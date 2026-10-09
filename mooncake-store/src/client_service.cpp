@@ -9,12 +9,14 @@
 
 #include <csignal>
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
+#include <future>
 #include <iomanip>
 #include <limits>
 #ifdef USE_NOF
@@ -69,6 +71,43 @@ namespace {
 
 constexpr size_t kObjectChecksumD2HChunkSize = 8 * 1024 * 1024;
 constexpr auto kInitialLeaderReadyTimeout = std::chrono::seconds(30);
+constexpr size_t kProviderQueryThreads = 8;
+constexpr size_t kProviderQueryMaxInflight = kProviderQueryThreads;
+
+using ProviderQueryResponse = ObjectStorageQueryResults;
+
+std::future<ProviderQueryResponse> QueryProviderAsync(
+    ThreadPool& thread_pool,
+    std::atomic<size_t>& inflight,
+    std::shared_ptr<DistributedStorageBackend> provider_backend,
+    std::vector<std::string> object_keys,
+    std::chrono::steady_clock::time_point deadline) {
+    size_t active = inflight.load(std::memory_order_relaxed);
+    while (active < kProviderQueryMaxInflight &&
+           !inflight.compare_exchange_weak(
+               active, active + 1, std::memory_order_acq_rel,
+               std::memory_order_relaxed)) {
+    }
+    if (active >= kProviderQueryMaxInflight) return {};
+
+    try {
+        return thread_pool.submit(
+            [provider_backend = std::move(provider_backend),
+             object_keys = std::move(object_keys), deadline, &inflight] {
+                struct InflightGuard {
+                    std::atomic<size_t>& count;
+                    ~InflightGuard() {
+                        count.fetch_sub(1, std::memory_order_release);
+                    }
+                } guard{inflight};
+                return provider_backend->BatchQueryProvider(object_keys,
+                                                            deadline);
+            });
+    } catch (...) {
+        inflight.fetch_sub(1, std::memory_order_release);
+        return {};
+    }
+}
 
 class ScopedObjectChecksumBuffer {
    public:
@@ -83,6 +122,154 @@ class ScopedObjectChecksumBuffer {
     PinnedBufferPool& pool_;
     PinnedBufferPool::Buffer buffer_;
 };
+
+ProviderReadContext MakeProviderReadContext(
+    ReplicaID replica_id, const ObjectStorageQueryContext& provider_context) {
+    ProviderReadContext context;
+    context.replica_id = replica_id;
+    context.logical_key = provider_context.logical_key;
+    context.total_shard = provider_context.total_shard;
+    context.total_size = provider_context.total_size;
+    context.layout_known = provider_context.layout_known;
+    context.shards.reserve(provider_context.shards.size());
+    for (const auto& shard : provider_context.shards) {
+        context.shards.push_back(ProviderShardReadContext{
+            .shard_id = shard.shard_id,
+            .size = shard.size,
+        });
+    }
+    return context;
+}
+
+ObjectStorageQueryContext MakeObjectStorageQueryContext(
+    const ProviderReadContext& context) {
+    ObjectStorageQueryContext provider_context;
+    provider_context.logical_key = context.logical_key;
+    provider_context.total_shard = context.total_shard;
+    provider_context.total_size = context.total_size;
+    provider_context.layout_known = context.layout_known;
+    provider_context.shards.reserve(context.shards.size());
+    for (const auto& shard : context.shards) {
+        provider_context.shards.push_back(ObjectStorageShardContext{
+            .shard_id = shard.shard_id,
+            .size = shard.size,
+        });
+    }
+    return provider_context;
+}
+
+tl::expected<std::vector<Slice>, ErrorCode> TrimSlicesToSize(
+    const std::vector<Slice>& slices, uint64_t object_size) {
+    if (object_size == 0 || object_size > std::numeric_limits<size_t>::max()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    size_t remaining = static_cast<size_t>(object_size);
+    std::vector<Slice> trimmed;
+    trimmed.reserve(slices.size());
+    for (const auto& slice : slices) {
+        if (remaining == 0) break;
+        if (slice.ptr == nullptr && slice.size != 0) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        const size_t size = std::min(slice.size, remaining);
+        if (size != 0) trimmed.push_back(Slice{slice.ptr, size});
+        remaining -= size;
+    }
+    if (remaining != 0) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return trimmed;
+}
+
+bool HasCompleteReplica(const std::vector<Replica::Descriptor>& replicas) {
+    return std::any_of(replicas.begin(), replicas.end(),
+                       [](const auto& replica) {
+                           return replica.status == ReplicaStatus::COMPLETE;
+                       });
+}
+
+bool HasCompleteMemoryReplica(
+    const std::vector<Replica::Descriptor>& replicas) {
+    return std::any_of(replicas.begin(), replicas.end(),
+                       [](const auto& replica) {
+                           return replica.status == ReplicaStatus::COMPLETE &&
+                                  replica.is_memory_replica();
+                       });
+}
+
+tl::expected<QueryResult, ErrorCode> BuildQueryResult(
+    const std::string& object_key, GetReplicaListResponse&& master_result,
+    std::chrono::steady_clock::time_point start_time,
+    const std::shared_ptr<DistributedStorageBackend>& provider_backend,
+    const tl::expected<ObjectStorageQueryContext, ErrorCode>* provider_result) {
+    std::vector<ProviderReadContext> provider_contexts;
+    std::optional<ErrorCode> reconcile_error;
+    bool saw_provider_replica = false;
+
+    if (provider_backend && provider_result != nullptr) {
+        std::vector<Replica::Descriptor> reconciled;
+        reconciled.reserve(master_result.replicas.size());
+        for (auto& replica : master_result.replicas) {
+            if (!provider_backend->IsProviderReplica(replica)) {
+                reconciled.push_back(std::move(replica));
+                continue;
+            }
+            saw_provider_replica = true;
+            if (replica.status != ReplicaStatus::COMPLETE) continue;
+            if (!*provider_result) {
+                reconcile_error = provider_result->error();
+                continue;
+            }
+
+            auto context = provider_result->value();
+            const uint64_t object_size =
+                replica.get_dfs_descriptor().object_size;
+            if (context.logical_key != object_key || object_size == 0 ||
+                (context.layout_known && context.total_size != object_size)) {
+                LOG(WARNING)
+                    << "provider_query_mismatch requested_key=" << object_key
+                    << " provider_key=" << context.logical_key
+                    << " master_size=" << object_size
+                    << " provider_size=" << context.total_size;
+                reconcile_error = ErrorCode::INTERNAL_ERROR;
+                continue;
+            }
+            if (!context.layout_known) context.total_size = object_size;
+            provider_contexts.push_back(
+                MakeProviderReadContext(replica.id, context));
+            reconciled.push_back(std::move(replica));
+        }
+        master_result.replicas = std::move(reconciled);
+    }
+
+    if (saw_provider_replica && provider_contexts.empty() &&
+        !HasCompleteReplica(master_result.replicas)) {
+        return tl::make_unexpected(
+            reconcile_error.value_or(ErrorCode::REPLICA_IS_NOT_READY));
+    }
+
+    const auto read_rank =
+        [&provider_contexts](const Replica::Descriptor& replica) {
+            if (replica.status != ReplicaStatus::COMPLETE) return 3;
+            if (replica.is_memory_replica()) return 0;
+            const bool is_provider =
+                std::any_of(provider_contexts.begin(), provider_contexts.end(),
+                            [&replica](const auto& context) {
+                                return context.replica_id == replica.id;
+                            });
+            return is_provider ? 1 : 2;
+        };
+    std::stable_sort(master_result.replicas.begin(),
+                     master_result.replicas.end(),
+                     [&read_rank](const auto& lhs, const auto& rhs) {
+                         return read_rank(lhs) < read_rank(rhs);
+                     });
+
+    return QueryResult(
+        std::move(master_result.replicas),
+        start_time + std::chrono::milliseconds(master_result.lease_ttl_ms),
+        master_result.object_checksum, std::move(provider_contexts));
+}
 
 #ifdef USE_NOF
 int GetCurrentNumaSocketId() {
@@ -453,6 +640,7 @@ Client::Client(const std::string& local_hostname,
       object_checksum_enabled_(
           ClientObjectChecksumConfig::IsEnabledAtFirstUse()),
       pinned_buffer_pool_(std::make_unique<PinnedBufferPool>()),
+      provider_query_thread_pool_(kProviderQueryThreads),
       write_thread_pool_(2),
       task_thread_pool_(4) {
     LOG(INFO) << "client_id=" << client_id_;
@@ -502,6 +690,7 @@ Client::~Client() {
 
     // Stop queued timer/task callbacks before tearing down segment state.
     task_running_ = false;
+    provider_query_thread_pool_.stop();
     task_thread_pool_.stop();
 
     // Make copies to avoid modifying while iterating
@@ -566,8 +755,15 @@ Client::~Client() {
     hot_cache_.reset();
 }
 
-ReplicateConfig Client::AttachHostId(const ReplicateConfig& config) const {
+ReplicateConfig Client::PrepareReplicateConfig(
+    const ReplicateConfig& config) const {
     ReplicateConfig client_cfg = config;
+    if (dfs_storage_backend_ && dfs_storage_backend_->UsesKvcs() &&
+        client_cfg.dfs_replica_num == 0) {
+        // KVCS is represented by one Mooncake DFS descriptor. The adapter
+        // independently handles target placement and provider replicas.
+        client_cfg.dfs_replica_num = 1;
+    }
     if (!host_id_.empty()) {
         client_cfg.host_id = host_id_;
     }
@@ -576,7 +772,8 @@ ReplicateConfig Client::AttachHostId(const ReplicateConfig& config) const {
 
 static std::vector<std::string> ParseDeviceNames(std::string_view value) {
     std::vector<std::string> devices;
-    boost::split(devices, std::string(value), boost::is_any_of(","),
+    std::string value_str(value);
+    boost::split(devices, value_str, boost::is_any_of(","),
                  boost::token_compress_on);
     for (auto& device : devices) {
         device = std::string(TrimAsciiWhitespace(device));
@@ -1238,16 +1435,59 @@ Client::QueryByRegex(const std::string& str) {
 
 tl::expected<QueryResult, ErrorCode> Client::Query(
     const std::string& object_key) {
-    std::chrono::steady_clock::time_point start_time =
-        std::chrono::steady_clock::now();
-    auto result = master_client_.GetReplicaList(object_key);
-    if (!result) {
-        return tl::unexpected(result.error());
+    const auto start_time = std::chrono::steady_clock::now();
+
+    auto provider_backend = dfs_storage_backend_;
+    std::future<ProviderQueryResponse> provider_future;
+    const bool query_provider =
+        provider_backend && provider_backend->CanQueryProviderInParallel();
+    auto provider_deadline = std::chrono::steady_clock::time_point::min();
+    if (query_provider) {
+        provider_deadline =
+            start_time + provider_backend->ProviderQueryTimeout();
+        provider_future = QueryProviderAsync(
+            provider_query_thread_pool_, provider_query_inflight_,
+            provider_backend, {object_key}, provider_deadline);
     }
-    return tl::expected<QueryResult, ErrorCode>(
-        tl::in_place, std::move(result.value().replicas),
-        start_time + std::chrono::milliseconds(result.value().lease_ttl_ms),
-        result.value().object_checksum);
+
+    auto master_result = master_client_.GetReplicaList(object_key);
+    ObjectStorageQueryResults provider_results;
+    if (query_provider && master_result &&
+        !HasCompleteMemoryReplica(master_result->replicas)) {
+        try {
+            if (provider_future.valid() &&
+                provider_future.wait_until(provider_deadline) ==
+                std::future_status::ready) {
+                provider_results = provider_future.get();
+            } else {
+                LOG(WARNING)
+                    << "KVCS provider query deadline exceeded or executor "
+                       "saturated, key="
+                    << object_key << ", timeout_ms="
+                    << provider_backend->ProviderQueryTimeout().count()
+                    << ", submitted=" << provider_future.valid();
+                provider_results.emplace_back(
+                    tl::make_unexpected(ErrorCode::RPC_TIMEOUT));
+            }
+        } catch (...) {
+            provider_results.emplace_back(
+                tl::make_unexpected(ErrorCode::INTERNAL_ERROR));
+        }
+        if (provider_results.size() != 1) {
+            provider_results = ObjectStorageQueryResults{
+                tl::make_unexpected(ErrorCode::INTERNAL_ERROR)};
+        }
+    }
+    if (!master_result) {
+        return tl::unexpected(master_result.error());
+    }
+
+    const auto* provider_result =
+        provider_results.empty() ? nullptr : &provider_results.front();
+    auto result =
+        BuildQueryResult(object_key, std::move(master_result.value()),
+                         start_time, provider_backend, provider_result);
+    return result;
 }
 
 std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
@@ -1255,11 +1495,67 @@ std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
     return BatchQuery(object_keys, master_client_.tenant_id());
 }
 
+bool Client::SupportsProviderQuery() const {
+    return dfs_storage_backend_ &&
+           dfs_storage_backend_->SupportsProviderQuery();
+}
+
 std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
     const std::vector<std::string>& object_keys, const std::string& tenant_id) {
-    std::chrono::steady_clock::time_point start_time =
-        std::chrono::steady_clock::now();
+    const auto start_time = std::chrono::steady_clock::now();
+
+    auto provider_backend = dfs_storage_backend_;
+    std::future<ProviderQueryResponse> provider_future;
+    const bool query_provider =
+        provider_backend && provider_backend->CanQueryProviderInParallel() &&
+        tenant_id == master_client_.tenant_id();
+    auto provider_deadline = std::chrono::steady_clock::time_point::min();
+    if (query_provider) {
+        provider_deadline =
+            start_time + provider_backend->ProviderQueryTimeout();
+        provider_future = QueryProviderAsync(
+            provider_query_thread_pool_, provider_query_inflight_,
+            provider_backend, object_keys, provider_deadline);
+    }
+
     auto response = master_client_.BatchGetReplicaList(object_keys, tenant_id);
+
+    ObjectStorageQueryResults provider_results;
+    bool wait_for_provider = false;
+    if (query_provider && response.size() == object_keys.size()) {
+        wait_for_provider =
+            std::any_of(response.begin(), response.end(), [](const auto& item) {
+                return item && !HasCompleteMemoryReplica(item->replicas);
+            });
+    }
+    if (query_provider && wait_for_provider) {
+        try {
+            if (provider_future.valid() &&
+                provider_future.wait_until(provider_deadline) ==
+                std::future_status::ready) {
+                provider_results = provider_future.get();
+            } else {
+                LOG(WARNING)
+                    << "KVCS provider batch query deadline exceeded or "
+                       "executor saturated, items="
+                    << object_keys.size() << ", timeout_ms="
+                    << provider_backend->ProviderQueryTimeout().count()
+                    << ", submitted=" << provider_future.valid();
+                provider_results = ObjectStorageQueryResults(
+                    object_keys.size(),
+                    tl::make_unexpected(ErrorCode::RPC_TIMEOUT));
+            }
+        } catch (...) {
+            provider_results = ObjectStorageQueryResults(
+                object_keys.size(),
+                tl::make_unexpected(ErrorCode::INTERNAL_ERROR));
+        }
+        if (provider_results.size() != object_keys.size()) {
+            provider_results = ObjectStorageQueryResults(
+                object_keys.size(),
+                tl::make_unexpected(ErrorCode::INTERNAL_ERROR));
+        }
+    }
 
     // Check if we got the expected number of responses
     if (response.size() != object_keys.size()) {
@@ -1277,11 +1573,11 @@ std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
     results.reserve(response.size());
     for (size_t i = 0; i < response.size(); ++i) {
         if (response[i]) {
-            results.emplace_back(
-                tl::in_place, std::move(response[i].value().replicas),
-                start_time +
-                    std::chrono::milliseconds(response[i].value().lease_ttl_ms),
-                response[i].value().object_checksum);
+            const auto* provider_result =
+                provider_results.empty() ? nullptr : &provider_results[i];
+            results.emplace_back(BuildQueryResult(
+                object_keys[i], std::move(response[i].value()), start_time,
+                provider_backend, provider_result));
         } else {
             results.emplace_back(tl::unexpected(response[i].error()));
         }
@@ -1398,7 +1694,8 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
 
     auto t0_get = std::chrono::steady_clock::now();
     if (replica.is_dfs_replica()) {
-        err = ReadDfsReplica(object_key, replica, slices);
+        err = ReadDfsReplica(object_key, replica, slices,
+                             query_result.FindProviderReadContext(replica.id));
     } else {
         err = TransferRead(replica, slices);
     }
@@ -1700,6 +1997,10 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         pending_transfers;
     std::vector<DfsReadRequest> dfs_read_requests;
     std::vector<size_t> dfs_read_indices;
+    std::vector<ObjectStorageGetRequest> provider_read_requests;
+    ObjectStorageQueryResults provider_read_contexts;
+    std::vector<size_t> provider_read_indices;
+    std::vector<uint64_t> provider_read_sizes;
     std::vector<tl::expected<void, ErrorCode>> results(object_keys.size());
     // Record batch get transfer latency (Submit + Wait)
     auto t0_batch_get = std::chrono::steady_clock::now();
@@ -1752,6 +2053,29 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                 continue;
             }
             const auto& desc = replica.get_dfs_descriptor();
+            if (const auto* provider_context =
+                    query_result.FindProviderReadContext(replica.id)) {
+                if (!dfs_storage_backend_->IsProviderReplica(replica) ||
+                    provider_context->logical_key != key ||
+                    provider_context->total_size != desc.object_size) {
+                    results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
+                    continue;
+                }
+                auto trimmed_slices =
+                    TrimSlicesToSize(slices_it->second, desc.object_size);
+                if (!trimmed_slices) {
+                    results[i] = tl::unexpected(trimmed_slices.error());
+                    continue;
+                }
+                provider_read_requests.push_back(ObjectStorageGetRequest{
+                    key, std::move(*trimmed_slices),
+                    static_cast<size_t>(desc.object_size)});
+                provider_read_contexts.emplace_back(
+                    MakeObjectStorageQueryContext(*provider_context));
+                provider_read_indices.push_back(i);
+                provider_read_sizes.push_back(calculate_total_size(replica));
+                continue;
+            }
             dfs_read_requests.push_back(
                 DfsReadRequest{key, desc, slices_it->second});
             dfs_read_indices.push_back(i);
@@ -1788,6 +2112,61 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
 
         pending_transfers.emplace_back(i, key, std::move(*future), replica,
                                        cache_used);
+    }
+
+    if (!provider_read_requests.empty()) {
+        auto* dfs_metric = GetDfsMetricPtr();
+        const auto provider_read_start = std::chrono::steady_clock::now();
+        auto provider_results =
+            dfs_storage_backend_->BatchGetProviderWithQueryContexts(
+                provider_read_requests, provider_read_contexts);
+        const auto provider_read_latency_us =
+            elapsed_us_since(provider_read_start);
+        int64_t success_keys = 0;
+        uint64_t success_bytes = 0;
+        if (provider_results.size() != provider_read_requests.size()) {
+            for (size_t index : provider_read_indices) {
+                results[index] = tl::unexpected(ErrorCode::INTERNAL_ERROR);
+            }
+            if (dfs_metric) {
+                dfs_metric->RecordReadErrors(
+                    toString(ErrorCode::INTERNAL_ERROR),
+                    static_cast<int64_t>(provider_read_indices.size()));
+            }
+        } else {
+            for (size_t i = 0; i < provider_results.size(); ++i) {
+                const size_t index = provider_read_indices[i];
+                if (!provider_results[i]) {
+                    results[index] =
+                        tl::unexpected(provider_results[i].error());
+                    if (dfs_metric) {
+                        dfs_metric->RecordReadErrors(
+                            toString(provider_results[i].error()));
+                    }
+                    continue;
+                }
+                ++success_keys;
+                success_bytes += provider_read_sizes[i];
+                auto checksum_result = VerifyObjectChecksum(
+                    object_keys[index], provider_read_requests[i].slices,
+                    provider_read_sizes[i],
+                    query_results[index].object_checksum);
+                if (!checksum_result) {
+                    results[index] = tl::unexpected(checksum_result.error());
+                    if (dfs_metric) {
+                        dfs_metric->RecordReadErrors(
+                            toString(checksum_result.error()));
+                    }
+                    continue;
+                }
+                results[index] = {};
+            }
+        }
+        if (dfs_metric && success_keys > 0) {
+            dfs_metric->ObserveRead(success_keys,
+                                    static_cast<int64_t>(success_bytes),
+                                    provider_read_latency_us);
+        }
     }
 
     if (!dfs_read_requests.empty()) {
@@ -1973,7 +2352,7 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         slice_lengths.emplace_back(slices[i].size);
     }
 
-    ReplicateConfig client_cfg = AttachHostId(config);
+    ReplicateConfig client_cfg = PrepareReplicateConfig(config);
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
     }
@@ -2056,8 +2435,9 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
             dfs_slices.push_back(&slices);
             dfs_descriptors.push_back(replica.get_dfs_descriptor());
         }
-        for (auto dfs_result :
-             WriteDfsReplicas(dfs_keys, dfs_slices, dfs_descriptors)) {
+        const auto dfs_results =
+            WriteDfsReplicas(dfs_keys, dfs_slices, dfs_descriptors, false);
+        for (auto dfs_result : dfs_results) {
             if (dfs_result == ErrorCode::OK) {
                 transfer_summary.RecordSuccess(ReplicaType::DFS);
             } else {
@@ -2186,7 +2566,7 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
         slice_lengths.emplace_back(slices[i].size);
     }
 
-    ReplicateConfig client_cfg = AttachHostId(config);
+    ReplicateConfig client_cfg = PrepareReplicateConfig(config);
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
     }
@@ -2259,8 +2639,9 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
             dfs_slices.push_back(&slices);
             dfs_descriptors.push_back(replica.get_dfs_descriptor());
         }
-        for (auto dfs_result :
-             WriteDfsReplicas(dfs_keys, dfs_slices, dfs_descriptors)) {
+        const auto dfs_results =
+            WriteDfsReplicas(dfs_keys, dfs_slices, dfs_descriptors, true);
+        for (auto dfs_result : dfs_results) {
             if (dfs_result == ErrorCode::OK) {
                 transfer_summary.RecordSuccess(ReplicaType::DFS);
             } else {
@@ -2330,7 +2711,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const ReplicateConfig& config, const WriteBufferStager& stager) {
-    ReplicateConfig client_cfg = AttachHostId(config);
+    ReplicateConfig client_cfg = PrepareReplicateConfig(config);
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
     }
@@ -2351,7 +2732,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
     auto t0 = std::chrono::steady_clock::now();
     SubmitTransfers(ops);
     WaitForTransfers(ops);
-    SubmitDfsWrites(ops);
+    SubmitDfsWrites(ops, true);
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(
                   std::chrono::steady_clock::now() - t0)
                   .count();
@@ -2906,7 +3287,8 @@ void Client::WaitForTransfers(std::vector<PutOperation>& ops) {
 std::vector<ErrorCode> Client::WriteDfsReplicas(
     const std::vector<std::string>& keys,
     const std::vector<const std::vector<Slice>*>& slice_lists,
-    const std::vector<DistributedFSDescriptor>& descriptors) {
+    const std::vector<DistributedFSDescriptor>& descriptors,
+    bool replace_existing) {
     if (keys.size() != slice_lists.size() ||
         keys.size() != descriptors.size()) {
         return std::vector<ErrorCode>(keys.size(), ErrorCode::INVALID_PARAMS);
@@ -2997,8 +3379,8 @@ std::vector<ErrorCode> Client::WriteDfsReplicas(
             continue;
         }
 
-        requests.push_back(
-            DfsWriteRequest{keys[i], descriptors[i], std::move(host_slices)});
+        requests.push_back(DfsWriteRequest{
+            keys[i], descriptors[i], std::move(host_slices), replace_existing});
         request_indices.push_back(i);
         request_bytes.push_back(key_bytes);
     }
@@ -3054,7 +3436,8 @@ std::vector<ErrorCode> Client::WriteDfsReplicas(
     return results;
 }
 
-void Client::SubmitDfsWrites(std::vector<PutOperation>& ops) {
+void Client::SubmitDfsWrites(std::vector<PutOperation>& ops,
+                             bool replace_existing) {
     std::vector<std::string> keys;
     std::vector<const std::vector<Slice>*> slice_lists;
     std::vector<DistributedFSDescriptor> descriptors;
@@ -3101,7 +3484,8 @@ void Client::SubmitDfsWrites(std::vector<PutOperation>& ops) {
         dfs_metric->RecordSkippedWrites(skipped_writes);
     }
 
-    auto results = WriteDfsReplicas(keys, slice_lists, descriptors);
+    auto results =
+        WriteDfsReplicas(keys, slice_lists, descriptors, replace_existing);
     for (size_t i = 0; i < results.size(); ++i) {
         auto& op = ops[op_indices[i]];
         if (results[i] == ErrorCode::OK) {
@@ -3593,7 +3977,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchWriteWhenPreferSameNode(
             seg_to_ops.at(seg).transfer_summary.first_error;
         op.failure_context = seg_to_ops.at(seg).failure_context;
     }
-    SubmitDfsWrites(ops);
+    SubmitDfsWrites(ops, is_upsert);
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(
                   std::chrono::steady_clock::now() - t0)
                   .count();
@@ -3619,7 +4003,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const ReplicateConfig& config, const WriteBufferStager& stager) {
-    ReplicateConfig client_cfg = AttachHostId(config);
+    ReplicateConfig client_cfg = PrepareReplicateConfig(config);
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
     }
@@ -3664,7 +4048,7 @@ Client::StartBatchPutForSizes(const std::vector<std::string>& keys,
         return results;
     }
 
-    ReplicateConfig client_cfg = AttachHostId(config);
+    ReplicateConfig client_cfg = PrepareReplicateConfig(config);
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
     }
@@ -3701,12 +4085,22 @@ tl::expected<void, ErrorCode> Client::Remove(const ObjectKey& key, bool force) {
         hot_cache_->BumpKeyGeneration(key);
     }
 
-    auto result = master_client_.Remove(key, force);
-    // if (storage_backend_) {
-    //     storage_backend_->RemoveFile(key);
-    // }
-    if (!result) {
-        return tl::unexpected(result.error());
+    auto master_result = master_client_.Remove(key, force);
+    const bool provider_delete_retry =
+        !master_result &&
+        master_result.error() == ErrorCode::OBJECT_NOT_FOUND &&
+        dfs_storage_backend_ && dfs_storage_backend_->SupportsProviderQuery();
+    if (!master_result && !provider_delete_retry) {
+        return tl::unexpected(master_result.error());
+    }
+    if (dfs_storage_backend_ && dfs_storage_backend_->SupportsProviderQuery()) {
+        const std::array<std::string, 1> keys{key};
+        auto provider_results = dfs_storage_backend_->BatchDeleteProvider(keys);
+        if (provider_results.size() != 1 || !provider_results[0]) {
+            return tl::unexpected(provider_results.size() == 1
+                                      ? provider_results[0].error()
+                                      : ErrorCode::INTERNAL_ERROR);
+        }
     }
     if (hot_cache_) {
         hot_cache_->RemoveHotKey(key);
@@ -3759,6 +4153,35 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchRemove(
     }
 
     auto results = master_client_.BatchRemove(keys, force);
+
+    if (dfs_storage_backend_ && dfs_storage_backend_->SupportsProviderQuery()) {
+        std::vector<std::string> provider_keys;
+        std::vector<size_t> provider_indices;
+        for (size_t i = 0; i < keys.size(); ++i) {
+            const bool master_removed =
+                i < results.size() && results[i].has_value();
+            const bool provider_delete_retry =
+                i < results.size() && !results[i] &&
+                results[i].error() == ErrorCode::OBJECT_NOT_FOUND;
+            if (master_removed || provider_delete_retry) {
+                provider_keys.push_back(keys[i]);
+                provider_indices.push_back(i);
+            }
+        }
+        auto provider_results =
+            dfs_storage_backend_->BatchDeleteProvider(provider_keys);
+        if (provider_results.size() != provider_keys.size()) {
+            provider_results.assign(
+                provider_keys.size(),
+                tl::make_unexpected(ErrorCode::INTERNAL_ERROR));
+        }
+        for (size_t i = 0; i < provider_results.size(); ++i) {
+            results[provider_indices[i]] =
+                provider_results[i]
+                    ? tl::expected<void, ErrorCode>{}
+                    : tl::make_unexpected(provider_results[i].error());
+        }
+    }
 
     if (hot_cache_) {
         std::vector<std::string> removed_keys;
@@ -4385,8 +4808,8 @@ tl::expected<void, ErrorCode> Client::Copy(
     const std::string& source, const std::vector<std::string>& targets,
     const UUID& dynamic_replication_lease_id,
     uint64_t dynamic_replication_version_epoch) {
-    LOG(INFO) << "action=replica_copy_start" << ", key=" << key
-              << ", targets_count=" << targets.size();
+    LOG(INFO) << "action=replica_copy_start"
+              << ", key=" << key << ", targets_count=" << targets.size();
 
     // Call CopyStart first - it validates existence and allocates replicas
     auto start_result =
@@ -4404,16 +4827,17 @@ tl::expected<void, ErrorCode> Client::Copy(
                       << ", info=target_replicas_already_exist";
             return {};
         }
-        LOG(ERROR) << "action=replica_copy_failed" << ", key=" << key
-                   << ", source=" << source << ", error=copy_start_failed"
+        LOG(ERROR) << "action=replica_copy_failed"
+                   << ", key=" << key << ", source=" << source
+                   << ", error=copy_start_failed"
                    << ", error_code=" << error;
         return tl::unexpected(error);
     }
 
     const auto& response = start_result.value();
     if (response.targets.empty()) {
-        LOG(INFO) << "action=replica_copy_skipped" << ", key=" << key
-                  << ", info=target_replicas_already_exist";
+        LOG(INFO) << "action=replica_copy_skipped"
+                  << ", key=" << key << ", info=target_replicas_already_exist";
         // Target replicas already exist, consider it success
         auto copy_end_result =
             dynamic_replication_lease_id == UUID{}
@@ -4423,8 +4847,9 @@ tl::expected<void, ErrorCode> Client::Copy(
                       dynamic_replication_version_epoch);
         if (!copy_end_result.has_value()) {
             ErrorCode error = copy_end_result.error();
-            LOG(ERROR) << "action=replica_copy_failed" << ", key=" << key
-                       << ", error=copy_end_failed" << ", error_code=" << error;
+            LOG(ERROR) << "action=replica_copy_failed"
+                       << ", key=" << key << ", error=copy_end_failed"
+                       << ", error_code=" << error;
             return tl::unexpected(error);
         }
         return {};
@@ -4448,7 +4873,8 @@ tl::expected<void, ErrorCode> Client::Copy(
                                          response.source, response.targets);
 
     if (result.has_value()) {
-        LOG(INFO) << "action=replica_copy_success" << ", key=" << key
+        LOG(INFO) << "action=replica_copy_success"
+                  << ", key=" << key
                   << ", target_count=" << response.targets.size();
     }
 
@@ -4465,8 +4891,9 @@ tl::expected<void, ErrorCode> Client::Move(const std::string& key,
                                            const std::string& tenant_id,
                                            const std::string& source,
                                            const std::string& target) {
-    LOG(INFO) << "action=replica_move_start" << ", key=" << key
-              << ", source_segment=" << source << ", target_segment=" << target;
+    LOG(INFO) << "action=replica_move_start"
+              << ", key=" << key << ", source_segment=" << source
+              << ", target_segment=" << target;
 
     // Call MoveStart first - it validates existence and allocates replica if
     // needed
@@ -4474,22 +4901,24 @@ tl::expected<void, ErrorCode> Client::Move(const std::string& key,
         master_client_.MoveStart(key, tenant_id, source, target);
     if (!move_start_result.has_value()) {
         ErrorCode error = move_start_result.error();
-        LOG(ERROR) << "action=replica_move_failed" << ", key=" << key
-                   << ", error=move_start_failed" << ", error_code=" << error;
+        LOG(ERROR) << "action=replica_move_failed"
+                   << ", key=" << key << ", error=move_start_failed"
+                   << ", error_code=" << error;
         // MoveStart already validated existence, so we just return the error
         return tl::unexpected(error);
     }
 
     const auto& response = move_start_result.value();
     if (!response.target.has_value()) {
-        LOG(INFO) << "action=replica_move_skipped" << ", key=" << key
-                  << ", info=target_replica_already_exists";
+        LOG(INFO) << "action=replica_move_skipped"
+                  << ", key=" << key << ", info=target_replica_already_exists";
         // Target already exists, consider it success
         auto move_end_result = master_client_.MoveEnd(key, tenant_id);
         if (!move_end_result.has_value()) {
             ErrorCode error = move_end_result.error();
-            LOG(ERROR) << "action=replica_move_failed" << ", key=" << key
-                       << ", error=move_end_failed" << ", error_code=" << error;
+            LOG(ERROR) << "action=replica_move_failed"
+                       << ", key=" << key << ", error=move_end_failed"
+                       << ", error_code=" << error;
             return tl::unexpected(error);
         }
         return {};
@@ -4503,8 +4932,8 @@ tl::expected<void, ErrorCode> Client::Move(const std::string& key,
         response.source, targets);
 
     if (result.has_value()) {
-        LOG(INFO) << "action=replica_move_success" << ", key=" << key
-                  << ", source_segment=" << source
+        LOG(INFO) << "action=replica_move_success"
+                  << ", key=" << key << ", source_segment=" << source
                   << ", target_segment=" << target;
     }
 
@@ -5003,7 +5432,8 @@ ErrorCode Client::TransferRead(const Replica::Descriptor& replica_descriptor,
 
 ErrorCode Client::ReadDfsReplica(const std::string& key,
                                  const Replica::Descriptor& replica_descriptor,
-                                 std::vector<Slice>& slices) {
+                                 std::vector<Slice>& slices,
+                                 const ProviderReadContext* provider_context) {
     if (!replica_descriptor.is_dfs_replica()) {
         return ErrorCode::INVALID_REPLICA;
     }
@@ -5016,8 +5446,51 @@ ErrorCode Client::ReadDfsReplica(const std::string& key,
         return ErrorCode::DFS_SERVICE_UNAVAILABLE;
     }
 
-    auto* dfs_metric = GetDfsMetricPtr();
     const auto& desc = replica_descriptor.get_dfs_descriptor();
+    auto* dfs_metric = GetDfsMetricPtr();
+    if (provider_context != nullptr) {
+        if (!dfs_storage_backend_->IsProviderReplica(replica_descriptor) ||
+            provider_context->replica_id != replica_descriptor.id ||
+            provider_context->logical_key != key ||
+            provider_context->total_size != desc.object_size) {
+            LOG(ERROR) << "Invalid provider read context for key " << key;
+            if (dfs_metric) {
+                dfs_metric->RecordReadErrors(
+                    toString(ErrorCode::INVALID_PARAMS));
+            }
+            return ErrorCode::INVALID_PARAMS;
+        }
+        auto trimmed_slices = TrimSlicesToSize(slices, desc.object_size);
+        if (!trimmed_slices) return trimmed_slices.error();
+        const std::array<ObjectStorageGetRequest, 1> requests{
+            ObjectStorageGetRequest{key, std::move(*trimmed_slices),
+                                    static_cast<size_t>(desc.object_size)}};
+        ObjectStorageQueryResults contexts;
+        contexts.emplace_back(MakeObjectStorageQueryContext(*provider_context));
+        const auto read_start = std::chrono::steady_clock::now();
+        auto results = dfs_storage_backend_->BatchGetProviderWithQueryContexts(
+            requests, contexts);
+        const auto read_latency_us = elapsed_us_since(read_start);
+        if (results.size() != 1) {
+            if (dfs_metric) {
+                dfs_metric->RecordReadErrors(
+                    toString(ErrorCode::INTERNAL_ERROR));
+            }
+            return ErrorCode::INTERNAL_ERROR;
+        }
+        if (!results[0]) {
+            if (dfs_metric) {
+                dfs_metric->RecordReadErrors(toString(results[0].error()));
+            }
+            return results[0].error();
+        }
+        if (dfs_metric) {
+            dfs_metric->ObserveRead(1, static_cast<int64_t>(desc.object_size),
+                                    read_latency_us);
+        }
+        return ErrorCode::OK;
+    }
+
     std::vector<DfsReadRequest> requests{DfsReadRequest{key, desc, slices}};
     const auto read_start = std::chrono::steady_clock::now();
     auto results = dfs_storage_backend_->BatchRead(requests);
@@ -5073,15 +5546,15 @@ void Client::PollAndDispatchTasks() {
             // Only log if it's not an RPC failure (which is expected
             // during connection failures)
             if (error != ErrorCode::RPC_FAIL) {
-                LOG(WARNING)
-                    << "action=task_poll_failed" << ", error_code=" << error;
+                LOG(WARNING) << "action=task_poll_failed"
+                             << ", error_code=" << error;
             }
         }
     }
 }
 
 void Client::TaskPollThreadMain() {
-    const auto poll_interval = std::chrono::milliseconds(1000);
+    const auto poll_interval = std::chrono::seconds(1);
 
     while (task_poll_running_.load()) {
         PollAndDispatchTasks();
@@ -5091,7 +5564,8 @@ void Client::TaskPollThreadMain() {
 
 void Client::SubmitTask(const TaskAssignment& assignment) {
     if (!task_running_.load()) {
-        LOG(WARNING) << "action=task_rejected" << ", task_id=" << assignment.id
+        LOG(WARNING) << "action=task_rejected"
+                     << ", task_id=" << assignment.id
                      << ", reason=executor_stopped";
         return;
     }
@@ -5155,18 +5629,34 @@ void Client::ExecuteTask(const ClientTask& client_task) {
         result = ErrorCode::INTERNAL_ERROR;
     }
 
-    if (result == ErrorCode::OK) {
+    auto complete_task_with_retry = [&](TaskStatus status,
+                                        const std::string& message) {
         TaskCompleteRequest complete_request;
         complete_request.id = assignment.id;
-        complete_request.status = TaskStatus::SUCCESS;
-        complete_request.message = "Task completed successfully";
-        auto complete_result =
-            master_client_.MarkTaskToComplete(complete_request);
-        if (!complete_result.has_value()) {
-            LOG(WARNING) << "action=task_complete_failed"
-                         << ", task_id=" << assignment.id
+        complete_request.status = status;
+        complete_request.message = message;
+        constexpr int kCompletionAttempts = 3;
+        for (int attempt = 0; attempt < kCompletionAttempts; ++attempt) {
+            auto complete_result =
+                master_client_.MarkTaskToComplete(complete_request);
+            if (complete_result.has_value()) {
+                return;
+            }
+            LOG(WARNING) << "action=task_complete_retry, task_id="
+                         << assignment.id << ", attempt=" << (attempt + 1)
                          << ", error_code=" << complete_result.error();
+            if (attempt + 1 < kCompletionAttempts) {
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(20 * (attempt + 1)));
+            }
         }
+        LOG(ERROR) << "action=task_complete_failed, task_id=" << assignment.id
+                   << ", status=" << status;
+    };
+
+    if (result == ErrorCode::OK) {
+        complete_task_with_retry(TaskStatus::SUCCESS,
+                                 "Task completed successfully");
     } else {
         uint32_t current_retry_count = client_task.retry_count;
         // Only retry on allocation failures (NO_AVAILABLE_HANDLE)
@@ -5200,19 +5690,10 @@ void Client::ExecuteTask(const ClientTask& client_task) {
                        << ", error_code=" << result
                        << ", retry_count=" << current_retry_count
                        << ", max_retry_count=" << assignment.max_retry_attempts;
-            TaskCompleteRequest complete_request;
-            complete_request.id = assignment.id;
-            complete_request.status = TaskStatus::FAILED;
-            complete_request.message =
+            const std::string message =
                 toString(result) + " (max retries reached: " +
                 std::to_string(assignment.max_retry_attempts) + ")";
-            auto complete_result =
-                master_client_.MarkTaskToComplete(complete_request);
-            if (!complete_result.has_value()) {
-                LOG(WARNING) << "action=task_complete_failed"
-                             << ", task_id=" << assignment.id
-                             << ", error_code=" << complete_result.error();
-            }
+            complete_task_with_retry(TaskStatus::FAILED, message);
         }
     }
 }

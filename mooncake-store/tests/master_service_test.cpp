@@ -64,6 +64,113 @@ class ScopedEnvVar {
     std::optional<std::string> previous_value_;
 };
 
+TEST_F(MasterServiceTest,
+       KvcsStorageModeSkipsFilesystemAllocatorRecoveryRestriction) {
+    ScopedEnvVar clear_kvcs_mode("MOONCAKE_KVCS_MODE");
+    ScopedEnvVar clear_enable_dfs("MOONCAKE_ENABLE_DFS");
+    ScopedEnvVar clear_dfs_enabled("MOONCAKE_DFS_ENABLED");
+    ScopedEnvVar kvcs_mode("MOONCAKE_KVCS_MODE", "low-level");
+    MasterServiceConfig config;
+    config.enable_ha = true;
+    config.enable_oplog = true;
+    config.ha_backend_type = "etcd";
+    MasterService service(config);
+    EXPECT_TRUE(MasterServiceTestPeer::EnableDfs(service));
+    EXPECT_EQ(MasterServiceTestPeer::DfsAllocator(service), nullptr);
+    EXPECT_EQ(MasterServiceTestPeer::DfsKvcsBackend(service),
+              "kvcs-lowlevel");
+}
+
+TEST_F(MasterServiceTest,
+       FilesystemStorageModeRetainsAllocatorRecoveryRestriction) {
+    ScopedEnvVar clear_kvcs_mode("MOONCAKE_KVCS_MODE");
+    ScopedEnvVar clear_enable_dfs("MOONCAKE_ENABLE_DFS");
+    ScopedEnvVar clear_dfs_enabled("MOONCAKE_DFS_ENABLED");
+
+    const auto dfs_root =
+        (std::filesystem::temp_directory_path() /
+         ("master_dfs_recovery_restriction_" + std::to_string(::getpid())))
+            .string();
+    std::filesystem::create_directories(dfs_root);
+    ScopedEnvVar enable_dfs("MOONCAKE_ENABLE_DFS", "1");
+    ScopedEnvVar fs_adapter("MOONCAKE_DFS_FS_ADAPTER", "posix");
+    ScopedEnvVar root_dir("MOONCAKE_DFS_ROOT_DIR", dfs_root.c_str());
+    ScopedEnvVar shard_count("MOONCAKE_DFS_SHARD_COUNT", "1");
+    ScopedEnvVar shard_capacity("MOONCAKE_DFS_SHARD_CAPACITY", "1048576");
+    ScopedEnvVar alignment("MOONCAKE_DFS_ALIGNMENT", "4096");
+    ScopedEnvVar single_tenant("MOONCAKE_DFS_SINGLE_TENANT", "true");
+
+    MasterServiceConfig config;
+    config.enable_ha = true;
+    config.enable_oplog = true;
+    config.ha_backend_type = "etcd";
+    EXPECT_THROW(
+        {
+            MasterService service(config);
+        },
+        std::invalid_argument);
+    std::filesystem::remove_all(dfs_root);
+}
+
+TEST_F(MasterServiceTest, InvalidKvcsConfigFailsFastForSnapshotRecovery) {
+    ScopedEnvVar clear_kvcs_mode("MOONCAKE_KVCS_MODE");
+    ScopedEnvVar clear_enable_dfs("MOONCAKE_ENABLE_DFS");
+    ScopedEnvVar clear_dfs_enabled("MOONCAKE_DFS_ENABLED");
+
+    ScopedEnvVar kvcs_mode("MOONCAKE_KVCS_MODE", "low-level");
+    ScopedEnvVar query_timeout("MOONCAKE_KVCS_QUERY_TIMEOUT_MS", "0");
+    MasterServiceConfig config;
+    config.enable_snapshot_restore = true;
+    EXPECT_THROW(
+        {
+            MasterService service(config);
+        },
+        std::invalid_argument);
+}
+
+TEST_F(MasterServiceTest, KvcsStandbyRestoreAcceptsObjectStorageDfsReplica) {
+    ScopedEnvVar clear_enable_dfs("MOONCAKE_ENABLE_DFS");
+    ScopedEnvVar clear_dfs_enabled("MOONCAKE_DFS_ENABLED");
+    ScopedEnvVar kvcs_mode("MOONCAKE_KVCS_MODE", "low-level");
+
+    MasterServiceConfig config;
+    config.enable_ha = true;
+    config.enable_oplog = true;
+    config.ha_backend_type = "etcd";
+    MasterService service(config);
+
+    constexpr uint64_t kObjectSize = 128;
+    DistributedFSDescriptor dfs_descriptor;
+    dfs_descriptor.object_size = kObjectSize;
+    dfs_descriptor.aligned_size = kObjectSize;
+    dfs_descriptor.shard_idx = -1;
+    dfs_descriptor.SetObjectStorageBackend("kvcs-lowlevel");
+    Replica replica(std::move(dfs_descriptor), ReplicaStatus::COMPLETE);
+
+    StandbyObjectMetadata metadata;
+    metadata.client_id = generate_uuid();
+    metadata.size = kObjectSize;
+    metadata.replicas.push_back(replica.get_descriptor());
+
+    const std::string key = "restored-kvcs-dfs-object";
+    ASSERT_TRUE(
+        service
+            .RestoreFromStandbySnapshot(
+                {{std::string(TenantId::kDefaultValue), key, metadata}},
+                /*initial_oplog_sequence_id=*/0, {})
+            .has_value());
+
+    auto response =
+        service.GetReplicaListForAdmin(key, TenantId::Default());
+    ASSERT_TRUE(response);
+    ASSERT_EQ(response->replicas.size(), 1u);
+    ASSERT_TRUE(response->replicas[0].is_dfs_replica());
+    const auto& restored = response->replicas[0].get_dfs_descriptor();
+    EXPECT_TRUE(restored.IsObjectStorage());
+    EXPECT_EQ(restored.ObjectStorageBackend(), "kvcs-lowlevel");
+    EXPECT_EQ(restored.object_size, kObjectSize);
+}
+
 TEST(TenantScopedStorageKeyTest, RoundTripsAndParsesLegacyKeys) {
     const auto scoped =
         TenantId("tenant:with:colon").MakeScopedKey("path/key:with:colon");

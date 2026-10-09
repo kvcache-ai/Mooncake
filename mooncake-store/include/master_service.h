@@ -923,6 +923,7 @@ class MasterService {
      */
     tl::expected<QueryTaskResponse, ErrorCode> QueryTask(const UUID& task_id);
 
+
     /**
      * @brief fetch tasks assigned to a client
      * @return list of tasks
@@ -1073,6 +1074,7 @@ class MasterService {
 
     static constexpr size_t kNumShards = 1024;  // Number of metadata shards
 
+
     struct TenantState {
         TenantQuotaHandle quota_account{nullptr};
         std::unordered_map<std::string, ObjectMetadata> metadata;
@@ -1092,8 +1094,9 @@ class MasterService {
 
         bool Empty() const {
             return metadata.empty() && processing_keys.empty() &&
-                   replication_tasks.empty() && offloading_tasks.empty() &&
-                   promotion_tasks.empty() && promotion_candidates.empty() &&
+                   replication_tasks.empty() &&
+                   offloading_tasks.empty() && promotion_tasks.empty() &&
+                   promotion_candidates.empty() &&
                    dynamic_replication_pending.empty() &&
                    dynamic_replication_leases.empty() &&
                    dynamic_replication_cooldowns.empty();
@@ -1806,6 +1809,7 @@ class MasterService {
                        tenant_state_->replication_tasks.end();
         }
 
+
         MetadataShardAccessorRW& GetShard() NO_THREAD_SAFETY_ANALYSIS {
             return shard_guard_;
         }
@@ -2245,6 +2249,7 @@ class MasterService {
 
     bool use_disk_replica_{false};
     bool enable_dfs_{false};
+    std::optional<std::string> dfs_kvcs_backend_;
     std::unique_ptr<DfsAllocatorInterface> dfs_allocator_;
     ShardAllocator* shard_allocator_{nullptr};
     ImmutableBucketAllocator* bucket_allocator_{nullptr};

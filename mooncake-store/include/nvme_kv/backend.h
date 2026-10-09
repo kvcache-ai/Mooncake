@@ -10,7 +10,6 @@
 
 #include "nvme_kv/connector.h"
 #include "nvme_kv/key_codec.h"
-#include "nvme_kv/key_conflict_policy.h"
 #include "nvme_kv/object_layout.h"
 #include "rpc_types.h"
 #include "storage_backend.h"

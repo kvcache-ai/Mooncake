@@ -1,5 +1,6 @@
 #include "storage_backend.h"
 
+#include <algorithm>
 #include <cmath>
 #include <filesystem>
 #include <locale>
@@ -205,7 +206,8 @@ bool FileStorageConfig::ValidatePath(std::string path) const {
 }
 
 bool FileStorageConfig::Validate() const {
-    if (!ValidatePath(storage_filepath)) {
+    if (storage_backend_type != StorageBackendType::kDistributed &&
+        !ValidatePath(storage_filepath)) {
         return false;
     }
     if (total_keys_limit <= 0) {

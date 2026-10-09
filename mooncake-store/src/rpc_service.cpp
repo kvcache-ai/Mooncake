@@ -1450,6 +1450,7 @@ tl::expected<QueryTaskResponse, ErrorCode> WrappedMasterService::QueryTask(
         [] { MasterMetricManager::instance().inc_query_task_failures(); });
 }
 
+
 tl::expected<std::vector<TaskAssignment>, ErrorCode>
 WrappedMasterService::FetchTasks(const UUID& client_id, size_t batch_size) {
     return execute_rpc(

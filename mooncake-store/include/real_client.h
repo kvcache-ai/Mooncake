@@ -712,6 +712,14 @@ class RealClient : public PyClient {
         const std::vector<std::vector<size_t>> &all_sizes,
         bool prefer_same_node);
 
+    std::vector<tl::expected<int64_t, ErrorCode>>
+    batch_get_into_multi_buffers_internal(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> &all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
+        bool prefer_same_node,
+        const std::vector<tl::expected<QueryResult, ErrorCode>> &query_results);
+
     tl::expected<void, ErrorCode> put_from_internal(
         const std::string &key, void *buffer, size_t size,
         const ReplicateConfig &config = ReplicateConfig{});
@@ -1074,6 +1082,8 @@ class RealClient : public PyClient {
     // request-scoped staging; LOCAL_DISK restores on the owner then
     // BatchTransferReadOffloadRanges; DISK BatchGets into a temp buffer then
     // scatters by src_offset.
+    // Pending provider query results are cached only for the next matching
+    // read, then expired or invalidated after mutation.
     // Put sessions track writable + inflight so end/revoke can seal the
     // session and wait for outstanding range writes before finalize/free.
     struct PutSessionEntry {
@@ -1090,6 +1100,33 @@ class RealClient : public PyClient {
 
     void wait_session_put_idle(std::unique_lock<std::mutex> &lock,
                                const std::vector<std::string> &keys);
+
+    struct PendingQueryResultEntry {
+        QueryResult query_result;
+        std::chrono::steady_clock::time_point cleanup_deadline;
+    };
+    static constexpr size_t kMaxPendingQueryResults = 16384;
+    mutable std::mutex pending_query_mutex_;
+    std::unordered_map<std::string, PendingQueryResultEntry>
+        pending_query_results_;
+    std::condition_variable_any pending_query_cleanup_cv_;
+    std::jthread pending_query_cleanup_thread_;
+    bool pending_query_stopping_{false};
+
+    void cache_pending_query_results(
+        const std::vector<std::string> &keys,
+        const std::vector<tl::expected<QueryResult, ErrorCode>> &query_results);
+    void invalidate_pending_query_result(const std::string &key);
+    void invalidate_pending_query_results(
+        const std::vector<std::string> &keys,
+        const std::vector<tl::expected<void, ErrorCode>> &results);
+    void clear_pending_query_results();
+    tl::expected<QueryResult, ErrorCode> take_pending_query_result_or_query(
+        const std::string &key);
+    std::vector<tl::expected<QueryResult, ErrorCode>>
+    take_pending_query_results_or_query(const std::vector<std::string> &keys);
+    void ensure_pending_query_cleanup_thread_locked();
+    void stop_pending_query_cleanup_thread();
 
     // Dummy VA -> real VA using mapped_shms; last_hit_shm caches locality.
     bool map_dummy_range_in_shm(const MappedShm &shm, uint64_t dummy_addr,

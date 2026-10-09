@@ -1,9 +1,21 @@
 #include "nvme_kv/object_layout.h"
 
 #include <cstring>
+#include <limits>
+
+#include "storage/object_layout.h"
 
 namespace mooncake {
 namespace {
+
+uint32_t PayloadLimitForIdentityMetadata(uint32_t max_value_size,
+                                         uint32_t identity_metadata_size) {
+    const uint64_t fixed_overhead =
+        static_cast<uint64_t>(sizeof(NvmeKvObjectHeader)) +
+        identity_metadata_size;
+    if (max_value_size <= fixed_overhead) return 0;
+    return static_cast<uint32_t>(max_value_size - fixed_overhead);
+}
 
 uint32_t ResolveNvmeKvObjectBlobSizeFromHeader(const char* buffer,
                                                uint32_t prefix_size,
@@ -31,6 +43,86 @@ uint32_t ResolveNvmeKvObjectBlobSizeFromHeader(const char* buffer,
 }
 
 }  // namespace
+
+tl::expected<NvmeKvWritePlan, ErrorCode> BuildNvmeKvWritePlan(
+    const NvmeKvObjectIdentity& identity, std::string_view payload,
+    uint32_t slot, uint32_t max_value_size) {
+    if (payload.size() >
+        static_cast<size_t>(std::numeric_limits<uint32_t>::max())) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    NvmeKvWritePlan plan;
+    plan.identity = identity;
+    plan.root_key = EncodeNvmeKvPhysicalKey(identity, slot);
+    const auto root_identity_metadata = SerializeNvmeKvStoredIdentity(
+        identity, BuildNvmeKvStoredIdentityMetadata(plan.root_key, slot));
+    const uint32_t inline_payload_limit = PayloadLimitForIdentityMetadata(
+        max_value_size, static_cast<uint32_t>(root_identity_metadata.size()));
+    auto shard_plan = PlanObjectShards(
+        payload.size(), {.max_value_size = max_value_size,
+                         .inline_value_size = inline_payload_limit});
+    if (!shard_plan) return tl::make_unexpected(shard_plan.error());
+    plan.store_inline = shard_plan->inline_value;
+
+    const auto verify_hash = ComputeNvmeKvVerifyHash(identity);
+    if (plan.store_inline) {
+        NvmeKvObjectHeader header{
+            .magic = NvmeKvObjectHeader::kMagic,
+            .object_type = static_cast<uint32_t>(NvmeKvObjectType::kInline),
+            .payload_size = static_cast<uint32_t>(payload.size()),
+            .verify_hash = verify_hash,
+            .payload_checksum = ComputeNvmeKvPayloadChecksum(payload),
+            .header_checksum = 0,
+            .identity_metadata_size =
+                static_cast<uint32_t>(root_identity_metadata.size()),
+        };
+        header.header_checksum = ComputeNvmeKvHeaderChecksum(header);
+        plan.root_blob =
+            BuildNvmeKvObjectBlob(header, root_identity_metadata, payload);
+        return plan;
+    }
+
+    plan.manifest_records.reserve(shard_plan->shards.size());
+    plan.chunk_values.reserve(shard_plan->shards.size());
+    for (const auto& shard : shard_plan->shards) {
+        const std::string_view chunk_payload(payload.data() + shard.offset,
+                                             shard.size);
+        const auto chunk_key =
+            EncodeNvmeKvChunkPhysicalKey(identity, shard.shard_id, slot);
+        plan.chunk_values.emplace_back(chunk_key, chunk_payload);
+        plan.manifest_records.push_back(NvmeKvManifestChunkRecord{
+            chunk_key, static_cast<uint32_t>(chunk_payload.size()),
+            ComputeNvmeKvPayloadChecksum(chunk_payload)});
+    }
+
+    const NvmeKvManifestMetadata metadata{
+        .logical_payload_size = static_cast<uint32_t>(payload.size()),
+        .chunk_count = static_cast<uint32_t>(plan.manifest_records.size()),
+    };
+    const std::string manifest_payload =
+        SerializeNvmeKvManifest(metadata, plan.manifest_records);
+    if (manifest_payload.size() + sizeof(NvmeKvObjectHeader) +
+            root_identity_metadata.size() >
+        max_value_size) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    NvmeKvObjectHeader header{
+        .magic = NvmeKvObjectHeader::kMagic,
+        .object_type = static_cast<uint32_t>(NvmeKvObjectType::kManifest),
+        .payload_size = static_cast<uint32_t>(manifest_payload.size()),
+        .verify_hash = verify_hash,
+        .payload_checksum = ComputeNvmeKvPayloadChecksum(manifest_payload),
+        .header_checksum = 0,
+        .identity_metadata_size =
+            static_cast<uint32_t>(root_identity_metadata.size()),
+    };
+    header.header_checksum = ComputeNvmeKvHeaderChecksum(header);
+    plan.root_blob =
+        BuildNvmeKvObjectBlob(header, root_identity_metadata, manifest_payload);
+    return plan;
+}
 
 uint32_t ComputeNvmeKvPayloadChecksum(std::string_view payload) {
     return ComputeNvmeKvChecksum(std::span<const uint8_t>(

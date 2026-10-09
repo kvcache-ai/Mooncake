@@ -2,6 +2,7 @@
 
 #include <sys/uio.h>
 
+#include <chrono>
 #include <span>
 #include <string>
 #include <vector>
@@ -28,6 +29,35 @@ struct ObjectGetRequest {
     void* buffer = nullptr;
     size_t size = 0;
 };
+
+struct ObjectStoragePutRequest {
+    std::string logical_key;
+    std::vector<Slice> slices;
+    bool replace_existing = false;
+};
+
+struct ObjectStorageGetRequest {
+    std::string logical_key;
+    std::vector<Slice> slices;
+    size_t expected_size = 0;
+};
+
+struct ObjectStorageShardContext {
+    uint32_t shard_id = 0;
+    uint64_t size = 0;
+};
+
+struct ObjectStorageQueryContext {
+    std::string logical_key;
+    uint32_t total_shard = 1;
+    uint64_t total_size = 0;
+    std::vector<ObjectStorageShardContext> shards;
+    bool layout_known = true;
+};
+
+using ObjectStorageIoResults = std::vector<tl::expected<void, ErrorCode>>;
+using ObjectStorageQueryResults =
+    std::vector<tl::expected<ObjectStorageQueryContext, ErrorCode>>;
 
 /**
  * @brief Adapts object storage services to the distributed backend's
@@ -85,6 +115,33 @@ class ObjectStorageAdapter {
 
     virtual tl::expected<void, ErrorCode> Delete(
         const std::string& logical_key) = 0;
+
+    // Compatibility implementations preserve behavior for existing object
+    // stores. Batch-native providers override these methods so one Mooncake
+    // batch maps to one provider submission.
+    virtual ObjectStorageIoResults BatchPutV(
+        std::span<const ObjectStoragePutRequest> requests);
+    virtual ObjectStorageIoResults BatchGetInto(
+        std::span<const ObjectStorageGetRequest> requests);
+    virtual ObjectStorageIoResults BatchDelete(
+        std::span<const std::string> logical_keys);
+
+    // Provider query contexts are request-local hints. Mooncake never stores
+    // them in master metadata; clients use them only to issue the matching
+    // direct provider read after the master query completes.
+    virtual bool SupportsProviderQuery() const { return false; }
+    virtual bool SupportsProviderQueryInParallel() const { return false; }
+    virtual ObjectStorageQueryResults BatchQueryProvider(
+        std::span<const std::string> logical_keys);
+    virtual ObjectStorageQueryResults BatchQueryProviderUntil(
+        std::span<const std::string> logical_keys,
+        std::chrono::steady_clock::time_point deadline) {
+        return BatchQueryProvider(logical_keys);
+    }
+    virtual ObjectStorageIoResults BatchGetIntoWithQueryContexts(
+        std::span<const ObjectStorageGetRequest> requests,
+        std::span<const tl::expected<ObjectStorageQueryContext, ErrorCode>>
+            contexts);
 
     // Pagination is an implementation detail. Returns decoded logical keys
     // from the adapter's configured physical namespace.
