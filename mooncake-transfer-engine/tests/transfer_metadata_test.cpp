@@ -29,6 +29,7 @@
 #include <cctype>
 #include <chrono>
 #include <cstdlib>
+#include <functional>
 #include <mutex>
 #include <sstream>
 #include <thread>
@@ -717,6 +718,143 @@ TEST(TransferMetadataVersionTest,
 #endif
 }
 
+#ifdef USE_HTTP
+namespace {
+struct ReservedHandshakePort {
+    int fd = -1;
+    uint16_t port = findAvailableTcpPort(fd);
+    ~ReservedHandshakePort() {
+        if (fd >= 0) close(fd);
+    }
+};
+}  // namespace
+
+class TransferMetadataHandshakeRefreshTest
+    : public ::testing::TestWithParam<bool> {};
+
+TEST_P(TransferMetadataHandshakeRefreshTest,
+       RefreshesOnlyFailedPeerForNextAttempt) {
+    ScopedMetadataRefreshConfig restore(0, true);
+    LocalHttpMetadataServer metadata_server;
+    ASSERT_TRUE(metadata_server.ok());
+    TransferMetadata publisher(metadata_server.uri());
+    TransferMetadata client(metadata_server.uri());
+    ReservedHandshakePort dead_port;
+    ASSERT_GT(dead_port.port, 0);
+
+    TransferMetadata old_server(P2PHANDSHAKE);
+    if (GetParam()) {
+        ASSERT_EQ(old_server.startHandshakeDaemon(
+                      [](const TransferMetadata::HandShakeDesc &,
+                         TransferMetadata::HandShakeDesc &reply) {
+                          reply.reply_msg = "obsolete endpoint";
+                          return ERR_METADATA;
+                      },
+                      dead_port.port, dead_port.fd),
+                  0);
+        dead_port.fd = -1;  // The daemon owns the socket now.
+    }
+
+    const std::string name = "handshake-refresh-peer";
+    TransferMetadata::RpcMetaDesc rpc;
+    rpc.ip_or_host_name = "127.0.0.1";
+    rpc.rpc_port = dead_port.port;
+    ASSERT_EQ(publisher.addRpcMetaEntry(name, rpc), 0);
+    TransferMetadata::RpcMetaDesc cached;
+    ASSERT_EQ(client.getRpcMetaEntry(name, cached), 0);
+    ASSERT_EQ(publisher.addRpcMetaEntry("healthy-peer", rpc), 0);
+    ASSERT_EQ(client.getRpcMetaEntry("healthy-peer", cached), 0);
+    const auto healthy_version = cached.metadata_version;
+
+    ASSERT_EQ(
+        publisher.updateSegmentDesc(name, *makeRdmaSegmentDesc(name, 0x1000)),
+        0);
+    const auto segment_id = client.getSegmentID(name);
+    const auto segment = client.getSegmentDescByID(segment_id);
+    ASSERT_TRUE(segment);
+
+    TransferMetadata server(P2PHANDSHAKE);
+    int server_fd = -1;
+    const auto server_port = findAvailableTcpPort(server_fd);
+    ASSERT_GT(server_port, 0);
+    ASSERT_EQ(server.startHandshakeDaemon(
+                  [](const TransferMetadata::HandShakeDesc &peer,
+                     TransferMetadata::HandShakeDesc &local) {
+                      local.payload = "reply:" + peer.payload;
+                      return 0;
+                  },
+                  server_port, server_fd),
+              0);
+    rpc.rpc_port = server_port;
+    ASSERT_EQ(publisher.addRpcMetaEntry(name, rpc), 0);
+    ASSERT_EQ(publisher.addRpcMetaEntry("healthy-peer", rpc), 0);
+
+    TransferMetadata::HandShakeDesc request, response;
+    request.payload = "retry";
+    // The original attempt still fails; its failure refreshes the address
+    // without sending a second handshake behind the caller's retry policy.
+    EXPECT_NE(client.sendHandshake(name, request, response), 0);
+    ASSERT_EQ(client.getRpcMetaEntry(name, cached), 0);
+    EXPECT_EQ(cached.rpc_port, server_port);
+    ASSERT_EQ(client.sendHandshake(name, request, response), 0);
+    EXPECT_EQ(response.payload, "reply:retry");
+
+    ASSERT_EQ(client.getRpcMetaEntry("healthy-peer", cached), 0);
+    EXPECT_EQ(cached.rpc_port, dead_port.port);
+    EXPECT_EQ(cached.metadata_version, healthy_version);
+    EXPECT_EQ(client.getSegmentID(name), segment_id);
+    EXPECT_EQ(client.getSegmentDescByID(segment_id), segment);
+}
+
+INSTANTIATE_TEST_SUITE_P(SendFailureOrPeerRejection,
+                         TransferMetadataHandshakeRefreshTest,
+                         ::testing::Bool());
+
+class TransferMetadataHandshakeRefreshRetentionTest
+    : public ::testing::TestWithParam<int> {};
+
+TEST_P(TransferMetadataHandshakeRefreshRetentionTest, RetainsCachedRpcVersion) {
+    ScopedMetadataRefreshConfig restore(0, true);
+    LocalHttpMetadataServer metadata_server;
+    ASSERT_TRUE(metadata_server.ok());
+    TransferMetadata publisher(metadata_server.uri());
+    TransferMetadata client(metadata_server.uri());
+    ReservedHandshakePort dead_port;
+    ASSERT_GT(dead_port.port, 0);
+    const std::string name = "handshake-retention-peer";
+    TransferMetadata::RpcMetaDesc rpc;
+    rpc.ip_or_host_name = "127.0.0.1";
+    rpc.rpc_port = dead_port.port;
+    ASSERT_EQ(publisher.addRpcMetaEntry(name, rpc), 0);
+    TransferMetadata::RpcMetaDesc cached;
+    ASSERT_EQ(client.getRpcMetaEntry(name, cached), 0);
+
+    auto plugin = MetadataStoragePlugin::Create(metadata_server.uri());
+    ASSERT_TRUE(plugin);
+    const std::string key = "mooncake/rpc_meta/" + name;
+    if (GetParam() == 0) {
+        ASSERT_TRUE(plugin->remove(key));
+    } else {
+        Json::Value stale;
+        stale["ip_or_host_name"] = "127.0.0.2";
+        stale["rpc_port"] = static_cast<Json::UInt>(dead_port.port);
+        stale["metadata_version"] = static_cast<Json::UInt64>(
+            rpc.metadata_version - (GetParam() == 1 ? 1 : 0));
+        ASSERT_TRUE(plugin->set(key, stale));
+    }
+    TransferMetadata::HandShakeDesc request, response;
+    EXPECT_NE(client.sendHandshake(name, request, response), 0);
+    ASSERT_EQ(client.getRpcMetaEntry(name, cached), 0);
+    EXPECT_EQ(cached.ip_or_host_name, rpc.ip_or_host_name);
+    EXPECT_EQ(cached.rpc_port, rpc.rpc_port);
+    EXPECT_EQ(cached.metadata_version, rpc.metadata_version);
+}
+
+INSTANTIATE_TEST_SUITE_P(LookupFailureOlderOrConflictingVersion,
+                         TransferMetadataHandshakeRefreshRetentionTest,
+                         ::testing::Values(0, 1, 2));
+#endif
+
 TEST(TransferMetadataVersionTest, SyncRejectsConflictingSameVersionMetadata) {
     constexpr uint64_t kInitialAddr = 0x1000;
     constexpr uint64_t kConflictingAddr = 0x2000;
@@ -1090,6 +1228,11 @@ class FakeMetadataStoragePlugin : public MetadataStoragePlugin {
         auto it = store_.find(key);
         if (it == store_.end()) return GetResult::kNotFound;
         value = it->second;
+        // Run after taking the backend snapshot, with no cache lock held.
+        // Tests use this to deterministically interleave a cache mutation.
+        auto callback = std::move(after_get);
+        after_get = {};
+        if (callback) callback();
         return GetResult::kFound;
     }
     bool set(const std::string &key, const Json::Value &value) override {
@@ -1109,6 +1252,8 @@ class FakeMetadataStoragePlugin : public MetadataStoragePlugin {
     // Inject n transient get() failures for key without removing the key,
     // modelling a curl timeout / etcd blip that resolves next sync cycle.
     void failNext(const std::string &key, int n) { forced_failures_[key] = n; }
+
+    std::function<void()> after_get;
 
    private:
     std::map<std::string, Json::Value> store_;
@@ -1177,6 +1322,142 @@ class TransferMetadataStaleSegmentInvalidationTest : public ::testing::Test {
         return client.getSegmentDescByName(name);
     }
 };
+
+TEST_F(TransferMetadataStaleSegmentInvalidationTest,
+       OnlyTransferReadsConsumeRefreshRequests) {
+    ScopedMetadataRefreshConfig restore(0, true);
+    auto plugin = std::make_shared<FakeMetadataStoragePlugin>();
+    TestableTransferMetadata client(plugin);
+    const auto cached = seedRemoteSegment(client, "failed");
+    ASSERT_TRUE(cached);
+    const auto id = client.getSegmentID("failed");
+    const auto healthy = seedRemoteSegment(client, "healthy");
+    ASSERT_TRUE(healthy);
+    client.requestSegmentRefresh(id);
+    plugin->failNext("mooncake/ram/failed", 2);
+    // Rail selection must remain a cache read even during an outage.
+    EXPECT_EQ(client.getSegmentDescByID(id), cached);
+    EXPECT_EQ(client.getSegmentDescByName("failed"), cached);
+    EXPECT_EQ(client.getSegmentDescForTransfer(id), nullptr);
+    EXPECT_EQ(client.getSegmentDescForTransfer(id), nullptr);
+    EXPECT_EQ(client.getSegmentID("failed"), id);
+    EXPECT_EQ(client.getSegmentDescForTransfer(client.getSegmentID("healthy")),
+              healthy);
+
+    auto updated = makeRdmaSegmentDesc("failed", 0x2000);
+    updated->buffers[0].rkey = {42};
+    ASSERT_EQ(client.updateSegmentDesc("failed", *updated), 0);
+    auto refreshed = client.getSegmentDescForTransfer(id);
+    ASSERT_TRUE(refreshed);
+    EXPECT_EQ(refreshed->buffers[0].rkey[0], 42u);
+    plugin->failNext("mooncake/ram/failed", 1);
+    EXPECT_EQ(client.getSegmentDescForTransfer(id), refreshed);
+}
+
+TEST_F(TransferMetadataStaleSegmentInvalidationTest,
+       SameNameReplacementRecoversAfterFailedExplicitRefresh) {
+    ScopedMetadataRefreshConfig restore(0, true);
+    auto plugin = std::make_shared<FakeMetadataStoragePlugin>();
+    TestableTransferMetadata client(plugin);
+    {
+        TestableTransferMetadata old_node(plugin);
+        ASSERT_EQ(old_node.updateSegmentDesc(
+                      "peer", *makeRdmaSegmentDesc("peer", 0x1000)),
+                  0);
+    }
+    const auto id = client.getSegmentID("peer");
+    auto cached = client.getSegmentDescByID(id);
+    ASSERT_TRUE(cached);
+    EXPECT_EQ(cached->buffers[0].addr, 0x1000u);
+    plugin->failNext("mooncake/ram/peer", 1);
+    EXPECT_EQ(client.getSegmentDescForTransfer(id, true), nullptr);
+    TestableTransferMetadata replacement(plugin);
+    ASSERT_EQ(replacement.updateSegmentDesc(
+                  "peer", *makeRdmaSegmentDesc("peer", 0x2000)),
+              0);
+    auto refreshed = client.getSegmentDescForTransfer(id);
+    ASSERT_TRUE(refreshed);
+    EXPECT_EQ(refreshed->buffers[0].addr, 0x2000u);
+    EXPECT_GT(refreshed->metadata_version, cached->metadata_version);
+    EXPECT_EQ(client.getSegmentID("peer"), id);
+    EXPECT_EQ(client.getSegmentDescByName("peer"), refreshed);
+}
+
+TEST_F(TransferMetadataStaleSegmentInvalidationTest,
+       RefreshDoesNotConsumeFailureReportedDuringFetch) {
+    ScopedMetadataRefreshConfig restore(0, true);
+    auto plugin = std::make_shared<FakeMetadataStoragePlugin>();
+    TestableTransferMetadata client(plugin);
+    ASSERT_TRUE(seedRemoteSegment(client, "peer"));
+    const auto id = client.getSegmentID("peer");
+    client.requestSegmentRefresh(id);
+    plugin->after_get = [&] {
+        client.requestSegmentRefresh(id);
+        ASSERT_EQ(client.updateSegmentDesc(
+                      "peer", *makeRdmaSegmentDesc("peer", 0x2000)),
+                  0);
+    };
+    auto snapshot = client.getSegmentDescForTransfer(id);
+    ASSERT_TRUE(snapshot);
+    EXPECT_EQ(snapshot->buffers[0].addr, 0x1000u);
+    auto refreshed = client.getSegmentDescForTransfer(id);
+    ASSERT_TRUE(refreshed);
+    EXPECT_EQ(refreshed->buffers[0].addr, 0x2000u);
+}
+
+TEST_F(TransferMetadataStaleSegmentInvalidationTest,
+       TransferRefreshPreservesVersionChecks) {
+    ScopedMetadataRefreshConfig restore(0, true);
+    auto plugin = std::make_shared<FakeMetadataStoragePlugin>();
+    TestableTransferMetadata client(plugin);
+    const auto cached = seedRemoteSegment(client, "peer");
+    ASSERT_TRUE(cached);
+    const auto id = client.getSegmentID("peer");
+    ASSERT_GT(cached->metadata_version, 0u);
+    ASSERT_EQ(
+        client.updateSegmentDesc("peer", *makeRdmaSegmentDesc("peer", 0x2000)),
+        0);
+    Json::Value conflicting;
+    ASSERT_TRUE(plugin->get("mooncake/ram/peer", conflicting));
+    for (auto version :
+         {cached->metadata_version - 1, cached->metadata_version}) {
+        conflicting["metadata_version"] = static_cast<Json::UInt64>(version);
+        ASSERT_TRUE(plugin->set("mooncake/ram/peer", conflicting));
+        client.requestSegmentRefresh(id);
+        EXPECT_EQ(client.getSegmentDescForTransfer(id), cached);
+    }
+    ASSERT_EQ(
+        client.updateSegmentDesc("peer", *makeRdmaSegmentDesc("peer", 0x2000)),
+        0);
+    client.requestSegmentRefresh(id);
+    auto refreshed = client.getSegmentDescForTransfer(id);
+    ASSERT_TRUE(refreshed);
+    EXPECT_EQ(refreshed->buffers[0].addr, 0x2000u);
+}
+
+TEST_F(TransferMetadataStaleSegmentInvalidationTest,
+       OutstandingFetchCannotResurrectIdRemovedBySync) {
+    ScopedMetadataRefreshConfig restore(0, true);
+    auto plugin = std::make_shared<FakeMetadataStoragePlugin>();
+    TestableTransferMetadata client(plugin);
+    ASSERT_TRUE(seedRemoteSegment(client, "peer"));
+    const auto id = client.getSegmentID("peer");
+    client.requestSegmentRefresh(id);
+    plugin->after_get = [&] {
+        plugin->drop("mooncake/ram/peer");
+        ASSERT_EQ(client.syncSegmentCache("peer"), 0);
+        ASSERT_EQ(client.syncSegmentCache("peer"), 0);
+        ASSERT_EQ(client.updateSegmentDesc(
+                      "peer", *makeRdmaSegmentDesc("peer", 0x2000)),
+                  0);
+        EXPECT_NE(client.getSegmentID("peer"), id);
+    };
+    EXPECT_EQ(client.getSegmentDescForTransfer(id), nullptr);
+    EXPECT_EQ(client.getSegmentDescByID(id), nullptr);
+    auto reopened = client.getSegmentDescByName("peer");
+    ASSERT_TRUE(reopened);
+    EXPECT_EQ(reopened->buffers[0].addr, 0x2000u);
+}
 
 // Red on master / green on branch: a cached remote segment whose backend key
 // is removed (peer unmount) is invalidated only after the consecutive-failure
