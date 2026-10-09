@@ -171,13 +171,30 @@ def default_result_dir():
     return os.path.join(DEFAULT_RESULT_ROOT, stamp)
 
 
+def check_iteration_counts(warmup, timed):
+    """The counts a run may take, checked before any GPU memory is taken.
+
+    A run with no timed iteration has no sample to summarise, and a negative count
+    is not a sample either, so both fail here rather than inside the measurement.
+    """
+    if timed <= 0:
+        raise ValueError(f"--kernel-timed must be at least 1, got {timed}")
+    if warmup < 0:
+        raise ValueError(f"--kernel-warmup cannot be negative, got {warmup}")
+    return warmup, timed
+
+
 def detect_tp_size(explicit):
     """Resolve the tensor parallel size, defaulting to the visible GPU count.
 
     Hardcoding a count makes a machine with fewer GPUs fail deep inside the first
-    step, which puts the error a long way from its cause.
+    step, which puts the error a long way from its cause. An explicit size is taken
+    as given: `0` is a size the user asked for and not an omission, so it is
+    refused here instead of being replaced by the visible count.
     """
-    if explicit:
+    if explicit is not None:
+        if explicit < 1:
+            raise ValueError(f"--tp-size must be at least 1, got {explicit}")
         return explicit
     count = manifest_module.visible_gpu_count()
     if count < 1:
@@ -228,6 +245,14 @@ def main(argv=None):
     if not args.dry_run and not args.model:
         parser.error("a real run needs --model; --dry-run accepts a placeholder")
 
+    # Both are checked before anything takes GPU memory, and both apply to a
+    # dry-run as well: it prints the run that would happen.
+    check_iteration_counts(args.kernel_warmup, args.kernel_timed)
+    # The extend branch is resolved here and not only on the measuring path, so a
+    # dry-run states the branch the run would replay, including the case where
+    # SGLANG_FLASHINFER_USE_PAGED disagrees with --extend-branch.
+    extend_branch = resolve_extend_branch(args.extend_branch)
+
     if not args.dry_run:
         args.tp_size = detect_tp_size(args.tp_size)
 
@@ -236,6 +261,10 @@ def main(argv=None):
 
     if args.dry_run:
         print(plan.describe())
+        print(
+            f"extend steps would replay {extend_branch}; "
+            f"SGLANG_FLASHINFER_USE_PAGED={use_paged_default()} in this process"
+        )
         print()
         print(
             "The above is dry-run output; nothing was started and no GPU memory taken."
@@ -280,7 +309,6 @@ def main(argv=None):
     if args.kernel_timed < MINIMUM_TIMED:
         errors.append(f"timed iterations below {MINIMUM_TIMED}")
 
-    extend_branch = resolve_extend_branch(args.extend_branch)
     print(
         f"[setup] extend steps replay {extend_branch}; "
         f"SGLANG_FLASHINFER_USE_PAGED={use_paged_default()} in this process"

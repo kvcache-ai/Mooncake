@@ -41,6 +41,12 @@ MLA_FIELDS = ("kv_lora_rank", "qk_rope_head_dim")
 # sliding-window layers keep a window, linear-attention layers are not attention
 # at all, and an encoder-decoder model reads a second cache for cross attention.
 # A model with any of them does not fit one per-token byte count.
+#
+# The last three are the same statement in another spelling: a model that names
+# which layers attend fully (full_attn_idxs), which blocks are attention at all
+# (layers_block_type), or how far a layer's attention reaches
+# (attention_chunk_size) is not one whose layers all keep a full-length KV, even
+# when none of the fields above are present.
 HYBRID_FIELDS = (
     "attention_types",
     "sliding_window_pattern",
@@ -48,6 +54,9 @@ HYBRID_FIELDS = (
     "linear_attention_config",
     "mamba_d_state",
     "hybrid_override_pattern",
+    "full_attn_idxs",
+    "layers_block_type",
+    "attention_chunk_size",
 )
 
 # layer_types entries that mean "this layer keeps a full-length KV"

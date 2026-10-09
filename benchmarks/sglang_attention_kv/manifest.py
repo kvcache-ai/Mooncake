@@ -78,7 +78,6 @@ def probe_torch():
         "cuda_runtime": None,
         "device_count": None,
         "device_names": [],
-        "attention_backends": [],
     }
     try:
         import torch

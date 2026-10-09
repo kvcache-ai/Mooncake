@@ -164,3 +164,35 @@ def test_dtype_spellings_are_normalised():
     assert canonical_torch_dtype("FP16") == "float16"
     with pytest.raises(ValueError, match="unrecognised dtype"):
         canonical_torch_dtype("int4")
+
+
+def test_a_model_that_lists_only_some_full_attention_layers_is_refused():
+    """full_attn_idxs names the layers that attend fully, so the others are not
+    attention or do not keep a full-length KV. LFM2 is written this way."""
+    layout, evidence = classify_attention_layout({"full_attn_idxs": [0, 7, 15]})
+    assert layout == "hybrid"
+    assert "full_attn_idxs" in evidence
+
+
+def test_a_model_whose_blocks_are_not_all_attention_is_refused():
+    """layers_block_type mixes attention blocks with mamba or linear ones;
+    NemotronH is written this way."""
+    layout, evidence = classify_attention_layout(
+        {"layers_block_type": ["mamba", "attention", "mamba"]}
+    )
+    assert layout == "hybrid"
+    assert "layers_block_type" in evidence
+
+
+def test_a_model_with_a_chunked_attention_window_is_refused():
+    """attention_chunk_size bounds how far a layer's attention reaches, which is a
+    window rather than the full context. Llama 4 carries it."""
+    layout, evidence = classify_attention_layout({"attention_chunk_size": 8192})
+    assert layout == "hybrid"
+    assert "attention_chunk_size" in evidence
+
+
+def test_a_dense_config_is_still_accepted():
+    layout, evidence = classify_attention_layout(dict(DENSE_BODY))
+    assert layout == "dense"
+    assert evidence

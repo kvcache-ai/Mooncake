@@ -422,18 +422,39 @@ def build_shapes(
     return shapes
 
 
+def _shrink(lengths, cap):
+    """Scale every length of one axis by the same factor, so the shape the
+    reference runs keeps the batch's ratios.
+
+    Clamping each length on its own would flatten a ragged batch — 8192, 4096,
+    2048 and 1024 to 256 each — and the reference would then check a shape the
+    step does not have. The factor is the smallest integer that brings the longest
+    length inside the cap, so 8192, 4096, 2048 and 1024 become 256, 128, 64 and 32
+    at a cap of 256.
+    """
+    longest = max(lengths)
+    if longest <= cap:
+        return tuple(lengths)
+    factor = -(-longest // cap)
+    return tuple(max(1, length // factor) for length in lengths)
+
+
 def short_case(case, context_cap=256, chunk_cap=64) -> KernelCase:
     """The same step on short sequences, for the arithmetic reference: the check
     materialises a query by context score matrix, which a long context cannot fit,
-    while the mapping and content checks stay on the full shape."""
+    while the mapping and content checks stay on the full shape.
+
+    Each axis is scaled by one factor, so the short step has the batch's lengths in
+    the batch's proportions and its offsets are the scaled ones.
+    """
     if case.mode == "prefill":
         prefix_lens = (0,) * case.batch_size
-        new_lens = tuple(min(length, context_cap) for length in case.new_lens)
+        new_lens = _shrink(case.new_lens, context_cap)
     elif case.mode == "extend":
-        prefix_lens = tuple(min(length, context_cap) for length in case.prefix_lens)
-        new_lens = tuple(min(length, chunk_cap) for length in case.new_lens)
+        prefix_lens = _shrink(case.prefix_lens, context_cap)
+        new_lens = _shrink(case.new_lens, chunk_cap)
     else:
-        prefix_lens = tuple(min(length, context_cap) for length in case.prefix_lens)
+        prefix_lens = _shrink(case.prefix_lens, context_cap)
         new_lens = (1,) * case.batch_size
     return KernelCase(
         mode=case.mode,

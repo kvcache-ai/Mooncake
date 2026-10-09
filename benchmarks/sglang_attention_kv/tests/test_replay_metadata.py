@@ -419,6 +419,39 @@ def test_the_checks_read_the_state_the_timed_loop_left(monkeypatch):
     assert history["mismatched_v_elements"] > 0
 
 
+def test_the_page_size_selects_the_allocator_a_server_builds():
+    """SGLang takes the token allocator at page size 1 and the paged one above it,
+    and the two allocate a step's slots through different entry points: the token
+    allocator raises on alloc_extend and alloc_decode. A step has to use the
+    allocator its pool's page size selects."""
+    token_step, _ = prepared(step_case("extend", (512,), (128,), page_size=1))
+    assert token_step.allocator_kind == "token"
+    assert token_step.as_dict()["slot_allocator"] == "token"
+    assert token_step.step_slots.numel() == 128
+
+    paged_step, _ = prepared(step_case("extend", (512,), (128,), page_size=64))
+    assert paged_step.allocator_kind == "paged"
+    assert paged_step.step_slots.numel() == 128
+
+
+def test_the_index_metadata_is_held_rather_than_allocated_per_step():
+    """The backend holds its index buffers and fills them in place, so the index
+    window is the fill and not the allocation. Two builds hand back the same
+    buffers, with the stream refilled."""
+    step, _ = prepared(step_case("extend", (512,), (128,)))
+    first = step.build_indices()
+    torch.cuda.synchronize()
+    before = first.paged_indices.clone()
+    second = step.build_indices()
+    assert second.qo_indptr.data_ptr() == first.qo_indptr.data_ptr()
+    assert second.paged_indptr.data_ptr() == first.paged_indptr.data_ptr()
+    assert second.paged_indices.data_ptr() == first.paged_indices.data_ptr()
+    assert second.paged_last_page_len.data_ptr() == first.paged_last_page_len.data_ptr()
+    torch.cuda.synchronize()
+    assert torch.equal(second.paged_indices, before)
+    assert step.check_indices(second)["passed"]
+
+
 def test_the_component_passes_run_against_a_plan_of_their_own_indices(monkeypatch):
     """The components read the indices they built, so they have to run against a
     plan of those and not the metadata the last timed iteration left behind. The

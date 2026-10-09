@@ -20,6 +20,11 @@ The step itself is three windows, in the order a forward pass runs them:
 | `phase_sum` | the three windows added up | — |
 | `step_window` | one window over the whole step, from the first index call to the last layer | — |
 
+The index metadata is held rather than allocated per step: `qo_indptr`, `paged_kv_indptr`,
+`paged_kv_indices` and `paged_kv_last_page_len` are sized once from the case, the way the backend holds
+its own buffers and fills them in place, so the `indices` window covers the fill by SGLang's kernel and
+not an allocation this benchmark makes on every iteration.
+
 `step_window` is the step as one span and `phase_sum` is the sum of its parts. A reader comparing them
 sees the between-window interval: what the three windows do not cover. The measurement does not say
 what that interval contains. The derived ratios divide `phase_sum` and are named `*_ratio_of_phase_sum`
@@ -79,13 +84,20 @@ and save the cache afterwards, the paged branches write first. This benchmark ti
 
 The page size and the layout are properties of the pool, not of the kernel call: SGLang hands
 FlashInfer a token-level CSR stream and plans the wrappers with `page_size=1` and a last-page length of
-1, whatever the pool's page size is. What the page size changes is the allocator's granularity, and
-what the layout changes is which physical slots a sequence's tokens occupy:
+1, whatever the pool's page size is. What the page size changes is the allocator, and what the layout
+changes is which physical slots a sequence's tokens occupy:
 
+- the allocator: SGLang builds `TokenToKVPoolAllocator` when the pool's page size is 1 and
+  `PagedTokenToKVPoolAllocator` above it, and the two allocate a step's slots through different entry
+  points. The token allocator takes `alloc` for the step's tokens, which is what
+  `mem_cache/allocation.py` does at that page size, and raises on `alloc_extend` and `alloc_decode`,
+  which are the paged allocator's step entry points. A step uses the allocator its page size selects,
+  and its record states which one that was in `slot_allocator`;
 - `contiguous`: the sequence's pages come from a pool that has not churned, so its slots are ascending;
 - `random`: the step's pages are a random subset of the pool drawn from the case's seed, in a random
   order, which is a pool that has churned. The draw happens once, so every timed iteration of a step
-  sees the same mapping.
+  sees the same mapping. The draw hands the pool's spare pages back through the allocator, which both
+  allocators serve with `free_page_ids`.
 
 ## 3. Model and KV byte conversion
 
@@ -108,7 +120,12 @@ Under tensor parallelism sharding, two figures are recorded at the same time:
 
 Both head counts have to divide evenly by `tp_size`; checking only the KV heads lets the integer
 division of query heads silently drop heads, and the measurement then describes a shape that does not
-exist.
+exist. A run also needs a whole number of query heads per KV head on each rank.
+
+Two shardings are therefore out of scope for this benchmark rather than unsupported by SGLang: KV head
+replication, which SGLang uses with a `tp_size` above the model's KV head count, and a sharding whose
+head counts do not divide. Both describe a per-token KV that is not `total / tp_size`, so a run states
+the sharding it measured and a reader compares results across shardings through the manifest.
 
 **A model whose layers do not all keep a full-length KV is refused.** The loader classifies the
 attention layout from the config and prints the field it decided on:
@@ -267,8 +284,10 @@ manifest of a run states every one of them.
   trace. A real workload's mix is what a reader has to map onto these steps.
 - The K/V values are random. The bytes moved and the arithmetic done are the shapes' own, and the
   checks compare content exactly, but nothing here depends on the data's distribution.
-- The page size changes the allocator's granularity and the pool's addresses. It does not change the
-  index tensors or the plan, because SGLang hands FlashInfer a token-level stream at every page size.
+- The page size selects the allocator SGLang builds — the token allocator at page size 1 and the paged
+  one above it — and the pool's addresses follow from the slots that allocator hands out. It does not
+  change the index tensors or the plan, because SGLang hands FlashInfer a token-level stream at every
+  page size.
 - The extension to a second GPU rank, or to a second model, changes the per-rank head counts and the
   per-token bytes; the manifest records both, and results from different shardings are only comparable
   through them.
@@ -283,3 +302,6 @@ version in [`RESULTS.md`](RESULTS.md); they are not what SGLang picks for every 
 | `wrapper_page_size` | `1`, and every last-page length is 1 | the same on every model: SGLang hands FlashInfer a token-level CSR stream, and the pool's page size is a separate figure that reaches the kernels only through the addresses in it |
 | `decode_use_tensor_cores` | `true` | `FlashInferAttnBackend` decides this per model through `should_use_tensor_core`: a bf16 or fp16 cache at a group size of 4 or more query heads per KV head takes the tensor-core path, which this model reaches at the sharding in `RESULTS.md`. A model below that threshold builds the wrapper without it, and `SGLANG_FLASHINFER_USE_TENSOR_CORE` overrides the choice either way |
 | `kv_write_stream` | `step`: the pool is built with `enable_alt_stream=False` | in SGLang 0.5.20 that stream is used only inside CUDA graph capture: `_set_kv_buffer_impl` branches on `get_is_capture_mode()` and otherwise writes through the fused `store_cache` kernel on the current stream. This replay captures no graph, so the flag records how the pool was built rather than a different write path |
+
+The allocator is not one of those four: it follows the pool's page size the way SGLang's own
+`kv_cache_configurator` selects it, and the record states which one a step used in `slot_allocator`.

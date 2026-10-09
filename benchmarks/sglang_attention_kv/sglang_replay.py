@@ -31,7 +31,10 @@ import torch
 from flashinfer.cascade import merge_state
 
 from sglang.kernels.ops.kvcache.kv_indices import create_flashinfer_kv_indices_triton
-from sglang.srt.mem_cache.allocator import PagedTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator import (
+    PagedTokenToKVPoolAllocator,
+    TokenToKVPoolAllocator,
+)
 from sglang.srt.mem_cache.memory_pool import (
     KVWriteLoc,
     MHATokenToKVPool,
@@ -179,14 +182,29 @@ class SglangStep:
             enable_memory_saver=False,
             enable_alt_stream=KV_WRITE_ALT_STREAM,
         )
-        self.allocator = PagedTokenToKVPoolAllocator(
-            size=pool_size,
-            page_size=case.page_size,
-            dtype=self.dtype,
-            device=self.device,
-            kvcache=self.kv_pool,
-            need_sort=False,
-        )
+        # The allocator a server builds for this pool. SGLang takes the token
+        # allocator when the page size is 1 and the paged one above it, and the two
+        # allocate a step's slots through different entry points, so a step uses the
+        # one its page size selects rather than one of them for every pool.
+        if case.page_size == 1:
+            self.allocator = TokenToKVPoolAllocator(
+                size=pool_size,
+                dtype=self.dtype,
+                device=self.device,
+                kvcache=self.kv_pool,
+                need_sort=False,
+            )
+            self.allocator_kind = "token"
+        else:
+            self.allocator = PagedTokenToKVPoolAllocator(
+                size=pool_size,
+                page_size=case.page_size,
+                dtype=self.dtype,
+                device=self.device,
+                kvcache=self.kv_pool,
+                need_sort=False,
+            )
+            self.allocator_kind = "paged"
         key_buffer, _ = self.kv_pool.get_kv_buffer(0)
         self.kv_cache_bytes_per_rank = (
             key_buffer.numel() * key_buffer.element_size() * 2 * case.num_layers
@@ -195,6 +213,7 @@ class SglangStep:
         self._shape_the_free_pages()
         self._allocate_slots()
         self._allocate_step_slots()
+        self._prepare_index_buffers()
         self.new_kv = self.make_new_kv()
         self._fill_prefix()
         self._build_wrappers()
@@ -256,28 +275,39 @@ class SglangStep:
         return torch.tensor(slots, dtype=torch.int64, device=self.device)
 
     def _allocate_step_slots(self):
-        """The slots this step writes, through the allocator's own step entry
-        points: alloc_extend for a step that computes a chunk, alloc_decode for a
-        single token."""
+        """The slots this step writes, allocated the way the scheduler allocates
+        them for this pool.
+
+        With a page above 1 that is the paged allocator's step entry points:
+        alloc_extend for a step that computes a chunk, alloc_decode for a single
+        token. At page size 1 the server builds the token allocator, which raises
+        on both of those, and `mem_cache/allocation.py` takes `alloc` for the whole
+        step's tokens instead.
+        """
         case = self.case
-        last_loc = self._last_prefix_slot()
-        if case.mode == "decode":
-            slots = self.allocator.alloc_decode(
-                seq_lens=self.context_lens,
-                seq_lens_cpu=self.context_lens.cpu(),
-                last_loc=last_loc,
-            )
+        if case.page_size == 1:
+            slots = self.allocator.alloc(case.new_tokens)
+            message = "the allocator ran out of slots for this step"
         else:
-            slots = self.allocator.alloc_extend(
-                prefix_lens=self.prefix_lens,
-                prefix_lens_cpu=self.prefix_lens.cpu(),
-                seq_lens=self.context_lens,
-                seq_lens_cpu=self.context_lens.cpu(),
-                last_loc=last_loc,
-                extend_num_tokens=case.new_tokens,
-            )
+            last_loc = self._last_prefix_slot()
+            if case.mode == "decode":
+                slots = self.allocator.alloc_decode(
+                    seq_lens=self.context_lens,
+                    seq_lens_cpu=self.context_lens.cpu(),
+                    last_loc=last_loc,
+                )
+            else:
+                slots = self.allocator.alloc_extend(
+                    prefix_lens=self.prefix_lens,
+                    prefix_lens_cpu=self.prefix_lens.cpu(),
+                    seq_lens=self.context_lens,
+                    seq_lens_cpu=self.context_lens.cpu(),
+                    last_loc=last_loc,
+                    extend_num_tokens=case.new_tokens,
+                )
+            message = "the allocator ran out of pages for this step"
         if slots is None:
-            raise RuntimeError("the allocator ran out of pages for this step")
+            raise RuntimeError(message)
         self.step_slots = slots[: case.new_tokens].to(torch.int64)
 
         # The token table the scheduler keeps up to date
@@ -387,48 +417,67 @@ class SglangStep:
     def _history_tokens(self):
         return sum(self._history_lens())
 
+    def _prepare_index_buffers(self):
+        """The index metadata, allocated once per case the way the backend allocates
+        it: `FlashInferAttnBackend` holds its `qo_indptr`, `paged_kv_indptr`,
+        `paged_kv_indices` and `paged_kv_last_page_len` buffers and fills them in
+        place every step, so a step's index stage is the fill and not the
+        allocation. Every length here comes from the case, so the buffers are sized
+        once, and nothing in them changes between the step's iterations.
+        """
+        case = self.case
+        self.qo_indptr = torch.zeros(
+            case.batch_size + 1, dtype=torch.int32, device=self.device
+        )
+        self.qo_indptr[1:] = torch.cumsum(
+            torch.tensor(case.new_lens, dtype=torch.int32, device=self.device), dim=0
+        ).to(torch.int32)
+        if self.branch == BRANCH_RAGGED_NO_PREFIX:
+            self.history_lens = None
+            self.paged_indptr = None
+            self.paged_indices = None
+            self.paged_last_page_len = None
+            return
+        self.history_lens = torch.tensor(
+            list(self._history_lens()), dtype=torch.int32, device=self.device
+        )
+        self.paged_indptr = torch.zeros(
+            case.batch_size + 1, dtype=torch.int32, device=self.device
+        )
+        self.paged_indptr[1:] = torch.cumsum(self.history_lens, dim=0).to(torch.int32)
+        self.paged_indices = torch.empty(
+            self._history_tokens(), dtype=torch.int32, device=self.device
+        )
+        self.paged_last_page_len = torch.ones(
+            case.batch_size, dtype=torch.int32, device=self.device
+        )
+
     def build_indices(self):
         """SGLang's index stage: the query offsets and the CSR stream of the
         tokens the paged side reads.
 
-        Every length is known before the step runs, so the buffers are allocated
-        from the case and the stream is filled by SGLang's kernel with no host
-        synchronisation inside the timed window.
+        Every length is known before the step runs, so the buffers are held from
+        the case and the stream is filled in place by SGLang's kernel with no host
+        synchronisation inside the timed window. What the window covers is that
+        fill, which is what a server's index stage does on a warmed step.
         """
         case = self.case
-        qo_indptr = torch.zeros(
-            case.batch_size + 1, dtype=torch.int32, device=self.device
-        )
-        qo_indptr[1:] = torch.cumsum(self.new_lens, dim=0).to(torch.int32)
-
-        indices = StepIndices(qo_indptr=qo_indptr, out_cache_loc=self.step_slots)
+        indices = StepIndices(qo_indptr=self.qo_indptr, out_cache_loc=self.step_slots)
         if self.branch == BRANCH_RAGGED_NO_PREFIX:
             return indices
 
-        history_lens = torch.tensor(
-            list(self._history_lens()), dtype=torch.int32, device=self.device
-        )
-        paged_indptr = torch.zeros(
-            case.batch_size + 1, dtype=torch.int32, device=self.device
-        )
-        paged_indptr[1:] = torch.cumsum(history_lens, dim=0).to(torch.int32)
-        paged_indices = torch.empty(
-            self._history_tokens(), dtype=torch.int32, device=self.device
-        )
         create_flashinfer_kv_indices_triton[(case.batch_size,)](
             self.token_pool.req_to_token,
             self.req_pool_indices,
-            history_lens,
-            paged_indptr,
+            self.history_lens,
+            self.paged_indptr,
             None,
-            paged_indices,
+            self.paged_indices,
             self.token_pool.req_to_token.stride(0),
         )
-        indices.paged_indptr = paged_indptr
-        indices.paged_indices = paged_indices
-        indices.paged_last_page_len = torch.ones(
-            case.batch_size, dtype=torch.int32, device=self.device
-        )
+        indices.paged_indptr = self.paged_indptr
+        indices.paged_indices = self.paged_indices
+        indices.paged_last_page_len = self.paged_last_page_len
         return indices
 
     def write_layer(self, layer_id, indices):
@@ -643,20 +692,11 @@ class SglangStep:
             "passed": bool(mismatched_k == 0 and mismatched_v == 0),
         }
 
-    def check_attention(self, query):
-        """The kernel output against a plain tensor reference over the same
-        content, in float32.
-
-        The reference is causal for every branch: a step's queries must not see
-        the tokens after them, and in the merge branch the full causal attention
-        over history and queries is what its two kernels and merge_state have to
-        add up to. A reference without the mask would pass a kernel that sees the
-        future, so the mask is not optional here.
-        """
+    def _reference_scores(self, query, causal):
+        """The float32 reference attention over the step's own content, with the
+        mask on or off. One builder for both, so the two references differ in the
+        mask and nowhere else."""
         case = self.case
-        produced = self.run_layer(0, query)
-        torch.cuda.synchronize()
-
         scale = 1.0 / (case.head_dim**0.5)
         repeat = case.group_ratio()
         outputs = []
@@ -671,54 +711,50 @@ class SglangStep:
             q_seq = query[q_offset : q_offset + new_len].transpose(0, 1).float()
             q_offset += new_len
             scores = torch.matmul(q_seq, k_seq.transpose(-1, -2)) * scale
-            mask = torch.ones(
-                (new_len, prefix_len + new_len),
-                dtype=torch.bool,
-                device=query.device,
-            ).tril(diagonal=prefix_len)
-            scores = scores.masked_fill(~mask, float("-inf"))
+            if causal:
+                mask = torch.ones(
+                    (new_len, prefix_len + new_len),
+                    dtype=torch.bool,
+                    device=query.device,
+                ).tril(diagonal=prefix_len)
+                scores = scores.masked_fill(~mask, float("-inf"))
             weights = torch.softmax(scores, dim=-1)
             outputs.append(torch.matmul(weights, v_seq).transpose(0, 1))
-        reference = torch.cat(outputs)
-        difference = (produced.float() - reference).abs()
-        largest = reference.abs().max().item()
-        return {
-            "max_abs_diff": difference.max().item(),
-            "reference_abs_max": largest,
-            "max_rel_diff": difference.max().item() / max(largest, 1e-6),
-            "mask": "causal",
-            "passed": bool(difference.max().item() / max(largest, 1e-6) < 1e-2),
-        }
+        return torch.cat(outputs)
 
-    def unmasked_reference(self, query):
-        """The same comparison with the mask left out, so a test can show that the
-        causal check above is sensitive to a kernel that sees the future."""
-        case = self.case
+    def _compare_against_reference(self, query, causal, mask_name):
         produced = self.run_layer(0, query)
         torch.cuda.synchronize()
-
-        scale = 1.0 / (case.head_dim**0.5)
-        repeat = case.group_ratio()
-        outputs = []
-        q_offset = 0
-        for index, new_len in enumerate(case.new_lens):
-            key_source, value_source = self._expected_kv(0, index)
-            k_seq = key_source.float().transpose(0, 1).repeat_interleave(repeat, dim=0)
-            v_seq = (
-                value_source.float().transpose(0, 1).repeat_interleave(repeat, dim=0)
-            )
-            q_seq = query[q_offset : q_offset + new_len].transpose(0, 1).float()
-            q_offset += new_len
-            scores = torch.matmul(q_seq, k_seq.transpose(-1, -2)) * scale
-            weights = torch.softmax(scores, dim=-1)
-            outputs.append(torch.matmul(weights, v_seq).transpose(0, 1))
-        reference = torch.cat(outputs)
+        reference = self._reference_scores(query, causal)
         difference = (produced.float() - reference).abs()
         largest = reference.abs().max().item()
-        return {
-            "max_rel_diff": difference.max().item() / max(largest, 1e-6),
-            "passed": bool(difference.max().item() / max(largest, 1e-6) < 1e-2),
+        relative = difference.max().item() / max(largest, 1e-6)
+        result = {
+            "max_abs_diff": difference.max().item(),
+            "reference_abs_max": largest,
+            "max_rel_diff": relative,
+            "passed": bool(relative < 1e-2),
         }
+        if mask_name is not None:
+            result["mask"] = mask_name
+        return result
+
+    def check_attention(self, query):
+        """The kernel output against a plain tensor reference over the same
+        content, in float32.
+
+        The reference is causal for every branch: a step's queries must not see
+        the tokens after them, and in the merge branch the full causal attention
+        over history and queries is what its two kernels and merge_state have to
+        add up to. A reference without the mask would pass a kernel that sees the
+        future, so the mask is not optional here; `unmasked_reference` is the same
+        comparison with the mask left out, for a test to show that this one is
+        sensitive to it.
+        """
+        return self._compare_against_reference(query, causal=True, mask_name="causal")
+
+    def unmasked_reference(self, query):
+        return self._compare_against_reference(query, causal=False, mask_name=None)
 
     def as_dict(self):
         """What a record states about this step's configuration."""
@@ -731,5 +767,6 @@ class SglangStep:
             "decode_use_tensor_cores": DECODE_USE_TENSOR_CORES,
             "kv_layout": "NHD",
             "kv_write_stream": "alternate" if KV_WRITE_ALT_STREAM else "step",
+            "slot_allocator": self.allocator_kind,
             "flashinfer_use_paged_env": use_paged_default(),
         }

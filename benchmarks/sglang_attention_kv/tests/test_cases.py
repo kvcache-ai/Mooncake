@@ -285,3 +285,37 @@ def test_the_extend_branch_has_one_source(monkeypatch):
     with pytest.raises(ValueError, match="unknown extend branch"):
         monkeypatch.delenv("SGLANG_FLASHINFER_USE_PAGED", raising=False)
         resolve_extend_branch("paged_whatever")
+
+
+def test_the_reference_case_scales_every_length_by_one_factor():
+    """The arithmetic reference runs on short sequences, and it has to run on the
+    batch's shape: clamping each length on its own would turn 8192, 4096, 2048 and
+    1024 into 256 each and check a shape the step does not have."""
+    ragged = case(
+        mode="prefill",
+        prefix_lens=(0, 0, 0, 0),
+        new_lens=(8192, 4096, 2048, 1024),
+    )
+    short = short_case(ragged)
+    assert short.new_lens == (256, 128, 64, 32)
+    # The batch's own ratio is preserved: 8192 is eight times 1024, and 256 is
+    # eight times 32.
+    assert ragged.new_lens[0] // ragged.new_lens[-1] == 8
+    assert short.new_lens[0] // short.new_lens[-1] == 8
+
+    # A batch whose lengths already fit is left alone.
+    small = case(mode="prefill", prefix_lens=(0,), new_lens=(128,))
+    assert short_case(small).new_lens == (128,)
+
+    # The same factor applies to the history of an extend step and to its chunk.
+    extending = case(
+        mode="extend",
+        prefix_lens=(8192, 4096, 2048, 1024),
+        new_lens=(512, 512, 512, 512),
+    )
+    short_extend = short_case(extending)
+    assert short_extend.prefix_lens == (256, 128, 64, 32)
+    assert short_extend.new_lens == (64, 64, 64, 64)
+    # Each sequence's context is its scaled history plus its scaled chunk, so the
+    # offsets the reference walks are the batch's own.
+    assert short_extend.context_lens == (320, 192, 128, 96)
