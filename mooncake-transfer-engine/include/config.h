@@ -123,6 +123,14 @@ struct GlobalConfig {
     // NICs the topology reports as closest to that GPU. Set via
     // MC_EFA_NIC_SELECTION=all|local; see efa_transport.cpp for the trade-off.
     EfaNicSelection efa_nic_selection = EfaNicSelection::ALL;
+    // Cap on EFA CQ poller threads. Set via MC_EFA_CQ_THREADS; 0 disables the
+    // cap.
+    int efa_cq_threads = 1;
+    // Register GPU memory with ibv_reg_mr() through the nvidia-peermem kernel
+    // module instead of exporting a dma_buf. Set via WITH_NVIDIA_PEERMEM.
+    bool with_nvidia_peermem = true;
+    // Register dma_buf MRs with mlx5 Data Direct. Set via MC_RDMA_DATA_DIRECT.
+    bool rdma_data_direct = false;
     size_t eic_max_block_size = 64UL * 1024 * 1024;
     EndpointStoreType endpoint_store_type = EndpointStoreType::SIEVE;
     int ib_traffic_class = -1;

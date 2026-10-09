@@ -61,6 +61,10 @@ struct ClientAutoPortEnvironmentVariables {
     MC_DEFINE_ENV_VAR(int, MC_STORE_CLIENT_MAX_PORT);
 };
 
+struct EmbeddedMasterEnvironmentVariables {
+    MC_DEFINE_ENV_VAR(bool, MOONCAKE_ENABLE_EMBEDDED_MASTER);
+};
+
 struct ClientObjectChecksumEnvironmentVariables {
     MC_DEFINE_ENV_VAR(bool, MOONCAKE_STORE_CHECKSUM);
 };
@@ -303,6 +307,12 @@ struct S3ClientEnvironmentVariables {
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_AWS_RESPONSE_CHECKSUM_VALIDATION);
     MC_DEFINE_ENV_VAR(int64_t, MOONCAKE_AWS_CONNECT_TIMEOUT_MS);
     MC_DEFINE_ENV_VAR(int64_t, MOONCAKE_AWS_REQUEST_TIMEOUT_MS);
+};
+
+struct RpcClientIoEnvironmentVariables {
+    MC_DEFINE_ENV_VAR(int, MC_RPC_CLIENT_IO_THREADS);
+    MC_DEFINE_ENV_VAR(int, MC_STORE_RPC_CLIENT_IO_THREADS);
+    MC_DEFINE_ENV_VAR(int, MC_TE_RPC_CLIENT_IO_THREADS);
 };
 
 #undef MC_DEFINE_ENV_VAR
