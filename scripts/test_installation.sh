@@ -61,6 +61,7 @@ fi
 python -c "import mooncake._fast_copy"
 python tests/test_fast_copy.py
 python tests/test_import_structure.py
+python tests/test_batch_register_memory.py
 
 echo "Running HTTP metadata server test..."
 python -m unittest service_tests/test_http_metadata_server.py

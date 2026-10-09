@@ -612,6 +612,9 @@ Registers multiple memory regions for RDMA access in a single batch operation.
 - `buffer_addresses` (List[int]): List of memory addresses to register
 - `capacities` (List[int]): List of sizes in bytes for each memory region
 
+The lists must have equal lengths. Otherwise, the call returns -1 without
+registering any memory regions.
+
 **Returns:**
 - `int`: 0 on success, negative value on failure
 
