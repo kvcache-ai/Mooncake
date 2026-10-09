@@ -1,10 +1,13 @@
 #pragma once
 
 #include <cstddef>
-#include <linux/memfd.h>
-#include <linux/mman.h>
 #include <string>
 #include <vector>
+
+#ifdef __linux__
+#include <linux/memfd.h>
+#include <linux/mman.h>
+#endif  // __linux__
 
 #include <Slab.h>
 
@@ -13,14 +16,16 @@ namespace mooncake {
 constexpr size_t SZ_2MB = 2 * 1024 * 1024;
 constexpr size_t SZ_512MB = 512 * 1024 * 1024;
 
-// 512MiB hugepages on arm64 kernels with 64K base pages may not be
-// defined by older glibc/kernel headers.
+#ifdef __linux__
+// 512MiB hugepages on arm64 kernels with 64K base pages may not be defined by
+// older glibc/kernel headers.
 #ifndef MAP_HUGE_512MB
 #define MAP_HUGE_512MB (29 << 26)  // MAP_HUGE_SHIFT = 26
 #endif
 #ifndef MFD_HUGE_512MB
 #define MFD_HUGE_512MB (29 << 26)  // MFD_HUGE_SHIFT = 26
 #endif
+#endif  // __linux__
 constexpr size_t SZ_1GB = 1024 * 1024 * 1024;
 constexpr double BYTES_PER_GIB = static_cast<double>(SZ_1GB);
 
@@ -70,5 +75,10 @@ void free_buffer_mmap_memory(void* ptr, size_t total_size);
 void* allocate_buffer_numa_segments(size_t total_size,
                                     const std::vector<int>& numa_nodes,
                                     size_t page_size = 0);
+
+// Anonymous 2MB-aligned mapping advised for THP and interleaved across the
+// allowed NUMA nodes. total_size must be a multiple of 2MB. Free with
+// free_buffer_mmap_memory(ptr, total_size).
+void* allocate_buffer_thp_interleaved(size_t total_size);
 
 }  // namespace mooncake

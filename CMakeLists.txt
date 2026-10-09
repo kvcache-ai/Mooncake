@@ -94,15 +94,18 @@ else()
   message(STATUS "USE_NOF=OFF, NoF SSD pool support is disabled")
 endif()
 
-option(STORE_USE_JEMALLOC "Use jemalloc in mooncake store master" OFF)
+# The matching STORE_USE_JEMALLOC compile definition is scoped to the master and
+# client executables in mooncake-store/src, since only they link the allocator.
+option(STORE_USE_JEMALLOC
+       "Use jemalloc in the mooncake store master and client binaries" OFF)
 
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/Dependencies.cmake)
 if(WITH_STORE)
   mooncake_provide_zstd()
   mooncake_provide_xxhash()
-  if(ENABLE_KV_EVENTS)
-    mooncake_provide_libzmq()
-  endif()
+endif()
+if(WITH_CONDUCTOR OR (WITH_STORE AND ENABLE_KV_EVENTS))
+  mooncake_provide_libzmq()
 endif()
 if(WITH_STORE OR (WITH_TE AND USE_TENT))
   mooncake_provide_liburing()
@@ -128,6 +131,12 @@ endif()
 
 if(WITH_STORE)
   message(STATUS "Mooncake Store will be built")
+  # mooncake-store sources include headers from mooncake-transfer-engine even
+  # when WITH_TE=OFF (e.g. common.h for host-name helpers).  Add the TE include
+  # path before creating store targets so store-only builds can find them.
+  if(NOT WITH_TE)
+    include_directories(mooncake-transfer-engine/include)
+  endif()
   add_subdirectory(mooncake-store)
   include_directories(mooncake-store/include)
 endif()

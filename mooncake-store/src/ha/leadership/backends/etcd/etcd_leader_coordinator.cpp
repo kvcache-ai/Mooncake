@@ -4,8 +4,6 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
-#include <cstdlib>
-#include <cstring>
 #include <mutex>
 #include <optional>
 #include <thread>
@@ -14,6 +12,7 @@
 #include <ylt/util/tl/expected.hpp>
 
 #include "types.h"
+#include "config/ha_cluster_namespace_config.h"
 
 namespace mooncake {
 namespace ha {
@@ -619,14 +618,7 @@ ClusterNamespace EtcdLeaderCoordinator::ResolveClusterNamespace(
         return cluster_namespace;
     }
 
-    std::string resolved_namespace;
-    const char* env_cluster_id = std::getenv("MC_STORE_CLUSTER_ID");
-    if (env_cluster_id != nullptr && std::strlen(env_cluster_id) > 0) {
-        resolved_namespace = env_cluster_id;
-    } else {
-        resolved_namespace = DEFAULT_CLUSTER_ID;
-    }
-    return resolved_namespace;
+    return HaClusterNamespaceConfig::FromEnvironment().cluster_namespace;
 }
 
 std::string EtcdLeaderCoordinator::BuildMasterViewKey(

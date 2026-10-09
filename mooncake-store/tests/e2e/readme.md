@@ -93,7 +93,7 @@ The script first verifies steady-state `put/get` success with `memory + nof` rep
   - `mooncake-store/src/mooncake_master`
   - `mooncake-integration/store*.so`
 - SPDK has already been built under `extern/spdk`
-- Python environment contains `aiohttp` because the script launches a standalone metadata process with `mooncake-wheel/mooncake/http_metadata_server.py`
+- Python environment contains `aiohttp` because the script launches a standalone metadata process with `python/mooncake/http_metadata_server.py`
 - The script uses `sudo -n` to set hugepages and mount `/dev/hugepages`, so the current user must have passwordless sudo
 
 **Usage**:
@@ -118,7 +118,7 @@ PRE_FAULT_SUCCESS_TARGET=10 BUILD_DIR=/path/to/build ./run_nof_heartbeat_tcp_e2e
 **Notes**:
 
 - The client payload size defaults to `4096` bytes because the current NoF path requires 4K-aligned I/O.
-- The script uses a standalone metadata server process (`mooncake-wheel/mooncake/http_metadata_server.py`) instead of the embedded master metadata server so all four components remain explicit during the test.
+- The script uses a standalone metadata server process (`python/mooncake/http_metadata_server.py`) instead of the embedded master metadata server so all four components remain explicit during the test.
 - In default mode, the script verifies **service continuity** after NoF unmount by checking that post-fault I/O still succeeds.
 - In `CLIENT_GLOBAL_SEGMENT_SIZE=0` mode, the script verifies **NoF-only failure behavior** by checking that post-fault I/O starts failing after the NoF segment is removed.
 - Logs are written under `LOG_DIR` (default `/tmp/mooncake_nof_heartbeat_e2e`) and the final pass/fail summary is printed from `summary.log`.
@@ -149,6 +149,27 @@ python3 store_client_e2e.py \
 - `--payload-size 4096`: keep NoF writes 4K aligned
 - `--duration-sec`: total workload duration
 - `--sleep-ms`: interval between operations
+
+### In-process master e2e (no `mooncake_master`)
+
+Linux CI (`test-wheel-ubuntu`) runs `scripts/run_standalone_store_e2e.sh` before
+starting `mooncake_master`. This covers `EmbeddedMaster` plumbing used by tests.
+The Store client owns the master in the same process; no `mooncake_master` or
+metadata-service process is launched. The existing client hosting options remain
+unchanged, and this is not a documented user deployment mode.
+
+The CTest targets `embedded_master_test` and `standalone_client_test` also cover
+loopback-only listeners, kernel-assigned ports during concurrent startup, and
+same-port restart after stopping a master. TransferEngine reuse is checked with
+both HTTP metadata and `P2PHANDSHAKE`; the latter deliberately uses different
+Store and engine names and checks the published replica endpoint. The TENT
+`cuda-off` CI job runs the same metadata-reuse cases with `MC_USE_TENT=1`.
+In embedded mode, the legacy external `master_server_addr` argument is ignored
+so multiple clients can keep its default without competing for port 50051.
+
+```bash
+bash scripts/run_standalone_store_e2e.sh
+```
 
 ### run_oplog_snapshot_smoke.sh
 
@@ -186,3 +207,33 @@ must not serve if its recovery history cannot be proven complete.
 This smoke does not cover the full crash/corruption/lease-contention matrix,
 S3 outages, large-scale memory/freeze-time measurements, or safe OpLog pruning.
 Keep batch history until retention/pruning has its own verified recovery gate.
+
+## Batch OpLog capacity tests
+
+Build `mooncake_master`, `oplog_batch_inspector`, and `oplog_ha_client` with
+`STORE_USE_ETCD=ON`. Put matching etcd/etcdctl 3.5+ binaries on `PATH` and install
+Python `aiohttp`. From the repository root:
+
+```bash
+bash mooncake-store/tests/e2e/run_oplog_batch_cluster_test.sh
+mooncake-store/tests/e2e/run_oplog_batch_cluster.sh capacity-soak \
+  --build-dir /path/to/build --run-dir /tmp/n13-soak \
+  --capacity-seconds 3600 --capacity-max-batches 2048
+mooncake-store/tests/e2e/run_oplog_batch_cluster.sh capacity-nospace \
+  --build-dir /path/to/build --run-dir /tmp/n13-nospace
+```
+
+Both commands require a fresh directory and reject external etcd endpoints. They
+create two masters, one etcd member and shared local snapshots; multi-member quorum
+availability and S3 are not tested. Processes stop on exit; artifacts remain.
+
+The soak checks bounded live batch keys, snapshot/floor progress and periodic
+compact/defrag reclamation. NOSPACE fills history under a 16 MiB quota after
+quiescing masters, then verifies the alarm, reclamation, disarm and recovered writes.
+Both audit surviving/deleted keys across restart and promotion, then test new writes.
+A 30-second soak is only a smoke test; report the actual measured duration.
+
+`<run-dir>/capacity/` contains consistent-revision key/control samples, raw metrics,
+maintenance status before/after compact and defrag, `soak-result.json`, and
+`audits.log`. Process logs and acknowledgement manifests are in `logs/` and
+`workload/`. Batch-specific helpers are in `tests/ha/snapshot/batch_oplog/`.

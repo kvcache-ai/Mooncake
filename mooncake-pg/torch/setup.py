@@ -46,8 +46,8 @@ cxx_args = [
     "-g0",
 ]
 
-include_dirs = [
-    os.path.join(current_dir, "include"),
+include_dirs = [os.path.join(current_dir, "include")]
+shared_include_dirs = [
     os.path.join(current_dir, "../include"),
     os.path.join(current_dir, "../../mooncake-transfer-engine/include"),
 ]
@@ -59,7 +59,13 @@ use_maca = (
 if use_musa:
     musa_defines = ["-DUSE_MUSA", "-DMOONCAKE_EP_USE_MUSA=1"]
     cxx_args += musa_defines
+    # torchada ports every include_dirs root in place. The shared PG core and
+    # Transfer Engine headers already map CUDA onto MUSA through cuda_alike.h
+    # and are compiled by other targets in the same build, so pass them as
+    # plain compiler flags to keep them out of the ported set.
+    cxx_args += [f"-I{d}" for d in shared_include_dirs]
 else:
+    include_dirs += shared_include_dirs
     if use_maca:
         cxx_args += ["-DUSE_MACA", "-DMOONCAKE_EP_USE_MACA=1"]
 

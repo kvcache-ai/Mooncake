@@ -50,7 +50,7 @@ class OssAdapterConfigTest : public ::testing::Test {
     }
 
    private:
-    inline static constexpr std::array<const char*, 14> kVariables = {
+    inline static constexpr std::array<const char*, 17> kVariables = {
         "MOONCAKE_OSS_ENDPOINT",
         "OSS_ENDPOINT",
         "MOONCAKE_OSS_BUCKET",
@@ -65,6 +65,9 @@ class OssAdapterConfigTest : public ::testing::Test {
         "OSS_SESSION_TOKEN",
         "MOONCAKE_OSS_PATH_STYLE",
         "MOONCAKE_OSS_ANONYMOUS",
+        "MOONCAKE_OSS_MAX_CONNECTIONS",
+        "MOONCAKE_OSS_RECEIVE_BUFFER_SIZE",
+        "MOONCAKE_OSS_UPLOAD_BUFFER_SIZE",
     };
 
     std::map<std::string, std::optional<std::string>> original_values_;
@@ -270,6 +273,79 @@ TEST_F(OssAdapterConfigTest, NewConfigsReadCurrentEnvironment) {
     ASSERT_TRUE(second);
     EXPECT_EQ(first->endpoint, "https://oss.example.com");
     EXPECT_EQ(second->endpoint, "https://second.example.com");
+}
+
+TEST_F(OssAdapterConfigTest, TuningDefaultsAndOverrides) {
+    SetRequiredPrimary();
+    Set("MOONCAKE_OSS_ANONYMOUS", "true");
+    const auto defaults = OssAdapterConfig::FromEnvironment();
+    ASSERT_TRUE(defaults);
+    EXPECT_EQ(defaults->max_connections, 64);
+    EXPECT_EQ(defaults->receive_buffer_size, 1024 * 1024);
+    EXPECT_EQ(defaults->upload_buffer_size, 1024 * 1024);
+
+    Set("MOONCAKE_OSS_MAX_CONNECTIONS", "128");
+    Set("MOONCAKE_OSS_RECEIVE_BUFFER_SIZE", "65536");
+    Set("MOONCAKE_OSS_UPLOAD_BUFFER_SIZE", "131072");
+    const auto configured = OssAdapterConfig::FromEnvironment();
+    ASSERT_TRUE(configured);
+    EXPECT_EQ(configured->max_connections, 128);
+    EXPECT_EQ(configured->receive_buffer_size, 65536);
+    EXPECT_EQ(configured->upload_buffer_size, 131072);
+}
+
+TEST_F(OssAdapterConfigTest, TuningValuesKeepExistingBounds) {
+    SetRequiredPrimary();
+    Set("MOONCAKE_OSS_ANONYMOUS", "true");
+    for (const char* value : {"-1", "0"}) {
+        SCOPED_TRACE(value);
+        Set("MOONCAKE_OSS_MAX_CONNECTIONS", value);
+        Set("MOONCAKE_OSS_RECEIVE_BUFFER_SIZE", value);
+        Set("MOONCAKE_OSS_UPLOAD_BUFFER_SIZE", value);
+        const auto config = OssAdapterConfig::FromEnvironment();
+        ASSERT_TRUE(config);
+        EXPECT_EQ(config->max_connections, 1);
+        EXPECT_EQ(config->receive_buffer_size, 16 * 1024);
+        EXPECT_EQ(config->upload_buffer_size, 16 * 1024);
+    }
+
+    Set("MOONCAKE_OSS_MAX_CONNECTIONS", "2147483647");
+    Set("MOONCAKE_OSS_RECEIVE_BUFFER_SIZE", "2147483647");
+    Set("MOONCAKE_OSS_UPLOAD_BUFFER_SIZE", "2147483647");
+    const auto config = OssAdapterConfig::FromEnvironment();
+    ASSERT_TRUE(config);
+    EXPECT_EQ(config->max_connections, 2147483647);
+    EXPECT_EQ(config->receive_buffer_size, 10 * 1024 * 1024);
+    EXPECT_EQ(config->upload_buffer_size, 2 * 1024 * 1024);
+}
+
+TEST_F(OssAdapterConfigTest, InvalidTuningValuesWarnAndUseDefaults) {
+    SetRequiredPrimary();
+    Set("MOONCAKE_OSS_ANONYMOUS", "true");
+    for (const char* value :
+         {"invalid", "", "65536bytes", "2147483648", "-2147483649"}) {
+        SCOPED_TRACE(value);
+        Set("MOONCAKE_OSS_MAX_CONNECTIONS", value);
+        Set("MOONCAKE_OSS_RECEIVE_BUFFER_SIZE", value);
+        Set("MOONCAKE_OSS_UPLOAD_BUFFER_SIZE", value);
+        testing::internal::CaptureStderr();
+        const auto config = OssAdapterConfig::FromEnvironment();
+        const std::string diagnostics = testing::internal::GetCapturedStderr();
+        ASSERT_TRUE(config);
+        EXPECT_EQ(config->max_connections, 64);
+        EXPECT_EQ(config->receive_buffer_size, 1024 * 1024);
+        EXPECT_EQ(config->upload_buffer_size, 1024 * 1024);
+        EXPECT_NE(
+            diagnostics.find("MOONCAKE_OSS_MAX_CONNECTIONS, using default 64"),
+            std::string::npos);
+        EXPECT_NE(
+            diagnostics.find(
+                "MOONCAKE_OSS_RECEIVE_BUFFER_SIZE, using default 1048576"),
+            std::string::npos);
+        EXPECT_NE(diagnostics.find(
+                      "MOONCAKE_OSS_UPLOAD_BUFFER_SIZE, using default 1048576"),
+                  std::string::npos);
+    }
 }
 
 }  // namespace

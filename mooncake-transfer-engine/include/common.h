@@ -16,10 +16,13 @@
 #define COMMON_H
 
 #include <glog/logging.h>
+#ifdef __linux__
 #include <numa.h>
+#endif
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
 
@@ -35,6 +38,7 @@
 #include <mutex>
 #include <optional>
 #include <sstream>
+#include <string>
 #include <string_view>
 #include <thread>
 #include <vector>
@@ -77,6 +81,40 @@ static inline std::string getHostname() {
     return hostname;
 }
 
+// Options for TransferEngine::allocateSharedMemory / ShmTransport.
+// Default path stays POSIX /dev/shm. Store production sets use_hugepage with
+// hugepage_size matching MC_STORE_HUGEPAGE_SIZE (2MB / 512MB / 1GB).
+//
+// Crash / SIGKILL leftovers: freeSharedMemory and ~ShmTransport unlink the
+// object. SIGKILL skips that, so POSIX names stay in /dev/shm and hugetlbfs
+// files stay on the mount. Hugetlbfs leftovers keep hugepages reserved until
+// the file is unlinked or the node reboots — worse than tmpfs leftovers.
+// There is no startup reaper (multiple processes share a mount; wiping
+// mooncake_* would delete live peers). Operators may remove files named
+// mooncake_<dead-pid>_* after confirming that pid is gone, e.g.
+//   rm /dev/hugepages/mooncake_<pid>_*
+struct SharedMemoryOptions {
+    bool use_hugepage = false;
+    size_t hugepage_size = 0;    // 0 → 2MB when use_hugepage
+    std::string hugetlbfs_path;  // empty → size-specific default mount
+    bool populate = true;        // Store passes false and populates itself
+
+    static constexpr size_t kHugepage2MB = 2ULL << 20;
+    static constexpr size_t kHugepage512MB = 512ULL << 20;
+    static constexpr size_t kHugepage1GB = 1ULL << 30;
+
+    static bool isSupportedHugepageSize(size_t size) {
+        return size == kHugepage2MB || size == kHugepage512MB ||
+               size == kHugepage1GB;
+    }
+
+    static const char *defaultHugetlbfsPathFor(size_t hugepage_size) {
+        if (hugepage_size == kHugepage1GB) return "/dev/hugepages-1G";
+        if (hugepage_size == kHugepage512MB) return "/dev/hugepages-512M";
+        return "/dev/hugepages";
+    }
+};
+
 // True when the variable is set to anything other than 0/false/no/off.
 // Used by MC_FORCE_SHM.
 inline bool envFlagEnabled(const char *name) {
@@ -109,6 +147,12 @@ inline std::mutex &numaNodeCpuCacheMutex() {
 }
 
 static inline int bindToSocket(int socket_id) {
+#ifndef __linux__
+    // libnuma and pthread_setaffinity_np are Linux-only.
+    (void)socket_id;
+    LOG(WARNING) << "The platform does not support NUMA";
+    return ERR_NUMA;
+#else
     if (unlikely(numa_available() < 0)) {
         LOG(WARNING) << "The platform does not support NUMA";
         return ERR_NUMA;
@@ -138,6 +182,7 @@ static inline int bindToSocket(int socket_id) {
         return ERR_NUMA;
     }
     return 0;
+#endif
 }
 
 static inline int64_t getCurrentTimeInNano() {
@@ -408,6 +453,48 @@ static inline ssize_t writeFully(int fd, const void *buf, size_t len) {
     return len;
 }
 
+// writeFully variant for stream sockets. A peer that resets the connection
+// while we are mid-reply must turn into an EPIPE error here, not a SIGPIPE
+// that kills the whole process (the handshake daemon answers untrusted
+// peers, and the engine usually runs inside a larger host process).
+static inline ssize_t writeFullySocket(int fd, const void *buf, size_t len) {
+#ifdef SO_NOSIGPIPE
+    // macOS has no MSG_NOSIGNAL; disarm SIGPIPE on the socket instead.
+    // Idempotent, and handshake traffic is low-rate, so per-call is fine.
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+#endif
+#ifdef MSG_NOSIGNAL
+    constexpr int kSendFlags = MSG_NOSIGNAL;
+#else
+    constexpr int kSendFlags = 0;
+#endif
+    char *pos = (char *)buf;
+    size_t nbytes = len;
+    while (nbytes) {
+        ssize_t rc = send(fd, pos, nbytes, kSendFlags);
+        if (rc < 0 && errno == EINTR)
+            continue;
+        else if (rc < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            // A blocking socket only reports EAGAIN once SO_SNDTIMEO fires;
+            // retrying here would spin forever, so fail the write instead.
+            LOG(WARNING) << "Socket write timed out: expected " << len
+                         << " bytes, actual " << len - nbytes << " bytes";
+            return len - nbytes;
+        } else if (rc < 0) {
+            PLOG(ERROR) << "Socket write failed";
+            return rc;
+        } else if (rc == 0) {
+            LOG(WARNING) << "Socket write incompleted: expected " << len
+                         << " bytes, actual " << len - nbytes << " bytes";
+            return len - nbytes;
+        }
+        pos += rc;
+        nbytes -= rc;
+    }
+    return len;
+}
+
 static inline ssize_t readFully(int fd, void *buf, size_t len) {
     // Set a timeout for read to avoid hanging forever.
     constexpr std::chrono::seconds kReadTimeout = std::chrono::seconds(300);
@@ -452,13 +539,14 @@ static inline int writeString(int fd, const HandShakeRequestType type,
     uint64_t length =
         str.size() +
         (type == HandShakeRequestType::OldProtocol ? 0 : sizeof(byte));
-    if (writeFully(fd, &length, sizeof(length)) != (ssize_t)sizeof(length))
+    if (writeFullySocket(fd, &length, sizeof(length)) !=
+        (ssize_t)sizeof(length))
         return ERR_SOCKET;
     if (type != HandShakeRequestType::OldProtocol) {
-        if (writeFully(fd, &byte, sizeof(byte)) != (ssize_t)sizeof(byte))
+        if (writeFullySocket(fd, &byte, sizeof(byte)) != (ssize_t)sizeof(byte))
             return ERR_SOCKET;
     }
-    if (writeFully(fd, str.data(), str.size()) != (ssize_t)str.size())
+    if (writeFullySocket(fd, str.data(), str.size()) != (ssize_t)str.size())
         return ERR_SOCKET;
     return 0;
 }

@@ -10,6 +10,8 @@
 #include "ha/snapshot/object/snapshot_object_store.h"
 #include "ha/snapshot/snapshot_maintenance_lease.h"
 
+#include "ha_metric_manager.h"
+
 namespace mooncake {
 namespace {
 
@@ -44,6 +46,8 @@ ErrorCode BatchOpLogSnapshotGc::Run(
     const SnapshotMaintenanceLease& lease, std::string_view published,
     const std::optional<std::string>& expected_fallback,
     const std::function<bool()>& cancelled) {
+    HAMetricManager::SnapshotOperationTimer metric_timer(
+        HAMetricManager::SnapshotOperation::Gc);
     if (!lease.IsHeld() || (cancelled && cancelled()))
         return ErrorCode::ETCD_TRANSACTION_FAIL;
 
@@ -85,7 +89,10 @@ ErrorCode BatchOpLogSnapshotGc::Run(
                 descriptor->manifest_crc32c)
             return ErrorCode::INTERNAL_ERROR;
         auto manifest = ha::DecodeBatchOpLogSnapshotManifest(manifest_json);
-        if (!manifest || manifest->snapshot_id != descriptor->snapshot_id ||
+        if (!manifest ||
+            manifest->schema_version != descriptor->schema_version ||
+            manifest->snapshot_format != descriptor->snapshot_format ||
+            manifest->snapshot_id != descriptor->snapshot_id ||
             manifest->segments.stored_size == 0 ||
             manifest->segments.key != ha::BuildBatchOpLogSnapshotSegmentsKey(
                                           root_, descriptor->snapshot_id) ||
@@ -100,6 +107,14 @@ ErrorCode BatchOpLogSnapshotGc::Run(
                                  root_, descriptor->snapshot_id, i) ||
                 !VerifyObject(store_, chunk.key, chunk.stored_size,
                               chunk.crc32c))
+                return ErrorCode::INTERNAL_ERROR;
+        }
+        if (manifest->weight_metadata) {
+            const auto& weights = *manifest->weight_metadata;
+            if (weights.key != ha::BuildBatchOpLogSnapshotWeightMetadataKey(
+                                   root_, descriptor->snapshot_id) ||
+                !VerifyObject(store_, weights.key, weights.stored_size,
+                              weights.crc32c))
                 return ErrorCode::INTERNAL_ERROR;
         }
         protected_prefixes.insert(prefix);
@@ -120,6 +135,13 @@ ErrorCode BatchOpLogSnapshotGc::Run(
             candidates.insert(object.substr(0, end + 1));
     }
 
+    uint64_t orphan_prefixes = 0;
+    for (const auto& prefix : candidates)
+        orphan_prefixes += !protected_prefixes.contains(prefix);
+    HAMetricManager::instance().update_snapshot_runtime([&](auto& metrics) {
+        metrics.gc_orphan_prefixes = orphan_prefixes;
+        metrics.gc_deleted_prefixes = 0;
+    });
     // Phase 3: fence every destructive operation.
     for (const auto& prefix : candidates) {
         if (protected_prefixes.contains(prefix)) continue;
@@ -127,8 +149,10 @@ ErrorCode BatchOpLogSnapshotGc::Run(
             return ErrorCode::ETCD_TRANSACTION_FAIL;
         if (!store_.DeleteObjectsWithPrefix(prefix))
             return ErrorCode::INTERNAL_ERROR;
+        HAMetricManager::instance().update_snapshot_runtime(
+            [](auto& metrics) { ++metrics.gc_deleted_prefixes; });
     }
-    return ErrorCode::OK;
+    return metric_timer.Success(ErrorCode::OK);
 }
 
 }  // namespace mooncake

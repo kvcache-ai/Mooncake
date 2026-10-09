@@ -154,6 +154,12 @@ class MasterServiceTest : public ::testing::Test {
         return MasterServiceTestPeer(service).getShardIndex(tenant_id, key);
     }
 
+    std::unique_ptr<SharedMutexLocker> LockMetadataShardForTest(
+        MasterService& service, size_t shard_idx) {
+        return std::make_unique<SharedMutexLocker>(
+            &MasterServiceTestPeer::MetadataShards(service)[shard_idx].mutex);
+    }
+
     size_t MetadataBucketCount(
         MasterService& service, size_t shard_idx,
         const TenantId& tenant_id = TenantId::Default()) {
@@ -266,9 +272,10 @@ class MasterServiceTest : public ::testing::Test {
     }
 
     std::chrono::system_clock::time_point ComputeSoftPinDeadlineForTest(
-        const std::chrono::system_clock::time_point& now, uint64_t ttl_ms) {
+        const std::chrono::system_clock::time_point& now,
+        std::chrono::milliseconds ttl) {
         return MasterServiceTestPeer::ObjectMetadata::ComputeSoftPinDeadline(
-            now, ttl_ms);
+            now, ttl);
     }
 
     std::string WriteTenantPolicyFile(

@@ -56,7 +56,7 @@ if ! kill -0 "$MASTER_PID" >/dev/null 2>&1; then
 fi
 
 export PYTHONPATH="$BUILD_DIR/mooncake-integration${PYTHONPATH:+:$PYTHONPATH}"
-export LD_LIBRARY_PATH="$BUILD_DIR/mooncake-store/src:$BUILD_DIR/mooncake-common:$BUILD_DIR/mooncake-transfer-engine/src${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export LD_LIBRARY_PATH="$BUILD_DIR/mooncake-store/src:$BUILD_DIR/mooncake-common:$BUILD_DIR/mooncake-common/src:$BUILD_DIR/mooncake-transfer-engine/src:$BUILD_DIR/mooncake-transfer-engine/src/transport/ascend_transport:$BUILD_DIR/mooncake-transfer-engine/tent/src/metrics${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export MOONCAKE_PROTOCOL=tcp
 export MOONCAKE_DEVICE=
 export MOONCAKE_MASTER="$MASTER_RPC"

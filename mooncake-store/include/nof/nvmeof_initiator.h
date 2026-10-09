@@ -121,4 +121,17 @@ class NVMeoFInitiator {
     virtual NofCapabilities GetCapabilities() const = 0;
 };
 
+// Registration page granularity fixed by the RegisterMemory contract above.
+// A range rejected by this check is never touched by RegisterMemory, so a
+// caller that skips the attempt keeps the mapping munmap-safe without a
+// pairing UnregisterMemory; anything accepted here may still fail inside the
+// implementation (reported via the RegisterMemory return code, with the
+// implementation rolling back the pages it touched).
+inline bool NofRangeIsRegistrable(const void* ptr, size_t size) {
+    constexpr uintptr_t kNofRegistrationPageSize = 2ULL << 20;  // 2MB
+    return ptr != nullptr && size != 0 &&
+           (reinterpret_cast<uintptr_t>(ptr) % kNofRegistrationPageSize) == 0 &&
+           (size % kNofRegistrationPageSize) == 0;
+}
+
 }  // namespace mooncake

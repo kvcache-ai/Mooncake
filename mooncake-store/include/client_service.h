@@ -198,7 +198,12 @@ class Client {
                                       std::vector<Slice>& slices,
                                       uint64_t src_offset);
     std::optional<TransferEngine::ScatterTransferOperation> SubmitScatter(
-        const std::vector<TransferEngine::ScatterTransferRange>& transfers);
+        const std::vector<TransferEngine::ScatterTransferRange>& transfers,
+        TransferIntent intent = TransferIntent::kUnspecified);
+
+    std::optional<StoreScatterTransferOperation> SubmitScatterNative(
+        const std::vector<TransferEngine::ScatterTransferRange>& transfers,
+        TransferIntent intent = TransferIntent::kUnspecified);
 
     /**
      * @brief Transfers data using pre-queried object information
@@ -252,10 +257,28 @@ class Client {
      * entries are issued as one scatter transfer so the transport can coalesce
      * everything bound for the same segment, then awaited together. Requires
      * memory replicas. Returns per-entry total bytes transferred or an
-     * ErrorCode. Used by RealClient get sessions. No Master RPC.
+     * ErrorCode. Used by session get. No Master RPC.
      */
     std::vector<tl::expected<int64_t, ErrorCode>> BatchTransferReadRanges(
         const std::vector<Replica::Descriptor>& replicas,
+        const std::vector<std::vector<Slice>>& slices,
+        const std::vector<std::vector<uint64_t>>& src_offsets,
+        TransferIntent intent = TransferIntent::kUnspecified);
+
+    /**
+     * @brief Batch ranged read from restored LOCAL_DISK arenas.
+     *
+     * Counterpart of BatchTransferReadRanges the same way BatchGetOffloadObject
+     * is the counterpart of BatchGet: one transfer_engine_addr for the batch,
+     * plus a restore pointer and object size per entry. Fragments use
+     * src_offsets into that restored object. Used by session get after RPC
+     * restore into the owner's TE-registered client buffer. No Master RPC.
+     */
+    std::vector<tl::expected<int64_t, ErrorCode>>
+    BatchTransferReadOffloadRanges(
+        const std::string& transfer_engine_addr,
+        const std::vector<uint64_t>& remote_bases,
+        const std::vector<size_t>& remote_sizes,
         const std::vector<std::vector<Slice>>& slices,
         const std::vector<std::vector<uint64_t>>& src_offsets);
 
@@ -264,12 +287,13 @@ class Client {
      * from all entries and all memory replicas are issued as one scatter
      * transfer, then awaited together. Returns per-entry logical bytes
      * transferred (counted once, not per replica) or an ErrorCode. Used by
-     * RealClient put sessions.
+     * session put.
      */
     std::vector<tl::expected<int64_t, ErrorCode>> BatchTransferWriteRanges(
         const std::vector<std::vector<Replica::Descriptor>>& replicas_per_entry,
         const std::vector<std::vector<Slice>>& slices,
-        const std::vector<std::vector<uint64_t>>& dst_offsets);
+        const std::vector<std::vector<uint64_t>>& dst_offsets,
+        TransferIntent intent = TransferIntent::kUnspecified);
 
     /**
      * @brief Upserts data: inserts if key doesn't exist, updates if it does
@@ -416,11 +440,29 @@ class Client {
     tl::expected<bool, ErrorCode> IsExist(const std::string& key);
 
     /**
+     * @brief Point-in-time existence check that grants no read lease.
+     *        A `true` result only means the object existed at the time of
+     *        the call; it may be evicted before a subsequent Get.
+     * @param key Key to check
+     * @return Vector of existence results for each key
+     */
+    tl::expected<bool, ErrorCode> ProbeKey(const std::string& key);
+
+    /**
      * @brief Checks if multiple objects exist
      * @param keys Vector of keys to check
      * @return Vector of existence results for each key
      */
     std::vector<tl::expected<bool, ErrorCode>> BatchIsExist(
+        const std::vector<std::string>& keys);
+
+    /**
+     * @brief Point-in-time existence check for multiple objects, granting no
+     *        read leases
+     * @param keys Vector of keys to check
+     * @return Vector of existence results for each key
+     */
+    std::vector<tl::expected<bool, ErrorCode>> BatchProbeKey(
         const std::vector<std::string>& keys);
 
     /**
@@ -576,7 +618,8 @@ class Client {
         const std::vector<std::string>& keys,
         const std::vector<uintptr_t>& pointers,
         const std::unordered_map<std::string, std::vector<Slice>>& batch_slices,
-        OffloadBufferAccess buffer_access);
+        OffloadBufferAccess buffer_access,
+        TransferIntent intent = TransferIntent::kForegroundGet);
 
     /**
      * @brief Notifies the master that offloading of specified objects has
@@ -815,9 +858,10 @@ class Client {
         const std::string& metadata_connstring, const std::string& protocol,
         const std::optional<std::string>& device_names);
     void InitTransferSubmitter();
-    ErrorCode TransferData(const Replica::Descriptor& replica_descriptor,
-                           std::vector<Slice>& slices,
-                           TransferRequest::OpCode op_code);
+    ErrorCode TransferData(
+        const Replica::Descriptor& replica_descriptor,
+        std::vector<Slice>& slices, TransferRequest::OpCode op_code,
+        TransferIntent intent = TransferIntent::kUnspecified);
     ErrorCode TransferReadInternal(
         const Replica::Descriptor& replica_descriptor,
         std::vector<Slice>& slices, uint64_t src_offset);
@@ -830,10 +874,14 @@ class Client {
     std::optional<TransferFuture> SubmitRangeWrite(
         const Replica::Descriptor& replica_descriptor,
         std::vector<Slice>& slices, uint64_t dst_offset);
-    ErrorCode TransferWrite(const Replica::Descriptor& replica_descriptor,
-                            std::vector<Slice>& slices);
-    ErrorCode TransferRead(const Replica::Descriptor& replica_descriptor,
-                           std::vector<Slice>& slices);
+    ErrorCode TransferWrite(
+        const Replica::Descriptor& replica_descriptor,
+        std::vector<Slice>& slices,
+        TransferIntent intent = TransferIntent::kUnspecified);
+    ErrorCode TransferRead(
+        const Replica::Descriptor& replica_descriptor,
+        std::vector<Slice>& slices,
+        TransferIntent intent = TransferIntent::kUnspecified);
     ErrorCode TransferReadRange(const Replica::Descriptor& replica_descriptor,
                                 std::vector<Slice>& slices,
                                 uint64_t src_offset);
@@ -1002,6 +1050,7 @@ class Client {
     std::atomic<bool> last_ping_success_{false};
     std::atomic<bool> segment_desc_publish_pending_{false};
     std::atomic<bool> rpc_meta_publish_pending_{false};
+    ErrorCode ConnectMasterEndpoint(const std::string& address);
     ErrorCode SwitchLeader(const ha::MasterView& target_view);
     void LeaderMonitorThreadMain();
     void StorageHeartbeatThreadMain();
