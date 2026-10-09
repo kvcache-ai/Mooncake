@@ -1,7 +1,5 @@
 #pragma once
 
-#include <zmq.hpp>
-
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -15,6 +13,7 @@
 #include <thread>
 #include <vector>
 
+#include "conductor/zmq/transport.h"
 #include "conductor/zmq/event_type.h"
 
 namespace mooncake::conductor::zmq {
@@ -136,9 +135,9 @@ class ZMQClient {
     ZMQClientConfig config_;
     std::shared_ptr<EventHandler> event_handler_;
 
-    ::zmq::context_t zmq_context_{1};
-    std::unique_ptr<::zmq::socket_t> sub_socket_;
-    std::unique_ptr<::zmq::socket_t> replay_socket_;
+    detail::Context zmq_context_{1};
+    std::unique_ptr<detail::Socket> sub_socket_;
+    std::unique_ptr<detail::Socket> replay_socket_;
 
     // State management.
     mutable std::shared_mutex mu_;
