@@ -1070,6 +1070,59 @@ void MasterAdminServer::HandleSegmentStatus(
     });
 }
 
+struct HttpSetSegmentStatusRequest {
+    std::string status;
+};
+YLT_REFL(HttpSetSegmentStatusRequest, status);
+
+void MasterAdminServer::HandleSetSegmentStatus(
+    coro_http::coro_http_request& req, coro_http::coro_http_response& resp) {
+    const std::string segment_name(req.get_decode_query_value("segment"));
+    if (segment_name.empty()) {
+        WriteErrorResponse(resp, coro_http::status_type::bad_request,
+                           ErrorCode::INVALID_PARAMS,
+                           "Missing segment query parameter");
+        return;
+    }
+
+    HttpSetSegmentStatusRequest request;
+    try {
+        struct_json::from_json(request, req.get_body());
+    } catch (const std::exception& e) {
+        WriteErrorResponse(resp, coro_http::status_type::bad_request,
+                           ErrorCode::INVALID_PARAMS,
+                           std::string("Invalid JSON body: ") + e.what());
+        return;
+    }
+    SegmentStatus status;
+    if (request.status == "OK") {
+        status = SegmentStatus::OK;
+    } else if (request.status == "DRAINING") {
+        status = SegmentStatus::DRAINING;
+    } else {
+        WriteErrorResponse(resp, coro_http::status_type::bad_request,
+                           ErrorCode::INVALID_PARAMS,
+                           "status must be OK or DRAINING");
+        return;
+    }
+
+    WithActiveService(resp, [&](auto service) {
+        auto result = service->SetSegmentStatus(segment_name, status);
+        if (!result.has_value()) {
+            WriteErrorResponse(resp, ErrorCodeToHttpStatus(result.error()),
+                               result.error());
+            return;
+        }
+
+        HttpSegmentStatusResponse payload;
+        payload.success = true;
+        payload.segment = segment_name;
+        payload.status = static_cast<int32_t>(status);
+        payload.status_name = EnumToString(status);
+        WriteJsonResponse(resp, coro_http::status_type::ok, payload);
+    });
+}
+
 struct HttpDiskReplicaInfo {
     std::string file_path;
     uint64_t object_size = 0;
@@ -1402,6 +1455,11 @@ void MasterAdminServer::RegisterHandler() {
         "/api/v1/segments/status",
         [this](coro_http_request& req, coro_http_response& resp) {
             HandleSegmentStatus(req, resp);
+        });
+    http_server_.set_http_handler<PUT>(
+        "/api/v1/segments/status",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            HandleSetSegmentStatus(req, resp);
         });
     http_server_.set_http_handler<GET>(
         "/api/v1/tenant_quotas",

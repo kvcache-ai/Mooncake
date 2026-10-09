@@ -475,18 +475,25 @@ class PendingTransferManager:
                 owned = set(current.registrations)
                 terminal_state = current.terminal_state
             failures: list[tuple[int, Union[str, int]]] = []
-            failed_addresses: set[int] = set()
             ordered_addresses = tuple(sorted(owned, reverse=True))
-            for index, address in enumerate(ordered_addresses):
+            for address in ordered_addresses:
                 try:
                     result = cleanup_engine.unregister_memory(address)
+                    if result != 0:
+                        failures.append((address, result))
+                    else:
+                        with _pending_transfer_lock:
+                            current = _pending_transfers.get(pending_transfer_id)
+                            if current is None:
+                                raise TransferEngineError(
+                                    "pending transfer disappeared during registration "
+                                    f"cleanup: {pending_transfer_id}"
+                                )
+                            current.registrations.discard(address)
                 except BaseException as error:
-                    unresolved = set(ordered_addresses[index:])
-                    unresolved.update(failed_addresses)
                     with _pending_transfer_lock:
                         current = _pending_transfers.get(pending_transfer_id)
                         if current is not None:
-                            current.registrations = unresolved
                             current.ticket = _UndrainableCompletionUnknownTicket()
                             current.restart_required = True
                     detail = (
@@ -499,21 +506,6 @@ class PendingTransferManager:
                     if callable(add_note):
                         add_note(detail)
                     raise
-                if result != 0:
-                    failures.append((address, result))
-                    failed_addresses.add(address)
-            with _pending_transfer_lock:
-                if failures:
-                    current = _pending_transfers.get(pending_transfer_id)
-                    if current is not None:
-                        current.registrations = failed_addresses
-                else:
-                    current = _pending_transfers.get(pending_transfer_id)
-                    if current is None:
-                        raise TransferEngineError(
-                            f"pending transfer does not exist: {pending_transfer_id}"
-                        )
-                    current.registrations = set()
             if failures:
                 raise TransferEngineError(
                     f"pending transfer registration cleanup failed: {failures}"

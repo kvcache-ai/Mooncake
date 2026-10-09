@@ -61,6 +61,11 @@ if(USE_HIP)
   target_sources(transport PUBLIC $<TARGET_OBJECTS:hip_transport>)
 endif()
 
+if(USE_HYLINK)
+  add_subdirectory(hylink_transport)
+  target_sources(transport PUBLIC $<TARGET_OBJECTS:hylink_transport>)
+endif()
+
 if(USE_MACA)
   add_subdirectory(maca_transport)
   target_sources(transport PUBLIC $<TARGET_OBJECTS:maca_transport>)

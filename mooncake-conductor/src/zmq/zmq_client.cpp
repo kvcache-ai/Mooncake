@@ -1,11 +1,9 @@
 #include "conductor/zmq/zmq_client.h"
 
 #include <glog/logging.h>
-#include <zmq_addon.hpp>
 
 #include <algorithm>
 #include <array>
-#include <iterator>
 #include <limits>
 #include <utility>
 #include <vector>
@@ -61,9 +59,7 @@ std::string ValidateConfig(const ZMQClientConfig& config) {
 
 ZMQClient::ZMQClient(ZMQClientConfig config,
                      std::shared_ptr<EventHandler> handler)
-    : config_(std::move(config)),
-      event_handler_(std::move(handler)),
-      reconnect_delay_(config_.reconnect_delay) {}
+    : config_(std::move(config)), event_handler_(std::move(handler)) {}
 
 ZMQClient::~ZMQClient() { Stop(); }
 
@@ -123,7 +119,7 @@ void ZMQClient::Loop() {
 void ZMQClient::HandleReconnect() {
     LOG(INFO) << "Attempting to reconnect to the service. service="
               << config_.cache_pool_key
-              << " reconnectDelay=" << reconnect_delay_.count() << "ms";
+              << " reconnectDelay=" << config_.reconnect_delay.count() << "ms";
 
     // Poll the stop flag in slices so Stop() is honored within ~one poll
     // interval.
@@ -172,31 +168,28 @@ std::string ZMQClient::Connect() {
     CleanupSocketsLocked();
 
     try {
-        auto sock = std::make_unique<::zmq::socket_t>(zmq_context_,
-                                                      ::zmq::socket_type::sub);
+        auto sock = std::make_unique<detail::Socket>(zmq_context_, ZMQ_SUB);
         // Enable IPv6 for dual-stack support
-        sock->set(::zmq::sockopt::ipv6, 1);
+        sock->set(ZMQ_IPV6, 1);
         // Set the receive HWM before connect; ZeroMQ applies it at connection
         // setup.
         if (config_.rcv_hwm > 0) {
-            sock->set(::zmq::sockopt::rcvhwm, config_.rcv_hwm);
+            sock->set(ZMQ_RCVHWM, config_.rcv_hwm);
         }
         sock->connect(config_.endpoint);
         // Important: Subscribe to all topics
-        sock->set(::zmq::sockopt::subscribe, "");
+        sock->SubscribeAll();
 
         sub_socket_ = std::move(sock);
         if (ReplayEnabled(config_)) {
-            auto replay_socket = std::make_unique<::zmq::socket_t>(
-                zmq_context_, ::zmq::socket_type::dealer);
-            replay_socket->set(::zmq::sockopt::ipv6, 1);
+            auto replay_socket =
+                std::make_unique<detail::Socket>(zmq_context_, ZMQ_DEALER);
+            replay_socket->set(ZMQ_IPV6, 1);
             replay_socket->connect(config_.replay_endpoint);
             replay_socket_ = std::move(replay_socket);
         }
         connected_ = true;
-
-        reconnect_delay_ = config_.reconnect_delay;
-    } catch (const ::zmq::error_t& e) {
+    } catch (const detail::Error& e) {
         CleanupSocketsLocked();
         return std::string("failed to connect to ") + config_.endpoint + ": " +
                e.what();
@@ -220,7 +213,7 @@ std::string ZMQClient::Consume() {
     // Grab the socket pointer under the read lock and poll outside the
     // lock; the socket is only destroyed by Stop() (after this thread
     // joins) or by Connect() on this same thread, so that is safe here.
-    ::zmq::socket_t* socket;
+    detail::Socket* socket;
     {
         std::shared_lock lock(mu_);
         socket = sub_socket_.get();
@@ -230,15 +223,16 @@ std::string ZMQClient::Consume() {
     }
 
     try {
-        ::zmq::pollitem_t items[] = {{socket->handle(), 0, ZMQ_POLLIN, 0}};
-        const int rc = ::zmq::poll(items, 1, config_.poll_timeout);
+        zmq_pollitem_t items[] = {{socket->handle(), 0, ZMQ_POLLIN, 0}};
+        const int rc =
+            detail::Check(zmq_poll(items, 1, config_.poll_timeout.count()));
         if (rc == 0) {
             return AttemptRecovery();
         }
         if (!(items[0].revents & ZMQ_POLLIN)) {
             return "";
         }
-    } catch (const ::zmq::error_t& e) {
+    } catch (const detail::Error& e) {
         return std::string("poll error: ") + e.what();
     }
 
@@ -250,7 +244,7 @@ std::string ZMQClient::Consume() {
 }
 
 std::string ZMQClient::ProcessMessage() {
-    ::zmq::socket_t* socket;
+    detail::Socket* socket;
     {
         std::shared_lock lock(mu_);
         socket = sub_socket_.get();
@@ -262,14 +256,13 @@ std::string ZMQClient::ProcessMessage() {
     // Once the first frame is readable, the complete multipart message is
     // available. Consume it through the final frame so malformed frame counts
     // cannot block shutdown or leak a tail into the next message.
-    std::vector<::zmq::message_t> frames;
+    std::vector<detail::Message> frames;
     try {
-        const auto frame_count = ::zmq::recv_multipart(
-            *socket, std::back_inserter(frames), ::zmq::recv_flags::none);
+        const auto frame_count = detail::ReceiveMultipart(*socket, frames);
         if (!frame_count) {
             return "failed to receive multipart message";
         }
-    } catch (const ::zmq::error_t& e) {
+    } catch (const detail::Error& e) {
         return std::string("recv error: ") + e.what();
     }
 
@@ -412,16 +405,7 @@ std::string ZMQClient::DispatchMessage(const std::string& topic,
         if (decoded.ok) {
             batch = std::move(decoded.batch);
         } else {
-            // A SGLang-backed Mooncake Store still uses the Mooncake map
-            // envelope.  Native SGLang is attempted first; fall back to the
-            // Mooncake decoder for that deployment mode.
-            auto mooncake = DecodeMooncakeEventBatch(payload, payload_size);
-            if (mooncake.ok) {
-                batch = std::move(mooncake.batch);
-            } else {
-                decode_error = "SGLang decode failed: " + decoded.error +
-                               "; Mooncake fallback failed: " + mooncake.error;
-            }
+            decode_error = std::move(decoded.error);
         }
     } else {
         auto decoded = DecodeVllmEventBatch(payload, payload_size);
@@ -658,7 +642,7 @@ void ZMQClient::MarkStale(const std::string& reason) {
 ZMQClient::ReplayResult ZMQClient::RequestReplay(
     int64_t from_seq, std::optional<int64_t> until_seq,
     std::chrono::steady_clock::time_point recovery_deadline) {
-    ::zmq::socket_t* socket;
+    detail::Socket* socket;
     {
         std::shared_lock lock(mu_);
         socket = replay_socket_.get();
@@ -682,11 +666,11 @@ ZMQClient::ReplayResult ZMQClient::RequestReplay(
         // A DEALER must add the empty delimiter that a REQ socket would add
         // automatically. vLLM's ROUTER expects [identity, empty, from_seq].
         const std::string empty;
-        const std::array<::zmq::const_buffer, 2> request = {
-            ::zmq::buffer(empty),
-            ::zmq::buffer(req, sizeof(req)),
+        const std::array<std::string_view, 2> request = {
+            detail::Buffer(empty),
+            detail::Buffer(req, sizeof(req)),
         };
-        if (!::zmq::send_multipart(*socket, request)) {
+        if (!detail::SendMultipart(*socket, request)) {
             return fail("failed to send replay request",
                         ReplayFailure::kRetryable);
         }
@@ -714,27 +698,27 @@ ZMQClient::ReplayResult ZMQClient::RequestReplay(
                              recovery_deadline - now));
             receive_timeout =
                 std::max(receive_timeout, std::chrono::milliseconds(1));
-            socket->set(
-                ::zmq::sockopt::rcvtimeo,
-                static_cast<int>(std::min<int64_t>(
-                    receive_timeout.count(), std::numeric_limits<int>::max())));
+            socket->set(ZMQ_RCVTIMEO, static_cast<int>(std::min<int64_t>(
+                                          receive_timeout.count(),
+                                          std::numeric_limits<int>::max())));
 
-            std::vector<::zmq::message_t> frames;
-            const auto frame_count = ::zmq::recv_multipart(
-                *socket, std::back_inserter(frames), ::zmq::recv_flags::none);
+            std::vector<detail::Message> frames;
+            const auto frame_count = detail::ReceiveMultipart(*socket, frames);
             if (!frame_count) {
                 return fail("failed to receive replay response: timed out",
                             ReplayFailure::kRetryable);
             }
-            // The ROUTER sends [identity, empty, sequence, payload]. The
-            // DEALER strips only the routing identity.
-            if (frames.size() != 3 || !frames[0].empty()) {
+            // DEALER strips only the ROUTER identity. SGLang/older vLLM reply
+            // [empty, sequence, payload]; newer vLLM adds topic after empty,
+            // including an empty topic in its end marker.
+            if ((frames.size() != 3 && frames.size() != 4) ||
+                !frames[0].empty()) {
                 return fail("invalid replay response frame count or delimiter",
                             ReplayFailure::kRetryable);
             }
 
-            auto& seq_msg = frames[1];
-            auto& payload_msg = frames[2];
+            auto& seq_msg = frames[frames.size() - 2];
+            auto& payload_msg = frames.back();
             if (seq_msg.size() != 8) {
                 return fail("invalid replay sequence length",
                             ReplayFailure::kRetryable);
@@ -781,6 +765,7 @@ ZMQClient::ReplayResult ZMQClient::RequestReplay(
             next_expected = replay_seq + 1;
 
             const size_t payload_size = payload_msg.size();
+            const size_t topic_size = frames.size() == 4 ? frames[1].size() : 0;
             const bool message_limit_exceeded =
                 existing_messages >= config_.max_recovery_buffered_messages ||
                 messages.size() >=
@@ -790,19 +775,23 @@ ZMQClient::ReplayResult ZMQClient::RequestReplay(
                 replay_bytes >
                     config_.max_recovery_buffered_bytes - existing_bytes ||
                 payload_size > config_.max_recovery_buffered_bytes -
-                                   existing_bytes - replay_bytes;
+                                   existing_bytes - replay_bytes ||
+                topic_size > config_.max_recovery_buffered_bytes -
+                                 existing_bytes - replay_bytes - payload_size;
             if (message_limit_exceeded || byte_limit_exceeded) {
                 return fail("replay response exceeds recovery buffer limits",
                             ReplayFailure::kUnrecoverable);
             }
-            replay_bytes += payload_size;
-            messages.push_back({.topic = "",
-                                .sequence = replay_seq,
-                                .payload = std::string(static_cast<const char*>(
-                                                           payload_msg.data()),
-                                                       payload_size)});
+            replay_bytes += payload_size + topic_size;
+            messages.push_back(
+                {.topic =
+                     frames.size() == 4 ? frames[1].to_string() : std::string{},
+                 .sequence = replay_seq,
+                 .payload =
+                     std::string(static_cast<const char*>(payload_msg.data()),
+                                 payload_size)});
         }
-    } catch (const ::zmq::error_t& e) {
+    } catch (const detail::Error& e) {
         return fail(std::string("replay request failed: ") + e.what(),
                     ReplayFailure::kRetryable);
     }
@@ -811,12 +800,6 @@ ZMQClient::ReplayResult ZMQClient::RequestReplay(
 std::string ZMQClient::ResetReplaySocket() {
     std::unique_lock lock(mu_);
     if (replay_socket_) {
-        try {
-            replay_socket_->close();
-        } catch (const ::zmq::error_t& e) {
-            replay_socket_.reset();
-            return e.what();
-        }
         replay_socket_.reset();
     }
     if (!connected_ || !ReplayEnabled(config_)) {
@@ -824,12 +807,12 @@ std::string ZMQClient::ResetReplaySocket() {
     }
 
     try {
-        auto socket = std::make_unique<::zmq::socket_t>(
-            zmq_context_, ::zmq::socket_type::dealer);
-        socket->set(::zmq::sockopt::ipv6, 1);
+        auto socket =
+            std::make_unique<detail::Socket>(zmq_context_, ZMQ_DEALER);
+        socket->set(ZMQ_IPV6, 1);
         socket->connect(config_.replay_endpoint);
         replay_socket_ = std::move(socket);
-    } catch (const ::zmq::error_t& e) {
+    } catch (const detail::Error& e) {
         return e.what();
     }
     return "";
