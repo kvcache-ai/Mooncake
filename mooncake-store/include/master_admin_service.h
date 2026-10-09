@@ -23,9 +23,12 @@ class WrappedMasterService;
 
 class MasterAdminServer {
    public:
-    MasterAdminServer(uint16_t http_port, bool enable_metric_reporting);
+    MasterAdminServer(uint16_t http_port, bool enable_metric_reporting,
+                      std::string http_host = "0.0.0.0");
 
     ~MasterAdminServer();
+
+    uint16_t port() const { return http_server_.port(); }
 
     bool Start();
 
@@ -67,6 +70,8 @@ class MasterAdminServer {
                               coro_http::coro_http_response& resp);
     void HandleHealth(coro_http::coro_http_request& req,
                       coro_http::coro_http_response& resp);
+    void HandleVersion(coro_http::coro_http_request& req,
+                       coro_http::coro_http_response& resp);
     void HandleRole(coro_http::coro_http_request& req,
                     coro_http::coro_http_response& resp);
     void HandleHaStatus(coro_http::coro_http_request& req,
@@ -83,6 +88,10 @@ class MasterAdminServer {
                                  coro_http::coro_http_response& resp);
     void HandleQuerySegment(coro_http::coro_http_request& req,
                             coro_http::coro_http_response& resp);
+    void HandleGetDfsShardCount(coro_http::coro_http_request& req,
+                                coro_http::coro_http_response& resp);
+    async_simple::coro::Lazy<void> HandleExpandDfsShards(
+        coro_http::coro_http_request& req, coro_http::coro_http_response& resp);
     void HandleCreateDrainJob(coro_http::coro_http_request& req,
                               coro_http::coro_http_response& resp);
     void HandleQueryDrainJob(coro_http::coro_http_request& req,
@@ -91,7 +100,11 @@ class MasterAdminServer {
                               coro_http::coro_http_response& resp);
     void HandleSegmentStatus(coro_http::coro_http_request& req,
                              coro_http::coro_http_response& resp);
+    void HandleSetSegmentStatus(coro_http::coro_http_request& req,
+                                coro_http::coro_http_response& resp);
     void HandleBatchQueryKeys(coro_http::coro_http_request& req,
+                              coro_http::coro_http_response& resp);
+    void HandleKvEventsStatus(coro_http::coro_http_request& req,
                               coro_http::coro_http_response& resp);
     void HandleGetTenantQuotas(coro_http::coro_http_request& req,
                                coro_http::coro_http_response& resp);
@@ -99,20 +112,27 @@ class MasterAdminServer {
                                  coro_http::coro_http_response& resp);
     void HandleDeleteTenantQuota(coro_http::coro_http_request& req,
                                  coro_http::coro_http_response& resp);
-    void HandleGetDefaultTenantQuota(coro_http::coro_http_request& req,
-                                     coro_http::coro_http_response& resp);
-    void HandleSetDefaultTenantQuota(coro_http::coro_http_request& req,
-                                     coro_http::coro_http_response& resp);
+    void HandleRemoveAll(coro_http::coro_http_request& req,
+                         coro_http::coro_http_response& resp);
 
     void RegisterHandler();
+    void RefreshStorageMetrics() const;
 
     uint16_t http_port_;
+    std::string http_host_;
     bool enable_metric_reporting_ = false;
     coro_http::coro_http_server http_server_;
     std::thread metric_report_thread_;
     std::atomic<bool> metric_report_running_{false};
     std::binary_semaphore metric_report_stop_sem_{0};
     std::atomic<bool> started_{false};
+    // Retained by each handler across its blocking operation and completion.
+    // Only one admin expansion may be pending, including disconnected requests.
+    std::shared_ptr<std::atomic<bool>> dfs_expansion_running_{
+        std::make_shared<std::atomic<bool>>(false)};
+    // Serializes storage projection with service-plane handoff so a refresh
+    // that sampled the old leader cannot publish after it becomes unavailable.
+    mutable std::mutex storage_metrics_refresh_mutex_;
     mutable std::mutex state_mutex_;
     ha::MasterRuntimeState state_{ha::MasterRuntimeState::kStarting};
     std::optional<ha::MasterView> leader_view_;

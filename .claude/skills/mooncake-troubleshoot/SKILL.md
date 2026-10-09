@@ -1,6 +1,6 @@
 ---
 name: mooncake-troubleshoot
-description: Automatically diagnose Mooncake deployment and runtime issues. Checks services (mooncake_master, metadata server), RDMA devices, environment variables, connectivity, memory limits, and analyzes logs for common error patterns. Use when Mooncake deployment fails, services won't start, connections fail, or you encounter runtime errors like "Error from etcd client", "No matched device found", "Failed to register memory", "NO_AVAILABLE_HANDLE", or any RDMA/networking issues. Also use when user asks to troubleshoot, debug, diagnose, or fix Mooncake problems.
+description: Automatically diagnose Mooncake deployment and runtime issues. Checks services (mooncake_master, metadata server), RDMA devices, environment variables, connectivity, memory limits, object integrity, and analyzes logs for common error patterns. Use when Mooncake deployment fails, services won't start, connections fail, data is corrupted or garbled, or you encounter runtime errors like "Error from etcd client", "No matched device found", "Failed to register memory", "NO_AVAILABLE_HANDLE", "CHECKSUM_MISMATCH", or any RDMA/networking issues. Also use when user asks to troubleshoot, debug, diagnose, or fix Mooncake problems.
 ---
 
 # Mooncake Deployment Troubleshooting
@@ -62,8 +62,8 @@ echo "https_proxy: $https_proxy"
 Verify critical environment variables are set correctly:
 
 ```bash
-# Display all MC_* variables
-env | grep ^MC_
+# Display Mooncake variables
+env | grep -E '^(MC_|MOONCAKE_STORE_CHECKSUM=)'
 
 # Key variables to check:
 echo "MC_METADATA_SERVER: $MC_METADATA_SERVER"
@@ -76,6 +76,7 @@ echo "MC_GID_INDEX: $MC_GID_INDEX"
 echo "MC_MTU: $MC_MTU"
 echo "MC_IB_PORT: $MC_IB_PORT"
 echo "MC_ENABLE_DEST_DEVICE_AFFINITY: $MC_ENABLE_DEST_DEVICE_AFFINITY"
+echo "MOONCAKE_STORE_CHECKSUM: $MOONCAKE_STORE_CHECKSUM"
 ```
 
 **Key variables:**
@@ -88,6 +89,7 @@ echo "MC_ENABLE_DEST_DEVICE_AFFINITY: $MC_ENABLE_DEST_DEVICE_AFFINITY"
 - `MC_GID_INDEX` - RDMA GID index (set if GID is all zeros)
 - `MC_MTU` - RDMA MTU size
 - `MC_ENABLE_DEST_DEVICE_AFFINITY=1` - Reduce QP creation (fix "Failed to create QP")
+- `MOONCAKE_STORE_CHECKSUM=1` - Enable diagnostic object-level CRC-64 checks; set before starting every writer and reader client process
 
 ### 4. RDMA Device Check
 
@@ -216,6 +218,8 @@ Search logs for common error patterns and their meanings:
   - **Fix:** Increase `default_kv_lease_ttl` in master startup
 - `OBJECT_NOT_FOUND` (-704) → Object doesn't exist
 - `SEGMENT_NOT_FOUND` (-101) → No available segments
+- `CHECKSUM_MISMATCH` (-801) → Full-object read differs from the checksum captured before the write
+  - **Action:** Treat the read as failed and do not use the destination buffer
 - `Failed to get description of XXX` → Segment name mismatch
   - **Fix:** Ensure segment name matches `local_hostname` from peer
 
@@ -244,6 +248,18 @@ env | grep MC_FORCE_TCP
 - RDMA device names must exist on the machine
 - Ports must not be in use by other services
 
+### 9. Object Integrity Diagnostics
+
+When the user reports corrupted data or garbled output that may originate from Mooncake Store:
+
+1. Verify that the Store clients, primary master, and standby master use checksum-capable binaries from the same version.
+2. Set `MOONCAKE_STORE_CHECKSUM=1` before starting every writer and reader client process, then restart or recreate existing clients.
+3. Reproduce with full-object `put`/`upsert` and `get` operations. Range reads, including `get_into_ranges`, are not covered.
+4. If `CHECKSUM_MISMATCH` (-801) is returned, the covered read differs from the checksum captured over the writer's source object. Treat the read as failed and do not consume the destination buffer.
+5. If `object_checksum_absent` appears at VLOG(1), metadata has no checksum and verification was skipped. This can occur for existing objects or objects written by clients without the switch.
+6. If verification succeeds, continue investigating corruption outside the covered Store path. A checksum mismatch identifies a difference but does not by itself distinguish transfer corruption from storage corruption.
+7. Warn that this diagnostic mode scans all object data, stages GPU buffers to host memory, and disables the local hot cache. Disable it after diagnosis.
+
 ## Error Code Quick Reference
 
 ### Transfer Engine Error Codes
@@ -266,6 +282,7 @@ env | grep MC_FORCE_TCP
 | -707 | LEASE_EXPIRED | Lease expired | Increase lease TTL |
 | -704 | OBJECT_NOT_FOUND | Object doesn't exist | Check object key |
 | -101 | SEGMENT_NOT_FOUND | No available segments | Check segment registration |
+| -801 | CHECKSUM_MISMATCH | Full-object data differs from its stored checksum | Reject the read buffer and investigate the Store data path |
 | -900 | RPC_FAIL | RPC failed | Check network/master |
 | -1000 | ETCD_OPERATION_ERROR | etcd operation failed | Check etcd status |
 

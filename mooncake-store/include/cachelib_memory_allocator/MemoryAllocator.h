@@ -101,6 +101,15 @@ class MemoryAllocator {
     //        allocation handed out by this allocator.
     void free(void* memory);
 
+    struct ImportedAllocation {
+        void* address;
+        uint32_t size;
+    };
+
+    // Imports final live allocations into a new, empty allocator.
+    bool importAllocations(PoolId id,
+                           const std::vector<ImportedAllocation>& allocations);
+
     // Memory pool interface. The memory pools must be established before the
     // first allocation happens. Currently we dont support adding / removing
     // pools dynamically.

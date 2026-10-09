@@ -1,94 +1,60 @@
 #include <algorithm>
+#include <atomic>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
 
 #include <glog/logging.h>
+#include "ascend_allocator.h"
 #include "config.h"
 #include "acl/acl.h"
 #include "transport/ascend_transport/ascend_direct_transport/adxl_compat.h"
+#include "transport/ascend_transport/ascend_direct_transport/context_manager.h"
 
 namespace mooncake {
 namespace {
-constexpr size_t kFabricMemPageSize = 1024 * 1024 * 1024;  // 1G
-#ifdef ASCEND_SUPPORT_FABRIC_MEM
-struct AllocRecord {
-    aclrtDrvMemHandle handle;
-    bool is_direct_alloc;
-};
-std::mutex g_vmm_alloc_mutex;
-std::unordered_map<void *, AllocRecord> g_vmm_alloc_records;
+constexpr size_t kFabricMemPageSize = 1024ULL * 1024 * 1024;  // 1G
+constexpr size_t kMemAccessDescCount = 1;
+constexpr int kBestEffortStartPercent = 100;
+constexpr int kBestEffortMinPercent = 50;
+constexpr int kBestEffortPercentStep = 10;
 
-int allocate_physical_memory(size_t total_size, aclrtDrvMemHandle &handle) {
-    int32_t user_dev_id;
-    auto ret = aclrtGetDevice(&user_dev_id);
-    if (ret != ACL_ERROR_NONE) {
-        LOG(ERROR) << "Failed to get device: " << ret;
-        return -1;
+std::atomic<uint32_t> g_agent_alloc_next{0};
+
+bool BindNextAgentDevice() {
+    if (!globalConfig().ascend_agent_mode) {
+        return true;
     }
-    int32_t physical_dev_id;
-    ret = aclrtGetPhyDevIdByLogicDevId(user_dev_id, &physical_dev_id);
-    if (ret != ACL_ERROR_NONE) {
-        LOG(ERROR) << "Failed to get physical dev id: " << ret;
-        return -1;
+    auto &mgr = ContextManager::getInstance();
+    if (!mgr.isInitialized()) {
+        return true;
     }
-    aclrtPhysicalMemProp prop = {};
-    prop.handleType = ACL_MEM_HANDLE_TYPE_NONE;
-    prop.allocationType = ACL_MEM_ALLOCATION_TYPE_PINNED;
-    prop.memAttr = ACL_MEM_P2P_HUGE1G;
-    prop.location.type = ACL_MEM_LOCATION_TYPE_HOST_NUMA;
-    // Only 0 2 4 6 is available for fabric mem, map 4 device to one numa.
-    const int32_t kDevicesPerChip = 4;
-    const int32_t kNumaNodeStep = 2;
-    prop.location.id = (physical_dev_id / kDevicesPerChip) * kNumaNodeStep;
-    prop.reserve = 0;
-    LOG(INFO) << "Malloc host memory for numa:" << prop.location.id;
-    ret = aclrtMallocPhysical(&handle, total_size, &prop, 0);
-    if (ret != ACL_ERROR_NONE) {
-        LOG(INFO) << "Malloc host memory for numa:" << prop.location.id
-                  << " failed, try common allocate instead.";
-        prop.location.type = ACL_MEM_LOCATION_TYPE_HOST;
-        prop.location.id = 0;
-        ret = aclrtMallocPhysical(&handle, total_size, &prop, 0);
-        if (ret != ACL_ERROR_NONE) {
-            LOG(INFO) << "Malloc failed, try smaller page instead.";
-            prop.memAttr = ACL_MEM_P2P_HUGE;
-            ret = aclrtMallocPhysical(&handle, total_size, &prop, 0);
-            if (ret != ACL_ERROR_NONE) {
-                LOG(ERROR) << "Failed to allocate memory: " << ret;
-                return -1;
-            }
-        }
+    const uint32_t n = mgr.getDeviceCount();
+    if (n == 0) {
+        return true;
     }
-    return 0;
+    const uint32_t idx = g_agent_alloc_next.load(std::memory_order_relaxed) % n;
+    if (!mgr.setCurrentContext(static_cast<int32_t>(idx))) {
+        LOG(ERROR) << "Failed to set agent-mode alloc context for device "
+                   << idx;
+        return false;
+    }
+    return true;
 }
 
-// Direct ACL VMM allocation (always bypasses adxl MallocMem).
-// Used by shm_helper when ascend_agent_mode && ascend_use_fabric_mem.
-void *allocate_vmm_memory_direct_impl(size_t total_size) {
-    aclrtDrvMemHandle handle = nullptr;
-    if (allocate_physical_memory(total_size, handle) != 0) {
-        return nullptr;
+void CommitAgentDeviceSlot() {
+    if (!globalConfig().ascend_agent_mode) {
+        return;
     }
-    void *va = nullptr;
-    auto ret = aclrtReserveMemAddress(&va, total_size, 0, nullptr, 1);
-    if (ret != ACL_ERROR_NONE) {
-        LOG(ERROR) << "Failed to reserve memory: " << ret;
-        (void)aclrtFreePhysical(handle);
-        return nullptr;
+    if (!ContextManager::getInstance().isInitialized()) {
+        return;
     }
-    ret = aclrtMapMem(va, total_size, 0, handle, 0);
-    if (ret != ACL_ERROR_NONE) {
-        LOG(ERROR) << "Failed to map memory: " << ret;
-        (void)aclrtReleaseMemAddress(va);
-        (void)aclrtFreePhysical(handle);
-        return nullptr;
-    }
-    std::lock_guard<std::mutex> lock(g_vmm_alloc_mutex);
-    g_vmm_alloc_records.emplace(va, AllocRecord{handle, true});
-    return va;
+    g_agent_alloc_next.fetch_add(1, std::memory_order_relaxed);
 }
-#endif
+
+size_t align_down_1g(size_t n) {
+    return (n / kFabricMemPageSize) * kFabricMemPageSize;
+}
 
 struct StoreMemRange {
     void *base;
@@ -104,6 +70,262 @@ void remove_store_memory_range(void *ptr) {
         [ptr](const StoreMemRange &range) { return range.base == ptr; });
     g_store_mem_ranges.erase(it, g_store_mem_ranges.end());
 }
+
+#ifdef ASCEND_SUPPORT_FABRIC_MEM
+struct AllocRecord {
+    aclrtDrvMemHandle handle;
+    bool is_direct_alloc;
+    size_t size;
+};
+std::mutex g_vmm_alloc_mutex;
+std::unordered_map<void *, AllocRecord> g_vmm_alloc_records;
+
+int allocate_physical_memory(size_t total_size, aclrtDrvMemHandle &handle,
+                             bool quiet) {
+    int32_t user_dev_id;
+    auto ret = aclrtGetDevice(&user_dev_id);
+    if (ret != ACL_ERROR_NONE) {
+        if (!quiet) {
+            LOG(ERROR) << "Failed to get device: " << ret;
+        }
+        return -1;
+    }
+    int32_t physical_dev_id;
+    ret = aclrtGetPhyDevIdByLogicDevId(user_dev_id, &physical_dev_id);
+    if (ret != ACL_ERROR_NONE) {
+        if (!quiet) {
+            LOG(ERROR) << "Failed to get physical dev id: " << ret;
+        }
+        return -1;
+    }
+    aclrtPhysicalMemProp prop = {};
+    prop.handleType = ACL_MEM_HANDLE_TYPE_NONE;
+    prop.allocationType = ACL_MEM_ALLOCATION_TYPE_PINNED;
+    prop.memAttr = ACL_MEM_P2P_HUGE1G;
+    prop.location.type = ACL_MEM_LOCATION_TYPE_HOST_NUMA;
+    // Only 0 2 4 6 is available for fabric mem, map 4 device to one numa.
+    const int32_t kDevicesPerChip = 4;
+    const int32_t kNumaNodeStep = 2;
+    prop.location.id = (physical_dev_id / kDevicesPerChip) * kNumaNodeStep;
+    prop.reserve = 0;
+    if (!quiet) {
+        LOG(INFO) << "Malloc host memory for numa:" << prop.location.id;
+    }
+    ret = aclrtMallocPhysical(&handle, total_size, &prop, 0);
+    if (ret != ACL_ERROR_NONE) {
+        if (!quiet) {
+            LOG(INFO) << "Malloc host memory for numa:" << prop.location.id
+                      << " failed, try common allocate instead.";
+        }
+        prop.location.type = ACL_MEM_LOCATION_TYPE_HOST;
+        prop.location.id = 0;
+        ret = aclrtMallocPhysical(&handle, total_size, &prop, 0);
+        if (ret != ACL_ERROR_NONE) {
+            if (!quiet) {
+                LOG(INFO) << "Malloc failed, try smaller page instead.";
+            }
+            prop.memAttr = ACL_MEM_P2P_HUGE;
+            ret = aclrtMallocPhysical(&handle, total_size, &prop, 0);
+            if (ret != ACL_ERROR_NONE) {
+                if (!quiet) {
+                    LOG(ERROR) << "Failed to allocate memory: " << ret;
+                }
+                return -1;
+            }
+        }
+    }
+    return 0;
+}
+
+// Host physical pages mapped behind a VA are only bound to the host by
+// aclrtMapMem; the NPU needs an explicit grant before SDMA/HCCS can touch them.
+// adxl::MallocMem grants it internally for its own allocations, so the direct
+// ACL VMM path has to do the same. location.id is a driver logical id while
+// aclrtGetDevice returns a user id (ASCEND_RT_VISIBLE_DEVICES), so convert.
+int grant_current_device_access(void *va, size_t total_size, bool quiet) {
+    int32_t user_dev_id = -1;
+    auto ret = aclrtGetDevice(&user_dev_id);
+    if (ret != ACL_ERROR_NONE) {
+        if (!quiet) {
+            LOG(ERROR) << "Failed to get device for MemSetAccess: " << ret;
+        }
+        return -1;
+    }
+    int32_t driver_dev_id = -1;
+    ret = aclrtGetLogicDevIdByUserDevId(user_dev_id, &driver_dev_id);
+    if (ret != ACL_ERROR_NONE) {
+        if (!quiet) {
+            LOG(ERROR) << "Failed to get logical device id for MemSetAccess: "
+                       << ret;
+        }
+        return -1;
+    }
+
+    aclrtMemAccessDesc desc = {};
+    desc.flags = ACL_RT_MEM_ACCESS_FLAGS_READWRITE;
+    desc.location.type = ACL_MEM_LOCATION_TYPE_DEVICE;
+    desc.location.id = static_cast<uint32_t>(driver_dev_id);
+    ret = aclrtMemSetAccess(va, total_size, &desc, kMemAccessDescCount);
+    if (ret != ACL_ERROR_NONE) {
+        if (!quiet) {
+            LOG(ERROR) << "Failed to set memory access: " << ret;
+        }
+        return -1;
+    }
+    return 0;
+}
+
+// Direct ACL VMM allocation (always bypasses adxl MallocMem).
+// Used by shm_helper when ascend_agent_mode && ascend_use_fabric_mem.
+void *allocate_vmm_memory_direct_impl(size_t total_size, bool quiet = false) {
+    aclrtDrvMemHandle handle = nullptr;
+    if (allocate_physical_memory(total_size, handle, quiet) != 0) {
+        return nullptr;
+    }
+    void *va = nullptr;
+    auto ret = aclrtReserveMemAddress(&va, total_size, 0, nullptr, 1);
+    if (ret != ACL_ERROR_NONE) {
+        if (!quiet) {
+            LOG(ERROR) << "Failed to reserve memory: " << ret;
+        }
+        (void)aclrtFreePhysical(handle);
+        return nullptr;
+    }
+    ret = aclrtMapMem(va, total_size, 0, handle, 0);
+    if (ret != ACL_ERROR_NONE) {
+        if (!quiet) {
+            LOG(ERROR) << "Failed to map memory: " << ret;
+        }
+        (void)aclrtReleaseMemAddress(va);
+        (void)aclrtFreePhysical(handle);
+        return nullptr;
+    }
+    if (grant_current_device_access(va, total_size, quiet) != 0) {
+        (void)aclrtUnmapMem(va);
+        (void)aclrtReleaseMemAddress(va);
+        (void)aclrtFreePhysical(handle);
+        return nullptr;
+    }
+    std::lock_guard<std::mutex> lock(g_vmm_alloc_mutex);
+    g_vmm_alloc_records.emplace(va, AllocRecord{handle, true, total_size});
+    return va;
+}
+
+// Exact-size fabric alloc: use adxl when the weak symbol is present; otherwise
+// direct VMM. Matches original ascend_allocate_memory behavior — adxl failure
+// does not fall back to direct VMM. When quiet=true, skip failure ERROR logs
+// (used by best-effort percentile probes).
+void *allocate_fabric_exact(size_t total_size, bool quiet = false) {
+    void *va = nullptr;
+    if (&adxl::AdxlEngine::MallocMem != nullptr) {
+        auto status = adxl::AdxlEngine::MallocMem(adxl::MemType::MEM_HOST,
+                                                  total_size, &va);
+        if (status != adxl::SUCCESS) {
+            if (!quiet) {
+                LOG(ERROR) << "Failed to allocate fabric memory, errmsg: "
+                           << aclGetRecentErrMsg();
+            }
+            return nullptr;
+        }
+        LOG(INFO) << "Call adxl MallocMem suc, va:" << va
+                  << ", size:" << total_size;
+        std::lock_guard<std::mutex> lock(g_vmm_alloc_mutex);
+        g_vmm_alloc_records.emplace(va,
+                                    AllocRecord{nullptr, false, total_size});
+        return va;
+    }
+    va = allocate_vmm_memory_direct_impl(total_size, quiet);
+    if (va) {
+        std::lock_guard<std::mutex> store_lock(g_store_mem_mutex);
+        g_store_mem_ranges.push_back({va, total_size});
+    }
+    return va;
+}
+#endif
+
+void *AllocateStoreMemoryImpl(size_t total_size, const std::string &protocol) {
+    if (globalConfig().ascend_use_fabric_mem) {
+#ifdef ASCEND_SUPPORT_FABRIC_MEM
+        return allocate_fabric_exact(total_size);
+#else
+        (void)total_size;
+        LOG(ERROR) << "Fabric mem mode is not supported, please upgrade Ascend "
+                      "HDK and CANN.";
+        return nullptr;
+#endif
+    }
+    if (protocol == "ubshmem") {
+        LOG(ERROR) << "ubshmem protocol only support fabric mem, please "
+                      "configure ASCEND_ENABLE_USE_FABRIC_MEM environment.";
+        return nullptr;
+    }
+
+    void *buffer = nullptr;
+    auto ret = aclrtMallocHost(&buffer, total_size);
+    if (ret != ACL_ERROR_NONE) {
+        LOG(ERROR) << "Failed to allocate memory: " << ret;
+        return nullptr;
+    }
+    LOG(INFO) << "aclrtMallocHost suc, addr: " << buffer;
+    if (buffer) {
+        std::lock_guard<std::mutex> store_lock(g_store_mem_mutex);
+        g_store_mem_ranges.push_back({buffer, total_size});
+    }
+    return buffer;
+}
+
+void *AllocateExactOnBoundDevice(size_t total_size, const std::string &protocol,
+                                 size_t *actual_size,
+                                 AscendHostAllocFn host_alloc,
+                                 size_t host_alignment,
+                                 bool defer_hugetlb_population) {
+    void *ptr =
+        host_alloc != nullptr
+            ? host_alloc(total_size, host_alignment, defer_hugetlb_population)
+            : AllocateStoreMemoryImpl(total_size, protocol);
+    if (ptr == nullptr) {
+        return nullptr;
+    }
+    *actual_size = total_size;
+    CommitAgentDeviceSlot();
+    return ptr;
+}
+
+#ifdef ASCEND_SUPPORT_FABRIC_MEM
+void *AllocateFabricBestEffort(size_t target_size, size_t *actual_size) {
+    // Try 100%, 90%, ... down to 50% of configured size (1G-aligned).
+    // Skip candidates that fall below the unaligned 50% floor after round-down
+    // (e.g. 2.1 GiB target → 50% is 1.05 GiB → 1 GiB must not be accepted).
+    // Probe attempts are quiet; only the final failure logs ERROR.
+    const size_t min_size =
+        target_size * static_cast<size_t>(kBestEffortMinPercent) / 100;
+    size_t last_tried = 0;
+    for (int pct = kBestEffortStartPercent; pct >= kBestEffortMinPercent;
+         pct -= kBestEffortPercentStep) {
+        size_t sz =
+            (pct == kBestEffortStartPercent)
+                ? align_down_1g(target_size)
+                : align_down_1g(target_size * static_cast<size_t>(pct) / 100);
+        if (sz == 0 || sz < min_size || sz == last_tried) {
+            continue;
+        }
+        last_tried = sz;
+        void *ptr = allocate_fabric_exact(sz, /*quiet=*/true);
+        if (ptr != nullptr) {
+            *actual_size = sz;
+            CommitAgentDeviceSlot();
+            if (sz < target_size) {
+                LOG(WARNING) << "Fabric mem best-effort: target=" << target_size
+                             << ", actual=" << sz << " (" << pct << "%)";
+            }
+            return ptr;
+        }
+    }
+    LOG(ERROR) << "Fabric mem best-effort failed: cannot allocate at least "
+               << kBestEffortMinPercent << "% of target=" << target_size;
+    return nullptr;
+}
+#endif
 }  // namespace
 
 void *ascend_allocate_vmm_memory_direct(size_t total_size) {
@@ -130,52 +352,46 @@ aclrtDrvMemHandle ascend_get_physical_handle_from_va(void *va) {
 }
 
 void *ascend_allocate_memory(size_t total_size, const std::string &protocol) {
-    if (globalConfig().ascend_use_fabric_mem) {
-        void *va = nullptr;
-#ifdef ASCEND_SUPPORT_FABRIC_MEM
-        if (&adxl::AdxlEngine::MallocMem != nullptr) {
-            // Try to use adxl_engine's MallocMem
-            auto status = adxl::AdxlEngine::MallocMem(adxl::MemType::MEM_HOST,
-                                                      total_size, &va);
-            if (status != adxl::SUCCESS) {
-                LOG(ERROR) << "Failed to allocate fabric memory, errmsg: "
-                           << aclGetRecentErrMsg();
-                return nullptr;
-            }
-            LOG(INFO) << "Call adxl MallocMem suc, va:" << va;
-            std::lock_guard<std::mutex> lock(g_vmm_alloc_mutex);
-            g_vmm_alloc_records.emplace(va, AllocRecord{nullptr, false});
-            return va;
-        }
-        va = allocate_vmm_memory_direct_impl(total_size);
-        if (va) {
-            std::lock_guard<std::mutex> store_lock(g_store_mem_mutex);
-            g_store_mem_ranges.push_back({va, total_size});
-        }
-        return va;
-#else
-        LOG(ERROR) << "Fabric mem mode is not supported, please upgrade Ascend "
-                      "HDK and CANN.";
-#endif
-    }
-    if (protocol == "ubshmem") {
-        LOG(ERROR) << "ubshmem protocol only support fabric mem, please "
-                      "configure ASCEND_ENABLE_USE_FABRIC_MEM environment.";
+    if (!BindNextAgentDevice()) {
         return nullptr;
     }
+    void *ptr = AllocateStoreMemoryImpl(total_size, protocol);
+    if (ptr) {
+        CommitAgentDeviceSlot();
+    }
+    return ptr;
+}
 
-    void *buffer = nullptr;
-    auto ret = aclrtMallocHost(&buffer, total_size);
-    if (ret != ACL_ERROR_NONE) {
-        LOG(ERROR) << "Failed to allocate memory: " << ret;
+void *ascend_allocate_memory_best_effort(size_t target_size,
+                                         const std::string &protocol,
+                                         size_t *actual_size,
+                                         AscendHostAllocFn host_alloc,
+                                         size_t host_alignment,
+                                         bool defer_hugetlb_population) {
+    if (actual_size == nullptr) {
+        LOG(ERROR) << "ascend_allocate_memory_best_effort: actual_size is null";
         return nullptr;
     }
-    LOG(INFO) << "aclrtMallocHost suc, addr: " << buffer;
-    if (buffer) {
-        std::lock_guard<std::mutex> store_lock(g_store_mem_mutex);
-        g_store_mem_ranges.push_back({buffer, total_size});
+    *actual_size = 0;
+    if (!BindNextAgentDevice()) {
+        return nullptr;
     }
-    return buffer;
+    if (!globalConfig().ascend_use_fabric_mem) {
+        return AllocateExactOnBoundDevice(target_size, protocol, actual_size,
+                                          host_alloc, host_alignment,
+                                          defer_hugetlb_population);
+    }
+    (void)protocol;
+    (void)host_alloc;
+    (void)host_alignment;
+    (void)defer_hugetlb_population;
+#ifdef ASCEND_SUPPORT_FABRIC_MEM
+    return AllocateFabricBestEffort(target_size, actual_size);
+#else
+    LOG(ERROR) << "Fabric mem mode is not supported, please upgrade Ascend "
+                  "HDK and CANN.";
+    return nullptr;
+#endif
 }
 
 bool ascend_is_store_memory(void *addr, size_t length) {
@@ -190,6 +406,31 @@ bool ascend_is_store_memory(void *addr, size_t length) {
             return true;
         }
     }
+    return false;
+}
+
+bool ascend_is_direct_vmm_memory(void *addr, size_t length) {
+    if (!addr || length == 0) return false;
+    const auto addr_start = reinterpret_cast<uintptr_t>(addr);
+#ifdef ASCEND_SUPPORT_FABRIC_MEM
+    std::lock_guard<std::mutex> lock(g_vmm_alloc_mutex);
+    for (const auto &[base, record] : g_vmm_alloc_records) {
+        if (!record.is_direct_alloc) {
+            continue;
+        }
+        // Only the start address identifies the allocation. A caller may hand
+        // over a longer range than was allocated - a store segment is mounted
+        // at its requested size while best-effort fabric allocation can return
+        // less - and demanding full containment would silently keep that
+        // buffer as MEM_HOST.
+        const auto base_start = reinterpret_cast<uintptr_t>(base);
+        if (addr_start >= base_start && addr_start < base_start + record.size) {
+            return true;
+        }
+    }
+#else
+    (void)addr_start;
+#endif
     return false;
 }
 

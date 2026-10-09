@@ -1,12 +1,95 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+// csignal must precede coro_http_client.hpp: the bundled ylt's coro_io.hpp
+// calls std::signal without including <csignal> itself.
+#include <chrono>
+#include <csignal>
 #include <cstdlib>
+#include <optional>
+#include <sstream>
 #include <string>
+#include <thread>
+#include <unordered_set>
+#include <ylt/coro_http/coro_http_client.hpp>
 
 #include "client_metric.h"
+#include "common/network.h"
+#include "environment_variables.h"
+#include "real_client.h"
+#include "test_server_helpers.h"
+#include "version.h"
 
 namespace mooncake::test {
+namespace {
+
+struct HttpResponse {
+    int status;
+    std::string body;
+};
+
+HttpResponse FetchUrl(const std::string& url) {
+    coro_http::coro_http_client client;
+    auto res = client.get(url);
+    return HttpResponse{res.status, std::string(res.resp_body)};
+}
+
+int GetTestPort(std::unordered_set<int>& used_ports) {
+    for (int i = 0; i < 100; ++i) {
+        int port = getFreeTcpPort();
+        if (port > 0 && port < 65535 && !used_ports.contains(port)) {
+            used_ports.insert(port);
+            return port;
+        }
+    }
+    return -1;
+}
+
+size_t CountOccurrences(const std::string& text, const std::string& needle) {
+    if (needle.empty()) return 0;
+
+    size_t count = 0;
+    size_t position = 0;
+    while ((position = text.find(needle, position)) != std::string::npos) {
+        ++count;
+        position += needle.size();
+    }
+    return count;
+}
+
+class ScopedEnv {
+   public:
+    explicit ScopedEnv(const char* name) : name_(name) {
+        const char* value = std::getenv(name);
+        if (value) old_value_ = value;
+    }
+
+    ~ScopedEnv() {
+        if (old_value_) {
+            setenv(name_, old_value_->c_str(), 1);
+        } else {
+            unsetenv(name_);
+        }
+    }
+
+   private:
+    const char* name_;
+    std::optional<std::string> old_value_;
+};
+
+tl::expected<void, ErrorCode> SetupClientWithHttp(
+    const std::shared_ptr<RealClient>& client, const std::string& client_addr,
+    const std::string& master_addr, bool enable_http, int http_port,
+    size_t global_segment_size = 0) {
+    return client->setup_internal(
+        client_addr, "P2PHANDSHAKE", global_segment_size,
+        /*local_buffer_size=*/0, "tcp", "", master_addr, nullptr, "",
+        /*local_rpc_port=*/50052, /*enable_ssd_offload=*/false,
+        /*start_offload_rpc_server=*/false, /*ssd_offload_path=*/"",
+        /*tenant_id=*/"default", enable_http, http_port);
+}
+
+}  // namespace
 
 class ClientMetricsTest : public ::testing::Test {
    protected:
@@ -128,6 +211,10 @@ TEST_F(ClientMetricsTest, ClientMetricsSummaryTest) {
     EXPECT_TRUE(summary.find("ExistKey: count=1") != std::string::npos);
     EXPECT_TRUE(summary.find("get_buffer: count=1") != std::string::npos);
     EXPECT_TRUE(summary.find("put_batch: count=1") != std::string::npos);
+    // The build is named inline so the summary alone identifies the binary.
+    EXPECT_TRUE(summary.find("Version: " + GetMooncakeStoreVersion()) !=
+                std::string::npos);
+    EXPECT_TRUE(summary.find(MOONCAKE_DISPLAY_VERSION) != std::string::npos);
 
     std::cout << "Full Client Metrics Summary:\n" << summary << std::endl;
 }
@@ -185,16 +272,47 @@ TEST_F(ClientMetricsTest, CompareWithSerializedMetrics) {
                 summary.find("No data") != std::string::npos);
 }
 
+TEST_F(ClientMetricsTest, HybridHistogramSerializesEachLabelOnce) {
+    ylt::metric::hybrid_histogram_1t histogram(
+        "request_latency", "Request latency", {10.0, 20.0}, {}, {"route"});
+    histogram.observe({"alpha"}, 5);
+    histogram.observe({"beta"}, 15);
+
+    std::string serialized;
+    histogram.serialize(serialized);
+
+    EXPECT_EQ(
+        CountOccurrences(serialized, "request_latency_bucket{route=\"alpha\","),
+        3);
+    EXPECT_EQ(
+        CountOccurrences(serialized, "request_latency_bucket{route=\"beta\","),
+        3);
+}
+
+TEST_F(ClientMetricsTest, ZeroSumHybridHistogramPreservesExistingMetrics) {
+    ylt::metric::hybrid_histogram_1t histogram(
+        "request_latency", "Request latency", {10.0}, {}, {"route"});
+    histogram.observe({"idle"}, 0);
+    std::string serialized = "existing_metric 1\n";
+
+    histogram.serialize(serialized);
+
+    EXPECT_EQ(serialized, "existing_metric 1\n");
+}
+
 TEST_F(ClientMetricsTest, BandwidthSummaryRespectsEnvFlag) {
-    setenv("MC_STORE_CLIENT_METRIC_BANDWIDTH", "0", 1);
+    ScopedEnv bandwidth_env(
+        ClientMetricEnvironmentVariables::MC_STORE_CLIENT_METRIC_BANDWIDTH
+            .name);
+    setenv(
+        ClientMetricEnvironmentVariables::MC_STORE_CLIENT_METRIC_BANDWIDTH.name,
+        "0", 1);
     auto metrics = ClientMetric::Create();
     ASSERT_NE(metrics, nullptr);
 
     metrics->transfer_metric.total_read_bytes.inc(1024);
     std::string summary = metrics->summary_metrics();
     EXPECT_TRUE(summary.find("Average Read Throughput:") == std::string::npos);
-
-    unsetenv("MC_STORE_CLIENT_METRIC_BANDWIDTH");
 }
 
 TEST_F(ClientMetricsTest, SummaryCanOmitMasterRpcMetrics) {
@@ -302,6 +420,344 @@ TEST_F(ClientMetricsTest, SerializeWithoutDynamicLabels) {
         metrics.serialize(serialized);
         verify(serialized);
     }
+}
+
+TEST_F(ClientMetricsTest, BuildInfoMetricIsSerialized) {
+    ClientMetric metrics(0);
+
+    std::string serialized;
+    metrics.serialize(serialized);
+
+    ASSERT_NE(serialized.find("mooncake_build_info{"), std::string::npos)
+        << "build info metric missing from serialized output";
+    // Label order inside the series is not asserted: only the presence of both
+    // labels with the compiled-in values matters for scraping and grouping.
+    EXPECT_NE(serialized.find("version=\"" + GetMooncakeStoreVersion() + "\""),
+              std::string::npos)
+        << "RPC handshake version missing from build info labels";
+    EXPECT_NE(serialized.find("display_version=\"" +
+                              std::string(MOONCAKE_DISPLAY_VERSION) + "\""),
+              std::string::npos)
+        << "display version missing from build info labels";
+
+    // Info-style metric: the value is fixed at 1, so exactly one series is
+    // emitted and its value follows the closing brace of the label set.
+    EXPECT_EQ(CountOccurrences(serialized, "mooncake_build_info{"), 1u);
+    const auto metric_pos = serialized.find("mooncake_build_info{");
+    const auto brace_end = serialized.find('}', metric_pos);
+    ASSERT_NE(brace_end, std::string::npos);
+    const auto line_end = serialized.find('\n', brace_end);
+    const std::string value_part =
+        serialized.substr(brace_end + 1, line_end == std::string::npos
+                                             ? std::string::npos
+                                             : line_end - brace_end - 1);
+    EXPECT_NE(value_part.find('1'), std::string::npos)
+        << "build info value should be 1, got:" << value_part;
+}
+
+TEST_F(ClientMetricsTest, BuildInfoMetricKeepsCallerLabels) {
+    // Caller supplied labels identify the instance; the version labels are
+    // added on top of them rather than replacing them.
+    std::map<std::string, std::string> static_labels = {
+        {"instance_id", "12345"}, {"cluster_id", "cluster1"}};
+    ClientMetric metrics(0, static_labels);
+
+    std::string serialized;
+    metrics.serialize(serialized);
+
+    const auto metric_pos = serialized.find("mooncake_build_info{");
+    ASSERT_NE(metric_pos, std::string::npos);
+    const auto brace_end = serialized.find('}', metric_pos);
+    ASSERT_NE(brace_end, std::string::npos);
+    const std::string labels =
+        serialized.substr(metric_pos, brace_end - metric_pos);
+
+    EXPECT_NE(labels.find("instance_id=\"12345\""), std::string::npos);
+    EXPECT_NE(labels.find("cluster_id=\"cluster1\""), std::string::npos);
+    EXPECT_NE(labels.find("version=\"" + GetMooncakeStoreVersion() + "\""),
+              std::string::npos);
+}
+
+TEST_F(ClientMetricsTest, HttpMetricsEndpointsReturnData) {
+    std::unordered_set<int> used_ports;
+    int master_rpc_port = GetTestPort(used_ports);
+    int master_http_port = GetTestPort(used_ports);
+    int http_port = GetTestPort(used_ports);
+    int client_port = GetTestPort(used_ports);
+    ASSERT_GT(master_rpc_port, 0);
+    ASSERT_GT(master_http_port, 0);
+    ASSERT_GT(http_port, 0);
+    ASSERT_GT(client_port, 0);
+
+    mooncake::testing::InProcMaster master;
+    ASSERT_TRUE(master.Start(mooncake::InProcMasterConfigBuilder()
+                                 .set_rpc_port(master_rpc_port)
+                                 .set_http_metrics_port(master_http_port)
+                                 .set_http_metadata_port(0)
+                                 .build()));
+
+    auto client = RealClient::create();
+    auto setup_result = SetupClientWithHttp(
+        client, "127.0.0.1:" + std::to_string(client_port),
+        master.master_address(), /*enable_http=*/true, http_port);
+    ASSERT_TRUE(setup_result.has_value()) << toString(setup_result.error());
+
+    auto metrics =
+        FetchUrl("http://127.0.0.1:" + std::to_string(http_port) + "/metrics");
+    EXPECT_EQ(metrics.status, 200);
+    EXPECT_EQ(metrics.body.find("metrics not available"), std::string::npos);
+    // A request-only client does not start the storage heartbeat.
+    EXPECT_EQ(metrics.body.find("mooncake_client_master_heartbeat_status_ok"),
+              std::string::npos);
+    EXPECT_EQ(
+        metrics.body.find(
+            "mooncake_client_master_heartbeat_observation_timestamp_seconds"),
+        std::string::npos);
+
+    auto summary = FetchUrl("http://127.0.0.1:" + std::to_string(http_port) +
+                            "/metrics/summary");
+    EXPECT_EQ(summary.status, 200);
+    EXPECT_NE(summary.body.find("Client Metrics Summary"), std::string::npos);
+
+    EXPECT_EQ(client->tearDownAll(), 0);
+}
+
+TEST_F(ClientMetricsTest, HeartbeatObservationsUseClientMetricLabels) {
+    ClientMetric metrics(
+        0, {{"cluster_id", "cluster1"}, {"instance_id", "12345"}});
+    auto& heartbeat = metrics.master_heartbeat_metric;
+    heartbeat.EndConnection(heartbeat.BeginConnection(), true);
+    heartbeat.Observe(heartbeat.BeginObservation(), false, 100.5);
+    std::string serialized;
+    metrics.serialize(serialized);
+    const std::string labels =
+        "{cluster_id=\"cluster1\",instance_id=\"12345\"}";
+    EXPECT_NE(serialized.find("mooncake_client_master_heartbeat_status_ok" +
+                              labels + " 0\n"),
+              std::string::npos);
+    EXPECT_NE(
+        serialized.find(
+            "mooncake_client_master_heartbeat_observation_timestamp_seconds" +
+            labels + " 100.500000\n"),
+        std::string::npos);
+}
+
+TEST_F(ClientMetricsTest, HttpHeartbeatMetricsRecoverAfterMasterRestart) {
+    ScopedEnv timeout("MC_RPC_TIMEOUT_MS");
+    setenv("MC_RPC_TIMEOUT_MS", "200", 1);
+    mooncake::testing::InProcMaster master;
+    ASSERT_TRUE(master.Start(mooncake::InProcMasterConfigBuilder()
+                                 .set_http_metadata_port(0)
+                                 .build()));
+    std::unordered_set<int> used_ports;
+    const int http_port = GetTestPort(used_ports);
+    const int client_port = GetTestPort(used_ports);
+    ASSERT_GT(http_port, 0);
+    ASSERT_GT(client_port, 0);
+    auto client = RealClient::create();
+    auto setup_result = SetupClientWithHttp(
+        client, "127.0.0.1:" + std::to_string(client_port),
+        master.master_address(), true, http_port, 16 * 1024 * 1024);
+    ASSERT_TRUE(setup_result.has_value()) << toString(setup_result.error());
+
+    const std::string url =
+        "http://127.0.0.1:" + std::to_string(http_port) + "/metrics";
+    const std::string status_name =
+        "mooncake_client_master_heartbeat_status_ok";
+    const std::string timestamp_name =
+        "mooncake_client_master_heartbeat_observation_timestamp_seconds";
+    auto sample = [](const std::string& body, const std::string& name) {
+        std::istringstream lines(body);
+        std::string line;
+        while (std::getline(lines, line)) {
+            if (line.starts_with(name + "{") || line.starts_with(name + " "))
+                return line;
+        }
+        return std::string{};
+    };
+    HttpResponse response;
+    auto wait_for = [&](bool known) {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(15);
+        do {
+            response = FetchUrl(url);
+            if (response.status == 200) {
+                const auto status = sample(response.body, status_name);
+                const auto timestamp = sample(response.body, timestamp_name);
+                if (known ? (status.ends_with(" 1") && !timestamp.empty())
+                          : (status.empty() && timestamp.empty()))
+                    return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        } while (std::chrono::steady_clock::now() < deadline);
+        return false;
+    };
+
+    ASSERT_TRUE(wait_for(true)) << response.body;
+    EXPECT_NE(sample(response.body, status_name).find("client_mode=\"real\""),
+              std::string::npos);
+    const auto before = std::stod(
+        sample(response.body, timestamp_name)
+            .substr(sample(response.body, timestamp_name).rfind(' ') + 1));
+    master.Stop();
+    ASSERT_TRUE(wait_for(false)) << response.body;
+    ASSERT_TRUE(
+        master.Start(mooncake::InProcMasterConfigBuilder()
+                         .set_rpc_port(master.rpc_port())
+                         .set_http_metrics_port(master.http_metrics_port())
+                         .set_http_metadata_port(0)
+                         .build()));
+    ASSERT_TRUE(wait_for(true)) << response.body;
+    const auto timestamp = sample(response.body, timestamp_name);
+    EXPECT_GT(std::stod(timestamp.substr(timestamp.rfind(' ') + 1)), before);
+    EXPECT_EQ(client->tearDownAll(), 0);
+}
+
+TEST_F(ClientMetricsTest, HttpMetricsConfigParserTrimsWhitespace) {
+    std::unordered_set<int> used_ports;
+    int master_rpc_port = GetTestPort(used_ports);
+    int master_http_port = GetTestPort(used_ports);
+    int http_port = GetTestPort(used_ports);
+    int client_port = GetTestPort(used_ports);
+    ASSERT_GT(master_rpc_port, 0);
+    ASSERT_GT(master_http_port, 0);
+    ASSERT_GT(http_port, 0);
+    ASSERT_GT(client_port, 0);
+
+    mooncake::testing::InProcMaster master;
+    ASSERT_TRUE(master.Start(mooncake::InProcMasterConfigBuilder()
+                                 .set_rpc_port(master_rpc_port)
+                                 .set_http_metrics_port(master_http_port)
+                                 .set_http_metadata_port(0)
+                                 .build()));
+
+    ConfigDict config = {
+        {CONFIG_KEY_LOCAL_HOSTNAME, "127.0.0.1:" + std::to_string(client_port)},
+        {CONFIG_KEY_METADATA_SERVER, "P2PHANDSHAKE"},
+        {CONFIG_KEY_GLOBAL_SEGMENT_SIZE, "0"},
+        {CONFIG_KEY_LOCAL_BUFFER_SIZE, "0"},
+        {CONFIG_KEY_PROTOCOL, "tcp"},
+        {CONFIG_KEY_MASTER_SERVER_ADDR, master.master_address()},
+        {CONFIG_KEY_ENABLE_CLIENT_HTTP_SERVER, " true "},
+        {CONFIG_KEY_CLIENT_HTTP_PORT, " " + std::to_string(http_port) + " "},
+    };
+
+    auto client = RealClient::create();
+    auto setup_result = client->setup_internal(config);
+    ASSERT_TRUE(setup_result.has_value()) << toString(setup_result.error());
+
+    auto health =
+        FetchUrl("http://127.0.0.1:" + std::to_string(http_port) + "/health");
+    EXPECT_EQ(health.status, 200);
+    EXPECT_NE(health.body.find("\"status\":\"healthy\""), std::string::npos);
+
+    EXPECT_EQ(client->tearDownAll(), 0);
+}
+
+TEST_F(ClientMetricsTest, HttpMetricsConfigParserRejectsInvalidIntegers) {
+    const char* invalid_ports[] = {
+        "9300x",
+        "999999999999999999999999",
+    };
+
+    for (const char* invalid_port : invalid_ports) {
+        ConfigDict config = {
+            {CONFIG_KEY_LOCAL_HOSTNAME, "127.0.0.1:1"},
+            {CONFIG_KEY_METADATA_SERVER, "P2PHANDSHAKE"},
+            {CONFIG_KEY_GLOBAL_SEGMENT_SIZE, "0"},
+            {CONFIG_KEY_LOCAL_BUFFER_SIZE, "0"},
+            {CONFIG_KEY_PROTOCOL, "tcp"},
+            {CONFIG_KEY_ENABLE_CLIENT_HTTP_SERVER, "true"},
+            {CONFIG_KEY_CLIENT_HTTP_PORT, invalid_port},
+        };
+
+        auto client = RealClient::create();
+        auto setup_result = client->setup_internal(config);
+        ASSERT_FALSE(setup_result.has_value()) << invalid_port;
+        EXPECT_EQ(setup_result.error(), ErrorCode::INVALID_PARAMS)
+            << invalid_port;
+    }
+}
+
+TEST_F(ClientMetricsTest, HttpMetricsEndpointReturns503WhenMetricsDisabled) {
+    ScopedEnv metrics_env("MC_STORE_CLIENT_METRIC");
+    setenv("MC_STORE_CLIENT_METRIC", "0", 1);
+
+    std::unordered_set<int> used_ports;
+    int master_rpc_port = GetTestPort(used_ports);
+    int master_http_port = GetTestPort(used_ports);
+    int http_port = GetTestPort(used_ports);
+    int client_port = GetTestPort(used_ports);
+    ASSERT_GT(master_rpc_port, 0);
+    ASSERT_GT(master_http_port, 0);
+    ASSERT_GT(http_port, 0);
+    ASSERT_GT(client_port, 0);
+
+    mooncake::testing::InProcMaster master;
+    ASSERT_TRUE(master.Start(mooncake::InProcMasterConfigBuilder()
+                                 .set_rpc_port(master_rpc_port)
+                                 .set_http_metrics_port(master_http_port)
+                                 .set_http_metadata_port(0)
+                                 .build()));
+
+    auto client = RealClient::create();
+    auto setup_result = SetupClientWithHttp(
+        client, "127.0.0.1:" + std::to_string(client_port),
+        master.master_address(), /*enable_http=*/true, http_port);
+    ASSERT_TRUE(setup_result.has_value()) << toString(setup_result.error());
+
+    auto metrics =
+        FetchUrl("http://127.0.0.1:" + std::to_string(http_port) + "/metrics");
+    EXPECT_EQ(metrics.status, 503);
+    EXPECT_NE(metrics.body.find("metrics not available"), std::string::npos);
+
+    // `/version` is served without touching the metric collector, so disabling
+    // metrics must not take it down along with `/metrics`.
+    auto version =
+        FetchUrl("http://127.0.0.1:" + std::to_string(http_port) + "/version");
+    EXPECT_EQ(version.status, 200);
+    EXPECT_NE(
+        version.body.find("\"version\":\"" + GetMooncakeStoreVersion() + "\""),
+        std::string::npos);
+    EXPECT_NE(version.body.find("display_version"), std::string::npos);
+
+    EXPECT_EQ(client->tearDownAll(), 0);
+}
+
+TEST_F(ClientMetricsTest, HttpMetricsPortConflictDoesNotFailSetup) {
+    std::unordered_set<int> used_ports;
+    int master_rpc_port = GetTestPort(used_ports);
+    int master_http_port = GetTestPort(used_ports);
+    int http_port = GetTestPort(used_ports);
+    int first_client_port = GetTestPort(used_ports);
+    int second_client_port = GetTestPort(used_ports);
+    ASSERT_GT(master_rpc_port, 0);
+    ASSERT_GT(master_http_port, 0);
+    ASSERT_GT(http_port, 0);
+    ASSERT_GT(first_client_port, 0);
+    ASSERT_GT(second_client_port, 0);
+
+    mooncake::testing::InProcMaster master;
+    ASSERT_TRUE(master.Start(mooncake::InProcMasterConfigBuilder()
+                                 .set_rpc_port(master_rpc_port)
+                                 .set_http_metrics_port(master_http_port)
+                                 .set_http_metadata_port(0)
+                                 .build()));
+
+    auto first_client = RealClient::create();
+    auto first_setup = SetupClientWithHttp(
+        first_client, "127.0.0.1:" + std::to_string(first_client_port),
+        master.master_address(), /*enable_http=*/true, http_port);
+    ASSERT_TRUE(first_setup.has_value()) << toString(first_setup.error());
+
+    auto second_client = RealClient::create();
+    auto second_setup = SetupClientWithHttp(
+        second_client, "127.0.0.1:" + std::to_string(second_client_port),
+        master.master_address(), /*enable_http=*/true, http_port);
+    EXPECT_TRUE(second_setup.has_value()) << toString(second_setup.error());
+
+    EXPECT_EQ(second_client->tearDownAll(), 0);
+    EXPECT_EQ(first_client->tearDownAll(), 0);
 }
 
 }  // namespace mooncake::test

@@ -59,6 +59,9 @@ class Transport {
 
     struct TransferRequest {
         enum OpCode { READ, WRITE };
+        enum Priority { PRIO_HIGH = 0, PRIO_MEDIUM = 1, PRIO_LOW = 2 };
+
+        static constexpr uint64_t kNoTaskGroup = 0;
 
         OpCode opcode;
         void *source;
@@ -68,6 +71,16 @@ class Transport {
         int advise_retry_cnt = 0;
         // Per-request transport pin, TENT only.
         int transport_hint = 0;
+        // Business intent for TENT scheduling (0 = unspecified).
+        int intent_type = 0;
+        // Adjacent requests in a group may be scheduled as one unit.
+        uint64_t task_group_id = kNoTaskGroup;
+        // TENT transport selection priority; ignored by classic TE.
+        int priority = PRIO_MEDIUM;
+        // Optional local RNIC index for the classic RDMA transport. The index
+        // refers to Topology::getHcaList(); -1 keeps normal topology-based
+        // selection. The hint is advisory and only affects initial submission.
+        int nic_hint = -1;
     };
 
     enum TransferStatusEnum {
@@ -83,6 +96,12 @@ class Transport {
     struct TransferStatus {
         TransferStatusEnum s;
         size_t transferred_bytes;
+    };
+
+    struct NicLoadStats {
+        std::string device_name;
+        uint64_t inflight_bytes{0};
+        double ewma_bandwidth_bps{0.0};
     };
 
     struct BatchDesc;
@@ -113,17 +132,24 @@ class Transport {
         TransferRequest::OpCode opcode;
         SegmentID target_id;
         std::string peer_nic_path;
+        std::string source_location;
         SliceStatus status;
         TransferTask *task;
-        // EFA's libfabric MR keys are 64-bit (fi_mr_key()); RDMA verbs keys
+        // EFA/CXI's libfabric MR keys are 64-bit (fi_mr_key()); RDMA verbs keys
         // are 32-bit. Use a scoped alias so the width is defined in one place.
-#ifdef USE_EFA
+#if defined(USE_EFA) || defined(USE_CXI)
         using mr_key_t = uint64_t;
 #else
         using mr_key_t = uint32_t;
 #endif
         std::vector<mr_key_t> dest_rkeys;
         bool from_cache;
+
+        // Optional resource cleanup invoked exactly once before the slice is
+        // deleted or returned to the thread-local cache. The callback must not
+        // delete the slice.
+        using CleanupCallback = void (*)(Slice *);
+        CleanupCallback cleanup_callback = nullptr;
 
         union {
             struct {
@@ -132,7 +158,7 @@ class Transport {
                 mr_key_t dest_rkey;
                 int lkey_index;
                 int rkey_index;
-                volatile int *qp_depth;
+                std::atomic<int> *qp_depth;
                 uint32_t retry_cnt;
                 uint32_t max_retry_cnt;
                 RdmaEndPoint *endpoint;  // Endpoint used for this transfer
@@ -150,7 +176,12 @@ class Transport {
                 void *dest_addr;
                 void *cuda_stream;  // cudaStream_t, used by async NVLink
                                     // transport
+                int cuda_device;    // device that owns cuda_stream
             } local;
+            struct {
+                void *event;  // cudaEvent_t
+                int device_id;
+            } nccl;
             struct {
                 uint64_t dest_addr;
             } tcp;
@@ -175,6 +206,9 @@ class Transport {
             struct {
                 uint64_t dest_addr;
             } ubshmem;
+            struct {
+                uint64_t dest_offset;
+            } flagcx;
         };
 
        public:
@@ -182,37 +216,49 @@ class Transport {
             status = Slice::SUCCESS;
             __atomic_fetch_add(&task->transferred_bytes, length,
                                __ATOMIC_RELAXED);
-            __atomic_fetch_add(&task->success_slice_count, 1, __ATOMIC_RELAXED);
+            __atomic_fetch_add(&task->success_slice_count, 1, __ATOMIC_ACQ_REL);
 
-            check_batch_completion(false);
+            check_batch_completion(task, false);
         }
 
         void markFailed() {
             status = Slice::FAILED;
-            __atomic_fetch_add(&task->failed_slice_count, 1, __ATOMIC_RELAXED);
+            __atomic_fetch_add(&task->failed_slice_count, 1, __ATOMIC_ACQ_REL);
 
-            check_batch_completion(true);
+            check_batch_completion(task, true);
         }
+
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+        static void sealTaskSubmission(TransferTask *task) {
+            __atomic_store_n(&task->submission_sealed, true, __ATOMIC_RELEASE);
+            check_batch_completion(task, false, false);
+        }
+#endif
 
         volatile int64_t ts;
 
        private:
-        inline void check_batch_completion(bool is_failed) {
+        static inline void check_batch_completion(TransferTask *task,
+                                                  bool is_failed,
+                                                  bool count_slice = true) {
 #ifdef USE_EVENT_DRIVEN_COMPLETION
             auto &batch_desc = toBatchDesc(task->batch_id);
+            batch_desc.active_completion_callbacks.fetch_add(
+                1, std::memory_order_acq_rel);
             if (is_failed) {
                 batch_desc.has_failure.store(true, std::memory_order_relaxed);
             }
 
-            // When the last slice of a task completes, check if the entire task
-            // is done using a single atomic counter to avoid reading
-            // inconsistent results.
-            uint64_t prev_completed = __atomic_fetch_add(
-                &task->completed_slice_count, 1, __ATOMIC_RELAXED);
-
-            // Only the thread completing the final slice will see prev+1 ==
-            // slice_count.
-            if (prev_completed + 1 == task->slice_count) {
+            uint64_t completed =
+                count_slice ? __atomic_add_fetch(&task->completed_slice_count,
+                                                 1, __ATOMIC_ACQ_REL)
+                            : __atomic_load_n(&task->completed_slice_count,
+                                              __ATOMIC_ACQUIRE);
+            if (__atomic_load_n(&task->submission_sealed, __ATOMIC_ACQUIRE) &&
+                completed ==
+                    __atomic_load_n(&task->slice_count, __ATOMIC_ACQUIRE) &&
+                !__atomic_exchange_n(&task->completion_published, true,
+                                     __ATOMIC_ACQ_REL)) {
                 __atomic_store_n(&task->is_finished, true, __ATOMIC_RELAXED);
 
                 // Increment the number of finished tasks in the batch
@@ -248,6 +294,8 @@ class Transport {
                     batch_desc.completion_cv.notify_all();
                 }
             }
+            batch_desc.active_completion_callbacks.fetch_sub(
+                1, std::memory_order_acq_rel);
 #endif
         }
     };
@@ -280,6 +328,12 @@ class Transport {
         }
 
         void deallocate(Slice *slice) {
+            // Clear before invoking so a cached slice cannot carry a
+            // transport-specific cleanup callback into its next use.
+            auto cleanup = slice->cleanup_callback;
+            slice->cleanup_callback = nullptr;
+            if (cleanup) cleanup(slice);
+
             if (head_ - tail_ == kLazyDeleteSliceCapacity) {
                 delete slice;
                 return;
@@ -314,6 +368,8 @@ class Transport {
 
 #ifdef USE_EVENT_DRIVEN_COMPLETION
         volatile uint64_t completed_slice_count = 0;
+        volatile bool submission_sealed = true;
+        volatile bool completion_published = false;
 #endif
 
         // record the origin request
@@ -324,6 +380,7 @@ class Transport {
 #else
         const TransferRequest *request = nullptr;
 #endif
+        size_t request_count = 1;
         // record the slice list for freeing objects
         std::vector<Slice *> slice_list;
         ~TransferTask() {
@@ -343,11 +400,17 @@ class Transport {
         std::atomic<bool> has_failure{false};
         std::atomic<bool> is_finished{
             false};  // Completion flag for wait predicate
+        // Completion events do not populate the status-query byte cache.
+        std::atomic<bool> status_cached{false};
         std::atomic<uint64_t> finished_transfer_bytes{0};
 
 #ifdef USE_EVENT_DRIVEN_COMPLETION
         // Event-driven completion: tracks batch progress and notifies waiters
         std::atomic<uint64_t> finished_task_count{0};
+        // Number of completion callbacks currently inside
+        // check_batch_completion and therefore still allowed to read or update
+        // this BatchDesc.
+        std::atomic<uint64_t> active_completion_callbacks{0};
 
         // Synchronization primitives for direct notification
         std::mutex completion_mutex;
@@ -370,11 +433,23 @@ class Transport {
     virtual Status submitTransfer(
         BatchID batch_id, const std::vector<TransferRequest> &entries) = 0;
 
+    // Implementations must publish every slice synchronously before this
+    // method returns. After any return status, no worker may append or publish
+    // additional slices for these tasks.
     virtual Status submitTransferTask(
         const std::vector<TransferTask *> &task_list) {
         return Status::NotImplemented(
             "Transport::submitTransferTask is not implemented");
     }
+
+    virtual Status submitTransferTaskGroup(
+        const std::vector<TransferTask *> &task_list) {
+        return submitTransferTask(task_list);
+    }
+
+    // Grouped transports must append slices in request order so scatter can
+    // recover per-request status after a grouped task fails.
+    virtual bool supportsGroupedScatter() const { return false; }
 
     /// @brief Get the status of a submitted transfer. This function shall not
     /// be called again after completion.

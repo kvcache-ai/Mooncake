@@ -1,0 +1,169 @@
+#ifndef MOONCAKE_EP_ELASTIC_BUFFER_H
+#define MOONCAKE_EP_ELASTIC_BUFFER_H
+
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <optional>
+#include <string>
+#include <tuple>
+#include <vector>
+
+#include <mooncake_ep_buffer.h>
+
+namespace mooncake {
+
+struct ElasticLaunchContext;
+struct NcclElasticState;
+
+std::vector<int32_t> create_elastic_nccl_unique_id();
+
+struct ElasticTopology {
+    int rank_idx = 0;
+    int num_ranks = 1;
+    int num_rdma_ranks = 1;
+    int num_nvlink_ranks = 1;
+    int num_scaleout_ranks = 1;
+    int num_scaleup_ranks = 1;
+    int scaleout_rank_idx = 0;
+    int scaleup_rank_idx = 0;
+    bool hybrid_enabled = false;
+    bool scaleup_lsa = false;
+};
+
+struct ElasticConfig {
+    int64_t num_max_tokens_per_rank = 0;
+    int64_t hidden = 0;
+    int64_t num_topk = 0;
+    bool use_fp8_dispatch = false;
+    bool deterministic = false;
+    bool allow_hybrid_mode = true;
+    bool allow_multiple_reduction = true;
+    bool prefer_overlap_with_compute = true;
+    int sl_idx = 3;
+    int num_allocated_qps = 0;
+    int num_cpu_timeout_secs = 300;
+    int num_gpu_timeout_secs = 100;
+};
+
+class MooncakeElasticBuffer {
+   public:
+    MooncakeElasticBuffer(int rank, int num_ranks, int64_t num_buffer_bytes,
+                          int64_t num_max_tokens_per_rank, int64_t hidden,
+                          int64_t num_topk, bool use_fp8_dispatch,
+                          bool deterministic, bool allow_hybrid_mode,
+                          bool allow_multiple_reduction,
+                          bool prefer_overlap_with_compute, int sl_idx,
+                          int num_allocated_qps, int num_cpu_timeout_secs,
+                          int num_gpu_timeout_secs);
+
+    MooncakeElasticBuffer(int rank, int num_ranks, int64_t num_buffer_bytes,
+                          int64_t num_max_tokens_per_rank, int64_t hidden,
+                          int64_t num_topk, bool use_fp8_dispatch,
+                          bool deterministic, bool allow_hybrid_mode,
+                          bool allow_multiple_reduction,
+                          bool prefer_overlap_with_compute, int sl_idx,
+                          int num_allocated_qps, int num_cpu_timeout_secs,
+                          int num_gpu_timeout_secs,
+                          const std::string& transport,
+                          const std::vector<int32_t>& nccl_unique_id);
+
+    ~MooncakeElasticBuffer();
+
+    // For NCCL, the caller must first quiesce CUDA work and coordinate every
+    // communicator rank. The Python wrapper provides that collective protocol.
+    void destroy();
+    bool using_nccl() const { return nccl_state_ != nullptr; }
+
+    // Replace the NCCL communicator-owned resources while preserving this
+    // buffer's fixed logical rank and configuration. Every rank must join the
+    // matching NCCL setup sequence at a quiescent EP boundary with the same
+    // fresh unique ID; replacement ranks enter it through construction.
+    void reconfigure_nccl(const std::vector<int32_t>& nccl_unique_id);
+
+    static int64_t calculate_buffer_size(int num_ranks,
+                                         int64_t num_max_tokens_per_rank,
+                                         int64_t hidden, int64_t num_topk,
+                                         bool use_fp8_dispatch,
+                                         bool allow_hybrid_mode,
+                                         bool allow_multiple_reduction);
+
+    std::tuple<int, int> get_physical_domain_size() const;
+    std::tuple<int, int> get_logical_domain_size() const;
+    int get_theoretical_num_sms(int num_experts, int num_topk) const;
+
+    std::optional<EventHandle> dispatch(
+        uint64_t x_ptr, int x_element_size, uint64_t sf_ptr, int num_tokens,
+        int hidden, int num_sf_packs, int sf_token_stride, int sf_hidden_stride,
+        uint64_t topk_idx_ptr, int num_topk, uint64_t topk_weights_ptr,
+        uint64_t active_ranks_ptr, int num_experts, int num_max_tokens_per_rank,
+        int expert_alignment, int num_sms, bool do_expand,
+        bool async_with_compute_stream, uint64_t compute_stream_ptr,
+        bool cached_mode, int num_recv_tokens,
+        uint64_t psum_num_recv_tokens_per_scaleup_rank_ptr,
+        uint64_t psum_num_recv_tokens_per_expert_ptr,
+        uint64_t dst_buffer_slot_idx_ptr,
+        uint64_t token_metadata_at_forward_ptr,
+        uint64_t channel_linked_list_ptr, uint64_t recv_x_ptr,
+        uint64_t recv_x_scales_ptr, uint64_t recv_topk_idx_ptr,
+        uint64_t recv_topk_weights_ptr, uint64_t recv_src_metadata_ptr);
+
+    std::optional<EventHandle> combine(
+        uint64_t x_ptr, int num_input_tokens, int hidden, uint64_t topk_idx_ptr,
+        int num_combined_tokens, int num_topk, uint64_t topk_weights_ptr,
+        uint64_t psum_num_recv_tokens_per_scaleup_rank_ptr,
+        uint64_t recv_src_metadata_ptr, uint64_t token_metadata_at_forward_ptr,
+        uint64_t channel_linked_list_ptr, uint64_t active_ranks_ptr,
+        int num_experts, int num_max_tokens_per_rank, bool do_expand,
+        int num_sms, bool async_with_compute_stream,
+        uint64_t compute_stream_ptr, uint64_t combined_x_ptr);
+
+    MooncakeEpBuffer& native_buffer();
+
+    bool ibgda_disabled() const;
+    bool use_fast_path();
+    void update_local_qpns();
+    bool is_roce() const;
+    void sync_ibgda_peers(const std::vector<int64_t>& remote_addrs,
+                          const std::vector<int32_t>& remote_keys,
+                          const std::vector<std::vector<int32_t>>& peer_qpns,
+                          const std::vector<std::vector<int32_t>>& peer_lids,
+                          const std::vector<int64_t>& subnet_prefixes,
+                          const std::vector<int64_t>& interface_ids,
+                          const std::vector<int>& active_ranks_mask);
+    std::tuple<int64_t, int32_t> get_mr_info();
+    std::tuple<int64_t, int64_t> get_gid();
+    std::vector<int32_t> get_local_qpns();
+    std::vector<int32_t> get_local_lids();
+    std::vector<int32_t> get_ipc_handle();
+    void sync_nvlink_ipc_handles(
+        const std::vector<std::vector<int32_t>>& remote_handles,
+        const std::vector<int>& active_ranks_mask);
+
+   private:
+    ElasticConfig config_;
+    ElasticTopology topology_;
+    std::string transport_;
+    std::unique_ptr<MooncakeEpBuffer> native_buffer_;
+    std::unique_ptr<NcclElasticState> nccl_state_;
+    int64_t host_workspace_bytes_ = 0;
+    void* host_workspace_ = nullptr;
+    void* mapped_host_workspace_ = nullptr;
+    std::shared_ptr<void> deterministic_rank_count_buffer_;
+    int64_t deterministic_rank_count_buffer_bytes_ = 0;
+    int device_id_ = -1;
+    int physical_num_sms_ = 0;
+    int device_smem_bytes_ = 0;
+    bool destroyed_ = false;
+
+    ElasticLaunchContext make_launch_context(int64_t timeout_cycles) const;
+    cudaStream_t communication_stream() const;
+    int clock_rate_khz() const;
+    static ElasticTopology discover_topology(int rank, int num_ranks,
+                                             bool allow_hybrid_mode);
+    std::shared_ptr<void> ensure_deterministic_rank_count_buffer(int num_sms);
+};
+
+}  // namespace mooncake
+
+#endif  // MOONCAKE_EP_ELASTIC_BUFFER_H

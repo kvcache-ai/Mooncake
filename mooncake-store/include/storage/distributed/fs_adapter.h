@@ -97,6 +97,41 @@ class FileSystemAdapter {
         return result;
     }
 
+    // === fd-based I/O for shard-offset DFS mode ===
+
+    virtual tl::expected<int, ErrorCode> OpenFile(const std::string& /*path*/) {
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+
+    // Open a file that must already exist. Implementations must not use
+    // O_CREAT: bucket descriptors can arrive after whole-bucket eviction.
+    virtual tl::expected<int, ErrorCode> OpenExistingFile(
+        const std::string& /*path*/) {
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+
+    virtual tl::expected<void, ErrorCode> CloseFile(int /*fd*/) {
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+
+    virtual tl::expected<void, ErrorCode> PreallocateFile(
+        const std::string& /*path*/, uint64_t /*size*/) {
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+
+    virtual tl::expected<size_t, ErrorCode> WriteAt(int /*fd*/,
+                                                    const iovec* /*iov*/,
+                                                    int /*iovcnt*/,
+                                                    int64_t /*offset*/) {
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+
+    virtual tl::expected<size_t, ErrorCode> ReadAt(int /*fd*/, iovec* /*iov*/,
+                                                   int /*iovcnt*/,
+                                                   int64_t /*offset*/) {
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+
     // === Lifecycle ===
 
     virtual tl::expected<void, ErrorCode> Init(

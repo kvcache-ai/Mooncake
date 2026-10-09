@@ -17,12 +17,14 @@
 
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include "tent/common/cuda_fabric_compat.h"
 
 #include <functional>
 #include <iostream>
+#include <mutex>
 #include <queue>
 #include <string>
-#include <unordered_set>
+#include <unordered_map>
 #include <vector>
 
 #include "tent/runtime/control_plane.h"
@@ -37,7 +39,6 @@ struct MnnvlTask {
     volatile TransferStatusEnum status_word;
     volatile size_t transferred_bytes;
     uint64_t target_addr = 0;
-    int cuda_id = 0;
     cudaEvent_t completion_event = nullptr;
 };
 
@@ -46,6 +47,7 @@ struct MnnvlSubBatch : public Transport::SubBatch {
     size_t max_size;
     CUDAStreamHandle sync_stream;
     CUDAStreamHandle async_stream;
+    int stream_device_id = -1;
     // Completion events created in startTransfer (one per submit). Destroyed by
     // the destructor (RAII); Slab<T>::deallocate() invokes ~MnnvlSubBatch()
     // before reusing the storage, so this runs on every free.
@@ -125,12 +127,17 @@ class MnnvlTransport : public Transport {
     std::string machine_id_;
 
     std::mutex allocate_mutex_;
-    std::unordered_set<void *> allocate_set_;
+    // VMM allocations owned by this transport: base address -> mapped extent
+    // (rounded to the allocation granularity), needed to unmap on free.
+    std::unordered_map<void *, size_t> allocate_set_;
     uint64_t async_memcpy_threshold_;
     bool supported_;
     CUmemAllocationHandleType handle_type_;
 
     bool host_register_;
+    // transports/mnnvl/egm: export HOST_NUMA (EGM) allocations so peers can
+    // read/write host memory over NVLink; adds dram_to_dram / gpu_to_dram.
+    bool egm_enabled_ = false;
 };
 }  // namespace tent
 }  // namespace mooncake

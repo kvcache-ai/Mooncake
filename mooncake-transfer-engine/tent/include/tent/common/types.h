@@ -54,6 +54,13 @@ enum TransportType : int {
     TCP,
     AscendDirect,
     SUNRISE_LINK,
+    TPU,
+    UB,
+    MPCOMM,
+    HP_TCP,
+    XPU,
+    HYLINK,
+    FABRIC,
     // Sentinel: must remain the last enumerator.
     kNumTransportTypes,
 };
@@ -64,6 +71,79 @@ inline TransportType c_to_transport_hint(int v) {
     if (v < 0 || v >= kSupportedTransportTypes) return UNSPEC;
     return static_cast<TransportType>(v);
 }
+
+inline const char* transportTypeName(TransportType type) {
+    switch (type) {
+        case UNSPEC:
+            return "unspec";
+        case RDMA:
+            return "rdma";
+        case MNNVL:
+            return "mnnvl";
+        case SHM:
+            return "shm";
+        case NVLINK:
+            return "nvlink";
+        case GDS:
+            return "gds";
+        case IOURING:
+            return "io_uring";
+        case TCP:
+            return "tcp";
+        case AscendDirect:
+            return "ascend";
+        case SUNRISE_LINK:
+            return "sunrise_link";
+        case TPU:
+            return "tpu";
+        case UB:
+            return "ub";
+        case MPCOMM:
+            return "mpcomm";
+        case HP_TCP:
+            return "hp_tcp";
+        case XPU:
+            return "xpu";
+        case HYLINK:
+            return "hylink";
+        case FABRIC:
+            return "fabric";
+        case kNumTransportTypes:
+            return "unknown";
+    }
+    return "unknown";
+}
+
+inline TransportType parseTransportType(const std::string& str) {
+    if (str == "unspec") return UNSPEC;
+    if (str == "rdma") return RDMA;
+    if (str == "mnnvl") return MNNVL;
+    if (str == "shm") return SHM;
+    if (str == "nvlink") return NVLINK;
+    if (str == "gds") return GDS;
+    if (str == "io_uring") return IOURING;
+    if (str == "tcp") return TCP;
+    if (str == "ascend") return AscendDirect;
+    if (str == "sunrise_link") return SUNRISE_LINK;
+    if (str == "tpu") return TPU;
+    if (str == "ub") return UB;
+    if (str == "mpcomm") return MPCOMM;
+    if (str == "hp_tcp") return HP_TCP;
+    if (str == "xpu") return XPU;
+    if (str == "hylink") return HYLINK;
+    if (str == "fabric") return FABRIC;
+    return UNSPEC;
+}
+
+enum class IntentType : int {
+    INTENT_UNSPEC = 0,
+    FOREGROUND_GET,
+    BACKGROUND_PREFETCH,
+    MIGRATION,
+    CHECKPOINT,
+    WEIGHT_LOADING,
+    STAGING_INTERNAL,
+};
 
 struct Request {
     enum OpCode { READ, WRITE };
@@ -81,10 +161,14 @@ struct Request {
                  // name transport.
     // Optional SLO deadline as an absolute steady_clock timestamp in
     // nanoseconds. 0 = no deadline (default), behaves exactly as today.
-    // When set, the engine emits an observability-only feasibility metric
-    // (MLU = actual transfer time / available window) on completion; it does
-    // not yet drive any admission or scheduling decision. See RFC #2519.
+    // When set, the engine records the feasibility metric (MLU = actual
+    // transfer time / available window) on completion, and -- each opt-in --
+    // the admission queue orders, promotes and may cancel the request by it
+    // (runtime_queue/*) and the RDMA workers order posts by it
+    // (transports/rdma/deadline_bw_arbitration). See RFC #2519, RFC #2792
+    // and docs/source/design/tent/deadline-scheduling.md.
     uint64_t deadline_ns = 0;
+    IntentType intent_type = IntentType::INTENT_UNSPEC;
 };
 
 enum TransferStatusEnum {
@@ -97,9 +181,39 @@ enum TransferStatusEnum {
     FAILED
 };
 
+// Rank for aggregating batch status. Unknown values rank with FAILED so
+// getBatchStatus never throws from unordered_map::at during teardown.
+inline int transferStatusSeverity(TransferStatusEnum s) {
+    switch (s) {
+        case INITIAL:
+        case PENDING:
+        case COMPLETED:
+            return 0;
+        case INVALID:
+            return 1;
+        case CANCELED:
+            return 2;
+        case TIMEOUT:
+            return 3;
+        case FAILED:
+            return 4;
+        default:
+            return 4;
+    }
+}
+
 struct TransferStatus {
     TransferStatusEnum s;
     size_t transferred_bytes;
+};
+
+// One RDMA NIC's load snapshot. Only NICs currently able to carry traffic
+// are reported: a NIC whose context failed to construct or whose port is
+// down is omitted rather than listed with a meaningless bandwidth.
+struct NicLoadStats {
+    std::string device_name;
+    uint64_t inflight_bytes{0};
+    double ewma_bandwidth_bps{0.0};
 };
 
 enum Permission {

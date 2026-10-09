@@ -247,8 +247,13 @@ WriteStats PutCompletedBatch(mooncake::MasterClient& client,
         return stats;
     }
 
+    std::vector<mooncake::ObjectMeta> object_metas;
+    object_metas.reserve(started_keys.size());
+    for (const auto& key : started_keys) {
+        object_metas.emplace_back(mooncake::ObjectMeta{key, std::nullopt});
+    }
     auto put_end_result =
-        client.BatchPutEnd(started_keys, mooncake::ReplicaType::MEMORY);
+        client.BatchPutEnd(object_metas, mooncake::ReplicaType::MEMORY);
     for (const auto& result : put_end_result) {
         if (result.has_value()) {
             ++stats.completed;

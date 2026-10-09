@@ -1,10 +1,55 @@
 #pragma once
 
+#include <optional>
+
 #include "types.h"
 #include "replica.h"
 #include "task_manager.h"
 
 namespace mooncake {
+
+struct ObjectMeta {
+    std::string key;
+    std::optional<uint64_t> object_checksum;
+};
+YLT_REFL(ObjectMeta, key, object_checksum);
+
+enum class ReplicaActionType {
+    ADD = 0,
+};
+
+struct ReplicaActionProposal {
+    ReplicaActionType action{ReplicaActionType::ADD};
+    UUID proposal_id{};
+    std::string tenant_id{"default"};
+    std::string key;
+    std::string requester_domain;
+    uint64_t observed_version_epoch{0};
+    uint64_t object_size_bytes{0};
+    std::string target_domain;
+    std::optional<std::string> preferred_target_segment;
+    int64_t expire_at_ms_epoch{0};
+};
+YLT_REFL(ReplicaActionProposal, action, proposal_id, tenant_id, key,
+         requester_domain, observed_version_epoch, object_size_bytes,
+         target_domain, preferred_target_segment, expire_at_ms_epoch);
+
+struct ReplicaActionLease {
+    UUID proposal_id{};
+    UUID lease_id{};
+    ReplicaActionType action{ReplicaActionType::ADD};
+    std::string tenant_id{"default"};
+    std::string key;
+    std::string source_segment;
+    std::string target_segment;
+    std::string target_domain;
+    uint64_t version_epoch{0};
+    int64_t expire_at_ms_epoch{0};
+    UUID task_id{};
+};
+YLT_REFL(ReplicaActionLease, proposal_id, lease_id, action, tenant_id, key,
+         source_segment, target_segment, target_domain, version_epoch,
+         expire_at_ms_epoch, task_id);
 
 /**
  * @brief Response structure for Ping operation
@@ -32,14 +77,18 @@ YLT_REFL(PingResponse, view_version_id, client_status);
 struct GetReplicaListResponse {
     std::vector<Replica::Descriptor> replicas;
     uint64_t lease_ttl_ms;
+    std::optional<uint64_t> object_checksum;
 
     GetReplicaListResponse() : lease_ttl_ms(0) {}
-    GetReplicaListResponse(std::vector<Replica::Descriptor>&& replicas_param,
-                           uint64_t lease_ttl_ms_param)
+    GetReplicaListResponse(
+        std::vector<Replica::Descriptor>&& replicas_param,
+        uint64_t lease_ttl_ms_param,
+        std::optional<uint64_t> object_checksum_param = std::nullopt)
         : replicas(std::move(replicas_param)),
-          lease_ttl_ms(lease_ttl_ms_param) {}
+          lease_ttl_ms(lease_ttl_ms_param),
+          object_checksum(object_checksum_param) {}
 };
-YLT_REFL(GetReplicaListResponse, replicas, lease_ttl_ms);
+YLT_REFL(GetReplicaListResponse, replicas, lease_ttl_ms, object_checksum);
 
 struct CachedQueryResultResponse {
     bool success;

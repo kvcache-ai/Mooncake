@@ -1,5 +1,7 @@
 #pragma once
 
+#include "common/result.h"
+
 #include <atomic>
 #include <csignal>
 #include <mutex>
@@ -8,7 +10,9 @@
 #include <ylt/coro_rpc/coro_rpc_client.hpp>
 
 #include "client_metric.h"
+#include "device/cuda_ipc_buffer_handle.h"
 #include "pyclient.h"
+#include "store_rpc_client_io_context.h"
 #include "shm_helper.h"
 #include <memory>
 
@@ -17,6 +21,7 @@ namespace mooncake {
 class DummyClient : public PyClient {
    public:
     DummyClient();
+    // Drains in-flight RPCs before the pool member is released (#3909).
     ~DummyClient();
 
     int64_t unregister_shm();
@@ -30,7 +35,9 @@ class DummyClient : public PyClient {
                    const std::string &ipc_socket_path,
                    bool enable_ssd_offload = false,
                    const std::string &ssd_offload_path = "",
-                   const std::string &tenant_id = "default") {
+                   const std::string &tenant_id = "default",
+                   bool enable_client_http_server = false,
+                   int client_http_port = DEFAULT_CLIENT_HTTP_PORT) {
         // Dummy client does not support real setup
         return -1;
     };
@@ -64,12 +71,24 @@ class DummyClient : public PyClient {
         const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
         const QueryResultCache *query_result_cache = nullptr) override;
 
+    std::vector<std::vector<std::vector<int64_t>>>
+    get_into_ranges_from_snapshot(
+        const std::vector<void *> &buffers,
+        const std::vector<std::vector<std::string>> &all_keys,
+        const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
+        const QueryResultCache &query_result_cache) override;
+
     std::vector<tl::expected<QueryResult, ErrorCode>> batch_query(
         const std::vector<std::string> &keys) override;
 
     std::vector<int64_t> batch_get_into(const std::vector<std::string> &keys,
                                         const std::vector<void *> &buffers,
                                         const std::vector<size_t> &sizes);
+
+    std::vector<int64_t> batch_get_into_cuda_ipc(
+        const std::vector<CudaIpcReadRequest> &requests);
 
     std::vector<int> batch_get_into_multi_buffers(
         const std::vector<std::string> &keys,
@@ -96,6 +115,19 @@ class DummyClient : public PyClient {
         const std::vector<std::vector<size_t>> &all_sizes,
         const ReplicateConfig &config = ReplicateConfig{});
 
+    std::vector<int> batch_put_from_cuda_ipc(
+        const std::vector<CudaIpcWriteRequest> &requests,
+        const ReplicateConfig &config = ReplicateConfig{});
+
+    std::vector<int> batch_upsert_from_cuda_ipc(
+        const std::vector<CudaIpcWriteRequest> &requests,
+        const ReplicateConfig &config = ReplicateConfig{});
+
+    std::vector<int> batch_upsert_from_multi_buffers(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> &all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
+        const ReplicateConfig &config = ReplicateConfig{}) override;
     std::shared_ptr<BufferHandle> get_buffer(const std::string &key);
 
     std::vector<std::shared_ptr<BufferHandle>> batch_get_buffer(
@@ -151,6 +183,10 @@ class DummyClient : public PyClient {
 
     std::vector<int> batchIsExist(const std::vector<std::string> &keys);
 
+    int probeKey(const std::string &key);
+
+    std::vector<int> batchProbeKey(const std::vector<std::string> &keys);
+
     int64_t getSize(const std::string &key);
 
     std::map<std::string, std::vector<Replica::Descriptor>>
@@ -176,7 +212,60 @@ class DummyClient : public PyClient {
 
     tl::expected<QueryTaskResponse, ErrorCode> query_task(const UUID &task_id);
 
+    std::optional<BufferHandle> allocate_client_buffer(size_t size) override;
+
    private:
+    struct PreparedBuffer {
+        void *original = nullptr;
+        void *dummy = nullptr;
+        size_t size = 0;
+        std::unique_ptr<BufferHandle> staging;
+        bool copy_back = false;
+    };
+
+    bool is_device_buffer(void *buffer) const;
+    bool is_dummy_shm_buffer(void *buffer, size_t size) const;
+    std::optional<size_t> external_buffer_remaining(void *buffer) const;
+    bool is_registered_buffer(void *buffer, size_t size) const;
+    int register_external_buffer(void *buffer, size_t size);
+    int unregister_external_buffer(void *buffer);
+#if defined(USE_ASCEND_DIRECT)
+    std::optional<size_t> registered_ascend_buffer_remaining(
+        void *buffer) const;
+#endif
+    std::optional<PreparedBuffer> prepare_buffer(void *buffer, size_t size,
+                                                 bool copy_to_staging,
+                                                 bool copy_back = false);
+    std::optional<PreparedBuffer> prepare_ranged_read_buffer(
+        void *buffer, std::vector<std::vector<size_t>> &dst_offsets,
+        const std::vector<std::vector<size_t>> &sizes);
+    bool copy_from_staging(const PreparedBuffer &buffer, size_t size,
+                           size_t offset = 0, size_t staging_offset = 0) const;
+
+    struct PreparedMultiBuffers {
+        std::vector<PreparedBuffer> buffers;
+        std::vector<std::vector<uint64_t>> dummy_buffers;
+    };
+    std::optional<PreparedMultiBuffers> prepare_multi_buffers(
+        const std::vector<std::vector<void *>> &all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
+        bool copy_to_staging = true, bool copy_back = false);
+
+    struct ExternalBufferRegistration {
+        size_t size = 0;
+        size_t references = 0;
+    };
+    using BufferRegistrationMap =
+        std::unordered_map<uintptr_t, ExternalBufferRegistration>;
+    enum class BufferRegistrationAction { kReject, kFirst, kRetained };
+    enum class BufferReleaseAction { kReject, kFinal, kRetained };
+    static BufferRegistrationAction retain_buffer_registration(
+        BufferRegistrationMap &registrations, uintptr_t base, size_t size);
+    static BufferReleaseAction release_buffer_registration(
+        BufferRegistrationMap &registrations, uintptr_t base);
+    mutable std::mutex registered_external_buffers_mutex_;
+    BufferRegistrationMap registered_external_buffers_;
+
     ErrorCode connect(const std::string &server_address);
 
     int register_ascend_shm(const ShmHelper::ShmSegment *shm,
@@ -190,8 +279,9 @@ class DummyClient : public PyClient {
 
     int unregister_device_buffer_for_reconnect(void *buffer);
 
-    [[nodiscard]] std::vector<ShmHelper::ShmSegment>
-    get_registered_device_buffers() const;
+    int reregister_fabric_buffers();
+
+    int reregister_device_buffers();
 #endif
 
     /**
@@ -235,38 +325,11 @@ class DummyClient : public PyClient {
         return to_py_ret(result);
     }
 
-    /**
-     * @brief Accessor for the coro_rpc_client pool. Since coro_rpc_client
-     * pool cannot reconnect to a different address, a new coro_rpc_client
-     * pool is created if the address is different from the current one.
-     */
-    class RpcClientAccessor {
-       public:
-        void SetClientPool(
-            std::shared_ptr<coro_io::client_pool<coro_rpc::coro_rpc_client>>
-                client_pool) {
-            std::lock_guard<std::shared_mutex> lock(client_mutex_);
-            client_pool_ = client_pool;
-        }
-
-        std::shared_ptr<coro_io::client_pool<coro_rpc::coro_rpc_client>>
-        GetClientPool() {
-            std::shared_lock<std::shared_mutex> lock(client_mutex_);
-            return client_pool_;
-        }
-
-       private:
-        mutable std::shared_mutex client_mutex_;
-        std::shared_ptr<coro_io::client_pool<coro_rpc::coro_rpc_client>>
-            client_pool_;
-    };
-    RpcClientAccessor client_accessor_;
+    RpcClientPool client_accessor_;
+    RpcDrainGuard rpc_drain_;
 
     // The client identification.
     const UUID client_id_;
-
-    std::shared_ptr<coro_io::client_pools<coro_rpc::coro_rpc_client>>
-        client_pools_;
 
     // Mutex to insure the Connect function is atomic.
     mutable Mutex connect_mutex_;
@@ -276,6 +339,7 @@ class DummyClient : public PyClient {
     // For shared memory management
     ShmHelper *shm_helper_ = nullptr;
     std::string ipc_socket_path_;
+    void *local_buffer_base_ = nullptr;
 
     // Hot cache shm mapping (obtained from real client via IPC)
     void *hot_cache_base_ = nullptr;
@@ -292,8 +356,10 @@ class DummyClient : public PyClient {
     std::atomic<bool> connected_{false};
 
 #if defined(USE_ASCEND_DIRECT)
+    mutable std::mutex external_fabric_registration_mutex_;
     mutable std::mutex registered_device_buffers_mutex_;
-    std::unordered_map<uint64_t, size_t> registered_device_buffers_;
+    // Tracks directly mapped Ascend device and Fabric host buffers.
+    BufferRegistrationMap registered_device_buffers_;
 #endif
 
     // Ascend physical device id for dummy-real RPC to real, set in setup_dummy

@@ -1,22 +1,33 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <chrono>
 #include <csignal>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <future>
+#include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include <ylt/coro_http/coro_http_client.hpp>
+#include <ylt/coro_io/coro_io.hpp>
 #include <ylt/struct_json/json_reader.h>
 #include <ylt/struct_json/json_writer.h>
 
+#include "common/network.h"
 #include "ha/ha_types.h"
 #include "master_admin_service.h"
 #include "master_config.h"
 #include "rpc_service.h"
+#include "tenant_quota_policy_store.h"
 #include "types.h"
-#include "utils.h"
+#include "version.h"
 
 #include <ylt/reflection/user_reflect_macro.hpp>
 
@@ -24,6 +35,97 @@ namespace mooncake {
 namespace test {
 
 namespace {
+
+struct HttpDfsShardCountResponse {
+    bool success{false};
+    int shard_count{0};
+};
+YLT_REFL(HttpDfsShardCountResponse, success, shard_count);
+
+class DfsAdminEnvironment {
+   public:
+    explicit DfsAdminEnvironment(bool enabled) {
+        root_ = std::filesystem::temp_directory_path() /
+                ("mooncake_admin_dfs_" + UuidToString(generate_uuid()));
+        std::filesystem::create_directories(root_);
+        Set("MOONCAKE_ENABLE_DFS", enabled ? "1" : "0");
+        Set("MOONCAKE_DFS_FS_ADAPTER", "posix");
+        Set("MOONCAKE_DFS_ROOT_DIR", root_.string());
+        Set("MOONCAKE_DFS_SHARD_COUNT", "1");
+        Set("MOONCAKE_DFS_SHARD_CAPACITY", "8192");
+        Set("MOONCAKE_DFS_ALIGNMENT", "4096");
+        Set("MOONCAKE_DFS_EVICTION_ENABLED", "0");
+        Set("MOONCAKE_DFS_SINGLE_TENANT", "true");
+    }
+
+    ~DfsAdminEnvironment() {
+        for (const auto& [key, value] : saved_) {
+            if (value) {
+                ::setenv(key.c_str(), value->c_str(), 1);
+            } else {
+                ::unsetenv(key.c_str());
+            }
+        }
+        std::error_code ec;
+        std::filesystem::remove_all(root_, ec);
+    }
+
+   private:
+    void Set(const std::string& key, const std::string& value) {
+        const char* previous = ::getenv(key.c_str());
+        saved_.push_back({key, previous ? std::optional<std::string>(previous)
+                                        : std::nullopt});
+        ::setenv(key.c_str(), value.c_str(), 1);
+    }
+    std::filesystem::path root_;
+    std::vector<std::pair<std::string, std::optional<std::string>>> saved_;
+};
+
+// Queue filesystem work deterministically without adding a production test
+// hook. HTTP uses its own pool, so it must remain responsive while this pool
+// is held. Release before destroying futures that may await queued work.
+class ScopedBlockingPoolHold {
+   public:
+    ScopedBlockingPoolHold()
+        : release_(std::make_unique<std::promise<void>>()),
+          entered_(std::make_shared<std::atomic<size_t>>(0)) {
+        const auto ready = release_->get_future().share();
+        const auto executors =
+            coro_io::g_block_io_context_pool<>().get_all_executor();
+        count_ = executors.size();
+        for (const auto& executor : executors) {
+            asio::post(executor->get_asio_executor(),
+                       [ready, entered = entered_] {
+                           entered->fetch_add(1);
+                           ready.wait();
+                       });
+        }
+    }
+
+    ~ScopedBlockingPoolHold() { Release(); }
+
+    bool WaitUntilBlocked() const {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (entered_->load() != count_) {
+            if (std::chrono::steady_clock::now() >= deadline) return false;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        return true;
+    }
+
+    void Release() {
+        if (release_) {
+            release_->set_value();
+            release_.reset();
+        }
+    }
+
+   private:
+    std::unique_ptr<std::promise<void>> release_;
+    std::shared_ptr<std::atomic<size_t>> entered_;
+    size_t count_ = 0;
+};
 
 struct HttpCreateDrainJobResponse {
     bool success{false};
@@ -82,6 +184,18 @@ struct HttpSegmentsDetailResponse {
 };
 YLT_REFL(HttpSegmentsDetailResponse, total_segments);
 
+std::string WriteTenantQuotaPolicyForTest(
+    const std::map<std::string, uint64_t>& tenant_quotas) {
+    TenantQuotaPolicySnapshot snapshot;
+    snapshot.tenant_quotas = tenant_quotas;
+    auto path = std::filesystem::temp_directory_path() /
+                ("mooncake_admin_tenant_quota_" +
+                 UuidToString(generate_uuid()) + ".yaml");
+    std::ofstream out(path);
+    out << FormatTenantQuotaPolicyYaml(snapshot);
+    return path.string();
+}
+
 }  // namespace
 
 // =========================================================================
@@ -138,6 +252,146 @@ class MasterAdminServerTest : public ::testing::Test {
 // Always-available endpoint tests
 // =========================================================================
 
+TEST_F(MasterAdminServerTest, DfsShardCountExpandsAndValidatesRequests) {
+    DfsAdminEnvironment env(true);
+    WrappedMasterServiceConfig config;
+    config.default_kv_lease_ttl = 5000;
+    config.enable_metric_reporting = false;
+    config.client_active_ttl_sec = 3600;
+    auto service = std::make_shared<WrappedMasterService>(config);
+    int port = getFreeTcpPort();
+    MasterAdminServer admin(static_cast<uint16_t>(port), false);
+    ASSERT_TRUE(admin.Start());
+    admin.SetRuntimeState(ha::MasterRuntimeState::kServing);
+    admin.SetServiceDelegate(service);
+    admin.SetServiceAvailable(true);
+    const std::string path = "/api/v1/dfs/shard_count";
+
+    auto before = HttpGet(port, path);
+    ASSERT_EQ(before.http_status, 200);
+    HttpDfsShardCountResponse parsed;
+    struct_json::from_json(parsed, before.body);
+    EXPECT_TRUE(parsed.success);
+    EXPECT_EQ(parsed.shard_count, 1);
+    for (int i = 0; i < 2; ++i) {
+        auto expanded = HttpPutJson(port, path, R"({"shard_count":3})");
+        ASSERT_EQ(expanded.http_status, 200);
+        struct_json::from_json(parsed, expanded.body);
+        EXPECT_TRUE(parsed.success);
+        EXPECT_EQ(parsed.shard_count, 3);
+    }
+    for (const auto& invalid :
+         {R"({"shard_count":2})", R"({"shard_count":0})",
+          R"({"shard_count":-1})", R"({"shard_count":3.0})",
+          R"({"shard_count":true})", R"({"shard_count":"3"})",
+          R"({"shard_count":null})", R"({"shard_count":2147483648})",
+          R"({"shard_count":3,"shard_count":4})", "{}", "[]",
+          R"({"shard_count":4} trailing)"}) {
+        EXPECT_EQ(HttpPutJson(port, path, invalid).http_status, 400) << invalid;
+    }
+    auto after = HttpGet(port, path);
+    ASSERT_EQ(after.http_status, 200);
+    struct_json::from_json(parsed, after.body);
+    EXPECT_EQ(parsed.shard_count, 3);
+    auto count = service->GetDfsShardCount();
+    ASSERT_TRUE(count);
+    EXPECT_EQ(*count, 3);
+    admin.Stop();
+}
+
+TEST_F(MasterAdminServerTest, DfsExpansionKeepsHttpResponsiveAndDrainsOnStop) {
+    DfsAdminEnvironment env(true);
+    WrappedMasterServiceConfig config;
+    config.default_kv_lease_ttl = 5000;
+    config.enable_metric_reporting = false;
+    config.client_active_ttl_sec = 3600;
+    auto service = std::make_shared<WrappedMasterService>(config);
+    int port = getFreeTcpPort();
+    MasterAdminServer admin(static_cast<uint16_t>(port), false);
+    ASSERT_TRUE(admin.Start());
+    admin.SetRuntimeState(ha::MasterRuntimeState::kServing);
+    admin.SetServiceDelegate(service);
+    admin.SetServiceAvailable(true);
+    const std::string path = "/api/v1/dfs/shard_count";
+
+    // Declare futures first so a failed assertion releases the held workers
+    // before future destruction waits for either request or shutdown.
+    std::future<HttpResponse> first;
+    std::future<HttpResponse> second;
+    std::future<void> stopped;
+    ScopedBlockingPoolHold hold;
+    ASSERT_TRUE(hold.WaitUntilBlocked());
+    auto expand = [&] {
+        return HttpPutJson(port, path, R"({"shard_count":3})");
+    };
+    first = std::async(std::launch::async, expand);
+    second = std::async(std::launch::async, expand);
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (
+        first.wait_for(std::chrono::seconds(0)) != std::future_status::ready &&
+        second.wait_for(std::chrono::seconds(0)) != std::future_status::ready &&
+        std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const bool first_ready =
+        first.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+    auto& rejected = first_ready ? first : second;
+    auto& pending = first_ready ? second : first;
+    ASSERT_EQ(rejected.wait_for(std::chrono::seconds(0)),
+              std::future_status::ready);
+    EXPECT_EQ(rejected.get().http_status, 409);
+    EXPECT_EQ(HttpGet(port, "/health").http_status, 200);
+    EXPECT_EQ(pending.wait_for(std::chrono::seconds(0)),
+              std::future_status::timeout);
+
+    stopped = std::async(std::launch::async, [&] { admin.Stop(); });
+    // Stop closes the client connection, but must retain its executor until
+    // the queued expansion has resumed and finished the handler.
+    ASSERT_EQ(pending.wait_for(std::chrono::seconds(10)),
+              std::future_status::ready);
+    pending.get();
+    EXPECT_EQ(stopped.wait_for(std::chrono::milliseconds(50)),
+              std::future_status::timeout);
+    hold.Release();
+    ASSERT_EQ(stopped.wait_for(std::chrono::seconds(10)),
+              std::future_status::ready);
+    stopped.get();
+    auto count = service->GetDfsShardCount();
+    ASSERT_TRUE(count);
+    EXPECT_EQ(*count, 3);
+}
+
+TEST_F(MasterAdminServerTest, DfsShardCountRejectsDisabledBackend) {
+    DfsAdminEnvironment env(false);
+    WrappedMasterServiceConfig config;
+    config.default_kv_lease_ttl = 5000;
+    config.enable_metric_reporting = false;
+    config.client_active_ttl_sec = 3600;
+    auto service = std::make_shared<WrappedMasterService>(config);
+    int port = getFreeTcpPort();
+    MasterAdminServer admin(static_cast<uint16_t>(port), false);
+    ASSERT_TRUE(admin.Start());
+    admin.SetRuntimeState(ha::MasterRuntimeState::kServing);
+    admin.SetServiceDelegate(service);
+    admin.SetServiceAvailable(true);
+    const std::string path = "/api/v1/dfs/shard_count";
+    EXPECT_EQ(HttpGet(port, path).http_status, 409);
+    EXPECT_EQ(HttpPutJson(port, path, R"({"shard_count":3})").http_status, 409);
+    admin.Stop();
+}
+
+TEST_F(MasterAdminServerTest, DfsShardCountRejectsUnavailableService) {
+    int port = getFreeTcpPort();
+    MasterAdminServer admin(static_cast<uint16_t>(port), false);
+    ASSERT_TRUE(admin.Start());
+    admin.SetRuntimeState(ha::MasterRuntimeState::kStandby);
+    const std::string path = "/api/v1/dfs/shard_count";
+    EXPECT_EQ(HttpGet(port, path).http_status, 503);
+    EXPECT_EQ(HttpPutJson(port, path, R"({"shard_count":3})").http_status, 503);
+    admin.Stop();
+}
+
 TEST_F(MasterAdminServerTest, MetricsEndpointReturns200) {
     int port = getFreeTcpPort();
     MasterAdminServer admin(static_cast<uint16_t>(port), false);
@@ -188,6 +442,35 @@ TEST_F(MasterAdminServerTest, HealthEndpointReturns200InServing) {
     auto resp = HttpGet(port, "/health");
     EXPECT_EQ(resp.http_status, 200);
     EXPECT_NE(resp.body.find("\"role\":\"leader\""), std::string::npos);
+
+    admin.Stop();
+}
+
+TEST_F(MasterAdminServerTest, VersionEndpointReturnsVersion) {
+    int port = getFreeTcpPort();
+    MasterAdminServer admin(static_cast<uint16_t>(port), false);
+    ASSERT_TRUE(admin.Start());
+    admin.SetRuntimeState(ha::MasterRuntimeState::kServing);
+
+    auto resp = HttpGet(port, "/version");
+    EXPECT_EQ(resp.http_status, 200);
+    EXPECT_NE(resp.body.find("\"version\""), std::string::npos);
+    EXPECT_NE(resp.body.find("\"display_version\""), std::string::npos);
+    EXPECT_NE(resp.body.find(GetMooncakeStoreVersion()), std::string::npos);
+    EXPECT_NE(resp.body.find(MOONCAKE_DISPLAY_VERSION), std::string::npos);
+
+    admin.Stop();
+}
+
+TEST_F(MasterAdminServerTest, VersionEndpointAvailableInStandby) {
+    int port = getFreeTcpPort();
+    MasterAdminServer admin(static_cast<uint16_t>(port), false);
+    ASSERT_TRUE(admin.Start());
+    admin.SetRuntimeState(ha::MasterRuntimeState::kStandby);
+
+    auto resp = HttpGet(port, "/version");
+    EXPECT_EQ(resp.http_status, 200);
+    EXPECT_NE(resp.body.find(GetMooncakeStoreVersion()), std::string::npos);
 
     admin.Stop();
 }
@@ -455,6 +738,12 @@ TEST_F(MasterAdminServerTest, ServiceEndpointsReturn503WhenServiceUnavailable) {
     EXPECT_EQ(seg_status.http_status, 503);
     EXPECT_NE(seg_status.body.find(unavailable_msg), std::string::npos);
 
+    auto set_seg_status =
+        HttpPutJson(port, "/api/v1/segments/status?segment=foo",
+                    R"({"status":"DRAINING"})");
+    EXPECT_EQ(set_seg_status.http_status, 503);
+    EXPECT_NE(set_seg_status.body.find(unavailable_msg), std::string::npos);
+
     auto tenant_quotas = HttpGet(port, "/api/v1/tenant_quotas");
     EXPECT_EQ(tenant_quotas.http_status, 503);
     EXPECT_NE(tenant_quotas.body.find(unavailable_msg), std::string::npos);
@@ -477,12 +766,13 @@ TEST_F(MasterAdminServerTest, ServiceEndpointsReturn503WhenServiceUnavailable) {
 }
 
 TEST_F(MasterAdminServerTest, TenantQuotaAdminLifecycleEndpoints) {
+    const std::string policy_path = WriteTenantQuotaPolicyForTest({});
     WrappedMasterServiceConfig svc_config;
     svc_config.default_kv_lease_ttl = 5000;
     svc_config.enable_metric_reporting = false;
-    svc_config.enable_tenant_quota = true;
-    svc_config.default_tenant_quota_bytes = 1000;
-    svc_config.tenant_quota_pool_capacity_bytes = 2000;
+    svc_config.enable_multi_tenants = true;
+    svc_config.tenant_quota_connector_type = "file";
+    svc_config.tenant_quota_connector_uri = policy_path;
     auto service = std::make_shared<WrappedMasterService>(svc_config);
 
     Segment segment;
@@ -499,17 +789,6 @@ TEST_F(MasterAdminServerTest, TenantQuotaAdminLifecycleEndpoints) {
     admin.SetRuntimeState(ha::MasterRuntimeState::kServing);
     admin.SetServiceDelegate(service);
     admin.SetServiceAvailable(true);
-
-    auto default_get = HttpGet(port, "/api/v1/tenant_quotas/default");
-    EXPECT_EQ(default_get.http_status, 200);
-    EXPECT_NE(default_get.body.find("\"requested_quota_bytes\":1000"),
-              std::string::npos);
-
-    auto default_put = HttpPutJson(port, "/api/v1/tenant_quotas/default",
-                                   "{\"requested_quota_bytes\":0}");
-    EXPECT_EQ(default_put.http_status, 200);
-    EXPECT_NE(default_put.body.find("\"requested_quota_bytes\":0"),
-              std::string::npos);
 
     auto upsert = HttpPutJson(port, "/api/v1/tenant_quotas?tenant_id=tenant-a",
                               "{\"requested_quota_bytes\":800}");
@@ -529,8 +808,44 @@ TEST_F(MasterAdminServerTest, TenantQuotaAdminLifecycleEndpoints) {
 
     auto one = HttpGet(port, "/api/v1/tenant_quotas?tenant_id=tenant-a");
     EXPECT_EQ(one.http_status, 200);
-    EXPECT_NE(one.body.find("\"committed_count\":0"), std::string::npos);
+    EXPECT_NE(one.body.find("\"charged_bytes\":0"), std::string::npos);
+    EXPECT_NE(one.body.find("\"admission_closed\":false"), std::string::npos);
     EXPECT_NE(one.body.find("\"over_quota\":false"), std::string::npos);
+
+    ReplicateConfig cfg;
+    cfg.replica_num = 1;
+    auto put =
+        service->PutStart(client_id, "quota_admin_key", 100, cfg, "tenant-a");
+    ASSERT_TRUE(put.has_value()) << toString(put.error());
+    ASSERT_TRUE(service
+                    ->PutEnd(client_id,
+                             ObjectMeta{"quota_admin_key", std::nullopt},
+                             ReplicaType::MEMORY, "tenant-a")
+                    .has_value());
+
+    auto metrics = HttpGet(port, "/metrics");
+    EXPECT_EQ(metrics.http_status, 200);
+    EXPECT_NE(
+        metrics.body.find(
+            "mooncake_tenant_quota_charged_bytes{tenant_id=\"tenant-a\"} 100"),
+        std::string::npos);
+    EXPECT_NE(metrics.body.find(
+                  "mooncake_tenant_quota_admission_closed{tenant_id=\"tenant-a"
+                  "\"} 0"),
+              std::string::npos);
+    EXPECT_EQ(metrics.body.find("mooncake_tenant_quota_reserved_bytes"),
+              std::string::npos);
+    EXPECT_EQ(metrics.body.find("mooncake_tenant_quota_used_bytes"),
+              std::string::npos);
+
+    auto delete_non_empty =
+        HttpDelete(port, "/api/v1/tenant_quotas?tenant_id=tenant-a");
+    EXPECT_EQ(delete_non_empty.http_status, 409);
+    EXPECT_NE(delete_non_empty.body.find("TENANT_NOT_EMPTY"),
+              std::string::npos);
+
+    ASSERT_TRUE(service->Remove("quota_admin_key", /*force=*/true, "tenant-a")
+                    .has_value());
 
     auto deleted = HttpDelete(port, "/api/v1/tenant_quotas?tenant_id=tenant-a");
     EXPECT_EQ(deleted.http_status, 200);
@@ -539,15 +854,17 @@ TEST_F(MasterAdminServerTest, TenantQuotaAdminLifecycleEndpoints) {
     EXPECT_EQ(missing.http_status, 404);
 
     admin.Stop();
+    std::filesystem::remove(policy_path);
 }
 
 TEST_F(MasterAdminServerTest, TenantQuotaAdminValidationErrors) {
+    const std::string policy_path = WriteTenantQuotaPolicyForTest({});
     WrappedMasterServiceConfig svc_config;
     svc_config.default_kv_lease_ttl = 5000;
     svc_config.enable_metric_reporting = false;
-    svc_config.enable_tenant_quota = true;
-    svc_config.default_tenant_quota_bytes = 1000;
-    svc_config.tenant_quota_pool_capacity_bytes = 1000;
+    svc_config.enable_multi_tenants = true;
+    svc_config.tenant_quota_connector_type = "file";
+    svc_config.tenant_quota_connector_uri = policy_path;
     auto service = std::make_shared<WrappedMasterService>(svc_config);
 
     int port = getFreeTcpPort();
@@ -570,6 +887,11 @@ TEST_F(MasterAdminServerTest, TenantQuotaAdminValidationErrors) {
                     "{\"requested_quota_bytes\":0}");
     EXPECT_EQ(zero_explicit.http_status, 400);
 
+    auto above_atomic_range =
+        HttpPutJson(port, "/api/v1/tenant_quotas?tenant_id=tenant-a",
+                    "{\"requested_quota_bytes\":9223372036854775808}");
+    EXPECT_EQ(above_atomic_range.http_status, 400);
+
     auto reserved_tenant =
         HttpGet(port, "/api/v1/tenant_quotas?tenant_id=_system");
     EXPECT_EQ(reserved_tenant.http_status, 400);
@@ -579,13 +901,14 @@ TEST_F(MasterAdminServerTest, TenantQuotaAdminValidationErrors) {
     EXPECT_EQ(missing_query.http_status, 404);
 
     admin.Stop();
+    std::filesystem::remove(policy_path);
 }
 
 TEST_F(MasterAdminServerTest, TenantQuotaAdminDisabledModeReturns409) {
     WrappedMasterServiceConfig svc_config;
     svc_config.default_kv_lease_ttl = 5000;
     svc_config.enable_metric_reporting = false;
-    svc_config.enable_tenant_quota = false;
+    svc_config.enable_multi_tenants = false;
     auto service = std::make_shared<WrappedMasterService>(svc_config);
 
     int port = getFreeTcpPort();
@@ -618,7 +941,7 @@ class MasterAdminServerWithServiceTest : public ::testing::Test {
         WrappedMasterServiceConfig svc_config;
         svc_config.default_kv_lease_ttl = 5000;
         svc_config.enable_metric_reporting = false;
-        svc_config.client_live_ttl_sec =
+        svc_config.client_active_ttl_sec =
             3600;  // prevent client expiry in slow CI
         service_ = std::make_shared<WrappedMasterService>(svc_config);
 
@@ -633,7 +956,9 @@ class MasterAdminServerWithServiceTest : public ::testing::Test {
         cfg.replica_num = 1;
         auto ps = service_->PutStart(client_id, kDefaultKey, 1024, cfg);
         if (ps.has_value()) {
-            (void)service_->PutEnd(client_id, kDefaultKey, ReplicaType::MEMORY);
+            (void)service_->PutEnd(client_id,
+                                   ObjectMeta{kDefaultKey, std::nullopt},
+                                   ReplicaType::MEMORY);
         }
 
         port_ = getFreeTcpPort();
@@ -664,6 +989,13 @@ class MasterAdminServerWithServiceTest : public ::testing::Test {
         coro_http::coro_http_client client;
         auto result = client.post(BaseUrl() + path, body,
                                   coro_http::req_content_type::json);
+        return {result.status, std::string(result.resp_body)};
+    }
+
+    HttpResponse HttpPutJson(const std::string& path, const std::string& body) {
+        coro_http::coro_http_client client;
+        auto result = async_simple::coro::syncAwait(client.async_put(
+            BaseUrl() + path, body, coro_http::req_content_type::json));
         return {result.status, std::string(result.resp_body)};
     }
 
@@ -702,7 +1034,8 @@ TEST_F(MasterAdminServerWithServiceTest, GetAllKeysExcludesRemovedKey) {
     cfg.replica_num = 1;
     auto ps = service_->PutStart(client_id, key, 1024, cfg);
     if (ps.has_value()) {
-        (void)service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+        (void)service_->PutEnd(client_id, ObjectMeta{key, std::nullopt},
+                               ReplicaType::MEMORY);
     }
     (void)service_->Remove(key, "default");
 
@@ -936,6 +1269,82 @@ TEST_F(MasterAdminServerWithServiceTest,
 }
 
 // -----------------------------------------------------------------------
+// PUT /api/v1/segments/status
+// -----------------------------------------------------------------------
+
+TEST_F(MasterAdminServerWithServiceTest,
+       SetSegmentStatusSwitchesBetweenOkAndDraining) {
+    std::string seg = "set_status_seg_" + UuidToString(generate_uuid());
+    Segment s;
+    s.id = generate_uuid();
+    s.name = seg;
+    s.base = 0xB00000000;
+    s.size = 4 * 1024 * 1024;
+    (void)service_->MountSegment(s, generate_uuid());
+    const std::string path = "/api/v1/segments/status?segment=" + seg;
+
+    for (const std::string target : {"DRAINING", "DRAINING", "OK"}) {
+        auto put_resp = HttpPutJson(path, R"({"status":")" + target + R"("})");
+        ASSERT_EQ(put_resp.http_status, 200);
+        HttpSegmentStatusResponse put_parsed;
+        struct_json::from_json(put_parsed, put_resp.body);
+        EXPECT_TRUE(put_parsed.success);
+        EXPECT_EQ(put_parsed.segment, seg);
+        EXPECT_EQ(put_parsed.status_name, target);
+
+        auto get_resp = HttpGet(path);
+        ASSERT_EQ(get_resp.http_status, 200);
+        HttpSegmentStatusResponse get_parsed;
+        struct_json::from_json(get_parsed, get_resp.body);
+        EXPECT_EQ(get_parsed.status_name, target);
+    }
+}
+
+TEST_F(MasterAdminServerWithServiceTest,
+       SetSegmentStatusRejectsInvalidRequests) {
+    const std::string path = "/api/v1/segments/status?segment=" + segment_.name;
+    EXPECT_EQ(HttpPutJson(path, R"({"status":"DRAINED"})").http_status, 400);
+    EXPECT_EQ(HttpPutJson(path, R"({"status":"UNMOUNTING"})").http_status, 400);
+    EXPECT_EQ(HttpPutJson(path, "{}").http_status, 400);
+    EXPECT_EQ(HttpPutJson(path, "not json").http_status, 400);
+    EXPECT_EQ(HttpPutJson("/api/v1/segments/status", R"({"status":"DRAINING"})")
+                  .http_status,
+              400);
+
+    auto get_resp = HttpGet(path);
+    ASSERT_EQ(get_resp.http_status, 200);
+    HttpSegmentStatusResponse parsed;
+    struct_json::from_json(parsed, get_resp.body);
+    EXPECT_EQ(parsed.status_name, "OK");
+}
+
+TEST_F(MasterAdminServerWithServiceTest,
+       SetSegmentStatusReturns404ForNonexistentSegment) {
+    auto resp = HttpPutJson("/api/v1/segments/status?segment=no_such_segment",
+                            R"({"status":"DRAINING"})");
+    EXPECT_EQ(resp.http_status, 404);
+}
+
+TEST_F(MasterAdminServerWithServiceTest,
+       SetSegmentStatusReturns409ForSegmentUnderDrainJob) {
+    std::string seg = "set_status_drain_seg_" + UuidToString(generate_uuid());
+    Segment s;
+    s.id = generate_uuid();
+    s.name = seg;
+    s.base = 0xC00000000;
+    s.size = 4 * 1024 * 1024;
+    (void)service_->MountSegment(s, generate_uuid());
+
+    auto create_resp = HttpPostJson("/api/v1/drain_jobs",
+                                    R"({"segments":[")" + seg + R"("]})");
+    ASSERT_EQ(create_resp.http_status, 200);
+
+    auto resp = HttpPutJson("/api/v1/segments/status?segment=" + seg,
+                            R"({"status":"OK"})");
+    EXPECT_EQ(resp.http_status, 409);
+}
+
+// -----------------------------------------------------------------------
 // GET /batch_query_keys
 // -----------------------------------------------------------------------
 
@@ -974,7 +1383,9 @@ TEST_F(MasterAdminServerWithServiceTest, BatchQueryKeysMultipleKeys) {
     cfg.replica_num = 1;
     auto ps = service_->PutStart(client_id, "second_key", 512, cfg);
     if (ps.has_value()) {
-        (void)service_->PutEnd(client_id, "second_key", ReplicaType::MEMORY);
+        (void)service_->PutEnd(client_id,
+                               ObjectMeta{"second_key", std::nullopt},
+                               ReplicaType::MEMORY);
     }
 
     auto resp = HttpGet("/batch_query_keys?keys=" + std::string(kDefaultKey) +
@@ -1118,11 +1529,13 @@ TEST_F(MasterAdminServerTest, MultipleSegmentsAndKeys) {
     cfg.replica_num = 1;
     auto ps1 = service->PutStart(client_id, "key_one", 1024, cfg);
     if (ps1.has_value()) {
-        (void)service->PutEnd(client_id, "key_one", ReplicaType::MEMORY);
+        (void)service->PutEnd(client_id, ObjectMeta{"key_one", std::nullopt},
+                              ReplicaType::MEMORY);
     }
     auto ps2 = service->PutStart(client_id, "key_two", 2048, cfg);
     if (ps2.has_value()) {
-        (void)service->PutEnd(client_id, "key_two", ReplicaType::MEMORY);
+        (void)service->PutEnd(client_id, ObjectMeta{"key_two", std::nullopt},
+                              ReplicaType::MEMORY);
     }
 
     int port = getFreeTcpPort();
@@ -1174,6 +1587,55 @@ TEST_F(MasterAdminServerTest, MultipleSegmentsAndKeys) {
     EXPECT_EQ(batch_resp.http_status, 200);
     EXPECT_NE(batch_resp.body.find("key_one"), std::string::npos);
     EXPECT_NE(batch_resp.body.find("key_two"), std::string::npos);
+
+    admin.Stop();
+}
+
+// /batch_query_keys returns replica metadata for disk-based keys via the
+// optional disk_values/local_disk_values/nof_values fields, while the existing
+// values field stays present (empty array) for backward compatibility.
+TEST_F(MasterAdminServerTest, BatchQueryKeysReturnsLocalDiskReplicaInfo) {
+    WrappedMasterServiceConfig svc_config;
+    svc_config.default_kv_lease_ttl = 5000;
+    svc_config.enable_metric_reporting = false;
+    svc_config.enable_offload = true;  // required to mount local-disk segments
+    auto service = std::make_shared<WrappedMasterService>(svc_config);
+
+    UUID client_id = generate_uuid();
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "ld_segment";
+    segment.base = 0x600000000;
+    segment.size = 8 * 1024 * 1024;
+    ASSERT_TRUE(service->MountSegment(segment, client_id).has_value());
+    ASSERT_TRUE(service->MountLocalDiskSegment(client_id, true).has_value());
+
+    const std::string key = "ld_only_key";
+    const std::string endpoint = "127.0.0.1:9999";
+    StorageObjectMetadata sm;
+    sm.bucket_id = 0;
+    sm.offset = 0;
+    sm.key_size = static_cast<int64_t>(key.size());
+    sm.data_size = 2048;
+    sm.transport_endpoint = endpoint;
+    OffloadTaskItem task{.tenant_id = "default", .key = key, .size = 2048};
+    ASSERT_TRUE(
+        service->NotifyOffloadSuccess(client_id, {task}, {sm}).has_value());
+
+    int port = getFreeTcpPort();
+    MasterAdminServer admin(static_cast<uint16_t>(port), false);
+    ASSERT_TRUE(admin.Start());
+    admin.SetRuntimeState(ha::MasterRuntimeState::kServing);
+    admin.SetServiceDelegate(service);
+    admin.SetServiceAvailable(true);
+
+    auto resp = HttpGet(port, "/batch_query_keys?keys=" + key);
+    EXPECT_EQ(resp.http_status, 200);
+    EXPECT_NE(resp.body.find("\"success\":true"), std::string::npos);
+    EXPECT_NE(resp.body.find("local_disk_values"), std::string::npos);
+    EXPECT_NE(resp.body.find(endpoint), std::string::npos);
+    // Backward compat: a disk-only key still reports an (empty) values array.
+    EXPECT_NE(resp.body.find("\"values\":[]"), std::string::npos);
 
     admin.Stop();
 }

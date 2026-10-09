@@ -36,6 +36,7 @@ const std::string& toString(ErrorCode errorCode) noexcept {
         {ErrorCode::REPLICA_IS_GONE, "REPLICA_IS_GONE"},
         {ErrorCode::OBJECT_REPLICA_BUSY, "OBJECT_REPLICA_BUSY"},
         {ErrorCode::TRANSFER_FAIL, "TRANSFER_FAIL"},
+        {ErrorCode::CHECKSUM_MISMATCH, "CHECKSUM_MISMATCH"},
         {ErrorCode::RPC_FAIL, "RPC_FAIL"},
         {ErrorCode::RPC_TIMEOUT, "RPC_TIMEOUT"},
         {ErrorCode::ETCD_OPERATION_ERROR, "ETCD_OPERATION_ERROR"},
@@ -45,9 +46,11 @@ const std::string& toString(ErrorCode errorCode) noexcept {
         {ErrorCode::OPLOG_ENTRY_NOT_FOUND, "OPLOG_ENTRY_NOT_FOUND"},
         {ErrorCode::K8S_LEASE_OPERATION_ERROR, "K8S_LEASE_OPERATION_ERROR"},
         {ErrorCode::K8S_LEASE_NOT_FOUND, "K8S_LEASE_NOT_FOUND"},
+        {ErrorCode::INCOMPLETE_OPLOG_CATCH_UP, "INCOMPLETE_OPLOG_CATCH_UP"},
         {ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS,
          "UNAVAILABLE_IN_CURRENT_STATUS"},
         {ErrorCode::UNAVAILABLE_IN_CURRENT_MODE, "UNAVAILABLE_IN_CURRENT_MODE"},
+        {ErrorCode::NOT_SUPPORTED, "NOT_SUPPORTED"},
         {ErrorCode::FILE_NOT_FOUND, "FILE_NOT_FOUND"},
         {ErrorCode::FILE_OPEN_FAIL, "FILE_OPEN_FAIL"},
         {ErrorCode::FILE_READ_FAIL, "FILE_READ_FAIL"},
@@ -74,7 +77,9 @@ const std::string& toString(ErrorCode errorCode) noexcept {
         {ErrorCode::DFS_PERMISSION_DENIED, "DFS_PERMISSION_DENIED"},
         {ErrorCode::DFS_STALE_HANDLE, "DFS_STALE_HANDLE"},
         {ErrorCode::DFS_PARTIAL_WRITE, "DFS_PARTIAL_WRITE"},
-        {ErrorCode::TENANT_QUOTA_EXCEEDED, "TENANT_QUOTA_EXCEEDED"}};
+        {ErrorCode::TENANT_QUOTA_EXCEEDED, "TENANT_QUOTA_EXCEEDED"},
+        {ErrorCode::TENANT_NOT_REGISTERED, "TENANT_NOT_REGISTERED"},
+        {ErrorCode::TENANT_NOT_EMPTY, "TENANT_NOT_EMPTY"}};
 
     auto it = errorCodeMap.find(errorCode);
     static const std::string unknownError = "UNKNOWN_ERROR";

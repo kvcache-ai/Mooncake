@@ -3,55 +3,31 @@
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <cassert>
 #include <cctype>
 #include <chrono>
 #include <cerrno>
+#include <cstring>
 #include <cstdlib>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <vector>
-#include "gpu_staging_utils.h"
+#include "config/transfer_submitter_config.h"
+#include "config/nof_debug_config.h"
+#include "config/fileread_worker_pool_config.h"
+#include "config/nof_worker_pool_config.h"
+#include "device/accelerator_registry.h"
 #include "transfer_engine.h"
 #include "transport/transport.h"
+#ifdef USE_TENT
+#include "tent/transfer_engine.h"
+#endif
 #ifdef USE_NOF
 #include "spdk/spdk_wrapper.h"
 #endif
 
 #ifdef USE_NOF
-static bool IsTruthyEnv(const char* value) {
-    if (!value) {
-        return false;
-    }
-    std::string normalized(value);
-    std::transform(
-        normalized.begin(), normalized.end(), normalized.begin(),
-        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    return normalized == "1" || normalized == "true" || normalized == "yes" ||
-           normalized == "on";
-}
-
-static bool IsSpdkNofDebugEnabled() {
-    static const bool enabled = IsTruthyEnv(std::getenv("MC_NOF_DEBUG"));
-    return enabled;
-}
-
-static int GetSpdkNofDebugIntervalMs() {
-    static const int interval_ms = []() {
-        const char* raw_value = std::getenv("MC_NOF_DEBUG_INTERVAL_MS");
-        if (!raw_value) {
-            return 1000;
-        }
-        char* end_ptr = nullptr;
-        long parsed = std::strtol(raw_value, &end_ptr, 10);
-        if (end_ptr == raw_value || (end_ptr != nullptr && *end_ptr != '\0') ||
-            parsed <= 0) {
-            return 1000;
-        }
-        return static_cast<int>(parsed);
-    }();
-    return interval_ms;
-}
-
 static int GetPositiveEnvOrDefault(const char* name, int default_value) {
     const char* raw_value = std::getenv(name);
     if (!raw_value || raw_value[0] == '\0') {
@@ -72,6 +48,14 @@ static int GetPositiveEnvOrDefault(const char* name, int default_value) {
     return static_cast<int>(parsed);
 }
 
+static bool IsSpdkNofDebugEnabled() {
+    return mooncake::NoFDebugConfig::IsEnabledAtFirstUse();
+}
+
+static std::chrono::milliseconds GetSpdkNofDebugIntervalMs() {
+    return mooncake::NoFDebugConfig::IntervalMsAtFirstUse();
+}
+
 static int GetSpdkNofSubmitChunkBytes() {
     static const int value = GetPositiveEnvOrDefault(
         "MC_NOF_SUBMIT_CHUNK_BYTES", mooncake::kDefaultSpdkNofSubmitChunkBytes);
@@ -82,12 +66,6 @@ static int GetSpdkNofInflightBytesLimit() {
     static const int value =
         GetPositiveEnvOrDefault("MC_NOF_INFLIGHT_BYTES_LIMIT",
                                 mooncake::kDefaultSpdkNofInflightBytesLimit);
-    return value;
-}
-
-static int GetSpdkNofWorkerCount() {
-    static const int value = GetPositiveEnvOrDefault(
-        "MC_NOF_WORKERS", mooncake::kDefaultSpdkNofWorkers);
     return value;
 }
 
@@ -149,6 +127,78 @@ static void nvmf_io_complete(void* ctx, const struct spdk_nvme_cpl* cpl) {
 }
 #endif
 namespace mooncake {
+namespace {
+
+#ifdef USE_TENT
+int GetTentPositiveEnvOrDefault(const char* name, int default_value) {
+    const char* raw_value = std::getenv(name);
+    if (!raw_value || raw_value[0] == '\0') return default_value;
+
+    errno = 0;
+    char* end_ptr = nullptr;
+    long parsed = std::strtol(raw_value, &end_ptr, 10);
+    if (errno != 0 || end_ptr == raw_value || *end_ptr != '\0' || parsed <= 0 ||
+        parsed > std::numeric_limits<int>::max()) {
+        LOG(WARNING) << "Invalid value for " << name << ": " << raw_value
+                     << ", using default " << default_value;
+        return default_value;
+    }
+    return static_cast<int>(parsed);
+}
+
+std::optional<tent::Request::OpCode> ToTentOpCode(
+    TransferRequest::OpCode op_code) {
+    switch (op_code) {
+        case TransferRequest::READ:
+            return tent::Request::READ;
+        case TransferRequest::WRITE:
+            return tent::Request::WRITE;
+        default:
+            return std::nullopt;
+    }
+}
+
+// NOTE: This only handles TransferIntent values (0-3). The compat-layer
+// toTentIntent in transfer_engine.cpp also handles raw int values 4-6
+// (CHECKPOINT, WEIGHT_LOADING, STAGING_INTERNAL) for forward compatibility.
+std::optional<tent::IntentType> ToTentIntent(TransferIntent intent) {
+    switch (intent) {
+        case TransferIntent::kUnspecified:
+            return tent::IntentType::INTENT_UNSPEC;
+        case TransferIntent::kForegroundGet:
+            return tent::IntentType::FOREGROUND_GET;
+        case TransferIntent::kBackgroundPrefetch:
+            return tent::IntentType::BACKGROUND_PREFETCH;
+        case TransferIntent::kMigration:
+            return tent::IntentType::MIGRATION;
+        default:
+            return std::nullopt;
+    }
+}
+
+std::optional<TransferStatusEnum> ToClassicTransferStatus(
+    tent::TransferStatusEnum status) {
+    switch (status) {
+        case tent::INITIAL:
+        case tent::PENDING:
+            return TransferStatusEnum::WAITING;
+        case tent::INVALID:
+            return TransferStatusEnum::INVALID;
+        case tent::CANCELED:
+            return TransferStatusEnum::CANCELED;
+        case tent::COMPLETED:
+            return TransferStatusEnum::COMPLETED;
+        case tent::TIMEOUT:
+            return TransferStatusEnum::TIMEOUT;
+        case tent::FAILED:
+            return TransferStatusEnum::FAILED;
+        default:
+            return std::nullopt;
+    }
+}
+#endif
+
+}  // namespace
 
 #ifdef USE_NOF
 SpdkNofQos::SpdkNofQos(uint32_t block_size) {
@@ -172,18 +222,15 @@ SpdkNofQos::SpdkNofQos(uint32_t block_size) {
 // ============================================================================
 // FilereadWorkerPool Implementation
 // ============================================================================
-// to fully utilize the available ssd bandwidth, we use a default of 10 worker
-// threads.
-constexpr int kDefaultFilereadWorkers = 10;
-
 FilereadWorkerPool::FilereadWorkerPool(std::shared_ptr<StorageBackend>& backend)
     : shutdown_(false) {
-    VLOG(1) << "Creating FilereadWorkerPool with " << kDefaultFilereadWorkers
-            << " workers";
+    static const auto config = FilereadWorkerPoolConfig::FromEnvironment();
+    const int num_workers = config.worker_count;
+    VLOG(1) << "Creating FilereadWorkerPool with " << num_workers << " workers";
 
     // Start worker threads
-    workers_.reserve(kDefaultFilereadWorkers);
-    for (int i = 0; i < kDefaultFilereadWorkers; ++i) {
+    workers_.reserve(num_workers);
+    for (int i = 0; i < num_workers; ++i) {
         workers_.emplace_back(&FilereadWorkerPool::workerThread, this);
     }
     backend_ = backend;
@@ -284,7 +331,7 @@ void FilereadWorkerPool::workerThread() {
 
 #ifdef USE_NOF
 SpdkNofWorkerPool::SpdkNofWorkerPool(int numa_socket_id)
-    : worker_count_(GetSpdkNofWorkerCount()),
+    : worker_count_(NoFWorkerPoolConfig::AtFirstUse().worker_count),
       numa_socket_id_(numa_socket_id),
       task_queue_(std::make_unique<std::queue<SpdkNofTask>[]>(worker_count_)),
       queue_mutex_(std::make_unique<std::mutex[]>(worker_count_)),
@@ -551,7 +598,7 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
             auto elapsed =
                 std::chrono::duration_cast<std::chrono::milliseconds>(
                     now - last_debug_snapshot);
-            if (elapsed.count() >= GetSpdkNofDebugIntervalMs()) {
+            if (elapsed >= GetSpdkNofDebugIntervalMs()) {
                 for (const auto& [seg_handle, nof_qos] : seg_to_qos) {
                     LOG(INFO)
                         << "nof_qos_state worker_idx=" << work_idx
@@ -656,23 +703,53 @@ void MemcpyWorkerPool::workerThread() {
         if (task.state) {
             try {
                 bool ok = true;
+                auto runtime_accelerator =
+                    device::GetAcceleratorRegistry().RuntimeAccelerators();
                 for (const auto& op : task.operations) {
-                    int src_dev = -1, dst_dev = -1;
-                    bool src_on_gpu =
-                        gpu_staging::IsDevicePointer(op.src, &src_dev);
-                    bool dst_on_gpu =
-                        gpu_staging::IsDevicePointer(op.dest, &dst_dev);
+                    device::PointerInfo src_info;
+                    device::PointerInfo dst_info;
+                    auto* src_device = runtime_accelerator.FindDeviceForPointer(
+                        op.src, &src_info);
+                    auto* dst_device = runtime_accelerator.FindDeviceForPointer(
+                        op.dest, &dst_info);
 
-                    if (!src_on_gpu && !dst_on_gpu) {
+                    if (!src_device && !dst_device) {
                         std::memcpy(op.dest, op.src, op.size);
                     } else {
-                        int dev = src_on_gpu ? src_dev : dst_dev;
-                        gpu_staging::SetDevice(dev);
-                        if (!gpu_staging::CopyAuto(op.dest, op.src, op.size)) {
+                        if (src_device && dst_device &&
+                            src_device != dst_device) {
                             LOG(ERROR)
-                                << "GPU memcpy failed: src_dev=" << src_dev
-                                << " dst_dev=" << dst_dev
+                                << "GPU memcpy failed: source and destination "
+                                   "belong to different accelerator runtimes"
+                                << " src_dev=" << src_info.device_id
+                                << " dst_dev=" << dst_info.device_id
                                 << " size=" << op.size;
+                            ok = false;
+                            break;
+                        }
+                        const device::AcceleratorDevice* accelerator = nullptr;
+                        int32_t device_id = -1;
+                        device::CopyDirection direction;
+                        if (src_device) {
+                            accelerator = src_device;
+                            device_id = src_info.device_id;
+                            direction = device::CopyDirection::kDeviceToHost;
+                            if (dst_device) {
+                                direction =
+                                    device::CopyDirection::kDeviceToDevice;
+                            }
+                        } else {
+                            accelerator = dst_device;
+                            device_id = dst_info.device_id;
+                            direction = device::CopyDirection::kHostToDevice;
+                        }
+                        accelerator->SetContext(device_id);
+                        if (!accelerator->Copy(op.dest, op.src, op.size,
+                                               direction)) {
+                            LOG(ERROR) << "GPU memcpy failed: src_dev="
+                                       << src_info.device_id
+                                       << " dst_dev=" << dst_info.device_id
+                                       << " size=" << op.size;
                             ok = false;
                             break;
                         }
@@ -698,6 +775,15 @@ void MemcpyWorkerPool::workerThread() {
 // TransferEngineOperationState Implementation
 // ============================================================================
 
+TransferEngineOperationState::~TransferEngineOperationState() {
+#ifdef USE_TENT
+    if (tent_engine_)
+        tent_engine_->freeBatch(batch_id_);
+    else
+#endif
+        engine_.freeBatchID(batch_id_);
+}
+
 bool TransferEngineOperationState::is_completed() {
     std::lock_guard<std::mutex> lock(mutex_);
     if (result_.has_value()) {
@@ -719,13 +805,41 @@ void TransferEngineOperationState::check_task_status() {
 
     for (size_t i = 0; i < batch_size_; ++i) {
         TransferStatus status;
-        Status s = engine_.getTransferStatus(batch_id_, i, status);
-        if (!s.ok()) {
-            LOG(ERROR) << "Failed to get transfer status for batch "
-                       << batch_id_ << " task " << i << " with error "
-                       << s.message();
-            set_result_internal(ErrorCode::TRANSFER_FAIL);
-            return;
+        Status s;
+#ifdef USE_TENT
+        if (tent_engine_) {
+            tent::TransferStatus tent_status;
+            auto tent_s =
+                tent_engine_->getTransferStatus(batch_id_, i, tent_status);
+            if (!tent_s.ok()) {
+                LOG(ERROR) << "Failed to get transfer status for batch "
+                           << batch_id_ << " task " << i << " with error "
+                           << tent_s.message();
+                set_result_internal(ErrorCode::TRANSFER_FAIL);
+                return;
+            }
+            auto classic_status = ToClassicTransferStatus(tent_status.s);
+            if (!classic_status) {
+                LOG(ERROR) << "Unknown TENT transfer status for batch "
+                           << batch_id_ << " task " << i << " with status "
+                           << static_cast<int>(tent_status.s);
+                set_result_internal(ErrorCode::TRANSFER_FAIL);
+                return;
+            }
+            status.s = *classic_status;
+            status.transferred_bytes = tent_status.transferred_bytes;
+            s = Status::OK();
+        } else
+#endif
+        {
+            s = engine_.getTransferStatus(batch_id_, i, status);
+            if (!s.ok()) {
+                LOG(ERROR) << "Failed to get transfer status for batch "
+                           << batch_id_ << " task " << i << " with error "
+                           << s.message();
+                set_result_internal(ErrorCode::TRANSFER_FAIL);
+                return;
+            }
         }
 
         switch (status.s) {
@@ -795,60 +909,63 @@ void TransferEngineOperationState::wait_for_completion() {
     constexpr int64_t timeout_milliseconds = 60 * 1000;
 
 #ifdef USE_EVENT_DRIVEN_COMPLETION
-    VLOG(1) << "Waiting for transfer engine completion for batch " << batch_id_;
+    // TENT batches do not use the classic transport BatchDesc layout.
+    if (!engine_.isUsingTent()) {
+        VLOG(1) << "Waiting for transfer engine completion for batch "
+                << batch_id_;
+        // Wait directly on BatchDesc's condition variable.
+        auto& batch_desc = Transport::toBatchDesc(batch_id_);
+        bool completed;
+        bool failed = false;
 
-    // Wait directly on BatchDesc's condition variable.
-    auto& batch_desc = Transport::toBatchDesc(batch_id_);
-    bool completed;
-    bool failed = false;
+        // Fast path: if already finished, avoid taking the mutex and waiting.
+        // Use acquire here to pair with the writer's release-store, because
+        // this path may skip taking the mutex. It ensures all prior updates are
+        // visible.
+        completed = batch_desc.is_finished.load(std::memory_order_acquire);
+        if (!completed) {
+            // Use the same mutex as the notifier when updating the predicate to
+            // avoid missed notifications. The predicate is re-checked under the
+            // lock. Under the mutex, relaxed is sufficient; the mutex acquire
+            // orders prior writes.
+            std::unique_lock<std::mutex> lock(batch_desc.completion_mutex);
+            const int64_t elapsed_milliseconds =
+                getCurrentTimeInMilli() - start_ts_;
+            if (elapsed_milliseconds < timeout_milliseconds) {
+                completed = batch_desc.completion_cv.wait_for(
+                    lock,
+                    std::chrono::milliseconds(timeout_milliseconds -
+                                              elapsed_milliseconds),
+                    [&batch_desc] {
+                        return batch_desc.is_finished.load(
+                            std::memory_order_relaxed);
+                    });
+            }
+        }  // Explicitly release completion_mutex before acquiring mutex_
 
-    // Fast path: if already finished, avoid taking the mutex and waiting.
-    // Use acquire here to pair with the writer's release-store, because this
-    // path may skip taking the mutex. It ensures all prior updates are visible.
-    completed = batch_desc.is_finished.load(std::memory_order_acquire);
-    if (!completed) {
-        // Use the same mutex as the notifier when updating the predicate to
-        // avoid missed notifications. The predicate is re-checked under the
-        // lock. Under the mutex, relaxed is sufficient; the mutex acquire
-        // orders prior writes.
-        std::unique_lock<std::mutex> lock(batch_desc.completion_mutex);
-        const int64_t elapsed_milliseconds =
-            getCurrentTimeInMilli() - start_ts_;
-        if (elapsed_milliseconds < timeout_milliseconds) {
-            completed = batch_desc.completion_cv.wait_for(
-                lock,
-                std::chrono::milliseconds(timeout_milliseconds -
-                                          elapsed_milliseconds),
-                [&batch_desc] {
-                    return batch_desc.is_finished.load(
-                        std::memory_order_relaxed);
-                });
+        // Once completion is observed, read failure flag.
+        if (completed) {
+            failed = batch_desc.has_failure.load(std::memory_order_relaxed);
         }
-    }  // Explicitly release completion_mutex before acquiring mutex_
-
-    // Once completion is observed, read failure flag.
-    if (completed) {
-        failed = batch_desc.has_failure.load(std::memory_order_relaxed);
+        ErrorCode error_code =
+            completed ? (failed ? ErrorCode::TRANSFER_FAIL : ErrorCode::OK)
+                      : ErrorCode::TRANSFER_FAIL;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            set_result_internal(error_code);
+        }
+        if (completed) {
+            VLOG(1) << "Transfer engine operation completed for batch "
+                    << batch_id_
+                    << " with result: " << static_cast<int>(error_code);
+        } else {
+            LOG(ERROR) << "Failed to complete transfers after "
+                       << timeout_milliseconds << " milliseconds for batch "
+                       << batch_id_;
+        }
+        return;
     }
-
-    ErrorCode error_code =
-        completed ? (failed ? ErrorCode::TRANSFER_FAIL : ErrorCode::OK)
-                  : ErrorCode::TRANSFER_FAIL;
-
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        set_result_internal(error_code);
-    }
-
-    if (completed) {
-        VLOG(1) << "Transfer engine operation completed for batch " << batch_id_
-                << " with result: " << static_cast<int>(error_code);
-    } else {
-        LOG(ERROR) << "Failed to complete transfers after "
-                   << timeout_milliseconds << " milliseconds for batch "
-                   << batch_id_;
-    }
-#else
+#endif
     VLOG(1) << "Starting transfer engine polling for batch " << batch_id_;
 
     while (true) {
@@ -872,7 +989,6 @@ void TransferEngineOperationState::wait_for_completion() {
         VLOG(1) << "Transfer engine operation still pending for batch "
                 << batch_id_;
     }
-#endif
 }
 
 // ============================================================================
@@ -912,6 +1028,7 @@ TransferSubmitter::TransferSubmitter(TransferEngine& engine,
                                      TransferMetric* transfer_metric,
                                      int numa_socket_id)
     : engine_(engine),
+      tent_engine_(engine.getTentEngine().get()),
       local_endpoint_(engine.getLocalIpAndPort()),
       memcpy_pool_(std::make_unique<MemcpyWorkerPool>()),
 #ifdef USE_NOF
@@ -924,29 +1041,15 @@ TransferSubmitter::TransferSubmitter(TransferEngine& engine,
     // When not set, auto-detect based on transport type:
     //   - TCP-only environment: enable memcpy (avoids TCP loopback overhead)
     //   - RDMA/other transports: disable memcpy (RDMA is more efficient)
-    const char* env_value = std::getenv("MC_STORE_MEMCPY");
-    if (env_value == nullptr) {
+    const auto config = TransferSubmitterConfig::FromEnvironment();
+    if (config.memcpy_enabled_override.has_value()) {
+        memcpy_enabled_ = *config.memcpy_enabled_override;
+    } else {
         memcpy_enabled_ = engine_.isTcpOnly();
         LOG(INFO) << "MC_STORE_MEMCPY not set, auto-detected: "
                   << (memcpy_enabled_ ? "TCP-only environment, memcpy enabled"
                                       : "non-TCP transport available, memcpy "
                                         "disabled");
-    } else {
-        std::string env_str(env_value);
-        // Convert to lowercase for case-insensitive comparison
-        std::transform(env_str.begin(), env_str.end(), env_str.begin(),
-                       [](unsigned char c) { return std::tolower(c); });
-        if (env_str == "false" || env_str == "0" || env_str == "no" ||
-            env_str == "off") {
-            memcpy_enabled_ = false;
-        } else if (env_str == "true" || env_str == "1" || env_str == "yes" ||
-                   env_str == "on") {
-            memcpy_enabled_ = true;
-        } else {
-            LOG(WARNING) << "Invalid value for MC_STORE_MEMCPY: " << env_str
-                         << ", defaulting to enabled";
-            memcpy_enabled_ = true;
-        }
     }
 
     VLOG(1) << "TransferSubmitter initialized with memcpy_enabled="
@@ -955,7 +1058,8 @@ TransferSubmitter::TransferSubmitter(TransferEngine& engine,
 
 std::optional<TransferFuture> TransferSubmitter::submit(
     const Replica::Descriptor& replica, std::vector<Slice>& slices,
-    TransferRequest::OpCode op_code, void* ptr, size_t size) {
+    TransferRequest::OpCode op_code, void* ptr, size_t size,
+    TransferIntent intent) {
     std::optional<TransferFuture> future;
 
     if (replica.is_memory_replica()) {
@@ -967,7 +1071,7 @@ std::optional<TransferFuture> TransferSubmitter::submit(
         }
 
         if (op_code == TransferRequest::READ) {
-            future = submitMemoryReadOperation(handle, slices, 0);
+            future = submitMemoryReadOperation(handle, slices, 0, intent);
         } else {
             TransferStrategy strategy = selectStrategy(handle, slices);
 
@@ -976,8 +1080,8 @@ std::optional<TransferFuture> TransferSubmitter::submit(
                     future = submitMemcpyOperation(handle, slices, op_code);
                     break;
                 case TransferStrategy::TRANSFER_ENGINE:
-                    future =
-                        submitTransferEngineOperation(handle, slices, op_code);
+                    future = submitTransferEngineOperation(handle, slices,
+                                                           op_code, 0, intent);
                     break;
                 default:
                     LOG(ERROR) << "Unknown transfer strategy: " << strategy;
@@ -1013,25 +1117,69 @@ std::optional<TransferFuture> TransferSubmitter::submit(
 std::optional<TransferFuture> TransferSubmitter::submit_batch(
     const std::vector<Replica::Descriptor>& replicas,
     std::vector<std::vector<Slice>>& all_slices,
-    TransferRequest::OpCode op_code) {
-    std::optional<TransferFuture> future;
-    std::vector<TransferRequest> requests;
+    TransferRequest::OpCode op_code, TransferIntent intent) {
+    if (replicas.size() != all_slices.size()) {
+        LOG(ERROR) << "Mismatched replicas and slice lists";
+        return std::nullopt;
+    }
+
+    bool use_local_memcpy =
+        op_code == TransferRequest::WRITE && !replicas.empty();
+    size_t operation_count = 0;
     for (size_t i = 0; i < replicas.size(); ++i) {
-        auto& replica = replicas[i];
+        if (!replicas[i].is_memory_replica()) {
+            LOG(ERROR) << "Batch transfer only supports memory replicas";
+            return std::nullopt;
+        }
+        const auto& handle =
+            replicas[i].get_memory_descriptor().buffer_descriptor;
+        if (!validateTransferParams(handle, all_slices[i])) {
+            return std::nullopt;
+        }
+        use_local_memcpy =
+            use_local_memcpy && canUseLocalMemcpy(handle.transport_endpoint_);
+        operation_count += all_slices[i].size();
+    }
+
+    std::vector<TransferRequest> requests;
+    std::vector<MemcpyOperation> memcpy_operations;
+    if (use_local_memcpy)
+        memcpy_operations.reserve(operation_count);
+    else
+        requests.reserve(operation_count);
+    for (size_t i = 0; i < replicas.size(); ++i) {
         auto& slices = all_slices[i];
-        auto& mem_desc = replica.get_memory_descriptor();
-        if (!validateTransferParams(mem_desc.buffer_descriptor, slices)) {
-            return std::nullopt;
+        const auto& handle =
+            replicas[i].get_memory_descriptor().buffer_descriptor;
+        if (use_local_memcpy) {
+            appendMemcpyOperations(handle, slices, op_code, 0,
+                                   memcpy_operations);
+            continue;
         }
-        auto& handle = mem_desc.buffer_descriptor;
         uint64_t offset = 0;
-        SegmentHandle seg = engine_.openSegment(handle.transport_endpoint_);
-        if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
-            LOG(ERROR) << "Failed to open segment "
-                       << handle.transport_endpoint_;
-            return std::nullopt;
+        SegmentHandle seg = 0;
+#ifdef USE_TENT
+        if (tent_engine_) {
+            tent::SegmentID seg_id;
+            auto status =
+                tent_engine_->openSegment(seg_id, handle.transport_endpoint_);
+            if (!status.ok()) {
+                LOG(ERROR) << "Failed to open segment "
+                           << handle.transport_endpoint_;
+                return std::nullopt;
+            }
+            seg = seg_id;
+        } else
+#endif
+        {
+            seg = engine_.openSegment(handle.transport_endpoint_);
+            if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
+                LOG(ERROR) << "Failed to open segment "
+                           << handle.transport_endpoint_;
+                return std::nullopt;
+            }
         }
-        for (auto slice : slices) {
+        for (const auto& slice : slices) {
             TransferRequest request;
             request.opcode = op_code;
             request.source = static_cast<char*>(slice.ptr);
@@ -1042,7 +1190,9 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
             offset += slice.size;
         }
     }
-    future = submitTransfer(requests);
+    auto future = use_local_memcpy
+                      ? submitMemcpyOperations(std::move(memcpy_operations))
+                      : submitTransfer(requests, intent);
     // Update metrics on successful submission
     if (future.has_value()) {
         for (auto& slices : all_slices) {
@@ -1052,118 +1202,591 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
     return future;
 }
 
+class StoreScatterTransferOperation::Impl {
+   public:
+    explicit Impl(TransferEngine::ScatterTransferOperation operation)
+        : classic_operation_(std::move(operation)) {}
+
+    explicit Impl(Status status)
+        : aggregate_status_(std::move(status)), completed_(true) {}
+
+#ifdef USE_TENT
+    Impl(std::shared_ptr<tent::TransferEngine> engine,
+         const std::vector<TransferEngine::ScatterTransferRange>& ranges,
+         TransferIntent intent)
+        : tent_engine_(std::move(engine)) {
+        build(ranges, intent);
+    }
+#endif
+    ~Impl() {
+        if (classic_operation_) {
+            classic_operation_->wait();
+            return;
+        }
+#ifdef USE_TENT
+        if (completed_) {
+            retryCloseSegments();
+            return;
+        }
+        // Destructor path: use a shorter timeout than wait() to avoid
+        // blocking too long when the caller didn't explicitly wait.
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::seconds(GetTentPositiveEnvOrDefault(
+                                  "MC_TENT_DESTRUCTOR_TIMEOUT_S", 5));
+        while (!completed_ && std::chrono::steady_clock::now() < deadline) {
+            poll();
+            if (!completed_) std::this_thread::sleep_for(kPollInterval);
+        }
+        if (!completed_) forceCleanup();
+#endif
+    }
+
+    Status wait() {
+        if (classic_operation_) return classic_operation_->wait();
+#ifdef USE_TENT
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::seconds(GetTentPositiveEnvOrDefault(
+                                  "MC_TENT_TRANSFER_TIMEOUT_S", 60));
+        while (!completed_) {
+            poll();
+            if (!completed_) std::this_thread::sleep_for(kPollInterval);
+            if (!completed_ && std::chrono::steady_clock::now() >= deadline) {
+                requestAbort(Status::Socket("TENT scatter transfer timed out"));
+                const auto cleanup_deadline =
+                    std::chrono::steady_clock::now() +
+                    std::chrono::seconds(GetTentPositiveEnvOrDefault(
+                        "MC_TENT_CANCEL_GRACE_S", 1));
+                while (!completed_ &&
+                       std::chrono::steady_clock::now() < cleanup_deadline) {
+                    poll();
+                    if (!completed_) std::this_thread::sleep_for(kPollInterval);
+                }
+                if (!completed_) forceCleanup();
+            }
+        }
+#endif
+        return aggregate_status_;
+    }
+
+    Status waitFor(std::chrono::nanoseconds timeout) {
+        if (classic_operation_) return classic_operation_->waitFor(timeout);
+#ifdef USE_TENT
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (!completed_) {
+            poll();
+            if (completed_) break;
+            if (std::chrono::steady_clock::now() >= deadline) {
+                requestAbort(Status::Clock("scatter transfer wait timed out"));
+                return aggregate_status_;
+            }
+            std::this_thread::sleep_for(kPollInterval);
+        }
+#else
+        (void)timeout;
+#endif
+        return aggregate_status_;
+    }
+
+   private:
+    static constexpr auto kPollInterval = std::chrono::microseconds(10);
+
+#ifdef USE_TENT
+    void remember(const Status& status) {
+        if (aggregate_status_.ok() && !status.ok()) aggregate_status_ = status;
+    }
+
+    void complete(size_t index, const Status& status) {
+        if (done_[index]) return;
+        done_[index] = true;
+        remember(status);
+        const auto [range_index, fragment_index] = request_fragments_[index];
+        if (callbacks_[range_index]) {
+            try {
+                callbacks_[range_index](fragment_index, status);
+            } catch (...) {
+                remember(Status::Context("scatter transfer callback failed"));
+            }
+        }
+    }
+
+    void retryCloseSegments() {
+        for (int attempt = 0; attempt < 3 && !segments_.empty(); ++attempt) {
+            for (auto it = segments_.begin(); it != segments_.end();) {
+                auto status = tent_engine_->closeSegment(it->second);
+                if (status.ok()) {
+                    it = segments_.erase(it);
+                } else {
+                    remember(Status::Context(status.ToString()));
+                    ++it;
+                }
+            }
+            if (!segments_.empty())
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+
+    void finish() {
+        retryCloseSegments();
+        completed_ = true;
+    }
+
+    void failPending(const Status& status) {
+        for (size_t i = 0; i < done_.size(); ++i) complete(i, status);
+    }
+
+    void requestAbort(const Status& status) {
+        remember(status);
+        if (abort_requested_ || batch_id_ == 0) return;
+        abort_requested_ = true;
+        abort_deadline_ = std::chrono::steady_clock::now() +
+                          std::chrono::seconds(GetTentPositiveEnvOrDefault(
+                              "MC_TENT_CANCEL_GRACE_S", 1));
+        for (size_t task = 0; task < tent_requests_.size(); ++task) {
+            const size_t index = native_indexes_[task];
+            if (done_[index]) continue;
+            auto cancel_status = tent_engine_->cancelTransfer(batch_id_, task);
+            if (!cancel_status.ok() && !cancel_status.IsNotImplemented())
+                remember(Status::Context(cancel_status.ToString()));
+        }
+    }
+
+    void forceCleanup() {
+        failPending(Status::Socket("TENT scatter transfer cleanup timed out"));
+        if (batch_id_ != 0) tent_engine_->freeBatch(batch_id_);
+        batch_id_ = 0;
+        finish();
+    }
+
+    void build(const std::vector<TransferEngine::ScatterTransferRange>& ranges,
+               TransferIntent intent) {
+        auto default_intent = ToTentIntent(intent);
+        if (!default_intent) {
+            aggregate_status_ =
+                Status::InvalidArgument("invalid TENT scatter transfer intent");
+            completed_ = true;
+            return;
+        }
+        std::map<std::string, tent::SegmentID> segment_ids;
+        for (size_t range_index = 0; range_index < ranges.size();
+             ++range_index) {
+            const auto& range = ranges[range_index];
+            callbacks_.push_back(range.on_fragment_complete);
+            const size_t count = range.local_offsets.size();
+            if (range.remote_offsets.size() != count ||
+                range.lengths.size() != count ||
+                range.local_buffer == nullptr || range.remote_segment.empty()) {
+                const auto error =
+                    Status::InvalidArgument("invalid scatter transfer range");
+                for (size_t i = 0; i < count; ++i) {
+                    request_fragments_.emplace_back(range_index, i);
+                    done_.push_back(false);
+                    complete(done_.size() - 1, error);
+                }
+                continue;
+            }
+            auto segment_it = segment_ids.find(range.remote_segment);
+            if (segment_it == segment_ids.end()) {
+                tent::SegmentID segment_id;
+                auto status =
+                    tent_engine_->openSegment(segment_id, range.remote_segment);
+                if (!status.ok()) {
+                    const auto error = Status::Context(status.ToString());
+                    for (size_t i = 0; i < count; ++i) {
+                        request_fragments_.emplace_back(range_index, i);
+                        done_.push_back(false);
+                        complete(done_.size() - 1, error);
+                    }
+                    continue;
+                }
+                segment_it =
+                    segment_ids.emplace(range.remote_segment, segment_id).first;
+                segments_.emplace_back(range.remote_segment, segment_id);
+            }
+            for (size_t fragment = 0; fragment < count; ++fragment) {
+                const size_t length = range.lengths[fragment];
+                const size_t local_offset = range.local_offsets[fragment];
+                const size_t remote_offset = range.remote_offsets[fragment];
+                const bool valid =
+                    local_offset <= range.local_capacity &&
+                    length <= range.local_capacity - local_offset &&
+                    remote_offset <= range.remote_size &&
+                    length <= range.remote_size - remote_offset &&
+                    range.remote_base_offset <=
+                        std::numeric_limits<uint64_t>::max() - remote_offset &&
+                    length <= std::numeric_limits<uint64_t>::max() -
+                                  (range.remote_base_offset + remote_offset);
+                request_fragments_.emplace_back(range_index, fragment);
+                done_.push_back(false);
+                if (!valid) {
+                    complete(done_.size() - 1,
+                             Status::InvalidArgument(
+                                 "invalid scatter transfer fragment"));
+                    continue;
+                }
+                if (length == 0) {
+                    complete(done_.size() - 1, Status::OK());
+                    continue;
+                }
+                TransferIntent request_store_intent = intent;
+                if (range.intent_type != transfer_intent_values::kUnspecified) {
+                    auto parsed_intent =
+                        TransferIntentFromInt(range.intent_type);
+                    if (!parsed_intent) {
+                        complete(done_.size() - 1,
+                                 Status::InvalidArgument(
+                                     "invalid TENT scatter transfer intent"));
+                        continue;
+                    }
+                    request_store_intent = *parsed_intent;
+                }
+                auto opcode = ToTentOpCode(range.opcode);
+                auto request_intent = ToTentIntent(request_store_intent);
+                if (!opcode || !request_intent) {
+                    complete(done_.size() - 1,
+                             Status::InvalidArgument(
+                                 "invalid TENT scatter transfer request"));
+                    continue;
+                }
+                tent::Request request;
+                request.opcode = *opcode;
+                request.source =
+                    static_cast<char*>(range.local_buffer) + local_offset;
+                request.target_id = segment_it->second;
+                request.target_offset =
+                    range.remote_base_offset + remote_offset;
+                request.length = length;
+                request.intent_type = *request_intent;
+                // transport_hint left at default (0 = auto-select);
+                // ScatterTransferRange does not carry per-fragment hints.
+                tent_requests_.push_back(request);
+                native_indexes_.push_back(done_.size() - 1);
+            }
+        }
+        if (tent_requests_.empty()) {
+            finish();
+            return;
+        }
+        batch_id_ = tent_engine_->allocateBatch(tent_requests_.size());
+        if (batch_id_ == 0) {
+            failPending(Status::InvalidArgument(
+                "failed to allocate TENT scatter transfer batch"));
+            finish();
+            return;
+        }
+        auto status = tent_engine_->submitTransfer(batch_id_, tent_requests_);
+        if (!status.ok()) {
+            failPending(Status::Context(status.ToString()));
+            tent_engine_->freeBatch(batch_id_);
+            batch_id_ = 0;
+            finish();
+            return;
+        }
+        remaining_ = tent_requests_.size();
+    }
+
+    void poll() {
+        for (size_t task = 0; task < tent_requests_.size(); ++task) {
+            const size_t index = native_indexes_[task];
+            if (done_[index]) continue;
+            tent::TransferStatus transfer_status;
+            auto status = tent_engine_->getTransferStatus(batch_id_, task,
+                                                          transfer_status);
+            if (!status.ok()) {
+                requestAbort(Status::Context(status.ToString()));
+                if (!abort_requested_ ||
+                    std::chrono::steady_clock::now() >= abort_deadline_) {
+                    complete(index, Status::Context(status.ToString()));
+                    assert(remaining_ > 0);
+                    --remaining_;
+                }
+                continue;
+            } else {
+                auto state = ToClassicTransferStatus(transfer_status.s);
+                if (!state) {
+                    complete(
+                        index,
+                        Status::Socket("unknown TENT scatter transfer status"));
+                    --remaining_;
+                    continue;
+                }
+                if (*state == TransferStatusEnum::WAITING) continue;
+                complete(index, *state == TransferStatusEnum::COMPLETED
+                                    ? Status::OK()
+                                    : Status::Socket(
+                                          "scatter transfer fragment failed"));
+            }
+            assert(remaining_ > 0);
+            --remaining_;
+        }
+        if (remaining_ != 0) return;
+        auto status = tent_engine_->freeBatch(batch_id_);
+        remember(status.ok() ? Status::OK()
+                             : Status::Context(status.ToString()));
+        batch_id_ = 0;
+        finish();
+    }
+#endif
+
+    std::optional<TransferEngine::ScatterTransferOperation> classic_operation_;
+    Status aggregate_status_;
+    bool completed_ = false;
+#ifdef USE_TENT
+    std::shared_ptr<tent::TransferEngine> tent_engine_;
+    std::vector<tent::Request> tent_requests_;
+    std::vector<size_t> native_indexes_;
+    std::vector<std::pair<size_t, size_t>> request_fragments_;
+    std::vector<std::function<void(size_t, const Status&)>> callbacks_;
+    std::vector<uint8_t> done_;
+    std::vector<std::pair<std::string, tent::SegmentID>> segments_;
+    BatchID batch_id_ = 0;
+    size_t remaining_ = 0;
+    bool abort_requested_ = false;
+    std::chrono::steady_clock::time_point abort_deadline_ =
+        std::chrono::steady_clock::time_point::max();
+#endif
+};
+
+StoreScatterTransferOperation::StoreScatterTransferOperation(
+    std::unique_ptr<Impl> impl)
+    : impl_(std::move(impl)) {}
+
+StoreScatterTransferOperation::StoreScatterTransferOperation(
+    StoreScatterTransferOperation&&) noexcept = default;
+
+StoreScatterTransferOperation& StoreScatterTransferOperation::operator=(
+    StoreScatterTransferOperation&&) noexcept = default;
+
+StoreScatterTransferOperation::~StoreScatterTransferOperation() = default;
+
+Status StoreScatterTransferOperation::wait() {
+    return impl_
+               ? impl_->wait()
+               : Status::InvalidArgument("invalid scatter transfer operation");
+}
+
+Status StoreScatterTransferOperation::waitFor(
+    std::chrono::nanoseconds timeout) {
+    return impl_
+               ? impl_->waitFor(timeout)
+               : Status::InvalidArgument("invalid scatter transfer operation");
+}
+
+TransferEngine::ScatterTransferOperation TransferSubmitter::submitScatter(
+    const std::vector<TransferEngine::ScatterTransferRange>& transfers) {
+    return engine_.submitScatter(transfers);
+}
+
+StoreScatterTransferOperation TransferSubmitter::submitNativeScatter(
+    const std::vector<TransferEngine::ScatterTransferRange>& transfers,
+    TransferIntent intent) {
+#ifdef USE_TENT
+    if (tent_engine_) {
+        return StoreScatterTransferOperation(
+            std::make_unique<StoreScatterTransferOperation::Impl>(
+                engine_.getTentEngine(), transfers, intent));
+    }
+#else
+    (void)intent;
+#endif
+    return StoreScatterTransferOperation(
+        std::make_unique<StoreScatterTransferOperation::Impl>(
+            engine_.submitScatter(transfers)));
+}
+
 std::optional<TransferFuture>
 TransferSubmitter::submit_batch_get_offload_object(
     const std::string& transfer_engine_addr,
     const std::vector<std::string>& keys, const std::vector<uint64_t>& pointers,
-    const std::unordered_map<std::string, std::vector<Slice>>& batched_slices) {
-    std::optional<TransferFuture> future;
-    std::vector<TransferRequest> requests;
-    // Open the segment once — all keys share the same transfer_engine_addr.
-    SegmentHandle seg = engine_.openSegment(transfer_engine_addr);
-    if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
-        LOG(ERROR) << "Failed to open segment " << transfer_engine_addr;
-        // nullopt = failure (caller checks !future).  The function returns
-        // std::optional so tl::unexpected is not available here.
+    const std::unordered_map<std::string, std::vector<Slice>>& batched_slices,
+    OffloadBufferAccess buffer_access, TransferIntent intent) {
+    if (keys.size() != pointers.size()) {
+        LOG(ERROR) << "Mismatched offload transfer argument counts";
         return std::nullopt;
     }
+
+    const bool use_local_memcpy =
+        buffer_access == OffloadBufferAccess::kLocalAddress;
+    if (use_local_memcpy && !canUseLocalMemcpy(transfer_engine_addr)) {
+        LOG(ERROR) << "Offload source is not locally addressable: "
+                   << transfer_engine_addr;
+        return std::nullopt;
+    }
+
+    std::vector<TransferRequest> requests;
+    std::vector<MemcpyOperation> operations;
+    constexpr uint64_t kMaxAddress = std::numeric_limits<uint64_t>::max();
+    SegmentHandle seg = 0;
+    if (!use_local_memcpy) {
+        // Open once: all keys share the same transfer endpoint.
+#ifdef USE_TENT
+        if (tent_engine_) {
+            tent::SegmentID seg_id;
+            auto status =
+                tent_engine_->openSegment(seg_id, transfer_engine_addr);
+            if (!status.ok()) {
+                LOG(ERROR) << "Failed to open segment " << transfer_engine_addr;
+                return std::nullopt;
+            }
+            seg = seg_id;
+        } else
+#endif
+        {
+            seg = engine_.openSegment(transfer_engine_addr);
+            if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
+                LOG(ERROR) << "Failed to open segment " << transfer_engine_addr;
+                return std::nullopt;
+            }
+        }
+    }
+
     for (size_t i = 0; i < keys.size(); ++i) {
         const auto& key = keys[i];
-        const uint64_t pointer = pointers[i];
         auto it = batched_slices.find(key);
         if (it == batched_slices.end()) {
             LOG(ERROR) << "Key not found in batched_slices: " << key;
-            return std::nullopt;  // fail closed
+            return std::nullopt;
         }
-        // Emit one TransferRequest per slice: the on-disk blob is read
-        // sequentially while slices may point to non-contiguous GPU memory.
         uint64_t offset = 0;
         for (const auto& slice : it->second) {
-            TransferRequest request;
-            request.opcode = TransferRequest::READ;
-            request.source = static_cast<char*>(slice.ptr);
-            request.target_id = seg;
-            request.target_offset = pointer + offset;
-            request.length = slice.size;
-            requests.emplace_back(request);
+            if (slice.size == 0) continue;
+            if (!slice.ptr || pointers[i] > kMaxAddress - offset ||
+                slice.size > kMaxAddress - pointers[i] - offset) {
+                LOG(ERROR) << "Invalid offload transfer range for key: " << key;
+                return std::nullopt;
+            }
+            if (use_local_memcpy) {
+                operations.emplace_back(
+                    slice.ptr,
+                    reinterpret_cast<const void*>(pointers[i] + offset),
+                    slice.size);
+            } else {
+                requests.emplace_back(TransferRequest{
+                    .opcode = TransferRequest::READ,
+                    .source = static_cast<char*>(slice.ptr),
+                    .target_id = seg,
+                    .target_offset = pointers[i] + offset,
+                    .length = slice.size,
+                });
+            }
             offset += slice.size;
         }
     }
-    return submitTransfer(requests);
+    return use_local_memcpy ? submitMemcpyOperations(std::move(operations))
+                            : submitTransfer(requests, intent);
+}
+
+void TransferSubmitter::appendMemcpyOperations(
+    const AllocatedBuffer::Descriptor& handle, const std::vector<Slice>& slices,
+    const TransferRequest::OpCode op_code, uint64_t buffer_offset,
+    std::vector<MemcpyOperation>& operations) {
+    uint64_t base_address = static_cast<uint64_t>(handle.buffer_address_);
+    uint64_t offset = buffer_offset;
+
+    for (const auto& slice : slices) {
+        if (slice.ptr == nullptr) continue;
+
+        void* dest;
+        const void* src;
+        if (op_code == TransferRequest::READ) {
+            dest = slice.ptr;
+            src = reinterpret_cast<const void*>(base_address + offset);
+        } else {
+            dest = reinterpret_cast<void*>(base_address + offset);
+            src = slice.ptr;
+        }
+        offset += slice.size;
+        operations.emplace_back(dest, src, slice.size);
+    }
 }
 
 std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
     const AllocatedBuffer::Descriptor& handle, const std::vector<Slice>& slices,
     const TransferRequest::OpCode op_code, uint64_t src_offset) {
-    auto state = std::make_shared<MemcpyOperationState>();
-
-    // Create memcpy operations
     std::vector<MemcpyOperation> operations;
     operations.reserve(slices.size());
-    uint64_t base_address = static_cast<uint64_t>(handle.buffer_address_);
-    uint64_t offset = src_offset;
+    appendMemcpyOperations(handle, slices, op_code, src_offset, operations);
+    return submitMemcpyOperations(std::move(operations));
+}
 
-    for (size_t i = 0; i < slices.size(); ++i) {
-        const auto& slice = slices[i];
-
-        if (slice.ptr == nullptr) continue;
-
-        void* dest;
-        const void* src;
-
-        if (op_code == TransferRequest::READ) {
-            // READ: from handle (remote buffer) to slice (local buffer)
-            dest = slice.ptr;
-            src = reinterpret_cast<const void*>(base_address + offset);
-        } else {
-            // WRITE: from slice (local buffer) to handle (remote buffer)
-            dest = reinterpret_cast<void*>(base_address + offset);
-            src = slice.ptr;
-        }
-        offset += slice.size;
-
-        operations.emplace_back(dest, src, slice.size);
-    }
-
-    // Submit memcpy operations to worker pool for async execution
+std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperations(
+    std::vector<MemcpyOperation> operations) {
+    auto state = std::make_shared<MemcpyOperationState>();
+    const size_t operation_count = operations.size();
     MemcpyTask task(std::move(operations), state);
     memcpy_pool_->submitTask(std::move(task));
 
-    VLOG(1) << "Memcpy transfer submitted to worker pool with " << slices.size()
-            << " operations";
+    VLOG(1) << "Memcpy transfer submitted to worker pool with "
+            << operation_count << " operations";
 
     return TransferFuture(state);
 }
 
 std::optional<TransferFuture> TransferSubmitter::submitTransfer(
-    std::vector<TransferRequest>& requests) {
-    // Allocate batch ID
+    std::vector<TransferRequest>& requests, TransferIntent intent) {
     const size_t batch_size = requests.size();
-    BatchID batch_id = engine_.allocateBatchID(batch_size);
-    if (batch_id == INVALID_BATCH_ID) {
-        LOG(ERROR) << "Failed to allocate batch ID";
-        return std::nullopt;
+
+    BatchID batch_id = INVALID_BATCH_ID;
+    Status s;
+
+#ifdef USE_TENT
+    if (tent_engine_) {
+        batch_id = tent_engine_->allocateBatch(batch_size);
+        if (batch_id == 0) {
+            LOG(ERROR) << "Failed to allocate batch ID";
+            return std::nullopt;
+        }
+        std::vector<tent::Request> tent_reqs;
+        tent_reqs.reserve(requests.size());
+        auto tent_intent = ToTentIntent(intent);
+        if (!tent_intent) {
+            LOG(ERROR) << "Invalid TENT transfer intent: "
+                       << static_cast<int>(intent);
+            tent_engine_->freeBatch(batch_id);
+            return std::nullopt;
+        }
+        for (auto& r : requests) {
+            auto tent_opcode = ToTentOpCode(r.opcode);
+            if (!tent_opcode) {
+                LOG(ERROR) << "Invalid TENT transfer opcode: "
+                           << static_cast<int>(r.opcode);
+                tent_engine_->freeBatch(batch_id);
+                return std::nullopt;
+            }
+            tent::Request tr;
+            tr.opcode = *tent_opcode;
+            tr.source = r.source;
+            tr.target_id = r.target_id;
+            tr.target_offset = r.target_offset;
+            tr.length = r.length;
+            tr.transport_hint =
+                mooncake::tent::c_to_transport_hint(r.transport_hint);
+            tr.intent_type = *tent_intent;
+            tent_reqs.push_back(tr);
+        }
+        auto tent_status = tent_engine_->submitTransfer(batch_id, tent_reqs);
+        if (!tent_status.ok()) {
+            LOG(ERROR) << "Failed to submit all transfers, error: "
+                       << tent_status.ToString();
+            tent_engine_->freeBatch(batch_id);
+            return std::nullopt;
+        }
+    } else
+#endif
+    {
+        batch_id = engine_.allocateBatchID(batch_size);
+        if (batch_id == INVALID_BATCH_ID) {
+            LOG(ERROR) << "Failed to allocate batch ID";
+            return std::nullopt;
+        }
+        s = engine_.submitTransfer(batch_id, requests);
+        if (!s.ok()) {
+            LOG(ERROR) << "Failed to submit all transfers, error code is "
+                       << s.code();
+            engine_.freeBatchID(batch_id);
+            return std::nullopt;
+        }
     }
 
-    // Submit transfer
-    Status s = engine_.submitTransfer(batch_id, requests);
-    if (!s.ok()) {
-        LOG(ERROR) << "Failed to submit all transfers, error code is "
-                   << s.code();
-        // Note: batch_id will be freed by TransferEngineOperationState
-        // destructor if we create the state object, otherwise we need to free
-        // it here
-        engine_.freeBatchID(batch_id);
-        return std::nullopt;
-    }
-
-    if (batch_id == INVALID_BATCH_ID) {  // INVALID_BATCH_ID
-        LOG(ERROR) << "Invalid batch ID for transfer engine operation";
-        return std::nullopt;
-    }
-
-    // Create state with transfer engine context - no polling thread
-    // needed
     auto state = std::make_shared<TransferEngineOperationState>(
         engine_, batch_id, batch_size);
 
@@ -1172,18 +1795,34 @@ std::optional<TransferFuture> TransferSubmitter::submitTransfer(
 
 std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
     const AllocatedBuffer::Descriptor& handle, const std::vector<Slice>& slices,
-    const TransferRequest::OpCode op_code, uint64_t src_offset) {
+    const TransferRequest::OpCode op_code, uint64_t src_offset,
+    TransferIntent intent) {
     if (handle.transport_endpoint_.empty()) {
         LOG(ERROR) << "Transport endpoint is empty for handle with address "
                    << handle.buffer_address_;
         return std::nullopt;
     }
-    SegmentHandle seg = engine_.openSegment(handle.transport_endpoint_);
-
-    if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
-        LOG(ERROR) << "Failed to open segment for endpoint='"
-                   << handle.transport_endpoint_ << "'";
-        return std::nullopt;
+    SegmentHandle seg = 0;
+#ifdef USE_TENT
+    if (tent_engine_) {
+        tent::SegmentID seg_id;
+        auto status =
+            tent_engine_->openSegment(seg_id, handle.transport_endpoint_);
+        if (!status.ok()) {
+            LOG(ERROR) << "Failed to open segment for endpoint='"
+                       << handle.transport_endpoint_ << "'";
+            return std::nullopt;
+        }
+        seg = seg_id;
+    } else
+#endif
+    {
+        seg = engine_.openSegment(handle.transport_endpoint_);
+        if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
+            LOG(ERROR) << "Failed to open segment for endpoint='"
+                       << handle.transport_endpoint_ << "'";
+            return std::nullopt;
+        }
     }
 
     // Create transfer requests
@@ -1206,12 +1845,12 @@ std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
         offset += slice.size;
         requests.emplace_back(request);
     }
-    return submitTransfer(requests);
+    return submitTransfer(requests, intent);
 }
 
 std::optional<TransferFuture> TransferSubmitter::submitMemoryReadOperation(
     const AllocatedBuffer::Descriptor& handle, const std::vector<Slice>& slices,
-    uint64_t src_offset) {
+    uint64_t src_offset, TransferIntent intent) {
     TransferStrategy strategy = selectStrategy(handle, slices);
 
     if (strategy == TransferStrategy::LOCAL_MEMCPY) {
@@ -1219,8 +1858,8 @@ std::optional<TransferFuture> TransferSubmitter::submitMemoryReadOperation(
                                      src_offset);
     }
     if (strategy == TransferStrategy::TRANSFER_ENGINE) {
-        return submitTransferEngineOperation(handle, slices,
-                                             TransferRequest::READ, src_offset);
+        return submitTransferEngineOperation(
+            handle, slices, TransferRequest::READ, src_offset, intent);
     }
 
     LOG(ERROR) << "Read only supports LOCAL_MEMCPY or TRANSFER_ENGINE, got: "
@@ -1228,9 +1867,28 @@ std::optional<TransferFuture> TransferSubmitter::submitMemoryReadOperation(
     return std::nullopt;
 }
 
+std::optional<TransferFuture> TransferSubmitter::submitMemoryWriteOperation(
+    const AllocatedBuffer::Descriptor& handle, const std::vector<Slice>& slices,
+    uint64_t dst_offset, TransferIntent intent) {
+    TransferStrategy strategy = selectStrategy(handle, slices);
+
+    if (strategy == TransferStrategy::LOCAL_MEMCPY) {
+        return submitMemcpyOperation(handle, slices, TransferRequest::WRITE,
+                                     dst_offset);
+    }
+    if (strategy == TransferStrategy::TRANSFER_ENGINE) {
+        return submitTransferEngineOperation(
+            handle, slices, TransferRequest::WRITE, dst_offset, intent);
+    }
+
+    LOG(ERROR) << "Write only supports LOCAL_MEMCPY or TRANSFER_ENGINE, got: "
+               << strategy;
+    return std::nullopt;
+}
+
 std::optional<TransferFuture> TransferSubmitter::submitRangeRead(
     const Replica::Descriptor& replica, std::vector<Slice>& slices,
-    uint64_t src_offset) {
+    uint64_t src_offset, TransferIntent intent) {
     std::optional<TransferFuture> future;
 
     if (replica.is_memory_replica()) {
@@ -1239,14 +1897,15 @@ std::optional<TransferFuture> TransferSubmitter::submitRangeRead(
 
         size_t slices_size = 0;
         for (const auto& s : slices) slices_size += s.size;
-        if (src_offset + slices_size > handle.size_) {
+        if (src_offset > std::numeric_limits<uint64_t>::max() - slices_size ||
+            src_offset + slices_size > handle.size_) {
             LOG(ERROR) << "Range read overflow: src_offset=" << src_offset
                        << " + slices_size=" << slices_size
                        << " > handle.size_=" << handle.size_;
             return std::nullopt;
         }
 
-        future = submitMemoryReadOperation(handle, slices, src_offset);
+        future = submitMemoryReadOperation(handle, slices, src_offset, intent);
     } else if (replica.is_nof_replica()) {
         LOG(ERROR) << "Range read not supported for NoF replicas";
         return std::nullopt;
@@ -1258,6 +1917,42 @@ std::optional<TransferFuture> TransferSubmitter::submitRangeRead(
 
     if (future.has_value()) {
         updateTransferMetrics(slices, TransferRequest::READ);
+    }
+
+    return future;
+}
+
+std::optional<TransferFuture> TransferSubmitter::submitRangeWrite(
+    const Replica::Descriptor& replica, std::vector<Slice>& slices,
+    uint64_t dst_offset, TransferIntent intent) {
+    std::optional<TransferFuture> future;
+
+    if (replica.is_memory_replica()) {
+        auto& mem_desc = replica.get_memory_descriptor();
+        auto& handle = mem_desc.buffer_descriptor;
+
+        size_t slices_size = 0;
+        for (const auto& s : slices) slices_size += s.size;
+        if (dst_offset > std::numeric_limits<uint64_t>::max() - slices_size ||
+            dst_offset + slices_size > handle.size_) {
+            LOG(ERROR) << "Range write overflow: dst_offset=" << dst_offset
+                       << " + slices_size=" << slices_size
+                       << " > handle.size_=" << handle.size_;
+            return std::nullopt;
+        }
+
+        future = submitMemoryWriteOperation(handle, slices, dst_offset, intent);
+    } else if (replica.is_nof_replica()) {
+        LOG(ERROR) << "Range write not supported for NoF replicas";
+        return std::nullopt;
+    } else if (replica.is_disk_replica() || replica.is_local_disk_replica()) {
+        LOG(ERROR)
+            << "Range write not supported for disk replicas (use full write)";
+        return std::nullopt;
+    }
+
+    if (future.has_value()) {
+        updateTransferMetrics(slices, TransferRequest::WRITE);
     }
 
     return future;
@@ -1322,50 +2017,17 @@ std::optional<TransferFuture> TransferSubmitter::submitFileReadOperation(
 
 TransferStrategy TransferSubmitter::selectStrategy(
     const AllocatedBuffer::Descriptor& handle,
-    const std::vector<Slice>& slices) const {
-    // Check if memcpy operations are enabled via environment variable
-    if (!memcpy_enabled_) {
-        VLOG(2) << "Memcpy operations disabled via MC_STORE_MEMCPY environment "
-                   "variable";
-        return TransferStrategy::TRANSFER_ENGINE;
-    }
-
-    // Check conditions for local memcpy optimization
-    if (isLocalTransfer(handle)) {
-        return TransferStrategy::LOCAL_MEMCPY;
-    }
-
-    return TransferStrategy::TRANSFER_ENGINE;
+    const std::vector<Slice>& /* slices */) const {
+    return canUseLocalMemcpy(handle.transport_endpoint_)
+               ? TransferStrategy::LOCAL_MEMCPY
+               : TransferStrategy::TRANSFER_ENGINE;
 }
 
-namespace {
-// Helper function to extract IP address from endpoint string (ip:port format).
-// Supports both IPv4 (ip:port) and IPv6 ([ipv6]:port) formats.
-std::string extractIpAddress(const std::string& endpoint) {
-    if (endpoint.empty()) {
-        return "";
-    }
-
-    // Handle IPv6 format: [ipv6]:port
-    if (endpoint[0] == '[') {
-        size_t closing_bracket = endpoint.find(']');
-        if (closing_bracket == std::string::npos) {
-            LOG(WARNING) << "Invalid IPv6 endpoint format: " << endpoint;
-            return "";
-        }
-        return endpoint.substr(1, closing_bracket - 1);
-    }
-
-    // Handle IPv4 or hostname:port format.
-    size_t colon_pos = endpoint.rfind(':');
-    if (colon_pos != std::string::npos) {
-        return endpoint.substr(0, colon_pos);
-    }
-
-    // No colon found, return the whole string (might be just IP or hostname).
-    return endpoint;
+bool TransferSubmitter::canUseLocalMemcpy(const std::string& endpoint) const {
+    return memcpy_enabled_ &&
+           (isSameProcessEndpoint(endpoint, local_hostname_) ||
+            isSameProcessEndpoint(endpoint, local_endpoint_));
 }
-}  // namespace
 
 bool TransferSubmitter::isSameProcessEndpoint(
     const std::string& handle_endpoint, const std::string& local_endpoint) {
@@ -1375,28 +2037,7 @@ bool TransferSubmitter::isSameProcessEndpoint(
     // memcpy on a peer process's address would segfault. Require the full
     // transport endpoint to match, which uniquely identifies the owning
     // process.
-    if (handle_endpoint.empty() || local_endpoint.empty()) {
-        return false;
-    }
-    if (handle_endpoint == local_endpoint) {
-        return true;
-    }
-
-    const std::string handle_ip = extractIpAddress(handle_endpoint);
-    const std::string local_ip = extractIpAddress(local_endpoint);
-    if (!handle_ip.empty() && handle_ip == local_ip) {
-        VLOG(2) << "Disabling local memcpy for same-host endpoints with "
-                   "different process endpoints: handle="
-                << handle_endpoint << ", local=" << local_endpoint;
-    }
-
-    return false;
-}
-
-bool TransferSubmitter::isLocalTransfer(
-    const AllocatedBuffer::Descriptor& handle) const {
-    return isSameProcessEndpoint(handle.transport_endpoint_, local_hostname_) ||
-           isSameProcessEndpoint(handle.transport_endpoint_, local_endpoint_);
+    return !handle_endpoint.empty() && handle_endpoint == local_endpoint;
 }
 
 bool TransferSubmitter::validateTransferParams(

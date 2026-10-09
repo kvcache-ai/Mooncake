@@ -3,15 +3,26 @@
 
 #pragma once
 
-#include <chrono>
-#include <thread>
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
+#include <limits>
+#include <thread>
 
 // For PAUSE macro
 #include <transfer_engine.h>
 
 namespace mooncake {
+
+inline constexpr bool addOverflows(uint64_t left, uint64_t right) noexcept {
+    return right > std::numeric_limits<uint64_t>::max() - left;
+}
+
+inline constexpr uint64_t alignmentPadding(uint64_t value,
+                                           uint64_t alignment) noexcept {
+    const uint64_t remainder = value % alignment;
+    return remainder == 0 ? 0 : alignment - remainder;
+}
 
 /**
  * @brief Configuration parameters for the BackoffWaiter.
@@ -181,6 +192,15 @@ class BackoffWaiter {
     uint32_t yield_count_{0};
     std::chrono::microseconds current_sleep_;
 };
+
+template <class... Ts>
+struct overloaded : Ts... {
+    using Ts::operator()...;
+};
+
+template <class... Ts>
+overloaded(Ts...) -> overloaded<Ts...>;
+
 }  // namespace mooncake
 
 #endif

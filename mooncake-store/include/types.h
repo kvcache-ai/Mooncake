@@ -11,14 +11,13 @@
 #include <utility>
 #include <vector>
 
+#include "tenant_id.h"
+
 #include "Slab.h"
 #include "ylt/struct_json/json_reader.h"
 #include "ylt/struct_json/json_writer.h"
 #include "ylt/struct_pack.hpp"
 
-#ifdef STORE_USE_ETCD
-#include "libetcd_wrapper.h"
-#endif
 namespace mooncake {
 
 // Constants
@@ -83,16 +82,25 @@ inline bool IsValidClusterIdComponent(const std::string& cluster_id) {
     return true;
 }
 static constexpr uint64_t DEFAULT_DEFAULT_KV_LEASE_TTL =
-    5000;  // in milliseconds
+    10000;  // in milliseconds
 static constexpr uint64_t DEFAULT_KV_SOFT_PIN_TTL_MS =
     30 * 60 * 1000;  // 30 minutes
+static constexpr uint64_t DEFAULT_MAX_KV_SOFT_PIN_TTL_MS =
+    24 * 60 * 60 * 1000;  // 24 hours
 static constexpr bool DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS = true;
 static constexpr double DEFAULT_EVICTION_RATIO = 0.05;
-static constexpr double DEFAULT_EVICTION_HIGH_WATERMARK_RATIO = 0.95;
+static constexpr double DEFAULT_EVICTION_HIGH_WATERMARK_RATIO = 0.90;
+// Per-tenant eviction watermark, as a fraction of a tenant's own effective
+// quota. Mirrors the pool-wide default above so that a tenant gets the same
+// evict-to-make-room contract the pool has; 0.0 disables the pass and restores
+// the pre-existing behaviour, where only the pool-wide watermark can trigger
+// background eviction. Inert unless enable_multi_tenants is set.
+static constexpr double DEFAULT_TENANT_EVICTION_HIGH_WATERMARK_RATIO = 0.90;
 static constexpr double DEFAULT_NOF_EVICTION_RATIO = 0.05;
-static constexpr double DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO = 0.95;
+static constexpr double DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO = 0.90;
 static constexpr int64_t DEFAULT_MASTER_VIEW_LEASE_TTL_SEC = 5;  // in seconds
 static constexpr int64_t DEFAULT_CLIENT_LIVE_TTL_SEC = 10;       // in seconds
+static constexpr int64_t DEFAULT_CLIENT_SUSPICION_TTL_SEC = 20;  // in seconds
 static constexpr int64_t DEFAULT_NOF_HEARTBEAT_INTERVAL_SEC = 10;
 static constexpr uint32_t DEFAULT_NOF_HEARTBEAT_PROBE_TIMEOUT_MS = 1000;
 static constexpr uint32_t DEFAULT_NOF_HEARTBEAT_FAILURES_THRESHOLD = 3;
@@ -186,16 +194,11 @@ using BufHandleList = std::vector<std::shared_ptr<AllocatedBuffer>>;
 using ReplicaList = std::unordered_map<uint32_t, Replica>;
 using BufferResources =
     std::map<SegmentId, std::vector<std::shared_ptr<BufferAllocatorBase>>>;
-// Mapping between c++ and go types
-#ifdef STORE_USE_ETCD
-using EtcdRevisionId = GoInt64;
-using ViewVersionId = EtcdRevisionId;
-using EtcdLeaseId = GoInt64;
-#else
+// Keep store-facing IDs independent from the generated Go C ABI header.
+// EtcdHelper performs the conversion to GoInt64 at the wrapper boundary.
 using EtcdRevisionId = int64_t;
-using ViewVersionId = int64_t;
+using ViewVersionId = EtcdRevisionId;
 using EtcdLeaseId = int64_t;
-#endif
 
 using UUID = std::pair<uint64_t, uint64_t>;
 
@@ -216,37 +219,18 @@ constexpr const char* CONFIG_KEY_RDMA_DEVICES = "rdma_devices";
 constexpr const char* CONFIG_KEY_MASTER_SERVER_ADDR = "master_server_addr";
 constexpr const char* CONFIG_KEY_IPC_SOCKET_PATH = "ipc_socket_path";
 constexpr const char* CONFIG_KEY_TENANT_ID = "tenant_id";
+constexpr const char* CONFIG_KEY_ENABLE_CLIENT_HTTP_SERVER =
+    "enable_client_http_server";
+constexpr const char* CONFIG_KEY_CLIENT_HTTP_PORT = "client_http_port";
+constexpr const char* CONFIG_KEY_ENABLE_EMBEDDED_MASTER =
+    "enable_embedded_master";
 
 // Store client configuration defaults
 static constexpr size_t DEFAULT_GLOBAL_SEGMENT_SIZE = 1024 * 1024 * 16;  // 16MB
 static constexpr size_t DEFAULT_LOCAL_BUFFER_SIZE = 1024 * 1024 * 16;    // 16MB
 constexpr const char* DEFAULT_PROTOCOL = "tcp";
 constexpr const char* DEFAULT_MASTER_SERVER_ADDR = "127.0.0.1:50051";
-
-inline std::string NormalizeTenantId(const std::string& tenant_id) {
-    return tenant_id.empty() ? "default" : tenant_id;
-}
-
-inline std::string MakeTenantScopedStorageKey(const std::string& tenant_id,
-                                              const std::string& key) {
-    const auto normalized_tenant = NormalizeTenantId(tenant_id);
-    std::string scoped_key;
-    scoped_key.reserve(normalized_tenant.size() + key.size() + 1);
-    scoped_key.append(normalized_tenant);
-    scoped_key.push_back('\0');
-    scoped_key.append(key);
-    return scoped_key;
-}
-
-inline std::pair<std::string, std::string> ParseTenantScopedStorageKey(
-    const std::string& storage_key) {
-    const auto separator = storage_key.find('\0');
-    if (separator == std::string::npos) {
-        return {"default", storage_key};
-    }
-    return {NormalizeTenantId(storage_key.substr(0, separator)),
-            storage_key.substr(separator + 1)};
-}
+static constexpr int DEFAULT_CLIENT_HTTP_PORT = 9300;
 
 struct OffloadTaskItem {
     std::string tenant_id;
@@ -355,6 +339,8 @@ enum class ErrorCode : int32_t {
 
     // Transfer errors (Range: -800 to -899)
     TRANSFER_FAIL = -800,  ///< Transfer operation failed.
+    /// Store checksum verification failed.
+    CHECKSUM_MISMATCH = -801,
 
     // RPC errors (Range: -900 to -999)
     RPC_FAIL = -900,     ///< RPC operation failed.
@@ -369,10 +355,15 @@ enum class ErrorCode : int32_t {
         -1004,  ///< OpLog entry not found (backend-agnostic).
     K8S_LEASE_OPERATION_ERROR = -1005,  ///< K8s Lease operation failed.
     K8S_LEASE_NOT_FOUND = -1006,        ///< K8s Lease not found.
+    INCOMPLETE_OPLOG_CATCH_UP =
+        -1007,  ///< Promotion catch-up could not prove all durable OpLog
+                ///< entries were applied, or unresolved skipped/missing
+                ///< gaps remain after final catch-up + second gap resolution.
     UNAVAILABLE_IN_CURRENT_STATUS =
         -1010,  ///< Request cannot be done in current status.
     UNAVAILABLE_IN_CURRENT_MODE =
-        -1011,  ///< Request cannot be done in current mode.
+        -1011,              ///< Request cannot be done in current mode.
+    NOT_SUPPORTED = -1012,  ///< Operation is not supported in current mode.
 
     // FILE errors (Range: -1100 to -1199)
     FILE_NOT_FOUND = -1100,       ///< File not found.
@@ -408,6 +399,8 @@ enum class ErrorCode : int32_t {
     DFS_STALE_HANDLE = -1604,         ///< DFS file handle expired.
     DFS_PARTIAL_WRITE = -1605,        ///< DFS partial write success.
     TENANT_QUOTA_EXCEEDED = -1700,    ///< Tenant memory quota exceeded.
+    TENANT_NOT_REGISTERED = -1701,    ///< Tenant has no quota policy.
+    TENANT_NOT_EMPTY = -1702,         ///< Tenant still owns objects or quota.
 };
 
 int32_t toInt(ErrorCode errorCode) noexcept;
@@ -454,9 +447,11 @@ struct Segment {
     // TE p2p endpoint (ip:port) for transport-only addressing
     std::string te_endpoint{};
     std::string protocol;
+    std::string host_id{};
     Segment() = default;
+    bool operator==(const Segment&) const = default;
 };
-YLT_REFL(Segment, id, name, base, size, te_endpoint, protocol);
+YLT_REFL(Segment, id, name, base, size, te_endpoint, protocol, host_id);
 
 /**
  * @brief Allocation strategy type for segment allocation
@@ -466,6 +461,7 @@ enum class AllocationStrategyType {
     FREE_RATIO_FIRST,      // Free-ratio-first allocation
     CXL,                   // CXL-specific allocation
     SSD_FREE_RATIO_FIRST,  // SSD free-ratio-first allocation
+    LOCAL_FIRST            // Prefer local host before ordered remote fallback
 };
 
 /**

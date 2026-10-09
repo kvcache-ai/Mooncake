@@ -427,11 +427,26 @@ int HipTransport::install(std::string& local_server_name,
     metadata_ = metadata;
     local_server_name_ = local_server_name;
 
+    // Compose with any local segment another transport (e.g. RDMA) already
+    // installed instead of overwriting it, so a single-node segment can
+    // advertise both protocols (e.g. "rdma,hip"). Work on a copy (the map may
+    // hand back a descriptor other threads are reading) and publish the new
+    // one atomically via addLocalSegment.
+    auto old_desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
     auto desc = std::make_shared<SegmentDesc>();
     if (!desc) return ERR_MEMORY;
+    if (old_desc) *desc = *old_desc;
 
     desc->name = local_server_name_;
+#ifdef ENABLE_MULTI_PROTOCOL
+    if (desc->protocol.empty()) {
+        desc->protocol = "hip";
+    } else if (desc->protocol.find("hip") == std::string::npos) {
+        desc->protocol += ",hip";
+    }
+#else
     desc->protocol = "hip";
+#endif
 
     metadata_->addLocalSegment(LOCAL_SEGMENT_ID, local_server_name_,
                                std::move(desc));
@@ -588,9 +603,13 @@ Status HipTransport::getTransferStatus(BatchID batch_id, size_t task_id,
 
     // Get task and status info
     auto& task = batch_desc.task_list[task_id];
-    status.transferred_bytes = task.transferred_bytes;
-    uint64_t success_slice_count = task.success_slice_count;
-    uint64_t failed_slice_count = task.failed_slice_count;
+    uint64_t success_slice_count =
+        __atomic_load_n(&task.success_slice_count, __ATOMIC_ACQUIRE);
+    uint64_t failed_slice_count =
+        __atomic_load_n(&task.failed_slice_count, __ATOMIC_ACQUIRE);
+    // Completion counters publish the preceding byte updates.
+    status.transferred_bytes =
+        __atomic_load_n(&task.transferred_bytes, __ATOMIC_RELAXED);
 
     // Determine completion status
     if (success_slice_count + failed_slice_count == task.slice_count) {
@@ -649,17 +668,23 @@ int HipTransport::registerLocalMemory(void* addr, size_t length,
 
     // IPC-based memory registration
     if (!use_fabric_mem_) {
-        // Validate memory type
+        // Only device memory can be exported via HIP IPC. Callers that register
+        // a batch across all transports (e.g. SGLang's PD metadata/aux buffers,
+        // which live in host memory) also hand those host buffers to this
+        // transport. Skip non-device memory gracefully and let RDMA/TCP
+        // register it; returning an error would roll back the entire
+        // multi-protocol batch and tear down every session.
         hipPointerAttribute_t attr;
-        if (!checkHip(hipPointerGetAttributes(&attr, addr),
-                      "HipTransport: hipPointerGetAttributes failed")) {
-            return -1;
-        }
-
-        if (attr.type != hipMemoryTypeDevice) {
-            LOG(ERROR) << "Unsupported memory type, " << addr << " "
-                       << attr.type;
-            return -1;
+        hipError_t attr_err = hipPointerGetAttributes(&attr, addr);
+        if (attr_err != hipSuccess || attr.type != hipMemoryTypeDevice) {
+            // Clear any sticky error the failed query latched so it does not
+            // poison subsequent HIP calls made by the caller.
+            (void)hipGetLastError();
+            if (globalConfig().trace) {
+                LOG(INFO) << "HipTransport: skipping non-device memory " << addr
+                          << ", leaving it to other transports";
+            }
+            return 0;
         }
 
         // Get IPC handle
@@ -676,6 +701,9 @@ int HipTransport::registerLocalMemory(void* addr, size_t length,
         desc.length = length;
         desc.name = location;
         desc.shm_name = serializeBinaryData(&handle, sizeof(hipIpcMemHandle_t));
+#ifdef ENABLE_MULTI_PROTOCOL
+        desc.protocol = "hip";
+#endif
         return metadata_->addLocalMemoryBuffer(desc, true);
     }
 
@@ -799,18 +827,20 @@ int HipTransport::registerLocalMemoryBatch(
     for (auto& buffer : buffer_list) {
         int rc = registerLocalMemory(buffer.addr, buffer.length, location, true,
                                      false);
-        if (rc < 0) return rc;
+        if (rc) return rc;
     }
     return metadata_->updateLocalSegmentDesc();
 }
 
 int HipTransport::unregisterLocalMemoryBatch(
     const std::vector<void*>& addr_list) {
+    int first_error = 0;
     for (auto& addr : addr_list) {
         int rc = unregisterLocalMemory(addr, false);
-        if (rc < 0) return rc;
+        if (rc && !first_error) first_error = rc;
     }
-    return metadata_->updateLocalSegmentDesc();
+    int metadata_ret = metadata_->updateLocalSegmentDesc();
+    return first_error ? first_error : metadata_ret;
 }
 
 void* HipTransport::allocatePinnedLocalMemory(size_t size) {

@@ -65,7 +65,6 @@ if command -v apt-get &> /dev/null; then
             wget \
             libibverbs-dev \
             libgoogle-glog-dev \
-            libgtest-dev \
             libjsoncpp-dev \
             libunwind-dev \
             libnuma-dev \
@@ -95,8 +94,6 @@ elif command -v yum &> /dev/null; then
             glog-devel \
             libibverbs-devel \
             numactl-devel \
-            gtest \
-            gtest-devel \
             boost-devel \
             openssl-devel \
             hiredis-devel \
@@ -136,16 +133,3 @@ check_success "Failed to install system packages"
 echo -e "system packages installed successfully."
 
 export CPLUS_INCLUDE_PATH=$(echo $CPLUS_INCLUDE_PATH | tr ':' '\n' | grep -v "/usr/local/Ascend" | paste -sd: -)
-
-# Install yalantinglibs
-clone_repo_if_not_exists "yalantinglibs" "https://github.com/alibaba/yalantinglibs.git"
-cd yalantinglibs || exit
-git checkout 0.5.5
-rm -rf build
-mkdir -p build && cd build
-cmake .. -DBUILD_EXAMPLES=OFF -DBUILD_BENCHMARK=OFF -DBUILD_UNIT_TESTS=OFF
-make -j$(nproc)
-make install
-cd ../..
-
-echo -e "yalantinglibs installed successfully."

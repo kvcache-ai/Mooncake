@@ -16,10 +16,13 @@
 #define COMMON_H
 
 #include <glog/logging.h>
+#ifdef __linux__
 #include <numa.h>
+#endif
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
 
@@ -32,10 +35,13 @@
 #include <ctime>
 #include <iomanip>
 #include <iostream>
+#include <mutex>
 #include <optional>
 #include <sstream>
+#include <string>
 #include <string_view>
 #include <thread>
+#include <vector>
 
 #include "error.h"
 
@@ -61,6 +67,7 @@ enum class HandShakeRequestType {
     Metadata = 1,
     Notify = 2,
     Probe = 3,
+    Invalid = 0xfe,
     // placeholder for old protocol without RequestType
     OldProtocol = 0xff,
 };
@@ -74,7 +81,78 @@ static inline std::string getHostname() {
     return hostname;
 }
 
+// Options for TransferEngine::allocateSharedMemory / ShmTransport.
+// Default path stays POSIX /dev/shm. Store production sets use_hugepage with
+// hugepage_size matching MC_STORE_HUGEPAGE_SIZE (2MB / 512MB / 1GB).
+//
+// Crash / SIGKILL leftovers: freeSharedMemory and ~ShmTransport unlink the
+// object. SIGKILL skips that, so POSIX names stay in /dev/shm and hugetlbfs
+// files stay on the mount. Hugetlbfs leftovers keep hugepages reserved until
+// the file is unlinked or the node reboots — worse than tmpfs leftovers.
+// There is no startup reaper (multiple processes share a mount; wiping
+// mooncake_* would delete live peers). Operators may remove files named
+// mooncake_<dead-pid>_* after confirming that pid is gone, e.g.
+//   rm /dev/hugepages/mooncake_<pid>_*
+struct SharedMemoryOptions {
+    bool use_hugepage = false;
+    size_t hugepage_size = 0;    // 0 → 2MB when use_hugepage
+    std::string hugetlbfs_path;  // empty → size-specific default mount
+    bool populate = true;        // Store passes false and populates itself
+
+    static constexpr size_t kHugepage2MB = 2ULL << 20;
+    static constexpr size_t kHugepage512MB = 512ULL << 20;
+    static constexpr size_t kHugepage1GB = 1ULL << 30;
+
+    static bool isSupportedHugepageSize(size_t size) {
+        return size == kHugepage2MB || size == kHugepage512MB ||
+               size == kHugepage1GB;
+    }
+
+    static const char *defaultHugetlbfsPathFor(size_t hugepage_size) {
+        if (hugepage_size == kHugepage1GB) return "/dev/hugepages-1G";
+        if (hugepage_size == kHugepage512MB) return "/dev/hugepages-512M";
+        return "/dev/hugepages";
+    }
+};
+
+// True when the variable is set to anything other than 0/false/no/off.
+// Used by MC_FORCE_SHM.
+inline bool envFlagEnabled(const char *name) {
+    const char *value = std::getenv(name);
+    if (!value || !*value) return false;
+    auto eqIgnoreCase = [](const char *a, const char *b) {
+        for (; *a && *b; ++a, ++b) {
+            unsigned char ca = static_cast<unsigned char>(*a);
+            unsigned char cb = static_cast<unsigned char>(*b);
+            if (ca >= 'A' && ca <= 'Z')
+                ca = static_cast<unsigned char>(ca - 'A' + 'a');
+            if (cb >= 'A' && cb <= 'Z')
+                cb = static_cast<unsigned char>(cb - 'A' + 'a');
+            if (ca != cb) return false;
+        }
+        return *a == *b;
+    };
+    return !eqIgnoreCase(value, "0") && !eqIgnoreCase(value, "false") &&
+           !eqIgnoreCase(value, "no") && !eqIgnoreCase(value, "off");
+}
+
+// libnuma fills the cache numa_node_to_cpus() reads lazily and without locking,
+// so concurrent first callers each allocate it and all but one are orphaned --
+// a leak LeakSanitizer fails the build on. Worker pools bind every thread at
+// startup, so they hit that window. An inline function, not a static local:
+// bindToSocket() has internal linkage, so a static local would be per-TU.
+inline std::mutex &numaNodeCpuCacheMutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
 static inline int bindToSocket(int socket_id) {
+#ifndef __linux__
+    // libnuma and pthread_setaffinity_np are Linux-only.
+    (void)socket_id;
+    LOG(WARNING) << "The platform does not support NUMA";
+    return ERR_NUMA;
+#else
     if (unlikely(numa_available() < 0)) {
         LOG(WARNING) << "The platform does not support NUMA";
         return ERR_NUMA;
@@ -84,7 +162,10 @@ static inline int bindToSocket(int socket_id) {
     if (socket_id < 0 || socket_id >= numa_num_configured_nodes())
         socket_id = 0;
     struct bitmask *cpu_list = numa_allocate_cpumask();
-    numa_node_to_cpus(socket_id, cpu_list);
+    {
+        std::lock_guard<std::mutex> guard(numaNodeCpuCacheMutex());
+        numa_node_to_cpus(socket_id, cpu_list);
+    }
     int nr_possible_cpus = numa_num_possible_cpus();
     int nr_cpus = 0;
     for (int cpu = 0; cpu < nr_possible_cpus; ++cpu) {
@@ -101,6 +182,7 @@ static inline int bindToSocket(int socket_id) {
         return ERR_NUMA;
     }
     return 0;
+#endif
 }
 
 static inline int64_t getCurrentTimeInNano() {
@@ -127,6 +209,20 @@ static inline std::string getCurrentDateTime() {
     std::ostringstream oss;
     oss << std::put_time(&local_time, "%Y-%m-%d %H:%M:%S") << "."
         << std::setw(6) << std::setfill('0') << micros.count();
+    return oss.str();
+}
+
+static inline std::string formatEpochMicroseconds(uint64_t epoch_us) {
+    if (epoch_us == 0) return "legacy(0)";
+
+    const auto seconds = static_cast<std::time_t>(epoch_us / 1000000);
+    const auto micros = epoch_us % 1000000;
+    std::tm local_time{};
+    localtime_r(&seconds, &local_time);
+
+    std::ostringstream oss;
+    oss << std::put_time(&local_time, "%Y-%m-%d %H:%M:%S") << "."
+        << std::setw(6) << std::setfill('0') << micros;
     return oss.str();
 }
 
@@ -357,6 +453,48 @@ static inline ssize_t writeFully(int fd, const void *buf, size_t len) {
     return len;
 }
 
+// writeFully variant for stream sockets. A peer that resets the connection
+// while we are mid-reply must turn into an EPIPE error here, not a SIGPIPE
+// that kills the whole process (the handshake daemon answers untrusted
+// peers, and the engine usually runs inside a larger host process).
+static inline ssize_t writeFullySocket(int fd, const void *buf, size_t len) {
+#ifdef SO_NOSIGPIPE
+    // macOS has no MSG_NOSIGNAL; disarm SIGPIPE on the socket instead.
+    // Idempotent, and handshake traffic is low-rate, so per-call is fine.
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+#endif
+#ifdef MSG_NOSIGNAL
+    constexpr int kSendFlags = MSG_NOSIGNAL;
+#else
+    constexpr int kSendFlags = 0;
+#endif
+    char *pos = (char *)buf;
+    size_t nbytes = len;
+    while (nbytes) {
+        ssize_t rc = send(fd, pos, nbytes, kSendFlags);
+        if (rc < 0 && errno == EINTR)
+            continue;
+        else if (rc < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            // A blocking socket only reports EAGAIN once SO_SNDTIMEO fires;
+            // retrying here would spin forever, so fail the write instead.
+            LOG(WARNING) << "Socket write timed out: expected " << len
+                         << " bytes, actual " << len - nbytes << " bytes";
+            return len - nbytes;
+        } else if (rc < 0) {
+            PLOG(ERROR) << "Socket write failed";
+            return rc;
+        } else if (rc == 0) {
+            LOG(WARNING) << "Socket write incompleted: expected " << len
+                         << " bytes, actual " << len - nbytes << " bytes";
+            return len - nbytes;
+        }
+        pos += rc;
+        nbytes -= rc;
+    }
+    return len;
+}
+
 static inline ssize_t readFully(int fd, void *buf, size_t len) {
     // Set a timeout for read to avoid hanging forever.
     constexpr std::chrono::seconds kReadTimeout = std::chrono::seconds(300);
@@ -366,9 +504,13 @@ static inline ssize_t readFully(int fd, void *buf, size_t len) {
     size_t nbytes = len;
     while (nbytes && std::chrono::steady_clock::now() < deadline) {
         ssize_t rc = read(fd, pos, nbytes);
-        if (rc < 0 && (errno == EAGAIN || errno == EINTR))
+        if (rc < 0 && errno == EINTR)
             continue;
-        else if (rc < 0) {
+        else if (rc < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            LOG(WARNING) << "Socket read timed out: expected " << len
+                         << " bytes, actual " << len - nbytes << " bytes";
+            return len - nbytes;
+        } else if (rc < 0) {
             PLOG(ERROR) << "Socket read failed";
             return rc;
         } else if (rc == 0) {
@@ -397,13 +539,14 @@ static inline int writeString(int fd, const HandShakeRequestType type,
     uint64_t length =
         str.size() +
         (type == HandShakeRequestType::OldProtocol ? 0 : sizeof(byte));
-    if (writeFully(fd, &length, sizeof(length)) != (ssize_t)sizeof(length))
+    if (writeFullySocket(fd, &length, sizeof(length)) !=
+        (ssize_t)sizeof(length))
         return ERR_SOCKET;
     if (type != HandShakeRequestType::OldProtocol) {
-        if (writeFully(fd, &byte, sizeof(byte)) != (ssize_t)sizeof(byte))
+        if (writeFullySocket(fd, &byte, sizeof(byte)) != (ssize_t)sizeof(byte))
             return ERR_SOCKET;
     }
-    if (writeFully(fd, str.data(), str.size()) != (ssize_t)str.size())
+    if (writeFullySocket(fd, str.data(), str.size()) != (ssize_t)str.size())
         return ERR_SOCKET;
     return 0;
 }
@@ -443,13 +586,13 @@ static inline size_t getHandshakeMaxLength() {
 }
 
 static inline std::pair<HandShakeRequestType, std::string> readString(int fd) {
-    HandShakeRequestType type = HandShakeRequestType::Connection;
+    HandShakeRequestType type = HandShakeRequestType::Invalid;
 
     const size_t kMaxLength = getHandshakeMaxLength();
     uint64_t length = 0;
     ssize_t n = readFully(fd, &length, sizeof(length));
     if (n != (ssize_t)sizeof(length)) {
-        LOG(ERROR) << "readString: failed to read length, got: " << n;
+        LOG(WARNING) << "readString: incomplete handshake length, got: " << n;
         return {type, ""};
     }
 
@@ -528,6 +671,7 @@ static inline bool overlap(const void *a, size_t a_len, const void *b,
 class RWSpinlock {
     union RWTicket {
         constexpr RWTicket() : whole(0) {}
+        constexpr RWTicket(uint64_t v) : whole(v) {}
         uint64_t whole;
         uint32_t readWrite;
         struct {
@@ -535,26 +679,12 @@ class RWSpinlock {
             uint16_t read;
             uint16_t users;
         };
-    } ticket;
+    };
 
-   private:
-    static void asm_volatile_memory() { asm volatile("" ::: "memory"); }
-
-    template <class T>
-    static T load_acquire(T *addr) {
-        T t = *addr;
-        asm_volatile_memory();
-        return t;
-    }
-
-    template <class T>
-    static void store_release(T *addr, T v) {
-        asm_volatile_memory();
-        *addr = v;
-    }
+    std::atomic<uint64_t> ticket;
 
    public:
-    RWSpinlock() {}
+    RWSpinlock() : ticket(0) {}
 
     RWSpinlock(RWSpinlock const &) = delete;
     RWSpinlock &operator=(RWSpinlock const &) = delete;
@@ -562,17 +692,21 @@ class RWSpinlock {
     void lock() { writeLockNice(); }
 
     bool tryLock() {
-        RWTicket t;
-        uint64_t old = t.whole = load_acquire(&ticket.whole);
+        RWTicket t, expected;
+        expected.whole = ticket.load(std::memory_order_acquire);
+        t.whole = expected.whole;
         if (t.users != t.write) return false;
         ++t.users;
-        return __sync_bool_compare_and_swap(&ticket.whole, old, t.whole);
+        return ticket.compare_exchange_weak(expected.whole, t.whole,
+                                            std::memory_order_acquire);
     }
 
     void writeLockAggressive() {
         uint32_t count = 0;
-        uint16_t val = __sync_fetch_and_add(&ticket.users, 1);
-        while (val != load_acquire(&ticket.write)) {
+        uint16_t val = fetch_add_users(1);
+        RWTicket t;
+        while (val !=
+               (t.whole = ticket.load(std::memory_order_acquire), t.write)) {
             PAUSE();
             if (++count > 1000) std::this_thread::yield();
         }
@@ -587,16 +721,22 @@ class RWSpinlock {
     }
 
     void unlockAndLockShared() {
-        uint16_t val = __sync_fetch_and_add(&ticket.read, 1);
+        uint16_t val = fetch_add_read(1);
         (void)val;
     }
 
     void unlock() {
+        uint64_t expected = ticket.load(std::memory_order_relaxed);
+        uint64_t new_val;
         RWTicket t;
-        t.whole = load_acquire(&ticket.whole);
-        ++t.read;
-        ++t.write;
-        store_release(&ticket.readWrite, t.readWrite);
+        do {
+            t.whole = expected;
+            ++t.read;
+            ++t.write;
+            new_val = t.whole;
+        } while (!ticket.compare_exchange_weak(expected, new_val,
+                                               std::memory_order_release,
+                                               std::memory_order_relaxed));
     }
 
     void lockShared() {
@@ -608,15 +748,58 @@ class RWSpinlock {
     }
 
     bool tryLockShared() {
-        RWTicket t, old;
-        old.whole = t.whole = load_acquire(&ticket.whole);
-        old.users = old.read;
+        RWTicket t, expected;
+        expected.whole = ticket.load(std::memory_order_acquire);
+        t.whole = expected.whole;
+        expected.users = expected.read;
         ++t.read;
         ++t.users;
-        return __sync_bool_compare_and_swap(&ticket.whole, old.whole, t.whole);
+        return ticket.compare_exchange_weak(expected.whole, t.whole,
+                                            std::memory_order_acquire);
     }
 
-    void unlockShared() { __sync_fetch_and_add(&ticket.write, 1); }
+    void unlockShared() { fetch_add_write(1); }
+
+   private:
+    uint16_t fetch_add_users(uint16_t delta) {
+        uint64_t expected = ticket.load(std::memory_order_relaxed);
+        uint64_t new_val;
+        RWTicket t;
+        do {
+            t.whole = expected;
+            t.users += delta;
+            new_val = t.whole;
+        } while (!ticket.compare_exchange_weak(expected, new_val,
+                                               std::memory_order_acquire,
+                                               std::memory_order_relaxed));
+        return static_cast<uint16_t>(t.users - delta);
+    }
+
+    uint16_t fetch_add_read(uint16_t delta) {
+        uint64_t expected = ticket.load(std::memory_order_relaxed);
+        uint64_t new_val;
+        RWTicket t;
+        do {
+            t.whole = expected;
+            t.read += delta;
+            new_val = t.whole;
+        } while (!ticket.compare_exchange_weak(expected, new_val,
+                                               std::memory_order_release));
+        return static_cast<uint16_t>(t.read - delta);
+    }
+
+    uint16_t fetch_add_write(uint16_t delta) {
+        uint64_t expected = ticket.load(std::memory_order_relaxed);
+        uint64_t new_val;
+        RWTicket t;
+        do {
+            t.whole = expected;
+            t.write += delta;
+            new_val = t.whole;
+        } while (!ticket.compare_exchange_weak(expected, new_val,
+                                               std::memory_order_release));
+        return static_cast<uint16_t>(t.write - delta);
+    }
 
    public:
     struct WriteGuard {

@@ -41,6 +41,8 @@ else()
     add_library(ascend_transport OBJECT ${ASCEND_SOURCES})
 endif()
 
+target_link_libraries(ascend_transport PRIVATE glog::glog)
+
 if (USE_ASCEND)
     target_link_libraries(ascend_transport PRIVATE ascend_transport_mem)
 endif()
@@ -56,7 +58,7 @@ set_target_properties(ascend_transport
 
 target_compile_options(ascend_transport PRIVATE
                        -O2
-                       -Xlinker -export-dynamic     
+                       -Xlinker -export-dynamic
                     )
 
 target_link_options(ascend_transport PRIVATE

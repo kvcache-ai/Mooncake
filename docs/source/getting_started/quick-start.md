@@ -1,263 +1,380 @@
 # Quick Start
 
-This document describes how to quickly start using Mooncake Transfer Engine and Mooncake Store.
+Get up and running with Mooncake in minutes.
+
+This guide walks you through the entire flow of getting started with Mooncake:
+
+1. **Install** Mooncake
+2. **Start** the Store master and **Send a request** with the Python Store API
+
+Serving-framework users can then connect SGLang, vLLM or other systems.
+
+## Prerequisites
+
+- **Python**: 3.10 or later; a virtual environment is recommended.
+- **RDMA**: an RDMA driver and SDK (for example, Mellanox OFED), if you plan to use RDMA for data transfer. On ScaleFabric SHCA systems, install `shca-tools` and build with `-DUSE_SHCA=ON`.
+- **CUDA**: 12.1 or later. For most CUDA-enabled use cases, such as RDMA-based KV cache transfer between GPUs or between GPU and DRAM, NVIDIA GPUDirect support is also required. You may install CUDA from [the NVIDIA downloads page](https://developer.nvidia.com/cuda-downloads).
+
+```{note}
+The default pip, build and Docker paths target NVIDIA CUDA. For other
+platforms, see [Other Platforms](#other-platforms) below.
+```
+
 
 ## Installation
 
-Install the Mooncake Transfer Engine package from PyPI, which includes both Mooncake Transfer Engine and Mooncake Store Python bindings:
+The same package provides:
 
-**For CUDA-enabled systems:**
-```bash
-pip install mooncake-transfer-engine numpy pyzmq
-```
-📦 **Package Details**: [https://pypi.org/project/mooncake-transfer-engine/](https://pypi.org/project/mooncake-transfer-engine/)
+- Mooncake Store Python bindings for vLLM and SGLang HiCache integrations.
+- Transfer Engine Python bindings and runtime components for direct
+  `mooncake.engine.TransferEngine` usage.
 
-**For non-CUDA systems:**
-```bash
-pip install mooncake-transfer-engine-non-cuda numpy pyzmq
-```
+::::{tab-set}
 
-📦 **Package Details**: [https://pypi.org/project/mooncake-transfer-engine-non-cuda/](https://pypi.org/project/mooncake-transfer-engine-non-cuda/)
-
-> **Note**: The CUDA version includes Mooncake-EP and GPU topology detection, requiring CUDA 12.1+. The non-CUDA version is for environments without CUDA dependencies, but it still requires the system runtime libraries used by the transfer stack. On Ubuntu, install them with:
-> ```bash
-> sudo apt-get update && sudo apt-get install -y libcurl4 libibverbs1 rdma-core librdmacm1 libnuma1 liburing2
-> ```
-
-## Transfer Engine Quick Start
-
-> **Note**: When using RDMA protocol, you may need to run with `sudo` for proper permissions.
-
-### Start Transfer Engine Receiver (Server)
-
-```python
-
-import numpy as np
-import zmq
-from mooncake.engine import TransferEngine
-
-def main():
-    # Initialize ZMQ context and socket
-    context = zmq.Context()
-    socket = context.socket(zmq.PUSH)
-    socket.bind("tcp://*:5555")  # Bind to port 5555 for buffer info
-
-    HOSTNAME = "localhost" # localhost for simple demo
-    METADATA_SERVER = "P2PHANDSHAKE" # [ETCD_SERVER_URL, P2PHANDSHAKE, ...]
-    PROTOCOL = "tcp" # use "rdma" on machines with RDMA devices configured
-    DEVICE_NAME = "" # auto discovery if empty
-
-    # Initialize server engine
-    server_engine = TransferEngine()
-    server_engine.initialize(
-        HOSTNAME,
-        METADATA_SERVER,
-        PROTOCOL,
-        DEVICE_NAME
-    )
-    session_id = f"{HOSTNAME}:{server_engine.get_rpc_port()}"
-
-    # Allocate memory on server side (1MB buffer)
-    server_buffer = np.zeros(1024 * 1024, dtype=np.uint8)
-    server_ptr = server_buffer.ctypes.data
-    server_len = server_buffer.nbytes
-
-    # Register memory with Mooncake so the target address is advertised
-    ret_value = server_engine.register_memory(server_ptr, server_len)
-    if ret_value != 0:
-        print("Mooncake memory registration failed.")
-        raise RuntimeError("Mooncake memory registration failed.")
-
-    print(f"Server initialized with session ID: {session_id}")
-    print(f"Server buffer address: {server_ptr}, length: {server_len}")
-
-    # Send buffer info to client
-    buffer_info = {
-        "session_id": session_id,
-        "ptr": server_ptr,
-        "len": server_len
-    }
-    socket.send_json(buffer_info)
-    print("Buffer information sent to client")
-
-    # Keep server running
-    try:
-        while True:
-            input("Press Ctrl+C to exit...")
-    except KeyboardInterrupt:
-        print("\nShutting down server...")
-    finally:
-        # Cleanup
-        ret_value = server_engine.unregister_memory(server_ptr)
-        if ret_value != 0:
-            print("Mooncake memory deregistration failed.")
-            raise RuntimeError("Mooncake memory deregistration failed.")
-
-        socket.close()
-        context.term()
-
-if __name__ == "__main__":
-    main()
-
-```
-
-### Start Transfer Engine Sender (Client)
-
-```python
-
-
-import numpy as np
-import zmq
-from mooncake.engine import TransferEngine
-
-def main():
-    # Initialize ZMQ context and socket
-    context = zmq.Context()
-    socket = context.socket(zmq.PULL)
-    socket.connect(f"tcp://localhost:5555")
-
-    # Wait for buffer info from server
-    print("Waiting for server buffer information...")
-    buffer_info = socket.recv_json()
-    server_session_id = buffer_info["session_id"]
-    server_ptr = buffer_info["ptr"]
-    server_len = buffer_info["len"]
-    print(f"Received server info - Session ID: {server_session_id}")
-    print(f"Server buffer address: {server_ptr}, length: {server_len}")
-
-    # Initialize client engine
-    HOSTNAME = "localhost" # localhost for simple demo
-    METADATA_SERVER = "P2PHANDSHAKE" # [ETCD_SERVER_URL, P2PHANDSHAKE, ...]
-    PROTOCOL = "tcp" # use "rdma" on machines with RDMA devices configured
-    DEVICE_NAME = "" # auto discovery if empty
-
-    client_engine = TransferEngine()
-    client_engine.initialize(
-        HOSTNAME,
-        METADATA_SERVER,
-        PROTOCOL,
-        DEVICE_NAME
-    )
-    session_id = f"{HOSTNAME}:{client_engine.get_rpc_port()}"
-
-    # Allocate and initialize client buffer (1MB)
-    client_buffer = np.ones(1024 * 1024, dtype=np.uint8)  # Fill with ones
-    client_ptr = client_buffer.ctypes.data
-    client_len = client_buffer.nbytes
-
-    # Register memory with Mooncake so the source address is advertised
-    ret_value = client_engine.register_memory(client_ptr, client_len)
-    if ret_value != 0:
-        print("Mooncake memory registration failed.")
-        raise RuntimeError("Mooncake memory registration failed.")
-
-    print(f"Client initialized with session ID: {session_id}")
-
-    # Transfer data from client to server
-    print("Transferring data to server...")
-    for _ in range(10):
-        ret = client_engine.transfer_sync_write(
-            server_session_id,
-            client_ptr,
-            server_ptr,
-            min(client_len, server_len)  # Transfer minimum of both lengths
-        )
-
-        if ret >= 0:
-            print("Transfer successful!")
-        else:
-            print("Transfer failed!")
-
-    # Cleanup
-    ret_value = client_engine.unregister_memory(client_ptr)
-    if ret_value != 0:
-        print("Mooncake memory deregistration failed.")
-        raise RuntimeError("Mooncake memory deregistration failed.")
-
-    socket.close()
-    context.term()
-
-if __name__ == "__main__":
-    main()
-
-```
-
-### More Examples and Documentation
-
-Please refer to the [Transfer Engine Python API](../python-api-reference/transfer-engine.md) and [Transfer Engine](../design/transfer-engine/index.md) for more examples and documentation.
-
-## Mooncake Store Quick Start
-
-### Start Master (with HTTP enabled)
-
-Enable the built-in HTTP metadata server when starting the master:
+:::{tab-item} pip / uv
+We recommend using **uv** for faster installation:
 
 ```bash
-mooncake_master \
-  --enable_http_metadata_server=true \
-  --http_metadata_server_host=0.0.0.0 \
-  --http_metadata_server_port=8080
+pip install --upgrade pip
+pip install uv
+uv pip install mooncake-transfer-engine
 ```
-This exposes the metadata endpoint at `http://<host>:<port>/metadata`.
 
-If the master runs in a container and its IP is dynamic, set `--rpc_interface=<ifname>` such as `--rpc_interface=eth0`. Mooncake Master will resolve the current IPv4 address from that interface at startup instead of relying on a fixed `--rpc_address`.
-
-Optional: Use the free-ratio-first allocation strategy for better load balancing across segments with different sizes or utilization:
+Plain `pip` also works:
 
 ```bash
-mooncake_master \
-  --allocation_strategy=free_ratio_first \
-  --enable_http_metadata_server=true \
-  --http_metadata_server_port=8080
+pip install mooncake-transfer-engine
 ```
 
-The free-ratio-first strategy balances memory utilization ratio across segments by sampling multiple candidates and preferentially allocating to those with higher free space ratios, leading to more even utilization.
+```{tip}
+The default wheel targets CUDA 12.1–12.9 and includes Mooncake-EP and GPU
+topology detection. For CUDA 13.0/13.1, install
+`mooncake-transfer-engine-cuda13` instead.
+```
+:::
 
-### Hello World Example
+:::{tab-item} From Source
+Clone the repository and build the default configuration:
+
+```bash
+git clone https://github.com/kvcache-ai/Mooncake.git
+cd Mooncake
+sudo bash dependencies.sh
+
+mkdir build
+cd build
+cmake ..
+make -j
+sudo make install
+```
+
+For CUDA, VRAM segments, NVMe-oF, and other backend flags, see the
+[Build Guide](build.md).
+:::
+
+:::{tab-item} Docker
+Published images are available on Docker Hub at
+[kvcacheai/mooncake](https://hub.docker.com/r/kvcacheai/mooncake).
+
+```bash
+docker run --net=host \
+    --ipc=host \
+    --ulimit memlock=-1 \
+    kvcacheai/mooncake:latest \
+    mooncake_master
+```
+
+For details, see
+[Use Mooncake in Docker Containers](build.md#use-mooncake-in-docker-containers).
+:::
+
+::::
+
+```{note}
+If users encounter problems such as missing `lib*.so`, first install the
+corresponding system runtime libraries. If the issue persists, uninstall the
+package and [build the binaries manually](build.md).
+```
+
+## Other Platforms
+
+The default path above targets NVIDIA CUDA. Use the matching wheel or source
+build for other platforms. Install only one variant in an environment.
+
+::::{tab-set}
+
+:::{tab-item} Non-CUDA
+**Prerequisites**
+
+- Python 3.10 or later.
+- Ubuntu runtime libraries: `libcurl4`, `libibverbs1`, `rdma-core`,
+  `librdmacm1`, `libnuma1`, and `liburing2`.
+
+**Installation**
+
+```bash
+sudo apt-get update && sudo apt-get install -y \
+  libcurl4 libibverbs1 rdma-core librdmacm1 libnuma1 liburing2
+pip install mooncake-transfer-engine-non-cuda
+```
+:::
+
+:::{tab-item} Ascend NPU
+**Prerequisites**
+
+- Python 3.10 or later.
+- Ascend CANN Toolkit. Source `/usr/local/Ascend/cann/set_env.sh` before
+  running Mooncake. Ascend Direct (ADXL/HIXL) is the recommended path.
+
+**Installation**
+
+```bash
+pip install mooncake-transfer-engine-npu
+source /usr/local/Ascend/cann/set_env.sh
+```
+
+See [Ascend Direct Transport](../design/transfer-engine/transport/ascend_direct_transport.md)
+for the recommended path. The legacy backend is documented in
+[Ascend Transport](../design/transfer-engine/transport/ascend_transport.md).
+For mixed GPU/NPU transfers, see
+[Heterogeneous Ascend Transport](../design/transfer-engine/transport/heterogeneous_ascend.md).
+There are also two detailed Chinese guides:
+[Mooncake KVPool guide](https://gitcode.com/cann/hixl/wiki/Mooncake%20KVPool%E6%8C%87%E5%8D%97.md)
+and
+[Mooncake NPU guide](https://gitcode.com/cann/hixl/wiki/Mooncake%EF%BC%88NPU%20%E7%89%88%EF%BC%89%E5%AE%8C%E6%95%B4%E6%8C%87%E5%8D%97.md).
+:::
+
+:::{tab-item} AMD ROCm
+**Prerequisites**
+
+- Python 3.10 or later.
+- ROCm / HIP SDK, with `hipcc` and runtime libraries on `PATH` (for example
+  `/opt/rocm`).
+
+**Installation**
+
+```bash
+pip install mooncake-transfer-engine-rocm
+```
+:::
+
+:::{tab-item} Moore Threads MUSA
+**Prerequisites**
+
+- Python 3.10 or later.
+- MUSA SDK. Add `/usr/local/musa/lib` to `LIBRARY_PATH` and `LD_LIBRARY_PATH`.
+- `mthreads-peermem` for GPUDirect RDMA.
+
+**Installation**
+
+```bash
+pip install mooncake-transfer-engine-musa
+```
+:::
+
+:::{tab-item} AWS EFA
+**Prerequisites**
+
+- An AWS instance with EFA (for example p5 or p6).
+- AWS EFA driver and libfabric. Verify with `fi_info -p efa`, and keep
+  `/opt/amazon/efa/lib` on `LD_LIBRARY_PATH`.
+- CUDA 12.1–12.9 or CUDA 13 if you use the GPU-aware EFA wheels.
+
+**Installation**
+
+```bash
+# GPU memory transfers with CUDA 12
+pip install mooncake-transfer-engine-efa
+
+# GPU memory transfers with CUDA 13
+pip install mooncake-transfer-engine-efa-cuda13
+
+# CPU/DRAM-only transfers
+pip install mooncake-transfer-engine-efa-non-cuda
+```
+
+See the [EFA transport guide](../design/transfer-engine/transport/efa_transport.md)
+for prerequisites and configuration.
+:::
+
+:::{tab-item} Cambricon MLU
+**Prerequisites**
+
+- Python 3.10 or later.
+- Cambricon Neuware SDK. Set `NEUWARE_HOME`, or use the default
+  `/usr/local/neuware`. There is no dedicated prebuilt MLU wheel yet.
+
+**Installation**
+
+```bash
+git clone https://github.com/kvcache-ai/Mooncake.git
+cd Mooncake
+sudo bash dependencies.sh
+mkdir build && cd build
+cmake .. -DUSE_MLU=ON
+make -j
+sudo make install
+```
+:::
+
+:::{tab-item} MetaX MACA
+**Prerequisites**
+
+- Python 3.10 or later.
+- MACA SDK. Set `MACA_HOME`, or use the default `/opt/maca`.
+
+**Installation**
+
+```bash
+git clone https://github.com/kvcache-ai/Mooncake.git
+cd Mooncake
+sudo bash dependencies.sh
+mkdir build && cd build
+cmake .. -DUSE_MACA=ON
+make -j
+sudo make install
+```
+:::
+
+:::{tab-item} Hygon DCU
+**Prerequisites**
+
+- Python 3.10 or later.
+- Hygon DTK SDK. Set `DTK_HOME`, or use the default `/opt/dtk`.
+
+**Installation**
+
+```bash
+git clone https://github.com/kvcache-ai/Mooncake.git
+cd Mooncake
+sudo bash dependencies.sh
+mkdir build && cd build
+cmake .. -DUSE_HYGON=ON
+make -j
+sudo make install
+```
+:::
+
+:::{tab-item} Iluvatar CoreX
+**Prerequisites**
+
+- Python 3.10 or later.
+- Iluvatar CoreX SDK. Set `COREX_HOME`, or use the default `/usr/local/corex`.
+
+**Installation**
+
+```bash
+git clone https://github.com/kvcache-ai/Mooncake.git
+cd Mooncake
+sudo bash dependencies.sh
+mkdir build && cd build
+cmake .. -DUSE_COREX=ON
+make -j
+sudo make install
+```
+:::
+
+:::{tab-item} Biren GPU
+**Prerequisites**
+
+- Python 3.10 or later.
+- Biren SUPA SDK. Set `BIREN_HOME` to the SDK root containing `supa/include`
+  and `supa/lib`, or use the default `/usr/local/birensupa/all/latest`.
+
+**Installation**
+
+```bash
+git clone https://github.com/kvcache-ai/Mooncake.git
+cd Mooncake
+sudo bash dependencies.sh
+mkdir build && cd build
+cmake .. -DUSE_SUPA=ON -DBIREN_HOME=/usr/local/birensupa/all/latest
+make -j
+sudo make install
+```
+:::
+
+::::
+
+## Start Mooncake Store
+
+If you installed with pip or from source, start the master service:
+
+```bash
+mooncake_master
+```
+
+Wait until you see a line like this in the logs:
+
+```
+Master service started on port 50051, max_threads=4, ...
+```
+
+The default RPC port is `50051`. Skip this step if the Docker command above is
+already running `mooncake_master`.
+
+## Send Your First Request
+
+Run this single-node `put`/`get` example after `mooncake_master` is running. This example uses `P2PHANDSHAKE`, so no separate Transfer Engine metadata service is required.
 
 ```python
 from mooncake.store import MooncakeDistributedStore
 
-# 1. Create store instance
 store = MooncakeDistributedStore()
-
-# 2. Setup with all required parameters
 store.setup(
-    "localhost",           # Your node's address
-    "http://localhost:8080/metadata",    # HTTP metadata server
-    512*1024*1024,          # 512MB segment size
-    128*1024*1024,          # 128MB local buffer
-    "tcp",                  # Use TCP (RDMA for high performance)
-    "",                      # Leave empty; Mooncake auto-picks RDMA devices when needed
-    "localhost:50051"        # Master service
+    local_hostname="localhost",
+    metadata_server="P2PHANDSHAKE",
+    global_segment_size=512 * 1024 * 1024,
+    local_buffer_size=128 * 1024 * 1024,
+    protocol="tcp",
+    rdma_devices="",
+    master_server_addr="127.0.0.1:50051",
 )
 
-# 3. Store data
 store.put("hello_key", b"Hello, Mooncake Store!")
 
-# 4. Retrieve data
 data = store.get("hello_key")
 print(data.decode())  # Output: Hello, Mooncake Store!
 
-# 5. Clean up
 store.close()
 ```
 
-### More Examples and Documentation
+## Connect vLLM or SGLang
 
-Please refer to the [Mooncake Store Python API](../python-api-reference/mooncake-store.md), [Mooncake Store](../design/mooncake-store.md) and [Mooncake Store Deployment & Tuning Guide](../deployment/mooncake-store-deployment-guide.md) for more examples and documentation.
+Choose the integration path that matches your serving deployment.
 
-## Skills for AI Coding Assistants
+### PD Disaggregation
 
-Mooncake ships a set of **built-in skills** under [`.claude/skills`](https://github.com/kvcache-ai/Mooncake/tree/main/.claude/skills) — reusable, task-focused playbooks that an AI coding assistant (such as Claude Code) invokes automatically when your request matches, or that you can run as a slash command:
+PD disaggregation paths use Mooncake Transfer Engine for direct KV transfer
+between prefill and decode workers. Configure these paths through the serving
+framework guides, not by calling Transfer Engine APIs directly:
 
-| Skill | Description |
-|-------|-------------|
-| `/mooncake-troubleshoot` | Diagnose Mooncake deployment and runtime issues (services, RDMA, env vars, logs). |
-| `/mooncake-ci-local` | Run pre-PR local validation via `scripts/run_ci_test.sh`. |
-| `/mooncake-api` | Work with the Mooncake Store, Transfer Engine, and EP/Backend Python APIs. |
+- [SGLang Disaggregated Serving with MooncakeTransferEngine](../deployment/integrations/sglang/pd-disaggregation.md)
+- [Disaggregated Prefill-Decode with MooncakeConnector](../deployment/integrations/vllm/disagg-prefill-decode.md)
 
-Install them without cloning the repository via the [Claude Code plugin marketplace](https://code.claude.com/docs/en/plugin-marketplaces):
+### Distributed KV Cache Pooling
+
+Mooncake Store provides distributed KV cache storage for vLLM and SGLang
+HiCache:
+
+| Framework | Use case | Setup guide |
+|-----------|----------|-------------|
+| SGLang | HiCache L3 storage backend with Mooncake Store | [SGLang HiCache Quick Start](../deployment/integrations/sglang/hicache-quick-start.md) |
+| vLLM | KV cache storage and sharing with `MooncakeStoreConnector` | [vLLM KV Cache Storage & Sharing](../deployment/integrations/vllm/kv-cache-storage.md) |
+
+## AI Coding Assistant Skills
+
+If you use Claude Code or another coding assistant that supports reusable
+skills, Mooncake provides built-in playbooks for common development tasks:
+
+| Skill | Use it for |
+|-------|------------|
+| `/mooncake-troubleshoot` | Diagnose services, RDMA, environment variables, and runtime logs. |
+| `/mooncake-ci-local` | Run pre-PR local validation with Mooncake's CI script. |
+| `/mooncake-api` | Work with Mooncake Store, Transfer Engine, and EP/Backend Python APIs. |
+
+Install them from the Claude Code plugin marketplace without cloning the full
+repository:
 
 ```text
 /plugin marketplace add kvcache-ai/Mooncake --sparse .claude-plugin
@@ -266,4 +383,11 @@ Install them without cloning the repository via the [Claude Code plugin marketpl
 /plugin install mooncake-api@mooncake
 ```
 
-The `--sparse .claude-plugin` flag fetches only the marketplace catalog, and each plugin is published as a `git-subdir` source, so installing one fetches only that single skill directory — never the whole repo. If you are already working inside a Mooncake checkout, the skills under `.claude/skills/` load automatically with no setup.
+## Next Steps
+
+For production deployment, standalone store services, high availability,
+allocation strategies, SSD offload, and runtime tuning, continue to the
+[Mooncake Store Deployment & Tuning Guide](../deployment/mooncake-store-deployment-guide.md).
+
+For API details, see the [Mooncake Store Python API](../api-reference/python/mooncake-store.md)
+and [Mooncake Store design](../design/store/mooncake-store.md).

@@ -4,12 +4,22 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing release tag to backfill (e.g. v0.3.12)'
+        required: true
+        type: string
+
+concurrency:
+  group: release-musa-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  cancel-in-progress: false
 
 jobs:
   build:
-    if: ${{ !contains(github.ref_name, '-') }}
+    if: ${{ github.event_name == 'workflow_dispatch' || !contains(github.ref_name, '-') }}
     runs-on: ubuntu-22.04
-    container: mthreads/musa:rc4.3.0-devel-ubuntu22.04-amd64
+    container: registry.mthreads.com/mcconline/inference/pytorch:2.9.1.post1-py3.10-musa5.2.0-mp31-devel-ubuntu22.04-amd64
 
     permissions:
       contents: write
@@ -17,26 +27,52 @@ jobs:
     strategy:
       max-parallel: 2
       matrix:
-        python-version: ['3.9', '3.10', '3.11', '3.12', '3.13']
+        python-version: ['3.10']
 
     env:
-      BUILD_WITH_EP: "0"
       MUSA_BUILD: "1"
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag) || github.ref }}
           fetch-depth: 0
 
       - name: Mark repository as safe
         shell: bash
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
+      - name: Validate backfill target
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [[ "${RELEASE_TAG}" != v* || "${RELEASE_TAG}" == *-* ]]; then
+            echo "::error::Backfill tag must be a stable release tag starting with v"
+            exit 1
+          fi
+          git check-ref-format "refs/tags/${RELEASE_TAG}"
+          TAG_SHA="$(git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}")"
+          BUILD_SHA="$(git rev-parse HEAD)"
+          if [[ "${BUILD_SHA}" != "${TAG_SHA}" ]]; then
+            echo "::error::Build source ${BUILD_SHA} does not match ${RELEASE_TAG} at ${TAG_SHA}"
+            exit 1
+          fi
+          echo "Build source: ${RELEASE_TAG} at ${BUILD_SHA}"
+
       - name: Setup Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.25.9'
+          cache: false
 
       - name: Set Python bin
         shell: bash
@@ -54,9 +90,21 @@ jobs:
           export PYTHONPATH="${PYTHONPATH:-}"
           export CMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH:-}"
           bash -x dependencies.sh -y
-          echo "PATH=/usr/local/go/bin:/usr/local/musa/bin:${PATH}" >> "$GITHUB_ENV"
+          echo "PATH=/usr/local/musa/bin:${PATH}" >> "$GITHUB_ENV"
           echo "LD_LIBRARY_PATH=/usr/local/musa/lib:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
           echo "LIBRARY_PATH=/usr/local/musa/lib:${LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+
+      - name: Verify Go toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          GO_BIN="$(command -v go || true)"
+          if [[ -z "${GO_BIN}" ]]; then
+            echo "::error::Go is not available on PATH"
+            exit 1
+          fi
+          echo "Go executable: ${GO_BIN}"
+          "${GO_BIN}" version
 
       - name: Configure project
         shell: bash
@@ -123,7 +171,7 @@ jobs:
           path: mooncake-wheel/dist-musa-py${{ steps.generate_tag_release.outputs.python_version_tag }}/*.whl
 
   publish-release:
-    if: ${{ !contains(github.ref_name, '-') }}
+    if: ${{ github.event_name == 'workflow_dispatch' || !contains(github.ref_name, '-') }}
     needs: build
     runs-on: ubuntu-22.04
     environment: pypi
@@ -135,6 +183,8 @@ jobs:
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag) || github.ref }}
 
       - name: Download all wheel artifacts
         uses: actions/download-artifact@v4
@@ -152,6 +202,7 @@ jobs:
       - name: Upload wheels to GitHub Release
         uses: softprops/action-gh-release@v1
         with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
           files: mooncake-wheel/dist-release/*.whl
 
       - name: Publish package to PyPI

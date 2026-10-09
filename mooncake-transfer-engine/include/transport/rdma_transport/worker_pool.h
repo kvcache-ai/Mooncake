@@ -15,14 +15,22 @@
 #ifndef WORKER_H
 #define WORKER_H
 
-#include <queue>
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+#include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 #include "config.h"
 #include "rdma_context.h"
 
 namespace mooncake {
+class WorkerPoolTestPeer;
 class WorkerPool {
+    friend class WorkerPoolTestPeer;
+
    public:
     WorkerPool(RdmaContext &context, int numa_socket_id = 0);
 
@@ -31,12 +39,36 @@ class WorkerPool {
     // Add slices to queue, called by Transport
     int submitPostSend(const std::vector<Transport::Slice *> &slice_list);
 
+    void trackPostedSlices(const std::vector<Transport::Slice *> &slice_list,
+                           size_t first, size_t count);
+    void untrackPostedSlices(const std::vector<Transport::Slice *> &slice_list,
+                             size_t first, size_t count);
+
    private:
+    using SliceList = std::vector<Transport::Slice *>;
+
+    // Enqueue slices that were prepared by another WorkerPool. Used for
+    // local-NIC failure handoff: the original worker keeps the remote path
+    // fixed, updates the local lkey, and pushes the slice to this context's
+    // worker queue.
+    int submitPreparedPostSend(
+        const std::vector<Transport::Slice *> &slice_list);
+    void enqueuePreparedSlices(const SliceList &slice_list,
+                               uint64_t submitted_slice_count);
+    void enqueueSliceToOwner(Transport::Slice *slice);
+    void enqueueSlicesToOwner(int owner_thread, const SliceList &slices);
+    int postingThreadForPeer(const std::string &peer_nic_path) const;
+    int cqIndexForPostingThread(int thread_id) const;
+
     void performPostSend(int thread_id);
 
-    void performPollCq(int thread_id);
+    int performPollCq(int thread_id, bool defer_local_redispatch = false);
+    void processCompletions(int thread_id, const std::vector<ibv_wc> &wc_list,
+                            bool defer_local_redispatch = false);
 
-    void redispatch(std::vector<Transport::Slice *> &slice_list, int thread_id);
+    void redispatch(std::vector<Transport::Slice *> &slice_list, int thread_id,
+                    bool handoff_to_local_worker = false,
+                    bool defer_local_redispatch = false);
 
     void transferWorker(int thread_id);
 
@@ -45,80 +77,106 @@ class WorkerPool {
     void monitorWorker();
 
     int doProcessContextEvents();
+    void processContextEventForTest(ibv_event_type event_type);
 
     // Simplified rail monitor: pause problematic paths for a cooldown period
     struct RailState {
         int error_count = 0;
         uint64_t pause_until_ns = 0;  // Timestamp (ns) when pause expires
+        uint64_t last_error_ns = 0;   // Timestamp (ns) of the last error
     };
 
-    void markRailFailed(const std::string &peer_nic_path);
+    void markRailFailed(const std::string &peer_nic_path,
+                        bool immediate_pause = false);
     bool isRailAvailable(const std::string &peer_nic_path);
 
     // Retry helper: increment retry count and return whether retry is allowed
     static bool shouldRetrySlice(Transport::Slice *slice);
 
-    // Unified path failure handler: marks rail failed, notifies other workers,
-    // and optionally deletes the endpoint
-    void handlePathFailure(const std::string &peer_nic_path,
-                           RdmaEndPoint *endpoint = nullptr);
+    void refreshPublishedLocalTopology();
+    GidRefreshResult refreshPublishedLocalGid();
+    bool handleContextEvent(ibv_event_type event_type, bool injected_for_test,
+                            struct ibv_async_event *event = nullptr);
+    void scheduleContextRecovery(uint64_t delay_ns = kContextRecoveryDelayNs);
+    void maybeActivateRecoveredContext();
+    bool hasAvailablePeerRailAlternative(Transport::Slice *slice,
+                                         const std::string &failed_peer_path);
 
-    // Context-level health tracking for catastrophic hardware failure.
-    // When all rails through a local RNIC are unavailable, increment the
-    // failure counter. Reset on any success. Mark context inactive after
-    // consecutive failures exceed threshold.
-    bool contextHealthy() const {
-        return context_failure_count_ < kContextFailureThreshold;
-    }
-    void markContextSuccess() { context_failure_count_ = 0; }
-    void markContextFailure() {
-        context_failure_count_++;
-        if (context_failure_count_ >= kContextFailureThreshold) {
-            LOG(WARNING) << "All rails failed for context "
-                         << context_.deviceName() << " for "
-                         << context_failure_count_
-                         << " consecutive attempts, marking inactive";
-            context_.set_active(false);
-        }
-    }
+    static bool isLocalWcFailure(const ibv_wc &wc);
+
+    // Local-side failure handler: degrade current context so retries are
+    // handed off to another local context's worker pool.
+    void handleLocalFailure(const std::string &peer_nic_path,
+                            RdmaEndPoint *endpoint = nullptr);
+
+    bool tryHandoffToAnotherLocalWorker(Transport::Slice *slice);
+
+    // Only direct local completion errors charge the context breaker.
+    // Submit-side all-rails-unavailable failures remain peer/rail scoped.
+    bool markLocalContextFailure();
+    void markContextSuccess();
+    bool tryReactivateContext(uint64_t now_ns);
+    void maybeReactivateContext();
+    // Serialize breaker transitions with physical-event recovery so a late
+    // completion cannot arm TTL recovery after a fatal event.
+    void resetContextBreaker(bool context_active);
 
    private:
     RdmaContext &context_;
     const int numa_socket_id_;
+    const int worker_count_;
 
     std::vector<std::thread> worker_thread_;
     std::atomic<bool> workers_running_;
 
     std::atomic<int> parked_worker_count_;
+
+    // The poll worker updates these on every poll pass. The monitor worker
+    // reads them when CQ entries stay outstanding, so a transfer timeout can
+    // be distinguished from a stalled poller.
+    std::atomic<uint64_t> last_poll_ts_ns_{0};
+    std::atomic<uint64_t> last_poll_interval_ns_{0};
+    std::atomic<uint64_t> max_poll_interval_ns_{0};
+
+    std::mutex posted_slices_mutex_;
+    std::unordered_set<Transport::Slice *> posted_slices_;
+
     std::atomic<int> redispatch_counter_;
 
     std::mutex cond_mutex_;
     std::condition_variable cond_var_;
 
-    using SliceList = std::vector<Transport::Slice *>;
-
-    const static int kShardCount = 8;
-    std::unordered_map<std::string, SliceList> slice_queue_[kShardCount];
-    std::atomic<uint64_t> slice_queue_count_[kShardCount];
-    TicketLock slice_queue_lock_[kShardCount];
-
     std::vector<std::unordered_map<std::string, SliceList>>
         collective_slice_queue_;
+    std::vector<std::unordered_map<std::string, SliceList>> worker_slice_queue_;
+    std::vector<std::mutex> worker_slice_queue_lock_;
 
     std::atomic<uint64_t> submitted_slice_count_, processed_slice_count_;
+    std::atomic<uint64_t> recovery_activate_after_ns_{0};
 
     // Rail state management: peer_nic_path -> RailState
     std::unordered_map<std::string, RailState> rail_states_;
     std::mutex rail_state_lock_;
+    // Number of rails with pause_until_ns in the future. The submit hot path
+    // skips rail_state_lock_ while this is zero. Expired pauses are cleared on
+    // the next locked isRailAvailable() for any path, not only the expired one.
+    std::atomic<int> paused_rail_count_{0};
 
     // Rail monitor configuration
-    const static int kRailErrorThreshold = 5;            // Errors before pause
-    const static uint64_t kRailPauseNs = 1000000000ull;  // 1 second pause
+    const static int kRailErrorThreshold = 5;  // Errors before pause
+    // Errors further apart than this are not consecutive, so error_count is
+    // restarted. Without it a long-lived process accumulates isolated failures
+    // until an otherwise healthy rail is paused.
+    const static uint64_t kRailErrorWindowNs = 5000000000ull;  // 5 seconds
+    const static uint64_t kContextRecoveryDelayNs =
+        30000000000ull;  // 30 seconds before a recovered local RNIC is reused
 
-    // Context-level health tracking
-    int context_failure_count_ = 0;
-    const static int kContextFailureThreshold =
-        32;  // consecutive all-rails-failed
+    // Local-completion context breaker. Protected by context_state_lock_ so
+    // fatal events, GID recovery and TTL recovery have one state owner.
+    std::mutex context_state_lock_;
+    std::atomic<int> context_failure_count_{0};
+    uint64_t breaker_reactivate_after_ns_{0};
+    static constexpr int kLocalCompletionFailureThreshold = 32;
 };
 }  // namespace mooncake
 

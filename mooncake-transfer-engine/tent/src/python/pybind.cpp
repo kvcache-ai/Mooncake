@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <exception>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -27,6 +28,23 @@
 
 namespace py = pybind11;
 using namespace mooncake::tent;
+
+// The enumerators below are exposed to Python as plain integers, so their
+// values are a compatibility contract shared with the C API macros. Pin them
+// here so that any divergence is a build failure instead of a protocol break
+// that only shows up between mismatched peers.
+static_assert(static_cast<int>(TransportType::UB) == TRANSPORT_UB,
+              "UB wire value must match the C API macro");
+static_assert(static_cast<int>(TransportType::MPCOMM) == TRANSPORT_MPCOMM,
+              "MPCOMM wire value must match the C API macro");
+static_assert(static_cast<int>(TransportType::HP_TCP) == TRANSPORT_HP_TCP,
+              "HP_TCP wire value must match the C API macro");
+static_assert(static_cast<int>(TransportType::XPU) == TRANSPORT_XPU,
+              "XPU wire value must match the C API macro");
+static_assert(static_cast<int>(TransportType::HYLINK) == TRANSPORT_HYLINK,
+              "HYLINK wire value must match the C API macro");
+static_assert(static_cast<int>(TransportType::FABRIC) == TRANSPORT_FABRIC,
+              "FABRIC wire value must match the C API macro");
 
 // =============================================================================
 // Custom Exception Hierarchy
@@ -85,6 +103,7 @@ static void ThrowStatus(const Status& s, const char* where) {
         case Status::Code::kMetadataError:
             throw MetadataError(full_msg);
         case Status::Code::kRpcServiceError:
+        case Status::Code::kRpcConnectionError:
             throw RpcServiceError(full_msg);
         case Status::Code::kNotImplemented:
             throw NotImplementedError(full_msg);
@@ -299,6 +318,23 @@ PYBIND11_MODULE(tent, m) {
         .value("TCP", TransportType::TCP)
         .value("AscendDirect", TransportType::AscendDirect)
         .value("SUNRISE_LINK", TransportType::SUNRISE_LINK)
+        .value("TPU", TransportType::TPU)
+        .value("UB", TransportType::UB)
+        .value("MPCOMM", TransportType::MPCOMM)
+        .value("HP_TCP", TransportType::HP_TCP)
+        .value("XPU", TransportType::XPU)
+        .value("HYLINK", TransportType::HYLINK)
+        .value("FABRIC", TransportType::FABRIC)
+        .export_values();
+
+    py::enum_<IntentType>(m, "IntentType")
+        .value("INTENT_UNSPEC", IntentType::INTENT_UNSPEC)
+        .value("FOREGROUND_GET", IntentType::FOREGROUND_GET)
+        .value("BACKGROUND_PREFETCH", IntentType::BACKGROUND_PREFETCH)
+        .value("MIGRATION", IntentType::MIGRATION)
+        .value("CHECKPOINT", IntentType::CHECKPOINT)
+        .value("WEIGHT_LOADING", IntentType::WEIGHT_LOADING)
+        .value("STAGING_INTERNAL", IntentType::STAGING_INTERNAL)
         .export_values();
 
     py::enum_<SegmentInfo::Type>(m, "SegmentInfoType")
@@ -321,7 +357,9 @@ PYBIND11_MODULE(tent, m) {
         .def(py::init([](Request::OpCode opcode, uint64_t source,
                          uint64_t target_id, uint64_t target_offset,
                          size_t length, int priority,
-                         TransportType transport_hint) {
+                         TransportType transport_hint,
+                         std::optional<std::string> policy_name,
+                         uint64_t deadline_ns, IntentType intent_type) {
                  Request r;
                  r.opcode = opcode;
                  r.source = U64ToPtr(source);
@@ -330,12 +368,17 @@ PYBIND11_MODULE(tent, m) {
                  r.length = length;
                  r.priority = priority;
                  r.transport_hint = transport_hint;
+                 r.policy_name = std::move(policy_name);
+                 r.deadline_ns = deadline_ns;
+                 r.intent_type = intent_type;
                  return r;
              }),
              py::arg("opcode"), py::arg("source"), py::arg("target_id"),
              py::arg("target_offset"), py::arg("length"),
              py::arg("priority") = PRIO_HIGH,
-             py::arg("transport_hint") = TransportType::UNSPEC)
+             py::arg("transport_hint") = TransportType::UNSPEC,
+             py::arg("policy_name") = std::nullopt, py::arg("deadline_ns") = 0,
+             py::arg("intent_type") = IntentType::INTENT_UNSPEC)
         .def_property(
             "opcode", [](const Request& r) { return r.opcode; },
             [](Request& r, Request::OpCode op) { r.opcode = op; })
@@ -346,7 +389,10 @@ PYBIND11_MODULE(tent, m) {
         .def_readwrite("target_offset", &Request::target_offset)
         .def_readwrite("length", &Request::length)
         .def_readwrite("priority", &Request::priority)
-        .def_readwrite("transport_hint", &Request::transport_hint);
+        .def_readwrite("transport_hint", &Request::transport_hint)
+        .def_readwrite("policy_name", &Request::policy_name)
+        .def_readwrite("deadline_ns", &Request::deadline_ns)
+        .def_readwrite("intent_type", &Request::intent_type);
 
     py::class_<TransferStatus>(m, "TransferStatus")
         .def(py::init<>())
@@ -385,7 +431,6 @@ PYBIND11_MODULE(tent, m) {
         .def("__exit__", [](MemoryGuard& self, py::args) {
             py::gil_scoped_release release;
             self.release();
-            return py::none();
         });
 
     py::class_<BatchGuard>(m, "BatchGuard")
@@ -397,7 +442,6 @@ PYBIND11_MODULE(tent, m) {
         .def("__exit__", [](BatchGuard& self, py::args) {
             py::gil_scoped_release release;
             self.release();
-            return py::none();
         });
 
     // -------------------------------------------------------------------------
@@ -413,6 +457,9 @@ PYBIND11_MODULE(tent, m) {
         .def("get_segment_name", &TransferEngine::getSegmentName)
         .def("get_rpc_server_address", &TransferEngine::getRpcServerAddress)
         .def("get_rpc_server_port", &TransferEngine::getRpcServerPort)
+        .def("get_local_topology", &TransferEngine::getLocalTopologyString,
+             "Dump local topology as native TENT JSON (nics/mems with "
+             "rank0/1/2)")
 
         // ---------------------------------------------------------------------
         // export/import: out param -> return
@@ -523,7 +570,8 @@ PYBIND11_MODULE(tent, m) {
                 ThrowStatus(s, "allocate_memory_guard");
                 return std::make_unique<MemoryGuard>(&self, addr, size);
             },
-            py::arg("size"), py::arg("location") = kWildcardLocation)
+            py::arg("size"), py::arg("location") = kWildcardLocation,
+            py::keep_alive<0, 1>())
 
         .def(
             "allocate_memory_guard_ex",
@@ -535,7 +583,7 @@ PYBIND11_MODULE(tent, m) {
                 ThrowStatus(s, "allocate_memory_guard_ex");
                 return std::make_unique<MemoryGuard>(&self, addr, size);
             },
-            py::arg("size"), py::arg("options"))
+            py::arg("size"), py::arg("options"), py::keep_alive<0, 1>())
 
         // ---------------------------------------------------------------------
         // register/unregister single
@@ -640,7 +688,7 @@ PYBIND11_MODULE(tent, m) {
                 }
                 return std::make_unique<BatchGuard>(&self, batch_id);
             },
-            py::arg("batch_size"))
+            py::arg("batch_size"), py::keep_alive<0, 1>())
 
         // ---------------------------------------------------------------------
         // submitTransfer overloads
@@ -681,6 +729,15 @@ PYBIND11_MODULE(tent, m) {
             },
             py::arg("batch_id"), py::arg("request_list"), py::arg("name"),
             py::arg("message"))
+
+        .def(
+            "cancel_transfer",
+            [](TransferEngine& self, uint64_t batch_id, size_t task_id) {
+                py::gil_scoped_release release;
+                auto s = self.cancelTransfer((BatchID)batch_id, task_id);
+                ThrowStatus(s, "cancel_transfer");
+            },
+            py::arg("batch_id"), py::arg("task_id"))
 
         // ---------------------------------------------------------------------
         // notification send/receive

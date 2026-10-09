@@ -1,15 +1,119 @@
 #include <gtest/gtest.h>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <thread>
+#include <vector>
 
 #include "common.h"
 
 namespace {
 
 using namespace mooncake;
+using namespace std::chrono_literals;
 
 const uint16_t kDefaultPort = getDefaultHandshakePort();
+
+//------------------------------------------------------------------------------
+// RWSpinlock
+//------------------------------------------------------------------------------
+
+TEST(RWSpinlockTest, AggressiveWriteLockProgressesAcrossTicketWraparound) {
+    RWSpinlock lock;
+    int protected_value = 0;
+
+    constexpr int kIterations = 65536 + 3;
+    for (int i = 0; i < kIterations; ++i) {
+        lock.writeLockAggressive();
+        ++protected_value;
+        lock.unlock();
+    }
+
+    RWSpinlock::ReadGuard guard(lock);
+    EXPECT_EQ(protected_value, kIterations);
+}
+
+TEST(RWSpinlockTest, DowngradePublishesToReadersAndBlocksWriters) {
+    RWSpinlock lock;
+    int protected_value = 0;
+    std::atomic<bool> writer_started{false};
+    std::atomic<bool> writer_entered{false};
+    std::atomic<bool> reader_observed{false};
+
+    lock.writeLockAggressive();
+    protected_value = 42;
+    lock.unlockAndLockShared();
+
+    std::thread reader([&] {
+        RWSpinlock::ReadGuard guard(lock);
+        reader_observed.store(protected_value == 42, std::memory_order_release);
+    });
+
+    reader.join();
+    EXPECT_TRUE(reader_observed.load(std::memory_order_acquire));
+
+    std::thread writer([&] {
+        writer_started.store(true, std::memory_order_release);
+        lock.writeLockAggressive();
+        writer_entered.store(true, std::memory_order_release);
+        protected_value = 99;
+        lock.unlock();
+    });
+
+    while (!writer_started.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+
+    std::this_thread::sleep_for(10ms);
+    EXPECT_FALSE(writer_entered.load(std::memory_order_acquire));
+
+    lock.unlockShared();
+    writer.join();
+
+    RWSpinlock::ReadGuard guard(lock);
+    EXPECT_TRUE(writer_entered.load(std::memory_order_acquire));
+    EXPECT_EQ(protected_value, 99);
+}
+
+//------------------------------------------------------------------------------
+// writeFullySocket
+//------------------------------------------------------------------------------
+
+TEST(WriteFullySocketTest, DeliversBytesIntactOnHealthySocket) {
+    int fds[2];
+    ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+    const char payload[] = "handshake-reply-bytes";
+
+    ssize_t rc = writeFullySocket(fds[0], payload, sizeof(payload));
+    ASSERT_EQ(rc, (ssize_t)sizeof(payload));
+
+    char buf[sizeof(payload)] = {0};
+    ASSERT_EQ(read(fds[1], buf, sizeof(buf)), (ssize_t)sizeof(buf));
+    EXPECT_STREQ(buf, payload);
+    close(fds[0]);
+    close(fds[1]);
+}
+
+TEST(WriteFullySocketTest, PeerResetYieldsEpipeInsteadOfSigpipe) {
+    int fds[2];
+    ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+    const char payload[] = "handshake-reply-bytes";
+    // Peer goes away before the answer is written. The first write may still
+    // succeed (the close has not been noticed yet), but a later write must
+    // report EPIPE. Without SIGPIPE suppression the process dies right here,
+    // which is exactly the handshake-daemon kill from #4454.
+    close(fds[1]);
+
+    ssize_t rc = 0;
+    for (int attempt = 0; attempt < 4 && rc != -1; ++attempt) {
+        rc = writeFullySocket(fds[0], payload, sizeof(payload));
+    }
+    ASSERT_EQ(rc, -1);
+    EXPECT_EQ(errno, EPIPE);
+    close(fds[0]);
+}
 
 //------------------------------------------------------------------------------
 // parseFromString<T>
@@ -279,6 +383,42 @@ TEST(GetHandshakeMaxLengthTest, ReturnsSameValueOnMultipleCalls) {
     size_t first_call = getHandshakeMaxLength();
     size_t second_call = getHandshakeMaxLength();
     EXPECT_EQ(first_call, second_call);
+}
+
+//------------------------------------------------------------------------------
+// bindToSocket
+//------------------------------------------------------------------------------
+
+// Worker pools bind every thread they spawn, so bindToSocket() races inside
+// libnuma's unlocked lazy cache fill and orphans an allocation. The leak is
+// what this guards, so it only fails under ASAN/LSAN; the barrier is what makes
+// it reliable there.
+TEST(BindToSocketTest, ConcurrentCallsDoNotLeakNumaState) {
+    if (numa_available() < 0) GTEST_SKIP() << "platform does not support NUMA";
+
+    constexpr int kThreads = 32;
+    std::atomic<int> ready{0};
+    std::atomic<bool> go{false};
+    std::vector<std::thread> threads;
+    std::vector<int> results(kThreads, -1);
+
+    for (int i = 0; i < kThreads; ++i) {
+        threads.emplace_back([&, i] {
+            ready.fetch_add(1, std::memory_order_release);
+            while (!go.load(std::memory_order_acquire))
+                std::this_thread::yield();
+            // Every thread races on the same node, maximizing the window.
+            results[i] = bindToSocket(0);
+        });
+    }
+    while (ready.load(std::memory_order_acquire) < kThreads)
+        std::this_thread::yield();
+    go.store(true, std::memory_order_release);
+    for (auto &thread : threads) thread.join();
+
+    // Serializing the cache fill must not change what callers observe.
+    for (int i = 0; i < kThreads; ++i)
+        EXPECT_EQ(results[i], 0) << "thread " << i << " failed to bind";
 }
 
 }  // namespace

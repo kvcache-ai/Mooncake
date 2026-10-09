@@ -79,58 +79,83 @@ TEST(SharedMutexTest, SharedAccessIsConcurrent) {
 
 TEST(SharedMutexTest, WriterBlocksReaders) {
     SharedMutex mtx;
-    std::atomic<bool> reader_started{false};
-    std::atomic<bool> writer_proceeded{false};
-
-    std::thread reader([&]() {
-        mtx.lock_shared();
-        reader_started = true;
-        while (!writer_proceeded) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
-        mtx.unlock_shared();
-    });
-
-    // Give reader time to start
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-
-    auto try_write =
-        mtx.try_lock();  // Should fail because reader holds shared lock
-    EXPECT_FALSE(try_write);
-
-    // Let reader finish
-    writer_proceeded = true;
-    reader.join();
-
-    // Now writer should be able to acquire the lock
     mtx.lock();
-    EXPECT_TRUE(true);  // No deadlock occurred
+
+    bool reader_acquired = false;
+    std::thread reader([&]() {
+        reader_acquired = mtx.try_lock_shared();
+        if (reader_acquired) {
+            mtx.unlock_shared();
+        }
+    });
+    reader.join();
+    EXPECT_FALSE(reader_acquired);
+
     mtx.unlock();
+
+    const bool reader_acquired_after_unlock = mtx.try_lock_shared();
+    EXPECT_TRUE(reader_acquired_after_unlock);
+    if (reader_acquired_after_unlock) {
+        mtx.unlock_shared();
+    }
 }
 
 TEST(SharedMutexTest, LocksOnConstructionExclusive) {
     SharedMutex mtx;
     {
         SharedMutexLocker locker(&mtx);
-        // Lock should still be held before destruction
-        EXPECT_FALSE(mtx.try_lock());  // Cannot acquire another exclusive lock
-        EXPECT_FALSE(mtx.try_lock_shared());  // Shared lock may also be blocked
-                                              // (implementation-defined)
-    }  // Destructor automatically unlocks
-    EXPECT_TRUE(mtx.try_lock());  // After destruction, lock should be available
+        bool exclusive_acquired = false;
+        bool shared_acquired = false;
+        std::thread contender([&]() {
+            exclusive_acquired = mtx.try_lock();
+            if (exclusive_acquired) {
+                mtx.unlock();
+            }
+            shared_acquired = mtx.try_lock_shared();
+            if (shared_acquired) {
+                mtx.unlock_shared();
+            }
+        });
+        contender.join();
+
+        EXPECT_FALSE(exclusive_acquired);
+        EXPECT_FALSE(shared_acquired);
+    }
+
+    const bool exclusive_acquired = mtx.try_lock();
+    EXPECT_TRUE(exclusive_acquired);
+    if (exclusive_acquired) {
+        mtx.unlock();
+    }
 }
 
 TEST(SharedMutexTest, LocksOnConstructionShared) {
     SharedMutex mtx;
     {
         SharedMutexLocker locker(&mtx, shared_lock);
-        EXPECT_TRUE(
-            mtx.try_lock_shared());  // Multiple shared locks should be allowed
-        // Note: This test does not attempt recursive locking (UB), just checks
-        // concurrent shared access.
+        bool shared_acquired = false;
+        bool exclusive_acquired = false;
+        std::thread contender([&]() {
+            shared_acquired = mtx.try_lock_shared();
+            if (shared_acquired) {
+                mtx.unlock_shared();
+            }
+            exclusive_acquired = mtx.try_lock();
+            if (exclusive_acquired) {
+                mtx.unlock();
+            }
+        });
+        contender.join();
+
+        EXPECT_TRUE(shared_acquired);
+        EXPECT_FALSE(exclusive_acquired);
     }
-    EXPECT_TRUE(
-        mtx.try_lock_shared());  // Should still be available after unlock
+
+    const bool shared_acquired = mtx.try_lock_shared();
+    EXPECT_TRUE(shared_acquired);
+    if (shared_acquired) {
+        mtx.unlock_shared();
+    }
 }
 
 TEST(SharedMutexTest, ManualLockUnlock) {
@@ -139,8 +164,12 @@ TEST(SharedMutexTest, ManualLockUnlock) {
     EXPECT_NO_THROW(locker.unlock());  // Unlocking a null locker should be safe
 
     SharedMutexLocker temp(&mtx);
-    temp.unlock();                // Manually release the lock
-    EXPECT_TRUE(mtx.try_lock());  // Now we should be able to acquire it
+    temp.unlock();
+    const bool acquired = mtx.try_lock();
+    EXPECT_TRUE(acquired);
+    if (acquired) {
+        mtx.unlock();
+    }
 }
 
 TEST(SharedMutexTest, TryLockSuccess) {
@@ -151,6 +180,7 @@ TEST(SharedMutexTest, TryLockSuccess) {
     bool result = locker.try_lock();
     EXPECT_TRUE(result);
     EXPECT_FALSE(locker.try_lock());  // Should not allow re-locking
+    locker.unlock();
 }
 
 TEST(SharedMutexTest, TryLockSharedSuccess) {
@@ -161,6 +191,7 @@ TEST(SharedMutexTest, TryLockSharedSuccess) {
     bool result = locker.try_lock_shared();
     EXPECT_TRUE(result);
     EXPECT_FALSE(locker.try_lock_shared());  // Should not allow re-locking
+    locker.unlock();
 }
 
 TEST(SharedMutexTest, HandlesNullptrSafely) {

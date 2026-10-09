@@ -23,7 +23,7 @@ struct CommCtx {
 };
 
 // Construct CommCtx from the raw kernel arguments.
-// raddrs/rkeys/qp_devctxs may be nullptr on MUSA (ignored).
+// RDMA tables may be nullptr when only the P2P path is used.
 __device__ __forceinline__ CommCtx make_comm_ctx(
     void* gdr_buffer, const int32_t* nvlink_available,
     void* const* ipc_peer_ptrs, void* raddrs, void* rkeys, void* qp_devctxs,

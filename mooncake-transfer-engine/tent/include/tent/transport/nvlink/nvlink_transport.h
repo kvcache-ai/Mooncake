@@ -20,6 +20,7 @@
 #include <mutex>
 #include <queue>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -40,7 +41,6 @@ struct NVLinkTask {
     volatile size_t transferred_bytes;
     uint64_t target_addr = 0;
     bool is_cuda_ipc;
-    int cuda_id = 0;
     cudaEvent_t completion_event = nullptr;
 };
 
@@ -49,6 +49,7 @@ struct NVLinkSubBatch : public Transport::SubBatch {
     size_t max_size;
     CUDAStreamHandle sync_stream;
     CUDAStreamHandle async_stream;
+    int stream_device_id = -1;
     // Completion events created in startTransfer (one per submit). Destroyed by
     // the destructor (RAII); Slab<T>::deallocate() invokes ~NVLinkSubBatch()
     // before reusing the storage, so this runs on every free.
@@ -99,6 +100,8 @@ class NVLinkTransport : public Transport {
 
     Status setPeerAccess();
 
+    friend class NVLinkTransportTestPeer;
+
    private:
     bool installed_;
     std::string local_segment_name_;
@@ -124,8 +127,12 @@ class NVLinkTransport : public Transport {
     uint64_t async_memcpy_threshold_;
     bool host_register_;
 
-    std::mutex register_mutex_;
-    std::unordered_set<uint64_t> registered_base_addrs_;
+    mutable std::mutex register_mutex_;
+    // cudaMalloc base address -> serialized cudaIpcMemHandle_t for that
+    // segment. Multiple BufferDescs can sub-allocate within one cudaMalloc
+    // segment (torch caching allocator); every one of them must carry the
+    // segment's IPC handle or NVLink submission for that buffer fails.
+    std::unordered_map<uint64_t, std::string> registered_base_addrs_;
 };
 }  // namespace tent
 }  // namespace mooncake
