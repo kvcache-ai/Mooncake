@@ -116,6 +116,41 @@ assert "_serialize_tensor" not in store.__all__
     )
 
 
+@pytest.mark.parametrize("backend", [None, "cpp"], ids=["default", "explicit-cpp"])
+def test_cpp_forwards_internal_helpers_without_public_exports(
+    tmp_path: Path, backend: str | None
+) -> None:
+    _run_python(
+        tmp_path,
+        """
+import importlib
+import sys
+import types
+
+native = types.ModuleType("mooncake._store")
+helpers = {
+    "_serialize_tensor": lambda value: ("serialized", value),
+    "_tensor_metadata_size": lambda: 304,
+    "_deserialize_tensor": lambda value: ("deserialized", value),
+    "_get_pyclient_from_wrapper": lambda value: ("client", value),
+}
+for name, value in helpers.items():
+    setattr(native, name, value)
+sys.modules[native.__name__] = native
+
+store = importlib.import_module("mooncake.store")
+for name, value in helpers.items():
+    assert getattr(store, name) is value
+assert not set(helpers) & set(store.__all__)
+assert store._serialize_tensor("tensor") == ("serialized", "tensor")
+assert store._tensor_metadata_size() == 304
+assert store._deserialize_tensor("payload") == ("deserialized", "payload")
+assert store._get_pyclient_from_wrapper("wrapper") == ("client", "wrapper")
+""",
+        backend=backend,
+    )
+
+
 @pytest.mark.parametrize("backend", ["", "store-rs", "CPP"])
 def test_invalid_backend_fails_when_facade_is_imported(
     tmp_path: Path, backend: str
@@ -198,6 +233,18 @@ except AttributeError as error:
     assert "C++ Store API" in str(error)
 else:
     raise AssertionError("Store-RS must mark C++-only APIs unavailable")
+for name in (
+    "_serialize_tensor",
+    "_tensor_metadata_size",
+    "_deserialize_tensor",
+    "_get_pyclient_from_wrapper",
+):
+    try:
+        getattr(store, name)
+    except AttributeError as error:
+        assert "C++ Store API" in str(error)
+    else:
+        raise AssertionError(f"Store-RS must reject C++ internal helper {name}")
 """,
         backend="rs",
     )

@@ -126,6 +126,8 @@ __all__ = sorted(_EXPORTS)
 def __getattr__(name: str):
     if name in _EXPORTS:
         return getattr(_IMPLEMENTATION, name)
+    if _BACKEND == "cpp" and name in _CPP_INTERNAL_EXPORTS:
+        return getattr(_IMPLEMENTATION, name)
     if _BACKEND == "rs" and (
         name in (_CPP_EXPORTS - _RS_EXPORTS) or name in _CPP_INTERNAL_EXPORTS
     ):
