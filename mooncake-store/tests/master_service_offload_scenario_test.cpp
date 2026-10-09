@@ -27,6 +27,29 @@ MasterServiceConfig OffloadForceEvictConfig() {
     return config;
 }
 
+// offload_on_evict routes every evictee through the per-cycle offload cap. A
+// cap that rounds to zero would skip every candidate and leave the eviction
+// thread backing off forever, so the service refuses the configuration.
+TEST(MasterServiceOffloadScenarioTest, OffloadOnEvictRejectsZeroCapRatio) {
+    MasterServiceConfig config = OffloadOnEvictConfig();
+    config.offload_cap_ratio = 0.0;
+    EXPECT_THROW({ MasterService service(config); }, std::invalid_argument);
+}
+
+TEST(MasterServiceOffloadScenarioTest, OffloadOnEvictRejectsCapBelowOne) {
+    MasterServiceConfig config = OffloadOnEvictConfig();
+    config.offloading_queue_limit = 1;
+    config.offload_cap_ratio = 0.4;  // 1 * 0.4 rounds to zero objects
+    EXPECT_THROW({ MasterService service(config); }, std::invalid_argument);
+}
+
+TEST(MasterServiceOffloadScenarioTest,
+     ZeroCapRatioAllowedWithoutOffloadOnEvict) {
+    MasterServiceConfig config = OffloadConfig();
+    config.offload_cap_ratio = 0.0;  // the cap is unused at PutEnd offload
+    EXPECT_NO_THROW({ MasterService service(config); });
+}
+
 // Matches the local-disk fleet the direct tests build: offloading enabled, no
 // leases in the way, and the allocator ranking segments by SSD free ratio.
 MasterServiceConfig SsdAwareOffloadConfig() {
