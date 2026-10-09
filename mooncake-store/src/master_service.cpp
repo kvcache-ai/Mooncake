@@ -2415,6 +2415,30 @@ tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
                 // drops bytes a remount could still revive (#4508). Leave
                 // replicas and metadata in place; the next sweep after lease
                 // expiry takes both.
+                //
+                // A promotion task anchored to the key is just as dead as
+                // the record (its source replica is stale), so cancel it
+                // now: keeping it would let a dead holder pin the
+                // cluster-wide in-flight cap until the lease lapses.
+                auto& state = accessor.GetState();
+                if (state.promotion_task) {
+                    if (auto* source = metadata.GetReplicaByID(
+                            state.promotion_task->source_id);
+                        source != nullptr) {
+                        source->dec_refcnt();
+                    }
+                    const ReplicaID alloc_id = state.promotion_task->alloc_id;
+                    const UUID holder_id = state.promotion_task->holder_id;
+                    ErasePromotionTaskIfPresent(accessor.QuotaAccount(), state);
+                    if (alloc_id != 0) {
+                        EraseReplicasWithCacheTotalAccounting(
+                            metadata, [alloc_id](const Replica& replica) {
+                                return replica.id() == alloc_id;
+                            });
+                    }
+                    local_ssd_manager_.RemovePromotion(
+                        holder_id, metadata.tenant_id, metadata.user_key);
+                }
                 continue;
             }
             if (!cleanup_plan.removed_ids.empty()) {
