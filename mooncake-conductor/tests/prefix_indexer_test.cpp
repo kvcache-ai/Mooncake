@@ -1,8 +1,11 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <array>
 #include <cstdint>
 #include <map>
 #include <optional>
+#include <random>
 #include <set>
 #include <span>
 #include <string>
@@ -252,6 +255,165 @@ BlockPresenceSnapshot Presence(const PrefixCacheTable& table,
     const PrefixCacheTableSnapshot table_snapshot =
         PrefixCacheTableTestPeer::Snapshot(table);
     return table_snapshot.contexts.at(TestContext()).blocks.at(prefix);
+}
+
+// Independent oracle: scan each tier from the start over a frozen owner view.
+// It intentionally does not share the production cursor or candidate masks.
+std::map<std::string, CacheHitResult> ReferenceQuery(
+    const PrefixCacheTable& table, const ContextKey& context,
+    const std::vector<int32_t>& tokens,
+    std::optional<std::string> filter = std::nullopt) {
+    const auto snapshot = PrefixCacheTableTestPeer::Snapshot(table);
+    const auto& state = snapshot.contexts.at(context);
+    std::string error;
+    auto strategy = mooncake::conductor::prefixindex::CreateHashStrategy(
+        state.profile, &error);
+    EXPECT_TRUE(error.empty());
+    std::vector<HashBlock> blocks;
+    EXPECT_TRUE(
+        strategy->Compute(context, tokens, std::nullopt, &blocks).empty());
+    const size_t logical_tokens = state.profile.strategy == "sglang_bigram"
+                                      ? tokens.size() - 1
+                                      : tokens.size();
+    std::map<std::string, CacheHitResult> result;
+    for (const auto& [instance, ranks] : state.instance_ranks) {
+        if (filter && instance != *filter) continue;
+        for (int64_t rank : ranks) {
+            auto engine_matches = [&](const auto& owners) {
+                return std::any_of(owners.begin(), owners.end(),
+                                   [&](const EngineOwner& owner) {
+                                       return owner.instance_id == instance &&
+                                              owner.dp_rank == rank;
+                                   });
+            };
+            std::array<int64_t, 4> lengths{};
+            for (size_t tier = 0; tier < lengths.size(); ++tier) {
+                size_t depth = 0;
+                for (const auto& hash : blocks) {
+                    const auto found = state.blocks.find(hash.projected);
+                    if (found == state.blocks.end()) break;
+                    const auto& owners = found->second;
+                    bool present = engine_matches(owners.npu_owners);
+                    if (tier >= 1) {
+                        present |= engine_matches(owners.cpu_local_owners);
+                    }
+                    if (tier >= 2) present |= !owners.cpu_share_owners.empty();
+                    if (tier == 3) {
+                        for (const auto& owner : owners.disk_owners) {
+                            const auto* engine =
+                                std::get_if<EngineOwner>(&owner);
+                            present |=
+                                !engine || (engine->instance_id == instance &&
+                                            engine->dp_rank == rank);
+                        }
+                    }
+                    if (!present) break;
+                    ++depth;
+                }
+                lengths[tier] =
+                    std::min(depth * static_cast<size_t>(context.block_size),
+                             logical_tokens);
+            }
+            auto& hit = result[instance];
+            const auto match =
+                RankMatch(lengths[0], lengths[1], lengths[2], lengths[3]);
+            hit.dp.emplace(rank, match.npu);
+            hit.rank_matches.emplace(rank, match);
+            hit.npu = std::max(hit.npu, match.npu);
+            hit.cpu_local = std::max(hit.cpu_local, match.cpu_local);
+            hit.cpu_share = std::max(hit.cpu_share, match.cpu_share);
+            hit.disk = std::max(hit.disk, match.disk);
+            hit.longest_match_tokens = hit.disk;
+        }
+    }
+    return result;
+}
+
+TEST(Query, BatchedCandidatesMatchIndependentTierOracleAcrossSourceChanges) {
+    std::mt19937 random(20261009);
+    for (const auto& profile :
+         {TestProfile(), SglangProfile(), SglangBigramProfile()}) {
+        for (int iteration = 0; iteration < 24; ++iteration) {
+            SCOPED_TRACE(profile.strategy + ":" + std::to_string(iteration));
+            PrefixCacheTable table;
+            const auto context = TestContext();
+            const auto tokens = Tokens(97);
+            std::string error;
+            auto strategy =
+                mooncake::conductor::prefixindex::CreateHashStrategy(profile,
+                                                                     &error);
+            ASSERT_TRUE(strategy) << error;
+            std::vector<HashBlock> blocks;
+            ASSERT_EQ(strategy->Compute(context, tokens, std::nullopt, &blocks),
+                      "");
+            for (int instance = 0; instance < 8; ++instance) {
+                const std::string id = "instance-" + std::to_string(instance);
+                for (int rank = 0; rank < 2; ++rank) {
+                    auto registration = Registration(id, rank);
+                    registration.profile = profile;
+                    RegisterOrFail(table, registration);
+                    for (int stream = 0; stream < 3; ++stream) {
+                        for (const auto& block : blocks) {
+                            auto mutation = Gpu(
+                                {block.projected},
+                                GpuOwner(id, rank,
+                                         "stream-" + std::to_string(stream)));
+                            for (auto tier :
+                                 {StorageTier::kNpu, StorageTier::kCpuLocal,
+                                  StorageTier::kDisk}) {
+                                if (random() % 3 == 0) continue;
+                                mutation.tier = tier;
+                                ASSERT_EQ(table.StoreEngine(mutation), "");
+                            }
+                        }
+                    }
+                }
+            }
+            for (const auto& block : blocks) {
+                for (auto tier : {StorageTier::kCpuShare, StorageTier::kDisk}) {
+                    if (random() % 2 != 0) {
+                        ASSERT_EQ(
+                            table.StoreShared(Shared({block.projected}, tier)),
+                            "");
+                    }
+                }
+            }
+            auto check = [&] {
+                const auto before = PrefixCacheTableTestPeer::Snapshot(table);
+                EXPECT_EQ(table.Query(context, tokens),
+                          ReferenceQuery(table, context, tokens));
+                for (const auto& filter :
+                     {"instance-0", "instance-7", "absent"}) {
+                    EXPECT_EQ(
+                        table.Query(context, tokens, std::nullopt, filter),
+                        ReferenceQuery(table, context, tokens, filter));
+                }
+                EXPECT_EQ(PrefixCacheTableTestPeer::Snapshot(table), before);
+            };
+            check();
+            auto clear = ClearFor(GpuOwner("instance-0", 0, "stream-0"));
+            clear.tier = std::nullopt;
+            ASSERT_EQ(table.ClearEngine(clear), "");
+            check();
+            ASSERT_EQ(table.Unregister(context, "instance-7", 1), "");
+            check();
+        }
+    }
+}
+
+TEST(Query, BatchedGlobalMissRetainsEveryRegisteredRank) {
+    PrefixCacheTable table;
+    for (int instance = 0; instance < 8; ++instance) {
+        for (int rank = 0; rank < 2; ++rank) {
+            RegisterOrFail(
+                table,
+                Registration("instance-" + std::to_string(instance), rank));
+        }
+    }
+    for (const auto& tokens : {Tokens(97), std::vector<int32_t>{}}) {
+        EXPECT_EQ(table.Query(TestContext(), tokens),
+                  ReferenceQuery(table, TestContext(), tokens));
+    }
 }
 
 TEST(Registration, InvalidInputsDoNotCreateContextState) {

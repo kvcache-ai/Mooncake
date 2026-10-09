@@ -3,8 +3,10 @@
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <array>
 #include <limits>
 #include <mutex>
+#include <string_view>
 #include <utility>
 
 #include "conductor/prefixindex/hash_strategy.h"
@@ -589,6 +591,164 @@ std::map<std::string, CacheHitResult> PrefixCacheTable::Query(
     }
 
     std::shared_lock state_lock(state->mutex);
+
+    size_t candidate_count = 0;
+    for (const auto& [instance_id, ranks] : selected_instances) {
+        candidate_count += ranks.size();
+    }
+    if (candidate_count > 1) {
+        // No tier can extend a prefix whose first block is absent. Preserve
+        // registered zero-hit ranks without allocating the owner projection.
+        const HashBlock* first =
+            block_count == 0 ? nullptr : chain->At(0, &chain_error);
+        if (first == nullptr || !state->blocks.contains(first->projected)) {
+            if (!chain_error.empty()) {
+                LOG(ERROR) << "Query hash computation failed: " << chain_error;
+                return {};
+            }
+            for (const auto& [instance_id, ranks] : selected_instances) {
+                auto& result = results[instance_id];
+                for (int64_t rank : ranks) {
+                    result.dp.emplace(rank, 0);
+                    result.rank_matches.emplace(rank, RankCacheHitResult{});
+                }
+            }
+            return results;
+        }
+
+        // Project stream-scoped ownership into query candidates once per block.
+        // Persistent owner sets remain unchanged: clearing one stream must not
+        // remove another stream's copy for the same instance and rank.
+        struct Candidate {
+            const std::string* instance_id;
+            int64_t rank;
+            uint8_t active = 0xf;
+            std::array<size_t, 4> depths{};
+        };
+        std::vector<Candidate> candidates;
+        candidates.reserve(candidate_count);
+        std::unordered_map<std::string_view,
+                           std::unordered_map<int64_t, size_t>>
+            candidate_index;
+        candidate_index.reserve(selected_instances.size());
+        for (const auto& [instance_id, ranks] : selected_instances) {
+            auto& rank_index = candidate_index[instance_id];
+            rank_index.reserve(ranks.size());
+            for (int64_t rank : ranks) {
+                rank_index.emplace(rank, candidates.size());
+                candidates.push_back({&instance_id, rank});
+            }
+        }
+
+        std::vector<uint8_t> presence(candidate_count);
+        std::vector<size_t> active_candidates;
+        active_candidates.reserve(candidate_count);
+        for (size_t i = 0; i < candidate_count; ++i)
+            active_candidates.push_back(i);
+        for (size_t depth = 0;
+             depth < block_count && !active_candidates.empty(); ++depth) {
+            const HashBlock* hashed = chain->At(depth, &chain_error);
+            if (hashed == nullptr) break;
+            auto block = state->blocks.find(hashed->projected);
+            if (block == state->blocks.end()) break;
+            for (size_t i : active_candidates) presence[i] = 0;
+            const auto& owners = block->second;
+            if (active_candidates.size() == 1) {
+                const size_t i = active_candidates.front();
+                const auto& candidate = candidates[i];
+                auto matches = [&](const EngineOwner& owner) {
+                    return owner.instance_id == *candidate.instance_id &&
+                           owner.dp_rank == candidate.rank;
+                };
+                if (std::any_of(owners.npu_owners.begin(),
+                                owners.npu_owners.end(), matches)) {
+                    presence[i] = 0xf;
+                } else if (std::any_of(owners.cpu_local_owners.begin(),
+                                       owners.cpu_local_owners.end(),
+                                       matches)) {
+                    presence[i] = 0xe;
+                } else if (!owners.cpu_share_owners.empty()) {
+                    presence[i] = 0xc;
+                } else {
+                    for (const auto& owner : owners.disk_owners) {
+                        const auto* engine = std::get_if<EngineOwner>(&owner);
+                        if (!engine || matches(*engine)) {
+                            presence[i] = 0x8;
+                            break;
+                        }
+                    }
+                }
+            } else {
+                auto mark_engine = [&](const EngineOwner& owner,
+                                       uint8_t tiers) {
+                    auto instance = candidate_index.find(owner.instance_id);
+                    if (instance == candidate_index.end()) return;
+                    auto rank = instance->second.find(owner.dp_rank);
+                    if (rank != instance->second.end()) {
+                        presence[rank->second] |= tiers;
+                    }
+                };
+                for (const auto& owner : owners.npu_owners) {
+                    mark_engine(owner, 0xf);
+                }
+                for (const auto& owner : owners.cpu_local_owners) {
+                    mark_engine(owner, 0xe);
+                }
+                uint8_t shared_tiers =
+                    owners.cpu_share_owners.empty() ? 0 : 0xc;
+                for (const auto& owner : owners.disk_owners) {
+                    if (const auto* engine = std::get_if<EngineOwner>(&owner)) {
+                        mark_engine(*engine, 0x8);
+                    } else {
+                        shared_tiers |= 0x8;
+                    }
+                }
+                for (size_t i : active_candidates) presence[i] |= shared_tiers;
+            }
+            for (size_t offset = 0; offset < active_candidates.size();) {
+                const size_t i = active_candidates[offset];
+                auto& candidate = candidates[i];
+                // A tier cannot resume matching after a gap. Each bit denotes
+                // the cumulative prefix available at that tier or above.
+                candidate.active &= presence[i];
+                if (candidate.active == 0) {
+                    active_candidates[offset] = active_candidates.back();
+                    active_candidates.pop_back();
+                    continue;
+                }
+                for (size_t tier = 0; tier < candidate.depths.size(); ++tier) {
+                    if (candidate.active & (1 << tier)) {
+                        candidate.depths[tier] = depth + 1;
+                    }
+                }
+                ++offset;
+            }
+        }
+        for (const auto& candidate : candidates) {
+            auto& result = results[*candidate.instance_id];
+            RankCacheHitResult match{
+                .npu = MatchedTokens(candidate.depths[0], context.block_size,
+                                     queried_tokens),
+                .cpu_local = MatchedTokens(candidate.depths[1],
+                                           context.block_size, queried_tokens),
+                .cpu_share = MatchedTokens(candidate.depths[2],
+                                           context.block_size, queried_tokens),
+                .disk = MatchedTokens(candidate.depths[3], context.block_size,
+                                      queried_tokens)};
+            result.dp.emplace(candidate.rank, match.npu);
+            result.rank_matches.emplace(candidate.rank, match);
+            result.npu = std::max(result.npu, match.npu);
+            result.cpu_local = std::max(result.cpu_local, match.cpu_local);
+            result.cpu_share = std::max(result.cpu_share, match.cpu_share);
+            result.disk = std::max(result.disk, match.disk);
+            result.longest_match_tokens = result.disk;
+        }
+        if (!chain_error.empty()) {
+            LOG(ERROR) << "Query hash computation failed: " << chain_error;
+            return {};
+        }
+        return results;
+    }
 
     // Hashes needed by the probe are memoized, so the final read-locked walk
     // performs only vector access and indexed lookups.

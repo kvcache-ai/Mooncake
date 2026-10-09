@@ -33,3 +33,10 @@ target_compile_definitions(
   PRIVATE CONDUCTOR_TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
 
 add_test(NAME conductor_test COMMAND conductor_test)
+
+option(CONDUCTOR_BUILD_QUERY_BENCHMARK "Build the prefix-query microbenchmark"
+       OFF)
+if(CONDUCTOR_BUILD_QUERY_BENCHMARK)
+  add_executable(conductor_query_benchmark query_benchmark.cpp)
+  target_link_libraries(conductor_query_benchmark PRIVATE conductor_cpp_core)
+endif()
