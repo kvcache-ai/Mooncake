@@ -7,7 +7,7 @@ int g_register_calls = 0;
 int g_unregister_calls = 0;
 
 extern "C" int aclrtGetLogicDevIdByUserDevId(int32_t user_device_id,
-                                               int32_t *logic_device_id) {
+                                             int32_t *logic_device_id) {
     *logic_device_id = user_device_id + 100;
     return 0;
 }

@@ -351,7 +351,6 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
 
     std::string resolved_name = name;
 
-
 #ifdef USE_ASCEND_RDMA
     const bool explicit_location = name != kWildcardLocation;
     // Keep MR registration aligned with the route selected for an explicit
@@ -375,7 +374,8 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
             for (const auto &hca : target_hcas) {
                 auto hca_it = std::find(hca_list.begin(), hca_list.end(), hca);
                 if (hca_it != hca_list.end()) {
-                    size_t index = static_cast<size_t>(hca_it - hca_list.begin());
+                    size_t index =
+                        static_cast<size_t>(hca_it - hca_list.begin());
                     if (index < context_list_.size())
                         target_indices.push_back(index);
                 }
@@ -634,8 +634,9 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
             for (size_t index : target_indices) {
                 reg_threads.emplace_back([this, &ret_codes, chunk_dmabuf_exp,
                                           index, chunk_addr, chunk_len, ar]() {
-                    ret_codes[index] = context_list_[index]->registerMemoryRegion(
-                        chunk_addr, chunk_len, ar, chunk_dmabuf_exp);
+                    ret_codes[index] =
+                        context_list_[index]->registerMemoryRegion(
+                            chunk_addr, chunk_len, ar, chunk_dmabuf_exp);
                 });
             }
 
@@ -797,8 +798,8 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
 #ifdef USE_ASCEND_RDMA
         for (size_t i = 0; i < chunk_addrs.size(); ++i) {
             if (chunk_locations[i].empty()) continue;
-            int ret = ub_segment_.UnRegUbSegment(chunk_locations[i],
-                                                 chunk_addrs[i]);
+            int ret =
+                ub_segment_.UnRegUbSegment(chunk_locations[i], chunk_addrs[i]);
             if (ret) {
                 LOG(WARNING) << "Failed to unregister UB segment (chunk " << i
                              << "/" << chunk_addrs.size() << ") at "
@@ -858,7 +859,8 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
     }
 
     const std::string location = findLocalBufferLocation((uint64_t)addr);
-    int rc = metadata_->removeLocalMemoryBuffer(addr, /*update_metadata=*/false);
+    int rc =
+        metadata_->removeLocalMemoryBuffer(addr, /*update_metadata=*/false);
     if (rc) return rc;
 
     // Once the local entry is removed, a publish failure must not prevent

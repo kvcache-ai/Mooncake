@@ -32,7 +32,8 @@ class UbSegment {
 
     // Registering a non-NPU location is a successful no-op. Re-registering
     // the same (device, VA, size) is also an idempotent successful no-op.
-    // With USE_ASCEND_RDMA enabled, missing Ascend symbols fail NPU registration.
+    // With USE_ASCEND_RDMA enabled, missing Ascend symbols fail NPU
+    // registration.
     int RegUbSegment(const std::string &location, uint64_t va, uint64_t size);
 
     // Unregistering a non-NPU or unknown location is a successful no-op.

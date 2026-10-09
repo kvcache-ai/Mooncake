@@ -26,11 +26,11 @@
 #include <string_view>
 
 extern "C" __attribute__((weak)) int halMemRegUbSegment(uint32_t, uint64_t,
-                                                      uint64_t);
-extern "C" __attribute__((weak)) int halMemUnRegUbSegment(uint32_t, uint64_t,
                                                         uint64_t);
+extern "C" __attribute__((weak)) int halMemUnRegUbSegment(uint32_t, uint64_t,
+                                                          uint64_t);
 extern "C" __attribute__((weak)) int aclrtGetLogicDevIdByUserDevId(int32_t,
-                                                                int32_t *);
+                                                                   int32_t *);
 
 namespace mooncake {
 namespace {
@@ -98,9 +98,9 @@ AscendSymbols &symbols() {
                 findAscendSymbol(RTLD_DEFAULT, "halMemUnRegUbSegment"));
         }
         if (!out.get_logic_device_id) {
-            out.get_logic_device_id = reinterpret_cast<GetLogicDeviceIdFn>(
-                findAscendSymbol(RTLD_DEFAULT,
-                                 "aclrtGetLogicDevIdByUserDevId"));
+            out.get_logic_device_id =
+                reinterpret_cast<GetLogicDeviceIdFn>(findAscendSymbol(
+                    RTLD_DEFAULT, "aclrtGetLogicDevIdByUserDevId"));
         }
 
         if (!out.register_segment || !out.unregister_segment) {
@@ -108,14 +108,14 @@ AscendSymbols &symbols() {
             out.hal_handle = loadAscendLibrary(library);
             if (out.hal_handle) {
                 if (!out.register_segment) {
-                    out.register_segment = reinterpret_cast<HalRegisterFn>(
-                        findAscendSymbol(out.hal_handle, "halMemRegUbSegment",
-                                         library));
+                    out.register_segment =
+                        reinterpret_cast<HalRegisterFn>(findAscendSymbol(
+                            out.hal_handle, "halMemRegUbSegment", library));
                 }
                 if (!out.unregister_segment) {
-                    out.unregister_segment = reinterpret_cast<HalUnregisterFn>(
-                        findAscendSymbol(out.hal_handle, "halMemUnRegUbSegment",
-                                         library));
+                    out.unregister_segment =
+                        reinterpret_cast<HalUnregisterFn>(findAscendSymbol(
+                            out.hal_handle, "halMemUnRegUbSegment", library));
                 }
             }
         }
@@ -219,8 +219,8 @@ int UbSegment::RegUbSegment(const std::string &location, uint64_t va,
     segments_[va].push_back({user_device_id, size});
     LOG(INFO) << "Registered UB segment: location=" << location
               << ", user_device_id=" << user_device_id
-              << ", logic_device_id=" << logic_device_id
-              << ", va=" << va << ", size=" << size;
+              << ", logic_device_id=" << logic_device_id << ", va=" << va
+              << ", size=" << size;
     return 0;
 }
 
@@ -252,8 +252,8 @@ int UbSegment::UnRegUbSegment(const std::string &location, uint64_t va) {
     int first_error = 0;
     if (symbolsAvailable(resolved)) {
         int32_t logic_device_id = -1;
-        int ret = resolved.get_logic_device_id(user_device_id,
-                                                &logic_device_id);
+        int ret =
+            resolved.get_logic_device_id(user_device_id, &logic_device_id);
         if (ret != 0) {
             LOG(ERROR) << "aclrtGetLogicDevIdByUserDevId failed for user "
                           "device "
