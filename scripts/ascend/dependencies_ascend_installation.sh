@@ -1,3 +1,4 @@
+#!/bin/bash
 # Copyright 2025 Huawei Technologies Co., Ltd
 # Copyright 2024 KVCache.AI
 #
@@ -16,23 +17,18 @@
 # Install system dependencies for the Ascend transport build.
 # Debian/Ubuntu uses apt packages; openEuler/RHEL uses yum/dnf packages.
 #
-# NOTE: the former from-source builds of yaml-cpp and msgpack-c were removed.
-# No Mooncake target built on the Ascend path consumes them (mooncake-conductor
-# is WITH_CONDUCTOR=OFF by default and locates msgpack on its own when enabled),
+# NOTE: the former from-source build of msgpack-c was removed: no Mooncake
+# target on the Ascend path consumes msgpack (mooncake-conductor is
+# WITH_CONDUCTOR=OFF by default and locates msgpack on its own when enabled),
 # and building msgpack-c with its default MSGPACK_USE_BOOST=ON forced an extra
 # Boost requirement that broke on newer CMake (>= 3.30) with older boost-devel.
-
-#!/bin/bash
+# yaml-cpp is a hard requirement of mooncake-common (find_package(yaml-cpp
+# REQUIRED)); it is now satisfied by the distro package (yaml-cpp-devel /
+# libyaml-cpp-dev) instead of a from-source build.
 
 print_error() {
     echo "[ERROR] $1"
     exit 1
-}
-
-check_success() {
-    if [ $? -ne 0 ]; then
-        print_error "$1"
-    fi
 }
 
 set -euo pipefail
@@ -87,6 +83,7 @@ elif command -v yum &> /dev/null; then
             hiredis-devel \
             libcurl-devel \
             jsoncpp-devel \
+            yaml-cpp-devel \
             zstd-devel \
             xxhash-devel
     # Best-effort packages: provided by most openEuler releases but safe to skip.
@@ -101,7 +98,6 @@ else
     exit 1
 fi
 
-check_success "Failed to install system packages"
 echo -e "system packages installed successfully."
 
 export CPLUS_INCLUDE_PATH="$(echo "${CPLUS_INCLUDE_PATH:-}" | tr ':' '\n' | grep -v "/usr/local/Ascend" | paste -sd: - || true)"
