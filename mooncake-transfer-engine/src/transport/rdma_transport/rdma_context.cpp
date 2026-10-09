@@ -269,6 +269,10 @@ int RdmaContext::construct(size_t num_cq_list, size_t num_comp_channels,
                    << static_cast<int>(port) << " with GID " << gid_index;
         return ERR_CONTEXT;
     }
+    peer_auto_gid_states_.configure(
+        static_cast<size_t>(std::max(max_endpoints, 1)),
+        static_cast<uint32_t>(std::max(globalConfig().auto_gid_max_retries, 0)),
+        auto_gid_selection_enabled_ && globalConfig().auto_gid_max_retries > 0);
 
     if (context_->num_comp_vectors <= 0) {
         LOG(ERROR) << "RDMA device " << device_name_
@@ -1224,6 +1228,84 @@ GidNetworkState RdmaContext::findBestGidIndex(const std::string &device_name,
     return autoGidStateFromSelection(*selection);
 }
 
+std::vector<AutoGidCandidate> RdmaContext::queryAutoGidCandidates() const {
+    ibv_context *verbs_context = nullptr;
+    uint8_t port = 0;
+    {
+        std::lock_guard<std::mutex> guard(gid_lock_);
+        verbs_context = context_;
+        port = port_;
+    }
+    if (!verbs_context) return {};
+
+    ibv_port_attr port_attr;
+    if (ibv_query_port(verbs_context, port, &port_attr)) return {};
+
+    std::vector<AutoGidCandidate> candidates;
+    candidates.reserve(port_attr.gid_tbl_len);
+    for (int i = 0; i < port_attr.gid_tbl_len; ++i) {
+        AutoGidCandidate candidate;
+        candidate.gid_index = i;
+        ibv_gid_entry gid_entry;
+        if (ibv_query_gid_ex(verbs_context, port, i, &gid_entry, 0)) {
+            candidate.query_succeeded = false;
+            candidates.push_back(candidate);
+            continue;
+        }
+        const auto *gid_addr =
+            reinterpret_cast<const in6_addr *>(gid_entry.gid.raw);
+        std::string ndev = readGidNdev(device_name_, port, i);
+        candidate.gid = gidBytesToString(gid_entry.gid.raw);
+        candidate.gid_type = gid_entry.gid_type;
+        candidate.has_network_device = !ndev.empty();
+        candidate.is_ipv4_mapped = ipv6_addr_v4mapped(gid_addr);
+        candidate.is_link_local_ipv6 = isLinkLocalIpv6(gid_addr);
+        candidate.is_overlay_network =
+            candidate.has_network_device && isOverlayNetwork(ndev);
+        candidate.is_overlay_ipv4 =
+            candidate.is_ipv4_mapped && isOverlayIPv4(gid_addr);
+        candidate.is_null_gid = isNullGid(&gid_entry.gid);
+        candidates.push_back(std::move(candidate));
+    }
+    return candidates;
+}
+
+PeerAutoGidSelection RdmaContext::preparePeerGidSelection(
+    const std::string &peer_nic_path, std::string_view auto_gid_reprobe_from) {
+    std::lock_guard<std::mutex> reprobe_guard(gid_reprobe_lock_);
+    const std::string peer = normalizeNicPath(peer_nic_path);
+    auto context_default = gidSelection();
+    AutoGidSelection default_selection{context_default.gid_index,
+                                       context_default.gid};
+    if (!peer_auto_gid_states_.needsCandidateScan(peer, default_selection,
+                                                  auto_gid_reprobe_from)) {
+        return peer_auto_gid_states_.prepare(peer, default_selection);
+    }
+    auto candidates = rankAutoGidCandidates(queryAutoGidCandidates());
+    return peer_auto_gid_states_.prepare(peer, default_selection, candidates,
+                                         auto_gid_reprobe_from);
+}
+
+void RdmaContext::requestPeerGidAdvance(const std::string &peer_nic_path) {
+    auto context_default = gidSelection();
+    peer_auto_gid_states_.requestAdvance(
+        normalizeNicPath(peer_nic_path),
+        {context_default.gid_index, context_default.gid});
+}
+
+AutoGidDataPathAction RdmaContext::recordAutoGidCompletion(
+    const std::string &peer_nic_path, const AutoGidDataPathAttempt &attempt,
+    bool success) {
+    return peer_auto_gid_states_.recordCompletion(
+        normalizeNicPath(peer_nic_path), attempt, success);
+}
+
+void RdmaContext::rememberPeerAdvertisedGid(const std::string &peer_nic_path,
+                                            std::string_view peer_gid) {
+    peer_auto_gid_states_.rememberPeerAdvertisedGid(
+        normalizeNicPath(peer_nic_path), peer_gid);
+}
+
 bool RdmaContext::reprobeAutoGid(
     const GidSelectionSnapshot &expected_selection,
     const std::vector<AutoGidSelectionIdentity> &tried_selections,
@@ -1369,6 +1451,7 @@ GidRefreshResult RdmaContext::refreshCurrentGid(std::string *previous_gid,
         current_port = port_;
         auto_gid_selection_enabled = auto_gid_selection_enabled_;
     }
+    if (auto_gid_selection_enabled) peer_auto_gid_states_.markCandidatesDirty();
 
     if (auto_gid_selection_enabled) {
         ibv_port_attr port_attr;

@@ -19,9 +19,13 @@
 #include <infiniband/verbs.h>
 
 #include <algorithm>
+#include <list>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace mooncake {
@@ -49,6 +53,14 @@ enum class AutoGidRetryAction {
     kRetryWithObservedChange = 2,
 };
 
+enum class AutoGidDataPathAction {
+    kRetrySameGid = 0,
+    kAdvanceGid = 1,
+    kIgnoreDuplicate = 2,
+    kExhausted = 3,
+    kUnavailable = 4,
+};
+
 struct AutoGidCandidate {
     int gid_index = -1;
     std::string gid;
@@ -72,6 +84,324 @@ struct AutoGidSelection {
 struct AutoGidSelectionIdentity {
     int gid_index = -1;
     std::string gid;
+};
+
+struct AutoGidDataPathAttempt {
+    uint64_t endpoint_id = 0;
+    uint64_t selection_epoch = 0;
+};
+
+struct PeerAutoGidSelection {
+    AutoGidSelection selection;
+    uint64_t selection_epoch = 0;
+    bool recovery_enabled = false;
+    bool observe_success = false;
+    std::string auto_gid_reprobe_from;
+};
+
+class PeerAutoGidStateTable {
+   public:
+    PeerAutoGidStateTable(size_t capacity = 1, uint32_t max_advances = 0,
+                          bool enabled = false)
+        : capacity_(std::max<size_t>(capacity, 1)),
+          hard_capacity_(capacity_ * 2),
+          max_advances_(max_advances),
+          enabled_(enabled) {}
+
+    void configure(size_t capacity, uint32_t max_advances, bool enabled) {
+        std::lock_guard<std::mutex> guard(mutex_);
+        states_.clear();
+        lru_.clear();
+        capacity_ = std::max<size_t>(capacity, 1);
+        hard_capacity_ = capacity_ * 2;
+        max_advances_ = max_advances;
+        enabled_ = enabled;
+        candidate_generation_ = 0;
+    }
+
+    PeerAutoGidSelection prepare(const std::string& peer,
+                                 const AutoGidSelection& default_selection) {
+        return prepareInternal(peer, default_selection, nullptr, {});
+    }
+
+    PeerAutoGidSelection prepare(
+        const std::string& peer, const AutoGidSelection& default_selection,
+        const std::vector<AutoGidSelection>& candidates,
+        std::string_view advisory_from = {}) {
+        return prepareInternal(peer, default_selection, &candidates,
+                               advisory_from);
+    }
+
+    bool needsCandidateScan(const std::string& peer,
+                            const AutoGidSelection& default_selection,
+                            std::string_view advisory_from = {}) const {
+        if (!enabled_) return false;
+        std::lock_guard<std::mutex> guard(mutex_);
+        auto iter = states_.find(peer);
+        if (iter == states_.end()) {
+            return !advisory_from.empty() &&
+                   advisory_from == default_selection.gid;
+        }
+        const State& state = iter->second.state;
+        return state.advance_pending ||
+               state.candidate_generation_seen != candidate_generation_ ||
+               (!advisory_from.empty() && advisory_from == state.current.gid);
+    }
+
+    AutoGidDataPathAction recordCompletion(
+        const std::string& peer, const AutoGidDataPathAttempt& attempt,
+        bool success) {
+        if (!enabled_ || attempt.endpoint_id == 0 ||
+            attempt.selection_epoch == 0) {
+            return AutoGidDataPathAction::kUnavailable;
+        }
+        std::lock_guard<std::mutex> guard(mutex_);
+        auto iter = states_.find(peer);
+        if (iter == states_.end()) {
+            return AutoGidDataPathAction::kUnavailable;
+        }
+        touch(iter);
+        State& state = iter->second.state;
+        if (attempt.selection_epoch != state.selection_epoch) {
+            return AutoGidDataPathAction::kIgnoreDuplicate;
+        }
+        if (success) {
+            clearRecovery(state);
+            state.first_failed_endpoint_id = 0;
+            return AutoGidDataPathAction::kIgnoreDuplicate;
+        }
+        if (state.exhausted) {
+            return AutoGidDataPathAction::kExhausted;
+        }
+        if (state.advance_pending) {
+            return AutoGidDataPathAction::kIgnoreDuplicate;
+        }
+        if (state.first_failed_endpoint_id == 0) {
+            state.first_failed_endpoint_id = attempt.endpoint_id;
+            state.recovery_active = true;
+            return AutoGidDataPathAction::kRetrySameGid;
+        }
+        if (attempt.endpoint_id <= state.first_failed_endpoint_id) {
+            return AutoGidDataPathAction::kIgnoreDuplicate;
+        }
+        state.advance_pending = true;
+        state.advance_requested_locally = true;
+        return AutoGidDataPathAction::kAdvanceGid;
+    }
+
+    void requestAdvance(const std::string& peer,
+                        const AutoGidSelection& default_selection) {
+        if (!enabled_) return;
+        std::lock_guard<std::mutex> guard(mutex_);
+        auto iter = getOrCreate(peer, default_selection);
+        if (iter == states_.end()) return;
+        State& state = iter->second.state;
+        if (!state.advance_pending) {
+            state.advance_pending = true;
+            state.advance_requested_locally = true;
+            state.recovery_active = true;
+        }
+        touch(iter);
+    }
+
+    void rememberPeerAdvertisedGid(const std::string& peer,
+                                   std::string_view peer_gid) {
+        if (!enabled_) return;
+        std::lock_guard<std::mutex> guard(mutex_);
+        auto iter = states_.find(peer);
+        if (iter == states_.end()) return;
+        iter->second.state.peer_advertised_gid = std::string(peer_gid);
+        iter->second.state.auto_gid_reprobe_from.clear();
+        touch(iter);
+    }
+
+    void markCandidatesDirty() {
+        std::lock_guard<std::mutex> guard(mutex_);
+        ++candidate_generation_;
+    }
+
+    size_t size() const {
+        std::lock_guard<std::mutex> guard(mutex_);
+        return states_.size();
+    }
+
+    bool contains(const std::string& peer) const {
+        std::lock_guard<std::mutex> guard(mutex_);
+        return states_.find(peer) != states_.end();
+    }
+
+   private:
+    struct State {
+        AutoGidSelection current;
+        uint64_t selection_epoch = 0;
+        uint64_t first_failed_endpoint_id = 0;
+        uint64_t candidate_generation_seen = 0;
+        uint32_t advances_used = 0;
+        bool advance_pending = false;
+        bool advance_requested_locally = false;
+        bool recovery_active = false;
+        bool exhausted = false;
+        std::string peer_advertised_gid;
+        std::string auto_gid_reprobe_from;
+        std::unordered_set<std::string> tried_gids;
+    };
+
+    struct Entry {
+        State state;
+        std::list<std::string>::iterator lru;
+    };
+
+    using StateMap = std::unordered_map<std::string, Entry>;
+
+    uint64_t nextSelectionEpoch() {
+        if (next_selection_epoch_ == 0) ++next_selection_epoch_;
+        return next_selection_epoch_++;
+    }
+
+    typename StateMap::iterator getOrCreate(
+        const std::string& peer, const AutoGidSelection& default_selection) {
+        auto iter = states_.find(peer);
+        if (iter != states_.end()) return iter;
+        while (states_.size() >= capacity_ && evictOldestIdle()) {
+        }
+        if (states_.size() >= hard_capacity_) evictOldest();
+        lru_.push_back(peer);
+        State state;
+        state.current = default_selection;
+        state.selection_epoch = nextSelectionEpoch();
+        state.candidate_generation_seen = candidate_generation_;
+        state.tried_gids.insert(default_selection.gid);
+        return states_.emplace(peer, Entry{std::move(state), --lru_.end()})
+            .first;
+    }
+
+    void touch(typename StateMap::iterator iter) {
+        lru_.splice(lru_.end(), lru_, iter->second.lru);
+        iter->second.lru = --lru_.end();
+    }
+
+    bool evictOldestIdle() {
+        for (auto lru = lru_.begin(); lru != lru_.end(); ++lru) {
+            auto victim = states_.find(*lru);
+            if (victim == states_.end()) {
+                lru_.erase(lru);
+                return true;
+            }
+            if (victim->second.state.recovery_active) continue;
+            states_.erase(victim);
+            lru_.erase(lru);
+            return true;
+        }
+        return false;
+    }
+
+    void evictOldest() {
+        while (!lru_.empty()) {
+            auto oldest = lru_.begin();
+            auto victim = states_.find(*oldest);
+            lru_.erase(oldest);
+            if (victim == states_.end()) continue;
+            states_.erase(victim);
+            return;
+        }
+    }
+
+    void clearRecovery(State& state) {
+        state.advance_pending = false;
+        state.advance_requested_locally = false;
+        state.recovery_active = false;
+        state.exhausted = false;
+    }
+
+    static void clearAdvanceRequest(State& state) {
+        state.advance_pending = false;
+        state.advance_requested_locally = false;
+    }
+
+    static const AutoGidSelection* findByGid(
+        const std::vector<AutoGidSelection>& candidates, std::string_view gid) {
+        auto iter = std::find_if(
+            candidates.begin(), candidates.end(),
+            [&](const auto& candidate) { return candidate.gid == gid; });
+        return iter == candidates.end() ? nullptr : &*iter;
+    }
+
+    PeerAutoGidSelection prepareInternal(
+        const std::string& peer, const AutoGidSelection& default_selection,
+        const std::vector<AutoGidSelection>* candidates,
+        std::string_view advisory_from) {
+        if (!enabled_) return {default_selection, 0, false, false, {}};
+        std::lock_guard<std::mutex> guard(mutex_);
+        auto iter = getOrCreate(peer, default_selection);
+        if (iter == states_.end()) {
+            return {default_selection, 0, false, false, {}};
+        }
+        touch(iter);
+        State& state = iter->second.state;
+        bool should_advance = state.advance_pending;
+        bool locally_requested = state.advance_requested_locally;
+
+        if (!advisory_from.empty() && advisory_from == state.current.gid) {
+            should_advance = true;
+        }
+
+        if (candidates &&
+            state.candidate_generation_seen != candidate_generation_) {
+            state.candidate_generation_seen = candidate_generation_;
+            const AutoGidSelection* rebound =
+                findByGid(*candidates, state.current.gid);
+            if (rebound) {
+                if (rebound->gid_index != state.current.gid_index) {
+                    state.current = *rebound;
+                    state.selection_epoch = nextSelectionEpoch();
+                    state.first_failed_endpoint_id = 0;
+                    state.exhausted = false;
+                }
+            } else {
+                should_advance = true;
+            }
+        }
+
+        if (should_advance && candidates) {
+            state.recovery_active = true;
+            const AutoGidSelection* next = nullptr;
+            if (state.advances_used < max_advances_) {
+                for (const auto& candidate : *candidates) {
+                    if (!state.tried_gids.count(candidate.gid)) {
+                        next = &candidate;
+                        break;
+                    }
+                }
+            }
+            clearAdvanceRequest(state);
+            if (next) {
+                if (locally_requested && !state.peer_advertised_gid.empty()) {
+                    state.auto_gid_reprobe_from = state.peer_advertised_gid;
+                }
+                state.current = *next;
+                state.tried_gids.insert(next->gid);
+                ++state.advances_used;
+                state.selection_epoch = nextSelectionEpoch();
+                state.first_failed_endpoint_id = 0;
+                state.exhausted = false;
+            } else {
+                state.exhausted = true;
+            }
+        }
+
+        return {state.current, state.selection_epoch, true,
+                state.recovery_active, state.auto_gid_reprobe_from};
+    }
+
+    mutable std::mutex mutex_;
+    size_t capacity_;
+    size_t hard_capacity_;
+    uint32_t max_advances_;
+    bool enabled_;
+    uint64_t candidate_generation_ = 0;
+    uint64_t next_selection_epoch_ = 1;
+    StateMap states_;
+    std::list<std::string> lru_;
 };
 
 inline const char* autoGidCandidateClassToString(
