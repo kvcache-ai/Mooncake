@@ -131,15 +131,17 @@ void MasterServiceTestPeer::SeedPromotionTaskForTesting(
         assert(inserted);
         (void)inserted;
     }
-    entry->WithExclusiveAccess([&](ObjectMetadata&, ObjectEntry::State& state) {
-        state.promotion_task =
-            PromotionTask{.source_id = 0,
-                          .alloc_id = alloc_id,
-                          .object_size = object_size,
-                          .start_time = std::chrono::system_clock::now(),
-                          .holder_id = holder_id};
-        tenant_handle->TrackInFlight(*entry, state);
-    });
+    auto hold = tenant_handle->WriteHold(entry);
+    assert(hold.has_value());
+    if (!hold) {
+        return;
+    }
+    hold->state().promotion_task =
+        PromotionTask{.source_id = 0,
+                      .alloc_id = alloc_id,
+                      .object_size = object_size,
+                      .start_time = std::chrono::system_clock::now(),
+                      .holder_id = holder_id};
 }
 
 size_t MasterServiceTestPeer::CountCandidatesForTesting(
@@ -163,8 +165,8 @@ void MasterServiceTestPeer::ResetCandidateBackoffsForTesting() {
                 if (entry == nullptr) {
                     continue;
                 }
-                entry->WithExclusiveAccess(
-                    [&](ObjectMetadata&, ObjectEntry::State& state) {
+                test::ObjectEntryTestPeer::WithExclusiveAccess(
+                    *entry, [&](ObjectMetadata&, ObjectEntry::State& state) {
                         if (state.promotion_candidate.has_value()) {
                             state.promotion_candidate->retry_after = epoch;
                         }

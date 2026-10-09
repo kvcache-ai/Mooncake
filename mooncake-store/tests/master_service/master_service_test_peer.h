@@ -3,6 +3,7 @@
 #include <utility>
 
 #include "master_service.h"
+#include "object_test_helpers.h"
 
 namespace mooncake::test {
 
@@ -156,8 +157,8 @@ class MasterServiceTestPeer {
 
     // --- The tenant metadata model ------------------------------------------
     // One tenant per registered tenant id, owning that tenant's object route,
-    // its group table and its bound quota account. A walk over all objects is
-    // `Visit` over the registry followed by `SnapshotObjects` per tenant.
+    // its group table and its bound quota account. A pass over all objects is
+    // `Visit` over the registry followed by a `ReadCursor` per tenant.
 
     static auto& Tenants(MasterService& service) { return service.tenants_; }
     static const auto& Tenants(const MasterService& service) {
@@ -511,8 +512,8 @@ class MasterServiceTestPeer {
                                    const std::string& key, Fn&& fn) {
         auto entry = FindObject(service_, ObjectIdentity{tenant_id, key});
         assert(entry != nullptr);
-        entry->WithExclusiveAccess(
-            [&](ObjectMetadata&, ObjectEntry::State&) { fn(); });
+        test::ObjectEntryTestPeer::WithExclusiveAccess(
+            *entry, [&](ObjectMetadata&, ObjectEntry::State&) { fn(); });
     }
 
    private:

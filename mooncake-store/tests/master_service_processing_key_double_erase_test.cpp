@@ -120,19 +120,22 @@ class MasterServiceProcessingKeyDoubleEraseTest : public ::testing::Test {
         if (tenant == nullptr) {
             ::_exit(kExitNotTornDown);
         }
+        // The torn-down entry is not held again, so no second teardown runs.
         bool released_again = false;
-        const bool torn_down_again = entry->WithExclusiveAccess(
-            [&](ObjectMetadata&, ObjectEntry::State& state) {
-                return tenant->TearDownObject(entry, state,
-                                              [&] { released_again = true; });
-            });
+        auto hold = tenant->WriteHold(entry);
+        const bool torn_down_again =
+            hold.has_value() &&
+            tenant->TearDownObject(*hold, [&] { released_again = true; });
+        hold.reset();
         if (torn_down_again || released_again) {
             ::_exit(kExitNotTornDown);
         }
-        const bool still_processing = entry->WithSharedAccess(
-            [](const ObjectMetadata&, const ObjectEntry::State& state) {
-                return state.is_processing;
-            });
+        const bool still_processing =
+            test::ObjectEntryTestPeer::WithSharedAccess(
+                *entry,
+                [](const ObjectMetadata&, const ObjectEntry::State& state) {
+                    return state.is_processing;
+                });
         if (still_processing) {
             ::_exit(kExitStillProcessing);
         }

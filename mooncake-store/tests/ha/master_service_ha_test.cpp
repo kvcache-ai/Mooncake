@@ -804,7 +804,7 @@ class MasterServiceHATest : public ::testing::Test {
         // object is what this has to look at.
         MasterServiceTestPeer::MetadataAccessorRO accessor(
             &service, MasterServiceTestPeer::ObjectIdentity{tenant_id, key});
-        return accessor.GetEntry() != nullptr &&
+        return accessor.IsPublished() &&
                accessor.Get().HasReplica([](const Replica& replica) {
                    return replica.is_memory_replica() && replica.is_completed();
                });

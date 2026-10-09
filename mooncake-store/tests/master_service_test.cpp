@@ -813,12 +813,13 @@ TEST_F(MasterServiceTest,
         ASSERT_NE(blocked_entry, nullptr);
         std::atomic<bool> release_blocked_entry{false};
         std::thread blocker([&] {
-            blocked_entry->WithExclusiveAccess([&](ObjectMetadata&,
-                                                   ObjectEntry::State&) {
-                while (!release_blocked_entry.load()) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                }
-            });
+            test::ObjectEntryTestPeer::WithExclusiveAccess(
+                *blocked_entry, [&](ObjectMetadata&, ObjectEntry::State&) {
+                    while (!release_blocked_entry.load()) {
+                        std::this_thread::sleep_for(
+                            std::chrono::milliseconds(1));
+                    }
+                });
         });
         std::barrier start_barrier(kConcurrentWrites + 1);
         std::vector<int> errors(kConcurrentWrites,

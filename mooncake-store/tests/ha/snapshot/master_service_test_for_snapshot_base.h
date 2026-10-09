@@ -783,9 +783,8 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
         MasterServiceTestPeer::Tenants(*service).Visit(
             [&](const TenantId&,
                 const std::shared_ptr<metadata::Tenant>& handle) {
-                for (const auto& entry : handle->SnapshotObjects()) {
-                    ObjectEntry::SharedHold hold(*entry);
-                    const auto& metadata = hold.metadata();
+                for (auto object : handle->ReadCursor()) {
+                    const auto& metadata = object.metadata();
                     for (const auto& replica : metadata.GetAllReplicas()) {
                         if (replica.is_memory_replica()) {
                             const auto record = replica.getClientLiveness();

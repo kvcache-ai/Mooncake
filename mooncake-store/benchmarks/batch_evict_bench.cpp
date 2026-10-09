@@ -178,9 +178,8 @@ class BatchEvictBench {
                 if (tenant_id != TenantId::Default()) {
                     return;
                 }
-                for (const auto& entry : tenant->SnapshotObjects()) {
-                    ObjectEntry::ExclusiveHold hold(*entry);
-                    auto& metadata = hold.metadata();
+                for (auto object : tenant->WriteCursor()) {
+                    auto& metadata = object.metadata();
                     {
                         SpinLocker locker(&metadata.lock);
                         metadata.lease_->SetDeadline(

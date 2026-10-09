@@ -132,8 +132,11 @@ class MasterServiceTest : public ::testing::Test {
         if (entry == nullptr) {
             return std::nullopt;
         }
-        ObjectEntry::SharedHold hold(*entry);
-        return hold.metadata().GetCommittedSoftPinTimeout();
+        return test::ObjectEntryTestPeer::WithSharedAccess(
+            *entry,
+            [](const ObjectMetadata& metadata, const ObjectEntry::State&) {
+                return metadata.GetCommittedSoftPinTimeout();
+            });
     }
 
     void CleanupExpiredSoftPinsAt(
@@ -151,12 +154,11 @@ class MasterServiceTest : public ::testing::Test {
             service,
             MasterServiceTestPeer::ObjectIdentity{normalized_tenant, key});
         ASSERT_TRUE(entry != nullptr);
-        ObjectEntry::ExclusiveHold hold(*entry);
-        auto& metadata = hold.metadata();
-        {
-            SpinLocker locker(&metadata.lock);
-            metadata.soft_pin_timeout = deadline;
-        }
+        test::ObjectEntryTestPeer::WithExclusiveAccess(
+            *entry, [&](ObjectMetadata& metadata, ObjectEntry::State&) {
+                SpinLocker locker(&metadata.lock);
+                metadata.soft_pin_timeout = deadline;
+            });
         MasterServiceTestPeer::SoftPinDeadlineIndex(service).Upsert(
             normalized_tenant.MakeScopedKey(key), deadline);
     }
@@ -491,11 +493,13 @@ class MasterServiceTest : public ::testing::Test {
         MasterServiceTestPeer::Tenants(service).Visit(
             [&](const TenantId&,
                 const std::shared_ptr<metadata::Tenant>& handle) {
-                for (const auto& entry : handle->SnapshotObjects()) {
-                    if (entry->group_id().empty()) {
+                // The group index is below the route in the lock order, so
+                // the cursor's loop body may drop memberships.
+                for (auto object : handle->ReadCursor()) {
+                    if (object.handle()->group_id().empty()) {
                         continue;
                     }
-                    handle->UnregisterGroupMember(entry);
+                    handle->UnregisterGroupMember(object.handle());
                 }
             });
     }
@@ -516,12 +520,9 @@ class MasterServiceTest : public ::testing::Test {
             return nullptr;
         }
         for (const auto& member_key : tenant_handle->GroupMembers(group_id)) {
-            auto entry = tenant_handle->Get(member_key);
-            if (entry == nullptr) {
-                continue;
+            if (auto hold = tenant_handle->ReadHold(member_key)) {
+                return hold->metadata().lease_;
             }
-            ObjectEntry::SharedHold hold(*entry);
-            return hold.metadata().lease_;
         }
         return nullptr;
     }

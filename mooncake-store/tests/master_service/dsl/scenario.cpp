@@ -1073,13 +1073,12 @@ MasterScenario& MasterScenario::When(ExpireAtAction action) {
         Fail("ExpireAt(" + action.key + ") could not find object");
         return *this;
     }
-    ObjectEntry::ExclusiveHold hold(*entry);
-    auto& metadata = hold.metadata();
-    {
-        SpinLocker locker(&metadata.lock);
-        metadata.lease_->SetDeadline(action.lease_timeout);
-        metadata.soft_pin_timeout = action.soft_pin_timeout;
-    }
+    test::ObjectEntryTestPeer::WithExclusiveAccess(
+        *entry, [&](ObjectMetadata& metadata, ObjectEntry::State&) {
+            SpinLocker locker(&metadata.lock);
+            metadata.lease_->SetDeadline(action.lease_timeout);
+            metadata.soft_pin_timeout = action.soft_pin_timeout;
+        });
     return *this;
 }
 

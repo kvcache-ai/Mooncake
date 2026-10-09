@@ -1169,8 +1169,7 @@ class MasterService {
     // cleaned through the oplog. False when it tore the object down.
     [[nodiscard]] bool CleanupInvalidMemoryReplicas(
         const TenantId& tenant_id, metadata::Tenant& tenant,
-        const std::shared_ptr<ObjectEntry>& entry, ObjectMetadata& metadata,
-        ObjectEntry::State& state);
+        const ObjectEntry::WriteHold& hold);
 
     // Reads the member keys registered for `group_id` from the tenant's group
     // table; empty if the tenant or the group is unregistered.
@@ -1204,9 +1203,9 @@ class MasterService {
         const TenantId& tenant_id, const std::string& key,
         const std::string& group_id, bool allow_soft_pinned,
         std::chrono::system_clock::time_point now,
-        const std::function<EvictMemberOutcome(
-            const std::string&, ObjectMetadata&, ObjectEntry::State&,
-            metadata::Tenant&)>& evict_one_member);
+        const std::function<EvictMemberOutcome(const ObjectEntry::WriteHold&,
+                                               metadata::Tenant&)>&
+            evict_one_member);
 
     void ReleaseLocalDiskUsage(const std::vector<Replica>& replicas);
     enum class QuotaEraseMode {
@@ -1225,16 +1224,14 @@ class MasterService {
     // release its refcounts, quota charges and KV removal events again.
     // Returns whether this call tore it down.
     [[nodiscard]] bool EraseMetadata(
-        metadata::Tenant& tenant, const std::shared_ptr<ObjectEntry>& entry,
-        ObjectMetadata& metadata, ObjectEntry::State& state,
+        metadata::Tenant& tenant, const ObjectEntry::WriteHold& hold,
         const TenantId& tenant_id,
         QuotaEraseMode quota_mode = QuotaEraseMode::kFull,
         const std::vector<std::string>& previous_media_hint = {});
     // EraseMetadata's release step: everything keyed to the object but the
     // route slot.
     void ReleaseObjectRecords(
-        metadata::Tenant& tenant, const std::shared_ptr<ObjectEntry>& entry,
-        ObjectMetadata& metadata, ObjectEntry::State& state,
+        metadata::Tenant& tenant, const ObjectEntry::WriteHold& hold,
         const TenantId& tenant_id, QuotaEraseMode quota_mode,
         const std::vector<std::string>& previous_media_hint);
     tl::expected<void, ErrorCode> SettlePrimaryWriteQuotaIfReady(
@@ -1494,33 +1491,26 @@ class MasterService {
 
     // Helper class for accessing metadata with automatic locking and cleanup
     //
-    // Resolves the tenant of `object_id` and the entry its route publishes for
-    // the key, then holds that entry exclusively for the accessor's scope, once
-    // it has re-checked under the hold that the route still publishes it. The
-    // entry lock is not recursive: nothing in the accessor's scope may reach
-    // the same key through another accessor.
+    // Resolves the tenant of `object_id` and write-holds the entry its route
+    // publishes for the key for the accessor's scope (see Tenant::WriteHold).
+    // The entry lock is not recursive: nothing in the accessor's scope may
+    // reach the same key through another accessor.
     class MetadataAccessorRW {
        public:
         MetadataAccessorRW(MasterService* service, ObjectIdentity object_id)
             : service_(service),
               object_id_(std::move(object_id)),
               tenant_(service_->tenants_.Lookup(object_id_.tenant_id)),
-              entry_(tenant_ == nullptr ? nullptr
-                                        : tenant_->Get(object_id_.user_key)) {
-            if (entry_ == nullptr) {
-                return;
-            }
-            hold_.emplace(*entry_);
-            if (!tenant_->IsPublishedObject(entry_)) {
-                hold_.reset();
-                entry_ = nullptr;
+              hold_(tenant_ == nullptr
+                        ? std::nullopt
+                        : tenant_->WriteHold(object_id_.user_key)) {
+            if (!hold_) {
                 return;
             }
             // Invalid memory replicas go first, which may tear the object
             // down.
             erased_ = !service_->CleanupInvalidMemoryReplicas(
-                object_id_.tenant_id, *tenant_, entry_, hold_->metadata(),
-                hold_->state());
+                object_id_.tenant_id, *tenant_, *hold_);
         }
 
         bool Exists() const {
@@ -1542,7 +1532,12 @@ class MasterService {
 
         metadata::Tenant& GetTenant() { return *tenant_; }
 
-        const std::shared_ptr<ObjectEntry>& GetEntry() const { return entry_; }
+        // The held entry; like `Get()`, only once something is held.
+        const std::shared_ptr<ObjectEntry>& GetEntry() const {
+            return hold_->handle();
+        }
+
+        const ObjectEntry::WriteHold& GetHold() const { return *hold_; }
 
         ObjectMetadata& Get() { return hold_->metadata(); }
 
@@ -1553,35 +1548,21 @@ class MasterService {
         }
 
         void Erase(const std::vector<std::string>& previous_media_hint = {}) {
-            (void)service_->EraseMetadata(*tenant_, entry_, hold_->metadata(),
-                                          hold_->state(), object_id_.tenant_id,
-                                          QuotaEraseMode::kFull,
-                                          previous_media_hint);
+            (void)service_->EraseMetadata(
+                *tenant_, *hold_, object_id_.tenant_id, QuotaEraseMode::kFull,
+                previous_media_hint);
             erased_ = true;
         }
 
-        // Lists the object with its tenant's in-flight work, once work has
-        // been started on it under this hold.
-        void TrackInFlight() {
-            tenant_->TrackInFlight(*entry_, hold_->state());
-        }
+        void EraseFromProcessing() { hold_->state().is_processing = false; }
 
-        void EraseFromProcessing() {
-            hold_->state().is_processing = false;
-            tenant_->UntrackIfIdle(*entry_, hold_->state());
-        }
-
-        void EraseReplicationTask() {
-            hold_->state().replication_task.reset();
-            tenant_->UntrackIfIdle(*entry_, hold_->state());
-        }
+        void EraseReplicationTask() { hold_->state().replication_task.reset(); }
 
        private:
         MasterService* service_;
         ObjectIdentity object_id_;
         std::shared_ptr<metadata::Tenant> tenant_;
-        std::shared_ptr<ObjectEntry> entry_;
-        std::optional<ObjectEntry::ExclusiveHold> hold_;
+        std::optional<ObjectEntry::Hold<LockMode::kWrite>> hold_;
         bool erased_{false};
     };
 
@@ -1637,17 +1618,9 @@ class MasterService {
                            ObjectIdentity object_id)
             : object_id_(std::move(object_id)),
               tenant_(service->tenants_.Lookup(object_id_.tenant_id)),
-              entry_(tenant_ == nullptr ? nullptr
-                                        : tenant_->Get(object_id_.user_key)) {
-            if (entry_ == nullptr) {
-                return;
-            }
-            hold_.emplace(*entry_);
-            if (!tenant_->IsPublishedObject(entry_)) {
-                hold_.reset();
-                entry_ = nullptr;
-            }
-        }
+              hold_(tenant_ == nullptr
+                        ? std::nullopt
+                        : tenant_->ReadHold(object_id_.user_key)) {}
 
         bool Exists() const {
             return IsPublished() && hold_->metadata().IsValid();
@@ -1662,7 +1635,10 @@ class MasterService {
 
         const metadata::Tenant& GetTenant() const { return *tenant_; }
 
-        const std::shared_ptr<ObjectEntry>& GetEntry() const { return entry_; }
+        // The held entry; like `Get()`, only once something is held.
+        const std::shared_ptr<ObjectEntry>& GetEntry() const {
+            return hold_->handle();
+        }
 
         const ObjectMetadata& Get() const { return hold_->metadata(); }
 
@@ -1671,8 +1647,7 @@ class MasterService {
        private:
         const ObjectIdentity object_id_;
         std::shared_ptr<metadata::Tenant> tenant_;
-        std::shared_ptr<ObjectEntry> entry_;
-        std::optional<ObjectEntry::SharedHold> hold_;
+        std::optional<ObjectEntry::Hold<LockMode::kRead>> hold_;
     };
 
     ViewVersionId view_version_;

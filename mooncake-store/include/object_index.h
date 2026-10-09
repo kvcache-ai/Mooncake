@@ -43,7 +43,7 @@ class ObjectIndex {
     // nullptr when the key is absent. The returned handle is strong, so it
     // keeps the entry alive after the stripe lock is released.
     [[nodiscard]] std::shared_ptr<ObjectEntry> Get(std::string_view key) const {
-        AssertNotWalking();
+        AssertNotInCursor();
         Stripe& stripe = StripeOf(key);
         std::shared_lock<std::shared_mutex> lock(stripe.lock);
         auto it = stripe.route.find(key);
@@ -62,7 +62,7 @@ class ObjectIndex {
     // so publishing the same instance twice is a caller bug rather than a
     // rejected duplicate.
     [[nodiscard]] bool Insert(std::shared_ptr<ObjectEntry> entry) {
-        AssertNotWalking();
+        AssertNotInCursor();
         assert(entry != nullptr);
         assert(!entry->IsPublished());
         Stripe& stripe = StripeOf(entry->key());
@@ -84,7 +84,7 @@ class ObjectIndex {
     // null one never matches.
     [[nodiscard]] bool EraseIf(std::string_view key,
                                const std::shared_ptr<ObjectEntry>& expected) {
-        AssertNotWalking();
+        AssertNotInCursor();
         Stripe& stripe = StripeOf(key);
         std::unique_lock<std::shared_mutex> lock(stripe.lock);
         const auto it = stripe.route.find(key);
@@ -98,7 +98,7 @@ class ObjectIndex {
     // True while the route publishes exactly `entry` for `key`.
     [[nodiscard]] bool IsCurrent(
         std::string_view key, const std::shared_ptr<ObjectEntry>& entry) const {
-        AssertNotWalking();
+        AssertNotInCursor();
         if (entry == nullptr) {
             return false;
         }
@@ -115,21 +115,21 @@ class ObjectIndex {
     // key of the same tenant is not affected.
     template <typename Fn>
     decltype(auto) WithExclusiveRoute(std::string_view key, Fn&& fn) {
-        AssertNotWalking();
+        AssertNotInCursor();
         Stripe& stripe = StripeOf(key);
         std::unique_lock<std::shared_mutex> lock(stripe.lock);
         return std::forward<Fn>(fn)(stripe.route);
     }
 
     [[nodiscard]] bool Contains(std::string_view key) const {
-        AssertNotWalking();
+        AssertNotInCursor();
         Stripe& stripe = StripeOf(key);
         std::shared_lock<std::shared_mutex> lock(stripe.lock);
         return stripe.route.contains(key);
     }
 
     [[nodiscard]] size_t ObjectCount() const {
-        AssertNotWalking();
+        AssertNotInCursor();
         size_t count = 0;
         for (const Stripe& stripe : stripes_) {
             std::shared_lock<std::shared_mutex> lock(stripe.lock);
@@ -140,7 +140,7 @@ class ObjectIndex {
 
     // True when no object is currently routed.
     [[nodiscard]] bool Empty() const {
-        AssertNotWalking();
+        AssertNotInCursor();
         for (const Stripe& stripe : stripes_) {
             std::shared_lock<std::shared_mutex> lock(stripe.lock);
             if (!stripe.route.empty()) {
@@ -150,99 +150,66 @@ class ObjectIndex {
         return true;
     }
 
-    // Collect strong handles to every object routed, one stripe at a time, for
-    // a caller that needs them all at once, such as one that orders them. A
-    // stripe's lock is released before its handles are returned, so a caller
-    // can take each entry's own mutex without holding a route lock, and the
-    // walk is per stripe rather than one point in time: callers use the result
-    // as the keys to resolve again. A scan that only visits each object once
-    // walks `Objects()` instead, which copies no handle.
-    [[nodiscard]] std::vector<std::shared_ptr<ObjectEntry>> SnapshotObjects()
-        const {
-        AssertNotWalking();
-        // The stripes are counted first so the handles are copied into one
-        // allocation: reserving per stripe would reallocate and copy the whole
-        // vector once per stripe.
-        size_t total = 0;
-        for (const Stripe& stripe : stripes_) {
-            std::shared_lock<std::shared_mutex> lock(stripe.lock);
-            total += stripe.route.size();
-        }
-        std::vector<std::shared_ptr<ObjectEntry>> entries;
-        entries.reserve(total);
-        for (const Stripe& stripe : stripes_) {
-            std::shared_lock<std::shared_mutex> lock(stripe.lock);
-            for (const auto& entry : stripe.route) {
-                entries.push_back(entry.second);
-            }
-        }
-        return entries;
-    }
+    template <LockMode kMode>
+    class Cursor;
 
-    template <bool kExclusive>
-    class Walk;
-
-    // Every routed object in turn, under its own lock: shared here, exclusive
-    // for `MutableObjects()`, which may change an object's metadata and state
-    // but not the route. Use it as a range:
+    // A cursor over every routed object, each visited under its own read or
+    // write lock. The route itself is only ever read: a write cursor may change
+    // an object's metadata and state, never which objects are routed. Use it
+    // as a range:
     //
-    //     for (auto object : index.Objects()) { ... object.metadata() ... }
+    //     for (auto object : index.ReadCursor()) { ... object.metadata() ... }
     //
     // Each object is visited at most once, while the route still publishes
-    // it, and the walk is per stripe rather than one point in time: an object
-    // published or dropped meanwhile may or may not be seen.
+    // it, and the cursor moves one stripe at a time rather than reading one
+    // point in time: an object published or dropped meanwhile may or may not
+    // be seen.
     //
-    // The walk holds the stripe's lock across the loop body, so no handle is
+    // The cursor holds the stripe's lock across the loop body, so no handle is
     // copied, and an entry it visits from there is current without a second
     // lookup. The body therefore must not reach any route, through this index
     // or another (debug builds assert it), nor block on a lock whose holder
     // may be waiting on a route.
-    [[nodiscard]] Walk<false> Objects() const { return Walk<false>(*this); }
-    [[nodiscard]] Walk<true> MutableObjects() { return Walk<true>(*this); }
+    [[nodiscard]] Cursor<LockMode::kRead> ReadCursor() const {
+        return Cursor<LockMode::kRead>(*this);
+    }
+    [[nodiscard]] Cursor<LockMode::kWrite> WriteCursor() {
+        return Cursor<LockMode::kWrite>(*this);
+    }
 
-    // The single-pass range behind `Objects()` and `MutableObjects()`. It owns
-    // the locks of the position it stands on, so it is neither copyable nor
-    // movable, and leaving the loop early releases them.
+    // The single-pass cursor behind `ReadCursor()` and `WriteCursor()`. It
+    // owns the locks of the position it stands on, so it is neither copyable
+    // nor movable, and leaving the loop early releases them.
     //
-    // The lock order is entry, then route, so while it holds a stripe the walk
-    // only tries an entry's lock: an entry busy elsewhere, which may be a
-    // teardown waiting on this very stripe, is set aside and visited after the
-    // stripe walk, under a lock it waits for and a route check of its own.
+    // The lock order is entry, then route, so while it holds a stripe the
+    // cursor only tries an entry's lock: an entry busy elsewhere, which may be
+    // a teardown waiting on this very stripe, is set aside and visited after
+    // the stripes, under a lock it waits for and a route check of its own.
     // Since TearDownObject claims an entry and drops its slot under one hold
-    // of the entry, an entry still in the stripe whose lock the walk obtained
-    // has not been torn down.
-    template <bool kExclusive>
-    class Walk {
+    // of the entry, an entry still in the stripe whose lock the cursor
+    // obtained has not been torn down.
+    template <LockMode kMode>
+    class Cursor {
+        static constexpr bool kWrite = kMode == LockMode::kWrite;
         using EntryLock =
-            std::conditional_t<kExclusive, std::unique_lock<std::shared_mutex>,
+            std::conditional_t<kWrite, std::unique_lock<std::shared_mutex>,
                                std::shared_lock<std::shared_mutex>>;
         using Index =
-            std::conditional_t<kExclusive, ObjectIndex, const ObjectIndex>;
+            std::conditional_t<kWrite, ObjectIndex, const ObjectIndex>;
 
        public:
-        // The object a position stands on, valid until the walk advances.
-        class Object {
+        // The object a position stands on, valid until the cursor advances.
+        // It reads like a hold of the same mode; the cursor keeps the lock.
+        class Object : public ObjectEntry::LockedAccess<Object, kMode> {
            public:
-            using Metadata = std::conditional_t<kExclusive, ObjectMetadata,
-                                                const ObjectMetadata>;
-            using State = std::conditional_t<kExclusive, ObjectEntry::State,
-                                             const ObjectEntry::State>;
-
-            // A copy keeps the entry beyond the walk; acting on it then is
+            // A copy keeps the entry beyond the cursor; acting on it then is
             // an ordinary handle access that checks the route again.
             const std::shared_ptr<ObjectEntry>& handle() const {
                 return handle_;
             }
-            const std::string& key() const { return handle_->key(); }
-            Metadata& metadata() const NO_THREAD_SAFETY_ANALYSIS {
-                return *handle_->metadata_;
-            }
-            State& state() const NO_THREAD_SAFETY_ANALYSIS {
-                return handle_->state_;
-            }
 
            private:
-            friend class Walk;
+            friend class Cursor;
             explicit Object(const std::shared_ptr<ObjectEntry>& handle)
                 : handle_(handle) {}
             const std::shared_ptr<ObjectEntry>& handle_;
@@ -252,24 +219,24 @@ class ObjectIndex {
 
         class Iterator {
            public:
-            Object operator*() const { return Object(*walk_->current_); }
+            Object operator*() const { return Object(*cursor_->current_); }
             Iterator& operator++() {
-                walk_->Advance();
+                cursor_->Advance();
                 return *this;
             }
             bool operator!=(Sentinel) const {
-                return walk_->current_ != nullptr;
+                return cursor_->current_ != nullptr;
             }
 
            private:
-            friend class Walk;
-            explicit Iterator(Walk* walk) : walk_(walk) {}
-            Walk* walk_;
+            friend class Cursor;
+            explicit Iterator(Cursor* cursor) : cursor_(cursor) {}
+            Cursor* cursor_;
         };
 
-        Walk(const Walk&) = delete;
-        Walk& operator=(const Walk&) = delete;
-        ~Walk() {
+        Cursor(const Cursor&) = delete;
+        Cursor& operator=(const Cursor&) = delete;
+        ~Cursor() {
             entry_lock_ = EntryLock();
             ReleaseStripe();
         }
@@ -280,7 +247,7 @@ class ObjectIndex {
        private:
         friend class ObjectIndex;
 
-        explicit Walk(Index& index) : index_(index) { Settle(); }
+        explicit Cursor(Index& index) : index_(index) { Settle(); }
 
         void Advance() {
             entry_lock_ = EntryLock();
@@ -298,10 +265,10 @@ class ObjectIndex {
             for (; stripe_ < kStripeCount; ++stripe_) {
                 const Stripe& stripe = index_.stripes_[stripe_];
                 if (!stripe_lock_.owns_lock()) {
-                    AssertNotWalking();
+                    AssertNotInCursor();
                     stripe_lock_ =
                         std::shared_lock<std::shared_mutex>(stripe.lock);
-                    ++walking_;
+                    ++cursor_stripes_;
                     route_it_ = stripe.route.begin();
                 }
                 for (; route_it_ != stripe.route.end(); ++route_it_) {
@@ -333,7 +300,7 @@ class ObjectIndex {
         void ReleaseStripe() {
             if (stripe_lock_.owns_lock()) {
                 stripe_lock_.unlock();
-                --walking_;
+                --cursor_stripes_;
             }
         }
 
@@ -341,7 +308,7 @@ class ObjectIndex {
         size_t stripe_ = 0;
         std::shared_lock<std::shared_mutex> stripe_lock_;
         typename RouteMap::const_iterator route_it_;
-        // Entries that were busy when their stripe was walked.
+        // Entries that were busy when the cursor passed their stripe.
         std::vector<std::shared_ptr<ObjectEntry>> deferred_;
         size_t deferred_pos_ = 0;
         EntryLock entry_lock_;
@@ -357,13 +324,15 @@ class ObjectIndex {
         RouteMap route;
     };
 
-    // How many stripe locks this thread holds for a walk. A route access made
-    // while one is held is the walk body reaching a route, which can deadlock
-    // against a writer that holds an entry and waits on that stripe.
-    static inline thread_local int walking_ = 0;
+    // How many stripe locks this thread holds for a cursor. A route access
+    // made while one is held is the cursor's loop body reaching a route, which
+    // can deadlock against a writer that holds an entry and waits on that
+    // stripe.
+    static inline thread_local int cursor_stripes_ = 0;
 
-    static void AssertNotWalking() {
-        assert(walking_ == 0 && "route access from inside an object walk");
+    static void AssertNotInCursor() {
+        assert(cursor_stripes_ == 0 &&
+               "route access from inside an object cursor");
     }
 
     [[nodiscard]] static size_t StripeIndex(std::string_view key) {
