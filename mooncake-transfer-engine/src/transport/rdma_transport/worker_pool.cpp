@@ -805,7 +805,8 @@ int WorkerPool::performPollCq(int thread_id, bool defer_local_redispatch) {
     }
 
     int wr_retired = 0;
-    const bool use_fifo = globalConfig().rdma_signal_interval > 1;
+    const bool use_fifo =
+        useRdmaPostedFifo(globalConfig().rdma_signal_interval);
     std::vector<Transport::Slice *> drained;
     drained.reserve(kPollCount);
     for (int i = 0; i < nr_poll; ++i) {
@@ -821,14 +822,15 @@ int WorkerPool::performPollCq(int thread_id, bool defer_local_redispatch) {
             // Stale CQE for a WR already retired by an earlier CQE. Do not
             // complete the slice again and do not charge cq_outstanding:
             // that WR was subtracted when it left the FIFO.
-            if (n == 0) continue;
+            if (wrRetiredByCqe(true, true, n) == 0) continue;
         } else {
             drained.push_back(completed);
             if (completed->rdma.qp_depth)
                 completed->rdma.qp_depth->fetch_sub(1,
                                                     std::memory_order_acq_rel);
         }
-        wr_retired += static_cast<int>(drained.size());
+        wr_retired +=
+            static_cast<int>(wrRetiredByCqe(use_fifo, true, drained.size()));
         if (globalConfig().track_rdma_posted_slices) {
             std::lock_guard<std::mutex> lock(posted_slices_mutex_);
             for (auto *slice : drained) posted_slices_.erase(slice);

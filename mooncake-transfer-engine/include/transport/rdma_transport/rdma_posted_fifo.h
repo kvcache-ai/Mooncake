@@ -38,6 +38,21 @@ inline bool shouldSignalRdmaWr(int unsignaled_since, int interval, int max_wr,
     return last_in_chain;
 }
 
+// interval==1 (and invalid <=1) keeps the historical 1:1 CQE path: no FIFO.
+inline bool useRdmaPostedFifo(int signal_interval) {
+    return signal_interval > 1;
+}
+
+// How many WRs this CQE retires for cq_outstanding.
+// Null wr_id: 0. No FIFO: 1 per non-null CQE. FIFO miss (stale): 0.
+// FIFO hit: drained_n (the prefix through this CQE).
+inline size_t wrRetiredByCqe(bool use_fifo, bool has_completed,
+                             size_t drained_n) {
+    if (!has_completed) return 0;
+    if (!use_fifo) return 1;
+    return drained_n;
+}
+
 // Pop posting-order WRs covered by this CQE. Failed and flushed WRs generate
 // a CQE even without IBV_SEND_SIGNALED, so the tail stays in the FIFO for
 // those later CQEs. On success the unsignaled prefix completed in RC order

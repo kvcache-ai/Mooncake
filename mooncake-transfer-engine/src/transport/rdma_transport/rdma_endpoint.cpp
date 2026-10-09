@@ -1320,7 +1320,7 @@ int RdmaEndPoint::submitPostSend(
                        cq_outstanding_->load(std::memory_order_relaxed);
     if (cq_remaining <= 0) return 0;
     const int signal_interval = globalConfig().rdma_signal_interval;
-    const bool use_fifo = signal_interval > 1;
+    const bool use_fifo = useRdmaPostedFifo(signal_interval);
 
     // Charge every posted WR to CQ depth. A failed/flushed WR generates a
     // CQE even without IBV_SEND_SIGNALED, so unsignaled posts cannot exceed

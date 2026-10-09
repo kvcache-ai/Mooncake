@@ -25,6 +25,8 @@ using mooncake::collectPostedFifo;
 using mooncake::DrainedSliceStatus;
 using mooncake::drainedSliceStatus;
 using mooncake::shouldSignalRdmaWr;
+using mooncake::useRdmaPostedFifo;
+using mooncake::wrRetiredByCqe;
 
 TEST(ShouldSignalRdmaWr, IntervalOneSignalsEveryWr) {
     EXPECT_TRUE(shouldSignalRdmaWr(0, 1, 256, false));
@@ -110,6 +112,61 @@ TEST(DrainedSliceStatus, AlreadyErroredPrefixIsFlushErr) {
               DrainedSliceStatus::kFlushErr);
     EXPECT_EQ(drainedSliceStatus(false, true, true, 0, 2),
               DrainedSliceStatus::kFlushErr);
+}
+
+TEST(DrainedSliceStatus, SequenceSuccessFirstErrorThenFlush) {
+    // One QP, three CQEs: success, first real error, then flush after error.
+    struct Event {
+        bool success;
+        bool flush;
+        size_t drained_n;
+    };
+    const Event events[] = {
+        {true, false, 2},
+        {false, false, 2},
+        {false, true, 2},
+    };
+    bool qp_errored = false;
+    std::vector<DrainedSliceStatus> got;
+    for (const auto &e : events) {
+        const bool already = qp_errored;
+        for (size_t j = 0; j < e.drained_n; ++j) {
+            got.push_back(drainedSliceStatus(e.success, e.flush, already, j,
+                                             e.drained_n));
+        }
+        if (!e.success) qp_errored = true;
+    }
+    ASSERT_EQ(got.size(), 6u);
+    EXPECT_EQ(got[0], DrainedSliceStatus::kSuccess);
+    EXPECT_EQ(got[1], DrainedSliceStatus::kKeepCqe);
+    EXPECT_EQ(got[2], DrainedSliceStatus::kSuccess);
+    EXPECT_EQ(got[3], DrainedSliceStatus::kKeepCqe);
+    EXPECT_EQ(got[4], DrainedSliceStatus::kFlushErr);
+    EXPECT_EQ(got[5], DrainedSliceStatus::kKeepCqe);
+    EXPECT_TRUE(qp_errored);
+}
+
+TEST(UseRdmaPostedFifo, IntervalOneSkipsFifo) {
+    EXPECT_FALSE(useRdmaPostedFifo(1));
+    EXPECT_FALSE(useRdmaPostedFifo(0));
+    EXPECT_TRUE(useRdmaPostedFifo(2));
+    EXPECT_TRUE(useRdmaPostedFifo(32));
+}
+
+TEST(WrRetiredByCqe, IntervalOneEqualsNonNullCqeCount) {
+    EXPECT_EQ(wrRetiredByCqe(false, false, 99), 0u);
+    EXPECT_EQ(wrRetiredByCqe(false, true, 99), 1u);
+    const bool has_completed[] = {true, true, false, true};
+    size_t retired = 0;
+    for (bool has : has_completed)
+        retired += wrRetiredByCqe(/*use_fifo=*/false, has, /*drained_n=*/4);
+    EXPECT_EQ(retired, 3u);
+}
+
+TEST(WrRetiredByCqe, FifoHitRetiresPrefixStaleRetiresZero) {
+    EXPECT_EQ(wrRetiredByCqe(true, true, 0), 0u);
+    EXPECT_EQ(wrRetiredByCqe(true, true, 4), 4u);
+    EXPECT_EQ(wrRetiredByCqe(true, false, 4), 0u);
 }
 
 class SignalIntervalEnvTest : public ::testing::Test {
