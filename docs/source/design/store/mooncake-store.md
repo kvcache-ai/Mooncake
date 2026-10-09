@@ -57,24 +57,12 @@ The cluster's available resources are viewed as a large resource pool, managed c
 
 ### Snapshot & Restore
 
-```{warning}
-The legacy Master-generated snapshot and restore path has been removed. HA
-recovery uses the standby-generated batch OpLog snapshot path.
-```
-
-To reduce cache warm-up time after a master restart, the Master Service supports periodic snapshots of its in-memory metadata and recovery from these snapshots.
-
-- Snapshot generation
-  - A background snapshot thread periodically takes a consistent copy of the in-memory KV metadata, segment information, and allocator state using fork-based copy-on-write, without blocking normal RPC handling.
-  - The child process serializes these structures into a compact binary format and writes them to the configured snapshot backend via the `SerializerBackend` abstraction.
-- Restore
-  - On startup, when snapshot restore is enabled, the master reads the latest snapshot from the backend and reconstructs the Master Service's metadata state in memory.
-- Notes
-  - Because snapshots are taken periodically rather than continuously, metadata changes after the last successful snapshot may be lost if the master fails before the next snapshot completes.
-
-> **Warning: Managed Storage**
->
-> The snapshot storage location is **exclusively managed** by the Mooncake snapshot system. Old snapshots are automatically deleted during cleanup. **DO NOT store other files in this location.** Use a dedicated, isolated storage for snapshots.
+HA recovery uses standby-generated batch OpLog snapshots. The standby captures
+object metadata, segment state, and weight metadata at a durable OpLog cursor,
+writes immutable chunk and manifest artifacts to the configured object store,
+and publishes `latest` and `fallback` control pointers. A standby or a newly
+elected Master restores the newest valid baseline and replays the remaining
+batch OpLog suffix before serving.
 
 ### Tenant Quota
 
