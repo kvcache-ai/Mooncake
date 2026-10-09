@@ -14,6 +14,9 @@
 
 #include "config.h"
 
+#include "bool_parser.h"
+#include "integer_parser.h"
+
 #include "glog_compat.h"
 
 #include <charconv>
@@ -679,6 +682,35 @@ void loadGlobalConfig(GlobalConfig& config) {
             LOG(WARNING) << "Invalid MC_EFA_NIC_SELECTION environment value: "
                          << efa_nic_selection
                          << ", expected all|local, keeping default";
+        }
+    }
+
+    if (const char* value = std::getenv("MC_EFA_CQ_THREADS")) {
+        const auto parsed = TryParseInteger<int>(
+            value, {.trim_ascii_whitespace = true, .allow_leading_plus = true});
+        if (parsed.has_value()) {
+            config.efa_cq_threads = *parsed;
+        } else {
+            LOG(WARNING) << "Invalid MC_EFA_CQ_THREADS environment value: "
+                         << value << ", keeping default "
+                         << config.efa_cq_threads;
+        }
+    }
+
+    for (const auto& [env_name, field] :
+         {std::pair{"WITH_NVIDIA_PEERMEM", &config.with_nvidia_peermem},
+          std::pair{"MC_RDMA_DATA_DIRECT", &config.rdma_data_direct}}) {
+        const char* value = std::getenv(env_name);
+        if (value == nullptr) {
+            continue;
+        }
+        const auto parsed = TryParseBool(value);
+        if (parsed.has_value()) {
+            *field = *parsed;
+        } else {
+            LOG(WARNING) << "Invalid " << env_name
+                         << " environment value: " << value
+                         << ", keeping default " << *field;
         }
     }
 
