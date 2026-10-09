@@ -325,6 +325,26 @@ struct RpcNameTraits<&WrappedMasterService::QueryTask> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::CreateDrainJob> {
+    static constexpr const char* value = "CreateDrainJob";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::QueryDrainJob> {
+    static constexpr const char* value = "QueryDrainJob";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::CancelDrainJob> {
+    static constexpr const char* value = "CancelDrainJob";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::QuerySegmentStatus> {
+    static constexpr const char* value = "QuerySegmentStatus";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::FetchTasks> {
     static constexpr const char* value = "FetchTasks";
 };
@@ -1016,6 +1036,17 @@ tl::expected<std::string, ErrorCode> MasterClient::GetFsdir() {
     return result;
 }
 
+tl::expected<SegmentStatus, ErrorCode> MasterClient::QuerySegmentStatus(
+    const std::string& segment_name) {
+    ScopedVLogTimer timer(1, "MasterClient::QuerySegmentStatus");
+    timer.LogRequest("segment_name=", segment_name);
+    auto result =
+        invoke_rpc<&WrappedMasterService::QuerySegmentStatus, SegmentStatus>(
+            segment_name);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
 tl::expected<SegmentStatus, ErrorCode> MasterClient::QuerySegmentStatusById(
     const UUID& segment_id) {
     ScopedVLogTimer timer(1, "MasterClient::QuerySegmentStatusById");
@@ -1275,6 +1306,38 @@ tl::expected<QueryTaskResponse, ErrorCode> MasterClient::QueryTask(
     auto result =
         invoke_rpc<&WrappedMasterService::QueryTask, QueryTaskResponse>(
             task_id);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<UUID, ErrorCode> MasterClient::CreateDrainJob(
+    const CreateDrainJobRequest& request) {
+    ScopedVLogTimer timer(1, "MasterClient::CreateDrainJob");
+    timer.LogRequest("segments_count=", request.segments.size(),
+                     ", target_segments_count=", request.target_segments.size(),
+                     ", max_concurrency=", request.max_concurrency);
+    auto result =
+        invoke_rpc<&WrappedMasterService::CreateDrainJob, UUID>(request);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<QueryJobResponse, ErrorCode> MasterClient::QueryDrainJob(
+    const UUID& job_id) {
+    ScopedVLogTimer timer(1, "MasterClient::QueryDrainJob");
+    timer.LogRequest("job_id=", job_id);
+    auto result =
+        invoke_rpc<&WrappedMasterService::QueryDrainJob, QueryJobResponse>(
+            job_id);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<void, ErrorCode> MasterClient::CancelDrainJob(const UUID& job_id) {
+    ScopedVLogTimer timer(1, "MasterClient::CancelDrainJob");
+    timer.LogRequest("job_id=", job_id);
+    auto result =
+        invoke_rpc<&WrappedMasterService::CancelDrainJob, void>(job_id);
     timer.LogResponseExpected(result);
     return result;
 }
