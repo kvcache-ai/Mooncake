@@ -78,6 +78,11 @@ DEFINE_string(qos_output_jsonl, "",
 DEFINE_string(result_output_jsonl, "",
               "Append versioned benchmark result records, including "
               "per-target metrics, to this JSONL file.");
+DEFINE_string(
+    split_output_jsonl, "",
+    "Initiator only: append one JSONL line per transfer with submit_us, "
+    "wait_us, and polls. Empty (default) disables the log: no extra timers "
+    "and no I/O. Enable to split Avg Tx into submit vs completion wait.");
 DEFINE_uint64(request_interval_us, 0,
               "Per-thread delay before issuing each transfer batch, in "
               "microseconds. 0 disables pacing.");
@@ -103,7 +108,7 @@ DEFINE_int32(
 DEFINE_string(xport_type, "",
               "Transport type: "
               "rdma|tcp|hp_tcp|shm|mnnvl|nvlink|gds|iouring|ub|sunrise_link|"
-              "mpcomm|flagcx");
+              "mpcomm|flagcx|efa|fabric");
 DEFINE_string(backend, "tent", "Transport backend: classic|tent");
 DEFINE_bool(use_hugepage, false,
             "classic DRAM: SHM allocates on hugetlbfs; RDMA allocates with "
@@ -123,7 +128,7 @@ DEFINE_bool(notifi, false,
 DEFINE_string(tent_transport_hint, "unspec",
               "tent only: per-request transport_hint. "
               "unspec|rdma|tcp|hp_tcp|shm|nvlink|gds|io_uring|mnnvl|ascend|"
-              "ub|sunrise_link|mpcomm");
+              "ub|sunrise_link|mpcomm|fabric");
 DEFINE_string(tent_intent_type, "unspec",
               "tent only: intent_type attached to every benchmark request. "
               "unspec|foreground_get|background_prefetch|migration|checkpoint|"
@@ -154,6 +159,7 @@ std::string XferBenchConfig::workload_classes_json;
 double XferBenchConfig::qos_link_capacity_gbps = 0.0;
 std::string XferBenchConfig::qos_output_jsonl;
 std::string XferBenchConfig::result_output_jsonl;
+std::string XferBenchConfig::split_output_jsonl;
 uint64_t XferBenchConfig::request_interval_us = 0;
 uint64_t XferBenchConfig::deadline_us = 0;
 int XferBenchConfig::deadline_tight_threads = 0;
@@ -242,6 +248,7 @@ void XferBenchConfig::loadFromFlags() {
     qos_link_capacity_gbps = FLAGS_qos_link_capacity_gbps;
     qos_output_jsonl = FLAGS_qos_output_jsonl;
     result_output_jsonl = FLAGS_result_output_jsonl;
+    split_output_jsonl = FLAGS_split_output_jsonl;
     request_interval_us = FLAGS_request_interval_us;
     deadline_us = FLAGS_deadline_us;
     deadline_tight_threads = FLAGS_deadline_tight_threads;

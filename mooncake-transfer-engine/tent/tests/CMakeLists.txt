@@ -188,6 +188,17 @@ target_include_directories(local_notification_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME local_notification_test COMMAND local_notification_test)
 
+# Notification fallback: an unavailable RDMA notification channel falls back
+# to the next transport and then to the control-plane RPC, and receive drains
+# every transport. Loopback only, no NIC required.
+add_executable(tent_notification_fallback_test notification_fallback_test.cpp)
+target_link_libraries(tent_notification_fallback_test
+                      PRIVATE gtest gtest_main tent_link_group)
+target_include_directories(tent_notification_fallback_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_notification_fallback_test
+         COMMAND tent_notification_fallback_test)
+
 add_executable(transfer_engine_config_override_test
                transfer_engine_config_override_test.cpp)
 target_link_libraries(transfer_engine_config_override_test
@@ -726,6 +737,25 @@ if(USE_XPU)
   target_include_directories(tent_xpu_platform_test
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
   add_test(NAME tent_xpu_platform_test COMMAND tent_xpu_platform_test)
+
+  # XPU staging transport test: drives XpuTransport's VRAM<->host staging hop
+  # through the active XpuPlatform (Platform::getLoader()). Like the platform
+  # test it links libsycl via tent_link_group and skips when no SYCL device is
+  # visible.
+  add_executable(tent_xpu_transport_test xpu/xpu_transport_test.cpp)
+  target_link_libraries(tent_xpu_transport_test PRIVATE gtest gtest_main
+                                                        tent_link_group)
+  target_include_directories(tent_xpu_transport_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_xpu_transport_test COMMAND tent_xpu_transport_test)
+
+  add_executable(tent_xpu_engine_test xpu/xpu_engine_test.cpp)
+  target_link_libraries(tent_xpu_engine_test PRIVATE gtest gtest_main
+                                                     tent_link_group)
+  target_include_directories(tent_xpu_engine_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_xpu_engine_test COMMAND tent_xpu_engine_test)
+  set_tests_properties(tent_xpu_engine_test PROPERTIES TIMEOUT 300)
 endif()
 
 # NOT registered via add_test: the test needs a real CUDA device (it exports a
@@ -778,3 +808,37 @@ target_include_directories(tent_segment_desc_retry_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_segment_desc_retry_test COMMAND tent_segment_desc_retry_test)
 set_tests_properties(tent_segment_desc_retry_test PROPERTIES TIMEOUT 60)
+
+# Fabric transport: attribute codec and slicing math, plus end-to-end cases on
+# libfabric's tcp;ofi_rxm provider (no fabric hardware needed). Each e2e case
+# forks a server before the client engine starts, so it runs in its own
+# process.
+if(TARGET tent_xport_fabric)
+  add_executable(tent_fabric_attrs_test fabric_attrs_test.cpp)
+  target_link_libraries(tent_fabric_attrs_test PRIVATE gtest gtest_main
+                                                       tent_link_group)
+  target_include_directories(tent_fabric_attrs_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_fabric_attrs_test COMMAND tent_fabric_attrs_test)
+
+  add_executable(tent_fabric_transport_test fabric_transport_test.cpp)
+  target_link_libraries(tent_fabric_transport_test PRIVATE gtest gtest_main
+                                                           tent_link_group)
+  target_include_directories(tent_fabric_transport_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  foreach(
+    case
+    WriteThenRead
+    SmallUnalignedTransfers
+    TransfersStraddleChunks
+    LoopbackToOwnSegment
+    UnregisteredTargetIsRejected
+    PeerLossFails
+    QueuedOpFailsWhileCreditIsHeld
+    OverdueOpHoldsTaskAndBuffer)
+    add_test(NAME tent_fabric_transport_${case}
+             COMMAND tent_fabric_transport_test
+                     --gtest_filter=FabricTransportTest.${case})
+    set_tests_properties(tent_fabric_transport_${case} PROPERTIES TIMEOUT 120)
+  endforeach()
+endif()

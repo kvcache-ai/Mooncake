@@ -317,6 +317,9 @@ class InMemoryStore:
         self.range_get_calls = 0
         self.range_sizes: list[int] = []
         self.range_batch_sizes: list[int] = []
+        self.snapshot_prepare_calls = 0
+        self.snapshot_get_calls = 0
+        self.snapshot_key_sets: list[tuple[str, ...]] = []
         self.exist_batch_sizes: list[int] = []
         self.register_result = 0
         self.removed_keys: list[str] = []
@@ -420,6 +423,29 @@ class InMemoryStore:
         self.processing_keys.discard(key)
         self.group_ids.pop(key, None)
         return 0
+
+    def prepare_get_into_ranges_snapshot(self, keys: list[str]) -> tuple[str, ...]:
+        self.calls.append("prepare_get_into_ranges_snapshot")
+        self.snapshot_prepare_calls += 1
+        snapshot = tuple(keys)
+        self.snapshot_key_sets.append(snapshot)
+        return snapshot
+
+    def get_into_ranges_from_snapshot(
+        self,
+        snapshot: tuple[str, ...],
+        addresses: list[int],
+        all_keys: list[list[str]],
+        all_dst_offsets: list[list[list[int]]],
+        all_src_offsets: list[list[list[int]]],
+        all_sizes: list[list[list[int]]],
+    ) -> list[list[list[int]]]:
+        self.calls.append("get_into_ranges_from_snapshot")
+        self.snapshot_get_calls += 1
+        assert all(key in snapshot for keys in all_keys for key in keys)
+        return self.get_into_ranges(
+            addresses, all_keys, all_dst_offsets, all_src_offsets, all_sizes
+        )
 
     def get_into_ranges(
         self,

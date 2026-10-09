@@ -24,6 +24,13 @@ if(USE_TENT)
 endif()
 add_test(NAME transport_uint_test COMMAND transport_uint_test)
 
+# Hardware-free checks that updateGlobalConfig() clamps the RD-atomic depths to
+# the device's advertised limits; no RDMA device required.
+add_executable(rdma_atomic_cap_test ${WORKSPACE}/rdma_atomic_cap_test.cpp)
+target_link_libraries(rdma_atomic_cap_test PUBLIC transfer_engine gtest
+                                                  gtest_main)
+add_test(NAME rdma_atomic_cap_test COMMAND rdma_atomic_cap_test)
+
 # Hardware-free tests for FlagCX transport range and descriptor validation.
 add_executable(flagcx_transport_internal_test
                ${WORKSPACE}/flagcx_transport_internal_test.cpp)
@@ -108,6 +115,14 @@ target_link_libraries(sender_credit_test PUBLIC transfer_engine gtest
                                                 gtest_main)
 add_test(NAME sender_credit_test COMMAND sender_credit_test)
 
+# Ordinary RDMA notifications; independent of the CtrlChannel tests below.
+add_executable(rdma_native_notify_test ${WORKSPACE}/rdma_native_notify_test.cpp)
+target_link_libraries(rdma_native_notify_test PUBLIC transfer_engine gtest
+                                                     gtest_main)
+add_test(NAME rdma_native_notify_test COMMAND rdma_native_notify_test)
+set_tests_properties(rdma_native_notify_test PROPERTIES LABELS "rdma" TIMEOUT
+                                                        120)
+
 # CtrlChannel RDMA notify correctness. Self-skips without RDMA.
 add_executable(rdma_notify_test ${WORKSPACE}/rdma_notify_test.cpp)
 target_link_libraries(rdma_notify_test PUBLIC transfer_engine gflags::gflags
@@ -123,7 +138,8 @@ target_link_libraries(rdma_endpoint_reestablish_test PUBLIC transfer_engine
 if(UNIX AND NOT APPLE)
   target_link_options(
     rdma_endpoint_reestablish_test PRIVATE "-Wl,--wrap=ibv_modify_qp"
-    "-Wl,--wrap=ibv_query_gid" "-Wl,--wrap=_ibv_query_gid_ex")
+    "-Wl,--wrap=ibv_query_qp" "-Wl,--wrap=ibv_query_gid"
+    "-Wl,--wrap=_ibv_query_gid_ex")
 endif()
 add_test(NAME rdma_endpoint_reestablish_test
          COMMAND rdma_endpoint_reestablish_test)
@@ -223,12 +239,45 @@ add_executable(dmabuf_export_test ${WORKSPACE}/dmabuf_export_test.cpp)
 target_link_libraries(dmabuf_export_test PUBLIC transfer_engine gtest
                                                 gtest_main)
 add_test(NAME dmabuf_export_test COMMAND dmabuf_export_test)
+if(USE_CUDA AND NOT USE_HIP)
+  # GPU sub-range export test (skipped at runtime without a CUDA device).
+  # WITH_NVIDIA_PEERMEM defaults to true, which selects ibv_reg_mr instead of
+  # the DMA-BUF export under test.
+  target_include_directories(dmabuf_export_test
+                             PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+  target_link_libraries(dmabuf_export_test PUBLIC CUDA::cudart)
+  set_tests_properties(dmabuf_export_test PROPERTIES ENVIRONMENT
+                                                     "WITH_NVIDIA_PEERMEM=0")
+endif()
 
 if(USE_MNNVL)
   add_executable(nvlink_transport_test ${WORKSPACE}/nvlink_transport_test.cpp)
   target_link_libraries(nvlink_transport_test PUBLIC transfer_engine gtest
                                                      gtest_main)
-  add_test(NAME nvlink_transport_test COMMAND nvlink_transport_test)
+  add_test(NAME nvlink_transport_test
+           COMMAND ${CMAKE_COMMAND} -E env GTEST_FILTER=NvlinkTransportTest.*
+                   $<TARGET_FILE:nvlink_transport_test>)
+  set_tests_properties(nvlink_transport_test PROPERTIES LABELS "nvlink_gpu")
+
+  if(USE_CUDA AND NOT USE_HIP)
+    add_test(
+      NAME nvlink_host_numa_registration_test
+      COMMAND
+        ${CMAKE_COMMAND} -E env --unset=MC_USE_NVLINK_IPC
+        GTEST_FILTER=NvlinkHostNumaRegistrationTest.*
+        $<TARGET_FILE:nvlink_transport_test>)
+    set_tests_properties(nvlink_host_numa_registration_test
+                         PROPERTIES LABELS "nvlink_vmm_unit")
+
+    add_executable(nvlink_host_numa_allocation_test
+                   ${WORKSPACE}/nvlink_host_numa_allocation_test.cpp)
+    target_link_libraries(nvlink_host_numa_allocation_test
+                          PUBLIC transfer_engine gtest gtest_main)
+    add_test(NAME nvlink_host_numa_allocation_test
+             COMMAND nvlink_host_numa_allocation_test)
+    set_tests_properties(nvlink_host_numa_allocation_test
+                         PROPERTIES LABELS "nvlink_vmm_unit")
+  endif()
 endif()
 
 if(USE_HIP)
@@ -412,6 +461,12 @@ target_link_libraries(rdma_context_reprobe_test PUBLIC transfer_engine gtest
                                                        gtest_main)
 add_test(NAME rdma_context_reprobe_test COMMAND rdma_context_reprobe_test)
 
+add_executable(rdma_memory_location_test
+               ${WORKSPACE}/rdma_memory_location_test.cpp)
+target_link_libraries(rdma_memory_location_test PUBLIC transfer_engine gtest
+                                                       gtest_main)
+add_test(NAME rdma_memory_location_test COMMAND rdma_memory_location_test)
+
 add_executable(rdma_transport_submit_task_test
                ${WORKSPACE}/rdma_transport_submit_task_test.cpp)
 target_link_libraries(rdma_transport_submit_task_test PUBLIC transfer_engine
@@ -424,6 +479,17 @@ add_executable(rdma_buffer_range_index_test
 target_link_libraries(rdma_buffer_range_index_test PUBLIC transfer_engine gtest
                                                           gtest_main)
 add_test(NAME rdma_buffer_range_index_test COMMAND rdma_buffer_range_index_test)
+
+add_executable(rdma_batch_reuse_test ${WORKSPACE}/rdma_batch_reuse_test.cpp)
+target_link_libraries(rdma_batch_reuse_test PUBLIC transfer_engine gtest
+                                                   gtest_main)
+add_test(NAME rdma_batch_reuse_test COMMAND rdma_batch_reuse_test)
+
+add_executable(multi_transport_batch_test
+               ${WORKSPACE}/multi_transport_batch_test.cpp)
+target_link_libraries(multi_transport_batch_test PUBLIC transfer_engine gtest
+                                                        gtest_main)
+add_test(NAME multi_transport_batch_test COMMAND multi_transport_batch_test)
 
 add_executable(topology_test ${WORKSPACE}/topology_test.cpp)
 target_link_libraries(topology_test PUBLIC transfer_engine gtest gtest_main)

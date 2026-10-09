@@ -24,7 +24,6 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdlib>
-#include <fstream>
 #include <future>
 #include <set>
 #include <thread>
@@ -33,7 +32,6 @@
 
 #include "common.h"
 #include "config.h"
-#include "environ.h"
 #include "memory_location.h"
 #include "topology.h"
 #include "transport/batch_registration.h"
@@ -47,39 +45,6 @@ namespace mooncake {
 // With 4KB pages: 22M × 4KB ≈ 88GB per NIC.
 // With 2MB hugepages: 22M × 2MB ≈ 44TB per NIC (effectively unlimited).
 static constexpr size_t kDefaultMaxPteEntries = 22ULL * 1024 * 1024;  // 22M
-
-// Detect the kernel page size backing the memory at `addr` by reading
-// /proc/self/smaps.  Falls back to sysconf(_SC_PAGESIZE) on any failure.
-static size_t detectBufferPageSize(void* addr) {
-    size_t fallback = static_cast<size_t>(sysconf(_SC_PAGESIZE));
-    std::ifstream smaps("/proc/self/smaps");
-    if (!smaps.is_open()) return fallback;
-
-    uintptr_t target = reinterpret_cast<uintptr_t>(addr);
-    std::string line;
-    bool in_range = false;
-
-    while (std::getline(smaps, line)) {
-        // VMA header: "start-end perms offset dev inode [pathname]".
-        // Cast to unsigned char before std::isxdigit: passing a (possibly
-        // signed) char whose value is > 0x7F is UB, since the argument must be
-        // representable as unsigned char or equal EOF.
-        if (!line.empty() &&
-            std::isxdigit(static_cast<unsigned char>(line[0]))) {
-            unsigned long start = 0, end = 0;
-            if (sscanf(line.c_str(), "%lx-%lx", &start, &end) == 2) {
-                in_range = (target >= start && target < end);
-            }
-        } else if (in_range && line.compare(0, 15, "KernelPageSize:") == 0) {
-            unsigned long kb = 0;
-            if (sscanf(line.c_str(), "KernelPageSize: %lu kB", &kb) == 1 &&
-                kb > 0) {
-                return kb * 1024;
-            }
-        }
-    }
-    return fallback;
-}
 
 static size_t getMaxPteEntries() { return kDefaultMaxPteEntries; }
 
@@ -100,7 +65,7 @@ void EfaTransport::startWorkerThreads() {
     worker_running_ = true;
     // MC_EFA_CQ_THREADS caps CQ poller count (default 1). Set 0 to disable cap.
     size_t num_threads = context_list_.size();
-    int cq_cap = Environ::Get().GetEfaCqThreads();
+    const int cq_cap = globalConfig().efa_cq_threads;
     if (cq_cap > 0 && static_cast<size_t>(cq_cap) < num_threads) {
         num_threads = static_cast<size_t>(cq_cap);
     }

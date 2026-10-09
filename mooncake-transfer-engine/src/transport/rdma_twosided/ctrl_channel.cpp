@@ -22,6 +22,10 @@
 #include <cstring>
 #include <sstream>
 
+#ifdef USE_SHCA
+#include <infiniband/shca_17b_types.h>
+#endif
+
 #include "common.h"
 #include "config.h"
 #include "error.h"
@@ -234,7 +238,7 @@ void CtrlChannel::fillLocalDesc(HandShakeDesc &local_desc) const {
     local_desc.notify_rq_depth = notifyRqDepth();
 }
 
-int CtrlChannel::connectQp(const std::string &peer_gid, uint16_t peer_lid,
+int CtrlChannel::connectQp(const std::string &peer_gid, uint32_t peer_lid,
                            uint32_t peer_qp_num) {
     if (!qp_ || peer_qp_num == 0) return ERR_INVALID_ARGUMENT;
 
@@ -291,7 +295,11 @@ int CtrlChannel::connectQp(const std::string &peer_gid, uint16_t peer_lid,
         attr.ah_attr.grh.traffic_class =
             static_cast<uint8_t>(globalConfig().ib_traffic_class);
     }
-    attr.ah_attr.dlid = peer_lid;
+#ifdef USE_SHCA
+    attr.ah_attr.dlid = u32_to_17(peer_lid);
+#else
+    attr.ah_attr.dlid = static_cast<uint16_t>(peer_lid);
+#endif
     attr.ah_attr.sl = 0;
     if (globalConfig().ib_service_level >= 0) {
         attr.ah_attr.sl = static_cast<uint8_t>(globalConfig().ib_service_level);

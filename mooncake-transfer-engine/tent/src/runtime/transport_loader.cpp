@@ -50,8 +50,20 @@
 #include "tent/transport/tpu/tpu_transport.h"
 #endif
 
+#ifdef USE_XPU
+#include "tent/transport/xpu/xpu_transport.h"
+#endif
+
 #ifdef USE_MPCOMM
 #include "tent/transport/mpcomm/mpcomm_transport.h"
+#endif
+
+#ifdef USE_HYLINK
+#include "tent/transport/hylink/hylink_transport.h"
+#endif
+
+#ifdef USE_FABRIC
+#include "tent/transport/fabric/fabric_transport.h"
 #endif
 
 namespace mooncake {
@@ -124,9 +136,24 @@ Status TransferEngineImpl::loadTransports() {
         transport_list_[TPU] = std::make_shared<TpuTransport>();
 #endif
 
+#ifdef USE_XPU
+    if (conf_->get("transports/xpu/enable", true))
+        transport_list_[XPU] = std::make_shared<XpuTransport>();
+#endif
+
 #ifdef USE_MPCOMM
     if (conf_->get("transports/mpcomm/enable", true))
         transport_list_[MPCOMM] = std::make_shared<MpcommTransport>();
+#endif
+
+#ifdef USE_HYLINK
+    if (conf_->get("transports/hylink/enable", false))
+        transport_list_[HYLINK] = std::make_shared<HylinkTransport>();
+#endif
+
+#ifdef USE_FABRIC
+    if (conf_->get("transports/fabric/enable", true))
+        transport_list_[FABRIC] = std::make_shared<FabricTransport>();
 #endif
 
     return Status::OK();

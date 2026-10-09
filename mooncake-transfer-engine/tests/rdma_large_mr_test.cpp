@@ -44,7 +44,6 @@
 
 #if defined(USE_CUDA) || defined(USE_HIP)
 #include "cuda_alike.h"
-#include "environ.h"
 #endif
 #include "config.h"
 #include "transfer_engine.h"
@@ -214,9 +213,10 @@ TEST_F(RDMALargeMrTest, WriteWithSourceStraddlingChunkBoundary) {
 }
 
 #if defined(USE_CUDA) || defined(USE_HIP)
-class RDMAGpuDmabufChunkTest : public ::testing::Test {
+class RDMAGpuDmabufChunkTest : public ::testing::TestWithParam<size_t> {
    protected:
     std::unique_ptr<TransferEngine> engine;
+    void *gpu_allocation = nullptr;
     void *gpu_addr = nullptr;
 
     void SetUp() override {
@@ -226,9 +226,10 @@ class RDMAGpuDmabufChunkTest : public ::testing::Test {
         ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
 
 #if defined(USE_CUDA)
-        ASSERT_FALSE(Environ::Get().GetWithNvidiaPeermem())
-            << "Launch with WITH_NVIDIA_PEERMEM=0 so this test exercises "
-               "ibv_reg_dmabuf_mr instead of the nvidia-peermem fallback";
+        ASSERT_TRUE(globalConfig().rdma_data_direct ||
+                    !globalConfig().with_nvidia_peermem)
+            << "Launch with WITH_NVIDIA_PEERMEM=0 or MC_RDMA_DATA_DIRECT=1 "
+               "so this test exercises DMA-BUF registration";
 #endif
 
         engine = std::make_unique<TransferEngine>(true);
@@ -239,7 +240,9 @@ class RDMAGpuDmabufChunkTest : public ::testing::Test {
         ASSERT_EQ(globalConfig().max_mr_size, kMaxMrSize)
             << "Launch this test process with MC_MAX_MR_SIZE=" << kMaxMrSize;
 
-        ASSERT_EQ(cudaMalloc(&gpu_addr, kBufferSize), cudaSuccess);
+        ASSERT_EQ(cudaMalloc(&gpu_allocation, kBufferSize + 65536),
+                  cudaSuccess);
+        gpu_addr = static_cast<char *>(gpu_allocation) + GetParam();
         ASSERT_EQ(engine->registerLocalMemory(gpu_addr, kBufferSize,
                                               GPU_PREFIX + "0"),
                   0);
@@ -247,15 +250,16 @@ class RDMAGpuDmabufChunkTest : public ::testing::Test {
 
     void TearDown() override {
         if (engine && gpu_addr) engine->unregisterLocalMemory(gpu_addr);
-        if (gpu_addr) cudaFree(gpu_addr);
+        if (gpu_allocation) cudaFree(gpu_allocation);
     }
 };
 
-// The allocation is split into four MRs. Before the fix, every chunk is
+// The allocation is split into multiple MRs. Before the fix, every chunk is
 // registered with the dma-buf offset of chunk 0. A loopback WRITE targeting
-// chunk 3 therefore maps the wrong GPU pages, fails registration/transfer, or
-// completes without updating the requested destination bytes.
-TEST_F(RDMAGpuDmabufChunkTest, LaterChunkUsesItsOwnDmabufOffset) {
+// a later chunk therefore maps the wrong GPU pages, fails
+// registration/transfer, or completes without updating the requested
+// destination bytes.
+TEST_P(RDMAGpuDmabufChunkTest, LaterChunkUsesItsOwnDmabufOffset) {
     const size_t kDataLength = 1ull << 20;
     const size_t kTargetOffset = kBufferSize - kDataLength;
     std::vector<char> source(kDataLength);
@@ -291,6 +295,21 @@ TEST_F(RDMAGpuDmabufChunkTest, LaterChunkUsesItsOwnDmabufOffset) {
               cudaSuccess);
     EXPECT_EQ(result, source);
 }
+
+TEST_P(RDMAGpuDmabufChunkTest, RegistersInteriorGpuBuffers) {
+    ASSERT_EQ(engine->unregisterLocalMemory(gpu_addr), 0);
+    constexpr size_t length = (8ull << 20) + 1024;
+    const size_t offsets[] = {0, 1024, 4096, 65536, length};
+    for (size_t offset : offsets) {
+        auto *ptr = static_cast<char *>(gpu_addr) + offset;
+        ASSERT_EQ(engine->registerLocalMemory(ptr, length, GPU_PREFIX + "0"), 0)
+            << "offset=" << offset;
+        EXPECT_EQ(engine->unregisterLocalMemory(ptr), 0);
+    }
+}
+
+INSTANTIATE_TEST_SUITE_P(AllocationOffsets, RDMAGpuDmabufChunkTest,
+                         ::testing::Values<size_t>(0, 1024));
 #endif
 
 }  // namespace mooncake

@@ -1,12 +1,11 @@
 #pragma once
 
-#include "environ.h"
 #include "rpc_client_io_context.h"
 
 namespace mooncake {
 
 inline uint32_t GetTransferEngineRpcClientIoThreads() {
-    return Environ::Get().GetTransferEngineRpcClientIoThreads();
+    return RpcClientIoThreadsConfig::Process().transfer_engine;
 }
 
 namespace detail {

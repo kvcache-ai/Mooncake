@@ -33,6 +33,10 @@ __device__ __forceinline__ uint64_t mc_ld_acquire_u64(const uint64_t* ptr) {
     return ret;
 }
 
+__device__ __forceinline__ uint64_t mc_ld_volatile_u64(const uint64_t* ptr) {
+    return *const_cast<volatile const uint64_t*>(ptr);
+}
+
 // ---------------------------------------------------------------------------
 // Release stores
 // ---------------------------------------------------------------------------
