@@ -22,6 +22,7 @@
 #include "transport/rdma_transport/rdma_posted_fifo.h"
 
 using mooncake::collectPostedFifo;
+using mooncake::drainedPrefixCompletedOnWire;
 using mooncake::shouldSignalRdmaWr;
 
 TEST(ShouldSignalRdmaWr, IntervalOneSignalsEveryWr) {
@@ -47,7 +48,7 @@ TEST(CollectPostedFifo, SuccessPopsPrefixThroughSignaled) {
     int a, b, c, d;
     std::deque<int *> q{&a, &b, &c, &d};
     std::vector<int *> out;
-    EXPECT_EQ(collectPostedFifo(q, &c, false, out), 3u);
+    EXPECT_EQ(collectPostedFifo(q, &c, out), 3u);
     ASSERT_EQ(out.size(), 3u);
     EXPECT_EQ(out[0], &a);
     EXPECT_EQ(out[1], &b);
@@ -56,23 +57,34 @@ TEST(CollectPostedFifo, SuccessPopsPrefixThroughSignaled) {
     EXPECT_EQ(q.front(), &d);
 }
 
-TEST(CollectPostedFifo, ErrorDrainsTheWholeQpWindow) {
+TEST(CollectPostedFifo, ErrorLeavesTheTailForLaterCqes) {
     int a, b, c, d;
     std::deque<int *> q{&a, &b, &c, &d};
     std::vector<int *> out;
-    EXPECT_EQ(collectPostedFifo(q, &b, true, out), 4u);
-    EXPECT_TRUE(q.empty());
-    ASSERT_EQ(out.size(), 4u);
-    EXPECT_EQ(out[3], &d);
+    EXPECT_EQ(collectPostedFifo(q, &b, out), 2u);
+    ASSERT_EQ(out.size(), 2u);
+    EXPECT_EQ(out[0], &a);
+    EXPECT_EQ(out[1], &b);
+    ASSERT_EQ(q.size(), 2u);
+    EXPECT_EQ(q.front(), &c);
+    EXPECT_EQ(q.back(), &d);
 }
 
 TEST(CollectPostedFifo, MissingSignaledLeavesQueueUntouched) {
     int a, b, missing;
     std::deque<int *> q{&a, &b};
     std::vector<int *> out;
-    EXPECT_EQ(collectPostedFifo(q, &missing, false, out), 0u);
+    EXPECT_EQ(collectPostedFifo(q, &missing, out), 0u);
     EXPECT_TRUE(out.empty());
     EXPECT_EQ(q.size(), 2u);
+}
+
+TEST(DrainedPrefixCompletedOnWire, ErrorPrefixIsSuccessTailKeepsCqe) {
+    EXPECT_TRUE(drainedPrefixCompletedOnWire(true, 0, 1));
+    EXPECT_TRUE(drainedPrefixCompletedOnWire(false, 0, 3));
+    EXPECT_TRUE(drainedPrefixCompletedOnWire(false, 1, 3));
+    EXPECT_FALSE(drainedPrefixCompletedOnWire(false, 2, 3));
+    EXPECT_FALSE(drainedPrefixCompletedOnWire(false, 0, 1));
 }
 
 class SignalIntervalEnvTest : public ::testing::Test {

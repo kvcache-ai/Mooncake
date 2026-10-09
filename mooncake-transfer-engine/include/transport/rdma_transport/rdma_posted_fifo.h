@@ -38,21 +38,29 @@ inline bool shouldSignalRdmaWr(int unsignaled_since, int interval, int max_wr,
     return last_in_chain;
 }
 
-// Pop posting-order WRs covered by a signaled CQE. On success, everything up
-// to `signaled` inclusive is retired (RC completion order). On error,
-// `drain_rest` also retires WRs after it: they will not generate CQEs.
+// Pop posting-order WRs covered by this CQE. Failed and flushed WRs generate
+// a CQE even without IBV_SEND_SIGNALED, so the tail stays in the FIFO for
+// those later CQEs. On success the unsignaled prefix completed in RC order
+// and is retired with this signaled CQE.
 template <typename Slice>
-size_t collectPostedFifo(std::deque<Slice *> &q, Slice *signaled,
-                         bool drain_rest, std::vector<Slice *> &out) {
-    if (!signaled || q.empty()) return 0;
-    const auto found = std::find(q.begin(), q.end(), signaled);
+size_t collectPostedFifo(std::deque<Slice *> &q, Slice *completed,
+                         std::vector<Slice *> &out) {
+    if (!completed || q.empty()) return 0;
+    const auto found = std::find(q.begin(), q.end(), completed);
     if (found == q.end()) return 0;
-    const size_t n =
-        drain_rest ? q.size()
-                   : static_cast<size_t>(std::distance(q.begin(), found) + 1);
-    out.insert(out.end(), q.begin(), std::next(q.begin(), static_cast<ptrdiff_t>(n)));
+    const size_t n = static_cast<size_t>(std::distance(q.begin(), found) + 1);
+    out.insert(out.end(), q.begin(),
+               std::next(q.begin(), static_cast<ptrdiff_t>(n)));
     q.erase(q.begin(), std::next(q.begin(), static_cast<ptrdiff_t>(n)));
     return n;
+}
+
+// RC completes in order. An error CQE for WR k means WRs 0..k-1 already
+// succeeded on the wire (they may have been unsignaled). WR k keeps the
+// CQE status; later WRs wait for their own flush CQEs.
+inline bool drainedPrefixCompletedOnWire(bool cqe_success, size_t index,
+                                         size_t drained_n) {
+    return cqe_success || index + 1 < drained_n;
 }
 
 }  // namespace mooncake
