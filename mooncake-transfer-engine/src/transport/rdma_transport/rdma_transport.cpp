@@ -58,6 +58,26 @@ static std::string resolveBufferLocation(
     return location;
 }
 
+std::string RdmaTransport::destinationLocalHca(SegmentDesc *peer,
+                                               TransferRequest::OpCode opcode,
+                                               uint64_t offset, size_t length) {
+    if (!globalConfig().enable_dest_local_rail ||
+        !globalConfig().enable_dest_device_affinity ||
+        opcode != TransferRequest::WRITE || !peer || length == 0)
+        return {};
+    int buffer_id = -1, device_id = -1;
+    if (selectDevice(peer, offset, length, buffer_id, device_id)) return {};
+    const auto &buffer = peer->buffers[buffer_id];
+    const auto location = resolveBufferLocation(buffer, offset);
+    // Ambiguous multi-GPU spans keep ordinary selection.
+    if (location != resolveBufferLocation(buffer, offset + length - 1))
+        return {};
+    const int pinned = peer->topology.pinnedDevice(location);
+    const auto &hcas = peer->topology.getHcaList();
+    if (pinned < 0 || static_cast<size_t>(pinned) >= hcas.size()) return {};
+    return hcas[pinned];
+}
+
 // The last-hit shortcut and the index lookup both assume the MR covering an
 // address is unique; only then do they answer what a first-match scan would.
 // Descriptors with overlapping MRs, or whose index is out of sync with
@@ -1028,9 +1048,17 @@ Status RdmaTransport::submitTransferTask(
         // local RNIC. The advisory hint affects initial submission only;
         // submit-level retries keep the existing topology policy.
         auto request_buffer_id = -1, request_device_id = -1;
-        const std::string_view request_hint =
-            request.advise_retry_cnt == 0 ? nic_hint_name(request.nic_hint)
-                                          : std::string_view{};
+        std::string destination_hint;
+        std::string_view request_hint;
+        if (request.advise_retry_cnt == 0) {
+            request_hint = nic_hint_name(request.nic_hint);
+            if (request_hint.empty()) {
+                destination_hint = destinationLocalHca(
+                    target_segment_desc.get(), request.opcode,
+                    request.target_offset, request.length);
+                request_hint = destination_hint;
+            }
+        }
         const int local_hint_device_id =
             request_hint.empty() &&
                     last_local_device_buffer_id == last_local_buffer_id
@@ -1098,9 +1126,17 @@ Status RdmaTransport::submitTransferTask(
                 // registered-memory boundaries even though each slice is
                 // valid. Honor the hint for the initial per-slice attempt too,
                 // then drop it so retries can fail over to another RNIC.
-                const std::string_view slice_hint =
-                    retry_cnt == 0 ? nic_hint_name(request.nic_hint)
-                                   : std::string_view{};
+                std::string slice_destination_hint;
+                std::string_view slice_hint;
+                if (retry_cnt == 0) {
+                    slice_hint = nic_hint_name(request.nic_hint);
+                    if (slice_hint.empty()) {
+                        slice_destination_hint = destinationLocalHca(
+                            target_segment_desc.get(), request.opcode,
+                            slice->rdma.dest_addr, slice->length);
+                        slice_hint = slice_destination_hint;
+                    }
+                }
                 const int slice_hint_device_id =
                     slice_hint.empty() &&
                             last_local_device_buffer_id == last_local_buffer_id

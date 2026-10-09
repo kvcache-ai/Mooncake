@@ -570,3 +570,9 @@ if(USE_NCCL_DEVICE AND NOT USE_CXI)
     endif()
   endif()
 endif()
+
+add_executable(rdma_destination_local_test
+               ${WORKSPACE}/rdma_destination_local_test.cpp)
+target_link_libraries(rdma_destination_local_test PUBLIC transfer_engine gtest
+                                                         gtest_main)
+add_test(NAME rdma_destination_local_test COMMAND rdma_destination_local_test)

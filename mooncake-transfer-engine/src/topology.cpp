@@ -15,6 +15,7 @@
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <charconv>
 #include <fstream>
 #include <iostream>
 #include <map>
@@ -616,6 +617,7 @@ bool Topology::empty() const {
 }
 
 void Topology::clear() {
+    pinned_hca_.clear();
     matrix_.clear();
     hca_list_.clear();
     resolved_matrix_.clear();
@@ -801,6 +803,45 @@ int Topology::selectDevice(const std::string storage_type, int retry_count) {
     return ERR_DEVICE_NOT_FOUND;
 }
 
+void Topology::resolvePinnedDevices() {
+    pinned_hca_.clear();
+    std::map<std::vector<std::string>, std::map<unsigned, std::string>> groups;
+    for (const auto &[location, entry] : matrix_) {
+        if (location.rfind(GPU_PREFIX, 0) != 0 || entry.preferred_hca.empty())
+            continue;
+        unsigned gpu;
+        const char *first = location.data() + GPU_PREFIX.size();
+        const char *last = location.data() + location.size();
+        const auto result = std::from_chars(first, last, gpu);
+        if (result.ec != std::errc{} || result.ptr != last) continue;
+        auto hcas = entry.preferred_hca;
+        const auto resolved = resolved_matrix_.find(location);
+        if (resolved == resolved_matrix_.end()) continue;
+        hcas.erase(std::remove_if(hcas.begin(), hcas.end(),
+                                  [&](const auto &hca) {
+                                      return resolved->second.getHcaIndex(hca) <
+                                             0;
+                                  }),
+                   hcas.end());
+        if (hcas.empty()) continue;
+        std::sort(hcas.begin(), hcas.end());
+        hcas.erase(std::unique(hcas.begin(), hcas.end()), hcas.end());
+        groups[hcas][gpu] = location;
+    }
+    // When PCIe locality is hidden, spread GPUs with the same preferred set.
+    // Preserve each GPU's existing single-HCA preference when it is available.
+    for (const auto &[hcas, gpus] : groups) {
+        size_t next = 0;
+        for (const auto &[gpu, location] : gpus) {
+            const auto &hca = hcas[next++ % hcas.size()];
+            const auto it = std::find(hca_list_.begin(), hca_list_.end(), hca);
+            if (it != hca_list_.end())
+                pinned_hca_[location] =
+                    static_cast<int>(it - hca_list_.begin());
+        }
+    }
+}
+
 int Topology::resolve() {
     resolved_matrix_.clear();
     resolved_hca_peer_affinity_by_local_.clear();
@@ -840,6 +881,7 @@ int Topology::resolve() {
     }
     precomputeResolvedHcaPeerAffinity(matrix_, hca_id_map,
                                       resolved_hca_peer_affinity_by_local_);
+    resolvePinnedDevices();
     return 0;
 }
 
@@ -891,6 +933,7 @@ int Topology::disableDevice(const std::string &device_name) {
                              candidates.end());
         }
     }
+    resolvePinnedDevices();
     return 0;
 }
 }  // namespace mooncake

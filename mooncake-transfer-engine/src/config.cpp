@@ -566,6 +566,16 @@ void loadGlobalConfig(GlobalConfig& config) {
         config.enable_dest_device_affinity = false;
     }
 
+    if (const char* value = std::getenv("MC_ENABLE_DEST_LOCAL_RAIL")) {
+        parseBoolConfigEnv(value, "MC_ENABLE_DEST_LOCAL_RAIL",
+                           config.enable_dest_local_rail);
+    }
+    if (config.enable_dest_local_rail && !config.enable_dest_device_affinity) {
+        LOG(WARNING) << "MC_ENABLE_DEST_LOCAL_RAIL requires "
+                        "MC_ENABLE_DEST_DEVICE_AFFINITY; ignoring it";
+        config.enable_dest_local_rail = false;
+    }
+
     const char* log_rdma_slice_affinity_env =
         std::getenv("MC_LOG_RDMA_SLICE_AFFINITY");
     if (log_rdma_slice_affinity_env) {
@@ -900,6 +910,7 @@ void dumpGlobalConfig() {
     }
     LOG(INFO) << "mlx5_qp_lag_port_balance = "
               << (config.mlx5_qp_lag_port_balance ? "true" : "false");
+    LOG(INFO) << "enable_dest_local_rail = " << config.enable_dest_local_rail;
     LOG(INFO) << "log_rdma_slice_affinity = "
               << (config.log_rdma_slice_affinity ? "true" : "false");
     LOG(INFO) << "track_rdma_posted_slices = "

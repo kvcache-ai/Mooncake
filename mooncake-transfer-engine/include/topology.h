@@ -101,15 +101,23 @@ class Topology {
     int getDeviceIndex(const std::string &storage_type,
                        std::string_view device_name) const;
 
+    // One deterministic preferred HCA per GPU; absent locations return -1.
+    int pinnedDevice(const std::string &storage_type) const {
+        auto it = pinned_hca_.find(storage_type);
+        return it == pinned_hca_.end() ? -1 : it->second;
+    }
+
     TopologyMatrix getMatrix() const { return matrix_; }
 
     const std::vector<std::string> &getHcaList() const { return hca_list_; }
 
    private:
     int resolve();
+    void resolvePinnedDevices();
 
    private:
     TopologyMatrix matrix_;
+    std::unordered_map<std::string, int> pinned_hca_;
     std::vector<std::string> hca_list_;
     bool use_round_robin_;
 

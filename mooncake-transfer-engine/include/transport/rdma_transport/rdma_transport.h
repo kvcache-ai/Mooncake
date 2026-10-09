@@ -137,6 +137,11 @@ class RdmaTransport : public Transport {
     void notifyWorkerThread();
 
    public:
+    // Initial WRITE hint; READ, host buffers and missing topology keep normal
+    // selection.
+    static std::string destinationLocalHca(SegmentDesc *peer,
+                                           TransferRequest::OpCode opcode,
+                                           uint64_t offset, size_t length);
     static int selectDevice(SegmentDesc *desc, uint64_t offset, size_t length,
                             int &buffer_id, int &device_id, int retry_cnt = 0,
                             int hint_buffer_id = -1, int hint_device_id = -1);
