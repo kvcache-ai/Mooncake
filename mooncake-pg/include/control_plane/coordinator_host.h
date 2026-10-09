@@ -147,6 +147,8 @@ class CoordinatorHost {
     void postViewUpdateAck(GroupId group_id, GlobalRank rank, uint64_t epoch,
                            bool applied);
 
+    void postTransferEndpointUpdateAck(TransferEndpointUpdateAck ack);
+
    private:
     CentralizedCoordinatorStateMachine state_machine_;
     SerializedExecutor executor_;
@@ -180,6 +182,7 @@ class CoordinatorHost {
 
     void runEffects(const std::vector<CoordinatorEffect>& effects);
     void pushViewUpdate(const PushViewUpdate& effect);
+    void pushTransferEndpointUpdate(const PushTransferEndpointUpdate& effect);
 
     template <auto Method, typename Push>
     void pushToAgent(GlobalRank rank, const Push& msg) {

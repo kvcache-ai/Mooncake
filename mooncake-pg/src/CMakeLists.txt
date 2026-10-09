@@ -15,6 +15,7 @@ if(USE_CUDA)
       "${_pg_device_source}"
       "${CMAKE_CURRENT_SOURCE_DIR}/device_comm/device_collective/algorithms/ring/ring_all_reduce.cu"
       "${CMAKE_CURRENT_SOURCE_DIR}/device_comm/device_collective/algorithms/oneshot/one_shot_all_reduce.cu"
+      "${CMAKE_CURRENT_SOURCE_DIR}/device_comm/device_transfer/routes/nccl_device_route/nccl_device_route.cu"
   )
 elseif(USE_MUSA OR USE_MACA)
   set(_pg_device_object "${CMAKE_CURRENT_BINARY_DIR}/mooncake_worker_device.o")
@@ -156,13 +157,13 @@ if(USE_CUDA)
   target_sources(
     mooncake_pg
     PRIVATE
-      device_comm/device_primitives/payload_writer.cpp
       device_comm/device_transfer/transfer_region.cpp
       device_comm/device_transfer/transfer_service.cpp
-      device_comm/device_transfer/routes/host_proxy_route/host_proxy_route.cpp
-      device_comm/device_transfer/routes/host_proxy_route/host_transfer_proxy.cpp
       device_comm/device_transfer/routes/p2p_route/p2p_route.cpp
       device_comm/device_transfer/routes/rdma_route/rdma_route.cpp
+      device_comm/device_transfer/routes/nccl_device_route/nccl_device_route.cpp
+      device_comm/device_transfer/routes/host_proxy_route/host_proxy_route.cpp
+      device_comm/device_transfer/routes/host_proxy_route/host_transfer_proxy.cpp
       device_comm/device_collective/device_collective.cpp
       device_comm/device_collective/device_collective_workspace.cpp
       device_comm/device_collective/device_collective_recovery.cpp
@@ -184,6 +185,20 @@ if(USE_MACA)
                              "${MACA_ROOT}/include/mcr")
 endif()
 target_link_libraries(mooncake_pg PRIVATE transfer_engine mooncake_pg_device)
+
+# PG uses ncclGin::wait(..., timeoutCycles) to wait for local transfer
+# completion with a timeout. For puts, completion allows source buffer reuse.
+if(USE_NCCL_DEVICE)
+  if(NCCLDevice_VERSION VERSION_LESS "2.31.2")
+    message(
+      FATAL_ERROR
+      "PG NCCL device route requires NCCL >= 2.31.2 "
+      "for ncclGin::wait() with a timeout; "
+      "found ${NCCLDevice_VERSION}")
+  endif()
+  target_link_libraries(mooncake_pg PRIVATE NCCL::nccl)
+  target_link_libraries(mooncake_pg_device PRIVATE NCCL::nccl)
+endif()
 
 set_target_properties(
   mooncake_pg

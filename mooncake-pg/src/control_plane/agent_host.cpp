@@ -40,6 +40,21 @@ PGResult<void> callAndCheck(RpcClient& client, const std::string& addr,
     return {};
 }
 
+// Runs on the installation executor with no access to AgentHost state.
+PGResult<DeviceTransferEndpoint> installTransferEndpoints(
+    DeviceTransferService* service, const InstallTransferEndpoints& effect) {
+#if MOONCAKE_PG_HAS_COLLECTIVE_V2
+    PG_VALIDATE_STATE(service, "device endpoint service is missing");
+    return service->installEndpoints(effect.snapshot,
+                                     effect.reclaim_before_version);
+#else
+    (void)service;
+    (void)effect;
+    return makePGError(PGErrorCode::NotSupported,
+                       "device endpoints require CUDA");
+#endif
+}
+
 }  // namespace
 
 void AgentRpcServiceImpl::onPeerJoined(PeerJoinedPush push) {
@@ -53,6 +68,12 @@ void AgentRpcServiceImpl::onRankStateUpdate(RankStatePush push) {
 void AgentRpcServiceImpl::onViewUpdate(coro_rpc::context<ViewUpdateAck> ctx,
                                        ViewUpdatePush push) {
     host_.postViewUpdate(std::move(ctx), std::move(push));
+}
+
+void AgentRpcServiceImpl::onTransferEndpointUpdate(
+    coro_rpc::context<TransferEndpointUpdateAck> ctx,
+    TransferEndpointUpdatePush push) {
+    host_.postTransferEndpointUpdate(std::move(ctx), std::move(push));
 }
 
 AgentHost::AgentHost(std::string coordinator_addr, const std::string& host_ip,
@@ -103,7 +124,8 @@ PGResult<void> AgentHost::start() {
     rpc_impl_ = std::make_unique<AgentRpcServiceImpl>(*this);
     rpc_server_->registerHandler<&AgentRpcService::onPeerJoined,
                                  &AgentRpcService::onRankStateUpdate,
-                                 &AgentRpcService::onViewUpdate>(
+                                 &AgentRpcService::onViewUpdate,
+                                 &AgentRpcService::onTransferEndpointUpdate>(
         rpc_impl_.get());
     bool server_started = rpc_server_->start();
     if (!server_started) {
@@ -115,6 +137,7 @@ PGResult<void> AgentHost::start() {
                                std::to_string(rank_));
     }
 
+    transfer_endpoint_installer_.start();
     executor_.setTickCallback([this]() { tick(); });
     executor_.start();
 
@@ -125,10 +148,9 @@ void AgentHost::shutdown() {
     if (shutdown_requested_.exchange(true, std::memory_order_acq_rel)) return;
 
     link_manager_.setEventCallback(nullptr);
-    if (rpc_server_) rpc_server_->shutdown();
-    // Finish operations that callers already submitted, including explicit
-    // unregisterGroup calls, before releasing process-level rank ownership.
     executor_.shutdown();
+    transfer_endpoint_installer_.shutdown();
+    if (rpc_server_) rpc_server_->shutdown();
     link_manager_.stop();
     unregisterAgent();
     if (rpc_client_) {
@@ -477,6 +499,60 @@ void AgentHost::postViewUpdate(coro_rpc::context<ViewUpdateAck> ctx,
     });
 }
 
+void AgentHost::postTransferEndpointUpdate(
+    coro_rpc::context<TransferEndpointUpdateAck> ctx,
+    TransferEndpointUpdatePush push) {
+    executor_.post([this, ctx = std::move(ctx),
+                    push = std::move(push)]() mutable {
+        uint64_t request_id = next_transfer_endpoint_request_id_++;
+        auto apply_result =
+            agent_.handleTransferEndpointUpdate(request_id, push);
+        if (apply_result.has_value()) {
+            pending_transfer_endpoint_resps_.emplace(request_id,
+                                                     std::move(ctx));
+            runEffects(std::move(apply_result).value());
+        } else {
+            LOG(ERROR) << apply_result.error().message;
+            TransferEndpointUpdateAck ack{.rank = rank_,
+                                          .rank_epoch = agent_.getRankEpoch(),
+                                          .version = push.snapshot.version,
+                                          .applied = false,
+                                          .updated_endpoint = std::nullopt};
+            ctx.response_msg(std::move(ack));
+        }
+    });
+}
+
+void AgentHost::enqueueTransferEndpointInstallation(
+    const InstallTransferEndpoints& effect,
+    coro_rpc::context<TransferEndpointUpdateAck> ctx) {
+    TransferEndpointUpdateAck ack{
+        .rank = rank_,
+        .rank_epoch = effect.snapshot.rank_epochs[rank_],
+        .version = effect.snapshot.version,
+        .applied = false,
+        .updated_endpoint = std::nullopt};
+    auto submitted = transfer_endpoint_installer_.post(
+        [service = device_transfer_service_, effect, ctx, ack]() mutable {
+            auto result = installTransferEndpoints(service, effect);
+            if (result.has_value()) {
+                ack.applied = true;
+                auto endpoint = std::move(result).value();
+                if (endpoint != *effect.snapshot.endpoints[ack.rank])
+                    ack.updated_endpoint = std::move(endpoint);
+            } else {
+                LOG(ERROR) << "Device endpoint installation failed: "
+                           << result.error().message;
+            }
+            ctx.response_msg(std::move(ack));
+        });
+    if (!submitted.has_value()) {
+        LOG(ERROR) << "Cannot submit device endpoint installation: "
+                   << submitted.error().message;
+        ctx.response_msg(std::move(ack));
+    }
+}
+
 void AgentHost::startAgentRegistration(bool start_new_session) {
     if (shutdown_requested_.load(std::memory_order_acquire)) return;
 
@@ -645,13 +721,14 @@ void AgentHost::runEffects(const AgentApplyResult& effects) {
     for (const auto& effect : effects) {
         std::visit(
             overloaded{
-                [this](const InstallDeviceTransferEndpoint& e) {
-#if MOONCAKE_PG_HAS_COLLECTIVE_V2
-                    PG_ASSERT_OK(device_transfer_service_->installPeerEndpoint(
-                        e.rank, e.endpoint));
-#else
-                    (void)e;
-#endif
+                [this](const InstallTransferEndpoints& e) {
+                    auto it =
+                        pending_transfer_endpoint_resps_.find(e.request_id);
+                    if (it != pending_transfer_endpoint_resps_.end()) {
+                        auto ctx = std::move(it->second);
+                        pending_transfer_endpoint_resps_.erase(it);
+                        enqueueTransferEndpointInstallation(e, std::move(ctx));
+                    }
                 },
                 [this](const InstallDeviceCollectiveWorkspaceEndpoint& e) {
 #if MOONCAKE_PG_HAS_COLLECTIVE_V2
