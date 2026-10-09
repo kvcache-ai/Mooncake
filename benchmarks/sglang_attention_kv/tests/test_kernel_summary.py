@@ -17,6 +17,7 @@ CONFIGURATION = {
     "decode_use_tensor_cores": True,
     "kv_layout": "NHD",
     "kv_write_stream": "step",
+    "slot_allocator": "paged",
     "flashinfer_use_paged_env": False,
 }
 
@@ -109,6 +110,7 @@ def test_the_configuration_reaches_the_row():
     assert row["wrapper_page_size"] == 1
     assert row["decode_use_tensor_cores"] is True
     assert row["kv_write_stream"] == "step"
+    assert row["slot_allocator"] == "paged"
     assert row["branch"] == "ragged_prefix_merge"
     assert row["reads_before_write"] is True
 
