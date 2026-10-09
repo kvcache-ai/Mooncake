@@ -1,5 +1,7 @@
 #pragma once
 
+#include <set>
+#include <string>
 #include <utility>
 
 #include "master_service.h"
@@ -79,6 +81,9 @@ class MasterServiceTestPeer {
 
     std::optional<uint32_t> GetNoFHeartbeatFailureCountForTesting(
         const UUID& segment_id);
+
+    std::set<std::string> GetNoFExcludedSegmentsForTesting(
+        const UUID& client_id);
 
     size_t RunPromotionCandidateRetryForTesting();
 
