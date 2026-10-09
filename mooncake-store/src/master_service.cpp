@@ -387,6 +387,19 @@ MasterService::MasterService(const MasterServiceConfig& config)
                          "cap will be evicted without disk offload";
         }
     }
+    // With offload_on_evict every evictee goes through the offload cap; a cap
+    // that rounds to zero would skip every candidate and the eviction thread
+    // would back off and re-run forever without freeing anything.
+    if (offload_on_evict_ &&
+        static_cast<long>(offloading_queue_limit_ * offload_cap_ratio_) < 1) {
+        LOG(ERROR) << "offload_on_evict requires a per-cycle offload cap of at "
+                   << "least one object, but offloading_queue_limit ("
+                   << offloading_queue_limit_ << ") * offload_cap_ratio ("
+                   << offload_cap_ratio_ << ") rounds to zero";
+        throw std::invalid_argument(
+            "offload_on_evict requires offloading_queue_limit * "
+            "offload_cap_ratio >= 1");
+    }
 
     // Promotion-on-hit: when Get observes a LOCAL_DISK-only key, queue an
     // async copy back to MEMORY. Only meaningful when offload is enabled

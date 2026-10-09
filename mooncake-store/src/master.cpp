@@ -246,7 +246,9 @@ DEFINE_validator(offloading_queue_limit, [](const char* flagname,
     return true;
 });
 DEFINE_double(offload_cap_ratio, 0.5,
-              "Per-cycle offload cap as a fraction of offloading_queue_limit. "
+              "Per-cycle offload cap as a fraction of offloading_queue_limit "
+              "(with offload_on_evict the cap must round to at least one "
+              "object). "
               "Controls how many objects can be queued for offload in a single "
               "eviction cycle before falling back to force-evict");
 DEFINE_validator(offload_cap_ratio, [](const char* flagname, double value) {
