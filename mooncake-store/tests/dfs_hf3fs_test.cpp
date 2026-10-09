@@ -3,11 +3,14 @@
 #include <limits.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
+#include <barrier>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <future>
 #include <memory>
 #include <optional>
 #include <string>
@@ -18,6 +21,7 @@
 #include "storage/distributed/shard_allocator.h"
 #include "storage/distributed/distributed_storage_backend.h"
 #include "storage/distributed/hf3fs_adapter.h"
+#include "storage/distributed/immutable_bucket_allocator.h"
 #include "storage_backend.h"
 
 namespace mooncake::test {
@@ -102,6 +106,39 @@ class Hf3fsAdapterTest : public ::testing::Test {
     std::unique_ptr<Hf3fsTestDir> test_dir_;
 };
 
+class RecordingHf3fsAdapter : public Hf3fsAdapter {
+   public:
+    tl::expected<int, ErrorCode> OpenExistingFile(
+        const std::string& path) override {
+        auto fd = Hf3fsAdapter::OpenExistingFile(path);
+        if (fd) peak_open = std::max(peak_open, ++open_now);
+        return fd;
+    }
+
+    tl::expected<void, ErrorCode> CloseFile(int fd) override {
+        auto result = Hf3fsAdapter::CloseFile(fd);
+        if (result) --open_now;
+        return result;
+    }
+
+    std::vector<tl::expected<size_t, ErrorCode>> BatchWriteAt(
+        std::span<const FdIoRequest> requests) override {
+        write_batches.push_back(requests.size());
+        return Hf3fsAdapter::BatchWriteAt(requests);
+    }
+
+    std::vector<tl::expected<size_t, ErrorCode>> BatchReadAt(
+        std::span<const FdIoRequest> requests) override {
+        read_batches.push_back(requests.size());
+        return Hf3fsAdapter::BatchReadAt(requests);
+    }
+
+    std::vector<size_t> write_batches;
+    std::vector<size_t> read_batches;
+    int open_now = 0;
+    int peak_open = 0;
+};
+
 }  // namespace
 
 TEST_F(Hf3fsAdapterTest, WriteAtReadAtThroughUsrbio) {
@@ -134,6 +171,49 @@ TEST_F(Hf3fsAdapterTest, WriteAtReadAtThroughUsrbio) {
     EXPECT_TRUE(adapter.Shutdown().has_value());
 }
 
+TEST_F(Hf3fsAdapterTest, BatchIoAcrossRingAndSharedBufferCapacity) {
+    Hf3fsAdapter adapter;
+    ASSERT_TRUE(adapter.Init(test_dir_->path()));
+    const Hf3fsConfig config;
+    const size_t count = config.ior_entries + 3;
+    std::vector<std::string> values(count);
+    std::vector<std::array<iovec, 3>> iovs(count);
+    std::vector<FdIoRequest> requests(count);
+    std::vector<int> fds;
+    // Two files, with multiple positional requests sharing each registered fd.
+    for (int i = 0; i < 2; ++i) {
+        auto fd =
+            adapter.OpenFile(test_dir_->file("batch_" + std::to_string(i)));
+        ASSERT_TRUE(fd);
+        fds.push_back(*fd);
+    }
+    int64_t offset = 7;
+    for (size_t i = 0; i < count; ++i) {
+        values[i].assign(i == 0 ? config.iov_size + 4097 : 4097, 'A' + i % 26);
+        iovs[i] = {{{values[i].data(), 31},
+                    {nullptr, 0},
+                    {values[i].data() + 31, values[i].size() - 31}}};
+        requests[i] = {fds[i % fds.size()], iovs[i].data(), 3, offset};
+        offset += values[i].size() + 13;
+    }
+    const auto writes = adapter.BatchWriteAt(requests);
+    ASSERT_EQ(writes.size(), count);
+    for (size_t i = 0; i < count; ++i) {
+        ASSERT_TRUE(writes[i]);
+        EXPECT_EQ(*writes[i], values[i].size());
+        std::fill(values[i].begin(), values[i].end(), '?');
+    }
+    const auto reads = adapter.BatchReadAt(requests);
+    ASSERT_EQ(reads.size(), count);
+    for (size_t i = 0; i < count; ++i) {
+        ASSERT_TRUE(reads[i]);
+        EXPECT_EQ(*reads[i], values[i].size());
+        EXPECT_EQ(values[i], std::string(values[i].size(), 'A' + i % 26));
+    }
+    for (int fd : fds) EXPECT_TRUE(adapter.CloseFile(fd));
+    EXPECT_TRUE(adapter.Shutdown());
+}
+
 TEST_F(Hf3fsAdapterTest, DistributedBackendBatchWriteAndRead) {
     FileStorageConfig file_config;
     file_config.storage_backend_type = StorageBackendType::kDistributed;
@@ -147,32 +227,171 @@ TEST_F(Hf3fsAdapterTest, DistributedBackendBatchWriteAndRead) {
     distributed_config.alignment = 4096;
     distributed_config.single_tenant = true;
 
+    // The master prepares shard files before publishing their descriptors.
+    ShardAllocator allocator;
+    ASSERT_TRUE(allocator.Init(distributed_config).has_value());
+
     DistributedStorageBackend backend(file_config, distributed_config,
                                       std::make_unique<Hf3fsAdapter>());
     ASSERT_TRUE(backend.Init().has_value());
 
-    alignas(4096) std::array<char, 4096> write_buf;
-    alignas(4096) std::array<char, 4096> read_buf{};
-    write_buf.fill('B');
+    constexpr size_t kObjects = 4;
+    constexpr size_t kObjectSize = 4096;
+    std::vector<std::string> values;
+    values.reserve(kObjects);
+    std::vector<DfsWriteRequest> writes;
+    for (size_t i = 0; i < kObjects; ++i) {
+        const auto key = "hf3fs_backend_key_" + std::to_string(i);
+        auto descriptor = allocator.Allocate(key, kObjectSize);
+        ASSERT_TRUE(descriptor.has_value());
+        values.emplace_back(kObjectSize, static_cast<char>('A' + i));
+        writes.push_back({key,
+                          *descriptor,
+                          {{values.back().data(), 1024},
+                           {values.back().data() + 1024, kObjectSize - 1024}}});
+    }
+    auto write_results = backend.BatchWrite(writes);
+    ASSERT_EQ(write_results.size(), kObjects);
+    for (size_t i = 0; i < kObjects; ++i) ASSERT_TRUE(write_results[i]) << i;
 
-    const std::string key = "hf3fs_backend_key";
-    const std::string shard_path = test_dir_->file(
-        "dfs_shard_" +
-        ShardAllocator::FormatShardIdx(0, distributed_config.shard_count) +
-        ".data");
-    DistributedFSDescriptor descriptor{shard_path, 0, write_buf.size(),
-                                       write_buf.size(), 0};
-    auto write = backend.BatchWrite(
-        {{key, descriptor, {{write_buf.data(), write_buf.size()}}}});
-    ASSERT_EQ(write.size(), 1);
-    ASSERT_TRUE(write[0].has_value());
+    std::vector<std::string> outputs(kObjects, std::string(kObjectSize, '\0'));
+    std::vector<DfsReadRequest> reads;
+    for (size_t i = 0; i < kObjects; ++i) {
+        reads.push_back({writes[i].key,
+                         writes[i].descriptor,
+                         {{outputs[i].data(), 2048},
+                          {outputs[i].data() + 2048, kObjectSize - 2048}}});
+    }
+    auto read_results = backend.BatchRead(reads);
+    ASSERT_EQ(read_results.size(), kObjects);
+    for (size_t i = 0; i < kObjects; ++i) ASSERT_TRUE(read_results[i]) << i;
+    EXPECT_EQ(outputs, values);
+}
 
-    auto read = backend.BatchRead(
-        {{key, descriptor, {{read_buf.data(), read_buf.size()}}}});
-    ASSERT_EQ(read.size(), 1);
-    ASSERT_TRUE(read[0].has_value());
-    EXPECT_EQ(std::memcmp(write_buf.data(), read_buf.data(), write_buf.size()),
-              0);
+TEST_F(Hf3fsAdapterTest, BucketBatchSharesHandlesAcrossBoundedSubmissions) {
+    constexpr size_t kMaxOpen =
+        DistributedStorageBackend::kMaxOpenBucketsPerBatch;
+    constexpr size_t kBuckets = kMaxOpen + 1;
+    constexpr size_t kObjects = 2 * kBuckets;
+    constexpr size_t kObjectSize = 4096;
+    DistributedStorageConfig config;
+    config.fsdir = test_dir_->path();
+    config.fs_adapter_type = "hf3fs";
+    config.allocator_type = "bucket";
+    config.alignment = 4096;
+    config.bucket_capacity = 2 * kObjectSize;
+    config.max_bucket_count = kBuckets;
+
+    ImmutableBucketAllocator allocator;
+    ASSERT_TRUE(allocator.Init(config));
+    auto adapter = std::make_unique<RecordingHf3fsAdapter>();
+    auto* recorded = adapter.get();
+    FileStorageConfig file_config;
+    DistributedStorageBackend backend(file_config, config, std::move(adapter));
+    ASSERT_TRUE(backend.Init());
+
+    std::vector<std::string> values;
+    values.reserve(kObjects);
+    std::vector<DfsWriteRequest> writes;
+    for (size_t i = 0; i < kObjects; ++i) {
+        const auto key = "bucket_key_" + std::to_string(i);
+        auto descriptor = allocator.Allocate(key, kObjectSize);
+        ASSERT_TRUE(descriptor) << i;
+        values.emplace_back(kObjectSize, static_cast<char>(i + 1));
+        writes.push_back(
+            {key, *descriptor, {{values.back().data(), kObjectSize}}});
+    }
+    ASSERT_EQ(allocator.GetFileCount(), kBuckets);
+
+    auto write_results = backend.BatchWrite(writes);
+    ASSERT_EQ(write_results.size(), kObjects);
+    for (size_t i = 0; i < kObjects; ++i) ASSERT_TRUE(write_results[i]) << i;
+    EXPECT_EQ(recorded->write_batches, (std::vector<size_t>{2 * kMaxOpen, 2}));
+    EXPECT_EQ(recorded->peak_open, static_cast<int>(kMaxOpen));
+    EXPECT_EQ(recorded->open_now, 0);
+
+    std::vector<std::string> outputs(kObjects, std::string(kObjectSize, '\0'));
+    std::vector<DfsReadRequest> reads;
+    for (size_t i = 0; i < kObjects; ++i) {
+        reads.push_back({writes[i].key,
+                         writes[i].descriptor,
+                         {{outputs[i].data(), kObjectSize}}});
+    }
+    auto read_results = backend.BatchRead(reads);
+    ASSERT_EQ(read_results.size(), kObjects);
+    for (size_t i = 0; i < kObjects; ++i) ASSERT_TRUE(read_results[i]) << i;
+    EXPECT_EQ(outputs, values);
+    EXPECT_EQ(recorded->read_batches, (std::vector<size_t>{2 * kMaxOpen, 2}));
+    EXPECT_EQ(recorded->peak_open, static_cast<int>(kMaxOpen));
+    EXPECT_EQ(recorded->open_now, 0);
+}
+
+TEST_F(Hf3fsAdapterTest, ConcurrentBatchesUseTheSameShard) {
+    constexpr size_t kWorkers = 4;
+    constexpr size_t kObjectsPerWorker = 2;
+    constexpr size_t kObjectSize = 4096;
+    DistributedStorageConfig config;
+    config.fsdir = test_dir_->path();
+    config.fs_adapter_type = "hf3fs";
+    config.shard_count = 1;
+    config.shard_capacity = 1024 * 1024;
+    config.alignment = 4096;
+
+    ShardAllocator allocator;
+    ASSERT_TRUE(allocator.Init(config));
+    std::vector<DistributedFSDescriptor> descriptors;
+    for (size_t i = 0; i < kWorkers * kObjectsPerWorker; ++i) {
+        auto descriptor =
+            allocator.Allocate("key_" + std::to_string(i), kObjectSize);
+        ASSERT_TRUE(descriptor);
+        descriptors.push_back(*descriptor);
+    }
+    FileStorageConfig file_config;
+    DistributedStorageBackend backend(file_config, config,
+                                      std::make_unique<Hf3fsAdapter>());
+    ASSERT_TRUE(backend.Init());
+
+    std::barrier start(static_cast<std::ptrdiff_t>(kWorkers));
+    std::vector<std::future<bool>> workers;
+    for (size_t worker = 0; worker < kWorkers; ++worker) {
+        workers.push_back(std::async(std::launch::async, [&, worker] {
+            std::vector<std::string> values(
+                kObjectsPerWorker,
+                std::string(kObjectSize, static_cast<char>('A' + worker)));
+            std::vector<std::string> outputs(kObjectsPerWorker,
+                                             std::string(kObjectSize, '\0'));
+            std::vector<DfsWriteRequest> writes;
+            std::vector<DfsReadRequest> reads;
+            for (size_t i = 0; i < kObjectsPerWorker; ++i) {
+                const size_t index = worker * kObjectsPerWorker + i;
+                const auto key = "key_" + std::to_string(index);
+                writes.push_back({key,
+                                  descriptors[index],
+                                  {{values[i].data(), kObjectSize}}});
+                reads.push_back({key,
+                                 descriptors[index],
+                                 {{outputs[i].data(), kObjectSize}}});
+            }
+            // Initialize each thread's USRBIO resources before concurrent I/O.
+            auto warmup = backend.BatchRead(reads);
+            start.arrive_and_wait();
+            if (warmup.size() != kObjectsPerWorker) return false;
+            for (const auto& result : warmup) {
+                if (!result) return false;
+            }
+            auto written = backend.BatchWrite(writes);
+            auto read = backend.BatchRead(reads);
+            if (written.size() != kObjectsPerWorker ||
+                read.size() != kObjectsPerWorker) {
+                return false;
+            }
+            for (size_t i = 0; i < kObjectsPerWorker; ++i) {
+                if (!written[i] || !read[i]) return false;
+            }
+            return outputs == values;
+        }));
+    }
+    for (auto& worker : workers) EXPECT_TRUE(worker.get());
 }
 
 }  // namespace mooncake::test

@@ -299,6 +299,22 @@ set_tests_properties(dfs_read_checksum_test
                      PROPERTIES ENVIRONMENT "MOONCAKE_STORE_CHECKSUM=1")
 if(USE_3FS)
   add_store_test(dfs_hf3fs_test dfs_hf3fs_test.cpp)
+  # Compile the adapter against the fake USRBIO C API in this test executable.
+  # No mounted 3FS cluster is needed to exercise ring/completion failures.
+  add_executable(
+    hf3fs_adapter_batch_test
+    hf3fs_adapter_batch_test.cpp ../src/storage/distributed/hf3fs_adapter.cpp
+    ../src/hf3fs/hf3fs_resource_manager.cpp)
+  target_include_directories(
+    hf3fs_adapter_batch_test
+    PRIVATE
+      $<TARGET_PROPERTY:mooncake_store,INTERFACE_INCLUDE_DIRECTORIES>
+      $<TARGET_PROPERTY:cachelib_memory_allocator,INTERFACE_INCLUDE_DIRECTORIES>
+  )
+  target_link_libraries(
+    hf3fs_adapter_batch_test PRIVATE glog::glog yalantinglibs::yalantinglibs
+                                     gtest gtest_main pthread)
+  add_test(NAME hf3fs_adapter_batch_test COMMAND hf3fs_adapter_batch_test)
 endif()
 add_store_test(
   embedded_snapshot_catalog_store_test

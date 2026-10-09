@@ -10,6 +10,19 @@ descriptor-based DFS replicas. It is selected explicitly with
 `MOONCAKE_DFS_FS_ADAPTER=hf3fs`; the legacy `--root_fs_dir` option does not
 enable it, and it does not automatically fall back to POSIX I/O.
 
+Descriptor batches use the per-thread USRBIO read or write ring to keep several
+positional requests in flight. Each request owns a separate slice of the shared
+staging buffer until its completion is reaped. Batches larger than the ring and
+requests larger than a staging slice are processed in bounded waves; completion
+order does not change the order of returned results. A short transfer or an I/O
+error fails only the affected request. A failure to reap completions retires the
+thread's rings and staging buffer before another call can reuse them.
+
+The `hf3fs_adapter_batch_test` unit test uses a fake USRBIO API and needs no
+mounted cluster. `dfs_hf3fs_test` exercises the real API, including batches that
+exceed the ring and staging-buffer capacities, using `MOONCAKE_DFS_ROOT_DIR`
+(default: `/mnt/3fs/mooncake_test`). Both targets are built with `USE_3FS=ON`.
+
 ## Prerequisites
 
 ### 1. HF3FS installation

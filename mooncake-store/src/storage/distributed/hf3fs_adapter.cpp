@@ -8,7 +8,9 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
+#include <deque>
 #include <filesystem>
+#include <limits>
 
 #include <glog/logging.h>
 
@@ -448,144 +450,215 @@ tl::expected<void, ErrorCode> Hf3fsAdapter::PreallocateFile(
     return {};
 }
 
+namespace {
+
+struct IovCursor {
+    int index = 0;
+    size_t offset = 0;
+
+    void Copy(const iovec* iov, uint8_t* buffer, size_t length, bool read) {
+        while (length > 0) {
+            if (offset == iov[index].iov_len) {
+                ++index;
+                offset = 0;
+                continue;
+            }
+            const size_t count = std::min(length, iov[index].iov_len - offset);
+            auto* data = static_cast<char*>(iov[index].iov_base) + offset;
+            if (read) {
+                memcpy(data, buffer, count);
+            } else {
+                memcpy(buffer, data, count);
+            }
+            buffer += count;
+            offset += count;
+            length -= count;
+        }
+    }
+};
+
+}  // namespace
+
 tl::expected<size_t, ErrorCode> Hf3fsAdapter::WriteAt(int fd, const iovec* iov,
                                                       int iovcnt,
                                                       int64_t offset) {
-    if (fd < 0 || offset < 0 || iovcnt < 0 || (iovcnt > 0 && iov == nullptr)) {
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-    for (int i = 0; i < iovcnt; ++i) {
-        if (!iov[i].iov_base && iov[i].iov_len > 0) {
-            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-        }
-    }
-
-    auto* resource = resource_manager_->getThreadResource();
-    if (!resource || !resource->initialized) {
-        return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
-    }
-
-    size_t total_length = 0;
-    for (int i = 0; i < iovcnt; ++i) total_length += iov[i].iov_len;
-    if (total_length == 0) return size_t{0};
-
-    auto& threefs_iov = resource->iov_;
-    auto& ior_write = resource->ior_write_;
-    size_t total_written = 0;
-    size_t remaining = total_length;
-    int iov_idx = 0;
-    size_t iov_off = 0;
-    off_t current_offset = static_cast<off_t>(offset);
-
-    while (remaining > 0) {
-        size_t chunk = std::min(remaining, resource->config_.iov_size);
-        size_t copied = 0;
-        char* dest = reinterpret_cast<char*>(threefs_iov.base);
-        while (copied < chunk && iov_idx < iovcnt) {
-            if (iov_off >= iov[iov_idx].iov_len) {
-                ++iov_idx;
-                iov_off = 0;
-                continue;
-            }
-            size_t n = std::min(chunk - copied, iov[iov_idx].iov_len - iov_off);
-            memcpy(dest + copied,
-                   static_cast<char*>(iov[iov_idx].iov_base) + iov_off, n);
-            copied += n;
-            iov_off += n;
-        }
-        if (copied == 0) break;
-
-        int ret =
-            hf3fs_prep_io(&ior_write, &threefs_iov, false, threefs_iov.base, fd,
-                          current_offset, copied, nullptr);
-        if (ret < 0) break;
-        ret = hf3fs_submit_ios(&ior_write);
-        if (ret < 0) break;
-        struct hf3fs_cqe cqe;
-        ret = hf3fs_wait_for_ios(&ior_write, &cqe, 1, 1, nullptr);
-        if (ret < 0 || cqe.result < 0) break;
-
-        size_t bytes_written = cqe.result;
-        if (bytes_written == 0) break;
-        total_written += bytes_written;
-        current_offset += bytes_written;
-        remaining -= bytes_written;
-        if (bytes_written < copied) break;
-    }
-
-    if (total_written != total_length) {
-        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
-    }
-    return total_written;
+    const FdIoRequest request{fd, const_cast<iovec*>(iov), iovcnt, offset};
+    return BatchWriteAt({&request, 1}).front();
 }
 
 tl::expected<size_t, ErrorCode> Hf3fsAdapter::ReadAt(int fd, iovec* iov,
                                                      int iovcnt,
                                                      int64_t offset) {
-    if (fd < 0 || offset < 0 || iovcnt < 0 || (iovcnt > 0 && iov == nullptr)) {
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-    for (int i = 0; i < iovcnt; ++i) {
-        if (!iov[i].iov_base && iov[i].iov_len > 0) {
-            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    const FdIoRequest request{fd, iov, iovcnt, offset};
+    return BatchReadAt({&request, 1}).front();
+}
+
+std::vector<tl::expected<size_t, ErrorCode>> Hf3fsAdapter::BatchWriteAt(
+    std::span<const FdIoRequest> requests) {
+    return BatchIo(requests, false);
+}
+
+std::vector<tl::expected<size_t, ErrorCode>> Hf3fsAdapter::BatchReadAt(
+    std::span<const FdIoRequest> requests) {
+    return BatchIo(requests, true);
+}
+
+std::vector<tl::expected<size_t, ErrorCode>> Hf3fsAdapter::BatchIo(
+    std::span<const FdIoRequest> requests, bool read) {
+    const auto io_error =
+        read ? ErrorCode::FILE_READ_FAIL : ErrorCode::FILE_WRITE_FAIL;
+    std::vector<tl::expected<size_t, ErrorCode>> results(
+        requests.size(), tl::make_unexpected(io_error));
+    struct RequestState {
+        size_t length = 0;
+        size_t completed = 0;
+        IovCursor cursor;
+    };
+    std::vector<RequestState> states(requests.size());
+    std::deque<size_t> pending;
+    for (size_t i = 0; i < requests.size(); ++i) {
+        const auto& request = requests[i];
+        if (request.fd < 0 || request.offset < 0 || request.iovcnt < 0 ||
+            (request.iovcnt > 0 && !request.iov)) {
+            results[i] = tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            continue;
         }
-    }
-
-    auto* resource = resource_manager_->getThreadResource();
-    if (!resource || !resource->initialized) {
-        return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
-    }
-
-    size_t total_length = 0;
-    for (int i = 0; i < iovcnt; ++i) total_length += iov[i].iov_len;
-    if (total_length == 0) return size_t{0};
-
-    auto& threefs_iov = resource->iov_;
-    auto& ior_read = resource->ior_read_;
-    size_t total_read = 0;
-    size_t remaining = total_length;
-    int iov_idx = 0;
-    size_t iov_off = 0;
-    off_t current_offset = static_cast<off_t>(offset);
-
-    while (remaining > 0) {
-        size_t chunk = std::min(remaining, resource->config_.iov_size);
-        int ret = hf3fs_prep_io(&ior_read, &threefs_iov, true, threefs_iov.base,
-                                fd, current_offset, chunk, nullptr);
-        if (ret < 0) break;
-        ret = hf3fs_submit_ios(&ior_read);
-        if (ret < 0) break;
-        struct hf3fs_cqe cqe;
-        ret = hf3fs_wait_for_ios(&ior_read, &cqe, 1, 1, nullptr);
-        if (ret < 0 || cqe.result < 0) break;
-
-        size_t bytes_read = cqe.result;
-        if (bytes_read == 0) break;
-
-        size_t to_copy = bytes_read;
-        char* src = reinterpret_cast<char*>(threefs_iov.base);
-        while (to_copy > 0 && iov_idx < iovcnt) {
-            if (iov_off >= iov[iov_idx].iov_len) {
-                ++iov_idx;
-                iov_off = 0;
-                continue;
+        // Bound both the aggregate length and every later positional offset.
+        const auto max_length = static_cast<size_t>(
+            std::numeric_limits<int64_t>::max() - request.offset);
+        auto& state = states[i];
+        bool valid = true;
+        for (int j = 0; j < request.iovcnt; ++j) {
+            const auto& iov = request.iov[j];
+            if ((!iov.iov_base && iov.iov_len > 0) ||
+                iov.iov_len > max_length - state.length) {
+                valid = false;
+                break;
             }
-            size_t n = std::min(to_copy, iov[iov_idx].iov_len - iov_off);
-            memcpy(static_cast<char*>(iov[iov_idx].iov_base) + iov_off, src, n);
-            src += n;
-            to_copy -= n;
-            total_read += n;
-            remaining -= n;
-            current_offset += n;
-            iov_off += n;
+            state.length += iov.iov_len;
         }
-        if (bytes_read < chunk) break;
+        if (!valid) {
+            results[i] = tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        } else if (state.length == 0) {
+            results[i] = size_t{0};
+        } else {
+            pending.push_back(i);
+        }
     }
+    if (pending.empty()) return results;
 
-    if (total_read != total_length) {
-        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    auto* resource =
+        resource_manager_ ? resource_manager_->getThreadResource() : nullptr;
+    if (!resource) {
+        for (const auto i : pending) {
+            results[i] = tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+        }
+        return results;
     }
-    return total_read;
+    auto& iov = resource->iov_;
+    auto& ior = read ? resource->ior_read_ : resource->ior_write_;
+    const int entries = hf3fs_io_entries(&ior);
+    if (entries <= 0 || !iov.base || iov.size == 0) return results;
+
+    // A slot owns its staging slice until its CQE is reaped. Limit each logical
+    // request to one chunk per wave so a short transfer cannot submit its tail.
+    const size_t slot_count =
+        std::min({pending.size(), static_cast<size_t>(entries), iov.size});
+    struct Chunk {
+        size_t request = 0;
+        uint8_t* buffer = nullptr;
+        size_t length = 0;
+        int index = -1;
+        bool active = false;
+    };
+    std::vector<Chunk> chunks(slot_count);
+    std::vector<hf3fs_cqe> cqes(slot_count);
+    while (!pending.empty()) {
+        // Give the remaining requests larger slices as their peers finish.
+        const size_t wave_slots = std::min(slot_count, pending.size());
+        const size_t slot_size = iov.size / wave_slots;
+        size_t prepared = 0;
+        while (!pending.empty() && prepared < wave_slots) {
+            const size_t i = pending.front();
+            pending.pop_front();
+            auto& state = states[i];
+            const auto& request = requests[i];
+            auto& chunk = chunks[prepared];
+            chunk = {i, iov.base + prepared * slot_size,
+                     std::min(state.length - state.completed, slot_size)};
+            auto cursor = state.cursor;
+            if (!read)
+                cursor.Copy(request.iov, chunk.buffer, chunk.length, false);
+            const int ret = hf3fs_prep_io(
+                &ior, &iov, read, chunk.buffer, request.fd,
+                request.offset + state.completed, chunk.length, &chunk);
+            if (ret == -EAGAIN && prepared > 0) {
+                pending.push_front(i);
+                break;
+            }
+            if (ret < 0) continue;
+            chunk.index = ret;
+            chunk.active = true;
+            if (!read) state.cursor = cursor;
+            ++prepared;
+        }
+        if (prepared == 0) continue;
+
+        // prep_io publishes immediately; even a failed submit notification
+        // must not abandon prepared requests or recycle their staging slices.
+        const bool submit_failed = hf3fs_submit_ios(&ior) < 0;
+        size_t outstanding = prepared;
+        while (outstanding > 0) {
+            const int count = hf3fs_wait_for_ios(
+                &ior, cqes.data(), static_cast<int>(outstanding), 1, nullptr);
+            if (count == -EINTR || count == -EAGAIN || count == 0) continue;
+            if (count < 0 || static_cast<size_t>(count) > outstanding) {
+                LOG(ERROR) << "3FS batch completion wait failed: " << count;
+                // No reliable way to reap this ring remains. Retire both rings
+                // and the shared buffer so later calls cannot reuse live slices
+                // or consume stale CQEs. The resource manager recreates them.
+                resource->Cleanup();
+                return results;
+            }
+            for (int c = 0; c < count; ++c) {
+                const auto& cqe = cqes[c];
+                auto it = std::find_if(
+                    chunks.begin(), chunks.begin() + prepared,
+                    [&](const Chunk& chunk) {
+                        return &chunk == cqe.userdata && chunk.active &&
+                               chunk.index == cqe.index;
+                    });
+                if (it == chunks.begin() + prepared) {
+                    LOG(ERROR) << "Unexpected 3FS batch completion";
+                    resource->Cleanup();
+                    return results;
+                }
+                auto& chunk = *it;
+                chunk.active = false;
+                --outstanding;
+                if (submit_failed || cqe.result < 0 ||
+                    static_cast<uint64_t>(cqe.result) > chunk.length) {
+                    continue;
+                }
+                auto& state = states[chunk.request];
+                const auto bytes = static_cast<size_t>(cqe.result);
+                if (read) {
+                    state.cursor.Copy(requests[chunk.request].iov, chunk.buffer,
+                                      bytes, true);
+                }
+                state.completed += bytes;
+                // Keep the existing full-transfer-or-error adapter contract.
+                if (bytes != chunk.length) continue;
+                if (state.completed == state.length) {
+                    results[chunk.request] = state.completed;
+                } else {
+                    pending.push_back(chunk.request);
+                }
+            }
+        }
+        if (submit_failed) return results;
+    }
+    return results;
 }
 
 }  // namespace mooncake
