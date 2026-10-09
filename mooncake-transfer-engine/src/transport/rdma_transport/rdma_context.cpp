@@ -40,7 +40,6 @@
 
 #include "config.h"
 #include "cuda_alike.h"
-#include "environ.h"
 #include "hip_device_guard.h"
 #if defined(USE_HIP_DMABUF)
 #include <sys/utsname.h>
@@ -101,7 +100,7 @@ static Mlx5RegDmabufMr dataDirectRegMr() {
 
 bool containsAddress(const MemoryRegionMeta &region, uintptr_t addr) {
     const auto region_start = reinterpret_cast<uintptr_t>(region.addr);
-    const auto region_length = static_cast<uintptr_t>(region.mr->length);
+    const auto region_length = static_cast<uintptr_t>(region.length);
     return region_start <= addr && addr - region_start < region_length;
 }
 
@@ -510,7 +509,7 @@ int RdmaContext::exportDmabuf(void *addr, size_t length, DmabufExport &out) {
     out = DmabufExport{};
     (void)addr;  // unused on the host-only (#else) build
     (void)length;
-    const bool data_direct = Environ::Get().GetRdmaDataDirect();
+    const bool data_direct = globalConfig().rdma_data_direct;
     if (data_direct) {
 #ifdef USE_CUDA
         if (!dataDirectRegMr()) return ERR_CONTEXT;
@@ -533,7 +532,7 @@ int RdmaContext::exportDmabuf(void *addr, size_t length, DmabufExport &out) {
         out.method = DmabufExport::Method::kHostReg;
 #if defined(USE_CUDA) || defined(USE_SUPA)
     } else if (memType == CU_MEMORYTYPE_DEVICE &&
-               Environ::Get().GetWithNvidiaPeermem() && !data_direct) {
+               globalConfig().with_nvidia_peermem && !data_direct) {
         // WITH_NVIDIA_PEERMEM env var is set: use ibv_reg_mr() directly for
         // GPU memory (requires the nvidia-peermem kernel module to be loaded).
         out.method = DmabufExport::Method::kHostReg;
@@ -763,6 +762,7 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
         return ERR_INVALID_ARGUMENT;
     }
     mrMeta.addr = addr;
+    mrMeta.length = length;
 #if defined(USE_MLU) || defined(USE_MACA) || defined(USE_CUDA) || \
     defined(USE_HIP_DMABUF) || defined(USE_SUPA)
     if (exp.method == DmabufExport::Method::kDmabufReg) {
@@ -771,11 +771,20 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
         // reference, so all NICs share one dma_buf object (and one BAR1
         // window).
 #ifdef USE_CUDA
-        if (Environ::Get().GetRdmaDataDirect()) {
+        if (globalConfig().rdma_data_direct) {
             auto reg_mr = dataDirectRegMr();
             if (!reg_mr) return ERR_CONTEXT;
-            mrMeta.mr = reg_mr(pd_, exp.offset, length, (uintptr_t)addr, exp.fd,
-                               access, MLX5DV_REG_DMABUF_ACCESS_DATA_DIRECT);
+            const size_t prefix = (uintptr_t)addr % getpagesize();
+            if (exp.offset < prefix ||
+                prefix > (size_t)globalConfig().max_mr_size - length) {
+                LOG(ERROR) << "Cannot align Data Direct memory region at "
+                           << addr << " length " << length << " dmabuf_offset "
+                           << exp.offset;
+                return ERR_INVALID_ARGUMENT;
+            }
+            mrMeta.mr = reg_mr(pd_, exp.offset - prefix, length + prefix,
+                               (uintptr_t)addr - prefix, exp.fd, access,
+                               MLX5DV_REG_DMABUF_ACCESS_DATA_DIRECT);
         } else
 #endif
         {
@@ -793,7 +802,7 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
         PLOG(ERROR) << "Failed to register memory " << addr << " length "
                     << length << " dmabuf_offset " << exp.offset << " on "
                     << device_name_ << " MC_RDMA_DATA_DIRECT="
-                    << Environ::Get().GetRdmaDataDirect();
+                    << globalConfig().rdma_data_direct;
         return ERR_CONTEXT;
     }
     return 0;
@@ -838,8 +847,9 @@ int RdmaContext::unregisterMemoryRegion(void *addr) {
     // reading mr->length (or the cached region length) afterwards is a use-
     // after-free. We restore fork state on the same range to undo the
     // MADV_DONTFORK applied at register time (see issue #3639).
-    void *region_addr = iter->second.addr;
     size_t region_length = iter->second.mr->length;
+    void *region_addr = static_cast<char *>(iter->second.addr) -
+                        (region_length - iter->second.length);
     if (ibv_dereg_mr(iter->second.mr)) {
         LOG(ERROR) << "Failed to unregister memory " << addr;
         return ERR_CONTEXT;
@@ -1525,7 +1535,7 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
         // not just GPUs listing it as preferred.  Runtime selection falls
         // back to avail_hca when a preferred NIC is disabled, so we must
         // validate both lists.
-        if (!Environ::Get().GetWithNvidiaPeermem()) {
+        if (!globalConfig().with_nvidia_peermem) {
             std::vector<int> mapped_gpu_devices;
             if (engine_.local_topology_) {
                 const auto topology_matrix =
@@ -1602,7 +1612,7 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
                     }
                 }
             }
-        }  // !Environ::Get().GetWithNvidiaPeermem()
+        }  // !globalConfig().with_nvidia_peermem
 #endif
 
         ibv_port_attr port_attr;
@@ -1621,6 +1631,19 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
         }
 
         updateGlobalConfig(device_attr);
+        max_qp_rd_atom_ = clampRdAtomicDepth(device_attr.max_qp_rd_atom);
+        max_qp_init_rd_atom_ =
+            clampRdAtomicDepth(device_attr.max_qp_init_rd_atom);
+        if (max_qp_rd_atom_ < kIdealRdAtomicDepth ||
+            max_qp_init_rd_atom_ < kIdealRdAtomicDepth) {
+            LOG(WARNING)
+                << "Device " << device_name
+                << " advertises a reduced RD-atomic depth: max_qp_rd_atom="
+                << max_qp_rd_atom_
+                << ", max_qp_init_rd_atom=" << max_qp_init_rd_atom_
+                << "; QPs on this NIC will use those "
+                << "values instead of the default " << kIdealRdAtomicDepth;
+        }
         GidNetworkState gid_state;
         auto_gid_selection_enabled_ = gid_index < 0;
         if (gid_index < 0) {
