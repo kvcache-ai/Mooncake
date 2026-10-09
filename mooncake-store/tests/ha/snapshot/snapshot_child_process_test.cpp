@@ -243,6 +243,13 @@ class SnapshotChildProcessTest : public ::testing::Test {
             config.group_ids =
                 std::vector<std::string>{importing->manifest.payload_group_id};
             const auto manifest_key = MakeWeightManifestKey(identity);
+            OpLogBatchStorage setup_storage(cluster, *backend);
+            DurablePrefix setup_prefix;
+            ASSERT_EQ(ErrorCode::OK,
+                      setup_storage.ReadDurablePrefix(setup_prefix));
+            auto& setup_writer =
+                MasterServiceTestPeer::OrderedOplogWriter(*service_);
+            ASSERT_NE(nullptr, setup_writer);
             for (const auto& key : {std::string("payload"), manifest_key}) {
                 config.data_type = key == "payload" ? ObjectDataType::WEIGHT
                                                     : ObjectDataType::METADATA;
@@ -250,6 +257,32 @@ class SnapshotChildProcessTest : public ::testing::Test {
                                                TenantId::Default(), 1, config));
                 ASSERT_TRUE(service_->PutEnd(
                     client_id, key, TenantId::Default(), ReplicaType::MEMORY));
+                // Public PutEnd returns before its OpLog entry is durable.
+                // Keep the single-slot writer drained during fixture setup.
+                const uint64_t expected_sequence = setup_prefix.last_seq + 1;
+                const uint64_t expected_batch = setup_prefix.batch_id + 1;
+                auto promise = std::make_shared<std::promise<ErrorCode>>();
+                auto durable = promise->get_future();
+                [[maybe_unused]] auto notification =
+                    setup_writer->AwaitDurable(expected_sequence)
+                        .thenValue([promise](ErrorCode error) {
+                            promise->set_value(error);
+                        });
+                ASSERT_EQ(std::future_status::ready,
+                          durable.wait_for(std::chrono::seconds(5)));
+                ASSERT_EQ(ErrorCode::OK, durable.get());
+                OpLogBatchRecord setup_batch;
+                ASSERT_EQ(ErrorCode::OK,
+                          setup_storage.ReadBatch(expected_batch, setup_batch));
+                ASSERT_EQ(1u, setup_batch.entries.size());
+                const auto& entry = setup_batch.entries.front();
+                EXPECT_EQ(OpType::PUT_END, entry.op_type);
+                EXPECT_EQ(key, entry.object_key);
+                EXPECT_EQ(expected_sequence, entry.sequence_id);
+                ASSERT_EQ(ErrorCode::OK,
+                          setup_storage.ReadDurablePrefix(setup_prefix));
+                EXPECT_EQ(expected_batch, setup_prefix.batch_id);
+                EXPECT_EQ(expected_sequence, setup_prefix.last_seq);
             }
             auto committed =
                 service_->CommitWeightImport(CommitWeightImportRequest{

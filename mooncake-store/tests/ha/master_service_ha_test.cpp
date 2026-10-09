@@ -6314,10 +6314,10 @@ TEST_F(MasterServiceHATest,
                       .set_oplog_batch_max_entries(1)
                       .build();
     MasterService service(config);
-    ASSERT_EQ(
-        ErrorCode::OK,
-        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
+    auto* writer = InstallGatedWriter(service, backend);
+    ASSERT_NE(nullptr, writer);
     const auto segment = PrepareSimpleSegment(service);
+    ASSERT_TRUE(writer->RunCallbacksThrough(1));
     const WeightRevisionIdentity identity{
         .tenant_id = "default",
         .name_space = "production",
@@ -6339,6 +6339,7 @@ TEST_F(MasterServiceHATest,
     replicate.with_hard_pin = true;
     replicate.group_ids =
         std::vector<std::string>{importing->manifest.payload_group_id};
+    uint64_t put_sequence = 3;
     for (const auto& key : {payload_key, manifest_key}) {
         replicate.data_type = key == payload_key ? ObjectDataType::WEIGHT
                                                  : ObjectDataType::METADATA;
@@ -6347,6 +6348,8 @@ TEST_F(MasterServiceHATest,
                                      replicate));
         ASSERT_TRUE(service.PutEnd(segment.client_id, key, kDefaultTenant,
                                    ReplicaType::MEMORY));
+        // PutEnd returns before durability; drain the single-entry writer.
+        ASSERT_TRUE(writer->RunCallbacksThrough(put_sequence++));
     }
     const auto ready = service.CommitWeightImport({
         .identity = identity,
