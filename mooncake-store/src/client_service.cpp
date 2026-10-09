@@ -1653,9 +1653,11 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
         for (auto& [segment, op] : seg_to_op_map) {
             for (size_t idx = 0; idx < op.key_indexes.size(); ++idx) {
                 const auto index = op.key_indexes[idx];
-                if (results[index].has_value() &&
-                    ShouldAdmitToHotCache(object_keys[index],
-                                          op.cache_used[idx])) {
+                if (results[index].has_value() && idx < op.replicas.size() &&
+                    idx < op.batched_slices.size() &&
+                    ShouldAdmitToHotCache(
+                        object_keys[index],
+                        idx < op.cache_used.size() && op.cache_used[idx])) {
                     ProcessSlicesAsync(object_keys[index],
                                        op.batched_slices[idx],
                                        op.replicas[idx]);
@@ -1910,9 +1912,13 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     if (hot_cache_) {
         for (auto& [index, key, future, stored_replica, cache_used] :
              pending_transfers) {
-            if (results[index].has_value() &&
+            if (!results[index].has_value()) {
+                continue;
+            }
+            auto slices_it = slices.find(key);
+            if (slices_it != slices.end() &&
                 ShouldAdmitToHotCache(key, cache_used)) {
-                ProcessSlicesAsync(key, slices.at(key), stored_replica);
+                ProcessSlicesAsync(key, slices_it->second, stored_replica);
             }
         }
     }
