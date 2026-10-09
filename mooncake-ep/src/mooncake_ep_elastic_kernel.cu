@@ -13,6 +13,7 @@
 #include <transport/device/comm_device.cuh>
 #if !defined(MOONCAKE_EP_USE_MUSA) && !defined(MOONCAKE_EP_USE_MACA)
 #include <jit/elastic_combine_jit.h>
+#include <jit/elastic_combine_reduce_epilogue_jit.h>
 #include <jit/elastic_dispatch_copy_epilogue_jit.h>
 #include <jit/elastic_dispatch_jit.h>
 #include <jit/elastic_dispatch_prologue_jit.h>
@@ -1228,8 +1229,7 @@ void* launch_mooncake_elastic_combine(
 #endif // !defined(MOONCAKE_EP_USE_MUSA) && !defined(MOONCAKE_EP_USE_MACA)
 }
 
-template <int kNumEpilogueWarps>
-void launch_mooncake_elastic_combine_reduce_epilogue_backend(
+void launch_mooncake_elastic_combine_reduce_epilogue(
     void* combined_x, float* combined_topk_weights, int64_t* combined_topk_idx,
     int num_combined_tokens, int num_max_tokens_per_rank, int hidden,
     int num_experts, int num_topk, void* reduce_buffer, void* bias_0,
@@ -1237,20 +1237,53 @@ void launch_mooncake_elastic_combine_reduce_epilogue_backend(
     bool use_expanded_layout,
     bool allow_multiple_reduction, const ElasticLaunchContext& ctx,
     cudaStream_t stream) {
-    const int num_threads = kNumEpilogueWarps * 32;
+    using elastic::transport::IbgdaOps;
+#ifdef USE_NCCL_DEVICE
+    using elastic::transport::NcclOps;
+    const int num_epilogue_warps =
+        ctx.backend == ElasticTransportBackend::kNccl
+            ? NcclOps::kNumCombineEpilogueWarps
+            : IbgdaOps::kNumCombineEpilogueWarps;
+#else
+    const int num_epilogue_warps = IbgdaOps::kNumCombineEpilogueWarps;
+#endif
     const int smem_bytes = std::max(
-        num_smem_bytes, combine_epilogue_smem_bytes(hidden, kNumEpilogueWarps));
+        num_smem_bytes,
+        combine_epilogue_smem_bytes(hidden, num_epilogue_warps));
+
+    // Neither the JIT nor the prebuilt path instantiates these modes.
+    if (use_expanded_layout || !allow_multiple_reduction)
+        unsupported_elastic_config("combine_reduce_epilogue", hidden,
+                                   num_experts, num_topk,
+                                   num_max_tokens_per_rank, num_sms,
+                                   ctx.num_scaleup_ranks);
+
+    const elastic::CombineReduceEpilogueKernelArgs args {
+        static_cast<nv_bfloat16*>(combined_x),
+        combined_topk_weights,
+        combined_topk_idx,
+        reduce_buffer,
+        bias_0,
+        bias_1,
+        num_combined_tokens,
+    };
+
+#if !defined(MOONCAKE_EP_USE_MUSA) && !defined(MOONCAKE_EP_USE_MACA)
+    jit::launch_elastic_combine_reduce_epilogue_jit(
+        num_epilogue_warps, num_epilogue_sms, ctx.num_scaleout_ranks,
+        ctx.num_scaleup_ranks, hidden, num_max_tokens_per_rank, num_experts,
+        num_topk, smem_bytes, args, stream);
+#else // !defined(MOONCAKE_EP_USE_MUSA) && !defined(MOONCAKE_EP_USE_MACA)
+    // MUSA / MACA builds have no NCCL backend.
+    constexpr int kNumEpilogueWarps = IbgdaOps::kNumCombineEpilogueWarps;
+    const int num_threads = kNumEpilogueWarps * 32;
 
 #define LAUNCH_COMBINE_EPILOGUE(H, E, K, M, S, SO, SU)                         \
     do {                                                                       \
-        auto kernel = elastic::combine_reduce_epilogue_impl<                   \
-            false, true, 0, kNumEpilogueWarps, SO, SU, H, M, E, K>;     \
-        launch_cooperative(kernel, ctx.device_id, num_epilogue_sms, num_threads,              \
-                           smem_bytes, stream,                                   \
-                           static_cast<nv_bfloat16*>(combined_x),              \
-                           combined_topk_weights, combined_topk_idx,           \
-                           reduce_buffer, bias_0, bias_1, num_combined_tokens, \
-                           ctx.scaleout_rank_idx, ctx.scaleup_rank_idx);       \
+        auto kernel = elastic::combine_reduce_epilogue<                        \
+            false, true, 0, kNumEpilogueWarps, SO, SU, H, M, E, K>;            \
+        launch_cooperative(kernel, ctx.device_id, num_epilogue_sms,            \
+                           num_threads, smem_bytes, stream, args);             \
     } while (false)
 
 #define TRY_COMBINE_EPILOGUE(H, E, K, M, S, SO, SU)                            \
@@ -1284,34 +1317,7 @@ void launch_mooncake_elastic_combine_reduce_epilogue_backend(
     unsupported_elastic_config("combine_reduce_epilogue", hidden, num_experts,
                                num_topk, num_max_tokens_per_rank, num_sms,
                                ctx.num_scaleup_ranks);
-}
-
-
-void launch_mooncake_elastic_combine_reduce_epilogue(
-    void* combined_x, float* combined_topk_weights, int64_t* combined_topk_idx,
-    int num_combined_tokens, int num_max_tokens_per_rank, int hidden,
-    int num_experts, int num_topk, void* reduce_buffer, void* bias_0,
-    void* bias_1, int num_sms, int num_epilogue_sms, int num_smem_bytes,
-    bool use_expanded_layout,
-    bool allow_multiple_reduction, const ElasticLaunchContext& ctx,
-    cudaStream_t stream) {
-#define CALL_COMBINE_EPILOGUE(WARPS)                                           \
-    launch_mooncake_elastic_combine_reduce_epilogue_backend<WARPS>(            \
-        combined_x, combined_topk_weights, combined_topk_idx,                  \
-        num_combined_tokens, num_max_tokens_per_rank, hidden, num_experts,     \
-        num_topk, reduce_buffer, bias_0, bias_1, num_sms, num_epilogue_sms,    \
-        num_smem_bytes,                                                        \
-        use_expanded_layout, allow_multiple_reduction, ctx, stream)
-#ifdef USE_NCCL_DEVICE
-    if (ctx.backend == ElasticTransportBackend::kNccl) {
-        CALL_COMBINE_EPILOGUE(
-            elastic::transport::NcclOps::kNumCombineEpilogueWarps);
-        return;
-    }
-#endif
-    CALL_COMBINE_EPILOGUE(
-        elastic::transport::IbgdaOps::kNumCombineEpilogueWarps);
-#undef CALL_COMBINE_EPILOGUE
+#endif // !defined(MOONCAKE_EP_USE_MUSA) && !defined(MOONCAKE_EP_USE_MACA)
 }
 
 }  // namespace mooncake
