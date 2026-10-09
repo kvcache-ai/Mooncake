@@ -832,8 +832,10 @@ class MasterServiceHATest : public ::testing::Test {
         MasterServiceTestPeer::MetadataAccessorRW accessor(
             &service, MasterServiceTestPeer::ObjectIdentity{tenant_id, key});
         ASSERT_TRUE(accessor.Exists());
-        SpinLocker locker(&accessor.Get().lock);
-        accessor.Get().lease_->SetDeadline(deadline);
+        {
+            SpinLocker locker(&accessor.Get().lock);
+            accessor.Get().lease_->SetDeadline(deadline);
+        }
     }
 
     static std::chrono::system_clock::time_point LeaseDeadlineForTesting(

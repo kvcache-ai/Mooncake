@@ -167,16 +167,38 @@ class Tenant {
         return entry != nullptr && object_index_.IsCurrent(entry->key(), entry);
     }
 
+    // The same answer from under the entry's own lock, given the `state` that
+    // lock guards, without a route lookup: only TearDownObject drops a route
+    // slot, and it marks the entry torn down under that lock first, so a
+    // published entry not yet torn down is still the one its slot holds.
+    [[nodiscard]] static bool IsPublishedObject(
+        const ObjectEntry& entry, const ObjectEntry::State& state) {
+        return entry.IsPublished() && !state.is_torn_down;
+    }
+
     [[nodiscard]] size_t ObjectCount() const {
         return object_index_.ObjectCount();
     }
 
-    // Strong handles to what is routed right now, for a scan that acts on them
-    // after it ends: resolve each key again before mutating anything, since an
-    // entry can be replaced under the same key in between.
+    // Strong handles to what is routed right now, for a scan that needs them
+    // all at once, such as one that orders them: resolve each key again before
+    // mutating anything, since an entry can be replaced under the same key in
+    // between. A scan that visits each object once walks `Objects()`.
     [[nodiscard]] std::vector<std::shared_ptr<ObjectEntry>> SnapshotObjects()
         const {
         return object_index_.SnapshotObjects();
+    }
+
+    // Every published object in turn, under its own lock, shared or exclusive;
+    // see ObjectIndex::Objects for what the loop body may do. An object it
+    // visits is the current publication of its key, so the body needs no
+    // route check; one that acts after the walk keeps `handle()` and goes
+    // through `WithPublishedObject` like any other handle.
+    [[nodiscard]] ObjectIndex::Walk<false> Objects() const {
+        return object_index_.Objects();
+    }
+    [[nodiscard]] ObjectIndex::Walk<true> MutableObjects() {
+        return object_index_.MutableObjects();
     }
 
     // True when the tenant holds no object and no group membership.
@@ -218,39 +240,33 @@ class Tenant {
     void RebuildGroupState() {
         std::unordered_map<std::string, std::chrono::system_clock::time_point>
             max_deadline_by_group;
-        const auto objects = object_index_.SnapshotObjects();
-        for (const auto& entry : objects) {
-            entry->WithSharedAccess(
-                [&](const ObjectMetadata& metadata, const ObjectEntry::State&) {
-                    if (!metadata.IsGrouped()) {
-                        return;
-                    }
-                    const auto deadline = metadata.EvictionDeadline();
-                    auto [it, inserted] = max_deadline_by_group.try_emplace(
-                        metadata.group_id, deadline);
-                    if (!inserted) {
-                        it->second = std::max(it->second, deadline);
-                    }
-                });
+        for (auto object : object_index_.Objects()) {
+            const ObjectMetadata& metadata = object.metadata();
+            if (!metadata.IsGrouped()) {
+                continue;
+            }
+            const auto deadline = metadata.EvictionDeadline();
+            auto [it, inserted] =
+                max_deadline_by_group.try_emplace(metadata.group_id, deadline);
+            if (!inserted) {
+                it->second = std::max(it->second, deadline);
+            }
         }
-        for (const auto& entry : objects) {
-            // `group_id` is a const member of the envelope, so it reads without
-            // the entry lock, unlike the metadata write below.
-            const std::string group_id = entry->group_id();
+        // The group index is below the route in the lock order, so the walk
+        // registers membership from inside it.
+        for (auto object : object_index_.MutableObjects()) {
+            const std::string& group_id = object.metadata().group_id;
             if (group_id.empty()) {
                 continue;
             }
-            auto lease = group_index_.AddMember(group_id, entry->key());
+            auto lease = group_index_.AddMember(group_id, object.key());
             // A non-empty group_id always yields a lease, as in InsertObject.
             assert(lease != nullptr);
             const auto it = max_deadline_by_group.find(group_id);
             if (it != max_deadline_by_group.end()) {
                 lease->ExtendTo(it->second);
             }
-            entry->WithExclusiveAccess(
-                [&](ObjectMetadata& metadata, ObjectEntry::State&) {
-                    metadata.lease_ = std::move(lease);
-                });
+            object.metadata().lease_ = std::move(lease);
         }
     }
 
@@ -399,18 +415,14 @@ class Tenant {
     // account. Throws std::overflow_error past the accounting range.
     [[nodiscard]] uint64_t QuotaUsage() const {
         uint64_t charged_bytes = 0;
-        for (const auto& entry : object_index_.SnapshotObjects()) {
-            entry->WithSharedAccess(
-                [&](const ObjectMetadata& metadata, const ObjectEntry::State&) {
-                    const uint64_t charge = MemoryQuotaCharge(metadata);
-                    if (charge > TenantQuotaAccount::kMaxChargedBytes ||
-                        charged_bytes >
-                            TenantQuotaAccount::kMaxChargedBytes - charge) {
-                        throw std::overflow_error(
-                            "rebuilt tenant quota exceeds 2^63 - 1 bytes");
-                    }
-                    charged_bytes += charge;
-                });
+        for (auto object : object_index_.Objects()) {
+            const uint64_t charge = MemoryQuotaCharge(object.metadata());
+            if (charge > TenantQuotaAccount::kMaxChargedBytes ||
+                charged_bytes > TenantQuotaAccount::kMaxChargedBytes - charge) {
+                throw std::overflow_error(
+                    "rebuilt tenant quota exceeds 2^63 - 1 bytes");
+            }
+            charged_bytes += charge;
         }
         return charged_bytes;
     }
@@ -419,18 +431,15 @@ class Tenant {
     // while no charge or release is in flight; the account itself is rebuilt
     // by the quota table. Throws std::runtime_error when a ledger rejects it.
     void RebuildQuotaLedgers(const TenantId& tenant_id) {
-        for (const auto& entry : object_index_.SnapshotObjects()) {
-            entry->WithExclusiveAccess(
-                [&](ObjectMetadata& metadata, ObjectEntry::State&) {
-                    auto rebuild_result = metadata.quota_ledger.Rebuild(
-                        quota_account_, MemoryQuotaCharge(metadata));
-                    if (!rebuild_result) {
-                        throw std::runtime_error(
-                            "failed to rebuild object tenant quota ledger "
-                            "for " +
-                            tenant_id.value() + "/" + entry->key());
-                    }
-                });
+        for (auto object : object_index_.MutableObjects()) {
+            ObjectMetadata& metadata = object.metadata();
+            auto rebuild_result = metadata.quota_ledger.Rebuild(
+                quota_account_, MemoryQuotaCharge(metadata));
+            if (!rebuild_result) {
+                throw std::runtime_error(
+                    "failed to rebuild object tenant quota ledger for " +
+                    tenant_id.value() + "/" + object.key());
+            }
         }
     }
 

@@ -1063,12 +1063,9 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
             tenants_.Visit(
                 [&](const TenantId&,
                     const std::shared_ptr<metadata::Tenant>& tenant) {
-                    for (const auto& entry : tenant->SnapshotObjects()) {
-                        ObjectEntry::ExclusiveHold hold(*entry);
-                        if (!tenant->IsPublishedObject(entry)) {
-                            continue;
-                        }
-                        auto& metadata = hold.metadata();
+                    for (auto object : tenant->MutableObjects()) {
+                        const auto& entry = object.handle();
+                        auto& metadata = object.metadata();
                         metadata.VisitReplicas(
                             [](const Replica& replica) {
                                 return replica.is_memory_replica() &&
@@ -1581,11 +1578,8 @@ void MasterService::RebuildCacheTotalAccounting() {
             // The objects are re-resolved one at a time: a route slot can be
             // replaced while this walk runs, and the accounting follows the
             // entry the slot publishes now.
-            for (const auto& entry : tenant->SnapshotObjects()) {
-                entry->WithExclusiveAccess(
-                    [](ObjectMetadata& metadata, ObjectEntry::State&) {
-                        SyncCacheTotalAccounting(metadata);
-                    });
+            for (auto object : tenant->MutableObjects()) {
+                SyncCacheTotalAccounting(object.metadata());
             }
         });
 }
@@ -2321,36 +2315,26 @@ tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
     std::optional<ErrorCode> first_persist_error;
     tenants_.Visit([&](const TenantId& tenant_id,
                        const std::shared_ptr<metadata::Tenant>& tenant) {
-        // The snapshot hands out handles to what the route published, so every
-        // key below is resolved through the route again: an entry can be
-        // replaced under the same key between the snapshot and the access.
-        for (const auto& snapshot_entry : tenant->SnapshotObjects()) {
-            const std::string key = snapshot_entry->key();
-            const ObjectIdentity object_id{tenant_id, key};
-            // Reader pre-check: an object with nothing to sweep skips the write
-            // path and the invalid-replica cleanup it starts with. The object
-            // is re-classified under the write access below, since it may have
-            // changed.
-            {
-                MetadataAccessorRO accessor(this, object_id);
-                if (!accessor.IsPublished()) {
-                    continue;
-                }
-                const auto& metadata = accessor.Get();
-                if (!metadata.HasReplica(is_stale) && metadata.IsValid()) {
-                    continue;
-                }
+        // Reader pre-check: an object with nothing to sweep skips the write
+        // path and the invalid-replica cleanup it starts with. The object is
+        // re-classified under the write access below, since it may have
+        // changed, and one torn down or replaced meanwhile is skipped.
+        std::vector<std::shared_ptr<ObjectEntry>> to_sweep;
+        for (auto object : tenant->Objects()) {
+            const auto& metadata = object.metadata();
+            if (metadata.HasReplica(is_stale) || !metadata.IsValid()) {
+                to_sweep.push_back(object.handle());
             }
+        }
+        for (const auto& entry : to_sweep) {
+            const std::string& key = entry->key();
             // The plain published-object access, not the read-write one: this
             // walk classifies and tears down itself, and the read-write
             // accessor would drop the stale replicas before the callback could
             // see what it erased.
             (void)tenant->WithPublishedObject(
-                key, [&](ObjectMetadata& metadata, ObjectEntry::State& state) {
-                    const std::shared_ptr<ObjectEntry> entry = tenant->Get(key);
-                    if (entry == nullptr) {
-                        return;
-                    }
+                entry,
+                [&](ObjectMetadata& metadata, ObjectEntry::State& state) {
                     const auto cleanup_plan =
                         BuildStaleHandleCleanupPlan(metadata, is_stale);
                     if (!cleanup_plan.removed_ids.empty()) {
@@ -2484,22 +2468,13 @@ bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
             }
             bool unfinished_affiliated_replica = false;
             tenants_.Visit(
-                [&](const TenantId& tenant_id,
+                [&](const TenantId&,
                     const std::shared_ptr<metadata::Tenant>& tenant) {
                     if (unfinished_affiliated_replica) {
                         return;
                     }
-                    // Resolved through the route again: the snapshot holds
-                    // handles, and the key may have been republished since.
-                    for (const auto& snapshot_entry :
-                         tenant->SnapshotObjects()) {
-                        const ObjectIdentity object_id{tenant_id,
-                                                       snapshot_entry->key()};
-                        MetadataAccessorRO accessor(this, object_id);
-                        if (!accessor.IsPublished()) {
-                            continue;
-                        }
-                        const auto& metadata = accessor.Get();
+                    for (auto object : tenant->Objects()) {
+                        const auto& metadata = object.metadata();
                         if (metadata.HasReplica([&job](const Replica& replica) {
                                 return replica.is_processing() &&
                                        replica.isAffiliatedWith(job.liveness);
@@ -2858,15 +2833,9 @@ auto MasterService::GetAllKeys(const TenantId& tenant_id)
     if (tenant == nullptr) {
         return all_keys;
     }
-    // The snapshot hands out handles to what the route published, so each key
-    // is resolved through the route again while its object is read.
-    for (const auto& snapshot_entry : tenant->SnapshotObjects()) {
-        const std::string& key = snapshot_entry->key();
-        MetadataAccessorRO accessor(this, ObjectIdentity{tenant_id, key});
-        if (!accessor.IsPublished()) {
-            continue;
-        }
-        const auto& metadata = accessor.Get();
+    for (auto object : tenant->Objects()) {
+        const std::string& key = object.key();
+        const auto& metadata = object.metadata();
         if (!HasReadableReplica(metadata)) {
             continue;
         }
@@ -3753,8 +3722,17 @@ std::vector<Replica::Descriptor> MasterService::GetReadableReplicaDescriptors(
 }
 
 bool MasterService::IsReplicaReadable(const Replica& replica) const {
-    Replica::Descriptor descriptor;
-    return TryGetReadableReplicaDescriptor(replica, descriptor);
+    // The verdict of TryGetReadableReplicaDescriptor without the descriptor
+    // it builds for a reader. The descriptor only supplies the endpoint to
+    // check against invalid_replica_endpoints_, so it is built only while that
+    // set holds one; eviction asks this of every replica it surveys.
+    if (!invalid_replica_endpoints_.empty()) {
+        Replica::Descriptor descriptor;
+        return TryGetReadableReplicaDescriptor(replica, descriptor);
+    }
+    // A buffer is available only while its allocator is valid, so
+    // is_available() also covers the handle checks the descriptor path makes.
+    return replica.is_completed() && replica.is_available();
 }
 
 bool MasterService::HasReadableReplica(const ObjectMetadata& metadata) const {
@@ -3788,16 +3766,10 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern,
     if (tenant == nullptr) {
         return results;
     }
-    // The snapshot holds handles to what the route published, so each key is
-    // resolved through the route again while its object is read.
-    for (const auto& snapshot_entry : tenant->SnapshotObjects()) {
-        const std::string& key = snapshot_entry->key();
+    for (auto object : tenant->Objects()) {
+        const std::string& key = object.key();
         if (std::regex_search(key, pattern)) {
-            MetadataAccessorRO accessor(this, ObjectIdentity{tenant_id, key});
-            if (!accessor.IsPublished()) {
-                continue;
-            }
-            const auto& metadata = accessor.Get();
+            const auto& metadata = object.metadata();
             auto replica_list = GetReadableReplicaDescriptors(metadata);
 
             if (replica_list.empty()) {
@@ -6787,13 +6759,15 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern,
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     const auto tenant_handle = tenants_.Lookup(tenant_id);
     if (tenant_handle != nullptr) {
-        // The snapshot only names the keys to consider: each key is resolved
+        // The walk only names the keys to consider: each key is resolved
         // again below, so the checks and the erase stay atomic with it.
-        for (const auto& snapshot_entry : tenant_handle->SnapshotObjects()) {
-            const std::string& key = snapshot_entry->key();
-            if (!std::regex_search(key, pattern)) {
-                continue;
+        std::vector<std::string> matched_keys;
+        for (auto object : tenant_handle->Objects()) {
+            if (std::regex_search(object.key(), pattern)) {
+                matched_keys.push_back(object.key());
             }
+        }
+        for (const std::string& key : matched_keys) {
             MetadataAccessorRW accessor(this, ObjectIdentity{tenant_id, key});
             if (!accessor.IsPublished()) {
                 continue;
@@ -6895,27 +6869,35 @@ long MasterService::RemoveAll(bool force) {
     size_t tenants_scanned = 0;
     tenants_.Visit([&](const TenantId& tenant_id,
                        const std::shared_ptr<metadata::Tenant>& tenant) {
-        // The snapshot only names the keys to consider: each key is resolved
-        // again below, so the checks and the erase stay atomic with it.
-        for (const auto& snapshot_entry : tenant->SnapshotObjects()) {
-            const std::string& key = snapshot_entry->key();
+        // The walk only names the objects that look removable: each is
+        // checked again below, so the checks and the erase stay atomic with
+        // it.
+        std::vector<std::shared_ptr<ObjectEntry>> removable;
+        for (auto object : tenant->Objects()) {
+            // Record the tenant only once the loop actually reaches an object.
+            // A tenant row can outlive its objects, and recording it
+            // unconditionally made every empty-but-present tenant look like a
+            // fresh wipe and emit a spurious `cleared`.
+            if (track_cleared_tenants) {
+                tenants_seen.insert(tenant_id.value());
+            }
+            const auto& metadata = object.metadata();
+            if ((force || metadata.IsLeaseExpired(now)) &&
+                metadata.AllReplicas(&Replica::fn_is_completed) &&
+                !object.state().replication_task.has_value()) {
+                removable.push_back(object.handle());
+            } else if (track_cleared_tenants) {
+                tenants_with_remaining_objects.insert(tenant_id.value());
+            }
+        }
+        for (const auto& entry : removable) {
+            const std::string& key = entry->key();
             // The plain published-object access: the read-write accessor syncs
             // the object's KV state, which bumps the tenant epoch this scan's
             // `cleared` decision is compared against.
             (void)tenant->WithPublishedObject(
-                key, [&](ObjectMetadata& metadata, ObjectEntry::State& state) {
-                    const std::shared_ptr<ObjectEntry> entry = tenant->Get(key);
-                    if (entry == nullptr) {
-                        return;
-                    }
-                    // Record the tenant only once the loop actually reaches an
-                    // object. A tenant row can outlive its objects, and
-                    // recording it unconditionally made every empty-but-present
-                    // tenant look like a fresh wipe and emit a spurious
-                    // `cleared`.
-                    if (track_cleared_tenants) {
-                        tenants_seen.insert(tenant_id.value());
-                    }
+                entry,
+                [&](ObjectMetadata& metadata, ObjectEntry::State& state) {
                     if ((force || metadata.IsLeaseExpired(now)) &&
                         metadata.AllReplicas(&Replica::fn_is_completed) &&
                         !state.replication_task.has_value()) {
@@ -7032,24 +7014,32 @@ long MasterService::RemoveAll(const TenantId& tenant_id, bool force) {
 
     const auto tenant_handle = tenants_.Lookup(tenant_id);
     if (tenant_handle != nullptr) {
-        // The snapshot only names the keys to consider: each key is resolved
-        // again below, so the checks and the erase stay atomic with it.
-        for (const auto& snapshot_entry : tenant_handle->SnapshotObjects()) {
-            const std::string& key = snapshot_entry->key();
+        // The walk only names the objects that look removable: each is
+        // checked again below, so the checks and the erase stay atomic with
+        // it.
+        std::vector<std::shared_ptr<ObjectEntry>> removable;
+        for (auto object : tenant_handle->Objects()) {
+            saw_any_object = true;
+            const auto& metadata = object.metadata();
+            if ((force || metadata.IsLeaseExpired(now)) &&
+                metadata.AllReplicas(&Replica::fn_is_completed) &&
+                !object.state().replication_task.has_value()) {
+                removable.push_back(object.handle());
+            } else {
+                skipped_any_object = true;
+            }
+        }
+        for (const auto& entry : removable) {
+            const std::string& key = entry->key();
             // The plain published-object access: the read-write accessor syncs
             // the object's KV state, which bumps the tenant epoch this scan
             // compares against.
-            const std::shared_ptr<ObjectEntry> entry = tenant_handle->Get(key);
-            if (entry == nullptr) {
-                continue;
-            }
             ObjectEntry::ExclusiveHold hold(*entry);
             if (!tenant_handle->IsPublishedObject(entry)) {
                 continue;
             }
             auto& metadata = hold.metadata();
             auto& state = hold.state();
-            saw_any_object = true;
             if ((force || metadata.IsLeaseExpired(now)) &&
                 metadata.AllReplicas(&Replica::fn_is_completed) &&
                 !state.replication_task.has_value()) {
@@ -8222,11 +8212,10 @@ void MasterService::BackoffCandidate(const ObjectIdentity& object_id,
 void MasterService::ClearCandidatesForReload() {
     tenants_.Visit([this](const TenantId& tenant_id,
                           const std::shared_ptr<metadata::Tenant>& tenant) {
-        for (const auto& entry : tenant->SnapshotObjects()) {
-            entry->WithExclusiveAccess(
-                [&](ObjectMetadata&, ObjectEntry::State& state) {
-                    promotion_candidates_.EraseLocked(tenant_id, *entry, state);
-                });
+        // The candidate index lock is a leaf, so it is taken inside the walk.
+        for (auto object : tenant->MutableObjects()) {
+            promotion_candidates_.EraseLocked(tenant_id, *object.handle(),
+                                              object.state());
         }
     });
     promotion_candidates_.Reset();
@@ -8348,11 +8337,10 @@ void MasterService::CleanupExpiredDynamicReplicationState() {
         // to, and the replacement owns pending state of its own that must not
         // be failed here.
         std::vector<std::shared_ptr<ObjectEntry>> expired_entries;
-        for (const auto& entry : tenant->SnapshotObjects()) {
-            ObjectEntry::SharedHold hold(*entry);
-            if (dynamic_replication_.PendingExpiredLocked(hold.state(),
+        for (auto object : tenant->Objects()) {
+            if (dynamic_replication_.PendingExpiredLocked(object.state(),
                                                           now_ms)) {
-                expired_entries.push_back(entry);
+                expired_entries.push_back(object.handle());
             }
         }
         for (const auto& entry : expired_entries) {
@@ -9656,12 +9644,10 @@ MasterService::RebuildClientLivenessAfterSnapshotRestore() {
         client_ids.insert(client_id);
     }
 
-    tenants_.Visit([&](const TenantId&,
-                       const std::shared_ptr<metadata::Tenant>& tenant) {
-        for (const auto& entry : tenant->SnapshotObjects()) {
-            entry->WithSharedAccess([&](const ObjectMetadata& metadata,
-                                        const ObjectEntry::State&) {
-                for (const auto& replica : metadata.GetAllReplicas()) {
+    tenants_.Visit(
+        [&](const TenantId&, const std::shared_ptr<metadata::Tenant>& tenant) {
+            for (auto object : tenant->Objects()) {
+                for (const auto& replica : object.metadata().GetAllReplicas()) {
                     if (replica.is_local_disk_replica()) {
                         const auto owner = replica.get_local_disk_client_id();
                         if (owner) {
@@ -9669,9 +9655,8 @@ MasterService::RebuildClientLivenessAfterSnapshotRestore() {
                         }
                     }
                 }
-            });
-        }
-    });
+            }
+        });
 
     std::unordered_map<UUID, std::shared_ptr<ClientLivenessRecord>,
                        boost::hash<UUID>>
@@ -9691,31 +9676,27 @@ MasterService::RebuildClientLivenessAfterSnapshotRestore() {
         }
         tenants_.Visit([&](const TenantId&,
                            const std::shared_ptr<metadata::Tenant>& tenant) {
-            for (const auto& entry : tenant->SnapshotObjects()) {
-                // Exclusive because the replicas below are rebound in place.
-                entry->WithExclusiveAccess([&](ObjectMetadata& metadata,
-                                               ObjectEntry::State&) {
-                    metadata.VisitReplicas(
-                        [](const Replica&) { return true; },
-                        [&](Replica& replica) {
-                            if (replica.is_memory_replica()) {
-                                auto& buffer =
-                                    *std::get<MemoryReplicaData>(replica.data_)
-                                         .buffer;
-                                if (!segment_access.RebindBufferToOwningSegment(
-                                        buffer)) {
-                                    missing_memory_registration = true;
-                                }
-                            } else if (replica.is_local_disk_replica()) {
-                                const auto owner =
-                                    replica.get_local_disk_client_id();
-                                if (owner) {
-                                    replica.bindClientLiveness(
-                                        records.at(*owner));
-                                }
+            // Exclusive because the replicas below are rebound in place.
+            for (auto object : tenant->MutableObjects()) {
+                object.metadata().VisitReplicas(
+                    [](const Replica&) { return true; },
+                    [&](Replica& replica) {
+                        if (replica.is_memory_replica()) {
+                            auto& buffer =
+                                *std::get<MemoryReplicaData>(replica.data_)
+                                     .buffer;
+                            if (!segment_access.RebindBufferToOwningSegment(
+                                    buffer)) {
+                                missing_memory_registration = true;
                             }
-                        });
-                });
+                        } else if (replica.is_local_disk_replica()) {
+                            const auto owner =
+                                replica.get_local_disk_client_id();
+                            if (owner) {
+                                replica.bindClientLiveness(records.at(*owner));
+                            }
+                        }
+                    });
             }
         });
     }
@@ -9766,18 +9747,14 @@ tl::expected<void, SerializationError> MasterService::ApplySnapshotState(
                     // handle keeps the teardown on the entry that was
                     // inspected, never on a same-key replacement.
                     std::vector<std::shared_ptr<ObjectEntry>> stale_entries;
-                    for (const auto& entry : tenant->SnapshotObjects()) {
-                        entry->WithSharedAccess(
-                            [&](const ObjectMetadata& metadata,
-                                const ObjectEntry::State&) {
-                                if (metadata.HasDiffRepStatus(
-                                        ReplicaStatus::COMPLETE) ||
-                                    metadata.IsLeaseExpired(cleanup_now)) {
-                                    VLOG(1) << "clear metadata key="
-                                            << entry->key();
-                                    stale_entries.push_back(entry);
-                                }
-                            });
+                    for (auto object : tenant->Objects()) {
+                        const auto& metadata = object.metadata();
+                        if (metadata.HasDiffRepStatus(
+                                ReplicaStatus::COMPLETE) ||
+                            metadata.IsLeaseExpired(cleanup_now)) {
+                            VLOG(1) << "clear metadata key=" << object.key();
+                            stale_entries.push_back(object.handle());
+                        }
                     }
                     for (const auto& entry : stale_entries) {
                         // The route slot goes only while it still publishes
@@ -9802,28 +9779,25 @@ tl::expected<void, SerializationError> MasterService::ApplySnapshotState(
 
         tenants_.Visit([&](const TenantId&,
                            const std::shared_ptr<metadata::Tenant>& tenant) {
-            for (const auto& entry : tenant->SnapshotObjects()) {
-                entry->WithSharedAccess([&](const ObjectMetadata& metadata,
-                                            const ObjectEntry::State&) {
-                    for (const auto& replica : metadata.GetAllReplicas()) {
-                        if (!replica.get_descriptor().is_memory_replica()) {
-                            continue;
-                        }
-                        auto temp_segment_names = replica.get_segment_names();
-                        if (temp_segment_names.empty()) {
-                            continue;
-                        }
-                        if (!temp_segment_names[0].has_value()) {
-                            continue;
-                        }
-                        auto buffer_descriptor = replica.get_descriptor()
-                                                     .get_memory_descriptor()
-                                                     .buffer_descriptor;
-                        MasterMetricManager::instance().inc_allocated_mem_size(
-                            temp_segment_names[0].value(),
-                            static_cast<int64_t>(buffer_descriptor.size_));
+            for (auto object : tenant->Objects()) {
+                for (const auto& replica : object.metadata().GetAllReplicas()) {
+                    if (!replica.get_descriptor().is_memory_replica()) {
+                        continue;
                     }
-                });
+                    auto temp_segment_names = replica.get_segment_names();
+                    if (temp_segment_names.empty()) {
+                        continue;
+                    }
+                    if (!temp_segment_names[0].has_value()) {
+                        continue;
+                    }
+                    auto buffer_descriptor = replica.get_descriptor()
+                                                 .get_memory_descriptor()
+                                                 .buffer_descriptor;
+                    MasterMetricManager::instance().inc_allocated_mem_size(
+                        temp_segment_names[0].value(),
+                        static_cast<int64_t>(buffer_descriptor.size_));
+                }
             }
         });
 
@@ -10103,20 +10077,19 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
     };
 
     auto pass = [&](bool allow_soft_pinned) {
-        // One snapshot covers the tenant's whole population. The snapshot only
-        // names the keys to consider: each is resolved and re-validated under
-        // its own lock inside try_evict_group_or_object, and the pass stops as
-        // soon as the target is met.
+        // One walk covers the tenant's whole population. It only names the
+        // keys to consider: each is resolved and re-validated under its own
+        // lock inside try_evict_group_or_object, and the pass stops as soon as
+        // the target is met.
         std::vector<std::string> candidate_keys;
-        for (const auto& entry : tenant.SnapshotObjects()) {
-            ObjectEntry::SharedHold hold(*entry);
-            const auto& metadata = hold.metadata();
+        for (auto object : tenant.Objects()) {
+            const auto& metadata = object.metadata();
             if (metadata.IsHardPinned() || !metadata.IsLeaseExpired(now) ||
                 (!allow_soft_pinned && IsSoftPinActive(metadata, now)) ||
                 !can_evict_replicas(metadata)) {
                 continue;
             }
-            candidate_keys.push_back(entry->key());
+            candidate_keys.push_back(object.key());
         }
 
         // The popped replicas are held only until the key that owned them has
@@ -10393,30 +10366,25 @@ void MasterService::BatchEvict(double evict_ratio_target,
     };
 
     // Evicts a single object or a whole group. MUST be called WITHOUT any
-    // per-object lock: the trigger is resolved and re-validated under its own
-    // lock, and that lock is not held across the member walk, so each member is
-    // re-resolved when its turn comes.
+    // per-object lock: the trigger is re-validated under its own lock, and that
+    // lock is not held across the member walk, so each member is re-resolved
+    // when its turn comes. The trigger is the entry a scan judged rather than
+    // whatever its key resolves to now: a key republished since is a newer
+    // object, which a later round judges on its own.
     auto try_evict_group_or_object =
-        [&, this](const TenantId& tenant_id, const std::string& key,
+        [&, this](const TenantId& tenant_id, metadata::Tenant& tenant,
+                  const std::shared_ptr<ObjectEntry>& entry,
                   bool allow_soft_pinned,
                   std::vector<std::vector<Replica>>& deferred_replicas)
         -> EvictionResult {
-        const auto tenant_handle = tenants_.Lookup(tenant_id);
-        if (tenant_handle == nullptr) {
-            return {};
-        }
-        metadata::Tenant& tenant = *tenant_handle;
+        const std::string& key = entry->key();
 
         // Snapshot grouped-ness under the trigger's own lock; that lock is
         // released before EvictGroupOrObject.
         std::string group_id;
         {
-            const auto entry = tenant.Get(key);
-            if (entry == nullptr) {
-                return {};
-            }
             ObjectEntry::ExclusiveHold hold(*entry);
-            if (!tenant.IsPublishedObject(entry)) {
+            if (!metadata::Tenant::IsPublishedObject(*entry, hold.state())) {
                 return {};
             }
             auto& metadata = hold.metadata();
@@ -10493,29 +10461,26 @@ void MasterService::BatchEvict(double evict_ratio_target,
                               .stop_scan = group_result.stop_scan};
 
         // EvictGroupOrObject erased every member except the trigger, which is
-        // the caller's to erase. Resolve it once more and drop it if the
-        // eviction left it invalid; the route slot goes only while it still
-        // publishes this object, so a same-key republish survives.
+        // the caller's to erase. Drop it if the eviction left it invalid and it
+        // is still published, so a same-key republish survives.
         if (!enable_oplog_) {
-            const auto entry = tenant.Get(key);
-            if (entry != nullptr) {
-                ObjectEntry::ExclusiveHold hold(*entry);
-                if (tenant.IsPublishedObject(entry) &&
-                    !hold.metadata().IsValid()) {
-                    EraseMetadata(tenant, entry, hold.metadata(), hold.state(),
-                                  tenant_id, QuotaEraseMode::kFull);
-                }
+            ObjectEntry::ExclusiveHold hold(*entry);
+            if (metadata::Tenant::IsPublishedObject(*entry, hold.state()) &&
+                !hold.metadata().IsValid()) {
+                EraseMetadata(tenant, entry, hold.metadata(), hold.state(),
+                              tenant_id, QuotaEraseMode::kFull);
             }
         }
         return result;
     };
 
-    // Candidate carries the key for a safe lookup after the walk that found it
-    // ends. Handles would be stale if a tenant's route is modified between
-    // phases.
+    // A candidate names the entry the scan judged and its tenant's place in
+    // `tenants`. The handle keeps the entry alive, not routed: the eviction
+    // re-validates it under its own lock, which includes checking that it is
+    // still published.
     struct Candidate {
-        TenantId tenant_id;
-        std::string key;
+        size_t tenant_slot;
+        std::shared_ptr<ObjectEntry> entry;
         std::chrono::system_clock::time_point lease_timeout;
     };
 
@@ -10531,11 +10496,10 @@ void MasterService::BatchEvict(double evict_ratio_target,
     });
 
     // ===== Phase 1: Parallel candidate census =====
-    // N threads each scan a batch of tenants. For selective ratios only the
-    // lease timestamps are collected here; full tenant/key identities are
-    // materialized afterwards for a bounded frontier around the eviction
-    // cutoff. High ratios collect full Candidates directly, because a census
-    // followed by a second scan would cost more than the identities it saves.
+    // N threads each scan a batch of tenants and keep a handle to every
+    // object evictable without a soft pin. For selective ratios the eviction
+    // pass then takes only a bounded frontier around the cutoff from those
+    // records; high ratios take them all as Candidates directly.
     constexpr size_t kMaxCensusThreads = 16;
     const int num_threads =
         static_cast<int>(std::min(tenants.size(), kMaxCensusThreads));
@@ -10555,9 +10519,12 @@ void MasterService::BatchEvict(double evict_ratio_target,
     const bool compact_frontier_prebypass =
         evict_ratio_target >= kCompactPrebypassTargetRatio;
 
+    // The census is the round's only walk over the tenants: it keeps a handle
+    // to every object it found evictable without a soft pin, and the frontier
+    // is selected from those records, so no object is visited twice and only
+    // the ones that may be evicted are pinned.
     std::vector<std::vector<Candidate>> local_candidates(num_threads);
-    std::vector<std::vector<std::chrono::system_clock::time_point>>
-        local_no_pin(num_threads);
+    std::vector<std::vector<Candidate>> local_no_pin(num_threads);
     std::vector<long> local_eviction_base(num_threads, 0);
     std::vector<long> local_object_count(num_threads, 0);
     std::vector<std::vector<std::chrono::system_clock::time_point>>
@@ -10576,11 +10543,10 @@ void MasterService::BatchEvict(double evict_ratio_target,
 
                 local_object_count[t] +=
                     static_cast<long>(tenant->ObjectCount());
-                // The snapshot only names the keys to consider: every eviction
-                // re-resolves its candidate under that object's own lock.
-                for (const auto& entry : tenant->SnapshotObjects()) {
-                    ObjectEntry::SharedHold hold(*entry);
-                    const auto& metadata = hold.metadata();
+                // A candidate only names the object to consider: every
+                // eviction re-validates it under that object's own lock.
+                for (auto object : tenant->Objects()) {
+                    const auto& metadata = object.metadata();
                     if (metadata.IsHardPinned()) continue;
                     bool has_evictable = can_evict_replicas(metadata);
                     if (has_evictable) local_eviction_base[t]++;
@@ -10594,9 +10560,10 @@ void MasterService::BatchEvict(double evict_ratio_target,
                     if (!IsSoftPinActive(metadata, now)) {
                         if (compact_frontier_prebypass) {
                             local_candidates[t].push_back(
-                                {tenant_id, entry->key(), deadline});
+                                {s, object.handle(), deadline});
                         } else {
-                            local_no_pin[t].push_back(deadline);
+                            local_no_pin[t].push_back(
+                                {s, object.handle(), deadline});
                         }
                     } else if (allow_evict_soft_pinned_objects_) {
                         local_soft_pin[t].push_back(deadline);
@@ -10626,16 +10593,21 @@ void MasterService::BatchEvict(double evict_ratio_target,
         }
     }
 
-    std::vector<std::chrono::system_clock::time_point> no_pin_timeouts;
+    std::vector<Candidate> no_pin_records;
     {
         size_t total = 0;
         for (auto& v : local_no_pin) total += v.size();
-        no_pin_timeouts.reserve(total);
+        no_pin_records.reserve(total);
     }
     for (auto& v : local_no_pin) {
-        no_pin_timeouts.insert(no_pin_timeouts.end(),
-                               std::make_move_iterator(v.begin()),
-                               std::make_move_iterator(v.end()));
+        no_pin_records.insert(no_pin_records.end(),
+                              std::make_move_iterator(v.begin()),
+                              std::make_move_iterator(v.end()));
+    }
+    std::vector<std::chrono::system_clock::time_point> no_pin_timeouts;
+    no_pin_timeouts.reserve(no_pin_records.size());
+    for (const auto& record : no_pin_records) {
+        no_pin_timeouts.push_back(record.lease_timeout);
     }
 
     std::vector<std::chrono::system_clock::time_point> soft_pin_objects;
@@ -10663,58 +10635,24 @@ void MasterService::BatchEvict(double evict_ratio_target,
     const long primary_no_pin_num =
         std::min(ideal_evict_num, static_cast<long>(no_pin_count));
 
-    // Re-scan the tenants and copy full identities only for objects inside the
-    // requested timestamp range. The eligibility conditions are identical to
-    // the census above, so the selected set matches what the census counted.
+    // Take the census records inside the requested timestamp range. The
+    // census already judged each object's eligibility, so selecting from its
+    // records yields the set it counted without visiting the tenants again;
+    // every candidate is still re-validated under its own lock when it is
+    // evicted. A record is moved out, which is safe because the ranges one
+    // round asks for are disjoint: the frontier, then what lies past it.
     auto collect_candidates = [&](bool use_cutoff,
                                   std::chrono::system_clock::time_point cutoff,
                                   bool collect_older_or_equal) {
-        std::vector<std::vector<Candidate>> local_frontier(num_threads);
-        std::vector<std::thread> collectors;
-        collectors.reserve(num_threads);
-
-        for (int t = 0; t < num_threads; t++) {
-            collectors.emplace_back([&, t] {
-                const size_t s_start = t * tenants_per_thread;
-                const size_t s_end =
-                    std::min(s_start + tenants_per_thread, tenants.size());
-                for (size_t s = s_start; s < s_end; s++) {
-                    const TenantId& tenant_id = tenants[s].first;
-                    const auto& tenant = tenants[s].second;
-                    for (const auto& entry : tenant->SnapshotObjects()) {
-                        ObjectEntry::SharedHold hold(*entry);
-                        const auto& metadata = hold.metadata();
-                        if (metadata.IsHardPinned() ||
-                            IsSoftPinActive(metadata, now) ||
-                            !can_evict_replicas(metadata)) {
-                            continue;
-                        }
-                        // Group-aware eviction deadline (shared group TTL
-                        // for grouped objects) so the cutoff matches
-                        // eviction.
-                        const auto deadline = metadata.EvictionDeadline();
-                        if (now < deadline) continue;
-                        if (use_cutoff) {
-                            const bool in_range = collect_older_or_equal
-                                                      ? deadline <= cutoff
-                                                      : deadline > cutoff;
-                            if (!in_range) continue;
-                        }
-                        local_frontier[t].push_back(
-                            {tenant_id, entry->key(), deadline});
-                    }
-                }
-            });
-        }
-        for (auto& collector : collectors) collector.join();
-
-        size_t total = 0;
-        for (const auto& v : local_frontier) total += v.size();
         std::vector<Candidate> merged;
-        merged.reserve(total);
-        for (auto& v : local_frontier) {
-            merged.insert(merged.end(), std::make_move_iterator(v.begin()),
-                          std::make_move_iterator(v.end()));
+        for (auto& record : no_pin_records) {
+            if (use_cutoff) {
+                const bool in_range = collect_older_or_equal
+                                          ? record.lease_timeout <= cutoff
+                                          : record.lease_timeout > cutoff;
+                if (!in_range) continue;
+            }
+            merged.push_back(std::move(record));
         }
         return merged;
     };
@@ -10741,20 +10679,12 @@ void MasterService::BatchEvict(double evict_ratio_target,
                              no_pin_timeouts.begin() + (reserve_count - 1),
                              no_pin_timeouts.end());
             reserve_cutoff = no_pin_timeouts[reserve_count - 1];
+            // The cutoff comes from the very records selected below, so the
+            // frontier holds at least reserve_count >= primary_count of them
+            // and evict_num below still derives from the requested target.
             candidates = collect_candidates(/*use_cutoff=*/true, reserve_cutoff,
                                             /*collect_older_or_equal=*/true);
-
-            // Shortfall guard: if churn left the frontier holding fewer
-            // objects than the target needs, fall back to the full candidate
-            // set so evict_num below still derives from the requested target
-            // rather than from a shrunken frontier.
-            if (candidates.size() >= primary_count) {
-                compact_frontier_used = true;
-            } else {
-                candidates =
-                    collect_candidates(/*use_cutoff=*/false, {},
-                                       /*collect_older_or_equal=*/true);
-            }
+            compact_frontier_used = true;
         } else {
             candidates = collect_candidates(/*use_cutoff=*/false, {},
                                             /*collect_older_or_equal=*/true);
@@ -10794,7 +10724,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
                     continue;
                 }
                 auto evict_result = try_evict_group_or_object(
-                    c.tenant_id, c.key,
+                    tenants[c.tenant_slot].first,
+                    *tenants[c.tenant_slot].second, c.entry,
                     /*allow_soft_pinned=*/false, deferred_replicas);
 
                 total_freed_size += evict_result.freed_bytes;
@@ -10814,11 +10745,10 @@ void MasterService::BatchEvict(double evict_ratio_target,
 
         evict_candidate_batch(candidates);
 
-        // Metadata may change after the frontier is materialized. If the
-        // reserve is exhausted before the target is met, refill from the
-        // remainder of the current no-soft-pin population. This recovery
-        // scan is paid only on churn and preserves the behavior of
-        // continuing past the cutoff until evict_num is reached.
+        // Metadata may change after the census. If the reserve is exhausted
+        // before the target is met, refill from the census records past the
+        // cutoff. This recovery is paid only on churn and preserves the
+        // behavior of continuing past the cutoff until evict_num is reached.
         if (!stop_eviction_scan && compact_frontier_used &&
             evicted_this_pass < evict_num) {
             auto refill_candidates = collect_candidates(
@@ -10827,6 +10757,9 @@ void MasterService::BatchEvict(double evict_ratio_target,
             evict_candidate_batch(refill_candidates);
         }
     }
+    // The second pass judges the tenants afresh, so the census records are
+    // released here rather than held through it.
+    no_pin_records.clear();
 
     // Try releasing discarded replicas before we decide whether to do the
     // second pass.
@@ -10852,28 +10785,28 @@ void MasterService::BatchEvict(double evict_ratio_target,
                              no_pin_objects.end());
             auto target_timeout = no_pin_objects[target_evict_num - 1];
 
-            // Evict via key lookup — avoid full metadata traversal
+            // Collect the qualifying entries first, then evict each under its
+            // own lock.
             {
-                std::vector<std::pair<TenantId, std::string>> to_evict;
-                tenants_.Visit(
-                    [&](const TenantId& tenant_id,
-                        const std::shared_ptr<metadata::Tenant>& tenant) {
-                        for (const auto& entry : tenant->SnapshotObjects()) {
-                            ObjectEntry::SharedHold hold(*entry);
-                            const auto& metadata = hold.metadata();
-                            if (!metadata.IsHardPinned() &&
-                                now >= metadata.EvictionDeadline() &&
-                                metadata.EvictionDeadline() <= target_timeout &&
-                                !IsSoftPinActive(metadata, now) &&
-                                can_evict_replicas(metadata)) {
-                                to_evict.emplace_back(tenant_id, entry->key());
-                            }
+                std::vector<Candidate> to_evict;
+                for (size_t s = 0; s < tenants.size(); ++s) {
+                    for (auto object : tenants[s].second->Objects()) {
+                        const auto& metadata = object.metadata();
+                        if (!metadata.IsHardPinned() &&
+                            now >= metadata.EvictionDeadline() &&
+                            metadata.EvictionDeadline() <= target_timeout &&
+                            !IsSoftPinActive(metadata, now) &&
+                            can_evict_replicas(metadata)) {
+                            to_evict.push_back({s, object.handle(),
+                                                metadata.EvictionDeadline()});
                         }
-                    });
+                    }
+                }
                 for (auto& c : to_evict) {
                     if (target_evict_num <= 0 || stop_eviction_scan) break;
                     auto evict_result = try_evict_group_or_object(
-                        c.first, c.second,
+                        tenants[c.tenant_slot].first,
+                        *tenants[c.tenant_slot].second, c.entry,
                         /*allow_soft_pinned=*/false, deferred_replicas);
                     total_freed_size += evict_result.freed_bytes;
                     evicted_count += evict_result.evicted_objects;
@@ -10896,29 +10829,28 @@ void MasterService::BatchEvict(double evict_ratio_target,
             auto soft_target_timeout = soft_pin_objects[soft_pin_evict_num - 1];
 
             {
-                std::vector<std::pair<TenantId, std::string>> to_evict;
-                tenants_.Visit(
-                    [&](const TenantId& tenant_id,
-                        const std::shared_ptr<metadata::Tenant>& tenant) {
-                        for (const auto& entry : tenant->SnapshotObjects()) {
-                            ObjectEntry::SharedHold hold(*entry);
-                            const auto& metadata = hold.metadata();
-                            if (metadata.IsHardPinned() ||
-                                now < metadata.EvictionDeadline() ||
-                                !can_evict_replicas(metadata)) {
-                                continue;
-                            }
-                            if (!IsSoftPinActive(metadata, now) ||
-                                metadata.EvictionDeadline() <=
-                                    soft_target_timeout) {
-                                to_evict.emplace_back(tenant_id, entry->key());
-                            }
+                std::vector<Candidate> to_evict;
+                for (size_t s = 0; s < tenants.size(); ++s) {
+                    for (auto object : tenants[s].second->Objects()) {
+                        const auto& metadata = object.metadata();
+                        if (metadata.IsHardPinned() ||
+                            now < metadata.EvictionDeadline() ||
+                            !can_evict_replicas(metadata)) {
+                            continue;
                         }
-                    });
+                        if (!IsSoftPinActive(metadata, now) ||
+                            metadata.EvictionDeadline() <=
+                                soft_target_timeout) {
+                            to_evict.push_back({s, object.handle(),
+                                                metadata.EvictionDeadline()});
+                        }
+                    }
+                }
                 for (auto& c : to_evict) {
                     if (target_evict_num <= 0 || stop_eviction_scan) break;
                     auto evict_result = try_evict_group_or_object(
-                        c.first, c.second,
+                        tenants[c.tenant_slot].first,
+                        *tenants[c.tenant_slot].second, c.entry,
                         /*allow_soft_pinned=*/true, deferred_replicas);
                     total_freed_size += evict_result.freed_bytes;
                     evicted_count += evict_result.evicted_objects;
@@ -11044,17 +10976,22 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
             if (evicted_count >= ideal_evict_num) {
                 return;
             }
-            // The snapshot only names the keys to consider: each one is
-            // resolved again under its own lock below.
-            for (const auto& snapshot_entry : tenant->SnapshotObjects()) {
+            // The walk only names the objects to consider: each one is
+            // checked again under its own lock below.
+            std::vector<std::shared_ptr<ObjectEntry>> candidates;
+            for (auto object : tenant->Objects()) {
+                const auto& metadata = object.metadata();
+                if (!metadata.IsHardPinned() && metadata.IsLeaseExpired(now) &&
+                    metadata.HasReplica(is_evictable_nof_replica) &&
+                    !IsSoftPinActive(metadata, now)) {
+                    candidates.push_back(object.handle());
+                }
+            }
+            for (const auto& entry : candidates) {
                 if (evicted_count >= ideal_evict_num) {
                     break;
                 }
-                const std::string& key = snapshot_entry->key();
-                const auto entry = tenant->Get(key);
-                if (entry == nullptr) {
-                    continue;
-                }
+                const std::string& key = entry->key();
                 ObjectEntry::ExclusiveHold hold(*entry);
                 if (!tenant->IsPublishedObject(entry)) {
                     continue;
@@ -12766,11 +12703,26 @@ void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
         std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
         tenants_.Visit([&](const TenantId& tenant_id,
                            const std::shared_ptr<metadata::Tenant>& tenant) {
-            for (const auto& snapshot_entry : tenant->SnapshotObjects()) {
-                // The snapshot hands out handles, so each key is resolved again
-                // here: a key republished meanwhile is judged on what it holds
-                // now, not on what the snapshot captured.
-                const std::string& key = snapshot_entry->key();
+            // The walk only narrows the keys to those with a replica on a
+            // source segment: target selection takes the segment lock, which
+            // the walk body must not, so each key is resolved again below and
+            // judged on what it holds then.
+            std::vector<std::string> keys_on_source;
+            for (auto object : tenant->Objects()) {
+                const auto replica_segments =
+                    object.metadata().GetReplicaSegmentNames();
+                if (std::any_of(job.request.segments.begin(),
+                                job.request.segments.end(),
+                                [&](const std::string& source_segment) {
+                                    return std::find(replica_segments.begin(),
+                                                     replica_segments.end(),
+                                                     source_segment) !=
+                                           replica_segments.end();
+                                })) {
+                    keys_on_source.push_back(object.key());
+                }
+            }
+            for (const std::string& key : keys_on_source) {
                 MetadataAccessorRO accessor(this,
                                             ObjectIdentity{tenant_id, key});
                 if (!accessor.IsPublished()) {
@@ -12884,19 +12836,13 @@ bool MasterService::MaybeCompleteDrainJob(DrainJob& job) {
         std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
         tenants_.Visit([&](const TenantId& tenant_id,
                            const std::shared_ptr<metadata::Tenant>& tenant) {
-            for (const auto& snapshot_entry : tenant->SnapshotObjects()) {
-                // The snapshot hands out handles, so each key is resolved again
-                // here: counting a replaced object's replicas would report a
-                // segment as drained while the object holding the key now still
-                // lives on it.
-                const std::string& key = snapshot_entry->key();
-                MetadataAccessorRO accessor(this,
-                                            ObjectIdentity{tenant_id, key});
-                if (!accessor.IsPublished()) {
-                    continue;
-                }
-                const auto& metadata = accessor.Get();
-                const auto replica_segments = metadata.GetReplicaSegmentNames();
+            // The walk reads each object as the route publishes it now, so a
+            // replaced object's replicas never report a segment as drained
+            // while the object holding the key still lives on it.
+            for (auto object : tenant->Objects()) {
+                const std::string& key = object.key();
+                const auto replica_segments =
+                    object.metadata().GetReplicaSegmentNames();
                 for (const auto& source_segment : job.request.segments) {
                     if (std::find(replica_segments.begin(),
                                   replica_segments.end(),
