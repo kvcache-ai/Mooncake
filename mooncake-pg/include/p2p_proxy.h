@@ -17,6 +17,7 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+#include "p2p_progress_timeout.h"
 
 namespace mooncake {
 
@@ -402,7 +403,7 @@ class P2PProxy {
         std::optional<uint32_t> credit_epoch_;
         int32_t* failed_ranks_hint_ = nullptr;
 
-        std::chrono::steady_clock::time_point last_update_time_;
+        P2PProgressTimeout progress_timeout_;
     };
 
     // One chunk of a RecvOp.  The receiver allocates a RecvPool chunk,
@@ -546,6 +547,10 @@ class P2PProxy {
     bool isTimeout(const T& obj) const {
         return std::chrono::steady_clock::now() - obj.last_update_time_ >
                std::chrono::microseconds(*p2p_timeout_us_);
+    }
+
+    bool isTimeout(const P2PProgressTimeout& timeout) const {
+        return timeout.expired(std::chrono::microseconds(*p2p_timeout_us_));
     }
 
    private:

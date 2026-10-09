@@ -1484,20 +1484,35 @@ int RdmaEndPoint::doSetupConnection(int qp_index, const ibv_gid &peer_gid,
         return ERR_INVALID_ARGUMENT;
     auto &qp = qp_list_[qp_index];
 
-    // Any state -> RESET
+    // Any state -> RESET, skipped when the QP is already in RESET. Some
+    // providers (e.g. irdma on Intel E810) carry out RESET by moving the
+    // hardware QP to ERROR, after which RESET -> INIT fails with EINVAL.
     ibv_qp_attr attr;
+    ibv_qp_init_attr init_attr;
     memset(&attr, 0, sizeof(attr));
-    attr.qp_state = IBV_QPS_RESET;
-    int ret = ibv_modify_qp(qp, &attr, IBV_QP_STATE);
-    if (ret) {
-        std::string message = "Failed to modify QP to RESET";
-        LOG(ERROR) << "[Handshake] " << message << ": " << strerror(ret);
-        if (reply_msg) *reply_msg = message + ": " + strerror(ret);
-        if (failure_info) {
-            failure_info->stage = SetupConnectionFailureStage::kReset;
-            failure_info->sys_errno = ret;
+    int cur_state = IBV_QPS_ERR;
+    int ret = ibv_query_qp(qp, &attr, IBV_QP_STATE, &init_attr);
+    if (ret == 0) {
+        cur_state = attr.qp_state;
+    } else {
+        LOG(WARNING) << "[Handshake] ibv_query_qp failed, proceeding to RESET: "
+                     << strerror(ret);
+    }
+
+    if (cur_state != IBV_QPS_RESET) {
+        memset(&attr, 0, sizeof(attr));
+        attr.qp_state = IBV_QPS_RESET;
+        ret = ibv_modify_qp(qp, &attr, IBV_QP_STATE);
+        if (ret) {
+            std::string message = "Failed to modify QP to RESET";
+            LOG(ERROR) << "[Handshake] " << message << ": " << strerror(ret);
+            if (reply_msg) *reply_msg = message + ": " + strerror(ret);
+            if (failure_info) {
+                failure_info->stage = SetupConnectionFailureStage::kReset;
+                failure_info->sys_errno = ret;
+            }
+            return ERR_ENDPOINT;
         }
-        return ERR_ENDPOINT;
     }
 
     // RESET -> INIT
@@ -1553,7 +1568,7 @@ int RdmaEndPoint::doSetupConnection(int qp_index, const ibv_gid &peer_gid,
     attr.ah_attr.port_num = context_.portNum();
     attr.dest_qp_num = peer_qp_num;
     attr.rq_psn = 0;
-    attr.max_dest_rd_atomic = 16;
+    attr.max_dest_rd_atomic = static_cast<uint8_t>(context_.maxQpRdAtom());
     attr.min_rnr_timer = 12;  // 12 in previous implementation
     ret = ibv_modify_qp(qp, &attr,
                         IBV_QP_STATE | IBV_QP_PATH_MTU | IBV_QP_MIN_RNR_TIMER |
@@ -1588,7 +1603,7 @@ int RdmaEndPoint::doSetupConnection(int qp_index, const ibv_gid &peer_gid,
     attr.retry_cnt = kRetryCount;
     attr.rnr_retry = 7;  // or 7,RNR error
     attr.sq_psn = 0;
-    attr.max_rd_atomic = 16;
+    attr.max_rd_atomic = static_cast<uint8_t>(context_.maxQpInitRdAtom());
     ret = ibv_modify_qp(qp, &attr,
                         IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT |
                             IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN |
