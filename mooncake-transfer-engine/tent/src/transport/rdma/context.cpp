@@ -307,7 +307,11 @@ RdmaContext::RdmaContext(RdmaTransport& transport)
     std::call_once(g_once_flag, fork_init);
 }
 
-RdmaContext::~RdmaContext() { disable(); }
+RdmaContext::~RdmaContext() {
+    if (disable())
+        LOG(FATAL)
+            << "Cannot destroy RDMA context with live endpoint resources";
+}
 
 int RdmaContext::construct(const std::string& device_name,
                            std::shared_ptr<RdmaParams> params) {
