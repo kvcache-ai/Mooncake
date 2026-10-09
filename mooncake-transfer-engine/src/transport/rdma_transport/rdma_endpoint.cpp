@@ -38,7 +38,6 @@
 
 namespace mooncake {
 constexpr uint8_t kMaxHopLimit = 16;
-constexpr uint8_t kTimeout = 14;
 constexpr uint8_t kRetryCount = 7;
 
 static GidSelectionSnapshot fillLocalHandshakeDesc(
@@ -1599,7 +1598,7 @@ int RdmaEndPoint::doSetupConnection(int qp_index, const ibv_gid &peer_gid,
     // RTR -> RTS
     memset(&attr, 0, sizeof(attr));
     attr.qp_state = IBV_QPS_RTS;
-    attr.timeout = kTimeout;
+    attr.timeout = static_cast<uint8_t>(globalConfig().ib_timeout);
     attr.retry_cnt = kRetryCount;
     attr.rnr_retry = 7;  // or 7,RNR error
     attr.sq_psn = 0;

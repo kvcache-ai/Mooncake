@@ -138,6 +138,8 @@ struct GlobalConfig {
     // Maps to a Virtual Lane on the switch for QoS isolation, e.g. to
     // steer KV-cache traffic into a different VL than EP all-to-all.
     int ib_service_level = -1;
+    // RC ACK timeout: 4.096 us * 2^n; 14 preserves the 67 ms default.
+    int ib_timeout = 14;
     // mlx5 QP UDP source ports for ECMP path diversification.
     // Empty = no modification. QP at index i uses
     // mlx5_qp_udp_sports[i % size]. Requires mlx5 device + RoCEv2,
