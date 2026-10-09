@@ -1,18 +1,11 @@
 import csv
 import json
 
-# Columns of kernel_summary.csv, in the order they are written. The step itself is
-# three windows, their sum phase_sum, and one window over all of them,
-# step_window. kv_write_component and attention_component are measured in passes of
-# their own, beside the gather probe, and are never added to the step.
-STEP_PHASES = ("indices", "attention_plan", "layer_loop")
-REPORTED_PHASES = STEP_PHASES + (
-    "kv_write_component",
-    "attention_component",
-    "kv_gather",
-    "step_window",
-    "phase_sum",
-)
+from .stats import PHASES
+
+# The windows this table writes one column group per: the phases the benchmark
+# measures plus the step as one span and the sum of its parts.
+REPORTED_PHASES = PHASES
 
 CSV_COLUMNS = [
     "case_id",

@@ -1,12 +1,14 @@
 # The summary table's contract, without a GPU: a record goes in and a row with the
-# declared columns comes out. The README promises the four configuration fields in
-# the CSV, so a record's configuration has to reach the row.
+# declared columns comes out. The README promises the configuration fields in the
+# CSV, so a record's configuration has to reach the row, and the phases and the
+# derived figures the schema writes are the ones stats.py defines.
 
 import csv
 
 import pytest
 
 from benchmarks.sglang_attention_kv import kernel_summary as summary_module
+from benchmarks.sglang_attention_kv.stats import PHASES, derive
 
 CONFIGURATION = {
     "branch": "ragged_prefix_merge",
@@ -45,6 +47,21 @@ DERIVED = {
 }
 
 
+class FakeCase:
+    """What stats.derive divides by, without building a case or importing torch."""
+
+    num_layers = 36
+    new_tokens = 128
+    context_tokens = 640
+
+    def attention_flops(self):
+        return 36 * 4 * (128 * 512 + 128 * 129 // 2) * 8 * 128
+
+
+def phases():
+    return {name: {"min": 1.0, "p50": 1.1, "p95": 1.2, "p99": 1.3} for name in PHASES}
+
+
 def record():
     case = {
         "label": "extend_pref512_chunk128_bs1_ps64",
@@ -64,10 +81,7 @@ def record():
         "attention_pairs": 128 * 512 + 128 * 129 // 2,
         "attention_flops": 36 * 4 * (128 * 512 + 128 * 129 // 2) * 8 * 128,
     }
-    phases = {
-        name: {"min": 1.0, "p50": 1.1, "p95": 1.2, "p99": 1.3}
-        for name in summary_module.REPORTED_PHASES
-    }
+    built = phases()
     return {
         "kind": "kernel",
         "case": case,
@@ -84,7 +98,7 @@ def record():
         "warmup": 10,
         "timed": 100,
         "device_name": "NVIDIA H20",
-        "phases": phases,
+        "phases": built,
         "derived": dict(DERIVED),
         "correctness": {
             "indices": {"passed": True},
@@ -96,6 +110,22 @@ def record():
 
 def test_the_schema_covers_every_derived_figure():
     assert set(DERIVED) <= set(summary_module.CSV_COLUMNS)
+
+
+def test_the_declared_derived_figures_are_the_ones_stats_produces():
+    """The two sides of the derived columns are one definition: the keys stats.derive
+    returns are the ones the schema names, so a figure added there without a column
+    fails here rather than being dropped from the file."""
+    assert set(derive(FakeCase(), phases(), 512 * 36864, 640 * 36864)) == set(DERIVED)
+
+
+def test_every_phase_has_its_columns():
+    """The phases the benchmark measures and stats.py names are the ones the schema
+    writes, so the two cannot drift apart."""
+    for phase in PHASES:
+        for statistic in ("min", "p50", "p95", "p99"):
+            assert f"{phase}_{statistic}_ms" in summary_module.CSV_COLUMNS
+    assert set(summary_module.REPORTED_PHASES) == set(PHASES)
 
 
 def test_a_row_carries_every_declared_column():

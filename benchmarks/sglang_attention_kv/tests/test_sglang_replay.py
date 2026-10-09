@@ -20,19 +20,30 @@ from benchmarks.sglang_attention_kv.cases import (  # noqa: E402
 )
 from benchmarks.sglang_attention_kv import kernel_bench  # noqa: E402
 from benchmarks.sglang_attention_kv.kernel_bench import (  # noqa: E402
-    PHASES,
-    STEP_PHASES,
-    derive,
     one_attention_component,
     one_iteration,
     run_case,
 )
 from benchmarks.sglang_attention_kv.sglang_replay import SglangStep  # noqa: E402
+from benchmarks.sglang_attention_kv.stats import (  # noqa: E402
+    PHASES,
+    STEP_PHASES,
+    derive,
+)
 
 DEVICE = "cuda:0"
 
 
-def step_case(mode, prefix_lens, new_lens, page_size=64, layout="random", layers=2):
+def step_case(
+    mode,
+    prefix_lens,
+    new_lens,
+    page_size=64,
+    layout="random",
+    layers=2,
+    qo_heads=8,
+    kv_heads=2,
+):
     return KernelCase(
         mode=mode,
         prefix_lens=prefix_lens,
@@ -40,8 +51,8 @@ def step_case(mode, prefix_lens, new_lens, page_size=64, layout="random", layers
         page_size=page_size,
         layout=layout,
         num_layers=layers,
-        num_qo_heads=8,
-        num_kv_heads=2,
+        num_qo_heads=qo_heads,
+        num_kv_heads=kv_heads,
         head_dim=128,
         dtype="bfloat16",
     )
@@ -72,7 +83,7 @@ def test_the_step_passes_every_check(mode, layout, page_size):
         step_case(mode, prefix_lens, new_lens, page_size=page_size, layout=layout)
     )
     assert step.check_indices(indices)["passed"]
-    assert step.check_history(indices)["passed"]
+    assert step.check_history()["passed"]
     assert step.check_attention(step.make_query())["passed"]
 
 
@@ -85,7 +96,7 @@ def test_both_extend_branches_pass_their_checks(extend_branch):
     )
     assert step.branch == extend_branch
     assert step.check_indices(indices)["passed"]
-    assert step.check_history(indices)["passed"]
+    assert step.check_history()["passed"]
     assert step.check_attention(step.make_query())["passed"]
 
 
@@ -145,7 +156,7 @@ def test_build_indices_does_not_synchronise_with_the_host(monkeypatch):
 
 def test_the_history_reads_what_was_written_for_every_layer():
     step, indices = prepared(step_case("decode", (768,), (1,), layers=3))
-    result = step.check_history(indices)
+    result = step.check_history()
     assert result["mismatched_k_elements"] == 0
     assert result["mismatched_v_elements"] == 0
     assert result["tokens_checked"] == 769 * 3
@@ -155,14 +166,14 @@ def test_a_corrupted_v_is_caught():
     """The content check has to cover V as well as K: a V that was never written
     where the token table points is a broken cache, not a passing check."""
     step, indices = prepared(step_case("decode", (512,), (1,), layers=2))
-    assert step.check_history(indices)["passed"]
+    assert step.check_history()["passed"]
 
     _, value_buffer = step.kv_pool.get_kv_buffer(1)
     row = int(step.token_pool.req_to_token[int(step.req_pool_indices[0]), 7])
     value_buffer[row] = 0.0
     torch.cuda.synchronize()
 
-    result = step.check_history(indices)
+    result = step.check_history()
     assert not result["passed"]
     assert result["mismatched_v_elements"] > 0
 
@@ -174,7 +185,7 @@ def test_a_corrupted_k_is_caught():
     key_buffer[row] = 0.0
     torch.cuda.synchronize()
 
-    result = step.check_history(indices)
+    result = step.check_history()
     assert not result["passed"]
     assert result["mismatched_k_elements"] > 0
 
@@ -220,7 +231,7 @@ def test_a_churned_pool_scatters_the_pages():
     assert len(pages) == 8
     assert pages != list(range(pages[0], pages[0] + 8))
     assert max(pages) > 8
-    assert step.check_history(indices)["passed"]
+    assert step.check_history()["passed"]
 
 
 def test_the_churned_layout_follows_the_seed():
@@ -382,6 +393,23 @@ def test_the_checks_read_the_state_the_timed_loop_left(monkeypatch):
     assert history["mismatched_v_elements"] > 0
 
 
+def test_the_decode_wrapper_follows_sglang_tensor_core_policy(monkeypatch):
+    """The tensor-core path is decided per case by SGLang's own function, not fixed:
+    at bf16 it takes the path from a group size of 4 query heads per KV head up, and
+    the environment variable turns it off for every case."""
+    wide = prepared(step_case("decode", (512,), (1,), qo_heads=8, kv_heads=2))[0]
+    assert wide.decode_use_tensor_cores is True
+    assert wide.as_dict()["decode_use_tensor_cores"] is True
+
+    narrow = prepared(step_case("decode", (512,), (1,), qo_heads=8, kv_heads=4))[0]
+    assert narrow.decode_use_tensor_cores is False
+    assert narrow.as_dict()["decode_use_tensor_cores"] is False
+
+    monkeypatch.setenv("SGLANG_FLASHINFER_USE_TENSOR_CORE", "false")
+    off = prepared(step_case("decode", (512,), (1,), qo_heads=8, kv_heads=2))[0]
+    assert off.decode_use_tensor_cores is False
+
+
 def test_the_page_size_selects_the_allocator_a_server_builds():
     """SGLang takes the token allocator at page size 1 and the paged one above it,
     and the two allocate a step's slots through different entry points: the token
@@ -509,7 +537,7 @@ def test_prefill_writes_kv_but_reads_no_paged_stream():
     step, indices = prepared(step_case("prefill", (0,), (128,)))
     assert indices.paged_indices is None
     assert step.check_indices(indices)["passed"]
-    assert step.check_history(indices)["passed"]
+    assert step.check_history()["passed"]
 
 
 @pytest.mark.parametrize("page_size", [1, 64])
@@ -549,7 +577,7 @@ def test_paged_prefill_reads_written_kv_causally(page_size, layout, monkeypatch)
         for operation in ("write", "read")
     ]
     assert step.check_indices(timed_indices)["passed"]
-    assert step.check_history(timed_indices)["passed"]
+    assert step.check_history()["passed"]
     assert step.check_attention(query)["passed"]
     assert not step.unmasked_reference(query)["passed"]
 

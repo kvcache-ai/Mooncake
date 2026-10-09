@@ -1,6 +1,6 @@
 # The command line's own checks, without a GPU: the counts a run may take, the
-# tensor parallel size it resolves, and the dry-run it prints. Each of these used
-# to pass a bad argument on to a place where the failure was harder to read.
+# tensor parallel size it resolves, and the dry-run it prints. Each of these fails
+# where the argument is read, before a run takes any GPU memory.
 
 import pytest
 

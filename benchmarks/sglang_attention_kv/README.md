@@ -40,8 +40,10 @@ own instead, and they are components rather than the schedule the step runs:
 | `attention_component` | the branch's attention path over every layer of the step, in one window, without the writes. What that path is depends on the branch: one ragged call, two wrapper calls and one `merge_state`, one paged prefill call, or one paged decode call. The merge branch's path is several calls per layer, so one component window holds more than one call per layer |
 | `kv_gather` | a read-only probe: the rows the branch's paged side reads (or the slots the step wrote, when it reads no paged KV), both K and V, moved with `index_select` and no arithmetic |
 
-Each of the two components holds one call per layer per step, so a step of a model with L layers holds
-L write calls and L per-layer attention paths.
+`kv_write_component` holds one `set_kv_buffer` call per layer, and
+`attention_component` holds the branch's path per layer: one call for the ragged and paged branches,
+and several for the merge branch. A step of a model with L layers therefore holds L write calls and L
+per-layer attention paths.
 
 None of the three is added to the step. Each runs after the timed loop, in windows of its own, so no
 step iteration is ever timed with a probe inside it, and the wrappers are planned against the probe's
@@ -155,7 +157,7 @@ below is recorded per step:
 | `kv_bytes_paged_read` | the same count over the tokens the branch's paged side reads: the cached history for `ragged_prefix_merge`, the whole context for `paged_extend` and `decode`, and nothing for `ragged_no_prefix` |
 | `kv_bytes_ragged_read` | the same count over the tokens the branch's ragged side reads: the step's own tokens for the two ragged branches, nothing for the paged ones |
 | `kv_bytes_attention_read` | `kv_bytes_paged_read + kv_bytes_ragged_read`: what the attention window covers |
-| `kv_bytes_page_capacity` | the same per-token count over whole pages, so a last page that is not full counts with its padding and `padding_tokens` states how many tokens that is. It is an allocation figure — the capacity the pages occupy — and no bandwidth divides by it |
+| `kv_bytes_page_capacity` | the same per-token count over whole pages, so a last page that is not full counts with the capacity it holds unused and `padding_tokens` states how many tokens that is. It is an allocation figure — the capacity the pages occupy — and no bandwidth divides by it |
 | `gather_bytes` | the bytes the read-only probe moves: both K and V of the `gather_rows` rows it reads, for every layer |
 | `attention_pairs` | `sum over sequences of new * prefix + new * (new + 1) / 2`: a causal mask aligned to the end of the context leaves each query the history and everything computed before it |
 | `attention_flops` | `layers * 4 * attention_pairs * qo_heads * head_dim`: QK^T and PV are one multiply-add each, so a query-key pair costs 4 operations, and every layer does that work |
@@ -166,14 +168,16 @@ The two rates a row reports are unique-payload normalisations, and their column 
 divides `gather_bytes`, each by the window that path ran in. The payload is counted once per layer for
 each token the path reads, however many queries read that token: the repeated operand a query costs
 appears in the FLOP count, not in those bytes, so the rate is not a kernel bandwidth and not the traffic
-the memory system moved. What the memory system actually transfers is not observable without a
-profiler, and no figure here claims it: a paged read touches whole pages and a write may coalesce, and
-the page capacity is reported as the allocation figure it is rather than as traffic.
+the memory system moved. What the memory system actually transfers is not observable without a profiler,
+and no figure here claims it: the CSR stream names valid tokens one index each at every page size, so
+the page capacity is unused capacity rather than bytes a kernel reads, and a write may coalesce. The
+page capacity is reported as the allocation figure it is rather than as traffic.
 
-The write side carries no rate of its own. Its window does not track the bytes a step writes, so what it
-covers is not determined by the measurement and a quotient of it would report whatever the window
-caught. `kv_write_component` is recorded as the window it is, with its min, p50, p95 and p99 beside it
-so a reader can see how far apart its samples are within one row.
+`kv_write_component` is the latency of the step's KV writer, one `set_kv_buffer` call per layer in a
+window of its own, beside the attention window rather than inside it. It is a timing of those calls and
+not a measurement of the bytes the pool transferred, which needs a profiler, so no rate is derived from
+it. Its min, p50, p95 and p99 are recorded so a reader can see how far apart its samples are within one
+row.
 
 ## 5. Correctness checks
 
@@ -297,15 +301,15 @@ added into it for the reason in section 1.
   per-token bytes; the manifest records both, and results from different shardings are only comparable
   through them.
 
-The replay fixes four settings, each stated in the record's `configuration` and in the CSV, so a row
-says which configuration it describes. They are the benchmark's own lane, read off SGLang 0.5.20 as the
-version below states; they are not what SGLang picks for every model:
+The replay fixes three settings and derives a fourth, each stated in the record's `configuration` and
+in the CSV, so a row says which configuration it describes. The three are the benchmark's own lane, read
+off SGLang 0.5.20; they are not what SGLang picks for every model:
 
 | Setting | Value here | What SGLang does |
 |---|---|---|
 | `attention_backend` | `flashinfer-fa2` | a server selects its backend; this benchmark calls the FlashInfer wrappers, so it measures that backend and no other |
 | `wrapper_page_size` | `1`, and every last-page length is 1 | the same on every model: SGLang hands FlashInfer a token-level CSR stream, and the pool's page size is a separate figure that reaches the kernels only through the addresses in it |
-| `decode_use_tensor_cores` | `true` | `FlashInferAttnBackend` decides this per model through `should_use_tensor_core`: a bf16 or fp16 cache at a group size of 4 or more query heads per KV head takes the tensor-core path, which a model at that group size reaches. A model below that threshold builds the wrapper without it, and `SGLANG_FLASHINFER_USE_TENSOR_CORE` overrides the choice either way |
+| `decode_use_tensor_cores` | per case, from SGLang's own `should_use_tensor_core` | the replay calls that function with the case's cache dtype and its per-rank head counts, which is how `FlashInferAttnBackend` resolves its decode wrapper: fp8 takes the tensor-core path, fp16 and bf16 take it at a group size of 4 or more query heads per KV head, `SGLANG_FLASHINFER_USE_TENSOR_CORE` overrides the choice, and the value a case resolved to is what the row records |
 | `kv_write_stream` | `step`: the pool is built with `enable_alt_stream=False` | in SGLang 0.5.20 that stream is used only inside CUDA graph capture: `_set_kv_buffer_impl` branches on `get_is_capture_mode()` and otherwise writes through the fused `store_cache` kernel on the current stream. This replay captures no graph, so the flag records how the pool was built rather than a different write path |
 
 The allocator is not one of those four: it follows the pool's page size the way SGLang's own

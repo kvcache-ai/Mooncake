@@ -1,12 +1,12 @@
-# SGLang's own KV cache structures for one attention step, and the branch of
+# SGLang's KV cache structures for one attention step, and the branch of
 # FlashInferAttnBackend each mode takes.
 #
-# Nothing here re-implements what SGLang already does:
+# The step is built from SGLang's own pieces:
 #
 #   - the request to token table is sglang.srt.mem_cache.memory_pool.ReqToTokenPool;
-#   - the slots a step writes come from PagedTokenToKVPoolAllocator, the allocator
-#     a server with page_size > 1 builds, through its own alloc_extend and
-#     alloc_decode entry points;
+#   - the slots a step writes come from the allocator its page size selects,
+#     TokenToKVPoolAllocator at page size 1 or PagedTokenToKVPoolAllocator above
+#     it, through the entry point that allocator has;
 #   - the KV write is MHATokenToKVPool.set_kv_buffer, the writer the attention
 #     layer calls;
 #   - the index mapping is create_flashinfer_kv_indices_triton, the kernel
@@ -30,6 +30,7 @@ import torch
 from flashinfer.cascade import merge_state
 
 from sglang.kernels.ops.kvcache.kv_indices import create_flashinfer_kv_indices_triton
+from sglang.srt.layers.attention.flashinfer_backend import should_use_tensor_core
 from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
@@ -57,14 +58,6 @@ from .cases import (
 FLASHINFER_BACKEND = "fa2"
 WRAPPER_PAGE_SIZE = 1
 WORKSPACE_BYTES = 384 * 1024 * 1024
-
-# The decode wrapper's tensor-core path. FlashInferAttnBackend decides this per
-# model through should_use_tensor_core, which returns True for a bf16 cache at a
-# group size of 4 or more query heads per KV head (and honours
-# SGLANG_FLASHINFER_USE_TENSOR_CORE). This model has a group size of 4 on this
-# sharding, so True is the lane the benchmark replays; a model below that
-# threshold would build the wrapper without it.
-DECODE_USE_TENSOR_CORES = True
 
 # Whether the KV pool is built with MHATokenToKVPool's alternate stream. In SGLang
 # 0.5.20 that stream is used only inside CUDA graph capture: _set_kv_buffer_impl
@@ -111,7 +104,7 @@ class StepIndices:
 
 
 class SglangStep:
-    """One step driven through SGLang's own structures. Head counts are per rank."""
+    """One step built on SGLang's structures. Head counts are per rank."""
 
     def __init__(self, case, device, seed=0, extend_branch=BRANCH_RAGGED_PREFIX_MERGE):
         self.case = case
@@ -133,6 +126,15 @@ class SglangStep:
         )
         self.req_pool_indices = torch.arange(
             1, case.batch_size + 1, dtype=torch.int32, device=device
+        )
+        # SGLang's own policy for the decode wrapper, per case rather than fixed:
+        # the backend calls it with the cache dtype and the per-rank head counts, so
+        # a case whose group size is below the tensor-core threshold, or whose
+        # environment turns the path off, gets the wrapper a server would build.
+        self.decode_use_tensor_cores = should_use_tensor_core(
+            kv_cache_dtype=self.dtype,
+            num_attention_heads=case.num_qo_heads,
+            num_kv_heads=case.num_kv_heads,
         )
         self.workspace = torch.empty(WORKSPACE_BYTES, dtype=torch.uint8, device=device)
 
@@ -386,7 +388,7 @@ class SglangStep:
             )
         else:
             self.decode_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
-                self.workspace, "NHD", use_tensor_cores=DECODE_USE_TENSOR_CORES
+                self.workspace, "NHD", use_tensor_cores=self.decode_use_tensor_cores
             )
 
     # ------------------------------------------------------------ the step
@@ -644,9 +646,13 @@ class SglangStep:
         history_v = self.prefix_value_source(layer_id, sequence_index, prefix_len)
         return torch.cat([history_k, new_k]), torch.cat([history_v, new_v])
 
-    def check_history(self, indices):
+    def check_history(self):
         """Every token the step reads has to hold what was written, K and V, for
-        every layer: the cached history and the tokens this step wrote."""
+        every layer: the cached history and the tokens this step wrote.
+
+        It reads the token table and the KV pool as they stand, so what it checks
+        is the state the last step left rather than a stream handed to it.
+        """
         case = self.case
         mismatched_k = 0
         mismatched_v = 0
@@ -744,7 +750,7 @@ class SglangStep:
             "reads_before_write": self.reads_before_write,
             "attention_backend": f"flashinfer-{FLASHINFER_BACKEND}",
             "wrapper_page_size": WRAPPER_PAGE_SIZE,
-            "decode_use_tensor_cores": DECODE_USE_TENSOR_CORES,
+            "decode_use_tensor_cores": self.decode_use_tensor_cores,
             "kv_layout": "NHD",
             "kv_write_stream": "alternate" if KV_WRITE_ALT_STREAM else "step",
             "slot_allocator": self.allocator_kind,

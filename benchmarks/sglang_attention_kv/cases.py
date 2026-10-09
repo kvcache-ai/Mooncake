@@ -204,8 +204,10 @@ class StepShape:
 
     @property
     def padding_tokens(self):
-        """Tokens the paged read covers beyond the valid ones, from a last page
-        that is not full."""
+        """Capacity the step's pages hold beyond its valid tokens, from a last page
+        that is not full. It is unused allocation rather than something the kernel
+        reads: the CSR stream names the valid tokens, one index each, at every page
+        size."""
         return self.pages * self.page_size - self.context_tokens
 
     @property
@@ -318,9 +320,9 @@ class KernelCase(StepShape):
 
     def kv_page_capacity_bytes(self):
         """The capacity the step's pages occupy: whole pages, so a last page that
-        is not full counts with its padding and `padding_tokens` states how many
-        tokens that is. This is an allocation figure. What a kernel reads is the
-        logical count for the path it takes, which `SglangStep.read_bytes` splits
+        is not full counts with the capacity it holds unused and `padding_tokens`
+        states how many tokens that is. This is an allocation figure, not a read:
+        the paged side reads the valid tokens, which `SglangStep.read_bytes` splits
         into the paged side and the ragged side."""
         return self.kv_bytes(self.pages * self.page_size)
 
