@@ -272,6 +272,8 @@ class RdmaContext {
 
     ibv_pd *pd() const { return pd_; }
 
+    uint32_t vendorId() const { return vendor_id_; }
+
     uint8_t portNum() const { return port_; }
 
     uint8_t numLagPorts() const { return num_lag_ports_; }
@@ -345,6 +347,7 @@ class RdmaContext {
 
     uint8_t port_ = 0;
     uint32_t lid_ = 0;
+    uint32_t vendor_id_ = 0;
     int gid_index_ = -1;
     int active_speed_ = -1;
     int active_width_ = 1;
