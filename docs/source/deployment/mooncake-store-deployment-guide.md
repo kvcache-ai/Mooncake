@@ -1038,8 +1038,8 @@ reads for that descriptor.
 - DFS allocator state is currently in memory. A master restart or HA leader
   failover does not reconstruct existing DFS allocations, so DFS cannot provide
   continuity across those events.
-- DFS cannot be enabled with snapshot generation, snapshot restore, oplog
-  recovery, or standby restore until DFS allocator state restoration is
+- DFS cannot be enabled with batch snapshot or OpLog recovery, or standby
+  restore until DFS allocator state restoration is
   implemented.
 - There is currently no background DFS retry queue or configurable
   asynchronous acknowledgement policy.

@@ -163,21 +163,10 @@ format.
 
 Weight metadata, leases, and operation records use durable-before-visible
 OpLog publication. Standby replay stores them in a separate weight-metadata
-namespace rather than encoding them as fake object metadata. Master snapshots
-carry an optional `weight_metadata` section; an older snapshot without the
-section restores empty Weight metadata while preserving ordinary KV metadata.
-Derived group indexes are rebuilt from restored metadata records.
-
-Periodic Master snapshots capture the durable log boundary and weight state
-under a shared consistency boundary. Weight mutations hold a barrier from
-log submission through in-memory publication. If a mutation is still pending,
-the snapshot skips that cycle and retries at the next interval rather than
-waiting for publication while holding the global snapshot lock. Continuous
-overlapping weight mutations can therefore postpone snapshots. Weight state
-is frozen in the parent; the forked child only serializes the frozen value.
-Snapshots also skip capture when the OpLog writer is not accepting writes:
-a failed caller may have an uncertain durable outcome, which must remain
-recoverable from the log rather than be skipped by a new snapshot boundary.
+namespace rather than encoding them as fake object metadata. Batch OpLog
+snapshots capture that namespace with object and segment metadata at the same
+durable replay cursor. Derived group indexes are rebuilt from restored
+metadata records.
 
 Batch-OpLog snapshots containing weight state use a version-2 manifest with a
 checksummed weight-state artifact captured at the same replay cursor as object
@@ -205,9 +194,9 @@ not automatic standby discovery. Reads and ordinary KV operations are not
 gated by it.
 
 The capability flag admits new mutations; it is not a rollback switch.
-Disabling it does not remove existing weight state, including state loaded
-through snapshot restore or standby promotion. Such a cluster still requires
-readers that support its weight OpLog and snapshot formats.
+Disabling it does not remove existing weight state loaded through batch
+snapshot restore or standby promotion. Such a cluster still requires readers
+that support its weight OpLog and batch snapshot formats.
 
 The metadata-only OpLog payload in this stage accepts revisions without an
 active residency operation (`operation=NONE`, `operation_id=0`). The applier
