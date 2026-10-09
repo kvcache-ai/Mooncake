@@ -1357,7 +1357,28 @@ TransferMetadata::getSegmentDescInternal(const std::string &segment_name,
         if (result != GetResult::kFound) {
             if (status) *status = result;
             LOG(WARNING) << "Failed to retrieve segment descriptor, name "
-                         << segment_name;
+                         << segment_name
+                         << (result == GetResult::kNotFound
+                                 ? ", key not found in metadata backend"
+                                 : ", metadata backend unavailable");
+            // An authoritative miss on the data path (not the background
+            // refresh poller, which passes force_rpc_update=true) can also
+            // come from a mixed metadata-mode cluster: a peer configured
+            // with P2PHANDSHAKE never publishes its segment descriptor to a
+            // shared metadata backend and instead registers its
+            // transfer-engine RPC endpoint (host:<ephemeral port>) as the
+            // transport endpoint, which can never be resolved by name.
+            // See issue #4536.
+            if (result == GetResult::kNotFound && !force_rpc_update) {
+                LOG(WARNING)
+                    << "Segment '" << segment_name
+                    << "' not found in metadata backend. If the peer is "
+                       "still running, it may be configured with "
+                       "metadata_connstring=P2PHANDSHAKE: such peers do "
+                       "not publish segment descriptors to shared metadata "
+                       "backends (HTTP/etcd/Redis). All clients in one "
+                       "cluster must use the same metadata backend.";
+            }
             return nullptr;
         }
     }
