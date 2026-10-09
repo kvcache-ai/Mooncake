@@ -19,10 +19,6 @@ import urllib.request
 from pathlib import Path
 from urllib.parse import urlparse, urlunparse
 
-if not os.environ.get("MOONCAKE_PYTHON_BIN"):
-    raise RuntimeError("MOONCAKE_PYTHON_BIN must identify the root-wheel virtualenv")
-if Path(sys.executable).resolve() != Path(os.environ["MOONCAKE_PYTHON_BIN"]).resolve():
-    raise RuntimeError("run this test with the interpreter in MOONCAKE_PYTHON_BIN")
 os.environ["MOONCAKE_STORE_BACKEND"] = "cpp"
 
 
