@@ -24,9 +24,11 @@
 namespace mooncake {
 
 // Signal every k WRs and always the last WR of this ibv_post_send chain.
-// k = min(interval, max_wr/2). interval<=1 is handled by the caller (every
-// WR signaled, no FIFO). Each chain starts at index 0 because the previous
-// chain always ended signaled (or the endpoint was destroyed).
+// k = min(interval, max_wr/2) so SQ slots free in two batches and later
+// posts need not wait for the whole chain. interval<=1 is handled by the
+// caller (every WR signaled, no FIFO). Each chain starts at index 0
+// because the previous chain always ended signaled (or the endpoint was
+// destroyed).
 inline int rdmaSignalPeriod(int interval, int max_wr) {
     if (interval <= 1 || max_wr < 2) return 1;
     return std::max(1, std::min(interval, max_wr / 2));

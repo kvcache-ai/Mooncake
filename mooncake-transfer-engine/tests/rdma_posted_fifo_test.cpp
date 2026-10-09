@@ -39,7 +39,7 @@ TEST(ShouldSignalRdmaWr, SignalsOnPeriodAndChainTail) {
     EXPECT_TRUE(shouldSignalRdmaWr(39, 40, period));
 }
 
-TEST(ShouldSignalRdmaWr, HalfSqCapPreventsUnsignaledDeadlock) {
+TEST(ShouldSignalRdmaWr, PeriodCappedAtHalfSq) {
     const int period = rdmaSignalPeriod(32, 8);
     EXPECT_EQ(period, 4);
     EXPECT_TRUE(shouldSignalRdmaWr(3, 8, period));
