@@ -61,6 +61,10 @@ struct ClientAutoPortEnvironmentVariables {
     MC_DEFINE_ENV_VAR(int, MC_STORE_CLIENT_MAX_PORT);
 };
 
+struct EmbeddedMasterEnvironmentVariables {
+    MC_DEFINE_ENV_VAR(bool, MOONCAKE_ENABLE_EMBEDDED_MASTER);
+};
+
 struct ClientObjectChecksumEnvironmentVariables {
     MC_DEFINE_ENV_VAR(bool, MOONCAKE_STORE_CHECKSUM);
 };
