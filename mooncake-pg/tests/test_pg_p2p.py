@@ -5,11 +5,11 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from mooncake import pg
-
 from pg_test_utils import (
     MooncakePGCPUBackendTestCase,
     MooncakePGCUDABackendTestCase,
     MooncakePGWorkerContext,
+    resolve_device_filters,
 )
 
 
@@ -59,6 +59,56 @@ def _direct_and_batch_send_recv_worker(
     ctx.record_result(value)
 
 
+def _chunked_send_recv_worker(ctx: MooncakePGWorkerContext) -> None:
+    if ctx.world_size != 2:
+        raise AssertionError("chunked P2P test expects world_size=2")
+    os.environ["MOONCAKE_P2P_CHUNK_SIZE"] = str(1 << 16)
+    device = ctx.init_group()
+    payload = torch.full((1 << 24,), ctx.rank, dtype=torch.uint8, device=device)
+    if ctx.rank == 0:
+        dist.send(payload, dst=1)
+        value = "sent"
+    else:
+        dist.recv(payload, src=0)
+        if not torch.all(payload == 0).item():
+            raise AssertionError("long P2P payload was corrupted")
+        value = "received"
+    ctx.synchronize()
+    ctx.record_result({"value": value})
+
+
+def _queued_send_progress_worker(ctx: MooncakePGWorkerContext) -> None:
+    if ctx.world_size != 2:
+        raise AssertionError("queued-send P2P test expects world_size=2")
+    os.environ["MOONCAKE_P2P_CHUNK_SIZE"] = str(1 << 16)
+    device = ctx.init_group()
+    pg.set_p2p_timeout_us(50_000)
+
+    if ctx.rank == 0:
+        large = torch.full((1 << 30,), 0x5A, dtype=torch.uint8, device=device)
+        small = torch.full((1 << 20,), 0xA5, dtype=torch.uint8, device=device)
+        large_work = dist.isend(large, dst=1)
+        small_work = dist.isend(small, dst=1)
+        large_work.wait()
+        small_work.wait()
+        value = "sent"
+    else:
+        large = torch.empty((1 << 30,), dtype=torch.uint8, device=device)
+        small = torch.empty((1 << 20,), dtype=torch.uint8, device=device)
+        dist.recv(large, src=0)
+        dist.recv(small, src=0)
+        large_ok = torch.all(large == 0x5A).item()
+        small_ok = torch.all(small == 0xA5).item()
+        if not large_ok or not small_ok:
+            raise AssertionError(
+                f"queued sends corrupted: large_ok={large_ok}, small_ok={small_ok}"
+            )
+        value = {"large_ok": large_ok, "small_ok": small_ok}
+
+    ctx.synchronize()
+    ctx.record_result({"value": value})
+
+
 def _ordering_worker(
     ctx: MooncakePGWorkerContext,
 ) -> None:
@@ -69,14 +119,18 @@ def _ordering_worker(
 
     num_msgs = 4
     if ctx.rank == 0:
-        send_tensors = [torch.tensor([i], dtype=torch.int64, device=device) for i in range(num_msgs)]
+        send_tensors = [
+            torch.tensor([i], dtype=torch.int64, device=device) for i in range(num_msgs)
+        ]
         ops = [dist.P2POp(op=dist.isend, tensor=t, peer=1) for t in send_tensors]
         works = dist.batch_isend_irecv(ops)
         for work in works:
             work.wait()
         value = "ok"
     else:
-        recv_tensors = [torch.empty(1, dtype=torch.int64, device=device) for _ in range(num_msgs)]
+        recv_tensors = [
+            torch.empty(1, dtype=torch.int64, device=device) for _ in range(num_msgs)
+        ]
         ops = [dist.P2POp(op=dist.irecv, tensor=t, peer=0) for t in recv_tensors]
         works = dist.batch_isend_irecv(ops)
         for work in works:
@@ -116,7 +170,9 @@ def _multiple_senders_worker(
         value = [int(recv_from_0.cpu().item()), int(recv_from_2.cpu().item())]
     elif ctx.rank == 2:
         send_tensor = torch.tensor([200], dtype=torch.int64, device=device)
-        works = dist.batch_isend_irecv([dist.P2POp(op=dist.isend, tensor=send_tensor, peer=1)])
+        works = dist.batch_isend_irecv(
+            [dist.P2POp(op=dist.isend, tensor=send_tensor, peer=1)]
+        )
         for work in works:
             work.wait()
         value = "ok"
@@ -159,8 +215,9 @@ def _p2p_fault_detection_worker(
         w.wait()
     ctx.synchronize()
     for w in works:
-        assert pg.get_local_success(w), \
-            f"rank {ctx.rank} round 1: all P2P ops should succeed locally"
+        assert pg.get_local_success(
+            w
+        ), f"rank {ctx.rank} round 1: all P2P ops should succeed locally"
         failed_ranks_hint = pg.get_failed_ranks_hint(w)
         assert (
             failed_ranks_hint.cpu().tolist() == [0] * ctx.world_size
@@ -185,12 +242,15 @@ def _p2p_fault_detection_worker(
     for w, peer in zip(works, [p for p in peers for _ in range(2)]):
         failed_ranks_hint = pg.get_failed_ranks_hint(w)
         expected = (
-            broken_peer_failed_ranks_hint if peer == BROKEN_RANK else normal_failed_ranks_hint
+            broken_peer_failed_ranks_hint
+            if peer == BROKEN_RANK
+            else normal_failed_ranks_hint
         )
         assert failed_ranks_hint.cpu().tolist() == expected
         if peer == BROKEN_RANK:
-            assert not pg.get_local_success(w), \
-                f"rank {ctx.rank} round 2: P2P with broken peer should fail locally"
+            assert not pg.get_local_success(
+                w
+            ), f"rank {ctx.rank} round 2: P2P with broken peer should fail locally"
 
     expected_active_ranks = [1] * ctx.world_size
     expected_active_ranks[BROKEN_RANK] = 0
@@ -264,13 +324,43 @@ class _P2PMixin:
         self.assertEqual(len(rank1["value"]), 2)
         self.assertEqual(rank2["value"], "ok")
 
+    def test_chunked_send_recv(self) -> None:
+        rows = self.spawn_backend_and_collect(
+            _chunked_send_recv_worker,
+            world_size=2,
+            nprocs=2,
+            timeout_s=120.0,
+        )
+        self.assert_all_ok(rows)
+        self.assertEqual({row["value"] for row in rows}, {"sent", "received"})
+
+    def test_queued_send_progress_does_not_timeout(self) -> None:
+        device_filters = resolve_device_filters(self.device_filters)
+        if device_filters is None:
+            device_filters = sorted(
+                os.listdir("/sys/class/infiniband")
+                if os.path.isdir("/sys/class/infiniband")
+                else []
+            )
+        if not device_filters:
+            self.skipTest("queued-send timeout regression requires an RDMA device")
+        rows = self.spawn_backend_and_collect(
+            _queued_send_progress_worker,
+            device_filters=device_filters[:1],
+            world_size=2,
+            nprocs=2,
+            timeout_s=180.0,
+        )
+        self.assert_all_ok(rows)
+        receiver = next(row for row in rows if row["rank"] == 1)
+        self.assertEqual(receiver["value"], {"large_ok": True, "small_ok": True})
+
 
 class TestMooncakePGP2PCPU(_P2PMixin, MooncakePGCPUBackendTestCase):
     pass
 
 
 class TestMooncakePGP2PCUDA(_P2PMixin, MooncakePGCUDABackendTestCase):
-
     @classmethod
     def configure_for_cuda_device_count(cls, device_count: int) -> None:
         if device_count < 2:
