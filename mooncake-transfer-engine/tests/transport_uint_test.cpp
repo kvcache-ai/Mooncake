@@ -327,8 +327,7 @@ TEST(TransferEngineInitTest, QosOverloadsPreserveMetadataConnection) {
         } else if (arguments == 5) {
             result = engine.init(P2PHANDSHAKE, "127.0.0.1:0", "", 0, "tcp");
         } else {
-            result = engine.init(P2PHANDSHAKE, "127.0.0.1:0", "", 0, "tcp",
-                                 R"({"comm_resource_config.qos":3})");
+            result = engine.init(P2PHANDSHAKE, "127.0.0.1:0", "", 0, "tcp", "");
         }
         ASSERT_EQ(result, 0) << "init arguments=" << arguments;
         EXPECT_EQ(engine.getMetadataConnectionString(), P2PHANDSHAKE);
@@ -336,6 +335,22 @@ TEST(TransferEngineInitTest, QosOverloadsPreserveMetadataConnection) {
         EXPECT_TRUE(engine.getMetadataConnectionString().empty());
     }
 }
+
+#ifndef USE_ASCEND_DIRECT
+TEST(TransferEngineInitTest, ClassicRejectsUnsupportedAscendResources) {
+    ScopedEnvVar use_tent("MC_USE_TENT", "0");
+    ScopedEnvVar force_tcp("MC_FORCE_TCP", nullptr);
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:0", "", 0, "tcp",
+                          R"({"comm_resource_config.qos":3})"),
+              ERR_INVALID_ARGUMENT);
+    EXPECT_TRUE(engine.getMetadataConnectionString().empty());
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:0", "", 0, "tcp", ""), 0);
+    EXPECT_EQ(engine.getMetadataConnectionString(), P2PHANDSHAKE);
+    EXPECT_EQ(engine.freeEngine(), 0);
+    EXPECT_TRUE(engine.getMetadataConnectionString().empty());
+}
+#endif
 
 #ifdef USE_TENT
 // RDMA is left enabled and TCP disabled so a regression that drops forceTcp()
