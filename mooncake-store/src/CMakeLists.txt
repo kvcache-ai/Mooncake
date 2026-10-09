@@ -120,6 +120,7 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     nvme_kv/key_codec.cpp
     nvme_kv/key_conflict_policy.cpp
     nvme_kv/object_layout.cpp
+    nof_io_layout.cpp
     transfer_task.cpp
     config/nof_debug_config.cpp
     config/fileread_worker_pool_config.cpp
