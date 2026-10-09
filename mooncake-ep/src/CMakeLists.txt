@@ -16,6 +16,7 @@ if(USE_CUDA)
       "${CMAKE_CURRENT_SOURCE_DIR}/jit/combine_jit.cpp"
       "${CMAKE_CURRENT_SOURCE_DIR}/jit/dispatch_jit.cpp"
       "${CMAKE_CURRENT_SOURCE_DIR}/jit/elastic_combine_jit.cpp"
+      "${CMAKE_CURRENT_SOURCE_DIR}/jit/elastic_combine_reduce_epilogue_jit.cpp"
       "${CMAKE_CURRENT_SOURCE_DIR}/jit/elastic_dispatch_copy_epilogue_jit.cpp"
       "${CMAKE_CURRENT_SOURCE_DIR}/jit/elastic_dispatch_jit.cpp"
       "${CMAKE_CURRENT_SOURCE_DIR}/jit/elastic_dispatch_prologue_jit.cpp"
@@ -59,6 +60,7 @@ if(USE_CUDA)
       mooncake_ep_exception.cuh
       mooncake_ep_utils.cuh
       elastic/mooncake_ep_elastic_combine_official.cuh
+      elastic/mooncake_ep_elastic_combine_reduce_epilogue.cuh
       elastic/mooncake_ep_elastic_combine_utils.cuh
       elastic/mooncake_ep_elastic_comm.cuh
       elastic/mooncake_ep_elastic_compiled.cuh
