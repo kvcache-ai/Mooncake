@@ -335,7 +335,11 @@ def finalize(result_dir, manifest):
         "steps": rows,
     }
     manifest_module.write_json(os.path.join(result_dir, "summary.json"), payload)
-    summary_module.write_csv(os.path.join(result_dir, "kernel_summary.csv"), rows)
+    summary_module.write_csv(
+        os.path.join(result_dir, "kernel_summary.csv"),
+        rows,
+        summary_module.CSV_COLUMNS,
+    )
 
 
 if __name__ == "__main__":

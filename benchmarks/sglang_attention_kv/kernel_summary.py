@@ -19,6 +19,10 @@ CSV_COLUMNS = [
     "mode",
     "branch",
     "reads_before_write",
+    "attention_backend",
+    "wrapper_page_size",
+    "decode_use_tensor_cores",
+    "kv_write_stream",
     "batch_size",
     "prefix_lens",
     "new_lens",
@@ -106,6 +110,10 @@ def kernel_summary(records):
             "mode": case["mode"],
             "branch": configuration["branch"],
             "reads_before_write": configuration["reads_before_write"],
+            "attention_backend": configuration["attention_backend"],
+            "wrapper_page_size": configuration["wrapper_page_size"],
+            "decode_use_tensor_cores": configuration["decode_use_tensor_cores"],
+            "kv_write_stream": configuration["kv_write_stream"],
             "batch_size": case["batch_size"],
             "prefix_lens": case["prefix_lens"],
             "new_lens": case["new_lens"],
@@ -141,17 +149,35 @@ def kernel_summary(records):
             row[f"{phase}_p95_ms"] = stats["p95"]
             row[f"{phase}_p99_ms"] = stats["p99"]
         row.update(record["derived"])
+        # The declared schema is the contract: a figure that derive() produces but
+        # the schema does not name would be dropped by the writer, and a column the
+        # schema promises has to be filled here.
+        unexpected = sorted(set(row) - set(CSV_COLUMNS))
+        missing = sorted(set(CSV_COLUMNS) - set(row))
+        if unexpected or missing:
+            raise ValueError(
+                f"row {case['label']} does not match the declared schema: "
+                f"undeclared {unexpected}, missing {missing}"
+            )
         rows.append(row)
     return rows
 
 
 def write_csv(path, rows, columns=None):
-    """Write one table as CSV, with dictionaries and lists as JSON cells."""
+    """Write one table as CSV, with dictionaries and lists as JSON cells.
+
+    The kernel table passes CSV_COLUMNS, so the file's schema is the one declared
+    here rather than whatever the first row happens to hold; a row missing a column
+    fails on the spot instead of writing a short line.
+    """
     if not rows:
         with open(path, "w", encoding="utf-8") as handle:
             handle.write("")
         return
-    fieldnames = columns or list(rows[0].keys())
+    fieldnames = list(columns) if columns is not None else list(rows[0].keys())
+    missing = sorted(set(fieldnames) - set(rows[0].keys()))
+    if missing:
+        raise ValueError(f"rows are missing the declared columns {missing}")
     with open(path, "w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()

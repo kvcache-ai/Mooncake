@@ -355,17 +355,68 @@ def test_the_attention_rate_divides_the_bytes_the_branch_reads():
     )
 
 
-def test_the_step_has_a_window_of_its_own_beside_the_phase_sum(monkeypatch):
-    """The three windows are timed separately, so phase_sum is their sum and not
-    the step: the device can be idle between them while the host issues the next
-    window's calls. step_window measures the whole step in one span."""
+def test_the_step_has_a_window_of_its_own_beside_the_phase_sum():
+    """The three windows are timed separately, so phase_sum is their sum and the
+    step is longer than it by the interval between the windows. step_window
+    measures the whole step in one span."""
     step, _ = prepared(step_case("extend", (256,), (128,)))
-    measured = one_iteration(step, step.make_query())
+    _, measured = one_iteration(step, step.make_query())
     assert set(measured) == set(STEP_PHASES) | {"step_window", "phase_sum"}
     assert measured["phase_sum"] == pytest.approx(
         sum(measured[name] for name in STEP_PHASES), rel=1e-12
     )
     assert measured["step_window"] >= measured["phase_sum"]
+
+
+def test_a_case_measures_the_device_it_was_given(monkeypatch):
+    """The events, the synchronise after them and the step's tensors have to be on
+    the case's device, with the process's current device left on another one. A
+    case measured without that binding records its windows on the current device
+    and returns from its synchronise before its own device has finished."""
+    if torch.cuda.device_count() < 2:
+        pytest.skip("needs two visible devices")
+    torch.cuda.set_device(0)
+    device = "cuda:1"
+    case = short_case(step_case("extend", (512,), (128,), layers=4))
+    measured = run_case(
+        case,
+        device,
+        warmup=2,
+        timed=3,
+        seed=3,
+        extend_branch=BRANCH_RAGGED_PREFIX_MERGE,
+    )
+    loop = measured["phases"]["layer_loop"]["p50"]
+    window = measured["phases"]["step_window"]["p50"]
+    assert measured["device"] == device
+    assert torch.cuda.current_device() == 0
+    assert measured["correctness"]["indices"]["passed"]
+    assert measured["correctness"]["history"]["passed"]
+    # A window that belonged to an idle device would hold no work at all.
+    assert loop > 0.1, f"layer_loop={loop} looks like an idle device's timeline"
+    assert window >= loop
+    assert measured["per_layer_p50_ms"]["layer_loop"] > 0
+
+
+def test_the_checks_read_the_state_the_timed_loop_left(monkeypatch):
+    """A step that wrote the wrong values has to fail on its own iteration, not on
+    the state the diagnostics rebuilt. The write component rewrites exactly the
+    slots the step wrote, so a check that ran after it could not see this."""
+    case = short_case(step_case("extend", (256,), (128,)))
+    original = kernel_bench.one_iteration
+
+    def corrupting(step, query):
+        indices, measured = original(step, query)
+        _, value_buffer = step.kv_pool.get_kv_buffer(0)
+        value_buffer[indices.out_cache_loc[0]] = 0.0
+        torch.cuda.synchronize()
+        return indices, measured
+
+    monkeypatch.setattr(kernel_bench, "one_iteration", corrupting)
+    result = run_case(case, DEVICE, warmup=1, timed=2)
+    history = result["correctness"]["history"]
+    assert not history["passed"], "a corrupted write passed its own check"
+    assert history["mismatched_v_elements"] > 0
 
 
 def test_the_component_passes_run_against_a_plan_of_their_own_indices(monkeypatch):
@@ -375,26 +426,35 @@ def test_the_component_passes_run_against_a_plan_of_their_own_indices(monkeypatc
     measures."""
     case = short_case(step_case("extend", (256,), (128,)))
     order = []
+    measured_step = []
     original_plan = SglangStep.plan
 
+    def record(step, marker):
+        # The correctness check builds a short step of its own, which plans too;
+        # this test is about the sequence the measured step runs.
+        if not measured_step or step is measured_step[0]:
+            order.append(marker)
+
     def plan(self, indices):
-        order.append("plan")
+        record(self, "plan")
         return original_plan(self, indices)
 
     def iteration(step, query):
-        order.append("iteration")
+        if not measured_step:
+            measured_step.append(step)
+        record(step, "iteration")
         return original_iteration(step, query)
 
     def write_component(step, indices):
-        order.append("write_component")
+        record(step, "write_component")
         return original_write(step, indices)
 
     def attention_component(step, query):
-        order.append("attention_component")
+        record(step, "attention_component")
         return original_attention(step, query)
 
     def gather(step, indices):
-        order.append("gather")
+        record(step, "gather")
         return original_gather(step, indices)
 
     original_iteration = kernel_bench.one_iteration
@@ -407,10 +467,9 @@ def test_the_component_passes_run_against_a_plan_of_their_own_indices(monkeypatc
     monkeypatch.setattr(kernel_bench, "one_attention_component", attention_component)
     monkeypatch.setattr(kernel_bench, "one_gather", gather)
     run_case(case, DEVICE, warmup=1, timed=2)
-    # Each timed iteration plans for its own indices inside its window. The plan
-    # that follows them is the one the component passes run against, and it comes
-    # before the first component window. The correctness check builds a short step
-    # of its own afterwards, which is why only this prefix is compared.
+    # Each iteration plans for its own indices inside its window. The plan after
+    # them is the one the component passes run against, and it comes before the
+    # first component window and after the correctness checks.
     expected = ["iteration", "plan"] * 3 + [
         "plan",
         "write_component",
@@ -441,7 +500,7 @@ def test_the_step_loop_interleaves_write_and_read_per_layer(monkeypatch):
 
     monkeypatch.setattr(step, "write_layer", write)
     monkeypatch.setattr(step, "run_layer", read)
-    measured = one_iteration(step, step.make_query())
+    _, measured = one_iteration(step, step.make_query())
     assert set(measured) == set(STEP_PHASES) | {"step_window", "phase_sum"}
     # The merge branch reads a layer and then writes it, so the calls alternate
     assert order[0] == ("read", 0)

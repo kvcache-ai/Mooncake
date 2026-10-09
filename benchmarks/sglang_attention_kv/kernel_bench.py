@@ -28,8 +28,8 @@ DIAGNOSTIC_PHASES = ("kv_write_component", "attention_component", "kv_gather")
 
 MEASURED_PHASES = STEP_PHASES + DIAGNOSTIC_PHASES
 # step_window is one window over the whole step; phase_sum is the sum of the three
-# windows above, which is what the two differ by: whatever the device spends
-# between them, and whatever the host takes to issue the step's calls.
+# windows above. step_window minus phase_sum is the between-window interval, which
+# the three windows do not cover; the measurement does not say what it holds.
 PHASES = MEASURED_PHASES + ("step_window", "phase_sum")
 
 # What the derived ratios divide by, and what phase_sum adds up.
@@ -44,6 +44,9 @@ def _case_seed(case, seed):
 
 
 def _event_pair():
+    """Two events on the current device. Every caller runs inside the device
+    context run_case holds, so the events, the synchronise that follows them and
+    the step's own tensors are on the same device."""
     return (
         torch.cuda.Event(enable_timing=True),
         torch.cuda.Event(enable_timing=True),
@@ -51,7 +54,7 @@ def _event_pair():
 
 
 def one_iteration(step, query):
-    """One timed step in the order the branch runs it.
+    """One timed step in the order the branch runs it, and the indices it read.
 
     The layer loop is timed as one window: a forward pass runs one layer's
     attention and one layer's KV write, layer by layer, in the order the branch
@@ -60,9 +63,10 @@ def one_iteration(step, query):
     passes of their own, as components.
 
     A pair around all three windows gives step_window, the step as one span. The
-    three windows do not add up to it: the device is idle between them while the
-    host issues the next window's calls, and that gap is inside step_window and
-    outside phase_sum.
+    three windows sum to phase_sum, which is below it by the between-window
+    interval: what the events of two windows do not cover. The indices come back
+    with the measurement, so the checks can run against the state this iteration
+    left rather than against a rebuild.
     """
     step_events = _event_pair()
     indices_events = _event_pair()
@@ -98,7 +102,7 @@ def one_iteration(step, query):
         "step_window": step_events[0].elapsed_time(step_events[1]),
     }
     measured["phase_sum"] = sum(measured[name] for name in TOTAL_PHASES)
-    return measured
+    return indices, measured
 
 
 def one_write_component(step, indices):
@@ -137,76 +141,99 @@ def run_case(
     case, device, warmup=DEFAULT_WARMUP, timed=DEFAULT_TIMED, seed=0, extend_branch=None
 ):
     """Measure one step and return per-phase percentiles plus the derived
-    figures."""
+    figures.
+
+    The whole case runs inside `torch.cuda.device(device)`: the step's tensors are
+    built on that device, and `Event.record()`, `torch.cuda.synchronize()` and the
+    wrapper workspaces all act on the process's current device. A case on `cuda:1`
+    measured while the current device is left on `cuda:0` would record its windows
+    on device 0 and return from its synchronise without waiting for device 1, so
+    the windows would be read off a timeline the case had not finished running.
+
+    The checks run on the state the timed loop left, before the component passes
+    rewrite the KV and replan the wrappers, so a step that wrote to the wrong
+    slots or read through a stale page table fails on its own iteration and not on
+    a state the diagnostics rebuilt.
+    """
     from .sglang_replay import BRANCH_RAGGED_PREFIX_MERGE, SglangStep
 
     if extend_branch is None:
         extend_branch = BRANCH_RAGGED_PREFIX_MERGE
-    step = SglangStep(
-        case, device, seed=_case_seed(case, seed), extend_branch=extend_branch
-    )
-    step.prepare()
+    with torch.cuda.device(device):
+        step = SglangStep(
+            case, device, seed=_case_seed(case, seed), extend_branch=extend_branch
+        )
+        step.prepare()
 
-    query = step.make_query()
+        query = step.make_query()
 
-    for _ in range(warmup):
-        one_iteration(step, query)
+        for _ in range(warmup):
+            one_iteration(step, query)
 
-    samples = {name: [] for name in STEP_PHASES}
-    samples["step_window"] = []
-    samples["phase_sum"] = []
-    for _ in range(timed):
-        measured = one_iteration(step, query)
-        for name in STEP_PHASES + ("step_window", "phase_sum"):
-            samples[name].append(measured[name])
+        samples = {name: [] for name in STEP_PHASES}
+        samples["step_window"] = []
+        samples["phase_sum"] = []
+        timed_indices = None
+        for _ in range(timed):
+            timed_indices, measured = one_iteration(step, query)
+            for name in STEP_PHASES + ("step_window", "phase_sum"):
+                samples[name].append(measured[name])
+        if timed_indices is None:
+            # No timed iteration to check against, so the checks read a state built
+            # for them; every run that measures anything has at least one.
+            timed_indices = step.build_indices()
 
-    # The components and the gather run after the step loop, each in its own
-    # windows, so no step iteration is ever timed with a probe inside it. They run
-    # against a plan of the indices they use, taken here rather than inside a
-    # window: the wrappers' metadata has to describe the indices the component pass
-    # reads, and planning is not part of what a component measures.
-    probe_indices = step.build_indices()
-    step.plan(probe_indices)
-    samples["kv_write_component"] = [
-        one_write_component(step, probe_indices) for _ in range(timed)
-    ]
-    samples["attention_component"] = [
-        one_attention_component(step, query) for _ in range(timed)
-    ]
-    samples["kv_gather"] = [one_gather(step, probe_indices) for _ in range(timed)]
+        correctness = {
+            "indices": step.check_indices(timed_indices),
+            "history": step.check_history(timed_indices),
+            "attention": short_step_attention(case, device, seed, extend_branch),
+        }
 
-    read_bytes = step.read_bytes()
-    result = {
-        "kind": "kernel",
-        "case": case.as_dict(),
-        "configuration": step.as_dict(),
-        "read_bytes": read_bytes,
-        "warmup": warmup,
-        "timed": timed,
-        "device_name": torch.cuda.get_device_name(device),
-        "kv_cache_bytes_per_rank": step.kv_cache_bytes_per_rank,
-        "num_pages_allocated": step.num_pages_allocated,
-        "phases": {name: summarize(samples[name]) for name in PHASES},
-        "per_layer_p50_ms": {
-            name: summarize(samples[name])["p50"] / case.num_layers
-            for name in STEP_PHASES + ("step_window",)
-        },
-    }
-    gather_bytes = step.gather_bytes(probe_indices)
-    result["gather_bytes"] = gather_bytes
-    result["gather_rows"] = int(step.gather_rows(probe_indices).numel())
-    result["derived"] = derive(
-        case, result["phases"], gather_bytes, read_bytes["attention"]
-    )
-    result["correctness"] = {
-        "indices": step.check_indices(probe_indices),
-        "history": step.check_history(probe_indices),
-        "attention": short_step_attention(case, device, seed, extend_branch),
-    }
-    # The next step builds its own pools; a step's pool and its tensors are the
-    # largest allocations in the run, so release them before moving on.
-    del step, query, probe_indices
-    torch.cuda.empty_cache()
+        # The components and the gather run after the checks, each in its own
+        # windows, so no step iteration is ever timed with a probe inside it and no
+        # check reads a state a probe built. They run against a plan of the indices
+        # they use, taken here rather than inside a window: the wrappers' metadata
+        # has to describe the indices the component pass reads, and planning is not
+        # part of what a component measures.
+        probe_indices = step.build_indices()
+        step.plan(probe_indices)
+        samples["kv_write_component"] = [
+            one_write_component(step, probe_indices) for _ in range(timed)
+        ]
+        samples["attention_component"] = [
+            one_attention_component(step, query) for _ in range(timed)
+        ]
+        samples["kv_gather"] = [one_gather(step, probe_indices) for _ in range(timed)]
+
+        read_bytes = step.read_bytes()
+        result = {
+            "kind": "kernel",
+            "case": case.as_dict(),
+            "configuration": step.as_dict(),
+            "read_bytes": read_bytes,
+            "warmup": warmup,
+            "timed": timed,
+            "device": str(device),
+            "device_name": torch.cuda.get_device_name(device),
+            "kv_cache_bytes_per_rank": step.kv_cache_bytes_per_rank,
+            "num_pages_allocated": step.num_pages_allocated,
+            "phases": {name: summarize(samples[name]) for name in PHASES},
+            "per_layer_p50_ms": {
+                name: summarize(samples[name])["p50"] / case.num_layers
+                for name in STEP_PHASES + ("step_window",)
+            },
+        }
+        gather_bytes = step.gather_bytes(probe_indices)
+        result["gather_bytes"] = gather_bytes
+        result["gather_rows"] = int(step.gather_rows(probe_indices).numel())
+        result["derived"] = derive(
+            case, result["phases"], gather_bytes, read_bytes["attention"]
+        )
+        result["correctness"] = correctness
+        # The next step builds its own pools; a step's pool and its tensors are the
+        # largest allocations in the run, so release them before moving on.
+        del step, query, probe_indices
+        torch.cuda.empty_cache()
     return result
 
 
@@ -246,10 +273,9 @@ def derive(case, phases, gather_bytes, read_bytes):
     without a profiler, so no figure here is a measured bandwidth. The page
     capacity is an allocation figure and is labelled as one.
 
-    The write window carries no rate. It reads two regimes for the same calls —
-    around 0.1 ms and around 1.16 ms — so what it covers is not determined by the
-    measurement, and a quotient of it would report whichever regime the window
-    caught.
+    The write window carries no rate. It does not follow the bytes the step writes,
+    so what it covers is not determined by the measurement and a quotient of it
+    would report whatever the window caught.
 
     The ratios divide phase_sum, the sum of the step's three windows, and are named
     for it: they are not shares of a total that the parts add up to, and the whole

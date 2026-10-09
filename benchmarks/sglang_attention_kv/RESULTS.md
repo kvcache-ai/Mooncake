@@ -44,8 +44,8 @@ branch's attention path over every layer in one window, each run after the timed
 to the step. `gather` is the read-only probe over the rows the branch's paged side reads.
 
 The step is 0.040 to 0.070 ms longer than the sum of its three windows in every one of the 600 matrix
-steps, and 0.053 to 0.060 ms longer in the six long-context steps: that is what the three windows do
-not cover, since the device is idle between them while the host issues the next window's calls.
+steps, and 0.053 to 0.060 ms longer in the six long-context steps: that is the between-window interval,
+what the three windows do not cover. The measurement does not say what the interval contains.
 
 `gather GB/s` and `read GB/s` are unique-payload normalisations: each divides the bytes its own path
 reads, counted once per layer for every token the path covers, by the window that path ran in.
@@ -163,9 +163,9 @@ about 3.5 ms against a loop of 2.42 to 2.49 ms, with the attention window alone 
 already most of the loop. On the 8192-token prefill the attention window (72.200 ms) is above the loop
 (71.900 ms), while on the 128-query extend behind 8192 tokens it is 4.730 ms against a loop of
 6.696 ms. The loop holds a layer's attention and its KV write as the branch interleaves them; each
-component holds one of the two, and the merge branch's path is three calls and a merge per layer rather
-than one. The CSV records their ratio to `phase_sum`, as a ratio of two measured windows, and no table
-here treats the components as parts that reconstruct the step.
+component holds one of the two, and the merge branch's path is two wrapper calls and one `merge_state`
+per layer rather than one call. The CSV records their ratio to `phase_sum`, as a ratio of two measured
+windows, and no table here treats the components as parts that reconstruct the step.
 
 The write window is reported as a window rather than as a rate. It reads 1.114 to 1.182 ms for steps
 that write 1 to 32768 tokens, so it does not follow the bytes written, and inside a single row its p95

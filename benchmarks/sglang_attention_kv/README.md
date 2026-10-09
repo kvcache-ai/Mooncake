@@ -21,9 +21,9 @@ The step itself is three windows, in the order a forward pass runs them:
 | `step_window` | one window over the whole step, from the first index call to the last layer | — |
 
 `step_window` is the step as one span and `phase_sum` is the sum of its parts. A reader comparing them
-sees what the three windows do not cover: the device is idle between them while the host issues the
-next window's calls, and that gap is inside `step_window`. The derived ratios divide `phase_sum` and are
-named `*_ratio_of_phase_sum` for it; the throughput figure divides `step_window`.
+sees the between-window interval: what the three windows do not cover. The measurement does not say
+what that interval contains. The derived ratios divide `phase_sum` and are named `*_ratio_of_phase_sum`
+for it; the throughput figure divides `step_window`.
 
 The loop is timed as one window on purpose. Putting an event pair around each layer's write and read
 would measure the events as much as the work — 144 events per iteration cost about 0.6 ms of the 5 ms
@@ -33,7 +33,7 @@ and they are components rather than the schedule the step runs:
 | Component | What it covers |
 |---|---|
 | `kv_write_component` | one `set_kv_buffer` call per layer, over every layer of the step, in one window, without the attention they interleave with |
-| `attention_component` | the branch's attention path over every layer of the step, in one window, without the writes. What that path is depends on the branch: one ragged call, a ragged call plus a paged call plus `merge_state`, one paged prefill call, or one paged decode call. The merge branch's path is three calls and a merge per layer, so one component window holds several calls per layer rather than one |
+| `attention_component` | the branch's attention path over every layer of the step, in one window, without the writes. What that path is depends on the branch: one ragged call, two wrapper calls and one `merge_state`, one paged prefill call, or one paged decode call. The merge branch's path is several calls per layer, so one component window holds more than one call per layer |
 | `kv_gather` | a read-only probe: the rows the branch's paged side reads (or the slots the step wrote, when it reads no paged KV), both K and V, moved with `index_select` and no arithmetic |
 
 The layer count of the model in [`RESULTS.md`](RESULTS.md) is 36, so those two components hold 36 write
@@ -150,10 +150,10 @@ the memory system moved. What the memory system actually transfers is not observ
 profiler, and no figure here claims it: a paged read touches whole pages and a write may coalesce, and
 the page capacity is reported as the allocation figure it is rather than as traffic.
 
-The write side carries no rate of its own. Its window reads two regimes for the same calls, one around
-0.1 ms and one around 1.16 ms in the run in [`RESULTS.md`](RESULTS.md), so what the window covers is not
-determined by the measurement and a quotient of it would report whichever regime the window caught.
-`kv_write_component` is recorded as the window it is.
+The write side carries no rate of its own. Its window does not follow the bytes written — the run in
+[`RESULTS.md`](RESULTS.md) records it between 1.114 and 1.182 ms for steps that write 1 to 32768 tokens
+— so what the window covers is not determined by the measurement, and a quotient of it would report
+whatever the window caught. `kv_write_component` is recorded as the window it is.
 
 ## 5. Correctness checks
 
