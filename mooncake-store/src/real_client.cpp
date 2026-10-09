@@ -13,6 +13,7 @@
 #include <cstring>
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <condition_variable>
 #include <functional>
 #include <limits>
@@ -1593,6 +1594,26 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     stop_ipc_server();
     stop_dummy_client_monitor();
     stop_http_server();
+
+#ifdef USE_NOF
+    // Callers must finish all I/O before closing. Release only this client's
+    // SPDK registrations here; TE follows the existing client teardown below.
+    std::vector<void *> spdk_buffers;
+    {
+        std::shared_lock<std::shared_mutex> lock(registered_buffer_mutex_);
+        spdk_buffers.reserve(external_spdk_buffers_.size());
+        for (const auto &entry : external_spdk_buffers_) {
+            spdk_buffers.push_back(entry.first);
+        }
+    }
+    for (void *buffer : spdk_buffers) {
+        if (!UnregisterExternalSpdkBuffer(buffer)) {
+            LOG(ERROR) << "SPDK buffer cleanup failed during teardown: "
+                       << buffer
+                       << "; keep its memory valid until process exit";
+        }
+    }
+#endif
 
     if (client_) {
         if (client_buffer_allocator_ && client_buffer_allocator_->size() > 0 &&
@@ -4149,11 +4170,54 @@ tl::expected<void, ErrorCode> RealClient::register_buffer_internal(
         }
     }
 
+#ifdef USE_NOF
+    const bool register_spdk =
+        ShmHelper::is_register_spdk_enabled() && !shm_helper->get_shm(buffer);
+    if (register_spdk) {
+        if (!SpdkWrapper::IsRegistrableRange(buffer, size)) {
+            LOG(ERROR) << "Invalid external NoF buffer range: " << buffer
+                       << ", size=" << size;
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+
+        std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
+        if (!external_spdk_buffers_.emplace(buffer, size).second) {
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+    }
+#endif
     auto result = client_->RegisterLocalMemory(buffer, registration_size,
                                                kWildcardLocation, false, true);
     if (!result) {
+#ifdef USE_NOF
+        if (register_spdk) {
+            std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
+            external_spdk_buffers_.erase(buffer);
+        }
+#endif
         return result;
     }
+#ifdef USE_NOF
+    if (register_spdk) {
+        const int rc = SpdkWrapper::GetInstance().RegisterMemory(buffer, size);
+        if (rc != 0) {
+            // -EBUSY means the range overlaps an existing SPDK registration;
+            // do not unregister it. Other errors may leave partial SPDK state;
+            // release TE only once our SPDK cleanup succeeds.
+            if (rc == -EBUSY) {
+                std::unique_lock<std::shared_mutex> lock(
+                    registered_buffer_mutex_);
+                external_spdk_buffers_.erase(buffer);
+            } else if (!UnregisterExternalSpdkBuffer(buffer)) {
+                return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+            }
+            if (!client_->unregisterLocalMemory(buffer, true)) {
+                LOG(ERROR) << "Failed to roll back TE registration: " << buffer;
+            }
+            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+    }
+#endif
     {
         std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
         registered_buffer_sizes_[buffer] = size;
@@ -4165,12 +4229,39 @@ int RealClient::register_buffer(void *buffer, size_t size) {
     return to_py_ret(register_buffer_internal(buffer, size));
 }
 
+#ifdef USE_NOF
+tl::expected<void, ErrorCode> RealClient::UnregisterExternalSpdkBuffer(
+    void *buffer) {
+    size_t size;
+    {
+        std::shared_lock<std::shared_mutex> lock(registered_buffer_mutex_);
+        auto it = external_spdk_buffers_.find(buffer);
+        if (it == external_spdk_buffers_.end()) return {};
+        size = it->second;
+    }
+    if (SpdkWrapper::GetInstance().UnregisterMemory(buffer, size) != 0) {
+        LOG(ERROR) << "SPDK buffer cleanup failed; keep memory alive: "
+                   << buffer;
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    {
+        std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
+        external_spdk_buffers_.erase(buffer);
+    }
+    return {};
+}
+#endif
+
 tl::expected<void, ErrorCode> RealClient::unregister_buffer_internal(
     void *buffer) {
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
+#ifdef USE_NOF
+    auto spdk_result = UnregisterExternalSpdkBuffer(buffer);
+    if (!spdk_result) return spdk_result;
+#endif
     auto unregister_result = client_->unregisterLocalMemory(buffer, true);
     if (!unregister_result) {
         LOG(ERROR) << "Unregister buffer failed with error: "

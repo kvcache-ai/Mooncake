@@ -1431,6 +1431,10 @@ pool plus any hugepage-backed segments; when the pool is exhausted the first
 allocation aborts with a clear error naming the hugepage size and count needed
 rather than silently degrading.
 
+With `USE_NOF` and `MC_STORE_REGISTER_SPDK=1`, `register_buffer(ptr, size)` also
+registers external host buffers with SPDK. Memory must be hugepage-backed, with
+both address and size aligned to 2 MiB.
+
 #### yalantinglibs Log Level
 
 ```bash

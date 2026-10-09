@@ -1175,6 +1175,12 @@ class RealClient : public PyClient {
         size_t local_buffer_size);
 
    private:
+#ifdef USE_NOF
+    // Keep the region here until SPDK unregistration succeeds.
+    std::unordered_map<void *, size_t> external_spdk_buffers_;
+    tl::expected<void, ErrorCode> UnregisterExternalSpdkBuffer(void *buffer);
+#endif
+
     tl::expected<std::string, ErrorCode> StartEmbeddedMaster(
         bool enable_ssd_offload);
 
