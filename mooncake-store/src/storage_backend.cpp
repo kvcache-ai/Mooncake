@@ -5628,8 +5628,7 @@ CreateStorageBackend(const FileStorageConfig& config) {
             } else if (distributed_config.UsesKvcs()) {
                 object_storage_adapter =
                     std::make_unique<KvcsObjectStorageAdapter>(
-                        config,
-                        distributed_config.object_storage_config_path);
+                        config, distributed_config.object_storage_config_path);
             } else {
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             }

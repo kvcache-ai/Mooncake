@@ -114,7 +114,6 @@ struct ReplicaMovePayload {
 };
 YLT_REFL(ReplicaMovePayload, tenant_id, key, source, target);
 
-
 template <TaskType T>
 struct TaskPayloadTraits;
 
@@ -129,7 +128,6 @@ struct TaskPayloadTraits<TaskType::REPLICA_MOVE> {
     using type = ReplicaMovePayload;
     static constexpr const char* name = "ReplicaMovePayload";
 };
-
 
 template <typename T>
 std::string serialize_payload(const T& payload) {

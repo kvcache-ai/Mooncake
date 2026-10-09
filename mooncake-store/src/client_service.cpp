@@ -133,8 +133,8 @@ tl::expected<QueryResult, ErrorCode> BuildQueryResult(
             const uint64_t object_size =
                 replica.get_dfs_descriptor().object_size;
             if (object_size == 0) {
-                LOG(WARNING) << "provider_query_invalid_master_size key="
-                             << object_key;
+                LOG(WARNING)
+                    << "provider_query_invalid_master_size key=" << object_key;
                 reconcile_error = ErrorCode::INTERNAL_ERROR;
                 continue;
             }
@@ -143,19 +143,19 @@ tl::expected<QueryResult, ErrorCode> BuildQueryResult(
         master_result.replicas = std::move(reconciled);
     }
 
-    if (saw_provider_replica &&
-        !HasCompleteReplica(master_result.replicas)) {
+    if (saw_provider_replica && !HasCompleteReplica(master_result.replicas)) {
         return tl::make_unexpected(
             reconcile_error.value_or(ErrorCode::REPLICA_IS_NOT_READY));
     }
 
-    const auto read_rank =
-        [&provider_backend](const Replica::Descriptor& replica) {
-            if (replica.status != ReplicaStatus::COMPLETE) return 3;
-            if (replica.is_memory_replica()) return 0;
-            return provider_backend && provider_backend->IsProviderReplica(replica)
-                       ? 1 : 2;
-        };
+    const auto read_rank = [&provider_backend](
+                               const Replica::Descriptor& replica) {
+        if (replica.status != ReplicaStatus::COMPLETE) return 3;
+        if (replica.is_memory_replica()) return 0;
+        return provider_backend && provider_backend->IsProviderReplica(replica)
+                   ? 1
+                   : 2;
+    };
     std::stable_sort(master_result.replicas.begin(),
                      master_result.replicas.end(),
                      [&read_rank](const auto& lhs, const auto& rhs) {
@@ -1336,10 +1336,11 @@ tl::expected<QueryResult, ErrorCode> Client::Query(
     auto master_result = master_client_.GetReplicaList(object_key);
     if (!master_result) return tl::unexpected(master_result.error());
     ObjectStorageQueryResults provider_results;
-    const bool needs_provider = provider_backend &&
-        provider_backend->SupportsProviderQuery() &&
+    const bool needs_provider =
+        provider_backend && provider_backend->SupportsProviderQuery() &&
         !HasCompleteMemoryReplica(master_result->replicas) &&
-        std::any_of(master_result->replicas.begin(), master_result->replicas.end(),
+        std::any_of(master_result->replicas.begin(),
+                    master_result->replicas.end(),
                     [&provider_backend](const auto& replica) {
                         return replica.status == ReplicaStatus::COMPLETE &&
                                provider_backend->IsProviderReplica(replica);
@@ -1384,13 +1385,14 @@ std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
     auto provider_backend = dfs_storage_backend_;
     auto response = master_client_.BatchGetReplicaList(object_keys, tenant_id);
 
-    ObjectStorageQueryResults provider_results(object_keys.size(),
+    ObjectStorageQueryResults provider_results(
+        object_keys.size(),
         tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY));
     std::vector<std::string> provider_keys;
     std::vector<size_t> provider_indices;
     const bool query_provider = provider_backend &&
-        provider_backend->SupportsProviderQuery() &&
-        tenant_id == master_client_.tenant_id();
+                                provider_backend->SupportsProviderQuery() &&
+                                tenant_id == master_client_.tenant_id();
     if (query_provider && response.size() == object_keys.size()) {
         for (size_t i = 0; i < response.size(); ++i) {
             if (!response[i] || HasCompleteMemoryReplica(response[i]->replicas))
@@ -1412,7 +1414,7 @@ std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
         try {
             queried = provider_backend->BatchQueryProvider(
                 provider_keys, std::chrono::steady_clock::now() +
-                                 provider_backend->ProviderQueryTimeout());
+                                   provider_backend->ProviderQueryTimeout());
         } catch (const std::exception&) {
             queried = ObjectStorageQueryResults(
                 provider_keys.size(),
@@ -1444,8 +1446,10 @@ std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
     for (size_t i = 0; i < response.size(); ++i) {
         if (response[i]) {
             const auto* provider_result =
-                std::binary_search(provider_indices.begin(), provider_indices.end(), i)
-                    ? &provider_results[i] : nullptr;
+                std::binary_search(provider_indices.begin(),
+                                   provider_indices.end(), i)
+                    ? &provider_results[i]
+                    : nullptr;
             results.emplace_back(BuildQueryResult(
                 object_keys[i], std::move(response[i].value()), start_time,
                 provider_backend, provider_result));
@@ -3900,7 +3904,8 @@ tl::expected<void, ErrorCode> Client::Remove(const ObjectKey& key, bool force) {
 
     auto master_result = master_client_.Remove(key, force);
     const bool provider_delete_retry =
-        !master_result && master_result.error() == ErrorCode::OBJECT_NOT_FOUND &&
+        !master_result &&
+        master_result.error() == ErrorCode::OBJECT_NOT_FOUND &&
         dfs_storage_backend_ && dfs_storage_backend_->SupportsProviderQuery();
     if (!master_result && !provider_delete_retry) {
         return tl::unexpected(master_result.error());

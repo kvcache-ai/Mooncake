@@ -28,9 +28,7 @@ struct DistributedStorageConfig {
     bool UsesObjectStorage() const {
         return fs_adapter_type == "oss" || fs_adapter_type == "kvcs-lowlevel";
     }
-    bool UsesKvcs() const {
-        return fs_adapter_type == "kvcs-lowlevel";
-    }
+    bool UsesKvcs() const { return fs_adapter_type == "kvcs-lowlevel"; }
 
     bool Validate() const;
     bool ValidateForAllocator() const;

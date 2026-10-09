@@ -21,8 +21,7 @@ class MemoryDriver final : public KvcsDriver {
     tl::expected<void, ErrorCode> Init() override { return {}; }
     uint64_t MaxValueSize() const override { return 8; }
 
-    KvcsPutResults BatchPut(
-        std::span<const KvcsPutRequest> requests) override {
+    KvcsPutResults BatchPut(std::span<const KvcsPutRequest> requests) override {
         ++put_calls_;
         KvcsPutResults results;
         for (const auto& request : requests) {
@@ -55,8 +54,7 @@ class MemoryDriver final : public KvcsDriver {
         return results;
     }
 
-    KvcsGetResults BatchGet(
-        std::span<const KvcsGetRequest> requests) override {
+    KvcsGetResults BatchGet(std::span<const KvcsGetRequest> requests) override {
         KvcsGetResults results;
         for (const auto& request : requests) {
             auto it = values_.find(request.logical_key);
@@ -216,8 +214,8 @@ TEST(KvcsObjectStorageAdapterTest, UpsertRequiresExplicitReplace) {
     put.replace_existing = true;
     put.slices = {{nullptr, 0}};
     std::string second = "two";
-    const ObjectStoragePutRequest insert{
-        "second", {{second.data(), second.size()}}};
+    const ObjectStoragePutRequest insert{"second",
+                                         {{second.data(), second.size()}}};
     const std::array<ObjectStoragePutRequest, 2> requests{put, insert};
     auto invalid = adapter.BatchPutV(requests);
     ASSERT_FALSE(invalid[0]);

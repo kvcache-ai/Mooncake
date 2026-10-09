@@ -284,11 +284,10 @@ class SingleValueDriver final : public KvcsDriver {
         return results;
     }
 
-    KvcsPutResults BatchPut(
-        std::span<const KvcsPutRequest> requests) override {
+    KvcsPutResults BatchPut(std::span<const KvcsPutRequest> requests) override {
         if (!client_)
             return Errors<KvcsPutResults>(requests.size(),
-                                               ErrorCode::INTERNAL_ERROR);
+                                          ErrorCode::INTERNAL_ERROR);
         KvcsPutResults results;
         results.reserve(requests.size());
         for (const auto& request : requests) {
@@ -352,11 +351,10 @@ class SingleValueDriver final : public KvcsDriver {
         return results;
     }
 
-    KvcsGetResults BatchGet(
-        std::span<const KvcsGetRequest> requests) override {
+    KvcsGetResults BatchGet(std::span<const KvcsGetRequest> requests) override {
         if (!client_)
             return Errors<KvcsGetResults>(requests.size(),
-                                               ErrorCode::INTERNAL_ERROR);
+                                          ErrorCode::INTERNAL_ERROR);
         KvcsGetResults results;
         results.reserve(requests.size());
         for (const auto& request : requests) {
@@ -487,8 +485,8 @@ class SingleValueDriver final : public KvcsDriver {
 #endif  // MOONCAKE_HAVE_KVCS_SDK
 }  // namespace
 
-tl::expected<std::unique_ptr<KvcsDriver>, ErrorCode>
-CreateKvcsLowLevelDriver(uint32_t mountpoint_index) {
+tl::expected<std::unique_ptr<KvcsDriver>, ErrorCode> CreateKvcsLowLevelDriver(
+    uint32_t mountpoint_index) {
 #ifdef MOONCAKE_HAVE_KVCS_SDK
     if (mountpoint_index == 0)
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);

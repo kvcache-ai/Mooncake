@@ -63,7 +63,6 @@ struct DistributedStorageEnvironment {
     ScopedEnvVar deferred_free_seconds{"MOONCAKE_DFS_DEFERRED_FREE_SECONDS"};
     ScopedEnvVar eviction_check_interval{
         "MOONCAKE_DFS_EVICTION_CHECK_INTERVAL"};
-
 };
 
 void ExpectDefaultConfig(const DistributedStorageConfig& config) {

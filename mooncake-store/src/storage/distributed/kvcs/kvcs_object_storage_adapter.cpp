@@ -62,7 +62,9 @@ KvcsObjectStorageAdapter::KvcsObjectStorageAdapter(
 
 KvcsObjectStorageAdapter::KvcsObjectStorageAdapter(
     const FileStorageConfig& config, std::unique_ptr<KvcsDriver> driver)
-    : config_(config), target_id_("injected"), mountpoint_index_(1),
+    : config_(config),
+      target_id_("injected"),
+      mountpoint_index_(1),
       driver_(std::move(driver)) {}
 
 KvcsObjectStorageAdapter::~KvcsObjectStorageAdapter() = default;
@@ -184,10 +186,11 @@ ObjectStorageIoResults KvcsObjectStorageAdapter::BatchPutV(
         if (!results[request_index]) continue;
         try {
             auto put = driver_->BatchPut({&puts[i], 1});
-            results[request_index] = put.size() == 1
-                             ? std::move(put[0])
-                             : tl::expected<void, ErrorCode>(
-                                   tl::make_unexpected(ErrorCode::INTERNAL_ERROR));
+            results[request_index] =
+                put.size() == 1
+                    ? std::move(put[0])
+                    : tl::expected<void, ErrorCode>(
+                          tl::make_unexpected(ErrorCode::INTERNAL_ERROR));
         } catch (...) {
             results[request_index] =
                 tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
@@ -211,8 +214,8 @@ ObjectStorageQueryResults KvcsObjectStorageAdapter::BatchQueryKvcs(
         }
         try {
             auto queried = deadline
-                ? driver_->BatchQueryUntil({&*key, 1}, *deadline)
-                : driver_->BatchQuery({&*key, 1});
+                               ? driver_->BatchQueryUntil({&*key, 1}, *deadline)
+                               : driver_->BatchQuery({&*key, 1});
             results.emplace_back(
                 queried.size() == 1
                     ? std::move(queried[0])
@@ -255,8 +258,8 @@ ObjectStorageIoResults KvcsObjectStorageAdapter::BatchGetInto(
         auto slices = DestinationSlices(request, driver_->MaxValueSize());
         auto key = EncodeKey(request.logical_key);
         if (!slices || !key) {
-            results.emplace_back(tl::make_unexpected(
-                !slices ? slices.error() : key.error()));
+            results.emplace_back(
+                tl::make_unexpected(!slices ? slices.error() : key.error()));
             continue;
         }
         const KvcsGetRequest get{std::move(*key), std::move(*slices),

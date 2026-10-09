@@ -855,7 +855,7 @@ ObjectStorageQueryResults DistributedStorageBackend::BatchQueryProvider(
             tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE));
     }
     return object_storage_adapter_->BatchQueryProviderUntil(logical_keys,
-                                                              deadline);
+                                                            deadline);
 }
 
 ObjectStorageIoResults DistributedStorageBackend::BatchDeleteProvider(

@@ -610,13 +610,13 @@ void MasterService::InitDfsAllocatorFromEnvironment(
     const auto dfs_config = DistributedStorageConfig::FromEnvironment();
     // KVCS is an object-storage backend and does not use the filesystem DFS
     // allocator, but it still enables the distributed-storage path.
-    enable_dfs_ = DfsEnablementConfig::FromEnvironment().enabled ||
-                  dfs_config.UsesKvcs();
+    enable_dfs_ =
+        DfsEnablementConfig::FromEnvironment().enabled || dfs_config.UsesKvcs();
     if (!enable_dfs_) return;
 
-    const bool recovery_enabled =
-        config.enable_snapshot || config.enable_snapshot_restore ||
-        enable_oplog_;
+    const bool recovery_enabled = config.enable_snapshot ||
+                                  config.enable_snapshot_restore ||
+                                  enable_oplog_;
     if (!dfs_config.Validate()) {
         LOG(ERROR) << "Invalid distributed storage config: {"
                    << dfs_config.FormatStr() << "}";
@@ -3900,8 +3900,7 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
                 } else if (desc.is_dfs_replica()) {
                     const auto& dfs_desc = desc.get_dfs_descriptor();
                     if (!dfs_kvcs_backend_ || !dfs_desc.IsObjectStorage() ||
-                        dfs_desc.ObjectStorageBackend() !=
-                            *dfs_kvcs_backend_ ||
+                        dfs_desc.ObjectStorageBackend() != *dfs_kvcs_backend_ ||
                         dfs_desc.object_size != standby_meta.size) {
                         LOG(ERROR)
                             << "RestoreFromStandbySnapshot: invalid DFS "
@@ -3911,14 +3910,12 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
                             << dfs_kvcs_backend_.value_or("")
                             << ", descriptor_backend="
                             << dfs_desc.ObjectStorageBackend()
-                            << ", object_storage="
-                            << dfs_desc.IsObjectStorage()
+                            << ", object_storage=" << dfs_desc.IsObjectStorage()
                             << ", descriptor_size=" << dfs_desc.object_size
                             << ", expected_size=" << standby_meta.size;
                         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
                     }
-                    replicas.push_back(
-                        Replica(desc.id, dfs_desc, desc.status));
+                    replicas.push_back(Replica(desc.id, dfs_desc, desc.status));
                 } else {
                     LOG(ERROR)
                         << "RestoreFromStandbySnapshot: unsupported replica "
@@ -11226,8 +11223,7 @@ tl::expected<void, SerializationError> MasterService::ApplySnapshotState(
                         continue;
                     }
                     const auto& descriptor = replica.get_dfs_descriptor();
-                    if (!dfs_kvcs_backend_ ||
-                        !descriptor.IsObjectStorage() ||
+                    if (!dfs_kvcs_backend_ || !descriptor.IsObjectStorage() ||
                         descriptor.ObjectStorageBackend() !=
                             *dfs_kvcs_backend_ ||
                         descriptor.object_size != metadata.size) {
@@ -11240,8 +11236,7 @@ tl::expected<void, SerializationError> MasterService::ApplySnapshotState(
                             << descriptor.ObjectStorageBackend()
                             << ", object_storage="
                             << descriptor.IsObjectStorage()
-                            << ", descriptor_size="
-                            << descriptor.object_size
+                            << ", descriptor_size=" << descriptor.object_size
                             << ", expected_size=" << metadata.size;
                         return tl::make_unexpected(SerializationError(
                             ErrorCode::DESERIALIZE_FAIL,

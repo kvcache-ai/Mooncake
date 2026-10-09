@@ -1335,8 +1335,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         this->local_rpc_addr = buildHostNameWithPort(
             getHostNameWithoutPort(this->local_hostname), offload_rpc_port_);
     }
-    const auto distributed_config =
-        DistributedStorageConfig::FromEnvironment();
+    const auto distributed_config = DistributedStorageConfig::FromEnvironment();
     const bool enable_kvcs = distributed_config.UsesKvcs();
     if (enable_ssd_offload || enable_kvcs) {
         auto file_storage_config = FileStorageConfig::FromEnvironment();

@@ -77,8 +77,7 @@ TEST_F(MasterServiceTest,
     MasterService service(config);
     EXPECT_TRUE(MasterServiceTestPeer::EnableDfs(service));
     EXPECT_EQ(MasterServiceTestPeer::DfsAllocator(service), nullptr);
-    EXPECT_EQ(MasterServiceTestPeer::DfsKvcsBackend(service),
-              "kvcs-lowlevel");
+    EXPECT_EQ(MasterServiceTestPeer::DfsKvcsBackend(service), "kvcs-lowlevel");
 }
 
 TEST_F(MasterServiceTest,
@@ -104,11 +103,7 @@ TEST_F(MasterServiceTest,
     config.enable_ha = true;
     config.enable_oplog = true;
     config.ha_backend_type = "etcd";
-    EXPECT_THROW(
-        {
-            MasterService service(config);
-        },
-        std::invalid_argument);
+    EXPECT_THROW({ MasterService service(config); }, std::invalid_argument);
     std::filesystem::remove_all(dfs_root);
 }
 
@@ -121,11 +116,7 @@ TEST_F(MasterServiceTest, InvalidKvcsConfigFailsFastForSnapshotRecovery) {
     ScopedEnvVar query_timeout("MOONCAKE_KVCS_QUERY_TIMEOUT_MS", "0");
     MasterServiceConfig config;
     config.enable_snapshot_restore = true;
-    EXPECT_THROW(
-        {
-            MasterService service(config);
-        },
-        std::invalid_argument);
+    EXPECT_THROW({ MasterService service(config); }, std::invalid_argument);
 }
 
 TEST_F(MasterServiceTest, KvcsStandbyRestoreAcceptsObjectStorageDfsReplica) {
@@ -153,15 +144,13 @@ TEST_F(MasterServiceTest, KvcsStandbyRestoreAcceptsObjectStorageDfsReplica) {
     metadata.replicas.push_back(replica.get_descriptor());
 
     const std::string key = "restored-kvcs-dfs-object";
-    ASSERT_TRUE(
-        service
-            .RestoreFromStandbySnapshot(
-                {{std::string(TenantId::kDefaultValue), key, metadata}},
-                /*initial_oplog_sequence_id=*/0, {})
-            .has_value());
+    ASSERT_TRUE(service
+                    .RestoreFromStandbySnapshot(
+                        {{std::string(TenantId::kDefaultValue), key, metadata}},
+                        /*initial_oplog_sequence_id=*/0, {})
+                    .has_value());
 
-    auto response =
-        service.GetReplicaListForAdmin(key, TenantId::Default());
+    auto response = service.GetReplicaListForAdmin(key, TenantId::Default());
     ASSERT_TRUE(response);
     ASSERT_EQ(response->replicas.size(), 1u);
     ASSERT_TRUE(response->replicas[0].is_dfs_replica());
