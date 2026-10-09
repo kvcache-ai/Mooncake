@@ -858,6 +858,7 @@ int TransferEnginePy::batchTransferSync(
     auto batch_size = buffers.size();
     const int nic_hint_id = resolveNicHint(nic_hint);
     std::vector<TransferRequest> entries;
+    entries.reserve(batch_size);
     for (size_t i = 0; i < batch_size; ++i) {
         TransferRequest entry;
         if (opcode == TransferOpcode::WRITE) {
@@ -986,6 +987,7 @@ batch_id_t TransferEnginePy::batchTransferAsync(
     auto batch_size = buffers.size();
     const int nic_hint_id = resolveNicHint(nic_hint);
     std::vector<TransferRequest> entries;
+    entries.reserve(batch_size);
     batch_id_t batch_id = 0;
     for (size_t i = 0; i < batch_size; ++i) {
         TransferRequest entry;
@@ -1291,6 +1293,7 @@ void TransferEnginePy::batchTransferOnCuda(
     size_t batch_size = buffers.size();
     const int nic_hint_id = resolveNicHint(nic_hint);
     std::vector<TransferRequest> entries;
+    entries.reserve(batch_size);
     uint64_t total_bytes = 0;
     for (size_t i = 0; i < batch_size; ++i) {
         TransferRequest entry;
