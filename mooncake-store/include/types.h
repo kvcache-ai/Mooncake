@@ -239,6 +239,8 @@ constexpr const char* CONFIG_KEY_SSD_PREFETCH_DEDUP_TTL_SEC =
 // Max wait budget (milliseconds) on get when an SSD-only key has a prefetch
 // in flight. 0 (the default) disables the wait entirely.
 constexpr const char* CONFIG_KEY_SSD_GET_WAIT_MS = "ssd_get_wait_ms";
+constexpr const char* CONFIG_KEY_ENABLE_EMBEDDED_MASTER =
+    "enable_embedded_master";
 
 // Store client configuration defaults
 static constexpr size_t DEFAULT_GLOBAL_SEGMENT_SIZE = 1024 * 1024 * 16;  // 16MB

@@ -2416,7 +2416,8 @@ PYBIND11_MODULE(store, m) {
                const std::string &ssd_offload_path = "",
                const std::string &tenant_id = "default",
                bool enable_client_http_server = false,
-               int client_http_port = DEFAULT_CLIENT_HTTP_PORT) {
+               int client_http_port = DEFAULT_CLIENT_HTTP_PORT,
+               bool enable_embedded_master = false) {
                 auto real_client = self.init_real_client();
                 std::shared_ptr<mooncake::TransferEngine> transfer_engine =
                     nullptr;
@@ -2427,12 +2428,15 @@ PYBIND11_MODULE(store, m) {
                 int ret;
                 {
                     py::gil_scoped_release release;
-                    ret = real_client->setup_real(
+                    auto result = real_client->setup_internal(
                         local_hostname, metadata_server, global_segment_size,
                         local_buffer_size, protocol, rdma_devices,
-                        master_server_addr, transfer_engine, "",
-                        enable_ssd_offload, ssd_offload_path, tenant_id,
-                        enable_client_http_server, client_http_port);
+                        master_server_addr, transfer_engine, "", 50052,
+                        enable_ssd_offload, true, ssd_offload_path, tenant_id,
+                        enable_client_http_server, client_http_port,
+                        enable_embedded_master);
+                    ret = result.has_value() ? 0
+                                             : static_cast<int>(result.error());
                 }
                 return ret;
             },
@@ -2443,7 +2447,8 @@ PYBIND11_MODULE(store, m) {
             py::arg("enable_ssd_offload") = false,
             py::arg("ssd_offload_path") = "", py::arg("tenant_id") = "default",
             py::arg("enable_client_http_server") = false,
-            py::arg("client_http_port") = DEFAULT_CLIENT_HTTP_PORT)
+            py::arg("client_http_port") = DEFAULT_CLIENT_HTTP_PORT,
+            py::arg("enable_embedded_master") = false)
         .def(
             "setup",
             [](MooncakeStorePyWrapper &self, const py::dict &config_dict) {
@@ -2491,7 +2496,10 @@ PYBIND11_MODULE(store, m) {
             "  ssd_prefetch_dedup_ttl_sec: Prefetch per-key dedup/rate-limit "
             "TTL in seconds (default 30, 0 disables).\n"
             "  ssd_get_wait_ms: get-side prefetch wait budget in "
-            "milliseconds (default 0 = no waiting).")
+            "milliseconds (default 0 = no waiting).\n"
+            "  enable_embedded_master: Start an in-process master so no "
+            "external mooncake_master is required (default false). This is "
+            "test/eval plumbing, not a documented deployment mode.")
         .def(
             "setup_dummy",
             [](MooncakeStorePyWrapper &self, size_t mem_pool_size,
