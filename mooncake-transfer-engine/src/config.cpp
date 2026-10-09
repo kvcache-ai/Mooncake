@@ -546,6 +546,14 @@ void loadGlobalConfig(GlobalConfig& config) {
         config.enable_dest_device_affinity = true;
     }
 
+    const char* enable_keep_paused_rail_env =
+        std::getenv("MC_ENABLE_KEEP_PAUSED_RAIL");
+    if (enable_keep_paused_rail_env) {
+        parseBoolConfigEnv(enable_keep_paused_rail_env,
+                           "MC_ENABLE_KEEP_PAUSED_RAIL",
+                           config.enable_keep_paused_rail);
+    }
+
     const char* enable_hca_peer_affinity_env =
         std::getenv("MC_ENABLE_HCA_PEER_AFFINITY");
     if (enable_hca_peer_affinity_env) {
@@ -900,6 +908,8 @@ void dumpGlobalConfig() {
     }
     LOG(INFO) << "mlx5_qp_lag_port_balance = "
               << (config.mlx5_qp_lag_port_balance ? "true" : "false");
+    LOG(INFO) << "enable_keep_paused_rail = "
+              << (config.enable_keep_paused_rail ? "true" : "false");
     LOG(INFO) << "log_rdma_slice_affinity = "
               << (config.log_rdma_slice_affinity ? "true" : "false");
     LOG(INFO) << "track_rdma_posted_slices = "

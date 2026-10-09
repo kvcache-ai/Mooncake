@@ -398,8 +398,13 @@ int WorkerPool::submitPostSend(
             MakeNicPath(peer_segment_desc->nicPathServerName(),
                         peer_segment_desc->devices[device_id].name);
 
-        // If selected rail is paused, try alternative devices
+        // If selected rail is paused, try alternative devices unless the
+        // selected path must be kept (MC_ENABLE_KEEP_PAUSED_RAIL).
         if (!isRailAvailable(peer_nic_path)) {
+            if (globalConfig().enable_keep_paused_rail) {
+                slice->markFailed();
+                continue;
+            }
             bool found = false;
             for (size_t alt_dev_id = 0;
                  alt_dev_id < peer_segment_desc->devices.size(); ++alt_dev_id) {
@@ -721,6 +726,7 @@ void WorkerPool::performPostSend(int thread_id) {
                 context_.deleteEndpointByPtr(endpoint.get());
                 for (auto &slice : entry.second) {
                     if (!has_peer_alternative && local_context_inactive &&
+                        !globalConfig().enable_keep_paused_rail &&
                         tryHandoffToAnotherLocalWorker(slice)) {
                         processed_slice_count_++;
                     } else {
@@ -1011,7 +1017,11 @@ void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
             processed_slice_count_++;
         } else {
             if (handoff_to_local_worker) {
-                if (tryHandoffToAnotherLocalWorker(slice)) {
+                // Local-only handoff keeps the peer RNIC and switches only
+                // the local RNIC, which leaves the selected rail pair. With
+                // MC_ENABLE_KEEP_PAUSED_RAIL the slice fails instead.
+                if (!globalConfig().enable_keep_paused_rail &&
+                    tryHandoffToAnotherLocalWorker(slice)) {
                     processed_slice_count_++;
                     continue;
                 }
@@ -1047,6 +1057,17 @@ void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
                 MakeNicPath(peer_segment_desc->nicPathServerName(),
                             peer_segment_desc->devices[device_id].name);
             if (!isRailAvailable(peer_nic_path)) {
+                if (globalConfig().enable_keep_paused_rail) {
+                    LOG(ERROR) << "Worker: Cannot redispatch slice because "
+                                  "the selected peer rail is paused for "
+                                  "target "
+                               << slice->target_id
+                               << ", selected peer=" << peer_nic_path
+                               << ", retry_cnt=" << slice->rdma.retry_cnt;
+                    slice->markFailed();
+                    processed_slice_count_++;
+                    continue;
+                }
                 bool found = false;
                 for (size_t alt_dev_id = 0;
                      alt_dev_id < peer_segment_desc->devices.size();

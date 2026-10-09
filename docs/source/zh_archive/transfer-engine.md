@@ -416,6 +416,7 @@ int init(const std::string &metadata_conn_string,
 - `MC_REDIS_DB_INDEX` Redis 存储插件的数据库索引，必须为 0 到 255 之间的整数。仅在指定 Redis 作为 metadata server 时生效。如果未设置或无效，默认值为 0。
 - `MC_FRAGMENT_RATIO` 在将RdmaTransport::submitTransferTask中切割传输任务为传输块时，当切割完成后最后一块数据大小小于等于切割块大小的1/MC_FRAGMENT_RATIO，最后一块数据将合并进前一块的切割块进行传输以减少开销，默认值为4。
 - `MC_ENABLE_DEST_DEVICE_AFFINITY` 启用设备亲和性以优化 RDMA 性能。启用后，Transfer Engine 将优先选择和本地网卡同名的远端网卡进行通信，以减少 QP 数量并改善 Rail-optimized 拓扑中的网络性能。默认值为 false
+- `MC_ENABLE_KEEP_PAUSED_RAIL` 远端 rail 被暂停时保持已选路径，不把传输块转移到其他路径。默认情况下，所选远端网卡被暂停时会切换到其他可用的远端网卡；本地网卡故障时会交给另一块本地网卡，并保持远端网卡不变。在非全互联拓扑中，这两种切换都可能让不同 rail 的网卡配对，导致 retry exceeded（`IBV_WC_RETRY_EXC_ERR`）。启用后，传输块会在已选路径上直接失败。可与 `MC_ENABLE_DEST_DEVICE_AFFINITY` 配合使用，先选择同名远端网卡。默认值为 false
 - `MC_FORCE_HCA` 强制使用RDMA作为主要传输方式，如果没有探测到有效的RDMA网卡，返回失败
 - `MC_FORCE_MNNVL` 强制使用 Multi-Node NVLink 作为主要传输方式，无论是否安装了有效的 RDMA 网卡
 - `MC_INTRA_NVLINK` 指定使用Intra-Node NVLink 作为主要传输方式，同时注意该设置不能与MC_FORCE_MNNVL一起使用
