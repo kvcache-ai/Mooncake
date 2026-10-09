@@ -806,15 +806,18 @@ int WorkerPool::performPollCq(int thread_id, bool defer_local_redispatch) {
 
     int wr_retired = 0;
     const bool use_fifo = globalConfig().rdma_signal_interval > 1;
+    std::vector<Transport::Slice *> drained;
+    drained.reserve(kPollCount);
     for (int i = 0; i < nr_poll; ++i) {
         Transport::Slice *completed = (Transport::Slice *)wc[i].wr_id;
         if (!completed) continue;
         assert(postingThreadForPeer(completed->peerNicPath()) == thread_id);
         const bool success = wc[i].status == IBV_WC_SUCCESS;
-        std::vector<Transport::Slice *> drained;
+        drained.clear();
+        bool qp_already_errored = false;
         if (use_fifo && completed->rdma.endpoint) {
             const size_t n = completed->rdma.endpoint->collectPostedCompletions(
-                completed, drained);
+                completed, success, drained, &qp_already_errored);
             // Stale CQE for a WR already retired by an earlier CQE. Do not
             // complete the slice again and do not charge cq_outstanding:
             // that WR was subtracted when it left the FIFO.
@@ -830,11 +833,21 @@ int WorkerPool::performPollCq(int thread_id, bool defer_local_redispatch) {
             std::lock_guard<std::mutex> lock(posted_slices_mutex_);
             for (auto *slice : drained) posted_slices_.erase(slice);
         }
+        const bool cqe_is_flush = wc[i].status == IBV_WC_WR_FLUSH_ERR;
         for (size_t j = 0; j < drained.size(); ++j) {
             ibv_wc expanded = wc[i];
             expanded.wr_id = reinterpret_cast<uint64_t>(drained[j]);
-            if (drainedPrefixCompletedOnWire(success, j, drained.size()))
-                expanded.status = IBV_WC_SUCCESS;
+            switch (drainedSliceStatus(success, cqe_is_flush,
+                                       qp_already_errored, j, drained.size())) {
+                case DrainedSliceStatus::kSuccess:
+                    expanded.status = IBV_WC_SUCCESS;
+                    break;
+                case DrainedSliceStatus::kFlushErr:
+                    expanded.status = IBV_WC_WR_FLUSH_ERR;
+                    break;
+                case DrainedSliceStatus::kKeepCqe:
+                    break;
+            }
             wc_list.push_back(expanded);
         }
     }

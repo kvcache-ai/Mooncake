@@ -55,12 +55,27 @@ size_t collectPostedFifo(std::deque<Slice *> &q, Slice *completed,
     return n;
 }
 
-// RC completes in order. An error CQE for WR k means WRs 0..k-1 already
-// succeeded on the wire (they may have been unsignaled). WR k keeps the
-// CQE status; later WRs wait for their own flush CQEs.
-inline bool drainedPrefixCompletedOnWire(bool cqe_success, size_t index,
-                                         size_t drained_n) {
-    return cqe_success || index + 1 < drained_n;
+// How to stamp a drained slice from one CQE. The CQE's own WR (the last
+// drained entry) always keeps the hardware status. Prefix WRs:
+//   * SUCCESS CQE, or the first non-flush error on this QP: SUCCESS
+//     (RC completed them on the wire before the failing WR).
+//   * FLUSH_ERR, or any later error after the QP is already errored:
+//     WR_FLUSH_ERR (those WRs did not complete; do not claim SUCCESS).
+enum class DrainedSliceStatus {
+    kKeepCqe,
+    kSuccess,
+    kFlushErr,
+};
+
+inline DrainedSliceStatus drainedSliceStatus(bool cqe_success,
+                                             bool cqe_is_flush,
+                                             bool qp_already_errored,
+                                             size_t index, size_t drained_n) {
+    if (index + 1 >= drained_n) return DrainedSliceStatus::kKeepCqe;
+    if (cqe_success) return DrainedSliceStatus::kSuccess;
+    if (!cqe_is_flush && !qp_already_errored)
+        return DrainedSliceStatus::kSuccess;
+    return DrainedSliceStatus::kFlushErr;
 }
 
 }  // namespace mooncake

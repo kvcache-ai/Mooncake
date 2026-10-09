@@ -189,8 +189,12 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     // failed/flushed WRs still generate CQEs. Decrements wr_depth by the
     // number of retired slices. Returns 0 if `completed` is not in the FIFO
     // (already collected, or interval==1 which does not use the FIFO).
+    // `qp_already_errored` is this QP's error flag before the CQE. A
+    // non-success CQE that actually retires WRs then marks the QP errored.
     size_t collectPostedCompletions(Transport::Slice *completed,
-                                    std::vector<Transport::Slice *> &out);
+                                    bool cqe_success,
+                                    std::vector<Transport::Slice *> &out,
+                                    bool *qp_already_errored);
 
     // Get the number of QPs in this endpoint
     size_t getQPNumber() const;
@@ -291,8 +295,11 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     // One posting-order FIFO per QP so a signaled CQE can retire the
     // unsignaled WRs that preceded it. unsignaled_since_signal_ is the
     // number of consecutive unsignaled WRs already on that QP's SQ.
+    // qp_errored_ is set on the first non-success CQE so later flush
+    // prefixes are not stamped SUCCESS.
     std::vector<std::deque<Transport::Slice *>> posted_fifo_;
     std::vector<int> unsignaled_since_signal_;
+    std::vector<char> qp_errored_;
 
     std::atomic<bool> active_;
     ibv_cq *cq_;

@@ -149,6 +149,7 @@ int RdmaEndPoint::construct(ibv_cq *cq, size_t num_qp_list,
     }
     posted_fifo_.assign(num_qp_list, {});
     unsignaled_since_signal_.assign(num_qp_list, 0);
+    qp_errored_.assign(num_qp_list, 0);
     for (size_t i = 0; i < num_qp_list; ++i) {
         wr_depth_list_[i].store(0, std::memory_order_relaxed);
         ibv_qp_init_attr attr;
@@ -230,6 +231,7 @@ int RdmaEndPoint::deconstructLocked() {
     bool displayed = false;
     posted_fifo_.clear();
     unsignaled_since_signal_.clear();
+    qp_errored_.clear();
     if (wr_depth_list_) {
         for (size_t i = 0; i < qp_list_.size(); ++i) {
             int wr_depth = wr_depth_list_[i].load(std::memory_order_relaxed);
@@ -1281,13 +1283,18 @@ const std::string RdmaEndPoint::toString() const {
 }
 
 size_t RdmaEndPoint::collectPostedCompletions(
-    Transport::Slice *completed, std::vector<Transport::Slice *> &out) {
+    Transport::Slice *completed, bool cqe_success,
+    std::vector<Transport::Slice *> &out, bool *qp_already_errored) {
     RWSpinlock::WriteGuard guard(lock_);
+    if (qp_already_errored) *qp_already_errored = false;
     if (!completed || posted_fifo_.empty()) return 0;
     const int qp = completed->rdma.qp_index;
     if (qp < 0 || qp >= static_cast<int>(posted_fifo_.size())) return 0;
-    const size_t n = collectPostedFifo(posted_fifo_[static_cast<size_t>(qp)],
-                                       completed, out);
+    const size_t q = static_cast<size_t>(qp);
+    if (q < qp_errored_.size() && qp_already_errored)
+        *qp_already_errored = qp_errored_[q] != 0;
+    const size_t n = collectPostedFifo(posted_fifo_[q], completed, out);
+    if (n && !cqe_success && q < qp_errored_.size()) qp_errored_[q] = 1;
     if (n && wr_depth_list_) {
         wr_depth_list_[qp].fetch_sub(static_cast<int>(n),
                                      std::memory_order_acq_rel);
@@ -1344,8 +1351,9 @@ int RdmaEndPoint::submitPostSend(
         wr_count = std::min(wr_count, cq_remaining);
         if (wr_count <= 0) continue;
 
-        std::vector<char> sig(static_cast<size_t>(wr_count), 1);
+        std::vector<char> sig;
         if (use_fifo) {
+            sig.resize(static_cast<size_t>(wr_count), 1);
             int since = unsignaled_since_signal_[qp_index];
             for (int i = 0; i < wr_count; ++i) {
                 const bool last = (i + 1 == wr_count);
@@ -1370,7 +1378,8 @@ int RdmaEndPoint::submitPostSend(
                             : IBV_WR_RDMA_WRITE;
             wr.num_sge = 1;
             wr.sg_list = &sge;
-            wr.send_flags = sig[static_cast<size_t>(i)] ? IBV_SEND_SIGNALED : 0;
+            const bool signaled = !use_fifo || sig[static_cast<size_t>(i)];
+            wr.send_flags = signaled ? IBV_SEND_SIGNALED : 0;
             wr.next = (i + 1 == wr_count) ? nullptr : &wr_list[i + 1];
             wr.wr.rdma.remote_addr = slice->rdma.dest_addr;
             wr.wr.rdma.rkey = slice->rdma.dest_rkey;
@@ -1378,7 +1387,6 @@ int RdmaEndPoint::submitPostSend(
             slice->status = Transport::Slice::POSTED;
             slice->rdma.qp_depth = &wr_depth_list_[qp_index];
             slice->rdma.qp_index = static_cast<int>(qp_index);
-            slice->rdma.signaled = sig[static_cast<size_t>(i)];
         }
 
         ibv_send_wr *bad_wr = nullptr;
@@ -1411,6 +1419,12 @@ int RdmaEndPoint::submitPostSend(
                     since = sig[i] ? 0 : since + 1;
                 }
                 unsignaled_since_signal_[qp_index] = since;
+                if (first_failed > 0 && !sig[first_failed - 1]) {
+                    // Last successfully posted WR is unsignaled. Spec
+                    // providers only generate its CQE on flush, so put
+                    // the QP in ERR to drain the prefix.
+                    beginDestroyLocked();
+                }
             }
             total_posted += wr_count;
             cursor += wr_count;

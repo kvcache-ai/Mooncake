@@ -22,7 +22,8 @@
 #include "transport/rdma_transport/rdma_posted_fifo.h"
 
 using mooncake::collectPostedFifo;
-using mooncake::drainedPrefixCompletedOnWire;
+using mooncake::DrainedSliceStatus;
+using mooncake::drainedSliceStatus;
 using mooncake::shouldSignalRdmaWr;
 
 TEST(ShouldSignalRdmaWr, IntervalOneSignalsEveryWr) {
@@ -79,12 +80,36 @@ TEST(CollectPostedFifo, MissingSignaledLeavesQueueUntouched) {
     EXPECT_EQ(q.size(), 2u);
 }
 
-TEST(DrainedPrefixCompletedOnWire, ErrorPrefixIsSuccessTailKeepsCqe) {
-    EXPECT_TRUE(drainedPrefixCompletedOnWire(true, 0, 1));
-    EXPECT_TRUE(drainedPrefixCompletedOnWire(false, 0, 3));
-    EXPECT_TRUE(drainedPrefixCompletedOnWire(false, 1, 3));
-    EXPECT_FALSE(drainedPrefixCompletedOnWire(false, 2, 3));
-    EXPECT_FALSE(drainedPrefixCompletedOnWire(false, 0, 1));
+TEST(DrainedSliceStatus, SuccessCqePrefixIsSuccess) {
+    EXPECT_EQ(drainedSliceStatus(true, false, false, 0, 3),
+              DrainedSliceStatus::kSuccess);
+    EXPECT_EQ(drainedSliceStatus(true, false, false, 2, 3),
+              DrainedSliceStatus::kKeepCqe);
+    EXPECT_EQ(drainedSliceStatus(true, false, false, 0, 1),
+              DrainedSliceStatus::kKeepCqe);
+}
+
+TEST(DrainedSliceStatus, FirstNonFlushErrorPrefixIsSuccess) {
+    EXPECT_EQ(drainedSliceStatus(false, false, false, 0, 3),
+              DrainedSliceStatus::kSuccess);
+    EXPECT_EQ(drainedSliceStatus(false, false, false, 1, 3),
+              DrainedSliceStatus::kSuccess);
+    EXPECT_EQ(drainedSliceStatus(false, false, false, 2, 3),
+              DrainedSliceStatus::kKeepCqe);
+}
+
+TEST(DrainedSliceStatus, FlushCqePrefixIsFlushErr) {
+    EXPECT_EQ(drainedSliceStatus(false, true, false, 0, 3),
+              DrainedSliceStatus::kFlushErr);
+    EXPECT_EQ(drainedSliceStatus(false, true, false, 2, 3),
+              DrainedSliceStatus::kKeepCqe);
+}
+
+TEST(DrainedSliceStatus, AlreadyErroredPrefixIsFlushErr) {
+    EXPECT_EQ(drainedSliceStatus(false, false, true, 0, 3),
+              DrainedSliceStatus::kFlushErr);
+    EXPECT_EQ(drainedSliceStatus(false, true, true, 0, 2),
+              DrainedSliceStatus::kFlushErr);
 }
 
 class SignalIntervalEnvTest : public ::testing::Test {

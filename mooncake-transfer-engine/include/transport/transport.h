@@ -171,7 +171,6 @@ class Transport {
                 uint32_t max_retry_cnt;
                 RdmaEndPoint *endpoint;  // Endpoint used for this transfer
                 int qp_index;
-                bool signaled;
             } rdma;
             struct {
                 uint64_t dest_addr;
