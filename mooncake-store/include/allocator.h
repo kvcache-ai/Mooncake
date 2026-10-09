@@ -105,13 +105,17 @@ class AllocatedBuffer {
         return allocator_.lock();
     }
 
+    // Both bindings are set before the buffer is published and not changed
+    // after, except by the snapshot restore in the constructor, which runs
+    // before any reader. So the client record is read in place, as the segment
+    // lifetime is: an atomic load would take a global lock and bounce the
+    // record's reference count on every check.
     [[nodiscard]] bool isAvailable() const {
         if (!isAllocatorValid()) {
             return false;
         }
-        const auto record = std::atomic_load_explicit(
-            &client_liveness_, std::memory_order_acquire);
-        return !record || record->IsServing();
+        const ClientLivenessRecord* record = client_liveness_.get();
+        return record == nullptr || record->IsServing();
     }
 
     void bindClientLiveness(
@@ -135,6 +139,9 @@ class AllocatedBuffer {
     [[nodiscard]] Descriptor get_descriptor() const;
 
     [[nodiscard]] std::string getSegmentName() const noexcept;
+
+    // The endpoint a reader transfers from, as get_descriptor() reports it.
+    [[nodiscard]] std::string getTransportEndpoint() const;
 
     // Friend declaration for operator<<
     friend std::ostream& operator<<(std::ostream& os,

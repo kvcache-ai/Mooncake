@@ -346,39 +346,38 @@ class Replica {
 
     [[nodiscard]] Descriptor get_descriptor() const;
 
-    [[nodiscard]] bool getDescriptorIfAvailable(Descriptor& descriptor) const {
-        if (is_memory_replica()) {
-            const auto& data = std::get<MemoryReplicaData>(data_);
-            if (!data.buffer || !data.buffer->isAvailable()) {
-                return false;
-            }
-        } else if (is_nof_replica()) {
-            const auto& data = std::get<NoFReplicaData>(data_);
-            if (!data.buffer || !data.buffer->isAvailable()) {
-                return false;
-            }
-        } else if (is_local_disk_replica()) {
-            const auto& data = std::get<LocalDiskReplicaData>(data_);
-            const auto record = std::atomic_load_explicit(
-                &data.client_liveness, std::memory_order_acquire);
-            if (!record || !record->IsServing()) {
-                return false;
-            }
+    // The endpoint get_descriptor() would send a reader to, without building
+    // the descriptor; none for kinds whose descriptor names no endpoint.
+    [[nodiscard]] std::optional<std::string> transport_endpoint() const;
+
+    // True while the replica's storage can serve a read: a buffer still
+    // allocated on a live segment whose client is serving, or a local-disk
+    // owner that is still serving. Other kinds carry no such state. The client
+    // binding is set before the replica is published and not changed after,
+    // except by the snapshot restore in the constructor, which runs before any
+    // reader, so it is read in place rather than through an atomic load.
+    [[nodiscard]] bool is_available() const {
+        if (const auto* data = std::get_if<MemoryReplicaData>(&data_)) {
+            return data->buffer && data->buffer->isAvailable();
         }
-        descriptor = get_descriptor();
-        if (is_memory_replica()) {
-            return std::get<MemoryReplicaData>(data_).buffer->isAvailable();
+        if (const auto* data = std::get_if<NoFReplicaData>(&data_)) {
+            return data->buffer && data->buffer->isAvailable();
         }
-        if (is_nof_replica()) {
-            return std::get<NoFReplicaData>(data_).buffer->isAvailable();
-        }
-        if (is_local_disk_replica()) {
-            const auto& data = std::get<LocalDiskReplicaData>(data_);
-            const auto record = std::atomic_load_explicit(
-                &data.client_liveness, std::memory_order_acquire);
-            return record && record->IsServing();
+        if (const auto* data = std::get_if<LocalDiskReplicaData>(&data_)) {
+            const ClientLivenessRecord* record = data->client_liveness.get();
+            return record != nullptr && record->IsServing();
         }
         return true;
+    }
+
+    [[nodiscard]] bool getDescriptorIfAvailable(Descriptor& descriptor) const {
+        if (!is_available()) {
+            return false;
+        }
+        descriptor = get_descriptor();
+        // Checked again: the storage can go away while the descriptor is
+        // built, and a reader must not be handed one that already has.
+        return is_available();
     }
 
     [[nodiscard]] ReplicaID id() const { return id_; }
@@ -881,6 +880,21 @@ inline Replica::Descriptor Replica::get_descriptor() const {
     }
 
     return desc;
+}
+
+inline std::optional<std::string> Replica::transport_endpoint() const {
+    if (const auto* data = std::get_if<MemoryReplicaData>(&data_)) {
+        return data->buffer ? data->buffer->getTransportEndpoint()
+                            : std::string();
+    }
+    if (const auto* data = std::get_if<NoFReplicaData>(&data_)) {
+        return data->buffer ? data->buffer->getTransportEndpoint()
+                            : std::string();
+    }
+    if (const auto* data = std::get_if<LocalDiskReplicaData>(&data_)) {
+        return data->transport_endpoint;
+    }
+    return std::nullopt;
 }
 
 inline std::vector<std::optional<std::string>> Replica::get_segment_names()
