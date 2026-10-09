@@ -380,9 +380,9 @@ int WorkerPool::submitPostSend(
                                  buffer_id, device_id, 0, last_buffer_id,
                                  last_device_id)) {
                 slice->markFailed();
+                failed_target_ids[slice->target_id] = getCurrentTimeInNano();
                 context_.engine().meta()->dumpMetadataContent(
-                    peer_segment_desc->name, slice->rdma.dest_addr,
-                    slice->length);
+                    peer_segment_desc, slice->rdma.dest_addr, slice->length);
                 continue;
             }
         }

@@ -19,6 +19,7 @@
 #include <cassert>
 #include <set>
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <exception>
 
@@ -1482,7 +1483,25 @@ int TransferMetadata::syncSegmentCache(const std::string &segment_name) {
             updated_names.push_back(name);
             ++updated_count;
             LOG(WARNING) << "Segment cache descriptor changed, name=" << name
-                         << ", segment_id=" << segment_id;
+                         << ", segment_id=" << segment_id << ", old_version="
+                         << (old_desc ? old_desc->metadata_version : 0)
+                         << ", new_version=" << desc->metadata_version
+                         << ", buffers=" << desc->buffers.size();
+            // The old/new descriptor bodies are sizable (one line per
+            // registered buffer); under churn every sync cycle would print
+            // them per changed segment. Throttle process-wide like
+            // dumpMetadataContent(); trace mode always prints. The WARNING
+            // header above stays per-change so no event is lost.
+            static std::atomic<uint64_t> last_desc_dump_ns{0};
+            const uint64_t now_ns = getCurrentTimeInNano();
+            uint64_t prev = last_desc_dump_ns.load(std::memory_order_relaxed);
+            constexpr uint64_t kDescDumpThrottleNs = 500000000;  // 0.5 sec
+            const bool may_dump =
+                globalConfig().trace ||
+                (now_ns - prev > kDescDumpThrottleNs &&
+                 last_desc_dump_ns.compare_exchange_strong(
+                     prev, now_ns, std::memory_order_relaxed));
+            if (!may_dump) continue;
             if (old_desc) {
                 LOG(INFO) << "Old segment descriptor:";
                 old_desc->dump();
