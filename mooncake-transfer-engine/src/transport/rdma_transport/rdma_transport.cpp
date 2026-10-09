@@ -35,7 +35,6 @@
 #include "buffer_range_index.h"
 #include "common.h"
 #include "config.h"
-#include "environ.h"
 #include "memory_location.h"
 #include "topology.h"
 #include "transport/batch_registration.h"
@@ -433,7 +432,7 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
     size_t alignment = 1;
 #ifdef USE_CUDA
     if (dmabuf_exp.method == DmabufExport::Method::kDmabufReg &&
-        Environ::Get().GetRdmaDataDirect()) {
+        globalConfig().rdma_data_direct) {
         alignment = getpagesize();
     }
 #endif
@@ -793,8 +792,9 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
 }
 
 int RdmaTransport::allocateLocalSegmentID() {
-    auto desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
-    if (!desc) desc = std::make_shared<SegmentDesc>();
+    auto desc = std::make_shared<SegmentDesc>();
+    auto old_desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    if (old_desc) *desc = *old_desc;
     desc->name = local_server_name_;
     // Store RDMA server name for dual-NIC setups; when it differs from
     // local_server_name_ the peer will use it for NIC path construction.
@@ -852,7 +852,7 @@ int RdmaTransport::registerLocalMemoryBatch(
     const std::vector<RdmaTransport::BufferEntry> &buffer_list,
     const std::string &location) {
 #if defined(USE_CUDA) || defined(USE_SUPA)
-    if (!Environ::Get().GetWithNvidiaPeermem()) {
+    if (!globalConfig().with_nvidia_peermem) {
         for (auto &buffer : buffer_list) {
             int ret = registerLocalMemory(buffer.addr, buffer.length, location,
                                           true, false);
@@ -890,7 +890,7 @@ int RdmaTransport::registerLocalMemoryBatch(
 
         if (first_error) return first_error;
 #if defined(USE_CUDA) || defined(USE_SUPA)
-    }  // Environ::Get().GetWithNvidiaPeermem()
+    }  // globalConfig().with_nvidia_peermem
 #endif
 
     return metadata_->updateLocalSegmentDesc();
@@ -1194,7 +1194,7 @@ Status RdmaTransport::getTransferStatus(BatchID batch_id,
                 status[task_id].s = TransferStatusEnum::FAILED;
             else
                 status[task_id].s = TransferStatusEnum::COMPLETED;
-            task.is_finished = true;
+            __atomic_store_n(&task.is_finished, true, __ATOMIC_RELAXED);
         } else {
             status[task_id].s = TransferStatusEnum::WAITING;
         }
@@ -1224,7 +1224,7 @@ Status RdmaTransport::getTransferStatus(BatchID batch_id, size_t task_id,
             status.s = TransferStatusEnum::FAILED;
         else
             status.s = TransferStatusEnum::COMPLETED;
-        task.is_finished = true;
+        __atomic_store_n(&task.is_finished, true, __ATOMIC_RELAXED);
     } else {
         status.s = TransferStatusEnum::WAITING;
     }
