@@ -8,6 +8,7 @@ from benchmarks.sglang_attention_kv.cases import (
     build_cases,
     build_shapes,
     ragged_lengths,
+    resolve_extend_branch,
     short_case,
 )
 from benchmarks.sglang_attention_kv.model_config import load_model_kv_config
@@ -41,7 +42,13 @@ def model_config(tmp_path, **overrides):
 
 
 def case(
-    mode="extend", prefix_lens=(512,), new_lens=(128,), page_size=64, layout="random"
+    mode="extend",
+    prefix_lens=(512,),
+    new_lens=(128,),
+    page_size=64,
+    layout="random",
+    num_qo_heads=8,
+    num_kv_heads=2,
 ):
     return KernelCase(
         mode=mode,
@@ -50,8 +57,8 @@ def case(
         page_size=page_size,
         layout=layout,
         num_layers=36,
-        num_qo_heads=8,
-        num_kv_heads=2,
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
         head_dim=128,
         dtype="bfloat16",
     )
@@ -232,3 +239,49 @@ def test_build_cases_rejects_a_dtype_the_kernels_cannot_run(tmp_path):
     )
     with pytest.raises(ValueError, match="paged attention kernels"):
         build_cases(shapes, config, tp_size=4)
+
+
+def test_a_case_refuses_a_head_count_that_is_not_a_whole_group():
+    """The reference attention reads each KV head num_qo_heads // num_kv_heads
+    times, so a ratio that is not whole would truncate query heads silently."""
+    with pytest.raises(ValueError, match="not a whole number of groups"):
+        case(num_qo_heads=8, num_kv_heads=3)
+    assert case(num_qo_heads=8, num_kv_heads=8).group_ratio() == 1
+    assert case(num_qo_heads=32, num_kv_heads=8).group_ratio() == 4
+
+
+def test_a_model_whose_ranks_do_not_keep_whole_groups_is_refused(tmp_path):
+    """The same check at the model level: 12 query heads over 8 KV heads at TP=1
+    is a group ratio of one and a half."""
+    config = model_config(tmp_path, num_attention_heads=12, num_key_value_heads=8)
+    shapes = build_shapes(
+        modes=("decode",),
+        input_lens=(128,),
+        chunk_lens=(1,),
+        batch_sizes=(1,),
+        page_sizes=(64,),
+        layouts=("contiguous",),
+    )
+    with pytest.raises(ValueError, match="not a whole group ratio"):
+        build_cases(shapes, config, tp_size=1)
+
+
+def test_the_extend_branch_has_one_source(monkeypatch):
+    """SGLANG_FLASHINFER_USE_PAGED is what a server sets; --extend-branch is what a
+    run passes. With the variable set it decides, and a conflict is refused rather
+    than silently overridden."""
+    monkeypatch.delenv("SGLANG_FLASHINFER_USE_PAGED", raising=False)
+    assert resolve_extend_branch(None) == "ragged_prefix_merge"
+    assert resolve_extend_branch("paged_extend") == "paged_extend"
+    monkeypatch.setenv("SGLANG_FLASHINFER_USE_PAGED", "1")
+    assert resolve_extend_branch(None) == "paged_extend"
+    assert resolve_extend_branch("paged_extend") == "paged_extend"
+    with pytest.raises(ValueError, match="disagrees with SGLANG_FLASHINFER_USE_PAGED"):
+        resolve_extend_branch("ragged_prefix_merge")
+    monkeypatch.setenv("SGLANG_FLASHINFER_USE_PAGED", "0")
+    assert resolve_extend_branch(None) == "ragged_prefix_merge"
+    with pytest.raises(ValueError, match="disagrees with SGLANG_FLASHINFER_USE_PAGED"):
+        resolve_extend_branch("paged_extend")
+    with pytest.raises(ValueError, match="unknown extend branch"):
+        monkeypatch.delenv("SGLANG_FLASHINFER_USE_PAGED", raising=False)
+        resolve_extend_branch("paged_whatever")

@@ -1,16 +1,17 @@
 import csv
 import json
 
-# Columns of kernel_summary.csv, in the order they are written. total_step is
-# indices + attention_plan + layer_loop, the three windows of the step itself.
-# kv_write_component and attention_component are measured in passes of their own,
-# beside the gather probe, and are never added to the step.
+# Columns of kernel_summary.csv, in the order they are written. The step itself is
+# three windows, their sum phase_sum, and one window over all of them,
+# step_window. kv_write_component and attention_component are measured in passes of
+# their own, beside the gather probe, and are never added to the step.
 STEP_PHASES = ("indices", "attention_plan", "layer_loop")
 REPORTED_PHASES = STEP_PHASES + (
     "kv_write_component",
     "attention_component",
     "kv_gather",
-    "total_step",
+    "step_window",
+    "phase_sum",
 )
 
 CSV_COLUMNS = [
@@ -65,17 +66,17 @@ CSV_COLUMNS.extend(
         "kv_write_component_us_per_layer",
         "indices_us_per_new_token",
         "attention_us_per_context_token",
-        "kv_gather_effective_gbps",
-        "attention_effective_gbps",
+        "kv_gather_unique_payload_gbps",
+        "attention_unique_payload_gbps",
         "attention_tflops",
-        "attention_arithmetic_intensity",
-        "indices_share_of_step",
-        "attention_plan_share_of_step",
-        "layer_loop_share_of_step",
-        "attention_component_share_of_step",
-        "kv_write_component_share_of_step",
-        "components_share_of_step",
-        "total_tokens_per_s",
+        "attention_flops_per_unique_payload_byte",
+        "indices_ratio_of_phase_sum",
+        "attention_plan_ratio_of_phase_sum",
+        "layer_loop_ratio_of_phase_sum",
+        "attention_component_ratio_of_phase_sum",
+        "kv_write_component_ratio_of_phase_sum",
+        "components_ratio_of_phase_sum",
+        "new_tokens_per_s",
     ]
 )
 

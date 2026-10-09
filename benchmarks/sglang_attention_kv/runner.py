@@ -8,7 +8,6 @@ from . import kernel_summary as summary_module
 from . import manifest as manifest_module
 from .cases import (
     BRANCH_CHOICES,
-    BRANCH_RAGGED_PREFIX_MERGE,
     DEFAULT_TIMED,
     DEFAULT_WARMUP,
     LAYOUTS,
@@ -16,6 +15,7 @@ from .cases import (
     MINIMUM_WARMUP,
     MODES,
     build_plan_from_args,
+    resolve_extend_branch,
     use_paged_default,
 )
 from .model_config import load_model_kv_config
@@ -27,10 +27,13 @@ def build_parser():
     parser = argparse.ArgumentParser(
         prog="python -m benchmarks.sglang_attention_kv",
         description=(
-            "Measure what one attention step spends on the paged KV cache: the "
-            "index mapping, the KV write, the plan and the attention read, over "
-            "the history lengths, query lengths, batch shapes, page sizes and page "
-            "layouts a deployment runs with."
+            "Measure what one attention step spends on the paged KV cache. The step "
+            "is three timed windows — the index mapping, the backend plan and the "
+            "per-layer loop of attention and KV write — with the step measured as a "
+            "whole beside them, and the KV write and the attention read priced "
+            "separately in passes of their own. Runs over the history lengths, query "
+            "lengths, batch shapes, page sizes and page layouts a deployment runs "
+            "with."
         ),
     )
     parser.add_argument(
@@ -277,7 +280,7 @@ def main(argv=None):
     if args.kernel_timed < MINIMUM_TIMED:
         errors.append(f"timed iterations below {MINIMUM_TIMED}")
 
-    extend_branch = args.extend_branch or BRANCH_RAGGED_PREFIX_MERGE
+    extend_branch = resolve_extend_branch(args.extend_branch)
     print(
         f"[setup] extend steps replay {extend_branch}; "
         f"SGLANG_FLASHINFER_USE_PAGED={use_paged_default()} in this process"

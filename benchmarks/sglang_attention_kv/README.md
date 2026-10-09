@@ -8,16 +8,22 @@ the ones a server uses, so the numbers describe SGLang's own access path and not
 The numbers from one validation run are in [`RESULTS.md`](RESULTS.md); this document is the method, the
 matrix, the command line and the boundaries.
 
-## 1. The stages
+## 1. The windows
 
 The step itself is three windows, in the order a forward pass runs them:
 
-| Stage | What it covers | SGLang call it replays |
+| Window | What it covers | SGLang call it replays |
 |---|---|---|
 | `indices` | the query offsets and the CSR stream of KV slots the paged side reads | `create_flashinfer_kv_indices_triton`, the kernel `KVIndexTranslator.fill_packed_read_stream` launches (`sglang/kernels/ops/kvcache/kv_indices.py`) |
 | `attention_plan` | the backend compiling the CSR stream into a kernel schedule | the wrappers' `plan`, as `FlashInferAttnBackend` calls it in `init_forward_metadata` |
 | `layer_loop` | the per-layer loop: one layer's attention and one layer's KV write, layer by layer, in the order the branch runs them | the wrappers' `forward` / `forward_return_lse` / `merge_state` and `MHATokenToKVPool.set_kv_buffer` (`sglang/srt/layers/attention/flashinfer_backend.py`) |
-| `total_step` | `indices` + `attention_plan` + `layer_loop` | — |
+| `phase_sum` | the three windows added up | — |
+| `step_window` | one window over the whole step, from the first index call to the last layer | — |
+
+`step_window` is the step as one span and `phase_sum` is the sum of its parts. A reader comparing them
+sees what the three windows do not cover: the device is idle between them while the host issues the
+next window's calls, and that gap is inside `step_window`. The derived ratios divide `phase_sum` and are
+named `*_ratio_of_phase_sum` for it; the throughput figure divides `step_window`.
 
 The loop is timed as one window on purpose. Putting an event pair around each layer's write and read
 would measure the events as much as the work — 144 events per iteration cost about 0.6 ms of the 5 ms
@@ -26,17 +32,18 @@ and they are components rather than the schedule the step runs:
 
 | Component | What it covers |
 |---|---|
-| `kv_write_component` | one `set_kv_buffer` call per layer for the whole step, in one window, without the attention they interleave with |
-| `attention_component` | the branch's attention path for every layer of the step, in one window, without the writes. What that path is depends on the branch: one ragged call, a ragged call plus a paged call plus `merge_state`, one paged prefill call, or one paged decode call |
+| `kv_write_component` | one `set_kv_buffer` call per layer, over every layer of the step, in one window, without the attention they interleave with |
+| `attention_component` | the branch's attention path over every layer of the step, in one window, without the writes. What that path is depends on the branch: one ragged call, a ragged call plus a paged call plus `merge_state`, one paged prefill call, or one paged decode call. The merge branch's path is three calls and a merge per layer, so one component window holds several calls per layer rather than one |
 | `kv_gather` | a read-only probe: the rows the branch's paged side reads (or the slots the step wrote, when it reads no paged KV), both K and V, moved with `index_select` and no arithmetic |
 
-The 36 calls the two write and attention components hold are the layer count of the model in
-[`RESULTS.md`](RESULTS.md); a step of another model holds that model's layers.
+The layer count of the model in [`RESULTS.md`](RESULTS.md) is 36, so those two components hold 36 write
+calls and 36 per-layer attention paths there; a step of another model holds that model's layers.
 
 None of the three is added to the step. Each runs after the timed loop, in windows of its own, so no
 step iteration is ever timed with a probe inside it, and the wrappers are planned against the probe's
-own indices before those passes rather than inside them. Their share of the step is named as a component
-share, because the step interleaves the two per layer.
+own indices before those passes rather than inside them. Their ratio to `phase_sum` is recorded as a
+ratio rather than as a share of the step, because the step interleaves the two per layer and a
+component window can read above the window it belongs to.
 
 The structures the step is built on are SGLang's throughout: `ReqToTokenPool` for the request to token
 table, `PagedTokenToKVPoolAllocator` for the slots (`alloc`, `alloc_extend` or `alloc_decode`,
@@ -59,8 +66,13 @@ mode says which of those the step is, and each mode replays one branch of `Flash
 default in this SGLang version: `use_ragged` is true and the extend step takes the ragged branch, where
 the new tokens are attended to through the ragged wrapper, the cached history through the paged one,
 and the two are combined with `merge_state`. `paged_extend` is the single call that variable selects
-instead when it is set. Every record states the branch, the order it ran in, and the value of that
-variable, so a row says which server configuration it describes.
+instead when it is set.
+
+That variable is the one place that decides the extend branch. With it set, a run takes the branch it
+selects; with it unset, `--extend-branch` decides and defaults to `ragged_prefix_merge`. Passing the
+other branch while the variable is set fails the run rather than overriding it, and every record states
+the branch, the order it ran in, and the value of the variable, so a row says which server
+configuration it describes.
 
 The branch also decides the order of the KV write: the two ragged branches compute the attention first
 and save the cache afterwards, the paged branches write first. This benchmark times them in that order.
@@ -127,13 +139,16 @@ below is recorded per step:
 | `gather_bytes` | the bytes the read-only probe moves: both K and V of the `gather_rows` rows it reads, for every layer |
 | `attention_pairs` | `sum over sequences of new * prefix + new * (new + 1) / 2`: a causal mask aligned to the end of the context leaves each query the history and everything computed before it |
 | `attention_flops` | `layers * 4 * attention_pairs * qo_heads * head_dim`: QK^T and PV are one multiply-add each, so a query-key pair costs 4 operations, and every layer does that work |
-| `attention_arithmetic_intensity` | `attention_flops / kv_bytes_attention_read` |
+| `attention_flops_per_unique_payload_byte` | `attention_flops / kv_bytes_attention_read` |
 
-Bandwidth divides logical bytes by the window those bytes belong to: the KV the branch's attention
-reads (`attention_effective_gbps`) and the rows the probe moves (`kv_gather_effective_gbps`). What the
-memory system actually transfers is not observable without a profiler, so no figure here claims it: a
-paged read touches whole pages and a write may coalesce, and the page capacity is reported as the
-allocation figure it is rather than as traffic.
+The two rates a row reports are unique-payload normalisations, and their column names say so:
+`attention_unique_payload_gbps` divides `kv_bytes_attention_read`, and `kv_gather_unique_payload_gbps`
+divides `gather_bytes`, each by the window that path ran in. The payload is counted once per layer for
+each token the path reads, however many queries read that token: the repeated operand a query costs
+appears in the FLOP count, not in those bytes, so the rate is not a kernel bandwidth and not the traffic
+the memory system moved. What the memory system actually transfers is not observable without a
+profiler, and no figure here claims it: a paged read touches whole pages and a write may coalesce, and
+the page capacity is reported as the allocation figure it is rather than as traffic.
 
 The write side carries no rate of its own. Its window reads two regimes for the same calls, one around
 0.1 ms and one around 1.16 ms in the run in [`RESULTS.md`](RESULTS.md), so what the window covers is not
@@ -185,7 +200,7 @@ Main arguments:
 | `--modes` | which steps to measure: `prefill`, `extend`, `decode` |
 | `--input-lens` | history lengths: a prefill step computes this many tokens, an extend or decode step caches this many |
 | `--chunk-lens` | query lengths of an extend step, one step per entry, over the history lengths of `--input-lens` |
-| `--extend-branch` | which extend branch to replay: `ragged_prefix_merge`, the default a server runs, or `paged_extend` |
+| `--extend-branch` | which extend branch to replay: `ragged_prefix_merge`, the default a server runs, or `paged_extend`. It decides the branch only when `SGLANG_FLASHINFER_USE_PAGED` is unset; with the variable set that variable decides, and passing a different branch fails the run |
 | `--batch-sizes` | sequences per step; a batch above one is measured with equal lengths and with ragged lengths |
 | `--page-sizes` | tokens per page of the pool |
 | `--layouts` | `contiguous`, or `random` for a pool that has churned |
@@ -223,12 +238,13 @@ per step, the page sizes 1 and 64, and both layouts.
   kernel_summary.csv   summary table, one row per measured step
 ```
 
-Every window carries min, p50, p95 and p99 over the timed iterations. The branch the step ran, the
-order it ran in and the configuration it was built with are fields of the record beside them — the
-`configuration` object of `kernel.jsonl`, and the `branch`, `reads_before_write`, `attention_backend`,
-`wrapper_page_size`, `decode_use_tensor_cores` and `kv_write_stream` columns of the CSV — so a reader
-can see which step a number came from. The CSV also carries the derived figures of section 4 plus the
-result of every correctness check.
+Every window carries min, p50, p95 and p99 over the timed iterations: the three step windows, their sum
+`phase_sum`, the step as one span `step_window`, and the components beside them. The branch the step
+ran, the order it ran in and the configuration it was built with are fields of the record beside
+them — the `configuration` object of `kernel.jsonl`, and the `branch`, `reads_before_write`,
+`attention_backend`, `wrapper_page_size`, `decode_use_tensor_cores` and `kv_write_stream` columns of the
+CSV — so a reader can see which step a number came from. The CSV also carries the derived figures of
+section 4 plus the result of every correctness check.
 
 ## 9. What one run measured
 
@@ -258,12 +274,12 @@ manifest of a run states every one of them.
   through them.
 
 The replay fixes four settings, each stated in the record's `configuration` and in the CSV, so a row
-says which configuration it describes. They are the benchmark's own choices and not the only paths
-SGLang runs:
+says which configuration it describes. They are the benchmark's own lane, checked against the SGLang
+version in [`RESULTS.md`](RESULTS.md); they are not what SGLang picks for every model:
 
-| Setting | Value here | What a server does |
+| Setting | Value here | What SGLang does |
 |---|---|---|
-| `attention_backend` | `flashinfer-fa2` | whichever backend the server selects; this benchmark calls the FlashInfer wrappers, so it measures that backend |
-| `wrapper_page_size` | `1`, and every last-page length is 1 | the same: SGLang hands FlashInfer a token-level CSR stream, and the pool's page size is a separate figure that reaches the kernels only through the addresses in it |
-| `decode_use_tensor_cores` | `true` | `FlashInferAttnBackend` builds its decode wrapper with the tensor-core path; a deployment can turn it off |
-| `kv_write_stream` | `step` | a server leaves `MHATokenToKVPool`'s alternate stream on, which overlaps the write with the attention; writing on the step's own stream is what makes a per-phase breakdown describe the phase rather than whichever window syncs next |
+| `attention_backend` | `flashinfer-fa2` | a server selects its backend; this benchmark calls the FlashInfer wrappers, so it measures that backend and no other |
+| `wrapper_page_size` | `1`, and every last-page length is 1 | the same on every model: SGLang hands FlashInfer a token-level CSR stream, and the pool's page size is a separate figure that reaches the kernels only through the addresses in it |
+| `decode_use_tensor_cores` | `true` | `FlashInferAttnBackend` decides this per model through `should_use_tensor_core`: a bf16 or fp16 cache at a group size of 4 or more query heads per KV head takes the tensor-core path, which this model reaches at the sharding in `RESULTS.md`. A model below that threshold builds the wrapper without it, and `SGLANG_FLASHINFER_USE_TENSOR_CORE` overrides the choice either way |
+| `kv_write_stream` | `step`: the pool is built with `enable_alt_stream=False` | in SGLang 0.5.20 that stream is used only inside CUDA graph capture: `_set_kv_buffer_impl` branches on `get_is_capture_mode()` and otherwise writes through the fused `store_cache` kernel on the current stream. This replay captures no graph, so the flag records how the pool was built rather than a different write path |

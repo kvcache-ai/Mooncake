@@ -37,24 +37,29 @@ quote p50.
 ## The columns
 
 All values are milliseconds, p50 of 100 timed iterations after 10 warmups. `indices`, `plan` and `loop`
-are the three windows a step is timed in, in the order a forward pass runs them; `step` is their sum.
-`write` and `attn` are the two component passes of section 1 of the README: the step's `set_kv_buffer`
-calls in one window, and the branch's attention path for every layer in one window, each run after the
-timed loop and never added to the step. `gather` is the read-only probe over the rows the branch's paged
-side reads.
+are the three windows a step is timed in, in the order a forward pass runs them; `sum` is their sum,
+`phase_sum`; `window` is the whole step as one span, `step_window`. `write` and `attn` are the two
+component passes of section 1 of the README: the step's `set_kv_buffer` calls in one window, and the
+branch's attention path over every layer in one window, each run after the timed loop and never added
+to the step. `gather` is the read-only probe over the rows the branch's paged side reads.
 
-`GB/s` divides the bytes the window's own path moves by that window: `read` for the attention window,
-the probe's own bytes for `gather`. `FLOP/byte` divides the arithmetic of the step's attention by the
-same read bytes.
+The step is 0.040 to 0.070 ms longer than the sum of its three windows in every one of the 600 matrix
+steps, and 0.053 to 0.060 ms longer in the six long-context steps: that is what the three windows do
+not cover, since the device is idle between them while the host issues the next window's calls.
 
-The ledger behind those two columns is split by the path that reads the KV, which differs per branch.
-For the 8192-token steps at page size 64, one rank:
+`gather GB/s` and `read GB/s` are unique-payload normalisations: each divides the bytes its own path
+reads, counted once per layer for every token the path covers, by the window that path ran in.
+`TFLOP/s` and `FLOP/byte` divide the step's attention arithmetic by the attention window and by those
+read bytes.
 
-| step | branch | paged read | ragged read | attention read | page capacity |
-|---|---|---|---|---|---|
-| prefill 8192 | `ragged_no_prefix` | 0 B | 302.0 MB | 302.0 MB | 302.0 MB |
-| 512 queries behind 8192 | `ragged_prefix_merge` | 302.0 MB | 18.9 MB | 320.9 MB | 320.9 MB |
-| decode at 8193 | `paged_decode` | 302.0 MB | 0 B | 302.0 MB | 304.3 MB |
+The ledger behind those last two columns is split by the path that reads the KV, which differs per
+branch. For the 8192-token steps at page size 64, one rank:
+
+| step | branch | paged read | ragged read | attention read | page capacity | probe rows |
+|---|---|---|---|---|---|---|
+| prefill 8192 | `ragged_no_prefix` | 0 B | 302.0 MB | 302.0 MB | 302.0 MB | 8192 |
+| 512 queries behind 8192 | `ragged_prefix_merge` | 302.0 MB | 18.9 MB | 320.9 MB | 320.9 MB | 8192 |
+| decode at 8193 | `paged_decode` | 302.0 MB | 0 B | 302.0 MB | 304.3 MB | 8193 |
 
 A merge step reads its 8192-token history through the paged wrapper and its own 512 tokens through the
 ragged one. A prefill step reads no paged KV at all, because its queries attend to the K/V it computes,
@@ -63,120 +68,113 @@ page capacity of 304.3 MB covers the 302.0 MB of valid tokens plus one page of p
 
 ## The step, page size 64, contiguous pool, one sequence
 
-| step | indices | plan | loop | step | write | attn | gather | gather GB/s | read GB/s | TFLOP/s | FLOP/byte |
-|---|---|---|---|---|---|---|---|---|---|---|---|
-| prefill 128 | 0.129 | 0.151 | 2.428 | 2.708 | 1.139 | 0.984 | 1.146 | 4.1 | 4.8 | 1.2 | 258 |
-| prefill 512 | 0.131 | 0.159 | 2.689 | 2.983 | 1.150 | 1.420 | 1.143 | 16.5 | 13.3 | 13.6 | 1026 |
-| prefill 2048 | 0.269 | 0.278 | 8.615 | 9.166 | 1.141 | 8.599 | 1.136 | 66.5 | 8.8 | 36.0 | 4098 |
-| prefill 8192 | 0.368 | 0.364 | 71.893 | 72.631 | 1.140 | 72.204 | 1.138 | 265.4 | 4.2 | 68.5 | 16386 |
-| decode at 129 | 0.344 | 0.215 | 3.290 | 3.853 | 1.155 | 1.635 | 1.160 | 4.1 | 2.9 | 0.0 | 4 |
-| decode at 513 | 0.341 | 0.212 | 3.298 | 3.857 | 1.148 | 1.632 | 1.164 | 16.2 | 11.6 | 0.0 | 4 |
-| decode at 2049 | 0.339 | 0.215 | 3.288 | 3.843 | 1.148 | 1.616 | 1.142 | 66.1 | 46.7 | 0.2 | 4 |
-| decode at 8193 | 0.344 | 0.220 | 3.296 | 3.867 | 1.152 | 1.622 | 1.160 | 260.4 | 186.2 | 0.7 | 4 |
-
-`read GB/s` on the prefill rows divides the bytes of the step's own K/V by a window that does the
-step's whole attention over them: the four prefill rows move 4.7, 18.9, 75.5 and 302.0 MB in windows of
-0.984, 1.420, 8.599 and 72.204 ms. The decode rows read the same 302.0 MB at 8193 tokens in 1.622 ms.
+| step | indices | plan | loop | sum | window | write | attn | gather | gather GB/s | read GB/s | TFLOP/s | FLOP/byte |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| prefill 128 | 0.126 | 0.150 | 2.415 | 2.682 | 2.735 | 1.137 | 0.962 | 1.129 | 4.2 | 4.9 | 1.3 | 258 |
+| prefill 512 | 0.126 | 0.156 | 2.623 | 2.907 | 2.958 | 1.134 | 1.419 | 1.126 | 16.8 | 13.3 | 13.7 | 1026 |
+| prefill 2048 | 0.255 | 0.267 | 8.623 | 9.146 | 9.189 | 1.159 | 8.583 | 1.115 | 67.7 | 8.8 | 36.0 | 4098 |
+| prefill 8192 | 0.345 | 0.352 | 71.900 | 72.604 | 72.651 | 1.140 | 72.200 | 1.131 | 266.9 | 4.2 | 68.5 | 16386 |
+| decode at 129 | 0.339 | 0.215 | 3.315 | 3.879 | 3.933 | 1.150 | 1.652 | 1.156 | 4.1 | 2.9 | 0.0 | 4 |
+| decode at 513 | 0.345 | 0.218 | 3.313 | 3.883 | 3.940 | 1.162 | 1.644 | 1.163 | 16.3 | 11.5 | 0.0 | 4 |
+| decode at 2049 | 0.329 | 0.209 | 3.225 | 3.765 | 3.820 | 1.141 | 1.590 | 1.127 | 67.0 | 47.5 | 0.2 | 4 |
+| decode at 8193 | 0.335 | 0.214 | 3.248 | 3.803 | 3.860 | 1.144 | 1.592 | 1.147 | 263.4 | 189.7 | 0.8 | 4 |
 
 ## The long-context run, page size 64, random layout, one sequence
 
-| step | indices | plan | loop | step | write | attn | gather | gather GB/s | read GB/s | TFLOP/s | FLOP/byte |
-|---|---|---|---|---|---|---|---|---|---|---|---|
-| prefill 16384 | 0.472 | 0.443 | 247.155 | 248.126 | 1.157 | 245.893 | 1.161 | 520.2 | 2.5 | 80.5 | 32770 |
-| prefill 32768 | 0.479 | 0.480 | 938.666 | 939.635 | 1.146 | 938.202 | 1.771 | 681.9 | 1.3 | 84.4 | 65538 |
-| 512 queries behind 16384 | 0.781 | 0.625 | 21.030 | 22.450 | 1.176 | 21.178 | 1.153 | 523.9 | 29.4 | 59.3 | 2017 |
-| 512 queries behind 32768 | 0.795 | 0.630 | 39.387 | 40.823 | 1.183 | 39.539 | 1.787 | 676.0 | 31.0 | 63.1 | 2032 |
-| decode at 16385 | 0.348 | 0.220 | 3.398 | 3.965 | 1.178 | 1.654 | 1.158 | 521.6 | 365.3 | 1.5 | 4 |
-| decode at 32769 | 0.350 | 0.222 | 3.401 | 3.970 | 1.191 | 1.647 | 1.777 | 679.9 | 733.4 | 2.9 | 4 |
+| step | indices | plan | loop | sum | window | write | attn | gather | gather GB/s | read GB/s | TFLOP/s | FLOP/byte |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| prefill 16384 | 0.437 | 0.427 | 247.164 | 248.062 | 248.115 | 1.166 | 245.800 | 1.184 | 510.0 | 2.5 | 80.5 | 32770 |
+| prefill 32768 | 0.449 | 0.482 | 938.644 | 939.592 | 939.646 | 1.180 | 938.895 | 1.773 | 681.5 | 1.3 | 84.3 | 65538 |
+| 512 queries behind 16384 | 0.748 | 0.618 | 21.047 | 22.422 | 22.474 | 1.174 | 21.174 | 1.160 | 520.8 | 29.4 | 59.3 | 2017 |
+| 512 queries behind 32768 | 0.764 | 0.620 | 39.411 | 40.806 | 40.860 | 1.165 | 39.523 | 1.787 | 675.9 | 31.0 | 63.1 | 2032 |
+| decode at 16385 | 0.355 | 0.225 | 3.387 | 3.972 | 4.032 | 1.182 | 1.671 | 1.163 | 519.5 | 361.4 | 1.4 | 4 |
+| decode at 32769 | 0.350 | 0.221 | 3.369 | 3.946 | 4.004 | 1.173 | 1.647 | 1.778 | 679.2 | 733.4 | 2.9 | 4 |
 
-A 32768-token history holds 1096 pages of 64 tokens and 1152 MiB of KV per rank of valid tokens, and a
-16384-token history 552 pages and 576 MiB; the capacity is one page more in each case.
+A 32768-token history is 512 pages of 64 tokens and 1152 MiB of KV per rank, and the step's pool
+allocated 1096 pages for it, because the churned layout leaves gaps. A 16384-token history is 256 pages
+and 576 MiB, out of 552 allocated.
 
 ## The query-length axis, extend steps in the merge branch
 
 Page size 64, contiguous pool, one sequence.
 
-| step | indices | plan | loop | step | write | attn | gather | gather GB/s | read GB/s | TFLOP/s | FLOP/byte |
-|---|---|---|---|---|---|---|---|---|---|---|---|
-| 128 queries behind 128 | 0.443 | 0.447 | 6.311 | 7.218 | 1.128 | 4.302 | 1.131 | 4.2 | 2.2 | 0.8 | 385 |
-| 512 queries behind 128 | 0.432 | 0.456 | 6.634 | 7.531 | 1.144 | 4.604 | 1.132 | 4.2 | 5.1 | 6.3 | 1230 |
-| 2048 queries behind 128 | 0.525 | 0.508 | 9.601 | 10.641 | 1.145 | 9.536 | 1.141 | 4.1 | 8.4 | 36.5 | 4339 |
-| 128 queries behind 512 | 0.433 | 0.446 | 6.565 | 7.448 | 1.145 | 4.561 | 1.144 | 16.5 | 5.2 | 2.4 | 461 |
-| 512 queries behind 512 | 0.439 | 0.465 | 6.780 | 7.683 | 1.138 | 4.713 | 1.146 | 16.5 | 8.0 | 12.3 | 1537 |
-| 2048 queries behind 512 | 0.543 | 0.515 | 11.322 | 12.386 | 1.130 | 11.288 | 1.135 | 16.6 | 8.4 | 41.1 | 4917 |
-| 128 queries behind 2048 | 0.430 | 0.447 | 6.631 | 7.516 | 1.155 | 4.603 | 1.136 | 66.5 | 17.4 | 8.7 | 497 |
-| 512 queries behind 2048 | 0.423 | 0.448 | 6.702 | 7.586 | 1.132 | 4.795 | 1.131 | 66.7 | 19.7 | 36.3 | 1844 |
-| 2048 queries behind 2048 | 0.651 | 0.565 | 18.213 | 19.431 | 1.120 | 18.243 | 1.145 | 66.0 | 8.3 | 50.9 | 6145 |
-| 128 queries behind 8192 | 0.435 | 0.453 | 6.649 | 7.548 | 1.147 | 4.608 | 1.149 | 262.8 | 66.6 | 33.8 | 508 |
-| 512 queries behind 8192 | 0.551 | 0.521 | 11.786 | 12.866 | 1.158 | 11.809 | 1.140 | 264.8 | 27.2 | 54.0 | 1988 |
-| 2048 queries behind 8192 | 0.684 | 0.577 | 45.628 | 46.900 | 1.141 | 45.667 | 1.149 | 262.8 | 8.3 | 60.9 | 7373 |
+| step | indices | plan | loop | sum | window | write | attn | gather | gather GB/s | read GB/s | TFLOP/s | FLOP/byte |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 128 queries behind 128 | 0.431 | 0.434 | 6.377 | 7.259 | 7.317 | 1.157 | 4.418 | 1.133 | 4.2 | 2.1 | 0.8 | 385 |
+| 512 queries behind 128 | 0.434 | 0.454 | 6.751 | 7.650 | 7.708 | 1.174 | 4.735 | 1.146 | 4.1 | 5.0 | 6.1 | 1230 |
+| 2048 queries behind 128 | 0.536 | 0.516 | 9.604 | 10.663 | 10.710 | 1.157 | 9.537 | 1.136 | 4.2 | 8.4 | 36.5 | 4339 |
+| 128 queries behind 512 | 0.444 | 0.451 | 6.661 | 7.578 | 7.643 | 1.161 | 4.648 | 1.142 | 16.5 | 5.1 | 2.3 | 461 |
+| 512 queries behind 512 | 0.457 | 0.472 | 6.883 | 7.834 | 7.894 | 1.160 | 4.874 | 1.146 | 16.5 | 7.7 | 11.9 | 1537 |
+| 2048 queries behind 512 | 0.541 | 0.521 | 11.313 | 12.378 | 12.424 | 1.157 | 11.293 | 1.142 | 16.5 | 8.4 | 41.1 | 4917 |
+| 128 queries behind 2048 | 0.453 | 0.463 | 6.741 | 7.665 | 7.725 | 1.158 | 4.665 | 1.138 | 66.3 | 17.2 | 8.5 | 497 |
+| 512 queries behind 2048 | 0.452 | 0.474 | 6.962 | 7.894 | 7.955 | 1.159 | 4.889 | 1.141 | 66.2 | 19.3 | 35.6 | 1844 |
+| 2048 queries behind 2048 | 0.641 | 0.560 | 18.192 | 19.398 | 19.448 | 1.159 | 18.222 | 1.138 | 66.3 | 8.3 | 50.9 | 6145 |
+| 128 queries behind 8192 | 0.444 | 0.456 | 6.696 | 7.611 | 7.671 | 1.163 | 4.730 | 1.160 | 260.3 | 64.8 | 32.9 | 508 |
+| 512 queries behind 8192 | 0.550 | 0.519 | 11.780 | 12.857 | 12.905 | 1.173 | 11.806 | 1.144 | 264.0 | 27.2 | 54.0 | 1988 |
+| 2048 queries behind 8192 | 0.694 | 0.587 | 45.580 | 46.869 | 46.918 | 1.173 | 45.626 | 1.156 | 261.3 | 8.3 | 61.0 | 7373 |
 
 ## The other axes
 
-| axis | configuration | loop | step | attn |
+| axis | configuration | loop | window | attn |
 |---|---|---|---|---|
-| page size, decode at a 8193-token history | 1, 16, 32, 64, 128 | 3.295, 3.271, 3.319, 3.296, 3.181 | 3.850, 3.826, 3.878, 3.867, 3.731 | 1.642, 1.620, 1.626, 1.622, 1.575 |
-| layout, decode at a 8193-token history | contiguous, random | 3.296, 3.211 | 3.867, 3.760 | 1.622, 1.608 |
-| batch, prefill 8192 | 1 sequence, 4 even, 4 ragged of 8192/4096/2048/1024 | 71.893, 242.339, 84.668 | 72.631, 243.158, 85.429 | 72.204, 241.723, 84.527 |
+| page size, decode at a 8193-token history | 1, 16, 32, 64, 128 | 3.262, 3.258, 3.256, 3.248, 3.244 | 3.869, 3.857, 3.857, 3.860, 3.845 | 1.596, 1.594, 1.591, 1.592, 1.596 |
+| layout, decode at a 8193-token history | contiguous, random | 3.248, 3.244 | 3.860, 3.842 | 1.592, 1.577 |
+| batch, prefill 8192 | 1 sequence, 4 even, 4 ragged of 8192/4096/2048/1024 | 71.900, 242.444, 84.714 | 72.651, 243.307, 85.493 | 72.200, 241.868, 84.527 |
 
 ## What the numbers show
 
-**Query length and history length move the loop.** A prefill of 128 tokens spends 2.428 ms in the loop,
-512 tokens 2.689 ms, 2048 tokens 8.615 ms and 8192 tokens 71.893 ms. Behind an 8192-token history the
-merge branch's loop reads 6.649 ms for 128 queries, 11.786 ms for 512 and 45.628 ms for 2048; behind a
-2048-token history the same three queries read 6.631, 6.702 and 18.213 ms. In the long-context run 512
-queries behind 16384 tokens read 21.030 ms and behind 32768 tokens 39.387 ms.
+**Query length and history length move the loop.** A prefill of 128 tokens spends 2.415 ms in the loop,
+512 tokens 2.623 ms, 2048 tokens 8.623 ms and 8192 tokens 71.900 ms. Behind an 8192-token history the
+merge branch's loop reads 6.696 ms for 128 queries, 11.780 ms for 512 and 45.580 ms for 2048; behind a
+2048-token history the same three queries read 6.741, 6.962 and 18.192 ms. In the long-context run 512
+queries behind 16384 tokens read 21.047 ms and behind 32768 tokens 39.411 ms.
 
-**A decode step's loop stays between 3.175 and 3.325 ms over the 120 decode steps of the matrix run**,
-and its attention window between 1.563 and 1.661 ms, while the KV it reads grows from 4.7 MB to 1.2 GB
-per rank: at a 8193-token history the paged read covers 302.0 MB in a 1.622 ms window. The whole step
-reads 3.731 to 3.924 ms across those steps, and 3.965 and 3.970 ms for the two 16K and 32K histories of
-the long-context run.
+**A decode step's loop stays between 3.214 and 3.389 ms over the 122 decode steps of the two runs**,
+its whole-step window between 3.813 and 4.047 ms and its attention window between 1.577 and 1.672 ms,
+while the KV it reads grows from 4.7 MB to 1.2 GB per rank: at a 8193-token history the paged read
+covers 302.0 MB in a 1.592 ms window.
 
 **The page size and the layout move no window by more than a tenth of a millisecond.** Decode at a
-8193-token history reads 3.181 to 3.319 ms in the loop, 3.731 to 3.878 ms in the step and 1.575 to
-1.642 ms in the attention window over page sizes 1 to 128, and 3.296 against 3.211 ms in the loop for a
-contiguous pool against a churned one. This is what the replay builds: SGLang hands FlashInfer a
-token-level CSR stream and plans the wrappers at `page_size=1` whatever the pool's page size is, so the
-page size reaches the kernels through the addresses in that stream.
+8193-token history reads 3.244 to 3.262 ms in the loop, 3.845 to 3.869 ms in the whole-step window and
+1.591 to 1.596 ms in the attention window over page sizes 1 to 128, and 3.248 against 3.244 ms in the
+loop for a contiguous pool against a churned one. This is what the replay builds: SGLang hands
+FlashInfer a token-level CSR stream and plans the wrappers at `page_size=1` whatever the pool's page
+size is, so the page size reaches the kernels through the addresses in that stream.
 
-**Batch shape moves the loop.** One 8192-token sequence takes 71.893 ms of loop, four take 242.339 ms,
-and four sequences of 8192, 4096, 2048 and 1024 take 84.668 ms, which is the same 8192 tokens under a
-causal mask.
+**Batch shape moves the loop with the tokens and the pairs the batch computes.** One 8192-token sequence
+computes 8192 tokens and 33,558,528 query-key pairs in a 71.900 ms loop; four of them compute 32768
+tokens and 134,234,112 pairs in 242.444 ms; four ragged sequences of 8192, 4096, 2048 and 1024 compute
+15360 tokens and 44,572,160 pairs in 84.714 ms.
 
-**The gather probe moves the same rows in a window of its own.** At a 32768-token history it moves
-1.2 GB per rank in 1.771 ms, 681.9 GB/s, while the attention window over the same rows is 938.202 ms
-and reads them at 1.3 GB/s. The probe indexes and copies; the attention window reads the same bytes
-through the branch's kernels and multiplies them.
+**The gather probe prices a copy of the rows the branch's paged side reads, and those are not always
+the rows the attention reads.** On the merge step behind 32768 tokens the probe moves the 32768 rows of
+paged history, both K and V, in 1.787 ms, 675.9 GB/s, while the attention window over that history is
+39.523 ms. On a prefill step, which reads no paged KV, the probe moves the rows the step wrote instead,
+and the attention reads the step's own K and V tensors: the 32768-token prefill moves 1.2 GB per rank in
+1.773 ms, 681.5 GB/s, in a run whose attention window is 938.895 ms.
 
 ## What the component windows are, and what they are not
 
 The write and the attention components are windows of their own, measured after the timed loop, and
-they do not decompose it. Three observations from this run's CSV and from an earlier one say where a
-reader can and cannot use them.
+they do not decompose it.
 
-**They do not add up to the loop.** On the four-sequence 512-token prefill rows the two windows sum to
-about 3.5 ms against a loop of 2.46 to 2.52 ms, with the attention window alone (2.255 to 2.383 ms)
-already most of the loop. On the 8192-token prefill the attention window (72.204 ms) is above the loop
-(71.893 ms), while on the 128-query extend behind 8192 tokens it is 4.608 ms against a loop of
-6.649 ms. The loop holds a layer's attention and its KV write as the branch interleaves them; each
-component holds one of the two. The CSV records their share of the step as a quotient of two measured
-windows, and no table here treats the components as parts that reconstruct the step.
+They do not add up to the loop. On the four-sequence 512-token prefill rows the two windows sum to
+about 3.5 ms against a loop of 2.42 to 2.49 ms, with the attention window alone (2.254 to 2.379 ms)
+already most of the loop. On the 8192-token prefill the attention window (72.200 ms) is above the loop
+(71.900 ms), while on the 128-query extend behind 8192 tokens it is 4.730 ms against a loop of
+6.696 ms. The loop holds a layer's attention and its KV write as the branch interleaves them; each
+component holds one of the two, and the merge branch's path is three calls and a merge per layer rather
+than one. The CSV records their ratio to `phase_sum`, as a ratio of two measured windows, and no table
+here treats the components as parts that reconstruct the step.
 
-**The write window reads one regime in this run and another in an earlier one.** Every one of the 600
-matrix rows reads 0.695 to 1.211 ms here, for steps that write 128 to 32768 tokens, so the window does
-not follow the bytes written. An earlier run of the same matrix on the same machine with the same
-settings read 0.050 to 0.240 ms in 17 of its 600 rows and 1.127 to 1.296 ms in the rest, and one of
-those rows carried both regimes inside its own pass: 0.240 ms at p50 and 1.180 ms at p95. Nothing in
-the measurement separates the host's issue of the calls from the device's execution of them, so the CSV
-records the write side as the window it is and derives no bandwidth or per-token cost from it.
+The write window is reported as a window rather than as a rate. It reads 1.114 to 1.182 ms for steps
+that write 1 to 32768 tokens, so it does not follow the bytes written, and inside a single row its p95
+sits 0.088 ms above its min at the median and 0.220 ms above it at most. Nothing in the measurement
+separates the host's issue of the calls from the device's execution of them, which is why the CSV
+derives no bandwidth and no per-token cost from the write side.
 
-**The same steps read differently in an earlier run.** In that earlier run five steps' attention
-windows read 181.141, 97.579, 85.132, 59.842 and 22.841 ms in rows whose loops were 84.738, 45.618,
-39.522, 28.320 and 12.098 ms, and re-measuring those steps read 84.568, 45.677, 39.615, 28.244 and
-12.091 ms. This run has no such row. The min column of a window is the smallest sample it took in its
-row, which is the figure a slower sample during the run does not move: the largest loops of the matrix,
-the batch-4 prefills of 8192-token sequences at 242.3 to 242.5 ms, have a p95 0.73 ms above their min.
+Each step's record in `kernel_summary.csv` carries the values behind every statement here: each
+window's min, p50, p95 and p99, the ledger, the derived figures and the three check results.
 
 ## Reading a row back
 
@@ -184,5 +182,6 @@ the batch-4 prefills of 8192-token sequences at 242.3 to 242.5 ms, have a p95 0.
 step was built with, the ledger — `kv_bytes_written`, `kv_bytes_paged_read`, `kv_bytes_ragged_read`,
 `kv_bytes_attention_read`, `kv_bytes_page_capacity`, `gather_rows`, `gather_bytes`, `attention_pairs`,
 `attention_flops` — every window's min, p50, p95 and p99, the derived figures, and the result of the
-three checks. A run of another model, another sharding or another branch reports its own row for every
-step, and the two sides of every figure in it are recorded there.
+three checks. The min of a window is the smallest sample it took in its row, which is the figure a
+slower sample during the run does not move: the largest loops of the matrix, the batch-4 prefills of
+8192-token sequences at 242.41 to 242.49 ms, have a p95 0.65 to 0.85 ms above their min.

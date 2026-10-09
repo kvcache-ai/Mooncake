@@ -27,10 +27,12 @@ STEP_PHASES = ("indices", "attention_plan", "layer_loop")
 DIAGNOSTIC_PHASES = ("kv_write_component", "attention_component", "kv_gather")
 
 MEASURED_PHASES = STEP_PHASES + DIAGNOSTIC_PHASES
-PHASES = MEASURED_PHASES + ("total_step",)
+# step_window is one window over the whole step; phase_sum is the sum of the three
+# windows above, which is what the two differ by: whatever the device spends
+# between them, and whatever the host takes to issue the step's calls.
+PHASES = MEASURED_PHASES + ("step_window", "phase_sum")
 
-# The phases total_step adds up: the step's three windows, in order. The
-# components are measured in passes of their own and are never added in.
+# What the derived ratios divide by, and what phase_sum adds up.
 TOTAL_PHASES = STEP_PHASES
 
 
@@ -56,11 +58,18 @@ def one_iteration(step, query):
     puts them, and putting an event pair around each of those would measure the
     events as much as the work. The write and the read are priced separately, in
     passes of their own, as components.
+
+    A pair around all three windows gives step_window, the step as one span. The
+    three windows do not add up to it: the device is idle between them while the
+    host issues the next window's calls, and that gap is inside step_window and
+    outside phase_sum.
     """
+    step_events = _event_pair()
     indices_events = _event_pair()
     plan_events = _event_pair()
     loop_events = _event_pair()
 
+    step_events[0].record()
     indices_events[0].record()
     indices = step.build_indices()
     indices_events[1].record()
@@ -79,13 +88,17 @@ def one_iteration(step, query):
             step.write_layer(layer_id, indices)
             step.run_layer(layer_id, query)
     loop_events[1].record()
+    step_events[1].record()
 
     torch.cuda.synchronize()
-    return {
+    measured = {
         "indices": indices_events[0].elapsed_time(indices_events[1]),
         "attention_plan": plan_events[0].elapsed_time(plan_events[1]),
         "layer_loop": loop_events[0].elapsed_time(loop_events[1]),
+        "step_window": step_events[0].elapsed_time(step_events[1]),
     }
+    measured["phase_sum"] = sum(measured[name] for name in TOTAL_PHASES)
+    return measured
 
 
 def one_write_component(step, indices):
@@ -140,12 +153,12 @@ def run_case(
         one_iteration(step, query)
 
     samples = {name: [] for name in STEP_PHASES}
-    samples["total_step"] = []
+    samples["step_window"] = []
+    samples["phase_sum"] = []
     for _ in range(timed):
         measured = one_iteration(step, query)
-        for name in STEP_PHASES:
+        for name in STEP_PHASES + ("step_window", "phase_sum"):
             samples[name].append(measured[name])
-        samples["total_step"].append(sum(measured[name] for name in TOTAL_PHASES))
 
     # The components and the gather run after the step loop, each in its own
     # windows, so no step iteration is ever timed with a probe inside it. They run
@@ -176,7 +189,7 @@ def run_case(
         "phases": {name: summarize(samples[name]) for name in PHASES},
         "per_layer_p50_ms": {
             name: summarize(samples[name])["p50"] / case.num_layers
-            for name in STEP_PHASES + ("total_step",)
+            for name in STEP_PHASES + ("step_window",)
         },
     }
     gather_bytes = step.gather_bytes(probe_indices)
@@ -226,20 +239,21 @@ def short_step_attention(case, device, seed, extend_branch):
 def derive(case, phases, gather_bytes, read_bytes):
     """The figures the report quotes, divided by the step's own ledger.
 
-    Bandwidth and the arithmetic rate divide logical bytes by the window those
-    bytes belong to: the KV the branch's attention reads (the paged side's bytes
-    plus the ragged side's) and the rows the probe moves. The page capacity is an
-    allocation figure and is labelled as one; what the memory system actually
-    transfers is not observable without a profiler, so no figure here claims it.
+    The rates are unique-payload normalisations: they divide the bytes one path
+    reads, counted once per layer however many queries read them, by the window
+    that path ran in. The repeated operand a query costs is in the FLOP count, not
+    in those bytes, and what the memory system actually transfers is not observable
+    without a profiler, so no figure here is a measured bandwidth. The page
+    capacity is an allocation figure and is labelled as one.
 
     The write window carries no rate. It reads two regimes for the same calls —
     around 0.1 ms and around 1.16 ms — so what it covers is not determined by the
     measurement, and a quotient of it would report whichever regime the window
     caught.
 
-    The write and the attention are components, measured in passes of their own.
-    Their share of the step is named as a component share, because the step
-    interleaves the two per layer and their serial sum is not what it runs.
+    The ratios divide phase_sum, the sum of the step's three windows, and are named
+    for it: they are not shares of a total that the parts add up to, and the whole
+    step is measured separately as step_window.
     """
     index_ms = phases["indices"]["p50"]
     plan_ms = phases["attention_plan"]["p50"]
@@ -247,7 +261,8 @@ def derive(case, phases, gather_bytes, read_bytes):
     write_ms = phases["kv_write_component"]["p50"]
     attention_ms = phases["attention_component"]["p50"]
     gather_ms = phases["kv_gather"]["p50"]
-    step_ms = phases["total_step"]["p50"]
+    sum_ms = phases["phase_sum"]["p50"]
+    window_ms = phases["step_window"]["p50"]
 
     flops = case.attention_flops()
 
@@ -262,15 +277,15 @@ def derive(case, phases, gather_bytes, read_bytes):
         "kv_write_component_us_per_layer": write_ms * 1000.0 / case.num_layers,
         "indices_us_per_new_token": index_ms * 1000.0 / case.new_tokens,
         "attention_us_per_context_token": attention_ms * 1000.0 / case.context_tokens,
-        "kv_gather_effective_gbps": gather_bytes / per_second(gather_ms) / 1e9,
-        "attention_effective_gbps": read_bytes / per_second(attention_ms) / 1e9,
+        "kv_gather_unique_payload_gbps": gather_bytes / per_second(gather_ms) / 1e9,
+        "attention_unique_payload_gbps": read_bytes / per_second(attention_ms) / 1e9,
         "attention_tflops": flops / per_second(attention_ms) / 1e12,
-        "attention_arithmetic_intensity": flops / read_bytes,
-        "indices_share_of_step": index_ms / step_ms,
-        "attention_plan_share_of_step": plan_ms / step_ms,
-        "layer_loop_share_of_step": loop_ms / step_ms,
-        "attention_component_share_of_step": attention_ms / step_ms,
-        "kv_write_component_share_of_step": write_ms / step_ms,
-        "components_share_of_step": (write_ms + attention_ms) / step_ms,
-        "total_tokens_per_s": case.new_tokens / per_second(step_ms),
+        "attention_flops_per_unique_payload_byte": flops / read_bytes,
+        "indices_ratio_of_phase_sum": index_ms / sum_ms,
+        "attention_plan_ratio_of_phase_sum": plan_ms / sum_ms,
+        "layer_loop_ratio_of_phase_sum": loop_ms / sum_ms,
+        "attention_component_ratio_of_phase_sum": attention_ms / sum_ms,
+        "kv_write_component_ratio_of_phase_sum": write_ms / sum_ms,
+        "components_ratio_of_phase_sum": (write_ms + attention_ms) / sum_ms,
+        "new_tokens_per_s": case.new_tokens / per_second(window_ms),
     }

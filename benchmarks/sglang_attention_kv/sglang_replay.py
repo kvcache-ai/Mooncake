@@ -56,19 +56,24 @@ FLASHINFER_BACKEND = "fa2"
 WRAPPER_PAGE_SIZE = 1
 WORKSPACE_BYTES = 384 * 1024 * 1024
 
-# The decode wrapper's tensor-core path, which is what FlashInferAttnBackend
-# builds for a decode step.
+# The decode wrapper's tensor-core path. FlashInferAttnBackend decides this per
+# model through should_use_tensor_core, which returns True for a bf16 cache at a
+# group size of 4 or more query heads per KV head (and honours
+# SGLANG_FLASHINFER_USE_TENSOR_CORE). This model has a group size of 4 on this
+# sharding, so True is the lane the benchmark replays; a model below that
+# threshold would build the wrapper without it.
 DECODE_USE_TENSOR_CORES = True
+
+# Whether the KV pool is built with MHATokenToKVPool's alternate stream. In SGLang
+# 0.5.20 that stream is used only inside CUDA graph capture: _set_kv_buffer_impl
+# branches on get_is_capture_mode() and otherwise writes through the fused
+# store_cache kernel on the current stream. This replay captures no graph, so the
+# flag records how the pool was built rather than a different write path, and the
+# record states which of the two was measured.
+KV_WRITE_ALT_STREAM = False
 
 # Spare pages beyond what the case needs, so a layout can leave gaps.
 SPARE_PAGE_FRACTION = 8
-
-# Whether the KV writer runs on the pool's alternate stream. A server leaves it
-# on and lets the write overlap with the attention, which makes a phase-by-phase
-# breakdown meaningless: the write's cost then lands in whichever window syncs
-# next. The benchmark writes on the step's own stream, so every phase is that
-# phase's own cost, and each record states which of the two it measured.
-KV_WRITE_ALT_STREAM = False
 
 # The two sources this benchmark writes: the cached history and the K/V of the
 # step itself. Regenerated on demand from these seeds, so a check can compare
@@ -653,7 +658,7 @@ class SglangStep:
         torch.cuda.synchronize()
 
         scale = 1.0 / (case.head_dim**0.5)
-        repeat = case.num_qo_heads // case.num_kv_heads
+        repeat = case.group_ratio()
         outputs = []
         q_offset = 0
         for index, new_len in enumerate(case.new_lens):
@@ -693,7 +698,7 @@ class SglangStep:
         torch.cuda.synchronize()
 
         scale = 1.0 / (case.head_dim**0.5)
-        repeat = case.num_qo_heads // case.num_kv_heads
+        repeat = case.group_ratio()
         outputs = []
         q_offset = 0
         for index, new_len in enumerate(case.new_lens):

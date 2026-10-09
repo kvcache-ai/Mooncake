@@ -56,14 +56,53 @@ BRANCH_DETAIL = {
 BRANCHES_THAT_WRITE_FIRST = (BRANCH_PAGED_EXTEND, BRANCH_PAGED_DECODE)
 
 
+def use_paged_env_value():
+    """What SGLANG_FLASHINFER_USE_PAGED is set to, or None when it is not set.
+
+    None and "0" mean different things: with the variable unset the matrix decides
+    the extend branch, and with it set the environment already decided, so a
+    conflicting choice is an error rather than a silent override.
+    """
+    raw = os.environ.get("SGLANG_FLASHINFER_USE_PAGED")
+    if raw is None:
+        return None
+    return raw.lower() in ("1", "true", "yes")
+
+
 def use_paged_default() -> bool:
     """What SGLANG_FLASHINFER_USE_PAGED is set to in this process, so a record
     says which server configuration it describes."""
-    return os.environ.get("SGLANG_FLASHINFER_USE_PAGED", "false").lower() in (
-        "1",
-        "true",
-        "yes",
-    )
+    return use_paged_env_value() or False
+
+
+def branch_for_paged(paged: bool) -> str:
+    """The extend branch that variable selects."""
+    return BRANCH_PAGED_EXTEND if paged else BRANCH_RAGGED_PREFIX_MERGE
+
+
+def resolve_extend_branch(cli_choice):
+    """The extend branch a run replays, from the one place that configures it.
+
+    SGLANG_FLASHINFER_USE_PAGED is what a server sets and what the backend reads;
+    --extend-branch is what a run passes. When the variable is set, it decides and
+    a conflicting --extend-branch is refused, so a record can never state a branch
+    the environment does not agree with.
+    """
+    env = use_paged_env_value()
+    if cli_choice is not None and cli_choice not in BRANCH_CHOICES:
+        raise ValueError(
+            f"unknown extend branch {cli_choice!r}, expected one of {BRANCH_CHOICES}"
+        )
+    if env is None:
+        return cli_choice or BRANCH_RAGGED_PREFIX_MERGE
+    from_env = branch_for_paged(env)
+    if cli_choice is not None and cli_choice != from_env:
+        raise ValueError(
+            f"--extend-branch {cli_choice} disagrees with "
+            f"SGLANG_FLASHINFER_USE_PAGED={int(env)}, which selects {from_env}; "
+            f"unset the variable to choose the branch on the command line"
+        )
+    return from_env
 
 
 # Load scale for the --full matrix; longer sequences are added with --input-lens
@@ -223,6 +262,28 @@ class KernelCase(StepShape):
     head_dim: int
     dtype: str
 
+    def __post_init__(self):
+        super().__post_init__()
+        if self.num_kv_heads < 1:
+            raise ValueError(
+                f"a step needs at least one KV head, got {self.num_kv_heads}"
+            )
+        # Several query heads share one KV head, and the reference attention reads
+        # that group with repeat_interleave. A head count that is not a whole
+        # number of groups would silently truncate query heads, so the ratio is
+        # checked here rather than left to the division.
+        if self.num_qo_heads % self.num_kv_heads != 0:
+            raise ValueError(
+                f"num_qo_heads={self.num_qo_heads} is not a whole number of groups "
+                f"of num_kv_heads={self.num_kv_heads}; the group ratio would "
+                f"truncate query heads"
+            )
+
+    def group_ratio(self):
+        """Query heads per KV head: how many queries one KV head serves, which is
+        the number of times the reference attention reads it."""
+        return self.num_qo_heads // self.num_kv_heads
+
     @property
     def dtype_bytes(self):
         if self.dtype not in DTYPE_BYTES:
@@ -303,10 +364,17 @@ def assert_dense_sharding(model_config, tp_size):
             f"is not divisible by tp_size={tp_size}; integer division would "
             f"silently drop heads"
         )
-    return (
-        model_config.num_attention_heads // tp_size,
-        model_config.num_key_value_heads // tp_size,
-    )
+    qo_heads = model_config.num_attention_heads // tp_size
+    kv_heads = model_config.num_key_value_heads // tp_size
+    # The same check the case makes, at the model level: the reference attention
+    # reads each KV head num_qo_heads // num_kv_heads times, so the ratio has to be
+    # a whole number of query heads per KV head.
+    if kv_heads < 1 or qo_heads % kv_heads != 0:
+        raise ValueError(
+            f"this model gives {qo_heads} query heads per rank for {kv_heads} KV "
+            f"heads per rank, which is not a whole group ratio"
+        )
+    return qo_heads, kv_heads
 
 
 def _lens_for(mode, lengths, chunk_len):

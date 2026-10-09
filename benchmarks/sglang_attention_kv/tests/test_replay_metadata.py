@@ -23,6 +23,7 @@ from benchmarks.sglang_attention_kv.cases import (  # noqa: E402
 from benchmarks.sglang_attention_kv import kernel_bench  # noqa: E402
 from benchmarks.sglang_attention_kv.kernel_bench import (  # noqa: E402
     PHASES,
+    STEP_PHASES,
     derive,
     one_attention_component,
     one_iteration,
@@ -329,7 +330,7 @@ def test_the_read_ledger_splits_the_paged_side_from_the_ragged_side():
     assert extend_read["ragged"] == 0
 
 
-def test_the_attention_bandwidth_divides_the_bytes_the_branch_reads():
+def test_the_attention_rate_divides_the_bytes_the_branch_reads():
     """The rate a row reports divides the KV the attention window covers. A derive
     that divided the page capacity instead would report a different number, so this
     fails if the ledger drifts back to the allocation figure."""
@@ -342,14 +343,29 @@ def test_the_attention_bandwidth_divides_the_bytes_the_branch_reads():
     indices = step.build_indices()
     derived = derive(case, phases, step.gather_bytes(indices), read["attention"])
     per_second = attention_ms / 1000.0
-    assert derived["attention_effective_gbps"] == pytest.approx(
+    assert derived["attention_unique_payload_gbps"] == pytest.approx(
         read["attention"] / per_second / 1e9, rel=1e-12
     )
-    assert derived["attention_arithmetic_intensity"] == pytest.approx(
+    assert derived["attention_flops_per_unique_payload_byte"] == pytest.approx(
         case.attention_flops() / read["attention"], rel=1e-12
     )
     capacity_rate = case.kv_page_capacity_bytes() / per_second / 1e9
-    assert derived["attention_effective_gbps"] != pytest.approx(capacity_rate, rel=1e-3)
+    assert derived["attention_unique_payload_gbps"] != pytest.approx(
+        capacity_rate, rel=1e-3
+    )
+
+
+def test_the_step_has_a_window_of_its_own_beside_the_phase_sum(monkeypatch):
+    """The three windows are timed separately, so phase_sum is their sum and not
+    the step: the device can be idle between them while the host issues the next
+    window's calls. step_window measures the whole step in one span."""
+    step, _ = prepared(step_case("extend", (256,), (128,)))
+    measured = one_iteration(step, step.make_query())
+    assert set(measured) == set(STEP_PHASES) | {"step_window", "phase_sum"}
+    assert measured["phase_sum"] == pytest.approx(
+        sum(measured[name] for name in STEP_PHASES), rel=1e-12
+    )
+    assert measured["step_window"] >= measured["phase_sum"]
 
 
 def test_the_component_passes_run_against_a_plan_of_their_own_indices(monkeypatch):
@@ -426,7 +442,7 @@ def test_the_step_loop_interleaves_write_and_read_per_layer(monkeypatch):
     monkeypatch.setattr(step, "write_layer", write)
     monkeypatch.setattr(step, "run_layer", read)
     measured = one_iteration(step, step.make_query())
-    assert set(measured) == {"indices", "attention_plan", "layer_loop"}
+    assert set(measured) == set(STEP_PHASES) | {"step_window", "phase_sum"}
     # The merge branch reads a layer and then writes it, so the calls alternate
     assert order[0] == ("read", 0)
     assert order[1] == ("write", 0)
