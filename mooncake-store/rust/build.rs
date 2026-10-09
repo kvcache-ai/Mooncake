@@ -208,10 +208,15 @@ fn main() {
 
     // mooncake_store depends on libasio.so (shared) built in mooncake-common.
     let lib_path = PathBuf::from(&lib_dir);
-    let build_dir = lib_path.ancestors().nth(2).map(PathBuf::from).unwrap_or_else(|| {
-        println!("cargo:warning=MOONCAKE_STORE_LIB_DIR='{lib_dir}' does not have enough parent directories; using current directory");
-        PathBuf::from(".")
-    });
+    // Prefer the supplied build root for sibling native libraries. Keep the
+    // conventional layout inference for standalone callers without it.
+    let build_dir = env::var_os("MOONCAKE_BUILD_DIR")
+        .map(PathBuf::from)
+        .or_else(|| lib_path.ancestors().nth(2).map(PathBuf::from))
+        .unwrap_or_else(|| {
+            println!("cargo:warning=MOONCAKE_STORE_LIB_DIR='{lib_dir}' does not have enough parent directories; using current directory");
+            PathBuf::from(".")
+        });
     println!(
         "cargo:rustc-link-search=native={}",
         build_dir.join("mooncake-common").display()
@@ -265,7 +270,7 @@ fn main() {
     // Dependencies of mooncake_store that must be satisfied at link time.
     // The list mirrors what mooncake-store/src/CMakeLists.txt links against.
     println!("cargo:rustc-link-lib=transfer_engine");
-    println!("cargo:rustc-link-lib=mooncake_common"); // Environ::Get() and other common utilities
+    println!("cargo:rustc-link-lib=mooncake_common"); // Environ and other common utilities
     println!("cargo:rustc-link-lib=base"); // mooncake::Status etc.
     println!("cargo:rustc-link-lib=asio"); // shared library built by mooncake-common
     println!("cargo:rustc-link-lib=jsoncpp"); // transfer_engine dependency

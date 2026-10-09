@@ -108,7 +108,7 @@ DEFINE_int32(
 DEFINE_string(xport_type, "",
               "Transport type: "
               "rdma|tcp|hp_tcp|shm|mnnvl|nvlink|gds|iouring|ub|sunrise_link|"
-              "mpcomm|flagcx");
+              "mpcomm|flagcx|efa|fabric");
 DEFINE_string(backend, "tent", "Transport backend: classic|tent");
 DEFINE_bool(use_hugepage, false,
             "classic DRAM: SHM allocates on hugetlbfs; RDMA allocates with "
@@ -128,7 +128,7 @@ DEFINE_bool(notifi, false,
 DEFINE_string(tent_transport_hint, "unspec",
               "tent only: per-request transport_hint. "
               "unspec|rdma|tcp|hp_tcp|shm|nvlink|gds|io_uring|mnnvl|ascend|"
-              "ub|sunrise_link|mpcomm");
+              "ub|sunrise_link|mpcomm|fabric");
 DEFINE_string(tent_intent_type, "unspec",
               "tent only: intent_type attached to every benchmark request. "
               "unspec|foreground_get|background_prefetch|migration|checkpoint|"

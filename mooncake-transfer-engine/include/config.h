@@ -74,6 +74,12 @@ struct GlobalConfig {
     // Cooldown before retrying a failed RDMA peer rail. Override via
     // MC_RDMA_RAIL_PAUSE_SECONDS.
     uint64_t rdma_rail_pause_seconds = 30;
+    // How long an RDMA transfer worker keeps busy-polling after its device
+    // instance becomes idle before it parks, in microseconds. A polling worker
+    // occupies a whole CPU core; a parked one pays a thread wake-up when the
+    // next transfer arrives. 0 parks as soon as the instance is idle. Override
+    // via MC_RDMA_WORKER_IDLE_SPIN_US.
+    uint64_t rdma_worker_idle_spin_us = 100000;
     bool metacache = true;
     // Periodically refresh Transfer Engine metadata-derived local caches. 0
     // disables the background poller and preserves the manual
@@ -117,6 +123,14 @@ struct GlobalConfig {
     // NICs the topology reports as closest to that GPU. Set via
     // MC_EFA_NIC_SELECTION=all|local; see efa_transport.cpp for the trade-off.
     EfaNicSelection efa_nic_selection = EfaNicSelection::ALL;
+    // Cap on EFA CQ poller threads. Set via MC_EFA_CQ_THREADS; 0 disables the
+    // cap.
+    int efa_cq_threads = 1;
+    // Register GPU memory with ibv_reg_mr() through the nvidia-peermem kernel
+    // module instead of exporting a dma_buf. Set via WITH_NVIDIA_PEERMEM.
+    bool with_nvidia_peermem = true;
+    // Register dma_buf MRs with mlx5 Data Direct. Set via MC_RDMA_DATA_DIRECT.
+    bool rdma_data_direct = false;
     size_t eic_max_block_size = 64UL * 1024 * 1024;
     EndpointStoreType endpoint_store_type = EndpointStoreType::SIEVE;
     int ib_traffic_class = -1;

@@ -365,7 +365,8 @@ TEBenchRunner::TEBenchRunner() {
     // Disable auto-discovery when an explicit non-RDMA xport is requested
     // (e.g. flagcx, shm) so we can installTransport() ourselves below.
     bool auto_disc = XferBenchConfig::xport_type != "flagcx" &&
-                     XferBenchConfig::xport_type != "shm";
+                     XferBenchConfig::xport_type != "shm" &&
+                     XferBenchConfig::xport_type != "efa";
     engine_ = std::make_unique<mooncake::TransferEngine>(auto_disc);
     auto conn_str = XferBenchConfig::metadata_type == "p2p"
                         ? "P2PHANDSHAKE"
@@ -395,6 +396,13 @@ TEBenchRunner::TEBenchRunner() {
             LOG_ASSERT(shm) << "installTransport(shm) failed";
         }
         LOG(INFO) << "tebench: SHM transport installed";
+    }
+    if (XferBenchConfig::xport_type == "efa") {
+        // Discover manually: auto-discovery would install RDMA instead.
+        engine_->getLocalTopology()->discover({});
+        auto* xp = engine_->installTransport("efa", nullptr);
+        LOG_ASSERT(xp) << "installTransport(efa) failed";
+        LOG(INFO) << "tebench: EFA transport installed";
     }
     init_ok_ = (allocateBuffers() == 0);
     if (!init_ok_) {

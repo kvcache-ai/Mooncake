@@ -144,13 +144,13 @@ struct RdmaSlice {
     int target_dev_id = -1;
     // GPUDirect reachability learning (see GdrReachability). Resolved once per
     // (re)submit in Workers::generatePostPath. GPU ordinals are -1 for host
-    // memory; the name pointers alias stable Topology::NicEntry / segment
-    // storage and stay valid for the slice's lifetime.
+    // memory; these copies must survive metadata snapshot replacement until
+    // asynchronous completion handling has finished with the slice.
     int source_gpu_ordinal = -1;
     int target_gpu_ordinal = -1;
-    const char* source_nic_name = nullptr;
-    const char* target_nic_name = nullptr;
-    const std::string* target_machine_id = nullptr;
+    std::string source_nic_name;
+    std::string target_nic_name;
+    std::string target_machine_id;
 
     std::weak_ptr<RdmaEndPoint> ep_weak_ptr;
     // Posted work requests whose completion has not been polled and fully

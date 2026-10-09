@@ -5,9 +5,22 @@
 #include <thread>
 
 #include "common/byte_size.h"
+#include "config/store_cluster_identity_config.h"
 #include "version.h"
 
 namespace mooncake {
+
+const std::map<std::string, std::string> merge_labels(
+    const std::map<std::string, std::string>& labels) {
+    static const std::string cluster_id =
+        StoreClusterIdentityConfig::FromEnvironment().cluster_id.value_or("");
+    std::map<std::string, std::string> merged_labels;
+    if (!cluster_id.empty()) {
+        merged_labels["cluster_id"] = cluster_id;
+    }
+    merged_labels.insert(labels.begin(), labels.end());
+    return merged_labels;
+}
 
 namespace {
 

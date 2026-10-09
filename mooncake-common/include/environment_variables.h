@@ -61,6 +61,14 @@ struct ClientAutoPortEnvironmentVariables {
     MC_DEFINE_ENV_VAR(int, MC_STORE_CLIENT_MAX_PORT);
 };
 
+struct EmbeddedMasterEnvironmentVariables {
+    MC_DEFINE_ENV_VAR(bool, MOONCAKE_ENABLE_EMBEDDED_MASTER);
+};
+
+struct ClientObjectChecksumEnvironmentVariables {
+    MC_DEFINE_ENV_VAR(bool, MOONCAKE_STORE_CHECKSUM);
+};
+
 struct CxlSegmentEnvironmentVariables {
     // Keep the raw string so an unset value remains distinguishable from a
     // present but invalid value, which the legacy path resolves to zero.
@@ -93,6 +101,11 @@ struct HugepageEnvironmentVariables {
     MC_DEFINE_ENV_VAR(std::string, MC_STORE_HUGEPAGE_SIZE);
 };
 
+struct ShmSpdkRegistrationEnvironmentVariables {
+    // The registration opt-in is enabled only by the exact string "1".
+    MC_DEFINE_ENV_VAR(std::string, MC_STORE_REGISTER_SPDK);
+};
+
 struct LocalHotCacheEnvironmentVariables {
     // Keep these values as strings to preserve their existing per-setting
     // parsing, fallback, and logging behavior.
@@ -108,6 +121,11 @@ struct ClientMetricEnvironmentVariables {
     MC_DEFINE_ENV_VAR(std::string, MC_STORE_CLIENT_METRIC);
     MC_DEFINE_ENV_VAR(std::string, MC_STORE_CLIENT_METRIC_INTERVAL);
     MC_DEFINE_ENV_VAR(std::string, MC_STORE_CLIENT_METRIC_BANDWIDTH);
+};
+
+struct DfsEnablementEnvironmentVariables {
+    MC_DEFINE_ENV_VAR(bool, MOONCAKE_ENABLE_DFS);
+    MC_DEFINE_ENV_VAR(bool, MOONCAKE_DFS_ENABLED);
 };
 
 struct DistributedStorageEnvironmentVariables {
@@ -182,8 +200,12 @@ struct LocalFileSnapshotEnvironmentVariables {
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_SNAPSHOT_LOCAL_PATH);
 };
 
-struct HaClusterNamespaceEnvironmentVariables {
+struct StoreClusterIdentityEnvironmentVariables {
     MC_DEFINE_ENV_VAR(std::string, MC_STORE_CLUSTER_ID);
+};
+
+struct MasterMetadataEnvironmentVariables {
+    MC_DEFINE_ENV_VAR(std::string, MC_METADATA_CLUSTER_ID);
 };
 
 struct TransferSubmitterEnvironmentVariables {
@@ -197,9 +219,21 @@ struct FilereadWorkerPoolEnvironmentVariables {
     MC_DEFINE_ENV_VAR(std::string, MC_FILEREAD_WORKERS);
 };
 
+struct NoFWorkerPoolEnvironmentVariables {
+    // Preserve the raw value in invalid-value warnings.
+    MC_DEFINE_ENV_VAR(std::string, MC_NOF_WORKERS);
+};
+
 struct NoFRegisterEnvironmentVariables {
     // Keep the raw string to preserve case normalization and warning behavior.
     MC_DEFINE_ENV_VAR(std::string, MC_NOF_TRTYPE);
+};
+
+struct NoFDebugEnvironmentVariables {
+    // Preserve the legacy case-insensitive true tokens and strtol syntax;
+    // neither parser trims trailing whitespace.
+    MC_DEFINE_ENV_VAR(std::string, MC_NOF_DEBUG);
+    MC_DEFINE_ENV_VAR(std::string, MC_NOF_DEBUG_INTERVAL_MS);
 };
 
 struct SpdkControllerEnvironmentVariables {
@@ -252,6 +286,15 @@ struct NvmeKvIoConcurrencyEnvironmentVariables {
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_NVME_KV_PREPARE_CONCURRENCY);
 };
 
+struct NvmeKvExecutorEnvironmentVariables {
+    // Keep these values as strings because the executor parser accepts base
+    // prefixes, a leading plus, and leading whitespace.
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_NVME_KV_TRANSFER_ALIGNMENT_BYTES);
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_NVME_KV_VALUE_BLOCK_UNIT_BYTES);
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_NVME_KV_PROTOCOL_MAX_VALUE_SIZE);
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_NVME_KV_READ_PLAN_BATCH_SIZE);
+};
+
 struct S3ClientEnvironmentVariables {
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_AWS_REGION);
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_AWS_S3_ENDPOINT);
@@ -264,6 +307,12 @@ struct S3ClientEnvironmentVariables {
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_AWS_RESPONSE_CHECKSUM_VALIDATION);
     MC_DEFINE_ENV_VAR(int64_t, MOONCAKE_AWS_CONNECT_TIMEOUT_MS);
     MC_DEFINE_ENV_VAR(int64_t, MOONCAKE_AWS_REQUEST_TIMEOUT_MS);
+};
+
+struct RpcClientIoEnvironmentVariables {
+    MC_DEFINE_ENV_VAR(int, MC_RPC_CLIENT_IO_THREADS);
+    MC_DEFINE_ENV_VAR(int, MC_STORE_RPC_CLIENT_IO_THREADS);
+    MC_DEFINE_ENV_VAR(int, MC_TE_RPC_CLIENT_IO_THREADS);
 };
 
 #undef MC_DEFINE_ENV_VAR

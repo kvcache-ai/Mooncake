@@ -482,7 +482,8 @@ bool TransportSelector::isTransportAvailable(
 
     const auto& caps = transport->capabilities();
     if (context.host_staging) {
-        return (type == RDMA || type == TCP || type == HP_TCP) &&
+        return (type == RDMA || type == FABRIC || type == TCP ||
+                type == HP_TCP) &&
                caps.dram_to_dram;
     }
 

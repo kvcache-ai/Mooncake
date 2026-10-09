@@ -1,4 +1,5 @@
 #include "transport/rpc_communicator/rpc_communicator.h"
+#include <cstdlib>
 #include <limits>
 #include <iostream>
 #include <thread>

@@ -98,6 +98,8 @@ TEST(ImmutableBucketAllocatorTest, AppendsAndPacksBatchAcrossBuckets) {
     EXPECT_EQ(results[1].descriptor.offset, 4096u);
     EXPECT_EQ(results[2].descriptor.offset, 0u);
     EXPECT_EQ(allocator.GetBucketCount(), 2u);
+    // GetFileCount mirrors the immutable bucket file count in bucket mode.
+    EXPECT_EQ(allocator.GetFileCount(), 2u);
 }
 
 TEST(ImmutableBucketAllocatorTest, DuplicateBatchRollsBackWithoutOffsetReuse) {
@@ -208,6 +210,8 @@ TEST(ImmutableBucketAllocatorTest, RetiresWholeBucketAfterDelete) {
     ASSERT_TRUE(allocator.DeleteEvictedBucket(std::move(*logical)));
     EXPECT_FALSE(std::filesystem::exists(path));
     EXPECT_EQ(allocator.GetBucketCount(), 1u);
+    // GetFileCount tracks the bucket count after eviction deletes a bucket.
+    EXPECT_EQ(allocator.GetFileCount(), 1u);
     EXPECT_FALSE(allocator.GetBucketIdForKey("cold"));
 }
 

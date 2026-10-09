@@ -688,12 +688,10 @@ void ControlClient::notifySegmentUpdatedAsync(
     const onNotifySegmentUpdateFailure& on_failure) {
     json j = segment_name;
     std::string request = j.dump();
-    tl_rpc_agent.callAsync(
+    tl_rpc_agent.callAsyncRetryOnce(
         server_addr, NotifySegmentUpdated, request,
         [on_failure](const Status& status, const std::string&) {
-            if (!status.ok()) {
-                on_failure();
-            }
+            if (!status.ok()) on_failure();
         });
 }
 

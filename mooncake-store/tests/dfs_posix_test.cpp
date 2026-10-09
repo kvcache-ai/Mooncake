@@ -629,6 +629,8 @@ TEST(ShardAllocatorTest, ExpansionValidatesCountAndUsesEmptyShards) {
     ASSERT_TRUE(expanded);
     EXPECT_EQ(*expanded, 2);
     EXPECT_EQ(alloc.GetShardCount(), 2);
+    // GetFileCount reports the shard file count in shard mode.
+    EXPECT_EQ(alloc.GetFileCount(), 2u);
     ASSERT_TRUE(alloc.ExpandShards(2));
     auto shrink = alloc.ExpandShards(1);
     ASSERT_FALSE(shrink);

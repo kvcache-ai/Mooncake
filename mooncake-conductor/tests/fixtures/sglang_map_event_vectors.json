@@ -1,0 +1,213 @@
+{
+  "description": "Golden SGLang KV-event payloads encoded by upstream msgspec definitions. EventBatch is a positional [ts, events, attn_dp_rank] array; each event is a tagged map with defaulted fields omitted.",
+  "provenance": {
+    "sglang_commit": "55cc90b533cdf4a956bd9e32460c1e1a5829c218",
+    "kv_events_relative_path": "python/sglang/srt/disaggregation/kv_events.py",
+    "kv_events_sha256": "a221ef7039a6f3a104447b5d5e02dd965c9d09a6c90aaca4b3f5fd5e2f42556c",
+    "msgspec_version": "0.21.1",
+    "python_version": "3.12.13",
+    "generation_command": "python3 generate_sglang_map_event_vectors.py --sglang-root <sglang checkout>",
+    "note": "Serialization harness only: this encodes real upstream struct definitions and is not a running SGLang engine.",
+    "hash_oracle_sha256": "90986c3cd097d0f3d7cef4bc99638cccbabba4f9444aa3d8f106a76e77af323d",
+    "hash_oracle": "upstream sglang/srt/mem_cache/cpp_utils/hash_binding.cpp built locally; block hashes are upstream values, not Conductor's"
+  },
+  "cases": [
+    {
+      "name": "stored_removed_cleared",
+      "comment": "One batch carrying each event type in order.",
+      "payload_hex": "93cb40290000000000009387a474797065ab426c6f636b53746f726564ac626c6f636b5f68617368657392ff02b1706172656e745f626c6f636b5f68617368c0a9746f6b656e5f6964739401020304aa626c6f636b5f73697a6502a76c6f72615f6964c0a66d656469756da347505583a474797065ac426c6f636b52656d6f766564ac626c6f636b5f68617368657391ffa66d656469756da347505581a474797065b0416c6c426c6f636b73436c656172656404",
+      "expected": {
+        "ts": 12.5,
+        "attn_dp_rank": 4,
+        "events": [
+          {
+            "type": "BlockStored",
+            "block_hashes": [
+              "-1",
+              "2"
+            ],
+            "parent_block_hash": null,
+            "token_ids": [
+              1,
+              2,
+              3,
+              4
+            ],
+            "block_size": 2,
+            "lora_id": null,
+            "medium": "GPU"
+          },
+          {
+            "type": "BlockRemoved",
+            "block_hashes": [
+              "-1"
+            ],
+            "medium": "GPU"
+          },
+          {
+            "type": "AllBlocksCleared"
+          }
+        ]
+      }
+    },
+    {
+      "name": "stored_omitted_optionals",
+      "comment": "medium/cache_salt/session_id omitted by omit_defaults.",
+      "payload_hex": "93cb3ff00000000000009186a474797065ab426c6f636b53746f726564ac626c6f636b5f6861736865739107b1706172656e745f626c6f636b5f68617368c0a9746f6b656e5f696473920b0caa626c6f636b5f73697a6502a76c6f72615f6964c000",
+      "expected": {
+        "ts": 1.0,
+        "attn_dp_rank": 0,
+        "events": [
+          {
+            "type": "BlockStored",
+            "block_hashes": [
+              "7"
+            ],
+            "parent_block_hash": null,
+            "token_ids": [
+              11,
+              12
+            ],
+            "block_size": 2,
+            "lora_id": null
+          }
+        ]
+      }
+    },
+    {
+      "name": "stored_salt_session_and_parent",
+      "comment": "All optionals present alongside a signed parent hash.",
+      "payload_hex": "93cb40040000000000009189a474797065ab426c6f636b53746f726564ac626c6f636b5f6861736865739109b1706172656e745f626c6f636b5f68617368fea9746f6b656e5f6964739105aa626c6f636b5f73697a6504a76c6f72615f696403a66d656469756daa4350555f50494e4e4544aa63616368655f73616c74a673616c742d61aa73657373696f6e5f6964a973657373696f6e2d6101",
+      "expected": {
+        "ts": 2.5,
+        "attn_dp_rank": 1,
+        "events": [
+          {
+            "type": "BlockStored",
+            "block_hashes": [
+              "9"
+            ],
+            "parent_block_hash": "-2",
+            "token_ids": [
+              5
+            ],
+            "block_size": 4,
+            "lora_id": 3,
+            "medium": "CPU_PINNED",
+            "cache_salt": "salt-a",
+            "session_id": "session-a"
+          }
+        ]
+      }
+    },
+    {
+      "name": "stored_signed_hash_limits",
+      "comment": "INT64_MIN/INT64_MAX hashes must keep their bit pattern.",
+      "payload_hex": "93cb40080000000000009186a474797065ab426c6f636b53746f726564ac626c6f636b5f68617368657393d38000000000000000cf7fffffffffffffffffb1706172656e745f626c6f636b5f68617368d38000000000000000a9746f6b656e5f69647390aa626c6f636b5f73697a6501a76c6f72615f6964c0c0",
+      "expected": {
+        "ts": 3.0,
+        "attn_dp_rank": null,
+        "events": [
+          {
+            "type": "BlockStored",
+            "block_hashes": [
+              "-9223372036854775808",
+              "9223372036854775807",
+              "-1"
+            ],
+            "parent_block_hash": "-9223372036854775808",
+            "token_ids": [],
+            "block_size": 1,
+            "lora_id": null
+          }
+        ]
+      }
+    },
+    {
+      "name": "removed_omitted_medium",
+      "comment": "BlockRemoved with medium left at its default.",
+      "payload_hex": "93cb40100000000000009182a474797065ac426c6f636b52656d6f766564ac626c6f636b5f68617368657391fd02",
+      "expected": {
+        "ts": 4.0,
+        "attn_dp_rank": 2,
+        "events": [
+          {
+            "type": "BlockRemoved",
+            "block_hashes": [
+              "-3"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "empty_batch",
+      "comment": "An empty event list is a valid batch.",
+      "payload_hex": "93cb40140000000000009000",
+      "expected": {
+        "ts": 5.0,
+        "attn_dp_rank": 0,
+        "events": []
+      }
+    }
+  ],
+  "integration": {
+    "comment": "Ingest-to-query chain data. block_hashes come from upstream's own hash extension, not from Conductor, so a query match proves the two agree.",
+    "block_size": 4,
+    "token_ids": [
+      11,
+      12,
+      13,
+      14,
+      21,
+      22,
+      23,
+      24,
+      31,
+      32,
+      33,
+      34,
+      41,
+      42,
+      43,
+      44
+    ],
+    "upstream_hex_digests": [
+      "f67c5ff154ee4961a5f9223699a9f82f6e06cb3c064efbf28119e8a43639ed97",
+      "e1c873d83402d824bf984a0e6d5b96bebbdf10e892a0f03a513ff951bea19a2c",
+      "71749b3c9f3e04bfcbb2c0091c6e0b6c24b1748ab8210b4a9bcf87700a59d6af",
+      "921bc52e4f7533bb365da1b69305fc47545a323b22dea240192afb7b076fdfae"
+    ],
+    "block_hashes_signed": [
+      "-685567553150498463",
+      "-2177363047410903004",
+      "8175329908256277695",
+      "-7918518717108636741"
+    ],
+    "tier_publishes": [
+      {
+        "medium": "GPU",
+        "block_count": 1,
+        "payload_hex": "93cb40594000000000009187a474797065ab426c6f636b53746f726564ac626c6f636b5f68617368657391d3f67c5ff154ee4961b1706172656e745f626c6f636b5f68617368c0a9746f6b656e5f696473940b0c0d0eaa626c6f636b5f73697a6504a76c6f72615f6964c0a66d656469756da347505500"
+      },
+      {
+        "medium": "CPU_PINNED",
+        "block_count": 2,
+        "payload_hex": "93cb40598000000000009187a474797065ab426c6f636b53746f726564ac626c6f636b5f68617368657392d3f67c5ff154ee4961d3e1c873d83402d824b1706172656e745f626c6f636b5f68617368c0a9746f6b656e5f696473980b0c0d0e15161718aa626c6f636b5f73697a6504a76c6f72615f6964c0a66d656469756daa4350555f50494e4e454400"
+      },
+      {
+        "medium": "DISK",
+        "block_count": 3,
+        "payload_hex": "93cb4059c000000000009187a474797065ab426c6f636b53746f726564ac626c6f636b5f68617368657393d3f67c5ff154ee4961d3e1c873d83402d824cf71749b3c9f3e04bfb1706172656e745f626c6f636b5f68617368c0a9746f6b656e5f6964739c0b0c0d0e151617181f202122aa626c6f636b5f73697a6504a76c6f72615f6964c0a66d656469756da44449534b00"
+      }
+    ],
+    "remove_first_block_hex": "93cb40690000000000009183a474797065ac426c6f636b52656d6f766564ac626c6f636b5f68617368657391d3f67c5ff154ee4961a66d656469756da347505500",
+    "clear_all_hex": "93cb40692000000000009181a474797065b0416c6c426c6f636b73436c656172656400",
+    "expected_cumulative_tokens": {
+      "npu": 4,
+      "cpu_local": 8,
+      "disk": 12,
+      "cpu_share": 8
+    }
+  }
+}

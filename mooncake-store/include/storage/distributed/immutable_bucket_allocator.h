@@ -74,6 +74,7 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     }
     uint64_t GetUsedBytes() const override;
     uint64_t GetTotalCapacity() const override;
+    uint64_t GetFileCount() const override;
 
     bool MarkCommitted(const std::string& key,
                        const DistributedFSDescriptor& descriptor);

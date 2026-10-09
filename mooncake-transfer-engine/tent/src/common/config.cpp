@@ -160,6 +160,7 @@ void ConfigHelper::forceTcp(Config& config) {
     config.set("transports/tcp/enable", true);
     config.set("transports/rdma/enable", false);
     config.set("transports/hp_tcp/enable", false);
+    config.set("transports/fabric/enable", false);
 }
 
 Status ConfigHelper::loadFromEnv(Config& config) {

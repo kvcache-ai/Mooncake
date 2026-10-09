@@ -50,7 +50,7 @@ struct SessionHeader {
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
-    defined(USE_COREX)
+    defined(USE_COREX) || defined(USE_SUPA)
 // Returns the CUDA device ordinal if addr is device memory, or -1 otherwise.
 // Callers must call cudaSetDevice before any cudaMemcpy to avoid implicit
 // GPU 0 context creation.
@@ -160,7 +160,7 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
     uint64_t status_frame_;
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
-    defined(USE_COREX)
+    defined(USE_COREX) || defined(USE_SUPA)
     int cuda_device_ = -1;
     TcpStagingBuffer staging_buffer_;
 #endif
@@ -220,7 +220,7 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
                 }
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
-    defined(USE_COREX)
+    defined(USE_COREX) || defined(USE_SUPA)
                 cuda_device_ = getCudaDeviceId(local_buffer_);
 #endif
                 if (opcode == (uint8_t)TransferRequest::WRITE) {
@@ -251,7 +251,7 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
-    defined(USE_COREX)
+    defined(USE_COREX) || defined(USE_SUPA)
         if (cuda_device_ >= 0) {
             dram_buffer = staging_buffer_.ensure(buffer_size);
             cudaSetDevice(cuda_device_);
@@ -308,7 +308,7 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
-    defined(USE_COREX)
+    defined(USE_COREX) || defined(USE_SUPA)
         if (cuda_device_ >= 0) {
             dram_buffer = staging_buffer_.ensure(buffer_size);
         }
@@ -335,7 +335,7 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
-    defined(USE_COREX)
+    defined(USE_COREX) || defined(USE_SUPA)
                 if (cuda_device_ >= 0) {
                     cudaSetDevice(cuda_device_);
                     cudaError_t cuda_status =
@@ -375,7 +375,7 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
     uint64_t status_frame_;
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
-    defined(USE_COREX)
+    defined(USE_COREX) || defined(USE_SUPA)
     int cuda_device_ = -1;
     TcpStagingBuffer staging_buffer_;
 #endif
@@ -435,7 +435,7 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
         local_buffer_ = (char*)buffer;
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
-    defined(USE_COREX)
+    defined(USE_COREX) || defined(USE_SUPA)
         cuda_device_ = getCudaDeviceId(local_buffer_);
 #endif
         header_.addr = htole64(dest_addr);
@@ -753,7 +753,7 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
-    defined(USE_COREX)
+    defined(USE_COREX) || defined(USE_SUPA)
         if (cuda_device_ >= 0) {
             dram_buffer = staging_buffer_.ensure(buffer_size);
         }
@@ -790,7 +790,7 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
-    defined(USE_COREX)
+    defined(USE_COREX) || defined(USE_SUPA)
                 if (cuda_device_ >= 0) {
                     cudaSetDevice(cuda_device_);
                     cudaError_t cuda_status =
@@ -848,7 +848,7 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
-    defined(USE_COREX)
+    defined(USE_COREX) || defined(USE_SUPA)
         if (cuda_device_ >= 0) {
             dram_buffer = staging_buffer_.ensure(buffer_size);
             cudaSetDevice(cuda_device_);

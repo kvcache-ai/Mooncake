@@ -1198,7 +1198,10 @@ bool WorkerPool::hasOutstandingCq(int thread_id) {
 
 void WorkerPool::transferWorker(int thread_id) {
     bindToSocket(numa_socket_id_);
-    const static uint64_t kWaitPeriodInNano = 100000000;  // 100ms
+    // Busy-poll this long after the pool goes idle before parking
+    // (MC_RDMA_WORKER_IDLE_SPIN_US, 100 ms by default).
+    const uint64_t idle_spin_ns =
+        globalConfig().rdma_worker_idle_spin_us * 1000;
     uint64_t last_wait_ts = getCurrentTimeInNano();
     while (workers_running_.load(std::memory_order_relaxed)) {
         auto processed_slice_count =
@@ -1208,7 +1211,7 @@ void WorkerPool::transferWorker(int thread_id) {
         if (processed_slice_count == submitted_slice_count &&
             !hasOutstandingCq(thread_id)) {
             uint64_t curr_wait_ts = getCurrentTimeInNano();
-            if (curr_wait_ts - last_wait_ts > kWaitPeriodInNano) {
+            if (curr_wait_ts - last_wait_ts > idle_spin_ns) {
                 std::unique_lock<std::mutex> lock(cond_mutex_);
                 parked_worker_count_.fetch_add(1, std::memory_order_acq_rel);
                 // Double-check condition after acquiring lock to avoid lost

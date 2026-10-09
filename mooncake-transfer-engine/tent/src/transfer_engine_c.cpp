@@ -295,7 +295,9 @@ int tent_recv_notifs(tent_engine_t engine, tent_notifi_info* info) {
         for (int i = 0; i < info->num_records; ++i) {
             info->records[i].handle = 0;
             strncpy(info->records[i].name, notify_list[i].name.c_str(), 255);
+            info->records[i].name[255] = '\0';
             strncpy(info->records[i].msg, notify_list[i].msg.c_str(), 4095);
+            info->records[i].msg[4095] = '\0';
         }
     }
     return 0;

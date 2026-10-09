@@ -109,6 +109,7 @@ class ShardAllocator final : public DfsAllocatorInterface {
     }
     uint64_t GetUsedBytes() const override;
     uint64_t GetTotalCapacity() const override;
+    uint64_t GetFileCount() const override;
 
     static std::string FormatShardIdx(int idx, int shard_count);
 
