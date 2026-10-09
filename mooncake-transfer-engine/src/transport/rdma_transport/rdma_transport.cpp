@@ -432,7 +432,7 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
     size_t alignment = 1;
 #ifdef USE_CUDA
     if (dmabuf_exp.method == DmabufExport::Method::kDmabufReg &&
-        Environ::Get().GetRdmaDataDirect()) {
+        globalConfig().rdma_data_direct) {
         alignment = getpagesize();
     }
 #endif
