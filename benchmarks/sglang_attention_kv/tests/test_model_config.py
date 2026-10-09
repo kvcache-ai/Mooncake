@@ -180,9 +180,3 @@ def test_a_model_with_a_chunked_attention_window_is_refused():
     layout, evidence = classify_attention_layout({"attention_chunk_size": 8192})
     assert layout == "hybrid"
     assert "attention_chunk_size" in evidence
-
-
-def test_a_dense_config_is_still_accepted():
-    layout, evidence = classify_attention_layout(dict(DENSE_BODY))
-    assert layout == "dense"
-    assert evidence

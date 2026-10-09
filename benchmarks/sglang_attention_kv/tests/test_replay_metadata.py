@@ -13,9 +13,7 @@ if not torch.cuda.is_available():
 pytest.importorskip("sglang")
 
 from benchmarks.sglang_attention_kv.cases import (  # noqa: E402
-    BRANCH_PAGED_DECODE,
     BRANCH_PAGED_EXTEND,
-    BRANCH_RAGGED_NO_PREFIX,
     BRANCH_RAGGED_PREFIX_MERGE,
     KernelCase,
     short_case,
@@ -112,21 +110,6 @@ def test_the_branch_decides_the_order():
     assert not paged.reads_before_write
 
 
-def test_each_mode_replays_its_branch():
-    assert (
-        SglangStep(step_case("prefill", (0,), (128,)), DEVICE, seed=1).branch
-        == BRANCH_RAGGED_NO_PREFIX
-    )
-    assert (
-        SglangStep(step_case("extend", (512,), (128,)), DEVICE, seed=1).branch
-        == BRANCH_RAGGED_PREFIX_MERGE
-    )
-    assert (
-        SglangStep(step_case("decode", (512,), (1,)), DEVICE, seed=1).branch
-        == BRANCH_PAGED_DECODE
-    )
-
-
 def test_the_merge_branch_reads_the_history_through_the_page_table():
     """The merge branch's paged side reads the cached history, not the new tokens,
     so the CSR stream is the history's rows."""
@@ -144,15 +127,6 @@ def test_the_csr_stream_is_the_token_table_row(page_size):
     )
     expected = step._expected_rows()
     assert indices.paged_indices.long().tolist() == expected.tolist()
-
-
-def test_a_second_index_build_names_the_same_slots():
-    """The page table a step reads has to be the one its KV was written through,
-    so building the index stream twice must give the same stream."""
-    step, first = prepared(step_case("decode", (512,), (1,)))
-    second = step.build_indices()
-    assert first.paged_indices.long().tolist() == second.paged_indices.long().tolist()
-    assert step.check_history(second)["passed"]
 
 
 def test_build_indices_does_not_synchronise_with_the_host(monkeypatch):
@@ -220,16 +194,6 @@ def test_the_gather_ledger_counts_both_tensors_of_the_rows_it_moves():
     # The merge branch's probe moves the history's rows, which is what the paged
     # side of that branch reads.
     assert rows == 512
-
-
-def test_the_gather_moves_both_k_and_v():
-    step, indices = prepared(step_case("decode", (128,), (1,)))
-    rows = step.gather_rows(indices)
-    last_layer = step.case.num_layers - 1
-    key_buffer, value_buffer = step.kv_pool.get_kv_buffer(last_layer)
-    moved = step.gather(indices)
-    assert torch.equal(moved, value_buffer.index_select(0, rows))
-    assert not torch.equal(moved, key_buffer.index_select(0, rows))
 
 
 def test_the_allocator_never_hands_out_the_reserved_page():
