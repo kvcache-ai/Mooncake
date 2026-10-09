@@ -228,12 +228,19 @@ Gets the address of the first buffer in a specified segment.
 
 ```{note}
 The optional `transport_hint` argument pins the request onto a named transport (`"rdma"`, `"tcp"`, ...), overriding policy-driven selection for that one call. **TENT backend only** (`MC_USE_TENT=1`); silently ignored on the classic backend. See [TENT transport selector](../../design/tent/transport-selector.md) for more details.
+
+The optional `nic_hint` argument prefers a named local RNIC (for example,
+`"mlx5_3"`) for that call. **Classic RDMA only**; the Python boundary resolves
+it to an index in the local topology. An empty, unknown, or unavailable device
+falls back to normal topology-based selection. The hint affects initial
+submission only; it is advisory rather than a hard pin for an in-flight slice.
+For example: `engine.batch_transfer_sync_read(..., nic_hint="mlx5_3")`.
 ```
 
 #### transfer_sync_write()
 
 ```python
-transfer_sync_write(target_hostname, buffer, peer_buffer_address, length, transport_hint="")
+transfer_sync_write(target_hostname, buffer, peer_buffer_address, length, transport_hint="", nic_hint="")
 ```
 
 Performs a synchronous write operation to transfer data from local buffer to remote buffer.
@@ -251,7 +258,7 @@ Performs a synchronous write operation to transfer data from local buffer to rem
 #### transfer_sync_read()
 
 ```python
-transfer_sync_read(target_hostname, buffer, peer_buffer_address, length, transport_hint="")
+transfer_sync_read(target_hostname, buffer, peer_buffer_address, length, transport_hint="", nic_hint="")
 ```
 
 Performs a synchronous read operation to transfer data from remote buffer to local buffer.
@@ -269,7 +276,7 @@ Performs a synchronous read operation to transfer data from remote buffer to loc
 #### transfer_sync()
 
 ```python
-transfer_sync(target_hostname, buffer, peer_buffer_address, length, opcode, notify=None, transport_hint="")
+transfer_sync(target_hostname, buffer, peer_buffer_address, length, opcode, notify=None, transport_hint="", nic_hint="")
 ```
 
 Performs a synchronous transfer operation with specified opcode and optional notification.
@@ -289,7 +296,7 @@ Performs a synchronous transfer operation with specified opcode and optional not
 #### transfer_submit_write()
 
 ```python
-transfer_submit_write(target_hostname, buffer, peer_buffer_address, length, transport_hint="")
+transfer_submit_write(target_hostname, buffer, peer_buffer_address, length, transport_hint="", nic_hint="")
 ```
 
 Submits an asynchronous write operation and returns immediately.
@@ -325,7 +332,7 @@ Checks the status of an asynchronous transfer operation.
 #### transfer_write_on_cuda()
 
 ```python
-transfer_write_on_cuda(target_hostname, buffer, peer_buffer_address, length, stream_ptr=0, transport_hint="")
+transfer_write_on_cuda(target_hostname, buffer, peer_buffer_address, length, stream_ptr=0, transport_hint="", nic_hint="")
 ```
 
 Performs a write operation to transfer data from local buffer to remote buffer on a given cuda stream.
@@ -350,7 +357,7 @@ Performs a write operation to transfer data from local buffer to remote buffer o
 #### transfer_read_on_cuda()
 
 ```python
-transfer_read_on_cuda(target_hostname, buffer, peer_buffer_address, length, stream_ptr=0, transport_hint="")
+transfer_read_on_cuda(target_hostname, buffer, peer_buffer_address, length, stream_ptr=0, transport_hint="", nic_hint="")
 ```
 
 Performs a read operation to transfer data from remote buffer to local buffer on a given cuda stream.
@@ -379,7 +386,7 @@ Performs a read operation to transfer data from remote buffer to local buffer on
 #### batch_transfer_sync_write()
 
 ```python
-batch_transfer_sync_write(target_hostname, buffers, peer_buffer_addresses, lengths, transport_hint="")
+batch_transfer_sync_write(target_hostname, buffers, peer_buffer_addresses, lengths, transport_hint="", nic_hint="")
 ```
 
 Performs a batch synchronous write operation to transfer multiple data chunks from local buffers to remote buffers.
@@ -397,7 +404,7 @@ Performs a batch synchronous write operation to transfer multiple data chunks fr
 #### batch_transfer_sync_read()
 
 ```python
-batch_transfer_sync_read(target_hostname, buffers, peer_buffer_addresses, lengths, transport_hint="")
+batch_transfer_sync_read(target_hostname, buffers, peer_buffer_addresses, lengths, transport_hint="", nic_hint="")
 ```
 
 Performs a batch synchronous read operation to transfer multiple data chunks from remote buffers to local buffers.
@@ -448,7 +455,7 @@ fragment must fit within both declared capacities.
 #### batch_transfer_sync()
 
 ```python
-batch_transfer_sync(target_hostname, buffers, peer_buffer_addresses, lengths, opcode, notify=None, transport_hint="")
+batch_transfer_sync(target_hostname, buffers, peer_buffer_addresses, lengths, opcode, notify=None, transport_hint="", nic_hint="")
 ```
 
 Performs a batch synchronous transfer operation with specified opcode and optional notification.
@@ -468,7 +475,7 @@ Performs a batch synchronous transfer operation with specified opcode and option
 #### batch_transfer_async_write()
 
 ```python
-batch_transfer_async_write(target_hostname, buffers, peer_buffer_addresses, lengths, transport_hint="")
+batch_transfer_async_write(target_hostname, buffers, peer_buffer_addresses, lengths, transport_hint="", nic_hint="")
 ```
 
 Submits a batch asynchronous write operation and returns immediately.
@@ -486,7 +493,7 @@ Submits a batch asynchronous write operation and returns immediately.
 #### batch_transfer_async_read()
 
 ```python
-batch_transfer_async_read(target_hostname, buffers, peer_buffer_addresses, lengths, transport_hint="")
+batch_transfer_async_read(target_hostname, buffers, peer_buffer_addresses, lengths, transport_hint="", nic_hint="")
 ```
 
 Submits a batch asynchronous read operation and returns immediately.
@@ -504,7 +511,7 @@ Submits a batch asynchronous read operation and returns immediately.
 #### batch_transfer_async()
 
 ```python
-batch_transfer_async(target_hostname, buffers, peer_buffer_addresses, lengths, opcode, transport_hint="")
+batch_transfer_async(target_hostname, buffers, peer_buffer_addresses, lengths, opcode, transport_hint="", nic_hint="")
 ```
 
 Submits a batch asynchronous transfer operation with specified opcode and returns immediately.
@@ -537,7 +544,7 @@ Waits for multiple batch asynchronous transfer operations to complete.
 #### batch_transfer_write_on_cuda()
 
 ```python
-batch_transfer_write_on_cuda(target_hostname, buffers, peer_buffer_addresses, lengths, stream_ptr=0, transport_hint="")
+batch_transfer_write_on_cuda(target_hostname, buffers, peer_buffer_addresses, lengths, stream_ptr=0, transport_hint="", nic_hint="")
 ```
 
 Performs a batch write operation to transfer multiple data chunks from local buffers to remote buffers on a given cuda stream.
@@ -562,7 +569,7 @@ Performs a batch write operation to transfer multiple data chunks from local buf
 #### batch_transfer_read_on_cuda()
 
 ```python
-batch_transfer_read_on_cuda(target_hostname, buffers, peer_buffer_addresses, lengths, stream_ptr=0, transport_hint="")
+batch_transfer_read_on_cuda(target_hostname, buffers, peer_buffer_addresses, lengths, stream_ptr=0, transport_hint="", nic_hint="")
 ```
 
 Performs a batch read operation to transfer multiple data chunks from remote buffers to local buffers on a given cuda stream.

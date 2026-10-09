@@ -148,6 +148,12 @@ class TransferEngine {
         return use_tent_ ? impl_tent_ : nullptr;
     }
 
+    // Configuration of the successfully initialized engine, for clients that
+    // reuse it without repeating the metadata connection string.
+    const std::string& getMetadataConnectionString() const {
+        return metadata_conn_string_;
+    }
+
     SegmentHandle openSegment(const std::string& segment_name);
 
     // Replace buffers with a snapshot of the segment's memory buffers.
@@ -355,6 +361,7 @@ class TransferEngine {
     // Classic callers provide this through TransferEngine(auto_discover,
     // filter) before init() creates the native TENT engine.
     std::vector<std::string> tent_device_filter_;
+    std::string metadata_conn_string_;
     bool use_tent_{false};
     friend class TransferEngineImplTestPeer;
 };

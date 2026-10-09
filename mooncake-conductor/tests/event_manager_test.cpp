@@ -6,8 +6,6 @@
 #include <asio.hpp>
 #include <json/json.h>
 #include <msgpack.hpp>
-#include <zmq.hpp>
-#include <zmq_addon.hpp>
 #include <ylt/coro_http/coro_http_client.hpp>
 #include <ylt/coro_http/coro_http_server.hpp>
 
@@ -28,6 +26,7 @@
 #include <thread>
 #include <vector>
 
+#include "conductor/zmq/transport.h"
 #include "conductor/common/types.h"
 #include "conductor/kvevent/config.h"
 #include "conductor/kvevent/event_manager.h"
@@ -35,6 +34,8 @@
 #include "event_manager_test_peer.h"
 #include "prefix_indexer_test_peer.h"
 #include "test_fixtures.h"
+
+namespace transport = mooncake::conductor::zmq::detail;
 
 namespace mooncake::conductor::kvevent {
 
@@ -2936,7 +2937,9 @@ TEST(ParseConfig, MissingFileReturnsEmptyList) {
     ConfigEnvGuard guard;
     guard.SetPath("/nonexistent/conductor_config.json");
     int port = 13333;
-    const auto services = mooncake::conductor::kvevent::ParseConfig(&port);
+    int rpc_port = 0;
+    const auto services =
+        mooncake::conductor::kvevent::ParseConfig(&port, &rpc_port);
     EXPECT_TRUE(services.empty());
     EXPECT_EQ(port, 13333);
 }
@@ -2987,7 +2990,8 @@ TEST(ParseConfig, LoadsProfilesAndSkipsInvalidEntries) {
     guard.SetPath(path);
 
     int port = 13333;
-    auto services = mooncake::conductor::kvevent::ParseConfig(&port);
+    int rpc_port = 0;
+    auto services = mooncake::conductor::kvevent::ParseConfig(&port, &rpc_port);
     EXPECT_EQ(port, 14444);
     ASSERT_EQ(services.size(), 2u);
     std::sort(services.begin(), services.end(),
@@ -3054,7 +3058,9 @@ TEST(ParseConfig, RejectsLegacyMissingMalformedAndUnknownProfiles) {
     guard.SetPath(path);
 
     int port = 13333;
-    const auto services = mooncake::conductor::kvevent::ParseConfig(&port);
+    int rpc_port = 0;
+    const auto services =
+        mooncake::conductor::kvevent::ParseConfig(&port, &rpc_port);
     ASSERT_EQ(services.size(), 1u);
     EXPECT_EQ(services[0].instance_id, "valid");
     EXPECT_EQ(services[0].hash_profile, TestProfile("00"));
@@ -3094,7 +3100,9 @@ TEST(ParseConfig, AcceptsPickleAlgorithmAndRejectsUnsupportedAlgorithms) {
     guard.SetPath(path);
 
     int port = 13333;
-    const auto services = mooncake::conductor::kvevent::ParseConfig(&port);
+    int rpc_port = 0;
+    const auto services =
+        mooncake::conductor::kvevent::ParseConfig(&port, &rpc_port);
     ASSERT_EQ(services.size(), 1u);
     EXPECT_EQ(services[0].instance_id, "pickle");
     // Static configuration and HTTP registration must resolve identical
@@ -3134,7 +3142,8 @@ TEST(ParseConfig, ExplicitInstanceIdSupportsMultipleStaticRanks) {
     guard.SetPath(path);
 
     int port = 13333;
-    auto services = mooncake::conductor::kvevent::ParseConfig(&port);
+    int rpc_port = 0;
+    auto services = mooncake::conductor::kvevent::ParseConfig(&port, &rpc_port);
     ASSERT_EQ(services.size(), 2u);
     std::sort(services.begin(), services.end(),
               [](const auto& left, const auto& right) {
@@ -3170,7 +3179,9 @@ TEST(ParseConfig, SglangSeedMayBeOmittedWithoutWeakeningVllm) {
     }
     guard.SetPath(path);
     int port = 0;
-    const auto services = mooncake::conductor::kvevent::ParseConfig(&port);
+    int rpc_port = 0;
+    const auto services =
+        mooncake::conductor::kvevent::ParseConfig(&port, &rpc_port);
     std::remove(path.c_str());
     ASSERT_EQ(services.size(), 2u);
     for (const auto& service : services) {
@@ -3188,7 +3199,8 @@ TEST(ParseConfig, MissingPortFieldZeroesPort) {
     }
     guard.SetPath(path);
     int port = 13333;
-    mooncake::conductor::kvevent::ParseConfig(&port);
+    int rpc_port = 0;
+    mooncake::conductor::kvevent::ParseConfig(&port, &rpc_port);
     EXPECT_EQ(port, 0);
     std::remove(path.c_str());
 }
@@ -3203,7 +3215,8 @@ TEST(ParseConfigDeathTest, MalformedJsonExits) {
     }
     guard.SetPath(path);
     int port = 0;
-    EXPECT_EXIT(mooncake::conductor::kvevent::ParseConfig(&port),
+    int rpc_port = 0;
+    EXPECT_EXIT(mooncake::conductor::kvevent::ParseConfig(&port, &rpc_port),
                 ::testing::ExitedWithCode(1), "");
     std::remove(path.c_str());
 }
@@ -3212,16 +3225,16 @@ TEST(ParseConfigDeathTest, MalformedJsonExits) {
 // This tests the event-to-query contract without starting an inference engine.
 class RealZmqPublisher {
    public:
-    RealZmqPublisher() : context_(1), pub_(context_, ::zmq::socket_type::xpub) {
-        pub_.set(::zmq::sockopt::linger, 0);
-        pub_.set(::zmq::sockopt::rcvtimeo, 5000);
+    RealZmqPublisher() : context_(1), pub_(context_, ZMQ_XPUB) {
+        pub_.set(ZMQ_LINGER, 0);
+        pub_.set(ZMQ_RCVTIMEO, 5000);
         pub_.bind("tcp://127.0.0.1:*");
     }
 
-    std::string Endpoint() { return pub_.get(::zmq::sockopt::last_endpoint); }
+    std::string Endpoint() { return pub_.Endpoint(); }
 
     bool WaitForSubscriber() {
-        ::zmq::message_t subscription;
+        transport::Message subscription;
         const auto size = pub_.recv(subscription);
         return size && *size > 0 &&
                static_cast<const unsigned char*>(subscription.data())[0] == 1;
@@ -3239,17 +3252,17 @@ class RealZmqPublisher {
             sequence_bytes[index] = static_cast<unsigned char>(sequence & 0xFF);
             sequence >>= 8;
         }
-        std::array<::zmq::const_buffer, 3> frames = {
-            ::zmq::buffer(std::string_view("")),
-            ::zmq::buffer(sequence_bytes, sizeof(sequence_bytes)),
-            ::zmq::buffer(payload),
+        std::array<std::string_view, 3> frames = {
+            transport::Buffer(std::string_view("")),
+            transport::Buffer(sequence_bytes, sizeof(sequence_bytes)),
+            transport::Buffer(payload),
         };
-        ::zmq::send_multipart(pub_, frames);
+        transport::SendMultipart(pub_, frames);
     }
 
    private:
-    ::zmq::context_t context_;
-    ::zmq::socket_t pub_;
+    transport::Context context_;
+    transport::Socket pub_;
     uint64_t sequence_ = 0;
 };
 
