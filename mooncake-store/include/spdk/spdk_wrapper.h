@@ -42,10 +42,13 @@ class SpdkWrapper {
      * @brief Poll completions of a NoF segment's io qpair.
      *
      * Completion callbacks run on the calling thread before this returns.
-     * When @p io_timed_out is not null it is set to whether SPDK reported,
-     * during this poll, an I/O of this qpair that exceeded
-     * MC_NOF_IO_TIMEOUT_MS since it was handed to the transport. Nothing has
-     * been aborted at that point; the caller decides.
+     * Only the designated owning worker may pass a non-null @p io_timed_out:
+     * it receives and acknowledges any pending timeout, including one reported
+     * during an earlier poll. A null output leaves the timeout pending.
+     * SPDK measures MC_NOF_IO_TIMEOUT_MS from transport submission. Nothing
+     * has been aborted at this point; the owner acts after this returns.
+     * Event acknowledgement does not serialize shared qpair operations or
+     * establish ownership across worker pools and direct probes.
      */
     int64_t NvmePollProcessCompletion(nof_seg_handle *seg,
                                       uint32_t complete_per_seg,

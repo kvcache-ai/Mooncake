@@ -579,8 +579,8 @@ inline void SpdkNofCompleteSubTask(SpdkNofSubTask* sub_task, bool failed) {
 /**
  * @brief Advance the stall state of a segment after it has been polled.
  *
- * @param io_timed_out whether SPDK reported an I/O timeout on the segment's
- *        qpair during that poll.
+ * @param io_timed_out whether the owning worker's poll delivered and
+ *        acknowledged a pending I/O timeout on the segment's qpair.
  * @return the action the worker must take. kAbort is returned once per stall;
  *         kDrained once every sub-I/O outstanding at that point has been
  *         reclaimed through its completion callback.

@@ -3,6 +3,7 @@
 #include <glog/logging.h>
 
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstring>
 #include <cstdlib>
@@ -20,6 +21,16 @@ namespace {
 bool ParseEnvU64(const char *name, uint64_t *out) {
     const char *val = std::getenv(name);
     if (!val || *val == '\0') {
+        return false;
+    }
+
+    const char *number = val;
+    while (std::isspace(static_cast<unsigned char>(*number))) {
+        ++number;
+    }
+    // strtoull accepts a minus sign and converts -1 to a large unsigned value.
+    if (*number == '-') {
+        LOG(WARNING) << "Invalid value for " << name << ": " << val;
         return false;
     }
 
@@ -111,8 +122,9 @@ struct nof_seg_handle {
     // Worker affinity is per pool; OpenNofSegment() caches handles across
     // pools and probes. Keep these flags atomic for those shared accesses;
     // qpair operations themselves still require serialization.
-    // Set by NofIoTimeoutCallback() while the qpair is being polled, read
-    // back by NvmePollProcessCompletion() on the same thread.
+    // Pending timeout set by NofIoTimeoutCallback(). Only the owning worker's
+    // non-null poll output acknowledges it; observer/probe polls leave it
+    // pending.
     std::atomic<bool> io_timed_out{false};
     // AbortNofSegmentIo() disconnected the qpair and nothing has reconnected
     // it since. A qpair disconnected this way still reports
@@ -356,15 +368,17 @@ void SpdkWrapper::RecycleProbeRequestContext(ProbeRequestContext *ctx) {
 int64_t SpdkWrapper::NvmePollProcessCompletion(nof_seg_handle *seg,
                                                uint32_t complete_per_seg,
                                                bool *io_timed_out) {
-    // Cleared before the poll so the flag only ever reflects this poll, even
-    // when an earlier caller did not ask for it.
-    seg->io_timed_out.store(false, std::memory_order_relaxed);
     tls_polling_seg = seg;
     int64_t ret =
         spdk_nvme_qpair_process_completions(seg->qpair, complete_per_seg);
     tls_polling_seg = nullptr;
     if (io_timed_out) {
-        *io_timed_out = seg->io_timed_out.load(std::memory_order_relaxed);
+        // Deliver and acknowledge pending timeout state, including a report
+        // from an earlier observer poll. An event after the exchange remains
+        // pending; no separate load/store may erase it. Only the owner
+        // consumes.
+        *io_timed_out =
+            seg->io_timed_out.exchange(false, std::memory_order_relaxed);
     }
     return ret;
 }
