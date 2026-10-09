@@ -360,7 +360,7 @@ With `ha_backend_type=etcd`, Mooncake Store supports a Primary-Standby HA model 
 ### HA Architecture
 
 ```
-+------------------+       etcd batch records        +---------------+
++------------------+     etcd batch records     +---------------+
 | Primary          | --------------------------> | Standby       |
 | OrderedOpLogWriter|     durable_prefix         | OpLogApplier  |
 | MasterService    |                              | MetadataStore |
