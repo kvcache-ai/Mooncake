@@ -360,7 +360,7 @@ With `ha_backend_type=etcd`, Mooncake Store supports a Primary-Standby HA model 
 ### HA Architecture
 
 ```
-+------------------+       etcd batches        +---------------+
++------------------+       etcd batch records        +---------------+
 | Primary          | --------------------------> | Standby       |
 | OrderedOpLogWriter|     durable_prefix         | OpLogApplier  |
 | MasterService    |                              | MetadataStore |
@@ -445,8 +445,6 @@ When the Primary fails, the Standby is promoted through the following steps:
 6. **Invalid Endpoint Filtering**: During restoration, any replica endpoints that correspond to segments no longer in the registry are automatically filtered out from `GetReplicaList` results.
 
 This fail-closed behavior is intentional. Older versions could log a restoration error and continue serving from empty or partially restored metadata. That behavior was a correctness bug, not a supported availability fallback: the serving state could disagree with the durable OpLog and poison later recovery attempts. Mooncake does not automatically discard snapshots, OpLog records, or metadata after a recovery error.
-
-These steps apply to etcd Primary-Standby deployments. Redis HA has no standby and does not promote from Redis state.
 
 ### Example: HA Deployment with etcd
 
@@ -766,7 +764,7 @@ mooncake_master \
 | `--ha_backend_connstring` | empty | HA backend connection string |
 | `--etcd_endpoints` | empty | Backward-compatible etcd HA endpoints, used only for `ha_backend_type=etcd` when `--ha_backend_connstring` is empty |
 | `--cluster_id` | `mooncake_cluster` | Cluster ID for HA persistence |
-| `--enable_oplog` | `false` | Enable the Primary OpLog writer and standby reader for etcd HA; requires `enable_ha=true`. Leave this off for the Redis HA backend, which has no standby |
+| `--enable_oplog` | `false` | Enable the batch OpLog writer and reader; requires `enable_ha=true` and `ha_backend_type=etcd` or `redis`. etcd uses it for Primary-Standby promotion. Redis uses it as an experimental HA log store: a successful write only means Redis accepted the record |
 | `--enable_oplog_snapshot` | `false` | Enable standby-generated batch OpLog snapshots; requires batch OpLog, HA/etcd, valid object-store configuration, and persistent local snapshot storage when applicable |
 | `--snapshot_chunk_object_count` | `1000000` | Maximum objects per batch OpLog snapshot chunk; must be positive when the new snapshot path is enabled |
 | `--oplog_poll_interval_ms` | `1000` | Base polling and retry delay for the batch standby, in milliseconds |
