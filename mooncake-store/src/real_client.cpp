@@ -4157,20 +4157,22 @@ tl::expected<void, ErrorCode> RealClient::register_buffer_internal(
     }
     // #3131: SPDK's RDMA transport keeps its own translation table, which TE
     // registration does not cover. Once TE registration succeeds, register
-    // with the initiator; on failure roll back the TE registration so no
-    // half-registered state is left behind.
+    // with the initiator too. Failure is non-fatal (same policy as the
+    // ShmHelper/shm paths): a buffer SPDK cannot translate (plain 4KB pages,
+    // device memory) can never serve NoF-over-RDMA I/O anyway, and failing
+    // the whole call would break the supported plain-page / pure-RDMA
+    // registration contract — including VRAM buffers that never touch NoF.
+    // The warning still surfaces at registration time, long before any NoF
+    // I/O could hit the missing translation.
     if (nof_runtime_.initiator) {
         auto rc = nof_runtime_.initiator->RegisterMemory(buffer, size);
         if (rc != ErrorCode::OK) {
-            LOG(ERROR) << "Initiator memory registration failed, rolling "
-                          "back TE registration: "
-                       << toString(rc);
-            auto rollback = client_->unregisterLocalMemory(buffer, true);
-            if (!rollback) {
-                LOG(ERROR) << "TE rollback failed for buffer " << buffer << ": "
-                           << toString(rollback.error());
-            }
-            return tl::unexpected(rc);
+            LOG(WARNING) << "NoF memory registration failed for buffer "
+                         << buffer << ", size " << size << ": " << toString(rc)
+                         << "; buffer stays registered with the transfer "
+                            "engine, but NoF I/O to it will fail. Use "
+                            "hugepage-backed memory for NoF, or set "
+                            "MC_NOF_BACKEND=none if NoF is not intended.";
         }
     }
     {

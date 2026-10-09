@@ -38,9 +38,6 @@
 #include "environ.h"
 #include "segment.h"
 #include "segment/region_driver.h"
-#ifdef USE_HTTP
-#include "transfer_metadata_plugin.h"
-#endif
 // nof_runtime.h is compiled unconditionally (returns a null initiator in
 // non-USE_NOF builds); MasterService::DefaultProbeNofSegment relies on that.
 #include "nof/nof_runtime.h"
@@ -72,8 +69,6 @@
 namespace mooncake {
 
 namespace {
-
-constexpr int kMaxTenantQuotaEvictionRetries = 2;
 
 // Upper bound on the number of keys MasterService::ClearStaleHandles cleans
 // up while holding one metadata shard's write lock. A mass client expiry

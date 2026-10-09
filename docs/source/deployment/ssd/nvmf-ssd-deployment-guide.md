@@ -291,7 +291,10 @@ extra_config:
   node (older versions build with a CMake warning and leave NoF-over-RDMA
   user-buffer I/O failing with "No translation" errors). Hugepage-backed,
   2MB-aligned buffers are expected; a non-aligned buffer is registered by
-  its containing 2MB pages and logs a `RegisterMemory` warning.
+  its containing 2MB pages and logs a `RegisterMemory` warning. A buffer
+  that cannot be registered at all (for example plain 4 KiB-page or device
+  memory) keeps working for non-NoF transfers: the failure is logged as a
+  warning instead of failing `register_buffer`.
 - The parameters in `extra_config` should use the same Mooncake master,
   metadata server, protocol, and RDMA device as the store service.
 
@@ -303,4 +306,6 @@ extra_config:
 | `MC_NOF_BACKEND` | NoF backend pair: `spdk` or `none`. `none` disables NoF at runtime in a `USE_NOF` build — one binary can be deployed on nodes without a working SPDK/hugepage environment. Case-insensitive; unrecognized values fall back to `spdk` with a warning. | `spdk` |
 | `MC_NOF_IOVA_MODE` | SPDK IOVA mode passed to `spdk_env_init`: `pa` or `va`. Set `va` inside containers without physical-address access (restricted `/proc/self/pagemap`), where the default PA mode fails with `Cannot use IOVA as 'PA'`. | unset (SPDK default, PA-preferred) |
 
-These three parameters together provide QoS control for SPDK NoF I/O.
+The `MC_NOF_WORKERS`, `MC_NOF_SUBMIT_CHUNK_BYTES` and
+`MC_NOF_INFLIGHT_BYTES_LIMIT` parameters together provide QoS control for SPDK
+NoF I/O.

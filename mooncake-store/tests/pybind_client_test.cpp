@@ -3174,6 +3174,9 @@ class RecordingNofInitiator : public NVMeoFInitiator {
     ErrorCode RegisterMemory(void* ptr, size_t size) override {
         std::lock_guard<std::mutex> lock(mu_);
         ++register_calls_;
+        if (register_result_ != ErrorCode::OK) {
+            return register_result_;
+        }
         registered_[ptr] = size;
         return ErrorCode::OK;
     }
@@ -3196,6 +3199,7 @@ class RecordingNofInitiator : public NVMeoFInitiator {
     mutable std::mutex mu_;
     int register_calls_ = 0;
     int unregister_calls_ = 0;
+    ErrorCode register_result_ = ErrorCode::OK;
     std::map<void*, size_t> registered_;
     std::vector<void*> unregistered_;
 };
@@ -3253,6 +3257,39 @@ TEST_F(RealClientTest, TearDownWithoutUnregisterReleasesNofRegistrations) {
 
     ASSERT_EQ(py_client_->tearDownAll(), 0);
     EXPECT_TRUE(initiator2->WasUnregistered(buffer.data()));
+}
+
+// Regression test: a failed NoF registration must NOT fail register_buffer
+// as a whole. A buffer the initiator cannot translate (plain 4 KiB pages,
+// device memory) can never serve NoF I/O anyway, but it remains fully usable
+// for RDMA/TCP transfers — hard-failing the call broke that supported
+// contract (e.g. plain-page buffers registered for pure RDMA).
+TEST_F(RealClientTest, RegisterBufferSucceedsWhenNofRegistrationFails) {
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
+    master_address_ = master_.master_address();
+
+    NofFactoryGuard guard;
+    auto initiator = std::make_shared<RecordingNofInitiator>();
+    initiator->register_result_ = ErrorCode::INTERNAL_ERROR;
+    RealClient::SetNofRuntimeFactoryForTesting([initiator]() {
+        return NofRuntime{initiator, std::make_shared<SystemDmaAllocator>()};
+    });
+
+    ASSERT_EQ(py_client_->setup_real("localhost:17933", "P2PHANDSHAKE",
+                                     16 * 1024 * 1024, 16 * 1024 * 1024, "tcp",
+                                     "", master_address_),
+              0);
+
+    std::vector<char> buffer(1 << 20);
+    // The NoF registration is attempted and fails, but the TE registration —
+    // and therefore register_buffer — succeeds.
+    ASSERT_EQ(py_client_->register_buffer(buffer.data(), buffer.size()), 0);
+    EXPECT_EQ(initiator->register_calls_, 1);
+
+    // unregister_buffer works; the NoF unregister is an idempotent no-op for
+    // a buffer the initiator never registered.
+    ASSERT_EQ(py_client_->unregister_buffer(buffer.data()), 0);
+    EXPECT_EQ(initiator->unregister_calls_, 1);
 }
 
 }  // namespace testing
