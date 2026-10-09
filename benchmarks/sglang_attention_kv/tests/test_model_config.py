@@ -19,7 +19,6 @@ DENSE_BODY = {
     "sliding_window": None,
     "use_sliding_window": False,
     "torch_dtype": "bfloat16",
-    "vocab_size": 151936,
 }
 
 
@@ -114,13 +113,6 @@ def test_kv_bytes_per_token_is_aggregate_and_per_rank(tmp_path):
     assert per_rank == aggregate // 4
 
 
-def test_kv_bytes_per_page_multiplies_the_page_size(tmp_path):
-    config = load_model_kv_config(write_config(tmp_path, body_with()))
-    aggregate, per_rank = config.kv_bytes_per_page(64, 4)
-    assert aggregate == 36 * 2 * 8 * 128 * 2 * 64
-    assert per_rank == aggregate // 4
-
-
 def test_an_indivisible_tensor_parallel_size_is_refused(tmp_path):
     config = load_model_kv_config(write_config(tmp_path, body_with()))
     with pytest.raises(ValueError, match="is not divisible by tp_size=64"):
@@ -136,12 +128,10 @@ def test_head_dim_is_derived_when_the_config_omits_it(tmp_path):
 
 
 def test_a_nested_language_config_is_used(tmp_path):
-    nested = {key: value for key, value in DENSE_BODY.items() if key != "vocab_size"}
-    nested["vocab_size"] = 151936
+    nested = dict(DENSE_BODY)
     body = {
         "architectures": ["SomeMultiModalForConditionalGeneration"],
         "text_config": nested,
-        "vocab_size": 151936,
     }
     config = load_model_kv_config(write_config(tmp_path, body))
     assert config.num_layers == 36

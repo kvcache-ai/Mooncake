@@ -395,7 +395,6 @@ def test_a_case_measures_the_device_it_was_given(monkeypatch):
     # A window that belonged to an idle device would hold no work at all.
     assert loop > 0.1, f"layer_loop={loop} looks like an idle device's timeline"
     assert window >= loop
-    assert measured["per_layer_p50_ms"]["layer_loop"] > 0
 
 
 def test_the_checks_read_the_state_the_timed_loop_left(monkeypatch):
@@ -547,6 +546,48 @@ def test_prefill_writes_kv_but_reads_no_paged_stream():
     assert indices.paged_indices is None
     assert step.check_indices(indices)["passed"]
     assert step.check_history(indices)["passed"]
+
+
+@pytest.mark.parametrize("page_size", [1, 64])
+@pytest.mark.parametrize("layout", ["contiguous", "random"])
+def test_paged_prefill_reads_written_kv_causally(page_size, layout, monkeypatch):
+    case = step_case(
+        "prefill", (0, 0, 0), (128, 73, 19), page_size=page_size, layout=layout
+    )
+    step, indices = prepared(case, extend_branch=BRANCH_PAGED_EXTEND)
+    assert step.branch == BRANCH_PAGED_EXTEND
+    assert not step.reads_before_write
+    assert indices.paged_indices.numel() == case.new_tokens
+    assert step.read_bytes() == {
+        "paged": case.kv_bytes(case.new_tokens),
+        "ragged": 0,
+        "attention": case.kv_bytes(case.new_tokens),
+    }
+
+    order = []
+    original_write, original_read = step.write_layer, step.run_layer
+
+    def write(layer_id, indexed):
+        order.append(("write", layer_id))
+        return original_write(layer_id, indexed)
+
+    def read(layer_id, query):
+        order.append(("read", layer_id))
+        return original_read(layer_id, query)
+
+    monkeypatch.setattr(step, "write_layer", write)
+    monkeypatch.setattr(step, "run_layer", read)
+    query = step.make_query()
+    timed_indices, _ = one_iteration(step, query)
+    assert order == [
+        (operation, layer_id)
+        for layer_id in range(case.num_layers)
+        for operation in ("write", "read")
+    ]
+    assert step.check_indices(timed_indices)["passed"]
+    assert step.check_history(timed_indices)["passed"]
+    assert step.check_attention(query)["passed"]
+    assert not step.unmasked_reference(query)["passed"]
 
 
 def test_the_arith_reference_runs_on_the_short_case():

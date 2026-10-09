@@ -8,6 +8,10 @@ paths of the manifest replaced by placeholders. They bound the example figures i
 that machine and those versions; they are not a precondition of the benchmark, and a run elsewhere
 reports its own CSV and manifest.
 
+Both published manifests record the benchmark commit as `unknown`. These are historical examples
+whose exact source revision cannot be established from the artifacts. A new run from a copied checkout
+should pass its actual `--git-commit`; these figures do not validate later changes to the replay.
+
 ## The machine
 
 | Item | Value during this run |
@@ -82,9 +86,9 @@ page capacity of 304.3 MB covers the 302.0 MB of valid tokens plus one page of p
 | decode at 2049 | 0.078 | 0.229 | 3.378 | 3.684 | 3.736 | 1.179 | 1.669 | 1.142 | 66.1 | 45.3 | 0.2 | 4 |
 | decode at 8193 | 0.077 | 0.228 | 3.378 | 3.683 | 3.736 | 1.179 | 1.668 | 1.166 | 259.1 | 181.1 | 0.7 | 4 |
 
-The `indices` window is 0.014 to 0.078 ms on these rows: the metadata buffers are held from the case
-and the window is SGLang's kernel filling the CSR stream, which is what a server's index stage does on
-a warmed step.
+The `indices` window is 0.014 to 0.078 ms on these rows. Offsets are computed during setup; paged
+branches refill the CSR stream, while no-prefix ragged prefills launch no index kernel in this window.
+These values exclude the server's per-step offset updates.
 
 ## The long-context run, page size 64, random layout, one sequence
 

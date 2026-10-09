@@ -105,6 +105,15 @@ def resolve_extend_branch(cli_choice):
     return from_env
 
 
+def branch_for_mode(mode, extend_branch):
+    """Select the wrapper path for the configured prefill/extend lane."""
+    if mode == "prefill" and extend_branch != BRANCH_PAGED_EXTEND:
+        return BRANCH_RAGGED_NO_PREFIX
+    if mode == "decode":
+        return BRANCH_PAGED_DECODE
+    return extend_branch
+
+
 # Load scale for the --full matrix; longer sequences are added with --input-lens
 BASE_INPUT_LENS = (128, 512, 2048, 8192)
 

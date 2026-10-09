@@ -17,14 +17,12 @@ REQUIRED = {
         "alloc",
         "alloc_extend",
         "alloc_decode",
-        "free",
         # The random layout hands the pool's spare pages back through this, and it
         # is the one call a paged allocator has and a token allocator spells the
         # same way, so a version without it fails every random case.
         "free_page_ids",
-        "clear",
     ),
-    "TokenToKVPoolAllocator": ("alloc", "free", "free_page_ids", "clear"),
+    "TokenToKVPoolAllocator": ("alloc", "free_page_ids"),
 }
 
 
@@ -42,8 +40,6 @@ def test_the_pool_has_the_constructor_and_writer_the_replay_calls():
     for method in (
         "set_kv_buffer",
         "get_kv_buffer",
-        "get_key_buffer",
-        "get_value_buffer",
     ):
         assert hasattr(pool, method), f"MHATokenToKVPool is missing {method}"
     parameters = inspect.signature(pool.__init__).parameters
@@ -61,8 +57,7 @@ def test_the_pool_has_the_constructor_and_writer_the_replay_calls():
 def test_the_token_table_has_the_columns_the_replay_writes():
     pool = getattr(memory_pool, "ReqToTokenPool", None)
     assert pool is not None, "sglang.srt.mem_cache.memory_pool has no ReqToTokenPool"
-    for method in ("write", "free"):
-        assert hasattr(pool, method), f"ReqToTokenPool is missing {method}"
+    assert hasattr(pool, "write"), "ReqToTokenPool is missing write"
 
 
 def test_the_index_kernel_is_importable():

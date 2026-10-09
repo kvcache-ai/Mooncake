@@ -12,17 +12,16 @@
 #   - the index mapping is create_flashinfer_kv_indices_triton, the kernel
 #     KVIndexTranslator.fill_packed_read_stream launches to turn the token table
 #     into the CSR stream FlashInfer reads;
-#   - the read is what FlashInferAttnBackend.forward_extend / forward_decode do,
-#     in the same order and with the same arguments.
+#   - the read calls the FlashInfer wrappers used by FlashInferAttnBackend.
 #
 # The branches come from that backend. SGLANG_FLASHINFER_USE_PAGED defaults to
 # False, so use_ragged is True and a paged prefill wrapper is not the path an
 # extend step takes: the new tokens go through the ragged wrapper, the cached
 # history through the paged wrapper, the two states are merged, and the KV cache
-# is written *after* the attention. A prefill with no cached history is one
-# ragged forward, and decode is the paged decode wrapper. A server with
-# SGLANG_FLASHINFER_USE_PAGED=1 replaces the extend branch with a single paged
-# prefill call, which --extend-branch can measure as well.
+# is written *after* the attention. A prefill with no cached history defaults to
+# one ragged forward, and decode is the paged decode wrapper.
+# SGLANG_FLASHINFER_USE_PAGED=1 selects one paged call for both prefill and extend;
+# --extend-branch selects the same lane when the environment variable is unset.
 
 from dataclasses import dataclass
 
@@ -43,11 +42,11 @@ from sglang.srt.mem_cache.memory_pool import (
 
 from .cases import (
     BRANCH_DETAIL,
-    BRANCH_PAGED_DECODE,
     BRANCH_PAGED_EXTEND,
     BRANCH_RAGGED_NO_PREFIX,
     BRANCH_RAGGED_PREFIX_MERGE,
     BRANCHES_THAT_WRITE_FIRST,
+    branch_for_mode,
     use_paged_default,
 )
 
@@ -119,7 +118,7 @@ class SglangStep:
         self.device = device
         self.seed = seed
         self.dtype = getattr(torch, case.dtype)
-        self.branch = self._branch_for(case.mode, extend_branch)
+        self.branch = branch_for_mode(case.mode, extend_branch)
         self.branch_detail = BRANCH_DETAIL[self.branch]
         self.reads_before_write = self.branch not in BRANCHES_THAT_WRITE_FIRST
         self.layers = [
@@ -129,9 +128,6 @@ class SglangStep:
         self.prefix_lens = torch.tensor(
             list(case.prefix_lens), dtype=torch.int32, device=device
         )
-        self.new_lens = torch.tensor(
-            list(case.new_lens), dtype=torch.int32, device=device
-        )
         self.context_lens = torch.tensor(
             list(case.context_lens), dtype=torch.int32, device=device
         )
@@ -139,14 +135,6 @@ class SglangStep:
             1, case.batch_size + 1, dtype=torch.int32, device=device
         )
         self.workspace = torch.empty(WORKSPACE_BYTES, dtype=torch.uint8, device=device)
-
-    @staticmethod
-    def _branch_for(mode, extend_branch):
-        if mode == "prefill":
-            return BRANCH_RAGGED_NO_PREFIX
-        if mode == "extend":
-            return extend_branch
-        return BRANCH_PAGED_DECODE
 
     # ---------------------------------------------------------------- setup
 
@@ -233,18 +221,14 @@ class SglangStep:
             return
         generator = torch.Generator(device="cpu")
         generator.manual_seed(self.seed)
-        self._held_pages = self.allocator.alloc(
-            self.num_pages_allocated * self.case.page_size
-        )
+        self.allocator.alloc(self.num_pages_allocated * self.case.page_size)
         # Page 0 is reserved and is never handed out, so the draw starts at 1.
         available = torch.arange(
             1, self.num_pages_allocated, dtype=torch.int64, device=self.device
         )
         order = torch.randperm(available.numel(), generator=generator).to(self.device)
         shuffled = available[order]
-        self.free_pages = shuffled[: self.pages_needed]
-        spare = shuffled[self.pages_needed :]
-        self.allocator.free_page_ids(torch.cat([self.free_pages, spare]))
+        self.allocator.free_page_ids(shuffled)
 
     def _allocate_slots(self):
         """The history slots of every sequence, page aligned, through the
@@ -418,12 +402,11 @@ class SglangStep:
         return sum(self._history_lens())
 
     def _prepare_index_buffers(self):
-        """The index metadata, allocated once per case the way the backend allocates
-        it: `FlashInferAttnBackend` holds its `qo_indptr`, `paged_kv_indptr`,
-        `paged_kv_indices` and `paged_kv_last_page_len` buffers and fills them in
-        place every step, so a step's index stage is the fill and not the
-        allocation. Every length here comes from the case, so the buffers are sized
-        once, and nothing in them changes between the step's iterations.
+        """Allocate the fixed case's metadata and compute its offsets once.
+
+        Timed iterations refill only the CSR slot stream. The server also updates
+        query and KV offsets as batches change, which this fixed-shape replay
+        excludes from its measured windows.
         """
         case = self.case
         self.qo_indptr = torch.zeros(
@@ -453,13 +436,10 @@ class SglangStep:
         )
 
     def build_indices(self):
-        """SGLang's index stage: the query offsets and the CSR stream of the
-        tokens the paged side reads.
+        """Fill the fixed case's CSR slot stream through SGLang's index kernel.
 
-        Every length is known before the step runs, so the buffers are held from
-        the case and the stream is filled in place by SGLang's kernel with no host
-        synchronisation inside the timed window. What the window covers is that
-        fill, which is what a server's index stage does on a warmed step.
+        Query and KV offsets are computed during setup. A no-prefix ragged
+        prefill returns that metadata without launching an index kernel.
         """
         case = self.case
         indices = StepIndices(qo_indptr=self.qo_indptr, out_cache_loc=self.step_slots)

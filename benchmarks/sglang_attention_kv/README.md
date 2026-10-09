@@ -1,9 +1,8 @@
 # Attention step to KV cache access benchmark
 
-This benchmark measures what one attention step spends on the paged KV cache, split into the stages
-the step runs in the order it runs them. Every call in it belongs to SGLang: the request to token
-table, the allocator, the KV writer, the index kernel and the FlashInfer paged attention wrappers are
-the ones a server uses, so the numbers describe SGLang's own access path and not a stand-in for it.
+This benchmark replays attention and KV writes for fixed synthetic batches using SGLang's request to
+token table, allocator, KV writer, index kernel and FlashInfer wrappers. It reports timing windows for
+this replay; metadata preparation and planning differ from a running SGLang server.
 
 The numbers from one validation run are in [`RESULTS.md`](RESULTS.md); this document is the method, the
 matrix, the command line and the boundaries.
@@ -14,16 +13,16 @@ The step itself is three windows, in the order a forward pass runs them:
 
 | Window | What it covers | SGLang call it replays |
 |---|---|---|
-| `indices` | the query offsets and the CSR stream of KV slots the paged side reads | `create_flashinfer_kv_indices_triton`, the kernel `KVIndexTranslator.fill_packed_read_stream` launches (`sglang/kernels/ops/kvcache/kv_indices.py`) |
-| `attention_plan` | the backend compiling the CSR stream into a kernel schedule | the wrappers' `plan`, as `FlashInferAttnBackend` calls it in `init_forward_metadata` |
+| `indices` | refill the CSR stream of KV slots for paged branches; no index kernel runs for a no-prefix ragged prefill | `create_flashinfer_kv_indices_triton`, the kernel `KVIndexTranslator.fill_packed_read_stream` launches (`sglang/kernels/ops/kvcache/kv_indices.py`) |
+| `attention_plan` | direct FlashInfer wrapper planning for the fixed batch | the wrappers' `plan` |
 | `layer_loop` | the per-layer loop: one layer's attention and one layer's KV write, layer by layer, in the order the branch runs them | the wrappers' `forward` / `forward_return_lse` / `merge_state` and `MHATokenToKVPool.set_kv_buffer` (`sglang/srt/layers/attention/flashinfer_backend.py`) |
 | `phase_sum` | the three windows added up | — |
 | `step_window` | one window over the whole step, from the first index call to the last layer | — |
 
-The index metadata is held rather than allocated per step: `qo_indptr`, `paged_kv_indptr`,
-`paged_kv_indices` and `paged_kv_last_page_len` are sized once from the case, the way the backend holds
-its own buffers and fills them in place, so the `indices` window covers the fill by SGLang's kernel and
-not an allocation this benchmark makes on every iteration.
+The index buffers are allocated once per case. Query and KV offsets are computed during setup, and
+each timed iteration refills only the CSR slot stream. SGLang also updates offsets for changing batches
+and its paged wrapper planning uses `non_blocking=True`; this replay calls `plan` with its default copy
+behavior. The windows therefore exclude some server metadata work and use a different planning path.
 
 `step_window` is the step as one span and `phase_sum` is the sum of its parts. A reader comparing them
 sees the between-window interval: what the three windows do not cover. The measurement does not say
@@ -50,10 +49,8 @@ own indices before those passes rather than inside them. Their ratio to `phase_s
 ratio rather than as a share of the step, because the step interleaves the two per layer and a
 component window can read above the window it belongs to.
 
-The structures the step is built on are SGLang's throughout: `ReqToTokenPool` for the request to token
-table, `PagedTokenToKVPoolAllocator` for the slots (`alloc`, `alloc_extend` or `alloc_decode`,
-depending on the step), `MHATokenToKVPool` for the buffers, and a workspace buffer sized like the one
-`FlashInferAttnBackend` builds its wrappers with.
+The step uses `ReqToTokenPool` for the token table, `TokenToKVPoolAllocator` at page size 1 or
+`PagedTokenToKVPoolAllocator` above it, and `MHATokenToKVPool` for the KV buffers.
 
 ## 2. The modes and the branches
 
@@ -63,6 +60,7 @@ mode says which of those the step is, and each mode replays one branch of `Flash
 | Mode | History | Queries | Branch | What runs per layer |
 |---|---|---|---|---|
 | `prefill` | none | the whole sequence | `ragged_no_prefix` | one ragged prefill call over the step's own K/V, then the KV write |
+| `prefill` | none | the whole sequence | `paged_extend` (paged lane) | the KV write, then one causal paged prefill call over those slots |
 | `extend` | cached | one chunk (`--chunk-lens`) | `ragged_prefix_merge` (default) | ragged suffix attention, paged history attention, `merge_state`, then the KV write |
 | `extend` | cached | one chunk | `paged_extend` (`--extend-branch paged_extend`) | the KV write, then one paged prefill call over the whole context |
 | `decode` | cached | one token | `paged_decode` | the KV write, then the paged decode call over the whole context |
@@ -73,7 +71,10 @@ the new tokens are attended to through the ragged wrapper, the cached history th
 and the two are combined with `merge_state`. `paged_extend` is the single call that variable selects
 instead when it is set.
 
-That variable is the one place that decides the extend branch. With it set, a run takes the branch it
+The paged lane also applies to prefill with no cached history. It reads all new tokens through the KV
+pool after writing them; the default ragged lane reads their K/V tensors before the KV write.
+
+That variable decides the prefill/extend lane. With it set, a run takes the branch it
 selects; with it unset, `--extend-branch` decides and defaults to `ragged_prefix_merge`. Passing the
 other branch while the variable is set fails the run rather than overriding it, and every record states
 the branch, the order it ran in, and the value of the variable, so a row says which server
@@ -134,7 +135,7 @@ attention layout from the config and prints the field it decided on:
 |---|---|---|
 | `dense` | none of the fields below | measured |
 | `mla` | `kv_lora_rank`, `qk_rope_head_dim` | refused: MLA compresses K and V into one latent vector, so the per-token formula above does not describe its layout |
-| `hybrid` | `layer_types` with an entry that is not a full-attention layer, `sliding_window` without `use_sliding_window: false`, `full_attention_interval` above 1, `attention_types`, `sliding_window_pattern`, `linear_attn_config`, `mamba_d_state`, `hybrid_override_pattern`, or `is_encoder_decoder` | refused: sliding-window and linear layers keep less than a full-length KV, and an encoder-decoder model reads a second cache, so one per-token count would describe none of them |
+| `hybrid` | `layer_types` with an entry that is not a full-attention layer, `sliding_window` without `use_sliding_window: false`, `full_attention_interval` above 1, `attention_types`, `sliding_window_pattern`, `linear_attn_config`, `linear_attention_config`, `mamba_d_state`, `hybrid_override_pattern`, `full_attn_idxs`, `layers_block_type`, `attention_chunk_size`, or `is_encoder_decoder` | refused: these configurations require attention or cache layouts outside this benchmark |
 
 The dtype of the measurement comes from the model config rather than being hardcoded; a model that
 declares a precision the paged attention kernels cannot run fails while the cases are built.
@@ -217,7 +218,7 @@ Main arguments:
 | `--modes` | which steps to measure: `prefill`, `extend`, `decode` |
 | `--input-lens` | history lengths: a prefill step computes this many tokens, an extend or decode step caches this many |
 | `--chunk-lens` | query lengths of an extend step, one step per entry, over the history lengths of `--input-lens` |
-| `--extend-branch` | which extend branch to replay: `ragged_prefix_merge`, the default a server runs, or `paged_extend`. It decides the branch only when `SGLANG_FLASHINFER_USE_PAGED` is unset; with the variable set that variable decides, and passing a different branch fails the run |
+| `--extend-branch` | the prefill/extend lane: `ragged_prefix_merge` defaults to ragged prefill and merged extend; `paged_extend` uses paged attention for both. It selects the lane when `SGLANG_FLASHINFER_USE_PAGED` is unset; a conflicting choice fails when the variable is set |
 | `--batch-sizes` | sequences per step; a batch above one is measured with equal lengths and with ragged lengths |
 | `--page-sizes` | tokens per page of the pool |
 | `--layouts` | `contiguous`, or `random` for a pool that has churned |

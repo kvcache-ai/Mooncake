@@ -3,8 +3,13 @@ import json
 import pytest
 
 from benchmarks.sglang_attention_kv.cases import (
+    BRANCH_PAGED_DECODE,
+    BRANCH_PAGED_EXTEND,
+    BRANCH_RAGGED_NO_PREFIX,
+    BRANCH_RAGGED_PREFIX_MERGE,
     KernelCase,
     StepShape,
+    branch_for_mode,
     build_cases,
     build_shapes,
     ragged_lengths,
@@ -24,7 +29,6 @@ QWEN3_LIKE = {
     "sliding_window": None,
     "use_sliding_window": False,
     "torch_dtype": "bfloat16",
-    "vocab_size": 151936,
 }
 
 
@@ -285,6 +289,33 @@ def test_the_extend_branch_has_one_source(monkeypatch):
     with pytest.raises(ValueError, match="unknown extend branch"):
         monkeypatch.delenv("SGLANG_FLASHINFER_USE_PAGED", raising=False)
         resolve_extend_branch("paged_whatever")
+
+
+@pytest.mark.parametrize(
+    "mode,lane,expected",
+    [
+        ("prefill", BRANCH_RAGGED_PREFIX_MERGE, BRANCH_RAGGED_NO_PREFIX),
+        ("prefill", BRANCH_PAGED_EXTEND, BRANCH_PAGED_EXTEND),
+        ("extend", BRANCH_RAGGED_PREFIX_MERGE, BRANCH_RAGGED_PREFIX_MERGE),
+        ("extend", BRANCH_PAGED_EXTEND, BRANCH_PAGED_EXTEND),
+        ("decode", BRANCH_RAGGED_PREFIX_MERGE, BRANCH_PAGED_DECODE),
+        ("decode", BRANCH_PAGED_EXTEND, BRANCH_PAGED_DECODE),
+    ],
+)
+def test_the_prefill_and_extend_lane_selects_each_modes_wrapper(mode, lane, expected):
+    assert branch_for_mode(mode, lane) == expected
+
+
+def test_paged_environment_also_selects_paged_prefill(monkeypatch):
+    monkeypatch.setenv("SGLANG_FLASHINFER_USE_PAGED", "1")
+    assert (
+        branch_for_mode("prefill", resolve_extend_branch(None)) == BRANCH_PAGED_EXTEND
+    )
+    monkeypatch.setenv("SGLANG_FLASHINFER_USE_PAGED", "0")
+    assert (
+        branch_for_mode("prefill", resolve_extend_branch(None))
+        == BRANCH_RAGGED_NO_PREFIX
+    )
 
 
 def test_the_reference_case_scales_every_length_by_one_factor():

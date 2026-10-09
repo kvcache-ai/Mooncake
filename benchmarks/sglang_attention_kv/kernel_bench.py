@@ -10,7 +10,7 @@ import zlib
 
 import torch
 
-from .cases import DEFAULT_TIMED, DEFAULT_WARMUP
+from .cases import BRANCH_RAGGED_PREFIX_MERGE, DEFAULT_TIMED, DEFAULT_WARMUP
 from .stats import summarize
 
 # The step, in the order one forward pass runs it. The index mapping is the stage
@@ -31,9 +31,6 @@ MEASURED_PHASES = STEP_PHASES + DIAGNOSTIC_PHASES
 # windows above. step_window minus phase_sum is the between-window interval, which
 # the three windows do not cover; the measurement does not say what it holds.
 PHASES = MEASURED_PHASES + ("step_window", "phase_sum")
-
-# What the derived ratios divide by, and what phase_sum adds up.
-TOTAL_PHASES = STEP_PHASES
 
 
 def _case_seed(case, seed):
@@ -101,7 +98,7 @@ def one_iteration(step, query):
         "layer_loop": loop_events[0].elapsed_time(loop_events[1]),
         "step_window": step_events[0].elapsed_time(step_events[1]),
     }
-    measured["phase_sum"] = sum(measured[name] for name in TOTAL_PHASES)
+    measured["phase_sum"] = sum(measured[name] for name in STEP_PHASES)
     return indices, measured
 
 
@@ -155,8 +152,10 @@ def run_case(
     slots or read through a stale page table fails on its own iteration and not on
     a state the diagnostics rebuilt.
     """
-    from .sglang_replay import BRANCH_RAGGED_PREFIX_MERGE, SglangStep
+    from .sglang_replay import SglangStep
 
+    if timed <= 0 or warmup < 0:
+        raise ValueError("a case needs timed > 0 and warmup >= 0")
     if extend_branch is None:
         extend_branch = BRANCH_RAGGED_PREFIX_MERGE
     with torch.cuda.device(device):
@@ -178,11 +177,6 @@ def run_case(
             timed_indices, measured = one_iteration(step, query)
             for name in STEP_PHASES + ("step_window", "phase_sum"):
                 samples[name].append(measured[name])
-        if timed_indices is None:
-            # No timed iteration to check against, so the checks read a state built
-            # for them; every run that measures anything has at least one.
-            timed_indices = step.build_indices()
-
         correctness = {
             "indices": step.check_indices(timed_indices),
             "history": step.check_history(timed_indices),
@@ -218,10 +212,6 @@ def run_case(
             "kv_cache_bytes_per_rank": step.kv_cache_bytes_per_rank,
             "num_pages_allocated": step.num_pages_allocated,
             "phases": {name: summarize(samples[name]) for name in PHASES},
-            "per_layer_p50_ms": {
-                name: summarize(samples[name])["p50"] / case.num_layers
-                for name in STEP_PHASES + ("step_window",)
-            },
         }
         gather_bytes = step.gather_bytes(probe_indices)
         result["gather_bytes"] = gather_bytes

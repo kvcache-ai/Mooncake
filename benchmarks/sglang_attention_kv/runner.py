@@ -119,10 +119,11 @@ def build_parser():
         default=None,
         choices=list(BRANCH_CHOICES),
         help=(
-            "which branch of FlashInferAttnBackend the extend steps replay: "
+            "the FlashInferAttnBackend lane for prefill and extend: "
             "ragged_prefix_merge is what a server runs while "
             "SGLANG_FLASHINFER_USE_PAGED is False (the default), paged_extend is "
-            "the single paged prefill call it runs with that variable set"
+            "the single paged call it runs with that variable set, including "
+            "prefill without a cached history"
         ),
     )
     parser.add_argument("--seed", type=int, default=42, help="random seed")
@@ -210,7 +211,6 @@ def run_steps(plan, device, jsonl_path, warmup, timed, errors, seed, extend_bran
     from .kernel_bench import run_case
 
     print(f"[steps] {len(plan.cases)} steps")
-    results = []
     # Truncate: a rerun into the same result directory must not leave a reader
     # with the records of two runs in one file.
     with open(jsonl_path, "w", encoding="utf-8") as handle:
@@ -231,11 +231,9 @@ def run_steps(plan, device, jsonl_path, warmup, timed, errors, seed, extend_bran
             )
             handle.write(json.dumps(record, default=str) + "\n")
             handle.flush()
-            results.append(record)
             for name, check in record["correctness"].items():
                 if not check["passed"]:
                     errors.append(f"{case.label} {name} check failed")
-    return results
 
 
 def main(argv=None):
@@ -262,7 +260,7 @@ def main(argv=None):
     if args.dry_run:
         print(plan.describe())
         print(
-            f"extend steps would replay {extend_branch}; "
+            f"prefill/extend lane: {extend_branch}; "
             f"SGLANG_FLASHINFER_USE_PAGED={use_paged_default()} in this process"
         )
         print()
@@ -310,7 +308,7 @@ def main(argv=None):
         errors.append(f"timed iterations below {MINIMUM_TIMED}")
 
     print(
-        f"[setup] extend steps replay {extend_branch}; "
+        f"[setup] prefill/extend lane: {extend_branch}; "
         f"SGLANG_FLASHINFER_USE_PAGED={use_paged_default()} in this process"
     )
 

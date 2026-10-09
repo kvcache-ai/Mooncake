@@ -128,10 +128,8 @@ class ModelKVConfig:
     num_key_value_heads: int
     head_dim: int
     hidden_size: int
-    vocab_size: int
     torch_dtype: str
     dtype_bytes: int
-    is_mla: bool
     attention_layout: str
     attention_layout_evidence: str
     config_source: str
@@ -160,10 +158,6 @@ class ModelKVConfig:
         )
         return aggregate, aggregate // tp_size
 
-    def kv_bytes_per_page(self, page_size: int, tp_size: int = 1) -> tuple:
-        aggregate, per_rank = self.kv_bytes_per_token(tp_size)
-        return aggregate * page_size, per_rank * page_size
-
     def as_dict(self) -> dict:
         return {
             "model_path": self.model_path,
@@ -174,10 +168,8 @@ class ModelKVConfig:
             "num_key_value_heads": self.num_key_value_heads,
             "head_dim": self.head_dim,
             "hidden_size": self.hidden_size,
-            "vocab_size": self.vocab_size,
             "torch_dtype": self.torch_dtype,
             "dtype_bytes": self.dtype_bytes,
-            "is_mla": self.is_mla,
             "attention_layout": self.attention_layout,
             "attention_layout_evidence": self.attention_layout_evidence,
             "config_source": self.config_source,
@@ -198,11 +190,7 @@ def _pick_config_dict(raw: dict, source: str) -> tuple:
 
 def load_config_document(model_path):
     """Read config.json and locate the layer that holds the language model
-    parameters.
-
-    load_model_kv_config and the vocabulary read share this entry point so the
-    two cannot disagree about nested configs.
-    """
+    parameters."""
     path = Path(model_path)
     config_file = path / "config.json" if path.is_dir() else path
     if not config_file.is_file():
@@ -221,9 +209,8 @@ def _dtype_from_config(raw: dict) -> str:
     raise ValueError("config.json has no torch_dtype/dtype field")
 
 
-def load_model_kv_config(model_path, dtype_override=None) -> ModelKVConfig:
-    """Read config.json and resolve the KV cache shape. dtype_override replaces
-    the declared precision, for instance when the server stores KV as fp8."""
+def load_model_kv_config(model_path) -> ModelKVConfig:
+    """Read config.json and resolve the KV cache shape and declared dtype."""
     path, body, source = load_config_document(model_path)
 
     num_layers = int(body["num_hidden_layers"])
@@ -243,8 +230,7 @@ def load_model_kv_config(model_path, dtype_override=None) -> ModelKVConfig:
 
     attention_layout, attention_layout_evidence = classify_attention_layout(body)
 
-    declared_dtype = str(dtype_override or _dtype_from_config(body))
-    torch_dtype = canonical_torch_dtype(declared_dtype)
+    torch_dtype = canonical_torch_dtype(_dtype_from_config(body))
 
     return ModelKVConfig(
         model_path=str(path),
@@ -255,20 +241,9 @@ def load_model_kv_config(model_path, dtype_override=None) -> ModelKVConfig:
         num_key_value_heads=num_key_value_heads,
         head_dim=head_dim,
         hidden_size=hidden_size,
-        vocab_size=read_vocab_size(model_path, body),
         torch_dtype=torch_dtype,
         dtype_bytes=DTYPE_BYTES[torch_dtype],
-        is_mla=attention_layout == "mla",
         attention_layout=attention_layout,
         attention_layout_evidence=attention_layout_evidence,
         config_source=f"{source} [{head_dim_source}]",
     )
-
-
-def read_vocab_size(model_path, body=None):
-    """Vocabulary size, through the same nested-config lookup as the KV shape."""
-    if body is None:
-        _, body, _ = load_config_document(model_path)
-    if "vocab_size" not in body:
-        raise ValueError(f"{model_path} has no vocab_size in its config.json")
-    return int(body["vocab_size"])
