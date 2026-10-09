@@ -4,8 +4,9 @@ This benchmark replays attention and KV writes for fixed synthetic batches using
 token table, allocator, KV writer, index kernel and FlashInfer wrappers. It reports timing windows for
 this replay; metadata preparation and planning differ from a running SGLang server.
 
-The numbers from one validation run are in [`RESULTS.md`](RESULTS.md); this document is the method, the
-matrix, the command line and the boundaries.
+This document is the method, the matrix, the command line and the boundaries. A run writes its own
+result directory — the raw records, a summary CSV and a manifest naming the machine, the versions and
+the command — so a report is made from the output of the run it describes.
 
 ## 1. The windows
 
@@ -29,10 +30,9 @@ sees the between-window interval: what the three windows do not cover. The measu
 what that interval contains. The derived ratios divide `phase_sum` and are named `*_ratio_of_phase_sum`
 for it; the throughput figure divides `step_window`.
 
-The loop is timed as one window on purpose. Putting an event pair around each layer's write and read
-would measure the events as much as the work — 144 events per iteration cost about 0.6 ms of the 5 ms
-step on the validation machine — so the write and the read are priced in passes of their own instead,
-and they are components rather than the schedule the step runs:
+The loop is timed as one window on purpose: putting an event pair around each layer's write and read
+would measure the events as much as the work, so the write and the read are priced in passes of their
+own instead, and they are components rather than the schedule the step runs:
 
 | Component | What it covers |
 |---|---|
@@ -40,14 +40,16 @@ and they are components rather than the schedule the step runs:
 | `attention_component` | the branch's attention path over every layer of the step, in one window, without the writes. What that path is depends on the branch: one ragged call, two wrapper calls and one `merge_state`, one paged prefill call, or one paged decode call. The merge branch's path is several calls per layer, so one component window holds more than one call per layer |
 | `kv_gather` | a read-only probe: the rows the branch's paged side reads (or the slots the step wrote, when it reads no paged KV), both K and V, moved with `index_select` and no arithmetic |
 
-The layer count of the model in [`RESULTS.md`](RESULTS.md) is 36, so those two components hold 36 write
-calls and 36 per-layer attention paths there; a step of another model holds that model's layers.
+Each of the two components holds one call per layer per step, so a step of a model with L layers holds
+L write calls and L per-layer attention paths.
 
 None of the three is added to the step. Each runs after the timed loop, in windows of its own, so no
 step iteration is ever timed with a probe inside it, and the wrappers are planned against the probe's
 own indices before those passes rather than inside them. Their ratio to `phase_sum` is recorded as a
 ratio rather than as a share of the step, because the step interleaves the two per layer and a
-component window can read above the window it belongs to.
+component window can read above the window it belongs to: the loop holds a layer's attention and its
+KV write as the branch interleaves them, each component holds one of the two, and the interval the
+three step windows leave out is not a component of anything.
 
 The step uses `ReqToTokenPool` for the token table, `TokenToKVPoolAllocator` at page size 1 or
 `PagedTokenToKVPoolAllocator` above it, and `MHATokenToKVPool` for the KV buffers.
@@ -168,10 +170,10 @@ the memory system moved. What the memory system actually transfers is not observ
 profiler, and no figure here claims it: a paged read touches whole pages and a write may coalesce, and
 the page capacity is reported as the allocation figure it is rather than as traffic.
 
-The write side carries no rate of its own. Its window does not follow the bytes written — the run in
-[`RESULTS.md`](RESULTS.md) records it between 1.114 and 1.182 ms for steps that write 1 to 32768 tokens
-— so what the window covers is not determined by the measurement, and a quotient of it would report
-whatever the window caught. `kv_write_component` is recorded as the window it is.
+The write side carries no rate of its own. Its window does not track the bytes a step writes, so what it
+covers is not determined by the measurement and a quotient of it would report whatever the window
+caught. `kv_write_component` is recorded as the window it is, with its min, p50, p95 and p99 beside it
+so a reader can see how far apart its samples are within one row.
 
 ## 5. Correctness checks
 
@@ -260,21 +262,23 @@ Every window carries min, p50, p95 and p99 over the timed iterations: the three 
 `phase_sum`, the step as one span `step_window`, and the components beside them. The branch the step
 ran, the order it ran in and the configuration it was built with are fields of the record beside
 them — the `configuration` object of `kernel.jsonl`, and the `branch`, `reads_before_write`,
-`attention_backend`, `wrapper_page_size`, `decode_use_tensor_cores` and `kv_write_stream` columns of the
-CSV — so a reader can see which step a number came from. The CSV also carries the derived figures of
-section 4 plus the result of every correctness check.
+`attention_backend`, `wrapper_page_size`, `decode_use_tensor_cores`, `kv_write_stream` and
+`slot_allocator` columns of the CSV — so a reader can see which step a number came from. The CSV also
+carries the derived figures of section 4 plus the result of every correctness check.
 
-## 9. What one run measured
+## 9. Reporting a run
 
-`RESULTS.md` holds the numbers from one validation run, the machine they were taken on, and what they
-say about the windows a step is timed in and the components measured beside it. This document keeps the
-method, the matrix and the boundaries: a run on another machine, model or sharding reports its own
-numbers, and the CSV and manifest of that run are what a reader compares, because the two sides of
-every figure in it are recorded there.
-
+A report of this benchmark is made from the output of the run it describes: the summary CSV holds the
+two sides of every figure — the bytes, the window they are divided by, the ledger and the checks — and
+the manifest holds the machine, the versions, the model, the sharding and the command that produced it.
 Nothing here is a precondition of the benchmark: the GPU, the driver, the tensor parallel size, the
-model's shapes and the page sizes are either probed at runtime or taken from the model config, and the
-manifest of a run states every one of them.
+model's shapes and the page sizes are either probed at runtime or taken from the model config, so a run
+elsewhere states its own.
+
+A report quotes the windows as they are named in the CSV, and says which lane the run used, which
+allocator the pool's page size selected, and which machine and versions it came from. Figures from two
+runs are comparable through those fields, and the components are reported beside the step rather than
+added into it for the reason in section 1.
 
 ## 10. Limitations
 
@@ -294,14 +298,14 @@ manifest of a run states every one of them.
   through them.
 
 The replay fixes four settings, each stated in the record's `configuration` and in the CSV, so a row
-says which configuration it describes. They are the benchmark's own lane, checked against the SGLang
-version in [`RESULTS.md`](RESULTS.md); they are not what SGLang picks for every model:
+says which configuration it describes. They are the benchmark's own lane, read off SGLang 0.5.20 as the
+version below states; they are not what SGLang picks for every model:
 
 | Setting | Value here | What SGLang does |
 |---|---|---|
 | `attention_backend` | `flashinfer-fa2` | a server selects its backend; this benchmark calls the FlashInfer wrappers, so it measures that backend and no other |
 | `wrapper_page_size` | `1`, and every last-page length is 1 | the same on every model: SGLang hands FlashInfer a token-level CSR stream, and the pool's page size is a separate figure that reaches the kernels only through the addresses in it |
-| `decode_use_tensor_cores` | `true` | `FlashInferAttnBackend` decides this per model through `should_use_tensor_core`: a bf16 or fp16 cache at a group size of 4 or more query heads per KV head takes the tensor-core path, which this model reaches at the sharding in `RESULTS.md`. A model below that threshold builds the wrapper without it, and `SGLANG_FLASHINFER_USE_TENSOR_CORE` overrides the choice either way |
+| `decode_use_tensor_cores` | `true` | `FlashInferAttnBackend` decides this per model through `should_use_tensor_core`: a bf16 or fp16 cache at a group size of 4 or more query heads per KV head takes the tensor-core path, which a model at that group size reaches. A model below that threshold builds the wrapper without it, and `SGLANG_FLASHINFER_USE_TENSOR_CORE` overrides the choice either way |
 | `kv_write_stream` | `step`: the pool is built with `enable_alt_stream=False` | in SGLang 0.5.20 that stream is used only inside CUDA graph capture: `_set_kv_buffer_impl` branches on `get_is_capture_mode()` and otherwise writes through the fused `store_cache` kernel on the current stream. This replay captures no graph, so the flag records how the pool was built rather than a different write path |
 
 The allocator is not one of those four: it follows the pool's page size the way SGLang's own
