@@ -215,5 +215,24 @@ TEST_F(TenantQuotaLedgerTest, RebuildMatchesGlobalChargedBytes) {
     EXPECT_EQ(ledger.TotalChargedBytes(), account_->ChargedBytes());
 }
 
+TEST(TenantQuotaLedgerNullAccountTest, EveryMutationIsANoOp) {
+    // A null account is what a tenant carries with quotas off: no mutation
+    // fails, and the ledger never records a byte.
+    TenantQuotaLedger ledger;
+    TenantQuotaLedger destination;
+    EXPECT_TRUE(ledger.AdoptPendingCharge(nullptr, 100));
+    EXPECT_TRUE(ledger.SettlePrimaryWrite(nullptr, 100));
+    EXPECT_TRUE(ledger.SettleAdditional(nullptr, 40, 30));
+    EXPECT_TRUE(ledger.RefundPending(nullptr));
+    EXPECT_TRUE(ledger.ReleaseCommitted(nullptr, 30));
+    EXPECT_TRUE(ledger.TransferReplacementCharge(nullptr, destination));
+    EXPECT_TRUE(destination.ReleaseReplacement(nullptr));
+    EXPECT_TRUE(ledger.ReleaseAll(nullptr));
+    EXPECT_TRUE(ledger.Rebuild(nullptr, 90));
+
+    EXPECT_EQ(ledger.TotalChargedBytes(), 0);
+    EXPECT_EQ(destination.TotalChargedBytes(), 0);
+}
+
 }  // namespace
 }  // namespace mooncake

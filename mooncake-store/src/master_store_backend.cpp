@@ -16,7 +16,8 @@ bool MasterStoreBackend::CanPublishWeightMutations() const {
 
 bool MasterStoreBackend::IsTenantSupported(const std::string& tenant_id) const {
     const TenantId tenant(tenant_id);
-    return tenant.IsValid() && master_.ResolveRequestTenantId(tenant) == tenant;
+    return tenant.IsValid() &&
+           (master_.IsTenantQuotaEnabled() || tenant == TenantId::Default());
 }
 
 tl::expected<OpLogEntry, ErrorCode>
@@ -56,34 +57,21 @@ MasterStoreBackend::SnapshotWeightGroup(
     std::vector<WeightGroupMemberSnapshot> members;
     members.reserve(member_keys.size());
     for (const auto& key : member_keys) {
-        // Each member is read through the tenant's route, so the snapshot is
-        // taken from the publication the route holds for that key.
-        std::optional<WeightGroupMemberSnapshot> snapshot;
-        const auto published = master_.WithObjectMetadataForRead(
-            tenant_id, key,
-            [&](const metadata::Tenant&, const std::shared_ptr<ObjectEntry>&,
-                const ObjectMetadata& metadata,
-                const ObjectEntry::State&) -> bool {
-                if (metadata.group_id != payload_group_id) {
-                    return false;
-                }
-                snapshot = WeightGroupMemberSnapshot{
-                    .key = key,
-                    .size = metadata.size,
-                    .data_type = metadata.data_type,
-                    .readable = master_.HasReadableReplica(metadata),
-                };
-                return true;
-            });
-        if (!published.has_value()) {
+        MasterService::MetadataAccessorRO accessor(
+            &master_, MasterService::ObjectIdentity{tenant_id, key});
+        if (!accessor.IsPublished()) {
             return tl::make_unexpected(WeightManagementError::NOT_FOUND);
         }
-        if (!*published) {
-            // The record no longer belongs to this group, so the caller's view
-            // of the group is stale.
+        const auto& metadata = accessor.Get();
+        if (metadata.group_id != payload_group_id) {
             return tl::make_unexpected(WeightManagementError::CONFLICT);
         }
-        members.push_back(std::move(*snapshot));
+        members.push_back(WeightGroupMemberSnapshot{
+            .key = key,
+            .size = metadata.size,
+            .data_type = metadata.data_type,
+            .readable = master_.HasReadableReplica(metadata),
+        });
     }
     return members;
 }

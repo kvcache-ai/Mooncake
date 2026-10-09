@@ -677,8 +677,9 @@ MasterScenario& MasterScenario::When(ClearReplicasAction action) {
         return *this;
     }
 
-    const auto result = service_->BatchReplicaClear(
-        action.keys, ActorId(action.actor), action.node, action.tenant);
+    const auto result =
+        service_->BatchReplicaClear(action.keys, ActorId(action.actor),
+                                    action.node, TenantId(action.tenant));
     ValidateActionResult("ClearReplicas", action.expected_error,
                          result.has_value(),
                          result ? ErrorCode::OK : result.error());
@@ -1065,21 +1066,18 @@ MasterScenario& MasterScenario::When(ExpireAtAction action) {
         return *this;
     }
 
-    // An object's per-key state lives on the entry its tenant's route
-    // publishes, so the object is reached by (tenant, key) alone.
-    const auto expired =
-        MasterServiceTestPeer(*service_).WithPublishedObjectForWrite(
-            TenantId(action.tenant), action.key,
-            [&](metadata::Tenant&, const std::shared_ptr<ObjectEntry>&,
-                ObjectMetadata& metadata, ObjectEntry::State&) {
-                SpinLocker locker(&metadata.lock);
-                metadata.lease_->SetDeadline(action.lease_timeout);
-                metadata.soft_pin_timeout = action.soft_pin_timeout;
-                return true;
-            });
-    if (!expired.has_value()) {
+    const TenantId tenant(action.tenant);
+    auto entry = MasterServiceTestPeer::FindObject(
+        *service_, MasterServiceTestPeer::ObjectIdentity{tenant, action.key});
+    if (entry == nullptr) {
         Fail("ExpireAt(" + action.key + ") could not find object");
+        return *this;
     }
+    ObjectEntry::ExclusiveHold hold(*entry);
+    auto& metadata = hold.metadata();
+    SpinLocker locker(&metadata.lock);
+    metadata.lease_->SetDeadline(action.lease_timeout);
+    metadata.soft_pin_timeout = action.soft_pin_timeout;
     return *this;
 }
 

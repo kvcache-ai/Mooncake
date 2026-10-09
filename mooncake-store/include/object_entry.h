@@ -7,7 +7,10 @@
 //
 // The lock never leaves the class: everything below the identity is reachable
 // only through WithExclusiveAccess or WithSharedAccess, which hold it for the
-// callback, so a caller cannot act on half of a compound operation.
+// callback, or through ExclusiveHold or SharedHold, which hold it for their
+// own scope, so a caller cannot act on half of a compound operation. The one
+// exception is the in-flight hook, which belongs to the tenant's list of
+// entries with work in flight and is guarded by that list's lock instead.
 
 #include <atomic>
 #include <chrono>
@@ -18,28 +21,46 @@
 #include <string>
 #include <utility>
 
+#include "common/intrusive_list.h"
 #include "object_metadata.h"
 #include "object_runtime_state.h"
 
 namespace mooncake {
 
-class ObjectEntry {
+namespace metadata {
+class Tenant;
+}  // namespace metadata
+
+// Tags the hook that links an entry into its tenant's in-flight list.
+struct InFlightListTag;
+
+class ObjectEntry : private IntrusiveListHook<InFlightListTag> {
    public:
     // What the entry adds to the envelope: the per-key task state, at most one
     // in-flight task per entry, and the lifecycle claims over it.
     struct State {
         // A primary write or a background task is in flight for this key.
         bool is_processing{false};
-        // Teardown-once claim: a second eraser of the same entry bails out
-        // instead of double-releasing its refcounts, quota charges and KV
-        // removal events.
-        bool is_torn_down{false};
         std::optional<ReplicationTask> replication_task;
         std::optional<OffloadingTask> offloading_task;
         std::optional<PromotionTask> promotion_task;
         std::optional<PromotionCandidate> promotion_candidate;
         std::optional<DynamicReplicaPending> dynamic_replication_pending;
         std::chrono::steady_clock::time_point dynamic_replication_cooldown{};
+
+        // True while a primary write or a replication, offloading or
+        // promotion task is in flight: the work an expiry sweep reclaims.
+        [[nodiscard]] bool HasInFlightWork() const noexcept {
+            return is_processing || replication_task.has_value() ||
+                   offloading_task.has_value() || promotion_task.has_value();
+        }
+
+       private:
+        friend class metadata::Tenant;  // claims it at teardown
+
+        // Teardown-once claim, so a second eraser of the same entry does not
+        // release its refcounts, quota charges and KV removal events again.
+        bool is_torn_down{false};
     };
 
     // Takes ownership of a non-null metadata envelope; the envelope carries the
@@ -82,8 +103,49 @@ class ObjectEntry {
                                     std::as_const(state_));
     }
 
+    // The scoped forms of the two above, for a caller whose critical section
+    // is the rest of its own scope rather than one callback: the entry stays
+    // held until the hold is destroyed, under the same lock order. Neither is
+    // copyable nor movable, so a hold never outlives the scope that took it.
+    class ExclusiveHold {
+       public:
+        explicit ExclusiveHold(ObjectEntry& entry) NO_THREAD_SAFETY_ANALYSIS
+            : lock_(entry.mutex_),
+              metadata_(*entry.metadata_),
+              state_(entry.state_) {}
+        ExclusiveHold(const ExclusiveHold&) = delete;
+        ExclusiveHold& operator=(const ExclusiveHold&) = delete;
+
+        ObjectMetadata& metadata() const { return metadata_; }
+        State& state() const { return state_; }
+
+       private:
+        std::unique_lock<std::shared_mutex> lock_;
+        ObjectMetadata& metadata_;
+        State& state_;
+    };
+
+    class SharedHold {
+       public:
+        explicit SharedHold(const ObjectEntry& entry) NO_THREAD_SAFETY_ANALYSIS
+            : lock_(entry.mutex_),
+              metadata_(*entry.metadata_),
+              state_(entry.state_) {}
+        SharedHold(const SharedHold&) = delete;
+        SharedHold& operator=(const SharedHold&) = delete;
+
+        const ObjectMetadata& metadata() const { return metadata_; }
+        const State& state() const { return state_; }
+
+       private:
+        std::shared_lock<std::shared_mutex> lock_;
+        const ObjectMetadata& metadata_;
+        const State& state_;
+    };
+
    private:
     friend class ObjectIndex;  // claims the entry at route publication
+    friend class IntrusiveList<ObjectEntry, InFlightListTag>;  // in-flight hook
 
     std::unique_ptr<ObjectMetadata> metadata_;
     // Atomic because publication claims it under the route lock while a holder

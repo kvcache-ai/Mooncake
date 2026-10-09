@@ -116,7 +116,7 @@ size_t MasterServiceTestPeer::RunPromotionCandidateRetryForTesting() {
 void MasterServiceTestPeer::SeedPromotionTaskForTesting(
     const TenantId& tenant_id, const std::string& key, const UUID& holder_id,
     ReplicaID alloc_id, uint64_t object_size) {
-    auto tenant_handle = service_.GetOrCreateTenantHandle(tenant_id);
+    auto tenant_handle = service_.tenants_.GetOrCreateTenant(tenant_id);
     auto entry = tenant_handle->Get(key);
     if (entry == nullptr) {
         // The route is what keeps the entry reachable by the completion path,
@@ -138,6 +138,7 @@ void MasterServiceTestPeer::SeedPromotionTaskForTesting(
                           .object_size = object_size,
                           .start_time = std::chrono::system_clock::now(),
                           .holder_id = holder_id};
+        tenant_handle->TrackInFlight(*entry, state);
     });
 }
 
@@ -146,7 +147,7 @@ size_t MasterServiceTestPeer::CountCandidatesForTesting(
     std::shared_lock<std::shared_mutex> lock(service_.snapshot_mutex_);
     // The count is the tenant's candidate index; the candidate state itself
     // lives on each entry.
-    return service_.PromotionCandidateKeys(tenant_id).size();
+    return service_.promotion_candidates_.Keys(tenant_id).size();
 }
 
 void MasterServiceTestPeer::ResetCandidateBackoffsForTesting() {
@@ -156,7 +157,8 @@ void MasterServiceTestPeer::ResetCandidateBackoffsForTesting() {
     service_.tenants_.Visit(
         [&](const TenantId& tenant_id,
             const std::shared_ptr<metadata::Tenant>& handle) {
-            for (const auto& key : service_.PromotionCandidateKeys(tenant_id)) {
+            for (const auto& key :
+                 service_.promotion_candidates_.Keys(tenant_id)) {
                 auto entry = handle->Get(key);
                 if (entry == nullptr) {
                     continue;

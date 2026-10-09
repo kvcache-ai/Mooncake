@@ -12,9 +12,9 @@
 // ClearInvalidHandles() internally, which would erase the crafted object
 // through the sweep before PutEnd could exercise the accessor's own cleanup.
 //
-// The child asserts EraseMetadata claimed ObjectEntry::State::is_torn_down,
-// the processing marker is cleared and the route slot is gone, and reports
-// that through its exit code: a forked child turns a crash into a test failure.
+// The child asserts EraseMetadata claimed the teardown, the processing marker
+// is cleared and the route slot is gone, and reports that through its exit
+// code: a forked child turns a crash into a test failure.
 
 #include "master_service.h"
 #include "master_service/master_service_test_peer.h"
@@ -81,8 +81,8 @@ class MasterServiceProcessingKeyDoubleEraseTest : public ::testing::Test {
             ::_exit(kExitPutStartFailed);
         }
 
-        // Hold the publication across its teardown, so the flag the cleanup
-        // claims can still be read once the route slot is gone.
+        // Hold the publication across its teardown, so the claim the cleanup
+        // took can still be probed once the route slot is gone.
         auto entry = MasterServiceTestPeer::FindObject(
             service,
             MasterServiceTestPeer::ObjectIdentity{TenantId::Default(), key});
@@ -91,8 +91,8 @@ class MasterServiceProcessingKeyDoubleEraseTest : public ::testing::Test {
         }
 
         // 3. Ghost client expires: the segment allocator is destroyed,
-        //    invalidating the replica's memory handle (weak_ptr expires). No
-        //    ClearInvalidHandles sweep here (see the file header).
+        //    invalidating the replica's memory handle (weak_ptr expires).
+        //    No ClearInvalidHandles sweep here (see file header).
         size_t metrics_dec_capacity = 0;
         {
             auto segment_access = MasterServiceTestPeer::SegmentManager(service)
@@ -113,11 +113,20 @@ class MasterServiceProcessingKeyDoubleEraseTest : public ::testing::Test {
             ::_exit(kExitPutEndAnswer);
         }
 
-        const bool torn_down = entry->WithSharedAccess(
-            [](const ObjectMetadata&, const ObjectEntry::State& state) {
-                return state.is_torn_down;
+        // A second teardown of the same entry must find the claim taken and
+        // release nothing.
+        const auto tenant =
+            MasterServiceTestPeer::Tenants(service).Lookup(TenantId::Default());
+        if (tenant == nullptr) {
+            ::_exit(kExitNotTornDown);
+        }
+        bool released_again = false;
+        const bool torn_down_again = entry->WithExclusiveAccess(
+            [&](ObjectMetadata&, ObjectEntry::State& state) {
+                return tenant->TearDownObject(entry, state,
+                                              [&] { released_again = true; });
             });
-        if (!torn_down) {
+        if (torn_down_again || released_again) {
             ::_exit(kExitNotTornDown);
         }
         const bool still_processing = entry->WithSharedAccess(
@@ -162,7 +171,7 @@ TEST_F(MasterServiceProcessingKeyDoubleEraseTest,
                << WTERMSIG(status)
                << (WTERMSIG(status) == SIGSEGV ? " (SIGSEGV)" : "")
                << ". One publication must be torn down at most once; "
-                  "ObjectEntry::State::is_torn_down is what claims it.";
+                  "Tenant::TearDownObject is what claims it.";
     }
     ASSERT_TRUE(WIFEXITED(status)) << "child did not exit normally";
     EXPECT_EQ(WEXITSTATUS(status), kExitOk)

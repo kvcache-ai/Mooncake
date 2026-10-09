@@ -172,42 +172,42 @@ class BatchEvictBench {
         const auto base_expiration = now - std::chrono::hours(1);
         size_t ordinal = 0;
 
-        // Every object of the default tenant lives on that tenant's own route,
-        // so each entry is re-dated and read under its own lock.
-        const auto tenant =
-            MasterServiceTestPeer::Tenants(service).Lookup(TenantId::Default());
-        if (tenant == nullptr) {
-            return stats;
-        }
-        for (const auto& entry : tenant->SnapshotObjects()) {
-            entry->WithExclusiveAccess([&](ObjectMetadata& metadata,
-                                           ObjectEntry::State&) {
-                {
-                    SpinLocker locker(&metadata.lock);
-                    metadata.lease_->SetDeadline(
-                        base_expiration + std::chrono::nanoseconds(ordinal++));
+        MasterServiceTestPeer::Tenants(service).Visit(
+            [&](const TenantId& tenant_id,
+                const std::shared_ptr<metadata::Tenant>& tenant) {
+                if (tenant_id != TenantId::Default()) {
+                    return;
                 }
+                for (const auto& entry : tenant->SnapshotObjects()) {
+                    ObjectEntry::ExclusiveHold hold(*entry);
+                    auto& metadata = hold.metadata();
+                    {
+                        SpinLocker locker(&metadata.lock);
+                        metadata.lease_->SetDeadline(
+                            base_expiration +
+                            std::chrono::nanoseconds(ordinal++));
+                    }
 
-                ++stats.object_count;
-                if (!metadata.IsLeaseExpired(now)) {
-                    ++stats.unexpired_leases;
-                }
-                for (const auto& replica : metadata.GetAllReplicas()) {
-                    if (replica.is_memory_replica()) {
-                        if (replica.is_completed()) {
-                            ++stats.completed_memory_replicas;
+                    ++stats.object_count;
+                    if (!metadata.IsLeaseExpired(now)) {
+                        ++stats.unexpired_leases;
+                    }
+                    for (const auto& replica : metadata.GetAllReplicas()) {
+                        if (replica.is_memory_replica()) {
+                            if (replica.is_completed()) {
+                                ++stats.completed_memory_replicas;
+                            } else {
+                                ++stats.incomplete_replicas;
+                            }
+                            if (replica.get_refcnt() != 0) {
+                                ++stats.busy_memory_replicas;
+                            }
                         } else {
-                            ++stats.incomplete_replicas;
+                            ++stats.non_memory_replicas;
                         }
-                        if (replica.get_refcnt() != 0) {
-                            ++stats.busy_memory_replicas;
-                        }
-                    } else {
-                        ++stats.non_memory_replicas;
                     }
                 }
             });
-        }
 
         return stats;
     }

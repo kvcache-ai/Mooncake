@@ -8,7 +8,9 @@ namespace mooncake {
 
 // Per-object accounting state for quota bytes already charged to a stable
 // TenantQuotaAccount. The ledger never owns the account and never releases
-// quota implicitly; every mutation receives the account handle explicitly.
+// quota implicitly; every mutation receives the account handle explicitly. A
+// null account is an unmetered tenant's: every mutation is then a no-op, so
+// the ledger stays empty.
 class TenantQuotaLedger {
    public:
     TenantQuotaLedger() = default;

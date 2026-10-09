@@ -107,24 +107,16 @@ class DynamicReplicationTest : public ::testing::Test {
             proposal.preferred_target_segment = *preferred_target_segment;
         }
 
-        MasterServiceTestPeer peer(service);
-        auto observed = peer.WithPublishedObjectForRead(
-            TenantId::Default(), key,
-            [&](const metadata::Tenant&, const std::shared_ptr<ObjectEntry>&,
-                const ObjectMetadata& metadata, const ObjectEntry::State&) {
-                struct Observed {
-                    uint64_t version_epoch;
-                    uint64_t size;
-                };
-                return Observed{
-                    .version_epoch =
-                        peer.DynamicReplicationVersionEpoch(metadata),
-                    .size = static_cast<uint64_t>(metadata.size)};
-            });
-        EXPECT_TRUE(observed.has_value());
-        if (observed.has_value()) {
-            proposal.observed_version_epoch = observed->version_epoch;
-            proposal.object_size_bytes = observed->size;
+        MasterServiceTestPeer::MetadataAccessorRO accessor(
+            &service,
+            MasterServiceTestPeer::ObjectIdentity{TenantId::Default(), key});
+        EXPECT_TRUE(accessor.Exists());
+        if (accessor.Exists()) {
+            const auto& metadata = accessor.Get();
+            proposal.observed_version_epoch =
+                MasterServiceTestPeer(service).DynamicReplicationVersionEpoch(
+                    metadata);
+            proposal.object_size_bytes = static_cast<uint64_t>(metadata.size);
         }
         if (admit) {
             AdmitDynamicReplication(service, key);
@@ -134,73 +126,59 @@ class DynamicReplicationTest : public ::testing::Test {
 
     size_t DynamicReplicaCount(MasterService& service,
                                const std::string& key) const {
-        auto count = MasterServiceTestPeer(service).WithPublishedObjectForRead(
-            TenantId::Default(), key,
-            [](const metadata::Tenant&, const std::shared_ptr<ObjectEntry>&,
-               const ObjectMetadata& metadata, const ObjectEntry::State&) {
-                return metadata.DynamicReplicaCount();
-            });
-        EXPECT_TRUE(count.has_value());
-        return count.value_or(0);
+        MasterServiceTestPeer::MetadataAccessorRO accessor(
+            &service,
+            MasterServiceTestPeer::ObjectIdentity{TenantId::Default(), key});
+        EXPECT_TRUE(accessor.Exists());
+        return accessor.Exists() ? accessor.Get().DynamicReplicaCount() : 0;
     }
 
     bool HasCompleteDynamicReplica(MasterService& service,
                                    const std::string& key,
                                    const std::string& target_segment) const {
-        auto has_complete =
-            MasterServiceTestPeer(service).WithPublishedObjectForRead(
-                TenantId::Default(), key,
-                [&target_segment](const metadata::Tenant&,
-                                  const std::shared_ptr<ObjectEntry>&,
-                                  const ObjectMetadata& metadata,
-                                  const ObjectEntry::State&) {
-                    for (const auto& [replica_id, record] :
-                         metadata.dynamic_replicas) {
-                        (void)replica_id;
-                        if (record.target_segment == target_segment &&
-                            record.complete) {
-                            return true;
-                        }
-                    }
-                    return false;
-                });
-        EXPECT_TRUE(has_complete.has_value());
-        return has_complete.value_or(false);
+        MasterServiceTestPeer::MetadataAccessorRO accessor(
+            &service,
+            MasterServiceTestPeer::ObjectIdentity{TenantId::Default(), key});
+        EXPECT_TRUE(accessor.Exists());
+        if (!accessor.Exists()) {
+            return false;
+        }
+        for (const auto& [replica_id, record] :
+             accessor.Get().dynamic_replicas) {
+            (void)replica_id;
+            if (record.target_segment == target_segment && record.complete) {
+                return true;
+            }
+        }
+        return false;
     }
 
     bool HasIncompleteDynamicReplica(MasterService& service,
                                      const std::string& key,
                                      const std::string& target_segment) const {
-        auto has_incomplete =
-            MasterServiceTestPeer(service).WithPublishedObjectForRead(
-                TenantId::Default(), key,
-                [&target_segment](const metadata::Tenant&,
-                                  const std::shared_ptr<ObjectEntry>&,
-                                  const ObjectMetadata& metadata,
-                                  const ObjectEntry::State&) {
-                    return std::any_of(metadata.dynamic_replicas.begin(),
-                                       metadata.dynamic_replicas.end(),
-                                       [&target_segment](const auto& entry) {
-                                           return entry.second.target_segment ==
-                                                      target_segment &&
-                                                  !entry.second.complete;
-                                       });
-                });
-        EXPECT_TRUE(has_incomplete.has_value());
-        return has_incomplete.value_or(false);
+        MasterServiceTestPeer::MetadataAccessorRO accessor(
+            &service,
+            MasterServiceTestPeer::ObjectIdentity{TenantId::Default(), key});
+        EXPECT_TRUE(accessor.Exists());
+        if (!accessor.Exists()) {
+            return false;
+        }
+        return std::any_of(accessor.Get().dynamic_replicas.begin(),
+                           accessor.Get().dynamic_replicas.end(),
+                           [&target_segment](const auto& entry) {
+                               return entry.second.target_segment ==
+                                          target_segment &&
+                                      !entry.second.complete;
+                           });
     }
 
     void BumpVersionEpoch(MasterService& service,
                           const std::string& key) const {
-        auto bumped =
-            MasterServiceTestPeer(service).WithPublishedObjectForWrite(
-                TenantId::Default(), key,
-                [](metadata::Tenant&, const std::shared_ptr<ObjectEntry>&,
-                   ObjectMetadata& metadata, ObjectEntry::State&) {
-                    metadata.put_start_time += std::chrono::milliseconds(1);
-                    return true;
-                });
-        ASSERT_TRUE(bumped.has_value());
+        MasterServiceTestPeer::MetadataAccessorRW accessor(
+            &service,
+            MasterServiceTestPeer::ObjectIdentity{TenantId::Default(), key});
+        ASSERT_TRUE(accessor.Exists());
+        accessor.Get().put_start_time += std::chrono::milliseconds(1);
     }
 
     // True when the object still carries dynamic-replication state: the entry's
@@ -212,18 +190,19 @@ class DynamicReplicationTest : public ::testing::Test {
             MasterServiceTestPeer::FindDynamicReplicationLease(
                 service, TenantId::Default(), proposal_id)
                 .has_value();
-        auto has_flags =
-            MasterServiceTestPeer(service).WithPublishedObjectForRead(
-                TenantId::Default(), key,
-                [](const metadata::Tenant&, const std::shared_ptr<ObjectEntry>&,
-                   const ObjectMetadata&, const ObjectEntry::State& state) {
-                    return state.dynamic_replication_pending.has_value() ||
-                           state.dynamic_replication_cooldown !=
-                               std::chrono::steady_clock::time_point{};
-                });
+        MasterServiceTestPeer::MetadataAccessorRO accessor(
+            &service,
+            MasterServiceTestPeer::ObjectIdentity{TenantId::Default(), key});
         // A torn-down object keeps neither flag, so only a lease can outlive
         // it; an absent object reports the same as one without flags.
-        return has_flags.value_or(false) || has_lease;
+        if (!accessor.Exists()) {
+            return has_lease;
+        }
+        const auto& state = accessor.GetState();
+        return state.dynamic_replication_pending.has_value() ||
+               state.dynamic_replication_cooldown !=
+                   std::chrono::steady_clock::time_point{} ||
+               has_lease;
     }
 
     size_t DynamicReplicationWindowEntryLimit() const {
@@ -245,13 +224,12 @@ class DynamicReplicationTest : public ::testing::Test {
 
     void ClearDynamicReplicationState(MasterService& service,
                                       const std::string& key) const {
-        // The clear takes the entry's own lock itself, so the tenant is
-        // resolved without holding one.
-        auto tenant_handle =
-            MasterServiceTestPeer::Tenants(service).Lookup(TenantId::Default());
-        ASSERT_NE(tenant_handle, nullptr);
+        MasterServiceTestPeer::MetadataAccessorRW accessor(
+            &service,
+            MasterServiceTestPeer::ObjectIdentity{TenantId::Default(), key});
+        ASSERT_TRUE(accessor.Exists());
         MasterServiceTestPeer(service).ClearDynamicReplicationStateForKey(
-            TenantId::Default(), *tenant_handle, key);
+            TenantId::Default(), *accessor.GetEntry(), accessor.GetState());
     }
 
     // The expired-processing sweep works one tenant's whole route, so it needs
@@ -263,7 +241,7 @@ class DynamicReplicationTest : public ::testing::Test {
             return;
         }
         MasterServiceTestPeer(service).DiscardExpiredProcessingReplicas(
-            *tenant_handle,
+            *tenant_handle, TenantId::Default(),
             std::chrono::system_clock::now() + std::chrono::seconds(1));
     }
 
@@ -275,50 +253,41 @@ class DynamicReplicationTest : public ::testing::Test {
 
     size_t EvictReplicaOnSegment(MasterService& service, const std::string& key,
                                  const std::string& target_segment) const {
+        MasterServiceTestPeer::MetadataAccessorRW accessor(
+            &service,
+            MasterServiceTestPeer::ObjectIdentity{TenantId::Default(), key});
+        EXPECT_TRUE(accessor.Exists());
+        if (!accessor.Exists()) {
+            return 0;
+        }
         std::vector<ReplicaID> erased_replica_ids;
-        // The replica accounting mutates the envelope, so the erase runs under
-        // the entry's own write lock.
-        auto erased =
-            MasterServiceTestPeer(service).WithPublishedObjectForWrite(
-                TenantId::Default(), key,
-                [&](metadata::Tenant&, const std::shared_ptr<ObjectEntry>&,
-                    ObjectMetadata& metadata, ObjectEntry::State&) {
-                    return MasterServiceTestPeer(service)
-                        .EraseReplicasWithCacheTotalAccounting(
-                            metadata,
-                            [&target_segment](const Replica& replica) {
-                                if (!replica.is_memory_replica()) {
-                                    return false;
-                                }
-                                const auto& segment_names =
-                                    replica.get_segment_names();
-                                return std::any_of(
-                                    segment_names.begin(), segment_names.end(),
-                                    [&target_segment](const auto& name) {
-                                        return name && *name == target_segment;
-                                    });
-                            },
-                            &erased_replica_ids);
-                });
-        EXPECT_TRUE(erased.has_value());
-        return erased.value_or(0);
+        return MasterServiceTestPeer(service)
+            .EraseReplicasWithCacheTotalAccounting(
+                accessor.Get(),
+                [&target_segment](const Replica& replica) {
+                    if (!replica.is_memory_replica()) {
+                        return false;
+                    }
+                    const auto& segment_names = replica.get_segment_names();
+                    return std::any_of(
+                        segment_names.begin(), segment_names.end(),
+                        [&target_segment](const auto& name) {
+                            return name && *name == target_segment;
+                        });
+                },
+                &erased_replica_ids);
     }
 
     void ExpireDynamicPending(MasterService& service,
                               const std::string& key) const {
-        auto expired =
-            MasterServiceTestPeer(service).WithPublishedObjectForWrite(
-                TenantId::Default(), key,
-                [](metadata::Tenant&, const std::shared_ptr<ObjectEntry>&,
-                   ObjectMetadata&, ObjectEntry::State& state) {
-                    if (!state.dynamic_replication_pending.has_value()) {
-                        return false;
-                    }
-                    state.dynamic_replication_pending->expire_at_ms_epoch = 1;
-                    return true;
-                });
-        ASSERT_TRUE(expired.has_value());
-        ASSERT_TRUE(*expired) << "the object carries no pending proposal";
+        MasterServiceTestPeer::MetadataAccessorRW accessor(
+            &service,
+            MasterServiceTestPeer::ObjectIdentity{TenantId::Default(), key});
+        ASSERT_TRUE(accessor.Exists());
+        auto& pending = accessor.GetState().dynamic_replication_pending;
+        ASSERT_TRUE(pending.has_value())
+            << "the object carries no pending proposal";
+        pending->expire_at_ms_epoch = 1;
     }
 };
 

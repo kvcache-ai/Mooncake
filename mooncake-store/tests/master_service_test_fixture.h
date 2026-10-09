@@ -125,19 +125,15 @@ class MasterServiceTest : public ::testing::Test {
     std::optional<std::chrono::system_clock::time_point> GetSoftPinDeadline(
         MasterService& service, const std::string& key,
         const std::string& tenant_id = "default") {
-        const TenantId normalized_tenant =
-            MasterServiceTestPeer(service).ResolveRequestTenantId(
-                TenantId(tenant_id));
+        const TenantId normalized_tenant(tenant_id);
         auto entry = MasterServiceTestPeer::FindObject(
             service,
             MasterServiceTestPeer::ObjectIdentity{normalized_tenant, key});
         if (entry == nullptr) {
             return std::nullopt;
         }
-        return entry->WithSharedAccess(
-            [](const ObjectMetadata& metadata, const ObjectEntry::State&) {
-                return metadata.GetCommittedSoftPinTimeout();
-            });
+        ObjectEntry::SharedHold hold(*entry);
+        return hold.metadata().GetCommittedSoftPinTimeout();
     }
 
     void CleanupExpiredSoftPinsAt(
@@ -150,18 +146,17 @@ class MasterServiceTest : public ::testing::Test {
         MasterService& service, const std::string& key,
         const std::chrono::system_clock::time_point& deadline,
         const std::string& tenant_id = "default") {
-        const TenantId normalized_tenant =
-            MasterServiceTestPeer(service).ResolveRequestTenantId(
-                TenantId(tenant_id));
+        const TenantId normalized_tenant(tenant_id);
         auto entry = MasterServiceTestPeer::FindObject(
             service,
             MasterServiceTestPeer::ObjectIdentity{normalized_tenant, key});
         ASSERT_TRUE(entry != nullptr);
-        entry->WithExclusiveAccess(
-            [&](ObjectMetadata& metadata, ObjectEntry::State&) {
-                SpinLocker locker(&metadata.lock);
-                metadata.soft_pin_timeout = deadline;
-            });
+        ObjectEntry::ExclusiveHold hold(*entry);
+        auto& metadata = hold.metadata();
+        {
+            SpinLocker locker(&metadata.lock);
+            metadata.soft_pin_timeout = deadline;
+        }
         MasterServiceTestPeer::SoftPinDeadlineIndex(service).Upsert(
             normalized_tenant.MakeScopedKey(key), deadline);
     }
@@ -174,74 +169,47 @@ class MasterServiceTest : public ::testing::Test {
         return MasterServiceTestPeer(service).SoftPinRegistrationCount();
     }
 
-    // What a segment-name lookup reports about one object: whether it carries a
-    // replica on that segment, and that replica's refcount. A plain result,
-    // because the read helper's own optional already means "not read".
-    struct ReplicaRefcntLookup {
-        bool found;
-        uint32_t refcnt;
-    };
-
-    // Reads one object's envelope and state the way the read paths do, with the
-    // callback contract of MasterService::WithObjectMetadataForRead. Nothing
-    // when the object is absent or no longer readable.
-    template <typename Fn>
-    [[nodiscard]] auto WithObjectForRead(MasterService& service,
-                                         const std::string& key,
-                                         const TenantId& tenant_id,
-                                         Fn&& fn) const
-        -> std::optional<std::invoke_result_t<
-            Fn, const metadata::Tenant&, const std::shared_ptr<ObjectEntry>&,
-            const ObjectMetadata&, const ObjectEntry::State&>> {
-        return MasterServiceTestPeer(service).WithPublishedObjectForRead(
-            tenant_id, key, std::forward<Fn>(fn));
-    }
-
     std::optional<uint32_t> GetReplicaRefcntBySegmentName(
         MasterService& service, const std::string& key,
         const std::string& segment_name) {
-        auto lookup = WithObjectForRead(
-            service, key, TenantId::Default(),
-            [&](const metadata::Tenant&, const std::shared_ptr<ObjectEntry>&,
-                const ObjectMetadata& metadata,
-                const ObjectEntry::State&) -> ReplicaRefcntLookup {
-                for (const auto& replica : metadata.GetAllReplicas()) {
-                    for (const auto& name : replica.get_segment_names()) {
-                        if (name.has_value() && *name == segment_name) {
-                            return ReplicaRefcntLookup{true,
-                                                       replica.get_refcnt()};
-                        }
-                    }
-                }
-                return ReplicaRefcntLookup{false, 0};
-            });
-        if (!lookup.has_value() || !lookup->found) {
+        MasterServiceTestPeer::MetadataAccessorRO accessor(
+            &service,
+            MasterServiceTestPeer::ObjectIdentity{TenantId::Default(), key});
+        if (!accessor.Exists()) {
             return std::nullopt;
         }
-        return lookup->refcnt;
+
+        for (const auto& replica : accessor.Get().GetAllReplicas()) {
+            for (const auto& name : replica.get_segment_names()) {
+                if (name.has_value() && *name == segment_name) {
+                    return replica.get_refcnt();
+                }
+            }
+        }
+        return std::nullopt;
     }
 
-    // Inspect normalized media as the read paths see it.
+    // Inspect normalized media through the peer's locked metadata accessors.
     std::optional<std::vector<std::string>> KvMediaForKey(
         MasterService& service, const std::string& key,
         const TenantId& tenant_id = TenantId::Default()) {
-        return WithObjectForRead(
-            service, key, tenant_id,
-            [](const metadata::Tenant&, const std::shared_ptr<ObjectEntry>&,
-               const ObjectMetadata& metadata, const ObjectEntry::State&) {
-                return MasterServiceTestPeer::KvMediaForMetadata(metadata);
-            });
+        MasterServiceTestPeer::MetadataAccessorRO accessor(
+            &service, MasterServiceTestPeer::ObjectIdentity{tenant_id, key});
+        if (!accessor.Exists()) {
+            return std::nullopt;
+        }
+        return MasterServiceTestPeer::KvMediaForMetadata(accessor.Get());
     }
 
     std::optional<std::vector<std::string>> KvRemovalMediaForKey(
         MasterService& service, const std::string& key,
         const TenantId& tenant_id = TenantId::Default()) {
-        return WithObjectForRead(
-            service, key, tenant_id,
-            [](const metadata::Tenant&, const std::shared_ptr<ObjectEntry>&,
-               const ObjectMetadata& metadata, const ObjectEntry::State&) {
-                return MasterServiceTestPeer::KvMediaForRemoval(metadata);
-            });
+        MasterServiceTestPeer::MetadataAccessorRO accessor(
+            &service, MasterServiceTestPeer::ObjectIdentity{tenant_id, key});
+        if (!accessor.Exists()) {
+            return std::nullopt;
+        }
+        return MasterServiceTestPeer::KvMediaForRemoval(accessor.Get());
     }
 
     void UpsertSoftPinDeadlineIndexForTest(
@@ -507,9 +475,7 @@ class MasterServiceTest : public ::testing::Test {
     std::vector<std::string> GetGroupMemberKeysForTest(
         MasterService& service, const std::string& group_id,
         const std::string& tenant_id = "default") {
-        const TenantId normalized_tenant =
-            MasterServiceTestPeer(service).ResolveRequestTenantId(
-                TenantId(tenant_id));
+        const TenantId normalized_tenant(tenant_id);
         // Membership is per tenant, so the group id alone is not enough.
         auto tenant_handle =
             MasterServiceTestPeer::Tenants(service).Lookup(normalized_tenant);
@@ -543,9 +509,7 @@ class MasterServiceTest : public ::testing::Test {
     std::shared_ptr<Lease> GetGroupLeaseForTest(
         MasterService& service, const std::string& group_id,
         const std::string& tenant_id = "default") {
-        const TenantId normalized_tenant =
-            MasterServiceTestPeer(service).ResolveRequestTenantId(
-                TenantId(tenant_id));
+        const TenantId normalized_tenant(tenant_id);
         auto tenant_handle =
             MasterServiceTestPeer::Tenants(service).Lookup(normalized_tenant);
         if (tenant_handle == nullptr) {
@@ -556,11 +520,8 @@ class MasterServiceTest : public ::testing::Test {
             if (entry == nullptr) {
                 continue;
             }
-            return entry->WithSharedAccess(
-                [](const ObjectMetadata& metadata,
-                   const ObjectEntry::State&) -> std::shared_ptr<Lease> {
-                    return metadata.lease_;
-                });
+            ObjectEntry::SharedHold hold(*entry);
+            return hold.metadata().lease_;
         }
         return nullptr;
     }

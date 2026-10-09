@@ -109,37 +109,25 @@ class PromotionOnHitTest : public ::testing::Test {
     static bool HasPromotionTaskForTesting(MasterService* service,
                                            const TenantId& tenant_id,
                                            const std::string& key) {
-        return MasterServiceTestPeer(*service)
-            .WithPublishedObjectForRead(
-                tenant_id, key,
-                [](const metadata::Tenant&, const std::shared_ptr<ObjectEntry>&,
-                   const ObjectMetadata&, const ObjectEntry::State& state) {
-                    return state.promotion_task.has_value();
-                })
-            .value_or(false);
+        MasterServiceTestPeer::MetadataAccessorRO accessor(
+            service, MasterServiceTestPeer::ObjectIdentity{
+                         .tenant_id = tenant_id, .user_key = key});
+        return accessor.Exists() &&
+               accessor.GetState().promotion_task.has_value();
     }
 
-    // What a key's in-flight promotion task reports. A plain result, because
-    // the read helper's own optional already means "not read".
-    struct PromotionTaskFailures {
-        bool has_task;
-        uint32_t execution_failures;
-    };
-
+    // std::nullopt when the key has no in-flight promotion task.
     static std::optional<uint32_t> GetPromotionTaskExecutionFailuresForTesting(
         MasterService* service, const TenantId& tenant_id,
         const std::string& key) {
-        auto task = MasterServiceTestPeer(*service).WithPublishedObjectForRead(
-            tenant_id, key,
-            [](const metadata::Tenant&, const std::shared_ptr<ObjectEntry>&,
-               const ObjectMetadata&,
-               const ObjectEntry::State& state) -> PromotionTaskFailures {
-                if (!state.promotion_task.has_value()) {
-                    return {false, 0};
-                }
-                return {true, state.promotion_task->execution_failures};
-            });
-        if (!task.has_value() || !task->has_task) {
+        MasterServiceTestPeer::MetadataAccessorRO accessor(
+            service, MasterServiceTestPeer::ObjectIdentity{
+                         .tenant_id = tenant_id, .user_key = key});
+        if (!accessor.Exists()) {
+            return std::nullopt;
+        }
+        const auto& task = accessor.GetState().promotion_task;
+        if (!task.has_value()) {
             return std::nullopt;
         }
         return task->execution_failures;
@@ -160,20 +148,13 @@ class PromotionOnHitTest : public ::testing::Test {
                                               const TenantId& tenant_id,
                                               const std::string& key,
                                               ReplicaID replica_id) {
-        auto completed =
-            MasterServiceTestPeer(*service).WithPublishedObjectForWrite(
-                tenant_id, key,
-                [&](metadata::Tenant&, const std::shared_ptr<ObjectEntry>&,
-                    ObjectMetadata& metadata, ObjectEntry::State&) {
-                    auto* replica = metadata.GetReplicaByID(replica_id);
-                    if (replica == nullptr) {
-                        return false;
-                    }
-                    replica->mark_complete();
-                    return true;
-                });
-        ASSERT_TRUE(completed.has_value());
-        ASSERT_TRUE(*completed) << "replica " << replica_id << " is absent";
+        MasterServiceTestPeer::MetadataAccessorRW accessor(
+            service, MasterServiceTestPeer::ObjectIdentity{
+                         .tenant_id = tenant_id, .user_key = key});
+        ASSERT_TRUE(accessor.Exists());
+        auto* replica = accessor.Get().GetReplicaByID(replica_id);
+        ASSERT_NE(replica, nullptr);
+        replica->mark_complete();
     }
 
     static std::unique_ptr<AllocatedBuffer> AllocateOnSegmentForTesting(

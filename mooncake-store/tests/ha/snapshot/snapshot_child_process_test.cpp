@@ -589,21 +589,13 @@ class SnapshotChildProcessTest : public ::testing::Test {
 
     std::optional<std::chrono::system_clock::time_point> GetSoftPinDeadline(
         MasterService* svc, const std::string& key) {
-        // The deadline is itself an optional, so it is read from the entry
-        // rather than through the published-object helper.
-        auto handle =
-            MasterServiceTestPeer::Tenants(*svc).Lookup(TenantId::Default());
-        if (handle == nullptr) {
+        MasterServiceTestPeer::MetadataAccessorRO accessor(
+            svc,
+            MasterServiceTestPeer::ObjectIdentity{TenantId::Default(), key});
+        if (!accessor.IsPublished()) {
             return std::nullopt;
         }
-        auto entry = handle->Get(key);
-        if (entry == nullptr) {
-            return std::nullopt;
-        }
-        return entry->WithSharedAccess(
-            [](const ObjectMetadata& metadata, const ObjectEntry::State&) {
-                return metadata.GetCommittedSoftPinTimeout();
-            });
+        return accessor.Get().GetCommittedSoftPinTimeout();
     }
 
     tl::expected<void, SerializationError> DeserializeMetadataForTest(
@@ -613,19 +605,10 @@ class SnapshotChildProcessTest : public ::testing::Test {
     }
 
     bool ObjectIsGroupedInMetadata(const std::string& key) {
-        auto handle = MasterServiceTestPeer::Tenants(*service_).Lookup(
-            TenantId::Default());
-        if (handle == nullptr) {
-            return false;
-        }
-        auto entry = handle->Get(key);
-        if (entry == nullptr) {
-            return false;
-        }
-        return entry->WithSharedAccess(
-            [](const ObjectMetadata& metadata, const ObjectEntry::State&) {
-                return metadata.IsGrouped();
-            });
+        MasterServiceTestPeer::MetadataAccessorRO accessor(
+            service_.get(),
+            MasterServiceTestPeer::ObjectIdentity{TenantId::Default(), key});
+        return accessor.GetEntry() != nullptr && accessor.Get().IsGrouped();
     }
 
    private:

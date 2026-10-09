@@ -22,7 +22,10 @@ bool AddOverflows(uint64_t lhs, uint64_t rhs) {
 
 TenantQuotaResult TenantQuotaLedger::AdoptPendingCharge(
     TenantQuotaHandle account, uint64_t bytes) {
-    if (account == nullptr || bytes > TenantQuotaAccount::kMaxChargedBytes) {
+    if (account == nullptr) {
+        return {};
+    }
+    if (bytes > TenantQuotaAccount::kMaxChargedBytes) {
         return InvalidArgument();
     }
     if (pending_bytes_ != 0 || AddOverflows(TotalChargedBytes(), bytes)) {
@@ -34,8 +37,10 @@ TenantQuotaResult TenantQuotaLedger::AdoptPendingCharge(
 
 TenantQuotaResult TenantQuotaLedger::SettlePrimaryWrite(
     TenantQuotaHandle account, uint64_t actual_committed_bytes) {
-    if (account == nullptr ||
-        actual_committed_bytes > TenantQuotaAccount::kMaxChargedBytes) {
+    if (account == nullptr) {
+        return {};
+    }
+    if (actual_committed_bytes > TenantQuotaAccount::kMaxChargedBytes) {
         return InvalidArgument();
     }
     if (AddOverflows(pending_bytes_, committed_bytes_)) {
@@ -62,8 +67,10 @@ TenantQuotaResult TenantQuotaLedger::SettlePrimaryWrite(
 TenantQuotaResult TenantQuotaLedger::SettleAdditional(TenantQuotaHandle account,
                                                       uint64_t pending_bytes,
                                                       uint64_t actual_bytes) {
-    if (account == nullptr ||
-        pending_bytes > TenantQuotaAccount::kMaxChargedBytes ||
+    if (account == nullptr) {
+        return {};
+    }
+    if (pending_bytes > TenantQuotaAccount::kMaxChargedBytes ||
         actual_bytes > TenantQuotaAccount::kMaxChargedBytes) {
         return InvalidArgument();
     }
@@ -83,7 +90,7 @@ TenantQuotaResult TenantQuotaLedger::SettleAdditional(TenantQuotaHandle account,
 
 TenantQuotaResult TenantQuotaLedger::RefundPending(TenantQuotaHandle account) {
     if (account == nullptr) {
-        return InvalidArgument();
+        return {};
     }
     if (pending_bytes_ == 0) {
         return AccountingMismatch();
@@ -98,7 +105,10 @@ TenantQuotaResult TenantQuotaLedger::RefundPending(TenantQuotaHandle account) {
 
 TenantQuotaResult TenantQuotaLedger::ReleaseCommitted(TenantQuotaHandle account,
                                                       uint64_t bytes) {
-    if (account == nullptr || bytes > TenantQuotaAccount::kMaxChargedBytes) {
+    if (account == nullptr) {
+        return {};
+    }
+    if (bytes > TenantQuotaAccount::kMaxChargedBytes) {
         return InvalidArgument();
     }
     if (bytes == 0) {
@@ -117,7 +127,10 @@ TenantQuotaResult TenantQuotaLedger::ReleaseCommitted(TenantQuotaHandle account,
 
 TenantQuotaResult TenantQuotaLedger::TransferReplacementCharge(
     TenantQuotaHandle account, TenantQuotaLedger& destination) {
-    if (account == nullptr || this == &destination) {
+    if (account == nullptr) {
+        return {};
+    }
+    if (this == &destination) {
         return InvalidArgument();
     }
     if (pending_bytes_ != 0 || destination.replaced_bytes_ != 0 ||
@@ -139,7 +152,7 @@ TenantQuotaResult TenantQuotaLedger::TransferReplacementCharge(
 TenantQuotaResult TenantQuotaLedger::ReleaseReplacement(
     TenantQuotaHandle account) {
     if (account == nullptr) {
-        return InvalidArgument();
+        return {};
     }
     if (replaced_bytes_ == 0) {
         return AccountingMismatch();
@@ -154,7 +167,7 @@ TenantQuotaResult TenantQuotaLedger::ReleaseReplacement(
 
 TenantQuotaResult TenantQuotaLedger::ReleaseAll(TenantQuotaHandle account) {
     if (account == nullptr) {
-        return InvalidArgument();
+        return {};
     }
     const uint64_t total_bytes = TotalChargedBytes();
     if (total_bytes == 0) {
@@ -172,8 +185,10 @@ TenantQuotaResult TenantQuotaLedger::ReleaseAll(TenantQuotaHandle account) {
 
 TenantQuotaResult TenantQuotaLedger::Rebuild(TenantQuotaHandle account,
                                              uint64_t committed_bytes) {
-    if (account == nullptr ||
-        committed_bytes > TenantQuotaAccount::kMaxChargedBytes) {
+    if (account == nullptr) {
+        return {};
+    }
+    if (committed_bytes > TenantQuotaAccount::kMaxChargedBytes) {
         return InvalidArgument();
     }
     pending_bytes_ = 0;

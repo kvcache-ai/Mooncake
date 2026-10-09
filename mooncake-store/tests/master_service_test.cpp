@@ -26,6 +26,7 @@
 
 #include <unistd.h>
 
+#include "common/shrink_buckets.h"
 #include "tenant_quota_policy_store.h"
 #include "types.h"
 #include "master_service_test_fixture.h"
@@ -2593,6 +2594,42 @@ TEST_F(MasterServiceTest, WrappedRequestBoundaryPreservesTenantNormalization) {
         single_tenant_service.ExistKey("missing-key", "_invalid-tenant");
     ASSERT_TRUE(invalid.has_value());
     EXPECT_FALSE(invalid.value());
+}
+
+TEST_F(MasterServiceTest, WrappedSingleTenantModeCollapsesRequestTenants) {
+    WrappedMasterServiceConfig service_config;
+    service_config.default_kv_lease_ttl = 100;
+    service_config.enable_metric_reporting = false;
+    service_config.enable_multi_tenants = false;
+    WrappedMasterService service(service_config);
+
+    Segment segment = MakeSegment("wrapped_single_tenant_segment");
+    const UUID client_id = generate_uuid();
+    ASSERT_TRUE(service.MountSegment(segment, client_id).has_value());
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    const std::string key = "wrapped_single_tenant_key";
+    ASSERT_TRUE(
+        service.PutStart(client_id, key, 1024, config, "tenant-a").has_value());
+    ASSERT_TRUE(service
+                    .PutEnd(client_id, ObjectMeta{key, std::nullopt},
+                            ReplicaType::MEMORY, "tenant-a")
+                    .has_value());
+
+    // Every tenant a request names resolves to the default tenant, so another
+    // name reaches the same object.
+    auto exists = service.ExistKey(key, "tenant-b");
+    ASSERT_TRUE(exists.has_value());
+    EXPECT_TRUE(exists.value());
+    auto duplicate = service.PutStart(client_id, key, 1024, config, "tenant-b");
+    ASSERT_FALSE(duplicate.has_value());
+    EXPECT_EQ(duplicate.error(), ErrorCode::OBJECT_ALREADY_EXISTS);
+    EXPECT_TRUE(service.Remove(key, /*force=*/true, "tenant-b").has_value());
+
+    auto snapshot = service.GetTenantQuotaSnapshot("tenant-a");
+    ASSERT_FALSE(snapshot.has_value());
+    EXPECT_EQ(snapshot.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
 }
 
 TEST_F(MasterServiceTest, PutStartExpiringTest) {

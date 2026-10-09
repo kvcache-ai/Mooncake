@@ -262,12 +262,11 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
     }
 #endif
 
+    // Charges through the tenant, the way every data-plane path does.
     tl::expected<void, ErrorCode> ChargeTenantQuotaForTest(
         MasterService& service, const TenantId& tenant_id, uint64_t bytes) {
-        return MasterServiceTestPeer(service).ChargeTenantQuota(
-            MasterServiceTestPeer::TenantQuotaTable(service)
-                .GetOrCreateTenantHandle(tenant_id),
-            bytes);
+        return GetOrCreateTenantHandleForTest(service, tenant_id)
+            ->ChargeQuota(bytes);
     }
 
     // The tenant for one tenant id, created through the registry's factory on
@@ -286,19 +285,7 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
         if (tenant == nullptr) {
             return nullptr;
         }
-        return MasterServiceTestPeer(service).GetBoundTenantQuotaHandle(
-            *tenant);
-    }
-
-    tl::expected<void, ErrorCode> ChargeBoundTenantQuotaForTest(
-        MasterService& service, TenantQuotaHandle account, uint64_t bytes) {
-        return MasterServiceTestPeer(service).ChargeTenantQuota(account, bytes);
-    }
-
-    void ReleaseBoundTenantQuotaForTest(MasterService& service,
-                                        TenantQuotaHandle account,
-                                        uint64_t bytes) {
-        MasterServiceTestPeer(service).ReleaseTenantQuota(account, bytes);
+        return tenant->QuotaAccount();
     }
 
     // Sweeps one tenant: its objects are its whole route, so no key is named.
@@ -308,7 +295,7 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
             MasterServiceTestPeer(service).GetOrCreateTenantHandle(tenant_id);
         ASSERT_NE(tenant, nullptr);
         MasterServiceTestPeer(service).DiscardExpiredProcessingReplicas(
-            *tenant, std::chrono::system_clock::time_point::max());
+            *tenant, tenant_id, std::chrono::system_clock::time_point::max());
     }
 
     void FinalizeExpiredProcessingForTest(MasterService& service,
@@ -317,33 +304,30 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
         auto object_entry = MasterServiceTestPeer::FindObject(
             service, MasterServiceTestPeer::ObjectIdentity{tenant_id, key});
         ASSERT_NE(object_entry, nullptr);
-        OpLogEntry durable;
-        durable.tenant_id = tenant_id.value();
-        durable.object_key = key;
+        OpLogEntry entry;
+        entry.tenant_id = tenant_id.value();
+        entry.object_key = key;
         MasterServiceTestPeer(service)
             .FinalizeExpiredProcessingReplicasAfterDurable(
-                object_entry, durable, std::chrono::system_clock::now());
+                object_entry, entry, std::chrono::system_clock::now());
     }
 
     void FinalizeRemovedMemoryReplicasForTest(MasterService& service,
                                               const TenantId& tenant_id,
                                               const std::string& key) {
         std::vector<ReplicaID> removed_ids;
-        const auto visited =
-            MasterServiceTestPeer(service).WithPublishedObjectForWrite(
-                tenant_id, key,
-                [&removed_ids](metadata::Tenant&,
-                               const std::shared_ptr<ObjectEntry>&,
-                               ObjectMetadata& metadata, ObjectEntry::State&) {
-                    metadata.VisitReplicas(
-                        &Replica::fn_is_memory_replica,
-                        [&removed_ids](Replica& replica) {
-                            removed_ids.push_back(replica.id());
-                            replica.mark_removed();
-                        });
-                    return true;
+        {
+            MasterServiceTestPeer::MetadataAccessorRW accessor(
+                &service,
+                MasterServiceTestPeer::ObjectIdentity{tenant_id, key});
+            ASSERT_TRUE(accessor.Exists());
+            accessor.Get().VisitReplicas(
+                &Replica::fn_is_memory_replica,
+                [&removed_ids](Replica& replica) {
+                    removed_ids.push_back(replica.id());
+                    replica.mark_removed();
                 });
-        ASSERT_TRUE(visited.has_value());
+        }
         ASSERT_FALSE(removed_ids.empty());
 
         OpLogEntry entry;
@@ -439,24 +423,21 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
     std::vector<std::string> policy_files_;
 };
 
-TEST_F(MasterServiceTenantQuotaTest,
-       SingleTenantModeCollapsesTenantsAndDisablesQuota) {
+TEST_F(MasterServiceTenantQuotaTest, SingleTenantModeDisablesQuota) {
     MasterService service(MakeConfig({}, /*enable_multi_tenants=*/false));
     UUID client_id = MountSegment(service, /*size=*/1024);
 
-    PutComplete(service, client_id, "shared-key", TenantId("tenant-a"), 800);
-
-    EXPECT_TRUE(service.ExistKey("shared-key", TenantId("tenant-b")).value());
-    auto duplicate = service.PutStart(client_id, "shared-key",
-                                      TenantId("tenant-b"), 1, MemoryConfig());
-    ASSERT_FALSE(duplicate.has_value());
-    EXPECT_EQ(duplicate.error(), ErrorCode::OBJECT_ALREADY_EXISTS);
+    // In this mode the request layer resolves every tenant to the default one
+    // (WrappedSingleTenantModeCollapsesRequestTenants), and no tenant is
+    // metered.
+    PutComplete(service, client_id, "shared-key", TenantId::Default(), 800);
+    EXPECT_TRUE(service.IsTenantRegistered(TenantId("tenant-a")));
+    EXPECT_FALSE(
+        service.GetTenantQuotaSnapshot(TenantId::Default()).has_value());
     EXPECT_TRUE(service
-                    .Remove("shared-key", TenantId("tenant-b"),
+                    .Remove("shared-key", TenantId::Default(),
                             /*force=*/true)
                     .has_value());
-    EXPECT_FALSE(
-        service.GetTenantQuotaSnapshot(TenantId("tenant-a")).has_value());
 }
 
 TEST_F(MasterServiceTenantQuotaTest,
@@ -487,6 +468,16 @@ TEST_F(MasterServiceTenantQuotaTest,
     PutComplete(service, client_id, "ok", TenantId("tenant-a"), 10);
 }
 
+TEST_F(MasterServiceTenantQuotaTest, RemoveOnUnknownTenantCreatesNoTenant) {
+    MasterService service(MakeConfig({{TenantId("tenant-a"), 1000}}));
+    const TenantId unknown("tenant-unknown");
+
+    auto removed = service.Remove("missing", unknown);
+    ASSERT_FALSE(removed.has_value());
+    EXPECT_EQ(removed.error(), ErrorCode::OBJECT_NOT_FOUND);
+    EXPECT_EQ(MasterServiceTestPeer::Tenants(service).Lookup(unknown), nullptr);
+}
+
 TEST_F(MasterServiceTenantQuotaTest,
        GetOrCreateTenantHandleIsIdempotentForOneTenantId) {
     const TenantId tenant_id("tenant-a");
@@ -507,23 +498,41 @@ TEST_F(MasterServiceTenantQuotaTest,
     // ...and that tenant owns exactly one bound account.
     EXPECT_EQ(first_handle, second_handle);
 
-    auto charge = ChargeBoundTenantQuotaForTest(service, first_handle, 128);
+    auto charge = first_tenant->ChargeQuota(128);
     ASSERT_TRUE(charge.has_value()) << toString(charge.error());
     EXPECT_EQ(Snapshot(service, tenant_id).charged_bytes, 128);
 
-    ReleaseBoundTenantQuotaForTest(service, second_handle, 128);
+    second_tenant->ReleaseQuota(128);
     EXPECT_EQ(Snapshot(service, tenant_id).charged_bytes, 0);
 }
 
-TEST_F(MasterServiceTenantQuotaTest,
-       ChargeRejectsMissingHandleWhenQuotaIsEnabled) {
+TEST_F(MasterServiceTenantQuotaTest, DroppedReservationGivesTheChargeBack) {
     const TenantId tenant_id("tenant-a");
     MasterService service(MakeConfig({{tenant_id, 1000}}));
     MountSegment(service);
+    auto tenant = GetOrCreateTenantHandleForTest(service, tenant_id);
+    ASSERT_NE(tenant, nullptr);
 
-    auto charge = ChargeBoundTenantQuotaForTest(service, nullptr, 1);
-    ASSERT_FALSE(charge.has_value());
-    EXPECT_EQ(charge.error(), ErrorCode::INTERNAL_ERROR);
+    {
+        auto reservation = tenant->ReserveQuota(128);
+        ASSERT_TRUE(reservation.has_value()) << toString(reservation.error());
+        EXPECT_EQ(Snapshot(service, tenant_id).charged_bytes, 128);
+    }
+    EXPECT_EQ(Snapshot(service, tenant_id).charged_bytes, 0);
+
+    {
+        auto reservation = tenant->ReserveQuota(128);
+        ASSERT_TRUE(reservation.has_value()) << toString(reservation.error());
+        EXPECT_EQ(reservation->Commit(), 128);
+    }
+    // Committed: the caller owes the bytes now, so the drop keeps them.
+    EXPECT_EQ(Snapshot(service, tenant_id).charged_bytes, 128);
+    tenant->ReleaseQuota(128);
+
+    // A rejected reservation charges nothing.
+    auto too_large = tenant->ReserveQuota(UINT64_C(1) << 40);
+    ASSERT_FALSE(too_large.has_value());
+    EXPECT_EQ(too_large.error(), ErrorCode::TENANT_QUOTA_EXCEEDED);
     EXPECT_EQ(Snapshot(service, tenant_id).charged_bytes, 0);
 }
 

@@ -27,7 +27,6 @@ TEST(ObjectEntryTest, OwnsMetadataEnvelopeFromConstruction) {
             ASSERT_TRUE(m.object_checksum.has_value());
             EXPECT_EQ(*m.object_checksum, 42u);
             EXPECT_FALSE(state.is_processing);
-            EXPECT_FALSE(state.is_torn_down);
         });
 }
 

@@ -715,27 +715,17 @@ class MasterServiceHATest : public ::testing::Test {
     static size_t ReplicaCountForTesting(MasterService& service,
                                          const TenantId& tenant_id,
                                          const std::string& key) {
-        return MasterServiceTestPeer(service)
-            .WithPublishedObjectForRead(
-                tenant_id, key,
-                [](const metadata::Tenant&, const std::shared_ptr<ObjectEntry>&,
-                   const ObjectMetadata& metadata, const ObjectEntry::State&) {
-                    return metadata.CountReplicas();
-                })
-            .value_or(0);
+        MasterServiceTestPeer::MetadataAccessorRO accessor(
+            &service, MasterServiceTestPeer::ObjectIdentity{tenant_id, key});
+        return accessor.Exists() ? accessor.Get().CountReplicas() : 0;
     }
 
     static bool IsHardPinnedForTesting(MasterService& service,
                                        const TenantId& tenant_id,
                                        const std::string& key) {
-        return MasterServiceTestPeer(service)
-            .WithPublishedObjectForRead(
-                tenant_id, key,
-                [](const metadata::Tenant&, const std::shared_ptr<ObjectEntry>&,
-                   const ObjectMetadata& metadata, const ObjectEntry::State&) {
-                    return metadata.IsHardPinned();
-                })
-            .value_or(false);
+        MasterServiceTestPeer::MetadataAccessorRO accessor(
+            &service, MasterServiceTestPeer::ObjectIdentity{tenant_id, key});
+        return accessor.Exists() && accessor.Get().IsHardPinned();
     }
 
     static std::vector<Replica::Descriptor> ReplicaDescriptorsForTesting(
@@ -743,65 +733,51 @@ class MasterServiceHATest : public ::testing::Test {
         const std::string& key) {
         // Read as stored: a replica a request path would refuse to serve is
         // still reported here.
-        return MasterServiceTestPeer(service)
-            .WithStoredObjectForRead(
-                tenant_id, key,
-                [](const std::shared_ptr<ObjectEntry>&,
-                   const ObjectMetadata& metadata, const ObjectEntry::State&) {
-                    std::vector<Replica::Descriptor> descriptors;
-                    for (const auto& replica : metadata.GetAllReplicas()) {
-                        descriptors.push_back(replica.get_descriptor());
-                    }
-                    return descriptors;
-                })
-            .value_or(std::vector<Replica::Descriptor>{});
+        MasterServiceTestPeer::MetadataAccessorRO accessor(
+            &service, MasterServiceTestPeer::ObjectIdentity{tenant_id, key});
+        if (!accessor.IsPublished()) {
+            return {};
+        }
+        std::vector<Replica::Descriptor> descriptors;
+        for (const auto& replica : accessor.Get().GetAllReplicas()) {
+            descriptors.push_back(replica.get_descriptor());
+        }
+        return descriptors;
     }
 
     static bool HasMetadataEntryForTesting(MasterService& service,
                                            const TenantId& tenant_id,
                                            const std::string& key) {
-        auto tenant = MasterServiceTestPeer::Tenants(service).Lookup(
-            MasterServiceTestPeer(service).ResolveRequestTenantId(tenant_id));
+        auto tenant = MasterServiceTestPeer::Tenants(service).Lookup(tenant_id);
         return tenant != nullptr && tenant->ContainsObject(key);
     }
 
     static bool HasInvalidMemoryHandleForTesting(MasterService& service,
                                                  const TenantId& tenant_id,
                                                  const std::string& key) {
-        // A missing or unreadable object counts as having no valid handle,
-        // which is the state the callers assert.
-        return MasterServiceTestPeer(service)
-            .WithPublishedObjectForRead(
-                tenant_id, key,
-                [](const metadata::Tenant&, const std::shared_ptr<ObjectEntry>&,
-                   const ObjectMetadata& metadata, const ObjectEntry::State&) {
-                    for (const auto& replica : metadata.GetAllReplicas()) {
-                        if (replica.has_invalid_mem_handle()) {
-                            return true;
-                        }
-                    }
-                    return false;
-                })
-            .value_or(true);
+        MasterServiceTestPeer::MetadataAccessorRO accessor(
+            &service, MasterServiceTestPeer::ObjectIdentity{tenant_id, key});
+        if (!accessor.Exists()) {
+            return true;
+        }
+        for (const auto& replica : accessor.Get().GetAllReplicas()) {
+            if (replica.has_invalid_mem_handle()) {
+                return true;
+            }
+        }
+        return false;
     }
 
     static bool HasReadableReplicaForTesting(MasterService& service,
                                              const TenantId& tenant_id,
                                              const std::string& key) {
-        return MasterServiceTestPeer(service)
-            .WithPublishedObjectForRead(
-                tenant_id, key,
-                [&service](const metadata::Tenant&,
-                           const std::shared_ptr<ObjectEntry>&,
-                           const ObjectMetadata& metadata,
-                           const ObjectEntry::State&) {
-                    return metadata.HasReplica([&service](
-                                                   const Replica& replica) {
-                        return MasterServiceTestPeer(service).IsReplicaReadable(
-                            replica);
-                    });
-                })
-            .value_or(false);
+        MasterServiceTestPeer::MetadataAccessorRO accessor(
+            &service, MasterServiceTestPeer::ObjectIdentity{tenant_id, key});
+        return accessor.Exists() &&
+               accessor.Get().HasReplica([&service](const Replica& replica) {
+                   return MasterServiceTestPeer(service).IsReplicaReadable(
+                       replica);
+               });
     }
 
     static std::shared_ptr<ClientLivenessRecord> ClientRecordForTesting(
@@ -826,68 +802,51 @@ class MasterServiceHATest : public ::testing::Test {
                                                     const std::string& key) {
         // A stale handle leaves the object held but unreadable, so the stored
         // object is what this has to look at.
-        return MasterServiceTestPeer(service)
-            .WithStoredObjectForRead(
-                tenant_id, key,
-                [](const std::shared_ptr<ObjectEntry>&,
-                   const ObjectMetadata& metadata, const ObjectEntry::State&) {
-                    return metadata.HasReplica([](const Replica& replica) {
-                        return replica.is_memory_replica() &&
-                               replica.is_completed();
-                    });
-                })
-            .value_or(false);
+        MasterServiceTestPeer::MetadataAccessorRO accessor(
+            &service, MasterServiceTestPeer::ObjectIdentity{tenant_id, key});
+        return accessor.GetEntry() != nullptr &&
+               accessor.Get().HasReplica([](const Replica& replica) {
+                   return replica.is_memory_replica() && replica.is_completed();
+               });
     }
 
     static bool MemoryReplicaAffiliatedWithForTesting(
         MasterService& service, const TenantId& tenant_id,
         const std::string& key,
         const std::shared_ptr<ClientLivenessRecord>& record) {
-        return MasterServiceTestPeer(service)
-            .WithPublishedObjectForRead(
-                tenant_id, key,
-                [&record](const metadata::Tenant&,
-                          const std::shared_ptr<ObjectEntry>&,
-                          const ObjectMetadata& metadata,
-                          const ObjectEntry::State&) {
-                    return metadata.HasReplica(
-                        [&record](const Replica& replica) {
-                            return replica.is_memory_replica() &&
-                                   replica.isAffiliatedWith(record);
-                        });
-                })
-            .value_or(false);
+        MasterServiceTestPeer::MetadataAccessorRO accessor(
+            &service, MasterServiceTestPeer::ObjectIdentity{tenant_id, key});
+        if (!accessor.Exists()) {
+            return false;
+        }
+        return accessor.Get().HasReplica([&](const Replica& replica) {
+            return replica.is_memory_replica() &&
+                   replica.isAffiliatedWith(record);
+        });
     }
 
     static void SetLeaseDeadlineForTesting(
         MasterService& service, const TenantId& tenant_id,
         const std::string& key,
         std::chrono::system_clock::time_point deadline) {
-        auto written =
-            MasterServiceTestPeer(service).WithPublishedObjectForWrite(
-                tenant_id, key,
-                [&](metadata::Tenant&, const std::shared_ptr<ObjectEntry>&,
-                    ObjectMetadata& metadata, ObjectEntry::State&) {
-                    SpinLocker locker(&metadata.lock);
-                    metadata.lease_->SetDeadline(deadline);
-                    return true;
-                });
-        ASSERT_TRUE(written.has_value());
+        MasterServiceTestPeer::MetadataAccessorRW accessor(
+            &service, MasterServiceTestPeer::ObjectIdentity{tenant_id, key});
+        ASSERT_TRUE(accessor.Exists());
+        SpinLocker locker(&accessor.Get().lock);
+        accessor.Get().lease_->SetDeadline(deadline);
     }
 
     static std::chrono::system_clock::time_point LeaseDeadlineForTesting(
         MasterService& service, const TenantId& tenant_id,
         const std::string& key) {
-        auto deadline =
-            MasterServiceTestPeer(service).WithPublishedObjectForRead(
-                tenant_id, key,
-                [](const metadata::Tenant&, const std::shared_ptr<ObjectEntry>&,
-                   const ObjectMetadata& metadata, const ObjectEntry::State&) {
-                    SpinLocker locker(&metadata.lock);
-                    return metadata.lease_->ExpiresAt();
-                });
-        EXPECT_TRUE(deadline.has_value());
-        return deadline.value_or(std::chrono::system_clock::time_point{});
+        MasterServiceTestPeer::MetadataAccessorRO accessor(
+            &service, MasterServiceTestPeer::ObjectIdentity{tenant_id, key});
+        EXPECT_TRUE(accessor.Exists());
+        if (!accessor.Exists()) {
+            return {};
+        }
+        SpinLocker locker(&accessor.Get().lock);
+        return accessor.Get().lease_->ExpiresAt();
     }
 
     static uint64_t EvictTenantMemoryForQuotaForTesting(
@@ -1059,8 +1018,10 @@ class MasterServiceHATest : public ::testing::Test {
     static void EraseObjectForTesting(MasterService& service,
                                       const TenantId& tenant_id,
                                       const std::string& key) {
-        ASSERT_TRUE(MasterServiceTestPeer(service).EraseObjectForTesting(
-            tenant_id, key));
+        MasterServiceTestPeer::MetadataAccessorRW accessor(
+            &service, MasterServiceTestPeer::ObjectIdentity{tenant_id, key});
+        ASSERT_TRUE(accessor.Exists());
+        accessor.Erase();
     }
 
     static void PrepareUnmountSegmentForTesting(MasterService& service,
@@ -1075,20 +1036,18 @@ class MasterServiceHATest : public ::testing::Test {
     static std::vector<ReplicaID> MarkCompletedReplicasRemovedForTesting(
         MasterService& service, const TenantId& tenant_id,
         const std::string& key) {
-        return MasterServiceTestPeer(service)
-            .WithPublishedObjectForWrite(
-                tenant_id, key,
-                [](metadata::Tenant&, const std::shared_ptr<ObjectEntry>&,
-                   ObjectMetadata& metadata, ObjectEntry::State&) {
-                    std::vector<ReplicaID> ids;
-                    metadata.VisitReplicas(&Replica::fn_is_completed,
-                                           [&ids](Replica& replica) {
-                                               ids.push_back(replica.id());
-                                               replica.mark_removed();
-                                           });
-                    return ids;
-                })
-            .value_or(std::vector<ReplicaID>{});
+        MasterServiceTestPeer::MetadataAccessorRW accessor(
+            &service, MasterServiceTestPeer::ObjectIdentity{tenant_id, key});
+        if (!accessor.Exists()) {
+            return {};
+        }
+        std::vector<ReplicaID> ids;
+        accessor.Get().VisitReplicas(&Replica::fn_is_completed,
+                                     [&ids](Replica& replica) {
+                                         ids.push_back(replica.id());
+                                         replica.mark_removed();
+                                     });
+        return ids;
     }
 
     static void FinalizeRemovedReplicasForTesting(
