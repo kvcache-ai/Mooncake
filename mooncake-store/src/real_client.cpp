@@ -26,6 +26,8 @@
 
 #include "real_client.h"
 #include "embedded_master.h"
+#include "environ.h"
+#include "environment_variables.h"
 #include "common/client_buffer_allocation.h"
 #include "common/mmap_aligned.h"
 #include "registered_pinned_memory.h"
@@ -945,7 +947,9 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     this->protocol = protocol;
     this->ipc_socket_path_ = ipc_socket_path;
     if (!enable_embedded_master &&
-        Environ::GetBool("MOONCAKE_ENABLE_EMBEDDED_MASTER", false)) {
+        Environ::Process().GetTypedOr(
+            EmbeddedMasterEnvironmentVariables::MOONCAKE_ENABLE_EMBEDDED_MASTER,
+            false)) {
         LOG(INFO) << "enable_embedded_master inferred from "
                      "MOONCAKE_ENABLE_EMBEDDED_MASTER";
         enable_embedded_master = true;
@@ -1487,8 +1491,9 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     bool enable_embedded_master =
         get_config_bool(config, CONFIG_KEY_ENABLE_EMBEDDED_MASTER, false);
     if (!enable_embedded_master) {
-        enable_embedded_master =
-            Environ::GetBool("MOONCAKE_ENABLE_EMBEDDED_MASTER", false);
+        enable_embedded_master = Environ::Process().GetTypedOr(
+            EmbeddedMasterEnvironmentVariables::MOONCAKE_ENABLE_EMBEDDED_MASTER,
+            false);
     }
 
     // Validate required parameters

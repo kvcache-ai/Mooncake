@@ -32,7 +32,6 @@
 
 #include "common.h"
 #include "config.h"
-#include "environ.h"
 #include "memory_location.h"
 #include "topology.h"
 #include "transport/batch_registration.h"
@@ -66,7 +65,7 @@ void EfaTransport::startWorkerThreads() {
     worker_running_ = true;
     // MC_EFA_CQ_THREADS caps CQ poller count (default 1). Set 0 to disable cap.
     size_t num_threads = context_list_.size();
-    int cq_cap = Environ::Get().GetEfaCqThreads();
+    const int cq_cap = globalConfig().efa_cq_threads;
     if (cq_cap > 0 && static_cast<size_t>(cq_cap) < num_threads) {
         num_threads = static_cast<size_t>(cq_cap);
     }
