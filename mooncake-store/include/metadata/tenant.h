@@ -1,9 +1,9 @@
 #pragma once
 
-// Tenant: one tenant's object route and the lifecycle of its groups, plus the
-// charges against the quota account it was built with. Replica-action leases
-// and promotion candidates belong to their own subsystems, which validate what
-// they hold against the entry the route publishes before acting on it.
+// Tenant: one tenant's object route, the lifecycle of its groups and the list
+// of its objects with work in flight. Quota, replica-action leases and
+// promotion candidates belong to their own subsystems, which hold their own
+// state and validate it against the entry the route publishes before acting.
 //
 // Identity is the entry handle: an entry stands for exactly one publication, so
 // `TearDownObject` recognises an object by the handle a caller holds and drops
@@ -21,41 +21,25 @@
 #include <cassert>
 #include <chrono>
 #include <cstdint>
-#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
-#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
-#include <glog/logging.h>
-#include <ylt/util/tl/expected.hpp>
-
 #include "common/intrusive_list.h"
 #include "common/transparent_string_hash.h"
 #include "group_index.h"
 #include "object_index.h"
-#include "tenant_quota.h"
-#include "types.h"
 
 namespace mooncake {
 namespace metadata {
 
 class Tenant {
    public:
-    // An unmetered tenant, for quotas off: its objects charge nothing.
-    Tenant() = default;
-
-    // A metered tenant, bound to its account in the quota table. The binding
-    // never changes: the table keeps one stable account per tenant id and a
-    // policy recompute updates it in place.
-    explicit Tenant(TenantQuotaAccount& quota_account)
-        : quota_account_(&quota_account) {}
-
     // Publishes `entry` on this tenant's route. The route slot and the group
     // lease are wired under the entry's own lock, so a reader that reaches the
     // entry through the route cannot observe a grouped object before its group
@@ -262,132 +246,6 @@ class Tenant {
         return keys;
     }
 
-    // --- Quota ---------------------------------------------------------------
-    //
-    // The tenant charges and releases its own account; an unmetered tenant has
-    // none, so every charge below succeeds and every release is a no-op. How
-    // large the account is belongs to TenantQuotaManager.
-
-    // A charge held for an operation still in flight. It is given back when
-    // the reservation goes out of scope, unless Commit() handed it on to what
-    // accounts for it from then on: a task's pending bytes or an object's
-    // ledger.
-    class QuotaReservation {
-       public:
-        QuotaReservation(QuotaReservation&& other) noexcept
-            : tenant_(other.tenant_), bytes_(std::exchange(other.bytes_, 0)) {}
-        QuotaReservation(const QuotaReservation&) = delete;
-        QuotaReservation& operator=(const QuotaReservation&) = delete;
-        QuotaReservation& operator=(QuotaReservation&&) = delete;
-        ~QuotaReservation() { tenant_->ReleaseQuota(bytes_); }
-
-        [[nodiscard]] uint64_t bytes() const { return bytes_; }
-        // The bytes, now owed by the caller instead of this reservation.
-        [[nodiscard]] uint64_t Commit() { return std::exchange(bytes_, 0); }
-
-       private:
-        friend class Tenant;
-        QuotaReservation(Tenant& tenant, uint64_t bytes)
-            : tenant_(&tenant), bytes_(bytes) {}
-
-        Tenant* tenant_;
-        uint64_t bytes_;
-    };
-
-    // Charges `bytes` to the account. Zero bytes charges nothing and only
-    // checks that the tenant still admits writes.
-    [[nodiscard]] tl::expected<void, ErrorCode> ChargeQuota(uint64_t bytes) {
-        if (quota_account_ == nullptr) {
-            return {};
-        }
-        auto result = quota_account_->TryCharge(bytes);
-        if (result) {
-            return {};
-        }
-        switch (result.error().error) {
-            case TenantQuotaError::kTenantNotRegistered:
-                return tl::make_unexpected(ErrorCode::TENANT_NOT_REGISTERED);
-            case TenantQuotaError::kQuotaExceeded:
-                return tl::make_unexpected(ErrorCode::TENANT_QUOTA_EXCEEDED);
-            case TenantQuotaError::kInvalidArgument:
-                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-            default:
-                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-        }
-    }
-
-    // ChargeQuota, held by a reservation the caller commits or drops.
-    [[nodiscard]] tl::expected<QuotaReservation, ErrorCode> ReserveQuota(
-        uint64_t bytes) {
-        auto charged = ChargeQuota(bytes);
-        if (!charged) {
-            return tl::make_unexpected(charged.error());
-        }
-        return QuotaReservation(*this, bytes);
-    }
-
-    void ReleaseQuota(uint64_t bytes) {
-        if (quota_account_ == nullptr || bytes == 0) {
-            return;
-        }
-        if (!quota_account_->Release(bytes)) {
-            LOG(ERROR) << "tenant quota release mismatch bytes=" << bytes;
-        }
-    }
-
-    // Null only for an unmetered tenant, which the quota ledger takes as
-    // nothing to charge.
-    [[nodiscard]] TenantQuotaHandle QuotaAccount() const {
-        return quota_account_;
-    }
-
-    // What an object charges once written: its size for every completed
-    // MEMORY replica, saturating at the 64-bit range.
-    [[nodiscard]] static uint64_t MemoryQuotaCharge(
-        const ObjectMetadata& metadata) {
-        const auto completed_replicas =
-            metadata.CountReplicas([](const Replica& replica) {
-                return replica.is_memory_replica() && replica.is_completed();
-            });
-        const unsigned __int128 charge =
-            static_cast<unsigned __int128>(metadata.size) * completed_replicas;
-        return charge > std::numeric_limits<uint64_t>::max()
-                   ? std::numeric_limits<uint64_t>::max()
-                   : static_cast<uint64_t>(charge);
-    }
-
-    // What all routed objects charge together, for a restore that rebuilds the
-    // account. Throws std::overflow_error past the accounting range.
-    [[nodiscard]] uint64_t QuotaUsage() const {
-        uint64_t charged_bytes = 0;
-        for (auto object : object_index_.ReadCursor()) {
-            const uint64_t charge = MemoryQuotaCharge(object.metadata());
-            if (charge > TenantQuotaAccount::kMaxChargedBytes ||
-                charged_bytes > TenantQuotaAccount::kMaxChargedBytes - charge) {
-                throw std::overflow_error(
-                    "rebuilt tenant quota exceeds 2^63 - 1 bytes");
-            }
-            charged_bytes += charge;
-        }
-        return charged_bytes;
-    }
-
-    // Resets every routed object's ledger to what its replicas charge. Only
-    // while no charge or release is in flight; the account itself is rebuilt
-    // by the quota table. Throws std::runtime_error when a ledger rejects it.
-    void RebuildQuotaLedgers(const TenantId& tenant_id) {
-        for (auto object : object_index_.WriteCursor()) {
-            ObjectMetadata& metadata = object.metadata();
-            auto rebuild_result = metadata.quota_ledger.Rebuild(
-                quota_account_, MemoryQuotaCharge(metadata));
-            if (!rebuild_result) {
-                throw std::runtime_error(
-                    "failed to rebuild object tenant quota ledger for " +
-                    tenant_id.value() + "/" + object.key());
-            }
-        }
-    }
-
    private:
     // Locks `entry` and keeps the hold only while the route still publishes
     // it. No route lookup is needed for that under the entry's lock: only
@@ -478,9 +336,6 @@ class Tenant {
 
     // Group membership and the one shared Lease per group.
     GroupIndex group_index_;
-
-    // The tenant's quota account, fixed at construction.
-    const TenantQuotaHandle quota_account_{nullptr};
 
     // The entries with work in flight. Declared after the route so it is
     // destroyed first: the route's handles keep every listed entry alive

@@ -1168,7 +1168,7 @@ class MasterService {
     // ClearInvalidHandles sweeps those. With HA and the oplog on, both are
     // cleaned through the oplog. False when it tore the object down.
     [[nodiscard]] bool CleanupInvalidMemoryReplicas(
-        const TenantId& tenant_id, metadata::Tenant& tenant,
+        const TenantId& tenant_id, const metadata::TenantHandle& tenant,
         const ObjectEntry::WriteHold& hold);
 
     // Reads the member keys registered for `group_id` from the tenant's group
@@ -1204,7 +1204,7 @@ class MasterService {
         const std::string& group_id, bool allow_soft_pinned,
         std::chrono::system_clock::time_point now,
         const std::function<EvictMemberOutcome(const ObjectEntry::WriteHold&,
-                                               metadata::Tenant&)>&
+                                               const metadata::TenantHandle&)>&
             evict_one_member);
 
     void ReleaseLocalDiskUsage(const std::vector<Replica>& replicas);
@@ -1224,18 +1224,18 @@ class MasterService {
     // release its refcounts, quota charges and KV removal events again.
     // Returns whether this call tore it down.
     [[nodiscard]] bool EraseMetadata(
-        metadata::Tenant& tenant, const ObjectEntry::WriteHold& hold,
-        const TenantId& tenant_id,
+        const metadata::TenantHandle& tenant,
+        const ObjectEntry::WriteHold& hold, const TenantId& tenant_id,
         QuotaEraseMode quota_mode = QuotaEraseMode::kFull,
         const std::vector<std::string>& previous_media_hint = {});
     // EraseMetadata's release step: everything keyed to the object but the
     // route slot.
     void ReleaseObjectRecords(
-        metadata::Tenant& tenant, const ObjectEntry::WriteHold& hold,
+        TenantQuotaBinding quota, const ObjectEntry::WriteHold& hold,
         const TenantId& tenant_id, QuotaEraseMode quota_mode,
         const std::vector<std::string>& previous_media_hint);
     tl::expected<void, ErrorCode> SettlePrimaryWriteQuotaIfReady(
-        metadata::Tenant& tenant, ObjectMetadata& metadata);
+        TenantQuotaBinding quota, ObjectMetadata& metadata);
     uint64_t RequestedMemoryQuotaCharge(uint64_t value_length,
                                         const ReplicateConfig& config) const;
     // Restore: rebuilds every object's quota ledger and every tenant's usage
@@ -1291,7 +1291,7 @@ class MasterService {
     // holds the object's own lock and passes the envelope and state it holds.
     bool CleanupStaleHandles(
         const std::string& key, const TenantId& tenant_id,
-        metadata::Tenant& tenant, ObjectMetadata& metadata,
+        TenantQuotaBinding quota, ObjectMetadata& metadata,
         ObjectEntry::State& state,
         const std::unordered_set<UUID, boost::hash<UUID>>& retaining_clients);
     // Predicate form, so the owner-targeted LOCAL_DISK sweep can reuse the
@@ -1299,7 +1299,7 @@ class MasterService {
     // duplicating it.
     bool CleanupStaleHandles(
         const std::string& key, const TenantId& tenant_id,
-        metadata::Tenant& tenant, ObjectMetadata& metadata,
+        TenantQuotaBinding quota, ObjectMetadata& metadata,
         ObjectEntry::State& state,
         const std::function<bool(const Replica&)>& is_stale);
 
@@ -1321,9 +1321,9 @@ class MasterService {
                           bool* dfs_allocation_failed = nullptr)
         -> tl::expected<std::vector<Replica>, ErrorCode>;
 
-    auto InsertMetadata(metadata::Tenant& tenant, const UUID& client_id,
-                        const std::string& key, uint64_t value_length,
-                        const ReplicateConfig& config,
+    auto InsertMetadata(const metadata::TenantHandle& tenant,
+                        const UUID& client_id, const std::string& key,
+                        uint64_t value_length, const ReplicateConfig& config,
                         const std::string& group_id, const TenantId& tenant_id,
                         const std::chrono::system_clock::time_point& now,
                         const ResolvedSoftPinRequest& soft_pin_request,
@@ -1337,10 +1337,10 @@ class MasterService {
     // tenant's route, and return descriptor list.  Shared by PutStart and
     // UpsertStart.
     auto AllocateAndInsertMetadata(
-        metadata::Tenant& tenant, const UUID& client_id, const std::string& key,
-        uint64_t value_length, const ReplicateConfig& config,
-        const std::string& writer_host_id, const std::string& group_id,
-        const TenantId& tenant_id,
+        const metadata::TenantHandle& tenant, const UUID& client_id,
+        const std::string& key, uint64_t value_length,
+        const ReplicateConfig& config, const std::string& writer_host_id,
+        const std::string& group_id, const TenantId& tenant_id,
         const std::chrono::system_clock::time_point& now,
         const ResolvedSoftPinRequest& soft_pin_request,
         std::optional<std::chrono::system_clock::time_point>
@@ -1352,7 +1352,7 @@ class MasterService {
      * @brief Helper to discard this tenant's expired processing replicas.
      */
     void DiscardExpiredProcessingReplicas(
-        metadata::Tenant& tenant, const TenantId& tenant_id,
+        const metadata::TenantHandle& tenant, const TenantId& tenant_id,
         const std::chrono::system_clock::time_point& now);
     void FreeDfsReplicas(const std::string& key,
                          const std::vector<Replica>& replicas);
@@ -1433,12 +1433,12 @@ class MasterService {
     // Erase any in-flight PromotionTask for the entry, refund its pending
     // charge, and decrement the cluster-wide in-flight counter. Safe no-op if
     // no task exists. The caller holds the entry's own lock.
-    void ErasePromotionTaskLocked(metadata::Tenant& tenant,
+    void ErasePromotionTaskLocked(TenantQuotaBinding quota,
                                   ObjectEntry::State& state);
     // Cancels a promotion task whose alloc_id is among the removed replicas.
     // The caller holds the object's own lock.
     void CancelPromotionTaskForRemovedReplicas(
-        metadata::Tenant& tenant, ObjectMetadata& metadata,
+        TenantQuotaBinding quota, ObjectMetadata& metadata,
         ObjectEntry::State& state,
         const std::vector<ReplicaID>& removed_replica_ids)
         NO_THREAD_SAFETY_ANALYSIS;
@@ -1510,7 +1510,7 @@ class MasterService {
             // Invalid memory replicas go first, which may tear the object
             // down.
             erased_ = !service_->CleanupInvalidMemoryReplicas(
-                object_id_.tenant_id, *tenant_, *hold_);
+                object_id_.tenant_id, tenant_, *hold_);
         }
 
         bool Exists() const {
@@ -1531,6 +1531,10 @@ class MasterService {
         }
 
         metadata::Tenant& GetTenant() { return *tenant_; }
+        const metadata::TenantHandle& GetTenantHandle() const {
+            return tenant_;
+        }
+        TenantQuotaBinding GetQuota() const { return tenant_.quota(); }
 
         // The held entry; like `Get()`, only once something is held.
         const std::shared_ptr<ObjectEntry>& GetEntry() const {
@@ -1548,9 +1552,9 @@ class MasterService {
         }
 
         void Erase(const std::vector<std::string>& previous_media_hint = {}) {
-            (void)service_->EraseMetadata(
-                *tenant_, *hold_, object_id_.tenant_id, QuotaEraseMode::kFull,
-                previous_media_hint);
+            (void)service_->EraseMetadata(tenant_, *hold_, object_id_.tenant_id,
+                                          QuotaEraseMode::kFull,
+                                          previous_media_hint);
             erased_ = true;
         }
 
@@ -1561,7 +1565,7 @@ class MasterService {
        private:
         MasterService* service_;
         ObjectIdentity object_id_;
-        std::shared_ptr<metadata::Tenant> tenant_;
+        metadata::TenantHandle tenant_;
         std::optional<ObjectEntry::Hold<LockMode::kWrite>> hold_;
         bool erased_{false};
     };
@@ -1634,6 +1638,7 @@ class MasterService {
         }
 
         const metadata::Tenant& GetTenant() const { return *tenant_; }
+        TenantQuotaBinding GetQuota() const { return tenant_.quota(); }
 
         // The held entry; like `Get()`, only once something is held.
         const std::shared_ptr<ObjectEntry>& GetEntry() const {
@@ -1646,7 +1651,7 @@ class MasterService {
 
        private:
         const ObjectIdentity object_id_;
-        std::shared_ptr<metadata::Tenant> tenant_;
+        metadata::TenantHandle tenant_;
         std::optional<ObjectEntry::Hold<LockMode::kRead>> hold_;
     };
 

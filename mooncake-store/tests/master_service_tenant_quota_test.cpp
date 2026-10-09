@@ -262,16 +262,18 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
     }
 #endif
 
-    // Charges through the tenant, the way every data-plane path does.
+    // Charges through the tenant's quota binding, the way every data-plane
+    // path does.
     tl::expected<void, ErrorCode> ChargeTenantQuotaForTest(
         MasterService& service, const TenantId& tenant_id, uint64_t bytes) {
         return GetOrCreateTenantHandleForTest(service, tenant_id)
-            ->ChargeQuota(bytes);
+            .quota()
+            .Charge(bytes);
     }
 
-    // The tenant for one tenant id, created through the registry's factory on
-    // first use, which binds its quota account.
-    std::shared_ptr<metadata::Tenant> GetOrCreateTenantHandleForTest(
+    // The tenant for one tenant id with its quota binding, created through the
+    // registry's factory on first use, which binds its quota account.
+    metadata::TenantHandle GetOrCreateTenantHandleForTest(
         MasterService& service, const TenantId& tenant_id) {
         return MasterServiceTestPeer(service).GetOrCreateTenantHandle(
             tenant_id);
@@ -285,7 +287,7 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
         if (tenant == nullptr) {
             return nullptr;
         }
-        return tenant->QuotaAccount();
+        return tenant.quota().Account();
     }
 
     // Sweeps one tenant: its objects are its whole route, so no key is named.
@@ -295,7 +297,7 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
             MasterServiceTestPeer(service).GetOrCreateTenantHandle(tenant_id);
         ASSERT_NE(tenant, nullptr);
         MasterServiceTestPeer(service).DiscardExpiredProcessingReplicas(
-            *tenant, tenant_id, std::chrono::system_clock::time_point::max());
+            tenant, tenant_id, std::chrono::system_clock::time_point::max());
     }
 
     void FinalizeExpiredProcessingForTest(MasterService& service,
@@ -498,11 +500,11 @@ TEST_F(MasterServiceTenantQuotaTest,
     // ...and that tenant owns exactly one bound account.
     EXPECT_EQ(first_handle, second_handle);
 
-    auto charge = first_tenant->ChargeQuota(128);
+    auto charge = first_tenant.quota().Charge(128);
     ASSERT_TRUE(charge.has_value()) << toString(charge.error());
     EXPECT_EQ(Snapshot(service, tenant_id).charged_bytes, 128);
 
-    second_tenant->ReleaseQuota(128);
+    second_tenant.quota().Release(128);
     EXPECT_EQ(Snapshot(service, tenant_id).charged_bytes, 0);
 }
 
@@ -514,23 +516,23 @@ TEST_F(MasterServiceTenantQuotaTest, DroppedReservationGivesTheChargeBack) {
     ASSERT_NE(tenant, nullptr);
 
     {
-        auto reservation = tenant->ReserveQuota(128);
+        auto reservation = tenant.quota().Reserve(128);
         ASSERT_TRUE(reservation.has_value()) << toString(reservation.error());
         EXPECT_EQ(Snapshot(service, tenant_id).charged_bytes, 128);
     }
     EXPECT_EQ(Snapshot(service, tenant_id).charged_bytes, 0);
 
     {
-        auto reservation = tenant->ReserveQuota(128);
+        auto reservation = tenant.quota().Reserve(128);
         ASSERT_TRUE(reservation.has_value()) << toString(reservation.error());
         EXPECT_EQ(reservation->Commit(), 128);
     }
     // Committed: the caller owes the bytes now, so the drop keeps them.
     EXPECT_EQ(Snapshot(service, tenant_id).charged_bytes, 128);
-    tenant->ReleaseQuota(128);
+    tenant.quota().Release(128);
 
     // A rejected reservation charges nothing.
-    auto too_large = tenant->ReserveQuota(UINT64_C(1) << 40);
+    auto too_large = tenant.quota().Reserve(UINT64_C(1) << 40);
     ASSERT_FALSE(too_large.has_value());
     EXPECT_EQ(too_large.error(), ErrorCode::TENANT_QUOTA_EXCEEDED);
     EXPECT_EQ(Snapshot(service, tenant_id).charged_bytes, 0);

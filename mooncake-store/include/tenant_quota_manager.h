@@ -4,9 +4,10 @@
 // table holding one stable account per tenant, and the effective quotas the
 // table derives from them and the cluster's allocatable capacity.
 //
-// The data plane never comes here: a tenant charges and releases the account
-// it was bound to (metadata::Tenant), and each object keeps its share in its
-// own ledger. This class decides how large every account is.
+// The data plane never comes here: it charges and releases the account a
+// tenant was bound to (TenantQuotaBinding, handed out by the tenant registry
+// with the tenant), and each object keeps its share in its own ledger. This
+// class decides how large every account is.
 //
 // A disabled manager meters nothing: every tenant counts as registered and no
 // account is ever handed out.
