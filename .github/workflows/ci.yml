@@ -128,12 +128,13 @@ jobs:
         python mooncake-wheel/tests/test_cuda_fabric_compat.py -v
       shell: bash
 
-    - name: Run all PG CPU tests with latest PyTorch
+    - name: Run all PG CPU tests with supported PyTorch
       if: matrix.ubuntu-version == 'ubuntu-22.04' && matrix.python-version == '3.12'
       env:
         MC_FORCE_TCP: "true"
       run: |
         source test_env/bin/activate
+        python -m pip install torch==2.14.0
         export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}:/usr/local/lib
         python -m unittest discover -s mooncake-pg/tests -k CPU -v
       shell: bash
