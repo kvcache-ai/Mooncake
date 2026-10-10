@@ -193,4 +193,20 @@ TEST(PrefetchThrottleTest, ConcurrentReserveGrantsEachKeyOnce) {
     EXPECT_EQ(total_reserved.load(), keys.size());
 }
 
+TEST(PrefetchThrottleTest, GetWaitDeadlineCappedByBatchLeaseFloor) {
+    constexpr int64_t now = 100000;
+    // A 2s wait budget with a lease floor 500ms out: the deadline must land
+    // inside the lease window (floor minus margin), not at now + 2000ms —
+    // otherwise co-batch keys' transfers expire their leases while waiting.
+    const int64_t capped =
+        PrefetchThrottle::CapWaitDeadlineByLeaseMs(now, 2000, now + 500);
+    EXPECT_LT(capped, now + 500);
+    EXPECT_GT(capped, now);
+    // Budget smaller than the lease window: uncapped.
+    EXPECT_EQ(PrefetchThrottle::CapWaitDeadlineByLeaseMs(now, 100, now + 5000),
+              now + 100);
+    // Lease already spent: deadline in the past, i.e. no wait at all.
+    EXPECT_LT(PrefetchThrottle::CapWaitDeadlineByLeaseMs(now, 2000, now), now);
+}
+
 }  // namespace mooncake::test

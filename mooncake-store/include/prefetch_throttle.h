@@ -20,6 +20,7 @@
 // scanning the whole table on every reserve() call.
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -36,6 +37,21 @@ namespace mooncake {
 
 class PrefetchThrottle {
    public:
+    // Caps a get-side wait deadline so the wait cannot outlive the batch's
+    // leases: the batch query granted every key's lease up front and
+    // transfers are submitted only after the wait loop, so a wait that
+    // outlasts a lease would turn the co-batch keys' successful transfers
+    // into LEASE_EXPIRED. The margin (remaining lease / 8, at least 10ms)
+    // leaves room for the fallback transfer itself. A lease floor at or
+    // below now yields a deadline in the past, i.e. no wait at all.
+    static inline int64_t CapWaitDeadlineByLeaseMs(int64_t now_ms,
+                                                   int64_t wait_budget_ms,
+                                                   int64_t lease_floor_ms) {
+        const int64_t margin_ms =
+            std::max<int64_t>(10, (lease_floor_ms - now_ms) / 8);
+        return std::min(now_ms + wait_budget_ms, lease_floor_ms - margin_ms);
+    }
+
     enum class State : uint8_t {
         kTriggered = 0,        // reserved, async job not started yet
         kInFlight = 1,         // promotion task registered, executing

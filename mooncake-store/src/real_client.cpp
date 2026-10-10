@@ -7715,8 +7715,30 @@ RealClient::batch_get_into_multi_buffers_internal(
     // a 16k prefix (~35 keys) into tens of seconds of sequential polling.
     const bool get_wait =
         ssd_get_wait_ms_ > 0 && enable_ssd_prefetch_ && prefetcher_;
-    const int64_t get_wait_deadline =
-        get_wait ? PrefetchThrottle::NowMs() + ssd_get_wait_ms_ : 0;
+    int64_t get_wait_deadline = 0;
+    if (get_wait) {
+        const int64_t now_ms = PrefetchThrottle::NowMs();
+        get_wait_deadline = now_ms + ssd_get_wait_ms_;
+        // Cap the wait by the batch's earliest lease deadline: the batch
+        // query granted every key's lease up front and transfers are
+        // submitted only after the wait loop, so a wait outliving a lease
+        // would turn the co-batch keys' successful transfers into
+        // LEASE_EXPIRED.
+        int64_t lease_floor_ms = std::numeric_limits<int64_t>::max();
+        for (const auto& query_result : query_results) {
+            if (query_result && !query_result->replicas.empty()) {
+                lease_floor_ms = std::min(
+                    lease_floor_ms,
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        query_result->lease_timeout.time_since_epoch())
+                        .count());
+            }
+        }
+        if (lease_floor_ms != std::numeric_limits<int64_t>::max()) {
+            get_wait_deadline = PrefetchThrottle::CapWaitDeadlineByLeaseMs(
+                now_ms, ssd_get_wait_ms_, lease_floor_ms);
+        }
+    }
     if (get_wait) {
         // Demand-side kick: a batch headed for SSD gets one promotion
         // attempt for its disk keys. ignore_cooldown bypasses only the
@@ -7782,17 +7804,35 @@ RealClient::batch_get_into_multi_buffers_internal(
         if (get_wait && best_replica->is_local_disk_replica()) {
             const int64_t remaining =
                 get_wait_deadline - PrefetchThrottle::NowMs();
+            bool waited = false;
             if (remaining > 0) {
-                if (auto waited =
+                waited = true;
+                if (auto waited_qr =
                         prefetcher_->WaitIfPromotionInFlight(key, remaining);
-                    waited.has_value()) {
+                    waited_qr.has_value()) {
                     const auto *promoted =
-                        SelectBestReplica(waited->replicas, local_endpoints);
+                        SelectBestReplica(waited_qr->replicas, local_endpoints);
                     if (promoted != nullptr && promoted->is_memory_replica()) {
-                        refreshed_qr.emplace(*waited);
-                        best_replica = SelectBestReplica(refreshed_qr->replicas,
-                                                         local_endpoints);
+                        refreshed_qr.emplace(*waited_qr);
                     }
+                }
+            }
+            if (waited && !refreshed_qr.has_value()) {
+                // The wait missed and the deadline is capped by this batch's
+                // lease floor, so the original query's lease is nearly spent;
+                // the SSD fallback transfer would fail the post-transfer
+                // lease check. Re-query with a fresh lease before falling
+                // back — the promotion may also have completed meanwhile.
+                if (auto fresh = client_->Query(key);
+                    fresh && !fresh->replicas.empty()) {
+                    refreshed_qr.emplace(std::move(*fresh));
+                }
+            }
+            if (refreshed_qr.has_value()) {
+                const auto *best = SelectBestReplica(refreshed_qr->replicas,
+                                                     local_endpoints);
+                if (best != nullptr) {
+                    best_replica = best;
                 }
             }
         }
@@ -8487,7 +8527,8 @@ bool RealClient::release_offload_buffer(uint64_t batch_id) {
 }
 
 bool RealClient::prefetch_offload_object(const std::vector<std::string> &keys,
-                                         const std::vector<int64_t> &sizes) {
+                                         const std::vector<int64_t> &sizes,
+                                         const std::string &tenant_id) {
     if (!enable_ssd_prefetch_ || !prefetcher_ || !file_storage_) {
         VLOG(1) << "prefetch_offload_object called but SSD prefetch is "
                    "disabled or SSD offload is not set up";
@@ -8502,8 +8543,10 @@ bool RealClient::prefetch_offload_object(const std::vector<std::string> &keys,
         return false;
     }
     // Best-effort and asynchronous: dedup + pool enqueue, never blocks the
-    // RPC thread on SSD reads.
-    prefetcher_->RunLocalPrefetch(keys, sizes);
+    // RPC thread on SSD reads. The requester's tenant travels with the keys:
+    // a shared SSD holder stores objects from other tenants and must look
+    // up / register / promote under the object's own tenant.
+    prefetcher_->RunLocalPrefetch(keys, sizes, tenant_id);
     return true;
 }
 
@@ -8735,11 +8778,11 @@ void ClientRequester::release_offload_buffer(const std::string &client_addr,
 
 void ClientRequester::prefetch_offload_object(
     const std::string &client_addr, const std::vector<std::string> &keys,
-    const std::vector<int64_t> &sizes) {
+    const std::vector<int64_t> &sizes, const std::string &tenant_id) {
     // Best-effort: old peers reject the unknown handler and network errors
     // are logged, never propagated. The keys simply stay SSD-only.
     auto result = invoke_rpc<&RealClient::prefetch_offload_object, bool>(
-        client_addr, keys, sizes);
+        client_addr, keys, sizes, tenant_id);
     if (!result) {
         VLOG(1) << "Failed to invoke prefetch_offload_object, client_addr = "
                 << client_addr << ", error is: " << result.error();
