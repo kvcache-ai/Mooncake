@@ -27,7 +27,7 @@ namespace {
 
 namespace fs = std::filesystem;
 
-std::vector<uint8_t> AddWeightMetadataStore(
+std::vector<uint8_t> AddWeightMetadata(
     const std::vector<uint8_t>& metadata,
     const WeightMetadataSnapshot& weight_metadata) {
     auto root = msgpack::unpack(reinterpret_cast<const char*>(metadata.data()),
@@ -223,7 +223,7 @@ TEST_P(CatalogBackedSnapshotProviderTest,
         .next_lease_id = 1,
         .next_operation_id = 1,
     };
-    auto metadata = AddWeightMetadataStore(
+    auto metadata = AddWeightMetadata(
         BuildMetadataPayload(UUID{1, 2}, kDefaultTestObjectKey,
                              kDefaultTestDiskFilePath, kDefaultTestObjectSize),
         weight_metadata);

@@ -812,14 +812,10 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
 }
 
 void FileStorage::RemoveAll() {
-    // TODO(tenant-isolation): This performs a tenant-UNAWARE global wipe of the
-    // storage directory. Storage backends store physical files without a
-    // tenant dimension, so a tenant-scoped master RemoveAll("tenant_A") that
-    // signals this client will also delete tenant_B's SSD files here, while
-    // master still holds valid metadata for tenant_B (subsequent reads get
-    // OBJECT_NOT_FOUND on this node). Safe for the global RemoveAll(force) and
-    // for single-tenant / shared-nothing deployments. Proper per-tenant
-    // physical isolation needs backend-level tenant-scoped layout (follow-up).
+    // Explicit physical reset: this bypasses per-object metadata protection
+    // and clears every tenant sharing the backend. Generic Client::RemoveAll
+    // must not request it; callers must ensure no live object depends on the
+    // files being removed.
     if (storage_backend_) {
         storage_backend_->RemoveAll();
     }

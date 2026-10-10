@@ -6,12 +6,34 @@
 
 namespace mooncake {
 
-bool MasterStoreBackend::IsOpLogEnabled() const {
-    return master_.enable_oplog_;
-}
-
 bool MasterStoreBackend::CanPublishWeightMutations() const {
     return master_.weight_management_mutations_enabled_;
+}
+
+PromotionQueueResult MasterStoreBackend::PromoteWeightObject(
+    const TenantId& tenant_id, const std::string& key) {
+    return master_.TryPushPromotionQueue(
+        master_.MakeObjectIdentity(key, tenant_id), false, true);
+}
+
+std::vector<std::string> MasterStoreBackend::GetGroupMemberKeys(
+    const TenantId& tenant_id, const std::string& group_id) const {
+    return master_.GetGroupMemberKeys(tenant_id, group_id);
+}
+
+tl::expected<void, ErrorCode> MasterStoreBackend::RemoveObject(
+    const std::string& key, const TenantId& tenant_id, bool force,
+    bool allow_managed_weight) {
+    return master_.RemoveObject(key, tenant_id, force, allow_managed_weight);
+}
+
+void MasterStoreBackend::EvictManagedWeightGroupToCold(
+    const WeightRevisionMetadata& revision) {
+    master_.EvictManagedWeightGroupToCold(revision);
+}
+
+bool MasterStoreBackend::IsOpLogEnabled() const {
+    return master_.enable_oplog_;
 }
 
 bool MasterStoreBackend::IsTenantSupported(const std::string& tenant_id) const {
@@ -70,6 +92,14 @@ MasterStoreBackend::SnapshotWeightGroup(
             .size = metadata.size,
             .data_type = metadata.data_type,
             .readable = master_.HasReadableReplica(metadata),
+            .has_memory = metadata.HasReplica([this](const Replica& replica) {
+                return replica.is_memory_replica() &&
+                       master_.IsReplicaReadable(replica);
+            }),
+            .has_cold = metadata.HasReplica([this](const Replica& replica) {
+                return !replica.is_memory_replica() &&
+                       master_.IsReplicaReadable(replica);
+            }),
         });
     }
     return members;
