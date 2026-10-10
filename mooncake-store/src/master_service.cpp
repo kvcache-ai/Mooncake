@@ -6934,11 +6934,12 @@ std::vector<tl::expected<void, ErrorCode>> MasterService::BatchUpsertRevoke(
     return BatchPutRevoke(client_id, keys, tenant_id);
 }
 
-auto MasterService::EvictDiskReplica(const UUID& client_id,
-                                     const std::string& key,
-                                     const TenantId& tenant_id,
-                                     ReplicaType replica_type)
-    -> tl::expected<void, ErrorCode> {
+auto MasterService::EvictDiskReplicaImpl(const UUID& client_id,
+                                         const std::string& key,
+                                         const TenantId& tenant_id,
+                                         ReplicaType replica_type,
+                                         const ReplicaID* expected_replica_id)
+    -> tl::expected<bool, ErrorCode> {
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
     MetadataAccessorRW accessor(this, object_id);
     if (!accessor.Exists()) {
@@ -6968,6 +6969,18 @@ auto MasterService::EvictDiskReplica(const UUID& client_id,
         }
         return false;
     };
+
+    if (expected_replica_id != nullptr &&
+        !metadata.HasReplica([&](const Replica& r) {
+            return target_pred(r) && r.id() == *expected_replica_id;
+        })) {
+        // The replica the caller failed on is no longer the current record:
+        // it was replaced or already evicted. Leave whatever is there now
+        // untouched and report the precondition miss.
+        LOG(INFO) << "key=" << key << ", replica_id=" << *expected_replica_id
+                  << ", info=eviction_precondition_miss";
+        return false;
+    }
 
     if (enable_oplog_ && ordered_oplog_writer_) {
         auto remaining =
@@ -7009,7 +7022,7 @@ auto MasterService::EvictDiskReplica(const UUID& client_id,
             if (!persist_result) {
                 return tl::make_unexpected(persist_result.error());
             }
-            return {};
+            return true;
         }
 
         tl::expected<OpLogEntry, ErrorCode> persist_result;
@@ -7045,7 +7058,30 @@ auto MasterService::EvictDiskReplica(const UUID& client_id,
     if (!metadata.IsValid()) {
         accessor.Erase();
     }
+    return true;
+}
+
+auto MasterService::EvictDiskReplica(const UUID& client_id,
+                                     const std::string& key,
+                                     const TenantId& tenant_id,
+                                     ReplicaType replica_type)
+    -> tl::expected<void, ErrorCode> {
+    auto result =
+        EvictDiskReplicaImpl(client_id, key, tenant_id, replica_type, nullptr);
+    if (!result) {
+        return tl::make_unexpected(result.error());
+    }
     return {};
+}
+
+auto MasterService::EvictDiskReplicaIfCurrent(const UUID& client_id,
+                                              const std::string& key,
+                                              const TenantId& tenant_id,
+                                              ReplicaType replica_type,
+                                              ReplicaID expected_replica_id)
+    -> tl::expected<bool, ErrorCode> {
+    return EvictDiskReplicaImpl(client_id, key, tenant_id, replica_type,
+                                &expected_replica_id);
 }
 
 std::vector<tl::expected<void, ErrorCode>> MasterService::BatchEvictDiskReplica(

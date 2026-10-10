@@ -49,13 +49,19 @@ class QueryResult {
     const std::chrono::steady_clock::time_point lease_timeout;
     /** @brief Optional full-object checksum */
     const std::optional<uint64_t> object_checksum;
+    /** @brief Tenant scope the master resolved the query to, when the master
+     * reports it; readers forward it to disk-replica verify requests */
+    const std::optional<std::string> resolved_tenant_id;
 
-    QueryResult(std::vector<Replica::Descriptor>&& replicas_param,
-                std::chrono::steady_clock::time_point lease_timeout_param,
-                std::optional<uint64_t> object_checksum_param = std::nullopt)
+    QueryResult(
+        std::vector<Replica::Descriptor>&& replicas_param,
+        std::chrono::steady_clock::time_point lease_timeout_param,
+        std::optional<uint64_t> object_checksum_param = std::nullopt,
+        std::optional<std::string> resolved_tenant_id_param = std::nullopt)
         : replicas(std::move(replicas_param)),
           lease_timeout(lease_timeout_param),
-          object_checksum(object_checksum_param) {}
+          object_checksum(object_checksum_param),
+          resolved_tenant_id(std::move(resolved_tenant_id_param)) {}
 
     bool IsLeaseExpired() const {
         return std::chrono::steady_clock::now() >= lease_timeout;
@@ -365,6 +371,13 @@ class Client {
     tl::expected<void, ErrorCode> EvictDiskReplica(const std::string& key,
                                                    const std::string& tenant_id,
                                                    ReplicaType replica_type);
+
+    // Conditional variant: the master evicts only when its current record is
+    // still the replica the caller failed on. See MasterClient for the
+    // mixed-version behavior.
+    tl::expected<bool, ErrorCode> EvictDiskReplicaIfCurrent(
+        const std::string& key, const std::string& tenant_id,
+        ReplicaType replica_type, ReplicaID expected_replica_id);
 
     std::vector<tl::expected<void, ErrorCode>> BatchEvictDiskReplica(
         const std::vector<std::string>& keys, ReplicaType replica_type);
@@ -806,6 +819,32 @@ class Client {
         const std::vector<std::string>& keys,
         ReplicaType replica_type = ReplicaType::ALL);
 
+    // What the dangling-replica probe established for one key. The Put path
+    // retries only on kEvicted; the batch-get path also retries on kPresent,
+    // because a batch read dies wholesale and a healthy key swept in by a
+    // sibling's wiped file must be re-read, not just left unevicted.
+    enum class DiskReplicaHealResult {
+        // Not a lone client-owned LOCAL_DISK replica; nothing to heal.
+        kNotDangling,
+        // The probe could not answer (transport/config trouble); leave
+        // everything as it was.
+        kUnknown,
+        // The backing file provably exists; nothing was evicted.
+        kPresent,
+        // The backing file is proven gone and the dangling replica was
+        // evicted, so the operation can be retried.
+        kEvicted,
+    };
+
+    // When PutStart reports OBJECT_ALREADY_EXISTS, check whether every
+    // completed replica is a LOCAL_DISK replica owned by this client, and ask
+    // the installed probe (FileStorage::Exists over the offload files) whether
+    // the backing file is gone (issue #3709). Only then evict the dangling
+    // replica so the Put can be retried; any other outcome keeps the old
+    // idempotent path. The batch-get path uses the same heal after a failed
+    // SSD read (#3884).
+    DiskReplicaHealResult healDanglingLocalDiskReplica(const ObjectKey& key);
+
    protected:
     /**
      * @brief Constructor exposed to subclasses for testing only; production
@@ -832,13 +871,6 @@ class Client {
      * @brief Internal helper functions for initialization and data transfer
      */
     ErrorCode ConnectToMaster(const std::string& master_server_entry);
-    // When PutStart reports OBJECT_ALREADY_EXISTS, check whether every
-    // completed replica is a LOCAL_DISK replica owned by this client, and ask
-    // the installed probe (FileStorage::Exists over the offload files) whether
-    // the backing file is gone (issue #3709). Only then evict the dangling
-    // replica so the Put can be retried; any other outcome keeps the old
-    // idempotent path. Returns true only when a replica was actually evicted.
-    bool healDanglingLocalDiskReplica(const ObjectKey& key);
     // The BatchPutStart counterpart: heals the OBJECT_ALREADY_EXISTS subset
     // with one batched replica-list query and one batched evict, then retries
     // PutStart for just the evicted keys and splices the responses back, so a
