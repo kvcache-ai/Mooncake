@@ -559,17 +559,22 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
         if (n > 0 && update_metadata) metadata_->updateLocalSegmentDesc();
     };
 
-    // Pre-touch decision is loop-invariant: it depends only on context_list_,
-    // hardware_concurrency(), and the ORIGINAL buffer length (never chunk_len,
-    // which is capped at max_mr_size and would silently disable pre-touch for a
-    // >=4GiB buffer). Compute once above the loop to avoid repeated
+    // Pre-touch decision is loop-invariant: it depends on memory kind/location,
+    // context_list_, hardware_concurrency(), and the ORIGINAL buffer length.
+    // Using chunk_len, which is capped at max_mr_size, could silently disable
+    // pre-touch for a >=4GiB buffer. Compute once above the loop to avoid repeated
     // hardware_concurrency() OS queries per chunk.
     //
     // Pre-touch faults host pages in before the real registration. It gains
     // nothing for device memory registered through DMA-BUF, where each
     // pre-touch thread only adds a DMA-BUF import (and a BAR1 mapping) of its
     // block, so skip it there.
+    // Explicit Ascend NPU buffers must also skip host pre-touch, which uses
+    // context 0 instead of the NPU's routed HCA contexts.
     const bool do_pre_touch =
+#ifdef USE_ASCEND_RDMA
+        !npu_location &&
+#endif
         dmabuf_exp.method != DmabufExport::Method::kDmabufReg &&
         context_list_.size() > 0 && std::thread::hardware_concurrency() >= 4 &&
         length >= (size_t)4 * 1024 * 1024 * 1024;
