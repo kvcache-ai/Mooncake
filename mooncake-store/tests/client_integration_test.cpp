@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <cerrno>
 #include <cstdlib>
 #include <cstdint>
 #include <filesystem>
@@ -348,6 +349,57 @@ std::string ClientIntegrationTest::master_address_;
 std::string ClientIntegrationTest::metadata_url_;
 UUID ClientIntegrationTest::test_client_id_{0, 0};
 UUID ClientIntegrationTest::segment_provider_client_id_{0, 0};
+
+namespace {
+
+// Minimal initiator used to observe which initiator Client::Create wires up.
+class WiringProbeInitiator : public NVMeoFInitiator {
+   public:
+    NofSegmentHandle* OpenSegment(const std::string&) override {
+        return nullptr;
+    }
+    bool ProbeSegment(const std::string&, uint32_t, std::string*) override {
+        return false;
+    }
+    uint32_t GetBlockSize(const NofSegmentHandle*) override {
+        return kInvalidBlockSize;
+    }
+    int SubmitIO(NofSegmentHandle*, void*, uint64_t, uint64_t, NofIOOp,
+                 NofIOAdaptor*) override {
+        return -EINVAL;
+    }
+    int64_t PollCompletion(NofSegmentHandle*, uint32_t) override { return 0; }
+    ErrorCode RegisterMemory(void*, size_t) override { return ErrorCode::OK; }
+    ErrorCode UnregisterMemory(void*) override { return ErrorCode::OK; }
+    NofCapabilities GetCapabilities() const override { return {}; }
+};
+
+// Clears the Client default-initiator factory seam even when the test fails.
+struct DefaultInitiatorFactoryGuard {
+    ~DefaultInitiatorFactoryGuard() {
+        Client::SetDefaultNofInitiatorFactoryForTesting(nullptr);
+    }
+};
+
+}  // namespace
+
+// Regression test: callers of the existing C++ creation API that pass no
+// initiator (the default argument) must keep getting NoF support — without
+// the default-runtime fallback they silently ended up with no initiator, and
+// every NoF transfer failed even in USE_NOF builds.
+TEST_F(ClientIntegrationTest, CreateWithoutInitiatorKeepsDefaultNofRuntime) {
+    DefaultInitiatorFactoryGuard guard;
+    auto probe = std::make_shared<WiringProbeInitiator>();
+    Client::SetDefaultNofInitiatorFactoryForTesting([probe] { return probe; });
+
+    auto client_opt = Client::Create("localhost:17941",  // unique hostname
+                                     "P2PHANDSHAKE", FLAGS_protocol,
+                                     std::nullopt, master_address_);
+    ASSERT_TRUE(client_opt.has_value());
+    // The default argument must resolve to the process default runtime
+    // (here: the injected probe), not nullptr.
+    EXPECT_EQ((*client_opt)->GetNofInitiatorForTesting(), probe);
+}
 
 // Test basic Put/Get operations through the client
 TEST_F(ClientIntegrationTest, BasicPutGetOperations) {

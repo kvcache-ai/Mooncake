@@ -314,7 +314,15 @@ class SpdkInitiator::Impl {
         // path unregisters its buffers explicitly; this covers anything that
         // path misses. The singleton registry outlives this instance and its
         // env pin keeps the translation table alive.
-        GetNofRegistryBundle().registry.UnregisterAll(this);
+        if (GetNofRegistryBundle().registry.UnregisterAll(this) !=
+            ErrorCode::OK) {
+            // The registry retains the failed pages' records, so a later
+            // owner teardown can still retry; the bundle's env pin keeps the
+            // translation table alive until process exit either way.
+            LOG(ERROR) << "NoF initiator teardown could not release all page "
+                          "registrations; they stay registered until process "
+                          "exit";
+        }
 #endif
         // env_guard_ released after all qpair/ctrlr teardown above;
         // spdk_env_fini runs inside ~SpdkEnvGuard.

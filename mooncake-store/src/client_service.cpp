@@ -6,6 +6,7 @@
 #include "ascii_string.h"
 #include "allocator.h"
 #include "segment.h"
+#include "nof/nof_runtime.h"
 
 #include <csignal>
 #include <algorithm>
@@ -92,6 +93,13 @@ int GetCurrentNumaSocketId() {
     }
     int node = numa_node_of_cpu(cpu);
     return node < 0 ? 0 : node;
+}
+
+// Backing slot for Client::SetDefaultNofInitiatorFactoryForTesting.
+std::function<std::shared_ptr<NVMeoFInitiator>()>&
+DefaultNofInitiatorFactoryForTestingSlot() {
+    static std::function<std::shared_ptr<NVMeoFInitiator>()> factory;
+    return factory;
 }
 
 struct ContiguousSliceRange {
@@ -1034,6 +1042,15 @@ void Client::InitTransferSubmitter() {
         nof_initiator_);
 }
 
+void Client::SetDefaultNofInitiatorFactoryForTesting(
+    std::function<std::shared_ptr<NVMeoFInitiator>()> factory) {
+    DefaultNofInitiatorFactoryForTestingSlot() = std::move(factory);
+}
+
+std::shared_ptr<NVMeoFInitiator> Client::GetNofInitiatorForTesting() const {
+    return nof_initiator_;
+}
+
 std::optional<std::shared_ptr<Client>> Client::Create(
     const std::string& local_hostname, const std::string& metadata_connstring,
     const std::string& protocol, const std::optional<std::string>& device_names,
@@ -1049,6 +1066,16 @@ std::optional<std::shared_ptr<Client>> Client::Create(
             : metadata_connstring;
     auto client = std::shared_ptr<Client>(new Client(
         local_hostname, resolved_metadata, protocol, labels, tenant_id));
+    if (!nof_initiator) {
+        // nullptr means "use the process default", not "disable NoF": before
+        // this parameter existed, every client in a USE_NOF build had NoF
+        // available, and existing callers must keep that behavior. The
+        // explicit runtime disable is MC_NOF_BACKEND=none (CreateNofRuntime
+        // then returns a null initiator); explicit injection is passing a
+        // non-null initiator.
+        auto& factory = DefaultNofInitiatorFactoryForTestingSlot();
+        nof_initiator = factory ? factory() : CreateNofRuntime().initiator;
+    }
     client->nof_initiator_ = std::move(nof_initiator);
 
     ErrorCode err = client->ConnectToMaster(master_server_entry);

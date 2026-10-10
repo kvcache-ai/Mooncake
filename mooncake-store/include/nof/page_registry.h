@@ -32,6 +32,19 @@ namespace mooncake {
 //   - UnregisterAll(owner) releases everything an owner holds (teardown
 //     backstop).
 //
+// Failure semantics (SPDK v23.01.1 can leave partial state behind):
+//   - Register failure: pages this call bumped are rolled back, and the
+//     failing page itself is cleaned up via unregister_fn_. If that cleanup
+//     cannot be confirmed, the page and the owner range stay recorded and
+//     NOF_REGISTRATION_STUCK is returned — callers must treat the range as
+//     still registered (quarantine; never munmap without a successful
+//     Unregister). A same-range retry does not re-call register_fn_ (a
+//     leftover translation would answer -EBUSY and be misclassified as
+//     external); it is an idempotent OK.
+//   - Unregister failure: pages that fail to unregister keep their records,
+//     the owner range is retained for retry, and INTERNAL_ERROR is
+//     propagated so callers can quarantine instead of munmapping.
+//
 // Normalization registers whole pages containing the buffer; this grants no
 // extra DMA reach beyond the buffer's own pages.
 class NofPageRegistry {
@@ -58,8 +71,11 @@ class NofPageRegistry {
     };
 
     // Drops this registration's page references, unregistering pages whose
-    // last reference goes away. Caller must hold mutex_.
-    void ReleaseRangeLocked(void* ptr, size_t size);
+    // last reference goes away. Returns true only when every page was
+    // released; pages whose backend unregistration fails keep their record
+    // (count stays 1) so a later retry still owns them. Caller must hold
+    // mutex_.
+    bool ReleaseRangeLocked(void* ptr, size_t size);
 
     MemRegisterFn register_fn_;
     MemUnregisterFn unregister_fn_;

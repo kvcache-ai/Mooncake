@@ -54,7 +54,36 @@ ErrorCode NofPageRegistry::Register(void* owner, void* ptr, size_t size) {
                         page_regs_.erase(p);
                     }
                 }
-                return ErrorCode::INTERNAL_ERROR;
+                // The backend may have partially changed state for the
+                // FAILING page itself: spdk_mem_register() marks the range in
+                // g_mem_reg_map before running its notify callbacks and does
+                // not roll that back on failure (SPDK v23.01.1
+                // lib/env_dpdk/memory.c:370-384), and in iova=va it can
+                // already have installed the IOMMU mapping when a later step
+                // fails. Try to clean the failing page up.
+                if (unregister_fn_(reinterpret_cast<void*>(page), kPageSize) ==
+                    0) {
+                    // Cleanup confirmed: drop the entry created above and
+                    // report a plain failure — the caller may munmap safely.
+                    if (reg.count == 0 && !reg.external) {
+                        page_regs_.erase(page);
+                    }
+                    return ErrorCode::INTERNAL_ERROR;
+                }
+                // Cleanup cannot be confirmed (-EINVAL covers both "nothing
+                // was marked" and "marked but not fully translated", and the
+                // two cannot be told apart). Keep explicit bookkeeping: the
+                // page stays charged to us and the owner range is recorded,
+                // so a later Unregister/UnregisterAll retries the cleanup and
+                // the shm quarantine paths retain the mapping instead of
+                // munmapping a possibly-live translation. A same-range retry
+                // hits the "already covered" fast path above and does not
+                // re-call register_fn_ — deliberate: re-registering a page in
+                // this unknown state could return -EBUSY from the leftover
+                // translation and be misclassified as externally owned.
+                reg.count = 1;
+                registrations[ptr] = size;
+                return ErrorCode::NOF_REGISTRATION_STUCK;
             }
         }
         if (!reg.external) {
@@ -76,7 +105,12 @@ ErrorCode NofPageRegistry::Unregister(void* owner, void* ptr) {
     if (it == owner_it->second.end()) {
         return ErrorCode::OK;  // not registered by this owner: no-op
     }
-    ReleaseRangeLocked(ptr, it->second);
+    if (!ReleaseRangeLocked(ptr, it->second)) {
+        // Some pages could not be released: keep the owner record so the
+        // caller's quarantine path can retry, and propagate the failure —
+        // munmap is NOT safe while the backend may still hold a translation.
+        return ErrorCode::INTERNAL_ERROR;
+    }
     owner_it->second.erase(it);
     if (owner_it->second.empty()) {
         owner_regs_.erase(owner_it);
@@ -90,34 +124,52 @@ ErrorCode NofPageRegistry::UnregisterAll(void* owner) {
     if (owner_it == owner_regs_.end()) {
         return ErrorCode::OK;
     }
-    for (const auto& [ptr, size] : owner_it->second) {
-        ReleaseRangeLocked(ptr, size);
+    bool all_released = true;
+    for (auto it = owner_it->second.begin(); it != owner_it->second.end();) {
+        if (ReleaseRangeLocked(it->first, it->second)) {
+            it = owner_it->second.erase(it);
+        } else {
+            // Keep this range's record for a later retry.
+            all_released = false;
+            ++it;
+        }
     }
-    owner_regs_.erase(owner_it);
-    return ErrorCode::OK;
+    if (owner_it->second.empty()) {
+        owner_regs_.erase(owner_it);
+    }
+    return all_released ? ErrorCode::OK : ErrorCode::INTERNAL_ERROR;
 }
 
-void NofPageRegistry::ReleaseRangeLocked(void* ptr, size_t size) {
+// Returns true only when every page of the range was released. Pages whose
+// backend unregistration fails keep their record (count stays 1) so a later
+// retry still owns them.
+bool NofPageRegistry::ReleaseRangeLocked(void* ptr, size_t size) {
     const uintptr_t begin = reinterpret_cast<uintptr_t>(ptr);
     const uintptr_t first_page = begin & ~(kPageSize - 1);
     const uintptr_t end_page =
         (begin + size + kPageSize - 1) & ~(kPageSize - 1);
+    bool all_released = true;
     for (uintptr_t page = first_page; page < end_page; page += kPageSize) {
         auto pit = page_regs_.find(page);
         if (pit == page_regs_.end() || pit->second.external) {
             continue;
         }
-        if (--pit->second.count == 0) {
-            // Single-page region == legal single-page unmap
-            // (NOTIFY_START semantics).
-            int rc = unregister_fn_(reinterpret_cast<void*>(page), kPageSize);
-            if (rc != 0) {
-                LOG(ERROR) << "page unregister failed: page="
-                           << reinterpret_cast<void*>(page) << " rc=" << rc;
-            }
+        if (pit->second.count > 1) {
+            --pit->second.count;
+            continue;
+        }
+        // Last reference: single-page region == legal single-page unmap
+        // (NOTIFY_START semantics).
+        int rc = unregister_fn_(reinterpret_cast<void*>(page), kPageSize);
+        if (rc == 0) {
             page_regs_.erase(pit);
+        } else {
+            LOG(ERROR) << "page unregister failed: page="
+                       << reinterpret_cast<void*>(page) << " rc=" << rc;
+            all_released = false;
         }
     }
+    return all_released;
 }
 
 }  // namespace mooncake

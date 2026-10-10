@@ -2883,11 +2883,25 @@ tl::expected<void, ErrorCode> RealClient::map_shm_internal_with_device(
         } else {
             // The process-global page registry normalizes to whole 2MB pages,
             // absorbs pages already registered by the DPDK memseg walk
-            // (-EBUSY) as external, and rolls back the pages it touched on
-            // failure — a failed call owns no registration, so teardown can
-            // munmap normally.
-            if (nof_runtime_.initiator->RegisterMemory(
-                    shm.shm_buffer, shm.shm_size) == ErrorCode::OK) {
+            // (-EBUSY) as external, and cleans up the pages it touched on
+            // failure. A plain failure owns no registration, so teardown can
+            // munmap normally; only NOF_REGISTRATION_STUCK (cleanup
+            // unconfirmed) must be treated as registered.
+            const ErrorCode register_rc =
+                nof_runtime_.initiator->RegisterMemory(shm.shm_buffer,
+                                                       shm.shm_size);
+            if (register_rc == ErrorCode::OK) {
+                shm.spdk_registered = true;
+            } else if (register_rc == ErrorCode::NOF_REGISTRATION_STUCK) {
+                // The backend may still hold translation state for this
+                // range. Treat it as registered so teardown retries the
+                // unregister and quarantines the mapping instead of
+                // munmapping a possibly-live translation.
+                LOG(ERROR) << "NoF registration of received shm left "
+                              "unconfirmed translation state: "
+                           << shm.shm_buffer << ", size=" << shm.shm_size
+                           << "; treating as registered so teardown retries "
+                              "the unregister and quarantines the mapping";
                 shm.spdk_registered = true;
             } else {
                 LOG(WARNING) << "Failed to register received shm with the NoF "
@@ -4166,7 +4180,18 @@ tl::expected<void, ErrorCode> RealClient::register_buffer_internal(
     // I/O could hit the missing translation.
     if (nof_runtime_.initiator) {
         auto rc = nof_runtime_.initiator->RegisterMemory(buffer, size);
-        if (rc != ErrorCode::OK) {
+        if (rc == ErrorCode::NOF_REGISTRATION_STUCK) {
+            // Cleanup of the failed registration could not be confirmed, so
+            // the translation table may still reference this buffer. The
+            // buffer stays recorded below, and teardown's UnregisterMemory
+            // walk retries the cleanup. Do NOT free/munmap the buffer
+            // without unregistering it first.
+            LOG(ERROR) << "NoF memory registration left unconfirmed "
+                          "translation state for buffer "
+                       << buffer << ", size " << size
+                       << "; buffer stays registered with the transfer "
+                          "engine, and teardown will retry the NoF cleanup";
+        } else if (rc != ErrorCode::OK) {
             LOG(WARNING) << "NoF memory registration failed for buffer "
                          << buffer << ", size " << size << ": " << toString(rc)
                          << "; buffer stays registered with the transfer "

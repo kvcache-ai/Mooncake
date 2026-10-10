@@ -267,11 +267,24 @@ void* ShmHelper::allocate(size_t size) {
         } else {
             // The process-global page registry normalizes to whole 2MB pages,
             // absorbs pages already registered by the DPDK memseg walk
-            // (-EBUSY) as external, and rolls back the pages it touched on
-            // failure — a failed call owns no registration, so teardown can
-            // munmap normally.
-            if (nof_initiator_->RegisterMemory(base_addr, size) ==
-                ErrorCode::OK) {
+            // (-EBUSY) as external, and cleans up the pages it touched on
+            // failure. A plain failure owns no registration, so teardown can
+            // munmap normally; only NOF_REGISTRATION_STUCK (cleanup
+            // unconfirmed) must be treated as registered.
+            const ErrorCode register_rc =
+                nof_initiator_->RegisterMemory(base_addr, size);
+            if (register_rc == ErrorCode::OK) {
+                shm->spdk_registered = true;
+            } else if (register_rc == ErrorCode::NOF_REGISTRATION_STUCK) {
+                // The backend may still hold translation state for this
+                // range. Treat it as registered so free()/cleanup() retry
+                // the unregister and retain the mapping instead of
+                // munmapping a possibly-live translation.
+                LOG(ERROR) << "NoF registration of shared memory left "
+                              "unconfirmed translation state: addr="
+                           << base_addr << ", size=" << size
+                           << "; treating as registered so teardown retries "
+                              "the unregister";
                 shm->spdk_registered = true;
             } else {
                 LOG(WARNING) << "Failed to register shared memory with the NoF "

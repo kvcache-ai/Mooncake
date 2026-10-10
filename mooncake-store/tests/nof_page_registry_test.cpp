@@ -15,18 +15,24 @@ constexpr uintptr_t kPage = 2ULL << 20;
 
 // Fake SPDK translation table: tracks registration depth per 2MB page and
 // can be told to fail pages with -EBUSY (already registered by the DPDK
-// memseg walk) or -EIO (genuine failure).
+// memseg walk), -EIO on register before marking anything (genuine failure),
+// -EIO on register AFTER marking the page (partial state, mirroring
+// spdk_mem_register's mark-then-notify ordering), or -EIO on unregister.
 struct FakeTranslationTable {
     int RegisterPage(uintptr_t page) {
         ++register_calls;
         if (busy_pages.count(page)) return -EBUSY;
         if (fail_pages.count(page)) return -EIO;
         ++registered[page];
+        // mark_fail_pages stay registered in the fake table despite the
+        // failure — the partial state the registry must clean up.
+        if (mark_fail_pages.count(page)) return -EIO;
         return 0;
     }
 
     int UnregisterPage(uintptr_t page) {
         ++unregister_calls;
+        if (fail_unregister_pages.count(page)) return -EIO;
         auto it = registered.find(page);
         if (it == registered.end() || it->second == 0) return -EINVAL;
         --it->second;
@@ -43,6 +49,8 @@ struct FakeTranslationTable {
     std::map<uintptr_t, int> registered;
     std::set<uintptr_t> busy_pages;
     std::set<uintptr_t> fail_pages;
+    std::set<uintptr_t> mark_fail_pages;
+    std::set<uintptr_t> fail_unregister_pages;
 };
 
 FakeTranslationTable* g_fake = nullptr;
@@ -172,15 +180,112 @@ TEST_F(NofPageRegistryTest, FailureRollsBackOnlyThisCall) {
     fake_.fail_pages.insert(page1);
 
     // Two-page registration fails on the second page: the first page bumped
-    // by this call is rolled back...
+    // by this call is rolled back (unregister_calls=1), and the failing page
+    // gets a cleanup attempt (unregister_calls=2). spdk_mem_unregister
+    // answers -EINVAL for a never-marked page, so cleanup cannot be
+    // confirmed and the range is retained as NOF_REGISTRATION_STUCK.
     ASSERT_EQ(registry_.Register(owner_a_, ptr, 3 * kPage / 2),
-              ErrorCode::INTERNAL_ERROR);
+              ErrorCode::NOF_REGISTRATION_STUCK);
     EXPECT_EQ(fake_.Depth(page0), 0);
-    EXPECT_EQ(fake_.unregister_calls, 1);
+    EXPECT_EQ(fake_.unregister_calls, 2);
 
-    // ...and a later registration sees a clean table.
+    // ...and a later registration by another owner sees a clean table.
     ASSERT_EQ(registry_.Register(owner_b_, ptr, 4096), ErrorCode::OK);
     EXPECT_EQ(fake_.Depth(page0), 1);
+}
+
+// The failing page can leave partial backend state (spdk_mem_register marks
+// before its notify callbacks and does not roll back). When the cleanup
+// unregister succeeds, the failure is a plain error and owns nothing.
+TEST_F(NofPageRegistryTest, FailingPageCleanedUpWhenConfirmed) {
+    void* ptr = PageAddr(0);
+    const uintptr_t page0 = reinterpret_cast<uintptr_t>(ptr);
+    fake_.mark_fail_pages.insert(page0);  // marks, then fails
+
+    ASSERT_EQ(registry_.Register(owner_a_, ptr, 4096),
+              ErrorCode::INTERNAL_ERROR);
+    // Cleanup ran on the failing page and removed its partial state.
+    EXPECT_EQ(fake_.unregister_calls, 1);
+    EXPECT_EQ(fake_.Depth(page0), 0);
+
+    // No bookkeeping retained: a later Unregister is a no-op, and a retry
+    // registers fresh (no stale count, no external misclassification).
+    const int unregister_calls_after = fake_.unregister_calls;
+    EXPECT_EQ(registry_.Unregister(owner_a_, ptr), ErrorCode::OK);
+    EXPECT_EQ(fake_.unregister_calls, unregister_calls_after);
+    fake_.mark_fail_pages.erase(page0);  // backend recovers
+    ASSERT_EQ(registry_.Register(owner_a_, ptr, 4096), ErrorCode::OK);
+    EXPECT_EQ(fake_.Depth(page0), 1);
+}
+
+// When the cleanup unregister also fails, the page state is unknown: the
+// page must stay charged and the owner range retained so teardown retries.
+TEST_F(NofPageRegistryTest, FailingPageRetainedWhenCleanupUnconfirmed) {
+    void* ptr = PageAddr(0);
+    const uintptr_t page0 = reinterpret_cast<uintptr_t>(ptr);
+    fake_.mark_fail_pages.insert(page0);
+    fake_.fail_unregister_pages.insert(page0);
+
+    ASSERT_EQ(registry_.Register(owner_a_, ptr, 4096),
+              ErrorCode::NOF_REGISTRATION_STUCK);
+    // The partial mark is still there, and the registry kept the page.
+    EXPECT_EQ(fake_.Depth(page0), 1);
+
+    // A same-range retry must NOT re-call register_fn_: the leftover
+    // translation would answer -EBUSY and be misclassified as external.
+    const int register_calls_after = fake_.register_calls;
+    EXPECT_EQ(registry_.Register(owner_a_, ptr, 4096), ErrorCode::OK);
+    EXPECT_EQ(fake_.register_calls, register_calls_after);
+
+    // Unregister retries the cleanup; while the backend keeps failing it
+    // propagates the error and retains the record...
+    EXPECT_EQ(registry_.Unregister(owner_a_, ptr), ErrorCode::INTERNAL_ERROR);
+    EXPECT_EQ(fake_.Depth(page0), 1);
+
+    // ...and once the backend recovers, the retry releases it.
+    fake_.fail_unregister_pages.erase(page0);
+    EXPECT_EQ(registry_.Unregister(owner_a_, ptr), ErrorCode::OK);
+    EXPECT_EQ(fake_.Depth(page0), 0);
+}
+
+// Backend unregister failures must propagate and retain state for retry
+// (the shm quarantine paths key off the error return).
+TEST_F(NofPageRegistryTest, UnregisterFailurePropagatesAndRetainsState) {
+    void* ptr = PageAddr(0);
+    const uintptr_t page0 = reinterpret_cast<uintptr_t>(ptr);
+    ASSERT_EQ(registry_.Register(owner_a_, ptr, 4096), ErrorCode::OK);
+
+    fake_.fail_unregister_pages.insert(page0);
+    EXPECT_EQ(registry_.Unregister(owner_a_, ptr), ErrorCode::INTERNAL_ERROR);
+    // State retained: the page is still registered in the backend, still
+    // charged to the owner, and no re-registration happened.
+    EXPECT_EQ(fake_.Depth(page0), 1);
+    EXPECT_EQ(fake_.register_calls, 1);
+
+    fake_.fail_unregister_pages.erase(page0);
+    EXPECT_EQ(registry_.Unregister(owner_a_, ptr), ErrorCode::OK);
+    EXPECT_EQ(fake_.Depth(page0), 0);
+    // Owner record was erased: a third Unregister is a no-op.
+    const int unregister_calls_after = fake_.unregister_calls;
+    EXPECT_EQ(registry_.Unregister(owner_a_, ptr), ErrorCode::OK);
+    EXPECT_EQ(fake_.unregister_calls, unregister_calls_after);
+}
+
+TEST_F(NofPageRegistryTest, UnregisterAllPropagatesPartialFailure) {
+    void* p0 = PageAddr(0);
+    void* p1 = PageAddr(1);
+    ASSERT_EQ(registry_.Register(owner_a_, p0, 4096), ErrorCode::OK);
+    ASSERT_EQ(registry_.Register(owner_a_, p1, 4096), ErrorCode::OK);
+
+    fake_.fail_unregister_pages.insert(reinterpret_cast<uintptr_t>(p1));
+    EXPECT_EQ(registry_.UnregisterAll(owner_a_), ErrorCode::INTERNAL_ERROR);
+    // The healthy range was released; the failing one is retained for retry.
+    EXPECT_EQ(fake_.Depth(reinterpret_cast<uintptr_t>(p0)), 0);
+    EXPECT_EQ(fake_.Depth(reinterpret_cast<uintptr_t>(p1)), 1);
+
+    fake_.fail_unregister_pages.clear();
+    EXPECT_EQ(registry_.UnregisterAll(owner_a_), ErrorCode::OK);
+    EXPECT_EQ(fake_.Depth(reinterpret_cast<uintptr_t>(p1)), 0);
 }
 
 TEST_F(NofPageRegistryTest, UnregisterAllReleasesEverything) {

@@ -108,6 +108,22 @@ class NVMeoFInitiator {
     // RegisterMemory with an UnregisterMemory (or let client teardown walk
     // them) — the bookkeeping is process-global and outlives any instance.
     //
+    // Return contract (three outcomes):
+    //   - OK: fully registered.
+    //   - any other error (e.g. INTERNAL_ERROR): failed, and every page the
+    //     attempt touched is confirmed clean — the caller may munmap the
+    //     range without a pairing UnregisterMemory.
+    //   - NOF_REGISTRATION_STUCK: failed after the backend may have
+    //     partially marked/installed translation state, and cleanup could
+    //     not be confirmed. Bookkeeping is retained; the caller MUST treat
+    //     the range as still registered — route it through UnregisterMemory
+    //     at teardown (which retries the cleanup) and quarantine the mapping
+    //     instead of munmapping on continued failure.
+    //
+    // UnregisterMemory returns OK when the range is fully released (or was
+    // never registered by this instance); on INTERNAL_ERROR some pages could
+    // not be released and remain recorded for a retry.
+    //
     // SPDK requires BOTH vaddr and len to be 2MB-aligned and fails with
     // -EBUSY on already-registered pages (verified against v23.01.1
     // lib/env_dpdk/memory.c), so implementations normalize the range to
@@ -125,8 +141,8 @@ class NVMeoFInitiator {
 // A range rejected by this check is never touched by RegisterMemory, so a
 // caller that skips the attempt keeps the mapping munmap-safe without a
 // pairing UnregisterMemory; anything accepted here may still fail inside the
-// implementation (reported via the RegisterMemory return code, with the
-// implementation rolling back the pages it touched).
+// implementation (reported via the RegisterMemory return code — see its
+// three-outcome contract for the cleanup/NOF_REGISTRATION_STUCK semantics).
 inline bool NofRangeIsRegistrable(const void* ptr, size_t size) {
     constexpr uintptr_t kNofRegistrationPageSize = 2ULL << 20;  // 2MB
     return ptr != nullptr && size != 0 &&

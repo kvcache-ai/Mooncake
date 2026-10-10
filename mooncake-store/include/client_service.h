@@ -104,6 +104,17 @@ class Client {
         const std::string& tenant_id = "default",
         std::shared_ptr<NVMeoFInitiator> nof_initiator = nullptr);
 
+    // Test-only seam: when set, Client::Create builds the default NoF
+    // initiator from this factory instead of CreateNofRuntime() whenever the
+    // caller passes no initiator (nullptr). Not thread-safe; set before
+    // Create and reset (pass nullptr) after the test.
+    static void SetDefaultNofInitiatorFactoryForTesting(
+        std::function<std::shared_ptr<NVMeoFInitiator>()> factory);
+
+    // Test-only accessor for the wiring above: the initiator this client
+    // ended up with (nullptr = NoF unavailable in this process).
+    std::shared_ptr<NVMeoFInitiator> GetNofInitiatorForTesting() const;
+
     /**
      * @brief Retrieves data for a given key
      * @param object_key Key to retrieve
