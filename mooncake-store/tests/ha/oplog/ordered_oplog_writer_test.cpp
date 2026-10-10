@@ -1719,4 +1719,138 @@ TEST(OrderedOpLogWriterCallbackTest, SlowCallbackDoesNotPreventNextBatchWrite) {
     writer.Stop();
 }
 
+TEST(OrderedOpLogWriterAdmissionTest, CommitBatchSealsWholeGroupIntoOneRecord) {
+    FakeBatchWriter storage;
+    OrderedOpLogWriter writer(
+        OrderedOpLogWriterConfig{.max_entries_per_batch = 2},
+        [&](const OpLogBatchRecord& batch,
+            const DurablePrefix& expected_prefix) {
+            return storage.Write(batch, expected_prefix);
+        });
+    writer.Start();
+
+    auto reservation = writer.ReserveBatch(2);
+    ASSERT_TRUE(reservation.has_value());
+    std::atomic<size_t> callbacks{0};
+    std::vector<OpLogEntry> entries;
+    entries.push_back(MakeEntry("g1"));
+    entries.push_back(MakeEntry("g2"));
+    auto pending =
+        writer.CommitBatch(std::move(*reservation), std::move(entries),
+                           [&](const OpLogEntry&) { ++callbacks; });
+    ASSERT_TRUE(pending.has_value());
+    ASSERT_EQ(2u, pending->size());
+    EXPECT_EQ(1u, (*pending)[0].sequence_id());
+    EXPECT_EQ(2u, (*pending)[1].sequence_id());
+
+    ASSERT_TRUE(storage.WaitForWrites(1));
+    writer.Stop();
+
+    auto batches = storage.Batches();
+    ASSERT_EQ(1u, batches.size());
+    ASSERT_EQ(2u, batches[0].entries.size());
+    EXPECT_EQ("g1", batches[0].entries[0].object_key);
+    EXPECT_EQ("g2", batches[0].entries[1].object_key);
+    EXPECT_EQ(1u, batches[0].first_seq);
+    EXPECT_EQ(2u, batches[0].last_seq);
+    EXPECT_EQ(2u, callbacks.load());
+}
+
+TEST(OrderedOpLogWriterAdmissionTest, CommitBatchKeepsNeighborEntriesOutside) {
+    FakeBatchWriter storage;
+    OrderedOpLogWriter writer(
+        OrderedOpLogWriterConfig{.max_entries_per_batch = 3},
+        [&](const OpLogBatchRecord& batch,
+            const DurablePrefix& expected_prefix) {
+            return storage.Write(batch, expected_prefix);
+        });
+    writer.Start();
+
+    // The plain commit seals first and keeps the writer busy, so the group
+    // queues behind it and must come out as its own record.
+    auto first = writer.Reserve();
+    ASSERT_TRUE(first.has_value());
+    ASSERT_TRUE(
+        writer.Commit(std::move(*first), MakeEntry("plain"), [](const auto&) {})
+            .has_value());
+    ASSERT_TRUE(storage.WaitForWrites(1));
+
+    auto reservation = writer.ReserveBatch(2);
+    ASSERT_TRUE(reservation.has_value());
+    std::vector<OpLogEntry> entries;
+    entries.push_back(MakeEntry("g1"));
+    entries.push_back(MakeEntry("g2"));
+    ASSERT_TRUE(writer
+                    .CommitBatch(std::move(*reservation), std::move(entries),
+                                 [](const auto&) {})
+                    .has_value());
+    ASSERT_TRUE(storage.WaitForWrites(2));
+    writer.Stop();
+
+    auto batches = storage.Batches();
+    ASSERT_EQ(2u, batches.size());
+    ASSERT_EQ(1u, batches[0].entries.size());
+    EXPECT_EQ("plain", batches[0].entries[0].object_key);
+    ASSERT_EQ(2u, batches[1].entries.size());
+    EXPECT_EQ("g1", batches[1].entries[0].object_key);
+    EXPECT_EQ("g2", batches[1].entries[1].object_key);
+    EXPECT_EQ(2u, batches[1].first_seq);
+    EXPECT_EQ(3u, batches[1].last_seq);
+}
+
+TEST(OrderedOpLogWriterAdmissionTest, ReserveBatchEnforcesAdmissionCap) {
+    FakeBatchWriter storage;
+    OrderedOpLogWriter writer(
+        OrderedOpLogWriterConfig{.max_entries_per_batch = 2},
+        [&](const OpLogBatchRecord& batch,
+            const DurablePrefix& expected_prefix) {
+            return storage.Write(batch, expected_prefix);
+        });
+
+    // A group larger than the batch cap is rejected up front rather than
+    // producing an oversized record the backend might refuse.
+    auto oversized = writer.ReserveBatch(3);
+    ASSERT_FALSE(oversized.has_value());
+    EXPECT_EQ(ErrorCode::TASK_PENDING_LIMIT_EXCEEDED, oversized.error());
+
+    auto first = writer.Reserve();
+    ASSERT_TRUE(first.has_value());
+    auto no_room = writer.ReserveBatch(2);
+    ASSERT_FALSE(no_room.has_value());
+    EXPECT_EQ(ErrorCode::TASK_PENDING_LIMIT_EXCEEDED, no_room.error());
+
+    writer.Abort(std::move(*first));
+    auto reservation = writer.ReserveBatch(2);
+    ASSERT_TRUE(reservation.has_value());
+    writer.Abort(std::move(*reservation));
+
+    auto zero = writer.ReserveBatch(0);
+    ASSERT_FALSE(zero.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, zero.error());
+}
+
+TEST(OrderedOpLogWriterAdmissionTest, CommitBatchRejectsSlotMismatch) {
+    FakeBatchWriter storage;
+    OrderedOpLogWriter writer(
+        OrderedOpLogWriterConfig{.max_entries_per_batch = 2},
+        [&](const OpLogBatchRecord& batch,
+            const DurablePrefix& expected_prefix) {
+            return storage.Write(batch, expected_prefix);
+        });
+
+    auto reservation = writer.ReserveBatch(2);
+    ASSERT_TRUE(reservation.has_value());
+    std::vector<OpLogEntry> entries;
+    entries.push_back(MakeEntry("only_one"));
+    auto pending = writer.CommitBatch(std::move(*reservation),
+                                      std::move(entries), [](const auto&) {});
+    ASSERT_FALSE(pending.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, pending.error());
+
+    // The rejected reservation released its slots, so admission still works.
+    auto next = writer.ReserveBatch(2);
+    ASSERT_TRUE(next.has_value());
+    writer.Abort(std::move(*next));
+}
+
 }  // namespace mooncake::test
