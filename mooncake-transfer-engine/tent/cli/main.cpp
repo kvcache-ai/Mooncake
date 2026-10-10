@@ -14,7 +14,7 @@
 
 #include <iostream>
 
-#include "CLI11.hpp"
+#include <CLI/CLI.hpp>
 #include "tent/diagnostics/diagnostic.h"
 
 namespace diagnostics = mooncake::tent::diagnostics;

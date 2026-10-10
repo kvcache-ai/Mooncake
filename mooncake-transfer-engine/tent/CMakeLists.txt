@@ -5,6 +5,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   include(../../cmake/Dependencies.cmake)
   mooncake_provide_liburing()
   mooncake_provide_hiredis()
+  mooncake_provide_cli11()
 endif()
 
 if(BUILD_UNIT_TESTS AND NOT TARGET gtest)

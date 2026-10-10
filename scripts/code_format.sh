@@ -46,7 +46,6 @@ GIT_CLANG_FORMAT_EXTENSIONS="h,hpp,cpp,cu,cuh,c,cc,cxx"
 EXCLUDE_DIRS=(
     "cachelib_memory_allocator"
     "thirdparty"
-    "extern"
 )
 
 # Colors for output
@@ -208,7 +207,6 @@ format_selected_lines() {
         "$@"
         ':(exclude,glob)**/cachelib_memory_allocator/**'
         ':(exclude,glob)**/thirdparty/**'
-        ':(exclude,glob)extern/**'
     )
 
     print_info "Using $(${clang_format} --version)"
