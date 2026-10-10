@@ -7,13 +7,17 @@
 #include <cstring>
 #include <memory>
 #include <fcntl.h>
+#include <functional>
+#include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <sys/uio.h>
 #include <string_view>
+#include <thread>
 #include <vector>
 #include "file_interface.h"
+#include "../src/iovec_cursor.h"
 #include "../src/uring_submit.h"
 
 namespace mooncake {
@@ -41,6 +45,139 @@ class PosixFileTest : public ::testing::Test {
     std::string test_filename;
     int test_fd = -1;
 };
+
+// PosixFile continues a short pwritev/preadv on a copy of the caller's
+// iovecs. A kernel cannot be made to stop at an arbitrary byte and then
+// succeed, so where the continuation starts is tested on the helpers.
+class IovecCursorTest : public ::testing::Test {
+   protected:
+    // iovecs over consecutive slices of `stream_`, one per length.
+    std::vector<iovec> Slices(const std::vector<size_t>& lens) {
+        size_t total = 0;
+        for (size_t len : lens) total += len;
+        stream_.resize(total);
+        for (size_t i = 0; i < total; ++i)
+            stream_[i] = static_cast<char>('!' + i % 89);
+        std::vector<iovec> iovs;
+        size_t at = 0;
+        for (size_t len : lens) {
+            iovs.push_back({stream_.data() + at, len});
+            at += len;
+        }
+        return iovs;
+    }
+
+    // The bytes the remaining iovecs still describe, in order.
+    static std::string Remaining(const std::vector<iovec>& iovs, size_t first) {
+        std::string out;
+        for (size_t i = first; i < iovs.size(); ++i)
+            out.append(static_cast<const char*>(iovs[i].iov_base),
+                       iovs[i].iov_len);
+        return out;
+    }
+
+    char* At(size_t offset) { return stream_.data() + offset; }
+
+    std::string stream_;
+};
+
+TEST_F(IovecCursorTest, StopInsideAnIovecResumesAtThatByte) {
+    auto iovs = Slices({3000, 3000});
+    size_t first = 0;
+    ASSERT_TRUE(detail::SkipEmptyIovecs(iovs, first));
+    detail::ConsumeIovecs(iovs, first, 4096);
+    ASSERT_TRUE(detail::SkipEmptyIovecs(iovs, first));
+    EXPECT_EQ(first, 1u);
+    EXPECT_EQ(iovs[1].iov_base, At(4096));
+    EXPECT_EQ(iovs[1].iov_len, 1904u);
+    EXPECT_EQ(Remaining(iovs, first), stream_.substr(4096));
+}
+
+TEST_F(IovecCursorTest, StopAtAnIovecBoundaryResumesAtTheNextIovec) {
+    auto iovs = Slices({3000, 3000});
+    size_t first = 0;
+    detail::ConsumeIovecs(iovs, first, 3000);
+    EXPECT_EQ(first, 1u);
+    EXPECT_EQ(iovs[0].iov_len, 0u);
+    EXPECT_EQ(iovs[1].iov_base, At(3000));
+    EXPECT_EQ(iovs[1].iov_len, 3000u);
+    EXPECT_EQ(Remaining(iovs, first), stream_.substr(3000));
+}
+
+TEST_F(IovecCursorTest, StopAcrossSeveralBoundaries) {
+    auto iovs = Slices({100, 200, 300, 400});
+    size_t first = 0;
+    detail::ConsumeIovecs(iovs, first, 350);
+    EXPECT_EQ(first, 2u);
+    EXPECT_EQ(iovs[2].iov_base, At(350));
+    EXPECT_EQ(iovs[2].iov_len, 250u);
+    EXPECT_EQ(iovs[3].iov_base, At(600));
+    EXPECT_EQ(iovs[3].iov_len, 400u);
+    EXPECT_EQ(Remaining(iovs, first), stream_.substr(350));
+
+    detail::ConsumeIovecs(iovs, first, 650);
+    EXPECT_EQ(first, 4u);
+    EXPECT_FALSE(detail::SkipEmptyIovecs(iovs, first));
+}
+
+TEST_F(IovecCursorTest, ZeroLengthIovecsAreSkipped) {
+    // Empty iovecs at the front, in the middle and at the end.
+    auto iovs = Slices({0, 100, 0, 0, 200, 0});
+    size_t first = 0;
+    ASSERT_TRUE(detail::SkipEmptyIovecs(iovs, first));
+    EXPECT_EQ(first, 1u);
+
+    detail::ConsumeIovecs(iovs, first, 100);
+    EXPECT_EQ(first, 2u);
+    ASSERT_TRUE(detail::SkipEmptyIovecs(iovs, first));
+    EXPECT_EQ(first, 4u);
+
+    detail::ConsumeIovecs(iovs, first, 50);
+    EXPECT_EQ(iovs[4].iov_base, At(150));
+    EXPECT_EQ(iovs[4].iov_len, 150u);
+    EXPECT_EQ(Remaining(iovs, first), stream_.substr(150));
+
+    detail::ConsumeIovecs(iovs, first, 150);
+    EXPECT_FALSE(detail::SkipEmptyIovecs(iovs, first));
+    EXPECT_EQ(first, 6u);
+
+    // ConsumeIovecs also steps over empty iovecs on its own.
+    iovs = Slices({10, 0, 0, 20});
+    first = 0;
+    detail::ConsumeIovecs(iovs, first, 15);
+    EXPECT_EQ(first, 3u);
+    EXPECT_EQ(iovs[3].iov_base, At(15));
+    EXPECT_EQ(iovs[3].iov_len, 15u);
+}
+
+// The same loop as PosixFile::vector_write, with a fake pwritev that moves
+// at most `max_per_call` bytes: the destination must equal the stream for
+// every short count, including stops inside, at and across iovec bounds.
+TEST_F(IovecCursorTest, EveryShortCountCopiesTheStreamInOrder) {
+    const std::vector<size_t> lens = {0, 3000, 0, 1096, 1, 0, 2903, 0};
+    for (size_t max_per_call :
+         {size_t{1}, size_t{7}, size_t{1095}, size_t{1096}, size_t{2999},
+          size_t{3000}, size_t{3001}, size_t{4096}, size_t{7000}}) {
+        auto iovs = Slices(lens);
+        std::string dest(stream_.size(), '\0');
+        size_t first = 0;
+        size_t written = 0;
+        while (detail::SkipEmptyIovecs(iovs, first)) {
+            size_t moved = 0;
+            for (size_t i = first; i < iovs.size() && moved < max_per_call;
+                 ++i) {
+                const size_t n =
+                    std::min(iovs[i].iov_len, max_per_call - moved);
+                std::memcpy(dest.data() + written + moved, iovs[i].iov_base, n);
+                moved += n;
+            }
+            written += moved;
+            detail::ConsumeIovecs(iovs, first, moved);
+        }
+        EXPECT_EQ(written, stream_.size()) << "max_per_call=" << max_per_call;
+        EXPECT_EQ(dest, stream_) << "max_per_call=" << max_per_call;
+    }
+}
 
 #ifdef USE_URING
 TEST(UringSubmitTest, ContinuesAfterPositiveShortSubmit) {
@@ -171,8 +308,8 @@ TEST_F(PosixFileTest, VectorizedWrite) {
     EXPECT_EQ(posix_file.get_error_code(), ErrorCode::OK);
 }
 
-// A short pwritev must be treated as a failed write. Otherwise the PosixFile
-// destructor has no failure state and leaves a truncated object on disk.
+// A write that cannot complete must fail, so that the PosixFile destructor
+// removes the partial object instead of leaving it truncated on disk.
 TEST_F(PosixFileTest, ShortVectorizedWriteRemovesPartialFile) {
 #if defined(RLIMIT_FSIZE) && defined(SIGXFSZ)
     const std::string partial_filename =
@@ -213,6 +350,182 @@ TEST_F(PosixFileTest, ShortVectorizedWriteRemovesPartialFile) {
 #else
     GTEST_SKIP() << "RLIMIT_FSIZE/SIGXFSZ is unavailable on this platform";
 #endif
+}
+
+// A failed syscall keeps its errno (the first one wins), so the disk fence
+// can classify it; the ErrorCode alone cannot.
+TEST_F(PosixFileTest, FailedSyscallKeepsFirstErrno) {
+    int full_fd = open("/dev/full", O_RDWR);
+    if (full_fd < 0) GTEST_SKIP() << "/dev/full is unavailable";
+    {
+        PosixFile full("/dev/full", full_fd);
+        // A failed write would otherwise unlink the path on destruction.
+        full.SetDeleteOnWriteFail(false);
+        EXPECT_EQ(full.sys_errno(), 0);
+        std::string data(4096, 'x');
+        auto written = full.write(data, data.size());
+        ASSERT_FALSE(written);
+        EXPECT_EQ(written.error(), ErrorCode::FILE_WRITE_FAIL);
+        EXPECT_EQ(full.sys_errno(), ENOSPC);
+
+        iovec iov{data.data(), data.size()};
+        ASSERT_FALSE(full.vector_write(&iov, 1, 0));
+        EXPECT_EQ(full.sys_errno(), ENOSPC);
+    }
+
+    // preadv on a write-only descriptor fails with EBADF.
+    int wronly_fd = open(test_filename.c_str(), O_WRONLY);
+    ASSERT_GE(wronly_fd, 0);
+    PosixFile wronly(test_filename, wronly_fd);
+    char buf[16];
+    iovec iov{buf, sizeof(buf)};
+    auto read = wronly.vector_read(&iov, 1, 0);
+    ASSERT_FALSE(read);
+    EXPECT_EQ(read.error(), ErrorCode::FILE_READ_FAIL);
+    EXPECT_EQ(wronly.sys_errno(), EBADF);
+}
+
+// A short read is a logical failure: no syscall failed, so errno stays 0.
+TEST_F(PosixFileTest, ShortReadHasNoErrno) {
+    PosixFile posix_file(test_filename, test_fd);
+    test_fd = -1;  // owned by posix_file now
+    std::string buffer;
+    auto read = posix_file.read(buffer, 64);  // the file is empty
+    ASSERT_FALSE(read);
+    EXPECT_EQ(read.error(), ErrorCode::FILE_READ_FAIL);
+    EXPECT_EQ(posix_file.sys_errno(), 0);
+}
+
+#if defined(RLIMIT_FSIZE) && defined(SIGXFSZ)
+// Runs `body` in a child whose file size limit is `limit_bytes`. With SIGXFSZ
+// ignored, a write that crosses the limit is short, and the next write at the
+// limit fails with EFBIG: a short write followed by the real error.
+static int RunWithFileSizeLimit(rlim_t limit_bytes,
+                                const std::function<int()>& body) {
+    pid_t child = fork();
+    if (child < 0) return -1;
+    if (child == 0) {
+        if (signal(SIGXFSZ, SIG_IGN) == SIG_ERR) _exit(100);
+        const struct rlimit limit = {limit_bytes, limit_bytes};
+        if (setrlimit(RLIMIT_FSIZE, &limit) != 0) _exit(101);
+        _exit(body());
+    }
+    int status = 0;
+    if (waitpid(child, &status, 0) != child || !WIFEXITED(status)) return -1;
+    return WEXITSTATUS(status);
+}
+#endif
+
+// A short pwritev is continued, so the caller sees the errno of the call that
+// really failed (EFBIG here, EIO on a dying disk) instead of a bare failure.
+TEST_F(PosixFileTest, ShortVectorWriteContinuesToTheRealErrno) {
+#if defined(RLIMIT_FSIZE) && defined(SIGXFSZ)
+    const std::string path =
+        "short_write_errno_" + std::to_string(getpid()) + ".tmp";
+    int rc = RunWithFileSizeLimit(4096, [&]() -> int {
+        int fd = open(path.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0644);
+        if (fd < 0) return 10;
+        PosixFile file(path, fd);
+        std::string data(8192, 'x');
+        iovec iov{data.data(), data.size()};
+        auto result = file.vector_write(&iov, 1, 0);
+        if (result) return 11;
+        if (result.error() != ErrorCode::FILE_WRITE_FAIL) return 12;
+        if (file.sys_errno() != EFBIG) return 13;
+        return 0;
+    });
+    unlink(path.c_str());
+    EXPECT_EQ(rc, 0) << "11: write succeeded, 12: wrong ErrorCode, "
+                        "13: errno is not EFBIG";
+#else
+    GTEST_SKIP() << "RLIMIT_FSIZE/SIGXFSZ is unavailable on this platform";
+#endif
+}
+
+// The first pwritev stops inside the second iovec, at the file size limit,
+// and the continuation fails there with EFBIG. The caller sees that errno, its
+// iovecs are not modified, and the bytes before the stop are on disk. (The
+// continuation writes nothing here; where it resumes is tested by
+// IovecCursorTest.)
+TEST_F(PosixFileTest, ShortVectorWriteInsideSecondIovecKeepsTheRealErrno) {
+#if defined(RLIMIT_FSIZE) && defined(SIGXFSZ)
+    const std::string path =
+        "short_write_iov_" + std::to_string(getpid()) + ".tmp";
+    int rc = RunWithFileSizeLimit(4096, [&]() -> int {
+        int fd = open(path.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0644);
+        if (fd < 0) return 10;
+        PosixFile file(path, fd);
+        file.SetDeleteOnWriteFail(false);  // keep the bytes for the check
+        std::string a(3000, 'a');
+        std::string b(3000, 'b');
+        iovec iov[2] = {{a.data(), a.size()}, {b.data(), b.size()}};
+        auto result = file.vector_write(iov, 2, 0);
+        if (result) return 11;
+        if (file.sys_errno() != EFBIG) return 12;
+        // The caller's iovecs are not modified.
+        if (iov[0].iov_base != a.data() || iov[0].iov_len != a.size() ||
+            iov[1].iov_base != b.data() || iov[1].iov_len != b.size())
+            return 13;
+        return 0;
+    });
+    EXPECT_EQ(rc, 0) << "11: write succeeded, 12: errno is not EFBIG, "
+                        "13: caller's iovecs changed";
+
+    // 3000 'a' then the first 1096 bytes of the second iovec.
+    std::string on_disk;
+    {
+        int fd = open(path.c_str(), O_RDONLY);
+        ASSERT_GE(fd, 0);
+        char buf[8192];
+        ssize_t n = pread(fd, buf, sizeof(buf), 0);
+        close(fd);
+        ASSERT_GE(n, 0);
+        on_disk.assign(buf, static_cast<size_t>(n));
+    }
+    unlink(path.c_str());
+    EXPECT_EQ(on_disk, std::string(3000, 'a') + std::string(1096, 'b'));
+#else
+    GTEST_SKIP() << "RLIMIT_FSIZE/SIGXFSZ is unavailable on this platform";
+#endif
+}
+
+// vector_read returns fewer bytes than asked only at EOF. A short preadv
+// before EOF is continued, so the caller sees the errno of the call that
+// really failed: here the second iovec is an inaccessible page, the kernel
+// fills the first iovec and returns that short count, and the continuation
+// fails with EFAULT (on a disk, a bad block gives a short read, then EIO).
+TEST_F(PosixFileTest, VectorReadIsShortOnlyAtEof) {
+    const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    std::string content(2 * page, '\0');
+    for (size_t i = 0; i < content.size(); ++i)
+        content[i] = static_cast<char>('0' + i % 75);
+    ASSERT_EQ(pwrite(test_fd, content.data(), content.size(), 0),
+              static_cast<ssize_t>(content.size()));
+    PosixFile file(test_filename, test_fd);
+    test_fd = -1;  // owned by file now
+
+    // EOF inside the third iovec: the short count, no error, iovecs in order.
+    char c1[30], c2[30], c3[30];
+    iovec eof_iov[3] = {{c1, 30}, {c2, 30}, {c3, 30}};
+    auto at_eof = file.vector_read(eof_iov, 3, content.size() - 50);
+    ASSERT_TRUE(at_eof);
+    EXPECT_EQ(*at_eof, 50u);
+    EXPECT_EQ(std::string(c1, 30) + std::string(c2, 20),
+              content.substr(content.size() - 50));
+    EXPECT_EQ(file.sys_errno(), 0);
+
+    // Short before EOF: continued, and the continuation's errno is kept.
+    void* mem = mmap(nullptr, 2 * page, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ASSERT_NE(mem, MAP_FAILED);
+    char* base = static_cast<char*>(mem);
+    ASSERT_EQ(mprotect(base + page, page, PROT_NONE), 0);
+    iovec iov[2] = {{base, page}, {base + page, page}};
+    auto result = file.vector_read(iov, 2, 0);
+    EXPECT_FALSE(result);
+    EXPECT_EQ(file.sys_errno(), EFAULT);
+    EXPECT_EQ(std::string(base, page), content.substr(0, page));
+    munmap(mem, 2 * page);
 }
 
 // Test vectorized read operation
@@ -530,6 +843,202 @@ TEST_F(PosixFileTest, UringVectorWriteAbortsWhenPreservationReadFails) {
     EXPECT_EQ(out_neighbor, neighbor);
 
     remove(direct_filename.c_str());
+}
+
+// Some sandboxes block io_uring (seccomp); the tests below skip there.
+static bool UringAvailable() {
+    struct io_uring ring;
+    if (io_uring_queue_init(2, &ring, 0) < 0) return false;
+    io_uring_queue_exit(&ring);
+    return true;
+}
+
+// A failed CQE keeps its errno, as a failed syscall does in PosixFile.
+TEST_F(PosixFileTest, UringFailedCqeKeepsErrno) {
+    if (!UringAvailable()) GTEST_SKIP() << "io_uring is unavailable";
+    // Reads on a write-only descriptor fail with EBADF.
+    int wronly_fd = open(test_filename.c_str(), O_WRONLY);
+    ASSERT_GE(wronly_fd, 0);
+    UringFile wronly(test_filename, wronly_fd, 32, false);
+    EXPECT_EQ(wronly.sys_errno(), 0);
+    std::array<char, 16> buf{};
+    UringFile::ReadDesc desc{buf.data(), buf.size(), 0};
+    ASSERT_FALSE(wronly.batch_read(&desc, 1));
+    EXPECT_EQ(wronly.sys_errno(), EBADF);
+    // A new file: the first errno wins, so `wronly` would keep EBADF anyway.
+    int wronly_fd2 = open(test_filename.c_str(), O_WRONLY);
+    ASSERT_GE(wronly_fd2, 0);
+    UringFile wronly2(test_filename, wronly_fd2, 32, false);
+    iovec iov{buf.data(), buf.size()};
+    ASSERT_FALSE(wronly2.vector_read(&iov, 1, 0));
+    EXPECT_EQ(wronly2.sys_errno(), EBADF);
+}
+
+#if defined(RLIMIT_FSIZE) && defined(SIGXFSZ)
+// Runs `body` on a new thread so that it gets its own io_uring ring: a forked
+// child must not submit to the ring it inherited from the parent's thread.
+static int OnFreshRing(const std::function<int()>& body) {
+    int rc = -1;
+    std::thread([&] { rc = body(); }).join();
+    return rc;
+}
+
+// Whether this kernel applies the file size limit to io_uring writes: a
+// write across the limit completes short, and the next one fails with EFBIG.
+// Buffered writes can be punted to io-wq workers, which older kernels did
+// not run with the submitter's limits.
+static bool UringHonorsFileSizeLimit(const std::string& path) {
+    int rc = RunWithFileSizeLimit(4096, [&]() -> int {
+        int fd = open(path.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0644);
+        if (fd < 0) return 10;
+        struct io_uring ring;
+        if (io_uring_queue_init(2, &ring, 0) < 0) return 11;
+        std::string data(8192, 'x');
+        const off_t offsets[2] = {0, 4096};
+        int results[2] = {0, 0};
+        for (int i = 0; i < 2; ++i) {
+            struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
+            io_uring_prep_write(sqe, fd, data.data(), data.size(), offsets[i]);
+            struct io_uring_cqe* cqe = nullptr;
+            if (io_uring_submit_and_wait(&ring, 1) < 0) return 12;
+            if (io_uring_wait_cqe(&ring, &cqe) < 0) return 12;
+            results[i] = cqe->res;
+            io_uring_cqe_seen(&ring, cqe);
+        }
+        return results[0] == 4096 && results[1] == -EFBIG ? 0 : 13;
+    });
+    unlink(path.c_str());
+    return rc == 0;
+}
+#endif
+
+// A write that completes short (here it crosses the file size limit) is
+// continued, so the caller sees the errno of the part that really failed
+// (EFBIG here, EIO on a dying disk) instead of a short success.
+TEST_F(PosixFileTest, UringShortWriteContinuesToTheRealErrno) {
+#if defined(RLIMIT_FSIZE) && defined(SIGXFSZ)
+    if (!UringAvailable()) GTEST_SKIP() << "io_uring is unavailable";
+    const std::string path =
+        "uring_short_write_" + std::to_string(getpid()) + ".tmp";
+    if (!UringHonorsFileSizeLimit(path))
+        GTEST_SKIP() << "this kernel does not apply RLIMIT_FSIZE to io_uring "
+                        "writes";
+    int rc = RunWithFileSizeLimit(5000, [&]() -> int {
+        return OnFreshRing([&]() -> int {
+            int fd = open(path.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0644);
+            if (fd < 0) return 10;
+            UringFile file(path, fd, 32, false);
+            std::string data(8192, 'x');
+            if (file.write_aligned(data.data(), data.size(), 0)) return 11;
+            if (file.sys_errno() != EFBIG) return 12;
+            return 0;
+        });
+    });
+    unlink(path.c_str());
+    EXPECT_EQ(rc, 0) << "11: write succeeded, 12: errno is not EFBIG";
+
+    // One SQE per iovec: the second iovec stops at the limit, and its rest is
+    // resubmitted and fails with EFBIG. The caller's iovecs are not modified.
+    rc = RunWithFileSizeLimit(4096, [&]() -> int {
+        return OnFreshRing([&]() -> int {
+            int fd = open(path.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0644);
+            if (fd < 0) return 10;
+            UringFile file(path, fd, 32, false);
+            file.SetDeleteOnWriteFail(false);  // keep the bytes for the check
+            std::string a(3000, 'a');
+            std::string b(3000, 'b');
+            iovec iov[2] = {{a.data(), a.size()}, {b.data(), b.size()}};
+            if (file.vector_write(iov, 2, 0)) return 11;
+            if (file.sys_errno() != EFBIG) return 12;
+            if (iov[0].iov_base != a.data() || iov[0].iov_len != a.size() ||
+                iov[1].iov_base != b.data() || iov[1].iov_len != b.size())
+                return 13;
+            return 0;
+        });
+    });
+    EXPECT_EQ(rc, 0) << "11: write succeeded, 12: errno is not EFBIG, "
+                        "13: caller's iovecs changed";
+    std::string on_disk;
+    {
+        int fd = open(path.c_str(), O_RDONLY);
+        ASSERT_GE(fd, 0);
+        char buf[8192];
+        ssize_t n = pread(fd, buf, sizeof(buf), 0);
+        close(fd);
+        ASSERT_GE(n, 0);
+        on_disk.assign(buf, static_cast<size_t>(n));
+    }
+    unlink(path.c_str());
+    EXPECT_EQ(on_disk, std::string(3000, 'a') + std::string(1096, 'b'));
+#else
+    GTEST_SKIP() << "RLIMIT_FSIZE/SIGXFSZ is unavailable on this platform";
+#endif
+}
+
+// A read completes short only at EOF. A short CQE before EOF is continued,
+// so the caller sees the errno of the part that really failed: here the
+// buffer runs into an inaccessible page, the kernel fills the accessible
+// half and completes short, and the continuation fails with EFAULT.
+TEST_F(PosixFileTest, UringReadIsShortOnlyAtEof) {
+    if (!UringAvailable()) GTEST_SKIP() << "io_uring is unavailable";
+    // A short completion resumes only on a 4 KiB boundary (O_DIRECT), and
+    // the inaccessible page below must start on one.
+    const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    if (page != 4096) GTEST_SKIP() << "needs 4 KiB pages, not " << page;
+    std::string content(3 * page, '\0');
+    for (size_t i = 0; i < content.size(); ++i)
+        content[i] = static_cast<char>('0' + i % 75);
+    ASSERT_EQ(pwrite(test_fd, content.data(), content.size(), 0),
+              static_cast<ssize_t>(content.size()));
+    int uring_fd = dup(test_fd);
+    ASSERT_GE(uring_fd, 0);
+    UringFile file(test_filename, uring_fd, 32, false);
+
+    // EOF: the short count, no error.
+    std::string tail(page, '\0');
+    auto at_eof = file.read_aligned(tail.data(), page, content.size() - 100);
+    ASSERT_TRUE(at_eof) << toString(at_eof.error());
+    EXPECT_EQ(*at_eof, 100u);
+    EXPECT_EQ(tail.substr(0, 100), content.substr(content.size() - 100));
+    EXPECT_EQ(file.sys_errno(), 0);
+
+    // Short before EOF: continued, and the continuation's errno is kept.
+    void* mem = mmap(nullptr, 2 * page, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ASSERT_NE(mem, MAP_FAILED);
+    char* base = static_cast<char*>(mem);
+    ASSERT_EQ(mprotect(base + page, page, PROT_NONE), 0);
+    char* buf = base + page / 2;  // half a page, then the inaccessible page
+    auto result = file.read_aligned(buf, page, page / 2);
+    EXPECT_FALSE(result);
+    EXPECT_EQ(file.sys_errno(), EFAULT);
+    EXPECT_EQ(std::string(buf, page / 2), content.substr(page / 2, page / 2));
+
+    // The same through batch_read and vector_read, each on a new file (the
+    // first errno wins).
+    {
+        int fd = dup(uring_fd);
+        ASSERT_GE(fd, 0);
+        UringFile batch_file(test_filename, fd, 32, false);
+        std::memset(buf, 0, page / 2);
+        UringFile::ReadDesc desc{buf, page, static_cast<off_t>(page / 2)};
+        EXPECT_FALSE(batch_file.batch_read(&desc, 1));
+        EXPECT_EQ(batch_file.sys_errno(), EFAULT);
+        EXPECT_EQ(std::string(buf, page / 2),
+                  content.substr(page / 2, page / 2));
+    }
+    {
+        int fd = dup(uring_fd);
+        ASSERT_GE(fd, 0);
+        UringFile vector_file(test_filename, fd, 32, false);
+        std::memset(buf, 0, page / 2);
+        iovec iov{buf, page};
+        EXPECT_FALSE(vector_file.vector_read(&iov, 1, page / 2));
+        EXPECT_EQ(vector_file.sys_errno(), EFAULT);
+        EXPECT_EQ(std::string(buf, page / 2),
+                  content.substr(page / 2, page / 2));
+    }
+    munmap(mem, 2 * page);
 }
 #endif
 

@@ -303,6 +303,11 @@ class StorageBackendInterface {
         // Default: no-op (no test failures injected)
     }
 
+    // Receives each failed disk syscall's errno and name, on the I/O thread.
+    // Set before any I/O starts; backends without errno reporting ignore it.
+    using DiskErrorObserver = std::function<void(int err, const char* op)>;
+    virtual void SetDiskErrorObserver(DiskErrorObserver /* observer */) {}
+
     // Remove all persisted objects from disk. Called during RemoveAll to
     // clean up physical SSD files alongside master metadata deletion.
     virtual void RemoveAll() {}
@@ -826,6 +831,10 @@ class BucketStorageBackend : public StorageBackendInterface {
         next_bucket_ = -1;
     }
 
+    void SetDiskErrorObserver(DiskErrorObserver observer) override {
+        disk_error_observer_ = std::move(observer);
+    }
+
     /**
      * @brief Checks whether the backend is allowed to continue offloading.
      * @return tl::expected<bool, ErrorCode>
@@ -1062,6 +1071,11 @@ class BucketStorageBackend : public StorageBackendInterface {
     }
 
    private:
+    void NotifyDiskError(int err, const char* op) const {
+        if (err != 0 && disk_error_observer_) disk_error_observer_(err, op);
+    }
+
+    DiskErrorObserver disk_error_observer_;
     std::atomic<bool> test_datasync_failure_{false};
     // Alignment helper functions for O_DIRECT I/O
     static constexpr size_t kDirectIOAlignment = 4096;
