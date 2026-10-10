@@ -14,6 +14,7 @@
 #include "master_config.h"
 #include "kv_event/kv_event_publisher.h"
 #include "segment.h"
+#include "gather_read.h"
 
 namespace mooncake {
 
@@ -21,6 +22,7 @@ namespace mooncake {
 class HttpMetadataServer;
 class WrappedMasterService {
    public:
+    store::GatherReadDirectory gather_directory;
     void SetBatchOpLogTerminalCallback(
         OrderedOpLogWriter::TerminalCallback callback);
     void StopBatchOpLogWriter();
