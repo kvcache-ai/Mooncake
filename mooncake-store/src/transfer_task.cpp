@@ -78,14 +78,13 @@ static int CountNofQueuedTasks(const mooncake::NofTask* head) {
 }
 
 static inline void NofTaskCompletion(mooncake::NofTask* task) {
-    if (task->remaining_bytes == 0 && task->outstanding_sub_io == 0) {
+    if (!task->on_chain && task->remaining_bytes == 0 &&
+        task->outstanding_sub_io == 0) {
         task->state->set_completed(task->failed
                                        ? mooncake::ErrorCode::TRANSFER_FAIL
                                        : mooncake::ErrorCode::OK,
                                    std::move(task->error_detail));
-        if (!task->on_chain) {
-            delete task;
-        }
+        delete task;
     }
 }
 
