@@ -8,6 +8,7 @@
 #include <iomanip>
 #include <memory>
 #include <numeric>
+#include <random>
 #include <set>
 #include <string>
 #include <tuple>
@@ -27,7 +28,8 @@ static constexpr size_t MiB = 1024 * 1024;
 
 // Strategy types for parameterized tests
 const auto kStrategyTypes = ::testing::Values(
-    AllocationStrategyType::RANDOM, AllocationStrategyType::FREE_RATIO_FIRST);
+    AllocationStrategyType::RANDOM, AllocationStrategyType::FREE_RATIO_FIRST,
+    AllocationStrategyType::BEST_FIT);
 
 const auto kAllocatorTypes = ::testing::Values(BufferAllocatorType::CACHELIB,
                                                BufferAllocatorType::OFFSET);
@@ -90,6 +92,9 @@ INSTANTIATE_TEST_SUITE_P(
                 break;
             case AllocationStrategyType::SSD_FREE_RATIO_FIRST:
                 strategy_str = "SsdFreeRatioFirst";
+                break;
+            case AllocationStrategyType::BEST_FIT:
+                strategy_str = "BestFit";
                 break;
             default:
                 strategy_str = "Unknown";
@@ -750,6 +755,90 @@ TEST_F(AllocationStrategyTest, PerformanceComparison) {
               << (static_cast<double>(random_elapsed_us.count()) /
                   frf_elapsed_us.count())
               << "x\n\n";
+}
+
+// Best-fit must place each request into the segment whose largest free
+// region is the smallest one that still fits, keeping big holes for big
+// objects.
+TEST_F(AllocationStrategyTest, BestFitPrefersTightestSegment) {
+    const size_t kSegmentSize = 64 * MiB;
+    AllocatorManager allocator_manager;
+    for (const auto& name : {"seg_a", "seg_b", "seg_c"}) {
+        allocator_manager.addAllocator(
+            name, std::make_shared<OffsetBufferAllocator>(name, 0x100000000ULL,
+                                                          kSegmentSize, name));
+    }
+    RandomAllocationStrategy placer;
+    std::vector<Replica> prefill;
+    // seg_a keeps ~4 MiB free, seg_b ~32 MiB, seg_c stays empty.
+    auto a = placer.AllocateFrom(allocator_manager, 60 * MiB, "seg_a");
+    auto b = placer.AllocateFrom(allocator_manager, 32 * MiB, "seg_b");
+    ASSERT_TRUE(a.has_value() && b.has_value());
+    prefill.push_back(std::move(a.value()));
+    prefill.push_back(std::move(b.value()));
+
+    BestFitAllocationStrategy strategy;
+    auto segment_of = [](const std::vector<Replica>& replicas) {
+        auto names = replicas.at(0).get_segment_names();
+        return names.at(0).value_or("");
+    };
+
+    auto small = strategy.Allocate(allocator_manager, 3 * MiB);
+    ASSERT_TRUE(small.has_value());
+    EXPECT_EQ(segment_of(small.value()), "seg_a");
+
+    auto medium = strategy.Allocate(allocator_manager, 20 * MiB);
+    ASSERT_TRUE(medium.has_value());
+    EXPECT_EQ(segment_of(medium.value()), "seg_b");
+
+    auto large = strategy.Allocate(allocator_manager, 40 * MiB);
+    ASSERT_TRUE(large.has_value());
+    EXPECT_EQ(segment_of(large.value()), "seg_c");
+
+    // Two replicas must land on two different segments.
+    auto pair = strategy.Allocate(allocator_manager, 1 * MiB, 2);
+    ASSERT_TRUE(pair.has_value());
+    ASSERT_EQ(pair->size(), 2u);
+    EXPECT_NE(pair->at(0).get_segment_names().at(0),
+              pair->at(1).get_segment_names().at(0));
+
+    // Nothing fits 100 MiB.
+    auto too_big = strategy.Allocate(allocator_manager, 100 * MiB);
+    EXPECT_FALSE(too_big.has_value());
+}
+
+// BestFit relies on getLargestFreeRegion() meaning "the largest request this
+// segment can satisfy right now": a request of exactly that size must succeed
+// and one byte more must fail. Any fork that changes the allocator's report
+// has to keep this property.
+TEST_F(AllocationStrategyTest, LargestFreeRegionIsLargestSatisfiableRequest) {
+    const size_t kSegmentSize = 64 * MiB;
+    auto allocator = std::make_shared<OffsetBufferAllocator>(
+        "seg", 0x100000000ULL, kSegmentSize, "seg");
+    std::mt19937 rng(7);
+    std::vector<std::unique_ptr<AllocatedBuffer>> live;
+    for (int round = 0; round < 200; ++round) {
+        // Random churn: allocate a random size or free a random object.
+        if (live.empty() || rng() % 3 != 0) {
+            size_t size = 4096 + rng() % (6 * MiB);
+            if (auto buf = allocator->allocate(size))
+                live.push_back(std::move(buf));
+        } else {
+            live.erase(live.begin() + rng() % live.size());
+        }
+        const size_t largest = allocator->getLargestFreeRegion();
+        ASSERT_NE(largest, kAllocatorUnknownFreeSpace);
+        if (largest == 0) continue;
+        auto fits = allocator->allocate(largest);
+        ASSERT_TRUE(fits != nullptr)
+            << "round " << round << " largest " << largest;
+        auto too_big = allocator->allocate(largest + 1);
+        EXPECT_TRUE(too_big == nullptr)
+            << "round " << round << " largest " << largest;
+        // fits is released here; the report must be back to `largest`.
+        fits.reset();
+        EXPECT_EQ(allocator->getLargestFreeRegion(), largest);
+    }
 }
 
 TEST_F(AllocationStrategyTest, PerformanceTest) {
