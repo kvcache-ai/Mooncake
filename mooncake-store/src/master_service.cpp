@@ -215,6 +215,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
           config.nof_heartbeat_failures_threshold),
       enable_ha_(config.enable_ha),
       enable_offload_(config.enable_offload),
+      serve_http_metadata_(config.serve_http_metadata),
       enable_oplog_(config.enable_ha && config.enable_oplog &&
                     config.ha_backend_type == "etcd"),
       weight_management_mutations_enabled_(
@@ -914,6 +915,29 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
                 LOG(INFO) << "client_id=" << client_id
                           << ", action=mount_segment, segment_name="
                           << segment.name;
+                // Mixed metadata-mode detection (issue #4536): a client in
+                // P2PHANDSHAKE mode sets te_endpoint to its ephemeral
+                // transfer-engine RPC port (client_service.cpp MountSegment),
+                // while every other mode sets te_endpoint == name. Readers
+                // that resolve segments through the HTTP metadata server can
+                // never open such a segment: P2PHANDSHAKE peers publish no
+                // descriptor there, and the RPC port never appears as a
+                // mooncake/ram/<name> key. Warn at mount time so the
+                // misconfiguration surfaces immediately instead of as
+                // per-put "metadata not found" failures.
+                if (serve_http_metadata_ &&
+                    segment.te_endpoint != segment.name) {
+                    LOG(WARNING)
+                        << "client_id=" << client_id
+                        << " mounted segment with te_endpoint='"
+                        << segment.te_endpoint << "' != name='" << segment.name
+                        << "'. This P2PHANDSHAKE-mode client never publishes "
+                           "its segment descriptor to the HTTP metadata "
+                           "server this master serves, so HTTP-metadata "
+                           "readers (e.g. vLLM) will fail with 'metadata "
+                           "not found'. All clients in one cluster must use "
+                           "the same metadata backend (issue #4536).";
+                }
                 mount_result =
                     segment_access.MountSegment(segment, client_id, record);
                 return mount_result == ErrorCode::OK ||

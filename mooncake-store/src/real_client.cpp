@@ -992,6 +992,20 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         }
         resolved_master_server_addr = started.value();
         if (resolved_metadata_server.empty() && !transfer_engine) {
+            // P2P handshake mode only works when every peer in the cluster
+            // also uses P2PHANDSHAKE: segment descriptors are exchanged
+            // directly between peers and are never published to a shared
+            // metadata backend. Warn explicitly because silently mixing
+            // this default with peers that use HTTP/etcd/Redis metadata
+            // makes their lookups fail with "metadata not found"
+            // (issue #4536).
+            LOG(WARNING)
+                << "metadata_server is empty; falling back to P2PHANDSHAKE. "
+                   "This mode requires ALL peers in the cluster to use "
+                   "P2PHANDSHAKE and does not publish segment descriptors "
+                   "to shared metadata backends (HTTP/etcd/Redis). Set "
+                   "metadata_server explicitly when other peers rely on a "
+                   "shared metadata backend.";
             resolved_metadata_server = "P2PHANDSHAKE";
         }
     } else if (resolved_metadata_server.empty() && !transfer_engine) {

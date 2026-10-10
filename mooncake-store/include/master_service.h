@@ -2056,6 +2056,11 @@ class MasterService {
 
     const bool enable_offload_;
 
+    // True when this master process serves the co-located HTTP metadata
+    // server (MasterConfig.enable_http_metadata_server). Used by
+    // MountSegment to warn about mixed metadata-mode clusters (issue #4536).
+    bool serve_http_metadata_{false};
+
     // Offload-on-evict: defer disk offload to eviction time
     // (config: offload_on_evict)
     bool offload_on_evict_{false};

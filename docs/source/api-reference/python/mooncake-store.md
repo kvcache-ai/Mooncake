@@ -95,6 +95,16 @@ print(store.get("hello_key").decode())
 store.close()
 ```
 
+> [!IMPORTANT]
+> All clients in one cluster (writers and readers) must use the **same**
+> metadata backend. A peer configured with `P2PHANDSHAKE` never publishes its
+> segment descriptor to a shared metadata backend (HTTP/etcd/Redis) and
+> registers its transfer-engine RPC endpoint instead, so peers that use an
+> HTTP metadata server will fail to open its segments with
+> `metadata not found`. When the master runs with
+> `--enable_http_metadata_server=true`, point every client's `metadata_server`
+> at `http://<host>:<port>/metadata`.
+
 ## Basic API Usage
 
 ### Simple Get/Put Operations
