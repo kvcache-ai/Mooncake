@@ -71,7 +71,7 @@ class FakeClient : public Client {
     tl::expected<PromotionAllocStartResponse, ErrorCode> PromotionAllocStart(
         const std::string& key, const std::string& tenant_id, uint64_t size,
         const std::vector<std::string>& preferred_segments) override {
-        (void)tenant_id;
+        last_alloc_tenant = tenant_id;
         (void)size;
         (void)preferred_segments;
         alloc_calls.fetch_add(1);
@@ -140,6 +140,7 @@ class FakeClient : public Client {
         return {};
     }
 
+    std::string last_alloc_tenant;
     std::atomic<int> heartbeat_calls{0};
     std::atomic<int> alloc_calls{0};
     std::atomic<int> write_calls{0};
@@ -392,6 +393,44 @@ TEST_F(FileStoragePromotionTest, PostAllocFailuresAllNotifyMaster) {
     EXPECT_EQ(got.count("k_alloc_fail"), 1u);
     EXPECT_EQ(got.count("k_load_fail"), 1u);
     EXPECT_EQ(got.count("k_notify_fail"), 1u);
+}
+
+TEST_F(FileStoragePromotionTest, PrefetchKeysForwardsTenantToPromotion) {
+    // A delegated prefetch carries the requester's tenant; the promotion
+    // chain must allocate under that tenant, not the holder's own
+    // ("default" here). The alloc fails without a backing file, but the
+    // tenant must reach the master-facing call intact.
+    bool dram_pressure = false;
+    auto res = file_storage->PrefetchKeys({"tk1"}, {1024}, &dram_pressure,
+                                          nullptr, "tenantA");
+    EXPECT_EQ(fake->last_alloc_tenant, "tenantA");
+
+    // Default (unset) tenant keeps the holder's own tenant.
+    dram_pressure = false;
+    res = file_storage->PrefetchKeys({"tk2"}, {1024}, &dram_pressure);
+    EXPECT_EQ(fake->last_alloc_tenant, "default");
+}
+
+TEST_F(FileStoragePromotionTest, PrefetchKeysStopsBatchOnDramPressure) {
+    // First key's AllocStart hits NO_AVAILABLE_HANDLE (DRAM saturated).
+    fake->alloc_overrides["pk1"] = ErrorCode::NO_AVAILABLE_HANDLE;
+
+    bool dram_pressure = false;
+    std::vector<std::string> attempted;
+    auto res = file_storage->PrefetchKeys(
+        {"pk1", "pk2", "pk3", "pk4"}, {1024, 1024, 1024, 1024}, &dram_pressure,
+        [&attempted](const std::string& key, bool) {
+            attempted.push_back(key);
+        });
+    ASSERT_TRUE(res.has_value());
+    EXPECT_TRUE(dram_pressure);
+
+    // The first pressure failure must stop the batch: one alloc
+    // round-trip (plus its slot-release notify), not one per key.
+    EXPECT_EQ(fake->alloc_calls.load(), 1);
+    EXPECT_EQ(attempted, std::vector<std::string>({"pk1"}));
+    EXPECT_EQ(fake->notify_failure_calls.load(), 1);
+    EXPECT_EQ(fake->notify_failure_keys, std::vector<std::string>({"pk1"}));
 }
 
 }  // namespace mooncake
