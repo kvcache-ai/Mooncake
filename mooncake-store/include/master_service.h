@@ -1702,8 +1702,8 @@ class MasterService {
     static constexpr uint64_t kEvictionThreadSleepMs =
         10;  // 10 ms sleep between eviction checks
     // Wait this long after a cycle that only queued objects for disk offload
-    // before checking the watermark again (allocation pressure still wakes
-    // the next cycle at once).
+    // before checking the watermark again. The wait is not interrupted: a
+    // failed allocation during it is acted on when it ends.
     static constexpr uint64_t kEvictionDeferredBackoffMs = 500;
     // The eviction thread wakes every 10 ms, but the tenant pass has to walk
     // every registered tenant and lock every quota shard, so it is throttled
