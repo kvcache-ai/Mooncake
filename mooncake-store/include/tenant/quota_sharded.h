@@ -4,7 +4,7 @@
 #include <cstddef>
 #include <mutex>
 
-#include "tenant_quota.h"
+#include "tenant/quota.h"
 
 namespace mooncake {
 
@@ -56,4 +56,4 @@ class ShardedTenantQuotaTable {
 
 }  // namespace mooncake
 
-#include "tenant_quota_sharded_impl.h"
+#include "tenant/quota_sharded_impl.h"

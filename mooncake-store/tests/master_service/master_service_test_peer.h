@@ -281,31 +281,31 @@ class MasterServiceTestPeer {
     }
 
     static auto& TenantQuotaPolicyMutex(MasterService& service) {
-        return service.tenant_quota_policy_mutex_;
+        return service.tenant_quota_manager_.policy_mutex_;
     }
     static const auto& TenantQuotaPolicyMutex(const MasterService& service) {
-        return service.tenant_quota_policy_mutex_;
+        return service.tenant_quota_manager_.policy_mutex_;
     }
 
     static auto& TenantQuotaPolicyStore(MasterService& service) {
-        return service.tenant_quota_policy_store_;
+        return service.tenant_quota_manager_.policy_store_;
     }
     static const auto& TenantQuotaPolicyStore(const MasterService& service) {
-        return service.tenant_quota_policy_store_;
+        return service.tenant_quota_manager_.policy_store_;
     }
 
     static auto& TenantQuotaRecomputeMutex(MasterService& service) {
-        return service.tenant_quota_recompute_mutex_;
+        return service.tenant_quota_manager_.recompute_mutex_;
     }
     static const auto& TenantQuotaRecomputeMutex(const MasterService& service) {
-        return service.tenant_quota_recompute_mutex_;
+        return service.tenant_quota_manager_.recompute_mutex_;
     }
 
     static auto& TenantQuotaTable(MasterService& service) {
-        return service.tenant_quota_table_;
+        return service.tenant_quota_manager_.table_;
     }
     static const auto& TenantQuotaTable(const MasterService& service) {
-        return service.tenant_quota_table_;
+        return service.tenant_quota_manager_.table_;
     }
 
     static auto& WeightMetadata(MasterService& service) {
@@ -447,7 +447,7 @@ class MasterServiceTestPeer {
     }
 
     void LoadTenantQuotaPoliciesFromStoreOrThrow() {
-        service_.LoadTenantQuotaPoliciesFromStoreOrThrow();
+        service_.tenant_quota_manager_.LoadPoliciesOrThrow();
     }
 
     ObjectIdentity MakeObjectIdentityForRequest(

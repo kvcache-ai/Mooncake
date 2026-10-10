@@ -25,7 +25,7 @@
 #include "master_admin_service.h"
 #include "master_config.h"
 #include "rpc_service.h"
-#include "tenant_quota_policy_store.h"
+#include "tenant/quota_policy_store.h"
 #include "types.h"
 #include "version.h"
 

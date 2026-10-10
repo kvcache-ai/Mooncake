@@ -2,7 +2,7 @@
 
 #include <cstdint>
 
-#include "tenant_quota.h"
+#include "tenant/quota.h"
 
 namespace mooncake {
 
