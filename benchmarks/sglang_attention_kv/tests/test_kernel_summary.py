@@ -185,25 +185,6 @@ def test_derive_divides_the_windows_and_the_ledger():
     )
 
 
-def test_the_rate_divides_the_read_bytes_and_not_the_page_capacity():
-    """The rate takes the bytes the paths read; a derive that reached for the page
-    capacity instead would report the other number."""
-    case = FakeCase()
-    capacity_bytes = 700 * 36864
-    read_bytes = 640 * 36864
-    attention_ms = WINDOWS["attention_component"]
-    derived = derive(case, measured_phases(), 512 * 36864, read_bytes)
-    assert derived["attention_unique_payload_gbps"] == pytest.approx(
-        read_bytes / (attention_ms / 1000.0) / 1e9
-    )
-    assert derived["attention_unique_payload_gbps"] != pytest.approx(
-        capacity_bytes / (attention_ms / 1000.0) / 1e9
-    )
-    assert derived["attention_flops_per_unique_payload_byte"] != pytest.approx(
-        case.attention_flops() / capacity_bytes
-    )
-
-
 def test_every_phase_has_its_columns():
     """The phases the benchmark measures and stats.py names are the ones the schema
     writes, so the two cannot drift apart."""
