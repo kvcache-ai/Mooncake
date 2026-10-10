@@ -62,6 +62,27 @@ def phases():
     return {name: {"min": 1.0, "p50": 1.1, "p95": 1.2, "p99": 1.3} for name in PHASES}
 
 
+# Distinct windows, so every quotient derive() takes has a value of its own to be
+# checked against.
+WINDOWS = {
+    "indices": 0.5,
+    "attention_plan": 0.7,
+    "layer_loop": 2.0,
+    "phase_sum": 3.2,
+    "step_window": 3.4,
+    "kv_write_component": 0.9,
+    "attention_component": 1.5,
+    "kv_gather": 0.4,
+}
+
+
+def measured_phases():
+    return {
+        name: {"min": value, "p50": value, "p95": value, "p99": value}
+        for name, value in WINDOWS.items()
+    }
+
+
 def record():
     case = {
         "label": "extend_pref512_chunk128_bs1_ps64",
@@ -117,6 +138,70 @@ def test_the_declared_derived_figures_are_the_ones_stats_produces():
     returns are the ones the schema names, so a figure added there without a column
     fails here rather than being dropped from the file."""
     assert set(derive(FakeCase(), phases(), 512 * 36864, 640 * 36864)) == set(DERIVED)
+
+
+def test_derive_divides_the_windows_and_the_ledger():
+    """The arithmetic itself, without a GPU: the per-layer and per-token quotients,
+    the unique-payload rate over the attention window, the arithmetic intensity over
+    the same bytes, the ratios over phase_sum and the throughput over step_window.
+    These are the figures a reader takes from a row, so they are checked as numbers
+    and not only as names."""
+    case = FakeCase()
+    read_bytes = 640 * 36864
+    derived = derive(case, measured_phases(), 512 * 36864, read_bytes)
+    attention_ms = WINDOWS["attention_component"]
+    assert derived["attention_plan_us_per_step"] == pytest.approx(
+        WINDOWS["attention_plan"] * 1000.0
+    )
+    assert derived["attention_component_us_per_layer"] == pytest.approx(
+        attention_ms * 1000.0 / case.num_layers
+    )
+    assert derived["kv_write_component_us_per_layer"] == pytest.approx(
+        WINDOWS["kv_write_component"] * 1000.0 / case.num_layers
+    )
+    assert derived["indices_us_per_new_token"] == pytest.approx(
+        WINDOWS["indices"] * 1000.0 / case.new_tokens
+    )
+    assert derived["attention_us_per_context_token"] == pytest.approx(
+        attention_ms * 1000.0 / case.context_tokens
+    )
+    assert derived["attention_unique_payload_gbps"] == pytest.approx(
+        read_bytes / (attention_ms / 1000.0) / 1e9
+    )
+    assert derived["attention_flops_per_unique_payload_byte"] == pytest.approx(
+        case.attention_flops() / read_bytes
+    )
+    assert derived["attention_tflops"] == pytest.approx(
+        case.attention_flops() / (attention_ms / 1000.0) / 1e12
+    )
+    assert derived["layer_loop_ratio_of_phase_sum"] == pytest.approx(
+        WINDOWS["layer_loop"] / WINDOWS["phase_sum"]
+    )
+    assert derived["components_ratio_of_phase_sum"] == pytest.approx(
+        (WINDOWS["kv_write_component"] + attention_ms) / WINDOWS["phase_sum"]
+    )
+    assert derived["new_tokens_per_s"] == pytest.approx(
+        case.new_tokens / (WINDOWS["step_window"] / 1000.0)
+    )
+
+
+def test_the_rate_divides_the_read_bytes_and_not_the_page_capacity():
+    """The rate takes the bytes the paths read; a derive that reached for the page
+    capacity instead would report the other number."""
+    case = FakeCase()
+    capacity_bytes = 700 * 36864
+    read_bytes = 640 * 36864
+    attention_ms = WINDOWS["attention_component"]
+    derived = derive(case, measured_phases(), 512 * 36864, read_bytes)
+    assert derived["attention_unique_payload_gbps"] == pytest.approx(
+        read_bytes / (attention_ms / 1000.0) / 1e9
+    )
+    assert derived["attention_unique_payload_gbps"] != pytest.approx(
+        capacity_bytes / (attention_ms / 1000.0) / 1e9
+    )
+    assert derived["attention_flops_per_unique_payload_byte"] != pytest.approx(
+        case.attention_flops() / capacity_bytes
+    )
 
 
 def test_every_phase_has_its_columns():

@@ -169,9 +169,9 @@ divides `gather_bytes`, each by the window that path ran in. The payload is coun
 each token the path reads, however many queries read that token: the repeated operand a query costs
 appears in the FLOP count, not in those bytes, so the rate is not a kernel bandwidth and not the traffic
 the memory system moved. What the memory system actually transfers is not observable without a profiler,
-and no figure here claims it: the CSR stream names valid tokens one index each at every page size, so
-the page capacity is unused capacity rather than bytes a kernel reads, and a write may coalesce. The
-page capacity is reported as the allocation figure it is rather than as traffic.
+and no figure here claims it: `kv_bytes_page_capacity` counts the valid tokens of the step's pages
+together with the slots the last page leaves unused, so no read traffic can be read off it, and a write
+may coalesce. The page capacity is reported as the allocation figure it is rather than as traffic.
 
 `kv_write_component` is the latency of the step's KV writer, one `set_kv_buffer` call per layer in a
 window of its own, beside the attention window rather than inside it. It is a timing of those calls and

@@ -582,10 +582,12 @@ class SglangStep:
         return self.case.context_tokens, 0
 
     def read_bytes(self):
-        """The KV bytes the attention window covers, split by the path that reads
-        them: the paged side's logical bytes, the ragged side's, and their sum.
-        That sum is what the window's bandwidth and its arithmetic intensity divide
-        by; the page capacity is a separate figure."""
+        """Logical KV bytes read by the paged and ragged attention paths.
+
+        Their sum is the numerator of the unique-payload rate, the read bytes over
+        the attention window, and the denominator of the arithmetic intensity, the
+        FLOPs over those bytes. The page capacity is reported separately.
+        """
         paged_tokens, ragged_tokens = self.read_tokens()
         paged = self.case.kv_bytes(paged_tokens)
         ragged = self.case.kv_bytes(ragged_tokens)

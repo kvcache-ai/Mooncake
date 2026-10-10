@@ -20,16 +20,11 @@ from benchmarks.sglang_attention_kv.cases import (  # noqa: E402
 )
 from benchmarks.sglang_attention_kv import kernel_bench  # noqa: E402
 from benchmarks.sglang_attention_kv.kernel_bench import (  # noqa: E402
-    one_attention_component,
     one_iteration,
     run_case,
 )
 from benchmarks.sglang_attention_kv.sglang_replay import SglangStep  # noqa: E402
-from benchmarks.sglang_attention_kv.stats import (  # noqa: E402
-    PHASES,
-    STEP_PHASES,
-    derive,
-)
+from benchmarks.sglang_attention_kv.stats import STEP_PHASES  # noqa: E402
 
 DEVICE = "cuda:0"
 
@@ -305,31 +300,6 @@ def test_the_read_ledger_splits_the_paged_side_from_the_ragged_side():
     assert extend_read["ragged"] == 0
 
 
-def test_the_attention_rate_divides_the_bytes_the_branch_reads():
-    """The rate a row reports divides the KV the attention window covers. A derive
-    that divided the page capacity instead would report a different number, so this
-    fails if the ledger drifts back to the allocation figure."""
-    step, _ = prepared(step_case("extend", (500,), (100,)))
-    case = step.case
-    read = step.read_bytes()
-    query = step.make_query()
-    attention_ms = one_attention_component(step, query)
-    phases = {name: {"p50": attention_ms} for name in PHASES}
-    indices = step.build_indices()
-    derived = derive(case, phases, step.gather_bytes(indices), read["attention"])
-    per_second = attention_ms / 1000.0
-    assert derived["attention_unique_payload_gbps"] == pytest.approx(
-        read["attention"] / per_second / 1e9, rel=1e-12
-    )
-    assert derived["attention_flops_per_unique_payload_byte"] == pytest.approx(
-        case.attention_flops() / read["attention"], rel=1e-12
-    )
-    capacity_rate = case.kv_page_capacity_bytes() / per_second / 1e9
-    assert derived["attention_unique_payload_gbps"] != pytest.approx(
-        capacity_rate, rel=1e-3
-    )
-
-
 def test_the_step_has_a_window_of_its_own_beside_the_phase_sum():
     """The three windows are timed separately, so phase_sum is their sum and the
     step is longer than it by the interval between the windows. step_window
@@ -396,7 +366,12 @@ def test_the_checks_read_the_state_the_timed_loop_left(monkeypatch):
 def test_the_decode_wrapper_follows_sglang_tensor_core_policy(monkeypatch):
     """The tensor-core path is decided per case by SGLang's own function, not fixed:
     at bf16 it takes the path from a group size of 4 query heads per KV head up, and
-    the environment variable turns it off for every case."""
+    the environment variable overrides the choice.
+
+    The variable is cleared first: an environment that already sets it would
+    otherwise decide the default cases and make this assert the wrong thing.
+    """
+    monkeypatch.delenv("SGLANG_FLASHINFER_USE_TENSOR_CORE", raising=False)
     wide = prepared(step_case("decode", (512,), (1,), qo_heads=8, kv_heads=2))[0]
     assert wide.decode_use_tensor_cores is True
     assert wide.as_dict()["decode_use_tensor_cores"] is True
@@ -408,6 +383,11 @@ def test_the_decode_wrapper_follows_sglang_tensor_core_policy(monkeypatch):
     monkeypatch.setenv("SGLANG_FLASHINFER_USE_TENSOR_CORE", "false")
     off = prepared(step_case("decode", (512,), (1,), qo_heads=8, kv_heads=2))[0]
     assert off.decode_use_tensor_cores is False
+    assert off.as_dict()["decode_use_tensor_cores"] is False
+
+    monkeypatch.setenv("SGLANG_FLASHINFER_USE_TENSOR_CORE", "true")
+    forced = prepared(step_case("decode", (512,), (1,), qo_heads=8, kv_heads=4))[0]
+    assert forced.decode_use_tensor_cores is True
 
 
 def test_the_page_size_selects_the_allocator_a_server_builds():
