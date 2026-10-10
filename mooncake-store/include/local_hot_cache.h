@@ -30,8 +30,8 @@ struct LocalHotCacheConfig {
 
 /**
  * @brief Token captured at async hot cache fill submission time.
- * Invalidated when RemoveHotKey, BumpKeyGeneration, or Clear bumps
- * generation/epoch.
+ * Invalidated by key removal/overwrite, whole-cache resets, or generation
+ * metadata reclamation.
  */
 struct HotCachePutToken {
     uint64_t cache_epoch = 0;
@@ -235,6 +235,7 @@ class LocalHotCache {
     void drainDeferredTouches();
     bool putHotKeyLocked(HotMemBlock* block);
     bool removeHotKeyLocked(const std::string& key);
+    void bumpKeyGenerationLocked(const std::string& key);
     bool hasActiveBlockForKeyLocked(const std::string& key) const;
     bool isPutTokenValidLocked(const std::string& key,
                                const HotCachePutToken& token) const;
