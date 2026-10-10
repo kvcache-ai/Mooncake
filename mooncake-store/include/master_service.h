@@ -1938,9 +1938,13 @@ class MasterService {
        private:
         MasterService* service_;
 
-        // Serialize a single ObjectMetadata
+        // Serialize a single ObjectMetadata. `replicas` replaces metadata's
+        // own replica list: the caller drops replicas whose backing store is
+        // already gone, so the record may be persisted with none.
         tl::expected<void, SerializationError> SerializeMetadata(
-            const ObjectMetadata& metadata, MsgpackPacker& packer) const;
+            const ObjectMetadata& metadata,
+            const std::vector<const Replica*>& replicas,
+            MsgpackPacker& packer) const;
 
         // Deserialize a single ObjectMetadata
         [[nodiscard]] tl::expected<std::unique_ptr<ObjectMetadata>,
