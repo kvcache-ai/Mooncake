@@ -2265,6 +2265,7 @@ class MasterService {
 
     bool use_disk_replica_{false};
     bool enable_dfs_{false};
+    std::optional<std::string> dfs_kvcs_backend_;
     std::unique_ptr<DfsAllocatorInterface> dfs_allocator_;
     ShardAllocator* shard_allocator_{nullptr};
     ImmutableBucketAllocator* bucket_allocator_{nullptr};

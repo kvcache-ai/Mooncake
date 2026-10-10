@@ -223,6 +223,7 @@ class FileStorageTest : public ::testing::Test {
         UnsetEnv("MOONCAKE_DFS_FS_ADAPTER");
         UnsetEnv("MOONCAKE_DISTRIBUTED_ROOT_DIR");
         UnsetEnv("MOONCAKE_DFS_ROOT_DIR");
+        UnsetEnv("MOONCAKE_KVCS_MODE");
         data_path = (std::filesystem::current_path() / "file_storage_test_data")
                         .string();
         fs::create_directories(data_path);
@@ -753,6 +754,12 @@ TEST_F(FileStorageTest, DistributedBackendSelectsControlPlaneFromStorageMode) {
     ASSERT_TRUE(enable_offloading);
     EXPECT_TRUE(*enable_offloading);
 #endif
+
+    SetEnv("MOONCAKE_KVCS_MODE", "low-level");
+    {
+        FileStorage file_storage(config, nullptr, "localhost:9003");
+        EXPECT_TRUE(FileStorageUsesDfsControlPlane(file_storage));
+    }
 }
 
 TEST_F(FileStorageTest, BatchGetUsesPinnedArenaAndFallsBackWhenFull) {
