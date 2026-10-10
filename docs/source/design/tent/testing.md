@@ -172,8 +172,8 @@ ctest --test-dir build-tent/mooncake-transfer-engine/tent/tests \
 
 `tent_link_group` links `mooncake_common` by archive path, which does
 not create a CMake build-order dependency — build `mooncake_common`
-first. The `tent-ci` `cuda-off` legs in GitHub Actions run the same
-`ctest` directory. The `cuda-on` leg compiles only: runners have no GPU,
+first. The `tent-ci` `cuda-off` job in GitHub Actions runs the same
+`ctest` directory. The `cuda-on` job compiles only: runners have no GPU,
 and CUDA stubs would bypass the fakes.
 
 Concurrency tests that touch shared runtime maps should also be run

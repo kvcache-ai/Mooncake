@@ -594,6 +594,11 @@ jobs:
     uses: ./.github/workflows/ci_rocm.yml
     secrets: inherit
 
+  # USE_CUDA changes TE, Store, and TENT, so cuda-on and cuda-off each get a
+  # full-tree compile. TENT_METRICS_ENABLED and USE_UB only flip tent-side
+  # (plus a few TE #ifdefs for UB); those variants reconfigure the cuda-off
+  # build tree so Ninja rebuilds dirty objects instead of compiling Store/TE
+  # from scratch on extra runners.
   tent-ci:
     needs: [spell-check, clang-format, check-paths]
     if: needs.check-paths.outputs.tent == 'true'
@@ -605,25 +610,14 @@ jobs:
           - name: cuda-on
             cmake_flags: '-DUSE_CUDA=ON -DCMAKE_EXE_LINKER_FLAGS=-L/usr/local/cuda/lib64/stubs'
             need_cuda: true
-            metrics_flags: ''
           - name: cuda-off
             cmake_flags: '-DUSE_CUDA=OFF -DUSE_EVENT_DRIVEN_COMPLETION=ON'
             need_cuda: false
-            metrics_flags: ''
-          - name: cuda-off-metrics-on
-            cmake_flags: '-DUSE_CUDA=OFF'
-            need_cuda: false
-            metrics_flags: '-DTENT_METRICS_ENABLED=ON'
-          # Exercise the native UB target with its injected mock adapter. A
-          # Debug build also catches ODR/link errors hidden by optimization.
-          - name: ub-mock
-            cmake_flags: '-DUSE_CUDA=OFF -DUSE_UB=ON -DCMAKE_BUILD_TYPE=Debug'
-            need_cuda: false
-            metrics_flags: ''
     name: tent-ci (${{ matrix.name }})
     env:
       CI: "true"
       SCCACHE_GHA_ENABLED: "true"
+      TENT_CMAKE_ARGS: "-DUSE_TENT=ON -DUSE_HTTP=ON -DENABLE_SCCACHE=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_DEBUG_SYMBOLS=OFF"
 
     steps:
     - uses: actions/checkout@v4
@@ -661,7 +655,7 @@ jobs:
       run: |
         mkdir build-tent
         cd build-tent
-        cmake -G Ninja .. -DUSE_TENT=ON -DUSE_HTTP=ON -DENABLE_SCCACHE=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_DEBUG_SYMBOLS=OFF ${{ matrix.cmake_flags }} ${{ matrix.metrics_flags }}
+        cmake -G Ninja .. $TENT_CMAKE_ARGS ${{ matrix.cmake_flags }}
       shell: bash
 
     - name: Build project with TENT
@@ -711,7 +705,7 @@ jobs:
     # that every #ifdef USE_CUDA branch compiles.
     - name: Test (TENT)
       id: ctest
-      if: '!matrix.need_cuda'
+      if: matrix.name == 'cuda-off'
       run: |
         cd build-tent
         mkdir -p test-results
@@ -731,7 +725,7 @@ jobs:
         last-test-log: build-tent/mooncake-transfer-engine/tent/tests/Testing/Temporary/LastTest.log
 
     - name: Start Metadata Server
-      if: '!matrix.need_cuda'
+      if: matrix.name == 'cuda-off'
       run: |
         cd mooncake-transfer-engine/example/http-metadata-server-python
         pip install aiohttp
@@ -740,12 +734,77 @@ jobs:
       shell: bash
 
     - name: Run Transfer Engine Rust smoke test
-      if: '!matrix.need_cuda'
+      if: matrix.name == 'cuda-off'
       env:
         MOONCAKE_BUILD_DIR: ${{ github.workspace }}/build-tent
         MOONCAKE_TE_RUST_LINK_ASAN: "0"
       run: ./scripts/ci/run_transfer_engine_rust_smoke.sh
       shell: bash
+
+    # Keep CMAKE_BUILD_TYPE unchanged so these variants stay incremental.
+    # A Debug rebuild of the whole tree is the cost the extra runners used
+    # to pay; the UB mock adapter still compiles and the tent tests still run.
+    - name: Rebuild with TENT metrics enabled
+      if: matrix.name == 'cuda-off'
+      run: |
+        cd build-tent
+        cmake -G Ninja .. $TENT_CMAKE_ARGS ${{ matrix.cmake_flags }} \
+          -DTENT_METRICS_ENABLED=ON -DUSE_UB=OFF
+        cmake --build .
+        sudo cmake --install .
+      shell: bash
+
+    - name: Test (TENT metrics)
+      id: ctest-metrics
+      if: matrix.name == 'cuda-off'
+      run: |
+        cd build-tent
+        mkdir -p test-results
+        ctest --test-dir mooncake-transfer-engine/tent/tests -j \
+          --output-on-failure \
+          --output-junit "$GITHUB_WORKSPACE/build-tent/test-results/ctest-metrics.xml"
+      shell: bash
+
+    - name: Preserve TENT metrics CTest diagnostics
+      if: ${{ always() && steps.ctest-metrics.outcome == 'failure' }}
+      uses: ./.github/actions/ctest-diagnostics
+      with:
+        summary-title: TENT CTest failure (cuda-off metrics)
+        artifact-name: ctest-diagnostics-tent-cuda-off-metrics
+        junit-report: build-tent/test-results/ctest-metrics.xml
+        failed-tests-log: build-tent/mooncake-transfer-engine/tent/tests/Testing/Temporary/LastTestsFailed.log
+        last-test-log: build-tent/mooncake-transfer-engine/tent/tests/Testing/Temporary/LastTest.log
+
+    - name: Rebuild with TENT UB mock
+      if: matrix.name == 'cuda-off'
+      run: |
+        cd build-tent
+        cmake -G Ninja .. $TENT_CMAKE_ARGS ${{ matrix.cmake_flags }} \
+          -DTENT_METRICS_ENABLED=OFF -DUSE_UB=ON
+        cmake --build .
+        sudo cmake --install .
+      shell: bash
+
+    - name: Test (TENT UB)
+      id: ctest-ub
+      if: matrix.name == 'cuda-off'
+      run: |
+        cd build-tent
+        mkdir -p test-results
+        ctest --test-dir mooncake-transfer-engine/tent/tests -j \
+          --output-on-failure \
+          --output-junit "$GITHUB_WORKSPACE/build-tent/test-results/ctest-ub.xml"
+      shell: bash
+
+    - name: Preserve TENT UB CTest diagnostics
+      if: ${{ always() && steps.ctest-ub.outcome == 'failure' }}
+      uses: ./.github/actions/ctest-diagnostics
+      with:
+        summary-title: TENT CTest failure (cuda-off UB)
+        artifact-name: ctest-diagnostics-tent-cuda-off-ub
+        junit-report: build-tent/test-results/ctest-ub.xml
+        failed-tests-log: build-tent/mooncake-transfer-engine/tent/tests/Testing/Temporary/LastTestsFailed.log
+        last-test-log: build-tent/mooncake-transfer-engine/tent/tests/Testing/Temporary/LastTest.log
 
     - name: Run sccache stat for check
       if: ${{ env.SCCACHE_PATH != '' }}
