@@ -164,8 +164,6 @@ export MC_CUSTOM_TOPO_JSON=/etc/mooncake/nic_priority_matrix.json
 
 A topology file may also use TENT's native `{"nics":[...],"mems":[...]}` format when loaded via `custom_json_path` / `MC_CUSTOM_TOPO_JSON`. If loading or parsing fails, TENT falls back to auto-discovery.
 
-Under the Ascend Direct transport, Transfer Engine uses the same `MC_CUSTOM_TOPO_JSON` path to configure HIXL's `comm_resource_config.nic_topo_path`; see the [Ascend Direct Transport](../../design/transfer-engine/transport/ascend_direct_transport.md).
-
 ## Core APIs
 
 ### Core Usage Path (C++)
