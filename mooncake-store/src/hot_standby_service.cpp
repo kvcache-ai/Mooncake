@@ -201,8 +201,7 @@ ErrorCode HotStandbyService::PrepareBootstrapBaselineLocked(
             {
                 std::lock_guard<std::mutex> cursor_lock(
                     batch_snapshot_cursor_mutex_);
-                last_applied_batch_snapshot_prefix_ =
-                    *batch_snapshot_baseline_;
+                last_applied_batch_snapshot_prefix_ = *batch_snapshot_baseline_;
             }
             LOG(INFO) << "Standby restart resumes preserved promotion cursor, "
                       << "applied_seq=" << preserved_seq

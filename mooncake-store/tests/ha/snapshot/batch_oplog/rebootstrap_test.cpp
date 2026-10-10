@@ -338,10 +338,9 @@ TEST_F(RebootstrapTest, RestartResumesPreservedPromotionCursor) {
     auto metadata = std::make_unique<StandbyMetadataStore>();
     ASSERT_TRUE(metadata->RestoreMetadata("default", "advanced", {}));
     DurablePrefix cursor{.batch_id = 50, .last_seq = 50};
-    ASSERT_EQ(ErrorCode::OK,
-              service_->PreservePromotionBaseline(std::move(metadata), cursor,
-                                                   /*producer_view_version=*/7,
-                                                   {}));
+    ASSERT_EQ(ErrorCode::OK, service_->PreservePromotionBaseline(
+                                 std::move(metadata), cursor,
+                                 /*producer_view_version=*/7, {}));
     Prefix(50);
     ASSERT_EQ(ErrorCode::OK, service_->Start("", "", "n09"));
     EXPECT_EQ(50u, service_->GetLatestAppliedSequenceId());

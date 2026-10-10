@@ -102,8 +102,9 @@ class LeadershipRenewalGuard {
             while (!stop_.load(std::memory_order_acquire)) {
                 auto renewed = coordinator_.RenewLeadership(session);
                 if (!renewed) {
-                    LOG(WARNING) << "Leadership renewal failed during recovery: "
-                                 << toString(renewed.error());
+                    LOG(WARNING)
+                        << "Leadership renewal failed during recovery: "
+                        << toString(renewed.error());
                     lost_.store(true, std::memory_order_release);
                     return;
                 }

@@ -226,6 +226,10 @@ class HotStandbyService {
     void SetCatchUpBatchKvBackendForTesting(
         std::shared_ptr<HaKvBackend> backend);
 
+    // Selects the durable OpLog backend opened by Start(). Defaults to etcd so
+    // existing callers keep the previous connection path.
+    void SetOpLogBackendType(ha::HABackendType type);
+
     /**
      * @brief Get current state from state machine
      */
