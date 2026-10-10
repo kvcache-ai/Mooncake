@@ -422,6 +422,11 @@ class MasterServiceTestPeer {
         return service_.FindClientRecord(client_id);
     }
 
+    auto GetRetainingClientIds() const {
+        std::shared_lock lock(service_.client_mutex_);
+        return service_.GetRetainingClientIdsLocked();
+    }
+
     TenantQuotaHandle GetBoundTenantQuotaHandle(
         const TenantState& tenant_state) const {
         return service_.GetBoundTenantQuotaHandle(tenant_state);

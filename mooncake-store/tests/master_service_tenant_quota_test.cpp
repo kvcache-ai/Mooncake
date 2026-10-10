@@ -509,8 +509,14 @@ TEST_F(MasterServiceTenantQuotaTest,
 
 TEST_F(MasterServiceTenantQuotaTest,
        MultiTenantModeRejectsUnregisteredOffloadSuccess) {
-    MasterService service(MakeConfig({{TenantId("tenant-a"), 1000}}));
+    auto service_config = MakeConfig({{TenantId("tenant-a"), 1000}});
+    service_config.enable_offload = true;
+    MasterService service(service_config);
     UUID client_id = MountSegment(service);
+    ASSERT_TRUE(service
+                    .MountLocalDiskSegment(client_id,
+                                           /*enable_offloading=*/false)
+                    .has_value());
 
     StorageObjectMetadata metadata;
     metadata.data_size = 128;
@@ -529,8 +535,14 @@ TEST_F(MasterServiceTenantQuotaTest,
 
 TEST_F(MasterServiceTenantQuotaTest,
        MultiTenantModeAllowsRegisteredOffloadSuccess) {
-    MasterService service(MakeConfig({{TenantId("tenant-a"), 1000}}));
+    auto service_config = MakeConfig({{TenantId("tenant-a"), 1000}});
+    service_config.enable_offload = true;
+    MasterService service(service_config);
     UUID client_id = MountSegment(service);
+    ASSERT_TRUE(service
+                    .MountLocalDiskSegment(client_id,
+                                           /*enable_offloading=*/false)
+                    .has_value());
 
     StorageObjectMetadata metadata;
     metadata.data_size = 128;
@@ -552,12 +564,17 @@ TEST_F(MasterServiceTenantQuotaTest,
     const std::string initial_policy = WritePolicyFile(
         {{TenantId("tenant-a"), 1000}, {TenantId("tenant-b"), 1000}});
     auto config = MasterServiceConfig::builder()
+                      .set_enable_offload(true)
                       .set_enable_multi_tenants(true)
                       .set_tenant_quota_connector_type("file")
                       .set_tenant_quota_connector_uri(initial_policy)
                       .build();
     MasterService service(config);
     UUID client_id = MountSegment(service);
+    ASSERT_TRUE(service
+                    .MountLocalDiskSegment(client_id,
+                                           /*enable_offloading=*/false)
+                    .has_value());
 
     StorageObjectMetadata metadata;
     metadata.data_size = 128;
@@ -634,12 +651,17 @@ TEST_F(MasterServiceTenantQuotaTest,
     const std::string initial_policy = WritePolicyFile(
         {{TenantId("tenant-a"), 1000}, {TenantId("tenant-b"), 1000}});
     auto config = MasterServiceConfig::builder()
+                      .set_enable_offload(true)
                       .set_enable_multi_tenants(true)
                       .set_tenant_quota_connector_type("file")
                       .set_tenant_quota_connector_uri(initial_policy)
                       .build();
     MasterService service(config);
     UUID client_id = MountSegment(service);
+    ASSERT_TRUE(service
+                    .MountLocalDiskSegment(client_id,
+                                           /*enable_offloading=*/false)
+                    .has_value());
     PutComplete(service, client_id, "warming", TenantId("tenant-b"), 128);
 
     {
@@ -767,8 +789,14 @@ TEST_F(MasterServiceTenantQuotaTest,
 TEST_F(MasterServiceTenantQuotaTest,
        SizeChangingUpsertFromDiskOnlyObjectChargesNewReplica) {
     const TenantId tenant_id("tenant-a");
-    MasterService service(MakeConfig({{tenant_id, 1000}}));
+    auto service_config = MakeConfig({{tenant_id, 1000}});
+    service_config.enable_offload = true;
+    MasterService service(service_config);
     UUID client_id = MountSegment(service);
+    ASSERT_TRUE(service
+                    .MountLocalDiskSegment(client_id,
+                                           /*enable_offloading=*/false)
+                    .has_value());
 
     StorageObjectMetadata metadata;
     metadata.data_size = 100;
@@ -811,8 +839,14 @@ TEST_F(MasterServiceTenantQuotaTest,
 TEST_F(MasterServiceTenantQuotaTest,
        PartialProcessingExpirySettlesPendingCharge) {
     const TenantId tenant_id("tenant-a");
-    MasterService service(MakeConfig({{tenant_id, 1000}}));
+    auto service_config = MakeConfig({{tenant_id, 1000}});
+    service_config.enable_offload = true;
+    MasterService service(service_config);
     UUID client_id = MountSegment(service);
+    ASSERT_TRUE(service
+                    .MountLocalDiskSegment(client_id,
+                                           /*enable_offloading=*/false)
+                    .has_value());
 
     auto start =
         service.PutStart(client_id, "key", tenant_id, 100, MemoryConfig());
@@ -828,8 +862,14 @@ TEST_F(MasterServiceTenantQuotaTest,
 TEST_F(MasterServiceTenantQuotaTest,
        DurablePartialProcessingExpirySettlesPendingCharge) {
     const TenantId tenant_id("tenant-a");
-    MasterService service(MakeConfig({{tenant_id, 1000}}));
+    auto service_config = MakeConfig({{tenant_id, 1000}});
+    service_config.enable_offload = true;
+    MasterService service(service_config);
     UUID client_id = MountSegment(service);
+    ASSERT_TRUE(service
+                    .MountLocalDiskSegment(client_id,
+                                           /*enable_offloading=*/false)
+                    .has_value());
 
     auto start =
         service.PutStart(client_id, "key", tenant_id, 100, MemoryConfig());
@@ -845,8 +885,14 @@ TEST_F(MasterServiceTenantQuotaTest,
 TEST_F(MasterServiceTenantQuotaTest,
        PartialSizeChangingUpsertRevokeReleasesReplacementCharge) {
     const TenantId tenant_id("tenant-a");
-    MasterService service(MakeConfig({{tenant_id, 1000}}));
+    auto service_config = MakeConfig({{tenant_id, 1000}});
+    service_config.enable_offload = true;
+    MasterService service(service_config);
     UUID client_id = MountSegment(service);
+    ASSERT_TRUE(service
+                    .MountLocalDiskSegment(client_id,
+                                           /*enable_offloading=*/false)
+                    .has_value());
     PutComplete(service, client_id, "key", tenant_id, 100);
 
     auto upsert =
@@ -865,8 +911,14 @@ TEST_F(MasterServiceTenantQuotaTest,
 TEST_F(MasterServiceTenantQuotaTest,
        DurablePartialUpsertRevokeReleasesReplacementCharge) {
     const TenantId tenant_id("tenant-a");
-    MasterService service(MakeConfig({{tenant_id, 1000}}));
+    auto service_config = MakeConfig({{tenant_id, 1000}});
+    service_config.enable_offload = true;
+    MasterService service(service_config);
     UUID client_id = MountSegment(service);
+    ASSERT_TRUE(service
+                    .MountLocalDiskSegment(client_id,
+                                           /*enable_offloading=*/false)
+                    .has_value());
     PutComplete(service, client_id, "key", tenant_id, 100);
 
     auto upsert =
@@ -1074,8 +1126,14 @@ TEST_F(MasterServiceTenantQuotaTest,
 
 TEST_F(MasterServiceTenantQuotaTest,
        DeletePolicyWaitsForInFlightAddReplicaBeforeEmptyCheck) {
-    MasterService service(MakeConfig({{TenantId("tenant-a"), 1000}}));
+    auto service_config = MakeConfig({{TenantId("tenant-a"), 1000}});
+    service_config.enable_offload = true;
+    MasterService service(service_config);
     UUID client_id = MountSegment(service);
+    ASSERT_TRUE(service
+                    .MountLocalDiskSegment(client_id,
+                                           /*enable_offloading=*/false)
+                    .has_value());
 
     TenantQuotaPolicySnapshot current_policy;
     current_policy.tenant_quotas = {{"tenant-a", 1000}};

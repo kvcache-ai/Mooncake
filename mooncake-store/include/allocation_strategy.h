@@ -4,6 +4,7 @@
 #include <memory>
 #include <optional>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -33,7 +34,7 @@ class ScopedSegmentAccess;
 class AllocatorManager {
    public:
     AllocatorManager() = default;
-    ~AllocatorManager() = default;
+    ~AllocatorManager() { ClearServingTracking(); }
 
     // Copy-construct disallowed.
     AllocatorManager(const AllocatorManager&) = delete;
@@ -85,11 +86,15 @@ class AllocatorManager {
         auto registration_it =
             std::find(it->second.begin(), it->second.end(), registration);
         if (registration_it != it->second.end()) {
+            if (serving_name_count_) {
+                registration->UntrackServingName();
+            }
             it->second.erase(registration_it);
             registration_removed = true;
         }
 
         if (it->second.empty()) {
+            serving_names_.erase(name);
             allocators_.erase(name);
             auto name_it = std::find(names_.begin(), names_.end(), name);
             if (name_it != names_.end()) {
@@ -133,7 +138,7 @@ class AllocatorManager {
 
     AllocatorManager Snapshot(
         const std::unordered_map<std::string, UUID>* owners = nullptr) const {
-        AllocatorManager snapshot;
+        AllocatorManager snapshot(SnapshotTag{});
         snapshot.names_ = names_;
         snapshot.allocators_ = allocators_;
         if (owners) {
@@ -156,6 +161,21 @@ class AllocatorManager {
      * @return a vector of names of all mounted segments
      */
     const std::vector<std::string>& getNames() const { return names_; }
+
+    // O(1) for the live registry. Placement snapshots do not maintain this
+    // count; querying one is a programming error.
+    // No counter bindings are created on the per-allocation Snapshot path.
+    // Liveness can change concurrently, as with getServingNames(); allocation
+    // still rechecks each registration rather than relying on this hint.
+    [[nodiscard]] size_t getServingNameCount() const {
+        if (!track_serving_names_) {
+            throw std::logic_error(
+                "getServingNameCount is unavailable on allocation snapshots");
+        }
+        return serving_name_count_
+                   ? serving_name_count_->load(std::memory_order_relaxed)
+                   : 0;
+    }
 
     [[nodiscard]] std::vector<std::string> getServingNames() const {
         std::vector<std::string> serving_names;
@@ -187,13 +207,39 @@ class AllocatorManager {
     }
 
    private:
+    struct SnapshotTag {};
+    explicit AllocatorManager(SnapshotTag) : track_serving_names_(false) {}
+
+    // Detach tracking explicitly before replacing a live registry.
+    void ClearServingTracking() {
+        if (serving_name_count_) {
+            for (const auto& [name, registrations] : allocators_) {
+                for (const auto& registration : registrations) {
+                    registration->UntrackServingName();
+                }
+            }
+        }
+    }
+
     void addRegistration(
         const std::string& name,
         const std::shared_ptr<SegmentAllocatorRegistration>& registration) {
         if (!allocators_.contains(name)) {
             names_.push_back(name);
+            if (track_serving_names_) {
+                if (!serving_name_count_) {
+                    serving_name_count_ =
+                        std::make_shared<std::atomic<size_t>>(0);
+                }
+                serving_names_.emplace(
+                    name,
+                    std::make_shared<ServingNameCounter>(serving_name_count_));
+            }
         }
         allocators_[name].push_back(registration);
+        if (serving_name_count_) {
+            registration->TrackServingName(serving_names_.at(name));
+        }
     }
 
     // Name array for randomly picking allocators.
@@ -203,6 +249,10 @@ class AllocatorManager {
         std::string, std::vector<std::shared_ptr<SegmentAllocatorRegistration>>>
         allocators_;
     std::unordered_map<std::string, UUID> owner_by_name_;
+    bool track_serving_names_ = true;
+    std::shared_ptr<std::atomic<size_t>> serving_name_count_;
+    std::unordered_map<std::string, std::shared_ptr<ServingNameCounter>>
+        serving_names_;
     friend class ScopedSegmentAccess;
     friend class SegmentSerializer;
 };

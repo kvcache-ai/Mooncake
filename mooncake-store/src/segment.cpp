@@ -1099,6 +1099,7 @@ SegmentSerializer::Deserialize(const std::vector<uint8_t>& data) {
 
     // Restore allocator_manager_ based on mounted_segments_ and saved names
     // order
+    segment_manager_->allocator_manager_.ClearServingTracking();
     segment_manager_->allocator_manager_ = AllocatorManager();
     for (auto& [segment_id, mounted_segment] :
          segment_manager_->mounted_segments_) {
@@ -1160,6 +1161,7 @@ void SegmentSerializer::Reset() {
     segment_manager_->client_by_name_.clear();
     segment_manager_->segment_id_by_name_.clear();
     segment_manager_->segments_by_host_.clear();
+    segment_manager_->allocator_manager_.ClearServingTracking();
     segment_manager_->allocator_manager_ = AllocatorManager();
 }
 
