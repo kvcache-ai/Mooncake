@@ -336,6 +336,7 @@ class CapabilityDrivenStandbyController final : public StandbyController {
             ctx.applied_seq_id = handoff->applied_cursor.last_seq;
             ctx.metadata_store = std::move(handoff->metadata_store);
             ctx.segments = std::move(handoff->segments);
+            ctx.nof_segments = std::move(handoff->nof_segments);
             ctx.applied_cursor = handoff->applied_cursor;
             ctx.producer_view_version = handoff->producer_view_version;
             ctx.max_replica_id = handoff->max_replica_id;
@@ -371,6 +372,7 @@ class CapabilityDrivenStandbyController final : public StandbyController {
         ctx.segments = std::move(snapshot.segments);
         ctx.weight_metadata =
             snapshot.weight_metadata.value_or(WeightMetadataSnapshot{});
+        ctx.nof_segments = std::move(snapshot.nof_segments);
 
         return ctx;
     }

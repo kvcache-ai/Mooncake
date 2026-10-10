@@ -95,7 +95,8 @@ TEST_F(BatchOpLogSnapshotProviderTest,
                                         "snapshots");
     StandbyMetadataStore metadata;
     StandbySegmentRegistry registry;
-    EXPECT_FALSE(provider.RestoreBaseline(metadata, registry));
+    StandbyNoFSegmentRegistry nof_registry;
+    EXPECT_FALSE(provider.RestoreBaseline(metadata, registry, nof_registry));
     EXPECT_EQ(
         42u,
         HAMetricManager::instance().get_snapshot_runtime().compaction_floor);
@@ -110,7 +111,7 @@ TEST_F(BatchOpLogSnapshotProviderTest,
     backend.Put(ha::BuildBatchOpLogSnapshotLatestKey("clusterA"),
                 ha::EncodeBatchOpLogSnapshotDescriptor(descriptor));
     HAMetricManager::instance().reset_snapshot_runtime(true);
-    EXPECT_FALSE(provider.RestoreBaseline(metadata, registry));
+    EXPECT_FALSE(provider.RestoreBaseline(metadata, registry, nof_registry));
     EXPECT_EQ(
         42u,
         HAMetricManager::instance().get_snapshot_runtime().compaction_floor);
@@ -139,8 +140,10 @@ TEST_F(BatchOpLogSnapshotProviderTest,
                                         "snapshots");
     StandbyMetadataStore metadata;
     StandbySegmentRegistry registry;
+    StandbyNoFSegmentRegistry nof_registry;
     OpLogApplier applier(&metadata, "clusterA");
-    const auto result = provider.RestoreBaseline(metadata, registry, &applier);
+    const auto result =
+        provider.RestoreBaseline(metadata, registry, nof_registry, &applier);
     ASSERT_FALSE(result);
     EXPECT_EQ(ErrorCode::ETCD_OPERATION_ERROR, result.error());
     EXPECT_EQ(1025u, applier.GetExpectedSequenceId());
@@ -156,8 +159,9 @@ TEST_F(BatchOpLogSnapshotProviderTest, AllAbsentNamespaceIsAnEmptyBaseline) {
                                         "snapshots");
     StandbyMetadataStore metadata;
     StandbySegmentRegistry registry;
+    StandbyNoFSegmentRegistry nof_registry;
 
-    auto result = provider.RestoreBaseline(metadata, registry);
+    auto result = provider.RestoreBaseline(metadata, registry, nof_registry);
 
     ASSERT_TRUE(result.has_value());
     EXPECT_EQ(0u, result->last_applied_seq);
@@ -175,8 +179,9 @@ TEST_F(BatchOpLogSnapshotProviderTest, RestoreHonorsCancellation) {
                                         "snapshots");
     StandbyMetadataStore metadata;
     StandbySegmentRegistry registry;
-    auto result = provider.RestoreBaseline(metadata, registry, nullptr, 0,
-                                           [] { return true; });
+    StandbyNoFSegmentRegistry nof_registry;
+    auto result = provider.RestoreBaseline(metadata, registry, nof_registry,
+                                           nullptr, 0, [] { return true; });
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(ErrorCode::ETCD_CTX_CANCELLED, result.error());
 }
@@ -191,14 +196,16 @@ TEST_F(BatchOpLogSnapshotProviderTest, EmptyCompleteHistoryIsAValidBaseline) {
                                         "snapshots");
     StandbyMetadataStore metadata;
     StandbySegmentRegistry registry;
+    StandbyNoFSegmentRegistry nof_registry;
 
-    auto result = provider.RestoreBaseline(metadata, registry);
+    auto result = provider.RestoreBaseline(metadata, registry, nof_registry);
 
     ASSERT_TRUE(result.has_value());
     EXPECT_EQ(0u, result->last_included_seq);
     EXPECT_EQ(0u, result->last_included_batch_id);
     EXPECT_EQ(0u, metadata.GetKeyCount());
     EXPECT_TRUE(registry.GetAllSegments().empty());
+    EXPECT_TRUE(nof_registry.GetAllSegments().empty());
 }
 
 TEST_F(BatchOpLogSnapshotProviderTest, UsesFallbackWhenLatestIsCorrupt) {
@@ -211,14 +218,22 @@ TEST_F(BatchOpLogSnapshotProviderTest, UsesFallbackWhenLatestIsCorrupt) {
     const std::string snapshot_id = "0-7";
     const std::string segments_key =
         ha::BuildBatchOpLogSnapshotSegmentsKey("snapshots", snapshot_id);
+    const std::string nof_segments_key =
+        ha::BuildBatchOpLogSnapshotNoFSegmentsKey("snapshots", snapshot_id);
     const auto segments = EncodeBatchOpLogSnapshotSegments({});
+    const auto nof_segments = EncodeBatchOpLogSnapshotNoFSegments({});
     ASSERT_TRUE(object_store.UploadBuffer(segments_key, segments));
+    ASSERT_TRUE(object_store.UploadBuffer(nof_segments_key, nof_segments));
     ha::BatchOpLogSnapshotManifest manifest;
     manifest.snapshot_id = snapshot_id;
     manifest.segments = {
         .key = segments_key,
         .stored_size = segments.size(),
         .crc32c = Crc32cValue(segments.data(), segments.size())};
+    manifest.nof_segments = {
+        .key = nof_segments_key,
+        .stored_size = nof_segments.size(),
+        .crc32c = Crc32cValue(nof_segments.data(), nof_segments.size())};
     const std::string manifest_key =
         ha::BuildBatchOpLogSnapshotManifestKey("snapshots", snapshot_id);
     const std::string manifest_bytes =
@@ -248,7 +263,8 @@ TEST_F(BatchOpLogSnapshotProviderTest, UsesFallbackWhenLatestIsCorrupt) {
                                         "snapshots");
     StandbyMetadataStore metadata;
     StandbySegmentRegistry registry;
-    auto result = provider.RestoreBaseline(metadata, registry);
+    StandbyNoFSegmentRegistry nof_registry;
+    auto result = provider.RestoreBaseline(metadata, registry, nof_registry);
     ASSERT_TRUE(result.has_value());
     EXPECT_EQ(0u, result->last_included_seq);
     EXPECT_EQ(0u, metadata.GetKeyCount());
@@ -276,9 +292,13 @@ TEST_F(BatchOpLogSnapshotProviderTest, ReturnsFinalCursorAfterSuffixReplay) {
 
     const std::string snapshot_id = "1-7";
     const auto segments = EncodeBatchOpLogSnapshotSegments({});
+    const auto nof_segments = EncodeBatchOpLogSnapshotNoFSegments({});
     const std::string segments_key =
         ha::BuildBatchOpLogSnapshotSegmentsKey("snapshots", snapshot_id);
+    const std::string nof_segments_key =
+        ha::BuildBatchOpLogSnapshotNoFSegmentsKey("snapshots", snapshot_id);
     ASSERT_TRUE(object_store.UploadBuffer(segments_key, segments));
+    ASSERT_TRUE(object_store.UploadBuffer(nof_segments_key, nof_segments));
 
     ha::BatchOpLogSnapshotManifest manifest;
     manifest.snapshot_id = snapshot_id;
@@ -288,6 +308,10 @@ TEST_F(BatchOpLogSnapshotProviderTest, ReturnsFinalCursorAfterSuffixReplay) {
         .key = segments_key,
         .stored_size = segments.size(),
         .crc32c = Crc32cValue(segments.data(), segments.size())};
+    manifest.nof_segments = {
+        .key = nof_segments_key,
+        .stored_size = nof_segments.size(),
+        .crc32c = Crc32cValue(nof_segments.data(), nof_segments.size())};
     const std::string manifest_bytes =
         ha::EncodeBatchOpLogSnapshotManifest(manifest);
     const std::string manifest_key =
@@ -315,7 +339,8 @@ TEST_F(BatchOpLogSnapshotProviderTest, ReturnsFinalCursorAfterSuffixReplay) {
                                         "snapshots");
     StandbyMetadataStore metadata;
     StandbySegmentRegistry registry;
-    auto result = provider.RestoreBaseline(metadata, registry);
+    StandbyNoFSegmentRegistry nof_registry;
+    auto result = provider.RestoreBaseline(metadata, registry, nof_registry);
 
     ASSERT_TRUE(result.has_value());
     EXPECT_EQ(1u, result->last_included_seq);
@@ -362,7 +387,8 @@ TEST_F(BatchOpLogSnapshotProviderTest,
                                         "snapshots");
     StandbyMetadataStore metadata;
     StandbySegmentRegistry registry;
-    auto result = provider.RestoreBaseline(metadata, registry);
+    StandbyNoFSegmentRegistry nof_registry;
+    auto result = provider.RestoreBaseline(metadata, registry, nof_registry);
 
     ASSERT_TRUE(result.has_value());
     EXPECT_EQ(2u, result->last_applied_seq);

@@ -912,7 +912,8 @@ class MasterService {
         const std::vector<StandbyObjectEntry>& objects,
         uint64_t initial_oplog_sequence_id,
         const std::vector<StandbySegmentInfo>& segments,
-        const WeightMetadataSnapshot& weight_metadata = {});
+        const WeightMetadataSnapshot& weight_metadata = {},
+        const std::vector<NoFSegmentInfo>& nof_segments = {});
     tl::expected<void, ErrorCode> RestoreFromBatchOpLogPromotion(
         BatchOpLogPromotionHandoff handoff,
         size_t chunk_object_count = kDefaultBatchOpLogPromotionChunkObjects);
@@ -965,7 +966,8 @@ class MasterService {
         const std::vector<StandbySegmentInfo>& segments,
         size_t chunk_object_count,
         std::optional<ReplicaID> expected_max_replica_id,
-        const WeightMetadataSnapshot* legacy_weight_metadata);
+        const WeightMetadataSnapshot* legacy_weight_metadata,
+        const std::vector<NoFSegmentInfo>& nof_segments);
 
     std::unique_ptr<ha::SnapshotCatalogStore> CreateSnapshotCatalogStore(
         const MasterServiceConfig& config);
@@ -2537,6 +2539,10 @@ class MasterService {
                                         const TenantId& tenant_id,
                                         const std::string& key,
                                         const std::string& payload);
+
+    void PersistNoFSegmentMountForHA(const NoFSegment& segment,
+                                     const UUID& client_id);
+    void PersistNoFSegmentUnmountForHA(const std::string& endpoint);
 
     /**
      * Helper to persist REMOVE OpLog for a key with strong-consistency.
