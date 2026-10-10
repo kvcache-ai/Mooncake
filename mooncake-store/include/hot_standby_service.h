@@ -12,6 +12,7 @@
 #include <thread>
 #include <vector>
 
+#include "ha/ha_types.h"
 #include "ha/oplog/oplog_applier.h"
 #include "ha/oplog/oplog_batch_types.h"
 #include "ha/oplog/oplog_types.h"
@@ -303,6 +304,7 @@ class HotStandbyService {
     // Configuration for OpLog sync
     std::string oplog_endpoints_;
     std::string cluster_id_;
+    ha::HABackendType oplog_backend_type_{ha::HABackendType::ETCD};
 
     // Replication state
     std::atomic<uint64_t> applied_seq_id_{0};
