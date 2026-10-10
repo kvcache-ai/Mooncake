@@ -2105,7 +2105,7 @@ class MooncakeDistributedNoFRegisterPyWrapper {
     MooncakeDistributedNoFRegisterPyWrapper() = default;
 };
 
-PYBIND11_MODULE(store, m) {
+PYBIND11_MODULE(_store, m) {
     m.def("_serialize_tensor", &serialize_tensor_metadata,
           "Inspect a torch tensor as Mooncake tensor metadata, data pointer, "
           "size, and owner.");

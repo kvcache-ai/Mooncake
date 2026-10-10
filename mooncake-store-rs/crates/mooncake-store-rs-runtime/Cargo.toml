@@ -1,0 +1,31 @@
+[package]
+name = "mooncake-store-rs-runtime"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+
+[features]
+default = []
+test-support = []
+
+[dependencies]
+libc = "0.2"
+mooncake-store-rs-metadata = { path = "../mooncake-store-rs-metadata" }
+mooncake-store-client = { path = "../mooncake-store-client" }
+mooncake-store-core = { path = "../mooncake-store-core" }
+mooncake-store-rs-transport = { path = "../mooncake-store-rs-transport" }
+parking_lot.workspace = true
+prost = "0.13"
+serde_json.workspace = true
+tokio = { version = "1", features = ["net", "rt-multi-thread", "sync", "time"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic = { version = "0.12", features = ["transport"] }
+tracing.workspace = true
+url = "2"
+
+[build-dependencies]
+protoc-bin-vendored = "3"
+tonic-build = "0.12"
+
+[lints]
+workspace = true

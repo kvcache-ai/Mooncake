@@ -4,7 +4,7 @@
 Requires a running mooncake_master and built store Python module.
 
 Example:
-  PYTHONPATH=build/mooncake-integration \\
+  MOONCAKE_STORE_BACKEND=cpp \\
   MOONCAKE_PROTOCOL=tcp \\
   MOONCAKE_MASTER=127.0.0.1:50051 \\
   MOONCAKE_TE_META_DATA_SERVER=P2PHANDSHAKE \\
@@ -21,7 +21,7 @@ import time
 
 def _require_store():
     try:
-        import store  # type: ignore
+        import mooncake.store as store
     except Exception as exc:  # pragma: no cover
         print(f"import_fail {exc}", flush=True)
         raise SystemExit(10)

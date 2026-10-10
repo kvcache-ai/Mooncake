@@ -1,0 +1,28 @@
+[package]
+name = "mooncake-store-py"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+python-extension = ["pyo3/extension-module"]
+
+[lib]
+name = "_store_rs"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+libc = "0.2"
+mooncake-store-client = { path = "../mooncake-store-client" }
+mooncake-store-core = { path = "../mooncake-store-core" }
+mooncake-store-rs-runtime = { path = "../mooncake-store-rs-runtime" }
+mooncake-store-rs-tensor = { path = "../mooncake-store-rs-tensor" }
+pyo3.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+mooncake-store-rs-metadata = { path = "../mooncake-store-rs-metadata" }
+mooncake-store-rs-runtime = { path = "../mooncake-store-rs-runtime", features = ["test-support"] }
+
+[lints]
+workspace = true
