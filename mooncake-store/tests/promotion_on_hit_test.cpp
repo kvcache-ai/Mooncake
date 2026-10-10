@@ -119,8 +119,12 @@ class PromotionOnHitTest : public ::testing::Test {
             service, MasterServiceTestPeer::ObjectIdentity{
                          .tenant_id = tenant_id, .user_key = key});
         const auto* tenant_state = accessor.GetTenantState();
-        return tenant_state != nullptr &&
-               tenant_state->promotion_tasks.contains(key);
+        if (tenant_state == nullptr) {
+            return false;
+        }
+        auto it = tenant_state->metadata.find(key);
+        return it != tenant_state->metadata.end() &&
+               it->second.state.promotion_task;
     }
 
     // std::nullopt when the key has no in-flight promotion task.
@@ -134,11 +138,12 @@ class PromotionOnHitTest : public ::testing::Test {
         if (tenant_state == nullptr) {
             return std::nullopt;
         }
-        auto it = tenant_state->promotion_tasks.find(key);
-        if (it == tenant_state->promotion_tasks.end()) {
+        auto it = tenant_state->metadata.find(key);
+        if (it == tenant_state->metadata.end() ||
+            !it->second.state.promotion_task) {
             return std::nullopt;
         }
-        return it->second.execution_failures;
+        return it->second.state.promotion_task->execution_failures;
     }
 
     static bool PromotionAdmissionBlockedByPrimaryWriteForTesting(
@@ -1139,7 +1144,7 @@ TEST_F(PromotionOnHitTest, HeartbeatBoundedBatchPreservesLeftovers) {
     EXPECT_TRUE(tick4->empty())
         << "after draining all queued keys, heartbeat must return empty";
 
-    // Sanity: master-side promotion_tasks records are intact for all keys
+    // Sanity: master-side promotion tasks are intact for all keys
     // (they're cleared by NotifyPromotionSuccess, not by Heartbeat), so the
     // source refcnts remain pinned until processed.
     for (const auto& k : keys) {
@@ -1151,8 +1156,8 @@ TEST_F(PromotionOnHitTest, HeartbeatBoundedBatchPreservesLeftovers) {
 }
 
 // The promotion task reaper must pop the staged PROCESSING MEMORY
-// replica added by PromotionAllocStart. The staged replica is not in
-// shard->processing_keys, so DiscardExpiredProcessingReplicas's main
+// replica added by PromotionAllocStart. Promotion never marks the object
+// processing, so DiscardExpiredProcessingReplicas's main
 // sweep can't see it, and the reaper for promotion tasks is the only
 // place that knows the replica exists. Without this path the orphan
 // holds its allocator buffer indefinitely (until the object is removed
@@ -1574,8 +1579,8 @@ TEST_F(PromotionOnHitTest, UpsertStartRejectsActivePromotionTask) {
 // (e.g. client stall past put_start_release_timeout_sec_). Without the
 // check, AllocStart would allocate + AddReplicas a PROCESSING MEMORY
 // replica with nothing tracking it: the generic PROCESSING reaper only
-// iterates shard->processing_keys (never populated by promotion) and
-// the promotion-task reaper has nothing left to iterate, so the buffer
+// reclaims objects marked processing (which promotion never sets) and
+// the promotion-task reaper has nothing left to reclaim, so the buffer
 // leaks until the object is removed or evicted.
 TEST_F(PromotionOnHitTest, AllocStartRejectsReapedTask) {
     MasterServiceConfig config;
@@ -2150,7 +2155,7 @@ TEST_F(PromotionOnHitTest, AllocStartRejectsSizeMismatch) {
 }
 
 // When a holder client expires, ClientMonitorFunc must clean up its
-// dangling promotion_tasks entries and decrement the global in-flight
+// dangling promotion tasks and decrement the global in-flight
 // counter. Without this cleanup, the entries stay pinned until reaper
 // TTL — and on a rolling restart of many holders the cluster-wide cap
 // promotion_queue_limit_ saturates and blocks all new admissions for
@@ -2229,7 +2234,7 @@ TEST_F(PromotionOnHitTest, ClientExpiryClearsPromotionTask) {
     }
 
     // ClearInvalidHandles should have erased the holder's LOCAL_DISK
-    // source replica AND (with the fix) the promotion_tasks entry,
+    // source replica AND (with the fix) the promotion task,
     // decrementing the global in-flight counter. Re-admit a promotion
     // on the second holder; with queue_limit=1 this can only succeed if
     // the slot was freed.
@@ -2243,7 +2248,7 @@ TEST_F(PromotionOnHitTest, ClientExpiryClearsPromotionTask) {
     ASSERT_TRUE(pending_post.has_value());
     EXPECT_EQ(CountPromotionTask(*pending_post, "k_other"), 1u)
         << "After the holder expired, ClearInvalidHandles must have "
-        << "erased its promotion_tasks entry and decremented "
+        << "erased its promotion task and decremented "
         << "promotion_in_flight_. Otherwise the global cap remains "
         << "saturated by the dead holder's task for "
         << "put_start_release_timeout_sec_ seconds, and this admission "
@@ -2326,7 +2331,7 @@ TEST_F(PromotionOnHitTest, RemoveErasesPromotionTask) {
     }
 
     // Remove k_first with force=true. With the fix, this also wipes
-    // k_first's promotion_tasks entry and decrements
+    // k_first's promotion task and decrements
     // promotion_in_flight_ back to 0.
     auto rm = service->Remove("k_first", TenantId::Default(), /*force=*/true);
     ASSERT_TRUE(rm.has_value())
@@ -2343,7 +2348,7 @@ TEST_F(PromotionOnHitTest, RemoveErasesPromotionTask) {
     ASSERT_TRUE(pending_post.has_value());
     EXPECT_EQ(CountPromotionTask(*pending_post, "k_second"), 1u)
         << "k_second must be admittable after Remove of k_first — Remove "
-        << "must erase the in-flight promotion_tasks entry and decrement "
+        << "must erase the in-flight promotion task and decrement "
         << "promotion_in_flight_, otherwise queue_limit=1 stays saturated.";
 
     service->RemoveAll();
@@ -2394,8 +2399,8 @@ TEST_F(PromotionOnHitTest, RemoveByRegexErasesPromotionTask) {
     ASSERT_TRUE(pending_post.has_value());
     EXPECT_EQ(CountPromotionTask(*pending_post, "other_k2"), 1u)
         << "other_k2 must be admittable after RemoveByRegex of regex_k1 "
-        << "— RemoveByRegex must erase the in-flight promotion_tasks "
-        << "entry. Otherwise queue_limit=1 stays saturated.";
+        << "— RemoveByRegex must erase the in-flight promotion task. "
+        << "Otherwise queue_limit=1 stays saturated.";
 
     service->RemoveAll();
 }

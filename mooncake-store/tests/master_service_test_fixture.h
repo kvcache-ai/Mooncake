@@ -140,7 +140,7 @@ class MasterServiceTest : public ::testing::Test {
         if (metadata_it == tenant_it->second.metadata.end()) {
             return std::nullopt;
         }
-        return metadata_it->second.GetCommittedSoftPinTimeout();
+        return metadata_it->second.metadata.GetCommittedSoftPinTimeout();
     }
 
     void CleanupExpiredSoftPinsAt(
@@ -182,7 +182,8 @@ class MasterServiceTest : public ::testing::Test {
             normalized_tenant, key);
         MasterServiceTestPeer::MetadataShardAccessorRW shard(&service,
                                                              shard_idx);
-        auto& metadata = shard->tenants.at(normalized_tenant).metadata.at(key);
+        auto& metadata =
+            shard->tenants.at(normalized_tenant).metadata.at(key).metadata;
         {
             SpinLocker locker(&metadata.lock);
             metadata.soft_pin_timeout = deadline;
