@@ -129,6 +129,14 @@ static void nvmf_io_complete(void* ctx, const struct spdk_nvme_cpl* cpl) {
 namespace mooncake {
 namespace {
 
+// A segment owner publishes its Transfer Engine metadata only to the metadata
+// service it was started with, so a reader configured with a different one
+// (e.g. HTTP metadata vs P2PHANDSHAKE) cannot resolve the endpoint.
+constexpr const char* kOpenSegmentFailureHint =
+    "; check that this client and the segment owner use the same "
+    "metadata_server (e.g. both P2PHANDSHAKE, or both the same HTTP/etcd "
+    "metadata service)";
+
 #ifdef USE_TENT
 int GetTentPositiveEnvOrDefault(const char* name, int default_value) {
     const char* raw_value = std::getenv(name);
@@ -1804,7 +1812,8 @@ std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
             tent_engine_->openSegment(seg_id, handle.transport_endpoint_);
         if (!status.ok()) {
             LOG(ERROR) << "Failed to open segment for endpoint='"
-                       << handle.transport_endpoint_ << "'";
+                       << handle.transport_endpoint_ << "'"
+                       << kOpenSegmentFailureHint;
             return std::nullopt;
         }
         seg = seg_id;
@@ -1814,7 +1823,8 @@ std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
         seg = engine_.openSegment(handle.transport_endpoint_);
         if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
             LOG(ERROR) << "Failed to open segment for endpoint='"
-                       << handle.transport_endpoint_ << "'";
+                       << handle.transport_endpoint_ << "'"
+                       << kOpenSegmentFailureHint;
             return std::nullopt;
         }
     }
