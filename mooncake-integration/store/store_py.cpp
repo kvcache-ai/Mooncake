@@ -491,6 +491,20 @@ inline int to_py_ret(ErrorCode error_code) {
     return static_cast<int>(error_code);
 }
 
+// pybind11's buffer `size` counts elements, not bytes, so a typed buffer
+// (itemsize > 1) passed to put/upsert would be stored truncated while the
+// call reports success (#4299). Store the full byte range of C-contiguous
+// buffers and reject the rest loudly instead of writing the wrong bytes.
+// PyBuffer_IsContiguous, not a hand-rolled stride walk: the buffer protocol
+// leaves strides for extent-0/1 dimensions unspecified, so a manual walk
+// rejects buffers that are contiguous in memory.
+inline size_t contiguous_buffer_bytes(const py::buffer_info &info) {
+    if (!PyBuffer_IsContiguous(info.view(), 'C')) {
+        throw std::runtime_error("buffer must be C-contiguous");
+    }
+    return static_cast<size_t>(info.size) * static_cast<size_t>(info.itemsize);
+}
+
 #include "store_py_internal.h"
 
 }  // namespace
@@ -2870,7 +2884,7 @@ PYBIND11_MODULE(store, m) {
                 return self.store_->upsert(
                     key,
                     std::span<const char>(static_cast<char *>(info.ptr),
-                                          static_cast<size_t>(info.size)),
+                                          contiguous_buffer_bytes(info)),
                     config);
             },
             py::arg("key"), py::arg("value"),
@@ -2894,9 +2908,13 @@ PYBIND11_MODULE(store, m) {
                     py::buffer buf = py::reinterpret_borrow<py::buffer>(obj);
                     infos.emplace_back(buf.request(false));
                     const auto &info = infos.back();
-                    if (info.ndim != 1 || info.itemsize != 1)
+                    // A strided 1-D view (memoryview(b"..")[::2]) passes the
+                    // ndim/itemsize check but is not contiguous in memory;
+                    // without this it would be stored as the wrong bytes.
+                    if (info.ndim != 1 || info.itemsize != 1 ||
+                        !PyBuffer_IsContiguous(info.view(), 'C'))
                         throw std::runtime_error(
-                            "parts must be 1-D bytes-like");
+                            "parts must be 1-D C-contiguous bytes-like");
 
                     spans.emplace_back(static_cast<const char *>(info.ptr),
                                        static_cast<size_t>(info.size));
@@ -2926,7 +2944,7 @@ PYBIND11_MODULE(store, m) {
                     infos.emplace_back(buf.request(/*writable=*/false));
                     const auto &info = infos.back();
                     spans.emplace_back(static_cast<const char *>(info.ptr),
-                                       static_cast<size_t>(info.size));
+                                       contiguous_buffer_bytes(info));
                 }
 
                 py::gil_scoped_release release;
@@ -3134,7 +3152,7 @@ PYBIND11_MODULE(store, m) {
                 return self.store_->put(
                     key,
                     std::span<const char>(static_cast<char *>(info.ptr),
-                                          static_cast<size_t>(info.size)),
+                                          contiguous_buffer_bytes(info)),
                     config);
             },
             py::arg("key"), py::arg("value"),
@@ -3154,9 +3172,13 @@ PYBIND11_MODULE(store, m) {
                     py::buffer buf = py::reinterpret_borrow<py::buffer>(obj);
                     infos.emplace_back(buf.request(false));
                     const auto &info = infos.back();
-                    if (info.ndim != 1 || info.itemsize != 1)
+                    // A strided 1-D view (memoryview(b"..")[::2]) passes the
+                    // ndim/itemsize check but is not contiguous in memory;
+                    // without this it would be stored as the wrong bytes.
+                    if (info.ndim != 1 || info.itemsize != 1 ||
+                        !PyBuffer_IsContiguous(info.view(), 'C'))
                         throw std::runtime_error(
-                            "parts must be 1-D bytes-like");
+                            "parts must be 1-D C-contiguous bytes-like");
 
                     spans.emplace_back(static_cast<const char *>(info.ptr),
                                        static_cast<size_t>(info.size));
@@ -3183,7 +3205,7 @@ PYBIND11_MODULE(store, m) {
                     infos.emplace_back(buf.request(/*writable=*/false));
                     const auto &info = infos.back();
                     spans.emplace_back(static_cast<const char *>(info.ptr),
-                                       static_cast<size_t>(info.size));
+                                       contiguous_buffer_bytes(info));
                 }
 
                 py::gil_scoped_release release;
