@@ -89,6 +89,107 @@ TEST(DiagnosticRedactionTest, StrictModeCorrelatesWithinOneSnapshotOnly) {
     EXPECT_EQ(redactor.metadata().fields_redacted, 3);
 }
 
+TEST(DiagnosticRedactionTest, TextSecretsAreRedactedInEveryMode) {
+    const std::string text =
+        "MC_REDIS_PASSWORD=abc url redis://u:p@h:6379/0 "
+        "Authorization: Bearer x rkey=12345 lkey 0x99 "
+        "addr=0x7f0069fa6000 {\"redis_password\": \"hunter2\"} peer 10.1.2.3";
+    for (const auto mode : {RedactionMode::kDefault, RedactionMode::kStrict,
+                            RedactionMode::kNone}) {
+        Redactor redactor(mode);
+        const std::string sanitized = redactor.sanitizeText(text);
+        for (const char* secret : {"=abc", "u:p@", "Bearer x", "12345", "0x99",
+                                   "0x7f0069fa6000", "hunter2"}) {
+            EXPECT_EQ(sanitized.find(secret), std::string::npos)
+                << secret << " in " << sanitized;
+        }
+        EXPECT_NE(sanitized.find("MC_REDIS_PASSWORD=[redacted]"),
+                  std::string::npos);
+        EXPECT_NE(sanitized.find("redis://[redacted]@h:6379/0"),
+                  std::string::npos);
+        EXPECT_NE(sanitized.find("\"redis_password\": \"[redacted]\""),
+                  std::string::npos);
+        const bool strict = mode == RedactionMode::kStrict;
+        EXPECT_EQ(sanitized.find("10.1.2.3") == std::string::npos, strict);
+        EXPECT_EQ(redactor.metadata().fields_redacted, strict ? 8 : 7);
+    }
+}
+
+TEST(DiagnosticRedactionTest, StrictTextUsesTheFieldPseudonyms) {
+    Redactor redactor(RedactionMode::kStrict);
+    const auto field =
+        redactor.sanitize("ip", "192.0.2.10", ValueSensitivity::kDeployment);
+    const std::string text = redactor.sanitizeText(
+        "peer 192.0.2.10 gid fe80::1 again "
+        "192.0.2.10 other 192.0.2.11");
+    const std::string pseudonym = field.value.get<std::string>();
+    EXPECT_EQ(text.find("192.0.2.1"), std::string::npos) << text;
+    EXPECT_EQ(text.find("fe80::1"), std::string::npos) << text;
+    EXPECT_EQ(text.find(pseudonym), text.find("peer ") + 5) << text;
+    EXPECT_NE(text.find(pseudonym, text.find("again")), std::string::npos);
+    EXPECT_EQ(text.find(pseudonym, text.find("other")), std::string::npos);
+    EXPECT_EQ(redactor.metadata().fields_redacted, 5);
+}
+
+TEST(DiagnosticRedactionTest, StrictTextReplacesKnownValuesAsWholeWords) {
+    Redactor redactor(RedactionMode::kStrict);
+    const auto host =
+        redactor.sanitize("hostname", "node-a", ValueSensitivity::kDeployment);
+    const auto netdev =
+        redactor.sanitize("netdev", "eth1", ValueSensitivity::kDeployment);
+    const std::string text =
+        redactor.sanitizeText("node-a eth1 eth10 node-a1 xnode-a (eth1)");
+    EXPECT_EQ(text, host.value.get<std::string>() + " " +
+                        netdev.value.get<std::string>() +
+                        " eth10 node-a1 xnode-a (" +
+                        netdev.value.get<std::string>() + ")");
+}
+
+TEST(DiagnosticRedactionTest, StrictTextFindsAddressShapes) {
+    const std::string addresses[] = {
+        "10.0.0.1",
+        "198.51.100.7",
+        "fe80::1a2b:3cff:fe4d:5e6f",
+        "00:00:00:00:00:00:00:00:00:00:ff:ff:c6:33:64:07",
+        "0a:1b:2c:3d:4e:5f",
+        "0a1b:2c3d:4e5f:6a7b",
+        "::ffff:203.0.113.9",
+        "10.9.8.7",
+    };
+    Redactor redactor(RedactionMode::kStrict);
+    const std::string text = redactor.sanitizeText(
+        "addr:10.0.0.1 seg 198.51.100.7:15321 gid:fe80::1a2b:3cff:fe4d:5e6f "
+        "raw 00:00:00:00:00:00:00:00:00:00:ff:ff:c6:33:64:07 mac "
+        "0a:1b:2c:3d:4e:5f guid 0a1b:2c3d:4e5f:6a7b mapped "
+        "[::ffff:203.0.113.9] end 10.9.8.7.");
+    for (const auto& address : addresses) {
+        EXPECT_EQ(text.find(address), std::string::npos)
+            << address << " in " << text;
+    }
+    EXPECT_NE(text.find(":15321 "), std::string::npos) << text;
+    EXPECT_EQ(text.back(), '.');
+    EXPECT_EQ(redactor.metadata().fields_redacted, 8);
+}
+
+TEST(DiagnosticRedactionTest, StrictTextKeepsNonAddresses) {
+    Redactor redactor(RedactionMode::kStrict);
+    const std::string text =
+        "std::string I1011 05:17:20.123456 file.cpp:123] mlx5_2:4096 "
+        "version 1.2.3 cafe deadbeef :: a::b GID[3] port 1: mtu 4096";
+    EXPECT_EQ(redactor.sanitizeText(text), text);
+    EXPECT_EQ(redactor.metadata().fields_redacted, 0);
+}
+
+TEST(DiagnosticRedactionTest, NonStrictTextKeepsDeploymentValues) {
+    for (const auto mode : {RedactionMode::kDefault, RedactionMode::kNone}) {
+        Redactor redactor(mode);
+        redactor.sanitize("hostname", "node-a", ValueSensitivity::kDeployment);
+        const std::string text = "node-a 198.51.100.7 fe80::1";
+        EXPECT_EQ(redactor.sanitizeText(text), text);
+        EXPECT_EQ(redactor.metadata().fields_redacted, 0);
+    }
+}
+
 TEST(DiagnosticRendererTest, TextAndJsonContainTheSameCheckFacts) {
     DiagnosticSnapshot snapshot;
     snapshot.command = "version";

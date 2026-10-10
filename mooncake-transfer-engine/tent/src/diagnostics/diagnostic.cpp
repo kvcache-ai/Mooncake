@@ -14,9 +14,12 @@
 
 #include "tent/diagnostics/diagnostic.h"
 
+#include <arpa/inet.h>
+
 #include <algorithm>
 #include <cctype>
 #include <iterator>
+#include <regex>
 #include <sstream>
 #include <utility>
 
@@ -59,6 +62,104 @@ std::string lowercase(std::string_view text) {
     return result;
 }
 
+constexpr std::string_view kRedactedText = "[redacted]";
+constexpr std::size_t kMinDeploymentTextLength = 3;
+
+bool isWordChar(char c) {
+    return std::isalnum(static_cast<unsigned char>(c)) || c == '_';
+}
+
+bool isAddressChar(char c) {
+    return std::isxdigit(static_cast<unsigned char>(c)) || c == ':' || c == '.';
+}
+
+bool isHexGroups(std::string_view token, std::size_t group_length,
+                 std::size_t min_groups, std::size_t max_groups) {
+    std::size_t groups = 0;
+    std::size_t begin = 0;
+    while (begin <= token.size()) {
+        const std::size_t end = std::min(token.find(':', begin), token.size());
+        const std::string_view group = token.substr(begin, end - begin);
+        if (group.size() != group_length ||
+            !std::all_of(group.begin(), group.end(), [](char c) {
+                return std::isxdigit(static_cast<unsigned char>(c));
+            })) {
+            return false;
+        }
+        ++groups;
+        begin = end + 1;
+    }
+    return groups >= min_groups && groups <= max_groups;
+}
+
+bool isIpv4(const std::string& token) {
+    in_addr address{};
+    return inet_pton(AF_INET, token.c_str(), &address) == 1;
+}
+
+// Requires a decimal digit so scope-like text such as "a::b" is not taken for
+// an address.
+bool isIpv6(const std::string& token) {
+    in6_addr address{};
+    return token.find(':') != std::string::npos &&
+           std::any_of(token.begin(), token.end(),
+                       [](unsigned char c) { return std::isdigit(c); }) &&
+           inet_pton(AF_INET6, token.c_str(), &address) == 1;
+}
+
+// GIDs and MACs are colon-separated byte pairs (16 and 6 or 8 groups), node
+// GUIDs are four groups of four hex digits.
+bool isHardwareAddress(std::string_view token) {
+    return isHexGroups(token, 2, 6, 6) || isHexGroups(token, 2, 8, 8) ||
+           isHexGroups(token, 2, 16, 16) || isHexGroups(token, 4, 4, 4);
+}
+
+bool isAddressToken(const std::string& token) {
+    const bool has_digit =
+        std::any_of(token.begin(), token.end(),
+                    [](unsigned char c) { return std::isxdigit(c); });
+    return has_digit &&
+           (isIpv4(token) || isIpv6(token) || isHardwareAddress(token));
+}
+
+// Replaces capture group `group` of every match with "[redacted]", keeping
+// surrounding quotes. Values that are already redacted are left alone.
+std::string redactGroup(const std::string& text, const std::regex& pattern,
+                        std::size_t group, std::uint64_t& replacements) {
+    std::string result;
+    std::size_t copied = 0;
+    for (auto it = std::sregex_iterator(text.begin(), text.end(), pattern);
+         it != std::sregex_iterator(); ++it) {
+        const std::smatch& match = *it;
+        if (!match[group].matched || match.length(group) == 0) {
+            continue;
+        }
+        std::string value = match.str(group);
+        const bool quoted = value.size() >= 2 &&
+                            (value.front() == '"' || value.front() == '\'') &&
+                            value.back() == value.front();
+        const std::string_view inner =
+            quoted ? std::string_view(value).substr(1, value.size() - 2)
+                   : std::string_view(value);
+        if (inner == kRedactedText) {
+            continue;
+        }
+        const auto position = static_cast<std::size_t>(match.position(group));
+        result.append(text, copied, position - copied);
+        if (quoted) {
+            result.push_back(value.front());
+            result.append(kRedactedText);
+            result.push_back(value.front());
+        } else {
+            result.append(kRedactedText);
+        }
+        copied = position + value.size();
+        ++replacements;
+    }
+    result.append(text, copied, std::string::npos);
+    return result;
+}
+
 std::string valueForText(const SanitizedValue& value) {
     if (!value.available) {
         return "unavailable";
@@ -89,9 +190,141 @@ SanitizedValue Redactor::sanitize(std::string_view field, nlohmann::json value,
     if (mode_ == RedactionMode::kStrict &&
         sensitivity == ValueSensitivity::kDeployment) {
         ++fields_redacted_;
+        if (value.is_string()) {
+            const auto& text = value.get_ref<const std::string&>();
+            if (text.size() >= kMinDeploymentTextLength &&
+                std::find(deployment_strings_.begin(),
+                          deployment_strings_.end(),
+                          text) == deployment_strings_.end()) {
+                deployment_strings_.push_back(text);
+            }
+        }
         return SanitizedValue{strictPseudonym(value), true, true};
     }
     return SanitizedValue{std::move(value), true, false};
+}
+
+std::string Redactor::sanitizeText(std::string_view text) {
+    std::string result = redactSecretText(std::string(text));
+    if (mode_ == RedactionMode::kStrict) {
+        result = replaceKnownDeploymentText(result);
+        result = replaceAddressTokens(result);
+    }
+    return result;
+}
+
+std::string Redactor::redactSecretText(std::string text) {
+    using std::regex_constants::ECMAScript;
+    using std::regex_constants::icase;
+    static const std::regex kUrlUserInfo(
+        R"(([a-z][a-z0-9+.\-]*://)([^\s/@]+)@)", ECMAScript | icase);
+    static const std::regex kAuthorization(
+        R"((authorization["']?\s*[:=]\s*["']?)((?:bearer|basic|digest|token)\s+)?([^\s"',;]+))",
+        ECMAScript | icase);
+    static const std::regex kBearer(R"(\b(bearer|basic)\s+([^\s"',;]+))",
+                                    ECMAScript | icase);
+    static const std::regex kSecretAssignment(
+        R"((["']?[a-z0-9_.\-]*(?:password|passwd|token|secret|credential|private_key|access_key|api_key|apikey|rkey|lkey)[a-z0-9_.\-]*["']?\s*[:=]\s*)("[^"]*"|'[^']*'|[^\s"',;&}\]]+))",
+        ECMAScript | icase);
+    static const std::regex kKeyValue(R"(\b([rl]key)\s+(0x[0-9a-f]+|[0-9]+))",
+                                      ECMAScript | icase);
+    static const std::regex kRawAddress(R"(\b(0x[0-9a-f]{8,})\b)",
+                                        ECMAScript | icase);
+
+    text = redactGroup(text, kUrlUserInfo, 2, fields_redacted_);
+    text = redactGroup(text, kAuthorization, 3, fields_redacted_);
+    text = redactGroup(text, kBearer, 2, fields_redacted_);
+    text = redactGroup(text, kSecretAssignment, 2, fields_redacted_);
+    text = redactGroup(text, kKeyValue, 2, fields_redacted_);
+    return redactGroup(text, kRawAddress, 1, fields_redacted_);
+}
+
+std::string Redactor::replaceKnownDeploymentText(const std::string& text) {
+    std::vector<std::string> known = deployment_strings_;
+    std::stable_sort(known.begin(), known.end(),
+                     [](const std::string& lhs, const std::string& rhs) {
+                         return lhs.size() > rhs.size();
+                     });
+    std::string result = text;
+    for (const auto& value : known) {
+        std::size_t position = 0;
+        while ((position = result.find(value, position)) != std::string::npos) {
+            const std::size_t end = position + value.size();
+            const bool bounded =
+                (position == 0 || !isWordChar(result[position - 1])) &&
+                (end == result.size() || !isWordChar(result[end]));
+            if (!bounded) {
+                position = end;
+                continue;
+            }
+            const std::string pseudonym = strictPseudonym(value);
+            result.replace(position, value.size(), pseudonym);
+            position += pseudonym.size();
+            ++fields_redacted_;
+        }
+    }
+    return result;
+}
+
+std::string Redactor::replaceAddressTokens(const std::string& text) {
+    std::string result;
+    std::size_t index = 0;
+    while (index < text.size()) {
+        if (!isAddressChar(text[index])) {
+            result.push_back(text[index++]);
+            continue;
+        }
+        std::size_t end = index;
+        while (end < text.size() && isAddressChar(text[end])) {
+            ++end;
+        }
+        const bool start_bounded = index == 0 || !isWordChar(text[index - 1]);
+        const bool end_bounded = end == text.size() || !isWordChar(text[end]);
+        result.append(redactAddressRun(text.substr(index, end - index),
+                                       start_bounded, end_bounded));
+        index = end;
+    }
+    return result;
+}
+
+std::string Redactor::redactAddressRun(const std::string& run,
+                                       bool start_bounded, bool end_bounded) {
+    if (run.empty()) {
+        return run;
+    }
+    // Dots at either end are punctuation ("reached 10.0.0.1."), not part of
+    // an address.
+    std::size_t first = 0;
+    std::size_t last = run.size();
+    while (first < last && run[first] == '.') {
+        ++first;
+    }
+    while (last > first && run[last - 1] == '.') {
+        --last;
+    }
+    if (first > 0 || last < run.size()) {
+        return run.substr(0, first) +
+               redactAddressRun(run.substr(first, last - first),
+                                start_bounded || first > 0,
+                                end_bounded || last < run.size()) +
+               run.substr(last);
+    }
+    if (start_bounded && end_bounded && isAddressToken(run)) {
+        ++fields_redacted_;
+        return strictPseudonym(run);
+    }
+    // A single colon can separate an address from a label ("gid:fe80::1") or
+    // a port ("10.0.0.1:15000"); "::" always belongs to an IPv6 address.
+    for (std::size_t i = 0; i < run.size(); ++i) {
+        const bool single_colon = run[i] == ':' &&
+                                  (i == 0 || run[i - 1] != ':') &&
+                                  (i + 1 == run.size() || run[i + 1] != ':');
+        if (single_colon) {
+            return redactAddressRun(run.substr(0, i), start_bounded, true) +
+                   ":" + redactAddressRun(run.substr(i + 1), true, end_bounded);
+        }
+    }
+    return run;
 }
 
 RedactionMetadata Redactor::metadata() const {

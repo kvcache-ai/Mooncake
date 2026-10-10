@@ -88,15 +88,30 @@ class Redactor {
     SanitizedValue sanitize(
         std::string_view field, nlohmann::json value,
         ValueSensitivity sensitivity = ValueSensitivity::kPublic);
+
+    // Sanitizes free text such as log lines and error messages. Credential
+    // assignments, URL user information, authorization values, rkey/lkey
+    // values and raw addresses are replaced in every mode. In strict mode,
+    // deployment strings already passed to sanitize() and any remaining
+    // IPv4, IPv6, GID, MAC or GUID token are replaced by the same pseudonyms
+    // sanitize() uses. Every replacement counts as one redacted field.
+    std::string sanitizeText(std::string_view text);
+
     RedactionMetadata metadata() const;
 
    private:
     static bool isAlwaysSensitiveField(std::string_view field);
     std::string strictPseudonym(const nlohmann::json& value);
+    std::string redactSecretText(std::string text);
+    std::string replaceKnownDeploymentText(const std::string& text);
+    std::string replaceAddressTokens(const std::string& text);
+    std::string redactAddressRun(const std::string& run, bool start_bounded,
+                                 bool end_bounded);
 
     RedactionMode mode_;
     std::uint64_t fields_redacted_ = 0;
     std::unordered_map<std::string, std::string> pseudonyms_;
+    std::vector<std::string> deployment_strings_;
 };
 
 std::string_view toString(CheckOutcome outcome);
