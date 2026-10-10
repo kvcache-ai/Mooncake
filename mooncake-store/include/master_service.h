@@ -97,6 +97,13 @@ class MasterServiceTestPeer;
 // container and must not be iterating it.
 inline constexpr size_t kShrinkMinBucketCount = 1024;
 
+// Minimum number of metadata entries a ClearStaleHandles sweep must erase
+// before it pays for a malloc_trim(0). The trim walks glibc's arenas and
+// madvise(MADV_DONTNEED)s their free tops; on a small unmount (hundreds of
+// keys) the cost exceeds the benefit, so we gate it. A full store node
+// offline erases millions of keys and always crosses this threshold.
+inline constexpr size_t kMallocTrimThreshold = 100000;
+
 template <typename UnorderedContainer>
 void ShrinkBucketsIfSparse(UnorderedContainer& container) {
     if (container.bucket_count() > kShrinkMinBucketCount &&
@@ -136,6 +143,7 @@ class MasterService {
    public:
     using NoFProbeFn =
         std::function<bool(const std::string&, uint32_t, std::string*)>;
+    using MallocTrimFn = std::function<int(size_t)>;
     using DurableFinalizeCallback =
         std::function<void(const OpLogEntry& durable_entry)>;
     using BatchOpLogWriterFactory =
@@ -2050,6 +2058,8 @@ class MasterService {
     static constexpr uint64_t kNoFHeartbeatThreadSleepMs = 100;
     mutable std::mutex nof_probe_fn_mutex_;
     NoFProbeFn nof_probe_fn_;
+
+    MallocTrimFn malloc_trim_fn_;
 
     // if high availability features enabled
     const bool enable_ha_;
