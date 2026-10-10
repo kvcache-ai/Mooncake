@@ -538,16 +538,41 @@ class MooncakeStorePyWrapper {
 
     MooncakeStorePyWrapper() = default;
 
-    // Helper to initialize real client and register it
-    std::shared_ptr<RealClient> init_real_client() {
+    // A wrapper holds at most one native client. setup() and setup_dummy()
+    // are rejected while one is active, leaving it untouched; close()
+    // releases it so that a new setup is allowed.
+    std::optional<int> reject_if_set_up() const {
+        if (!store_) return std::nullopt;
+        LOG(ERROR) << "Store is already set up; call close() before setting "
+                      "it up again";
+        return static_cast<int>(ErrorCode::INVALID_PARAMS);
+    }
+
+    // Sets up a fresh RealClient and publishes it only if setup succeeds. On
+    // failure the client is torn down and the wrapper stays uninitialized, so
+    // the caller can retry.
+    template <typename SetupFn>
+    int setup_real_client(SetupFn &&setup) {
         auto &resource_tracker = ResourceTracker::getInstance();
         auto real_client = RealClient::create();
-        use_dummy_client_ = false;
-        store_ = real_client;
-        real_client_ = real_client;
         resource_tracker.registerInstance(
-            std::static_pointer_cast<PyClient>(store_));
-        return real_client;
+            std::static_pointer_cast<PyClient>(real_client));
+        int ret;
+        {
+            py::gil_scoped_release release;
+            auto result = setup(*real_client);
+            ret = result.has_value() ? 0 : static_cast<int>(result.error());
+            if (ret != 0) {
+                real_client->tearDownAll();
+                real_client.reset();
+            }
+        }
+        if (real_client) {
+            use_dummy_client_ = false;
+            store_ = real_client;
+            real_client_ = std::move(real_client);
+        }
+        return ret;
     }
 
     bool is_client_initialized() const {
@@ -2409,27 +2434,22 @@ PYBIND11_MODULE(store, m) {
                bool enable_client_http_server = false,
                int client_http_port = DEFAULT_CLIENT_HTTP_PORT,
                bool enable_embedded_master = false) {
-                auto real_client = self.init_real_client();
+                if (auto rejected = self.reject_if_set_up()) return *rejected;
                 std::shared_ptr<mooncake::TransferEngine> transfer_engine =
                     nullptr;
                 if (!engine.is_none()) {
                     transfer_engine =
                         engine.cast<std::shared_ptr<TransferEngine>>();
                 }
-                int ret;
-                {
-                    py::gil_scoped_release release;
-                    auto result = real_client->setup_internal(
+                return self.setup_real_client([&](RealClient &client) {
+                    return client.setup_internal(
                         local_hostname, metadata_server, global_segment_size,
                         local_buffer_size, protocol, rdma_devices,
                         master_server_addr, transfer_engine, "", 50052,
                         enable_ssd_offload, true, ssd_offload_path, tenant_id,
                         enable_client_http_server, client_http_port,
                         enable_embedded_master);
-                    ret = result.has_value() ? 0
-                                             : static_cast<int>(result.error());
-                }
-                return ret;
+                });
             },
             py::arg("local_hostname"), py::arg("metadata_server"),
             py::arg("global_segment_size"), py::arg("local_buffer_size"),
@@ -2443,7 +2463,7 @@ PYBIND11_MODULE(store, m) {
         .def(
             "setup",
             [](MooncakeStorePyWrapper &self, const py::dict &config_dict) {
-                auto real_client = self.init_real_client();
+                if (auto rejected = self.reject_if_set_up()) return *rejected;
 
                 // Convert py::dict to ConfigDict (all values as strings)
                 ConfigDict config;
@@ -2453,14 +2473,9 @@ PYBIND11_MODULE(store, m) {
                     config[key] = value;
                 }
 
-                int ret;
-                {
-                    py::gil_scoped_release release;
-                    auto result = real_client->setup_internal(config);
-                    ret = result.has_value() ? 0
-                                             : static_cast<int>(result.error());
-                }
-                return ret;
+                return self.setup_real_client([&](RealClient &client) {
+                    return client.setup_internal(config);
+                });
             },
             py::arg("config"),
             "Setup the store with a configuration dictionary.\n"
@@ -2487,16 +2502,25 @@ PYBIND11_MODULE(store, m) {
             "setup_dummy",
             [](MooncakeStorePyWrapper &self, size_t mem_pool_size,
                size_t local_buffer_size, const std::string &server_address) {
+                if (auto rejected = self.reject_if_set_up()) return *rejected;
                 auto &resource_tracker = ResourceTracker::getInstance();
-                self.use_dummy_client_ = true;
-                self.store_ = std::make_shared<DummyClient>();
-                self.real_client_.reset();
+                auto dummy_client = std::make_shared<DummyClient>();
                 resource_tracker.registerInstance(
-                    std::static_pointer_cast<PyClient>(self.store_));
+                    std::static_pointer_cast<PyClient>(dummy_client));
                 auto [ip, port] = parseHostNameWithPort(server_address);
-                return self.store_->setup_dummy(
+                int ret = dummy_client->setup_dummy(
                     mem_pool_size, local_buffer_size, server_address,
                     "@mooncake_client_" + std::to_string(port) + ".sock");
+                if (ret != 0) {
+                    // Tear down the unpublished client; the wrapper stays
+                    // uninitialized so the caller can retry.
+                    dummy_client->tearDownAll();
+                    return ret;
+                }
+                self.use_dummy_client_ = true;
+                self.store_ = std::move(dummy_client);
+                self.real_client_.reset();
+                return ret;
             },
             py::arg("mem_pool_size"), py::arg("local_buffer_size"),
             py::arg("server_address"))
@@ -2629,13 +2653,17 @@ PYBIND11_MODULE(store, m) {
             "no read leases. Returns list of results: 1 if existed at the "
             "time of the call, 0 if not exists, -1 if error. Objects may "
             "still be evicted before a subsequent get.")
-        .def("close",
-             [](MooncakeStorePyWrapper &self) {
-                 if (!self.store_) return 0;
-                 int rc = self.store_->tearDownAll();
-                 self.store_.reset();
-                 return rc;
-             })
+        .def(
+            "close",
+            [](MooncakeStorePyWrapper &self) {
+                int rc = self.store_ ? self.store_->tearDownAll() : 0;
+                self.store_.reset();
+                self.real_client_.reset();
+                self.use_dummy_client_ = false;
+                return rc;
+            },
+            "Close the store and clear the native client, including on "
+            "cleanup failure. A nonzero result is terminal, not retryable.")
         .def("health_check", &MooncakeStorePyWrapper::health_check,
              "Health check for store connectivity. "
              "Returns 0 if healthy, 1 if not initialized/closed, "

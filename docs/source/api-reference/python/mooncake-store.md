@@ -1064,12 +1064,21 @@ segment memory.
 **Returns:**
 - `int`: Status code (0 = success, non-zero = error code)
 
+**Lifecycle:** A store object holds one native client at a time. While it is
+set up, further `setup()` or `setup_dummy()` calls return `-600`
+(`INVALID_PARAMS`) and leave the active client unchanged; call `close()` first.
+If setup fails, the store stays uninitialized and can be set up again. Serialize
+setup and `close()` calls, and finish outstanding operations before `close()`.
+
 **Example:**
 
 <details>
 <summary>Click to expand: Setup examples for TCP and RDMA</summary>
 
 ```python
+# Alternatives: set up a store once, and call store.close() before setting it
+# up again.
+
 # TCP initialization
 store.setup("localhost", "http://localhost:8080/metadata", 1024*1024*1024, 128*1024*1024, "tcp", "", "localhost:50051")
 
@@ -1097,6 +1106,8 @@ def setup_dummy(self, mem_pool_size: int, local_buffer_size: int, server_address
 
 **Returns:**
 - `int`: Status code (0 = success, non-zero = error code)
+
+The lifecycle rules described under `setup()` also apply to `setup_dummy()`.
 
 **Example:**
 ```python
@@ -2101,6 +2112,11 @@ def close(self) -> int
 
 **Returns:**
 - `int`: Status code (0 = success, non-zero = error code)
+
+`close()` releases the native client even when cleanup fails, so a non-zero
+result is not retryable. Closing a store that is not set up returns `0`. After
+`close()`, the same store object can be set up again with `setup()` or
+`setup_dummy()`.
 
 **Example:**
 ```python
