@@ -274,8 +274,8 @@ class Transport {
             __atomic_fetch_add(&t->success_slice_count, 1, __ATOMIC_ACQ_REL);
             // Second CQ RMW: handshake word. success_slice_count stays for
             // getTransferStatus; packing both into one word is a follow-up.
-            const uint64_t state = __atomic_add_fetch(&t->completion_state, 1,
-                                                      __ATOMIC_ACQ_REL);
+            const uint64_t state =
+                __atomic_add_fetch(&t->completion_state, 1, __ATOMIC_ACQ_REL);
             finishIfComplete(t, state, false);
         }
 
@@ -283,8 +283,8 @@ class Transport {
             status = Slice::FAILED;
             TransferTask *t = task.load(std::memory_order_acquire);
             __atomic_fetch_add(&t->failed_slice_count, 1, __ATOMIC_ACQ_REL);
-            const uint64_t state = __atomic_add_fetch(&t->completion_state, 1,
-                                                      __ATOMIC_ACQ_REL);
+            const uint64_t state =
+                __atomic_add_fetch(&t->completion_state, 1, __ATOMIC_ACQ_REL);
             finishIfComplete(t, state, true);
         }
 
