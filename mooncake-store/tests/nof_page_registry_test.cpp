@@ -288,6 +288,36 @@ TEST_F(NofPageRegistryTest, UnregisterAllPropagatesPartialFailure) {
     EXPECT_EQ(fake_.Depth(reinterpret_cast<uintptr_t>(p1)), 0);
 }
 
+// The rollback path has the same unconfirmed-cleanup problem as the failing
+// page: if an earlier page's rollback unregister fails, its record must stay
+// charged — erasing it would let a later Register misread the leftover
+// backend state as -EBUSY/external.
+TEST_F(NofPageRegistryTest, RollbackFailureIsRetainedAndRetried) {
+    void* ptr = PageAddr(0);
+    const uintptr_t page0 = reinterpret_cast<uintptr_t>(ptr);
+    const uintptr_t page1 = page0 + kPage;
+    fake_.mark_fail_pages.insert(page1);        // page1: marks, then fails
+    fake_.fail_unregister_pages.insert(page0);  // page0's rollback fails
+
+    ASSERT_EQ(registry_.Register(owner_a_, ptr, 3 * kPage / 2),
+              ErrorCode::NOF_REGISTRATION_STUCK);
+    // page1's partial mark was cleaned up (its unregister succeeded);
+    // page0's rollback unregister failed, so it stays registered AND
+    // recorded.
+    EXPECT_EQ(fake_.Depth(page1), 0);
+    EXPECT_EQ(fake_.Depth(page0), 1);
+
+    // A same-range retry does not re-register the retained page.
+    const int register_calls_after = fake_.register_calls;
+    EXPECT_EQ(registry_.Register(owner_a_, ptr, 3 * kPage / 2), ErrorCode::OK);
+    EXPECT_EQ(fake_.register_calls, register_calls_after);
+
+    // Teardown retry releases the retained page once the backend recovers.
+    fake_.fail_unregister_pages.erase(page0);
+    EXPECT_EQ(registry_.Unregister(owner_a_, ptr), ErrorCode::OK);
+    EXPECT_EQ(fake_.Depth(page0), 0);
+}
+
 TEST_F(NofPageRegistryTest, UnregisterAllReleasesEverything) {
     void* p0 = PageAddr(0);
     void* p1 = PageAddr(1);

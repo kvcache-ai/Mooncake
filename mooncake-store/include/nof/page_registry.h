@@ -33,9 +33,10 @@ namespace mooncake {
 //     backstop).
 //
 // Failure semantics (SPDK v23.01.1 can leave partial state behind):
-//   - Register failure: pages this call bumped are rolled back, and the
-//     failing page itself is cleaned up via unregister_fn_. If that cleanup
-//     cannot be confirmed, the page and the owner range stay recorded and
+//   - Register failure: pages this call bumped are rolled back and the
+//     failing page itself is cleaned up via unregister_fn_. If any of those
+//     unregisters cannot be confirmed (failing page or a rollback page
+//     alike), the affected pages and the owner range stay recorded and
 //     NOF_REGISTRATION_STUCK is returned — callers must treat the range as
 //     still registered (quarantine; never munmap without a successful
 //     Unregister). A same-range retry does not re-call register_fn_ (a

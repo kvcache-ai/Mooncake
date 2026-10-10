@@ -46,42 +46,57 @@ ErrorCode NofPageRegistry::Register(void* owner, void* ptr, size_t size) {
             } else if (rc != 0) {
                 LOG(ERROR) << "page register failed: page="
                            << reinterpret_cast<void*>(page) << " rc=" << rc;
-                // Roll back the pages this call bumped.
+                // Roll back the pages this call bumped. A backend unregister
+                // failure here is the same unconfirmed-state problem as the
+                // failing page itself (SPDK v23.01.1 does not roll back a
+                // failed spdk_mem_register, and -EINVAL on unregister covers
+                // both "nothing marked" and "partially translated"), so keep
+                // the record charged instead of erasing it — otherwise a
+                // later Register would re-call register_fn_, get -EBUSY from
+                // the leftover state, and misclassify the page as external.
+                bool rollback_clean = true;
                 for (uintptr_t p : touched) {
                     auto& r = page_regs_[p];
-                    if (--r.count == 0) {
-                        unregister_fn_(reinterpret_cast<void*>(p), kPageSize);
+                    if (r.count > 1) {
+                        --r.count;  // other owners still hold the page
+                        continue;
+                    }
+                    if (unregister_fn_(reinterpret_cast<void*>(p), kPageSize) ==
+                        0) {
                         page_regs_.erase(p);
+                    } else {
+                        LOG(ERROR) << "rollback unregister failed: page="
+                                   << reinterpret_cast<void*>(p);
+                        rollback_clean = false;  // record kept, count stays 1
                     }
                 }
-                // The backend may have partially changed state for the
-                // FAILING page itself: spdk_mem_register() marks the range in
-                // g_mem_reg_map before running its notify callbacks and does
-                // not roll that back on failure (SPDK v23.01.1
-                // lib/env_dpdk/memory.c:370-384), and in iova=va it can
-                // already have installed the IOMMU mapping when a later step
-                // fails. Try to clean the failing page up.
-                if (unregister_fn_(reinterpret_cast<void*>(page), kPageSize) ==
-                    0) {
-                    // Cleanup confirmed: drop the entry created above and
-                    // report a plain failure — the caller may munmap safely.
+                // The failing page itself may hold partial state (see above):
+                // try to clean it up.
+                const bool failing_clean =
+                    unregister_fn_(reinterpret_cast<void*>(page), kPageSize) ==
+                    0;
+                if (failing_clean) {
+                    // Cleanup confirmed: drop the entry created above.
                     if (reg.count == 0 && !reg.external) {
                         page_regs_.erase(page);
                     }
+                } else {
+                    // Cleanup unconfirmed: keep the page charged to us.
+                    reg.count = 1;
+                }
+                if (failing_clean && rollback_clean) {
+                    // Everything this call touched is confirmed clean —
+                    // plain failure, the caller may munmap safely.
                     return ErrorCode::INTERNAL_ERROR;
                 }
-                // Cleanup cannot be confirmed (-EINVAL covers both "nothing
-                // was marked" and "marked but not fully translated", and the
-                // two cannot be told apart). Keep explicit bookkeeping: the
-                // page stays charged to us and the owner range is recorded,
-                // so a later Unregister/UnregisterAll retries the cleanup and
-                // the shm quarantine paths retain the mapping instead of
+                // Something could not be confirmed clean. Keep the owner
+                // range recorded so a later Unregister/UnregisterAll retries
+                // and the shm quarantine paths retain the mapping instead of
                 // munmapping a possibly-live translation. A same-range retry
                 // hits the "already covered" fast path above and does not
                 // re-call register_fn_ — deliberate: re-registering a page in
                 // this unknown state could return -EBUSY from the leftover
                 // translation and be misclassified as externally owned.
-                reg.count = 1;
                 registrations[ptr] = size;
                 return ErrorCode::NOF_REGISTRATION_STUCK;
             }
