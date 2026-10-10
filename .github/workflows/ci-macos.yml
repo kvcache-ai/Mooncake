@@ -1,0 +1,79 @@
+name: 'Build (macOS)'
+
+on:
+  push:
+    branches:
+      - "main"
+      - "release/**"
+    paths: &macos-paths
+      - 'mooncake-*/**'
+      - 'extern/**'
+      - 'cmake/**'
+      - 'CMakeLists.txt'
+      - '.github/workflows/ci-macos.yml'
+  pull_request:
+    branches:
+      - "main"
+      - "release/**"
+    types: [opened, synchronize, reopened]
+    paths: *macos-paths
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Only mooncake_master builds on macOS today (no RDMA/NUMA), so this job
+  # guards that target from Linux-only regressions.
+  build-master-macos:
+    runs-on: macos-15
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_INSTALL_CLEANUP: "1"
+      HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: "1"
+      BREW_PACKAGES: >-
+        ninja boost fmt gflags glog jsoncpp msgpack-cxx yaml-cpp xxhash zstd
+        openssl@3
+
+    steps:
+    # extern/pybind11 is required at configure time. Linux CI gets it from
+    # dependencies.sh, which this job does not run.
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+        submodules: recursive
+
+    # Cache downloaded bottles only. ImageVersion changes with the runner
+    # image, which also pins the formula versions (auto-update is off).
+    - name: Cache Homebrew downloads
+      uses: actions/cache@v4
+      with:
+        path: ~/Library/Caches/Homebrew/downloads
+        key: brew-${{ runner.os }}-${{ runner.arch }}-${{ env.ImageVersion }}-${{ env.BREW_PACKAGES }}
+        restore-keys: |
+          brew-${{ runner.os }}-${{ runner.arch }}-${{ env.ImageVersion }}-
+          brew-${{ runner.os }}-${{ runner.arch }}-
+
+    - name: Install dependencies
+      run: brew install $BREW_PACKAGES
+      shell: bash
+
+    - name: Configure
+      run: |
+        cmake -S . -B build -G Ninja \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DBUILD_UNIT_TESTS=OFF \
+          -DBUILD_EXAMPLES=OFF
+      shell: bash
+
+    - name: Build mooncake_master
+      run: cmake --build build --target mooncake_master --parallel "$(sysctl -n hw.ncpu)"
+      shell: bash
+
+    - name: Smoke test
+      run: ./build/mooncake-store/src/mooncake_master --version
+      shell: bash
