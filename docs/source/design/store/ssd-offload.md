@@ -129,6 +129,8 @@ Step by step:
 4. **Transfer data**: Remote restores use the Transfer Engine (RDMA or TCP). The same-process pinned branch submits H2D copies from the local restore arena and supports per-object source offsets for tensor payloads.
 5. **Release buffer**: Remote restores call `release_offload_buffer(batch_id)` and retain TTL GC as a failure fallback. A same-process allocation is held by an RAII owner through the synchronous H2D operation and released automatically on success or failure; it is never published in the remote batch map.
 
+**Zero-copy from a DAX arena.** When `OffsetAllocatorStorageBackend` maps a DAX arena with `MOONCAKE_OFFSET_DAX_ZERO_COPY` set, `FileStorage::Init` registers the whole mapping with the Transfer Engine (the backend exposes it through `ZeroCopyRegion()`). `FileStorage::BatchGet` then calls the backend's `BatchPin` instead of copying: each record's header and key are checked, its allocation handle is held, and the response pointers address the values inside the mapping. The pinned batch sits in the same batch map as a copied one, so `release_offload_buffer` and the lease GC release it the same way, and the RPC is unchanged. A held extent cannot be reused by the allocator even if its key is evicted or overwritten meanwhile. Pinned bytes are capped at `local_buffer_size`; over the cap, or if registration failed, `BatchGet` uses the copy path above.
+
 ---
 
 ## Storage Backends
