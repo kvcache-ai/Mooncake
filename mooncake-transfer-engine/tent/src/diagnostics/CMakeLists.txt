@@ -33,3 +33,11 @@ install(
   TARGETS tent_diagnostics
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib)
+
+# The installed diagnostics header includes the bundled JSON header, so both are
+# installed together.
+set(TENT_DIAGNOSTICS_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../include")
+install(FILES ${TENT_DIAGNOSTICS_INCLUDE_DIR}/tent/diagnostics/diagnostic.h
+        DESTINATION include/tent/diagnostics)
+install(FILES ${TENT_DIAGNOSTICS_INCLUDE_DIR}/tent/thirdparty/nlohmann/json.h
+        DESTINATION include/tent/thirdparty/nlohmann)
