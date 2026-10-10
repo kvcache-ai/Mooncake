@@ -20,10 +20,9 @@ The step itself is three windows, in the order a forward pass runs them:
 | `phase_sum` | the three windows added up | — |
 | `step_window` | one window over the whole step, from the first index call to the last layer | — |
 
-The index buffers are allocated once per case. Query and KV offsets are computed during setup, and
-each timed iteration refills only the CSR slot stream. SGLang also updates offsets for changing batches
-and its paged wrapper planning uses `non_blocking=True`; this replay calls `plan` with its default copy
-behavior. The windows therefore exclude some server metadata work and use a different planning path.
+The index buffers are allocated once per case, and each timed iteration refills only the CSR slot
+stream. SGLang also updates offsets for changing batches and plans its paged wrappers with
+`non_blocking=True`, so the windows exclude that metadata work and use `plan`'s default copy.
 
 `step_window` is the step as one span and `phase_sum` is the sum of its parts. A reader comparing them
 sees the between-window interval: what the three windows do not cover. The measurement does not say
@@ -40,18 +39,10 @@ own instead, and they are components rather than the schedule the step runs:
 | `attention_component` | the branch's attention path over every layer of the step, in one window, without the writes. What that path is depends on the branch: one ragged call, two wrapper calls and one `merge_state`, one paged prefill call, or one paged decode call. The merge branch's path is several calls per layer, so one component window holds more than one call per layer |
 | `kv_gather` | a read-only probe: the rows the branch's paged side reads (or the slots the step wrote, when it reads no paged KV), both K and V, moved with `index_select` and no arithmetic |
 
-`kv_write_component` holds one `set_kv_buffer` call per layer, and
-`attention_component` holds the branch's path per layer: one call for the ragged and paged branches,
-and several for the merge branch. A step of a model with L layers therefore holds L write calls and L
-per-layer attention paths.
-
-None of the three is added to the step. Each runs after the timed loop, in windows of its own, so no
-step iteration is ever timed with a probe inside it, and the wrappers are planned against the probe's
-own indices before those passes rather than inside them. Their ratio to `phase_sum` is recorded as a
-ratio rather than as a share of the step, because the step interleaves the two per layer and a
-component window can read above the window it belongs to: the loop holds a layer's attention and its
-KV write as the branch interleaves them, each component holds one of the two, and the interval the
-three step windows leave out is not a component of anything.
+None of the three is added to the step: each runs after the timed loop in a window of its own, and the
+wrappers are planned against the probe's own indices. Their ratio to `phase_sum` is recorded as a ratio
+rather than as a share, because the step interleaves the two per layer — the loop holds a layer's
+attention and its KV write, and each component holds one of the two.
 
 The step uses `ReqToTokenPool` for the token table, `TokenToKVPoolAllocator` at page size 1 or
 `PagedTokenToKVPoolAllocator` above it, and `MHATokenToKVPool` for the KV buffers.
