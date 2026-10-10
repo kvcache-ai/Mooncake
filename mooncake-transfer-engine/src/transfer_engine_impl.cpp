@@ -797,18 +797,24 @@ int TransferEngineImpl::registerLocalMemory(void* addr, size_t length,
 
 int TransferEngineImpl::unregisterLocalMemory(void* addr,
                                               bool update_metadata) {
-    // Best-effort: try every transport so one failure can't leave the region
-    // registered on the others; mirrors unregisterLocalMemoryBatch (#2869).
+    // A transport can skip a range while registration succeeds on the engine.
+    // Missing transport metadata must not retain the engine's reservation.
     int first_error = 0;
+    bool missing_on_transport = false;
     for (auto& transport : multi_transports_->listTransports()) {
         int ret = transport->unregisterLocalMemory(addr, update_metadata);
-        if (ret && !first_error) first_error = ret;
+        if (ret == ERR_ADDRESS_NOT_REGISTERED)
+            missing_on_transport = true;
+        else if (ret && !first_error)
+            first_error = ret;
     }
     if (first_error) return first_error;
 
     std::unique_lock<std::shared_mutex> lock(mutex_);
+    const bool registered =
+        local_memory_regions_.count(reinterpret_cast<uintptr_t>(addr)) != 0;
     eraseMemoryRegionLocked(addr);
-    return 0;
+    return missing_on_transport && !registered ? ERR_ADDRESS_NOT_REGISTERED : 0;
 }
 
 #ifdef ENABLE_MULTI_PROTOCOL
@@ -1001,17 +1007,26 @@ int TransferEngineImpl::registerLocalMemoryBatch(
 int TransferEngineImpl::unregisterLocalMemoryBatch(
     const std::vector<void*>& addr_list) {
     int first_error = 0;
+    bool missing_on_transport = false;
     for (auto transport : multi_transports_->listTransports()) {
         int ret = transport->unregisterLocalMemoryBatch(addr_list);
-        if (ret && !first_error) first_error = ret;
+        if (ret == ERR_ADDRESS_NOT_REGISTERED)
+            missing_on_transport = true;
+        else if (ret && !first_error)
+            first_error = ret;
     }
     if (first_error) return first_error;
 
     std::unique_lock<std::shared_mutex> lock(mutex_);
+    bool missing_on_engine = false;
     for (auto& addr : addr_list) {
+        missing_on_engine |=
+            local_memory_regions_.count(reinterpret_cast<uintptr_t>(addr)) == 0;
         eraseMemoryRegionLocked(addr);
     }
-    return 0;
+    return missing_on_transport && missing_on_engine
+               ? ERR_ADDRESS_NOT_REGISTERED
+               : 0;
 }
 
 bool TransferEngineImpl::hasOverlapLocked(uintptr_t addr,
