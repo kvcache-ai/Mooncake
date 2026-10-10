@@ -6,6 +6,7 @@ add_subdirectory(local_ssd)
 set(MOONCAKE_STORE_SHARED_SOURCES
     allocator_metric.cpp
     types.cpp
+    storage_device_metadata.cpp
     common/network.cpp
     thread_pool.cpp
     etcd_helper.cpp

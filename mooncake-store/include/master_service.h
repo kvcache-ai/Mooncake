@@ -37,6 +37,7 @@
 #include "mutex.h"
 #include "segment.h"
 #include "local_ssd/manager.h"
+#include "storage_device_metadata.h"
 #include "tenant_quota_ledger.h"
 #include "tenant_quota_sharded.h"
 #include "tenant_quota_policy_store.h"
@@ -308,6 +309,36 @@ class MasterService {
      */
     auto GetNoFSegmentsByName(const std::string& segment_name)
         -> tl::expected<std::vector<NoFSegmentOwnerInfo>, ErrorCode>;
+
+    /**
+     * @brief Cold-tier storage device inventory with derived health.
+     *
+     * Reports every mounted NoF segment as a storage device, combining mount
+     * status, allocator usage and heartbeat probe accounting into one health
+     * state. This is observability and maintenance tooling: it never runs on
+     * the allocation or transfer fast path.
+     */
+    tl::expected<std::vector<StorageDeviceMetadata>, ErrorCode>
+    ListStorageDevices() const;
+
+    /**
+     * @brief Derive recovery and GC candidates from the device inventory.
+     *
+     * Recovery candidates are devices whose data is at risk because probes are
+     * failing. GC candidates are devices that should have space reclaimed,
+     * either because they are nearly full or because they are leaving the
+     * cluster.
+     */
+    tl::expected<StorageDeviceMaintenancePlan, ErrorCode>
+    GetStorageDeviceMaintenancePlan() const;
+
+    /**
+     * @brief Ask the heartbeat thread to probe one device on its next tick
+     * instead of waiting for the scheduled probe time.
+     * @param device_id Mounted NoF segment id.
+     */
+    tl::expected<void, ErrorCode> RequestStorageDeviceProbe(
+        const UUID& device_id);
 
     /**
      * @brief Detailed information about a single segment.
@@ -2041,8 +2072,12 @@ class MasterService {
         std::chrono::steady_clock::time_point last_success_at{};
         uint32_t consecutive_failures{0};
         std::string last_error_reason;
+        // Reported through the device inventory. last_success_at stays a
+        // steady_clock value because the alive-timeout rule depends on it.
+        bool ever_probed{false};
+        int64_t last_success_unix_ms{-1};
     };
-    std::mutex nof_heartbeat_mutex_;
+    mutable std::mutex nof_heartbeat_mutex_;
     std::unordered_map<UUID, NoFHeartbeatState, boost::hash<UUID>>
         nof_heartbeat_states_;
     std::thread nof_heartbeat_thread_;
@@ -2050,6 +2085,25 @@ class MasterService {
     static constexpr uint64_t kNoFHeartbeatThreadSleepMs = 100;
     mutable std::mutex nof_probe_fn_mutex_;
     NoFProbeFn nof_probe_fn_;
+
+    // Reported device health is derived from the configured heartbeat failure
+    // threshold instead of a separate constant, so what operators see can never
+    // contradict the master's own unmount decision. The unmount rule itself is
+    // unchanged: it still uses the alive timeout measured from the last
+    // successful probe.
+    StorageDeviceHealthPolicy NoFDeviceHealthPolicy() const;
+    static constexpr double kStorageDeviceGcHighWatermark = 0.95;
+
+    /// Copy of the heartbeat accounting needed to report device health, taken
+    /// under nof_heartbeat_mutex_ so callers never hold two locks at once.
+    struct NoFHeartbeatReport {
+        bool ever_probed{false};
+        uint32_t consecutive_failures{0};
+        std::string last_error_reason;
+        int64_t last_success_unix_ms{-1};
+    };
+    std::unordered_map<UUID, NoFHeartbeatReport, boost::hash<UUID>>
+    SnapshotNoFHeartbeatReports() const;
 
     // if high availability features enabled
     const bool enable_ha_;

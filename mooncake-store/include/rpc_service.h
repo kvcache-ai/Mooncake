@@ -220,6 +220,18 @@ class WrappedMasterService {
     tl::expected<std::vector<MasterService::SegmentDetailInfo>, ErrorCode>
     GetSegmentsDetailForAdmin();
 
+    /// Cold-tier storage device inventory with derived health.
+    tl::expected<std::vector<StorageDeviceMetadata>, ErrorCode>
+    GetStorageDevicesForAdmin();
+
+    /// Recovery and GC candidates derived from the device inventory.
+    tl::expected<StorageDeviceMaintenancePlan, ErrorCode>
+    GetStorageDeviceMaintenancePlanForAdmin();
+
+    /// Schedule an immediate heartbeat probe for one device.
+    tl::expected<void, ErrorCode> ProbeStorageDeviceForAdmin(
+        const UUID& device_id);
+
     tl::expected<std::pair<uint64_t, uint64_t>, ErrorCode> QuerySegmentForAdmin(
         const std::string& segment);
 

@@ -47,6 +47,15 @@ struct MountedNoFSegmentSnapshot {
     SegmentStatus status;
 };
 
+/// Allocator usage of one mounted NoF segment, used for cold-tier device
+/// inventory reporting. Kept separate from MountedNoFSegmentSnapshot so the
+/// snapshot layout consumed by heartbeat and serialization stays unchanged.
+struct NoFSegmentUsage {
+    UUID segment_id{0, 0};
+    int64_t used_bytes = -1;  ///< -1 when no allocator is attached
+    int64_t capacity_bytes = 0;
+};
+
 /**
  * @brief Stream operator for MountedNoFSegmentSnapshot
  */
@@ -515,6 +524,15 @@ class NoFSegmentManager {
 
     void GetMountedSegmentsSnapshot(
         std::vector<MountedNoFSegmentSnapshot>& segments) const;
+
+    /**
+     * @brief Report allocator usage for every mounted NoF segment.
+     *
+     * Segments whose allocator has been removed (for example while they are
+     * being unmounted) fall back to the mounted segment size and report
+     * used_bytes as -1.
+     */
+    void GetSegmentUsages(std::vector<NoFSegmentUsage>& usages) const;
 
     /**
      * @brief Return current NoF usage derived from mounted allocators.
