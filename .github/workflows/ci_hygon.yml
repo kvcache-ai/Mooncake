@@ -95,7 +95,7 @@ jobs:
           bash dependencies.sh -y
           mkdir -p build
           cd build
-          cmake .. -DUSE_HTTP=ON -DCMAKE_BUILD_TYPE=Release
+          cmake .. -DUSE_HTTP=ON -DWITH_CONDUCTOR=ON -DCMAKE_BUILD_TYPE=Release
           cmake --build . -j"$(nproc)"
           cmake --install .
 

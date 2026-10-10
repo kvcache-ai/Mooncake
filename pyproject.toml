@@ -109,6 +109,7 @@ sdist.exclude = ["extern/yalantinglibs/.git"]
 BUILD_BENCHMARK = false
 BUILD_UNIT_TESTS = false
 USE_CUDA = false
+WITH_CONDUCTOR = true
 WITH_EP = false
 WITH_P2P_STORE = false
 WITH_STORE_GO = false
