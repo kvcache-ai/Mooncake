@@ -22,6 +22,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
 
@@ -452,6 +453,48 @@ static inline ssize_t writeFully(int fd, const void *buf, size_t len) {
     return len;
 }
 
+// writeFully variant for stream sockets. A peer that resets the connection
+// while we are mid-reply must turn into an EPIPE error here, not a SIGPIPE
+// that kills the whole process (the handshake daemon answers untrusted
+// peers, and the engine usually runs inside a larger host process).
+static inline ssize_t writeFullySocket(int fd, const void *buf, size_t len) {
+#ifdef SO_NOSIGPIPE
+    // macOS has no MSG_NOSIGNAL; disarm SIGPIPE on the socket instead.
+    // Idempotent, and handshake traffic is low-rate, so per-call is fine.
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+#endif
+#ifdef MSG_NOSIGNAL
+    constexpr int kSendFlags = MSG_NOSIGNAL;
+#else
+    constexpr int kSendFlags = 0;
+#endif
+    char *pos = (char *)buf;
+    size_t nbytes = len;
+    while (nbytes) {
+        ssize_t rc = send(fd, pos, nbytes, kSendFlags);
+        if (rc < 0 && errno == EINTR)
+            continue;
+        else if (rc < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            // A blocking socket only reports EAGAIN once SO_SNDTIMEO fires;
+            // retrying here would spin forever, so fail the write instead.
+            LOG(WARNING) << "Socket write timed out: expected " << len
+                         << " bytes, actual " << len - nbytes << " bytes";
+            return len - nbytes;
+        } else if (rc < 0) {
+            PLOG(ERROR) << "Socket write failed";
+            return rc;
+        } else if (rc == 0) {
+            LOG(WARNING) << "Socket write incompleted: expected " << len
+                         << " bytes, actual " << len - nbytes << " bytes";
+            return len - nbytes;
+        }
+        pos += rc;
+        nbytes -= rc;
+    }
+    return len;
+}
+
 static inline ssize_t readFully(int fd, void *buf, size_t len) {
     // Set a timeout for read to avoid hanging forever.
     constexpr std::chrono::seconds kReadTimeout = std::chrono::seconds(300);
@@ -496,13 +539,14 @@ static inline int writeString(int fd, const HandShakeRequestType type,
     uint64_t length =
         str.size() +
         (type == HandShakeRequestType::OldProtocol ? 0 : sizeof(byte));
-    if (writeFully(fd, &length, sizeof(length)) != (ssize_t)sizeof(length))
+    if (writeFullySocket(fd, &length, sizeof(length)) !=
+        (ssize_t)sizeof(length))
         return ERR_SOCKET;
     if (type != HandShakeRequestType::OldProtocol) {
-        if (writeFully(fd, &byte, sizeof(byte)) != (ssize_t)sizeof(byte))
+        if (writeFullySocket(fd, &byte, sizeof(byte)) != (ssize_t)sizeof(byte))
             return ERR_SOCKET;
     }
-    if (writeFully(fd, str.data(), str.size()) != (ssize_t)str.size())
+    if (writeFullySocket(fd, str.data(), str.size()) != (ssize_t)str.size())
         return ERR_SOCKET;
     return 0;
 }
@@ -539,6 +583,37 @@ static inline size_t loadHandshakeMaxLength() {
 static inline size_t getHandshakeMaxLength() {
     static size_t max_length = loadHandshakeMaxLength();
     return max_length;
+}
+
+// Constants for the handshake daemon's pending-notify bound.
+constexpr size_t kDefaultHandshakeMaxNotifyEntries = 1024;
+constexpr size_t kMaxHandshakeMaxNotifyEntries = 1ULL << 20;
+
+// Load the pending-notify bound from the environment variable.
+static inline size_t loadHandshakeMaxNotifyEntries() {
+    const char *env = std::getenv("MC_HANDSHAKE_MAX_NOTIFY_ENTRIES");
+    if (env != nullptr) {
+        std::string_view env_sv(env);
+        size_t val = 0;
+        auto [ptr, ec] =
+            std::from_chars(env_sv.data(), env_sv.data() + env_sv.size(), val);
+        if (ec == std::errc() && ptr == env_sv.data() + env_sv.size() &&
+            val >= 1 && val <= kMaxHandshakeMaxNotifyEntries) {
+            LOG(INFO) << "MC_HANDSHAKE_MAX_NOTIFY_ENTRIES set to " << val;
+            return val;
+        }
+        LOG(WARNING) << "Invalid MC_HANDSHAKE_MAX_NOTIFY_ENTRIES value: " << env
+                     << ", valid range: 1 to " << kMaxHandshakeMaxNotifyEntries
+                     << ", using default " << kDefaultHandshakeMaxNotifyEntries;
+    }
+    return kDefaultHandshakeMaxNotifyEntries;
+}
+
+// Get the pending-notify bound.
+// Loaded once from MC_HANDSHAKE_MAX_NOTIFY_ENTRIES at first call.
+static inline size_t getHandshakeMaxNotifyEntries() {
+    static size_t max_entries = loadHandshakeMaxNotifyEntries();
+    return max_entries;
 }
 
 static inline std::pair<HandShakeRequestType, std::string> readString(int fd) {

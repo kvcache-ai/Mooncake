@@ -138,7 +138,8 @@ target_link_libraries(rdma_endpoint_reestablish_test PUBLIC transfer_engine
 if(UNIX AND NOT APPLE)
   target_link_options(
     rdma_endpoint_reestablish_test PRIVATE "-Wl,--wrap=ibv_modify_qp"
-    "-Wl,--wrap=ibv_query_gid" "-Wl,--wrap=_ibv_query_gid_ex")
+    "-Wl,--wrap=ibv_query_qp" "-Wl,--wrap=ibv_query_gid"
+    "-Wl,--wrap=_ibv_query_gid_ex")
 endif()
 add_test(NAME rdma_endpoint_reestablish_test
          COMMAND rdma_endpoint_reestablish_test)
@@ -569,3 +570,8 @@ if(USE_NCCL_DEVICE AND NOT USE_CXI)
     endif()
   endif()
 endif()
+
+add_executable(batch_counter_wait_test ${WORKSPACE}/batch_counter_wait_test.cpp)
+target_link_libraries(batch_counter_wait_test PUBLIC transfer_engine gtest
+                                                     gtest_main)
+add_test(NAME batch_counter_wait_test COMMAND batch_counter_wait_test)

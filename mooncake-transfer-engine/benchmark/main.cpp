@@ -262,7 +262,7 @@ int processBatchSizes(
         printStats(block_size, batch_size, stats, num_threads);
     auto target_report = calculateTargetMetrics(
         block_size, batch_size, num_threads, XferBenchConfig::backend,
-        XferBenchConfig::op_type, &target_stats);
+        mixed_opcode ? "mix" : XferBenchConfig::op_type, &target_stats);
     if (runner.getTargetCount() > 1) printTargetMetrics(target_report);
     if (!XferBenchConfig::result_output_jsonl.empty()) {
         std::string error;
