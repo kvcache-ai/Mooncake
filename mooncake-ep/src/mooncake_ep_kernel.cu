@@ -223,6 +223,9 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
 
                 // Increase counter after finishing
                 __syncwarp();
+#ifdef MOONCAKE_EP_USE_MUSA
+                mc_fence_noflush();
+#endif
                 lane_id == 0 ?
 #ifdef MOONCAKE_EP_USE_MUSA
                     mc_atomic_add_relaxed(atomic_finish_counter_per_expert + dst_expert_idx, 1) : 0;

@@ -127,6 +127,12 @@ __device__ __forceinline__ void mc_grid_sync() {}
 // ---------------------------------------------------------------------------
 __device__ __forceinline__ void mc_fence() { __threadfence_system(); }
 
+// System-scope ordering without forcing a cache flush. This is sufficient
+// before publishing a local completion counter after P2P payload stores.
+__device__ __forceinline__ void mc_fence_noflush() {
+    __threadfence_system_noflush();
+}
+
 // ---------------------------------------------------------------------------
 // Fence/barrier/fence: ensures all threads' writes are globally visible
 // before any thread proceeds.  On MUSA, __syncthreads() does NOT imply a
