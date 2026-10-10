@@ -81,6 +81,11 @@ class RdmaTransportTestPeer {
         transport.conf_ = std::make_shared<Config>();
     }
 
+    static void setBatchPolicy(RdmaTransport& transport,
+                               const std::string& policy) {
+        transport.conf_->set("transports/rdma/batch_allocation_policy", policy);
+    }
+
     static void bindMetadata(RdmaTransport& transport,
                              std::shared_ptr<ControlService> metadata) {
         transport.metadata_ = std::move(metadata);
@@ -1003,6 +1008,25 @@ std::vector<uint64_t> walkPlan(const RdmaSlicePlan& plan, uint64_t length) {
         offset += n;
     }
     return lengths;
+}
+
+TEST(RdmaBatchPolicyTest, StartupConfigurationAndDefault) {
+    using Policy = DeviceSelector::BatchAllocationPolicy;
+    for (const auto& item : std::vector<std::pair<std::string, Policy>>{
+             {"", Policy::InverseScore},
+             {"inverse_score", Policy::InverseScore},
+             {"virtual_load", Policy::VirtualLoad},
+             {"unknown", Policy::InverseScore}}) {
+        RdmaTransport transport;
+        RdmaTransportTestPeer::bindTopology(transport,
+                                            std::make_shared<Topology>());
+        if (!item.first.empty())
+            RdmaTransportTestPeer::setBatchPolicy(transport, item.first);
+        auto workers = RdmaTransportTestPeer::makeWorkers(transport);
+        const auto& params =
+            workers->getDeviceSelector()->getSchedulingParams();
+        EXPECT_EQ(params.batch_allocation_policy, item.second);
+    }
 }
 
 // The whole contract, over a sweep of lengths against both caps: the slices
