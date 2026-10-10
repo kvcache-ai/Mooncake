@@ -61,6 +61,12 @@ class TransferEnginePy {
     int initialize(const char *local_hostname, const char *metadata_server,
                    const char *protocol, const char *device_name);
 
+    // Must be called on a fresh engine; never mutates process environment.
+    int initializeWithAscendResourceConfig(const char *local_hostname,
+                                           const char *metadata_server,
+                                           const char *device_name,
+                                           const std::string &resource_config);
+
     int initializeExt(const char *local_hostname, const char *metadata_server,
                       const char *protocol, const char *device_name,
                       const char *metadata_type);
@@ -262,6 +268,7 @@ class TransferEnginePy {
 
    private:
     std::shared_ptr<TransferEngine> engine_;
+    std::string ascend_resource_config_;
     Transport *xport_;
 
     std::mutex mutex_;

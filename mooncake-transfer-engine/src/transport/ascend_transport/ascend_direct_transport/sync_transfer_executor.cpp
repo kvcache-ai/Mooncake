@@ -20,6 +20,12 @@
 #include "common.h"
 #include "transfer_metadata.h"
 
+// Optional audit hooks. Undefined weak symbols leave normal behavior unchanged.
+extern "C" uint64_t mc_qos_audit_begin(int) __attribute__((weak));
+extern "C" void mc_qos_audit_desc(uint64_t, uint64_t, uint64_t, uint64_t)
+    __attribute__((weak));
+extern "C" void mc_qos_audit_end(uint64_t, int) __attribute__((weak));
+
 namespace mooncake {
 namespace {
 constexpr int32_t kDefaultDisconnectTime = 1000;
@@ -71,9 +77,19 @@ TransferExecutorBase::ExecuteResult SyncTransferExecutor::execute(
         op_descs.emplace_back(op_desc);
     }
 
+    uint64_t audit_id = 0;
+    if (mc_qos_audit_begin && mc_qos_audit_desc && mc_qos_audit_end) {
+        audit_id = mc_qos_audit_begin(operation == adxl::READ ? 0 : 1);
+        for (const auto& desc : op_descs) {
+            mc_qos_audit_desc(audit_id, desc.local_addr, desc.remote_addr,
+                              desc.len);
+        }
+    }
     auto status =
         engine->TransferSync(target_adxl_engine_name.c_str(), operation,
                              op_descs, params_.transfer_timeout);
+
+    if (audit_id) mc_qos_audit_end(audit_id, static_cast<int>(status));
 
     if (status != adxl::SUCCESS) {
         if (!params_.auto_connect) {

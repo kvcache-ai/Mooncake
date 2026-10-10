@@ -556,8 +556,9 @@ Status MultiTransport::getBatchTransferStatus(BatchID batch_id,
     return Status::OK();
 }
 
-Transport* MultiTransport::installTransport(const std::string& proto,
-                                            std::shared_ptr<Topology> topo) {
+Transport* MultiTransport::installTransport(
+    const std::string& proto, std::shared_ptr<Topology> topo,
+    const std::string& ascend_resource_config) {
 #ifdef USE_NCCL_HOST
     if ((proto == "nccl" && !transport_map_.empty()) ||
         (proto != "nccl" && transport_map_.count("nccl") != 0)) {
@@ -607,7 +608,7 @@ Transport* MultiTransport::installTransport(const std::string& proto,
 #endif
 #ifdef USE_ASCEND_DIRECT
     else if (std::string(proto) == "ascend") {
-        transport = new AscendDirectTransport();
+        transport = new AscendDirectTransport(ascend_resource_config);
     }
 #endif
 #ifdef USE_ASCEND

@@ -108,7 +108,11 @@ static std::string loadTopologyJsonFile(const std::string& path) {
 int TransferEngineImpl::init(const std::string& metadata_conn_string,
                              const std::string& local_server_name,
                              const std::string& ip_or_host_name,
-                             uint64_t rpc_port) {
+                             uint64_t rpc_port,
+                             const std::string& ascend_resource_config) {
+#ifndef USE_ASCEND_DIRECT
+    if (!ascend_resource_config.empty()) return ERR_INVALID_ARGUMENT;
+#endif
     TransferMetadata::RpcMetaDesc desc;
     std::string rpc_binding_method;
 
@@ -274,8 +278,8 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
 #endif
 
 #if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)
-    Transport* ascend_transport =
-        multi_transports_->installTransport("ascend", local_topology_);
+    Transport* ascend_transport = multi_transports_->installTransport(
+        "ascend", local_topology_, ascend_resource_config);
     if (!ascend_transport) {
         LOG(ERROR) << "Failed to install Ascend transport";
         return -1;
@@ -333,8 +337,8 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
 #endif
 
 #ifdef USE_ASCEND_HETEROGENEOUS
-        Transport* ascend_transport =
-            multi_transports_->installTransport("ascend", local_topology_);
+        Transport* ascend_transport = multi_transports_->installTransport(
+            "ascend", local_topology_, ascend_resource_config);
         if (!ascend_transport) {
             LOG(ERROR) << "Failed to install Ascend transport";
             return -1;

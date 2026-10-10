@@ -129,19 +129,29 @@ int TransferEngine::init(const std::string& metadata_conn_string,
                          const std::string& local_server_name,
                          const std::string& ip_or_host_name,
                          uint64_t rpc_port) {
-    const int result = impl_->init(metadata_conn_string, local_server_name,
-                                   ip_or_host_name, rpc_port);
-    if (result == 0) metadata_conn_string_ = metadata_conn_string;
-    return result;
+    return init(metadata_conn_string, local_server_name, ip_or_host_name,
+                rpc_port, "");
 }
 
 int TransferEngine::init(const std::string& metadata_conn_string,
                          const std::string& local_server_name,
                          const std::string& ip_or_host_name, uint64_t rpc_port,
                          const std::string& protocol) {
-    (void)protocol;
     return init(metadata_conn_string, local_server_name, ip_or_host_name,
-                rpc_port);
+                rpc_port, protocol, "");
+}
+
+int TransferEngine::init(const std::string& metadata_conn_string,
+                         const std::string& local_server_name,
+                         const std::string& ip_or_host_name, uint64_t rpc_port,
+                         const std::string& protocol,
+                         const std::string& ascend_resource_config) {
+    (void)protocol;
+    const int result =
+        impl_->init(metadata_conn_string, local_server_name, ip_or_host_name,
+                    rpc_port, ascend_resource_config);
+    if (result == 0) metadata_conn_string_ = metadata_conn_string;
+    return result;
 }
 
 int TransferEngine::freeEngine() {
@@ -671,13 +681,27 @@ int TransferEngine::init(const std::string& metadata_conn_string,
                          const std::string& local_server_name,
                          const std::string& ip_or_host_name, uint64_t rpc_port,
                          const std::string& protocol) {
+    return init(metadata_conn_string, local_server_name, ip_or_host_name,
+                rpc_port, protocol, "");
+}
+
+int TransferEngine::init(const std::string& metadata_conn_string,
+                         const std::string& local_server_name,
+                         const std::string& ip_or_host_name, uint64_t rpc_port,
+                         const std::string& protocol,
+                         const std::string& ascend_resource_config) {
     if (!use_tent_) {
-        const int result = impl_->init(metadata_conn_string, local_server_name,
-                                       ip_or_host_name, rpc_port);
+        const int result =
+            impl_->init(metadata_conn_string, local_server_name,
+                        ip_or_host_name, rpc_port, ascend_resource_config);
         if (result == 0) metadata_conn_string_ = metadata_conn_string;
         return result;
     } else {
         auto config = buildTentConfig(metadata_conn_string, local_server_name);
+        if (!ascend_resource_config.empty()) {
+            config->set("transports/ascend_direct/global_resource_config",
+                        ascend_resource_config);
+        }
         if (protocol == "tcp") {
             mooncake::tent::ConfigHelper::forceTcp(*config);
             if (!std::getenv("MC_FORCE_TCP")) {

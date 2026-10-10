@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -27,6 +28,7 @@
 #include <unordered_map>
 
 #include "tent/common/config.h"
+#include "tent/runtime/platform.h"
 #include "tent/runtime/transfer_engine_impl.h"
 
 #ifndef _WIN32
@@ -633,11 +635,17 @@ TEST(TransferEngineConfigOverrideTest,
     TransferEngineImpl engine(config);
     ASSERT_TRUE(engine.available());
 
-    // Register a host buffer with an incompatible caller location. The
-    // probe classifies host memory as "cpu:N"; "segments:..." is an unknown
-    // type to TENT and must be ignored in favor of the probe.
+    // Register a host buffer with an incompatible caller location. Preserve
+    // the actual probe result, including the supported wildcard fallback
+    // when NUMA topology cannot be queried in a restricted container.
     constexpr size_t kBufSize = 4096;
     std::vector<char> buf(kBufSize, 0);
+    const auto probed = Platform::getLoader().getLocation(buf.data(), kBufSize);
+    ASSERT_FALSE(probed.empty());
+    const auto& expected_location = probed.front().location;
+    ASSERT_TRUE(expected_location == kWildcardLocation ||
+                expected_location.rfind("cpu:", 0) == 0)
+        << "unexpected host probe location '" << expected_location << "'";
     MemoryOptions options;
     options.location = "segments:4096:0,1";
     std::vector<void*> addrs = {buf.data()};
@@ -647,11 +655,10 @@ TEST(TransferEngineConfigOverrideTest,
     SegmentInfo info;
     ASSERT_TRUE(engine.getSegmentInfo(LOCAL_SEGMENT_ID, info).ok());
     ASSERT_EQ(info.buffers.size(), 1u);
-    // The buffer location must be the probed "cpu:..." form, NOT the
-    // caller-supplied "segments:..." string.
+    // The incompatible caller hint must not change the probed location.
     const auto& loc = info.buffers[0].location;
-    EXPECT_NE(loc.find("cpu"), std::string::npos)
-        << "expected probed cpu location, got '" << loc << "'";
+    EXPECT_EQ(loc, expected_location)
+        << "incompatible caller location must not overwrite the probe";
     EXPECT_EQ(loc.find("segments"), std::string::npos)
         << "caller 'segments:' must not leak into buffer location";
 
@@ -660,5 +667,86 @@ TEST(TransferEngineConfigOverrideTest,
 }
 
 }  // namespace
+TEST(TransferEngineConfigOverrideTest,
+     ExplicitAscendResourcesSurviveMcTentConf) {
+    EnvVarGuard conf_guard(
+        "MC_TENT_CONF",
+        R"({"transports":{"ascend_direct":{"enable":false,"global_resource_config":"{\"comm_resource_config.qos\":1}"}},"metrics":{"enabled":false}})");
+    for (int qos : {0, 3, 7}) {
+        auto config = std::make_shared<Config>();
+        config->set("metadata_type", "p2p");
+        config->set("local_segment_name", "qos-config-" + std::to_string(qos));
+        config->set("rpc_server_hostname", kLoopbackHostname);
+        config->set("rpc_server_port", 0);
+        configureTcpOnlyTransports(*config);
+        ConfigHelper::forceTcp(*config);
+        const auto resource = std::string("{\"comm_resource_config.qos\":") +
+                              std::to_string(qos) + "}";
+        config->set("transports/ascend_direct/global_resource_config",
+                    resource);
+        TransferEngineImpl engine(config);
+        ASSERT_TRUE(engine.available());
+        EXPECT_EQ(
+            config->get("transports/ascend_direct/global_resource_config", ""),
+            resource);
+        EXPECT_TRUE(config->get("transports/force_tcp", false));
+        EXPECT_FALSE(config->get("transports/ascend_direct/enable", true));
+    }
+}
+
+TEST(TransferEngineConfigOverrideTest,
+     ConcurrentAscendLaneConfigsStaySeparate) {
+    EnvVarGuard conf_guard("MC_TENT_CONF", R"({"metrics":{"enabled":false}})");
+    std::vector<std::future<std::pair<bool, std::string>>> results;
+    for (int qos : {0, 3, 7}) {
+        results.push_back(std::async(std::launch::async, [qos] {
+            auto config = std::make_shared<Config>();
+            config->set("metadata_type", "p2p");
+            config->set("local_segment_name",
+                        "qos-concurrent-" + std::to_string(qos));
+            config->set("rpc_server_hostname", kLoopbackHostname);
+            config->set("rpc_server_port", 0);
+            configureTcpOnlyTransports(*config);
+            ConfigHelper::forceTcp(*config);
+            const auto resource =
+                std::string("{\"comm_resource_config.qos\":") +
+                std::to_string(qos) + "}";
+            config->set("transports/ascend_direct/global_resource_config",
+                        resource);
+            TransferEngineImpl engine(config);
+            return std::make_pair(
+                engine.available(),
+                config->get("transports/ascend_direct/global_resource_config",
+                            ""));
+        }));
+    }
+    size_t index = 0;
+    for (int qos : {0, 3, 7}) {
+        const auto result = results[index++].get();
+        EXPECT_TRUE(result.first);
+        EXPECT_EQ(result.second, std::string("{\"comm_resource_config.qos\":") +
+                                     std::to_string(qos) + "}");
+    }
+}
+
+TEST(TransferEngineConfigOverrideTest, UnsetAscendResourcesKeepFileDefault) {
+    const std::string resource = R"({"comm_resource_config.qos":3})";
+    EnvVarGuard conf_guard(
+        "MC_TENT_CONF",
+        R"({"transports":{"ascend_direct":{"enable":false,"global_resource_config":"{\"comm_resource_config.qos\":3}"}},"metrics":{"enabled":false}})");
+    auto config = std::make_shared<Config>();
+    config->set("metadata_type", "p2p");
+    config->set("local_segment_name", "qos-fallback");
+    config->set("rpc_server_hostname", kLoopbackHostname);
+    config->set("rpc_server_port", 0);
+    configureTcpOnlyTransports(*config);
+    ConfigHelper::forceTcp(*config);
+    TransferEngineImpl engine(config);
+    ASSERT_TRUE(engine.available());
+    EXPECT_EQ(
+        config->get("transports/ascend_direct/global_resource_config", ""),
+        resource);
+}
+
 }  // namespace tent
 }  // namespace mooncake
