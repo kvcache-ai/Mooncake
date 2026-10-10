@@ -821,6 +821,9 @@ class Replica {
           status_(status),
           refcnt_(0) {}
 
+    // Process-wide and monotonic. Standby restores bump it past the max
+    // restored id and never roll back: a failed restore keeps the counter
+    // advanced so ids are never reused.
     inline static std::atomic<ReplicaID> next_id_{1};
 
     ReplicaID id_;

@@ -82,19 +82,34 @@ def _queued_send_progress_worker(ctx: MooncakePGWorkerContext) -> None:
         raise AssertionError("queued-send P2P test expects world_size=2")
     os.environ["MOONCAKE_P2P_CHUNK_SIZE"] = str(1 << 16)
     device = ctx.init_group()
-    pg.set_p2p_timeout_us(50_000)
 
+    # Allocate and rendezvous first, under the default 10 s timeout, so process
+    # startup skew and first-op connection setup stay out of the timed window.
+    ready = torch.ones((1,), dtype=torch.uint8, device=device)
     if ctx.rank == 0:
         large = torch.full((1 << 30,), 0x5A, dtype=torch.uint8, device=device)
         small = torch.full((1 << 20,), 0xA5, dtype=torch.uint8, device=device)
+        dist.recv(ready, src=1)
+    else:
+        large = torch.zeros((1 << 30,), dtype=torch.uint8, device=device)
+        small = torch.zeros((1 << 20,), dtype=torch.uint8, device=device)
+        dist.send(ready, dst=0)
+
+    # 200 ms stays far below the multi-second 1 GiB transfer, so a send that
+    # stops reporting progress (the #4496 regression) is still caught.
+    pg.set_p2p_timeout_us(200_000)
+
+    if ctx.rank == 0:
         large_work = dist.isend(large, dst=1)
         small_work = dist.isend(small, dst=1)
         large_work.wait()
         small_work.wait()
+        if not pg.get_local_success(large_work) or not pg.get_local_success(small_work):
+            raise AssertionError(
+                "queued sends failed locally: no-progress timeout fired"
+            )
         value = "sent"
     else:
-        large = torch.empty((1 << 30,), dtype=torch.uint8, device=device)
-        small = torch.empty((1 << 20,), dtype=torch.uint8, device=device)
         dist.recv(large, src=0)
         dist.recv(small, src=0)
         large_ok = torch.all(large == 0x5A).item()
