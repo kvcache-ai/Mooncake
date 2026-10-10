@@ -220,6 +220,32 @@ class WrappedMasterService {
     tl::expected<std::vector<MasterService::SegmentDetailInfo>, ErrorCode>
     GetSegmentsDetailForAdmin();
 
+    /// Cold-tier storage device inventory with derived health.
+    tl::expected<std::vector<StorageDeviceMetadata>, ErrorCode>
+    GetStorageDevicesForAdmin();
+
+    /// Recovery and GC candidates derived from the device inventory.
+    tl::expected<StorageDeviceMaintenancePlan, ErrorCode>
+    GetStorageDeviceMaintenancePlanForAdmin();
+
+    /// Schedule an immediate heartbeat probe for one device.
+    tl::expected<void, ErrorCode> ProbeStorageDeviceForAdmin(
+        const UUID& device_id);
+
+    tl::expected<void, ErrorCode> IsolateStorageDeviceForAdmin(
+        const UUID& device_id);
+
+    tl::expected<void, ErrorCode> UnisolateStorageDeviceForAdmin(
+        const UUID& device_id);
+
+    tl::expected<UUID, ErrorCode> DrainStorageDeviceForAdmin(
+        const UUID& device_id,
+        const std::vector<std::string>& target_segments = {},
+        uint32_t max_concurrency = 4);
+
+    tl::expected<QueryJobResponse, ErrorCode>
+    QueryStorageDeviceDrainStatusForAdmin(const UUID& device_id) const;
+
     tl::expected<std::pair<uint64_t, uint64_t>, ErrorCode> QuerySegmentForAdmin(
         const std::string& segment);
 
@@ -266,7 +292,8 @@ class WrappedMasterService {
     tl::expected<UUID, ErrorCode> CreateDrainJob(
         const CreateDrainJobRequest& request);
 
-    tl::expected<QueryJobResponse, ErrorCode> QueryDrainJob(const UUID& job_id);
+    tl::expected<QueryJobResponse, ErrorCode> QueryDrainJob(
+        const UUID& job_id) const;
 
     tl::expected<void, ErrorCode> CancelDrainJob(const UUID& job_id);
 

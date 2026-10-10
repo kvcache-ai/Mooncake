@@ -47,6 +47,15 @@ struct MountedNoFSegmentSnapshot {
     SegmentStatus status;
 };
 
+/// Allocator usage of one mounted NoF segment, used for cold-tier device
+/// inventory reporting. Kept separate from MountedNoFSegmentSnapshot so the
+/// snapshot layout consumed by heartbeat and serialization stays unchanged.
+struct NoFSegmentUsage {
+    UUID segment_id{0, 0};
+    int64_t used_bytes = -1;  ///< -1 when no allocator is attached
+    int64_t capacity_bytes = 0;
+};
+
 /**
  * @brief Stream operator for MountedNoFSegmentSnapshot
  */
@@ -292,6 +301,48 @@ class ScopedNoFSegmentAccess {
     ErrorCode QuerySegments(const std::string& segment, size_t& used,
                             size_t& capacity);
 
+    /**
+     * @brief Isolate a segment from new allocations (removes allocator from
+     * allocator manager and sets status to DRAINING). Existing buffers remain
+     * readable.
+     */
+    ErrorCode IsolateSegment(const UUID& segment_id);
+
+    /**
+     * @brief Restore an isolated segment to normal allocations (re-adds
+     * allocator and sets status to OK).
+     */
+    ErrorCode UnisolateSegment(const UUID& segment_id);
+
+    /**
+     * @brief Check if a NoF segment is allocatable (status OK, allocator
+     * registered and serving).
+     */
+    bool IsSegmentAllocatable(const std::string& segment_name) const;
+
+    /**
+     * @brief Check if a segment name exists in NoF segment manager.
+     */
+    bool ExistsSegmentName(const std::string& segment_name) const;
+
+    /**
+     * @brief Query the lifecycle status of a NoF segment by name.
+     */
+    ErrorCode GetSegmentStatusByName(const std::string& segment_name,
+                                     SegmentStatus& status) const;
+
+    /**
+     * @brief Update the lifecycle status of a NoF segment by name.
+     */
+    ErrorCode SetSegmentStatusByName(const std::string& segment_name,
+                                     SegmentStatus status);
+
+    /**
+     * @brief Get the client id by segment name for NoF segment.
+     */
+    ErrorCode GetClientIdBySegmentName(const std::string& segment_name,
+                                       UUID& client_id) const;
+
    private:
     NoFSegmentManager* nof_segment_manager_;
     std::unique_lock<std::shared_mutex> lock_;
@@ -515,6 +566,15 @@ class NoFSegmentManager {
 
     void GetMountedSegmentsSnapshot(
         std::vector<MountedNoFSegmentSnapshot>& segments) const;
+
+    /**
+     * @brief Report allocator usage for every mounted NoF segment.
+     *
+     * Segments whose allocator has been removed (for example while they are
+     * being unmounted) fall back to the mounted segment size and report
+     * used_bytes as -1.
+     */
+    void GetSegmentUsages(std::vector<NoFSegmentUsage>& usages) const;
 
     /**
      * @brief Return current NoF usage derived from mounted allocators.

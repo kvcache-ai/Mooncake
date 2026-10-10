@@ -684,6 +684,269 @@ curl -X POST "http://localhost:9003/api/v1/drain_jobs/cancel?job_id=00000000-000
 }
 ```
 
+### Storage Device Endpoints
+
+Cold-tier storage devices are the NVMe-oF (NoF) targets that back offloaded
+objects. These endpoints expose the device inventory, its derived health, and
+the maintenance actions that can be taken on a device.
+
+Device health is derived from NoF heartbeat probe accounting rather than
+stored, so it can never contradict the unmount decision the master makes on
+its own. With `nof_heartbeat_failures_threshold` set to `N`, a device is
+reported `DEGRADED` after `N/2` consecutive probe failures and `FAILED` after
+`N`.
+
+| Health | Meaning |
+| --- | --- |
+| `UNKNOWN` | Mounted but not probed yet |
+| `HEALTHY` | Probes succeeding |
+| `DEGRADED` | Consecutive probe failures below the unmount threshold |
+| `FAILED` | Probe failures reached the unmount threshold |
+| `UNMOUNTING` | Segment is draining out or being unmounted |
+
+A device that reaches `DEGRADED` is isolated automatically: its allocator is
+detached so that no new object lands on it, while the segment stays mounted
+and keeps being probed. The first successful probe returns it to service.
+Isolation never delays or replaces the alive-timeout unmount. Start the master
+with `--nof_auto_isolate_degraded_devices=false` to disable automatic
+isolation and keep health reporting only.
+
+A device is `schedulable` when it can still receive new allocations, that is
+when its segment is `OK` and it is neither isolated nor draining.
+
+#### `GET /api/v1/devices`
+List cold-tier storage devices with identity, capacity, health and probe
+statistics.
+
+**Method**: `GET`
+**Parameters**: `health` (query parameter, optional) - filter by health name,
+case-insensitive. One of `unknown`, `healthy`, `degraded`, `failed`,
+`unmounting`. An unrecognised value is rejected with HTTP `400`.
+
+**Example**:
+```bash
+curl "http://localhost:9003/api/v1/devices?health=degraded"
+```
+
+**Response Format**:
+```json
+{
+  "success": true,
+  "total_devices": 1,
+  "devices": [
+    {
+      "device_id": "3f2b8c1e-6d4a-4f7b-9c2e-8a1d5e0b7c64",
+      "name": "nof_seg_0",
+      "endpoint": "trtype:TCP adrfam:IPv4 traddr:127.0.0.1 trsvcid:4420",
+      "owner_client_id": "9a7c1e52-0b38-4d64-8f21-7c5e0a1b6d33",
+      "health": "DEGRADED",
+      "schedulable": false,
+      "isolated": true,
+      "draining": false,
+      "draining_job_id": "",
+      "capacity_bytes": 1099511627776,
+      "used_bytes": 137438953472,
+      "usage_percent": 12.5,
+      "consecutive_failures": 3,
+      "last_error": "completion_timeout",
+      "last_success_unix_ms": 1767225600000
+    }
+  ]
+}
+```
+
+**Fields**:
+- `health` (string): Derived health state, see the table above
+- `schedulable` (boolean): Whether the device can still receive new allocations
+- `isolated` (boolean): Whether the device is cordoned, automatically or by an operator
+- `draining` (boolean): Whether a drain job for this device is currently active
+- `draining_job_id` (string): UUID of the bound drain job, empty when there is none
+- `used_bytes` (integer): Bytes allocated on the device; `-1` when no allocator is attached
+- `usage_percent` (number): `used_bytes / capacity_bytes * 100`, `0` when either is unavailable
+- `consecutive_failures` (integer): Consecutive heartbeat probe failures
+- `last_error` (string): Reason of the most recent failed probe
+- `last_success_unix_ms` (integer): Last successful probe in ms since epoch; `-1` when never
+
+#### `GET /api/v1/devices/maintenance_plan`
+Return the derived maintenance work for the cold tier. The plan is computed on
+demand from the current device inventory; nothing is stored.
+
+**Method**: `GET`
+
+**Example**:
+```bash
+curl "http://localhost:9003/api/v1/devices/maintenance_plan"
+```
+
+**Response Format**:
+```json
+{
+  "success": true,
+  "recovery_candidate_count": 1,
+  "gc_candidate_count": 1,
+  "recovery_candidates": [
+    {
+      "device_id": "3f2b8c1e-6d4a-4f7b-9c2e-8a1d5e0b7c64",
+      "name": "nof_seg_0",
+      "reason": "probe_degraded"
+    }
+  ],
+  "gc_candidates": [
+    {
+      "device_id": "7c1d90ab-4e22-4b8f-a613-2f0c8b7d5e41",
+      "name": "nof_seg_1",
+      "reason": "draining"
+    }
+  ]
+}
+```
+
+**Reasons**:
+
+| Bucket | Reason | Meaning |
+| --- | --- | --- |
+| `recovery_candidates` | `probe_failed` | Health is `FAILED`; data on the device is at risk |
+| `recovery_candidates` | `probe_degraded` | Health is `DEGRADED`; the device is fenced and still mounted |
+| `recovery_candidates` | `device_isolated` | Cordoned by an operator with no active drain |
+| `gc_candidates` | `draining` | A drain job is migrating objects off the device |
+| `gc_candidates` | `unmounting` | Segment is draining out or being unmounted |
+| `gc_candidates` | `high_usage` | Used capacity reached the GC high watermark |
+
+#### `POST /api/v1/devices/probe`
+Request an immediate heartbeat probe instead of waiting for the next scheduled
+one. Fenced devices can be probed too, which is how an operator checks whether
+a cordoned device has recovered.
+
+**Method**: `POST`
+**Parameters**: `device_id` (query parameter) - UUID from `GET /api/v1/devices`
+
+**Example**:
+```bash
+curl -X POST "http://localhost:9003/api/v1/devices/probe?device_id=3f2b8c1e-6d4a-4f7b-9c2e-8a1d5e0b7c64"
+```
+
+**Success Response** (HTTP 200):
+```json
+{
+  "success": true,
+  "device_id": "3f2b8c1e-6d4a-4f7b-9c2e-8a1d5e0b7c64",
+  "error_code": 0,
+  "error_message": ""
+}
+```
+
+**Error Response** (unknown device, HTTP 404):
+```json
+{
+  "success": false,
+  "error_code": -1401,
+  "error_message": "SEGMENT_NOT_FOUND"
+}
+```
+
+#### `POST /api/v1/devices/isolate`
+Cordon a device so it stops receiving new allocations. The segment stays
+mounted and its objects stay readable. A manual cordon is not lifted
+automatically when probes recover; use the unisolate endpoint.
+
+**Method**: `POST`
+**Parameters**: `device_id` (query parameter, or JSON body field `device_id`)
+
+**Example**:
+```bash
+curl -X POST "http://localhost:9003/api/v1/devices/isolate?device_id=3f2b8c1e-6d4a-4f7b-9c2e-8a1d5e0b7c64"
+```
+
+**Success Response** (HTTP 200):
+```json
+{
+  "success": true,
+  "device_id": "3f2b8c1e-6d4a-4f7b-9c2e-8a1d5e0b7c64",
+  "error_code": 0,
+  "error_message": ""
+}
+```
+
+#### `POST /api/v1/devices/unisolate`
+Lift a cordon and re-register the allocator so the device takes new
+allocations again. Refused with HTTP `409` while a drain job for the device is
+still active, because returning a half-migrated device to service would undo
+the drain.
+
+**Method**: `POST`
+**Parameters**: `device_id` (query parameter, or JSON body field `device_id`)
+
+**Example**:
+```bash
+curl -X POST "http://localhost:9003/api/v1/devices/unisolate?device_id=3f2b8c1e-6d4a-4f7b-9c2e-8a1d5e0b7c64"
+```
+
+**Success Response** (HTTP 200): same shape as the isolate endpoint.
+
+#### `POST /api/v1/devices/drain`
+Migrate every object off a device so it can be removed safely. The device is
+cordoned first, then the existing drain job machinery runs over its segment.
+
+**Method**: `POST`
+**Content-Type**: `application/json; charset=utf-8`
+
+**Request Body**:
+```json
+{
+  "device_id": "3f2b8c1e-6d4a-4f7b-9c2e-8a1d5e0b7c64",
+  "target_segments": ["segment_1"],
+  "max_concurrency": 4
+}
+```
+
+**Fields**:
+- `device_id` (string, required): UUID from `GET /api/v1/devices`
+- `target_segments` (array of string, optional): Preferred destinations for migrated objects
+- `max_concurrency` (integer, optional): Maximum concurrently migrating objects. Defaults to `4`
+
+**Example**:
+```bash
+curl -X POST http://localhost:9003/api/v1/devices/drain \
+  -H "Content-Type: application/json" \
+  -d '{"device_id": "3f2b8c1e-6d4a-4f7b-9c2e-8a1d5e0b7c64", "max_concurrency": 4}'
+```
+
+**Success Response** (HTTP 200):
+```json
+{
+  "success": true,
+  "device_id": "3f2b8c1e-6d4a-4f7b-9c2e-8a1d5e0b7c64",
+  "job_id": "00000000-0000-0000-0000-000000000003",
+  "error_code": 0,
+  "error_message": ""
+}
+```
+
+**Error Responses**: HTTP `404` when the device is not mounted, HTTP `409`
+when it is already unmounting or already has an active drain job.
+
+#### `GET /api/v1/devices/drain_status`
+Query the drain job bound to a device. The response has the same shape as
+`GET /api/v1/drain_jobs/query`.
+
+**Method**: `GET`
+**Parameters**: `device_id` (query parameter) - UUID from `GET /api/v1/devices`
+
+**Example**:
+```bash
+curl "http://localhost:9003/api/v1/devices/drain_status?device_id=3f2b8c1e-6d4a-4f7b-9c2e-8a1d5e0b7c64"
+```
+
+**Error Response** (no drain bound to the device, HTTP 404):
+```json
+{
+  "success": false,
+  "error_code": -1402,
+  "error_message": "JOB_NOT_FOUND"
+}
+```
+
+
 ### Tenant Quota Endpoints
 
 Tenant quota policies limit how much memory each tenant may cache. These

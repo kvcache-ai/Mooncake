@@ -1446,6 +1446,106 @@ TEST_F(MasterAdminServerWithServiceTest, DrainJobFullLifecycle) {
     EXPECT_TRUE(query_parsed.success);
 }
 
+// -----------------------------------------------------------------------
+// GET /api/v1/devices, GET /api/v1/devices/maintenance_plan,
+// POST /api/v1/devices/probe
+//
+// This suite mounts a DRAM segment only, so the cold-tier device inventory is
+// expected to be empty. The tests pin the endpoint contract (shape, filtering
+// and error mapping); device health transitions are covered by
+// nof_heartbeat_test.cpp against a real MasterService.
+// -----------------------------------------------------------------------
+
+TEST_F(MasterAdminServerWithServiceTest, StorageDevicesEmptyInventory) {
+    auto resp = HttpGet("/api/v1/devices");
+    ASSERT_EQ(resp.http_status, 200) << resp.body;
+    EXPECT_NE(resp.body.find("\"success\":true"), std::string::npos)
+        << resp.body;
+    EXPECT_NE(resp.body.find("\"total_devices\":0"), std::string::npos)
+        << resp.body;
+}
+
+TEST_F(MasterAdminServerWithServiceTest, StorageDevicesHealthFilter) {
+    auto resp = HttpGet("/api/v1/devices?health=DEGRADED");
+    ASSERT_EQ(resp.http_status, 200) << resp.body;
+    EXPECT_NE(resp.body.find("\"total_devices\":0"), std::string::npos)
+        << resp.body;
+
+    // Filter parsing is case-insensitive, matching the enum name spelling.
+    EXPECT_EQ(HttpGet("/api/v1/devices?health=failed").http_status, 200);
+}
+
+TEST_F(MasterAdminServerWithServiceTest, StorageDevicesRejectsBadHealthFilter) {
+    auto resp = HttpGet("/api/v1/devices?health=NOT_A_STATE");
+    EXPECT_EQ(resp.http_status, 400) << resp.body;
+    EXPECT_NE(resp.body.find("Unknown health filter value"), std::string::npos)
+        << resp.body;
+}
+
+TEST_F(MasterAdminServerWithServiceTest, StorageDeviceMaintenancePlanEmpty) {
+    auto resp = HttpGet("/api/v1/devices/maintenance_plan");
+    ASSERT_EQ(resp.http_status, 200) << resp.body;
+    EXPECT_NE(resp.body.find("\"success\":true"), std::string::npos)
+        << resp.body;
+    EXPECT_NE(resp.body.find("\"recovery_candidate_count\":0"),
+              std::string::npos)
+        << resp.body;
+    EXPECT_NE(resp.body.find("\"gc_candidate_count\":0"), std::string::npos)
+        << resp.body;
+}
+
+TEST_F(MasterAdminServerWithServiceTest, StorageDeviceProbeRejectsMissingId) {
+    auto resp = HttpPostJson("/api/v1/devices/probe", "");
+    EXPECT_EQ(resp.http_status, 400) << resp.body;
+    EXPECT_NE(resp.body.find("Missing or invalid device_id"), std::string::npos)
+        << resp.body;
+}
+
+TEST_F(MasterAdminServerWithServiceTest, StorageDeviceProbeRejectsUnknownId) {
+    // Well-formed UUID that was never mounted as a NoF segment. UUIDs are
+    // serialized as "<first>-<second>" decimal words, matching job ids.
+    auto resp = HttpPostJson("/api/v1/devices/probe?device_id=1-2", "");
+    EXPECT_EQ(resp.http_status, 404) << resp.body;
+}
+
+TEST_F(MasterAdminServerWithServiceTest, StorageDeviceIsolateEndpointContract) {
+    auto bad_resp = HttpPostJson("/api/v1/devices/isolate", "");
+    EXPECT_EQ(bad_resp.http_status, 400);
+
+    auto unknown_resp =
+        HttpPostJson("/api/v1/devices/isolate?device_id=1-2", "");
+    EXPECT_EQ(unknown_resp.http_status, 404);
+}
+
+TEST_F(MasterAdminServerWithServiceTest,
+       StorageDeviceUnisolateEndpointContract) {
+    auto bad_resp = HttpPostJson("/api/v1/devices/unisolate", "");
+    EXPECT_EQ(bad_resp.http_status, 400);
+
+    auto unknown_resp =
+        HttpPostJson("/api/v1/devices/unisolate?device_id=1-2", "");
+    EXPECT_EQ(unknown_resp.http_status, 404);
+}
+
+TEST_F(MasterAdminServerWithServiceTest, StorageDeviceDrainEndpointContract) {
+    auto bad_resp =
+        HttpPostJson("/api/v1/devices/drain", R"({"device_id":""})");
+    EXPECT_EQ(bad_resp.http_status, 400);
+
+    auto unknown_resp =
+        HttpPostJson("/api/v1/devices/drain", R"({"device_id":"1-2"})");
+    EXPECT_EQ(unknown_resp.http_status, 404);
+}
+
+TEST_F(MasterAdminServerWithServiceTest,
+       StorageDeviceDrainStatusEndpointContract) {
+    auto bad_resp = HttpGet("/api/v1/devices/drain_status");
+    EXPECT_EQ(bad_resp.http_status, 400);
+
+    auto unknown_resp = HttpGet("/api/v1/devices/drain_status?device_id=1-2");
+    EXPECT_EQ(unknown_resp.http_status, 404);
+}
+
 // =========================================================================
 // Destructive / isolated tests that must run on their own server instance.
 // =========================================================================

@@ -1601,6 +1601,44 @@ WrappedMasterService::GetSegmentsDetailForAdmin() {
     return master_service_.GetSegmentsDetail();
 }
 
+tl::expected<std::vector<StorageDeviceMetadata>, ErrorCode>
+WrappedMasterService::GetStorageDevicesForAdmin() {
+    return master_service_.ListStorageDevices();
+}
+
+tl::expected<StorageDeviceMaintenancePlan, ErrorCode>
+WrappedMasterService::GetStorageDeviceMaintenancePlanForAdmin() {
+    return master_service_.GetStorageDeviceMaintenancePlan();
+}
+
+tl::expected<void, ErrorCode> WrappedMasterService::ProbeStorageDeviceForAdmin(
+    const UUID& device_id) {
+    return master_service_.RequestStorageDeviceProbe(device_id);
+}
+
+tl::expected<void, ErrorCode>
+WrappedMasterService::IsolateStorageDeviceForAdmin(const UUID& device_id) {
+    return master_service_.IsolateStorageDevice(device_id);
+}
+
+tl::expected<void, ErrorCode>
+WrappedMasterService::UnisolateStorageDeviceForAdmin(const UUID& device_id) {
+    return master_service_.UnisolateStorageDevice(device_id);
+}
+
+tl::expected<UUID, ErrorCode> WrappedMasterService::DrainStorageDeviceForAdmin(
+    const UUID& device_id, const std::vector<std::string>& target_segments,
+    uint32_t max_concurrency) {
+    return master_service_.DrainStorageDevice(device_id, target_segments,
+                                              max_concurrency);
+}
+
+tl::expected<QueryJobResponse, ErrorCode>
+WrappedMasterService::QueryStorageDeviceDrainStatusForAdmin(
+    const UUID& device_id) const {
+    return master_service_.QueryStorageDeviceDrainStatus(device_id);
+}
+
 tl::expected<std::pair<uint64_t, uint64_t>, ErrorCode>
 WrappedMasterService::QuerySegmentForAdmin(const std::string& segment) {
     return master_service_.QuerySegments(segment);
@@ -1754,7 +1792,7 @@ tl::expected<UUID, ErrorCode> WrappedMasterService::CreateDrainJob(
 }
 
 tl::expected<QueryJobResponse, ErrorCode> WrappedMasterService::QueryDrainJob(
-    const UUID& job_id) {
+    const UUID& job_id) const {
     return master_service_.QueryDrainJob(job_id);
 }
 
