@@ -2,52 +2,35 @@
 
 #include <gtest/gtest.h>
 
-#include <cstdlib>
-#include <optional>
-#include <string>
+#include "environ.h"
 
 namespace mooncake::test {
 namespace {
 
 class MasterMetadataConfigTest : public ::testing::Test {
    protected:
-    void SetUp() override {
-        if (const char* value = std::getenv("MC_METADATA_CLUSTER_ID")) {
-            original_ = value;
-        }
-        ASSERT_EQ(unsetenv("MC_METADATA_CLUSTER_ID"), 0);
+    MasterMetadataConfig Load() const {
+        return MasterMetadataConfig::FromEnvironment(Environ(source_));
     }
 
-    void TearDown() override {
-        if (original_.has_value()) {
-            EXPECT_EQ(setenv("MC_METADATA_CLUSTER_ID", original_->c_str(), 1),
-                      0);
-        } else {
-            EXPECT_EQ(unsetenv("MC_METADATA_CLUSTER_ID"), 0);
-        }
-    }
-
-    std::optional<std::string> original_;
+    MapEnvironSource source_;
 };
 
 TEST_F(MasterMetadataConfigTest, UsesDefaultPrefixWhenUnsetOrEmpty) {
-    const auto config = MasterMetadataConfig::FromEnvironment();
+    const auto config = Load();
     EXPECT_TRUE(config.cluster_id.empty());
     EXPECT_EQ(config.HttpMetadataPrefix(), "mooncake/");
 
-    ASSERT_EQ(setenv("MC_METADATA_CLUSTER_ID", "", 1), 0);
-    EXPECT_EQ(MasterMetadataConfig::FromEnvironment().HttpMetadataPrefix(),
-              "mooncake/");
+    source_.Set("MC_METADATA_CLUSTER_ID", "");
+    EXPECT_EQ(Load().HttpMetadataPrefix(), "mooncake/");
 }
 
 TEST_F(MasterMetadataConfigTest, PreservesClusterIdAndTrailingSlash) {
-    ASSERT_EQ(setenv("MC_METADATA_CLUSTER_ID", "team-a", 1), 0);
-    EXPECT_EQ(MasterMetadataConfig::FromEnvironment().HttpMetadataPrefix(),
-              "mooncake/team-a/");
+    source_.Set("MC_METADATA_CLUSTER_ID", "team-a");
+    EXPECT_EQ(Load().HttpMetadataPrefix(), "mooncake/team-a/");
 
-    ASSERT_EQ(setenv("MC_METADATA_CLUSTER_ID", "team-a/", 1), 0);
-    EXPECT_EQ(MasterMetadataConfig::FromEnvironment().HttpMetadataPrefix(),
-              "mooncake/team-a/");
+    source_.Set("MC_METADATA_CLUSTER_ID", "team-a/");
+    EXPECT_EQ(Load().HttpMetadataPrefix(), "mooncake/team-a/");
 }
 
 }  // namespace

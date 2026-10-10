@@ -12,11 +12,12 @@
 namespace mooncake {
 
 ClientAutoDiscoveryConfig ClientAutoDiscoveryConfig::FromEnvironment(
-    std::string_view protocol, bool device_names_configured) {
+    const Environ& env, std::string_view protocol,
+    bool device_names_configured) {
     using Variables = ClientAutoDiscoveryEnvironmentVariables;
     ClientAutoDiscoveryConfig config;
 
-    const auto raw_auto_discover = Environ::Read(Variables::MC_MS_AUTO_DISC);
+    const auto raw_auto_discover = env.GetTyped(Variables::MC_MS_AUTO_DISC);
     std::optional<bool> configured_auto_discover;
     if (raw_auto_discover) {
         try {
@@ -56,10 +57,10 @@ ClientAutoDiscoveryConfig ClientAutoDiscoveryConfig::FromEnvironment(
     return config;
 }
 
-void ClientAutoDiscoveryConfig::LoadFiltersFromEnvironment() {
+void ClientAutoDiscoveryConfig::LoadFiltersFromEnvironment(const Environ& env) {
     using Variables = ClientAutoDiscoveryEnvironmentVariables;
 
-    const auto raw_filters = Environ::Read(Variables::MC_MS_FILTERS);
+    const auto raw_filters = env.GetTyped(Variables::MC_MS_FILTERS);
     if (enabled) {
         if (raw_filters) {
             LOG(INFO) << "whitelist filters: " << *raw_filters;

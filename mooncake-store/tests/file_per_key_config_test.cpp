@@ -3,10 +3,9 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
-#include <array>
-#include <cstdlib>
-#include <optional>
 #include <string>
+
+#include "environ.h"
 
 namespace mooncake::test {
 namespace {
@@ -22,38 +21,23 @@ class FilePerKeyConfigTest : public ::testing::Test {
     void SetUp() override {
         original_logtostderr_ = FLAGS_logtostderr;
         FLAGS_logtostderr = true;
-        for (size_t i = 0; i < kVariables.size(); ++i) {
-            if (const char* value = std::getenv(kVariables[i])) {
-                original_[i] = value;
-            }
-        }
-        for (const char* name : kVariables) {
-            ASSERT_EQ(unsetenv(name), 0);
-        }
     }
 
-    void TearDown() override {
-        for (size_t i = 0; i < kVariables.size(); ++i) {
-            if (original_[i].has_value()) {
-                EXPECT_EQ(setenv(kVariables[i], original_[i]->c_str(), 1), 0);
-            } else {
-                EXPECT_EQ(unsetenv(kVariables[i]), 0);
-            }
-        }
-        FLAGS_logtostderr = original_logtostderr_;
+    void TearDown() override { FLAGS_logtostderr = original_logtostderr_; }
+
+    FilePerKeyConfig Load() const {
+        return FilePerKeyConfig::FromEnvironment(Environ(source_));
     }
+
+    MapEnvironSource source_;
 
    private:
-    inline static constexpr std::array<const char*, 3> kVariables = {
-        "MOONCAKE_OFFLOAD_FSDIR", "MOONCAKE_OFFLOAD_ENABLE_EVICTION",
-        "ENABLE_EVICTION"};
-    std::array<std::optional<std::string>, 3> original_;
     bool original_logtostderr_ = false;
 };
 
 TEST_F(FilePerKeyConfigTest, UnsetValuesKeepDefaults) {
     testing::internal::CaptureStderr();
-    const auto config = FilePerKeyConfig::FromEnvironment();
+    const auto config = Load();
     const auto diagnostics = testing::internal::GetCapturedStderr();
 
     EXPECT_EQ(config.fsdir, "file_per_key_dir");
@@ -65,9 +49,9 @@ TEST_F(FilePerKeyConfigTest, UnsetValuesKeepDefaults) {
 TEST_F(FilePerKeyConfigTest, ReadsDirectoryVerbatimWithoutValidation) {
     for (const char* value : {"", "   ", "relative/subdir", " /data "}) {
         SCOPED_TRACE(value);
-        ASSERT_EQ(setenv("MOONCAKE_OFFLOAD_FSDIR", value, 1), 0);
+        source_.Set("MOONCAKE_OFFLOAD_FSDIR", value);
         testing::internal::CaptureStderr();
-        const auto config = FilePerKeyConfig::FromEnvironment();
+        const auto config = Load();
         const auto diagnostics = testing::internal::GetCapturedStderr();
 
         EXPECT_EQ(config.fsdir, value);
@@ -123,9 +107,9 @@ TEST_F(FilePerKeyConfigTest, BothEvictionNamesKeepBoolParsingAndWarnings) {
         SCOPED_TRACE(name);
         for (const auto& entry : cases) {
             SCOPED_TRACE(entry.value);
-            ASSERT_EQ(setenv(name, entry.value, 1), 0);
+            source_.Set(name, entry.value);
             testing::internal::CaptureStderr();
-            const auto config = FilePerKeyConfig::FromEnvironment();
+            const auto config = Load();
             const auto diagnostics = testing::internal::GetCapturedStderr();
 
             EXPECT_EQ(config.enable_eviction, entry.enabled);
@@ -137,7 +121,7 @@ TEST_F(FilePerKeyConfigTest, BothEvictionNamesKeepBoolParsingAndWarnings) {
                     : "";
             EXPECT_EQ(diagnostics, expected);
         }
-        ASSERT_EQ(unsetenv(name), 0);
+        source_.Unset(name);
     }
 }
 
@@ -150,11 +134,10 @@ TEST_F(FilePerKeyConfigTest, PreferredEvictionNameOverridesLegacyValue) {
     const Case cases[] = {{"true", "false", false}, {"false", "true", true}};
     for (const auto& entry : cases) {
         SCOPED_TRACE(entry.preferred);
-        ASSERT_EQ(setenv("ENABLE_EVICTION", entry.legacy, 1), 0);
-        ASSERT_EQ(
-            setenv("MOONCAKE_OFFLOAD_ENABLE_EVICTION", entry.preferred, 1), 0);
+        source_.Set("ENABLE_EVICTION", entry.legacy);
+        source_.Set("MOONCAKE_OFFLOAD_ENABLE_EVICTION", entry.preferred);
         testing::internal::CaptureStderr();
-        const auto config = FilePerKeyConfig::FromEnvironment();
+        const auto config = Load();
         const auto diagnostics = testing::internal::GetCapturedStderr();
 
         EXPECT_EQ(config.enable_eviction, entry.enabled);
@@ -163,12 +146,12 @@ TEST_F(FilePerKeyConfigTest, PreferredEvictionNameOverridesLegacyValue) {
 }
 
 TEST_F(FilePerKeyConfigTest, InvalidPreferredValueFallsBackToLegacyValue) {
-    ASSERT_EQ(setenv("ENABLE_EVICTION", "false", 1), 0);
+    source_.Set("ENABLE_EVICTION", "false");
     for (const char* value : {"", "bad"}) {
         SCOPED_TRACE(value);
-        ASSERT_EQ(setenv("MOONCAKE_OFFLOAD_ENABLE_EVICTION", value, 1), 0);
+        source_.Set("MOONCAKE_OFFLOAD_ENABLE_EVICTION", value);
         testing::internal::CaptureStderr();
-        const auto config = FilePerKeyConfig::FromEnvironment();
+        const auto config = Load();
         const auto diagnostics = testing::internal::GetCapturedStderr();
 
         EXPECT_FALSE(config.enable_eviction);
@@ -180,10 +163,10 @@ TEST_F(FilePerKeyConfigTest, InvalidPreferredValueFallsBackToLegacyValue) {
 }
 
 TEST_F(FilePerKeyConfigTest, InvalidLegacyValueWarnsEvenWithValidPreferred) {
-    ASSERT_EQ(setenv("ENABLE_EVICTION", "bad", 1), 0);
-    ASSERT_EQ(setenv("MOONCAKE_OFFLOAD_ENABLE_EVICTION", "false", 1), 0);
+    source_.Set("ENABLE_EVICTION", "bad");
+    source_.Set("MOONCAKE_OFFLOAD_ENABLE_EVICTION", "false");
     testing::internal::CaptureStderr();
-    const auto config = FilePerKeyConfig::FromEnvironment();
+    const auto config = Load();
     const auto diagnostics = testing::internal::GetCapturedStderr();
 
     EXPECT_FALSE(config.enable_eviction);
@@ -193,10 +176,10 @@ TEST_F(FilePerKeyConfigTest, InvalidLegacyValueWarnsEvenWithValidPreferred) {
 }
 
 TEST_F(FilePerKeyConfigTest, InvalidAliasesWarnInLegacyFirstOrder) {
-    ASSERT_EQ(setenv("ENABLE_EVICTION", "bad", 1), 0);
-    ASSERT_EQ(setenv("MOONCAKE_OFFLOAD_ENABLE_EVICTION", "bad", 1), 0);
+    source_.Set("ENABLE_EVICTION", "bad");
+    source_.Set("MOONCAKE_OFFLOAD_ENABLE_EVICTION", "bad");
     testing::internal::CaptureStderr();
-    const auto config = FilePerKeyConfig::FromEnvironment();
+    const auto config = Load();
     const auto diagnostics = testing::internal::GetCapturedStderr();
 
     EXPECT_TRUE(config.enable_eviction);
@@ -208,16 +191,16 @@ TEST_F(FilePerKeyConfigTest, InvalidAliasesWarnInLegacyFirstOrder) {
 }
 
 TEST_F(FilePerKeyConfigTest, NewConfigsReadCurrentEnvironment) {
-    ASSERT_EQ(setenv("MOONCAKE_OFFLOAD_FSDIR", "first", 1), 0);
-    ASSERT_EQ(setenv("ENABLE_EVICTION", "false", 1), 0);
-    const auto first = FilePerKeyConfig::FromEnvironment();
-    ASSERT_EQ(setenv("MOONCAKE_OFFLOAD_FSDIR", "second", 1), 0);
-    ASSERT_EQ(setenv("MOONCAKE_OFFLOAD_ENABLE_EVICTION", "true", 1), 0);
-    const auto second = FilePerKeyConfig::FromEnvironment();
-    ASSERT_EQ(unsetenv("MOONCAKE_OFFLOAD_FSDIR"), 0);
-    ASSERT_EQ(unsetenv("MOONCAKE_OFFLOAD_ENABLE_EVICTION"), 0);
-    ASSERT_EQ(unsetenv("ENABLE_EVICTION"), 0);
-    const auto third = FilePerKeyConfig::FromEnvironment();
+    source_.Set("MOONCAKE_OFFLOAD_FSDIR", "first");
+    source_.Set("ENABLE_EVICTION", "false");
+    const auto first = Load();
+    source_.Set("MOONCAKE_OFFLOAD_FSDIR", "second");
+    source_.Set("MOONCAKE_OFFLOAD_ENABLE_EVICTION", "true");
+    const auto second = Load();
+    source_.Unset("MOONCAKE_OFFLOAD_FSDIR");
+    source_.Unset("MOONCAKE_OFFLOAD_ENABLE_EVICTION");
+    source_.Unset("ENABLE_EVICTION");
+    const auto third = Load();
 
     EXPECT_EQ(first.fsdir, "first");
     EXPECT_FALSE(first.enable_eviction);

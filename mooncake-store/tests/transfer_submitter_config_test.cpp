@@ -1,11 +1,11 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
-#include <cstdlib>
 #include <optional>
 #include <string>
 
 #include "../src/config/transfer_submitter_config.h"
+#include "environ.h"
 
 namespace mooncake {
 namespace {
@@ -13,33 +13,29 @@ namespace {
 class TransferSubmitterConfigTest : public ::testing::Test {
    protected:
     void SetUp() override {
-        if (const char* value = std::getenv("MC_STORE_MEMCPY")) {
-            original_ = value;
-        }
         google::InitGoogleLogging("TransferSubmitterConfigTest");
         original_logtostderr_ = FLAGS_logtostderr;
         FLAGS_logtostderr = true;
-        ASSERT_EQ(unsetenv("MC_STORE_MEMCPY"), 0);
     }
 
     void TearDown() override {
-        if (original_.has_value()) {
-            EXPECT_EQ(setenv("MC_STORE_MEMCPY", original_->c_str(), 1), 0);
-        } else {
-            EXPECT_EQ(unsetenv("MC_STORE_MEMCPY"), 0);
-        }
         FLAGS_logtostderr = original_logtostderr_;
         google::ShutdownGoogleLogging();
     }
 
+    TransferSubmitterConfig Load() const {
+        return TransferSubmitterConfig::FromEnvironment(Environ(source_));
+    }
+
+    MapEnvironSource source_;
+
    private:
-    std::optional<std::string> original_;
     bool original_logtostderr_ = false;
 };
 
 TEST_F(TransferSubmitterConfigTest, UnsetMeansAutomatic) {
     ::testing::internal::CaptureStderr();
-    const auto config = TransferSubmitterConfig::FromEnvironment();
+    const auto config = Load();
     const auto diagnostics = ::testing::internal::GetCapturedStderr();
 
     EXPECT_FALSE(config.memcpy_enabled_override.has_value());
@@ -71,9 +67,9 @@ TEST_F(TransferSubmitterConfigTest, PreservesLegacyTokensAndFallbacks) {
 
     for (const auto& test_case : cases) {
         SCOPED_TRACE(test_case.value);
-        ASSERT_EQ(setenv("MC_STORE_MEMCPY", test_case.value, 1), 0);
+        source_.Set("MC_STORE_MEMCPY", test_case.value);
         ::testing::internal::CaptureStderr();
-        const auto config = TransferSubmitterConfig::FromEnvironment();
+        const auto config = Load();
         const auto diagnostics = ::testing::internal::GetCapturedStderr();
 
         EXPECT_EQ(config.memcpy_enabled_override,
@@ -88,9 +84,9 @@ TEST_F(TransferSubmitterConfigTest, PreservesLegacyTokensAndFallbacks) {
 }
 
 TEST_F(TransferSubmitterConfigTest, InvalidValueWarningUsesLowercaseValue) {
-    ASSERT_EQ(setenv("MC_STORE_MEMCPY", "BAD", 1), 0);
+    source_.Set("MC_STORE_MEMCPY", "BAD");
     ::testing::internal::CaptureStderr();
-    const auto config = TransferSubmitterConfig::FromEnvironment();
+    const auto config = Load();
     const auto diagnostics = ::testing::internal::GetCapturedStderr();
 
     EXPECT_EQ(config.memcpy_enabled_override, std::optional<bool>{true});
@@ -100,12 +96,12 @@ TEST_F(TransferSubmitterConfigTest, InvalidValueWarningUsesLowercaseValue) {
 }
 
 TEST_F(TransferSubmitterConfigTest, NewConfigsReadCurrentEnvironment) {
-    ASSERT_EQ(setenv("MC_STORE_MEMCPY", "0", 1), 0);
-    const auto first = TransferSubmitterConfig::FromEnvironment();
-    ASSERT_EQ(setenv("MC_STORE_MEMCPY", "1", 1), 0);
-    const auto second = TransferSubmitterConfig::FromEnvironment();
-    ASSERT_EQ(unsetenv("MC_STORE_MEMCPY"), 0);
-    const auto third = TransferSubmitterConfig::FromEnvironment();
+    source_.Set("MC_STORE_MEMCPY", "0");
+    const auto first = Load();
+    source_.Set("MC_STORE_MEMCPY", "1");
+    const auto second = Load();
+    source_.Unset("MC_STORE_MEMCPY");
+    const auto third = Load();
 
     EXPECT_EQ(first.memcpy_enabled_override, std::optional<bool>{false});
     EXPECT_EQ(second.memcpy_enabled_override, std::optional<bool>{true});

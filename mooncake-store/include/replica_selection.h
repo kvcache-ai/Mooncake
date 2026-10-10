@@ -31,6 +31,7 @@
 
 #include "config/replica_selection_config.h"
 #include "replica.h"
+#include "environ.h"
 
 namespace mooncake {
 
@@ -82,7 +83,8 @@ inline double BuiltinRemoteReplicaScore(const Replica::Descriptor &r) {
 // scorer has been injected. Env is read once; the injected-scorer check is
 // live so tests / late injection take effect.
 inline bool RemoteReplicaScoringEnabled() {
-    static const auto config = ReplicaSelectionConfig::FromEnvironment();
+    static const auto config =
+        ReplicaSelectionConfig::FromEnvironment(Environ::Process());
     if (config.remote_scoring_enabled) return true;
     std::shared_lock lk(detail::ScorerMutex());
     return static_cast<bool>(detail::ScorerStorage());

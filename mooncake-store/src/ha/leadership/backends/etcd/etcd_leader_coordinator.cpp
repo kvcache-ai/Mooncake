@@ -11,6 +11,7 @@
 #include <glog/logging.h>
 #include <ylt/util/tl/expected.hpp>
 
+#include "environ.h"
 #include "types.h"
 #include "config/ha_cluster_namespace_config.h"
 
@@ -618,7 +619,8 @@ ClusterNamespace EtcdLeaderCoordinator::ResolveClusterNamespace(
         return cluster_namespace;
     }
 
-    return HaClusterNamespaceConfig::FromEnvironment().cluster_namespace;
+    return HaClusterNamespaceConfig::FromEnvironment(Environ::Process())
+        .cluster_namespace;
 }
 
 std::string EtcdLeaderCoordinator::BuildMasterViewKey(

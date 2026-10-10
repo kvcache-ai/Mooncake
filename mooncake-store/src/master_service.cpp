@@ -253,7 +253,8 @@ MasterService::MasterService(const MasterServiceConfig& config)
     // Initialize the HTTP metadata key prefix from its component-owned
     // startup configuration.
     http_metadata_prefix_ =
-        MasterMetadataConfig::FromEnvironment().HttpMetadataPrefix();
+        MasterMetadataConfig::FromEnvironment(Environ::Process())
+            .HttpMetadataPrefix();
     if (allocation_strategy_type_ == AllocationStrategyType::LOCAL_FIRST) {
         LOG(INFO) << "Local-first allocation strategy enabled";
     }
@@ -596,7 +597,8 @@ tl::expected<int, ErrorCode> MasterService::ExpandDfsShards(int shard_count) {
 
 void MasterService::InitDfsAllocatorFromEnvironment(
     const MasterServiceConfig& config) {
-    enable_dfs_ = DfsEnablementConfig::FromEnvironment().enabled;
+    enable_dfs_ =
+        DfsEnablementConfig::FromEnvironment(Environ::Process()).enabled;
     if (!enable_dfs_) return;
 
     if (config.enable_snapshot || config.enable_snapshot_restore ||
@@ -607,7 +609,8 @@ void MasterService::InitDfsAllocatorFromEnvironment(
             "DFS is incompatible with snapshot/oplog recovery");
     }
 
-    const auto dfs_config = DistributedStorageConfig::FromEnvironment();
+    const auto dfs_config =
+        DistributedStorageConfig::FromEnvironment(Environ::Process());
     if (!dfs_config.single_tenant) {
         LOG(ERROR) << "Currently, DFS backend is not supported in "
                       "multi-tenant mode";

@@ -7,6 +7,7 @@
 
 #include <glog/logging.h>
 
+#include "environ.h"
 #include "types.h"
 #include "config/ha_cluster_namespace_config.h"
 #include "ascii_string.h"
@@ -331,7 +332,8 @@ ClusterNamespace RedisSnapshotCatalogStore::ResolveClusterNamespace(
         return cluster_namespace;
     }
 
-    return HaClusterNamespaceConfig::FromEnvironment().cluster_namespace;
+    return HaClusterNamespaceConfig::FromEnvironment(Environ::Process())
+        .cluster_namespace;
 }
 
 std::string RedisSnapshotCatalogStore::BuildLatestKey(

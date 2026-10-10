@@ -8,10 +8,13 @@
 #include <utility>
 
 #include "../src/config/nof_debug_config.h"
+#include "environ.h"
 
 namespace mooncake {
 namespace {
 
+// Only for the *AtFirstUse() snapshot test, which reads the process
+// environment.
 class ScopedEnvironment {
    public:
     explicit ScopedEnvironment(const char* name) : name_(name) {
@@ -34,20 +37,27 @@ class ScopedEnvironment {
     std::optional<std::string> original_;
 };
 
-TEST(NoFDebugConfigTest, DefaultsWhenUnset) {
-    ScopedEnvironment enabled("MC_NOF_DEBUG");
-    ScopedEnvironment interval("MC_NOF_DEBUG_INTERVAL_MS");
-    const auto config = NoFDebugConfig::FromEnvironment();
+class NoFDebugConfigTest : public ::testing::Test {
+   protected:
+    NoFDebugConfig Load() const {
+        return NoFDebugConfig::FromEnvironment(Environ(source_));
+    }
+
+    MapEnvironSource source_;
+};
+
+TEST_F(NoFDebugConfigTest, DefaultsWhenUnset) {
+    const auto config = Load();
     EXPECT_FALSE(config.enabled);
     EXPECT_EQ(config.interval_ms, std::chrono::milliseconds{1000});
 }
 
-TEST(NoFDebugConfigTest, ExposesTheIntervalAsMilliseconds) {
+TEST_F(NoFDebugConfigTest, ExposesTheIntervalAsMilliseconds) {
     EXPECT_TRUE((std::is_same_v<decltype(NoFDebugConfig{}.interval_ms),
                                 std::chrono::milliseconds>));
 }
 
-TEST(NoFDebugConfigTest, EachSettingKeepsItsOwnFirstUseSnapshot) {
+TEST_F(NoFDebugConfigTest, EachSettingKeepsItsOwnFirstUseSnapshot) {
     ScopedEnvironment enabled("MC_NOF_DEBUG");
     ScopedEnvironment interval("MC_NOF_DEBUG_INTERVAL_MS");
     enabled.Set("yes");
@@ -63,47 +73,40 @@ TEST(NoFDebugConfigTest, EachSettingKeepsItsOwnFirstUseSnapshot) {
               std::chrono::milliseconds{7});
 }
 
-TEST(NoFDebugConfigTest, AcceptsOnlyLegacyTruthyTokens) {
-    ScopedEnvironment enabled("MC_NOF_DEBUG");
+TEST_F(NoFDebugConfigTest, AcceptsOnlyLegacyTruthyTokens) {
     for (const char* value : {"1", "TRUE", "Yes", "On"}) {
-        enabled.Set(value);
-        EXPECT_TRUE(NoFDebugConfig::FromEnvironment().enabled) << value;
+        source_.Set("MC_NOF_DEBUG", value);
+        EXPECT_TRUE(Load().enabled) << value;
     }
     for (const char* value : {"", "0", " true ", "y", "off"}) {
-        enabled.Set(value);
-        EXPECT_FALSE(NoFDebugConfig::FromEnvironment().enabled) << value;
+        source_.Set("MC_NOF_DEBUG", value);
+        EXPECT_FALSE(Load().enabled) << value;
     }
 }
 
-TEST(NoFDebugConfigTest, ParsesLegacyIntervalWithoutTrimming) {
-    ScopedEnvironment interval("MC_NOF_DEBUG_INTERVAL_MS");
+TEST_F(NoFDebugConfigTest, ParsesLegacyIntervalWithoutTrimming) {
     for (const auto& [value, expected] :
          {std::pair{"7", 7}, std::pair{"+7", 7}, std::pair{" 7", 7},
           std::pair{"17", 17}}) {
-        interval.Set(value);
-        EXPECT_EQ(NoFDebugConfig::FromEnvironment().interval_ms,
-                  std::chrono::milliseconds{expected})
+        source_.Set("MC_NOF_DEBUG_INTERVAL_MS", value);
+        EXPECT_EQ(Load().interval_ms, std::chrono::milliseconds{expected})
             << value;
     }
     for (const char* value : {"", "0", "-2", "7 ", "7ms", "bad"}) {
-        interval.Set(value);
-        EXPECT_EQ(NoFDebugConfig::FromEnvironment().interval_ms,
-                  std::chrono::milliseconds{1000})
-            << value;
+        source_.Set("MC_NOF_DEBUG_INTERVAL_MS", value);
+        EXPECT_EQ(Load().interval_ms, std::chrono::milliseconds{1000}) << value;
     }
 }
 
-TEST(NoFDebugConfigTest, ReadsEachValueWhenRequested) {
-    ScopedEnvironment enabled("MC_NOF_DEBUG");
-    ScopedEnvironment interval("MC_NOF_DEBUG_INTERVAL_MS");
-    enabled.Set("1");
-    interval.Set("5");
-    const auto first = NoFDebugConfig::FromEnvironment();
+TEST_F(NoFDebugConfigTest, ReadsEachValueWhenRequested) {
+    source_.Set("MC_NOF_DEBUG", "1");
+    source_.Set("MC_NOF_DEBUG_INTERVAL_MS", "5");
+    const auto first = Load();
     EXPECT_TRUE(first.enabled);
     EXPECT_EQ(first.interval_ms, std::chrono::milliseconds{5});
-    enabled.Set("0");
-    interval.Set("9");
-    const auto second = NoFDebugConfig::FromEnvironment();
+    source_.Set("MC_NOF_DEBUG", "0");
+    source_.Set("MC_NOF_DEBUG_INTERVAL_MS", "9");
+    const auto second = Load();
     EXPECT_FALSE(second.enabled);
     EXPECT_EQ(second.interval_ms, std::chrono::milliseconds{9});
 }

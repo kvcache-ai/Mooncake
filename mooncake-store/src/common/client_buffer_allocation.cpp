@@ -2,6 +2,7 @@
 
 #include "config.h"
 #include "config/hugepage_config.h"
+#include "environ.h"
 #include "ub_allocator.h"
 
 #include <cstdlib>
@@ -59,7 +60,8 @@ tl::expected<void *, std::string> allocate_vram_memory(
 }  // namespace
 
 size_t get_hugepage_size_from_env(unsigned int *out_flags, bool use_memfd) {
-    const HugepageConfig config = HugepageConfig::FromEnvironment();
+    const HugepageConfig config =
+        HugepageConfig::FromEnvironment(Environ::Process());
     if (!config.enabled) {
         return 0;
     }

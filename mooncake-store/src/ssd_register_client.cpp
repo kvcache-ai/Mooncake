@@ -1,6 +1,7 @@
 #include "ssd_register_client.h"
 
 #include "config/nof_register_config.h"
+#include "environ.h"
 
 namespace mooncake {
 
@@ -24,7 +25,7 @@ int NoFRegisterClient::set_register(const std::string &nqn, size_t nsid,
         return OPERATION_FAILED;
     }
 
-    const auto config = NoFRegisterConfig::FromEnvironment();
+    const auto config = NoFRegisterConfig::FromEnvironment(Environ::Process());
 
     std::string te_endpoint =
         "traddr:" + traddr + " trsvcid:" + std::to_string(trsvcid) +
@@ -60,7 +61,7 @@ int NoFRegisterClient::set_unregister_by_endpoint(
         return OPERATION_FAILED;
     }
 
-    const auto config = NoFRegisterConfig::FromEnvironment();
+    const auto config = NoFRegisterConfig::FromEnvironment(Environ::Process());
 
     // Build the te_endpoint string to match registered segments
     std::string te_endpoint =

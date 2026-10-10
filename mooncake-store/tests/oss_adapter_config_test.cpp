@@ -3,33 +3,32 @@
 #include <array>
 #include <cstdlib>
 #include <map>
-#include <mutex>
 #include <optional>
 #include <string>
 
 #include "../src/config/oss_adapter_config.h"
+#include "environ.h"
 #include "storage/distributed/oss_adapter.h"
 
 namespace mooncake {
 namespace {
 
-std::mutex environment_mutex;
-
-class OssAdapterConfigTest : public ::testing::Test {
-   protected:
-    void SetUp() override {
-        environment_lock_ = std::unique_lock<std::mutex>(environment_mutex);
+// Only for tests that go through OssObjectStorageAdapter::Init(), which reads
+// the process environment.
+class ScopedProcessEnvironment {
+   public:
+    ScopedProcessEnvironment() {
         for (const char* name : kVariables) {
             if (const char* value = std::getenv(name)) {
                 original_values_[name] = value;
             } else {
                 original_values_[name] = std::nullopt;
             }
-            ASSERT_EQ(unsetenv(name), 0) << name;
+            EXPECT_EQ(unsetenv(name), 0) << name;
         }
     }
 
-    void TearDown() override {
+    ~ScopedProcessEnvironment() {
         for (const auto& [name, value] : original_values_) {
             if (value) {
                 EXPECT_EQ(setenv(name.c_str(), value->c_str(), 1), 0) << name;
@@ -39,14 +38,12 @@ class OssAdapterConfigTest : public ::testing::Test {
         }
     }
 
+    ScopedProcessEnvironment(const ScopedProcessEnvironment&) = delete;
+    ScopedProcessEnvironment& operator=(const ScopedProcessEnvironment&) =
+        delete;
+
     void Set(const char* name, const std::string& value) {
         ASSERT_EQ(setenv(name, value.c_str(), 1), 0) << name;
-    }
-
-    void SetRequiredPrimary() {
-        Set("MOONCAKE_OSS_ENDPOINT", "https://oss.example.com");
-        Set("MOONCAKE_OSS_BUCKET", "bucket");
-        Set("MOONCAKE_OSS_REGION", "region");
     }
 
    private:
@@ -71,25 +68,42 @@ class OssAdapterConfigTest : public ::testing::Test {
     };
 
     std::map<std::string, std::optional<std::string>> original_values_;
-    std::unique_lock<std::mutex> environment_lock_;
+};
+
+template <typename Environment>
+void SetRequiredPrimary(Environment& env) {
+    env.Set("MOONCAKE_OSS_ENDPOINT", "https://oss.example.com");
+    env.Set("MOONCAKE_OSS_BUCKET", "bucket");
+    env.Set("MOONCAKE_OSS_REGION", "region");
+}
+
+class OssAdapterConfigTest : public ::testing::Test {
+   protected:
+    tl::expected<OssAdapterConfig, ErrorCode> Load() const {
+        return OssAdapterConfig::FromEnvironment(Environ(source_));
+    }
+
+    MapEnvironSource source_;
 };
 
 TEST_F(OssAdapterConfigTest, InitUsesCompatibilityAliases) {
-    Set("OSS_ENDPOINT", "https://oss.example.com");
-    Set("OSS_BUCKET", "bucket");
-    Set("OSS_REGION", "region");
-    Set("MOONCAKE_OSS_ANONYMOUS", "true");
+    ScopedProcessEnvironment env;
+    env.Set("OSS_ENDPOINT", "https://oss.example.com");
+    env.Set("OSS_BUCKET", "bucket");
+    env.Set("OSS_REGION", "region");
+    env.Set("MOONCAKE_OSS_ANONYMOUS", "true");
 
     OssObjectStorageAdapter adapter("prefix");
     EXPECT_TRUE(adapter.Init());
 }
 
 TEST_F(OssAdapterConfigTest, EmptyPrimaryOverridesCompatibilityAlias) {
-    Set("OSS_ENDPOINT", "https://oss.example.com");
-    Set("MOONCAKE_OSS_ENDPOINT", "");
-    Set("MOONCAKE_OSS_BUCKET", "bucket");
-    Set("MOONCAKE_OSS_REGION", "region");
-    Set("MOONCAKE_OSS_ANONYMOUS", "true");
+    ScopedProcessEnvironment env;
+    env.Set("OSS_ENDPOINT", "https://oss.example.com");
+    env.Set("MOONCAKE_OSS_ENDPOINT", "");
+    env.Set("MOONCAKE_OSS_BUCKET", "bucket");
+    env.Set("MOONCAKE_OSS_REGION", "region");
+    env.Set("MOONCAKE_OSS_ANONYMOUS", "true");
 
     OssObjectStorageAdapter adapter("prefix");
     const auto result = adapter.Init();
@@ -99,21 +113,23 @@ TEST_F(OssAdapterConfigTest, EmptyPrimaryOverridesCompatibilityAlias) {
 }
 
 TEST_F(OssAdapterConfigTest, CredentialsAreRequiredUnlessAnonymous) {
-    SetRequiredPrimary();
+    ScopedProcessEnvironment env;
+    SetRequiredPrimary(env);
 
     OssObjectStorageAdapter authenticated("prefix");
     const auto missing_credentials = authenticated.Init();
     ASSERT_FALSE(missing_credentials);
     EXPECT_EQ(missing_credentials.error(), ErrorCode::INVALID_PARAMS);
 
-    Set("MOONCAKE_OSS_ANONYMOUS", "true");
+    env.Set("MOONCAKE_OSS_ANONYMOUS", "true");
     OssObjectStorageAdapter anonymous("prefix");
     EXPECT_TRUE(anonymous.Init());
 }
 
 TEST_F(OssAdapterConfigTest, InvalidAnonymousValueWarnsAndUsesFalse) {
-    SetRequiredPrimary();
-    Set("MOONCAKE_OSS_ANONYMOUS", "invalid");
+    ScopedProcessEnvironment env;
+    SetRequiredPrimary(env);
+    env.Set("MOONCAKE_OSS_ANONYMOUS", "invalid");
 
     testing::internal::CaptureStderr();
     OssObjectStorageAdapter adapter("prefix");
@@ -128,29 +144,30 @@ TEST_F(OssAdapterConfigTest, InvalidAnonymousValueWarnsAndUsesFalse) {
 }
 
 TEST_F(OssAdapterConfigTest, InitReadsCurrentEnvironmentEachTime) {
-    SetRequiredPrimary();
-    Set("MOONCAKE_OSS_ANONYMOUS", "true");
+    ScopedProcessEnvironment env;
+    SetRequiredPrimary(env);
+    env.Set("MOONCAKE_OSS_ANONYMOUS", "true");
 
     OssObjectStorageAdapter adapter("prefix");
     EXPECT_TRUE(adapter.Init());
 
-    Set("MOONCAKE_OSS_ANONYMOUS", "false");
+    env.Set("MOONCAKE_OSS_ANONYMOUS", "false");
     const auto second = adapter.Init();
     ASSERT_FALSE(second);
     EXPECT_EQ(second.error(), ErrorCode::INVALID_PARAMS);
 }
 
 TEST_F(OssAdapterConfigTest, LoadsPrimaryValuesAndNormalizesStrings) {
-    Set("MOONCAKE_OSS_ENDPOINT", "https://oss.example.com///");
-    Set("MOONCAKE_OSS_BUCKET", "primary-bucket");
-    Set("MOONCAKE_OSS_REGION", "primary-region");
-    Set("MOONCAKE_OSS_ACCESS_KEY_ID", "primary-id");
-    Set("MOONCAKE_OSS_ACCESS_KEY_SECRET", "primary-secret");
-    Set("MOONCAKE_OSS_SECURITY_TOKEN", "  primary-token\t");
-    Set("MOONCAKE_OSS_PATH_STYLE", "TRUE");
-    Set("MOONCAKE_OSS_ANONYMOUS", "On");
+    source_.Set("MOONCAKE_OSS_ENDPOINT", "https://oss.example.com///");
+    source_.Set("MOONCAKE_OSS_BUCKET", "primary-bucket");
+    source_.Set("MOONCAKE_OSS_REGION", "primary-region");
+    source_.Set("MOONCAKE_OSS_ACCESS_KEY_ID", "primary-id");
+    source_.Set("MOONCAKE_OSS_ACCESS_KEY_SECRET", "primary-secret");
+    source_.Set("MOONCAKE_OSS_SECURITY_TOKEN", "  primary-token\t");
+    source_.Set("MOONCAKE_OSS_PATH_STYLE", "TRUE");
+    source_.Set("MOONCAKE_OSS_ANONYMOUS", "On");
 
-    const auto config = OssAdapterConfig::FromEnvironment();
+    const auto config = Load();
 
     ASSERT_TRUE(config);
     EXPECT_EQ(config->endpoint, "https://oss.example.com");
@@ -164,14 +181,14 @@ TEST_F(OssAdapterConfigTest, LoadsPrimaryValuesAndNormalizesStrings) {
 }
 
 TEST_F(OssAdapterConfigTest, LoadsCompatibilityAliases) {
-    Set("OSS_ENDPOINT", "https://alias.example.com");
-    Set("OSS_BUCKET", "alias-bucket");
-    Set("OSS_REGION", "alias-region");
-    Set("OSS_ACCESS_KEY_ID", "alias-id");
-    Set("OSS_ACCESS_KEY_SECRET", "alias-secret");
-    Set("OSS_SESSION_TOKEN", "alias-token");
+    source_.Set("OSS_ENDPOINT", "https://alias.example.com");
+    source_.Set("OSS_BUCKET", "alias-bucket");
+    source_.Set("OSS_REGION", "alias-region");
+    source_.Set("OSS_ACCESS_KEY_ID", "alias-id");
+    source_.Set("OSS_ACCESS_KEY_SECRET", "alias-secret");
+    source_.Set("OSS_SESSION_TOKEN", "alias-token");
 
-    const auto config = OssAdapterConfig::FromEnvironment();
+    const auto config = Load();
 
     ASSERT_TRUE(config);
     EXPECT_EQ(config->endpoint, "https://alias.example.com");
@@ -185,20 +202,20 @@ TEST_F(OssAdapterConfigTest, LoadsCompatibilityAliases) {
 }
 
 TEST_F(OssAdapterConfigTest, PresentPrimaryOverridesCompatibilityAlias) {
-    Set("OSS_ENDPOINT", "https://alias.example.com");
-    Set("MOONCAKE_OSS_ENDPOINT", "https://primary.example.com");
-    Set("OSS_BUCKET", "alias-bucket");
-    Set("MOONCAKE_OSS_BUCKET", "primary-bucket");
-    Set("OSS_REGION", "alias-region");
-    Set("MOONCAKE_OSS_REGION", "primary-region");
-    Set("OSS_ACCESS_KEY_ID", "alias-id");
-    Set("MOONCAKE_OSS_ACCESS_KEY_ID", "primary-id");
-    Set("OSS_ACCESS_KEY_SECRET", "alias-secret");
-    Set("MOONCAKE_OSS_ACCESS_KEY_SECRET", "primary-secret");
-    Set("OSS_SESSION_TOKEN", "alias-token");
-    Set("MOONCAKE_OSS_SECURITY_TOKEN", "");
+    source_.Set("OSS_ENDPOINT", "https://alias.example.com");
+    source_.Set("MOONCAKE_OSS_ENDPOINT", "https://primary.example.com");
+    source_.Set("OSS_BUCKET", "alias-bucket");
+    source_.Set("MOONCAKE_OSS_BUCKET", "primary-bucket");
+    source_.Set("OSS_REGION", "alias-region");
+    source_.Set("MOONCAKE_OSS_REGION", "primary-region");
+    source_.Set("OSS_ACCESS_KEY_ID", "alias-id");
+    source_.Set("MOONCAKE_OSS_ACCESS_KEY_ID", "primary-id");
+    source_.Set("OSS_ACCESS_KEY_SECRET", "alias-secret");
+    source_.Set("MOONCAKE_OSS_ACCESS_KEY_SECRET", "primary-secret");
+    source_.Set("OSS_SESSION_TOKEN", "alias-token");
+    source_.Set("MOONCAKE_OSS_SECURITY_TOKEN", "");
 
-    const auto config = OssAdapterConfig::FromEnvironment();
+    const auto config = Load();
 
     ASSERT_TRUE(config);
     EXPECT_EQ(config->endpoint, "https://primary.example.com");
@@ -210,14 +227,14 @@ TEST_F(OssAdapterConfigTest, PresentPrimaryOverridesCompatibilityAlias) {
 }
 
 TEST_F(OssAdapterConfigTest, InvalidBoolValuesWarnAndUseFalse) {
-    SetRequiredPrimary();
-    Set("MOONCAKE_OSS_ACCESS_KEY_ID", "id");
-    Set("MOONCAKE_OSS_ACCESS_KEY_SECRET", "secret");
-    Set("MOONCAKE_OSS_PATH_STYLE", "invalid-path-style");
-    Set("MOONCAKE_OSS_ANONYMOUS", "invalid-anonymous");
+    SetRequiredPrimary(source_);
+    source_.Set("MOONCAKE_OSS_ACCESS_KEY_ID", "id");
+    source_.Set("MOONCAKE_OSS_ACCESS_KEY_SECRET", "secret");
+    source_.Set("MOONCAKE_OSS_PATH_STYLE", "invalid-path-style");
+    source_.Set("MOONCAKE_OSS_ANONYMOUS", "invalid-anonymous");
 
     testing::internal::CaptureStderr();
-    const auto config = OssAdapterConfig::FromEnvironment();
+    const auto config = Load();
     const std::string diagnostics = testing::internal::GetCapturedStderr();
 
     ASSERT_TRUE(config);
@@ -235,26 +252,26 @@ TEST_F(OssAdapterConfigTest, InvalidBoolValuesWarnAndUseFalse) {
 }
 
 TEST_F(OssAdapterConfigTest, RejectsMissingRequiredValuesBeforeCredentials) {
-    Set("MOONCAKE_OSS_BUCKET", "bucket");
-    Set("MOONCAKE_OSS_REGION", "region");
-    Set("MOONCAKE_OSS_ACCESS_KEY_ID", "id");
-    Set("MOONCAKE_OSS_ACCESS_KEY_SECRET", "secret");
+    source_.Set("MOONCAKE_OSS_BUCKET", "bucket");
+    source_.Set("MOONCAKE_OSS_REGION", "region");
+    source_.Set("MOONCAKE_OSS_ACCESS_KEY_ID", "id");
+    source_.Set("MOONCAKE_OSS_ACCESS_KEY_SECRET", "secret");
 
-    const auto config = OssAdapterConfig::FromEnvironment();
+    const auto config = Load();
 
     ASSERT_FALSE(config);
     EXPECT_EQ(config.error(), ErrorCode::INVALID_PARAMS);
 }
 
 TEST_F(OssAdapterConfigTest, AllowsMissingCredentialsOnlyWhenAnonymous) {
-    SetRequiredPrimary();
+    SetRequiredPrimary(source_);
 
-    const auto authenticated = OssAdapterConfig::FromEnvironment();
+    const auto authenticated = Load();
     ASSERT_FALSE(authenticated);
     EXPECT_EQ(authenticated.error(), ErrorCode::INVALID_PARAMS);
 
-    Set("MOONCAKE_OSS_ANONYMOUS", "yes");
-    const auto anonymous = OssAdapterConfig::FromEnvironment();
+    source_.Set("MOONCAKE_OSS_ANONYMOUS", "yes");
+    const auto anonymous = Load();
     ASSERT_TRUE(anonymous);
     EXPECT_TRUE(anonymous->anonymous);
     EXPECT_TRUE(anonymous->access_key_id.empty());
@@ -262,12 +279,12 @@ TEST_F(OssAdapterConfigTest, AllowsMissingCredentialsOnlyWhenAnonymous) {
 }
 
 TEST_F(OssAdapterConfigTest, NewConfigsReadCurrentEnvironment) {
-    SetRequiredPrimary();
-    Set("MOONCAKE_OSS_ANONYMOUS", "true");
-    const auto first = OssAdapterConfig::FromEnvironment();
+    SetRequiredPrimary(source_);
+    source_.Set("MOONCAKE_OSS_ANONYMOUS", "true");
+    const auto first = Load();
 
-    Set("MOONCAKE_OSS_ENDPOINT", "https://second.example.com");
-    const auto second = OssAdapterConfig::FromEnvironment();
+    source_.Set("MOONCAKE_OSS_ENDPOINT", "https://second.example.com");
+    const auto second = Load();
 
     ASSERT_TRUE(first);
     ASSERT_TRUE(second);
@@ -276,18 +293,18 @@ TEST_F(OssAdapterConfigTest, NewConfigsReadCurrentEnvironment) {
 }
 
 TEST_F(OssAdapterConfigTest, TuningDefaultsAndOverrides) {
-    SetRequiredPrimary();
-    Set("MOONCAKE_OSS_ANONYMOUS", "true");
-    const auto defaults = OssAdapterConfig::FromEnvironment();
+    SetRequiredPrimary(source_);
+    source_.Set("MOONCAKE_OSS_ANONYMOUS", "true");
+    const auto defaults = Load();
     ASSERT_TRUE(defaults);
     EXPECT_EQ(defaults->max_connections, 64);
     EXPECT_EQ(defaults->receive_buffer_size, 1024 * 1024);
     EXPECT_EQ(defaults->upload_buffer_size, 1024 * 1024);
 
-    Set("MOONCAKE_OSS_MAX_CONNECTIONS", "128");
-    Set("MOONCAKE_OSS_RECEIVE_BUFFER_SIZE", "65536");
-    Set("MOONCAKE_OSS_UPLOAD_BUFFER_SIZE", "131072");
-    const auto configured = OssAdapterConfig::FromEnvironment();
+    source_.Set("MOONCAKE_OSS_MAX_CONNECTIONS", "128");
+    source_.Set("MOONCAKE_OSS_RECEIVE_BUFFER_SIZE", "65536");
+    source_.Set("MOONCAKE_OSS_UPLOAD_BUFFER_SIZE", "131072");
+    const auto configured = Load();
     ASSERT_TRUE(configured);
     EXPECT_EQ(configured->max_connections, 128);
     EXPECT_EQ(configured->receive_buffer_size, 65536);
@@ -295,24 +312,24 @@ TEST_F(OssAdapterConfigTest, TuningDefaultsAndOverrides) {
 }
 
 TEST_F(OssAdapterConfigTest, TuningValuesKeepExistingBounds) {
-    SetRequiredPrimary();
-    Set("MOONCAKE_OSS_ANONYMOUS", "true");
+    SetRequiredPrimary(source_);
+    source_.Set("MOONCAKE_OSS_ANONYMOUS", "true");
     for (const char* value : {"-1", "0"}) {
         SCOPED_TRACE(value);
-        Set("MOONCAKE_OSS_MAX_CONNECTIONS", value);
-        Set("MOONCAKE_OSS_RECEIVE_BUFFER_SIZE", value);
-        Set("MOONCAKE_OSS_UPLOAD_BUFFER_SIZE", value);
-        const auto config = OssAdapterConfig::FromEnvironment();
+        source_.Set("MOONCAKE_OSS_MAX_CONNECTIONS", value);
+        source_.Set("MOONCAKE_OSS_RECEIVE_BUFFER_SIZE", value);
+        source_.Set("MOONCAKE_OSS_UPLOAD_BUFFER_SIZE", value);
+        const auto config = Load();
         ASSERT_TRUE(config);
         EXPECT_EQ(config->max_connections, 1);
         EXPECT_EQ(config->receive_buffer_size, 16 * 1024);
         EXPECT_EQ(config->upload_buffer_size, 16 * 1024);
     }
 
-    Set("MOONCAKE_OSS_MAX_CONNECTIONS", "2147483647");
-    Set("MOONCAKE_OSS_RECEIVE_BUFFER_SIZE", "2147483647");
-    Set("MOONCAKE_OSS_UPLOAD_BUFFER_SIZE", "2147483647");
-    const auto config = OssAdapterConfig::FromEnvironment();
+    source_.Set("MOONCAKE_OSS_MAX_CONNECTIONS", "2147483647");
+    source_.Set("MOONCAKE_OSS_RECEIVE_BUFFER_SIZE", "2147483647");
+    source_.Set("MOONCAKE_OSS_UPLOAD_BUFFER_SIZE", "2147483647");
+    const auto config = Load();
     ASSERT_TRUE(config);
     EXPECT_EQ(config->max_connections, 2147483647);
     EXPECT_EQ(config->receive_buffer_size, 10 * 1024 * 1024);
@@ -320,16 +337,16 @@ TEST_F(OssAdapterConfigTest, TuningValuesKeepExistingBounds) {
 }
 
 TEST_F(OssAdapterConfigTest, InvalidTuningValuesWarnAndUseDefaults) {
-    SetRequiredPrimary();
-    Set("MOONCAKE_OSS_ANONYMOUS", "true");
+    SetRequiredPrimary(source_);
+    source_.Set("MOONCAKE_OSS_ANONYMOUS", "true");
     for (const char* value :
          {"invalid", "", "65536bytes", "2147483648", "-2147483649"}) {
         SCOPED_TRACE(value);
-        Set("MOONCAKE_OSS_MAX_CONNECTIONS", value);
-        Set("MOONCAKE_OSS_RECEIVE_BUFFER_SIZE", value);
-        Set("MOONCAKE_OSS_UPLOAD_BUFFER_SIZE", value);
+        source_.Set("MOONCAKE_OSS_MAX_CONNECTIONS", value);
+        source_.Set("MOONCAKE_OSS_RECEIVE_BUFFER_SIZE", value);
+        source_.Set("MOONCAKE_OSS_UPLOAD_BUFFER_SIZE", value);
         testing::internal::CaptureStderr();
-        const auto config = OssAdapterConfig::FromEnvironment();
+        const auto config = Load();
         const std::string diagnostics = testing::internal::GetCapturedStderr();
         ASSERT_TRUE(config);
         EXPECT_EQ(config->max_connections, 64);
