@@ -66,8 +66,12 @@ class HipTransport : public Transport {
 
    private:
     struct OpenedShmEntry {
-        void* shm_addr;
+        void* shm_addr;  // what hipIpcOpenMemHandle / the fabric map returned
         uint64_t length;
+        // Byte offset of the registered buffer inside the mapping at
+        // shm_addr. An IPC handle maps its whole allocation, so a buffer that
+        // starts inside the allocation is at shm_addr + offset.
+        uint64_t offset = 0;
     };
 
     struct PendingTransfer {

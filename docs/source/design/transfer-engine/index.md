@@ -462,6 +462,7 @@ signatures and the crate `README.md` for Cargo-only builds.
 ## Advanced Runtime Options
 For advanced users, TransferEngine provides the following advanced runtime options, all of which can be passed in through **environment variables**.
 
+- `MC_HIP_IPC_OWNER_DEVICE_WORKAROUND` Set exactly `1` to rewrite out-of-range HIP IPC owner ordinals before import. The default leaves handles unchanged. This workaround uses ROCclr's private LP64 handle layout. Qualify each deployed runtime with `HipTransportTest.IpcOpensHandlesFromDeviceOrdinalsTheImporterLacks` before enabling it. A runtime version alone does not establish layout compatibility. Prefer a ROCm runtime with the upstream IPC owner-device fix, and leave this option unset there.
 - `MC_NUM_CQ_PER_CTX` The number of CQs created per device instance, default value 1
 - `MC_NUM_COMP_CHANNELS_PER_CTX` The number of Completion Channel created per device instance, default value 1
 - `MC_IB_PORT` The IB port number used per device instance, default value 1
