@@ -646,7 +646,7 @@ class TransferEngineImpl {
 
     int notify_proto_{1};  // notification/proto; 0 = raw, no stamp, no dedup
     NotifySequencer notify_sequencer_;
-    NotifyDedupWindow notify_dedup_;
+    NotifyDedupFilter notify_dedup_;
     std::atomic<uint64_t> notify_dedup_dropped_{0};
 
     std::string hostname_;

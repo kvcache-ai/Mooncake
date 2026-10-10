@@ -14,7 +14,11 @@
 
 #include "tent/common/notify_frame.h"
 
+#include <glog/logging.h>
+
+#include <algorithm>
 #include <cstring>
+#include <iterator>
 #include <limits>
 #include <random>
 
@@ -46,6 +50,14 @@ uint64_t randomSession() {
 }
 
 constexpr auto kIdleTarget = std::chrono::minutes(10);  // both tables
+
+// In ms: a ttl meant as "never" would overflow once converted to ns.
+bool outlived(NotifyDedupFilter::Clock::time_point created,
+              NotifyDedupFilter::Clock::time_point now,
+              std::chrono::milliseconds ttl) {
+    using std::chrono::milliseconds;
+    return std::chrono::duration_cast<milliseconds>(now - created) > ttl;
+}
 
 }  // namespace
 
@@ -146,7 +158,7 @@ Notification NotifySequencer::stamp(const std::string& target,
                                     const Notification& notifi,
                                     Clock::time_point now) {
     std::lock_guard<std::mutex> guard(mutex_);
-    if (++stamps_since_prune_ >= NotifyDedupWindow::kWindow) {
+    if (++stamps_since_prune_ >= kPruneEvery) {
         stamps_since_prune_ = 0;
         for (auto it = targets_.begin(); it != targets_.end();) {
             if (now - it->second.last_used > kIdleTarget) {
@@ -167,54 +179,107 @@ Notification NotifySequencer::stamp(const std::string& target,
     return stamped;
 }
 
-bool NotifyDedupWindow::admit(uint64_t session, uint64_t seq,
+void NotifyDedupFilter::configure(const Config& config) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    config_ = config;
+}
+
+bool NotifyDedupFilter::admit(uint64_t session, uint64_t seq,
                               Clock::time_point now) {
     if (session == 0 || seq == 0) return true;
     std::lock_guard<std::mutex> guard(mutex_);
-    if (++admits_since_prune_ >= kWindow) pruneLocked(now);
-    auto it = sessions_.find(session);
-    if (it == sessions_.end()) {
-        SessionState state;
-        state.max_seq = seq;
-        state.seen.set(seq % kWindow);
-        state.last_seen = now;
-        sessions_.emplace(session, std::move(state));
-        return true;
-    }
+    if (++admits_since_prune_ >= kPruneEvery) pruneLocked(now);
+    auto [it, fresh] = sessions_.try_emplace(session);
     SessionState& state = it->second;
-    state.last_seen = now;
+    // now is read before the lock; never step back, so that holes are created
+    // in time order as well as in seq order.
+    state.last_seen = std::max(state.last_seen, now);
     if (seq > state.max_seq) {
-        if (seq - state.max_seq >= kWindow) {
-            state.seen.reset();
-        } else {
-            for (uint64_t s = state.max_seq + 1; s < seq; ++s) {
-                state.seen.reset(s % kWindow);
-            }
+        if (seq - state.max_seq > 1) {
+            state.holes.emplace_hint(state.holes.end(), state.max_seq + 1,
+                                     Hole{seq, state.last_seen, fresh});
         }
         state.max_seq = seq;
-        state.seen.set(seq % kWindow);
-        return true;
+    } else {
+        auto hole = state.holes.upper_bound(seq);
+        if (hole == state.holes.begin() || seq >= std::prev(hole)->second.hi)
+            return false;  // delivered before
+        --hole;
+        if (outlived(hole->second.created, now, config_.ttl)) {
+            giveUpLocked(session, state.holes, hole, expired_);
+            return false;
+        }
+        const Hole whole = hole->second;
+        const auto next = std::next(hole);
+        if (hole->first < seq) {
+            hole->second.hi = seq;
+        } else {
+            state.holes.erase(hole);
+        }
+        if (seq + 1 < whole.hi) {
+            state.holes.emplace_hint(
+                next, seq + 1,
+                Hole{whole.hi, whole.created, whole.before_first});
+        }
     }
-    if (state.max_seq - seq >= kWindow) return false;  // behind the window
-    if (state.seen.test(seq % kWindow)) return false;  // delivered before
-    state.seen.set(seq % kWindow);
+    while (state.holes.size() > config_.max_holes)
+        giveUpLocked(session, state.holes, state.holes.begin(), evicted_);
     return true;
 }
 
-size_t NotifyDedupWindow::sessions() {
+size_t NotifyDedupFilter::sessions() {
     std::lock_guard<std::mutex> guard(mutex_);
     return sessions_.size();
 }
 
-void NotifyDedupWindow::pruneLocked(Clock::time_point now) {
+void NotifyDedupFilter::pruneLocked(Clock::time_point now) {
     admits_since_prune_ = 0;
+    const auto forget_after =
+        std::max<std::chrono::milliseconds>(kIdleTarget, config_.ttl);
     for (auto it = sessions_.begin(); it != sessions_.end();) {
-        if (now - it->second.last_seen > kIdleTarget) {
+        // Holes are only added above the others or split off one, keeping its
+        // time, so the first is the oldest. Counted here because a late
+        // arrival in a dropped hole can no longer be told from a duplicate.
+        auto& holes = it->second.holes;
+        while (!holes.empty() &&
+               outlived(holes.begin()->second.created, now, config_.ttl))
+            giveUpLocked(it->first, holes, holes.begin(), expired_);
+        if (outlived(it->second.last_seen, now, forget_after)) {
             it = sessions_.erase(it);
         } else {
             ++it;
         }
     }
+}
+
+void NotifyDedupFilter::giveUpLocked(uint64_t session, Holes& holes,
+                                     Holes::iterator hole,
+                                     std::atomic<size_t>& counter) {
+    if (!hole->second.before_first) {
+        counter.fetch_add(1, std::memory_order_relaxed);
+        LOG_EVERY_N(WARNING, 100)
+            << "Gave up on notifications " << hole->first << ".."
+            << hole->second.hi - 1 << " of session " << session << ", "
+            << expired_.load(std::memory_order_relaxed) << " expired and "
+            << evicted_.load(std::memory_order_relaxed)
+            << " evicted ranges so far";
+    }
+    holes.erase(hole);
+}
+
+size_t NotifyDedupFilter::holes() {
+    std::lock_guard<std::mutex> guard(mutex_);
+    size_t total = 0;
+    for (const auto& entry : sessions_) total += entry.second.holes.size();
+    return total;
+}
+
+size_t NotifyDedupFilter::expired() const {
+    return expired_.load(std::memory_order_relaxed);
+}
+
+size_t NotifyDedupFilter::evicted() const {
+    return evicted_.load(std::memory_order_relaxed);
 }
 
 }  // namespace tent

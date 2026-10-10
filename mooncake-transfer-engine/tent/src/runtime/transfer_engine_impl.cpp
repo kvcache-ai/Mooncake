@@ -420,6 +420,16 @@ Status TransferEngineImpl::construct() {
     merge_requests_ = conf_->get("merge_requests", true);
     notify_rpc_fallback_ = conf_->get("notification/rpc_fallback", true);
     notify_proto_ = conf_->get("notification/proto", 1);
+    {
+        NotifyDedupFilter::Config dedup;
+        const int64_t ttl_ms =
+            conf_->get("notification/dedup_hole_ttl_ms", int64_t{600000});
+        const int64_t max_holes =
+            conf_->get("notification/dedup_max_holes", int64_t{65536});
+        if (ttl_ms > 0) dedup.ttl = std::chrono::milliseconds(ttl_ms);
+        if (max_holes > 0) dedup.max_holes = static_cast<size_t>(max_holes);
+        notify_dedup_.configure(dedup);
+    }
     enable_progress_worker_ = conf_->get("enable_progress_worker", false);
     runtime_queue_config_.enabled = conf_->get("enable_runtime_queue", false);
     if (runtime_queue_config_.enabled) enable_progress_worker_ = true;
@@ -3524,7 +3534,7 @@ Status TransferEngineImpl::receiveNotification(
             notify_dedup_dropped_.fetch_add(notifi_list.end() - dup,
                                             std::memory_order_relaxed);
             LOG_EVERY_N(WARNING, 100)
-                << "Dropped duplicate notifications, "
+                << "Dropped notifications delivered before or given up on, "
                 << notify_dedup_dropped_.load(std::memory_order_relaxed)
                 << " so far";
             notifi_list.erase(dup, notifi_list.end());

@@ -15,10 +15,11 @@
 #ifndef TENT_NOTIFY_FRAME_H
 #define TENT_NOTIFY_FRAME_H
 
-#include <bitset>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -69,6 +70,7 @@ bool decodeNotifyFrame(const char* data, size_t len, NotifyFrameHeader* header,
 class NotifySequencer {
    public:
     using Clock = std::chrono::steady_clock;
+    static constexpr size_t kPruneEvery = 4096;
 
     Notification stamp(const std::string& target, const Notification& notifi,
                        Clock::time_point now = Clock::now());
@@ -85,31 +87,56 @@ class NotifySequencer {
     size_t stamps_since_prune_ = 0;
 };
 
-// Receiver-side window per sender session: each (session, seq) is admitted
-// once; anything behind the window is refused.
-class NotifyDedupWindow {
+// Receiver-side filter per sender session: each (session, seq) is admitted
+// once, however late, while the hole [lo, hi) it fell in is open. A hole is
+// given up after ttl (expired) or as the oldest past max_holes (evicted).
+class NotifyDedupFilter {
    public:
     using Clock = std::chrono::steady_clock;
-    static constexpr size_t kWindow = 4096;
+    static constexpr size_t kPruneEvery = 4096;
+
+    struct Config {
+        std::chrono::milliseconds ttl{600000};
+        size_t max_holes = 65536;
+    };
+
+    void configure(const Config& config);
 
     // seq 0 (unstamped) is always admitted.
     bool admit(uint64_t session, uint64_t seq,
                Clock::time_point now = Clock::now());
 
     size_t sessions();
+    size_t holes();
+    size_t expired() const;
+    size_t evicted() const;
 
    private:
+    struct Hole {
+        uint64_t hi;
+        Clock::time_point created;
+        // Below a session's first seq, as a restarted receiver sees one: not
+        // known to be missing, so given up without counting.
+        bool before_first = false;
+    };
+    using Holes = std::map<uint64_t, Hole>;
+
     struct SessionState {
         uint64_t max_seq = 0;
-        std::bitset<kWindow> seen;
+        Holes holes;
         Clock::time_point last_seen;
     };
 
     void pruneLocked(Clock::time_point now);
+    void giveUpLocked(uint64_t session, Holes& holes, Holes::iterator hole,
+                      std::atomic<size_t>& counter);
 
     std::mutex mutex_;
+    Config config_;
     std::unordered_map<uint64_t, SessionState> sessions_;
     size_t admits_since_prune_ = 0;
+    std::atomic<size_t> expired_{0};
+    std::atomic<size_t> evicted_{0};
 };
 
 }  // namespace tent
