@@ -719,8 +719,9 @@ TEST(MasterServiceOffloadScenarioTest, InFlightOffloadsBoundTheNextCycle) {
     };
     const auto base = std::chrono::system_clock::now() - std::chrono::hours(1);
     MasterServiceConfig config = OffloadOnEvictConfig();
-    config.offloading_queue_limit = kCap;
-    config.offload_cap_ratio = 1.0;
+    config.default_kv_lease_ttl = 0;  // a completed offload grants no lease
+    config.offloading_queue_limit = 2 * kCap;  // the mailbox is not the bound
+    config.offload_cap_ratio = 0.5;            // cap = 2 objects in flight
     MasterScenario scenario("in-flight offloads bound the next cycle", config);
     scenario.Given(MemoryNode("node").Capacity(64 * 1024 * 1024))
         .When(MountLocalDisk("node"))
