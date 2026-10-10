@@ -1601,6 +1601,21 @@ WrappedMasterService::GetSegmentsDetailForAdmin() {
     return master_service_.GetSegmentsDetail();
 }
 
+tl::expected<std::vector<StorageDeviceMetadata>, ErrorCode>
+WrappedMasterService::GetStorageDevicesForAdmin() {
+    return master_service_.ListStorageDevices();
+}
+
+tl::expected<StorageDeviceMaintenancePlan, ErrorCode>
+WrappedMasterService::GetStorageDeviceMaintenancePlanForAdmin() {
+    return master_service_.GetStorageDeviceMaintenancePlan();
+}
+
+tl::expected<void, ErrorCode> WrappedMasterService::ProbeStorageDeviceForAdmin(
+    const UUID& device_id) {
+    return master_service_.RequestStorageDeviceProbe(device_id);
+}
+
 tl::expected<std::pair<uint64_t, uint64_t>, ErrorCode>
 WrappedMasterService::QuerySegmentForAdmin(const std::string& segment) {
     return master_service_.QuerySegments(segment);

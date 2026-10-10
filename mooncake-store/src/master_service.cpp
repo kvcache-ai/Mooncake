@@ -13515,6 +13515,11 @@ void MasterService::NofHeartbeatThreadFunc() {
                     it->second.last_error_reason.clear();
                     it->second.next_probe_at =
                         success_time + nof_heartbeat_interval_sec_;
+                    it->second.ever_probed = true;
+                    it->second.last_success_unix_ms =
+                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::system_clock::now().time_since_epoch())
+                            .count();
                 }
             }
             VLOG(1) << "segment_id=" << probe_target->segment_id
@@ -13547,21 +13552,152 @@ void MasterService::NofHeartbeatThreadFunc() {
                     failure_time + nof_heartbeat_interval_sec_;
                 should_unmount =
                     failure_time - it->second.last_success_at >= alive_timeout;
+                it->second.ever_probed = true;
             }
         }
+
+        // Health is derived, not stored: the same probe accounting also drives
+        // the alive-timeout unmount rule below, so both views stay consistent.
+        const auto reported_health = DeriveStorageDeviceHealth(
+            StorageDeviceProbeState{/*unmounting=*/false,
+                                    /*ever_probed=*/true, failure_count},
+            NoFDeviceHealthPolicy());
 
         LOG(WARNING) << "segment_id=" << probe_target->segment_id
                      << ", segment_name=" << probe_target->segment.name
                      << ", endpoint=" << probe_target->segment.te_endpoint
                      << ", action=nof_heartbeat_failure"
                      << ", failure_count=" << failure_count
-                     << ", latency_ms=" << latency_ms
+                     << ", latency_ms=" << latency_ms << ", health="
+                     << StorageDeviceHealthToString(reported_health)
                      << ", reason=" << error_reason;
 
         if (should_unmount) {
             TryUnmountNoFSegmentByHeartbeat(*probe_target, error_reason);
         }
     }
+}
+
+StorageDeviceHealthPolicy MasterService::NoFDeviceHealthPolicy() const {
+    const uint32_t failed_at = std::max(nof_heartbeat_failures_threshold_, 1u);
+    return StorageDeviceHealthPolicy{
+        /*degraded_failures=*/std::max(failed_at / 2, 1u),
+        /*failed_failures=*/failed_at};
+}
+
+std::unordered_map<UUID, MasterService::NoFHeartbeatReport, boost::hash<UUID>>
+MasterService::SnapshotNoFHeartbeatReports() const {
+    std::unordered_map<UUID, NoFHeartbeatReport, boost::hash<UUID>> reports;
+    std::lock_guard<std::mutex> lock(nof_heartbeat_mutex_);
+    reports.reserve(nof_heartbeat_states_.size());
+    for (const auto& [segment_id, state] : nof_heartbeat_states_) {
+        NoFHeartbeatReport report;
+        report.ever_probed = state.ever_probed;
+        report.consecutive_failures = state.consecutive_failures;
+        report.last_error_reason = state.last_error_reason;
+        report.last_success_unix_ms = state.last_success_unix_ms;
+        reports.emplace(segment_id, std::move(report));
+    }
+    return reports;
+}
+
+tl::expected<std::vector<StorageDeviceMetadata>, ErrorCode>
+MasterService::ListStorageDevices() const {
+    std::vector<MountedNoFSegmentSnapshot> snapshots;
+    nof_segment_manager_.GetMountedSegmentsSnapshot(snapshots);
+
+    std::vector<NoFSegmentUsage> usages;
+    nof_segment_manager_.GetSegmentUsages(usages);
+    std::unordered_map<UUID, NoFSegmentUsage, boost::hash<UUID>> usage_by_id;
+    usage_by_id.reserve(usages.size());
+    for (const auto& usage : usages) {
+        usage_by_id.emplace(usage.segment_id, usage);
+    }
+
+    // Snapshot each lock in turn; never hold the segment and heartbeat locks
+    // at the same time.
+    const auto reports = SnapshotNoFHeartbeatReports();
+    const auto health_policy = NoFDeviceHealthPolicy();
+
+    std::vector<StorageDeviceMetadata> devices;
+    devices.reserve(snapshots.size());
+    for (const auto& snapshot : snapshots) {
+        StorageDeviceMetadata device;
+        device.device_id = snapshot.segment_id;
+        device.name = snapshot.segment.name;
+        device.endpoint = snapshot.segment.te_endpoint;
+        device.owner_client_id = snapshot.client_id;
+        device.capacity_bytes = static_cast<int64_t>(snapshot.segment.size);
+
+        if (auto usage = usage_by_id.find(snapshot.segment_id);
+            usage != usage_by_id.end()) {
+            device.used_bytes = usage->second.used_bytes;
+            if (usage->second.capacity_bytes > 0) {
+                device.capacity_bytes = usage->second.capacity_bytes;
+            }
+        }
+
+        StorageDeviceProbeState probe_state;
+        probe_state.unmounting = snapshot.status != SegmentStatus::OK;
+        if (auto report = reports.find(snapshot.segment_id);
+            report != reports.end()) {
+            probe_state.ever_probed = report->second.ever_probed;
+            probe_state.consecutive_failures =
+                report->second.consecutive_failures;
+            device.consecutive_failures = report->second.consecutive_failures;
+            device.last_error = report->second.last_error_reason;
+            device.last_success_unix_ms = report->second.last_success_unix_ms;
+        }
+        device.health = DeriveStorageDeviceHealth(probe_state, health_policy);
+        LOG(INFO) << "DBGDEV name=" << device.name
+                  << " thr=" << nof_heartbeat_failures_threshold_
+                  << " deg=" << health_policy.degraded_failures
+                  << " fail=" << health_policy.failed_failures
+                  << " cf=" << device.consecutive_failures
+                  << " ever=" << probe_state.ever_probed
+                  << " unmounting=" << probe_state.unmounting
+                  << " health=" << StorageDeviceHealthToString(device.health);
+        device.schedulable = snapshot.status == SegmentStatus::OK &&
+                             device.health != StorageDeviceHealth::FAILED;
+        devices.push_back(std::move(device));
+    }
+    return devices;
+}
+
+tl::expected<StorageDeviceMaintenancePlan, ErrorCode>
+MasterService::GetStorageDeviceMaintenancePlan() const {
+    auto devices = ListStorageDevices();
+    if (!devices.has_value()) {
+        return tl::make_unexpected(devices.error());
+    }
+    return BuildStorageDeviceMaintenancePlan(*devices,
+                                             kStorageDeviceGcHighWatermark);
+}
+
+tl::expected<void, ErrorCode> MasterService::RequestStorageDeviceProbe(
+    const UUID& device_id) {
+    std::vector<MountedNoFSegmentSnapshot> snapshots;
+    nof_segment_manager_.GetMountedSegmentsSnapshot(snapshots);
+    auto snap_it =
+        std::find_if(snapshots.begin(), snapshots.end(), [&](const auto& s) {
+            return s.segment_id == device_id && s.status == SegmentStatus::OK;
+        });
+    if (snap_it == snapshots.end()) {
+        return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> lock(nof_heartbeat_mutex_);
+    auto [it, inserted] = nof_heartbeat_states_.try_emplace(device_id);
+    auto& state = it->second;
+    state.owner_client_id = snap_it->client_id;
+    state.segment_name = snap_it->segment.name;
+    state.te_endpoint = snap_it->segment.te_endpoint;
+    if (inserted) {
+        state.last_success_at = now;
+    }
+    it->second.next_probe_at = now;
+    return {};
 }
 
 tl::expected<std::vector<uint8_t>, SerializationError>

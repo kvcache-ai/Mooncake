@@ -1512,6 +1512,29 @@ void NoFSegmentManager::GetMountedSegmentsSnapshot(
     }
 }
 
+void NoFSegmentManager::GetSegmentUsages(
+    std::vector<NoFSegmentUsage>& usages) const {
+    std::shared_lock<std::shared_mutex> lock(segment_mutex_);
+    usages.clear();
+    usages.reserve(mounted_segments_.size());
+    for (const auto& [segment_id, mounted_segment] : mounted_segments_) {
+        NoFSegmentUsage usage;
+        usage.segment_id = segment_id;
+        usage.capacity_bytes =
+            static_cast<int64_t>(mounted_segment.segment.size);
+        if (mounted_segment.buf_allocator) {
+            usage.used_bytes =
+                static_cast<int64_t>(mounted_segment.buf_allocator->size());
+            const auto allocator_capacity =
+                static_cast<int64_t>(mounted_segment.buf_allocator->capacity());
+            if (allocator_capacity > 0) {
+                usage.capacity_bytes = allocator_capacity;
+            }
+        }
+        usages.push_back(usage);
+    }
+}
+
 StorageUsageSnapshot NoFSegmentManager::GetUsageSnapshot() const {
     std::shared_lock<std::shared_mutex> lock(segment_mutex_);
     StorageUsageSnapshot snapshot;
