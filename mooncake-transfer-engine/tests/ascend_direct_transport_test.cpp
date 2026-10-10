@@ -379,6 +379,7 @@ static int g_transfer_count = 0;
 static int g_transfer_async_count = 0;
 static int g_register_mem_count = 0;
 static int g_deregister_mem_count = 0;
+static bool g_last_local_only = false;
 static std::string g_last_connect_target;
 static std::vector<std::string> g_connect_targets;
 static adxl::Status g_get_capability_result = adxl::SUCCESS;
@@ -408,6 +409,7 @@ void reset() {
     g_transfer_async_count = 0;
     g_register_mem_count = 0;
     g_deregister_mem_count = 0;
+    g_last_local_only = false;
     g_last_connect_target.clear();
     g_connect_targets.clear();
     g_get_capability_result = adxl::SUCCESS;
@@ -496,6 +498,11 @@ int get_disconnect_count() {
 int get_register_mem_count() {
     std::lock_guard<std::mutex> lock(g_mutex);
     return g_register_mem_count;
+}
+
+bool get_last_local_only() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    return g_last_local_only;
 }
 
 int get_deregister_mem_count() {
@@ -644,10 +651,10 @@ Status AdxlEngine::GetTransferStatus(const TransferReq& req,
 
 Status AdxlEngine::RegisterMem(const MemDesc& mem, MemType type,
                                MemHandle& mem_handle) {
-    (void)mem;
     (void)type;
     std::lock_guard<std::mutex> lock(g_mutex);
     g_register_mem_count++;
+    g_last_local_only = mem.local_only;
     if (g_register_mem_result != adxl::SUCCESS) {
         return g_register_mem_result;
     }
@@ -1287,6 +1294,22 @@ TEST_F(AscendDirectTransportTest, Memory_RegisterAndUnregister) {
                                              "cpu:0", true, true),
               0);
     EXPECT_EQ(transport->unregisterLocalMemory(test_buffer_src_, true), 0);
+}
+
+TEST_F(AscendDirectTransportTest, Memory_RegisterPassesLocalOnly) {
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+
+    // remote_accessible=false is local_only=true on the HIXL MemDesc.
+    ASSERT_EQ(transport->registerLocalMemory(test_buffer_src_, kRegisterMemSize,
+                                             "cpu:0", false, true),
+              0);
+    EXPECT_TRUE(adxl_mock::get_last_local_only());
+
+    ASSERT_EQ(transport->registerLocalMemory(test_buffer_dst_, kRegisterMemSize,
+                                             "cpu:0", true, true),
+              0);
+    EXPECT_FALSE(adxl_mock::get_last_local_only());
 }
 
 TEST_F(AscendDirectTransportTest, Memory_RegisterStampsBufferDeviceId) {
