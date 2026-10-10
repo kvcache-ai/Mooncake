@@ -486,6 +486,19 @@ class TransferEngineImpl {
     Status finishQueuedOwner(QueueOwnerId owner_id,
                              TransferStatusEnum terminal_status);
 
+    // An owner the queue dropped at pick time: terminal on the queue side
+    // already, so only the impl's record and the batch's task statuses are
+    // left to settle. It never entered the dispatch window.
+    Status finishDroppedOwner(QueueOwnerId owner_id);
+
+    // Every queue owner of `batch`, dispatched or not, is finished with
+    // `terminal_status` so the dispatch window and the queue's byte accounting
+    // give back what the batch held. For a batch that is leaving the normal
+    // lifecycle (deferred staging teardown, quarantine): nothing will poll it
+    // to a terminal state any more.
+    Status detachQueuedOwnersOfBatch(Batch* batch,
+                                     TransferStatusEnum terminal_status);
+
     Status cancelQueuedOwner(QueueOwnerId owner_id);
 
     Status retireQueueForBatch(Batch* batch);
