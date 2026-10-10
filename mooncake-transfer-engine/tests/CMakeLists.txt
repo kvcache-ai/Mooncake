@@ -41,6 +41,20 @@ target_link_libraries(flagcx_transport_internal_test PUBLIC gtest gtest_main)
 add_test(NAME flagcx_transport_internal_test
          COMMAND flagcx_transport_internal_test)
 
+if(WITH_METRICS)
+  add_executable(transfer_engine_metrics_test
+                 ${WORKSPACE}/transfer_engine_metrics_test.cpp)
+  target_link_libraries(transfer_engine_metrics_test PUBLIC transfer_engine
+                                                            gtest gtest_main)
+  add_test(NAME transfer_engine_metrics_test
+           COMMAND transfer_engine_metrics_test)
+
+  add_executable(metrics_exporter_test ${WORKSPACE}/metrics_exporter_test.cpp)
+  target_link_libraries(metrics_exporter_test PUBLIC transfer_engine gtest
+                                                     gtest_main)
+  add_test(NAME metrics_exporter_test COMMAND metrics_exporter_test)
+endif()
+
 add_executable(endpoint_store_test ${WORKSPACE}/endpoint_store_test.cpp)
 target_link_libraries(endpoint_store_test PUBLIC transfer_engine gtest
                                                  gtest_main)
@@ -519,8 +533,8 @@ if(USE_ASCEND_DIRECT)
            COMMAND ascend_direct_transport_test)
 endif()
 
-# Multi-protocol transport test (only when ENABLE_MULTI_PROTOCOL is ON)
-if(ENABLE_MULTI_PROTOCOL)
+# This multi-protocol test directly uses CxlTransport and requires its backend.
+if(ENABLE_MULTI_PROTOCOL AND USE_CXL)
   add_executable(mp_transport_test ${WORKSPACE}/mp_transport_test.cpp)
   target_link_libraries(mp_transport_test PUBLIC transfer_engine gtest
                                                  gtest_main)

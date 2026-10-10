@@ -15,9 +15,6 @@
 #ifndef MULTI_TRANSFER_ENGINE_IMPL_H_
 #define MULTI_TRANSFER_ENGINE_IMPL_H_
 
-#include <limits.h>
-#include <string.h>
-
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -127,36 +124,12 @@ class TransferEngineImpl {
 
     Status submitTransfer(BatchID batch_id,
                           const std::vector<TransferRequest>& entries) {
-        Status s = multi_transports_->submitTransfer(batch_id, entries);
-#ifdef WITH_METRICS
-        if (metrics_enabled_ && s.ok()) {
-            auto& batch = Transport::toBatchDesc(batch_id);
-            auto now = std::chrono::steady_clock::now();
-            for (auto& task : batch.task_list) {
-                if (task.start_time.time_since_epoch().count() == 0) {
-                    task.start_time = now;
-                }
-            }
-        }
-#endif
-        return s;
+        return multi_transports_->submitTransfer(batch_id, entries);
     }
 
     Status submitScatter(const std::vector<TransferRequest>& entries,
                          MultiTransport::ScatterSubmission& submission) {
-        Status s = multi_transports_->submitScatter(entries, submission);
-#ifdef WITH_METRICS
-        if (metrics_enabled_ && s.ok()) {
-            auto& batch = Transport::toBatchDesc(submission.batch_id);
-            auto now = std::chrono::steady_clock::now();
-            for (auto& task : batch.task_list) {
-                if (task.start_time.time_since_epoch().count() == 0) {
-                    task.start_time = now;
-                }
-            }
-        }
-#endif
-        return s;
+        return multi_transports_->submitScatter(entries, submission);
     }
 
     Status submitTransferWithNotify(BatchID batch_id,
@@ -170,18 +143,6 @@ class TransferEngineImpl {
         if (!s.ok()) {
             return s;
         }
-
-#ifdef WITH_METRICS
-        if (metrics_enabled_) {
-            auto& batch = Transport::toBatchDesc(batch_id);
-            auto now = std::chrono::steady_clock::now();
-            for (auto& task : batch.task_list) {
-                if (task.start_time.time_since_epoch().count() == 0) {
-                    task.start_time = now;
-                }
-            }
-        }
-#endif
 
         // store notify
         RWSpinlock::WriteGuard guard(send_notifies_lock_);
@@ -204,20 +165,7 @@ class TransferEngineImpl {
     Status mp_submitTransfer(BatchID batch_id,
                              const std::vector<TransferRequest>& entries,
                              std::string& proto) {
-        Status s =
-            multi_transports_->mp_submitTransfer(batch_id, entries, proto);
-#ifdef WITH_METRICS
-        if (metrics_enabled_ && s.ok()) {
-            auto& batch = Transport::toBatchDesc(batch_id);
-            auto now = std::chrono::steady_clock::now();
-            for (auto& task : batch.task_list) {
-                if (task.start_time.time_since_epoch().count() == 0) {
-                    task.start_time = now;
-                }
-            }
-        }
-#endif
-        return s;
+        return multi_transports_->mp_submitTransfer(batch_id, entries, proto);
     }
 
     Status mp_submitTransferWithNotify(
@@ -232,18 +180,6 @@ class TransferEngineImpl {
         if (!s.ok()) {
             return s;
         }
-
-#ifdef WITH_METRICS
-        if (metrics_enabled_) {
-            auto& batch = Transport::toBatchDesc(batch_id);
-            auto now = std::chrono::steady_clock::now();
-            for (auto& task : batch.task_list) {
-                if (task.start_time.time_since_epoch().count() == 0) {
-                    task.start_time = now;
-                }
-            }
-        }
-#endif
 
         // store notify
         RWSpinlock::WriteGuard guard(send_notifies_lock_);
@@ -309,6 +245,13 @@ class TransferEngineImpl {
             if (start.time_since_epoch().count() == 0) {
                 goto metrics_done;
             }
+            if (__atomic_load_n(&task.slice_count, __ATOMIC_ACQUIRE) == 0) {
+                goto metrics_done;
+            }
+            if (__atomic_exchange_n(&task.log_metrics_recorded, true,
+                                    __ATOMIC_ACQ_REL)) {
+                goto metrics_done;
+            }
 
             // Only record metrics for successful completions
             if (status.s == TransferStatusEnum::COMPLETED) {
@@ -321,9 +264,6 @@ class TransferEngineImpl {
                         now - start);
                 task_completion_latency_us_.observe(duration.count());
             }
-
-            // Reset start_time to prevent duplicate processing
-            task.start_time = std::chrono::steady_clock::time_point();
         }
     metrics_done:
 #endif

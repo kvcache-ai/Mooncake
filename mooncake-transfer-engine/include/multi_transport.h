@@ -15,6 +15,7 @@
 #ifndef MULTI_TRANSPORT_H_
 #define MULTI_TRANSPORT_H_
 
+#include <atomic>
 #include <condition_variable>
 #include <functional>
 #include <map>
@@ -108,6 +109,16 @@ class MultiTransport {
 
     Status selectTransports(const std::vector<TransferRequest> &entries,
                             std::vector<Transport *> &transports);
+
+    // Stamp a task's submission time and direction for the metrics, before it
+    // is posted to its transport.
+    static void recordTaskStart(Transport::TransferTask &task,
+                                const TransferRequest &request);
+
+    // Record `task` in the metrics once, on the first poll that observes a
+    // terminal `status` (COMPLETED, FAILED, CANCELED or TIMEOUT).
+    static void recordTaskEnd(Transport::TransferTask &task,
+                              const TransferStatus &status);
 
     // If `allows_reuse` is non-null it is written on every return. True means
     // this segment's transport is a function of `target_id` only, so the
