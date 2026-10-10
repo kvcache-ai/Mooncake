@@ -16,6 +16,7 @@
 
 #include "allocator_status.h"
 #include "config/metrics_bootstrap_config_loader.h"
+#include "config/nof_heartbeat_bootstrap_config_loader.h"
 #include "config/rpc_protocol_config.h"
 #include "default_config.h"
 #include "duration_utils.h"
@@ -485,6 +486,28 @@ GetMetricsBootstrapCommandLineOverrides() {
     return command_line;
 }
 
+mooncake::NofHeartbeatCommandLineOverrides
+GetNofHeartbeatCommandLineOverrides() {
+    mooncake::NofHeartbeatCommandLineOverrides command_line;
+    google::CommandLineFlagInfo info;
+    if (google::GetCommandLineFlagInfo("nof_heartbeat_interval_sec", &info) &&
+        !info.is_default) {
+        command_line.interval_seconds = FLAGS_nof_heartbeat_interval_sec;
+    }
+    if (google::GetCommandLineFlagInfo("nof_heartbeat_probe_timeout_ms",
+                                       &info) &&
+        !info.is_default) {
+        command_line.probe_timeout_ms = FLAGS_nof_heartbeat_probe_timeout_ms;
+    }
+    if (google::GetCommandLineFlagInfo("nof_heartbeat_failures_threshold",
+                                       &info) &&
+        !info.is_default) {
+        command_line.failures_threshold =
+            FLAGS_nof_heartbeat_failures_threshold;
+    }
+    return command_line;
+}
+
 void ResolveRpcAddressFromInterfaceOrDie(
     mooncake::MasterConfig& master_config) {
     if (master_config.rpc_interface.empty()) {
@@ -564,16 +587,6 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetDouble("nof_eviction_high_watermark_ratio",
                              &master_config.nof_eviction_high_watermark_ratio,
                              FLAGS_nof_eviction_high_watermark_ratio);
-    default_config.GetInt64("nof_heartbeat_interval_sec",
-                            &master_config.nof_heartbeat_interval_sec,
-                            FLAGS_nof_heartbeat_interval_sec);
-    default_config.GetUInt32("nof_heartbeat_probe_timeout_ms",
-                             &master_config.nof_heartbeat_probe_timeout_ms,
-                             FLAGS_nof_heartbeat_probe_timeout_ms);
-    default_config.GetUInt32("nof_heartbeat_failures_threshold",
-                             &master_config.nof_heartbeat_failures_threshold,
-                             FLAGS_nof_heartbeat_failures_threshold);
-
     default_config.GetBool("enable_ha", &master_config.enable_ha,
                            FLAGS_enable_ha);
     default_config.GetBool("enable_offload", &master_config.enable_offload,
@@ -1134,26 +1147,6 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.etcd_endpoints = FLAGS_etcd_endpoints;
     }
-    if ((google::GetCommandLineFlagInfo("nof_heartbeat_interval_sec", &info) &&
-         !info.is_default) ||
-        !conf_set) {
-        master_config.nof_heartbeat_interval_sec =
-            FLAGS_nof_heartbeat_interval_sec;
-    }
-    if ((google::GetCommandLineFlagInfo("nof_heartbeat_probe_timeout_ms",
-                                        &info) &&
-         !info.is_default) ||
-        !conf_set) {
-        master_config.nof_heartbeat_probe_timeout_ms =
-            FLAGS_nof_heartbeat_probe_timeout_ms;
-    }
-    if ((google::GetCommandLineFlagInfo("nof_heartbeat_failures_threshold",
-                                        &info) &&
-         !info.is_default) ||
-        !conf_set) {
-        master_config.nof_heartbeat_failures_threshold =
-            FLAGS_nof_heartbeat_failures_threshold;
-    }
     if ((google::GetCommandLineFlagInfo("cluster_id", &info) &&
          !info.is_default) ||
         !conf_set) {
@@ -1566,6 +1559,15 @@ int main(int argc, char* argv[]) {
         loaded_default_config = &default_config;
     }
     LoadConfigFromCmdline(master_config, !conf_path.empty());
+    try {
+        master_config.nof_heartbeat =
+            mooncake::ResolveNofHeartbeatBootstrapConfig(
+                loaded_default_config, GetNofHeartbeatCommandLineOverrides());
+    } catch (const std::exception& error) {
+        LOG(ERROR) << "Invalid NoF heartbeat bootstrap configuration: "
+                   << error.what();
+        return 1;
+    }
     try {
         master_config.metrics = mooncake::ResolveMetricsBootstrapConfig(
             loaded_default_config, GetMetricsBootstrapCommandLineOverrides());

@@ -1,13 +1,17 @@
 #include <gtest/gtest.h>
 
-#include <cstdlib>
+#include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <string>
+#include <type_traits>
 
-#include "../src/config/metrics_bootstrap_config_loader.h"
+#include "config/metrics_bootstrap_config_loader.h"
+#include "config/nof_heartbeat_bootstrap_config_loader.h"
 #include "default_config.h"
 #include "ha/snapshot/batch_oplog/config.h"
 #include "master_config.h"
@@ -144,6 +148,143 @@ TEST_F(MetricsBootstrapConfigTest, RejectsOutOfRangeCommandLinePort) {
     command_line.port = UINT32_MAX;
     EXPECT_THROW(ResolveMetricsBootstrapConfig(nullptr, command_line),
                  std::invalid_argument);
+}
+
+class NofHeartbeatBootstrapConfigTest : public ::testing::Test {
+   protected:
+    void SetUp() override {
+        std::string pattern = (std::filesystem::temp_directory_path() /
+                               "nof_heartbeat_bootstrap_test_XXXXXX")
+                                  .string();
+        char* directory = mkdtemp(pattern.data());
+        ASSERT_NE(directory, nullptr);
+        temp_dir_ = directory;
+    }
+
+    void TearDown() override {
+        if (!temp_dir_.empty()) {
+            std::filesystem::remove_all(temp_dir_);
+        }
+    }
+
+    std::unique_ptr<DefaultConfig> LoadConfig(const std::string& extension,
+                                              const std::string& contents) {
+        const auto path = temp_dir_ / ("config" + extension);
+        {
+            std::ofstream file(path);
+            EXPECT_TRUE(file.is_open());
+            file << contents;
+        }
+        auto config = std::make_unique<DefaultConfig>();
+        config->SetPath(path.string());
+        config->Load();
+        return config;
+    }
+
+    std::filesystem::path temp_dir_;
+};
+
+TEST_F(NofHeartbeatBootstrapConfigTest, UsesExistingDefaults) {
+    const auto resolved = ResolveNofHeartbeatBootstrapConfig(nullptr, {});
+    EXPECT_EQ(resolved.interval, std::chrono::seconds(10));
+    EXPECT_EQ(resolved.probe_timeout, std::chrono::milliseconds(1000));
+    EXPECT_EQ(resolved.failures_threshold, 3u);
+}
+
+TEST_F(NofHeartbeatBootstrapConfigTest, LoadsExistingFlatYamlAndJsonKeys) {
+    const auto yaml = LoadConfig(".yaml",
+                                 "nof_heartbeat_interval_sec: 7\n"
+                                 "nof_heartbeat_probe_timeout_ms: 250\n"
+                                 "nof_heartbeat_failures_threshold: 4\n");
+    const auto from_yaml = ResolveNofHeartbeatBootstrapConfig(yaml.get(), {});
+    EXPECT_EQ(from_yaml.interval, std::chrono::seconds(7));
+    EXPECT_EQ(from_yaml.probe_timeout, std::chrono::milliseconds(250));
+    EXPECT_EQ(from_yaml.failures_threshold, 4u);
+
+    const auto json = LoadConfig(
+        ".json",
+        R"({"nof_heartbeat_interval_sec":2,"nof_heartbeat_probe_timeout_ms":300,"nof_heartbeat_failures_threshold":5})");
+    const auto from_json = ResolveNofHeartbeatBootstrapConfig(json.get(), {});
+    EXPECT_EQ(from_json.interval, std::chrono::seconds(2));
+    EXPECT_EQ(from_json.probe_timeout, std::chrono::milliseconds(300));
+    EXPECT_EQ(from_json.failures_threshold, 5u);
+}
+
+TEST_F(NofHeartbeatBootstrapConfigTest, ExplicitCliValuesOverrideFile) {
+    const auto file = LoadConfig(".yaml",
+                                 "nof_heartbeat_interval_sec: 7\n"
+                                 "nof_heartbeat_probe_timeout_ms: 250\n"
+                                 "nof_heartbeat_failures_threshold: 4\n");
+    const NofHeartbeatCommandLineOverrides command_line{
+        .interval_seconds = 0,
+        .probe_timeout_ms = 0,
+        .failures_threshold = 0,
+    };
+    const auto resolved =
+        ResolveNofHeartbeatBootstrapConfig(file.get(), command_line);
+    EXPECT_EQ(resolved.interval, std::chrono::seconds(0));
+    EXPECT_EQ(resolved.probe_timeout, std::chrono::milliseconds(0));
+    EXPECT_EQ(resolved.failures_threshold, 0u);
+
+    const auto without_cli = ResolveNofHeartbeatBootstrapConfig(file.get(), {});
+    EXPECT_EQ(without_cli.interval, std::chrono::seconds(7));
+    EXPECT_EQ(without_cli.probe_timeout, std::chrono::milliseconds(250));
+    EXPECT_EQ(without_cli.failures_threshold, 4u);
+}
+
+TEST_F(NofHeartbeatBootstrapConfigTest, PreservesSignedAndUnsignedRanges) {
+    const auto yaml = LoadConfig(".yaml", "nof_heartbeat_interval_sec: -1\n");
+    const auto json = LoadConfig(
+        ".json",
+        R"({"nof_heartbeat_probe_timeout_ms":4294967295,"nof_heartbeat_failures_threshold":4294967295})");
+    EXPECT_EQ(ResolveNofHeartbeatBootstrapConfig(yaml.get(), {}).interval,
+              std::chrono::seconds(-1));
+    const auto from_json = ResolveNofHeartbeatBootstrapConfig(json.get(), {});
+    EXPECT_EQ(from_json.probe_timeout,
+              std::chrono::milliseconds(std::numeric_limits<uint32_t>::max()));
+    EXPECT_EQ(from_json.failures_threshold,
+              std::numeric_limits<uint32_t>::max());
+
+    NofHeartbeatCommandLineOverrides command_line;
+    command_line.interval_seconds = std::numeric_limits<int64_t>::min();
+    EXPECT_EQ(
+        ResolveNofHeartbeatBootstrapConfig(nullptr, command_line).interval,
+        std::chrono::seconds(std::numeric_limits<int64_t>::min()));
+}
+
+TEST_F(NofHeartbeatBootstrapConfigTest, KeepsInvalidYamlFailure) {
+    const auto file =
+        LoadConfig(".yaml", "nof_heartbeat_interval_sec: invalid\n");
+    EXPECT_THROW(ResolveNofHeartbeatBootstrapConfig(file.get(), {}),
+                 std::exception);
+}
+
+TEST(NofHeartbeatBootstrapConfigPropagationTest,
+     ReachesStandaloneAndHaServingConfigs) {
+    MasterConfig master_config{};
+    master_config.allocation_strategy = "random";
+    master_config.nof_heartbeat.interval = std::chrono::seconds(-7);
+    master_config.nof_heartbeat.probe_timeout = NofHeartbeatProbeTimeout(250);
+    master_config.nof_heartbeat.failures_threshold = 9;
+    // The probe timeout stays unsigned by type, so no signed value can be
+    // narrowed into the serving field while it is forwarded.
+    static_assert(std::is_unsigned_v<
+                  decltype(master_config.nof_heartbeat.probe_timeout)::rep>);
+
+    WrappedMasterServiceConfig standalone(master_config, 0);
+    EXPECT_EQ(standalone.nof_heartbeat_interval_sec, -7);
+    EXPECT_EQ(standalone.nof_heartbeat_probe_timeout_ms, 250u);
+    EXPECT_EQ(standalone.nof_heartbeat_failures_threshold, 9u);
+
+    MasterServiceSupervisorConfig supervisor(master_config);
+    EXPECT_EQ(supervisor.nof_heartbeat_interval_sec.Get(), -7);
+    EXPECT_EQ(supervisor.nof_heartbeat_probe_timeout_ms.Get(), 250u);
+    EXPECT_EQ(supervisor.nof_heartbeat_failures_threshold.Get(), 9u);
+
+    WrappedMasterServiceConfig ha_serving(supervisor, 0);
+    EXPECT_EQ(ha_serving.nof_heartbeat_interval_sec, -7);
+    EXPECT_EQ(ha_serving.nof_heartbeat_probe_timeout_ms, 250u);
+    EXPECT_EQ(ha_serving.nof_heartbeat_failures_threshold, 9u);
 }
 
 TEST(MasterServiceConfigTest, OplogBatchMaxEntriesDefaultsTo1024) {
