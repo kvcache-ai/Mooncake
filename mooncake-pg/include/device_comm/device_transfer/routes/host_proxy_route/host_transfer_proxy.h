@@ -33,8 +33,6 @@ class HostTransferProxy {
     // Create the fixed command-slot set used by the transfer-service device.
     PGResult<HostProxyCommandSlot*> initializeDevice(int device_index);
 
-    PGResult<void> waitUntilIdle();
-    PGResult<void> waitUntilIdle(std::chrono::milliseconds timeout);
     PGResult<void> shutdown();
 
    private:

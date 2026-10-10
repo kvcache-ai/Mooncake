@@ -140,6 +140,7 @@ struct mlx5gda_qp *mlx5gda_create_rc_qp(
     const struct mlx5gda_control_region_allocator *qp_region_allocator);
 void mlx5gda_destroy_qp(struct mlx5gda_qp *qp);
 
+int mlx5gda_modify_rc_qp_2rst(struct mlx5gda_qp *qp);
 int mlx5gda_modify_rc_qp_rst2init(struct mlx5gda_qp *qp, uint16_t pkey_index);
 int mlx5gda_modify_rc_qp_init2rtr(struct mlx5gda_qp *qp,
                                   struct ibv_ah_attr ah_attr,
