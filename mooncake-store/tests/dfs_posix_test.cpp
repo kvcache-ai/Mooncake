@@ -993,8 +993,25 @@ class ControlledPosixFsAdapter : public PosixFsAdapter {
     void ShortWriteCall(int call) { short_write_call_ = call; }
     void FailReadCall(int call) { fail_read_call_ = call; }
     void ShortReadCall(int call) { short_read_call_ = call; }
+    // Offset-based injection persists across the backend's reopen-and-retry, so
+    // it models a permanently bad object rather than a single transient call.
+    void FailWriteAtOffset(int64_t offset) { fail_write_offset_ = offset; }
+    void ShortWriteAtOffset(int64_t offset) { short_write_offset_ = offset; }
+    void FailReadAtOffset(int64_t offset) { fail_read_offset_ = offset; }
+    void ShortReadAtOffset(int64_t offset) { short_read_offset_ = offset; }
+    // Fails the first write at this offset, then clears itself. Models a
+    // transient stale-descriptor hiccup that a single reopen recovers from.
+    void FailWriteAtOffsetOnce(int64_t offset) {
+        fail_write_offset_once_.store(offset);
+    }
     int WriteCallCount() const { return write_calls_.load(); }
     int ReadCallCount() const { return read_calls_.load(); }
+
+    // Toggles the backend's fd-reopen gating. Defaults to true so the adapter
+    // behaves like a real PosixFsAdapter; set false to model an adapter whose
+    // I/O faults are not fd-recoverable (e.g. 3FS).
+    void SetSupportsFdReopen(bool v) { supports_reopen_ = v; }
+    bool SupportsFdReopen() const override { return supports_reopen_; }
 
     std::vector<tl::expected<size_t, ErrorCode>> BatchWriteAt(
         std::span<const FdIoRequest> requests) override {
@@ -1012,10 +1029,15 @@ class ControlledPosixFsAdapter : public PosixFsAdapter {
                                             int iovcnt,
                                             int64_t offset) override {
         const int call = ++write_calls_;
-        if (call == fail_write_call_) {
+        int64_t once = fail_write_offset_once_.load();
+        if (once >= 0 && once == offset &&
+            fail_write_offset_once_.compare_exchange_strong(once, -1)) {
             return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
         }
-        if (call == short_write_call_) {
+        if (call == fail_write_call_ || offset == fail_write_offset_) {
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+        if (call == short_write_call_ || offset == short_write_offset_) {
             size_t total_size = 0;
             for (int i = 0; i < iovcnt; ++i) {
                 total_size += iov[i].iov_len;
@@ -1028,10 +1050,10 @@ class ControlledPosixFsAdapter : public PosixFsAdapter {
     tl::expected<size_t, ErrorCode> ReadAt(int fd, iovec* iov, int iovcnt,
                                            int64_t offset) override {
         const int call = ++read_calls_;
-        if (call == fail_read_call_) {
-            return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+        if (call == fail_read_call_ || offset == fail_read_offset_) {
+            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
         }
-        if (call == short_read_call_) {
+        if (call == short_read_call_ || offset == short_read_offset_) {
             size_t total_size = 0;
             for (int i = 0; i < iovcnt; ++i) {
                 total_size += iov[i].iov_len;
@@ -1050,7 +1072,37 @@ class ControlledPosixFsAdapter : public PosixFsAdapter {
     int short_write_call_ = -1;
     int fail_read_call_ = -1;
     int short_read_call_ = -1;
+    int64_t fail_write_offset_ = -1;
+    int64_t short_write_offset_ = -1;
+    int64_t fail_read_offset_ = -1;
+    int64_t short_read_offset_ = -1;
+    std::atomic<int64_t> fail_write_offset_once_{-1};
+    bool supports_reopen_ = true;
 };
+
+// Builds a backend backed by a ControlledPosixFsAdapter pointed at an existing
+// shard directory (shards must already be preallocated, as
+// DfsBackendTest::SetUp does). Returns the un-Init'd backend and hands back the
+// adapter pointer so the caller can program fault injection. The caller owns
+// Init() so it can ASSERT.
+std::unique_ptr<DistributedStorageBackend> MakeControlledBackend(
+    const std::string& dir, ControlledPosixFsAdapter** out_adapter) {
+    FileStorageConfig file_config;
+    file_config.storage_backend_type = StorageBackendType::kDistributed;
+    file_config.storage_filepath = dir;
+
+    DistributedStorageConfig distributed_config;
+    distributed_config.fsdir = dir;
+    distributed_config.fs_adapter_type = "posix";
+    distributed_config.shard_count = 4;
+    distributed_config.shard_capacity = 64 * 1024 * 1024;
+    distributed_config.alignment = 4096;
+
+    auto adapter = std::make_unique<ControlledPosixFsAdapter>();
+    *out_adapter = adapter.get();
+    return std::make_unique<DistributedStorageBackend>(
+        file_config, distributed_config, std::move(adapter));
+}
 
 class BlockingShardFsAdapter : public PosixFsAdapter {
    public:
@@ -1465,8 +1517,11 @@ TEST_F(DfsBackendTest, BatchWritePreservesPerKeyWriteErrors) {
     auto backend = std::make_unique<DistributedStorageBackend>(
         file_config, distributed_config, std::move(adapter));
     ASSERT_TRUE(backend->Init().has_value());
-    controlled_adapter->FailWriteCall(2);
-    controlled_adapter->ShortWriteCall(3);
+    // Offset-based injection so the reopen-and-retry hits the same failure and
+    // the error still surfaces. "failed" is a hard error (retried once);
+    // "short" is a short write (not retried).
+    controlled_adapter->FailWriteAtOffset(4096);
+    controlled_adapter->ShortWriteAtOffset(8192);
 
     AlignedBuffer write_buf(4096);
     ASSERT_NE(write_buf.data(), nullptr);
@@ -1488,6 +1543,9 @@ TEST_F(DfsBackendTest, BatchWritePreservesPerKeyWriteErrors) {
     EXPECT_EQ(results[1].error(), ErrorCode::FILE_WRITE_FAIL);
     ASSERT_FALSE(results[2].has_value());
     EXPECT_EQ(results[2].error(), ErrorCode::FILE_WRITE_FAIL);
+    // Shard opened once, then reopened once for the hard-failed write; the
+    // short write is not retried.
+    EXPECT_EQ(controlled_adapter->OpenCallCount(), 2);
 }
 
 TEST_F(DfsBackendTest, BatchReadUsesExplicitDescriptorsAndMultipleSlices) {
@@ -1574,8 +1632,8 @@ TEST_F(DfsBackendTest, BatchReadPreservesPerKeyErrors) {
         ASSERT_TRUE(result.has_value());
     }
 
-    controlled_adapter->FailReadCall(2);
-    controlled_adapter->ShortReadCall(3);
+    controlled_adapter->FailReadAtOffset(4096);
+    controlled_adapter->ShortReadAtOffset(8192);
     AlignedBuffer out0(4096), out1(4096), out2(4096), out3(4096);
     std::vector<DfsReadRequest> reads{
         {"ok_0", writes[0].descriptor, {{out0.data(), out0.size()}}},
@@ -1587,11 +1645,277 @@ TEST_F(DfsBackendTest, BatchReadPreservesPerKeyErrors) {
     ASSERT_EQ(read_results.size(), reads.size());
     EXPECT_TRUE(read_results[0].has_value());
     ASSERT_FALSE(read_results[1].has_value());
-    EXPECT_EQ(read_results[1].error(), ErrorCode::FILE_OPEN_FAIL);
+    EXPECT_EQ(read_results[1].error(), ErrorCode::FILE_READ_FAIL);
     ASSERT_FALSE(read_results[2].has_value());
     EXPECT_EQ(read_results[2].error(), ErrorCode::FILE_READ_FAIL);
     EXPECT_TRUE(read_results[3].has_value());
     EXPECT_EQ(std::memcmp(write_buf.data(), out3.data(), write_buf.size()), 0);
+    // One open for the initial writes, one reopen for the hard-failed read; the
+    // short read is not retried.
+    EXPECT_EQ(controlled_adapter->OpenCallCount(), 2);
+}
+
+TEST_F(DfsBackendTest, WriteReopensStaleDescriptorAndSucceeds) {
+    ControlledPosixFsAdapter* controlled = nullptr;
+    auto backend = MakeControlledBackend(tmp_->path(), &controlled);
+    ASSERT_TRUE(backend->Init().has_value());
+
+    // The first write fails as if the descriptor went stale; the backend should
+    // reopen the shard once and retry, so the write ultimately succeeds.
+    controlled->FailWriteCall(1);
+
+    AlignedBuffer write_buf(4096);
+    ASSERT_NE(write_buf.data(), nullptr);
+    write_buf.Fill('W');
+    const DistributedFSDescriptor desc{ShardPath(0), 0, 4096, 4096, 0};
+    auto results = backend->BatchWrite(
+        {{"key", desc, {{write_buf.data(), write_buf.size()}}}});
+    ASSERT_EQ(results.size(), 1);
+    EXPECT_TRUE(results[0].has_value());
+    // One failed write + one retried write.
+    EXPECT_EQ(controlled->WriteCallCount(), 2);
+    // One initial open in GetOrOpenShard + one reopen.
+    EXPECT_EQ(controlled->OpenCallCount(), 2);
+
+    AlignedBuffer read_buf(4096);
+    ASSERT_NE(read_buf.data(), nullptr);
+    auto read_results = backend->BatchRead(
+        {{"key", desc, {{read_buf.data(), read_buf.size()}}}});
+    ASSERT_EQ(read_results.size(), 1);
+    ASSERT_TRUE(read_results[0].has_value());
+    EXPECT_EQ(std::memcmp(write_buf.data(), read_buf.data(), write_buf.size()),
+              0);
+}
+
+TEST_F(DfsBackendTest, ReadReopensStaleDescriptorAndSucceeds) {
+    ControlledPosixFsAdapter* controlled = nullptr;
+    auto backend = MakeControlledBackend(tmp_->path(), &controlled);
+    ASSERT_TRUE(backend->Init().has_value());
+
+    AlignedBuffer write_buf(4096);
+    ASSERT_NE(write_buf.data(), nullptr);
+    write_buf.Fill('R');
+    const DistributedFSDescriptor desc{ShardPath(0), 0, 4096, 4096, 0};
+    auto write_results = backend->BatchWrite(
+        {{"key", desc, {{write_buf.data(), write_buf.size()}}}});
+    ASSERT_EQ(write_results.size(), 1);
+    ASSERT_TRUE(write_results[0].has_value());
+    const int opens_after_write = controlled->OpenCallCount();
+
+    // The first read fails; the backend should reopen the shard once and retry.
+    controlled->FailReadCall(1);
+    AlignedBuffer read_buf(4096);
+    ASSERT_NE(read_buf.data(), nullptr);
+    auto read_results = backend->BatchRead(
+        {{"key", desc, {{read_buf.data(), read_buf.size()}}}});
+    ASSERT_EQ(read_results.size(), 1);
+    ASSERT_TRUE(read_results[0].has_value());
+    // One failed read + one retried read.
+    EXPECT_EQ(controlled->ReadCallCount(), 2);
+    // The read path reopens exactly once on top of the shard already opened by
+    // the write.
+    EXPECT_EQ(controlled->OpenCallCount(), opens_after_write + 1);
+    EXPECT_EQ(std::memcmp(write_buf.data(), read_buf.data(), write_buf.size()),
+              0);
+}
+
+TEST_F(DfsBackendTest, WriteReopenExhaustedSurfacesError) {
+    ControlledPosixFsAdapter* controlled = nullptr;
+    auto backend = MakeControlledBackend(tmp_->path(), &controlled);
+    ASSERT_TRUE(backend->Init().has_value());
+
+    // A persistent failure at this offset survives the reopen-and-retry, so the
+    // error must surface after exactly one retry.
+    controlled->FailWriteAtOffset(0);
+
+    AlignedBuffer write_buf(4096);
+    ASSERT_NE(write_buf.data(), nullptr);
+    const DistributedFSDescriptor desc{ShardPath(0), 0, 4096, 4096, 0};
+    auto results = backend->BatchWrite(
+        {{"key", desc, {{write_buf.data(), write_buf.size()}}}});
+    ASSERT_EQ(results.size(), 1);
+    ASSERT_FALSE(results[0].has_value());
+    EXPECT_EQ(results[0].error(), ErrorCode::FILE_WRITE_FAIL);
+    // Retry is bounded to one attempt: initial write + one retry.
+    EXPECT_EQ(controlled->WriteCallCount(), 2);
+    // Initial open + one reopen; no unbounded reopen loop.
+    EXPECT_EQ(controlled->OpenCallCount(), 2);
+}
+
+TEST_F(DfsBackendTest, ReadReopenExhaustedSurfacesError) {
+    ControlledPosixFsAdapter* controlled = nullptr;
+    auto backend = MakeControlledBackend(tmp_->path(), &controlled);
+    ASSERT_TRUE(backend->Init().has_value());
+
+    AlignedBuffer write_buf(4096);
+    ASSERT_NE(write_buf.data(), nullptr);
+    write_buf.Fill('X');
+    const DistributedFSDescriptor desc{ShardPath(0), 0, 4096, 4096, 0};
+    auto write_results = backend->BatchWrite(
+        {{"key", desc, {{write_buf.data(), write_buf.size()}}}});
+    ASSERT_EQ(write_results.size(), 1);
+    ASSERT_TRUE(write_results[0].has_value());
+    const int reads_before = controlled->ReadCallCount();
+
+    // Persistent read failure survives the reopen-and-retry.
+    controlled->FailReadAtOffset(0);
+    AlignedBuffer read_buf(4096);
+    ASSERT_NE(read_buf.data(), nullptr);
+    auto read_results = backend->BatchRead(
+        {{"key", desc, {{read_buf.data(), read_buf.size()}}}});
+    ASSERT_EQ(read_results.size(), 1);
+    ASSERT_FALSE(read_results[0].has_value());
+    EXPECT_EQ(read_results[0].error(), ErrorCode::FILE_READ_FAIL);
+    // Retry bounded to one attempt: initial read + one retry.
+    EXPECT_EQ(controlled->ReadCallCount(), reads_before + 2);
+}
+
+TEST_F(DfsBackendTest, WriteSkipsReopenWhenAdapterOptsOut) {
+    ControlledPosixFsAdapter* controlled = nullptr;
+    auto backend = MakeControlledBackend(tmp_->path(), &controlled);
+    ASSERT_TRUE(backend->Init().has_value());
+
+    // An adapter whose faults are not fd-recoverable (SupportsFdReopen() ==
+    // false, modelling 3FS) must surface the write error directly, with no
+    // reopen-and-retry.
+    controlled->SetSupportsFdReopen(false);
+    controlled->FailWriteCall(1);
+
+    AlignedBuffer write_buf(4096);
+    ASSERT_NE(write_buf.data(), nullptr);
+    const DistributedFSDescriptor desc{ShardPath(0), 0, 4096, 4096, 0};
+    auto results = backend->BatchWrite(
+        {{"key", desc, {{write_buf.data(), write_buf.size()}}}});
+    ASSERT_EQ(results.size(), 1);
+    ASSERT_FALSE(results[0].has_value());
+    EXPECT_EQ(results[0].error(), ErrorCode::FILE_WRITE_FAIL);
+    // No retry and no reopen: exactly one write, one initial open.
+    EXPECT_EQ(controlled->WriteCallCount(), 1);
+    EXPECT_EQ(controlled->OpenCallCount(), 1);
+}
+
+TEST_F(DfsBackendTest, ReadSkipsReopenWhenAdapterOptsOut) {
+    ControlledPosixFsAdapter* controlled = nullptr;
+    auto backend = MakeControlledBackend(tmp_->path(), &controlled);
+    ASSERT_TRUE(backend->Init().has_value());
+
+    AlignedBuffer write_buf(4096);
+    ASSERT_NE(write_buf.data(), nullptr);
+    write_buf.Fill('N');
+    const DistributedFSDescriptor desc{ShardPath(0), 0, 4096, 4096, 0};
+    auto write_results = backend->BatchWrite(
+        {{"key", desc, {{write_buf.data(), write_buf.size()}}}});
+    ASSERT_EQ(write_results.size(), 1);
+    ASSERT_TRUE(write_results[0].has_value());
+    const int opens_after_write = controlled->OpenCallCount();
+
+    // Opt out of fd reopen, then fail the read: the error must surface with no
+    // reopen-and-retry.
+    controlled->SetSupportsFdReopen(false);
+    controlled->FailReadCall(1);
+    AlignedBuffer read_buf(4096);
+    ASSERT_NE(read_buf.data(), nullptr);
+    auto read_results = backend->BatchRead(
+        {{"key", desc, {{read_buf.data(), read_buf.size()}}}});
+    ASSERT_EQ(read_results.size(), 1);
+    ASSERT_FALSE(read_results[0].has_value());
+    EXPECT_EQ(read_results[0].error(), ErrorCode::FILE_READ_FAIL);
+    // No reopen on the read path when the adapter opts out.
+    EXPECT_EQ(controlled->OpenCallCount(), opens_after_write);
+}
+
+TEST_F(DfsBackendTest, ReopenOpenFailureLeavesShardReopenable) {
+    ControlledPosixFsAdapter* controlled = nullptr;
+    auto backend = MakeControlledBackend(tmp_->path(), &controlled);
+    ASSERT_TRUE(backend->Init().has_value());
+
+    // First write fails, triggering a reopen whose OpenFile (the 2nd open) also
+    // fails. The shard's fd must be reset to -1 so a later request can re-open
+    // it and succeed.
+    controlled->FailWriteCall(1);
+    controlled->FailOpenCall(2);
+
+    AlignedBuffer write_buf(4096);
+    ASSERT_NE(write_buf.data(), nullptr);
+    write_buf.Fill('Z');
+    const DistributedFSDescriptor desc{ShardPath(0), 0, 4096, 4096, 0};
+    auto first = backend->BatchWrite(
+        {{"key", desc, {{write_buf.data(), write_buf.size()}}}});
+    ASSERT_EQ(first.size(), 1);
+    ASSERT_FALSE(first[0].has_value());
+    EXPECT_EQ(first[0].error(), ErrorCode::FILE_WRITE_FAIL);
+
+    // The reopen failure left fd == -1; the next write re-initializes the shard
+    // (3rd open) and succeeds because both the write-fail and open-fail
+    // triggers are one-shot on earlier call indices.
+    auto second = backend->BatchWrite(
+        {{"key", desc, {{write_buf.data(), write_buf.size()}}}});
+    ASSERT_EQ(second.size(), 1);
+    ASSERT_TRUE(second[0].has_value());
+    EXPECT_EQ(controlled->OpenCallCount(), 3);
+
+    AlignedBuffer read_buf(4096);
+    ASSERT_NE(read_buf.data(), nullptr);
+    auto read_results = backend->BatchRead(
+        {{"key", desc, {{read_buf.data(), read_buf.size()}}}});
+    ASSERT_EQ(read_results.size(), 1);
+    ASSERT_TRUE(read_results[0].has_value());
+    EXPECT_EQ(std::memcmp(write_buf.data(), read_buf.data(), write_buf.size()),
+              0);
+}
+
+TEST_F(DfsBackendTest, ConcurrentWritesWithReopenPreserveData) {
+    ControlledPosixFsAdapter* controlled = nullptr;
+    auto backend = MakeControlledBackend(tmp_->path(), &controlled);
+    ASSERT_TRUE(backend->Init().has_value());
+
+    constexpr int kThreads = 8;
+    constexpr int64_t kBlock = 4096;
+    // One thread's write fails exactly once and must recover via a single
+    // reopen. Because all shard I/O is serialized by the per-shard mutex, the
+    // close+reopen cannot race the other threads' concurrent writes.
+    controlled->FailWriteAtOffsetOnce(3 * kBlock);
+
+    std::vector<std::unique_ptr<AlignedBuffer>> buffers(kThreads);
+    for (int i = 0; i < kThreads; ++i) {
+        buffers[i] = std::make_unique<AlignedBuffer>(kBlock);
+        ASSERT_NE(buffers[i]->data(), nullptr);
+        buffers[i]->Fill(static_cast<char>('A' + i));
+    }
+
+    std::vector<std::thread> threads;
+    std::atomic<int> failures{0};
+    for (int i = 0; i < kThreads; ++i) {
+        threads.emplace_back([&, i]() {
+            const DistributedFSDescriptor desc{ShardPath(0), i * kBlock, kBlock,
+                                               kBlock, 0};
+            auto results = backend->BatchWrite(
+                {{"key_" + std::to_string(i),
+                  desc,
+                  {{buffers[i]->data(), buffers[i]->size()}}}});
+            if (results.size() != 1 || !results[0].has_value()) {
+                ++failures;
+            }
+        });
+    }
+    for (auto& t : threads) t.join();
+    EXPECT_EQ(failures.load(), 0);
+
+    // Every distinct offset must hold exactly the bytes its writer produced,
+    // including the offset that went through the reopen path.
+    for (int i = 0; i < kThreads; ++i) {
+        AlignedBuffer read_buf(kBlock);
+        ASSERT_NE(read_buf.data(), nullptr);
+        const DistributedFSDescriptor desc{ShardPath(0), i * kBlock, kBlock,
+                                           kBlock, 0};
+        auto read_results =
+            backend->BatchRead({{"key_" + std::to_string(i),
+                                 desc,
+                                 {{read_buf.data(), read_buf.size()}}}});
+        ASSERT_EQ(read_results.size(), 1);
+        ASSERT_TRUE(read_results[0].has_value());
+        EXPECT_EQ(std::memcmp(buffers[i]->data(), read_buf.data(), kBlock), 0);
+    }
 }
 
 TEST_F(DfsBackendTest, RejectsInvalidDescriptorRangesBeforeIo) {
