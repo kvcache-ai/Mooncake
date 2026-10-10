@@ -313,8 +313,14 @@ class TransferMetadata {
                    const NotifyDesc &local_desc, NotifyDesc &peer_desc);
     int sendProbe(const std::string &peer_server_name);
 
-    void dumpMetadataContent(const std::string &segment_name = "",
-                             uint64_t offset = 0, uint64_t length = 0);
+    // Record a failed peer buffer/device selection.  Runs on the transfer
+    // worker (CQ polling) thread, so the record is fixed-size and capped
+    // process-wide: one line per throttle window plus a suppressed-event
+    // count.  Uses the descriptor the caller already holds — the exact
+    // version the failed selection matched against — instead of
+    // re-looking-up the cache, and takes no metadata locks.
+    void dumpMetadataContent(const std::shared_ptr<const SegmentDesc> &desc,
+                             uint64_t offset, uint64_t length);
 
     void dumpMetadataContentUnlocked();
 

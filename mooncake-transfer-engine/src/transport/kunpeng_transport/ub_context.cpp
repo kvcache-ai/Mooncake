@@ -253,12 +253,12 @@ int UbWorkerPool::submitPostSend(
                                           slice->ub.dest_addr, slice->length,
                                           hint, buffer_id, device_id)) {
                 slice->markFailed();
-                for (const auto& dev_desc : peer_segment_desc.get()->devices) {
-                    LOG(ERROR) << "peer device : " << dev_desc.name;
-                }
+                failed_target_ids[slice->target_id] = getCurrentTimeInNano();
+                // The per-device list used to be logged here per event,
+                // which floods under failure storms; the throttled
+                // fixed-size record inside dumpMetadataContent covers it.
                 context_.engine().meta()->dumpMetadataContent(
-                    peer_segment_desc->name, slice->ub.dest_addr,
-                    slice->length);
+                    peer_segment_desc, slice->ub.dest_addr, slice->length);
                 continue;
             }
         }
