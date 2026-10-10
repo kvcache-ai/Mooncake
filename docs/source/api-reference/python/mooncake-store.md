@@ -1082,6 +1082,63 @@ store.setup("localhost", "http://localhost:8080/metadata", 512*1024*1024, 128*10
 
 </details>
 
+The class also accepts a configuration dictionary. For the EGM Provider and
+Consumer examples below, select NVLink explicitly before calling `setup()`:
+
+```bash
+export MC_MS_AUTO_DISC=0
+# MC_FORCE_MNNVL is not needed with manual protocol selection.
+```
+
+```python
+# EGM Provider
+store.setup({
+    "local_hostname": "10.192.8.81:12345",
+    "metadata_server": "http://10.192.8.81:8079/metadata",
+    "master_server_addr": "10.192.8.81:50051",
+    "protocol": "nvlink",
+    "global_segment_size": str(64 * 1024**3),
+    "local_buffer_size": "0",
+    "enable_egm_store_pool": "true",
+    "egm_numa_nodes": "auto",  # or, for example, "0,1"
+})
+```
+
+`enable_egm_store_pool` defaults to `false`; `egm_numa_nodes` defaults to
+`auto`. These controls apply only to this dictionary overload. The EGM pool
+requires a `USE_MNNVL=ON` build, a non-TENT Transfer Engine, and the exact
+`nvlink`/nonzero-global/zero-local combination shown above. With `auto`, nodes
+come from the visible GPUs' CUDA `CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID` values.
+
+EGM capacity is rounded down to a multiple of the common alignment: the
+maximum of the Store slab alignment and the selected nodes' CUDA allocation
+granularities. It is then divided across nodes and split into balanced,
+aligned chunks no larger than `max_mr_size`. This capacity planning applies
+only to the EGM pool.
+
+An ordinary Consumer does not enable the EGM pool; it uses `protocol="nvlink"`
+to access the Provider's mounted segments:
+
+```python
+# Consumer accessing the Provider's EGM pool
+consumer.setup({
+    "local_hostname": "10.192.8.58:12400",
+    "metadata_server": "http://10.192.8.81:8079/metadata",
+    "master_server_addr": "10.192.8.81:50051",
+    "protocol": "nvlink",
+    "global_segment_size": "0",
+    "local_buffer_size": "0",
+    "rdma_devices": "",
+    "enable_egm_store_pool": "false",
+})
+```
+
+Manual NVLink selection is supported for both Providers and Consumers.
+If you instead set `MC_MS_AUTO_DISC=1`, EGM setup verifies that the selected
+non-TENT engine actually has the `nvlink` transport installed and fails before
+allocating EGM memory otherwise. Set `MC_FORCE_MNNVL=1` when using discovery on
+hosts with RDMA HCAs to select MNNVL instead of RDMA.
+
 ---
 #### setup_dummy()
 Initialize the store with a dummy client for testing purposes.
@@ -2093,18 +2150,37 @@ store.close()
 ---
 
 #### close()
-Clean up all resources and terminate connections.
+Terminate the store and clean up its resources. Before calling `close()`, wait
+for setup and all application and offload calls to finish; do not issue new
+calls concurrently. Close stops local services. For an EGM Provider, close
+also stops `FileStorage` workers before unmounting EGM segments and
+releasing their backing memory.
+
+Close is terminal: both real-client and dummy-client handles are cleared from
+the Python object even when cleanup fails. Further `close()` calls are
+idempotent, not cleanup retries. Repeated `setup()` calls are not a recovery
+mechanism.
+
+If EGM setup fails, Mooncake attempts cleanup even for failed or uncertain
+mounts. When unmount cannot be confirmed, it logs the error and retains the
+affected EGM allocation until process exit. CUDA cleanup failures likewise
+retain any remaining resources. Recreating the store does not reclaim retained
+resources; restart the process to reclaim them.
+A failed mount may leave a remote segment record: close does not guarantee
+synchronous remote cleanup, and there is no background cleanup reaper.
 
 ```python
 def close(self) -> int
 ```
 
 **Returns:**
-- `int`: Status code (0 = success, non-zero = error code)
+- `int`: Status code (0 = success, non-zero = terminal cleanup failure).
 
 **Example:**
 ```python
-store.close()
+if store.close() != 0:
+    # Inspect the cleanup logs; retained EGM memory requires process restart.
+    raise RuntimeError("Store cleanup failed")
 ```
 
 ---
