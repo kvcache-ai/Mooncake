@@ -8,7 +8,10 @@ used by Mooncake. It can be used as an alternative to etcd for metadata storage.
 
 import argparse
 import asyncio
+import hmac
+import ipaddress
 import logging
+import os
 import signal
 import sys
 import threading
@@ -16,6 +19,26 @@ from enum import Enum
 from time import sleep
 
 from aiohttp import web
+
+
+def _int_env(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logging.warning(f"Ignoring invalid {name}={raw!r}: not an integer")
+        return default
+
+
+def _is_loopback(host: str) -> bool:
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 class KVPoll(Enum):
@@ -43,6 +66,15 @@ class KVBootstrapServer:
         self.app = web.Application()
         self.store = dict()
         self.lock = asyncio.Lock()
+        # Shared-token authentication (#4444). Both this server and every
+        # engine's HTTPStoragePlugin read the same env; unset keeps the
+        # legacy open behavior for trusted-network deployments.
+        self.auth_token = os.environ.get("MC_METADATA_HTTP_TOKEN") or None
+        # The store is otherwise a memory faucet: many mid-size PUTs sail
+        # under aiohttp's per-body limit and grow RSS without bound.
+        self.max_keys = _int_env("MC_METADATA_MAX_KEYS", 65536)
+        self.max_total_bytes = _int_env("MC_METADATA_MAX_TOTAL_BYTES", 1 << 30)
+        self._total_bytes = 0
         self._loop = None
         self._runner = None
         self.thread = None
@@ -53,7 +85,21 @@ class KVBootstrapServer:
         self.thread = threading.Thread(target=self._run_server, daemon=True)
         self.thread.start()
         logging.info(f"HTTP Metadata Server started on {self.host}:{self.port}")
+        if self.auth_token is None and not _is_loopback(self.host):
+            logging.warning(
+                f"HTTP Metadata Server is bound to {self.host} with no "
+                "authentication token: anyone who can reach this port can "
+                "read and rewrite cluster metadata. Set "
+                "MC_METADATA_HTTP_TOKEN here and on every engine."
+            )
         return self.thread
+
+    def _token_ok(self, request: web.Request) -> bool:
+        header = request.headers.get("Authorization", "")
+        scheme, _, presented = header.partition(" ")
+        if scheme.lower() != "bearer" or not presented:
+            return False
+        return hmac.compare_digest(presented.encode(), self.auth_token.encode())
 
     def _setup_routes(self):
         """Set up the HTTP routes."""
@@ -61,6 +107,11 @@ class KVBootstrapServer:
 
     async def _handle_metadata(self, request: web.Request):
         """Handle metadata requests."""
+        if self.auth_token is not None and not self._token_ok(request):
+            return web.Response(
+                text="unauthorized", status=401, content_type="application/json"
+            )
+
         key = request.query.get("key", "").strip()
         if not key:
             return web.Response(
@@ -108,7 +159,24 @@ class KVBootstrapServer:
                     status=400,
                     content_type="application/json",
                 )
+            old = self.store.get(key)
+            if old is None and len(self.store) >= self.max_keys:
+                return web.Response(
+                    text="metadata key budget exhausted",
+                    status=507,
+                    content_type="application/json",
+                )
+            new_total = (
+                self._total_bytes - (len(old) if old is not None else 0) + len(data)
+            )
+            if new_total > self.max_total_bytes:
+                return web.Response(
+                    text="metadata size budget exhausted",
+                    status=507,
+                    content_type="application/json",
+                )
             self.store[key] = data
+            self._total_bytes = new_total
         return web.Response(
             text="metadata updated", status=200, content_type="application/json"
         )
@@ -122,6 +190,7 @@ class KVBootstrapServer:
                     status=404,
                     content_type="application/json",
                 )
+            self._total_bytes -= len(self.store[key])
             del self.store[key]
         return web.Response(
             text="metadata deleted", status=200, content_type="application/json"
