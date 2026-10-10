@@ -130,7 +130,8 @@ class FileStorage {
 
     tl::expected<void, ErrorCode> PrefetchKeys(
         const std::vector<std::string>& keys, const std::vector<int64_t>& sizes,
-        bool* dram_pressure = nullptr, PrefetchKeyCallback on_key_done = nullptr,
+        bool* dram_pressure = nullptr,
+        PrefetchKeyCallback on_key_done = nullptr,
         const std::string& tenant_id = "");
 
     /**

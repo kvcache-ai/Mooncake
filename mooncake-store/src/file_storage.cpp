@@ -1071,8 +1071,9 @@ std::optional<int64_t> FileStorage::LookupLocalObjectSize(
         return size;
     }
     // Tenant-scoped fallback: bucket keys are stored scoped by tenant.
-    const std::string& lookup_tenant =
-        tenant_id.empty() && client_ != nullptr ? client_->tenant_id() : tenant_id;
+    const std::string& lookup_tenant = tenant_id.empty() && client_ != nullptr
+                                           ? client_->tenant_id()
+                                           : tenant_id;
     if (!lookup_tenant.empty()) {
         const auto scoped = TenantId(lookup_tenant).MakeScopedKey(key);
         if (scoped != key) {

@@ -7725,7 +7725,7 @@ RealClient::batch_get_into_multi_buffers_internal(
         // would turn the co-batch keys' successful transfers into
         // LEASE_EXPIRED.
         int64_t lease_floor_ms = std::numeric_limits<int64_t>::max();
-        for (const auto& query_result : query_results) {
+        for (const auto &query_result : query_results) {
             if (query_result && !query_result->replicas.empty()) {
                 lease_floor_ms = std::min(
                     lease_floor_ms,
@@ -7829,8 +7829,8 @@ RealClient::batch_get_into_multi_buffers_internal(
                 }
             }
             if (refreshed_qr.has_value()) {
-                const auto *best = SelectBestReplica(refreshed_qr->replicas,
-                                                     local_endpoints);
+                const auto *best =
+                    SelectBestReplica(refreshed_qr->replicas, local_endpoints);
                 if (best != nullptr) {
                     best_replica = best;
                 }

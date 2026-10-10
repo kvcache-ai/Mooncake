@@ -35,8 +35,7 @@ struct SsdPrefetchRoute {
 // so they cannot collide with same-named local keys. Keys in the holder's
 // own tenant keep the raw form, so single-tenant behavior is unchanged.
 std::string ScopeTenantKey(const std::string& own_tenant,
-                           const std::string& tenant,
-                           const std::string& key) {
+                           const std::string& tenant, const std::string& key) {
     return tenant == own_tenant ? key : TenantId(tenant).MakeScopedKey(key);
 }
 
@@ -84,8 +83,8 @@ void RegisterAndPromote(Client& client, FileStorage& file_storage,
                         const std::vector<int64_t>& sizes,
                         const std::string& tenant_id) {
     const std::string own_tenant = client.tenant_id();
-    auto on_key_done = [throttle, own_tenant,
-                        tenant_id](const std::string& key, bool success) {
+    auto on_key_done = [throttle, own_tenant, tenant_id](const std::string& key,
+                                                         bool success) {
         if (!throttle) {
             return;
         }
@@ -111,13 +110,12 @@ void RegisterAndPromote(Client& client, FileStorage& file_storage,
             continue;
         }
         if (throttle) {
-            throttle->markInFlight(ScopeTenantKey(own_tenant, tenant_id,
-                                                  keys[i]));
+            throttle->markInFlight(
+                ScopeTenantKey(own_tenant, tenant_id, keys[i]));
         }
         bool dram_pressure = false;
-        auto prefetch_res =
-            file_storage.PrefetchKeys({keys[i]}, {sizes[i]}, &dram_pressure,
-                                      on_key_done, tenant_id);
+        auto prefetch_res = file_storage.PrefetchKeys(
+            {keys[i]}, {sizes[i]}, &dram_pressure, on_key_done, tenant_id);
         if (!prefetch_res) {
             LOG(WARNING) << "SSD prefetch: PrefetchKeys failed for key="
                          << keys[i] << ", error=" << prefetch_res.error();
@@ -342,8 +340,8 @@ void SsdPrefetcher::RunLocalPrefetch(const std::vector<std::string>& keys,
             if (!local_size || *local_size <= 0) {
                 VLOG(1) << "SSD prefetch: skip remote key=" << key
                         << " (not in local object map)";
-                throttle->markFailed(ScopeTenantKey(own_tenant, tenant_id,
-                                                    key));
+                throttle->markFailed(
+                    ScopeTenantKey(own_tenant, tenant_id, key));
                 continue;
             }
             local_keys.push_back(key);
