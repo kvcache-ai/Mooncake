@@ -289,7 +289,25 @@ MasterService::MasterService(const MasterServiceConfig& config)
         tenant_quota_policy_store_ = std::move(store.value());
     }
 
-    if (config.enable_snapshot_restore && !config.enable_oplog_snapshot) {
+    if (config.initial_snapshot_payloads) {
+        if (enable_oplog_ || config.enable_oplog_snapshot) {
+            throw MasterSnapshotRestoreError(
+                ErrorCode::INVALID_PARAMS,
+                "Full master snapshot handoff requires snapshot-only mode");
+        }
+        ha::MasterSnapshotCodec codec;
+        auto restored = codec.Decode(this, *config.initial_snapshot_payloads);
+        if (restored)
+            restored = ApplySnapshotState(std::chrono::system_clock::now());
+        if (!restored) {
+            ResetStateAfterFailedRestoreAttempt();
+            throw MasterSnapshotRestoreError(
+                restored.error().code,
+                "Failed to restore supplied master snapshot: " +
+                    restored.error().message);
+        }
+    } else if (config.enable_snapshot_restore &&
+               !config.enable_oplog_snapshot) {
         RestoreState();
     }
     if (enable_multi_tenants_) {
@@ -1608,13 +1626,26 @@ void MasterService::RebuildTenantQuotaUsageFromMetadata() {
     for (size_t i = 0; i < kNumShards; ++i) {
         MetadataShardAccessorRO shard(this, i);
         for (const auto& [tenant_id, tenant_state] : shard->tenants) {
+            for (const auto& [key, task] : tenant_state.replication_tasks) {
+                auto& charged_bytes = usage[tenant_id];
+                if (task.pending_quota_charge_bytes >
+                        TenantQuotaAccount::kMaxChargedBytes ||
+                    charged_bytes > TenantQuotaAccount::kMaxChargedBytes -
+                                        task.pending_quota_charge_bytes) {
+                    throw MasterSnapshotRestoreError(
+                        ErrorCode::DESERIALIZE_FAIL,
+                        "rebuilt pending tenant quota exceeds 2^63 - 1 bytes");
+                }
+                charged_bytes += task.pending_quota_charge_bytes;
+            }
             for (const auto& [_, metadata] : tenant_state.metadata) {
                 auto& charged_bytes = usage[tenant_id];
                 const uint64_t charge = CompletedMemoryQuotaCharge(metadata);
                 if (charge > TenantQuotaAccount::kMaxChargedBytes ||
                     charged_bytes >
                         TenantQuotaAccount::kMaxChargedBytes - charge) {
-                    throw std::overflow_error(
+                    throw MasterSnapshotRestoreError(
+                        ErrorCode::DESERIALIZE_FAIL,
                         "rebuilt tenant quota exceeds 2^63 - 1 bytes");
                 }
                 charged_bytes += charge;
@@ -1632,9 +1663,10 @@ void MasterService::RebuildTenantQuotaUsageFromMetadata() {
                     tenant_state.quota_account,
                     CompletedMemoryQuotaCharge(metadata));
                 if (!rebuild_result) {
-                    throw std::runtime_error(
+                    throw MasterSnapshotRestoreError(
+                        ErrorCode::DESERIALIZE_FAIL,
                         "failed to rebuild object tenant quota ledger for " +
-                        tenant_id.value() + "/" + key);
+                            tenant_id.value() + "/" + key);
                 }
             }
         }
@@ -1652,7 +1684,9 @@ void MasterService::RebuildTenantQuotaUsageFromMetadata() {
     const uint64_t capacity = GetTenantQuotaAllocatableCapacityBytes();
     auto rebuild_result = tenant_quota_table_.RebuildUsage(usage, capacity);
     if (!rebuild_result) {
-        throw std::runtime_error("failed to rebuild tenant quota usage");
+        throw MasterSnapshotRestoreError(
+            ErrorCode::DESERIALIZE_FAIL,
+            "failed to rebuild tenant quota usage");
     }
 }
 
@@ -3913,6 +3947,7 @@ tl::expected<size_t, ErrorCode> MasterService::InstallLegacyStandbyObjects(
 
 tl::expected<void, ErrorCode> MasterService::SetSegmentStatus(
     const std::string& segment_name, SegmentStatus status) {
+    std::lock_guard<std::mutex> drain_lock(drain_snapshot_mutex_);
     if (status != SegmentStatus::OK && status != SegmentStatus::DRAINING) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
@@ -3942,6 +3977,26 @@ tl::expected<void, ErrorCode> MasterService::SetSegmentStatus(
     if (current != SegmentStatus::OK && current != SegmentStatus::DRAINING) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
+
+    if (current == SegmentStatus::DRAINING && status == SegmentStatus::OK) {
+        auto tasks = task_manager_.get_read_access();
+        for (const auto& [id, task] : tasks) {
+            if (task.type != TaskType::REPLICA_MOVE || task.is_finished())
+                continue;
+            ReplicaMovePayload payload;
+            try {
+                struct_json::from_json(payload, task.payload);
+            } catch (...) {
+                return tl::make_unexpected(
+                    ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+            }
+            if (payload.source == segment_name) {
+                return tl::make_unexpected(
+                    ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+            }
+        }
+    }
+
     err = segment_access.SetSegmentStatusByName(segment_name, status);
     if (err != ErrorCode::OK) {
         return tl::make_unexpected(err);
@@ -7598,6 +7653,14 @@ tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
     }
     Replica::Descriptor source_descriptor;
     if (!TryGetReadableReplicaDescriptor(*source, source_descriptor)) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+
+    // A recovered orphan can retain a target buffer whose writer has not
+    // finished. Reusing it as a completed copy would let MoveEnd delete the
+    // only complete source without transferring data.
+    const auto* existing_target = metadata.GetReplicaBySegmentName(tgt_segment);
+    if (existing_target && !existing_target->is_completed()) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
 
@@ -11587,6 +11650,10 @@ void MasterService::RestoreState() {
 }
 
 void MasterService::ResetStateAfterFailedRestoreAttempt() {
+    {
+        std::lock_guard<std::mutex> lock(job_mutex_);
+        drain_jobs_.clear();
+    }
     SegmentSerializer segment_serializer(&segment_manager_);
     MetadataSerializer metadata_serializer(this);
     TaskManagerSerializer task_manager_serializer(&task_manager_);
@@ -11726,6 +11793,33 @@ tl::expected<void, SerializationError> MasterService::ApplySnapshotState(
         segment_access.GetAllSegmentNames(segment_names);
     }
 
+    std::unordered_set<std::string> draining_segments;
+    std::unordered_set<std::string> owned_segments;
+    std::unordered_set<std::string> active_keys;
+    for (const auto& [id, job] : drain_jobs_) {
+        if (job->status < JobStatus::SUCCEEDED) {
+            owned_segments.insert(job->request.segments.begin(),
+                                  job->request.segments.end());
+        }
+        for (const auto& [task_id, task] : job->active_tasks) {
+            active_keys.insert(MakeDrainUnitKey(task.tenant_id, task.key, ""));
+        }
+    }
+    for (const auto& name : segment_names) {
+        auto status = QuerySegmentStatus(name);
+        if (status && *status == SegmentStatus::DRAINING) {
+            draining_segments.insert(name);
+            if (!owned_segments.contains(name)) {
+                LOG(WARNING) << "[Restore] orphaned DRAINING segment=" << name
+                             << "; kept non-allocatable. Finish outstanding "
+                                "moves before "
+                                "using PUT /api/v1/segments/status to resume "
+                                "allocation.";
+                MasterMetricManager::instance().inc_orphaned_draining_restore();
+            }
+        }
+    }
+
     // Cleanup expired metadata (unless test environment disables it)
     {
         const bool skip_cleanup =
@@ -11738,9 +11832,26 @@ tl::expected<void, SerializationError> MasterService::ApplySnapshotState(
                     auto& tenant_state = tenant_it->second;
                     for (auto it = tenant_state.metadata.begin();
                          it != tenant_state.metadata.end();) {
-                        if (it->second.HasDiffRepStatus(
-                                ReplicaStatus::COMPLETE) ||
-                            it->second.IsLeaseExpired(cleanup_now)) {
+                        const auto replicas =
+                            it->second.GetReplicaSegmentNames();
+                        const bool drain_object =
+                            active_keys.contains(MakeDrainUnitKey(
+                                tenant_it->first, it->first, "")) ||
+                            std::any_of(
+                                replicas.begin(), replicas.end(),
+                                [&](const auto& name) {
+                                    return draining_segments.contains(name);
+                                });
+                        // A drain schedules lease-expired objects. Keep those
+                        // objects (including orphans) and validated in-flight
+                        // moves.
+                        const bool keep_drain =
+                            drain_object &&
+                            it->second.HasReplica(&Replica::fn_is_completed);
+                        if (!keep_drain &&
+                            (it->second.HasDiffRepStatus(
+                                 ReplicaStatus::COMPLETE) ||
+                             it->second.IsLeaseExpired(cleanup_now))) {
                             VLOG(1) << "clear metadata key=" << it->first;
                             it = EraseMetadata(tenant_state, it,
                                                tenant_it->first);
@@ -11807,16 +11918,23 @@ tl::expected<void, SerializationError> MasterService::ApplySnapshotState(
                 segment_name);
         }
 
-        ScopedSegmentAccess segment_access =
-            segment_manager_.getSegmentAccess();
         std::vector<std::pair<Segment, UUID>> unready_segments;
-        if (segment_access.GetUnreadySegments(unready_segments) ==
-            ErrorCode::OK) {
-            for (const auto& [segment, client_id] : unready_segments) {
-                UnmountSegment(segment.id, client_id);
-            }
+        {
+            ScopedSegmentAccess access = segment_manager_.getSegmentAccess();
+            access.GetUnreadySegments(unready_segments);
+            std::erase_if(unready_segments, [&](const auto& entry) {
+                SegmentStatus status = SegmentStatus::UNDEFINED;
+                access.GetSegmentStatusById(entry.first.id, status);
+                return status == SegmentStatus::DRAINING ||
+                       status == SegmentStatus::DRAINED;
+            });
+        }
+        for (const auto& [segment, client_id] : unready_segments) {
+            UnmountSegment(segment.id, client_id);
         }
 
+        ScopedSegmentAccess segment_access =
+            segment_manager_.getSegmentAccess();
         std::vector<std::pair<Segment, UUID>> all_segments;
         auto err = segment_access.GetAllSegments(all_segments);
 
@@ -14636,6 +14754,7 @@ tl::expected<void, ErrorCode> MasterService::ValidateDrainRequestLocked(
 
 tl::expected<UUID, ErrorCode> MasterService::CreateDrainJob(
     const CreateDrainJobRequest& request) {
+    std::lock_guard<std::mutex> drain_lock(drain_snapshot_mutex_);
     // Held until the job is registered so SetSegmentStatus never sees a
     // segment this job has marked DRAINING without also seeing the job.
     std::lock_guard<std::mutex> lock(job_mutex_);
@@ -14711,6 +14830,7 @@ tl::expected<QueryJobResponse, ErrorCode> MasterService::QueryDrainJob(
 
 tl::expected<void, ErrorCode> MasterService::CancelDrainJob(
     const UUID& job_id) {
+    std::lock_guard<std::mutex> drain_lock(drain_snapshot_mutex_);
     std::shared_ptr<DrainJob> job;
     {
         std::lock_guard<std::mutex> lock(job_mutex_);
@@ -15050,6 +15170,7 @@ bool MasterService::MaybeCompleteDrainJob(DrainJob& job) {
 }
 
 void MasterService::ProcessDrainJobs() {
+    std::lock_guard<std::mutex> drain_lock(drain_snapshot_mutex_);
     std::vector<std::shared_ptr<DrainJob>> jobs;
     {
         std::lock_guard<std::mutex> lock(job_mutex_);
@@ -15077,9 +15198,44 @@ void MasterService::ProcessDrainJobs() {
     }
 }
 
+void MasterService::WarnOrphanedDrainingSegments() {
+    std::lock_guard drain_lock(drain_snapshot_mutex_);
+    std::unordered_set<std::string> owned;
+    {
+        std::lock_guard lock(job_mutex_);
+        for (const auto& [id, job] : drain_jobs_) {
+            std::lock_guard job_lock(job->mutex);
+            if (job->status < JobStatus::SUCCEEDED)
+                owned.insert(job->request.segments.begin(),
+                             job->request.segments.end());
+        }
+    }
+    auto access = segment_manager_.getSegmentAccess();
+    std::vector<std::pair<Segment, UUID>> segments;
+    access.GetAllSegments(segments);
+    for (const auto& [segment, client] : segments) {
+        SegmentStatus status = SegmentStatus::UNDEFINED;
+        access.GetSegmentStatusById(segment.id, status);
+        if (status == SegmentStatus::DRAINING &&
+            !owned.contains(segment.name)) {
+            LOG(WARNING) << "[Drain] orphaned DRAINING segment=" << segment.name
+                         << " stranded_capacity_bytes=" << segment.size
+                         << "; finish outstanding transfers and use PUT "
+                            "/api/v1/segments/status to resume allocation.";
+        }
+    }
+}
+
 void MasterService::JobDispatchThreadFunc() {
+    auto next_orphan_warning =
+        std::chrono::steady_clock::now() + std::chrono::minutes(1);
     while (job_dispatch_running_) {
         ProcessDrainJobs();
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= next_orphan_warning) {
+            WarnOrphanedDrainingSegments();
+            next_orphan_warning = now + std::chrono::minutes(1);
+        }
         std::this_thread::sleep_for(
             std::chrono::milliseconds(kJobDispatchThreadSleepMs));
     }

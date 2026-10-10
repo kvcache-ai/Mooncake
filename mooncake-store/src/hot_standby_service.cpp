@@ -88,6 +88,7 @@ ErrorCode HotStandbyService::Start(const std::string& primary_address,
     batch_standby_reader_.reset();
     batch_standby_kv_backend_.reset();
     batch_snapshot_baseline_.reset();
+    master_snapshot_payloads_.reset();
     batch_snapshot_producer_view_version_ = 0;
     {
         std::lock_guard<std::mutex> cursor_lock(batch_snapshot_cursor_mutex_);
@@ -217,6 +218,7 @@ ErrorCode HotStandbyService::PrepareBootstrapBaselineLocked(
 ErrorCode HotStandbyService::LoadSnapshotBaselineLocked(
     uint64_t& baseline_seq_id) {
     baseline_seq_id = 0;
+    master_snapshot_payloads_.reset();
     metadata_store_->Clear();
     oplog_applier_->Recover(0);
 
@@ -274,6 +276,11 @@ ErrorCode HotStandbyService::LoadSnapshotBaselineLocked(
     }
     oplog_applier_->Recover(snapshot.snapshot_sequence_id);
     baseline_seq_id = snapshot.snapshot_sequence_id;
+    // A replayed object view is newer than these bytes. Never overwrite it
+    // with snapshot-era jobs/tasks during an OpLog-following promotion.
+    if (!config_.enable_oplog_following) {
+        master_snapshot_payloads_ = snapshot.master_snapshot_payloads;
+    }
     return ErrorCode::OK;
 }
 
@@ -411,6 +418,8 @@ void HotStandbyService::Stop() {
     if (verification_thread_.joinable()) {
         verification_thread_.join();
     }
+
+    master_snapshot_payloads_.reset();
 
     LOG(INFO) << "HotStandbyService stopped, final_state="
               << StandbyStateToString(GetState());
@@ -755,6 +764,7 @@ ErrorCode HotStandbyService::PromoteAndExportSnapshot(StandbySnapshot& out) {
     // Export snapshot BEFORE unlocking mutex (atomic promotion + export)
     uint64_t latest_applied_seq_id = GetLocalLastAppliedSequenceIdLocked();
     out.oplog_sequence_id = latest_applied_seq_id;
+    out.master_snapshot_payloads = master_snapshot_payloads_;
     if (metadata_store_) {
         metadata_store_->Snapshot(out.objects);
         out.weight_metadata = metadata_store_->SnapshotWeightMetadata();
@@ -892,6 +902,8 @@ bool HotStandbyService::ExportStandbySnapshot(StandbySnapshot& out) const {
     if (!IsRunning()) {
         return false;
     }
+
+    out.master_snapshot_payloads = master_snapshot_payloads_;
 
     // Get applied sequence ID (inline to avoid recursive mutex lock)
     if (oplog_applier_) {

@@ -3310,6 +3310,36 @@ TEST_F(MasterServiceTest, SetSegmentStatusStopsAndRestoresAllocation) {
               std::unordered_set<std::string>{"segment_0"});
 }
 
+TEST_F(MasterServiceTest, SetSegmentStatusKeepsOkIdempotentWithPendingMove) {
+    MasterService service;
+    const auto source = PrepareSimpleSegment(service, "status_source",
+                                             0x300000000, kDefaultSegmentSize);
+    [[maybe_unused]] const auto target = PrepareSimpleSegment(
+        service, "status_target", 0x400000000, kDefaultSegmentSize);
+    const auto key =
+        PutObjectOnSegment(service, source.client_id, "status_source");
+    auto task = service.CreateMoveTask(key, TenantId::Default(),
+                                       "status_source", "status_target");
+    ASSERT_TRUE(task);
+
+    EXPECT_TRUE(service.SetSegmentStatus("status_source", SegmentStatus::OK));
+    ASSERT_TRUE(
+        service.SetSegmentStatus("status_source", SegmentStatus::DRAINING));
+    auto reopened =
+        service.SetSegmentStatus("status_source", SegmentStatus::OK);
+    ASSERT_FALSE(reopened);
+    EXPECT_EQ(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS, reopened.error());
+
+    auto fetched = service.FetchTasks(source.client_id, 1);
+    ASSERT_TRUE(fetched);
+    ASSERT_EQ(1u, fetched->size());
+    TaskCompleteRequest failed;
+    failed.id = *task;
+    failed.status = TaskStatus::FAILED;
+    ASSERT_TRUE(service.MarkTaskToComplete(source.client_id, failed));
+    EXPECT_TRUE(service.SetSegmentStatus("status_source", SegmentStatus::OK));
+}
+
 TEST_F(MasterServiceTest, SetSegmentStatusRejectsOtherTargetStatuses) {
     auto service_ = std::make_unique<MasterService>();
     [[maybe_unused]] const auto ctx0 = PrepareSimpleSegment(

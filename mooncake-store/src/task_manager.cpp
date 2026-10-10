@@ -258,6 +258,8 @@ void ScopedTaskWriteAccess::prune_expired_tasks() {
 }
 
 void ScopedTaskWriteAccess::restore_task(Task&& task) {
+    // The legacy task format does not include this dispatch configuration.
+    task.max_retry_attempts = manager_->max_retry_attempts_;
     const UUID task_id = task.id;
     manager_->all_tasks_[task_id] = std::move(task);
     Task& stored_task = manager_->all_tasks_[task_id];

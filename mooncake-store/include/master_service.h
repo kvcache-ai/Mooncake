@@ -2370,6 +2370,7 @@ class MasterService {
         ScopedSegmentAccess& segment_access,
         const CreateDrainJobRequest& request);
     void ProcessDrainJobs();
+    void WarnOrphanedDrainingSegments();
     void RefreshDrainJobTasks(DrainJob& job);
     void ScheduleDrainJobTasks(DrainJob& job);
     bool MaybeCompleteDrainJob(DrainJob& job);
@@ -2383,6 +2384,9 @@ class MasterService {
     std::thread job_dispatch_thread_;
     std::atomic<bool> job_dispatch_running_{false};
     static constexpr uint64_t kJobDispatchThreadSleepMs = 500;
+    // Acquire before job_mutex_, individual job mutexes, and snapshot_mutex_.
+    // Serialize drain mutations with snapshot capture.
+    std::mutex drain_snapshot_mutex_;
     std::mutex job_mutex_;
     std::unordered_map<UUID, std::shared_ptr<DrainJob>, boost::hash<UUID>>
         drain_jobs_ GUARDED_BY(job_mutex_);

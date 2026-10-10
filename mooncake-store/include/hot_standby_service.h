@@ -277,6 +277,7 @@ class HotStandbyService {
     std::unique_ptr<StandbyMetadataStore> metadata_store_;
     std::unique_ptr<SnapshotProvider> snapshot_provider_{
         std::make_unique<NoopSnapshotProvider>()};
+    std::shared_ptr<const ha::MasterSnapshotPayloads> master_snapshot_payloads_;
     std::shared_ptr<BatchOpLogSnapshotProvider> batch_oplog_snapshot_provider_;
 
     // OpLog replication components

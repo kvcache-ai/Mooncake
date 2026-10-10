@@ -1,6 +1,8 @@
 #include "ha/snapshot/master_snapshot_codec.h"
 
 #include <string>
+#include <limits>
+#include <stdexcept>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -22,7 +24,8 @@ std::vector<uint8_t> MasterSnapshotCodec::EncodeManifest(
 tl::expected<MasterSnapshotPayloads, SerializationError>
 MasterSnapshotCodec::Encode(
     MasterSnapshotStateView& state_view,
-    const WeightMetadataSnapshot* frozen_weight_metadata) const {
+    const WeightMetadataSnapshot* frozen_weight_metadata,
+    const std::vector<uint8_t>* frozen_drain_jobs) const {
     MasterSnapshotPayloads payloads;
 
     // 1. Encode metadata (shards, discarded replicas, replica_next_id)
@@ -49,6 +52,9 @@ MasterSnapshotCodec::Encode(
     }
     payloads.task_manager = std::move(task_manager_result.value());
 
+    payloads.drain_jobs = frozen_drain_jobs
+                              ? *frozen_drain_jobs
+                              : EncodeDrainJobs(state_view.master_service);
     return payloads;
 }
 
@@ -94,6 +100,7 @@ tl::expected<void, SerializationError> MasterSnapshotCodec::Decode(
             return tl::make_unexpected(task_manager_result.error());
         }
 
+        DecodeDrainJobs(*master_service, payloads.drain_jobs);
         return {};
     } catch (const std::exception& e) {
         return tl::make_unexpected(SerializationError(
@@ -156,6 +163,427 @@ tl::expected<void, SerializationError> MasterSnapshotCodec::DecodeTaskManager(
     // Access the task manager from MasterService
     TaskManagerSerializer serializer(&master_service->task_manager_);
     return serializer.Deserialize(data);
+}
+
+namespace {
+// Snapshot records contain values only; never mutexes or allocator pointers.
+struct DrainReplicationRecord {
+    std::string tenant, key;
+    int32_t type;
+    std::string client;
+    int64_t started;
+    ReplicaID source;
+    std::vector<ReplicaID> targets;
+    uint64_t pending_bytes;
+    std::string dynamic_lease;
+    uint64_t dynamic_version;
+    MSGPACK_DEFINE(tenant, key, type, client, started, source, targets,
+                   pending_bytes, dynamic_lease, dynamic_version);
+};
+struct DrainTaskRecord {
+    std::string id, tenant, key, source, target;
+    uint64_t bytes;
+    std::string unit;
+    MSGPACK_DEFINE(id, tenant, key, source, target, bytes, unit);
+};
+struct DrainJobRecord {
+    std::string id;
+    int32_t type, status;
+    std::vector<std::string> sources, targets;
+    uint32_t concurrency;
+    int64_t created, updated;
+    std::string message;
+    uint64_t succeeded, failed, blocked, bytes;
+    std::vector<DrainTaskRecord> active;
+    std::unordered_set<std::string> completed;
+    std::unordered_map<std::string, uint32_t> retries;
+    std::unordered_set<std::string> terminal;
+    MSGPACK_DEFINE(id, type, status, sources, targets, concurrency, created,
+                   updated, message, succeeded, failed, blocked, bytes, active,
+                   completed, retries, terminal);
+};
+
+int64_t DrainTimeMs(std::chrono::system_clock::time_point time) {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               time.time_since_epoch())
+        .count();
+}
+void RequireDrain(bool condition, const char* check,
+                  const std::string& context = {}) {
+    if (!condition)
+        throw std::runtime_error(std::string("invalid drain job snapshot: ") +
+                                 (context.empty() ? "" : context + ": ") +
+                                 check);
+}
+UUID DrainUuid(const std::string& value, const char* check,
+               const std::string& context, bool allow_nil = false) {
+    UUID id;
+    RequireDrain(StringToUuid(value, id) && (allow_nil || id != UUID{}), check,
+                 context);
+    return id;
+}
+std::chrono::system_clock::time_point DrainTime(int64_t value,
+                                                const char* check,
+                                                const std::string& context) {
+    RequireDrain(
+        value >= 0 &&
+            value <= DrainTimeMs(std::chrono::system_clock::time_point::max()),
+        check, context);
+    return std::chrono::system_clock::time_point(
+        std::chrono::milliseconds(value));
+}
+}  // namespace
+
+std::vector<uint8_t> MasterSnapshotCodec::EncodeDrainJobs(
+    MasterService& service) const {
+    std::vector<DrainJobRecord> records;
+    std::unordered_set<std::string> active_objects;
+    std::lock_guard lock(service.job_mutex_);
+    for (const auto& [id, job] : service.drain_jobs_) {
+        std::lock_guard job_lock(job->mutex);
+        DrainJobRecord record{UuidToString(id),
+                              static_cast<int32_t>(job->type),
+                              static_cast<int32_t>(job->status),
+                              job->request.segments,
+                              job->request.target_segments,
+                              job->request.max_concurrency,
+                              DrainTimeMs(job->created_at),
+                              DrainTimeMs(job->last_updated_at),
+                              job->message,
+                              job->succeeded_units,
+                              job->failed_units,
+                              job->blocked_units,
+                              job->migrated_bytes,
+                              {},
+                              job->completed_unit_keys,
+                              job->retry_counts,
+                              job->terminal_failed_unit_keys};
+        for (const auto& [task_id, task] : job->active_tasks) {
+            record.active.push_back({UuidToString(task_id),
+                                     task.tenant_id.value(), task.key,
+                                     task.source_segment, task.target_segment,
+                                     task.bytes, task.unit_key});
+            active_objects.insert(
+                service.MakeDrainUnitKey(task.tenant_id, task.key, ""));
+        }
+        records.push_back(std::move(record));
+    }
+    // A client can issue CopyStart/MoveStart independently of the queued
+    // drain task, including before any unit is scheduled. Preserve per-object
+    // runtime for every retained draining object, including orphaned sources.
+    std::unordered_set<std::string> draining_segments;
+    {
+        auto segments = service.segment_manager_.getSegmentAccess();
+        std::vector<std::string> names;
+        segments.GetAllSegmentNames(names);
+        for (const auto& name : names) {
+            SegmentStatus status;
+            if (segments.GetSegmentStatusByName(name, status) ==
+                    ErrorCode::OK &&
+                status == SegmentStatus::DRAINING)
+                draining_segments.insert(name);
+        }
+    }
+    std::vector<DrainReplicationRecord> replication;
+    for (size_t i = 0; i < MasterService::kNumShards; ++i) {
+        MasterService::MetadataShardAccessorRO shard(&service, i);
+        for (const auto& [tenant, state] : shard->tenants) {
+            for (const auto& [key, runtime] : state.replication_tasks) {
+                const auto metadata = state.metadata.find(key);
+                if (metadata == state.metadata.end()) continue;
+                const auto names = metadata->second.GetReplicaSegmentNames();
+                if (!active_objects.contains(
+                        service.MakeDrainUnitKey(tenant, key, "")) &&
+                    std::none_of(names.begin(), names.end(),
+                                 [&](const auto& name) {
+                                     return draining_segments.contains(name);
+                                 }))
+                    continue;
+                replication.push_back(
+                    {tenant.value(), key, static_cast<int32_t>(runtime.type),
+                     UuidToString(runtime.client_id),
+                     DrainTimeMs(runtime.start_time), runtime.source_id,
+                     runtime.replica_ids, runtime.pending_quota_charge_bytes,
+                     UuidToString(runtime.dynamic_replication_lease_id),
+                     runtime.dynamic_replication_version_epoch});
+            }
+        }
+    }
+    msgpack::sbuffer buffer;
+    msgpack::packer<msgpack::sbuffer> packer(&buffer);
+    packer.pack_array(2);
+    packer.pack(records);
+    packer.pack(replication);
+    return {reinterpret_cast<const uint8_t*>(buffer.data()),
+            reinterpret_cast<const uint8_t*>(buffer.data()) + buffer.size()};
+}
+
+void MasterSnapshotCodec::DecodeDrainJobs(
+    MasterService& service,
+    const std::optional<std::vector<uint8_t>>& data) const {
+    decltype(service.drain_jobs_) jobs;
+    struct ReplicationRestore {
+        TenantId tenant;
+        std::string key;
+        ReplicationTask runtime;
+    };
+    std::vector<ReplicationRestore> replication;
+    std::unordered_set<UUID, boost::hash<UUID>> task_ids;
+    std::unordered_set<std::string> owned_sources;
+    std::unordered_set<std::string> active_objects;
+    std::unordered_set<std::string> replication_objects;
+    if (data) {
+        size_t offset = 0;
+        auto root = msgpack::unpack(
+            reinterpret_cast<const char*>(data->data()), data->size(), offset,
+            nullptr, nullptr,
+            msgpack::unpack_limit(data->size(), data->size(), data->size(),
+                                  data->size(), data->size(), 16));
+        RequireDrain(
+            offset == data->size() && root.get().type == msgpack::type::ARRAY &&
+                root.get().via.array.size == 2,
+            "payload must contain exactly [jobs, replication_records]");
+        const auto* sections = root.get().via.array.ptr;
+        RequireDrain(sections[0].type == msgpack::type::ARRAY &&
+                         sections[1].type == msgpack::type::ARRAY,
+                     "jobs and replication_records must be arrays");
+        for (const auto& object :
+             sections[0].as<std::vector<msgpack::object>>()) {
+            RequireDrain(object.type == msgpack::type::ARRAY &&
+                             object.via.array.size == 17,
+                         "job record must have 17 fields");
+            const auto* fields = object.via.array.ptr;
+            const std::string job_context =
+                fields[0].type == msgpack::type::STR
+                    ? "job=" + fields[0].as<std::string>()
+                    : "job record";
+            RequireDrain(fields[13].type == msgpack::type::ARRAY,
+                         "active task list must be an array", job_context);
+            for (uint32_t i = 0; i < fields[13].via.array.size; ++i) {
+                const auto& active = fields[13].via.array.ptr[i];
+                RequireDrain(active.type == msgpack::type::ARRAY &&
+                                 active.via.array.size == 7,
+                             "active task record must have 7 fields",
+                             job_context);
+            }
+            const auto record = object.as<DrainJobRecord>();
+            RequireDrain(
+                fields[14].type == msgpack::type::ARRAY &&
+                    fields[14].via.array.size == record.completed.size() &&
+                    fields[15].type == msgpack::type::MAP &&
+                    fields[15].via.map.size == record.retries.size() &&
+                    fields[16].type == msgpack::type::ARRAY &&
+                    fields[16].via.array.size == record.terminal.size(),
+                "invalid or duplicate completed/retry/terminal entries",
+                job_context);
+            auto job = std::make_shared<MasterService::DrainJob>();
+            job->id = DrainUuid(record.id, "invalid job UUID", job_context);
+            RequireDrain(
+                record.type == static_cast<int32_t>(JobType::DRAIN) &&
+                    record.status >= static_cast<int32_t>(JobStatus::CREATED) &&
+                    record.status <= static_cast<int32_t>(JobStatus::CANCELED),
+                "invalid job type/status", job_context);
+            job->status = static_cast<JobStatus>(record.status);
+            job->request = {record.sources, record.targets, record.concurrency};
+            const std::unordered_set<std::string> sources(
+                record.sources.begin(), record.sources.end());
+            RequireDrain(!sources.empty() &&
+                             sources.size() == record.sources.size() &&
+                             record.concurrency > 0,
+                         "invalid source list or max_concurrency", job_context);
+            for (const auto& target : record.targets)
+                RequireDrain(!sources.contains(target),
+                             "target overlaps a source segment", job_context);
+            const bool terminal = job->status >= JobStatus::SUCCEEDED;
+            if (!terminal) {
+                for (const auto& source : sources)
+                    RequireDrain(owned_sources.insert(source).second,
+                                 "source already owned by a live job",
+                                 job_context);
+            }
+            job->created_at =
+                DrainTime(record.created, "created_at timestamp out of range",
+                          job_context);
+            job->last_updated_at =
+                DrainTime(record.updated, "updated_at timestamp out of range",
+                          job_context);
+            job->message = record.message;
+            job->succeeded_units = record.succeeded;
+            job->failed_units = record.failed;
+            job->blocked_units = record.blocked;
+            job->migrated_bytes = record.bytes;
+            job->completed_unit_keys = record.completed;
+            job->retry_counts = record.retries;
+            job->terminal_failed_unit_keys = record.terminal;
+            RequireDrain(record.succeeded == record.completed.size() &&
+                             record.failed >= record.terminal.size() &&
+                             (!terminal || record.active.empty()) &&
+                             record.active.size() <= record.concurrency,
+                         "inconsistent job progress or terminal tasks",
+                         job_context);
+            for (const auto& key : record.terminal)
+                RequireDrain(!record.completed.contains(key),
+                             "unit is both completed and terminal-failed",
+                             job_context);
+            uint64_t retries = 0;
+            for (const auto& [key, count] : record.retries) {
+                RequireDrain(
+                    count > 0 && count <= MasterService::kMaxDrainUnitRetries &&
+                        count <= record.failed - retries,
+                    "invalid retry count or total exceeds failed_units",
+                    job_context);
+                retries += count;
+            }
+            std::unordered_set<std::string> units;
+            for (const auto& active : record.active) {
+                const auto task_context = job_context + " task=" + active.id;
+                const auto task_id =
+                    DrainUuid(active.id, "invalid task UUID", task_context);
+                const TenantId tenant(active.tenant);
+                RequireDrain(tenant.IsValid(), "invalid active task tenant",
+                             task_context);
+                RequireDrain(
+                    task_ids.insert(task_id).second &&
+                        units.insert(active.unit).second &&
+                        sources.contains(active.source) &&
+                        active.target != active.source &&
+                        active.unit == service.MakeDrainUnitKey(
+                                           tenant, active.key, active.source) &&
+                        !record.completed.contains(active.unit) &&
+                        !record.terminal.contains(active.unit),
+                    "inconsistent active task identity/unit", task_context);
+                active_objects.insert(
+                    service.MakeDrainUnitKey(tenant, active.key, ""));
+                RequireDrain(
+                    record.targets.empty() ||
+                        std::find(record.targets.begin(), record.targets.end(),
+                                  active.target) != record.targets.end(),
+                    "active task target is outside requested targets",
+                    task_context);
+                const auto task =
+                    service.task_manager_.get_read_access().find_task_by_id(
+                        task_id);
+                if (task) {
+                    RequireDrain(task->type == TaskType::REPLICA_MOVE &&
+                                     task->status >= TaskStatus::PENDING &&
+                                     task->status <= TaskStatus::SUCCESS,
+                                 "invalid task history type/status",
+                                 task_context);
+                    ReplicaMovePayload payload;
+                    struct_json::from_json(payload, task->payload);
+                    RequireDrain(
+                        payload.tenant_id == active.tenant &&
+                            payload.key == active.key &&
+                            payload.source == active.source &&
+                            payload.target == active.target,
+                        "task history payload does not match active task",
+                        task_context);
+                }
+                job->active_tasks.emplace(
+                    task_id,
+                    MasterService::ActiveDrainTask{
+                        task_id, tenant, active.key, active.source,
+                        active.target, static_cast<size_t>(active.bytes),
+                        active.unit});
+            }
+            RequireDrain(jobs.emplace(job->id, std::move(job)).second,
+                         "duplicate job UUID", job_context);
+        }
+        for (const auto& object :
+             sections[1].as<std::vector<msgpack::object>>()) {
+            RequireDrain(object.type == msgpack::type::ARRAY &&
+                             object.via.array.size == 10,
+                         "replication record must have 10 fields");
+            const auto saved = object.as<DrainReplicationRecord>();
+            const auto object_context =
+                "tenant=" + saved.tenant + " key=" + saved.key;
+            const TenantId tenant(saved.tenant);
+            RequireDrain(tenant.IsValid(), "invalid replication tenant",
+                         object_context);
+            const auto identity =
+                service.MakeDrainUnitKey(tenant, saved.key, "");
+            RequireDrain(
+                replication_objects.insert(identity).second &&
+                    (saved.type ==
+                         static_cast<int32_t>(ReplicationTask::Type::COPY) ||
+                     saved.type ==
+                         static_cast<int32_t>(ReplicationTask::Type::MOVE)),
+                "duplicate replication object or invalid COPY/MOVE type",
+                object_context);
+            MasterService::MetadataAccessorRW metadata(&service,
+                                                       {tenant, saved.key});
+            // Metadata may have disappeared when invalid replicas were
+            // pruned during decode. There is no retained object to resume.
+            if (!metadata.Exists()) continue;
+            RequireDrain(!metadata.HasReplicationTask(),
+                         "object already has a replication task",
+                         object_context);
+            const auto names = metadata.Get().GetReplicaSegmentNames();
+            RequireDrain(
+                active_objects.contains(identity) ||
+                    std::any_of(
+                        names.begin(), names.end(),
+                        [&](const auto& name) {
+                            auto status = service.QuerySegmentStatus(name);
+                            return status && *status == SegmentStatus::DRAINING;
+                        }),
+                "object has neither an active drain task nor a DRAINING "
+                "replica",
+                object_context);
+            RequireDrain(saved.type != static_cast<int32_t>(
+                                           ReplicationTask::Type::MOVE) ||
+                             saved.targets.size() <= 1,
+                         "MOVE has more than one target", object_context);
+            std::unordered_set<ReplicaID> targets;
+            for (const auto id : saved.targets) {
+                // A target (or source) can disappear while a replication
+                // task remains live. CopyEnd/MoveEnd already handle that
+                // partial failure; retain IDs and pending charge for them.
+                RequireDrain(targets.insert(id).second && id != saved.source,
+                             "duplicate target or target equals source",
+                             object_context);
+            }
+            const auto size = metadata.Get().size;
+            RequireDrain(size != 0 &&
+                             saved.targets.size() <=
+                                 std::numeric_limits<uint64_t>::max() / size &&
+                             saved.pending_bytes == saved.targets.size() * size,
+                         "invalid object size/target count or pending quota "
+                         "charge mismatch",
+                         object_context);
+            replication.push_back(
+                {tenant,
+                 saved.key,
+                 {DrainUuid(saved.client, "invalid replication client UUID",
+                            object_context, true),
+                  DrainTime(saved.started,
+                            "replication start timestamp out of range",
+                            object_context),
+                  static_cast<ReplicationTask::Type>(saved.type), saved.source,
+                  saved.targets, saved.pending_bytes,
+                  DrainUuid(saved.dynamic_lease, "invalid dynamic lease UUID",
+                            object_context, true),
+                  saved.dynamic_version}});
+        }
+    }
+    // All records are validated before publication. Restore runs before
+    // workers.
+    for (auto& restored : replication) {
+        MasterService::MetadataAccessorRW metadata(
+            &service, {restored.tenant, restored.key});
+        RequireDrain(
+            !metadata.HasReplicationTask(),
+            "object already has a replication task at publication",
+            "tenant=" + restored.tenant.value() + " key=" + restored.key);
+        if (auto* source =
+                metadata.Get().GetReplicaByID(restored.runtime.source_id)) {
+            source->inc_refcnt();
+        }
+        metadata.GetTenantState().replication_tasks.emplace(
+            restored.key, std::move(restored.runtime));
+    }
+    std::lock_guard lock(service.job_mutex_);
+    service.drain_jobs_ = std::move(jobs);
 }
 
 }  // namespace mooncake::ha

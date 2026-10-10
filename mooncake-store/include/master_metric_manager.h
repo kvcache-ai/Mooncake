@@ -164,6 +164,7 @@ class MasterMetricManager {
     void set_snapshot_duration_ms(int64_t size);
     void inc_snapshot_success();
     void inc_snapshot_fail();
+    void inc_orphaned_draining_restore();
 
     // Operation Statistics (Counters)
     void inc_put_start_requests(int64_t val = 1);
@@ -792,6 +793,7 @@ class MasterMetricManager {
     ylt::metric::histogram_t snapshot_duration_ms_;
     ylt::metric::counter_t snapshot_success_;
     ylt::metric::counter_t snapshot_fail_;
+    ylt::metric::counter_t orphaned_draining_restore_;
     // CopyStart, CopyEnd, CopyRevoke, MoveStart, MoveEnd, MoveRevoke Metrics
     ylt::metric::counter_t copy_start_requests_;
     ylt::metric::counter_t copy_start_failures_;
