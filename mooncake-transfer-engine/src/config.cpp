@@ -772,6 +772,18 @@ void loadGlobalConfig(GlobalConfig& config) {
         }
     }
 
+    if (const char* value = std::getenv("MC_IB_TIMEOUT")) {
+        const auto parsed = TryParseInteger<int>(
+            value, {.trim_ascii_whitespace = true, .allow_leading_plus = true});
+        if (parsed && *parsed >= 1 && *parsed <= 31) {
+            config.ib_timeout = *parsed;
+        } else {
+            LOG(WARNING) << "Invalid MC_IB_TIMEOUT: " << value
+                         << "; expected an integer in [1, 31], keeping "
+                         << config.ib_timeout;
+        }
+    }
+
     const char* ib_relaxed_ordering_env =
         std::getenv("MC_IB_PCI_RELAXED_ORDERING");
     if (ib_relaxed_ordering_env) {
@@ -894,6 +906,7 @@ void dumpGlobalConfig() {
                                                                      : "all");
     LOG(INFO) << "ib_traffic_class = " << config.ib_traffic_class;
     LOG(INFO) << "ib_service_level = " << config.ib_service_level;
+    LOG(INFO) << "ib_timeout = " << config.ib_timeout;
     LOG(INFO) << "te_metadata_refresh_interval_seconds = "
               << config.te_metadata_refresh_interval_seconds;
     LOG(INFO) << "rdma_rail_pause_seconds = " << config.rdma_rail_pause_seconds;
