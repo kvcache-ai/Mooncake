@@ -78,11 +78,10 @@ std::vector<Task> ScopedTaskWriteAccess::pop_tasks(const UUID& client_id,
 
         auto it = manager_->all_tasks_.find(task_id);
         if (it == manager_->all_tasks_.end()) {
-            LOG(ERROR) << "Task " << task_id
-                       << " not found in all_tasks_ while popping";
-            if (manager_->total_pending_tasks_ > 0) {
-                manager_->total_pending_tasks_--;
-            }
+            // Terminal tasks can be pruned before their queued IDs are
+            // consumed.
+            VLOG(1) << "Skipping stale pending queue entry for task "
+                    << task_id;
             continue;
         }
 
@@ -140,6 +139,10 @@ ErrorCode ScopedTaskWriteAccess::complete_task(const UUID& client_id,
         return ErrorCode::OK;
     }
 
+    if (task.status == TaskStatus::PENDING &&
+        manager_->total_pending_tasks_ > 0) {
+        manager_->total_pending_tasks_--;
+    }
     task.mark_complete(status, message);
 
     auto ps_it = manager_->processing_tasks_.find(client_id);
@@ -180,10 +183,8 @@ void ScopedTaskWriteAccess::prune_expired_tasks() {
 
                 auto it = manager_->all_tasks_.find(task_id);
                 if (it == manager_->all_tasks_.end()) {
-                    // Drop dangling id;
-                    if (manager_->total_pending_tasks_ > 0) {
-                        manager_->total_pending_tasks_--;
-                    }
+                    // The terminal transition already released the pending
+                    // slot.
                     continue;
                 }
 
