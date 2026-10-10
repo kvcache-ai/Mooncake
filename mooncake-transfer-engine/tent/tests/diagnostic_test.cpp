@@ -207,6 +207,50 @@ TEST(DiagnosticRendererTest, TextAndJsonContainTheSameCheckFacts) {
     EXPECT_NE(json.find("build information is available"), std::string::npos);
 }
 
+TEST(DiagnosticRendererTest, TextShowsEvidenceOfChecksThatDidNotPass) {
+    DiagnosticSnapshot snapshot;
+    snapshot.command = "doctor";
+    const auto device = [](const char* name) {
+        return DiagnosticEvidence{"rdma.filter", "device",
+                                  SanitizedValue{name, true, false}};
+    };
+    snapshot.checks = {
+        {"rdma.port.state",
+         CheckOutcome::kPass,
+         "ports active",
+         {device("mlx5_1")},
+         {}},
+        {"rdma.filter.names",
+         CheckOutcome::kFail,
+         "unknown device",
+         {device("mlx5_9")},
+         {"remove the name"}},
+        {"engine.gid.selected",
+         CheckOutcome::kWarn,
+         "overlay GID",
+         {device("mlx5_0")},
+         {}},
+        {"gpu.runtime",
+         CheckOutcome::kSkip,
+         "no CUDA support",
+         {{"build", "features.cuda", SanitizedValue{false, true, false}}},
+         {}},
+    };
+
+    const std::string text = renderText(snapshot);
+    EXPECT_EQ(text.find("mlx5_1"), std::string::npos) << text;
+    const auto fail = text.find("[fail] rdma.filter.names");
+    const auto fail_device = text.find("    device = mlx5_9 [rdma.filter]");
+    const auto fail_fix = text.find("    remediation: remove the name");
+    ASSERT_NE(fail, std::string::npos);
+    EXPECT_LT(fail, fail_device);
+    EXPECT_LT(fail_device, fail_fix);
+    EXPECT_NE(text.find("    device = mlx5_0 [rdma.filter]"),
+              std::string::npos);
+    EXPECT_NE(text.find("    features.cuda = false [build]"),
+              std::string::npos);
+}
+
 TEST(DiagnosticExitCodeTest, FailuresAndStrictWarningsReturnOne) {
     DiagnosticSnapshot snapshot;
     EXPECT_EQ(diagnosticExitCode(snapshot), 0);

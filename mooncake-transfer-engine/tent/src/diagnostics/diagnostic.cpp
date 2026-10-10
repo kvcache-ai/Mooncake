@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <cctype>
 #include <iterator>
+#include <ostream>
 #include <regex>
 #include <sstream>
 #include <utility>
@@ -168,6 +169,16 @@ std::string valueForText(const SanitizedValue& value) {
         return value.value.get<std::string>();
     }
     return value.value.dump();
+}
+
+void writeEvidenceLine(std::ostream& output, std::string_view indent,
+                       const DiagnosticEvidence& evidence) {
+    output << indent << evidence.field << " = "
+           << valueForText(evidence.observed);
+    if (evidence.observed.redacted) {
+        output << " (redacted)";
+    }
+    output << " [" << evidence.source << "]\n";
 }
 
 }  // namespace
@@ -442,12 +453,7 @@ std::string renderText(const DiagnosticSnapshot& snapshot) {
     for (const auto& section : snapshot.sections) {
         output << '\n' << section.id << ": " << section.summary << '\n';
         for (const auto& evidence : section.evidence) {
-            output << "  " << evidence.field << " = "
-                   << valueForText(evidence.observed);
-            if (evidence.observed.redacted) {
-                output << " (redacted)";
-            }
-            output << " [" << evidence.source << "]\n";
+            writeEvidenceLine(output, "  ", evidence);
         }
     }
 
@@ -456,6 +462,13 @@ std::string renderText(const DiagnosticSnapshot& snapshot) {
         for (const auto& check : snapshot.checks) {
             output << "  [" << toString(check.outcome) << "] " << check.id
                    << ": " << check.summary << '\n';
+            // Evidence locates a problem (node, device, link, cause), so it
+            // is shown for every check that did not pass.
+            if (check.outcome != CheckOutcome::kPass) {
+                for (const auto& evidence : check.evidence) {
+                    writeEvidenceLine(output, "    ", evidence);
+                }
+            }
             for (const auto& remediation : check.remediation) {
                 output << "    remediation: " << remediation << '\n';
             }
