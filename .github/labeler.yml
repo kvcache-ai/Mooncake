@@ -30,6 +30,8 @@ Transfer Engine:
       - 'mooncake-transfer-engine/**/*'
       - 'python/mooncake/cli_bench.py'
       - 'python/mooncake/transfer_engine_topology_dump.py'
+      - 'python/mooncake/shared_segment.py'
+      - 'python/tests/engine/**/*'
 
 PyTorch Backend:
   - changed-files:
