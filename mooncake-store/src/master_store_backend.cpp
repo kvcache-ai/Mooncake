@@ -16,7 +16,8 @@ bool MasterStoreBackend::CanPublishWeightMutations() const {
 
 bool MasterStoreBackend::IsTenantSupported(const std::string& tenant_id) const {
     const TenantId tenant(tenant_id);
-    return tenant.IsValid() && master_.ResolveRequestTenantId(tenant) == tenant;
+    return tenant.IsValid() &&
+           (master_.IsTenantQuotaEnabled() || tenant == TenantId::Default());
 }
 
 tl::expected<OpLogEntry, ErrorCode>
@@ -57,8 +58,8 @@ MasterStoreBackend::SnapshotWeightGroup(
     members.reserve(member_keys.size());
     for (const auto& key : member_keys) {
         MasterService::MetadataAccessorRO accessor(
-            &master_, master_.MakeObjectIdentity(key, tenant_id));
-        if (!accessor.Exists()) {
+            &master_, MasterService::ObjectIdentity{tenant_id, key});
+        if (!accessor.IsPublished()) {
             return tl::make_unexpected(WeightManagementError::NOT_FOUND);
         }
         const auto& metadata = accessor.Get();

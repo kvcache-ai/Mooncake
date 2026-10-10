@@ -172,15 +172,14 @@ class BatchEvictBench {
         const auto base_expiration = now - std::chrono::hours(1);
         size_t ordinal = 0;
 
-        for (size_t shard_idx = 0;
-             shard_idx < MasterServiceTestPeer::kNumShards; ++shard_idx) {
-            MasterServiceTestPeer::MetadataShardAccessorRW shard(&service,
-                                                                 shard_idx);
-            for (auto& [tenant_id, tenant_state] : shard->tenants) {
+        MasterServiceTestPeer::Tenants(service).Visit(
+            [&](const TenantId& tenant_id,
+                const std::shared_ptr<metadata::Tenant>& tenant) {
                 if (tenant_id != TenantId::Default()) {
-                    continue;
+                    return;
                 }
-                for (auto& [key, metadata] : tenant_state.metadata) {
+                for (auto object : tenant->WriteCursor()) {
+                    auto& metadata = object.metadata();
                     {
                         SpinLocker locker(&metadata.lock);
                         metadata.lease_->SetDeadline(
@@ -207,8 +206,7 @@ class BatchEvictBench {
                         }
                     }
                 }
-            }
-        }
+            });
 
         return stats;
     }

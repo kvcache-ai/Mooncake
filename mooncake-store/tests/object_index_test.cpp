@@ -2,7 +2,10 @@
 #include "object_test_helpers.h"
 
 #include <algorithm>
+#include <atomic>
+#include <future>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -99,20 +102,148 @@ TEST(ObjectIndexTest, IsCurrentComparesTheHandleTheRoutePublishes) {
     EXPECT_TRUE(store.IsCurrent("k1", e2));
 }
 
-TEST(ObjectIndexTest, SnapshotObjectsEnumeratesEveryEntry) {
+TEST(ObjectIndexTest, ReadCursorVisitsEveryEntryOnce) {
     ObjectIndex store;
     ASSERT_TRUE(store.Insert(test::MakeObjectEntry("k1")));
     ASSERT_TRUE(store.Insert(test::MakeObjectEntry("k2", "g1")));
     ASSERT_TRUE(store.Insert(test::MakeObjectEntry("k3", "g1")));
 
     std::vector<std::string> keys;
-    for (const auto& entry : store.SnapshotObjects()) {
-        keys.push_back(entry->key());
+    for (auto object : store.ReadCursor()) {
+        EXPECT_EQ(object.key(), object.handle()->key());
+        keys.push_back(object.key());
     }
-    // Enumeration order is the map's, so compare as a set.
     std::sort(keys.begin(), keys.end());
     EXPECT_EQ(keys, (std::vector<std::string>{"k1", "k2", "k3"}));
+
+    size_t count = 0;
+    for (auto object : ObjectIndex().ReadCursor()) {
+        (void)object;
+        ++count;
+    }
+    EXPECT_EQ(count, 0u);
 }
+
+TEST(ObjectIndexTest, WriteCursorWritesUnderTheEntryLock) {
+    ObjectIndex store;
+    auto entry = test::MakeObjectEntry("k1");
+    ASSERT_TRUE(store.Insert(entry));
+
+    for (auto object : store.WriteCursor()) {
+        object.state().is_processing = true;
+    }
+    EXPECT_TRUE(test::ObjectEntryTestPeer::WithSharedAccess(
+        *entry, [](const ObjectMetadata&, const ObjectEntry::State& state) {
+            return state.is_processing;
+        }));
+}
+
+// Leaving the loop early releases the stripe and the entry it stood on, so
+// the route and the entry are writable again.
+TEST(ObjectIndexTest, BreakingOutOfACursorReleasesItsLocks) {
+    ObjectIndex store;
+    std::vector<std::shared_ptr<ObjectEntry>> entries;
+    for (int i = 0; i < 8; ++i) {
+        entries.push_back(test::MakeObjectEntry("k" + std::to_string(i)));
+        ASSERT_TRUE(store.Insert(entries.back()));
+    }
+    for (auto object : store.ReadCursor()) {
+        (void)object;
+        break;
+    }
+    for (const auto& entry : entries) {
+        test::ObjectEntryTestPeer::WithExclusiveAccess(
+            *entry, [](ObjectMetadata&, ObjectEntry::State&) {});
+        EXPECT_TRUE(store.EraseIf(entry->key(), entry));
+    }
+    EXPECT_TRUE(store.Empty());
+}
+
+// An entry locked elsewhere is not waited for under the stripe lock: the
+// cursor visits everything else first, then waits for it.
+TEST(ObjectIndexTest, BusyEntryIsVisitedAfterTheOthers) {
+    ObjectIndex store;
+    auto busy = test::MakeObjectEntry("busy");
+    ASSERT_TRUE(store.Insert(busy));
+    for (int i = 0; i < 8; ++i) {
+        ASSERT_TRUE(
+            store.Insert(test::MakeObjectEntry("k" + std::to_string(i))));
+    }
+
+    std::promise<void> held;
+    std::promise<void> release;
+    std::thread holder([&] {
+        test::ObjectEntryTestPeer::WithExclusiveAccess(
+            *busy, [&](ObjectMetadata&, ObjectEntry::State&) {
+                held.set_value();
+                release.get_future().wait();
+            });
+    });
+    held.get_future().wait();
+
+    std::vector<std::string> keys;
+    for (auto object : store.ReadCursor()) {
+        keys.push_back(object.key());
+        if (keys.size() == 8) {
+            release.set_value();
+        }
+    }
+    holder.join();
+    ASSERT_EQ(keys.size(), 9u);
+    EXPECT_EQ(keys.back(), "busy");
+}
+
+// A busy entry is visited only while the route still publishes it: one
+// replaced before the cursor gets its lock is skipped. Whether the replacement
+// is seen depends on whether the cursor has passed its stripe yet, so only the
+// replaced entry's absence is checked.
+TEST(ObjectIndexTest, BusyEntryReplacedMeanwhileIsSkipped) {
+    ObjectIndex store;
+    auto busy = test::MakeObjectEntry("busy");
+    ASSERT_TRUE(store.Insert(busy));
+    ASSERT_TRUE(store.Insert(test::MakeObjectEntry("other")));
+
+    std::promise<void> held;
+    std::promise<void> replace;
+    std::thread holder([&] {
+        test::ObjectEntryTestPeer::WithExclusiveAccess(
+            *busy, [&](ObjectMetadata&, ObjectEntry::State&) {
+                held.set_value();
+                replace.get_future().wait();
+                // Entry, then route: the order every teardown takes.
+                EXPECT_TRUE(store.EraseIf("busy", busy));
+                EXPECT_TRUE(store.Insert(test::MakeObjectEntry("busy")));
+            });
+    });
+    held.get_future().wait();
+
+    std::vector<std::shared_ptr<ObjectEntry>> visited;
+    for (auto object : store.ReadCursor()) {
+        visited.push_back(object.handle());
+        if (object.key() == "other") {
+            replace.set_value();
+        }
+    }
+    holder.join();
+    EXPECT_EQ(std::count(visited.begin(), visited.end(), busy), 0);
+    EXPECT_EQ(std::count_if(visited.begin(), visited.end(),
+                            [](const auto& e) { return e->key() == "other"; }),
+              1);
+}
+
+#ifndef NDEBUG
+TEST(ObjectIndexDeathTest, RouteAccessFromACursorAsserts) {
+    ObjectIndex store;
+    ASSERT_TRUE(store.Insert(test::MakeObjectEntry("k1")));
+    EXPECT_DEATH(
+        {
+            for (auto object : store.ReadCursor()) {
+                (void)store.Contains(object.key());
+            }
+        },
+        "route access from inside an object cursor");
+}
+#endif
 
 }  // namespace
 }  // namespace mooncake

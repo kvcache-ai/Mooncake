@@ -8,6 +8,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "object_entry.h"
@@ -34,6 +35,22 @@ inline std::shared_ptr<ObjectEntry> MakeObjectEntry(
     const std::string& key, const std::string& group_id = {}) {
     return std::make_shared<ObjectEntry>(MakeObjectMetadata(key, group_id));
 }
+
+// Reaches an entry's own lock directly, beneath the tenant that otherwise
+// owns every access to a published entry: for the suites of the layers below
+// it (ObjectEntry, ObjectIndex), and for a test that holds an entry busy from
+// another thread or inspects one the tenant no longer hands out, such as one
+// already torn down.
+struct ObjectEntryTestPeer {
+    template <typename Fn>
+    static decltype(auto) WithExclusiveAccess(ObjectEntry& entry, Fn&& fn) {
+        return entry.WithExclusiveAccess(std::forward<Fn>(fn));
+    }
+    template <typename Fn>
+    static decltype(auto) WithSharedAccess(const ObjectEntry& entry, Fn&& fn) {
+        return entry.WithSharedAccess(std::forward<Fn>(fn));
+    }
+};
 
 }  // namespace test
 }  // namespace mooncake

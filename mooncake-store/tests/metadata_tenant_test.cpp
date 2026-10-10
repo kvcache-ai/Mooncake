@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -17,35 +18,39 @@ namespace {
 
 // The lease the entry currently holds, read through the entry's own lock.
 std::shared_ptr<Lease> LeaseOf(const std::shared_ptr<ObjectEntry>& entry) {
-    return entry->WithSharedAccess(
-        [](const ObjectMetadata& metadata, const ObjectEntry::State&) {
+    return test::ObjectEntryTestPeer::WithSharedAccess(
+        *entry, [](const ObjectMetadata& metadata, const ObjectEntry::State&) {
             return metadata.lease_;
         });
 }
 
 bool IsProcessing(const std::shared_ptr<ObjectEntry>& entry) {
-    return entry->WithSharedAccess(
-        [](const ObjectMetadata&, const ObjectEntry::State& state) {
+    return test::ObjectEntryTestPeer::WithSharedAccess(
+        *entry, [](const ObjectMetadata&, const ObjectEntry::State& state) {
             return state.is_processing;
         });
 }
 
-enum class TearDownResult { kRemoved, kAlreadyClaimed, kLostSlot };
+enum class TearDownResult { kRemoved, kNotHeld, kLostSlot };
 
-// Tears `entry` down the way a caller must: claim it under its own lock, then
-// remove it while still holding that lock. A claimed entry is still routed, so
-// failing to remove it (`kLostSlot`) means the route lost track of it.
+// Tears `entry` down the way a caller must, under its write hold. An entry the
+// tenant will not hold (not published, or already torn down) is `kNotHeld`. A
+// held entry is still routed while it releases and gone once the teardown
+// returns; anything else (`kLostSlot`) means the route lost track of it.
 TearDownResult TearDownObject(Tenant& tenant,
                               const std::shared_ptr<ObjectEntry>& entry) {
-    return entry->WithExclusiveAccess(
-        [&](ObjectMetadata&, ObjectEntry::State& state) {
-            if (state.is_torn_down) {
-                return TearDownResult::kAlreadyClaimed;
-            }
-            state.is_torn_down = true;
-            return tenant.RemoveObject(entry) ? TearDownResult::kRemoved
-                                              : TearDownResult::kLostSlot;
-        });
+    auto hold = tenant.WriteHold(entry);
+    if (!hold) {
+        return TearDownResult::kNotHeld;
+    }
+    bool routed_while_releasing = false;
+    const bool torn_down = tenant.TearDownObject(*hold, [&] {
+        routed_while_releasing = tenant.Get(entry->key()) == entry;
+    });
+    return torn_down && routed_while_releasing &&
+                   tenant.Get(entry->key()) != entry
+               ? TearDownResult::kRemoved
+               : TearDownResult::kLostSlot;
 }
 
 TEST(TenantTest, InsertObjectWiresTheGroupLeaseAndJoinsTheGroup) {
@@ -79,7 +84,8 @@ TEST(TenantTest, InsertObjectLeavesAnUngroupedEntryOnItsOwnLease) {
     // An ungrouped entry keeps the never-granted lease the envelope was
     // constructed with: present, and expired.
     ASSERT_NE(LeaseOf(singleton), nullptr);
-    EXPECT_TRUE(singleton->WithSharedAccess(
+    EXPECT_TRUE(test::ObjectEntryTestPeer::WithSharedAccess(
+        *singleton,
         [](const ObjectMetadata& metadata, const ObjectEntry::State&) {
             return metadata.IsLeaseExpired();
         }));
@@ -97,7 +103,7 @@ TEST(TenantTest, InsertObjectRejectsAKeyThatIsAlreadyRouted) {
     EXPECT_TRUE(tenant.GroupMembers("g2").empty());
 }
 
-TEST(TenantTest, RemoveObjectDropsTheSlotAndTheMembershipTogether) {
+TEST(TenantTest, TearDownObjectDropsTheSlotAndTheMembershipTogether) {
     Tenant tenant;
     auto entry = test::MakeObjectEntry("k1", "g1");
     ASSERT_TRUE(tenant.InsertObject(entry));
@@ -105,40 +111,56 @@ TEST(TenantTest, RemoveObjectDropsTheSlotAndTheMembershipTogether) {
 
     // The slot names this entry, so the membership is its own and a teardown
     // drops both in one call.
-    EXPECT_TRUE(tenant.RemoveObject(entry));
+    EXPECT_EQ(TearDownObject(tenant, entry), TearDownResult::kRemoved);
 
     EXPECT_FALSE(tenant.ContainsObject("k1"));
     EXPECT_TRUE(tenant.GroupMembers("g1").empty());
     EXPECT_TRUE(tenant.Empty());
 
-    // The slot is gone, so a repeated teardown has nothing left to take.
-    EXPECT_FALSE(tenant.RemoveObject(entry));
+    // The claim is taken, so the entry is not held again.
+    EXPECT_EQ(TearDownObject(tenant, entry), TearDownResult::kNotHeld);
 }
 
-TEST(TenantTest, RemoveObjectRequiresTheEntryStillOnTheRoute) {
+TEST(TenantTest, TearDownObjectRunsOnceUnderOneHold) {
+    Tenant tenant;
+    auto entry = test::MakeObjectEntry("k1");
+    ASSERT_TRUE(tenant.InsertObject(entry));
+
+    auto hold = tenant.WriteHold(entry);
+    ASSERT_TRUE(hold.has_value());
+    int releases = 0;
+    EXPECT_TRUE(tenant.TearDownObject(*hold, [&] { ++releases; }));
+    // A second eraser under the same hold finds the claim taken and releases
+    // nothing again.
+    EXPECT_FALSE(tenant.TearDownObject(*hold, [&] { ++releases; }));
+    EXPECT_EQ(releases, 1);
+    EXPECT_FALSE(tenant.ContainsObject("k1"));
+}
+
+TEST(TenantTest, TearDownObjectRemovesOnlyTheEntryOnTheRoute) {
     Tenant tenant;
     auto published = test::MakeObjectEntry("k1", "g1");
     ASSERT_TRUE(tenant.InsertObject(published));
+    const auto published_lease = LeaseOf(published);
 
     // A different handle for the same key is not what the route publishes, so
-    // the slot survives and the caller learns nothing was removed.
-    EXPECT_FALSE(tenant.RemoveObject(test::MakeObjectEntry("k1", "g1")));
-    EXPECT_TRUE(tenant.ContainsObject("k1"));
+    // it is not held, and the slot and membership of the published one stay.
+    EXPECT_EQ(TearDownObject(tenant, test::MakeObjectEntry("k1", "g1")),
+              TearDownResult::kNotHeld);
     EXPECT_EQ(tenant.Get("k1"), published);
+    EXPECT_EQ(tenant.GroupMembers("g1").size(), 1u);
+    EXPECT_EQ(LeaseOf(published).get(), published_lease.get());
 
     // The published entry itself is removed.
-    EXPECT_TRUE(tenant.RemoveObject(published));
+    EXPECT_EQ(TearDownObject(tenant, published), TearDownResult::kRemoved);
     EXPECT_FALSE(tenant.ContainsObject("k1"));
-
-    // A null handle changes nothing.
-    EXPECT_FALSE(tenant.RemoveObject(std::shared_ptr<ObjectEntry>{}));
 }
 
-TEST(TenantTest, RemoveObjectLeavesAReplacementAndItsMembershipUntouched) {
+TEST(TenantTest, TearDownObjectLeavesAReplacementAndItsMembershipUntouched) {
     Tenant tenant;
     auto first = test::MakeObjectEntry("k1", "g1");
     ASSERT_TRUE(tenant.InsertObject(first));
-    ASSERT_TRUE(tenant.RemoveObject(first));
+    ASSERT_EQ(TearDownObject(tenant, first), TearDownResult::kRemoved);
 
     auto second = test::MakeObjectEntry("k1", "g1");
     ASSERT_TRUE(tenant.InsertObject(second));
@@ -147,52 +169,44 @@ TEST(TenantTest, RemoveObjectLeavesAReplacementAndItsMembershipUntouched) {
 
     // The slot holds a newer publication of the same key, so the older handle
     // owns nothing under it: the membership the newer object registered stays.
-    EXPECT_FALSE(tenant.RemoveObject(first));
+    EXPECT_EQ(TearDownObject(tenant, first), TearDownResult::kNotHeld);
     EXPECT_EQ(tenant.Get("k1"), second);
     EXPECT_EQ(tenant.GroupMembers("g1").size(), 1u);
     EXPECT_EQ(LeaseOf(second).get(), second_lease.get());
 }
 
-TEST(TenantTest, WithPublishedObjectRunsOnlyOnThePublishedEntry) {
+// A hold is made only on the entry the route publishes: never on one not yet
+// published, one torn down, or a kept handle whose key was published again.
+TEST(TenantTest, HoldIsMadeOnlyOnThePublishedEntry) {
     Tenant tenant;
-    auto first = test::MakeObjectEntry("k1", "g1");
+    auto first = test::MakeObjectEntry("k1");
+    EXPECT_FALSE(tenant.WriteHold(first).has_value());
+    EXPECT_FALSE(tenant.ReadHold("k1").has_value());
+
     ASSERT_TRUE(tenant.InsertObject(first));
-
-    bool ran = false;
-    EXPECT_TRUE(tenant.WithPublishedObject(
-        "k1", [&](ObjectMetadata&, ObjectEntry::State& state) {
-            ran = true;
-            state.is_processing = true;
-        }));
-    EXPECT_TRUE(ran);
+    {
+        auto hold = tenant.WriteHold("k1");
+        ASSERT_TRUE(hold.has_value());
+        EXPECT_EQ(hold->handle(), first);
+        hold->state().is_processing = true;
+    }
     EXPECT_TRUE(IsProcessing(first));
+    {
+        const auto hold = tenant.ReadHold(first);
+        ASSERT_TRUE(hold.has_value());
+        EXPECT_TRUE(hold->state().is_processing);
+    }
 
-    // After the key is published again, the same call lands on the newer entry,
-    // never on the handle a caller kept from before.
-    ASSERT_TRUE(tenant.RemoveObject(first));
-    auto second = test::MakeObjectEntry("k1", "g1");
+    ASSERT_EQ(TearDownObject(tenant, first), TearDownResult::kRemoved);
+    EXPECT_FALSE(tenant.WriteHold(first).has_value());
+    EXPECT_FALSE(tenant.ReadHold("k1").has_value());
+
+    auto second = test::MakeObjectEntry("k1");
     ASSERT_TRUE(tenant.InsertObject(second));
-    EXPECT_TRUE(tenant.WithPublishedObject(
-        "k1", [](ObjectMetadata&, ObjectEntry::State& state) {
-            state.is_processing = false;
-        }));
-    EXPECT_FALSE(IsProcessing(second));
-    // The handle from before was not the one that changed.
-    EXPECT_TRUE(IsProcessing(first));
-
-    // Nothing is routed under the key any more.
-    ASSERT_TRUE(tenant.RemoveObject(second));
-    EXPECT_FALSE(tenant.WithPublishedObject(
-        "k1", [](ObjectMetadata&, ObjectEntry::State&) {}));
-
-    // A torn-down entry is not a target either.
-    auto third = test::MakeObjectEntry("k1", "g1");
-    ASSERT_TRUE(tenant.InsertObject(third));
-    third->WithExclusiveAccess([](ObjectMetadata&, ObjectEntry::State& state) {
-        state.is_torn_down = true;
-    });
-    EXPECT_FALSE(tenant.WithPublishedObject(
-        "k1", [](ObjectMetadata&, ObjectEntry::State&) {}));
+    EXPECT_FALSE(tenant.ReadHold(first).has_value());
+    auto hold = tenant.WriteHold("k1");
+    ASSERT_TRUE(hold.has_value());
+    EXPECT_EQ(hold->handle(), second);
 }
 
 TEST(TenantTest, UnregisterGroupMemberDropsOnlyTheEntryItIsGiven) {
@@ -239,7 +253,7 @@ TEST(TenantTest, AGroupKeepsOneLeaseAcrossReplacementOfItsKeys) {
 
     // Replacing one key of the group re-registers that member and keeps both on
     // the group's one lease.
-    ASSERT_TRUE(tenant.RemoveObject(first));
+    ASSERT_EQ(TearDownObject(tenant, first), TearDownResult::kRemoved);
     auto replacement = test::MakeObjectEntry("k1", "g1");
     ASSERT_TRUE(tenant.InsertObject(replacement));
     ASSERT_EQ(tenant.GroupMembers("g1").size(), 2u);
@@ -248,8 +262,8 @@ TEST(TenantTest, AGroupKeepsOneLeaseAcrossReplacementOfItsKeys) {
 
     // The group, and its lease, go with the last member; a later publication
     // gets the fresh lease of a new group.
-    ASSERT_TRUE(tenant.RemoveObject(replacement));
-    ASSERT_TRUE(tenant.RemoveObject(second));
+    ASSERT_EQ(TearDownObject(tenant, replacement), TearDownResult::kRemoved);
+    ASSERT_EQ(TearDownObject(tenant, second), TearDownResult::kRemoved);
     ASSERT_TRUE(tenant.GroupMembers("g1").empty());
 
     auto late = test::MakeObjectEntry("k1", "g1");
@@ -327,7 +341,7 @@ TEST(TenantTest, SameKeyChurnKeepsTheRouteAndTheGroupConsistent) {
                     case TearDownResult::kLostSlot:
                         violation();
                         break;
-                    case TearDownResult::kAlreadyClaimed:
+                    case TearDownResult::kNotHeld:
                         break;
                 }
             }
@@ -342,14 +356,13 @@ TEST(TenantTest, SameKeyChurnKeepsTheRouteAndTheGroupConsistent) {
                  ++i) {
                 std::this_thread::yield();
                 const std::string& key = keys[i % 2];
-                (void)tenant.WithPublishedObject(
-                    key, [&](ObjectMetadata&, ObjectEntry::State& state) {
-                        mutations.fetch_add(1, std::memory_order_relaxed);
-                        if (state.is_torn_down || !is_member(key)) {
-                            violation();
-                        }
-                        state.is_processing = !state.is_processing;
-                    });
+                if (auto hold = tenant.WriteHold(key)) {
+                    mutations.fetch_add(1, std::memory_order_relaxed);
+                    if (!is_member(key)) {
+                        violation();
+                    }
+                    hold->state().is_processing = !hold->state().is_processing;
+                }
             }
         });
     }
@@ -367,22 +380,20 @@ TEST(TenantTest, SameKeyChurnKeepsTheRouteAndTheGroupConsistent) {
             if (first == nullptr || second == nullptr) {
                 continue;
             }
-            first->WithSharedAccess([&](const ObjectMetadata& first_metadata,
-                                        const ObjectEntry::State& first_state) {
-                second->WithSharedAccess(
-                    [&](const ObjectMetadata& second_metadata,
-                        const ObjectEntry::State& second_state) {
-                        if (first_state.is_torn_down ||
-                            second_state.is_torn_down) {
-                            return;
-                        }
-                        pairs_observed.fetch_add(1, std::memory_order_relaxed);
-                        if (first_metadata.lease_ != second_metadata.lease_ ||
-                            !is_member("k1") || !is_member("k2")) {
-                            violation();
-                        }
-                    });
-            });
+            const auto first_hold = tenant.ReadHold(first);
+            if (!first_hold) {
+                continue;
+            }
+            const auto second_hold = tenant.ReadHold(second);
+            if (!second_hold) {
+                continue;
+            }
+            pairs_observed.fetch_add(1, std::memory_order_relaxed);
+            if (first_hold->metadata().lease_ !=
+                    second_hold->metadata().lease_ ||
+                !is_member("k1") || !is_member("k2")) {
+                violation();
+            }
         }
     });
 
@@ -404,15 +415,17 @@ TEST(TenantTest, SameKeyChurnKeepsTheRouteAndTheGroupConsistent) {
     // At rest, the group lists exactly the keys that are routed: no member
     // outlived its object, and no routed object lost its membership.
     std::vector<std::string> routed;
-    for (const auto& entry : tenant.SnapshotObjects()) {
-        routed.push_back(entry->key());
+    std::vector<std::shared_ptr<ObjectEntry>> entries;
+    for (auto object : tenant.ReadCursor()) {
+        routed.push_back(object.key());
+        entries.push_back(object.handle());
     }
     auto members = tenant.GroupMembers("g1");
     std::sort(routed.begin(), routed.end());
     std::sort(members.begin(), members.end());
     EXPECT_EQ(members, routed);
 
-    for (const auto& entry : tenant.SnapshotObjects()) {
+    for (const auto& entry : entries) {
         EXPECT_EQ(TearDownObject(tenant, entry), TearDownResult::kRemoved);
     }
     EXPECT_TRUE(tenant.Empty());
@@ -426,10 +439,143 @@ TEST(TenantTest, EmptyTracksObjectsAndGroups) {
     ASSERT_TRUE(tenant.InsertObject(grouped));
     EXPECT_FALSE(tenant.Empty());
 
-    // Removing the object drops its membership with the slot.
-    ASSERT_TRUE(tenant.RemoveObject(grouped));
+    // Tearing the object down drops its membership with the slot.
+    ASSERT_EQ(TearDownObject(tenant, grouped), TearDownResult::kRemoved);
     EXPECT_TRUE(tenant.Empty());
     EXPECT_TRUE(tenant.GroupMembers("g1").empty());
+}
+
+// Starts a primary write on `entry`. A published entry is listed once its
+// write hold is released; one not yet published only carries the work, which
+// InsertObject lists.
+void StartWrite(Tenant& tenant, const std::shared_ptr<ObjectEntry>& entry) {
+    if (auto hold = tenant.WriteHold(entry)) {
+        hold->state().is_processing = true;
+        return;
+    }
+    entry->WithUnpublished([](ObjectMetadata&, ObjectEntry::State& state) {
+        state.is_processing = true;
+    });
+}
+
+void FinishWrite(Tenant& tenant, const std::shared_ptr<ObjectEntry>& entry) {
+    auto hold = tenant.WriteHold(entry);
+    ASSERT_TRUE(hold.has_value());
+    hold->state().is_processing = false;
+}
+
+std::vector<std::string> SortedInFlightKeys(const Tenant& tenant) {
+    auto keys = tenant.InFlightKeys();
+    std::sort(keys.begin(), keys.end());
+    return keys;
+}
+
+TEST(TenantTest, InFlightListsOnlyPublishedEntriesWithWork) {
+    Tenant tenant;
+    auto idle = test::MakeObjectEntry("idle");
+    auto busy = test::MakeObjectEntry("busy");
+    ASSERT_TRUE(tenant.InsertObject(idle));
+    ASSERT_TRUE(tenant.InsertObject(busy));
+
+    {
+        auto hold = tenant.WriteHold(busy);
+        ASSERT_TRUE(hold.has_value());
+        hold->state().is_processing = true;
+        // Listed as the hold is released, not before.
+        EXPECT_TRUE(tenant.InFlightKeys().empty());
+    }
+    EXPECT_EQ(SortedInFlightKeys(tenant), (std::vector<std::string>{"busy"}));
+    // A write hold on an entry with no work lists nothing.
+    {
+        auto hold = tenant.WriteHold(idle);
+        ASSERT_TRUE(hold.has_value());
+    }
+    // Starting work again lists the entry once.
+    StartWrite(tenant, busy);
+
+    EXPECT_EQ(SortedInFlightKeys(tenant), (std::vector<std::string>{"busy"}));
+
+    FinishWrite(tenant, busy);
+    EXPECT_TRUE(tenant.InFlightKeys().empty());
+}
+
+TEST(TenantTest, InsertObjectTracksAnEntryPublishedWithWork) {
+    Tenant tenant;
+    auto entry = test::MakeObjectEntry("k1");
+    // Work started before publication is tracked by the publication itself.
+    StartWrite(tenant, entry);
+    EXPECT_TRUE(tenant.InFlightKeys().empty());
+
+    ASSERT_TRUE(tenant.InsertObject(entry));
+    EXPECT_EQ(SortedInFlightKeys(tenant), (std::vector<std::string>{"k1"}));
+
+    // A rejected duplicate is not published, so it is not listed either.
+    auto duplicate = test::MakeObjectEntry("k1");
+    StartWrite(tenant, duplicate);
+    ASSERT_FALSE(tenant.InsertObject(duplicate));
+    EXPECT_EQ(tenant.InFlightKeys().size(), 1u);
+
+    FinishWrite(tenant, entry);
+}
+
+TEST(TenantTest, AnEntryStaysListedWhileAnyWorkRemains) {
+    Tenant tenant;
+    auto entry = test::MakeObjectEntry("k1");
+    ASSERT_TRUE(tenant.InsertObject(entry));
+
+    {
+        auto hold = tenant.WriteHold(entry);
+        ASSERT_TRUE(hold.has_value());
+        hold->state().is_processing = true;
+        hold->state().offloading_task =
+            OffloadingTask{1, std::chrono::system_clock::now(), {}};
+    }
+
+    // The write finished but the offload has not, so the entry stays listed.
+    FinishWrite(tenant, entry);
+    EXPECT_EQ(SortedInFlightKeys(tenant), (std::vector<std::string>{"k1"}));
+
+    {
+        auto hold = tenant.WriteHold(entry);
+        ASSERT_TRUE(hold.has_value());
+        hold->state().offloading_task.reset();
+    }
+    EXPECT_TRUE(tenant.InFlightKeys().empty());
+}
+
+TEST(TenantTest, TearDownTakesAnEntryOffTheInFlightList) {
+    Tenant tenant;
+    auto first = test::MakeObjectEntry("k1");
+    auto second = test::MakeObjectEntry("k2");
+    ASSERT_TRUE(tenant.InsertObject(first));
+    ASSERT_TRUE(tenant.InsertObject(second));
+    StartWrite(tenant, first);
+    StartWrite(tenant, second);
+
+    // The entry still carries its write, yet leaves the list with its slot.
+    ASSERT_EQ(TearDownObject(tenant, first), TearDownResult::kRemoved);
+    EXPECT_EQ(SortedInFlightKeys(tenant), (std::vector<std::string>{"k2"}));
+
+    // Work started on a torn-down entry is never listed.
+    StartWrite(tenant, first);
+    EXPECT_EQ(SortedInFlightKeys(tenant), (std::vector<std::string>{"k2"}));
+    // The handle can outlive the tenant's interest in it.
+    first.reset();
+
+    FinishWrite(tenant, second);
+}
+
+TEST(TenantTest, DestroyingATenantReleasesItsInFlightEntries) {
+    auto entry = test::MakeObjectEntry("k1");
+    {
+        Tenant tenant;
+        ASSERT_TRUE(tenant.InsertObject(entry));
+        StartWrite(tenant, entry);
+        ASSERT_EQ(tenant.InFlightKeys().size(), 1u);
+    }
+    // The caller's handle outlives the tenant; the list let go of its hook
+    // first, so the entry is destroyed unlinked.
+    entry.reset();
 }
 
 TEST(TenantTest, RebuildGroupStateRegroupsTheSameMembers) {

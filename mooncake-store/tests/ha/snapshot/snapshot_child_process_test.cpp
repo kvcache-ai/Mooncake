@@ -578,13 +578,9 @@ class SnapshotChildProcessTest : public ::testing::Test {
 
     // Check if a key exists in raw metadata (regardless of replica status)
     bool KeyExistsInMetadata(MasterService* svc, const std::string& key) {
-        size_t shard_idx = MasterServiceTestPeer(*svc).getShardIndex(key);
-        auto& shard = MasterServiceTestPeer::MetadataShards(*svc)[shard_idx];
-        SharedMutexLocker lock(&shard.mutex, shared_lock_t{});
-        auto tenant_it = shard.tenants.find(TenantId::Default());
-        return tenant_it != shard.tenants.end() &&
-               tenant_it->second.metadata.find(key) !=
-                   tenant_it->second.metadata.end();
+        auto handle =
+            MasterServiceTestPeer::Tenants(*svc).Lookup(TenantId::Default());
+        return handle != nullptr && handle->ContainsObject(key);
     }
 
     size_t SoftPinRegistrationCount(MasterService* svc) {
@@ -593,23 +589,13 @@ class SnapshotChildProcessTest : public ::testing::Test {
 
     std::optional<std::chrono::system_clock::time_point> GetSoftPinDeadline(
         MasterService* svc, const std::string& key) {
-        const size_t shard_idx =
-            MasterServiceTestPeer(*svc).getShardIndex(TenantId::Default(), key);
-        MasterServiceTestPeer::MetadataShardAccessorRO shard(svc, shard_idx);
-        const auto tenant_it = shard->tenants.find(TenantId::Default());
-        if (tenant_it == shard->tenants.end()) {
+        MasterServiceTestPeer::MetadataAccessorRO accessor(
+            svc,
+            MasterServiceTestPeer::ObjectIdentity{TenantId::Default(), key});
+        if (!accessor.IsPublished()) {
             return std::nullopt;
         }
-        const auto metadata_it = tenant_it->second.metadata.find(key);
-        if (metadata_it == tenant_it->second.metadata.end()) {
-            return std::nullopt;
-        }
-        return metadata_it->second.GetCommittedSoftPinTimeout();
-    }
-
-    uint32_t GetShardIndexForTest(const std::string& key) {
-        return static_cast<uint32_t>(
-            MasterServiceTestPeer(*service_).getShardIndex(key));
+        return accessor.Get().GetCommittedSoftPinTimeout();
     }
 
     tl::expected<void, SerializationError> DeserializeMetadataForTest(
@@ -618,30 +604,11 @@ class SnapshotChildProcessTest : public ::testing::Test {
         return serializer.Deserialize(data);
     }
 
-    bool ObjectIsGroupedInMetadata(const std::string& key, size_t shard_idx) {
-        auto& shard =
-            MasterServiceTestPeer::MetadataShards(*service_)[shard_idx];
-        SharedMutexLocker lock(&shard.mutex, shared_lock_t{});
-        for (const auto& [tenant_id, tenant_state] : shard.tenants) {
-            auto it = tenant_state.metadata.find(key);
-            if (it != tenant_state.metadata.end()) {
-                return it->second.IsGrouped();
-            }
-        }
-        return false;
-    }
-
-    std::string FindGroupIdOnDifferentShard(MasterService* svc,
-                                            const std::string& key) {
-        const size_t key_shard = MasterServiceTestPeer(*svc).getShardIndex(key);
-        for (int i = 0; i < 1024; ++i) {
-            std::string group_id = key + "_group_" + std::to_string(i);
-            if (MasterServiceTestPeer(*svc).getShardIndex(group_id) !=
-                key_shard) {
-                return group_id;
-            }
-        }
-        return key + "_group";
+    bool ObjectIsGroupedInMetadata(const std::string& key) {
+        MasterServiceTestPeer::MetadataAccessorRO accessor(
+            service_.get(),
+            MasterServiceTestPeer::ObjectIdentity{TenantId::Default(), key});
+        return accessor.GetEntry() != nullptr && accessor.Get().IsGrouped();
     }
 
    private:
@@ -1095,8 +1062,7 @@ TEST_F(SnapshotChildProcessTest, RestoreRebuildsGroupedObjectRouting) {
     const std::string key = "snapshot_grouped_route_key";
     ReplicateConfig replicate_config;
     replicate_config.replica_num = 1;
-    replicate_config.group_ids = std::vector<std::string>{
-        FindGroupIdOnDifferentShard(service_.get(), key)};
+    replicate_config.group_ids = std::vector<std::string>{key + "_group"};
 
     auto put_start = service_->PutStart(client_id, key, TenantId::Default(),
                                         1024, replicate_config);
@@ -1176,7 +1142,6 @@ TEST_F(SnapshotChildProcessTest,
        DeserializeLegacyMetadataWithoutGroupIdRestoresUngroupedObject) {
     CreateDefaultService();
     const std::string key = "legacy_snapshot_no_group_id_key";
-    const uint32_t shard_idx = GetShardIndexForTest(key);
     const UUID client_id = generate_uuid();
 
     msgpack::sbuffer shard_buffer;
@@ -1207,7 +1172,8 @@ TEST_F(SnapshotChildProcessTest,
     root_packer.pack_map(3);
     root_packer.pack(std::string("shards"));
     root_packer.pack_map(1);
-    root_packer.pack(shard_idx);
+    // The reader ignores the inner "shards" map key, so any value works.
+    root_packer.pack(uint32_t{0});
     root_packer.pack_bin(compressed_shard.size());
     root_packer.pack_bin_body(
         reinterpret_cast<const char*>(compressed_shard.data()),
@@ -1222,13 +1188,12 @@ TEST_F(SnapshotChildProcessTest,
     ASSERT_TRUE(deserialize_result.has_value())
         << deserialize_result.error().message;
 
-    EXPECT_FALSE(ObjectIsGroupedInMetadata(key, shard_idx));
+    EXPECT_FALSE(ObjectIsGroupedInMetadata(key));
 }
 
 TEST_F(SnapshotChildProcessTest, DeserializeMetadataSkipsInvalidClientId) {
     CreateDefaultService();
     const std::string key = "invalid_client_id_snapshot_key";
-    const uint32_t shard_idx = GetShardIndexForTest(key);
 
     msgpack::sbuffer shard_buffer;
     MsgpackPacker shard_packer(&shard_buffer);
@@ -1258,7 +1223,8 @@ TEST_F(SnapshotChildProcessTest, DeserializeMetadataSkipsInvalidClientId) {
     root_packer.pack_map(3);
     root_packer.pack(std::string("shards"));
     root_packer.pack_map(1);
-    root_packer.pack(shard_idx);
+    // The reader ignores the inner "shards" map key, so any value works.
+    root_packer.pack(uint32_t{0});
     root_packer.pack_bin(compressed_shard.size());
     root_packer.pack_bin_body(
         reinterpret_cast<const char*>(compressed_shard.data()),

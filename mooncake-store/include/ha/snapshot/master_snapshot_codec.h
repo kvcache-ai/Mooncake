@@ -61,7 +61,7 @@ struct MasterSnapshotPayloads {
  * @brief Encodes and decodes master snapshot payloads.
  *
  * This codec handles serialization of the complete master state bundle:
- * - Metadata shards (objects, replicas, tenant state)
+ * - Metadata entries (one per tenant that holds objects)
  * - Segment manager state
  * - Task manager state
  * - Discarded replicas
@@ -70,7 +70,8 @@ struct MasterSnapshotPayloads {
  * to maintain backward compatibility with existing snapshots.
  *
  * Format details:
- * - metadata: msgpack-encoded metadata shards (compressed per-shard with zstd)
+ * - metadata: msgpack-encoded metadata entries, kept under the legacy "shards"
+ *   map key (compressed per entry with zstd)
  * - segments: msgpack-encoded segment manager state
  * - task_manager: msgpack-encoded task manager state
  * - manifest.txt: format descriptor "<type>|<version>|<snapshot_id>"
@@ -97,7 +98,7 @@ class MasterSnapshotCodec {
      * @return Structured payloads containing serialized data, or error
      *
      * The returned struct contains:
-     * - metadata: serialized metadata shards
+     * - metadata: serialized metadata entries
      * - segments: serialized segment manager state
      * - task_manager: serialized task manager state
      */

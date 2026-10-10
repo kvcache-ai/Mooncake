@@ -122,7 +122,7 @@ struct ReplicateConfig {
     // Optional per-key group IDs. Empty string keeps that key
     // ungrouped. Group IDs tie keys into a lifecycle group: the background
     // eviction treats the group as a unit (all-or-none). Object routing is
-    // always hash(tenant, key) and is decoupled from groups.
+    // always the key inside the owning tenant, and is decoupled from groups.
     std::optional<std::vector<std::string>> group_ids{};
 
     ReplicateConfig ForSingleKey(size_t key_index) const {
@@ -346,39 +346,38 @@ class Replica {
 
     [[nodiscard]] Descriptor get_descriptor() const;
 
-    [[nodiscard]] bool getDescriptorIfAvailable(Descriptor& descriptor) const {
+    // True while the replica's storage can serve a read: a buffer still
+    // allocated on a live segment whose client is serving, or a local-disk
+    // owner that is still serving. Other kinds carry no such state. The caller
+    // holds the lock of the entry that owns this replica, or owns a replica no
+    // other thread can reach yet: the client binding changes only under that
+    // entry's exclusive lock or before the replica is published, so it is read
+    // in place rather than through an atomic load.
+    [[nodiscard]] bool is_available() const {
         if (is_memory_replica()) {
             const auto& data = std::get<MemoryReplicaData>(data_);
-            if (!data.buffer || !data.buffer->isAvailable()) {
-                return false;
-            }
-        } else if (is_nof_replica()) {
-            const auto& data = std::get<NoFReplicaData>(data_);
-            if (!data.buffer || !data.buffer->isAvailable()) {
-                return false;
-            }
-        } else if (is_local_disk_replica()) {
-            const auto& data = std::get<LocalDiskReplicaData>(data_);
-            const auto record = std::atomic_load_explicit(
-                &data.client_liveness, std::memory_order_acquire);
-            if (!record || !record->IsServing()) {
-                return false;
-            }
-        }
-        descriptor = get_descriptor();
-        if (is_memory_replica()) {
-            return std::get<MemoryReplicaData>(data_).buffer->isAvailable();
+            return data.buffer && data.buffer->isAvailable();
         }
         if (is_nof_replica()) {
-            return std::get<NoFReplicaData>(data_).buffer->isAvailable();
+            const auto& data = std::get<NoFReplicaData>(data_);
+            return data.buffer && data.buffer->isAvailable();
         }
         if (is_local_disk_replica()) {
             const auto& data = std::get<LocalDiskReplicaData>(data_);
-            const auto record = std::atomic_load_explicit(
-                &data.client_liveness, std::memory_order_acquire);
-            return record && record->IsServing();
+            const ClientLivenessRecord* record = data.client_liveness.get();
+            return record != nullptr && record->IsServing();
         }
         return true;
+    }
+
+    [[nodiscard]] bool getDescriptorIfAvailable(Descriptor& descriptor) const {
+        if (!is_available()) {
+            return false;
+        }
+        descriptor = get_descriptor();
+        // Checked again: the storage can go away while the descriptor is
+        // built, and a reader must not be handed one that already has.
+        return is_available();
     }
 
     [[nodiscard]] ReplicaID id() const { return id_; }

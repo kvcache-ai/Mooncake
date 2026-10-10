@@ -262,56 +262,56 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
     }
 #endif
 
+    // Charges through the tenant's quota binding, the way every data-plane
+    // path does.
     tl::expected<void, ErrorCode> ChargeTenantQuotaForTest(
         MasterService& service, const TenantId& tenant_id, uint64_t bytes) {
-        return MasterServiceTestPeer(service).ChargeTenantQuota(
-            MasterServiceTestPeer::TenantQuotaTable(service)
-                .GetOrCreateTenantHandle(tenant_id),
-            bytes);
+        return GetOrCreateTenantHandleForTest(service, tenant_id)
+            .quota()
+            .Charge(bytes);
     }
 
-    TenantQuotaHandle GetOrCreateTenantStateHandleForTest(
-        MasterService& service, size_t shard_idx, const TenantId& tenant_id) {
-        MasterServiceTestPeer::MetadataShardAccessorRW shard(&service,
-                                                             shard_idx);
-        auto& tenant_state =
-            MasterServiceTestPeer(service).GetOrCreateTenantState(shard.get(),
-                                                                  tenant_id);
-        return MasterServiceTestPeer(service).GetBoundTenantQuotaHandle(
-            tenant_state);
+    // The tenant for one tenant id with its quota binding, created through the
+    // registry's factory on first use, which binds its quota account.
+    metadata::TenantHandle GetOrCreateTenantHandleForTest(
+        MasterService& service, const TenantId& tenant_id) {
+        return MasterServiceTestPeer(service).GetOrCreateTenantHandle(
+            tenant_id);
     }
 
-    tl::expected<void, ErrorCode> ChargeBoundTenantQuotaForTest(
-        MasterService& service, TenantQuotaHandle account, uint64_t bytes) {
-        return MasterServiceTestPeer(service).ChargeTenantQuota(account, bytes);
+    // The one quota account bound to that tenant.
+    TenantQuotaHandle GetBoundTenantQuotaHandleForTest(
+        MasterService& service, const TenantId& tenant_id) {
+        auto tenant =
+            MasterServiceTestPeer(service).GetOrCreateTenantHandle(tenant_id);
+        if (tenant == nullptr) {
+            return nullptr;
+        }
+        return tenant.quota().Account();
     }
 
-    void ReleaseBoundTenantQuotaForTest(MasterService& service,
-                                        TenantQuotaHandle account,
-                                        uint64_t bytes) {
-        MasterServiceTestPeer(service).ReleaseTenantQuota(account, bytes);
-    }
-
+    // Sweeps one tenant: its objects are its whole route, so no key is named.
     void DiscardExpiredProcessingForTest(MasterService& service,
-                                         const TenantId& tenant_id,
-                                         const std::string& key) {
-        const size_t shard_idx =
-            MasterServiceTestPeer(service).getShardIndex(tenant_id, key);
-        MasterServiceTestPeer::MetadataShardAccessorRW shard(&service,
-                                                             shard_idx);
+                                         const TenantId& tenant_id) {
+        auto tenant =
+            MasterServiceTestPeer(service).GetOrCreateTenantHandle(tenant_id);
+        ASSERT_NE(tenant, nullptr);
         MasterServiceTestPeer(service).DiscardExpiredProcessingReplicas(
-            shard, std::chrono::system_clock::time_point::max());
+            tenant, tenant_id, std::chrono::system_clock::time_point::max());
     }
 
     void FinalizeExpiredProcessingForTest(MasterService& service,
                                           const TenantId& tenant_id,
                                           const std::string& key) {
+        auto object_entry = MasterServiceTestPeer::FindObject(
+            service, MasterServiceTestPeer::ObjectIdentity{tenant_id, key});
+        ASSERT_NE(object_entry, nullptr);
         OpLogEntry entry;
         entry.tenant_id = tenant_id.value();
         entry.object_key = key;
         MasterServiceTestPeer(service)
             .FinalizeExpiredProcessingReplicasAfterDurable(
-                entry, std::chrono::system_clock::now());
+                object_entry, entry, std::chrono::system_clock::now());
     }
 
     void FinalizeRemovedMemoryReplicasForTest(MasterService& service,
@@ -425,24 +425,21 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
     std::vector<std::string> policy_files_;
 };
 
-TEST_F(MasterServiceTenantQuotaTest,
-       SingleTenantModeCollapsesTenantsAndDisablesQuota) {
+TEST_F(MasterServiceTenantQuotaTest, SingleTenantModeDisablesQuota) {
     MasterService service(MakeConfig({}, /*enable_multi_tenants=*/false));
     UUID client_id = MountSegment(service, /*size=*/1024);
 
-    PutComplete(service, client_id, "shared-key", TenantId("tenant-a"), 800);
-
-    EXPECT_TRUE(service.ExistKey("shared-key", TenantId("tenant-b")).value());
-    auto duplicate = service.PutStart(client_id, "shared-key",
-                                      TenantId("tenant-b"), 1, MemoryConfig());
-    ASSERT_FALSE(duplicate.has_value());
-    EXPECT_EQ(duplicate.error(), ErrorCode::OBJECT_ALREADY_EXISTS);
+    // In this mode the request layer resolves every tenant to the default one
+    // (WrappedSingleTenantModeCollapsesRequestTenants), and no tenant is
+    // metered.
+    PutComplete(service, client_id, "shared-key", TenantId::Default(), 800);
+    EXPECT_TRUE(service.IsTenantRegistered(TenantId("tenant-a")));
+    EXPECT_FALSE(
+        service.GetTenantQuotaSnapshot(TenantId::Default()).has_value());
     EXPECT_TRUE(service
-                    .Remove("shared-key", TenantId("tenant-b"),
+                    .Remove("shared-key", TenantId::Default(),
                             /*force=*/true)
                     .has_value());
-    EXPECT_FALSE(
-        service.GetTenantQuotaSnapshot(TenantId("tenant-a")).has_value());
 }
 
 TEST_F(MasterServiceTenantQuotaTest,
@@ -473,37 +470,71 @@ TEST_F(MasterServiceTenantQuotaTest,
     PutComplete(service, client_id, "ok", TenantId("tenant-a"), 10);
 }
 
-TEST_F(MasterServiceTenantQuotaTest,
-       SameTenantStatesAcrossMetadataShardsShareBoundHandle) {
-    const TenantId tenant_id("tenant-a");
-    MasterService service(MakeConfig({{tenant_id, 1000}}));
-    MountSegment(service);
+TEST_F(MasterServiceTenantQuotaTest, RemoveOnUnknownTenantCreatesNoTenant) {
+    MasterService service(MakeConfig({{TenantId("tenant-a"), 1000}}));
+    const TenantId unknown("tenant-unknown");
 
-    auto* first_handle =
-        GetOrCreateTenantStateHandleForTest(service, 0, tenant_id);
-    auto* second_handle =
-        GetOrCreateTenantStateHandleForTest(service, 1, tenant_id);
-
-    ASSERT_NE(first_handle, nullptr);
-    EXPECT_EQ(first_handle, second_handle);
-
-    auto charge = ChargeBoundTenantQuotaForTest(service, first_handle, 128);
-    ASSERT_TRUE(charge.has_value()) << toString(charge.error());
-    EXPECT_EQ(Snapshot(service, tenant_id).charged_bytes, 128);
-
-    ReleaseBoundTenantQuotaForTest(service, second_handle, 128);
-    EXPECT_EQ(Snapshot(service, tenant_id).charged_bytes, 0);
+    auto removed = service.Remove("missing", unknown);
+    ASSERT_FALSE(removed.has_value());
+    EXPECT_EQ(removed.error(), ErrorCode::OBJECT_NOT_FOUND);
+    EXPECT_EQ(MasterServiceTestPeer::Tenants(service).Lookup(unknown), nullptr);
 }
 
 TEST_F(MasterServiceTenantQuotaTest,
-       ChargeRejectsMissingHandleWhenQuotaIsEnabled) {
+       GetOrCreateTenantHandleIsIdempotentForOneTenantId) {
     const TenantId tenant_id("tenant-a");
     MasterService service(MakeConfig({{tenant_id, 1000}}));
     MountSegment(service);
 
-    auto charge = ChargeBoundTenantQuotaForTest(service, nullptr, 1);
-    ASSERT_FALSE(charge.has_value());
-    EXPECT_EQ(charge.error(), ErrorCode::INTERNAL_ERROR);
+    auto first_tenant = GetOrCreateTenantHandleForTest(service, tenant_id);
+    auto second_tenant = GetOrCreateTenantHandleForTest(service, tenant_id);
+
+    ASSERT_NE(first_tenant, nullptr);
+    // One tenant id names one tenant, so a second lookup yields the same one.
+    EXPECT_EQ(first_tenant, second_tenant);
+
+    auto* first_handle = GetBoundTenantQuotaHandleForTest(service, tenant_id);
+    auto* second_handle = GetBoundTenantQuotaHandleForTest(service, tenant_id);
+
+    ASSERT_NE(first_handle, nullptr);
+    // ...and that tenant owns exactly one bound account.
+    EXPECT_EQ(first_handle, second_handle);
+
+    auto charge = first_tenant.quota().Charge(128);
+    ASSERT_TRUE(charge.has_value()) << toString(charge.error());
+    EXPECT_EQ(Snapshot(service, tenant_id).charged_bytes, 128);
+
+    second_tenant.quota().Release(128);
+    EXPECT_EQ(Snapshot(service, tenant_id).charged_bytes, 0);
+}
+
+TEST_F(MasterServiceTenantQuotaTest, DroppedReservationGivesTheChargeBack) {
+    const TenantId tenant_id("tenant-a");
+    MasterService service(MakeConfig({{tenant_id, 1000}}));
+    MountSegment(service);
+    auto tenant = GetOrCreateTenantHandleForTest(service, tenant_id);
+    ASSERT_NE(tenant, nullptr);
+
+    {
+        auto reservation = tenant.quota().Reserve(128);
+        ASSERT_TRUE(reservation.has_value()) << toString(reservation.error());
+        EXPECT_EQ(Snapshot(service, tenant_id).charged_bytes, 128);
+    }
+    EXPECT_EQ(Snapshot(service, tenant_id).charged_bytes, 0);
+
+    {
+        auto reservation = tenant.quota().Reserve(128);
+        ASSERT_TRUE(reservation.has_value()) << toString(reservation.error());
+        EXPECT_EQ(reservation->Commit(), 128);
+    }
+    // Committed: the caller owes the bytes now, so the drop keeps them.
+    EXPECT_EQ(Snapshot(service, tenant_id).charged_bytes, 128);
+    tenant.quota().Release(128);
+
+    // A rejected reservation charges nothing.
+    auto too_large = tenant.quota().Reserve(UINT64_C(1) << 40);
+    ASSERT_FALSE(too_large.has_value());
+    EXPECT_EQ(too_large.error(), ErrorCode::TENANT_QUOTA_EXCEEDED);
     EXPECT_EQ(Snapshot(service, tenant_id).charged_bytes, 0);
 }
 
@@ -820,7 +851,7 @@ TEST_F(MasterServiceTenantQuotaTest,
     AddCompletedDiskReplica(service, client_id, "key", tenant_id, 100);
     EXPECT_EQ(Snapshot(service, tenant_id).charged_bytes, 100);
 
-    DiscardExpiredProcessingForTest(service, tenant_id, "key");
+    DiscardExpiredProcessingForTest(service, tenant_id);
 
     ExpectDiskOnlyObjectAndChargedBytes(service, tenant_id, "key", 0);
 }
@@ -1175,7 +1206,7 @@ TEST_F(MasterServiceTenantQuotaTest,
     EXPECT_EQ(delete_future.wait_for(std::chrono::milliseconds(200)),
               std::future_status::timeout)
         << "tenant deletion passed the metadata scan while zero-charge "
-           "PutStart still held the target metadata shard";
+           "PutStart was still in flight for that tenant";
 
     blocking_strategy_ptr->AllowAllocation();
     put_thread.join();

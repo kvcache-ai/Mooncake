@@ -780,12 +780,11 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
                     owner));
         }
 
-        for (const auto& shard :
-             MasterServiceTestPeer::MetadataShards(*service)) {
-            for (const auto& [tenant_id, tenant_state] : shard.tenants) {
-                (void)tenant_id;
-                for (const auto& [key, metadata] : tenant_state.metadata) {
-                    (void)key;
+        MasterServiceTestPeer::Tenants(*service).Visit(
+            [&](const TenantId&,
+                const std::shared_ptr<metadata::Tenant>& handle) {
+                for (auto object : handle->ReadCursor()) {
+                    const auto& metadata = object.metadata();
                     for (const auto& replica : metadata.GetAllReplicas()) {
                         if (replica.is_memory_replica()) {
                             const auto record = replica.getClientLiveness();
@@ -809,8 +808,7 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
                         }
                     }
                 }
-            }
-        }
+            });
     }
 
     // Test snapshot and restore functionality

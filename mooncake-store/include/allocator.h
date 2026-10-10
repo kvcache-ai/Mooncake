@@ -105,13 +105,18 @@ class AllocatedBuffer {
         return allocator_.lock();
     }
 
+    // The caller holds the lock of the entry whose metadata owns this buffer,
+    // or owns a buffer no other thread can reach yet. Both bindings change
+    // only under that entry's exclusive lock or before the buffer is
+    // published, so the client record is read in place, as the segment
+    // lifetime is: an atomic load would take a global lock and bounce the
+    // record's reference count with every allocation.
     [[nodiscard]] bool isAvailable() const {
         if (!isAllocatorValid()) {
             return false;
         }
-        const auto record = std::atomic_load_explicit(
-            &client_liveness_, std::memory_order_acquire);
-        return !record || record->IsServing();
+        const ClientLivenessRecord* record = client_liveness_.get();
+        return record == nullptr || record->IsServing();
     }
 
     void bindClientLiveness(

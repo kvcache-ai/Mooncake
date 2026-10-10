@@ -77,12 +77,6 @@ class PromotionOnHitTest : public ::testing::Test {
             .RunPromotionCandidateRetryForTesting();
     }
 
-    static size_t RunPromotionCandidateRetryForTesting(MasterService* service,
-                                                       size_t shards_to_scan) {
-        return MasterServiceTestPeer(*service).RunPromotionCandidateRetry(
-            shards_to_scan);
-    }
-
     static void ClearCandidatesForReloadForTesting(MasterService* service) {
         MasterServiceTestPeer(*service).ClearCandidatesForReload();
     }
@@ -118,9 +112,8 @@ class PromotionOnHitTest : public ::testing::Test {
         MasterServiceTestPeer::MetadataAccessorRO accessor(
             service, MasterServiceTestPeer::ObjectIdentity{
                          .tenant_id = tenant_id, .user_key = key});
-        const auto* tenant_state = accessor.GetTenantState();
-        return tenant_state != nullptr &&
-               tenant_state->promotion_tasks.contains(key);
+        return accessor.Exists() &&
+               accessor.GetState().promotion_task.has_value();
     }
 
     // std::nullopt when the key has no in-flight promotion task.
@@ -130,15 +123,14 @@ class PromotionOnHitTest : public ::testing::Test {
         MasterServiceTestPeer::MetadataAccessorRO accessor(
             service, MasterServiceTestPeer::ObjectIdentity{
                          .tenant_id = tenant_id, .user_key = key});
-        const auto* tenant_state = accessor.GetTenantState();
-        if (tenant_state == nullptr) {
+        if (!accessor.Exists()) {
             return std::nullopt;
         }
-        auto it = tenant_state->promotion_tasks.find(key);
-        if (it == tenant_state->promotion_tasks.end()) {
+        const auto& task = accessor.GetState().promotion_task;
+        if (!task.has_value()) {
             return std::nullopt;
         }
-        return it->second.execution_failures;
+        return task->execution_failures;
     }
 
     static bool PromotionAdmissionBlockedByPrimaryWriteForTesting(
@@ -794,7 +786,7 @@ TEST_F(PromotionOnHitTest, StalePromotionReaper) {
     const int64_t expired_pre = mm.get_promotion_expired();
 
     // Trigger #1: enqueue, then drain the per-segment queue. Drain leaves
-    // the per-shard PromotionTask intact (the heartbeat is best-effort GC,
+    // the entry's PromotionTask intact (the heartbeat is best-effort GC,
     // not the authoritative state).
     {
         auto r = service->GetReplicaList("k_cold", TenantId::Default());
@@ -894,7 +886,7 @@ TEST_F(PromotionOnHitTest, RemoveDuringPromotion) {
     std::this_thread::sleep_for(std::chrono::seconds(3));
 
     // Re-injecting the key and re-triggering must work end-to-end, proving
-    // the per-shard PromotionTask was reaped (not stuck).
+    // the entry's PromotionTask was reaped (not stuck).
     ASSERT_TRUE(InjectLocalDiskReplica(*service, ctx.client_id, "k_cold", 1024,
                                        ctx.segment_name));
     {
@@ -1006,44 +998,24 @@ TEST_F(PromotionOnHitTest, MultiSegmentAllocRespectsPreferred) {
     service->RemoveAll();
 }
 
-// promotion_queue_limit caps total in-flight tasks cluster-wide
-// (gate: promotion_in_flight_ >= limit). With limit=1 the very first
-// queued task saturates the cap, so a second LOCAL_DISK-only read —
-// even on a key in the same shard — must be silently dropped by the
-// cap gate (reads still succeed; just no new task is enqueued).
-// QueueLimitRejectsCrossShard covers the same-cap-across-different-
-// shards case.
+// promotion_queue_limit caps in-flight tasks cluster-wide (gate:
+// promotion_in_flight_ >= limit). With limit=1 the first queued task
+// saturates the cap, so a later LOCAL_DISK-only read of another key is
+// dropped by the gate while the read itself still succeeds.
 TEST_F(PromotionOnHitTest, QueueLimitRejectsBeyondCap) {
     MasterServiceConfig config;
     config.enable_offload = true;
     config.promotion_on_hit = true;
     config.promotion_admission_threshold = 1;
-    config.promotion_queue_limit = 1;  // any 1 task saturates a shard
+    config.promotion_queue_limit = 1;  // the first task fills the cap
     config.default_kv_lease_ttl = 2000;
     auto service = std::make_unique<MasterService>(config);
 
     constexpr size_t seg_size = 1024 * 1024 * 16;
     auto seg = PrepareSegment(*service, "seg_a", kDefaultSegmentBase, seg_size);
 
-    // Find two keys that hash to the same shard. MasterService::
-    // getShardIndex is private but the formula is deterministic
-    // (std::hash<std::string>{}(key) % kNumShards), so we can mirror
-    // it here. kNumShards=1024 (master_service.h:889).
-    constexpr size_t kNumShardsLocal = 1024;
-    auto shard_of = [](const std::string& k) {
-        return std::hash<std::string>{}(k) % kNumShardsLocal;
-    };
     const std::string k1 = "qlim_first";
-    std::string k2;
-    for (int i = 0; i < 100000 && k2.empty(); ++i) {
-        std::string candidate = "qlim_collide_" + std::to_string(i);
-        if (shard_of(candidate) == shard_of(k1)) {
-            k2 = candidate;
-        }
-    }
-    ASSERT_FALSE(k2.empty())
-        << "could not find a same-shard collision for " << k1;
-
+    const std::string k2 = "qlim_second";
     ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, k1, 1024,
                                        seg.segment_name));
     ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, k2, 1024,
@@ -1052,13 +1024,12 @@ TEST_F(PromotionOnHitTest, QueueLimitRejectsBeyondCap) {
     auto& mm = MasterMetricManager::instance();
     const int64_t cap_rej_pre = mm.get_promotion_rejected_cap();
 
-    // First read on k1 enqueues a task in shard S.
+    // First read on k1 enqueues a task.
     auto r1 = service->GetReplicaList(k1, TenantId::Default());
     ASSERT_TRUE(r1.has_value());
 
-    // Second read on k2 (same shard S, different key, so no dedup) must
-    // be dropped by the cap gate: the cluster-wide in-flight counter is
-    // already 1, which meets promotion_queue_limit_ = 1.
+    // Second read on k2: a different key, so no dedup, and the cluster-wide
+    // in-flight counter is already at promotion_queue_limit_.
     auto r2 = service->GetReplicaList(k2, TenantId::Default());
     ASSERT_TRUE(r2.has_value()) << "read itself must still succeed; "
                                 << "queue gate is silent";
@@ -1139,9 +1110,8 @@ TEST_F(PromotionOnHitTest, HeartbeatBoundedBatchPreservesLeftovers) {
     EXPECT_TRUE(tick4->empty())
         << "after draining all queued keys, heartbeat must return empty";
 
-    // Sanity: master-side promotion_tasks records are intact for all keys
-    // (they're cleared by NotifyPromotionSuccess, not by Heartbeat), so the
-    // source refcnts remain pinned until processed.
+    // NotifyPromotionSuccess clears a task and the heartbeat does not, so each
+    // key's entry still carries its promotion task and pins the source refcnt.
     for (const auto& k : keys) {
         auto rl = service->GetReplicaList(k, TenantId::Default());
         ASSERT_TRUE(rl.has_value()) << "key " << k << " should still exist";
@@ -1151,9 +1121,9 @@ TEST_F(PromotionOnHitTest, HeartbeatBoundedBatchPreservesLeftovers) {
 }
 
 // The promotion task reaper must pop the staged PROCESSING MEMORY
-// replica added by PromotionAllocStart. The staged replica is not in
-// shard->processing_keys, so DiscardExpiredProcessingReplicas's main
-// sweep can't see it, and the reaper for promotion tasks is the only
+// replica added by PromotionAllocStart. The staged replica carries no
+// is_processing flag of its own, so DiscardExpiredProcessingReplicas's
+// main sweep can't see it, and the reaper for promotion tasks is the only
 // place that knows the replica exists. Without this path the orphan
 // holds its allocator buffer indefinitely (until the object is removed
 // or evicted).
@@ -1247,63 +1217,51 @@ TEST_F(PromotionOnHitTest, ReaperPopsStagedMemoryReplicaOnExpiry) {
     service->RemoveAll();
 }
 
-// The cap gate must be cluster-wide, not per-shard. Promotion targets
-// skewed hot keys, which by definition cluster into a small number of
-// shards; a `shard->size() * kNumShards >= limit` heuristic fires
-// roughly kNumShards-times too eagerly on that workload. With a global
-// atomic counter, a task in shard A counts toward the cap that gates a
-// task in shard B.
-TEST_F(PromotionOnHitTest, QueueLimitRejectsCrossShard) {
+// The cap gate is one cluster-wide counter, not a per-tenant one: promotion
+// targets skewed hot keys, which cluster into one tenant's route, so a
+// per-tenant count would let every tenant admit a task of its own.
+TEST_F(PromotionOnHitTest, QueueLimitRejectsCrossTenant) {
+    const TenantId tenant_other("tenant-b");
     MasterServiceConfig config;
     config.enable_offload = true;
+    config.enable_multi_tenants = true;
+    config.tenant_quota_connector_type = "file";
+    config.tenant_quota_connector_uri =
+        WriteTenantQuotaPolicyFile({{TenantId::Default().value(), 1 << 20},
+                                    {tenant_other.value(), 1 << 20}});
     config.promotion_on_hit = true;
     config.promotion_admission_threshold = 1;
-    config.promotion_queue_limit = 1;  // 1 in-flight task globally
+    config.promotion_queue_limit = 1;  // 1 in-flight task cluster-wide
     config.default_kv_lease_ttl = 2000;
     auto service = std::make_unique<MasterService>(config);
 
     constexpr size_t seg_size = 1024 * 1024 * 16;
     auto seg = PrepareSegment(*service, "seg_a", kDefaultSegmentBase, seg_size);
 
-    // Find two keys hashing to *different* shards. With the old per-shard
-    // heuristic this would let both through (each shard's count is 0
-    // independently). With the global counter, only the first goes in.
-    constexpr size_t kNumShardsLocal = 1024;
-    auto shard_of = [](const std::string& k) {
-        return std::hash<std::string>{}(k) % kNumShardsLocal;
-    };
-    const std::string k1 = "xshard_first";
-    std::string k2;
-    for (int i = 0; i < 100000 && k2.empty(); ++i) {
-        std::string candidate = "xshard_other_" + std::to_string(i);
-        if (shard_of(candidate) != shard_of(k1)) {
-            k2 = candidate;
-        }
-    }
-    ASSERT_FALSE(k2.empty()) << "couldn't find a different-shard key";
-    ASSERT_NE(shard_of(k1), shard_of(k2));
-
+    // Each key is in its own tenant with its own empty task count, while the
+    // cap is one counter for the whole service.
+    const std::string k1 = "xtenant_first";
+    const std::string k2 = "xtenant_other";
     ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, k1, 1024,
                                        seg.segment_name));
     ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, k2, 1024,
-                                       seg.segment_name));
+                                       seg.segment_name, tenant_other.value()));
 
     auto r1 = service->GetReplicaList(k1, TenantId::Default());
     ASSERT_TRUE(r1.has_value());
 
-    // k2 lives in a different shard, but the global cap is already met
-    // by k1's task — k2 must be rejected.
-    auto r2 = service->GetReplicaList(k2, TenantId::Default());
+    // k2's own tenant holds no task, but the cluster-wide cap is already met
+    // by k1's.
+    auto r2 = service->GetReplicaList(k2, tenant_other);
     ASSERT_TRUE(r2.has_value()) << "read itself still succeeds";
 
     auto heartbeat = service->PromotionObjectHeartbeat(seg.client_id);
     ASSERT_TRUE(heartbeat.has_value());
     EXPECT_EQ(heartbeat->size(), 1u)
-        << "with global cap=1 and one task already in shard " << shard_of(k1)
-        << ", a key hashing to shard " << shard_of(k2)
-        << " must be rejected by the global gate. A per-shard heuristic "
-        << "would admit it here since the destination shard's local "
-        << "count is 0.";
+        << "with cluster-wide cap=1 and one task already admitted for tenant "
+        << TenantId::Default().value() << ", a key of " << tenant_other.value()
+        << " must be rejected by the global gate. A per-tenant heuristic "
+        << "would admit it here, the other tenant's own count being 0.";
     EXPECT_EQ(CountPromotionTask(*heartbeat, k1), 1u);
     EXPECT_EQ(CountPromotionTask(*heartbeat, k2), 0u);
 
@@ -1574,8 +1532,8 @@ TEST_F(PromotionOnHitTest, UpsertStartRejectsActivePromotionTask) {
 // (e.g. client stall past put_start_release_timeout_sec_). Without the
 // check, AllocStart would allocate + AddReplicas a PROCESSING MEMORY
 // replica with nothing tracking it: the generic PROCESSING reaper only
-// iterates shard->processing_keys (never populated by promotion) and
-// the promotion-task reaper has nothing left to iterate, so the buffer
+// visits entries whose is_processing flag is set (never set by promotion)
+// and the promotion-task reaper has nothing left to iterate, so the buffer
 // leaks until the object is removed or evicted.
 TEST_F(PromotionOnHitTest, AllocStartRejectsReapedTask) {
     MasterServiceConfig config;
@@ -2150,7 +2108,7 @@ TEST_F(PromotionOnHitTest, AllocStartRejectsSizeMismatch) {
 }
 
 // When a holder client expires, ClientMonitorFunc must clean up its
-// dangling promotion_tasks entries and decrement the global in-flight
+// dangling promotion tasks and decrement the global in-flight
 // counter. Without this cleanup, the entries stay pinned until reaper
 // TTL — and on a rolling restart of many holders the cluster-wide cap
 // promotion_queue_limit_ saturates and blocks all new admissions for
@@ -2192,7 +2150,7 @@ TEST_F(PromotionOnHitTest, ClientExpiryClearsPromotionTask) {
     }
 
     // Sanity: with queue_limit=1 the cap is saturated. A second
-    // different-shard admission must be rejected right now.
+    // admission of another key must be rejected right now.
     auto second_holder = PrepareSegment(
         *service, "seg_b", kDefaultSegmentBase + seg_size, seg_size);
     // MountSegment and MountLocalDiskSegment establish Active liveness; no
@@ -2229,10 +2187,9 @@ TEST_F(PromotionOnHitTest, ClientExpiryClearsPromotionTask) {
     }
 
     // ClearInvalidHandles should have erased the holder's LOCAL_DISK
-    // source replica AND (with the fix) the promotion_tasks entry,
-    // decrementing the global in-flight counter. Re-admit a promotion
-    // on the second holder; with queue_limit=1 this can only succeed if
-    // the slot was freed.
+    // source replica and the entry's promotion task, decrementing the global
+    // in-flight counter. Re-admit a promotion on the second holder: with
+    // queue_limit=1 this can only succeed if the slot was freed.
     {
         auto r = service->GetReplicaList("k_other", TenantId::Default());
         ASSERT_TRUE(r.has_value())
@@ -2243,7 +2200,7 @@ TEST_F(PromotionOnHitTest, ClientExpiryClearsPromotionTask) {
     ASSERT_TRUE(pending_post.has_value());
     EXPECT_EQ(CountPromotionTask(*pending_post, "k_other"), 1u)
         << "After the holder expired, ClearInvalidHandles must have "
-        << "erased its promotion_tasks entry and decremented "
+        << "erased the promotion task recorded on its entry and decremented "
         << "promotion_in_flight_. Otherwise the global cap remains "
         << "saturated by the dead holder's task for "
         << "put_start_release_timeout_sec_ seconds, and this admission "
@@ -2326,7 +2283,7 @@ TEST_F(PromotionOnHitTest, RemoveErasesPromotionTask) {
     }
 
     // Remove k_first with force=true. With the fix, this also wipes
-    // k_first's promotion_tasks entry and decrements
+    // the promotion task recorded on k_first's entry and decrements
     // promotion_in_flight_ back to 0.
     auto rm = service->Remove("k_first", TenantId::Default(), /*force=*/true);
     ASSERT_TRUE(rm.has_value())
@@ -2343,16 +2300,16 @@ TEST_F(PromotionOnHitTest, RemoveErasesPromotionTask) {
     ASSERT_TRUE(pending_post.has_value());
     EXPECT_EQ(CountPromotionTask(*pending_post, "k_second"), 1u)
         << "k_second must be admittable after Remove of k_first — Remove "
-        << "must erase the in-flight promotion_tasks entry and decrement "
-        << "promotion_in_flight_, otherwise queue_limit=1 stays saturated.";
+        << "must erase the in-flight promotion task recorded on the entry "
+        << "and decrement promotion_in_flight_, otherwise queue_limit=1 "
+        << "stays saturated.";
 
     service->RemoveAll();
 }
 
 // RemoveByRegex on a key with an in-flight PromotionTask must drop the
 // task entry, same as Remove. Mirror of RemoveErasesPromotionTask, but
-// exercises the regex path which iterates shards directly without an
-// accessor object.
+// exercises the regex path, which walks every tenant's route directly.
 TEST_F(PromotionOnHitTest, RemoveByRegexErasesPromotionTask) {
     MasterServiceConfig config;
     config.enable_offload = true;
@@ -2384,8 +2341,8 @@ TEST_F(PromotionOnHitTest, RemoveByRegexErasesPromotionTask) {
         << "RemoveByRegex should succeed; error=" << removed.error();
     EXPECT_EQ(removed.value(), 1) << "exactly one key (regex_k1) should match";
 
-    // Slot must be free — admit on other_k2 (different shard or same,
-    // doesn't matter because counter is global).
+    // Slot must be free — admit on other_k2 (same tenant or another,
+    // doesn't matter because the counter is global).
     {
         auto r = service->GetReplicaList("other_k2", TenantId::Default());
         ASSERT_TRUE(r.has_value());
@@ -2394,8 +2351,8 @@ TEST_F(PromotionOnHitTest, RemoveByRegexErasesPromotionTask) {
     ASSERT_TRUE(pending_post.has_value());
     EXPECT_EQ(CountPromotionTask(*pending_post, "other_k2"), 1u)
         << "other_k2 must be admittable after RemoveByRegex of regex_k1 "
-        << "— RemoveByRegex must erase the in-flight promotion_tasks "
-        << "entry. Otherwise queue_limit=1 stays saturated.";
+        << "— RemoveByRegex must erase the in-flight promotion task "
+        << "recorded on the entry. Otherwise queue_limit=1 stays saturated.";
 
     service->RemoveAll();
 }
@@ -2403,7 +2360,7 @@ TEST_F(PromotionOnHitTest, RemoveByRegexErasesPromotionTask) {
 // RemoveAll on a key with an in-flight PromotionTask must drop the
 // task entry alongside the metadata. Same shape as
 // RemoveErasesPromotionTask but exercises the bulk-erase loop in
-// MasterService::RemoveAll, which iterates every shard and erases
+// MasterService::RemoveAll, which walks every tenant's route and erases
 // metadata entries directly.
 TEST_F(PromotionOnHitTest, RemoveAllErasesPromotionTask) {
     MasterServiceConfig config;
@@ -3031,7 +2988,10 @@ TEST_F(PromotionOnHitTest, RetryCandidate_CapRejectedThenQueuedOnRetry) {
     service->RemoveAll();
 }
 
-TEST_F(PromotionOnHitTest, RetryCandidate_NoCandidatesOrNoShardBudgetNoops) {
+// The retry driver queues nothing without candidates, and nothing for a
+// candidate whose admission stays rejected: it is backed off, not dropped.
+TEST_F(PromotionOnHitTest,
+       RetryCandidate_NoCandidatesOrTransientRejectionQueuesNothing) {
     MasterServiceConfig config;
     config.enable_offload = true;
     config.promotion_on_hit = true;
@@ -3056,9 +3016,7 @@ TEST_F(PromotionOnHitTest, RetryCandidate_NoCandidatesOrNoShardBudgetNoops) {
         CountPromotionCandidatesForTesting(service.get(), TenantId::Default()),
         1u);
 
-    EXPECT_EQ(RunPromotionCandidateRetryForTesting(service.get(),
-                                                   /*shards_to_scan=*/0),
-              0u);
+    EXPECT_EQ(RunPromotionCandidateRetryForTesting(service.get()), 0u);
     EXPECT_EQ(
         CountPromotionCandidatesForTesting(service.get(), TenantId::Default()),
         1u);

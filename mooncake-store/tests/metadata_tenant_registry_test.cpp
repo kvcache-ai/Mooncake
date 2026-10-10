@@ -8,6 +8,7 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -18,15 +19,15 @@ namespace {
 
 // Every tenant of one registry is built through the factory it was constructed
 // with, so its tests can pass a plain one.
-std::shared_ptr<Tenant> MakeTenant(const TenantId&) {
-    return std::make_shared<Tenant>();
+TenantHandle MakeTenant(const TenantId&) {
+    return TenantHandle(std::make_shared<Tenant>());
 }
 
 TEST(TenantRegistryTest, GetOrCreateTenantBuildsOncePerTenantId) {
     size_t builds = 0;
     TenantRegistry registry([&builds](const TenantId&) {
         ++builds;
-        return std::make_shared<Tenant>();
+        return TenantHandle(std::make_shared<Tenant>());
     });
     const TenantId tenant("tenant-a");
     EXPECT_EQ(registry.Lookup(tenant), nullptr);
@@ -46,7 +47,7 @@ TEST(TenantRegistryTest, ConcurrentCreationPublishesOneWinningTenant) {
     std::atomic<size_t> builds{0};
     TenantRegistry registry([&builds](const TenantId&) {
         builds.fetch_add(1, std::memory_order_relaxed);
-        return std::make_shared<Tenant>();
+        return TenantHandle(std::make_shared<Tenant>());
     });
     const TenantId tenant("tenant-race");
 
@@ -187,7 +188,7 @@ TEST(TenantRegistryTest, MixedLookupCreateRemoveAndVisitStayConsistent) {
         [[maybe_unused]] const bool inserted =
             tenant->InsertObject(test::MakeObjectEntry("k1"));
         assert(inserted);
-        return tenant;
+        return TenantHandle(std::move(tenant));
     });
     const std::vector<TenantId> ids = {
         TenantId("tenant-a"), TenantId("tenant-b"), TenantId("tenant-c"),

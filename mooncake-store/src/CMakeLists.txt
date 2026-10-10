@@ -29,7 +29,10 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     config/s3_client_config.cpp
     segment_allocator_registration.cpp
     client_offboarding.cpp
+    dynamic_replication_controller.cpp
+    promotion_candidate_tracker.cpp
     master_service.cpp
+    tenant_quota_manager.cpp
     master_store_backend.cpp
     weight_store_manager.cpp
     master_snapshot_manager.cpp
