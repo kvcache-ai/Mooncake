@@ -1308,13 +1308,21 @@ ErrorCode ScopedNoFSegmentAccess::MountSegment(const NoFSegment& segment,
     // if a retry arrives with a different generated UUID.
     for (const auto& [existing_id, existing_segment] :
          nof_segment_manager_->mounted_segments_) {
-        if (existing_segment.status == SegmentStatus::OK &&
-            existing_segment.segment.te_endpoint == segment.te_endpoint) {
+        if (existing_segment.segment.te_endpoint != segment.te_endpoint) {
+            continue;
+        }
+
+        if (existing_segment.status == SegmentStatus::OK) {
             LOG(WARNING) << "NoF segment mount: segment_name=" << segment.name
                          << ", endpoint=" << segment.te_endpoint
                          << ", warn=segment_already_exists_with_different_id";
             return ErrorCode::SEGMENT_ALREADY_EXISTS;
         }
+        LOG(WARNING) << "NoF segment mount: segment_name=" << segment.name
+                     << ", endpoint=" << segment.te_endpoint
+                     << ", error=segment_already_exists_but_not_ok"
+                     << ", status=" << existing_segment.status;
+        return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
     }
 
     auto created = CreateBufferAllocator(
