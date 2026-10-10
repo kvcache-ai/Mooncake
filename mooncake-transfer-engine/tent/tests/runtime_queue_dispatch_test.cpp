@@ -482,7 +482,20 @@ TEST(RuntimeQueueDispatch, RejectsCancellationForUnsupportedTransport) {
     TransferEngineImpl engine(cfg);
     ASSERT_TRUE(engine.available());
 
-    auto fake_rdma = std::make_shared<FakeTransport>(RDMA);
+    // Keep the task in flight until the cancellation has been judged. The
+    // runtime queue enables the ProgressWorker, which may poll the transport
+    // before this test calls cancelTransfer(); a fake that completes on
+    // submit would then let cancelTransfer() return OK for an already
+    // terminal task instead of reaching the transport capability check.
+    std::atomic<bool> complete{false};
+    auto fake_rdma = std::make_shared<FakeTransport>(
+        RDMA, [&complete](const Request& request, int) {
+            if (!complete.load()) {
+                return TransferStatus{TransferStatusEnum::PENDING, 0};
+            }
+            return TransferStatus{TransferStatusEnum::COMPLETED,
+                                  request.length};
+        });
     fake_rdma->cancellation_supported = false;
     installFakeRdma(engine, fake_rdma);
 
@@ -498,6 +511,7 @@ TEST(RuntimeQueueDispatch, RejectsCancellationForUnsupportedTransport) {
     EXPECT_TRUE(engine.cancelTransfer(batch, 0).IsNotImplemented());
     EXPECT_EQ(fake_rdma->cancel_calls.load(), 0);
 
+    complete.store(true);
     TransferStatus status{};
     ASSERT_TRUE(engine.getTransferStatus(batch, 0, status).ok());
     EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
