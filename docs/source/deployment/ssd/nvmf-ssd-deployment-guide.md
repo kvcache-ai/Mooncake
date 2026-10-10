@@ -286,5 +286,17 @@ extra_config:
 | `MC_NOF_WORKERS` | Number of worker threads used to process SPDK NoF I/O operations. | 4 |
 | `MC_NOF_SUBMIT_CHUNK_BYTES` | Size of each I/O operation submitted to SPDK. | 128KB |
 | `MC_NOF_INFLIGHT_BYTES_LIMIT` | Maximum number of in-flight I/O bytes allowed in the system. | 32MB |
+| `MC_NOF_IO_TIMEOUT_MS` | Timeout for a single SPDK sub-I/O, in milliseconds, measured from the moment it is handed to the SPDK transport. `0` disables it. | 30000 |
 
-These three parameters together provide QoS control for SPDK NoF I/O.
+The first three parameters together provide QoS control for SPDK NoF I/O.
+
+`MC_NOF_IO_TIMEOUT_MS` bounds I/O that the target neither completes nor fails
+(for example a target that stalls while its connection stays up). When a
+sub-I/O exceeds it, the worker that owns the segment disconnects the
+segment's io qpair locally, which completes every request still outstanding
+on that qpair as aborted, and the affected transfers fail only after all of
+their sub-I/Os have been reclaimed, so the caller's buffers are never
+reused while SPDK can still write into them. The qpair stays disconnected
+afterwards: further transfers to that segment fail immediately until the
+qpair is reconnected. Time spent waiting in Mooncake's own submission
+queue does not count toward the timeout.
