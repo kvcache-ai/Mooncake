@@ -153,6 +153,8 @@ Status DeviceSelector::allocate(uint64_t total_length, uint32_t num_slices,
                 devices_[dev_id].total_bytes.fetch_add(
                     this_slice_bytes, std::memory_order_relaxed);
             }
+            if (!slice_dev_ids.empty())
+                recordSelection(slice_dev_ids, total_length, slice_bytes);
             return Status::OK();
         }
         return Status::DeviceNotFound(noEligibleDeviceReason());
@@ -172,8 +174,51 @@ Status DeviceSelector::allocate(uint64_t total_length, uint32_t num_slices,
         bool probe_mode = ((++tl_call_count % 100) == 0);
         selectMultiPath(tl_candidates, num_slices, total_length, slice_bytes,
                         slice_dev_ids, probe_mode);
+        if (probe_mode && !slice_dev_ids.empty()) {
+            selection_probe_allocations_.fetch_add(1,
+                                                   std::memory_order_relaxed);
+        }
     }
+    if (!slice_dev_ids.empty())
+        recordSelection(slice_dev_ids, total_length, slice_bytes);
     return Status::OK();
+}
+
+void DeviceSelector::recordSelection(const std::vector<int>& slice_dev_ids,
+                                     uint64_t total_length,
+                                     uint64_t slice_bytes) {
+    selection_allocations_.fetch_add(1, std::memory_order_relaxed);
+    // Multi-path means the request actually spanned more than one NIC: a
+    // multi-slice request whose slices all landed on the best device is
+    // still a single-path selection. Classification is binary, so the scan
+    // stops at the first device that differs from slice zero.
+    bool multi_path = false;
+    for (size_t i = 1; i < slice_dev_ids.size(); ++i) {
+        if (slice_dev_ids[i] != slice_dev_ids[0]) {
+            multi_path = true;
+            break;
+        }
+    }
+    if (multi_path) {
+        selection_multi_path_allocations_.fetch_add(1,
+                                                    std::memory_order_relaxed);
+    } else {
+        selection_single_path_allocations_.fetch_add(1,
+                                                     std::memory_order_relaxed);
+    }
+
+    uint64_t offset = 0;
+    for (size_t i = 0; i < slice_dev_ids.size(); ++i) {
+        auto it = devices_.find(slice_dev_ids[i]);
+        if (it == devices_.end()) continue;
+        const uint64_t bytes =
+            (i + 1 == slice_dev_ids.size())
+                ? total_length - offset
+                : std::min(slice_bytes, total_length - offset);
+        offset += bytes;
+        it->second.selected_slices.fetch_add(1, std::memory_order_relaxed);
+        it->second.selected_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    }
 }
 
 void DeviceSelector::auditStrictLocalNuma() const {
@@ -574,6 +619,47 @@ Status DeviceSelector::getNicLoadStats(std::vector<NicLoadStats>& stats) const {
         });
     }
     return Status::OK();
+}
+
+SelectionStats DeviceSelector::getSelectionStats() const {
+    SelectionStats stats;
+    stats.allocations = selection_allocations_.load(std::memory_order_relaxed);
+    stats.single_path_allocations =
+        selection_single_path_allocations_.load(std::memory_order_relaxed);
+    stats.multi_path_allocations =
+        selection_multi_path_allocations_.load(std::memory_order_relaxed);
+    stats.probe_allocations =
+        selection_probe_allocations_.load(std::memory_order_relaxed);
+    stats.devices.reserve(devices_.size());
+    for (const auto& [dev_id, dev] : devices_) {
+        const auto* nic =
+            local_topology_ ? local_topology_->getNicEntry(dev_id) : nullptr;
+        stats.devices.push_back(DeviceSelectionStats{
+            dev_id,
+            dev.available.load(std::memory_order_relaxed),
+            dev.selected_slices.load(std::memory_order_relaxed),
+            dev.selected_bytes.load(std::memory_order_relaxed),
+            nic ? nic->name : "",
+            nic ? nic->numa_node : -1,
+        });
+    }
+    std::sort(
+        stats.devices.begin(), stats.devices.end(),
+        [](const DeviceSelectionStats& lhs, const DeviceSelectionStats& rhs) {
+            return lhs.dev_id < rhs.dev_id;
+        });
+    return stats;
+}
+
+void DeviceSelector::resetSelectionStats() {
+    selection_allocations_.store(0, std::memory_order_relaxed);
+    selection_single_path_allocations_.store(0, std::memory_order_relaxed);
+    selection_multi_path_allocations_.store(0, std::memory_order_relaxed);
+    selection_probe_allocations_.store(0, std::memory_order_relaxed);
+    for (auto& [dev_id, dev] : devices_) {
+        dev.selected_slices.store(0, std::memory_order_relaxed);
+        dev.selected_bytes.store(0, std::memory_order_relaxed);
+    }
 }
 
 void DeviceSelector::printTrafficStats() {

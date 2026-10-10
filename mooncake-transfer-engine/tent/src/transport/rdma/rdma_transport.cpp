@@ -711,6 +711,11 @@ Status RdmaTransport::getNicLoadStats(std::vector<NicLoadStats>& stats) const {
     return workers_->getDeviceSelector()->getNicLoadStats(stats);
 }
 
+Status RdmaTransport::getSelectionStats(SelectionStats& stats) const {
+    stats = workers_->getDeviceSelector()->getSelectionStats();
+    return Status::OK();
+}
+
 bool RdmaTransport::warmupMemory(void* addr, size_t length) {
     if (length < kMrWarmupMinBytes) return false;
     unsigned hwc = std::thread::hardware_concurrency();
