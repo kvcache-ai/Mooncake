@@ -39,6 +39,11 @@ constexpr const char* kProtocolDescFlatKey =
     "comm_resource_config.protocol_desc";
 constexpr const char* kRocePrefix = "roce:";
 constexpr const char* kStoreConfigKey = "store";
+constexpr const char* kCommResourceConfigKey = "comm_resource_config";
+constexpr const char* kNicTopoPathKey = "nic_topo_path";
+constexpr const char* kNicTopoPathFlatKey =
+    "comm_resource_config.nic_topo_path";
+constexpr const char* kCustomTopoJsonEnv = "MC_CUSTOM_TOPO_JSON";
 
 std::string SerializeCompactJson(const Json::Value& value) {
     Json::StreamWriterBuilder writer;
@@ -99,6 +104,24 @@ bool ParseGlobalResourceConfigObject(const char* config_str,
     }
     return true;
 }
+
+// True when comm_resource_config.nic_topo_path is set to a non-empty string,
+// accepting either the flat key or the nested comm_resource_config object.
+// An explicit empty string counts as "not configured" (matching HIXL).
+bool NicTopoPathIsSet(const Json::Value& root) {
+    if (root.isMember(kNicTopoPathFlatKey) &&
+        root[kNicTopoPathFlatKey].isString() &&
+        !root[kNicTopoPathFlatKey].asString().empty()) {
+        return true;
+    }
+    if (root.isMember(kCommResourceConfigKey) &&
+        root[kCommResourceConfigKey].isObject() &&
+        root[kCommResourceConfigKey].isMember(kNicTopoPathKey)) {
+        const auto& value = root[kCommResourceConfigKey][kNicTopoPathKey];
+        return value.isString() && !value.asString().empty();
+    }
+    return false;
+}
 }  // namespace
 
 bool HasRoceProtocolDescInGlobalResourceConfig(const char* config_str) {
@@ -137,6 +160,56 @@ std::string ResolveAscendGlobalResourceConfig(const char* config_str) {
     Json::Value normal = root;
     normal.removeMember(kStoreConfigKey);
     return SerializeCompactJson(normal);
+}
+
+std::string InjectNicTopoPathFromCustomTopoEnvTe(
+    const std::string& resolved_config) {
+    // MC_CUSTOM_TOPO_JSON points to the NIC topology file; its path is used as
+    // the fallback source for HIXL's comm_resource_config.nic_topo_path.
+    const char* custom_topo_json = std::getenv(kCustomTopoJsonEnv);
+    if (custom_topo_json == nullptr || custom_topo_json[0] == '\0') {
+        return resolved_config;
+    }
+
+    Json::Value root;
+    if (resolved_config.empty()) {
+        root = Json::Value(Json::objectValue);
+    } else {
+        Json::CharReaderBuilder builder;
+        builder["collectComments"] = false;
+        std::string errs;
+        const std::unique_ptr<Json::CharReader> reader(builder.newCharReader());
+        if (!reader->parse(resolved_config.c_str(),
+                           resolved_config.c_str() + resolved_config.size(),
+                           &root, &errs) ||
+            !root.isObject()) {
+            LOG(WARNING)
+                << "Cannot inject MC_CUSTOM_TOPO_JSON into "
+                   "comm_resource_config.nic_topo_path: GlobalResourceConfig "
+                   "is not a JSON object";
+            return resolved_config;
+        }
+    }
+
+    // An explicitly configured nic_topo_path always wins over the fallback.
+    if (NicTopoPathIsSet(root)) {
+        return resolved_config;
+    }
+
+    // Prefer the nested form when comm_resource_config already exists so HIXL
+    // sees a single representation; drop any stale flat key in that case
+    // (mirrors WithHixlListenPort).
+    if (root.isMember(kCommResourceConfigKey) &&
+        root[kCommResourceConfigKey].isObject()) {
+        root[kCommResourceConfigKey][kNicTopoPathKey] = custom_topo_json;
+        root.removeMember(kNicTopoPathFlatKey);
+    } else {
+        root[kNicTopoPathFlatKey] = custom_topo_json;
+    }
+    LOG(INFO) << "[AscendTE] comm_resource_config.nic_topo_path is empty, "
+                 "injecting MC_CUSTOM_TOPO_JSON: "
+              << custom_topo_json;
+    return SerializeCompactJson(root);
 }
 
 bool IsRoceModeEnabled() {

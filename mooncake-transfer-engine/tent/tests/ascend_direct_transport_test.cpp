@@ -213,6 +213,7 @@ const char* kEnvKeys[] = {
     "HCCL_RDMA_SL",
     "HCCL_INTRA_ROCE_ENABLE",
     "ASCEND_BASE_PORT",
+    "MC_CUSTOM_TOPO_JSON",
 };
 
 void ClearAscendEnv() {
@@ -790,6 +791,92 @@ TEST(AscendDirectResourceConfigTest, WithHixlListenPortReplacesFlatPort) {
     auto init = WithHixlListenPort(BuildHixlInitOptions(options), 52067);
     const auto parsed = nlohmann::json::parse(init.at("GlobalResourceConfig"));
     EXPECT_EQ(parsed.at("comm_resource_config.listen_port"), 52067);
+}
+
+namespace {
+struct CustomTopoJsonScope {
+    explicit CustomTopoJsonScope(const char* value) {
+        if (value == nullptr) {
+            unsetenv("MC_CUSTOM_TOPO_JSON");
+        } else {
+            setenv("MC_CUSTOM_TOPO_JSON", value, 1);
+        }
+    }
+    ~CustomTopoJsonScope() { unsetenv("MC_CUSTOM_TOPO_JSON"); }
+};
+}  // namespace
+
+TEST(AscendDirectResourceConfigTest, InjectNicTopoPath_EmptyConfigCreates) {
+    CustomTopoJsonScope env("/etc/mooncake/nic_topo.json");
+    auto out = InjectNicTopoPathFromCustomTopoEnvTent("");
+    const auto parsed = nlohmann::json::parse(out);
+    EXPECT_EQ(parsed.at("comm_resource_config.nic_topo_path"),
+              "/etc/mooncake/nic_topo.json");
+}
+
+TEST(AscendDirectResourceConfigTest, InjectNicTopoPath_ExplicitWins) {
+    CustomTopoJsonScope env("/etc/mooncake/nic_topo.json");
+    const std::string cfg =
+        R"({"comm_resource_config.nic_topo_path":"/explicit.json"})";
+    EXPECT_EQ(InjectNicTopoPathFromCustomTopoEnvTent(cfg), cfg);
+}
+
+TEST(AscendDirectResourceConfigTest, InjectNicTopoPath_NestedDropsFlat) {
+    CustomTopoJsonScope env("/etc/mooncake/nic_topo.json");
+    const std::string out = InjectNicTopoPathFromCustomTopoEnvTent(
+        R"({"comm_resource_config":{"protocol_desc":"roce:host"},)"
+        R"("comm_resource_config.nic_topo_path":""})");
+    const auto parsed = nlohmann::json::parse(out);
+    EXPECT_EQ(parsed.at("comm_resource_config").at("nic_topo_path"),
+              "/etc/mooncake/nic_topo.json");
+    EXPECT_FALSE(parsed.contains("comm_resource_config.nic_topo_path"))
+        << "the flat key must be dropped once the nested object is used";
+}
+
+TEST(AscendDirectResourceConfigTest, InjectNicTopoPath_InvalidJsonUnchanged) {
+    CustomTopoJsonScope env("/etc/mooncake/nic_topo.json");
+    const std::string cfg = "{not json";
+    EXPECT_EQ(InjectNicTopoPathFromCustomTopoEnvTent(cfg), cfg);
+}
+
+TEST(AscendDirectResourceConfigTest, LoadOptionsInjectsCustomTopoJson) {
+    ClearAscendEnv();
+    CustomTopoJsonScope env("/etc/mooncake/nic_topo.json");
+    auto conf = std::make_shared<Config>();
+    conf->set("transports/ascend_direct/global_resource_config",
+              R"({"comm_resource_config":{"protocol_desc":"roce:host"}})");
+    auto options = LoadAscendDirectOptions(conf);
+    const auto parsed = nlohmann::json::parse(options.global_resource_config);
+    EXPECT_EQ(parsed.at("comm_resource_config").at("nic_topo_path"),
+              "/etc/mooncake/nic_topo.json");
+    auto init = BuildHixlInitOptions(options);
+    EXPECT_NE(init.at("GlobalResourceConfig").find("nic_topo_path"),
+              std::string::npos);
+}
+
+// Injection is scenario-agnostic: HIXL decides whether to use nic_topo_path.
+TEST(AscendDirectResourceConfigTest, LoadOptionsInjectsForNonRoceToo) {
+    ClearAscendEnv();
+    CustomTopoJsonScope env("/etc/mooncake/nic_topo.json");
+    auto conf = std::make_shared<Config>();
+    conf->set("transports/ascend_direct/global_resource_config",
+              R"({"comm_resource_config":{"protocol_desc":"hccs:device"}})");
+    auto options = LoadAscendDirectOptions(conf);
+    EXPECT_FALSE(options.roce_mode);
+    const auto parsed = nlohmann::json::parse(options.global_resource_config);
+    EXPECT_EQ(parsed.at("comm_resource_config").at("nic_topo_path"),
+              "/etc/mooncake/nic_topo.json");
+}
+
+TEST(AscendDirectResourceConfigTest, LoadOptionsNoCustomTopoJsonUnchanged) {
+    ClearAscendEnv();
+    CustomTopoJsonScope env(nullptr);
+    auto conf = std::make_shared<Config>();
+    conf->set("transports/ascend_direct/global_resource_config",
+              R"({"comm_resource_config":{"protocol_desc":"roce:host"}})");
+    auto options = LoadAscendDirectOptions(conf);
+    EXPECT_EQ(options.global_resource_config,
+              R"({"comm_resource_config":{"protocol_desc":"roce:host"}})");
 }
 
 }  // namespace

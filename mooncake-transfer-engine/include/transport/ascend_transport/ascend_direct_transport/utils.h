@@ -96,6 +96,21 @@ bool HasRoceProtocolDescInGlobalResourceConfig(const char *config_str);
 // A Store TE with no "store" key falls back to the default config.
 std::string ResolveAscendGlobalResourceConfig(const char *config_str);
 
+// Fill comm_resource_config.nic_topo_path in the (already role-resolved)
+// GlobalResourceConfig with the Mooncake MC_CUSTOM_TOPO_JSON path when the HIXL
+// option is empty. Rules:
+//   - MC_CUSTOM_TOPO_JSON unset/empty                    -> returned unchanged
+//   - nic_topo_path already set (flat or nested, string, non-empty)
+//                                                       -> returned unchanged
+//   - otherwise the MC_CUSTOM_TOPO_JSON path is written under the nested
+//     "comm_resource_config" object when one exists (any stale flat key is
+//     dropped), otherwise as the flat key
+//     "comm_resource_config.nic_topo_path". An empty input yields a minimal
+//     {"comm_resource_config.nic_topo_path":"..."} object.
+// A non-empty but unparseable input is returned unchanged (HIXL rejects it).
+std::string InjectNicTopoPathFromCustomTopoEnvTe(
+    const std::string &resolved_config);
+
 int SetDeviceAndGetContext(int32_t device_id, aclrtContext *out_context);
 
 /**

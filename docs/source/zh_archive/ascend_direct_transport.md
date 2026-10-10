@@ -40,6 +40,7 @@ Transfer Engine RPC using <协议> listening on <IP>:<实际端口>，记录目�
 | `ASCEND_ENABLE_USE_FABRIC_MEM` | 在Mooncake Store中启用fabric内存传输模式（仅A3）  | 0（禁用） | `ASCEND_ENABLE_USE_FABRIC_MEM=1`                                      |
 | `ASCEND_USE_ASYNC_TRANSFER` | 启用异步传输模式                             | 0（禁用） | `ASCEND_USE_ASYNC_TRANSFER=1`                                         |
 | `ASCEND_GLOBAL_RESOURCE_CONFIG` | 全局资源配置                               | - | `ASCEND_GLOBAL_RESOURCE_CONFIG="{\"fabric_memory.max_capacity\":32}"` |
+| `MC_CUSTOM_TOPO_JSON` | 网卡拓扑JSON文件路径，同时作为HIXL `comm_resource_config.nic_topo_path`的回退来源 | - | `MC_CUSTOM_TOPO_JSON=/etc/mooncake/nic_topo.json` |
 | `ASCEND_CONNECT_TIMEOUT` | 链路建链超时时间（毫秒）                         | 3000 | `ASCEND_CONNECT_TIMEOUT=5000`                                         |
 | `ASCEND_TRANSFER_TIMEOUT` | 数据传输超时时间（毫秒）                         | 3000 | `ASCEND_TRANSFER_TIMEOUT=10000`                                       |
 | `ASCEND_THREAD_POOL_SIZE` | 传输线程池的工作线程数                          | 8（缓冲池模式下为1） | `ASCEND_THREAD_POOL_SIZE=16`                                          |
@@ -54,7 +55,17 @@ Transfer Engine RPC using <协议> listening on <IP>:<实际端口>，记录目�
 ASCEND_AUTO_CONNECT: 需要CANN升级到9.0之后的版本，默认值为1：当对端异常下线后可以自动断链。如需关闭可设置`ASCEND_AUTO_CONNECT=0`。
 ASCEND_ENABLE_USE_FABRIC_MEM：需要CANN升级到9.0之后的版本，HDK升级到26.0之后的版本，在支持该功能的版本使用Mooncake Store时推荐启用：可显著提升传输性能。
 ASCEND_USE_ASYNC_TRANSFER: 需要CANN升级到8.5之后的版本，用于开启Hixl异步传输模式，默认为同步模式。
-ASCEND_GLOBAL_RESOURCE_CONFIG：配置Hixl的全局资源，具体查看hixl的文档关于OPTION_GLOBAL_RESOURCE_CONFIG的配置。
+ASCEND_GLOBAL_RESOURCE_CONFIG：配置Hixl的全局资源，具体查看hixl的文档关于OPTION_GLOBAL_RESOURCE_CONFIG的配置。当`comm_resource_config.nic_topo_path`未设置或为空串且已设置`MC_CUSTOM_TOPO_JSON`时，Transport会先用`MC_CUSTOM_TOPO_JSON`的值填充`nic_topo_path`再下发给HIXL；未设置`MC_CUSTOM_TOPO_JSON`则不注入；当`ASCEND_GLOBAL_RESOURCE_CONFIG`整体未设置时，会新建并下发仅含`comm_resource_config.nic_topo_path`的配置。
+MC_CUSTOM_TOPO_JSON：网卡拓扑JSON文件路径。除了Transfer Engine/TENT用于拓扑发现外，Ascend Direct Transport还会用同一路径作为HIXL `comm_resource_config.nic_topo_path`的回退来源，供HIXL生成Host RoCE endpoint使用。HIXL要求key为`npu:<user_device_id>`（`aclrtGetDevice()`返回的逻辑设备号，受`ASCEND_RT_VISIBLE_DEVICES`影响）、value为`[[preferred...],[avail...]]`，仅含`cpu:N`或物理设备号key的文件不会被HIXL匹配。文件原样透传、不做转换与改键，网卡取`preferred`第一项（HIXL当前不解析`avail`）。该文件仅参与Host RoCE endpoint生成，是否生成由`comm_resource_config.protocol_desc`决定。当`nic_topo_path`非空时，HIXL会严格校验文件（存在性、JSON合法性、key/value格式），格式非法会导致`Initialize`返回参数错误，而非被静默忽略；非空的`nic_topo_path`也会优先于HIXL的网卡亲和自动探测。`ASCEND_GLOBAL_RESOURCE_CONFIG`中已显式配置的`nic_topo_path`优先，不会被覆盖。
+
+例如，让HIXL根据网卡拓扑文件生成Host RoCE endpoint：
+
+```shell
+export ASCEND_GLOBAL_RESOURCE_CONFIG='{"comm_resource_config.protocol_desc":["roce:host"]}'
+export MC_CUSTOM_TOPO_JSON=/etc/mooncake/nic_topo.json
+# nic_topo.json 必须以 npu:<user_device_id> 作为key，例如：
+# {"npu:0": [["rocep185s0f0"], []], "npu:1": [["rocep185s0f1"], []]}
+```
 
 
 ### 注意事项（必看）
