@@ -2,6 +2,11 @@
 
 #include <cstdint>
 #include <ostream>
+#include <vector>
+
+#include <ylt/util/tl/expected.hpp>
+
+#include "types.h"
 
 namespace mooncake {
 
@@ -62,9 +67,25 @@ struct BucketBackendConfig {
     // max_physical_bytes > 0.
     int64_t disk_scan_cache_ms = 500;
 
+    // Per-disk quotas, positionally aligned with the disks parsed out of
+    // FileStorageConfig::storage_filepath. Empty => broadcast the scalar
+    // max_total_size to every disk. Otherwise it must have exactly one entry
+    // per disk; BucketStorageBackend::Init() rejects any other length.
+    std::vector<int64_t> max_total_size_per_disk;
+
     bool Validate() const;
 
-    static BucketBackendConfig FromEnvironment();
+    /**
+     * @brief Build the configuration from MOONCAKE_OFFLOAD_BUCKET_* variables.
+     *
+     * Scalar variables that fail to parse fall back to their defaults with a
+     * warning. The per-disk quota list is stricter because it is positionally
+     * aligned with the disks: an empty or unparsable entry is an error.
+     *
+     * @return The configuration; INVALID_PARAMS if the per-disk quota list
+     *         has an empty or unparsable entry.
+     */
+    static tl::expected<BucketBackendConfig, ErrorCode> FromEnvironment();
 };
 
 }  // namespace mooncake

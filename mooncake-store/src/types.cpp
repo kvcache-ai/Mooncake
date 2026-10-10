@@ -62,6 +62,7 @@ const std::string& toString(ErrorCode errorCode) noexcept {
         {ErrorCode::BUCKET_ALREADY_EXISTS, "BUCKET_ALREADY_EXISTS"},
         {ErrorCode::KEYS_EXCEED_BUCKET_LIMIT, "KEYS_EXCEED_BUCKET_LIMIT"},
         {ErrorCode::KEYS_ULTRA_LIMIT, "KEYS_ULTRA_LIMIT"},
+        {ErrorCode::NO_AVAILABLE_DISK, "NO_AVAILABLE_DISK"},
         {ErrorCode::UNABLE_OFFLOAD, "UNABLE_OFFLOAD"},
         {ErrorCode::UNABLE_OFFLOADING, "UNABLE_OFFLOADING"},
         {ErrorCode::SERIALIZE_UNSUPPORTED, "SERIALIZE_UNSUPPORTED"},

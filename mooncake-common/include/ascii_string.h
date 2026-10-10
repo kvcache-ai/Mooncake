@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace mooncake {
 
@@ -19,6 +20,31 @@ inline std::string_view TrimAsciiWhitespace(std::string_view value) {
         value.remove_suffix(1);
     }
     return value;
+}
+
+// Split a `delimiter`-separated list, trimming ASCII whitespace around each
+// entry. Empty entries are dropped unless `keep_empty` is set, which a
+// positionally aligned list needs so that a missing entry can be rejected
+// instead of shifting every later entry onto its neighbour.
+// The returned views alias `value`, so they outlive the call only as long as
+// the buffer behind `value` does: never pass a temporary std::string here.
+inline std::vector<std::string_view> SplitAsciiList(std::string_view value,
+                                                    char delimiter,
+                                                    bool keep_empty = false) {
+    std::vector<std::string_view> entries;
+    while (true) {
+        const size_t pos = value.find(delimiter);
+        const std::string_view token =
+            TrimAsciiWhitespace(value.substr(0, pos));
+        if (keep_empty || !token.empty()) {
+            entries.push_back(token);
+        }
+        if (pos == std::string_view::npos) {
+            break;
+        }
+        value.remove_prefix(pos + 1);
+    }
+    return entries;
 }
 
 constexpr char AsciiToLower(char ch) {
