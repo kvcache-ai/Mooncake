@@ -4854,29 +4854,20 @@ auto MasterService::BatchReplicaClear(
     return cleared_keys;
 }
 
+bool MasterService::IsAwaitingRemount(const Replica& replica) const {
+    // The set is empty outside the window between a standby restore and the
+    // owners' remounts, so the endpoint is looked up only inside it.
+    if (invalid_replica_endpoints_.empty()) {
+        return false;
+    }
+    const auto endpoint = replica.transport_endpoint();
+    return endpoint && invalid_replica_endpoints_.contains(*endpoint);
+}
+
 bool MasterService::TryGetReadableReplicaDescriptor(
     const Replica& replica, Replica::Descriptor& descriptor) const {
-    if (!replica.is_completed() || replica.has_invalid_mem_handle() ||
-        replica.has_invalid_nof_handle()) {
-        return false;
-    }
-    if (!replica.getDescriptorIfAvailable(descriptor)) {
-        return false;
-    }
-    std::optional<std::string> endpoint;
-    if (descriptor.is_memory_replica()) {
-        endpoint = descriptor.get_memory_descriptor()
-                       .buffer_descriptor.transport_endpoint_;
-    } else if (descriptor.is_nof_replica()) {
-        endpoint = descriptor.get_nof_descriptor()
-                       .buffer_descriptor.transport_endpoint_;
-    } else if (descriptor.is_local_disk_replica()) {
-        endpoint = descriptor.get_local_disk_descriptor().transport_endpoint;
-    }
-    if (endpoint && invalid_replica_endpoints_.contains(*endpoint)) {
-        return false;
-    }
-    return true;
+    return IsReplicaReadable(replica) &&
+           replica.getDescriptorIfAvailable(descriptor);
 }
 
 std::vector<Replica::Descriptor> MasterService::GetReadableReplicaDescriptors(
@@ -4895,8 +4886,8 @@ std::vector<Replica::Descriptor> MasterService::GetReadableReplicaDescriptors(
 }
 
 bool MasterService::IsReplicaReadable(const Replica& replica) const {
-    Replica::Descriptor descriptor;
-    return TryGetReadableReplicaDescriptor(replica, descriptor);
+    return replica.is_completed() && replica.is_available() &&
+           !IsAwaitingRemount(replica);
 }
 
 bool MasterService::HasReadableReplica(const ObjectMetadata& metadata) const {
