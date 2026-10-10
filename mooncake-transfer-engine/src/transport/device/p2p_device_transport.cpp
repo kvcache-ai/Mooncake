@@ -146,6 +146,10 @@ int macaAllocFlagFromMode(const std::string& mode, const char* env_name) {
 }
 
 int macaAllocFlagFromEnv() {
+    // IBGDA payloads written by a MACA GPU and consumed by the NIC require
+    // fine-grained memory. Select it explicitly with
+    // MOONCAKE_EP_MACA_ALLOC=fine; keep the allocator default intuitive for
+    // ordinary P2P/non-IBGDA users.
     return macaAllocFlagFromMode(getLowerEnv("MOONCAKE_EP_MACA_ALLOC"),
                                  "MOONCAKE_EP_MACA_ALLOC");
 }
