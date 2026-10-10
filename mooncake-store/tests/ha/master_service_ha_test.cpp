@@ -1548,8 +1548,8 @@ TEST_F(MasterServiceHATest, BatchPromotionDropsReplicasOnUnloadedSegments) {
     ASSERT_TRUE(service.RestoreFromBatchOpLogPromotion(std::move(handoff), 1)
                     .has_value());
 
-    auto replicas = ReplicaDescriptorsForTesting(service, kDefaultTenant,
-                                                 "batch_drop_key");
+    auto replicas =
+        ReplicaDescriptorsForTesting(service, kDefaultTenant, "batch_drop_key");
     ASSERT_EQ(replicas.size(), 1);
     EXPECT_EQ(replicas.front().id, 1);
     EXPECT_EQ(replicas.front()
@@ -1558,8 +1558,7 @@ TEST_F(MasterServiceHATest, BatchPromotionDropsReplicasOnUnloadedSegments) {
               endpoint);
 }
 
-TEST_F(MasterServiceHATest,
-       BatchPromotionSkipsObjectWhenAllReplicasAreStale) {
+TEST_F(MasterServiceHATest, BatchPromotionSkipsObjectWhenAllReplicasAreStale) {
     MasterService service(
         MasterServiceConfig::builder().set_enable_ha(false).build());
 
@@ -1568,8 +1567,8 @@ TEST_F(MasterServiceHATest,
     good.metadata.replicas.front()
         .get_memory_descriptor()
         .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
-    auto stale_only = MakeStandbyObject("batch_skip_stale",
-                                        "batch_skip_unloaded_segment");
+    auto stale_only =
+        MakeStandbyObject("batch_skip_stale", "batch_skip_unloaded_segment");
     stale_only.metadata.replicas.front().id = 2;
     auto empty = MakeStandbyObject("batch_skip_empty", endpoint);
     empty.metadata.replicas.clear();
@@ -1589,9 +1588,8 @@ TEST_F(MasterServiceHATest,
     ASSERT_TRUE(service.RestoreFromBatchOpLogPromotion(std::move(handoff), 1)
                     .has_value());
 
-    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
-                                     "batch_skip_good"),
-              1);
+    EXPECT_EQ(
+        ReplicaCountForTesting(service, kDefaultTenant, "batch_skip_good"), 1);
     EXPECT_FALSE(HasMetadataEntryForTesting(service, kDefaultTenant,
                                             "batch_skip_stale"));
     EXPECT_TRUE(HasMetadataEntryForTesting(service, kDefaultTenant,
