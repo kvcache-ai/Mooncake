@@ -774,8 +774,9 @@ TEST(MasterServiceOffloadScenarioTest,
     };
     const auto base = std::chrono::system_clock::now() - std::chrono::hours(1);
     MasterServiceConfig config = OffloadForceEvictConfig();
-    config.default_kv_lease_ttl = 0;             // no leases in the way
-    config.eviction_high_watermark_ratio = 1.0;  // only pressure arms the thread
+    config.default_kv_lease_ttl = 0;  // no leases in the way
+    // Only a failed allocation arms the eviction thread.
+    config.eviction_high_watermark_ratio = 1.0;
     config.eviction_ratio = 0.10;
     config.offloading_queue_limit = kCap;
     config.offload_cap_ratio = 1.0;
