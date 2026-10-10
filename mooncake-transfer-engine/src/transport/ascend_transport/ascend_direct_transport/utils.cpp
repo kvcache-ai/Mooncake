@@ -164,8 +164,8 @@ std::string ResolveAscendGlobalResourceConfig(const char* config_str) {
 
 std::string InjectNicTopoPathFromCustomTopoEnvTe(
     const std::string& resolved_config) {
-    // MC_CUSTOM_TOPO_JSON points to the NIC topology file; its path is used as
-    // the fallback source for HIXL's comm_resource_config.nic_topo_path.
+    // TE support for configuring HIXL's comm_resource_config.nic_topo_path:
+    // the MC_CUSTOM_TOPO_JSON path is written into it when it is empty.
     const char* custom_topo_json = std::getenv(kCustomTopoJsonEnv);
     if (custom_topo_json == nullptr || custom_topo_json[0] == '\0') {
         return resolved_config;
@@ -191,7 +191,7 @@ std::string InjectNicTopoPathFromCustomTopoEnvTe(
         }
     }
 
-    // An explicitly configured nic_topo_path always wins over the fallback.
+    // An explicitly configured nic_topo_path always wins over MC_CUSTOM_TOPO_JSON.
     if (NicTopoPathIsSet(root)) {
         return resolved_config;
     }

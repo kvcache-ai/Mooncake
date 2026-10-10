@@ -254,8 +254,8 @@ int TransferExecutorBase::initEngines() {
     char* global_resource_config = std::getenv("ASCEND_GLOBAL_RESOURCE_CONFIG");
     std::string resolved_resource_config =
         ResolveAscendGlobalResourceConfig(global_resource_config);
-    // Fill the empty nic_topo_path from MC_CUSTOM_TOPO_JSON (if set). HIXL
-    // decides whether to consume it based on protocol_desc.
+    // TE support for configuring HIXL's nic_topo_path from MC_CUSTOM_TOPO_JSON
+    // (if set). HIXL decides whether to consume it based on protocol_desc.
     resolved_resource_config =
         InjectNicTopoPathFromCustomTopoEnvTe(resolved_resource_config);
     if (!resolved_resource_config.empty()) {

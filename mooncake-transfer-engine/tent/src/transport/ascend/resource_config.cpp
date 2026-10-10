@@ -188,8 +188,8 @@ bool ParseEnvEnabled(const char* name) {
 
 std::string InjectNicTopoPathFromCustomTopoEnvTent(
     const std::string& resolved_config) {
-    // MC_CUSTOM_TOPO_JSON points to the NIC topology file; its path is used as
-    // the fallback source for HIXL's comm_resource_config.nic_topo_path.
+    // TE support for configuring HIXL's comm_resource_config.nic_topo_path:
+    // the MC_CUSTOM_TOPO_JSON path is written into it when it is empty.
     const std::string custom_topo_json = EnvOrEmpty(kCustomTopoJsonEnv);
     if (custom_topo_json.empty()) {
         return resolved_config;
@@ -209,7 +209,7 @@ std::string InjectNicTopoPathFromCustomTopoEnvTent(
         }
     }
 
-    // An explicitly configured nic_topo_path always wins over the fallback.
+    // An explicitly configured nic_topo_path always wins over MC_CUSTOM_TOPO_JSON.
     if (NicTopoPathIsSet(root)) {
         return resolved_config;
     }
@@ -312,8 +312,8 @@ AscendDirectOptions LoadAscendDirectOptions(
 
     options.roce_mode = ParseEnvEnabled("HCCL_INTRA_ROCE_ENABLE") ||
                         HasRoceProtocolDesc(resolved);
-    // Fill the empty nic_topo_path from MC_CUSTOM_TOPO_JSON (if set). HIXL
-    // decides whether to consume it based on protocol_desc.
+    // TE support for configuring HIXL's nic_topo_path from MC_CUSTOM_TOPO_JSON
+    // (if set). HIXL decides whether to consume it based on protocol_desc.
     options.global_resource_config =
         InjectNicTopoPathFromCustomTopoEnvTent(options.global_resource_config);
     return options;
