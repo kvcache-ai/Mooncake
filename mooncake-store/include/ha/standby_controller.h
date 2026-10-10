@@ -66,6 +66,12 @@ class StandbyController {
 
     virtual void SetStandbyRuntimeStateCallback(
         RuntimeStateCallback callback) = 0;
+
+    // Put a detached promotion handoff back onto the standby so the next
+    // StartStandby resumes from that cursor instead of an older snapshot.
+    virtual ErrorCode RestorePromotionBaseline(PromotionContext) {
+        return ErrorCode::OK;
+    }
 };
 
 std::unique_ptr<StandbyController> CreateStandbyController(

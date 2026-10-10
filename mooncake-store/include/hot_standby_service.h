@@ -133,6 +133,17 @@ class HotStandbyService {
      */
     ErrorCode Promote();
 
+    // Remember the applied durable prefix across Stop()/Start(). Used when
+    // promotion fails before the metadata store is detached.
+    void MarkAppliedCursorForRestart();
+
+    // Reinstall a detached promotion handoff. The following Start() resumes
+    // from this cursor instead of reloading an older snapshot.
+    ErrorCode PreservePromotionBaseline(
+        std::unique_ptr<StandbyMetadataStore> metadata_store,
+        DurablePrefix applied_cursor, ViewVersionId producer_view_version,
+        std::vector<StandbySegmentInfo> segments);
+
     /**
      * @brief Promote this standby to Primary and export a snapshot atomically.
      *
@@ -285,6 +296,8 @@ class HotStandbyService {
     std::unique_ptr<OpLogBatchStandbyReader> batch_standby_reader_;
     std::optional<DurablePrefix> batch_snapshot_baseline_;
     ViewVersionId batch_snapshot_producer_view_version_{0};
+    std::vector<StandbySegmentInfo> preserved_segments_;
+    bool preserve_promotion_baseline_{false};
 
     std::shared_ptr<HaKvBackend> catch_up_batch_kv_backend_for_testing_;
 

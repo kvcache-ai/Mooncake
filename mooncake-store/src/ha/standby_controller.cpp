@@ -283,6 +283,7 @@ class CapabilityDrivenStandbyController final : public StandbyController {
 
         ErrorCode err = standby_service_->Promote();
         if (err != ErrorCode::OK) {
+            standby_service_->MarkAppliedCursorForRestart();
             standby_service_->Stop();
         }
         if (err == ErrorCode::OK && batch_oplog_snapshot_coordinator_) {
@@ -317,6 +318,7 @@ class CapabilityDrivenStandbyController final : public StandbyController {
         if (standby_service_->IsBatchOpLogSnapshotMode()) {
             auto handoff = standby_service_->PromoteAndDetachBatchOpLogStore();
             if (!handoff) {
+                standby_service_->MarkAppliedCursorForRestart();
                 standby_service_->Stop();
                 {
                     std::lock_guard<std::mutex> lock(state_mutex_);
@@ -351,6 +353,7 @@ class CapabilityDrivenStandbyController final : public StandbyController {
         StandbySnapshot snapshot;
         ErrorCode err = standby_service_->PromoteAndExportSnapshot(snapshot);
         if (err != ErrorCode::OK) {
+            standby_service_->MarkAppliedCursorForRestart();
             {
                 std::lock_guard<std::mutex> lock(state_mutex_);
                 standby_running_ = false;
@@ -399,6 +402,15 @@ class CapabilityDrivenStandbyController final : public StandbyController {
         }
         return MapStandbyRuntimeState(standby_service_->GetSyncStatus(),
                                       observed_leader, capabilities_);
+    }
+
+    ErrorCode RestorePromotionBaseline(PromotionContext context) override {
+        if (!context.metadata_store) {
+            return ErrorCode::OK;
+        }
+        return standby_service_->PreservePromotionBaseline(
+            std::move(context.metadata_store), context.applied_cursor,
+            context.producer_view_version, std::move(context.segments));
     }
 
     void SetStandbyRuntimeStateCallback(
