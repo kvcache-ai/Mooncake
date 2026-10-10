@@ -105,11 +105,6 @@ class AllocatedBuffer {
         return allocator_.lock();
     }
 
-    // Both bindings are set before the buffer is published and not changed
-    // after, except by the snapshot restore in the constructor, which runs
-    // before any reader. So the client record is read in place, as the segment
-    // lifetime is: an atomic load would take a global lock and bounce the
-    // record's reference count on every check.
     [[nodiscard]] bool isAvailable() const {
         if (!isAllocatorValid()) {
             return false;
@@ -120,9 +115,7 @@ class AllocatedBuffer {
 
     void bindClientLiveness(
         std::shared_ptr<ClientLivenessRecord> client_liveness) {
-        std::atomic_store_explicit(&client_liveness_,
-                                   std::move(client_liveness),
-                                   std::memory_order_release);
+        client_liveness_ = std::move(client_liveness);
     }
 
     void bindSegmentLifetime(SegmentLifetime lifetime) {
@@ -131,8 +124,7 @@ class AllocatedBuffer {
 
     [[nodiscard]] std::shared_ptr<ClientLivenessRecord> getClientLiveness()
         const {
-        return std::atomic_load_explicit(&client_liveness_,
-                                         std::memory_order_acquire);
+        return client_liveness_;
     }
 
     // Serialize the buffer into a descriptor for transfer
@@ -164,6 +156,11 @@ class AllocatedBuffer {
     bool copyTransferProtocolFrom(const AllocatedBuffer& source);
 
     std::weak_ptr<BufferAllocatorBase> allocator_;
+    // Both bindings are set before the buffer is published to readers and not
+    // changed while readers can see it, so neither needs atomic access. The
+    // one rebind of a published buffer is the snapshot restore pass
+    // (RebuildClientLivenessAfterSnapshotRestore), which runs inside the
+    // MasterService constructor, before any reader.
     SegmentLifetime segment_lifetime_;
     std::shared_ptr<ClientLivenessRecord> client_liveness_;
     std::string segment_name_;

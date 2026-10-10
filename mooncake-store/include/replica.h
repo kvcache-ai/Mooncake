@@ -219,7 +219,10 @@ struct LocalDiskReplicaData {
     uint64_t object_size = 0;
     std::string transport_endpoint;
     // Process-local affiliation with the exact Client incarnation. This is
-    // rebuilt after restore and deliberately excluded from descriptors.
+    // rebuilt after restore and deliberately excluded from descriptors. Like
+    // the buffer bindings in AllocatedBuffer, it is set before the replica is
+    // published and not changed while readers can see it, so it needs no
+    // atomic access.
     std::shared_ptr<ClientLivenessRecord> client_liveness;
 };
 
@@ -352,10 +355,7 @@ class Replica {
 
     // True while the replica's storage can serve a read: a buffer still
     // allocated on a live segment whose client is serving, or a local-disk
-    // owner that is still serving. Other kinds carry no such state. The client
-    // binding is set before the replica is published and not changed after,
-    // except by the snapshot restore in the constructor, which runs before any
-    // reader, so it is read in place rather than through an atomic load.
+    // owner that is still serving. Other kinds carry no such state.
     [[nodiscard]] bool is_available() const {
         if (const auto* data = std::get_if<MemoryReplicaData>(&data_)) {
             return data->buffer && data->buffer->isAvailable();
@@ -528,10 +528,8 @@ class Replica {
                 data.buffer->bindClientLiveness(std::move(client_liveness));
             }
         } else if (is_local_disk_replica()) {
-            auto& record =
-                std::get<LocalDiskReplicaData>(data_).client_liveness;
-            std::atomic_store_explicit(&record, std::move(client_liveness),
-                                       std::memory_order_release);
+            std::get<LocalDiskReplicaData>(data_).client_liveness =
+                std::move(client_liveness);
         }
     }
 
@@ -543,8 +541,7 @@ class Replica {
         }
         if (is_local_disk_replica()) {
             const auto& data = std::get<LocalDiskReplicaData>(data_);
-            return std::atomic_load_explicit(&data.client_liveness,
-                                             std::memory_order_acquire);
+            return data.client_liveness;
         }
         return nullptr;
     }
@@ -558,9 +555,7 @@ class Replica {
         }
         if (is_local_disk_replica()) {
             const auto& data = std::get<LocalDiskReplicaData>(data_);
-            return std::atomic_load_explicit(&data.client_liveness,
-                                             std::memory_order_acquire) ==
-                   client_liveness;
+            return data.client_liveness == client_liveness;
         }
         return false;
     }
