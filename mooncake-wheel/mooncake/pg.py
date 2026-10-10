@@ -8,6 +8,7 @@ import importlib.util
 import os
 import shutil
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -137,6 +138,26 @@ def _cached_extension_path(build_dir: Path, is_musa: bool) -> Path | None:
     return matches[0] if matches else None
 
 
+def _musa_source_paths(ported_dir: Path) -> list[Path]:
+    paths = []
+    for name in _SOURCE_NAMES:
+        candidates = (
+            ported_dir / name,
+            ported_dir / "src_musa" / name,
+            ported_dir / "src" / name,
+        )
+        path = next(
+            (candidate for candidate in candidates if candidate.is_file()), None
+        )
+        if path is None:
+            raise ImportError(
+                "MUSA PG JIT source staging is incomplete; missing "
+                f"{name} under {ported_dir}"
+            )
+        paths.append(path)
+    return paths
+
+
 def _load_cached_extension(build_dir: Path, is_musa: bool):
     extension_path = _cached_extension_path(build_dir, is_musa)
     if extension_path is None:
@@ -189,30 +210,47 @@ def _build_adapter(source_dir: Path, core_path: Path, build_dir: Path):
         from torchada.utils.cpp_extension import BuildExtension
 
         musa_input = build_dir / "musa_input"
-        if not musa_input.exists():
-            shutil.copytree(source_dir, musa_input)
-            external_include = source_dir.parent / "include"
-            if external_include.is_dir():
-                target_include = musa_input / "include"
-                target_include.mkdir(parents=True, exist_ok=True)
-                for header in ("pg_utils.h", "mooncake_pg.h"):
-                    source_header = external_include / header
-                    if source_header.is_file():
-                        shutil.copy2(source_header, target_include / header)
+        input_ready = musa_input.is_dir() and all(
+            _source_path(musa_input, name).is_file()
+            for name in (*_SOURCE_NAMES, *_HEADER_NAMES)
+        )
+        if not input_ready:
+            if musa_input.exists():
+                shutil.rmtree(musa_input)
+            staging_root = Path(tempfile.mkdtemp(prefix=".musa-input-", dir=build_dir))
+            staged_input = staging_root / "musa_input"
+            try:
+                shutil.copytree(source_dir, staged_input)
+                external_include = source_dir.parent / "include"
+                if external_include.is_dir():
+                    target_include = staged_input / "include"
+                    target_include.mkdir(parents=True, exist_ok=True)
+                    for header in ("pg_utils.h", "mooncake_pg.h"):
+                        source_header = external_include / header
+                        if source_header.is_file():
+                            shutil.copy2(source_header, target_include / header)
+                os.replace(staged_input, musa_input)
+            finally:
+                shutil.rmtree(staging_root, ignore_errors=True)
+
         ported_dir = musa_input.with_name(musa_input.name + "_musa")
-        if not ported_dir.exists():
-            ported_dir = Path(
-                object.__new__(BuildExtension)._port_directory(str(musa_input))
-            )
+        try:
+            source_paths = _musa_source_paths(ported_dir)
+        except ImportError:
+            if ported_dir.exists():
+                shutil.rmtree(ported_dir)
+            staging_root = Path(tempfile.mkdtemp(prefix=".musa-port-", dir=build_dir))
+            staged_input = staging_root / "musa_input"
+            try:
+                shutil.copytree(musa_input, staged_input)
+                generated_dir = Path(
+                    object.__new__(BuildExtension)._port_directory(str(staged_input))
+                )
+                os.replace(generated_dir, ported_dir)
+            finally:
+                shutil.rmtree(staging_root, ignore_errors=True)
+            source_paths = _musa_source_paths(ported_dir)
         adapter_source_dir = ported_dir
-        source_paths = []
-        for name in _SOURCE_NAMES:
-            candidates = (
-                ported_dir / name,
-                ported_dir / "src_musa" / name,
-                ported_dir / "src" / name,
-            )
-            source_paths.append(next(path for path in candidates if path.is_file()))
     else:
         from torch.utils.cpp_extension import library_paths, load
 
@@ -287,10 +325,13 @@ def _load_jit_adapter():
     is_musa = _using_musa()
     is_maca = _using_maca()
     build_dir = _cache_directory(source_dir, core_path, is_musa)
-    build_dir.mkdir(parents=True, exist_ok=True)
     lock_path = build_dir.with_suffix(".lock")
     try:
+        cached = _load_cached_extension(build_dir, is_musa)
+        if cached is not None:
+            return cached
         with _build_lock(lock_path):
+            build_dir.mkdir(parents=True, exist_ok=True)
             cached = _load_cached_extension(build_dir, is_musa)
             if cached is not None:
                 return cached

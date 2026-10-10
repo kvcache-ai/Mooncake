@@ -34,6 +34,11 @@ result locally. The wheel provides the native PG core/device libraries and the
 adapter source bundle; the runtime environment provides PyTorch, a CUDA toolkit
 with `nvcc`, and Ninja.
 
+PG symbols are exposed through `mooncake.pg`; `mooncake.ep` is the EP entry point
+and no longer re-exports PG symbols. Existing callers should move imports such
+as `MooncakeBackendOptions` and `set_host_ip` from `mooncake.ep` to
+`mooncake.pg`.
+
 ## Mooncake PG quick start
 
 ### CUDA backend
