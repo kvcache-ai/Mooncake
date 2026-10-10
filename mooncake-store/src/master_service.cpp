@@ -252,6 +252,8 @@ MasterService::MasterService(const MasterServiceConfig& config)
         throw std::invalid_argument("Invalid soft-pin TTL configuration");
     }
 
+    auto_isolate_degraded_devices_ = config.nof_auto_isolate_degraded_devices;
+
     // Initialize the HTTP metadata key prefix from its component-owned
     // startup configuration.
     http_metadata_prefix_ =
@@ -3266,6 +3268,12 @@ auto MasterService::UnmountNoFSegment(const UUID& segment_id,
         std::lock_guard<std::mutex> lock(nof_heartbeat_mutex_);
         nof_heartbeat_states_.erase(segment_id);
     }
+    {
+        std::lock_guard<std::mutex> lock(device_maintenance_mutex_);
+        manually_isolated_devices_.erase(segment_id);
+        auto_isolated_devices_.erase(segment_id);
+        device_drain_jobs_.erase(segment_id);
+    }
     return {};
 #endif
 }
@@ -3526,19 +3534,45 @@ tl::expected<void, ErrorCode> MasterService::SetSegmentStatus(
     }
 
     ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
-    SegmentStatus current = SegmentStatus::UNDEFINED;
-    auto err = segment_access.GetSegmentStatusByName(segment_name, current);
-    if (err != ErrorCode::OK) {
-        return tl::make_unexpected(err);
+    if (segment_access.ExistsSegmentName(segment_name)) {
+        SegmentStatus current = SegmentStatus::UNDEFINED;
+        auto err = segment_access.GetSegmentStatusByName(segment_name, current);
+        if (err != ErrorCode::OK) {
+            return tl::make_unexpected(err);
+        }
+        if (current != SegmentStatus::OK &&
+            current != SegmentStatus::DRAINING) {
+            return tl::make_unexpected(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        }
+        err = segment_access.SetSegmentStatusByName(segment_name, status);
+        if (err != ErrorCode::OK) {
+            return tl::make_unexpected(err);
+        }
+        return {};
     }
-    if (current != SegmentStatus::OK && current != SegmentStatus::DRAINING) {
-        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+
+    auto nof_segment_access = nof_segment_manager_.getNoFSegmentAccess();
+    if (nof_segment_access.ExistsSegmentName(segment_name)) {
+        SegmentStatus current = SegmentStatus::UNDEFINED;
+        auto err =
+            nof_segment_access.GetSegmentStatusByName(segment_name, current);
+        if (err != ErrorCode::OK) {
+            return tl::make_unexpected(err);
+        }
+        if (current != SegmentStatus::OK &&
+            current != SegmentStatus::DRAINING) {
+            return tl::make_unexpected(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        }
+        err = nof_segment_access.SetSegmentStatusByName(segment_name, status);
+        if (err != ErrorCode::OK) {
+            return tl::make_unexpected(err);
+        }
+        return {};
     }
-    err = segment_access.SetSegmentStatusByName(segment_name, status);
-    if (err != ErrorCode::OK) {
-        return tl::make_unexpected(err);
-    }
-    return {};
+
+    return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
 }
 
 tl::expected<void, ErrorCode> MasterService::RestoreFromStandbySnapshot(
@@ -12832,6 +12866,12 @@ bool MasterService::TryUnmountNoFSegmentByHeartbeat(
         std::lock_guard<std::mutex> lock(nof_heartbeat_mutex_);
         nof_heartbeat_states_.erase(snapshot.segment_id);
     }
+    {
+        std::lock_guard<std::mutex> lock(device_maintenance_mutex_);
+        manually_isolated_devices_.erase(snapshot.segment_id);
+        auto_isolated_devices_.erase(snapshot.segment_id);
+        device_drain_jobs_.erase(snapshot.segment_id);
+    }
     MasterMetricManager::instance()
         .inc_nof_segments_unmounted_by_heartbeat_total();
     LOG(INFO) << "segment_id=" << snapshot.segment_id
@@ -12843,6 +12883,19 @@ bool MasterService::TryUnmountNoFSegmentByHeartbeat(
     return true;
 }
 
+// A mounted NoF segment keeps being probed while it serves allocations (OK)
+// and while it is fenced for maintenance (isolated segments report DRAINING).
+// Segments that are on their way out of the cluster are not probed. Keeping
+// fenced devices in the probe set is what makes auto-recovery possible, and it
+// stops their reported health from going stale while an operator decides what
+// to do with them.
+static bool IsNoFSegmentProbeCandidate(SegmentStatus status, bool isolated) {
+    if (status == SegmentStatus::OK) {
+        return true;
+    }
+    return status == SegmentStatus::DRAINING && isolated;
+}
+
 void MasterService::NofHeartbeatThreadFunc() {
     size_t next_probe_index = 0;
     while (nof_heartbeat_running_) {
@@ -12850,11 +12903,21 @@ void MasterService::NofHeartbeatThreadFunc() {
         std::vector<MountedNoFSegmentSnapshot> mounted_segments;
         nof_segment_manager_.GetMountedSegmentsSnapshot(mounted_segments);
 
-        std::vector<MountedNoFSegmentSnapshot> ok_segments;
-        ok_segments.reserve(mounted_segments.size());
+        std::unordered_set<UUID, boost::hash<UUID>> isolated_snapshot;
+        {
+            std::lock_guard<std::mutex> lock(device_maintenance_mutex_);
+            isolated_snapshot = auto_isolated_devices_;
+            isolated_snapshot.insert(manually_isolated_devices_.begin(),
+                                     manually_isolated_devices_.end());
+        }
+
+        std::vector<MountedNoFSegmentSnapshot> probe_candidates;
+        probe_candidates.reserve(mounted_segments.size());
         for (const auto& snapshot : mounted_segments) {
-            if (snapshot.status == SegmentStatus::OK) {
-                ok_segments.push_back(snapshot);
+            if (IsNoFSegmentProbeCandidate(
+                    snapshot.status,
+                    isolated_snapshot.contains(snapshot.segment_id))) {
+                probe_candidates.push_back(snapshot);
             }
         }
 
@@ -12862,13 +12925,13 @@ void MasterService::NofHeartbeatThreadFunc() {
         {
             std::lock_guard<std::mutex> lock(nof_heartbeat_mutex_);
             std::unordered_set<UUID, boost::hash<UUID>> live_segment_ids;
-            live_segment_ids.reserve(ok_segments.size());
+            live_segment_ids.reserve(probe_candidates.size());
 
             const auto interval_ms =
                 std::chrono::duration_cast<std::chrono::milliseconds>(
                     nof_heartbeat_interval_sec_);
-            for (size_t i = 0; i < ok_segments.size(); ++i) {
-                const auto& snapshot = ok_segments[i];
+            for (size_t i = 0; i < probe_candidates.size(); ++i) {
+                const auto& snapshot = probe_candidates[i];
                 live_segment_ids.insert(snapshot.segment_id);
                 auto [it, inserted] =
                     nof_heartbeat_states_.try_emplace(snapshot.segment_id);
@@ -12878,9 +12941,10 @@ void MasterService::NofHeartbeatThreadFunc() {
                 state.te_endpoint = snapshot.segment.te_endpoint;
                 if (inserted) {
                     int64_t spread_ms = 0;
-                    if (!ok_segments.empty()) {
-                        spread_ms = static_cast<int64_t>(
-                            (interval_ms.count() * i) / ok_segments.size());
+                    if (!probe_candidates.empty()) {
+                        spread_ms =
+                            static_cast<int64_t>((interval_ms.count() * i) /
+                                                 probe_candidates.size());
                     }
                     state.last_success_at = now;
                     state.next_probe_at = now + nof_heartbeat_interval_sec_ +
@@ -12897,12 +12961,13 @@ void MasterService::NofHeartbeatThreadFunc() {
                 }
             }
 
-            if (!ok_segments.empty()) {
-                next_probe_index %= ok_segments.size();
-                for (size_t offset = 0; offset < ok_segments.size(); ++offset) {
+            if (!probe_candidates.empty()) {
+                next_probe_index %= probe_candidates.size();
+                for (size_t offset = 0; offset < probe_candidates.size();
+                     ++offset) {
                     const auto& candidate =
-                        ok_segments[(next_probe_index + offset) %
-                                    ok_segments.size()];
+                        probe_candidates[(next_probe_index + offset) %
+                                         probe_candidates.size()];
                     auto state_it =
                         nof_heartbeat_states_.find(candidate.segment_id);
                     if (state_it == nof_heartbeat_states_.end()) {
@@ -12911,7 +12976,7 @@ void MasterService::NofHeartbeatThreadFunc() {
                     if (state_it->second.next_probe_at <= now) {
                         probe_target = candidate;
                         next_probe_index = (next_probe_index + offset + 1) %
-                                           ok_segments.size();
+                                           probe_candidates.size();
                         break;
                     }
                 }
@@ -12952,6 +13017,25 @@ void MasterService::NofHeartbeatThreadFunc() {
                             std::chrono::system_clock::now().time_since_epoch())
                             .count();
                 }
+            }
+            bool should_unisolate = false;
+            {
+                std::lock_guard<std::mutex> lock(device_maintenance_mutex_);
+                if (auto_isolated_devices_.contains(probe_target->segment_id) &&
+                    !manually_isolated_devices_.contains(
+                        probe_target->segment_id) &&
+                    !device_drain_jobs_.contains(probe_target->segment_id)) {
+                    auto_isolated_devices_.erase(probe_target->segment_id);
+                    should_unisolate = true;
+                }
+            }
+            if (should_unisolate) {
+                auto nof_segment_access =
+                    nof_segment_manager_.getNoFSegmentAccess();
+                nof_segment_access.UnisolateSegment(probe_target->segment_id);
+                LOG(INFO) << "segment_id=" << probe_target->segment_id
+                          << ", segment_name=" << probe_target->segment.name
+                          << ", action=auto_unisolate_recovered_device";
             }
             VLOG(1) << "segment_id=" << probe_target->segment_id
                     << ", segment_name=" << probe_target->segment.name
@@ -13003,6 +13087,38 @@ void MasterService::NofHeartbeatThreadFunc() {
                      << StorageDeviceHealthToString(reported_health)
                      << ", reason=" << error_reason;
 
+        // Fence at DEGRADED instead of waiting for FAILED: FAILED coincides
+        // with the alive timeout that unmounts the segment, so isolating only
+        // there would never leave a window to act. Isolation just stops new
+        // allocations -- the segment stays mounted, keeps serving reads and
+        // keeps being probed, and a device that recovers is returned to
+        // service automatically.
+        if (auto_isolate_degraded_devices_ &&
+            (reported_health == StorageDeviceHealth::DEGRADED ||
+             reported_health == StorageDeviceHealth::FAILED)) {
+            bool newly_isolated = false;
+            {
+                std::lock_guard<std::mutex> lock(device_maintenance_mutex_);
+                if (!auto_isolated_devices_.contains(
+                        probe_target->segment_id) &&
+                    !manually_isolated_devices_.contains(
+                        probe_target->segment_id)) {
+                    auto_isolated_devices_.insert(probe_target->segment_id);
+                    newly_isolated = true;
+                }
+            }
+            if (newly_isolated) {
+                auto nof_segment_access =
+                    nof_segment_manager_.getNoFSegmentAccess();
+                nof_segment_access.IsolateSegment(probe_target->segment_id);
+                LOG(WARNING) << "segment_id=" << probe_target->segment_id
+                             << ", segment_name=" << probe_target->segment.name
+                             << ", health="
+                             << StorageDeviceHealthToString(reported_health)
+                             << ", action=auto_isolate_degraded_device";
+            }
+        }
+
         if (should_unmount) {
             TryUnmountNoFSegmentByHeartbeat(*probe_target, error_reason);
         }
@@ -13050,6 +13166,16 @@ MasterService::ListStorageDevices() const {
     const auto reports = SnapshotNoFHeartbeatReports();
     const auto health_policy = NoFDeviceHealthPolicy();
 
+    std::unordered_map<UUID, UUID, boost::hash<UUID>> drain_jobs_snapshot;
+    std::unordered_set<UUID, boost::hash<UUID>> manual_isolated_snapshot;
+    std::unordered_set<UUID, boost::hash<UUID>> auto_isolated_snapshot;
+    {
+        std::lock_guard<std::mutex> lock(device_maintenance_mutex_);
+        drain_jobs_snapshot = device_drain_jobs_;
+        manual_isolated_snapshot = manually_isolated_devices_;
+        auto_isolated_snapshot = auto_isolated_devices_;
+    }
+
     std::vector<StorageDeviceMetadata> devices;
     devices.reserve(snapshots.size());
     for (const auto& snapshot : snapshots) {
@@ -13069,7 +13195,10 @@ MasterService::ListStorageDevices() const {
         }
 
         StorageDeviceProbeState probe_state;
-        probe_state.unmounting = snapshot.status != SegmentStatus::OK;
+        probe_state.unmounting =
+            snapshot.status == SegmentStatus::GRACEFULLY_UNMOUNTING ||
+            snapshot.status == SegmentStatus::UNMOUNTING ||
+            snapshot.status == SegmentStatus::DRAINED;
         if (auto report = reports.find(snapshot.segment_id);
             report != reports.end()) {
             probe_state.ever_probed = report->second.ever_probed;
@@ -13080,16 +13209,21 @@ MasterService::ListStorageDevices() const {
             device.last_success_unix_ms = report->second.last_success_unix_ms;
         }
         device.health = DeriveStorageDeviceHealth(probe_state, health_policy);
-        LOG(INFO) << "DBGDEV name=" << device.name
-                  << " thr=" << nof_heartbeat_failures_threshold_
-                  << " deg=" << health_policy.degraded_failures
-                  << " fail=" << health_policy.failed_failures
-                  << " cf=" << device.consecutive_failures
-                  << " ever=" << probe_state.ever_probed
-                  << " unmounting=" << probe_state.unmounting
-                  << " health=" << StorageDeviceHealthToString(device.health);
-        device.schedulable = snapshot.status == SegmentStatus::OK &&
-                             device.health != StorageDeviceHealth::FAILED;
+        device.isolated =
+            manual_isolated_snapshot.contains(snapshot.segment_id) ||
+            auto_isolated_snapshot.contains(snapshot.segment_id);
+        if (auto drain_it = drain_jobs_snapshot.find(snapshot.segment_id);
+            drain_it != drain_jobs_snapshot.end()) {
+            device.draining_job_id = UuidToString(drain_it->second);
+            auto job_opt = QueryDrainJob(drain_it->second);
+            if (job_opt.has_value()) {
+                device.draining = (job_opt->status == JobStatus::CREATED ||
+                                   job_opt->status == JobStatus::PLANNING ||
+                                   job_opt->status == JobStatus::RUNNING);
+            }
+        }
+        device.schedulable = IsStorageDeviceSchedulable(
+            snapshot.status, device.health, device.isolated, device.draining);
         devices.push_back(std::move(device));
     }
     return devices;
@@ -13109,9 +13243,20 @@ tl::expected<void, ErrorCode> MasterService::RequestStorageDeviceProbe(
     const UUID& device_id) {
     std::vector<MountedNoFSegmentSnapshot> snapshots;
     nof_segment_manager_.GetMountedSegmentsSnapshot(snapshots);
+
+    // A fenced device is exactly the one an operator wants to re-probe before
+    // deciding whether to return it to service, so accept the same set of
+    // segments the heartbeat thread itself probes.
+    bool isolated = false;
+    {
+        std::lock_guard<std::mutex> lock(device_maintenance_mutex_);
+        isolated = auto_isolated_devices_.contains(device_id) ||
+                   manually_isolated_devices_.contains(device_id);
+    }
     auto snap_it =
         std::find_if(snapshots.begin(), snapshots.end(), [&](const auto& s) {
-            return s.segment_id == device_id && s.status == SegmentStatus::OK;
+            return s.segment_id == device_id &&
+                   IsNoFSegmentProbeCandidate(s.status, isolated);
         });
     if (snap_it == snapshots.end()) {
         return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
@@ -13129,6 +13274,122 @@ tl::expected<void, ErrorCode> MasterService::RequestStorageDeviceProbe(
     }
     it->second.next_probe_at = now;
     return {};
+}
+
+tl::expected<void, ErrorCode> MasterService::IsolateStorageDevice(
+    const UUID& device_id) {
+    auto nof_segment_access = nof_segment_manager_.getNoFSegmentAccess();
+    auto err = nof_segment_access.IsolateSegment(device_id);
+    if (err != ErrorCode::OK) {
+        return tl::make_unexpected(err);
+    }
+    std::lock_guard<std::mutex> lock(device_maintenance_mutex_);
+    manually_isolated_devices_.insert(device_id);
+    return {};
+}
+
+tl::expected<void, ErrorCode> MasterService::UnisolateStorageDevice(
+    const UUID& device_id) {
+    {
+        std::lock_guard<std::mutex> lock(device_maintenance_mutex_);
+        if (auto it = device_drain_jobs_.find(device_id);
+            it != device_drain_jobs_.end()) {
+            auto job_res = QueryDrainJob(it->second);
+            if (job_res.has_value() &&
+                (job_res->status == JobStatus::CREATED ||
+                 job_res->status == JobStatus::PLANNING ||
+                 job_res->status == JobStatus::RUNNING)) {
+                return tl::make_unexpected(
+                    ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+            }
+        }
+        manually_isolated_devices_.erase(device_id);
+        auto_isolated_devices_.erase(device_id);
+    }
+    auto nof_segment_access = nof_segment_manager_.getNoFSegmentAccess();
+    auto err = nof_segment_access.UnisolateSegment(device_id);
+    if (err != ErrorCode::OK) {
+        return tl::make_unexpected(err);
+    }
+    return {};
+}
+
+tl::expected<UUID, ErrorCode> MasterService::DrainStorageDevice(
+    const UUID& device_id, const std::vector<std::string>& target_segments,
+    uint32_t max_concurrency) {
+    // Outermost lock for device drain operations: held across the
+    // already-draining check, the isolation and the job creation so that two
+    // concurrent requests cannot both pass the check and orphan a job.
+    std::lock_guard<std::mutex> drain_lock(device_drain_mutex_);
+
+    std::string segment_name;
+    {
+        std::vector<MountedNoFSegmentSnapshot> snapshots;
+        nof_segment_manager_.GetMountedSegmentsSnapshot(snapshots);
+        auto it = std::find_if(
+            snapshots.begin(), snapshots.end(),
+            [&](const auto& s) { return s.segment_id == device_id; });
+        if (it == snapshots.end()) {
+            return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+        }
+        if (it->status == SegmentStatus::UNMOUNTING) {
+            return tl::make_unexpected(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        }
+        segment_name = it->segment.name;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(device_maintenance_mutex_);
+        if (auto it = device_drain_jobs_.find(device_id);
+            it != device_drain_jobs_.end()) {
+            auto job_res = QueryDrainJob(it->second);
+            if (job_res.has_value() &&
+                (job_res->status == JobStatus::CREATED ||
+                 job_res->status == JobStatus::PLANNING ||
+                 job_res->status == JobStatus::RUNNING)) {
+                return tl::make_unexpected(
+                    ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+            }
+        }
+    }
+
+    auto isolate_res = IsolateStorageDevice(device_id);
+    if (!isolate_res.has_value() &&
+        isolate_res.error() != ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS) {
+        return tl::make_unexpected(isolate_res.error());
+    }
+
+    CreateDrainJobRequest drain_req;
+    drain_req.segments = {segment_name};
+    drain_req.target_segments = target_segments;
+    drain_req.max_concurrency = max_concurrency;
+
+    auto job_id_res = CreateDrainJob(drain_req);
+    if (!job_id_res.has_value()) {
+        return tl::make_unexpected(job_id_res.error());
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(device_maintenance_mutex_);
+        device_drain_jobs_[device_id] = job_id_res.value();
+    }
+
+    return job_id_res.value();
+}
+
+tl::expected<QueryJobResponse, ErrorCode>
+MasterService::QueryStorageDeviceDrainStatus(const UUID& device_id) const {
+    UUID job_id{0, 0};
+    {
+        std::lock_guard<std::mutex> lock(device_maintenance_mutex_);
+        auto it = device_drain_jobs_.find(device_id);
+        if (it == device_drain_jobs_.end()) {
+            return tl::make_unexpected(ErrorCode::JOB_NOT_FOUND);
+        }
+        job_id = it->second;
+    }
+    return QueryDrainJob(job_id);
 }
 
 tl::expected<std::vector<uint8_t>, SerializationError>
@@ -14008,12 +14269,25 @@ tl::expected<UUID, ErrorCode> MasterService::CreateMoveTask(
         const auto& metadata = accessor.Get();
         ScopedSegmentAccess segment_accessor =
             segment_manager_.getSegmentAccess();
-        if (!segment_accessor.ExistsSegmentName(target)) {
+        auto nof_segment_accessor = nof_segment_manager_.getNoFSegmentAccess();
+
+        bool target_exists = false;
+        bool target_allocatable = false;
+        if (segment_accessor.ExistsSegmentName(target)) {
+            target_exists = true;
+            target_allocatable = segment_accessor.IsSegmentAllocatable(target);
+        } else if (nof_segment_accessor.ExistsSegmentName(target)) {
+            target_exists = true;
+            target_allocatable =
+                nof_segment_accessor.IsSegmentAllocatable(target);
+        }
+
+        if (!target_exists) {
             LOG(ERROR) << "key=" << key << ", target_segment=" << target
                        << ", error=target_segment_not_mounted";
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
-        if (!segment_accessor.IsSegmentAllocatable(target)) {
+        if (!target_allocatable) {
             LOG(ERROR) << "key=" << key << ", target_segment=" << target
                        << ", error=target_segment_not_allocatable";
             return tl::make_unexpected(
@@ -14051,6 +14325,10 @@ tl::expected<UUID, ErrorCode> MasterService::CreateMoveTask(
         ErrorCode error =
             segment_accessor.GetClientIdBySegmentName(source, select_client);
         if (error != ErrorCode::OK) {
+            error = nof_segment_accessor.GetClientIdBySegmentName(
+                source, select_client);
+        }
+        if (error != ErrorCode::OK) {
             LOG(ERROR) << "key=" << key << ", segment_name=" << source
                        << ", error=client_id_not_found";
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
@@ -14074,11 +14352,26 @@ tl::expected<UUID, ErrorCode> MasterService::CreateMoveTask(
     }
     const auto& metadata = submission_metadata.Get();
     ScopedSegmentAccess submission_access = segment_manager_.getSegmentAccess();
+    auto nof_submission_access = nof_segment_manager_.getNoFSegmentAccess();
+
     UUID current_source_client;
-    if (submission_access.GetClientIdBySegmentName(
-            source, current_source_client) != ErrorCode::OK ||
-        current_source_client != select_client ||
-        !submission_access.IsSegmentAllocatable(target) ||
+    ErrorCode source_client_err = submission_access.GetClientIdBySegmentName(
+        source, current_source_client);
+    if (source_client_err != ErrorCode::OK) {
+        source_client_err = nof_submission_access.GetClientIdBySegmentName(
+            source, current_source_client);
+    }
+
+    bool is_target_allocatable = false;
+    if (submission_access.ExistsSegmentName(target)) {
+        is_target_allocatable = submission_access.IsSegmentAllocatable(target);
+    } else if (nof_submission_access.ExistsSegmentName(target)) {
+        is_target_allocatable =
+            nof_submission_access.IsSegmentAllocatable(target);
+    }
+
+    if (source_client_err != ErrorCode::OK ||
+        current_source_client != select_client || !is_target_allocatable ||
         !metadata.HasReplica([this, &source](const Replica& replica) {
             if (!IsReplicaReadable(replica)) {
                 return false;
@@ -14171,18 +14464,44 @@ tl::expected<void, ErrorCode> MasterService::ValidateDrainRequestLocked(
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
+    auto nof_segment_access = nof_segment_manager_.getNoFSegmentAccess();
+
     for (const auto& segment_name : request.segments) {
-        if (!segment_access.ExistsSegmentName(segment_name)) {
+        bool exists = segment_access.ExistsSegmentName(segment_name);
+        SegmentStatus status = SegmentStatus::UNDEFINED;
+        if (exists) {
+            auto err =
+                segment_access.GetSegmentStatusByName(segment_name, status);
+            if (err != ErrorCode::OK) {
+                return tl::make_unexpected(err);
+            }
+        } else if (nof_segment_access.ExistsSegmentName(segment_name)) {
+            exists = true;
+            auto err =
+                nof_segment_access.GetSegmentStatusByName(segment_name, status);
+            if (err != ErrorCode::OK) {
+                return tl::make_unexpected(err);
+            }
+        } else {
             return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
         }
-        SegmentStatus status = SegmentStatus::UNDEFINED;
-        auto err = segment_access.GetSegmentStatusByName(segment_name, status);
-        if (err != ErrorCode::OK) {
-            return tl::make_unexpected(err);
-        }
-        if (status != SegmentStatus::OK) {
+
+        if (status != SegmentStatus::OK && status != SegmentStatus::DRAINING) {
             return tl::make_unexpected(
                 ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        }
+
+        for (const auto& [_, job] : drain_jobs_) {
+            if (job->status != JobStatus::SUCCEEDED &&
+                job->status != JobStatus::FAILED &&
+                job->status != JobStatus::CANCELED) {
+                for (const auto& s : job->request.segments) {
+                    if (s == segment_name) {
+                        return tl::make_unexpected(
+                            ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+                    }
+                }
+            }
         }
     }
 
@@ -14190,10 +14509,20 @@ tl::expected<void, ErrorCode> MasterService::ValidateDrainRequestLocked(
         if (unique_segments.contains(target_segment)) {
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
-        if (!segment_access.ExistsSegmentName(target_segment)) {
+        bool exists = false;
+        bool allocatable = false;
+        if (segment_access.ExistsSegmentName(target_segment)) {
+            exists = true;
+            allocatable = segment_access.IsSegmentAllocatable(target_segment);
+        } else if (nof_segment_access.ExistsSegmentName(target_segment)) {
+            exists = true;
+            allocatable =
+                nof_segment_access.IsSegmentAllocatable(target_segment);
+        }
+        if (!exists) {
             return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
         }
-        if (!segment_access.IsSegmentAllocatable(target_segment)) {
+        if (!allocatable) {
             return tl::make_unexpected(
                 ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
         }
@@ -14215,14 +14544,27 @@ tl::expected<UUID, ErrorCode> MasterService::CreateDrainJob(
             return tl::make_unexpected(valid.error());
         }
 
+        auto nof_segment_access = nof_segment_manager_.getNoFSegmentAccess();
         draining_segments.reserve(request.segments.size());
         for (const auto& segment_name : request.segments) {
-            auto err = segment_access.SetSegmentStatusByName(
-                segment_name, SegmentStatus::DRAINING);
+            ErrorCode err = ErrorCode::SEGMENT_NOT_FOUND;
+            if (segment_access.ExistsSegmentName(segment_name)) {
+                err = segment_access.SetSegmentStatusByName(
+                    segment_name, SegmentStatus::DRAINING);
+            } else if (nof_segment_access.ExistsSegmentName(segment_name)) {
+                err = nof_segment_access.SetSegmentStatusByName(
+                    segment_name, SegmentStatus::DRAINING);
+            }
             if (err != ErrorCode::OK) {
                 for (const auto& updated_segment : draining_segments) {
-                    (void)segment_access.SetSegmentStatusByName(
-                        updated_segment, SegmentStatus::OK);
+                    if (segment_access.ExistsSegmentName(updated_segment)) {
+                        (void)segment_access.SetSegmentStatusByName(
+                            updated_segment, SegmentStatus::OK);
+                    } else if (nof_segment_access.ExistsSegmentName(
+                                   updated_segment)) {
+                        (void)nof_segment_access.SetSegmentStatusByName(
+                            updated_segment, SegmentStatus::OK);
+                    }
                 }
                 return tl::make_unexpected(err);
             }
@@ -14242,7 +14584,7 @@ tl::expected<UUID, ErrorCode> MasterService::CreateDrainJob(
 }
 
 tl::expected<QueryJobResponse, ErrorCode> MasterService::QueryDrainJob(
-    const UUID& job_id) {
+    const UUID& job_id) const {
     std::shared_ptr<DrainJob> job;
     {
         std::lock_guard<std::mutex> lock(job_mutex_);
@@ -14305,13 +14647,23 @@ tl::expected<void, ErrorCode> MasterService::CancelDrainJob(
     }
 
     ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
+    auto nof_segment_access = nof_segment_manager_.getNoFSegmentAccess();
     for (const auto& segment_name : segments_to_restore) {
         SegmentStatus status = SegmentStatus::UNDEFINED;
-        if (segment_access.GetSegmentStatusByName(segment_name, status) ==
-                ErrorCode::OK &&
-            status != SegmentStatus::UNMOUNTING) {
-            (void)segment_access.SetSegmentStatusByName(segment_name,
-                                                        SegmentStatus::OK);
+        if (segment_access.ExistsSegmentName(segment_name)) {
+            if (segment_access.GetSegmentStatusByName(segment_name, status) ==
+                    ErrorCode::OK &&
+                status != SegmentStatus::UNMOUNTING) {
+                (void)segment_access.SetSegmentStatusByName(segment_name,
+                                                            SegmentStatus::OK);
+            }
+        } else if (nof_segment_access.ExistsSegmentName(segment_name)) {
+            if (nof_segment_access.GetSegmentStatusByName(
+                    segment_name, status) == ErrorCode::OK &&
+                status != SegmentStatus::UNMOUNTING) {
+                (void)nof_segment_access.SetSegmentStatusByName(
+                    segment_name, SegmentStatus::OK);
+            }
         }
     }
     return {};
@@ -14328,11 +14680,17 @@ std::optional<std::string> MasterService::SelectDrainTargetForKey(
     const ObjectMetadata& metadata, const std::string& source_segment,
     const std::vector<std::string>& requested_targets) {
     ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
+    auto nof_segment_access = nof_segment_manager_.getNoFSegmentAccess();
     std::vector<std::string> candidate_segments = requested_targets;
     if (candidate_segments.empty()) {
         auto err = segment_access.GetAllSegments(candidate_segments);
         if (err != ErrorCode::OK) {
             return std::nullopt;
+        }
+        std::vector<std::string> nof_segments;
+        if (nof_segment_access.GetAllSegments(nof_segments) == ErrorCode::OK) {
+            candidate_segments.insert(candidate_segments.end(),
+                                      nof_segments.begin(), nof_segments.end());
         }
     }
 
@@ -14347,13 +14705,25 @@ std::optional<std::string> MasterService::SelectDrainTargetForKey(
                       candidate) != existing_segments.end()) {
             continue;
         }
-        if (!segment_access.IsSegmentAllocatable(candidate)) {
-            continue;
-        }
+
+        bool allocatable = false;
         size_t used = 0, capacity = 0;
-        if (segment_access.QuerySegments(candidate, used, capacity) !=
-                ErrorCode::OK ||
-            capacity == 0) {
+        if (segment_access.ExistsSegmentName(candidate)) {
+            allocatable = segment_access.IsSegmentAllocatable(candidate);
+            if (allocatable &&
+                segment_access.QuerySegments(candidate, used, capacity) !=
+                    ErrorCode::OK) {
+                continue;
+            }
+        } else if (nof_segment_access.ExistsSegmentName(candidate)) {
+            allocatable = nof_segment_access.IsSegmentAllocatable(candidate);
+            if (allocatable &&
+                nof_segment_access.QuerySegments(candidate, used, capacity) !=
+                    ErrorCode::OK) {
+                continue;
+            }
+        }
+        if (!allocatable || capacity == 0) {
             continue;
         }
         const double util =
@@ -14570,10 +14940,16 @@ bool MasterService::MaybeCompleteDrainJob(DrainJob& job) {
     {
         ScopedSegmentAccess segment_access =
             segment_manager_.getSegmentAccess();
+        auto nof_segment_access = nof_segment_manager_.getNoFSegmentAccess();
         for (const auto& segment_name : job.request.segments) {
             if (!remaining_segments.contains(segment_name)) {
-                (void)segment_access.SetSegmentStatusByName(
-                    segment_name, SegmentStatus::DRAINED);
+                if (segment_access.ExistsSegmentName(segment_name)) {
+                    (void)segment_access.SetSegmentStatusByName(
+                        segment_name, SegmentStatus::DRAINED);
+                } else if (nof_segment_access.ExistsSegmentName(segment_name)) {
+                    (void)nof_segment_access.SetSegmentStatusByName(
+                        segment_name, SegmentStatus::DRAINED);
+                }
             }
         }
     }
@@ -14599,6 +14975,7 @@ bool MasterService::MaybeCompleteDrainJob(DrainJob& job) {
     {
         ScopedSegmentAccess segment_access =
             segment_manager_.getSegmentAccess();
+        auto nof_segment_access = nof_segment_manager_.getNoFSegmentAccess();
         for (const auto& segment_name : job.request.segments) {
             SegmentStatus status = SegmentStatus::UNDEFINED;
             if (segment_access.GetSegmentStatusByName(segment_name, status) ==
@@ -14606,6 +14983,13 @@ bool MasterService::MaybeCompleteDrainJob(DrainJob& job) {
                 status != SegmentStatus::UNMOUNTING) {
                 (void)segment_access.SetSegmentStatusByName(segment_name,
                                                             SegmentStatus::OK);
+            } else if (nof_segment_access.ExistsSegmentName(segment_name)) {
+                if (nof_segment_access.GetSegmentStatusByName(
+                        segment_name, status) == ErrorCode::OK &&
+                    status != SegmentStatus::UNMOUNTING) {
+                    (void)nof_segment_access.SetSegmentStatusByName(
+                        segment_name, SegmentStatus::OK);
+                }
             }
         }
     }

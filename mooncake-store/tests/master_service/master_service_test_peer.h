@@ -80,6 +80,16 @@ class MasterServiceTestPeer {
     std::optional<uint32_t> GetNoFHeartbeatFailureCountForTesting(
         const UUID& segment_id);
 
+    bool IsDeviceManuallyIsolatedForTesting(const UUID& device_id) const {
+        std::lock_guard<std::mutex> lock(service_.device_maintenance_mutex_);
+        return service_.manually_isolated_devices_.contains(device_id);
+    }
+
+    bool IsDeviceAutoIsolatedForTesting(const UUID& device_id) const {
+        std::lock_guard<std::mutex> lock(service_.device_maintenance_mutex_);
+        return service_.auto_isolated_devices_.contains(device_id);
+    }
+
     size_t RunPromotionCandidateRetryForTesting();
 
     size_t CountCandidatesForTesting(const TenantId& tenant_id);

@@ -6,6 +6,7 @@
 #include <string_view>
 #include <vector>
 
+#include "segment/status.h"
 #include "types.h"
 
 namespace mooncake {
@@ -76,12 +77,29 @@ struct StorageDeviceMetadata {
     UUID owner_client_id{0, 0};
     StorageDeviceHealth health = StorageDeviceHealth::UNKNOWN;
     bool schedulable = false;  ///< still eligible to receive new allocations
+    bool isolated = false;     ///< cordoned/isolated from new allocations
+    bool draining = false;     ///< device segments are actively being drained
+    std::string draining_job_id;  ///< UUID of active DrainJob if draining
     int64_t capacity_bytes = 0;
     int64_t used_bytes = -1;  ///< -1 when no allocator is attached
     uint32_t consecutive_failures = 0;
     std::string last_error;
     int64_t last_success_unix_ms = -1;
 };
+
+inline bool IsStorageDeviceSchedulable(SegmentStatus segment_status,
+                                       StorageDeviceHealth health,
+                                       bool isolated, bool draining) noexcept {
+    if (segment_status != SegmentStatus::OK) {
+        return false;
+    }
+    if (isolated || draining) {
+        return false;
+    }
+    return health == StorageDeviceHealth::HEALTHY ||
+           health == StorageDeviceHealth::UNKNOWN ||
+           health == StorageDeviceHealth::DEGRADED;
+}
 
 /// A device that the maintenance plan says needs attention, and why.
 struct StorageDeviceMaintenanceCandidate {

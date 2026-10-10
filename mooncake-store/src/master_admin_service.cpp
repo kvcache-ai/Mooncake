@@ -789,6 +789,9 @@ struct HttpStorageDeviceItem {
     std::string owner_client_id;
     std::string health;
     bool schedulable{false};
+    bool isolated{false};
+    bool draining{false};
+    std::string draining_job_id;
     int64_t capacity_bytes{0};
     int64_t used_bytes{-1};
     double usage_percent{0.0};
@@ -797,8 +800,9 @@ struct HttpStorageDeviceItem {
     int64_t last_success_unix_ms{-1};
 };
 YLT_REFL(HttpStorageDeviceItem, device_id, name, endpoint, owner_client_id,
-         health, schedulable, capacity_bytes, used_bytes, usage_percent,
-         consecutive_failures, last_error, last_success_unix_ms);
+         health, schedulable, isolated, draining, draining_job_id,
+         capacity_bytes, used_bytes, usage_percent, consecutive_failures,
+         last_error, last_success_unix_ms);
 
 struct HttpStorageDeviceListResponse {
     bool success{true};
@@ -834,6 +838,38 @@ struct HttpStorageDeviceProbeResponse {
 YLT_REFL(HttpStorageDeviceProbeResponse, success, device_id, error_code,
          error_message);
 
+struct HttpStorageDeviceIdRequest {
+    std::string device_id;
+};
+YLT_REFL(HttpStorageDeviceIdRequest, device_id);
+
+struct HttpStorageDeviceIsolateResponse {
+    bool success{false};
+    std::string device_id;
+    int32_t error_code{0};
+    std::string error_message;
+};
+YLT_REFL(HttpStorageDeviceIsolateResponse, success, device_id, error_code,
+         error_message);
+
+struct HttpStorageDeviceDrainRequest {
+    std::string device_id;
+    std::vector<std::string> target_segments;
+    uint32_t max_concurrency{4};
+};
+YLT_REFL(HttpStorageDeviceDrainRequest, device_id, target_segments,
+         max_concurrency);
+
+struct HttpStorageDeviceDrainResponse {
+    bool success{false};
+    std::string device_id;
+    std::string job_id;
+    int32_t error_code{0};
+    std::string error_message;
+};
+YLT_REFL(HttpStorageDeviceDrainResponse, success, device_id, job_id, error_code,
+         error_message);
+
 // Device ids and job ids share the same UUID wire format.
 tl::expected<UUID, ErrorCode> ParseDeviceId(std::string_view device_id_view) {
     return ParseJobId(device_id_view);
@@ -848,6 +884,9 @@ HttpStorageDeviceItem ToHttpStorageDeviceItem(
     item.owner_client_id = UuidToString(device.owner_client_id);
     item.health = std::string(StorageDeviceHealthToString(device.health));
     item.schedulable = device.schedulable;
+    item.isolated = device.isolated;
+    item.draining = device.draining;
+    item.draining_job_id = device.draining_job_id;
     item.capacity_bytes = device.capacity_bytes;
     item.used_bytes = device.used_bytes;
     item.usage_percent = (device.used_bytes >= 0 && device.capacity_bytes > 0)
@@ -953,6 +992,128 @@ void MasterAdminServer::HandleProbeStorageDevice(
         HttpStorageDeviceProbeResponse payload;
         payload.success = true;
         payload.device_id = UuidToString(device_id_result.value());
+        WriteJsonResponse(resp, coro_http::status_type::ok, payload);
+    });
+}
+
+void MasterAdminServer::HandleIsolateStorageDevice(
+    coro_http::coro_http_request& req, coro_http::coro_http_response& resp) {
+    std::string device_id_str(req.get_decode_query_value("device_id"));
+    if (device_id_str.empty() && !req.get_body().empty()) {
+        try {
+            HttpStorageDeviceIdRequest body_req;
+            struct_json::from_json(body_req, req.get_body());
+            device_id_str = body_req.device_id;
+        } catch (...) {
+        }
+    }
+    auto device_id_result = ParseDeviceId(device_id_str);
+    if (!device_id_result.has_value()) {
+        WriteErrorResponse(resp, coro_http::status_type::bad_request,
+                           device_id_result.error(),
+                           "Missing or invalid device_id");
+        return;
+    }
+
+    WithActiveService(resp, [&](auto service) {
+        auto result =
+            service->IsolateStorageDeviceForAdmin(device_id_result.value());
+        if (!result.has_value()) {
+            WriteErrorResponse(resp, ErrorCodeToHttpStatus(result.error()),
+                               result.error(),
+                               "Failed to isolate storage device");
+            return;
+        }
+
+        HttpStorageDeviceIsolateResponse payload;
+        payload.success = true;
+        payload.device_id = device_id_str;
+        WriteJsonResponse(resp, coro_http::status_type::ok, payload);
+    });
+}
+
+void MasterAdminServer::HandleUnisolateStorageDevice(
+    coro_http::coro_http_request& req, coro_http::coro_http_response& resp) {
+    std::string device_id_str(req.get_decode_query_value("device_id"));
+    if (device_id_str.empty() && !req.get_body().empty()) {
+        try {
+            HttpStorageDeviceIdRequest body_req;
+            struct_json::from_json(body_req, req.get_body());
+            device_id_str = body_req.device_id;
+        } catch (...) {
+        }
+    }
+    auto device_id_result = ParseDeviceId(device_id_str);
+    if (!device_id_result.has_value()) {
+        WriteErrorResponse(resp, coro_http::status_type::bad_request,
+                           device_id_result.error(),
+                           "Missing or invalid device_id");
+        return;
+    }
+
+    WithActiveService(resp, [&](auto service) {
+        auto result =
+            service->UnisolateStorageDeviceForAdmin(device_id_result.value());
+        if (!result.has_value()) {
+            WriteErrorResponse(resp, ErrorCodeToHttpStatus(result.error()),
+                               result.error(),
+                               "Failed to unisolate storage device");
+            return;
+        }
+
+        HttpStorageDeviceIsolateResponse payload;
+        payload.success = true;
+        payload.device_id = device_id_str;
+        WriteJsonResponse(resp, coro_http::status_type::ok, payload);
+    });
+}
+
+void MasterAdminServer::HandleDrainStorageDevice(
+    coro_http::coro_http_request& req, coro_http::coro_http_response& resp) {
+    HttpStorageDeviceDrainRequest request;
+    if (!req.get_body().empty()) {
+        try {
+            struct_json::from_json(request, req.get_body());
+        } catch (const std::exception& e) {
+            WriteErrorResponse(resp, coro_http::status_type::bad_request,
+                               ErrorCode::INVALID_PARAMS,
+                               std::string("Invalid JSON body: ") + e.what());
+            return;
+        }
+    }
+    if (request.device_id.empty()) {
+        if (auto query_val = req.get_decode_query_value("device_id");
+            !query_val.empty()) {
+            request.device_id = std::string(query_val);
+        }
+    }
+    if (request.max_concurrency == 0) {
+        request.max_concurrency = 4;
+    }
+
+    auto device_id_result = ParseDeviceId(request.device_id);
+    if (!device_id_result.has_value()) {
+        WriteErrorResponse(resp, coro_http::status_type::bad_request,
+                           device_id_result.error(),
+                           "Missing or invalid device_id");
+        return;
+    }
+
+    WithActiveService(resp, [&](auto service) {
+        auto result = service->DrainStorageDeviceForAdmin(
+            device_id_result.value(), request.target_segments,
+            request.max_concurrency);
+        if (!result.has_value()) {
+            WriteErrorResponse(resp, ErrorCodeToHttpStatus(result.error()),
+                               result.error(),
+                               "Failed to initiate storage device drain");
+            return;
+        }
+
+        HttpStorageDeviceDrainResponse payload;
+        payload.success = true;
+        payload.device_id = request.device_id;
+        payload.job_id = UuidToString(result.value());
         WriteJsonResponse(resp, coro_http::status_type::ok, payload);
     });
 }
@@ -1164,6 +1325,32 @@ void MasterAdminServer::HandleQueryDrainJob(
         if (!result.has_value()) {
             WriteErrorResponse(resp, ErrorCodeToHttpStatus(result.error()),
                                result.error());
+            return;
+        }
+
+        WriteJsonResponse(resp, coro_http::status_type::ok,
+                          ToHttpQueryDrainJobResponse(result.value()));
+    });
+}
+
+void MasterAdminServer::HandleQueryStorageDeviceDrainStatus(
+    coro_http::coro_http_request& req, coro_http::coro_http_response& resp) {
+    auto device_id_result =
+        ParseDeviceId(req.get_decode_query_value("device_id"));
+    if (!device_id_result.has_value()) {
+        WriteErrorResponse(resp, coro_http::status_type::bad_request,
+                           device_id_result.error(),
+                           "Missing or invalid device_id");
+        return;
+    }
+
+    WithActiveService(resp, [&](auto service) {
+        auto result = service->QueryStorageDeviceDrainStatusForAdmin(
+            device_id_result.value());
+        if (!result.has_value()) {
+            WriteErrorResponse(resp, ErrorCodeToHttpStatus(result.error()),
+                               result.error(),
+                               "Failed to query device drain status");
             return;
         }
 
@@ -1650,6 +1837,26 @@ void MasterAdminServer::RegisterHandler() {
         "/api/v1/devices/probe",
         [this](coro_http_request& req, coro_http_response& resp) {
             HandleProbeStorageDevice(req, resp);
+        });
+    http_server_.set_http_handler<POST>(
+        "/api/v1/devices/isolate",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            HandleIsolateStorageDevice(req, resp);
+        });
+    http_server_.set_http_handler<POST>(
+        "/api/v1/devices/unisolate",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            HandleUnisolateStorageDevice(req, resp);
+        });
+    http_server_.set_http_handler<POST>(
+        "/api/v1/devices/drain",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            HandleDrainStorageDevice(req, resp);
+        });
+    http_server_.set_http_handler<GET>(
+        "/api/v1/devices/drain_status",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            HandleQueryStorageDeviceDrainStatus(req, resp);
         });
     http_server_.set_http_handler<GET>(
         "/api/v1/tenant_quotas",

@@ -115,6 +115,10 @@ struct MasterConfig {
     int64_t nof_heartbeat_interval_sec;
     uint32_t nof_heartbeat_probe_timeout_ms;
     uint32_t nof_heartbeat_failures_threshold;
+    // Fencing a degraded NoF device only stops new allocations; it never
+    // replaces the alive-timeout unmount rule and is undone automatically once
+    // probes succeed again.
+    bool nof_auto_isolate_degraded_devices = true;
 
     bool enable_ha;
     bool enable_offload;
@@ -260,6 +264,7 @@ class MasterServiceSupervisorConfig {
     // Parameters with default values (optional parameters)
     double tenant_eviction_high_watermark_ratio =
         DEFAULT_TENANT_EVICTION_HIGH_WATERMARK_RATIO;
+    bool nof_auto_isolate_degraded_devices = true;
     uint64_t max_kv_soft_pin_ttl = DEFAULT_MAX_KV_SOFT_PIN_TTL_MS;
     std::string rpc_address = "0.0.0.0";
     std::chrono::steady_clock::duration rpc_conn_timeout = std::chrono::seconds(
@@ -373,6 +378,8 @@ class MasterServiceSupervisorConfig {
         nof_heartbeat_probe_timeout_ms = config.nof_heartbeat_probe_timeout_ms;
         nof_heartbeat_failures_threshold =
             config.nof_heartbeat_failures_threshold;
+        nof_auto_isolate_degraded_devices =
+            config.nof_auto_isolate_degraded_devices;
         enable_offload = config.enable_offload;
         offload_on_evict = config.offload_on_evict;
         offload_force_evict = config.offload_force_evict;
@@ -575,6 +582,7 @@ class WrappedMasterServiceConfig {
         DEFAULT_NOF_HEARTBEAT_PROBE_TIMEOUT_MS;
     uint32_t nof_heartbeat_failures_threshold =
         DEFAULT_NOF_HEARTBEAT_FAILURES_THRESHOLD;
+    bool nof_auto_isolate_degraded_devices = true;
     bool enable_ha = false;
     bool enable_offload = false;
     bool offload_on_evict = false;
@@ -675,6 +683,8 @@ class WrappedMasterServiceConfig {
         nof_heartbeat_probe_timeout_ms = config.nof_heartbeat_probe_timeout_ms;
         nof_heartbeat_failures_threshold =
             config.nof_heartbeat_failures_threshold;
+        nof_auto_isolate_degraded_devices =
+            config.nof_auto_isolate_degraded_devices;
         enable_ha = config.enable_ha;
         enable_offload = config.enable_offload;
         offload_on_evict = config.offload_on_evict;
@@ -807,6 +817,8 @@ class WrappedMasterServiceConfig {
         nof_heartbeat_probe_timeout_ms = config.nof_heartbeat_probe_timeout_ms;
         nof_heartbeat_failures_threshold =
             config.nof_heartbeat_failures_threshold;
+        nof_auto_isolate_degraded_devices =
+            config.nof_auto_isolate_degraded_devices;
         enable_ha =
             true;  // This is used in HA mode, so enable_ha should be true
         enable_offload = config.enable_offload;
@@ -912,6 +924,7 @@ class MasterServiceConfigBuilder {
         DEFAULT_NOF_HEARTBEAT_PROBE_TIMEOUT_MS;
     uint32_t nof_heartbeat_failures_threshold_ =
         DEFAULT_NOF_HEARTBEAT_FAILURES_THRESHOLD;
+    bool nof_auto_isolate_degraded_devices_ = true;
     bool enable_ha_ = false;
     bool enable_offload_ = false;
     std::string ha_backend_type_ = "etcd";
@@ -1045,6 +1058,12 @@ class MasterServiceConfigBuilder {
     MasterServiceConfigBuilder& set_nof_heartbeat_failures_threshold(
         uint32_t threshold) {
         nof_heartbeat_failures_threshold_ = threshold;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_nof_auto_isolate_degraded_devices(
+        bool enabled) {
+        nof_auto_isolate_degraded_devices_ = enabled;
         return *this;
     }
 
@@ -1318,6 +1337,7 @@ class MasterServiceConfig {
         DEFAULT_NOF_HEARTBEAT_PROBE_TIMEOUT_MS;
     uint32_t nof_heartbeat_failures_threshold =
         DEFAULT_NOF_HEARTBEAT_FAILURES_THRESHOLD;
+    bool nof_auto_isolate_degraded_devices = true;
     bool enable_ha = false;
     bool enable_offload = false;
     bool offload_on_evict = false;
@@ -1414,6 +1434,8 @@ class MasterServiceConfig {
         nof_heartbeat_probe_timeout_ms = config.nof_heartbeat_probe_timeout_ms;
         nof_heartbeat_failures_threshold =
             config.nof_heartbeat_failures_threshold;
+        nof_auto_isolate_degraded_devices =
+            config.nof_auto_isolate_degraded_devices;
         enable_ha = config.enable_ha;
         enable_offload = config.enable_offload;
         offload_on_evict = config.offload_on_evict;
@@ -1524,6 +1546,8 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.nof_heartbeat_interval_sec = nof_heartbeat_interval_sec_;
     config.nof_heartbeat_probe_timeout_ms = nof_heartbeat_probe_timeout_ms_;
     config.nof_heartbeat_failures_threshold = nof_heartbeat_failures_threshold_;
+    config.nof_auto_isolate_degraded_devices =
+        nof_auto_isolate_degraded_devices_;
     config.enable_ha = enable_ha_;
     config.enable_offload = enable_offload_;
     config.ha_backend_type = ha_backend_type_;

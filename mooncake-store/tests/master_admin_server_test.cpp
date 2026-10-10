@@ -1508,6 +1508,44 @@ TEST_F(MasterAdminServerWithServiceTest, StorageDeviceProbeRejectsUnknownId) {
     EXPECT_EQ(resp.http_status, 404) << resp.body;
 }
 
+TEST_F(MasterAdminServerWithServiceTest, StorageDeviceIsolateEndpointContract) {
+    auto bad_resp = HttpPostJson("/api/v1/devices/isolate", "");
+    EXPECT_EQ(bad_resp.http_status, 400);
+
+    auto unknown_resp =
+        HttpPostJson("/api/v1/devices/isolate?device_id=1-2", "");
+    EXPECT_EQ(unknown_resp.http_status, 404);
+}
+
+TEST_F(MasterAdminServerWithServiceTest,
+       StorageDeviceUnisolateEndpointContract) {
+    auto bad_resp = HttpPostJson("/api/v1/devices/unisolate", "");
+    EXPECT_EQ(bad_resp.http_status, 400);
+
+    auto unknown_resp =
+        HttpPostJson("/api/v1/devices/unisolate?device_id=1-2", "");
+    EXPECT_EQ(unknown_resp.http_status, 404);
+}
+
+TEST_F(MasterAdminServerWithServiceTest, StorageDeviceDrainEndpointContract) {
+    auto bad_resp =
+        HttpPostJson("/api/v1/devices/drain", R"({"device_id":""})");
+    EXPECT_EQ(bad_resp.http_status, 400);
+
+    auto unknown_resp =
+        HttpPostJson("/api/v1/devices/drain", R"({"device_id":"1-2"})");
+    EXPECT_EQ(unknown_resp.http_status, 404);
+}
+
+TEST_F(MasterAdminServerWithServiceTest,
+       StorageDeviceDrainStatusEndpointContract) {
+    auto bad_resp = HttpGet("/api/v1/devices/drain_status");
+    EXPECT_EQ(bad_resp.http_status, 400);
+
+    auto unknown_resp = HttpGet("/api/v1/devices/drain_status?device_id=1-2");
+    EXPECT_EQ(unknown_resp.http_status, 404);
+}
+
 // =========================================================================
 // Destructive / isolated tests that must run on their own server instance.
 // =========================================================================
