@@ -1085,6 +1085,59 @@ TEST(HandshakeFrameTest, WriteToSilentPeerFailsWithinSendTimeout) {
     close(fds[1]);
 }
 
+// Every notify frame the daemon accepts lands in an in-memory vector that
+// used to have no bound, so any peer that can reach the RPC port could grow
+// the host's RSS forever (#4445). The queue now caps at
+// getHandshakeMaxNotifyEntries() and evicts the oldest undrained entry once
+// full. Flood cap + 64 frames over the real socket, then drain.
+TEST(HandshakeNotifyTest, BoundedQueueEvictsOldestUnderFlood) {
+    TransferMetadata server(P2PHANDSHAKE);
+    int sockfd = -1;
+    const uint16_t port = findAvailableTcpPort(sockfd);
+    ASSERT_NE(port, 0);
+
+    TransferMetadata::RpcMetaDesc rpc{};
+    rpc.ip_or_host_name = "127.0.0.1";
+    rpc.rpc_port = port;
+    rpc.sockfd = sockfd;
+    ASSERT_EQ(server.addRpcMetaEntry("notify-bounded-test", rpc), 0);
+
+    const size_t cap = getHandshakeMaxNotifyEntries();
+    const size_t total = cap + 64;
+    for (size_t i = 0; i < total; ++i) {
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        ASSERT_NE(fd, -1);
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(port);
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        ASSERT_EQ(
+            connect(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)), 0);
+        Json::Value body;
+        body["name"] = "atk";
+        body["notify_msg"] = "m" + std::to_string(i);
+        ASSERT_EQ(writeString(fd, HandShakeRequestType::Notify,
+                              Json::FastWriter{}.write(body)),
+                  0);
+        // The daemon answers each accepted frame before half-closing, so
+        // reading the reply orders frame i before frame i+1. Read the whole
+        // frame: a bare read() can return after the header alone, and closing
+        // while the daemon is still writing the payload resets the socket
+        // and kills the process with SIGPIPE on its next write.
+        auto [rtype, rjson] = readString(fd);
+        ASSERT_EQ(rtype, HandShakeRequestType::Notify);
+        ASSERT_FALSE(rjson.empty());
+        close(fd);
+    }
+
+    std::vector<TransferMetadata::NotifyDesc> drained;
+    ASSERT_EQ(server.getNotifies(drained), 0);
+    ASSERT_EQ(drained.size(), cap);
+    // The oldest 64 frames were evicted; the survivors keep arrival order.
+    EXPECT_EQ(drained.front().notify_msg, "m64");
+    EXPECT_EQ(drained.back().notify_msg, "m" + std::to_string(total - 1));
+}
+
 namespace {
 
 // Hardware-free in-memory MetadataStoragePlugin. get() returns false for keys
