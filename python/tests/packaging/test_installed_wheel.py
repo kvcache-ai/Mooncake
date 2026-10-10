@@ -97,6 +97,18 @@ assert Path(mooncake.async_store.__file__).resolve().parent == package_path.pare
 assert mooncake.engine.TransferEngine is not None
 assert mooncake.http_metadata_server.KVBootstrapServer is not None
 assert mooncake.mooncake_config.MooncakeConfig is not None
+optional_roots = {{
+    "fastapi", "httpx", "msgspec", "numpy", "torch", "uvicorn", "vllm", "zmq"
+}}
+for module_name in (
+    "mooncake.mooncake_connector_v1",
+    "mooncake.vllm_v1_proxy_server",
+):
+    spec = util.find_spec(module_name)
+    assert spec is not None and spec.origin is not None, module_name
+    module_path = Path(spec.origin).resolve()
+    assert module_path.parent == package_path.parent, (module_name, module_path)
+assert not (optional_roots & {{name.partition(".")[0] for name in sys.modules}})
 for ep_module in (
     "ep.py",
     "mooncake_ep_buffer.py",
