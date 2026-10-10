@@ -1,5 +1,6 @@
 #include "device_comm/device_transfer/routes/p2p_route/p2p_route.h"
 
+#include <cstring>
 #include <utility>
 
 #include <transport/device/device_transport.h>
@@ -20,6 +21,31 @@ P2pRoute::P2pRoute(device::P2pTransport& transport, void* local_region,
 PGResult<void> P2pRoute::initialize() {
     PG_VALIDATE_STATE(!snapshot_stream_, "P2P route is already initialized");
     PG_TRY(auto snapshot_stream, GpuStream::createNonBlocking(device_index_));
+
+    // Scan visible hardware once; peer mappings are resolved separately.
+    cudaDeviceProp properties{};
+    PG_TRY_CUDA(cudaGetDeviceProperties(&properties, device_index_));
+    static_assert(sizeof(properties.uuid.bytes) == sizeof(DeviceUUID));
+    std::memcpy(device_uuid_.data(), properties.uuid.bytes,
+                device_uuid_.size());
+    int device_count = 0;
+    PG_TRY_CUDA(cudaGetDeviceCount(&device_count));
+    for (int peer = 0; peer < device_count; ++peer) {
+        if (peer == device_index_) continue;
+        int accessible = 0;
+        PG_TRY_CUDA(cudaDeviceCanAccessPeer(&accessible, device_index_, peer));
+        if (!accessible) continue;
+        int native_atomics = 0;
+        PG_TRY_CUDA(cudaDeviceGetP2PAttribute(
+            &native_atomics, cudaDevP2PAttrNativeAtomicSupported, device_index_,
+            peer));
+        if (!native_atomics) continue;
+        PG_TRY_CUDA(cudaGetDeviceProperties(&properties, peer));
+        DeviceUUID uuid;
+        std::memcpy(uuid.data(), properties.uuid.bytes, uuid.size());
+        native_atomic_peer_uuids_.push_back(uuid);
+    }
+
     snapshot_stream_.emplace(std::move(snapshot_stream));
     return {};
 }

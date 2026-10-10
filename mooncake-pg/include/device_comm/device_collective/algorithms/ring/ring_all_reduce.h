@@ -5,86 +5,46 @@
 #include <cstdint>
 #include <memory>
 
-#include "control_plane/control_types.h"
 #include "device_comm/device_collective/algorithms/ring/ring_types.cuh"
-#include "device_comm/device_transfer/transfer_region.h"
+#include "device_comm/device_collective/resolved_group_view.h"
 #include "error_types.h"
 #include "gpu_runtime.h"
 
 namespace mooncake {
 
 class DeviceCollectiveWorkspace;
-class DeviceTransferService;
 class ControlUpdateBuilder;
+class SimpleResources;
 
-// Owns the host-side decisions specific to Ring AllReduce. The common runtime
-// supplies view-epoch signal storage, ordering, and recovery lifecycle; the
-// Ring Plan supplies the exact peers that preparation must check.
 class RingAllReduceAlgorithm {
    public:
+    // Workspace and protocol resources must outlive the algorithm.
     static PGResult<std::unique_ptr<RingAllReduceAlgorithm>> create(
-        DeviceTransferService& transfer_service,
-        DeviceCollectiveWorkspace& workspace,
-        const uint64_t* view_epoch_signals, InvocationState* invocation_state,
-        ControlMailbox* control_mailbox, uint64_t timeout_ticks,
-        int device_index, InGroupRank self_rank, uint32_t max_group_size);
+        int device_index, CollectiveRuntimeBindings collective,
+        DeviceCollectiveWorkspace& workspace, const SimpleResources& simple);
 
     ~RingAllReduceAlgorithm() noexcept;
 
     RingAllReduceAlgorithm(const RingAllReduceAlgorithm&) = delete;
     RingAllReduceAlgorithm& operator=(const RingAllReduceAlgorithm&) = delete;
 
-    // These methods update only the host Plan. Runtime publication is a
-    // separate step that encodes the complete collective state below.
-    void useLocalOnly(uint64_t view_epoch);
-    PGResult<void> applyGroupView(const GroupView& view);
-    void invalidateHostPlan() noexcept;
-    PGResult<void> appendPlanUpdate(ControlUpdateBuilder& builder) const;
-
-    [[nodiscard]] bool ready() const noexcept;
-    [[nodiscard]] const RingAllReduceEndpoint& localEndpoint() const noexcept;
-
-    PGResult<void> enqueue(const void* send_buffer, void* recv_buffer,
-                           size_t count, DataType datatype, ReduceOp op,
-                           cudaStream_t stream,
-                           int32_t* failed_ranks_hint) const;
+    // Construct a candidate without changing published state.
+    PGResult<RingAllReducePlan> buildPlan(const ResolvedGroupView& view) const;
+    PGResult<void> appendPlanUpdate(ControlUpdateBuilder& builder,
+                                    const RingAllReducePlan& plan) const;
+    PGResult<void> enqueue(const AllReduceRequest& request,
+                           cudaStream_t stream) const;
 
    private:
-    RingAllReduceAlgorithm(DeviceTransferService& transfer_service,
+    RingAllReduceAlgorithm(int device_index,
                            DeviceCollectiveWorkspace& workspace,
-                           const DeviceTransferHandle* transfer_handle,
-                           const uint64_t* view_epoch_signals,
-                           InvocationState* invocation_state,
-                           ControlMailbox* control_mailbox,
-                           uint64_t timeout_ticks, int device_index,
-                           InGroupRank self_rank, uint32_t max_group_size,
-                           RegionSlice signals,
-                           RingSignalLayout signal_layout) noexcept;
+                           const SimpleResources& simple) noexcept
+        : workspace_(workspace), simple_(simple), device_index_(device_index) {}
 
-    PGResult<void> initializeDeviceState();
-    void releaseDeviceState() noexcept;
-    [[nodiscard]] RingAllReducePlan makePlan(uint64_t view_epoch,
-                                             int32_t self_active_index,
-                                             uint32_t participant_count,
-                                             uint64_t buffer_size,
-                                             RingPeerTarget predecessor,
-                                             RingPeerTarget successor,
-                                             char* staging_ptr) const;
-    DeviceTransferService& transfer_service_;
     DeviceCollectiveWorkspace& workspace_;
-    const DeviceTransferHandle* transfer_handle_ = nullptr;
-    const uint64_t* view_epoch_signals_ = nullptr;
-    InvocationState* invocation_state_ = nullptr;
-    ControlMailbox* control_mailbox_ = nullptr;
-    uint64_t timeout_ticks_ = 0;
+    const SimpleResources& simple_;
     int device_index_ = -1;
-    InGroupRank self_rank_ = kInvalidInGroupRank;
-    uint32_t max_group_size_ = 0;
-    RegionSlice signals_;
-    RingSignalLayout signal_layout_;
     RingAllReduceDeviceState* state_ = nullptr;
-    RingAllReduceEndpoint endpoint_;
-    RingAllReducePlanSlot host_plan_;
 };
 
 }  // namespace mooncake

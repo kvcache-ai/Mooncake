@@ -136,6 +136,8 @@ class GpuEvent {
     GpuEvent(GpuEvent&& other) noexcept;
     GpuEvent& operator=(GpuEvent&& other) noexcept;
 
+    [[nodiscard]] cudaEvent_t get() const noexcept { return event_; }
+
     [[nodiscard]] PGResult<void> record(const GpuStream& stream);
     [[nodiscard]] PGResult<bool> query() const;
 

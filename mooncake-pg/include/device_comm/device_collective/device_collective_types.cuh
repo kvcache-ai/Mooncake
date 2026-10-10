@@ -6,15 +6,88 @@
 #include <cuda_alike.h>
 
 #include "common_types.h"
+#include "pg_assert.h"
 #include "device_comm/device_utils/d2h_request_slot_types.h"
 #include "device_comm/device_transfer/transfer_types.cuh"
 
 namespace mooncake {
 
+struct CollectiveStepResult {
+    InGroupRank failed_rank = kInvalidInGroupRank;
+
+    [[nodiscard]] __device__ __forceinline__ bool succeeded() const {
+        return failed_rank == kInvalidInGroupRank;
+    }
+};
+
+struct AllReduceRequest {
+    const void* send_buffer = nullptr;
+    void* recv_buffer = nullptr;
+    uint64_t count = 0;
+    DataType datatype = DataType::Float32;
+    ReduceOp op = ReduceOp::Sum;
+    int32_t* failed_ranks_hint = nullptr;
+};
+
+// One remote participant selected by an algorithm. Workspace and signal offsets
+// are relative to that peer's DTS region.
+struct CollectivePeer {
+    GlobalRank global_rank = kInvalidGlobalRank;
+    InGroupRank in_group_rank = kInvalidInGroupRank;
+    uint64_t workspace_offset = 0;
+    uint64_t view_epoch_signal_offset = 0;
+};
+
+// Non-owning compact list of remote peers selected by an algorithm, excluding
+// self. Shared by communication, the View handshake, and failure drain.
+// Entries are indexed by list position, not by global or in-group rank.
+class RemotePeerList {
+   public:
+    __host__ __device__ constexpr RemotePeerList(
+        const CollectivePeer* entries = nullptr, uint32_t count = 0)
+        : entries_(entries), count_(count) {
+        PG_ASSERT(entries_ || count_ == 0, "Remote peer list has no storage");
+    }
+
+    [[nodiscard]] __host__ __device__ constexpr const CollectivePeer* begin()
+        const {
+        return entries_;
+    }
+
+    [[nodiscard]] __host__ __device__ constexpr const CollectivePeer* end()
+        const {
+        return count_ == 0 ? entries_ : entries_ + count_;
+    }
+
+    [[nodiscard]] __host__ __device__ constexpr uint32_t size() const {
+        return count_;
+    }
+
+    [[nodiscard]] __host__ __device__ constexpr const CollectivePeer& atIndex(
+        uint64_t peer_index) const {
+        PG_ASSERT(peer_index < count_, "Remote peer index is out of range");
+        return entries_[peer_index];
+    }
+
+   private:
+    const CollectivePeer* entries_;
+    uint32_t count_;
+};
+
+// Local data operands for one collective step.
+// count is in T elements. Each operation defines which pointers it uses;
+// unused pointers may be null.
+template <typename T>
+struct CollectiveChunk {
+    const T* source = nullptr;
+    T* destination = nullptr;
+    uint64_t count = 0;
+};
+
 inline constexpr uint32_t kMaxDeviceCollectiveChannels = 32;
 static_assert(kMaxDeviceCollectiveChannels <= kTransferLaneCount);
 inline constexpr uint32_t kMaxDeviceControlUpdateOperations = 8;
-inline constexpr uint32_t kDeviceControlUpdatePayloadBytes = 1024;
+inline constexpr uint32_t kDeviceControlUpdatePayloadBytes = 8192;
 
 inline constexpr bool isDeviceAllReduceCombinationSupported(
     DataType datatype, ReduceOp op) noexcept {
@@ -29,7 +102,6 @@ inline constexpr bool isDeviceAllReduceCombinationSupported(
     }
     switch (datatype) {
         case DataType::Float16:
-            return op == ReduceOp::Sum;
         case DataType::Uint8:
         case DataType::Int8:
         case DataType::Int16:
@@ -133,12 +205,6 @@ struct alignas(64) ControlUpdateSlot {
     ControlUpdate update;
 };
 
-template <typename Plan>
-struct PlanSlot {
-    DevicePlanStatus status = DevicePlanStatus::Unavailable;
-    Plan plan{};
-};
-
 struct CollectiveFailureReport {
     InGroupRank failed_rank = kInvalidInGroupRank;
     uint64_t failed_hint_address = 0;
@@ -175,6 +241,17 @@ struct alignas(64) InvocationState {
     uint32_t failure_latched = 0;
     InGroupRank failed_rank = kInvalidInGroupRank;
     uint64_t failed_hint_address = 0;
+};
+
+// Stable runtime bindings borrowed by every collective algorithm. Per-call
+// operands live in AllReduceRequest; topology and protocol bindings live in the
+// algorithm's device state.
+struct CollectiveRuntimeBindings {
+    const DeviceTransferHandle* transfer_handle = nullptr;
+    uint64_t timeout_ticks = 0;
+    const uint64_t* view_epoch_signals = nullptr;
+    InvocationState* invocation_state = nullptr;
+    ControlMailbox* control_mailbox = nullptr;
 };
 
 }  // namespace mooncake
