@@ -140,6 +140,14 @@ class FileSystemAdapter {
         return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
     }
 
+    // Whether a hard WriteAt/ReadAt failure can be recovered by closing and
+    // reopening the fd (stale-fd self-healing). Only meaningful for adapters
+    // backed by a plain long-lived positional fd (POSIX). Adapters whose I/O
+    // failures are unrelated to the file fd (e.g. 3FS USRBIO submit/completion
+    // or per-thread ior/iov state) must leave this false so the backend does
+    // not perform a pointless close/reopen/retry under the shard lock.
+    virtual bool SupportsFdReopen() const { return false; }
+
     // Opt in to backend batching and concurrent positional I/O on cached
     // shard fds. Other adapters retain per-request bucket handles and
     // serialized shard I/O.
