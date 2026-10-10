@@ -86,6 +86,12 @@ class MasterAdminServer {
                               coro_http::coro_http_response& resp);
     void HandleGetSegmentsDetail(coro_http::coro_http_request& req,
                                  coro_http::coro_http_response& resp);
+    void HandleGetStorageDevices(coro_http::coro_http_request& req,
+                                 coro_http::coro_http_response& resp);
+    void HandleGetStorageDeviceMaintenancePlan(
+        coro_http::coro_http_request& req, coro_http::coro_http_response& resp);
+    void HandleProbeStorageDevice(coro_http::coro_http_request& req,
+                                  coro_http::coro_http_response& resp);
     void HandleQuerySegment(coro_http::coro_http_request& req,
                             coro_http::coro_http_response& resp);
     void HandleGetDfsShardCount(coro_http::coro_http_request& req,
