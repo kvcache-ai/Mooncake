@@ -52,6 +52,10 @@ target_include_directories(
   shared_segment_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src/shared_segment)
 target_link_libraries(shared_segment_test PUBLIC transfer_engine gtest
                                                  gtest_main)
+# aclInit/aclrtSetDevice are called directly under USE_ASCEND_DIRECT.
+if(USE_ASCEND_DIRECT)
+  target_link_libraries(shared_segment_test PUBLIC ascendcl)
+endif()
 add_test(NAME shared_segment_test COMMAND shared_segment_test)
 
 add_executable(rdma_endpoint_state_test
