@@ -23,6 +23,7 @@
 #include "mutex.h"
 #include "common/network.h"
 #include "pyclient.h"
+#include "nof/nof_runtime.h"
 #include "rpc_types.h"
 #if defined(USE_SUNRISE)
 #include "sunrise_allocator.h"
@@ -358,6 +359,12 @@ class RealClient : public PyClient {
                                  bool force = false);
 
     int tearDownAll();
+
+    // Test-only seam: when set, setup_internal() builds the NoF runtime from
+    // this factory instead of CreateNofRuntime(). Not thread-safe; set before
+    // setup and reset (pass nullptr) after the test.
+    static void SetNofRuntimeFactoryForTesting(
+        std::function<NofRuntime()> factory);
 
     int health_check() override;
 
@@ -1024,6 +1031,11 @@ class RealClient : public PyClient {
     std::unique_ptr<coro_rpc::coro_rpc_server> offload_rpc_server_;
     int offload_rpc_port_ = 0;
     bool use_hugepage_ = false;
+    // NoF runtime (initiator + DMA allocator) created during setup_internal.
+    // Both components are additionally owned by client_ /
+    // client_buffer_allocator_ (in the PyClient base), so member declaration
+    // order is not load-bearing.
+    NofRuntime nof_runtime_{};
 
     struct MappedShm {
         std::string shm_name;

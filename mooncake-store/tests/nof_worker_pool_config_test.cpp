@@ -98,10 +98,12 @@ TEST_F(NoFWorkerPoolConfigTest, PoolConstructionUsesCachedWorkerCount) {
             std::filesystem::directory_iterator());
     };
     const auto before = count_threads();
-    SpdkNofWorkerPool first;
+    // A nullptr initiator is enough here: the pool spawns its workers without
+    // touching the initiator until a task is submitted.
+    NofWorkerPool first{nullptr};
     EXPECT_EQ(count_threads() - before, 2);
     ASSERT_EQ(setenv("MC_NOF_WORKERS", "3", 1), 0);
-    SpdkNofWorkerPool second;
+    NofWorkerPool second{nullptr};
     EXPECT_EQ(count_threads() - before, 4);
     EXPECT_EQ(NoFWorkerPoolConfig::AtFirstUse().worker_count, 2);
 }

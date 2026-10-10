@@ -38,11 +38,15 @@
 #include "environ.h"
 #include "segment.h"
 #include "segment/region_driver.h"
-#ifdef USE_NOF
-#include "spdk/spdk_wrapper.h"
-#endif
+// nof_runtime.h is compiled unconditionally (returns a null initiator in
+// non-USE_NOF builds); MasterService::DefaultProbeNofSegment relies on that.
+#include "nof/nof_runtime.h"
 #include "ha/ha_types.h"
 #include "ha/kv/ha_kv_backend_factory.h"
+#ifdef STORE_USE_ETCD
+#include "etcd_helper.h"
+#include "ha/kv/etcd_ha_kv_backend.h"
+#endif
 #include "ha/oplog/oplog_batch_storage.h"
 #include "ha/oplog/ordered_oplog_writer.h"
 #include "ha/snapshot/catalog/backends/embedded/embedded_snapshot_catalog_store.h"
@@ -173,6 +177,23 @@ tl::expected<std::string, ErrorCode> GetGroupIdForKey(
 }
 
 }  // namespace
+
+// Defined unconditionally (CreateNofRuntime() exists in every build and
+// returns a null initiator without USE_NOF); the constructor wires it up only
+// under USE_NOF. See the declaration in master_service.h for the rationale.
+bool MasterService::DefaultProbeNofSegment(const std::string& te_endpoint,
+                                           uint32_t timeout_ms,
+                                           std::string* error_reason) {
+    static const std::shared_ptr<NVMeoFInitiator> initiator =
+        CreateNofRuntime().initiator;
+    if (!initiator) {
+        if (error_reason) {
+            *error_reason = "nof_unavailable";
+        }
+        return false;
+    }
+    return initiator->ProbeSegment(te_endpoint, timeout_ms, error_reason);
+}
 
 MasterService::MasterService() : MasterService(MasterServiceConfig()) {}
 
@@ -366,11 +387,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
         throw std::invalid_argument("Invalid nof heartbeat failure threshold");
     }
 
-    nof_probe_fn_ = [](const std::string& te_endpoint, uint32_t timeout_ms,
-                       std::string* error_reason) {
-        return SpdkWrapper::GetInstance().ProbeNofSegment(
-            te_endpoint, timeout_ms, error_reason);
-    };
+    nof_probe_fn_ = &DefaultProbeNofSegment;
 #endif
 
     // Offload-on-evict: defer LOCAL_DISK offload to eviction time

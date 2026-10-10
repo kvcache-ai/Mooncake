@@ -74,10 +74,6 @@ if(BUILD_UNIT_TESTS OR BUILD_BENCHMARK)
   target_include_directories(master_service_test_peer
                              PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/tests)
   target_link_libraries(master_service_test_peer PUBLIC mooncake_store)
-  if(USE_NOF)
-    target_include_directories(master_service_test_peer
-                               PRIVATE ${SPDK_INCLUDE_DIR} ${DPDK_INCLUDE_DIR})
-  endif()
 endif()
 
 if (BUILD_UNIT_TESTS)

@@ -14,9 +14,7 @@
 #include "config.h"
 #include "config/hugepage_config.h"
 #include "config/shm_spdk_registration_config.h"
-#ifdef USE_NOF
-#include "spdk/spdk_wrapper.h"
-#endif
+#include "nof/nof_runtime.h"  // SPDK-free; compiled unconditionally
 #if defined(USE_ASCEND_DIRECT)
 #include "ascend_allocator.h"
 #endif
@@ -63,44 +61,45 @@ static std::string shm_alloc_error(const char* step, size_t size,
 }
 
 ShmHelper* ShmHelper::getInstance() {
-    static ShmHelper instance;
-    return &instance;
+    // Deliberately leaked, never destroyed: ~ShmHelper -> cleanup() would
+    // unregister segments from the process-global NoF page registry, whose
+    // static-destruction order relative to this singleton is unspecified.
+    // Leaking guarantees the exit path can never touch a finalized registry
+    // or SPDK env; the kernel reclaims the mappings and registrations at
+    // process exit instead. cleanup() remains available to explicit callers.
+    static ShmHelper* instance = new ShmHelper();
+    return instance;
 }
 
 ShmHelper::ShmHelper() {
-#ifdef USE_NOF
-    // Force SpdkWrapper to complete construction before ShmHelper does, so that
-    // at process exit ShmHelper is destroyed FIRST: its cleanup() (which calls
-    // SpdkWrapper::UnregisterMemory) runs while the SPDK env is still alive,
-    // before ~SpdkWrapper -> Cleanup() -> spdk_env_fini(). Without this, the
-    // first host-pool allocation constructs SpdkWrapper AFTER ShmHelper, so at
-    // exit SpdkWrapper is destroyed first and cleanup() would call
-    // spdk_mem_unregister after spdk_env_fini() (UB / NULL-deref on SPDK
-    // >= 26.09). Constructing SpdkWrapper here is side-effect free: its ctor is
-    // `= default` and the env is only initialized lazily via InitializeEnv().
-    SpdkWrapper::GetInstance();
-#endif
     use_hugepage_ = HugepageConfig::IsEnabledFromEnvironment();
     // Read once at construction (ShmHelper is a singleton). Opt-in only: with
-    // MC_STORE_REGISTER_SPDK=1, ShmHelper mappings are registered with SPDK so
-    // NoF zero-copy transfers can DMA to/from them; otherwise the previous
-    // allocation behavior is preserved exactly.
+    // MC_STORE_REGISTER_SPDK=1, ShmHelper mappings are registered with the NoF
+    // initiator so NoF zero-copy transfers can DMA to/from them; otherwise the
+    // previous allocation behavior is preserved exactly.
     register_spdk_ = is_register_spdk_enabled();
     if (register_spdk_) {
 #ifdef USE_NOF
-        // spdk_mem_register() requires hugepage-backed memory: SPDK's vtophys
-        // notify checks each 2MB segment's PHYSICAL address for 2MB alignment,
-        // which only hugepage pages satisfy (4KB-backed memory always fails
-        // with -EINVAL, on v23.01.1 and every later version in iova=pa mode).
-        // Virtual-address alignment alone (mmap_shm_2mb_aligned) is not
-        // sufficient, so force hugepages here; if not enough are configured the
-        // allocation below fails with a clear error instead of silently losing
-        // NoF zero-copy. This is an override on top of
+        nof_initiator_ = CreateNofRuntime().initiator;
+        if (!nof_initiator_) {
+            LOG(WARNING) << "MC_STORE_REGISTER_SPDK=1 but NoF is unavailable "
+                            "(e.g. MC_NOF_BACKEND=none); shared memory will "
+                            "NOT be registered for NoF zero-copy transfers";
+        }
+        // SPDK's spdk_mem_register() requires hugepage-backed memory: its
+        // vtophys notify checks each 2MB segment's PHYSICAL address for 2MB
+        // alignment, which only hugepage pages satisfy (4KB-backed memory
+        // always fails with -EINVAL, on v23.01.1 and every later version in
+        // iova=pa mode). Virtual-address alignment alone is not sufficient, so
+        // force hugepages here; if not enough are configured the allocation
+        // below fails with a clear error instead of silently losing NoF
+        // zero-copy. This is an override on top of
         // HugepageConfig::IsEnabledFromEnvironment() above.
         use_hugepage_ = true;
 #endif
         LOG(INFO) << "MC_STORE_REGISTER_SPDK=1: shared memory will be "
-                     "registered with SPDK for NoF zero-copy transfers";
+                     "registered with the NoF initiator for zero-copy "
+                     "transfers";
     }
 }
 
@@ -121,16 +120,16 @@ bool ShmHelper::cleanup() {
         if (shm->base_addr) {
 #ifdef USE_NOF
             if (shm->spdk_registered) {
-                if (SpdkWrapper::GetInstance().UnregisterMemory(
-                        shm->base_addr, shm->size) != 0) {
-                    // SPDK still holds a translation for this range: do NOT
+                if (!nof_initiator_ || nof_initiator_->UnregisterMemory(
+                                           shm->base_addr) != ErrorCode::OK) {
+                    // The NoF translation table still holds this range: do NOT
                     // munmap or clear spdk_registered, or a later mmap could
                     // reuse the VA and NoF would silently DMA to the wrong
                     // memory. Retain the mapping (released by the OS at process
-                    // exit; cleanup() only runs from ~ShmHelper).
-                    LOG(ERROR) << "Failed to unregister shared memory from "
-                                  "SPDK during cleanup; retaining mapping "
-                                  "(never munmap): "
+                    // exit; cleanup() only runs from explicit callers).
+                    LOG(ERROR) << "Failed to unregister shared memory from the "
+                                  "NoF initiator during cleanup; retaining "
+                                  "mapping (never munmap): "
                                << shm->base_addr;
                     ret = false;
                     continue;
@@ -250,69 +249,49 @@ void* ShmHelper::allocate(size_t size) {
     shm->name = MOONCAKE_SHM_NAME;
     shm->registered = false;
 #ifdef USE_NOF
-    // Register the mapping with SPDK so NoF (NVMe-oF) RDMA transfers can DMA
-    // to/from this buffer directly (spdk_rdma_get_translation). Registration
-    // failure is non-fatal: the buffer stays usable for all non-NoF paths.
-    // Enabled only with MC_STORE_REGISTER_SPDK=1 (read once at construction).
-    if (register_spdk_) {
-        if (!SpdkWrapper::IsRegistrableRange(base_addr, size)) {
+    // Register the mapping with the NoF initiator so NoF (NVMe-oF) RDMA
+    // transfers can DMA to/from this buffer directly (RDMA translation table).
+    // Registration failure is non-fatal: the buffer stays usable for all
+    // non-NoF paths. Enabled only with MC_STORE_REGISTER_SPDK=1 (read once at
+    // construction).
+    if (register_spdk_ && nof_initiator_) {
+        if (!NofRangeIsRegistrable(base_addr, size)) {
             // The hugepage forcing in the constructor makes this unreachable
             // today (hugetlb mmap returns a hugepage-aligned base and size is
-            // aligned to the hugepage size), but a range SPDK would reject
-            // up-front must not be registered at all: the rejection happens
-            // before any state is marked, so munmap below stays safe.
+            // aligned to the hugepage size). A range rejected here is never
+            // touched by RegisterMemory, so the munmap in free()/cleanup()
+            // stays safe without a pairing unregister.
             LOG(WARNING) << "Shared memory is not 2MB-aligned; not registering "
-                            "with SPDK: addr="
-                         << base_addr << ", size=" << size
-                         << "; NoF zero-copy transfers to this buffer will be "
-                            "unavailable";
+                            "for NoF zero-copy transfers: addr="
+                         << base_addr << ", size=" << size;
         } else {
-            const int register_rc =
-                SpdkWrapper::GetInstance().RegisterMemory(base_addr, size);
-            if (register_rc == 0) {
+            // The process-global page registry normalizes to whole 2MB pages,
+            // absorbs pages already registered by the DPDK memseg walk
+            // (-EBUSY) as external, and cleans up the pages it touched on
+            // failure. A plain failure owns no registration, so teardown can
+            // munmap normally; only NOF_REGISTRATION_STUCK (cleanup
+            // unconfirmed) must be treated as registered.
+            const ErrorCode register_rc =
+                nof_initiator_->RegisterMemory(base_addr, size);
+            if (register_rc == ErrorCode::OK) {
                 shm->spdk_registered = true;
-            } else if (register_rc == -EBUSY) {
-                // The range is already registered, so SPDK marked nothing new
-                // for us. Do NOT roll back: the unregister below would clear
-                // the existing registration (memory.c:358-366 detects it,
-                // 445-466 clears it). Retain the mapping and let teardown
-                // retry.
-                LOG(ERROR) << "Shared memory is already registered with SPDK: "
-                           << base_addr << ", size: " << size
-                           << "; retaining mapping";
+            } else if (register_rc == ErrorCode::NOF_REGISTRATION_STUCK) {
+                // The backend may still hold translation state for this
+                // range. Treat it as registered so free()/cleanup() retry
+                // the unregister and retain the mapping instead of
+                // munmapping a possibly-live translation.
+                LOG(ERROR) << "NoF registration of shared memory left "
+                              "unconfirmed translation state: addr="
+                           << base_addr << ", size=" << size
+                           << "; treating as registered so teardown retries "
+                              "the unregister";
                 shm->spdk_registered = true;
             } else {
-                LOG(WARNING) << "Failed to register shared memory with SPDK: "
-                             << "addr=" << base_addr << ", size=" << size
+                LOG(WARNING) << "Failed to register shared memory with the NoF "
+                                "initiator: addr="
+                             << base_addr << ", size=" << size
                              << "; NoF zero-copy transfers to this buffer will "
                                 "be unavailable";
-                // spdk_mem_register() marks the range in g_mem_reg_map before
-                // running its notify callbacks and does NOT roll back on
-                // failure (SPDK v23.01.1, memory.c:370-384), and in iova=va it
-                // can already have installed the IOMMU mapping when a later
-                // step fails (memory.c:1092-1107). This unregister is the only
-                // chance to undo that, and only a 0 return proves it worked:
-                // -EINVAL is also returned for a half-marked range
-                // (memory.c:426) and, in iova=va, for an incomplete
-                // translation before the IOMMU is unmapped
-                // (memory.c:1216-1224). -EINVAL covers both a failure before
-                // anything was mapped and one after the DMA mapping was
-                // installed, and the codes cannot be told apart, so retaining
-                // a mapping that turns out to have been clean is the accepted
-                // cost of never munmapping a live translation.
-                const int rollback_rc =
-                    SpdkWrapper::GetInstance().UnregisterMemory(base_addr,
-                                                                size);
-                if (rollback_rc != 0) {
-                    LOG(ERROR)
-                        << "Failed to roll back incomplete SPDK registration: "
-                        << base_addr << ", size: " << size
-                        << ", rc: " << rollback_rc
-                        << "; treating the range as registered so free()/"
-                           "cleanup() retry the unregister and quarantine the "
-                           "mapping instead of munmapping";
-                    shm->spdk_registered = true;
-                }
             }
         }
     }
@@ -333,15 +312,17 @@ int ShmHelper::free(void* addr) {
             if ((*it)->base_addr) {
 #ifdef USE_NOF
                 if ((*it)->spdk_registered) {
-                    if (SpdkWrapper::GetInstance().UnregisterMemory(
-                            (*it)->base_addr, (*it)->size) != 0) {
-                        // SPDK still holds a translation for this range: do NOT
-                        // munmap, clear spdk_registered, or erase the segment.
-                        // Retain the mapping so the VA cannot be reused while
-                        // SPDK's translation is live (a later free() retries).
+                    if (!nof_initiator_ ||
+                        nof_initiator_->UnregisterMemory((*it)->base_addr) !=
+                            ErrorCode::OK) {
+                        // The NoF translation table still holds this range: do
+                        // NOT munmap, clear spdk_registered, or erase the
+                        // segment. Retain the mapping so the VA cannot be
+                        // reused while the translation is live (a later free()
+                        // retries).
                         LOG(ERROR) << "Failed to unregister shared memory from "
-                                      "SPDK during free; retaining mapping "
-                                      "(never munmap): "
+                                      "the NoF initiator during free; "
+                                      "retaining mapping (never munmap): "
                                    << (*it)->base_addr;
                         return -1;
                     }

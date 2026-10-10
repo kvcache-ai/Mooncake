@@ -2071,6 +2071,15 @@ class MasterService {
     mutable std::mutex nof_probe_fn_mutex_;
     NoFProbeFn nof_probe_fn_;
 
+    // Shared NoF probe default, used by both the constructor and the
+    // test-seam reset. A single function-static initiator keeps the probe
+    // path aligned with the process-global NofPageRegistry and avoids
+    // duplicating the lambda body in two places. Private but reachable from
+    // the friend test peer, which resets nof_probe_fn_ to this default.
+    static bool DefaultProbeNofSegment(const std::string& te_endpoint,
+                                       uint32_t timeout_ms,
+                                       std::string* error_reason);
+
     // if high availability features enabled
     const bool enable_ha_;
 
