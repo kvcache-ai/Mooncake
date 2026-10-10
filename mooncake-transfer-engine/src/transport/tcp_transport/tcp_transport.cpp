@@ -59,6 +59,7 @@ using LaneObserverHook = void (*)(int, size_t, uint64_t, size_t, bool) noexcept;
 using LaneFailureReasonHook = void (*)(int) noexcept;
 using SessionProgressHook = int (*)(int, bool) noexcept;
 using StartTransferMetadataHook = void (*)() noexcept;
+using TerminalActionPreQuiesceHook = void (*)() noexcept;
 
 std::mutex lane_test_hook_mutex;
 LaneConnectHandlerHook lane_connect_handler_hook = nullptr;
@@ -69,6 +70,7 @@ LaneObserverHook lane_observer_hook = nullptr;
 LaneFailureReasonHook lane_failure_reason_hook = nullptr;
 SessionProgressHook session_progress_hook = nullptr;
 StartTransferMetadataHook start_transfer_metadata_hook = nullptr;
+TerminalActionPreQuiesceHook terminal_action_pre_quiesce_hook = nullptr;
 std::atomic<size_t> staging_buffer_allocation_count{0};
 std::atomic<size_t> staging_device_query_count{0};
 
@@ -193,6 +195,15 @@ void invokeStartTransferMetadataHook() noexcept {
     }
     if (hook) hook();
 }
+
+void invokeTerminalActionPreQuiesceHook() noexcept {
+    TerminalActionPreQuiesceHook hook;
+    {
+        std::lock_guard<std::mutex> lock(lane_test_hook_mutex);
+        hook = terminal_action_pre_quiesce_hook;
+    }
+    if (hook) hook();
+}
 }  // namespace
 
 void tcpTransportSetLaneConnectHandlerHookForTest(
@@ -240,6 +251,12 @@ void tcpTransportSetStartTransferMetadataHookForTest(
     StartTransferMetadataHook hook) noexcept {
     std::lock_guard<std::mutex> lock(lane_test_hook_mutex);
     start_transfer_metadata_hook = hook;
+}
+
+void tcpTransportSetTerminalActionPreQuiesceHookForTest(
+    TerminalActionPreQuiesceHook hook) noexcept {
+    std::lock_guard<std::mutex> lock(lane_test_hook_mutex);
+    terminal_action_pre_quiesce_hook = hook;
 }
 
 bool tcpTransportLaneTypesAreMoveOnlyForTest() noexcept {
@@ -528,13 +545,16 @@ Status TcpTransport::getTransferStatus(BatchID batch_id, size_t task_id,
     // Acquire completion counters before reading the bytes they publish.
     status.transferred_bytes =
         __atomic_load_n(&task.transferred_bytes, __ATOMIC_RELAXED);
-    if (success_slice_count + failed_slice_count == task.slice_count) {
+    const uint64_t outstanding_slice_completions =
+        __atomic_load_n(&task.outstanding_slice_completions, __ATOMIC_ACQUIRE);
+    if (success_slice_count + failed_slice_count == task.slice_count &&
+        outstanding_slice_completions == 0) {
         if (failed_slice_count) {
             status.s = TransferStatusEnum::FAILED;
         } else {
             status.s = TransferStatusEnum::COMPLETED;
         }
-        task.is_finished = true;
+        __atomic_store_n(&task.is_finished, true, __ATOMIC_RELEASE);
     } else {
         status.s = TransferStatusEnum::WAITING;
     }
@@ -607,17 +627,19 @@ Status TcpTransport::submitTransferTaskGroup(
 
 Transport::Slice* TcpTransport::prepareTransfer(
     TransferTask* task, const TransferRequest& request) {
-    task->total_bytes += request.length;
+    __atomic_fetch_add(&task->total_bytes, request.length, __ATOMIC_RELAXED);
     Slice* slice = getSliceCache().allocate();
     slice->source_addr = static_cast<char*>(request.source);
     slice->length = request.length;
     slice->opcode = request.opcode;
     slice->tcp.dest_addr = request.target_offset;
-    slice->task = task;
+    __atomic_store_n(&slice->task, task, __ATOMIC_RELEASE);
     slice->target_id = request.target_id;
     slice->status = Slice::PENDING;
     slice->ts = 0;
     task->slice_list.push_back(slice);
+    __atomic_fetch_add(&task->outstanding_slice_completions, 1,
+                       __ATOMIC_RELEASE);
     __sync_fetch_and_add(&task->slice_count, 1);
     return slice;
 }
@@ -715,15 +737,18 @@ std::shared_ptr<asio::ip::tcp::socket> TcpTransport::getConnection(
 void TcpTransport::startTransfer(Slice* slice,
                                  std::function<void()> continuation,
                                  bool reuse_connection) {
-    auto finish = [slice, &continuation](TransferStatusEnum status) mutable {
-        if (status == TransferStatusEnum::COMPLETED)
-            slice->markSuccess();
-        else
-            slice->markFailed();
-        if (continuation) {
-            auto next = std::move(continuation);
-            next();
-        }
+    // RELAXED is sufficient here: prepareTransfer stores slice->task with
+    // RELEASE before publishing the slice through the work queue, and that
+    // publication orders this load against the store.
+    TransferTask* owner = __atomic_load_n(&slice->task, __ATOMIC_RELAXED);
+    size_t slice_length = slice->length;
+
+    auto finish = [slice, owner, slice_length,
+                   &continuation](TransferStatusEnum status) mutable {
+        completeTerminalAction(
+            TerminalAction(TcpWorkItem(slice, false, std::move(continuation),
+                                       owner, slice_length),
+                           status, false));
     };
 
     auto desc = metadata_->getSegmentDescByID(slice->target_id);
@@ -758,7 +783,8 @@ void TcpTransport::startTransfer(Slice* slice,
     const ConnectionKey key{desc->tcp_data_host,
                             static_cast<uint16_t>(desc->tcp_data_port)};
     const bool use_v2 = desc->tcp_proto_version >= 2 && !forceLegacyTcpProto();
-    TcpWorkItem work(slice, use_v2, std::move(continuation));
+    TcpWorkItem work(slice, use_v2, std::move(continuation), owner,
+                     slice_length);
 
     // Scatter task groups request reuse even when the general pool setting is
     // disabled. Fixed lanes provide the same serial socket reuse without
