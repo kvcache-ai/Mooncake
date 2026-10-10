@@ -472,11 +472,14 @@ bool TransportSelector::isTransportAvailable(
     }
 
     // Special constraints
-    if (type == XPU && !context.local_segment) return false;
+    if (type == XPU && !context.local_segment &&
+        !(context.xpu_ipc && context.same_machine))
+        return false;
     if ((type == NVLINK || type == SHM || type == TPU) &&
         !context.same_machine) {
         // These transports require machine locality. XPU additionally needs
-        // process-local addresses, checked separately above.
+        // addresses this process can reach: its own segment, or a same-host
+        // peer's buffer it has mapped in over IPC (xpu_ipc), checked above.
         return false;
     }
 
@@ -491,8 +494,9 @@ bool TransportSelector::isTransportAvailable(
     // to the single isGpuMemoryType() in platform.h so this routing predicate
     // and the staging capability checks share one device-type list and cannot
     // disagree. TPU and Intel XPU are included so their device<->host staging
-    // hop routes to the matching staging transport (gpu_to_dram / dram_to_gpu);
-    // they never satisfy gpu_to_gpu, so cross-node device traffic is always
+    // hop routes to the matching staging transport (gpu_to_dram / dram_to_gpu).
+    // XPU also satisfies gpu_to_gpu, but only for the local segment (checked
+    // above), so cross-node device traffic without GPUDirect RDMA is always
     // staged through host DRAM.
     auto is_gpu = [](MemoryType t) { return isGpuMemoryType(t); };
 

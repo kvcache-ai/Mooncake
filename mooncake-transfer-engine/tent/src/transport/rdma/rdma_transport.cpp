@@ -263,6 +263,14 @@ static bool isGpuDirectRdmaSupported(std::shared_ptr<Config> conf) {
     if (disable_gpu_direct) {
         return false;
     }
+    // Intel XPU: no peer-memory kernel module; device buffers are exported as
+    // dma-bufs and registered with ibv_reg_dmabuf_mr, so the presence of that
+    // verb is the capability signal. Buffers that fail to export at
+    // registration time are simply not offered on RDMA and get staged.
+    if (Platform::getLoader().type() == "xpu") {
+        auto& loader = IbvLoader::Instance();
+        return loader.available() && loader.sym().ibv_reg_dmabuf_mr != nullptr;
+    }
     // Detect vendor GPUDirect/peer-memory drivers from /proc/modules.
     // NVIDIA: nvidia_peermem. AMD: peermem is built into amdgpu (linked with
     // ib_core), so the amdgpu module itself is the presence signal.
@@ -713,6 +721,10 @@ Status RdmaTransport::getNicLoadStats(std::vector<NicLoadStats>& stats) const {
 
 bool RdmaTransport::warmupMemory(void* addr, size_t length) {
     if (length < kMrWarmupMinBytes) return false;
+    // Warm-up is a plain ibv_reg_mr. Intel XPU VRAM has no host pages behind
+    // it and is registered through dma-buf export instead, so the temporary
+    // ibv_reg_mr would only EFAULT.
+    if (Platform::getLoader().getMemoryType(addr) == MTYPE_XPU) return false;
     unsigned hwc = std::thread::hardware_concurrency();
     if (hwc < 4) return false;
     RdmaContext* warmup_ctx = nullptr;
