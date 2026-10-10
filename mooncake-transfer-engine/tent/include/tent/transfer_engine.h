@@ -228,6 +228,10 @@ typedef struct tent_nic_load_stat tent_nic_load_stat_t;
 int tent_get_nic_load_stats(tent_engine_t engine, tent_nic_load_stat_t* stats,
                             size_t* count);
 
+// Transport type value (TRANSPORT_* or a loaded plugin's slot) for `name`, or
+// TRANSPORT_UNSPEC if the name is unknown. Usable as a transport_hint.
+int tent_transport_type_by_name(const char* name);
+
 #ifdef __cplusplus
 }
 #endif  // __cplusplus

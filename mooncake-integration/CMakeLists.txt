@@ -105,6 +105,21 @@ if(WITH_TE)
         ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_tent_first_buffer.py)
     set_tests_properties(tent_python_first_buffer_test PROPERTIES TIMEOUT 60)
+    if(TARGET tent_xport_loopback)
+      add_test(
+        NAME tent_python_plugin_loopback_test
+        COMMAND
+          ${CMAKE_COMMAND} -E env MC_USE_TENT=1
+          MOONCAKE_LOCAL_HOSTNAME=127.0.0.1
+          "MC_TENT_CONF={\"plugins\":{\"dir\":\"${TENT_TRANSPORT_PLUGIN_DIR}\"},\"transports\":{\"loopback\":{\"enable\":true},\"rdma\":{\"enable\":false},\"tcp\":{\"enable\":true},\"gds\":{\"enable\":false},\"shm\":{\"enable\":false}}}"
+          TENT_TEST_PLUGIN_DIR=${TENT_TRANSPORT_PLUGIN_DIR}
+          PYTHONPATH=$<TARGET_FILE_DIR:engine>
+          LD_LIBRARY_PATH=$<TARGET_FILE_DIR:transfer_engine>:$<TARGET_FILE_DIR:tent_metrics>:$<TARGET_FILE_DIR:asio_shared>
+          ${Python3_EXECUTABLE}
+          ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_tent_plugin_loopback.py)
+      set_tests_properties(tent_python_plugin_loopback_test PROPERTIES TIMEOUT
+                                                                       60)
+    endif()
   endif()
 endif()
 

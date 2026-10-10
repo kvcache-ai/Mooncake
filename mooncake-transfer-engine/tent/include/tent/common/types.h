@@ -43,6 +43,11 @@ struct Notification {
 #define LOCAL_SEGMENT_ID (0ull)
 #endif
 
+// Slots reserved after the built-in transports for runtime-loaded transport
+// plugins (see tent/transport_plugin.h). A plugin slot is process-local: it is
+// never sent to a peer as an integer, only by plugin name.
+static constexpr int kNumPluginSlots = 8;
+
 enum TransportType : int {
     UNSPEC = 0,
     RDMA,
@@ -63,14 +68,31 @@ enum TransportType : int {
     FABRIC,
     MLU,
     MEMFABRIC,
+    // Built-in enumerators end here; their values are sent to peers and must
+    // stay stable.
+    kNumBuiltinTransportTypes,
+    kFirstPluginSlot = kNumBuiltinTransportTypes,
     // Sentinel: must remain the last enumerator.
-    kNumTransportTypes,
+    kNumTransportTypes = kFirstPluginSlot + kNumPluginSlots,
 };
 
 const static int kSupportedTransportTypes = (int)kNumTransportTypes;
 
+// Name of a plugin slot registered by the transport plugin loader, or
+// "unknown" if the slot is unused or out of range. Defined in tent_common.
+const char* pluginTransportSlotName(int slot);
+
+// Plugin slot whose registered name is `name`, or UNSPEC if none.
+TransportType pluginTransportSlotByName(const std::string& name);
+
+// True if `type` is a plugin slot that has been assigned.
+bool isPluginTransportSlot(int type);
+
 inline TransportType c_to_transport_hint(int v) {
     if (v < 0 || v >= kSupportedTransportTypes) return UNSPEC;
+    // An unassigned plugin slot is no transport: treat it like any other
+    // unknown value.
+    if (v >= kFirstPluginSlot && !isPluginTransportSlot(v)) return UNSPEC;
     return static_cast<TransportType>(v);
 }
 
@@ -114,10 +136,11 @@ inline const char* transportTypeName(TransportType type) {
             return "fabric";
         case MEMFABRIC:
             return "memfabric";
+        case kNumBuiltinTransportTypes:  // == kFirstPluginSlot
         case kNumTransportTypes:
-            return "unknown";
+            break;
     }
-    return "unknown";
+    return pluginTransportSlotName(type);
 }
 
 inline TransportType parseTransportType(const std::string& str) {
@@ -140,7 +163,7 @@ inline TransportType parseTransportType(const std::string& str) {
     if (str == "hylink") return HYLINK;
     if (str == "fabric") return FABRIC;
     if (str == "memfabric") return MEMFABRIC;
-    return UNSPEC;
+    return pluginTransportSlotByName(str);
 }
 
 enum class IntentType : int {

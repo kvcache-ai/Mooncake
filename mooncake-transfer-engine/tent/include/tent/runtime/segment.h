@@ -82,11 +82,58 @@ struct BufferDesc {
     // Local registration policy, deliberately excluded from JSON metadata.
     Permission permission{kGlobalReadWrite};
 
-   public:
-    NLOHMANN_DEFINE_TYPE_INTRUSIVE(BufferDesc, addr, length, location,
-                                   transports, regions, transport_attrs, rkey,
-                                   shm_path, mnnvl_handle, internal);
+    // Wire form of plugin transports, keyed by plugin name. Filled only while
+    // a descriptor is exchanged with peers; see transport_wire_codec.h.
+    std::vector<std::string> plugin_transports;
+    std::unordered_map<std::string, std::string> plugin_transport_attrs;
 };
+
+// Same keys as before plugin transports existed; the plugin_* keys are written
+// only when non-empty and are optional on read, so peers without plugin
+// support exchange identical JSON.
+inline void to_json(json& j, const BufferDesc& b) {
+    j["addr"] = b.addr;
+    j["length"] = b.length;
+    j["location"] = b.location;
+    j["transports"] = b.transports;
+    j["regions"] = b.regions;
+    j["transport_attrs"] = b.transport_attrs;
+    j["rkey"] = b.rkey;
+    j["shm_path"] = b.shm_path;
+    j["mnnvl_handle"] = b.mnnvl_handle;
+    j["internal"] = b.internal;
+    if (!b.plugin_transports.empty())
+        j["plugin_transports"] = b.plugin_transports;
+    if (!b.plugin_transport_attrs.empty())
+        j["plugin_transport_attrs"] = b.plugin_transport_attrs;
+}
+
+inline void from_json(const json& j, BufferDesc& b) {
+    j.at("addr").get_to(b.addr);
+    j.at("length").get_to(b.length);
+    j.at("location").get_to(b.location);
+    j.at("transports").get_to(b.transports);
+    j.at("regions").get_to(b.regions);
+    j.at("transport_attrs").get_to(b.transport_attrs);
+    j.at("rkey").get_to(b.rkey);
+    j.at("shm_path").get_to(b.shm_path);
+    j.at("mnnvl_handle").get_to(b.mnnvl_handle);
+    j.at("internal").get_to(b.internal);
+    // Optional and lenient: a malformed plugin key from a peer is ignored
+    // rather than failing the whole descriptor.
+    auto names = j.find("plugin_transports");
+    if (names != j.end() && names->is_array()) {
+        for (const auto& name : *names)
+            if (name.is_string())
+                b.plugin_transports.push_back(name.get<std::string>());
+    }
+    auto attrs = j.find("plugin_transport_attrs");
+    if (attrs != j.end() && attrs->is_object()) {
+        for (auto it = attrs->begin(); it != attrs->end(); ++it)
+            if (it->is_string())
+                b.plugin_transport_attrs[it.key()] = it->get<std::string>();
+    }
+}
 
 struct FileBufferDesc {
     std::string path;
@@ -106,6 +153,8 @@ struct MemorySegmentDesc {
     // Transport-specific attributes (key-value pairs per transport type)
     // int maps to TransportType enum
     std::unordered_map<int, std::string> transport_attrs;
+    // Wire form of plugin-slot transport_attrs, keyed by plugin name.
+    std::unordered_map<std::string, std::string> plugin_transport_attrs;
 
    public:
     // Get transport attributes for a specific transport type
@@ -129,6 +178,8 @@ inline void to_json(json& j, const MemorySegmentDesc& m) {
              {"devices", m.devices},
              {"topology", m.topology.toString()},
              {"transport_attrs", m.transport_attrs}};
+    if (!m.plugin_transport_attrs.empty())
+        j["plugin_transport_attrs"] = m.plugin_transport_attrs;
 }
 
 inline void from_json(const json& j, MemorySegmentDesc& m) {
@@ -141,6 +192,12 @@ inline void from_json(const json& j, MemorySegmentDesc& m) {
     }
     if (j.contains("transport_attrs")) {
         j.at("transport_attrs").get_to(m.transport_attrs);
+    }
+    auto plugin_attrs = j.find("plugin_transport_attrs");
+    if (plugin_attrs != j.end() && plugin_attrs->is_object()) {
+        for (auto it = plugin_attrs->begin(); it != plugin_attrs->end(); ++it)
+            if (it->is_string())
+                m.plugin_transport_attrs[it.key()] = it->get<std::string>();
     }
 }
 

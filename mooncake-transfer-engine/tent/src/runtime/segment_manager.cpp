@@ -22,6 +22,7 @@
 #include "tent/runtime/control_plane.h"
 #include "tent/runtime/segment_registry.h"
 #include "tent/common/utils/os.h"
+#include "transport_wire_codec.h"
 
 namespace mooncake {
 namespace tent {
@@ -229,7 +230,7 @@ std::shared_ptr<const std::string> SegmentManager::getLocalDumpedJson() {
         if (local_json_cache_ && local_json_cache_version_ == version)
             return local_json_cache_;
     }
-    json j = *snapshot;
+    json j = segmentDescToWireJson(*snapshot);
     auto computed = std::make_shared<const std::string>(j.dump());
 
     std::lock_guard<std::mutex> g(local_json_cache_mu_);

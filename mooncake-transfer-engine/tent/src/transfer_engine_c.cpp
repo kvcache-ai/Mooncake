@@ -521,3 +521,8 @@ int tent_get_nic_load_stats(tent_engine_t engine, tent_nic_load_stat_t* stats,
     *count = native_stats.size();
     return 0;
 }
+
+int tent_transport_type_by_name(const char* name) {
+    if (!name) return TRANSPORT_UNSPEC;
+    return static_cast<int>(mooncake::tent::parseTransportType(name));
+}
