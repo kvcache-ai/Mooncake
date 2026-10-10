@@ -2,6 +2,13 @@
 
 This directory contains benchmark tools for Mooncake Store internals.
 
+## ReadPlan Benchmark
+
+[ReadPlan benchmark](read_plan_bench.md) compares Python session/range reads,
+native sequential ReadPlan, and native pipelined ReadPlan using the same data.
+It reports read latency and group readiness, with content validation after each
+trial. See the linked instructions for TCP smoke tests and RDMA measurements.
+
 ## Allocation Strategy Benchmark
 
 `allocation_strategy_bench` evaluates Store allocation behavior across segment
