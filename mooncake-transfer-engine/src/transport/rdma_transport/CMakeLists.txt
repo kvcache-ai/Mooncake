@@ -11,6 +11,12 @@ if(USE_CUDA)
   target_link_libraries(rdma_transport PUBLIC ${CMAKE_DL_LIBS})
 endif()
 
+if(USE_ASCEND_RDMA)
+  target_compile_definitions(rdma_transport PRIVATE USE_ASCEND_RDMA)
+  target_link_libraries(rdma_transport PUBLIC ${CMAKE_DL_LIBS})
+  message(STATUS "Ascend UB segment registration for RDMA is enabled")
+endif()
+
 if(USE_MLX5DV)
   target_compile_definitions(rdma_transport PRIVATE USE_MLX5DV)
 endif()
