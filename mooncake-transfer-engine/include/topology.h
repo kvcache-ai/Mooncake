@@ -76,7 +76,11 @@ class Topology {
         return discover(filter);
     }
 
-    int discover(const std::vector<std::string> &filter);
+    // exclude_efa drops AWS EFA NICs. They are verbs devices too, but only
+    // expose SRD, so the RDMA transport (RC QPs) cannot use them. RDMA
+    // auto-discovery sets it; callers setting up the EFA transport must not.
+    int discover(const std::vector<std::string> &filter,
+                 bool exclude_efa = false);
 
     int parse(const std::string &topology_json);
 

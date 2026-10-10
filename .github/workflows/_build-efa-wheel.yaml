@@ -201,6 +201,26 @@ jobs:
           echo "OK: libfabric/libefa correctly excluded (resolve to system EFA at runtime)"
         shell: bash
 
+      - name: Verify libfabric is loaded at runtime, not linked
+        run: |
+          WHL=$(ls mooncake-wheel/dist-py${{ steps.python-tag.outputs.python_version_tag }}/*.whl | head -1)
+          inspect_dir=$(mktemp -d)
+          unzip -q "$WHL" -d "$inspect_dir"
+          status=0
+          while IFS= read -r so; do
+            if readelf -d "$so" | grep -Fq "Shared library: [libfabric.so"; then
+              echo "::error::$(basename "$so") links libfabric; the EFA transport must dlopen it"
+              status=1
+            fi
+            if nm -D --undefined-only "$so" 2>/dev/null | grep -qE ' fi_(getinfo|freeinfo|dupinfo|fabric|strerror|version)$'; then
+              echo "::error::$(basename "$so") has undefined libfabric symbols"
+              status=1
+            fi
+          done < <(find "$inspect_dir" -name '*.so*' -type f)
+          [ "$status" = 0 ] && echo "OK: no libfabric link-time dependency"
+          exit "$status"
+        shell: bash
+
       - name: Verify wheel platform tag
         run: |
           WHL=$(ls mooncake-wheel/dist-py${{ steps.python-tag.outputs.python_version_tag }}/*.whl | head -1)
