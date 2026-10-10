@@ -857,7 +857,8 @@ class RealClient : public PyClient {
      * is not set up here.
      */
     bool prefetch_offload_object(const std::vector<std::string> &keys,
-                                 const std::vector<int64_t> &sizes);
+                                 const std::vector<int64_t> &sizes,
+                                 const std::string &tenant_id);
 
     /**
      * @brief Retrieves multiple stored objects from a remote service.

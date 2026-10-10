@@ -64,7 +64,8 @@ class SsdPrefetcher {
     // dedup, size the staging from authoritative local metadata, then run
     // register + promote for keys whose LOCAL_DISK replica this node holds.
     void RunLocalPrefetch(const std::vector<std::string>& keys,
-                          const std::vector<int64_t>& sizes);
+                          const std::vector<int64_t>& sizes,
+                          const std::string& tenant_id);
 
     // get()-side wait, only meaningful with ssd_get_wait_ms > 0 and a
     // LOCAL_DISK best replica. Returns a refreshed QueryResult only when a

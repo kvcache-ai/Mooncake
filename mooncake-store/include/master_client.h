@@ -546,7 +546,8 @@ class MasterClient {
      * The client's own tenant is used.
      */
     [[nodiscard]] tl::expected<void, ErrorCode> RegisterPrefetchTask(
-        const UUID& client_id, const std::string& key);
+        const UUID& client_id, const std::string& key,
+        const std::string& tenant_id);
 
     /**
      * @brief Stage a PROCESSING MEMORY replica for an existing key during

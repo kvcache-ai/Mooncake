@@ -1248,11 +1248,12 @@ tl::expected<void, ErrorCode> MasterClient::NotifyPromotionSuccess(
 }
 
 tl::expected<void, ErrorCode> MasterClient::RegisterPrefetchTask(
-    const UUID& client_id, const std::string& key) {
+    const UUID& client_id, const std::string& key,
+    const std::string& tenant_id) {
     ScopedVLogTimer timer(1, "MasterClient::RegisterPrefetchTask");
     timer.LogRequest("client_id=", client_id, ", key=", key);
     auto result = invoke_rpc<&WrappedMasterService::RegisterPrefetchTask, void>(
-        client_id, key, tenant_id_.value());
+        client_id, key, tenant_id);
     timer.LogResponseExpected(result);
     return result;
 }

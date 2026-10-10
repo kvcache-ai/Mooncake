@@ -5,6 +5,7 @@
 #include <optional>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 #include <glog/logging.h>
@@ -14,6 +15,7 @@
 #include "file_storage.h"
 #include "pyclient.h"
 #include "replica.h"
+#include "tenant_id.h"
 
 namespace mooncake {
 
@@ -28,6 +30,15 @@ struct SsdPrefetchRoute {
     int64_t local_disk_size{0};
     std::string holder_endpoint;
 };
+
+// Delegated keys may carry a foreign tenant; scope them in the dedup table
+// so they cannot collide with same-named local keys. Keys in the holder's
+// own tenant keep the raw form, so single-tenant behavior is unchanged.
+std::string ScopeTenantKey(const std::string& own_tenant,
+                           const std::string& tenant,
+                           const std::string& key) {
+    return tenant == own_tenant ? key : TenantId(tenant).MakeScopedKey(key);
+}
 
 // A key is prefetchable when it has a COMPLETE LOCAL_DISK replica (data
 // readable) and no MEMORY replica at all (a PROCESSING memory replica means
@@ -70,36 +81,43 @@ std::optional<SsdPrefetchRoute> ClassifySsdPrefetchRoute(
 void RegisterAndPromote(Client& client, FileStorage& file_storage,
                         const std::shared_ptr<PrefetchThrottle>& throttle,
                         const std::vector<std::string>& keys,
-                        const std::vector<int64_t>& sizes) {
-    auto on_key_done = [throttle](const std::string& key, bool success) {
+                        const std::vector<int64_t>& sizes,
+                        const std::string& tenant_id) {
+    const std::string own_tenant = client.tenant_id();
+    auto on_key_done = [throttle, own_tenant,
+                        tenant_id](const std::string& key, bool success) {
         if (!throttle) {
             return;
         }
+        const std::string scoped = ScopeTenantKey(own_tenant, tenant_id, key);
         if (success) {
-            throttle->markCompleted(key);
+            throttle->markCompleted(scoped);
         } else {
-            throttle->markFailed(key);
+            throttle->markFailed(scoped);
         }
     };
     for (size_t i = 0; i < keys.size(); ++i) {
-        auto register_result = client.RegisterPrefetchTask(keys[i]);
+        auto register_result = client.RegisterPrefetchTask(keys[i], tenant_id);
         if (!register_result) {
             if (register_result.error() !=
                 ErrorCode::PROMOTION_ALREADY_EXISTS) {
                 VLOG(1) << "SSD prefetch: RegisterPrefetchTask failed for key="
                         << keys[i] << ", error=" << register_result.error();
                 if (throttle) {
-                    throttle->markFailed(keys[i]);
+                    throttle->markFailed(
+                        ScopeTenantKey(own_tenant, tenant_id, keys[i]));
                 }
             }
             continue;
         }
         if (throttle) {
-            throttle->markInFlight(keys[i]);
+            throttle->markInFlight(ScopeTenantKey(own_tenant, tenant_id,
+                                                  keys[i]));
         }
         bool dram_pressure = false;
-        auto prefetch_res = file_storage.PrefetchKeys(
-            {keys[i]}, {sizes[i]}, &dram_pressure, on_key_done);
+        auto prefetch_res =
+            file_storage.PrefetchKeys({keys[i]}, {sizes[i]}, &dram_pressure,
+                                      on_key_done, tenant_id);
         if (!prefetch_res) {
             LOG(WARNING) << "SSD prefetch: PrefetchKeys failed for key="
                          << keys[i] << ", error=" << prefetch_res.error();
@@ -246,7 +264,7 @@ void SsdPrefetcher::TriggerPrefetch(const std::vector<std::string>& keys,
 
             if (file_storage && !local_keys.empty()) {
                 RegisterAndPromote(*client, *file_storage, throttle, local_keys,
-                                   local_sizes);
+                                   local_sizes, client->tenant_id());
             }
         }
 
@@ -258,15 +276,21 @@ void SsdPrefetcher::TriggerPrefetch(const std::vector<std::string>& keys,
             for (auto& [endpoint, group_keys] : remote_keys) {
                 VLOG(1) << "SSD prefetch: delegating " << group_keys.size()
                         << " key(s) to remote holder " << endpoint;
+                // The keys' tenant travels with the delegation: a shared
+                // SSD holder stores objects from other tenants and must
+                // look up / register / promote under the object's own
+                // tenant. The holder's client_id still proves ownership.
                 client_requester->prefetch_offload_object(
-                    endpoint, group_keys, remote_sizes[endpoint]);
+                    endpoint, group_keys, remote_sizes[endpoint],
+                    client->tenant_id());
             }
         }
     });
 }
 
 void SsdPrefetcher::RunLocalPrefetch(const std::vector<std::string>& keys,
-                                     const std::vector<int64_t>& sizes) {
+                                     const std::vector<int64_t>& sizes,
+                                     const std::string& tenant_id) {
     if (!initialized_.load() || keys.empty()) {
         return;
     }
@@ -284,30 +308,49 @@ void SsdPrefetcher::RunLocalPrefetch(const std::vector<std::string>& keys,
     // sizes from the remote caller are a hint only; the local object map is
     // authoritative (LookupLocalObjectSize inside the job).
     (void)sizes;
-    auto reserved = throttle->reserve(keys);
+    const std::string own_tenant = client->tenant_id();
+    std::vector<std::string> scoped_keys;
+    scoped_keys.reserve(keys.size());
+    for (const auto& key : keys) {
+        scoped_keys.push_back(ScopeTenantKey(own_tenant, tenant_id, key));
+    }
+    auto reserved = throttle->reserve(scoped_keys);
     if (reserved.empty()) {
         return;
     }
+    // Pair accepted scoped keys back with their raw forms for the downstream
+    // lookup/register/promote calls (master RPCs take key + tenant separately).
+    const std::unordered_set<std::string> accepted(reserved.begin(),
+                                                   reserved.end());
+    std::vector<std::string> raw_keys;
+    raw_keys.reserve(reserved.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (accepted.count(scoped_keys[i])) {
+            raw_keys.push_back(keys[i]);
+        }
+    }
     SubmitJob([client = std::move(client),
-               file_storage = std::move(file_storage), throttle,
-               keys = std::move(reserved)]() {
+               file_storage = std::move(file_storage), throttle, own_tenant,
+               tenant_id, keys = std::move(raw_keys)]() {
         std::vector<std::string> local_keys;
         std::vector<int64_t> local_sizes;
         local_keys.reserve(keys.size());
         local_sizes.reserve(keys.size());
         for (const auto& key : keys) {
-            auto local_size = file_storage->LookupLocalObjectSize(key);
+            auto local_size =
+                file_storage->LookupLocalObjectSize(key, tenant_id);
             if (!local_size || *local_size <= 0) {
                 VLOG(1) << "SSD prefetch: skip remote key=" << key
                         << " (not in local object map)";
-                throttle->markFailed(key);
+                throttle->markFailed(ScopeTenantKey(own_tenant, tenant_id,
+                                                    key));
                 continue;
             }
             local_keys.push_back(key);
             local_sizes.push_back(*local_size);
         }
         RegisterAndPromote(*client, *file_storage, throttle, local_keys,
-                           local_sizes);
+                           local_sizes, tenant_id);
     });
 }
 

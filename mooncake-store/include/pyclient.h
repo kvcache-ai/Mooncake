@@ -181,10 +181,14 @@ class ClientRequester {
      * @param keys SSD-only keys held by the remote node.
      * @param sizes Object sizes (bytes), index-aligned with keys. Hint only;
      *        the holder re-reads sizes from its authoritative local metadata.
+     * @param tenant_id The keys' tenant. A shared SSD holder stores objects
+     *        from other tenants, so lookup/registration/promotion must run
+     *        under the object's own tenant, not the holder's.
      */
     void prefetch_offload_object(const std::string &client_addr,
                                  const std::vector<std::string> &keys,
-                                 const std::vector<int64_t> &sizes);
+                                 const std::vector<int64_t> &sizes,
+                                 const std::string &tenant_id);
 
    private:
     /**

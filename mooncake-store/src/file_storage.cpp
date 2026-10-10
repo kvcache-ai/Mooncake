@@ -1014,7 +1014,8 @@ tl::expected<void, ErrorCode> FileStorage::PromoteOneKeyFromLocalDisk(
 
 tl::expected<void, ErrorCode> FileStorage::PrefetchKeys(
     const std::vector<std::string>& keys, const std::vector<int64_t>& sizes,
-    bool* dram_pressure, PrefetchKeyCallback on_key_done) {
+    bool* dram_pressure, PrefetchKeyCallback on_key_done,
+    const std::string& tenant_id) {
     if (client_ == nullptr) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
@@ -1022,12 +1023,15 @@ tl::expected<void, ErrorCode> FileStorage::PrefetchKeys(
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    const std::string tenant_id = client_->tenant_id();
+    // Default (empty) means the holder's own tenant; a delegated prefetch
+    // carries the requester's tenant explicitly.
+    const std::string effective_tenant =
+        tenant_id.empty() ? client_->tenant_id() : tenant_id;
     for (size_t i = 0; i < keys.size(); ++i) {
         const auto& key = keys[i];
         const int64_t size = sizes[i];
         bool key_dram_pressure = false;
-        auto result = PromoteOneKeyFromLocalDisk(key, tenant_id, size,
+        auto result = PromoteOneKeyFromLocalDisk(key, effective_tenant, size,
                                                  &key_dram_pressure);
         if (key_dram_pressure && dram_pressure != nullptr) {
             *dram_pressure = true;
@@ -1058,7 +1062,7 @@ tl::expected<void, ErrorCode> FileStorage::PrefetchKeys(
 }
 
 std::optional<int64_t> FileStorage::LookupLocalObjectSize(
-    const std::string& key) const {
+    const std::string& key, const std::string& tenant_id) const {
     if (!storage_backend_) {
         return std::nullopt;
     }
@@ -1067,8 +1071,10 @@ std::optional<int64_t> FileStorage::LookupLocalObjectSize(
         return size;
     }
     // Tenant-scoped fallback: bucket keys are stored scoped by tenant.
-    if (client_) {
-        const auto scoped = TenantId(client_->tenant_id()).MakeScopedKey(key);
+    const std::string& lookup_tenant =
+        tenant_id.empty() && client_ != nullptr ? client_->tenant_id() : tenant_id;
+    if (!lookup_tenant.empty()) {
+        const auto scoped = TenantId(lookup_tenant).MakeScopedKey(key);
         if (scoped != key) {
             if (auto size = storage_backend_->GetObjectDataSize(scoped);
                 size && *size > 0) {

@@ -595,7 +595,7 @@ class Client {
      * applies.
      */
     virtual tl::expected<void, ErrorCode> RegisterPrefetchTask(
-        const std::string& object_key);
+        const std::string& object_key, const std::string& tenant_id);
 
     /**
      * @brief Stage a PROCESSING MEMORY replica for an existing key during

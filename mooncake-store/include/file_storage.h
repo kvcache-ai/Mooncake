@@ -130,15 +130,16 @@ class FileStorage {
 
     tl::expected<void, ErrorCode> PrefetchKeys(
         const std::vector<std::string>& keys, const std::vector<int64_t>& sizes,
-        bool* dram_pressure = nullptr,
-        PrefetchKeyCallback on_key_done = nullptr);
+        bool* dram_pressure = nullptr, PrefetchKeyCallback on_key_done = nullptr,
+        const std::string& tenant_id = "");
 
     /**
      * @brief Local SSD object size from the storage backend's authoritative
      * metadata (with tenant-scoped key fallback). Remote callers' size hints
      * must not be trusted for allocation sizing.
      */
-    std::optional<int64_t> LookupLocalObjectSize(const std::string& key) const;
+    std::optional<int64_t> LookupLocalObjectSize(
+        const std::string& key, const std::string& tenant_id = "") const;
 
     /**
      * @brief Releases buffer associated with a specific batch_id.

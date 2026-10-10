@@ -71,7 +71,7 @@ class FakeClient : public Client {
     tl::expected<PromotionAllocStartResponse, ErrorCode> PromotionAllocStart(
         const std::string& key, const std::string& tenant_id, uint64_t size,
         const std::vector<std::string>& preferred_segments) override {
-        (void)tenant_id;
+        last_alloc_tenant = tenant_id;
         (void)size;
         (void)preferred_segments;
         alloc_calls.fetch_add(1);
@@ -140,6 +140,7 @@ class FakeClient : public Client {
         return {};
     }
 
+    std::string last_alloc_tenant;
     std::atomic<int> heartbeat_calls{0};
     std::atomic<int> alloc_calls{0};
     std::atomic<int> write_calls{0};
@@ -392,6 +393,22 @@ TEST_F(FileStoragePromotionTest, PostAllocFailuresAllNotifyMaster) {
     EXPECT_EQ(got.count("k_alloc_fail"), 1u);
     EXPECT_EQ(got.count("k_load_fail"), 1u);
     EXPECT_EQ(got.count("k_notify_fail"), 1u);
+}
+
+TEST_F(FileStoragePromotionTest, PrefetchKeysForwardsTenantToPromotion) {
+    // A delegated prefetch carries the requester's tenant; the promotion
+    // chain must allocate under that tenant, not the holder's own
+    // ("default" here). The alloc fails without a backing file, but the
+    // tenant must reach the master-facing call intact.
+    bool dram_pressure = false;
+    auto res = file_storage->PrefetchKeys({"tk1"}, {1024}, &dram_pressure,
+                                          nullptr, "tenantA");
+    EXPECT_EQ(fake->last_alloc_tenant, "tenantA");
+
+    // Default (unset) tenant keeps the holder's own tenant.
+    dram_pressure = false;
+    res = file_storage->PrefetchKeys({"tk2"}, {1024}, &dram_pressure);
+    EXPECT_EQ(fake->last_alloc_tenant, "default");
 }
 
 TEST_F(FileStoragePromotionTest, PrefetchKeysStopsBatchOnDramPressure) {

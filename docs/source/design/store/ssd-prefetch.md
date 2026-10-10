@@ -23,7 +23,9 @@ is_exist(..., prefetch_to_memory=true)          # synchronous, no RPC added
       → 128-key chunks: BatchQueryReadOnly      # no lease, no promotion-on-hit
         → classify: SSD-only (LOCAL_DISK complete, no MEMORY), size > 0
           → local holder:  RegisterPrefetchTask + FileStorage::PrefetchKeys
-          → remote holder: prefetch_offload_object RPC → holder promotes locally
+          → remote holder: prefetch_offload_object RPC (carries the keys'
+            tenant; a shared holder promotes under the object's own tenant)
+            → holder promotes locally
 ```
 
 `PrefetchKeys` shares the promotion execution chain with promotion-on-hit
@@ -86,6 +88,16 @@ Per-client `PrefetchThrottle` (sharded, lock-free fast path per shard):
 batch-get**, not a fresh timeout per key. A long prefix spans tens of keys;
 applying a per-key wait serially multiplied the batch budget by the key
 count and produced tens-of-seconds TTFT p99 spikes when prefetch was on.
+
+The deadline is also **capped by the batch's earliest lease expiry** (minus a
+margin for the fallback transfer itself): the batch query grants every key's
+lease up front and transfers are submitted after the wait loop, so a wait
+outliving a lease would turn co-resident keys' successful transfers into
+`LEASE_EXPIRED`. On a missed wait, the SSD fallback re-queries the key with a
+fresh lease before transferring. On a successful wait, the descriptor used
+for the transfer comes from a lease-granting `Query()` — the read-only probe
+result's lease is expired by design and would fail the post-transfer lease
+check deterministically.
 
 Wait only when this process has a live local promotion (`kInFlight` /
 `kCompleted`). Do **not** wait on `kTriggered` (pool job still queued),
