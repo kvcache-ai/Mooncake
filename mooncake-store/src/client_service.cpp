@@ -1432,6 +1432,12 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
         return tl::unexpected(checksum_result.error());
     }
 
+    if (query_result.IsLeaseExpired()) {
+        LOG(WARNING) << "lease_expired_before_data_transfer_completed key="
+                     << object_key;
+        return tl::unexpected(ErrorCode::LEASE_EXPIRED);
+    }
+
     // Frequency admission: only promote frequently accessed keys to hot cache.
     // Skip when cache_used — data was already served from local cache, no need
     // to re-promote or increment the CMS counter.
@@ -1439,11 +1445,6 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
         ProcessSlicesAsync(object_key, slices, replica);
     }
 
-    if (query_result.IsLeaseExpired()) {
-        LOG(WARNING) << "lease_expired_before_data_transfer_completed key="
-                     << object_key;
-        return tl::unexpected(ErrorCode::LEASE_EXPIRED);
-    }
     // Log cache hit statistics
     if (hot_cache_ && replica.is_memory_replica()) {
         VLOG(1) << "Get completed: key=" << object_key
@@ -1633,18 +1634,6 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
                     continue;
                 }
                 results[index] = {};
-
-                // Frequency admission: only promote frequently accessed keys.
-                // Skip when cache was used (data served from local cache).
-                if (idx < op.replicas.size() &&
-                    idx < op.batched_slices.size() &&
-                    ShouldAdmitToHotCache(
-                        object_keys[index],
-                        idx < op.cache_used.size() && op.cache_used[idx])) {
-                    ProcessSlicesAsync(object_keys[index],
-                                       op.batched_slices[idx],
-                                       op.replicas[idx]);
-                }
             }
         }
     }
@@ -1657,6 +1646,23 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
             LOG(WARNING) << "lease_expired_before_data_transfer_completed key="
                          << object_keys[i];
             results[i] = tl::unexpected(ErrorCode::LEASE_EXPIRED);
+        }
+    }
+    // Only promote reads accepted by the final lease check.
+    if (hot_cache_) {
+        for (auto& [segment, op] : seg_to_op_map) {
+            for (size_t idx = 0; idx < op.key_indexes.size(); ++idx) {
+                const auto index = op.key_indexes[idx];
+                if (results[index].has_value() && idx < op.replicas.size() &&
+                    idx < op.batched_slices.size() &&
+                    ShouldAdmitToHotCache(
+                        object_keys[index],
+                        idx < op.cache_used.size() && op.cache_used[idx])) {
+                    ProcessSlicesAsync(object_keys[index],
+                                       op.batched_slices[idx],
+                                       op.replicas[idx]);
+                }
+            }
         }
     }
     return results;
@@ -1887,16 +1893,6 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                 continue;
             }
             results[index] = {};
-
-            // Frequency admission: only promote frequently accessed keys.
-            // Skip when cache was used (data served from local cache).
-            if (hot_cache_) {
-                auto slices_it = slices.find(key);
-                if (slices_it != slices.end() &&
-                    ShouldAdmitToHotCache(key, cache_used)) {
-                    ProcessSlicesAsync(key, slices_it->second, stored_replica);
-                }
-            }
         }
     }
 
@@ -1909,6 +1905,21 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
             LOG(WARNING) << "lease_expired_before_data_transfer_completed key="
                          << object_keys[i];
             results[i] = tl::unexpected(ErrorCode::LEASE_EXPIRED);
+        }
+    }
+
+    // Only promote reads accepted by the final lease check.
+    if (hot_cache_) {
+        for (auto& [index, key, future, stored_replica, cache_used] :
+             pending_transfers) {
+            if (!results[index].has_value()) {
+                continue;
+            }
+            auto slices_it = slices.find(key);
+            if (slices_it != slices.end() &&
+                ShouldAdmitToHotCache(key, cache_used)) {
+                ProcessSlicesAsync(key, slices_it->second, stored_replica);
+            }
         }
     }
 
