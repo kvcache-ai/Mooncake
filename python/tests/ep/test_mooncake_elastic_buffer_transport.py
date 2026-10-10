@@ -361,9 +361,9 @@ def test_active_rank_mask_uses_registered_mooncake_backend(
     buffer.num_ranks = 2
     buffer._device_index = 3
 
-    fake_ep = types.ModuleType("mooncake.ep")
-    fake_ep.get_active_ranks = lambda group: torch.tensor([1, 0])
-    monkeypatch.setitem(sys.modules, "mooncake.ep", fake_ep)
+    fake_pg = types.ModuleType("mooncake.pg")
+    fake_pg.get_active_ranks = lambda group: torch.tensor([1, 0])
+    monkeypatch.setitem(sys.modules, "mooncake.pg", fake_pg)
     monkeypatch.setattr(dist, "get_backend", lambda group: backend_name)
     synchronized_devices = []
     monkeypatch.setattr(torch.cuda, "synchronize", synchronized_devices.append)
@@ -379,7 +379,7 @@ def test_non_mooncake_group_uses_full_membership(monkeypatch, backend_name) -> N
     buffer.num_ranks = 2
     monkeypatch.setattr(dist, "get_backend", lambda _: backend_name)
     # No native EP/PG helper is available for these process-group backends.
-    monkeypatch.setitem(sys.modules, "mooncake.ep", types.ModuleType("mooncake.ep"))
+    monkeypatch.setitem(sys.modules, "mooncake.pg", types.ModuleType("mooncake.pg"))
     assert buffer._active_ranks_mask() == [1, 1]
 
 

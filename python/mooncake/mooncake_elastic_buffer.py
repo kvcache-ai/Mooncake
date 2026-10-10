@@ -469,14 +469,15 @@ class ElasticBuffer:
         torch.cuda.synchronize()
 
     def _active_ranks_mask(self) -> list:
-        # `mooncake.ep.get_active_ranks` is a Mooncake PG helper and performs a
+        # `mooncake.pg.get_active_ranks` is a Mooncake PG helper and performs a
         # native static cast to MooncakeBackend. PyTorch exposes custom process
         # groups through its base ProcessGroup type, so query the registered
         # backend name instead of relying on the Python wrapper's type name.
+        # Regular NCCL/Gloo groups treat every supplied rank as active.
         if "mooncake" not in str(dist.get_backend(self.backend)).lower():
             return [1] * self.num_ranks
 
-        from mooncake.ep import get_active_ranks
+        from mooncake.pg import get_active_ranks
 
         # Mooncake PG refreshes this CUDA mirror on its own stream. Wait for
         # that update before taking the host snapshot used for membership
