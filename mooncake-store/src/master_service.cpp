@@ -5370,7 +5370,8 @@ auto MasterService::AllocateReplicas(const std::string& key,
                             << host_ordered_segments.size();
                 }
             }
-            allocator_snapshot = allocator_access.SnapshotAllocatorManager();
+            allocator_snapshot = allocator_access.SnapshotAllocatorManager(
+                config.avoid_replicas_on_same_host);
         }
 
         auto allocation_result = allocation_strategy_->Allocate(
