@@ -1549,19 +1549,51 @@ else:
 ---
 
 #### batch_probe_key()
-Point-in-time existence check for multiple objects in a single batch
-operation, granting no read leases.
+Probe multiple objects, optionally selecting and leasing the last complete
+candidate. The default `"none"` policy remains a lease-free existence check.
 
 ```python
-def batch_probe_key(self, keys: List[str]) -> List[int]
+def batch_probe_key(
+    self, keys: List[str], policy: str = "none", candidate_size: int = 1
+) -> List[int]
 ```
 
 **Parameters:**
 - `keys` (List[str]): List of object identifiers to check
+- `policy` (str): `"none"` or `"LastHitOnly"`.
+- `candidate_size` (int): Number of consecutive keys forming each candidate.
+  Ignored for `"none"`. For a nonempty `"LastHitOnly"` request, it must be
+  positive and divide the number of keys exactly. Empty input returns `[]`.
 
 **Returns:**
-- `List[int]`: List of existence results (1=existed at probe time,
-0=not exists, -1=error)
+- Both policies return per-key existence results in the same length and order
+  as `keys`: 1=readable when checked, 0=missing or unreadable. Negative values
+  indicate errors, not cache misses.
+- With `"LastHitOnly"`, the last group of `candidate_size` all-1 results is
+  the selected, leased candidate. Earlier complete groups and incomplete
+  groups retain their existence results. If no group is all-1, no complete
+  candidate was selected.
+
+Candidates are ordered by the caller. A candidate is complete when every key
+has a readable replica. Earlier candidates may be missing or incomplete.
+The caller must include all required components,
+cache groups, and rank shards; Store does not infer prefix or model semantics.
+Duplicate key positions are allowed and must not alter the grouping.
+
+The Master first probes without leases, then rechecks and leases complete
+candidates in reverse order using the existing per-shard lookup. Recheck
+results replace that candidate's initial results; a candidate that loses a
+member cannot remain all-1. A failed candidate may retain partial leases
+while selection falls back to an earlier candidate. This is not an atomic
+snapshot of all keys, and unselected existence results are not lease guarantees.
+
+Selected objects receive the Master's default read-lease TTL, protecting them
+from normal eviction while the leases remain valid; soft-pin deadlines are
+unchanged. The policy does not protect against lease expiry, forced removal,
+or replica loss. Existing shared group leases (or a physical key repeated
+outside the selected candidate) may also protect unselected positions. No
+persistent group registration is added. Invalid candidate sizes return
+per-key parameter errors; unknown policy strings raise `ValueError` in Python.
 
 **Example:**
 ```python
@@ -1570,6 +1602,29 @@ results = store.batch_probe_key(keys)
 candidates = [key for key, exists in zip(keys, results) if exists == 1]
 print("Probed candidates (unprotected from eviction):", candidates)
 ```
+
+For checkpoint selection, first use `batch_is_exist()` to protect the required
+KV data and determine its usable boundary. Pass only valid checkpoint
+candidates within that boundary, in increasing resume-position order:
+
+```python
+keys = ["checkpoint128.rank0", "checkpoint128.rank1",
+        "checkpoint256.rank0", "checkpoint256.rank1"]
+results = store.batch_probe_key(keys, policy="LastHitOnly", candidate_size=2)
+if any(result < 0 for result in results):
+    raise RuntimeError("Checkpoint lookup failed")
+selected = next((i for i in reversed(range(len(keys) // 2))
+                 if all(result == 1 for result in results[i * 2:(i + 1) * 2])), None)
+# Both complete: [1, 1, 1, 1] selects 1.
+# Last incomplete: [1, 1, 1, 0] selects 0.
+# Load only the selected checkpoint, with the KV prefix it needs.
+```
+
+**Upgrade note:** the policy changes the `BatchProbeKey` Master RPC and the
+DummyClient-to-RealClient batch-probe RPC signatures. Upgrade the Master,
+client daemon, and clients together; mixed-version batch-probe calls are not
+supported. Default Python arguments preserve the old call syntax, not wire
+compatibility. `is_exist()`, `batch_is_exist()`, and `probe_key()` are unchanged.
 
 ---
 

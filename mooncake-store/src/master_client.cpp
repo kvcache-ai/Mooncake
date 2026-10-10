@@ -560,12 +560,13 @@ tl::expected<bool, ErrorCode> MasterClient::ProbeKey(
 }
 
 std::vector<tl::expected<bool, ErrorCode>> MasterClient::BatchProbeKey(
-    const std::vector<std::string>& object_keys) {
+    const std::vector<std::string>& object_keys,
+    const GrantLeasePolicy& policy) {
     ScopedVLogTimer timer(1, "MasterClient::BatchProbeKey");
     timer.LogRequest("keys_count=", object_keys.size());
 
     auto result = invoke_batch_rpc<&WrappedMasterService::BatchProbeKey, bool>(
-        object_keys.size(), object_keys, tenant_id_.value());
+        object_keys.size(), policy, object_keys, tenant_id_.value());
     timer.LogResponse("result=", result.size(), " keys");
     return result;
 }

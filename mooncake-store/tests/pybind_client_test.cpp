@@ -331,6 +331,90 @@ TEST_F(RealClientTest, SessionRangesReadDfsAndPropagateShortRead) {
 }
 
 #ifdef MOONCAKE_TEST_CUDA_H2D
+TEST_F(RealClientTest, LastHitOnlyGpuCheckpointRoundTrip) {
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
+        GTEST_SKIP() << "CUDA device is unavailable";
+    }
+
+    ScopedEnvVar local_memcpy("MC_STORE_MEMCPY", "1");
+    StartMasterAndSetupClient();
+    ASSERT_FALSE(HasFatalFailure());
+
+    // Three synthetic TP8 checkpoints, each with two state components per
+    // rank. The last checkpoint is missing one component.
+    constexpr size_t kCandidateSize = 16;
+    constexpr size_t kKeyCount = 3 * kCandidateSize;
+    constexpr size_t kPartSize = 4096;
+    constexpr size_t kPayloadSize = kKeyCount * kPartSize;
+    std::vector<char> source(kPayloadSize);
+    for (size_t i = 0; i < source.size(); ++i) {
+        source[i] = static_cast<char>(i % 251);
+    }
+    void* allocation = nullptr;
+    ASSERT_EQ(cudaMalloc(&allocation, 2 * kPayloadSize), cudaSuccess);
+    bool registered = false;
+    auto cleanup = [this, &registered](void* ptr) {
+        if (registered) EXPECT_EQ(py_client_->unregister_buffer(ptr), 0);
+        EXPECT_EQ(cudaFree(ptr), cudaSuccess);
+    };
+    std::unique_ptr<void, decltype(cleanup)> gpu_owner(allocation, cleanup);
+    ASSERT_EQ(cudaMemcpy(allocation, source.data(), kPayloadSize,
+                         cudaMemcpyHostToDevice),
+              cudaSuccess);
+    ASSERT_EQ(py_client_->register_buffer(allocation, 2 * kPayloadSize), 0);
+    registered = true;
+
+    std::vector<std::string> keys;
+    std::vector<void*> buffers;
+    for (size_t i = 0; i < kKeyCount; ++i) {
+        keys.push_back("gpu-probe-" + std::to_string(i));
+        if (i + 1 < kKeyCount) {
+            buffers.push_back(static_cast<char*>(allocation) + i * kPartSize);
+        }
+    }
+    const std::vector<std::string> present(keys.begin(), keys.end() - 1);
+    ASSERT_EQ(
+        py_client_->batch_put_from(
+            present, buffers, std::vector<size_t>(present.size(), kPartSize),
+            {.replica_num = 1}),
+        std::vector<int>(present.size(), 0));
+
+    auto expected = std::vector<int>(kKeyCount, 1);
+    expected.back() = 0;
+    EXPECT_EQ(py_client_->batchProbeKey(keys), expected);
+    ASSERT_EQ(py_client_->batchProbeKey(
+                  keys, {ProbeLeaseMode::LastHitOnly, kCandidateSize}),
+              expected);
+
+    const std::vector<std::string> selected(keys.begin() + kCandidateSize,
+                                            keys.begin() + 2 * kCandidateSize);
+    for (const auto& key : selected) {
+        EXPECT_EQ(py_client_->remove(key), toInt(ErrorCode::OBJECT_HAS_LEASE));
+    }
+    // Existence results remain true for unselected keys without leasing them.
+    EXPECT_EQ(py_client_->remove(keys.front()), 0);
+    EXPECT_EQ(py_client_->remove(keys[kKeyCount - 2]), 0);
+
+    auto* destination = static_cast<char*>(allocation) + kPayloadSize;
+    ASSERT_EQ(cudaMemset(destination, 0, kCandidateSize * kPartSize),
+              cudaSuccess);
+    buffers.clear();
+    for (size_t i = 0; i < kCandidateSize; ++i) {
+        buffers.push_back(destination + i * kPartSize);
+    }
+    ASSERT_EQ(
+        py_client_->batch_get_into(
+            selected, buffers, std::vector<size_t>(kCandidateSize, kPartSize)),
+        std::vector<int64_t>(kCandidateSize, kPartSize));
+    std::vector<char> actual(kCandidateSize * kPartSize);
+    ASSERT_EQ(cudaMemcpy(actual.data(), destination, actual.size(),
+                         cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    EXPECT_TRUE(std::equal(actual.begin(), actual.end(),
+                           source.begin() + kCandidateSize * kPartSize));
+}
+
 TEST_F(RealClientTest, SessionRangesReadDfsIntoGpuUsesPinnedArena) {
     int device_count = 0;
     if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {

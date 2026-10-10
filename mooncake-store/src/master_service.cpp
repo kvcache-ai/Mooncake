@@ -3312,8 +3312,55 @@ std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchExistKey(
 }
 
 std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchProbeKey(
-    const std::vector<std::string>& keys, const TenantId& tenant_id) {
-    return BatchExistKeyImpl(keys, tenant_id, /*grant_lease=*/false);
+    const GrantLeasePolicy& policy, const std::vector<std::string>& keys,
+    const TenantId& tenant_id) {
+    if (keys.empty()) return {};
+    std::string_view invalid_reason;
+    if (policy.lease_mode != ProbeLeaseMode::None &&
+        policy.lease_mode != ProbeLeaseMode::LastHitOnly) {
+        invalid_reason = "unknown lease mode";
+    } else if (policy.lease_mode == ProbeLeaseMode::LastHitOnly) {
+        if (policy.candidate_size == 0) {
+            invalid_reason = "candidate_size is zero";
+        } else if (keys.size() % policy.candidate_size != 0) {
+            invalid_reason = "key count is not divisible by candidate_size";
+        }
+    }
+    if (!invalid_reason.empty()) {
+        LOG(WARNING) << "BatchProbeKey: " << invalid_reason
+                     << ", lease_mode=" << static_cast<int>(policy.lease_mode)
+                     << ", candidate_size=" << policy.candidate_size
+                     << ", key_count=" << keys.size();
+        return std::vector<tl::expected<bool, ErrorCode>>(
+            keys.size(), tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+    }
+
+    auto results = BatchExistKeyImpl(keys, tenant_id, /*grant_lease=*/false);
+    if (policy.lease_mode == ProbeLeaseMode::None) return results;
+
+    const auto is_readable = [](const auto& result) {
+        return result.has_value() && result.value();
+    };
+    for (size_t end = keys.size(); end > 0; end -= policy.candidate_size) {
+        const size_t begin = end - policy.candidate_size;
+        if (!std::all_of(results.begin() + begin, results.begin() + end,
+                         is_readable)) {
+            continue;
+        }
+
+        const std::vector<std::string> candidate(keys.begin() + begin,
+                                                 keys.begin() + end);
+        auto leased =
+            BatchExistKeyImpl(candidate, tenant_id, /*grant_lease=*/true);
+        // Recheck under the existing per-shard locks. Publish the fresh
+        // results so a candidate lost since probing cannot remain all-true.
+        // Failed candidates may retain partial leases until their TTL expires.
+        std::copy(leased.begin(), leased.end(), results.begin() + begin);
+        if (std::all_of(leased.begin(), leased.end(), is_readable)) {
+            break;
+        }
+    }
+    return results;
 }
 
 std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchExistKeyImpl(

@@ -152,13 +152,14 @@ class MasterClient {
         const std::vector<std::string>& object_keys);
 
     /**
-     * @brief Point-in-time existence check for multiple objects, granting no
-     * read leases
+     * @brief Probe multiple objects, optionally leasing the last complete
+     * candidate. LastHitOnly leases the last all-true candidate in the results.
      * @param object_keys Vector of keys to query
-     * @return Vector containing existence status for each key
+     * @return Per-key existence results in input order
      */
     [[nodiscard]] std::vector<tl::expected<bool, ErrorCode>> BatchProbeKey(
-        const std::vector<std::string>& object_keys);
+        const std::vector<std::string>& object_keys,
+        const GrantLeasePolicy& policy = {});
 
     /**
      * @brief Calculate Store-observed cache reuse metrics

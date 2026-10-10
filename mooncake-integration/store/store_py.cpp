@@ -2620,15 +2620,31 @@ PYBIND11_MODULE(store, m) {
         .def(
             "batch_probe_key",
             [](MooncakeStorePyWrapper &self,
-               const std::vector<std::string> &keys) {
+               const std::vector<std::string> &keys, const std::string &policy,
+               uint64_t candidate_size) {
+                GrantLeasePolicy lease_policy;
+                if (policy == "none") {
+                    lease_policy.lease_mode = ProbeLeaseMode::None;
+                } else if (policy == "LastHitOnly") {
+                    lease_policy.lease_mode = ProbeLeaseMode::LastHitOnly;
+                } else {
+                    throw py::value_error("Unknown batch_probe_key policy: " +
+                                          policy);
+                }
+                lease_policy.candidate_size = candidate_size;
+                if (!self.is_client_initialized()) {
+                    return std::vector<int>(
+                        keys.size(), to_py_ret(ErrorCode::INVALID_PARAMS));
+                }
                 py::gil_scoped_release release;
-                return self.store_->batchProbeKey(keys);
+                return self.store_->batchProbeKey(keys, lease_policy);
             },
-            py::arg("keys"),
-            "Point-in-time existence check for multiple objects that grants "
-            "no read leases. Returns list of results: 1 if existed at the "
-            "time of the call, 0 if not exists, -1 if error. Objects may "
-            "still be evicted before a subsequent get.")
+            py::arg("keys"), py::arg("policy") = "none",
+            py::arg("candidate_size") = 1,
+            "Per-key existence results: 1 if readable, 0 if missing, and "
+            "negative values on error. none grants no leases. LastHitOnly "
+            "leases the last all-1 group of candidate_size results; failed "
+            "candidates may retain partial leases after a concurrent eviction.")
         .def("close",
              [](MooncakeStorePyWrapper &self) {
                  if (!self.store_) return 0;
