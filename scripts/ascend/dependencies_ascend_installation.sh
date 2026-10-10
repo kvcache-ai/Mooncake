@@ -46,6 +46,7 @@ if command -v apt-get &> /dev/null; then
             git \
             wget \
             libibverbs-dev \
+            libaio-dev \
             libgoogle-glog-dev \
             libjsoncpp-dev \
             libunwind-dev \
@@ -77,6 +78,7 @@ elif command -v yum &> /dev/null; then
             gflags-devel \
             glog-devel \
             libibverbs-devel \
+            libaio-devel \
             numactl-devel \
             boost-devel \
             openssl-devel \
