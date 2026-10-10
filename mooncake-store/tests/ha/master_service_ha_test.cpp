@@ -1373,9 +1373,12 @@ TEST_F(MasterServiceHATest, FailedRestoreDoesNotAdvanceReplicaIdCounter) {
     valid.metadata.replicas.front()
         .get_memory_descriptor()
         .buffer_descriptor.buffer_address_ = kDefaultSegmentBase + 4096;
-    auto invalid = MakeStandbyObject("replica_id_counter_invalid",
-                                     "unknown_replica_id_endpoint");
+    auto invalid =
+        MakeStandbyObject("replica_id_counter_invalid", "replica_id_counter");
     invalid.metadata.replicas.front().id = first.front().id + 2000;
+    invalid.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.size_ = 2048;
     auto result = service.RestoreFromStandbySnapshot(
         {valid, invalid}, 7, {MakeStandbyMemorySegment("replica_id_counter")});
     ASSERT_FALSE(result.has_value());
@@ -1458,8 +1461,10 @@ TEST_F(MasterServiceHATest, RestoreFailureKeepsExistingState) {
     const auto metric_after_restore =
         MasterMetricManager::instance().get_allocated_mem_size();
 
-    auto invalid =
-        MakeStandbyObject("standby_restore_invalid", "unknown_endpoint");
+    auto invalid = MakeStandbyObject("standby_restore_invalid", endpoint);
+    invalid.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.size_ = 2048;
     auto result = service.RestoreFromStandbySnapshot(
         {invalid}, 7, {MakeStandbyMemorySegment(endpoint)});
 
@@ -1475,6 +1480,75 @@ TEST_F(MasterServiceHATest, RestoreFailureKeepsExistingState) {
               metric_after_restore);
     ASSERT_TRUE(service.ReMountSegment({MakeSegment(endpoint)}, generate_uuid())
                     .has_value());
+}
+
+TEST_F(MasterServiceHATest, RestoreFromStandbyDropsReplicasOnUnloadedSegments) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+
+    const std::string endpoint = "restore_drop_live_segment";
+    const std::string stale_endpoint = "restore_drop_unloaded_segment";
+    auto object = MakeStandbyObject("restore_drop_key", endpoint);
+    object.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    auto stale = MakeStandbyMemoryReplica(stale_endpoint);
+    stale.id = 2;
+    stale.get_memory_descriptor().buffer_descriptor.buffer_address_ =
+        kDefaultSegmentBase + 4096;
+    object.metadata.replicas.push_back(std::move(stale));
+    auto stale_tombstone = MakeStandbyMemoryReplica(stale_endpoint);
+    stale_tombstone.id = 3;
+    stale_tombstone.status = ReplicaStatus::REMOVED;
+    object.metadata.replicas.push_back(std::move(stale_tombstone));
+
+    ASSERT_TRUE(service
+                    .RestoreFromStandbySnapshot(
+                        {object}, 7, {MakeStandbyMemorySegment(endpoint)})
+                    .has_value());
+
+    auto replicas = ReplicaDescriptorsForTesting(service, kDefaultTenant,
+                                                 "restore_drop_key");
+    ASSERT_EQ(replicas.size(), 1);
+    EXPECT_EQ(replicas.front().id, 1);
+    EXPECT_EQ(replicas.front()
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              endpoint);
+}
+
+TEST_F(MasterServiceHATest,
+       RestoreFromStandbySkipsObjectWhenAllReplicasAreStale) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+
+    const std::string endpoint = "restore_skip_live_segment";
+    auto good = MakeStandbyObject("restore_skip_good", endpoint);
+    good.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    auto stale_only = MakeStandbyObject("restore_skip_stale",
+                                        "restore_skip_unloaded_segment");
+    stale_only.metadata.replicas.front().id = 2;
+    auto empty = MakeStandbyObject("restore_skip_empty", endpoint);
+    empty.metadata.replicas.clear();
+
+    ASSERT_TRUE(
+        service
+            .RestoreFromStandbySnapshot({good, stale_only, empty}, 7,
+                                        {MakeStandbyMemorySegment(endpoint)})
+            .has_value());
+
+    EXPECT_EQ(
+        ReplicaCountForTesting(service, kDefaultTenant, "restore_skip_good"),
+        1);
+    EXPECT_FALSE(HasMetadataEntryForTesting(service, kDefaultTenant,
+                                            "restore_skip_stale"));
+    EXPECT_TRUE(HasMetadataEntryForTesting(service, kDefaultTenant,
+                                           "restore_skip_empty"));
+    EXPECT_EQ(
+        ReplicaCountForTesting(service, kDefaultTenant, "restore_skip_empty"),
+        0);
 }
 
 TEST_F(MasterServiceHATest,
