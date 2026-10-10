@@ -481,13 +481,21 @@ std::string renderText(const DiagnosticSnapshot& snapshot) {
 
 int diagnosticExitCode(const DiagnosticSnapshot& snapshot,
                        bool warnings_are_errors) {
+    int code = 0;
     for (const auto& check : snapshot.checks) {
-        if (check.outcome == CheckOutcome::kFail ||
-            (warnings_are_errors && check.outcome == CheckOutcome::kWarn)) {
-            return 1;
+        if (check.outcome == CheckOutcome::kFail) {
+            if (check.id == kInternalErrorCheckId) {
+                return 4;
+            }
+            const bool collector = check.id == kCollectorProcessCheckId ||
+                                   check.id == kCollectorMissingCheckId;
+            code = std::max(code, collector ? 3 : 1);
+        } else if (warnings_are_errors &&
+                   check.outcome == CheckOutcome::kWarn) {
+            code = std::max(code, 1);
         }
     }
-    return 0;
+    return code;
 }
 
 DiagnosticSnapshot makeVersionSnapshot() {

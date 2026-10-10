@@ -17,6 +17,8 @@
 #include <gtest/gtest.h>
 
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace mooncake::tent::diagnostics {
 namespace {
@@ -263,6 +265,45 @@ TEST(DiagnosticExitCodeTest, FailuresAndStrictWarningsReturnOne) {
     snapshot.checks.push_back(
         {"failure", CheckOutcome::kFail, "failure", {}, {}});
     EXPECT_EQ(diagnosticExitCode(snapshot), 1);
+}
+
+TEST(DiagnosticExitCodeTest, CollectorAndInternalFailuresTakePrecedence) {
+    const auto snapshotWith = [](std::vector<DiagnosticCheck> checks) {
+        DiagnosticSnapshot snapshot;
+        snapshot.checks = std::move(checks);
+        return snapshot;
+    };
+    const DiagnosticCheck failure{
+        "rdma.port.state", CheckOutcome::kFail, "port down", {}, {}};
+    const DiagnosticCheck warning{
+        "host.memlock", CheckOutcome::kWarn, "memlock limited", {}, {}};
+    const DiagnosticCheck process{std::string(kCollectorProcessCheckId),
+                                  CheckOutcome::kFail,
+                                  "probe timed out",
+                                  {},
+                                  {}};
+    const DiagnosticCheck missing{std::string(kCollectorMissingCheckId),
+                                  CheckOutcome::kFail,
+                                  "probe not found",
+                                  {},
+                                  {}};
+    const DiagnosticCheck internal{std::string(kInternalErrorCheckId),
+                                   CheckOutcome::kFail,
+                                   "internal error",
+                                   {},
+                                   {}};
+    DiagnosticCheck process_passed = process;
+    process_passed.outcome = CheckOutcome::kPass;
+
+    EXPECT_EQ(diagnosticExitCode(snapshotWith({failure})), 1);
+    EXPECT_EQ(diagnosticExitCode(snapshotWith({process_passed})), 0);
+    EXPECT_EQ(diagnosticExitCode(snapshotWith({failure, process})), 3);
+    EXPECT_EQ(diagnosticExitCode(snapshotWith({missing, failure})), 3);
+    EXPECT_EQ(diagnosticExitCode(snapshotWith({internal, process})), 4);
+    EXPECT_EQ(diagnosticExitCode(snapshotWith({process, failure, internal})),
+              4);
+    EXPECT_EQ(diagnosticExitCode(snapshotWith({warning}), true), 1);
+    EXPECT_EQ(diagnosticExitCode(snapshotWith({warning, process}), true), 3);
 }
 
 TEST(DiagnosticVersionTest, SnapshotIsOfflineBuildMetadata) {

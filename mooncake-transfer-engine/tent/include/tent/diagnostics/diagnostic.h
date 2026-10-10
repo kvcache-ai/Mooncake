@@ -27,6 +27,14 @@ namespace mooncake::tent::diagnostics {
 
 inline constexpr std::uint32_t kDiagnosticSchemaVersion = 1;
 
+// Checks with a fixed exit-code meaning. A failed collector check means a
+// required collector process or service was unavailable, crashed or timed
+// out; a failed internal check means the tool itself failed.
+inline constexpr std::string_view kCollectorProcessCheckId = "engine.process";
+inline constexpr std::string_view kCollectorMissingCheckId =
+    "tool.probe_missing";
+inline constexpr std::string_view kInternalErrorCheckId = "tool.internal";
+
 enum class CheckOutcome { kPass, kWarn, kFail, kSkip };
 enum class RedactionMode { kDefault, kStrict, kNone };
 enum class ValueSensitivity { kPublic, kDeployment, kSecret, kRawAddress };
@@ -120,6 +128,11 @@ std::string_view toString(RedactionMode mode);
 nlohmann::json toJson(const DiagnosticSnapshot& snapshot);
 std::string renderJson(const DiagnosticSnapshot& snapshot, int indent = 2);
 std::string renderText(const DiagnosticSnapshot& snapshot);
+
+// Returns 4 if an internal check failed, otherwise 3 if a collector check
+// failed, otherwise 1 if any check failed (or warned, with
+// warnings_are_errors), otherwise 0. Exit code 2 is left to the command-line
+// parser for usage errors.
 int diagnosticExitCode(const DiagnosticSnapshot& snapshot,
                        bool warnings_are_errors = false);
 
