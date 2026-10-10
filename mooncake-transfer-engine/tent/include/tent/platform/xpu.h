@@ -30,14 +30,16 @@ namespace tent {
 // platform sources are compiled with the Intel DPC++ compiler (icpx); the SYCL
 // dependency is confined to platform_xpu and never leaks into this header.
 //
-// In the MVP, XPU VRAM cannot be reached by the NIC, so there is no direct
-// device transport. This platform provides the device-side building blocks:
-// USM allocation ("xpu:N"), pointer classification, and the VRAM<->host copy()
-// primitive. These are wired into the transport-layer staging path so
-// getTypeEnum / isGpuType / findStagingPolicy let ProxyManager chain the
-// VRAM<->host hop (executed by XpuTransport via copy()) and the host<->host hop
-// end-to-end over the network. Direct VRAM RDMA (dma-buf) and PCIe P2P are
-// future work.
+// This platform provides the device-side building blocks: USM allocation
+// ("xpu:N"), pointer classification, the VRAM<->host copy() primitive, and
+// dma-buf export of device allocations. When the RNIC supports
+// ibv_reg_dmabuf_mr, RdmaContext registers exported XPU buffers directly and
+// the engine moves VRAM<->VRAM / VRAM<->DRAM data over RDMA without a host
+// bounce (GPUDirect-style). Buffers that cannot be exported, or hosts without
+// dma-buf capable verbs, keep using the staging path: getTypeEnum / isGpuType /
+// findStagingPolicy let ProxyManager chain the VRAM<->host hop (executed by
+// XpuTransport via copy()) and the host<->host hop end-to-end over the
+// network. PCIe P2P between XPUs is future work.
 class XpuPlatform : public CpuPlatform {
    public:
     explicit XpuPlatform(std::shared_ptr<Config> config)
@@ -66,6 +68,13 @@ class XpuPlatform : public CpuPlatform {
 
     const std::vector<RangeLocation> getLocation(
         void *start, size_t len, bool skip_prefault = false) override;
+
+    // Level Zero dma-buf export of the USM device allocation containing
+    // [addr, addr+length). InvalidArgument for non-XPU pointers so the caller
+    // registers them as host memory; InternalError when the driver refuses or
+    // when a foreign allocation sits in a runtime-managed USM pool (its
+    // dma-buf is shared, so the allocation cannot be registered on its own).
+    Status exportDmabuf(void *addr, size_t length, DmabufExport &out) override;
 
     const std::string type() const override { return "xpu"; }
 };

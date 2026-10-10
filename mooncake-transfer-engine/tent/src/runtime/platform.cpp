@@ -65,6 +65,14 @@ Status Platform::synchronizeDevices(const Topology* topology) {
     return Status::OK();
 }
 
+Status Platform::exportDmabuf(void* addr, size_t length, DmabufExport& out) {
+    (void)addr;
+    (void)length;
+    out = DmabufExport{};
+    return Status::NotImplemented(
+        "dma-buf export is not supported by this platform" LOC_MARK);
+}
+
 std::vector<int> Platform::topologyDeviceIndices(const Topology* topology,
                                                  Topology::MemType mem_type) {
     std::vector<int> devices;

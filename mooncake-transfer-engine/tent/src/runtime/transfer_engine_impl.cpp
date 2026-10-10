@@ -1436,6 +1436,21 @@ Status TransferEngineImpl::validateTransportHint(const Request& req,
 
 SelectionResult TransferEngineImpl::getTransportType(const Request& request,
                                                      int transport_index) {
+    bool xpu_direct = false;
+    auto result = planTransport(request, transport_index, true, &xpu_direct);
+    // The direct plan left the XPU buffers unstaged, but the selector policy
+    // admitted no transport able to address device memory (e.g. a policy that
+    // permits only host transports). Fall back to the staged plan, where the
+    // host stage buffers can be carried by any host-DRAM transport.
+    if (result.transport == UNSPEC && xpu_direct)
+        result = planTransport(request, transport_index, false, nullptr);
+    return result;
+}
+
+SelectionResult TransferEngineImpl::planTransport(const Request& request,
+                                                  int transport_index,
+                                                  bool allow_xpu_direct,
+                                                  bool* xpu_direct) {
     // Owning reference: keeps the snapshot alive while we read through it.
     SegmentDescRef desc;
     if (request.target_id == LOCAL_SEGMENT_ID) {
@@ -1449,9 +1464,16 @@ SelectionResult TransferEngineImpl::getTransportType(const Request& request,
 
     const TransportType hint = request.transport_hint;
 
-    // XPU has no direct peer-memory path. Plan staging before requiring a
-    // direct device route: HP TCP (and non-GDR RDMA) only advertises DRAM
-    // capability. Keep the original memory types for policy matching.
+    // XPU memory is reachable by the NIC only when it was registered through
+    // dma-buf (RDMA present on the buffer) and the RDMA transport advertises
+    // device capability; then it routes like any GPUDirect buffer. Otherwise
+    // plan staging before requiring a direct device route: HP TCP (and
+    // non-GDR RDMA) only advertises DRAM capability. The dma-buf direct route
+    // exists on RDMA alone, so a request hinted to another transport is
+    // staged even when direct would be possible; getTransportType() likewise
+    // re-plans staged when the direct plan finds no route (e.g. a policy that
+    // only authorizes a DRAM-only transport). Keep the original memory types
+    // for policy matching.
     std::vector<std::string> xpu_staging_params;
     std::vector<TransportType> staging_transports;
     if (desc->type == SegmentType::Memory &&
@@ -1459,7 +1481,13 @@ SelectionResult TransferEngineImpl::getTransportType(const Request& request,
         auto* entry = desc->findBuffer(request.target_offset, request.length);
         if (!entry) return SelectionResult{};
         auto remote_mtype = getTypeEnum(LocationParser(entry->location).type());
-        if (local_mtype == MTYPE_XPU || remote_mtype == MTYPE_XPU) {
+        const bool xpu_side =
+            local_mtype == MTYPE_XPU || remote_mtype == MTYPE_XPU;
+        const bool direct =
+            xpu_side && allow_xpu_direct && (hint == UNSPEC || hint == RDMA) &&
+            xpuDirectRdmaReady(request, entry, local_mtype, remote_mtype);
+        if (xpu_direct) *xpu_direct = direct;
+        if (xpu_side && !direct) {
             findStagingPolicy(request, xpu_staging_params);
             if (xpu_staging_params.empty()) return SelectionResult{};
             // A staged side is replaced by a freshly registered host stage
@@ -1845,6 +1873,37 @@ std::vector<RequestBoundaryInfo> resolveRequestBoundaries(
     return boundaries;
 }
 
+bool TransferEngineImpl::xpuDirectRdmaReady(const Request& request,
+                                            const BufferDesc* remote_entry,
+                                            MemoryType local_mtype,
+                                            MemoryType remote_mtype) {
+    if (!remote_entry || !transport_list_[RDMA]) return false;
+    const auto& caps = transport_list_[RDMA]->capabilities();
+    const bool local_gpu = isGpuType(local_mtype);
+    const bool remote_gpu = isGpuType(remote_mtype);
+    bool cap_ok;
+    if (local_gpu && remote_gpu)
+        cap_ok = caps.gpu_to_gpu;
+    else if (local_gpu)
+        cap_ok = caps.gpu_to_dram;
+    else if (remote_gpu)
+        cap_ok = caps.dram_to_gpu;
+    else
+        cap_ok = caps.dram_to_dram;
+    if (!cap_ok) return false;
+
+    auto carries_rdma = [](const BufferDesc* buffer) {
+        return buffer &&
+               std::find(buffer->transports.begin(), buffer->transports.end(),
+                         RDMA) != buffer->transports.end();
+    };
+    if (!carries_rdma(remote_entry)) return false;
+    auto local_desc = metadata_->segmentManager().getLocal();
+    if (!local_desc) return false;
+    return carries_rdma(
+        local_desc->findBuffer((uint64_t)request.source, request.length));
+}
+
 void TransferEngineImpl::findStagingPolicy(const Request& request,
                                            std::vector<std::string>& policy) {
     if (request.target_id == LOCAL_SEGMENT_ID) return;
@@ -1944,13 +2003,17 @@ void TransferEngineImpl::findStagingPolicy(const Request& request,
             policy.push_back(desc->getMemory().topology.findNearMem(remote));
         }
     }
-    // case 4: Intel XPU. VRAM is not NIC-addressable, so any hop touching XPU
-    // memory is staged through host DRAM: XpuTransport performs the local
-    // VRAM<->host copy (via the SYCL backend) and the host<->host hop is
-    // carried by whatever host-DRAM network transport is present. We gate on
-    // RDMA/TCP/HP_TCP (the cross stage is routed by capability, so TCP is
-    // selected when RDMA is absent) and require XpuTransport (the local
-    // VRAM<->host executor), mirroring how the CUDA cases gate on NVLINK.
+    // case 4: Intel XPU. VRAM is NIC-addressable only through a dma-buf RDMA
+    // registration; getTransportType skips this policy entirely when
+    // xpuDirectRdmaReady() holds, so reaching here means at least one side
+    // must be staged through host DRAM (no dma-buf support, a buffer whose
+    // export failed, or a host-only transport such as TCP was selected):
+    // XpuTransport performs the local VRAM<->host copy (via the SYCL backend)
+    // and the host<->host hop is carried by whatever host-DRAM network
+    // transport is present. We gate on RDMA/TCP/HP_TCP (the cross stage is
+    // routed by capability, so TCP is selected when RDMA is absent) and
+    // require XpuTransport (the local VRAM<->host executor), mirroring how the
+    // CUDA cases gate on NVLINK.
     // Every device side is staged, including a mixed CUDA/ROCm/TPU peer whose
     // direct-DMA capability is unknown here; a host DRAM side is not (empty
     // stage location). A device side without a host DRAM stage location in
