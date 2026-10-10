@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <sstream>
+#include <stdexcept>
 #include <transfer_engine.h>
 
 namespace mooncake {
@@ -65,6 +66,21 @@ constexpr int kTopkShadowSlots = 8;
 constexpr size_t kTopkShadowBytes = static_cast<size_t>(kTopkShadowMaxTokens) *
                                     kTopkShadowMaxTopk * sizeof(int64_t);
 
+int validate_rank(int rank, int num_ranks) {
+    if (num_ranks <= 0 || num_ranks > MAX_QP_COUNT || rank < 0 ||
+        rank >= num_ranks) {
+        throw std::invalid_argument("invalid EP rank or world size");
+    }
+    return rank;
+}
+
+int64_t validate_buffer_size(int64_t num_ep_buffer_bytes) {
+    if (num_ep_buffer_bytes <= 0) {
+        throw std::invalid_argument("EP buffer size must be positive");
+    }
+    return num_ep_buffer_bytes;
+}
+
 int64_t* topk_shadow(void* workspace, int shadow_slot, int num_experts) {
     auto* base = reinterpret_cast<uint8_t*>(workspace) +
                  2 * static_cast<size_t>(num_experts) * sizeof(int);
@@ -102,9 +118,9 @@ static bool macaHostPhaseFenceCoversPeers() {
 MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
                                    int64_t num_ep_buffer_bytes,
                                    bool disable_p2p, TransferEngine* engine)
-    : rank(rank),
+    : rank(validate_rank(rank, num_ranks)),
       num_ranks(num_ranks),
-      num_ep_buffer_bytes(num_ep_buffer_bytes),
+      num_ep_buffer_bytes(validate_buffer_size(num_ep_buffer_bytes)),
       p2p_enabled_(!disable_p2p),
       comm_stream(create_comm_stream()) {
     USE_QP_COUNT = MAX_QP_COUNT / num_ranks * num_ranks;
