@@ -110,7 +110,10 @@ TEST_P(HotStandbySnapshotBootstrapTest,
     HAMetricManager::instance().reset_snapshot_runtime(true);
     HAMetricManager::instance().update_snapshot_runtime(
         [](auto& metrics) { metrics.snapshot_bytes = 100; });
+    HAMetricManager::instance().set_oplog_applied_sequence_id(0);
     ASSERT_EQ(ErrorCode::OK, service.Start("", "", cluster_id_));
+    EXPECT_EQ(static_cast<int64_t>(descriptor_.last_included_seq),
+              HAMetricManager::instance().get_oplog_applied_sequence_id());
     const auto metrics = HAMetricManager::instance().get_snapshot_runtime();
     EXPECT_FALSE(metrics.enabled);
     EXPECT_EQ(0u, metrics.snapshot_bytes);
@@ -141,9 +144,11 @@ TEST_P(HotStandbySnapshotBootstrapTest,
     HotStandbyService service(MakeSnapshotOnlyConfig());
     service.SetSnapshotProvider(std::move(provider.value()));
 
+    HAMetricManager::instance().set_oplog_applied_sequence_id(42);
     ASSERT_EQ(ErrorCode::OK, service.Start("", "", cluster_id_));
     EXPECT_EQ(StandbyState::WATCHING, service.GetState());
     EXPECT_EQ(0u, service.GetMetadataCount());
+    EXPECT_EQ(0, HAMetricManager::instance().get_oplog_applied_sequence_id());
     EXPECT_EQ(0u, service.GetLatestAppliedSequenceId());
 
     auto status = service.GetSyncStatus();
