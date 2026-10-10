@@ -20,6 +20,7 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <queue>
 #include <vector>
 
@@ -81,6 +82,7 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
    public:
     void setPeerNicPath(const std::string &peer_nic_path);
     std::string peerNicPath() const;
+    std::optional<AutoGidDataPathAttempt> autoGidDataPathAttempt() const;
 
     int setupConnectionsByActive();
 
@@ -173,6 +175,8 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     int resetConnection(const std::string &reason);
     int sendReadyAck(const std::string &peer_server_name,
                      const HandShakeDesc &local_desc);
+    void rememberConnectedAutoGid(const GidSelectionSnapshot &local_selection,
+                                  const HandShakeDesc &peer_desc);
 
    public:
     const std::string toString() const;
@@ -280,6 +284,7 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
 
     std::string peer_nic_path_;
     std::vector<uint32_t> peer_qp_num_list_;
+    std::optional<GidSelectionSnapshot> connected_auto_gid_;
     bool has_connected_;
     std::atomic<uint64_t> ready_wait_start_ts_;
 

@@ -159,6 +159,9 @@ TEST_F(TransferMetadataTest, NcclMetadataAndHandshakePayloadRoundTrip) {
                   [](const TransferMetadata::HandShakeDesc& peer,
                      TransferMetadata::HandShakeDesc& local) {
                       local.payload = "reply:" + peer.payload;
+                      local.auto_gid_rank_supported =
+                          peer.auto_gid_rank_supported;
+                      local.auto_gid_rank = peer.auto_gid_rank + 1;
                       return 0;
                   },
                   port, sockfd),
@@ -187,9 +190,22 @@ TEST_F(TransferMetadataTest, NcclMetadataAndHandshakePayloadRoundTrip) {
 
     TransferMetadata::HandShakeDesc request;
     request.payload = "bootstrap";
+    request.auto_gid_rank_supported = true;
+    request.auto_gid_rank = 1;
     TransferMetadata::HandShakeDesc response;
     ASSERT_EQ(client.sendHandshake(server_name, request, response), 0);
     EXPECT_EQ(response.payload, "reply:bootstrap");
+    EXPECT_TRUE(response.auto_gid_rank_supported);
+    EXPECT_EQ(response.auto_gid_rank, 2U);
+
+    TransferMetadata::HandShakeDesc legacy_request;
+    legacy_request.payload = "legacy";
+    TransferMetadata::HandShakeDesc legacy_response;
+    ASSERT_EQ(
+        client.sendHandshake(server_name, legacy_request, legacy_response), 0);
+    EXPECT_EQ(legacy_response.payload, "reply:legacy");
+    EXPECT_FALSE(legacy_response.auto_gid_rank_supported);
+    EXPECT_EQ(legacy_response.auto_gid_rank, 0U);
 }
 
 // add, get and remove RPCMetaEntryMeta

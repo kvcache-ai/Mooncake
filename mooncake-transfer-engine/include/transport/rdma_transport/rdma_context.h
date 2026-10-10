@@ -72,6 +72,7 @@ enum class GidNetworkState {
 struct GidSelectionSnapshot {
     std::string gid;
     int gid_index = -1;
+    uint32_t rank = 0;
 };
 
 enum class GidRefreshResult {
@@ -258,7 +259,12 @@ class RdmaContext {
     bool reprobeAutoGid(
         const GidSelectionSnapshot &expected_selection,
         const std::vector<AutoGidSelectionIdentity> &tried_selections = {},
-        std::string *previous_gid = nullptr, std::string *next_gid = nullptr);
+        std::string *previous_gid = nullptr, std::string *next_gid = nullptr,
+        uint32_t minimum_rank = 0);
+
+    GidRefreshResult ensureAutoGidRank(uint32_t requested_rank,
+                                       std::string *previous_gid = nullptr,
+                                       std::string *next_gid = nullptr);
 
     // Refresh the runtime GID after IBV_EVENT_GID_CHANGE. Auto-GID mode uses
     // the same candidate filtering/ranking as initial device open; explicit
@@ -346,6 +352,7 @@ class RdmaContext {
     uint8_t port_ = 0;
     uint32_t lid_ = 0;
     int gid_index_ = -1;
+    uint32_t auto_gid_selection_rank_ = 0;
     int active_speed_ = -1;
     int active_width_ = 1;
     ibv_mtu active_mtu_;

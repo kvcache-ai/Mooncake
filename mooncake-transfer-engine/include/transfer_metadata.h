@@ -211,6 +211,10 @@ class TransferMetadata {
         // Capability marker. Encoded only by transports that opt into
         // ready_ack; decoded from field presence to detect peer support.
         bool ready_ack_supported = false;
+        // Optional classic-RDMA capability used to coordinate auto-GID
+        // fallback. Older peers omit this field and keep legacy behavior.
+        uint32_t auto_gid_rank = 0;
+        bool auto_gid_rank_supported = false;
         // Per-peer RDMA CtrlChannel (notify QP). 0 = not supported / unused.
         // When ctrl_channel is true, this handshake only sets up the control
         // path (qp_num may be empty).
