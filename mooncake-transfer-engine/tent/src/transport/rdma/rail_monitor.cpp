@@ -109,6 +109,31 @@ bool RailMonitor::isAvailable(int local_nic, int remote_nic) const {
     return !it->second.paused();
 }
 
+uint64_t RailMonitor::localDeviceMask(const Topology::MemEntry& remote_memory,
+                                      bool same_machine) const {
+    uint64_t mask = 0;
+    if (!ready_) return mask;
+    for (const auto& devices : remote_memory.device_list) {
+        for (int remote_nic : devices) {
+            const auto* remote_entry = remote_->getNicEntry(remote_nic);
+            if (!remote_entry || remote_entry->type != Topology::NIC_RDMA)
+                continue;
+            for (size_t local_nic = 0;
+                 local_nic < local_->getNicCount() && local_nic < 64;
+                 ++local_nic) {
+                const auto* local_entry = local_->getNicEntry(local_nic);
+                if (local_entry && local_entry->type == Topology::NIC_RDMA &&
+                    ((same_machine &&
+                      static_cast<int>(local_nic) == remote_nic) ||
+                     rail_states_.count(
+                         {static_cast<int>(local_nic), remote_nic})))
+                    mask |= 1ULL << local_nic;
+            }
+        }
+    }
+    return mask;
+}
+
 bool RailMonitor::admit(int local_nic, int remote_nic) {
     auto it = rail_states_.find(std::make_pair(local_nic, remote_nic));
     if (it == rail_states_.end()) return false;
