@@ -2353,10 +2353,10 @@ MasterService::EraseMetadata(
             source->dec_refcnt();
         }
         tenant_state.offloading_tasks.erase(offload_it);
-
-        // The mailbox entry must be dropped too, otherwise the next
-        // OffloadObjectHeartbeat drains a task-less key back to the client and
-        // produces an orphan bucket.
+    }
+    // A completed mirror can have released the task marker while another
+    // mirror is still queued. Erasing the object must remove those entries too.
+    if (enable_offload_) {
         local_ssd_manager_.RemoveOffloadFromAll(tenant_id, key);
     }
     tenant_state.processing_keys.erase(key);
@@ -3923,6 +3923,9 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
                         standby_meta.data_type, standby_meta.group_id,
                         object.tenant_id, object.user_key));
                 (void)inserted;
+                if (standby_meta.offload_version.has_value()) {
+                    it->second.offload_version = *standby_meta.offload_version;
+                }
                 if (!standby_meta.group_id.empty()) {
                     it->second.lease_ =
                         RegisterGroupMember(object.tenant_id, object.user_key,
@@ -4471,9 +4474,9 @@ auto MasterService::GetReplicaList(const std::string& key,
                 memory_replicas < dynamic_replication_max_memory_replicas_;
         }
 
-        resp = GetReplicaListResponse(std::move(replica_list),
-                                      default_kv_lease_ttl_,
-                                      metadata.object_checksum);
+        resp = GetReplicaListResponse(
+            std::move(replica_list), default_kv_lease_ttl_,
+            metadata.object_checksum, metadata.offload_version);
     }
     // RO accessor released. Safe to take a fresh RW accessor now.
     if (promotion_eligible) {
@@ -4507,9 +4510,9 @@ auto MasterService::GetReplicaListForAdmin(const std::string& key,
         return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
     }
 
-    return GetReplicaListResponse(std::move(replica_list),
-                                  default_kv_lease_ttl_,
-                                  metadata.object_checksum);
+    return GetReplicaListResponse(
+        std::move(replica_list), default_kv_lease_ttl_,
+        metadata.object_checksum, metadata.offload_version);
 }
 
 std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
@@ -4656,7 +4659,7 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
 
                 results[original_idx] = GetReplicaListResponse(
                     std::move(replica_list), default_kv_lease_ttl_,
-                    metadata.object_checksum);
+                    metadata.object_checksum, metadata.offload_version);
             }
         }
 
@@ -4740,7 +4743,7 @@ MasterService::BatchGetReplicaListForAdmin(const std::vector<std::string>& keys,
 
                 results[original_idx] = GetReplicaListResponse(
                     std::move(replica_list), default_kv_lease_ttl_,
-                    metadata.object_checksum);
+                    metadata.object_checksum, metadata.offload_version);
             }
         }
     }
@@ -5395,9 +5398,11 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
             [](const Replica& replica) {
                 return replica.is_completed() && replica.is_memory_replica();
             },
-            [this, &object_id, &source_id, &mirror_clients](Replica& replica) {
-                auto result =
-                    PushOffloadingQueue(object_id, replica, &mirror_clients);
+            [this, &object_id, &source_id, &mirror_clients,
+             &metadata](Replica& replica) {
+                auto result = PushOffloadingQueue(object_id, replica,
+                                                  metadata.offload_version,
+                                                  &mirror_clients);
                 if (result && !source_id.has_value()) {
                     replica.inc_refcnt();
                     source_id = replica.id();
@@ -5448,10 +5453,9 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
     return AddReplicaForRetainedClient(client_id, key, tenant_id, replica);
 }
 
-auto MasterService::AddReplicaForRetainedClient(const UUID& client_id,
-                                                const std::string& key,
-                                                const TenantId& tenant_id,
-                                                Replica& replica)
+auto MasterService::AddReplicaForRetainedClient(
+    const UUID& client_id, const std::string& key, const TenantId& tenant_id,
+    Replica& replica, const std::string& object_version, bool allow_create)
     -> tl::expected<bool, ErrorCode> {
     assert(tenant_id.IsValid());
     TenantId normalized_tenant;
@@ -5482,12 +5486,19 @@ auto MasterService::AddReplicaForRetainedClient(const UUID& client_id,
     const ObjectIdentity object_id{std::move(normalized_tenant), key};
     MetadataAccessorRW accessor(this, object_id);
     if (!accessor.Exists()) {
+        if (!allow_create) return false;
         accessor.Create(
             client_id,
             replica.get_descriptor().get_local_disk_descriptor().object_size,
             std::vector<Replica>{});
+        if (!object_version.empty()) {
+            accessor.Get().offload_version = object_version;
+        }
     }
     auto& metadata = accessor.Get();
+    if (!object_version.empty() && metadata.offload_version != object_version) {
+        return false;
+    }
     const auto previous_kv_media = KvMediaSnapshot(metadata);
     if (replica.type() != ReplicaType::LOCAL_DISK) {
         LOG(ERROR) << "Invalid replica type: " << replica.type()
@@ -6069,6 +6080,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     !has_bucket_dfs_replica && !restore_missing_bucket_dfs) {
                     metadata.client_id = client_id;
                     metadata.put_start_time = now;
+                    metadata.offload_version = UuidToString(generate_uuid());
 
                     const auto previous_kv_media = KvMediaSnapshot(metadata);
 
@@ -8587,6 +8599,9 @@ auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
             MakeObjectIdentity(task.key, TenantId(task.tenant_id));
         MetadataAccessorRW accessor(this, object_id);
         if (accessor.Exists()) {
+            if (!task.object_version.empty() &&
+                accessor.Get().offload_version != task.object_version)
+                continue;
             auto& tenant_state = accessor.GetTenantState();
             auto task_it =
                 tenant_state.offloading_tasks.find(object_id.user_key);
@@ -8667,6 +8682,8 @@ auto MasterService::NotifyOffloadSuccess(
     for (size_t i = 0; i < tasks.size(); ++i) {
         const auto& task = tasks[i];
         const auto& metadata = metadatas[i];
+        // Legacy bucket metadata cannot identify the object it belongs to.
+        if (task.is_rescan && task.object_version.empty()) continue;
         const TenantId task_tenant = enable_multi_tenants_
                                          ? TenantId(task.tenant_id)
                                          : TenantId::Default();
@@ -8679,6 +8696,10 @@ auto MasterService::NotifyOffloadSuccess(
             std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
             MetadataAccessorRW accessor(this, request_object_id);
             if (accessor.Exists()) {
+                if (!task.object_version.empty() &&
+                    accessor.Get().offload_version != task.object_version) {
+                    continue;
+                }
                 auto& tenant_state = accessor.GetTenantState();
                 auto task_it = tenant_state.offloading_tasks.find(
                     request_object_id.user_key);
@@ -8723,6 +8744,10 @@ auto MasterService::NotifyOffloadSuccess(
             MetadataAccessorRW accessor(this, request_object_id);
             if (accessor.Exists()) {
                 auto& obj_metadata = accessor.Get();
+                if (!task.object_version.empty() &&
+                    obj_metadata.offload_version != task.object_version) {
+                    continue;
+                }
                 const auto previous_kv_media = KvMediaSnapshot(obj_metadata);
                 auto& tenant_state = accessor.GetTenantState();
                 auto task_it = tenant_state.offloading_tasks.find(
@@ -8737,7 +8762,8 @@ auto MasterService::NotifyOffloadSuccess(
                 // Existing orphan objects can only bypass tenant registration
                 // for a master-admitted offload completion. Without this task
                 // marker, fall through to the regular registration check.
-                if (task_it != tenant_state.offloading_tasks.end()) {
+                if (!task.is_rescan &&
+                    task_it != tenant_state.offloading_tasks.end()) {
                     auto source =
                         obj_metadata.GetReplicaByID(task_it->second.source_id);
                     if (source != nullptr) {
@@ -8802,7 +8828,9 @@ auto MasterService::NotifyOffloadSuccess(
                 request_object_id.user_key};
 
             auto res = AddReplicaForRetainedClient(
-                client_id, object_id.user_key, object_id.tenant_id, replica);
+                client_id, object_id.user_key, object_id.tenant_id, replica,
+                task.object_version,
+                task.is_rescan || task.object_version.empty());
             if (!res) {
                 if (res.error() == ErrorCode::OBJECT_NOT_FOUND) {
                     continue;
@@ -8838,7 +8866,7 @@ auto MasterService::NotifyOffloadSuccess(
 
 tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
     const ObjectIdentity& object_id, Replica& replica,
-    std::vector<UUID>* mirror_clients) {
+    const std::string& object_version, std::vector<UUID>* mirror_clients) {
     const auto& segment_names = replica.get_segment_names();
     // No source segment names means there is no usable source segment to
     // offload from. Returning a silent {} here caused the caller to record an
@@ -8895,7 +8923,9 @@ tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
             *client_id,
             OffloadTaskItem{.tenant_id = object_id.tenant_id.value(),
                             .key = object_id.user_key,
-                            .size = size},
+                            .size = size,
+                            .object_version = object_version,
+                            .source_replica_id = replica.id()},
             offloading_queue_limit_);
         if (err == ErrorCode::SEGMENT_NOT_FOUND) {
             return tl::make_unexpected(ErrorCode::UNABLE_OFFLOADING);
@@ -11348,15 +11378,15 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
         bool queued = false;
         metadata.VisitReplicas(
             is_evictable_memory_replica,
-            [this, &key, &normalized_tenant, &tenant_state, &queued,
-             &now](Replica& replica) {
+            [this, &key, &normalized_tenant, &tenant_state, &queued, &now,
+             &metadata](Replica& replica) {
                 if (queued) {
                     return;
                 }
                 std::vector<UUID> mirror_clients;
                 auto result = PushOffloadingQueue(
                     MakeObjectIdentity(key, normalized_tenant), replica,
-                    &mirror_clients);
+                    metadata.offload_version, &mirror_clients);
                 if (result) {
                     replica.inc_refcnt();
                     tenant_state.offloading_tasks.emplace(
@@ -11668,13 +11698,14 @@ void MasterService::BatchEvict(double evict_ratio_target,
         // Queue one MEMORY replica for offload; others will be evicted below.
         bool queued = false;
         metadata.VisitReplicas(
-            is_evictable_memory_replica, [this, &tenant_id, &key, &tenant_state,
-                                          &queued, &now](Replica& replica) {
+            is_evictable_memory_replica,
+            [this, &tenant_id, &key, &tenant_state, &queued, &now,
+             &metadata](Replica& replica) {
                 if (queued) return;  // only need to pin one replica for offload
                 std::vector<UUID> mirror_clients;
-                auto result =
-                    PushOffloadingQueue(MakeObjectIdentity(key, tenant_id),
-                                        replica, &mirror_clients);
+                auto result = PushOffloadingQueue(
+                    MakeObjectIdentity(key, tenant_id), replica,
+                    metadata.offload_version, &mirror_clients);
                 if (result) {
                     replica.inc_refcnt();
                     tenant_state.offloading_tasks.emplace(
@@ -13416,6 +13447,7 @@ MasterService::MetadataSerializer::DeserializeShard(const msgpack::object& obj,
 
         it->second.lease_->ExtendTo(metadata_ptr->lease_->ExpiresAt());
         it->second.object_checksum = metadata_ptr->object_checksum;
+        it->second.offload_version = metadata_ptr->offload_version;
 
         // Recompute disk_object_count for restored metadata
         if (it->second.HasReplica([](const Replica& r) {
@@ -13434,11 +13466,12 @@ MasterService::MetadataSerializer::SerializeMetadata(
     // Pack ObjectMetadata using array structure for efficiency
     // Format: [client_id, put_start_time, size, lease_timeout,
     // has_soft_pin_timeout, soft_pin_timeout, replicas_count, data_type,
-    // replicas..., hard_pinned, group_id, object_checksum?]
+    // replicas..., hard_pinned, group_id, object_checksum?, offload_version]
 
-    size_t array_size = 10;  // client_id, put_start_time, size, lease_timeout,
+    size_t array_size = 11;  // client_id, put_start_time, size, lease_timeout,
                              // has_soft_pin_timeout, soft_pin_timeout,
-                             // replicas_count, data_type, hard_pinned, group_id
+                             // replicas_count, data_type, hard_pinned,
+                             // group_id, offload_version
     array_size += metadata.CountReplicas();  // One element per replica
     if (metadata.object_checksum.has_value()) {
         ++array_size;
@@ -13490,6 +13523,7 @@ MasterService::MetadataSerializer::SerializeMetadata(
     if (metadata.object_checksum.has_value()) {
         packer.pack(*metadata.object_checksum);
     }
+    packer.pack(metadata.offload_version);
 
     return {};
 }
@@ -13560,11 +13594,12 @@ MasterService::MetadataSerializer::DeserializeMetadata(
     //   v3: 9 + replicas_count, data_type + hard_pinned or hard_pinned +
     //   group_id v4: 10 + replicas_count, data_type + hard_pinned + group_id
     //   v5: 11 + replicas_count, v4 + object_checksum
+    //   v6: v4/v5 + offload_version (string)
     // 64-bit arithmetic keeps an attacker-controlled near-UINT32_MAX
     // replicas_count from wrapping the bounds and slipping an out-of-bounds
     // index past the size check.
     constexpr uint64_t kBaseFieldCount = 7;
-    constexpr uint64_t kMaxOptionalFieldCount = 4;
+    constexpr uint64_t kMaxOptionalFieldCount = 5;
     const uint64_t total_elements = obj.via.array.size;
     const uint64_t min_elements = kBaseFieldCount + replicas_count;
     if (total_elements < min_elements ||
@@ -13619,6 +13654,10 @@ MasterService::MetadataSerializer::DeserializeMetadata(
         array[index].type == msgpack::type::POSITIVE_INTEGER) {
         object_checksum = array[index++].as<uint64_t>();
     }
+    std::optional<std::string> offload_version;
+    if (index < total_elements && array[index].type == msgpack::type::STR) {
+        offload_version = array[index++].as<std::string>();
+    }
     if (index != total_elements) {
         return tl::unexpected(SerializationError(
             ErrorCode::DESERIALIZE_FAIL,
@@ -13633,6 +13672,7 @@ MasterService::MetadataSerializer::DeserializeMetadata(
         size, std::move(replicas), std::nullopt, is_hard_pinned, data_type,
         group_id);
     metadata->object_checksum = object_checksum;
+    if (offload_version) metadata->offload_version = *offload_version;
     metadata->lease_->ExtendTo(std::chrono::system_clock::time_point(
         std::chrono::milliseconds(lease_timestamp)));
 
@@ -14949,6 +14989,7 @@ std::string MasterService::SerializeMetadataForOpLog(
     payload.group_id = metadata.group_id;
     payload.data_type = metadata.data_type;
     payload.hard_pinned = metadata.IsHardPinned();
+    payload.offload_version = metadata.offload_version;
 
     // Extract replica descriptors - get them all at once
     const auto& replicas = metadata.GetAllReplicas();
@@ -14975,6 +15016,7 @@ std::string MasterService::SerializeMetadataForOpLogWithoutMemReplicas(
     payload.group_id = metadata.group_id;
     payload.data_type = metadata.data_type;
     payload.hard_pinned = metadata.IsHardPinned();
+    payload.offload_version = metadata.offload_version;
 
     const auto& replicas = metadata.GetAllReplicas();
     payload.replicas.reserve(replicas.size());
@@ -14999,6 +15041,7 @@ std::string MasterService::SerializeMetadataForOpLogFromReplicaDescriptors(
     payload.group_id = metadata.group_id;
     payload.data_type = metadata.data_type;
     payload.hard_pinned = metadata.IsHardPinned();
+    payload.offload_version = metadata.offload_version;
     auto result = struct_pack::serialize(payload);
     return std::string(result.begin(), result.end());
 }

@@ -2138,6 +2138,86 @@ TEST_F(StorageBackendTest,
 // BucketStorageBackend: Duplicate Key Detection Tests (Phase 0 - D0)
 //-----------------------------------------------------------------------------
 
+TEST_F(StorageBackendTest,
+       BucketReputPersistsInvalidationWithoutDeletingSharedKeys) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    std::string old_value(4109, 'a');
+    std::string new_value(4109, 'b');
+    std::string neighbor_value(257, 'c');
+    auto backend =
+        std::make_unique<BucketStorageBackend>(config, bucket_config);
+    ASSERT_TRUE(backend->Init());
+    std::unordered_map<std::string, std::vector<Slice>> first{
+        {"reused", {{old_value.data(), old_value.size()}}},
+        {"neighbor", {{neighbor_value.data(), neighbor_value.size()}}}};
+    ASSERT_TRUE(backend->BatchOffloadVersioned(
+        first, nullptr, nullptr, {{"reused", "v1"}, {"neighbor", "n1"}}));
+
+    std::unordered_map<std::string, std::vector<Slice>> replacement{
+        {"reused", {{new_value.data(), new_value.size()}}}};
+    auto second = backend->BatchOffloadVersioned(replacement, nullptr, nullptr,
+                                                 {{"reused", "v2"}});
+    ASSERT_TRUE(second);
+    const auto replacement_bucket = *second;
+
+    // A retry for this incarnation must retain the first successful write.
+    replacement["reused"][0].ptr = old_value.data();
+    int notifications = 0;
+    ASSERT_TRUE(
+        backend->BatchOffloadVersioned(replacement,
+                                       [&notifications](const auto&, auto&) {
+                                           ++notifications;
+                                           return ErrorCode::OK;
+                                       },
+                                       nullptr, {{"reused", "v2"}}));
+    EXPECT_EQ(notifications, 0);
+
+    for (int reopen = 0; reopen < 2; ++reopen) {
+        if (reopen) {
+            backend.reset();
+            backend =
+                std::make_unique<BucketStorageBackend>(config, bucket_config);
+            ASSERT_TRUE(backend->Init());
+        }
+        std::string current(new_value.size(), '\0');
+        std::string neighbor(neighbor_value.size(), '\0');
+        std::unordered_map<std::string, Slice> output{
+            {"reused", {current.data(), current.size()}},
+            {"neighbor", {neighbor.data(), neighbor.size()}}};
+        ASSERT_TRUE(backend->BatchLoad(output));
+        EXPECT_EQ(current, new_value);
+        EXPECT_EQ(neighbor, neighbor_value);
+        std::unordered_map<std::string, std::string> scanned;
+        backend->ResetScanIterator();
+        ASSERT_TRUE(backend->ScanMeta([&](const auto& keys, auto& metadata) {
+            for (size_t i = 0; i < keys.size(); ++i) {
+                EXPECT_TRUE(scanned.emplace(keys[i], metadata[i].object_version)
+                                .second);
+            }
+            return ErrorCode::OK;
+        }));
+        EXPECT_EQ(scanned, (std::unordered_map<std::string, std::string>{
+                               {"reused", "v2"}, {"neighbor", "n1"}}));
+    }
+
+    // The old shared bucket is still present. Removing the replacement must
+    // not make the superseded key recoverable from that old bucket.
+    ASSERT_TRUE(backend->DeleteBucket(replacement_bucket));
+    backend.reset();
+    backend = std::make_unique<BucketStorageBackend>(config, bucket_config);
+    ASSERT_TRUE(backend->Init());
+    auto exists = backend->IsExist("reused");
+    ASSERT_TRUE(exists);
+    EXPECT_FALSE(*exists);
+    std::string neighbor(neighbor_value.size(), '\0');
+    std::unordered_map<std::string, Slice> output{
+        {"neighbor", {neighbor.data(), neighbor.size()}}};
+    ASSERT_TRUE(backend->BatchLoad(output));
+    EXPECT_EQ(neighbor, neighbor_value);
+}
+
 TEST_F(StorageBackendTest, BucketStorageBackend_DuplicateKeyIdempotentSkip) {
     FileStorageConfig config;
     config.storage_filepath = data_path;

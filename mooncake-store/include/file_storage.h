@@ -204,7 +204,8 @@ class FileStorage {
 
     tl::expected<void, ErrorCode> BatchQuerySegmentSlices(
         const std::vector<std::string>& keys, const std::string& tenant_id,
-        std::unordered_map<std::string, std::vector<Slice>>& batched_slices);
+        std::unordered_map<std::string, std::vector<Slice>>& batched_slices,
+        const std::unordered_map<std::string, OffloadTaskItem>& tasks = {});
 
     tl::expected<void, ErrorCode> RegisterLocalMemory();
 
@@ -239,6 +240,7 @@ class FileStorage {
         client_buffer_mutex_) client_buffer_allocated_batches_;
     std::atomic<uint64_t> next_batch_id_{1};
 
+    mutable Mutex offload_execution_mutex_;
     mutable Mutex offloading_mutex_;
     bool GUARDED_BY(offloading_mutex_) enable_offloading_;
     std::atomic<bool> heartbeat_running_;

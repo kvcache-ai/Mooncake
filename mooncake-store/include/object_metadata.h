@@ -101,6 +101,7 @@ struct ObjectMetadata {
     std::chrono::system_clock::time_point put_start_time;
     const size_t size;
     std::optional<uint64_t> object_checksum;
+    std::string offload_version = UuidToString(generate_uuid());
     const ObjectDataType data_type{ObjectDataType::UNKNOWN};
     const std::string group_id;
     const TenantId tenant_id;

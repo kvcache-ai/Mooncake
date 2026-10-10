@@ -153,11 +153,12 @@ DeserializeStandbyObjectMetadata(
         //       hard_pinned + group_id
         //   v4: 10 + replica_count, data_type + hard_pinned + group_id
         //   v5: 11 + replica_count, v4 + object_checksum (ignored here)
+        //   v6: v4/v5 + offload_version (string)
         // 64-bit arithmetic keeps an attacker-controlled near-UINT32_MAX
         // replica_count from wrapping the bounds and slipping an out-of-bounds
         // index through.
         constexpr uint64_t kBaseFieldCount = 7;
-        constexpr uint64_t kMaxOptionalFieldCount = 4;
+        constexpr uint64_t kMaxOptionalFieldCount = 5;
         const uint64_t total_elements = object.via.array.size;
         const uint64_t min_elements = kBaseFieldCount + replica_count;
         if (total_elements < min_elements ||
@@ -233,6 +234,16 @@ DeserializeStandbyObjectMetadata(
         metadata.data_type = data_type;
         metadata.group_id = std::move(group_id);
         metadata.hard_pinned = hard_pinned;
+        if (index < total_elements &&
+            array[index].type == msgpack::type::POSITIVE_INTEGER) {
+            ++index;  // object checksum
+        }
+        if (index < total_elements && array[index].type == msgpack::type::STR) {
+            metadata.offload_version = array[index++].as<std::string>();
+        }
+        if (index != total_elements) {
+            return tl::make_unexpected(ErrorCode::DESERIALIZE_FAIL);
+        }
         return std::optional<StandbyObjectMetadata>(std::move(metadata));
     } catch (const std::exception& ex) {
         LOG(ERROR) << "Failed to parse snapshot metadata entry: " << ex.what();

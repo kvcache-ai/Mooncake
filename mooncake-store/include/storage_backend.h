@@ -34,8 +34,11 @@ struct BucketObjectMetadata {
     int64_t offset;
     int64_t key_size;
     int64_t data_size;
+    std::string object_version{};
+    bool superseded{false};
 };
-YLT_REFL(BucketObjectMetadata, offset, key_size, data_size);
+YLT_REFL(BucketObjectMetadata, offset, key_size, data_size, object_version,
+         superseded);
 
 struct BucketMetadata {
     int64_t meta_size;
@@ -745,6 +748,17 @@ class StorageBackendAdaptor : public StorageBackendInterface {
 
 class BucketStorageBackend : public StorageBackendInterface {
    public:
+    using ObjectVersions = std::unordered_map<std::string, std::string>;
+
+    // The owner serializes offloads and validates their source replica before
+    // replacing a different incarnation of a key. Unversioned calls retain
+    // the existing duplicate-skip contract.
+    virtual tl::expected<int64_t, ErrorCode> BatchOffloadVersioned(
+        const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
+        std::function<ErrorCode(const std::vector<std::string>&,
+                                std::vector<StorageObjectMetadata>&)>
+            complete_handler,
+        EvictionHandler eviction_handler, const ObjectVersions& versions);
     BucketStorageBackend(const FileStorageConfig& file_storage_config_,
                          const BucketBackendConfig& bucket_backend_config_);
 
@@ -846,7 +860,8 @@ class BucketStorageBackend : public StorageBackendInterface {
      */
     tl::expected<void, ErrorCode> AllocateOffloadingBuckets(
         const std::unordered_map<std::string, int64_t>& offloading_objects,
-        std::vector<std::vector<std::string>>& buckets_keys);
+        std::vector<std::vector<std::string>>& buckets_keys,
+        const ObjectVersions& versions = {});
 
     void ClearUngroupedOffloadingObjects();
 
@@ -904,8 +919,8 @@ class BucketStorageBackend : public StorageBackendInterface {
     tl::expected<std::shared_ptr<BucketMetadata>, ErrorCode> BuildBucket(
         int64_t bucket_id,
         const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
-        std::vector<iovec>& iovs,
-        std::vector<StorageObjectMetadata>& metadatas);
+        std::vector<iovec>& iovs, std::vector<StorageObjectMetadata>& metadatas,
+        const ObjectVersions& versions);
 
     tl::expected<void, ErrorCode> WriteBucket(
         int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket_metadata,
@@ -929,7 +944,8 @@ class BucketStorageBackend : public StorageBackendInterface {
 
     tl::expected<void, ErrorCode> GroupOffloadingKeysByBucket(
         const std::unordered_map<std::string, int64_t>& offloading_objects,
-        std::vector<std::vector<std::string>>& buckets_keys);
+        std::vector<std::vector<std::string>>& buckets_keys,
+        const ObjectVersions& versions = {});
 
     tl::expected<void, ErrorCode> HandleNext(
         const std::function<
@@ -988,7 +1004,8 @@ class BucketStorageBackend : public StorageBackendInterface {
      * @return PendingEviction with all keys and bucket metadata removed.
      */
     tl::expected<PendingEviction, ErrorCode> PrepareEviction(
-        int64_t required_size, const std::vector<std::string>& write_keys = {});
+        int64_t required_size, const std::vector<std::string>& write_keys = {},
+        const ObjectVersions& versions = {});
 
     void RestorePreparedEviction(PendingEviction&& pending);
 

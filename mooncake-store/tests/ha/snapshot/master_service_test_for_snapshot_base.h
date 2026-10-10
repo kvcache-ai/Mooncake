@@ -408,6 +408,17 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
     // Compare two ServiceStateSnapshot
     bool CompareServiceState(const ServiceStateSnapshot& before,
                              const ServiceStateSnapshot& after) const {
+        for (const auto& [key, replicas] : before.replica_lists) {
+            const auto restored = after.replica_lists.find(key);
+            if (restored != after.replica_lists.end() &&
+                replicas.offload_version != restored->second.offload_version) {
+                ADD_FAILURE()
+                    << "Offload incarnation changed after snapshot restore: "
+                    << key;
+                return false;
+            }
+        }
+
         bool all_passed = true;
 
         // ========== Check LocalDiskSegment state ==========
