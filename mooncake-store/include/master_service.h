@@ -967,6 +967,26 @@ class MasterService {
         std::optional<ReplicaID> expected_max_replica_id,
         const WeightMetadataSnapshot* legacy_weight_metadata);
 
+    // Tolerant legacy snapshot restore (#3760), one phase per method so each
+    // stays single-purpose.
+    struct LegacyRestoreContext;
+    void NoteLegacyStandbyRejection(LegacyRestoreContext& ctx,
+                                    const StandbyObjectEntry& entry,
+                                    const char* reason);
+    tl::expected<void, ErrorCode> ValidateLegacyStandbyEntries(
+        LegacyRestoreContext& ctx);
+    tl::expected<void, ErrorCode> ConstructLegacyStandbyReplicas(
+        LegacyRestoreContext& ctx);
+    tl::expected<size_t, ErrorCode> InstallLegacyStandbyObjects(
+        LegacyRestoreContext& ctx);
+
+    // A restored local-disk replica reads only while its owner has a liveness
+    // record; share the existing one or stage a fresh record for install.
+    std::shared_ptr<ClientLivenessRecord> RecordRestoreKnownOwner(
+        std::unordered_map<UUID, std::shared_ptr<ClientLivenessRecord>,
+                           boost::hash<UUID>>& new_known_owner_records,
+        const UUID& owner);
+
     std::unique_ptr<ha::SnapshotCatalogStore> CreateSnapshotCatalogStore(
         const MasterServiceConfig& config);
 
@@ -2503,6 +2523,11 @@ class MasterService {
     tl::expected<OpLogEntry, ErrorCode> AppendOpLogWithDurableFinalize(
         OpType type, const std::string& tenant_id, const std::string& key,
         const std::string& payload, DurableFinalizeCallback callback);
+    // Commit a set of entries as one indivisible batch record, so a durable
+    // prefix either covers the whole set or none of it. Returns the last
+    // assigned sequence id on success.
+    tl::expected<uint64_t, ErrorCode> AppendOpLogBatchWithDurableFinalize(
+        std::vector<OpLogEntry> entries, DurableFinalizeCallback callback);
     tl::expected<OrderedOpLogWriter::Reservation, ErrorCode>
     ReserveBatchOpLogSlot();
     tl::expected<OpLogEntry, ErrorCode> AppendReservedOpLogWithDurableFinalize(
