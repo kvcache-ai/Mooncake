@@ -2572,8 +2572,12 @@ void Client::healDanglingLocalDiskBatchStarts(
     if (retry_keys.empty()) {
         return;
     }
-    auto retry_responses =
-        master_client_.BatchPutStart(retry_keys, retry_slices, config);
+    std::vector<size_t> config_indices;
+    for (auto position : retry_positions) {
+        config_indices.push_back(active_indices[already_exists[position]]);
+    }
+    auto retry_responses = master_client_.BatchPutStart(
+        retry_keys, retry_slices, config.ForKeys(config_indices));
     if (retry_responses.size() != retry_keys.size()) {
         return;
     }
@@ -2603,6 +2607,14 @@ void Client::healDanglingLocalDiskBatchStarts(
 
 void Client::StartBatchPut(std::vector<PutOperation>& ops,
                            const ReplicateConfig& config) {
+    if (!config.ValidSessionShape(ops.size()) ||
+        (config.group_ids && config.group_ids->size() != ops.size())) {
+        for (auto& op : ops)
+            op.SetError(ErrorCode::INVALID_PARAMS,
+                        "Invalid per-key write tags");
+        return;
+    }
+
     std::vector<std::string> keys;
     std::vector<std::vector<uint64_t>> slice_lengths;
     std::vector<size_t> active_indices;
@@ -2638,8 +2650,8 @@ void Client::StartBatchPut(std::vector<PutOperation>& ops,
         return;
     }
 
-    auto start_responses =
-        master_client_.BatchPutStart(keys, slice_lengths, config);
+    auto start_responses = master_client_.BatchPutStart(
+        keys, slice_lengths, config.ForKeys(active_indices));
 
     // Ensure response size matches request size
     if (start_responses.size() != active_indices.size()) {
@@ -2702,6 +2714,14 @@ void Client::StartBatchPut(std::vector<PutOperation>& ops,
 
 void Client::StartBatchUpsert(std::vector<PutOperation>& ops,
                               const ReplicateConfig& config) {
+    if (!config.ValidSessionShape(ops.size()) ||
+        (config.group_ids && config.group_ids->size() != ops.size())) {
+        for (auto& op : ops)
+            op.SetError(ErrorCode::INVALID_PARAMS,
+                        "Invalid per-key write tags");
+        return;
+    }
+
     std::vector<std::string> keys;
     std::vector<std::vector<uint64_t>> slice_lengths;
     std::vector<size_t> active_indices;
@@ -2737,8 +2757,8 @@ void Client::StartBatchUpsert(std::vector<PutOperation>& ops,
         return;
     }
 
-    auto start_responses =
-        master_client_.BatchUpsertStart(keys, slice_lengths, config);
+    auto start_responses = master_client_.BatchUpsertStart(
+        keys, slice_lengths, config.ForKeys(active_indices));
 
     // Ensure response size matches request size
     if (start_responses.size() != active_indices.size()) {

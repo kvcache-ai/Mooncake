@@ -21,6 +21,54 @@ namespace mooncake {
 class HttpMetadataServer;
 class WrappedMasterService {
    public:
+    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+    BatchUpsertStartWithKvSessions(const UUID& client_id,
+                                   const std::vector<std::string>& keys,
+                                   const std::vector<uint64_t>& sizes,
+                                   const ReplicateConfig& config,
+                                   const std::string& tenant_id = "default") {
+        return BatchUpsertStart(client_id, keys, sizes, config, tenant_id);
+    }
+    tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
+    UpsertStartWithKvSessions(const UUID& client_id, const std::string& key,
+                              uint64_t size, const ReplicateConfig& config,
+                              const std::string& tenant_id = "default") {
+        return UpsertStart(client_id, key, size, config, tenant_id);
+    }
+    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+    BatchPutStartWithKvSessions(const UUID& client_id,
+                                const std::vector<std::string>& keys,
+                                const std::vector<uint64_t>& sizes,
+                                const ReplicateConfig& config,
+                                const std::string& tenant_id = "default") {
+        return BatchPutStart(client_id, keys, sizes, config, tenant_id);
+    }
+    tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
+    PutStartWithKvSessions(const UUID& client_id, const std::string& key,
+                           uint64_t size, const ReplicateConfig& config,
+                           const std::string& tenant_id = "default") {
+        return PutStart(client_id, key, size, config, tenant_id);
+    }
+    tl::expected<void, ErrorCode> SetKvSessionPin(
+        const std::string& session_id, bool pinned,
+        const std::string& tenant_id = "default");
+    tl::expected<void, ErrorCode> CloseKvSession(
+        const std::string& session_id,
+        const std::string& tenant_id = "default");
+    tl::expected<void, ErrorCode> UpdateKvSession(
+        const std::string& session_id,
+        const std::vector<std::string>& keep_keys,
+        const std::string& tenant_id = "default");
+    tl::expected<KvSessionInfo, ErrorCode> GetKvSession(
+        const std::string& session_id,
+        const std::string& tenant_id = "default");
+    tl::expected<KvSessionPage, ErrorCode> ListKvSessionKeys(
+        const std::string& session_id, const std::string& cursor,
+        uint64_t limit, const std::string& tenant_id = "default");
+    std::vector<tl::expected<void, ErrorCode>> AttachKvSession(
+        const std::string& session_id, const std::vector<std::string>& keys,
+        const std::string& tenant_id = "default");
+
     void SetBatchOpLogTerminalCallback(
         OrderedOpLogWriter::TerminalCallback callback);
     void StopBatchOpLogWriter();

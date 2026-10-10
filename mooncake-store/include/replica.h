@@ -14,9 +14,11 @@
 #include <unordered_map>
 #include <optional>
 #include <string_view>
+#include <span>
 #include <ostream>
 
 #include "types.h"
+#include "kv_session.h"
 #include "allocator.h"
 #include "master_metric_manager.h"
 
@@ -125,13 +127,56 @@ struct ReplicateConfig {
     // always hash(tenant, key) and is decoupled from groups.
     std::optional<std::vector<std::string>> group_ids{};
 
-    ReplicateConfig ForSingleKey(size_t key_index) const {
-        ReplicateConfig key_config = *this;
+    // Per-key additive memberships, scoped by the client's existing tenant.
+    // Compatible encoding keeps ordinary writes wire-compatible. Tagged writes
+    // use dedicated RPC names so an old master cannot silently ignore tags.
+    struct_pack::compatible<KvSessionTags, 1> kv_sessions{};
+
+    bool ValidSessionShape(size_t key_count) const {
+        return !kv_sessions.has_value() || kv_sessions->size() == key_count;
+    }
+
+    ReplicateConfig ForKeys(std::span<const size_t> indices,
+                            size_t repeat_count = 1) const {
+        // Copy common options once; never copy the full batch's per-key tags.
+        ReplicateConfig result{
+            .replica_num = replica_num,
+            .nof_replica_num = nof_replica_num,
+            .dfs_replica_num = dfs_replica_num,
+            .soft_pin_action = soft_pin_action,
+            .soft_pin_ttl_ms = soft_pin_ttl_ms,
+            .with_hard_pin = with_hard_pin,
+            .preferred_segments = preferred_segments,
+            .preferred_segment = preferred_segment,
+            .preferred_nof_segments = preferred_nof_segments,
+            .prefer_alloc_in_same_node = prefer_alloc_in_same_node,
+            .data_type = data_type,
+            .host_id = host_id,
+        };
         if (group_ids.has_value()) {
-            key_config.group_ids =
-                std::vector<std::string>{group_ids->at(key_index)};
+            result.group_ids.emplace();
+            result.group_ids->reserve(indices.size() * repeat_count);
         }
-        return key_config;
+        if (kv_sessions.has_value()) {
+            result.kv_sessions = KvSessionTags{};
+            result.kv_sessions->reserve(indices.size() * repeat_count);
+        }
+        for (auto index : indices) {
+            if (group_ids.has_value()) {
+                result.group_ids->insert(result.group_ids->end(), repeat_count,
+                                         group_ids->at(index));
+            }
+            if (kv_sessions.has_value()) {
+                result.kv_sessions->insert(result.kv_sessions->end(),
+                                           repeat_count,
+                                           kv_sessions->at(index));
+            }
+        }
+        return result;
+    }
+
+    ReplicateConfig ForSingleKey(size_t key_index) const {
+        return ForKeys(std::span(&key_index, 1));
     }
 
     friend std::ostream& operator<<(std::ostream& os,
