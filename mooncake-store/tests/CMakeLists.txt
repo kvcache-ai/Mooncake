@@ -1,5 +1,9 @@
 set(MOONCAKE_STORE_TESTS_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR})
 
+add_executable(kv_codec_test codec/kv_codec_test.cpp)
+target_link_libraries(kv_codec_test PRIVATE mooncake_kv_codec)
+add_test(NAME codec_buffers COMMAND kv_codec_test)
+
 function(add_store_test name)
   add_executable(${name} ${ARGN})
   target_include_directories(${name} PRIVATE ${MOONCAKE_STORE_TESTS_SOURCE_DIR})
