@@ -24,6 +24,8 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdint>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -434,6 +436,55 @@ TEST(NotificationFallbackTest, DuplicateStampedNotificationIsDeliveredOnce) {
     EXPECT_TRUE(received.empty());
 }
 
+// The receiver's dedup limits come from the config; a value <= 0 keeps the
+// default. Each engine sees 1, 3 and 5 of one sender, then a late 2 and 4.
+TEST(NotificationFallbackTest, DedupLimitsComeFromTheConfig) {
+    auto late = [](const std::shared_ptr<Config>& config,
+                   std::chrono::milliseconds wait) {
+        TransferEngineImpl engine(config);
+        EXPECT_TRUE(engine.available());
+        auto rdma = installStub(engine, RDMA, "<rdma>", Status::OK());
+        auto queue = [&](std::initializer_list<uint64_t> seqs) {
+            for (uint64_t seq : seqs) {
+                Notification notifi = makeNotification(std::to_string(seq));
+                notifi.session = 0x5EED;
+                notifi.seq = seq;
+                rdma->queued.push_back(notifi);
+            }
+        };
+        std::vector<Notification> received;
+        queue({1, 3, 5});
+        EXPECT_TRUE(engine.receiveNotification(received).ok());
+        EXPECT_EQ(received.size(), 3u);
+        std::this_thread::sleep_for(wait);
+        queue({2, 4});
+        EXPECT_TRUE(engine.receiveNotification(received).ok());
+        std::string delivered;
+        for (const Notification& notifi : received) delivered += notifi.msg;
+        return delivered;
+    };
+    const std::chrono::milliseconds none(0);
+    EXPECT_EQ(late(makeConfig(), none), "24");
+
+    auto capped = makeConfig();
+    capped->set("notification/dedup_max_holes", 1);
+    EXPECT_EQ(late(capped, none), "4");
+
+    auto short_ttl = makeConfig();
+    short_ttl->set("notification/dedup_hole_ttl_ms", 1);
+    EXPECT_EQ(late(short_ttl, std::chrono::milliseconds(10)), "");
+
+    auto endless = makeConfig();
+    endless->set("notification/dedup_hole_ttl_ms",
+                 std::numeric_limits<int64_t>::max());
+    EXPECT_EQ(late(endless, none), "24");
+
+    auto unset = makeConfig();
+    unset->set("notification/dedup_hole_ttl_ms", -1);
+    unset->set("notification/dedup_max_holes", 0);
+    EXPECT_EQ(late(unset, none), "24");
+}
+
 // Two engines on loopback, neither with a TCP transport. The sender's only
 // notification transport reports its channel unavailable, so the engine
 // itself makes the control-plane RPC; the receiver, with nothing registered
@@ -714,7 +765,7 @@ TEST(NotificationFallbackTest, ReopenedSegmentDoesNotRepeatAStamp) {
     ASSERT_EQ(rdma->sent.size(), 2u);
     EXPECT_EQ(rdma->sent[1].session, rdma->sent[0].session);  // one window
     EXPECT_EQ(rdma->sent[1].seq, 2u);
-    NotifyDedupWindow receiver;
+    NotifyDedupFilter receiver;
     EXPECT_TRUE(receiver.admit(rdma->sent[0].session, rdma->sent[0].seq));
     EXPECT_TRUE(receiver.admit(rdma->sent[1].session, rdma->sent[1].seq));
 }
