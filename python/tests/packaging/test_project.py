@@ -53,6 +53,10 @@ def test_dependency_boundaries_are_declared() -> None:
     metadata = project["project"]
 
     assert set(metadata["dependencies"]) == {"aiohttp", "msgpack", "requests"}
+    assert set(metadata["optional-dependencies"]["structured"]) == {
+        "numpy",
+        "pillow",
+    }
     assert set(metadata["optional-dependencies"]) == {
         "administration",
         "dev",
@@ -82,6 +86,32 @@ def test_tracked_source_roots_contain_no_generated_native_artifacts() -> None:
     assert (package_root / "__init__.py").is_file()
     assert not list(package_root.rglob("*.so"))
     assert not list((REPOSITORY_ROOT / "mooncake-pg" / "torch").rglob("*.so"))
+
+
+def test_structured_object_storage_has_one_authoritative_source() -> None:
+    package_root = REPOSITORY_ROOT / "python" / "mooncake"
+    test_root = REPOSITORY_ROOT / "python" / "tests" / "store"
+    legacy_package_root = REPOSITORY_ROOT / "mooncake-wheel" / "mooncake"
+    legacy_test_root = REPOSITORY_ROOT / "mooncake-wheel" / "tests"
+
+    for module in ("structured_object_store.py", "_fast_copy.c"):
+        assert (package_root / module).is_file()
+        assert not (legacy_package_root / module).exists()
+
+    for test in ("test_structured_object_store.py", "test_fast_copy.py"):
+        assert (test_root / test).is_file()
+        assert not (legacy_test_root / test).exists()
+
+    cmake = (REPOSITORY_ROOT / "python" / "CMakeLists.txt").read_text()
+    assert '"${CMAKE_CURRENT_SOURCE_DIR}/mooncake/_fast_copy.c"' in cmake
+
+    legacy_build_script = (REPOSITORY_ROOT / "scripts" / "build_wheel.sh").read_text()
+    migrated_modules = (
+        legacy_build_script.split("MIGRATED_PYTHON_MODULES=(", 1)[1]
+        .split(")", 1)[0]
+        .split()
+    )
+    assert {"structured_object_store.py", "_fast_copy.c"} <= set(migrated_modules)
 
 
 def test_http_metadata_service_has_one_authoritative_source(
@@ -246,7 +276,6 @@ def test_scikit_build_consumes_unified_python_sources() -> None:
         "mooncake_connector_v1.py",
         "vllm_v1_proxy_server.py",
         "pg.py",
-        "structured_object_store.py",
         "dataproto_catalog.py",
     ):
         assert (REPOSITORY_ROOT / "mooncake-wheel" / "mooncake" / module).is_file()
