@@ -1204,6 +1204,10 @@ void HotStandbyService::ReplicationLoop() {
             const uint64_t expected_before =
                 oplog_applier_->GetExpectedSequenceId();
             auto result = batch_standby_reader_->PollOnce();
+            if (result.skipped_entries > 0) {
+                HAMetricManager::instance().inc_oplog_skipped_entries(
+                    static_cast<int64_t>(result.skipped_entries));
+            }
             if (result.durable_prefix_present ||
                 result.disposition ==
                     OpLogBatchStandbyPollDisposition::REBOOTSTRAP_REQUIRED) {
@@ -1303,6 +1307,10 @@ void HotStandbyService::ReplicationLoop() {
 
         const uint64_t applied_seq_id = applied_seq_id_.load();
         const uint64_t primary_seq_id = primary_seq_id_.load();
+        HAMetricManager::instance().set_oplog_standby_lag(
+            primary_seq_id > applied_seq_id
+                ? static_cast<int64_t>(primary_seq_id - applied_seq_id)
+                : 0);
         if (applied_seq_id != last_reported_applied_seq_id ||
             primary_seq_id != last_reported_primary_seq_id) {
             last_reported_applied_seq_id = applied_seq_id;
