@@ -16,6 +16,7 @@
 
 #include <unistd.h>
 
+#include <algorithm>
 #include <cctype>
 #include <cstdio>
 #include <fstream>
@@ -50,6 +51,65 @@ size_t detectBufferPageSize(void *addr) {
         }
     }
     return fallback;
+}
+
+bool hasHugepageAdvice(void *addr) {
+    std::ifstream smaps("/proc/self/smaps");
+    if (!smaps.is_open()) return false;
+
+    const uintptr_t target = reinterpret_cast<uintptr_t>(addr);
+    std::string line;
+    bool in_range = false;
+
+    while (std::getline(smaps, line)) {
+        if (!line.empty() &&
+            std::isxdigit(static_cast<unsigned char>(line[0]))) {
+            unsigned long start = 0, end = 0;
+            if (std::sscanf(line.c_str(), "%lx-%lx", &start, &end) == 2) {
+                in_range = target >= start && target < end;
+            }
+        } else if (in_range && line.compare(0, 8, "VmFlags:") == 0) {
+            // Two-letter flags separated by spaces; "hg" is MADV_HUGEPAGE.
+            return (line + " ").find(" hg ") != std::string::npos;
+        }
+    }
+    return false;
+}
+
+bool isThpBacked(void *addr, size_t length) {
+    std::ifstream smaps("/proc/self/smaps");
+    if (!smaps.is_open() || length == 0) return false;
+
+    const uintptr_t begin = reinterpret_cast<uintptr_t>(addr);
+    const uintptr_t finish = begin + length;
+    std::string line;
+    bool overlaps = false;
+    size_t covered = 0;
+    long rss_kb = -1;
+
+    while (std::getline(smaps, line)) {
+        if (!line.empty() &&
+            std::isxdigit(static_cast<unsigned char>(line[0]))) {
+            unsigned long start = 0, end = 0;
+            if (std::sscanf(line.c_str(), "%lx-%lx", &start, &end) == 2) {
+                overlaps = start < finish && end > begin;
+                if (overlaps)
+                    covered += std::min<uintptr_t>(end, finish) -
+                               std::max<uintptr_t>(start, begin);
+                rss_kb = -1;
+            }
+        } else if (overlaps && line.compare(0, 4, "Rss:") == 0) {
+            if (std::sscanf(line.c_str(), "Rss: %ld kB", &rss_kb) != 1)
+                return false;
+        } else if (overlaps && line.compare(0, 14, "AnonHugePages:") == 0) {
+            long thp_kb = -1;
+            if (std::sscanf(line.c_str(), "AnonHugePages: %ld kB", &thp_kb) !=
+                    1 ||
+                rss_kb <= 0 || thp_kb != rss_kb)
+                return false;
+        }
+    }
+    return covered == length;
 }
 
 uintptr_t alignPage(uintptr_t address) { return address & ~(pagesize - 1); }

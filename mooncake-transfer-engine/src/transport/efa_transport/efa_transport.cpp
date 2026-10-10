@@ -48,6 +48,8 @@ static constexpr size_t kDefaultMaxPteEntries = 22ULL * 1024 * 1024;  // 22M
 
 static size_t getMaxPteEntries() { return kDefaultMaxPteEntries; }
 
+static constexpr size_t kThpPageSize = 2ULL * 1024 * 1024;
+
 EfaTransport::EfaTransport() {
     LOG(INFO) << "[EFA] AWS Elastic Fabric Adapter transport initialized";
 }
@@ -182,9 +184,13 @@ int EfaTransport::preTouchMemory(void* addr, size_t length) {
 
     for (size_t thread_i = 0; thread_i < num_threads; ++thread_i) {
         void* block_addr = static_cast<char*>(addr) + thread_i * block_size;
-        threads.emplace_back([this, thread_i, block_addr, block_size,
+        // The last thread also takes the remainder.
+        size_t block_len = thread_i + 1 == num_threads
+                               ? length - thread_i * block_size
+                               : block_size;
+        threads.emplace_back([this, thread_i, block_addr, block_len,
                               &thread_results]() {
-            int ret = context_list_[0]->preTouchMemory(block_addr, block_size);
+            int ret = context_list_[0]->preTouchMemory(block_addr, block_len);
             thread_results[thread_i] = ret;
         });
     }
@@ -231,6 +237,25 @@ int EfaTransport::registerLocalMemoryInternal(void* addr, size_t length,
     // We detect the actual page size of the buffer and compute accordingly,
     // so hugepage-backed memory avoids unnecessary splitting.
     size_t page_size = detectBufferPageSize(addr);
+    // KernelPageSize reads 4KB for transparent huge pages, yet the NIC maps a
+    // THP-backed range with 2MB pages. For MADV_HUGEPAGE memory (e.g. Store
+    // segments), fault the buffer in now and, if THP backs all of it, budget
+    // PTEs at 2MB. Otherwise a large segment is partitioned so that each chunk
+    // is reachable through only one or two NICs.
+    bool pre_touched = false;
+    if (page_size < kThpPageSize && length >= kThpPageSize &&
+        context_list_.size() > 1 && hasHugepageAdvice(addr)) {
+        int ret = preTouchMemory(addr, length);
+        if (ret != 0) return ret;
+        pre_touched = true;
+        if (isThpBacked(addr, length)) {
+            page_size = kThpPageSize;
+        } else {
+            LOG(INFO) << "EFA: " << addr << " (" << length
+                      << " bytes) is not fully THP-backed, budgeting PTEs at "
+                      << page_size << " bytes";
+        }
+    }
     size_t pte_limit = getMaxPteEntries() * page_size;
     // When max_mr_size is not configured, fall back to pte_limit so that
     // PTE-aware splitting still kicks in for large buffers on 4KB pages.
@@ -401,7 +426,7 @@ int EfaTransport::registerLocalMemoryInternal(void* addr, size_t length,
         bool do_pre_touch = is_host_mem && context_list_.size() > 0 &&
                             std::thread::hardware_concurrency() >= 4 &&
                             chunk_len >= (size_t)4 * 1024 * 1024 * 1024;
-        if (do_pre_touch) {
+        if (do_pre_touch && !pre_touched) {
             int ret = preTouchMemory(chunk_addr, chunk_len);
             if (ret != 0) {
                 if (ci > 0) rollbackChunks(ci - 1);
