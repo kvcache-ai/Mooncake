@@ -105,6 +105,25 @@ if(WITH_TE)
         ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_tent_first_buffer.py)
     set_tests_properties(tent_python_first_buffer_test PROPERTIES TIMEOUT 60)
+
+    foreach(backend IN ITEMS classic tent)
+      set(backend_env --unset=MC_USE_TENT --unset=MC_USE_TEV1)
+      if(backend STREQUAL "tent")
+        list(APPEND backend_env MC_USE_TENT=1)
+      endif()
+      add_test(
+        NAME python_async_batch_${backend}_test
+        COMMAND
+          ${CMAKE_COMMAND} -E env ${backend_env}
+          MOONCAKE_LOCAL_HOSTNAME=127.0.0.1
+          "MC_TENT_CONF={\"transports\":{\"rdma\":{\"enable\":false},\"tcp\":{\"enable\":true},\"shm\":{\"enable\":false},\"gds\":{\"enable\":false}}}"
+          PYTHONPATH=$<TARGET_FILE_DIR:engine>
+          LD_LIBRARY_PATH=$<TARGET_FILE_DIR:transfer_engine>:$<TARGET_FILE_DIR:tent_metrics>:$<TARGET_FILE_DIR:asio_shared>
+          ${Python3_EXECUTABLE}
+          ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_async_batch_transfer.py)
+      set_tests_properties(python_async_batch_${backend}_test PROPERTIES TIMEOUT
+                                                                         60)
+    endforeach()
   endif()
 endif()
 
