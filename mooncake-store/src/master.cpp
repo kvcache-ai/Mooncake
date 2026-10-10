@@ -1,6 +1,8 @@
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 
+#include "tracing.h"
+
 #include <atomic>  // For std::atomic
 #include <chrono>  // For std::chrono
 #include <csignal>
@@ -456,6 +458,12 @@ DEFINE_string(cxl_path, mooncake::DEFAULT_CXL_PATH,
               "DAX device path for CXL memory");
 DEFINE_uint64(cxl_size, mooncake::DEFAULT_CXL_SIZE, "CXL memory size in bytes");
 DEFINE_bool(enable_cxl, false, "Whether to enable CXL memory support");
+DEFINE_string(otlp_traces_endpoint, "",
+              "OTLP traces collector endpoint, without a scheme: "
+              "\"host:port\" for --otlp_traces_protocol=grpc, or "
+              "\"host:port/path\" for http. When empty, tracing is disabled.");
+DEFINE_string(otlp_traces_protocol, "http",
+              "OTLP transport protocol for traces: http (default) or grpc.");
 
 namespace {
 
@@ -1527,6 +1535,9 @@ int main(int argc, char* argv[]) {
     // Initialize gflags
     gflags::SetVersionString(mooncake::MOONCAKE_DISPLAY_VERSION);
     gflags::ParseCommandLineFlags(&argc, &argv, true);
+
+    mooncake::InitTracing(FLAGS_otlp_traces_endpoint, "mooncake-master",
+                          FLAGS_otlp_traces_protocol);
 
     if (!FLAGS_log_dir.empty()) {
         // MC_LOG_DIR may have initialized glog (and set FLAGS_log_dir) from

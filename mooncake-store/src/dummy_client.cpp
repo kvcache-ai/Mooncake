@@ -18,6 +18,7 @@
 #include "uds_transport.h"
 #include "common/result.h"
 #include "common/scoped_vlog_timer.h"
+#include "request_context.h"
 #include "rpc_types.h"
 #include "types.h"
 #include "default_config.h"
@@ -198,10 +199,19 @@ tl::expected<ReturnType, ErrorCode> DummyClient::invoke_rpc(Args&&... args) {
 
     return async_simple::coro::syncAwait(
         [&]() -> async_simple::coro::Lazy<tl::expected<ReturnType, ErrorCode>> {
+            // Bypass inject: snapshot the calling (Python) thread's per-request
+            // RequestContext once at entry, then carry it on hop A via
+            // send_request_with_attachment. The hop A server handler reads it
+            // back (when it is a V3 context handler) and bridges it to hop B;
+            // non-reading handlers ignore it. Empty attachment == plain
+            // send_request (gray).
+            std::string ctx_attachment = current_request_context_attachment();
             auto ret = co_await pool->send_request(
                 [&](coro_io::client_reuse_hint,
                     coro_rpc::coro_rpc_client& client) {
-                    return client.send_request<ServiceMethod>(
+                    return client.send_request_with_attachment<ServiceMethod>(
+                        std::string_view(ctx_attachment.data(),
+                                         ctx_attachment.size()),
                         std::forward<Args>(args)...);
                 });
             if (!ret.has_value()) {
@@ -240,10 +250,16 @@ std::vector<tl::expected<ResultType, ErrorCode>> DummyClient::invoke_batch_rpc(
     return async_simple::coro::syncAwait(
         [&]() -> async_simple::coro::Lazy<
                   std::vector<tl::expected<ResultType, ErrorCode>>> {
+            // Bypass inject (see invoke_rpc): snapshot the per-request
+            // RequestContext on the calling thread once at entry and carry it
+            // on hop A via send_request_with_attachment.
+            std::string ctx_attachment = current_request_context_attachment();
             auto ret = co_await pool->send_request(
                 [&](coro_io::client_reuse_hint,
                     coro_rpc::coro_rpc_client& client) {
-                    return client.send_request<ServiceMethod>(
+                    return client.send_request_with_attachment<ServiceMethod>(
+                        std::string_view(ctx_attachment.data(),
+                                         ctx_attachment.size()),
                         std::forward<Args>(args)...);
                 });
             if (!ret.has_value()) {
@@ -1173,7 +1189,7 @@ uint64_t DummyClient::alloc_from_mem_pool(size_t size) {
 
 int DummyClient::put(const std::string& key, std::span<const char> value,
                      const ReplicateConfig& config) {
-    return invoke_observed_void_rpc<&RealClient::put_dummy_helper>(
+    return invoke_observed_void_rpc<&RealClient::put_dummy_helper_rpc>(
         TransferOperationKind::kWrite, "put", value.size_bytes(), false, key,
         value, config, client_id_);
 }
@@ -1181,7 +1197,7 @@ int DummyClient::put(const std::string& key, std::span<const char> value,
 int DummyClient::put_batch(const std::vector<std::string>& keys,
                            const std::vector<std::span<const char>>& values,
                            const ReplicateConfig& config) {
-    return invoke_observed_void_rpc<&RealClient::put_batch_dummy_helper>(
+    return invoke_observed_void_rpc<&RealClient::put_batch_dummy_helper_rpc>(
         TransferOperationKind::kWrite, "put_batch", sum_value_sizes(values),
         true, keys, values, config, client_id_);
 }
@@ -1189,7 +1205,7 @@ int DummyClient::put_batch(const std::vector<std::string>& keys,
 int DummyClient::put_parts(const std::string& key,
                            std::vector<std::span<const char>> values,
                            const ReplicateConfig& config) {
-    return invoke_observed_void_rpc<&RealClient::put_parts_dummy_helper>(
+    return invoke_observed_void_rpc<&RealClient::put_parts_dummy_helper_rpc>(
         TransferOperationKind::kWrite, "put_parts", sum_value_sizes(values),
         false, key, values, config, client_id_);
 }
@@ -1266,7 +1282,7 @@ int DummyClient::upsert_batch(const std::vector<std::string>& keys,
 
 int DummyClient::remove(const std::string& key, bool force) {
     return to_py_ret(
-        invoke_rpc<&RealClient::remove_internal, void>(key, force));
+        invoke_rpc<&RealClient::remove_internal_rpc, void>(key, force));
 }
 
 long DummyClient::removeByRegex(const std::string& str, bool force) {
@@ -1293,7 +1309,7 @@ std::vector<int> DummyClient::batchRemove(const std::vector<std::string>& keys,
 }
 
 int DummyClient::isExist(const std::string& key) {
-    auto result = invoke_rpc<&RealClient::isExist_internal, bool>(key);
+    auto result = invoke_rpc<&RealClient::isExist_internal_rpc, bool>(key);
 
     if (result.has_value()) {
         return *result ? 1 : 0;  // 1 if exists, 0 if not
@@ -1305,8 +1321,8 @@ int DummyClient::isExist(const std::string& key) {
 std::vector<int> DummyClient::batchIsExist(
     const std::vector<std::string>& keys) {
     auto internal_results =
-        invoke_batch_rpc<&RealClient::batchIsExist_internal, bool>(keys.size(),
-                                                                   keys);
+        invoke_batch_rpc<&RealClient::batchIsExist_internal_rpc, bool>(
+            keys.size(), keys);
     std::vector<int> results;
     results.reserve(internal_results.size());
 
@@ -1353,7 +1369,8 @@ std::vector<int> DummyClient::batchProbeKey(
 }
 
 int64_t DummyClient::getSize(const std::string& key) {
-    return to_py_ret(invoke_rpc<&RealClient::getSize_internal, int64_t>(key));
+    return to_py_ret(
+        invoke_rpc<&RealClient::getSize_internal_rpc, int64_t>(key));
 }
 
 std::shared_ptr<BufferHandle> DummyClient::get_buffer(const std::string& key) {
@@ -1738,7 +1755,7 @@ std::vector<int> DummyClient::batch_put_from(
     }
     const auto start_time = std::chrono::steady_clock::now();
     auto internal_results =
-        invoke_batch_rpc<&RealClient::batch_put_from_dummy_helper, void>(
+        invoke_batch_rpc<&RealClient::batch_put_from_dummy_helper_rpc, void>(
             keys.size(), keys, buffers, sizes, config, device_id_, client_id_);
     std::vector<int> results;
     results.reserve(internal_results.size());
@@ -1811,7 +1828,7 @@ std::vector<int64_t> DummyClient::batch_get_into(
     }
     const auto start_time = std::chrono::steady_clock::now();
     auto internal_results =
-        invoke_batch_rpc<&RealClient::batch_get_into_dummy_helper, int64_t>(
+        invoke_batch_rpc<&RealClient::batch_get_into_dummy_helper_rpc, int64_t>(
             keys.size(), keys, buffers, sizes, device_id_, client_id_);
     auto results = expected_results_to_py(internal_results);
 
