@@ -372,6 +372,31 @@ TEST_F(MasterServiceEvictScenarioTest, ActiveGroupMemberBlocksWholeGroup) {
         .Then(Object(Key(kGroupSize)).DoesNotExist());
 }
 
+TEST_F(MasterServiceEvictScenarioTest,
+       ProbedObjectsStayEvictableWhileLeasedObjectsSurvive) {
+    auto config = EvictConfig();
+    config.default_kv_lease_ttl = 60 * 60 * 1000;
+    MasterScenario scenario("batch probe grants no lease", config);
+    scenario.Given(MemoryNode("memory"))
+        .Given(Objects({"leased_a", "leased_b", "probed_a", "probed_b"})
+                   .Size(kObjectSize)
+                   .CompleteOn("memory")
+                   .ExpiredFrom(ExpiredBase()))
+        // BatchExistence grants every hit a fresh lease. BatchProbe reports
+        // the same hits and leaves their expired leases untouched.
+        .Then(BatchExistence({"leased_a", "leased_b"}).Returns({true, true}))
+        .Then(BatchProbe({"probed_a", "missing", "probed_b", "probed_a"})
+                  .Returns({true, false, true, true}))
+        .When(EvictMemory(1.0))
+        .Then(Objects({"leased_a", "leased_b"}).AreReadable())
+        .Then(Objects({"probed_a", "probed_b"}).DoNotExist())
+        // Once those leases expire, the same pass reclaims the leased objects.
+        .When(ExpireAt("leased_a", ExpiredBase()))
+        .When(ExpireAt("leased_b", ExpiredBase()))
+        .When(EvictMemory(1.0))
+        .Then(Objects({"leased_a", "leased_b"}).DoNotExist());
+}
+
 TEST_F(MasterServiceEvictScenarioTest, EvictsExactOldestObjectsAtHighRatio) {
     constexpr size_t kObjectCount = 200;
     constexpr size_t kExpectedEvicted = 160;

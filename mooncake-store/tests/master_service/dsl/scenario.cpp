@@ -209,6 +209,12 @@ BatchExistenceSpec BatchExistence(std::initializer_list<std::string> keys) {
     return existence;
 }
 
+BatchProbeSpec BatchProbe(std::initializer_list<std::string> keys) {
+    BatchProbeSpec probe;
+    probe.keys.assign(keys.begin(), keys.end());
+    return probe;
+}
+
 BatchReplicaListsSpec BatchReplicaLists(
     std::initializer_list<std::string> keys) {
     BatchReplicaListsSpec replica_lists;
@@ -1905,6 +1911,31 @@ MasterScenario& MasterScenario::Then(BatchExistenceSpec batch_existence) {
         } else if (*result[index] != batch_existence.expected[index]) {
             Fail("BatchExistence returned an unexpected result for key " +
                  batch_existence.keys[index]);
+        }
+    }
+    return *this;
+}
+
+MasterScenario& MasterScenario::Then(BatchProbeSpec batch_probe) {
+    if (!EnsureService()) {
+        return *this;
+    }
+
+    const auto result =
+        service_->BatchProbeKey(batch_probe.keys, TenantId(batch_probe.tenant));
+    if (result.size() != batch_probe.expected.size()) {
+        Fail("BatchProbe returned " + std::to_string(result.size()) +
+             " results; expected " +
+             std::to_string(batch_probe.expected.size()));
+        return *this;
+    }
+    for (size_t index = 0; index < result.size(); ++index) {
+        if (!result[index]) {
+            Fail("BatchProbe failed for key " + batch_probe.keys[index] + ": " +
+                 toString(result[index].error()));
+        } else if (*result[index] != batch_probe.expected[index]) {
+            Fail("BatchProbe returned an unexpected result for key " +
+                 batch_probe.keys[index]);
         }
     }
     return *this;
