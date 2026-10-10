@@ -4,6 +4,8 @@
 
 set -e  # Exit immediately if a command exits with a non-zero status
 
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+
 # Ensure LD_LIBRARY_PATH includes /usr/local/lib
 export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
 
@@ -43,21 +45,10 @@ cp -r python/tests/unit test_env/unit_tests
 cp -r mooncake-reshard/tests test_env/reshard_tests
 cp -r python/tests/ssd test_env/ssd_tests
 cd test_env
-# Pin torch to a PG build the wheel actually ships, otherwise a fresh PyPI
-# release makes mooncake.pg raise ImportError and the pg tests go red (#4439).
-pg_torch=$(python -c '
-import pkgutil, re, mooncake
-vers = [tuple(map(int, m.groups())) for m in
-        (re.fullmatch(r"pg_(\d+)_(\d+)_(\d+)", mod.name)
-         for mod in pkgutil.iter_modules(mooncake.__path__))
-        if m]
-print(".".join(map(str, max(vers))) if vers else "")
-' || true)
-if [ -n "$pg_torch" ]; then
-  pip install "torch==$pg_torch" numpy
-else
-  pip install torch numpy
-fi
+torch_requirement=$(python "$script_dir/ci/select_pg_torch_version.py" \
+    ../mooncake-wheel/dist/*.whl)
+echo "Installing $torch_requirement for the bundled PG extensions"
+pip install "$torch_requirement" numpy
 python -c "import mooncake._fast_copy"
 python tests/test_fast_copy.py
 python tests/test_import_structure.py
