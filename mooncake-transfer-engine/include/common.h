@@ -585,6 +585,37 @@ static inline size_t getHandshakeMaxLength() {
     return max_length;
 }
 
+// Constants for the handshake daemon's pending-notify bound.
+constexpr size_t kDefaultHandshakeMaxNotifyEntries = 1024;
+constexpr size_t kMaxHandshakeMaxNotifyEntries = 1ULL << 20;
+
+// Load the pending-notify bound from the environment variable.
+static inline size_t loadHandshakeMaxNotifyEntries() {
+    const char *env = std::getenv("MC_HANDSHAKE_MAX_NOTIFY_ENTRIES");
+    if (env != nullptr) {
+        std::string_view env_sv(env);
+        size_t val = 0;
+        auto [ptr, ec] =
+            std::from_chars(env_sv.data(), env_sv.data() + env_sv.size(), val);
+        if (ec == std::errc() && ptr == env_sv.data() + env_sv.size() &&
+            val >= 1 && val <= kMaxHandshakeMaxNotifyEntries) {
+            LOG(INFO) << "MC_HANDSHAKE_MAX_NOTIFY_ENTRIES set to " << val;
+            return val;
+        }
+        LOG(WARNING) << "Invalid MC_HANDSHAKE_MAX_NOTIFY_ENTRIES value: " << env
+                     << ", valid range: 1 to " << kMaxHandshakeMaxNotifyEntries
+                     << ", using default " << kDefaultHandshakeMaxNotifyEntries;
+    }
+    return kDefaultHandshakeMaxNotifyEntries;
+}
+
+// Get the pending-notify bound.
+// Loaded once from MC_HANDSHAKE_MAX_NOTIFY_ENTRIES at first call.
+static inline size_t getHandshakeMaxNotifyEntries() {
+    static size_t max_entries = loadHandshakeMaxNotifyEntries();
+    return max_entries;
+}
+
 static inline std::pair<HandShakeRequestType, std::string> readString(int fd) {
     HandShakeRequestType type = HandShakeRequestType::Invalid;
 
