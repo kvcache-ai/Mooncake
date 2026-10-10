@@ -55,7 +55,7 @@ ASCEND_AUTO_CONNECT: 需要CANN升级到9.0之后的版本，默认值为1：当
 ASCEND_ENABLE_USE_FABRIC_MEM：需要CANN升级到9.0之后的版本，HDK升级到26.0之后的版本，在支持该功能的版本使用Mooncake Store时推荐启用：可显著提升传输性能。
 ASCEND_USE_ASYNC_TRANSFER: 需要CANN升级到8.5之后的版本，用于开启Hixl异步传输模式，默认为同步模式。
 ASCEND_GLOBAL_RESOURCE_CONFIG：配置Hixl的全局资源，具体查看hixl的文档关于OPTION_GLOBAL_RESOURCE_CONFIG的配置。
-
+MC_CUSTOM_TOPO_JSON：网卡拓扑JSON文件路径，TE也用它为HIXL配置`comm_resource_config.nic_topo_path`（`npu:<user_device_id>`）以生成Host RoCE endpoint。
 
 ### 注意事项（必看）
 1. 调用TransferEngine initialize前需要set device, 比如`torch.npu.set_device(0)`。

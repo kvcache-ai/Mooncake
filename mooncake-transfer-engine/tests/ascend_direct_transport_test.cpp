@@ -679,6 +679,7 @@ class AscendDirectTransportTest : public ::testing::Test {
     void SetUp() override {
         // Unit tests mock explicit Connect(); disable auto-connect by default.
         setenv("ASCEND_AUTO_CONNECT", "0", 1);
+        unsetenv("MC_CUSTOM_TOPO_JSON");
         mock_acl::reset();
         adxl_mock::reset();
 
@@ -701,6 +702,9 @@ class AscendDirectTransportTest : public ::testing::Test {
 
     void TearDown() override {
         unsetenv("ASCEND_AUTO_CONNECT");
+        unsetenv("MC_CUSTOM_TOPO_JSON");
+        unsetenv("ASCEND_GLOBAL_RESOURCE_CONFIG");
+        unsetenv("HCCL_INTRA_ROCE_ENABLE");
         ContextManager::getInstance().finalize();
         google::ShutdownGoogleLogging();
     }
@@ -2629,6 +2633,118 @@ TEST(StoreResourceConfigSplitTest, IsRoceModeEnabled_StoreRoceP2pHccs) {
         EXPECT_FALSE(IsRoceModeEnabled()) << "P2P TE should resolve to HCCS";
     }
     unsetenv("ASCEND_GLOBAL_RESOURCE_CONFIG");
+}
+
+// -----------------------------------------------------------------------------
+// Inject MC_CUSTOM_TOPO_JSON as comm_resource_config.nic_topo_path when the
+// HIXL global resource config leaves nic_topo_path empty (Host RoCE endpoint
+// auto-generation fallback).
+// -----------------------------------------------------------------------------
+
+namespace {
+struct CustomTopoJsonScope {
+    explicit CustomTopoJsonScope(const char* value) {
+        if (value == nullptr) {
+            unsetenv("MC_CUSTOM_TOPO_JSON");
+        } else {
+            setenv("MC_CUSTOM_TOPO_JSON", value, 1);
+        }
+    }
+    ~CustomTopoJsonScope() { unsetenv("MC_CUSTOM_TOPO_JSON"); }
+};
+}  // namespace
+
+TEST(InjectNicTopoPathTest, NoCustomTopoJson_ConfigUnchanged) {
+    CustomTopoJsonScope env(nullptr);
+    const std::string cfg =
+        R"({"comm_resource_config":{"protocol_desc":"roce:host"}})";
+    EXPECT_EQ(InjectNicTopoPathFromCustomTopoEnvTe(cfg), cfg);
+}
+
+TEST(InjectNicTopoPathTest, EmptyConfig_CreatesConfigWithFlatKey) {
+    CustomTopoJsonScope env("/etc/mooncake/nic_topo.json");
+    const std::string out = InjectNicTopoPathFromCustomTopoEnvTe("");
+    EXPECT_NE(out.find("comm_resource_config.nic_topo_path"),
+              std::string::npos);
+    EXPECT_NE(out.find("/etc/mooncake/nic_topo.json"), std::string::npos);
+}
+
+TEST(InjectNicTopoPathTest, EmptyNicTopoPath_IsInjected) {
+    CustomTopoJsonScope env("/etc/mooncake/nic_topo.json");
+    const std::string out = InjectNicTopoPathFromCustomTopoEnvTe(
+        R"({"comm_resource_config.nic_topo_path":""})");
+    EXPECT_NE(out.find("/etc/mooncake/nic_topo.json"), std::string::npos);
+}
+
+TEST(InjectNicTopoPathTest, FlatNicTopoPath_NotOverwritten) {
+    CustomTopoJsonScope env("/etc/mooncake/nic_topo.json");
+    const std::string cfg =
+        R"({"comm_resource_config.nic_topo_path":"/explicit.json"})";
+    EXPECT_EQ(InjectNicTopoPathFromCustomTopoEnvTe(cfg), cfg);
+}
+
+TEST(InjectNicTopoPathTest, NestedNicTopoPath_NotOverwritten) {
+    CustomTopoJsonScope env("/etc/mooncake/nic_topo.json");
+    const std::string cfg =
+        R"({"comm_resource_config":{"nic_topo_path":"/explicit.json"}})";
+    EXPECT_EQ(InjectNicTopoPathFromCustomTopoEnvTe(cfg), cfg);
+}
+
+TEST(InjectNicTopoPathTest, ProtocolDescPreservedWhenInjected) {
+    CustomTopoJsonScope env("/etc/mooncake/nic_topo.json");
+    const std::string out = InjectNicTopoPathFromCustomTopoEnvTe(
+        R"({"comm_resource_config":{"protocol_desc":"roce:host"}})");
+    EXPECT_NE(out.find("roce:host"), std::string::npos);
+    EXPECT_NE(out.find("/etc/mooncake/nic_topo.json"), std::string::npos);
+    // A nested comm_resource_config already exists: inject nested, not flat.
+    EXPECT_EQ(out.find("comm_resource_config.nic_topo_path"),
+              std::string::npos);
+}
+
+TEST(InjectNicTopoPathTest, NestedCommResourceConfigInjectsNestedDropsFlat) {
+    CustomTopoJsonScope env("/etc/mooncake/nic_topo.json");
+    const std::string out = InjectNicTopoPathFromCustomTopoEnvTe(
+        R"({"comm_resource_config":{"protocol_desc":"roce:host"},)"
+        R"("comm_resource_config.nic_topo_path":""})");
+    EXPECT_NE(out.find("/etc/mooncake/nic_topo.json"), std::string::npos);
+    EXPECT_EQ(out.find("comm_resource_config.nic_topo_path"),
+              std::string::npos)
+        << "the flat key must be dropped once the nested object is used";
+}
+
+TEST(InjectNicTopoPathTest, InvalidJson_Unchanged) {
+    CustomTopoJsonScope env("/etc/mooncake/nic_topo.json");
+    const std::string cfg = "{not json";
+    EXPECT_EQ(InjectNicTopoPathFromCustomTopoEnvTe(cfg), cfg);
+}
+
+// End-to-end: MC_CUSTOM_TOPO_JSON is injected regardless of the transport
+// scenario (HIXL decides whether to consume nic_topo_path).
+TEST_F(AscendDirectTransportTest, GlobalResourceConfig_InjectsCustomTopoJson) {
+    unsetenv("HCCL_INTRA_ROCE_ENABLE");
+    unsetenv("ASCEND_GLOBAL_RESOURCE_CONFIG");
+    setenv("MC_CUSTOM_TOPO_JSON", "/etc/mooncake/nic_topo.json", 1);
+    mock_acl::set_device_count(1);
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+    const auto opts = adxl_mock::get_last_init_options();
+    auto it = opts.find("GlobalResourceConfig");
+    ASSERT_NE(it, opts.end());
+    EXPECT_NE(it->second.find("/etc/mooncake/nic_topo.json"),
+              std::string::npos);
+    unsetenv("MC_CUSTOM_TOPO_JSON");
+}
+
+TEST_F(AscendDirectTransportTest,
+       GlobalResourceConfig_NoInjectWithoutCustomTopoJson) {
+    unsetenv("ASCEND_GLOBAL_RESOURCE_CONFIG");
+    unsetenv("MC_CUSTOM_TOPO_JSON");
+    mock_acl::set_device_count(1);
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+    const auto opts = adxl_mock::get_last_init_options();
+    EXPECT_EQ(opts.find("GlobalResourceConfig"), opts.end())
+        << "GlobalResourceConfig must stay unset when nothing is configured";
 }
 
 // -----------------------------------------------------------------------------

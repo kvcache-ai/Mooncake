@@ -68,6 +68,7 @@ The following environment variables can be configured to control Ascend Direct T
 - **ASCEND_ENABLE_USE_FABRIC_MEM**: Requires CANN 9.0+ and HDK 26.0+. Recommended when using Mooncake Store on supported A3 platforms: it can significantly improve transmission performance.
 - **ASCEND_USE_ASYNC_TRANSFER**: Requires CANN 8.5+. Enables HIXL asynchronous transfer mode, defaults to synchronous mode.
 - **ASCEND_GLOBAL_RESOURCE_CONFIG**: Configures HIXL global resources. Refer to HIXL documentation for `OPTION_GLOBAL_RESOURCE_CONFIG` settings.
+- **MC_CUSTOM_TOPO_JSON**: Path to a NIC topology JSON file; Transfer Engine also uses it to configure HIXL's `comm_resource_config.nic_topo_path` (`npu:<user_device_id>` key) for Host RoCE endpoint generation.
 
 ### Important Notes
 
