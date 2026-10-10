@@ -4105,6 +4105,8 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
         bounded_memory_ranges;
     std::unordered_map<std::string, uint64_t> restored_accounted_memory_bytes;
     size_t restored_object_count = 0;
+    size_t dropped_stale_replica_count = 0;
+    size_t skipped_stale_object_count = 0;
 
     size_t rejected_count = 0;
     // Objects skipped because the live index already holds them are not
@@ -4126,6 +4128,7 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
         std::unordered_map<size_t, std::vector<PreparedObject>>
             objects_by_shard;
         std::unordered_set<std::string> chunk_object_ids;
+        size_t chunk_skipped_objects = 0;
         for (const auto& entry : objects) {
             auto [tenant_id, user_key] = resolve_standby_object(entry);
             if (!tenant_id.IsValid()) {
@@ -4157,6 +4160,7 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
             const auto& standby_meta = entry.metadata;
             std::vector<Replica> replicas;
             replicas.reserve(standby_meta.replicas.size());
+            bool dropped_stale_replica = false;
 
             for (const auto& desc : standby_meta.replicas) {
                 if (desc.is_memory_replica()) {
@@ -4165,12 +4169,19 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
                     auto segment_it = memory_segments_by_alias.find(
                         buffer.transport_endpoint_);
                     if (segment_it == memory_segments_by_alias.end()) {
-                        LOG(ERROR)
-                            << "RestoreFromStandbySnapshot: unknown memory "
+                        // The snapshot can still carry replicas on segments
+                        // that were unloaded before the handoff. Those are
+                        // gone for good, so drop just these replicas instead
+                        // of failing the whole promotion.
+                        LOG(WARNING)
+                            << "RestoreFromStandbySnapshot: dropping replica "
+                            << "id=" << desc.id << " on unknown memory "
                             << "endpoint=" << buffer.transport_endpoint_
                             << ", tenant=" << tenant_id.value()
                             << ", key=" << user_key;
-                        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+                        ++dropped_stale_replica_count;
+                        dropped_stale_replica = true;
+                        continue;
                     }
                     if (buffer.size_ != standby_meta.size ||
                         buffer.size_ == 0 ||
@@ -4289,6 +4300,14 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
                     return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
                 }
             }
+            if (replicas.empty() && dropped_stale_replica) {
+                LOG(WARNING)
+                    << "RestoreFromStandbySnapshot: skipping object with no "
+                    << "surviving replicas, tenant=" << tenant_id.value()
+                    << ", key=" << user_key;
+                ++chunk_skipped_objects;
+                continue;
+            }
             objects_by_shard[shard_idx].push_back({&entry, std::move(tenant_id),
                                                    std::move(user_key),
                                                    std::move(replicas)});
@@ -4349,7 +4368,8 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
                                             object.user_key);
             }
         }
-        restored_object_count += objects.size();
+        restored_object_count += objects.size() - chunk_skipped_objects;
+        skipped_stale_object_count += chunk_skipped_objects;
         return {};
     };
 
@@ -4566,6 +4586,12 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
               << " segments, initial_seq_id=" << initial_oplog_sequence_id
               << ", invalid_endpoints=" << invalid_replica_endpoints_.size()
               << ", rejected_objects=" << rejected_count;
+    if (dropped_stale_replica_count > 0) {
+        LOG(WARNING) << "Restored from standby dropped "
+                     << dropped_stale_replica_count
+                     << " stale replicas on unloaded segments, skipped "
+                     << skipped_stale_object_count << " objects";
+    }
     return {};
 }
 
