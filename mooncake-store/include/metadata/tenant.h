@@ -26,7 +26,7 @@
 
 #include "group_index.h"
 #include "object_index.h"
-#include "tenant_quota.h"
+#include "tenant/quota.h"
 
 namespace mooncake {
 namespace metadata {
