@@ -2,8 +2,10 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <csignal>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string_view>
 #include <thread>
@@ -14,7 +16,7 @@
 #include "config/rpc_protocol_config.h"
 #include "ha/leadership/leader_coordinator_factory.h"
 #include "ha/leadership/leader_label_reconciler.h"
-#include "ha/kv/ha_kv_backend_factory.h"
+#include "ha/kv/etcd_ha_kv_backend.h"
 #include "ha/oplog/oplog_batch_storage.h"
 #include "ha/standby_controller.h"
 #include "k8s_lease_helper.h"
@@ -86,6 +88,69 @@ bool IsFatalHABackendError(ErrorCode err) {
     return err == ErrorCode::INVALID_PARAMS ||
            err == ErrorCode::UNAVAILABLE_IN_CURRENT_MODE;
 }
+
+// Polls RenewLeadership on a side thread so a long Oplog catch-up cannot
+// outlive the lease. Etcd keepalive starts on the first successful renew and
+// keeps running after this guard stops; the guard only stops polling.
+class LeadershipRenewalGuard {
+   public:
+    LeadershipRenewalGuard(LeaderCoordinator& coordinator,
+                           const LeadershipSession& session)
+        : coordinator_(coordinator) {
+        worker_ = std::thread([this, &session] {
+            bool logged_start = false;
+            while (!stop_.load(std::memory_order_acquire)) {
+                auto renewed = coordinator_.RenewLeadership(session);
+                if (!renewed) {
+                    LOG(WARNING) << "Leadership renewal failed during recovery: "
+                                 << toString(renewed.error());
+                    lost_.store(true, std::memory_order_release);
+                    return;
+                }
+                if (!renewed.value()) {
+                    LOG(WARNING) << "Leadership lease lost during recovery";
+                    lost_.store(true, std::memory_order_release);
+                    return;
+                }
+                if (!logged_start) {
+                    logged_start = true;
+                    LOG(INFO) << "Leadership keepalive covers oplog catch-up, "
+                              << "lease_ttl_sec=" << session.lease_ttl.count();
+                }
+                std::unique_lock<std::mutex> lock(mutex_);
+                cv_.wait_for(lock, kRenewCheckInterval, [this] {
+                    return stop_.load(std::memory_order_acquire);
+                });
+            }
+        });
+    }
+
+    ~LeadershipRenewalGuard() { Stop(); }
+
+    LeadershipRenewalGuard(const LeadershipRenewalGuard&) = delete;
+    LeadershipRenewalGuard& operator=(const LeadershipRenewalGuard&) = delete;
+
+    void Stop() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stop_.store(true, std::memory_order_release);
+        }
+        cv_.notify_all();
+        if (worker_.joinable()) {
+            worker_.join();
+        }
+    }
+
+    bool Lost() const { return lost_.load(std::memory_order_acquire); }
+
+   private:
+    LeaderCoordinator& coordinator_;
+    std::thread worker_;
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    std::atomic<bool> stop_{false};
+    std::atomic<bool> lost_{false};
+};
 
 void LogLeadershipReleaseWarning(std::string_view context, ErrorCode err) {
     if (err == ErrorCode::OK) {
@@ -202,21 +267,16 @@ void ApplyCurrentView(MasterAdminServer& admin_server,
 ErrorCode ClaimProducerViewForServing(
     const HABackendSpec& spec, const MasterServiceSupervisorConfig& config,
     ViewVersionId view_version) {
-    if (!config.enable_oplog || config.cluster_id.empty()) {
+    if (!config.enable_oplog || spec.type != HABackendType::ETCD ||
+        config.cluster_id.empty()) {
         return ErrorCode::OK;
-    }
-    if (!HaBackendSupportsOpLog(spec.type)) {
-        return ErrorCode::INVALID_PARAMS;
     }
     if (view_version == 0) {
         return ErrorCode::INVALID_PARAMS;
     }
 
-    auto backend = CreateHaKvBackend(spec);
-    if (!backend) {
-        return backend.error();
-    }
-    OpLogBatchStorage storage(config.cluster_id, *backend.value());
+    EtcdHaKvBackend backend;
+    OpLogBatchStorage storage(config.cluster_id, backend);
     return storage.ClaimProducerView(view_version);
 }
 
@@ -353,6 +413,11 @@ int RunSupervisorLoop(const HABackendSpec& spec,
             continue;
         }
 
+        // Start the lease keepalive before catch-up. The grant happens in
+        // TryAcquireLeadership, but etcd KeepAlive previously started only in
+        // the warmup phase, so a large Oplog replay expired the lease first.
+        LeadershipRenewalGuard renewal(leader_coordinator, *leadership_session);
+
         auto claim_error = ClaimProducerViewForServing(
             spec, config, leadership_session->view.view_version);
         if (claim_error != ErrorCode::OK) {
@@ -383,14 +448,45 @@ int RunSupervisorLoop(const HABackendSpec& spec,
             continue;
         }
 
+        auto return_to_standby =
+            [&](const std::optional<MasterView>& leader_view) {
+                if (promotion_ctx->metadata_store) {
+                    const uint64_t applied_seq =
+                        promotion_ctx->applied_cursor.last_seq;
+                    auto restore_err =
+                        standby_controller->RestorePromotionBaseline(
+                            std::move(*promotion_ctx));
+                    if (restore_err != ErrorCode::OK) {
+                        LOG(ERROR)
+                            << "Failed to preserve catch-up cursor seq="
+                            << applied_seq << ": " << toString(restore_err);
+                    } else {
+                        LOG(INFO) << "Preserved catch-up cursor for retry, "
+                                  << "applied_seq=" << applied_seq;
+                    }
+                }
+                EnterStandbyMode(admin_server, *standby_controller,
+                                 accept_standby_runtime_updates, leader_view);
+            };
+
+        if (renewal.Lost()) {
+            LOG(WARNING) << "Leadership expired during oplog catch-up, "
+                         << "applied_seq="
+                         << promotion_ctx->applied_cursor.last_seq;
+            return_to_standby(std::nullopt);
+            LogLeadershipReleaseWarning(
+                "catch-up lease loss",
+                leader_coordinator.ReleaseLeadership(*leadership_session));
+            admin_server.SetObservedLeader(std::nullopt);
+            continue;
+        }
+
         LOG(INFO) << "Entering warmup phase...";
         SetRuntimeState(admin_server, MasterRuntimeState::kLeaderWarmup);
         auto warmup_result =
             WarmupLeadership(leader_coordinator, *leadership_session);
         if (!warmup_result) {
-            EnterStandbyMode(admin_server, *standby_controller,
-                             accept_standby_runtime_updates,
-                             leadership_session->view);
+            return_to_standby(leadership_session->view);
             if (HandleLeadershipPhaseError(
                     "renewal startup failure", "start leadership renewal",
                     leader_coordinator, *leadership_session,
@@ -400,8 +496,7 @@ int RunSupervisorLoop(const HABackendSpec& spec,
             continue;
         }
         if (!warmup_result.value()) {
-            EnterStandbyMode(admin_server, *standby_controller,
-                             accept_standby_runtime_updates, std::nullopt);
+            return_to_standby(std::nullopt);
             LogLeadershipReleaseWarning(
                 "warmup expiration",
                 leader_coordinator.ReleaseLeadership(*leadership_session));
