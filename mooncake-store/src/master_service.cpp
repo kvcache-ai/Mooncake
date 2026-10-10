@@ -385,6 +385,19 @@ MasterService::MasterService(const MasterServiceConfig& config)
                          "cap will be evicted without disk offload";
         }
     }
+    // With offload_on_evict every evictee goes through the offload cap; a cap
+    // that rounds to zero would skip every candidate and the eviction thread
+    // would back off and re-run forever without freeing anything.
+    if (offload_on_evict_ &&
+        static_cast<long>(offloading_queue_limit_ * offload_cap_ratio_) < 1) {
+        LOG(ERROR) << "offload_on_evict requires a per-cycle offload cap of at "
+                   << "least one object, but offloading_queue_limit ("
+                   << offloading_queue_limit_ << ") * offload_cap_ratio ("
+                   << offload_cap_ratio_ << ") rounds to zero";
+        throw std::invalid_argument(
+            "offload_on_evict requires offloading_queue_limit * "
+            "offload_cap_ratio >= 1");
+    }
 
     // Promotion-on-hit: when Get observes a LOCAL_DISK-only key, queue an
     // async copy back to MEMORY. Only meaningful when offload is enabled
@@ -11084,9 +11097,19 @@ void MasterService::EvictionThreadFunc() {
             double evict_ratio_lowerbound =
                 std::max(evict_ratio_target * 0.5,
                          used_ratio - eviction_high_watermark_ratio_);
-            BatchEvict(evict_ratio_target, evict_ratio_lowerbound);
+            const bool freed_now =
+                BatchEvict(evict_ratio_target, evict_ratio_lowerbound);
             LOG(INFO) << "[EVICT-DONE] BatchEvict execution completed.";
             last_discard_time = now;
+            if (!freed_now && !need_mem_eviction_) {
+                // Every evictee is waiting for its owner to write it to disk;
+                // nothing more can be freed until those offloads complete, so
+                // wait instead of re-scanning every kEvictionThreadSleepMs
+                // (each extra cycle would queue and pin the next ratio of the
+                // store). A failed allocation still wakes the next cycle.
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(kEvictionDeferredBackoffMs));
+            }
         } else if (now - last_discard_time > put_start_release_timeout_sec_) {
             // Try discarding expired processing keys and ongoing replication
             // tasks if we have not done this for a long time.
@@ -12133,7 +12156,7 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
     return total;
 }
 
-void MasterService::BatchEvict(double evict_ratio_target,
+bool MasterService::BatchEvict(double evict_ratio_target,
                                double evict_ratio_lowerbound) {
     // Consume the allocation-pressure signal before this pass. A new failure
     // during the pass remains visible to the next iteration.
@@ -12201,6 +12224,12 @@ void MasterService::BatchEvict(double evict_ratio_target,
         offload_on_evict_
             ? static_cast<long>(offloading_queue_limit_ * offload_cap_ratio_)
             : 0;
+    // The cap bounds what is in flight to the owners: objects queued in this
+    // and earlier cycles whose memory replica is still pinned. The census
+    // below counts the pending tasks and leaves this cycle the remaining room.
+    long pending_offloads = 0;
+    long offload_room = offload_cap;
+    bool offload_room_exhausted = false;
 
     auto has_local_disk_replica = [](const ObjectMetadata& metadata) {
         return metadata.HasReplica(&Replica::fn_is_local_disk_replica);
@@ -12209,10 +12238,11 @@ void MasterService::BatchEvict(double evict_ratio_target,
     // Returns freed bytes. Returns 0 if offload-queued and no additional
     // replicas were evicted (all MEMORY replicas of the key are now pinned).
     auto try_evict_or_offload =
-        [&, this](
-            const TenantId& tenant_id, const std::string& key,
-            ObjectMetadata& metadata, TenantState& tenant_state,
-            std::vector<std::vector<Replica>>& deferred_replicas) -> uint64_t {
+        [&, this](const TenantId& tenant_id, const std::string& key,
+                  ObjectMetadata& metadata, TenantState& tenant_state,
+                  std::vector<std::vector<Replica>>& deferred_replicas,
+                  bool& deferred_for_offload) -> uint64_t {
+        deferred_for_offload = false;
         if (enable_oplog_) {
             return evict_replicas(tenant_state, metadata, deferred_replicas);
         }
@@ -12226,12 +12256,19 @@ void MasterService::BatchEvict(double evict_ratio_target,
             return evict_replicas(tenant_state, metadata, deferred_replicas);
         }
 
-        // Force-evict cap: if force_evict enabled and cap reached, force
-        // delete. Warning is aggregated at the end of the cycle to avoid log
-        // flooding.
-        if (offload_force_evict_ && offload_queued_this_cycle >= offload_cap) {
-            offload_cap_forced_count++;
-            return evict_replicas(tenant_state, metadata, deferred_replicas);
+        // No room left in flight: with offload_force_evict and a failed
+        // allocation the object is dropped to free memory now (the warning is
+        // aggregated at the end of the cycle); otherwise it is skipped, the
+        // pass goes on freeing objects the owners have already written, and
+        // the eviction thread waits for the owners to drain the queue.
+        if (offload_queued_this_cycle >= offload_room) {
+            if (offload_force_evict_ && allocation_pressure) {
+                offload_cap_forced_count++;
+                return evict_replicas(tenant_state, metadata,
+                                      deferred_replicas);
+            }
+            offload_room_exhausted = true;
+            return 0;
         }
 
         // Queue one MEMORY replica for offload; others will be evicted below.
@@ -12256,6 +12293,12 @@ void MasterService::BatchEvict(double evict_ratio_target,
         if (queued) {
             offload_queued_this_cycle++;
             offload_deferred_count++;
+            // The pinned replica is released once the owner has written it to
+            // disk. For this cycle's target the object counts as evicted now;
+            // otherwise the pass ran on past the offload cap and through the
+            // shard-ordered second pass, removing cap + ratio x base objects
+            // per cycle and dropping objects of any age without offload.
+            deferred_for_offload = true;
             // Any remaining MEMORY replicas with refcnt==0 are redundant copies
             // (data survives via the pinned replica → disk). Evict them now to
             // reclaim memory immediately rather than waiting another cycle.
@@ -12391,10 +12434,13 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 if (!submission) {
                     return {.stop_scan = true};
                 }
-                uint64_t freed = try_evict_or_offload(
-                    tenant_id, key, metadata, tenant_state, deferred_replicas);
-                EvictionResult result{.freed_bytes = freed,
-                                      .evicted_objects = freed > 0 ? 1 : 0};
+                bool deferred = false;
+                uint64_t freed =
+                    try_evict_or_offload(tenant_id, key, metadata, tenant_state,
+                                         deferred_replicas, deferred);
+                EvictionResult result{
+                    .freed_bytes = freed,
+                    .evicted_objects = (freed > 0 || deferred) ? 1 : 0};
                 if (!enable_oplog_ && freed > 0) {
                     PublishKvRemovedAfterEvict(key, 1, "cpu", metadata,
                                                tenant_id);
@@ -12431,11 +12477,13 @@ void MasterService::BatchEvict(double evict_ratio_target,
             if (!submission) {
                 return {.stop_scan = true};
             }
+            bool deferred = false;
             const uint64_t freed =
                 try_evict_or_offload(tenant_id, member_key, member_metadata,
-                                     state, deferred_replicas);
-            EvictMemberOutcome outcome{.freed_bytes = freed,
-                                       .evicted_objects = freed > 0 ? 1 : 0};
+                                     state, deferred_replicas, deferred);
+            EvictMemberOutcome outcome{
+                .freed_bytes = freed,
+                .evicted_objects = (freed > 0 || deferred) ? 1 : 0};
             if (freed > 0 && !enable_oplog_) {
                 PublishKvRemovedAfterEvict(member_key, 1, "cpu",
                                            member_metadata, tenant_id);
@@ -12517,6 +12565,11 @@ void MasterService::BatchEvict(double evict_ratio_target,
         local_no_pin(num_threads);
     std::vector<long> local_eviction_base(num_threads, 0);
     std::vector<long> local_object_count(num_threads, 0);
+    std::vector<long> local_pending_offloads(num_threads, 0);
+    // Oldest in-flight offload per thread, so a stalled queue (owners dead,
+    // tasks waiting for the orphan expiry) reads differently from a busy one.
+    std::vector<std::chrono::system_clock::time_point> local_oldest_offload(
+        num_threads, std::chrono::system_clock::time_point::max());
     std::vector<std::vector<std::chrono::system_clock::time_point>>
         local_soft_pin(num_threads);
 
@@ -12531,8 +12584,17 @@ void MasterService::BatchEvict(double evict_ratio_target,
 
                 size_t shard_metadata_count = 0;
                 size_t shard_evictable_count = 0;
+                size_t shard_pending_offloads = 0;
                 for (const auto& [tenant_id, tenant_state] : shard->tenants) {
                     shard_metadata_count += tenant_state.metadata.size();
+                    shard_pending_offloads +=
+                        tenant_state.offloading_tasks.size();
+                    for (const auto& [task_key, task] :
+                         tenant_state.offloading_tasks) {
+                        if (task.start_time < local_oldest_offload[t]) {
+                            local_oldest_offload[t] = task.start_time;
+                        }
+                    }
                     for (auto it = tenant_state.metadata.begin();
                          it != tenant_state.metadata.end(); ++it) {
                         if (it->second.IsHardPinned()) continue;
@@ -12559,6 +12621,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 }
                 local_object_count[t] += shard_metadata_count;
                 local_eviction_base[t] += shard_evictable_count;
+                local_pending_offloads[t] += shard_pending_offloads;
             }
         });
     }
@@ -12570,6 +12633,21 @@ void MasterService::BatchEvict(double evict_ratio_target,
 
     long object_count = 0;
     for (auto v : local_object_count) object_count += v;
+    for (auto v : local_pending_offloads) pending_offloads += v;
+    auto oldest_offload = std::chrono::system_clock::time_point::max();
+    for (const auto& v : local_oldest_offload) {
+        if (v < oldest_offload) oldest_offload = v;
+    }
+    const long oldest_offload_age_s =
+        (pending_offloads > 0 &&
+         oldest_offload != std::chrono::system_clock::time_point::max())
+            ? std::chrono::duration_cast<std::chrono::seconds>(now -
+                                                               oldest_offload)
+                  .count()
+            : 0;
+    if (offload_on_evict_) {
+        offload_room = std::max<long>(0, offload_cap - pending_offloads);
+    }
 
     std::vector<Candidate> candidates;
     if (compact_frontier_prebypass) {
@@ -12610,7 +12688,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
     if (total_eviction_base == 0) {
         VLOG(1) << "[EVICT-DIAG] object_count=" << object_count
                 << " eviction_base=0 (no evictable memory objects)";
-        return;
+        return true;
     }
 
     const long ideal_evict_num =
@@ -12784,7 +12862,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
         // scan is paid only on churn and preserves the behavior of
         // continuing past the cutoff until evict_num is reached.
         if (!stop_eviction_scan && compact_frontier_used &&
-            evicted_this_pass < evict_num) {
+            !offload_room_exhausted && evicted_this_pass < evict_num) {
             auto refill_candidates = collect_candidates(
                 /*use_cutoff=*/true, reserve_cutoff,
                 /*collect_older_or_equal=*/false);
@@ -12988,7 +13066,15 @@ void MasterService::BatchEvict(double evict_ratio_target,
                       ? (double)evicted_count / total_eviction_base
                       : 0.0)
               << ", target_evict_ratio=" << evict_ratio_target;
-    if (offload_on_evict_ && evicted_count == 0 && offload_deferred_count > 0) {
+    const bool freed_now = total_freed_size > 0;
+    if (offload_room_exhausted) {
+        LOG(INFO) << "[EVICT] offload queue full: " << pending_offloads
+                  << " object(s) in flight to the owners (cap " << offload_cap
+                  << "), " << offload_queued_this_cycle
+                  << " queued this cycle, oldest in flight "
+                  << oldest_offload_age_s << " s; waiting for the owners";
+    }
+    if (offload_on_evict_ && !freed_now && offload_deferred_count > 0) {
         LOG(WARNING) << "[EVICT] No memory freed this cycle; "
                      << offload_deferred_count
                      << " objects deferred for disk offload. "
@@ -13005,6 +13091,14 @@ void MasterService::BatchEvict(double evict_ratio_target,
                      << " object(s); force-evicted without disk offload "
                         "(offload_force_evict=true).";
     }
+    // False (so the caller backs off) while the owners are the bottleneck: the
+    // in-flight room ran out this cycle, or nothing was freed and they still
+    // hold work (queued this cycle, or earlier cycles' objects in flight).
+    const bool waiting_on_offloads =
+        offload_on_evict_ &&
+        (offload_room_exhausted ||
+         (!freed_now && (offload_deferred_count > 0 || pending_offloads > 0)));
+    return !waiting_on_offloads;
 }
 
 void MasterService::NoFBatchEvict(double evict_ratio_target,

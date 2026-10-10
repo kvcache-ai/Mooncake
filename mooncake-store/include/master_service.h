@@ -1022,7 +1022,11 @@ class MasterService {
     // evict ratio target. If the actual evicted ratio is less than
     // evict_ratio_lowerbound, the second pass will be triggered and try to
     // fulfill evict ratio lowerbound.
-    void BatchEvict(double evict_ratio_target, double evict_ratio_lowerbound);
+    // Returns false when the cycle freed no memory because every evictee was
+    // queued for disk offload (offload_on_evict): their memory is released
+    // when the owners report the writes done, so the eviction thread backs off
+    // instead of starting another cycle every kEvictionThreadSleepMs.
+    bool BatchEvict(double evict_ratio_target, double evict_ratio_lowerbound);
     void NoFBatchEvict(double evict_ratio_target,
                        double evict_ratio_lowerbound);
     struct TenantQuotaEvictionResult {
@@ -1697,6 +1701,10 @@ class MasterService {
     std::atomic<bool> eviction_running_{false};
     static constexpr uint64_t kEvictionThreadSleepMs =
         10;  // 10 ms sleep between eviction checks
+    // Wait this long after a cycle that only queued objects for disk offload
+    // before checking the watermark again. The wait is not interrupted: a
+    // failed allocation during it is acted on when it ends.
+    static constexpr uint64_t kEvictionDeferredBackoffMs = 500;
     // The eviction thread wakes every 10 ms, but the tenant pass has to walk
     // every registered tenant and lock every quota shard, so it is throttled
     // rather than run on each tick. Quota pressure builds over seconds, not
