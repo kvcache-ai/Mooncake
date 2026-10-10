@@ -26,6 +26,8 @@
 #include <shared_mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "memory_location.h"
@@ -407,17 +409,6 @@ class TransferEngineImpl {
 
     bool checkOverlap(void* addr, uint64_t length);
 
-#ifdef ENABLE_MULTI_PROTOCOL
-    struct RegisteredRecord {
-        Transport* transport;
-        void* addr;
-        uint64_t length;
-        std::string location;
-        bool remote_accessible;
-    };
-    void rollbackAllRegistrations(const std::vector<RegisteredRecord>& records);
-#endif
-
     void setAutoDiscover(bool auto_discover) {
         auto_discover_config_ = {.enabled = auto_discover, .protocol = ""};
     }
@@ -454,6 +445,20 @@ class TransferEngineImpl {
     };
 
     using MemoryRegionMap = std::map<uintptr_t, MemoryRegion>;
+    using TransportSet = std::unordered_set<std::shared_ptr<Transport>>;
+    using RegisteredTransportMap = std::unordered_map<uintptr_t, TransportSet>;
+
+    struct RegisteredRecord {
+        Transport* transport;
+        void* addr;
+        uint64_t length;
+        std::string location;
+        bool remote_accessible;
+        bool update_metadata;
+    };
+
+    std::vector<RegisteredRecord> rollbackRegistrations(
+        const std::vector<RegisteredRecord>& records);
 
     bool hasOverlapLocked(uintptr_t addr, uint64_t length) const;
 
@@ -462,13 +467,22 @@ class TransferEngineImpl {
 
     bool tryReserveMemoryRegions(const std::vector<MemoryRegion>& regions);
 
-    void commitMemoryRegions(const std::vector<MemoryRegion>& regions);
+    void commitMemoryRegions(
+        const std::vector<MemoryRegion>& regions,
+        const RegisteredTransportMap* registered_transport_map = nullptr);
 
-    void releaseMemoryRegions(const std::vector<MemoryRegion>& regions);
+    void releaseMemoryRegions(
+        const std::vector<MemoryRegion>& regions,
+        const std::unordered_set<uintptr_t>* quarantined_addresses = nullptr);
 
     void insertMemoryRegionLocked(const MemoryRegion& region);
 
     void eraseMemoryRegionLocked(void* addr);
+
+    int unregisterLocalMemoryInternal(void* addr, bool update_metadata,
+                                      bool keep_address_reserved);
+
+    void releaseUnregisterReservation(void* addr);
 
     std::shared_ptr<TransferMetadata> metadata_;
     std::string local_server_name_;
@@ -476,6 +490,10 @@ class TransferEngineImpl {
     std::shared_mutex mutex_;
     MemoryRegionMap local_memory_regions_;
     MemoryRegionMap registering_memory_regions_;
+    MemoryRegionMap quarantined_memory_regions_;
+    RegisteredTransportMap registered_transports_;
+    RegisteredTransportMap unregistered_transports_;
+    MemoryRegionMap unregistering_memory_regions_;
     std::shared_ptr<Topology> local_topology_;
 
     RWSpinlock send_notifies_lock_;

@@ -223,6 +223,7 @@ jobs:
           -DWITH_P2P_STORE=ON \
           -DWITH_CONDUCTOR=ON \
           -DSTORE_USE_ETCD=ON \
+          -DENABLE_MULTI_PROTOCOL=ON \
           -DCMAKE_BUILD_TYPE=Release \
           -DBUILD_UNIT_TESTS=ON \
           -DENABLE_SCCACHE=ON
@@ -334,6 +335,9 @@ jobs:
           "-DCMAKE_CXX_FLAGS_RELWITHDEBINFO=${CMAKE_RELWITHDEBINFO_FLAGS}" \
           -DENABLE_DEBUG_SYMBOLS=OFF
         cmake --build .
+        ./tests/transport_uint_test
+        ./tests/shm_transport_test
+        ./tests/shm_transport_e2e_test
         sudo cmake --install .
         df -h
         cd ..
