@@ -341,6 +341,38 @@ class MasterService {
         const UUID& device_id);
 
     /**
+     * @brief Isolate a storage device from new allocations (cordon).
+     * @param device_id Mounted NoF segment id.
+     */
+    tl::expected<void, ErrorCode> IsolateStorageDevice(const UUID& device_id);
+
+    /**
+     * @brief Restore an isolated storage device to normal allocations
+     * (uncordon).
+     * @param device_id Mounted NoF segment id.
+     */
+    tl::expected<void, ErrorCode> UnisolateStorageDevice(const UUID& device_id);
+
+    /**
+     * @brief Initiate a graceful drain of all segments on a storage device.
+     * @param device_id Mounted NoF segment id.
+     * @param target_segments Optional target segment candidates.
+     * @param max_concurrency Maximum concurrent move tasks.
+     * @return Drain job id on success, error code otherwise.
+     */
+    tl::expected<UUID, ErrorCode> DrainStorageDevice(
+        const UUID& device_id,
+        const std::vector<std::string>& target_segments = {},
+        uint32_t max_concurrency = 4);
+
+    /**
+     * @brief Query the drain status of a storage device.
+     * @param device_id Mounted NoF segment id.
+     */
+    tl::expected<QueryJobResponse, ErrorCode> QueryStorageDeviceDrainStatus(
+        const UUID& device_id) const;
+
+    /**
      * @brief Detailed information about a single segment.
      * Keeps original types so callers can use values directly without
      * needing to parse strings back to uuid/address/enum.
@@ -907,7 +939,8 @@ class MasterService {
     /**
      * @brief Query the status of a drain job.
      */
-    tl::expected<QueryJobResponse, ErrorCode> QueryDrainJob(const UUID& job_id);
+    tl::expected<QueryJobResponse, ErrorCode> QueryDrainJob(
+        const UUID& job_id) const;
 
     /**
      * @brief Cancel an in-flight drain job and restore draining segments to OK.
@@ -2086,6 +2119,19 @@ class MasterService {
     mutable std::mutex nof_probe_fn_mutex_;
     NoFProbeFn nof_probe_fn_;
 
+    mutable std::mutex device_maintenance_mutex_;
+    std::unordered_set<UUID, boost::hash<UUID>> manually_isolated_devices_;
+    std::unordered_set<UUID, boost::hash<UUID>> auto_isolated_devices_;
+    std::unordered_map<UUID, UUID, boost::hash<UUID>> device_drain_jobs_;
+    bool auto_isolate_degraded_devices_{true};
+
+    // Serialises DrainStorageDevice() so two concurrent admin requests cannot
+    // both pass the "already draining" check and orphan a job. This is the
+    // outermost lock on that path: device_maintenance_mutex_, job_mutex_ and
+    // the segment locks are all acquired underneath it, and nothing acquires
+    // it while holding any of those.
+    mutable std::mutex device_drain_mutex_;
+
     // Reported device health is derived from the configured heartbeat failure
     // threshold instead of a separate constant, so what operators see can never
     // contradict the master's own unmount decision. The unmount rule itself is
@@ -2417,7 +2463,7 @@ class MasterService {
     std::thread job_dispatch_thread_;
     std::atomic<bool> job_dispatch_running_{false};
     static constexpr uint64_t kJobDispatchThreadSleepMs = 500;
-    std::mutex job_mutex_;
+    mutable std::mutex job_mutex_;
     std::unordered_map<UUID, std::shared_ptr<DrainJob>, boost::hash<UUID>>
         drain_jobs_ GUARDED_BY(job_mutex_);
 

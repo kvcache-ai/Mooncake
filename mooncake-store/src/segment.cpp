@@ -1388,7 +1388,9 @@ ErrorCode ScopedNoFSegmentAccess::PrepareUnmountSegment(
                                                                  registration);
     }
 
-    registration->Invalidate();
+    if (registration) {
+        registration->Invalidate();
+    }
     mounted_segment.allocator_registration.reset();
     mounted_segment.buf_allocator.reset();
     mounted_segment.status = SegmentStatus::UNMOUNTING;
@@ -1497,6 +1499,135 @@ ErrorCode ScopedNoFSegmentAccess::QuerySegments(const std::string& segment,
 
     used = total_used;
     capacity = total_capacity;
+    return ErrorCode::OK;
+}
+
+ErrorCode ScopedNoFSegmentAccess::IsolateSegment(const UUID& segment_id) {
+    auto it = nof_segment_manager_->mounted_segments_.find(segment_id);
+    if (it == nof_segment_manager_->mounted_segments_.end()) {
+        LOG(WARNING) << "NoF segment isolate: segment_id=" << segment_id
+                     << ", warn=segment_not_found";
+        return ErrorCode::SEGMENT_NOT_FOUND;
+    }
+    if (it->second.status == SegmentStatus::DRAINING ||
+        it->second.status == SegmentStatus::UNMOUNTING) {
+        return ErrorCode::OK;
+    }
+
+    auto& mounted_segment = it->second;
+    auto& segment = mounted_segment.segment;
+
+    auto registration = mounted_segment.allocator_registration;
+    if (registration &&
+        HasAllocatorRegistration(nof_segment_manager_->allocator_manager_,
+                                 segment.name, registration)) {
+        nof_segment_manager_->allocator_manager_.removeAllocator(segment.name,
+                                                                 registration);
+    }
+
+    mounted_segment.allocator_registration.reset();
+    mounted_segment.status = SegmentStatus::DRAINING;
+    return ErrorCode::OK;
+}
+
+ErrorCode ScopedNoFSegmentAccess::UnisolateSegment(const UUID& segment_id) {
+    auto it = nof_segment_manager_->mounted_segments_.find(segment_id);
+    if (it == nof_segment_manager_->mounted_segments_.end()) {
+        LOG(WARNING) << "NoF segment unisolate: segment_id=" << segment_id
+                     << ", warn=segment_not_found";
+        return ErrorCode::SEGMENT_NOT_FOUND;
+    }
+    if (it->second.status == SegmentStatus::OK) {
+        return ErrorCode::OK;
+    }
+    if (it->second.status == SegmentStatus::UNMOUNTING) {
+        return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+    }
+
+    auto& mounted_segment = it->second;
+    auto& segment = mounted_segment.segment;
+
+    if (mounted_segment.buf_allocator &&
+        !mounted_segment.allocator_registration) {
+        mounted_segment.allocator_registration =
+            nof_segment_manager_->allocator_manager_.addAllocator(
+                segment.name, mounted_segment.buf_allocator);
+    }
+
+    mounted_segment.status = SegmentStatus::OK;
+    return ErrorCode::OK;
+}
+
+bool ScopedNoFSegmentAccess::IsSegmentAllocatable(
+    const std::string& segment_name) const {
+    auto it = nof_segment_manager_->client_by_name_.find(segment_name);
+    if (it == nof_segment_manager_->client_by_name_.end()) {
+        return false;
+    }
+    for (const auto& [seg_id, mounted] :
+         nof_segment_manager_->mounted_segments_) {
+        if (mounted.segment.name == segment_name) {
+            return mounted.status == SegmentStatus::OK &&
+                   mounted.allocator_registration &&
+                   mounted.allocator_registration->IsServing();
+        }
+    }
+    return false;
+}
+
+bool ScopedNoFSegmentAccess::ExistsSegmentName(
+    const std::string& segment_name) const {
+    return nof_segment_manager_->client_by_name_.contains(segment_name);
+}
+
+ErrorCode ScopedNoFSegmentAccess::GetSegmentStatusByName(
+    const std::string& segment_name, SegmentStatus& status) const {
+    auto it = nof_segment_manager_->client_by_name_.find(segment_name);
+    if (it == nof_segment_manager_->client_by_name_.end()) {
+        return ErrorCode::SEGMENT_NOT_FOUND;
+    }
+    for (const auto& [seg_id, mounted] :
+         nof_segment_manager_->mounted_segments_) {
+        if (mounted.segment.name == segment_name) {
+            status = mounted.status;
+            return ErrorCode::OK;
+        }
+    }
+    return ErrorCode::SEGMENT_NOT_FOUND;
+}
+
+ErrorCode ScopedNoFSegmentAccess::SetSegmentStatusByName(
+    const std::string& segment_name, SegmentStatus status) {
+    auto it = nof_segment_manager_->client_by_name_.find(segment_name);
+    if (it == nof_segment_manager_->client_by_name_.end()) {
+        return ErrorCode::SEGMENT_NOT_FOUND;
+    }
+    for (auto& [seg_id, mounted] : nof_segment_manager_->mounted_segments_) {
+        if (mounted.segment.name != segment_name) {
+            continue;
+        }
+        // IsolateSegment() detaches the allocator, so a segment without a
+        // registration must never be reported as OK. Drain cancellation and
+        // drain failure both try to restore OK, and letting them through would
+        // silently put a fenced device back into the allocation path while it
+        // is still reported as isolated. Returning a device to service is
+        // UnisolateSegment()'s job.
+        if (status == SegmentStatus::OK && !mounted.allocator_registration) {
+            return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+        }
+        mounted.status = status;
+        return ErrorCode::OK;
+    }
+    return ErrorCode::SEGMENT_NOT_FOUND;
+}
+
+ErrorCode ScopedNoFSegmentAccess::GetClientIdBySegmentName(
+    const std::string& segment_name, UUID& client_id) const {
+    auto it = nof_segment_manager_->client_by_name_.find(segment_name);
+    if (it == nof_segment_manager_->client_by_name_.end()) {
+        return ErrorCode::SEGMENT_NOT_FOUND;
+    }
+    client_id = it->second;
     return ErrorCode::OK;
 }
 

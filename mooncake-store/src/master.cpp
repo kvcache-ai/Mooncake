@@ -333,6 +333,11 @@ DEFINE_uint32(
     mooncake::DEFAULT_NOF_HEARTBEAT_FAILURES_THRESHOLD,
     "Consecutive NoF heartbeat failures required before unmounting a NoF "
     "segment");
+DEFINE_bool(nof_auto_isolate_degraded_devices, true,
+            "Automatically fence a NoF device from new allocations once its "
+            "heartbeat health reaches DEGRADED. The device stays mounted and "
+            "keeps being probed, and is returned to service automatically "
+            "when a probe succeeds again.");
 
 DEFINE_string(root_fs_dir, mooncake::DEFAULT_ROOT_FS_DIR,
               "Root directory for storage backend, used in HA mode");
@@ -572,6 +577,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetUInt32("nof_heartbeat_failures_threshold",
                              &master_config.nof_heartbeat_failures_threshold,
                              FLAGS_nof_heartbeat_failures_threshold);
+    default_config.GetBool("nof_auto_isolate_degraded_devices",
+                           &master_config.nof_auto_isolate_degraded_devices,
+                           FLAGS_nof_auto_isolate_degraded_devices);
 
     default_config.GetBool("enable_ha", &master_config.enable_ha,
                            FLAGS_enable_ha);
@@ -1152,6 +1160,13 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.nof_heartbeat_failures_threshold =
             FLAGS_nof_heartbeat_failures_threshold;
+    }
+    if ((google::GetCommandLineFlagInfo("nof_auto_isolate_degraded_devices",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.nof_auto_isolate_degraded_devices =
+            FLAGS_nof_auto_isolate_degraded_devices;
     }
     if ((google::GetCommandLineFlagInfo("cluster_id", &info) &&
          !info.is_default) ||

@@ -55,7 +55,8 @@ class NoFHeartbeatTest : public ::testing::Test {
     std::unique_ptr<MasterService> CreateService(int64_t heartbeat_interval_sec,
                                                  uint32_t probe_timeout_ms,
                                                  uint32_t failure_threshold,
-                                                 int64_t client_ttl_sec = 10) {
+                                                 int64_t client_ttl_sec = 10,
+                                                 bool auto_isolate = true) {
         auto config =
             MasterServiceConfig::builder()
                 .set_memory_allocator(BufferAllocatorType::OFFSET)
@@ -63,6 +64,7 @@ class NoFHeartbeatTest : public ::testing::Test {
                 .set_nof_heartbeat_interval_sec(heartbeat_interval_sec)
                 .set_nof_heartbeat_probe_timeout_ms(probe_timeout_ms)
                 .set_nof_heartbeat_failures_threshold(failure_threshold)
+                .set_nof_auto_isolate_degraded_devices(auto_isolate)
                 .build();
         return std::make_unique<MasterService>(config);
     }
@@ -326,7 +328,8 @@ TEST_F(NoFHeartbeatTest, StorageDevicesReportDegradedBeforeHeartbeatUnmount) {
     // degraded_failures=3 and failed_failures=6. With a 1s probe interval the
     // device is reported DEGRADED after roughly 3s while the alive-timeout
     // unmount only fires at roughly 6s. That window is the point of the state
-    // machine: today a flapping disk is invisible until it disappears.
+    // machine: the master can fence a flapping disk and hand it back if it
+    // recovers, instead of the disk being invisible until it disappears.
     auto service = CreateService(/*heartbeat_interval_sec=*/1,
                                  /*probe_timeout_ms=*/50,
                                  /*failure_threshold=*/6);
@@ -343,34 +346,33 @@ TEST_F(NoFHeartbeatTest, StorageDevicesReportDegradedBeforeHeartbeatUnmount) {
     ASSERT_TRUE(service->MountNoFSegment(segment, client_id).has_value());
 
     auto health_of = [&](StorageDeviceHealth* out, uint32_t* failures,
-                         bool* schedulable) -> bool {
+                         bool* schedulable, bool* isolated) -> bool {
         auto result = service->ListStorageDevices();
         if (!result.has_value() || result->size() != 1) {
-            std::cout << "DBG size="
-                      << (result.has_value() ? (int)result->size() : -1)
-                      << std::endl;
             return false;
         }
         *out = (*result)[0].health;
         *failures = (*result)[0].consecutive_failures;
         *schedulable = (*result)[0].schedulable;
-        std::cout << "DBG health=" << StorageDeviceHealthToString(*out)
-                  << " failures=" << *failures << std::endl;
+        *isolated = (*result)[0].isolated;
         return true;
     };
 
     StorageDeviceHealth health = StorageDeviceHealth::UNKNOWN;
     uint32_t failures = 0;
-    bool schedulable = false;
+    bool schedulable = true;
+    bool isolated = false;
     ASSERT_TRUE(WaitForCondition(
         std::chrono::seconds(10), std::chrono::milliseconds(50), [&]() {
-            return health_of(&health, &failures, &schedulable) &&
-                   health == StorageDeviceHealth::DEGRADED;
+            return health_of(&health, &failures, &schedulable, &isolated) &&
+                   health == StorageDeviceHealth::DEGRADED && isolated;
         }));
     EXPECT_GE(failures, 3u);
-    // DEGRADED is a warning rather than a verdict: the device keeps serving and
-    // stays eligible for allocation until the master actually gives up on it.
-    EXPECT_TRUE(schedulable);
+    // DEGRADED is a warning rather than a verdict: the segment stays mounted
+    // and keeps serving reads, but the master fences it from new allocations
+    // so a sick disk stops absorbing evictions while it still has a chance to
+    // recover on its own.
+    EXPECT_FALSE(schedulable);
     EXPECT_TRUE(MasterServiceTestPeer(*service).IsNoFSegmentMountedForTesting(
         segment.id));
 
@@ -450,6 +452,217 @@ TEST_F(NoFHeartbeatTest, RequestStorageDeviceProbeTriggersImmediateProbe) {
     const auto missing = service->RequestStorageDeviceProbe(generate_uuid());
     ASSERT_FALSE(missing.has_value());
     EXPECT_EQ(missing.error(), ErrorCode::SEGMENT_NOT_FOUND);
+}
+
+TEST_F(NoFHeartbeatTest,
+       DegradedNoFDeviceIsFencedAndReturnedToServiceOnRecovery) {
+    // A device that stops answering probes is fenced from new allocations as
+    // soon as it reports DEGRADED, but it is not unmounted: the segment stays
+    // mounted and keeps being probed, so a transient fault heals itself
+    // instead of costing the cluster the data on that disk.
+    auto service = CreateService(/*heartbeat_interval_sec=*/1,
+                                 /*probe_timeout_ms=*/50,
+                                 /*failure_threshold=*/6);
+    std::atomic<bool> probe_succeed{false};
+    MasterServiceTestPeer(*service).SetNoFProbeFnForTesting(
+        [&probe_succeed](const std::string&, uint32_t, std::string* reason) {
+            if (probe_succeed.load()) {
+                return true;
+            }
+            if (reason) {
+                *reason = "timeout";
+            }
+            return false;
+        });
+
+    UUID client_id = generate_uuid();
+    NoFSegment segment = MakeNoFSegment("nof_seg_iso", "nof_iso");
+    ASSERT_TRUE(service->MountNoFSegment(segment, client_id).has_value());
+
+    // Wait until the device degrades and is auto-isolated
+    ASSERT_TRUE(WaitForCondition(
+        std::chrono::seconds(10), std::chrono::milliseconds(50), [&]() {
+            return MasterServiceTestPeer(*service)
+                .IsDeviceAutoIsolatedForTesting(segment.id);
+        }));
+
+    auto devices = service->ListStorageDevices();
+    ASSERT_TRUE(devices.has_value() && devices->size() == 1);
+    EXPECT_TRUE((*devices)[0].isolated);
+    EXPECT_FALSE((*devices)[0].schedulable);
+    EXPECT_EQ((*devices)[0].health, StorageDeviceHealth::DEGRADED);
+    // Fencing is not a terminal action: the segment is still mounted and its
+    // objects are still reachable.
+    EXPECT_TRUE(MasterServiceTestPeer(*service).IsNoFSegmentMountedForTesting(
+        segment.id));
+
+    // Now simulate recovery
+    probe_succeed.store(true);
+
+    // The next successful probe returns the device to service on its own.
+    ASSERT_TRUE(WaitForCondition(
+        std::chrono::seconds(10), std::chrono::milliseconds(50), [&]() {
+            return !MasterServiceTestPeer(*service)
+                        .IsDeviceAutoIsolatedForTesting(segment.id);
+        }));
+
+    devices = service->ListStorageDevices();
+    ASSERT_TRUE(devices.has_value() && devices->size() == 1);
+    EXPECT_FALSE((*devices)[0].isolated);
+    EXPECT_TRUE((*devices)[0].schedulable);
+    EXPECT_EQ((*devices)[0].health, StorageDeviceHealth::HEALTHY);
+}
+
+TEST_F(NoFHeartbeatTest, DrainStorageDeviceCreatesDrainJobAndReportsDraining) {
+    auto service = CreateService(/*heartbeat_interval_sec=*/10,
+                                 /*probe_timeout_ms=*/50,
+                                 /*failure_threshold=*/3);
+    MasterServiceTestPeer(*service).SetNoFProbeFnForTesting(
+        [](const std::string&, uint32_t, std::string*) { return true; });
+
+    UUID client_id = generate_uuid();
+    NoFSegment segment = MakeNoFSegment("nof_seg_drain", "nof_drain");
+    ASSERT_TRUE(service->MountNoFSegment(segment, client_id).has_value());
+
+    // Initiate device drain
+    auto drain_res = service->DrainStorageDevice(segment.id);
+    ASSERT_TRUE(drain_res.has_value());
+    UUID job_id = drain_res.value();
+
+    // Query device drain status
+    auto status_res = service->QueryStorageDeviceDrainStatus(segment.id);
+    ASSERT_TRUE(status_res.has_value());
+    EXPECT_EQ(status_res->id, job_id);
+
+    // Device list should reflect draining state
+    auto devices = service->ListStorageDevices();
+    ASSERT_TRUE(devices.has_value() && devices->size() == 1);
+    EXPECT_TRUE((*devices)[0].isolated);
+    EXPECT_TRUE((*devices)[0].draining);
+    EXPECT_EQ((*devices)[0].draining_job_id, UuidToString(job_id));
+    EXPECT_FALSE((*devices)[0].schedulable);
+
+    // Maintenance plan flags draining device for GC
+    auto plan = service->GetStorageDeviceMaintenancePlan();
+    ASSERT_TRUE(plan.has_value());
+    ASSERT_EQ(plan->gc_candidates.size(), 1u);
+    EXPECT_EQ(plan->gc_candidates[0].device_id, segment.id);
+    EXPECT_EQ(plan->gc_candidates[0].reason, "draining");
+}
+
+TEST_F(NoFHeartbeatTest, ManuallyIsolatedDeviceKeepsBeingProbedAndReported) {
+    // Cordoning a device must not blind the master to it. The segment keeps
+    // being probed so its health stays current while an operator decides
+    // whether to drain it or return it to service; otherwise the reported
+    // health would silently collapse back to UNKNOWN.
+    auto service = CreateService(/*heartbeat_interval_sec=*/1,
+                                 /*probe_timeout_ms=*/50,
+                                 /*failure_threshold=*/10);
+    MasterServiceTestPeer(*service).SetNoFProbeFnForTesting(
+        [](const std::string&, uint32_t, std::string* reason) {
+            if (reason) {
+                *reason = "completion_timeout";
+            }
+            return false;
+        });
+
+    UUID client_id = generate_uuid();
+    NoFSegment segment = MakeNoFSegment("nof_seg_cordon", "nof_cordon");
+    ASSERT_TRUE(service->MountNoFSegment(segment, client_id).has_value());
+    ASSERT_TRUE(service->IsolateStorageDevice(segment.id).has_value());
+    EXPECT_TRUE(
+        MasterServiceTestPeer(*service).IsDeviceManuallyIsolatedForTesting(
+            segment.id));
+
+    // Failure counts can only keep climbing if probes keep running.
+    ASSERT_TRUE(WaitForCondition(
+        std::chrono::seconds(15), std::chrono::milliseconds(50), [&]() {
+            auto devices = service->ListStorageDevices();
+            return devices.has_value() && devices->size() == 1 &&
+                   (*devices)[0].consecutive_failures >= 6;
+        }));
+
+    auto devices = service->ListStorageDevices();
+    ASSERT_TRUE(devices.has_value() && devices->size() == 1);
+    EXPECT_TRUE((*devices)[0].isolated);
+    EXPECT_FALSE((*devices)[0].schedulable);
+    EXPECT_EQ((*devices)[0].health, StorageDeviceHealth::DEGRADED);
+
+    // A cordoned device is the one an operator most wants to re-probe.
+    EXPECT_TRUE(service->RequestStorageDeviceProbe(segment.id).has_value());
+
+    // The heartbeat thread never lifts a manual cordon on its own.
+    EXPECT_FALSE(MasterServiceTestPeer(*service).IsDeviceAutoIsolatedForTesting(
+        segment.id));
+}
+
+TEST_F(NoFHeartbeatTest, CancelledDeviceDrainKeepsTheDeviceIsolated) {
+    auto service = CreateService(/*heartbeat_interval_sec=*/600,
+                                 /*probe_timeout_ms=*/50,
+                                 /*failure_threshold=*/3);
+    MasterServiceTestPeer(*service).SetNoFProbeFnForTesting(
+        [](const std::string&, uint32_t, std::string*) { return true; });
+
+    UUID client_id = generate_uuid();
+    NoFSegment segment = MakeNoFSegment("nof_seg_cancel", "nof_cancel");
+    ASSERT_TRUE(service->MountNoFSegment(segment, client_id).has_value());
+
+    auto drain_res = service->DrainStorageDevice(segment.id);
+    ASSERT_TRUE(drain_res.has_value());
+    ASSERT_TRUE(service->CancelDrainJob(drain_res.value()).has_value());
+
+    // Cancelling the migration must not silently return a cordoned device to
+    // the allocation path: the fence is lifted only by an explicit unisolate.
+    auto devices = service->ListStorageDevices();
+    ASSERT_TRUE(devices.has_value() && devices->size() == 1);
+    EXPECT_TRUE((*devices)[0].isolated);
+    EXPECT_FALSE((*devices)[0].schedulable);
+    EXPECT_FALSE((*devices)[0].draining);
+
+    ASSERT_TRUE(service->UnisolateStorageDevice(segment.id).has_value());
+    devices = service->ListStorageDevices();
+    ASSERT_TRUE(devices.has_value() && devices->size() == 1);
+    EXPECT_FALSE((*devices)[0].isolated);
+}
+
+TEST_F(NoFHeartbeatTest, AutoIsolationCanBeDisabledByConfiguration) {
+    // The automatic fence is an operator-facing policy, so it has an off
+    // switch. Turning it off must not weaken the alive-timeout unmount rule.
+    auto service = CreateService(/*heartbeat_interval_sec=*/1,
+                                 /*probe_timeout_ms=*/50,
+                                 /*failure_threshold=*/6,
+                                 /*client_ttl_sec=*/10,
+                                 /*auto_isolate=*/false);
+    MasterServiceTestPeer(*service).SetNoFProbeFnForTesting(
+        [](const std::string&, uint32_t, std::string* reason) {
+            if (reason) {
+                *reason = "completion_timeout";
+            }
+            return false;
+        });
+
+    UUID client_id = generate_uuid();
+    NoFSegment segment = MakeNoFSegment("nof_seg_noauto", "nof_noauto");
+    ASSERT_TRUE(service->MountNoFSegment(segment, client_id).has_value());
+
+    ASSERT_TRUE(WaitForCondition(
+        std::chrono::seconds(10), std::chrono::milliseconds(50), [&]() {
+            auto devices = service->ListStorageDevices();
+            return devices.has_value() && devices->size() == 1 &&
+                   (*devices)[0].consecutive_failures >= 4;
+        }));
+
+    auto devices = service->ListStorageDevices();
+    ASSERT_TRUE(devices.has_value() && devices->size() == 1);
+    EXPECT_FALSE((*devices)[0].isolated);
+    EXPECT_FALSE(MasterServiceTestPeer(*service).IsDeviceAutoIsolatedForTesting(
+        segment.id));
+
+    EXPECT_TRUE(WaitForCondition(
+        std::chrono::seconds(20), std::chrono::milliseconds(100), [&]() {
+            return !MasterServiceTestPeer(*service)
+                        .IsNoFSegmentMountedForTesting(segment.id);
+        }));
 }
 
 }  // namespace mooncake::test

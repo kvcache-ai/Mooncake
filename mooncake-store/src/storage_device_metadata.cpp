@@ -76,11 +76,15 @@ std::optional<std::string> StorageDeviceRecoveryReason(
         case StorageDeviceHealth::UNMOUNTING:
             break;
     }
+    if (device.isolated && !device.draining) {
+        return "device_isolated";
+    }
     return std::nullopt;
 }
 
 std::optional<std::string> StorageDeviceGcReason(
     const StorageDeviceMetadata& device, double gc_high_watermark) {
+    if (device.draining) return "draining";
     if (device.health == StorageDeviceHealth::UNMOUNTING) return "unmounting";
     if (gc_high_watermark <= 0.0 || gc_high_watermark > 1.0) {
         return std::nullopt;

@@ -171,5 +171,42 @@ TEST(StorageDeviceMaintenanceTest, EmptyInventoryYieldsEmptyPlan) {
     EXPECT_TRUE(plan.gc_candidates.empty());
 }
 
+TEST(StorageDeviceSchedulableTest, EvaluatesIsolationAndDraining) {
+    EXPECT_TRUE(IsStorageDeviceSchedulable(SegmentStatus::OK, Health::HEALTHY,
+                                           /*isolated=*/false,
+                                           /*draining=*/false));
+    EXPECT_TRUE(IsStorageDeviceSchedulable(SegmentStatus::OK, Health::UNKNOWN,
+                                           /*isolated=*/false,
+                                           /*draining=*/false));
+    EXPECT_TRUE(IsStorageDeviceSchedulable(SegmentStatus::OK, Health::DEGRADED,
+                                           /*isolated=*/false,
+                                           /*draining=*/false));
+    EXPECT_FALSE(IsStorageDeviceSchedulable(SegmentStatus::OK, Health::FAILED,
+                                            /*isolated=*/false,
+                                            /*draining=*/false));
+    EXPECT_FALSE(IsStorageDeviceSchedulable(SegmentStatus::OK, Health::HEALTHY,
+                                            /*isolated=*/true,
+                                            /*draining=*/false));
+    EXPECT_FALSE(IsStorageDeviceSchedulable(SegmentStatus::OK, Health::HEALTHY,
+                                            /*isolated=*/false,
+                                            /*draining=*/true));
+    EXPECT_FALSE(IsStorageDeviceSchedulable(SegmentStatus::DRAINING,
+                                            Health::HEALTHY, /*isolated=*/false,
+                                            /*draining=*/false));
+    EXPECT_FALSE(IsStorageDeviceSchedulable(SegmentStatus::UNMOUNTING,
+                                            Health::HEALTHY, /*isolated=*/false,
+                                            /*draining=*/false));
+}
+
+TEST(StorageDeviceMaintenanceTest, IsolatedDeviceReportedInRecoveryPlan) {
+    auto isolated_dev = MakeDevice("iso", Health::HEALTHY, 10, 100);
+    isolated_dev.isolated = true;
+    EXPECT_EQ(StorageDeviceRecoveryReason(isolated_dev), "device_isolated");
+
+    isolated_dev.draining = true;
+    EXPECT_FALSE(StorageDeviceRecoveryReason(isolated_dev).has_value());
+    EXPECT_EQ(StorageDeviceGcReason(isolated_dev, 0.95), "draining");
+}
+
 }  // namespace
 }  // namespace mooncake
