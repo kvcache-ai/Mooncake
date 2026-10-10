@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// The typed frame codec, the sender's stamps and the receiver's window.
+// The typed frame codec, the sender's stamps and the receiver's filter.
 
 #include <gtest/gtest.h>
 
@@ -180,82 +180,195 @@ TEST(NotifyFrameTest, RejectsWhatItDoesNotUnderstand) {
                                    buf.data(), buf.size(), &len));
 }
 
-TEST(NotifyDedupWindowTest, InOrderIsAdmittedOnce) {
-    NotifyDedupWindow window;
+TEST(NotifyDedupFilterTest, InOrderIsAdmittedOnce) {
+    NotifyDedupFilter filter;
     for (uint64_t seq = 1; seq <= 10; ++seq) {
-        EXPECT_TRUE(window.admit(7, seq)) << seq;
-        EXPECT_FALSE(window.admit(7, seq)) << seq;
+        EXPECT_TRUE(filter.admit(7, seq)) << seq;
+        EXPECT_FALSE(filter.admit(7, seq)) << seq;
     }
-    EXPECT_EQ(window.sessions(), 1u);
+    EXPECT_EQ(filter.sessions(), 1u);
 }
 
-TEST(NotifyDedupWindowTest, ReorderedInsideTheWindowIsAdmitted) {
-    NotifyDedupWindow window;
-    EXPECT_TRUE(window.admit(7, 5));
-    EXPECT_TRUE(window.admit(7, 3));
-    EXPECT_TRUE(window.admit(7, 4));
-    EXPECT_FALSE(window.admit(7, 4));
-    EXPECT_TRUE(window.admit(7, 1));
-    EXPECT_FALSE(window.admit(7, 5));
+TEST(NotifyDedupFilterTest, ReorderedIsAdmitted) {
+    NotifyDedupFilter filter;
+    EXPECT_TRUE(filter.admit(7, 5));
+    EXPECT_TRUE(filter.admit(7, 3));
+    EXPECT_TRUE(filter.admit(7, 4));
+    EXPECT_FALSE(filter.admit(7, 4));
+    EXPECT_TRUE(filter.admit(7, 1));
+    EXPECT_FALSE(filter.admit(7, 5));
 }
 
-TEST(NotifyDedupWindowTest, BehindTheWindowIsRefused) {
-    NotifyDedupWindow window;
-    const uint64_t w = NotifyDedupWindow::kWindow;
-    EXPECT_TRUE(window.admit(7, 1));
-    EXPECT_TRUE(window.admit(7, w + 1));  // slides past 1
-    EXPECT_FALSE(window.admit(7, 1));     // too old
-    EXPECT_TRUE(window.admit(7, 2));      // just inside, never seen
-    EXPECT_FALSE(window.admit(7, 2));
-    // A jump of more than a window forgets everything in between.
-    EXPECT_TRUE(window.admit(7, 10 * w));
-    EXPECT_TRUE(window.admit(7, 10 * w - 1));
-    EXPECT_FALSE(window.admit(7, 10 * w - 1));
-    EXPECT_FALSE(window.admit(7, 9 * w));
-    // More than a window behind, on a slot that is free again.
-    EXPECT_TRUE(window.admit(8, 1));
-    EXPECT_TRUE(window.admit(8, w + 2));
-    EXPECT_FALSE(window.admit(8, 1));
+TEST(NotifyDedupFilterTest, ALateFirstDeliveryFarBehindIsAdmitted) {
+    NotifyDedupFilter filter;
+    EXPECT_TRUE(filter.admit(7, 1));
+    EXPECT_TRUE(filter.admit(7, 100001));
+    EXPECT_EQ(filter.holes(), 1u);
+    const uint64_t late[] = {50000, 2,     100000, 4097,  99998,
+                             3,     77777, 34464,  99999, 65537};
+    for (uint64_t seq : late) EXPECT_TRUE(filter.admit(7, seq)) << seq;
+    for (uint64_t seq : late) EXPECT_FALSE(filter.admit(7, seq)) << seq;
 }
 
-TEST(NotifyDedupWindowTest, SessionsAreIndependent) {
-    NotifyDedupWindow window;
-    EXPECT_TRUE(window.admit(1, 1));
-    EXPECT_TRUE(window.admit(2, 1));
-    EXPECT_FALSE(window.admit(1, 1));
-    EXPECT_FALSE(window.admit(2, 1));
-    EXPECT_EQ(window.sessions(), 2u);
+TEST(NotifyDedupFilterTest, AFarJumpIsOneHole) {
+    NotifyDedupFilter filter;
+    EXPECT_TRUE(filter.admit(7, 1));
+    EXPECT_TRUE(filter.admit(7, 1000000000));
+    EXPECT_EQ(filter.holes(), 1u);
+    EXPECT_TRUE(filter.admit(7, 2));
+    EXPECT_TRUE(filter.admit(7, 999999999));
+    EXPECT_EQ(filter.holes(), 1u);
 }
 
-TEST(NotifyDedupWindowTest, UnstampedAlwaysPasses) {
-    NotifyDedupWindow window;
-    EXPECT_TRUE(window.admit(0, 0));
-    EXPECT_TRUE(window.admit(0, 0));
-    EXPECT_TRUE(window.admit(0, 5));
-    EXPECT_TRUE(window.admit(5, 0));
-    EXPECT_EQ(window.sessions(), 0u);
+TEST(NotifyDedupFilterTest, SessionsAreIndependent) {
+    NotifyDedupFilter filter;
+    EXPECT_TRUE(filter.admit(1, 1));
+    EXPECT_TRUE(filter.admit(2, 1));
+    EXPECT_FALSE(filter.admit(1, 1));
+    EXPECT_FALSE(filter.admit(2, 1));
+    EXPECT_EQ(filter.sessions(), 2u);
 }
 
-TEST(NotifyDedupWindowTest, IdleSessionsAreForgotten) {
-    NotifyDedupWindow window;
-    const auto t0 = NotifyDedupWindow::Clock::now();
-    EXPECT_TRUE(window.admit(1, 1, t0));
-    // Pruning runs every kWindow admissions; drive it with another session.
-    for (size_t i = 1; i <= NotifyDedupWindow::kWindow; ++i) {
-        EXPECT_TRUE(window.admit(2, i, t0 + 11min));
+TEST(NotifyDedupFilterTest, UnstampedAlwaysPasses) {
+    NotifyDedupFilter filter;
+    EXPECT_TRUE(filter.admit(0, 0));
+    EXPECT_TRUE(filter.admit(0, 0));
+    EXPECT_TRUE(filter.admit(0, 5));
+    EXPECT_TRUE(filter.admit(5, 0));
+    EXPECT_EQ(filter.sessions(), 0u);
+}
+
+TEST(NotifyDedupFilterTest, IdleSessionsAreForgotten) {
+    NotifyDedupFilter filter;
+    const auto t0 = NotifyDedupFilter::Clock::now();
+    EXPECT_TRUE(filter.admit(1, 1, t0));
+    // Pruning runs every kPruneEvery admissions; drive it with another session.
+    for (size_t i = 1; i <= NotifyDedupFilter::kPruneEvery; ++i) {
+        EXPECT_TRUE(filter.admit(2, i, t0 + 11min));
     }
-    EXPECT_EQ(window.sessions(), 1u);
+    EXPECT_EQ(filter.sessions(), 1u);
     // Session 1 was forgotten, so its old number is new again.
-    EXPECT_TRUE(window.admit(1, 1, t0 + 11min));
+    EXPECT_TRUE(filter.admit(1, 1, t0 + 11min));
 }
 
-TEST(NotifyDedupWindowTest, SlideClearsSkippedBits) {
-    NotifyDedupWindow window;
-    const uint64_t w = NotifyDedupWindow::kWindow;
-    EXPECT_TRUE(window.admit(7, 2));
-    EXPECT_TRUE(window.admit(7, w));
-    EXPECT_TRUE(window.admit(7, w + 3));  // slides over w + 1 and w + 2
-    EXPECT_TRUE(window.admit(7, w + 2));  // not seen, despite 2's old bit
+TEST(NotifyDedupFilterTest, SkippedSequencesBecomeHolesAndArriveOnce) {
+    NotifyDedupFilter filter;
+    EXPECT_TRUE(filter.admit(7, 2));
+    EXPECT_TRUE(filter.admit(7, 10));
+    EXPECT_TRUE(filter.admit(7, 13));
+    EXPECT_EQ(filter.holes(), 3u);
+    const uint64_t late[] = {12, 1, 5, 3, 9, 11, 4, 6, 8, 7};
+    for (uint64_t seq : late) {
+        EXPECT_TRUE(filter.admit(7, seq)) << seq;
+        EXPECT_FALSE(filter.admit(7, seq)) << seq;
+    }
+    EXPECT_EQ(filter.holes(), 0u);
+    for (uint64_t seq = 1; seq <= 13; ++seq)
+        EXPECT_FALSE(filter.admit(7, seq)) << seq;
+}
+
+// A receiver that restarted sees each sender mid-stream, while the sender may
+// still hold any older one for a retry: all of them get in, once.
+TEST(NotifyDedupFilterTest, AnythingBelowAFirstSeqIsAdmittedOnce) {
+    NotifyDedupFilter filter;
+    EXPECT_TRUE(filter.admit(8, 100000));
+    EXPECT_EQ(filter.holes(), 1u);
+    const uint64_t late[] = {1, 100000 - 4097, 99999, 2, 50000};
+    for (uint64_t seq : late) EXPECT_TRUE(filter.admit(8, seq)) << seq;
+    for (uint64_t seq : late) EXPECT_FALSE(filter.admit(8, seq)) << seq;
+    EXPECT_FALSE(filter.admit(8, 100000));
+}
+
+// Nothing below a first seq is known to be missing, so giving that range up,
+// past the ttl or the cap, is not counted; a gap after it still is.
+TEST(NotifyDedupFilterTest, TheRangeBelowAFirstSeqIsGivenUpUncounted) {
+    NotifyDedupFilter filter;
+    NotifyDedupFilter::Config config;
+    config.max_holes = 1;
+    filter.configure(config);
+    const auto t0 = NotifyDedupFilter::Clock::now();
+    EXPECT_TRUE(filter.admit(7, 10, t0));
+    EXPECT_TRUE(filter.admit(7, 20, t0));  // evicts 1..9
+    EXPECT_EQ(filter.evicted(), 0u);
+    EXPECT_TRUE(filter.admit(7, 30, t0));  // evicts 11..19
+    EXPECT_EQ(filter.evicted(), 1u);
+    EXPECT_TRUE(filter.admit(8, 10, t0));
+    EXPECT_FALSE(filter.admit(8, 5, t0 + config.ttl + 1ms));
+    EXPECT_EQ(filter.expired(), 0u);
+}
+
+// A session is forgotten only once its holes have outlived the ttl, and they
+// are counted then: a ttl longer than the idle limit keeps the session.
+TEST(NotifyDedupFilterTest, AForgottenSessionCountsItsHoles) {
+    NotifyDedupFilter filter;
+    NotifyDedupFilter::Config config;
+    config.ttl = 30min;
+    filter.configure(config);
+    const auto t0 = NotifyDedupFilter::Clock::now();
+    EXPECT_TRUE(filter.admit(7, 1, t0));
+    EXPECT_TRUE(filter.admit(7, 10, t0));
+    uint64_t other = 0;
+    auto prune = [&](NotifyDedupFilter::Clock::time_point now) {
+        for (size_t i = 0; i < NotifyDedupFilter::kPruneEvery; ++i)
+            EXPECT_TRUE(filter.admit(8, ++other, now));
+    };
+    prune(t0 + 20min);
+    EXPECT_EQ(filter.sessions(), 2u);
+    EXPECT_TRUE(filter.admit(7, 5, t0 + 20min));  // leaves 2..4 and 6..9
+    prune(t0 + 51min);
+    EXPECT_EQ(filter.sessions(), 1u);
+    EXPECT_EQ(filter.expired(), 2u);
+}
+
+TEST(NotifyDedupFilterTest, AnExpiredHoleIsRefused) {
+    NotifyDedupFilter filter;
+    const auto ttl = NotifyDedupFilter::Config().ttl;
+    const auto t0 = NotifyDedupFilter::Clock::now();
+    EXPECT_TRUE(filter.admit(7, 1, t0));
+    EXPECT_TRUE(filter.admit(7, 10, t0));
+    EXPECT_TRUE(filter.admit(7, 20, t0 + 1min));
+    EXPECT_TRUE(filter.admit(7, 2, t0 + ttl));
+    EXPECT_FALSE(filter.admit(7, 3, t0 + ttl + 1ms));
+    EXPECT_EQ(filter.expired(), 1u);
+    EXPECT_FALSE(filter.admit(7, 4, t0 + ttl + 1ms));
+    EXPECT_TRUE(filter.admit(7, 15, t0 + ttl + 1ms));
+    EXPECT_EQ(filter.expired(), 1u);
+    // Pruning gives up the rest of 11..19, though nothing arrived there late.
+    for (size_t i = 1; i <= NotifyDedupFilter::kPruneEvery; ++i) {
+        EXPECT_TRUE(filter.admit(8, i, t0 + ttl + 2min));
+    }
+    EXPECT_EQ(filter.holes(), 0u);
+    EXPECT_EQ(filter.expired(), 3u);
+    EXPECT_FALSE(filter.admit(7, 12, t0 + ttl + 2min));
+    EXPECT_EQ(filter.expired(), 3u);
+}
+
+// Callers read the clock before the lock, so now can step back.
+TEST(NotifyDedupFilterTest, AStaleClockDoesNotAgeANewHole) {
+    NotifyDedupFilter filter;
+    const auto ttl = NotifyDedupFilter::Config().ttl;
+    const auto t0 = NotifyDedupFilter::Clock::now();
+    EXPECT_TRUE(filter.admit(7, 1, t0 + 1s));
+    EXPECT_TRUE(filter.admit(7, 10, t0));
+    EXPECT_TRUE(filter.admit(7, 5, t0 + ttl + 1s));
+    EXPECT_EQ(filter.expired(), 0u);
+}
+
+TEST(NotifyDedupFilterTest, HolesAreCappedAtTheOldest) {
+    NotifyDedupFilter filter;
+    NotifyDedupFilter::Config config;
+    config.max_holes = 4;
+    filter.configure(config);
+    EXPECT_TRUE(filter.admit(7, 1));
+    for (uint64_t seq = 3; seq <= 21; seq += 2)
+        EXPECT_TRUE(filter.admit(7, seq));
+    EXPECT_EQ(filter.holes(), 4u);
+    EXPECT_EQ(filter.evicted(), 6u);
+    for (uint64_t seq = 2; seq <= 12; seq += 2)
+        EXPECT_FALSE(filter.admit(7, seq)) << seq;
+    for (uint64_t seq = 14; seq <= 20; seq += 2)
+        EXPECT_TRUE(filter.admit(7, seq)) << seq;
+    EXPECT_EQ(filter.expired(), 0u);
 }
 
 TEST(NotifySequencerTest, StampsPerTargetAndKeepsItsOwnStamp) {
@@ -288,7 +401,7 @@ TEST(NotifySequencerTest, IdleTargetsGetANewSession) {
     const auto t0 = NotifySequencer::Clock::now();
     const Notification first = sequencer.stamp("a", Notification{}, t0);
     const Notification busy = sequencer.stamp("b", Notification{}, t0 + 11min);
-    for (size_t i = 0; i < NotifyDedupWindow::kWindow; ++i)
+    for (size_t i = 0; i < NotifySequencer::kPruneEvery; ++i)
         (void)sequencer.stamp("b", Notification{}, t0 + 11min);
     const Notification later = sequencer.stamp("a", Notification{}, t0 + 11min);
     EXPECT_NE(later.session, first.session);
