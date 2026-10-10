@@ -738,8 +738,9 @@ int TransferEnginePy::transferSync(const char* target_hostname,
     // associated with one local RNIC. If the local RNIC fails to connect to any
     // remote RNIC, it will eventually fail. This allows selecting multiple
     // local RNIC in one transferSync call. Will be fixed in the next revision.
+    // TENT owns retry/failover decisions, including non-replayable WRITEs.
     const int max_retry =
-        engine_->numContexts() + 1;  // Iter all possible local contexts
+        engine_->isUsingTent() ? 1 : engine_->numContexts() + 1;
     auto start_ts = getCurrentTimeInNano();
     const int nic_hint_id = resolveNicHint(nic_hint);
     for (int retry = 0; retry < max_retry; ++retry) {
@@ -852,7 +853,9 @@ int TransferEnginePy::batchTransferSync(
         return -1;
     }
 
-    const int max_retry = engine_->numContexts() + 1;
+    // Re-submission here would discard TENT's non-replayable failure state.
+    const int max_retry =
+        engine_->isUsingTent() ? 1 : engine_->numContexts() + 1;
     auto start_ts = getCurrentTimeInNano();
     auto total_length = std::accumulate(lengths.begin(), lengths.end(), 0ull);
     auto batch_size = buffers.size();
