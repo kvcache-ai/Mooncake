@@ -22,6 +22,8 @@
 #include "utils.h"
 #include "rpc_types.h"
 #include "default_config.h"
+#include "request_context.h"
+#include "tracing.h"
 
 namespace mooncake {
 
@@ -329,17 +331,47 @@ tl::expected<void, ErrorCode> RealClient::put_internal(
     return {};
 }
 
-tl::expected<void, ErrorCode> RealClient::put_dummy_helper(
+void RealClient::put_dummy_helper(
+    coro_rpc::context<tl::expected<void, ErrorCode>> ctx,
     const std::string& key, std::span<const char> value,
     const WriteConfig& config, const UUID& client_id) {
+    // Bridge the per-request id from hop A's out-of-band attachment to hop B:
+    // install it in this (coro_rpc server) thread's g_current_ctx so the
+    // synchronous master RPC (put_internal -> client_service_->Put ->
+    // master_client_.PutStart) re-attaches the same id.
+    auto att = ctx.get_context_info()->release_request_attachment();
+    RequestContext rc;
+    if (!att.empty()) {
+        rc = deserialize_request_context(att);
+        VLOG(2) << "hop-A bridge request_id=" << rc.request_id
+                << " trace_id=" << rc.trace_id << " caller=" << caller_id_of(rc)
+                << " role=" << caller_role_of(rc);
+    }
+    // OpenTelemetry: open a hop-A SERVER span as a child of the incoming trace
+    // context, then refresh `rc` so the downstream hop-B (master) attachment
+    // carries this span as the parent. No-op when tracing is disabled, so the
+    // existing hop-A bridge behaviour is unchanged.
+    ScopedSpan hop_a_span("mooncake-real-client", "rc.put", &rc);
+    hop_a_span.PopulateRequestContext(rc);
+    // Always install a scope (even for an empty attachment / disabled tracing)
+    // so the hop B inject reads THIS request's id, not residue left on this io
+    // thread (see put_dummy_helper).
+    CurrentCtxScope ctx_guard(std::move(rc));
+
     auto context_ptr = find_shm_context(client_id);
     if (!context_ptr) {
         LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        hop_a_span.SetError("shm_not_mapped");
+        ctx.response_msg(tl::expected<void, ErrorCode>(
+            tl::unexpected(ErrorCode::INVALID_PARAMS)));
+        return;
     }
     auto& context = *context_ptr;
     SharedMutexLocker lock(&context.mutex, shared_lock);
-    return put_internal(key, value, config, context.client_buffer_allocator);
+    auto result =
+        put_internal(key, value, config, context.client_buffer_allocator);
+    if (!result.has_value()) hop_a_span.SetError(toString(result.error()));
+    ctx.response_msg(std::move(result));
 }
 
 int RealClient::put(const std::string& key, std::span<const char> value,
@@ -417,19 +449,46 @@ tl::expected<void, ErrorCode> RealClient::put_batch_internal(
     return {};
 }
 
-tl::expected<void, ErrorCode> RealClient::put_batch_dummy_helper(
+void RealClient::put_batch_dummy_helper(
+    coro_rpc::context<tl::expected<void, ErrorCode>> ctx,
     const std::vector<std::string>& keys,
     const std::vector<std::span<const char>>& values, const WriteConfig& config,
     const UUID& client_id) {
+    // Bridge the per-request id from hop A's out-of-band attachment to hop B
+    // (master RPC: BatchPutStart). See put_dummy_helper.
+    auto att = ctx.get_context_info()->release_request_attachment();
+    RequestContext rc;
+    if (!att.empty()) {
+        rc = deserialize_request_context(att);
+        VLOG(2) << "hop-A bridge request_id=" << rc.request_id
+                << " trace_id=" << rc.trace_id << " caller=" << caller_id_of(rc)
+                << " role=" << caller_role_of(rc);
+    }
+    // OpenTelemetry: open a hop-A SERVER span as a child of the incoming trace
+    // context, then refresh `rc` so the downstream hop-B (master) attachment
+    // carries this span as the parent. No-op when tracing is disabled, so the
+    // existing hop-A bridge behaviour is unchanged.
+    ScopedSpan hop_a_span("mooncake-real-client", "rc.put_batch", &rc);
+    hop_a_span.PopulateRequestContext(rc);
+    // Always install a scope (even for an empty attachment / disabled tracing)
+    // so the hop B inject reads THIS request's id, not residue left on this io
+    // thread (see put_dummy_helper).
+    CurrentCtxScope ctx_guard(std::move(rc));
+
     auto context_ptr = find_shm_context(client_id);
     if (!context_ptr) {
         LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        hop_a_span.SetError("shm_not_mapped");
+        ctx.response_msg(tl::expected<void, ErrorCode>(
+            tl::unexpected(ErrorCode::INVALID_PARAMS)));
+        return;
     }
     auto& context = *context_ptr;
     SharedMutexLocker lock(&context.mutex, shared_lock);
-    return put_batch_internal(keys, values, config,
-                              context.client_buffer_allocator);
+    auto result = put_batch_internal(keys, values, config,
+                                     context.client_buffer_allocator);
+    if (!result.has_value()) hop_a_span.SetError(toString(result.error()));
+    ctx.response_msg(std::move(result));
 }
 
 int RealClient::put_batch(const std::vector<std::string>& keys,
@@ -501,18 +560,45 @@ tl::expected<void, ErrorCode> RealClient::put_parts_internal(
     return {};
 }
 
-tl::expected<void, ErrorCode> RealClient::put_parts_dummy_helper(
+void RealClient::put_parts_dummy_helper(
+    coro_rpc::context<tl::expected<void, ErrorCode>> ctx,
     const std::string& key, std::vector<std::span<const char>> values,
     const WriteConfig& config, const UUID& client_id) {
+    // Bridge the per-request id from hop A's out-of-band attachment to hop B
+    // (master RPC: PutStart). See put_dummy_helper.
+    auto att = ctx.get_context_info()->release_request_attachment();
+    RequestContext rc;
+    if (!att.empty()) {
+        rc = deserialize_request_context(att);
+        VLOG(2) << "hop-A bridge request_id=" << rc.request_id
+                << " trace_id=" << rc.trace_id << " caller=" << caller_id_of(rc)
+                << " role=" << caller_role_of(rc);
+    }
+    // OpenTelemetry: open a hop-A SERVER span as a child of the incoming trace
+    // context, then refresh `rc` so the downstream hop-B (master) attachment
+    // carries this span as the parent. No-op when tracing is disabled, so the
+    // existing hop-A bridge behaviour is unchanged.
+    ScopedSpan hop_a_span("mooncake-real-client", "rc.put_parts", &rc);
+    hop_a_span.PopulateRequestContext(rc);
+    // Always install a scope (even for an empty attachment / disabled tracing)
+    // so the hop B inject reads THIS request's id, not residue left on this io
+    // thread (see put_dummy_helper).
+    CurrentCtxScope ctx_guard(std::move(rc));
+
     auto context_ptr = find_shm_context(client_id);
     if (!context_ptr) {
         LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        hop_a_span.SetError("shm_not_mapped");
+        ctx.response_msg(tl::expected<void, ErrorCode>(
+            tl::unexpected(ErrorCode::INVALID_PARAMS)));
+        return;
     }
     auto& context = *context_ptr;
     SharedMutexLocker lock(&context.mutex, shared_lock);
-    return put_parts_internal(key, values, config,
-                              context.client_buffer_allocator);
+    auto result = put_parts_internal(key, values, config,
+                                     context.client_buffer_allocator);
+    if (!result.has_value()) hop_a_span.SetError(toString(result.error()));
+    ctx.response_msg(std::move(result));
 }
 
 int RealClient::put_parts(const std::string& key,
@@ -927,9 +1013,9 @@ std::tuple<uint64_t, size_t> RealClient::get_buffer_info(
 }
 
 tl::expected<std::tuple<uint64_t, size_t>, ErrorCode>
-RealClient::get_buffer_info_dummy_helper(const std::string& key,
-                                         const ReadRouteConfig& config,
-                                         const UUID& client_id) {
+RealClient::get_buffer_info_dummy_helper_impl(const std::string& key,
+                                              const ReadRouteConfig& config,
+                                              const UUID& client_id) {
     auto context_ptr = find_shm_context(client_id);
     if (!context_ptr) {
         LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
@@ -961,6 +1047,37 @@ RealClient::get_buffer_info_dummy_helper(const std::string& key,
     LOG(ERROR) << "Buffer allocated at " << buffer_base
                << " not found in any shared memory for client " << client_id;
     return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+}
+
+void RealClient::get_buffer_info_dummy_helper(
+    coro_rpc::context<tl::expected<std::tuple<uint64_t, size_t>, ErrorCode>>
+        ctx,
+    const std::string& key, const ReadRouteConfig& config,
+    const UUID& client_id) {
+    // Bridge the per-request id from hop A's out-of-band attachment to hop B
+    // (master RPC: GetReplicaList via Query). See put_dummy_helper.
+    auto att = ctx.get_context_info()->release_request_attachment();
+    RequestContext rc;
+    if (!att.empty()) {
+        rc = deserialize_request_context(att);
+        VLOG(2) << "hop-A bridge request_id=" << rc.request_id
+                << " trace_id=" << rc.trace_id << " caller=" << caller_id_of(rc)
+                << " role=" << caller_role_of(rc);
+    }
+    // OpenTelemetry: open a hop-A SERVER span as a child of the incoming trace
+    // context, then refresh `rc` so the downstream hop-B (master) attachment
+    // carries this span as the parent. No-op when tracing is disabled, so the
+    // existing hop-A bridge behaviour is unchanged.
+    ScopedSpan hop_a_span("mooncake-real-client", "rc.get", &rc);
+    hop_a_span.PopulateRequestContext(rc);
+    // Always install a scope (even for an empty attachment / disabled tracing)
+    // so the hop B inject reads THIS request's id, not residue left on this io
+    // thread (see put_dummy_helper).
+    CurrentCtxScope ctx_guard(std::move(rc));
+
+    auto result = get_buffer_info_dummy_helper_impl(key, config, client_id);
+    if (!result.has_value()) hop_a_span.SetError(toString(result.error()));
+    ctx.response_msg(std::move(result));
 }
 
 // Implementation of batch_get_buffer_internal method
@@ -1074,17 +1191,41 @@ std::vector<int> RealClient::batch_put_from(
     return results;
 }
 
-std::vector<tl::expected<void, ErrorCode>>
-RealClient::batch_put_from_dummy_helper(
+void RealClient::batch_put_from_dummy_helper(
+    coro_rpc::context<std::vector<tl::expected<void, ErrorCode>>> ctx,
     const std::vector<std::string>& keys,
     const std::vector<uint64_t>& dummy_buffers,
     const std::vector<size_t>& sizes, const WriteConfig& config,
     const UUID& client_id) {
+    // Bridge the per-request id from hop A's out-of-band attachment to hop B:
+    // install it in this (coro_rpc server) thread's g_current_ctx so the
+    // synchronous master RPC below re-attaches the same id.
+    auto att = ctx.get_context_info()->release_request_attachment();
+    RequestContext rc;
+    if (!att.empty()) {
+        rc = deserialize_request_context(att);
+        VLOG(2) << "hop-A bridge request_id=" << rc.request_id
+                << " trace_id=" << rc.trace_id << " caller=" << caller_id_of(rc)
+                << " role=" << caller_role_of(rc);
+    }
+    // OpenTelemetry: open a hop-A SERVER span as a child of the incoming trace
+    // context, then refresh `rc` so the downstream hop-B (master) attachment
+    // carries this span as the parent. No-op when tracing is disabled, so the
+    // existing hop-A bridge behaviour is unchanged.
+    ScopedSpan hop_a_span("mooncake-real-client", "rc.batch_put", &rc);
+    hop_a_span.PopulateRequestContext(rc);
+    // Always install a scope (even for an empty attachment / disabled tracing)
+    // so the hop B inject reads THIS request's id, not residue left on this io
+    // thread (see put_dummy_helper).
+    CurrentCtxScope ctx_guard(std::move(rc));
+
     auto context_ptr = find_shm_context(client_id);
     if (!context_ptr) {
         LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
-        return std::vector<tl::expected<void, ErrorCode>>(
-            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+        hop_a_span.SetError("shm_not_mapped");
+        ctx.response_msg(std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS)));
+        return;
     }
     // Hold the context lock across translation and the transfer so a concurrent
     // unmap can't munmap the segments mid-transfer.
@@ -1124,11 +1265,19 @@ RealClient::batch_put_from_dummy_helper(
                        << dummy_addr << std::dec << ", size " << size << ") "
                        << "not found in any mapped shared memory for client "
                        << client_id;
-            return std::vector<tl::expected<void, ErrorCode>>(
-                keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+            ctx.response_msg(std::vector<tl::expected<void, ErrorCode>>(
+                keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS)));
+            return;
         }
     }
-    return batch_put_from_internal(keys, buffers, sizes, config);
+    auto results = batch_put_from_internal(keys, buffers, sizes, config);
+    for (const auto& r : results) {
+        if (!r.has_value()) {
+            hop_a_span.SetError(toString(r.error()));
+            break;
+        }
+    }
+    ctx.response_msg(std::move(results));
 }
 
 std::vector<tl::expected<void, ErrorCode>> RealClient::batch_put_from_internal(
@@ -1251,17 +1400,41 @@ std::vector<int64_t> RealClient::batch_get_into(
     return results;
 }
 
-std::vector<tl::expected<int64_t, ErrorCode>>
-RealClient::batch_get_into_dummy_helper(
+void RealClient::batch_get_into_dummy_helper(
+    coro_rpc::context<std::vector<tl::expected<int64_t, ErrorCode>>> ctx,
     const std::vector<std::string>& keys,
     const std::vector<uint64_t>& dummy_buffers,
     const std::vector<size_t>& sizes, const ReadRouteConfig& config,
     const UUID& client_id) {
+    // Bridge the per-request id from hop A's out-of-band attachment to hop B:
+    // install it in this (coro_rpc server) thread's g_current_ctx so the
+    // synchronous master RPC below re-attaches the same id.
+    auto att = ctx.get_context_info()->release_request_attachment();
+    RequestContext rc;
+    if (!att.empty()) {
+        rc = deserialize_request_context(att);
+        VLOG(2) << "hop-A bridge request_id=" << rc.request_id
+                << " trace_id=" << rc.trace_id << " caller=" << caller_id_of(rc)
+                << " role=" << caller_role_of(rc);
+    }
+    // OpenTelemetry: open a hop-A SERVER span as a child of the incoming trace
+    // context, then refresh `rc` so the downstream hop-B (master) attachment
+    // carries this span as the parent. No-op when tracing is disabled, so the
+    // existing hop-A bridge behaviour is unchanged.
+    ScopedSpan hop_a_span("mooncake-real-client", "rc.batch_get", &rc);
+    hop_a_span.PopulateRequestContext(rc);
+    // Always install a scope (even for an empty attachment / disabled tracing)
+    // so the hop B inject reads THIS request's id, not residue left on this io
+    // thread (see put_dummy_helper).
+    CurrentCtxScope ctx_guard(std::move(rc));
+
     auto context_ptr = find_shm_context(client_id);
     if (!context_ptr) {
         LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
-        return std::vector<tl::expected<int64_t, ErrorCode>>(
-            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+        hop_a_span.SetError("shm_not_mapped");
+        ctx.response_msg(std::vector<tl::expected<int64_t, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS)));
+        return;
     }
     // Hold the context lock across translation and the transfer so a concurrent
     // unmap can't munmap the segments mid-transfer.
@@ -1301,11 +1474,19 @@ RealClient::batch_get_into_dummy_helper(
                        << dummy_addr << std::dec << ", size " << size << ") "
                        << "not found in any mapped shared memory for client "
                        << client_id;
-            return std::vector<tl::expected<int64_t, ErrorCode>>(
-                keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+            ctx.response_msg(std::vector<tl::expected<int64_t, ErrorCode>>(
+                keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS)));
+            return;
         }
     }
-    return batch_get_into_internal(keys, buffers, sizes, config);
+    auto results = batch_get_into_internal(keys, buffers, sizes, config);
+    for (const auto& r : results) {
+        if (!r.has_value()) {
+            hop_a_span.SetError(toString(r.error()));
+            break;
+        }
+    }
+    ctx.response_msg(std::move(results));
 }
 
 std::vector<tl::expected<int64_t, ErrorCode>>
@@ -1356,6 +1537,134 @@ std::vector<tl::expected<bool, ErrorCode>> RealClient::batchIsExist_internal(
 
     // Call client BatchIsExist and return the vector<expected> directly
     return client_service_->BatchIsExist(keys);
+}
+
+void RealClient::batchIsExist_internal_rpc(
+    coro_rpc::context<std::vector<tl::expected<bool, ErrorCode>>> ctx,
+    const std::vector<std::string>& keys) {
+    // V3 hop A entry (dummy path). Read the out-of-band request attachment and
+    // install a CurrentCtxScope so the synchronous hop B master RPC
+    // (client_service_->BatchIsExist -> master_client_.BatchExistKey, run via
+    // syncAwait on this same coro_rpc server thread) re-attaches the same id.
+    // The value-returning batchIsExist_internal stays the shared body (also
+    // used in-process by the real path).
+    auto att = ctx.get_context_info()->release_request_attachment();
+    RequestContext rc;
+    if (!att.empty()) {
+        rc = deserialize_request_context(att);
+        VLOG(2) << "hop-A bridge request_id=" << rc.request_id
+                << " trace_id=" << rc.trace_id << " caller=" << caller_id_of(rc)
+                << " role=" << caller_role_of(rc);
+    }
+    // OpenTelemetry: open a hop-A SERVER span as a child of the incoming trace
+    // context, then refresh `rc` so the downstream hop-B (master) attachment
+    // carries this span as the parent. No-op when tracing is disabled, so the
+    // existing hop-A bridge behaviour is unchanged.
+    ScopedSpan hop_a_span("mooncake-real-client", "rc.batch_is_exist", &rc);
+    hop_a_span.PopulateRequestContext(rc);
+    // Always install a scope (even for an empty attachment / disabled tracing)
+    // so the hop B inject reads THIS request's id, not residue left on this io
+    // thread (see put_dummy_helper).
+    CurrentCtxScope ctx_guard(std::move(rc));
+    auto results = batchIsExist_internal(keys);
+    for (const auto& r : results) {
+        if (!r.has_value()) {
+            hop_a_span.SetError(toString(r.error()));
+            break;
+        }
+    }
+    ctx.response_msg(std::move(results));
+}
+
+void RealClient::isExist_internal_rpc(
+    coro_rpc::context<tl::expected<bool, ErrorCode>> ctx,
+    const std::string& key) {
+    // V3 hop A entry (dummy path only). isExist_internal stays the
+    // value-returning body used in-process by the real path. Read the
+    // out-of-band attachment, install a CurrentCtxScope so the synchronous hop
+    // B master RPC (client_service_->IsExist -> master_client_.ExistKey) on
+    // this same coro_rpc server thread re-attaches the id, delegate and reply.
+    auto att = ctx.get_context_info()->release_request_attachment();
+    RequestContext rc;
+    if (!att.empty()) {
+        rc = deserialize_request_context(att);
+        VLOG(2) << "hop-A bridge request_id=" << rc.request_id
+                << " trace_id=" << rc.trace_id << " caller=" << caller_id_of(rc)
+                << " role=" << caller_role_of(rc);
+    }
+    // OpenTelemetry: open a hop-A SERVER span as a child of the incoming trace
+    // context, then refresh `rc` so the downstream hop-B (master) attachment
+    // carries this span as the parent. No-op when tracing is disabled, so the
+    // existing hop-A bridge behaviour is unchanged.
+    ScopedSpan hop_a_span("mooncake-real-client", "rc.is_exist", &rc);
+    hop_a_span.PopulateRequestContext(rc);
+    // Always install a scope (even for an empty attachment / disabled tracing)
+    // so the hop B inject reads THIS request's id, not residue left on this io
+    // thread (see put_dummy_helper).
+    CurrentCtxScope ctx_guard(std::move(rc));
+    auto result = isExist_internal(key);
+    if (!result.has_value()) hop_a_span.SetError(toString(result.error()));
+    ctx.response_msg(std::move(result));
+}
+
+void RealClient::remove_internal_rpc(
+    coro_rpc::context<tl::expected<void, ErrorCode>> ctx,
+    const std::string& key, bool force) {
+    // V3 hop A entry (dummy path only). remove_internal stays the
+    // value-returning body used in-process by the real path. Bridge the per-
+    // request id to hop B (client_service_->Remove -> master_client_.Remove)
+    // via CurrentCtxScope.
+    auto att = ctx.get_context_info()->release_request_attachment();
+    RequestContext rc;
+    if (!att.empty()) {
+        rc = deserialize_request_context(att);
+        VLOG(2) << "hop-A bridge request_id=" << rc.request_id
+                << " trace_id=" << rc.trace_id << " caller=" << caller_id_of(rc)
+                << " role=" << caller_role_of(rc);
+    }
+    // OpenTelemetry: open a hop-A SERVER span as a child of the incoming trace
+    // context, then refresh `rc` so the downstream hop-B (master) attachment
+    // carries this span as the parent. No-op when tracing is disabled, so the
+    // existing hop-A bridge behaviour is unchanged.
+    ScopedSpan hop_a_span("mooncake-real-client", "rc.remove", &rc);
+    hop_a_span.PopulateRequestContext(rc);
+    // Always install a scope (even for an empty attachment / disabled tracing)
+    // so the hop B inject reads THIS request's id, not residue left on this io
+    // thread (see put_dummy_helper).
+    CurrentCtxScope ctx_guard(std::move(rc));
+    auto result = remove_internal(key, force);
+    if (!result.has_value()) hop_a_span.SetError(toString(result.error()));
+    ctx.response_msg(std::move(result));
+}
+
+void RealClient::getSize_internal_rpc(
+    coro_rpc::context<tl::expected<int64_t, ErrorCode>> ctx,
+    const std::string& key) {
+    // V3 hop A entry (dummy path only). getSize_internal stays the
+    // value-returning body used in-process by the real path. Bridge the per-
+    // request id to hop B (client_service_->Query ->
+    // master_client_.GetReplicaList) via CurrentCtxScope.
+    auto att = ctx.get_context_info()->release_request_attachment();
+    RequestContext rc;
+    if (!att.empty()) {
+        rc = deserialize_request_context(att);
+        VLOG(2) << "hop-A bridge request_id=" << rc.request_id
+                << " trace_id=" << rc.trace_id << " caller=" << caller_id_of(rc)
+                << " role=" << caller_role_of(rc);
+    }
+    // OpenTelemetry: open a hop-A SERVER span as a child of the incoming trace
+    // context, then refresh `rc` so the downstream hop-B (master) attachment
+    // carries this span as the parent. No-op when tracing is disabled, so the
+    // existing hop-A bridge behaviour is unchanged.
+    ScopedSpan hop_a_span("mooncake-real-client", "rc.get_size", &rc);
+    hop_a_span.PopulateRequestContext(rc);
+    // Always install a scope (even for an empty attachment / disabled tracing)
+    // so the hop B inject reads THIS request's id, not residue left on this io
+    // thread (see put_dummy_helper).
+    CurrentCtxScope ctx_guard(std::move(rc));
+    auto result = getSize_internal(key);
+    if (!result.has_value()) hop_a_span.SetError(toString(result.error()));
+    ctx.response_msg(std::move(result));
 }
 
 int RealClient::put_from_with_metadata(const std::string& key, void* buffer,
