@@ -6983,6 +6983,437 @@ TEST_F(MasterServiceHATest, WeightLeaseRenewalRechecksExpiryAfterGroupWait) {
     EXPECT_EQ(WeightManagementError::LEASE_EXPIRED, renewed.error());
 }
 
+TEST_F(MasterServiceHATest, RestoreInvalidMemoryRepairSurvivesSecondPromotion) {
+    for (int kind = 0; kind < 3; ++kind) {
+        SCOPED_TRACE(kind);
+        const std::string cluster_id =
+            "restore_invalid_memory_" + std::to_string(kind);
+        auto backend = std::make_shared<FakeBatchHaKvBackend>();
+        auto config = MasterServiceConfig::builder()
+                          .set_enable_ha(true)
+                          .set_enable_oplog(true)
+                          .set_cluster_id(cluster_id)
+                          .set_enable_multi_tenants(true)
+                          .set_tenant_quota_connector_uri(WriteTenantPolicyFile(
+                              {{"default", kStrictTenantQuotaBytes},
+                               {"other_tenant", kStrictTenantQuotaBytes}}))
+                          .build();
+        MasterService service(config);
+        ASSERT_EQ(ErrorCode::OK,
+                  MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(
+                      backend));
+        const std::string endpoint = "invalid_memory_segment";
+        auto good = MakeStandbyObject("shared_key", endpoint);
+        good.metadata.replicas.front()
+            .get_memory_descriptor()
+            .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+        auto bad = MakeStandbyObject(good.key, endpoint);
+        bad.tenant_id = "other_tenant";
+        bad.metadata.replicas.front().id = 2;
+        auto& buffer = bad.metadata.replicas.front()
+                           .get_memory_descriptor()
+                           .buffer_descriptor;
+        if (kind == 0) {
+            ++buffer.size_;
+        } else if (kind == 1) {
+            bad.metadata.size = buffer.size_ = 0;
+        } else {
+            buffer.buffer_address_ =
+                std::numeric_limits<uintptr_t>::max() - 511;
+        }
+        const auto segments = std::vector{MakeStandbyMemorySegment(endpoint)};
+        ASSERT_TRUE(service.RestoreFromStandbySnapshot({bad, good}, 7, segments)
+                        .has_value());
+
+        OpLogBatchStorage storage(cluster_id, *backend);
+        OpLogBatchRecord batch;
+        ReadBatchEventually(storage, 1, batch);
+        ASSERT_EQ(1u, batch.entries.size());
+        EXPECT_EQ(OpType::REMOVE, batch.entries[0].op_type);
+        EXPECT_EQ(bad.tenant_id, batch.entries[0].tenant_id);
+        EXPECT_EQ(bad.key, batch.entries[0].object_key);
+        DurablePrefix prefix;
+        ASSERT_EQ(ErrorCode::OK, storage.ReadDurablePrefix(prefix));
+        EXPECT_EQ(1u, prefix.last_seq);
+
+        StandbyMetadataStore standby;
+        ASSERT_TRUE(
+            standby.PutMetadata(good.tenant_id, good.key, good.metadata));
+        ASSERT_TRUE(standby.PutMetadata(bad.tenant_id, bad.key, bad.metadata));
+        OpLogApplier applier(&standby, cluster_id);
+        OpLogBatchStandbyReader reader(cluster_id, *backend, applier);
+        const auto poll = reader.PollOnce();
+        ASSERT_EQ(ErrorCode::OK, poll.error);
+        EXPECT_EQ(1u, poll.applied_entries);
+        EXPECT_TRUE(standby.Exists(good.tenant_id, good.key));
+        EXPECT_FALSE(standby.Exists(bad.tenant_id, bad.key));
+
+        std::vector<StandbyObjectEntry> replayed;
+        standby.Snapshot(replayed);
+        ASSERT_EQ(1u, replayed.size());
+        // No writer on the next candidate: any repeated repair would fail.
+        MasterService second(config);
+        ASSERT_FALSE(HasOpLogWriter(second));
+        ASSERT_TRUE(second.RestoreFromStandbySnapshot(replayed, 8, segments)
+                        .has_value());
+        EXPECT_EQ(1, ReplicaCountForTesting(second, kDefaultTenant, good.key));
+        EXPECT_EQ(0, ReplicaCountForTesting(second, TenantId(bad.tenant_id),
+                                            bad.key));
+    }
+}
+
+TEST_F(MasterServiceHATest, RestoreInvalidMemoryDoesNotTombstoneDuplicateKeys) {
+    for (int variant = 0; variant < 6; ++variant) {
+        SCOPED_TRACE(variant);
+        const bool invalid_first = variant % 2 != 0;
+        const int spelling = variant / 2;
+        const std::string cluster_id = "restore_duplicate_no_repair";
+        auto backend = std::make_shared<FakeBatchHaKvBackend>();
+        MasterService service(
+            MasterServiceConfig::builder()
+                .set_enable_ha(true)
+                .set_enable_oplog(true)
+                .set_cluster_id(cluster_id)
+                .set_enable_multi_tenants(true)
+                .set_tenant_quota_connector_uri(WriteTenantPolicyFile(
+                    {{"default", kStrictTenantQuotaBytes},
+                     {"target_tenant", kStrictTenantQuotaBytes}}))
+                .build());
+        ASSERT_EQ(ErrorCode::OK,
+                  MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(
+                      backend));
+        const std::string endpoint = "duplicate_no_repair_segment";
+        auto survivor = MakeStandbyObject("survivor", endpoint);
+        survivor.metadata.replicas.front()
+            .get_memory_descriptor()
+            .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+        auto valid = MakeStandbyObject("duplicate", endpoint);
+        if (spelling != 0) {
+            valid.tenant_id = "target_tenant";
+        }
+        valid.metadata.replicas.front().id = 2;
+        valid.metadata.replicas.front()
+            .get_memory_descriptor()
+            .buffer_descriptor.buffer_address_ = kDefaultSegmentBase + 4096;
+        auto invalid = valid;
+        if (spelling == 1) {
+            // Legacy scoped spelling resolves to the same tenant and key.
+            invalid.tenant_id = "default";
+            invalid.key = TenantId(valid.tenant_id).MakeScopedKey(valid.key);
+        } else if (spelling == 2) {
+            // An explicit non-default tenant overrides the embedded tenant.
+            invalid.key = TenantId("ignored_tenant").MakeScopedKey(valid.key);
+        }
+        invalid.metadata.replicas.front().id = 3;
+        ++invalid.metadata.replicas.front()
+              .get_memory_descriptor()
+              .buffer_descriptor.size_;
+        auto objects = invalid_first ? std::vector{survivor, invalid, valid}
+                                     : std::vector{survivor, valid, invalid};
+        ASSERT_TRUE(service
+                        .RestoreFromStandbySnapshot(
+                            objects, 7, {MakeStandbyMemorySegment(endpoint)})
+                        .has_value());
+        EXPECT_EQ(
+            1, ReplicaCountForTesting(service, kDefaultTenant, survivor.key));
+        EXPECT_EQ(invalid_first ? 0 : 1,
+                  ReplicaCountForTesting(service, TenantId(valid.tenant_id),
+                                         valid.key));
+        OpLogBatchStorage storage(cluster_id, *backend);
+        OpLogBatchRecord batch;
+        EXPECT_EQ(ErrorCode::ETCD_KEY_NOT_EXIST, storage.ReadBatch(1, batch));
+    }
+}
+
+TEST_F(MasterServiceHATest,
+       RestoreTransientAndExistingEntriesDoNotWriteRepairs) {
+    const std::string cluster_id = "restore_transient_no_repair";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    MasterService service(MasterServiceConfig::builder()
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id(cluster_id)
+                              .build());
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
+    const std::string endpoint = "transient_no_repair_segment";
+    auto good = MakeStandbyObject("survivor", endpoint);
+    good.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    auto unknown = MakeStandbyObject("unknown", "not_mounted");
+    unknown.metadata.replicas.front().id = 2;
+    auto capacity = MakeStandbyObject("capacity", endpoint);
+    capacity.metadata.replicas.front().id = 3;
+    capacity.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase + 4096;
+    auto invalid_tenant = MakeStandbyObject("invalid_tenant", endpoint);
+    invalid_tenant.tenant_id = "_reserved";
+    invalid_tenant.metadata.replicas.front().id = 4;
+    // The first object consumes all current capacity; a later candidate may
+    // have more capacity or know the missing endpoint.
+    const auto segments = std::vector{MakeStandbyMemorySegment(endpoint, 1024)};
+    ASSERT_TRUE(service
+                    .RestoreFromStandbySnapshot(
+                        {good, unknown, capacity, invalid_tenant}, 7, segments)
+                    .has_value());
+    EXPECT_EQ(1, ReplicaCountForTesting(service, kDefaultTenant, good.key));
+    EXPECT_EQ(0, ReplicaCountForTesting(service, kDefaultTenant, unknown.key));
+    EXPECT_EQ(0, ReplicaCountForTesting(service, kDefaultTenant, capacity.key));
+    auto existing = good;
+    ++existing.metadata.replicas.front()
+          .get_memory_descriptor()
+          .buffer_descriptor.size_;
+    ASSERT_TRUE(service.RestoreFromStandbySnapshot({existing}, 8, segments)
+                    .has_value());
+    EXPECT_EQ(1, ReplicaCountForTesting(service, kDefaultTenant, good.key));
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    EXPECT_EQ(ErrorCode::ETCD_KEY_NOT_EXIST, storage.ReadBatch(1, batch));
+
+    MasterService next(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+    ASSERT_TRUE(next.RestoreFromStandbySnapshot(
+                        {good, unknown, capacity, invalid_tenant}, 9,
+                        {MakeStandbyMemorySegment(endpoint),
+                         MakeStandbyMemorySegment("not_mounted")})
+                    .has_value());
+    EXPECT_EQ(1, ReplicaCountForTesting(next, kDefaultTenant, good.key));
+    EXPECT_EQ(1, ReplicaCountForTesting(next, kDefaultTenant, unknown.key));
+    EXPECT_EQ(1, ReplicaCountForTesting(next, kDefaultTenant, capacity.key));
+}
+
+TEST_F(MasterServiceHATest,
+       RestoreInvalidMemoryRepairFailureRollsBackAndRetries) {
+    for (bool missing_writer : {false, true}) {
+        SCOPED_TRACE(missing_writer);
+        const std::string cluster_id = "restore_invalid_memory_retry";
+        auto backend = std::make_shared<FakeBatchHaKvBackend>();
+        MasterService service(MasterServiceConfig::builder()
+                                  .set_enable_ha(true)
+                                  .set_enable_oplog(true)
+                                  .set_cluster_id(cluster_id)
+                                  .build());
+        if (missing_writer) {
+            ASSERT_FALSE(HasOpLogWriter(service));
+        } else {
+            InstallRejectOnceWriter(service, backend)->RejectNextCommit();
+        }
+        const std::string endpoint = "invalid_memory_retry_segment";
+        auto good = MakeStandbyObject("survivor", endpoint);
+        good.metadata.replicas.front()
+            .get_memory_descriptor()
+            .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+        const UUID disk_owner = generate_uuid();
+        good.metadata.replicas.push_back(
+            MakeStandbyLocalDiskReplica(disk_owner, endpoint));
+        good.metadata.replicas.back().id = 3;
+        auto bad = MakeStandbyObject("invalid", endpoint);
+        bad.metadata.replicas.front().id = 2;
+        ++bad.metadata.replicas.front()
+              .get_memory_descriptor()
+              .buffer_descriptor.size_;
+        const auto segments = std::vector{MakeStandbyMemorySegment(endpoint)};
+        const auto bytes_before =
+            MasterMetricManager::instance().get_allocated_mem_size();
+        auto result =
+            service.RestoreFromStandbySnapshot({good, bad}, 7, segments);
+        ASSERT_FALSE(result.has_value());
+        EXPECT_EQ(missing_writer ? ErrorCode::INTERNAL_ERROR
+                                 : ErrorCode::PERSISTENT_FAIL,
+                  result.error());
+        EXPECT_EQ(bytes_before,
+                  MasterMetricManager::instance().get_allocated_mem_size());
+        EXPECT_EQ(0, ReplicaCountForTesting(service, kDefaultTenant, good.key));
+        EXPECT_TRUE(
+            MasterServiceTestPeer::ClientLivenessRecords(service).empty());
+        OpLogBatchStorage storage(cluster_id, *backend);
+        OpLogBatchRecord batch;
+        EXPECT_EQ(ErrorCode::ETCD_KEY_NOT_EXIST, storage.ReadBatch(1, batch));
+        if (missing_writer) {
+            ASSERT_EQ(
+                ErrorCode::OK,
+                MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(
+                    backend));
+        }
+        ASSERT_TRUE(service.RestoreFromStandbySnapshot({good, bad}, 7, segments)
+                        .has_value());
+        EXPECT_EQ(2, ReplicaCountForTesting(service, kDefaultTenant, good.key));
+        EXPECT_TRUE(
+            MasterServiceTestPeer::ClientLivenessRecords(service).contains(
+                disk_owner));
+        EXPECT_EQ(0, ReplicaCountForTesting(service, kDefaultTenant, bad.key));
+        EXPECT_EQ(bytes_before + good.metadata.size,
+                  MasterMetricManager::instance().get_allocated_mem_size());
+        ReadBatchEventually(storage, 1, batch);
+        ASSERT_EQ(1u, batch.entries.size());
+        EXPECT_EQ(OpType::REMOVE, batch.entries[0].op_type);
+        EXPECT_EQ(bad.key, batch.entries[0].object_key);
+    }
+}
+
+TEST_F(MasterServiceHATest,
+       RestoreInvalidMemoryOnlyStillFailsWithoutTombstone) {
+    const std::string cluster_id = "restore_all_invalid_memory";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    MasterService service(MasterServiceConfig::builder()
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id(cluster_id)
+                              .build());
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
+    const std::string endpoint = "all_invalid_memory_segment";
+    auto bad = MakeStandbyObject("invalid", endpoint);
+    ++bad.metadata.replicas.front()
+          .get_memory_descriptor()
+          .buffer_descriptor.size_;
+    auto result = service.RestoreFromStandbySnapshot(
+        {bad}, 7, {MakeStandbyMemorySegment(endpoint)});
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, result.error());
+    EXPECT_EQ(0, ReplicaCountForTesting(service, kDefaultTenant, bad.key));
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    EXPECT_EQ(ErrorCode::ETCD_KEY_NOT_EXIST, storage.ReadBatch(1, batch));
+}
+
+TEST_F(MasterServiceHATest, RestoreStructuralAndConflictRepairsStayInOneBatch) {
+    const std::string cluster_id = "restore_mixed_repair_atomic";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    MasterService service(MasterServiceConfig::builder()
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_batch_max_entries(3)
+                              .build());
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
+    const std::string endpoint = "mixed_repair_segment";
+    auto survivor = MakeStandbyObject("survivor", endpoint);
+    survivor.metadata.replicas.push_back(MakeStandbyMemoryReplica(endpoint));
+    survivor.metadata.replicas[1].id = 2;
+    survivor.metadata.replicas[0]
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    survivor.metadata.replicas[1]
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase + 8192;
+    auto lost = MakeStandbyObject("conflict", endpoint);
+    lost.metadata.replicas.front().id = 3;
+    lost.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    auto invalid = MakeStandbyObject("invalid", endpoint);
+    invalid.metadata.replicas.front().id = 4;
+    ++invalid.metadata.replicas.front()
+          .get_memory_descriptor()
+          .buffer_descriptor.size_;
+    ASSERT_TRUE(
+        service
+            .RestoreFromStandbySnapshot({survivor, lost, invalid}, 7,
+                                        {MakeStandbyMemorySegment(endpoint)})
+            .has_value());
+
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ReadBatchEventually(storage, 1, batch);
+    ASSERT_EQ(3u, batch.entries.size());
+    std::map<std::string, OpType> repairs;
+    for (const auto& entry : batch.entries) {
+        repairs.emplace(entry.object_key, entry.op_type);
+    }
+    EXPECT_EQ((std::map<std::string, OpType>{{invalid.key, OpType::REMOVE},
+                                             {lost.key, OpType::REMOVE},
+                                             {survivor.key, OpType::PUT_END}}),
+              repairs);
+    DurablePrefix prefix;
+    ASSERT_EQ(ErrorCode::OK, storage.ReadDurablePrefix(prefix));
+    EXPECT_EQ(1u, prefix.batch_id);
+    EXPECT_EQ(3u, prefix.last_seq);
+    OpLogBatchRecord next;
+    EXPECT_EQ(ErrorCode::ETCD_KEY_NOT_EXIST, storage.ReadBatch(2, next));
+
+    StandbyMetadataStore standby;
+    for (const auto& entry : {survivor, lost, invalid}) {
+        ASSERT_TRUE(
+            standby.PutMetadata(entry.tenant_id, entry.key, entry.metadata));
+    }
+    OpLogApplier applier(&standby, cluster_id);
+    ASSERT_EQ(3u, applier.ApplyOpLogEntries(batch.entries));
+    EXPECT_FALSE(standby.Exists(lost.tenant_id, lost.key));
+    EXPECT_FALSE(standby.Exists(invalid.tenant_id, invalid.key));
+    const auto canonical =
+        standby.GetMetadata(survivor.tenant_id, survivor.key);
+    ASSERT_TRUE(canonical.has_value());
+    ASSERT_EQ(1u, canonical->replicas.size());
+    EXPECT_EQ(kDefaultSegmentBase + 8192,
+              canonical->replicas.front()
+                  .get_memory_descriptor()
+                  .buffer_descriptor.buffer_address_);
+}
+
+TEST_F(MasterServiceHATest, RestoreDuplicateDoesNotSuppressOtherTenantRepair) {
+    for (bool invalid_first : {false, true}) {
+        SCOPED_TRACE(invalid_first);
+        const std::string cluster_id = "restore_duplicate_tenant_isolation";
+        auto backend = std::make_shared<FakeBatchHaKvBackend>();
+        MasterService service(
+            MasterServiceConfig::builder()
+                .set_enable_ha(true)
+                .set_enable_oplog(true)
+                .set_cluster_id(cluster_id)
+                .set_enable_multi_tenants(true)
+                .set_tenant_quota_connector_uri(WriteTenantPolicyFile(
+                    {{"default", kStrictTenantQuotaBytes},
+                     {"other_tenant", kStrictTenantQuotaBytes}}))
+                .build());
+        ASSERT_EQ(ErrorCode::OK,
+                  MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(
+                      backend));
+        const std::string endpoint = "duplicate_tenant_segment";
+        auto survivor = MakeStandbyObject("survivor", endpoint);
+        survivor.metadata.replicas.front()
+            .get_memory_descriptor()
+            .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+        auto valid = MakeStandbyObject("shared_key", endpoint);
+        valid.metadata.replicas.front().id = 2;
+        valid.metadata.replicas.front()
+            .get_memory_descriptor()
+            .buffer_descriptor.buffer_address_ = kDefaultSegmentBase + 4096;
+        auto invalid = valid;
+        invalid.metadata.replicas.front().id = 3;
+        ++invalid.metadata.replicas.front()
+              .get_memory_descriptor()
+              .buffer_descriptor.size_;
+        auto independent = invalid;
+        independent.tenant_id = "other_tenant";
+        independent.metadata.replicas.front().id = 4;
+        const auto objects =
+            invalid_first ? std::vector{survivor, invalid, valid, independent}
+                          : std::vector{survivor, valid, invalid, independent};
+        ASSERT_TRUE(service
+                        .RestoreFromStandbySnapshot(
+                            objects, 7, {MakeStandbyMemorySegment(endpoint)})
+                        .has_value());
+        EXPECT_EQ(
+            1, ReplicaCountForTesting(service, kDefaultTenant, survivor.key));
+        EXPECT_EQ(invalid_first ? 0 : 1,
+                  ReplicaCountForTesting(service, kDefaultTenant, valid.key));
+        OpLogBatchStorage storage(cluster_id, *backend);
+        OpLogBatchRecord batch;
+        ReadBatchEventually(storage, 1, batch);
+        ASSERT_EQ(1u, batch.entries.size());
+        EXPECT_EQ(OpType::REMOVE, batch.entries[0].op_type);
+        EXPECT_EQ(independent.tenant_id, batch.entries[0].tenant_id);
+        EXPECT_EQ(independent.key, batch.entries[0].object_key);
+    }
+}
+
 }  // namespace mooncake::test
 
 int main(int argc, char** argv) {

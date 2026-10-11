@@ -18,6 +18,7 @@
 #include <shared_mutex>
 #include <sstream>
 #include <stdexcept>
+#include <string_view>
 #include <thread>
 #include <tuple>
 #include <regex>
@@ -3552,6 +3553,7 @@ struct MasterService::LegacyRestoreContext {
     };
     std::vector<AcceptedEntry> accepted;
     std::unordered_set<std::string> object_ids;
+    std::unordered_set<std::string> duplicate_object_ids;
     // segment -> (address, size, index into `accepted`, descriptor index)
     std::unordered_map<
         const StandbySegmentInfo*,
@@ -3569,6 +3571,17 @@ void MasterService::NoteLegacyStandbyRejection(LegacyRestoreContext& ctx,
                  << entry.key << ", reason=" << reason;
     MasterMetricManager::instance().inc_standby_restore_rejected_objects(
         reason);
+
+    const std::string_view rejection(reason);
+    if (rejection == "invalid_memory_descriptor") {
+        // Only structural errors are permanent; endpoint and capacity
+        // failures depend on this promotion's view. Identity is already
+        // validated before memory descriptors reach this rejection.
+        ctx.repair_remove_keys.push_back(ResolveStandbyObject(entry));
+    } else if (rejection == "duplicate_object") {
+        const auto [tenant_id, user_key] = ResolveStandbyObject(entry);
+        ctx.duplicate_object_ids.insert(tenant_id.MakeScopedKey(user_key));
+    }
 }
 
 std::shared_ptr<ClientLivenessRecord> MasterService::RecordRestoreKnownOwner(
@@ -3660,6 +3673,14 @@ tl::expected<void, ErrorCode> MasterService::ValidateLegacyStandbyEntries(
                                                      desc_idx);
         }
     }
+
+    // A later duplicate may refer to a valid version of an earlier bad
+    // entry. Keep the existing duplicate policy without making that
+    // first entry's structural rejection a permanent key-level deletion.
+    std::erase_if(ctx.repair_remove_keys, [&](const auto& key) {
+        return ctx.duplicate_object_ids.contains(
+            key.first.MakeScopedKey(key.second));
+    });
 
     // Overlap is ambiguity, not recency: the promotion context carries no
     // replay order (the standby snapshot enumerates unordered maps), so an
@@ -4460,7 +4481,7 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    // Durable repair for conflict-derived discards: a later promotion must
+    // Durable repair for permanent discards: a later promotion must
     // not replay what this one dropped. The whole repair set goes out as one
     // indivisible batch record (REMOVE for full drops, canonical PUT_END
     // carrying only the survivors for partial ones), and the restore fails
@@ -4475,7 +4496,7 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
     // unrepaired, so the restore fails explicitly instead.
     if ((!repair_remove_keys.empty() || !repair_canonical_keys.empty()) &&
         enable_oplog_ && !ordered_oplog_writer_) {
-        LOG(ERROR) << "RestoreFromStandbySnapshot: conflict discards need "
+        LOG(ERROR) << "RestoreFromStandbySnapshot: permanent discards need "
                       "durable repair but no OpLog writer is available; "
                       "failing the restore";
         rollback_restored_state();
