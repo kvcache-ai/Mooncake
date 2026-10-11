@@ -119,6 +119,38 @@ if(WITH_TE)
           ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_tent_plugin_loopback.py)
       set_tests_properties(tent_python_plugin_loopback_test PROPERTIES TIMEOUT
                                                                        60)
+      # The same with the plugin directory named relative to the file TENT is
+      # linked into: engine.so, or libtransfer_engine.so when BUILD_SHARED_LIBS
+      # makes that a shared library. It runs from the build root, so that a
+      # working-directory result cannot pass.
+      set(tent_core_dir ${CMAKE_CURRENT_BINARY_DIR})
+      if(BUILD_SHARED_LIBS)
+        get_target_property(tent_core_dir transfer_engine BINARY_DIR)
+      endif()
+      file(RELATIVE_PATH tent_plugins_from_core ${tent_core_dir}
+           ${TENT_TRANSPORT_PLUGIN_DIR})
+      add_test(
+        NAME tent_python_plugin_loopback_origin_test
+        COMMAND
+          ${CMAKE_COMMAND} -E env MC_USE_TENT=1
+          MOONCAKE_LOCAL_HOSTNAME=127.0.0.1
+          "MC_TENT_CONF={\"plugins\":{\"dir\":\"$ORIGIN/${tent_plugins_from_core}\"},\"transports\":{\"loopback\":{\"enable\":true},\"rdma\":{\"enable\":false},\"tcp\":{\"enable\":true},\"gds\":{\"enable\":false},\"shm\":{\"enable\":false}}}"
+          TENT_TEST_PLUGIN_DIR=${TENT_TRANSPORT_PLUGIN_DIR}
+          PYTHONPATH=$<TARGET_FILE_DIR:engine>
+          LD_LIBRARY_PATH=$<TARGET_FILE_DIR:transfer_engine>:$<TARGET_FILE_DIR:tent_metrics>:$<TARGET_FILE_DIR:asio_shared>
+          ${Python3_EXECUTABLE}
+          ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_tent_plugin_loopback.py)
+      set_tests_properties(
+        tent_python_plugin_loopback_origin_test
+        PROPERTIES TIMEOUT 60 WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+    endif()
+    # A core built with TENT_XPORT_TCP=plugin gets TCP from the plugin
+    # directory.
+    if(TENT_XPORT_TCP STREQUAL "plugin")
+      set_property(
+        TEST tent_python_send_probe_test tent_python_first_buffer_test
+        APPEND
+        PROPERTY ENVIRONMENT "MC_TENT_PLUGIN_DIR=${TENT_TRANSPORT_PLUGIN_DIR}")
     endif()
   endif()
 endif()

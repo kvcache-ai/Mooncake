@@ -125,6 +125,11 @@ Status LoopbackTransport::install(std::string& local_segment_name,
     installed_ = true;
     LOG(INFO) << "Loopback transport installed: slot " << type_
               << (async_ ? ", async" : ", sync");
+#ifdef TENT_TRANSPORT_PLUGIN_VERSION
+    // Only a build that sets the version on the command line logs it here
+    // (plugin_entry.cpp supplies the default "1" to the descriptor alone).
+    LOG(INFO) << "Loopback transport version " TENT_TRANSPORT_PLUGIN_VERSION;
+#endif
     return Status::OK();
 }
 

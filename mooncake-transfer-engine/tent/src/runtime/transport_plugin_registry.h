@@ -70,8 +70,10 @@ struct PluginReport {
 // TransferEngineImpl::construct() in three steps:
 //   ensureLoaded()    before the TransportSelector parses policies, so that
 //                     plugin names resolve. Once per process: lists the
-//                     plugins/dir directories, dlopen()s the candidates,
-//                     checks their ABI and assigns plugin slots;
+//                     plugins/dir directories (a leading $ORIGIN stands for
+//                     the directory of the file the core was loaded from),
+//                     dlopen()s the candidates, checks their ABI and assigns
+//                     plugin slots;
 //   instantiate()     at the end of loadTransports(): creates this engine's
 //                     plugin transports;
 //   verifyInstalled() after the install loop: drops plugins whose
@@ -91,7 +93,8 @@ class TransportPluginRegistry {
                        TransportList& transports);
 
     // `summary` receives one line for the verbose banner, e.g.
-    // "loopback(loaded,slot 19)"; empty when the engine uses no plugins.
+    // "loopback(loaded,slot 19)", or "rdma(loaded,slot 1,<file>)" for a
+    // plugin in a built-in slot; empty when the engine uses no plugins.
     Status verifyInstalled(const Config& conf, TransportList& transports,
                            std::string* summary = nullptr);
 

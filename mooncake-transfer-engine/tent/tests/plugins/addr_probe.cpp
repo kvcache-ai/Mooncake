@@ -19,7 +19,7 @@
 #include "tent/common/utils/random.h"
 #include "tent/runtime/platform.h"
 #include "tent/runtime/slab.h"
-#include "tent/transport/tcp/tcp_transport.h"
+#include "tent/transport/shm/shm_transport.h"
 #include "tent/transport_plugin.hpp"
 
 namespace mooncake {
@@ -43,13 +43,13 @@ class ProbeTransport : public Transport {
 
 // out[0]: Platform::getLoader() (out-of-line function)
 // out[1]: SimpleRandom::Get() (inline function-local static)
-// out[2]: Slab<TcpSubBatch>::Get() (template function-local static)
+// out[2]: Slab<ShmSubBatch>::Get() (template function-local static)
 extern "C" __attribute__((visibility("default"))) void
 tent_test_addr_probe_addresses(const void** out) {
     using namespace mooncake::tent;
     out[0] = &Platform::getLoader();
     out[1] = &SimpleRandom::Get();
-    out[2] = &Slab<TcpSubBatch>::Get();
+    out[2] = &Slab<ShmSubBatch>::Get();
 }
 
 TENT_DEFINE_TRANSPORT_PLUGIN(addr_probe,

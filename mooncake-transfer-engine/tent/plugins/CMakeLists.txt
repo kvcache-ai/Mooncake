@@ -31,6 +31,24 @@ endif()
 
 option(TENT_BUILD_TRANSPORT_PLUGINS "Build the in-tree TENT transport plugins"
        ON)
+if(NOT TENT_BUILD_TRANSPORT_PLUGINS
+   AND (NOT TENT_XPORT_TCP STREQUAL "static" OR NOT TENT_XPORT_RDMA STREQUAL
+                                                "static"))
+  message(
+    FATAL_ERROR
+      "TENT_XPORT_TCP=${TENT_XPORT_TCP} and TENT_XPORT_RDMA=${TENT_XPORT_RDMA} "
+      "build transport plugins, which needs TENT_BUILD_TRANSPORT_PLUGINS=ON")
+endif()
+# A build directory reconfigured back to static drops the TCP/RDMA plugin it
+# built before, so its plugin directory does not offer a stale copy.
+foreach(name tcp rdma)
+  string(TOUPPER ${name} upper)
+  if(TENT_XPORT_${upper} STREQUAL "static")
+    file(REMOVE ${CMAKE_BINARY_DIR}/tent_plugins/libtent_xport_${name}.so)
+  endif()
+endforeach()
 if(TENT_BUILD_TRANSPORT_PLUGINS)
   add_subdirectory(transport)
 endif()
+# find_package(tentPlugin): tent_plugin for plugins built out of tree.
+add_subdirectory(sdk)

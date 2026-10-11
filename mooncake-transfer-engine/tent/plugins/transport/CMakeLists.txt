@@ -18,3 +18,14 @@ function(tent_add_transport_plugin target name)
 endfunction()
 
 add_subdirectory(loopback)
+
+# Built-in transports packaged as plugins (TENT_XPORT_<NAME>=plugin or both).
+foreach(name tcp rdma)
+  string(TOUPPER ${name} upper)
+  if(NOT TENT_XPORT_${upper} STREQUAL "static")
+    add_subdirectory(${name})
+    # Building a target that links tent_link_group also builds the plugin it may
+    # load.
+    add_dependencies(tent_link_group tent_xport_${name}_plugin)
+  endif()
+endforeach()

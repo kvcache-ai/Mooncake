@@ -18,6 +18,8 @@
 
 #include <gtest/gtest.h>
 
+#include <unistd.h>
+
 #include <algorithm>
 #include <cstring>
 #include <vector>
@@ -207,6 +209,7 @@ TEST_F(TransportPluginEngineTest, PluginSlotsComeAfterBuiltins) {
 }
 
 TEST_F(TransportPluginEngineTest, HintRoutesToPlugin) {
+    TENT_TEST_REQUIRE_BUILTIN_TCP();
     TransferEngine target(makeConfig(pluginDir()));
     TransferEngine initiator(makeConfig(pluginDir()));
     ASSERT_TRUE(target.available() && initiator.available());
@@ -254,6 +257,7 @@ TEST_F(TransportPluginEngineTest, PolicyNamesResolveToPlugin) {
 // transports (same as for built-ins), so the selector picks loopback; the
 // plugin then rejects a target without loopback, and nothing falls back.
 TEST_F(TransportPluginEngineTest, PolicyPinnedToPluginMissingOnTargetFails) {
+    TENT_TEST_REQUIRE_BUILTIN_TCP();
     auto target_conf = makeConfig(pluginDir());
     target_conf->set("transports/loopback/enable", false);
     TransferEngine target(target_conf);
@@ -288,6 +292,7 @@ TEST_F(TransportPluginEngineTest, PolicyNamingUnloadedPluginIsReported) {
 // Plugin names in the policy of an engine without plugins/dir are unknown
 // names, whether or not another engine of the process loaded the plugin.
 TEST_F(TransportPluginEngineTest, PluginNamesIgnoredWithoutPluginDir) {
+    TENT_TEST_REQUIRE_BUILTIN_TCP();
     TransferEngine loader(makeConfig(pluginDir()));
     ASSERT_TRUE(loader.available());
     ASSERT_NE(parseTransportType("loopback"), UNSPEC);
@@ -366,6 +371,7 @@ TEST_F(TransportPluginEngineTest, NestedRegistrationsServeCopies) {
 // A plugin dropped after install (here: capabilities beyond its
 // declaration) is not listed as loaded in the banner.
 TEST_F(TransportPluginEngineTest, BannerOmitsDroppedPlugins) {
+    TENT_TEST_REQUIRE_BUILTIN_TCP();
     LogCapture log;
     auto conf = makeConfig(plugin_test::badPluginDir());
     conf->set("verbose", true);
@@ -432,7 +438,76 @@ TEST_F(TransportPluginEngineTest, PluginProvidesMissingBuiltin) {
 }
 #endif
 
+// TENT_XPORT_TCP/RDMA: in plugin and both builds the build's own plugin
+// directory holds the built-in transports as plugins; a static build leaves
+// none there. With TCP=plugin the TCP plugin fills the built-in slot and
+// carries the data; with TCP=both the core's TCP is used and the plugin is
+// rejected as a conflict. In plugin mode this executable contains neither
+// transport, so the plugins run their own code.
+TEST_F(TransportPluginEngineTest, BuiltinTransportsAsPlugins) {
+    const std::string dir = TENT_TEST_BUILTIN_PLUGIN_DIR;
+    const std::string tcp_mode = TENT_TEST_XPORT_TCP;
+    const std::string rdma_mode = TENT_TEST_XPORT_RDMA;
+    auto built = [&](const std::string& name) {
+        const std::string file = dir + "/libtent_xport_" + name + ".so";
+        return access(file.c_str(), F_OK) == 0;
+    };
+    EXPECT_EQ(built("tcp"), tcp_mode != "static");
+    EXPECT_EQ(built("rdma"), rdma_mode != "static");
+
+    LogCapture log;
+    auto make = [&] {
+        auto conf = makeConfig("");
+        conf->set("plugins/dir", dir);
+        conf->set("verbose", true);
+        return conf;
+    };
+    TransferEngine target(make());
+    TransferEngine initiator(make());
+    ASSERT_TRUE(target.available() && initiator.available());
+    auto reports = plugin_test::reportsByName();
+
+    // Whether the TCP object comes from the plugin file: its vtable lives in
+    // the object that defines the class.
+    const auto& tcp = Peer::transports(initiator)[TCP];
+    ASSERT_NE(tcp, nullptr);
+    Dl_info info{};
+    ASSERT_NE(dladdr(*reinterpret_cast<void* const*>(tcp.get()), &info), 0);
+    const std::string tcp_file = dir + "/libtent_xport_tcp.so";
+    const bool tcp_from_plugin = tcp_file == info.dli_fname;
+    if (tcp_mode == "plugin") {
+        ASSERT_EQ(reports["tcp"].outcome, PluginOutcome::kLoaded)
+            << reports["tcp"].detail;
+        EXPECT_TRUE(tcp_from_plugin) << info.dli_fname;
+        EXPECT_TRUE(log.contains("tcp(loaded,slot " + std::to_string(TCP) +
+                                 "," + tcp_file + ")"));
+    } else {
+        EXPECT_FALSE(tcp_from_plugin) << info.dli_fname;
+        if (tcp_mode == "both")
+            EXPECT_EQ(reports["tcp"].outcome,
+                      PluginOutcome::kRejectedConflictWithBuiltin);
+        else
+            EXPECT_EQ(reports.count("tcp"), 0u);
+    }
+    // RDMA is off in these engines, but the plugin must still load cleanly in
+    // a host that does not link the RDMA objects.
+    if (rdma_mode == "static") {
+        EXPECT_EQ(reports.count("rdma"), 0u);
+    } else {
+        ASSERT_EQ(reports.count("rdma"), 1u);
+        const auto outcome = reports["rdma"].outcome;
+        EXPECT_TRUE(outcome == PluginOutcome::kDisabledByConfig ||
+                    outcome == PluginOutcome::kNotApplicable)
+            << pluginOutcomeName(outcome) << ": " << reports["rdma"].detail;
+    }
+
+    registerBuffers(initiator, target);
+    EXPECT_TRUE(write(initiator, target, TCP).ok());
+    unregisterBuffers(initiator, target);
+}
+
 TEST_F(TransportPluginEngineTest, SameMachineOnlyIsEnforcedBySelector) {
+    TENT_TEST_REQUIRE_BUILTIN_TCP();
     TransferEngine target(makeConfig(pluginDir()));
     TransferEngine initiator(makeConfig(pluginDir()));
     ASSERT_TRUE(target.available() && initiator.available());
@@ -645,6 +720,7 @@ TEST_F(TransportPluginEngineTest, CentralMetadataCarriesPluginNames) {
 }
 
 TEST_F(TransportPluginEngineTest, VerboseBannerListsPlugins) {
+    TENT_TEST_REQUIRE_BUILTIN_TCP();
     LogCapture log;
     auto conf = makeConfig(pluginDir());
     conf->set("verbose", true);

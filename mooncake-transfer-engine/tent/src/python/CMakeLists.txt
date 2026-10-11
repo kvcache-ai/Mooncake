@@ -36,4 +36,14 @@ if(BUILD_UNIT_TESTS)
       "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/mooncake-common:$<TARGET_FILE_DIR:tent_metrics>:$ENV{LD_LIBRARY_PATH}"
       ${Python3_EXECUTABLE}
       ${CMAKE_CURRENT_SOURCE_DIR}/../../tests/test_python_guards.py)
+  # A core built with TENT_XPORT_TCP=plugin gets TCP from the plugin directory
+  # (plugins/transport is configured after this directory, so the path is
+  # spelled out).
+  if(TENT_XPORT_TCP STREQUAL "plugin")
+    set_property(
+      TEST tent_python_guards_test
+      APPEND
+      PROPERTY ENVIRONMENT
+               "MC_TENT_PLUGIN_DIR=${CMAKE_BINARY_DIR}/tent_plugins")
+  endif()
 endif()

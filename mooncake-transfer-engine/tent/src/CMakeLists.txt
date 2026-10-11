@@ -149,6 +149,45 @@ if(USE_SUNRISE)
   target_link_libraries(tent_interface INTERFACE tangrt_shared ptml_shared dl)
 endif()
 
+# How the TCP and RDMA transports are built: static (in the core, the default),
+# plugin (only as plugins/transport's libtent_xport_<name>.so; the core does not
+# contain the transport) or both. The static libraries are built in every mode
+# because unit tests use them directly.
+set(TENT_XPORT_TCP
+    static
+    CACHE STRING "TCP transport: static, plugin or both")
+set(TENT_XPORT_RDMA
+    static
+    CACHE STRING "RDMA transport: static, plugin or both")
+set(TENT_XPORT_PLUGIN_ONLY_TARGETS)
+foreach(xport TCP RDMA)
+  set_property(CACHE TENT_XPORT_${xport} PROPERTY STRINGS static plugin both)
+  if(NOT TENT_XPORT_${xport} MATCHES "^(static|plugin|both)$")
+    message(
+      FATAL_ERROR "TENT_XPORT_${xport} must be static, plugin or both, not "
+                  "'${TENT_XPORT_${xport}}'")
+  endif()
+  if(TENT_XPORT_${xport} STREQUAL "plugin")
+    string(TOLOWER ${xport} name)
+    list(APPEND TENT_XPORT_PLUGIN_ONLY_TARGETS tent_xport_${name})
+  endif()
+endforeach()
+if(WITH_STORE_C_SHARED AND TENT_XPORT_PLUGIN_ONLY_TARGETS)
+  message(
+    WARNING
+      "libmooncake_store.so (WITH_STORE_C_SHARED) hides TENT's symbols, so its "
+      "TENT engines cannot load the plugins that replace "
+      "${TENT_XPORT_PLUGIN_ONLY_TARGETS} in this build")
+endif()
+if(NOT TENT_XPORT_RDMA STREQUAL "static" AND NOT (IBVERBS_LIB
+                                                  AND IBVERBS_INCLUDE))
+  message(
+    FATAL_ERROR
+      "TENT_XPORT_RDMA=${TENT_XPORT_RDMA} needs libibverbs to build the RDMA "
+      "transport, but it was not found (IBVERBS_LIB='${IBVERBS_LIB}', "
+      "IBVERBS_INCLUDE='${IBVERBS_INCLUDE}')")
+endif()
+
 add_subdirectory(common)
 add_subdirectory(rpc)
 add_subdirectory(metastore)
@@ -210,7 +249,7 @@ foreach(
   tent_xport_fabric
   tent_xport_memfabric
   tent_metrics)
-  if(TARGET ${tgt})
+  if(TARGET ${tgt} AND NOT tgt IN_LIST TENT_XPORT_PLUGIN_ONLY_TARGETS)
     target_link_libraries(tent_link_group INTERFACE ${tgt})
   endif()
 endforeach()
@@ -223,6 +262,19 @@ if(TARGET mooncake_common)
                         INTERFACE "$<TARGET_FILE:mooncake_common>")
 endif()
 target_link_libraries(tent_link_group INTERFACE "-Wl,--end-group")
+# When the build produces the TCP/RDMA plugins, an executable that links TENT
+# statically exports TENT's symbols so that the plugins can resolve them; it
+# opts out by setting ENABLE_EXPORTS to a false value.
+if(NOT TENT_XPORT_TCP STREQUAL "static" OR NOT TENT_XPORT_RDMA STREQUAL
+                                           "static")
+  set(tent_is_exe "$<STREQUAL:$<TARGET_PROPERTY:TYPE>,EXECUTABLE>")
+  set(tent_no_exports
+      "$<IN_LIST:$<UPPER_CASE:$<TARGET_PROPERTY:ENABLE_EXPORTS>>,0;OFF;NO;FALSE;N>"
+  )
+  target_link_options(
+    tent_link_group INTERFACE
+    "$<$<AND:${tent_is_exe},$<NOT:${tent_no_exports}>>:-rdynamic>")
+endif()
 install(
   TARGETS tent_shared
   ARCHIVE DESTINATION lib

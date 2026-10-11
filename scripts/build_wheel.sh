@@ -38,6 +38,15 @@ cp mooncake-integration/fabric_allocator_utils.py mooncake-wheel/mooncake/fabric
 # Copy engine.so to mooncake directory (will be imported by transfer module)
 cp ${BUILD_DIR}/mooncake-integration/engine.*.so mooncake-wheel/mooncake/engine.so
 
+# Copy the TENT transport plugins (TENT builds only) next to engine.so, where
+# plugins/dir="$ORIGIN/tent_plugins" (or MC_TENT_PLUGIN_DIR) finds them.
+rm -rf mooncake-wheel/mooncake/tent_plugins
+if compgen -G "${BUILD_DIR}/tent_plugins/libtent_xport_*.so" >/dev/null; then
+    echo "Copying TENT transport plugins..."
+    mkdir -p mooncake-wheel/mooncake/tent_plugins
+    cp ${BUILD_DIR}/tent_plugins/libtent_xport_*.so mooncake-wheel/mooncake/tent_plugins/
+fi
+
 # Copy the host-only PG core to mooncake directory
 if [ -f "${BUILD_DIR}/mooncake-pg/src/libmooncake_pg.so" ]; then
     echo "Copying libmooncake_pg.so..."

@@ -20,12 +20,13 @@
 #include <gtest/gtest.h>
 
 #include <cstring>
+#include <filesystem>
 #include <vector>
 
 #include "tent/common/utils/random.h"
 #include "tent/runtime/platform.h"
 #include "tent/runtime/slab.h"
-#include "tent/transport/tcp/tcp_transport.h"
+#include "tent/transport/shm/shm_transport.h"
 #include "transport_plugin_test_util.h"
 
 namespace mooncake {
@@ -91,7 +92,7 @@ TEST_F(TransportPluginHostTest, PluginSeesHostSingletons) {
     fn(seen);
     EXPECT_EQ(seen[0], &Platform::getLoader());
     EXPECT_EQ(seen[1], &SimpleRandom::Get());
-    EXPECT_EQ(seen[2], &Slab<TcpSubBatch>::Get());
+    EXPECT_EQ(seen[2], &Slab<ShmSubBatch>::Get());
     dlclose(handle);
 }
 
@@ -115,6 +116,22 @@ TEST_F(TransportPluginHostTest, NonExportingHostRefusesPlugins) {
     for (int t = kFirstPluginSlot; t < kNumTransportTypes; ++t)
         EXPECT_EQ(Peer::transports(engine)[t], nullptr);
     EXPECT_EQ(parseTransportType("loopback"), UNSPEC);
+}
+
+// The report names the directory searched, with $ORIGIN expanded (the core
+// is in this executable).
+TEST_F(TransportPluginHostTest, ReportNamesTheExpandedDirectory) {
+    namespace fs = std::filesystem;
+    const fs::path exe_dir = fs::read_symlink("/proc/self/exe").parent_path();
+    const std::string rel =
+        fs::path(pluginDir()).lexically_relative(exe_dir).string();
+    ASSERT_FALSE(rel.empty());
+    TransferEngine engine(makeConfig("$ORIGIN/" + rel));
+    ASSERT_TRUE(engine.available());
+    auto reports = TransportPluginRegistry::Get().reports();
+    ASSERT_EQ(reports.size(), 1u);
+    EXPECT_EQ(reports[0].outcome, PluginOutcome::kHostSymbolsNotExported);
+    EXPECT_EQ(reports[0].path, exe_dir.string() + "/" + rel);
 }
 
 // With a shadowed duplicate in a second directory the reason is still the

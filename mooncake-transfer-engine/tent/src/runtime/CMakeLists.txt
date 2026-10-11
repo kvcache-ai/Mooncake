@@ -19,6 +19,14 @@ endif()
 target_link_libraries(
   tent_runtime PUBLIC tent_common tent_rpc tent_platform_all tent_transport_all
                       tent_metrics ${CMAKE_DL_LIBS})
+# A transport built only as a plugin is not created by the loader. PRIVATE, so
+# plugins (which copy tent_runtime's interface definitions) do not see it.
+if(TENT_XPORT_TCP STREQUAL "plugin")
+  target_compile_definitions(tent_runtime PRIVATE TENT_XPORT_TCP_PLUGIN_ONLY)
+endif()
+if(TENT_XPORT_RDMA STREQUAL "plugin")
+  target_compile_definitions(tent_runtime PRIVATE TENT_XPORT_RDMA_PLUGIN_ONLY)
+endif()
 # The runtime references the Transfer Engine client I/O pool accessor
 # (mooncake::CreateRpcClientIoContextPool / mooncake::Environ) from the common
 # library. Declaring the dependency here keeps the shared library link ordered

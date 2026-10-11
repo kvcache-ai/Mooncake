@@ -98,9 +98,57 @@ TEST_F(TransportPluginRegistryTest, MissingDirectoryIsDiagnosed) {
     EXPECT_TRUE(log.contains("libtent_xport_loopback.so is not a directory"));
 }
 
+// This test links the core statically, so $ORIGIN is its own directory. It
+// runs from "/" so that a relative or working-directory result cannot pass.
+TEST_F(TransportPluginRegistryTest, OriginIsTheCoreDirectory) {
+    namespace fs = std::filesystem;
+    const fs::path exe_dir = fs::read_symlink("/proc/self/exe").parent_path();
+    struct RestoreCwd {
+        fs::path cwd = fs::current_path();
+        ~RestoreCwd() { fs::current_path(cwd); }
+    } restore_cwd;
+    fs::current_path("/");
+    const std::string rel =
+        fs::path(pluginDir()).lexically_relative(exe_dir).string();
+    ASSERT_FALSE(rel.empty());
+    auto conf = makeConfig("$ORIGIN/" + rel);
+    ASSERT_TRUE(
+        TransportPluginRegistry::Get().ensureLoaded(*conf, nullptr).ok());
+    auto reports = reportsByName();
+    ASSERT_TRUE(reports.count("loopback"));
+    EXPECT_EQ(reports["loopback"].outcome, PluginOutcome::kLoaded);
+    EXPECT_EQ(reports["loopback"].path,
+              exe_dir.string() + "/" + rel + "/libtent_xport_loopback.so");
+    // A missing directory is reported with the entry it came from; the
+    // plugins/load warning names the expanded directory.
+    TransportPluginRegistry::Get().resetForTest();
+    LogCapture log;
+    auto missing = makeConfig("$ORIGIN/no_such_dir");
+    missing->set("plugins/load", std::vector<std::string>{"vendorx"});
+    ASSERT_TRUE(
+        TransportPluginRegistry::Get().ensureLoaded(*missing, nullptr).ok());
+    EXPECT_TRUE(log.contains("plugin directory " + exe_dir.string() +
+                             "/no_such_dir (from $ORIGIN/no_such_dir) does "
+                             "not exist"));
+    EXPECT_TRUE(log.contains("no libtent_xport_vendorx.so exists in " +
+                             exe_dir.string() + "/no_such_dir"));
+}
+
+TEST_F(TransportPluginRegistryTest, OriginOnlyAsTheFirstComponent) {
+    LogCapture log;
+    auto conf = makeConfig("$ORIGINAL/x:/nonexistent/$ORIGIN");
+    ASSERT_TRUE(
+        TransportPluginRegistry::Get().ensureLoaded(*conf, nullptr).ok());
+    EXPECT_TRUE(TransportPluginRegistry::Get().reports().empty());
+    EXPECT_TRUE(log.contains("plugin directory $ORIGINAL/x does not exist"));
+    EXPECT_TRUE(
+        log.contains("plugin directory /nonexistent/$ORIGIN does not exist"));
+}
+
 // Every broken plugin in the bad directory gets exactly the outcome it was
 // built for, and the engine still comes up and moves data over TCP.
 TEST_F(TransportPluginRegistryTest, EveryBadPluginIsDiagnosed) {
+    TENT_TEST_REQUIRE_BUILTIN_TCP();
     LogCapture log;
     TransferEngine target(makeConfig(badPluginDir()));
     ASSERT_TRUE(target.available());

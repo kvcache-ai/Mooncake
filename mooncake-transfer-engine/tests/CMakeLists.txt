@@ -29,6 +29,15 @@ if(USE_TENT)
   )
 endif()
 add_test(NAME transport_uint_test COMMAND transport_uint_test)
+# A core built with TENT_XPORT_TCP=plugin has no TCP of its own; the MC_USE_TENT
+# cases above use TCP, so they load it from the plugin directory (tent/ is
+# configured after this directory, so the path is spelled out).
+if(USE_TENT AND TENT_XPORT_TCP STREQUAL "plugin")
+  set_property(
+    TEST transport_uint_test tent_compat_notify_test
+    APPEND
+    PROPERTY ENVIRONMENT "MC_TENT_PLUGIN_DIR=${CMAKE_BINARY_DIR}/tent_plugins")
+endif()
 
 # Hardware-free checks that updateGlobalConfig() clamps the RD-atomic depths to
 # the device's advertised limits; no RDMA device required.

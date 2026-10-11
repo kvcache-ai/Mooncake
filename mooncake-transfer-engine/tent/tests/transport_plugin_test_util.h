@@ -72,6 +72,17 @@ inline std::string badPluginDir() { return TENT_TEST_BAD_PLUGIN_DIR; }
 inline std::string dupPluginDir() { return TENT_TEST_DUP_PLUGIN_DIR; }
 inline std::string probePluginDir() { return TENT_TEST_PROBE_PLUGIN_DIR; }
 
+// TENT_XPORT_TCP=plugin builds a core without TCP. Cases whose premise is a
+// built-in TCP transport do not apply to it; the TCP plugin itself is covered
+// by the TCP tests, which load it from the plugin directory, and by
+// BuiltinTransportsAsPlugins.
+#if TENT_TEST_TCP_PLUGIN_ONLY
+#define TENT_TEST_REQUIRE_BUILTIN_TCP() \
+    GTEST_SKIP() << "TCP is a plugin in this build (TENT_XPORT_TCP=plugin)"
+#else
+#define TENT_TEST_REQUIRE_BUILTIN_TCP() static_cast<void>(0)
+#endif
+
 // Engine config for in-process tests: p2p metadata on loopback, TCP on, every
 // other built-in transport off so results do not depend on the host or the
 // build options.

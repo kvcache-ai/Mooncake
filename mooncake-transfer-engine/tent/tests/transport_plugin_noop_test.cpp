@@ -66,6 +66,11 @@ TEST_F(TransportPluginNoopTest, NoPluginDirectoryChangesNothing) {
     LogCapture log;
     auto conf = makeConfig("");
     conf->set("verbose", true);
+#if TENT_TEST_TCP_PLUGIN_ONLY
+    // This core has no TCP without plugins; SHM gives registerLocalMemory a
+    // transport (it does not take this heap buffer).
+    conf->set("transports/shm/enable", true);
+#endif
     TransferEngine engine(conf);
     ASSERT_TRUE(engine.available());
 

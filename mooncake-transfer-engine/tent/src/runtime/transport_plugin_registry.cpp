@@ -18,7 +18,10 @@
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <cinttypes>
+#include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <sstream>
 #include <unordered_set>
@@ -134,6 +137,27 @@ tent_transport_plugin_host_t makeHost(TransportType type,
     host.topology = topology;
     host.config = conf;
     return host;
+}
+
+// The directory of the file the TENT core was loaded from (the executable,
+// libtent_shared.so or a Python extension). /proc/self/maps names it with an
+// absolute path, whatever path and working directory it was loaded with
+// (Linux only, as is TENT). Empty if it cannot be found.
+std::string coreDirectory() {
+    // Each line: <start>-<end> <perms> <offset> <dev> <inode> <path>
+    constexpr char kRange[] = "%" SCNxPTR "-%" SCNxPTR;
+    const auto anchor = reinterpret_cast<uintptr_t>(&g_registry_anchor);
+    std::ifstream maps("/proc/self/maps");
+    std::string line;
+    while (std::getline(maps, line)) {
+        uintptr_t start = 0, end = 0;
+        if (std::sscanf(line.c_str(), kRange, &start, &end) != 2) continue;
+        if (anchor < start || anchor >= end) continue;
+        const size_t path = line.find('/');
+        if (path == std::string::npos) return "";
+        return fs::path(line.substr(path)).parent_path().string();
+    }
+    return "";
 }
 
 }  // namespace
@@ -338,8 +362,26 @@ Status TransportPluginRegistry::ensureLoaded(const Config& conf,
     std::unordered_map<std::string, std::string> seen;  // name -> first path
     std::stringstream stream(dirs);
     std::string dir;
+    std::string searched;  // the directories, with $ORIGIN expanded
     while (std::getline(stream, dir, ':')) {
         if (dir.empty()) continue;
+        // A leading "$ORIGIN" (only this spelling) is the directory of the
+        // file the core was loaded from, with symlinks resolved.
+        std::string from;
+        if (dir == "$ORIGIN" || dir.rfind("$ORIGIN/", 0) == 0) {
+            const std::string origin = coreDirectory();
+            if (origin.empty()) {
+                LOG(WARNING) << "[TransportPlugin] cannot resolve $ORIGIN in "
+                                "plugin directory "
+                             << dir
+                             << ": /proc/self/maps shows no file for the "
+                                "TENT core";
+                continue;
+            }
+            from = " (from " + dir + ")";
+            dir = origin + dir.substr(sizeof("$ORIGIN") - 1);
+        }
+        searched += (searched.empty() ? "" : ":") + dir;
         std::error_code ec;
         if (!fs::is_directory(dir, ec)) {
             std::string why = " is not a directory";
@@ -347,7 +389,8 @@ Status TransportPluginRegistry::ensureLoaded(const Config& conf,
                 why = " does not exist";
             else if (ec)
                 why = " is not accessible: " + ec.message();
-            LOG(WARNING) << "[TransportPlugin] plugin directory " << dir << why;
+            LOG(WARNING) << "[TransportPlugin] plugin directory " << dir << from
+                         << why;
             continue;
         }
         std::vector<fs::path> files;
@@ -365,7 +408,7 @@ Status TransportPluginRegistry::ensureLoaded(const Config& conf,
         }
         if (ec) {
             LOG(WARNING) << "[TransportPlugin] cannot list plugin directory "
-                         << dir << ": " << ec.message();
+                         << dir << from << ": " << ec.message();
         }
         std::sort(files.begin(), files.end());
         for (const auto& file : files) {
@@ -400,7 +443,7 @@ Status TransportPluginRegistry::ensureLoaded(const Config& conf,
         if (!seen.count(name)) {
             LOG(WARNING) << "[TransportPlugin] plugins/load lists '" << name
                          << "' but no " << kPrefix << name << kSuffix
-                         << " exists in " << dirs;
+                         << " exists in " << searched;
         }
     }
     const bool any_candidate =
@@ -416,7 +459,7 @@ Status TransportPluginRegistry::ensureLoaded(const Config& conf,
             loadOneLocked(item.path, item.name, topology, &conf);
     }
     if (any_candidate && !host_ok) {
-        addReportLocked(dirs, "", PluginOutcome::kHostSymbolsNotExported,
+        addReportLocked(searched, "", PluginOutcome::kHostSymbolsNotExported,
                         detail);
     }
     return Status::OK();
@@ -749,9 +792,13 @@ Status TransportPluginRegistry::verifyInstalled(const Config& conf,
                 const auto* entry = engineOutcome(r);
                 std::string item = pluginOutcomeName(
                     entry ? entry->outcome : reports_[r].outcome);
-                if (entry && entry->outcome == PluginOutcome::kLoaded)
-                    item +=
-                        ",slot " + std::to_string(plugins_[entry->plugin].type);
+                if (entry && entry->outcome == PluginOutcome::kLoaded) {
+                    const auto& plugin = plugins_[entry->plugin];
+                    item += ",slot " + std::to_string(plugin.type);
+                    // A built-in name alone does not tell where it came from.
+                    if (plugin.type < kNumBuiltinTransportTypes)
+                        item += "," + plugin.path;
+                }
                 if (!reports_[r].name.empty())
                     item = reports_[r].name + "(" + item + ")";
                 if (!summary->empty()) *summary += " ";
