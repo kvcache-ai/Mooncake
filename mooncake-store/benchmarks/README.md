@@ -83,3 +83,31 @@ The benchmark also prints a one-line `Prefill summary`, `Fragmentation summary`,
 and `Size-class breakdown` after each result row, so reviewers can read the
 actual prefill utilization, fragmentation, and per-size-class latency numbers
 without manually deriving them from the table.
+
+### RL Data-Plane Offload Benchmark
+
+The `rl_offload` workload replays the object lifecycle of RL training data
+offloaded through the object store. Every step writes bundles shaped like a
+captured GRPO trainer bundle: three payloads of data-dependent size (10-12 MiB
+by default) and 31 small Arrow buffers of 256 B to 9896 B. Objects are removed
+explicitly `--rl_lifetime_steps` later and nothing is evicted, so a failed put
+is lost data rather than a cache miss. The number of bundles per step is
+derived from each `--rl_target_utils` entry, the share of capacity the live set
+should occupy.
+
+```bash
+./build/mooncake-store/benchmarks/allocation_strategy_bench \
+  --workload=rl_offload \
+  --rl_segments=8 \
+  --rl_segment_mib=147 \
+  --rl_target_utils=70,80,85,90,95
+```
+
+- `Live%` is requested bytes live over capacity, averaged over steps;
+  `Charged%` is what the allocator reserved for them, size-class round-up
+  included.
+- `Failed/Puts` counts puts that found no segment with a large enough
+  contiguous region, summed over `--rl_seeds`.
+- `FreeMB@Fail` and `LargestMB@Fail` are cluster free space and the largest
+  contiguous free region at those failures. A large gap between them means the
+  failures come from placement, not from a full pool.
