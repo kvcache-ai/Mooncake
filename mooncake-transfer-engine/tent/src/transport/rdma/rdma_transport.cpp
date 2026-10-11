@@ -339,6 +339,25 @@ size_t RdmaTransport::initializeContexts() {
     return context_count;
 }
 
+RdmaTransport::NotifyConfig RdmaTransport::readNotifyConfig(
+    const Config& conf) {
+    NotifyConfig config;
+    config.rpc_fallback = conf.get("notification/rpc_fallback", true);
+    // Clamped so the hold's deadline arithmetic cannot overflow.
+    constexpr int64_t kMaxDeadlineMs = 24 * 3600 * 1000;
+    const int64_t deadline_ms =
+        conf.get("notification/resend_deadline_ms", int64_t{120000});
+    if (deadline_ms > kMaxDeadlineMs) {
+        LOG(WARNING) << "notification/resend_deadline_ms " << deadline_ms
+                     << " clamped to " << kMaxDeadlineMs;
+    }
+    if (deadline_ms > 0) {
+        config.resend_deadline =
+            std::chrono::milliseconds(std::min(deadline_ms, kMaxDeadlineMs));
+    }
+    return config;
+}
+
 Status RdmaTransport::install(std::string& local_segment_name,
                               std::shared_ptr<ControlService> metadata,
                               std::shared_ptr<Topology> local_topology,
@@ -363,7 +382,9 @@ Status RdmaTransport::install(std::string& local_segment_name,
     auto param_status = convertConfToRdmaParams(conf_, params_);
     if (!param_status.ok()) return param_status;
     metadata_ = metadata;
-    notify_rpc_fallback_ = conf_->get("notification/rpc_fallback", true);
+    const NotifyConfig notify = readNotifyConfig(*conf_);
+    notify_rpc_fallback_ = notify.rpc_fallback;
+    notify_resend_deadline_ = notify.resend_deadline;
     local_segment_name_ = local_segment_name;
     local_topology_ = local_topology;
 
@@ -430,6 +451,7 @@ Status RdmaTransport::quiesce() {
     {
         std::lock_guard<std::mutex> lock(notify_resend_mutex_);
         notify_resend_running_ = false;
+        notify_resend_stopped_ = true;
     }
     notify_resend_cv_.notify_all();
     if (notify_resend_worker_.joinable()) notify_resend_worker_.join();
@@ -1113,8 +1135,11 @@ Status RdmaTransport::sendNotificationOnAnyPath(const PendingNotify& pending) {
             if (last.IsRpcServiceError()) return last;  // no pair will do
             continue;
         }
-        const PendingNotify track{
-            pending.target, {}, pending.attempts, static_cast<int>(i)};
+        const PendingNotify track{pending.target,
+                                  {},
+                                  pending.attempts,
+                                  static_cast<int>(i),
+                                  pending.first_failed};
         if (endpoint->sendNotification(pending.notifi, &track))
             return Status::OK();
         last =
@@ -1126,13 +1151,21 @@ Status RdmaTransport::sendNotificationOnAnyPath(const PendingNotify& pending) {
 void RdmaTransport::requeueNotifications(std::vector<PendingNotify>&& drained) {
     {
         std::lock_guard<std::mutex> lock(notify_resend_mutex_);
+        // E.g. endpoints retired by uninstall(): nothing would resend them.
+        if (notify_resend_stopped_ && !drained.empty()) {
+            LOG(WARNING) << "Dropped " << drained.size()
+                         << " notification resend(s) after quiesce, "
+                         << (notify_resend_dropped_ += drained.size())
+                         << " so far";
+            return;
+        }
         for (auto& pending : drained)
             notify_resend_queue_.push_back(std::move(pending));
     }
     notify_resend_cv_.notify_one();
 }
 
-bool RdmaTransport::resendOne(PendingNotify& pending) {
+bool RdmaTransport::resendOne(PendingNotify& pending, Clock::time_point now) {
     Status status =
         Status::RdmaError("notification resend budget spent" LOC_MARK);
     if (++pending.attempts <= kMaxNotifyResendAttempts) {
@@ -1149,32 +1182,121 @@ bool RdmaTransport::resendOne(PendingNotify& pending) {
             });
         if (status.ok()) return true;
     }
+    // A stopped or restarting peer does not answer, or does not take it yet:
+    // hold the resend rather than drop it, and do not count the round.
+    if (holdsResend(status)) {
+        if (now == Clock::time_point{}) now = Clock::now();
+        if (pending.first_failed == Clock::time_point{})
+            pending.first_failed = now;
+        const auto give_up = pending.first_failed + notify_resend_deadline_;
+        if (now <= give_up) {
+            --pending.attempts;
+            pending.next_try =
+                now + std::min<Clock::duration>(kNotifyResendHoldInterval,
+                                                give_up - now);
+            return false;
+        }
+    }
+    pending.next_try = {};
+    const uint64_t dropped = ++notify_resend_dropped_;
     LOG_EVERY_N(WARNING, 100)
         << "Dropped a notification to segment " << pending.target << " after "
-        << pending.attempts << " attempt(s), " << google::COUNTER
+        << pending.attempts << " attempt(s), " << dropped
         << " so far: " << status.ToString();
     return false;
 }
 
 void RdmaTransport::notifyResendThread() {
     std::unique_lock<std::mutex> lock(notify_resend_mutex_);
+    auto next_due = [this] {
+        auto due = Clock::time_point::max();
+        for (const auto& held : notify_resend_held_)
+            due = std::min(due, held.second.due);
+        return due;
+    };
     while (true) {
-        notify_resend_cv_.wait(lock, [this] {
-            return !notify_resend_running_ || !notify_resend_queue_.empty();
-        });
-        if (!notify_resend_running_) return;
-        PendingNotify pending = std::move(notify_resend_queue_.front());
-        notify_resend_queue_.pop_front();
+        auto runnable = [&] {
+            return !notify_resend_running_ || !notify_resend_queue_.empty() ||
+                   next_due() <= Clock::now();
+        };
+        const auto due = next_due();
+        if (due == Clock::time_point::max()) {
+            notify_resend_cv_.wait(lock, runnable);
+        } else {
+            notify_resend_cv_.wait_until(lock, due, runnable);
+        }
+        if (!notify_resend_running_) {
+            // Nothing restarts this thread: what it leaves is never sent.
+            size_t left = notify_resend_queue_.size();
+            for (const auto& held : notify_resend_held_)
+                left += held.second.resends.size();
+            if (left > 0) {
+                LOG(WARNING) << "Dropped " << left
+                             << " notification resend(s) on shutdown, "
+                             << (notify_resend_dropped_ += left) << " so far";
+            }
+            return;
+        }
+        PendingNotify pending;
+        auto held =
+            std::find_if(notify_resend_held_.begin(), notify_resend_held_.end(),
+                         [now = Clock::now()](const auto& entry) {
+                             return entry.second.due <= now;
+                         });
+        if (held != notify_resend_held_.end()) {
+            pending = std::move(held->second.resends.front());
+            held->second.resends.pop_front();
+        } else if (!notify_resend_queue_.empty()) {
+            pending = std::move(notify_resend_queue_.front());
+            notify_resend_queue_.pop_front();
+            held = notify_resend_held_.find(pending.target);
+            if (held != notify_resend_held_.end()) {
+                if (pending.first_failed == Clock::time_point{})
+                    pending.first_failed = Clock::now();
+                held->second.resends.push_back(std::move(pending));
+                continue;
+            }
+        } else {
+            continue;
+        }
         lock.unlock();
+        bool delivered = false;
+        pending.next_try = {};
         try {
-            (void)resendOne(pending);
+            delivered = resendOne(pending);
         } catch (const std::exception& e) {
             // E.g. a msg the RPC leg cannot encode: nothing above us catches.
+            const uint64_t dropped = ++notify_resend_dropped_;
             LOG_EVERY_N(WARNING, 100)
                 << "Dropped a notification to segment " << pending.target
-                << ", " << google::COUNTER << " so far: " << e.what();
+                << ", " << dropped << " so far: " << e.what();
         }
         lock.lock();
+        const SegmentID target = pending.target;
+        if (!delivered && pending.next_try != Clock::time_point{}) {
+            auto& peer = notify_resend_held_[target];
+            peer.due = pending.next_try;
+            peer.resends.push_front(std::move(pending));
+            continue;
+        }
+        held = notify_resend_held_.find(target);
+        if (held == notify_resend_held_.end()) continue;
+        // The oldest is through: retry the rest, but not those out of time.
+        const auto now = Clock::now();
+        size_t expired = 0;
+        for (auto& rest : held->second.resends) {
+            if (!delivered && now - rest.first_failed > notify_resend_deadline_)
+                ++expired;
+            else
+                notify_resend_queue_.push_back(std::move(rest));
+        }
+        notify_resend_held_.erase(held);
+        if (expired > 0) {
+            LOG(WARNING) << "Dropped " << expired
+                         << " notification resend(s) to segment " << target
+                         << " past the deadline, "
+                         << (notify_resend_dropped_ += expired) << " so far";
+        }
     }
 }
 

@@ -1415,7 +1415,7 @@ bool RdmaEndPoint::sendNotification(const Notification& notifi,
     if (typed && track) {
         notify_resendable_.emplace(
             wr.wr_id, PendingNotify{track->target, notifi, track->attempts,
-                                    track->last_path});
+                                    track->last_path, track->first_failed});
     }
     notify_pending_count_++;
     notify_inflight_.fetch_add(1, std::memory_order_release);

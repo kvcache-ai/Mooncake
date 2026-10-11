@@ -61,6 +61,17 @@ request: the requests behind it are polled, and their notifications owed, only
 once a later call gets past it. Bound notifications of a transfer never polled
 to completion before teardown are not sent.
 
+## Resends over RDMA
+
+A notification posted on a notify queue pair that fails before the peer acked
+it is handed back to the RDMA transport's resend thread. That thread posts it
+again on the next NIC pair, up to three rounds, and then makes the Notify RPC.
+If the peer's control plane does not answer, or answers that it cannot take
+the notification yet, the resend is held instead of
+dropped and tried again every 2 s, only the oldest one per peer, until
+`notification/resend_deadline_ms` has passed since it was first held. Resends
+still queued or held when the transport stops are dropped.
+
 ## Duplicates
 
 With `notification/proto` 1 (the default) the sender stamps each notification
@@ -89,6 +100,8 @@ can repeat is rate-limited and carries the count so far:
 | `... unretryable so far` | the peer or transport rejected it as invalid |
 | `... unencodable so far` | the RPC leg could not encode it |
 | `Dropped N undelivered notification(s) at shutdown` | left in the outbox at teardown |
+| `Dropped a notification to segment S after N attempt(s)` | a resend that ran out of rounds or of `notification/resend_deadline_ms` |
+| `Dropped N notification resend(s) ...` | resends past the deadline behind a held one, or left when the RDMA transport stops |
 | `Gave up on notifications A..B of session S` | receiver: a missing range expired or was evicted |
 | `Dropped notifications delivered before or given up on` | receiver: a duplicate, or a late arrival in a range given up |
 
@@ -104,5 +117,6 @@ keeps the default; larger values are clamped where noted.
 | `notification/outbox_max` | `65536` | Entries the outbox holds before it drops its oldest. |
 | `notification/outbox_deadline_ms` | `120000` | How long a bound notification may wait in the outbox. At most 24 h. |
 | `notification/outbox_retry_ms` | `50` | First retry delay for a peer, doubled per failure. At most 2000. |
+| `notification/resend_deadline_ms` | `120000` | How long an RDMA resend is held for a peer whose control plane does not answer or does not take it yet. At most 24 h. |
 | `notification/dedup_hole_ttl_ms` | `600000` | How long the receiver waits for a missing sequence. Keep it above the sender's deadlines. |
 | `notification/dedup_max_holes` | `65536` | Missing ranges the receiver keeps per sender session. |
