@@ -15,7 +15,7 @@
 namespace mooncake {
 
 struct RdmaRouteOptions {
-    bool enabled = true;
+    bool enabled = false;
 
     // Optional RDMA device names, such as mlx5_0. An empty filter delegates
     // device selection to the RDMA implementation.
