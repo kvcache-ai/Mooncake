@@ -18,12 +18,17 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -307,6 +312,9 @@ class TransferEngineImpl {
     Status submitTransfer(BatchID batch_id,
                           const std::vector<Request>& request_list);
 
+    // notifi goes to each segment request_list targets once all of it has
+    // completed. What the completing poll cannot deliver waits in an outbox,
+    // up to notification/outbox_deadline_ms, and may land after later ones.
     Status submitTransfer(BatchID batch_id,
                           const std::vector<Request>& request_list,
                           const Notification& notifi);
@@ -354,7 +362,8 @@ class TransferEngineImpl {
     // Production code never calls this. Used by failover integration tests to
     // inject a FaultProxyTransport without bypassing resubmitTransferTask,
     // resolveTransport, or any other engine state. Not thread-safe with any
-    // in-flight transfer on that slot.
+    // in-flight transfer on that slot, nor while the outbox holds or sends a
+    // notification.
     void swapTransportForTest(TransportType type,
                               std::shared_ptr<Transport> xport) {
         if (type >= 0 && type < (TransportType)kSupportedTransportTypes) {
@@ -544,6 +553,22 @@ class TransferEngineImpl {
     Status sendNotificationViaRpc(SegmentID target_id,
                                   const Notification& notifi);
 
+    Notification stampNotification(SegmentID target_id,
+                                   const Notification& notifi);
+
+    // sendNotification() past the stamp. hook_path: a single try on the first
+    // notification transport, over a channel that is already up.
+    Status sendNotificationOnce(SegmentID target_id,
+                                const Notification& to_send, bool hook_path);
+
+    void fireBoundNotification(SegmentID target_id, const Notification& notifi);
+
+    bool outboxHolds(SegmentID target_id);
+
+    void enqueueOutbox(SegmentID target_id, Notification notifi);
+
+    void notifyOutboxThread();
+
     void findStagingPolicy(const Request& req,
                            std::vector<std::string>& policy);
 
@@ -649,6 +674,34 @@ class TransferEngineImpl {
     NotifyDedupFilter notify_dedup_;
     std::atomic<uint64_t> notify_dedup_dropped_{0};
 
+    // Stamped notifications a hook could not send, per target, oldest first.
+    // Only a target's oldest is tried, so a silent peer is dialed once per
+    // backoff; the outbox thread sends with no lock held.
+    struct OutboxEntry {
+        SegmentID target;
+        Notification notifi;
+        std::chrono::steady_clock::time_point enqueued;
+        std::chrono::steady_clock::time_point next_try;
+        int attempts{0};
+    };
+    std::mutex notify_outbox_mutex_;
+    std::condition_variable notify_outbox_cv_;
+    std::unordered_map<SegmentID, std::deque<OutboxEntry>> notify_outbox_;
+    size_t notify_outbox_size_{0};  // queued, plus the one in flight
+    std::optional<SegmentID> notify_outbox_sending_;
+    std::thread notify_outbox_worker_;  // started by the first entry
+    bool notify_outbox_running_{false};
+    size_t notify_outbox_max_{65536};
+    std::chrono::milliseconds notify_outbox_deadline_{120000};
+    std::chrono::milliseconds notify_outbox_retry_{50};
+    std::function<std::chrono::steady_clock::time_point()> notify_outbox_clock_{
+        std::chrono::steady_clock::now};
+    std::atomic<uint64_t> notify_outbox_dropped_deadline_{0};
+    std::atomic<uint64_t> notify_outbox_dropped_full_{0};
+    std::atomic<uint64_t> notify_outbox_dropped_unretryable_{0};
+    std::atomic<uint64_t> notify_outbox_dropped_encode_{0};
+    std::atomic<uint64_t> notify_outbox_dropped_shutdown_{0};
+
     std::string hostname_;
     uint16_t port_;
     bool ipv6_;
@@ -689,7 +742,7 @@ class TransferEngineImpl {
     // sits on the poll/alloc/free hot path.
     //
     // Lock order (never reversed):
-    //   progress_mutex_ -> shard
+    //   progress_mutex_ -> shard -> notify_outbox_mutex_
     // With the runtime queue enabled, hot paths hold progress_mutex_ and
     // take the shard only for membership ops:
     //   progress_mutex_ -> shard (membership only)

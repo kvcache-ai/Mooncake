@@ -133,6 +133,14 @@ deadline-scheduling
 failover
 :::
 
+## TENT Notifications
+
+:::{toctree}
+:maxdepth: 1
+
+notifications
+:::
+
 ## TENT Testing
 
 :::{toctree}
