@@ -275,7 +275,7 @@ class Transport {
             // Handshake / dummy slices are not attached to a BatchDesc.
             if (!task->batch_id) return;
             // Callers hold a pin on this BatchDesc across the publish and
-            // this callback; see pinCompletionCallback().
+            // this callback; see CompletionCallbackPin.
             auto &batch_desc = toBatchDesc(task->batch_id);
             if (is_failed) {
                 batch_desc.has_failure.store(true, std::memory_order_relaxed);
