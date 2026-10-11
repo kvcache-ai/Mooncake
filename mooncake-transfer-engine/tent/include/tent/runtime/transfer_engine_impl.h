@@ -21,6 +21,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -33,6 +34,7 @@
 #include "tent/common/status.h"
 #include "tent/common/types.h"
 #include "tent/runtime/admission_queue.h"
+#include "tent/runtime/registration_guard.h"
 #include "tent/runtime/transport.h"
 #include "tent/runtime/transport_selector.h"
 #include "tent/runtime/hp_tcp_transport_config.h"
@@ -413,7 +415,21 @@ class TransferEngineImpl {
     std::vector<TransportType> getSupportedTransports(
         TransportType request_type);
 
-    void deregisterRemovedBuffer(BufferDesc& desc);
+    struct RetiredRegistration {
+        BufferDesc desc;
+        std::vector<TransportType> pending;
+        bool counted;
+        bool unregister_pending;
+    };
+    RetiredRegistration makeRetiredRegistration(const BufferDesc& desc,
+                                                bool counted,
+                                                bool unregister_pending);
+    Status cleanRegistration(RetiredRegistration& retired);
+    void retainRetirement(RetiredRegistration retired);
+    Status retryFailedRegistrations(const std::vector<uint64_t>& addresses);
+    Status deregisterRemovedBuffer(BufferDesc& desc, bool counted = true);
+    Status unregisterLocalMemoryLocked(void* addr, size_t size,
+                                       bool synchronize = true);
 
     Status resubmitTransferTask(Batch* batch, size_t task_id);
 
@@ -583,6 +599,13 @@ class TransferEngineImpl {
     std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
         transport_list_;
     std::unique_ptr<SegmentTracker> local_segment_tracker_;
+    RegistrationCoordinator registration_coordinator_;
+    // Failed cleanup is not advertised, but prevents reuse of the old range.
+    // Address reservations serialize each entry; this mutex protects the map
+    // while unrelated addresses complete concurrently.
+    std::mutex retired_registration_mutex_;
+    std::map<std::pair<uint64_t, uint64_t>, RetiredRegistration>
+        retired_registrations_;
 
     std::vector<AllocatedMemory> allocated_memory_;
     std::mutex mutex_;

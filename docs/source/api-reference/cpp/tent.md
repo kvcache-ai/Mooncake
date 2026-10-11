@@ -413,9 +413,16 @@ Status registerLocalMemory(std::vector<void*> addr_list,
 
 // Advanced version with MemoryOptions
 Status registerLocalMemory(void* addr, size_t size, MemoryOptions& options);
+
+Status registerLocalMemory(std::vector<void*> addr_list,
+                           std::vector<size_t> size_list,
+                           MemoryOptions& options);
 ```
 
 Registers externally allocated memory for use in transfers.
+
+Each range must have a non-null address and a positive size without address
+overflow. Invalid ranges are rejected before any batch entry is registered.
 
 - `addr`: Starting address of the memory region.
 - `size`: Size in bytes.
@@ -424,11 +431,34 @@ Registers externally allocated memory for use in transfers.
 - `options`: Advanced options for fine-grained control.
 - Return value: `Status::OK()` on success; otherwise a non-OK status.
 
-Within a batch, repeated identical `(address, size)` pairs share one underlying
-registration, with one reference per occurrence. Each successful occurrence must
-be balanced by an unregistration; the underlying registration remains active
-until the last reference is released. Different or partially overlapping ranges
-are not combined and remain subject to the selected transport's range checks.
+Repeated identical `(address, size)` pairs share one underlying registration only
+when all original `MemoryOptions` values match: `type`, `perm`, `location`,
+`shm_path`, `shm_offset`, and `internal`. Matching uses the supplied values, not
+the resolved transport or location; the `Permission` overloads use defaults for
+the other fields. Incompatible options return `InvalidArgument` without adding a
+reference or attempting a new transport registration. Each input occurrence in a
+successful call adds one reference, including duplicates within a batch and
+across concurrent calls. Each reference requires one unregistration.
+
+On the same engine, registration and unregistration coordinate by starting
+address through cleanup and metadata publication. A batch reserves all its
+addresses together, so reversed address order does not cause a lifecycle
+deadlock. Operations on different starting addresses may proceed concurrently.
+Different lengths and partially overlapping ranges are not combined; acceptance
+remains subject to the selected transport's range checks. This coordination does
+not guarantee safety for arbitrary overlapping ranges.
+
+A failed registration grants no new references. If its error reports pending
+cleanup, retain the buffer and retry registration; the retry first attempts to
+finish that cleanup. Metadata publication failure also rolls back the call's
+local references. This is not a distributed transaction: peers may already have
+observed an earlier publication.
+
+Failure of an explicitly requested transport, or the only available transport,
+is returned to the caller. With `type = UNSPEC` and multiple transports, the
+existing best-effort policy is retained: an individual transport failure is
+logged and does not fail the whole call. Success in that mode does not imply
+registration with every transport.
 
 #### TransferEngine::unregisterLocalMemory
 
@@ -445,6 +475,23 @@ Unregisters previously registered memory.
 - `addr`: Starting address of the memory region.
 - `size`: Size in bytes (optional, can be 0 if the engine tracks it).
 - Return value: `Status::OK()` on success; otherwise a non-OK status.
+
+Each successful input releases one reference. The final release removes the
+underlying registration and publishes the metadata change. If that cleanup or
+publication fails, the engine retains a pending unregistration record. New
+registrations at the same starting address return `TooManyRequests` until it is
+resolved. Keep the buffer allocated and serialize retries of the failed
+unregistration until it succeeds. Do not replay a completed unregistration: it
+could release a reference acquired by a later caller.
+
+Batch unregistration processes entries in order. On failure, earlier entries
+remain completed; the error message identifies the failing zero-based index.
+Retry only that entry and the remaining suffix, not the completed prefix.
+
+Externally allocated buffers must remain alive until their final cleanup
+completes, including any retries. Applications must ensure that local and remote
+transfers using a buffer have stopped before its final release. Engine
+destruction must not race with these calls or with transfers.
 
 ### Segment Management
 

@@ -38,10 +38,13 @@
 #define TENT_SEGMENT_DESC_TTL_MS (60 * 60 * 1000)  // 1h
 
 namespace mooncake {
+class TransferEngineImplTestPeer;
 namespace tent {
 class SegmentRegistry;
 
 class SegmentManager {
+    friend class ::mooncake::TransferEngineImplTestPeer;
+
    public:
     SegmentManager(std::unique_ptr<SegmentRegistry> registry);
 

@@ -174,6 +174,24 @@ target_include_directories(segment_manager_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME segment_manager_test COMMAND segment_manager_test)
 
+add_executable(registration_guard_test registration_guard_test.cpp)
+target_link_libraries(registration_guard_test PRIVATE gtest gtest_main)
+target_include_directories(registration_guard_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME registration_guard_test COMMAND registration_guard_test)
+set_tests_properties(registration_guard_test PROPERTIES TIMEOUT 30)
+
+add_executable(registration_failure_test registration_failure_test.cpp)
+target_link_libraries(registration_failure_test PRIVATE gtest gtest_main
+                                                        tent_link_group)
+if(TARGET asio_shared)
+  target_link_libraries(registration_failure_test PRIVATE asio_shared)
+endif()
+target_include_directories(registration_failure_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME registration_failure_test COMMAND registration_failure_test)
+set_tests_properties(registration_failure_test PROPERTIES TIMEOUT 30)
+
 add_executable(request_merge_test request_merge_test.cpp)
 target_link_libraries(request_merge_test PRIVATE gtest gtest_main
                                                  tent_link_group)
@@ -188,12 +206,12 @@ target_include_directories(local_notification_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME local_notification_test COMMAND local_notification_test)
 
-# Notification fallback: an unavailable RDMA notification channel falls back
-# to the next transport and then to the control-plane RPC, and receive drains
-# every transport. Loopback only, no NIC required.
+# Notification fallback: an unavailable RDMA notification channel falls back to
+# the next transport and then to the control-plane RPC, and receive drains every
+# transport. Loopback only, no NIC required.
 add_executable(tent_notification_fallback_test notification_fallback_test.cpp)
-target_link_libraries(tent_notification_fallback_test
-                      PRIVATE gtest gtest_main tent_link_group)
+target_link_libraries(tent_notification_fallback_test PRIVATE gtest gtest_main
+                                                              tent_link_group)
 target_include_directories(tent_notification_fallback_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_notification_fallback_test
@@ -811,8 +829,7 @@ set_tests_properties(tent_segment_desc_retry_test PROPERTIES TIMEOUT 60)
 
 # Fabric transport: attribute codec and slicing math, plus end-to-end cases on
 # libfabric's tcp;ofi_rxm provider (no fabric hardware needed). Each e2e case
-# forks a server before the client engine starts, so it runs in its own
-# process.
+# forks a server before the client engine starts, so it runs in its own process.
 if(TARGET tent_xport_fabric)
   add_executable(tent_fabric_attrs_test fabric_attrs_test.cpp)
   target_link_libraries(tent_fabric_attrs_test PRIVATE gtest gtest_main

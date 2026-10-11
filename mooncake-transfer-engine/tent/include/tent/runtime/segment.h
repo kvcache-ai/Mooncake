@@ -81,6 +81,9 @@ struct BufferDesc {
     bool internal{false};
     // Local registration policy, deliberately excluded from JSON metadata.
     Permission permission{kGlobalReadWrite};
+    // Original caller policy for local duplicate-registration validation.
+    // Immutable and shared across a batch; never uploaded to remote peers.
+    std::shared_ptr<const MemoryOptions> registration_options;
 
    public:
     NLOHMANN_DEFINE_TYPE_INTRUSIVE(BufferDesc, addr, length, location,
