@@ -19,6 +19,7 @@
 
 #include <atomic>
 #include <cassert>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <deque>
@@ -57,6 +58,11 @@ struct PendingNotify {
     Notification notifi{};
     int attempts = 0;  // resend rounds so far
     int last_path = 0;
+    // When a resend first found the peer's control plane silent or not
+    // taking it yet, kept across hand-backs so the deadline is not restarted.
+    std::chrono::steady_clock::time_point first_failed{};
+    // Set by a resend that held it: when it is due again.
+    std::chrono::steady_clock::time_point next_try{};
 };
 
 struct RdmaSubBatch : public Transport::SubBatch {
@@ -238,18 +244,45 @@ class RdmaTransport : public Transport {
                                                 SegmentID target_id,
                                                 int device_id, Status* failure);
 
+    // The notification/* keys install() reads; a value <= 0 keeps the
+    // default.
+    struct NotifyConfig {
+        bool rpc_fallback = true;
+        std::chrono::milliseconds resend_deadline{120000};  // at most 24 h
+    };
+    static NotifyConfig readNotifyConfig(const Config& conf);
+
+    using Clock = std::chrono::steady_clock;
     void requeueNotifications(std::vector<PendingNotify>&& drained);
     static constexpr int kMaxNotifyResendAttempts = 3;
+    static constexpr std::chrono::seconds kNotifyResendHoldInterval{2};
     Status sendNotificationOnAnyPath(const PendingNotify& pending);
-    bool resendOne(PendingNotify& pending);
+    // Unless given, `now` is read once the round is over: it may have blocked.
+    bool resendOne(PendingNotify& pending, Clock::time_point now = {});
     void notifyResendThread();
+    // What resendOne() holds rather than drops: an RPC error, or an internal
+    // error from the RPC leg (e.g. a receiver without its callback yet).
+    static bool holdsResend(const Status& status) {
+        return status.IsRpcServiceError() || status.IsInternalError();
+    }
 
     std::mutex notify_resend_mutex_;
     std::condition_variable notify_resend_cv_;
     std::deque<PendingNotify> notify_resend_queue_;
+    // Per peer whose control plane was silent or did not take it yet, apart
+    // from the queue: only the oldest is tried when due, so the others
+    // neither redial that peer nor hold up the resends to other peers.
+    struct HeldResends {
+        Clock::time_point due;
+        std::deque<PendingNotify> resends;  // oldest first
+    };
+    std::unordered_map<SegmentID, HeldResends> notify_resend_held_;
     std::thread notify_resend_worker_;
     bool notify_resend_running_ = false;
+    bool notify_resend_stopped_ = false;  // by quiesce(), for good
     bool notify_rpc_fallback_ = true;
+    std::chrono::milliseconds notify_resend_deadline_{120000};
+    std::atomic<uint64_t> notify_resend_dropped_{0};
 
     // Maps the reason getEndpoint() could not hand out a notify-capable
     // endpoint to what sendNotification() reports. A bootstrap RPC that
