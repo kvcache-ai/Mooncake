@@ -424,6 +424,12 @@ Registers externally allocated memory for use in transfers.
 - `options`: Advanced options for fine-grained control.
 - Return value: `Status::OK()` on success; otherwise a non-OK status.
 
+Within a batch, repeated identical `(address, size)` pairs share one underlying
+registration, with one reference per occurrence. Each successful occurrence must
+be balanced by an unregistration; the underlying registration remains active
+until the last reference is released. Different or partially overlapping ranges
+are not combined and remain subject to the selected transport's range checks.
+
 #### TransferEngine::unregisterLocalMemory
 
 ```cpp

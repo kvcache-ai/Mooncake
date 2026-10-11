@@ -14,6 +14,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -116,6 +117,82 @@ TEST(LocalMemoryLifecycle, SegmentInfoReplacesPreviouslyReportedBuffers) {
     ASSERT_TRUE(engine.getSegmentInfo(LOCAL_SEGMENT_ID, info).ok());
     EXPECT_TRUE(info.buffers.empty())
         << "An unregistered buffer must not survive a segment-info refresh";
+}
+
+TEST(LocalMemoryLifecycle, HpTcpDuplicateBatchRetainsRegistration) {
+    auto config = makeConfig();
+    config->set("transports/hp_tcp/enable", true);
+    config->set("transports/hp_tcp/bind_address", "127.0.0.1");
+    config->set("transports/hp_tcp/advertise_address", "127.0.0.1");
+    config->set("transports/hp_tcp/worker_count", 1);
+    config->set("transports/hp_tcp/progress_timeout_ms", 1000);
+    // Storage outlives both engines, including on an assertion failure.
+    std::vector<unsigned char> remote(4096);
+    std::vector<unsigned char> local(remote.size());
+    TransferEngineImpl target(config);
+    TransferEngineImpl initiator(config);
+    ASSERT_TRUE(target.available());
+    ASSERT_TRUE(initiator.available());
+
+    MemoryOptions options;
+    options.type = HP_TCP;
+    options.perm = kGlobalReadWrite;
+    auto status =
+        target.registerLocalMemory({remote.data(), remote.data()},
+                                   {remote.size(), remote.size()}, options);
+    ASSERT_TRUE(status.ok()) << status.ToString();
+    ASSERT_TRUE(
+        initiator.registerLocalMemory({local.data()}, {local.size()}, options)
+            .ok());
+
+    SegmentInfo info;
+    ASSERT_TRUE(target.getSegmentInfo(LOCAL_SEGMENT_ID, info).ok());
+    ASSERT_EQ(info.buffers.size(), 1u);
+    EXPECT_EQ(info.buffers.front().base,
+              reinterpret_cast<uint64_t>(remote.data()));
+
+    SegmentID peer;
+    ASSERT_TRUE(initiator.openSegment(peer, target.getSegmentName()).ok());
+    Request request;
+    request.source = local.data();
+    request.target_id = peer;
+    request.target_offset = reinterpret_cast<uint64_t>(remote.data());
+    request.length = remote.size();
+    request.transport_hint = HP_TCP;
+    for (int remaining_references : {2, 1}) {
+        SCOPED_TRACE(remaining_references);
+        // Exercise the real socket path before and after dropping one logical
+        // reference: both READ and WRITE must retain the same registration.
+        for (auto opcode : {Request::READ, Request::WRITE}) {
+            request.opcode = opcode;
+            std::memset(remote.data(), 0x6b, remote.size());
+            std::memset(local.data(), 0x5a, local.size());
+            status = initiator.transferSync({request});
+            ASSERT_TRUE(status.ok()) << status.ToString();
+            EXPECT_EQ(std::memcmp(remote.data(), local.data(), local.size()),
+                      0);
+            const auto expected_byte = opcode == Request::READ ? 0x6b : 0x5a;
+            EXPECT_TRUE(std::all_of(local.begin(), local.end(),
+                                    [expected_byte](unsigned char byte) {
+                                        return byte == expected_byte;
+                                    }));
+        }
+        ASSERT_TRUE(
+            target.unregisterLocalMemory(remote.data(), remote.size()).ok());
+        ASSERT_TRUE(target.getSegmentInfo(LOCAL_SEGMENT_ID, info).ok());
+        EXPECT_EQ(info.buffers.size(), remaining_references == 2 ? 1u : 0u);
+    }
+
+    // The final unregister must also retire the transport registration;
+    // otherwise a fresh registration of this range is rejected as overlapping.
+    ASSERT_TRUE(
+        target.registerLocalMemory({remote.data()}, {remote.size()}, options)
+            .ok());
+    EXPECT_TRUE(
+        target.unregisterLocalMemory(remote.data(), remote.size()).ok());
+    EXPECT_TRUE(initiator.closeSegment(peer).ok());
+    EXPECT_TRUE(
+        initiator.unregisterLocalMemory(local.data(), local.size()).ok());
 }
 
 TEST(LocalMemoryLifecycle, ShmAcceptsDefaultAllocationLocation) {

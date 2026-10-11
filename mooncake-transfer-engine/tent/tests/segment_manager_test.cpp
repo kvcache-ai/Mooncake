@@ -29,6 +29,7 @@
 #include <cstdlib>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "tent/runtime/segment_manager.h"
@@ -184,6 +185,157 @@ TEST(SegmentTrackerTest, AddInBatchCallbackFailureRollsBackRefCounts) {
     ASSERT_TRUE(tracker.remove(0x20000, 0x1000, on_remove).ok());
     EXPECT_EQ(remove_callbacks, 1);
     EXPECT_TRUE(buffersOf(manager->getLocal()).empty());
+}
+
+TEST(SegmentTrackerTest, FreshBatchDuplicatesShareOneRegistration) {
+    auto manager = makeManager();
+    SegmentTracker tracker(*manager);
+    auto buffer = makeBuffer(0x40000, 0x1000);
+    std::vector<BufferDesc> batch{buffer, buffer};
+    size_t registrations = 0;
+    ASSERT_TRUE(tracker
+                    .addInBatch(batch,
+                                [&](std::vector<BufferDesc>& descs) {
+                                    registrations += descs.size();
+                                    return Status::OK();
+                                })
+                    .ok());
+    EXPECT_EQ(registrations, 1u);
+    auto snapshot = manager->getLocal();
+    EXPECT_EQ(buffersOf(snapshot).size(), 1u);
+    EXPECT_EQ(buffersOf(snapshot).front().ref_count, 2);
+
+    int removals = 0;
+    auto on_remove = [&](BufferDesc&) {
+        ++removals;
+        return Status::OK();
+    };
+    ASSERT_TRUE(tracker.remove(buffer.addr, buffer.length, on_remove).ok());
+    EXPECT_EQ(removals, 0);
+    EXPECT_EQ(buffersOf(manager->getLocal()).size(), 1u);
+    ASSERT_TRUE(tracker.remove(buffer.addr, buffer.length, on_remove).ok());
+    EXPECT_EQ(removals, 1);
+    EXPECT_TRUE(buffersOf(manager->getLocal()).empty());
+}
+
+TEST(SegmentTrackerTest, MixedBatchDuplicatesRetainAllReferences) {
+    auto manager = makeManager();
+    SegmentTracker tracker(*manager);
+    auto old_buffer = makeBuffer(0x40000, 0x1000);
+    auto new_buffer = makeBuffer(0x50000, 0x1000);
+    std::vector<BufferDesc> first{old_buffer};
+    auto ok = [](std::vector<BufferDesc>&) { return Status::OK(); };
+    ASSERT_TRUE(tracker.addInBatch(first, ok).ok());
+
+    // Exercise the path that pins old ranges before registering new ranges.
+    std::vector<BufferDesc> mixed{new_buffer, old_buffer, new_buffer,
+                                  old_buffer};
+    ASSERT_TRUE(tracker
+                    .addInBatch(mixed,
+                                [&](std::vector<BufferDesc>& descs) {
+                                    EXPECT_EQ(descs.size(), 1u);
+                                    for (const auto& desc : descs)
+                                        EXPECT_EQ(desc.addr, new_buffer.addr);
+                                    return Status::OK();
+                                })
+                    .ok());
+    auto snapshot = manager->getLocal();
+    EXPECT_EQ(buffersOf(snapshot).size(), 2u);
+    EXPECT_EQ(buffersOf(snapshot).front().ref_count, 3);
+    EXPECT_EQ(buffersOf(snapshot).back().ref_count, 2);
+
+    for (const auto& item : std::vector<std::pair<BufferDesc, int>>{
+             {old_buffer, 3}, {new_buffer, 2}}) {
+        int removals = 0;
+        for (int reference = 0; reference < item.second; ++reference) {
+            ASSERT_TRUE(tracker
+                            .remove(item.first.addr, item.first.length,
+                                    [&](BufferDesc&) {
+                                        ++removals;
+                                        return Status::OK();
+                                    })
+                            .ok());
+            EXPECT_EQ(removals, reference == item.second - 1 ? 1 : 0);
+        }
+    }
+    EXPECT_TRUE(buffersOf(manager->getLocal()).empty());
+}
+
+TEST(SegmentTrackerTest, FailedMixedDuplicateBatchRollsBackPins) {
+    auto manager = makeManager();
+    SegmentTracker tracker(*manager);
+    auto old_buffer = makeBuffer(0x40000, 0x1000);
+    auto new_buffer = makeBuffer(0x50000, 0x1000);
+    std::vector<BufferDesc> first{old_buffer};
+    auto ok = [](std::vector<BufferDesc>&) { return Status::OK(); };
+    ASSERT_TRUE(tracker.addInBatch(first, ok).ok());
+
+    std::vector<BufferDesc> mixed{old_buffer, new_buffer, old_buffer,
+                                  new_buffer};
+    const auto failure = Status::InternalError("injected registration failure");
+    auto status =
+        tracker.addInBatch(mixed, [&](std::vector<BufferDesc>& descs) {
+            EXPECT_EQ(descs.size(), 1u);
+            for (const auto& desc : descs)
+                EXPECT_EQ(desc.addr, new_buffer.addr);
+            return failure;
+        });
+    EXPECT_EQ(status.code(), failure.code());
+    EXPECT_EQ(status.message(), failure.message());
+    auto snapshot = manager->getLocal();
+    ASSERT_EQ(buffersOf(snapshot).size(), 1u);
+    EXPECT_EQ(buffersOf(snapshot).front().addr, old_buffer.addr);
+    EXPECT_EQ(buffersOf(snapshot).front().ref_count, 1);
+
+    int removals = 0;
+    ASSERT_TRUE(tracker
+                    .remove(old_buffer.addr, old_buffer.length,
+                            [&](BufferDesc&) {
+                                ++removals;
+                                return Status::OK();
+                            })
+                    .ok());
+    EXPECT_EQ(removals, 1);
+    EXPECT_TRUE(buffersOf(manager->getLocal()).empty());
+}
+
+TEST(SegmentTrackerTest, BatchDuplicatesPreserveDistinctSizesAndMetadata) {
+    auto manager = makeManager();
+    SegmentTracker tracker(*manager);
+    auto full = makeBuffer(0x40000, 0x1000);
+    full.location = "cpu:7";
+    auto shorter = makeBuffer(full.addr, 0x800);
+    shorter.location = "cpu:3";
+    std::vector<BufferDesc> batch{full, full, shorter};
+    ASSERT_TRUE(tracker
+                    .addInBatch(batch,
+                                [&](std::vector<BufferDesc>& descs) {
+                                    EXPECT_EQ(descs.size(), 2u);
+                                    for (auto& desc : descs) {
+                                        desc.transports = {TCP};
+                                        desc.transport_attrs[TCP] =
+                                            "registered-" +
+                                            std::to_string(desc.length);
+                                    }
+                                    return Status::OK();
+                                })
+                    .ok());
+    auto snapshot = manager->getLocal();
+    const auto& buffers = buffersOf(snapshot);
+    ASSERT_EQ(buffers.size(), 2u);
+    EXPECT_EQ(buffers[0].addr, full.addr);
+    EXPECT_EQ(buffers[0].length, full.length);
+    EXPECT_EQ(buffers[0].ref_count, 2);
+    EXPECT_EQ(buffers[0].location, full.location);
+    EXPECT_EQ(buffers[1].addr, shorter.addr);
+    EXPECT_EQ(buffers[1].length, shorter.length);
+    EXPECT_EQ(buffers[1].ref_count, 1);
+    EXPECT_EQ(buffers[1].location, shorter.location);
+    for (const auto& buffer : buffers) {
+        EXPECT_EQ(buffer.transports, std::vector<TransportType>{TCP});
+        EXPECT_EQ(buffer.transport_attrs.at(TCP),
+                  "registered-" + std::to_string(buffer.length));
+    }
 }
 
 TEST(SegmentTrackerTest, FailedBatchHandsOffLastReferenceOutsideWriterLock) {
