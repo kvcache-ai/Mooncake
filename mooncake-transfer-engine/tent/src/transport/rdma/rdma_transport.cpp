@@ -1044,6 +1044,36 @@ Status RdmaTransport::sendNotification(SegmentID target_id,
     return Status::OK();
 }
 
+Status RdmaTransport::sendNotificationIfConnected(SegmentID target_id,
+                                                  const Notification& notify) {
+    // The pair sendNotification() takes, looked up only: a segment fetch or
+    // a bootstrap would wait on the peer's control plane.
+    auto& segments = metadata_->segmentManager();
+    SegmentDescRef segment;
+    std::shared_ptr<RdmaEndPoint> endpoint;
+    if (segments.peekRemote(segment, target_id).ok() &&
+        segment->type == SegmentType::Memory) {
+        const auto& topo =
+            std::get<MemorySegmentDesc>(segment->detail).topology;
+        const std::string peer_name =
+            MakeNicPath(segment->nicPathServerName(), topo.getNicName(0));
+        for (auto& context : context_set_) {
+            if (context->status() != RdmaContext::DEVICE_ENABLED) continue;
+            endpoint = context->endpointStore()->get(peer_name);
+            break;
+        }
+    }
+    if (!endpoint || endpoint->status() != RdmaEndPoint::EP_READY)
+        return Status::DeviceNotFound("notify endpoint not connected" LOC_MARK);
+    PendingNotify track;
+    track.target = target_id;
+    if (!endpoint->sendNotification(notify, &track)) {
+        return Status::RdmaError(
+            "RDMA notification channel unavailable" LOC_MARK);
+    }
+    return Status::OK();
+}
+
 Status RdmaTransport::sendNotificationOnAnyPath(const PendingNotify& pending) {
     std::vector<bool> rdma_nic;  // by the peer's NicID
     auto status = metadata_->segmentManager().withCachedSegment(

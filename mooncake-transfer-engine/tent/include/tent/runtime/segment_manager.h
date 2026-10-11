@@ -67,6 +67,11 @@ class SegmentManager {
     // cache's lifetime.
     Status getRemoteCached(SegmentDescRef &desc, SegmentID handle);
 
+    // Never fetches: the desc any thread last fetched for an open handle, or
+    // InvalidEntry if none was fetched within the desc TTL. It may predate a
+    // segment update, so use it only to find what is already connected.
+    Status peekRemote(SegmentDescRef &desc, SegmentID handle);
+
     Status getRemote(SegmentDescRef &desc, const std::string &segment_name);
 
     // Invalidates the thread-local cache.
@@ -250,6 +255,14 @@ class SegmentManager {
     const uint64_t manager_id_;
 
     ThreadLocalStorage<RemoteSegmentCache> tl_remote_cache_;
+
+    // What peekRemote() answers from, shared by every thread.
+    struct FetchedDesc {
+        SegmentDescRef desc;
+        uint64_t fetched_at = 0;
+    };
+    std::shared_mutex fetched_lock_;
+    std::unordered_map<SegmentID, FetchedDesc> fetched_;
 
     std::unique_ptr<SegmentRegistry> registry_;
 

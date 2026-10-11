@@ -4426,6 +4426,87 @@ TEST_F(RdmaWorkersSharedQpTest, ResendWalksThePairsAfterTheFailedOne) {
     EXPECT_EQ(silent.notified(), std::vector<std::string>{"9/3"});
 }
 
+// The no-dial send takes pair 0 once it is up, on any thread. No desc yet, no
+// endpoint or one not yet ready is "not connected", and none of them sends the
+// peer a lookup or a bootstrap.
+TEST_F(RdmaWorkersSharedQpTest, SendIfConnectedNeverDials) {
+    FakePeer peer(R"([{"name":"peer-rnic-0","type":0,"numa_node":0}])");
+    auto metadata = std::make_shared<ControlService>("p2p", "", nullptr);
+    RdmaTransportTestPeer::bindMetadata(transport_, metadata);
+    auto& segments = metadata->segmentManager();
+    SegmentID id = 0;
+    ASSERT_TRUE(segments.openRemote(id, peer.addr()).ok());
+    auto send = [&] {
+        return onFreshThread([&] {
+            return transport_.sendNotificationIfConnected(id, {"n", "m", 9, 1});
+        });
+    };
+
+    EXPECT_TRUE(send().IsDeviceNotFound());
+    EXPECT_EQ(peer.lookups(), 0);
+    std::weak_ptr<SegmentDesc> fetched;
+    EXPECT_TRUE(onFreshThread([&] {
+                    SegmentDescRef desc;
+                    auto status = segments.getRemoteCached(desc, id);
+                    fetched = desc;
+                    return status;
+                }).ok());
+    EXPECT_TRUE(send().IsDeviceNotFound());
+    auto endpoint = context_->endpointStore()->getOrInsert(
+        MakeNicPath(peer.addr(), "peer-rnic-0"));
+    ASSERT_TRUE(endpoint);
+    EXPECT_TRUE(send().IsDeviceNotFound());
+    RdmaEndPointTestPeer::markReady(endpoint);
+    RdmaEndPointTestPeer::connectTypedNotify(endpoint);
+    EXPECT_TRUE(send().ok());
+    EXPECT_EQ(RdmaEndPointTestPeer::resendable(endpoint), 1u);
+
+    // Opening another segment leaves this one's desc in use.
+    SegmentID other = 0;
+    ASSERT_TRUE(segments.openRemote(other, "127.0.0.1:1").ok());
+    EXPECT_TRUE(send().ok());
+    EXPECT_EQ(RdmaEndPointTestPeer::resendable(endpoint), 2u);
+    EXPECT_EQ(peer.lookups(), 1);  // the test's own
+    EXPECT_TRUE(peer.bootstraps().empty());
+    // Closing the segment lets go of its desc.
+    EXPECT_FALSE(fetched.expired());
+    ASSERT_TRUE(segments.closeRemote(id).ok());
+    EXPECT_TRUE(fetched.expired());
+    EXPECT_TRUE(send().IsDeviceNotFound());
+}
+
+// A fetch still in flight when its segment closes leaves no desc behind for
+// the no-dial send to use.
+TEST_F(RdmaWorkersSharedQpTest, SendIfConnectedNeverUsesAClosedSegment) {
+    std::promise<void> release;
+    FakePeer peer(R"([{"name":"peer-rnic-0","type":0,"numa_node":0}])", 0,
+                  release.get_future().share());
+    auto metadata = std::make_shared<ControlService>("p2p", "", nullptr);
+    RdmaTransportTestPeer::bindMetadata(transport_, metadata);
+    auto& segments = metadata->segmentManager();
+    SegmentID id = 0;
+    ASSERT_TRUE(segments.openRemote(id, peer.addr()).ok());
+    auto endpoint = context_->endpointStore()->getOrInsert(
+        MakeNicPath(peer.addr(), "peer-rnic-0"));
+    RdmaEndPointTestPeer::markReady(endpoint);
+    RdmaEndPointTestPeer::connectTypedNotify(endpoint);
+
+    auto fetch = std::async(std::launch::async, [&] {
+        SegmentDescRef desc;
+        return segments.getRemoteCached(desc, id);
+    });
+    for (int i = 0; i < 500 && peer.lookups() == 0; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    ASSERT_TRUE(segments.closeRemote(id).ok());
+    release.set_value();
+    EXPECT_TRUE(fetch.get().ok());
+    const Status status = onFreshThread([&] {
+        return transport_.sendNotificationIfConnected(id, {"n", "m", 9, 1});
+    });
+    EXPECT_TRUE(status.IsDeviceNotFound()) << status.ToString();
+    EXPECT_EQ(RdmaEndPointTestPeer::resendable(endpoint), 0u);
+}
+
 // A hand-back keeps posting order, so resends go out oldest first.
 TEST_F(RdmaWorkersSharedQpTest, HandBackKeepsPostingOrder) {
     RdmaEndPointTestPeer::connectTypedNotify(endpoint_);
