@@ -275,8 +275,8 @@ TransferEngineImpl::TransferEngineImpl()
       port_(0),
       ipv6_(false),
       merge_requests_(true) {
-    ConfigHelper().loadFromEnv(*conf_);
-    auto status = construct();
+    auto status = ConfigHelper().loadFromEnv(*conf_);
+    if (status.ok()) status = construct();
     if (!status.ok()) {
         LOG(ERROR) << "Failed to construct Transfer Engine instance: "
                    << status.ToString();
@@ -294,9 +294,9 @@ TransferEngineImpl::TransferEngineImpl(std::shared_ptr<Config> conf)
     auto preserved = captureExplicitTransferEngineConfig(*conf_);
     // Allow MC_TENT_CONF to supply shared defaults while keeping the caller's
     // explicit metadata identity intact.
-    ConfigHelper().loadFromEnv(*conf_);
+    auto status = ConfigHelper().loadFromEnv(*conf_);
     restoreExplicitTransferEngineConfig(*conf_, preserved);
-    auto status = construct();
+    if (status.ok()) status = construct();
     if (!status.ok()) {
         LOG(ERROR) << "Failed to construct Transfer Engine instance: "
                    << status.ToString();
