@@ -16,6 +16,20 @@ unavailable, the engine makes that RPC itself, unless
 A standalone `sendNotification()` runs on the calling thread and returns the
 status of the path that took the notification, or of the last one tried.
 
+Over RDMA a new notification takes pair 0, the first enabled local NIC to the
+peer's NIC 0. If pair 0 cannot take it and the peer's control plane did answer,
+every other pair gets one try before the notification moves on to the next
+path, and a full send queue on them is not waited on. Those pairs are dialed if
+pair 0 could not be connected. If pair 0's send queue stalled instead (no free
+slot for 1 s), the peer's NIC 0 is suspect and no pair to it is tried, so for a
+peer with one RDMA NIC the notification moves on at once. Pairs to the peer's
+other NICs that are already up go first; then those are dialed, except by the
+no-dial send a status poll makes. A dial that ends in an RPC error returns it
+without the RPC fallback, so after a stall a caller waits at most 1 s and one
+RPC request timeout. This includes an error on a stale pooled RPC connection,
+as just after the peer restarted, which the Notify RPC would have retried once.
+`notification/path_probe` `false` turns this off.
+
 ## Notifications bound to transfers
 
 A bound notification is owed once a status poll sees every request of its
@@ -114,6 +128,7 @@ keeps the default; larger values are clamped where noted.
 |-----|---------|---------|
 | `notification/proto` | `1` | `1` stamps notifications for duplicate detection; `0` sends them unstamped. |
 | `notification/rpc_fallback` | `true` | Make the Notify RPC when every notification transport reports its channel unavailable. |
+| `notification/path_probe` | `true` | Try the other RDMA NIC pairs when pair 0 cannot take a new notification. |
 | `notification/outbox_max` | `65536` | Entries the outbox holds before it drops its oldest. |
 | `notification/outbox_deadline_ms` | `120000` | How long a bound notification may wait in the outbox. At most 24 h. |
 | `notification/outbox_retry_ms` | `50` | First retry delay for a peer, doubled per failure. At most 2000. |
