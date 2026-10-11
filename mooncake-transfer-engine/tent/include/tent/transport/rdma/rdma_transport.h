@@ -119,6 +119,9 @@ class RdmaTransport : public Transport {
     virtual Status sendNotification(SegmentID target_id,
                                     const Notification& notify) override;
 
+    virtual Status sendNotificationIfConnected(
+        SegmentID target_id, const Notification& notify) override;
+
     virtual Status receiveNotification(
         std::vector<Notification>& notify_list) override;
 

@@ -66,13 +66,18 @@ std::string SegmentManager::remoteName(SegmentID handle) {
 }
 
 Status SegmentManager::closeRemote(SegmentID handle) {
-    RWSpinlock::WriteGuard guard(lock_);
-    if (!id_to_name_map_.count(handle))
-        return Status::InvalidArgument("Invalid segment handle" LOC_MARK);
-    auto segment_name = id_to_name_map_[handle];
-    name_to_id_map_.erase(segment_name);
-    id_to_name_map_.erase(handle);
-    version_.fetch_add(1, std::memory_order_relaxed);
+    {
+        RWSpinlock::WriteGuard guard(lock_);
+        if (!id_to_name_map_.count(handle))
+            return Status::InvalidArgument("Invalid segment handle" LOC_MARK);
+        auto segment_name = id_to_name_map_[handle];
+        name_to_id_map_.erase(segment_name);
+        id_to_name_map_.erase(handle);
+        version_.fetch_add(1, std::memory_order_relaxed);
+    }
+    // After the version bump: a fetch still in flight then stores nothing.
+    std::unique_lock<std::shared_mutex> fetched_guard(fetched_lock_);
+    fetched_.erase(handle);
     return Status::OK();
 }
 
@@ -124,6 +129,12 @@ Status SegmentManager::getRemoteCached(SegmentDescRef &desc, SegmentID handle) {
         auto status = getRemote(desc_ref, handle);
         if (!status.ok()) return status;
         cache.id_to_desc_map[handle] = desc_ref;
+        {
+            std::unique_lock<std::shared_mutex> guard(fetched_lock_);
+            if (version_.load(std::memory_order_relaxed) == current_version)
+                fetched_[handle] = {desc_ref,
+                                    static_cast<uint64_t>(current_ts)};
+        }
 
         std::string peer_rpc_addr = desc_ref->rpc_server_addr;
         std::string local_rpc_addr = getLocal()->rpc_server_addr;
@@ -144,6 +155,18 @@ Status SegmentManager::getRemoteCached(SegmentDescRef &desc, SegmentID handle) {
     }
     desc = cache.id_to_desc_map[handle];
     assert(desc);
+    return Status::OK();
+}
+
+Status SegmentManager::peekRemote(SegmentDescRef &desc, SegmentID handle) {
+    std::shared_lock<std::shared_mutex> guard(fetched_lock_);
+    auto it = fetched_.find(handle);
+    if (it == fetched_.end() ||
+        getCurrentTimeInNano() - it->second.fetched_at >
+            static_cast<uint64_t>(TENT_SEGMENT_DESC_TTL_MS) * 1000000) {
+        return Status::InvalidEntry("Segment desc not cached" LOC_MARK);
+    }
+    desc = it->second.desc;
     return Status::OK();
 }
 

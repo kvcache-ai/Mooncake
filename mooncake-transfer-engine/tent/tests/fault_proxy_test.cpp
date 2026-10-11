@@ -42,6 +42,8 @@ class FakeTransport : public Transport {
     int install_calls = 0;
     int submit_calls = 0;
     int status_calls = 0;
+    int notify_calls = 0;
+    int no_dial_notify_calls = 0;
 
     Status install(std::string& /*local_segment_name*/,
                    std::shared_ptr<ControlService> /*metadata*/,
@@ -83,6 +85,19 @@ class FakeTransport : public Transport {
         }
         status = fb->statuses[task_id];
         return Status::OK();
+    }
+
+    bool supportNotification() const override { return true; }
+
+    Status sendNotification(SegmentID, const Notification&) override {
+        ++notify_calls;
+        return Status::OK();
+    }
+
+    Status sendNotificationIfConnected(SegmentID,
+                                       const Notification&) override {
+        ++no_dial_notify_calls;
+        return Status::DeviceNotFound("not connected" LOC_MARK);
     }
 
     const char* getName() const override { return "<fake>"; }
@@ -143,6 +158,19 @@ TEST(FaultProxyTest, DelegatesToReal) {
     EXPECT_EQ(fake->status_calls, 1);
 
     proxy->freeSubBatch(batch);
+}
+
+// The no-dial send reaches the real transport's own: falling back to the full
+// send would let a proxied RDMA transport dial from a poller's thread.
+TEST(FaultProxyTest, DelegatesTheNoDialNotification) {
+    auto fake = std::make_shared<FakeTransport>();
+    FaultProxyTransport proxy(fake, FaultPolicy{});
+
+    EXPECT_TRUE(proxy.sendNotificationIfConnected(1, {}).IsDeviceNotFound());
+    EXPECT_EQ(fake->no_dial_notify_calls, 1);
+    EXPECT_EQ(fake->notify_calls, 0);
+    EXPECT_TRUE(proxy.sendNotification(1, {}).ok());
+    EXPECT_EQ(fake->notify_calls, 1);
 }
 
 TEST(FaultProxyTest, FailsInstall) {
