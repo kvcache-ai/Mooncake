@@ -1338,14 +1338,15 @@ bool RdmaEndPoint::sendNotification(const std::string& name,
 }
 
 bool RdmaEndPoint::sendNotification(const Notification& notifi,
-                                    const PendingNotify* track) {
+                                    const PendingNotify* track,
+                                    bool wait_for_slot) {
     // Flow control: wait for pending sends to complete
     std::unique_lock<std::mutex> lock(notify_send_mutex_);
     auto slot_free = [this] {
         return !notify_connected_ ||
                notify_pending_count_ < kNotifyMaxPendingSends;
     };
-    if (notify_send_stalled_ && !slot_free()) return false;
+    if ((notify_send_stalled_ || !wait_for_slot) && !slot_free()) return false;
     if (!notify_send_cv_.wait_for(lock, kNotifySendStallTimeout, slot_free)) {
         notify_send_stalled_ = true;
         LOG(WARNING) << "Notification send queue stalled on endpoint "

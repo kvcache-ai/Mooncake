@@ -151,8 +151,10 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     // notifi is stamped; otherwise the raw payload older peers understand.
     // With `track` (target and tries so far), a typed send is kept until it
     // completes: a notify QP that dies with it in flight hands it back.
+    // Without `wait_for_slot`, a full send queue fails it at once.
     bool sendNotification(const Notification& notifi,
-                          const PendingNotify* track = nullptr);
+                          const PendingNotify* track = nullptr,
+                          bool wait_for_slot = true);
 
     static bool useTypedNotifyFrame(uint32_t peer_notify_proto, uint64_t seq) {
         return peer_notify_proto >= 1 && seq != 0;
@@ -163,6 +165,12 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     // Whether the notify QP is connected and not disabled after a fault.
     bool notifyConnected() const {
         return notify_connected_.load(std::memory_order_acquire);
+    }
+
+    // Whether a wait for a send slot timed out and no send completed since.
+    bool notifySendStalled() {
+        std::lock_guard<std::mutex> lock(notify_send_mutex_);
+        return notify_send_stalled_;
     }
 
     // One notification WR (send or receive) left the CQ. Called by the

@@ -243,11 +243,16 @@ class RdmaTransport : public Transport {
     std::shared_ptr<RdmaEndPoint> getEndpointOn(size_t local_ctx,
                                                 SegmentID target_id,
                                                 int device_id, Status* failure);
+    // Same, but only an endpoint that is already up: never dials.
+    std::shared_ptr<RdmaEndPoint> peekEndpoint(size_t local_ctx,
+                                               const SegmentDesc& peer,
+                                               int device_id);
 
     // The notification/* keys install() reads; a value <= 0 keeps the
     // default.
     struct NotifyConfig {
         bool rpc_fallback = true;
+        bool path_probe = true;
         std::chrono::milliseconds resend_deadline{120000};  // at most 24 h
     };
     static NotifyConfig readNotifyConfig(const Config& conf);
@@ -256,7 +261,11 @@ class RdmaTransport : public Transport {
     void requeueNotifications(std::vector<PendingNotify>&& drained);
     static constexpr int kMaxNotifyResendAttempts = 3;
     static constexpr std::chrono::seconds kNotifyResendHoldInterval{2};
-    Status sendNotificationOnAnyPath(const PendingNotify& pending);
+    // Without `dial`, only endpoints already up, over a desc already fetched.
+    // A probe skips the pair that just failed and never waits for a slot.
+    // If pair 0 `stalled`, no pair to the peer's NIC 0 is tried.
+    Status sendNotificationOnAnyPath(const PendingNotify& pending, bool dial,
+                                     bool probe, bool stalled = false);
     // Unless given, `now` is read once the round is over: it may have blocked.
     bool resendOne(PendingNotify& pending, Clock::time_point now = {});
     void notifyResendThread();
@@ -281,6 +290,7 @@ class RdmaTransport : public Transport {
     bool notify_resend_running_ = false;
     bool notify_resend_stopped_ = false;  // by quiesce(), for good
     bool notify_rpc_fallback_ = true;
+    bool notify_path_probe_ = true;
     std::chrono::milliseconds notify_resend_deadline_{120000};
     std::atomic<uint64_t> notify_resend_dropped_{0};
 
