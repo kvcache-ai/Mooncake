@@ -26,9 +26,11 @@ struct ListObjectsPage {
 };
 
 // Parses a ListObjectsV2 ListBucketResult document. A document that is not
-// well-formed, or lacks IsTruncated or a Key or Size in any Contents element,
-// is an error (with a reason for logging): it may be a cut-off response, and
-// a partial listing must not be mistaken for a complete one.
+// well-formed (including an end tag that does not match its start tag), has
+// a Contents element anywhere but directly under the root, or lacks
+// IsTruncated or a Key or Size in any Contents element, is an error (with a
+// reason for logging): it may be a cut-off or corrupt response, and a partial
+// listing must not be mistaken for a complete one.
 tl::expected<ListObjectsPage, std::string> ParseListObjectsV2(
     std::string_view body);
 

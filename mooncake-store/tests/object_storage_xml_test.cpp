@@ -90,6 +90,23 @@ TEST(ObjectStorageXmlTest, DecodesEntitiesAndCdataInKeys) {
     EXPECT_EQ(page->objects[1].key, "p/x<&>y");
 }
 
+// Text that looks like a tag inside an attribute value, a comment, CDATA or
+// a processing instruction is not a tag and must not upset end-tag matching.
+TEST(ObjectStorageXmlTest, AcceptsTagLikeTextOutsideTags) {
+    const std::string body =
+        "<?xml version=\"1.0\"?><?note </Contents> ?>"
+        "<ListBucketResult other='/>' note=\"a > b\">"
+        "<!-- </ListBucketResult> <Contents> -->"
+        "<Contents><Key><![CDATA[p/</Key><Contents>]]></Key><Size>3</Size>"
+        "<Owner/><Tag a=\"/\"/></Contents>"
+        "<IsTruncated>false</IsTruncated></ListBucketResult>";
+    auto page = ParseListObjectsV2(body);
+    ASSERT_TRUE(page.has_value()) << page.error();
+    ASSERT_EQ(page->objects.size(), 1u);
+    EXPECT_EQ(page->objects[0].key, "p/</Key><Contents>");
+    EXPECT_EQ(page->objects[0].size, 3u);
+}
+
 TEST(ObjectStorageXmlTest, AcceptsEmptyListing) {
     auto page = ParseListObjectsV2(Listing("<KeyCount>0</KeyCount>"));
     ASSERT_TRUE(page.has_value()) << page.error();
@@ -136,6 +153,31 @@ TEST(ObjectStorageXmlTest, RejectsMalformedListResponses) {
         {"Size out of range",
          Listing("<Contents><Key>p/a</Key><Size>18446744073709551616</Size>"
                  "</Contents>")},
+        {"Contents nested in Contents",
+         Listing("<Contents><Key>p/a</Key><Size>3</Size>" + object +
+                 "</Contents>")},
+        {"Contents nested in another element",
+         Listing(object + "<CommonPrefixes>" + object + "</CommonPrefixes>")},
+        {"Contents nested two levels down",
+         Listing(object + "<A><B>" + object + "</B></A>")},
+        {"Contents nested in a Key", Listing("<Contents><Key>p/a" + object +
+                                             "</Key><Size>3</Size>"
+                                             "</Contents>")},
+        {"object hidden under another element by mismatched end tags",
+         Listing(object + "<Owner><Contents><Key>p/b</Key><Size>3</Size>"
+                          "</Owner></Contents>")},
+        {"end tag of a different element",
+         Listing("<Contents><Key>p/a</Size><Size>3</Key></Contents>")},
+        {"end tag differing only in case",
+         Listing("<Contents><Key>p/a</key><Size>3</Size></Contents>")},
+        {"mismatched root end tag",
+         "<ListBucketResult>" + object +
+             "<IsTruncated>false</IsTruncated></ListBucketResults>"},
+        {"element inside a Key",
+         Listing("<Contents><Key>p/a<b/></Key><Size>3</Size></Contents>")},
+        {"element inside a Size",
+         Listing("<Contents><Key>p/a</Key><Size>3<b>4</b></Size>"
+                 "</Contents>")},
         {"missing IsTruncated", Listing(object, "")},
         {"invalid IsTruncated",
          Listing(object, "<IsTruncated>maybe</IsTruncated>")},
@@ -172,6 +214,7 @@ TEST(ObjectStorageXmlTest, ExtractsErrorCodeAndMessage) {
     EXPECT_EQ(ErrorCodeAndMessage(""), "");
     EXPECT_EQ(ErrorCodeAndMessage("<html>Bad Gateway</html>"), "");
     EXPECT_EQ(ErrorCodeAndMessage("<Error><Code>Slow"), "");
+    EXPECT_EQ(ErrorCodeAndMessage("<Error><Code>Slow</Message></Error>"), "");
 }
 
 }  // namespace

@@ -512,6 +512,15 @@ TEST(S3ObjectStorageAdapterTest, RejectsMalformedListResponses) {
         // Text after the root element.
         "<ListBucketResult>" + first +
             "<IsTruncated>false</IsTruncated></ListBucketResult>junk",
+        // A second object nested inside the first Contents element.
+        "<ListBucketResult><Contents><Key>p/first</Key><Size>3</Size>"
+        "<Contents><Key>p/second</Key><Size>3</Size></Contents></Contents>"
+        "<IsTruncated>false</IsTruncated></ListBucketResult>",
+        // A second object placed under another element by mismatched end
+        // tags.
+        "<ListBucketResult>" + first +
+            "<Owner><Contents><Key>p/second</Key><Size>3</Size></Owner>"
+            "</Contents><IsTruncated>false</IsTruncated></ListBucketResult>",
     };
     for (const auto& body : malformed) {
         SCOPED_TRACE(body);
