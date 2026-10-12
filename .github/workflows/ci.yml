@@ -19,9 +19,12 @@ on:
 permissions:
   contents: read
 
+# A branch push lets the running build finish: a full run outlasts the gap
+# between merges, so cancelling on every push left main with no completed
+# result. Newer pushes still replace the one pending run.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name != 'push' }}
 
 env:
   # Only push/schedule builds write: PR-scoped entries are invisible to
@@ -774,7 +777,10 @@ jobs:
 
   ci-gate:
     name: CI Gate
-    if: always()
+    # A cancelled branch push run reports no result rather than a failed gate.
+    # Everywhere else the gate must fail: a skipped gate would satisfy the
+    # required check for a PR head whose run was cancelled.
+    if: ${{ (github.event_name != 'push' && always()) || !cancelled() }}
     needs:
       - check-paths
       - spell-check
