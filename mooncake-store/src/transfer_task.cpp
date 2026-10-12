@@ -1050,6 +1050,19 @@ TransferSubmitter::TransferSubmitter(TransferEngine& engine,
             << memcpy_enabled_;
 }
 
+#ifdef USE_NOF
+// A NoF request the client rejects before it reaches the target. Returned as
+// a future that already failed with INVALID_PARAMS rather than as nullopt, so
+// callers can tell it apart from a target that could not be opened, which is
+// the only submit failure that says anything about reachability.
+static TransferFuture RejectedSpdkNofOperation() {
+    auto state = std::make_shared<SpdkNofOperationState>();
+    state->set_completed(ErrorCode::INVALID_PARAMS);
+    return TransferFuture(state);
+}
+
+#endif
+
 std::optional<TransferFuture> TransferSubmitter::submit(
     const Replica::Descriptor& replica, std::vector<Slice>& slices,
     TransferRequest::OpCode op_code, void* ptr, size_t size,
@@ -1088,7 +1101,7 @@ std::optional<TransferFuture> TransferSubmitter::submit(
         auto& handle = ssd_desc.buffer_descriptor;
 
         if (!ptr || (size == 0)) {
-            return std::nullopt;
+            return RejectedSpdkNofOperation();
         }
 
         future = submitSpdkNofOperation(handle, ptr, size, op_code);
@@ -1961,7 +1974,7 @@ std::optional<TransferFuture> TransferSubmitter::submitSpdkNofOperation(
                    << handle.transport_endpoint_
                    << ", buffer_size=" << handle.size_
                    << ", request_size=" << size;
-        return std::nullopt;
+        return RejectedSpdkNofOperation();
     }
 
     nof_seg_handle* seg_handle =
@@ -1979,7 +1992,7 @@ std::optional<TransferFuture> TransferSubmitter::submitSpdkNofOperation(
         LOG(ERROR) << "NoF request offset=" << handle.buffer_address_
                    << ", ptr=" << ptr << ", size=" << size
                    << " is not aligned to block size " << block_size;
-        return std::nullopt;
+        return RejectedSpdkNofOperation();
     }
 
     auto state = std::make_shared<SpdkNofOperationState>();
