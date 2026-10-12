@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
@@ -238,12 +239,18 @@ class FilereadOperationState : public OperationState {
  */
 class TransferEngineOperationState : public OperationState {
    public:
-    TransferEngineOperationState(TransferEngine& engine, BatchID batch_id,
-                                 size_t batch_size)
+    // How long wait_for_completion() waits before failing the operation.
+    // Overridable with MC_STORE_TRANSFER_TIMEOUT_MS via TransferSubmitter.
+    static constexpr std::chrono::milliseconds kDefaultTimeout{60 * 1000};
+
+    TransferEngineOperationState(
+        TransferEngine& engine, BatchID batch_id, size_t batch_size,
+        std::chrono::milliseconds timeout = kDefaultTimeout)
         : engine_(engine),
           tent_engine_(engine.getTentEngine().get()),
           batch_id_(batch_id),
           batch_size_(batch_size),
+          timeout_(timeout),
           start_ts_(getCurrentTimeInMilli()) {}
 
     ~TransferEngineOperationState();
@@ -270,6 +277,7 @@ class TransferEngineOperationState : public OperationState {
     mooncake::tent::TransferEngine* tent_engine_;
     BatchID batch_id_;
     size_t batch_size_;
+    const std::chrono::milliseconds timeout_;
     const int64_t start_ts_;
 };
 
@@ -679,6 +687,8 @@ class TransferSubmitter {
 #endif
     std::unique_ptr<FilereadWorkerPool> fileread_pool_;
     bool memcpy_enabled_;
+    std::chrono::milliseconds transfer_timeout_ =
+        TransferEngineOperationState::kDefaultTimeout;
     const std::string local_hostname_;
     TransferMetric* transfer_metric_;
 

@@ -922,8 +922,7 @@ void TransferEngineOperationState::wait_for_completion() {
         return;
     }
 
-    // 60 seconds
-    constexpr int64_t timeout_milliseconds = 60 * 1000;
+    const int64_t timeout_milliseconds = timeout_.count();
 
 #ifdef USE_EVENT_DRIVEN_COMPLETION
     // TENT batches do not use the classic transport BatchDesc layout.
@@ -1070,8 +1069,16 @@ TransferSubmitter::TransferSubmitter(TransferEngine& engine,
                                         "disabled");
     }
 
+    if (config.transfer_timeout_override.has_value()) {
+        transfer_timeout_ = *config.transfer_timeout_override;
+        LOG(INFO) << "MC_STORE_TRANSFER_TIMEOUT_MS set: Transfer Engine "
+                     "operations time out after "
+                  << transfer_timeout_.count() << " ms";
+    }
+
     VLOG(1) << "TransferSubmitter initialized with memcpy_enabled="
-            << memcpy_enabled_;
+            << memcpy_enabled_
+            << ", transfer_timeout_ms=" << transfer_timeout_.count();
 }
 
 std::optional<TransferFuture> TransferSubmitter::submit(
@@ -1806,7 +1813,7 @@ std::optional<TransferFuture> TransferSubmitter::submitTransfer(
     }
 
     auto state = std::make_shared<TransferEngineOperationState>(
-        engine_, batch_id, batch_size);
+        engine_, batch_id, batch_size, transfer_timeout_);
 
     return TransferFuture(state);
 }
