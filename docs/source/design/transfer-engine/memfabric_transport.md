@@ -149,9 +149,9 @@ Tests use mock ACL functions and mock `MemFabricUnderApi`; no real memfabric har
 
 1. **`libmf_smem.so` must be in `LD_LIBRARY_PATH`**: MemFabric Transport loads it via dlopen at runtime. If the library cannot be found, `install()` returns `DeviceNotFound`.
 
-2. **`MF_DATA_OP_TYPE` must be set**: If unset, `install()` returns `InvalidArgument`.
+2. **`data_op_type` must be set in TENT config**: If unset, `install()` returns `InvalidArgument`.
 
-3. **`device_rdma` mode requires NIC configuration**: When `MF_DATA_OP_TYPE=device_rdma` or `host_rdma`, the `cfg.nic` field is set to `tcp://ip:port` format. The IP is obtained from the `HCCL_IF_IP` environment variable, and the port from the segment name.
+3. **`device_rdma` mode requires NIC configuration**: When `data_op_type=device_rdma` or `host_rdma`, the `cfg.nic` field is set to `tcp://ip:port` format. The IP is obtained from the `HCCL_IF_IP` environment variable, and the port from the segment name.
 
 4. **Hugepage configuration**: When using Store pooling (`protocol=ascend`), hugepages must be reserved.
    The page size depends on the system configuration; check with `cat /proc/meminfo | grep Hugepagesize`:

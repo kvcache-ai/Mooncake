@@ -64,8 +64,11 @@ Status MemFabricTransport::install(std::string& local_segment_name,
     }
     LOG(INFO) << "data_op_type=" << config_.data_op_type_str;
 
-    const char* log_level = std::getenv("MF_LOG_LEVEL");
-    if (log_level) MemFabricUnderApi::SmemSetLogLevel(std::atoi(log_level));
+    auto log_level_str = conf->get("log_level", "info");
+    int mf_log_level = 1;
+    if (log_level_str == "warning") mf_log_level = 2;
+    else if (log_level_str == "error") mf_log_level = 3;
+    MemFabricUnderApi::SmemSetLogLevel(mf_log_level);
 
     int32_t device_id = 0;
     if (aclrtGetDevice(&device_id) != ACL_ERROR_NONE) {

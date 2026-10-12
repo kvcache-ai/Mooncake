@@ -148,9 +148,9 @@ ctest --test-dir build -R 'memfabric' --output-on-failure
 
 1. **`libmf_smem.so` 必须在 `LD_LIBRARY_PATH` 中**：MemFabric Transport 通过 dlopen 动态加载，找不到库会返回 `DeviceNotFound`。
 
-2. **`MF_DATA_OP_TYPE` 必须设置**：未设置时 install 返回 `InvalidArgument`。
+2. **`data_op_type` 必须在 TENT 配置中设置**：未设置时 install 返回 `InvalidArgument`。
 
-3. **`device_rdma` 模式需配置 NIC**：当 `MF_DATA_OP_TYPE=device_rdma` 或 `host_rdma` 时，`cfg.nic` 字段会设为 `tcp://ip:port` 格式，IP 从 `HCCL_IF_IP` 环境变量获取，端口从 segment name 获取。
+3. **`device_rdma` 模式需配置 NIC**：当 `data_op_type=device_rdma` 或 `host_rdma` 时，`cfg.nic` 字段会设为 `tcp://ip:port` 格式，IP 从 `HCCL_IF_IP` 环境变量获取，端口从 segment name 获取。
 
 4. **大页配置**：使用 Store 池化（`protocol=ascend`）时需要预留大页。
    页大小取决于系统配置，可通过 `cat /proc/meminfo | grep Hugepagesize` 查看：
