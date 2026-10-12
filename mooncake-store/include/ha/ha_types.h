@@ -39,6 +39,18 @@ inline std::string HABackendTypeToString(HABackendType type) {
     return "unknown";
 }
 
+inline bool HaBackendSupportsOpLog(HABackendType type) {
+    switch (type) {
+        case HABackendType::ETCD:
+        case HABackendType::REDIS:
+            return true;
+        case HABackendType::UNKNOWN:
+        case HABackendType::K8S:
+            return false;
+    }
+    return false;
+}
+
 inline std::optional<HABackendType> ParseHABackendType(std::string_view type) {
     if (type == "etcd") {
         return HABackendType::ETCD;
@@ -50,6 +62,11 @@ inline std::optional<HABackendType> ParseHABackendType(std::string_view type) {
         return HABackendType::K8S;
     }
     return std::nullopt;
+}
+
+inline bool HaBackendSupportsOpLog(std::string_view type) {
+    const auto parsed = ParseHABackendType(type);
+    return parsed.has_value() && HaBackendSupportsOpLog(parsed.value());
 }
 
 inline ErrorCode ValidateHABackendAvailability(HABackendType type) {

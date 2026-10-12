@@ -321,7 +321,7 @@ def build_integration(ns, hash_oracle):
         "remove_first_block_hex": remove_first.hex(),
         "clear_all_hex": clear_all.hex(),
         "expected_cumulative_tokens": {
-            "npu": page * 1,
+            "device": page * 1,
             "cpu_local": page * 2,
             "disk": page * 3,
             # No shared owner exists here, so the shared tier adds nothing of
