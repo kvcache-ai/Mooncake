@@ -311,6 +311,11 @@ if(USE_EFA)
                                                   gtest_main)
   add_test(NAME efa_transport_test COMMAND efa_transport_test)
 
+  add_executable(efa_select_device_test ${WORKSPACE}/efa_select_device_test.cpp)
+  target_link_libraries(efa_select_device_test PUBLIC transfer_engine gtest
+                                                       gtest_main)
+  add_test(NAME efa_select_device_test COMMAND efa_select_device_test)
+
   add_executable(efa_c_api_test ${WORKSPACE}/efa_c_api_test.cpp)
   target_link_libraries(efa_c_api_test PUBLIC transfer_engine gtest gtest_main)
   add_test(NAME efa_c_api_test COMMAND efa_c_api_test)

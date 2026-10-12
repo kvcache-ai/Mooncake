@@ -1313,6 +1313,22 @@ int EfaTransport::selectDevice(SegmentDesc* desc, uint64_t offset,
                 return 0;
             }
         }
+
+        // The topology walk above is not exhaustive: attempt 0 draws a random
+        // HCA from the preferred list, and attempts 1..num_devices-1 visit only
+        // the first num_devices-1 entries of preferred + available. Under the
+        // disjoint per-NIC partition a chunk is registered on a single NIC,
+        // and the walk can miss it, failing a transfer that a registered NIC
+        // could serve. Fall back to any NIC that holds a key for this buffer.
+        const size_t num_keys = buffer.rkey.size();
+        for (size_t i = 0; i < num_keys; ++i) {
+            const size_t candidate =
+                (static_cast<size_t>(retry_count) + i) % num_keys;
+            if (buffer.rkey[candidate] != 0) {
+                device_id = static_cast<int>(candidate);
+                return 0;
+            }
+        }
     }
     return ERR_ADDRESS_NOT_REGISTERED;
 }
