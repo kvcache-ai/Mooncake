@@ -368,8 +368,7 @@ TEST_F(MasterMetricsTest, SnapshotReaderTeardownKeepsCapacityIntact) {
     ASSERT_TRUE(snapshot.has_value());
 
     {
-        // Deserialize into a temporary reader (as
-        // CatalogBackedSnapshotProvider does). The reader's records never
+        // Deserialize into a temporary reader. The reader's records never
         // contributed to the capacity metrics, so destroying it must leave
         // the gauges untouched.
         SegmentManager reader(BufferAllocatorType::OFFSET);
