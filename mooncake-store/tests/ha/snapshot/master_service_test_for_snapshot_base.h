@@ -784,9 +784,10 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
              MasterServiceTestPeer::MetadataShards(*service)) {
             for (const auto& [tenant_id, tenant_state] : shard.tenants) {
                 (void)tenant_id;
-                for (const auto& [key, metadata] : tenant_state.metadata) {
+                for (const auto& [key, record] : tenant_state.metadata) {
                     (void)key;
-                    for (const auto& replica : metadata.GetAllReplicas()) {
+                    for (const auto& replica :
+                         record.metadata.GetAllReplicas()) {
                         if (replica.is_memory_replica()) {
                             const auto record = replica.getClientLiveness();
                             ASSERT_TRUE(record);
