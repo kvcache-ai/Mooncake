@@ -3,6 +3,8 @@ name: Pre-Release
 # Build the same core wheel matrix as the stable release workflows and attach
 # the artifacts to a GitHub Pre-release. Also publish the exact artifacts to
 # TestPyPI, then consume them in smoke and T-one tests. No production PyPI upload.
+# Stable vX.Y.Z / vX.Y.Z.postN tags go to release*.yaml instead. Tags that match
+# neither set (e.g. v0.3.14a1, v0.3.14post1) trigger no workflow at all.
 on:
   push:
     tags:
