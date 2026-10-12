@@ -22,12 +22,20 @@ bool BuildNoFIoLayout(uint32_t block_size, uint64_t disk_offset,
     const uint64_t head_bytes = size - tail_bytes;
     const uint64_t padded_size =
         tail_bytes == 0 ? size : head_bytes + block_size;
+    // SpdkNofTask counts its remaining blocks in an int, so a larger
+    // request would go negative there and never be submitted or completed.
+    const uint64_t padded_blocks = padded_size / block_size;
     if (padded_size < size ||
-        padded_size / block_size > std::numeric_limits<uint32_t>::max()) {
+        padded_blocks >
+            static_cast<uint64_t>(std::numeric_limits<int>::max())) {
         return false;
     }
 
+    // The last LBA of the request must not wrap around.
     const uint64_t base_lba = disk_offset / block_size;
+    if (base_lba > std::numeric_limits<uint64_t>::max() - padded_blocks) {
+        return false;
+    }
     std::vector<NoFIoSegment> segments;
     if (buffer_address % block_size != 0) {
         // The direct path needs a block aligned address, so the whole payload

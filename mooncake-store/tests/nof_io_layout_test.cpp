@@ -149,3 +149,22 @@ TEST(NoFIoLayoutTest, RejectsBlockCountOverflow) {
         kBlock512;
     EXPECT_FALSE(BuildNoFIoLayout(kBlock512, 0, kAlignedAddress, size, layout));
 }
+
+TEST(NoFIoLayoutTest, RejectsBlockCountAboveWorkerCounter) {
+    // SpdkNofTask tracks the remaining blocks in an int.
+    NoFIoLayout layout;
+    const size_t max_blocks =
+        static_cast<size_t>(std::numeric_limits<int>::max());
+    EXPECT_FALSE(BuildNoFIoLayout(kBlock512, 0, kAlignedAddress,
+                                  (max_blocks + 1) * kBlock512, layout));
+    EXPECT_TRUE(BuildNoFIoLayout(kBlock512, 0, kAlignedAddress,
+                                 max_blocks * kBlock512, layout));
+}
+
+TEST(NoFIoLayoutTest, RejectsLbaRangeThatWraps) {
+    NoFIoLayout layout;
+    const uint64_t last_lba = std::numeric_limits<uint64_t>::max();
+    // Two blocks starting on the last addressable LBA would wrap past it.
+    EXPECT_FALSE(BuildNoFIoLayout(1, last_lba, kAlignedAddress, 2, layout));
+    EXPECT_TRUE(BuildNoFIoLayout(1, last_lba - 1, kAlignedAddress, 1, layout));
+}
