@@ -21,6 +21,11 @@ jobs:
       package_version: ${{ steps.version.outputs.package_version }}
       is_prerelease: ${{ steps.version.outputs.is_prerelease }}
     steps:
+      - name: Checkout release gate
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -34,24 +39,23 @@ jobs:
         env:
           RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
         run: |
-          python - <<'PY'
-          import os
-          from pathlib import Path
-          import re
-
-          from packaging.version import Version
-
-          tag = os.environ["RELEASE_TAG"]
-          if not re.fullmatch(r"v[0-9][0-9A-Za-z._-]*", tag):
-              raise SystemExit(f"Invalid release tag: {tag!r}")
-          version = Version(tag[1:])
-          if version.is_devrelease:
-              raise SystemExit("Development versions are not release tags")
-          with Path(os.environ["GITHUB_OUTPUT"]).open("a") as output:
-              output.write(f"release_tag={tag}\n")
-              output.write(f"package_version={version}\n")
-              output.write(f"is_prerelease={str(version.is_prerelease).lower()}\n")
-          PY
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9][0-9A-Za-z._-]*$ ]]; then
+            echo "Invalid release tag: $RELEASE_TAG" >&2
+            exit 1
+          fi
+          if [[ "$RELEASE_TAG" == *-* ]]; then
+            version=$(python scripts/ci/testpypi_wheel_gate.py \
+              normalize-version --tag "$RELEASE_TAG")
+            is_prerelease=true
+          else
+            # Keep the repository-wide stable path for tags without a hyphen.
+            version="${RELEASE_TAG#v}"
+            is_prerelease=false
+          fi
+          echo "release_tag=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "package_version=${version}" >> "$GITHUB_OUTPUT"
+          echo "is_prerelease=${is_prerelease}" >> "$GITHUB_OUTPUT"
 
   build:
     needs: version-stamp
