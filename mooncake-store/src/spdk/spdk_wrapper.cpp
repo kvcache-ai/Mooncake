@@ -265,6 +265,10 @@ void SpdkWrapper::ProbeReadComplete(void *ctx,
     }
     probe_ctx->done.store(true, std::memory_order_release);
     if (probe_ctx->owner != nullptr) {
+        if (probe_ctx->buffer != nullptr) {
+            probe_ctx->owner->ReleaseProbeBufferRef(probe_ctx->buffer);
+            probe_ctx->buffer = nullptr;
+        }
         probe_ctx->owner->RecycleProbeRequestContext(probe_ctx);
     }
 }
@@ -474,13 +478,24 @@ SpdkWrapper::ProbeBuffer *SpdkWrapper::GetOrCreateProbeBuffer(
     if (!probe_buffer) {
         probe_buffer = std::make_unique<ProbeBuffer>();
     }
+    // The endpoint is being probed again, e.g. after a remount, so a release
+    // deferred by an earlier unmount no longer applies.
+    probe_buffer->release_requested = false;
 
     if (probe_buffer->ptr != nullptr && probe_buffer->size == block_size) {
-        probe_buffer->in_flight = true;
+        ++probe_buffer->outstanding;
         return probe_buffer.get();
     }
 
     if (probe_buffer->ptr != nullptr) {
+        if (probe_buffer->outstanding > 0) {
+            // The block size changed under a read that has not been reaped,
+            // so the old buffer cannot be freed yet.
+            if (error_reason) {
+                *error_reason = "probe_buffer_busy";
+            }
+            return nullptr;
+        }
         spdk_free(probe_buffer->ptr);
         probe_buffer->ptr = nullptr;
         probe_buffer->size = 0;
@@ -495,15 +510,30 @@ SpdkWrapper::ProbeBuffer *SpdkWrapper::GetOrCreateProbeBuffer(
         return nullptr;
     }
     probe_buffer->size = block_size;
-    probe_buffer->in_flight = true;
+    probe_buffer->outstanding = 1;
     return probe_buffer.get();
 }
 
-void SpdkWrapper::MarkProbeBufferIdle(const std::string &tr_str) {
+void SpdkWrapper::ReleaseProbeBufferRef(ProbeBuffer *buffer) {
     std::lock_guard<std::mutex> lock(probe_buffers_mutex_);
-    auto it = probe_buffers_.find(tr_str);
-    if (it != probe_buffers_.end() && it->second) {
-        it->second->in_flight = false;
+    if (buffer->outstanding > 0) {
+        --buffer->outstanding;
+    }
+    if (buffer->outstanding > 0 || !buffer->release_requested) {
+        return;
+    }
+    // The endpoint was released while this read was in flight, and nothing
+    // references the buffer any more.
+    for (auto it = probe_buffers_.begin(); it != probe_buffers_.end(); ++it) {
+        if (it->second.get() == buffer) {
+            if (buffer->ptr) {
+                spdk_free(buffer->ptr);
+            }
+            LOG(INFO) << "endpoint=" << it->first
+                      << ", action=release_deferred_nof_probe_buffer";
+            probe_buffers_.erase(it);
+            return;
+        }
     }
 }
 
@@ -513,11 +543,12 @@ void SpdkWrapper::ReleaseProbeResources(const std::string &tr_str) {
     if (it == probe_buffers_.end()) {
         return;
     }
-    if (it->second && it->second->in_flight) {
-        // The last probe never completed, so the controller may still DMA
-        // into this buffer. Keep it until Cleanup() tears the device down.
+    if (it->second && it->second->outstanding > 0) {
+        // A probe read has not been reaped, so the controller may still DMA
+        // into this buffer. Free it once that completion comes back instead.
+        it->second->release_requested = true;
         LOG(WARNING) << "endpoint=" << tr_str
-                     << ", action=skip_release_nof_probe_buffer"
+                     << ", action=defer_release_nof_probe_buffer"
                      << ", reason=probe_in_flight";
         return;
     }
@@ -560,11 +591,14 @@ bool SpdkWrapper::ProbeNofSegment(const std::string &tr_str,
     }
 
     ProbeRequestContext *probe_ctx = AcquireProbeRequestContext();
+    probe_ctx->buffer = probe_buffer;
     int ret = SubmitRequest(seg_handle, probe_buffer->ptr, 0, 1, kSpdkNofOpRead,
                             ProbeReadComplete, probe_ctx);
     if (ret != 0) {
+        // No completion will run for a request that was never submitted.
+        probe_ctx->buffer = nullptr;
         RecycleProbeRequestContext(probe_ctx);
-        MarkProbeBufferIdle(tr_str);
+        ReleaseProbeBufferRef(probe_buffer);
         if (error_reason) {
             *error_reason = "submit_fail";
         }
@@ -577,11 +611,6 @@ bool SpdkWrapper::ProbeNofSegment(const std::string &tr_str,
            std::chrono::steady_clock::now() < deadline) {
         NvmePollProcessCompletion(seg_handle, 0);
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-
-    if (probe_ctx->done.load(std::memory_order_acquire)) {
-        // The request completed, so nothing references the buffer any more.
-        MarkProbeBufferIdle(tr_str);
     }
 
     bool ok = probe_ctx->done.load(std::memory_order_acquire) &&
