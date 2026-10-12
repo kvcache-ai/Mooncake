@@ -99,7 +99,7 @@ endif()
 if(USE_EFA)
   add_subdirectory(efa_transport)
   target_sources(transport PUBLIC $<TARGET_OBJECTS:efa_transport>)
-  target_link_libraries(transport PRIVATE fabric)
+  target_link_libraries(transport PRIVATE ${CMAKE_DL_LIBS})
 endif()
 
 if(USE_CXI)
