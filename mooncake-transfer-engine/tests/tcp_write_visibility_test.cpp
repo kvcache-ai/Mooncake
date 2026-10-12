@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Contract tests for TcpTransport completion semantics (issue #2086 / PR #4428).
+// Contract tests for TcpTransport completion semantics (issue #2086 / PR
+// #4428).
 //
 // Under the legacy (v1) framing, a WRITE was reported COMPLETED when the
 // final chunk reached the initiator's kernel socket buffer: destination
