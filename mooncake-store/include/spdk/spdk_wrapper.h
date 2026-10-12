@@ -53,6 +53,15 @@ class SpdkWrapper {
     bool ProbeNofSegment(const std::string &tr_str, uint32_t timeout_ms,
                          std::string *error_reason = nullptr);
 
+    /**
+     * @brief Release the probe resources cached for a transport endpoint.
+     *        Called once the last NoF segment behind @p tr_str is unmounted,
+     *        so that the DMA buffer does not outlive the segment. The call is
+     *        idempotent and skips buffers whose probe request never completed,
+     *        because the device may still write into them.
+     */
+    void ReleaseProbeResources(const std::string &tr_str);
+
     /** @brief Register external memory with SPDK for NoF zero-copy transfers.
      *
      * Memory returned by Alloc() is already registered with SPDK; use this to
@@ -103,6 +112,9 @@ class SpdkWrapper {
     struct ProbeBuffer {
         void *ptr{nullptr};
         uint32_t size{0};
+        // Set while a probe request holding this buffer is outstanding, so
+        // ReleaseProbeResources never frees memory a pending DMA targets.
+        bool in_flight{false};
 
         ProbeBuffer() = default;
         ProbeBuffer(const ProbeBuffer &) = delete;
@@ -136,6 +148,7 @@ class SpdkWrapper {
     ProbeBuffer *GetOrCreateProbeBuffer(const std::string &tr_str,
                                         uint32_t block_size,
                                         std::string *error_reason);
+    void MarkProbeBufferIdle(const std::string &tr_str);
     ProbeRequestContext *AcquireProbeRequestContext();
     void RecycleProbeRequestContext(ProbeRequestContext *ctx);
     void ReplenishProbeRequestContextPoolLocked(size_t count);
