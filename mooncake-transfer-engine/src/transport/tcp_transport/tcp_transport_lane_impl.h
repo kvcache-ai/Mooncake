@@ -1379,7 +1379,7 @@ void TcpTransport::completeTerminalAction(TerminalAction action) noexcept {
     auto continuation = std::move(action.work.continuation);
     TransferTask* owner = action.work.task;
     if (!owner && action.work.slice)
-        owner = __atomic_load_n(&action.work.slice->task, __ATOMIC_ACQUIRE);
+        owner = action.work.slice->task.load(std::memory_order_acquire);
 
     try {
         if (action.work.slice) {

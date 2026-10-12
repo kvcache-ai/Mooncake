@@ -1717,7 +1717,7 @@ TEST(TcpWriteVisibilityTest, CompletedWriteIsVisibleToSubsequentRead) {
         // semantics, which disaggregated-serving integrations rely on when
         // they notify the consumer out-of-band) is that destination memory
         // is now fully written. Verify by direct local inspection of the
-        // destination region â€?this is exactly what a decode instance does
+        // destination region â€” this is exactly what a decode instance does
         // after the prefill side signals transfer completion. Scan backwards:
         // the tail chunks are the ones still in flight when the initiator's
         // final local send completes.
@@ -1855,7 +1855,7 @@ TEST(TcpWriteVisibilityTest, V2ReadRoundTripAndRejectedRead) {
     r.target_offset = h.remote_base;
     ASSERT_EQ(runOne(h.engine.get(), r), TransferStatusEnum::COMPLETED);
     // v2 WRITE completion means the destination was already applied, so the
-    // read-back must match immediately â€?no drain wait.
+    // read-back must match immediately â€” no drain wait.
     EXPECT_EQ(memcmp(dst, src, kBigLength), 0);
 
     // A READ of an unregistered range must fail via the error status frame.
@@ -2089,7 +2089,7 @@ TEST(TcpWriteVisibilityTest,
 // A stale v2 descriptor can also point at a legacy server with a request
 // SHORTER than a status frame (1-7 bytes). The v1 peer treats the flagged
 // opcode as READ, streams fewer than 8 "payload" bytes, and then keeps the
-// connection open waiting for the next header â€?no EOF ever arrives, and for
+// connection open waiting for the next header â€” no EOF ever arrives, and for
 // WRITE it is symmetrically stuck parsing our body bytes as a partial
 // header. Without a status-frame deadline both directions wait forever;
 // with it they must fail, and only after actually waiting the deadline out
@@ -4558,4 +4558,3 @@ TEST(TcpWriteVisibilityTest, FreeBatchDefersUntilSliceCompletionUnwinds) {
 }
 #endif
 #endif
-

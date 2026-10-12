@@ -633,7 +633,7 @@ Transport::Slice* TcpTransport::prepareTransfer(
     slice->length = request.length;
     slice->opcode = request.opcode;
     slice->tcp.dest_addr = request.target_offset;
-    __atomic_store_n(&slice->task, task, __ATOMIC_RELEASE);
+    slice->task = task;
     slice->target_id = request.target_id;
     slice->status = Slice::PENDING;
     slice->ts = 0;
@@ -737,10 +737,10 @@ std::shared_ptr<asio::ip::tcp::socket> TcpTransport::getConnection(
 void TcpTransport::startTransfer(Slice* slice,
                                  std::function<void()> continuation,
                                  bool reuse_connection) {
-    // RELAXED is sufficient here: prepareTransfer stores slice->task with
-    // RELEASE before publishing the slice through the work queue, and that
-    // publication orders this load against the store.
-    TransferTask* owner = __atomic_load_n(&slice->task, __ATOMIC_RELAXED);
+    // RELAXED is sufficient here: prepareTransfer stores slice->task before
+    // publishing the slice through the work queue, and that publication
+    // orders this load against the store.
+    TransferTask* owner = slice->task.load(std::memory_order_relaxed);
     size_t slice_length = slice->length;
 
     auto finish = [slice, owner, slice_length,

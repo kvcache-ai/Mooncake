@@ -19,6 +19,7 @@
 #include "config/rpc_protocol_config.h"
 #include "default_config.h"
 #include "duration_utils.h"
+#include "ha/ha_types.h"
 #include "ha/leadership/master_service_supervisor.h"
 #include "ha/snapshot/batch_oplog/config.h"
 
@@ -1605,8 +1606,9 @@ int main(int argc, char* argv[]) {
         LOG(FATAL) << "enable_oplog requires enable_ha=true";
         return 1;
     }
-    if (master_config.enable_oplog && master_config.ha_backend_type != "etcd") {
-        LOG(FATAL) << "enable_oplog currently requires ha_backend_type=etcd";
+    if (master_config.enable_oplog &&
+        !mooncake::ha::HaBackendSupportsOpLog(master_config.ha_backend_type)) {
+        LOG(FATAL) << "enable_oplog requires ha_backend_type=etcd or redis";
         return 1;
     }
     if (auto error = ValidateBatchOpLogSnapshotConfig(master_config)) {
