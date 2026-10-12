@@ -148,6 +148,7 @@ add_store_test(spdk_controller_config_test spdk_controller_config_test.cpp)
 add_store_test(client_integration_test client_integration_test.cpp)
 add_store_test(batch_replica_clear_tenant_rpc_test
                batch_replica_clear_tenant_rpc_test.cpp)
+add_store_test(rpc_worker_pool_test rpc_worker_pool_test.cpp)
 add_test(
   NAME object_checksum_client_test
   COMMAND

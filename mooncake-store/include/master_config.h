@@ -96,6 +96,7 @@ struct MasterConfig {
     MetricsBootstrapConfig metrics;
     uint32_t rpc_port;
     uint32_t rpc_thread_num;
+    uint32_t handler_worker_thread_num;
     std::string rpc_address;
     std::string rpc_interface;
     int32_t rpc_conn_timeout_seconds;
