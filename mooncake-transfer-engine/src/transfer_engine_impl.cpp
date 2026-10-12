@@ -274,13 +274,22 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
 #endif
 
 #if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)
-    Transport* ascend_transport =
-        multi_transports_->installTransport("ascend", local_topology_);
-    if (!ascend_transport) {
-        LOG(ERROR) << "Failed to install Ascend transport";
-        return -1;
+    if (shouldInstallAscendTransport(auto_discover_config_.protocol)) {
+        Transport* ascend_transport =
+            multi_transports_->installTransport("ascend", local_topology_);
+        if (!ascend_transport) {
+            LOG(ERROR) << "Failed to install Ascend transport";
+            return -1;
+        }
+        maybeInstallShmTransport(multi_transports_.get(), local_topology_);
+        return 0;
     }
-#else
+    // The hint asked for a host transport. Discovery installs it below when
+    // enabled; with discovery off the caller installs it explicitly, the way
+    // Store and the Python binding do.
+    LOG(INFO) << "protocol=" << auto_discover_config_.protocol
+              << ", skipping Ascend Direct for the host transports";
+#endif
 
 #ifdef USE_UBSHMEM
     Transport* ubshmem_transport =
@@ -507,7 +516,6 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
         }
 #endif
     }
-#endif
 
     maybeInstallShmTransport(multi_transports_.get(), local_topology_);
     return 0;
