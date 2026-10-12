@@ -49,6 +49,11 @@ FileStorage::FileStorage(const FileStorageConfig& config,
       pinned_buffer_pool_(std::make_unique<PinnedBufferPool>()),
       client_buffer_allocator_(AlignedClientBufferAllocator::create(
           config.local_buffer_size, client ? client->GetProtocol() : "")) {
+    if (ssd_metric_) {
+        pinned_buffer_pool_->SetFallbackCallback([this](size_t /*size*/) {
+            ssd_metric_->RecordPinnedPoolFallback(1);
+        });
+    }
     if (!config_.Validate()) {
         throw std::invalid_argument("Invalid FileStorage configuration");
     }
@@ -418,6 +423,7 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         // D2H staging: replace device slices with host memory slices
         // so that storage_backend (ConcatSlicesToString / BuildBucket /
         // WriteBucket) always receives host pointers.
+        auto staging_start = std::chrono::steady_clock::now();
         std::unordered_map<std::string, std::vector<Slice>> host_batch_object;
         std::vector<PinnedBufferPool::Buffer> staging_bufs;
         auto runtime_accelerator =
@@ -439,6 +445,10 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
                         pinned_buffer_pool_->Release(std::move(buf));
                         obj_success = false;
                         failed_tasks.push_back(task_by_storage_key.at(obj_key));
+                        if (ssd_metric_) {
+                            ssd_metric_->RecordWriteErrors("D2H_COPY_FAILED",
+                                                           1);
+                        }
                         break;
                     }
                     host_slices.emplace_back(Slice{buf.data, slice.size});
@@ -450,6 +460,14 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             if (obj_success) {
                 host_batch_object[obj_key] = std::move(host_slices);
             }
+        }
+
+        if (ssd_metric_ && !staging_bufs.empty()) {
+            auto elapsed_us =
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - staging_start)
+                    .count();
+            ssd_metric_->ObserveWriteStaging(elapsed_us);
         }
 
         // If every object in this bucket failed D2H staging, host_batch_object
@@ -477,24 +495,26 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             auto res = complete_handler(keys, metadatas);
             if (res == ErrorCode::OK) {
                 reported_keys.insert(keys.begin(), keys.end());
-            }
-            if (res == ErrorCode::OK && ssd_metric_) {
-                auto elapsed_us =
-                    std::chrono::duration_cast<std::chrono::microseconds>(
-                        std::chrono::steady_clock::now() - offload_start)
-                        .count();
-                int64_t total_bytes = 0;
-                for (const auto& metadata : metadatas) {
-                    total_bytes += metadata.data_size;
+                if (ssd_metric_) {
+                    auto elapsed_us =
+                        std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now() - offload_start)
+                            .count();
+                    int64_t total_bytes = 0;
+                    for (const auto& metadata : metadatas) {
+                        total_bytes += metadata.data_size;
+                    }
+                    ssd_metric_->ssd_write_ops.inc(keys.size());
+                    ssd_metric_->ssd_write_bytes.inc(total_bytes);
+                    ssd_metric_->ssd_write_latency_us.observe(elapsed_us);
+                    ssd_metric_->ssd_write_latency_summary.observe(elapsed_us);
+                    ssd_metric_->ssd_total_ops.inc(keys.size());
+                    ssd_metric_->ssd_total_bytes.inc(total_bytes);
+                    ssd_metric_->ssd_total_latency_us.observe(elapsed_us);
+                    ssd_metric_->ssd_total_latency_summary.observe(elapsed_us);
                 }
-                ssd_metric_->ssd_write_ops.inc(keys.size());
-                ssd_metric_->ssd_write_bytes.inc(total_bytes);
-                ssd_metric_->ssd_write_latency_us.observe(elapsed_us);
-                ssd_metric_->ssd_write_latency_summary.observe(elapsed_us);
-                ssd_metric_->ssd_total_ops.inc(keys.size());
-                ssd_metric_->ssd_total_bytes.inc(total_bytes);
-                ssd_metric_->ssd_total_latency_us.observe(elapsed_us);
-                ssd_metric_->ssd_total_latency_summary.observe(elapsed_us);
+            } else if (ssd_metric_) {
+                ssd_metric_->RecordWriteErrors(toString(res), keys.size());
             }
             return res;
         };
@@ -521,6 +541,10 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         if (!offload_res) {
             LOG(ERROR) << "Failed to store objects with error: "
                        << offload_res.error();
+            if (ssd_metric_) {
+                ssd_metric_->RecordWriteErrors(toString(offload_res.error()),
+                                               host_batch_object.size());
+            }
             // This bucket did not persist, so report its keys back to the
             // master as failed regardless of whether we continue or abort.
             // Doing it here (rather than only on the soft path) keeps their
@@ -1027,6 +1051,10 @@ tl::expected<void, ErrorCode> FileStorage::BatchLoad(
             << "us,with keys count: " << batch_object.size();
     if (!result) {
         LOG(ERROR) << "Batch load object failed,err_code = " << result.error();
+        if (ssd_metric_) {
+            ssd_metric_->RecordReadErrors(toString(result.error()),
+                                          batch_object.size());
+        }
     } else if (ssd_metric_) {
         int64_t total_bytes = 0;
         for (const auto& [key, slice] : batch_object) {

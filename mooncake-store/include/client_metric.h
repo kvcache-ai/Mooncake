@@ -496,6 +496,8 @@ inline const std::vector<double> kSsdLatencyBucket = {
 };
 
 struct SsdMetric {
+    std::array<std::string, 1> error_label_names = {"error"};
+
     SsdMetric(std::map<std::string, std::string> labels = {})
         : ssd_read_bytes("mooncake_ssd_read_bytes_total",
                          "Total bytes read from SSD", labels),
@@ -513,6 +515,10 @@ struct SsdMetric {
           ssd_write_latency_us("mooncake_ssd_write_latency_us",
                                "SSD BatchOffload latency per batch (us)",
                                kSsdLatencyBucket, labels),
+          ssd_write_staging_latency_us(
+              "mooncake_ssd_write_staging_latency_us",
+              "SSD device-to-host staging latency per batch (us)",
+              kSsdLatencyBucket, labels),
           ssd_total_bytes("mooncake_ssd_total_bytes_total",
                           "Total bytes read and written to SSD", labels),
           ssd_total_ops("mooncake_ssd_total_ops_total",
@@ -529,6 +535,17 @@ struct SsdMetric {
           ssd_total_latency_summary("mooncake_ssd_total_latency_summary_us",
                                     "SSD total latency quantiles (us)",
                                     {0.5, 0.9, 0.99}, labels),
+          ssd_read_errors("mooncake_ssd_read_errors_total",
+                          "SSD read failures by error code (key count)", labels,
+                          error_label_names),
+          ssd_write_errors("mooncake_ssd_write_errors_total",
+                           "SSD write failures by error code (key count)",
+                           labels, error_label_names),
+          ssd_pinned_pool_fallback_total(
+              "mooncake_ssd_pinned_pool_fallback_total",
+              "Total count of fallbacks to pageable memory when pinned buffer "
+              "allocation fails",
+              labels),
           start_time_(std::chrono::steady_clock::now()) {}
 
     ylt::metric::counter_t ssd_read_bytes;
@@ -537,13 +554,43 @@ struct SsdMetric {
     ylt::metric::counter_t ssd_write_ops;
     ylt::metric::histogram_t ssd_read_latency_us;
     ylt::metric::histogram_t ssd_write_latency_us;
+    ylt::metric::histogram_t ssd_write_staging_latency_us;
     ylt::metric::counter_t ssd_total_bytes;
     ylt::metric::counter_t ssd_total_ops;
     ylt::metric::histogram_t ssd_total_latency_us;
     ylt::metric::summary_t ssd_read_latency_summary;
     ylt::metric::summary_t ssd_write_latency_summary;
     ylt::metric::summary_t ssd_total_latency_summary;
+    ylt::metric::hybrid_counter_1t ssd_read_errors;
+    ylt::metric::hybrid_counter_1t ssd_write_errors;
+    ylt::metric::counter_t ssd_pinned_pool_fallback_total;
     std::chrono::steady_clock::time_point start_time_;
+
+    void ObserveWriteStaging(uint64_t latency_us) {
+        ssd_write_staging_latency_us.observe(latency_us);
+    }
+
+    void RecordReadErrors(const std::string& error_name, int64_t count = 1) {
+        const std::array<std::string, 1> error_label = {error_name};
+        {
+            std::lock_guard<std::mutex> lock(observed_errors_mutex_);
+            observed_read_errors_.insert(error_name);
+        }
+        ssd_read_errors.inc(error_label, count);
+    }
+
+    void RecordWriteErrors(const std::string& error_name, int64_t count = 1) {
+        const std::array<std::string, 1> error_label = {error_name};
+        {
+            std::lock_guard<std::mutex> lock(observed_errors_mutex_);
+            observed_write_errors_.insert(error_name);
+        }
+        ssd_write_errors.inc(error_label, count);
+    }
+
+    void RecordPinnedPoolFallback(int64_t count = 1) {
+        ssd_pinned_pool_fallback_total.inc(count);
+    }
 
     void serialize(std::string& str) {
         ssd_read_bytes.serialize(str);
@@ -552,12 +599,16 @@ struct SsdMetric {
         ssd_write_ops.serialize(str);
         ssd_read_latency_us.serialize(str);
         ssd_write_latency_us.serialize(str);
+        ssd_write_staging_latency_us.serialize(str);
         ssd_total_bytes.serialize(str);
         ssd_total_ops.serialize(str);
         ssd_total_latency_us.serialize(str);
         ssd_read_latency_summary.serialize(str);
         ssd_write_latency_summary.serialize(str);
         ssd_total_latency_summary.serialize(str);
+        ssd_read_errors.serialize(str);
+        ssd_write_errors.serialize(str);
+        ssd_pinned_pool_fallback_total.serialize(str);
     }
 
     std::string summary_metrics() {
@@ -611,6 +662,13 @@ struct SsdMetric {
         }
         ss << "\n";
 
+        ss << "SSD Pinned Fallback: " << ssd_pinned_pool_fallback_total.value()
+           << "\n";
+        ss << format_error_line("SSD Read Errors", observed_read_errors_,
+                                ssd_read_errors);
+        ss << format_error_line("SSD Write Errors", observed_write_errors_,
+                                ssd_write_errors);
+
         ss << "\n" << "=== SSD Latency Summary (microseconds) ===" << "\n";
         ss << "Read: " << format_summary_percentiles(ssd_read_latency_summary)
            << "\n";
@@ -623,6 +681,34 @@ struct SsdMetric {
     }
 
    private:
+    std::mutex observed_errors_mutex_;
+    std::unordered_set<std::string> observed_read_errors_;
+    std::unordered_set<std::string> observed_write_errors_;
+
+    std::string format_error_line(
+        const std::string& label,
+        const std::unordered_set<std::string>& observed,
+        ylt::metric::hybrid_counter_1t& counter) {
+        std::vector<std::string> names;
+        {
+            std::lock_guard<std::mutex> lock(observed_errors_mutex_);
+            names.assign(observed.begin(), observed.end());
+        }
+        if (names.empty()) {
+            return "";
+        }
+        std::sort(names.begin(), names.end());
+
+        std::stringstream ss;
+        ss << label << ":";
+        for (const auto& name : names) {
+            const std::array<std::string, 1> error_label = {name};
+            ss << " " << name << "=" << counter.value(error_label);
+        }
+        ss << "\n";
+        return ss.str();
+    }
+
     std::string format_summary_percentiles(ylt::metric::summary_t& summary) {
         double sum = 0;
         uint64_t count = 0;
