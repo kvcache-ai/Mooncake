@@ -7,7 +7,16 @@ mooncake.store's client exactly; this module only adds ergonomics.
 
 from typing import Any
 
-from mooncake import _conductor
+try:
+    import mooncake._conductor as _conductor
+except ModuleNotFoundError as exc:
+    if exc.name != "mooncake._conductor":
+        raise
+    raise ImportError(
+        "This Mooncake installation does not include Conductor support. "
+        "Install a package with Conductor support, or rebuild with "
+        "WITH_CONDUCTOR=ON."
+    ) from exc
 
 # Re-export error-code constants for callers that don't want magic numbers.
 OK = 0
@@ -64,20 +73,25 @@ class ConductorClient:
     ) -> int:
         """Connect to the conductor at ``host:port``.
 
+        Each attempt replaces the previous connection. Failure leaves the
+        client uninitialized; setup() can be retried after failure or close().
+
         Returns OK (0) on success, otherwise a negative error code
-        (CONDUCTOR_UNAVAILABLE / RPC_FAIL / RPC_TIMEOUT / INTERNAL_ERROR).
+        (INVALID_PARAMS / RPC_FAIL).
         """
         return self._raw.setup(conductor_addr, connect_timeout_ms, request_timeout_ms)
 
     def close(self) -> int:
-        """Release the underlying RPC resources. Always returns OK (0)."""
+        """Release RPC resources and reset initialization. Returns OK (0)."""
         return self._raw.close()
 
     def health_check(self) -> int:
         """Probe conductor liveness.
 
-        Returns HEALTH_OK (0), HEALTH_NOT_INITIALIZED (1) if setup() never
-        succeeded, or HEALTH_UNREACHABLE (2) if the conductor does not answer.
+        Returns HEALTH_OK (0), HEALTH_NOT_INITIALIZED (1) before successful
+        setup(), after close(), or after a failed setup(), or
+        HEALTH_UNREACHABLE (2) if an initialized client's conductor does not
+        answer.
         """
         return self._raw.health_check()
 
@@ -96,8 +110,15 @@ class ConductorClient:
 
         Returns {"ret": int, "hits": dict}; "hits" maps instance_id to
         {"longest_matched": int, "dp": {rank: tokens}, "rank_matches": {...},
-        "npu": int, "cpu_local": int, "cpu_share": int, "disk": int}. On error
+        "device": int, "cpu_local": int, "cpu_share": int, "disk": int}. On error
         "ret" is a negative error code and "hits" is empty.
+
+        Rank keys in "dp" and "rank_matches" are decimal strings (e.g. "0"),
+        matching the HTTP/msgpack response. Token counts remain integers.
+
+        The "device" field counts prefixes in inference-engine device memory
+        (e.g. GPU memory). It corresponds to "npu" in the existing
+        HTTP/msgpack response, both in each hit and rank match.
 
         All parameters after ``model_name`` are keyword-only, mirroring the
         pybind signature where the required ``block_size`` and ``token_ids``

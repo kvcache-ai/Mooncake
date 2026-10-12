@@ -16,19 +16,20 @@ py::dict HitToDict(
     py::dict d;
     d["longest_matched"] = hit.longest_match_tokens;
     py::dict dp;
-    for (const auto& [rank, tokens] : hit.dp) dp[py::int_(rank)] = tokens;
+    for (const auto& [rank, tokens] : hit.dp)
+        dp[py::str(std::to_string(rank))] = tokens;
     d["dp"] = std::move(dp);
     py::dict rank_matches;
     for (const auto& [rank, m] : hit.rank_matches) {
         py::dict rm;
-        rm["npu"] = m.npu;
+        rm["device"] = m.npu;
         rm["cpu_local"] = m.cpu_local;
         rm["cpu_share"] = m.cpu_share;
         rm["disk"] = m.disk;
-        rank_matches[py::int_(rank)] = std::move(rm);
+        rank_matches[py::str(std::to_string(rank))] = std::move(rm);
     }
     d["rank_matches"] = std::move(rank_matches);
-    d["npu"] = hit.npu;
+    d["device"] = hit.npu;
     d["cpu_local"] = hit.cpu_local;
     d["cpu_share"] = hit.cpu_share;
     d["disk"] = hit.disk;
@@ -104,18 +105,20 @@ class PyConductorClient {
    public:
     int setup(const std::string& addr, int64_t connect_timeout_ms,
               int64_t request_timeout_ms) {
+        initialized_ = false;
         auto result =
             client_.Setup({addr, connect_timeout_ms, request_timeout_ms});
-        if (result) setup_called_ = true;
+        initialized_ = result.has_value();
         return result ? 0 : static_cast<int>(result.error());
     }
     int close() {
         client_.Close();
+        initialized_ = false;
         return 0;
     }
     int health_check() {
         // Same codes as store: 0 healthy / 1 uninitialized / 2 unreachable.
-        if (!setup_called_) return 1;
+        if (!initialized_) return 1;
         return client_.HealthCheck() ? 0 : 2;
     }
     py::dict query(const std::string& model_name, const std::string& lora_name,
@@ -277,7 +280,7 @@ class PyConductorClient {
 
    private:
     mooncake::conductor::ConductorClient client_;
-    bool setup_called_ = false;
+    bool initialized_ = false;
 };
 
 PYBIND11_MODULE(_conductor, m) {

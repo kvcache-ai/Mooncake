@@ -22,8 +22,11 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from urllib.request import Request, urlopen
 
+import msgpack
 import pytest
+import zmq
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 _MODULE_DIR = REPO_ROOT / "build" / "mooncake-integration"
@@ -54,7 +57,7 @@ def _log_tail(log_path: str, max_bytes: int = 4000) -> str:
 
 
 @pytest.fixture
-def conductor_server():
+def conductor_endpoints():
     http_port, rpc_port = _free_port(), _free_port()
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
         json.dump(
@@ -90,7 +93,7 @@ def conductor_server():
             else:
                 proc.kill()
                 pytest.fail(f"conductor did not start:\n{_log_tail(log_path)}")
-            yield rpc_port
+            yield rpc_port, http_port
         finally:
             proc.terminate()
             try:
@@ -104,6 +107,11 @@ def conductor_server():
         os.unlink(log_path)
 
 
+@pytest.fixture
+def conductor_server(conductor_endpoints):
+    return conductor_endpoints[0]
+
+
 def test_query_roundtrip(conductor_server):
     client = ConductorClient()
     assert client.setup(f"127.0.0.1:{conductor_server}") == 0
@@ -113,6 +121,7 @@ def test_query_roundtrip(conductor_server):
     assert result["hits"] == {}
     assert client.list_services()["ret"] == 0
     assert client.close() == 0
+    assert client.health_check() == 1
 
 
 def test_unavailable_codes(conductor_server):
@@ -120,3 +129,128 @@ def test_unavailable_codes(conductor_server):
     # Before setup(): ret is CONDUCTOR_UNAVAILABLE (-2000)
     assert client.query(model_name="m", block_size=16, token_ids=[])["ret"] == -2000
     assert client.health_check() == 1
+
+
+@pytest.mark.parametrize(
+    "bad_addr, expected", [("invalid", -600), ("127.0.0.1:1", -900)]
+)
+def test_failed_setup_replaces_connection(conductor_server, bad_addr, expected):
+    client = ConductorClient()
+    addr = f"127.0.0.1:{conductor_server}"
+    try:
+        assert client.setup(addr) == 0
+        assert client.health_check() == 0
+        assert client.setup(bad_addr, 200, 200) == expected
+        assert client.health_check() == 1
+        assert client.list_services()["ret"] == -2000
+        assert client.query(model_name="m", block_size=4, token_ids=[])["ret"] == -2000
+        assert client.setup(addr) == 0
+        assert client.health_check() == 0
+        # Replacing an active connection with another successful setup works.
+        assert client.setup(addr) == 0
+        assert client.health_check() == 0
+        assert client.close() == client.close() == 0
+        assert client.health_check() == 1
+        assert client.setup(bad_addr, 200, 200) == expected
+        assert client.health_check() == 1
+        assert client.setup(addr) == 0
+        assert client.health_check() == 0
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize("rank", [0, 12])
+def test_query_rank_keys_match_http(conductor_endpoints, rank):
+    rpc_port, http_port = conductor_endpoints
+    vectors = json.loads(
+        (
+            REPO_ROOT
+            / "mooncake-conductor/tests/fixtures/hash_golden_vectors_sha256.json"
+        ).read_text()
+    )
+    case = vectors["cases"][0]
+    profile = {k: v for k, v in vectors["profile"].items() if k != "root_digest"}
+    tokens = case["token_ids"]
+    expected = len(case["expected"]) * case["block_size"]
+    client = ConductorClient()
+    with zmq.Context() as context, context.socket(zmq.XPUB) as publisher:
+        publisher.setsockopt(zmq.LINGER, 0)
+        port = publisher.bind_to_random_port("tcp://127.0.0.1")
+        try:
+            assert client.setup(f"127.0.0.1:{rpc_port}") == 0
+            assert (
+                client.register(
+                    {
+                        "instance_id": "rank-test",
+                        "endpoint": f"tcp://127.0.0.1:{port}",
+                        "model_name": "rank-model",
+                        "block_size": case["block_size"],
+                        "dp_rank": rank,
+                        "hash_profile": profile,
+                    }
+                )
+                == 0
+            )
+            assert publisher.poll(3000), "No ZMQ subscription"
+            assert publisher.recv().startswith(b"\x01")
+            event = {
+                "type": "BlockStored",
+                "block_hashes": [int(h["projected_decimal"]) for h in case["expected"]],
+                "parent_block_hash": None,
+                "token_ids": tokens,
+                "block_size": case["block_size"],
+                "lora_id": None,
+                "lora_name": None,
+                "medium": "GPU",
+                "cache_salt": None,
+            }
+            publisher.send_multipart(
+                [
+                    b"",
+                    (0).to_bytes(8, "big"),
+                    msgpack.packb([time.time(), [event], rank]),
+                ]
+            )
+            deadline = time.monotonic() + 5
+            while True:
+                result = client.query(
+                    model_name="rank-model",
+                    block_size=case["block_size"],
+                    token_ids=tokens,
+                )
+                assert result["ret"] == 0
+                hit = result["hits"].get("rank-test", {})
+                if hit.get("longest_matched") == expected:
+                    break
+                assert time.monotonic() < deadline, result
+                time.sleep(0.02)
+            assert hit["dp"] == {str(rank): expected}
+            assert hit["device"] == expected
+            assert "gpu" not in hit
+            assert "npu" not in hit
+            assert set(hit["rank_matches"]) == {str(rank)}
+            assert hit["rank_matches"][str(rank)]["device"] == expected
+            assert "gpu" not in hit["rank_matches"][str(rank)]
+            assert "npu" not in hit["rank_matches"][str(rank)]
+            request = Request(
+                f"http://127.0.0.1:{http_port}/query",
+                data=msgpack.packb(
+                    {
+                        "model": "rank-model",
+                        "block_size": case["block_size"],
+                        "token_ids": tokens,
+                    }
+                ),
+                headers={"Content-Type": "application/msgpack"},
+            )
+            with urlopen(request, timeout=3) as response:
+                http_result = msgpack.unpackb(response.read(), raw=False)
+            # Python exposes device memory under "device"; the existing HTTP API
+            # uses "npu". All rank keys and token counts must still agree.
+            for http_hit in http_result["instances"].values():
+                http_hit["device"] = http_hit.pop("npu")
+                for rank_match in http_hit["rank_matches"].values():
+                    rank_match["device"] = rank_match.pop("npu")
+            assert result["hits"] == http_result["instances"]
+        finally:
+            client.close()

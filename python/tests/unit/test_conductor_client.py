@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+from importlib import import_module
 from pathlib import Path
 from types import ModuleType
 
@@ -75,3 +76,46 @@ def test_context_manager_closes(conductor_module: ModuleType) -> None:
     with ConductorClient() as c:
         c.setup("127.0.0.1:13334")
     assert c._raw.closed
+
+
+@pytest.fixture
+def package_without_native(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    pkg = ModuleType("mooncake")
+    pkg.__path__ = [str(PACKAGE_ROOT), str(tmp_path)]
+    pkg.__package__ = "mooncake"
+    monkeypatch.setitem(sys.modules, "mooncake", pkg)
+    monkeypatch.delitem(sys.modules, "mooncake._conductor", raising=False)
+    monkeypatch.delitem(sys.modules, "mooncake.conductor", raising=False)
+    return tmp_path
+
+
+def test_missing_native_extension_has_actionable_error(package_without_native) -> None:
+    with pytest.raises(ImportError, match="does not include Conductor support") as info:
+        import_module("mooncake.conductor")
+    assert "WITH_CONDUCTOR=ON" in str(info.value)
+    assert isinstance(info.value.__cause__, ModuleNotFoundError)
+    assert info.value.__cause__.name == "mooncake._conductor"
+
+
+@pytest.mark.parametrize(
+    "native_source, error_type, message",
+    [
+        (
+            'raise ImportError("libasio.so: cannot open shared object file")',
+            ImportError,
+            "libasio.so: cannot open shared object file",
+        ),
+        (
+            'raise ModuleNotFoundError("native dependency missing", name="dependency")',
+            ModuleNotFoundError,
+            "native dependency missing",
+        ),
+    ],
+)
+def test_native_loading_errors_are_preserved(
+    package_without_native: Path, native_source: str, error_type: type, message: str
+) -> None:
+    (package_without_native / "_conductor.py").write_text(native_source)
+    with pytest.raises(error_type) as info:
+        import_module("mooncake.conductor")
+    assert str(info.value) == message
