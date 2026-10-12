@@ -53,7 +53,6 @@ using namespace mooncake;
 
 namespace mooncake {
 
-#ifdef USE_TENT
 class ScopedEnvVar {
    public:
     ScopedEnvVar(const char* name, const char* value) : name_(name) {
@@ -76,7 +75,6 @@ class ScopedEnvVar {
     std::string name_;
     std::optional<std::string> old_value_;
 };
-#endif
 
 class TransferEngineImplTestPeer {
    public:
@@ -317,6 +315,43 @@ TEST(TransferEngineAutoDiscoverTest, BoolSetterPreservesDefaultSelection) {
               "rdma");
 }
 
+TEST(TransferEngineInitTest, QosOverloadsPreserveMetadataConnection) {
+    ScopedEnvVar use_tent("MC_USE_TENT", "0");
+    ScopedEnvVar force_tcp("MC_FORCE_TCP", nullptr);
+    for (int arguments : {4, 5, 6}) {
+        TransferEngine engine(false);
+        EXPECT_TRUE(engine.getMetadataConnectionString().empty());
+        int result = -1;
+        if (arguments == 4) {
+            result = engine.init(P2PHANDSHAKE, "127.0.0.1:0", "", 0);
+        } else if (arguments == 5) {
+            result = engine.init(P2PHANDSHAKE, "127.0.0.1:0", "", 0, "tcp");
+        } else {
+            result = engine.init(P2PHANDSHAKE, "127.0.0.1:0", "", 0, "tcp", "");
+        }
+        ASSERT_EQ(result, 0) << "init arguments=" << arguments;
+        EXPECT_EQ(engine.getMetadataConnectionString(), P2PHANDSHAKE);
+        EXPECT_EQ(engine.freeEngine(), 0);
+        EXPECT_TRUE(engine.getMetadataConnectionString().empty());
+    }
+}
+
+#ifndef USE_ASCEND_DIRECT
+TEST(TransferEngineInitTest, ClassicRejectsUnsupportedAscendResources) {
+    ScopedEnvVar use_tent("MC_USE_TENT", "0");
+    ScopedEnvVar force_tcp("MC_FORCE_TCP", nullptr);
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:0", "", 0, "tcp",
+                          R"({"comm_resource_config.qos":3})"),
+              ERR_INVALID_ARGUMENT);
+    EXPECT_TRUE(engine.getMetadataConnectionString().empty());
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:0", "", 0, "tcp", ""), 0);
+    EXPECT_EQ(engine.getMetadataConnectionString(), P2PHANDSHAKE);
+    EXPECT_EQ(engine.freeEngine(), 0);
+    EXPECT_TRUE(engine.getMetadataConnectionString().empty());
+}
+#endif
+
 #ifdef USE_TENT
 // RDMA is left enabled and TCP disabled so a regression that drops forceTcp()
 // still comes up with RDMA selected. forceTcp() must flip both flags.
@@ -327,6 +362,37 @@ void expectForcedTcpConstraint(const tent::Config& config) {
     EXPECT_TRUE(config.get("transports/force_tcp", false));
     EXPECT_TRUE(config.get("transports/tcp/enable", false));
     EXPECT_FALSE(config.get("transports/rdma/enable", true));
+}
+
+TEST(TransferEngineTentCompatibilityTest, QosInitOverloadsKeepTcpProtocol) {
+    ScopedEnvVar use_tent("MC_USE_TENT", "1");
+    ScopedEnvVar force_tcp("MC_FORCE_TCP", nullptr);
+    ScopedEnvVar hostname("MOONCAKE_LOCAL_HOSTNAME", "127.0.0.1");
+    ScopedEnvVar conf("MC_TENT_CONF", kTentConfPrefersRdma);
+    for (int qos : {0, 3, 7}) {
+        TransferEngine engine(true);
+        const std::string resources =
+            "{\"comm_resource_config.qos\":" + std::to_string(qos) + "}";
+        ASSERT_EQ(
+            engine.init(P2PHANDSHAKE, "qos-overload-" + std::to_string(qos), "",
+                        0, "tcp", resources),
+            0);
+        EXPECT_EQ(engine.getMetadataConnectionString(), P2PHANDSHAKE);
+        std::array<char, 64> buffer{};
+        ASSERT_EQ(engine.registerLocalMemory(buffer.data(), buffer.size()), 0);
+        EXPECT_EQ(engine.unregisterLocalMemory(buffer.data()), 0);
+        EXPECT_EQ(engine.freeEngine(), 0);
+        EXPECT_TRUE(engine.getMetadataConnectionString().empty());
+    }
+    TransferEngine five(true);
+    ASSERT_EQ(five.init(P2PHANDSHAKE, "qos-five", "", 0, "tcp"), 0);
+    EXPECT_EQ(five.getMetadataConnectionString(), P2PHANDSHAKE);
+    ScopedEnvVar four_tcp("MC_FORCE_TCP", "1");
+    TransferEngine four(true), defaults(true);
+    ASSERT_EQ(four.init(P2PHANDSHAKE, "qos-four", "", 0), 0);
+    ASSERT_EQ(defaults.init(P2PHANDSHAKE, "qos-defaults"), 0);
+    EXPECT_EQ(four.getMetadataConnectionString(), P2PHANDSHAKE);
+    EXPECT_EQ(defaults.getMetadataConnectionString(), P2PHANDSHAKE);
 }
 
 TEST(TransferEngineTentCompatibilityTest, CheckSegmentStatusRejectsDeadPeer) {

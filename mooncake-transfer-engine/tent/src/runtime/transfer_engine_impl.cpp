@@ -101,6 +101,7 @@ struct PreservedTentConfigOverrides {
     std::optional<bool> ascend_agent_mode;
     std::optional<bool> ascend_store_te_init;
     std::optional<bool> ascend_fabric_mem;
+    std::optional<std::string> ascend_resource_config;
 };
 
 template <typename T>
@@ -233,6 +234,9 @@ PreservedTentConfigOverrides captureExplicitTransferEngineConfig(
         config, "transports/ascend_direct/store_te_init", false);
     preserved.ascend_fabric_mem = captureExplicitConfigValue(
         config, "transports/ascend_direct/fabric_mem", false);
+    preserved.ascend_resource_config = captureExplicitConfigValue(
+        config, "transports/ascend_direct/global_resource_config",
+        std::string());
     return preserved;
 }
 
@@ -267,6 +271,10 @@ void restoreExplicitTransferEngineConfig(
                                preserved.ascend_store_te_init);
     restoreExplicitConfigValue(config, "transports/ascend_direct/fabric_mem",
                                preserved.ascend_fabric_mem);
+    // MC_TENT_CONF supplies defaults, but must not overwrite a lane's QoS.
+    restoreExplicitConfigValue(
+        config, "transports/ascend_direct/global_resource_config",
+        preserved.ascend_resource_config);
 }
 
 TransferEngineImpl::TransferEngineImpl()

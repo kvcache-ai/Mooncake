@@ -48,6 +48,7 @@ class TransferExecutorBase {
     };
 
     struct InitParams {
+        std::string resource_config;
         std::shared_ptr<TransferMetadata> metadata;
         std::vector<std::string> local_adxl_engine_names;
         std::vector<aclrtContext> local_engine_contexts;

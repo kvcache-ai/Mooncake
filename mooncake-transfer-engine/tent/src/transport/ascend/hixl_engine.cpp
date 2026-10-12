@@ -23,6 +23,11 @@
 #include "tent/common/status.h"
 #include "tent/transport/ascend/resource_config.h"
 
+extern "C" uint64_t mc_qos_audit_begin(int) __attribute__((weak));
+extern "C" void mc_qos_audit_desc(uint64_t, uint64_t, uint64_t, uint64_t)
+    __attribute__((weak));
+extern "C" void mc_qos_audit_end(uint64_t, int) __attribute__((weak));
+
 namespace mooncake {
 namespace tent {
 namespace {
@@ -71,10 +76,20 @@ class RealHixlVendor final : public HixlEngine::Vendor {
             op_descs.push_back(op);
         }
         hixl::TransferReq handle = nullptr;
+        uint64_t audit_id = 0;
+        if (mc_qos_audit_begin && mc_qos_audit_desc && mc_qos_audit_end) {
+            audit_id = mc_qos_audit_begin(write ? 1 : 0);
+            for (const auto& desc : descs) {
+                mc_qos_audit_desc(audit_id, desc.local_addr, desc.remote_addr,
+                                  desc.len);
+            }
+        }
         auto status =
             hixl_.TransferAsync(hixl::AscendString(remote.c_str()),
                                 write ? hixl::WRITE : hixl::READ, op_descs,
                                 hixl::TransferArgs(), handle);
+        // This event records submission return, not asynchronous completion.
+        if (audit_id) mc_qos_audit_end(audit_id, static_cast<int>(status));
         req = handle;
         return status;
     }

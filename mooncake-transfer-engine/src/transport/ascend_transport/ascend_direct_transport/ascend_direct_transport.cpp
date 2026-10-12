@@ -98,7 +98,8 @@ void InitializeSlice(const Transport::TransferRequest &request,
 
 }  // namespace
 
-AscendDirectTransport::AscendDirectTransport() = default;
+AscendDirectTransport::AscendDirectTransport(const std::string &resource_config)
+    : resource_config_(resource_config) {}
 
 AscendDirectTransport::~AscendDirectTransport() {
     LOG(INFO) << "AscendDirectTransport destructor called";
@@ -138,6 +139,7 @@ int AscendDirectTransport::install(std::string &local_server_name,
     }
 
     TransferExecutorBase::InitParams exec_params;
+    exec_params.resource_config = resource_config_;
     exec_params.metadata = metadata_;
     exec_params.local_engine_contexts = local_engine_contexts_;
     exec_params.agent_mode = agent_mode_;

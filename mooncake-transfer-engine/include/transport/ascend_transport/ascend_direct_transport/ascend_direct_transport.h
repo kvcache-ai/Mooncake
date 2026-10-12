@@ -37,7 +37,7 @@ class AscendDirectTransport : public Transport {
     using SegmentDesc = TransferMetadata::SegmentDesc;
 
    public:
-    AscendDirectTransport();
+    explicit AscendDirectTransport(const std::string &resource_config = "");
 
     ~AscendDirectTransport() override;
 
@@ -70,6 +70,7 @@ class AscendDirectTransport : public Transport {
         const std::vector<void *> &addr_list) override;
 
    private:
+    const std::string resource_config_;
     int allocateLocalSegmentID();
 
     // Add one engine to segment desc
