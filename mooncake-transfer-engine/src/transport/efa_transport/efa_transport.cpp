@@ -133,6 +133,12 @@ int EfaTransport::install(std::string& local_server_name,
     local_server_name_ = local_server_name;
     local_topology_ = topo;
 
+    std::string fabric_error;
+    if (!loadLibfabric(&fabric_error)) {
+        LOG(ERROR) << "EfaTransport: " << fabric_error;
+        return ERR_CONTEXT;
+    }
+
     auto ret = initializeEfaResources();
     if (ret) {
         LOG(ERROR) << "EfaTransport: cannot initialize EFA resources";
