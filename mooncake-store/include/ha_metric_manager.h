@@ -23,7 +23,10 @@ namespace mooncake {
  * - Standby replication lag
  * - Error counters (checksum failures, skipped entries)
  * - Performance histograms (etcd write latency)
- * - Queue sizes (pending mutations)
+ *
+ * Writer-side queue depth and retry counters live in the batch-record metric
+ * family and the writer runtime snapshot below; this class deliberately does
+ * not expose a second, differently-defined copy of those numbers.
  */
 class HAMetricManager {
    public:
@@ -155,39 +158,25 @@ class HAMetricManager {
     // ========== OpLog Sequence Metrics (Gauge) ==========
 
     /**
-     * @brief Set the latest OpLog sequence ID on Primary
-     */
-    void set_oplog_last_sequence_id(int64_t seq_id);
-    int64_t get_oplog_last_sequence_id();
-
-    /**
      * @brief Set the Standby's applied sequence ID
      */
     void set_oplog_applied_sequence_id(int64_t seq_id);
     int64_t get_oplog_applied_sequence_id();
 
     /**
-     * @brief Set the replication lag (entries behind Primary)
+     * @brief Set the replication lag (entries behind Primary).
+     *
+     * Published by HotStandbyService::ReplicationLoop from the same
+     * primary/applied pair that GetSyncStatus() reports as lag_entries.
      */
     void set_oplog_standby_lag(int64_t lag);
     int64_t get_oplog_standby_lag();
 
-    /**
-     * @brief Set the number of pending (out-of-order) entries in OpLogApplier
-     */
-    void set_oplog_pending_entries(int64_t count);
-    int64_t get_oplog_pending_entries();
-
-    /**
-     * @brief Set the pending mutation queue size (retry queue)
-     */
-    void set_pending_mutation_queue_size(int64_t size);
-    int64_t get_pending_mutation_queue_size();
-
     // ========== Error Counters ==========
 
     /**
-     * @brief Increment counter for skipped OpLog entries
+     * @brief Increment counter for OpLog entries skipped because they were
+     * already applied (duplicate or out-of-order redelivery)
      */
     void inc_oplog_skipped_entries(int64_t val = 1);
     int64_t get_oplog_skipped_entries_total();
@@ -197,30 +186,6 @@ class HAMetricManager {
      */
     void inc_oplog_checksum_failures(int64_t val = 1);
     int64_t get_oplog_checksum_failures_total();
-
-    /**
-     * @brief Increment counter for gap resolve attempts
-     */
-    void inc_oplog_gap_resolve_attempts(int64_t val = 1);
-    int64_t get_oplog_gap_resolve_attempts_total();
-
-    /**
-     * @brief Increment counter for successful gap resolves
-     */
-    void inc_oplog_gap_resolve_success(int64_t val = 1);
-    int64_t get_oplog_gap_resolve_success_total();
-
-    /**
-     * @brief Increment counter for etcd write failures
-     */
-    void inc_oplog_etcd_write_failures(int64_t val = 1);
-    int64_t get_oplog_etcd_write_failures_total();
-
-    /**
-     * @brief Increment counter for etcd write retries
-     */
-    void inc_oplog_etcd_write_retries(int64_t val = 1);
-    int64_t get_oplog_etcd_write_retries_total();
 
     /**
      * @brief Increment counter for watch disconnections
@@ -233,13 +198,6 @@ class HAMetricManager {
      */
     void inc_oplog_applied_entries(int64_t val = 1);
     int64_t get_oplog_applied_entries_total();
-
-    /**
-     * @brief Increment counter for dropped PUT_END operations (late arrival
-     * after skip)
-     */
-    void inc_oplog_dropped_put_end(int64_t val = 1);
-    int64_t get_oplog_dropped_put_end_total();
 
     /**
      * @brief Increase the total number of OpLog batch commits (Group Commit)
@@ -327,22 +285,14 @@ class HAMetricManager {
     // --- Metric Members ---
 
     // OpLog Sequence Gauges
-    ylt::metric::gauge_t oplog_last_sequence_id_;
     ylt::metric::gauge_t oplog_applied_sequence_id_;
     ylt::metric::gauge_t oplog_standby_lag_;
-    ylt::metric::gauge_t oplog_pending_entries_;
-    ylt::metric::gauge_t pending_mutation_queue_size_;
 
     // Error Counters
     ylt::metric::counter_t oplog_skipped_entries_total_;
     ylt::metric::counter_t oplog_checksum_failures_total_;
-    ylt::metric::counter_t oplog_gap_resolve_attempts_total_;
-    ylt::metric::counter_t oplog_gap_resolve_success_total_;
-    ylt::metric::counter_t oplog_etcd_write_failures_total_;
-    ylt::metric::counter_t oplog_etcd_write_retries_total_;
     ylt::metric::counter_t oplog_watch_disconnections_total_;
     ylt::metric::counter_t oplog_applied_entries_total_;
-    ylt::metric::counter_t oplog_dropped_put_end_total_;
     ylt::metric::counter_t oplog_batch_commits_total_;
     ylt::metric::counter_t oplog_sync_batch_commits_total_;
 

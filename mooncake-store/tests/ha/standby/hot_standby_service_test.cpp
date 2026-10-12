@@ -1023,6 +1023,10 @@ TEST_F(HotStandbyServiceTest, TestReplicationLoop_UpdatesMetrics) {
                                     std::memory_order_relaxed);
         });
 
+    // Sentinel: the replication loop publishes lag on every poll, so an
+    // orphaned gauge would leave this value in place.
+    HAMetricManager::instance().set_oplog_standby_lag(999);
+
     ASSERT_EQ(ErrorCode::OK,
               service_->Start("primary", oplog_endpoints_, cluster_id_));
     ASSERT_TRUE(WaitForAppliedSequence(*service_, 1));
@@ -1032,6 +1036,13 @@ TEST_F(HotStandbyServiceTest, TestReplicationLoop_UpdatesMetrics) {
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
     EXPECT_GE(observed_applied->load(), 1u);
+    // Single one-entry batch: primary and applied converge to 1, so lag is 0.
+    for (int i = 0;
+         i < 200 && HAMetricManager::instance().get_oplog_standby_lag() != 0;
+         ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    EXPECT_EQ(0, HAMetricManager::instance().get_oplog_standby_lag());
     service_->Stop();
     service_->SetSyncStatusCallback({});
     EXPECT_EQ(StandbyState::STOPPED, service_->GetState());
