@@ -4320,6 +4320,10 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
     const auto prev_standby_memory_segments = standby_memory_segments_;
     const auto prev_standby_allocator_keepalive = standby_allocator_keepalive_;
     const auto prev_invalid_replica_endpoints = invalid_replica_endpoints_;
+    const auto prev_standby_nof_allocator_keepalive =
+        standby_nof_allocator_keepalive_;
+    const auto prev_invalid_nof_replica_endpoints =
+        invalid_nof_replica_endpoints_;
 
     // A failed restore leaves nothing behind: installed keys go back out
     // through the canonical removal, bookkeeping returns to its pre-restore
@@ -4343,6 +4347,8 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
         standby_memory_segments_ = prev_standby_memory_segments;
         standby_allocator_keepalive_ = prev_standby_allocator_keepalive;
         invalid_replica_endpoints_ = prev_invalid_replica_endpoints;
+        standby_nof_allocator_keepalive_ = prev_standby_nof_allocator_keepalive;
+        invalid_nof_replica_endpoints_ = prev_invalid_nof_replica_endpoints;
         for (const auto& [client_id, record] : new_known_owner_records) {
             client_liveness_records_.erase(client_id);
             MasterMetricManager::instance().on_client_liveness_record_removed(

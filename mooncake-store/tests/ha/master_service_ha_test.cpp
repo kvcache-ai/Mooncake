@@ -913,8 +913,8 @@ class MasterServiceHATest : public ::testing::Test {
     static bool HasInvalidNoFHandleForTesting(MasterService& service,
                                               const TenantId& tenant_id,
                                               const std::string& key) {
-        MasterService::MetadataAccessorRO accessor(
-            &service, MasterService::ObjectIdentity{tenant_id, key});
+        MasterServiceTestPeer::MetadataAccessorRO accessor(
+            &service, MasterServiceTestPeer::ObjectIdentity{tenant_id, key});
         if (!accessor.Exists()) {
             return true;
         }
@@ -1378,8 +1378,9 @@ TEST_F(MasterServiceHATest, NoFBatchEvictSkipsQuarantinedReplicas) {
     // unreferenced, so without the quarantine check eviction would take it
     // and the descriptor a later import needs would be gone.
     std::this_thread::sleep_for(std::chrono::milliseconds(60));
-    service.RunNoFBatchEvictForTesting(/*evict_ratio_target=*/1.0,
-                                       /*evict_ratio_lowerbound=*/1.0);
+    MasterServiceTestPeer(service).RunNoFBatchEvictForTesting(
+        /*evict_ratio_target=*/1.0,
+        /*evict_ratio_lowerbound=*/1.0);
 
     EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant, key), 1);
     auto replicas = ReplicaDescriptorsForTesting(service, kDefaultTenant, key);
