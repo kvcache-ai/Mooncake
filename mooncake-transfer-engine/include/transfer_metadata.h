@@ -55,6 +55,27 @@ enum class GetResult {
 
 #define P2PHANDSHAKE "P2PHANDSHAKE"
 
+// Classification of a metadata-server connection string. P2PHANDSHAKE peers
+// exchange segment descriptors directly over their TE RPC ports and never
+// publish to a shared backend, so mixing the two classes is broken in both
+// directions (issue #4536). Used by the store to reject mixed-mode
+// deployments at setup() time instead of failing silently at transfer time.
+enum class MetadataServerClass {
+    kP2PHandshake,
+    kSharedBackend,
+};
+
+inline MetadataServerClass ClassifyMetadataServer(
+    const std::string &conn_string) {
+    return conn_string == P2PHANDSHAKE ? MetadataServerClass::kP2PHandshake
+                                       : MetadataServerClass::kSharedBackend;
+}
+
+inline const char *MetadataServerClassName(MetadataServerClass c) {
+    return c == MetadataServerClass::kP2PHandshake ? "P2PHANDSHAKE"
+                                                   : "shared backend";
+}
+
 class TransferMetadata {
    public:
     struct DeviceDesc {

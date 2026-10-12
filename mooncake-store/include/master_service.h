@@ -2206,6 +2206,9 @@ class MasterService {
     // storage backend eviction configuration
     const bool enable_disk_eviction_;
     const uint64_t quota_bytes_;
+    // TE metadata backend advertised to clients via GetStorageConfig
+    // (issue #4536): "P2PHANDSHAKE" or a shared-backend URL. Empty = unset.
+    const std::string te_metadata_server_;
     const bool enable_multi_tenants_;
     TenantQuotaManager tenant_quota_manager_{
         [this] { return GetTenantQuotaAllocatableCapacityBytes(); }};

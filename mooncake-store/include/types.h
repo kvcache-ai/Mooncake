@@ -314,6 +314,9 @@ enum class ErrorCode : int32_t {
     // Parameter errors (Range: -600 to -699)
     INVALID_PARAMS = -600,  ///< Invalid parameters.
     ILLEGAL_CLIENT = -601,  ///< Illegal client to do the operation.
+    /// Client metadata backend class (P2P vs shared) conflicts with the
+    /// master-advertised backend (issue #4536).
+    METADATA_BACKEND_MISMATCH = -602,
 
     // Engine operation errors (Range: -700 to -799)
     INVALID_WRITE = -700,    ///< Invalid write operation.

@@ -1050,12 +1050,91 @@ std::optional<std::shared_ptr<Client>> Client::Create(
     std::map<std::string, std::string> labels, const std::string& tenant_id) {
     // Reused engines retain their metadata mode. In particular, P2PHANDSHAKE
     // must publish the engine's actual endpoint rather than the Store hostname.
-    const auto& resolved_metadata =
-        transfer_engine && metadata_connstring.empty()
-            ? transfer_engine->getMetadataConnectionString()
-            : metadata_connstring;
+    const bool inherit_from_engine =
+        transfer_engine && metadata_connstring.empty();
+    const std::string resolved_metadata =
+        inherit_from_engine ? transfer_engine->getMetadataConnectionString()
+                            : metadata_connstring;
+
+    // Resolve the effective TE metadata backend (issue #4536) before
+    // constructing the Client: the master owns the cluster-wide backend, so
+    // the advertised value decides what an empty client value inherits. A
+    // probe MasterClient is used because the Client's own master_client_ is
+    // not connected yet; Client::ConnectToMaster re-establishes the full
+    // connection (including HA leader discovery) afterwards.
+    std::string effective_metadata = resolved_metadata;
+    {
+        std::string advertised;
+        MasterClient probe_master_client(generate_uuid(), nullptr, tenant_id);
+        ErrorCode probe_err = ErrorCode::OK;
+        if (master_server_entry.empty() || master_server_entry == "auto") {
+            // No master to consult (embedded/standalone setups); keep the
+            // client value as-is.
+            probe_err = ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+        } else {
+            probe_err = probe_master_client.Connect(master_server_entry);
+        }
+        if (probe_err == ErrorCode::OK) {
+            auto config_response = probe_master_client.GetStorageConfig();
+            if (config_response) {
+                advertised = config_response.value().te_metadata_server.value();
+            } else {
+                // Old master without the compatible field: treated as
+                // unset below, which preserves today's behavior.
+                advertised.clear();
+            }
+        } else if (effective_metadata.empty() && !inherit_from_engine) {
+            // An explicitly empty metadata_server with a separately deployed
+            // master has no other source to inherit from: the master is the
+            // single source of truth and it is unreachable, so fail fast
+            // instead of retrying port binding until INTERNAL_ERROR.
+            LOG(ERROR)
+                << "metadata_server is empty and the master ("
+                << master_server_entry
+                << ") could not be consulted for its advertised TE metadata "
+                   "backend. Configure metadata_server on the client or "
+                   "--te_metadata_server on the master (issue #4536).";
+            return std::nullopt;
+        }
+        if (!advertised.empty()) {
+            if (effective_metadata.empty()) {
+                LOG(INFO) << "metadata_server not configured; inheriting "
+                             "master-advertised TE metadata backend: "
+                          << advertised;
+                effective_metadata = advertised;
+            } else if (ClassifyMetadataServer(effective_metadata) !=
+                       ClassifyMetadataServer(advertised)) {
+                // Never enforce when the master does not advertise a
+                // backend: mixed old/new binaries during a rolling upgrade
+                // must keep working.
+                LOG(ERROR)
+                    << "TE metadata backend mismatch: client uses '"
+                    << effective_metadata << "' ("
+                    << MetadataServerClassName(
+                           ClassifyMetadataServer(effective_metadata))
+                    << ") but the master advertises '" << advertised << "' ("
+                    << MetadataServerClassName(
+                           ClassifyMetadataServer(advertised))
+                    << "). Configure every node with the same backend (issue "
+                       "#4536).";
+                return std::nullopt;
+            }
+        } else if (effective_metadata.empty() && !inherit_from_engine) {
+            // The master is reachable but advertises no backend: an empty
+            // client value has nothing to inherit and no explicit backend to
+            // use, so the transfer engine would come up with no metadata
+            // backend at all.
+            LOG(ERROR)
+                << "metadata_server is empty and the master advertises no "
+                   "TE metadata backend. Configure metadata_server on the "
+                   "client or --te_metadata_server on the master (issue "
+                   "#4536).";
+            return std::nullopt;
+        }
+    }
+
     auto client = std::shared_ptr<Client>(new Client(
-        local_hostname, resolved_metadata, protocol, labels, tenant_id));
+        local_hostname, effective_metadata, protocol, labels, tenant_id));
 
     ErrorCode err = client->ConnectToMaster(master_server_entry);
     if (err != ErrorCode::OK) {
@@ -1142,7 +1221,9 @@ std::optional<std::shared_ptr<Client>> Client::Create(
     // Initialize transfer engine
     if (transfer_engine == nullptr) {
         client->transfer_engine_ = std::make_shared<TransferEngine>();
-        err = client->InitTransferEngine(local_hostname, metadata_connstring,
+        // Use the effective metadata backend (possibly inherited from the
+        // master) rather than the raw user input.
+        err = client->InitTransferEngine(local_hostname, effective_metadata,
                                          protocol, device_names);
         if (err != ErrorCode::OK) {
             LOG(ERROR) << "Failed to initialize transfer engine";

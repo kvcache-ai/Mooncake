@@ -996,9 +996,15 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         }
     } else if (resolved_metadata_server.empty() && !transfer_engine) {
         // An existing transfer engine already owns its metadata connection;
-        // Client::Create reuses it without initialization.
-        LOG(ERROR) << "metadata_server is empty";
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        // Client::Create reuses it without initialization. Otherwise an empty
+        // metadata_server defers to the master: Client::Create inherits the
+        // master-advertised backend via GetStorageConfig (issue #4536). But
+        // with no master address to consult either, there is no source left.
+        if (resolved_master_server_addr.empty()) {
+            LOG(ERROR) << "metadata_server is empty and no master address is "
+                          "configured to inherit the backend from";
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
     }
 
     // Check if hostname already contains a port
