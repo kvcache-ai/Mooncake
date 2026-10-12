@@ -7804,35 +7804,24 @@ RealClient::batch_get_into_multi_buffers_internal(
         if (get_wait && best_replica->is_local_disk_replica()) {
             const int64_t remaining =
                 get_wait_deadline - PrefetchThrottle::NowMs();
-            bool waited = false;
+            auto outcome = SsdPrefetcher::WaitOutcome::kSkipped;
             if (remaining > 0) {
-                waited = true;
-                if (auto waited_qr =
-                        prefetcher_->WaitIfPromotionInFlight(key, remaining);
-                    waited_qr.has_value()) {
-                    const auto *promoted =
-                        SelectBestReplica(waited_qr->replicas, local_endpoints);
-                    if (promoted != nullptr && promoted->is_memory_replica()) {
-                        refreshed_qr.emplace(*waited_qr);
-                    }
-                }
+                outcome = prefetcher_->WaitIfPromotionInFlight(key, remaining);
             }
-            if (waited && !refreshed_qr.has_value()) {
-                // The wait missed and the deadline is capped by this batch's
-                // lease floor, so the original query's lease is nearly spent;
-                // the SSD fallback transfer would fail the post-transfer
-                // lease check. Re-query with a fresh lease before falling
-                // back — the promotion may also have completed meanwhile.
+            // After an actual wait (completed, failed, or timed out) the
+            // original query is stale: the lease is nearly spent (the
+            // deadline is capped by it), and a completed promotion means a
+            // fresh MEMORY replica to pick up. Re-query once with a fresh
+            // lease; skipped keys keep the original result untouched.
+            if (outcome != SsdPrefetcher::WaitOutcome::kSkipped) {
                 if (auto fresh = client_->Query(key);
                     fresh && !fresh->replicas.empty()) {
                     refreshed_qr.emplace(std::move(*fresh));
-                }
-            }
-            if (refreshed_qr.has_value()) {
-                const auto *best =
-                    SelectBestReplica(refreshed_qr->replicas, local_endpoints);
-                if (best != nullptr) {
-                    best_replica = best;
+                    const auto *best = SelectBestReplica(refreshed_qr->replicas,
+                                                         local_endpoints);
+                    if (best != nullptr) {
+                        best_replica = best;
+                    }
                 }
             }
         }

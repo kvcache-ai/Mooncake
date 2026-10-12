@@ -67,18 +67,25 @@ class SsdPrefetcher {
                           const std::vector<int64_t>& sizes,
                           const std::string& tenant_id);
 
+    // get()-side wait outcome for one key.
+    enum class WaitOutcome {
+        kSkipped,    // nothing live to wait for (also: wait disabled)
+        kCompleted,  // a local promotion completed (already, or in-budget)
+        kFailed,     // the local promotion failed terminally
+        kTimedOut,   // still in flight when the batch budget ran out
+    };
+
     // get()-side wait, only meaningful with ssd_get_wait_ms > 0 and a
-    // LOCAL_DISK best replica. Returns a refreshed QueryResult only when a
-    // COMPLETE MEMORY replica is observed; std::nullopt otherwise (callers
-    // fall back to the SSD read with no further delay).
+    // LOCAL_DISK best replica. Waits only on a live local promotion
+    // (kInFlight, or kCompleted already); kTriggered / kFailed /
+    // kAlreadyResident / delegated keys are skipped. Pure throttle read +
+    // bounded wait: no RPC of any kind. The caller owns any metadata refresh
+    // for the key afterwards.
     //
     // budget_ms is the remaining *batch* budget (one deadline for the whole
-    // get), not a fresh per-key timeout. Never waits without evidence of an
-    // in-flight promotion: a local throttle record that is still live, or a
-    // read-only re-query showing a PROCESSING MEMORY replica. Fail / already
-    // resident / delegated keys return immediately.
-    std::optional<QueryResult> WaitIfPromotionInFlight(const std::string& key,
-                                                       int64_t budget_ms);
+    // get), not a fresh per-key timeout.
+    WaitOutcome WaitIfPromotionInFlight(const std::string& key,
+                                        int64_t budget_ms);
 
    private:
     // Submit to the bounded pool; drop the job when the pool is unavailable

@@ -2,6 +2,7 @@
 // backoff, memory-pressure cooldown, and concurrent reserve uniqueness.
 
 #include "prefetch_throttle.h"
+#include "ssd_prefetcher.h"
 
 #include <gtest/gtest.h>
 
@@ -191,6 +192,57 @@ TEST(PrefetchThrottleTest, ConcurrentReserveGrantsEachKeyOnce) {
         thread.join();
     }
     EXPECT_EQ(total_reserved.load(), keys.size());
+}
+
+TEST(PrefetchThrottleTest, WaitOutcomeReflectsPromotionState) {
+    SsdPrefetcher prefetcher;
+    prefetcher.Init(std::weak_ptr<Client>(), std::weak_ptr<FileStorage>(),
+                    std::weak_ptr<ClientRequester>(), "", 1000);
+    auto throttle = prefetcher.throttle();
+    throttle->configure(1, 30);
+
+    // No record at all: skipped.
+    EXPECT_EQ(prefetcher.WaitIfPromotionInFlight("none", 100),
+              SsdPrefetcher::WaitOutcome::kSkipped);
+    // kTriggered (pool job still queued): never waited on.
+    throttle->reserve({"queued"});
+    EXPECT_EQ(prefetcher.WaitIfPromotionInFlight("queued", 100),
+              SsdPrefetcher::WaitOutcome::kSkipped);
+    // kFailed / kDelegated: terminal, skipped.
+    throttle->reserve({"failed"});
+    throttle->markFailed("failed");
+    EXPECT_EQ(prefetcher.WaitIfPromotionInFlight("failed", 100),
+              SsdPrefetcher::WaitOutcome::kSkipped);
+    // Already completed: immediate, no wait.
+    throttle->reserve({"done"});
+    throttle->markCompleted("done");
+    EXPECT_EQ(prefetcher.WaitIfPromotionInFlight("done", 100),
+              SsdPrefetcher::WaitOutcome::kCompleted);
+    // In-flight, completes during the wait.
+    throttle->reserve({"live"});
+    throttle->markInFlight("live");
+    std::thread finisher([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        throttle->markCompleted("live");
+    });
+    EXPECT_EQ(prefetcher.WaitIfPromotionInFlight("live", 2000),
+              SsdPrefetcher::WaitOutcome::kCompleted);
+    finisher.join();
+    // Still in flight when the budget runs out.
+    throttle->reserve({"slow"});
+    throttle->markInFlight("slow");
+    EXPECT_EQ(prefetcher.WaitIfPromotionInFlight("slow", 30),
+              SsdPrefetcher::WaitOutcome::kTimedOut);
+    // Fails during the wait.
+    throttle->reserve({"bad"});
+    throttle->markInFlight("bad");
+    std::thread breaker([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        throttle->markFailed("bad");
+    });
+    EXPECT_EQ(prefetcher.WaitIfPromotionInFlight("bad", 2000),
+              SsdPrefetcher::WaitOutcome::kFailed);
+    breaker.join();
 }
 
 TEST(PrefetchThrottleTest, GetWaitDeadlineCappedByBatchLeaseFloor) {

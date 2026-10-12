@@ -352,63 +352,29 @@ void SsdPrefetcher::RunLocalPrefetch(const std::vector<std::string>& keys,
     });
 }
 
-std::optional<QueryResult> SsdPrefetcher::WaitIfPromotionInFlight(
+SsdPrefetcher::WaitOutcome SsdPrefetcher::WaitIfPromotionInFlight(
     const std::string& key, int64_t budget_ms) {
     if (budget_ms <= 0 || !initialized_.load()) {
-        return std::nullopt;
-    }
-    auto client = client_.lock();
-    if (!client) {
-        return std::nullopt;
+        return WaitOutcome::kSkipped;
     }
     auto throttle = throttle_;
-
-    // Returns the refreshed QueryResult iff a COMPLETE MEMORY replica shows.
-    // The caller starts a data transfer from the returned descriptor, and
-    // BatchGet rejects transfers whose read lease has expired — a
-    // QueryReadOnly result (lease_ttl_ms forced to 0 by design) would
-    // deterministically turn a successful wait into LEASE_EXPIRED (see the
-    // warning on QueryReadOnly). So the result handed back must come from a
-    // lease-granting Query().
-    auto requery_memory_leased = [&]() -> std::optional<QueryResult> {
-        auto qr = client->Query(key);
-        if (!qr) {
-            return std::nullopt;
-        }
-        const bool has_memory =
-            std::any_of(qr->replicas.begin(), qr->replicas.end(),
-                        [](const Replica::Descriptor& replica) {
-                            return replica.is_memory_replica() &&
-                                   replica.status == ReplicaStatus::COMPLETE;
-                        });
-        if (!has_memory) {
-            return std::nullopt;
-        }
-        return std::optional<QueryResult>(*qr);
-    };
-
-    if (throttle->triggeredAt(key) >= 0) {
-        // Only wait for a promotion that has actually started. kTriggered
-        // means the pool job is still queued; waiting it burns the batch
-        // budget and is what produced the 70s+ p99 in v2.
-        const auto st = throttle->stateOf(key);
-        if (st == PrefetchThrottle::State::kCompleted) {
-            return requery_memory_leased();
-        }
-        if (st == PrefetchThrottle::State::kInFlight) {
-            throttle->waitForCompletion(key, budget_ms, /*poll_ms=*/1);
-            return requery_memory_leased();
-        }
-        return requery_memory_leased();
+    if (throttle->triggeredAt(key) < 0) {
+        return WaitOutcome::kSkipped;
     }
-
-    // The key is unknown to the local throttle: no live local promotion, so
-    // there is nothing to wait for. Promotions started by other processes
-    // are intentionally not waited on — client-visible replica queries
-    // filter out non-COMPLETE replicas (TryGetReadableReplicaDescriptor), so
-    // a PROCESSING MEMORY replica staged by another process can never be
-    // observed here. Fall through to the SSD read at once.
-    return std::nullopt;
+    const auto st = throttle->stateOf(key);
+    if (st == PrefetchThrottle::State::kCompleted) {
+        return WaitOutcome::kCompleted;
+    }
+    if (st != PrefetchThrottle::State::kInFlight) {
+        // kTriggered (job still queued) / kFailed / kAlreadyResident /
+        // kDelegated: nothing live to wait on.
+        return WaitOutcome::kSkipped;
+    }
+    if (throttle->waitForCompletion(key, budget_ms, /*poll_ms=*/1)) {
+        return WaitOutcome::kCompleted;
+    }
+    return throttle->stateOf(key) == PrefetchThrottle::State::kFailed
+               ? WaitOutcome::kFailed
+               : WaitOutcome::kTimedOut;
 }
-
 }  // namespace mooncake
