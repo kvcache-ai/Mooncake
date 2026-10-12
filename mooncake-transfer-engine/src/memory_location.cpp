@@ -53,6 +53,18 @@ size_t detectBufferPageSize(void *addr) {
     return fallback;
 }
 
+// Parses a smaps VMA header ("start-end perms ..."). Field lines can start
+// with a hex digit too (e.g. "AnonHugePages:"), so a leading hex digit alone
+// does not identify a header.
+static bool parseVmaHeader(const std::string &line, unsigned long *start,
+                           unsigned long *end) {
+    char dash = 0;
+    return !line.empty() &&
+           std::isxdigit(static_cast<unsigned char>(line[0])) &&
+           std::sscanf(line.c_str(), "%lx%c%lx", start, &dash, end) == 3 &&
+           dash == '-';
+}
+
 bool hasHugepageAdvice(void *addr) {
     std::ifstream smaps("/proc/self/smaps");
     if (!smaps.is_open()) return false;
@@ -62,12 +74,9 @@ bool hasHugepageAdvice(void *addr) {
     bool in_range = false;
 
     while (std::getline(smaps, line)) {
-        if (!line.empty() &&
-            std::isxdigit(static_cast<unsigned char>(line[0]))) {
-            unsigned long start = 0, end = 0;
-            if (std::sscanf(line.c_str(), "%lx-%lx", &start, &end) == 2) {
-                in_range = target >= start && target < end;
-            }
+        unsigned long start = 0, end = 0;
+        if (parseVmaHeader(line, &start, &end)) {
+            in_range = target >= start && target < end;
         } else if (in_range && line.compare(0, 8, "VmFlags:") == 0) {
             // Two-letter flags separated by spaces; "hg" is MADV_HUGEPAGE.
             return (line + " ").find(" hg ") != std::string::npos;
@@ -88,16 +97,13 @@ bool isThpBacked(void *addr, size_t length) {
     long rss_kb = -1;
 
     while (std::getline(smaps, line)) {
-        if (!line.empty() &&
-            std::isxdigit(static_cast<unsigned char>(line[0]))) {
-            unsigned long start = 0, end = 0;
-            if (std::sscanf(line.c_str(), "%lx-%lx", &start, &end) == 2) {
-                overlaps = start < finish && end > begin;
-                if (overlaps)
-                    covered += std::min<uintptr_t>(end, finish) -
-                               std::max<uintptr_t>(start, begin);
-                rss_kb = -1;
-            }
+        unsigned long start = 0, end = 0;
+        if (parseVmaHeader(line, &start, &end)) {
+            overlaps = start < finish && end > begin;
+            if (overlaps)
+                covered += std::min<uintptr_t>(end, finish) -
+                           std::max<uintptr_t>(start, begin);
+            rss_kb = -1;
         } else if (overlaps && line.compare(0, 4, "Rss:") == 0) {
             if (std::sscanf(line.c_str(), "Rss: %ld kB", &rss_kb) != 1)
                 return false;

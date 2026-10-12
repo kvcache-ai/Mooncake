@@ -93,12 +93,14 @@ class EfaTransport : public Transport {
     int warmupSegment(const std::string& segment_name);
 
    private:
-    // Internal version with force_sequential option to avoid nested parallelism
+    // Internal version with force_sequential option to avoid nested
+    // parallelism. thp_fallback retries an already pre-touched THP buffer with
+    // the 4KB PTE budget after the 2MB-budget registration failed.
     int registerLocalMemoryInternal(void* addr, size_t length,
                                     const std::string& location,
                                     bool remote_accessible,
-                                    bool update_metadata,
-                                    bool force_sequential);
+                                    bool update_metadata, bool force_sequential,
+                                    bool thp_fallback = false);
 
     int unregisterLocalMemoryInternal(void* addr, bool update_metadata,
                                       bool force_sequential);

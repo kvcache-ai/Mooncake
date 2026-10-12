@@ -216,11 +216,9 @@ int EfaTransport::registerLocalMemory(void* addr, size_t length,
                                        update_metadata, false);
 }
 
-int EfaTransport::registerLocalMemoryInternal(void* addr, size_t length,
-                                              const std::string& name,
-                                              bool remote_accessible,
-                                              bool update_metadata,
-                                              bool force_sequential) {
+int EfaTransport::registerLocalMemoryInternal(
+    void* addr, size_t length, const std::string& name, bool remote_accessible,
+    bool update_metadata, bool force_sequential, bool thp_fallback) {
     (void)remote_accessible;
     const int kBaseAccessRights = IBV_ACCESS_LOCAL_WRITE |
                                   IBV_ACCESS_REMOTE_WRITE |
@@ -242,14 +240,16 @@ int EfaTransport::registerLocalMemoryInternal(void* addr, size_t length,
     // segments), fault the buffer in now and, if THP backs all of it, budget
     // PTEs at 2MB. Otherwise a large segment is partitioned so that each chunk
     // is reachable through only one or two NICs.
-    bool pre_touched = false;
-    if (page_size < kThpPageSize && length >= kThpPageSize &&
+    bool pre_touched = thp_fallback;
+    bool thp_budget = false;
+    if (!thp_fallback && page_size < kThpPageSize && length >= kThpPageSize &&
         context_list_.size() > 1 && hasHugepageAdvice(addr)) {
         int ret = preTouchMemory(addr, length);
         if (ret != 0) return ret;
         pre_touched = true;
         if (isThpBacked(addr, length)) {
             page_size = kThpPageSize;
+            thp_budget = true;
         } else {
             LOG(INFO) << "EFA: " << addr << " (" << length
                       << " bytes) is not fully THP-backed, budgeting PTEs at "
@@ -414,6 +414,18 @@ int EfaTransport::registerLocalMemoryInternal(void* addr, size_t length,
         }
     };
 
+    // The 2MB budget registers every NIC on the whole buffer, which can fail
+    // with ENOMEM on a NIC where the 4KB partitioned plan (each NIC maps only
+    // part of the buffer) still fits. If the first chunk fails, nothing has
+    // been published to metadata yet, so retry with the partitioned plan.
+    auto retryWithoutThpBudget = [&](size_t ci) {
+        if (!thp_budget || ci != 0) return false;
+        LOG(WARNING) << "EFA: registering " << addr << " (" << length
+                     << " bytes) with the 2MB THP PTE budget failed, retrying "
+                        "with the 4KB budget";
+        return true;
+    };
+
     // Register each chunk on its assigned NICs
     for (size_t ci = 0; ci < chunks.size(); ++ci) {
         void* chunk_addr = chunks[ci].first;
@@ -469,6 +481,10 @@ int EfaTransport::registerLocalMemoryInternal(void* addr, size_t length,
                         << "Failed to register memory region chunk " << ci
                         << " with EFA context " << assigned_nics[j];
                     rollbackChunks(ci);
+                    if (retryWithoutThpBudget(ci))
+                        return registerLocalMemoryInternal(
+                            addr, length, name, remote_accessible,
+                            update_metadata, force_sequential, true);
                     return ret_codes[j];
                 }
             }
@@ -480,6 +496,10 @@ int EfaTransport::registerLocalMemoryInternal(void* addr, size_t length,
                     LOG(ERROR) << "Failed to register memory region chunk "
                                << ci << " with EFA context " << nic_idx;
                     rollbackChunks(ci);
+                    if (retryWithoutThpBudget(ci))
+                        return registerLocalMemoryInternal(
+                            addr, length, name, remote_accessible,
+                            update_metadata, force_sequential, true);
                     return ret;
                 }
             }
