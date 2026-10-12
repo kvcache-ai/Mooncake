@@ -129,13 +129,14 @@ static void nvmf_io_complete(void* ctx, const struct spdk_nvme_cpl* cpl) {
 namespace mooncake {
 namespace {
 
-// A segment owner publishes its Transfer Engine metadata only to the metadata
-// service it was started with, so a reader configured with a different one
-// (e.g. HTTP metadata vs P2PHANDSHAKE) cannot resolve the endpoint.
+// openSegment fails when the owner's segment descriptor cannot be resolved:
+// the peer is down or unreachable, its metadata entry is stale or missing, or
+// the owner published to a different metadata service than this client reads
+// (e.g. HTTP metadata vs P2PHANDSHAKE). List the causes rather than pick one.
 constexpr const char* kOpenSegmentFailureHint =
-    "; check that this client and the segment owner use the same "
-    "metadata_server (e.g. both P2PHANDSHAKE, or both the same HTTP/etcd "
-    "metadata service)";
+    "; the segment owner may be down or unreachable, or its metadata entry "
+    "stale or missing. If nodes and clients use different metadata_server "
+    "settings (e.g. P2PHANDSHAKE vs HTTP/etcd), that is a common cause";
 
 #ifdef USE_TENT
 int GetTentPositiveEnvOrDefault(const char* name, int default_value) {
