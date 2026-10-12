@@ -19,8 +19,10 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <iomanip>
 #include <memory>
 #include <unordered_map>
@@ -242,8 +244,27 @@ Status MnnvlTransport::install(std::string &local_segment_name,
 Status MnnvlTransport::uninstall() {
     if (installed_) {
         metadata_.reset();
-        // TODO close all opened entries
-        relocate_map_.clear();
+        std::vector<EntryRef> to_release;
+        {
+            RWSpinlock::WriteGuard guard(relocate_lock_);
+            for (auto &[target_id, entries] : relocate_map_) {
+                for (auto &[addr, entry] : entries) {
+                    entry->stale = true;
+                    retired_.push_back(entry);
+                }
+            }
+            relocate_map_.clear();
+            collectReleasableLocked(to_release);
+            if (!retired_.empty()) {
+                // Batches still hold pins at shutdown: a caller bug. Unmap
+                // anyway rather than leak the peer's allocations.
+                LOG(WARNING) << "MnnvlTransport: " << retired_.size()
+                             << " mapping(s) still pinned at uninstall";
+                for (auto &entry : retired_) to_release.push_back(entry);
+                retired_.clear();
+            }
+        }
+        releaseMappings(to_release);
         installed_ = false;
     }
     return Status::OK();
@@ -265,6 +286,19 @@ Status MnnvlTransport::freeSubBatch(SubBatchRef &batch) {
     auto mnnvl_batch = dynamic_cast<MnnvlSubBatch *>(batch);
     if (!mnnvl_batch)
         return Status::InvalidArgument("Invalid MNNVL sub-batch" LOC_MARK);
+    // Release the mappings the tasks pinned. A task the caller never polled
+    // to completion may still have its copy in flight; wait for it, since a
+    // retired mapping is unmapped as soon as its last pin drops.
+    cudaEvent_t synced = nullptr;  // tasks of one submit share an event
+    for (auto &task : mnnvl_batch->task_list) {
+        if (!task.mapping) continue;
+        if (task.status_word == TransferStatusEnum::PENDING &&
+            task.completion_event && task.completion_event != synced) {
+            cudaEventSynchronize(task.completion_event);
+            synced = task.completion_event;
+        }
+        unpin(task.mapping);
+    }
     // Completion events are destroyed by ~MnnvlSubBatch(), which Slab's
     // deallocate() invokes before returning the storage. Streams are
     // pool-managed and not destroyed here.
@@ -334,10 +368,18 @@ Status MnnvlTransport::submitTransferTasks(
         uint64_t target_addr = request.target_offset;
         if (request.target_id != LOCAL_SEGMENT_ID) {
             auto status = relocateSharedMemoryAddress(
-                target_addr, request.length, request.target_id);
+                target_addr, request.length, request.target_id, &task.mapping);
             if (!status.ok()) {
-                LOG(FATAL) << status;
+                // Fail closed: nothing from this submit is started. Tasks
+                // already relocated in this call hold pins; drop them.
+                LOG(ERROR) << "MnnvlTransport: cannot resolve target "
+                           << (void *)request.target_offset << " of segment "
+                           << request.target_id << ": " << status;
                 task.status_word = TransferStatusEnum::FAILED;
+                for (auto *started : new_tasks) {
+                    started->status_word = TransferStatusEnum::FAILED;
+                    unpin(started->mapping);
+                }
                 return status;
             }
         }
@@ -511,6 +553,8 @@ Status MnnvlTransport::getTransferStatus(SubBatchRef batch, int task_id,
     // Read status AFTER the poll so a just-observed completion/failure is
     // reported on this call rather than one poll cycle late.
     status = TransferStatus{task.status_word, task.transferred_bytes};
+    if (task.status_word != TransferStatusEnum::PENDING && task.mapping)
+        unpin(task.mapping);
     return Status::OK();
 }
 
@@ -557,6 +601,11 @@ Status MnnvlTransport::addMemoryBuffer(BufferDesc &desc,
     CHECK_STATUS(roundGranularity(prop, granularity, desc.length));
 
     if (handle_type_ == CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR) {
+        // The fd is kept open for the lifetime of the process (it is never
+        // closed on unregister). Consumers identify the allocation by this
+        // "<pid>-<fd>" string (see sameGeneration()), which stays unique only
+        // while fd numbers are not reused; closing the fd on unregister
+        // requires a per-registration id in the descriptor first.
         int shared_fd;
         result =
             cuMemExportToShareableHandle(&shared_fd, handle, handle_type_, 0);
@@ -730,19 +779,29 @@ Status MnnvlTransport::freeLocalMemory(void *addr, size_t size) {
     return Status::OK();
 }
 
-static std::pair<pid_t, int> parsePidFd(const std::string &handle_str) {
-    std::stringstream ss(handle_str);
-    std::string token;
-    std::vector<std::string> parts;
-
-    while (std::getline(ss, token, '-')) parts.push_back(token);
-    if (parts.size() != 2) {
-        throw std::runtime_error("Invalid mnnvl_handle format: " + handle_str);
-    }
-
-    pid_t pid = static_cast<pid_t>(std::stoi(parts[0]));
-    int fd = std::stoi(parts[1]);
-    return {pid, fd};
+// "<pid>-<fd>", as addMemoryBuffer publishes it. A malformed handle is an
+// error status: it arrives from the metadata service and must not take the
+// consumer down with an exception.
+static Status parsePidFd(const std::string &handle_str, pid_t &pid, int &fd) {
+    auto dash = handle_str.find('-');
+    if (dash == std::string::npos || dash == 0 ||
+        dash + 1 >= handle_str.size() ||
+        handle_str.find('-', dash + 1) != std::string::npos)
+        return Status::InvalidArgument(
+            "Invalid mnnvl_handle format: " + handle_str + LOC_MARK);
+    char *end = nullptr;
+    errno = 0;
+    long pid_value = strtol(handle_str.c_str(), &end, 10);
+    if (errno || end != handle_str.c_str() + dash || pid_value <= 0)
+        return Status::InvalidArgument(
+            "Invalid pid in mnnvl_handle: " + handle_str + LOC_MARK);
+    long fd_value = strtol(handle_str.c_str() + dash + 1, &end, 10);
+    if (errno || *end != '\0' || fd_value < 0 || fd_value > INT32_MAX)
+        return Status::InvalidArgument(
+            "Invalid fd in mnnvl_handle: " + handle_str + LOC_MARK);
+    pid = static_cast<pid_t>(pid_value);
+    fd = static_cast<int>(fd_value);
+    return Status::OK();
 }
 
 static int importFdFromProcess(pid_t pid, int remote_fd) {
@@ -763,109 +822,338 @@ static int importFdFromProcess(pid_t pid, int remote_fd) {
     return newfd;
 }
 
-Status MnnvlTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
-                                                   uint64_t length,
-                                                   uint64_t target_id) {
-    thread_local HashMap tl_relocate_map;
-    if (tl_relocate_map.empty()) {
-        RWSpinlock::ReadGuard guard(relocate_lock_);
-        tl_relocate_map = relocate_map_;
+Status MnnvlTransport::importMapping(uint64_t peer_addr, uint64_t length,
+                                     const std::string &mnnvl_handle,
+                                     EntryRef &entry) {
+    CUmemGenericAllocationHandle handle;
+    // Do NOT switch to the peer buffer's device index: that ordinal is the
+    // PEER's, relative to the peer's CUDA_VISIBLE_DEVICES. In the local
+    // process it may be invalid, and even when numerically valid it may
+    // denote a different physical GPU. The driver calls below are
+    // device-agnostic: the VA mapping is process-wide and cuMemSetAccess
+    // grants read/write access to ALL local devices.
+    if (handle_type_ == CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR) {
+        pid_t pid = 0;
+        int remote_fd = -1;
+        CHECK_STATUS(parsePidFd(mnnvl_handle, pid, remote_fd));
+        int local_fd = importFdFromProcess(pid, remote_fd);
+        if (local_fd < 0)
+            return Status::InternalError(
+                "Unable to import fd from remote process " +
+                std::to_string(pid) + LOC_MARK);
+        // For POSIX_FILE_DESCRIPTOR the driver takes the fd value itself
+        // (cast to void*), not a pointer to it; the export side is the one
+        // that takes a pointer. The imported handle holds its own reference,
+        // so the fd is closed right away either way.
+        auto import_result = cuMemImportFromShareableHandle(
+            &handle, (void *)(uintptr_t)local_fd, handle_type_);
+        close(local_fd);
+        if (import_result != CUDA_SUCCESS) {
+            return Status::InternalError(
+                std::string("cuMemImportFromShareableHandle: cuResult ") +
+                std::to_string(import_result) + LOC_MARK);
+        }
+    } else {
+        std::vector<unsigned char> output_buffer;
+        deserializeBinaryData(mnnvl_handle, output_buffer);
+        if (output_buffer.size() != sizeof(CUmemFabricHandle)) {
+            return Status::InternalError(
+                "Received MNNVL handle length incorrect" LOC_MARK);
+        }
+        CUmemFabricHandle export_handle;
+        memcpy(&export_handle, output_buffer.data(), sizeof(export_handle));
+        CHECK_CU(cuMemImportFromShareableHandle(&handle, &export_handle,
+                                                handle_type_));
     }
 
-    for (auto &entry : tl_relocate_map[target_id]) {
-        if (entry.first <= dest_addr &&
-            dest_addr + length <= entry.first + entry.second.length) {
-            auto mnnvl_addr = entry.second.mnnvl_addr;
-            dest_addr = dest_addr - entry.first + ((uint64_t)mnnvl_addr);
-            return Status::OK();
+    void *mnnvl_addr = nullptr;
+    auto result =
+        cuMemAddressReserve((CUdeviceptr *)&mnnvl_addr, length, 0, 0, 0);
+    if (result != CUDA_SUCCESS) {
+        cuMemRelease(handle);
+        return Status::InternalError(
+            std::string("cuMemAddressReserve: cuResult ") +
+            std::to_string(result) + LOC_MARK);
+    }
+    result = cuMemMap((CUdeviceptr)mnnvl_addr, length, 0, handle, 0);
+    if (result != CUDA_SUCCESS) {
+        cuMemAddressFree((CUdeviceptr)mnnvl_addr, length);
+        cuMemRelease(handle);
+        return Status::InternalError(std::string("cuMemMap: cuResult ") +
+                                     std::to_string(result) + LOC_MARK);
+    }
+    // The mapping now holds its own reference to the allocation; drop the
+    // import's so that cuMemUnmap alone releases it (see releaseMappings).
+    cuMemRelease(handle);
+
+    int device_count = 0;
+    auto cuda_err = cudaGetDeviceCount(&device_count);
+    if (cuda_err != cudaSuccess) {
+        cuMemUnmap((CUdeviceptr)mnnvl_addr, length);
+        cuMemAddressFree((CUdeviceptr)mnnvl_addr, length);
+        return Status::InternalError(std::string("cudaGetDeviceCount: ") +
+                                     cudaGetErrorString(cuda_err) + LOC_MARK);
+    }
+    std::vector<CUmemAccessDesc> access(device_count);
+    for (int device_id = 0; device_id < device_count; ++device_id) {
+        access[device_id].location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        access[device_id].location.id = device_id;
+        access[device_id].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    }
+    result = cuMemSetAccess((CUdeviceptr)mnnvl_addr, length, access.data(),
+                            access.size());
+    if (result != CUDA_SUCCESS) {
+        cuMemUnmap((CUdeviceptr)mnnvl_addr, length);
+        cuMemAddressFree((CUdeviceptr)mnnvl_addr, length);
+        return Status::InternalError(std::string("cuMemSetAccess: cuResult ") +
+                                     std::to_string(result) + LOC_MARK);
+    }
+
+    entry = std::make_shared<OpenedMnnvlEntry>();
+    entry->mnnvl_addr = mnnvl_addr;
+    entry->length = length;
+    entry->mnnvl_handle = mnnvl_handle;
+    VLOG(1) << "MnnvlTransport: imported peer buffer " << (void *)peer_addr
+            << " (" << length << " bytes) at " << mnnvl_addr;
+    return Status::OK();
+}
+
+void MnnvlTransport::retireLocked(HashMap::iterator target,
+                                  HashMap::mapped_type::iterator slot,
+                                  std::vector<EntryRef> &to_release) {
+    EntryRef entry = slot->second;
+    entry->stale = true;
+    target->second.erase(slot);
+    if (target->second.empty()) relocate_map_.erase(target);
+    retired_.push_back(std::move(entry));
+    collectReleasableLocked(to_release);
+}
+
+void MnnvlTransport::retireUnpublishedLocked(
+    SegmentID target_id, const SegmentDesc &segment,
+    std::vector<EntryRef> &to_release) {
+    if (segment.type != SegmentType::Memory) return;
+    auto target = relocate_map_.find(target_id);
+    if (target == relocate_map_.end()) return;
+    const auto &buffers = std::get<MemorySegmentDesc>(segment.detail).buffers;
+    std::vector<uint64_t> unpublished;
+    for (const auto &[peer_addr, entry] : target->second) {
+        bool published = false;
+        for (const auto &buffer : buffers) {
+            if (buffer.addr == peer_addr &&
+                sameGeneration(*entry, buffer.mnnvl_handle)) {
+                published = true;
+                break;
+            }
+        }
+        if (!published) unpublished.push_back(peer_addr);
+    }
+    for (auto peer_addr : unpublished) {
+        // retireLocked() may erase the target map itself; look it up again.
+        target = relocate_map_.find(target_id);
+        if (target == relocate_map_.end()) return;
+        auto slot = target->second.find(peer_addr);
+        if (slot == target->second.end()) continue;
+        LOG(INFO) << "MnnvlTransport: peer buffer " << (void *)peer_addr
+                  << " of segment " << target_id
+                  << " is no longer published; retiring old mapping";
+        retireLocked(target, slot, to_release);
+    }
+}
+
+void MnnvlTransport::collectReleasableLocked(
+    std::vector<EntryRef> &to_release) {
+    for (auto it = retired_.begin(); it != retired_.end();) {
+        if ((*it)->pins.load() == 0) {
+            to_release.push_back(*it);
+            it = retired_.erase(it);
+        } else {
+            ++it;
         }
     }
+}
 
-    RWSpinlock::WriteGuard guard(relocate_lock_);
+void MnnvlTransport::releaseMappings(std::vector<EntryRef> &entries) {
+    for (auto &entry : entries) {
+        if (!entry->mnnvl_addr) continue;
+        // Mirror of importMapping: the handle reference was already dropped
+        // after cuMemMap, so unmapping releases the peer's allocation.
+        cuMemUnmap((CUdeviceptr)entry->mnnvl_addr, entry->length);
+        cuMemAddressFree((CUdeviceptr)entry->mnnvl_addr, entry->length);
+        VLOG(1) << "MnnvlTransport: released mapping at " << entry->mnnvl_addr;
+        entry->mnnvl_addr = nullptr;
+    }
+    entries.clear();
+}
 
-    BufferDesc *buffer;
-    // Owning reference: `buffer` is used after the lambda returns.
+void MnnvlTransport::unpin(EntryRef &entry) {
+    if (!entry) return;
+    std::vector<EntryRef> to_release;
+    if (entry->pins.fetch_sub(1) == 1) {
+        RWSpinlock::WriteGuard guard(relocate_lock_);
+        if (entry->stale) collectReleasableLocked(to_release);
+    }
+    releaseMappings(to_release);
+    entry.reset();
+}
+
+// Whether a cached mapping was imported from the allocation the peer
+// publishes now. The handle bytes are the identity for now (a new fd number
+// or pid in POSIX-FD mode, a new fabric handle per cuMemCreate); a
+// per-registration id in BufferDesc::transport_attrs would be compared here.
+// POSIX-FD caveat: "<pid>-<fd>" is unique only because the exporter never
+// closes the fd (see addMemoryBuffer); a closed fd number is reused by the
+// next export and would make two generations compare equal.
+bool MnnvlTransport::sameGeneration(const OpenedMnnvlEntry &entry,
+                                    const std::string &mnnvl_handle) {
+    return entry.mnnvl_handle == mnnvl_handle;
+}
+
+Status MnnvlTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
+                                                   uint64_t length,
+                                                   uint64_t target_id,
+                                                   EntryRef *pinned) {
+    // The second attempt runs only when another thread published a different
+    // generation of the same buffer while this one was importing (step 3 of
+    // relocateOnce): this thread's descriptor may be the stale one, so it is
+    // dropped and resolved again instead of overwriting the other import.
+    for (int attempt = 0;; ++attempt) {
+        bool lost_race = false;
+        auto status =
+            relocateOnce(dest_addr, length, target_id, pinned, lost_race);
+        if (!lost_race || attempt > 0) return status;
+        if (target_id != LOCAL_SEGMENT_ID)
+            metadata_->segmentManager().invalidateRemote(target_id);
+    }
+}
+
+Status MnnvlTransport::relocateOnce(uint64_t &dest_addr, uint64_t length,
+                                    uint64_t target_id, EntryRef *pinned,
+                                    bool &lost_race) {
+    // 1. Resolve the peer's CURRENT descriptor. A cached mapping is only
+    //    valid if it was imported from the handle the peer publishes now;
+    //    if the handles differ the descriptor is refetched once so that a
+    //    peer that re-registered twice is not imported at an intermediate
+    //    generation. withCachedSegment() retries once in total, so the
+    //    refetch is requested only on the first pass.
+    uint64_t peer_addr = 0, peer_length = 0;
+    std::string peer_handle;
+    bool first_pass = true;
+    bool refreshed = false;  // second pass: `pin` was just refetched
+    const bool can_refresh = target_id != LOCAL_SEGMENT_ID;
     SegmentDescRef pin;
     auto &segment_manager = metadata_->segmentManager();
     CHECK_STATUS(segment_manager.withCachedSegment(
         target_id, pin, [&](SegmentDesc *segment) {
-            buffer = segment->findBuffer(dest_addr, length);
+            const bool may_request_refresh = can_refresh && first_pass;
+            refreshed = !first_pass;
+            first_pass = false;
+            auto *buffer = segment->findBuffer(dest_addr, length);
             if (!buffer || buffer->mnnvl_handle.empty())
                 return Status::NeedsRefreshCache(
                     "Requested address is not in registered buffer" LOC_MARK);
+            if (may_request_refresh) {
+                RWSpinlock::ReadGuard guard(relocate_lock_);
+                auto it = relocate_map_.find(target_id);
+                if (it != relocate_map_.end()) {
+                    auto jt = it->second.find(buffer->addr);
+                    if (jt != it->second.end() &&
+                        !sameGeneration(*jt->second, buffer->mnnvl_handle)) {
+                        return Status::NeedsRefreshCache(
+                            "mnnvl_handle changed for buffer" LOC_MARK);
+                    }
+                }
+            }
+            peer_addr = buffer->addr;
+            peer_length = buffer->length;
+            peer_handle = buffer->mnnvl_handle;
             return Status::OK();
         }));
 
-    if (!relocate_map_[target_id].count(buffer->addr)) {
-        CUmemGenericAllocationHandle handle;
-        void *mnnvl_addr = nullptr;
-        // A non-empty mnnvl_handle (checked above) means the peer exported
-        // this buffer, whether it is device memory or EGM host memory.
-
-        // Do NOT switch to buffer->location's device index: that ordinal is
-        // the PEER's device index, relative to the peer's
-        // CUDA_VISIBLE_DEVICES. In the local process it may be an invalid
-        // ordinal, and even when numerically valid it may denote a different
-        // physical GPU. The driver calls below are device-agnostic: the VA
-        // mapping is process-wide and cuMemSetAccess grants read/write
-        // access to ALL local devices.
-        if (handle_type_ == CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR) {
-            auto [pid, remote_fd] = parsePidFd(buffer->mnnvl_handle);
-            int local_fd = importFdFromProcess(pid, remote_fd);
-            if (local_fd < 0)
-                return Status::InternalError(
-                    "Unable to import fd from remote process");
-            // For POSIX_FILE_DESCRIPTOR the driver takes the fd value itself
-            // (cast to void*), not a pointer to it; the export side is the
-            // one that takes a pointer. Passing &local_fd fails with
-            // CUDA_ERROR_UNKNOWN. The imported handle holds its own
-            // reference, so the fd is closed right away either way.
-            auto import_result = cuMemImportFromShareableHandle(
-                &handle, (void *)(uintptr_t)local_fd, handle_type_);
-            close(local_fd);
-            if (import_result != CUDA_SUCCESS) {
-                return Status::InternalError(
-                    std::string("cuMemImportFromShareableHandle: cuResult ") +
-                    std::to_string(import_result) + LOC_MARK);
+    // 2. Cache lookup under the read lock: the hot path. A hit requires
+    //    address AND handle to match. Pinning under the read lock is safe
+    //    because retiring needs the write lock.
+    EntryRef entry;
+    bool mismatch = false;
+    {
+        RWSpinlock::ReadGuard guard(relocate_lock_);
+        auto it = relocate_map_.find(target_id);
+        if (it != relocate_map_.end()) {
+            auto jt = it->second.find(peer_addr);
+            if (jt != it->second.end()) {
+                if (sameGeneration(*jt->second, peer_handle)) {
+                    entry = jt->second;
+                    if (pinned) entry->pins.fetch_add(1);
+                } else {
+                    mismatch = true;
+                }
             }
-        } else {
-            std::vector<unsigned char> output_buffer;
-            deserializeBinaryData(buffer->mnnvl_handle, output_buffer);
-            if (output_buffer.size() != sizeof(CUmemFabricHandle)) {
-                return Status::InternalError(
-                    "Received MNNVL handle length incorrect");
-            }
-            CUmemFabricHandle export_handle;
-            memcpy(&export_handle, output_buffer.data(), sizeof(export_handle));
-            CHECK_CU(cuMemImportFromShareableHandle(&handle, &export_handle,
-                                                    handle_type_));
         }
-        CHECK_CU(cuMemAddressReserve((CUdeviceptr *)&mnnvl_addr, buffer->length,
-                                     0, 0, 0));
-        CHECK_CU(
-            cuMemMap((CUdeviceptr)mnnvl_addr, buffer->length, 0, handle, 0));
-        int device_count;
-        cudaGetDeviceCount(&device_count);
-        CUmemAccessDesc accessDesc[device_count];
-        for (int device_id = 0; device_id < device_count; ++device_id) {
-            accessDesc[device_id].location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-            accessDesc[device_id].location.id = device_id;
-            accessDesc[device_id].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-        }
-        CHECK_CU(cuMemSetAccess((CUdeviceptr)mnnvl_addr, buffer->length,
-                                accessDesc, device_count));
-        OpenedMnnvlEntry mnnvl_entry;
-        mnnvl_entry.mnnvl_addr = mnnvl_addr;
-        mnnvl_entry.length = buffer->length;
-        int cuda_dev = 0;
-        CHECK_CUDA(cudaGetDevice(&cuda_dev));
-        mnnvl_entry.cuda_id = cuda_dev;
-        relocate_map_[target_id][buffer->addr] = mnnvl_entry;
     }
 
-    auto mnnvl_addr = relocate_map_[target_id][buffer->addr].mnnvl_addr;
-    dest_addr = dest_addr - buffer->addr + ((uint64_t)mnnvl_addr);
-    tl_relocate_map = relocate_map_;
+    // 2b. The cached entry maps the peer's previous allocation: retire it,
+    //     whether or not the new import below succeeds. Re-check under the
+    //     write lock; another thread may have done it already.
+    if (mismatch) {
+        std::vector<EntryRef> to_release;
+        {
+            RWSpinlock::WriteGuard guard(relocate_lock_);
+            auto it = relocate_map_.find(target_id);
+            if (it != relocate_map_.end()) {
+                auto jt = it->second.find(peer_addr);
+                if (jt != it->second.end() &&
+                    !sameGeneration(*jt->second, peer_handle)) {
+                    LOG(INFO)
+                        << "MnnvlTransport: peer buffer " << (void *)peer_addr
+                        << " of segment " << target_id
+                        << " was re-registered; retiring old mapping";
+                    retireLocked(it, jt, to_release);
+                }
+            }
+        }
+        releaseMappings(to_release);
+    }
+
+    // 3. Miss: import outside the lock, then publish. If another thread
+    //    imported the same generation meanwhile, keep theirs. If it imported
+    //    a DIFFERENT one, this thread's descriptor may be the stale one and
+    //    must not overwrite it: give the import back and let the caller
+    //    resolve again.
+    if (!entry) {
+        EntryRef fresh;
+        CHECK_STATUS(importMapping(peer_addr, peer_length, peer_handle, fresh));
+        std::vector<EntryRef> to_release;
+        {
+            RWSpinlock::WriteGuard guard(relocate_lock_);
+            auto &slot = relocate_map_[target_id][peer_addr];
+            if (!slot) {
+                slot = fresh;
+                entry = fresh;
+            } else if (sameGeneration(*slot, peer_handle)) {
+                to_release.push_back(fresh);
+                entry = slot;
+            } else {
+                to_release.push_back(fresh);
+                lost_race = true;
+            }
+            if (entry && pinned) entry->pins.fetch_add(1);
+            // A miss means the peer published something this process had
+            // not seen. When the descriptor is authoritative (local
+            // snapshot, or just refetched because the cached one did not
+            // cover this address), mappings it no longer lists, typically
+            // a peer that restarted onto a different address, are retired
+            // now instead of lingering until uninstall().
+            if (entry && (refreshed || !can_refresh))
+                retireUnpublishedLocked(target_id, *pin, to_release);
+        }
+        releaseMappings(to_release);
+        if (lost_race)
+            return Status::InternalError(
+                "Peer buffer was re-registered concurrently" LOC_MARK);
+    }
+
+    if (pinned) *pinned = entry;
+    dest_addr = dest_addr - peer_addr + ((uint64_t)entry->mnnvl_addr);
     return Status::OK();
 }
 
