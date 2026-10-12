@@ -980,6 +980,32 @@ TEST_F(DynamicReplicationTest, ExpiredLeaseRejectsCopyStart) {
     EXPECT_FALSE(HasDynamicState(service, "expired-key"));
 }
 
+TEST_F(DynamicReplicationTest, CleanupFailsTheTaskOfAnExpiredPendingProposal) {
+    MasterServiceConfig config;
+    config.dynamic_replication_mode = "enforce";
+    config.dynamic_replication_max_memory_replicas = 2;
+    MasterService service(config);
+
+    auto source = PrepareSegment(service, "segment_0", 0xf00000000);
+    auto target = PrepareSegment(service, "segment_1", 0x1000000000);
+    PutObject(service, source.client_id, "cleanup-key", source.segment_name);
+    auto lease = service.SubmitReplicaActionProposal(
+        BuildProposal(service, "cleanup-key", target.segment_name));
+    ASSERT_TRUE(lease.has_value());
+
+    // A live pending proposal survives the sweep.
+    MasterServiceTestPeer(service).CleanupExpiredDynamicReplicationState();
+    EXPECT_TRUE(HasDynamicState(service, "cleanup-key"));
+
+    ExpireDynamicPending(service, "cleanup-key");
+    MasterServiceTestPeer(service).CleanupExpiredDynamicReplicationState();
+
+    EXPECT_FALSE(HasDynamicState(service, "cleanup-key"));
+    auto task = service.QueryTask(lease->task_id);
+    ASSERT_TRUE(task.has_value());
+    EXPECT_EQ(task->status, TaskStatus::FAILED);
+}
+
 TEST_F(DynamicReplicationTest, EvictedDynamicReplicaBlocksImmediateRecreate) {
     MasterServiceConfig config;
     config.dynamic_replication_mode = "enforce";

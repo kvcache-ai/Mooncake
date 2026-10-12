@@ -31,7 +31,7 @@ class MasterServiceTestPeer {
     using TenantState = MasterService::TenantState;
 
     static constexpr auto kDynamicReplicationWindowEntryLimit =
-        MasterService::kDynamicReplicationWindowEntryLimit;
+        DynamicReplicationController::kWindowEntryLimit;
     static constexpr auto kMaxPromotionExecutionFailures =
         MasterService::kMaxPromotionExecutionFailures;
     static constexpr auto kNumShards = MasterService::kNumShards;
@@ -118,10 +118,10 @@ class MasterServiceTestPeer {
     }
 
     static auto& DynamicReplicationWindows(MasterService& service) {
-        return service.dynamic_replication_windows_;
+        return service.dynamic_replication_.windows_;
     }
     static const auto& DynamicReplicationWindows(const MasterService& service) {
-        return service.dynamic_replication_windows_;
+        return service.dynamic_replication_.windows_;
     }
 
     static auto& EnableDfs(MasterService& service) {
@@ -322,6 +322,10 @@ class MasterServiceTestPeer {
         return service_.ChargeTenantQuota(std::move(account), bytes);
     }
 
+    void CleanupExpiredDynamicReplicationState() {
+        service_.CleanupExpiredDynamicReplicationState();
+    }
+
     void CleanupExpiredSoftPins(
         const std::chrono::system_clock::time_point& now) {
         service_.CleanupExpiredSoftPins(now);
@@ -352,16 +356,16 @@ class MasterServiceTestPeer {
     }
 
     uint32_t DynamicReplicationAdmissionMinHits() const {
-        return service_.DynamicReplicationAdmissionMinHits();
+        return service_.dynamic_replication_.AdmissionMinHits();
     }
 
     static int64_t DynamicReplicationNowMs() {
-        return MasterService::DynamicReplicationNowMs();
+        return DynamicReplicationController::NowMs();
     }
 
     uint64_t DynamicReplicationVersionEpoch(
         const ObjectMetadata& metadata) const {
-        return service_.DynamicReplicationVersionEpoch(metadata);
+        return DynamicReplicationController::VersionEpoch(metadata);
     }
 
     size_t EraseReplicasWithCacheTotalAccounting(
@@ -431,7 +435,8 @@ class MasterServiceTestPeer {
     }
 
     bool ObserveDynamicReplicationAccess(const ObjectIdentity& object_id) {
-        return service_.ObserveDynamicReplicationAccess(object_id);
+        return service_.dynamic_replication_.ObserveAccess(object_id.tenant_id,
+                                                           object_id.user_key);
     }
 
     bool ProcessClientOffboardingJob(ClientOffboardingJob& job) {
