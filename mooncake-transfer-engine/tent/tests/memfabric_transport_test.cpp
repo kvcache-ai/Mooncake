@@ -212,7 +212,6 @@ class MemFabricTransportTest : public ::testing::Test {
         g_state = std::make_shared<MockMemFabricState>();
         state_ = g_state;
         InstallMockApi();
-        setenv("MF_DATA_OP_TYPE", "device_sdma", 1);
         metadata_ = std::make_shared<ControlService>("p2p", "", nullptr);
         uint16_t port = 0;
         ASSERT_TRUE(metadata_->start(port).ok());
@@ -229,12 +228,12 @@ class MemFabricTransportTest : public ::testing::Test {
             (void)transport_->uninstall();
         }
         ResetMockApi();
-        unsetenv("MF_DATA_OP_TYPE");
         g_state.reset();
     }
 
     Status Install() {
         auto conf = std::make_shared<Config>();
+        conf->set("transports/memfabric/data_op_type", "device_rdma");
         return transport_->install(name_, metadata_, nullptr, conf);
     }
 

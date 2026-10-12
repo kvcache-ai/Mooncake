@@ -116,7 +116,8 @@
             "agent_mode": false
         },
         "memfabric": {
-            "enable": false
+            "enable": false,
+            "data_op_type": "device_rdma"
         }
     },
     "policy": [

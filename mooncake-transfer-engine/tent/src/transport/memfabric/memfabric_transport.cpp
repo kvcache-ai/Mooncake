@@ -50,19 +50,19 @@ Status MemFabricTransport::install(std::string& local_segment_name,
     local_segment_name_ = local_segment_name;
     metadata_ = metadata;
 
-    config_.data_op_type_str = std::getenv("MF_DATA_OP_TYPE") ?: "";
+    config_.data_op_type_str = conf->get("transports/memfabric/data_op_type", "");
     if (config_.data_op_type_str.empty()) {
-        LOG(ERROR) << "MF_DATA_OP_TYPE env var not set";
+        LOG(ERROR) << "transports/memfabric/data_op_type not set in config";
         return Status::InvalidArgument(
-            "MF_DATA_OP_TYPE must be set (device_sdma/device_rdma/...)" LOC_MARK);
+            "data_op_type must be set (device_sdma/device_rdma/...)" LOC_MARK);
     }
     config_.data_op_type = parseDataOpType(config_.data_op_type_str);
     if (!config_.data_op_type.has_value()) {
-        LOG(ERROR) << "Invalid MF_DATA_OP_TYPE: " << config_.data_op_type_str;
+        LOG(ERROR) << "Invalid data_op_type: " << config_.data_op_type_str;
         return Status::InvalidArgument(
-            "Invalid MF_DATA_OP_TYPE: " + config_.data_op_type_str + LOC_MARK);
+            "Invalid data_op_type: " + config_.data_op_type_str + LOC_MARK);
     }
-    LOG(INFO) << "MF_DATA_OP_TYPE=" << config_.data_op_type_str;
+    LOG(INFO) << "data_op_type=" << config_.data_op_type_str;
 
     const char* log_level = std::getenv("MF_LOG_LEVEL");
     if (log_level) MemFabricUnderApi::SmemSetLogLevel(std::atoi(log_level));

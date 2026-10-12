@@ -84,7 +84,6 @@ sudo cmake --install build
 |----------|----------|---------|-------------|
 | `MC_USE_TENT` | Yes | — | Set to `1` to enable TENT mode |
 | `MC_TENT_CONF` | Yes | — | Path to TENT config JSON file; must include `transports/memfabric/enable: true` |
-| `MF_DATA_OP_TYPE` | Yes | — | Underlying operation type: `device_sdma` / `device_rdma` / `host_rdma` / `device_urma` / `device_uboe` |
 | `LD_LIBRARY_PATH` | Yes | — | Directory containing `libmf_smem.so` |
 | `MC_STORE_USE_HUGEPAGE` | No | — | Set to `1` to enable Store hugepage allocation (recommended when using Store pooling) |
 | `MC_STORE_HUGEPAGE_SIZE` | No | `2MB` | Hugepage size: `2MB` / `512MB` / `1GB`; must match the system-allocated hugepage size |
@@ -95,18 +94,20 @@ sudo cmake --install build
 {
     "transports": {
         "memfabric": {
-            "enable": true
+            "enable": true,
+            "data_op_type": "device_rdma"
         }
     }
 }
 ```
+
+The `data_op_type` field supports: `device_sdma` / `device_rdma` / `host_rdma` / `device_urma` / `device_uboe`.
 
 ### Basic Configuration
 
 ```bash
 export MC_USE_TENT=1
 export MC_TENT_CONF=/path/to/memfabric_tent.json
-export MF_DATA_OP_TYPE=device_sdma
 export LD_LIBRARY_PATH=/usr/local/memfabric_hybrid/latest/aarch64-linux/lib64:$LD_LIBRARY_PATH
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 ```
@@ -195,11 +196,18 @@ find / -name "libmf_smem.so" 2>/dev/null
 export LD_LIBRARY_PATH=/usr/local/memfabric_hybrid/latest/aarch64-linux/lib64:$LD_LIBRARY_PATH
 ```
 
-### `InvalidArgument: MF_DATA_OP_TYPE must be set`
+### `InvalidArgument: data_op_type must be set`
 
-**Solution**: Set the `MF_DATA_OP_TYPE` environment variable:
-```bash
-export MF_DATA_OP_TYPE=device_sdma  # or device_rdma / host_rdma
+**Solution**: Set `data_op_type` in the TENT config JSON file:
+```json
+{
+    "transports": {
+        "memfabric": {
+            "enable": true,
+            "data_op_type": "device_rdma"
+        }
+    }
+}
 ```
 
 ### `session not found` (smem_trans internal error)

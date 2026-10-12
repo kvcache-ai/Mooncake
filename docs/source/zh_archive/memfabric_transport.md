@@ -83,7 +83,6 @@ sudo cmake --install build
 |------|------|--------|------|
 | `MC_USE_TENT` | 是 | — | 设为 `1` 启用 TENT 模式 |
 | `MC_TENT_CONF` | 是 | — | TENT 配置 JSON 文件路径，需包含 `transports/memfabric/enable: true` |
-| `MF_DATA_OP_TYPE` | 是 | — | 底层操作类型：`device_sdma` / `device_rdma` / `host_rdma` / `device_urma` / `device_uboe` |
 | `LD_LIBRARY_PATH` | 是 | — | 包含 `libmf_smem.so` 所在目录 |
 | `MC_STORE_USE_HUGEPAGE` | 否 | — | 设为 `1` 启用 Store 大页分配（使用 Store 池化时建议开启） |
 | `MC_STORE_HUGEPAGE_SIZE` | 否 | `2MB` | 大页大小，可选 `2MB` / `512MB` / `1GB`，需与系统实际分配的大页大小匹配 |
@@ -94,18 +93,20 @@ sudo cmake --install build
 {
     "transports": {
         "memfabric": {
-            "enable": true
+            "enable": true,
+            "data_op_type": "device_rdma"
         }
     }
 }
 ```
+
+`data_op_type` 可选：`device_sdma` / `device_rdma` / `host_rdma` / `device_urma` / `device_uboe`。
 
 ### 基础配置
 
 ```bash
 export MC_USE_TENT=1
 export MC_TENT_CONF=/path/to/memfabric_tent.json
-export MF_DATA_OP_TYPE=device_sdma
 export LD_LIBRARY_PATH=/usr/local/memfabric_hybrid/latest/aarch64-linux/lib64:$LD_LIBRARY_PATH
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 ```
@@ -194,11 +195,18 @@ find / -name "libmf_smem.so" 2>/dev/null
 export LD_LIBRARY_PATH=/usr/local/memfabric_hybrid/latest/aarch64-linux/lib64:$LD_LIBRARY_PATH
 ```
 
-### `InvalidArgument: MF_DATA_OP_TYPE must be set`
+### `InvalidArgument: data_op_type must be set`
 
-**解决**：设置 `MF_DATA_OP_TYPE` 环境变量：
-```bash
-export MF_DATA_OP_TYPE=device_sdma  # 或 device_rdma / host_rdma
+**解决**：在 TENT 配置文件中设置 `data_op_type`：
+```json
+{
+    "transports": {
+        "memfabric": {
+            "enable": true,
+            "data_op_type": "device_rdma"
+        }
+    }
+}
 ```
 
 ### `session not found` (smem_trans 内部错误)
