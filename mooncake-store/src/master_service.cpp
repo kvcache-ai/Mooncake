@@ -12148,6 +12148,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
     }
 
     auto now = std::chrono::system_clock::now();
+    const auto cycle_start = std::chrono::steady_clock::now();
 
     auto is_evictable_memory_replica = [this](const Replica& replica) {
         return IsEvictableMemoryReplica(replica);
@@ -12396,6 +12397,11 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 EvictionResult result{.freed_bytes = freed,
                                       .evicted_objects = freed > 0 ? 1 : 0};
                 if (!enable_oplog_ && freed > 0) {
+                    MasterMetricManager::instance()
+                        .observe_evicted_key_age_seconds(
+                            std::chrono::duration<double>(
+                                now - metadata.put_start_time)
+                                .count());
                     PublishKvRemovedAfterEvict(key, 1, "cpu", metadata,
                                                tenant_id);
                 }
@@ -12437,6 +12443,11 @@ void MasterService::BatchEvict(double evict_ratio_target,
             EvictMemberOutcome outcome{.freed_bytes = freed,
                                        .evicted_objects = freed > 0 ? 1 : 0};
             if (freed > 0 && !enable_oplog_) {
+                MasterMetricManager::instance()
+                    .observe_evicted_key_age_seconds(
+                        std::chrono::duration<double>(
+                            now - member_metadata.put_start_time)
+                            .count());
                 PublishKvRemovedAfterEvict(member_key, 1, "cpu",
                                            member_metadata, tenant_id);
             }
@@ -12610,6 +12621,10 @@ void MasterService::BatchEvict(double evict_ratio_target,
     if (total_eviction_base == 0) {
         VLOG(1) << "[EVICT-DIAG] object_count=" << object_count
                 << " eviction_base=0 (no evictable memory objects)";
+        MasterMetricManager::instance().observe_eviction_duration_ms(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - cycle_start)
+                .count());
         return;
     }
 
@@ -12949,6 +12964,10 @@ void MasterService::BatchEvict(double evict_ratio_target,
         need_mem_eviction_.store(true, std::memory_order_relaxed);
     }
 
+    MasterMetricManager::instance().observe_eviction_duration_ms(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - cycle_start)
+            .count());
     if (success) {
         MasterMetricManager::instance().inc_eviction_success(evicted_count,
                                                              total_freed_size);
