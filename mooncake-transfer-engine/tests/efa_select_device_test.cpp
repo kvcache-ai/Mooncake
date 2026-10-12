@@ -62,8 +62,8 @@ Transport::SegmentDesc makePeerDesc(int keyed_nic) {
 }
 
 // A chunk registered on one NIC must be selectable whichever NIC that is,
-// including the last available one, which the topology walk alone does not
-// reach deterministically.
+// including the last available one, which the topology walk used to reach
+// only through its random first draw.
 TEST(EfaSelectDeviceTest, FindsTheOnlyKeyedNic) {
     for (int keyed_nic = 0; keyed_nic < kNumNics; ++keyed_nic) {
         Transport::SegmentDesc desc = makePeerDesc(keyed_nic);
@@ -90,6 +90,21 @@ TEST(EfaSelectDeviceTest, FindsTheOnlyKeyedNicForAnyRetryCount) {
                   0)
             << "retry=" << retry;
         EXPECT_EQ(device_id, kNumNics - 1);
+    }
+}
+
+// A hint that names an HCA pins every attempt of the topology walk to that HCA,
+// so a chunk keyed on another NIC is reached only through the fallback scan.
+TEST(EfaSelectDeviceTest, FindsTheOnlyKeyedNicWhenTheHintNamesAnotherNic) {
+    for (int keyed_nic = 1; keyed_nic < kNumNics; ++keyed_nic) {
+        Transport::SegmentDesc desc = makePeerDesc(keyed_nic);
+        int buffer_id = -1;
+        int device_id = -1;
+        ASSERT_EQ(EfaTransport::selectDevice(&desc, kBufferAddr, 4096, "rdmap0",
+                                             buffer_id, device_id),
+                  0)
+            << "keyed_nic=" << keyed_nic;
+        EXPECT_EQ(device_id, keyed_nic);
     }
 }
 
