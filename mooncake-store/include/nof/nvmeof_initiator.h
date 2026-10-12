@@ -109,20 +109,29 @@ class NVMeoFInitiator {
     // them) — the bookkeeping is process-global and outlives any instance.
     //
     // Return contract (three outcomes):
-    //   - OK: fully registered.
-    //   - any other error (e.g. INTERNAL_ERROR): failed, and every page the
-    //     attempt touched is confirmed clean — the caller may munmap the
-    //     range without a pairing UnregisterMemory.
+    //   - OK: fully registered. OK is only ever returned when every page of
+    //     the range is validly registered.
+    //   - any other error except NOF_REGISTRATION_STUCK (e.g.
+    //     INTERNAL_ERROR): failed, and every page the attempt touched is
+    //     confirmed clean — the caller may munmap the range without a
+    //     pairing UnregisterMemory.
     //   - NOF_REGISTRATION_STUCK: failed after the backend may have
     //     partially marked/installed translation state, and cleanup could
-    //     not be confirmed. Bookkeeping is retained; the caller MUST treat
-    //     the range as still registered — route it through UnregisterMemory
-    //     at teardown (which retries the cleanup) and quarantine the mapping
-    //     instead of munmapping on continued failure.
+    //     not be confirmed. The range is kept in cleanup-pending state:
+    //     the caller MUST treat it as still registered — route it through
+    //     UnregisterMemory at teardown (which retries only the pending
+    //     pages) and quarantine the mapping instead of munmapping on
+    //     continued failure. A Register retry of a stuck range first
+    //     retries the pending cleanup, then registers the still-missing
+    //     coverage for real — it returns OK only once the range is fully
+    //     registered, and keeps returning NOF_REGISTRATION_STUCK while
+    //     the backlog is unresolved.
     //
     // UnregisterMemory returns OK when the range is fully released (or was
-    // never registered by this instance); on INTERNAL_ERROR some pages could
-    // not be released and remain recorded for a retry.
+    // never registered by this instance); on INTERNAL_ERROR some pages
+    // could not be released and remain recorded (pending) for a retry.
+    // Retries only touch this instance's own pending pages and valid
+    // prefix — never references owned by other instances.
     //
     // SPDK requires BOTH vaddr and len to be 2MB-aligned and fails with
     // -EBUSY on already-registered pages (verified against v23.01.1

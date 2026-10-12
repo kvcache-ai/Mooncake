@@ -231,19 +231,23 @@ TEST_F(NofPageRegistryTest, FailingPageRetainedWhenCleanupUnconfirmed) {
     // The partial mark is still there, and the registry kept the page.
     EXPECT_EQ(fake_.Depth(page0), 1);
 
-    // A same-range retry must NOT re-call register_fn_: the leftover
-    // translation would answer -EBUSY and be misclassified as external.
+    // A same-range retry is cleanup-pending, NOT a no-op OK: it must not
+    // re-call register_fn_ (the leftover translation would answer -EBUSY
+    // and be misclassified as external), and it must not return OK while
+    // coverage is unrestored — "OK means fully registered".
     const int register_calls_after = fake_.register_calls;
-    EXPECT_EQ(registry_.Register(owner_a_, ptr, 4096), ErrorCode::OK);
+    EXPECT_EQ(registry_.Register(owner_a_, ptr, 4096),
+              ErrorCode::NOF_REGISTRATION_STUCK);
     EXPECT_EQ(fake_.register_calls, register_calls_after);
 
-    // Unregister retries the cleanup; while the backend keeps failing it
-    // propagates the error and retains the record...
-    EXPECT_EQ(registry_.Unregister(owner_a_, ptr), ErrorCode::INTERNAL_ERROR);
+    // Once the backend recovers, the retry completes the pending cleanup
+    // and then registers the range for real — a legitimate OK.
+    fake_.fail_unregister_pages.erase(page0);
+    fake_.mark_fail_pages.erase(page0);
+    EXPECT_EQ(registry_.Register(owner_a_, ptr, 4096), ErrorCode::OK);
     EXPECT_EQ(fake_.Depth(page0), 1);
 
-    // ...and once the backend recovers, the retry releases it.
-    fake_.fail_unregister_pages.erase(page0);
+    // ...and it is a real registration: unregister releases it.
     EXPECT_EQ(registry_.Unregister(owner_a_, ptr), ErrorCode::OK);
     EXPECT_EQ(fake_.Depth(page0), 0);
 }
@@ -307,14 +311,72 @@ TEST_F(NofPageRegistryTest, RollbackFailureIsRetainedAndRetried) {
     EXPECT_EQ(fake_.Depth(page1), 0);
     EXPECT_EQ(fake_.Depth(page0), 1);
 
-    // A same-range retry does not re-register the retained page.
+    // Retry is cleanup-pending: no re-registration, no premature OK.
     const int register_calls_after = fake_.register_calls;
-    EXPECT_EQ(registry_.Register(owner_a_, ptr, 3 * kPage / 2), ErrorCode::OK);
+    EXPECT_EQ(registry_.Register(owner_a_, ptr, 3 * kPage / 2),
+              ErrorCode::NOF_REGISTRATION_STUCK);
     EXPECT_EQ(fake_.register_calls, register_calls_after);
 
     // Teardown retry releases the retained page once the backend recovers.
     fake_.fail_unregister_pages.erase(page0);
     EXPECT_EQ(registry_.Unregister(owner_a_, ptr), ErrorCode::OK);
+    EXPECT_EQ(fake_.Depth(page0), 0);
+}
+
+// A partial unregister must retain exactly the pages that still owe a
+// backend cleanup — and a retry must never touch references owned by
+// someone else (issue: A and B share page0; A's range also covers page1;
+// page1 fails to unregister; retrying A must not release B's page0).
+TEST_F(NofPageRegistryTest,
+       RetryAfterPartialUnregisterNeverTouchesOtherOwners) {
+    void* ptr = PageAddr(0);
+    const uintptr_t page0 = reinterpret_cast<uintptr_t>(ptr);
+    const uintptr_t page1 = page0 + kPage;
+    ASSERT_EQ(registry_.Register(owner_a_, ptr, 3 * kPage / 2), ErrorCode::OK);
+    ASSERT_EQ(registry_.Register(owner_b_, ptr, 4096), ErrorCode::OK);
+    // page0 count == 2 (A and B), page1 count == 1 (A only).
+
+    fake_.fail_unregister_pages.insert(page1);
+    EXPECT_EQ(registry_.Unregister(owner_a_, ptr), ErrorCode::INTERNAL_ERROR);
+    // A's page0 reference was dropped (2 -> 1, B remains); page1 is pending.
+    EXPECT_EQ(fake_.Depth(page0), 1);
+    EXPECT_EQ(fake_.Depth(page1), 1);
+
+    // Retry: exactly page1 is attempted; B's page0 is never touched.
+    fake_.fail_unregister_pages.erase(page1);
+    const int unregister_calls_before = fake_.unregister_calls;
+    EXPECT_EQ(registry_.Unregister(owner_a_, ptr), ErrorCode::OK);
+    EXPECT_EQ(fake_.unregister_calls, unregister_calls_before + 1);
+    EXPECT_EQ(fake_.Depth(page0), 1);
+    EXPECT_EQ(fake_.Depth(page1), 0);
+
+    EXPECT_EQ(registry_.Unregister(owner_b_, ptr), ErrorCode::OK);
+    EXPECT_EQ(fake_.Depth(page0), 0);
+}
+
+// A pending page taken over by another owner must stay registered for the
+// new owner — the stale cleanup must not unmap it from under them.
+TEST_F(NofPageRegistryTest, PendingPageTakenOverByAnotherOwnerStaysRegistered) {
+    void* ptr = PageAddr(0);
+    const uintptr_t page0 = reinterpret_cast<uintptr_t>(ptr);
+    fake_.mark_fail_pages.insert(page0);
+    fake_.fail_unregister_pages.insert(page0);
+    ASSERT_EQ(registry_.Register(owner_a_, ptr, 4096),
+              ErrorCode::NOF_REGISTRATION_STUCK);
+
+    // B registers the same page while A is cleanup-pending.
+    ASSERT_EQ(registry_.Register(owner_b_, ptr, 4096), ErrorCode::OK);
+    EXPECT_EQ(fake_.Depth(page0), 1);
+
+    // A's unregister drops its pending charge without a backend unregister:
+    // the page must stay registered for B.
+    const int unregister_calls_before = fake_.unregister_calls;
+    EXPECT_EQ(registry_.Unregister(owner_a_, ptr), ErrorCode::OK);
+    EXPECT_EQ(fake_.unregister_calls, unregister_calls_before);
+    EXPECT_EQ(fake_.Depth(page0), 1);
+
+    fake_.fail_unregister_pages.erase(page0);  // backend recovers
+    EXPECT_EQ(registry_.Unregister(owner_b_, ptr), ErrorCode::OK);
     EXPECT_EQ(fake_.Depth(page0), 0);
 }
 

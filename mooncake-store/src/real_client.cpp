@@ -4226,10 +4226,18 @@ tl::expected<void, ErrorCode> RealClient::unregister_buffer_internal(
     if (nof_runtime_.initiator) {
         auto rc = nof_runtime_.initiator->UnregisterMemory(buffer);
         if (rc != ErrorCode::OK) {
-            // The TE unregistration can no longer be rolled back; warn and
-            // continue (same severity as existing unregister failures).
-            LOG(WARNING) << "Initiator memory unregistration failed: "
-                         << toString(rc);
+            // The TE unregistration can no longer be rolled back, but the
+            // NoF backend may still hold a translation for this buffer.
+            // Propagate the failure instead of reporting success: the
+            // caller must NOT free or remap the buffer yet. The buffer
+            // record is intentionally kept so teardown's UnregisterMemory
+            // walk retries the cleanup even though TE is already
+            // unregistered.
+            LOG(ERROR) << "NoF memory unregistration failed for buffer "
+                       << buffer << ": " << toString(rc)
+                       << "; buffer stays recorded and teardown will retry "
+                          "the cleanup. Do not free or remap this buffer.";
+            return tl::unexpected(rc);
         }
     }
     {

@@ -3184,6 +3184,9 @@ class RecordingNofInitiator : public NVMeoFInitiator {
     ErrorCode UnregisterMemory(void* ptr) override {
         std::lock_guard<std::mutex> lock(mu_);
         ++unregister_calls_;
+        if (unregister_result_ != ErrorCode::OK) {
+            return unregister_result_;
+        }
         unregistered_.push_back(ptr);
         return ErrorCode::OK;
     }
@@ -3200,6 +3203,7 @@ class RecordingNofInitiator : public NVMeoFInitiator {
     int register_calls_ = 0;
     int unregister_calls_ = 0;
     ErrorCode register_result_ = ErrorCode::OK;
+    ErrorCode unregister_result_ = ErrorCode::OK;
     std::map<void*, size_t> registered_;
     std::vector<void*> unregistered_;
 };
@@ -3290,6 +3294,43 @@ TEST_F(RealClientTest, RegisterBufferSucceedsWhenNofRegistrationFails) {
     // a buffer the initiator never registered.
     ASSERT_EQ(py_client_->unregister_buffer(buffer.data()), 0);
     EXPECT_EQ(initiator->unregister_calls_, 1);
+}
+
+// Regression test: a failed NoF cleanup must NOT be reported as a successful
+// unregister_buffer — the caller could free/remap the buffer while the
+// backend may still hold a translation for it. The API propagates the error
+// and keeps the buffer recorded so teardown retries the cleanup even after
+// TE has already been unregistered.
+TEST_F(RealClientTest, UnregisterBufferPropagatesNofCleanupFailure) {
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
+    master_address_ = master_.master_address();
+
+    NofFactoryGuard guard;
+    auto initiator = std::make_shared<RecordingNofInitiator>();
+    RealClient::SetNofRuntimeFactoryForTesting([initiator]() {
+        return NofRuntime{initiator, std::make_shared<SystemDmaAllocator>()};
+    });
+
+    ASSERT_EQ(py_client_->setup_real("localhost:17934", "P2PHANDSHAKE",
+                                     16 * 1024 * 1024, 16 * 1024 * 1024, "tcp",
+                                     "", master_address_),
+              0);
+
+    std::vector<char> buffer(1 << 20);
+    ASSERT_EQ(py_client_->register_buffer(buffer.data(), buffer.size()), 0);
+
+    // Backend cleanup fails: unregister_buffer must fail and must NOT drop
+    // the buffer record.
+    initiator->unregister_result_ = ErrorCode::INTERNAL_ERROR;
+    EXPECT_NE(py_client_->unregister_buffer(buffer.data()), 0);
+    EXPECT_EQ(initiator->unregister_calls_, 1);
+
+    // Backend recovers: teardown retries the pending cleanup even though TE
+    // was already unregistered.
+    initiator->unregister_result_ = ErrorCode::OK;
+    ASSERT_EQ(py_client_->tearDownAll(), 0);
+    EXPECT_EQ(initiator->unregister_calls_, 2);
+    EXPECT_TRUE(initiator->WasUnregistered(buffer.data()));
 }
 
 }  // namespace testing
