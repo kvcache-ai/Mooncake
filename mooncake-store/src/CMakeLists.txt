@@ -47,9 +47,10 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     segment/pool_write_access.cpp
     segment/pool_read_access.cpp
     segment.cpp
-    tenant_quota.cpp
+    tenant/quota.cpp
+    tenant/quota_manager.cpp
     tenant_quota_ledger.cpp
-    tenant_quota_policy_store.cpp
+    tenant/quota_policy_store.cpp
     weight_metadata_store.cpp
     rpc_service.cpp
     master_admin_service.cpp

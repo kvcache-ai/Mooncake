@@ -280,20 +280,16 @@ MasterService::MasterService(const MasterServiceConfig& config)
     }
 
     if (enable_multi_tenants_) {
-        auto store = CreateTenantQuotaPolicyStore(
+        tenant_quota_manager_.OpenPolicyStore(
             config.tenant_quota_connector_type,
             config.tenant_quota_connector_uri, cluster_id_);
-        if (!store) {
-            throw std::invalid_argument(store.error());
-        }
-        tenant_quota_policy_store_ = std::move(store.value());
     }
 
     if (config.enable_snapshot_restore && !config.enable_oplog_snapshot) {
         RestoreState();
     }
     if (enable_multi_tenants_) {
-        LoadTenantQuotaPoliciesFromStoreOrThrow();
+        tenant_quota_manager_.LoadPoliciesOrThrow();
         RebuildTenantQuotaUsageFromMetadata();
     }
     if (config.enable_snapshot && config.snapshot_retention_count == 0) {
@@ -796,13 +792,12 @@ bool MasterService::IsTenantQuotaEnabled() const {
 
 std::vector<TenantQuotaSnapshot> MasterService::ListTenantQuotaSnapshots()
     const {
-    return tenant_quota_table_.ListTenantSnapshots();
+    return tenant_quota_manager_.ListSnapshots();
 }
 
 std::optional<TenantQuotaSnapshot> MasterService::GetTenantQuotaSnapshot(
     const TenantId& tenant_id) const {
-    assert(tenant_id.IsValid());
-    return tenant_quota_table_.GetTenantSnapshot(tenant_id);
+    return tenant_quota_manager_.GetSnapshot(tenant_id);
 }
 
 tl::expected<TenantQuotaSnapshot, ErrorCode>
@@ -812,26 +807,7 @@ MasterService::UpsertTenantQuotaPolicy(const TenantId& tenant_id,
     if (!enable_multi_tenants_) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
     }
-    if (requested_quota_bytes == 0 ||
-        requested_quota_bytes > TenantQuotaAccount::kMaxChargedBytes) {
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
-    std::lock_guard<std::mutex> policy_lock(tenant_quota_policy_mutex_);
-    auto policy = BuildTenantQuotaPolicySnapshot();
-    policy.tenant_quotas[tenant_id.value()] = requested_quota_bytes;
-    auto save_result = tenant_quota_policy_store_->Save(policy);
-    if (!save_result) {
-        LOG(ERROR) << "failed to save tenant quota policy: "
-                   << save_result.error();
-        return tl::make_unexpected(ErrorCode::PERSISTENT_FAIL);
-    }
-    ApplyTenantQuotaPolicies(policy);
-    auto result_snapshot = GetTenantQuotaSnapshot(tenant_id);
-    if (!result_snapshot.has_value()) {
-        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-    }
-    return result_snapshot.value();
+    return tenant_quota_manager_.UpsertPolicy(tenant_id, requested_quota_bytes);
 }
 
 tl::expected<std::optional<TenantQuotaSnapshot>, ErrorCode>
@@ -840,51 +816,9 @@ MasterService::DeleteTenantQuotaPolicy(const TenantId& tenant_id) {
     if (!enable_multi_tenants_) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
     }
-
-    std::lock_guard<std::mutex> policy_lock(tenant_quota_policy_mutex_);
-    auto policy = BuildTenantQuotaPolicySnapshot();
-    auto policy_it = policy.tenant_quotas.find(tenant_id.value());
-    if (policy_it == policy.tenant_quotas.end()) {
-        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
-    }
-    const uint64_t requested_quota_bytes = policy_it->second;
-
-    auto restore_policy = [&] {
-        std::lock_guard<std::mutex> recompute_lock(
-            tenant_quota_recompute_mutex_);
-        const uint64_t capacity = GetTenantQuotaAllocatableCapacityBytes();
-        auto result = tenant_quota_table_.UpsertTenantPolicy(
-            tenant_id, requested_quota_bytes, capacity);
-        if (!result) {
-            LOG(ERROR) << "failed to restore tenant quota policy tenant="
-                       << tenant_id.value();
-        }
-    };
-
-    auto disable_result =
-        tenant_quota_table_.DisableTenantPolicyIfEmpty(tenant_id);
-    if (!disable_result) {
-        return tl::make_unexpected(disable_result.error() ==
-                                           TenantQuotaError::kTenantNotEmpty
-                                       ? ErrorCode::TENANT_NOT_EMPTY
-                                       : ErrorCode::OBJECT_NOT_FOUND);
-    }
-
-    if (TenantHasObjects(tenant_id)) {
-        restore_policy();
-        return tl::make_unexpected(ErrorCode::TENANT_NOT_EMPTY);
-    }
-
-    policy.tenant_quotas.erase(policy_it);
-    auto save_result = tenant_quota_policy_store_->Save(policy);
-    if (!save_result) {
-        restore_policy();
-        LOG(ERROR) << "failed to save tenant quota policy: "
-                   << save_result.error();
-        return tl::make_unexpected(ErrorCode::PERSISTENT_FAIL);
-    }
-    ApplyTenantQuotaPolicies(policy);
-    return GetTenantQuotaSnapshot(tenant_id);
+    return tenant_quota_manager_.DeletePolicy(
+        tenant_id,
+        [this](const TenantId& tenant) { return TenantHasObjects(tenant); });
 }
 
 auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
@@ -1413,7 +1347,7 @@ bool MasterService::IsTenantRegistered(const TenantId& tenant_id) const {
     if (!enable_multi_tenants_) {
         return true;
     }
-    return tenant_quota_table_.IsTenantRegistered(tenant_id);
+    return tenant_quota_manager_.IsTenantRegistered(tenant_id);
 }
 
 tl::expected<TenantId, ErrorCode> MasterService::ResolveTenantIdForWrite(
@@ -1422,7 +1356,7 @@ tl::expected<TenantId, ErrorCode> MasterService::ResolveTenantIdForWrite(
     if (!enable_multi_tenants_) {
         return TenantId::Default();
     }
-    std::lock_guard<std::mutex> policy_lock(tenant_quota_policy_mutex_);
+    auto policy_lock = tenant_quota_manager_.LockPolicy();
     return ResolveTenantIdForWriteLocked(tenant_id);
 }
 
@@ -1448,50 +1382,6 @@ bool MasterService::TenantHasObjects(const TenantId& tenant_id) const {
         }
     }
     return false;
-}
-
-TenantQuotaPolicySnapshot MasterService::BuildTenantQuotaPolicySnapshot()
-    const {
-    TenantQuotaPolicySnapshot snapshot;
-    for (const auto& [tenant_id, requested_quota_bytes] :
-         tenant_quota_table_.GetTenantPolicies()) {
-        snapshot.tenant_quotas.emplace(tenant_id.value(),
-                                       requested_quota_bytes);
-    }
-    return snapshot;
-}
-
-void MasterService::ApplyTenantQuotaPolicies(
-    const TenantQuotaPolicySnapshot& snapshot) {
-    TenantQuotaPolicyMap policies;
-    for (const auto& [tenant_id, requested_quota_bytes] :
-         snapshot.tenant_quotas) {
-        policies.emplace(TenantId(tenant_id), requested_quota_bytes);
-    }
-    std::lock_guard<std::mutex> recompute_lock(tenant_quota_recompute_mutex_);
-    const uint64_t capacity = GetTenantQuotaAllocatableCapacityBytes();
-    auto result = tenant_quota_table_.ApplyTenantPolicies(policies, capacity);
-    if (!result) {
-        throw std::invalid_argument(
-            "tenant quota policy exceeds atomic accounting range");
-    }
-}
-
-void MasterService::LoadTenantQuotaPoliciesFromStoreOrThrow() {
-    if (!enable_multi_tenants_) {
-        return;
-    }
-    if (!tenant_quota_policy_store_) {
-        throw std::runtime_error(
-            "tenant quota policy store is not initialized");
-    }
-    std::lock_guard<std::mutex> policy_lock(tenant_quota_policy_mutex_);
-    auto snapshot = tenant_quota_policy_store_->Load();
-    if (!snapshot) {
-        throw std::runtime_error("failed to load tenant quota policy: " +
-                                 snapshot.error());
-    }
-    ApplyTenantQuotaPolicies(snapshot.value());
 }
 
 uint64_t MasterService::CompletedMemoryQuotaCharge(
@@ -1537,17 +1427,14 @@ void MasterService::RecomputeTenantEffectiveQuotas() {
     if (!enable_multi_tenants_) {
         return;
     }
-    std::lock_guard<std::mutex> recompute_lock(tenant_quota_recompute_mutex_);
-    const uint64_t capacity = GetTenantQuotaAllocatableCapacityBytes();
-    tenant_quota_table_.RecomputeEffectiveQuotas(capacity);
+    tenant_quota_manager_.Recompute();
 }
 
 MasterService::TenantState& MasterService::GetOrCreateTenantState(
     MetadataShard& shard, const TenantId& tenant_id) {
     auto it = shard.tenants.try_emplace(tenant_id).first;
     if (enable_multi_tenants_ && it->second.quota_account == nullptr) {
-        it->second.quota_account =
-            tenant_quota_table_.GetOrCreateTenantHandle(tenant_id);
+        it->second.quota_account = &tenant_quota_manager_.AccountFor(tenant_id);
     }
     return it->second;
 }
@@ -1626,7 +1513,7 @@ void MasterService::RebuildTenantQuotaUsageFromMetadata() {
         MetadataShardAccessorRW shard(this, i);
         for (auto& [tenant_id, tenant_state] : shard->tenants) {
             tenant_state.quota_account =
-                tenant_quota_table_.GetOrCreateTenantHandle(tenant_id);
+                &tenant_quota_manager_.AccountFor(tenant_id);
             for (auto& [key, metadata] : tenant_state.metadata) {
                 auto rebuild_result = metadata.quota_ledger.Rebuild(
                     tenant_state.quota_account,
@@ -1640,20 +1527,7 @@ void MasterService::RebuildTenantQuotaUsageFromMetadata() {
         }
     }
 
-    for (const auto& [tenant_id, _] : usage) {
-        if (!tenant_quota_table_.IsTenantRegistered(tenant_id)) {
-            LOG(WARNING)
-                << "tenant " << tenant_id.value()
-                << " exists in metadata but has no connector quota policy; "
-                   "creating orphan quota state";
-        }
-    }
-    std::lock_guard<std::mutex> recompute_lock(tenant_quota_recompute_mutex_);
-    const uint64_t capacity = GetTenantQuotaAllocatableCapacityBytes();
-    auto rebuild_result = tenant_quota_table_.RebuildUsage(usage, capacity);
-    if (!rebuild_result) {
-        throw std::runtime_error("failed to rebuild tenant quota usage");
-    }
+    tenant_quota_manager_.RebuildUsageOrThrow(usage);
 }
 
 MasterService::ObjectOperationLock MasterService::AcquireObjectOperationLock(
@@ -6024,10 +5898,9 @@ auto MasterService::AddReplicaForRetainedClient(const UUID& client_id,
     -> tl::expected<bool, ErrorCode> {
     assert(tenant_id.IsValid());
     TenantId normalized_tenant;
-    std::unique_lock<std::mutex> policy_lock(tenant_quota_policy_mutex_,
-                                             std::defer_lock);
+    std::unique_lock<std::mutex> policy_lock;
     if (enable_multi_tenants_) {
-        policy_lock.lock();
+        policy_lock = tenant_quota_manager_.LockPolicy();
         auto normalized_tenant_result =
             ResolveTenantIdForWriteLocked(tenant_id);
         if (!normalized_tenant_result) {
@@ -11028,7 +10901,7 @@ void MasterService::EvictTenantsOverWatermark() {
     const double target_ratio =
         std::max(0.0, tenant_eviction_high_watermark_ratio_ - eviction_ratio_);
 
-    for (const auto& snapshot : tenant_quota_table_.ListTenantSnapshots()) {
+    for (const auto& snapshot : tenant_quota_manager_.ListSnapshots()) {
         if (snapshot.effective_quota_bytes == 0) {
             continue;
         }

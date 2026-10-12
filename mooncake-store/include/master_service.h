@@ -38,8 +38,7 @@
 #include "segment.h"
 #include "local_ssd/manager.h"
 #include "tenant_quota_ledger.h"
-#include "tenant_quota_sharded.h"
-#include "tenant_quota_policy_store.h"
+#include "tenant/quota_manager.h"
 #include "types.h"
 #include "weight_store_manager.h"
 #include "master_config.h"
@@ -109,19 +108,19 @@ void ShrinkBucketsIfSparse(UnorderedContainer& container) {
  * @brief MasterService is the main class for the master server.
  * Lock order: To avoid deadlocks, the following lock order should be followed:
  * 1. client_mutex_
- * 2. tenant_quota_policy_mutex_
+ * 2. tenant_quota_manager_'s policy mutex
  * 3. snapshot_mutex_
  * 4. metadata_shards_[shard_idx_].mutex
- * 5. tenant_quota_recompute_mutex_
+ * 5. tenant_quota_manager_'s recompute mutex
  * 6. ShardedTenantQuotaTable internal mutex or segment_mutex_
  * 7. soft_pin_deadline_index_ mutex
  *
- * Strict tenant admission and policy mutation paths that need both
- * tenant_quota_policy_mutex_ and snapshot_mutex_ must acquire the tenant
- * policy mutex first, then snapshot_mutex_.
- * tenant_quota_recompute_mutex_ serializes the capacity snapshot and the
- * corresponding quota-table update. The segment mutex is released before
- * entering ShardedTenantQuotaTable, so these two locks are never nested.
+ * Strict tenant admission and policy mutation paths that need both the tenant
+ * policy mutex and snapshot_mutex_ must acquire the tenant policy mutex first,
+ * then snapshot_mutex_.
+ * The recompute mutex serializes the capacity snapshot and the corresponding
+ * quota-table update. The segment mutex is released before entering
+ * ShardedTenantQuotaTable, so these two locks are never nested.
  */
 
 class MasterService {
@@ -1441,9 +1440,6 @@ class MasterService {
     void ReleaseTenantQuota(TenantQuotaHandle account, uint64_t bytes);
     void RecomputeTenantEffectiveQuotas();
     void RebuildTenantQuotaUsageFromMetadata();
-    void LoadTenantQuotaPoliciesFromStoreOrThrow();
-    void ApplyTenantQuotaPolicies(const TenantQuotaPolicySnapshot& snapshot);
-    TenantQuotaPolicySnapshot BuildTenantQuotaPolicySnapshot() const;
     std::unordered_map<std::string, ObjectMetadata>::iterator EraseMetadata(
         TenantState& tenant_state,
         std::unordered_map<std::string, ObjectMetadata>::iterator it,
@@ -2228,10 +2224,8 @@ class MasterService {
     const bool enable_disk_eviction_;
     const uint64_t quota_bytes_;
     const bool enable_multi_tenants_;
-    std::unique_ptr<TenantQuotaPolicyStore> tenant_quota_policy_store_;
-    mutable std::mutex tenant_quota_policy_mutex_;
-    mutable std::mutex tenant_quota_recompute_mutex_;
-    ShardedTenantQuotaTable<1024> tenant_quota_table_;
+    TenantQuotaManager tenant_quota_manager_{
+        [this] { return GetTenantQuotaAllocatableCapacityBytes(); }};
 
     // HTTP metadata server pointer for cleanup on client timeout
     // nullptr means cleanup is disabled

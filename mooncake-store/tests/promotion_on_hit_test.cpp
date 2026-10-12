@@ -21,7 +21,7 @@
 
 #include <unistd.h>
 
-#include "tenant_quota_policy_store.h"
+#include "tenant/quota_policy_store.h"
 #include "types.h"
 
 namespace mooncake::test {
