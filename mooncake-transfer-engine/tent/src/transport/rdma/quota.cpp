@@ -651,17 +651,6 @@ SelectionStats DeviceSelector::getSelectionStats() const {
     return stats;
 }
 
-void DeviceSelector::resetSelectionStats() {
-    selection_allocations_.store(0, std::memory_order_relaxed);
-    selection_single_path_allocations_.store(0, std::memory_order_relaxed);
-    selection_multi_path_allocations_.store(0, std::memory_order_relaxed);
-    selection_probe_allocations_.store(0, std::memory_order_relaxed);
-    for (auto& [dev_id, dev] : devices_) {
-        dev.selected_slices.store(0, std::memory_order_relaxed);
-        dev.selected_bytes.store(0, std::memory_order_relaxed);
-    }
-}
-
 void DeviceSelector::printTrafficStats() {
     std::cout << "=== Device Traffic Statistics ===" << std::endl;
     for (const auto& [dev_id, dev] : devices_) {

@@ -269,8 +269,6 @@ class DeviceSelector {
     // These counters do not participate in device scoring or accounting.
     // Concurrent snapshots are best-effort and may span in-flight allocations.
     SelectionStats getSelectionStats() const;
-    // Reset a measurement window while no allocations are in progress.
-    void resetSelectionStats();
 
     void updateTrafficStats(int dev_id, uint64_t length) {
         auto it = devices_.find(dev_id);

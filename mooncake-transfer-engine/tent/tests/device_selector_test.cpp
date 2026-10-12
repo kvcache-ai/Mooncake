@@ -979,31 +979,6 @@ TEST(DeviceSelectorSelectionStatsTest, UnavailableDeviceKeepsHistoricalStats) {
     EXPECT_EQ(stats.devices[1].selected_bytes, kMiB);
 }
 
-TEST(DeviceSelectorSelectionStatsTest, ResetPreservesSchedulingState) {
-    auto sel = makeTwoNicSelector();
-    int chosen = -1;
-    ASSERT_TRUE(sel->allocate(kMiB, "cpu:0", chosen).ok());
-    ASSERT_TRUE(sel->release(chosen, kMiB, kMiB / 1e9).ok());
-    const double ewma = sel->getAggregateEwmaBandwidth();
-
-    ASSERT_TRUE(sel->allocate(kMiB, "cpu:0", chosen).ok());
-    const auto inflight = sel->getInflightBytes(chosen);
-    ASSERT_EQ(inflight, kMiB);
-
-    sel->resetSelectionStats();
-    const auto stats = sel->getSelectionStats();
-    EXPECT_EQ(stats.allocations, 0u);
-    EXPECT_EQ(stats.single_path_allocations, 0u);
-    EXPECT_EQ(stats.multi_path_allocations, 0u);
-    for (const auto& device : stats.devices) {
-        EXPECT_EQ(device.selected_slices, 0u);
-        EXPECT_EQ(device.selected_bytes, 0u);
-    }
-    EXPECT_DOUBLE_EQ(sel->getAggregateEwmaBandwidth(), ewma);
-    EXPECT_EQ(sel->getInflightBytes(chosen), inflight);
-    ASSERT_TRUE(sel->release(chosen, kMiB, 0.0).ok());
-}
-
 TEST(DeviceSelectorSelectionStatsTest, EmptySelectionDoesNotRecordCounters) {
     auto sel = makeTwoNicSelector();
     std::vector<int> selected;
