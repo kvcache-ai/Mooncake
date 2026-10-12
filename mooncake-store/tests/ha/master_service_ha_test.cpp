@@ -3951,7 +3951,6 @@ TEST_F(MasterServiceHATest, OplogDoesNotStartWithUnsupportedHABackend) {
     EXPECT_FALSE(HasOpLogWriter(service));
 }
 
-
 TEST_F(MasterServiceHATest, OplogRedisWithoutConnstringDoesNotCreateWriter) {
     auto config = MasterServiceConfig::builder()
                       .set_enable_ha(true)
