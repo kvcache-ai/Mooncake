@@ -93,11 +93,12 @@ The deadline is also **capped by the batch's earliest lease expiry** (minus a
 margin for the fallback transfer itself): the batch query grants every key's
 lease up front and transfers are submitted after the wait loop, so a wait
 outliving a lease would turn co-resident keys' successful transfers into
-`LEASE_EXPIRED`. On a missed wait, the SSD fallback re-queries the key with a
-fresh lease before transferring. On a successful wait, the descriptor used
-for the transfer comes from a lease-granting `Query()` — the read-only probe
-result's lease is expired by design and would fail the post-transfer lease
-check deterministically.
+`LEASE_EXPIRED`. The wait helper itself returns only an outcome (skipped /
+completed / failed / timed out) and never issues an RPC. Keys that actually
+waited or completed are refreshed with **one batch lease-granting query**
+after the loop, and their transfer operations are built from the fresh
+descriptors and leases — so no serial per-key re-queries, and no transfer
+runs on a nearly-spent lease.
 
 Wait only when this process has a live local promotion (`kInFlight` /
 `kCompleted`). Do **not** wait on `kTriggered` (pool job still queued),

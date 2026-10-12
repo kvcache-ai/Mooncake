@@ -7668,7 +7668,9 @@ RealClient::batch_get_into_multi_buffers_internal(
     }
 
     const size_t num_keys = keys.size();
-    std::vector<tl::expected<int64_t, ErrorCode>> results;
+    // Indexed by key position; the wait-deferral path below writes a
+    // placeholder first and overwrites it after the batch refresh.
+    std::vector<tl::expected<int64_t, ErrorCode>> results(num_keys);
     results.reserve(num_keys);
     if (num_keys == 0) {
         return results;
@@ -7768,65 +7770,12 @@ RealClient::batch_get_into_multi_buffers_internal(
             prefetcher_->TriggerPrefetch(disk_keys, /*ignore_cooldown=*/true);
         }
     }
-    for (size_t i = 0; i < num_keys; ++i) {
+    // Shared by the main loop (unwaited keys) and the post-wait refresh
+    // rebuild below: registers the transfer operation for key i from the
+    // chosen replica and the given (possibly refreshed) query result.
+    auto build_transfer_op = [&](size_t i, const QueryResult &qr_values,
+                                 const Replica::Descriptor &replica) {
         const auto &key = keys[i];
-        // Handle query failures
-        if (!query_results[i]) {
-            const auto error = query_results[i].error();
-            results.emplace_back(tl::unexpected(error));
-            if (error != ErrorCode::OBJECT_NOT_FOUND) {
-                LOG(ERROR) << "Query failed for key '" << key
-                           << "': " << toString(error);
-            }
-            continue;
-        }
-        // Validate replica list
-        const auto &query_result_values = query_results[i].value();
-        if (query_result_values.replicas.empty()) {
-            LOG(ERROR) << "Empty replica list for key: " << key;
-            results.emplace_back(tl::unexpected(ErrorCode::INVALID_REPLICA));
-            continue;
-        }
-        // Select best replica: prefer local MEMORY, any MEMORY, local NOF,
-        // any NOF, LOCAL_DISK, DFS, then DISK. Master may return multiple
-        // replicas in any order, so always scan.
-        const auto *best_replica =
-            SelectBestReplica(query_result_values.replicas, local_endpoints);
-        if (!best_replica) {
-            LOG(ERROR) << "No usable replica for key: " << key;
-            results.emplace_back(tl::unexpected(ErrorCode::INVALID_REPLICA));
-            continue;
-        }
-
-        // Optional get-side wait for SSD prefetch. Budget is shared across
-        // this batch (remaining time until get_wait_deadline).
-        std::optional<QueryResult> refreshed_qr;
-        if (get_wait && best_replica->is_local_disk_replica()) {
-            const int64_t remaining =
-                get_wait_deadline - PrefetchThrottle::NowMs();
-            auto outcome = SsdPrefetcher::WaitOutcome::kSkipped;
-            if (remaining > 0) {
-                outcome = prefetcher_->WaitIfPromotionInFlight(key, remaining);
-            }
-            // After an actual wait (completed, failed, or timed out) the
-            // original query is stale: the lease is nearly spent (the
-            // deadline is capped by it), and a completed promotion means a
-            // fresh MEMORY replica to pick up. Re-query once with a fresh
-            // lease; skipped keys keep the original result untouched.
-            if (outcome != SsdPrefetcher::WaitOutcome::kSkipped) {
-                if (auto fresh = client_->Query(key);
-                    fresh && !fresh->replicas.empty()) {
-                    refreshed_qr.emplace(std::move(*fresh));
-                    const auto *best = SelectBestReplica(refreshed_qr->replicas,
-                                                         local_endpoints);
-                    if (best != nullptr) {
-                        best_replica = best;
-                    }
-                }
-            }
-        }
-
-        const auto replica = *best_replica;
         uint64_t total_size = calculate_total_size(replica);
         const auto &sizes = all_sizes[i];
         uint64_t dst_total_size = 0;
@@ -7837,8 +7786,8 @@ RealClient::batch_get_into_multi_buffers_internal(
             LOG(ERROR) << "Buffer too small for key '" << key
                        << "': required=" << total_size
                        << ", available=" << dst_total_size;
-            results.emplace_back(tl::unexpected(ErrorCode::INVALID_PARAMS));
-            continue;
+            results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
+            return;
         }
         // Create slices for this key's buffer
         const auto &buffers = all_buffers[i];
@@ -7863,38 +7812,125 @@ RealClient::batch_get_into_multi_buffers_internal(
                                     .buffers = all_buffers[i],
                                     .sizes = all_sizes[i],
                                     .total_size = total_size});
-                results.emplace_back(static_cast<int64_t>(total_size));
-                continue;
+                results[i] = static_cast<int64_t>(total_size);
+                return;
             }
             valid_local_disk_ops.emplace(
                 key,
                 DiskKeyInfo{.key = key,
                             .original_index = i,
-                            .query_result = std::move(query_result_values),
+                            .query_result = qr_values,
                             .buffers = all_buffers[i],
                             .sizes = all_sizes[i],
                             .total_size = total_size,
                             .replica = replica,
                             .is_local_disk = replica.is_local_disk_replica()});
-            results.emplace_back(static_cast<int64_t>(total_size));
-            continue;
-        } else {
+            results[i] = static_cast<int64_t>(total_size);
+            return;
+        }
+        if (!replica.is_memory_replica() && !replica.is_nof_replica()) {
             LOG(ERROR) << "Unsupported replica type for key: " << key;
-            results.emplace_back(tl::unexpected(ErrorCode::INVALID_PARAMS));
-            continue;
+            results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
+            return;
         }
 
         valid_operations.push_back(
             {.key = key,
              .original_index = i,
-             .query_result = FilterQueryResult(refreshed_qr.has_value()
-                                                   ? refreshed_qr.value()
-                                                   : query_result_values,
-                                               replica),
+             .query_result = FilterQueryResult(qr_values, replica),
              .slices = std::move(key_slices),
              .total_size = total_size});
         // Set success result (actual bytes transferred)
-        results.emplace_back(static_cast<int64_t>(total_size));
+        results[i] = static_cast<int64_t>(total_size);
+    };
+
+    std::vector<size_t> refresh_pending;
+    for (size_t i = 0; i < num_keys; ++i) {
+        const auto &key = keys[i];
+        // Handle query failures
+        if (!query_results[i]) {
+            const auto error = query_results[i].error();
+            results[i] = tl::unexpected(error);
+            if (error != ErrorCode::OBJECT_NOT_FOUND) {
+                LOG(ERROR) << "Query failed for key '" << key
+                           << "': " << toString(error);
+            }
+            continue;
+        }
+        // Validate replica list
+        const auto &query_result_values = query_results[i].value();
+        if (query_result_values.replicas.empty()) {
+            LOG(ERROR) << "Empty replica list for key: " << key;
+            results[i] = tl::unexpected(ErrorCode::INVALID_REPLICA);
+            continue;
+        }
+        // Select best replica: prefer local MEMORY, any MEMORY, local NOF,
+        // any NOF, LOCAL_DISK, DFS, then DISK. Master may return multiple
+        // replicas in any order, so always scan.
+        const auto *best_replica =
+            SelectBestReplica(query_result_values.replicas, local_endpoints);
+        if (!best_replica) {
+            LOG(ERROR) << "No usable replica for key: " << key;
+            results[i] = tl::unexpected(ErrorCode::INVALID_REPLICA);
+            continue;
+        }
+
+        // Optional get-side wait for SSD prefetch. Budget is shared across
+        // this batch (remaining time until get_wait_deadline).
+        if (get_wait && best_replica->is_local_disk_replica()) {
+            const int64_t remaining =
+                get_wait_deadline - PrefetchThrottle::NowMs();
+            auto outcome = SsdPrefetcher::WaitOutcome::kSkipped;
+            if (remaining > 0) {
+                outcome = prefetcher_->WaitIfPromotionInFlight(key, remaining);
+            }
+            if (outcome != SsdPrefetcher::WaitOutcome::kSkipped) {
+                // After an actual wait or an observed completion the original
+                // query result is stale: its lease is nearly spent (the
+                // deadline is capped by it), and a completed promotion means
+                // a fresh MEMORY replica to pick up. Defer op-building to the
+                // single batch refresh after this loop.
+                refresh_pending.push_back(i);
+                results[i] = tl::unexpected(ErrorCode::INTERNAL_ERROR);
+                continue;
+            }
+        }
+
+        build_transfer_op(i, query_result_values, *best_replica);
+    }
+
+    // Keys that actually waited (or completed mid-wait) have stale entries:
+    // the batch query granted their leases before the loop, and a completed
+    // promotion means a fresh MEMORY replica to pick up. Refresh them with
+    // one batch lease-granting query, then build their transfer operations
+    // from the fresh descriptors and leases — one bounded RPC, not N serial
+    // per-key re-queries.
+    if (!refresh_pending.empty()) {
+        std::vector<std::string> pending_keys;
+        pending_keys.reserve(refresh_pending.size());
+        for (const size_t idx : refresh_pending) {
+            pending_keys.push_back(keys[idx]);
+        }
+        auto fresh_results = client_->BatchQuery(pending_keys);
+        for (size_t j = 0; j < refresh_pending.size(); ++j) {
+            const size_t idx = refresh_pending[j];
+            const QueryResult *qr = nullptr;
+            if (j < fresh_results.size() && fresh_results[j] &&
+                !fresh_results[j]->replicas.empty()) {
+                qr = &fresh_results[j].value();
+            } else {
+                // Refresh failed for this key: fall back to the original
+                // (stale-lease) metadata, same as the no-wait behavior.
+                qr = &query_results[idx].value();
+            }
+            const auto *best = SelectBestReplica(qr->replicas, local_endpoints);
+            if (best == nullptr) {
+                LOG(ERROR) << "No usable replica for key: " << keys[idx];
+                results[idx] = tl::unexpected(ErrorCode::INVALID_REPLICA);
+                continue;
+            }
+            build_transfer_op(idx, *qr, *best);
+        }
     }
     // Early return if no valid operations
     if (valid_operations.empty() && valid_local_disk_ops.empty()) {
