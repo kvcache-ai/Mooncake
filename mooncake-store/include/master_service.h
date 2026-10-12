@@ -1103,18 +1103,8 @@ class MasterService {
         std::unordered_map<std::string, PromotionCandidate>
             promotion_candidates;
 
-        std::unordered_map<std::string, DynamicReplicaPending>
-            dynamic_replication_pending;
-        std::unordered_map<UUID, ReplicaActionLease, boost::hash<UUID>>
-            dynamic_replication_leases;
-        std::unordered_map<std::string, std::chrono::steady_clock::time_point>
-            dynamic_replication_cooldowns;
-
         bool Empty() const {
-            return metadata.empty() && promotion_candidates.empty() &&
-                   dynamic_replication_pending.empty() &&
-                   dynamic_replication_leases.empty() &&
-                   dynamic_replication_cooldowns.empty();
+            return metadata.empty() && promotion_candidates.empty();
         }
     };
 
@@ -1813,6 +1803,9 @@ class MasterService {
             return it_->second.state;
         }
 
+        // The tenant the object was resolved under.
+        const TenantId& GetTenantId() const { return object_id_.tenant_id; }
+
         ReplicationTask& GetReplicationTask() NO_THREAD_SAFETY_ANALYSIS {
             return *it_->second.state.replication_task;
         }
@@ -2055,33 +2048,27 @@ class MasterService {
     // from any GetReplicaList caller without additional locking.
     std::unique_ptr<CountMinSketch> promotion_sketch_;
 
-    // Hot-object MEMORY replication: heat admission and placement. The
-    // pending task, cooldown and leases of a key stay in its TenantState.
+    // Hot-object MEMORY replication: heat admission, placement and the leases
+    // a client copies inside. The pending task of a key stays on its record.
     DynamicReplicationController dynamic_replication_;
 
     void TrySubmitDynamicReplicaProposal(const ObjectIdentity& object_id);
     tl::expected<ReplicaActionLease, ErrorCode>
     SubmitReplicaActionProposalLocked(const ReplicaActionProposal& proposal);
-    void ClearDynamicReplicationStateForKey(TenantState& tenant_state,
-                                            const std::string& key);
     void CleanupExpiredDynamicReplicationState();
-    bool HasDynamicReplicationPending(TenantState& tenant_state,
-                                      const std::string& key);
     tl::expected<UUID, ErrorCode> SubmitDynamicReplicaCopyTask(
         const ObjectIdentity& object_id,
         const DynamicReplicationController::Plan& plan, const UUID& lease_id,
         uint64_t version_epoch);
+    // Runs under the shard lock CopyStart holds for the whole operation, so
+    // the pending state it reads is the one that copy was admitted for.
     tl::expected<void, ErrorCode> ValidateDynamicReplicaPendingForCopyStart(
-        TenantState& tenant_state, const std::string& key,
-        const UUID& dynamic_replication_lease_id, const UUID& client_id,
-        const std::string& source_segment, uint64_t current_version_epoch,
+        route::ObjectState& state, const TenantId& tenant_id,
+        const std::string& key, const UUID& dynamic_replication_lease_id,
+        const UUID& client_id, const std::string& source_segment,
+        uint64_t current_version_epoch,
         uint64_t dynamic_replication_version_epoch,
         const std::vector<std::string>& target_segments);
-    void RegisterDynamicReplicaStart(
-        TenantState& tenant_state, ObjectMetadata& metadata,
-        const std::string& key, const std::string& source_segment,
-        uint64_t version_epoch, const std::vector<std::string>& target_segments,
-        const std::vector<ReplicaID>& replica_ids);
 
     const bool enable_oplog_;
     const bool weight_management_mutations_enabled_;

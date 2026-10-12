@@ -3,7 +3,9 @@
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <cassert>
 #include <cmath>
+#include <iterator>
 #include <limits>
 #include <tuple>
 #include <utility>
@@ -207,7 +209,7 @@ void DynamicReplicationController::AdmissionThreadFunc() {
     VLOG(1) << "action=dynamic_replication_admission_thread_stopped";
 }
 
-// --- Proposals ---------------------------------------------------------------
+// --- Proposals and leases ---------------------------------------------------
 
 ReplicaActionProposal DynamicReplicationController::MakeAutoProposal(
     const TenantId& tenant_id, const std::string& key) const {
@@ -240,6 +242,45 @@ tl::expected<void, ErrorCode> DynamicReplicationController::ValidateProposal(
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     return {};
+}
+
+tl::expected<std::optional<ReplicaActionLease>, ErrorCode>
+DynamicReplicationController::FindReusableLease(
+    const TenantId& tenant_id, const std::string& key,
+    const ReplicaActionProposal& proposal, int64_t now_ms) {
+    std::lock_guard<std::mutex> lock(lease_mutex_);
+    const auto table = leases_.find(tenant_id);
+    if (table == leases_.end()) {
+        return std::nullopt;
+    }
+    auto existing_lease = table->second.Find(proposal.proposal_id);
+    if (!existing_lease.has_value()) {
+        return std::nullopt;
+    }
+    if (existing_lease->expire_at_ms_epoch < now_ms) {
+        // The expired lease is dropped before the new proposal is recorded;
+        // whether this call removed it is not interesting here.
+        (void)table->second.Remove(proposal.proposal_id);
+        if (table->second.Empty()) {
+            leases_.erase(table);
+        }
+        return std::nullopt;
+    }
+    const bool same_request =
+        existing_lease->action == proposal.action &&
+        existing_lease->tenant_id == tenant_id.value() &&
+        existing_lease->key == key &&
+        (proposal.observed_version_epoch == 0 ||
+         existing_lease->version_epoch == proposal.observed_version_epoch) &&
+        (!proposal.preferred_target_segment.has_value() ||
+         existing_lease->target_segment ==
+             *proposal.preferred_target_segment) &&
+        (proposal.target_domain.empty() ||
+         existing_lease->target_domain == proposal.target_domain);
+    if (!same_request) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return existing_lease;
 }
 
 std::optional<DynamicReplicationController::Plan>
@@ -386,6 +427,235 @@ DynamicReplicationController::SelectPlan(
         .target_domain = std::move(target_domain),
         .source_liveness = source_liveness->second,
     };
+}
+
+std::optional<ReplicaActionLease> DynamicReplicationController::FindLease(
+    const TenantId& tenant_id, const UUID& proposal_id) const {
+    std::lock_guard<std::mutex> lock(lease_mutex_);
+    const auto it = leases_.find(tenant_id);
+    if (it == leases_.end()) {
+        return std::nullopt;
+    }
+    return it->second.Find(proposal_id);
+}
+
+void DynamicReplicationController::EraseLeasesForObject(
+    const TenantId& tenant_id, std::string_view key) {
+    std::lock_guard<std::mutex> lock(lease_mutex_);
+    const auto it = leases_.find(tenant_id);
+    if (it == leases_.end()) {
+        return;
+    }
+    it->second.EraseForObject(key);
+    if (it->second.Empty()) {
+        leases_.erase(it);
+    }
+}
+
+void DynamicReplicationController::EraseExpiredLeases(
+    std::chrono::system_clock::time_point now) {
+    std::lock_guard<std::mutex> lock(lease_mutex_);
+    for (auto it = leases_.begin(); it != leases_.end();) {
+        it->second.EraseExpired(now);
+        it = it->second.Empty() ? leases_.erase(it) : std::next(it);
+    }
+}
+
+std::vector<std::pair<TenantId, std::string>>
+DynamicReplicationController::PendingKeys() const {
+    std::vector<std::pair<TenantId, std::string>> keys;
+    std::lock_guard<std::mutex> lock(pending_mutex_);
+    for (const auto& [tenant_id, tenant_keys] : pending_keys_) {
+        for (const auto& key : tenant_keys) {
+            keys.emplace_back(tenant_id, key);
+        }
+    }
+    return keys;
+}
+
+void DynamicReplicationController::UnindexPendingLocked(
+    const TenantId& tenant_id, const std::string& key) {
+    std::lock_guard<std::mutex> lock(pending_mutex_);
+    const auto it = pending_keys_.find(tenant_id);
+    if (it == pending_keys_.end()) {
+        return;
+    }
+    it->second.erase(key);
+    if (it->second.empty()) {
+        pending_keys_.erase(it);
+    }
+}
+
+// --- Per-object pending state ------------------------------------------------
+
+tl::expected<void, ErrorCode> DynamicReplicationController::CheckCooldownLocked(
+    route::ObjectState& state) const {
+    if (state.dynamic_replication_cooldown ==
+        std::chrono::steady_clock::time_point{}) {
+        return {};
+    }
+    if (state.dynamic_replication_cooldown > std::chrono::steady_clock::now()) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+    state.dynamic_replication_cooldown =
+        std::chrono::steady_clock::time_point{};
+    return {};
+}
+
+ReplicaActionLease DynamicReplicationController::IssueLeaseLocked(
+    route::ObjectState& state, const TenantId& tenant_id,
+    const std::string& key, const ReplicaActionProposal& proposal,
+    const Plan& plan, uint64_t version_epoch, int64_t now_ms) {
+    const int64_t server_deadline_ms = now_ms + kLeaseTtl.count();
+
+    ReplicaActionLease lease;
+    lease.proposal_id = proposal.proposal_id;
+    lease.lease_id = generate_uuid();
+    lease.action = ReplicaActionType::ADD;
+    lease.tenant_id = tenant_id.value();
+    lease.key = key;
+    lease.source_segment = plan.source_segment;
+    lease.target_segment = plan.target_segment;
+    lease.target_domain = plan.target_domain;
+    lease.version_epoch = version_epoch;
+    lease.expire_at_ms_epoch =
+        proposal.expire_at_ms_epoch > 0
+            ? std::min(proposal.expire_at_ms_epoch, server_deadline_ms)
+            : server_deadline_ms;
+
+    state.dynamic_replication_pending =
+        DynamicReplicaPending{.proposal_id = lease.proposal_id,
+                              .lease_id = lease.lease_id,
+                              .source_segment = lease.source_segment,
+                              .target_segment = lease.target_segment,
+                              .target_domain = lease.target_domain,
+                              .version_epoch = lease.version_epoch,
+                              .expire_at_ms_epoch = lease.expire_at_ms_epoch,
+                              .task_id = UUID{}};
+    std::lock_guard<std::mutex> lock(pending_mutex_);
+    pending_keys_[tenant_id].insert(key);
+    return lease;
+}
+
+void DynamicReplicationController::CommitLeaseLocked(
+    route::ObjectState& state, const TenantId& tenant_id,
+    const std::string& key, const ReplicaActionLease& lease) {
+    assert(state.dynamic_replication_pending.has_value());
+    // A lease is filed under the key of the object it was issued for.
+    assert(lease.key == key);
+    state.dynamic_replication_pending->task_id = lease.task_id;
+    state.dynamic_replication_cooldown =
+        std::chrono::steady_clock::now() + kActionCooldown;
+    std::lock_guard<std::mutex> lock(lease_mutex_);
+    leases_[tenant_id].Put(lease.proposal_id, lease);
+}
+
+bool DynamicReplicationController::PendingExpiredLocked(
+    const route::ObjectState& state, int64_t now_ms) const {
+    return state.dynamic_replication_pending.has_value() &&
+           state.dynamic_replication_pending->expire_at_ms_epoch < now_ms;
+}
+
+bool DynamicReplicationController::HasPendingLocked(const TenantId& tenant_id,
+                                                    const std::string& key,
+                                                    route::ObjectState& state) {
+    if (!state.dynamic_replication_pending.has_value()) {
+        return false;
+    }
+    if (!PendingExpiredLocked(state, NowMs())) {
+        return true;
+    }
+    ClearPendingLocked(tenant_id, key, state);
+    return false;
+}
+
+void DynamicReplicationController::ClearPendingLocked(
+    const TenantId& tenant_id, const std::string& key,
+    route::ObjectState& state) {
+    state.dynamic_replication_pending.reset();
+    state.dynamic_replication_cooldown =
+        std::chrono::steady_clock::time_point{};
+    EraseLeasesForObject(tenant_id, key);
+    UnindexPendingLocked(tenant_id, key);
+}
+
+tl::expected<void, ErrorCode>
+DynamicReplicationController::ValidateCopyStartLocked(
+    route::ObjectState& state, const TenantId& tenant_id,
+    const std::string& key, const UUID& lease_id,
+    const std::string& source_segment, uint64_t current_version_epoch,
+    uint64_t lease_version_epoch,
+    const std::vector<std::string>& target_segments) {
+    const bool dynamic_copy = lease_id != UUID{};
+    // Dropping a pending task clears its cooldown and its leases with it, so
+    // the next proposal is not held back by the abandoned one.
+    auto drop_pending = [&] { ClearPendingLocked(tenant_id, key, state); };
+    if (!state.dynamic_replication_pending.has_value()) {
+        if (dynamic_copy) {
+            return tl::make_unexpected(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        }
+        return {};
+    }
+    // Taken by value: the branches below reset the pending state this reference
+    // would otherwise point into.
+    const auto pending = *state.dynamic_replication_pending;
+    if (pending.expire_at_ms_epoch < NowMs()) {
+        drop_pending();
+        if (dynamic_copy) {
+            return tl::make_unexpected(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        }
+        return {};
+    }
+    if (!dynamic_copy) {
+        return tl::make_unexpected(ErrorCode::OBJECT_HAS_REPLICATION_TASK);
+    }
+    if (pending.version_epoch != current_version_epoch) {
+        drop_pending();
+        return tl::make_unexpected(ErrorCode::INVALID_VERSION);
+    }
+    if (pending.lease_id != lease_id ||
+        pending.version_epoch != lease_version_epoch) {
+        return tl::make_unexpected(ErrorCode::INVALID_VERSION);
+    }
+    if (pending.source_segment != source_segment ||
+        target_segments.size() != 1 ||
+        target_segments.front() != pending.target_segment) {
+        return tl::make_unexpected(ErrorCode::OBJECT_HAS_REPLICATION_TASK);
+    }
+    return {};
+}
+
+void DynamicReplicationController::RegisterCopyStartLocked(
+    ObjectMetadata& metadata, route::ObjectState& state,
+    const std::string& source_segment, uint64_t version_epoch,
+    const std::vector<std::string>& target_segments,
+    const std::vector<ReplicaID>& replica_ids) const {
+    if (!state.dynamic_replication_pending.has_value()) {
+        return;
+    }
+    const auto pending = *state.dynamic_replication_pending;
+    state.dynamic_replication_pending.reset();
+    if (pending.source_segment != source_segment ||
+        pending.expire_at_ms_epoch < NowMs() ||
+        pending.version_epoch != version_epoch) {
+        return;
+    }
+    for (size_t i = 0; i < target_segments.size() && i < replica_ids.size();
+         ++i) {
+        if (target_segments[i] != pending.target_segment) {
+            continue;
+        }
+        metadata.MarkDynamicReplica(
+            replica_ids[i], ObjectMetadata::DynamicReplicaRecord{
+                                .created_at = std::chrono::system_clock::now(),
+                                .source_segment = pending.source_segment,
+                                .target_segment = pending.target_segment,
+                                .target_domain = pending.target_domain,
+                                .complete = false});
+        return;
+    }
 }
 
 size_t DynamicReplicationController::RecordReplicaRemoval(

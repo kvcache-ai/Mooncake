@@ -124,6 +124,22 @@ class MasterServiceTestPeer {
         return service.dynamic_replication_.windows_;
     }
 
+    // A replica-action lease is recorded per tenant and keyed by proposal id,
+    // so a caller names both.
+    static std::optional<ReplicaActionLease> FindDynamicReplicationLease(
+        MasterService& service, const TenantId& tenant_id,
+        const UUID& proposal_id) {
+        return service.dynamic_replication_.FindLease(tenant_id, proposal_id);
+    }
+
+    // A tenant keeps a lease table only while one of its leases is in flight.
+    static bool HasDynamicReplicationLeaseTable(
+        const DynamicReplicationController& controller,
+        const TenantId& tenant_id) {
+        std::lock_guard<std::mutex> lock(controller.lease_mutex_);
+        return controller.leases_.contains(tenant_id);
+    }
+
     static auto& EnableDfs(MasterService& service) {
         return service.enable_dfs_;
     }
@@ -333,9 +349,11 @@ class MasterServiceTestPeer {
 
     void ClearCandidatesForReload() { service_.ClearCandidatesForReload(); }
 
-    void ClearDynamicReplicationStateForKey(TenantState& tenant_state,
-                                            const std::string& key) {
-        service_.ClearDynamicReplicationStateForKey(tenant_state, key);
+    // The caller holds the object's shard, as through MetadataAccessorRW.
+    void ClearDynamicReplicationStateForKey(const TenantId& tenant_id,
+                                            const std::string& key,
+                                            route::ObjectState& state) {
+        service_.dynamic_replication_.ClearPendingLocked(tenant_id, key, state);
     }
 
     void ClearLocalDiskHandlesOwnedBy(const UUID& owner) {
