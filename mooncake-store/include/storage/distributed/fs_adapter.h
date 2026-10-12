@@ -16,6 +16,14 @@ struct FileInfo {
     size_t size;
 };
 
+// One positional I/O for FileSystemAdapter::BatchWriteAt/BatchReadAt.
+struct FdIoRequest {
+    int fd;
+    iovec* iov;
+    int iovcnt;
+    int64_t offset;
+};
+
 /**
  * @brief Abstract interface for distributed filesystem adapters.
  *
@@ -130,6 +138,38 @@ class FileSystemAdapter {
                                                    int /*iovcnt*/,
                                                    int64_t /*offset*/) {
         return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+
+    // Opt in to backend batching and concurrent positional I/O on cached
+    // shard fds. Other adapters retain per-request bucket handles and
+    // serialized shard I/O.
+    virtual bool SupportsBatchIo() const { return false; }
+
+    // Batched positional I/O. Adapters may override these to keep several
+    // requests in flight; the defaults issue one WriteAt/ReadAt per request,
+    // in order. Return exactly one result per request, in the same order,
+    // with the same short-transfer semantics as WriteAt/ReadAt. Requests may
+    // target the same fd and may be issued concurrently by multiple callers.
+    virtual std::vector<tl::expected<size_t, ErrorCode>> BatchWriteAt(
+        std::span<const FdIoRequest> requests) {
+        std::vector<tl::expected<size_t, ErrorCode>> results;
+        results.reserve(requests.size());
+        for (const auto& request : requests) {
+            results.push_back(WriteAt(request.fd, request.iov, request.iovcnt,
+                                      request.offset));
+        }
+        return results;
+    }
+
+    virtual std::vector<tl::expected<size_t, ErrorCode>> BatchReadAt(
+        std::span<const FdIoRequest> requests) {
+        std::vector<tl::expected<size_t, ErrorCode>> results;
+        results.reserve(requests.size());
+        for (const auto& request : requests) {
+            results.push_back(ReadAt(request.fd, request.iov, request.iovcnt,
+                                     request.offset));
+        }
+        return results;
     }
 
     // === Lifecycle ===

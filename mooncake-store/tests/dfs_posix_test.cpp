@@ -996,6 +996,18 @@ class ControlledPosixFsAdapter : public PosixFsAdapter {
     int WriteCallCount() const { return write_calls_.load(); }
     int ReadCallCount() const { return read_calls_.load(); }
 
+    std::vector<tl::expected<size_t, ErrorCode>> BatchWriteAt(
+        std::span<const FdIoRequest> requests) override {
+        ADD_FAILURE() << "POSIX shard writes must retain per-request I/O";
+        return PosixFsAdapter::BatchWriteAt(requests);
+    }
+
+    std::vector<tl::expected<size_t, ErrorCode>> BatchReadAt(
+        std::span<const FdIoRequest> requests) override {
+        ADD_FAILURE() << "POSIX shard reads must retain per-request I/O";
+        return PosixFsAdapter::BatchReadAt(requests);
+    }
+
     tl::expected<size_t, ErrorCode> WriteAt(int fd, const iovec* iov,
                                             int iovcnt,
                                             int64_t offset) override {
