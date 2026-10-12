@@ -2709,27 +2709,27 @@ tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
                     // the record (its source replica is stale), so cancel it
                     // now: keeping it would let a dead holder pin the
                     // cluster-wide in-flight cap until the lease lapses.
-                    auto task_it =
-                        tenant_state.promotion_tasks.find(stale_keys[j].second);
-                    if (task_it != tenant_state.promotion_tasks.end()) {
-                        if (auto* source = it->second.GetReplicaByID(
-                                task_it->second.source_id);
+                    auto& task = it->second.state.promotion_task;
+                    if (task) {
+                        if (auto* source = it->second.metadata.GetReplicaByID(
+                                task->source_id);
                             source != nullptr) {
                             source->dec_refcnt();
                         }
-                        if (task_it->second.alloc_id != 0) {
-                            const ReplicaID alloc_id = task_it->second.alloc_id;
+                        const ReplicaID alloc_id = task->alloc_id;
+                        const UUID holder_id = task->holder_id;
+                        ErasePromotionTaskIfPresent(tenant_state,
+                                                    it->second.state);
+                        if (alloc_id != 0) {
                             EraseReplicasWithCacheTotalAccounting(
-                                it->second, [alloc_id](const Replica& replica) {
+                                it->second.metadata,
+                                [alloc_id](const Replica& replica) {
                                     return replica.id() == alloc_id;
                                 });
                         }
-                        const UUID holder_id = task_it->second.holder_id;
-                        ErasePromotionTaskIfPresent(tenant_state,
-                                                    stale_keys[j].second);
-                        local_ssd_manager_.RemovePromotion(holder_id,
-                                                           it->second.tenant_id,
-                                                           it->second.user_key);
+                        local_ssd_manager_.RemovePromotion(
+                            holder_id, it->second.metadata.tenant_id,
+                            it->second.metadata.user_key);
                     }
                     continue;
                 }
