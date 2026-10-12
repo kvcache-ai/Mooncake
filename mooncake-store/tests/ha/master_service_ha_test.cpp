@@ -740,13 +740,13 @@ class MasterServiceHATest : public ::testing::Test {
         auto& tenant_state =
             MasterServiceTestPeer(*service).GetOrCreateTenantState(
                 shard_access.get(), tenant);
-        tenant_state.promotion_tasks.emplace(
-            key, MasterServiceTestPeer::PromotionTask{
-                     .source_id = 0,
-                     .alloc_id = alloc_id,
-                     .object_size = object_size,
-                     .start_time = std::chrono::system_clock::now(),
-                     .holder_id = holder_id});
+        tenant_state.metadata.at(key).state.promotion_task =
+            MasterServiceTestPeer::PromotionTask{
+                .source_id = 0,
+                .alloc_id = alloc_id,
+                .object_size = object_size,
+                .start_time = std::chrono::system_clock::now(),
+                .holder_id = holder_id};
     }
 
     static bool SnapshotManagerCreatedForTesting(const MasterService& service) {
@@ -925,7 +925,7 @@ class MasterServiceHATest : public ::testing::Test {
         }
         const auto metadata = tenant->second.metadata.find(key);
         return metadata != tenant->second.metadata.end() &&
-               metadata->second.HasReplica([](const Replica& replica) {
+               metadata->second.metadata.HasReplica([](const Replica& replica) {
                    return replica.is_memory_replica() && replica.is_completed();
                });
     }

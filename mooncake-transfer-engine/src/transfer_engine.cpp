@@ -139,7 +139,7 @@ int TransferEngine::init(const std::string& metadata_conn_string,
                          const std::string& local_server_name,
                          const std::string& ip_or_host_name, uint64_t rpc_port,
                          const std::string& protocol) {
-    (void)protocol;
+    impl_->applyProtocolHint(protocol);
     return init(metadata_conn_string, local_server_name, ip_or_host_name,
                 rpc_port);
 }
@@ -672,6 +672,7 @@ int TransferEngine::init(const std::string& metadata_conn_string,
                          const std::string& ip_or_host_name, uint64_t rpc_port,
                          const std::string& protocol) {
     if (!use_tent_) {
+        impl_->applyProtocolHint(protocol);
         const int result = impl_->init(metadata_conn_string, local_server_name,
                                        ip_or_host_name, rpc_port);
         if (result == 0) metadata_conn_string_ = metadata_conn_string;
@@ -1017,7 +1018,8 @@ int TransferEngine::sendNotifyByName(std::string remote_agent,
         auto status = impl_tent_->openSegment(handle, remote_agent);
         if (!status.ok()) return tentToClassicError(status.code());
         status = impl_tent_->sendNotification(handle, notifi);
-        impl_tent_->closeSegment(handle);
+        // openSegment may return a handle already held by a transfer caller.
+        // Keep the cached mapping until that caller closes it explicitly.
         return tentToClassicError(status.code());
     } else
         return impl_->sendNotifyByName(std::move(remote_agent), notify_msg);

@@ -221,7 +221,7 @@ endif()
 
 if(USE_EFA)
   message(STATUS "Enabled USE_EFA (AWS Elastic Fabric Adapter) support")
-  target_link_libraries(transfer_engine PUBLIC fabric efa_transport)
+  target_link_libraries(transfer_engine PUBLIC efa_transport)
 endif()
 if(USE_CXI)
   message(STATUS "Enabled USE_CXI (HPE Cray Slingshot) support")

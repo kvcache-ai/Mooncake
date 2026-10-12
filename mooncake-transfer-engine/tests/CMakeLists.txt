@@ -21,6 +21,12 @@ if(USE_TENT)
   # Match the compatibility shim public class definition and enable the
   # MC_USE_TENT regression cases in transport_uint_test.cpp.
   target_compile_definitions(transport_uint_test PRIVATE USE_TENT)
+  add_test(
+    NAME tent_compat_notify_test
+    COMMAND
+      transport_uint_test
+      --gtest_filter=TransferEngineTentCompatibilityTest.NotifyByNamePreservesOpenSegment
+  )
 endif()
 add_test(NAME transport_uint_test COMMAND transport_uint_test)
 
@@ -59,6 +65,11 @@ add_executable(rdma_endpoint_state_test
 target_link_libraries(rdma_endpoint_state_test PUBLIC transfer_engine gtest
                                                       gtest_main)
 add_test(NAME rdma_endpoint_state_test COMMAND rdma_endpoint_state_test)
+
+add_executable(rdma_posted_fifo_test ${WORKSPACE}/rdma_posted_fifo_test.cpp)
+target_link_libraries(rdma_posted_fifo_test PUBLIC transfer_engine gtest
+                                                   gtest_main)
+add_test(NAME rdma_posted_fifo_test COMMAND rdma_posted_fifo_test)
 
 # Hardware-free regression tests for peer-rail pausing and the local-WC context
 # breaker. Both are plain per-worker-pool state, so this runs on every CI runner

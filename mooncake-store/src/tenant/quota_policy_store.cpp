@@ -1,6 +1,6 @@
-#include "tenant_quota_policy_store.h"
+#include "tenant/quota_policy_store.h"
 
-#include "tenant_quota.h"
+#include "tenant/quota.h"
 
 #include <cerrno>
 #include <chrono>
