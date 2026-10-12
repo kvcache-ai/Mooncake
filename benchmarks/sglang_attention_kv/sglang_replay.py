@@ -165,6 +165,9 @@ class SglangStep:
         # the events it sits between.
         self.write_calls = 0
         self.index_fills = 0
+        self.fetched_bytes = 0
+        self.fetch_descriptors_ms = 0.0
+        self.fetch_submit_ms = 0.0
 
     # ---------------------------------------------------------------- setup
 
@@ -236,10 +239,12 @@ class SglangStep:
         self.history = None
         if self.case.kv_source == "gpu":
             self._fill_prefix()
-        else:
+        elif sum(int(slots.numel()) for slots in self.prefix_slots) > 0:
             # The history is staged outside the GPU and moved in by Mooncake, so the
             # pool holds nothing until fetch_kv() runs and the content check that
-            # follows a step is the check on that move.
+            # follows a step is the check on that move. A step with no cached history
+            # has nothing to hold: it records no holder and moves nothing, whatever
+            # its source says.
             from .mooncake_kv import MooncakeHistory
 
             self.history = MooncakeHistory(
@@ -799,10 +804,17 @@ class SglangStep:
         sampled = []
         worst_difference = 0.0
         reference_abs_max = 0.0
+        non_finite = 0
         q_offset = 0
         for index, new_len in enumerate(case.new_lens):
             prefix_len = case.prefix_lens[index]
-            positions = [new_len - 1]
+            # The first, middle and last query of the sequence. The first two have
+            # tokens after them that they must not see, so a kernel whose mask is
+            # wrong for this shape fails here; the last one sees the whole context and
+            # is the row a mask error would leave looking right.
+            positions = (
+                [0] if new_len == 1 else sorted({0, (new_len - 1) // 2, new_len - 1})
+            )
             key_source, value_source = self._expected_kv(layer_id, index)
             keys = key_source.float().transpose(0, 1).repeat_interleave(repeat, dim=0)
             values = (
@@ -821,10 +833,20 @@ class SglangStep:
             weights = torch.softmax(scores.masked_fill(~allowed, float("-inf")), dim=-1)
             reference = torch.matmul(weights, values).transpose(0, 1)
             produced = output[q_offset + torch.tensor(positions, device=query.device)]
-            worst_difference = max(
-                worst_difference, (produced.float() - reference).abs().max().item()
-            )
-            reference_abs_max = max(reference_abs_max, reference.abs().max().item())
+            # An output or a reference that is not finite is a failure on its own: a
+            # comparison against a NaN is false rather than true, so a maximum taken
+            # over it would quietly report no difference at all.
+            if (
+                not torch.isfinite(produced).all()
+                or not torch.isfinite(reference).all()
+            ):
+                non_finite += int((~torch.isfinite(produced)).sum().item())
+                non_finite += int((~torch.isfinite(reference)).sum().item())
+            else:
+                worst_difference = max(
+                    worst_difference, (produced.float() - reference).abs().max().item()
+                )
+                reference_abs_max = max(reference_abs_max, reference.abs().max().item())
             sampled += [
                 {"sequence": index, "query": int(position)} for position in positions
             ]
@@ -832,10 +854,11 @@ class SglangStep:
         relative = worst_difference / max(reference_abs_max, 1e-6)
         return {
             "rows": sampled,
+            "non_finite": non_finite,
             "max_abs_diff": worst_difference,
             "reference_abs_max": reference_abs_max,
             "max_rel_diff": relative,
-            "passed": bool(relative < 1e-2),
+            "passed": bool(non_finite == 0 and relative < 1e-2),
         }
 
     def _compare_against_reference(self, query, causal, mask_name):
@@ -844,12 +867,17 @@ class SglangStep:
         reference = self._reference_scores(query, causal)
         difference = (produced.float() - reference).abs()
         largest = reference.abs().max().item()
+        non_finite = int(
+            (~torch.isfinite(produced)).sum().item()
+            + (~torch.isfinite(reference)).sum().item()
+        )
         relative = difference.max().item() / max(largest, 1e-6)
         result = {
+            "non_finite": non_finite,
             "max_abs_diff": difference.max().item(),
             "reference_abs_max": largest,
             "max_rel_diff": relative,
-            "passed": bool(relative < 1e-2),
+            "passed": bool(non_finite == 0 and relative < 1e-2),
         }
         if mask_name is not None:
             result["mask"] = mask_name

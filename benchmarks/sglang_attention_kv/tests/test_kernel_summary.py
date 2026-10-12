@@ -131,11 +131,13 @@ def record():
         "warmup": 10,
         "timed": 100,
         "device_name": "NVIDIA H20",
-        "host_ahead": {
+        "deferred_sync": {
             "iterations": 20,
             "step_window_p50_ms": 1.4,
             "layer_loop_p50_ms": 1.2,
         },
+        "plan_host": {"samples": 5, "p50_ms": 0.4},
+        "fetch_parts": {"descriptors_ms": 0.3, "submit_ms": 2.0},
         "phases": built,
         "derived": dict(DERIVED),
         "correctness": {

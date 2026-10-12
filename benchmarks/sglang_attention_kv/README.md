@@ -35,14 +35,18 @@ measure the events as much as the work, so the write and the read are priced in 
 | `kv_write_component` | one `set_kv_buffer` call per layer, over every layer of the step, in one window, without the attention they interleave with |
 | `attention_component` | the branch's attention path over every layer of the step, in one window, without the writes: one ragged call, two wrapper calls and one `merge_state`, one paged prefill call, or one paged decode call |
 | `kv_gather` | a read-only probe: the rows the branch's paged side reads (or the slots the step wrote, when it reads no paged KV), both K and V, moved with `index_select` and no arithmetic |
-| `kv_fetch` | the move of the cached history into the pool through Mooncake, for a step whose history is held outside the GPU (section 3). One entry per pool page per layer per K and V tensor, all layers in one batch |
+| `kv_fetch` | the move of the cached history into the pool through Mooncake, for a step whose history is held outside the GPU (section 3). One entry per run of consecutive pool slots over every layer and both tensors, submitted as one batch; the window covers building the entries, the engine's submit and wait, and the device synchronise, and the two wall-clock parts are recorded beside it |
 
 None of the four is added to the step: each runs in a window of its own, planned against the probe's own
 indices. Their ratio to `phase_sum` is recorded as a ratio rather than as a share, because the step
-interleaves the write and the read per layer. The two step windows include the device waiting for the
-next kernel launch, which a step whose kernels are smaller than its host work is made of almost
-entirely; every record also carries a second pass of the same iterations with the host free to run
-ahead, whose window holds the kernels alone, so the difference between the two is that wait.
+interleaves the write and the read per layer.
+
+The step windows are windows on the device's timeline: they start and end with an event on the step's
+stream, so they include the device waiting for the next launch that the host has not issued yet. Every
+record also carries a **deferred-sync comparison**: the same iterations timed with the host allowed to
+run ahead, which removes some of that wait rather than all of it, because the wrappers' plan runs on the
+host inside each iteration and waits for the device itself. The two passes are therefore compared for
+the size of the gap they differ by, and the plan's own wall clock is recorded beside them.
 
 The step is built from SGLang's own `ReqToTokenPool` for the token table and `MHATokenToKVPool` for the
 KV buffers, and its slots come from the allocator its page size selects (section 2).
@@ -86,22 +90,27 @@ sequence's tokens occupy.
 A step's cached history is read from the pool by default: `--kv-sources gpu` puts it there before the
 step and nothing moves during the run. `--kv-sources host` holds it outside the GPU instead, in host
 memory registered with Mooncake's Transfer Engine, and moves it into the pool in a window of its own
-before the step, which is the path a serving deployment takes when the cache was offloaded:
+before the step:
 
 | Part | What it does |
 |---|---|
-| staging | the generated history is written into a host buffer per layer and per tensor, laid out with the pool's row pitch and one row per token of the aligned prefix, so a page is one contiguous run on both sides |
+| staging | the generated history is written into a host buffer per layer and per tensor, laid out with the pool's row pitch and one row per token of the aligned prefix, so a run of consecutive slots on both sides is one entry |
 | registration | the host buffers and the pool's own K/V buffers are registered with the engine, because an RDMA transfer can only write into registered memory |
-| the move | one batch over every layer: one entry per pool page, carrying the page's rows from the host buffer to the pool row it belongs in. `kv_transfer_entries` states how many entries a case needed, which is its history's pages times the layers times two |
-| the record | the row states the source, the transport it asked the engine for, the registered bytes, the entries, and the fetched bytes beside the window in `kv_fetch` |
+| the move | one batch over every layer: one entry per run of consecutive pool slots, so a pool whose history sits together needs one entry per sequence and a pool that churned needs one per page. `kv_transfer_entries` states what a case needed |
+| the record | the row states the source, the engine and its version, the endpoint it was told to write to, the NICs the topology puts next to the GPU, the rows and bytes registered, the entries, and the bytes moved, beside the window in `kv_fetch` and its two wall-clock parts |
+
+**What this is.** A component-level move through Mooncake's Transfer Engine between buffers this process
+registered: the endpoint is the engine's own, so the route may be an RNIC loopback or a local path
+depending on the backend. It is not SGLang's deployment path for an offloaded cache, which asks a Store
+for the blocks into a host pool and then submits the host-to-device copies per layer with a readiness
+check per layer, and it is not a move between machines. Those layers sit above this benchmark, and the
+numbers here are for the configuration the row states.
 
 The move happens before the step's warmup and every timed iteration reads the history it left in the
 pool, so the content check that follows a step is a check on the transfer: the rows that arrive have to
-be the ones the benchmark generated. `--kv-source-protocol` picks the transport, `rdma` unless the
-machine has none.
-
-What this measures is the move into the GPU. It is not a Store request, not a HiCache tier decision and
-not a transfer between machines: those are the layers above this one, and a benchmark of their own.
+be the ones the benchmark generated. A step with no cached history holds nothing whatever its source
+says, and records no holder. `--kv-source-protocol` picks the transport, `rdma` unless the machine has
+none.
 
 ## 4. Model and KV byte conversion
 
@@ -170,9 +179,11 @@ Each step runs four checks, and a failure fails the run:
   what was written, **K and V**, for every layer, compared against the values the benchmark generated.
   For a step whose history Mooncake holds, this is also the check on the move (section 3).
 - `attention_rows`: the output of a timed iteration itself, at full size, against a float32 reference
-  built from the same content. It follows the last query of each sequence, which is the row that sees
-  the whole context, and costs one score per context token per head, so the whole context fits. The
-  reference is built from the layer whose output is compared.
+  built from the same content. It follows the first, middle and last query of each sequence — a decode
+  step has one — because the last query may see the whole context and would leave a wrong mask looking
+  right, while the first two must not see the tokens after them. A row costs one score per context token
+  per head, so the whole context fits. The reference is built from the layer whose output is compared,
+  and an output or a reference that is not finite fails the check rather than being compared.
 - `attention`: the kernel output must match a plain tensor reference computed in float32 over the same
   content, relative error below 1e-2. The reference is causal in every branch, and a reference without
   the mask has to fail the same comparison, so a kernel that saw the future could not pass. It
@@ -180,6 +191,10 @@ Each step runs four checks, and a failure fails the run:
   — the same mode, page size, layout and per-rank head counts, on one layer, with every length of each
   axis scaled by one factor — while the three checks above run at full size. Every record states the
   short step it used in `correctness.attention.case`.
+
+The checks run before every pass that rewrites the pool or replans the wrappers, so what they read is
+the state the last timed iteration left and the state the last measured move left, rather than a state a
+diagnostic pass produced.
 
 Each record also states how many write calls and index fills its timed loop made, against the counts
 that loop has to make: every iteration writes one layer's K/V per layer and fills one index stream. The
@@ -235,7 +250,7 @@ the `configuration` object of `kernel.jsonl`, and the `branch`, `reads_before_wr
 `attention_backend`, `wrapper_page_size`, `decode_use_tensor_cores`, `merge_state_impl`, `kv_source`,
 `kv_write_stream` and `slot_allocator` columns of the CSV — so a reader can see which step a number came
 from. The CSV also carries the derived figures of section 5, the fetched bytes and transfer entries of
-section 3, and the result of every correctness check.
+section 3, the plan's own wall clock, and the result of every correctness check.
 
 A report quotes the figures as the CSV names them, and states the lane the run used, the allocator its
 page size selected, and the machine and versions the manifest holds, which is what makes two runs
@@ -253,12 +268,13 @@ either probed at runtime or read from the model config, so a run elsewhere state
   compare content exactly, but nothing here depends on the data's distribution.
 - A different GPU rank count or model changes the per-rank head counts and the per-token bytes, which
   the manifest records; results from different shardings are only comparable through them.
-- The step windows include the device waiting for the next launch, so a step whose kernels are smaller
-  than its host work is priced as the host work it is. The host-ahead pass in every record states the
-  same iterations with that wait removed; the difference is what the device spent idle.
-- The Mooncake source moves the history from host memory into the pool of the same process. It is not a
-  Store request, not a decision between cache tiers, and not a move between machines; those layers are
-  above this benchmark.
+- The step windows are windows on the device's timeline and include the device waiting for a launch the
+  host has not issued yet. The deferred-sync comparison in every record states the same iterations with
+  the host allowed to run ahead; it removes some of that wait and not all of it, and the wrappers' plan —
+  which runs on the host and waits for the device itself — stays inside both.
+- The Mooncake source moves the history from host memory into the pool of the same process, through the
+  engine's own endpoint. It is not a Store request, not a decision between cache tiers, not SGLang's
+  host-pool-then-copy order for an offloaded cache, and not a move between machines.
 
 The replay fixes four settings and records two it derives per case, each stated in the record's
 `configuration` and in the CSV, so a row says which configuration it describes. The four are this

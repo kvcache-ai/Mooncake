@@ -20,7 +20,8 @@ from benchmarks.sglang_attention_kv.cases import (  # noqa: E402
 )
 from benchmarks.sglang_attention_kv import kernel_bench  # noqa: E402
 from benchmarks.sglang_attention_kv.kernel_bench import (  # noqa: E402
-    HOST_AHEAD_ITERATIONS,
+    DEFERRED_SYNC_ITERATIONS,
+    PLAN_SAMPLES,
     one_iteration,
     run_case,
 )
@@ -140,6 +141,98 @@ def test_a_step_whose_history_is_in_the_pool_moves_nothing():
     assert step.fetch_kv() == 0
     assert step.as_dict()["history_holder"] is None
     step.close()
+
+
+def test_a_step_with_no_history_holds_nothing_whatever_its_source_says():
+    """A prefill has no cached history, so a host source has nothing to stage: the
+    engine refuses a zero-length registration, and the step records no holder and
+    moves nothing."""
+    case = step_case("prefill", (0,), (256,), kv_source="host")
+    step = SglangStep(case, DEVICE, seed=5)
+    step.prepare()
+    assert step.history is None
+    assert step.fetch_kv() == 0
+    assert step.as_dict()["history_holder"] is None
+    assert step.as_dict()["kv_source"] == "host"
+    step.close()
+
+
+def test_the_content_check_catches_a_step_that_never_wrote():
+    """The write is what the check reads, so a step whose read ran but whose write did
+    not is a failure rather than a pass on the warmup's state."""
+    case = step_case("decode", (256,), (1,), layers=2)
+    step = SglangStep(case, DEVICE, seed=3)
+    step.prepare()
+    indices = step.build_indices()
+    step.plan(indices)
+    step.read(step.make_query())
+    torch.cuda.synchronize()
+    assert not step.check_history()["passed"]
+    step.close()
+
+
+def test_a_poisoned_source_fails_the_check_after_the_measured_move(monkeypatch):
+    """The check follows the move the run measured rather than an earlier one: a
+    source row changed before the run reaches the pool, and the check fails there."""
+    case = step_case("decode", (512,), (1,), kv_source="host", layers=2)
+    original = SglangStep.prepare
+
+    def poison(self):
+        original(self)
+        # The arithmetic check builds a short step of its own, which has no history.
+        if self.history is not None:
+            host = self.history.buffers[(self.case.num_layers - 1, "v")]
+            host[3] = host[3] + 1.0
+        return self
+
+    monkeypatch.setattr(SglangStep, "prepare", poison)
+    result = run_case(case, DEVICE, warmup=1, timed=2)
+    assert not result["correctness"]["history"]["passed"]
+    assert result["witness"]["write_calls"] == 2 * case.num_layers
+
+
+def test_a_non_finite_output_fails_the_sampled_check():
+    """A comparison against a NaN is false rather than true, so an output full of
+    them would otherwise report no difference at all."""
+    case = step_case("decode", (256,), (1,))
+    step, _ = prepared(case)
+    query = step.make_query()
+    output = torch.full_like(step.read(query), float("nan"))
+    torch.cuda.synchronize()
+    result = step.check_attention_rows(query, output, case.num_layers - 1)
+    assert result["non_finite"] > 0
+    assert not result["passed"]
+
+
+def test_the_sampled_rows_include_one_that_must_not_see_the_future():
+    """A step's last query sees the whole context, so a mask error leaves it looking
+    right; the first and middle rows are the ones that catch it."""
+    case = step_case("extend", (512,), (128,), layers=1)
+    step, _ = prepared(case)
+    query = step.make_query()
+    output = step.read(query)
+    torch.cuda.synchronize()
+    result = step.check_attention_rows(query, output, case.num_layers - 1)
+    assert result["passed"]
+    assert result["rows"] == [
+        {"sequence": 0, "query": 0},
+        {"sequence": 0, "query": 63},
+        {"sequence": 0, "query": 127},
+    ]
+
+    # The middle row, replaced by attention that saw the tokens after it.
+    layer_id = case.num_layers - 1
+    keys, values = step._expected_kv(layer_id, 0)
+    repeat = case.group_ratio()
+    keys = keys.float().transpose(0, 1).repeat_interleave(repeat, dim=0)
+    values = values.float().transpose(0, 1).repeat_interleave(repeat, dim=0)
+    middle = (case.new_lens[0] - 1) // 2
+    row = query[middle].float().unsqueeze(1)
+    scores = torch.matmul(row, keys.transpose(-1, -2)) * (1.0 / case.head_dim**0.5)
+    unmasked = torch.matmul(torch.softmax(scores, dim=-1), values).squeeze(1)
+    output[middle] = unmasked.to(output.dtype)
+    torch.cuda.synchronize()
+    assert not step.check_attention_rows(query, output, layer_id)["passed"]
 
 
 def test_the_branch_decides_the_order():
@@ -606,18 +699,23 @@ def test_the_component_passes_run_against_a_plan_of_their_own_indices(monkeypatc
     monkeypatch.setattr(kernel_bench, "one_gather", gather)
     run_case(case, DEVICE, warmup=1, timed=2)
     # Each iteration plans for its own indices inside its window: the warmup, the
-    # timed loop, and the host-ahead pass that follows them. The plan after those is
-    # the one the component passes run against, and it comes before the first
-    # component window and after the correctness checks.
-    expected = ["iteration", "plan"] * (HOST_AHEAD_ITERATIONS + 3) + [
-        "plan",
-        "write_component",
-        "write_component",
-        "attention_component",
-        "attention_component",
-        "gather",
-        "gather",
-    ]
+    # timed loop, and the deferred-sync pass that follows the checks. In between, the
+    # plan the component passes run against is taken outside every window, and the
+    # plan's own wall clock is sampled beside it.
+    expected = (
+        ["iteration", "plan"] * 3
+        + ["plan"]
+        + [
+            "write_component",
+            "write_component",
+            "attention_component",
+            "attention_component",
+            "gather",
+            "gather",
+        ]
+        + ["plan"] * PLAN_SAMPLES
+        + ["iteration", "plan"] * DEFERRED_SYNC_ITERATIONS
+    )
     assert order[: len(expected)] == expected
 
 

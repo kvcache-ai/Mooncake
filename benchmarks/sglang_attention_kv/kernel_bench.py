@@ -5,6 +5,7 @@
 # FlashInfer wrappers its FlashInfer backend issues. What this module adds is the
 # CUDA timing and the sampling; the ledger arithmetic lives in stats.py.
 
+import time
 import zlib
 
 import torch
@@ -35,17 +36,21 @@ def _event_pair():
     )
 
 
-# Iterations of the host-ahead comparison pass: the step timed with the host free to
-# run ahead of the device, so its windows hold the kernels they cover instead of the
-# time the device spent idle waiting for the next launch. The difference against the
-# primary windows is that idle time, which a step whose kernels are smaller than its
-# host work is made of almost entirely.
-HOST_AHEAD_ITERATIONS = 20
+# Iterations of the deferred-sync comparison pass: the step timed with the host free
+# to run ahead of the device, so its windows hold more of the kernels they cover and
+# less of the time the device spent waiting for the next launch. Each iteration still
+# plans on the host, and that plan waits for the device, so this is a comparison of
+# two sync points rather than a kernel-only measurement.
+DEFERRED_SYNC_ITERATIONS = 20
 
 # Moves of the cached history measured for a step whose history Mooncake holds. The
 # step's own iterations read the history the last of them left in the pool, so the
 # content check that follows is a check on a move that really happened.
 FETCH_ITERATIONS = 20
+
+# Wall-clock samples of the wrappers' plan, which runs on the host inside the
+# attention_plan window.
+PLAN_SAMPLES = 5
 
 
 def _windows(events):
@@ -151,9 +156,9 @@ def one_gather(step, indices):
 
 
 def one_fetch(step):
-    """One Mooncake move of the cached history into the pool, in a window of its
-    own. A step whose history is already in the pool moves nothing and reports no
-    window rather than a window around nothing."""
+    """One Mooncake move of the cached history into the pool, in a window of its own.
+    A step whose history is already in the pool moves nothing and reports no window
+    rather than a window around nothing."""
     if step.history is None:
         return 0.0
     begin = torch.cuda.Event(enable_timing=True)
@@ -163,7 +168,18 @@ def one_fetch(step):
     end.record()
     torch.cuda.synchronize()
     step.fetched_bytes = fetched
+    step.fetch_descriptors_ms = step.history.descriptors_ms
+    step.fetch_submit_ms = step.history.submit_ms
     return begin.elapsed_time(end)
+
+
+def one_plan(step, indices):
+    """The wrappers' plan on the host, timed with the wall clock: it runs inside the
+    attention_plan window, so its own cost is stated beside that window rather than
+    left inside it."""
+    begin = time.perf_counter()
+    step.plan(indices)
+    return (time.perf_counter() - begin) * 1000.0
 
 
 def run_case(
@@ -207,20 +223,27 @@ def run_case(
             kv_protocol=kv_protocol,
         )
         step.prepare()
-        # A step whose history Mooncake holds starts with the pool empty, so one move
-        # happens before anything reads it: the warmup and every iteration below then
-        # read the history the way a step whose history was in the pool all along
-        # does. Its window is measured with the other moves, below.
-        step.fetch_kv()
+
+        samples = {name: [] for name in STEP_PHASES}
+        samples["step_window"] = []
+        samples["phase_sum"] = []
+
+        # The Mooncake move of the history, in a window of its own and before anything
+        # reads the pool: the warmup and every timed iteration read the history the
+        # last of these moves left, so the content check that follows the timed loop is
+        # a check on a move that really happened rather than on a pool the benchmark
+        # filled itself. A step whose history the pool already holds moves nothing.
+        if step.history is None:
+            samples["kv_fetch"] = [0.0] * FETCH_ITERATIONS
+        else:
+            samples["kv_fetch"] = [one_fetch(step) for _ in range(FETCH_ITERATIONS)]
+        fetch_bytes = step.fetched_bytes if step.history is not None else 0
 
         query = step.make_query()
 
         for _ in range(warmup):
             one_iteration(step, query)
 
-        samples = {name: [] for name in STEP_PHASES}
-        samples["step_window"] = []
-        samples["phase_sum"] = []
         timed_indices = None
         timed_output = None
         writes_before = step.write_calls
@@ -250,16 +273,9 @@ def run_case(
                 f"{witness['expected_index_fills']}"
             )
 
-        # The same step timed with the host free to run ahead. The primary windows
-        # above include the device waiting for the next launch, which a step whose
-        # kernels are small is made of almost entirely; the difference between the
-        # two passes is that wait, so a reader can tell kernel time from idle time.
-        host_ahead_events = []
-        for _ in range(HOST_AHEAD_ITERATIONS):
-            one_iteration(step, query, defer=host_ahead_events)
-        torch.cuda.synchronize()
-        host_ahead = [_windows(events) for events in host_ahead_events]
-
+        # The checks run here, before every pass that rewrites the pool or replans the
+        # wrappers: what they read is the state the last timed iteration left, and a
+        # diagnostic pass before them would hand them its own state instead.
         correctness = {
             "indices": step.check_indices(timed_indices),
             "history": step.check_history(),
@@ -269,23 +285,11 @@ def run_case(
             "attention": short_step_attention(case, device, seed, extend_branch),
         }
 
-        # The Mooncake move of the history, in a window of its own beside the step
-        # and before it: the pool the step's iterations read is the one the last of
-        # these moves filled, so the content check below is a check on a move rather
-        # than on a pool that was never filled. A step whose history the pool already
-        # holds moves nothing and states no window.
-        if step.history is None:
-            samples["kv_fetch"] = [0.0] * FETCH_ITERATIONS
-        else:
-            samples["kv_fetch"] = [one_fetch(step) for _ in range(FETCH_ITERATIONS)]
-        fetch_bytes = step.fetched_bytes if step.history is not None else 0
-
-        # The write and the read are priced in passes of their own, after the checks,
-        # each in its own window, so no step iteration is ever timed with a probe
-        # inside it and no check reads a state a probe built. They run against a plan
-        # of the indices they use, taken here rather than inside a window: the
-        # wrappers' metadata has to describe the indices the component pass reads, and
-        # planning is not part of what a component measures.
+        # The write and the read are priced in passes of their own, each in its own
+        # window, so no step iteration is ever timed with a probe inside it. They run
+        # against a plan of the indices they use, taken here rather than inside a
+        # window: the wrappers' metadata has to describe the indices the component
+        # pass reads, and planning is not part of what a component measures.
         probe_indices = step.build_indices()
         step.plan(probe_indices)
         samples["kv_write_component"] = [
@@ -296,6 +300,22 @@ def run_case(
         ]
         samples["kv_gather"] = [one_gather(step, probe_indices) for _ in range(timed)]
 
+        # The wrappers' plan runs on the host and, in FlashInfer 0.6.18, copies the
+        # index pointers off the device synchronously, so its wall clock is stated
+        # beside the window that contains it.
+        plan_host = [one_plan(step, probe_indices) for _ in range(PLAN_SAMPLES)]
+
+        # The same step timed with the host free to run ahead of the device. It is a
+        # deferred-sync comparison rather than a kernel-only measurement: each
+        # iteration still plans on the host, and that plan waits for the device, so
+        # the pass removes some of the launch gap rather than all of it. What a reader
+        # can take from it is the size of the gap these two passes differ by.
+        deferred_events = []
+        for _ in range(DEFERRED_SYNC_ITERATIONS):
+            one_iteration(step, query, defer=deferred_events)
+        torch.cuda.synchronize()
+        deferred = [_windows(events) for events in deferred_events]
+
         read_bytes = step.read_bytes()
         result = {
             "kind": "kernel",
@@ -305,14 +325,18 @@ def run_case(
             "warmup": warmup,
             "timed": timed,
             "witness": witness,
-            "host_ahead": {
-                "iterations": HOST_AHEAD_ITERATIONS,
+            "deferred_sync": {
+                "iterations": DEFERRED_SYNC_ITERATIONS,
                 "step_window_p50_ms": summarize(
-                    [entry["step_window"] for entry in host_ahead]
+                    [entry["step_window"] for entry in deferred]
                 )["p50"],
                 "layer_loop_p50_ms": summarize(
-                    [entry["layer_loop"] for entry in host_ahead]
+                    [entry["layer_loop"] for entry in deferred]
                 )["p50"],
+            },
+            "plan_host": {
+                "samples": PLAN_SAMPLES,
+                "p50_ms": summarize(plan_host)["p50"],
             },
             "device": str(device),
             "device_name": torch.cuda.get_device_name(device),
@@ -324,6 +348,10 @@ def run_case(
         result["gather_bytes"] = gather_bytes
         result["gather_rows"] = int(step.gather_rows(probe_indices).numel())
         result["kv_bytes_fetched"] = fetch_bytes
+        result["fetch_parts"] = {
+            "descriptors_ms": step.fetch_descriptors_ms,
+            "submit_ms": step.fetch_submit_ms,
+        }
         result["derived"] = derive(
             case, result["phases"], gather_bytes, read_bytes["attention"], fetch_bytes
         )
