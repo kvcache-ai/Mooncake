@@ -27,10 +27,13 @@ from dataclasses import dataclass
 
 import flashinfer
 import torch
-from flashinfer.cascade import merge_state
 
 from sglang.kernels.ops.kvcache.kv_indices import create_flashinfer_kv_indices_triton
-from sglang.srt.layers.attention.flashinfer_backend import should_use_tensor_core
+from sglang.srt.layers.attention.flashinfer_backend import (
+    _merge_state_max_safe_num_heads,
+    _safe_merge_state,
+    should_use_tensor_core,
+)
 from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
@@ -47,6 +50,7 @@ from .cases import (
     BRANCH_RAGGED_NO_PREFIX,
     BRANCH_RAGGED_PREFIX_MERGE,
     BRANCHES_THAT_WRITE_FIRST,
+    DEFAULT_KV_SOURCE_PROTOCOL,
     branch_for_mode,
     use_paged_default,
 )
@@ -106,10 +110,18 @@ class StepIndices:
 class SglangStep:
     """One step built on SGLang's structures. Head counts are per rank."""
 
-    def __init__(self, case, device, seed=0, extend_branch=BRANCH_RAGGED_PREFIX_MERGE):
+    def __init__(
+        self,
+        case,
+        device,
+        seed=0,
+        extend_branch=BRANCH_RAGGED_PREFIX_MERGE,
+        kv_protocol=DEFAULT_KV_SOURCE_PROTOCOL,
+    ):
         self.case = case
         self.device = device
         self.seed = seed
+        self.kv_protocol = kv_protocol
         self.dtype = getattr(torch, case.dtype)
         self.branch = branch_for_mode(case.mode, extend_branch)
         self.branch_detail = BRANCH_DETAIL[self.branch]
@@ -136,7 +148,23 @@ class SglangStep:
             num_attention_heads=case.num_qo_heads,
             num_kv_heads=case.num_kv_heads,
         )
+        # The merge branch joins its two halves with the implementation the backend
+        # picks: FlashInfer's kernel up to the head count its thread block can hold,
+        # SGLang's own Triton kernel above it. The threshold comes from the backend
+        # itself, so a case records the merge it actually ran.
+        self.merge_state_impl = (
+            "flashinfer"
+            if case.num_qo_heads
+            <= _merge_state_max_safe_num_heads(case.head_dim, self.dtype.itemsize)
+            else "triton"
+        )
         self.workspace = torch.empty(WORKSPACE_BYTES, dtype=torch.uint8, device=device)
+        # Host-side counters for the calls a timed iteration has to make. They are
+        # incremented inside the loop, so the timed loop can be shown to have run
+        # them: an increment is host work with no device work behind it, far below
+        # the events it sits between.
+        self.write_calls = 0
+        self.index_fills = 0
 
     # ---------------------------------------------------------------- setup
 
@@ -205,9 +233,36 @@ class SglangStep:
         self._allocate_step_slots()
         self._prepare_index_buffers()
         self.new_kv = self.make_new_kv()
-        self._fill_prefix()
+        self.history = None
+        if self.case.kv_source == "gpu":
+            self._fill_prefix()
+        else:
+            # The history is staged outside the GPU and moved in by Mooncake, so the
+            # pool holds nothing until fetch_kv() runs and the content check that
+            # follows a step is the check on that move.
+            from .mooncake_kv import MooncakeHistory
+
+            self.history = MooncakeHistory(
+                self.case,
+                self.device,
+                self.dtype,
+                protocol=self.kv_protocol,
+            )
+            self.history.stage(self)
         self._build_wrappers()
         return self
+
+    def fetch_kv(self):
+        """Move the cached history into the pool through Mooncake. A step whose
+        history is already in the pool has nothing to move."""
+        if self.history is None:
+            return 0
+        return self.history.fetch(self)
+
+    def close(self):
+        if self.history is not None:
+            self.history.close()
+            self.history = None
 
     def _shape_the_free_pages(self):
         """The order the allocator hands pages out in, which is the layout the
@@ -450,6 +505,7 @@ class SglangStep:
         prefill returns that metadata without launching an index kernel.
         """
         case = self.case
+        self.index_fills += 1
         indices = StepIndices(qo_indptr=self.qo_indptr, out_cache_loc=self.step_slots)
         if self.branch == BRANCH_RAGGED_NO_PREFIX:
             return indices
@@ -470,6 +526,7 @@ class SglangStep:
 
     def write_layer(self, layer_id, indices):
         """SGLang's writer for one layer."""
+        self.write_calls += 1
         k, v = self.new_kv[layer_id]
         self.kv_pool.set_kv_buffer(
             self.layers[layer_id], KVWriteLoc(indices.out_cache_loc), k, v
@@ -539,7 +596,7 @@ class SglangStep:
                 causal=False,
                 sm_scale=scale,
             )
-            merged, _ = merge_state(suffix, suffix_lse, history, history_lse)
+            merged, _ = _safe_merge_state(suffix, suffix_lse, history, history_lse)
             return merged
         if self.branch == BRANCH_PAGED_EXTEND:
             # SGLang passes causal=True to this wrapper's forward, which is what
@@ -724,6 +781,63 @@ class SglangStep:
             outputs.append(torch.matmul(weights, v_seq).transpose(0, 1))
         return torch.cat(outputs)
 
+    def check_attention_rows(self, query, output, layer_id):
+        """A sample of the kernel's own output rows against a float32 reference.
+
+        The short case in kernel_bench covers every row of a smaller step, because
+        the full reference materialises a query by context score matrix. This covers
+        rows of the step that was actually timed, at full size: a row costs one
+        score per context token per head, so a few rows fit at any context length.
+        It reads the output a timed iteration produced, not a fresh call, so the
+        arithmetic of the measured step is the arithmetic checked here, and its
+        reference is built from the content of the layer that produced that output,
+        which every layer draws differently.
+        """
+        case = self.case
+        scale = 1.0 / (case.head_dim**0.5)
+        repeat = case.group_ratio()
+        sampled = []
+        worst_difference = 0.0
+        reference_abs_max = 0.0
+        q_offset = 0
+        for index, new_len in enumerate(case.new_lens):
+            prefix_len = case.prefix_lens[index]
+            positions = [new_len - 1]
+            key_source, value_source = self._expected_kv(layer_id, index)
+            keys = key_source.float().transpose(0, 1).repeat_interleave(repeat, dim=0)
+            values = (
+                value_source.float().transpose(0, 1).repeat_interleave(repeat, dim=0)
+            )
+            queries = query[q_offset + torch.tensor(positions, device=query.device)]
+            queries = queries.transpose(0, 1).float()
+            scores = torch.matmul(queries, keys.transpose(-1, -2)) * scale
+            allowed = torch.zeros(
+                (len(positions), prefix_len + new_len),
+                dtype=torch.bool,
+                device=query.device,
+            )
+            for row, position in enumerate(positions):
+                allowed[row, : prefix_len + position + 1] = True
+            weights = torch.softmax(scores.masked_fill(~allowed, float("-inf")), dim=-1)
+            reference = torch.matmul(weights, values).transpose(0, 1)
+            produced = output[q_offset + torch.tensor(positions, device=query.device)]
+            worst_difference = max(
+                worst_difference, (produced.float() - reference).abs().max().item()
+            )
+            reference_abs_max = max(reference_abs_max, reference.abs().max().item())
+            sampled += [
+                {"sequence": index, "query": int(position)} for position in positions
+            ]
+            q_offset += new_len
+        relative = worst_difference / max(reference_abs_max, 1e-6)
+        return {
+            "rows": sampled,
+            "max_abs_diff": worst_difference,
+            "reference_abs_max": reference_abs_max,
+            "max_rel_diff": relative,
+            "passed": bool(relative < 1e-2),
+        }
+
     def _compare_against_reference(self, query, causal, mask_name):
         produced = self.run_layer(0, query)
         torch.cuda.synchronize()
@@ -767,8 +881,13 @@ class SglangStep:
             "attention_backend": f"flashinfer-{FLASHINFER_BACKEND}",
             "wrapper_page_size": WRAPPER_PAGE_SIZE,
             "decode_use_tensor_cores": self.decode_use_tensor_cores,
+            "merge_state_impl": self.merge_state_impl,
             "kv_layout": "NHD",
             "kv_write_stream": "alternate" if KV_WRITE_ALT_STREAM else "step",
             "slot_allocator": self.allocator_kind,
             "flashinfer_use_paged_env": use_paged_default(),
+            "kv_source": self.case.kv_source,
+            "history_holder": (
+                self.history.describe() if self.history is not None else None
+            ),
         }

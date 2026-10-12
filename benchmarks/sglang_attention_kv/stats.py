@@ -10,8 +10,14 @@ STEP_PHASES = ("indices", "attention_plan", "layer_loop")
 # Passes of their own: the KV write and the attention read each run over all the
 # layers in one window, as components rather than as the schedule the step runs,
 # and the read-only gather probe over the same rows. None of them is added to the
-# step.
-DIAGNOSTIC_PHASES = ("kv_write_component", "attention_component", "kv_gather")
+# step. kv_fetch is the Mooncake move of the cached history into the pool, which a
+# step whose history already sits in the pool does not make.
+DIAGNOSTIC_PHASES = (
+    "kv_write_component",
+    "attention_component",
+    "kv_gather",
+    "kv_fetch",
+)
 
 MEASURED_PHASES = STEP_PHASES + DIAGNOSTIC_PHASES
 
@@ -50,7 +56,7 @@ def summarize(samples):
     }
 
 
-def derive(case, phases, gather_bytes, read_bytes):
+def derive(case, phases, gather_bytes, read_bytes, fetch_bytes=0):
     """The figures the report quotes, divided by the step's own ledger.
 
     The rates are unique-payload normalisations: they divide the bytes one path
@@ -74,6 +80,7 @@ def derive(case, phases, gather_bytes, read_bytes):
     write_ms = phases["kv_write_component"]["p50"]
     attention_ms = phases["attention_component"]["p50"]
     gather_ms = phases["kv_gather"]["p50"]
+    fetch_ms = phases["kv_fetch"]["p50"]
     sum_ms = phases["phase_sum"]["p50"]
     window_ms = phases["step_window"]["p50"]
 
@@ -89,6 +96,9 @@ def derive(case, phases, gather_bytes, read_bytes):
         "indices_us_per_new_token": index_ms * 1000.0 / case.new_tokens,
         "attention_us_per_context_token": attention_ms * 1000.0 / case.context_tokens,
         "kv_gather_unique_payload_gbps": gather_bytes / per_second(gather_ms) / 1e9,
+        "kv_fetch_unique_payload_gbps": (
+            fetch_bytes / per_second(fetch_ms) / 1e9 if fetch_ms > 0 else 0.0
+        ),
         "attention_unique_payload_gbps": read_bytes / per_second(attention_ms) / 1e9,
         "attention_tflops": flops / per_second(attention_ms) / 1e12,
         "attention_flops_per_unique_payload_byte": flops / read_bytes,

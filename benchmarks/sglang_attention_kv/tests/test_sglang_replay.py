@@ -20,6 +20,7 @@ from benchmarks.sglang_attention_kv.cases import (  # noqa: E402
 )
 from benchmarks.sglang_attention_kv import kernel_bench  # noqa: E402
 from benchmarks.sglang_attention_kv.kernel_bench import (  # noqa: E402
+    HOST_AHEAD_ITERATIONS,
     one_iteration,
     run_case,
 )
@@ -38,6 +39,7 @@ def step_case(
     layers=2,
     qo_heads=8,
     kv_heads=2,
+    kv_source="gpu",
 ):
     return KernelCase(
         mode=mode,
@@ -50,6 +52,7 @@ def step_case(
         num_kv_heads=kv_heads,
         head_dim=128,
         dtype="bfloat16",
+        kv_source=kv_source,
     )
 
 
@@ -93,6 +96,50 @@ def test_both_extend_branches_pass_their_checks(extend_branch):
     assert step.check_indices(indices)["passed"]
     assert step.check_history()["passed"]
     assert step.check_attention(step.make_query())["passed"]
+
+
+def test_the_history_can_arrive_through_mooncake():
+    """With a host source the pool starts empty and Mooncake moves the history in,
+    so the content check that follows a step is also the check on that move: the
+    rows that arrive have to be exactly the ones the benchmark generated."""
+    case = step_case("decode", (512,), (1,), kv_source="host")
+    step = SglangStep(case, DEVICE, seed=5)
+    step.prepare()
+    assert step.history is not None
+    # One entry per pool page per layer per tensor: the history's 512 tokens fill
+    # eight pages at page size 64, over two layers, K and V.
+    assert step.history.entries == 8 * case.num_layers * 2
+
+    # Nothing has been moved yet, so the pool does not hold the history.
+    assert not step.check_history()["passed"]
+
+    fetched = step.fetch_kv()
+    assert fetched == case.kv_bytes(512)
+    indices = step.build_indices()
+    step.write_kv(indices)
+    torch.cuda.synchronize()
+    assert step.check_history()["passed"]
+
+    # A source row the step reads, changed behind the benchmark's back, has to reach
+    # the pool and fail the check: the check is on the move, not only on the write.
+    host = step.history.buffers[(case.num_layers - 1, "v")]
+    host[4] = host[5]
+    step.fetch_kv()
+    torch.cuda.synchronize()
+    assert not step.check_history()["passed"]
+    step.close()
+
+
+def test_a_step_whose_history_is_in_the_pool_moves_nothing():
+    """The pool source keeps its history where the step reads it, and states no
+    fetch rather than a window around nothing."""
+    case = step_case("decode", (512,), (1,))
+    step = SglangStep(case, DEVICE, seed=5)
+    step.prepare()
+    assert step.history is None
+    assert step.fetch_kv() == 0
+    assert step.as_dict()["history_holder"] is None
+    step.close()
 
 
 def test_the_branch_decides_the_order():
@@ -153,6 +200,73 @@ def test_the_ragged_prefill_has_no_paged_history_to_name():
     step = SglangStep(step_case("prefill", (0,), (128,)), DEVICE, seed=1)
     with pytest.raises(ValueError, match="reads no paged KV"):
         step._history_lens()
+
+
+def test_a_measured_case_reports_how_much_the_timed_loop_ran():
+    """Every timed iteration writes one layer's K/V per layer and fills one index
+    stream. A run states that it did, because the checks read the state those calls
+    left and every iteration writes the same content to the same slots."""
+    case = step_case("decode", (512,), (1,), layers=3)
+    result = run_case(case, DEVICE, warmup=1, timed=4, seed=11)
+    assert result["witness"] == {
+        "write_calls": 12,
+        "index_fills": 4,
+        "expected_write_calls": 12,
+        "expected_index_fills": 4,
+    }
+
+
+def test_a_timed_loop_that_skipped_its_writes_is_caught(monkeypatch):
+    """The guard fires where the work is missing rather than letting the checks
+    accept the state the warmup left."""
+    monkeypatch.setattr(SglangStep, "write_layer", lambda self, layer_id, indices: None)
+    with pytest.raises(RuntimeError, match="write calls"):
+        run_case(step_case("decode", (256,), (1,), layers=2), DEVICE, warmup=1, timed=2)
+
+
+def test_the_sampled_reference_reads_the_output_of_a_timed_iteration():
+    """The arithmetic check that runs at full size follows rows of the output the
+    timed loop produced, and reads the same content the kernels read: a value the
+    step's own read did not produce has to fail it."""
+    case = step_case("decode", (512,), (1,))
+    result = run_case(case, DEVICE, warmup=1, timed=2, seed=13)
+    sampled = result["correctness"]["attention_rows"]
+    assert sampled["passed"]
+    assert sampled["rows"] == [{"sequence": 0, "query": 0}]
+
+    corrupted = prepared(case)[0]
+    # The row to break is in the layer whose output is compared below, and the
+    # reference is rebuilt from that layer's content, so a value the read did not
+    # produce has to show up.
+    layer_id = case.num_layers - 1
+    _, value_buffer = corrupted.kv_pool.get_kv_buffer(layer_id)
+    row = int(corrupted.token_pool.req_to_token[int(corrupted.req_pool_indices[0]), 4])
+    value_buffer[row] = 0.0
+    torch.cuda.synchronize()
+    query = corrupted.make_query()
+    output = corrupted.read(query)
+    torch.cuda.synchronize()
+    result = corrupted.check_attention_rows(query, output, layer_id)
+    assert not result["passed"]
+    assert result["max_abs_diff"] > 0.0
+
+
+def test_the_merge_uses_the_implementation_sglang_picks():
+    """FlashInfer's merge kernel holds a bounded number of heads in its thread
+    block; above that the backend calls SGLang's Triton merge instead. The replay
+    follows that choice, so a case above the bound measures the call a server makes
+    and does not fail to launch."""
+    wide, _ = prepared(step_case("extend", (512,), (128,), qo_heads=8, kv_heads=2))
+    assert wide.merge_state_impl == "flashinfer"
+    assert wide.as_dict()["merge_state_impl"] == "flashinfer"
+
+    many, indices = prepared(
+        step_case("extend", (512,), (128,), qo_heads=80, kv_heads=8)
+    )
+    assert many.merge_state_impl == "triton"
+    assert many.as_dict()["merge_state_impl"] == "triton"
+    assert many.check_indices(indices)["passed"]
+    assert many.check_history()["passed"]
 
 
 def test_build_indices_does_not_synchronise_with_the_host(monkeypatch):
@@ -325,7 +439,7 @@ def test_the_step_has_a_window_of_its_own_beside_the_phase_sum():
     step is longer than it by the interval between the windows. step_window
     measures the whole step in one span."""
     step, _ = prepared(step_case("extend", (256,), (128,)))
-    _, measured = one_iteration(step, step.make_query())
+    _, measured, _ = one_iteration(step, step.make_query())
     assert set(measured) == set(STEP_PHASES) | {"step_window", "phase_sum"}
     assert measured["phase_sum"] == pytest.approx(
         sum(measured[name] for name in STEP_PHASES), rel=1e-12
@@ -369,12 +483,12 @@ def test_the_checks_read_the_state_the_timed_loop_left(monkeypatch):
     case = short_case(step_case("extend", (256,), (128,)))
     original = kernel_bench.one_iteration
 
-    def corrupting(step, query):
-        indices, measured = original(step, query)
+    def corrupting(step, query, defer=None):
+        indices, measured, output = original(step, query, defer=defer)
         _, value_buffer = step.kv_pool.get_kv_buffer(0)
         value_buffer[indices.out_cache_loc[0]] = 0.0
         torch.cuda.synchronize()
-        return indices, measured
+        return indices, measured, output
 
     monkeypatch.setattr(kernel_bench, "one_iteration", corrupting)
     result = run_case(case, DEVICE, warmup=1, timed=2)
@@ -463,11 +577,11 @@ def test_the_component_passes_run_against_a_plan_of_their_own_indices(monkeypatc
         record(self, "plan")
         return original_plan(self, indices)
 
-    def iteration(step, query):
+    def iteration(step, query, defer=None):
         if not measured_step:
             measured_step.append(step)
         record(step, "iteration")
-        return original_iteration(step, query)
+        return original_iteration(step, query, defer=defer)
 
     def write_component(step, indices):
         record(step, "write_component")
@@ -491,10 +605,11 @@ def test_the_component_passes_run_against_a_plan_of_their_own_indices(monkeypatc
     monkeypatch.setattr(kernel_bench, "one_attention_component", attention_component)
     monkeypatch.setattr(kernel_bench, "one_gather", gather)
     run_case(case, DEVICE, warmup=1, timed=2)
-    # Each iteration plans for its own indices inside its window. The plan after
-    # them is the one the component passes run against, and it comes before the
-    # first component window and after the correctness checks.
-    expected = ["iteration", "plan"] * 3 + [
+    # Each iteration plans for its own indices inside its window: the warmup, the
+    # timed loop, and the host-ahead pass that follows them. The plan after those is
+    # the one the component passes run against, and it comes before the first
+    # component window and after the correctness checks.
+    expected = ["iteration", "plan"] * (HOST_AHEAD_ITERATIONS + 3) + [
         "plan",
         "write_component",
         "write_component",
@@ -524,7 +639,7 @@ def test_the_step_loop_interleaves_write_and_read_per_layer(monkeypatch):
 
     monkeypatch.setattr(step, "write_layer", write)
     monkeypatch.setattr(step, "run_layer", read)
-    _, measured = one_iteration(step, step.make_query())
+    _, measured, _ = one_iteration(step, step.make_query())
     assert set(measured) == set(STEP_PHASES) | {"step_window", "phase_sum"}
     # The merge branch reads a layer and then writes it, so the calls alternate
     assert order[0] == ("read", 0)
@@ -570,7 +685,7 @@ def test_paged_prefill_reads_written_kv_causally(page_size, layout, monkeypatch)
     monkeypatch.setattr(step, "write_layer", write)
     monkeypatch.setattr(step, "run_layer", read)
     query = step.make_query()
-    timed_indices, _ = one_iteration(step, query)
+    timed_indices, _, _ = one_iteration(step, query)
     assert order == [
         (operation, layer_id)
         for layer_id in range(case.num_layers)

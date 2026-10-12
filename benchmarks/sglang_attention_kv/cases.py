@@ -27,6 +27,14 @@ LAYOUTS = ("contiguous", "random")
 # KV precisions the paged attention kernels this benchmark calls support.
 KERNEL_DTYPES = ("bfloat16", "float16")
 
+# Where a step's cached history is held: in the pool it reads, or outside the GPU in
+# host memory, moved in by Mooncake's Transfer Engine before the step. The second is
+# the path a serving deployment takes when the cache was offloaded.
+KV_SOURCES = ("gpu", "host")
+KV_SOURCE_PROTOCOLS = ("rdma", "tcp")
+DEFAULT_KV_SOURCE = "gpu"
+DEFAULT_KV_SOURCE_PROTOCOL = "rdma"
+
 # The branches of FlashInferAttnBackend this benchmark replays. They live here,
 # with the rest of the configuration vocabulary, so --help and --dry-run work on
 # a machine with no GPU libraries installed.
@@ -147,20 +155,27 @@ def ragged_lengths(length, batch_size):
 
 @dataclass(frozen=True)
 class StepShape:
-    """What the matrix varies: the step's history and query lengths, its page size
-    and its layout."""
+    """What the matrix varies: the step's history and query lengths, its page size,
+    its layout, and where its cached history is held."""
 
     mode: str
     prefix_lens: tuple
     new_lens: tuple
     page_size: int
     layout: str
+    # Keyword only, so the model-bound subclass can keep its own fields positional
+    # and a caller that says nothing about the source gets the pool.
+    kv_source: str = field(default=DEFAULT_KV_SOURCE, kw_only=True)
 
     def __post_init__(self):
         if self.mode not in MODES:
             raise ValueError(f"unknown mode {self.mode!r}, expected one of {MODES}")
         if self.layout not in LAYOUTS:
             raise ValueError(f"unknown layout {self.layout!r}, expected {LAYOUTS}")
+        if self.kv_source not in KV_SOURCES:
+            raise ValueError(
+                f"unknown KV source {self.kv_source!r}, expected one of {KV_SOURCES}"
+            )
         if len(self.prefix_lens) != len(self.new_lens):
             raise ValueError(
                 f"prefix_lens and new_lens must have one entry per sequence, got "
@@ -227,7 +242,8 @@ class StepShape:
 
     @property
     def label(self):
-        """Unique across the matrix: mode, lengths, batch, page size, layout."""
+        """Unique across the matrix: mode, lengths, batch, page size, layout, and
+        where the history was held."""
         parts = [self.mode]
         if self.mode == "prefill":
             parts.append(f"len{self._length_tag(self.new_lens)}")
@@ -240,6 +256,8 @@ class StepShape:
         parts.append(f"ps{self.page_size}")
         if self.layout != "contiguous":
             parts.append(self.layout)
+        if self.kv_source != DEFAULT_KV_SOURCE:
+            parts.append(f"kv{self.kv_source}")
         return "_".join(parts)
 
     def as_dict(self):
@@ -406,11 +424,11 @@ def _batch_shapes(length, batch_size):
 
 
 def build_shapes(
-    modes, input_lens, chunk_lens, batch_sizes, page_sizes, layouts
+    modes, input_lens, chunk_lens, batch_sizes, page_sizes, layouts, kv_sources=("gpu",)
 ) -> list:
     """Every step of the matrix: mode x history length x query length x batch shape
-    x page size x layout. A decode step has one query length by definition, so
-    --chunk-lens only multiplies the extend steps."""
+    x page size x layout x KV source. A decode step has one query length by
+    definition, so --chunk-lens only multiplies the extend steps."""
     shapes = []
     for mode in modes:
         for length in input_lens:
@@ -421,15 +439,17 @@ def build_shapes(
                         prefix_lens, new_lens = _lens_for(mode, lengths, chunk_len)
                         for page_size in page_sizes:
                             for layout in layouts:
-                                shapes.append(
-                                    StepShape(
-                                        mode=mode,
-                                        prefix_lens=prefix_lens,
-                                        new_lens=new_lens,
-                                        page_size=page_size,
-                                        layout=layout,
+                                for kv_source in kv_sources:
+                                    shapes.append(
+                                        StepShape(
+                                            mode=mode,
+                                            prefix_lens=prefix_lens,
+                                            new_lens=new_lens,
+                                            page_size=page_size,
+                                            layout=layout,
+                                            kv_source=kv_source,
+                                        )
                                     )
-                                )
     return shapes
 
 
@@ -456,7 +476,9 @@ def short_case(case, context_cap=256, chunk_cap=64) -> KernelCase:
     while the mapping and content checks stay on the full shape.
 
     Each axis is scaled by one factor, so the short step has the batch's lengths in
-    the batch's proportions and its offsets are the scaled ones.
+    the batch's proportions and its offsets are the scaled ones. It always reads the
+    pool: whatever source the full case drew its history from, the pool is where the
+    step reads it, and the full case's content check is what validates the move in.
     """
     if case.mode == "prefill":
         prefix_lens = (0,) * case.batch_size
@@ -498,6 +520,7 @@ def build_cases(shapes, model_config, tp_size) -> list:
             new_lens=shape.new_lens,
             page_size=shape.page_size,
             layout=shape.layout,
+            kv_source=shape.kv_source,
             num_layers=model_config.num_layers,
             num_qo_heads=qo_heads_per_rank,
             num_kv_heads=kv_heads_per_rank,
@@ -522,6 +545,7 @@ class BenchmarkPlan:
     page_sizes: tuple
     layouts: tuple
     seed: int
+    kv_sources: tuple = (DEFAULT_KV_SOURCE,)
     shapes: list = field(default_factory=list)
     cases: list = field(default_factory=list)
 
@@ -535,6 +559,7 @@ class BenchmarkPlan:
             batch_sizes=self.batch_sizes,
             page_sizes=self.page_sizes,
             layouts=self.layouts,
+            kv_sources=self.kv_sources,
         )
         if model_config is not None:
             self.cases = build_cases(self.shapes, model_config, self.tp_size)
@@ -560,6 +585,7 @@ class BenchmarkPlan:
             "page_sizes": list(self.page_sizes),
             "layouts": list(self.layouts),
             "seed": self.seed,
+            "kv_sources": list(self.kv_sources),
             "num_steps": len(self.shapes),
         }
 
@@ -577,6 +603,7 @@ class BenchmarkPlan:
         lines.append(row("batch sizes", ", ".join(str(v) for v in self.batch_sizes)))
         lines.append(row("page sizes", ", ".join(str(v) for v in self.page_sizes)))
         lines.append(row("layouts", ", ".join(self.layouts)))
+        lines.append(row("KV sources", ", ".join(self.kv_sources)))
         lines.append(row("seed", self.seed))
         lines.append("")
         lines.append(f"  steps ({len(self.shapes)})")
@@ -624,6 +651,12 @@ def build_plan_from_args(args) -> BenchmarkPlan:
         page_sizes = tuple(args.page_sizes)
     if args.layouts is not None:
         layouts = tuple(args.layouts)
+    kv_sources = tuple(args.kv_sources or (DEFAULT_KV_SOURCE,))
+    for value in kv_sources:
+        if value not in KV_SOURCES:
+            raise ValueError(
+                f"unknown --kv-sources entry {value!r}, expected one of {KV_SOURCES}"
+            )
 
     # Validate every numeric argument up front, so a 0 or a negative value cannot
     # turn into a division by zero, an empty sample or a hard-to-place exception.
@@ -661,4 +694,5 @@ def build_plan_from_args(args) -> BenchmarkPlan:
         page_sizes=page_sizes,
         layouts=layouts,
         seed=args.seed,
+        kv_sources=kv_sources,
     )

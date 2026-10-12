@@ -79,7 +79,7 @@ sequence's tokens occupy.
 
 ## 3. Model and KV byte conversion
 
-`model_config.py` reads the number of layers, the number of query heads, the number of KV heads,
+The model loader reads the number of layers, the number of query heads, the number of KV heads,
 head_dim and the dtype from the model's real `config.json`, with nothing hardcoded. For grouped-query
 and multi-head attention (GQA and MHA), where several query heads share one KV head, the per-token KV
 is `num_layers * 2 * num_kv_heads * head_dim * dtype_bytes`: the `2` is K and V, one tensor each, and
@@ -184,7 +184,8 @@ and 32768 with `--input-lens`.
 ```
 <result-dir>/
   plan.json            the step matrix that was actually in effect
-  manifest.json        GPU, driver, framework versions, model revision, dtype, TP, command, timestamp, git commit
+  manifest.json        what the run was measured on: machine, driver, versions, model, sharding,
+                       command, commit
   kernel.jsonl         raw records, one measured step per line
   summary.json         the summary table, in JSON
   kernel_summary.csv   summary table, one row per measured step

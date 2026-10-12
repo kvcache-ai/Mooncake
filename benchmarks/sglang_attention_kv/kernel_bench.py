@@ -9,7 +9,12 @@ import zlib
 
 import torch
 
-from .cases import BRANCH_RAGGED_PREFIX_MERGE, DEFAULT_TIMED, DEFAULT_WARMUP
+from .cases import (
+    BRANCH_RAGGED_PREFIX_MERGE,
+    DEFAULT_KV_SOURCE_PROTOCOL,
+    DEFAULT_TIMED,
+    DEFAULT_WARMUP,
+)
 from .stats import PHASES, STEP_PHASES, derive, summarize
 
 
@@ -30,7 +35,32 @@ def _event_pair():
     )
 
 
-def one_iteration(step, query):
+# Iterations of the host-ahead comparison pass: the step timed with the host free to
+# run ahead of the device, so its windows hold the kernels they cover instead of the
+# time the device spent idle waiting for the next launch. The difference against the
+# primary windows is that idle time, which a step whose kernels are smaller than its
+# host work is made of almost entirely.
+HOST_AHEAD_ITERATIONS = 20
+
+# Moves of the cached history measured for a step whose history Mooncake holds. The
+# step's own iterations read the history the last of them left in the pool, so the
+# content check that follows is a check on a move that really happened.
+FETCH_ITERATIONS = 20
+
+
+def _windows(events):
+    """The windows of one iteration, read off its event pairs."""
+    measured = {
+        "indices": events["indices"][0].elapsed_time(events["indices"][1]),
+        "attention_plan": events["plan"][0].elapsed_time(events["plan"][1]),
+        "layer_loop": events["loop"][0].elapsed_time(events["loop"][1]),
+        "step_window": events["step"][0].elapsed_time(events["step"][1]),
+    }
+    measured["phase_sum"] = sum(measured[name] for name in STEP_PHASES)
+    return measured
+
+
+def one_iteration(step, query, defer=None):
     """One timed step in the order the branch runs it, and the indices it read.
 
     The layer loop is timed as one window: a forward pass runs one layer's
@@ -43,43 +73,49 @@ def one_iteration(step, query):
     three windows sum to phase_sum, which is below it by the between-window
     interval: what the events of two windows do not cover. The indices come back
     with the measurement, so the checks can run against the state this iteration
-    left rather than against a rebuild.
-    """
-    step_events = _event_pair()
-    indices_events = _event_pair()
-    plan_events = _event_pair()
-    loop_events = _event_pair()
+    left rather than against a rebuild, and the last layer's output comes back with
+    them, so the arithmetic check can sample the output a timed iteration produced.
 
-    step_events[0].record()
-    indices_events[0].record()
+    With `defer` a list, the event pairs are appended to it and nothing
+    synchronises here: the caller resolves them after a synchronise of its own,
+    which lets it enqueue iteration after iteration without the device going idle
+    between them. A window then holds the kernels it covers rather than the time
+    the device waited for the next launch.
+    """
+    events = {
+        "step": _event_pair(),
+        "indices": _event_pair(),
+        "plan": _event_pair(),
+        "loop": _event_pair(),
+    }
+
+    events["step"][0].record()
+    events["indices"][0].record()
     indices = step.build_indices()
-    indices_events[1].record()
+    events["indices"][1].record()
 
     # SGLang plans once per step, in init_forward_metadata, before its layer loop.
-    plan_events[0].record()
+    events["plan"][0].record()
     step.plan(indices)
-    plan_events[1].record()
+    events["plan"][1].record()
 
-    loop_events[0].record()
+    events["loop"][0].record()
+    output = None
     for layer_id in range(step.case.num_layers):
         if step.reads_before_write:
-            step.run_layer(layer_id, query)
+            output = step.run_layer(layer_id, query)
             step.write_layer(layer_id, indices)
         else:
             step.write_layer(layer_id, indices)
-            step.run_layer(layer_id, query)
-    loop_events[1].record()
-    step_events[1].record()
+            output = step.run_layer(layer_id, query)
+    events["loop"][1].record()
+    events["step"][1].record()
 
+    if defer is not None:
+        defer.append(events)
+        return indices, None, output
     torch.cuda.synchronize()
-    measured = {
-        "indices": indices_events[0].elapsed_time(indices_events[1]),
-        "attention_plan": plan_events[0].elapsed_time(plan_events[1]),
-        "layer_loop": loop_events[0].elapsed_time(loop_events[1]),
-        "step_window": step_events[0].elapsed_time(step_events[1]),
-    }
-    measured["phase_sum"] = sum(measured[name] for name in STEP_PHASES)
-    return indices, measured
+    return indices, _windows(events), output
 
 
 def one_write_component(step, indices):
@@ -114,8 +150,30 @@ def one_gather(step, indices):
     return begin.elapsed_time(end)
 
 
+def one_fetch(step):
+    """One Mooncake move of the cached history into the pool, in a window of its
+    own. A step whose history is already in the pool moves nothing and reports no
+    window rather than a window around nothing."""
+    if step.history is None:
+        return 0.0
+    begin = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    begin.record()
+    fetched = step.fetch_kv()
+    end.record()
+    torch.cuda.synchronize()
+    step.fetched_bytes = fetched
+    return begin.elapsed_time(end)
+
+
 def run_case(
-    case, device, warmup=DEFAULT_WARMUP, timed=DEFAULT_TIMED, seed=0, extend_branch=None
+    case,
+    device,
+    warmup=DEFAULT_WARMUP,
+    timed=DEFAULT_TIMED,
+    seed=0,
+    extend_branch=None,
+    kv_protocol=DEFAULT_KV_SOURCE_PROTOCOL,
 ):
     """Measure one step and return per-phase percentiles plus the derived
     figures.
@@ -142,9 +200,18 @@ def run_case(
         extend_branch = BRANCH_RAGGED_PREFIX_MERGE
     with torch.cuda.device(device):
         step = SglangStep(
-            case, device, seed=_case_seed(case, seed), extend_branch=extend_branch
+            case,
+            device,
+            seed=_case_seed(case, seed),
+            extend_branch=extend_branch,
+            kv_protocol=kv_protocol,
         )
         step.prepare()
+        # A step whose history Mooncake holds starts with the pool empty, so one move
+        # happens before anything reads it: the warmup and every iteration below then
+        # read the history the way a step whose history was in the pool all along
+        # does. Its window is measured with the other moves, below.
+        step.fetch_kv()
 
         query = step.make_query()
 
@@ -155,22 +222,70 @@ def run_case(
         samples["step_window"] = []
         samples["phase_sum"] = []
         timed_indices = None
+        timed_output = None
+        writes_before = step.write_calls
+        fills_before = step.index_fills
         for _ in range(timed):
-            timed_indices, measured = one_iteration(step, query)
+            timed_indices, measured, timed_output = one_iteration(step, query)
             for name in STEP_PHASES + ("step_window", "phase_sum"):
                 samples[name].append(measured[name])
+
+        # Every timed iteration writes one layer's K/V per layer and fills one index
+        # stream. Without this the checks below could pass on the state the warmup
+        # left, because every iteration writes the same content to the same slots.
+        witness = {
+            "write_calls": step.write_calls - writes_before,
+            "index_fills": step.index_fills - fills_before,
+            "expected_write_calls": timed * case.num_layers,
+            "expected_index_fills": timed,
+        }
+        if (
+            witness["write_calls"] != witness["expected_write_calls"]
+            or witness["index_fills"] != witness["expected_index_fills"]
+        ):
+            raise RuntimeError(
+                f"{case.label}: the timed loop made {witness['write_calls']} write "
+                f"calls and {witness['index_fills']} index fills, expected "
+                f"{witness['expected_write_calls']} and "
+                f"{witness['expected_index_fills']}"
+            )
+
+        # The same step timed with the host free to run ahead. The primary windows
+        # above include the device waiting for the next launch, which a step whose
+        # kernels are small is made of almost entirely; the difference between the
+        # two passes is that wait, so a reader can tell kernel time from idle time.
+        host_ahead_events = []
+        for _ in range(HOST_AHEAD_ITERATIONS):
+            one_iteration(step, query, defer=host_ahead_events)
+        torch.cuda.synchronize()
+        host_ahead = [_windows(events) for events in host_ahead_events]
+
         correctness = {
             "indices": step.check_indices(timed_indices),
             "history": step.check_history(),
+            "attention_rows": step.check_attention_rows(
+                query, timed_output, case.num_layers - 1
+            ),
             "attention": short_step_attention(case, device, seed, extend_branch),
         }
 
-        # The components and the gather run after the checks, each in its own
-        # windows, so no step iteration is ever timed with a probe inside it and no
-        # check reads a state a probe built. They run against a plan of the indices
-        # they use, taken here rather than inside a window: the wrappers' metadata
-        # has to describe the indices the component pass reads, and planning is not
-        # part of what a component measures.
+        # The Mooncake move of the history, in a window of its own beside the step
+        # and before it: the pool the step's iterations read is the one the last of
+        # these moves filled, so the content check below is a check on a move rather
+        # than on a pool that was never filled. A step whose history the pool already
+        # holds moves nothing and states no window.
+        if step.history is None:
+            samples["kv_fetch"] = [0.0] * FETCH_ITERATIONS
+        else:
+            samples["kv_fetch"] = [one_fetch(step) for _ in range(FETCH_ITERATIONS)]
+        fetch_bytes = step.fetched_bytes if step.history is not None else 0
+
+        # The write and the read are priced in passes of their own, after the checks,
+        # each in its own window, so no step iteration is ever timed with a probe
+        # inside it and no check reads a state a probe built. They run against a plan
+        # of the indices they use, taken here rather than inside a window: the
+        # wrappers' metadata has to describe the indices the component pass reads, and
+        # planning is not part of what a component measures.
         probe_indices = step.build_indices()
         step.plan(probe_indices)
         samples["kv_write_component"] = [
@@ -189,6 +304,16 @@ def run_case(
             "read_bytes": read_bytes,
             "warmup": warmup,
             "timed": timed,
+            "witness": witness,
+            "host_ahead": {
+                "iterations": HOST_AHEAD_ITERATIONS,
+                "step_window_p50_ms": summarize(
+                    [entry["step_window"] for entry in host_ahead]
+                )["p50"],
+                "layer_loop_p50_ms": summarize(
+                    [entry["layer_loop"] for entry in host_ahead]
+                )["p50"],
+            },
             "device": str(device),
             "device_name": torch.cuda.get_device_name(device),
             "kv_cache_bytes_per_rank": step.kv_cache_bytes_per_rank,
@@ -198,10 +323,15 @@ def run_case(
         gather_bytes = step.gather_bytes(probe_indices)
         result["gather_bytes"] = gather_bytes
         result["gather_rows"] = int(step.gather_rows(probe_indices).numel())
+        result["kv_bytes_fetched"] = fetch_bytes
         result["derived"] = derive(
-            case, result["phases"], gather_bytes, read_bytes["attention"]
+            case, result["phases"], gather_bytes, read_bytes["attention"], fetch_bytes
         )
         result["correctness"] = correctness
+        # The history's buffers are registered with Mooncake's engine and the record
+        # above names what it moved, so they are released here rather than left
+        # registered until the process ends.
+        step.close()
         # The next step builds its own pools; a step's pool and its tensors are the
         # largest allocations in the run, so release them before moving on.
         del step, query, probe_indices

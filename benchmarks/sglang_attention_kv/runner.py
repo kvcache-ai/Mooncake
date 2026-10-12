@@ -10,8 +10,11 @@ import time
 from . import kernel_summary as summary_module
 from .cases import (
     BRANCH_CHOICES,
+    DEFAULT_KV_SOURCE_PROTOCOL,
     DEFAULT_TIMED,
     DEFAULT_WARMUP,
+    KV_SOURCES,
+    KV_SOURCE_PROTOCOLS,
     LAYOUTS,
     MINIMUM_TIMED,
     MINIMUM_WARMUP,
@@ -128,6 +131,26 @@ def build_parser():
             "prefill without a cached history"
         ),
     )
+    parser.add_argument(
+        "--kv-sources",
+        nargs="+",
+        default=None,
+        choices=list(KV_SOURCES),
+        help=(
+            "where a step's cached history is held: gpu reads it from the pool, "
+            "host stages it in host memory and moves it in through Mooncake's "
+            "Transfer Engine before the step"
+        ),
+    )
+    parser.add_argument(
+        "--kv-source-protocol",
+        default=DEFAULT_KV_SOURCE_PROTOCOL,
+        choices=list(KV_SOURCE_PROTOCOLS),
+        help=(
+            "transport Mooncake moves the history over when --kv-sources includes "
+            f"host, {DEFAULT_KV_SOURCE_PROTOCOL} unless given"
+        ),
+    )
     parser.add_argument("--seed", type=int, default=42, help="random seed")
     parser.add_argument(
         "--device",
@@ -222,7 +245,9 @@ def detect_tp_size(explicit):
     return count
 
 
-def run_steps(plan, device, jsonl_path, warmup, timed, errors, seed, extend_branch):
+def run_steps(
+    plan, device, jsonl_path, warmup, timed, errors, seed, extend_branch, kv_protocol
+):
     from .kernel_bench import run_case
 
     print(f"[steps] {len(plan.cases)} steps")
@@ -243,6 +268,7 @@ def run_steps(plan, device, jsonl_path, warmup, timed, errors, seed, extend_bran
                 timed=timed,
                 seed=seed,
                 extend_branch=extend_branch,
+                kv_protocol=kv_protocol,
             )
             handle.write(json.dumps(record, default=str) + "\n")
             handle.flush()
@@ -501,6 +527,7 @@ def main(argv=None):
         errors,
         args.seed,
         extend_branch,
+        args.kv_source_protocol,
     )
 
     manifest = record_environment(

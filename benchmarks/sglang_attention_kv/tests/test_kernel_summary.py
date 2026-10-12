@@ -17,6 +17,15 @@ CONFIGURATION = {
     "attention_backend": "flashinfer-fa2",
     "wrapper_page_size": 1,
     "decode_use_tensor_cores": True,
+    "merge_state_impl": "flashinfer",
+    "kv_source": "host",
+    "history_holder": {
+        "source": "host",
+        "protocol": "rdma",
+        "registered_bytes": 2048,
+        "entries": 12,
+        "pages": 6,
+    },
     "kv_layout": "NHD",
     "kv_write_stream": "step",
     "slot_allocator": "paged",
@@ -34,6 +43,7 @@ DERIVED = {
     "indices_us_per_new_token": 0.0034,
     "attention_us_per_context_token": 0.0025,
     "kv_gather_unique_payload_gbps": 260.0,
+    "kv_fetch_unique_payload_gbps": 300.0,
     "attention_unique_payload_gbps": 4.2,
     "attention_tflops": 68.5,
     "attention_flops_per_unique_payload_byte": 16386.0,
@@ -73,6 +83,7 @@ WINDOWS = {
     "kv_write_component": 0.9,
     "attention_component": 1.5,
     "kv_gather": 0.4,
+    "kv_fetch": 2.5,
 }
 
 
@@ -114,6 +125,7 @@ def record():
         },
         "gather_rows": 512,
         "gather_bytes": 512 * 36864,
+        "kv_bytes_fetched": 512 * 36864,
         "kv_cache_bytes_per_rank": 1024 * 1024,
         "num_pages_allocated": 12,
         "warmup": 10,
@@ -124,6 +136,7 @@ def record():
         "correctness": {
             "indices": {"passed": True},
             "history": {"passed": True},
+            "attention_rows": {"passed": True},
             "attention": {"passed": True},
         },
     }
@@ -205,6 +218,7 @@ def test_the_configuration_reaches_the_row():
     assert row["attention_backend"] == "flashinfer-fa2"
     assert row["wrapper_page_size"] == 1
     assert row["decode_use_tensor_cores"] is True
+    assert row["merge_state_impl"] == "flashinfer"
     assert row["kv_write_stream"] == "step"
     assert row["slot_allocator"] == "paged"
     assert row["branch"] == "ragged_prefix_merge"

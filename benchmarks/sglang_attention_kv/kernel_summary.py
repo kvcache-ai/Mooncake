@@ -15,6 +15,8 @@ CSV_COLUMNS = [
     "attention_backend",
     "wrapper_page_size",
     "decode_use_tensor_cores",
+    "merge_state_impl",
+    "kv_source",
     "kv_write_stream",
     "slot_allocator",
     "batch_size",
@@ -32,6 +34,8 @@ CSV_COLUMNS = [
     "kv_bytes_ragged_read",
     "kv_bytes_attention_read",
     "kv_bytes_page_capacity",
+    "kv_bytes_fetched",
+    "kv_transfer_entries",
     "gather_rows",
     "gather_bytes",
     "attention_pairs",
@@ -43,6 +47,7 @@ CSV_COLUMNS = [
     "device_name",
     "indices_passed",
     "history_passed",
+    "attention_rows_passed",
     "attention_passed",
 ]
 for _phase in REPORTED_PHASES:
@@ -65,6 +70,7 @@ CSV_COLUMNS.extend(
         "indices_us_per_new_token",
         "attention_us_per_context_token",
         "kv_gather_unique_payload_gbps",
+        "kv_fetch_unique_payload_gbps",
         "attention_unique_payload_gbps",
         "attention_tflops",
         "attention_flops_per_unique_payload_byte",
@@ -107,6 +113,8 @@ def kernel_summary(records):
             "attention_backend": configuration["attention_backend"],
             "wrapper_page_size": configuration["wrapper_page_size"],
             "decode_use_tensor_cores": configuration["decode_use_tensor_cores"],
+            "merge_state_impl": configuration["merge_state_impl"],
+            "kv_source": configuration["kv_source"],
             "kv_write_stream": configuration["kv_write_stream"],
             "slot_allocator": configuration["slot_allocator"],
             "batch_size": case["batch_size"],
@@ -124,6 +132,12 @@ def kernel_summary(records):
             "kv_bytes_ragged_read": record["read_bytes"]["ragged"],
             "kv_bytes_attention_read": record["read_bytes"]["attention"],
             "kv_bytes_page_capacity": case["kv_page_capacity_bytes"],
+            "kv_bytes_fetched": record["kv_bytes_fetched"],
+            "kv_transfer_entries": (
+                configuration["history_holder"]["entries"]
+                if configuration["history_holder"] is not None
+                else 0
+            ),
             "gather_rows": record["gather_rows"],
             "gather_bytes": record["gather_bytes"],
             "attention_pairs": case["attention_pairs"],
@@ -134,7 +148,7 @@ def kernel_summary(records):
             "timed": record["timed"],
             "device_name": record["device_name"],
         }
-        for name in ("indices", "history", "attention"):
+        for name in ("indices", "history", "attention_rows", "attention"):
             check = correctness[name]
             row[f"{name}_passed"] = check["passed"] if isinstance(check, dict) else None
         for phase in REPORTED_PHASES:
