@@ -46,6 +46,24 @@ MasterMetricManager::MasterMetricManager()
       nof_total_capacity_per_segment_(
           "nof_segment_total_capacity_bytes",
           "Total nof ssd capacity of the mounted segment", {"segment"}),
+      storage_devices_total_(
+          "master_storage_devices_total",
+          "Current number of storage devices by health state", {"health"}),
+      storage_devices_isolated_total_(
+          "master_storage_devices_isolated_total",
+          "Current number of storage devices fenced from allocations"),
+      storage_devices_auto_isolated_total_(
+          "master_storage_devices_auto_isolated_total",
+          "Cumulative count of automatic storage device fencing events"),
+      storage_devices_draining_total_(
+          "master_storage_devices_draining_total",
+          "Current number of storage devices undergoing graceful drain"),
+      storage_device_recovery_candidates_(
+          "master_storage_device_recovery_candidates",
+          "Current number of storage devices recommended for data recovery"),
+      storage_device_gc_candidates_("master_storage_device_gc_candidates",
+                                    "Current number of storage devices "
+                                    "recommended for garbage collection"),
       file_allocated_size_(
           "master_allocated_file_size_bytes",
           "Total bytes currently allocated for file storage in 3fs/nfs"),
@@ -566,6 +584,15 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     // Update Gauges (use update(0) to mark as changed)
     mem_allocated_size_.update(0);
     mem_total_capacity_.update(0);
+    storage_devices_total_.update({"healthy"}, 0);
+    storage_devices_total_.update({"degraded"}, 0);
+    storage_devices_total_.update({"failed"}, 0);
+    storage_devices_total_.update({"unknown"}, 0);
+    storage_devices_total_.update({"unmounting"}, 0);
+    storage_devices_isolated_total_.update(0);
+    storage_devices_draining_total_.update(0);
+    storage_device_recovery_candidates_.update(0);
+    storage_device_gc_candidates_.update(0);
     file_allocated_size_.update(0);
     file_total_capacity_.update(0);
     dfs_allocated_size_.update(0);
@@ -584,6 +611,7 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     promotion_in_flight_metric_.update(0);
 
     // Update Counters (use inc(0) to mark as changed)
+    storage_devices_auto_isolated_total_.inc(0);
     promotion_admitted_.inc(0);
     client_liveness_suspected_transitions_.inc(0);
     client_liveness_recoveries_.inc(0);
@@ -901,6 +929,82 @@ void MasterMetricManager::remove_nof_segment_metrics(
     const std::string& segment) {
     nof_allocated_size_per_segment_.remove_label_value({{"segment", segment}});
     nof_total_capacity_per_segment_.remove_label_value({{"segment", segment}});
+}
+
+void MasterMetricManager::project_storage_devices(
+    const std::vector<StorageDeviceMetadata>& devices,
+    const StorageDeviceMaintenancePlan& plan) {
+    int64_t count_healthy = 0;
+    int64_t count_degraded = 0;
+    int64_t count_failed = 0;
+    int64_t count_unknown = 0;
+    int64_t count_unmounting = 0;
+    int64_t count_isolated = 0;
+    int64_t count_draining = 0;
+
+    for (const auto& dev : devices) {
+        switch (dev.health) {
+            case StorageDeviceHealth::HEALTHY:
+                ++count_healthy;
+                break;
+            case StorageDeviceHealth::DEGRADED:
+                ++count_degraded;
+                break;
+            case StorageDeviceHealth::FAILED:
+                ++count_failed;
+                break;
+            case StorageDeviceHealth::UNKNOWN:
+                ++count_unknown;
+                break;
+            case StorageDeviceHealth::UNMOUNTING:
+                ++count_unmounting;
+                break;
+        }
+        if (dev.isolated) ++count_isolated;
+        if (dev.draining) ++count_draining;
+    }
+
+    storage_devices_total_.update({"healthy"}, count_healthy);
+    storage_devices_total_.update({"degraded"}, count_degraded);
+    storage_devices_total_.update({"failed"}, count_failed);
+    storage_devices_total_.update({"unknown"}, count_unknown);
+    storage_devices_total_.update({"unmounting"}, count_unmounting);
+
+    storage_devices_isolated_total_.update(count_isolated);
+    storage_devices_draining_total_.update(count_draining);
+    storage_device_recovery_candidates_.update(
+        static_cast<int64_t>(plan.recovery_candidates.size()));
+    storage_device_gc_candidates_.update(
+        static_cast<int64_t>(plan.gc_candidates.size()));
+}
+
+void MasterMetricManager::inc_nof_devices_auto_isolated_total(int64_t val) {
+    storage_devices_auto_isolated_total_.inc(val);
+}
+
+int64_t MasterMetricManager::get_storage_devices_total(
+    const std::string& health) {
+    return storage_devices_total_.value({health});
+}
+
+int64_t MasterMetricManager::get_storage_devices_isolated_total() {
+    return storage_devices_isolated_total_.value();
+}
+
+int64_t MasterMetricManager::get_storage_devices_auto_isolated_total() {
+    return storage_devices_auto_isolated_total_.value();
+}
+
+int64_t MasterMetricManager::get_storage_devices_draining_total() {
+    return storage_devices_draining_total_.value();
+}
+
+int64_t MasterMetricManager::get_storage_device_recovery_candidates() {
+    return storage_device_recovery_candidates_.value();
+}
+
+int64_t MasterMetricManager::get_storage_device_gc_candidates() {
+    return storage_device_gc_candidates_.value();
 }
 
 // File Storage Metrics
@@ -2049,6 +2153,12 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(nof_total_capacity_);
     serialize_metric(nof_allocated_size_per_segment_);
     serialize_metric(nof_total_capacity_per_segment_);
+    serialize_metric(storage_devices_total_);
+    serialize_metric(storage_devices_isolated_total_);
+    serialize_metric(storage_devices_auto_isolated_total_);
+    serialize_metric(storage_devices_draining_total_);
+    serialize_metric(storage_device_recovery_candidates_);
+    serialize_metric(storage_device_gc_candidates_);
     serialize_metric(file_allocated_size_);
     serialize_metric(file_total_capacity_);
     serialize_metric(dfs_allocated_size_);

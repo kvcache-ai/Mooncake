@@ -564,6 +564,16 @@ void MasterAdminServer::RefreshStorageMetrics() const {
                              ? runtime.service->GetStorageUsageSnapshot()
                              : TieredStorageUsageSnapshot{};
     MasterMetricManager::instance().project_storage_usage(storage);
+
+    if (runtime.service_available && runtime.service) {
+        auto devices = runtime.service->GetStorageDevicesForAdmin();
+        auto plan = runtime.service->GetStorageDeviceMaintenancePlanForAdmin();
+        MasterMetricManager::instance().project_storage_devices(
+            devices ? devices.value() : std::vector<StorageDeviceMetadata>{},
+            plan ? plan.value() : StorageDeviceMaintenancePlan{});
+    } else {
+        MasterMetricManager::instance().project_storage_devices({}, {});
+    }
 }
 
 template <typename Handler>

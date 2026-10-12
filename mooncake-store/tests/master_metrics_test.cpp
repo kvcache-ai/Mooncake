@@ -1437,6 +1437,76 @@ TEST_F(MasterMetricsTest, DuplicatePutResponsesCountItemsWithoutPerKeyLogs) {
     EXPECT_NE(response.body.find(batch_sample), std::string::npos);
 }
 
+TEST_F(MasterMetricsTest, StorageDeviceMetricsProjectionAndSerialization) {
+    auto& metrics = MasterMetricManager::instance();
+
+    // Verify initial values.
+    EXPECT_EQ(metrics.get_storage_devices_total("healthy"), 0);
+    EXPECT_EQ(metrics.get_storage_devices_total("degraded"), 0);
+    EXPECT_EQ(metrics.get_storage_devices_total("failed"), 0);
+    EXPECT_EQ(metrics.get_storage_devices_isolated_total(), 0);
+    EXPECT_EQ(metrics.get_storage_devices_draining_total(), 0);
+    EXPECT_EQ(metrics.get_storage_device_recovery_candidates(), 0);
+    EXPECT_EQ(metrics.get_storage_device_gc_candidates(), 0);
+
+    // Prepare simulated devices inventory.
+    std::vector<StorageDeviceMetadata> devices;
+    StorageDeviceMetadata d1;
+    d1.name = "dev_healthy";
+    d1.health = StorageDeviceHealth::HEALTHY;
+    devices.push_back(d1);
+
+    StorageDeviceMetadata d2;
+    d2.name = "dev_degraded_isolated";
+    d2.health = StorageDeviceHealth::DEGRADED;
+    d2.isolated = true;
+    devices.push_back(d2);
+
+    StorageDeviceMetadata d3;
+    d3.name = "dev_failed_draining";
+    d3.health = StorageDeviceHealth::FAILED;
+    d3.isolated = true;
+    d3.draining = true;
+    devices.push_back(d3);
+
+    StorageDeviceMaintenancePlan plan;
+    plan.recovery_candidates.push_back(
+        {UUID{1, 1}, "dev_degraded_isolated", "probe_degraded"});
+    plan.gc_candidates.push_back(
+        {UUID{2, 2}, "dev_failed_draining", "draining"});
+
+    metrics.project_storage_devices(devices, plan);
+    metrics.inc_nof_devices_auto_isolated_total(3);
+
+    EXPECT_EQ(metrics.get_storage_devices_total("healthy"), 1);
+    EXPECT_EQ(metrics.get_storage_devices_total("degraded"), 1);
+    EXPECT_EQ(metrics.get_storage_devices_total("failed"), 1);
+    EXPECT_EQ(metrics.get_storage_devices_total("unknown"), 0);
+    EXPECT_EQ(metrics.get_storage_devices_total("unmounting"), 0);
+    EXPECT_EQ(metrics.get_storage_devices_isolated_total(), 2);
+    EXPECT_EQ(metrics.get_storage_devices_draining_total(), 1);
+    EXPECT_EQ(metrics.get_storage_devices_auto_isolated_total(), 3);
+    EXPECT_EQ(metrics.get_storage_device_recovery_candidates(), 1);
+    EXPECT_EQ(metrics.get_storage_device_gc_candidates(), 1);
+
+    std::string text = metrics.serialize_metrics();
+    EXPECT_NE(text.find("master_storage_devices_total"), std::string::npos);
+    EXPECT_NE(text.find("health="), std::string::npos);
+    EXPECT_NE(text.find("healthy"), std::string::npos);
+    EXPECT_NE(text.find("degraded"), std::string::npos);
+    EXPECT_NE(text.find("failed"), std::string::npos);
+    EXPECT_NE(text.find("master_storage_devices_isolated_total 2"),
+              std::string::npos);
+    EXPECT_NE(text.find("master_storage_devices_draining_total 1"),
+              std::string::npos);
+    EXPECT_NE(text.find("master_storage_devices_auto_isolated_total 3"),
+              std::string::npos);
+    EXPECT_NE(text.find("master_storage_device_recovery_candidates 1"),
+              std::string::npos);
+    EXPECT_NE(text.find("master_storage_device_gc_candidates 1"),
+              std::string::npos);
+}
+
 }  // namespace mooncake::test
 
 int main(int argc, char** argv) {

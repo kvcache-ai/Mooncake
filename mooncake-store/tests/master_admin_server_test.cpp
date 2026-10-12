@@ -1740,6 +1740,24 @@ TEST_F(MasterAdminServerTest, BatchQueryKeysReturnsLocalDiskReplicaInfo) {
     admin.Stop();
 }
 
+TEST_F(MasterAdminServerWithServiceTest, StorageDeviceMetricsExportedOnScrape) {
+    auto resp = HttpGet("/metrics");
+    EXPECT_EQ(resp.http_status, 200);
+    EXPECT_NE(resp.body.find("master_storage_devices_total"),
+              std::string::npos);
+    EXPECT_NE(resp.body.find("health="), std::string::npos);
+    EXPECT_NE(resp.body.find("master_storage_devices_isolated_total"),
+              std::string::npos);
+    EXPECT_NE(resp.body.find("master_storage_devices_auto_isolated_total"),
+              std::string::npos);
+    EXPECT_NE(resp.body.find("master_storage_devices_draining_total"),
+              std::string::npos);
+    EXPECT_NE(resp.body.find("master_storage_device_recovery_candidates"),
+              std::string::npos);
+    EXPECT_NE(resp.body.find("master_storage_device_gc_candidates"),
+              std::string::npos);
+}
+
 }  // namespace test
 }  // namespace mooncake
 

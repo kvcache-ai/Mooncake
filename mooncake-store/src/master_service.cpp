@@ -13111,6 +13111,8 @@ void MasterService::NofHeartbeatThreadFunc() {
                 auto nof_segment_access =
                     nof_segment_manager_.getNoFSegmentAccess();
                 nof_segment_access.IsolateSegment(probe_target->segment_id);
+                MasterMetricManager::instance()
+                    .inc_nof_devices_auto_isolated_total();
                 LOG(WARNING) << "segment_id=" << probe_target->segment_id
                              << ", segment_name=" << probe_target->segment.name
                              << ", health="
