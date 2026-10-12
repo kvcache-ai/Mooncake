@@ -4487,6 +4487,32 @@ def test_dataproto_helper_object_non_tensor_codecs_roundtrip() -> None:
     assert result["non_tensor_batch"]["nullable_int"].tolist() == [1, None, 3, 4]
 
 
+@pytest.mark.parametrize("explicit_schema", [False, True])
+@pytest.mark.parametrize(
+    "values",
+    [
+        [{1: "one", -2: {3: "nested"}}, {4: "four"}],
+        [{1: "one", -2: {3: "nested"}}, None],
+        [{"outer": {1: "one"}}, {"outer": {2: "two"}}],
+    ],
+)
+def test_dataproto_msgpack_preserves_integer_map_keys(values, explicit_schema) -> None:
+    _store, transfer = make_transfer()
+    rows = np.empty(len(values), dtype=object)
+    rows[:] = values
+    schemas = (
+        {"mapping": FieldSchema(codec="msgpack_ragged")} if explicit_schema else None
+    )
+    ref = transfer.put_dataproto(
+        SimpleDataProto(non_tensor_batch={"mapping": rows}),
+        field_schemas=schemas,
+    )
+
+    assert ref.encoded_non_tensor["mapping"]["codec"] == "msgpack_ragged"
+    result = transfer.get_dataproto(ref)
+    assert result["non_tensor_batch"]["mapping"].tolist() == values
+
+
 def test_msgpack_ragged_decode_validates_row_count() -> None:
     payload, _metadata = sos._encode_msgpack_ragged_values(
         "json", [{"a": 1}, {"b": 2}]
