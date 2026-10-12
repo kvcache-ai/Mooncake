@@ -19,13 +19,39 @@ and installs Go.
 sudo bash dependencies.sh
 ```
 
-Then build and install Mooncake:
+For a simple CPU build, use the preset:
 
 ```bash
-cmake -B build -G Ninja
-cmake --build build
-sudo cmake --install build
+cmake --preset cpu-release
+cmake --build --preset cpu-release
+sudo cmake --install build/cpu-release
 ```
+
+The repository provides a small set of presets for common workflows:
+
+`cpu-release`: Standard CPU Release build with Store and Transfer Engine.
+`cpu-debug`: CPU Debug build with unit tests enabled.
+`cuda-release`: CUDA Release build with Store and Transfer Engine.
+`transfer-engine-only`: Build Transfer Engine only.
+`store-only`: Build Store only.
+
+The presets are optional. Advanced users can use native CMake commands and
+enable additional features directly:
+
+```bash
+cmake -S . -B build/custom -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DWITH_TE=ON \
+  -DWITH_STORE=ON \
+  -DUSE_CUDA=ON \
+  -DUSE_INTRA_NVLINK=ON
+cmake --build build/custom
+```
+
+Keep different platforms and toolchains in separate build directories, such as
+`build/cpu-release` and `build/custom`. Personal preset combinations can be
+stored in `CMakeUserPresets.json` without modifying the repository's
+`CMakePresets.json`.
 
 ### Build with VRAM Segment
 
