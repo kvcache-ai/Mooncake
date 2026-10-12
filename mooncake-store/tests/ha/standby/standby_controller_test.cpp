@@ -82,6 +82,30 @@ TEST(StandbyControllerTest, OplogEnablementControlsReaderController) {
     EXPECT_EQ(ErrorCode::OK, unsupported->PromoteStandby());
 }
 
+TEST(StandbyControllerTest, PromotionReportsStandbyStartFailure) {
+    // No OpLog endpoint: opening the backend fails without touching the
+    // network, whether or not etcd support is compiled in.
+    ha::HABackendSpec spec{};
+    spec.type = ha::HABackendType::ETCD;
+    MasterServiceSupervisorConfig config;
+    config.cluster_id = "promotion-start-failure-test";
+    config.enable_oplog = true;
+
+    auto controller = ha::CreateStandbyController(spec, config);
+    ASSERT_NE(controller, nullptr);
+
+    auto not_started = controller->PromoteStandbyAndExport();
+    ASSERT_FALSE(not_started.has_value());
+    EXPECT_EQ(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS, not_started.error());
+
+    const ErrorCode start_error = controller->StartStandby(std::nullopt);
+    ASSERT_NE(ErrorCode::OK, start_error);
+    EXPECT_EQ(start_error, controller->PromoteStandby());
+    auto failed = controller->PromoteStandbyAndExport();
+    ASSERT_FALSE(failed.has_value());
+    EXPECT_EQ(start_error, failed.error());
+}
+
 TEST(StandbyControllerTest, BatchSnapshotDependencyFailureThrowsBeforeStart) {
     ha::HABackendSpec spec{};
     spec.type = ha::HABackendType::ETCD;
