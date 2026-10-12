@@ -77,12 +77,6 @@ class PromotionOnHitTest : public ::testing::Test {
             .RunPromotionCandidateRetryForTesting();
     }
 
-    static size_t RunPromotionCandidateRetryForTesting(MasterService* service,
-                                                       size_t shards_to_scan) {
-        return MasterServiceTestPeer(*service).RunPromotionCandidateRetry(
-            shards_to_scan);
-    }
-
     static void ClearCandidatesForReloadForTesting(MasterService* service) {
         MasterServiceTestPeer(*service).ClearCandidatesForReload();
     }
@@ -3036,7 +3030,10 @@ TEST_F(PromotionOnHitTest, RetryCandidate_CapRejectedThenQueuedOnRetry) {
     service->RemoveAll();
 }
 
-TEST_F(PromotionOnHitTest, RetryCandidate_NoCandidatesOrNoShardBudgetNoops) {
+// The retry driver queues nothing without candidates, and nothing for a
+// candidate whose admission stays rejected: it is backed off, not dropped.
+TEST_F(PromotionOnHitTest,
+       RetryCandidate_NoCandidatesOrTransientRejectionQueuesNothing) {
     MasterServiceConfig config;
     config.enable_offload = true;
     config.promotion_on_hit = true;
@@ -3061,9 +3058,7 @@ TEST_F(PromotionOnHitTest, RetryCandidate_NoCandidatesOrNoShardBudgetNoops) {
         CountPromotionCandidatesForTesting(service.get(), TenantId::Default()),
         1u);
 
-    EXPECT_EQ(RunPromotionCandidateRetryForTesting(service.get(),
-                                                   /*shards_to_scan=*/0),
-              0u);
+    EXPECT_EQ(RunPromotionCandidateRetryForTesting(service.get()), 0u);
     EXPECT_EQ(
         CountPromotionCandidatesForTesting(service.get(), TenantId::Default()),
         1u);

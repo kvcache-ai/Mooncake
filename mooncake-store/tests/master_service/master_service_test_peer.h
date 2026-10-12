@@ -38,7 +38,7 @@ class MasterServiceTestPeer {
     static constexpr auto kObjectOperationLockStripes =
         MasterService::kObjectOperationLockStripes;
     static constexpr auto kPromotionCandidateMaxRetries =
-        MasterService::kPromotionCandidateMaxRetries;
+        PromotionCandidateTracker::kMaxRetries;
 
     ErrorCode SetBatchOpLogBackendForTesting(
         std::shared_ptr<HaKvBackend> backend);
@@ -219,10 +219,10 @@ class MasterServiceTestPeer {
     }
 
     static auto& PromotionCandidateCount(MasterService& service) {
-        return service.promotion_candidate_count_;
+        return service.promotion_candidates_.count_;
     }
     static const auto& PromotionCandidateCount(const MasterService& service) {
-        return service.promotion_candidate_count_;
+        return service.promotion_candidates_.count_;
     }
 
     static auto& PromotionInFlight(MasterService& service) {
@@ -487,10 +487,6 @@ class MasterServiceTestPeer {
 
     const TenantId& ResolveRequestTenantId(const TenantId& tenant_id) const {
         return service_.ResolveRequestTenantId(tenant_id);
-    }
-
-    size_t RunPromotionCandidateRetry(size_t max_shards_to_scan) {
-        return service_.RunPromotionCandidateRetry(max_shards_to_scan);
     }
 
     size_t RunPromotionCandidateRetry() {
