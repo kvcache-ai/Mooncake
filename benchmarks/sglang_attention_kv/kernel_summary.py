@@ -49,6 +49,8 @@ CSV_COLUMNS = [
     "history_passed",
     "attention_rows_passed",
     "attention_passed",
+    "step_window_host_ahead_ms",
+    "layer_loop_host_ahead_ms",
 ]
 for _phase in REPORTED_PHASES:
     # min as well as the percentiles: min is the smallest sample the window took
@@ -147,6 +149,8 @@ def kernel_summary(records):
             "warmup": record["warmup"],
             "timed": record["timed"],
             "device_name": record["device_name"],
+            "step_window_host_ahead_ms": record["host_ahead"]["step_window_p50_ms"],
+            "layer_loop_host_ahead_ms": record["host_ahead"]["layer_loop_p50_ms"],
         }
         for name in ("indices", "history", "attention_rows", "attention"):
             check = correctness[name]
