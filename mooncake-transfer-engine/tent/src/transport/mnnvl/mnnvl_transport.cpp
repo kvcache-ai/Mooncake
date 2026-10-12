@@ -608,6 +608,66 @@ Status MnnvlTransport::removeMemoryBuffer(BufferDesc &desc) {
     return Status::OK();
 }
 
+// Grant read/write access to the mapped range for every local device that can
+// actually reach it. cuMemSetAccess with one descriptor per visible device is
+// all-or-nothing: on a box where some GPUs have no P2P path to the one that
+// owns the allocation (e.g. two PCIe cards without NVLink) the driver rejects
+// the whole call with CUDA_ERROR_INVALID_DEVICE, and the buffer cannot be
+// allocated or imported at all even though the owning device could use it.
+// Granting per device lets the unreachable ones drop out; a transfer that
+// later needs one of them fails at the copy, not here. `extra` descriptors
+// (e.g. HOST_NUMA for EGM) are mandatory and applied as-is.
+static Status setAccessForReachableDevices(
+    CUdeviceptr ptr, size_t size, const std::vector<CUmemAccessDesc> &extra) {
+    int device_count = 0;
+    auto cuda_err = cudaGetDeviceCount(&device_count);
+    if (cuda_err != cudaSuccess) {
+        return Status::InternalError(std::string("cudaGetDeviceCount: ") +
+                                     cudaGetErrorString(cuda_err) + LOC_MARK);
+    }
+    std::vector<int> skipped;
+    int granted = 0;
+    for (int device_id = 0; device_id < device_count; ++device_id) {
+        CUmemAccessDesc desc = {};
+        desc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        desc.location.id = device_id;
+        desc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+        auto result = cuMemSetAccess(ptr, size, &desc, 1);
+        if (result == CUDA_SUCCESS) {
+            ++granted;
+        } else if (result == CUDA_ERROR_INVALID_DEVICE ||
+                   result == CUDA_ERROR_PEER_ACCESS_UNSUPPORTED) {
+            skipped.push_back(device_id);
+        } else {
+            return Status::InternalError(
+                std::string("cuMemSetAccess: cuResult ") +
+                std::to_string(result) + " for device " +
+                std::to_string(device_id) + LOC_MARK);
+        }
+    }
+    if (granted == 0) {
+        return Status::InternalError(
+            "cuMemSetAccess: no local device can access the mapping" LOC_MARK);
+    }
+    if (!skipped.empty()) {
+        std::string list;
+        for (int id : skipped)
+            list += (list.empty() ? "" : ",") + std::to_string(id);
+        VLOG(1) << "MnnvlTransport: mapping " << (void *)ptr
+                << " not accessible from device(s) " << list
+                << " (no P2P path); transfers from them will fail";
+    }
+    if (!extra.empty()) {
+        auto result = cuMemSetAccess(ptr, size, extra.data(), extra.size());
+        if (result != CUDA_SUCCESS) {
+            return Status::InternalError(
+                std::string("cuMemSetAccess (host): cuResult ") +
+                std::to_string(result) + LOC_MARK);
+        }
+    }
+    return Status::OK();
+}
+
 Status MnnvlTransport::allocateLocalMemory(void **addr, size_t size,
                                            MemoryOptions &options) {
     LocationParser location(options.location);
@@ -659,40 +719,24 @@ Status MnnvlTransport::allocateLocalMemory(void **addr, size_t size,
                                      std::to_string(result) + LOC_MARK);
     }
 
-    int device_count = 0;
-    auto cuda_err = cudaGetDeviceCount(&device_count);
-    if (cuda_err != cudaSuccess) {
-        // Teardown order: unmap, release, then free VA range.
-        cuMemUnmap((CUdeviceptr)ptr, size);
-        cuMemRelease(handle);
-        cuMemAddressFree((CUdeviceptr)ptr, size);
-        return Status::InternalError(std::string("cudaGetDeviceCount: ") +
-                                     cudaGetErrorString(cuda_err) + LOC_MARK);
-    }
-    std::vector<CUmemAccessDesc> accessDesc(device_count);
-    for (int device_id = 0; device_id < device_count; ++device_id) {
-        accessDesc[device_id].location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-        accessDesc[device_id].location.id = device_id;
-        accessDesc[device_id].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-    }
+    std::vector<CUmemAccessDesc> extra_access;
     if (is_host) {
         // Host memory is filled and consumed by the CPU as well.
         CUmemAccessDesc host_access = {};
         host_access.location.type = CU_MEM_LOCATION_TYPE_HOST_NUMA;
         host_access.location.id = numa_node;
         host_access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-        accessDesc.push_back(host_access);
+        extra_access.push_back(host_access);
     }
 
-    result = cuMemSetAccess((CUdeviceptr)ptr, size, accessDesc.data(),
-                            accessDesc.size());
-    if (result != CUDA_SUCCESS) {
+    auto status =
+        setAccessForReachableDevices((CUdeviceptr)ptr, size, extra_access);
+    if (!status.ok()) {
         // Teardown order: unmap, release, then free VA range.
         cuMemUnmap((CUdeviceptr)ptr, size);
         cuMemRelease(handle);
         cuMemAddressFree((CUdeviceptr)ptr, size);
-        return Status::InternalError(std::string("cuMemSetAccess: cuResult ") +
-                                     std::to_string(result) + LOC_MARK);
+        return status;
     }
 
     // The mapping holds its own reference to the physical allocation; drop
@@ -807,8 +851,8 @@ Status MnnvlTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
         // CUDA_VISIBLE_DEVICES. In the local process it may be an invalid
         // ordinal, and even when numerically valid it may denote a different
         // physical GPU. The driver calls below are device-agnostic: the VA
-        // mapping is process-wide and cuMemSetAccess grants read/write
-        // access to ALL local devices.
+        // mapping is process-wide and access is granted to every local
+        // device that can reach it.
         if (handle_type_ == CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR) {
             auto [pid, remote_fd] = parsePidFd(buffer->mnnvl_handle);
             int local_fd = importFdFromProcess(pid, remote_fd);
@@ -833,16 +877,8 @@ Status MnnvlTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                                      0, 0, 0));
         CHECK_CU(
             cuMemMap((CUdeviceptr)mnnvl_addr, buffer->length, 0, handle, 0));
-        int device_count;
-        cudaGetDeviceCount(&device_count);
-        CUmemAccessDesc accessDesc[device_count];
-        for (int device_id = 0; device_id < device_count; ++device_id) {
-            accessDesc[device_id].location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-            accessDesc[device_id].location.id = device_id;
-            accessDesc[device_id].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-        }
-        CHECK_CU(cuMemSetAccess((CUdeviceptr)mnnvl_addr, buffer->length,
-                                accessDesc, device_count));
+        CHECK_STATUS(setAccessForReachableDevices((CUdeviceptr)mnnvl_addr,
+                                                  buffer->length, {}));
         OpenedMnnvlEntry mnnvl_entry;
         mnnvl_entry.mnnvl_addr = mnnvl_addr;
         mnnvl_entry.length = buffer->length;
