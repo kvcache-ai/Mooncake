@@ -97,7 +97,7 @@ TEST(TenantRegistryTest, RemoveDropsTheTenantButNotTheHandle) {
     ASSERT_NE(removed, nullptr);
     registry.Remove(TenantId("tenant-a"));
     EXPECT_EQ(registry.Lookup(TenantId("tenant-a")), nullptr);
-    ASSERT_TRUE(removed->InsertObject(test::MakeObjectEntry("k1")));
+    ASSERT_NE(test::PublishObject(removed->Route(), "k1"), 0u);
     EXPECT_FALSE(removed->Empty());
 
     auto recreated = registry.GetOrCreateTenant(TenantId("tenant-a"));
@@ -114,14 +114,11 @@ TEST(TenantRegistryTest, VisitReachesEveryTenantAndCarriesABroadcast) {
         tenants.push_back(registry.GetOrCreateTenant(TenantId(name)));
     }
     for (auto& tenant : tenants) {
-        auto first = test::MakeObjectEntry("k1", "g1");
-        auto second = test::MakeObjectEntry("k2", "g1");
-        ASSERT_TRUE(tenant->InsertObject(first));
-        ASSERT_TRUE(tenant->InsertObject(second));
+        ASSERT_NE(test::PublishObject(tenant->Route(), "k1", "g1"), 0u);
+        ASSERT_NE(test::PublishObject(tenant->Route(), "k2", "g1"), 0u);
         // A restored tenant starts without membership.
-        tenant->UnregisterGroupMember(first);
-        tenant->UnregisterGroupMember(second);
-        ASSERT_TRUE(tenant->GroupMembers("g1").empty());
+        test::ObjectRouteTestPeer::DropGroupMemberships(tenant->Route());
+        ASSERT_TRUE(tenant->Route().GroupMembers("g1").empty());
     }
 
     // The broadcast a snapshot restore needs: one walk reaches every tenant,
@@ -131,12 +128,12 @@ TEST(TenantRegistryTest, VisitReachesEveryTenantAndCarriesABroadcast) {
         [&](const TenantId& tenant_id, const std::shared_ptr<Tenant>& tenant) {
             EXPECT_NE(tenant, nullptr) << tenant_id.value();
             ++visited;
-            tenant->RebuildGroupState();
+            tenant->Route().RebuildGroupState();
         });
 
     EXPECT_EQ(visited, tenants.size());
     for (const auto& tenant : tenants) {
-        EXPECT_EQ(tenant->GroupMembers("g1").size(), 2u);
+        EXPECT_EQ(tenant->Route().GroupMembers("g1").size(), 2u);
     }
 }
 
@@ -184,9 +181,9 @@ TEST(TenantRegistryTest, MixedLookupCreateRemoveAndVisitStayConsistent) {
     // published before it had finished being built.
     TenantRegistry registry([](const TenantId&) {
         auto tenant = std::make_shared<Tenant>();
-        [[maybe_unused]] const bool inserted =
-            tenant->InsertObject(test::MakeObjectEntry("k1"));
-        assert(inserted);
+        [[maybe_unused]] const route::Generation published =
+            test::PublishObject(tenant->Route(), "k1");
+        assert(published != 0);
         return tenant;
     });
     const std::vector<TenantId> ids = {
@@ -206,7 +203,7 @@ TEST(TenantRegistryTest, MixedLookupCreateRemoveAndVisitStayConsistent) {
         violations.fetch_add(1, std::memory_order_relaxed);
     };
     const auto whole = [](const std::shared_ptr<Tenant>& tenant) {
-        return tenant != nullptr && tenant->ObjectCount() == 1;
+        return tenant != nullptr && tenant->Route().ObjectCount() == 1;
     };
 
     std::vector<std::thread> threads;
