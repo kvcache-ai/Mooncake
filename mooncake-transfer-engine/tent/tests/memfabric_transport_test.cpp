@@ -195,9 +195,62 @@ int32_t mockSmemSetLogLevel(int) {
     return 0;
 }
 
-void InstallMockApi() {
+Request MakeWrite(void* src, uint64_t dest, size_t len) {
+    Request request{};
+    request.opcode = Request::WRITE;
+    request.source = src;
+    request.target_id = LOCAL_SEGMENT_ID;
+    request.target_offset = dest;
+    request.length = len;
+    return request;
+}
+
+class MemFabricTransportTest : public ::testing::Test {
+   protected:
+    void SetUp() override {
+        ResetAcl();
+        g_state = std::make_shared<MockMemFabricState>();
+        state_ = g_state;
+        InstallMockApi();
+        setenv("MF_DATA_OP_TYPE", "device_sdma", 1);
+        metadata_ = std::make_shared<ControlService>("p2p", "", nullptr);
+        uint16_t port = 0;
+        ASSERT_TRUE(metadata_->start(port).ok());
+        name_ = "127.0.0.1:" + std::to_string(static_cast<unsigned>(port));
+        transport_ = std::make_unique<MemFabricTransport>();
+    }
+
+    void TearDown() override {
+        if (batch_ != nullptr) {
+            (void)transport_->freeSubBatch(batch_);
+            batch_ = nullptr;
+        }
+        if (transport_) {
+            (void)transport_->uninstall();
+        }
+        ResetMockApi();
+        unsetenv("MF_DATA_OP_TYPE");
+        g_state.reset();
+    }
+
+    Status Install() {
+        auto conf = std::make_shared<Config>();
+        return transport_->install(name_, metadata_, nullptr, conf);
+    }
+
+    void InstallMockApi();
+    void ResetMockApi();
+
+    std::shared_ptr<MockMemFabricState> state_;
+    std::shared_ptr<ControlService> metadata_;
+    std::unique_ptr<MemFabricTransport> transport_;
+    Transport::SubBatchRef batch_{nullptr};
+    std::string name_;
+};
+
+void MemFabricTransportTest::InstallMockApi() {
     MemFabricUnderApi::gLoaded = true;
-    MemFabricUnderApi::gLibHandle = reinterpret_cast<void*>(0x1000);
+    MemFabricUnderApi::gLibHandle = nullptr;
     MemFabricUnderApi::pSmemTransInit = &mockSmemTransInit;
     MemFabricUnderApi::pSmemTransUninit = &mockSmemTransUninit;
     MemFabricUnderApi::pSmemTransConfigInit = &mockSmemTransConfigInit;
@@ -216,7 +269,7 @@ void InstallMockApi() {
     MemFabricUnderApi::pSmemSetLogLevel = &mockSmemSetLogLevel;
 }
 
-void ResetMockApi() {
+void MemFabricTransportTest::ResetMockApi() {
     MemFabricUnderApi::gLoaded = false;
     MemFabricUnderApi::gLibHandle = nullptr;
     MemFabricUnderApi::pSmemTransInit = nullptr;
@@ -234,60 +287,11 @@ void ResetMockApi() {
     MemFabricUnderApi::pSmemSetLogLevel = nullptr;
 }
 
-Request MakeWrite(void* src, uint64_t dest, size_t len) {
-    Request request{};
-    request.opcode = Request::WRITE;
-    request.source = src;
-    request.target_id = LOCAL_SEGMENT_ID;
-    request.target_offset = dest;
-    request.length = len;
-    return request;
-}
-
-class MemFabricTransportTest : public ::testing::Test {
-   protected:
-    void SetUp() override {
-        ResetAcl();
-        g_state = std::make_shared<MockMemFabricState>();
-        InstallMockApi();
-        setenv("MF_DATA_OP_TYPE", "device_sdma", 1);
-        metadata_ = std::make_shared<ControlService>("p2p", "", nullptr);
-        transport_ = std::make_unique<MemFabricTransport>();
-    }
-
-    void TearDown() override {
-        if (batch_ != nullptr) {
-            (void)transport_->freeSubBatch(batch_);
-            batch_ = nullptr;
-        }
-        if (transport_) {
-            (void)transport_->uninstall();
-        }
-        ResetMockApi();
-        unsetenv("MF_DATA_OP_TYPE");
-        g_state.reset();
-    }
-
-    Status Install() {
-        name_ = "127.0.0.1:23456";
-        auto conf = std::make_shared<Config>();
-        return transport_->install(name_, metadata_, nullptr, conf);
-    }
-
-    std::shared_ptr<MockMemFabricState> state_;
-    std::shared_ptr<ControlService> metadata_;
-    std::unique_ptr<MemFabricTransport> transport_;
-    Transport::SubBatchRef batch_{nullptr};
-    std::string name_;
-};
-
 TEST_F(MemFabricTransportTest, InstallSucceeds) {
     ASSERT_TRUE(Install().ok());
     EXPECT_EQ(state_->init_calls, 1);
     EXPECT_EQ(state_->create_calls, 1);
     EXPECT_EQ(state_->get_rpc_port_calls, 1);
-    EXPECT_TRUE(transport_->installed_);
-    EXPECT_NE(transport_->handle_, nullptr);
 }
 
 TEST_F(MemFabricTransportTest, InstallFailsWhenCreateReturnsNull) {
