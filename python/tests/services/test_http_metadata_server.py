@@ -206,5 +206,44 @@ class TestHttpMetadataServerBounds(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(server.max_keys, 65536)
 
 
+class TestHttpMetadataServerBindGate(unittest.TestCase):
+    """run() must refuse a non-loopback bind with no token unless the
+    operator explicitly opts into the legacy open behavior."""
+
+    def _start(self, host: str, env: dict) -> unittest.mock.Mock:
+        with patch.dict(os.environ, env):
+            server = KVBootstrapServer(port=0, host=host)
+            with patch("mooncake.http_metadata_server.threading.Thread") as thread:
+                server.run()
+        return thread
+
+    def test_non_loopback_without_token_refuses_to_start(self) -> None:
+        env = {"MC_METADATA_HTTP_TOKEN": "", "MC_METADATA_HTTP_ALLOW_INSECURE": ""}
+        with self.assertRaisesRegex(RuntimeError, "refuses to bind"):
+            self._start("0.0.0.0", env)
+
+    def test_loopback_bind_without_token_starts(self) -> None:
+        env = {"MC_METADATA_HTTP_TOKEN": "", "MC_METADATA_HTTP_ALLOW_INSECURE": ""}
+        for host in ("127.0.0.1", "localhost", "::1"):
+            with self.subTest(host=host):
+                thread = self._start(host, env)
+                thread.return_value.start.assert_called_once()
+
+    def test_non_loopback_with_insecure_opt_in_starts(self) -> None:
+        env = {"MC_METADATA_HTTP_TOKEN": "", "MC_METADATA_HTTP_ALLOW_INSECURE": "1"}
+        thread = self._start("0.0.0.0", env)
+        thread.return_value.start.assert_called_once()
+
+    def test_opt_in_value_must_be_truthy(self) -> None:
+        env = {"MC_METADATA_HTTP_TOKEN": "", "MC_METADATA_HTTP_ALLOW_INSECURE": "0"}
+        with self.assertRaisesRegex(RuntimeError, "refuses to bind"):
+            self._start("0.0.0.0", env)
+
+    def test_non_loopback_with_token_starts(self) -> None:
+        env = {"MC_METADATA_HTTP_TOKEN": TOKEN, "MC_METADATA_HTTP_ALLOW_INSECURE": ""}
+        thread = self._start("0.0.0.0", env)
+        thread.return_value.start.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()

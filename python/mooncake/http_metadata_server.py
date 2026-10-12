@@ -67,8 +67,9 @@ class KVBootstrapServer:
         self.store = dict()
         self.lock = asyncio.Lock()
         # Shared-token authentication (#4444). Both this server and every
-        # engine's HTTPStoragePlugin read the same env; unset keeps the
-        # legacy open behavior for trusted-network deployments.
+        # engine's HTTPStoragePlugin read the same env. Unset is only
+        # tolerated on loopback binds or with an explicit insecure opt-in;
+        # run() refuses anything else.
         self.auth_token = os.environ.get("MC_METADATA_HTTP_TOKEN") or None
         # The store is otherwise a memory faucet: many mid-size PUTs sail
         # under aiohttp's per-body limit and grow RSS without bound.
@@ -80,17 +81,46 @@ class KVBootstrapServer:
         self.thread = None
         self._setup_routes()
 
+    @staticmethod
+    def _insecure_opted_in() -> bool:
+        return os.environ.get("MC_METADATA_HTTP_ALLOW_INSECURE", "").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+
     def run(self):
-        """Start the server in a background thread."""
+        """Start the server in a background thread.
+
+        Refuses to start when bound to a non-loopback address with no
+        authentication token: that combination serves unauthenticated
+        GET/PUT/DELETE to the network. Set MC_METADATA_HTTP_TOKEN, bind a
+        loopback address, or export MC_METADATA_HTTP_ALLOW_INSECURE=1 to
+        keep the legacy open behavior.
+        """
+        if (
+            self.auth_token is None
+            and not _is_loopback(self.host)
+            and not self._insecure_opted_in()
+        ):
+            raise RuntimeError(
+                f"HTTP Metadata Server refuses to bind {self.host}:{self.port} "
+                "without an authentication token: anyone who can reach this "
+                "port could read and rewrite cluster metadata. Set "
+                "MC_METADATA_HTTP_TOKEN here and on every engine, bind a "
+                "loopback address, or export MC_METADATA_HTTP_ALLOW_INSECURE=1 "
+                "to keep the legacy open behavior."
+            )
         self.thread = threading.Thread(target=self._run_server, daemon=True)
         self.thread.start()
         logging.info(f"HTTP Metadata Server started on {self.host}:{self.port}")
         if self.auth_token is None and not _is_loopback(self.host):
             logging.warning(
                 f"HTTP Metadata Server is bound to {self.host} with no "
-                "authentication token: anyone who can reach this port can "
-                "read and rewrite cluster metadata. Set "
-                "MC_METADATA_HTTP_TOKEN here and on every engine."
+                "authentication token (MC_METADATA_HTTP_ALLOW_INSECURE "
+                "opt-in): anyone who can reach this port can read and "
+                "rewrite cluster metadata. Set MC_METADATA_HTTP_TOKEN here "
+                "and on every engine."
             )
         return self.thread
 
