@@ -30,6 +30,9 @@
 // handles and whether it holds an object in one word, so the release of the
 // last handle on a slot with no object sees that it is the last one and drops
 // the slot from the map; nothing else ever does.
+//
+// Lifetime: guards and cursors point into the route, so its owner keeps it
+// alive for as long as any of them exists; a route destroyed under one aborts.
 
 #include <array>
 #include <atomic>
@@ -47,6 +50,8 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
+#include <glog/logging.h>
 
 #include "common/transparent_string_hash.h"
 #include "metadata/group_index.h"
@@ -259,10 +264,14 @@ class Guard {
     Metadata& metadata() const { return record().metadata; }
     State& state() const { return record().state; }
 
-    // Publishes an object under this key, which holds none: builds its
+    // Publishes an object under this key, which must hold none: builds its
     // metadata in place from `metadata_args`, ObjectMetadata's constructor
     // arguments, and wires its group membership and the group's shared lease;
     // the state starts empty. Returns the new publication's generation.
+    //
+    // Two caller bugs abort in every build rather than corrupt the route: a
+    // key that already holds an object, whose group membership and count the
+    // new one would strand, and metadata whose user_key is not this key.
     //
     // Nobody else can reach the object until the guard is released, so the
     // caller finishes setting it up through metadata() and state().
@@ -273,7 +282,8 @@ class Guard {
     // Ends the publication this guard holds: drops its group membership and
     // the record. The caller gives back whatever hangs off the object first,
     // under this same guard. A later Publish on the guard starts a new
-    // publication of the key with nothing in between.
+    // publication of the key with nothing in between. A key that holds no
+    // object aborts in every build.
     void TearDown() const
         requires kWrite;
 
@@ -320,6 +330,13 @@ class ObjectRoute {
           report_reads_(observer != nullptr && report_reads) {}
     ObjectRoute(const ObjectRoute&) = delete;
     ObjectRoute& operator=(const ObjectRoute&) = delete;
+
+    // Guards and cursors point into the route, so none may outlive it: the
+    // owner keeps the route alive for as long as it hands them out (a tenant's
+    // route through the registry's shared_ptr to the tenant). A route
+    // destroyed under a guard or a cursor's set-aside slot aborts in every
+    // build rather than leave the holder on freed memory.
+    ~ObjectRoute();
 
     // The object under `key`, held shared; nullopt when the key holds none.
     [[nodiscard]] std::optional<ReadGuard> Read(std::string_view key) const {
@@ -464,7 +481,10 @@ template <typename... Args>
 Generation Guard<kMode>::Publish(Args&&... metadata_args) const
     requires kWrite
 {
-    assert(!has_object());
+    if (has_object()) {
+        LOG(FATAL) << "Publish on key " << key()
+                   << ", which already holds an object";
+    }
     return route_->PublishLocked(*slot_, std::forward<Args>(metadata_args)...);
 }
 
@@ -472,7 +492,9 @@ template <LockMode kMode>
 void Guard<kMode>::TearDown() const
     requires kWrite
 {
-    assert(has_object());
+    if (!has_object()) {
+        LOG(FATAL) << "TearDown on key " << key() << ", which holds no object";
+    }
     route_->TearDownLocked(*slot_);
 }
 
@@ -633,6 +655,21 @@ class ObjectRoute::Cursor {
 
 // --- ObjectRoute ------------------------------------------------------------
 
+inline ObjectRoute::~ObjectRoute() {
+    // A slot with no holder and no object is already gone, so this walks the
+    // objects plus the slots someone still holds. A holder lets go before its
+    // owner lets go of the route, so a relaxed load sees every release.
+    for (const Stripe& stripe : stripes_) {
+        for (const auto& [key, slot] : stripe.slots) {
+            if ((slot.state_.load(std::memory_order_relaxed) &
+                 ~KeySlot::kOccupied) != 0) {
+                LOG(FATAL) << "ObjectRoute destroyed while key " << key
+                           << " is still held";
+            }
+        }
+    }
+}
+
 inline SlotHandle ObjectRoute::FindSlot(std::string_view key) const {
     AssertNotInCursor();
     Stripe& stripe = StripeOf(key);
@@ -683,7 +720,10 @@ Generation ObjectRoute::PublishLocked(KeySlot& slot, Args&&... metadata_args) {
         slot.record_.emplace(generation, std::forward<Args>(metadata_args)...)
             .metadata;
     slot.state_.fetch_or(KeySlot::kOccupied, std::memory_order_relaxed);
-    assert(metadata.user_key == slot.key());
+    if (metadata.user_key != slot.key()) {
+        LOG(FATAL) << "Publish under key " << slot.key()
+                   << " of an object keyed " << metadata.user_key;
+    }
     if (!metadata.group_id.empty()) {
         // AddMember returns null only for an empty group_id.
         auto lease = groups_.AddMember(metadata.group_id, slot.key());

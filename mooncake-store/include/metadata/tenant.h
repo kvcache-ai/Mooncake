@@ -29,6 +29,9 @@ class Tenant {
     Tenant(const Tenant&) = delete;
     Tenant& operator=(const Tenant&) = delete;
 
+    // A guard or cursor taken on the route must not outlive the tenant, so
+    // whoever takes one keeps its handle to the tenant for as long; a removal
+    // from the registry drops only the registry's handle.
     [[nodiscard]] route::ObjectRoute& Route() { return route_; }
     [[nodiscard]] const route::ObjectRoute& Route() const { return route_; }
 

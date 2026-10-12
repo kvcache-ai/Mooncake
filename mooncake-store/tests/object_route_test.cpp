@@ -721,6 +721,48 @@ TEST(ObjectRouteTest, CursorLeavesNoEmptySlotItSetAside) {
     EXPECT_EQ(ObjectRouteTestPeer::SlotCount(route), 1u);
 }
 
+// Misuse that would corrupt the route aborts in release builds too.
+TEST(ObjectRouteDeathTest, PublishOverAnObjectAborts) {
+    ObjectRoute route;
+    ASSERT_NE(PublishObject(route, "k1"), 0u);
+    EXPECT_DEATH(
+        {
+            auto guard = route.WriteKey("k1");
+            (void)test::PublishEnvelope(guard);
+        },
+        "already holds an object");
+}
+
+TEST(ObjectRouteDeathTest, PublishOfAnotherKeysMetadataAborts) {
+    ObjectRoute route;
+    const auto write_time =
+        std::chrono::system_clock::time_point(std::chrono::seconds(1));
+    EXPECT_DEATH(
+        {
+            auto guard = route.WriteKey("k1");
+            (void)guard.Publish(UUID{1, 2}, write_time, 128,
+                                std::vector<Replica>{}, std::nullopt, false,
+                                ObjectDataType::UNKNOWN, std::string(),
+                                TenantId(), std::string("k2"));
+        },
+        "of an object keyed k2");
+}
+
+TEST(ObjectRouteDeathTest, TearDownOfAnEmptyKeyAborts) {
+    ObjectRoute route;
+    EXPECT_DEATH(route.WriteKey("k1").TearDown(), "holds no object");
+}
+
+TEST(ObjectRouteDeathTest, DestroyingARouteUnderAGuardAborts) {
+    EXPECT_DEATH(
+        {
+            auto route = std::make_unique<ObjectRoute>();
+            auto guard = route->WriteKey("k1");
+            route.reset();
+        },
+        "is still held");
+}
+
 #ifndef NDEBUG
 TEST(ObjectRouteDeathTest, RouteAccessFromACursorAsserts) {
     ObjectRoute route;

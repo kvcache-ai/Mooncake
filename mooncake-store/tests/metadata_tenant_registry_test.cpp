@@ -107,6 +107,21 @@ TEST(TenantRegistryTest, RemoveDropsTheTenantButNotTheHandle) {
     ASSERT_NE(registry.Lookup(TenantId("tenant-b")), nullptr);
 }
 
+// A guard lives on the tenant's route, so whoever takes one keeps the
+// tenant's handle for as long; a removal meanwhile does not end the guard.
+TEST(TenantRegistryTest, AGuardOutlivesTheRemovalOfItsTenant) {
+    TenantRegistry registry(MakeTenant);
+    auto tenant = registry.GetOrCreateTenant(TenantId("tenant-a"));
+    ASSERT_NE(tenant, nullptr);
+    auto guard = tenant->Route().WriteKey("k1");
+
+    registry.Remove(TenantId("tenant-a"));
+    EXPECT_EQ(registry.Lookup(TenantId("tenant-a")), nullptr);
+    ASSERT_NE(test::PublishEnvelope(guard), 0u);
+    EXPECT_TRUE(guard.has_object());
+    EXPECT_EQ(tenant->Route().ObjectCount(), 1u);
+}
+
 TEST(TenantRegistryTest, VisitReachesEveryTenantAndCarriesABroadcast) {
     TenantRegistry registry(MakeTenant);
     std::vector<std::shared_ptr<Tenant>> tenants;
