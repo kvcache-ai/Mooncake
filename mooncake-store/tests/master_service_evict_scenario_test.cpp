@@ -38,8 +38,7 @@ int64_t ParseHistogramCount(const std::string& serialized,
     }
     const auto value_begin = pos + marker.size();
     const auto value_end = serialized.find('\n', value_begin);
-    return std::stoll(
-        serialized.substr(value_begin, value_end - value_begin));
+    return std::stoll(serialized.substr(value_begin, value_end - value_begin));
 }
 
 class EvictFakeBatchHaKvBackend : public HaKvBackend {
@@ -851,11 +850,10 @@ TEST_F(MasterServiceEvictScenarioTest, EvictionMetricsRecordAgeAndDuration) {
     const auto serialized_before = metrics.serialize_metrics();
     const int64_t age_count_before = ParseHistogramCount(
         serialized_before, "master_evicted_key_age_seconds");
-    const int64_t duration_count_before = ParseHistogramCount(
-        serialized_before, "master_eviction_duration_ms");
+    const int64_t duration_count_before =
+        ParseHistogramCount(serialized_before, "master_eviction_duration_ms");
 
-    MasterScenario scenario("eviction records age and duration",
-                            EvictConfig());
+    MasterScenario scenario("eviction records age and duration", EvictConfig());
     scenario.Given(MemoryNode("memory").Capacity(256 * 1024 * 1024))
         .Given(IndexedObjects(0, kObjectCount)
                    .Size(kObjectSize)
@@ -874,10 +872,10 @@ TEST_F(MasterServiceEvictScenarioTest, EvictionMetricsRecordAgeAndDuration) {
         .When(EvictMemory(0.10));
 
     const auto serialized_after = metrics.serialize_metrics();
-    const int64_t age_count_after = ParseHistogramCount(
-        serialized_after, "master_evicted_key_age_seconds");
-    const int64_t duration_count_after = ParseHistogramCount(
-        serialized_after, "master_eviction_duration_ms");
+    const int64_t age_count_after =
+        ParseHistogramCount(serialized_after, "master_evicted_key_age_seconds");
+    const int64_t duration_count_after =
+        ParseHistogramCount(serialized_after, "master_eviction_duration_ms");
 
     EXPECT_GE(age_count_after - age_count_before, kExpectedEvicted);
     EXPECT_GE(duration_count_after - duration_count_before, 1);

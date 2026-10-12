@@ -12443,11 +12443,10 @@ void MasterService::BatchEvict(double evict_ratio_target,
             EvictMemberOutcome outcome{.freed_bytes = freed,
                                        .evicted_objects = freed > 0 ? 1 : 0};
             if (freed > 0 && !enable_oplog_) {
-                MasterMetricManager::instance()
-                    .observe_evicted_key_age_seconds(
-                        std::chrono::duration<double>(
-                            now - member_metadata.put_start_time)
-                            .count());
+                MasterMetricManager::instance().observe_evicted_key_age_seconds(
+                    std::chrono::duration<double>(
+                        now - member_metadata.put_start_time)
+                        .count());
                 PublishKvRemovedAfterEvict(member_key, 1, "cpu",
                                            member_metadata, tenant_id);
             }
