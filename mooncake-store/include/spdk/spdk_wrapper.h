@@ -2,11 +2,15 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <condition_variable>
+#include <deque>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <stack>
 #include <string>
+#include <thread>
 #include <vector>
 #include <spdk/env.h>
 #include <spdk/nvme.h>
@@ -58,15 +62,30 @@ class SpdkWrapper {
     bool IsNofSegmentFailed(const nof_seg_handle *seg_handle);
 
     /**
-     * @brief Reconnect the io qpair of a NoF segment after a transport
-     * failure, resetting the controller when the whole nvme association is
-     * gone.
+     * @brief Shared hold on the controller behind a NoF segment.
      *
-     * SPDK requires the io qpair to be reconnected from the same thread that
-     * submits requests to and polls completions of that qpair, so callers
-     * must invoke this from their own submit/poll thread.
+     * Every thread that submits to or polls the io qpair of a segment must
+     * hold this while it does so. A controller reset takes the same lock
+     * exclusively, so it never runs while another thread is using any qpair
+     * or cached namespace of that controller. The lock is only tried, never
+     * waited on: when a reset is queued or in progress the returned lock does
+     * not own the mutex and the caller should skip the segment for this
+     * round.
      */
-    bool ReconnectNofSegment(nof_seg_handle *seg_handle);
+    std::shared_lock<std::shared_mutex> TryLockNofSegmentIo(
+        const nof_seg_handle *seg_handle);
+
+    /**
+     * @brief Try to bring a failed NoF segment back, without blocking.
+     *
+     * Must be called from the thread that owns the segment's io qpair, while
+     * holding TryLockNofSegmentIo(). Returns true when the qpair is healthy.
+     * Otherwise the controller reset runs on a background recovery thread,
+     * and once it has succeeded the next call reconnects the io qpair here,
+     * on the owning thread, as SPDK requires. A thread that serves several
+     * segments therefore never waits on a target that is still down.
+     */
+    bool TryRecoverNofSegment(nof_seg_handle *seg_handle);
 
     /** @brief Register external memory with SPDK for NoF zero-copy transfers.
      *
@@ -155,6 +174,10 @@ class SpdkWrapper {
     void RecycleProbeRequestContext(ProbeRequestContext *ctx);
     void ReplenishProbeRequestContextPoolLocked(size_t count);
     static void ProbeReadComplete(void *ctx, const struct spdk_nvme_cpl *cpl);
+    void ScheduleControllerReset(ctrlr_info *info);
+    void RecoveryLoop();
+    void ResetController(ctrlr_info *info);
+    void StopRecoveryThread();
 
     std::atomic<bool> initialized{false};
     std::mutex init_mutex;
@@ -165,6 +188,14 @@ class SpdkWrapper {
     std::vector<std::unique_ptr<ProbeRequestContext>> probe_request_contexts_;
     std::stack<ProbeRequestContext *> probe_request_context_pool_;
     std::mutex probe_request_context_pool_mutex_;
+
+    // Controller resets requested by TryRecoverNofSegment, run one at a time
+    // on recovery_thread_ so no I/O worker blocks on a target that is down.
+    std::thread recovery_thread_;
+    std::mutex recovery_mutex_;
+    std::condition_variable recovery_cv_;
+    std::deque<ctrlr_info *> recovery_queue_;
+    bool recovery_stop_{false};
 };
 
 }  // namespace mooncake

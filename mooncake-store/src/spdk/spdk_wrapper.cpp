@@ -61,8 +61,17 @@ void ApplyCtrlrOptsFromEnv(struct spdk_nvme_ctrlr_opts *opts) {
 
 struct nof_seg_handle {
     struct spdk_nvme_qpair *qpair;
+    // Only read with the controller's io_mutex held: a reset may free the
+    // namespace struct and replaces this pointer under the exclusive lock.
     struct spdk_nvme_ns *ns;
     ctrlr_info *owner;
+    uint32_t nsid;
+    // Cached so GetBlockSize() does not have to dereference ns from threads
+    // that do not hold io_mutex. Refreshed by ResetController().
+    std::atomic<uint32_t> block_size{INVALID_BLOCK_SIZE};
+    // reset_generation of the owner when this qpair was last (re)connected.
+    // Only touched by the thread that owns the qpair.
+    uint64_t connected_generation{0};
 };
 
 struct tr_info {
@@ -73,8 +82,20 @@ struct tr_info {
 
 struct ctrlr_info {
     struct spdk_nvme_ctrlr *ctrlr;
+    // traddr:trsvcid/subnqn, for logs.
+    std::string endpoint;
     std::map<uint32_t, std::unique_ptr<nof_seg_handle>> ns_seg;
     std::mutex ns_mutex;
+    // Shared by every thread using an io qpair or cached ns of this
+    // controller, exclusive while ResetController() runs. SPDK requires that
+    // nobody else uses the device during spdk_nvme_ctrlr_reset(), and the
+    // reset may invalidate the ns pointers cached in ns_seg.
+    // Lock order: io_mutex before ns_mutex.
+    std::shared_mutex io_mutex;
+    // Bumped after every successful reset, so each qpair owner knows it has
+    // to reconnect its qpair on its own thread.
+    std::atomic<uint64_t> reset_generation{0};
+    std::atomic<bool> reset_pending{false};
 };
 
 SpdkWrapper::SpdkWrapper() = default;
@@ -142,6 +163,7 @@ bool SpdkWrapper::InitializeEnv() {
 }
 
 void SpdkWrapper::Cleanup() {
+    StopRecoveryThread();
     if (initialized.load(std::memory_order_acquire)) {
         {
             std::lock_guard<std::mutex> lock(ctrlrs_mutex);
@@ -394,6 +416,9 @@ nof_seg_handle *SpdkWrapper::OpenNofSegment(const std::string &tr_str) {
         if (it == connected_ctrlrs.end()) {
             auto new_info = std::make_unique<ctrlr_info>();
             info = new_info.get();
+            info->endpoint = std::string(tr.trid.traddr) + ":" +
+                             std::string(tr.trid.trsvcid) + "/" +
+                             std::string(tr.trid.subnqn);
 
             ret = ConnectController(&tr.trid, info);
             if (ret != 0) {
@@ -411,6 +436,8 @@ nof_seg_handle *SpdkWrapper::OpenNofSegment(const std::string &tr_str) {
     struct spdk_nvme_ns *ns = nullptr;
     {
         auto &ns_seg = info->ns_seg;
+        // A new qpair must not be created while the controller is resetting.
+        std::shared_lock<std::shared_mutex> io_lock(info->io_mutex);
         std::lock_guard<std::mutex> lock(info->ns_mutex);
         auto ns_it = ns_seg.find(tr.ns);
         if (ns_it != ns_seg.end()) {
@@ -434,6 +461,11 @@ nof_seg_handle *SpdkWrapper::OpenNofSegment(const std::string &tr_str) {
         new_seg->qpair = qpair;
         new_seg->ns = ns;
         new_seg->owner = info;
+        new_seg->nsid = tr.ns;
+        new_seg->block_size.store(spdk_nvme_ns_get_sector_size(ns),
+                                  std::memory_order_relaxed);
+        new_seg->connected_generation =
+            info->reset_generation.load(std::memory_order_acquire);
         seg_handle = new_seg.get();
         ns_seg[tr.ns] = std::move(new_seg);
     }
@@ -450,55 +482,152 @@ bool SpdkWrapper::IsNofSegmentFailed(const nof_seg_handle *seg_handle) {
            SPDK_NVME_QPAIR_FAILURE_NONE;
 }
 
-bool SpdkWrapper::ReconnectNofSegment(nof_seg_handle *seg_handle) {
+std::shared_lock<std::shared_mutex> SpdkWrapper::TryLockNofSegmentIo(
+    const nof_seg_handle *seg_handle) {
+    if (!seg_handle || !seg_handle->owner) {
+        return {};
+    }
+    // Back off as soon as a reset is queued, not only once it holds the
+    // lock. std::shared_mutex may prefer readers, and busy workers taking
+    // the lock round after round could otherwise keep the reset out.
+    if (seg_handle->owner->reset_pending.load(std::memory_order_acquire)) {
+        return {};
+    }
+    return std::shared_lock<std::shared_mutex>(seg_handle->owner->io_mutex,
+                                               std::try_to_lock);
+}
+
+bool SpdkWrapper::TryRecoverNofSegment(nof_seg_handle *seg_handle) {
     if (!seg_handle || !seg_handle->qpair || !seg_handle->owner ||
         !seg_handle->owner->ctrlr) {
         return false;
     }
+    if (!IsNofSegmentFailed(seg_handle)) {
+        return true;
+    }
 
     ctrlr_info *info = seg_handle->owner;
-    std::lock_guard<std::mutex> lock(info->ns_mutex);
-    if (spdk_nvme_qpair_get_failure_reason(seg_handle->qpair) ==
-        SPDK_NVME_QPAIR_FAILURE_NONE) {
-        // Another segment of the same controller already recovered it.
-        return true;
+    const uint64_t generation =
+        info->reset_generation.load(std::memory_order_acquire);
+    if (seg_handle->connected_generation != generation && seg_handle->ns) {
+        // The controller has been reset since this qpair last connected, so
+        // the target answered moments ago and the connect does not wait out
+        // a dead target. Disconnect first: a reset only marks io qpairs as
+        // failed, and reconnect is a no-op on a qpair that is not
+        // disconnected. Both calls complete any outstanding requests on this
+        // thread, which is why they belong to the owner and not the recovery
+        // thread.
+        seg_handle->connected_generation = generation;
+        spdk_nvme_ctrlr_disconnect_io_qpair(seg_handle->qpair);
+        int ret = spdk_nvme_ctrlr_reconnect_io_qpair(seg_handle->qpair);
+        if (ret == 0 && !IsNofSegmentFailed(seg_handle)) {
+            LOG(INFO) << "NoF io qpair reconnected, endpoint " << info->endpoint
+                      << ", nsid " << seg_handle->nsid;
+            return true;
+        }
+        LOG(WARNING) << "reconnect NoF io qpair failed, endpoint "
+                     << info->endpoint << ", nsid " << seg_handle->nsid
+                     << ", ret " << ret;
     }
 
-    int ret = spdk_nvme_ctrlr_reconnect_io_qpair(seg_handle->qpair);
-    if (ret == 0) {
-        LOG(INFO) << "NoF io qpair reconnected";
-        return true;
-    }
+    // Telling a dropped io connection apart from a target that lost the
+    // whole nvme association (e.g. a restart) takes a connect attempt, which
+    // blocks for up to the fabrics connect timeout while the target is down.
+    // So always go through a controller reset, and run it on the recovery
+    // thread instead of here.
+    ScheduleControllerReset(info);
+    return false;
+}
 
-    // Only the io connection can be reconnected on its own. When the target
-    // restarts, the whole nvme association is gone and the controller has to
-    // be reset before its io qpairs can be connected again.
-    LOG(WARNING) << "reconnect NoF io qpair failed, ret " << ret
-                 << ", resetting controller";
-    ret = spdk_nvme_ctrlr_reset(info->ctrlr);
+void SpdkWrapper::ScheduleControllerReset(ctrlr_info *info) {
+    if (info->reset_pending.exchange(true, std::memory_order_acq_rel)) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(recovery_mutex_);
+    if (recovery_stop_) {
+        info->reset_pending.store(false, std::memory_order_release);
+        return;
+    }
+    if (!recovery_thread_.joinable()) {
+        recovery_thread_ = std::thread(&SpdkWrapper::RecoveryLoop, this);
+    }
+    recovery_queue_.push_back(info);
+    recovery_cv_.notify_one();
+}
+
+void SpdkWrapper::RecoveryLoop() {
+    while (true) {
+        ctrlr_info *info = nullptr;
+        {
+            std::unique_lock<std::mutex> lock(recovery_mutex_);
+            recovery_cv_.wait(lock, [this] {
+                return recovery_stop_ || !recovery_queue_.empty();
+            });
+            if (recovery_stop_) {
+                return;
+            }
+            info = recovery_queue_.front();
+            recovery_queue_.pop_front();
+        }
+        ResetController(info);
+        info->reset_pending.store(false, std::memory_order_release);
+    }
+}
+
+void SpdkWrapper::ResetController(ctrlr_info *info) {
+    // Waits for every thread that is inside a submit/poll round on this
+    // controller to leave it. New rounds fail their try-lock and skip the
+    // controller's segments until the reset is over.
+    std::unique_lock<std::shared_mutex> io_lock(info->io_mutex);
+    std::lock_guard<std::mutex> ns_lock(info->ns_mutex);
+
+    LOG(WARNING) << "resetting NoF controller, endpoint " << info->endpoint;
+    int ret = spdk_nvme_ctrlr_reset(info->ctrlr);
     if (ret != 0) {
-        LOG(ERROR) << "reset NoF controller failed, ret " << ret;
-        return false;
+        LOG(ERROR) << "reset NoF controller failed, endpoint " << info->endpoint
+                   << ", ret " << ret;
+        return;
     }
 
-    ret = spdk_nvme_ctrlr_reconnect_io_qpair(seg_handle->qpair);
-    if (ret != 0) {
-        LOG(ERROR) << "reconnect NoF io qpair after controller reset failed, "
-                      "ret "
-                   << ret;
-        return false;
+    // The reset may have freed namespace structs, so refresh every cached
+    // pointer before anyone can use it again.
+    for (auto &[nsid, seg] : info->ns_seg) {
+        if (spdk_nvme_ctrlr_is_active_ns(info->ctrlr, nsid)) {
+            seg->ns = spdk_nvme_ctrlr_get_ns(info->ctrlr, nsid);
+            seg->block_size.store(spdk_nvme_ns_get_sector_size(seg->ns),
+                                  std::memory_order_relaxed);
+        } else {
+            LOG(ERROR) << "NoF namespace inactive after controller reset, "
+                          "endpoint "
+                       << info->endpoint << ", nsid " << nsid;
+            seg->ns = nullptr;
+            seg->block_size.store(INVALID_BLOCK_SIZE,
+                                  std::memory_order_relaxed);
+        }
     }
 
-    LOG(INFO) << "NoF controller reset, io qpair reconnected";
-    return true;
+    info->reset_generation.fetch_add(1, std::memory_order_acq_rel);
+    LOG(INFO) << "NoF controller reset, endpoint " << info->endpoint;
+}
+
+void SpdkWrapper::StopRecoveryThread() {
+    {
+        std::lock_guard<std::mutex> lock(recovery_mutex_);
+        recovery_stop_ = true;
+        recovery_queue_.clear();
+    }
+    recovery_cv_.notify_all();
+    if (recovery_thread_.joinable()) {
+        recovery_thread_.join();
+    }
 }
 
 uint32_t SpdkWrapper::GetBlockSize(const nof_seg_handle *seg_handle) {
-    if (!seg_handle || !seg_handle->ns) {
+    if (!seg_handle) {
         return INVALID_BLOCK_SIZE;
     }
 
-    return spdk_nvme_ns_get_sector_size(seg_handle->ns);
+    return seg_handle->block_size.load(std::memory_order_relaxed);
 }
 
 int SpdkWrapper::SubmitRequest(const nof_seg_handle *seg_handle, void *ptr,
@@ -569,12 +698,22 @@ bool SpdkWrapper::ProbeNofSegment(const std::string &tr_str,
         return false;
     }
 
+    // Held until the probe read has completed or timed out, so a controller
+    // reset cannot run underneath it.
+    auto io_lock = TryLockNofSegmentIo(seg_handle);
+    if (!io_lock.owns_lock()) {
+        if (error_reason) {
+            *error_reason = "controller_resetting";
+        }
+        return false;
+    }
+
     // OpenNofSegment caches one qpair per namespace, so a qpair that failed
     // while the target was down would otherwise be reused forever and the
     // segment would never be probed successfully again.
-    if (IsNofSegmentFailed(seg_handle) && !ReconnectNofSegment(seg_handle)) {
+    if (!TryRecoverNofSegment(seg_handle)) {
         if (error_reason) {
-            *error_reason = "reconnect_fail";
+            *error_reason = "recovering";
         }
         return false;
     }
