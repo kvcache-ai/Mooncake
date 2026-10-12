@@ -11032,11 +11032,20 @@ void MasterService::DiscardExpiredProcessingReplicas(
     for (auto tenant_it = shard->tenants.begin();
          tenant_it != shard->tenants.end();) {
         auto& tenant_state = tenant_it->second;
+        auto& objects = tenant_state.metadata;
 
-        for (auto it = tenant_state.metadata.begin();
-             it != tenant_state.metadata.end();) {
-            if (!it->second.state.is_processing) {
-                ++it;
+        // Find the objects with work in flight once, so that each pass below
+        // walks only those. A pass that erases an object sets its entry to
+        // end(), and the passes after it skip the entry.
+        std::vector<ObjectMap::iterator> in_flight;
+        for (auto it = objects.begin(); it != objects.end(); ++it) {
+            if (it->second.state.HasWorkInFlight()) {
+                in_flight.push_back(it);
+            }
+        }
+
+        for (auto& it : in_flight) {
+            if (it == objects.end() || !it->second.state.is_processing) {
                 continue;
             }
 
@@ -11045,15 +11054,15 @@ void MasterService::DiscardExpiredProcessingReplicas(
                 metadata.AllReplicas(&Replica::fn_is_completed)) {
                 metadata.ClearPendingSoftPinIfNoViableReplica();
                 if (!metadata.IsValid()) {
-                    it = EraseMetadata(tenant_state, it, tenant_it->first,
-                                       QuotaEraseMode::kFull, &shard);
+                    EraseMetadata(tenant_state, it, tenant_it->first,
+                                  QuotaEraseMode::kFull, &shard);
+                    it = objects.end();
                 } else {
                     auto settle_result =
                         SettlePrimaryWriteQuotaIfReady(tenant_state, metadata);
                     if (settle_result) {
                         it->second.state.is_processing = false;
                     }
-                    ++it;
                 }
                 continue;
             }
@@ -11100,11 +11109,9 @@ void MasterService::DiscardExpiredProcessingReplicas(
                                      << it->first << ", err="
                                      << static_cast<int>(persist_result.error())
                                      << ", deferring discard";
-                        ++it;
                         continue;
                     }
                     if (enable_oplog_) {
-                        ++it;
                         continue;
                     }
                 }
@@ -11118,32 +11125,30 @@ void MasterService::DiscardExpiredProcessingReplicas(
                     discarded_replicas.emplace_back(std::move(replicas), ttl);
                 }
                 if (!metadata.IsValid()) {
-                    it = EraseMetadata(tenant_state, it, tenant_it->first,
-                                       QuotaEraseMode::kFull, &shard);
+                    EraseMetadata(tenant_state, it, tenant_it->first,
+                                  QuotaEraseMode::kFull, &shard);
+                    it = objects.end();
                 } else {
                     auto settle_result =
                         SettlePrimaryWriteQuotaIfReady(tenant_state, metadata);
                     if (settle_result) {
                         it->second.state.is_processing = false;
                     }
-                    ++it;
                 }
-                continue;
             }
-            ++it;
         }
 
-        for (auto metadata_it = tenant_state.metadata.begin();
-             metadata_it != tenant_state.metadata.end();) {
+        for (auto& metadata_it : in_flight) {
+            if (metadata_it == objects.end()) {
+                continue;
+            }
             auto& task = metadata_it->second.state.replication_task;
             if (!task) {
-                ++metadata_it;
                 continue;
             }
 
             const auto ttl = task->start_time + put_start_release_timeout_sec_;
             if (ttl > now || task->durable_cleanup_pending) {
-                ++metadata_it;
                 continue;
             }
 
@@ -11213,11 +11218,9 @@ void MasterService::DiscardExpiredProcessingReplicas(
                         << ", err=" << static_cast<int>(persist_result.error())
                         << ", deferring discard";
                     task->durable_cleanup_pending = false;
-                    ++metadata_it;
                     continue;
                 }
                 if (enable_oplog_) {
-                    ++metadata_it;
                     continue;
                 }
             }
@@ -11247,18 +11250,22 @@ void MasterService::DiscardExpiredProcessingReplicas(
                                                    metadata_it->first);
             }
             if (!metadata.IsValid()) {
-                metadata_it =
-                    EraseMetadata(tenant_state, metadata_it, tenant_it->first,
-                                  QuotaEraseMode::kFull, &shard);
+                EraseMetadata(tenant_state, metadata_it, tenant_it->first,
+                              QuotaEraseMode::kFull, &shard);
+                metadata_it = objects.end();
             } else {
                 ReleaseTenantQuota(GetBoundTenantQuotaHandle(tenant_state),
                                    task->pending_quota_charge_bytes);
                 task.reset();
-                ++metadata_it;
             }
         }
 
-        for (auto& [key, record] : tenant_state.metadata) {
+        for (const auto& it : in_flight) {
+            if (it == objects.end()) {
+                continue;
+            }
+            const auto& key = it->first;
+            auto& record = it->second;
             auto& task = record.state.offloading_task;
             if (!task) {
                 continue;
@@ -11276,7 +11283,12 @@ void MasterService::DiscardExpiredProcessingReplicas(
             task.reset();
         }
 
-        for (auto& [key, record] : tenant_state.metadata) {
+        for (const auto& it : in_flight) {
+            if (it == objects.end()) {
+                continue;
+            }
+            const auto& key = it->first;
+            auto& record = it->second;
             auto& task = record.state.promotion_task;
             if (!task) {
                 continue;

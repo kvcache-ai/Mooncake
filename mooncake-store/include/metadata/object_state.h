@@ -18,6 +18,11 @@ struct ObjectState {
     HeapOptional<ReplicationTask> replication_task;
     HeapOptional<OffloadingTask> offloading_task;
     HeapOptional<PromotionTask> promotion_task;
+
+    bool HasWorkInFlight() const {
+        return is_processing || replication_task || offloading_task ||
+               promotion_task;
+    }
 };
 
 }  // namespace route
