@@ -35,10 +35,14 @@ measure the events as much as the work, so the write and the read are priced in 
 | `kv_write_component` | one `set_kv_buffer` call per layer, over every layer of the step, in one window, without the attention they interleave with |
 | `attention_component` | the branch's attention path over every layer of the step, in one window, without the writes: one ragged call, two wrapper calls and one `merge_state`, one paged prefill call, or one paged decode call |
 | `kv_gather` | a read-only probe: the rows the branch's paged side reads (or the slots the step wrote, when it reads no paged KV), both K and V, moved with `index_select` and no arithmetic |
+| `kv_fetch` | the move of the cached history into the pool through Mooncake, for a step whose history is held outside the GPU (section 3). One entry per pool page per layer per K and V tensor, all layers in one batch |
 
-None of the three is added to the step: each runs after the timed loop in a window of its own, planned
-against the probe's own indices. Their ratio to `phase_sum` is recorded as a ratio rather than as a
-share, because the step interleaves the write and the read per layer.
+None of the four is added to the step: each runs in a window of its own, planned against the probe's own
+indices. Their ratio to `phase_sum` is recorded as a ratio rather than as a share, because the step
+interleaves the write and the read per layer. The two step windows include the device waiting for the
+next kernel launch, which a step whose kernels are smaller than its host work is made of almost
+entirely; every record also carries a second pass of the same iterations with the host free to run
+ahead, whose window holds the kernels alone, so the difference between the two is that wait.
 
 The step is built from SGLang's own `ReqToTokenPool` for the token table and `MHATokenToKVPool` for the
 KV buffers, and its slots come from the allocator its page size selects (section 2).
@@ -77,7 +81,29 @@ sequence's tokens occupy.
   sees the same mapping, and it hands the pool's spare pages back through the allocator, which both
   allocators serve with `free_page_ids`.
 
-## 3. Model and KV byte conversion
+## 3. Where the cached history is held
+
+A step's cached history is read from the pool by default: `--kv-sources gpu` puts it there before the
+step and nothing moves during the run. `--kv-sources host` holds it outside the GPU instead, in host
+memory registered with Mooncake's Transfer Engine, and moves it into the pool in a window of its own
+before the step, which is the path a serving deployment takes when the cache was offloaded:
+
+| Part | What it does |
+|---|---|
+| staging | the generated history is written into a host buffer per layer and per tensor, laid out with the pool's row pitch and one row per token of the aligned prefix, so a page is one contiguous run on both sides |
+| registration | the host buffers and the pool's own K/V buffers are registered with the engine, because an RDMA transfer can only write into registered memory |
+| the move | one batch over every layer: one entry per pool page, carrying the page's rows from the host buffer to the pool row it belongs in. `kv_transfer_entries` states how many entries a case needed, which is its history's pages times the layers times two |
+| the record | the row states the source, the transport it asked the engine for, the registered bytes, the entries, and the fetched bytes beside the window in `kv_fetch` |
+
+The move happens before the step's warmup and every timed iteration reads the history it left in the
+pool, so the content check that follows a step is a check on the transfer: the rows that arrive have to
+be the ones the benchmark generated. `--kv-source-protocol` picks the transport, `rdma` unless the
+machine has none.
+
+What this measures is the move into the GPU. It is not a Store request, not a HiCache tier decision and
+not a transfer between machines: those are the layers above this one, and a benchmark of their own.
+
+## 4. Model and KV byte conversion
 
 The model loader reads the number of layers, the number of query heads, the number of KV heads,
 head_dim and the dtype from the model's real `config.json`, with nothing hardcoded. For grouped-query
@@ -105,7 +131,7 @@ attention layout from the config and prints the field it decided on:
 The dtype of the measurement also comes from the model config; a model that declares a precision the
 paged attention kernels cannot run fails while the cases are built.
 
-## 4. The ledger
+## 5. The ledger
 
 The read side is split by the path that reads it: the two ragged branches hand their own tokens to the
 ragged wrapper and let the paged wrapper see the cached history only, while the paged branches read the
@@ -133,24 +159,35 @@ bandwidth nor the traffic the memory system moved. What the memory system transf
 `kv_bytes_page_capacity` and `kv_write_component` are reported as what they are, an allocation figure
 and the latency of the writer's calls, so no bandwidth divides by either.
 
-## 5. Correctness checks
+## 6. Correctness checks
 
-Each step runs three checks, and a failure fails the run:
+Each step runs four checks, and a failure fails the run:
 
 - `indices`: the CSR stream must name exactly the token table rows the paged side of the branch reads,
   in order. A stream built from a different page table than the one the KV was written through fails
   here, and so does a stream of another length.
 - `history`: every token the step reads — the cached history and the tokens this step wrote — must hold
   what was written, **K and V**, for every layer, compared against the values the benchmark generated.
+  For a step whose history Mooncake holds, this is also the check on the move (section 3).
+- `attention_rows`: the output of a timed iteration itself, at full size, against a float32 reference
+  built from the same content. It follows the last query of each sequence, which is the row that sees
+  the whole context, and costs one score per context token per head, so the whole context fits. The
+  reference is built from the layer whose output is compared.
 - `attention`: the kernel output must match a plain tensor reference computed in float32 over the same
   content, relative error below 1e-2. The reference is causal in every branch, and a reference without
   the mask has to fail the same comparison, so a kernel that saw the future could not pass. It
   materialises a query by context score matrix, so the reference runs on a short step of the same shape
   — the same mode, page size, layout and per-rank head counts, on one layer, with every length of each
-  axis scaled by one factor — while the two checks above run at full size. Every record states the
+  axis scaled by one factor — while the three checks above run at full size. Every record states the
   short step it used in `correctness.attention.case`.
 
-## 6. Command line
+Each record also states how many write calls and index fills its timed loop made, against the counts
+that loop has to make: every iteration writes one layer's K/V per layer and fills one index stream. The
+checks read the state the last timed iteration left, and without that count a timed loop that skipped
+its work would pass on the state the warmup left, because every iteration writes the same content to
+the same slots.
+
+## 7. Command line
 
 ```bash
 python -m benchmarks.sglang_attention_kv --help
@@ -164,11 +201,11 @@ python -m benchmarks.sglang_attention_kv --quick \
 `--dry-run` prints the matrix and exits without touching a GPU. `--help` lists every argument with its
 default; the ones a run usually has to decide are `--model`, `--tp-size` (taken from the number of
 visible GPUs when omitted), `--extend-branch` for the lane, `--page-sizes` and `--layouts` for the
-pool, and `--result-dir`, whose default lands inside the checkout. `--kernel-warmup` and
-`--kernel-timed` default to 10 and 100; lower values make the run exit non-zero, and every record
-carries the counts it used.
+pool, `--kv-sources` for where the cached history is held (section 3), and `--result-dir`, whose default
+lands inside the checkout. `--kernel-warmup` and `--kernel-timed` default to 10 and 100; lower values
+make the run exit non-zero, and every record carries the counts it used.
 
-## 7. The step matrix
+## 8. The step matrix
 
 The matrix that `--full` expands to: the three modes; history lengths 128, 512, 2048 and 8192; extend
 query lengths 128, 512 and 2048; batch sizes 1, and 4 with equal lengths and with lengths of 1, 1/2,
@@ -179,7 +216,7 @@ are its whole sequence, an extend step takes its history from `--input-lens` and
 `--chunk-lens`, and a decode step has one query by definition. When memory and runtime allow, add 16384
 and 32768 with `--input-lens`.
 
-## 8. Result files
+## 9. Result files
 
 ```
 <result-dir>/
@@ -195,16 +232,17 @@ Every window carries min, p50, p95 and p99 over the timed iterations: the three 
 `phase_sum`, the step as one span `step_window`, and the components beside them. The branch the step
 ran, the order it ran in and the configuration it was built with are fields of the record beside them —
 the `configuration` object of `kernel.jsonl`, and the `branch`, `reads_before_write`,
-`attention_backend`, `wrapper_page_size`, `decode_use_tensor_cores`, `kv_write_stream` and
-`slot_allocator` columns of the CSV — so a reader can see which step a number came from. The CSV also
-carries the derived figures of section 4 and the result of every correctness check.
+`attention_backend`, `wrapper_page_size`, `decode_use_tensor_cores`, `merge_state_impl`, `kv_source`,
+`kv_write_stream` and `slot_allocator` columns of the CSV — so a reader can see which step a number came
+from. The CSV also carries the derived figures of section 5, the fetched bytes and transfer entries of
+section 3, and the result of every correctness check.
 
 A report quotes the figures as the CSV names them, and states the lane the run used, the allocator its
 page size selected, and the machine and versions the manifest holds, which is what makes two runs
 comparable. The GPU, the driver, the tensor parallel size, the model's shapes and the page sizes are
 either probed at runtime or read from the model config, so a run elsewhere states its own.
 
-## 9. Limitations
+## 10. Limitations
 
 - One step on one GPU. A serving step also holds the queue in front of it, the scheduler, and the rest
   of the forward pass; this benchmark prices the KV access inside a step, not a request's latency.
@@ -215,10 +253,16 @@ either probed at runtime or read from the model config, so a run elsewhere state
   compare content exactly, but nothing here depends on the data's distribution.
 - A different GPU rank count or model changes the per-rank head counts and the per-token bytes, which
   the manifest records; results from different shardings are only comparable through them.
+- The step windows include the device waiting for the next launch, so a step whose kernels are smaller
+  than its host work is priced as the host work it is. The host-ahead pass in every record states the
+  same iterations with that wait removed; the difference is what the device spent idle.
+- The Mooncake source moves the history from host memory into the pool of the same process. It is not a
+  Store request, not a decision between cache tiers, and not a move between machines; those layers are
+  above this benchmark.
 
-The replay fixes three settings and derives a fourth, each stated in the record's `configuration` and
-in the CSV, so a row says which configuration it describes. The three are this benchmark's own lane,
-read off SGLang 0.5.20, and they are not what SGLang picks for every model:
+The replay fixes four settings and records two it derives per case, each stated in the record's
+`configuration` and in the CSV, so a row says which configuration it describes. The four are this
+benchmark's own lane, read off SGLang 0.5.20, and they are not what SGLang picks for every model:
 
 | Setting | Value here | What SGLang does |
 |---|---|---|
@@ -226,6 +270,7 @@ read off SGLang 0.5.20, and they are not what SGLang picks for every model:
 | `wrapper_page_size` | `1`, and every last-page length is 1 | the same on every model: SGLang hands FlashInfer a token-level CSR stream, and the pool's page size reaches the kernels only through the addresses in it |
 | `decode_use_tensor_cores` | per case, from SGLang's own `should_use_tensor_core` | the replay calls that function with the case's cache dtype and its per-rank head counts, which is how `FlashInferAttnBackend` resolves its decode wrapper: fp8 takes the tensor-core path, fp16 and bf16 take it at a group size of 4 or more query heads per KV head, `SGLANG_FLASHINFER_USE_TENSOR_CORE` overrides the choice, and the row records the value a case resolved to |
 | `kv_write_stream` | `step`: the pool is built with `enable_alt_stream=False` | in SGLang 0.5.20 that stream is used only inside CUDA graph capture, where `_set_kv_buffer_impl` branches on `get_is_capture_mode()` and otherwise writes through the fused `store_cache` kernel on the current stream. This replay captures no graph, so the field records how the pool was built |
+| `merge_state_impl` | per case, from the backend's own `_merge_state_max_safe_num_heads`: FlashInfer's kernel up to 64 query heads at head_dim 128 in bf16, SGLang's Triton merge above it | the merge branch's two halves are joined by `_safe_merge_state`, which picks between the same two implementations on the same threshold, so a case records the merge a server would run |
 
-The allocator is not one of those four: it follows the pool's page size the way SGLang's own
+The allocator is not one of those: it follows the pool's page size the way SGLang's own
 `kv_cache_configurator` selects it, and the record states which one a step used in `slot_allocator`.
