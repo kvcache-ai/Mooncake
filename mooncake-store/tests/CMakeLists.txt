@@ -200,15 +200,14 @@ if(USE_TENT)
       --gtest_filter=TransferTaskTest.TransferScatterHandlesFragmentedCpuBuffers
   )
   set_tests_properties(transfer_scatter_tent_test PROPERTIES ENVIRONMENT
-                                                           "MC_USE_TENT=1")
+                                                             "MC_USE_TENT=1")
   add_test(
     NAME transfer_submitter_scatter_tent_test
     COMMAND
       transfer_task_test
-      --gtest_filter=TransferTaskTest.TransferSubmitterScatterUsesTentDataPath
-  )
-  set_tests_properties(transfer_submitter_scatter_tent_test PROPERTIES
-                       ENVIRONMENT "MC_USE_TENT=1")
+      --gtest_filter=TransferTaskTest.TransferSubmitterScatterUsesTentDataPath)
+  set_tests_properties(transfer_submitter_scatter_tent_test
+                       PROPERTIES ENVIRONMENT "MC_USE_TENT=1")
 endif()
 add_store_test(tenant_quota_test tenant_quota_test.cpp)
 add_store_test(tenant_quota_ledger_test tenant_quota_ledger_test.cpp)
@@ -247,8 +246,10 @@ add_store_test(cxl_segment_config_test cxl_segment_config_test.cpp)
 add_store_test(client_numa_config_test client_numa_config_test.cpp)
 add_store_test(local_hot_cache_config_test local_hot_cache_config_test.cpp)
 add_store_test(client_local_hot_cache_test client_local_hot_cache_test.cpp)
-add_store_test(real_client_hugepage_register_test real_client_hugepage_register_test.cpp)
-add_store_test(real_client_regular_page_register_test real_client_regular_page_register_test.cpp)
+add_store_test(real_client_hugepage_register_test
+               real_client_hugepage_register_test.cpp)
+add_store_test(real_client_regular_page_register_test
+               real_client_regular_page_register_test.cpp)
 add_store_test(client_tcp_local_memcpy_test client_tcp_local_memcpy_test.cpp)
 add_store_test(pybind_client_test pybind_client_test.cpp)
 add_store_test(standalone_client_test standalone_client_test.cpp)
@@ -360,6 +361,15 @@ add_store_test(fileread_worker_pool_config_test
                fileread_worker_pool_config_test.cpp)
 add_store_test(nof_worker_pool_config_test nof_worker_pool_config_test.cpp)
 add_store_test(nof_debug_config_test nof_debug_config_test.cpp)
+
+if(USE_NOF)
+  add_store_test(nof_worker_control_queue_test
+                 nof_worker_control_queue_test.cpp)
+  target_include_directories(nof_worker_control_queue_test
+                             PRIVATE ${SPDK_INCLUDE_DIR} ${DPDK_INCLUDE_DIR})
+  set_tests_properties(nof_worker_control_queue_test PROPERTIES TIMEOUT 30)
+endif()
+
 add_store_test(fileread_worker_pool_test fileread_worker_pool_test.cpp)
 if(MOONCAKE_OSS_ADAPTER_ENABLED)
   target_compile_definitions(file_storage_test PRIVATE HAVE_OSS_ADAPTER)

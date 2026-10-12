@@ -4,6 +4,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -493,6 +494,13 @@ struct SpdkNofQos {
 constexpr int kDefaultSpdkNofWorkers = 4;
 class SpdkNofWorkerPool {
    public:
+    struct WorkerContext;
+    using ControlTask = std::function<void(WorkerContext&)>;
+
+    // Callbacks run on the target worker and must not wait for other tasks on
+    // that worker. Callers must stop posting before destroying the pool.
+    void PostControlTask(int worker_idx, ControlTask task);
+
     explicit SpdkNofWorkerPool(int numa_socket_id = 0);
     ~SpdkNofWorkerPool();
 
@@ -515,6 +523,7 @@ class SpdkNofWorkerPool {
     int numa_socket_id_;
     std::vector<std::thread> workers_;
     std::unique_ptr<std::queue<SpdkNofTask>[]> task_queue_;
+    std::unique_ptr<std::queue<ControlTask>[]> control_queue_;
     std::unique_ptr<std::mutex[]> queue_mutex_;
     std::unique_ptr<std::condition_variable[]> queue_cv_;
     std::atomic<bool> shutdown_;

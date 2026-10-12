@@ -333,6 +333,8 @@ SpdkNofWorkerPool::SpdkNofWorkerPool(int numa_socket_id)
     : worker_count_(NoFWorkerPoolConfig::AtFirstUse().worker_count),
       numa_socket_id_(numa_socket_id),
       task_queue_(std::make_unique<std::queue<SpdkNofTask>[]>(worker_count_)),
+      control_queue_(
+          std::make_unique<std::queue<ControlTask>[]>(worker_count_)),
       queue_mutex_(std::make_unique<std::mutex[]>(worker_count_)),
       queue_cv_(std::make_unique<std::condition_variable[]>(worker_count_)),
       shutdown_(false) {
@@ -362,6 +364,14 @@ SpdkNofWorkerPool::~SpdkNofWorkerPool() {
     }
 
     VLOG(1) << "SpdkNofWorkerPool destroyed";
+}
+
+void SpdkNofWorkerPool::PostControlTask(int worker_idx, ControlTask task) {
+    {
+        std::lock_guard<std::mutex> lock(queue_mutex_[worker_idx]);
+        control_queue_[worker_idx].push(std::move(task));
+    }
+    queue_cv_[worker_idx].notify_one();
 }
 
 void SpdkNofWorkerPool::submitTask(SpdkNofTask task) {
@@ -441,81 +451,108 @@ static inline bool CheckSubTaskPool(
     return true;
 }
 
+struct SpdkNofWorkerPool::WorkerContext {
+    int64_t total_outstanding_io{0};
+    std::map<nof_seg_handle*, std::unique_ptr<SpdkNofQos>> seg_to_qos;
+    std::stack<SpdkNofSubTask*> sub_task_pool;
+    std::vector<SpdkNofSubTask*> sub_task_chunks;
+    std::chrono::steady_clock::time_point last_debug_snapshot{
+        std::chrono::steady_clock::now()};
+
+    ~WorkerContext() {
+        for (auto* sub_tasks : sub_task_chunks) delete[] sub_tasks;
+    }
+};
+
 void SpdkNofWorkerPool::workerThread(int work_idx) {
     bindToSocket(numa_socket_id_);
     VLOG(2) << "SpdkNofWorkerPool worker thread started";
 
-    int64_t total_outstanding_io = 0;
-    // std::set<nof_seg_handle *> seg_set;
-    std::map<nof_seg_handle*, std::unique_ptr<SpdkNofQos>> seg_to_qos;
-    std::stack<SpdkNofSubTask*> sub_task_pool;
-    std::vector<SpdkNofSubTask*> sub_task_chunks;
+    WorkerContext ctx;
+    auto& total_outstanding_io = ctx.total_outstanding_io;
+    auto& seg_to_qos = ctx.seg_to_qos;
+    auto& sub_task_pool = ctx.sub_task_pool;
+    auto& sub_task_chunks = ctx.sub_task_chunks;
     auto& task_queue = task_queue_[work_idx];
+    auto& control_queue = control_queue_[work_idx];
     auto& queue_cv = queue_cv_[work_idx];
     auto& queue_mutex = queue_mutex_[work_idx];
-    auto last_debug_snapshot = std::chrono::steady_clock::now();
+    auto& last_debug_snapshot = ctx.last_debug_snapshot;
 
     if (!CheckSubTaskPool(sub_task_pool, sub_task_chunks, work_idx)) {
         return;
     }
 
+    std::queue<ControlTask> controls;
+    std::queue<SpdkNofTask> incoming;
     while (true) {
         // Wait for task or shutdown signal
         {
             std::unique_lock<std::mutex> lock(queue_mutex);
-            queue_cv.wait(
-                lock, [this, &task_queue, &total_outstanding_io, &seg_to_qos] {
-                    return shutdown_.load() || !task_queue.empty() ||
-                           total_outstanding_io || HasBufferedTask(seg_to_qos);
-                });
+            queue_cv.wait(lock, [this, &task_queue, &control_queue,
+                                 &total_outstanding_io, &seg_to_qos] {
+                return shutdown_.load() || !task_queue.empty() ||
+                       !control_queue.empty() || total_outstanding_io ||
+                       HasBufferedTask(seg_to_qos);
+            });
 
             if (shutdown_.load() && task_queue.empty() &&
-                (total_outstanding_io == 0) && !HasBufferedTask(seg_to_qos)) {
+                control_queue.empty() && (total_outstanding_io == 0) &&
+                !HasBufferedTask(seg_to_qos)) {
                 break;
             }
 
-            while (!task_queue.empty()) {
-                SpdkNofTask* task = new (std::nothrow)
-                    SpdkNofTask(std::move(task_queue.front()));
-                if (task == nullptr) {
+            // Snapshot both queues together so new I/O cannot overtake a
+            // preceding control task while this worker executes callbacks.
+            controls.swap(control_queue);
+            incoming.swap(task_queue);
+        }
+
+        while (!controls.empty()) {
+            controls.front()(ctx);
+            controls.pop();
+        }
+
+        while (!incoming.empty()) {
+            auto incoming_task = std::move(incoming.front());
+            incoming.pop();
+            SpdkNofTask* task =
+                new (std::nothrow) SpdkNofTask(std::move(incoming_task));
+            if (task == nullptr) {
+                LOG(ERROR) << "alloc SpdkNofTask failed, worker " << work_idx;
+                incoming_task.state->set_completed(ErrorCode::TRANSFER_FAIL);
+                continue;
+            }
+
+            SpdkNofQos* nof_qos = nullptr;
+            auto it = seg_to_qos.find(task->seg_handle);
+            if (it == seg_to_qos.end()) {
+                auto qos = std::make_unique<SpdkNofQos>(
+                    SpdkWrapper::GetInstance().GetBlockSize(task->seg_handle));
+                if (qos == nullptr) {
                     LOG(ERROR)
-                        << "alloc SpdkNofTask failed, worker " << work_idx;
+                        << "alloc SpdkNofQos failed, worker " << work_idx;
+                    delete task;
                     continue;
                 }
-
-                SpdkNofQos* nof_qos = nullptr;
-                auto it = seg_to_qos.find(task->seg_handle);
-                if (it == seg_to_qos.end()) {
-                    auto qos = std::make_unique<SpdkNofQos>(
-                        SpdkWrapper::GetInstance().GetBlockSize(
-                            task->seg_handle));
-                    if (qos == nullptr) {
-                        LOG(ERROR)
-                            << "alloc SpdkNofQos failed, worker " << work_idx;
-                        delete task;
-                        continue;
-                    }
-                    nof_qos = qos.get();
-                    seg_to_qos[task->seg_handle] = std::move(qos);
-                    if (IsSpdkNofDebugEnabled()) {
-                        LOG(INFO)
-                            << "nof_qos_create worker_idx=" << work_idx
-                            << " seg_handle=" << task->seg_handle
-                            << " blocks_per_chunk="
-                            << seg_to_qos[task->seg_handle]->blocks_per_chunk
-                            << " inflight_blocks_limit="
-                            << seg_to_qos[task->seg_handle]
-                                   ->inflight_blocks_limit;
-                    }
-                } else {
-                    nof_qos = it->second.get();
+                nof_qos = qos.get();
+                seg_to_qos[task->seg_handle] = std::move(qos);
+                if (IsSpdkNofDebugEnabled()) {
+                    LOG(INFO)
+                        << "nof_qos_create worker_idx=" << work_idx
+                        << " seg_handle=" << task->seg_handle
+                        << " blocks_per_chunk="
+                        << seg_to_qos[task->seg_handle]->blocks_per_chunk
+                        << " inflight_blocks_limit="
+                        << seg_to_qos[task->seg_handle]->inflight_blocks_limit;
                 }
-                task->io_count = &total_outstanding_io;
-                task->nof_qos = nof_qos;
-                task->on_chain = true;
-                nof_qos->PushTask(task);
-                task_queue.pop();
+            } else {
+                nof_qos = it->second.get();
             }
+            task->io_count = &total_outstanding_io;
+            task->nof_qos = nof_qos;
+            task->on_chain = true;
+            nof_qos->PushTask(task);
         }
 
         for (auto& [seg_handle, nof_qos] : seg_to_qos) {
@@ -609,12 +646,6 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
             }
         }
     }
-
-    for (auto* sub_tasks : sub_task_chunks) {
-        delete[] sub_tasks;
-    }
-    // seg_to_qos will automatically clean up SpdkNofQos objects using
-    // unique_ptr
 
     VLOG(2) << "SpdkNofWorkerPool worker thread exiting";
 }
