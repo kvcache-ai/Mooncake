@@ -60,7 +60,7 @@ bool ParseEnvEnabled(const char* name);
 //     dropped), otherwise as the flat key
 //     "comm_resource_config.nic_topo_path". An empty input yields a minimal
 //     {"comm_resource_config.nic_topo_path":"..."} object.
-// A non-empty but unparseable input is returned unchanged (HIXL rejects it).
+// A non-empty but unparsable input is returned unchanged (HIXL rejects it).
 std::string InjectNicTopoPathFromCustomTopoEnvTent(
     const std::string& resolved_config);
 

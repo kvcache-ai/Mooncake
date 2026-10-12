@@ -209,7 +209,8 @@ std::string InjectNicTopoPathFromCustomTopoEnvTent(
         }
     }
 
-    // An explicitly configured nic_topo_path always wins over MC_CUSTOM_TOPO_JSON.
+    // An explicitly configured nic_topo_path always wins over
+    // MC_CUSTOM_TOPO_JSON.
     if (NicTopoPathIsSet(root)) {
         return resolved_config;
     }

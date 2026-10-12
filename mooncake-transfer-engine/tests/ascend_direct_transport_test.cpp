@@ -2707,8 +2707,7 @@ TEST(InjectNicTopoPathTest, NestedCommResourceConfigInjectsNestedDropsFlat) {
         R"({"comm_resource_config":{"protocol_desc":"roce:host"},)"
         R"("comm_resource_config.nic_topo_path":""})");
     EXPECT_NE(out.find("/etc/mooncake/nic_topo.json"), std::string::npos);
-    EXPECT_EQ(out.find("comm_resource_config.nic_topo_path"),
-              std::string::npos)
+    EXPECT_EQ(out.find("comm_resource_config.nic_topo_path"), std::string::npos)
         << "the flat key must be dropped once the nested object is used";
 }
 
