@@ -295,7 +295,7 @@ class ObservedRdmaTransport : public FakeTransport {
         second_.slice_idx = 1;
         second_.source_nic_name = "local-nic";
         second_.target_nic_name = "remote-nic";
-        second_.target_machine_id = &target_machine_id_;
+        second_.target_machine_id = target_machine_id_;
         first_.length = first_length_;
         second_.length = second_length_;
         adaptive_congestion_control::PathHandle path{&device_, &route_.domain,

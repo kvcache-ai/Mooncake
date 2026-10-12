@@ -90,10 +90,10 @@ adaptive_congestion_control::TaskCongestionEvidence taskEvidence(
     evidence.controller_generation = domain.generation;
     evidence.window_bytes = domain.window_bytes;
     evidence.inflight_bytes = domain.inflight_bytes;
-    if (slice.source_nic_name && slice.target_nic_name &&
-        slice.target_machine_id) {
-        evidence.path = std::string(slice.source_nic_name) + " -> " +
-                        *slice.target_machine_id + "/" + slice.target_nic_name;
+    if (!slice.source_nic_name.empty() && !slice.target_nic_name.empty() &&
+        !slice.target_machine_id.empty()) {
+        evidence.path = slice.source_nic_name + " -> " +
+                        slice.target_machine_id + "/" + slice.target_nic_name;
     }
     return evidence;
 }

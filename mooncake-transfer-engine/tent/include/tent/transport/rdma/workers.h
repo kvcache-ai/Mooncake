@@ -273,7 +273,8 @@ class Workers {
     // hardware reports as up.
     void resumePausedContexts();
 
-    Status generatePostPath(RdmaSlice* slice, bool* recovery_probe_in_progress);
+    Status generatePostPath(RdmaSlice* slice,
+                            bool* recovery_probe_in_progress = nullptr);
 
    private:
     struct RouteHint {

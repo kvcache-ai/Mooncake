@@ -3474,7 +3474,7 @@ TEST_F(RdmaWorkersAvoidTest, UnpostedAvoidDoesNotPauseRailAndProbeRecovers) {
         EXPECT_EQ(slice->posted_dev.load(), -1);
         EXPECT_TRUE(slice->ep_weak_ptr.expired());
         ASSERT_NE(slice->rail_monitor, nullptr);
-        EXPECT_TRUE(slice->rail_monitor->available(kDev, kDev))
+        EXPECT_TRUE(slice->rail_monitor->isAvailable(kDev, kDev))
             << "avoiding unposted slices must not count new rail failures";
     }
 
