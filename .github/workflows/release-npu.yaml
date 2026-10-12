@@ -232,7 +232,7 @@ jobs:
         with:
           tag_name: ${{ needs.version-stamp.outputs.release_tag }}
           prerelease: ${{ needs.version-stamp.outputs.is_prerelease == 'true' }}
-          make_latest: ${{ needs.version-stamp.outputs.is_prerelease == 'true' && 'false' || 'legacy' }}
+          make_latest: ${{ needs.version-stamp.outputs.is_prerelease == 'true' && 'false' || '' }}
           files: mooncake-wheel/dist-release/*.whl
           fail_on_unmatched_files: true
 
