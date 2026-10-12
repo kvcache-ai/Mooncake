@@ -95,6 +95,20 @@ inline RpcClientPool::PoolConfig MakeMasterRpcClientPoolConfig(
  */
 class MasterClient {
    public:
+    tl::expected<void, ErrorCode> SetKvSessionPin(const std::string& session_id,
+                                                  bool pinned);
+    tl::expected<void, ErrorCode> CloseKvSession(const std::string& session_id);
+    tl::expected<void, ErrorCode> UpdateKvSession(
+        const std::string& session_id,
+        const std::vector<std::string>& keep_keys);
+    tl::expected<KvSessionInfo, ErrorCode> GetKvSession(
+        const std::string& session_id);
+    tl::expected<KvSessionPage, ErrorCode> ListKvSessionKeys(
+        const std::string& session_id, const std::string& cursor,
+        uint64_t limit);
+    std::vector<tl::expected<void, ErrorCode>> AttachKvSession(
+        const std::string& session_id, const std::vector<std::string>& keys);
+
     MasterClient(const UUID& client_id, MasterClientMetric* metrics = nullptr,
                  std::string tenant_id = "default")
         : client_accessor_(GetStoreRpcClientIoContextPool(),

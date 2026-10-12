@@ -135,8 +135,7 @@ std::optional<std::vector<int>> try_dummy_cuda_ipc_batch_write_tensor_impl(
     }
 
     if (!write_requests.empty()) {
-        ReplicateConfig write_config =
-            MakeIndexedConfig(config, original_indices);
+        ReplicateConfig write_config = config.ForKeys(original_indices);
         auto dummy_client = std::static_pointer_cast<DummyClient>(store_);
         for (const auto &[device_id, stream_handle] : unique_streams) {
             if (!mooncake::device::SynchronizeCudaStream(device_id,
@@ -283,8 +282,7 @@ std::vector<int> batch_write_tensor_impl(
             }
 
             if (!valid_keys.empty()) {
-                ReplicateConfig write_config =
-                    MakeIndexedConfig(config, original_indices);
+                ReplicateConfig write_config = config.ForKeys(original_indices);
                 std::vector<int> op_results = staged_batch_write(
                     valid_keys, buffer_ptrs, buffer_sizes, write_config);
                 apply_tensor_batch_results(results, original_indices,
@@ -321,8 +319,7 @@ std::vector<int> batch_write_tensor_impl(
         }
 
         if (!valid_keys.empty()) {
-            ReplicateConfig write_config =
-                MakeIndexedConfig(config, original_indices);
+            ReplicateConfig write_config = config.ForKeys(original_indices);
             std::vector<int> op_results = direct_batch_write(
                 valid_keys, all_buffers, all_sizes, write_config);
             apply_tensor_batch_results(results, original_indices, op_results,

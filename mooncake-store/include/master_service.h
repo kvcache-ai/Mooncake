@@ -254,6 +254,23 @@ class MasterService {
     auto UnmountNoFSegment(const UUID& segment_id, const UUID& client_id)
         -> tl::expected<void, ErrorCode>;
 
+    tl::expected<void, ErrorCode> SetKvSessionPin(const std::string& session_id,
+                                                  bool pinned,
+                                                  const TenantId& tenant);
+    tl::expected<void, ErrorCode> CloseKvSession(const std::string& session_id,
+                                                 const TenantId& tenant);
+    tl::expected<void, ErrorCode> UpdateKvSession(
+        const std::string& session_id,
+        const std::vector<std::string>& keep_keys, const TenantId& tenant);
+    tl::expected<KvSessionInfo, ErrorCode> GetKvSession(
+        const std::string& session_id, const TenantId& tenant);
+    tl::expected<KvSessionPage, ErrorCode> ListKvSessionKeys(
+        const std::string& session_id, const std::string& cursor,
+        uint64_t limit, const TenantId& tenant);
+    std::vector<tl::expected<void, ErrorCode>> AttachKvSession(
+        const std::string& session_id, const std::vector<std::string>& keys,
+        const TenantId& tenant);
+
     /**
      * @brief Check if an object exists
      * @return ErrorCode::OK if exists, otherwise return other ErrorCode
@@ -1491,6 +1508,9 @@ class MasterService {
     void ApplySoftPinEvaluation(
         const ObjectMetadata& metadata,
         const ObjectMetadata::SoftPinEvaluation& result) const;
+    std::shared_ptr<KvSessionRegistry> kv_session_registry_{
+        std::make_shared<KvSessionRegistry>()};
+
     bool IsSoftPinActive(
         const ObjectMetadata& metadata,
         const std::chrono::system_clock::time_point& now) const;

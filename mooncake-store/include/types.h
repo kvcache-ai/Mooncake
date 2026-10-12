@@ -401,6 +401,9 @@ enum class ErrorCode : int32_t {
     TENANT_QUOTA_EXCEEDED = -1700,    ///< Tenant memory quota exceeded.
     TENANT_NOT_REGISTERED = -1701,    ///< Tenant has no quota policy.
     TENANT_NOT_EMPTY = -1702,         ///< Tenant still owns objects or quota.
+
+    SESSION_NOT_FOUND = -1800,
+    SESSION_LIMIT_EXCEEDED = -1802,
 };
 
 int32_t toInt(ErrorCode errorCode) noexcept;
