@@ -24,6 +24,7 @@ using smemTransSetPeerDownCallbackFunc = int32_t (*)(smem_trans_t, smem_trans_pe
 using smemSetLogLevelFunc = int32_t (*)(int);
 
 class MemFabricUnderApi {
+   friend class MemFabricTransportTest;
 public:
     static bool LoadLibrary();
     static void CleanupLibrary();

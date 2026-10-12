@@ -575,6 +575,14 @@ flagcx_transport
 mpcomm_transport
 ::::
 
+## MemFabric Transport Component
+
+:::{toctree}
+:maxdepth: 1
+
+memfabric_transport
+:::
+
 ## Benchmark and Tuning Guide
 
 :::{toctree}

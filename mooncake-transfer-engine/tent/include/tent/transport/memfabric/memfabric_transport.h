@@ -42,6 +42,7 @@ struct MemFabricSubBatch : public Transport::SubBatch {
 };
 
 class MemFabricTransport : public Transport {
+   friend class MemFabricTransportTest;
    public:
     MemFabricTransport();
     ~MemFabricTransport() override;

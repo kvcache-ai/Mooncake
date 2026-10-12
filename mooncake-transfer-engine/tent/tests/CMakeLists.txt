@@ -777,4 +777,14 @@ endif()
 target_include_directories(tent_segment_desc_retry_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_segment_desc_retry_test COMMAND tent_segment_desc_retry_test)
+
+if(USE_MEMFABRIC)
+  add_executable(tent_memfabric_transport_test memfabric_transport_test.cpp)
+  target_link_libraries(tent_memfabric_transport_test
+                        PRIVATE gtest gtest_main tent_link_group)
+  target_include_directories(tent_memfabric_transport_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_memfabric_transport_test
+           COMMAND tent_memfabric_transport_test)
+endif()
 set_tests_properties(tent_segment_desc_retry_test PROPERTIES TIMEOUT 60)
