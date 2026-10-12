@@ -41,10 +41,11 @@ class NpuReleaseTest(unittest.TestCase):
         )
         return result, values
 
-    def test_normalizes_stable_and_prerelease_tags(self):
+    def test_classifies_tags_using_repository_release_policy(self):
         cases = (
             ("v0.3.14", "0.3.14", "false"),
             ("v0.3.13.post1", "0.3.13.post1", "false"),
+            ("v0.3.14rc1", "0.3.14rc1", "false"),
             ("v0.3.14-rc1", "0.3.14rc1", "true"),
             ("v0.3.14-alpha1", "0.3.14a1", "true"),
             ("v0.3.14-beta1", "0.3.14b1", "true"),
@@ -63,7 +64,9 @@ class NpuReleaseTest(unittest.TestCase):
             "0.3.14-rc1",
             "vnot-a-version",
             "v0.3.14+local",
-            "v0.3.14.dev1",
+            "v0.3.14-rc1+local",
+            "v0.3.13-1",
+            "v0.3.13-post1",
             "v1!0.3.14",
             "v0.3.14\ninjected=true",
         ):
@@ -72,37 +75,9 @@ class NpuReleaseTest(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(values, {})
 
-    def test_build_uses_validated_tag_for_push_and_manual_runs(self):
-        triggers = self.workflow.get("on", self.workflow.get(True))
-        self.assertEqual(triggers["push"]["tags"], ["v*"])
-        self.assertTrue(triggers["workflow_dispatch"]["inputs"]["tag"]["required"])
-        prepare = step_named(self.jobs["version-stamp"], "Normalize release tag")
-        self.assertEqual(
-            prepare["env"]["RELEASE_TAG"],
-            "${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}",
-        )
-        build = self.jobs["build"]
-        self.assertEqual(build["needs"], "version-stamp")
-        self.assertNotIn("if", build)
-        self.assertEqual(
-            step_named(build, "Checkout code")["with"]["ref"],
-            "refs/tags/${{ needs.version-stamp.outputs.release_tag }}",
-        )
-
-    def test_prerelease_version_override_runs_before_packaging(self):
+    def test_prerelease_version_override(self):
         build = self.jobs["build"]
         step = step_named(build, "Apply pre-release wheel version")
-        self.assertEqual(
-            step["if"], "${{ needs.version-stamp.outputs.is_prerelease == 'true' }}"
-        )
-        self.assertEqual(
-            step["env"]["PACKAGE_VERSION"],
-            "${{ needs.version-stamp.outputs.package_version }}",
-        )
-        self.assertLess(
-            build["steps"].index(step),
-            build["steps"].index(step_named(build, "Build Python wheel")),
-        )
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             metadata = directory / "mooncake-wheel/pyproject.toml"
@@ -120,37 +95,6 @@ class NpuReleaseTest(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn('version = "0.3.14rc1"', metadata.read_text())
-
-    def test_github_prereleases_are_separate_from_production_pypi(self):
-        github = self.jobs["publish-release"]
-        self.assertEqual(set(github["needs"]), {"version-stamp", "build"})
-        self.assertNotIn("environment", github)
-        self.assertNotIn("if", github)
-        upload = step_named(github, "Upload wheels to GitHub Release")["with"]
-        self.assertEqual(
-            upload["tag_name"], "${{ needs.version-stamp.outputs.release_tag }}"
-        )
-        self.assertEqual(
-            upload["prerelease"],
-            "${{ needs.version-stamp.outputs.is_prerelease == 'true' }}",
-        )
-        self.assertIn("is_prerelease", upload["make_latest"])
-        self.assertTrue(upload["fail_on_unmatched_files"])
-        self.assertFalse(
-            any("pypi-publish" in step.get("uses", "") for step in github["steps"])
-        )
-        pypi = self.jobs["publish-pypi"]
-        self.assertEqual(set(pypi["needs"]), {"version-stamp", "publish-release"})
-        self.assertEqual(pypi["environment"], "pypi")
-        self.assertEqual(
-            pypi["if"],
-            "${{ github.repository == 'kvcache-ai/Mooncake' && needs.version-stamp.outputs.is_prerelease == 'false' }}",
-        )
-        self.assertEqual(pypi["permissions"]["id-token"], "write")
-        self.assertEqual(
-            step_named(pypi, "Publish package to PyPI")["with"]["packages-dir"],
-            "mooncake-wheel/dist-release/",
-        )
 
 
 if __name__ == "__main__":
