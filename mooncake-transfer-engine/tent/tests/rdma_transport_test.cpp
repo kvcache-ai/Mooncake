@@ -156,6 +156,7 @@ class RdmaTransportTestPeer {
         transport.workers_ = std::make_unique<Workers>(&transport);
         auto& workers = *transport.workers_;
         makeWorkerContexts(workers, 1);
+        workers.running_.store(true, std::memory_order_release);
         workers.getDeviceSelector()->setSmartSelection(false);
         return workers;
     }
@@ -212,6 +213,7 @@ class RdmaTransportTestPeer {
         workers.num_workers_ = n;
     }
     static void destroyWorkerContexts(Workers& workers) {
+        workers.running_.store(false, std::memory_order_release);
         delete[] workers.worker_context_;
         workers.worker_context_ = nullptr;
         workers.num_workers_ = 0;
