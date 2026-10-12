@@ -34,6 +34,9 @@
 #include "cuda_alike.h"
 #include "config.h"
 #include "memory_location.h"
+#if defined(USE_CUDA) && !defined(USE_CXI)
+#include "transport/rdma_transport/data_direct_topology.h"
+#endif
 #include "topology.h"
 #include "char_util.h"
 #ifdef USE_UB
@@ -557,6 +560,19 @@ static std::vector<TopologyEntry> discoverCudaTopology(
     if (cudaGetDeviceCount(&device_count) != cudaSuccess) {
         device_count = 0;
     }
+#if defined(USE_CUDA) && !defined(USE_CXI)
+    // With MC_RDMA_DATA_DIRECT a GPU's memory can only be registered (and so
+    // transferred) through the NICs whose Data Direct function sits on the
+    // GPU's PCI root; PCIe distance cannot see that pairing inside a VM where
+    // every device is its own segment. Pair by sysfs root instead and keep the
+    // other NICs out of the GPU's HCA list entirely.
+    std::map<std::string, std::string> data_direct_roots;
+    if (globalConfig().rdma_data_direct) {
+        std::vector<std::string> names;
+        for (const auto &hca : all_hca) names.push_back(hca.name);
+        data_direct_roots = dataDirectRootsByDevice(names);
+    }
+#endif
     for (int i = 0; i < device_count; i++) {
         char pci_bus_id[20];
         if (cudaDeviceGetPCIBusId(pci_bus_id, sizeof(pci_bus_id), i) !=
@@ -567,6 +583,34 @@ static std::vector<TopologyEntry> discoverCudaTopology(
 
         std::vector<std::string> preferred_hca;
         std::vector<std::string> avail_hca;
+
+#if defined(USE_CUDA) && !defined(USE_CXI)
+        if (!data_direct_roots.empty()) {
+            const std::string gpu_root = pciSysfsRoot(pci_bus_id);
+            for (const auto &hca : all_hca) {
+                auto it = data_direct_roots.find(hca.name);
+                if (!gpu_root.empty() && it != data_direct_roots.end() &&
+                    it->second == gpu_root)
+                    preferred_hca.push_back(hca.name);
+            }
+            if (!preferred_hca.empty()) {
+                std::string list;
+                for (const auto &name : preferred_hca)
+                    list += (list.empty() ? "" : ",") + name;
+                LOG(INFO) << GPU_PREFIX << i << " (" << pci_bus_id << ", root "
+                          << gpu_root << "): Data Direct NICs " << list
+                          << "; other NICs excluded";
+                topology.push_back(
+                    TopologyEntry{.name = GPU_PREFIX + std::to_string(i),
+                                  .preferred_hca = std::move(preferred_hca),
+                                  .avail_hca = {}});
+                continue;
+            }
+            LOG(WARNING) << GPU_PREFIX << i << " (" << pci_bus_id
+                         << "): no Data Direct NIC shares its PCI root; "
+                            "falling back to PCIe-distance topology";
+        }
+#endif
 
         // Find HCAs with minimum distance in one pass.
         int min_distance = INT_MAX;
