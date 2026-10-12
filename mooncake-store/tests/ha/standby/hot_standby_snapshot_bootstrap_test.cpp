@@ -193,6 +193,12 @@ TEST(StandbyControllerTest, OplogEnablementControlsReaderController) {
               enabled->PromoteStandby());
 
     spec.type = ha::HABackendType::REDIS;
+    auto redis = ha::CreateStandbyController(spec, config);
+    ASSERT_NE(redis, nullptr);
+    EXPECT_EQ(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS,
+              redis->PromoteStandby());
+
+    spec.type = ha::HABackendType::K8S;
     auto unsupported = ha::CreateStandbyController(spec, config);
     ASSERT_NE(unsupported, nullptr);
     EXPECT_EQ(ErrorCode::OK, unsupported->PromoteStandby());

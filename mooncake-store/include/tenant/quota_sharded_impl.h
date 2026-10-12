@@ -2,7 +2,7 @@
 
 #include <algorithm>
 
-#include "tenant_quota_sharded.h"
+#include "tenant/quota_sharded.h"
 
 namespace mooncake {
 

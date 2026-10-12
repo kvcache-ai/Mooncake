@@ -49,7 +49,12 @@ __device__ __forceinline__ mlx5gda_qp_devctx* mc_ibgda_channel(
 }
 
 __device__ __forceinline__ void mc_ibgda_lock(mlx5gda_qp_devctx* qp) {
-#if defined(MOONCAKE_EP_USE_MUSA) || defined(MOONCAKE_EP_USE_MACA)
+#if defined(MOONCAKE_EP_USE_MACA)
+    uint32_t old;
+    do {
+        old = atomicCAS(&qp->mutex, 0u, 1u);
+    } while (old != 0);
+#elif defined(MOONCAKE_EP_USE_MUSA)
     uint32_t old;
     do {
         old = atomicCAS(&qp->mutex, 0u, 1u);
@@ -61,7 +66,11 @@ __device__ __forceinline__ void mc_ibgda_lock(mlx5gda_qp_devctx* qp) {
 }
 
 __device__ __forceinline__ void mc_ibgda_unlock(mlx5gda_qp_devctx* qp) {
-#if defined(MOONCAKE_EP_USE_MUSA) || defined(MOONCAKE_EP_USE_MACA)
+#if defined(MOONCAKE_EP_USE_MACA)
+    __threadfence_system();
+    atomicExch(&qp->mutex, 0u);
+    __threadfence_system();
+#elif defined(MOONCAKE_EP_USE_MUSA)
     mc_st_release_u32(&qp->mutex, 0u);
 #else
     cuda::atomic_ref<uint32_t, cuda::thread_scope_system> lock(qp->mutex);
