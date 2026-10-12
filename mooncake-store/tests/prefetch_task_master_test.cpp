@@ -92,15 +92,22 @@ class PrefetchTaskMasterTest : public ::testing::Test {
     }
 
     // Friend funnels (PrefetchTaskMasterTest is friended on MasterService).
-    // In-flight tasks live on the object's own runtime state (#4562).
+    // In-flight tasks live on the object's runtime state. The read-only
+    // accessor keeps GetState private, so read promotion_task from the
+    // public tenant metadata map.
     static bool HasPromotionTaskForTesting(MasterService* service,
                                            const TenantId& tenant_id,
                                            const std::string& key) {
         MasterService::MetadataAccessorRO accessor(
             service, MasterService::ObjectIdentity{.tenant_id = tenant_id,
                                                    .user_key = key});
-        return accessor.Exists() &&
-               accessor.GetState().promotion_task.has_value();
+        if (!accessor.Exists()) {
+            return false;
+        }
+        const auto* tenant_state = accessor.GetTenantState();
+        auto it = tenant_state->metadata.find(key);
+        return it != tenant_state->metadata.end() &&
+               it->second.state.promotion_task;
     }
 
     static bool IsLeaseAliveForTesting(MasterService* service,
@@ -143,11 +150,13 @@ class PrefetchTaskMasterTest : public ::testing::Test {
         if (!accessor.Exists()) {
             return std::nullopt;
         }
-        const auto& task = accessor.GetState().promotion_task;
-        if (!task) {
+        const auto* tenant_state = accessor.GetTenantState();
+        auto it = tenant_state->metadata.find(key);
+        if (it == tenant_state->metadata.end() ||
+            !it->second.state.promotion_task) {
             return std::nullopt;
         }
-        return task->execution_failures;
+        return it->second.state.promotion_task->execution_failures;
     }
 
     // Seed an on-hit candidate carrying a prior execution-failure history,
