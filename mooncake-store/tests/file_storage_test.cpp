@@ -42,12 +42,12 @@ class ConcurrentOffloadBackend : public BucketStorageBackend {
           duplicate_keys_(std::move(duplicate_keys)),
           fail_write_(fail_write) {}
 
-    tl::expected<int64_t, ErrorCode> BatchOffload(
+    tl::expected<int64_t, ErrorCode> BatchOffloadVersioned(
         const std::unordered_map<std::string, std::vector<Slice>>& batch,
         std::function<ErrorCode(const std::vector<std::string>&,
                                 std::vector<StorageObjectMetadata>&)>
             complete,
-        EvictionHandler eviction = nullptr) override {
+        EvictionHandler eviction, const ObjectVersions& versions) override {
         std::unordered_map<std::string, std::vector<Slice>> duplicates;
         for (const auto& key : duplicate_keys_) {
             duplicates.emplace(key, batch.at(key));
@@ -56,13 +56,13 @@ class ConcurrentOffloadBackend : public BucketStorageBackend {
             // The local commit survives even if its Master notification was
             // lost. The retry must release its own task without claiming a
             // new disk replica for the skipped write.
-            auto result =
-                BucketStorageBackend::BatchOffload(duplicates, nullptr);
+            auto result = BucketStorageBackend::BatchOffloadVersioned(
+                duplicates, nullptr, nullptr, versions);
             if (!result) return result;
         }
         if (fail_write_) return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
-        return BucketStorageBackend::BatchOffload(batch, std::move(complete),
-                                                  std::move(eviction));
+        return BucketStorageBackend::BatchOffloadVersioned(
+            batch, std::move(complete), std::move(eviction), versions);
     }
 
    private:
@@ -194,6 +194,148 @@ class FileStorageTest : public ::testing::Test {
         allocator.deallocate(overwrite_buffer, values.front().size());
         EXPECT_TRUE(client->UnmountSegment(segment.get(), kSegmentSize));
         EXPECT_TRUE(client->unregisterLocalMemory(allocator.getBase()));
+    }
+
+    void RunIssue4487Scenario(bool same_key, bool rescan) {
+        testing::InProcMaster master;
+        ASSERT_TRUE(master.Start(InProcMasterConfigBuilder()
+                                     .set_enable_offload(true)
+                                     .set_default_kv_lease_ttl(1000)
+                                     .set_root_fs_dir("")
+                                     .build()));
+        constexpr size_t kSegmentSize = 16 * 1024 * 1024;
+        constexpr size_t kValueSize = 4096 + 13;
+        constexpr size_t kGuardSize = 16;
+        std::unique_ptr<void, decltype(&std::free)> segment(
+            allocate_buffer_allocator_memory(kSegmentSize), &std::free);
+        ASSERT_NE(segment, nullptr);
+        SimpleAllocator allocator(kSegmentSize);
+        const auto endpoint = "127.0.0.1:" + std::to_string(getFreeTcpPort());
+        auto created = Client::Create(endpoint, master.metadata_url(), "tcp",
+                                      std::nullopt, master.master_address());
+        ASSERT_TRUE(created.has_value());
+        auto client = created.value();
+        ASSERT_TRUE(client->MountSegment(segment.get(), kSegmentSize, "tcp"));
+        ASSERT_TRUE(client->RegisterLocalMemory(
+            allocator.getBase(), kSegmentSize, "cpu:0", false, false));
+        ASSERT_TRUE(client->MountLocalDiskSegment(true));
+
+        FileStorageConfig config = FileStorageConfig::FromEnvironment();
+        config.storage_backend_type = StorageBackendType::kBucket;
+        config.storage_filepath = data_path + "/issue4487";
+        config.local_buffer_size = 1024 * 1024;
+        fs::create_directories(config.storage_filepath);
+        FileStorage storage(config, client, endpoint);
+        BucketBackendConfig bucket_config;
+        bucket_config.bucket_keys_limit = 1;
+        storage.storage_backend_ =
+            std::make_shared<BucketStorageBackend>(config, bucket_config);
+        auto backend = storage.storage_backend_;
+        ASSERT_TRUE(backend->Init());
+
+        auto* source = static_cast<char*>(allocator.allocate(kValueSize));
+        auto* output =
+            static_cast<char*>(allocator.allocate(kValueSize + 2 * kGuardSize));
+        ASSERT_NE(source, nullptr);
+        ASSERT_NE(output, nullptr);
+        std::vector<Slice> input{{source, kValueSize}};
+        std::vector<Slice> destination{{output + kGuardSize, kValueSize}};
+        ReplicateConfig replicate;
+        replicate.replica_num = 1;
+        const std::string first_key = "issue4487-key";
+        std::string previous_value;
+        std::vector<OffloadTaskItem> previous_tasks;
+        for (size_t round = 0; round < 2; ++round) {
+            const std::string key =
+                same_key || round == 0 ? first_key : "issue4487-fresh-key";
+            const auto scoped_key = TenantId::Default().MakeScopedKey(key);
+            std::string expected(kValueSize, '\0');
+            for (size_t i = 0; i < expected.size(); ++i) {
+                expected[i] = static_cast<char>(
+                    (i * 37 + (i >> 7) + (round + 1) * 113) & 255);
+            }
+            std::memcpy(source, expected.data(), expected.size());
+            ASSERT_TRUE(client->Put(key, input, replicate));
+            std::vector<OffloadTaskItem> tasks;
+            ASSERT_TRUE(client->OffloadObjectHeartbeat(true, tasks));
+            ASSERT_EQ(tasks.size(), 1u);
+            ASSERT_EQ(tasks.front().key, key);
+            ASSERT_EQ(tasks.front().size, static_cast<int64_t>(kValueSize));
+            if (round == 1 && same_key) {
+                EXPECT_NE(tasks.front().object_version,
+                          previous_tasks.front().object_version);
+                ASSERT_TRUE(storage.ReRegisterOffloadedObjects());
+                auto before = client->Query(key);
+                ASSERT_TRUE(before);
+                ASSERT_EQ(before->replicas.size(), 1u);
+                EXPECT_TRUE(before->replicas.front().is_memory_replica());
+                ASSERT_TRUE(storage.OffloadObjects(previous_tasks));
+            }
+            ASSERT_TRUE(storage.OffloadObjects(tasks));
+            if (round == 1 && same_key) {
+                ASSERT_TRUE(storage.OffloadObjects(previous_tasks));
+            }
+            if (round == 0) previous_tasks = tasks;
+
+            auto query = client->Query(key);
+            ASSERT_TRUE(query.has_value());
+            auto disk_count = [](const auto& replicas) {
+                size_t count = 0;
+                for (const auto& replica : replicas) {
+                    count += replica.is_local_disk_replica();
+                }
+                return count;
+            };
+            const auto before_rescan = disk_count(query->replicas);
+            std::memset(output, 0xA5, kValueSize + 2 * kGuardSize);
+            ASSERT_TRUE(client->Get(key, destination));
+            EXPECT_EQ(std::string(output + kGuardSize, kValueSize), expected);
+            EXPECT_EQ(std::string(output, kGuardSize),
+                      std::string(kGuardSize, static_cast<char>(0xA5)));
+            EXPECT_EQ(std::string(output + kGuardSize + kValueSize, kGuardSize),
+                      std::string(kGuardSize, static_cast<char>(0xA5)));
+
+            if (round == 1 && rescan) {
+                ASSERT_TRUE(storage.ReRegisterOffloadedObjects());
+            }
+            auto final_query = client->Query(key);
+            ASSERT_TRUE(final_query.has_value());
+            std::string disk_bytes(kValueSize, '\0');
+            std::unordered_map<std::string, Slice> read{
+                {scoped_key, {disk_bytes.data(), disk_bytes.size()}}};
+            ASSERT_TRUE(backend->BatchLoad(read));
+            std::vector<OffloadTaskItem> later_tasks;
+            ASSERT_TRUE(client->OffloadObjectHeartbeat(true, later_tasks));
+            LOG(INFO) << "REPRO4487 same_key=" << same_key
+                      << " rescan=" << rescan << " round=" << round
+                      << " disk_replicas_before_rescan=" << before_rescan
+                      << " disk_replicas_after_rescan="
+                      << disk_count(final_query->replicas)
+                      << " disk_matches_current=" << (disk_bytes == expected)
+                      << " disk_matches_previous="
+                      << (round == 1 && disk_bytes == previous_value)
+                      << " next_heartbeat_tasks=" << later_tasks.size();
+            EXPECT_EQ(disk_count(final_query->replicas), 1u)
+                << "Completed re-put must obtain a new disk replica";
+            EXPECT_EQ(disk_bytes, expected)
+                << "Disk bytes must belong to the current object incarnation";
+            if (round == 0) {
+                ASSERT_EQ(before_rescan, 1u);
+                ASSERT_EQ(disk_bytes, expected);
+                // Let the last read lease expire; exercise ordinary Remove.
+                std::this_thread::sleep_until(final_query->lease_timeout +
+                                              std::chrono::milliseconds(100));
+                ASSERT_TRUE(client->Remove(key));
+                auto removed = client->Query(key);
+                ASSERT_FALSE(removed.has_value());
+                ASSERT_EQ(removed.error(), ErrorCode::OBJECT_NOT_FOUND);
+                previous_value = expected;
+            }
+        }
+        EXPECT_TRUE(client->UnmountSegment(segment.get(), kSegmentSize));
+        EXPECT_TRUE(client->unregisterLocalMemory(allocator.getBase()));
+        allocator.deallocate(source, kValueSize);
+        allocator.deallocate(output, kValueSize + 2 * kGuardSize);
     }
 
     void SetUp() override {
@@ -665,6 +807,18 @@ class FileStorageTest : public ::testing::Test {
         std::free(seg_ptr);
     }
 };
+
+TEST_F(FileStorageTest, Issue4487ReputSameKeyMustOffloadNewBytes) {
+    RunIssue4487Scenario(true, false);
+}
+
+TEST_F(FileStorageTest, Issue4487FreshKeyControl) {
+    RunIssue4487Scenario(false, false);
+}
+
+TEST_F(FileStorageTest, Issue4487RescanMustNotReattachOldBytes) {
+    RunIssue4487Scenario(true, true);
+}
 
 TEST_F(FileStorageTest, SkippedOffloadAllDuplicatesReleaseSourceTasks) {
     RunSkippedOffloadScenario(2, false);

@@ -466,7 +466,8 @@ class MasterServiceTestPeer {
     tl::expected<void, ErrorCode> PushOffloadingQueue(
         const ObjectIdentity& object_id, Replica& replica,
         std::vector<UUID>* mirror_clients = nullptr) {
-        return service_.PushOffloadingQueue(object_id, replica, mirror_clients);
+        return service_.PushOffloadingQueue(object_id, replica, "",
+                                            mirror_clients);
     }
 
     void ReRouteRestoredObjectsByKey() {

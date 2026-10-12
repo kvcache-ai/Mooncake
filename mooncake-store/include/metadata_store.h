@@ -39,10 +39,12 @@ struct StandbyObjectMetadata {
         ObjectDataType::UNKNOWN};                  // Data type classification
     struct_pack::compatible<bool, 1> hard_pinned;  // Eviction protection
 
+    struct_pack::compatible<std::string, 2> offload_version;
+
     StandbyObjectMetadata() = default;
 
     YLT_REFL(StandbyObjectMetadata, client_id, size, replicas, group_id,
-             data_type, hard_pinned);
+             data_type, hard_pinned, offload_version);
 
     // Check if this metadata has valid replicas
     bool HasReplicas() const { return !replicas.empty(); }
@@ -106,8 +108,10 @@ struct MetadataPayload {
     struct_pack::compatible<ObjectDataType, 1> data_type;  // Data type
     struct_pack::compatible<bool, 1> hard_pinned;          // Hard pin state
 
+    struct_pack::compatible<std::string, 2> offload_version;
+
     YLT_REFL(MetadataPayload, client_id, size, replicas, group_id, data_type,
-             hard_pinned);
+             hard_pinned, offload_version);
 
     // Convert to StandbyObjectMetadata
     StandbyObjectMetadata ToStandbyMetadata() const {
@@ -118,6 +122,7 @@ struct MetadataPayload {
         meta.group_id = group_id.value_or("");
         meta.data_type = data_type.value_or(ObjectDataType::UNKNOWN);
         meta.hard_pinned = hard_pinned.value_or(false);
+        meta.offload_version = offload_version;
         return meta;
     }
 };

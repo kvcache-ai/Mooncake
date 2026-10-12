@@ -305,7 +305,11 @@ mooncake_client \
 
 - `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` must be an absolute path to an existing, writable directory. Symbolic links and paths containing `..` are rejected.
 - Each live Real Client needs its **own** offload directory. Sharing one path across TP ranks fails at `Init()` under the LOCAL_DISK ownership lock.
-- On real client restart, `bucket_storage_backend` and `file_per_key_storage_backend` scan existing SSD metadata and report it to the master, so previously offloaded objects remain accessible. `offset_allocator_storage_backend` does not support restart recovery.
+- On real client restart, `bucket_storage_backend` and `file_per_key_storage_backend` scan existing SSD metadata and report it to the master. Bucket recovery registers only matching object incarnations when the master already tracks a key. `offset_allocator_storage_backend` does not support restart recovery.
+
+Bucket offloads record an object incarnation so `remove(key)` followed by a new `put(key)` can replace the old disk entry without treating it as a retry. Superseded entries are invalidated in persisted bucket metadata; other keys and existing readers retain their backing files until normal bucket reclamation.
+
+This changes the offload and query RPC schemas: upgrade the master and store clients together. Bucket metadata from older versions has no incarnation and is not automatically re-registered; treat that SSD cache as cold after upgrading. Master snapshots and operation logs preserve incarnations written by the new version. Legacy master snapshots and operation logs do not carry this identity and are not migrated for offload: start with fresh master state when upgrading an offload-enabled deployment. Recovery from complete loss of authoritative master metadata still cannot establish which keys were explicitly removed across all storage nodes; this mechanism is not a durable deletion log.
 - Eviction only notifies the master and deletes local files; objects replicated on other nodes are unaffected.
 - Each machine requires its own real client process. In multi-node deployments, ensure `--host` and `--port` are correctly set so nodes can reach each other.
 

@@ -49,13 +49,16 @@ class QueryResult {
     const std::chrono::steady_clock::time_point lease_timeout;
     /** @brief Optional full-object checksum */
     const std::optional<uint64_t> object_checksum;
+    const std::string offload_version;
 
     QueryResult(std::vector<Replica::Descriptor>&& replicas_param,
                 std::chrono::steady_clock::time_point lease_timeout_param,
-                std::optional<uint64_t> object_checksum_param = std::nullopt)
+                std::optional<uint64_t> object_checksum_param = std::nullopt,
+                std::string offload_version_param = "")
         : replicas(std::move(replicas_param)),
           lease_timeout(lease_timeout_param),
-          object_checksum(object_checksum_param) {}
+          object_checksum(object_checksum_param),
+          offload_version(std::move(offload_version_param)) {}
 
     bool IsLeaseExpired() const {
         return std::chrono::steady_clock::now() >= lease_timeout;

@@ -236,13 +236,19 @@ struct OffloadTaskItem {
     std::string tenant_id;
     std::string key;
     int64_t size;
+    std::string object_version{};
+    uint64_t source_replica_id{0};
+    bool is_rescan{false};
 
     bool operator==(const OffloadTaskItem& other) const {
         return tenant_id == other.tenant_id && key == other.key &&
-               size == other.size;
+               size == other.size && object_version == other.object_version &&
+               source_replica_id == other.source_replica_id &&
+               is_rescan == other.is_rescan;
     }
 };
-YLT_REFL(OffloadTaskItem, tenant_id, key, size);
+YLT_REFL(OffloadTaskItem, tenant_id, key, size, object_version,
+         source_replica_id, is_rescan);
 
 struct PromotionTaskItem {
     std::string tenant_id;
@@ -527,8 +533,9 @@ struct StorageObjectMetadata {
     int64_t key_size;
     int64_t data_size;
     std::string transport_endpoint;
+    std::string object_version{};
     YLT_REFL(StorageObjectMetadata, bucket_id, offset, key_size, data_size,
-             transport_endpoint);
+             transport_endpoint, object_version);
 };
 
 }  // namespace mooncake

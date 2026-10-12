@@ -1530,6 +1530,16 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
                             std::vector<StorageObjectMetadata>& metadatas)>
         complete_handler,
     EvictionHandler eviction_handler) {
+    return BatchOffloadVersioned(batch_object, std::move(complete_handler),
+                                 std::move(eviction_handler), {});
+}
+
+tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffloadVersioned(
+    const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
+    std::function<ErrorCode(const std::vector<std::string>& keys,
+                            std::vector<StorageObjectMetadata>& metadatas)>
+        complete_handler,
+    EvictionHandler eviction_handler, const ObjectVersions& versions) {
     if (!initialized_.load(std::memory_order_acquire)) {
         LOG(ERROR)
             << "Storage backend is not initialized. Call Init() before use.";
@@ -1551,7 +1561,7 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
     std::vector<iovec> iovs;
     std::vector<StorageObjectMetadata> metadatas;
     auto build_bucket_result =
-        BuildBucket(bucket_id, batch_object, iovs, metadatas);
+        BuildBucket(bucket_id, batch_object, iovs, metadatas, versions);
     if (!build_bucket_result) {
         LOG(ERROR) << "Failed to build bucket with id: " << bucket_id;
         return tl::make_unexpected(build_bucket_result.error());
@@ -1561,7 +1571,8 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
     // Phase 1: eviction — remove oldest buckets from metadata maps to make
     // room. Must notify master BEFORE deleting files (Phase 2).
     const int64_t required_size = bucket->data_size + bucket->meta_size;
-    auto prepare_result = PrepareEviction(required_size, bucket->keys);
+    auto prepare_result =
+        PrepareEviction(required_size, bucket->keys, versions);
     if (!prepare_result) {
         return tl::make_unexpected(prepare_result.error());
     }
@@ -1628,8 +1639,11 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
                     object_bucket_map_.end()) {
                 continue;  // Still persisted elsewhere: idempotent skip.
             }
-            if (object_bucket_map_.find(bucket_keys[i]) ==
-                object_bucket_map_.end()) {
+            const auto existing = object_bucket_map_.find(bucket_keys[i]);
+            if (existing == object_bucket_map_.end() ||
+                (!metadatas[i].object_version.empty() &&
+                 existing->second.object_version !=
+                     metadatas[i].object_version)) {
                 committed_indices.push_back(i);
             } else {
                 VLOG(1) << "Key already committed by a concurrent offload, "
@@ -1646,14 +1660,57 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
             return bucket_id;
         }
 
+        std::unordered_map<int64_t, std::shared_ptr<BucketMetadata>>
+            replacements;
+        for (size_t i : committed_indices) {
+            const auto existing = object_bucket_map_.find(bucket_keys[i]);
+            if (existing == object_bucket_map_.end()) continue;
+            const auto old_id = existing->second.bucket_id;
+            auto [replacement, inserted] = replacements.try_emplace(old_id);
+            if (inserted) {
+                replacement->second =
+                    std::make_shared<BucketMetadata>(*buckets_.at(old_id));
+            }
+            auto& old = *replacement->second;
+            for (size_t j = 0; j < old.keys.size(); ++j) {
+                if (old.keys[j] == bucket_keys[i])
+                    old.metadatas[j].superseded = true;
+            }
+        }
+        // Persist per-key invalidation before publishing the replacement. Old
+        // files stay alive for readers and other keys sharing their buckets.
+        for (auto& [old_id, replacement] : replacements) {
+            auto persisted = StoreBucketMetadata(old_id, replacement);
+            if (!persisted) {
+                lock.unlock();
+                CleanupOrphanedBucket(bucket_id);
+                return tl::make_unexpected(persisted.error());
+            }
+            auto& old = *buckets_.at(old_id);
+            total_size_ += replacement->meta_size - old.meta_size;
+            for (size_t j = 0; j < old.keys.size(); ++j) {
+                if (!replacement->metadatas[j].superseded) continue;
+                auto current = object_bucket_map_.find(old.keys[j]);
+                if (current != object_bucket_map_.end() &&
+                    current->second.bucket_id == old_id) {
+                    total_size_ -=
+                        current->second.key_size + current->second.data_size;
+                    object_bucket_map_.erase(current);
+                }
+            }
+            old = *replacement;
+        }
+
         int64_t committed_data_size = bucket->meta_size;
         object_bucket_map_.reserve(object_bucket_map_.size() +
                                    committed_indices.size());
         for (size_t i : committed_indices) {
-            auto [it, inserted] =
-                object_bucket_map_.insert({bucket_keys[i], metadatas[i]});
-            CHECK(inserted)
-                << "Reserved key became duplicated: " << bucket_keys[i];
+            auto existing = object_bucket_map_.find(bucket_keys[i]);
+            if (existing != object_bucket_map_.end()) {
+                total_size_ -=
+                    existing->second.data_size + existing->second.key_size;
+            }
+            object_bucket_map_.insert_or_assign(bucket_keys[i], metadatas[i]);
             committed_data_size +=
                 metadatas[i].data_size + metadatas[i].key_size;
             committed_keys.push_back(bucket_keys[i]);
@@ -2071,15 +2128,52 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
                 total_size_ += metadata_it->second->data_size +
                                metadata_it->second->meta_size;
                 for (size_t i = 0; i < metadata_it->second->keys.size(); i++) {
-                    object_bucket_map_.emplace(
-                        metadata_it->second->keys[i],
-                        StorageObjectMetadata{
-                            metadata_it->first,
-                            metadata_it->second->metadatas[i].offset,
-                            metadata_it->second->metadatas[i].key_size,
-                            metadata_it->second->metadatas[i].data_size, ""});
+                    const auto& key = metadata_it->second->keys[i];
+                    const auto& item = metadata_it->second->metadatas[i];
+                    if (item.superseded) continue;
+                    auto current = object_bucket_map_.find(key);
+                    // New incarnations are written to new immutable buckets.
+                    // Directory iteration order must not resurrect an old one.
+                    const bool same_version =
+                        current != object_bucket_map_.end() &&
+                        current->second.object_version == item.object_version;
+                    if (current == object_bucket_map_.end() ||
+                        (same_version
+                             ? current->second.bucket_id > bucket_id
+                             : current->second.bucket_id < bucket_id)) {
+                        object_bucket_map_.insert_or_assign(
+                            key, StorageObjectMetadata{
+                                     bucket_id, item.offset, item.key_size,
+                                     item.data_size, "", item.object_version});
+                    }
                 }
             }
+        }
+
+        // Complete an interrupted replacement: a newer durable bucket may
+        // exist even if the process stopped before invalidating its
+        // predecessor.
+        for (const auto& [id, bucket] : buckets_) {
+            bool changed = false;
+            for (size_t i = 0; i < bucket->keys.size(); ++i) {
+                const auto current = object_bucket_map_.find(bucket->keys[i]);
+                if (!bucket->metadatas[i].superseded &&
+                    (current == object_bucket_map_.end() ||
+                     current->second.bucket_id != id)) {
+                    bucket->metadatas[i].superseded = true;
+                    changed = true;
+                }
+            }
+            if (changed) {
+                auto persisted = StoreBucketMetadata(id, bucket);
+                if (!persisted) return persisted;
+            }
+        }
+        total_size_ = 0;
+        for (const auto& [id, bucket] : buckets_)
+            total_size_ += bucket->meta_size;
+        for (const auto& [key, metadata] : object_bucket_map_) {
+            total_size_ += metadata.key_size + metadata.data_size;
         }
 
         // Clean up orphaned bucket files (.bucket files without corresponding
@@ -2254,11 +2348,17 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BucketScan(
         }
         buckets.emplace_back(bucket_it->first);
         for (size_t i = 0; i < bucket_it->second->keys.size(); i++) {
+            const auto current =
+                object_bucket_map_.find(bucket_it->second->keys[i]);
+            if (current == object_bucket_map_.end() ||
+                current->second.bucket_id != bucket_it->first)
+                continue;
             keys.emplace_back(bucket_it->second->keys[i]);
             metadatas.emplace_back(StorageObjectMetadata{
                 bucket_it->first, bucket_it->second->metadatas[i].offset,
                 bucket_it->second->metadatas[i].key_size,
-                bucket_it->second->metadatas[i].data_size, ""});
+                bucket_it->second->metadatas[i].data_size, "",
+                bucket_it->second->metadatas[i].object_version});
         }
     }
     return 0;
@@ -2273,8 +2373,10 @@ BucketStorageBackend::GetStoreMetadata() {
 
 tl::expected<void, ErrorCode> BucketStorageBackend::AllocateOffloadingBuckets(
     const std::unordered_map<std::string, int64_t>& offloading_objects,
-    std::vector<std::vector<std::string>>& buckets_keys) {
-    return GroupOffloadingKeysByBucket(offloading_objects, buckets_keys);
+    std::vector<std::vector<std::string>>& buckets_keys,
+    const ObjectVersions& versions) {
+    return GroupOffloadingKeysByBucket(offloading_objects, buckets_keys,
+                                       versions);
 }
 
 void BucketStorageBackend::ClearUngroupedOffloadingObjects() {
@@ -2289,7 +2391,8 @@ size_t BucketStorageBackend::UngroupedOffloadingObjectsSize() const {
 
 tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
     const std::unordered_map<std::string, int64_t>& offloading_objects,
-    std::vector<std::vector<std::string>>& buckets_keys) {
+    std::vector<std::vector<std::string>>& buckets_keys,
+    const ObjectVersions& versions) {
     MutexLocker offloading_locker(&offloading_mutex_);
     if (offloading_objects.empty()) {
         return {};
@@ -2303,8 +2406,14 @@ tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
     int64_t total_count = residue_count;
 
     auto is_exist_func =
-        [this](const std::string& key) -> tl::expected<bool, ErrorCode> {
-        return IsExist(key);
+        [this,
+         &versions](const std::string& key) -> tl::expected<bool, ErrorCode> {
+        SharedMutexLocker lock(&mutex_, shared_lock);
+        const auto existing = object_bucket_map_.find(key);
+        if (existing == object_bucket_map_.end()) return false;
+        const auto version = versions.find(key);
+        return version == versions.end() || version->second.empty() ||
+               version->second == existing->second.object_version;
     };
 
     while (it != offloading_objects.cend()) {
@@ -2396,7 +2505,8 @@ tl::expected<std::shared_ptr<BucketMetadata>, ErrorCode>
 BucketStorageBackend::BuildBucket(
     int64_t bucket_id,
     const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
-    std::vector<iovec>& iovs, std::vector<StorageObjectMetadata>& metadatas) {
+    std::vector<iovec>& iovs, std::vector<StorageObjectMetadata>& metadatas,
+    const ObjectVersions& versions) {
     auto bucket = std::make_shared<BucketMetadata>();
     int64_t storage_offset = 0;
     for (const auto& object : batch_object) {
@@ -2412,12 +2522,16 @@ BucketStorageBackend::BuildBucket(
             iovs.emplace_back(iovec{slice.ptr, slice.size});
         }
         bucket->data_size += object_total_size + object.first.size();
+        const auto version = versions.find(object.first);
+        const auto object_version =
+            version == versions.end() ? "" : version->second;
         bucket->metadatas.emplace_back(BucketObjectMetadata{
             storage_offset, static_cast<int64_t>(object.first.size()),
-            object_total_size});
-        metadatas.emplace_back(StorageObjectMetadata{
-            bucket_id, storage_offset,
-            static_cast<int64_t>(object.first.size()), object_total_size, ""});
+            object_total_size, object_version});
+        metadatas.emplace_back(
+            StorageObjectMetadata{bucket_id, storage_offset,
+                                  static_cast<int64_t>(object.first.size()),
+                                  object_total_size, "", object_version});
         bucket->keys.push_back(object.first);
         storage_offset += object_total_size + object.first.size();
     }
@@ -2799,13 +2913,20 @@ int64_t BucketStorageBackend::ActualDiskBytesUsedLocked() const {
 
 tl::expected<BucketStorageBackend::PendingEviction, ErrorCode>
 BucketStorageBackend::PrepareEviction(
-    int64_t required_size, const std::vector<std::string>& write_keys) {
+    int64_t required_size, const std::vector<std::string>& write_keys,
+    const ObjectVersions& versions) {
     PendingEviction result;
     SharedMutexLocker lock(&mutex_);
 
     if (!write_keys.empty()) {
         for (const auto& key : write_keys) {
-            if (object_bucket_map_.find(key) != object_bucket_map_.end() ||
+            const auto existing = object_bucket_map_.find(key);
+            const auto version = versions.find(key);
+            const bool same_version =
+                existing != object_bucket_map_.end() &&
+                (version == versions.end() || version->second.empty() ||
+                 version->second == existing->second.object_version);
+            if (same_version ||
                 pending_write_keys_.find(key) != pending_write_keys_.end()) {
                 // Already persisted, or being persisted by a concurrent
                 // offload: re-offloading is an idempotent no-op (Put
@@ -3016,9 +3137,13 @@ void BucketStorageBackend::RestorePreparedEvictionLocked(
                 continue;
             }
             const auto& object_meta = bucket_meta->metadatas[i];
-            object_bucket_map_[key] = StorageObjectMetadata{
-                bucket_id, object_meta.offset, object_meta.key_size,
-                object_meta.data_size, ""};
+            object_bucket_map_[key] =
+                StorageObjectMetadata{bucket_id,
+                                      object_meta.offset,
+                                      object_meta.key_size,
+                                      object_meta.data_size,
+                                      "",
+                                      object_meta.object_version};
             total_size_ += object_meta.data_size + object_meta.key_size;
         }
         total_size_ += bucket_meta->meta_size;
@@ -3348,7 +3473,12 @@ tl::expected<void, ErrorCode> BucketStorageBackend::StoreBucketMetadata(
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
     auto meta_path = meta_path_res.value();
-    auto open_file_result = OpenFile(meta_path, FileMode::Write);
+    const std::string temporary_path = meta_path + ".tmp";
+    struct TemporaryFile {
+        const std::string& path;
+        ~TemporaryFile() { ::unlink(path.c_str()); }
+    } temporary{temporary_path};
+    auto open_file_result = OpenFile(temporary_path, FileMode::Write);
     if (!open_file_result) {
         LOG(ERROR) << "Failed to open file for bucket writing: " << meta_path;
         return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
@@ -3366,6 +3496,17 @@ tl::expected<void, ErrorCode> BucketStorageBackend::StoreBucketMetadata(
         LOG(ERROR) << "Write size mismatch for: " << meta_path
                    << ", expected: " << str.size()
                    << ", got: " << write_result.value();
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+    if (!file->datasync()) {
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+    if (::rename(temporary_path.c_str(), meta_path.c_str()) != 0) {
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+    FdGuard directory(::open(fs::path(meta_path).parent_path().c_str(),
+                             O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    if (directory.get() < 0 || ::fsync(directory.get()) != 0) {
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
     metadata->meta_size = str.size();

@@ -28,10 +28,13 @@ tl::expected<void, SerializationError> LocalSsdCodec::Encode(
         packer.pack(static_cast<uint64_t>(client.pending_offloads.size()));
         for (const auto& [encoded_key, task] : client.pending_offloads) {
             packer.pack(encoded_key);
-            packer.pack_array(3);
+            packer.pack_array(6);
             packer.pack(task.tenant_id);
             packer.pack(task.key);
             packer.pack(task.size);
+            packer.pack(task.object_version);
+            packer.pack(task.source_replica_id);
+            packer.pack(task.is_rescan);
         }
         packer.pack(client.total_capacity_bytes);
     }
@@ -102,7 +105,8 @@ tl::expected<LocalSsdPersistedState, SerializationError> LocalSsdCodec::Decode(
                     client_value.via.array.ptr[task_index];
                 OffloadTaskItem task;
                 if (task_object.type == msgpack::type::ARRAY &&
-                    task_object.via.array.size == 3) {
+                    (task_object.via.array.size == 3 ||
+                     task_object.via.array.size == 6)) {
                     if (task_object.via.array.ptr[0].type !=
                             msgpack::type::STR ||
                         task_object.via.array.ptr[1].type !=
@@ -116,6 +120,14 @@ tl::expected<LocalSsdPersistedState, SerializationError> LocalSsdCodec::Decode(
                         task_object.via.array.ptr[0].as<std::string>();
                     task.key = task_object.via.array.ptr[1].as<std::string>();
                     task.size = task_object.via.array.ptr[2].as<int64_t>();
+                    if (task_object.via.array.size == 6) {
+                        task.object_version =
+                            task_object.via.array.ptr[3].as<std::string>();
+                        task.source_replica_id =
+                            task_object.via.array.ptr[4].as<uint64_t>();
+                        task.is_rescan =
+                            task_object.via.array.ptr[5].as<bool>();
+                    }
                 } else {
                     if (!IsMsgpackInteger(task_object)) {
                         return tl::unexpected(DecodeError(
