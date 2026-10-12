@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <filesystem>
@@ -14,9 +15,29 @@
 
 #include <glog/logging.h>
 
+#include "environment_value_parser.h"
+#include "environment_variables.h"
 #include "hf3fs/hf3fs.h"
 
 namespace mooncake {
+namespace {
+
+template <typename T>
+bool ReadPositiveEnvironmentVariable(const EnvironmentVariable<T>& variable,
+                                     T maximum, T& value) {
+    const char* raw = std::getenv(variable.name);
+    if (!raw) return true;
+    const auto parsed = TryParseEnvironmentValue<T>(raw);
+    if (!parsed || *parsed <= 0 || *parsed > maximum) {
+        LOG(ERROR) << variable.name << " must be an integer between 1 and "
+                   << maximum;
+        return false;
+    }
+    value = *parsed;
+    return true;
+}
+
+}  // namespace
 
 // Destructor must be defined in .cpp where USRBIOResourceManager is complete.
 Hf3fsAdapter::~Hf3fsAdapter() = default;
@@ -25,8 +46,21 @@ Hf3fsAdapter::Hf3fsAdapter() = default;
 
 tl::expected<void, ErrorCode> Hf3fsAdapter::Init(
     const std::string& mount_path) {
-    resource_manager_ = std::make_unique<USRBIOResourceManager>();
     Hf3fsConfig config{};
+    using Variables = Hf3fsAdapterEnvironmentVariables;
+    int ring_entries = static_cast<int>(config.ior_entries);
+    // The buffer must support pointer differences; 3FS reserves an extra ring
+    // slot and calculates its size using entries + 1 as an int.
+    if (!ReadPositiveEnvironmentVariable(
+            Variables::MOONCAKE_HF3FS_IOV_SIZE,
+            static_cast<size_t>(std::numeric_limits<ptrdiff_t>::max()),
+            config.iov_size) ||
+        !ReadPositiveEnvironmentVariable(Variables::MOONCAKE_HF3FS_IOR_ENTRIES,
+                                         std::numeric_limits<int>::max() - 1,
+                                         ring_entries)) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    config.ior_entries = static_cast<size_t>(ring_entries);
     char hf3fs_mount_point[PATH_MAX] = {};
     int ret = hf3fs_extract_mount_point(
         hf3fs_mount_point, sizeof(hf3fs_mount_point), mount_path.c_str());
@@ -35,6 +69,7 @@ tl::expected<void, ErrorCode> Hf3fsAdapter::Init(
     } else {
         config.mount_root = mount_path;
     }
+    resource_manager_ = std::make_unique<USRBIOResourceManager>();
     resource_manager_->setDefaultParams(config);
     return {};
 }

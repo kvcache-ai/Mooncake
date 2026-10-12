@@ -37,6 +37,40 @@ cmake -DUSE_3FS=ON ...
 
 Then build and install Mooncake as usual.
 
+## USRBIO resource settings
+
+The adapter reads these optional environment variables once during
+initialization:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `MOONCAKE_HF3FS_IOV_SIZE` | `33554432` (32 MiB) | Shared staging buffer size in bytes per I/O thread |
+| `MOONCAKE_HF3FS_IOR_ENTRIES` | `16` | Requested entries in each thread's read and write ring |
+
+For example:
+
+```bash
+export MOONCAKE_HF3FS_IOV_SIZE=67108864  # 64 MiB per I/O thread
+export MOONCAKE_HF3FS_IOR_ENTRIES=32    # Entries per read/write ring
+```
+
+Set these variables before starting each process that uses the HF3FS adapter.
+They are process-local tuning settings and may differ between clients and the
+master. Resources are allocated lazily on first I/O using the settings captured
+at adapter initialization; restart the process to apply changes.
+
+Values must be positive decimal integers. The buffer size must fit in
+`ptrdiff_t`, and ring entries must be less than `INT_MAX` because 3FS reserves
+one additional internal slot. Empty, malformed, zero, negative, or out-of-range
+values fail adapter initialization. Allocation can still fail if available
+shared memory or 3FS limits are exceeded.
+
+Staging memory scales with the number of I/O threads: a 64 MiB buffer used by
+eight threads consumes 512 MiB, plus ring overhead. Batched requests share the
+buffer using separate slices; increasing ring entries with the same buffer
+size reduces each active request's slice, and larger requests use multiple
+waves.
+
 ## Usage
 
 ### Master

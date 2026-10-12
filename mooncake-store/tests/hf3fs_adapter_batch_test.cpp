@@ -12,6 +12,7 @@
 #include <filesystem>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -37,6 +38,7 @@ struct FakeRing {
     std::thread::id owner = std::this_thread::get_id();
     std::vector<FakeIo> pending;
     int next_index = 0;
+    int entries = 0;
 };
 
 // Small resources force multi-wave and multi-chunk transfers. Perform the data
@@ -63,6 +65,8 @@ struct FakeUsrbio {
     int buffers_created = 0;
     int rings_created = 0;
     int waits = 0;
+    std::vector<size_t> requested_buffer_sizes;
+    std::vector<int> requested_ring_entries;
 } fake;
 
 std::mutex fake_mutex;
@@ -91,6 +95,7 @@ void hf3fs_dereg_fd(int fd) {
 int hf3fs_iovcreate(hf3fs_iov* iov, const char*, size_t size, size_t, int) {
     std::lock_guard lock(fake_mutex);
     if (fake.fail_create) return -ENOMEM;
+    fake.requested_buffer_sizes.push_back(size);
     *iov = {};
     iov->size = std::min(size, fake.buffer_size);
     iov->base = new uint8_t[iov->size];
@@ -103,12 +108,15 @@ void hf3fs_iovdestroy(hf3fs_iov* iov) {
     *iov = {};
 }
 
-int hf3fs_iorcreate4(hf3fs_ior* ior, const char*, int, bool read, int, int, int,
-                     uint64_t) {
+int hf3fs_iorcreate4(hf3fs_ior* ior, const char*, int entries, bool read, int,
+                     int, int, uint64_t) {
     std::lock_guard lock(fake_mutex);
     *ior = {};
     ior->for_read = read;
     ior->iorh = new FakeRing;
+    static_cast<FakeRing*>(ior->iorh)->entries =
+        std::min(entries, fake.entries);
+    fake.requested_ring_entries.push_back(entries);
     ++fake.rings_created;
     return 0;
 }
@@ -122,7 +130,9 @@ void hf3fs_iordestroy(hf3fs_ior* ior) {
     ior->iorh = nullptr;
 }
 
-int hf3fs_io_entries(const hf3fs_ior*) { return fake.entries; }
+int hf3fs_io_entries(const hf3fs_ior* ior) {
+    return static_cast<FakeRing*>(ior->iorh)->entries;
+}
 
 int hf3fs_prep_io(const hf3fs_ior* ior, const hf3fs_iov* iov, bool read,
                   void* ptr, int fd, size_t offset, uint64_t length,
@@ -137,13 +147,14 @@ int hf3fs_prep_io(const hf3fs_ior* ior, const hf3fs_iov* iov, bool read,
     EXPECT_GT(length, 0);
     if (!fake.registered.contains(fd) || fd == fake.prep_error_fd)
         return -EBADF;
-    if (ring.pending.size() >= static_cast<size_t>(fake.capacity))
+    if (ring.pending.size() >=
+        static_cast<size_t>(std::min(fake.capacity, ring.entries)))
         return -EAGAIN;
     for (const auto& io : ring.pending) {
         EXPECT_TRUE(buffer + length <= io.buffer ||
                     io.buffer + io.length <= buffer);
     }
-    const int index = ring.next_index++ % fake.entries;
+    const int index = ring.next_index++ % ring.entries;
     FakeIo io{buffer, fd, offset, length, userdata, index, {}};
     if (!read) io.write_data.assign(buffer, buffer + length);
     ring.pending.push_back(std::move(io));
@@ -204,6 +215,32 @@ int hf3fs_wait_for_ios(const hf3fs_ior* ior, hf3fs_cqe* cqes, int count,
 namespace mooncake::test {
 namespace {
 
+class ScopedEnvVar {
+   public:
+    explicit ScopedEnvVar(const char* name) : name_(name) {
+        if (const char* value = std::getenv(name)) original_ = value;
+        unsetenv(name);
+    }
+
+    ~ScopedEnvVar() {
+        if (original_) {
+            setenv(name_, original_->c_str(), 1);
+        } else {
+            unsetenv(name_);
+        }
+    }
+
+    ScopedEnvVar(const ScopedEnvVar&) = delete;
+    ScopedEnvVar& operator=(const ScopedEnvVar&) = delete;
+
+    void Set(const char* value) { ASSERT_EQ(setenv(name_, value, 1), 0); }
+    void Clear() { ASSERT_EQ(unsetenv(name_), 0); }
+
+   private:
+    const char* name_;
+    std::optional<std::string> original_;
+};
+
 class Hf3fsBatchTest : public ::testing::Test {
    protected:
     void SetUp() override {
@@ -241,9 +278,73 @@ class Hf3fsBatchTest : public ::testing::Test {
     }
 
     Hf3fsAdapter adapter_;
+    ScopedEnvVar buffer_size_env_{"MOONCAKE_HF3FS_IOV_SIZE"};
+    ScopedEnvVar ring_entries_env_{"MOONCAKE_HF3FS_IOR_ENTRIES"};
     std::string directory_;
     std::vector<int> fds_;
 };
+
+TEST_F(Hf3fsBatchTest, DefaultResourceSizes) {
+    std::string data = "default";
+    iovec iov{data.data(), data.size()};
+    FdIoRequest request{Open(), &iov, 1, 0};
+    CheckSuccess(adapter_.BatchWriteAt({&request, 1}), 1, data.size());
+    EXPECT_EQ(fake.requested_buffer_sizes, (std::vector<size_t>{32 << 20}));
+    EXPECT_EQ(fake.requested_ring_entries, (std::vector<int>{16, 16}));
+}
+
+TEST_F(Hf3fsBatchTest, ConfiguredSizesApplyToBothRingsAndBatchChunking) {
+    buffer_size_env_.Set("48");
+    ring_entries_env_.Set("2");
+    ASSERT_TRUE(adapter_.Init(directory_));
+    // Configuration is captured at Init, before lazy thread allocation.
+    buffer_size_env_.Set("32");
+    ring_entries_env_.Set("1");
+    std::array<std::string, 3> data{std::string(41, 'a'), std::string(41, 'b'),
+                                    std::string(41, 'c')};
+    const auto expected = data;
+    std::array<iovec, 3> iovs;
+    std::array<FdIoRequest, 3> requests;
+    for (size_t i = 0; i < data.size(); ++i) {
+        iovs[i] = {data[i].data(), data[i].size()};
+        requests[i] = {Open(), &iovs[i], 1, 0};
+    }
+    CheckSuccess(adapter_.BatchWriteAt(requests), 3, 41);
+    EXPECT_EQ(fake.requested_buffer_sizes, (std::vector<size_t>{48}));
+    EXPECT_EQ(fake.requested_ring_entries, (std::vector<int>{2, 2}));
+    EXPECT_EQ(fake.max_outstanding, 2);
+    EXPECT_EQ(fake.prepared_lengths.front(), 24);
+    EXPECT_GT(fake.submissions.size(), 2);
+    for (auto& value : data) std::fill(value.begin(), value.end(), '?');
+    CheckSuccess(adapter_.BatchReadAt(requests), 3, 41);
+    EXPECT_EQ(data, expected);
+}
+
+TEST_F(Hf3fsBatchTest, InvalidResourceSizesFailInitialization) {
+    for (auto* variable : {&buffer_size_env_, &ring_entries_env_}) {
+        for (const char* value : {"", "0", "-1", "abc", "1MB", "1.5", "12x",
+                                  "18446744073709551616"}) {
+            SCOPED_TRACE(value);
+            variable->Set(value);
+            auto result = adapter_.Init(directory_);
+            ASSERT_FALSE(result);
+            EXPECT_TRUE(result.error() == ErrorCode::INVALID_PARAMS);
+        }
+        variable->Clear();
+    }
+    buffer_size_env_.Set(
+        std::to_string(std::numeric_limits<size_t>::max()).c_str());
+    EXPECT_FALSE(adapter_.Init(directory_));
+    buffer_size_env_.Clear();
+    // 3FS adds one internal slot using signed int arithmetic.
+    ring_entries_env_.Set(
+        std::to_string(std::numeric_limits<int>::max()).c_str());
+    EXPECT_FALSE(adapter_.Init(directory_));
+    ring_entries_env_.Set("2147483648");
+    EXPECT_FALSE(adapter_.Init(directory_));
+    ring_entries_env_.Clear();
+    EXPECT_TRUE(adapter_.Init(directory_));
+}
 
 TEST_F(Hf3fsBatchTest,
        BatchesAcrossFilesAndRingCapacityWithReorderedCompletions) {
