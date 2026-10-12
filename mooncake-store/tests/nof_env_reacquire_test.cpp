@@ -1,23 +1,11 @@
-// Regression test for the SpdkEnvGuard reacquire failure (PR #3424 review):
-// in SPDK v23.01.1, re-initializing the environment within the same process
-// after spdk_env_fini requires a NULL opts argument — passing options again
-// returns -EINVAL. Finalizing the env when the last guard reference died
-// therefore made every later SpdkEnvGuard::Acquire() fail, leaving NoF — and
-// setup-time staging-buffer allocation through SpdkDmaAllocator — permanently
-// unavailable after a client close/reopen cycle.
+// Regression test for the SpdkEnvGuard reacquire failure: SPDK v23.01.1
+// rejects a non-NULL-opts spdk_env_init after spdk_env_fini with -EINVAL, so
+// finalizing the env on last release broke every later Acquire() in the
+// process. The env must stay pinned until process exit.
 //
-// The sequence below never calls RegisterMemory, so the NofRegistryBundle env
-// pin is never constructed and cannot mask the failure; and it never destroys
-// an SpdkInitiator that acquired the env, because ~Impl's UnregisterAll
-// backstop would construct the bundle too (HAVE_SPDK_MEM_REGISTER builds).
-// The DMA allocator exercises the guard directly without touching the page
-// registry, so the test fails without the process-wide pin in SpdkEnvGuard
-// and passes with it, in every build configuration.
-//
-// A working SPDK environment (hugepages) is required: the tests skip when the
-// FIRST acquisition already fails (e.g. CI containers without hugepages), but
-// any later acquisition after a full release must succeed whenever the first
-// one did.
+// This sequence never calls RegisterMemory, so the NofRegistryBundle env pin
+// cannot mask the failure. Requires a working SPDK env (hugepages); skips
+// when the first acquisition already fails (e.g. CI containers).
 
 #include <gtest/gtest.h>
 

@@ -98,48 +98,35 @@ class NVMeoFInitiator {
     // Closes #3131: register a user buffer with the initiator's DMA
     // translation table. No-op (OK) for initiators without one.
     //
-    // Contract: registrations are tracked per (initiator instance, ptr).
-    // Re-registering a ptr whose existing range already covers the request
-    // is an idempotent no-op; a larger size extends coverage to the newly
-    // covered pages. Two instances registering the same ptr each hold an
-    // independent reference, so one instance's UnregisterMemory never unmaps
-    // pages the other still relies on. Destroying an initiator releases any
-    // registrations it still holds, but callers should pair every
-    // RegisterMemory with an UnregisterMemory (or let client teardown walk
-    // them) — the bookkeeping is process-global and outlives any instance.
+    // Registrations are tracked per (initiator instance, ptr): re-registering
+    // a covered ptr is an idempotent no-op; a larger size extends coverage.
+    // Two instances registering the same ptr each hold an independent
+    // reference, so one instance's UnregisterMemory never unmaps pages the
+    // other still relies on. The bookkeeping is process-global and outlives
+    // any instance; destroying an initiator releases what it still holds.
     //
-    // Return contract (three outcomes):
-    //   - OK: fully registered. OK is only ever returned when every page of
-    //     the range is validly registered.
-    //   - any other error except NOF_REGISTRATION_STUCK (e.g.
-    //     INTERNAL_ERROR): failed, and every page the attempt touched is
-    //     confirmed clean — the caller may munmap the range without a
+    // Return contract:
+    //   - OK: the range is fully registered.
+    //   - other errors except NOF_REGISTRATION_STUCK: failed, everything
+    //     touched is confirmed clean; the caller may munmap without a
     //     pairing UnregisterMemory.
-    //   - NOF_REGISTRATION_STUCK: failed after the backend may have
-    //     partially marked/installed translation state, and cleanup could
-    //     not be confirmed. The range is kept in cleanup-pending state:
-    //     the caller MUST treat it as still registered — route it through
-    //     UnregisterMemory at teardown (which retries only the pending
-    //     pages) and quarantine the mapping instead of munmapping on
-    //     continued failure. A Register retry of a stuck range first
-    //     retries the pending cleanup, then registers the still-missing
-    //     coverage for real — it returns OK only once the range is fully
-    //     registered, and keeps returning NOF_REGISTRATION_STUCK while
-    //     the backlog is unresolved.
+    //   - NOF_REGISTRATION_STUCK: cleanup of the failed attempt could not be
+    //     confirmed. The caller MUST treat the range as still registered
+    //     (route it through UnregisterMemory at teardown, quarantine instead
+    //     of munmapping). A Register retry first retries the pending cleanup,
+    //     then registers the missing coverage; it returns OK only once the
+    //     range is fully registered.
     //
     // UnregisterMemory returns OK when the range is fully released (or was
-    // never registered by this instance); on INTERNAL_ERROR some pages
-    // could not be released and remain recorded (pending) for a retry.
-    // Retries only touch this instance's own pending pages and valid
-    // prefix — never references owned by other instances.
+    // never registered by this instance); INTERNAL_ERROR means some pages
+    // could not be released and remain recorded for a retry.
     //
     // SPDK requires BOTH vaddr and len to be 2MB-aligned and fails with
     // -EBUSY on already-registered pages (verified against v23.01.1
     // lib/env_dpdk/memory.c), so implementations normalize the range to
     // whole 2MB pages and keep a per-page refcount — adjacent/overlapping
     // buffers sharing a page must neither double-register it nor unregister
-    // it early. Normalization registers whole pages containing the buffer;
-    // this grants no extra DMA reach beyond the buffer's own pages.
+    // it early.
     virtual ErrorCode RegisterMemory(void* ptr, size_t size) = 0;
     virtual ErrorCode UnregisterMemory(void* ptr) = 0;
 

@@ -3264,10 +3264,7 @@ TEST_F(RealClientTest, TearDownWithoutUnregisterReleasesNofRegistrations) {
 }
 
 // Regression test: a failed NoF registration must NOT fail register_buffer
-// as a whole. A buffer the initiator cannot translate (plain 4 KiB pages,
-// device memory) can never serve NoF I/O anyway, but it remains fully usable
-// for RDMA/TCP transfers — hard-failing the call broke that supported
-// contract (e.g. plain-page buffers registered for pure RDMA).
+// as a whole; the buffer remains usable for non-NoF transfers.
 TEST_F(RealClientTest, RegisterBufferSucceedsWhenNofRegistrationFails) {
     ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
     master_address_ = master_.master_address();
@@ -3296,11 +3293,9 @@ TEST_F(RealClientTest, RegisterBufferSucceedsWhenNofRegistrationFails) {
     EXPECT_EQ(initiator->unregister_calls_, 1);
 }
 
-// Regression test: a failed NoF cleanup must NOT be reported as a successful
-// unregister_buffer — the caller could free/remap the buffer while the
-// backend may still hold a translation for it. The API propagates the error
-// and keeps the buffer recorded so teardown retries the cleanup even after
-// TE has already been unregistered.
+// A failed NoF cleanup must not be reported as a successful
+// unregister_buffer: the API propagates the error and keeps the buffer
+// recorded so teardown retries the cleanup after TE is unregistered.
 TEST_F(RealClientTest, UnregisterBufferPropagatesNofCleanupFailure) {
     ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
     master_address_ = master_.master_address();

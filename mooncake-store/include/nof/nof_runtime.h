@@ -19,16 +19,9 @@ struct NofRuntime {
 
 // The ONLY #ifdef USE_NOF-gated definition site that names SPDK types.
 // Compiled unconditionally; in non-USE_NOF builds returns
-// {nullptr, SystemDmaAllocator}.
-//
-// Backend selection: MC_NOF_BACKEND picks one matched Initiator/Allocator
-// pair — "spdk" (default) or "none" (runtime-disable NoF in a USE_NOF
-// build). Case-insensitive; unrecognized values fall back to "spdk" with a
-// warning. New backends plug in here; callers must stay backend-agnostic.
-//
-// Returned objects are ready to use: no caller ever invokes a setup method.
-// The SPDK environment lifecycle is owned inside the implementation (a
-// shared, refcounted env guard) and acquired lazily on first use.
+// {nullptr, SystemDmaAllocator}. MC_NOF_BACKEND selects the backend pair
+// ("spdk" default, "none" disables NoF at runtime); new backends plug in
+// here.
 NofRuntime CreateNofRuntime();
 
 // For the Python-ABI exception site (hugepage_memory_alloc/free) only:

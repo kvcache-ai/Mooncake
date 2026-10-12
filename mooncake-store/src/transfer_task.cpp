@@ -1987,10 +1987,8 @@ std::optional<TransferFuture> TransferSubmitter::submitNofOperation(
     }
 
     uint32_t block_size = nof_initiator_->GetBlockSize(seg_handle);
-    // Consumer of dma_alignment: without SGL, ptr must still be
-    // block-aligned (the existing precondition from RFC §5.3); once #3251
-    // lands SGL with supports_sgl=true, the ptr requirement relaxes to DWORD
-    // automatically, with no interface change.
+    // Without SGL, ptr must be block-aligned; with SGL (supports_sgl) the
+    // requirement relaxes to dma_alignment.
     const auto caps = nof_initiator_->GetCapabilities();
     const uint64_t ptr_alignment =
         caps.supports_sgl ? caps.dma_alignment : block_size;

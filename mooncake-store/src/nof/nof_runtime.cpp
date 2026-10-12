@@ -16,23 +16,13 @@ namespace mooncake {
 #ifdef USE_NOF
 namespace {
 
-// Backend selector (MC_NOF_BACKEND). A single knob selects a *paired*
-// Initiator+Allocator — not two independent choices — because the SPDK
-// initiator imposes alignment/registration assumptions on its buffers that a
-// mismatched generic allocator would silently violate. Pairing is the
-// factory's responsibility, not the caller's.
-//
-// Values (case-insensitive):
+// Backend selector (MC_NOF_BACKEND, case-insensitive). One knob selects a
+// *paired* Initiator+Allocator — a mismatched pair would silently violate
+// the SPDK initiator's alignment/registration assumptions.
 //   spdk (default; unset/empty) -> SpdkInitiator + SpdkDmaAllocator
 //   none                        -> runtime-disable NoF: {nullptr, System}
-//
-// Unrecognized values fall back to spdk with a warning rather than disabling
-// NoF: a typo that silently disables NoF turns into write failures, which is
-// worse than a warning; an env-var typo should also not be a fatal error.
-//
-// The selector must be honored by BOTH CreateNofRuntime() and
-// CreateDefaultDmaAllocator() (the Python-ABI path); ResolveNofBackend() is
-// shared so the two cannot diverge.
+// Unrecognized values fall back to spdk with a warning: a typo that silently
+// disables NoF turns into write failures, which is worse.
 enum class NofBackend { kSpdk, kNone };
 
 NofBackend ResolveNofBackend() {

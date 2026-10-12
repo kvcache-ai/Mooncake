@@ -1067,12 +1067,9 @@ std::optional<std::shared_ptr<Client>> Client::Create(
     auto client = std::shared_ptr<Client>(new Client(
         local_hostname, resolved_metadata, protocol, labels, tenant_id));
     if (!nof_initiator) {
-        // nullptr means "use the process default", not "disable NoF": before
-        // this parameter existed, every client in a USE_NOF build had NoF
-        // available, and existing callers must keep that behavior. The
-        // explicit runtime disable is MC_NOF_BACKEND=none (CreateNofRuntime
-        // then returns a null initiator); explicit injection is passing a
-        // non-null initiator.
+        // nullptr means "use the process default", not "disable NoF" —
+        // existing callers keep the pre-parameter behavior. Explicit disable
+        // is MC_NOF_BACKEND=none; explicit injection is a non-null initiator.
         auto& factory = DefaultNofInitiatorFactoryForTestingSlot();
         nof_initiator = factory ? factory() : CreateNofRuntime().initiator;
     }

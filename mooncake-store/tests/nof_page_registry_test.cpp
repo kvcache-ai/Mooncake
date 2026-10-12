@@ -179,11 +179,10 @@ TEST_F(NofPageRegistryTest, FailureRollsBackOnlyThisCall) {
     const uintptr_t page1 = page0 + kPage;
     fake_.fail_pages.insert(page1);
 
-    // Two-page registration fails on the second page: the first page bumped
-    // by this call is rolled back (unregister_calls=1), and the failing page
-    // gets a cleanup attempt (unregister_calls=2). spdk_mem_unregister
-    // answers -EINVAL for a never-marked page, so cleanup cannot be
-    // confirmed and the range is retained as NOF_REGISTRATION_STUCK.
+    // Two-page registration fails on the second page: the first page is
+    // rolled back and the failing page gets a cleanup attempt. The cleanup
+    // is unconfirmable (-EINVAL for a never-marked page), so the range is
+    // retained as NOF_REGISTRATION_STUCK.
     ASSERT_EQ(registry_.Register(owner_a_, ptr, 3 * kPage / 2),
               ErrorCode::NOF_REGISTRATION_STUCK);
     EXPECT_EQ(fake_.Depth(page0), 0);
@@ -194,8 +193,7 @@ TEST_F(NofPageRegistryTest, FailureRollsBackOnlyThisCall) {
     EXPECT_EQ(fake_.Depth(page0), 1);
 }
 
-// The failing page can leave partial backend state (spdk_mem_register marks
-// before its notify callbacks and does not roll back). When the cleanup
+// The failing page can leave partial backend state. When the cleanup
 // unregister succeeds, the failure is a plain error and owns nothing.
 TEST_F(NofPageRegistryTest, FailingPageCleanedUpWhenConfirmed) {
     void* ptr = PageAddr(0);
@@ -218,8 +216,8 @@ TEST_F(NofPageRegistryTest, FailingPageCleanedUpWhenConfirmed) {
     EXPECT_EQ(fake_.Depth(page0), 1);
 }
 
-// When the cleanup unregister also fails, the page state is unknown: the
-// page must stay charged and the owner range retained so teardown retries.
+// When the cleanup unregister also fails, the page state is unknown: it
+// stays charged and pending so teardown retries.
 TEST_F(NofPageRegistryTest, FailingPageRetainedWhenCleanupUnconfirmed) {
     void* ptr = PageAddr(0);
     const uintptr_t page0 = reinterpret_cast<uintptr_t>(ptr);
@@ -231,17 +229,15 @@ TEST_F(NofPageRegistryTest, FailingPageRetainedWhenCleanupUnconfirmed) {
     // The partial mark is still there, and the registry kept the page.
     EXPECT_EQ(fake_.Depth(page0), 1);
 
-    // A same-range retry is cleanup-pending, NOT a no-op OK: it must not
-    // re-call register_fn_ (the leftover translation would answer -EBUSY
-    // and be misclassified as external), and it must not return OK while
-    // coverage is unrestored — "OK means fully registered".
+    // A same-range retry is cleanup-pending: it must neither re-call
+    // register_fn_ nor return OK before coverage is restored.
     const int register_calls_after = fake_.register_calls;
     EXPECT_EQ(registry_.Register(owner_a_, ptr, 4096),
               ErrorCode::NOF_REGISTRATION_STUCK);
     EXPECT_EQ(fake_.register_calls, register_calls_after);
 
     // Once the backend recovers, the retry completes the pending cleanup
-    // and then registers the range for real — a legitimate OK.
+    // and registers the range for real — a legitimate OK.
     fake_.fail_unregister_pages.erase(page0);
     fake_.mark_fail_pages.erase(page0);
     EXPECT_EQ(registry_.Register(owner_a_, ptr, 4096), ErrorCode::OK);
@@ -252,8 +248,7 @@ TEST_F(NofPageRegistryTest, FailingPageRetainedWhenCleanupUnconfirmed) {
     EXPECT_EQ(fake_.Depth(page0), 0);
 }
 
-// Backend unregister failures must propagate and retain state for retry
-// (the shm quarantine paths key off the error return).
+// Backend unregister failures must propagate and retain state for retry.
 TEST_F(NofPageRegistryTest, UnregisterFailurePropagatesAndRetainsState) {
     void* ptr = PageAddr(0);
     const uintptr_t page0 = reinterpret_cast<uintptr_t>(ptr);
@@ -323,10 +318,8 @@ TEST_F(NofPageRegistryTest, RollbackFailureIsRetainedAndRetried) {
     EXPECT_EQ(fake_.Depth(page0), 0);
 }
 
-// A partial unregister must retain exactly the pages that still owe a
-// backend cleanup — and a retry must never touch references owned by
-// someone else (issue: A and B share page0; A's range also covers page1;
-// page1 fails to unregister; retrying A must not release B's page0).
+// A partial unregister must retain only the pages still owed a cleanup; a
+// retry must never touch references owned by someone else.
 TEST_F(NofPageRegistryTest,
        RetryAfterPartialUnregisterNeverTouchesOtherOwners) {
     void* ptr = PageAddr(0);
@@ -355,7 +348,7 @@ TEST_F(NofPageRegistryTest,
 }
 
 // A pending page taken over by another owner must stay registered for the
-// new owner — the stale cleanup must not unmap it from under them.
+// new owner.
 TEST_F(NofPageRegistryTest, PendingPageTakenOverByAnotherOwnerStaysRegistered) {
     void* ptr = PageAddr(0);
     const uintptr_t page0 = reinterpret_cast<uintptr_t>(ptr);

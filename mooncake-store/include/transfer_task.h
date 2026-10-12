@@ -432,8 +432,8 @@ struct NofTask {
     // First failure's error detail (sc/sct/status string); written only on
     // the failure path, empty in steady state — zero hot-path cost.
     std::string error_detail;
-    // Formerly a raw pointer to a worker-thread stack variable (C2).
-    // Now shared ownership: worker holds one ref, each task holds one.
+    // Shared ownership of the worker's outstanding-I/O counter (formerly a
+    // raw pointer to a worker-thread stack variable).
     std::shared_ptr<std::atomic<int64_t>> io_count;
     NofQos* nof_qos;
     NofTask* nxt;
@@ -458,8 +458,8 @@ struct NofTask {
 };
 
 struct NofSubTask {
-    // Two-slot adaptor embedded in pooled sub-task storage: steady-state
-    // submit/completion performs no per-sub-IO heap allocation (RFC §5.5).
+    // Embedded adaptor keeps the steady-state submit/completion path free of
+    // per-sub-IO heap allocation.
     NofIOAdaptor adaptor;
     NofTask* task;
     uint32_t submit_bytes;
@@ -470,8 +470,7 @@ constexpr int kDefaultNofSubmitChunkBytes = (1 << 17);    // 128k
 constexpr int kDefaultNofInflightBytesLimit = (1 << 25);  // 32M
 
 struct NofQos {
-    // Block size cached at QoS creation — removes the per-poll-loop
-    // GetBlockSize query that exists today (transfer_task.cpp:487-488).
+    // Block size cached at QoS creation; the poll loop does not re-query it.
     const uint32_t block_size;
     const int blocks_per_chunk;
     const int inflight_blocks_limit;

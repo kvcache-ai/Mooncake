@@ -383,10 +383,8 @@ struct DefaultInitiatorFactoryGuard {
 
 }  // namespace
 
-// Regression test: callers of the existing C++ creation API that pass no
-// initiator (the default argument) must keep getting NoF support — without
-// the default-runtime fallback they silently ended up with no initiator, and
-// every NoF transfer failed even in USE_NOF builds.
+// Regression test: callers that pass no initiator (the default argument)
+// must keep getting the process default NoF runtime, not nullptr.
 TEST_F(ClientIntegrationTest, CreateWithoutInitiatorKeepsDefaultNofRuntime) {
     DefaultInitiatorFactoryGuard guard;
     auto probe = std::make_shared<WiringProbeInitiator>();

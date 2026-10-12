@@ -29,16 +29,13 @@ struct NofProbeContext {
 
 // Pool of probe contexts with a quarantine lane for timed-out probes.
 //
-// A probe that times out must NOT go back to the free pool: its NVMe command
-// is still in flight and still holds &ctx->adaptor. Recycling it would let
-// the next probe Reset() and reuse the context, and when the stale
-// completion is processed by a later PollCompletion it would write
-// done/success into the NEW probe — the heartbeat would consume the previous
-// request's result. Timed-out contexts are quarantined until their original
-// callback runs (done == true), then reaped back into the pool by the next
+// A timed-out probe still has its NVMe command in flight holding
+// &ctx->adaptor; recycling it would let a later poll write the stale
+// completion into the NEXT probe. Timed-out contexts are quarantined until
+// their original callback runs (done == true), then reaped by the next
 // Acquire(). A command that never completes (dead target) leaves its context
-// quarantined forever — one context per dead-target probe, a bounded leak
-// that is the price of never recycling an in-flight callback context.
+// quarantined forever — a bounded leak, the price of never recycling an
+// in-flight callback context.
 class NofProbeContextPool {
    public:
     NofProbeContext* Acquire();

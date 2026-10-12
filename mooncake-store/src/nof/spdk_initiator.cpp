@@ -73,16 +73,10 @@ void ApplyCtrlrOptsFromEnv(struct spdk_nvme_ctrlr_opts* opts) {
 // ---------------------------------------------------------------------------
 // Shared, refcounted SPDK environment guard.
 //
-// DPDK EAL init is process-global; one env per process, many runtimes
-// allowed. The env is acquired lazily on first use and, once successfully
-// initialized, pinned until process exit: SPDK v23.01.1 rejects a
-// spdk_env_init with non-NULL opts after spdk_env_fini with -EINVAL, so
-// finalizing the env when the last reference dies would make every later
-// Acquire() fail in this process (e.g. client close -> reopen without
-// RegisterMemory, which separately pins the env via NofRegistryBundle).
-// spdk_env_fini therefore runs only when the process-wide pin and all user
-// references are gone — i.e. during static destruction at exit, matching
-// baseline SpdkWrapper's teardown-at-exit behavior.
+// DPDK EAL init is process-global. The env is acquired lazily on first use
+// and, once initialized, pinned until process exit: SPDK v23.01.1 rejects a
+// non-NULL-opts spdk_env_init after spdk_env_fini with -EINVAL, so a
+// mid-process fini would break every later Acquire() in this process.
 // ---------------------------------------------------------------------------
 
 class SpdkEnvGuard {
@@ -92,10 +86,9 @@ class SpdkEnvGuard {
         if (auto existing = Registry().lock()) {
             return existing;
         }
-        // Use a raw pointer for the temporary so that, on init failure, we
-        // can plain-delete under the lock without re-entering the mutex (the
-        // Deleter locks RegistryMutex; destroying a shared_ptr while holding
-        // that mutex would deadlock).
+        // Raw pointer so an init failure can be plain-deleted under the lock
+        // (the Deleter locks RegistryMutex; destroying a shared_ptr while
+        // holding it would deadlock).
         auto* raw = new SpdkEnvGuard();
         if (!raw->ok_) {
             delete raw;
@@ -103,11 +96,7 @@ class SpdkEnvGuard {
         }
         std::shared_ptr<SpdkEnvGuard> guard(raw, Deleter());
         Registry() = guard;
-        // Pin the env until process exit (see the class comment). The pin is
-        // a function-local static: constructed on first successful Acquire,
-        // destroyed during static destruction, so spdk_env_fini can only run
-        // at exit and a mid-process fini/re-init cycle is impossible.
-        ProcessPin() = guard;
+        ProcessPin() = guard;  // pinned until process exit (class comment)
         return guard;
     }
 
@@ -116,17 +105,11 @@ class SpdkEnvGuard {
 
    private:
     SpdkEnvGuard() {
-        // rte_eal_init registers the calling thread as DPDK's main lcore and
-        // may restrict its CPU affinity to the configured EAL cores (default
-        // core_mask "0x1"). Linux threads inherit the creator's affinity
-        // mask, so without restoring it, every thread the host app spawns
-        // after Mooncake's setup would be pinned to a single core and KV
-        // read/write throughput would drop sharply. Save the original
-        // affinity and restore it around spdk_env_init to stop that
-        // propagation. DPDK's main-lcore identity is a thread registration,
-        // not the kernel affinity, so later SPDK calls are unaffected by the
-        // restore. pthread affinity APIs are glibc-specific, so this is gated
-        // to Linux; other platforms see the previous behavior.
+        // rte_eal_init may restrict the calling thread's CPU affinity, and
+        // Linux threads inherit the creator's mask — without a restore,
+        // threads the host app spawns later would be pinned to one core.
+        // Save/restore the affinity around spdk_env_init (glibc-only APIs,
+        // hence Linux-gated).
 #if defined(__linux__)
         cpu_set_t orig_cpuset;
         CPU_ZERO(&orig_cpuset);
@@ -207,19 +190,11 @@ class SpdkEnvGuard {
 //
 // SPDK's translation table is process-global, so the bookkeeping must be
 // too: per-instance refcounts would let one initiator instance unmap pages
-// another instance still uses ("No translation" I/O failures). The
-// bookkeeping itself (per-owner ranges, per-page refcounts) lives in the
-// SPDK-free NofPageRegistry so it is unit-testable; this TU only owns the
-// singleton and the env pin. Each SpdkInitiator::Impl registers under its
-// own `this` as the owner token.
+// another still uses. Each SpdkInitiator::Impl registers under its own
+// `this` as the owner token.
 //
-// The bundle pins the SPDK env from first use until process exit: an
-// UnregisterMemory can never run against a translation table that has
-// already been finalized, even if every initiator/allocator instance in the
-// process is torn down first (matches baseline SpdkWrapper's
-// teardown-at-exit behavior). SpdkEnvGuard::Acquire() always constructs the
-// guard registry mutex before this static is constructed, so that mutex
-// outlives the bundle during static destruction.
+// The bundle also pins the SPDK env from first use until process exit, so an
+// UnregisterMemory can never run after spdk_env_fini.
 // ---------------------------------------------------------------------------
 
 #ifdef HAVE_SPDK_MEM_REGISTER
@@ -276,10 +251,8 @@ class SpdkInitiator::Impl {
         if (!env_guard_) {
             return;
         }
-        // A probe that timed out leaves its NVMe command in flight on the
-        // probe qpair, and SPDK requires a qpair to have no outstanding I/O
-        // when freed below. Give such stale commands a bounded grace period
-        // to complete.
+        // Give timed-out probe commands a bounded chance to complete before
+        // the qpairs are freed below.
         DrainQuarantinedProbes();
         {
             std::lock_guard<std::mutex> lock(ctrlrs_mutex_);
@@ -310,15 +283,10 @@ class SpdkInitiator::Impl {
         }
 #ifdef HAVE_SPDK_MEM_REGISTER
         // Backstop, after all I/O teardown above: release every page
-        // registration this instance still holds. The real-client teardown
-        // path unregisters its buffers explicitly; this covers anything that
-        // path misses. The singleton registry outlives this instance and its
-        // env pin keeps the translation table alive.
+        // registration this instance still holds, in case the real-client
+        // teardown path missed any.
         if (GetNofRegistryBundle().registry.UnregisterAll(this) !=
             ErrorCode::OK) {
-            // The registry retains the failed pages' records, so a later
-            // owner teardown can still retry; the bundle's env pin keeps the
-            // translation table alive until process exit either way.
             LOG(ERROR) << "NoF initiator teardown could not release all page "
                           "registrations; they stay registered until process "
                           "exit";
@@ -346,10 +314,8 @@ class SpdkInitiator::Impl {
             }
         }
         if (!info) {
-            // Connect OUTSIDE the mutex: spdk_nvme_probe establishes an
-            // NVMe-oF connection and may block for seconds; holding
-            // ctrlrs_mutex_ across it (baseline spdk_wrapper.cpp:313-329)
-            // stalls first-time opens of every other endpoint.
+            // Connect OUTSIDE the mutex: spdk_nvme_probe may block for
+            // seconds and would stall first-time opens of other endpoints.
             auto new_info = std::make_unique<ctrlr_info>();
             if (ConnectController(&tr.trid, new_info.get()) != 0) {
                 return nullptr;
@@ -457,22 +423,17 @@ class SpdkInitiator::Impl {
             return ErrorCode::INTERNAL_ERROR;
         }
 #ifdef HAVE_SPDK_MEM_REGISTER
-        // A non-aligned ptr is floored to its 2MB page, which assumes
-        // the whole containing page is mapped. True for hugepage-backed
-        // buffers (hugetlb maps aligned 2MB extents; LMCache/vLLM pool
-        // slices land here); 4KB-backed malloc memory fails later inside
-        // SPDK with paddr-misalignment -EINVAL anyway. Warn loudly rather
-        // than fail silently — a silent floor is the hardest failure
-        // shape to debug.
+        // A non-aligned ptr is floored to its 2MB page, which assumes the
+        // whole containing page is mapped and hugepage-backed — warn loudly
+        // rather than fail silently later inside SPDK.
         if (reinterpret_cast<uintptr_t>(ptr) & ((2ULL << 20) - 1)) {
             LOG(WARNING) << "RegisterMemory: ptr " << ptr
                          << " is not 2MB-aligned; registering the whole "
                             "containing 2MB pages, which must be mapped "
                             "and hugepage-backed";
         }
-        // `this` is the owner token: registrations are charged per
-        // initiator instance, so two clients registering the same buffer
-        // each hold an independent page reference.
+        // `this` is the owner token: registrations are charged per initiator
+        // instance.
         return GetNofRegistryBundle().registry.Register(this, ptr, size);
 #else
         LOG(WARNING) << "SPDK build lacks spdk_mem_register; NoF over RDMA "
@@ -560,16 +521,12 @@ class SpdkInitiator::Impl {
         }
 
         if (done) {
-            // The completion callback already ran: safe to reuse the
-            // context. (Recycle only AFTER the caller has read all results,
-            // never inside the callback.)
+            // Recycle only after the caller has read all results, never
+            // inside the callback.
             probe_pool_.Recycle(probe_ctx);
         } else {
-            // completion_timeout only stops this thread from waiting; it
-            // does not cancel or drain the submitted NVMe command, which
-            // still retains &probe_ctx->adaptor. Keep the context out of the
-            // pool until the stale callback runs — recycling it would let a
-            // later poll write the old completion into the next probe.
+            // The timed-out command is still in flight and retains
+            // &probe_ctx->adaptor: quarantine until the stale callback runs.
             probe_pool_.Quarantine(probe_ctx);
         }
         return ok;
@@ -588,10 +545,8 @@ class SpdkInitiator::Impl {
     };
 
     bool EnsureEnv() {
-        // Lock first, then check: an unlocked read of a shared_ptr member
-        // paired with a locked write is a torn-read UB, so the
-        // double-checked pattern does not apply here. Cold path; one
-        // mutex acquisition is negligible.
+        // Locked check-then-set: an unlocked read of a shared_ptr member is
+        // a torn-read UB. Cold path, one mutex acquisition is negligible.
         std::lock_guard<std::mutex> lock(env_mutex_);
         if (!env_guard_) {
             env_guard_ = SpdkEnvGuard::Acquire();
@@ -730,11 +685,9 @@ class SpdkInitiator::Impl {
         return probe_buffer.get();
     }
 
-    // Bounded grace period for timed-out probes at teardown: their commands
-    // are still outstanding on the probe qpairs, and SPDK requires a qpair
-    // to have no outstanding I/O when it is freed. Completions are only
-    // processed by polling, so poll each affected qpair until the stale
-    // callback runs or the budget is exhausted.
+    // Bounded grace period for timed-out probes at teardown: SPDK requires a
+    // qpair to have no outstanding I/O when freed, and completions are only
+    // processed by polling.
     void DrainQuarantinedProbes() {
         const auto stale = probe_pool_.QuarantinedSnapshot();
         if (stale.empty()) {
@@ -834,10 +787,8 @@ SpdkDmaAllocator::~SpdkDmaAllocator() = default;
 
 void* SpdkDmaAllocator::Alloc(size_t size, size_t align, int socket_id) {
     {
-        // Lock first, then check: an unlocked read of a shared_ptr member
-        // paired with a locked write is a torn-read UB, so the
-        // double-checked pattern does not apply here. Alloc is a cold path;
-        // one mutex acquisition is negligible.
+        // Locked check-then-set: an unlocked read of a shared_ptr member is
+        // a torn-read UB.
         std::lock_guard<std::mutex> lock(env_mutex_);
         if (!env_guard_) {
             env_guard_ = SpdkEnvGuard::Acquire();

@@ -61,12 +61,9 @@ static std::string shm_alloc_error(const char* step, size_t size,
 }
 
 ShmHelper* ShmHelper::getInstance() {
-    // Deliberately leaked, never destroyed: ~ShmHelper -> cleanup() would
-    // unregister segments from the process-global NoF page registry, whose
-    // static-destruction order relative to this singleton is unspecified.
-    // Leaking guarantees the exit path can never touch a finalized registry
-    // or SPDK env; the kernel reclaims the mappings and registrations at
-    // process exit instead. cleanup() remains available to explicit callers.
+    // Deliberately leaked: cleanup() would touch the process-global NoF page
+    // registry, whose static-destruction order against this singleton is
+    // unspecified. cleanup() remains available to explicit callers.
     static ShmHelper* instance = new ShmHelper();
     return instance;
 }
@@ -265,21 +262,15 @@ void* ShmHelper::allocate(size_t size) {
                             "for NoF zero-copy transfers: addr="
                          << base_addr << ", size=" << size;
         } else {
-            // The process-global page registry normalizes to whole 2MB pages,
-            // absorbs pages already registered by the DPDK memseg walk
-            // (-EBUSY) as external, and cleans up the pages it touched on
-            // failure. A plain failure owns no registration, so teardown can
-            // munmap normally; only NOF_REGISTRATION_STUCK (cleanup
-            // unconfirmed) must be treated as registered.
+            // Only NOF_REGISTRATION_STUCK (cleanup unconfirmed) must be
+            // treated as registered; a plain failure owns no registration.
             const ErrorCode register_rc =
                 nof_initiator_->RegisterMemory(base_addr, size);
             if (register_rc == ErrorCode::OK) {
                 shm->spdk_registered = true;
             } else if (register_rc == ErrorCode::NOF_REGISTRATION_STUCK) {
-                // The backend may still hold translation state for this
-                // range. Treat it as registered so free()/cleanup() retry
-                // the unregister and retain the mapping instead of
-                // munmapping a possibly-live translation.
+                // Treat as registered so free()/cleanup() retry the
+                // unregister and retain the mapping instead of munmapping.
                 LOG(ERROR) << "NoF registration of shared memory left "
                               "unconfirmed translation state: addr="
                            << base_addr << ", size=" << size

@@ -32,14 +32,12 @@ bool NofPageRegistry::ReleasePageRefLocked(uint64_t page,
     }
     if (reg.count > 1) {
         // Other owners still hold the page: dropping this reference never
-        // touches the backend. (For a pending page this also cancels the
-        // owed cleanup — the page must stay registered for the new owner.)
+        // touches the backend.
         --reg.count;
         pending.erase(page);
         return true;
     }
-    // count == 1: last reference. Single-page region == legal single-page
-    // unmap (NOTIFY_START semantics).
+    // count == 1: last reference.
     if (unregister_fn_(reinterpret_cast<void*>(page), kPageSize) == 0) {
         page_regs_.erase(pit);
         pending.erase(page);
@@ -47,10 +45,8 @@ bool NofPageRegistry::ReleasePageRefLocked(uint64_t page,
     }
     LOG(ERROR) << "page unregister failed: page="
                << reinterpret_cast<void*>(page);
-    // Keep the record charged and the page pending: the backend may still
-    // hold the translation, and a later retry must find it here rather than
-    // re-registering it (a leftover translation answers -EBUSY and would be
-    // misclassified as external).
+    // Keep the page charged and pending: the backend may still hold the
+    // translation, and a later retry must find it here.
     pending.insert(page);
     return false;
 }
@@ -72,13 +68,11 @@ bool NofPageRegistry::UnregisterRecordLocked(void* ptr, OwnerReg& rec) {
     const uintptr_t covered_end = AlignUpToPage(begin + rec.valid_size);
 
     bool all_released = true;
-    // Release the valid prefix.
     for (uintptr_t page = first_page; page < covered_end; page += kPageSize) {
         all_released &= ReleasePageRefLocked(page, rec.pending);
     }
     rec.valid_size = 0;
-    // Release the pending backlog (snapshot: ReleasePageRefLocked mutates
-    // the set).
+    // Snapshot: ReleasePageRefLocked mutates the set.
     const std::set<uint64_t> backlog = rec.pending;
     for (uint64_t page : backlog) {
         all_released &= ReleasePageRefLocked(page, rec.pending);
@@ -95,15 +89,14 @@ ErrorCode NofPageRegistry::Register(void* owner, void* ptr, size_t size) {
     auto& registrations = owner_regs_[owner];
     auto existing = registrations.find(ptr);
 
-    // Cleanup-pending record: retry the backlog first. OK is only returned
-    // for fully registered ranges, so a stuck record must be cleaned and
-    // then genuinely (re)registered before OK can come back.
+    // Cleanup-pending record: retry the backlog first; OK is only returned
+    // for fully registered ranges.
     if (existing != registrations.end() && !existing->second.pending.empty() &&
         !RetryPendingLocked(existing->second)) {
         return ErrorCode::NOF_REGISTRATION_STUCK;
     }
 
-    // Coverage from the VALID prefix only: a stuck record's valid_size was
+    // Coverage counts only the VALID prefix: a stuck record's valid_size was
     // never extended past what is actually registered.
     uintptr_t bump_from = first_page;
     if (existing != registrations.end()) {
@@ -127,12 +120,9 @@ ErrorCode NofPageRegistry::Register(void* owner, void* ptr, size_t size) {
             } else if (rc != 0) {
                 LOG(ERROR) << "page register failed: page="
                            << reinterpret_cast<void*>(page) << " rc=" << rc;
-                // Roll back the pages this call bumped. A backend unregister
-                // failure here is the same unconfirmed-state problem as the
-                // failing page itself (SPDK v23.01.1 does not roll back a
-                // failed spdk_mem_register, and -EINVAL on unregister covers
-                // both "nothing marked" and "partially translated"), so move
-                // the page into pending instead of erasing it.
+                // Roll back the pages this call bumped; a backend unregister
+                // failure here is as unconfirmable as on the failing page, so
+                // move the page into pending instead of erasing it.
                 std::set<uint64_t> newly_pending;
                 bool rollback_clean = true;
                 for (uintptr_t p : touched) {
@@ -147,17 +137,16 @@ ErrorCode NofPageRegistry::Register(void* owner, void* ptr, size_t size) {
                     } else {
                         LOG(ERROR) << "rollback unregister failed: page="
                                    << reinterpret_cast<void*>(p);
-                        newly_pending.insert(p);  // record kept, count stays 1
+                        newly_pending.insert(p);
                         rollback_clean = false;
                     }
                 }
-                // The failing page itself may hold partial state (see
-                // above): try to clean it up.
+                // SPDK does not roll back a failed spdk_mem_register: try to
+                // clean up the failing page itself.
                 const bool failing_clean =
                     unregister_fn_(reinterpret_cast<void*>(page), kPageSize) ==
                     0;
                 if (failing_clean) {
-                    // Cleanup confirmed: drop the entry created above.
                     if (reg.count == 0 && !reg.external) {
                         page_regs_.erase(page);
                     }
@@ -167,16 +156,12 @@ ErrorCode NofPageRegistry::Register(void* owner, void* ptr, size_t size) {
                     newly_pending.insert(page);
                 }
                 if (failing_clean && rollback_clean) {
-                    // Everything this call touched is confirmed clean —
-                    // plain failure, the caller may munmap safely. An
-                    // existing record keeps its previous valid prefix.
+                    // Confirmed-clean failure; munmap is safe. An existing
+                    // record keeps its previous valid prefix.
                     return ErrorCode::INTERNAL_ERROR;
                 }
-                // Something could not be confirmed clean. Record the backlog
-                // so a later retry resumes exactly where it stopped and the
-                // shm quarantine paths retain the mapping instead of
-                // munmapping a possibly-live translation. The valid prefix
-                // is NOT extended: coverage must be restored by a retry.
+                // Record the backlog so a later retry resumes exactly where
+                // it stopped; the valid prefix is NOT extended.
                 auto& rec = registrations[ptr];
                 rec.pending.insert(newly_pending.begin(), newly_pending.end());
                 return ErrorCode::NOF_REGISTRATION_STUCK;
@@ -203,9 +188,8 @@ ErrorCode NofPageRegistry::Unregister(void* owner, void* ptr) {
         return ErrorCode::OK;  // not registered by this owner: no-op
     }
     if (!UnregisterRecordLocked(ptr, it->second)) {
-        // Some pages could not be released: the record (with its pending
-        // backlog) is retained so the caller's quarantine path can retry —
-        // munmap is NOT safe while the backend may still hold a translation.
+        // Record retained with its pending backlog so the caller's
+        // quarantine path can retry; munmap is not safe yet.
         return ErrorCode::INTERNAL_ERROR;
     }
     owner_it->second.erase(it);
