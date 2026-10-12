@@ -189,8 +189,19 @@ static std::set<std::string> getIbvDeviceWhitelist() {
     return whitelist;
 }
 
+#ifndef USE_CXI
+static bool isEfaDevice(const std::string &device_name) {
+    char path[PATH_MAX + 64];
+    char resolved_path[PATH_MAX];
+    snprintf(path, sizeof(path), "/sys/class/infiniband/%s/device/driver",
+             device_name.c_str());
+    if (realpath(path, resolved_path) == NULL) return false;
+    return strcmp(basename(resolved_path), "efa") == 0;
+}
+#endif
+
 static std::vector<InfinibandDevice> listInfiniBandDevices(
-    const std::vector<std::string> &filter) {
+    const std::vector<std::string> &filter, bool exclude_efa) {
 #ifndef USE_CXI
     int num_devices = 0;
     std::vector<InfinibandDevice> devices;
@@ -216,6 +227,12 @@ static std::vector<InfinibandDevice> listInfiniBandDevices(
         if (!whitelist.empty() &&
             whitelist.find(device_name) == whitelist.end()) {
             LOG(INFO) << "Skipping device: " << device_name;
+            continue;
+        }
+
+        if (exclude_efa && isEfaDevice(device_name)) {
+            LOG(INFO) << "Skipping EFA device for RDMA: " << device_name
+                      << " (use protocol=efa for EFA)";
             continue;
         }
 
@@ -250,6 +267,7 @@ static std::vector<InfinibandDevice> listInfiniBandDevices(
     ibv_free_device_list(device_list);
     return devices;
 #else
+    (void)exclude_efa;  // CXI builds have no EFA NICs
     // assume devices available and working, later use libcxi to check if they
     // actually work
     std::vector<std::string> device_names;
@@ -489,7 +507,7 @@ static std::vector<TopologyEntry> discoverCpuTopology(
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
-    defined(USE_COREX)
+    defined(USE_COREX) || defined(USE_SUPA)
 
 static int getPciDistance(const char *bus1, const char *bus2) {
     char buf[PATH_MAX];
@@ -622,16 +640,17 @@ void Topology::clear() {
     resolved_hca_peer_affinity_by_local_.clear();
 }
 
-int Topology::discover(const std::vector<std::string> &filter) {
+int Topology::discover(const std::vector<std::string> &filter,
+                       bool exclude_efa) {
     matrix_.clear();
     resolved_hca_peer_affinity_by_local_.clear();
-    auto all_hca = listInfiniBandDevices(filter);
+    auto all_hca = listInfiniBandDevices(filter, exclude_efa);
     for (auto &ent : discoverCpuTopology(all_hca)) {
         matrix_[ent.name] = ent;
     }
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
-    defined(USE_COREX)
+    defined(USE_COREX) || defined(USE_SUPA)
     for (auto &ent : discoverCudaTopology(all_hca)) {
         matrix_[ent.name] = ent;
     }
@@ -707,6 +726,16 @@ Json::Value Topology::toJson() const {
         root[pair.first] = pair.second.toJson();
     }
     return root;
+}
+
+int Topology::getDeviceIndex(const std::string &storage_type,
+                             std::string_view device_name) const {
+    const auto it = resolved_matrix_.find(storage_type);
+    if (it == resolved_matrix_.end() || device_name.empty()) {
+        return ERR_DEVICE_NOT_FOUND;
+    }
+    const int hca_idx = it->second.getHcaIndex(std::string(device_name));
+    return hca_idx >= 0 ? hca_idx : ERR_DEVICE_NOT_FOUND;
 }
 
 int Topology::selectDevice(const std::string storage_type,

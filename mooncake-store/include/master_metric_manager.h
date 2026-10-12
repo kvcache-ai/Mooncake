@@ -128,6 +128,13 @@ class MasterMetricManager {
     void set_dfs_capacity_unlimited(bool unlimited);
     bool is_dfs_capacity_unlimited() const;
 
+    // DFS Allocator Metrics (projected from the DFS allocator snapshot). These
+    // reflect the shard/bucket DFS allocator, distinct from the 3fs/nfs file
+    // storage gauges above.
+    int64_t get_dfs_allocated_bytes();
+    int64_t get_dfs_total_capacity();
+    int64_t get_dfs_file_count();
+
     // Key/Value Metrics
     void inc_key_count(int64_t val = 1);
     void dec_key_count(int64_t val = 1);
@@ -347,6 +354,8 @@ class MasterMetricManager {
     // Tenant quota metrics
     void inc_tenant_quota_reject(const std::string& tenant_id,
                                  const std::string& reason, int64_t val = 1);
+    void inc_standby_restore_rejected_objects(const std::string& reason,
+                                              int64_t val = 1);
     void inc_tenant_evict_bytes(const std::string& tenant_id, int64_t bytes);
 
     // Promotion retry candidate metrics
@@ -601,6 +610,11 @@ class MasterMetricManager {
     ylt::metric::gauge_t file_total_capacity_;
     std::atomic<bool> dfs_capacity_unlimited_{false};
 
+    // DFS Allocator Metrics
+    ylt::metric::gauge_t dfs_allocated_size_;
+    ylt::metric::gauge_t dfs_total_capacity_;
+    ylt::metric::gauge_t dfs_file_count_;
+
     // Key/Value Metrics
     ylt::metric::gauge_t key_count_;
     ylt::metric::gauge_t soft_pin_key_count_;
@@ -765,6 +779,7 @@ class MasterMetricManager {
 
     ylt::metric::dynamic_counter_2t tenant_quota_reject_total_;
     ylt::metric::dynamic_counter_1t tenant_evict_bytes_total_;
+    ylt::metric::dynamic_counter_1t standby_restore_rejected_objects_total_;
 
     // SSD Offload Task Metrics
     ylt::metric::dynamic_counter_1t offload_enqueued_total_;

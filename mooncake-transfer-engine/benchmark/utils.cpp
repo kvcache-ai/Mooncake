@@ -40,7 +40,8 @@ DEFINE_string(
     op_type, "read",
     "Operation type to benchmark: read|write|mix|write_seed|read_verify");
 DEFINE_bool(check_consistency, false,
-            "Enable data consistency check after transfer.");
+            "Validate data with alternating WRITE/READ transfers; reports "
+            "op_type=mix regardless of --op_type=read|write|mix.");
 DEFINE_uint64(total_buffer_size, 1UL << 30,
               "Total buffer size for testing (in bytes).");
 DEFINE_uint64(start_block_size, 4096, "Start block size (in bytes).");
@@ -108,7 +109,7 @@ DEFINE_int32(
 DEFINE_string(xport_type, "",
               "Transport type: "
               "rdma|tcp|hp_tcp|shm|mnnvl|nvlink|gds|iouring|ub|sunrise_link|"
-              "mpcomm|flagcx");
+              "mpcomm|flagcx|efa|fabric");
 DEFINE_string(backend, "tent", "Transport backend: classic|tent");
 DEFINE_bool(use_hugepage, false,
             "classic DRAM: SHM allocates on hugetlbfs; RDMA allocates with "
@@ -128,7 +129,7 @@ DEFINE_bool(notifi, false,
 DEFINE_string(tent_transport_hint, "unspec",
               "tent only: per-request transport_hint. "
               "unspec|rdma|tcp|hp_tcp|shm|nvlink|gds|io_uring|mnnvl|ascend|"
-              "ub|sunrise_link|mpcomm");
+              "ub|sunrise_link|mpcomm|fabric");
 DEFINE_string(tent_intent_type, "unspec",
               "tent only: intent_type attached to every benchmark request. "
               "unspec|foreground_get|background_prefetch|migration|checkpoint|"

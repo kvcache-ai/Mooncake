@@ -150,6 +150,27 @@ python3 store_client_e2e.py \
 - `--duration-sec`: total workload duration
 - `--sleep-ms`: interval between operations
 
+### In-process master e2e (no `mooncake_master`)
+
+Linux CI (`test-wheel-ubuntu`) runs `scripts/run_standalone_store_e2e.sh` before
+starting `mooncake_master`. This covers `EmbeddedMaster` plumbing used by tests.
+The Store client owns the master in the same process; no `mooncake_master` or
+metadata-service process is launched. The existing client hosting options remain
+unchanged, and this is not a documented user deployment mode.
+
+The CTest targets `embedded_master_test` and `standalone_client_test` also cover
+loopback-only listeners, kernel-assigned ports during concurrent startup, and
+same-port restart after stopping a master. TransferEngine reuse is checked with
+both HTTP metadata and `P2PHANDSHAKE`; the latter deliberately uses different
+Store and engine names and checks the published replica endpoint. The TENT
+`cuda-off` CI job runs the same metadata-reuse cases with `MC_USE_TENT=1`.
+In embedded mode, the legacy external `master_server_addr` argument is ignored
+so multiple clients can keep its default without competing for port 50051.
+
+```bash
+bash scripts/run_standalone_store_e2e.sh
+```
+
 ### run_oplog_snapshot_smoke.sh
 
 Runs the batch OpLog snapshot path with two real master processes and a local

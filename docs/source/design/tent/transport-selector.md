@@ -199,11 +199,11 @@ transport: it can be listed in a policy's `transports` array, pinned with
 explicitly instead:
 
 * **Local memory allocation.** When the requested transport is `UNSPEC`,
-  allocation walks `MNNVL → RDMA → UB → TCP → HP_TCP` (with `SHM` taking the
+  allocation walks `MNNVL → RDMA → UB → FABRIC → TCP → HP_TCP` (with `SHM` taking the
   host-memory slot ahead of RDMA for CPU and wildcard locations), so an
   installed UB transport is preferred over the generic TCP paths.
 * **TPU staging.** The TPU staging policy needs a host-DRAM network transport
-  for the host↔host hop and gates on `RDMA`, `UB`, `TCP` or `HP_TCP`.
+  for the host↔host hop and gates on `RDMA`, `UB`, `FABRIC`, `TCP` or `HP_TCP`.
 
 Once UB is the selected transport, the rail for each slice is chosen inside
 `UbTransport` rather than by this selector; see {ref}`TENT Failover

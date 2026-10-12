@@ -629,6 +629,8 @@ TEST(ShardAllocatorTest, ExpansionValidatesCountAndUsesEmptyShards) {
     ASSERT_TRUE(expanded);
     EXPECT_EQ(*expanded, 2);
     EXPECT_EQ(alloc.GetShardCount(), 2);
+    // GetFileCount reports the shard file count in shard mode.
+    EXPECT_EQ(alloc.GetFileCount(), 2u);
     ASSERT_TRUE(alloc.ExpandShards(2));
     auto shrink = alloc.ExpandShards(1);
     ASSERT_FALSE(shrink);
@@ -993,6 +995,18 @@ class ControlledPosixFsAdapter : public PosixFsAdapter {
     void ShortReadCall(int call) { short_read_call_ = call; }
     int WriteCallCount() const { return write_calls_.load(); }
     int ReadCallCount() const { return read_calls_.load(); }
+
+    std::vector<tl::expected<size_t, ErrorCode>> BatchWriteAt(
+        std::span<const FdIoRequest> requests) override {
+        ADD_FAILURE() << "POSIX shard writes must retain per-request I/O";
+        return PosixFsAdapter::BatchWriteAt(requests);
+    }
+
+    std::vector<tl::expected<size_t, ErrorCode>> BatchReadAt(
+        std::span<const FdIoRequest> requests) override {
+        ADD_FAILURE() << "POSIX shard reads must retain per-request I/O";
+        return PosixFsAdapter::BatchReadAt(requests);
+    }
 
     tl::expected<size_t, ErrorCode> WriteAt(int fd, const iovec* iov,
                                             int iovcnt,

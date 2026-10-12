@@ -120,10 +120,11 @@ device marks its context unavailable, and the transport then calls
 that device and quarantines any whose native cleanup has not completed. The
 context only returns to service once every one of them reaches `Destroyed`,
 because reactivating JFC health before that barrier would post onto Jetty sets
-that still lack their flush fence. Quarantined endpoints are retried only when
-the store actually needs a slot, and at most once per sweep interval, so a
-still-failing device cannot turn every posting call into a serialized provider
-call.
+that still lack their flush fence. The cache-capacity path retries quarantined
+endpoints only when the store actually needs a slot, and at most once per sweep
+interval, so a still-failing device cannot turn every posting call into a
+serialized provider call. Device-failure cleanup and shutdown retry retirement
+independently of that cache-capacity throttle.
 
 When UB cannot resolve or post a slice, the generic submit-stage failover
 described above moves the owner to the remaining candidate transports.

@@ -169,10 +169,11 @@ In addition, if the error `Failed to get description of XXX` is displayed, it in
    ```
 
    **Solutions:**
-   - Enable the TCP connection pool so that long-lived sockets are reused across transfers instead of being opened per transfer:
+   - Keep the TCP connection pool enabled so that long-lived sockets are reused across transfers instead of being opened per transfer. The pool is on by default in current builds; if it was explicitly disabled, re-enable it by removing the opt-out:
      ```bash
-     export MC_TCP_ENABLE_CONNECTION_POOL=1
+     unset MC_TCP_ENABLE_CONNECTION_POOL   # or stop setting it to 0
      ```
+     On older builds where the pool is still opt-in, enable it with `export MC_TCP_ENABLE_CONNECTION_POOL=1`.
    - Widen the ephemeral port range if the workload genuinely needs many distinct connections:
      ```bash
      sysctl -w net.ipv4.ip_local_port_range="1024 65535"
@@ -182,20 +183,19 @@ In addition, if the error `Failed to get description of XXX` is displayed, it in
      sysctl -w net.ipv4.tcp_tw_reuse=1
      ```
 
-2. The TCP connection pool (`MC_TCP_ENABLE_CONNECTION_POOL=1`) has two known limitations in the current implementation. The pool is functional for most workloads, but operators running long-lived services should be aware of them:
+2. The TCP connection pool is enabled by default (`MC_TCP_ENABLE_CONNECTION_POOL=0` opts out). The current lane-based implementation has none of the failure modes the old dynamic pool had here before; its actual operational caveats are:
 
-   * **Idle-expired connections are not always reclaimed.** `cleanupIdleConnections()` only inspects the tail of each endpoint's deque. When a newer `in_use` entry has been pushed behind an older idle-expired entry, the loop terminates at the tail and the idle entry is never removed. The pool's reported state diverges from reality: it still lists the connection as idle while the socket has been sitting past `kConnectionIdleTimeout`, may have been half-closed by the peer, and will fail on the next `getConnection()` that tries to reuse it. In long-running services this also leaks sockets and file descriptors until the process is restarted.
+   * **Lane sockets are kept open for the life of the process.** There is no idle reaping, so a long-lived initiator holds up to `MC_TCP_LANES_PER_PEER` (default 4) sockets per peer. That is bounded per peer, but the total grows with the number of distinct peers the process talks to.
 
      **Diagnostic Commands:**
      ```bash
-     # Watch for unbounded growth of open sockets from the process
+     # Watch open socket count from the process
      ls /proc/$PID/fd | wc -l
      ss -tan | awk '$1=="ESTAB"' | wc -l
      ```
 
-     **Workaround:** restart the process periodically if fd usage climbs without bound.
-
-   * **`asio::socket::close()` runs under `pool_mutex_`.** `close()` cancels outstanding async operations and posts completion handlers to the io_context. Handlers such as `returnConnection()` also acquire `pool_mutex_`, so the current code is one scheduling step away from a circular wait. No deadlock has been observed in practice, but if the transfer engine hangs with all worker threads stuck waiting on `pool_mutex_`, this is the first place to look.
+   * **Reused sockets are not probed before a transfer.** A connection that a middlebox silently dropped while idle surfaces as a stall on the next transfer (TCP retransmission timeout) rather than a fast reconnect. Same-datacenter peers are unaffected in practice; if your initiators reach peers across a NAT or firewall with aggressive idle expiry, keep the pool opted out or shorten the idle gap below the middlebox timeout.
+   * A connection whose protocol stream went dirty is closed instead of reused, and a failed lane is retried on a cooldown, so a restarted peer costs at most the transfer that was in flight.
 
 ## Memory Allocator
 

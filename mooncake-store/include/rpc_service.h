@@ -274,6 +274,8 @@ class WrappedMasterService {
         const std::string& segment_name);
     tl::expected<SegmentStatus, ErrorCode> QuerySegmentStatusById(
         const UUID& segment_id);
+    tl::expected<void, ErrorCode> SetSegmentStatus(
+        const std::string& segment_name, SegmentStatus status);
 
     // Internal method called by supervisor during promotion; NOT an RPC
     // endpoint.
