@@ -2,8 +2,12 @@ name: Release
 
 on:
   push:
+    # Stable tags only (vX.Y.Z or vX.Y.Z.postN). PEP 440 pre-release tags
+    # such as v0.3.14rc1 must not reach production PyPI; pre-release.yaml
+    # handles them.
     tags:
-      - 'v*'
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+.post[0-9]+'
 
 jobs:
   # Skip semver pre-release tags (e.g. v1.0.0-rc1); those are handled by pre-release.yaml.

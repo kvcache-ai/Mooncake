@@ -2,8 +2,12 @@ name: Release Ascend NPU
 
 on:
   push:
+    # Stable tags only (vX.Y.Z or vX.Y.Z.postN). PEP 440 pre-release tags
+    # such as v0.3.14rc1 must not reach production PyPI; pre-release.yaml
+    # handles them.
     tags:
-      - 'v*'
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+.post[0-9]+'
   workflow_dispatch:
     inputs:
       tag:
@@ -42,6 +46,17 @@ jobs:
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag) || github.ref }}
           fetch-depth: 0
+
+      - name: Validate release tag
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ ! "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(\.post[0-9]+)?$ ]]; then
+            echo "::error::Release tag must be a stable release tag (vX.Y.Z or vX.Y.Z.postN)"
+            exit 1
+          fi
 
       - name: Setup Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5

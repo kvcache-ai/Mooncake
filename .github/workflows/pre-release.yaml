@@ -6,10 +6,10 @@ name: Pre-Release
 on:
   push:
     tags:
-      - 'v*-rc*'
-      - 'v*-alpha*'
-      - 'v*-beta*'
-      - 'v*-pre*'
+      - 'v*rc*'
+      - 'v*alpha*'
+      - 'v*beta*'
+      - 'v*pre*'
 
 jobs:
   version-stamp:
