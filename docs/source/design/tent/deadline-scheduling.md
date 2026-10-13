@@ -571,6 +571,13 @@ it stays RDMA-only. On a host with TCP only, `deadline_aware` and
 `deadline_bw_arbitration` do nothing. That is by design, not a
 misconfiguration.
 
+`tebench` exposes the same switches for measuring on hardware:
+`--deadline_aware` sets `enable_runtime_queue` and
+`runtime_queue/deadline_aware`, `--mlu_local_threshold` sets
+`runtime_queue/mlu_local_threshold`, and `--deadline_bw_arbitration` sets
+`transports/rdma/deadline_bw_arbitration`; `--deadline_us` tags the requests.
+See the [tebench guide](../../performance/mooncake/tebench.md).
+
 ## Known Limits
 
 - **Drop notification.** The engine installs an empty `DegradationHooks`, and

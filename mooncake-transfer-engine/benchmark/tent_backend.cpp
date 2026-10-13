@@ -74,6 +74,18 @@ std::shared_ptr<Config> loadConfig() {
     config->set("rpc_server_port", XferBenchConfig::rpc_server_port);
     config->set("transports/rdma/deadline_bw_arbitration",
                 XferBenchConfig::deadline_bw_arbitration);
+    // Admission-queue knobs are written only when asked for, so a config
+    // file given through MC_TENT_CONF keeps its own runtime_queue settings
+    // otherwise. The drop (mlu_local_threshold) needs the queue to be on
+    // and deadline-ordered; both are implied here.
+    if (XferBenchConfig::deadline_aware) {
+        config->set("enable_runtime_queue", true);
+        config->set("runtime_queue/deadline_aware", true);
+        if (XferBenchConfig::mlu_local_threshold > 0.0) {
+            config->set("runtime_queue/mlu_local_threshold",
+                        XferBenchConfig::mlu_local_threshold);
+        }
+    }
 
     // Configure transport types based on xport_type parameter
     if (!XferBenchConfig::xport_type.empty()) {

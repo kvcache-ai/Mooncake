@@ -90,6 +90,8 @@ struct XferBenchConfig {
     static uint64_t deadline_us;
     static int deadline_tight_threads;
     static bool deadline_bw_arbitration;
+    static bool deadline_aware;
+    static double mlu_local_threshold;
 
     static std::string metadata_type;
     static std::string metadata_url_list;

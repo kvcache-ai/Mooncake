@@ -483,6 +483,72 @@ TEST(RuntimeQueueDispatch, DroppedOwnerLeavesNoImplRecord) {
         engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
 }
 
+// The drop's bandwidth comes from the RDMA transport's own estimate, wired
+// by the engine from the config keys (enable_runtime_queue, deadline_aware,
+// mlu_local_threshold). No provider is injected here: a fake RDMA transport
+// reporting a bandwidth is enough to make the engine drop, and raising that
+// bandwidth makes the next request go through. This is the wiring tebench's
+// --deadline_aware / --mlu_local_threshold rely on.
+class MeteredFakeTransport : public FakeTransport {
+   public:
+    using FakeTransport::FakeTransport;
+    std::atomic<double> bandwidth_bps{1.0};
+    double getEstimatedBandwidth() const override {
+        return bandwidth_bps.load();
+    }
+};
+
+TEST(RuntimeQueueDispatch, DropReadsBandwidthFromTheRdmaTransport) {
+    auto cfg = makeRuntimeQueueConfig(4, 1UL << 20);
+    cfg->set("runtime_queue/deadline_aware", true);
+    cfg->set("runtime_queue/mlu_local_threshold", 1.0);
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    // One byte per second: a request with a one-second deadline is
+    // infeasible by the queue's own MLU, with no injected provider.
+    auto fake_rdma = std::make_shared<MeteredFakeTransport>(RDMA);
+    installFakeRdma(engine, fake_rdma);
+
+    constexpr size_t kReqLen = 4096;
+    std::vector<uint8_t> buffer(kReqLen, 0x55);
+    ASSERT_TRUE(engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+    auto one_second_out = [] {
+        return static_cast<uint64_t>(
+                   std::chrono::duration_cast<std::chrono::nanoseconds>(
+                       std::chrono::steady_clock::now().time_since_epoch())
+                       .count()) +
+               1'000'000'000ULL;
+    };
+
+    BatchID dropped = engine.allocateBatch(1);
+    ASSERT_NE(dropped, (BatchID)0);
+    auto request = makeLocalWrite(buffer.data(), kReqLen);
+    request.deadline_ns = one_second_out();
+    ASSERT_TRUE(engine.submitTransfer(dropped, {request}).ok());
+    EXPECT_EQ(fake_rdma->submit_calls.load(), 0);
+    TransferStatus status{};
+    ASSERT_TRUE(engine.getTransferStatus(dropped, 0, status).ok());
+    EXPECT_EQ(status.s, TransferStatusEnum::CANCELED);
+    EXPECT_TRUE(engine.freeBatch(dropped).ok());
+
+    // The provider is live: a terabyte per second makes the same request
+    // feasible and it is dispatched to the transport.
+    fake_rdma->bandwidth_bps.store(1e12);
+    BatchID dispatched = engine.allocateBatch(1);
+    ASSERT_NE(dispatched, (BatchID)0);
+    request.deadline_ns = one_second_out();
+    ASSERT_TRUE(engine.submitTransfer(dispatched, {request}).ok());
+    EXPECT_EQ(fake_rdma->submit_calls.load(), 1);
+    ASSERT_TRUE(engine.getTransferStatus(dispatched, 0, status).ok());
+    EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
+    EXPECT_TRUE(engine.freeBatch(dispatched).ok());
+
+    EXPECT_EQ(TransferEngineImplTestPeer::queuedOwners(engine), 0u);
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
+}
+
 // A batch handed to the deferred staging teardown is never polled again, so
 // a dispatched owner of it would hold its dispatch-window slot and its queue
 // bytes for the rest of the process; with a one-owner window that is every

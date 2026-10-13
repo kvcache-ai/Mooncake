@@ -416,6 +416,23 @@ int main(int argc, char* argv[]) {
         LOG(ERROR) << "deadline tagging is supported only by the tent backend";
         return EXIT_FAILURE;
     }
+    if ((XferBenchConfig::deadline_aware ||
+         XferBenchConfig::mlu_local_threshold != 0.0) &&
+        XferBenchConfig::backend != "tent") {
+        LOG(ERROR) << "--deadline_aware and --mlu_local_threshold are "
+                      "supported only by the tent backend";
+        return EXIT_FAILURE;
+    }
+    if (!std::isfinite(XferBenchConfig::mlu_local_threshold) ||
+        XferBenchConfig::mlu_local_threshold < 0.0) {
+        LOG(ERROR) << "mlu_local_threshold must be finite and non-negative";
+        return EXIT_FAILURE;
+    }
+    if (XferBenchConfig::mlu_local_threshold > 0.0 &&
+        !XferBenchConfig::deadline_aware) {
+        LOG(ERROR) << "--mlu_local_threshold requires --deadline_aware";
+        return EXIT_FAILURE;
+    }
     if (!workload_classes.empty() &&
         XferBenchConfig::tent_intent_type != "unspec") {
         LOG(ERROR) << "--tent_intent_type cannot be combined with per-class "
