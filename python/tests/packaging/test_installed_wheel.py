@@ -77,6 +77,7 @@ import mooncake.transfer_engine_topology_dump
 assert "mooncake.engine" not in sys.modules
 
 import mooncake.async_store
+import mooncake.dataproto_catalog
 import mooncake.engine
 import mooncake.http_metadata_server
 import mooncake.mooncake_config
@@ -94,9 +95,11 @@ assert issubclass(
     mooncake.store.MooncakeDistributedStore,
 )
 assert Path(mooncake.async_store.__file__).resolve().parent == package_path.parent
+assert mooncake.dataproto_catalog.DataProtoCatalog is not None
 assert mooncake.engine.TransferEngine is not None
 assert mooncake.http_metadata_server.KVBootstrapServer is not None
 assert mooncake.mooncake_config.MooncakeConfig is not None
+assert "mooncake.structured_object_store" not in sys.modules
 for ep_module in (
     "ep.py",
     "mooncake_ep_buffer.py",

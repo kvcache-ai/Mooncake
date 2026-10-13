@@ -200,6 +200,7 @@ MIGRATED_PYTHON_MODULES=(
     mooncake_ssd_register.py
     mooncake_ssd_unregister.py
     spdk_tgt_create.py
+    dataproto_catalog.py
 )
 RESHARD_SOURCE_DIR="mooncake-reshard/python/mooncake/reshard"
 RESHARD_STAGING_DIR="$(pwd)/mooncake-wheel/mooncake/reshard"

@@ -53,6 +53,8 @@ Installation:
       - 'python/mooncake/cli_client.py'
       - 'python/mooncake/cli_bench.py'
       - 'python/mooncake/transfer_engine_topology_dump.py'
+      - 'python/mooncake/dataproto_catalog.py'
+      - 'python/tests/integration/dataproto/**/*'
 
 P2P Store:
   - changed-files:
