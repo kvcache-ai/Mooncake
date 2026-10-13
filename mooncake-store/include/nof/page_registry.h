@@ -25,31 +25,24 @@ namespace mooncake {
 // Ownership: registrations are charged to an explicit owner token (the
 // registering initiator instance). Per-page refcounts are process-wide, so
 // one owner's Unregister never unmaps pages another owner still relies on.
-// Each owner record covers exactly the pages the registration is still
-// charged for (a whole-page prefix of the requested range).
 //
 // Failure handling is fail-stop (the baseline SpdkWrapper contract): a
-// failed registration is cleaned up once — the failing page and this call's
-// pages. Anything whose cleanup cannot be confirmed is QUARANTINED: the
-// page stays charged, is never unregistered and never re-registered, and
-// its VA must never be munmapped; the kernel reclaims everything at process
-// exit. Quarantine is terminal (no retry state machine). A later
-// registration treats a quarantined page like an external one: it bumps no
-// backend state, returns OK, and its teardown will fail to release the page
-// (keeping the mapping pinned) — the translation state stays unknown but
-// the VA is never reused.
+// failed registration is cleaned up once; anything whose cleanup cannot be
+// confirmed is QUARANTINED — terminally pinned, never unregistered, never
+// re-registered, never munmapped (the kernel reclaims it at process exit).
+// A later registration treats a quarantined page like an external one
+// (covered, OK) and fails to release it at teardown, keeping the mapping
+// pinned.
 //
 // Each owner record is {size, charged_from}: the covered range is
-// [charged_from ?: first_page, page_align(begin + size)). Charges held by
-// one record are contiguous up to the first quarantined page — registration
-// failures keep charges contiguous (reverse-order rollback stops at the
-// first failure), and a failed unregister shrinks charged_from to the
-// first unreleasable page, so a retry immediately hits it again and can
-// never touch pages whose remaining references belong to other owners. In
-// the deepest cascade (a redo of a shrunk record failing again before the
-// retained suffix), charges may form two blocks; the gap is skipped safely
-// on teardown, and pages past a quarantine point stay registered — leaked
-// but pinned, which is the fail-stop design.
+// [charged_from ?: first_page, page_align(begin + size)). Charges are
+// contiguous up to the first quarantined page, and a failed unregister
+// shrinks charged_from to the first unreleasable page, so a retry
+// immediately hits it again and can never touch pages whose remaining
+// references belong to other owners. In the deepest cascade (a redo of a
+// shrunk record failing again before the retained suffix), charges may form
+// two blocks; the gap is skipped safely on teardown, and pages past a
+// quarantine point stay registered — leaked but pinned, by design.
 class NofPageRegistry {
    public:
     using MemRegisterFn = int (*)(void* addr, size_t len);

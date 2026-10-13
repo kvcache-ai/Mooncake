@@ -26,11 +26,9 @@ ErrorCode NofPageRegistry::Register(void* owner, void* ptr, size_t size) {
     auto& registrations = owner_regs_[owner];
 
     // [skip_from, skip_end): the retained suffix of a record shrunk by a
-    // failed unregister — still charged, must not be re-bumped. On a redo,
-    // the walk always covers the whole dropped prefix up to skip_end, even
-    // when the new size is smaller: pages between the new size's end and
-    // skip_from would otherwise become covered-but-uncharged holes that a
-    // later teardown could release from under another owner.
+    // failed unregister — still charged, must not be re-bumped. A redo walks
+    // up to skip_end even when the new size is smaller, so no
+    // covered-but-uncharged hole is left in the prefix.
     uintptr_t bump_from = first_page;
     uintptr_t skip_from = 0, skip_end = 0;
     auto existing = registrations.find(ptr);
@@ -43,8 +41,6 @@ ErrorCode NofPageRegistry::Register(void* owner, void* ptr, size_t size) {
             }
             bump_from = covered_end;
         } else {
-            // The record was shrunk: redo the dropped prefix, keep the
-            // retained suffix untouched.
             bump_from = first_page;
             skip_from = existing->second.charged_from;
             skip_end = covered_end;
@@ -60,8 +56,7 @@ ErrorCode NofPageRegistry::Register(void* owner, void* ptr, size_t size) {
         }
         auto& reg = page_regs_[page];
         // External and quarantined pages are treated alike: pinned, never
-        // (un)registered by us. A quarantined page's translation state is
-        // unknown; the coverage counts so teardown keeps the mapping pinned.
+        // (un)registered by us.
         if (reg.external) {
             continue;
         }
@@ -81,9 +76,8 @@ ErrorCode NofPageRegistry::Register(void* owner, void* ptr, size_t size) {
                 LOG(ERROR) << "page register failed: page="
                            << reinterpret_cast<void*>(page) << " rc=" << rc;
                 // SPDK does not roll back a failed spdk_mem_register: try to
-                // clean up the failing page itself, once. On success the
-                // entry is erased; otherwise quarantine it and keep this
-                // call's charges (they form a contiguous prefix).
+                // clean up the failing page itself, once; otherwise
+                // quarantine it and keep this call's charges.
                 if (unregister_fn_(reinterpret_cast<void*>(page), kPageSize) !=
                     0) {
                     reg.count = 1;
@@ -92,14 +86,14 @@ ErrorCode NofPageRegistry::Register(void* owner, void* ptr, size_t size) {
                     rec.size = std::max(
                         rec.size,
                         static_cast<size_t>((page + kPageSize) - begin));
-                    rec.charged_from = 0;  // charges stay a contiguous prefix
+                    rec.charged_from = 0;
                     return ErrorCode::NOF_REGISTRATION_STUCK;
                 }
                 page_regs_.erase(page);
                 // The failing page is confirmed clean: roll back this call's
                 // pages in reverse order and STOP at the first rollback
-                // failure, quarantining that page — the charges that remain
-                // always form a contiguous prefix.
+                // failure, quarantining that page — the remaining charges
+                // stay a contiguous prefix.
                 for (auto it = touched.rbegin(); it != touched.rend(); ++it) {
                     auto& r = page_regs_[*it];
                     if (r.count > 1) {
@@ -119,7 +113,7 @@ ErrorCode NofPageRegistry::Register(void* owner, void* ptr, size_t size) {
                     rec.size = std::max(
                         rec.size,
                         static_cast<size_t>((*it + kPageSize) - begin));
-                    rec.charged_from = 0;  // charges stay a contiguous prefix
+                    rec.charged_from = 0;
                     return ErrorCode::NOF_REGISTRATION_STUCK;
                 }
                 // Everything this call touched is confirmed clean.
@@ -139,8 +133,7 @@ bool NofPageRegistry::ReleaseRangeLocked(void* ptr, OwnerRange& rec) {
     const uintptr_t begin = reinterpret_cast<uintptr_t>(ptr);
     const uintptr_t first_page = begin & ~kPageMask;
     const uintptr_t end_page = AlignUpToPage(begin + rec.size);
-    // Start where the remaining charges start; everything before
-    // charged_from was already released.
+    // Start where the remaining charges start.
     const uintptr_t start =
         rec.charged_from != 0 ? rec.charged_from : first_page;
     for (uintptr_t page = start; page < end_page; page += kPageSize) {
@@ -182,8 +175,7 @@ ErrorCode NofPageRegistry::Unregister(void* owner, void* ptr) {
     }
     if (!ReleaseRangeLocked(ptr, it->second)) {
         // Record retained (shrunk to the first unreleasable page): the
-        // caller's quarantine path keeps the mapping pinned, and a retry
-        // immediately hits that page again — never pages owned by others.
+        // caller's quarantine path keeps the mapping pinned.
         return ErrorCode::INTERNAL_ERROR;
     }
     owner_it->second.erase(it);

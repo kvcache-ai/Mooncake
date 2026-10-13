@@ -4202,18 +4202,13 @@ tl::expected<void, ErrorCode> RealClient::unregister_buffer_internal(
     auto unregister_result = client_->unregisterLocalMemory(buffer, true);
 
     // Record check, NoF cleanup and record erase stay in one critical
-    // section (teardown's unregister walk takes the same lock). The TE call
-    // above is intentionally outside it: if teardown finishes the cleanup in
-    // between, this call returns a TE error for an already-cleaned buffer —
-    // a harmless false error.
+    // section (teardown's unregister walk takes the same lock).
     std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
     if (!unregister_result) {
         // Fall through to the NoF cleanup ONLY when TE reports the buffer as
         // not registered (a previous call already tore TE down) and the
-        // record is still present. Any other TE failure (e.g. a transient
-        // deregistration error) means the TE registration may still be
-        // alive: keep the record and propagate, so the caller does not free
-        // the buffer under a live registration.
+        // record is still present. Any other TE failure means the TE
+        // registration may still be alive: keep the record and propagate.
         if (unregister_result.error() != ErrorCode::NOT_REGISTERED ||
             registered_buffer_sizes_.count(buffer) == 0) {
             LOG(ERROR) << "Unregister buffer failed with error: "
@@ -4227,8 +4222,7 @@ tl::expected<void, ErrorCode> RealClient::unregister_buffer_internal(
         auto rc = nof_runtime_.initiator->UnregisterMemory(buffer);
         if (rc != ErrorCode::OK) {
             // The backend may still hold a translation for this buffer:
-            // propagate the failure and keep the record so teardown keeps
-            // the NoF pages pinned (quarantined).
+            // propagate and keep the record so the NoF pages stay pinned.
             LOG(ERROR) << "NoF memory unregistration failed for buffer "
                        << buffer << ": " << toString(rc)
                        << "; buffer stays recorded and the NoF pages stay "

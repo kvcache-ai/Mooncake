@@ -103,29 +103,24 @@ class NVMeoFInitiator {
     // Two instances registering the same ptr each hold an independent
     // reference, so one instance's UnregisterMemory never unmaps pages the
     // other still relies on. The bookkeeping is process-global and outlives
-    // any instance; destroying an initiator releases what it still holds.
+    // any instance.
     //
     // Return contract:
-    //   - OK: the range is fully registered (pages already external or
-    //     quarantined count as covered; a quarantined page's translation
-    //     state is unknown but the page is pinned forever).
+    //   - OK: the range is fully registered (external or quarantined pages
+    //     count as covered).
     //   - other errors except NOF_REGISTRATION_STUCK: failed, everything
     //     touched is confirmed clean; the caller may munmap without a
     //     pairing UnregisterMemory.
     //   - NOF_REGISTRATION_STUCK: cleanup of the failed attempt could not be
-    //     confirmed. The affected pages are terminally quarantined — never
-    //     unregistered, never re-registered, never munmapped (the kernel
-    //     reclaims them at process exit). The caller MUST treat the range as
-    //     still registered: route it through UnregisterMemory at teardown,
-    //     which fails to release quarantined pages and keeps the mapping
-    //     pinned instead of munmapping. A later Register of the same range
-    //     extends only over the still-unregistered tail.
+    //     confirmed. The affected pages are terminally quarantined (never
+    //     unregistered/re-registered/munmapped). The caller MUST treat the
+    //     range as still registered and route it through UnregisterMemory at
+    //     teardown; a later Register extends only over the unregistered tail.
     //
     // UnregisterMemory returns OK when the range is fully released (or was
     // never registered by this instance); INTERNAL_ERROR means some pages
-    // could not be released (a failed release also quarantines the page
-    // terminally) and the record is retained so the caller's mapping
-    // quarantines instead of munmapping.
+    // could not be released (which also quarantines them), and the record is
+    // retained so the caller's mapping quarantines instead of munmapping.
     //
     // SPDK requires BOTH vaddr and len to be 2MB-aligned and fails with
     // -EBUSY on already-registered pages (verified against v23.01.1
