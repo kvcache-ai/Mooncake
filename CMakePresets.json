@@ -47,19 +47,7 @@
       "name": "transfer-engine-only",
       "inherits": "base",
       "cacheVariables": {
-        "WITH_STORE": "OFF",
-        "WITH_STORE_RUST": "OFF",
-        "BUILD_EXAMPLES": "ON"
-      }
-    },
-    {
-      "name": "store-only",
-      "inherits": "base",
-      "cacheVariables": {
-        "WITH_TE": "ON",
-        "WITH_STORE": "ON",
-        "WITH_STORE_RUST": "OFF",
-        "BUILD_EXAMPLES": "ON"
+        "WITH_STORE": "OFF"
       }
     }
   ],
@@ -79,10 +67,6 @@
     {
       "name": "transfer-engine-only",
       "configurePreset": "transfer-engine-only"
-    },
-    {
-      "name": "store-only",
-      "configurePreset": "store-only"
     }
   ]
 }
