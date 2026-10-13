@@ -128,7 +128,7 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
     }
 #endif
 
-#ifdef USE_ASCEND
+#if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)
     // The only difference in initializing the Ascend Transport is that the
     // `local_server_name` must include the physical NPU card ID. The format
     // changes from `ip:port` to `ip:port:npu_x`, e.g., `"0.0.0.0:12345:npu_2"`.
