@@ -48,6 +48,8 @@
 #include "common/network.h"
 #include "common/result.h"
 #include "rpc_types.h"
+#include "request_context.h"
+#include "tracing.h"
 #include "file_storage.h"
 #include "device/accelerator_registry.h"
 #include "default_config.h"
@@ -2239,6 +2241,39 @@ int RealClient::start_http_server(int port) {
                                std::string(MOONCAKE_DISPLAY_VERSION) + "\"}";
             resp.add_header("Content-Type", "application/json");
             resp.set_status_and_content(status_type::ok, std::move(body));
+        });
+
+    // Runtime control for whether Backup-role spans are exported. When this
+    // is off, hop-A drops a Backup span and tags the outgoing RequestContext so
+    // hop-B does the same for that request.
+    http_server_->set_http_handler<GET>(
+        "/trace_filter", [](coro_http_request &req, coro_http_response &resp) {
+            (void)req;
+            const bool enabled = IsExportBackupSpansEnabled();
+            resp.add_header("Content-Type", "text/plain");
+            resp.set_status_and_content(status_type::ok,
+                                        enabled ? "export_backup_spans=true"
+                                                : "export_backup_spans=false");
+        });
+    http_server_->set_http_handler<POST>(
+        "/trace_filter", [](coro_http_request &req, coro_http_response &resp) {
+            const auto value = req.get_query_value("export_backup_spans");
+            bool enabled = false;
+            if (value == "true" || value == "1") {
+                enabled = true;
+            } else if (value == "false" || value == "0") {
+                enabled = false;
+            } else {
+                resp.set_status_and_content(
+                    status_type::bad_request,
+                    "export_backup_spans must be true|false|1|0");
+                return;
+            }
+            SetExportBackupSpansEnabled(enabled);
+            resp.add_header("Content-Type", "text/plain");
+            resp.set_status_and_content(status_type::ok,
+                                        enabled ? "export_backup_spans=true"
+                                                : "export_backup_spans=false");
         });
 
     auto ec = http_server_->async_start();
@@ -8505,6 +8540,199 @@ RealClient::batch_get_into_offload_object_internal(
         return tl::make_unexpected(ErrorCode::OBJECT_HAS_LEASE);
     }
     return {};
+}
+
+namespace {
+RequestContext LoadRequestContextAttachment(const std::string &attachment) {
+    RequestContext request_context;
+    if (!attachment.empty()) {
+        request_context = deserialize_request_context(attachment);
+        VLOG(2) << "hop-A bridge request_id=" << request_context.request_id
+                << " trace_id=" << request_context.trace_id
+                << " caller_id=" << caller_id_of(request_context)
+                << " caller_role=" << caller_role_of(request_context);
+    }
+    return request_context;
+}
+
+void SetSpanError(ScopedSpan &span, ErrorCode error) {
+    span.SetError(toString(error));
+}
+
+template <typename T>
+void SetSpanError(ScopedSpan &span, const tl::expected<T, ErrorCode> &result) {
+    if (!result.has_value()) SetSpanError(span, result.error());
+}
+
+template <typename T>
+void SetSpanError(ScopedSpan &span,
+                  const std::vector<tl::expected<T, ErrorCode>> &results) {
+    for (const auto &result : results) {
+        if (!result.has_value()) {
+            SetSpanError(span, result.error());
+            return;
+        }
+    }
+}
+}  // namespace
+
+// Every V3 hop A entry below bridges the incoming out-of-band RequestContext
+// to hop B with the same three invariants:
+//   1. Bridge the request context in this (coro_rpc server) thread's
+//      g_current_ctx so the synchronous master RPC re-attaches the same id.
+//   2. OpenTelemetry: open a hop-A SERVER span as a child of the incoming trace
+//      context, then refresh the request context so the downstream hop-B
+//      (master) attachment carries this span as the parent.
+//   3. Always install a scope (even for an empty attachment / disabled
+//      tracing) so the hop B inject reads THIS request's id, not residue left
+//      on this io thread.
+void RealClient::put_dummy_helper_rpc(
+    coro_rpc::context<tl::expected<void, ErrorCode>> ctx,
+    const std::string &key, std::span<const char> value,
+    const ReplicateConfig &config, const UUID &client_id) {
+    RequestContext request_context = LoadRequestContextAttachment(
+        ctx.get_context_info()->release_request_attachment());
+    ScopedSpan span("mooncake-real-client", "rc.put", &request_context);
+    span.PopulateRequestContext(request_context);
+    CurrentCtxScope guard(std::move(request_context));
+    // Hop B path: put_dummy_helper -> put_internal -> client_->Put ->
+    // master_client_.PutStart.
+    auto result = put_dummy_helper(key, value, config, client_id);
+    SetSpanError(span, result);
+    ctx.response_msg(std::move(result));
+}
+
+void RealClient::put_batch_dummy_helper_rpc(
+    coro_rpc::context<tl::expected<void, ErrorCode>> ctx,
+    const std::vector<std::string> &keys,
+    const std::vector<std::span<const char>> &values,
+    const ReplicateConfig &config, const UUID &client_id) {
+    RequestContext request_context = LoadRequestContextAttachment(
+        ctx.get_context_info()->release_request_attachment());
+    ScopedSpan span("mooncake-real-client", "rc.put_batch", &request_context);
+    span.PopulateRequestContext(request_context);
+    CurrentCtxScope guard(std::move(request_context));
+    // Hop B path: put_batch_dummy_helper -> put_batch_internal ->
+    // client_->BatchPut -> master_client_.BatchPutStart.
+    auto result = put_batch_dummy_helper(keys, values, config, client_id);
+    SetSpanError(span, result);
+    ctx.response_msg(std::move(result));
+}
+
+void RealClient::put_parts_dummy_helper_rpc(
+    coro_rpc::context<tl::expected<void, ErrorCode>> ctx,
+    const std::string &key, std::vector<std::span<const char>> values,
+    const ReplicateConfig &config, const UUID &client_id) {
+    RequestContext request_context = LoadRequestContextAttachment(
+        ctx.get_context_info()->release_request_attachment());
+    ScopedSpan span("mooncake-real-client", "rc.put_parts", &request_context);
+    span.PopulateRequestContext(request_context);
+    CurrentCtxScope guard(std::move(request_context));
+    // Hop B path: put_parts_dummy_helper -> put_parts_internal ->
+    // client_->Put -> master_client_.PutStart.
+    auto result = put_parts_dummy_helper(key, values, config, client_id);
+    SetSpanError(span, result);
+    ctx.response_msg(std::move(result));
+}
+
+void RealClient::batch_get_into_dummy_helper_rpc(
+    coro_rpc::context<std::vector<tl::expected<int64_t, ErrorCode>>> ctx,
+    const std::vector<std::string> &keys,
+    const std::vector<uint64_t> &dummy_buffers,
+    const std::vector<size_t> &sizes, int32_t device_id,
+    const UUID &client_id) {
+    RequestContext request_context = LoadRequestContextAttachment(
+        ctx.get_context_info()->release_request_attachment());
+    ScopedSpan span("mooncake-real-client", "rc.batch_get", &request_context);
+    span.PopulateRequestContext(request_context);
+    CurrentCtxScope guard(std::move(request_context));
+    // Hop B path: batch_get_into_dummy_helper -> batch_get_into_internal
+    // -> client_->BatchQuery -> master_client_.BatchGetReplicaList.
+    auto result = async_simple::coro::syncAwait(batch_get_into_dummy_helper(
+        keys, dummy_buffers, sizes, device_id, client_id));
+    SetSpanError(span, result);
+    ctx.response_msg(std::move(result));
+}
+
+void RealClient::batch_put_from_dummy_helper_rpc(
+    coro_rpc::context<std::vector<tl::expected<void, ErrorCode>>> ctx,
+    const std::vector<std::string> &keys,
+    const std::vector<uint64_t> &dummy_buffers,
+    const std::vector<size_t> &sizes, const ReplicateConfig &config,
+    int32_t device_id, const UUID &client_id) {
+    RequestContext request_context = LoadRequestContextAttachment(
+        ctx.get_context_info()->release_request_attachment());
+    ScopedSpan span("mooncake-real-client", "rc.batch_put_from",
+                    &request_context);
+    span.PopulateRequestContext(request_context);
+    CurrentCtxScope guard(std::move(request_context));
+    // Hop B path: batch_put_from_dummy_helper -> batch_put_from_internal ->
+    // client_->BatchPut -> master_client_.BatchPutStart.
+    auto result = batch_put_from_dummy_helper(keys, dummy_buffers, sizes,
+                                              config, device_id, client_id);
+    SetSpanError(span, result);
+    ctx.response_msg(std::move(result));
+}
+
+void RealClient::remove_internal_rpc(
+    coro_rpc::context<tl::expected<void, ErrorCode>> ctx,
+    const std::string &key, bool force) {
+    RequestContext request_context = LoadRequestContextAttachment(
+        ctx.get_context_info()->release_request_attachment());
+    ScopedSpan span("mooncake-real-client", "rc.remove", &request_context);
+    span.PopulateRequestContext(request_context);
+    CurrentCtxScope guard(std::move(request_context));
+    // Hop B path: remove_internal -> client_->Remove ->
+    // master_client_.Remove.
+    auto result = remove_internal(key, force);
+    SetSpanError(span, result);
+    ctx.response_msg(std::move(result));
+}
+
+void RealClient::isExist_internal_rpc(
+    coro_rpc::context<tl::expected<bool, ErrorCode>> ctx,
+    const std::string &key) {
+    RequestContext request_context = LoadRequestContextAttachment(
+        ctx.get_context_info()->release_request_attachment());
+    ScopedSpan span("mooncake-real-client", "rc.is_exist", &request_context);
+    span.PopulateRequestContext(request_context);
+    CurrentCtxScope guard(std::move(request_context));
+    // Hop B path: isExist_internal -> client_->IsExist ->
+    // master_client_.ExistKey.
+    auto result = isExist_internal(key);
+    SetSpanError(span, result);
+    ctx.response_msg(std::move(result));
+}
+
+void RealClient::batchIsExist_internal_rpc(
+    coro_rpc::context<std::vector<tl::expected<bool, ErrorCode>>> ctx,
+    const std::vector<std::string> &keys) {
+    RequestContext request_context = LoadRequestContextAttachment(
+        ctx.get_context_info()->release_request_attachment());
+    ScopedSpan span("mooncake-real-client", "rc.batch_is_exist",
+                    &request_context);
+    span.PopulateRequestContext(request_context);
+    CurrentCtxScope guard(std::move(request_context));
+    // Hop B path: batchIsExist_internal -> client_->BatchIsExist ->
+    // master_client_.BatchExistKey.
+    auto result = batchIsExist_internal(keys);
+    SetSpanError(span, result);
+    ctx.response_msg(std::move(result));
+}
+
+void RealClient::getSize_internal_rpc(
+    coro_rpc::context<tl::expected<int64_t, ErrorCode>> ctx,
+    const std::string &key) {
+    RequestContext request_context = LoadRequestContextAttachment(
+        ctx.get_context_info()->release_request_attachment());
+    ScopedSpan span("mooncake-real-client", "rc.get_size", &request_context);
+    span.PopulateRequestContext(request_context);
+    CurrentCtxScope guard(std::move(request_context));
+    // Hop B path: getSize_internal -> client_->Query ->
+    // master_client_.GetReplicaList.
+    auto result = getSize_internal(key);
+    SetSpanError(span, result);
+    ctx.response_msg(std::move(result));
 }
 
 ClientRequester::ClientRequester() {

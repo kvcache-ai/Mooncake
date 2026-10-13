@@ -12,6 +12,7 @@
 
 #include "mutex.h"
 #include "rpc_service.h"
+#include "request_context.h"
 #include "types.h"
 #include "common/scoped_vlog_timer.h"
 #include "master_metric_manager.h"
@@ -334,6 +335,84 @@ struct RpcNameTraits<&WrappedMasterService::MarkTaskToComplete> {
     static constexpr const char* value = "MarkTaskToComplete";
 };
 
+// hop B: per-request _with_context handler metric labels aggregate
+// under the base method name so dashboards don't split the rpc.
+template <>
+struct RpcNameTraits<&WrappedMasterService::ExistKey_with_context> {
+    static constexpr const char* value = "ExistKey";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::BatchExistKey_with_context> {
+    static constexpr const char* value = "BatchExistKey";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::BatchReplicaClear_with_context> {
+    static constexpr const char* value = "BatchReplicaClear";
+};
+
+template <>
+struct RpcNameTraits<
+    &WrappedMasterService::GetReplicaListByRegex_with_context> {
+    static constexpr const char* value = "GetReplicaListByRegex";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::GetReplicaList_with_context> {
+    static constexpr const char* value = "GetReplicaList";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::BatchGetReplicaList_with_context> {
+    static constexpr const char* value = "BatchGetReplicaList";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::PutStart_with_context> {
+    static constexpr const char* value = "PutStart";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::PutEnd_with_context> {
+    static constexpr const char* value = "PutEnd";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::PutRevoke_with_context> {
+    static constexpr const char* value = "PutRevoke";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::BatchPutStart_with_context> {
+    static constexpr const char* value = "BatchPutStart";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::BatchPutEnd_with_context> {
+    static constexpr const char* value = "BatchPutEnd";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::BatchPutRevoke_with_context> {
+    static constexpr const char* value = "BatchPutRevoke";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::Remove_with_context> {
+    static constexpr const char* value = "Remove";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::RemoveByRegex_with_context> {
+    static constexpr const char* value = "RemoveByRegex";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::RemoveAll_with_context> {
+    static constexpr const char* value = "RemoveAll";
+};
+
 template <>
 struct RpcNameTraits<&WrappedMasterService::EvictDiskReplica> {
     static constexpr const char* value = "EvictDiskReplica";
@@ -465,6 +544,137 @@ std::vector<tl::expected<ResultType, ErrorCode>> MasterClient::invoke_batch_rpc(
         }());
 }
 
+template <auto ServiceMethod, typename ReturnType, typename... Args>
+tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc_with_context(
+    std::string attachment, Args&&... args) {
+    RpcDrainGuard::ScopedCall inflight(rpc_drain_);
+    if (!inflight.ok()) {
+        return tl::make_unexpected(ErrorCode::RPC_FAIL);
+    }
+
+    auto pool = client_accessor_.GetClientPool();
+    if (metrics_) {
+        metrics_->rpc_count.inc({RpcNameTraits<ServiceMethod>::value});
+    }
+
+    auto start_time = std::chrono::steady_clock::now();
+    return async_simple::coro::syncAwait(
+        [&]() -> async_simple::coro::Lazy<tl::expected<ReturnType, ErrorCode>> {
+            auto ret = co_await pool->send_request(
+                [&](coro_io::client_reuse_hint,
+                    coro_rpc::coro_rpc_client& client) {
+                    return client.send_request_with_attachment<ServiceMethod>(
+                        std::string_view(attachment.data(), attachment.size()),
+                        std::forward<Args>(args)...);
+                });
+            if (!ret.has_value()) {
+                LOG(ERROR) << "Client not available";
+                co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
+            }
+            auto result = co_await std::move(ret.value());
+            if (!result) {
+                const ErrorCode err_code =
+                    (result.error().code == coro_rpc::errc::timed_out)
+                        ? ErrorCode::RPC_TIMEOUT
+                        : ErrorCode::RPC_FAIL;
+                LOG(ERROR) << "RPC call failed: " << result.error().msg;
+                co_return tl::make_unexpected(err_code);
+            }
+            if (metrics_) {
+                auto end_time = std::chrono::steady_clock::now();
+                auto latency =
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        end_time - start_time);
+                metrics_->rpc_latency.observe(
+                    {RpcNameTraits<ServiceMethod>::value}, latency.count());
+            }
+            co_return result->result();
+        }());
+}
+
+template <auto ServiceMethod, typename ResultType, typename... Args>
+std::vector<tl::expected<ResultType, ErrorCode>>
+MasterClient::invoke_batch_rpc_with_context(std::string attachment,
+                                            size_t input_size, Args&&... args) {
+    RpcDrainGuard::ScopedCall inflight(rpc_drain_);
+    if (!inflight.ok()) {
+        return std::vector<tl::expected<ResultType, ErrorCode>>(
+            input_size, tl::make_unexpected(ErrorCode::RPC_FAIL));
+    }
+
+    auto pool = client_accessor_.GetClientPool();
+    if (metrics_) {
+        metrics_->rpc_count.inc({RpcNameTraits<ServiceMethod>::value});
+    }
+
+    auto start_time = std::chrono::steady_clock::now();
+    return async_simple::coro::syncAwait(
+        [&]() -> async_simple::coro::Lazy<
+                  std::vector<tl::expected<ResultType, ErrorCode>>> {
+            auto ret = co_await pool->send_request(
+                [&](coro_io::client_reuse_hint,
+                    coro_rpc::coro_rpc_client& client) {
+                    return client.send_request_with_attachment<ServiceMethod>(
+                        std::string_view(attachment.data(), attachment.size()),
+                        std::forward<Args>(args)...);
+                });
+            if (!ret.has_value()) {
+                LOG(ERROR) << "Client not available";
+                co_return std::vector<tl::expected<ResultType, ErrorCode>>(
+                    input_size, tl::make_unexpected(ErrorCode::RPC_FAIL));
+            }
+            auto result = co_await std::move(ret.value());
+            if (!result) {
+                const ErrorCode err_code =
+                    (result.error().code == coro_rpc::errc::timed_out)
+                        ? ErrorCode::RPC_TIMEOUT
+                        : ErrorCode::RPC_FAIL;
+                LOG(ERROR) << "Batch RPC call failed: " << result.error().msg;
+                std::vector<tl::expected<ResultType, ErrorCode>> error_results;
+                error_results.reserve(input_size);
+                for (size_t i = 0; i < input_size; ++i) {
+                    error_results.emplace_back(tl::make_unexpected(err_code));
+                }
+                co_return error_results;
+            }
+            if (metrics_) {
+                auto end_time = std::chrono::steady_clock::now();
+                auto latency =
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        end_time - start_time);
+                metrics_->rpc_latency.observe(
+                    {RpcNameTraits<ServiceMethod>::value}, latency.count());
+            }
+            co_return result->result();
+        }());
+}
+
+template <auto PlainMethod, auto ContextMethod, typename ReturnType,
+          typename... Args>
+tl::expected<ReturnType, ErrorCode>
+MasterClient::invoke_rpc_with_current_context(Args&&... args) {
+    std::string attachment = current_request_context_attachment();
+    return attachment.empty()
+               ? invoke_rpc<PlainMethod, ReturnType>(
+                     std::forward<Args>(args)...)
+               : invoke_rpc_with_context<ContextMethod, ReturnType>(
+                     std::move(attachment), std::forward<Args>(args)...);
+}
+
+template <auto PlainMethod, auto ContextMethod, typename ResultType,
+          typename... Args>
+std::vector<tl::expected<ResultType, ErrorCode>>
+MasterClient::invoke_batch_rpc_with_current_context(size_t input_size,
+                                                    Args&&... args) {
+    std::string attachment = current_request_context_attachment();
+    return attachment.empty()
+               ? invoke_batch_rpc<PlainMethod, ResultType>(
+                     input_size, std::forward<Args>(args)...)
+               : invoke_batch_rpc_with_context<ContextMethod, ResultType>(
+                     std::move(attachment), input_size,
+                     std::forward<Args>(args)...);
+}
+
 MasterClient::~MasterClient() {
     // Never release the pool under a suspended request coroutine (#3909).
     // 30s is generous: every request carries its own RPC timeout.
@@ -531,8 +741,10 @@ tl::expected<bool, ErrorCode> MasterClient::ExistKey(
     ScopedVLogTimer timer(1, "MasterClient::ExistKey");
     timer.LogRequest("object_key=", object_key);
 
-    auto result = invoke_rpc<&WrappedMasterService::ExistKey, bool>(
-        object_key, tenant_id_.value());
+    auto result = invoke_rpc_with_current_context<
+        &WrappedMasterService::ExistKey,
+        &WrappedMasterService::ExistKey_with_context, bool>(object_key,
+                                                            tenant_id_.value());
     timer.LogResponseExpected(result);
     return result;
 }
@@ -542,7 +754,9 @@ std::vector<tl::expected<bool, ErrorCode>> MasterClient::BatchExistKey(
     ScopedVLogTimer timer(1, "MasterClient::BatchExistKey");
     timer.LogRequest("keys_count=", object_keys.size());
 
-    auto result = invoke_batch_rpc<&WrappedMasterService::BatchExistKey, bool>(
+    auto result = invoke_batch_rpc_with_current_context<
+        &WrappedMasterService::BatchExistKey,
+        &WrappedMasterService::BatchExistKey_with_context, bool>(
         object_keys.size(), object_keys, tenant_id_.value());
     timer.LogResponse("result=", result.size(), " keys");
     return result;
@@ -600,9 +814,11 @@ MasterClient::BatchReplicaClear(const std::vector<std::string>& object_keys,
     timer.LogRequest("object_keys_count=", object_keys.size(),
                      ", client_id=", client_id,
                      ", segment_name=", segment_name);
-    auto result = invoke_rpc<&WrappedMasterService::BatchReplicaClear,
-                             std::vector<std::string>>(
-        object_keys, client_id, segment_name, tenant_id_.value());
+    auto result = invoke_rpc_with_current_context<
+        &WrappedMasterService::BatchReplicaClear,
+        &WrappedMasterService::BatchReplicaClear_with_context,
+        std::vector<std::string>>(object_keys, client_id, segment_name,
+                                  tenant_id_.value());
     timer.LogResponseExpected(result);
     return result;
 }
@@ -613,8 +829,9 @@ MasterClient::GetReplicaListByRegex(const std::string& str) {
     ScopedVLogTimer timer(1, "MasterClient::GetReplicaListByRegex");
     timer.LogRequest("Regex=", str);
 
-    auto result = invoke_rpc<
+    auto result = invoke_rpc_with_current_context<
         &WrappedMasterService::GetReplicaListByRegex,
+        &WrappedMasterService::GetReplicaListByRegex_with_context,
         std::unordered_map<std::string, std::vector<Replica::Descriptor>>>(
         str, tenant_id_.value());
 
@@ -632,8 +849,10 @@ tl::expected<GetReplicaListResponse, ErrorCode> MasterClient::GetReplicaList(
     ScopedVLogTimer timer(1, "MasterClient::GetReplicaList");
     timer.LogRequest("object_key=", object_key, ", tenant_id=", tenant_id);
 
-    auto result = invoke_rpc<&WrappedMasterService::GetReplicaList,
-                             GetReplicaListResponse>(object_key, tenant_id);
+    auto result = invoke_rpc_with_current_context<
+        &WrappedMasterService::GetReplicaList,
+        &WrappedMasterService::GetReplicaList_with_context,
+        GetReplicaListResponse>(object_key, tenant_id);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -650,9 +869,10 @@ MasterClient::BatchGetReplicaList(const std::vector<std::string>& object_keys,
     timer.LogRequest("keys_count=", object_keys.size(),
                      ", tenant_id=", tenant_id);
 
-    auto result = invoke_batch_rpc<&WrappedMasterService::BatchGetReplicaList,
-                                   GetReplicaListResponse>(
-        object_keys.size(), object_keys, tenant_id);
+    auto result = invoke_batch_rpc_with_current_context<
+        &WrappedMasterService::BatchGetReplicaList,
+        &WrappedMasterService::BatchGetReplicaList_with_context,
+        GetReplicaListResponse>(object_keys.size(), object_keys, tenant_id);
     timer.LogResponse("result=", result.size(), " operations");
     return result;
 }
@@ -669,9 +889,11 @@ MasterClient::PutStart(const std::string& key,
         total_slice_length += slice_length;
     }
 
-    auto result = invoke_rpc<&WrappedMasterService::PutStart,
-                             std::vector<Replica::Descriptor>>(
-        client_id_, key, total_slice_length, config, tenant_id_.value());
+    auto result = invoke_rpc_with_current_context<
+        &WrappedMasterService::PutStart,
+        &WrappedMasterService::PutStart_with_context,
+        std::vector<Replica::Descriptor>>(client_id_, key, total_slice_length,
+                                          config, tenant_id_.value());
     timer.LogResponseExpected(result);
     return result;
 }
@@ -694,10 +916,12 @@ MasterClient::BatchPutStart(
         total_slice_lengths.emplace_back(total_slice_length);
     }
 
-    auto result = invoke_batch_rpc<&WrappedMasterService::BatchPutStart,
-                                   std::vector<Replica::Descriptor>>(
-        keys.size(), client_id_, keys, total_slice_lengths, config,
-        tenant_id_.value());
+    auto result = invoke_batch_rpc_with_current_context<
+        &WrappedMasterService::BatchPutStart,
+        &WrappedMasterService::BatchPutStart_with_context,
+        std::vector<Replica::Descriptor>>(keys.size(), client_id_, keys,
+                                          total_slice_lengths, config,
+                                          tenant_id_.value());
     timer.LogResponse("result=", result.size(), " operations");
     return result;
 }
@@ -707,7 +931,9 @@ tl::expected<void, ErrorCode> MasterClient::PutEnd(
     ScopedVLogTimer timer(1, "MasterClient::PutEnd");
     timer.LogRequest("key=", object_meta.key);
 
-    auto result = invoke_rpc<&WrappedMasterService::PutEnd, void>(
+    auto result = invoke_rpc_with_current_context<
+        &WrappedMasterService::PutEnd,
+        &WrappedMasterService::PutEnd_with_context, void>(
         client_id_, object_meta, replica_type, tenant_id_.value());
     timer.LogResponseExpected(result);
     return result;
@@ -718,7 +944,9 @@ std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchPutEnd(
     ScopedVLogTimer timer(1, "MasterClient::BatchPutEnd");
     timer.LogRequest("keys_count=", object_metas.size());
 
-    auto result = invoke_batch_rpc<&WrappedMasterService::BatchPutEnd, void>(
+    auto result = invoke_batch_rpc_with_current_context<
+        &WrappedMasterService::BatchPutEnd,
+        &WrappedMasterService::BatchPutEnd_with_context, void>(
         object_metas.size(), client_id_, object_metas, replica_type,
         tenant_id_.value());
     timer.LogResponse("result=", result.size(), " operations");
@@ -730,7 +958,9 @@ tl::expected<void, ErrorCode> MasterClient::PutRevoke(
     ScopedVLogTimer timer(1, "MasterClient::PutRevoke");
     timer.LogRequest("key=", key);
 
-    auto result = invoke_rpc<&WrappedMasterService::PutRevoke, void>(
+    auto result = invoke_rpc_with_current_context<
+        &WrappedMasterService::PutRevoke,
+        &WrappedMasterService::PutRevoke_with_context, void>(
         client_id_, key, replica_type, tenant_id_.value());
     timer.LogResponseExpected(result);
     return result;
@@ -741,7 +971,9 @@ std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchPutRevoke(
     ScopedVLogTimer timer(1, "MasterClient::BatchPutRevoke");
     timer.LogRequest("keys_count=", keys.size());
 
-    auto result = invoke_batch_rpc<&WrappedMasterService::BatchPutRevoke, void>(
+    auto result = invoke_batch_rpc_with_current_context<
+        &WrappedMasterService::BatchPutRevoke,
+        &WrappedMasterService::BatchPutRevoke_with_context, void>(
         keys.size(), client_id_, keys, replica_type, tenant_id_.value());
     timer.LogResponse("result=", result.size(), " operations");
     return result;
@@ -842,8 +1074,10 @@ tl::expected<void, ErrorCode> MasterClient::Remove(const std::string& key,
     ScopedVLogTimer timer(1, "MasterClient::Remove");
     timer.LogRequest("key=", key, ", force=", force);
 
-    auto result = invoke_rpc<&WrappedMasterService::Remove, void>(
-        key, force, tenant_id_.value());
+    auto result = invoke_rpc_with_current_context<
+        &WrappedMasterService::Remove,
+        &WrappedMasterService::Remove_with_context, void>(key, force,
+                                                          tenant_id_.value());
     timer.LogResponseExpected(result);
     return result;
 }
@@ -853,7 +1087,9 @@ tl::expected<long, ErrorCode> MasterClient::RemoveByRegex(
     ScopedVLogTimer timer(1, "MasterClient::RemoveByRegex");
     timer.LogRequest("key=", str, ", force=", force);
 
-    auto result = invoke_rpc<&WrappedMasterService::RemoveByRegex, long>(
+    auto result = invoke_rpc_with_current_context<
+        &WrappedMasterService::RemoveByRegex,
+        &WrappedMasterService::RemoveByRegex_with_context, long>(
         str, force, tenant_id_.value());
     timer.LogResponseExpected(result);
     return result;
@@ -863,7 +1099,9 @@ tl::expected<long, ErrorCode> MasterClient::RemoveAll(bool force) {
     ScopedVLogTimer timer(1, "MasterClient::RemoveAll");
     timer.LogRequest("action=remove_all_objects, force=", force);
 
-    auto result = invoke_rpc<&WrappedMasterService::RemoveAll, long>(
+    auto result = invoke_rpc_with_current_context<
+        &WrappedMasterService::RemoveAll,
+        &WrappedMasterService::RemoveAll_with_context, long>(
         force, tenant_id_.value());
     timer.LogResponseExpected(result);
     return result;

@@ -31,6 +31,8 @@
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include <ylt/coro_io/coro_io.hpp>
 #include <async_simple/coro/Lazy.h>
+#include <ylt/coro_rpc/coro_rpc_context.hpp>
+#include "request_context.h"
 
 namespace mooncake {
 
@@ -504,13 +506,57 @@ class RealClient : public PyClient {
         const std::string &key, std::vector<std::span<const char>> values,
         const ReplicateConfig &config, const UUID &client_id);
 
+    // Hop A (dummy -> real server) V3 context handlers bridge hop A's
+    // out-of-band attachment into the thread-local context used by the
+    // subsequent hop B master RPC.
+    void put_dummy_helper_rpc(
+        coro_rpc::context<tl::expected<void, ErrorCode>> ctx,
+        const std::string &key, std::span<const char> value,
+        const ReplicateConfig &config, const UUID &client_id);
+
+    // See put_dummy_helper_rpc: V3 hop A entry bridging the request context
+    // to hop B via CurrentCtxScope (master RPC: BatchPutStart).
+    void put_batch_dummy_helper_rpc(
+        coro_rpc::context<tl::expected<void, ErrorCode>> ctx,
+        const std::vector<std::string> &keys,
+        const std::vector<std::span<const char>> &values,
+        const ReplicateConfig &config, const UUID &client_id);
+
+    // See put_dummy_helper_rpc: V3 hop A entry (master RPC: PutStart).
+    void put_parts_dummy_helper_rpc(
+        coro_rpc::context<tl::expected<void, ErrorCode>> ctx,
+        const std::string &key, std::vector<std::span<const char>> values,
+        const ReplicateConfig &config, const UUID &client_id);
+
     async_simple::coro::Lazy<std::vector<tl::expected<int64_t, ErrorCode>>>
     batch_get_into_dummy_helper(const std::vector<std::string> &keys,
                                 const std::vector<uint64_t> &buffers,
                                 const std::vector<size_t> &sizes,
                                 int32_t device_id, const UUID &client_id);
 
+    // Hop A (dummy -> real server) entry. The value-returning
+    // batch_get_into_dummy_helper stays the shared body (also used in-process
+    // by the real path); this wrapper installs a CurrentCtxScope before
+    // syncAwait so the hop B master RPC (BatchQuery -> BatchGetReplicaList)
+    // re-attaches the request context.
+    void batch_get_into_dummy_helper_rpc(
+        coro_rpc::context<std::vector<tl::expected<int64_t, ErrorCode>>> ctx,
+        const std::vector<std::string> &keys,
+        const std::vector<uint64_t> &dummy_buffers,
+        const std::vector<size_t> &sizes, int32_t device_id,
+        const UUID &client_id);
+
     std::vector<tl::expected<void, ErrorCode>> batch_put_from_dummy_helper(
+        const std::vector<std::string> &keys,
+        const std::vector<uint64_t> &dummy_buffers,
+        const std::vector<size_t> &sizes, const ReplicateConfig &config,
+        int32_t device_id, const UUID &client_id);
+
+    // Hop A (dummy -> real server) entry for the value-returning
+    // batch_put_from_dummy_helper body; bridges the request context to hop B
+    // through the synchronous master RPC (BatchPut -> BatchPutStart).
+    void batch_put_from_dummy_helper_rpc(
+        coro_rpc::context<std::vector<tl::expected<void, ErrorCode>>> ctx,
         const std::vector<std::string> &keys,
         const std::vector<uint64_t> &dummy_buffers,
         const std::vector<size_t> &sizes, const ReplicateConfig &config,
@@ -781,6 +827,15 @@ class RealClient : public PyClient {
     tl::expected<void, ErrorCode> remove_internal(const std::string &key,
                                                   bool force = false);
 
+    // V3 hop A entry (dummy path only). remove_internal stays the
+    // value-returning body used in-process by the real path; this wrapper
+    // reads the attachment, installs a CurrentCtxScope for the hop B bridge
+    // (master RPC: Remove), delegates to the body, and replies via
+    // ctx.response_msg.
+    void remove_internal_rpc(
+        coro_rpc::context<tl::expected<void, ErrorCode>> ctx,
+        const std::string &key, bool force);
+
     tl::expected<long, ErrorCode> removeByRegex_internal(const std::string &str,
                                                          bool force = false);
 
@@ -796,12 +851,39 @@ class RealClient : public PyClient {
     std::vector<tl::expected<bool, ErrorCode>> batchIsExist_internal(
         const std::vector<std::string> &keys);
 
+    // V3 hop A entry (dummy path only). isExist_internal stays the
+    // value-returning body used in-process by the real path; this wrapper
+    // reads the attachment, installs a CurrentCtxScope for the hop B bridge
+    // (master RPC: ExistKey), delegates to the body, and replies via
+    // ctx.response_msg.
+    void isExist_internal_rpc(
+        coro_rpc::context<tl::expected<bool, ErrorCode>> ctx,
+        const std::string &key);
+
+    // V3 hop A entry (dummy path only). batchIsExist_internal stays the
+    // value-returning body used in-process by the real path; this wrapper
+    // reads the attachment, installs a CurrentCtxScope for the hop B bridge
+    // (master RPC: BatchExistKey), delegates to the body, and replies via
+    // ctx.response_msg.
+    void batchIsExist_internal_rpc(
+        coro_rpc::context<std::vector<tl::expected<bool, ErrorCode>>> ctx,
+        const std::vector<std::string> &keys);
+
     tl::expected<bool, ErrorCode> probeKey_internal(const std::string &key);
 
     std::vector<tl::expected<bool, ErrorCode>> batchProbeKey_internal(
         const std::vector<std::string> &keys);
 
     tl::expected<int64_t, ErrorCode> getSize_internal(const std::string &key);
+
+    // V3 hop A entry (dummy path only). getSize_internal stays the
+    // value-returning body used in-process by the real path; this wrapper
+    // reads the attachment, installs a CurrentCtxScope for the hop B bridge
+    // (master RPC: GetReplicaList via Query), delegates to the body, and
+    // replies via ctx.response_msg.
+    void getSize_internal_rpc(
+        coro_rpc::context<tl::expected<int64_t, ErrorCode>> ctx,
+        const std::string &key);
 
     std::shared_ptr<BufferHandle> get_buffer_internal(
         const std::string &key,
