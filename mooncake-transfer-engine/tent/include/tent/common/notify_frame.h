@@ -19,6 +19,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <string>
@@ -95,9 +96,14 @@ class NotifyDedupFilter {
     using Clock = std::chrono::steady_clock;
     static constexpr size_t kPruneEvery = 4096;
 
+    // What a filter refuses or gives up, one at a time: the metrics are
+    // process-wide, while expired() and evicted() count this filter alone.
+    enum class Drop { Duplicate, Expired, HoleExpired, HoleEvicted };
+
     struct Config {
         std::chrono::milliseconds ttl{600000};
         size_t max_holes = 65536;
+        std::function<void(Drop)> on_drop;  // called under the filter's lock
     };
 
     void configure(const Config& config);
@@ -129,7 +135,7 @@ class NotifyDedupFilter {
 
     void pruneLocked(Clock::time_point now);
     void giveUpLocked(uint64_t session, Holes& holes, Holes::iterator hole,
-                      std::atomic<size_t>& counter);
+                      Drop drop);
 
     std::mutex mutex_;
     Config config_;

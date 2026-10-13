@@ -20,6 +20,7 @@
 // so a notification that arrived over RPC is not stranded in a queue nobody
 // polls. Stand-in transports keep this free of any NIC or metadata server.
 
+#include <glog/logging.h>
 #include <gtest/gtest.h>
 
 #include <atomic>
@@ -768,6 +769,60 @@ TEST(NotificationFallbackTest, ReopenedSegmentDoesNotRepeatAStamp) {
     NotifyDedupFilter receiver;
     EXPECT_TRUE(receiver.admit(rdma->sent[0].session, rdma->sent[0].seq));
     EXPECT_TRUE(receiver.admit(rdma->sent[1].session, rdma->sent[1].seq));
+}
+
+// Nothing takes a Notify RPC before the engine registers its callback or
+// after teardown clears it.
+TEST(NotificationFallbackTest, ANotifyRpcWithNoCallbackIsLogged) {
+    ControlService service("p2p", "", nullptr);
+    uint16_t port = 0;
+    ASSERT_TRUE(service.start(port).ok());
+    const std::string addr = "127.0.0.1:" + std::to_string(port);
+    // 100 drops: LOG_EVERY_N(100) logs one of them, whatever ran before.
+    const auto warnings = google::LogMessage::num_messages(google::WARNING);
+    for (int i = 0; i < 100; ++i)
+        (void)ControlClient::notify(addr, makeNotification("lost"));
+    EXPECT_GE(google::LogMessage::num_messages(google::WARNING) - warnings, 1);
+}
+
+// One poll that refuses copies logs once; 100 polls log at least once.
+TEST(NotificationFallbackTest, ACopyRefusedInAPollIsLogged) {
+    TransferEngineImpl engine(makeConfig());
+    ASSERT_TRUE(engine.available());
+    auto rdma = installStub(engine, RDMA, "<rdma>", Status::OK());
+    Notification copy = makeNotification("once");
+    copy.session = 7;
+    copy.seq = 1;
+    std::vector<Notification> received;
+    rdma->queued = {copy};
+    ASSERT_TRUE(engine.receiveNotification(received).ok());
+    ASSERT_EQ(received.size(), 1u);
+    const auto warnings = google::LogMessage::num_messages(google::WARNING);
+    for (int i = 0; i < 100; ++i) {
+        rdma->queued = {copy};
+        (void)engine.receiveNotification(received);
+        EXPECT_TRUE(received.empty());
+    }
+    EXPECT_GE(google::LogMessage::num_messages(google::WARNING) - warnings, 1);
+}
+
+// The engine's own queue refuses a copy on arrival, not in the poll.
+TEST(NotificationFallbackTest, ACopyRefusedOnArrivalIsLogged) {
+    TransferEngineImpl receiver(makeConfig());
+    ASSERT_TRUE(receiver.available());
+    Notification copy = makeNotification("once");
+    copy.session = 7;
+    copy.seq = 1;
+    const std::string addr = receiver.getSegmentName();
+    ASSERT_TRUE(ControlClient::notify(addr, copy).ok());
+    const auto warnings = google::LogMessage::num_messages(google::WARNING);
+    for (int i = 0; i < 100; ++i)
+        ASSERT_TRUE(ControlClient::notify(addr, copy).ok());
+    EXPECT_GE(google::LogMessage::num_messages(google::WARNING) - warnings, 1);
+    std::vector<Notification> received;
+    ASSERT_TRUE(receiver.receiveNotification(received).ok());
+    ASSERT_EQ(received.size(), 1u);
+    EXPECT_EQ(received[0].msg, "once");
 }
 
 }  // namespace tent

@@ -36,6 +36,7 @@
 #include "tent/common/types.h"
 #include "tent/common/utils/os.h"
 #include "tent/common/utils/string_builder.h"
+#include "tent/metrics/tent_metrics.h"
 #include "tent/runtime/control_plane.h"
 #include "tent/thirdparty/nlohmann/json.h"
 #include "tent/transport/rdma/context.h"
@@ -372,6 +373,7 @@ void RdmaEndPoint::beginDestroyNoLock() {
         notify_connected_ = false;
         notify_send_cv_.notify_all();
         drained = takeResendableNoLock();
+        uncountNotifySendsNoLock();
     }
     requeueDrained(std::move(drained));
 
@@ -1418,6 +1420,13 @@ bool RdmaEndPoint::sendNotification(const Notification& notifi,
             wr.wr_id, PendingNotify{track->target, notifi, track->attempts,
                                     track->last_path, track->first_failed});
     }
+#if TENT_METRICS_ENABLED
+    if (notify_posts_.empty()) notify_posts_.resize(kNotifyMaxPendingSends);
+    notify_posts_[wr.wr_id % kNotifyMaxPendingSends] = {
+        wr.wr_id, std::chrono::steady_clock::now()};
+    ++notify_sends_counted_;
+    TENT_ADD_NOTIFY_INFLIGHT(1);
+#endif
     notify_pending_count_++;
     notify_inflight_.fetch_add(1, std::memory_order_release);
     return true;
@@ -1428,6 +1437,8 @@ bool RdmaEndPoint::handleNotifyRecv(size_t buffer_idx, size_t byte_len) {
     if (!notify_recv_mr_) {
         // The endpoint was deconstructed while this completion was in the
         // worker's batch. Rare, and not a malformed completion.
+        TENT_RECORD_NOTIFY_DROPPED(
+            TentMetrics::NotifyDropReason::RecvEndpointGone, 1);
         LOG_EVERY_N(WARNING, 100)
             << "Notification dropped: endpoint " << endpoint_name_
             << " was torn down before the completion was handled";
@@ -1461,6 +1472,8 @@ bool RdmaEndPoint::handleNotifyRecv(size_t buffer_idx, size_t byte_len) {
             decodeNotifyPayload(data, byte_len, &notifi.name, &notifi.msg);
     }
     if (!decoded) {
+        TENT_RECORD_NOTIFY_DROPPED(TentMetrics::NotifyDropReason::RecvDecode,
+                                   1);
         LOG(ERROR) << "Invalid notification message size or format: "
                    << byte_len;
         rearmNotifyRecv(buffer_idx);
@@ -1483,6 +1496,19 @@ void RdmaEndPoint::handleNotifySendComplete(uint64_t wr_id) {
         notify_send_stalled_ = false;
         notify_send_cv_.notify_one();
     }
+#if TENT_METRICS_ENABLED
+    if (notify_sends_counted_ > 0) {
+        --notify_sends_counted_;
+        TENT_ADD_NOTIFY_INFLIGHT(-1);
+    }
+    if (notify_posts_.empty()) return;
+    auto& post = notify_posts_[wr_id % kNotifyMaxPendingSends];
+    if (post.wr_id != wr_id) return;  // its slot was taken since
+    post.wr_id = UINT64_MAX;
+    const std::chrono::duration<double, std::micro> acked =
+        std::chrono::steady_clock::now() - post.at;
+    TENT_RECORD_NOTIFY_ACK_LATENCY(acked.count());
+#endif
 }
 
 void RdmaEndPoint::disableNotification(const std::string& reason) {
@@ -1493,6 +1519,7 @@ void RdmaEndPoint::disableNotification(const std::string& reason) {
         if (!notify_connected_.exchange(false)) return;
         notify_send_cv_.notify_all();
         drained = takeResendableNoLock();
+        uncountNotifySendsNoLock();
     }
     LOG(WARNING) << "Notifications disabled on endpoint " << endpoint_name_
                  << ", data path kept alive: " << reason;
@@ -1509,6 +1536,13 @@ std::vector<PendingNotify> RdmaEndPoint::takeResendableNoLock() {
         drained.push_back(std::move(entry.second));
     notify_resendable_.clear();
     return drained;
+}
+
+void RdmaEndPoint::uncountNotifySendsNoLock() {
+#if TENT_METRICS_ENABLED
+    if (notify_sends_counted_ == 0) return;
+    TENT_ADD_NOTIFY_INFLIGHT(-std::exchange(notify_sends_counted_, 0));
+#endif
 }
 
 void RdmaEndPoint::requeueDrained(std::vector<PendingNotify>&& drained) {

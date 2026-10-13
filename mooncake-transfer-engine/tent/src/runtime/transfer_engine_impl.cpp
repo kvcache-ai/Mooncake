@@ -125,6 +125,29 @@ std::chrono::milliseconds clampedSetting(const char* key, int64_t ms,
     LOG(WARNING) << key << " " << ms << " clamped to " << max.count();
     return max;
 }
+
+#if TENT_METRICS_ENABLED
+TentMetrics::NotifyPath notifyPathOf(size_t type) {
+    if (type == static_cast<size_t>(RDMA)) return TentMetrics::NotifyPath::Rdma;
+    if (type == static_cast<size_t>(HP_TCP))
+        return TentMetrics::NotifyPath::HpTcp;
+    return TentMetrics::NotifyPath::Tcp;
+}
+
+void recordDedupDrop(NotifyDedupFilter::Drop drop) {
+    using Drop = NotifyDedupFilter::Drop;
+    auto& metrics = TentMetrics::instance();
+    if (drop == Drop::Duplicate || drop == Drop::Expired) {
+        metrics.recordNotifyDedupDropped(
+            drop == Drop::Expired ? TentMetrics::NotifyDedupReason::Expired
+                                  : TentMetrics::NotifyDedupReason::Duplicate);
+    } else {
+        metrics.recordNotifyHoleDropped(
+            drop == Drop::HoleExpired ? TentMetrics::NotifyHoleReason::Ttl
+                                      : TentMetrics::NotifyHoleReason::Cap);
+    }
+}
+#endif
 }  // namespace
 
 struct PreservedTentConfigOverrides {
@@ -483,6 +506,9 @@ Status TransferEngineImpl::construct() {
             conf_->get("notification/dedup_max_holes", int64_t{65536});
         if (ttl_ms > 0) dedup.ttl = std::chrono::milliseconds(ttl_ms);
         if (max_holes > 0) dedup.max_holes = static_cast<size_t>(max_holes);
+#if TENT_METRICS_ENABLED
+        dedup.on_drop = recordDedupDrop;
+#endif
         notify_dedup_.configure(dedup);
     }
     {
@@ -586,11 +612,13 @@ Status TransferEngineImpl::construct() {
     // transports register their own in install() below and take over.
     metadata_->setNotifyCallback([this](const Notification& notifi) -> int {
         // A copy may also arrive over the notify QP; the window sees both.
-        if (notify_proto_ != 0 &&
-            !notify_dedup_.admit(notifi.session, notifi.seq))
-            return 0;
+        const bool fresh = notify_proto_ == 0 ||
+                           notify_dedup_.admit(notifi.session, notifi.seq);
+        if (!fresh) noteRefusedNotifications(1);
         std::lock_guard<std::mutex> lk(local_notifi_mutex_);
-        local_notifi_list_.push_back(notifi);
+        if (fresh) local_notifi_list_.push_back(notifi);
+        TENT_RECORD_NOTIFY_RECEIVED(TentMetrics::NotifyQueue::RecvLocal,
+                                    local_notifi_list_.size());
         return 0;
     });
 
@@ -741,10 +769,13 @@ Status TransferEngineImpl::deconstruct() {
         if (notify_outbox_size_ > 0) {
             notify_outbox_dropped_shutdown_.fetch_add(
                 notify_outbox_size_, std::memory_order_relaxed);
+            TENT_RECORD_NOTIFY_DROPPED(TentMetrics::NotifyDropReason::Shutdown,
+                                       notify_outbox_size_);
             LOG(WARNING) << "Dropped " << notify_outbox_size_
                          << " undelivered notification(s) at shutdown";
             notify_outbox_.clear();
             notify_outbox_size_ = 0;
+            TENT_SET_NOTIFY_QUEUE_DEPTH(TentMetrics::NotifyQueue::Outbox, 0);
         }
     }
 
@@ -3267,6 +3298,11 @@ Status TransferEngineImpl::maybeFireSubmitHooks(Batch* batch, bool check) {
     for (auto& hook : batch->submit_hooks) {
         if (hook.fired) continue;
         if (check && !hookIntervalCompleted(*batch, hook)) continue;
+#if TENT_METRICS_ENABLED
+        const auto completed_at = std::chrono::steady_clock::now();
+#else
+        const std::chrono::steady_clock::time_point completed_at{};
+#endif
         // A target leaves the set once handled, so whatever throws, a later
         // poll does not notify the ones before it again.
         while (!hook.targets.empty()) {
@@ -3274,7 +3310,7 @@ Status TransferEngineImpl::maybeFireSubmitHooks(Batch* batch, bool check) {
             if (target == LOCAL_SEGMENT_ID)
                 (void)sendNotification(target, hook.notifi);
             else
-                fireBoundNotification(target, hook.notifi);
+                fireBoundNotification(target, hook.notifi, completed_at);
             hook.targets.erase(hook.targets.begin());
         }
         hook.fired = true;
@@ -3282,21 +3318,24 @@ Status TransferEngineImpl::maybeFireSubmitHooks(Batch* batch, bool check) {
     return Status::OK();
 }
 
-void TransferEngineImpl::fireBoundNotification(SegmentID target_id,
-                                               const Notification& notifi) {
+void TransferEngineImpl::fireBoundNotification(
+    SegmentID target_id, const Notification& notifi,
+    std::chrono::steady_clock::time_point completed_at) {
     // One try over a channel already up, as this runs under a poller's batch
     // lock; the rest queues behind what the outbox holds for this peer.
     Notification stamped = stampNotification(target_id, notifi);
     if (outboxHolds(target_id)) {
-        enqueueOutbox(target_id, std::move(stamped));
+        enqueueOutbox(target_id, std::move(stamped), completed_at);
         return;
     }
     Status status;
     try {
-        status = sendNotificationOnce(target_id, stamped, true);
+        status = sendNotificationOnce(target_id, stamped, true, completed_at);
     } catch (const std::exception& e) {
         // E.g. a msg the RPC leg cannot encode; a retry would throw again.
         const uint64_t dropped = ++notify_outbox_dropped_encode_;
+        TENT_RECORD_NOTIFY_DROPPED(TentMetrics::NotifyDropReason::OutboxEncode,
+                                   1);
         LOG_EVERY_N(WARNING, 100)
             << "Dropped a notification to segment " << target_id << ", "
             << dropped << " unencodable so far: " << e.what();
@@ -3304,10 +3343,12 @@ void TransferEngineImpl::fireBoundNotification(SegmentID target_id,
     }
     if (status.ok()) return;
     if (!status.IsInvalidArgument()) {
-        enqueueOutbox(target_id, std::move(stamped));
+        enqueueOutbox(target_id, std::move(stamped), completed_at);
         return;
     }
     const uint64_t dropped = ++notify_outbox_dropped_unretryable_;
+    TENT_RECORD_NOTIFY_DROPPED(TentMetrics::NotifyDropReason::OutboxUnretryable,
+                               1);
     LOG(WARNING) << "sendNotification failed, " << dropped
                  << " unretryable so far: " << status.ToString();
 }
@@ -3648,6 +3689,9 @@ Status TransferEngineImpl::sendNotification(SegmentID target_id,
         // polls forever.
         std::lock_guard<std::mutex> lk(local_notifi_mutex_);
         local_notifi_list_.push_back(notifi);
+        TENT_RECORD_NOTIFY_SENT(TentMetrics::NotifyPath::Local, {});
+        TENT_RECORD_NOTIFY_RECEIVED(TentMetrics::NotifyQueue::RecvLocal,
+                                    local_notifi_list_.size());
         return Status::OK();
     }
     return sendNotificationOnce(target_id, stampNotification(target_id, notifi),
@@ -3666,9 +3710,9 @@ Notification TransferEngineImpl::stampNotification(SegmentID target_id,
     return to_send;
 }
 
-Status TransferEngineImpl::sendNotificationOnce(SegmentID target_id,
-                                                const Notification& to_send,
-                                                bool hook_path) {
+Status TransferEngineImpl::sendNotificationOnce(
+    SegmentID target_id, const Notification& to_send, bool hook_path,
+    std::chrono::steady_clock::time_point completed_at) {
     // Transports are tried in slot order, RDMA before TCP, so with TCP loaded
     // the fallback is its own RPC-based sendNotification(); the explicit RPC
     // below is for engines without one. Only a transport whose channel is
@@ -3688,6 +3732,8 @@ Status TransferEngineImpl::sendNotificationOnce(SegmentID target_id,
         // A transport that advertises notifications without implementing
         // them (SunriseLink) is not a channel at all.
         if (attempt.IsNotImplemented()) continue;
+        if (attempt.ok())
+            TENT_RECORD_NOTIFY_SENT(notifyPathOf(type), completed_at);
         if (hook_path) return attempt;
         attempted = true;
         status = attempt;
@@ -3706,7 +3752,10 @@ Status TransferEngineImpl::sendNotificationOnce(SegmentID target_id,
         return Status::InvalidArgument("Notification not supported" LOC_MARK);
     // Every loaded notification transport reported its channel unavailable;
     // the control plane the peer answers bootstrap on is still there.
-    return sendNotificationViaRpc(target_id, to_send);
+    status = sendNotificationViaRpc(target_id, to_send);
+    if (status.ok())
+        TENT_RECORD_NOTIFY_SENT(TentMetrics::NotifyPath::Rpc, completed_at);
+    return status;
 }
 
 Status TransferEngineImpl::sendNotificationViaRpc(SegmentID target_id,
@@ -3723,8 +3772,9 @@ bool TransferEngineImpl::outboxHolds(SegmentID target_id) {
            notify_outbox_.count(target_id) != 0;
 }
 
-void TransferEngineImpl::enqueueOutbox(SegmentID target_id,
-                                       Notification notifi) {
+void TransferEngineImpl::enqueueOutbox(
+    SegmentID target_id, Notification notifi,
+    std::chrono::steady_clock::time_point completed_at) {
     {
         std::lock_guard<std::mutex> lock(notify_outbox_mutex_);
         while (notify_outbox_size_ >= notify_outbox_max_ &&
@@ -3740,14 +3790,18 @@ void TransferEngineImpl::enqueueOutbox(SegmentID target_id,
             if (oldest->second.empty()) notify_outbox_.erase(oldest);
             --notify_outbox_size_;
             const uint64_t dropped = ++notify_outbox_dropped_full_;
+            TENT_RECORD_NOTIFY_DROPPED(
+                TentMetrics::NotifyDropReason::OutboxFull, 1);
             LOG_EVERY_N(WARNING, 100)
                 << "Notification outbox full at " << notify_outbox_max_
                 << ", dropped the oldest, " << dropped << " so far";
         }
         const auto now = notify_outbox_clock_();
-        notify_outbox_[target_id].push_back(
-            OutboxEntry{target_id, std::move(notifi), now, now});
+        notify_outbox_[target_id].push_back(OutboxEntry{
+            target_id, std::move(notifi), now, now, 0, completed_at});
         ++notify_outbox_size_;
+        TENT_SET_NOTIFY_QUEUE_DEPTH(TentMetrics::NotifyQueue::Outbox,
+                                    notify_outbox_size_);
         if (notify_outbox_running_ && !notify_outbox_worker_.joinable()) {
             notify_outbox_worker_ =
                 std::thread(&TransferEngineImpl::notifyOutboxThread, this);
@@ -3766,10 +3820,15 @@ void TransferEngineImpl::notifyOutboxThread() {
             --notify_outbox_size_;
             any = true;
             const uint64_t dropped = ++notify_outbox_dropped_deadline_;
+            TENT_RECORD_NOTIFY_DROPPED(
+                TentMetrics::NotifyDropReason::OutboxDeadline, 1);
             LOG_EVERY_N(WARNING, 100)
                 << "Dropped a notification to segment " << target
                 << " past the outbox deadline, " << dropped << " so far";
         }
+        if (any)
+            TENT_SET_NOTIFY_QUEUE_DEPTH(TentMetrics::NotifyQueue::Outbox,
+                                        notify_outbox_size_);
         return any;
     };
     std::unique_lock<std::mutex> lock(notify_outbox_mutex_);
@@ -3823,25 +3882,34 @@ void TransferEngineImpl::notifyOutboxThread() {
             lock.unlock();
             Status status;
             try {
-                status = sendNotificationOnce(target, entry.notifi, false);
+                status = sendNotificationOnce(target, entry.notifi, false,
+                                              entry.completed_at);
             } catch (const std::exception& e) {
                 // E.g. a msg the RPC leg cannot encode: nothing above us
                 // catches it, and a retry would throw again.
                 const uint64_t dropped = ++notify_outbox_dropped_encode_;
+                TENT_RECORD_NOTIFY_DROPPED(
+                    TentMetrics::NotifyDropReason::OutboxEncode, 1);
                 LOG_EVERY_N(WARNING, 100)
                     << "Dropped a notification to segment " << target << ", "
                     << dropped << " unencodable so far: " << e.what();
                 lock.lock();
                 notify_outbox_sending_.reset();
                 --notify_outbox_size_;
+                TENT_SET_NOTIFY_QUEUE_DEPTH(TentMetrics::NotifyQueue::Outbox,
+                                            notify_outbox_size_);
                 continue;
             }
             lock.lock();
             notify_outbox_sending_.reset();
             if (status.ok() || status.IsInvalidArgument()) {
                 --notify_outbox_size_;
+                TENT_SET_NOTIFY_QUEUE_DEPTH(TentMetrics::NotifyQueue::Outbox,
+                                            notify_outbox_size_);
                 if (status.ok()) continue;
                 const uint64_t dropped = ++notify_outbox_dropped_unretryable_;
+                TENT_RECORD_NOTIFY_DROPPED(
+                    TentMetrics::NotifyDropReason::OutboxUnretryable, 1);
                 LOG_EVERY_N(WARNING, 100)
                     << "Dropped a notification to segment " << target << ", "
                     << dropped << " unretryable so far: " << status.ToString();
@@ -3864,6 +3932,15 @@ Status TransferEngineImpl::probePeerAliveByID(SegmentID target_id) {
         target_id, [&](const std::string& rpc_server_addr) {
             return ControlClient::probe(rpc_server_addr);
         });
+}
+
+void TransferEngineImpl::noteRefusedNotifications(uint64_t count) {
+    const uint64_t refused =
+        notify_dedup_dropped_.fetch_add(count, std::memory_order_relaxed) +
+        count;
+    LOG_EVERY_N(WARNING, 100)
+        << "Dropped notifications delivered before or given up on, " << refused
+        << " so far";
 }
 
 Status TransferEngineImpl::receiveNotification(
@@ -3907,12 +3984,7 @@ Status TransferEngineImpl::receiveNotification(
                 return !notify_dedup_.admit(n.session, n.seq);
             });
         if (dup != notifi_list.end()) {
-            notify_dedup_dropped_.fetch_add(notifi_list.end() - dup,
-                                            std::memory_order_relaxed);
-            LOG_EVERY_N(WARNING, 100)
-                << "Dropped notifications delivered before or given up on, "
-                << notify_dedup_dropped_.load(std::memory_order_relaxed)
-                << " so far";
+            noteRefusedNotifications(notifi_list.end() - dup);
             notifi_list.erase(dup, notifi_list.end());
         }
     }
@@ -3927,6 +3999,7 @@ Status TransferEngineImpl::receiveNotification(
                 std::make_move_iterator(local_notifi_list_.begin()),
                 std::make_move_iterator(local_notifi_list_.end()));
             local_notifi_list_.clear();
+            TENT_SET_NOTIFY_QUEUE_DEPTH(TentMetrics::NotifyQueue::RecvLocal, 0);
         }
     }
     // Whatever landed in the list has been consumed from its queue, so the

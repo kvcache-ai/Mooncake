@@ -12,6 +12,7 @@
 #include <glog/logging.h>
 
 #include "tent/common/config.h"
+#include "tent/metrics/tent_metrics.h"
 #include "tent/runtime/platform.h"
 #include "tent/runtime/slab.h"
 
@@ -367,6 +368,8 @@ Status HighPerformanceTcpTransport::install(
     metadata_->setNotifyCallback([this](const Notification& notification) {
         RWSpinlock::WriteGuard guard(notify_lock_);
         notifications_.push_back(notification);
+        TENT_RECORD_NOTIFY_RECEIVED(TentMetrics::NotifyQueue::RecvHpTcp,
+                                    notifications_.size());
         return 0;
     });
     installed_.store(true, std::memory_order_release);
@@ -959,6 +962,8 @@ Status HighPerformanceTcpTransport::receiveNotification(
     RWSpinlock::WriteGuard guard(notify_lock_);
     notifications.clear();
     notifications.swap(notifications_);
+    if (!notifications.empty())
+        TENT_SET_NOTIFY_QUEUE_DEPTH(TentMetrics::NotifyQueue::RecvHpTcp, 0);
     return Status::OK();
 }
 

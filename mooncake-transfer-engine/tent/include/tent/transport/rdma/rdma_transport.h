@@ -293,6 +293,7 @@ class RdmaTransport : public Transport {
     bool notify_path_probe_ = true;
     std::chrono::milliseconds notify_resend_deadline_{120000};
     std::atomic<uint64_t> notify_resend_dropped_{0};
+    void setResendDepthsLocked();
 
     // Maps the reason getEndpoint() could not hand out a notify-capable
     // endpoint to what sendNotification() reports. A bootstrap RPC that

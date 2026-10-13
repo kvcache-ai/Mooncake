@@ -202,11 +202,14 @@ bool NotifyDedupFilter::admit(uint64_t session, uint64_t seq,
         state.max_seq = seq;
     } else {
         auto hole = state.holes.upper_bound(seq);
-        if (hole == state.holes.begin() || seq >= std::prev(hole)->second.hi)
+        if (hole == state.holes.begin() || seq >= std::prev(hole)->second.hi) {
+            if (config_.on_drop) config_.on_drop(Drop::Duplicate);
             return false;  // delivered before
+        }
         --hole;
         if (outlived(hole->second.created, now, config_.ttl)) {
-            giveUpLocked(session, state.holes, hole, expired_);
+            giveUpLocked(session, state.holes, hole, Drop::HoleExpired);
+            if (config_.on_drop) config_.on_drop(Drop::Expired);
             return false;
         }
         const Hole whole = hole->second;
@@ -223,7 +226,8 @@ bool NotifyDedupFilter::admit(uint64_t session, uint64_t seq,
         }
     }
     while (state.holes.size() > config_.max_holes)
-        giveUpLocked(session, state.holes, state.holes.begin(), evicted_);
+        giveUpLocked(session, state.holes, state.holes.begin(),
+                     Drop::HoleEvicted);
     return true;
 }
 
@@ -243,7 +247,7 @@ void NotifyDedupFilter::pruneLocked(Clock::time_point now) {
         auto& holes = it->second.holes;
         while (!holes.empty() &&
                outlived(holes.begin()->second.created, now, config_.ttl))
-            giveUpLocked(it->first, holes, holes.begin(), expired_);
+            giveUpLocked(it->first, holes, holes.begin(), Drop::HoleExpired);
         if (outlived(it->second.last_seen, now, forget_after)) {
             it = sessions_.erase(it);
         } else {
@@ -253,10 +257,11 @@ void NotifyDedupFilter::pruneLocked(Clock::time_point now) {
 }
 
 void NotifyDedupFilter::giveUpLocked(uint64_t session, Holes& holes,
-                                     Holes::iterator hole,
-                                     std::atomic<size_t>& counter) {
+                                     Holes::iterator hole, Drop drop) {
     if (!hole->second.before_first) {
+        auto& counter = drop == Drop::HoleExpired ? expired_ : evicted_;
         counter.fetch_add(1, std::memory_order_relaxed);
+        if (config_.on_drop) config_.on_drop(drop);
         LOG_EVERY_N(WARNING, 100)
             << "Gave up on notifications " << hole->first << ".."
             << hole->second.hi - 1 << " of session " << session << ", "
