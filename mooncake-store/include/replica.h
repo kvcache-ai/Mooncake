@@ -124,12 +124,47 @@ struct ReplicateConfig {
     // eviction treats the group as a unit (all-or-none). Object routing is
     // always hash(tenant, key) and is decoupled from groups.
     std::optional<std::vector<std::string>> group_ids{};
+    // Best-effort receiver affinity. A matching range is local to every
+    // named HCA on that receiver; NUMA IDs are never compared across hosts.
+    struct_pack::compatible<std::vector<std::string>, 1> preferred_hca_names;
+    // Batch hints follow the key order; an empty entry means no preference.
+    struct_pack::compatible<std::vector<std::vector<std::string>>, 2>
+        per_key_preferred_hca_names;
+
+    bool HasValidKeyHints(size_t key_count) const {
+        return (!group_ids || group_ids->size() == key_count) &&
+               (!per_key_preferred_hca_names ||
+                per_key_preferred_hca_names->size() == key_count);
+    }
+
+    ReplicateConfig ForKeySubset(const std::vector<size_t>& indices) const {
+        ReplicateConfig result = *this;
+        if (group_ids) {
+            result.group_ids = std::vector<std::string>{};
+            for (auto index : indices)
+                result.group_ids->push_back(group_ids->at(index));
+        }
+        if (per_key_preferred_hca_names) {
+            result.per_key_preferred_hca_names =
+                std::vector<std::vector<std::string>>{};
+            for (auto index : indices) {
+                result.per_key_preferred_hca_names->push_back(
+                    per_key_preferred_hca_names->at(index));
+            }
+        }
+        return result;
+    }
 
     ReplicateConfig ForSingleKey(size_t key_index) const {
         ReplicateConfig key_config = *this;
         if (group_ids.has_value()) {
             key_config.group_ids =
                 std::vector<std::string>{group_ids->at(key_index)};
+        }
+        if (per_key_preferred_hca_names) {
+            key_config.preferred_hca_names =
+                per_key_preferred_hca_names->at(key_index);
+            key_config.per_key_preferred_hca_names.reset();
         }
         return key_config;
     }
@@ -239,7 +274,8 @@ struct DfsReplicaData {
 
 struct MemoryDescriptor {
     AllocatedBuffer::Descriptor buffer_descriptor;
-    YLT_REFL(MemoryDescriptor, buffer_descriptor);
+    struct_pack::compatible<SegmentLocality, 1> locality;
+    YLT_REFL(MemoryDescriptor, buffer_descriptor, locality);
 };
 
 struct NoFDescriptor {
@@ -847,6 +883,9 @@ inline Replica::Descriptor Replica::get_descriptor() const {
         MemoryDescriptor mem_desc;
         if (mem_data.buffer) {
             mem_desc.buffer_descriptor = mem_data.buffer->get_descriptor();
+            if (auto allocator = mem_data.buffer->getAllocator()) {
+                mem_desc.locality = allocator->GetLocality();
+            }
         } else {
             mem_desc.buffer_descriptor.size_ = 0;
             mem_desc.buffer_descriptor.buffer_address_ = 0;

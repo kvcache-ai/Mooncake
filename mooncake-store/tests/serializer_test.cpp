@@ -192,6 +192,107 @@ TEST_F(SerializerTest, MountedSegmentSerializationPreservesHostId) {
     EXPECT_EQ(restored->status, original.status);
 }
 
+TEST_F(SerializerTest, MountedSegmentPreservesHcaLocalityAndAllocator) {
+    MountedSegment original;
+    original.segment.id = generate_uuid();
+    original.segment.name = "receiver";
+    original.segment.base = 0x300000000;
+    original.segment.size = 1024 * 1024;
+    original.segment.te_endpoint = "receiver:1234";
+    original.segment.host_id = "receiver";
+    original.segment.locality = SegmentLocality{7, {"mlx5_0", "mlx5_2"}};
+    original.status = SegmentStatus::OK;
+    original.buf_allocator = std::make_shared<OffsetBufferAllocator>(
+        original.segment.name, original.segment.base, original.segment.size,
+        original.segment.te_endpoint);
+    original.buf_allocator->SetLocality(original.segment.locality);
+    msgpack::sbuffer buffer;
+    MsgpackPacker packer(&buffer);
+    ASSERT_TRUE(Serializer<MountedSegment>::serialize(original, packer));
+    auto object = msgpack::unpack(buffer.data(), buffer.size());
+    auto restored = Serializer<MountedSegment>::deserialize(object.get());
+    ASSERT_TRUE(restored);
+    ASSERT_TRUE(restored->segment.locality);
+    EXPECT_EQ(*restored->segment.locality, *original.segment.locality);
+    ASSERT_TRUE(restored->buf_allocator);
+    EXPECT_EQ(restored->buf_allocator->GetLocality(),
+              original.buf_allocator->GetLocality());
+}
+
+struct LegacyMemoryDescriptor {
+    AllocatedBuffer::Descriptor buffer_descriptor;
+};
+YLT_REFL(LegacyMemoryDescriptor, buffer_descriptor);
+
+struct LegacyReplicaDescriptor {
+    ReplicaID id{0};
+    std::variant<LegacyMemoryDescriptor, NoFDescriptor, DiskDescriptor,
+                 LocalDiskDescriptor, DistributedFSDescriptor>
+        descriptor_variant;
+    ReplicaStatus status;
+};
+YLT_REFL(LegacyReplicaDescriptor, id, descriptor_variant, status);
+
+TEST_F(SerializerTest, ReadLocalityIsCompatibleInsideReplicaVariant) {
+    Replica::Descriptor replica;
+    replica.status = ReplicaStatus::COMPLETE;
+    MemoryDescriptor memory;
+    memory.buffer_descriptor = {1024, 0x300000000, "rdma", "receiver"};
+    memory.locality = SegmentLocality{7, {"mlx5_0"}};
+    replica.descriptor_variant = memory;
+    auto old_reader = struct_pack::deserialize<LegacyReplicaDescriptor>(
+        struct_pack::serialize(replica));
+    ASSERT_TRUE(old_reader);
+    EXPECT_EQ(std::get<LegacyMemoryDescriptor>(old_reader->descriptor_variant)
+                  .buffer_descriptor.transport_endpoint_,
+              "receiver");
+    auto current = struct_pack::deserialize<Replica::Descriptor>(
+        struct_pack::serialize(replica));
+    ASSERT_TRUE(current);
+    EXPECT_EQ(current->get_memory_descriptor().locality, memory.locality);
+    auto new_reader = struct_pack::deserialize<Replica::Descriptor>(
+        struct_pack::serialize(*old_reader));
+    ASSERT_TRUE(new_reader);
+    EXPECT_FALSE(new_reader->get_memory_descriptor().locality);
+}
+
+struct LegacySegment {
+    UUID id{0, 0};
+    std::string name;
+    uintptr_t base{0};
+    size_t size{0};
+    std::string te_endpoint;
+    std::string protocol;
+    std::string host_id;
+};
+YLT_REFL(LegacySegment, id, name, base, size, te_endpoint, protocol, host_id);
+
+TEST_F(SerializerTest, SegmentLocalityHasCompatibleWireFields) {
+    LegacySegment old;
+    old.id = generate_uuid();
+    old.name = "receiver";
+    old.base = 0x300000000;
+    old.size = 1024 * 1024;
+    old.te_endpoint = "receiver:1234";
+    old.protocol = "rdma";
+    old.host_id = "receiver";
+    auto decoded =
+        struct_pack::deserialize<Segment>(struct_pack::serialize(old));
+    ASSERT_TRUE(decoded);
+    EXPECT_EQ(decoded->name, old.name);
+    EXPECT_FALSE(decoded->locality);
+    decoded->locality = SegmentLocality{7, {"mlx5_0"}};
+    const auto encoded = struct_pack::serialize(*decoded);
+    auto legacy = struct_pack::deserialize<LegacySegment>(encoded);
+    ASSERT_TRUE(legacy);
+    EXPECT_EQ(legacy->base, old.base);
+    EXPECT_EQ(legacy->host_id, old.host_id);
+    auto current = struct_pack::deserialize<Segment>(encoded);
+    ASSERT_TRUE(current);
+    ASSERT_TRUE(current->locality);
+    EXPECT_EQ(*current->locality, *decoded->locality);
+}
+
 TEST_F(SerializerTest, MountedSegmentDeserializesLegacyFormatWithoutHostId) {
     const UUID segment_id = generate_uuid();
 

@@ -7,6 +7,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string>
 #include <thread>
 #include <vector>
@@ -72,6 +73,19 @@ class QueryResult {
 class Client {
    public:
     virtual ~Client();
+
+    // One topology/registration snapshot serves every key or fragment in a
+    // batch.
+    using HcaAffinity =
+        std::function<std::vector<std::string>(std::span<const Slice>)>;
+    static HcaAffinity MakeHcaAffinity(
+        const Topology& topology, std::span<const SegmentBufferInfo> buffers);
+    static std::optional<SegmentLocality> DiscoverSegmentLocality(
+        const Topology& topology, const std::string& location);
+    using ReadReplicaSelector =
+        std::function<ErrorCode(const std::vector<Replica::Descriptor>&,
+                                std::span<const Slice>, Replica::Descriptor&)>;
+    ReadReplicaSelector MakeReadReplicaSelector() const;
 
     using WriteBufferStager =
         std::function<tl::expected<std::vector<Slice>, ErrorCode>(
@@ -262,7 +276,8 @@ class Client {
         const std::vector<Replica::Descriptor>& replicas,
         const std::vector<std::vector<Slice>>& slices,
         const std::vector<std::vector<uint64_t>>& src_offsets,
-        TransferIntent intent = TransferIntent::kUnspecified);
+        TransferIntent intent = TransferIntent::kUnspecified,
+        std::span<const QueryResult* const> query_results = {});
 
     /**
      * @brief Batch ranged read from restored LOCAL_DISK arenas.
@@ -936,7 +951,7 @@ class Client {
      */
     ErrorCode FindFirstCompleteReplica(
         const std::vector<Replica::Descriptor>& replica_list,
-        Replica::Descriptor& replica);
+        Replica::Descriptor& replica) const;
 
     /**
      * @brief Batch put helper methods for structured approach
@@ -971,6 +986,12 @@ class Client {
         const std::vector<QueryResult>& query_results,
         std::unordered_map<std::string, std::vector<Slice>>& slices);
     ReplicateConfig AttachHostId(const ReplicateConfig& config) const;
+    HcaAffinity MakeHcaAffinity() const;
+    void AttachHcaAffinity(ReplicateConfig& config,
+                           const std::vector<Slice>& slices) const;
+    ReplicateConfig AttachBatchHcaAffinity(
+        const ReplicateConfig& config, const std::vector<PutOperation>& ops,
+        const std::vector<size_t>& indices) const;
 
     // Client identification
     const UUID client_id_;

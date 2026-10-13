@@ -2155,6 +2155,26 @@ PYBIND11_MODULE(store, m) {
                        &ReplicateConfig::prefer_alloc_in_same_node)
         .def_readwrite("data_type", &ReplicateConfig::data_type)
         .def_readwrite("group_ids", &ReplicateConfig::group_ids)
+        .def_property(
+            "preferred_hca_names",
+            [](const ReplicateConfig &config)
+                -> std::optional<std::vector<std::string>> {
+                return config.preferred_hca_names;
+            },
+            [](ReplicateConfig &config,
+               std::optional<std::vector<std::string>> value) {
+                config.preferred_hca_names = std::move(value);
+            })
+        .def_property(
+            "per_key_preferred_hca_names",
+            [](const ReplicateConfig &config)
+                -> std::optional<std::vector<std::vector<std::string>>> {
+                return config.per_key_preferred_hca_names;
+            },
+            [](ReplicateConfig &config,
+               std::optional<std::vector<std::vector<std::string>>> value) {
+                config.per_key_preferred_hca_names = std::move(value);
+            })
         .def("__str__", [](const ReplicateConfig &config) {
             std::ostringstream oss;
             oss << config;

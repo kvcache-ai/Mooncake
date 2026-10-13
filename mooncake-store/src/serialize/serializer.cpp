@@ -921,9 +921,15 @@ tl::expected<void, SerializationError> Serializer<MountedSegment>::serialize(
     // Use array structure for packing, more efficient
     // Format: [segment_id, segment_name, segment_base, segment_size,
     // te_endpoint, status, has_buffer_allocator, buffer_allocator_data,
-    // host_id]
+    // host_id, optional [numa_node, hca_names]]
 
-    packer.pack_array(9);
+    packer.pack_array(mounted_segment.segment.locality ? 10 : 9);
+    const auto pack_locality = [&] {
+        if (const auto &locality = mounted_segment.segment.locality) {
+            packer.pack(
+                std::make_pair(locality->numa_node, locality->hca_names));
+        }
+    };
 
     // Serialize Segment info
     packer.pack(UuidToString(mounted_segment.segment.id));
@@ -947,6 +953,7 @@ tl::expected<void, SerializationError> Serializer<MountedSegment>::serialize(
                 return tl::unexpected(result.error());
             }
             packer.pack(mounted_segment.segment.host_id);
+            pack_locality();
             return {};
         }
     }
@@ -954,6 +961,7 @@ tl::expected<void, SerializationError> Serializer<MountedSegment>::serialize(
     packer.pack(false);  // Mark no valid buffer allocator exists
     packer.pack_nil();
     packer.pack(mounted_segment.segment.host_id);
+    pack_locality();
     return {};
 }
 
@@ -1012,6 +1020,17 @@ Serializer<MountedSegment>::deserialize(const msgpack::object &obj) {
         }
         if (obj.via.array.size >= 9) {
             mounted_segment.segment.host_id = array[8].as<std::string>();
+        }
+        if (obj.via.array.size >= 10) {
+            auto [numa, hcas] =
+                array[9].as<std::pair<int32_t, std::vector<std::string>>>();
+            if (numa < 0) throw msgpack::type_error();
+            mounted_segment.segment.locality =
+                SegmentLocality{numa, std::move(hcas)};
+        }
+        if (mounted_segment.buf_allocator) {
+            mounted_segment.buf_allocator->SetLocality(
+                mounted_segment.segment.locality);
         }
     } catch (const std::exception &e) {
         return tl::unexpected(SerializationError(

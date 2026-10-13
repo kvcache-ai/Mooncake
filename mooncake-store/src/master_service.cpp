@@ -1,4 +1,5 @@
 #include "master_service.h"
+#include "config/replica_selection_config.h"
 
 #include <algorithm>
 #include <array>
@@ -972,17 +973,29 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                                                   .get_memory_descriptor()
                                                   .buffer_descriptor;
                             SegmentRestore* match = nullptr;
+                            bool endpoint_match = false;
                             for (auto& restore : restores) {
                                 if (descriptor.transport_endpoint_ ==
                                         restore.segment.te_endpoint ||
                                     descriptor.transport_endpoint_ ==
                                         restore.segment.name) {
+                                    endpoint_match = true;
+                                    if (descriptor.buffer_address_ <
+                                            restore.segment.base ||
+                                        descriptor.buffer_address_ -
+                                                restore.segment.base >=
+                                            restore.segment.size)
+                                        continue;
                                     if (match != nullptr) {
                                         ambiguous_endpoint = true;
                                         return;
                                     }
                                     match = &restore;
                                 }
+                            }
+                            if (endpoint_match && match == nullptr) {
+                                ambiguous_endpoint = true;
+                                return;
                             }
                             if (match != nullptr) {
                                 if (descriptor.protocol_ == "cxl") {
@@ -5122,6 +5135,11 @@ auto MasterService::AllocateReplicas(const std::string& key,
             allocator_snapshot = allocator_access.SnapshotAllocatorManager();
         }
 
+        if (StoreHcaAffinityEnabled()) {
+            allocator_snapshot.SetHcaAffinity(
+                config.preferred_hca_names.value_or(
+                    std::vector<std::string>{}));
+        }
         auto allocation_result = allocation_strategy_->Allocate(
             allocator_snapshot, value_length, config.replica_num,
             preferred_segments, std::set<std::string>(), ReplicaType::MEMORY);
@@ -6652,11 +6670,9 @@ MasterService::BatchUpsertStart(const UUID& client_id,
             tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>(
             keys.size(), tl::make_unexpected(ErrorCode::INVALID_PARAMS));
     }
-    if (config.group_ids.has_value() &&
-        config.group_ids->size() != keys.size()) {
-        LOG(ERROR) << "BatchUpsertStart: group_ids.size()="
-                   << config.group_ids->size()
-                   << " != keys.size()=" << keys.size();
+    if (!config.HasValidKeyHints(keys.size())) {
+        LOG(ERROR)
+            << "BatchUpsertStart: per-key hint count does not match keys";
         return std::vector<
             tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>(
             keys.size(), tl::make_unexpected(ErrorCode::INVALID_PARAMS));

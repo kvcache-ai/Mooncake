@@ -501,11 +501,8 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
                    << " != slice_lengths.size()=" << slice_lengths.size();
         results.assign(keys.size(),
                        tl::make_unexpected(ErrorCode::INVALID_PARAMS));
-    } else if (config.group_ids.has_value() &&
-               config.group_ids->size() != keys.size()) {
-        LOG(ERROR) << "BatchPutStart: group_ids.size()="
-                   << config.group_ids->size()
-                   << " != keys.size()=" << keys.size();
+    } else if (!config.HasValidKeyHints(keys.size())) {
+        LOG(ERROR) << "BatchPutStart: per-key hint count does not match keys";
         results.assign(keys.size(),
                        tl::make_unexpected(ErrorCode::INVALID_PARAMS));
     } else if (!resolved_tenant_id) {
@@ -756,11 +753,9 @@ WrappedMasterService::BatchUpsertStart(
                    << " != slice_lengths.size()=" << slice_lengths.size();
         results.assign(keys.size(),
                        tl::make_unexpected(ErrorCode::INVALID_PARAMS));
-    } else if (config.group_ids.has_value() &&
-               config.group_ids->size() != keys.size()) {
-        LOG(ERROR) << "BatchUpsertStart: group_ids.size()="
-                   << config.group_ids->size()
-                   << " != keys.size()=" << keys.size();
+    } else if (!config.HasValidKeyHints(keys.size())) {
+        LOG(ERROR)
+            << "BatchUpsertStart: per-key hint count does not match keys";
         results.assign(keys.size(),
                        tl::make_unexpected(ErrorCode::INVALID_PARAMS));
     } else if (auto resolved_tenant_id = ResolveTenantIdForWrite(

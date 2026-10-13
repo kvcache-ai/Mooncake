@@ -12,6 +12,7 @@ set(MOONCAKE_STORE_SHARED_SOURCES
     uds_transport.cpp
     config/distributed_storage_config.cpp
     config/rpc_protocol_config.cpp
+    config/replica_selection_config.cpp
     config/store_cluster_identity_config.cpp
     storage/distributed/distributed_storage_backend.cpp
     storage/distributed/posix_fs_adapter.cpp
@@ -144,7 +145,6 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     config/local_hot_cache_config.cpp
     config/nof_register_config.cpp
     config/offset_allocator_backend_config.cpp
-    config/replica_selection_config.cpp
     config/rpc_timeout_config.cpp
     config/spdk_controller_config.cpp
     config/transfer_submitter_config.cpp

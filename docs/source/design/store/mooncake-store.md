@@ -339,6 +339,60 @@ The C++ client reads `MOONCAKE_HOST_ID` as an explicit deployment override for t
 
 This strategy currently applies to memory allocation with `replica_num == 1`. Explicit `preferred_segment` or `preferred_segments` in `ReplicateConfig` are still tried first; if they are unavailable or full, allocation continues with the local-first ordered fallback list.
 
+**HCA-local NUMA placement**
+
+This Store feature is disabled by default. Enable it on the master, storage
+clients and RL workers before startup; unset, `0`, `false` or invalid values
+keep the existing allocation, memory layout and read-selection behavior.
+Transfer Engine's existing affinity setting alone does not enable this feature.
+
+When enabled, RDMA Store ranges are bound to one NUMA node and mounted under the same
+logical segment name. They report receiver-local NUMA/HCA metadata to the
+master. Within a selected segment, allocation tries matching HCA-local ranges,
+unknown locality, then known mismatches. Existing host/segment preferences,
+capacity policies and replica separation remain in effect. NUMA IDs are never
+compared across hosts.
+
+Enable request-local inference together with classic Transfer Engine's
+same-name peer-device selection before starting the client:
+
+```bash
+export MC_ENABLE_DEST_DEVICE_AFFINITY=1
+export MC_STORE_HCA_AFFINITY=1
+```
+
+Put/Upsert infer preferred HCA names from the current registered source;
+batches infer per key, supporting different GPUs or NUMA nodes in one batch.
+All source slices in an object must share the same HCA set, and a matching
+receiver range must be local to every named HCA. Mixed, unknown or unregistered
+sources use ordinary placement. Transfer Engine still selects transfer devices.
+
+For RL workers, Get/BatchGet rank complete existing memory copies against the
+current registered transfer destination. Cached queries and read sessions
+retain candidates and reselect at read time; ranged reads can select per
+fragment without another Master RPC. Host/medium priorities, leases and
+checksum checks still apply. Single-copy objects are read directly, without
+read-triggered replication or migration; unknown destinations keep the original
+winner.
+
+Explicit hints override inference (`None` allows inference; an empty shared
+list or per-key entry means no preference). Per-key hints follow input key order and remain
+aligned with group IDs when a batch is filtered or retried:
+
+```python
+from mooncake.store import ReplicateConfig
+
+config = ReplicateConfig()
+config.preferred_hca_names = ["mlx5_0"]
+config.per_key_preferred_hca_names = [["mlx5_0"], ["mlx5_1"]]
+```
+
+Put-session start receives sizes without source buffers, so use explicit hints
+when placement must follow the writer's topology. Hints are best effort and old
+clients/snapshots remain usable. Low-level mounts should register each bound
+range separately with `cpu:N`; compound `segments:...` locations are unknown
+to master placement.
+
 **`cxl` — CxlAllocationStrategy**
 
 Specialized for CXL (Compute Express Link) memory hardware. Unlike the other strategies, this one does not perform random or load-balanced selection — it always allocates from a specific CXL segment:
