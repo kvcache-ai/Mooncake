@@ -458,7 +458,7 @@ class LocalDiskUnmountInterleavingTest : public MasterServiceSSDTest {
    protected:
     static void DeregisterHalf(MasterService& service, const UUID& client_id) {
         std::unique_lock<std::shared_mutex> snapshot_lock(
-            MasterServiceTestPeer::SnapshotMutex(service));
+            MasterServiceTestPeer::MasterStateMutex(service));
         MasterServiceTestPeer::LocalSsdManager(service).UnregisterClient(
             client_id);
     }
