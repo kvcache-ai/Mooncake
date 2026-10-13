@@ -83,15 +83,16 @@ TEST(StandbyControllerTest, OplogEnablementControlsReaderController) {
 }
 
 TEST(StandbyControllerTest, PromotionReportsStandbyStartFailure) {
-    // No OpLog endpoint: opening the backend fails without touching the
-    // network, whether or not etcd support is compiled in.
+    // Inject a synchronous startup failure so this test does not depend on
+    // asynchronous HA backend connection behavior.
     ha::HABackendSpec spec{};
     spec.type = ha::HABackendType::ETCD;
     MasterServiceSupervisorConfig config;
     config.cluster_id = "promotion-start-failure-test";
     config.enable_oplog = true;
 
-    auto controller = ha::CreateStandbyController(spec, config);
+    auto controller = ha::CreateStandbyController(
+        spec, config, [] { return ErrorCode::INVALID_PARAMS; });
     ASSERT_NE(controller, nullptr);
 
     auto not_started = controller->PromoteStandbyAndExport();

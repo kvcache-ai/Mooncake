@@ -4,6 +4,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <utility>
 
 #include <glog/logging.h>
 
@@ -111,11 +112,13 @@ class NoopStandbyController final : public StandbyController {
 class CapabilityDrivenStandbyController final : public StandbyController {
    public:
     CapabilityDrivenStandbyController(
-        const HABackendSpec& spec, const MasterServiceSupervisorConfig& config)
+        const HABackendSpec& spec, const MasterServiceSupervisorConfig& config,
+        StartErrorInjector start_error_injector)
         : spec_(spec),
           config_(config),
           capabilities_(BuildStandbyRuntimeCapabilities(spec, config)),
-          standby_service_(CreateStandbyService(config, capabilities_)) {
+          standby_service_(CreateStandbyService(config, capabilities_)),
+          start_error_injector_(std::move(start_error_injector)) {
         if (config_.enable_oplog_snapshot) {
             try {
                 if (spec_.type != HABackendType::ETCD ||
@@ -195,6 +198,15 @@ class CapabilityDrivenStandbyController final : public StandbyController {
         if (standby_running) {
             NotifyRuntimeStateIfChanged();
             return ErrorCode::OK;
+        }
+
+        if (start_error_injector_) {
+            const auto injected_error = start_error_injector_();
+            if (injected_error != ErrorCode::OK) {
+                std::lock_guard<std::mutex> lock(state_mutex_);
+                last_standby_error_ = injected_error;
+                return injected_error;
+            }
         }
 
         if (dependency_init_error_ != ErrorCode::OK) {
@@ -426,6 +438,7 @@ class CapabilityDrivenStandbyController final : public StandbyController {
     std::unique_ptr<BatchOpLogSnapshotCoordinator>
         batch_oplog_snapshot_coordinator_;
     ErrorCode dependency_init_error_{ErrorCode::OK};
+    StartErrorInjector start_error_injector_;
     std::string oplog_connstring_;
 
     mutable std::mutex state_mutex_;
@@ -441,12 +454,15 @@ class CapabilityDrivenStandbyController final : public StandbyController {
 }  // namespace
 
 std::unique_ptr<StandbyController> CreateStandbyController(
-    const HABackendSpec& spec, const MasterServiceSupervisorConfig& config) {
+    const HABackendSpec& spec, const MasterServiceSupervisorConfig& config,
+    StandbyController::StartErrorInjector start_error_injector) {
     const auto capabilities = BuildStandbyRuntimeCapabilities(spec, config);
     if (capabilities.has_snapshot_bootstrap ||
         capabilities.has_oplog_following) {
         return std::make_unique<CapabilityDrivenStandbyController>(spec,
-                                                                   config);
+                                                                   config,
+                                                                   std::move(
+                                                                       start_error_injector));
     }
 
     LOG(INFO) << "HA standby controller falls back to noop, backend_type="
