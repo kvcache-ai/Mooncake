@@ -245,6 +245,15 @@ class WrappedMasterService {
     tl::expected<std::vector<PromotionTaskItem>, ErrorCode>
     PromotionObjectHeartbeat(const UUID& client_id);
 
+    // SSD prefetch RPC. Registers a promotion task without the
+    // promotion-on-hit admission gates and without the holder's heartbeat
+    // mailbox; the caller drives the execution chain itself. Best-effort:
+    // PROMOTION_ALREADY_EXISTS is a normal "skip" outcome. Additive RPC —
+    // older masters reject it and prefetch degrades to a no-op.
+    tl::expected<void, ErrorCode> RegisterPrefetchTask(
+        const UUID& client_id, const std::string& key,
+        const std::string& tenant_id);
+
     tl::expected<PromotionAllocStartResponse, ErrorCode> PromotionAllocStart(
         const UUID& client_id, const std::string& key,
         const std::string& tenant_id, uint64_t size,
