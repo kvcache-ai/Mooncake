@@ -62,6 +62,10 @@
 #include "tent/transport/hylink/hylink_transport.h"
 #endif
 
+#ifdef USE_FABRIC
+#include "tent/transport/fabric/fabric_transport.h"
+#endif
+
 namespace mooncake {
 namespace tent {
 
@@ -145,6 +149,11 @@ Status TransferEngineImpl::loadTransports() {
 #ifdef USE_HYLINK
     if (conf_->get("transports/hylink/enable", false))
         transport_list_[HYLINK] = std::make_shared<HylinkTransport>();
+#endif
+
+#ifdef USE_FABRIC
+    if (conf_->get("transports/fabric/enable", true))
+        transport_list_[FABRIC] = std::make_shared<FabricTransport>();
 #endif
 
     return Status::OK();

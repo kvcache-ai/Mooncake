@@ -613,7 +613,7 @@ class SnapshotChildProcessTest : public ::testing::Test {
         if (metadata_it == tenant_it->second.metadata.end()) {
             return std::nullopt;
         }
-        return metadata_it->second.GetCommittedSoftPinTimeout();
+        return metadata_it->second.metadata.GetCommittedSoftPinTimeout();
     }
 
     uint32_t GetShardIndexForTest(const std::string& key) {
@@ -634,7 +634,7 @@ class SnapshotChildProcessTest : public ::testing::Test {
         for (const auto& [tenant_id, tenant_state] : shard.tenants) {
             auto it = tenant_state.metadata.find(key);
             if (it != tenant_state.metadata.end()) {
-                return it->second.IsGrouped();
+                return it->second.metadata.IsGrouped();
             }
         }
         return false;

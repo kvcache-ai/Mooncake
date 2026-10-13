@@ -19,7 +19,6 @@
 #include <asio/ip/v6_only.hpp>
 #include <asio/post.hpp>
 #include <asio/steady_timer.hpp>
-
 #include <algorithm>
 #include <array>
 #include <atomic>

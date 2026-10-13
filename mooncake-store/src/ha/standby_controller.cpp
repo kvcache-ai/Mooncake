@@ -48,7 +48,7 @@ StandbyRuntimeCapabilities BuildStandbyRuntimeCapabilities(
     capabilities.has_snapshot_bootstrap =
         config.enable_oplog_snapshot || config.enable_snapshot_restore;
     capabilities.has_oplog_following =
-        config.enable_oplog && spec.type == HABackendType::ETCD;
+        config.enable_oplog && HaBackendSupportsOpLog(spec.type);
     return capabilities;
 }
 
@@ -135,7 +135,8 @@ class CapabilityDrivenStandbyController final : public StandbyController {
 
         if (config_.enable_oplog_snapshot) {
             try {
-                if (!capabilities_.has_oplog_following ||
+                if (spec_.type != HABackendType::ETCD ||
+                    !capabilities_.has_oplog_following ||
                     config_.snapshot_chunk_object_count == 0) {
                     throw std::invalid_argument(
                         "batch snapshot requires etcd OpLog and positive chunk "
@@ -175,6 +176,7 @@ class CapabilityDrivenStandbyController final : public StandbyController {
         }
 
         if (capabilities_.has_oplog_following) {
+            standby_service_->SetOpLogBackendType(spec_.type);
             oplog_connstring_ = config_.ha_backend_connstring.empty()
                                     ? config_.etcd_endpoints
                                     : config_.ha_backend_connstring;

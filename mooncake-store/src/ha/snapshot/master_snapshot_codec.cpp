@@ -288,10 +288,10 @@ std::vector<uint8_t> MasterSnapshotCodec::EncodeDrainJobs(
     for (size_t i = 0; i < MasterService::kNumShards; ++i) {
         MasterService::MetadataShardAccessorRO shard(&service, i);
         for (const auto& [tenant, state] : shard->tenants) {
-            for (const auto& [key, runtime] : state.replication_tasks) {
-                const auto metadata = state.metadata.find(key);
-                if (metadata == state.metadata.end()) continue;
-                const auto names = metadata->second.GetReplicaSegmentNames();
+            for (const auto& [key, record] : state.metadata) {
+                if (!record.state.replication_task) continue;
+                const auto& runtime = *record.state.replication_task;
+                const auto names = record.metadata.GetReplicaSegmentNames();
                 if (!active_objects.contains(
                         service.MakeDrainUnitKey(tenant, key, "")) &&
                     std::none_of(names.begin(), names.end(),
@@ -579,8 +579,8 @@ void MasterSnapshotCodec::DecodeDrainJobs(
                 metadata.Get().GetReplicaByID(restored.runtime.source_id)) {
             source->inc_refcnt();
         }
-        metadata.GetTenantState().replication_tasks.emplace(
-            restored.key, std::move(restored.runtime));
+        metadata.GetState().replication_task.emplace(
+            std::move(restored.runtime));
     }
     std::lock_guard lock(service.job_mutex_);
     service.drain_jobs_ = std::move(jobs);

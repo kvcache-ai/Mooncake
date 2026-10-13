@@ -1098,13 +1098,13 @@ void Workers::handleCompletion(WorkerContext& worker, RdmaContext& context,
         bool remote_gdr_err = (wc.status == IBV_WC_REM_ACCESS_ERR ||
                                wc.status == IBV_WC_REM_OP_ERR);
         if (local_gdr_err && slice->source_gpu_ordinal >= 0 &&
-            slice->source_nic_name) {
+            !slice->source_nic_name.empty()) {
             GdrReachability::instance().reportLocalFailure(
                 slice->source_nic_name, slice->source_gpu_ordinal);
         } else if (remote_gdr_err && slice->target_gpu_ordinal >= 0 &&
-                   slice->target_nic_name && slice->target_machine_id) {
+                   !slice->target_nic_name.empty()) {
             GdrReachability::instance().reportRemoteFailure(
-                *slice->target_machine_id, slice->target_nic_name,
+                slice->target_machine_id, slice->target_nic_name,
                 slice->target_gpu_ordinal);
         }
         slice->retry_count++;
@@ -1142,12 +1142,13 @@ void Workers::handleCompletion(WorkerContext& worker, RdmaContext& context,
         // entirely until something has actually been excluded.
         if (GdrReachability::hasAnyExclusion()) {
             auto& gdr = GdrReachability::instance();
-            if (slice->source_gpu_ordinal >= 0 && slice->source_nic_name)
+            if (slice->source_gpu_ordinal >= 0 &&
+                !slice->source_nic_name.empty())
                 gdr.reportLocalSuccess(slice->source_nic_name,
                                        slice->source_gpu_ordinal);
-            if (slice->target_gpu_ordinal >= 0 && slice->target_nic_name &&
-                slice->target_machine_id)
-                gdr.reportRemoteSuccess(*slice->target_machine_id,
+            if (slice->target_gpu_ordinal >= 0 &&
+                !slice->target_nic_name.empty())
+                gdr.reportRemoteSuccess(slice->target_machine_id,
                                         slice->target_nic_name,
                                         slice->target_gpu_ordinal);
         }
@@ -1797,18 +1798,18 @@ Status Workers::generatePostPath(RdmaSlice* slice) {
             "Selected device has no registered memory key" LOC_MARK);
     slice->source_lkey = lkeys[slice->source_dev_id];
     slice->target_rkey = rkeys[slice->target_dev_id];
-    // Stash identifiers for GPUDirect reachability learning in asyncPollCq.
-    // The name pointers alias stable Topology::NicEntry / segment storage and
-    // remain valid for the slice's lifetime.
+    // Copy identifiers for GPUDirect reachability learning in asyncPollCq.
+    // RouteHint pins the metadata snapshot only through this call; completion
+    // handling may happen after the segment publishes a replacement snapshot.
     {
         LocationParser s(source.location), d(target.location);
         slice->source_gpu_ordinal = (s.type() == "cuda") ? s.index() : -1;
         slice->target_gpu_ordinal = (d.type() == "cuda") ? d.index() : -1;
         const auto* lnic = source.topo->getNicEntry(slice->source_dev_id);
         const auto* rnic = target.topo->getNicEntry(slice->target_dev_id);
-        slice->source_nic_name = lnic ? lnic->name.c_str() : nullptr;
-        slice->target_nic_name = rnic ? rnic->name.c_str() : nullptr;
-        slice->target_machine_id = &target.segment->machine_id;
+        slice->source_nic_name = lnic ? lnic->name : "";
+        slice->target_nic_name = rnic ? rnic->name : "";
+        slice->target_machine_id = target.segment->machine_id;
     }
     if (transport_->params_->log_slice_affinity) {
         const auto* local_nic = source.topo->getNicEntry(slice->source_dev_id);

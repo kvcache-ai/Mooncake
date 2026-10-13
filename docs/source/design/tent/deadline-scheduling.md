@@ -577,10 +577,11 @@ misconfiguration.
 - **Mixed submits.** A submit that mixes staged and non-staged owners bypasses
   the queue as a whole, so its RDMA owners do not enter `dispatching_bytes_`
   and the drop predictor underestimates the queue ahead of later requests.
-- **Quarantined owners.** An owner that is dispatched and then never reaches
-  a terminal status (a batch abandoned by the lazy free path) keeps its bytes
-  in `dispatching_bytes_`, so the drop predictor grows more pessimistic over
-  time in that failure mode.
+- **Owners of a batch that leaves the normal lifecycle.** When a batch is
+  handed to the deferred staging teardown or quarantined by the lazy free
+  path, its queue owners are cancelled and their dispatch-window slots and
+  queue bytes returned. Nothing polls such a batch afterwards, so its owners
+  are settled at the moment it leaves rather than left charged.
 - **RDMA completion wake.** RDMA does not yet signal the progress worker on
   completion, so dispatch-window refill after an RDMA completion waits for the
   fallback timer.

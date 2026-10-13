@@ -1,4 +1,4 @@
-#include "tenant_quota.h"
+#include "tenant/quota.h"
 
 #include <algorithm>
 #include <cassert>
