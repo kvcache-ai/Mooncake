@@ -25,20 +25,33 @@ ErrorCode NofPageRegistry::Register(void* owner, void* ptr, size_t size) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto& registrations = owner_regs_[owner];
 
-    // Same-owner re-registration of ptr: no-op when the existing record
-    // covers the request; a larger size extends from the covered prefix.
+    // [skip_from, skip_end): the retained suffix of a record shrunk by a
+    // failed unregister — still charged, must not be re-bumped.
     uintptr_t bump_from = first_page;
+    uintptr_t skip_from = 0, skip_end = 0;
     auto existing = registrations.find(ptr);
     if (existing != registrations.end()) {
-        const uintptr_t covered_end = AlignUpToPage(begin + existing->second);
-        if (end_page <= covered_end) {
-            return ErrorCode::OK;
+        const uintptr_t covered_end =
+            AlignUpToPage(begin + existing->second.size);
+        if (existing->second.charged_from == 0) {
+            if (end_page <= covered_end) {
+                return ErrorCode::OK;
+            }
+            bump_from = covered_end;
+        } else {
+            // The record was shrunk: redo the dropped prefix, keep the
+            // retained suffix untouched.
+            bump_from = first_page;
+            skip_from = existing->second.charged_from;
+            skip_end = covered_end;
         }
-        bump_from = covered_end;
     }
 
     std::vector<uintptr_t> touched;  // pages whose count this call bumped
     for (uintptr_t page = bump_from; page < end_page; page += kPageSize) {
+        if (page >= skip_from && page < skip_end) {
+            continue;  // still charged by this record
+        }
         auto& reg = page_regs_[page];
         // External and quarantined pages are treated alike: pinned, never
         // (un)registered by us. A quarantined page's translation state is
@@ -62,58 +75,77 @@ ErrorCode NofPageRegistry::Register(void* owner, void* ptr, size_t size) {
                 LOG(ERROR) << "page register failed: page="
                            << reinterpret_cast<void*>(page) << " rc=" << rc;
                 // SPDK does not roll back a failed spdk_mem_register: try to
-                // clean up the failing page itself, once.
-                const bool clean = unregister_fn_(reinterpret_cast<void*>(page),
-                                                  kPageSize) == 0;
-                if (clean) {
-                    page_regs_.erase(page);
-                    // Confirmed-clean failure: roll back this call's pages;
-                    // the caller may munmap safely.
-                    for (uintptr_t p : touched) {
-                        auto& r = page_regs_[p];
-                        if (--r.count == 0) {
-                            unregister_fn_(reinterpret_cast<void*>(p),
-                                           kPageSize);
-                            page_regs_.erase(p);
-                        }
-                    }
-                    return ErrorCode::INTERNAL_ERROR;
+                // clean up the failing page itself, once. On success the
+                // entry is erased; otherwise quarantine it and keep this
+                // call's charges (they form a contiguous prefix).
+                if (unregister_fn_(reinterpret_cast<void*>(page), kPageSize) !=
+                    0) {
+                    reg.count = 1;
+                    reg.quarantined = true;
+                    auto& rec = registrations[ptr];
+                    rec.size = std::max(
+                        rec.size,
+                        static_cast<size_t>((page + kPageSize) - begin));
+                    rec.charged_from = 0;  // charges stay a contiguous prefix
+                    return ErrorCode::NOF_REGISTRATION_STUCK;
                 }
-                // Cleanup unconfirmed: quarantine the failing page and keep
-                // this call's charges (per-page refcounts already partition
-                // owners). Record coverage up to the failing page so a later
-                // re-registration extends over the untouched tail.
-                reg.count = 1;
-                reg.quarantined = true;
-                const size_t covered =
-                    static_cast<size_t>((page + kPageSize) - begin);
-                size_t& rec = registrations[ptr];
-                rec = std::max(rec, covered);
-                return ErrorCode::NOF_REGISTRATION_STUCK;
+                page_regs_.erase(page);
+                // The failing page is confirmed clean: roll back this call's
+                // pages in reverse order and STOP at the first rollback
+                // failure, quarantining that page — the charges that remain
+                // always form a contiguous prefix.
+                for (auto it = touched.rbegin(); it != touched.rend(); ++it) {
+                    auto& r = page_regs_[*it];
+                    if (r.count > 1) {
+                        --r.count;  // other owners still hold the page
+                        continue;
+                    }
+                    if (unregister_fn_(reinterpret_cast<void*>(*it),
+                                       kPageSize) == 0) {
+                        page_regs_.erase(*it);
+                        continue;
+                    }
+                    LOG(ERROR) << "rollback unregister failed: page="
+                               << reinterpret_cast<void*>(*it)
+                               << "; quarantining page";
+                    r.quarantined = true;  // count stays 1, terminal
+                    auto& rec = registrations[ptr];
+                    rec.size = std::max(
+                        rec.size,
+                        static_cast<size_t>((*it + kPageSize) - begin));
+                    rec.charged_from = 0;  // charges stay a contiguous prefix
+                    return ErrorCode::NOF_REGISTRATION_STUCK;
+                }
+                // Everything this call touched is confirmed clean.
+                return ErrorCode::INTERNAL_ERROR;
             }
         }
         reg.count++;
         touched.push_back(page);
     }
-    size_t& rec = registrations[ptr];
-    rec = std::max(rec, size);
+    auto& rec = registrations[ptr];
+    rec.size = std::max(rec.size, size);
+    rec.charged_from = 0;  // full coverage restored
     return ErrorCode::OK;
 }
 
-bool NofPageRegistry::ReleaseRangeLocked(void* ptr, size_t size) {
+bool NofPageRegistry::ReleaseRangeLocked(void* ptr, OwnerRange& rec) {
     const uintptr_t begin = reinterpret_cast<uintptr_t>(ptr);
     const uintptr_t first_page = begin & ~kPageMask;
-    const uintptr_t end_page = AlignUpToPage(begin + size);
-    bool all_released = true;
-    for (uintptr_t page = first_page; page < end_page; page += kPageSize) {
+    const uintptr_t end_page = AlignUpToPage(begin + rec.size);
+    // Start where the remaining charges start; everything before
+    // charged_from was already released.
+    const uintptr_t start =
+        rec.charged_from != 0 ? rec.charged_from : first_page;
+    for (uintptr_t page = start; page < end_page; page += kPageSize) {
         auto pit = page_regs_.find(page);
         if (pit == page_regs_.end() || pit->second.external) {
             continue;
         }
         if (pit->second.quarantined) {
             // Terminal: never unregistered, the mapping must stay pinned.
-            all_released = false;
-            continue;
+            rec.charged_from = page;
+            return false;
         }
         if (pit->second.count > 1) {
             --pit->second.count;
@@ -121,15 +153,15 @@ bool NofPageRegistry::ReleaseRangeLocked(void* ptr, size_t size) {
         }
         if (unregister_fn_(reinterpret_cast<void*>(page), kPageSize) == 0) {
             page_regs_.erase(pit);
-        } else {
-            LOG(ERROR) << "page unregister failed: page="
-                       << reinterpret_cast<void*>(page)
-                       << "; quarantining page";
-            pit->second.quarantined = true;  // count stays 1, terminal
-            all_released = false;
+            continue;
         }
+        LOG(ERROR) << "page unregister failed: page="
+                   << reinterpret_cast<void*>(page) << "; quarantining page";
+        pit->second.quarantined = true;  // count stays 1, terminal
+        rec.charged_from = page;
+        return false;
     }
-    return all_released;
+    return true;
 }
 
 ErrorCode NofPageRegistry::Unregister(void* owner, void* ptr) {
@@ -143,8 +175,9 @@ ErrorCode NofPageRegistry::Unregister(void* owner, void* ptr) {
         return ErrorCode::OK;  // not registered by this owner: no-op
     }
     if (!ReleaseRangeLocked(ptr, it->second)) {
-        // Record retained: the caller's quarantine path keeps the mapping
-        // pinned instead of munmapping a possibly-live translation.
+        // Record retained (shrunk to the first unreleasable page): the
+        // caller's quarantine path keeps the mapping pinned, and a retry
+        // immediately hits that page again — never pages owned by others.
         return ErrorCode::INTERNAL_ERROR;
     }
     owner_it->second.erase(it);

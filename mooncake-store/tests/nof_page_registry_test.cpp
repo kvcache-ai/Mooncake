@@ -269,10 +269,12 @@ TEST_F(NofPageRegistryTest, StuckRetryExtendsOverUntouchedTail) {
     EXPECT_EQ(fake_.Depth(page2), 1);
     EXPECT_EQ(fake_.register_calls, 3);  // exactly one new backend call
 
-    // Teardown: page0/page2 release; the quarantined page1 fails.
+    // Teardown stops at the quarantined page1: page0 is released, page1 and
+    // everything beyond it stay registered (the mapping is pinned anyway).
     EXPECT_EQ(registry_.Unregister(owner_a_, ptr), ErrorCode::INTERNAL_ERROR);
     EXPECT_EQ(fake_.Depth(page0), 0);
-    EXPECT_EQ(fake_.Depth(page2), 0);
+    EXPECT_EQ(fake_.Depth(page1), 1);
+    EXPECT_EQ(fake_.Depth(page2), 1);
 }
 
 // A quarantined page is treated like an external one by later registrations
@@ -324,6 +326,87 @@ TEST_F(NofPageRegistryTest, UnregisterAllPropagatesPartialFailure) {
     fake_.fail_unregister_pages.clear();
     EXPECT_EQ(registry_.UnregisterAll(owner_a_), ErrorCode::INTERNAL_ERROR);
     EXPECT_EQ(fake_.Depth(reinterpret_cast<uintptr_t>(p1)), 1);
+}
+
+// A rollback unregister failure is quarantined too: reverse-order rollback
+// stops at the failure, so the remaining charges stay a contiguous prefix.
+TEST_F(NofPageRegistryTest, RollbackFailureQuarantinesAndKeepsPrefix) {
+    void* ptr = PageAddr(0);
+    const uintptr_t page0 = reinterpret_cast<uintptr_t>(ptr);
+    const uintptr_t page1 = page0 + kPage;
+    const uintptr_t page2 = page1 + kPage;
+    fake_.mark_fail_pages.insert(page2);        // page2: marks then fails
+    fake_.fail_unregister_pages.insert(page1);  // page1: rollback fails
+
+    ASSERT_EQ(registry_.Register(owner_a_, ptr, 3 * kPage),
+              ErrorCode::NOF_REGISTRATION_STUCK);
+    // page2 was confirmed clean and erased; page1 is quarantined; page0's
+    // charge was never rolled back (rollback stopped at page1).
+    EXPECT_EQ(fake_.Depth(page2), 0);
+    EXPECT_EQ(fake_.Depth(page1), 1);
+    EXPECT_EQ(fake_.Depth(page0), 1);
+
+    // The record covers only up to the quarantined page: a retry registers
+    // the untouched tail.
+    fake_.mark_fail_pages.erase(page2);
+    ASSERT_EQ(registry_.Register(owner_a_, ptr, 3 * kPage), ErrorCode::OK);
+    EXPECT_EQ(fake_.Depth(page2), 1);
+
+    // Teardown releases the healthy prefix and fails on the quarantine.
+    EXPECT_EQ(registry_.Unregister(owner_a_, ptr), ErrorCode::INTERNAL_ERROR);
+    EXPECT_EQ(fake_.Depth(page0), 0);
+    EXPECT_EQ(fake_.Depth(page1), 1);  // pinned
+}
+
+// A partial unregister shrinks the record to the first unreleasable page: a
+// caller-side retry immediately hits that page and can never release a page
+// owned by someone else (the round-2 cross-owner regression shape).
+TEST_F(NofPageRegistryTest, PartialUnregisterRetryNeverReachesOtherOwnersPage) {
+    void* ptr = PageAddr(0);
+    const uintptr_t page0 = reinterpret_cast<uintptr_t>(ptr);
+    const uintptr_t page1 = page0 + kPage;
+    ASSERT_EQ(registry_.Register(owner_a_, ptr, 3 * kPage / 2), ErrorCode::OK);
+    ASSERT_EQ(registry_.Register(owner_b_, ptr, 4096), ErrorCode::OK);
+    // page0 count == 2 (A and B), page1 count == 1 (A only).
+
+    fake_.fail_unregister_pages.insert(page1);
+    EXPECT_EQ(registry_.Unregister(owner_a_, ptr), ErrorCode::INTERNAL_ERROR);
+    // A's page0 reference was dropped (2 -> 1, B remains); the record is
+    // shrunk to page1 (quarantined).
+    EXPECT_EQ(fake_.Depth(page0), 1);
+
+    // The retry starts at the quarantined page1 and fails there — it never
+    // attempts page0 (B's page), even after the backend recovers.
+    fake_.fail_unregister_pages.erase(page1);
+    const int unregister_calls_before = fake_.unregister_calls;
+    EXPECT_EQ(registry_.Unregister(owner_a_, ptr), ErrorCode::INTERNAL_ERROR);
+    EXPECT_EQ(fake_.unregister_calls, unregister_calls_before);
+    EXPECT_EQ(fake_.Depth(page0), 1);
+
+    ASSERT_EQ(registry_.Unregister(owner_b_, ptr), ErrorCode::OK);
+    EXPECT_EQ(fake_.Depth(page0), 0);
+}
+
+// Re-registering a shrunk record redoes the dropped prefix while keeping
+// the retained (quarantined) suffix pinned.
+TEST_F(NofPageRegistryTest, ReregisterShrunkRecordRestoresPrefix) {
+    void* ptr = PageAddr(0);
+    const uintptr_t page0 = reinterpret_cast<uintptr_t>(ptr);
+    const uintptr_t page1 = page0 + kPage;
+    ASSERT_EQ(registry_.Register(owner_a_, ptr, 3 * kPage / 2), ErrorCode::OK);
+    ASSERT_EQ(registry_.Register(owner_b_, ptr, 4096), ErrorCode::OK);
+
+    fake_.fail_unregister_pages.insert(page1);
+    EXPECT_EQ(registry_.Unregister(owner_a_, ptr), ErrorCode::INTERNAL_ERROR);
+
+    // Re-register: page0 is re-charged for A (1 -> 2), page1 stays pinned.
+    ASSERT_EQ(registry_.Register(owner_a_, ptr, 3 * kPage / 2), ErrorCode::OK);
+
+    // Teardown drops exactly A's page0 reference and fails on page1.
+    EXPECT_EQ(registry_.Unregister(owner_a_, ptr), ErrorCode::INTERNAL_ERROR);
+    EXPECT_EQ(fake_.Depth(page0), 1);  // B intact
+    ASSERT_EQ(registry_.Unregister(owner_b_, ptr), ErrorCode::OK);
+    EXPECT_EQ(fake_.Depth(page0), 0);
 }
 
 TEST_F(NofPageRegistryTest, UnregisterAllReleasesEverything) {

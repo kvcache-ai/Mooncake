@@ -4202,7 +4202,10 @@ tl::expected<void, ErrorCode> RealClient::unregister_buffer_internal(
     auto unregister_result = client_->unregisterLocalMemory(buffer, true);
 
     // Record check, NoF cleanup and record erase stay in one critical
-    // section (teardown's unregister walk takes the same lock).
+    // section (teardown's unregister walk takes the same lock). The TE call
+    // above is intentionally outside it: if teardown finishes the cleanup in
+    // between, this call returns a TE error for an already-cleaned buffer —
+    // a harmless false error.
     std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
     if (!unregister_result) {
         // A previous call may have unregistered TE while the NoF cleanup

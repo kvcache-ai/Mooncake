@@ -38,6 +38,14 @@ namespace mooncake {
 // backend state, returns OK, and its teardown will fail to release the page
 // (keeping the mapping pinned) — the translation state stays unknown but
 // the VA is never reused.
+//
+// Each owner record is {size, charged_from}: the covered range is
+// [charged_from ?: first_page, page_align(begin + size)). Charges held by
+// one record are always a contiguous page range — registration failures
+// keep charges contiguous (reverse-order rollback stops at the first
+// failure), and a failed unregister shrinks charged_from to the first
+// unreleasable page, so a retry immediately hits it again and can never
+// touch pages whose remaining references belong to other owners.
 class NofPageRegistry {
    public:
     using MemRegisterFn = int (*)(void* addr, size_t len);
@@ -63,16 +71,25 @@ class NofPageRegistry {
         bool quarantined = false;
     };
 
-    // Releases this registration's pages; pages that fail to unregister
-    // become quarantined. Returns true only when nothing remains charged.
+    struct OwnerRange {
+        // Requested range size; coverage ends at page_align(begin + size).
+        size_t size = 0;
+        // First page still charged (0 = the whole prefix is charged). Set
+        // to the first unreleasable page when an unregister fails.
+        uintptr_t charged_from = 0;
+    };
+
+    // Releases this registration's charged pages starting at charged_from,
+    // stopping at the first unreleasable page and shrinking charged_from to
+    // it. Returns true only when nothing remains charged.
     // Caller must hold mutex_.
-    bool ReleaseRangeLocked(void* ptr, size_t size);
+    bool ReleaseRangeLocked(void* ptr, OwnerRange& rec);
 
     MemRegisterFn register_fn_;
     MemUnregisterFn unregister_fn_;
     std::map<uint64_t, PageReg> page_regs_;  // key: 2MB-aligned page base
-    // owner token -> (user ptr -> registered size)
-    std::map<void*, std::map<void*, size_t>> owner_regs_;
+    // owner token -> (user ptr -> registration record)
+    std::map<void*, std::map<void*, OwnerRange>> owner_regs_;
     std::mutex mutex_;
 };
 
