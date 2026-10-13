@@ -92,9 +92,8 @@ class PrefetchTaskMasterTest : public ::testing::Test {
     }
 
     // Friend funnels (PrefetchTaskMasterTest is friended on MasterService).
-    // In-flight tasks live on the object's runtime state. The read-only
-    // accessor keeps GetState private, so read promotion_task from the
-    // public tenant metadata map.
+    // In-flight tasks live on the object's runtime state; read
+    // promotion_task through the public tenant metadata map.
     static bool HasPromotionTaskForTesting(MasterService* service,
                                            const TenantId& tenant_id,
                                            const std::string& key) {

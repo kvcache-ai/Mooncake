@@ -2030,10 +2030,6 @@ class MasterService {
         std::unordered_map<TenantId, TenantState, TenantIdHash>::const_iterator
             tenant_it_;
         const TenantState* tenant_state_;
-        // The tasks in flight for the object (only call when Exists() is true)
-        const route::ObjectState& GetState() const NO_THREAD_SAFETY_ANALYSIS {
-            return it_->second.state;
-        }
 
         ObjectMetadataConstIterator it_;
     };
