@@ -79,6 +79,10 @@ SPARE_PAGE_FRACTION = 8
 # against them without holding every layer of the context in memory.
 PREFIX_SOURCE = 10_000
 STEP_SOURCE = 20_000
+# A third source, used only by the check that writes a payload the step never wrote
+# and reads it back: a writer that stopped writing cannot pass it on the step's own
+# content, because the content it is asked for is one the step never produced.
+VERIFY_SOURCE = 30_000
 
 
 class LayerStandIn:
@@ -531,16 +535,58 @@ class SglangStep:
 
     def write_layer(self, layer_id, indices):
         """SGLang's writer for one layer."""
+        key, value = self.new_kv[layer_id]
+        self.write_payload(layer_id, indices, key, value)
+
+    def write_payload(self, layer_id, indices, key, value):
+        """One layer's K/V through SGLang's writer.
+
+        The timed loop writes the step's own content through here, and so does the
+        check that writes a different payload and reads it back, so whatever the
+        writer does with a payload it does the same way for both.
+        """
         self.write_calls += 1
-        k, v = self.new_kv[layer_id]
         self.kv_pool.set_kv_buffer(
-            self.layers[layer_id], KVWriteLoc(indices.out_cache_loc), k, v
+            self.layers[layer_id], KVWriteLoc(indices.out_cache_loc), key, value
         )
 
     def write_kv(self, indices):
         """SGLang's writer, once per layer."""
         for layer_id in range(self.case.num_layers):
             self.write_layer(layer_id, indices)
+
+    def check_write_path(self, indices, source=VERIFY_SOURCE):
+        """Write a payload the step never wrote, then read it back.
+
+        The content check reads the state the timed loop left, and every iteration
+        writes the same K/V to the same slots, so a writer that stopped writing would
+        leave the warmup's values behind and still pass. This runs the writer again
+        with K/V drawn from another source and compares the slots it wrote against
+        that payload, which only passes if the bytes really went through.
+
+        It runs after the checks that read the timed state, because it overwrites the
+        slots the step writes.
+        """
+        case = self.case
+        mismatched = 0
+        checked = 0
+        for layer_id in range(case.num_layers):
+            key = self._source(source, layer_id, case.new_tokens)
+            value = self._source(source, case.num_layers + layer_id, case.new_tokens)
+            self.write_payload(layer_id, indices, key, value)
+            torch.cuda.synchronize()
+            rows = indices.out_cache_loc.long()
+            key_buffer, value_buffer = self.kv_pool.get_kv_buffer(layer_id)
+            written_key = key_buffer.index_select(0, rows).reshape(key.shape)
+            written_value = value_buffer.index_select(0, rows).reshape(value.shape)
+            mismatched += int((written_key != key).sum().item())
+            mismatched += int((written_value != value).sum().item())
+            checked += key.numel() + value.numel()
+        return {
+            "tokens_checked": checked // max(1, case.num_kv_heads * case.head_dim * 2),
+            "mismatched_elements": mismatched,
+            "passed": bool(mismatched == 0),
+        }
 
     def plan(self, indices):
         case = self.case

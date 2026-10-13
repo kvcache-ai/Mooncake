@@ -21,11 +21,15 @@ from benchmarks.sglang_attention_kv.cases import (  # noqa: E402
 from benchmarks.sglang_attention_kv import kernel_bench  # noqa: E402
 from benchmarks.sglang_attention_kv.kernel_bench import (  # noqa: E402
     DEFERRED_SYNC_ITERATIONS,
+    FETCH_ITERATIONS,
     PLAN_SAMPLES,
     one_iteration,
     run_case,
 )
-from benchmarks.sglang_attention_kv.sglang_replay import SglangStep  # noqa: E402
+from benchmarks.sglang_attention_kv.sglang_replay import (  # noqa: E402
+    VERIFY_SOURCE,
+    SglangStep,
+)
 from benchmarks.sglang_attention_kv.stats import STEP_PHASES  # noqa: E402
 
 DEVICE = "cuda:0"
@@ -233,6 +237,39 @@ def test_the_sampled_rows_include_one_that_must_not_see_the_future():
     output[middle] = unmasked.to(output.dtype)
     torch.cuda.synchronize()
     assert not step.check_attention_rows(query, output, layer_id)["passed"]
+
+
+def test_a_writer_that_stopped_writing_fails_the_write_path_check(monkeypatch):
+    """Every timed iteration writes the same K/V to the same slots, so the content
+    check would pass on the warmup's values. This is the check that reads back a
+    payload the step never wrote, and a writer that stopped writing cannot pass it."""
+    case = step_case("decode", (256,), (1,), layers=2)
+    step, indices = prepared(case)
+    assert step.check_write_path(indices, source=VERIFY_SOURCE)["passed"]
+
+    monkeypatch.setattr(
+        SglangStep, "write_payload", lambda self, layer_id, indices, key, value: None
+    )
+    result = step.check_write_path(indices, source=VERIFY_SOURCE + 1_000)
+    assert not result["passed"]
+    assert result["mismatched_elements"] > 0
+
+
+def test_a_measured_move_keeps_its_first_move_and_its_samples():
+    """The move a request pays when the cache comes back is kept apart from the ones
+    that follow it, and every move of the pass is kept in order with the parts it was
+    timed in, so a summary is never divided by another summary's figure."""
+    case = step_case("decode", (512,), (1,), kv_source="host", layers=2)
+    result = run_case(case, DEVICE, warmup=1, timed=2)
+    fetch = result["fetch"]
+    assert fetch["first"]["total_ms"] > 0
+    assert len(fetch["steady"]["samples"]) == FETCH_ITERATIONS
+    for sample in fetch["steady"]["samples"]:
+        assert set(sample) == {"total_ms", "descriptors_ms", "submit_ms", "device_ms"}
+        assert sample["total_ms"] > 0
+    assert fetch["steady"]["total"]["p50"] > 0
+    assert fetch["steady"]["submit"]["p50"] > 0
+    assert result["correctness"]["write_path"]["passed"]
 
 
 def test_the_branch_decides_the_order():

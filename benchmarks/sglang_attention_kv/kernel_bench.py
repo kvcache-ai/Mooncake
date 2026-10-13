@@ -156,21 +156,37 @@ def one_gather(step, indices):
 
 
 def one_fetch(step):
-    """One Mooncake move of the cached history into the pool, in a window of its own.
-    A step whose history is already in the pool moves nothing and reports no window
-    rather than a window around nothing."""
+    """One Mooncake move of the cached history into the pool.
+
+    A move runs on the host and in the engine, so its total is a wall clock taken
+    around the whole call, with the two parts the holder times itself — building the
+    entries and the engine's submit and wait — recorded beside it. A CUDA event span
+    comes back as well, for the part of the move that is on the device's timeline; it
+    starts before the first byte moves, so it is not a transfer time on its own. A
+    step whose history is already in the pool moves nothing and reports zeros.
+    """
     if step.history is None:
-        return 0.0
+        return {
+            "total_ms": 0.0,
+            "descriptors_ms": 0.0,
+            "submit_ms": 0.0,
+            "device_ms": 0.0,
+        }
     begin = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     begin.record()
+    start = time.perf_counter()
     fetched = step.fetch_kv()
+    total_ms = (time.perf_counter() - start) * 1000.0
     end.record()
     torch.cuda.synchronize()
     step.fetched_bytes = fetched
-    step.fetch_descriptors_ms = step.history.descriptors_ms
-    step.fetch_submit_ms = step.history.submit_ms
-    return begin.elapsed_time(end)
+    return {
+        "total_ms": total_ms,
+        "descriptors_ms": step.history.descriptors_ms,
+        "submit_ms": step.history.submit_ms,
+        "device_ms": begin.elapsed_time(end),
+    }
 
 
 def one_plan(step, indices):
@@ -228,17 +244,20 @@ def run_case(
         samples["step_window"] = []
         samples["phase_sum"] = []
 
-        # The Mooncake move of the history, in a window of its own and before anything
-        # reads the pool: the warmup and every timed iteration read the history the
-        # last of these moves left, so the content check that follows the timed loop is
-        # a check on a move that really happened rather than on a pool the benchmark
-        # filled itself. A step whose history the pool already holds moves nothing.
-        if step.history is None:
-            samples["kv_fetch"] = [0.0] * FETCH_ITERATIONS
-        else:
-            samples["kv_fetch"] = [one_fetch(step) for _ in range(FETCH_ITERATIONS)]
+        # The Mooncake move of the history, before anything reads the pool: the warmup
+        # and every timed iteration read the history the last of these moves left, so
+        # the content check that follows the timed loop is a check on a move that
+        # really happened rather than on a pool the benchmark filled itself.
+        #
+        # The first move is kept apart from the ones that follow it. It is the one a
+        # request pays when the cache has to be brought back, and it is also the one
+        # that may carry whatever a first connection costs; a median over the moves
+        # after it is a different figure, and taking both as one sample would hide
+        # either. Every move of the pass is kept in order, so a tail can be read.
+        first_fetch = one_fetch(step)
+        fetch_samples = [one_fetch(step) for _ in range(FETCH_ITERATIONS)]
+        samples["kv_fetch"] = [sample["total_ms"] for sample in fetch_samples]
         fetch_bytes = step.fetched_bytes if step.history is not None else 0
-
         query = step.make_query()
 
         for _ in range(warmup):
@@ -284,6 +303,10 @@ def run_case(
             ),
             "attention": short_step_attention(case, device, seed, extend_branch),
         }
+        # Last, because it overwrites the slots the step writes: a payload drawn from
+        # another source goes in through the same writer and is read back, so a writer
+        # that stopped writing cannot pass on the content the warmup left behind.
+        correctness["write_path"] = step.check_write_path(timed_indices)
 
         # The write and the read are priced in passes of their own, each in its own
         # window, so no step iteration is ever timed with a probe inside it. They run
@@ -348,9 +371,19 @@ def run_case(
         result["gather_bytes"] = gather_bytes
         result["gather_rows"] = int(step.gather_rows(probe_indices).numel())
         result["kv_bytes_fetched"] = fetch_bytes
-        result["fetch_parts"] = {
-            "descriptors_ms": step.fetch_descriptors_ms,
-            "submit_ms": step.fetch_submit_ms,
+        # Every move of the pass in order, each with the parts it was timed in, so a
+        # reader can pair them instead of dividing one summary by another. The first
+        # move is the one a request pays when the cache comes back; the pass that
+        # follows it is the steady one.
+        result["fetch"] = {
+            "first": first_fetch,
+            "steady": {
+                "samples": fetch_samples,
+                "total": summarize([s["total_ms"] for s in fetch_samples]),
+                "descriptors": summarize([s["descriptors_ms"] for s in fetch_samples]),
+                "submit": summarize([s["submit_ms"] for s in fetch_samples]),
+                "device": summarize([s["device_ms"] for s in fetch_samples]),
+            },
         }
         result["derived"] = derive(
             case, result["phases"], gather_bytes, read_bytes["attention"], fetch_bytes

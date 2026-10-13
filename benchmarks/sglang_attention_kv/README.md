@@ -44,9 +44,9 @@ interleaves the write and the read per layer.
 The step windows are windows on the device's timeline: they start and end with an event on the step's
 stream, so they include the device waiting for the next launch that the host has not issued yet. Every
 record also carries a **deferred-sync comparison**: the same iterations timed with the host allowed to
-run ahead, which removes some of that wait rather than all of it, because the wrappers' plan runs on the
-host inside each iteration and waits for the device itself. The two passes are therefore compared for
-the size of the gap they differ by, and the plan's own wall clock is recorded beside them.
+run ahead. It removes some of that wait rather than all of it — the per-layer enqueue in Python and the
+wrappers' plan, which waits for the device itself, run in both arrangements — so what it supports is a
+comparison of two sync points, and its plan's own wall clock is recorded beside it.
 
 The step is built from SGLang's own `ReqToTokenPool` for the token table and `MHATokenToKVPool` for the
 KV buffers, and its slots come from the allocator its page size selects (section 2).
@@ -97,7 +97,7 @@ before the step:
 | staging | the generated history is written into a host buffer per layer and per tensor, laid out with the pool's row pitch and one row per token of the aligned prefix, so a run of consecutive slots on both sides is one entry |
 | registration | the host buffers and the pool's own K/V buffers are registered with the engine, because an RDMA transfer can only write into registered memory |
 | the move | one batch over every layer: one entry per run of consecutive pool slots, so a pool whose history sits together needs one entry per sequence and a pool that churned needs one per page. `kv_transfer_entries` states what a case needed |
-| the record | the row states the source, the engine and its version, the endpoint it was told to write to, the NICs the topology puts next to the GPU, the rows and bytes registered, the entries, and the bytes moved, beside the window in `kv_fetch` and its two wall-clock parts |
+| the record | the row states the source, the engine and its version, the endpoint it was told to write to, the NICs the topology puts next to the GPU, the rows and bytes registered, the entries, and the bytes moved. The move a case pays first is kept apart from the moves that follow it, and every move of the pass is recorded in order with the parts it was timed in — the wall clock around the call, the entry building, the engine's submit and wait, and the span on the device's timeline |
 
 **What this is.** A component-level move through Mooncake's Transfer Engine between buffers this process
 registered: the endpoint is the engine's own, so the route may be an RNIC loopback or a local path
@@ -170,7 +170,7 @@ and the latency of the writer's calls, so no bandwidth divides by either.
 
 ## 6. Correctness checks
 
-Each step runs four checks, and a failure fails the run:
+Each step runs five checks, and a failure fails the run:
 
 - `indices`: the CSR stream must name exactly the token table rows the paged side of the branch reads,
   in order. A stream built from a different page table than the one the KV was written through fails
@@ -192,15 +192,18 @@ Each step runs four checks, and a failure fails the run:
   axis scaled by one factor — while the three checks above run at full size. Every record states the
   short step it used in `correctness.attention.case`.
 
+- `write_path`: after the checks above have read the state the timed loop left, a payload the step never
+  produced goes in through the same writer and is read back from the pool. Every timed iteration writes
+  the same K/V to the same slots, so a writer that stopped writing would leave the warmup's values in
+  place and pass the content check; this one cannot, because the bytes it asks for did not exist before
+  it ran.
+
 The checks run before every pass that rewrites the pool or replans the wrappers, so what they read is
 the state the last timed iteration left and the state the last measured move left, rather than a state a
-diagnostic pass produced.
-
-Each record also states how many write calls and index fills its timed loop made, against the counts
-that loop has to make: every iteration writes one layer's K/V per layer and fills one index stream. The
-checks read the state the last timed iteration left, and without that count a timed loop that skipped
-its work would pass on the state the warmup left, because every iteration writes the same content to
-the same slots.
+diagnostic pass produced. Each record also states how many write calls and index fills its timed loop
+made, against the counts that loop has to make: every iteration writes one layer's K/V per layer and
+fills one index stream. That count says the calls were made; the `write_path` check says the writes
+arrived.
 
 ## 7. Command line
 
@@ -251,7 +254,6 @@ the `configuration` object of `kernel.jsonl`, and the `branch`, `reads_before_wr
 `kv_write_stream` and `slot_allocator` columns of the CSV — so a reader can see which step a number came
 from. The CSV also carries the derived figures of section 5, the fetched bytes and transfer entries of
 section 3, the plan's own wall clock, and the result of every correctness check.
-
 A report quotes the figures as the CSV names them, and states the lane the run used, the allocator its
 page size selected, and the machine and versions the manifest holds, which is what makes two runs
 comparable. The GPU, the driver, the tensor parallel size, the model's shapes and the page sizes are

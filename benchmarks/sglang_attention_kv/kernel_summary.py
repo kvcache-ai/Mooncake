@@ -49,11 +49,14 @@ CSV_COLUMNS = [
     "history_passed",
     "attention_rows_passed",
     "attention_passed",
+    "write_path_passed",
     "step_window_deferred_sync_ms",
     "layer_loop_deferred_sync_ms",
     "attention_plan_host_ms",
-    "kv_fetch_descriptors_ms",
-    "kv_fetch_submit_ms",
+    "kv_fetch_first_ms",
+    "kv_fetch_descriptors_p50_ms",
+    "kv_fetch_submit_p50_ms",
+    "kv_fetch_device_p50_ms",
 ]
 for _phase in REPORTED_PHASES:
     # min as well as the percentiles: min is the smallest sample the window took
@@ -157,10 +160,14 @@ def kernel_summary(records):
             ],
             "layer_loop_deferred_sync_ms": record["deferred_sync"]["layer_loop_p50_ms"],
             "attention_plan_host_ms": record["plan_host"]["p50_ms"],
-            "kv_fetch_descriptors_ms": record["fetch_parts"]["descriptors_ms"],
-            "kv_fetch_submit_ms": record["fetch_parts"]["submit_ms"],
+            "kv_fetch_first_ms": record["fetch"]["first"]["total_ms"],
+            "kv_fetch_descriptors_p50_ms": record["fetch"]["steady"]["descriptors"][
+                "p50"
+            ],
+            "kv_fetch_submit_p50_ms": record["fetch"]["steady"]["submit"]["p50"],
+            "kv_fetch_device_p50_ms": record["fetch"]["steady"]["device"]["p50"],
         }
-        for name in ("indices", "history", "attention_rows", "attention"):
+        for name in ("indices", "history", "attention_rows", "attention", "write_path"):
             check = correctness[name]
             row[f"{name}_passed"] = check["passed"] if isinstance(check, dict) else None
         for phase in REPORTED_PHASES:

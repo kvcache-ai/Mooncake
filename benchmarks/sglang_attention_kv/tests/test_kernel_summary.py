@@ -137,7 +137,28 @@ def record():
             "layer_loop_p50_ms": 1.2,
         },
         "plan_host": {"samples": 5, "p50_ms": 0.4},
-        "fetch_parts": {"descriptors_ms": 0.3, "submit_ms": 2.0},
+        "fetch": {
+            "first": {
+                "total_ms": 9.5,
+                "descriptors_ms": 0.4,
+                "submit_ms": 9.0,
+                "device_ms": 9.1,
+            },
+            "steady": {
+                "samples": [
+                    {
+                        "total_ms": 2.5,
+                        "descriptors_ms": 0.3,
+                        "submit_ms": 2.1,
+                        "device_ms": 2.2,
+                    }
+                ],
+                "total": {"min": 2.5, "p50": 2.5, "p95": 2.5, "p99": 2.5},
+                "descriptors": {"min": 0.3, "p50": 0.3, "p95": 0.3, "p99": 0.3},
+                "submit": {"min": 2.1, "p50": 2.1, "p95": 2.1, "p99": 2.1},
+                "device": {"min": 2.2, "p50": 2.2, "p95": 2.2, "p99": 2.2},
+            },
+        },
         "phases": built,
         "derived": dict(DERIVED),
         "correctness": {
@@ -145,6 +166,7 @@ def record():
             "history": {"passed": True},
             "attention_rows": {"passed": True},
             "attention": {"passed": True},
+            "write_path": {"passed": True},
         },
     }
 

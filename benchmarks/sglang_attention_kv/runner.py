@@ -1,5 +1,6 @@
 import argparse
 import hashlib
+import importlib.metadata
 import json
 import os
 import platform
@@ -387,6 +388,18 @@ def probe_model(model_path):
     return info
 
 
+def probe_mooncake():
+    """The Mooncake distribution installed here, named the way its own metadata names
+    it: the wheel is built per CUDA flavour, so the name varies with the build."""
+    providers = importlib.metadata.packages_distributions().get("mooncake", [])
+    if not providers:
+        return None
+    return {
+        "distribution": providers[0],
+        "version": importlib.metadata.version(providers[0]),
+    }
+
+
 def record_environment(
     repo_dir,
     model_path,
@@ -427,6 +440,14 @@ def record_environment(
         "workload": plan.as_dict() if plan is not None else None,
     }
     record.update(run_facts)
+    if plan is not None and "host" in tuple(plan.kv_sources):
+        # What the moves ran through, and where they were told to write: the record of
+        # a step states the rest, per case.
+        record["kv_transfer"] = {
+            "mooncake": probe_mooncake(),
+            "protocol": run_facts.get("kv_source_protocol"),
+            "endpoint": "this process",
+        }
     if model_config is not None:
         aggregate, per_rank = model_config.kv_bytes_per_token(plan.tp_size)
         record["model"]["kv_config"] = model_config.as_dict()
@@ -544,6 +565,7 @@ def main(argv=None):
             "planned_failures": errors,
             "extend_branch": extend_branch,
             "flashinfer_use_paged_env": use_paged_default(),
+            "kv_source_protocol": args.kv_source_protocol,
         },
         git_override=git_override_from_args(args),
     )
