@@ -867,7 +867,8 @@ bool is_default_replicate_config(const ReplicateConfig &config) {
            !config.soft_pin_ttl_ms.has_value() && !config.with_hard_pin &&
            config.preferred_segments.empty() &&
            config.preferred_segment.empty() &&
-           !config.prefer_alloc_in_same_node && !config.group_ids.has_value();
+           !config.prefer_alloc_in_same_node && !config.group_ids.has_value() &&
+           !config.agent_hints.has_value();
 }
 
 std::optional<ParallelAxisSpec> parse_parallel_axis_spec(

@@ -52,6 +52,11 @@ Descriptor-based DFS is a work-in-progress feature for development and evaluatio
 The DFS-related replica-count fields of `ReplicateConfig` are as follows:
 
 ```C++
+struct AgentHints {
+    std::string reuse_hint{"neutral"};  // "keep", "discard", or "neutral"
+    int64_t cache_ttl_ms{0};            // raises the soft-pin deadline when reuse_hint is "keep"
+};
+
 struct ReplicateConfig {
     size_t replica_num{1};                       // Memory replicas
     size_t nof_replica_num{0};                   // NoF SSD replicas
@@ -60,7 +65,9 @@ struct ReplicateConfig {
     std::optional<uint64_t> soft_pin_ttl_ms{};   // ENABLE override; omitted uses the Master default
     bool with_hard_pin{false};                   // Whether to enable hard pin (never evicted)
     std::string preferred_segment{};             // Preferred segment for allocation
-    // Other placement, data-type, and grouping fields are omitted.
+    std::optional<std::vector<std::string>> group_ids{};
+    std::optional<AgentHints> agent_hints{};     // Optional agent workflow metadata
+    // Other placement and data-type fields are omitted.
 };
 ```
 
