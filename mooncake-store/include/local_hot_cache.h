@@ -8,6 +8,7 @@
 #include <mutex>
 #include <queue>
 #include <shared_mutex>
+#include <span>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -275,15 +276,15 @@ struct HotCachePutTask {
     // Default constructor for empty task
     HotCachePutTask() : block(nullptr), size(0), hot_cache(nullptr) {}
 
-    HotCachePutTask(const std::string& k, const Slice& slice, HotMemBlock* blk,
+    HotCachePutTask(const std::string& k, size_t object_size, HotMemBlock* blk,
                     std::shared_ptr<LocalHotCache> cache,
                     HotCachePutToken put_token)
         : key(k),
           block(blk),
-          size(slice.size),
+          size(object_size),
           hot_cache(std::move(cache)),
           token(put_token) {
-        // No data copy here; memcpy is done by SubmitPutTask into block->addr.
+        // No data copy here; SubmitPutTask already copied into block->addr.
     }
 };
 
@@ -323,6 +324,15 @@ class LocalHotCacheHandler {
      * hot_cache_ is null or handler is shutdown).
      */
     bool SubmitPutTask(const std::string& key, const Slice& slice);
+
+    /**
+     * @brief Gather one object's slices into a single cache block.
+     * Copies every nonempty slice synchronously, in order, before publishing
+     * one async task. Sources may be released after this function returns.
+     * Empty slices are ignored; an empty object or invalid/oversized input is
+     * rejected. Device slices use the runtime accelerator's host-copy path.
+     */
+    bool SubmitPutTask(const std::string& key, std::span<const Slice> slices);
 
    private:
     void workerThread();

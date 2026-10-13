@@ -4,9 +4,12 @@
 #include <cstring>
 #include <cstdlib>
 #include <cstdint>
+#include <limits>
 #include <regex>
 #include <shared_mutex>
 #include <glog/logging.h>
+
+#include "device/accelerator_registry.h"
 
 namespace mooncake {
 namespace {
@@ -490,11 +493,24 @@ LocalHotCacheHandler::~LocalHotCacheHandler() {
 
 bool LocalHotCacheHandler::SubmitPutTask(const std::string& key,
                                          const Slice& slice) {
+    return SubmitPutTask(key, std::span<const Slice>(&slice, 1));
+}
+
+bool LocalHotCacheHandler::SubmitPutTask(const std::string& key,
+                                         std::span<const Slice> slices) {
     if (!hot_cache_) {
         return false;
     }
 
-    if (slice.ptr == nullptr || slice.size == 0) {
+    size_t object_size = 0;
+    for (const auto& slice : slices) {
+        if ((slice.size != 0 && slice.ptr == nullptr) ||
+            slice.size > std::numeric_limits<size_t>::max() - object_size) {
+            return false;
+        }
+        object_size += slice.size;
+    }
+    if (object_size == 0) {
         return false;
     }
 
@@ -505,7 +521,7 @@ bool LocalHotCacheHandler::SubmitPutTask(const std::string& key,
 
     // Reject before acquiring a block: GetFreeBlock may evict a cached key.
     // Capacity is fixed; block->size only describes its last object's length.
-    if (slice.size > hot_cache_->GetBlockSize()) {
+    if (object_size > hot_cache_->GetBlockSize()) {
         return false;
     }
 
@@ -529,13 +545,29 @@ bool LocalHotCacheHandler::SubmitPutTask(const std::string& key,
         return false;
     }
 
-    // Copy data directly into the block (No Lock held here!)
-    // This is the only copy operation: Source -> Block
-    std::memcpy(block->addr, slice.ptr, slice.size);
-    block->size = slice.size;
+    // Gather directly into the detached block, without an intermediate buffer
+    // or a cache lock. Publish only after the whole object has been copied.
+    const auto& registry = device::GetAcceleratorRegistry();
+    auto accelerator = registry.RegisteredDevices().empty()
+                           ? device::RuntimeAccelerator{}
+                           : registry.RuntimeAccelerators();
+    auto* destination = static_cast<char*>(block->addr);
+    for (const auto& slice : slices) {
+        if (slice.size == 0) {
+            continue;
+        }
+        if (!accelerator.CopyToHost(destination, slice.ptr, slice.size)) {
+            // GetFreeBlock cleared the key; returning it cannot publish a
+            // partially copied object.
+            hot_cache_->PutHotKey(block);
+            return false;
+        }
+        destination += slice.size;
+    }
+    block->size = object_size;
     block->key_ = key;  // Set key for insertion
 
-    HotCachePutTask task(key, slice, block, hot_cache_, token);
+    HotCachePutTask task(key, object_size, block, hot_cache_, token);
 
     {
         std::lock_guard<std::mutex> lock(queue_mutex_);
