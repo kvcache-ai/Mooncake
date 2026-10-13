@@ -357,6 +357,7 @@ class TransferEngineImpl {
                               std::shared_ptr<Transport> xport) {
         if (type >= 0 && type < (TransportType)kSupportedTransportTypes) {
             transport_list_[type] = std::move(xport);
+            if (type == RDMA || type == UB) installDegradationPolicy();
         }
     }
 
@@ -491,6 +492,13 @@ class TransferEngineImpl {
     // already, so only the impl's record and the batch's task statuses are
     // left to settle. It never entered the dispatch window.
     Status finishDroppedOwner(QueueOwnerId owner_id);
+
+    // Gives the admission queue its bandwidth source for the deadline drop:
+    // the live estimate of the installed RDMA or UB transport. A no-op unless
+    // the queue is on with deadline_aware and a positive mlu_local_threshold.
+    // Called once at construction; swapTransportForTest() calls it again so a
+    // test double in the RDMA or UB slot is read through the same path.
+    void installDegradationPolicy();
 
     // Every queue owner of `batch`, dispatched or not, is finished with
     // `terminal_status` so the dispatch window and the queue's byte accounting

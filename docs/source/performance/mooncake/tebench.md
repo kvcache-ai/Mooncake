@@ -446,6 +446,25 @@ gpu_id + thread_id
   such as `foreground_get`, `background_prefetch`, or `checkpoint`. This is
   useful for validating intent-specific transport and QoS policy selection.
 
+**Deadline scheduling (TENT only)**
+
+* `--deadline_us` / `--deadline_tight_threads` : tag the transfers of workers
+  `[0, N)` with a relative deadline (Section 4.2 does the same per class).
+* `--deadline_aware` : route transfers through the admission queue
+  (`enable_runtime_queue` + `runtime_queue/deadline_aware`), ordered by
+  deadline.
+* `--mlu_local_threshold` : drop a queued transfer whose predicted completion
+  time divided by its remaining window (MLU) reaches this value
+  (`runtime_queue/mlu_local_threshold`); `0` disables the drop. Requires
+  `--deadline_aware`. The drop reads the RDMA transport's bandwidth estimate
+  and only acts on RDMA-routed transfers; on a TCP-only host it does nothing.
+* `--deadline_bw_arbitration` : order slices most-urgent-first before posting
+  on a NIC (`transports/rdma/deadline_bw_arbitration`).
+
+These flags only add keys to the engine config; a `MC_TENT_CONF` file keeps
+its own `runtime_queue` settings when they are left at their defaults. See the
+[deadline scheduling design](../../design/tent/deadline-scheduling.md).
+
 **Metadata service**
 
 * `--metadata_type` : `p2p | etcd | redis | http` (default: `p2p`)
