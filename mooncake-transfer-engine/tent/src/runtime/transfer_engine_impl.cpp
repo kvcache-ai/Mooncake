@@ -3011,6 +3011,13 @@ bool TransferEngineImpl::attemptSubmitStageFailover(Batch* batch,
 Status TransferEngineImpl::pollTaskStatus(Batch* batch, size_t task_id,
                                           TransferStatus& task_status) {
     auto& task = batch->task_list[task_id];
+    // Match batch polling: a logical failure is terminal. A rejected fallback
+    // may not have created a sub-task, but keep its type for metric
+    // attribution.
+    if (task.status == FAILED) {
+        task_status = {FAILED, 0};
+        return Status::OK();
+    }
     if (task.staging) {
         return staging_proxy_->getStatus(&task, task_status);
     }
@@ -3109,23 +3116,27 @@ void TransferEngineImpl::updateTaskStatusAfterPoll(Batch* batch, size_t task_id,
     // request will recover through failover. Close it before task.type is
     // overwritten by resubmitTransferTask().
     finishTransportAttempt(task, FAILED, std::chrono::steady_clock::now());
-    if (resubmitTransferTask(batch, task_id).ok()) {
-        task_status.s = PENDING;
-        task.status = PENDING;
-        for (size_t alias_id = 0; alias_id < batch->task_list.size();
-             ++alias_id) {
-            auto& alias = batch->task_list[alias_id];
-            if (!alias.derived || alias.physical_owner_task_id != task_id)
-                continue;
-            alias.type = task.type;
-            alias.sub_task_id = task.sub_task_id;
-            alias.status = task.status;
-            alias.failover_count = task.failover_count;
-            alias.xport_priority = task.xport_priority;
-            alias.device_mask = task.device_mask;
-            alias.qp_pool = task.qp_pool;
-            alias.staging = task.staging;
+    // A synchronous rejection dispatches no work, so keep trying candidates
+    // within the original budget. An accepted attempt is polled on the next
+    // progress step, rather than spinning here until it completes.
+    while (task.failover_count < task.runtime_policy.max_failover_attempts) {
+        if (resubmitTransferTask(batch, task_id).ok()) {
+            task_status.s = PENDING;
+            task.status = PENDING;
+            break;
         }
+    }
+    for (size_t alias_id = 0; alias_id < batch->task_list.size(); ++alias_id) {
+        auto& alias = batch->task_list[alias_id];
+        if (!alias.derived || alias.physical_owner_task_id != task_id) continue;
+        alias.type = task.type;
+        alias.sub_task_id = task.sub_task_id;
+        alias.status = task.status;
+        alias.failover_count = task.failover_count;
+        alias.xport_priority = task.xport_priority;
+        alias.device_mask = task.device_mask;
+        alias.qp_pool = task.qp_pool;
+        alias.staging = task.staging;
     }
 }
 
