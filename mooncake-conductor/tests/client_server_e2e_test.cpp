@@ -88,7 +88,7 @@ std::vector<ProjectedPrefix> ProjectedFor(const ContextKey& context,
 }
 
 // Seed directly through GetIndexer() (the same path QueryHttpTest uses):
-// register one engine whose first two blocks land on npu, with all three
+// register one engine whose first two blocks land on device, with all three
 // blocks also on cpu_share and disk via the shared pool.
 void SeedEngine(EventManager& manager, const ContextKey& context,
                 const HashProfile& profile,
@@ -235,7 +235,7 @@ Json::Value DecodeMsgpackBody(const std::string& body) {
 
 // Convert the RPC channel's QueryResult into the same JSON shape as the HTTP
 // /query response ({"instances": {id: {longest_matched, dp, rank_matches,
-// npu, ...}}}) so the two channels can be compared field by field with
+// device, ...}}}) so the two channels can be compared field by field with
 // EXPECT_EQ.
 Json::Value QueryResultToJson(const QueryResult& result) {
     Json::Value instances(Json::objectValue);
@@ -250,14 +250,14 @@ Json::Value QueryResultToJson(const QueryResult& result) {
         Json::Value rank_matches(Json::objectValue);
         for (const auto& [rank, match] : hit.rank_matches) {
             Json::Value entry(Json::objectValue);
-            entry["npu"] = Json::Int64(match.npu);
+            entry["device"] = Json::Int64(match.device);
             entry["cpu_local"] = Json::Int64(match.cpu_local);
             entry["cpu_share"] = Json::Int64(match.cpu_share);
             entry["disk"] = Json::Int64(match.disk);
             rank_matches[std::to_string(rank)] = entry;
         }
         value["rank_matches"] = rank_matches;
-        value["npu"] = Json::Int64(hit.npu);
+        value["device"] = Json::Int64(hit.device);
         value["cpu_local"] = Json::Int64(hit.cpu_local);
         value["cpu_share"] = Json::Int64(hit.cpu_share);
         value["disk"] = Json::Int64(hit.disk);
@@ -472,7 +472,7 @@ TEST(ClientServerE2ETest, QueryEquivalenceAcrossProtocols) {
     ASSERT_EQ(rpc_result->instances.size(), 1u);
     const auto& hit = rpc_result->instances.at("e2e-engine");
     EXPECT_EQ(hit.longest_match_tokens, 48);
-    EXPECT_EQ(hit.npu, 32);
+    EXPECT_EQ(hit.device, 32);
     EXPECT_EQ(hit.cpu_share, 48);
     EXPECT_EQ(hit.disk, 48);
 
