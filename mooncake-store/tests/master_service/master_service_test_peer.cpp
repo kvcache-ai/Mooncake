@@ -94,7 +94,8 @@ bool MasterServiceTestPeer::IsNoFSegmentMountedForTesting(
         mounted_segments.begin(), mounted_segments.end(),
         [&segment_id](const MountedNoFSegmentSnapshot& snapshot) {
             return snapshot.segment_id == segment_id &&
-                   snapshot.status == SegmentStatus::OK;
+                   (snapshot.status == SegmentStatus::OK ||
+                    snapshot.status == SegmentStatus::DRAINING);
         });
 }
 
