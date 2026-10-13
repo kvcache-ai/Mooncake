@@ -148,6 +148,7 @@ class StoreSessionMetadataTest(unittest.TestCase):
         args = SimpleNamespace(
             memory_replica_num=1,
             nof_replica_num=0,
+            dfs_replica_num=0,
             key_prefix="metadata",
             key_size=24,
             value_size=512,

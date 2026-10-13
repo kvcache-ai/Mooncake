@@ -120,9 +120,12 @@ SharedObjectOwner SharedOwner(const std::string& object_id = "object-a",
 
 ProjectedPrefix Prefix(uint64_t value) { return {.value = value}; }
 
-RankCacheHitResult RankMatch(int64_t npu, int64_t local, int64_t shared,
+RankCacheHitResult RankMatch(int64_t device, int64_t local, int64_t shared,
                              int64_t disk) {
-    return {.npu = npu, .cpu_local = local, .cpu_share = shared, .disk = disk};
+    return {.device = device,
+            .cpu_local = local,
+            .cpu_share = shared,
+            .disk = disk};
 }
 
 EngineMutation Gpu(const std::vector<ProjectedPrefix>& prefixes,
@@ -481,7 +484,7 @@ TEST(Mutations, InvalidGroupTierAndOwnersPreserveState) {
     bad_owner.owner.source_stream.clear();
     EXPECT_FALSE(table.StoreEngine(bad_owner).empty());
 
-    auto bad_tier = Shared({Prefix(2)}, StorageTier::kNpu);
+    auto bad_tier = Shared({Prefix(2)}, StorageTier::kDevice);
     EXPECT_FALSE(table.StoreShared(bad_tier).empty());
 
     EXPECT_EQ(PrefixCacheTableTestPeer::Snapshot(table), before);
@@ -495,12 +498,12 @@ TEST(Mutations, DuplicateGpuStoreAndRemoveAreIdempotent) {
 
     ASSERT_EQ(table.StoreEngine(mutation), "");
     ASSERT_EQ(table.StoreEngine(mutation), "");
-    EXPECT_EQ(Presence(table, prefix).npu_owners,
+    EXPECT_EQ(Presence(table, prefix).device_owners,
               (std::set<EngineOwner>{GpuOwner()}));
 
     auto absent_owner = Gpu({prefix}, GpuOwner("instance-b", 0, "stream-b"));
     ASSERT_EQ(table.RemoveEngine(absent_owner), "");
-    EXPECT_EQ(Presence(table, prefix).npu_owners,
+    EXPECT_EQ(Presence(table, prefix).device_owners,
               (std::set<EngineOwner>{GpuOwner()}));
 
     ASSERT_EQ(table.RemoveEngine(mutation), "");
@@ -556,7 +559,7 @@ TEST(Mutations, BlockLivesUntilEveryTierOwnerSetIsEmpty) {
     ASSERT_EQ(table.StoreShared(cpu), "");
     ASSERT_EQ(table.StoreShared(disk), "");
     ASSERT_EQ(table.RemoveEngine(gpu), "");
-    EXPECT_TRUE(Presence(table, prefix).npu_owners.empty());
+    EXPECT_TRUE(Presence(table, prefix).device_owners.empty());
     EXPECT_FALSE(Presence(table, prefix).cpu_share_owners.empty());
     EXPECT_FALSE(Presence(table, prefix).disk_owners.empty());
 
@@ -595,7 +598,7 @@ TEST(Mutations, GpuAndSharedClearAreExactlyOwnerScoped) {
         "");
 
     ASSERT_EQ(table.ClearEngine(ClearFor(engine_a)), "");
-    EXPECT_EQ(Presence(table, prefix).npu_owners,
+    EXPECT_EQ(Presence(table, prefix).device_owners,
               (std::set<EngineOwner>{engine_a_other_stream, engine_b}));
     EXPECT_EQ(Presence(table, prefix).cpu_share_owners,
               (std::set<SharedObjectOwner>{shared_a, shared_b}));
@@ -607,12 +610,12 @@ TEST(Mutations, GpuAndSharedClearAreExactlyOwnerScoped) {
     EXPECT_EQ(
         Presence(table, prefix).disk_owners,
         (std::set<mooncake::conductor::prefixindex::TierOwner>{shared_a}));
-    EXPECT_EQ(Presence(table, prefix).npu_owners,
+    EXPECT_EQ(Presence(table, prefix).device_owners,
               (std::set<EngineOwner>{engine_a_other_stream, engine_b}));
 
     ASSERT_EQ(table.ClearShared(ClearFor(shared_a)), "");
     EXPECT_TRUE(Presence(table, prefix).disk_owners.empty());
-    EXPECT_EQ(Presence(table, prefix).npu_owners,
+    EXPECT_EQ(Presence(table, prefix).device_owners,
               (std::set<EngineOwner>{engine_a_other_stream, engine_b}));
 }
 
@@ -657,7 +660,7 @@ TEST(Unregister, RemovesOnlySelectedRankGpuOwners) {
     const auto& state = snapshot.contexts.at(TestContext());
     EXPECT_EQ(state.instance_ranks.at("instance-a"), (std::set<int64_t>{1}));
     EXPECT_EQ(state.instance_ranks.at("instance-b"), (std::set<int64_t>{0}));
-    EXPECT_EQ(state.blocks.at(prefix).npu_owners,
+    EXPECT_EQ(state.blocks.at(prefix).device_owners,
               (std::set<EngineOwner>{a1, b0}));
     EXPECT_EQ(state.blocks.at(prefix).cpu_share_owners,
               (std::set<SharedObjectOwner>{shared}));
@@ -666,8 +669,9 @@ TEST(Unregister, RemovesOnlySelectedRankGpuOwners) {
     snapshot = PrefixCacheTableTestPeer::Snapshot(table);
     EXPECT_FALSE(snapshot.contexts.at(TestContext())
                      .instance_ranks.contains("instance-a"));
-    EXPECT_EQ(snapshot.contexts.at(TestContext()).blocks.at(prefix).npu_owners,
-              (std::set<EngineOwner>{b0}));
+    EXPECT_EQ(
+        snapshot.contexts.at(TestContext()).blocks.at(prefix).device_owners,
+        (std::set<EngineOwner>{b0}));
     EXPECT_EQ(
         snapshot.contexts.at(TestContext()).blocks.at(prefix).cpu_share_owners,
         (std::set<SharedObjectOwner>{shared}));
@@ -696,7 +700,7 @@ TEST(Query, ExactTwoInstanceSharedCacheExample) {
 
     const CacheHitResult& first = results.at("instance-1");
     EXPECT_EQ(first.longest_match_tokens, 48);
-    EXPECT_EQ(first.npu, 32);
+    EXPECT_EQ(first.device, 32);
     EXPECT_EQ(first.dp, (std::map<int64_t, int64_t>{{0, 32}}));
     EXPECT_EQ(first.rank_matches, (std::map<int64_t, RankCacheHitResult>{
                                       {0, RankMatch(32, 32, 48, 48)}}));
@@ -705,7 +709,7 @@ TEST(Query, ExactTwoInstanceSharedCacheExample) {
 
     const CacheHitResult& second = results.at("instance-2");
     EXPECT_EQ(second.longest_match_tokens, 48);
-    EXPECT_EQ(second.npu, 0);
+    EXPECT_EQ(second.device, 0);
     EXPECT_EQ(second.dp, (std::map<int64_t, int64_t>{{1, 0}}));
     EXPECT_EQ(
         second.rank_matches,
@@ -732,7 +736,7 @@ TEST(Query, TrailingPartialBlockNeverReportsMoreThanPromptTokens) {
 
     const auto result = table.Query(TestContext(), tokens).at("instance-a");
     EXPECT_EQ(result.longest_match_tokens, 40);
-    EXPECT_EQ(result.npu, 40);
+    EXPECT_EQ(result.device, 40);
     EXPECT_EQ(result.dp, (std::map<int64_t, int64_t>{{0, 40}}));
     EXPECT_EQ(result.rank_matches, (std::map<int64_t, RankCacheHitResult>{
                                        {0, RankMatch(40, 40, 40, 40)}}));
@@ -757,7 +761,7 @@ TEST(Query, WholeBlockRunIsUnaffectedByThePromptLengthClamp) {
 
     const auto result = table.Query(TestContext(), tokens).at("instance-a");
     EXPECT_EQ(result.longest_match_tokens, 32);
-    EXPECT_EQ(result.npu, 0);
+    EXPECT_EQ(result.device, 0);
     EXPECT_EQ(result.cpu_share, 0);
     EXPECT_EQ(result.disk, 32);
 }
@@ -781,7 +785,7 @@ TEST(Query, BigramFullMatchReportsOneFewerPositionThanPromptTokens) {
     // 39, not 40 and not the 48 a whole-block count would report.
     const auto result = table.Query(TestContext(), tokens).at("instance-a");
     EXPECT_EQ(result.longest_match_tokens, 39);
-    EXPECT_EQ(result.npu, 39);
+    EXPECT_EQ(result.device, 39);
     EXPECT_EQ(result.dp, (std::map<int64_t, int64_t>{{0, 39}}));
     EXPECT_EQ(result.rank_matches, (std::map<int64_t, RankCacheHitResult>{
                                        {0, RankMatch(39, 39, 39, 39)}}));
@@ -807,7 +811,7 @@ TEST(Query, BigramWholeBlockRunIsUnaffectedByTheLogicalLengthClamp) {
 
     const auto result = table.Query(TestContext(), tokens).at("instance-a");
     EXPECT_EQ(result.longest_match_tokens, 32);
-    EXPECT_EQ(result.npu, 0);
+    EXPECT_EQ(result.device, 0);
     EXPECT_EQ(result.cpu_share, 0);
     EXPECT_EQ(result.disk, 32);
 }
@@ -826,7 +830,7 @@ TEST(Query, GpuCpuAndDiskExtendOneCumulativePrefix) {
 
     const auto result = table.Query(TestContext(), tokens).at("instance-a");
     EXPECT_EQ(result.longest_match_tokens, 64);
-    EXPECT_EQ(result.npu, 32);
+    EXPECT_EQ(result.device, 32);
     EXPECT_EQ(result.dp, (std::map<int64_t, int64_t>{{0, 32}}));
     EXPECT_EQ(result.rank_matches, (std::map<int64_t, RankCacheHitResult>{
                                        {0, RankMatch(32, 32, 48, 64)}}));
@@ -848,7 +852,7 @@ TEST(Query, EmptyCpuPhaseFallsThroughToDiskAtSameBlock) {
 
     const auto result = table.Query(TestContext(), tokens).at("instance-a");
     EXPECT_EQ(result.longest_match_tokens, 48);
-    EXPECT_EQ(result.npu, 16);
+    EXPECT_EQ(result.device, 16);
     EXPECT_EQ(result.dp, (std::map<int64_t, int64_t>{{0, 16}}));
     EXPECT_EQ(result.rank_matches, (std::map<int64_t, RankCacheHitResult>{
                                        {0, RankMatch(16, 16, 16, 48)}}));
@@ -867,7 +871,7 @@ TEST(Query, CompleteGpuCoverageCarriesThroughLowerTierBoundaries) {
 
     const auto result = table.Query(TestContext(), tokens).at("instance-a");
     EXPECT_EQ(result.longest_match_tokens, 48);
-    EXPECT_EQ(result.npu, 48);
+    EXPECT_EQ(result.device, 48);
     EXPECT_EQ(result.dp, (std::map<int64_t, int64_t>{{0, 48}}));
     EXPECT_EQ(result.rank_matches, (std::map<int64_t, RankCacheHitResult>{
                                        {0, RankMatch(48, 48, 48, 48)}}));
@@ -890,7 +894,7 @@ TEST(Query, DuplicateTierPresenceIsAttributedOnce) {
 
     const auto result = table.Query(TestContext(), tokens).at("instance-a");
     EXPECT_EQ(result.longest_match_tokens, 48);
-    EXPECT_EQ(result.npu, 16);
+    EXPECT_EQ(result.device, 16);
     EXPECT_EQ(result.dp, (std::map<int64_t, int64_t>{{0, 16}}));
     EXPECT_EQ(result.rank_matches, (std::map<int64_t, RankCacheHitResult>{
                                        {0, RankMatch(16, 16, 32, 48)}}));
@@ -914,7 +918,7 @@ TEST(Query, CumulativeTierIncludesHigherTierAfterLowerTierBlocks) {
 
     const auto result = table.Query(TestContext(), tokens).at("instance-a");
     EXPECT_EQ(result.longest_match_tokens, 64);
-    EXPECT_EQ(result.npu, 16);
+    EXPECT_EQ(result.device, 16);
     EXPECT_EQ(result.dp, (std::map<int64_t, int64_t>{{0, 16}}));
     EXPECT_EQ(result.rank_matches, (std::map<int64_t, RankCacheHitResult>{
                                        {0, RankMatch(16, 16, 16, 64)}}));
@@ -961,7 +965,7 @@ TEST(Query, LocalAndSharedTiersRespectRankAndContinuousPrefix) {
 
 TEST(Query, FourTierInterleavedPrefixesAndGaps) {
     struct Case {
-        // NPU, local CPU, shared CPU, local disk, shared disk, absent.
+        // DEVICE, local CPU, shared CPU, local disk, shared disk, absent.
         std::string tiers;
         RankCacheHitResult expected;
     };
@@ -987,7 +991,7 @@ TEST(Query, FourTierInterleavedPrefixesAndGaps) {
                           "");
             } else {
                 auto mutation = Gpu({hashes[i]});
-                mutation.tier = tier == 'N'   ? StorageTier::kNpu
+                mutation.tier = tier == 'N'   ? StorageTier::kDevice
                                 : tier == 'L' ? StorageTier::kCpuLocal
                                               : StorageTier::kDisk;
                 ASSERT_EQ(table.StoreEngine(mutation), "");
@@ -995,8 +999,8 @@ TEST(Query, FourTierInterleavedPrefixesAndGaps) {
         }
         const auto result = table.Query(TestContext(), tokens).at("instance-a");
         EXPECT_EQ(result.rank_matches.at(0), example.expected);
-        EXPECT_EQ(result.dp.at(0), example.expected.npu);
-        EXPECT_EQ(result.npu, example.expected.npu);
+        EXPECT_EQ(result.dp.at(0), example.expected.device);
+        EXPECT_EQ(result.device, example.expected.device);
         EXPECT_EQ(result.cpu_local, example.expected.cpu_local);
         EXPECT_EQ(result.cpu_share, example.expected.cpu_share);
         EXPECT_EQ(result.longest_match_tokens, example.expected.disk);
@@ -1058,7 +1062,7 @@ TEST(Mutations, FourTierMutationsRejectWrongOwnerFamily) {
     auto clear = ClearFor();
     clear.tier = StorageTier::kCpuShare;
     EXPECT_FALSE(table.ClearEngine(clear).empty());
-    for (auto tier : {StorageTier::kNpu, StorageTier::kCpuLocal}) {
+    for (auto tier : {StorageTier::kDevice, StorageTier::kCpuLocal}) {
         auto shared = Shared({Prefix(1)}, tier);
         EXPECT_FALSE(table.StoreShared(shared).empty());
         EXPECT_FALSE(table.RemoveShared(shared).empty());
@@ -1164,7 +1168,7 @@ TEST(Query, DiskMissIgnoresAllLaterIsolatedBlocks) {
 
     const auto result = table.Query(TestContext(), tokens).at("instance-a");
     EXPECT_EQ(result.longest_match_tokens, 32);
-    EXPECT_EQ(result.npu, 16);
+    EXPECT_EQ(result.device, 16);
     EXPECT_EQ(result.dp, (std::map<int64_t, int64_t>{{0, 16}}));
     EXPECT_EQ(result.rank_matches, (std::map<int64_t, RankCacheHitResult>{
                                        {0, RankMatch(16, 16, 32, 32)}}));
@@ -1189,7 +1193,7 @@ TEST(Query, DifferentRanksNeverFabricateOneGpuPrefix) {
 
     const auto result = table.Query(TestContext(), tokens).at("instance-a");
     EXPECT_EQ(result.longest_match_tokens, 16);
-    EXPECT_EQ(result.npu, 16);
+    EXPECT_EQ(result.device, 16);
     EXPECT_EQ(result.dp, (std::map<int64_t, int64_t>{{0, 16}, {1, 0}}));
     EXPECT_EQ(result.rank_matches,
               (std::map<int64_t, RankCacheHitResult>{
@@ -1225,9 +1229,9 @@ TEST(Query, InstanceSummaryIsRealizedByMaximumGpuRank) {
     EXPECT_EQ(result.dp.size(), result.rank_matches.size());
     for (const auto& [rank, gpu] : result.dp) {
         ASSERT_TRUE(result.rank_matches.contains(rank));
-        EXPECT_EQ(gpu, result.rank_matches.at(rank).npu);
+        EXPECT_EQ(gpu, result.rank_matches.at(rank).device);
     }
-    EXPECT_EQ(result.npu, result.rank_matches.at(0).npu);
+    EXPECT_EQ(result.device, result.rank_matches.at(0).device);
     EXPECT_EQ(result.cpu_share, result.rank_matches.at(0).cpu_share);
     EXPECT_EQ(result.disk, result.rank_matches.at(0).disk);
     EXPECT_EQ(result.longest_match_tokens, result.rank_matches.at(0).disk);
@@ -1247,7 +1251,7 @@ TEST(Query, RegisteredZeroHitRanksAndIncompleteTailAreRetained) {
     EXPECT_EQ(result.rank_matches,
               (std::map<int64_t, RankCacheHitResult>{
                   {0, RankMatch(0, 0, 0, 0)}, {2, RankMatch(0, 0, 0, 0)}}));
-    EXPECT_EQ(result.npu, 0);
+    EXPECT_EQ(result.device, 0);
     EXPECT_EQ(result.cpu_share, 0);
     EXPECT_EQ(result.disk, 0);
 }

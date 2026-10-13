@@ -34,6 +34,24 @@
 
 namespace mooncake {
 
+// GPU builds also run on hosts without a GPU (e.g. the CUDA wheel on a CPU
+// instance). Request FI_HMEM and use the device-memory paths only when a
+// device is present; otherwise the EFA provider rejects the FI_HMEM hints.
+static bool hasGpuDevice() {
+    static const bool present = [] {
+        int count = 0;
+#if defined(USE_CUDA)
+        return cudaGetDeviceCount(&count) == cudaSuccess && count > 0;
+#elif defined(USE_HIP)
+        return hipGetDeviceCount(&count) == hipSuccess && count > 0;
+#else
+        (void)count;
+        return false;
+#endif
+    }();
+    return present;
+}
+
 // EfaContext implementation
 
 EfaContext::EfaContext(EfaTransport& engine, const std::string& device_name)
@@ -56,14 +74,16 @@ EfaContext::~EfaContext() {
 
 int EfaContext::construct(size_t num_cq_list, size_t max_cqe,
                           int max_endpoints) {
-#if !defined(USE_CUDA) && !defined(USE_HIP)
-    // When built without GPU support, prevent libfabric's EFA provider from
-    // dlopen-ing libcudart/libcuda at fi_getinfo/fi_domain time. That
-    // initialization creates a CUDA primary context on GPU 0 and leaks
-    // ~616 MiB of device memory even when no GPU memory is ever registered.
-    // Only set if the user hasn't explicitly configured FI_HMEM.
-    setenv("FI_HMEM", "system", 0);
-#endif
+    const bool gpu = hasGpuDevice();
+    if (!gpu) {
+        // Without GPU memory to register (CPU build or no device), prevent
+        // libfabric's EFA provider from dlopen-ing libcudart/libcuda at
+        // fi_getinfo/fi_domain time. That initialization creates a CUDA
+        // primary context on GPU 0 and leaks ~616 MiB of device memory even
+        // when no GPU memory is ever registered. Only set if the user hasn't
+        // explicitly configured FI_HMEM.
+        setenv("FI_HMEM", "system", 0);
+    }
 
     // Setup hints for EFA provider
     hints_ = fi_allocinfo();
@@ -73,9 +93,8 @@ int EfaContext::construct(size_t num_cq_list, size_t max_cqe,
     }
 
     hints_->caps =
-        FI_MSG | FI_RMA | FI_READ | FI_WRITE | FI_REMOTE_READ |
-        FI_REMOTE_WRITE
-#if defined(USE_CUDA) || defined(USE_HIP)
+        FI_MSG | FI_RMA | FI_READ | FI_WRITE | FI_REMOTE_READ | FI_REMOTE_WRITE;
+    if (gpu) {
         // Declare FI_HMEM so the provider wires up HMEM-aware copy routines
         // (cudaMemcpy) on every data path, including the intra-node SHM SAR
         // segmentation/reassembly path. Registering device memory via
@@ -84,9 +103,8 @@ int EfaContext::construct(size_t num_cq_list, size_t max_cqe,
         // does a host memcpy() straight into a CUDA device VA during SAR,
         // which SIGSEGVs in __memcpy_avx512_unaligned_erms.
         // See https://github.com/ofiwg/libfabric/issues/12328.
-        | FI_HMEM
-#endif
-        ;
+        hints_->caps |= FI_HMEM;
+    }
     hints_->mode = FI_CONTEXT;
     hints_->ep_attr->type = FI_EP_RDM;  // EFA uses RDM endpoints
     hints_->fabric_attr->prov_name = strdup("efa");
@@ -94,12 +112,9 @@ int EfaContext::construct(size_t num_cq_list, size_t max_cqe,
     // Specify the domain (device) name - append "-rdm" for RDM endpoint
     std::string domain_name = device_name_ + "-rdm";
     hints_->domain_attr->name = strdup(domain_name.c_str());
-    hints_->domain_attr->mr_mode = FI_MR_LOCAL | FI_MR_VIRT_ADDR |
-                                   FI_MR_ALLOCATED | FI_MR_PROV_KEY
-#if defined(USE_CUDA) || defined(USE_HIP)
-                                   | FI_MR_HMEM
-#endif
-        ;
+    hints_->domain_attr->mr_mode =
+        FI_MR_LOCAL | FI_MR_VIRT_ADDR | FI_MR_ALLOCATED | FI_MR_PROV_KEY;
+    if (gpu) hints_->domain_attr->mr_mode |= FI_MR_HMEM;
     hints_->domain_attr->threading = FI_THREAD_SAFE;
 
     // Get fabric info.
@@ -503,6 +518,12 @@ class ScopedCudaContext {
 };
 
 static int getCudaDeviceForPointer(const void* ptr, cudaError_t& status) {
+    // Without a device every pointer is host memory, and the CUDA runtime
+    // would fail the query instead of saying so.
+    if (!hasGpuDevice()) {
+        status = cudaSuccess;
+        return -1;
+    }
     cudaPointerAttributes attributes;
     status = cudaPointerGetAttributes(&attributes, ptr);
     if (status != cudaSuccess) return -1;
