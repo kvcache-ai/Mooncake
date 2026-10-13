@@ -3,6 +3,7 @@
 #include "config/hugepage_config.h"
 #include "config/mmap_arena_config.h"
 #include "mmap_arena.h"
+#include "environ.h"
 
 #include <algorithm>
 #include <atomic>
@@ -35,7 +36,8 @@ static std::atomic<uint64_t> g_arena_noop_free_count{0};
 
 static void initializeGlobalArena() {
     const MmapArenaConfig config = MmapArenaConfig::FromEnvironment(
-        FLAGS_use_mmap_arena_allocator, FLAGS_mmap_arena_pool_size);
+        Environ::Process(), FLAGS_use_mmap_arena_allocator,
+        FLAGS_mmap_arena_pool_size);
     if (!config.enabled) {
         return;
     }
@@ -231,7 +233,8 @@ void *allocate_buffer_mmap_memory(size_t total_size, size_t alignment,
 
     // Traditional mmap allocation (fallback or arena disabled).
     const bool defer_direct_population =
-        defer_hugetlb_population && HugepageConfig::FromEnvironment().enabled;
+        defer_hugetlb_population &&
+        HugepageConfig::FromEnvironment(Environ::Process()).enabled;
     unsigned int flags = MAP_PRIVATE | MAP_ANONYMOUS;
     if (!defer_direct_population) {
         flags |= MAP_POPULATE;

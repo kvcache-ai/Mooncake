@@ -6,16 +6,19 @@
 
 namespace mooncake {
 
+class Environ;
+
 struct ClientAutoDiscoveryConfig {
     bool enabled = false;
     std::vector<std::string> filters;
 
     static ClientAutoDiscoveryConfig FromEnvironment(
-        std::string_view protocol, bool device_names_configured);
+        const Environ& env, std::string_view protocol,
+        bool device_names_configured);
 
     // Filters are loaded after the enabled state is applied so the existing
     // environment-read and diagnostic order remains unchanged.
-    void LoadFiltersFromEnvironment();
+    void LoadFiltersFromEnvironment(const Environ& env);
 };
 
 }  // namespace mooncake

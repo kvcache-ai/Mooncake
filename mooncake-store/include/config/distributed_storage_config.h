@@ -6,6 +6,8 @@
 
 namespace mooncake {
 
+class Environ;
+
 struct DistributedStorageConfig {
     std::string fsdir = "/mnt/3fs/mooncake";
     std::string fs_adapter_type = "hf3fs";
@@ -25,7 +27,7 @@ struct DistributedStorageConfig {
 
     bool Validate() const;
     bool ValidateForAllocator() const;
-    static DistributedStorageConfig FromEnvironment();
+    static DistributedStorageConfig FromEnvironment(const Environ& env);
     std::string FormatStr() const;
 };
 

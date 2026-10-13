@@ -11,6 +11,7 @@
 #include <thread>
 
 #include "client_service.h"
+#include "environ.h"
 #include "file_storage.h"
 #include "storage_backend.h"
 
@@ -161,7 +162,6 @@ class FileStoragePromotionTest : public ::testing::Test {
     void SetUp() override {
         google::InitGoogleLogging("FileStoragePromotionTest");
         FLAGS_logtostderr = true;
-        unsetenv("MOONCAKE_OFFLOAD_FILE_STORAGE_PATH");
 
         data_path = std::filesystem::current_path().string() + "/data_prom";
         std::filesystem::create_directories(data_path);
@@ -170,7 +170,9 @@ class FileStoragePromotionTest : public ::testing::Test {
             if (entry.is_regular_file()) std::filesystem::remove(entry.path());
         }
 
-        FileStorageConfig cfg = FileStorageConfig::FromEnvironment();
+        const MapEnvironSource empty_environment;
+        FileStorageConfig cfg =
+            FileStorageConfig::FromEnvironment(Environ(empty_environment));
         cfg.storage_filepath = data_path;
         cfg.local_buffer_size = 4 * 1024 * 1024;
         fake = std::make_shared<fs_test::FakeClient>();

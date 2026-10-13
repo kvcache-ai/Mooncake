@@ -21,6 +21,8 @@
 
 namespace mooncake {
 
+class Environ;
+
 // latency bucket is in microsecond
 // Tuned for RDMA: fine-grained in <1ms, with ms-scale tail up to 1s
 const std::vector<double> kLatencyBucket = {
@@ -870,7 +872,7 @@ struct ClientMetricConfig {
     std::chrono::milliseconds reporting_interval{0};
     bool bandwidth_reporting_enabled = true;
 
-    static ClientMetricConfig FromEnvironment();
+    static ClientMetricConfig FromEnvironment(const Environ& env);
 };
 
 struct ClientMetric {

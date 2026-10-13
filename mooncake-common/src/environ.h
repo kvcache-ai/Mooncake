@@ -128,23 +128,6 @@ class Environ {
         }
     }
 
-    // Compatibility wrappers over Process() for configs that still read the
-    // process environment directly. They keep the previous static API and
-    // behavior and are removed once those configs accept an Environ.
-    template <typename T>
-    static std::optional<T> Read(const EnvironmentVariable<T>& variable) {
-        return Process().GetTyped(variable);
-    }
-
-    template <typename T>
-    static T ReadOr(const EnvironmentVariable<T>& variable, T default_value) {
-        return Process().GetTypedOr(variable, std::move(default_value));
-    }
-
-    // An unset or empty value returns `default_value` silently; an invalid
-    // value warns and returns `default_value`.
-    static double GetDouble(const char* name, double default_value);
-
    private:
     const EnvironSource* source_;
 };

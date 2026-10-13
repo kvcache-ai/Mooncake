@@ -20,6 +20,7 @@
 #include "k8s_lease_helper.h"
 #include "master_admin_service.h"
 #include "rpc_service.h"
+#include "environ.h"
 
 namespace mooncake {
 namespace ha {
@@ -414,7 +415,7 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         coro_rpc::coro_rpc_server server(
             config.rpc_thread_num, config.rpc_port, config.rpc_address,
             config.rpc_conn_timeout, config.rpc_enable_tcp_no_delay);
-        if (RpcProtocolConfig::FromEnvironment().use_rdma) {
+        if (RpcProtocolConfig::FromEnvironment(Environ::Process()).use_rdma) {
 #ifdef YLT_ENABLE_IBV
             server.init_ibv();
 #else

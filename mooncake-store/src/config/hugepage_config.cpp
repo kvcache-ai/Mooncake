@@ -17,14 +17,14 @@ constexpr size_t kSize1Gb = 1024ULL * 1024 * 1024;
 
 }  // namespace
 
-bool HugepageConfig::IsEnabledFromEnvironment() {
+bool HugepageConfig::IsEnabledFromEnvironment(const Environ& env) {
     using Variables = HugepageEnvironmentVariables;
-    return Environ::Read(Variables::MC_STORE_USE_HUGEPAGE).has_value();
+    return env.GetTyped(Variables::MC_STORE_USE_HUGEPAGE).has_value();
 }
 
-HugepageConfig HugepageConfig::FromEnvironment() {
+HugepageConfig HugepageConfig::FromEnvironment(const Environ& env) {
     HugepageConfig config;
-    if (!IsEnabledFromEnvironment()) {
+    if (!IsEnabledFromEnvironment(env)) {
         return config;
     }
 
@@ -32,7 +32,7 @@ HugepageConfig HugepageConfig::FromEnvironment() {
     config.page_size = kSize2Mb;
 
     using Variables = HugepageEnvironmentVariables;
-    const auto raw_size = Environ::Read(Variables::MC_STORE_HUGEPAGE_SIZE);
+    const auto raw_size = env.GetTyped(Variables::MC_STORE_HUGEPAGE_SIZE);
     if (!raw_size.has_value()) {
         return config;
     }

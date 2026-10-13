@@ -15,16 +15,16 @@ bool FilePerKeyConfig::Validate() const {
     return true;
 }
 
-FilePerKeyConfig FilePerKeyConfig::FromEnvironment() {
+FilePerKeyConfig FilePerKeyConfig::FromEnvironment(const Environ& env) {
     FilePerKeyConfig config;
     using Variables = FilePerKeyEnvironmentVariables;
 
     config.fsdir =
-        Environ::ReadOr(Variables::MOONCAKE_OFFLOAD_FSDIR, config.fsdir);
+        env.GetTypedOr(Variables::MOONCAKE_OFFLOAD_FSDIR, config.fsdir);
 
-    config.enable_eviction = Environ::ReadOr(
+    config.enable_eviction = env.GetTypedOr(
         Variables::MOONCAKE_OFFLOAD_ENABLE_EVICTION,
-        Environ::ReadOr(Variables::ENABLE_EVICTION, config.enable_eviction));
+        env.GetTypedOr(Variables::ENABLE_EVICTION, config.enable_eviction));
 
     return config;
 }

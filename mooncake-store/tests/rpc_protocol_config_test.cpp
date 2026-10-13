@@ -1,37 +1,23 @@
 #include <gtest/gtest.h>
 
-#include <cstdlib>
-#include <optional>
-#include <string>
-
 #include "config/rpc_protocol_config.h"
+#include "environ.h"
 
 namespace mooncake {
 namespace {
 
 class RpcProtocolConfigTest : public ::testing::Test {
    protected:
-    void SetUp() override {
-        if (const char* value = std::getenv(kName)) {
-            original_ = value;
-        }
-        ASSERT_EQ(unsetenv(kName), 0);
-    }
-
-    void TearDown() override {
-        if (original_.has_value()) {
-            EXPECT_EQ(setenv(kName, original_->c_str(), 1), 0);
-        } else {
-            EXPECT_EQ(unsetenv(kName), 0);
-        }
+    RpcProtocolConfig Load() const {
+        return RpcProtocolConfig::FromEnvironment(Environ(source_));
     }
 
     static constexpr const char* kName = "MC_RPC_PROTOCOL";
-    std::optional<std::string> original_;
+    MapEnvironSource source_;
 };
 
 TEST_F(RpcProtocolConfigTest, OnlyExactRdmaTokenEnablesRdma) {
-    EXPECT_FALSE(RpcProtocolConfig::FromEnvironment().use_rdma);
+    EXPECT_FALSE(Load().use_rdma);
 
     struct Case {
         const char* value;
@@ -42,20 +28,19 @@ TEST_F(RpcProtocolConfigTest, OnlyExactRdmaTokenEnablesRdma) {
                           {"1", false}};
     for (const auto& entry : cases) {
         SCOPED_TRACE(entry.value);
-        ASSERT_EQ(setenv(kName, entry.value, 1), 0);
-        EXPECT_EQ(RpcProtocolConfig::FromEnvironment().use_rdma,
-                  entry.expected);
+        source_.Set(kName, entry.value);
+        EXPECT_EQ(Load().use_rdma, entry.expected);
     }
 }
 
 TEST_F(RpcProtocolConfigTest, EachConstructionReadsCurrentEnvironment) {
-    const auto unset = RpcProtocolConfig::FromEnvironment();
+    const auto unset = Load();
 
-    ASSERT_EQ(setenv(kName, "rdma", 1), 0);
-    const auto enabled = RpcProtocolConfig::FromEnvironment();
+    source_.Set(kName, "rdma");
+    const auto enabled = Load();
 
-    ASSERT_EQ(setenv(kName, "tcp", 1), 0);
-    const auto disabled = RpcProtocolConfig::FromEnvironment();
+    source_.Set(kName, "tcp");
+    const auto disabled = Load();
 
     EXPECT_FALSE(unset.use_rdma);
     EXPECT_TRUE(enabled.use_rdma);

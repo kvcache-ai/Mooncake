@@ -19,13 +19,15 @@
 
 namespace mooncake {
 
+class Environ;
+
 struct LocalHotCacheConfig {
     size_t total_size_bytes = 0;
     size_t block_size_bytes = 16 * 1024 * 1024;
     bool use_shm = false;
     uint8_t admission_threshold = 2;
 
-    static LocalHotCacheConfig FromEnvironment();
+    static LocalHotCacheConfig FromEnvironment(const Environ& env);
 };
 
 /**

@@ -9,6 +9,8 @@
 
 namespace mooncake {
 
+class Environ;
+
 enum class NvmeKvTransport {
     kAuto,
     kIoUring,
@@ -24,7 +26,8 @@ struct NvmeKvConnectorConfig {
     uint32_t runtime_transfer_limit = 270336;
     NvmeKvTransport transport = NvmeKvTransport::kAuto;
 
-    static tl::expected<NvmeKvConnectorConfig, ErrorCode> FromEnvironment();
+    static tl::expected<NvmeKvConnectorConfig, ErrorCode> FromEnvironment(
+        const Environ& env);
 };
 
 }  // namespace mooncake

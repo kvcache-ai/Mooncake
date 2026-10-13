@@ -11,10 +11,11 @@
 
 namespace mooncake {
 
-TransferSubmitterConfig TransferSubmitterConfig::FromEnvironment() {
+TransferSubmitterConfig TransferSubmitterConfig::FromEnvironment(
+    const Environ& env) {
     TransferSubmitterConfig config;
     auto value =
-        Environ::Read(TransferSubmitterEnvironmentVariables::MC_STORE_MEMCPY);
+        env.GetTyped(TransferSubmitterEnvironmentVariables::MC_STORE_MEMCPY);
     if (!value.has_value()) {
         return config;
     }

@@ -2,61 +2,48 @@
 
 #include <gtest/gtest.h>
 
-#include <cstdlib>
-#include <optional>
 #include <string>
+
+#include "environ.h"
 
 namespace mooncake::test {
 namespace {
 
-class ScopedEnvVar {
-   public:
-    explicit ScopedEnvVar(const char* name) : name_(name) {
-        if (const char* value = std::getenv(name)) {
-            original_ = value;
-        }
-        unsetenv(name);
-    }
-
-    ~ScopedEnvVar() {
-        if (original_.has_value()) {
-            setenv(name_.c_str(), original_->c_str(), 1);
-        } else {
-            unsetenv(name_.c_str());
-        }
-    }
-
-    void Set(const char* value) { setenv(name_.c_str(), value, 1); }
-
-   private:
-    std::string name_;
-    std::optional<std::string> original_;
-};
-
 class DfsEnablementConfigTest : public ::testing::Test {
    protected:
-    ScopedEnvVar enabled{"MOONCAKE_ENABLE_DFS"};
-    ScopedEnvVar legacy_enabled{"MOONCAKE_DFS_ENABLED"};
+    DfsEnablementConfig Load() const {
+        return DfsEnablementConfig::FromEnvironment(Environ(source_));
+    }
+
+    void SetEnabled(const char* value) {
+        source_.Set("MOONCAKE_ENABLE_DFS", value);
+    }
+
+    void SetLegacyEnabled(const char* value) {
+        source_.Set("MOONCAKE_DFS_ENABLED", value);
+    }
+
+    MapEnvironSource source_;
 };
 
 TEST_F(DfsEnablementConfigTest, DefaultsToDisabled) {
-    EXPECT_FALSE(DfsEnablementConfig::FromEnvironment().enabled);
+    EXPECT_FALSE(Load().enabled);
 }
 
 TEST_F(DfsEnablementConfigTest, PrimaryValueOverridesLegacyAlias) {
-    legacy_enabled.Set("true");
-    EXPECT_TRUE(DfsEnablementConfig::FromEnvironment().enabled);
+    SetLegacyEnabled("true");
+    EXPECT_TRUE(Load().enabled);
 
-    enabled.Set("false");
-    EXPECT_FALSE(DfsEnablementConfig::FromEnvironment().enabled);
+    SetEnabled("false");
+    EXPECT_FALSE(Load().enabled);
 }
 
 TEST_F(DfsEnablementConfigTest, InvalidPrimaryFallsBackToLegacyAlias) {
-    legacy_enabled.Set("true");
-    enabled.Set("invalid-primary");
+    SetLegacyEnabled("true");
+    SetEnabled("invalid-primary");
 
     testing::internal::CaptureStderr();
-    const auto config = DfsEnablementConfig::FromEnvironment();
+    const auto config = Load();
     const std::string diagnostics = testing::internal::GetCapturedStderr();
 
     EXPECT_TRUE(config.enabled);
@@ -65,11 +52,11 @@ TEST_F(DfsEnablementConfigTest, InvalidPrimaryFallsBackToLegacyAlias) {
 }
 
 TEST_F(DfsEnablementConfigTest, PreservesInvalidValueDiagnostics) {
-    legacy_enabled.Set("invalid-legacy");
-    enabled.Set("invalid-primary");
+    SetLegacyEnabled("invalid-legacy");
+    SetEnabled("invalid-primary");
 
     testing::internal::CaptureStderr();
-    const auto config = DfsEnablementConfig::FromEnvironment();
+    const auto config = Load();
     const std::string diagnostics = testing::internal::GetCapturedStderr();
 
     EXPECT_FALSE(config.enabled);

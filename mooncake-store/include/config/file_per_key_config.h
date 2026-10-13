@@ -4,6 +4,8 @@
 
 namespace mooncake {
 
+class Environ;
+
 struct FilePerKeyConfig {
     std::string fsdir = "file_per_key_dir";  // Subdirectory name
 
@@ -11,7 +13,7 @@ struct FilePerKeyConfig {
 
     bool Validate() const;
 
-    static FilePerKeyConfig FromEnvironment();
+    static FilePerKeyConfig FromEnvironment(const Environ& env);
 };
 
 }  // namespace mooncake

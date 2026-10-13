@@ -7,13 +7,15 @@
 #include "common/byte_size.h"
 #include "config/store_cluster_identity_config.h"
 #include "version.h"
+#include "environ.h"
 
 namespace mooncake {
 
 const std::map<std::string, std::string> merge_labels(
     const std::map<std::string, std::string>& labels) {
     static const std::string cluster_id =
-        StoreClusterIdentityConfig::FromEnvironment().cluster_id.value_or("");
+        StoreClusterIdentityConfig::FromEnvironment(Environ::Process())
+            .cluster_id.value_or("");
     std::map<std::string, std::string> merged_labels;
     if (!cluster_id.empty()) {
         merged_labels["cluster_id"] = cluster_id;
@@ -70,7 +72,7 @@ ClientMetric::~ClientMetric() { StopMetricsReportingThread(); }
 std::unique_ptr<ClientMetric> ClientMetric::Create(
     const std::map<std::string, std::string>& labels,
     bool master_rpc_metrics_enabled) {
-    const auto config = ClientMetricConfig::FromEnvironment();
+    const auto config = ClientMetricConfig::FromEnvironment(Environ::Process());
     if (!config.enabled) {
         LOG(INFO) << "Client metrics disabled (set MC_STORE_CLIENT_METRIC=0 to "
                      "disable)";

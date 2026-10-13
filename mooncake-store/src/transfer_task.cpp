@@ -18,6 +18,7 @@
 #include "config/fileread_worker_pool_config.h"
 #include "config/nof_worker_pool_config.h"
 #include "device/accelerator_registry.h"
+#include "environ.h"
 #include "transfer_engine.h"
 #include "transport/transport.h"
 #ifdef USE_TENT
@@ -224,7 +225,8 @@ SpdkNofQos::SpdkNofQos(uint32_t block_size) {
 // ============================================================================
 FilereadWorkerPool::FilereadWorkerPool(std::shared_ptr<StorageBackend>& backend)
     : shutdown_(false) {
-    static const auto config = FilereadWorkerPoolConfig::FromEnvironment();
+    static const auto config =
+        FilereadWorkerPoolConfig::FromEnvironment(Environ::Process());
     const int num_workers = config.worker_count;
     VLOG(1) << "Creating FilereadWorkerPool with " << num_workers << " workers";
 
@@ -1035,7 +1037,8 @@ TransferSubmitter::TransferSubmitter(TransferEngine& engine,
     // When not set, auto-detect based on transport type:
     //   - TCP-only environment: enable memcpy (avoids TCP loopback overhead)
     //   - RDMA/other transports: disable memcpy (RDMA is more efficient)
-    const auto config = TransferSubmitterConfig::FromEnvironment();
+    const auto config =
+        TransferSubmitterConfig::FromEnvironment(Environ::Process());
     if (config.memcpy_enabled_override.has_value()) {
         memcpy_enabled_ = *config.memcpy_enabled_override;
     } else {

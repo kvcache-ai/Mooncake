@@ -3,53 +3,19 @@
 
 #include <chrono>
 #include <cstdlib>
-#include <optional>
 #include <string>
 
 #include "client_metric.h"
+#include "environ.h"
 #include "environment_variables.h"
 
 namespace mooncake {
 namespace {
 
-class ScopedEnvVar {
-   public:
-    explicit ScopedEnvVar(const char* name) : name_(name) {
-        const char* value = std::getenv(name);
-        if (value != nullptr) {
-            original_ = value;
-        }
-        unsetenv(name);
-    }
-
-    ~ScopedEnvVar() {
-        if (original_.has_value()) {
-            setenv(name_.c_str(), original_->c_str(), 1);
-        } else {
-            unsetenv(name_.c_str());
-        }
-    }
-
-    ScopedEnvVar(const ScopedEnvVar&) = delete;
-    ScopedEnvVar& operator=(const ScopedEnvVar&) = delete;
-
-    void Set(const char* value) { setenv(name_.c_str(), value, 1); }
-
-   private:
-    std::string name_;
-    std::optional<std::string> original_;
-};
-
-struct ClientMetricEnvironment {
-    using Variables = ClientMetricEnvironmentVariables;
-
-    ScopedEnvVar enabled{Variables::MC_STORE_CLIENT_METRIC.name};
-    ScopedEnvVar interval{Variables::MC_STORE_CLIENT_METRIC_INTERVAL.name};
-    ScopedEnvVar bandwidth{Variables::MC_STORE_CLIENT_METRIC_BANDWIDTH.name};
-};
-
 class ClientMetricConfigTest : public ::testing::Test {
    protected:
+    using Variables = ClientMetricEnvironmentVariables;
+
     void SetUp() override {
         google::InitGoogleLogging("ClientMetricConfigTest");
         FLAGS_logtostderr = true;
@@ -57,11 +23,27 @@ class ClientMetricConfigTest : public ::testing::Test {
 
     void TearDown() override { google::ShutdownGoogleLogging(); }
 
-    ClientMetricEnvironment env;
+    ClientMetricConfig Load() const {
+        return ClientMetricConfig::FromEnvironment(Environ(source_));
+    }
+
+    void SetEnabled(const char* value) {
+        source_.Set(Variables::MC_STORE_CLIENT_METRIC.name, value);
+    }
+
+    void SetInterval(const char* value) {
+        source_.Set(Variables::MC_STORE_CLIENT_METRIC_INTERVAL.name, value);
+    }
+
+    void SetBandwidth(const char* value) {
+        source_.Set(Variables::MC_STORE_CLIENT_METRIC_BANDWIDTH.name, value);
+    }
+
+    MapEnvironSource source_;
 };
 
 TEST_F(ClientMetricConfigTest, UsesDefaultsWhenEnvironmentIsUnset) {
-    const auto config = ClientMetricConfig::FromEnvironment();
+    const auto config = Load();
 
     EXPECT_TRUE(config.enabled);
     EXPECT_EQ(config.reporting_interval, std::chrono::milliseconds::zero());
@@ -69,12 +51,12 @@ TEST_F(ClientMetricConfigTest, UsesDefaultsWhenEnvironmentIsUnset) {
 }
 
 TEST_F(ClientMetricConfigTest, ReadsValidEnvironmentValues) {
-    env.enabled.Set("true");
-    env.interval.Set(" +15 ");
-    env.bandwidth.Set("false");
+    SetEnabled("true");
+    SetInterval(" +15 ");
+    SetBandwidth("false");
 
     ::testing::internal::CaptureStderr();
-    const auto config = ClientMetricConfig::FromEnvironment();
+    const auto config = Load();
     const std::string logs = ::testing::internal::GetCapturedStderr();
 
     EXPECT_TRUE(config.enabled);
@@ -86,12 +68,12 @@ TEST_F(ClientMetricConfigTest, ReadsValidEnvironmentValues) {
 }
 
 TEST_F(ClientMetricConfigTest, InvalidEnableValueSilentlyDisablesMetrics) {
-    env.enabled.Set("invalid");
-    env.interval.Set("invalid");
-    env.bandwidth.Set("invalid");
+    SetEnabled("invalid");
+    SetInterval("invalid");
+    SetBandwidth("invalid");
 
     ::testing::internal::CaptureStderr();
-    const auto config = ClientMetricConfig::FromEnvironment();
+    const auto config = Load();
     const std::string logs = ::testing::internal::GetCapturedStderr();
 
     EXPECT_FALSE(config.enabled);
@@ -102,10 +84,10 @@ TEST_F(ClientMetricConfigTest, InvalidEnableValueSilentlyDisablesMetrics) {
 }
 
 TEST_F(ClientMetricConfigTest, EmptyEnableValueSilentlyDisablesMetrics) {
-    env.enabled.Set("");
+    SetEnabled("");
 
     ::testing::internal::CaptureStderr();
-    const auto config = ClientMetricConfig::FromEnvironment();
+    const auto config = Load();
     const std::string logs = ::testing::internal::GetCapturedStderr();
 
     EXPECT_FALSE(config.enabled);
@@ -115,10 +97,10 @@ TEST_F(ClientMetricConfigTest, EmptyEnableValueSilentlyDisablesMetrics) {
 TEST_F(ClientMetricConfigTest, InvalidIntervalValuesUseDefaultAndWarn) {
     for (const char* value : {"invalid", "-1", "18446744073709551616", ""}) {
         SCOPED_TRACE(value);
-        env.interval.Set(value);
+        SetInterval(value);
 
         ::testing::internal::CaptureStderr();
-        const auto config = ClientMetricConfig::FromEnvironment();
+        const auto config = Load();
         const std::string logs = ::testing::internal::GetCapturedStderr();
 
         EXPECT_EQ(config.reporting_interval, std::chrono::milliseconds::zero());
@@ -131,10 +113,10 @@ TEST_F(ClientMetricConfigTest, InvalidIntervalValuesUseDefaultAndWarn) {
 TEST_F(ClientMetricConfigTest, InvalidBandwidthValuesUseDefaultAndWarn) {
     for (const char* value : {"invalid", ""}) {
         SCOPED_TRACE(value);
-        env.bandwidth.Set(value);
+        SetBandwidth(value);
 
         ::testing::internal::CaptureStderr();
-        const auto config = ClientMetricConfig::FromEnvironment();
+        const auto config = Load();
         const std::string logs = ::testing::internal::GetCapturedStderr();
 
         EXPECT_TRUE(config.bandwidth_reporting_enabled);
@@ -145,10 +127,10 @@ TEST_F(ClientMetricConfigTest, InvalidBandwidthValuesUseDefaultAndWarn) {
 }
 
 TEST_F(ClientMetricConfigTest, ZeroIntervalRemainsEnabled) {
-    env.interval.Set("0");
+    SetInterval("0");
 
     ::testing::internal::CaptureStderr();
-    const auto config = ClientMetricConfig::FromEnvironment();
+    const auto config = Load();
     const std::string logs = ::testing::internal::GetCapturedStderr();
 
     EXPECT_TRUE(config.enabled);

@@ -11,11 +11,11 @@
 
 namespace mooncake {
 
-ClientNumaConfig ClientNumaConfig::FromEnvironment() {
+ClientNumaConfig ClientNumaConfig::FromEnvironment(const Environ& env) {
     ClientNumaConfig config;
     using Variables = ClientNumaEnvironmentVariables;
 
-    const auto raw_value = Environ::Read(Variables::MC_STORE_NUMA_SOCKET_ID);
+    const auto raw_value = env.GetTyped(Variables::MC_STORE_NUMA_SOCKET_ID);
     if (!raw_value.has_value() || raw_value->empty()) {
         return config;
     }

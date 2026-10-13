@@ -5,6 +5,8 @@
 
 namespace mooncake {
 
+class Environ;
+
 struct SpdkControllerConfig {
     std::optional<uint32_t> num_io_queues;
     std::optional<uint32_t> io_queue_size;
@@ -15,7 +17,7 @@ struct SpdkControllerConfig {
     std::optional<bool> header_digest;
     std::optional<bool> data_digest;
 
-    static SpdkControllerConfig FromEnvironment();
+    static SpdkControllerConfig FromEnvironment(const Environ& env);
 };
 
 }  // namespace mooncake

@@ -7,15 +7,14 @@
 
 namespace mooncake {
 
-RpcTimeoutConfig RpcTimeoutConfig::FromEnvironment() {
+RpcTimeoutConfig RpcTimeoutConfig::FromEnvironment(const Environ& env) {
     RpcTimeoutConfig config;
     using Variables = RpcTimeoutEnvironmentVariables;
-    if (const auto value = Environ::Read(Variables::MC_RPC_TIMEOUT_MS)) {
+    if (const auto value = env.GetTyped(Variables::MC_RPC_TIMEOUT_MS)) {
         config.request_timeout =
             std::chrono::milliseconds{std::atoll(value->c_str())};
     }
-    if (const auto value =
-            Environ::Read(Variables::MC_RPC_CONNECT_TIMEOUT_MS)) {
+    if (const auto value = env.GetTyped(Variables::MC_RPC_CONNECT_TIMEOUT_MS)) {
         config.connect_timeout =
             std::chrono::milliseconds{std::atoll(value->c_str())};
     }

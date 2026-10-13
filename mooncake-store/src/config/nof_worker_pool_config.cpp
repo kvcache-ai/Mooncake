@@ -8,10 +8,10 @@
 
 namespace mooncake {
 
-NoFWorkerPoolConfig NoFWorkerPoolConfig::FromEnvironment() {
+NoFWorkerPoolConfig NoFWorkerPoolConfig::FromEnvironment(const Environ& env) {
     NoFWorkerPoolConfig config;
     const auto raw =
-        Environ::Read(NoFWorkerPoolEnvironmentVariables::MC_NOF_WORKERS);
+        env.GetTyped(NoFWorkerPoolEnvironmentVariables::MC_NOF_WORKERS);
     if (!raw || raw->empty()) {
         return config;
     }
@@ -27,7 +27,7 @@ NoFWorkerPoolConfig NoFWorkerPoolConfig::FromEnvironment() {
 }
 
 const NoFWorkerPoolConfig& NoFWorkerPoolConfig::AtFirstUse() {
-    static const auto config = FromEnvironment();
+    static const auto config = FromEnvironment(Environ::Process());
     return config;
 }
 

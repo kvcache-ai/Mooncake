@@ -10,6 +10,7 @@
 #include "config/connector_config.h"
 #include "nvme_kv/executor_util.h"
 #include "storage_backend.h"
+#include "environ.h"
 
 namespace mooncake {
 
@@ -45,7 +46,7 @@ tl::expected<void, ErrorCode> NvmeKvConnector::Init() {
 }
 
 tl::expected<void, ErrorCode> NvmeKvConnector::InitRealExecutor() {
-    auto config = NvmeKvConnectorConfig::FromEnvironment();
+    auto config = NvmeKvConnectorConfig::FromEnvironment(Environ::Process());
     if (!config.has_value()) {
         return tl::make_unexpected(config.error());
     }

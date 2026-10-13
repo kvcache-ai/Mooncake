@@ -4,11 +4,13 @@
 
 namespace mooncake {
 
+class Environ;
+
 struct ClientHostIdentityConfig {
     std::string host_id;
 
     static ClientHostIdentityConfig FromEnvironment(
-        const std::string& local_hostname);
+        const Environ& env, const std::string& local_hostname);
 };
 
 }  // namespace mooncake

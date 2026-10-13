@@ -3,12 +3,10 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
-#include <array>
 #include <cstdint>
-#include <cstdlib>
 #include <limits>
-#include <optional>
-#include <string>
+
+#include "environ.h"
 
 namespace mooncake::test {
 namespace {
@@ -24,41 +22,24 @@ class SpdkControllerConfigTest : public ::testing::Test {
     void SetUp() override {
         original_logtostderr_ = FLAGS_logtostderr;
         FLAGS_logtostderr = true;
-        for (size_t i = 0; i < kVariables.size(); ++i) {
-            if (const char* value = std::getenv(kVariables[i])) {
-                original_[i] = value;
-            }
-            ASSERT_EQ(unsetenv(kVariables[i]), 0);
-        }
     }
 
-    void TearDown() override {
-        for (size_t i = 0; i < kVariables.size(); ++i) {
-            if (original_[i].has_value()) {
-                EXPECT_EQ(setenv(kVariables[i], original_[i]->c_str(), 1), 0);
-            } else {
-                EXPECT_EQ(unsetenv(kVariables[i]), 0);
-            }
-        }
-        FLAGS_logtostderr = original_logtostderr_;
+    void TearDown() override { FLAGS_logtostderr = original_logtostderr_; }
+
+    SpdkControllerConfig Load() const {
+        return SpdkControllerConfig::FromEnvironment(Environ(source_));
     }
 
-    inline static constexpr std::array<const char*, 8> kVariables = {
-        "MC_NVME_NUM_IO_QUEUES",     "MC_NVME_IO_QUEUE_SIZE",
-        "MC_NVME_IO_QUEUE_REQUESTS", "MC_NVME_TRANSPORT_ACK_TIMEOUT",
-        "MC_NVME_ADMIN_QUEUE_SIZE",  "MC_NVME_FABRICS_CONNECT_TIMEOUT_US",
-        "MC_NVME_HEADER_DIGEST",     "MC_NVME_DATA_DIGEST",
-    };
-    std::array<std::optional<std::string>, kVariables.size()> original_;
+    MapEnvironSource source_;
     bool original_logtostderr_ = false;
 };
 
 TEST_F(SpdkControllerConfigTest, UnsetAndEmptyValuesLeaveOverridesAbsent) {
-    ASSERT_EQ(setenv("MC_NVME_NUM_IO_QUEUES", "", 1), 0);
-    ASSERT_EQ(setenv("MC_NVME_HEADER_DIGEST", "", 1), 0);
+    source_.Set("MC_NVME_NUM_IO_QUEUES", "");
+    source_.Set("MC_NVME_HEADER_DIGEST", "");
 
     testing::internal::CaptureStderr();
-    const auto config = SpdkControllerConfig::FromEnvironment();
+    const auto config = Load();
     const auto diagnostics = testing::internal::GetCapturedStderr();
 
     EXPECT_FALSE(config.num_io_queues.has_value());
@@ -73,16 +54,16 @@ TEST_F(SpdkControllerConfigTest, UnsetAndEmptyValuesLeaveOverridesAbsent) {
 }
 
 TEST_F(SpdkControllerConfigTest, ReadsIndependentValidOverrides) {
-    ASSERT_EQ(setenv("MC_NVME_NUM_IO_QUEUES", "11", 1), 0);
-    ASSERT_EQ(setenv("MC_NVME_IO_QUEUE_SIZE", "22", 1), 0);
-    ASSERT_EQ(setenv("MC_NVME_IO_QUEUE_REQUESTS", "33", 1), 0);
-    ASSERT_EQ(setenv("MC_NVME_TRANSPORT_ACK_TIMEOUT", "44", 1), 0);
-    ASSERT_EQ(setenv("MC_NVME_ADMIN_QUEUE_SIZE", "55", 1), 0);
-    ASSERT_EQ(setenv("MC_NVME_FABRICS_CONNECT_TIMEOUT_US", "66", 1), 0);
-    ASSERT_EQ(setenv("MC_NVME_HEADER_DIGEST", "false", 1), 0);
-    ASSERT_EQ(setenv("MC_NVME_DATA_DIGEST", "TRUE", 1), 0);
+    source_.Set("MC_NVME_NUM_IO_QUEUES", "11");
+    source_.Set("MC_NVME_IO_QUEUE_SIZE", "22");
+    source_.Set("MC_NVME_IO_QUEUE_REQUESTS", "33");
+    source_.Set("MC_NVME_TRANSPORT_ACK_TIMEOUT", "44");
+    source_.Set("MC_NVME_ADMIN_QUEUE_SIZE", "55");
+    source_.Set("MC_NVME_FABRICS_CONNECT_TIMEOUT_US", "66");
+    source_.Set("MC_NVME_HEADER_DIGEST", "false");
+    source_.Set("MC_NVME_DATA_DIGEST", "TRUE");
 
-    const auto config = SpdkControllerConfig::FromEnvironment();
+    const auto config = Load();
 
     EXPECT_EQ(config.num_io_queues, 11u);
     EXPECT_EQ(config.io_queue_size, 22u);
@@ -95,18 +76,16 @@ TEST_F(SpdkControllerConfigTest, ReadsIndependentValidOverrides) {
 }
 
 TEST_F(SpdkControllerConfigTest, UsesTypedIntegerAndBooleanSyntax) {
-    ASSERT_EQ(setenv("MC_NVME_NUM_IO_QUEUES", "  +42 ", 1), 0);
-    ASSERT_EQ(setenv("MC_NVME_IO_QUEUE_SIZE", "010", 1), 0);
-    ASSERT_EQ(setenv("MC_NVME_IO_QUEUE_REQUESTS", "4294967295", 1), 0);
-    ASSERT_EQ(setenv("MC_NVME_TRANSPORT_ACK_TIMEOUT", "255", 1), 0);
-    ASSERT_EQ(setenv("MC_NVME_ADMIN_QUEUE_SIZE", "65535", 1), 0);
-    ASSERT_EQ(
-        setenv("MC_NVME_FABRICS_CONNECT_TIMEOUT_US", "18446744073709551615", 1),
-        0);
-    ASSERT_EQ(setenv("MC_NVME_HEADER_DIGEST", "OFF", 1), 0);
-    ASSERT_EQ(setenv("MC_NVME_DATA_DIGEST", "enable", 1), 0);
+    source_.Set("MC_NVME_NUM_IO_QUEUES", "  +42 ");
+    source_.Set("MC_NVME_IO_QUEUE_SIZE", "010");
+    source_.Set("MC_NVME_IO_QUEUE_REQUESTS", "4294967295");
+    source_.Set("MC_NVME_TRANSPORT_ACK_TIMEOUT", "255");
+    source_.Set("MC_NVME_ADMIN_QUEUE_SIZE", "65535");
+    source_.Set("MC_NVME_FABRICS_CONNECT_TIMEOUT_US", "18446744073709551615");
+    source_.Set("MC_NVME_HEADER_DIGEST", "OFF");
+    source_.Set("MC_NVME_DATA_DIGEST", "enable");
 
-    const auto config = SpdkControllerConfig::FromEnvironment();
+    const auto config = Load();
 
     EXPECT_EQ(config.num_io_queues, 42u);
     EXPECT_EQ(config.io_queue_size, 10u);
@@ -122,19 +101,17 @@ TEST_F(SpdkControllerConfigTest, UsesTypedIntegerAndBooleanSyntax) {
 
 TEST_F(SpdkControllerConfigTest,
        RejectsNegativeOutOfRangeAndNonCanonicalValues) {
-    ASSERT_EQ(setenv("MC_NVME_NUM_IO_QUEUES", "4294967296", 1), 0);
-    ASSERT_EQ(setenv("MC_NVME_IO_QUEUE_SIZE", "-1", 1), 0);
-    ASSERT_EQ(setenv("MC_NVME_IO_QUEUE_REQUESTS", "0x10", 1), 0);
-    ASSERT_EQ(setenv("MC_NVME_TRANSPORT_ACK_TIMEOUT", "256", 1), 0);
-    ASSERT_EQ(setenv("MC_NVME_ADMIN_QUEUE_SIZE", "65536", 1), 0);
-    ASSERT_EQ(
-        setenv("MC_NVME_FABRICS_CONNECT_TIMEOUT_US", "18446744073709551616", 1),
-        0);
-    ASSERT_EQ(setenv("MC_NVME_HEADER_DIGEST", "-0", 1), 0);
-    ASSERT_EQ(setenv("MC_NVME_DATA_DIGEST", "2", 1), 0);
+    source_.Set("MC_NVME_NUM_IO_QUEUES", "4294967296");
+    source_.Set("MC_NVME_IO_QUEUE_SIZE", "-1");
+    source_.Set("MC_NVME_IO_QUEUE_REQUESTS", "0x10");
+    source_.Set("MC_NVME_TRANSPORT_ACK_TIMEOUT", "256");
+    source_.Set("MC_NVME_ADMIN_QUEUE_SIZE", "65536");
+    source_.Set("MC_NVME_FABRICS_CONNECT_TIMEOUT_US", "18446744073709551616");
+    source_.Set("MC_NVME_HEADER_DIGEST", "-0");
+    source_.Set("MC_NVME_DATA_DIGEST", "2");
 
     testing::internal::CaptureStderr();
-    const auto config = SpdkControllerConfig::FromEnvironment();
+    const auto config = Load();
     const auto diagnostics = testing::internal::GetCapturedStderr();
 
     EXPECT_FALSE(config.num_io_queues.has_value());
@@ -150,12 +127,12 @@ TEST_F(SpdkControllerConfigTest,
 }
 
 TEST_F(SpdkControllerConfigTest, EachConstructionReadsCurrentEnvironment) {
-    ASSERT_EQ(setenv("MC_NVME_NUM_IO_QUEUES", "1", 1), 0);
-    const auto first = SpdkControllerConfig::FromEnvironment();
-    ASSERT_EQ(setenv("MC_NVME_NUM_IO_QUEUES", "2", 1), 0);
-    const auto second = SpdkControllerConfig::FromEnvironment();
-    ASSERT_EQ(unsetenv("MC_NVME_NUM_IO_QUEUES"), 0);
-    const auto third = SpdkControllerConfig::FromEnvironment();
+    source_.Set("MC_NVME_NUM_IO_QUEUES", "1");
+    const auto first = Load();
+    source_.Set("MC_NVME_NUM_IO_QUEUES", "2");
+    const auto second = Load();
+    source_.Unset("MC_NVME_NUM_IO_QUEUES");
+    const auto third = Load();
 
     EXPECT_EQ(first.num_io_queues, 1u);
     EXPECT_EQ(second.num_io_queues, 2u);

@@ -57,12 +57,13 @@ bool OffsetAllocatorBackendConfig::Validate() const {
     return true;
 }
 
-OffsetAllocatorBackendConfig OffsetAllocatorBackendConfig::FromEnvironment() {
+OffsetAllocatorBackendConfig OffsetAllocatorBackendConfig::FromEnvironment(
+    const Environ& env) {
     OffsetAllocatorBackendConfig cfg;
     using Variables = OffsetAllocatorBackendEnvironmentVariables;
 
     const auto policy =
-        Environ::Read(Variables::MOONCAKE_OFFSET_EVICTION_POLICY);
+        env.GetTyped(Variables::MOONCAKE_OFFSET_EVICTION_POLICY);
     if (policy.has_value()) {
         if (AsciiCaseInsensitiveEquals(*policy, "fifo")) {
             cfg.eviction_policy = OffsetEvictionPolicy::FIFO;
@@ -75,12 +76,11 @@ OffsetAllocatorBackendConfig OffsetAllocatorBackendConfig::FromEnvironment() {
         .allow_non_finite = true,
     };
     if (const auto value =
-            Environ::Read(Variables::MOONCAKE_OFFSET_HIGH_RATIO)) {
+            env.GetTyped(Variables::MOONCAKE_OFFSET_HIGH_RATIO)) {
         cfg.high_ratio = TryParseEnvironmentDouble(*value, kLegacyRatioParsing)
                              .value_or(cfg.high_ratio);
     }
-    if (const auto value =
-            Environ::Read(Variables::MOONCAKE_OFFSET_LOW_RATIO)) {
+    if (const auto value = env.GetTyped(Variables::MOONCAKE_OFFSET_LOW_RATIO)) {
         cfg.low_ratio = TryParseEnvironmentDouble(*value, kLegacyRatioParsing)
                             .value_or(cfg.low_ratio);
     }
@@ -88,14 +88,14 @@ OffsetAllocatorBackendConfig OffsetAllocatorBackendConfig::FromEnvironment() {
     cfg.keys_high_ratio = cfg.high_ratio;
     cfg.keys_low_ratio = cfg.low_ratio;
 
-    cfg.max_capacity_nodes = Environ::ReadOr(
+    cfg.max_capacity_nodes = env.GetTypedOr(
         Variables::MOONCAKE_OFFSET_MAX_CAPACITY_NODES, cfg.max_capacity_nodes);
 
     // Read eviction cap as int64_t to guard against negative env values
     // which would wrap to SIZE_MAX with an unsigned parser.
     auto max_evict_raw =
-        Environ::ReadOr(Variables::MOONCAKE_OFFSET_MAX_EVICT_PER_OFFLOAD,
-                        static_cast<int64_t>(cfg.max_evict_per_offload));
+        env.GetTypedOr(Variables::MOONCAKE_OFFSET_MAX_EVICT_PER_OFFLOAD,
+                       static_cast<int64_t>(cfg.max_evict_per_offload));
     if (max_evict_raw > 0) {
         cfg.max_evict_per_offload = static_cast<size_t>(max_evict_raw);
     } else if (max_evict_raw <= 0) {
@@ -105,7 +105,7 @@ OffsetAllocatorBackendConfig OffsetAllocatorBackendConfig::FromEnvironment() {
     }
 
     // Persistence mode
-    const auto persist = Environ::Read(Variables::MOONCAKE_OFFSET_PERSIST_MODE);
+    const auto persist = env.GetTyped(Variables::MOONCAKE_OFFSET_PERSIST_MODE);
     if (persist.has_value()) {
         const std::string& s = *persist;
         if (AsciiCaseInsensitiveEquals(s, "disabled")) {
@@ -121,12 +121,12 @@ OffsetAllocatorBackendConfig OffsetAllocatorBackendConfig::FromEnvironment() {
     }
 
     cfg.persist_interval_seconds =
-        Environ::ReadOr(Variables::MOONCAKE_OFFSET_PERSIST_INTERVAL_SECONDS,
-                        cfg.persist_interval_seconds);
+        env.GetTypedOr(Variables::MOONCAKE_OFFSET_PERSIST_INTERVAL_SECONDS,
+                       cfg.persist_interval_seconds);
 
     // Record CRC-32C: "0"/"false"/"off" disables per-record checksums.
     if (const auto record_crc =
-            Environ::Read(Variables::MOONCAKE_OFFSET_RECORD_CRC);
+            env.GetTyped(Variables::MOONCAKE_OFFSET_RECORD_CRC);
         record_crc.has_value() && !*record_crc) {
         cfg.enable_record_crc = false;
     }

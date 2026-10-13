@@ -34,13 +34,15 @@
 #include "fmt/format.h"
 #include "common/base64.h"
 #include "config/s3_client_config.h"
+#include "environ.h"
 
 namespace mooncake {
 
 namespace {
 
 const S3ClientConfig &GetS3ClientConfig() {
-    static const S3ClientConfig config = S3ClientConfig::FromEnvironment();
+    static const S3ClientConfig config =
+        S3ClientConfig::FromEnvironment(Environ::Process());
     return config;
 }
 

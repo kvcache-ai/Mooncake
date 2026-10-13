@@ -1,4 +1,5 @@
 #include "registered_pinned_memory.h"
+#include "environ.h"
 
 #include <string>
 
@@ -70,7 +71,8 @@ RegisteredPinnedMemoryManager& RegisteredPinnedMemoryManager::instance() {
 
 RegisteredPinnedMemoryManager::RegisteredPinnedMemoryManager()
     : RegisteredPinnedMemoryManager(
-          RegisteredPinnedMemoryConfig::FromEnvironment(), DefaultPinOps()) {}
+          RegisteredPinnedMemoryConfig::FromEnvironment(Environ::Process()),
+          DefaultPinOps()) {}
 
 RegisteredPinnedMemoryManager::RegisteredPinnedMemoryManager(
     RegisteredPinnedMemoryConfig config, PinOps pin_ops)

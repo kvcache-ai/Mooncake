@@ -9,12 +9,13 @@
 
 namespace mooncake {
 
-RegisteredPinnedMemoryConfig RegisteredPinnedMemoryConfig::FromEnvironment() {
+RegisteredPinnedMemoryConfig RegisteredPinnedMemoryConfig::FromEnvironment(
+    const Environ& env) {
     RegisteredPinnedMemoryConfig config;
     using Variables = RegisteredPinnedMemoryEnvironmentVariables;
 
     const auto raw_value =
-        Environ::Read(Variables::MC_STORE_PIN_MEMORY_MAX_BYTES);
+        env.GetTyped(Variables::MC_STORE_PIN_MEMORY_MAX_BYTES);
     if (!raw_value.has_value() || raw_value->empty()) {
         return config;
     }

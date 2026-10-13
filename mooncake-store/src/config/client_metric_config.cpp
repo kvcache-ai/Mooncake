@@ -10,11 +10,11 @@
 
 namespace mooncake {
 
-ClientMetricConfig ClientMetricConfig::FromEnvironment() {
+ClientMetricConfig ClientMetricConfig::FromEnvironment(const Environ& env) {
     ClientMetricConfig config;
     using Variables = ClientMetricEnvironmentVariables;
 
-    const auto enabled = Environ::Read(Variables::MC_STORE_CLIENT_METRIC);
+    const auto enabled = env.GetTyped(Variables::MC_STORE_CLIENT_METRIC);
     if (enabled.has_value()) {
         config.enabled = TryParseBool(*enabled).value_or(false);
     }
@@ -23,7 +23,7 @@ ClientMetricConfig ClientMetricConfig::FromEnvironment() {
     }
 
     const auto interval =
-        Environ::Read(Variables::MC_STORE_CLIENT_METRIC_INTERVAL);
+        env.GetTyped(Variables::MC_STORE_CLIENT_METRIC_INTERVAL);
     if (interval.has_value()) {
         const auto parsed = TryParseInteger<uint64_t>(
             *interval,
@@ -48,7 +48,7 @@ ClientMetricConfig ClientMetricConfig::FromEnvironment() {
     }
 
     const auto bandwidth =
-        Environ::Read(Variables::MC_STORE_CLIENT_METRIC_BANDWIDTH);
+        env.GetTyped(Variables::MC_STORE_CLIENT_METRIC_BANDWIDTH);
     if (bandwidth.has_value()) {
         const auto parsed = TryParseBool(*bandwidth);
         if (parsed.has_value()) {

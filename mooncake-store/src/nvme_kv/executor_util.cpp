@@ -8,6 +8,7 @@
 #include <limits>
 
 #include "config/u32_parser.h"
+#include "environ.h"
 
 namespace mooncake {
 namespace {
@@ -67,13 +68,15 @@ uint32_t RoundDownToNvmeKvTransferBytes(uint32_t bytes) {
 
 uint32_t NvmeKvTransferAlignmentBytes() {
     const uint32_t configured =
-        NvmeKvExecutorConfig::ReadTransferAlignmentBytesFromEnvironment();
+        NvmeKvExecutorConfig::ReadTransferAlignmentBytesFromEnvironment(
+            Environ::Process());
     return configured == 0 ? kDefaultNvmeKvTransferAlignmentBytes : configured;
 }
 
 uint32_t NvmeKvValueBlockUnitBytes() {
     const uint32_t configured =
-        NvmeKvExecutorConfig::ReadValueBlockUnitBytesFromEnvironment();
+        NvmeKvExecutorConfig::ReadValueBlockUnitBytesFromEnvironment(
+            Environ::Process());
     return configured == 0 ? kDefaultNvmeKvValueBlockUnitBytes : configured;
 }
 
@@ -118,7 +121,8 @@ NvmeKvCommandExecutor::Capabilities BuildNvmeKvCapabilities(
     uint32_t runtime_transfer_limit) {
     NvmeKvCommandExecutor::Capabilities caps;
     const uint32_t protocol_max_value_size =
-        NvmeKvExecutorConfig::ReadProtocolMaxValueSizeFromEnvironment();
+        NvmeKvExecutorConfig::ReadProtocolMaxValueSizeFromEnvironment(
+            Environ::Process());
     const uint32_t effective_runtime_limit =
         runtime_transfer_limit == 0 ? kDefaultNvmeKvRuntimeTransferLimit
                                     : runtime_transfer_limit;

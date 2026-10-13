@@ -10,8 +10,8 @@
 
 namespace mooncake {
 
-bool NoFDebugConfig::ReadEnabledFromEnvironment() {
-    const auto raw = Environ::Read(NoFDebugEnvironmentVariables::MC_NOF_DEBUG);
+bool NoFDebugConfig::ReadEnabledFromEnvironment(const Environ& env) {
+    const auto raw = env.GetTyped(NoFDebugEnvironmentVariables::MC_NOF_DEBUG);
     if (!raw) return false;
 
     std::string normalized = *raw;
@@ -22,9 +22,10 @@ bool NoFDebugConfig::ReadEnabledFromEnvironment() {
            normalized == "on";
 }
 
-std::chrono::milliseconds NoFDebugConfig::ReadIntervalMsFromEnvironment() {
+std::chrono::milliseconds NoFDebugConfig::ReadIntervalMsFromEnvironment(
+    const Environ& env) {
     const auto raw =
-        Environ::Read(NoFDebugEnvironmentVariables::MC_NOF_DEBUG_INTERVAL_MS);
+        env.GetTyped(NoFDebugEnvironmentVariables::MC_NOF_DEBUG_INTERVAL_MS);
     if (!raw) return std::chrono::milliseconds{1000};
 
     char* end = nullptr;
@@ -37,17 +38,19 @@ std::chrono::milliseconds NoFDebugConfig::ReadIntervalMsFromEnvironment() {
 }
 
 bool NoFDebugConfig::IsEnabledAtFirstUse() {
-    static const bool enabled = ReadEnabledFromEnvironment();
+    static const bool enabled = ReadEnabledFromEnvironment(Environ::Process());
     return enabled;
 }
 
 std::chrono::milliseconds NoFDebugConfig::IntervalMsAtFirstUse() {
-    static const auto interval_ms = ReadIntervalMsFromEnvironment();
+    static const auto interval_ms =
+        ReadIntervalMsFromEnvironment(Environ::Process());
     return interval_ms;
 }
 
-NoFDebugConfig NoFDebugConfig::FromEnvironment() {
-    return {ReadEnabledFromEnvironment(), ReadIntervalMsFromEnvironment()};
+NoFDebugConfig NoFDebugConfig::FromEnvironment(const Environ& env) {
+    return {ReadEnabledFromEnvironment(env),
+            ReadIntervalMsFromEnvironment(env)};
 }
 
 }  // namespace mooncake

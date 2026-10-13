@@ -1,66 +1,18 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
-#include <cstdlib>
 #include <filesystem>
 #include <functional>
-#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "config/distributed_storage_config.h"
+#include "environ.h"
 
 namespace mooncake {
 
 namespace {
-
-class ScopedEnvVar {
-   public:
-    explicit ScopedEnvVar(const char* name) : name_(name) {
-        const char* value = std::getenv(name);
-        if (value != nullptr) {
-            original_ = value;
-        }
-        unsetenv(name);
-    }
-
-    ~ScopedEnvVar() {
-        if (original_.has_value()) {
-            setenv(name_.c_str(), original_->c_str(), 1);
-        } else {
-            unsetenv(name_.c_str());
-        }
-    }
-
-    ScopedEnvVar(const ScopedEnvVar&) = delete;
-    ScopedEnvVar& operator=(const ScopedEnvVar&) = delete;
-
-    void Set(const char* value) { setenv(name_.c_str(), value, 1); }
-
-   private:
-    std::string name_;
-    std::optional<std::string> original_;
-};
-
-struct DistributedStorageEnvironment {
-    ScopedEnvVar root_dir{"MOONCAKE_DFS_ROOT_DIR"};
-    ScopedEnvVar legacy_root_dir{"MOONCAKE_DISTRIBUTED_ROOT_DIR"};
-    ScopedEnvVar fs_adapter{"MOONCAKE_DFS_FS_ADAPTER"};
-    ScopedEnvVar legacy_fs_adapter{"MOONCAKE_DISTRIBUTED_FS_TYPE"};
-    ScopedEnvVar health_check{"MOONCAKE_DISTRIBUTED_HEALTH_CHECK"};
-    ScopedEnvVar shard_count{"MOONCAKE_DFS_SHARD_COUNT"};
-    ScopedEnvVar shard_capacity{"MOONCAKE_DFS_SHARD_CAPACITY"};
-    ScopedEnvVar alignment{"MOONCAKE_DFS_ALIGNMENT"};
-    ScopedEnvVar single_tenant{"MOONCAKE_DFS_SINGLE_TENANT"};
-    ScopedEnvVar eviction_enabled{"MOONCAKE_DFS_EVICTION_ENABLED"};
-    ScopedEnvVar eviction_high_watermark{
-        "MOONCAKE_DFS_EVICTION_HIGH_WATERMARK"};
-    ScopedEnvVar eviction_low_watermark{"MOONCAKE_DFS_EVICTION_LOW_WATERMARK"};
-    ScopedEnvVar deferred_free_seconds{"MOONCAKE_DFS_DEFERRED_FREE_SECONDS"};
-    ScopedEnvVar eviction_check_interval{
-        "MOONCAKE_DFS_EVICTION_CHECK_INTERVAL"};
-};
 
 void ExpectDefaultConfig(const DistributedStorageConfig& config) {
     EXPECT_EQ(config.fsdir, "/mnt/3fs/mooncake");
@@ -95,11 +47,15 @@ DistributedStorageConfig ValidConfig() {
 
 class DistributedStorageConfigTest : public ::testing::Test {
    protected:
-    DistributedStorageEnvironment env;
+    DistributedStorageConfig Load() const {
+        return DistributedStorageConfig::FromEnvironment(Environ(source_));
+    }
+
+    MapEnvironSource source_;
 };
 
 TEST_F(DistributedStorageConfigTest, UsesDefaultsWhenEnvironmentIsUnset) {
-    const auto config = DistributedStorageConfig::FromEnvironment();
+    const auto config = Load();
 
     ExpectDefaultConfig(config);
     EXPECT_TRUE(config.Validate());
@@ -107,20 +63,20 @@ TEST_F(DistributedStorageConfigTest, UsesDefaultsWhenEnvironmentIsUnset) {
 }
 
 TEST_F(DistributedStorageConfigTest, ReadsValidEnvironmentValues) {
-    env.root_dir.Set("/tmp/mooncake-dfs");
-    env.fs_adapter.Set("posix");
-    env.health_check.Set("true");
-    env.shard_count.Set("8");
-    env.shard_capacity.Set("1048576");
-    env.alignment.Set("4096");
-    env.single_tenant.Set("1");
-    env.eviction_enabled.Set("1");
-    env.eviction_high_watermark.Set("0.85");
-    env.eviction_low_watermark.Set("0.65");
-    env.deferred_free_seconds.Set("12");
-    env.eviction_check_interval.Set("3");
+    source_.Set("MOONCAKE_DFS_ROOT_DIR", "/tmp/mooncake-dfs");
+    source_.Set("MOONCAKE_DFS_FS_ADAPTER", "posix");
+    source_.Set("MOONCAKE_DISTRIBUTED_HEALTH_CHECK", "true");
+    source_.Set("MOONCAKE_DFS_SHARD_COUNT", "8");
+    source_.Set("MOONCAKE_DFS_SHARD_CAPACITY", "1048576");
+    source_.Set("MOONCAKE_DFS_ALIGNMENT", "4096");
+    source_.Set("MOONCAKE_DFS_SINGLE_TENANT", "1");
+    source_.Set("MOONCAKE_DFS_EVICTION_ENABLED", "1");
+    source_.Set("MOONCAKE_DFS_EVICTION_HIGH_WATERMARK", "0.85");
+    source_.Set("MOONCAKE_DFS_EVICTION_LOW_WATERMARK", "0.65");
+    source_.Set("MOONCAKE_DFS_DEFERRED_FREE_SECONDS", "12");
+    source_.Set("MOONCAKE_DFS_EVICTION_CHECK_INTERVAL", "3");
 
-    const auto config = DistributedStorageConfig::FromEnvironment();
+    const auto config = Load();
 
     EXPECT_EQ(config.fsdir, "/tmp/mooncake-dfs");
     EXPECT_EQ(config.fs_adapter_type, "posix");
@@ -145,43 +101,42 @@ TEST_F(DistributedStorageConfigTest, ReadsValidEnvironmentValues) {
 }
 
 TEST_F(DistributedStorageConfigTest, PreservesAliasPrecedence) {
-    env.legacy_root_dir.Set("/tmp/legacy-dfs");
-    env.legacy_fs_adapter.Set("posix");
+    source_.Set("MOONCAKE_DISTRIBUTED_ROOT_DIR", "/tmp/legacy-dfs");
+    source_.Set("MOONCAKE_DISTRIBUTED_FS_TYPE", "posix");
 
-    const auto legacy = DistributedStorageConfig::FromEnvironment();
+    const auto legacy = Load();
     EXPECT_EQ(legacy.fsdir, "/tmp/legacy-dfs");
     EXPECT_EQ(legacy.fs_adapter_type, "posix");
 
-    env.root_dir.Set("/tmp/preferred-dfs");
-    env.fs_adapter.Set("hf3fs");
+    source_.Set("MOONCAKE_DFS_ROOT_DIR", "/tmp/preferred-dfs");
+    source_.Set("MOONCAKE_DFS_FS_ADAPTER", "hf3fs");
 
-    const auto preferred = DistributedStorageConfig::FromEnvironment();
+    const auto preferred = Load();
     EXPECT_EQ(preferred.fsdir, "/tmp/preferred-dfs");
     EXPECT_EQ(preferred.fs_adapter_type, "hf3fs");
 }
 
 TEST_F(DistributedStorageConfigTest, EmptyPreferredRootOverridesAlias) {
-    env.legacy_root_dir.Set("/tmp/legacy-dfs");
-    env.root_dir.Set("");
+    source_.Set("MOONCAKE_DISTRIBUTED_ROOT_DIR", "/tmp/legacy-dfs");
+    source_.Set("MOONCAKE_DFS_ROOT_DIR", "");
 
-    EXPECT_THROW(DistributedStorageConfig::FromEnvironment(),
-                 std::filesystem::filesystem_error);
+    EXPECT_THROW(Load(), std::filesystem::filesystem_error);
 }
 
 TEST_F(DistributedStorageConfigTest, EmptyPreferredAdapterOverridesAlias) {
-    env.legacy_fs_adapter.Set("posix");
-    env.fs_adapter.Set("");
+    source_.Set("MOONCAKE_DISTRIBUTED_FS_TYPE", "posix");
+    source_.Set("MOONCAKE_DFS_FS_ADAPTER", "");
 
-    const auto config = DistributedStorageConfig::FromEnvironment();
+    const auto config = Load();
 
     EXPECT_TRUE(config.fs_adapter_type.empty());
     EXPECT_FALSE(config.Validate());
 }
 
 TEST_F(DistributedStorageConfigTest, ConvertsRelativeRootToAbsolutePath) {
-    env.root_dir.Set("relative-dfs-root");
+    source_.Set("MOONCAKE_DFS_ROOT_DIR", "relative-dfs-root");
 
-    const auto config = DistributedStorageConfig::FromEnvironment();
+    const auto config = Load();
 
     EXPECT_EQ(config.fsdir,
               std::filesystem::absolute("relative-dfs-root").string());
@@ -189,18 +144,18 @@ TEST_F(DistributedStorageConfigTest, ConvertsRelativeRootToAbsolutePath) {
 
 TEST_F(DistributedStorageConfigTest,
        InvalidValuesUseDefaultsAndPreserveDiagnostics) {
-    env.health_check.Set("invalid");
-    env.shard_count.Set("invalid");
-    env.shard_capacity.Set("-1");
-    env.alignment.Set("18446744073709551616");
-    env.single_tenant.Set("invalid");
-    env.eviction_enabled.Set("invalid");
-    env.eviction_high_watermark.Set("invalid");
-    env.deferred_free_seconds.Set("invalid");
-    env.eviction_check_interval.Set("invalid");
+    source_.Set("MOONCAKE_DISTRIBUTED_HEALTH_CHECK", "invalid");
+    source_.Set("MOONCAKE_DFS_SHARD_COUNT", "invalid");
+    source_.Set("MOONCAKE_DFS_SHARD_CAPACITY", "-1");
+    source_.Set("MOONCAKE_DFS_ALIGNMENT", "18446744073709551616");
+    source_.Set("MOONCAKE_DFS_SINGLE_TENANT", "invalid");
+    source_.Set("MOONCAKE_DFS_EVICTION_ENABLED", "invalid");
+    source_.Set("MOONCAKE_DFS_EVICTION_HIGH_WATERMARK", "invalid");
+    source_.Set("MOONCAKE_DFS_DEFERRED_FREE_SECONDS", "invalid");
+    source_.Set("MOONCAKE_DFS_EVICTION_CHECK_INTERVAL", "invalid");
 
     ::testing::internal::CaptureStderr();
-    const auto config = DistributedStorageConfig::FromEnvironment();
+    const auto config = Load();
     const std::string logs = ::testing::internal::GetCapturedStderr();
 
     ExpectDefaultConfig(config);
@@ -221,11 +176,11 @@ TEST_F(DistributedStorageConfigTest,
 
 TEST_F(DistributedStorageConfigTest,
        EmptyWatermarksUseDefaultsWithoutDiagnostics) {
-    env.eviction_high_watermark.Set("");
-    env.eviction_low_watermark.Set("");
+    source_.Set("MOONCAKE_DFS_EVICTION_HIGH_WATERMARK", "");
+    source_.Set("MOONCAKE_DFS_EVICTION_LOW_WATERMARK", "");
 
     ::testing::internal::CaptureStderr();
-    const auto config = DistributedStorageConfig::FromEnvironment();
+    const auto config = Load();
     const std::string logs = ::testing::internal::GetCapturedStderr();
 
     EXPECT_DOUBLE_EQ(config.eviction_high_watermark, 0.9);

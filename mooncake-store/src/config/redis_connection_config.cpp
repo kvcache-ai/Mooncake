@@ -7,10 +7,10 @@
 namespace mooncake {
 
 tl::expected<RedisConnectionConfig, ErrorCode>
-RedisConnectionConfig::FromEnvironment() {
+RedisConnectionConfig::FromEnvironment(const Environ& env) {
     RedisConnectionConfig config;
     const auto raw_db_index =
-        Environ::Read(RedisConnectionEnvironmentVariables::MC_REDIS_DB_INDEX)
+        env.GetTyped(RedisConnectionEnvironmentVariables::MC_REDIS_DB_INDEX)
             .value_or("");
     if (!raw_db_index.empty()) {
         const auto db_index = TryParseEnvironmentValue<int>(raw_db_index);
@@ -20,10 +20,10 @@ RedisConnectionConfig::FromEnvironment() {
         config.db_index = *db_index;
     }
     config.username =
-        Environ::Read(RedisConnectionEnvironmentVariables::MC_REDIS_USERNAME)
+        env.GetTyped(RedisConnectionEnvironmentVariables::MC_REDIS_USERNAME)
             .value_or("");
     config.password =
-        Environ::Read(RedisConnectionEnvironmentVariables::MC_REDIS_PASSWORD)
+        env.GetTyped(RedisConnectionEnvironmentVariables::MC_REDIS_PASSWORD)
             .value_or("");
     return config;
 }

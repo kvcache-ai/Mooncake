@@ -1,51 +1,26 @@
 #include <gtest/gtest.h>
 
-#include <cstdlib>
-#include <optional>
-#include <string>
-
 #include "client_auto_port_config.h"
+#include "environ.h"
 
 namespace mooncake {
 namespace {
 
-class ScopedEnvVar {
-   public:
-    explicit ScopedEnvVar(const char* name) : name_(name) {
-        if (const char* value = std::getenv(name)) {
-            original_ = value;
-        }
-        unsetenv(name);
-    }
-
-    ~ScopedEnvVar() {
-        if (original_.has_value()) {
-            setenv(name_.c_str(), original_->c_str(), 1);
-        } else {
-            unsetenv(name_.c_str());
-        }
-    }
-
-    void Set(const char* value) { setenv(name_.c_str(), value, 1); }
-
-   private:
-    std::string name_;
-    std::optional<std::string> original_;
-};
-
-struct ClientAutoPortEnvironment {
-    ScopedEnvVar setup_retries{"MC_STORE_CLIENT_SETUP_RETRIES"};
-    ScopedEnvVar min_port{"MC_STORE_CLIENT_MIN_PORT"};
-    ScopedEnvVar max_port{"MC_STORE_CLIENT_MAX_PORT"};
-};
+constexpr char kSetupRetries[] = "MC_STORE_CLIENT_SETUP_RETRIES";
+constexpr char kMinPort[] = "MC_STORE_CLIENT_MIN_PORT";
+constexpr char kMaxPort[] = "MC_STORE_CLIENT_MAX_PORT";
 
 class ClientAutoPortConfigTest : public ::testing::Test {
    protected:
-    ClientAutoPortEnvironment env;
+    ClientAutoPortConfig Load() const {
+        return ClientAutoPortConfig::FromEnvironment(Environ(source_));
+    }
+
+    MapEnvironSource source_;
 };
 
 TEST_F(ClientAutoPortConfigTest, UsesExistingDefaultsWhenEnvironmentIsUnset) {
-    const auto config = ClientAutoPortConfig::FromEnvironment();
+    const auto config = Load();
 
     EXPECT_EQ(config.max_retries, 20);
     EXPECT_EQ(config.min_port, 12300);
@@ -53,11 +28,11 @@ TEST_F(ClientAutoPortConfigTest, UsesExistingDefaultsWhenEnvironmentIsUnset) {
 }
 
 TEST_F(ClientAutoPortConfigTest, ReadsValidValues) {
-    env.setup_retries.Set("7");
-    env.min_port.Set("12000");
-    env.max_port.Set("14000");
+    source_.Set(kSetupRetries, "7");
+    source_.Set(kMinPort, "12000");
+    source_.Set(kMaxPort, "14000");
 
-    const auto config = ClientAutoPortConfig::FromEnvironment();
+    const auto config = Load();
 
     EXPECT_EQ(config.max_retries, 7);
     EXPECT_EQ(config.min_port, 12000);
@@ -66,20 +41,20 @@ TEST_F(ClientAutoPortConfigTest, ReadsValidValues) {
 
 TEST_F(ClientAutoPortConfigTest, InvalidIntegersUseIndividualFieldDefaults) {
     for (const char* value : {"", "invalid", "2147483648"}) {
-        env.setup_retries.Set(value);
-        env.min_port.Set(value);
-        env.max_port.Set("15000");
+        source_.Set(kSetupRetries, value);
+        source_.Set(kMinPort, value);
+        source_.Set(kMaxPort, "15000");
 
-        auto config = ClientAutoPortConfig::FromEnvironment();
+        auto config = Load();
 
         EXPECT_EQ(config.max_retries, 20) << value;
         EXPECT_EQ(config.min_port, 12300) << value;
         EXPECT_EQ(config.max_port, 15000) << value;
 
-        env.min_port.Set("13000");
-        env.max_port.Set(value);
+        source_.Set(kMinPort, "13000");
+        source_.Set(kMaxPort, value);
 
-        config = ClientAutoPortConfig::FromEnvironment();
+        config = Load();
 
         EXPECT_EQ(config.min_port, 13000) << value;
         EXPECT_EQ(config.max_port, 14300) << value;
@@ -87,16 +62,16 @@ TEST_F(ClientAutoPortConfigTest, InvalidIntegersUseIndividualFieldDefaults) {
 }
 
 TEST_F(ClientAutoPortConfigTest, SupportsIndependentEndpointOverrides) {
-    env.min_port.Set("13000");
+    source_.Set(kMinPort, "13000");
 
-    auto config = ClientAutoPortConfig::FromEnvironment();
+    auto config = Load();
     EXPECT_EQ(config.min_port, 13000);
     EXPECT_EQ(config.max_port, 14300);
 
-    env.min_port.Set("12300");
-    env.max_port.Set("15000");
+    source_.Set(kMinPort, "12300");
+    source_.Set(kMaxPort, "15000");
 
-    config = ClientAutoPortConfig::FromEnvironment();
+    config = Load();
     EXPECT_EQ(config.min_port, 12300);
     EXPECT_EQ(config.max_port, 15000);
 }
@@ -109,10 +84,10 @@ TEST_F(ClientAutoPortConfigTest, InvalidPortPairsRestoreBothDefaults) {
     for (const auto& value :
          {PortPair{"14301", "14300"}, PortPair{"80", "443"},
           PortPair{"32768", "40000"}, PortPair{"61000", "65536"}}) {
-        env.min_port.Set(value.min_port);
-        env.max_port.Set(value.max_port);
+        source_.Set(kMinPort, value.min_port);
+        source_.Set(kMaxPort, value.max_port);
 
-        const auto config = ClientAutoPortConfig::FromEnvironment();
+        const auto config = Load();
 
         EXPECT_EQ(config.min_port, 12300);
         EXPECT_EQ(config.max_port, 14300);
@@ -120,19 +95,19 @@ TEST_F(ClientAutoPortConfigTest, InvalidPortPairsRestoreBothDefaults) {
 }
 
 TEST_F(ClientAutoPortConfigTest, PreservesNonPositiveRetryCounts) {
-    env.setup_retries.Set("0");
-    EXPECT_EQ(ClientAutoPortConfig::FromEnvironment().max_retries, 0);
+    source_.Set(kSetupRetries, "0");
+    EXPECT_EQ(Load().max_retries, 0);
 
-    env.setup_retries.Set("-1");
-    EXPECT_EQ(ClientAutoPortConfig::FromEnvironment().max_retries, -1);
+    source_.Set(kSetupRetries, "-1");
+    EXPECT_EQ(Load().max_retries, -1);
 }
 
 TEST_F(ClientAutoPortConfigTest, PreservesAcceptedIntegerSyntax) {
-    env.setup_retries.Set(" +7 ");
-    env.min_port.Set(" +12000 ");
-    env.max_port.Set(" +14000 ");
+    source_.Set(kSetupRetries, " +7 ");
+    source_.Set(kMinPort, " +12000 ");
+    source_.Set(kMaxPort, " +14000 ");
 
-    const auto config = ClientAutoPortConfig::FromEnvironment();
+    const auto config = Load();
 
     EXPECT_EQ(config.max_retries, 7);
     EXPECT_EQ(config.min_port, 12000);

@@ -3,12 +3,11 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
-#include <array>
 #include <cstdint>
-#include <cstdlib>
 #include <limits>
-#include <optional>
 #include <string>
+
+#include "environ.h"
 
 namespace mooncake::test {
 namespace {
@@ -24,44 +23,29 @@ class NvmeKvConnectorConfigTest : public ::testing::Test {
     void SetUp() override {
         original_logtostderr_ = FLAGS_logtostderr;
         FLAGS_logtostderr = true;
-        for (size_t i = 0; i < kVariables.size(); ++i) {
-            if (const char* value = std::getenv(kVariables[i])) {
-                original_[i] = value;
-            }
-            ASSERT_EQ(unsetenv(kVariables[i]), 0);
-        }
     }
 
-    void TearDown() override {
-        for (size_t i = 0; i < kVariables.size(); ++i) {
-            if (original_[i].has_value()) {
-                EXPECT_EQ(setenv(kVariables[i], original_[i]->c_str(), 1), 0);
-            } else {
-                EXPECT_EQ(unsetenv(kVariables[i]), 0);
-            }
-        }
-        FLAGS_logtostderr = original_logtostderr_;
-    }
+    void TearDown() override { FLAGS_logtostderr = original_logtostderr_; }
 
     void SetDevicePath() {
-        ASSERT_EQ(setenv("MOONCAKE_NVME_KV_DEVICE_PATH", "/dev/nvme0n1", 1), 0);
+        source_.Set("MOONCAKE_NVME_KV_DEVICE_PATH", "/dev/nvme0n1");
     }
 
+    tl::expected<NvmeKvConnectorConfig, ErrorCode> Load() const {
+        return NvmeKvConnectorConfig::FromEnvironment(Environ(source_));
+    }
+
+    MapEnvironSource source_;
+
    private:
-    inline static constexpr std::array<const char*, 5> kVariables = {
-        "MOONCAKE_NVME_KV_DEVICE_PATH", "MOONCAKE_NVME_KV_NSID",
-        "MOONCAKE_NVME_KV_QUEUE_DEPTH",
-        "MOONCAKE_NVME_KV_RUNTIME_TRANSFER_LIMIT",
-        "MOONCAKE_NVME_KV_TRANSPORT"};
-    std::array<std::optional<std::string>, kVariables.size()> original_;
     bool original_logtostderr_ = false;
 };
 
 TEST_F(NvmeKvConnectorConfigTest, MissingDevicePathStopsBeforeTransport) {
-    ASSERT_EQ(setenv("MOONCAKE_NVME_KV_TRANSPORT", "invalid", 1), 0);
+    source_.Set("MOONCAKE_NVME_KV_TRANSPORT", "invalid");
 
     testing::internal::CaptureStderr();
-    const auto config = NvmeKvConnectorConfig::FromEnvironment();
+    const auto config = Load();
     const auto diagnostics = testing::internal::GetCapturedStderr();
 
     ASSERT_FALSE(config.has_value());
@@ -74,10 +58,10 @@ TEST_F(NvmeKvConnectorConfigTest, MissingDevicePathStopsBeforeTransport) {
 }
 
 TEST_F(NvmeKvConnectorConfigTest, EmptyDevicePathIsRejected) {
-    ASSERT_EQ(setenv("MOONCAKE_NVME_KV_DEVICE_PATH", "", 1), 0);
+    source_.Set("MOONCAKE_NVME_KV_DEVICE_PATH", "");
 
     testing::internal::CaptureStderr();
-    const auto config = NvmeKvConnectorConfig::FromEnvironment();
+    const auto config = Load();
     const auto diagnostics = testing::internal::GetCapturedStderr();
 
     ASSERT_FALSE(config.has_value());
@@ -90,7 +74,7 @@ TEST_F(NvmeKvConnectorConfigTest, EmptyDevicePathIsRejected) {
 TEST_F(NvmeKvConnectorConfigTest, UnsetOptionalValuesKeepRealExecutorDefaults) {
     SetDevicePath();
 
-    const auto config = NvmeKvConnectorConfig::FromEnvironment();
+    const auto config = Load();
 
     ASSERT_TRUE(config.has_value());
     EXPECT_EQ(config->device_path, "/dev/nvme0n1");
@@ -115,13 +99,11 @@ TEST_F(NvmeKvConnectorConfigTest, PreservesLegacyUnsignedIntegerSyntax) {
     SetDevicePath();
     for (const auto& entry : cases) {
         SCOPED_TRACE(entry.value);
-        ASSERT_EQ(setenv("MOONCAKE_NVME_KV_NSID", entry.value, 1), 0);
-        ASSERT_EQ(setenv("MOONCAKE_NVME_KV_QUEUE_DEPTH", entry.value, 1), 0);
-        ASSERT_EQ(
-            setenv("MOONCAKE_NVME_KV_RUNTIME_TRANSFER_LIMIT", entry.value, 1),
-            0);
+        source_.Set("MOONCAKE_NVME_KV_NSID", entry.value);
+        source_.Set("MOONCAKE_NVME_KV_QUEUE_DEPTH", entry.value);
+        source_.Set("MOONCAKE_NVME_KV_RUNTIME_TRANSFER_LIMIT", entry.value);
 
-        const auto config = NvmeKvConnectorConfig::FromEnvironment();
+        const auto config = Load();
 
         ASSERT_TRUE(config.has_value());
         EXPECT_EQ(config->nsid, entry.expected);
@@ -135,13 +117,12 @@ TEST_F(NvmeKvConnectorConfigTest, InvalidUnsignedIntegersKeepDefaultsSilently) {
     SetDevicePath();
     for (const char* value : values) {
         SCOPED_TRACE(value);
-        ASSERT_EQ(setenv("MOONCAKE_NVME_KV_NSID", value, 1), 0);
-        ASSERT_EQ(setenv("MOONCAKE_NVME_KV_QUEUE_DEPTH", value, 1), 0);
-        ASSERT_EQ(setenv("MOONCAKE_NVME_KV_RUNTIME_TRANSFER_LIMIT", value, 1),
-                  0);
+        source_.Set("MOONCAKE_NVME_KV_NSID", value);
+        source_.Set("MOONCAKE_NVME_KV_QUEUE_DEPTH", value);
+        source_.Set("MOONCAKE_NVME_KV_RUNTIME_TRANSFER_LIMIT", value);
 
         testing::internal::CaptureStderr();
-        const auto config = NvmeKvConnectorConfig::FromEnvironment();
+        const auto config = Load();
         const auto diagnostics = testing::internal::GetCapturedStderr();
 
         ASSERT_TRUE(config.has_value());
@@ -164,9 +145,9 @@ TEST_F(NvmeKvConnectorConfigTest, AcceptsOnlyExistingTransportTokens) {
     SetDevicePath();
     for (const auto& entry : cases) {
         SCOPED_TRACE(entry.value);
-        ASSERT_EQ(setenv("MOONCAKE_NVME_KV_TRANSPORT", entry.value, 1), 0);
+        source_.Set("MOONCAKE_NVME_KV_TRANSPORT", entry.value);
 
-        const auto config = NvmeKvConnectorConfig::FromEnvironment();
+        const auto config = Load();
 
         ASSERT_TRUE(config.has_value());
         EXPECT_EQ(config->transport, entry.expected);
@@ -177,10 +158,10 @@ TEST_F(NvmeKvConnectorConfigTest, InvalidTransportKeepsErrorAndDiagnostic) {
     SetDevicePath();
     for (const char* value : {"AUTO", "io-uring", " ioctl", "invalid"}) {
         SCOPED_TRACE(value);
-        ASSERT_EQ(setenv("MOONCAKE_NVME_KV_TRANSPORT", value, 1), 0);
+        source_.Set("MOONCAKE_NVME_KV_TRANSPORT", value);
 
         testing::internal::CaptureStderr();
-        const auto config = NvmeKvConnectorConfig::FromEnvironment();
+        const auto config = Load();
         const auto diagnostics = testing::internal::GetCapturedStderr();
 
         ASSERT_FALSE(config.has_value());
@@ -193,10 +174,10 @@ TEST_F(NvmeKvConnectorConfigTest, InvalidTransportKeepsErrorAndDiagnostic) {
 
 TEST_F(NvmeKvConnectorConfigTest, NewConfigsReadCurrentEnvironment) {
     SetDevicePath();
-    ASSERT_EQ(setenv("MOONCAKE_NVME_KV_NSID", "1", 1), 0);
-    const auto first = NvmeKvConnectorConfig::FromEnvironment();
-    ASSERT_EQ(setenv("MOONCAKE_NVME_KV_NSID", "2", 1), 0);
-    const auto second = NvmeKvConnectorConfig::FromEnvironment();
+    source_.Set("MOONCAKE_NVME_KV_NSID", "1");
+    const auto first = Load();
+    source_.Set("MOONCAKE_NVME_KV_NSID", "2");
+    const auto second = Load();
 
     ASSERT_TRUE(first.has_value());
     ASSERT_TRUE(second.has_value());

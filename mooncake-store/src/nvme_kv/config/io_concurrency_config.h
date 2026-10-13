@@ -4,6 +4,8 @@
 
 namespace mooncake {
 
+class Environ;
+
 struct NvmeKvIoConcurrencyConfig {
     std::size_t max_io_concurrency = 256;
     std::size_t io_concurrency = 1;
@@ -12,7 +14,7 @@ struct NvmeKvIoConcurrencyConfig {
     std::size_t prepare_concurrency = 1;
 
     static NvmeKvIoConcurrencyConfig FromEnvironment(
-        std::size_t device_queue_depth);
+        const Environ& env, std::size_t device_queue_depth);
 };
 
 }  // namespace mooncake

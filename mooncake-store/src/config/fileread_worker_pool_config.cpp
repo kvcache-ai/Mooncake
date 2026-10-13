@@ -8,9 +8,10 @@
 
 namespace mooncake {
 
-FilereadWorkerPoolConfig FilereadWorkerPoolConfig::FromEnvironment() {
+FilereadWorkerPoolConfig FilereadWorkerPoolConfig::FromEnvironment(
+    const Environ& env) {
     FilereadWorkerPoolConfig config;
-    const auto raw = Environ::Read(
+    const auto raw = env.GetTyped(
         FilereadWorkerPoolEnvironmentVariables::MC_FILEREAD_WORKERS);
     if (!raw || raw->empty()) {
         return config;

@@ -13,18 +13,19 @@
 
 namespace mooncake {
 
-MmapArenaConfig MmapArenaConfig::FromEnvironment(bool enabled_by_flag,
+MmapArenaConfig MmapArenaConfig::FromEnvironment(const Environ& env,
+                                                 bool enabled_by_flag,
                                                  uint64_t flag_pool_size) {
     MmapArenaConfig config{.enabled = enabled_by_flag,
                            .pool_size = flag_pool_size};
     using Variables = MmapArenaEnvironmentVariables;
 
     const std::string env_pool_size =
-        Environ::ReadOr(Variables::MC_MMAP_ARENA_POOL_SIZE, std::string{});
+        env.GetTypedOr(Variables::MC_MMAP_ARENA_POOL_SIZE, std::string{});
     // An explicit pool-size env var is treated as an opt-in because pybind11
     // users cannot easily pass gflags.
     const std::string env_disable =
-        Environ::ReadOr(Variables::MC_DISABLE_MMAP_ARENA, std::string{});
+        env.GetTypedOr(Variables::MC_DISABLE_MMAP_ARENA, std::string{});
     const std::optional<bool> disable_override = TryParseBool(env_disable);
     if (!env_disable.empty() && !disable_override.has_value()) {
         LOG(WARNING) << "Ignoring invalid MC_DISABLE_MMAP_ARENA='"
@@ -55,7 +56,7 @@ MmapArenaConfig MmapArenaConfig::FromEnvironment(bool enabled_by_flag,
     // This preserves both pre-existing contracts and avoids surprising
     // operators with a silent hugepage downgrade.
     config.hugepages_explicitly_requested =
-        HugepageConfig::FromEnvironment().enabled;
+        HugepageConfig::FromEnvironment(env).enabled;
 
     // Supports human-readable sizes via string_to_byte_size(): "20gb", "16GB",
     // etc.

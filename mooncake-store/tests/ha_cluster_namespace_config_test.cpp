@@ -1,52 +1,36 @@
 #include <gtest/gtest.h>
 
-#include <cstdlib>
-#include <optional>
 #include <string>
 
 #include "../src/config/ha_cluster_namespace_config.h"
+#include "environ.h"
 
 namespace mooncake {
 namespace {
 
 class HaClusterNamespaceConfigTest : public ::testing::Test {
    protected:
-    void SetUp() override {
-        if (const char* original = std::getenv("MC_STORE_CLUSTER_ID")) {
-            original_ = original;
-        }
-        ASSERT_EQ(unsetenv("MC_STORE_CLUSTER_ID"), 0);
+    HaClusterNamespaceConfig Load() const {
+        return HaClusterNamespaceConfig::FromEnvironment(Environ(source_));
     }
 
-    void TearDown() override {
-        if (original_) {
-            EXPECT_EQ(setenv("MC_STORE_CLUSTER_ID", original_->c_str(), 1), 0);
-        } else {
-            EXPECT_EQ(unsetenv("MC_STORE_CLUSTER_ID"), 0);
-        }
-    }
-
-   private:
-    std::optional<std::string> original_;
+    MapEnvironSource source_;
 };
 
 TEST_F(HaClusterNamespaceConfigTest, FallsBackWhenUnsetOrEmpty) {
-    EXPECT_EQ(HaClusterNamespaceConfig::FromEnvironment().cluster_namespace,
-              "mooncake_cluster");
+    EXPECT_EQ(Load().cluster_namespace, "mooncake_cluster");
 
-    ASSERT_EQ(setenv("MC_STORE_CLUSTER_ID", "", 1), 0);
-    EXPECT_EQ(HaClusterNamespaceConfig::FromEnvironment().cluster_namespace,
-              "mooncake_cluster");
+    source_.Set("MC_STORE_CLUSTER_ID", "");
+    EXPECT_EQ(Load().cluster_namespace, "mooncake_cluster");
 }
 
 TEST_F(HaClusterNamespaceConfigTest, PreservesValueAndReadsEachConstruction) {
-    ASSERT_EQ(setenv("MC_STORE_CLUSTER_ID", "  team a  ", 1), 0);
-    const auto first = HaClusterNamespaceConfig::FromEnvironment();
+    source_.Set("MC_STORE_CLUSTER_ID", "  team a  ");
+    const auto first = Load();
     EXPECT_EQ(first.cluster_namespace, "  team a  ");
 
-    ASSERT_EQ(setenv("MC_STORE_CLUSTER_ID", "team b", 1), 0);
-    EXPECT_EQ(HaClusterNamespaceConfig::FromEnvironment().cluster_namespace,
-              "team b");
+    source_.Set("MC_STORE_CLUSTER_ID", "team b");
+    EXPECT_EQ(Load().cluster_namespace, "team b");
     EXPECT_EQ(first.cluster_namespace, "  team a  ");
 }
 

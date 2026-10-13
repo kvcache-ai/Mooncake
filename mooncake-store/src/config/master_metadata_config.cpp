@@ -5,11 +5,10 @@
 
 namespace mooncake {
 
-MasterMetadataConfig MasterMetadataConfig::FromEnvironment() {
+MasterMetadataConfig MasterMetadataConfig::FromEnvironment(const Environ& env) {
     MasterMetadataConfig config;
     config.cluster_id =
-        Environ::Read(
-            MasterMetadataEnvironmentVariables::MC_METADATA_CLUSTER_ID)
+        env.GetTyped(MasterMetadataEnvironmentVariables::MC_METADATA_CLUSTER_ID)
             .value_or("");
     return config;
 }

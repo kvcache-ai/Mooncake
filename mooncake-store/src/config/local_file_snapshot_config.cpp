@@ -7,8 +7,9 @@
 
 namespace mooncake {
 
-LocalFileSnapshotConfig LocalFileSnapshotConfig::FromEnvironment() {
-    const auto value = Environ::Read(
+LocalFileSnapshotConfig LocalFileSnapshotConfig::FromEnvironment(
+    const Environ& env) {
+    const auto value = env.GetTyped(
         LocalFileSnapshotEnvironmentVariables::MOONCAKE_SNAPSHOT_LOCAL_PATH);
     if (!value || value->empty()) {
         throw std::runtime_error(
