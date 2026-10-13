@@ -219,6 +219,8 @@ MasterService::MasterService(const MasterServiceConfig& config)
           !enable_oplog_ ||
           config.weight_management_oplog_capability_confirmed),
       oplog_batch_max_entries_(config.oplog_batch_max_entries),
+      restore_repair_durable_timeout_ms_(
+          config.restore_repair_durable_timeout_ms),
       cluster_id_(config.cluster_id),
       root_fs_dir_(config.root_fs_dir),
       enable_disk_eviction_(config.enable_disk_eviction),
@@ -4530,12 +4532,28 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
         if (!appended) {
             repair_err = appended.error();
         }
-        if (repair_err == ErrorCode::OK &&
-            durable_future.wait_for(std::chrono::seconds(10)) !=
-                std::future_status::ready) {
-            LOG(ERROR) << "RestoreFromStandbySnapshot: repair batch not "
-                          "durable within 10s, failing the restore";
-            repair_err = ErrorCode::INTERNAL_ERROR;
+        if (repair_err == ErrorCode::OK) {
+            // Wait on the writer's durability callback. 0 means no cap: a
+            // slow backend should not turn a recoverable delay into a
+            // promotion failure. A positive timeout still fail-closes, and
+            // a later durable completion is left in the log for the retry
+            // to observe rather than rolling it back locally.
+            std::future_status durable_status = std::future_status::ready;
+            if (restore_repair_durable_timeout_ms_ == 0) {
+                durable_future.wait();
+            } else {
+                durable_status = durable_future.wait_for(
+                    std::chrono::milliseconds(
+                        restore_repair_durable_timeout_ms_));
+            }
+            if (durable_status != std::future_status::ready) {
+                LOG(ERROR)
+                    << "RestoreFromStandbySnapshot: repair batch not "
+                       "durable within "
+                    << restore_repair_durable_timeout_ms_
+                    << "ms, failing the restore";
+                repair_err = ErrorCode::INTERNAL_ERROR;
+            }
         }
         if (repair_err != ErrorCode::OK) {
             LOG(ERROR) << "RestoreFromStandbySnapshot: durable repair failed, "

@@ -16,7 +16,7 @@
 #include "config/rpc_protocol_config.h"
 #include "ha/leadership/leader_coordinator_factory.h"
 #include "ha/leadership/leader_label_reconciler.h"
-#include "ha/kv/etcd_ha_kv_backend.h"
+#include "ha/kv/ha_kv_backend_factory.h"
 #include "ha/oplog/oplog_batch_storage.h"
 #include "ha/standby_controller.h"
 #include "k8s_lease_helper.h"
@@ -268,16 +268,24 @@ void ApplyCurrentView(MasterAdminServer& admin_server,
 ErrorCode ClaimProducerViewForServing(
     const HABackendSpec& spec, const MasterServiceSupervisorConfig& config,
     ViewVersionId view_version) {
-    if (!config.enable_oplog || spec.type != HABackendType::ETCD ||
-        config.cluster_id.empty()) {
+    if (!config.enable_oplog || config.cluster_id.empty()) {
         return ErrorCode::OK;
+    }
+    if (!HaBackendSupportsOpLog(spec.type)) {
+        return ErrorCode::INVALID_PARAMS;
     }
     if (view_version == 0) {
         return ErrorCode::INVALID_PARAMS;
     }
 
-    EtcdHaKvBackend backend;
-    OpLogBatchStorage storage(config.cluster_id, backend);
+    // Fence the previous producer through the backend selected by spec, not
+    // etcd alone. Redis already implements the transactional compare-and-swap
+    // ClaimProducerView needs, so an old Redis primary must be fenced too.
+    auto backend = CreateHaKvBackend(spec);
+    if (!backend) {
+        return backend.error();
+    }
+    OpLogBatchStorage storage(config.cluster_id, *backend.value());
     return storage.ClaimProducerView(view_version);
 }
 
@@ -578,17 +586,31 @@ int RunSupervisorLoop(const HABackendSpec& spec,
             }
             continue;
         }
-        SetRuntimeState(admin_server, MasterRuntimeState::kLeaderWarmup);
 
-        mooncake::RegisterRpcService(server, *wrapped_master_service);
+        // Restore can outlast catch-up. Recheck the side-thread guard and
+        // renew once more before registering RPC or publishing a serving
+        // endpoint, otherwise a lease lost mid-restore keeps recovering.
+        if (renewal.Lost()) {
+            LOG(WARNING) << "Leadership expired during restore, applied_seq="
+                         << promotion_ctx->applied_cursor.last_seq;
+            wrapped_master_service.reset();
+            DeactivateServingState(admin_server, label_reconciler);
+            return_to_standby(std::nullopt);
+            LogLeadershipReleaseWarning(
+                "restore lease loss",
+                leader_coordinator.ReleaseLeadership(*leadership_session));
+            admin_server.SetObservedLeader(std::nullopt);
+            continue;
+        }
+
+        SetRuntimeState(admin_server, MasterRuntimeState::kLeaderWarmup);
 
         auto serve_preflight =
             leader_coordinator.RenewLeadership(*leadership_session);
         if (!serve_preflight) {
+            wrapped_master_service.reset();
             DeactivateServingState(admin_server, label_reconciler);
-            EnterStandbyMode(admin_server, *standby_controller,
-                             accept_standby_runtime_updates,
-                             leadership_session->view);
+            return_to_standby(leadership_session->view);
             if (HandleLeadershipPhaseError(
                     "serve preflight failure",
                     "validate leadership before serving", leader_coordinator,
@@ -598,9 +620,9 @@ int RunSupervisorLoop(const HABackendSpec& spec,
             continue;
         }
         if (!serve_preflight.value()) {
+            wrapped_master_service.reset();
             DeactivateServingState(admin_server, label_reconciler);
-            EnterStandbyMode(admin_server, *standby_controller,
-                             accept_standby_runtime_updates, std::nullopt);
+            return_to_standby(std::nullopt);
             LogLeadershipReleaseWarning(
                 "serve preflight expiration",
                 leader_coordinator.ReleaseLeadership(*leadership_session));
@@ -608,6 +630,8 @@ int RunSupervisorLoop(const HABackendSpec& spec,
             admin_server.SetObservedLeader(std::nullopt);
             continue;
         }
+
+        mooncake::RegisterRpcService(server, *wrapped_master_service);
 
         auto leadership_monitor = leader_coordinator.StartLeadershipMonitor(
             *leadership_session, [&server, &admin_server, &serving_state,

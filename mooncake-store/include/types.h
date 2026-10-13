@@ -124,6 +124,9 @@ constexpr const char* PUT_NO_SPACE_HELPER_STR =  // A helpful string
     " due to insufficient space. Consider lowering "
     "eviction_high_watermark_ratio or mounting more segments.";
 static constexpr uint64_t DEFAULT_PUT_START_DISCARD_TIMEOUT = 30;  // 30 seconds
+// How long RestoreFromStandbySnapshot waits for conflict-repair records to
+// become durable. 0 waits on the writer's durability future with no cap.
+static constexpr uint64_t DEFAULT_RESTORE_REPAIR_DURABLE_TIMEOUT_MS = 10000;
 static constexpr uint64_t DEFAULT_PUT_START_RELEASE_TIMEOUT =
     600;  // 10 minutes
 

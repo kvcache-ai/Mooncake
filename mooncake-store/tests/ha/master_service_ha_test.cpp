@@ -259,6 +259,11 @@ class GatedOrderedOpLogWriter : public OrderedOpLogWriter {
         cv_.notify_all();
     }
 
+    void HoldCallbacks() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        released_through_ = 0;
+    }
+
    private:
     std::mutex mutex_;
     std::condition_variable cv_;
@@ -2663,6 +2668,72 @@ TEST_F(MasterServiceHATest,
               0);
     EXPECT_TRUE(MasterServiceTestPeer::ClientLivenessRecords(service).contains(
         disk_owner));
+}
+
+TEST_F(MasterServiceHATest,
+       RestoreDiscardRepairTimeoutThenRetrySucceeds) {
+    const std::string cluster_id = "test_restore_repair_timeout_retry";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_batch_max_entries(2)
+                              .set_restore_repair_durable_timeout_ms(50)
+                              .build();
+    MasterService service(service_config);
+    auto* writer = InstallGatedWriter(service, backend);
+    writer->HoldCallbacks();
+
+    const std::string endpoint = "standby_repair_timeout_segment";
+    auto survivor =
+        MakeStandbyObject("standby_repair_timeout_survivor", endpoint);
+    auto lost = MakeStandbyObject("standby_repair_timeout_lost", endpoint);
+    survivor.metadata.replicas.push_back(MakeStandbyMemoryReplica(endpoint));
+    survivor.metadata.replicas[1].id = 2;
+    survivor.metadata.replicas[0]
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    survivor.metadata.replicas[1]
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase + 8192;
+    lost.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+
+    const auto metric_before =
+        MasterMetricManager::instance().get_allocated_mem_size();
+
+    auto result = service.RestoreFromStandbySnapshot(
+        {survivor, lost}, 7, {MakeStandbyMemorySegment(endpoint)});
+
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(ErrorCode::INTERNAL_ERROR, result.error());
+    EXPECT_EQ(MasterMetricManager::instance().get_allocated_mem_size(),
+              metric_before);
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
+                                     "standby_repair_timeout_survivor"),
+              0);
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
+                                     "standby_repair_timeout_lost"),
+              0);
+    EXPECT_TRUE(MasterServiceTestPeer::ClientLivenessRecords(service).empty());
+
+    // The first repair may still become durable after the local restore
+    // has rolled back. Resume the writer, then retry the same snapshot.
+    writer->ResumeCallbacks();
+    auto retry = service.RestoreFromStandbySnapshot(
+        {survivor, lost}, 7, {MakeStandbyMemorySegment(endpoint)});
+    ASSERT_TRUE(retry.has_value());
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
+                                     "standby_repair_timeout_survivor"),
+              1);
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
+                                     "standby_repair_timeout_lost"),
+              0);
+    EXPECT_EQ(MasterMetricManager::instance().get_allocated_mem_size(),
+              metric_before + 1024);
 }
 
 TEST_F(MasterServiceHATest, RestoreDiscardRepairWithoutWriterFailsRestore) {
