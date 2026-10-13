@@ -14,7 +14,7 @@
 #include "config/rpc_protocol_config.h"
 #include "ha/leadership/leader_coordinator_factory.h"
 #include "ha/leadership/leader_label_reconciler.h"
-#include "ha/kv/etcd_ha_kv_backend.h"
+#include "ha/kv/ha_kv_backend_factory.h"
 #include "ha/oplog/oplog_batch_storage.h"
 #include "ha/standby_controller.h"
 #include "k8s_lease_helper.h"
@@ -202,16 +202,21 @@ void ApplyCurrentView(MasterAdminServer& admin_server,
 ErrorCode ClaimProducerViewForServing(
     const HABackendSpec& spec, const MasterServiceSupervisorConfig& config,
     ViewVersionId view_version) {
-    if (!config.enable_oplog || spec.type != HABackendType::ETCD ||
-        config.cluster_id.empty()) {
+    if (!config.enable_oplog || config.cluster_id.empty()) {
         return ErrorCode::OK;
+    }
+    if (!HaBackendSupportsOpLog(spec.type)) {
+        return ErrorCode::INVALID_PARAMS;
     }
     if (view_version == 0) {
         return ErrorCode::INVALID_PARAMS;
     }
 
-    EtcdHaKvBackend backend;
-    OpLogBatchStorage storage(config.cluster_id, backend);
+    auto backend = CreateHaKvBackend(spec);
+    if (!backend) {
+        return backend.error();
+    }
+    OpLogBatchStorage storage(config.cluster_id, *backend.value());
     return storage.ClaimProducerView(view_version);
 }
 
@@ -420,9 +425,6 @@ int RunSupervisorLoop(const HABackendSpec& spec,
 
         mooncake::WrappedMasterServiceConfig wrapped_config(
             config, leadership_session->view.view_version);
-        // In HA serving-primary mode, snapshot bootstrap belongs to standby.
-        // The new primary must restore from PromotionContext only.
-        wrapped_config.enable_snapshot_restore = false;
         // The serving primary handles heartbeats/unmounts, so forward the
         // metadata cleanup config here like the non-HA path does.
         // Keep the gate alive until after the service is destroyed because the

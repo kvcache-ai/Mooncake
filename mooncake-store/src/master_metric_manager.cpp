@@ -460,6 +460,9 @@ MasterMetricManager::MasterMetricManager()
       tenant_evict_bytes_total_(
           "mooncake_tenant_evict_bytes_total",
           "Total bytes evicted by tenant-scoped quota eviction", {"tenant_id"}),
+      standby_restore_rejected_objects_total_(
+          "mooncake_ha_standby_restore_rejected_objects_total",
+          "Standby-restore objects skipped by validation reason", {"reason"}),
       offload_enqueued_total_(
           "master_offload_enqueued_total",
           "SSD offload tasks successfully enqueued (per store worker)",
@@ -477,17 +480,6 @@ MasterMetricManager::MasterMetricManager()
       offload_enqueue_rejected_total_(
           "master_offload_enqueue_rejected_total",
           "SSD offload tasks rejected at enqueue (queue full)", {"client_id"}),
-
-      // Snapshot Metrics
-      snapshot_duration_ms_(
-          "master_snapshot_duration_ms",
-          "Distribution of snapshot operation durations in milliseconds",
-          {0, 500, 1000, 5000, 10000, 30000, 60000, 120000, 180000, 240000,
-           300000}),
-      snapshot_success_("master_snapshot_success",
-                        "Total number of successful snapshot operations"),
-      snapshot_fail_("master_snapshot_fail",
-                     "Total number of failed snapshot operations"),
 
       // Initialize CopyStart, CopyEnd, CopyRevoke, MoveStart, MoveEnd,
       // MoveRevoke Counters
@@ -1422,6 +1414,11 @@ void MasterMetricManager::inc_tenant_quota_reject(const std::string& tenant_id,
     tenant_quota_reject_total_.inc({tenant_id, reason}, val);
 }
 
+void MasterMetricManager::inc_standby_restore_rejected_objects(
+    const std::string& reason, int64_t val) {
+    standby_restore_rejected_objects_total_.inc({reason}, val);
+}
+
 void MasterMetricManager::inc_tenant_evict_bytes(const std::string& tenant_id,
                                                  int64_t bytes) {
     tenant_evict_bytes_total_.inc({tenant_id}, bytes);
@@ -1451,14 +1448,6 @@ void MasterMetricManager::inc_offload_enqueue_rejected(
     const std::string& client_id, int64_t val) {
     offload_enqueue_rejected_total_.inc({client_id}, val);
 }
-
-void MasterMetricManager::set_snapshot_duration_ms(int64_t size) {
-    snapshot_duration_ms_.observe(size);
-}
-
-void MasterMetricManager::inc_snapshot_success() { snapshot_success_.inc(); }
-
-void MasterMetricManager::inc_snapshot_fail() { snapshot_fail_.inc(); }
 
 int64_t MasterMetricManager::get_put_start_requests() {
     return put_start_requests_.value();
@@ -2229,6 +2218,7 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(promotion_candidate_expired_unevaluated_);
     serialize_metric(promotion_candidate_dropped_limit_);
     serialize_metric(tenant_quota_reject_total_);
+    serialize_metric(standby_restore_rejected_objects_total_);
     serialize_metric(tenant_evict_bytes_total_);
     serialize_metric(offload_enqueued_total_);
     serialize_metric(offload_completed_total_);
@@ -2236,11 +2226,6 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(offload_cancelled_total_);
     serialize_metric(offload_enqueue_rejected_total_);
     serialize_metric(build_info_);
-
-    // Serialize Snapshot Metrics
-    serialize_metric(snapshot_duration_ms_);
-    serialize_metric(snapshot_success_);
-    serialize_metric(snapshot_fail_);
 
     return ss.str();
 }
@@ -2899,11 +2884,6 @@ std::string MasterMetricManager::get_summary_string(
        << "rejected(freq/wm/cap)=" << promotion_rejected_frequency_.value()
        << "/" << promotion_rejected_watermark_.value() << "/"
        << promotion_rejected_cap_.value();
-
-    // Snapshot summary
-    ss << " | Snapshots: "
-       << "Success=" << snapshot_success_.value() << ", "
-       << "Fail=" << snapshot_fail_.value();
 
     return ss.str();
 }

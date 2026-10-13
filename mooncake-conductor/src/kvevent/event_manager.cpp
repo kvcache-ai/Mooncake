@@ -639,8 +639,8 @@ void PackCacheHitResult(MsgpackPacker& packer,
     for (const auto& [rank, match] : result.rank_matches) {
         packer.pack(std::to_string(rank));
         packer.pack_map(4);
-        packer.pack("npu");
-        packer.pack(match.npu);
+        packer.pack("device");
+        packer.pack(match.device);
         packer.pack("cpu_local");
         packer.pack(match.cpu_local);
         packer.pack("cpu_share");
@@ -648,8 +648,8 @@ void PackCacheHitResult(MsgpackPacker& packer,
         packer.pack("disk");
         packer.pack(match.disk);
     }
-    packer.pack("npu");
-    packer.pack(result.npu);
+    packer.pack("device");
+    packer.pack(result.device);
     packer.pack("cpu_local");
     packer.pack(result.cpu_local);
     packer.pack("cpu_share");
