@@ -459,10 +459,8 @@ std::unique_ptr<StandbyController> CreateStandbyController(
     const auto capabilities = BuildStandbyRuntimeCapabilities(spec, config);
     if (capabilities.has_snapshot_bootstrap ||
         capabilities.has_oplog_following) {
-        return std::make_unique<CapabilityDrivenStandbyController>(spec,
-                                                                   config,
-                                                                   std::move(
-                                                                       start_error_injector));
+        return std::make_unique<CapabilityDrivenStandbyController>(
+            spec, config, std::move(start_error_injector));
     }
 
     LOG(INFO) << "HA standby controller falls back to noop, backend_type="
