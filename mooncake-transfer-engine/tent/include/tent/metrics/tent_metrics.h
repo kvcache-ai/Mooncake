@@ -16,6 +16,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
@@ -27,7 +28,6 @@
 
 #include "tent/common/status.h"
 #include "tent/common/types.h"
-#include "tent/metrics/cached_metric.h"
 #include "tent/metrics/config_loader.h"
 
 // Compile-time metrics enable/disable switch
@@ -42,6 +42,8 @@
 #include <csignal>  // Required before ylt headers: coro_io.hpp uses std::signal/SIGPIPE
 #include <ylt/metric.hpp>
 #include <ylt/coro_http/coro_http_server.hpp>
+
+#include "tent/metrics/cached_metric.h"
 #endif
 
 namespace mooncake::tent {
@@ -166,6 +168,47 @@ class TentMetrics {
 
     // Causal chain: record per-stage latency breakdown (microseconds).
     void recordStageLatency(Stage stage, TransportType tp, double latency_us);
+
+    // Notifications; each enum ends in kCount, the size of its label domain.
+    // Depths and in-flight sends track a size, so ignore setEnabled();
+    // completed_at is {} for a notification not bound to a transfer.
+    enum class NotifyPath { Rdma, Tcp, HpTcp, Rpc, Local, kCount };
+    enum class NotifyQueue {
+        Outbox,
+        Resend,
+        ResendHeld,
+        RecvRdma,
+        RecvTcp,
+        RecvHpTcp,
+        RecvLocal,
+        kCount,
+    };
+    enum class NotifyDropReason {
+        ResendDeadline,
+        ResendExhausted,
+        ResendEncode,
+        OutboxDeadline,
+        OutboxFull,
+        OutboxUnretryable,
+        OutboxEncode,
+        Shutdown,
+        RecvDecode,
+        RecvNoCallback,
+        RecvEndpointGone,
+        kCount,
+    };
+    enum class NotifyDedupReason { Duplicate, Expired, kCount };
+    enum class NotifyHoleReason { Ttl, Cap, kCount };
+    void recordNotifySent(NotifyPath path,
+                          std::chrono::steady_clock::time_point completed_at);
+    void recordNotifyReceived(NotifyQueue queue, size_t depth);
+    void recordNotifyResent();
+    void recordNotifyDropped(NotifyDropReason reason, uint64_t count);
+    void recordNotifyDedupDropped(NotifyDedupReason reason);
+    void recordNotifyHoleDropped(NotifyHoleReason reason);
+    void recordNotifyAckLatency(double latency_us);
+    void setNotifyQueueDepth(NotifyQueue queue, size_t depth);
+    void addNotifyInflight(int64_t delta);
 
     // Get metrics for HTTP server
     std::string getPrometheusMetrics();
@@ -337,9 +380,9 @@ class TentMetrics {
         "Batches abandoned by lazyFreeBatch after repeated failed reclaim "
         "attempts; reclaimed only at engine teardown"};
 
-    // Gauges, backed by cached cells and updated with add/sub. Serialized as
-    // Prometheus gauges (current value per label), NOT via the counters_
-    // vector.
+    // Gauges, backed by cached cells and updated with add/sub or set.
+    // Serialized as Prometheus gauges (current value per label), NOT via the
+    // counters_ vector.
     metrics::CachedDynamicCounter<1> inflight_attempts_{
         "tent_inflight_attempts",
         "In-flight transport attempts (submitted, not yet finished)",
@@ -405,6 +448,69 @@ class TentMetrics {
         "tent_transport_attempt_latency_us",
         "Observed physical transport attempt latency in microseconds",
         kLatencyBuckets, kAttemptLabels, kAttemptDomain};
+
+    // Notifications. Latencies reach from a notify QP ack (tens of us) to the
+    // outbox deadline (120 s), past both ends of kLatencyBuckets.
+    static inline const std::array<std::string, 1> kPathLabel{"path"};
+    static inline const std::array<std::string, 1> kQueueLabel{"queue"};
+    static inline const std::array<std::string, 1> kReasonLabel{"reason"};
+    static constexpr size_t kNotifyPathDomain =
+        static_cast<size_t>(NotifyPath::kCount);
+    static constexpr size_t kNotifyQueueDomain =
+        static_cast<size_t>(NotifyQueue::kCount);
+    static constexpr size_t kNotifyDropDomain =
+        static_cast<size_t>(NotifyDropReason::kCount);
+    static constexpr size_t kNotifyDedupDomain =
+        static_cast<size_t>(NotifyDedupReason::kCount);
+    static constexpr size_t kNotifyHoleDomain =
+        static_cast<size_t>(NotifyHoleReason::kCount);
+    static inline const std::vector<double> kNotifyLatencyBuckets{
+        10,   50,    100,    250,     500,      1000,
+        5000, 10000, 100000, 1000000, 10000000, 120000000};
+    metrics::CachedDynamicCounter<1> notify_sent_total_{
+        "tent_notify_sent_total", "Notifications sent, by the path taken",
+        kPathLabel, kNotifyPathDomain};
+    metrics::CachedDynamicCounter<1> notify_received_total_{
+        "tent_notify_received_total",
+        "Notifications queued for receiveNotification(), by queue", kQueueLabel,
+        kNotifyQueueDomain};
+    ylt::metric::counter_t notify_resent_total_{
+        "tent_notify_resent_total",
+        "Notifications resent after their notify QP failed with them in "
+        "flight"};
+    metrics::CachedDynamicCounter<1> notify_dropped_total_{
+        "tent_notify_dropped_total",
+        "Notifications dropped without delivery, by reason", kReasonLabel,
+        kNotifyDropDomain};
+    metrics::CachedDynamicCounter<1> notify_dedup_dropped_total_{
+        "tent_notify_dedup_dropped_total",
+        "Stamped notifications refused as delivered before or too late",
+        kReasonLabel, kNotifyDedupDomain};
+    metrics::CachedDynamicCounter<1> notify_dedup_holes_dropped_total_{
+        "tent_notify_dedup_holes_dropped_total",
+        "Ranges of missing notifications the receiver stopped waiting for",
+        kReasonLabel, kNotifyHoleDomain};
+    metrics::CachedDynamicCounter<1> notify_queue_depth_{
+        "tent_notify_queue_depth", "Notifications waiting in a queue",
+        kQueueLabel, kNotifyQueueDomain};
+    metrics::CachedDynamicCounter<1> notify_inflight_{
+        "tent_notify_inflight",
+        "Notifications posted on a notify QP, not yet completed or handed "
+        "back for resend",
+        kTransportLabel, kTransportDomain};
+    metrics::CachedDynamicHistogram<1> notify_ack_latency_{
+        "tent_notify_ack_latency_us",
+        "Notify QP post to send completion (peer ack) in microseconds",
+        kNotifyLatencyBuckets, kTransportLabel, kTransportDomain};
+    metrics::CachedDynamicHistogram<1> notify_bound_delay_{
+        "tent_notify_bound_delay_us",
+        "Bound notification, transfer seen complete to first send, in "
+        "microseconds",
+        kNotifyLatencyBuckets, kPathLabel, kNotifyPathDomain};
+    // One count for every module of the process, counted from its start;
+    // posts and completions race, so the gauge is read off it when scraped.
+    std::atomic<int64_t> notify_sends_inflight_{0};
+    void refreshNotifyInflight();
 
     // Per-transport (N=1) histograms for unified serialization; the N=2
     // transport_attempt_latency_ histogram is serialized separately (see
@@ -562,6 +668,46 @@ class ScopedLatencyRecorder {
         }                                                                 \
     } while (0)
 
+#define TENT_RECORD_NOTIFY_SENT(path, completed_at)                     \
+    do {                                                                \
+        if (::mooncake::tent::TentMetrics::isEnabled()) {               \
+            ::mooncake::tent::TentMetrics::instance().recordNotifySent( \
+                path, completed_at);                                    \
+        }                                                               \
+    } while (0)
+
+#define TENT_RECORD_NOTIFY_RECEIVED(queue, depth) \
+    ::mooncake::tent::TentMetrics::instance().recordNotifyReceived(queue, depth)
+
+#define TENT_RECORD_NOTIFY_RESENT()                                         \
+    do {                                                                    \
+        if (::mooncake::tent::TentMetrics::isEnabled()) {                   \
+            ::mooncake::tent::TentMetrics::instance().recordNotifyResent(); \
+        }                                                                   \
+    } while (0)
+
+#define TENT_RECORD_NOTIFY_DROPPED(reason, count)                          \
+    do {                                                                   \
+        if (::mooncake::tent::TentMetrics::isEnabled()) {                  \
+            ::mooncake::tent::TentMetrics::instance().recordNotifyDropped( \
+                reason, count);                                            \
+        }                                                                  \
+    } while (0)
+
+#define TENT_RECORD_NOTIFY_ACK_LATENCY(latency_us)                            \
+    do {                                                                      \
+        if (::mooncake::tent::TentMetrics::isEnabled()) {                     \
+            ::mooncake::tent::TentMetrics::instance().recordNotifyAckLatency( \
+                latency_us);                                                  \
+        }                                                                     \
+    } while (0)
+
+#define TENT_SET_NOTIFY_QUEUE_DEPTH(queue, depth) \
+    ::mooncake::tent::TentMetrics::instance().setNotifyQueueDepth(queue, depth)
+
+#define TENT_ADD_NOTIFY_INFLIGHT(delta) \
+    ::mooncake::tent::TentMetrics::instance().addNotifyInflight(delta)
+
 #else  // !TENT_METRICS_ENABLED
 
 // No-op stub class for ScopedLatencyRecorder when metrics are disabled
@@ -582,6 +728,13 @@ class ScopedLatencyRecorder {
 #define TENT_SCOPED_READ_LATENCY(tp, bytes) ((void)0)
 #define TENT_SCOPED_WRITE_LATENCY(tp, bytes) ((void)0)
 #define TENT_RECORD_STAGE_LATENCY(stage, tp, latency_us) ((void)0)
+#define TENT_RECORD_NOTIFY_SENT(path, completed_at) ((void)0)
+#define TENT_RECORD_NOTIFY_RECEIVED(queue, depth) ((void)0)
+#define TENT_RECORD_NOTIFY_RESENT() ((void)0)
+#define TENT_RECORD_NOTIFY_DROPPED(reason, count) ((void)0)
+#define TENT_RECORD_NOTIFY_ACK_LATENCY(latency_us) ((void)0)
+#define TENT_SET_NOTIFY_QUEUE_DEPTH(queue, depth) ((void)0)
+#define TENT_ADD_NOTIFY_INFLIGHT(delta) ((void)0)
 
 #endif  // TENT_METRICS_ENABLED
 

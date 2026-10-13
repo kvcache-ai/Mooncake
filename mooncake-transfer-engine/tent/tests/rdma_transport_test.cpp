@@ -12,12 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <arpa/inet.h>
 #include <fcntl.h>
 #include <cerrno>
 #include <dlfcn.h>
 #include <gtest/gtest.h>
 #include <infiniband/verbs.h>
+#include <netinet/in.h>
 #include <sys/eventfd.h>
+#include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -36,6 +39,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -45,6 +49,7 @@
 #include "tent/common/types.h"
 #include "tent/common/utils/string_builder.h"
 #include "tent/transfer_engine.h"
+#include "tent/metrics/tent_metrics.h"
 #include "tent/rpc/rpc.h"
 #include "tent/runtime/platform.h"
 #include "tent/runtime/topology.h"
@@ -207,6 +212,10 @@ class RdmaTransportTestPeer {
     }
 
     using NotifyAction = RdmaTransport::NotifyCompletionAction;
+
+    static int processNotifyCompletions(RdmaTransport& transport) {
+        return transport.processNotifyCompletions();
+    }
 
     static NotifyAction classifyNotifyCompletion(ibv_wc_status status,
                                                  bool endpoint_alive,
@@ -7163,6 +7172,381 @@ TEST(RdmaBufferRegistrationGapTest, ANicWithoutAContextIsNotAFailure) {
         RdmaContextTestPeer::unbindDevice(*context);
     }
 }
+
+#if TENT_METRICS_ENABLED
+// Records made while no test holds one are lost, which is why gauges are
+// read as moves from a value set within the test.
+class NotifyMetricsScope {
+   public:
+    NotifyMetricsScope() {
+        TentMetrics::instance().shutdown();
+        MetricsConfig config;
+        config.http_host = "127.0.0.1";
+        config.http_port = freeLoopbackPort();
+        config.report_interval_seconds = 0;
+        EXPECT_TRUE(TentMetrics::instance().initialize(config).ok());
+        TentMetrics::setEnabled(true);
+    }
+    ~NotifyMetricsScope() { TentMetrics::instance().shutdown(); }
+
+    static double series(const std::string& name) {
+        std::istringstream text(TentMetrics::instance().getPrometheusMetrics());
+        for (std::string line; std::getline(text, line);) {
+            if (line.rfind(name + " ", 0) == 0)
+                return std::stod(line.substr(name.size() + 1));
+        }
+        return 0;
+    }
+
+    static bool reaches(const std::string& name, double value) {
+        for (int i = 0; i < 500 && series(name) != value; ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        return series(name) == value;
+    }
+
+   private:
+    static uint16_t freeLoopbackPort() {
+        const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        socklen_t len = sizeof(addr);
+        if (fd < 0) return 0;
+        const bool bound =
+            ::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0 &&
+            ::getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &len) == 0;
+        ::close(fd);
+        return bound ? ntohs(addr.sin_port) : 0;
+    }
+};
+
+const std::string kInflight = "tent_notify_inflight{transport=\"rdma\"}";
+
+std::string notifyDropped(const std::string& reason) {
+    return "tent_notify_dropped_total{reason=\"" + reason + "\"}";
+}
+
+TEST_F(RdmaWorkersSharedQpTest, NotifyInflightAndAckLatencyFollowTheEndpoint) {
+    NotifyMetricsScope metrics;
+    const std::string acks =
+        "tent_notify_ack_latency_us_count{transport=\"rdma\"}";
+    RdmaEndPointTestPeer::connectTypedNotify(endpoint_);
+    Notification notifi{"n", "m", 9, 1};
+    ASSERT_TRUE(endpoint_->sendNotification(notifi));
+    const double base = metrics.series(kInflight) - 1;
+    const double acked = metrics.series(acks);
+    for (uint64_t seq = 2; seq <= 3; ++seq) {
+        notifi.seq = seq;
+        ASSERT_TRUE(endpoint_->sendNotification(notifi));
+    }
+    EXPECT_EQ(metrics.series(kInflight) - base, 3);
+
+    const std::string waited =
+        "tent_notify_ack_latency_us_sum{transport=\"rdma\"}";
+    const double waited0 = metrics.series(waited);
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    endpoint_->handleNotifySendComplete(1);
+    EXPECT_EQ(metrics.series(kInflight) - base, 2);
+    EXPECT_EQ(metrics.series(acks) - acked, 1);
+    EXPECT_GE(metrics.series(waited) - waited0, 2000);
+    endpoint_->handleNotifySendComplete(
+        RdmaEndPointTestPeer::kNotifyMaxPendingSends);  // wr_id 0's slot
+    EXPECT_EQ(metrics.series(kInflight) - base, 1);
+    EXPECT_EQ(metrics.series(acks) - acked, 1);
+
+    endpoint_->deconstruct();
+    EXPECT_EQ(metrics.series(kInflight) - base, 0);
+    endpoint_->handleNotifySendComplete(2);
+    EXPECT_EQ(metrics.series(kInflight) - base, 0);
+}
+
+TEST_F(RdmaWorkersSharedQpTest, HandedBackSendsLeaveTheInflightGauge) {
+    NotifyMetricsScope metrics;
+    const std::string resend = "tent_notify_queue_depth{queue=\"resend\"}";
+    auto retiring = std::make_shared<RdmaEndPoint>();
+    ASSERT_EQ(retiring->construct(context_.get(), &params_->endpoint, "peer:1"),
+              0);
+    const PendingNotify track{5};
+    for (const auto& endpoint : {endpoint_, retiring}) {
+        RdmaEndPointTestPeer::connectTypedNotify(endpoint);
+        for (uint64_t seq = 1; seq <= 2; ++seq)
+            ASSERT_TRUE(endpoint->sendNotification({"n", "m", 9, seq}, &track));
+    }
+    const double base = metrics.series(kInflight) - 4;
+
+    endpoint_->disableNotification("test");
+    EXPECT_EQ(metrics.series(kInflight) - base, 2);
+    EXPECT_EQ(metrics.series(resend), 2);
+    retiring->beginDestroy();
+    EXPECT_EQ(metrics.series(kInflight) - base, 0);
+    EXPECT_EQ(metrics.series(resend), 4);
+}
+
+TEST_F(RdmaWorkersSharedQpTest, UndeliverableNotifyReceivesAreDropped) {
+    NotifyMetricsScope metrics;
+    const double decode0 = metrics.series(notifyDropped("recv_decode"));
+    const double gone0 = metrics.series(notifyDropped("recv_endpoint_gone"));
+    EXPECT_FALSE(endpoint_->handleNotifyRecv(0, 3));
+    EXPECT_EQ(metrics.series(notifyDropped("recv_endpoint_gone")) - gone0, 0);
+    endpoint_->deconstruct();
+    EXPECT_FALSE(endpoint_->handleNotifyRecv(0, 3));
+    EXPECT_EQ(metrics.series(notifyDropped("recv_decode")) - decode0, 1);
+    EXPECT_EQ(metrics.series(notifyDropped("recv_endpoint_gone")) - gone0, 1);
+}
+
+// The receiver counts what it refuses outright; a callback failure, a JSON
+// exception included, is answered to the sender and is not counted here.
+TEST(RdmaNotifyMetricsTest, ANotifyRpcTheReceiverRefusesIsCountedByCause) {
+    NotifyMetricsScope metrics;
+    const double no_callback0 =
+        metrics.series(notifyDropped("recv_no_callback"));
+    const double decode0 = metrics.series(notifyDropped("recv_decode"));
+    ControlService receiver("p2p", "", nullptr);
+    uint16_t port = 0;
+    ASSERT_TRUE(receiver.start(port).ok());
+    const std::string addr = "127.0.0.1:" + std::to_string(port);
+    // An earlier test may have marked this port.
+    PeerHealth::instance().clear();
+    auto notify = [&addr] {
+        return onFreshThread(
+            [&addr] { return ControlClient::notify(addr, {"n", "m", 1, 1}); });
+    };
+
+    Status status = notify();
+    EXPECT_TRUE(status.IsInternalError()) << status.ToString();
+    EXPECT_EQ(metrics.series(notifyDropped("recv_no_callback")) - no_callback0,
+              1);
+    EXPECT_EQ(metrics.series(notifyDropped("recv_decode")) - decode0, 0);
+
+    receiver.setNotifyCallback([](const Notification&) -> int {
+        throw std::runtime_error("queue full");
+    });
+    status = notify();
+    EXPECT_TRUE(status.IsInternalError()) << status.ToString();
+    receiver.setNotifyCallback([](const Notification&) -> int {
+        return json::parse("{bad").get<int>();
+    });
+    status = notify();
+    EXPECT_TRUE(status.IsInternalError()) << status.ToString();
+    receiver.setNotifyCallback([](const Notification&) { return 1; });
+    status = notify();
+    EXPECT_TRUE(status.IsInternalError()) << status.ToString();
+    EXPECT_EQ(metrics.series(notifyDropped("recv_decode")) - decode0, 0);
+
+    const double decode1 = metrics.series(notifyDropped("recv_decode"));
+    std::string answer;
+    const Status sent = onFreshThread([&] {
+        CoroRpcAgent client;
+        return client.call(addr, Notify, "{bad", answer);
+    });
+    ASSERT_TRUE(sent.ok()) << sent.ToString();
+    EXPECT_EQ(answer.rfind("malformed notification: ", 0), 0u) << answer;
+    EXPECT_EQ(metrics.series(notifyDropped("recv_decode")) - decode1, 1);
+    EXPECT_EQ(metrics.series(notifyDropped("recv_no_callback")) - no_callback0,
+              1);
+}
+
+// A send completing for a QP no endpoint owns is not a loss; a receive is.
+TEST_F(RdmaWorkersSharedQpTest, ARecvOnAQpWithoutAnEndpointIsDropped) {
+    NotifyMetricsScope metrics;
+    static std::vector<ibv_wc> completions;
+    completions.clear();
+    for (const ibv_wc_opcode opcode : {IBV_WC_RECV, IBV_WC_SEND}) {
+        ibv_wc wc{};
+        wc.status = IBV_WC_SUCCESS;
+        wc.opcode = opcode;
+        wc.qp_num = 4242;
+        completions.push_back(wc);
+    }
+    fake.cq.context = &fake.native;
+    fake.native.ops.poll_cq = [](ibv_cq*, int max, ibv_wc* wc) {
+        const int n = std::min<int>(max, completions.size());
+        std::copy_n(completions.begin(), n, wc);
+        completions.erase(completions.begin(), completions.begin() + n);
+        return n;
+    };
+    const double gone0 = metrics.series(notifyDropped("recv_endpoint_gone"));
+    RdmaTransportTestPeer::processNotifyCompletions(transport_);
+    EXPECT_TRUE(completions.empty());
+    EXPECT_EQ(metrics.series(notifyDropped("recv_endpoint_gone")) - gone0, 1);
+}
+
+TEST(RdmaNotifyMetricsTest, ReceivedNotificationsAreCountedUntilPolled) {
+    NotifyMetricsScope metrics;
+    const std::string queued =
+        "tent_notify_received_total{queue=\"recv_rdma\"}";
+    const std::string depth = "tent_notify_queue_depth{queue=\"recv_rdma\"}";
+    RdmaTransport transport;
+    const double before = metrics.series(queued);
+    transport.addNotificationToQueue({"n", "a", 0, 0});
+    transport.addNotificationToQueue({"n", "b", 0, 0});
+    EXPECT_EQ(metrics.series(queued) - before, 2);
+    EXPECT_EQ(metrics.series(depth), 2);
+    std::vector<Notification> polled;
+    ASSERT_TRUE(transport.receiveNotification(polled).ok());
+    EXPECT_EQ(polled.size(), 2u);
+    EXPECT_EQ(metrics.series(depth), 0);
+}
+
+TEST(RdmaNotifyMetricsTest, ResendsAreCountedAsResentOrDropped) {
+    NotifyMetricsScope metrics;
+    const std::string resent = "tent_notify_resent_total";
+    const std::string resend = "tent_notify_queue_depth{queue=\"resend\"}";
+    const double resent0 = metrics.series(resent);
+    const double encode0 = metrics.series(notifyDropped("resend_encode"));
+    FakePeer peer;
+    RdmaTransport transport;
+    const SegmentID target = openPeers(transport, {peer.addr()})[0];
+    const int spent = RdmaTransportTestPeer::kMaxNotifyResendAttempts;
+    RdmaTransportTestPeer::requeue(transport,
+                                   {target, {"n", "\xff", 1, 1}, spent, 0});
+    for (uint64_t seq = 2; seq <= 3; ++seq)
+        RdmaTransportTestPeer::requeue(transport,
+                                       {target, {"n", "m", 1, seq}, spent, 0});
+    EXPECT_EQ(metrics.series(resend), 3);
+
+    RdmaTransportTestPeer::startResendThread(transport);
+    for (int i = 0; i < 500 && peer.notified().size() < 2; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    RdmaTransportTestPeer::wakeResendThread(transport);
+    (void)transport.quiesce();
+    EXPECT_EQ(metrics.series(resent) - resent0, 2);
+    EXPECT_EQ(metrics.series(notifyDropped("resend_encode")) - encode0, 1);
+    EXPECT_EQ(metrics.series(resend), 0);
+}
+
+TEST(RdmaNotifyMetricsTest, ResendDropsAreLabelledByReason) {
+    using std::chrono::seconds;
+    NotifyMetricsScope metrics;
+    const std::string held = "tent_notify_queue_depth{queue=\"resend_held\"}";
+    const double exhausted0 = metrics.series(notifyDropped("resend_exhausted"));
+    const double deadline0 = metrics.series(notifyDropped("resend_deadline"));
+    const double shutdown0 = metrics.series(notifyDropped("shutdown"));
+    auto exhausted = [&] {
+        return metrics.series(notifyDropped("resend_exhausted")) - exhausted0;
+    };
+    auto deadline = [&] {
+        return metrics.series(notifyDropped("resend_deadline")) - deadline0;
+    };
+    const int spent = RdmaTransportTestPeer::kMaxNotifyResendAttempts;
+    {
+        RdmaTransport transport;
+        RdmaTransportTestPeer::setRpcFallback(transport, false);
+        PendingNotify pending{9, {"n", "m", 1, 1}, spent, 0};
+        EXPECT_FALSE(resendOnFreshThread(transport, pending));
+    }
+    EXPECT_EQ(exhausted(), 1);
+    EXPECT_EQ(deadline(), 0);
+    {
+        RdmaTransport transport;
+        const SegmentID dead = openPeers(transport, {"127.0.0.1:1"})[0];
+        RdmaTransportTestPeer::setResendDeadline(transport, seconds(10));
+        const auto t0 = std::chrono::steady_clock::now();
+        PendingNotify pending{dead, {"n", "m", 1, 1}, 0, 0};
+        EXPECT_FALSE(resendOnFreshThread(transport, pending, t0));
+        EXPECT_EQ(deadline(), 0);
+        EXPECT_FALSE(resendOnFreshThread(transport, pending, t0 + seconds(11)));
+    }
+    EXPECT_EQ(exhausted(), 1);
+    EXPECT_EQ(deadline(), 1);
+    {
+        RdmaTransport transport;
+        const SegmentID dead = openPeers(transport, {"127.0.0.1:1"})[0];
+        RdmaTransportTestPeer::startResendThread(transport);
+        RdmaTransportTestPeer::requeue(transport,
+                                       {dead, {"n", "m", 1, 1}, 0, 0});
+        EXPECT_TRUE(metrics.reaches(held, 1));
+        (void)transport.quiesce();
+        EXPECT_EQ(metrics.series(held), 0);
+        RdmaTransportTestPeer::requeue(transport,
+                                       {dead, {"n", "m", 1, 2}, 0, 0});
+    }
+    PeerHealth::instance().clear();
+    EXPECT_EQ(exhausted(), 1);
+    EXPECT_EQ(deadline(), 1);
+    EXPECT_EQ(metrics.series(notifyDropped("shutdown")) - shutdown0, 2);
+}
+
+// The oldest held resend is dropped on its own; the rest of the peer's held
+// resends past the deadline go in one batch.
+TEST(RdmaNotifyMetricsTest, HeldResendsPastTheDeadlineAreCountedAsDropped) {
+    NotifyMetricsScope metrics;
+    const double deadline0 = metrics.series(notifyDropped("resend_deadline"));
+    FakePeer refusing("[]", /*failed_lookups=*/1000);
+    RdmaTransport transport;
+    const SegmentID id = openPeers(transport, {refusing.addr()})[0];
+    RdmaTransportTestPeer::setResendDeadline(transport,
+                                             std::chrono::milliseconds(300));
+    for (uint64_t seq = 1; seq <= 3; ++seq)
+        RdmaTransportTestPeer::requeue(transport, {id, {"n", "m", 1, seq}});
+
+    RdmaTransportTestPeer::startResendThread(transport);
+    for (int i = 0;
+         i < 300 && RdmaTransportTestPeer::droppedResends(transport) < 3; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    EXPECT_EQ(RdmaTransportTestPeer::droppedResends(transport), 3u);
+    EXPECT_EQ(metrics.series(notifyDropped("resend_deadline")) - deadline0, 3);
+    RdmaTransportTestPeer::wakeResendThread(transport);
+    (void)transport.quiesce();
+    PeerHealth::instance().clear();
+}
+
+// A resend held because the receiver kept answering it could not take it
+// yet is dropped at the deadline, not as out of rounds.
+TEST(RdmaNotifyMetricsTest, AResendTheReceiverKeptRefusingIsCountedAsDeadline) {
+    NotifyMetricsScope metrics;
+    const double deadline0 = metrics.series(notifyDropped("resend_deadline"));
+    const double exhausted0 = metrics.series(notifyDropped("resend_exhausted"));
+    FakePeer peer;
+    peer.refuseNotifies(1000);
+    RdmaTransport transport;
+    const SegmentID id = openPeers(transport, {peer.addr()})[0];
+    RdmaTransportTestPeer::setResendDeadline(transport,
+                                             std::chrono::milliseconds(300));
+    const int spent = RdmaTransportTestPeer::kMaxNotifyResendAttempts;
+    RdmaTransportTestPeer::requeue(transport, {id, {"n", "m", 1, 1}, spent, 0});
+
+    RdmaTransportTestPeer::startResendThread(transport);
+    for (int i = 0;
+         i < 300 && RdmaTransportTestPeer::droppedResends(transport) == 0; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    EXPECT_EQ(RdmaTransportTestPeer::droppedResends(transport), 1u);
+    EXPECT_TRUE(
+        metrics.reaches(notifyDropped("resend_deadline"), deadline0 + 1));
+    EXPECT_EQ(metrics.series(notifyDropped("resend_exhausted")) - exhausted0,
+              0);
+    RdmaTransportTestPeer::wakeResendThread(transport);
+    (void)transport.quiesce();
+    PeerHealth::instance().clear();
+}
+
+// A resend being retried can wait out a request timeout on its peer; it is
+// then in neither queue.
+TEST(RdmaNotifyMetricsTest, AResendBeingRetriedIsInNeitherQueue) {
+    NotifyMetricsScope metrics;
+    const std::string resend = "tent_notify_queue_depth{queue=\"resend\"}";
+    const std::string held = "tent_notify_queue_depth{queue=\"resend_held\"}";
+    std::promise<void> release;
+    FakePeer peer("[]", 0, release.get_future().share());
+    RdmaTransport transport;
+    const SegmentID target = openPeers(transport, {peer.addr()})[0];
+    RdmaTransportTestPeer::requeue(transport, {target, {"n", "m", 1, 1}, 0, 0});
+    EXPECT_EQ(metrics.series(resend), 1);
+
+    RdmaTransportTestPeer::startResendThread(transport);
+    for (int i = 0; i < 500 && peer.lookups() == 0; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    EXPECT_EQ(peer.lookups(), 1);
+    EXPECT_EQ(metrics.series(resend), 0);
+    EXPECT_EQ(metrics.series(held), 0);
+    release.set_value();
+    for (int i = 0; i < 500 && peer.notified().empty(); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    RdmaTransportTestPeer::wakeResendThread(transport);
+    (void)transport.quiesce();
+    EXPECT_EQ(peer.notified(), std::vector<std::string>{"1/1"});
+}
+#endif
 
 }  // namespace
 }  // namespace tent

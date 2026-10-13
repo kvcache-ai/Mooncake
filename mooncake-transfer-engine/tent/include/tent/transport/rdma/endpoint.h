@@ -299,6 +299,9 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
 
     std::vector<PendingNotify> takeResendableNoLock();
     void requeueDrained(std::vector<PendingNotify>&& drained);
+    // Once the notify QP cannot complete what it carries, its sends leave
+    // the in-flight gauge; any handed back are then in the resend queue.
+    void uncountNotifySendsNoLock();
 
     static char* notifySlotPtr(char* base, size_t idx);
     static bool encodeNotifyPayload(char* slot, const std::string& name,
@@ -379,6 +382,15 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     // Tracked typed sends by wr_id (posting order) until their completion;
     // guarded by notify_send_mutex_.
     std::map<uint64_t, PendingNotify> notify_resendable_;
+    // Metrics only, guarded by notify_send_mutex_: when each send was posted,
+    // by wr_id modulo the slots, and the sends this endpoint holds in the
+    // transport's in-flight count until they complete or are uncounted.
+    struct NotifyPost {
+        uint64_t wr_id = UINT64_MAX;
+        std::chrono::steady_clock::time_point at;
+    };
+    std::vector<NotifyPost> notify_posts_;
+    int64_t notify_sends_counted_ = 0;
 
     // Two-phase destruction constants (matching TE)
     static constexpr double kFinishDestroyTimeoutSec = 30.0;

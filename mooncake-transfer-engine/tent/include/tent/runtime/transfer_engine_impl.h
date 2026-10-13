@@ -553,19 +553,25 @@ class TransferEngineImpl {
     Status sendNotificationViaRpc(SegmentID target_id,
                                   const Notification& notifi);
 
+    void noteRefusedNotifications(uint64_t count);
+
     Notification stampNotification(SegmentID target_id,
                                    const Notification& notifi);
 
     // sendNotification() past the stamp. hook_path: a single try on the first
     // notification transport, over a channel that is already up.
-    Status sendNotificationOnce(SegmentID target_id,
-                                const Notification& to_send, bool hook_path);
+    Status sendNotificationOnce(
+        SegmentID target_id, const Notification& to_send, bool hook_path,
+        std::chrono::steady_clock::time_point completed_at = {});
 
-    void fireBoundNotification(SegmentID target_id, const Notification& notifi);
+    void fireBoundNotification(
+        SegmentID target_id, const Notification& notifi,
+        std::chrono::steady_clock::time_point completed_at);
 
     bool outboxHolds(SegmentID target_id);
 
-    void enqueueOutbox(SegmentID target_id, Notification notifi);
+    void enqueueOutbox(SegmentID target_id, Notification notifi,
+                       std::chrono::steady_clock::time_point completed_at);
 
     void notifyOutboxThread();
 
@@ -683,6 +689,7 @@ class TransferEngineImpl {
         std::chrono::steady_clock::time_point enqueued;
         std::chrono::steady_clock::time_point next_try;
         int attempts{0};
+        std::chrono::steady_clock::time_point completed_at;  // of its transfer
     };
     std::mutex notify_outbox_mutex_;
     std::condition_variable notify_outbox_cv_;

@@ -93,6 +93,27 @@ const char* taskFailureReasonName(TentMetrics::TaskFailureReason reason) {
     }
     return "unknown";
 }
+
+constexpr const char* kNotifyPathNames[] = {"rdma", "tcp", "hp_tcp", "rpc",
+                                            "local"};
+constexpr const char* kNotifyQueueNames[] = {
+    "outbox",   "resend",      "resend_held", "recv_rdma",
+    "recv_tcp", "recv_hp_tcp", "recv_local"};
+constexpr const char* kNotifyDropNames[] = {
+    "resend_deadline",  "resend_exhausted",  "resend_encode",
+    "outbox_deadline",  "outbox_full",       "outbox_unretryable",
+    "outbox_encode",    "shutdown",          "recv_decode",
+    "recv_no_callback", "recv_endpoint_gone"};
+constexpr const char* kNotifyDedupNames[] = {"duplicate", "expired"};
+constexpr const char* kNotifyHoleNames[] = {"ttl", "cap"};
+
+// A table indexed past its end would read a label slot that does not exist.
+template <typename Enum, size_t N>
+std::array<std::string, 1> notifyLabel(const char* const (&names)[N],
+                                       Enum value) {
+    static_assert(N == static_cast<size_t>(Enum::kCount));
+    return {names[static_cast<size_t>(value)]};
+}
 }  // namespace
 
 Status TentMetrics::initialize(const MetricsConfig& config) {
@@ -297,11 +318,19 @@ void TentMetrics::registerMetrics() {
         &task_failures_total_,
         &deadline_infeasible_total_,
         &quarantined_batches_total_,
+        &notify_sent_total_,
+        &notify_received_total_,
+        &notify_resent_total_,
+        &notify_dropped_total_,
+        &notify_dedup_dropped_total_,
+        &notify_dedup_holes_dropped_total_,
     };
 
     gauges_ = {
         &inflight_attempts_,
         &registered_buffer_bytes_,
+        &notify_queue_depth_,
+        &notify_inflight_,
     };
 
     // Register the N=1 per-transport histograms for unified serialization.
@@ -309,8 +338,10 @@ void TentMetrics::registerMetrics() {
     // (it can't share this N=1-typed vector); see getPrometheusMetrics /
     // getJsonMetrics.
     histograms_ = {
-        &read_latency_, &write_latency_,    &read_size_,      &write_size_,
-        &deadline_mlu_, &stage_queue_wait_, &stage_dispatch_, &stage_transport_,
+        &read_latency_,       &write_latency_,   &read_size_,
+        &write_size_,         &deadline_mlu_,    &stage_queue_wait_,
+        &stage_dispatch_,     &stage_transport_, &notify_ack_latency_,
+        &notify_bound_delay_,
     };
 }
 
@@ -440,6 +471,88 @@ void TentMetrics::recordStageLatency(Stage stage, TransportType tp,
     }
 }
 
+void TentMetrics::recordNotifySent(
+    NotifyPath path, std::chrono::steady_clock::time_point completed_at) {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
+        return;
+    const size_t slot = static_cast<size_t>(path);
+    auto label = [path] { return notifyLabel(kNotifyPathNames, path); };
+    notify_sent_total_.incCached(slot, label);
+    if (completed_at == std::chrono::steady_clock::time_point{}) return;
+    const auto delay = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - completed_at);
+    notify_bound_delay_.observeCached(slot, label, delay.count());
+}
+
+void TentMetrics::recordNotifyReceived(NotifyQueue queue, size_t depth) {
+    if (!initialized_) return;
+    const size_t slot = static_cast<size_t>(queue);
+    auto label = [queue] { return notifyLabel(kNotifyQueueNames, queue); };
+    if (runtime_enabled_.load(std::memory_order_relaxed))
+        notify_received_total_.incCached(slot, label);
+    notify_queue_depth_.setCached(slot, label, static_cast<int64_t>(depth));
+}
+
+void TentMetrics::recordNotifyResent() {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
+        return;
+    notify_resent_total_.inc();
+}
+
+void TentMetrics::recordNotifyDropped(NotifyDropReason reason, uint64_t count) {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
+        return;
+    notify_dropped_total_.incCached(
+        static_cast<size_t>(reason),
+        [reason] { return notifyLabel(kNotifyDropNames, reason); },
+        static_cast<int64_t>(count));
+}
+
+void TentMetrics::recordNotifyDedupDropped(NotifyDedupReason reason) {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
+        return;
+    notify_dedup_dropped_total_.incCached(
+        static_cast<size_t>(reason),
+        [reason] { return notifyLabel(kNotifyDedupNames, reason); });
+}
+
+void TentMetrics::recordNotifyHoleDropped(NotifyHoleReason reason) {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
+        return;
+    notify_dedup_holes_dropped_total_.incCached(
+        static_cast<size_t>(reason),
+        [reason] { return notifyLabel(kNotifyHoleNames, reason); });
+}
+
+void TentMetrics::recordNotifyAckLatency(double latency_us) {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
+        return;
+    if (latency_us < 0.0) return;
+    notify_ack_latency_.observeCached(
+        transportSlot(RDMA),
+        [] { return std::array<std::string, 1>{transportTypeName(RDMA)}; },
+        static_cast<int64_t>(latency_us));
+}
+
+void TentMetrics::setNotifyQueueDepth(NotifyQueue queue, size_t depth) {
+    if (!initialized_) return;
+    notify_queue_depth_.setCached(
+        static_cast<size_t>(queue),
+        [queue] { return notifyLabel(kNotifyQueueNames, queue); },
+        static_cast<int64_t>(depth));
+}
+
+void TentMetrics::addNotifyInflight(int64_t delta) {
+    notify_sends_inflight_.fetch_add(delta, std::memory_order_relaxed);
+}
+
+void TentMetrics::refreshNotifyInflight() {
+    notify_inflight_.setCached(
+        transportSlot(RDMA),
+        [] { return std::array<std::string, 1>{transportTypeName(RDMA)}; },
+        notify_sends_inflight_.load(std::memory_order_relaxed));
+}
+
 void TentMetrics::recordReadFailed(TransportType tp) {
     if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
         return;
@@ -540,6 +653,7 @@ bool TentMetrics::tryGetPrometheusMetrics(std::string& result) {
     return serializeWithAccounting(
         kPrometheusFormat, result,
         [this](std::string& output, uint64_t success_timestamp) {
+            refreshNotifyInflight();
             output.reserve(kPrometheusBufferSize);
 
             // Counters: ylt's counter_t::serialize() is reliable — no evidence
@@ -859,6 +973,7 @@ bool TentMetrics::tryGetJsonMetrics(std::string& result) {
     return serializeWithAccounting(
         kJsonFormat, result,
         [this](std::string& output, uint64_t success_timestamp) {
+            refreshNotifyInflight();
             nlohmann::json root;
 
             // Counters: aggregate (sum) across all transport label values so
@@ -888,6 +1003,18 @@ bool TentMetrics::tryGetJsonMetrics(std::string& result) {
                 sumCounterValues(&deadline_infeasible_total_);
             root[quarantined_batches_total_.str_name()] =
                 static_cast<int64_t>(quarantined_batches_total_.value());
+            root[notify_sent_total_.str_name()] =
+                sumCounterValues(&notify_sent_total_);
+            root[notify_received_total_.str_name()] =
+                sumCounterValues(&notify_received_total_);
+            root[notify_resent_total_.str_name()] =
+                static_cast<int64_t>(notify_resent_total_.value());
+            root[notify_dropped_total_.str_name()] =
+                sumCounterValues(&notify_dropped_total_);
+            root[notify_dedup_dropped_total_.str_name()] =
+                sumCounterValues(&notify_dedup_dropped_total_);
+            root[notify_dedup_holes_dropped_total_.str_name()] =
+                sumCounterValues(&notify_dedup_holes_dropped_total_);
 
             // Gauges: aggregate across transport labels (total in-flight
             // attempts / total registered bytes). Per-transport breakdown is
@@ -896,6 +1023,10 @@ bool TentMetrics::tryGetJsonMetrics(std::string& result) {
                 sumCounterValues(&inflight_attempts_);
             root[registered_buffer_bytes_.str_name()] =
                 sumCounterValues(&registered_buffer_bytes_);
+            root[notify_queue_depth_.str_name()] =
+                sumCounterValues(&notify_queue_depth_);
+            root[notify_inflight_.str_name()] =
+                sumCounterValues(&notify_inflight_);
 
             // Histograms: sum bucket counts across all transport labels. The
             // templated helper also reads back the histogram's sum counter so
@@ -910,6 +1041,8 @@ bool TentMetrics::tryGetJsonMetrics(std::string& result) {
             serializeHistogramToJson(root, stage_dispatch_);
             serializeHistogramToJson(root, stage_transport_);
             serializeHistogramToJson(root, transport_attempt_latency_);
+            serializeHistogramToJson(root, notify_ack_latency_);
+            serializeHistogramToJson(root, notify_bound_delay_);
 
             root["tent_metrics_build_info"] = {
                 {"version", TENT_BUILD_VERSION},
@@ -1039,6 +1172,16 @@ void TentMetrics::recordInflightAttemptStarted(TransportType) {}
 void TentMetrics::recordInflightAttemptFinished(TransportType) {}
 void TentMetrics::recordRegisteredBufferBytes(TransportType, int64_t) {}
 void TentMetrics::recordStageLatency(Stage, TransportType, double) {}
+void TentMetrics::recordNotifySent(NotifyPath,
+                                   std::chrono::steady_clock::time_point) {}
+void TentMetrics::recordNotifyReceived(NotifyQueue, size_t) {}
+void TentMetrics::recordNotifyResent() {}
+void TentMetrics::recordNotifyDropped(NotifyDropReason, uint64_t) {}
+void TentMetrics::recordNotifyDedupDropped(NotifyDedupReason) {}
+void TentMetrics::recordNotifyHoleDropped(NotifyHoleReason) {}
+void TentMetrics::recordNotifyAckLatency(double) {}
+void TentMetrics::setNotifyQueueDepth(NotifyQueue, size_t) {}
+void TentMetrics::addNotifyInflight(int64_t) {}
 
 std::string TentMetrics::getPrometheusMetrics() {
     return "# TENT metrics disabled at compile time\n";

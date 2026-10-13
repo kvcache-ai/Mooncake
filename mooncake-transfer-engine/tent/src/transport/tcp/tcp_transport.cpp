@@ -27,6 +27,7 @@
 #include <thread>
 
 #include "tent/common/status.h"
+#include "tent/metrics/tent_metrics.h"
 #include "tent/runtime/control_plane.h"
 #include "tent/runtime/slab.h"
 
@@ -99,6 +100,8 @@ Status TcpTransport::install(std::string &local_segment_name,
     metadata_->setNotifyCallback([&](const Notification &message) -> int {
         RWSpinlock::WriteGuard guard(notify_lock_);
         notify_list_.push_back(message);
+        TENT_RECORD_NOTIFY_RECEIVED(TentMetrics::NotifyQueue::RecvTcp,
+                                    notify_list_.size());
         return 0;
     });
     caps.dram_to_dram = true;
@@ -369,6 +372,8 @@ Status TcpTransport::receiveNotification(
     RWSpinlock::WriteGuard guard(notify_lock_);
     notify_list.clear();
     notify_list.swap(notify_list_);
+    if (!notify_list.empty())
+        TENT_SET_NOTIFY_QUEUE_DEPTH(TentMetrics::NotifyQueue::RecvTcp, 0);
     return Status::OK();
 }
 

@@ -34,6 +34,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <future>
 #include <memory>
 #include <sstream>
 #include <stdexcept>
@@ -487,6 +488,37 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
     EXPECT_NE(body.find("tent_metrics_serialization_attempts_total{format=\""
                         "json\"}"),
               std::string::npos);
+
+    // The ten notification families, each after one sample.
+    metrics.recordNotifySent(
+        TentMetrics::NotifyPath::Rdma,
+        std::chrono::steady_clock::now() - std::chrono::milliseconds(1));
+    metrics.recordNotifyReceived(TentMetrics::NotifyQueue::RecvRdma, 0);
+    metrics.recordNotifyResent();
+    metrics.recordNotifyDropped(TentMetrics::NotifyDropReason::ResendDeadline,
+                                1);
+    metrics.recordNotifyDedupDropped(TentMetrics::NotifyDedupReason::Duplicate);
+    metrics.recordNotifyHoleDropped(TentMetrics::NotifyHoleReason::Ttl);
+    metrics.recordNotifyAckLatency(1.0);
+    const std::string notify_body = metrics.getPrometheusMetrics();
+    for (const auto& [name, type] :
+         std::array<std::pair<std::string_view, std::string_view>, 10>{{
+             {"tent_notify_sent_total", "counter"},
+             {"tent_notify_received_total", "counter"},
+             {"tent_notify_resent_total", "counter"},
+             {"tent_notify_dropped_total", "counter"},
+             {"tent_notify_dedup_dropped_total", "counter"},
+             {"tent_notify_dedup_holes_dropped_total", "counter"},
+             {"tent_notify_queue_depth", "gauge"},
+             {"tent_notify_inflight", "gauge"},
+             {"tent_notify_ack_latency_us", "histogram"},
+             {"tent_notify_bound_delay_us", "histogram"},
+         }}) {
+        EXPECT_NE(notify_body.find("# TYPE " + std::string(name) + " " +
+                                   std::string(type) + "\n"),
+                  std::string::npos)
+            << "missing or changed Prometheus contract for " << name;
+    }
 }
 
 TEST_F(MetricsRecordingTest, SelfMetricsRemainVisibleWhenRuntimeDisabled) {
@@ -1209,6 +1241,12 @@ TEST_F(MetricsRecordingTest, HistogramJsonBucketsMatchBoundaries) {
          {10, 50, 100, 500, 1000, 5000, 10000, 50000, 100000, 500000}},
         {"tent_transport_attempt_latency_us",
          {100, 500, 1000, 5000, 10000, 50000, 100000, 500000, 1000000}},
+        {"tent_notify_ack_latency_us",
+         {10, 50, 100, 250, 500, 1000, 5000, 10000, 100000, 1000000, 10000000,
+          120000000}},
+        {"tent_notify_bound_delay_us",
+         {10, 50, 100, 250, 500, 1000, 5000, 10000, 100000, 1000000, 10000000,
+          120000000}},
     };
 
     auto snap = MetricsSnapshot(TentMetrics::instance());
@@ -1488,6 +1526,146 @@ TEST_F(MetricsRecordingTest, RegisteredBytesGaugeSurvivesEnableToggle) {
         0);
 }
 
+// A depth is set whole, so one set while disabled lands; the arrival is not.
+TEST_F(MetricsRecordingTest, NotifyQueueDepthGaugeSurvivesEnableToggle) {
+    auto& m = TentMetrics::instance();
+    const std::string outbox = "tent_notify_queue_depth{queue=\"outbox\"}";
+    const std::string local = "tent_notify_queue_depth{queue=\"recv_local\"}";
+    const std::string arrived =
+        "tent_notify_received_total{queue=\"recv_local\"}";
+
+    TentMetrics::setEnabled(true);
+    m.setNotifyQueueDepth(TentMetrics::NotifyQueue::Outbox, 3);
+    EXPECT_EQ(MetricsSnapshot(m).series(outbox), 3);
+    TentMetrics::setEnabled(false);
+    m.setNotifyQueueDepth(TentMetrics::NotifyQueue::Outbox, 0);
+    TentMetrics::setEnabled(true);
+    EXPECT_EQ(MetricsSnapshot(m).series(outbox), 0);
+
+    auto before = MetricsSnapshot(m);
+    TentMetrics::setEnabled(false);
+    m.recordNotifyReceived(TentMetrics::NotifyQueue::RecvLocal, 2);
+    TentMetrics::setEnabled(true);
+    auto after = MetricsSnapshot(m);
+    EXPECT_EQ(after.series(local), 2);
+    EXPECT_EQ(after.series(arrived) - before.series(arrived), 0);
+    m.setNotifyQueueDepth(TentMetrics::NotifyQueue::RecvLocal, 0);
+}
+
+// Sends can be posted before the metrics start, and complete after.
+TEST_F(MetricsRecordingTest, NotifyInflightGaugeSurvivesEnableToggle) {
+    auto& m = TentMetrics::instance();
+    const std::string inflight = "tent_notify_inflight{transport=\"rdma\"}";
+    const double base = MetricsSnapshot(m).series(inflight);
+    m.shutdown();
+    m.addNotifyInflight(4);
+    MetricsConfig config;
+    config.enabled = true;
+    config.http_host = "127.0.0.1";
+    config.http_port = getFreeTcpPort();
+    config.report_interval_seconds = 0;
+    ASSERT_TRUE(m.initialize(config).ok());
+    auto posted = MetricsSnapshot(m);
+    EXPECT_EQ(posted.counter("tent_notify_inflight") - base, 4);
+    EXPECT_EQ(posted.series(inflight) - base, 4);
+    TentMetrics::setEnabled(false);
+    m.addNotifyInflight(-4);
+    TentMetrics::setEnabled(true);
+    auto completed = MetricsSnapshot(m);
+    EXPECT_EQ(completed.counter("tent_notify_inflight") - base, 0);
+    EXPECT_EQ(completed.series(inflight) - base, 0);
+}
+
+std::shared_ptr<Config> makeNotifyTestConfig(bool tcp) {
+    auto cfg = makeMetricsTestConfig();
+    cfg->set("transports/tcp/enable", tcp);
+    cfg->set("enable_progress_worker", false);
+    return cfg;
+}
+
+Notification makeNotify(const std::string& msg) {
+    Notification notifi;
+    notifi.name = "metrics-recording-test";
+    notifi.msg = msg;
+    return notifi;
+}
+
+bool seriesReaches(const std::string& series, double value) {
+    for (int i = 0; i < 200; ++i) {
+        if (MetricsSnapshot(TentMetrics::instance()).series(series) == value)
+            return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    return false;
+}
+
+TEST_F(MetricsRecordingTest, NotifyMetricsRecordRoundTrip) {
+    TransferEngineImpl receiver(makeNotifyTestConfig(true));
+    ASSERT_TRUE(receiver.available());
+    TransferEngineImpl sender(makeNotifyTestConfig(true));
+    ASSERT_TRUE(sender.available());
+    SegmentID remote = 0;
+    ASSERT_TRUE(sender.openSegment(remote, receiver.getSegmentName()).ok());
+
+    auto& m = TentMetrics::instance();
+    const std::string sent = "tent_notify_sent_total{path=\"tcp\"}";
+    const std::string queued = "tent_notify_received_total{queue=\"recv_tcp\"}";
+    const std::string depth = "tent_notify_queue_depth{queue=\"recv_tcp\"}";
+    const std::string duplicate =
+        "tent_notify_dedup_dropped_total{reason=\"duplicate\"}";
+    auto before = MetricsSnapshot(m);
+    constexpr int kCount = 10;
+    for (int i = 0; i < kCount; ++i) {
+        ASSERT_TRUE(
+            sender.sendNotification(remote, makeNotify(std::to_string(i)))
+                .ok());
+    }
+    EXPECT_TRUE(seriesReaches(depth, kCount));
+    auto waiting = MetricsSnapshot(m);
+    EXPECT_EQ(waiting.series(sent) - before.series(sent), kCount);
+    EXPECT_EQ(waiting.series(queued) - before.series(queued), kCount);
+
+    std::vector<Notification> received;
+    ASSERT_TRUE(receiver.receiveNotification(received).ok());
+    ASSERT_EQ(received.size(), static_cast<size_t>(kCount));
+    EXPECT_EQ(MetricsSnapshot(m).series(depth), 0);
+
+    ASSERT_TRUE(sender.sendNotification(remote, received[0]).ok());
+    EXPECT_TRUE(seriesReaches(depth, 1));
+    std::vector<Notification> again;
+    (void)receiver.receiveNotification(again);
+    EXPECT_TRUE(again.empty());
+    auto after = MetricsSnapshot(m);
+    EXPECT_EQ(after.series(depth), 0);
+    EXPECT_EQ(after.series(duplicate) - before.series(duplicate), 1);
+    // Only a notify QP completion is an ack; TCP has none.
+    EXPECT_EQ(after.histogramCount("tent_notify_ack_latency_us") -
+                  before.histogramCount("tent_notify_ack_latency_us"),
+              0);
+}
+
+// Set by the TCP transport itself, so the metrics must be built into it.
+TEST_F(MetricsRecordingTest, RecvQueueDepthIsRecordedByTheTransport) {
+    TransferEngineImpl receiver(makeNotifyTestConfig(true));
+    ASSERT_TRUE(receiver.available());
+    TransferEngineImpl sender(makeNotifyTestConfig(true));
+    ASSERT_TRUE(sender.available());
+    SegmentID remote = 0;
+    ASSERT_TRUE(sender.openSegment(remote, receiver.getSegmentName()).ok());
+
+    const std::string depth = "tent_notify_queue_depth{queue=\"recv_tcp\"}";
+    for (int i = 0; i < 5; ++i) {
+        ASSERT_TRUE(
+            sender.sendNotification(remote, makeNotify(std::to_string(i)))
+                .ok());
+    }
+    EXPECT_TRUE(seriesReaches(depth, 5));
+    std::vector<Notification> received;
+    ASSERT_TRUE(receiver.receiveNotification(received).ok());
+    EXPECT_EQ(received.size(), 5u);
+    EXPECT_EQ(MetricsSnapshot(TentMetrics::instance()).series(depth), 0);
+}
+
 // ---------------------------------------------------------------------------
 // L2 HTTP integration: scrape the real /metrics, /metrics/json, /health
 // endpoints via coro_http_client and assert on status + body. Validates the
@@ -1732,6 +1910,340 @@ TEST_F(MetricsHttpTest, HealthEndpointOk) {
     auto resp = retryGet("/health");
     EXPECT_EQ(resp.http_status, 200);
     EXPECT_EQ(resp.body, "OK");
+}
+
+// Every send through the outbox waits for `gate`, so entries queue behind it.
+class NotifyFakeTransport : public FakeTransport {
+   public:
+    NotifyFakeTransport(Status hook, Status send,
+                        std::shared_future<void> gate = {})
+        : FakeTransport(RDMA),
+          hook_(std::move(hook)),
+          send_(std::move(send)),
+          gate_(std::move(gate)) {}
+    bool supportNotification() const override { return true; }
+    Status sendNotificationIfConnected(SegmentID,
+                                       const Notification&) override {
+        return hook_;
+    }
+    Status sendNotification(SegmentID, const Notification&) override {
+        ++sends;
+        if (gate_.valid()) gate_.wait();
+        return send_;
+    }
+    std::atomic<int> sends{0};
+
+   private:
+    const Status hook_;
+    const Status send_;
+    const std::shared_future<void> gate_;
+};
+
+Status notUp() { return Status::DeviceNotFound("notify endpoint not up"); }
+Status down() { return Status::RdmaError("notify channel down"); }
+
+class BoundNotifyPair {
+   public:
+    BoundNotifyPair(std::shared_ptr<FakeTransport> notify,
+                    std::shared_ptr<Config> sender_config)
+        : receiver_(makeNotifyTestConfig(false)), sender_(sender_config) {
+        EXPECT_TRUE(receiver_.available());
+        EXPECT_TRUE(sender_.available());
+        installFakeRdma(receiver_, std::make_shared<FakeTransport>(RDMA));
+        installFakeRdma(sender_, notify);
+        EXPECT_TRUE(receiver_.registerLocalMemory(target_.data(), kLen).ok());
+        EXPECT_TRUE(sender_.registerLocalMemory(source_.data(), kLen).ok());
+        EXPECT_TRUE(
+            sender_.openSegment(remote_, receiver_.getSegmentName()).ok());
+    }
+
+    ~BoundNotifyPair() {
+        for (BatchID batch : batches_) (void)sender_.freeBatch(batch);
+        (void)sender_.unregisterLocalMemory(source_.data(), kLen);
+        (void)receiver_.unregisterLocalMemory(target_.data(), kLen);
+    }
+
+    void write(const std::string& msg) {
+        Request request = makeLocalWrite(source_.data(), kLen);
+        request.target_id = remote_;
+        request.target_offset = reinterpret_cast<uint64_t>(target_.data());
+        BatchID batch = sender_.allocateBatch(1);
+        ASSERT_NE(batch, (BatchID)0);
+        batches_.push_back(batch);
+        ASSERT_TRUE(
+            sender_.submitTransfer(batch, {request}, makeNotify(msg)).ok());
+        ASSERT_EQ(pollUntilTerminal(sender_, batch),
+                  TransferStatusEnum::COMPLETED);
+    }
+
+   private:
+    static constexpr size_t kLen = 4096;
+    std::vector<uint8_t> target_ = std::vector<uint8_t>(kLen, 0);
+    std::vector<uint8_t> source_ = std::vector<uint8_t>(kLen, 0x5A);
+    TransferEngineImpl receiver_;
+    TransferEngineImpl sender_;
+    SegmentID remote_ = 0;
+    std::vector<BatchID> batches_;
+};
+
+TEST_F(MetricsRecordingTest, NotifyBoundDelayIsRecordedOnHookAndOutboxPaths) {
+    const std::string sent = "tent_notify_sent_total{path=\"rdma\"}";
+    const std::string delayed =
+        "tent_notify_bound_delay_us_count{path=\"rdma\"}";
+    const std::string outbox = "tent_notify_queue_depth{queue=\"outbox\"}";
+    for (bool hook_up : {true, false}) {
+        auto notify = std::make_shared<NotifyFakeTransport>(
+            hook_up ? Status::OK() : notUp(), Status::OK());
+        BoundNotifyPair pair(notify, makeNotifyTestConfig(false));
+        auto before = MetricsSnapshot(TentMetrics::instance());
+        pair.write("bound");
+        EXPECT_TRUE(seriesReaches(delayed, before.series(delayed) + 1))
+            << "hook_up=" << hook_up;
+        EXPECT_EQ(MetricsSnapshot(TentMetrics::instance()).series(sent) -
+                      before.series(sent),
+                  1);
+        EXPECT_TRUE(seriesReaches(outbox, 0));
+        EXPECT_EQ(notify->sends.load(), hook_up ? 0 : 1);
+    }
+}
+
+// Both wait about 150 ms in the outbox: the first in its send, the second
+// behind it.
+TEST_F(MetricsRecordingTest, NotifyBoundDelayIncludesTheOutboxWait) {
+    const std::string name = "tent_notify_bound_delay_us";
+    const std::string count = "tent_notify_bound_delay_us_count{path=\"rdma\"}";
+    std::promise<void> release;
+    auto notify = std::make_shared<NotifyFakeTransport>(
+        notUp(), Status::OK(), release.get_future().share());
+    BoundNotifyPair pair(notify, makeNotifyTestConfig(false));
+    auto before = MetricsSnapshot(TentMetrics::instance());
+    pair.write("first");
+    for (int i = 0; i < 200 && notify->sends == 0; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    pair.write("second");
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    release.set_value();
+    EXPECT_TRUE(seriesReaches(count, before.series(count) + 2));
+    auto after = MetricsSnapshot(TentMetrics::instance());
+    auto slow = [&](const MetricsSnapshot& s) {
+        return s.bucket(name, "1000000") + s.bucket(name, "10000000");
+    };
+    EXPECT_EQ(slow(after) - slow(before), 2);
+}
+
+// /metrics/json lists metrics by hand, at zero too.
+TEST_F(MetricsRecordingTest, NotifyFamiliesAreInJson) {
+    auto json = nlohmann::json::parse(TentMetrics::instance().getJsonMetrics());
+    for (const char* name :
+         {"tent_notify_sent_total", "tent_notify_received_total",
+          "tent_notify_resent_total", "tent_notify_dropped_total",
+          "tent_notify_dedup_dropped_total",
+          "tent_notify_dedup_holes_dropped_total", "tent_notify_queue_depth",
+          "tent_notify_inflight", "tent_notify_ack_latency_us",
+          "tent_notify_bound_delay_us"})
+        EXPECT_TRUE(json.contains(name)) << name;
+}
+
+TEST_F(MetricsRecordingTest, LocalNotifyRecordsSentQueuedAndDepth) {
+    TransferEngineImpl engine(makeNotifyTestConfig(false));
+    ASSERT_TRUE(engine.available());
+    auto& m = TentMetrics::instance();
+    const std::string sent = "tent_notify_sent_total{path=\"local\"}";
+    const std::string queued =
+        "tent_notify_received_total{queue=\"recv_local\"}";
+    const std::string depth = "tent_notify_queue_depth{queue=\"recv_local\"}";
+    auto before = MetricsSnapshot(m);
+    ASSERT_TRUE(
+        engine.sendNotification(LOCAL_SEGMENT_ID, makeNotify("a")).ok());
+    ASSERT_TRUE(
+        engine.sendNotification(LOCAL_SEGMENT_ID, makeNotify("b")).ok());
+    auto waiting = MetricsSnapshot(m);
+    EXPECT_EQ(waiting.series(sent) - before.series(sent), 2);
+    EXPECT_EQ(waiting.series(queued) - before.series(queued), 2);
+    EXPECT_EQ(waiting.series(depth), 2);
+    std::vector<Notification> received;
+    ASSERT_TRUE(engine.receiveNotification(received).ok());
+    EXPECT_EQ(received.size(), 2u);
+    EXPECT_EQ(MetricsSnapshot(m).series(depth), 0);
+}
+
+// No TCP on either side: RPC lands in the engine's queue, counted pre-dedup.
+TEST_F(MetricsRecordingTest, RpcNotificationsAreCountedBeforeDedup) {
+    auto receiver_config = makeNotifyTestConfig(false);
+    receiver_config->set("notification/dedup_hole_ttl_ms", 20);
+    receiver_config->set("notification/dedup_max_holes", 1);
+    TransferEngineImpl receiver(receiver_config);
+    ASSERT_TRUE(receiver.available());
+    TransferEngineImpl sender(makeNotifyTestConfig(false));
+    ASSERT_TRUE(sender.available());
+    installFakeRdma(sender,
+                    std::make_shared<NotifyFakeTransport>(notUp(), down()));
+    SegmentID remote = 0;
+    ASSERT_TRUE(sender.openSegment(remote, receiver.getSegmentName()).ok());
+
+    auto& m = TentMetrics::instance();
+    const std::string rpc = "tent_notify_sent_total{path=\"rpc\"}";
+    const std::string queued =
+        "tent_notify_received_total{queue=\"recv_local\"}";
+    const std::string depth = "tent_notify_queue_depth{queue=\"recv_local\"}";
+    auto refused = [](const std::string& reason) {
+        return "tent_notify_dedup_dropped_total{reason=\"" + reason + "\"}";
+    };
+    auto gaps = [](const std::string& reason) {
+        return "tent_notify_dedup_holes_dropped_total{reason=\"" + reason +
+               "\"}";
+    };
+    auto before = MetricsSnapshot(m);
+    ASSERT_TRUE(sender.sendNotification(remote, makeNotify("first")).ok());
+    EXPECT_TRUE(seriesReaches(depth, 1));
+    std::vector<Notification> received;
+    ASSERT_TRUE(receiver.receiveNotification(received).ok());
+    ASSERT_EQ(received.size(), 1u);
+    EXPECT_EQ(MetricsSnapshot(m).series(depth), 0);
+
+    Notification copy = received[0];
+    const uint64_t first = copy.seq;
+    auto send = [&](uint64_t seq) {
+        copy.seq = seq;
+        return sender.sendNotification(remote, copy).ok();
+    };
+    auto moved = [&](const std::string& series) {
+        return MetricsSnapshot(m).series(series) - before.series(series);
+    };
+    ASSERT_TRUE(send(first));
+    EXPECT_EQ(moved(refused("duplicate")), 1);
+    EXPECT_EQ(moved(refused("expired")), 0);
+    ASSERT_TRUE(send(first + 3));
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    ASSERT_TRUE(send(first + 2));
+    EXPECT_EQ(moved(refused("expired")), 1);
+    EXPECT_EQ(moved(gaps("ttl")), 1);
+    EXPECT_EQ(moved(gaps("cap")), 0);
+    ASSERT_TRUE(send(first + 5));
+    ASSERT_TRUE(send(first + 7));
+    EXPECT_EQ(moved(gaps("ttl")), 1);
+    EXPECT_EQ(moved(gaps("cap")), 1);
+    auto after = MetricsSnapshot(m);
+    EXPECT_EQ(after.series(rpc) - before.series(rpc), 6);
+    EXPECT_EQ(after.series(queued) - before.series(queued), 6);
+    EXPECT_EQ(after.series(depth), 3);
+    for (const auto& series :
+         {refused("duplicate"), refused("expired"), gaps("ttl"), gaps("cap")})
+        EXPECT_EQ(after.series(series) - before.series(series), 1) << series;
+    ASSERT_TRUE(receiver.receiveNotification(received).ok());
+    EXPECT_EQ(received.size(), 3u);
+}
+
+TEST_F(MetricsRecordingTest, NotifyDropReasonsAreLabelled) {
+    auto& m = TentMetrics::instance();
+    auto dropped = [](const std::string& reason) {
+        return "tent_notify_dropped_total{reason=\"" + reason + "\"}";
+    };
+    const std::string outbox = "tent_notify_queue_depth{queue=\"outbox\"}";
+    auto before = MetricsSnapshot(m);
+    {
+        std::promise<void> release;
+        auto notify = std::make_shared<NotifyFakeTransport>(
+            notUp(), down(), release.get_future().share());
+        auto config = makeNotifyTestConfig(false);
+        config->set("notification/rpc_fallback", false);
+        config->set("notification/outbox_deadline_ms", 300);
+        config->set("notification/outbox_max", 1);
+        BoundNotifyPair pair(notify, config);
+        pair.write("held");
+        for (int i = 0; i < 200 && notify->sends == 0; ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        EXPECT_EQ(MetricsSnapshot(m).series(outbox), 1);
+        pair.write("full");
+        pair.write("kept");
+        EXPECT_EQ(MetricsSnapshot(m).series(outbox), 2);
+        release.set_value();
+        EXPECT_TRUE(
+            seriesReaches(dropped("outbox_deadline"),
+                          before.series(dropped("outbox_deadline")) + 2));
+        EXPECT_TRUE(seriesReaches(outbox, 0));
+    }
+    EXPECT_EQ(MetricsSnapshot(m).series(dropped("shutdown")) -
+                  before.series(dropped("shutdown")),
+              0);
+    for (bool on_hook : {true, false}) {
+        auto refuse = Status::InvalidArgument("refused");
+        BoundNotifyPair pair(std::make_shared<NotifyFakeTransport>(
+                                 on_hook ? refuse : notUp(), refuse),
+                             makeNotifyTestConfig(false));
+        pair.write("refused");
+        EXPECT_TRUE(seriesReaches(
+            dropped("outbox_unretryable"),
+            before.series(dropped("outbox_unretryable")) + (on_hook ? 1 : 2)));
+    }
+    for (bool on_hook : {true, false}) {
+        // A TCP sender's hook path sends the RPC itself, so it fails to encode.
+        std::shared_ptr<FakeTransport> notify =
+            on_hook ? std::make_shared<FakeTransport>(RDMA)
+                    : std::make_shared<NotifyFakeTransport>(notUp(), down());
+        BoundNotifyPair pair(notify, makeNotifyTestConfig(on_hook));
+        pair.write("\xff");
+        EXPECT_TRUE(seriesReaches(
+            dropped("outbox_encode"),
+            before.series(dropped("outbox_encode")) + (on_hook ? 1 : 2)));
+        EXPECT_TRUE(seriesReaches(outbox, 0));
+    }
+    {
+        auto config = makeNotifyTestConfig(false);
+        config->set("notification/rpc_fallback", false);
+        BoundNotifyPair pair(
+            std::make_shared<NotifyFakeTransport>(notUp(), down()), config);
+        pair.write("left");
+        EXPECT_TRUE(seriesReaches(outbox, 1));
+    }
+    auto after = MetricsSnapshot(m);
+    EXPECT_EQ(after.series(dropped("outbox_full")) -
+                  before.series(dropped("outbox_full")),
+              1);
+    EXPECT_EQ(
+        after.series(dropped("shutdown")) - before.series(dropped("shutdown")),
+        1);
+    EXPECT_EQ(after.series(outbox), 0);
+    EXPECT_EQ(after.histogramCount("tent_notify_bound_delay_us") -
+                  before.histogramCount("tent_notify_bound_delay_us"),
+              0);
+}
+
+TEST_F(MetricsRecordingTest, HpTcpNotificationsAreRecordedByTheTransport) {
+    auto config = [] {
+        auto config = makeNotifyTestConfig(false);
+        config->set("transports/hp_tcp/enable", true);
+        config->set("transports/hp_tcp/bind_address", "127.0.0.1");
+        config->set("transports/hp_tcp/advertise_address", "127.0.0.1");
+        config->set("transports/hp_tcp/port", 0);
+        return config;
+    };
+    TransferEngineImpl receiver(config());
+    ASSERT_TRUE(receiver.available());
+    TransferEngineImpl sender(config());
+    ASSERT_TRUE(sender.available());
+    SegmentID remote = 0;
+    ASSERT_TRUE(sender.openSegment(remote, receiver.getSegmentName()).ok());
+
+    auto& m = TentMetrics::instance();
+    const std::string sent = "tent_notify_sent_total{path=\"hp_tcp\"}";
+    const std::string queued =
+        "tent_notify_received_total{queue=\"recv_hp_tcp\"}";
+    const std::string depth = "tent_notify_queue_depth{queue=\"recv_hp_tcp\"}";
+    auto before = MetricsSnapshot(m);
+    for (int i = 0; i < 3; ++i) {
+        ASSERT_TRUE(
+            sender.sendNotification(remote, makeNotify(std::to_string(i)))
+                .ok());
+    }
+    EXPECT_TRUE(seriesReaches(depth, 3));
+    auto waiting = MetricsSnapshot(m);
+    EXPECT_EQ(waiting.series(sent) - before.series(sent), 3);
+    EXPECT_EQ(waiting.series(queued) - before.series(queued), 3);
+    std::vector<Notification> received;
+    ASSERT_TRUE(receiver.receiveNotification(received).ok());
+    EXPECT_EQ(received.size(), 3u);
+    EXPECT_EQ(MetricsSnapshot(m).series(depth), 0);
 }
 
 #else  // !TENT_METRICS_ENABLED

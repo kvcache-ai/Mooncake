@@ -99,6 +99,17 @@ class CachedDynamicCounter
         cell->fetch_add(value, std::memory_order_relaxed);
     }
 
+    // Overwrite via the cached cell: a gauge that mirrors a size.
+    template <typename LabelFn>
+    void setCached(size_t label_index, LabelFn&& make_label, int64_t value) {
+        std::atomic<int64_t>* cell = slots_[label_index].load();
+        if (cell == nullptr) [[unlikely]] {
+            cell = resolve(make_label());
+            slots_[label_index].store(cell);
+        }
+        cell->store(value, std::memory_order_relaxed);
+    }
+
    private:
     std::vector<CellSlot> slots_;
 };

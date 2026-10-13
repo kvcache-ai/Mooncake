@@ -5,5 +5,6 @@ add_library(
 target_link_libraries(tent_xport_hp_tcp_core PUBLIC tent_common tent_interface)
 
 add_library(tent_xport_hp_tcp STATIC hp_tcp_transport.cpp)
-target_link_libraries(tent_xport_hp_tcp PUBLIC tent_rpc tent_common
-                                               tent_xport_hp_tcp_core)
+target_link_libraries(
+  tent_xport_hp_tcp PUBLIC tent_rpc tent_common tent_xport_hp_tcp_core
+                           tent_metrics)

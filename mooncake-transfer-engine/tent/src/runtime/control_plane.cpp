@@ -24,6 +24,7 @@
 
 #include "tent/common/status.h"
 #include "tent/common/utils/os.h"
+#include "tent/metrics/tent_metrics.h"
 #include "tent/runtime/platform.h"
 #include "tent/runtime/segment_registry.h"
 
@@ -793,6 +794,12 @@ void ControlService::onNotify(const std::string_view& request,
         // An empty response is the sender's ack; before the callback is
         // registered and after teardown clears it, nothing takes the message.
         if (!notify_callback_) {
+            TENT_RECORD_NOTIFY_DROPPED(
+                TentMetrics::NotifyDropReason::RecvNoCallback, 1);
+            LOG_EVERY_N(WARNING, 100)
+                << "Dropped a Notify RPC that arrived with no notification "
+                   "callback registered ("
+                << google::COUNTER << " so far)";
             response = "notify callback not registered";
             return;
         }
@@ -817,7 +824,12 @@ void ControlService::onNotify(const std::string_view& request,
         }
     } catch (const json::exception& e) {
         LOG(ERROR) << "onNotify failed: " << e.what();
-        // Only a request that does not parse fails again on every retry.
+        // Only a request that does not parse fails again on every retry; a
+        // callback failure is answered to the sender, which keeps the copy.
+        if (!message) {
+            TENT_RECORD_NOTIFY_DROPPED(
+                TentMetrics::NotifyDropReason::RecvDecode, 1);
+        }
         response = std::string(message ? kNotifyCallbackFailed
                                        : kMalformedNotification) +
                    e.what();

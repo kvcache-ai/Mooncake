@@ -371,6 +371,25 @@ TEST(NotifyDedupFilterTest, HolesAreCappedAtTheOldest) {
     EXPECT_EQ(filter.expired(), 0u);
 }
 
+// Each refusal and each counted hole reaches on_drop, in order.
+TEST(NotifyDedupFilterTest, OnDropSeesEachRefusalAndCountedHole) {
+    using Drop = NotifyDedupFilter::Drop;
+    std::vector<Drop> drops;
+    NotifyDedupFilter filter;
+    NotifyDedupFilter::Config config;
+    config.max_holes = 1;
+    config.on_drop = [&](Drop drop) { drops.push_back(drop); };
+    filter.configure(config);
+    const auto t0 = NotifyDedupFilter::Clock::now();
+    EXPECT_TRUE(filter.admit(7, 10, t0));
+    EXPECT_TRUE(filter.admit(7, 20, t0));  // evicts 1..9, below the first
+    EXPECT_FALSE(filter.admit(7, 20, t0));
+    EXPECT_TRUE(filter.admit(7, 30, t0));  // evicts 11..19
+    EXPECT_FALSE(filter.admit(7, 25, t0 + config.ttl + 1ms));
+    EXPECT_EQ(drops, (std::vector<Drop>{Drop::Duplicate, Drop::HoleEvicted,
+                                        Drop::HoleExpired, Drop::Expired}));
+}
+
 TEST(NotifySequencerTest, StampsPerTargetAndKeepsItsOwnStamp) {
     NotifySequencer sequencer;
     Notification notifi;

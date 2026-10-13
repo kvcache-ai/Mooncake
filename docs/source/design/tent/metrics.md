@@ -7,7 +7,7 @@ TENT provides a built-in metrics system based on yalantinglibs, compatible with 
 The metrics system supports three metric types:
 
 - **Counter**: Monotonically increasing values (e.g., total bytes transferred, total requests)
-- **Gauge**: Current state that can increase or decrease (e.g., in-flight attempts, HTTP server state)
+- **Gauge**: Current state that can increase or decrease (e.g., in-flight attempts, notification queue depth, HTTP server state)
 - **Histogram**: Distribution of values with configurable buckets (e.g., latency)
 
 All metrics are thread-safe and designed for high-performance data paths.
@@ -24,7 +24,9 @@ By default, metrics are **disabled** at compile time for maximum performance. To
 cmake -DTENT_METRICS_ENABLED=ON ..
 ```
 
-When disabled at compile time (`TENT_METRICS_ENABLED=OFF`, the default), all metrics macros expand to `((void)0)` and the `recordTaskCompletionMetrics` body is `#if`-gated out, resulting in **zero runtime overhead** on the transfer hot path.
+When disabled at compile time (`TENT_METRICS_ENABLED=OFF`, the default), all metrics macros expand to `((void)0)`, and the code that calls the recorders directly (the `recordTaskCompletionMetrics` body, the attempt and in-flight gauges, the notification timestamps) is `#if`-gated out, resulting in **zero runtime overhead** on the transfer hot path.
+
+The option sets the `TENT_METRICS_ENABLED=0/1` compile definition on `tent_interface`, so every TENT target, transports included, is built with the same value.
 
 Code that needs to report this build capability without relying on an HTTP
 endpoint can query `TentMetrics::isCompiledIn()` in both enabled and disabled
@@ -45,7 +47,7 @@ TentMetrics::setEnabled(true);
 bool enabled = TentMetrics::isEnabled();
 ```
 
-When disabled at runtime, record functions return immediately after a single atomic load (~1ns overhead).
+When disabled at runtime, counter and histogram record functions return immediately after a single atomic load (~1ns overhead). Gauges keep updating: they track state rather than sample it, and a value skipped while disabled would stay wrong after re-enabling.
 
 ## Configuration
 
@@ -83,6 +85,8 @@ TENT metrics configuration is integrated into the main `transfer-engine.json` co
 - Histogram buckets are fixed at compile time (see `kLatencyBuckets` / `kSizeBuckets` in `tent_metrics.h`) for reproducible observability across deployments.
 
 ### Environment Variables
+
+The environment variable `TENT_METRICS_ENABLED` is the same setting as `metrics/enabled`, which decides whether the engine starts the metrics subsystem at all (see Compatibility). It is not the CMake option of the same name and cannot turn on metrics that were compiled out.
 
 ```bash
 # Basic settings
@@ -263,6 +267,14 @@ Metrics HTTP: up (start failures: 0) | Read: 1.00 MB (100 reqs, 2 fails) | Write
 | `tent_quarantined_batches_total` | Counter | - | Batches abandoned after repeated reclaim failures and retained until engine teardown |
 | `tent_inflight_attempts` | Gauge | `transport` | Physical transport attempts submitted but not yet finished |
 | `tent_registered_buffer_bytes` | Gauge | `transport` | Currently registered local buffer bytes |
+| `tent_notify_sent_total` | Counter | `path` | Notifications sent, by the path that took them |
+| `tent_notify_received_total` | Counter | `queue` | Notifications queued for `receiveNotification()`, by queue |
+| `tent_notify_resent_total` | Counter | - | Notifications resent after their notify QP failed with them in flight |
+| `tent_notify_dropped_total` | Counter | `reason` | Notifications dropped without delivery |
+| `tent_notify_dedup_dropped_total` | Counter | `reason` | Stamped notifications the receiver refused (`duplicate`, `expired`) |
+| `tent_notify_dedup_holes_dropped_total` | Counter | `reason` | Ranges of missing notifications the receiver stopped waiting for (`ttl`, `cap`) |
+| `tent_notify_queue_depth` | Gauge | `queue` | Notifications waiting in a queue |
+| `tent_notify_inflight` | Gauge | `transport` | Notifications posted on a notify QP, not yet completed or handed back for resend |
 | `tent_read_latency_us` | Histogram | `transport` | Read latency distribution in microseconds |
 | `tent_write_latency_us` | Histogram | `transport` | Write latency distribution in microseconds |
 | `tent_read_size_bytes` | Histogram | `transport` | Read request size distribution in bytes |
@@ -272,6 +284,8 @@ Metrics HTTP: up (start failures: 0) | Read: 1.00 MB (100 reqs, 2 fails) | Write
 | `tent_stage_dispatch_us` | Histogram | `transport` | Causal chain: dispatch latency in microseconds |
 | `tent_stage_transport_us` | Histogram | `transport` | Causal chain: transport execution latency in microseconds |
 | `tent_transport_attempt_latency_us` | Histogram | `transport`, `operation` | Observed latency of each physical transport attempt |
+| `tent_notify_ack_latency_us` | Histogram | `transport` | Notify QP post to send completion (peer ack) in microseconds |
+| `tent_notify_bound_delay_us` | Histogram | `path` | Bound notification: transfer seen complete to its first send, in microseconds |
 
 ### Metrics pipeline self-observability
 
@@ -296,14 +310,15 @@ visible when runtime transfer recording is disabled.
 - `*_failures_total` does not record bytes; failed transfers transfer no bytes.
 - `tent_deadline_infeasible_total` is a dedicated counter (not a histogram sentinel) so infeasible-at-submit cases are distinguishable from genuine high-MLU samples.
 - `tent_metrics_last_success_timestamp_seconds{format="..."} == 0` means that format has never completed a successful serialization. Prometheus freshness alerts must select `format="prometheus"` and guard on a value greater than zero; a Prometheus-only deployment is not expected to serialize JSON.
-- yalantinglibs omits zero-valued transfer counters/histograms from the Prometheus output, so a transfer metric only appears once it has been observed at least once. The metrics-pipeline self-observability families above are emitted unconditionally.
+- yalantinglibs omits zero-valued transfer counters, and TENT omits histograms without samples, from the Prometheus output, so a transfer metric only appears once it has been observed at least once; gauges are printed at zero too, once set. The metrics-pipeline self-observability families above are emitted unconditionally.
 
 ### Labels
 
 Transfer and attempt metrics carry a `transport` label (the
 `tent_transport_failover_total` counter uses `from` and `to` instead) so they
 can be sliced by transport without grepping logs. Attempt metrics also carry
-an `operation` label. Task failures add a closed-set `reason` label and metrics
+an `operation` label. Task failures add a closed-set `reason` label,
+notification metrics add `reason`, `path` and `queue` labels, and metrics
 serialization adds a two-valued `format` label. Label values come from bounded
 sets; no request IDs, addresses, segment names, or other unbounded values are
 accepted.
@@ -312,10 +327,12 @@ accepted.
 |-------|--------|-------------|
 | `transport` | `unspec`, `rdma`, `mnnvl`, `shm`, `nvlink`, `gds`, `io_uring`, `tcp`, `ascend`, `sunrise_link`, `tpu`, `ub`, `mpcomm`, `hp_tcp`, `xpu`, `hylink`, `fabric`, `mlu`, `memfabric` | The transport that handled the transfer |
 | `operation` | `read`, `write` | Attempt operation |
-| `reason` | `submit`, `poll`, `timeout`, `canceled` | Task failure classification |
+| `reason` | `tent_task_failures_total`: `submit`, `poll`, `timeout`, `canceled`; `tent_notify_dropped_total`, `tent_notify_dedup_dropped_total`, `tent_notify_dedup_holes_dropped_total`: see Notification Metrics | Why a task failed or a notification was dropped |
 | `format` | `prometheus`, `json` | Serialization output format |
 | `from` | (same set) | Transport that failed before failover |
 | `to` | (same set) | Transport that the failover switched to |
+| `path` | `rdma`, `tcp`, `hp_tcp`, `rpc`, `local` | The path a notification left by |
+| `queue` | `outbox`, `resend`, `resend_held`, `recv_rdma`, `recv_tcp`, `recv_hp_tcp`, `recv_local` | The queue a notification waits in |
 | `version` | Build-time constant | TENT build version |
 | `commit` | Build-time constant | Git commit used for the build |
 
@@ -325,11 +342,12 @@ Transport label values come from the shared `transportTypeName()` mapping.
 **Cardinality**: the `transport` label has 19 values; the failover
 `from`/`to` pair has at most 19x19 = 361 combinations (in practice only a
 few pairs ever occur), each attempt metric has at most 19x2 = 38
-transport/operation combinations, task failures have at most 19x4 = 76, and
-each serialization family has exactly two series. Build identity labels are
-constant for the life of the process; a served `tent_metrics_build_info` series
-itself confirms that metrics were compiled in. Total series across all metrics
-is bounded by these closed sets.
+transport/operation combinations, task failures have at most 19x4 = 76, each
+serialization family has exactly two series, and the notification metrics add
+about 120 series. Build identity labels are constant for the life of the
+process; a served `tent_metrics_build_info` series itself confirms that
+metrics were compiled in. Total series across all metrics is bounded by these
+closed sets.
 
 ### Per-rail load (`getNicLoadStats`)
 
@@ -345,6 +363,35 @@ These are pull-based snapshots, not Prometheus series: UB rail health
 (pauses, errors in window, timeouts, endpoint rebuilds) lives in `RailMonitor`
 and is read through the transport rather than scraped. See {ref}`TENT Failover
 <tent-failover>` for how those counters drive rail selection.
+
+### Notification Metrics
+
+The `tent_notify_*` metrics follow a notification from the sender to the application polling `receiveNotification()`:
+
+- `tent_notify_sent_total` counts each notification once, under the path that took it: `rdma` (a notify QP), `tcp` or `hp_tcp` (that transport's control-plane send), `rpc` (the engine's own control-plane fallback) or `local` (a notification to the engine's own segment). A resend after its notify QP failed counts in `tent_notify_resent_total` instead.
+- `tent_notify_received_total` counts arrivals in the receive queue that took them, `recv_rdma`, `recv_tcp`, `recv_hp_tcp` or `recv_local`. A receiver cannot tell a TCP transport send from the RPC fallback, hence queues rather than paths. A copy that arrives twice is counted twice here, then refused once by deduplication.
+- `tent_notify_dedup_dropped_total` counts stamped notifications the receiver refused. `duplicate`: at or below the highest sequence number seen from that sender and not inside an open missing range, that is delivered before, or inside a range already given up. `expired`: the first late arrival into a missing range older than `notification/dedup_hole_ttl_ms`; it gives the range up, so later arrivals into that range count as `duplicate`. `tent_notify_dedup_holes_dropped_total` counts the missing ranges (the holes of the `dedup_*` keys) given up, past that ttl (`ttl`) or past `notification/dedup_max_holes` (`cap`); it, not `expired`, is the signal that notifications were lost. The range below the first sequence number seen from a sender is not counted.
+- `tent_notify_queue_depth` is the current length of the `outbox` (bound notifications waiting for their peer, the one being sent included), of the RDMA resend queue (`resend`) and the resends held for a peer whose control plane is silent (`resend_held`), and of the four receive queues. Each is set to the current size rather than counted up and down. The resend the RDMA resend thread is retrying is in neither `resend` nor `resend_held`. With several engines in one process, a queue's gauge shows the engine that changed it last, and a receive queue's gauge keeps what its engine left unpolled when it was destroyed.
+- `tent_notify_inflight` counts the notifications posted on the notify QPs of the process and not yet completed, resends included. It is one count for the whole process, read when the metrics are scraped. When a notify QP fails, its sends leave this gauge: stamped ones are handed back and counted in `resend`, while unstamped ones are not resent, and no counter shows whether they arrived.
+- `/metrics/json` reports each metric summed over its labels; read per-queue values from `/metrics`.
+- `tent_notify_ack_latency_us` runs from post to send completion on a notify QP; on RC the completion follows the peer HCA's ack, i.e. the notification is in the peer's memory, not that the application took it. Only notify QP sends are sampled.
+- `tent_notify_bound_delay_us` runs, for a notification bound to a transfer to a remote segment (the hook the transfer fires on completion), from the poll that saw the transfer complete to the first successful send, outbox retries included. It is labeled by the path that sent it.
+
+`tent_notify_dropped_total` reasons:
+
+| Reason | Dropped notification |
+|--------|----------------------|
+| `resend_deadline` | An RDMA resend held past `notification/resend_deadline_ms` for a peer that did not answer or did not take it yet |
+| `resend_exhausted` | An RDMA resend no pair took, or out of rounds, with the control-plane leg off or refusing it as invalid |
+| `resend_encode` | An RDMA resend the control-plane leg could not encode |
+| `outbox_deadline` | A bound notification older than `notification/outbox_deadline_ms` |
+| `outbox_full` | The oldest bound notification, at `notification/outbox_max` |
+| `outbox_unretryable` | A bound notification its send rejected as invalid |
+| `outbox_encode` | A bound notification the control-plane leg could not encode |
+| `shutdown` | Left in the outbox or the resend queue at teardown |
+| `recv_decode` | A received notification that did not decode; over the control plane the sender is told and drops its copy |
+| `recv_no_callback` | A Notify RPC that arrived with nothing registered to take it; the sender is told and keeps its copy, or a standalone send returns the error |
+| `recv_endpoint_gone` | Arrived on a notify QP whose endpoint was torn down first |
 
 ## Integration with TransferEngine
 
@@ -398,9 +445,11 @@ Add the metric member variable in `tent_metrics.h`:
 // For a new counter:
 ylt::metric::counter_t new_counter_{"tent_new_counter", "Description of the counter"};
 
-// For a new histogram:
-ylt::metric::histogram_t new_histogram_{"tent_new_histogram", "Description",
-                                        std::vector<double>{/* bucket boundaries */}};
+// For a new histogram, labeled by transport:
+static inline const std::vector<double> kNewBuckets{/* bucket boundaries */};
+metrics::CachedDynamicHistogram<1> new_histogram_{
+    "tent_new_histogram", "Description", kNewBuckets, kTransportLabel,
+    kTransportDomain};
 ```
 
 ### Step 2: Register the Metric
@@ -415,10 +464,15 @@ void TentMetrics::registerMetrics() {
         &new_counter_,  // Add new counter here
     };
 
+    gauges_ = {
+        &inflight_attempts_,
+        // ... existing gauges ...
+    };
+
     histograms_ = {
-        {&read_latency_, &kLatencyBuckets},
+        &read_latency_,
         // ... existing histograms ...
-        {&new_histogram_, &kNewBuckets},  // Add new histogram + its buckets here
+        &new_histogram_,  // Add new histogram here
     };
 }
 ```
@@ -440,19 +494,15 @@ void TentMetrics::recordNewMetric(int64_t value) {
 }
 ```
 
-### Automatic Serialization
+### Serialization
 
-Once registered in `registerMetrics()`, the new metric will be **automatically included** in:
-- `/metrics` (Prometheus format)
-- `/metrics/json` (JSON format)
-
-No changes to `getPrometheusMetrics()` or `getJsonMetrics()` are required.
+Once registered in `registerMetrics()`, the new metric is **automatically included** in `/metrics` (Prometheus format). `/metrics/json` is not automatic: `getJsonMetrics()` names each metric it reports, so add a line there too. Also add a no-op stub of any new record method to the `TENT_METRICS_ENABLED=0` branch of `tent_metrics.cpp`, and a new histogram to the bucket list in `HistogramJsonBucketsMatchBoundaries`.
 
 ## Advanced Configuration
 
 ### Histogram Buckets
 
-Histogram bucket boundaries are fixed at compile time (defined as `static inline const std::vector<double>` members in `tent_metrics.h`: `kLatencyBuckets`, `kSizeBuckets`, `kMluPerMilleBuckets`, `kStageBuckets`). They are intentionally not runtime-configurable so that observability is reproducible across deployments. To change buckets, edit the constant in `tent_metrics.h` and rebuild.
+Histogram bucket boundaries are fixed at compile time (defined as `static inline const std::vector<double>` members in `tent_metrics.h`: `kLatencyBuckets`, `kSizeBuckets`, `kMluPerMilleBuckets`, `kStageBuckets`, `kNotifyLatencyBuckets`). They are intentionally not runtime-configurable so that observability is reproducible across deployments. To change buckets, edit the constant in `tent_metrics.h` and rebuild.
 
 ### Compatibility
 

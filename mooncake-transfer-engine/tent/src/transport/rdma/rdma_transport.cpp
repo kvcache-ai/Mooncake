@@ -41,6 +41,7 @@
 #include "tent/runtime/platform.h"
 #include "tent/runtime/topology.h"
 #include "tent/common/utils/random.h"
+#include "tent/metrics/tent_metrics.h"
 #include "tent/thirdparty/nlohmann/json.h"
 
 #define SET_DEVICE(key, param) \
@@ -1207,12 +1208,26 @@ void RdmaTransport::requeueNotifications(std::vector<PendingNotify>&& drained) {
                          << " notification resend(s) after quiesce, "
                          << (notify_resend_dropped_ += drained.size())
                          << " so far";
+            TENT_RECORD_NOTIFY_DROPPED(TentMetrics::NotifyDropReason::Shutdown,
+                                       drained.size());
             return;
         }
         for (auto& pending : drained)
             notify_resend_queue_.push_back(std::move(pending));
+        setResendDepthsLocked();
     }
     notify_resend_cv_.notify_one();
+}
+
+void RdmaTransport::setResendDepthsLocked() {
+#if TENT_METRICS_ENABLED
+    size_t held = 0;
+    for (const auto& peer : notify_resend_held_)
+        held += peer.second.resends.size();
+    TENT_SET_NOTIFY_QUEUE_DEPTH(TentMetrics::NotifyQueue::Resend,
+                                notify_resend_queue_.size());
+    TENT_SET_NOTIFY_QUEUE_DEPTH(TentMetrics::NotifyQueue::ResendHeld, held);
+#endif
 }
 
 bool RdmaTransport::resendOne(PendingNotify& pending, Clock::time_point now) {
@@ -1250,6 +1265,10 @@ bool RdmaTransport::resendOne(PendingNotify& pending, Clock::time_point now) {
     }
     pending.next_try = {};
     const uint64_t dropped = ++notify_resend_dropped_;
+    TENT_RECORD_NOTIFY_DROPPED(
+        holdsResend(status) ? TentMetrics::NotifyDropReason::ResendDeadline
+                            : TentMetrics::NotifyDropReason::ResendExhausted,
+        1);
     LOG_EVERY_N(WARNING, 100)
         << "Dropped a notification to segment " << pending.target << " after "
         << pending.attempts << " attempt(s), " << dropped
@@ -1266,6 +1285,7 @@ void RdmaTransport::notifyResendThread() {
         return due;
     };
     while (true) {
+        setResendDepthsLocked();
         auto runnable = [&] {
             return !notify_resend_running_ || !notify_resend_queue_.empty() ||
                    next_due() <= Clock::now();
@@ -1285,6 +1305,12 @@ void RdmaTransport::notifyResendThread() {
                 LOG(WARNING) << "Dropped " << left
                              << " notification resend(s) on shutdown, "
                              << (notify_resend_dropped_ += left) << " so far";
+                TENT_RECORD_NOTIFY_DROPPED(
+                    TentMetrics::NotifyDropReason::Shutdown, left);
+                TENT_SET_NOTIFY_QUEUE_DEPTH(TentMetrics::NotifyQueue::Resend,
+                                            0);
+                TENT_SET_NOTIFY_QUEUE_DEPTH(
+                    TentMetrics::NotifyQueue::ResendHeld, 0);
             }
             return;
         }
@@ -1310,14 +1336,19 @@ void RdmaTransport::notifyResendThread() {
         } else {
             continue;
         }
+        // The resend in hand may take an RPC timeout; it is in neither queue.
+        setResendDepthsLocked();
         lock.unlock();
         bool delivered = false;
         pending.next_try = {};
         try {
             delivered = resendOne(pending);
+            if (delivered) TENT_RECORD_NOTIFY_RESENT();
         } catch (const std::exception& e) {
             // E.g. a msg the RPC leg cannot encode: nothing above us catches.
             const uint64_t dropped = ++notify_resend_dropped_;
+            TENT_RECORD_NOTIFY_DROPPED(
+                TentMetrics::NotifyDropReason::ResendEncode, 1);
             LOG_EVERY_N(WARNING, 100)
                 << "Dropped a notification to segment " << pending.target
                 << ", " << dropped << " so far: " << e.what();
@@ -1347,6 +1378,8 @@ void RdmaTransport::notifyResendThread() {
                          << " notification resend(s) to segment " << target
                          << " past the deadline, "
                          << (notify_resend_dropped_ += expired) << " so far";
+            TENT_RECORD_NOTIFY_DROPPED(
+                TentMetrics::NotifyDropReason::ResendDeadline, expired);
         }
     }
 }
@@ -1359,12 +1392,15 @@ Status RdmaTransport::receiveNotification(
     }
     notify_list = std::move(notify_list_);
     notify_list_.clear();
+    TENT_SET_NOTIFY_QUEUE_DEPTH(TentMetrics::NotifyQueue::RecvRdma, 0);
     return Status::OK();
 }
 
 void RdmaTransport::addNotificationToQueue(const Notification& notifi) {
     std::lock_guard<std::mutex> lock(notify_mutex_);
     notify_list_.push_back(notifi);
+    TENT_RECORD_NOTIFY_RECEIVED(TentMetrics::NotifyQueue::RecvRdma,
+                                notify_list_.size());
 }
 
 namespace {
@@ -1476,6 +1512,10 @@ int RdmaTransport::processNotifyCompletions() {
             }
 
             if (!endpoint) {
+                // The peer's NIC acked it, so the sender will not resend it.
+                if (wc[i].opcode == IBV_WC_RECV)
+                    TENT_RECORD_NOTIFY_DROPPED(
+                        TentMetrics::NotifyDropReason::RecvEndpointGone, 1);
                 LOG(WARNING) << "Received notification from unknown QP: "
                              << wc[i].qp_num;
                 continue;
