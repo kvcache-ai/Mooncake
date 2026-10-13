@@ -919,6 +919,13 @@ struct SocketHandShakePlugin : public HandShakePlugin {
                     close(conn_fd);
                     continue;
                 }
+                if (setsockopt(conn_fd, SOL_SOCKET, SO_SNDTIMEO, &timeout,
+                               sizeof(timeout))) {
+                    PLOG(ERROR)
+                        << "SocketHandShakePlugin: setsockopt(SO_SNDTIMEO)";
+                    close(conn_fd);
+                    continue;
+                }
 
                 auto peer_hostname =
                     getNetworkAddress((struct sockaddr *)&addr);

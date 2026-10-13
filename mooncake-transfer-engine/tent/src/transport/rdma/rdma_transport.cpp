@@ -19,12 +19,15 @@
 #include <glog/logging.h>
 #include <sys/mman.h>
 #include <sys/time.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <cassert>
 #include <cerrno>
 #include <cstddef>
+#include <climits>
 #include <cstdlib>
+#include <cstring>
 #include <future>
 #include <limits>
 #include <sstream>
@@ -55,6 +58,18 @@ namespace tent {
 namespace {
 
 constexpr uint64_t kDefaultRdmaQuiesceTimeoutNs = 10000000000ull;
+
+// EFA devices are listed by ibverbs but have no RC QPs; they are served by
+// the fabric transport instead.
+bool isEfaDevice(const std::string& name) {
+    const std::string link = "/sys/class/infiniband/" + name + "/device/driver";
+    char target[PATH_MAX];
+    ssize_t len = readlink(link.c_str(), target, sizeof(target) - 1);
+    if (len <= 0) return false;
+    target[len] = '\0';
+    const char* base = strrchr(target, '/');
+    return strcmp(base ? base + 1 : target, "efa") == 0;
+}
 
 uint16_t getRdmaBindDefaultPort(const Config& config) {
     constexpr const char* kKey = "rpc_server_port";
@@ -282,7 +297,10 @@ size_t RdmaTransport::initializeContexts() {
     size_t context_count = 0;
     for (size_t i = 0; i < local_topology_->getNicCount(); ++i) {
         auto entry = local_topology_->getNicEntry(i);
-        if (entry->type == Topology::NIC_RDMA) {
+        if (entry->type == Topology::NIC_RDMA && isEfaDevice(entry->name)) {
+            LOG(INFO) << "Skip EFA device " << entry->name
+                      << " (not RC capable; use the fabric transport)";
+        } else if (entry->type == Topology::NIC_RDMA) {
             auto context = std::make_shared<RdmaContext>(*this);
             if (context->construct(entry->name, params_) == 0) {
                 context_name_lookup_[entry->name] = i;

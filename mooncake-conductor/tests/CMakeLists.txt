@@ -18,6 +18,7 @@ add_executable(
   msgpack_reader_test.cpp
   msg_decoder_test.cpp
   zmq_client_test.cpp
+  zmq_transport_test.cpp
   event_manager_test.cpp
   conductor_service_test.cpp
   wire_types_test.cpp

@@ -15,7 +15,7 @@
 namespace mooncake::conductor::prefixindex {
 
 struct BlockPresenceSnapshot {
-    std::set<EngineOwner> npu_owners;
+    std::set<EngineOwner> device_owners;
     std::set<EngineOwner> cpu_local_owners;
     std::set<SharedObjectOwner> cpu_share_owners;
     std::set<TierOwner> disk_owners;
@@ -61,7 +61,7 @@ class PrefixCacheTableTestPeer {
         const auto block = state->blocks.find(prefix);
         if (block == state->blocks.end()) return std::nullopt;
         return BlockPresenceSnapshot{
-            block->second.npu_owners, block->second.cpu_local_owners,
+            block->second.device_owners, block->second.cpu_local_owners,
             block->second.cpu_share_owners, block->second.disk_owners};
     }
 
@@ -117,7 +117,7 @@ class PrefixCacheTableTestPeer {
             state_snapshot.instance_ranks = state->instance_ranks;
             for (const auto& [prefix, presence] : state->blocks) {
                 state_snapshot.blocks.emplace(
-                    prefix, BlockPresenceSnapshot{presence.npu_owners,
+                    prefix, BlockPresenceSnapshot{presence.device_owners,
                                                   presence.cpu_local_owners,
                                                   presence.cpu_share_owners,
                                                   presence.disk_owners});

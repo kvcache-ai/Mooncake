@@ -43,9 +43,11 @@
 #include "tent/transfer_engine.h"
 #include "tent/runtime/platform.h"
 #include "tent/runtime/topology.h"
+#include "tent/transport/rdma/buffers.h"
 #include "tent/transport/rdma/context.h"
 #include "tent/transport/rdma/endpoint.h"
 #include "tent/transport/rdma/endpoint_store.h"
+#include "tent/transport/rdma/gdr_reachability.h"
 #include "tent/transport/rdma/params.h"
 #include "tent/transport/rdma/quota.h"
 #include "tent/transport/rdma/rdma_transport.h"
@@ -56,9 +58,21 @@
 namespace mooncake {
 namespace tent {
 
+extern thread_local int tl_wid;
+constexpr size_t kMetadataLifetimeBlockSize = 4096;
+constexpr int kGdrFailureThreshold = 2;
+
 // Friend accessor for driving initializeContexts() without a full install().
 class RdmaTransportTestPeer {
    public:
+    static Status generatePostPath(Workers& workers, RdmaSlice* slice) {
+        const int previous = tl_wid;
+        tl_wid = 0;
+        auto status = workers.generatePostPath(slice);
+        tl_wid = previous;
+        return status;
+    }
+
     static void bindTopology(RdmaTransport& transport,
                              std::shared_ptr<Topology> topology) {
         transport.local_topology_ = topology;
@@ -133,6 +147,18 @@ class RdmaTransportTestPeer {
 
     static void setNumWorkers(RdmaTransport& transport, int num_workers) {
         transport.params_->workers.num_workers = num_workers;
+    }
+
+    static Workers& prepareMetadataLifetime(RdmaTransport& transport) {
+        transport.params_->workers.num_workers = 1;
+        transport.params_->workers.block_size = kMetadataLifetimeBlockSize;
+        transport.conf_->set("transports/rdma/gdr_error_threshold",
+                             kGdrFailureThreshold);
+        transport.workers_ = std::make_unique<Workers>(&transport);
+        auto& workers = *transport.workers_;
+        makeWorkerContexts(workers, 1);
+        workers.getDeviceSelector()->setSmartSelection(false);
+        return workers;
     }
 
     static void addInflight(Workers& workers, size_t worker_id, int64_t delta) {
@@ -233,6 +259,13 @@ class RdmaTransportTestPeer {
 class RdmaContextTestPeer {
    public:
     static IbvSymbols& verbs(RdmaContext& context) { return context.verbs_; }
+
+    // Memory regions the context currently holds, as registerMemReg() and
+    // unregisterMemReg() account for them.
+    static size_t mrCount(RdmaContext& context) {
+        std::lock_guard<std::mutex> guard(context.mr_set_mutex_);
+        return context.mr_set_.size();
+    }
 
     // Make the context look opened on `native` (never dereferenced by the
     // port-attribute paths, only passed back to the verbs) with `params`.
@@ -423,6 +456,182 @@ std::shared_ptr<Topology> topologyWithRdmaNics(size_t count) {
     }
     topology->mem_list_.push_back(std::move(memory));
     return topology;
+}
+
+class RdmaSliceMetadataLifetimeTest : public ::testing::Test {
+   protected:
+    void SetUp() override {
+        topology_ = topologyWithRdmaNics(2);
+        Topology::MemEntry gpu_memory;
+        gpu_memory.name = "cuda:0";
+        gpu_memory.type = Topology::MEM_CUDA;
+        gpu_memory.numa_node = 0;
+        gpu_memory.device_list[0] = {0, 1};
+        topology_->mem_list_.push_back(std::move(gpu_memory));
+        RdmaTransportTestPeer::bindTopology(transport_, topology_);
+        metadata_ = std::make_shared<ControlService>("p2p", "", nullptr);
+        RdmaTransportTestPeer::bindMetadata(transport_, metadata_);
+        uint16_t local_port = 0;
+        ASSERT_TRUE(metadata_->start(local_port).ok());
+        ASSERT_TRUE(metadata_->segmentManager()
+                        .updateLocal([&](SegmentDesc& segment) {
+                            segment.type = SegmentType::Memory;
+                            segment.machine_id = "metadata-lifetime-test";
+                            segment.rpc_server_addr =
+                                "127.0.0.1:" + std::to_string(local_port);
+                            auto& memory =
+                                std::get<MemorySegmentDesc>(segment.detail);
+                            memory.topology = *topology_;
+                            BufferDesc buffer;
+                            buffer.addr =
+                                reinterpret_cast<uint64_t>(buffer_.data());
+                            buffer.length = buffer_.size();
+                            buffer.location = "cuda:0";
+                            buffer.lkey = {101, 102};
+                            buffer.rkey = {201, 202};
+                            memory.buffers = {buffer};
+                            return Status::OK();
+                        })
+                        .ok());
+        workers_ = &RdmaTransportTestPeer::prepareMetadataLifetime(transport_);
+        ASSERT_TRUE(transport_.allocateSubBatch(batch_, 1).ok());
+        request_.opcode = Request::WRITE;
+        request_.source = buffer_.data();
+        request_.target_offset = reinterpret_cast<uint64_t>(buffer_.data());
+        request_.length = buffer_.size();
+        peer_ = std::make_shared<ControlService>("p2p", "", nullptr);
+        uint16_t port = 0;
+        ASSERT_TRUE(peer_->start(port).ok());
+        peer_name_ = "127.0.0.1:" + std::to_string(port);
+        publishPeer();
+        ASSERT_TRUE(metadata_->segmentManager()
+                        .openRemote(request_.target_id, peer_name_)
+                        .ok());
+    }
+
+    void TearDown() override {
+        if (batch_) {
+            for (auto* first :
+                 static_cast<RdmaSubBatch*>(batch_)->slice_chain) {
+                for (auto* slice = first; slice; slice = slice->next) {
+                    RdmaTransportTestPeer::releaseSliceQuota(*workers_, slice,
+                                                             0, 0);
+                    slice->task->deref();
+                }
+            }
+            EXPECT_TRUE(transport_.freeSubBatch(batch_).ok());
+        }
+        if (workers_) {
+            std::vector<NicLoadStats> stats;
+            EXPECT_TRUE(
+                workers_->getDeviceSelector()->getNicLoadStats(stats).ok());
+            for (const auto& nic : stats) EXPECT_EQ(nic.inflight_bytes, 0u);
+            RdmaTransportTestPeer::destroyWorkerContexts(*workers_);
+        }
+    }
+
+    void publishPeer() {
+        ASSERT_TRUE(peer_->segmentManager()
+                        .updateLocal([&](SegmentDesc& segment) {
+                            segment = *metadata_->segmentManager().getLocal();
+                            segment.name = peer_name_;
+                            segment.rpc_server_addr = peer_name_;
+                            segment.machine_id = "different-machine";
+                            return Status::OK();
+                        })
+                        .ok());
+        metadata_->segmentManager().invalidateRemote(request_.target_id);
+    }
+
+    RdmaTransport transport_;
+    std::shared_ptr<Topology> topology_;
+    std::shared_ptr<ControlService> metadata_;
+    std::shared_ptr<ControlService> peer_;
+    std::string peer_name_;
+    Workers* workers_ = nullptr;
+    Transport::SubBatchRef batch_ = nullptr;
+    Request request_{};
+    std::vector<char> buffer_ = std::vector<char>(kMetadataLifetimeBlockSize);
+};
+
+TEST_F(RdmaSliceMetadataLifetimeTest,
+       GdrCompletionUsesSliceMetadataAfterTopologyRefresh) {
+    constexpr int kSelectedNicId = 1;
+    batch_->device_mask = 1ULL << kSelectedNicId;
+    ASSERT_TRUE(transport_.submitTransferTasks(batch_, {request_}).ok());
+    auto* first = static_cast<RdmaSubBatch*>(batch_)->slice_chain[0];
+    ASSERT_NE(first, nullptr);
+    const auto first_path =
+        RdmaTransportTestPeer::generatePostPath(*workers_, first);
+    ASSERT_TRUE(first_path.ok()) << first_path.ToString();
+    ASSERT_EQ(first->source_gpu_ordinal, 0);
+    ASSERT_EQ(first->target_gpu_ordinal, 0);
+    ASSERT_EQ(first->source_dev_id, kSelectedNicId);
+    ASSERT_EQ(first->target_dev_id, kSelectedNicId);
+    const auto* selected_nic = topology_->getNicEntry(kSelectedNicId);
+    ASSERT_NE(selected_nic, nullptr);
+    const std::string expected_nic_name = selected_nic->name;
+
+    auto endpoint = std::make_shared<RdmaEndPoint>();
+    first->ep_weak_ptr = endpoint;
+    auto& worker = RdmaTransportTestPeer::workerContext(*workers_, 0);
+    RdmaTransportTestPeer::markPosted(*workers_, worker, first, 1000);
+    std::weak_ptr<const SegmentDesc> old_local =
+        metadata_->segmentManager().getLocal();
+    SegmentDescRef remote_pin;
+    ASSERT_TRUE(metadata_->segmentManager()
+                    .getRemoteCached(remote_pin, request_.target_id)
+                    .ok());
+    const std::string expected_machine_id = remote_pin->machine_id;
+    std::weak_ptr<const SegmentDesc> old_remote = remote_pin;
+    remote_pin.reset();
+    // updateLocal publishes a new immutable snapshot even without mutations.
+    ASSERT_TRUE(metadata_->segmentManager()
+                    .updateLocal([](SegmentDesc&) { return Status::OK(); })
+                    .ok());
+    publishPeer();
+    {
+        RdmaTask task;
+        task.request = request_;
+        RdmaSlice second;
+        second.task = &task;
+        second.source_addr = request_.source;
+        second.target_addr = request_.target_offset;
+        second.length = request_.length;
+        ASSERT_TRUE(
+            RdmaTransportTestPeer::generatePostPath(*workers_, &second).ok());
+        RdmaTransportTestPeer::releaseSliceQuota(*workers_, &second, 0, 0);
+    }
+    EXPECT_TRUE(old_local.expired());
+    EXPECT_TRUE(old_remote.expired());
+    EXPECT_EQ(first->source_nic_name, expected_nic_name);
+    EXPECT_EQ(first->target_nic_name, expected_nic_name);
+    EXPECT_EQ(first->target_machine_id, expected_machine_id);
+
+    auto& gdr = GdrReachability::instance();
+    const int source_gpu = first->source_gpu_ordinal;
+    const int target_gpu = first->target_gpu_ordinal;
+    for (int i = 0; i < kGdrFailureThreshold; ++i) {
+        gdr.reportLocalFailure(expected_nic_name, source_gpu);
+        gdr.reportRemoteFailure(expected_machine_id, expected_nic_name,
+                                target_gpu);
+    }
+    EXPECT_FALSE(gdr.localReachable(expected_nic_name, source_gpu));
+    EXPECT_FALSE(gdr.remoteReachable(expected_machine_id, expected_nic_name,
+                                     target_gpu));
+    ibv_wc completion{};
+    completion.wr_id = reinterpret_cast<uint64_t>(first);
+    completion.status = IBV_WC_SUCCESS;
+    RdmaContext context(transport_);
+    // A synthetic successful WR owes one completion but is not enqueued on
+    // the endpoint; this exercises only the GDR recovery path.
+    first->completions_owed.fetch_add(1, std::memory_order_acq_rel);
+    RdmaTransportTestPeer::handleCompletion(*workers_, worker, context,
+                                            completion, 2000);
+    EXPECT_EQ(first->completions_owed.load(std::memory_order_acquire), 0);
+    EXPECT_TRUE(gdr.localReachable(expected_nic_name, source_gpu));
+    EXPECT_TRUE(gdr.remoteReachable(expected_machine_id, expected_nic_name,
+                                    target_gpu));
 }
 
 bool waitBatchDone(TransferEngine& engine, BatchID batch) {
@@ -3681,6 +3890,281 @@ TEST(RdmaQuiesceTest, DrainTimeoutLeavesInflight) {
               std::chrono::milliseconds(500));
 
     ASSERT_TRUE(workers->stop().ok());
+}
+
+// LocalBufferManager registers one buffer on every enabled NIC. These tests
+// drive it with two contexts whose verbs are faked per protection domain, so
+// one NIC can refuse a registration while the other accepts it.
+struct FakeMrVerbs {
+    static constexpr int kNics = 2;
+    ibv_context native{};
+    ibv_pd pd[kNics]{};
+    // One MR object per (NIC, buffer slot): the fake has to hand out
+    // distinct pointers so unregisterMemReg() can account for each.
+    static constexpr int kSlots = 4;
+    ibv_mr mr[kNics][kSlots]{};
+    std::atomic<int> next_slot[kNics]{};
+    std::atomic<int> reg_calls[kNics]{};
+    std::atomic<int> dereg_calls[kNics]{};
+    // Registrations the fake refuses: NIC index, and either any address
+    // (nullptr) or one specific buffer.
+    std::atomic<int> fail_nic{-1};
+    void* fail_addr = nullptr;
+
+    int nicOf(ibv_pd* p) const { return p == &pd[0] ? 0 : 1; }
+    int nicOf(ibv_mr* m) const {
+        return (m >= &mr[0][0] && m <= &mr[0][kSlots - 1]) ? 0 : 1;
+    }
+};
+
+FakeMrVerbs fake_mr;
+
+ibv_mr* fakeRegMr(ibv_pd* pd, void* addr, size_t length, int) {
+    int nic = fake_mr.nicOf(pd);
+    fake_mr.reg_calls[nic]++;
+    if (fake_mr.fail_nic.load() == nic &&
+        (fake_mr.fail_addr == nullptr || fake_mr.fail_addr == addr)) {
+        errno = ENOMEM;
+        return nullptr;
+    }
+    int slot = fake_mr.next_slot[nic]++;
+    if (slot >= FakeMrVerbs::kSlots) return nullptr;
+    auto* mr = &fake_mr.mr[nic][slot];
+    mr->addr = addr;
+    mr->length = length;
+    mr->lkey = 0x100 * (nic + 1) + slot;
+    mr->rkey = 0x1000 * (nic + 1) + slot;
+    return mr;
+}
+
+int fakeDeregMr(ibv_mr* mr) {
+    fake_mr.dereg_calls[fake_mr.nicOf(mr)]++;
+    return 0;
+}
+
+class RdmaBufferRegistrationTest : public ::testing::Test {
+   protected:
+    void SetUp() override {
+        fake_mr.~FakeMrVerbs();
+        new (&fake_mr) FakeMrVerbs();
+
+        topology_ = std::make_shared<Topology>();
+        ASSERT_TRUE(topology_
+                        ->parse(R"({"nics":[
+                        {"name":"mc-fake-rnic-0","type":0,"numa_node":0},
+                        {"name":"mc-fake-rnic-1","type":0,"numa_node":0}]})")
+                        .ok());
+        manager_.setTopology(topology_);
+        params_ = std::make_shared<RdmaParams>();
+        for (int i = 0; i < FakeMrVerbs::kNics; ++i) {
+            contexts_[i] = std::make_unique<RdmaContext>(transport_);
+            auto& verbs = RdmaContextTestPeer::verbs(*contexts_[i]);
+            verbs.ibv_reg_mr_default = fakeRegMr;
+            verbs.ibv_dereg_mr = fakeDeregMr;
+            RdmaContextTestPeer::bindDevice(*contexts_[i], &fake_mr.native,
+                                            params_);
+            RdmaContextTestPeer::bindResources(*contexts_[i], &fake_mr.pd[i],
+                                               {}, nullptr);
+            ibv_gid gid{};
+            gid.raw[15] = static_cast<uint8_t>(0x20 + i);
+            RdmaContextTestPeer::seedAddress(
+                *contexts_[i], "mc-fake-rnic-" + std::to_string(i),
+                /*lid=*/10 + i, /*gid_index=*/3, gid,
+                RdmaContext::DEVICE_ENABLED);
+            ASSERT_TRUE(manager_.addDevice(contexts_[i].get()).ok());
+        }
+    }
+
+    void TearDown() override {
+        // The manager's destructor would otherwise deregister through
+        // contexts that are already gone.
+        ASSERT_TRUE(manager_.clear().ok());
+        for (auto& context : contexts_) {
+            if (!context) continue;
+            RdmaContextTestPeer::unbindResources(*context);
+            RdmaContextTestPeer::unbindDevice(*context);
+        }
+    }
+
+    BufferDesc describe(void* addr, size_t length) {
+        BufferDesc desc;
+        desc.addr = reinterpret_cast<uint64_t>(addr);
+        desc.length = length;
+        return desc;
+    }
+
+    RdmaTransport transport_;
+    std::shared_ptr<Topology> topology_;
+    std::shared_ptr<RdmaParams> params_;
+    std::unique_ptr<RdmaContext> contexts_[FakeMrVerbs::kNics];
+    LocalBufferManager manager_;
+    MemoryOptions options_;
+    alignas(4096) char buffer_a_[4096];
+    alignas(4096) char buffer_b_[4096];
+};
+
+TEST_F(RdmaBufferRegistrationTest, EveryNicRegistersAndKeysAreNicIndexed) {
+    auto desc = describe(buffer_a_, sizeof(buffer_a_));
+    ASSERT_TRUE(manager_.addBuffer(desc, options_).ok());
+
+    ASSERT_EQ(desc.lkey.size(), 2u);
+    ASSERT_EQ(desc.rkey.size(), 2u);
+    EXPECT_EQ(desc.lkey[0], 0x100u);
+    EXPECT_EQ(desc.rkey[0], 0x1000u);
+    EXPECT_EQ(desc.lkey[1], 0x200u);
+    EXPECT_EQ(desc.rkey[1], 0x2000u);
+    EXPECT_EQ(RdmaContextTestPeer::mrCount(*contexts_[0]), 1u);
+    EXPECT_EQ(RdmaContextTestPeer::mrCount(*contexts_[1]), 1u);
+    EXPECT_EQ(fake_mr.dereg_calls[0].load(), 0);
+    EXPECT_EQ(fake_mr.dereg_calls[1].load(), 0);
+
+    ASSERT_TRUE(manager_.removeBuffer(desc).ok());
+    EXPECT_TRUE(desc.lkey.empty());
+    EXPECT_TRUE(desc.rkey.empty());
+    EXPECT_EQ(fake_mr.dereg_calls[0].load(), 1);
+    EXPECT_EQ(fake_mr.dereg_calls[1].load(), 1);
+    EXPECT_EQ(RdmaContextTestPeer::mrCount(*contexts_[0]), 0u);
+    EXPECT_EQ(RdmaContextTestPeer::mrCount(*contexts_[1]), 0u);
+}
+
+TEST_F(RdmaBufferRegistrationTest,
+       ANicThatRefusesReleasesTheRegistrationsThatSucceeded) {
+    fake_mr.fail_nic = 1;
+    auto desc = describe(buffer_a_, sizeof(buffer_a_));
+
+    auto status = manager_.addBuffer(desc, options_);
+    ASSERT_FALSE(status.ok());
+    EXPECT_NE(std::string(status.message()).find("mc-fake-rnic-1"),
+              std::string::npos)
+        << status.ToString();
+
+    // NIC 0 registered and must have been deregistered again; NIC 1 never
+    // produced an MR, so there is nothing to release there.
+    EXPECT_EQ(fake_mr.reg_calls[0].load(), 1);
+    EXPECT_EQ(fake_mr.dereg_calls[0].load(), 1);
+    EXPECT_EQ(fake_mr.reg_calls[1].load(), 1);
+    EXPECT_EQ(fake_mr.dereg_calls[1].load(), 0);
+    EXPECT_EQ(RdmaContextTestPeer::mrCount(*contexts_[0]), 0u);
+    EXPECT_EQ(RdmaContextTestPeer::mrCount(*contexts_[1]), 0u);
+    // A failed registration leaves the descriptor as it found it, so the
+    // caller can retry it.
+    EXPECT_TRUE(desc.lkey.empty());
+    EXPECT_TRUE(desc.rkey.empty());
+
+    // The retry after the NIC recovers registers normally.
+    fake_mr.fail_nic = -1;
+    ASSERT_TRUE(manager_.addBuffer(desc, options_).ok());
+    EXPECT_EQ(RdmaContextTestPeer::mrCount(*contexts_[0]), 1u);
+    EXPECT_EQ(RdmaContextTestPeer::mrCount(*contexts_[1]), 1u);
+    ASSERT_EQ(desc.rkey.size(), 2u);
+    EXPECT_NE(desc.rkey[0], 0u);
+    EXPECT_NE(desc.rkey[1], 0u);
+}
+
+TEST_F(RdmaBufferRegistrationTest, ABatchWithOneFailureRegistersNothing) {
+    std::vector<BufferDesc> descs{describe(buffer_a_, sizeof(buffer_a_)),
+                                  describe(buffer_b_, sizeof(buffer_b_))};
+    // Only the second buffer is refused, and only by NIC 1.
+    fake_mr.fail_nic = 1;
+    fake_mr.fail_addr = buffer_b_;
+
+    ASSERT_FALSE(manager_.addBuffer(descs, options_).ok());
+
+    // Buffer A registered on both NICs and buffer B on NIC 0: three MRs were
+    // created, and all three must be gone.
+    EXPECT_EQ(fake_mr.reg_calls[0].load() + fake_mr.reg_calls[1].load(), 4);
+    EXPECT_EQ(fake_mr.dereg_calls[0].load(), 2);
+    EXPECT_EQ(fake_mr.dereg_calls[1].load(), 1);
+    EXPECT_EQ(RdmaContextTestPeer::mrCount(*contexts_[0]), 0u);
+    EXPECT_EQ(RdmaContextTestPeer::mrCount(*contexts_[1]), 0u);
+    for (auto& desc : descs) {
+        EXPECT_TRUE(desc.lkey.empty());
+        EXPECT_TRUE(desc.rkey.empty());
+    }
+
+    // The manager tracks neither buffer: removing them again releases
+    // nothing more.
+    ASSERT_TRUE(manager_.removeBuffer(descs[0]).ok());
+    ASSERT_TRUE(manager_.removeBuffer(descs[1]).ok());
+    EXPECT_EQ(fake_mr.dereg_calls[0].load(), 2);
+    EXPECT_EQ(fake_mr.dereg_calls[1].load(), 1);
+}
+
+TEST_F(RdmaBufferRegistrationTest,
+       EveryNicRefusingNamesThemAllAndReleasesNothing) {
+    fake_mr.fail_nic = 0;
+    auto desc = describe(buffer_a_, sizeof(buffer_a_));
+    // The fake refuses one NIC at a time; refuse the other through its
+    // slot budget instead, so neither produces an MR.
+    fake_mr.next_slot[1] = FakeMrVerbs::kSlots;
+
+    auto status = manager_.addBuffer(desc, options_);
+    ASSERT_FALSE(status.ok());
+    const std::string message(status.message());
+    EXPECT_NE(message.find("mc-fake-rnic-0"), std::string::npos) << message;
+    EXPECT_NE(message.find("mc-fake-rnic-1"), std::string::npos) << message;
+
+    EXPECT_EQ(fake_mr.dereg_calls[0].load(), 0);
+    EXPECT_EQ(fake_mr.dereg_calls[1].load(), 0);
+    EXPECT_TRUE(desc.lkey.empty());
+    EXPECT_TRUE(desc.rkey.empty());
+}
+
+// The key vectors are NicID-indexed and the topology may name a NIC that has
+// no context (not RC capable, failed to open). Such a slot is not a failed
+// registration: it stays a zero key and the buffer registers on the rest.
+TEST(RdmaBufferRegistrationGapTest, ANicWithoutAContextIsNotAFailure) {
+    fake_mr.~FakeMrVerbs();
+    new (&fake_mr) FakeMrVerbs();
+
+    auto topology = std::make_shared<Topology>();
+    ASSERT_TRUE(topology
+                    ->parse(R"({"nics":[
+                    {"name":"mc-fake-rnic-0","type":0,"numa_node":0},
+                    {"name":"mc-fake-rnic-gap","type":0,"numa_node":0},
+                    {"name":"mc-fake-rnic-1","type":0,"numa_node":0}]})")
+                    .ok());
+    RdmaTransport transport;
+    LocalBufferManager manager;
+    manager.setTopology(topology);
+    auto params = std::make_shared<RdmaParams>();
+    std::unique_ptr<RdmaContext> contexts[FakeMrVerbs::kNics];
+    for (int i = 0; i < FakeMrVerbs::kNics; ++i) {
+        contexts[i] = std::make_unique<RdmaContext>(transport);
+        auto& verbs = RdmaContextTestPeer::verbs(*contexts[i]);
+        verbs.ibv_reg_mr_default = fakeRegMr;
+        verbs.ibv_dereg_mr = fakeDeregMr;
+        RdmaContextTestPeer::bindDevice(*contexts[i], &fake_mr.native, params);
+        RdmaContextTestPeer::bindResources(*contexts[i], &fake_mr.pd[i], {},
+                                           nullptr);
+        ibv_gid gid{};
+        gid.raw[15] = static_cast<uint8_t>(0x30 + i);
+        RdmaContextTestPeer::seedAddress(
+            *contexts[i], "mc-fake-rnic-" + std::to_string(i), /*lid=*/20 + i,
+            /*gid_index=*/3, gid, RdmaContext::DEVICE_ENABLED);
+        ASSERT_TRUE(manager.addDevice(contexts[i].get()).ok());
+    }
+
+    alignas(4096) static char buffer[4096];
+    BufferDesc desc;
+    desc.addr = reinterpret_cast<uint64_t>(buffer);
+    desc.length = sizeof(buffer);
+    ASSERT_TRUE(manager.addBuffer(desc, MemoryOptions{}).ok());
+
+    // Slot 1 is the gap: NicID-indexed, zero key, no registration attempted.
+    ASSERT_EQ(desc.rkey.size(), 3u);
+    EXPECT_EQ(desc.rkey[0], 0x1000u);
+    EXPECT_EQ(desc.rkey[1], 0u);
+    EXPECT_EQ(desc.rkey[2], 0x2000u);
+    EXPECT_EQ(fake_mr.reg_calls[0].load() + fake_mr.reg_calls[1].load(), 2);
+
+    ASSERT_TRUE(manager.clear().ok());
+    EXPECT_EQ(fake_mr.dereg_calls[0].load(), 1);
+    EXPECT_EQ(fake_mr.dereg_calls[1].load(), 1);
+    for (auto& context : contexts) {
+        RdmaContextTestPeer::unbindResources(*context);
+        RdmaContextTestPeer::unbindDevice(*context);
+    }
 }
 
 }  // namespace

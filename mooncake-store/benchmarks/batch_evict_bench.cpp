@@ -180,7 +180,8 @@ class BatchEvictBench {
                 if (tenant_id != TenantId::Default()) {
                     continue;
                 }
-                for (auto& [key, metadata] : tenant_state.metadata) {
+                for (auto& [key, record] : tenant_state.metadata) {
+                    auto& metadata = record.metadata;
                     {
                         SpinLocker locker(&metadata.lock);
                         metadata.lease_->SetDeadline(
