@@ -33,7 +33,6 @@ The repository provides a small set of presets for common workflows:
 `cpu-debug`: CPU Debug build with unit tests enabled.
 `cuda-release`: CUDA Release build with Store and Transfer Engine.
 `transfer-engine-only`: Build Transfer Engine only.
-`store-only`: Build Store only.
 
 The presets are optional. Advanced users can use native CMake commands and
 enable additional features directly:
