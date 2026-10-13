@@ -5522,11 +5522,10 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                    << ", key_size=" << key.size() << ", error=invalid_params";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    if (config.dfs_replica_num > 1 ||
-        (config.dfs_replica_num > 0 && config.replica_num == 0)) {
-        LOG(ERROR) << "key=" << key << ", replica_num=" << config.replica_num
+    if (config.dfs_replica_num > 1) {
+        LOG(ERROR) << "key=" << key
                    << ", dfs_replica_num=" << config.dfs_replica_num
-                   << ", error=invalid_dfs_replica_config";
+                   << ", error=dfs_replica_num_must_be_0_or_1";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     if (config.dfs_replica_num > 0 && !object_id.tenant_id.IsDefault()) {
@@ -6204,11 +6203,10 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                    << ", key_size=" << key.size() << ", error=invalid_params";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    if (config.dfs_replica_num > 1 ||
-        (config.dfs_replica_num > 0 && config.replica_num == 0)) {
-        LOG(ERROR) << "key=" << key << ", replica_num=" << config.replica_num
+    if (config.dfs_replica_num > 1) {
+        LOG(ERROR) << "key=" << key
                    << ", dfs_replica_num=" << config.dfs_replica_num
-                   << ", error=invalid_dfs_replica_config";
+                   << ", error=dfs_replica_num_must_be_0_or_1";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     if (config.dfs_replica_num > 0 && !object_id.tenant_id.IsDefault()) {
