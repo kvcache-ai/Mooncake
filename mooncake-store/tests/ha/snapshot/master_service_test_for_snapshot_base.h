@@ -165,6 +165,8 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
     // Persist the master's snapshot using state exposed by the test peer.
     static tl::expected<void, SerializationError> CallPersistState(
         MasterService* service, const std::string& snapshot_id) {
+        std::unique_lock drain_lock(
+            MasterServiceTestPeer::DrainSnapshotMutex(*service));
         std::unique_lock<std::shared_mutex> snapshot_lock(
             MasterServiceTestPeer::SnapshotMutex(*service));
         // If snapshot_manager_ exists, use it; otherwise create a temporary one

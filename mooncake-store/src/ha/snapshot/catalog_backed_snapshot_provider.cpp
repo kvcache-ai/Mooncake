@@ -15,6 +15,7 @@
 #include "ha/snapshot/catalog/backends/redis/redis_snapshot_catalog_store.h"
 #include "ha/snapshot/catalog/snapshot_catalog_store.h"
 #include "ha/snapshot/object/snapshot_object_store.h"
+#include "ha/snapshot/snapshot_constants.h"
 #include "segment.h"
 #include "serialize/serializer.h"
 #include "common/zstd_util.h"
@@ -27,7 +28,6 @@ namespace {
 constexpr char kSnapshotManifestFile[] = "manifest.txt";
 constexpr char kSnapshotMetadataFile[] = "metadata";
 constexpr char kSnapshotSegmentsFile[] = "segments";
-constexpr char kSnapshotSerializerVersion[] = "1.0.0";
 constexpr char kSnapshotSerializerType[] = "messagepack";
 
 enum class SnapshotCatalogBackendKind {
@@ -69,7 +69,7 @@ const msgpack::object* FindMapField(const msgpack::object& object,
 }
 
 ErrorCode ValidateManifest(std::string_view snapshot_id,
-                           std::string_view manifest) {
+                           std::string_view manifest, bool& has_drain_jobs) {
     const auto first = manifest.find('|');
     const auto second = first == std::string_view::npos
                             ? std::string_view::npos
@@ -88,12 +88,15 @@ ErrorCode ValidateManifest(std::string_view snapshot_id,
                    << ", expected=" << kSnapshotSerializerType;
         return ErrorCode::DESERIALIZE_FAIL;
     }
-    if (version != kSnapshotSerializerVersion) {
+    if (version != ha::kSnapshotSerializerVersion &&
+        version != ha::kLegacySnapshotSerializerVersion) {
         LOG(ERROR) << "Unsupported snapshot manifest version, snapshot_id="
                    << snapshot_id << ", version=" << version
-                   << ", expected=" << kSnapshotSerializerVersion;
+                   << ", expected=" << ha::kSnapshotSerializerVersion;
         return ErrorCode::DESERIALIZE_FAIL;
     }
+
+    has_drain_jobs = version == ha::kSnapshotSerializerVersion;
 
     return ErrorCode::OK;
 }
@@ -464,8 +467,9 @@ class CatalogBackedSnapshotProvider final : public SnapshotProvider {
             return tl::make_unexpected(ErrorCode::PERSISTENT_FAIL);
         }
 
-        auto manifest_err =
-            ValidateManifest(descriptor.snapshot_id, manifest_content);
+        bool has_drain_jobs = false;
+        auto manifest_err = ValidateManifest(descriptor.snapshot_id,
+                                             manifest_content, has_drain_jobs);
         if (manifest_err != ErrorCode::OK) {
             return tl::make_unexpected(manifest_err);
         }
@@ -492,6 +496,45 @@ class CatalogBackedSnapshotProvider final : public SnapshotProvider {
                        << ", path=" << metadata_path
                        << ", error=" << metadata_result.error();
             return tl::make_unexpected(ErrorCode::PERSISTENT_FAIL);
+        }
+
+        std::shared_ptr<ha::MasterSnapshotPayloads> full_payloads;
+        if (has_drain_jobs) {
+            full_payloads = std::make_shared<ha::MasterSnapshotPayloads>();
+            full_payloads->drain_jobs.emplace();
+            auto tasks_result = object_store_->DownloadBuffer(
+                object_prefix + ha::kSnapshotTaskManagerFile,
+                full_payloads->task_manager);
+            auto jobs_result = object_store_->DownloadBuffer(
+                object_prefix + ha::kSnapshotDrainJobsFile,
+                *full_payloads->drain_jobs);
+            if (!tasks_result || !jobs_result) {
+                LOG(ERROR) << "Failed to download required task/job snapshot "
+                              "payload, snapshot_id="
+                           << descriptor.snapshot_id;
+                return tl::make_unexpected(ErrorCode::PERSISTENT_FAIL);
+            }
+            if (full_payloads->task_manager.empty() ||
+                full_payloads->drain_jobs->empty()) {
+                return tl::make_unexpected(ErrorCode::DESERIALIZE_FAIL);
+            }
+            // Reject malformed envelopes here. MasterSnapshotCodec validates
+            // the full job/task relationships before the new primary serves.
+            try {
+                const auto& jobs = *full_payloads->drain_jobs;
+                size_t offset = 0;
+                const auto decoded = msgpack::unpack(
+                    reinterpret_cast<const char*>(jobs.data()), jobs.size(),
+                    offset, nullptr, nullptr,
+                    msgpack::unpack_limit(jobs.size(), jobs.size(), jobs.size(),
+                                          jobs.size(), jobs.size(), 16));
+                if (offset != jobs.size() ||
+                    decoded.get().type != msgpack::type::ARRAY) {
+                    return tl::make_unexpected(ErrorCode::DESERIALIZE_FAIL);
+                }
+            } catch (const std::exception&) {
+                return tl::make_unexpected(ErrorCode::DESERIALIZE_FAIL);
+            }
         }
 
         SegmentManager segment_manager(BufferAllocatorType::OFFSET);
@@ -565,6 +608,11 @@ class CatalogBackedSnapshotProvider final : public SnapshotProvider {
             snapshot.segments.push_back(std::move(info));
         }
 
+        if (full_payloads) {
+            full_payloads->metadata = std::move(metadata_content);
+            full_payloads->segments = std::move(segments_content);
+            snapshot.master_snapshot_payloads = std::move(full_payloads);
+        }
         return std::optional<LoadedSnapshot>(std::move(snapshot));
     }
 

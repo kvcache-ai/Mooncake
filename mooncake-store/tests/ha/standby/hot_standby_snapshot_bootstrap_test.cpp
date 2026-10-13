@@ -9,12 +9,17 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <utility>
 
 #include "ha/standby_controller.h"
 #include "ha/snapshot/catalog/snapshot_catalog_store.h"
 #include "ha/snapshot/catalog_backed_snapshot_provider.h"
 #include "ha/snapshot/object/backends/local/local_file_snapshot_object_store.h"
 #include "ha/snapshot/snapshot_test_utils.h"
+#include "ha/snapshot/master_snapshot_codec.h"
+#include "ha/snapshot/snapshot_constants.h"
+#include "master_service.h"
+#include "master_service/master_service_test_peer.h"
 
 namespace mooncake::test {
 
@@ -150,6 +155,76 @@ TEST_P(HotStandbySnapshotBootstrapTest,
     EXPECT_EQ(StandbyState::WATCHING, status.state);
     EXPECT_EQ(0u, status.applied_seq_id);
     EXPECT_EQ(0u, status.primary_seq_id);
+}
+
+TEST_P(HotStandbySnapshotBootstrapTest,
+       CurrentSnapshotOnlyPromotionRestoresDrainJobFromDisk) {
+    UUID job_id;
+    {
+        MasterService source(MasterServiceConfig{});
+        Segment segment;
+        segment.id = generate_uuid();
+        segment.name = "promoted-drain-source";
+        segment.base = 0x300000000;
+        segment.size = 16 * 1024 * 1024;
+        segment.te_endpoint = segment.name;
+        ASSERT_TRUE(source.MountSegment(segment, generate_uuid()));
+        CreateDrainJobRequest request;
+        request.segments = {segment.name};
+        auto created = source.CreateDrainJob(request);
+        ASSERT_TRUE(created.has_value());
+        job_id = *created;
+
+        ha::MasterSnapshotStateView state(
+            source, MasterServiceTestPeer::SegmentManager(source),
+            MasterServiceTestPeer::LocalSsdManager(source),
+            MasterServiceTestPeer::NofSegmentManager(source),
+            MasterServiceTestPeer::TaskManager(source));
+        ha::MasterSnapshotCodec codec;
+        auto payloads = codec.Encode(state);
+        ASSERT_TRUE(payloads.has_value());
+        ASSERT_TRUE(payloads->drain_jobs.has_value());
+        for (const auto& [name, bytes] :
+             std::vector<std::pair<const char*, const std::vector<uint8_t>*>>{
+                 {ha::kSnapshotMetadataFile, &payloads->metadata},
+                 {ha::kSnapshotSegmentsFile, &payloads->segments},
+                 {ha::kSnapshotTaskManagerFile, &payloads->task_manager},
+                 {ha::kSnapshotDrainJobsFile, &*payloads->drain_jobs}}) {
+            ASSERT_TRUE(object_store_->UploadBuffer(
+                descriptor_.object_prefix + name, *bytes));
+        }
+        ASSERT_TRUE(object_store_->UploadBuffer(
+            descriptor_.manifest_key,
+            ha::MasterSnapshotCodec::EncodeManifest(
+                ha::kSnapshotSerializerType, ha::kSnapshotSerializerVersion,
+                descriptor_.snapshot_id)));
+        ASSERT_EQ(catalog_store_->Publish(descriptor_), ErrorCode::OK);
+        snapshot_published_ = true;
+    }
+
+    auto config = MakeSnapshotProviderConfig(GetParam(), cluster_id_,
+                                             FLAGS_redis_endpoint);
+    config.enable_snapshot_restore = true;
+    config.enable_oplog = false;
+    config.local_hostname = "127.0.0.1:50051";
+    const ha::HABackendSpec spec{.type = ha::HABackendType::UNKNOWN,
+                                 .connstring = "",
+                                 .cluster_namespace = cluster_id_};
+    auto controller = ha::CreateStandbyController(spec, config);
+    ASSERT_EQ(controller->StartStandby(std::nullopt), ErrorCode::OK);
+    auto promoted = controller->PromoteStandbyAndExport();
+    ASSERT_TRUE(promoted.has_value());
+    ASSERT_NE(promoted->master_snapshot_payloads, nullptr);
+
+    MasterServiceConfig target_config;
+    target_config.initial_snapshot_payloads =
+        promoted->master_snapshot_payloads;
+    MasterService target(target_config);
+    auto recovered = target.QueryDrainJob(job_id);
+    ASSERT_TRUE(recovered.has_value());
+    EXPECT_EQ(recovered->id, job_id);
+    EXPECT_EQ(recovered->segments,
+              std::vector<std::string>{"promoted-drain-source"});
 }
 
 TEST(StandbyControllerTest, PromoteStandbyReturnsStartFailure) {

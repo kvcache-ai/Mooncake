@@ -666,15 +666,21 @@ TEST_F(HotStandbyServiceTest, TestWarmStart_WithSnapshot) {
     config_.enable_oplog_following = true;
     config_.oplog_poll_interval_ms = 1;
     service_ = CreateOplogFollowingStandby(config_, cluster_id_, backend);
-    service_->SetSnapshotProvider(
-        std::make_unique<FakeSnapshotProvider>(std::optional<LoadedSnapshot>(
-            MakeSnapshot("warm-start-snapshot", 42, "key-1", 4096))));
+    auto snapshot = MakeSnapshot("warm-start-snapshot", 42, "key-1", 4096);
+    snapshot.master_snapshot_payloads =
+        std::make_shared<ha::MasterSnapshotPayloads>();
+    service_->SetSnapshotProvider(std::make_unique<FakeSnapshotProvider>(
+        std::optional<LoadedSnapshot>(std::move(snapshot))));
 
     ASSERT_EQ(ErrorCode::OK,
               service_->Start("primary", oplog_endpoints_, cluster_id_));
     EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
     EXPECT_EQ(42u, service_->GetLatestAppliedSequenceId());
     EXPECT_EQ(1u, service_->GetMetadataCount());
+    StandbySnapshot exported;
+    ASSERT_TRUE(service_->ExportStandbySnapshot(exported));
+    EXPECT_EQ(exported.master_snapshot_payloads, nullptr)
+        << "Snapshot-era tasks must not overwrite an OpLog-replayed view";
 }
 
 TEST_F(HotStandbyServiceTest, TestStart_SnapshotOnlyWithSnapshot) {

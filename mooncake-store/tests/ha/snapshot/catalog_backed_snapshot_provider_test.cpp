@@ -16,6 +16,8 @@
 #include "ha/snapshot/catalog_backed_snapshot_provider.h"
 #include "ha/snapshot/object/backends/local/local_file_snapshot_object_store.h"
 #include "ha/snapshot/snapshot_test_utils.h"
+#include "ha/snapshot/snapshot_constants.h"
+#include "task_manager.h"
 #include "weight_metadata_store.h"
 
 namespace mooncake::test {
@@ -95,6 +97,23 @@ class CatalogBackedSnapshotProviderTest
         snapshot_published_ = true;
     }
 
+    void UpgradeToDrainSnapshot() {
+        ClientTaskManager tasks(TaskManagerConfig{});
+        TaskManagerSerializer serializer(&tasks);
+        const auto encoded_tasks = serializer.Serialize();
+        ASSERT_TRUE(encoded_tasks.has_value());
+        ASSERT_TRUE(object_store_->UploadBuffer(
+            descriptor_.object_prefix + ha::kSnapshotTaskManagerFile,
+            *encoded_tasks));
+        ASSERT_TRUE(object_store_->UploadBuffer(
+            descriptor_.object_prefix + ha::kSnapshotDrainJobsFile,
+            std::vector<uint8_t>({0x92, 0x90, 0x90})));
+        ASSERT_TRUE(object_store_->UploadString(
+            descriptor_.manifest_key, std::string("messagepack|") +
+                                          ha::kSnapshotSerializerVersion + "|" +
+                                          descriptor_.snapshot_id));
+    }
+
     // Loads the published snapshot and asserts the single default object
     // round-trips intact, regardless of the metadata on-wire format.
     void ExpectLoadsDefaultObject(bool expected_hard_pinned = false) {
@@ -147,6 +166,52 @@ TEST_P(CatalogBackedSnapshotProviderTest,
     auto snapshot = provider.value()->LoadLatestSnapshot(cluster_id_);
     ASSERT_TRUE(snapshot.has_value()) << toString(snapshot.error());
     EXPECT_FALSE(snapshot->has_value());
+}
+
+TEST_P(CatalogBackedSnapshotProviderTest,
+       CurrentFormatPreservesObjectViewAndFullPayloads) {
+    PublishSnapshotPayload();
+    UpgradeToDrainSnapshot();
+    ExpectLoadsDefaultObject();
+    auto provider = CreateProvider();
+    ASSERT_TRUE(provider.has_value());
+    auto loaded = (*provider)->LoadLatestSnapshot(cluster_id_);
+    ASSERT_TRUE(loaded.has_value());
+    ASSERT_TRUE(loaded->has_value());
+    const auto& payloads = (**loaded).master_snapshot_payloads;
+    ASSERT_NE(payloads, nullptr);
+    EXPECT_FALSE(payloads->metadata.empty());
+    EXPECT_FALSE(payloads->segments.empty());
+    EXPECT_FALSE(payloads->task_manager.empty());
+    ASSERT_TRUE(payloads->drain_jobs.has_value());
+    EXPECT_EQ(*payloads->drain_jobs, std::vector<uint8_t>({0x92, 0x90, 0x90}));
+}
+
+TEST_P(CatalogBackedSnapshotProviderTest,
+       CurrentFormatRejectsMissingJobsInsteadOfTreatingItAsLegacy) {
+    PublishSnapshotPayload();
+    UpgradeToDrainSnapshot();
+    ASSERT_TRUE(fs::remove(fs::path(temp_dir_) / descriptor_.object_prefix /
+                           ha::kSnapshotDrainJobsFile));
+    auto provider = CreateProvider();
+    ASSERT_TRUE(provider.has_value());
+    auto loaded = (*provider)->LoadLatestSnapshot(cluster_id_);
+    ASSERT_FALSE(loaded.has_value());
+    EXPECT_EQ(loaded.error(), ErrorCode::PERSISTENT_FAIL);
+}
+
+TEST_P(CatalogBackedSnapshotProviderTest,
+       CurrentFormatRejectsMalformedJobEnvelope) {
+    PublishSnapshotPayload();
+    UpgradeToDrainSnapshot();
+    ASSERT_TRUE(object_store_->UploadBuffer(
+        descriptor_.object_prefix + ha::kSnapshotDrainJobsFile,
+        std::vector<uint8_t>{0xc0}));
+    auto provider = CreateProvider();
+    ASSERT_TRUE(provider.has_value());
+    auto loaded = (*provider)->LoadLatestSnapshot(cluster_id_);
+    ASSERT_FALSE(loaded.has_value());
+    EXPECT_EQ(loaded.error(), ErrorCode::DESERIALIZE_FAIL);
 }
 
 TEST_P(CatalogBackedSnapshotProviderTest, LoadLatestSnapshotRoundTrip) {

@@ -132,7 +132,9 @@ void MasterSnapshotManager::SnapshotThreadFunc() {
         std::optional<ha::SnapshotDescriptor> descriptor;
         pid_t pid;
         WeightMetadataSnapshot frozen_weight_metadata;
+        std::vector<uint8_t> frozen_drain_jobs;
         {
+            std::unique_lock drain_lock(master_service_->drain_snapshot_mutex_);
             std::unique_lock<std::shared_mutex> lock(snapshot_mutex_);
             LOG(INFO) << "[Snapshot] Locking snapshot mutex, snapshot_id="
                       << snapshot_id;
@@ -193,6 +195,8 @@ void MasterSnapshotManager::SnapshotThreadFunc() {
             // mutex.
             frozen_weight_metadata =
                 master_service_->weight_manager_.ExportSnapshot();
+            frozen_drain_jobs =
+                ha::MasterSnapshotCodec().EncodeDrainJobs(*master_service_);
             pid = fork();
         }
         if (pid == -1) {
@@ -212,7 +216,8 @@ void MasterSnapshotManager::SnapshotThreadFunc() {
             SNAP_LOG_INFO("[Snapshot] Child process started, snapshot_id={}",
                           snapshot_id);
             auto result =
-                PersistState(descriptor.value(), &frozen_weight_metadata);
+                PersistState(descriptor.value(), &frozen_weight_metadata,
+                             &frozen_drain_jobs);
             if (!result) {
                 SNAP_LOG_ERROR(
                     "[Snapshot] Child process failed to persist state, "
@@ -471,7 +476,8 @@ tl::expected<void, SerializationError> MasterSnapshotManager::PersistState(
 
 tl::expected<void, SerializationError> MasterSnapshotManager::PersistState(
     const ha::SnapshotDescriptor& descriptor,
-    const WeightMetadataSnapshot* frozen_weight_metadata) {
+    const WeightMetadataSnapshot* frozen_weight_metadata,
+    const std::vector<uint8_t>* frozen_drain_jobs) {
     const std::string& snapshot_id = descriptor.snapshot_id;
     const std::string& path_prefix = descriptor.object_prefix;
     const std::string& manifest_path = descriptor.manifest_key;
@@ -497,7 +503,8 @@ tl::expected<void, SerializationError> MasterSnapshotManager::PersistState(
             master_service_->nof_segment_manager_,
             master_service_->task_manager_);
 
-        auto encode_result = codec.Encode(state_view, frozen_weight_metadata);
+        auto encode_result =
+            codec.Encode(state_view, frozen_weight_metadata, frozen_drain_jobs);
         if (!encode_result) {
             SNAP_LOG_ERROR(
                 "[Snapshot] state encoding failed, snapshot_id={}, "
@@ -572,6 +579,18 @@ tl::expected<void, SerializationError> MasterSnapshotManager::PersistState(
                 snapshot_id, task_manager_path,
                 toString(upload_result.error().code),
                 upload_result.error().message);
+            if (!options_.use_snapshot_backup_dir) {
+                return tl::make_unexpected(upload_result.error());
+            }
+            error_msg.append(upload_result.error().message + "\n");
+            upload_success = false;
+        }
+
+        upload_result = repository_->UploadPayloadFile(
+            *encode_result->drain_jobs,
+            path_prefix + ha::kSnapshotDrainJobsFile,
+            ha::kSnapshotDrainJobsFile, snapshot_id);
+        if (!upload_result) {
             if (!options_.use_snapshot_backup_dir) {
                 return tl::make_unexpected(upload_result.error());
             }

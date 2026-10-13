@@ -243,7 +243,7 @@ MasterSnapshotRepository::DownloadSnapshotPayloads(
     // Parse and validate manifest
     std::vector<std::string> parts;
     boost::split(parts, manifest_content, boost::is_any_of("|"));
-    if (parts.size() < 3) {
+    if (parts.size() != 3 || parts[2] != snapshot_id) {
         return tl::make_unexpected(SerializationError(
             ErrorCode::INVALID_PARAMS, "invalid snapshot manifest format"));
     }
@@ -260,7 +260,8 @@ MasterSnapshotRepository::DownloadSnapshotPayloads(
                                            protocol_type + "', expected '" +
                                            ha::kSnapshotSerializerType + "'"));
     }
-    if (version != ha::kSnapshotSerializerVersion) {
+    if (version != ha::kSnapshotSerializerVersion &&
+        version != ha::kLegacySnapshotSerializerVersion) {
         return tl::make_unexpected(SerializationError(
             ErrorCode::INVALID_PARAMS,
             "incompatible snapshot version '" + version + "', expected '" +
@@ -338,6 +339,25 @@ MasterSnapshotRepository::DownloadSnapshotPayloads(
     }
     SNAP_LOG_INFO("[Restore] Downloaded task manager file successfully");
 
+    if (version == ha::kSnapshotSerializerVersion) {
+        payloads.drain_jobs.emplace();
+        const auto path = path_prefix + ha::kSnapshotDrainJobsFile;
+        auto result = object_store_->DownloadBuffer(path, *payloads.drain_jobs);
+        if (!result) {
+            return tl::make_unexpected(SerializationError(
+                ErrorCode::PERSISTENT_FAIL, "failed to download drain jobs '" +
+                                                path + "': " + result.error()));
+        }
+        if (use_backup_dir_) {
+            auto saved = FileUtil::SaveBinaryToFile(
+                *payloads.drain_jobs, fs::path(backup_dir_) /
+                                          ha::kSnapshotBackupRestoreDir /
+                                          ha::kSnapshotDrainJobsFile);
+            if (!saved)
+                SNAP_LOG_ERROR("[Restore] Failed to save drain jobs: {}",
+                               saved.error());
+        }
+    }
     return payloads;
 }
 

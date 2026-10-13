@@ -317,6 +317,16 @@ ErrorCode ScopedSegmentAccess::ReMountSegment(
         if (validation != ErrorCode::OK) {
             return validation;
         }
+        const auto existing =
+            segment_manager_->mounted_segments_.find(segment.id);
+        if (existing != segment_manager_->mounted_segments_.end() &&
+            (existing->second.status == SegmentStatus::DRAINING ||
+             existing->second.status == SegmentStatus::DRAINED)) {
+            // ValidateRemountSegment above verified ownership and every
+            // registration field. Keep the recovered maintenance status and
+            // allocator; the caller binds the refreshed client liveness.
+            continue;
+        }
         ErrorCode err = MountSegment(segment, client_id, client_liveness);
         if (err == ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS ||
             err == ErrorCode::INTERNAL_ERROR) {

@@ -8,12 +8,17 @@ namespace mooncake::ha {
 inline constexpr const char* kSnapshotMetadataFile = "metadata";
 inline constexpr const char* kSnapshotSegmentsFile = "segments";
 inline constexpr const char* kSnapshotTaskManagerFile = "task_manager";
+inline constexpr const char* kSnapshotDrainJobsFile = "drain_jobs";
 inline constexpr const char* kSnapshotManifestFile = "manifest.txt";
 inline constexpr const char* kSnapshotLatestFile = "latest.txt";
 
 // Snapshot format
 inline constexpr const char* kSnapshotSerializerType = "messagepack";
-inline constexpr const char* kSnapshotSerializerVersion = "1.0.0";
+// Format 1.1.0 replication pending_bytes is the full allocation charge:
+// object size * number of newly allocated targets. A different billing formula
+// must translate this representation or use a new snapshot format version.
+inline constexpr const char* kSnapshotSerializerVersion = "1.1.0";
+inline constexpr const char* kLegacySnapshotSerializerVersion = "1.0.0";
 
 // Backup directories
 inline constexpr const char* kSnapshotBackupSaveDir =

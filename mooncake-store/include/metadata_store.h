@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <memory>
 #include <optional>
 #include <shared_mutex>
 #include <string>
@@ -13,6 +14,10 @@
 #include "weight_metadata_store.h"
 
 namespace mooncake {
+
+namespace ha {
+struct MasterSnapshotPayloads;
+}
 
 inline std::string NormalizeTenantId(std::string_view tenant_id) {
     return TenantId(std::string(tenant_id)).value();
@@ -87,6 +92,9 @@ struct StandbySnapshot {
     std::vector<StandbySegmentInfo> segments;
     std::vector<StandbyObjectEntry> objects;
     struct_pack::compatible<WeightMetadataSnapshot, 1> weight_metadata;
+
+    // Internal promotion handoff only; intentionally excluded from YLT_REFL.
+    std::shared_ptr<const ha::MasterSnapshotPayloads> master_snapshot_payloads;
 
     YLT_REFL(StandbySnapshot, oplog_sequence_id, segments, objects,
              weight_metadata);

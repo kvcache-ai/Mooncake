@@ -1,6 +1,7 @@
 #pragma once
 
 #include <optional>
+#include <memory>
 #include <stdexcept>
 #include <string_view>
 
@@ -11,6 +12,16 @@
 #include "types.h"
 
 namespace mooncake {
+namespace ha {
+struct MasterSnapshotPayloads;
+}
+
+class MasterSnapshotRestoreError : public std::runtime_error {
+   public:
+    MasterSnapshotRestoreError(ErrorCode error_code, const std::string& message)
+        : std::runtime_error(message), code(error_code) {}
+    ErrorCode code;
+};
 
 struct ClientLivenessConfigSource {
     std::optional<int64_t> active_ttl_sec;
@@ -549,6 +560,8 @@ class MasterServiceSupervisorConfig {
 
 class WrappedMasterServiceConfig {
    public:
+    // Internal snapshot-only promotion handoff, consumed before workers start.
+    std::shared_ptr<const ha::MasterSnapshotPayloads> initial_snapshot_payloads;
     // Required parameters (no default values) - using RequiredParam
     RequiredParam<uint64_t> default_kv_lease_ttl{"default_kv_lease_ttl"};
 
@@ -1295,6 +1308,8 @@ struct TaskManagerConfig {
 
 class MasterServiceConfig {
    public:
+    // Internal snapshot-only promotion handoff, consumed before workers start.
+    std::shared_ptr<const ha::MasterSnapshotPayloads> initial_snapshot_payloads;
     uint64_t default_kv_lease_ttl = DEFAULT_DEFAULT_KV_LEASE_TTL;
     uint64_t default_kv_soft_pin_ttl = DEFAULT_KV_SOFT_PIN_TTL_MS;
     uint64_t max_kv_soft_pin_ttl = DEFAULT_MAX_KV_SOFT_PIN_TTL_MS;
@@ -1393,6 +1408,7 @@ class MasterServiceConfig {
 
     // From WrappedMasterServiceConfig
     MasterServiceConfig(const WrappedMasterServiceConfig& config) {
+        initial_snapshot_payloads = config.initial_snapshot_payloads;
         auto cxl_allocator_type = BufferAllocatorType::CACHELIB;
 
         default_kv_lease_ttl = config.default_kv_lease_ttl;

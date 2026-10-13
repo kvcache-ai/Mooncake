@@ -2,11 +2,13 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 #include <ylt/util/tl/expected.hpp>
 
 #include "types.h"
+#include "ha/snapshot/snapshot_constants.h"
 
 namespace mooncake {
 
@@ -47,7 +49,7 @@ struct MasterSnapshotStateView {
 /**
  * @brief Container for serialized master snapshot payloads.
  *
- * This struct provides a type-safe, zero-overhead container for the three
+ * This struct provides a type-safe, zero-overhead container for the
  * serialized payload buffers, eliminating map lookup overhead and potential
  * runtime exceptions from using std::unordered_map.
  */
@@ -55,6 +57,8 @@ struct MasterSnapshotPayloads {
     std::vector<uint8_t> metadata;
     std::vector<uint8_t> segments;
     std::vector<uint8_t> task_manager;
+    // Absent only for a manifest explicitly declaring the legacy format.
+    std::optional<std::vector<uint8_t>> drain_jobs;
 };
 
 /**
@@ -66,13 +70,14 @@ struct MasterSnapshotPayloads {
  * - Task manager state
  * - Discarded replicas
  *
- * The current implementation preserves the existing snapshot format exactly
- * to maintain backward compatibility with existing snapshots.
+ * Version 1.1 adds required DrainJob state. Version 1.0 remains readable
+ * with no jobs and conservative handling of orphaned DRAINING segments.
  *
  * Format details:
  * - metadata: msgpack-encoded metadata shards (compressed per-shard with zstd)
  * - segments: msgpack-encoded segment manager state
  * - task_manager: msgpack-encoded task manager state
+ * - drain_jobs: msgpack-encoded [jobs, per-object COPY/MOVE runtime records]
  * - manifest.txt: format descriptor "<type>|<version>|<snapshot_id>"
  *   (e.g., "messagepack|1.0.0|snapshot-000123")
  */
@@ -91,6 +96,10 @@ class MasterSnapshotCodec {
     /**
      * @brief Encode master state into serialized buffers.
      *
+     * Caller must quiesce mutations. For live capture, acquire the drain
+     * snapshot gate before snapshot_mutex_; the fork producer supplies frozen
+     * job bytes so the child does not acquire inherited job locks.
+     *
      * @param state_view View of the live master state
      * @param frozen_weight_metadata Parent-captured weights for fork snapshots;
      *        nullptr exports the live weight state
@@ -103,7 +112,8 @@ class MasterSnapshotCodec {
      */
     tl::expected<MasterSnapshotPayloads, SerializationError> Encode(
         MasterSnapshotStateView& state_view,
-        const WeightMetadataSnapshot* frozen_weight_metadata = nullptr) const;
+        const WeightMetadataSnapshot* frozen_weight_metadata = nullptr,
+        const std::vector<uint8_t>* frozen_drain_jobs = nullptr) const;
 
     /**
      * @brief Decode snapshot payloads and restore into master service.
@@ -117,8 +127,9 @@ class MasterSnapshotCodec {
         const MasterSnapshotPayloads& payloads) const;
 
     // Canonical serializer identifiers embedded in the snapshot manifest.
-    static constexpr const char* kSerializerType = "messagepack";
-    static constexpr const char* kSerializerVersion = "1.0.0";
+    static constexpr const char* kSerializerType = kSnapshotSerializerType;
+    static constexpr const char* kSerializerVersion =
+        kSnapshotSerializerVersion;
 
     /**
      * @brief Encode a snapshot manifest into its on-disk byte representation.
@@ -136,7 +147,13 @@ class MasterSnapshotCodec {
                                                const std::string& version,
                                                const std::string& snapshot_id);
 
+    // Caller freezes job mutations before snapshot_mutex_. The fork child
+    // receives these bytes and never acquires an inherited job mutex.
+    std::vector<uint8_t> EncodeDrainJobs(MasterService& service) const;
+
    private:
+    void DecodeDrainJobs(MasterService& service,
+                         const std::optional<std::vector<uint8_t>>& data) const;
     // Metadata encoding/decoding (delegates to MetadataSerializer for now)
     tl::expected<std::vector<uint8_t>, SerializationError> EncodeMetadata(
         MasterService& master_service,

@@ -647,13 +647,18 @@ auto Serializer<AllocatedBuffer>::deserialize(const msgpack::object &obj,
                 static_cast<int32_t>(ret), segment_id)));
     }
 
-    if (mountedSegment.status != SegmentStatus::OK) {
+    // DRAINED segments may still own discarded buffers awaiting lease expiry.
+    // Rebinding preserves their allocator reservation without allowing new
+    // allocation; segment restoration retains the maintenance status.
+    if (mountedSegment.status != SegmentStatus::OK &&
+        mountedSegment.status != SegmentStatus::DRAINING &&
+        mountedSegment.status != SegmentStatus::DRAINED) {
         return tl::unexpected(SerializationError(
             ErrorCode::DESERIALIZE_FAIL,
-            fmt::format("deserialize_msgpack AllocatedBuffer "
-                        "mountedSegment.status!=OK status={} segment_id={}",
-                        static_cast<int32_t>(mountedSegment.status),
-                        segment_id)));
+            fmt::format(
+                "deserialize_msgpack AllocatedBuffer "
+                "mountedSegment is not readable: status={} segment_id={}",
+                static_cast<int32_t>(mountedSegment.status), segment_id)));
     }
 
     std::shared_ptr<BufferAllocatorBase> allocator =
