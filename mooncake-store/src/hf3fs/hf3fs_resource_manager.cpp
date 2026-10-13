@@ -1,5 +1,8 @@
 #include "file_interface.h"
 
+#include <cstddef>
+#include <limits>
+
 namespace mooncake {
 // ============================================================================
 // USRBIO Resource manager Implementation
@@ -9,11 +12,23 @@ bool ThreadUSRBIOResource::Initialize(const Hf3fsConfig &config) {
         return true;
     }
 
+    // Bound the full allocation before multiplying, including direct callers
+    // that do not pass through Hf3fsAdapter::Init.
+    if (config.iov_size == 0 || config.ior_entries == 0 ||
+        config.ior_entries >=
+            static_cast<size_t>(std::numeric_limits<int>::max()) ||
+        config.iov_size >
+            static_cast<size_t>(std::numeric_limits<ptrdiff_t>::max()) /
+                config.ior_entries) {
+        return false;
+    }
     this->config_ = config;
 
-    // Create shared memory
-    int ret = hf3fs_iovcreate(&iov_, config.mount_root.c_str(), config.iov_size,
-                              0, -1);
+    // One staging slice per configured ring entry, shared by the read/write
+    // rings because a thread uses only one ring at a time.
+    const size_t buffer_size = config.iov_size * config.ior_entries;
+    int ret =
+        hf3fs_iovcreate(&iov_, config.mount_root.c_str(), buffer_size, 0, -1);
     if (ret < 0) {
         return false;
     }

@@ -20,6 +20,7 @@
 #include <utility>
 #include <vector>
 
+#include "hf3fs/hf3fs.h"
 #include "storage/distributed/hf3fs_adapter.h"
 
 namespace {
@@ -248,6 +249,8 @@ class Hf3fsBatchTest : public ::testing::Test {
         char path[] = "/tmp/mooncake-hf3fs-batch-XXXXXX";
         ASSERT_NE(::mkdtemp(path), nullptr);
         directory_ = path;
+        buffer_size_env_.Set("16");
+        ring_entries_env_.Set("4");
         ASSERT_TRUE(adapter_.Init(directory_));
     }
 
@@ -285,23 +288,27 @@ class Hf3fsBatchTest : public ::testing::Test {
 };
 
 TEST_F(Hf3fsBatchTest, DefaultResourceSizes) {
+    buffer_size_env_.Clear();
+    ring_entries_env_.Clear();
+    ASSERT_TRUE(adapter_.Init(directory_));
     std::string data = "default";
     iovec iov{data.data(), data.size()};
     FdIoRequest request{Open(), &iov, 1, 0};
     CheckSuccess(adapter_.BatchWriteAt({&request, 1}), 1, data.size());
-    EXPECT_EQ(fake.requested_buffer_sizes, (std::vector<size_t>{32 << 20}));
+    EXPECT_EQ(fake.requested_buffer_sizes, (std::vector<size_t>{512 << 20}));
     EXPECT_EQ(fake.requested_ring_entries, (std::vector<int>{16, 16}));
 }
 
 TEST_F(Hf3fsBatchTest, ConfiguredSizesApplyToBothRingsAndBatchChunking) {
+    fake.buffer_size = 96;
     buffer_size_env_.Set("48");
     ring_entries_env_.Set("2");
     ASSERT_TRUE(adapter_.Init(directory_));
     // Configuration is captured at Init, before lazy thread allocation.
     buffer_size_env_.Set("32");
     ring_entries_env_.Set("1");
-    std::array<std::string, 3> data{std::string(41, 'a'), std::string(41, 'b'),
-                                    std::string(41, 'c')};
+    std::array<std::string, 3> data{
+        std::string(101, 'a'), std::string(101, 'b'), std::string(101, 'c')};
     const auto expected = data;
     std::array<iovec, 3> iovs;
     std::array<FdIoRequest, 3> requests;
@@ -309,15 +316,83 @@ TEST_F(Hf3fsBatchTest, ConfiguredSizesApplyToBothRingsAndBatchChunking) {
         iovs[i] = {data[i].data(), data[i].size()};
         requests[i] = {Open(), &iovs[i], 1, 0};
     }
-    CheckSuccess(adapter_.BatchWriteAt(requests), 3, 41);
-    EXPECT_EQ(fake.requested_buffer_sizes, (std::vector<size_t>{48}));
+    CheckSuccess(adapter_.BatchWriteAt(requests), 3, 101);
+    EXPECT_EQ(fake.requested_buffer_sizes, (std::vector<size_t>{96}));
     EXPECT_EQ(fake.requested_ring_entries, (std::vector<int>{2, 2}));
     EXPECT_EQ(fake.max_outstanding, 2);
-    EXPECT_EQ(fake.prepared_lengths.front(), 24);
+    EXPECT_EQ(fake.prepared_lengths.front(), 48);
+    // Every chunk must retain the per-entry limit.
+    EXPECT_EQ(*std::max_element(fake.prepared_lengths.begin(),
+                                fake.prepared_lengths.end()),
+              48);
     EXPECT_GT(fake.submissions.size(), 2);
     for (auto& value : data) std::fill(value.begin(), value.end(), '?');
-    CheckSuccess(adapter_.BatchReadAt(requests), 3, 41);
+    CheckSuccess(adapter_.BatchReadAt(requests), 3, 101);
     EXPECT_EQ(data, expected);
+}
+
+TEST_F(Hf3fsBatchTest, RingSizeScalesAllocationWithoutShrinkingSlices) {
+    char data[17] = {};
+    iovec iov{data, sizeof(data)};
+    std::array<FdIoRequest, 4> requests;
+    for (auto& request : requests) request = {Open(), &iov, 1, 0};
+    for (const int entries : {1, 2, 4}) {
+        SCOPED_TRACE(entries);
+        buffer_size_env_.Set("8");
+        ring_entries_env_.Set(std::to_string(entries).c_str());
+        ASSERT_TRUE(adapter_.Init(directory_));
+        fake.max_outstanding = 0;
+        fake.prepared_lengths.clear();
+        CheckSuccess(adapter_.BatchWriteAt(requests), 4, sizeof(data));
+        EXPECT_EQ(fake.requested_buffer_sizes.back(), 8 * entries);
+        EXPECT_EQ(fake.max_outstanding, entries);
+        EXPECT_EQ(*std::max_element(fake.prepared_lengths.begin(),
+                                    fake.prepared_lengths.end()),
+                  8);
+    }
+}
+
+TEST_F(Hf3fsBatchTest, SingleRequestUsesOneStagingSlice) {
+    std::string data(55, 'S');
+    iovec iov{data.data(), data.size()};
+    const FdIoRequest request{Open(), &iov, 1, 0};
+    CheckSuccess(adapter_.BatchWriteAt({&request, 1}), 1, data.size());
+    EXPECT_EQ(fake.prepared_lengths, (std::vector<size_t>{16, 16, 16, 7}));
+    fake.prepared_lengths.clear();
+    std::fill(data.begin(), data.end(), '?');
+    CheckSuccess(adapter_.BatchReadAt({&request, 1}), 1, data.size());
+    EXPECT_EQ(fake.prepared_lengths, (std::vector<size_t>{16, 16, 16, 7}));
+    EXPECT_EQ(data, std::string(55, 'S'));
+}
+
+TEST_F(Hf3fsBatchTest, RejectsOversizedStagingPoolBeforeAllocation) {
+    const auto maximum =
+        static_cast<size_t>(std::numeric_limits<ptrdiff_t>::max());
+    buffer_size_env_.Set(std::to_string(maximum / 4 + 1).c_str());
+    auto result = adapter_.Init(directory_);
+    ASSERT_FALSE(result);
+    EXPECT_TRUE(result.error() == ErrorCode::INVALID_PARAMS);
+    buffer_size_env_.Set(std::to_string(maximum / 4).c_str());
+    EXPECT_TRUE(adapter_.Init(directory_));
+
+    // The resource manager must also reject unsafe direct configurations.
+    USRBIOResourceManager manager;
+    Hf3fsConfig config;
+    config.iov_size = maximum / 4 + 1;
+    config.ior_entries = 4;
+    EXPECT_EQ(manager.getThreadResource(config), nullptr);
+    config.iov_size = std::numeric_limits<size_t>::max();
+    EXPECT_EQ(manager.getThreadResource(config), nullptr);
+    config.iov_size = 1;
+    config.ior_entries = 0;
+    EXPECT_EQ(manager.getThreadResource(config), nullptr);
+    config.ior_entries = std::numeric_limits<int>::max();
+    EXPECT_EQ(manager.getThreadResource(config), nullptr);
+    config.ior_entries = 1;
+    config.iov_size = 0;
+    EXPECT_EQ(manager.getThreadResource(config), nullptr);
+    EXPECT_TRUE(fake.requested_buffer_sizes.empty());
+    EXPECT_EQ(fake.rings_created, 0);
 }
 
 TEST_F(Hf3fsBatchTest, InvalidResourceSizesFailInitialization) {

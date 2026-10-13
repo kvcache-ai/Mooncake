@@ -20,7 +20,7 @@ thread's rings and staging buffer before another call can reuse them.
 
 The `hf3fs_adapter_batch_test` unit test uses a fake USRBIO API and needs no
 mounted cluster. `dfs_hf3fs_test` exercises the real API, including batches that
-exceed the ring and staging-buffer capacities, using `MOONCAKE_DFS_ROOT_DIR`
+exceed the ring and per-entry buffer capacities, using `MOONCAKE_DFS_ROOT_DIR`
 (default: `/mnt/3fs/mooncake_test`). Both targets are built with `USE_3FS=ON`.
 
 ## Prerequisites
@@ -50,18 +50,22 @@ initialization:
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `MOONCAKE_HF3FS_IOV_SIZE` | `33554432` (32 MiB) | Shared staging buffer size in bytes per I/O thread |
+| `MOONCAKE_HF3FS_IOV_SIZE` | `33554432` (32 MiB) | Staging buffer size in bytes per ring entry |
 | `MOONCAKE_HF3FS_IOR_ENTRIES` | `16` | Requested entries in each thread's read and write ring |
 
-For example, configure a 64 MiB buffer and 32 entries per ring before starting
-a process that uses the adapter:
+Each I/O thread allocates one shared staging buffer of
+`MOONCAKE_HF3FS_IOR_ENTRIES * MOONCAKE_HF3FS_IOV_SIZE` bytes for its read and
+write rings. The defaults allocate `16 * 32 MiB = 512 MiB` per thread.
+
+For example, configure 64 MiB per entry and 32 entries per ring (2 GiB of
+staging memory per thread) before starting a process that uses the adapter:
 
 ```bash
 export MOONCAKE_HF3FS_IOV_SIZE=67108864
 export MOONCAKE_HF3FS_IOR_ENTRIES=32
 ```
 
-Values must be positive decimal integers. The buffer size must fit in
+Values must be positive decimal integers. The product of the two settings must fit in
 `ptrdiff_t`, and ring entries must be less than `INT_MAX` because 3FS reserves
 one additional internal slot. Empty, malformed, zero, negative, or out-of-range
 values fail adapter initialization. Resource allocation can still fail when
@@ -70,9 +74,10 @@ the configured sizes exceed available shared memory or 3FS limits.
 These are process-local tuning settings and may differ between clients and the
 master. Thread resources are allocated lazily on first I/O and retain the
 settings captured at initialization. Restart the process to apply changes.
-Staging memory scales with the number of I/O threads. Batches divide the actual
-buffer among active requests up to the ring capacity; increasing ring entries
-without increasing the buffer reduces each request's staging slice.
+Staging memory scales with both the ring entry count and the number of I/O
+threads. Each active request uses a separate slice of up to
+`MOONCAKE_HF3FS_IOV_SIZE` bytes; larger requests use multiple waves. Increasing
+ring entries increases total staging memory and preserves the per-entry size.
 
 ## Usage
 

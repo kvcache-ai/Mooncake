@@ -61,6 +61,14 @@ tl::expected<void, ErrorCode> Hf3fsAdapter::Init(
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     config.ior_entries = static_cast<size_t>(ring_entries);
+    if (config.iov_size >
+        static_cast<size_t>(std::numeric_limits<ptrdiff_t>::max()) /
+            config.ior_entries) {
+        LOG(ERROR)
+            << "3FS staging buffer size (IOV_SIZE * IOR_ENTRIES) must fit "
+               "in ptrdiff_t";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
     char hf3fs_mount_point[PATH_MAX] = {};
     int ret = hf3fs_extract_mount_point(
         hf3fs_mount_point, sizeof(hf3fs_mount_point), mount_path.c_str());
@@ -597,8 +605,10 @@ std::vector<tl::expected<size_t, ErrorCode>> Hf3fsAdapter::BatchIo(
 
     // A slot owns its staging slice until its CQE is reaped. Limit each logical
     // request to one chunk per wave so a short transfer cannot submit its tail.
+    const size_t slot_size = std::min(resource->config_.iov_size, iov.size);
     const size_t slot_count =
-        std::min({pending.size(), static_cast<size_t>(entries), iov.size});
+        std::min({pending.size(), static_cast<size_t>(entries),
+                  resource->config_.ior_entries, iov.size / slot_size});
     struct Chunk {
         size_t request = 0;
         uint8_t* buffer = nullptr;
@@ -609,9 +619,7 @@ std::vector<tl::expected<size_t, ErrorCode>> Hf3fsAdapter::BatchIo(
     std::vector<Chunk> chunks(slot_count);
     std::vector<hf3fs_cqe> cqes(slot_count);
     while (!pending.empty()) {
-        // Give the remaining requests larger slices as their peers finish.
         const size_t wave_slots = std::min(slot_count, pending.size());
-        const size_t slot_size = iov.size / wave_slots;
         size_t prepared = 0;
         while (!pending.empty() && prepared < wave_slots) {
             const size_t i = pending.front();

@@ -171,7 +171,7 @@ TEST_F(Hf3fsAdapterTest, WriteAtReadAtThroughUsrbio) {
     EXPECT_TRUE(adapter.Shutdown().has_value());
 }
 
-TEST_F(Hf3fsAdapterTest, BatchIoAcrossRingAndSharedBufferCapacity) {
+TEST_F(Hf3fsAdapterTest, BatchIoAcrossRingAndPerEntryBufferCapacity) {
     Hf3fsAdapter adapter;
     ASSERT_TRUE(adapter.Init(test_dir_->path()));
     const Hf3fsConfig config;
