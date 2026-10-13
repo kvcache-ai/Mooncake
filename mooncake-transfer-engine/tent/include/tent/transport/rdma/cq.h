@@ -44,7 +44,8 @@ class RdmaCQ {
     // ibv_post_send to HW. if there are no available CQEs, the function returns
     // false.
     //
-    // TODO handling work requests without IBV_SEND_SIGNALED
+    // Unsignaled work requests do not consume CQE quota; a later signaled
+    // completion resolves their posting-order prefix.
     bool reserveQuota(int num_entries = 1);
 
     void cancelQuota(int num_entries);

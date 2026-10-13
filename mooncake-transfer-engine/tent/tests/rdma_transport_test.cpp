@@ -149,6 +149,10 @@ class RdmaTransportTestPeer {
         transport.params_->workers.num_workers = num_workers;
     }
 
+    static std::shared_ptr<RdmaParams>& params(RdmaTransport& transport) {
+        return transport.params_;
+    }
+
     static Workers& prepareMetadataLifetime(RdmaTransport& transport) {
         transport.params_->workers.num_workers = 1;
         transport.params_->workers.block_size = kMetadataLifetimeBlockSize;
@@ -193,11 +197,21 @@ class RdmaTransportTestPeer {
         workers.notePostedSlice(slice);
     }
 
+    static void pollCompletions(Workers& workers, int worker_id) {
+        const int previous_worker_id = tl_wid;
+        tl_wid = worker_id;
+        workers.asyncPollCq();
+        tl_wid = previous_worker_id;
+    }
+
     static void handleCompletion(Workers& workers,
                                  Workers::WorkerContext& worker,
                                  RdmaContext& context, const ibv_wc& wc,
-                                 uint64_t poll_ts, bool last_in_pass = true) {
-        workers.handleCompletion(worker, context, wc, poll_ts, last_in_pass);
+                                 uint64_t poll_ts, bool last_in_pass = true,
+                                 bool queue_already_drained = false,
+                                 bool completion_owed = true) {
+        workers.handleCompletion(worker, context, wc, poll_ts, last_in_pass,
+                                 queue_already_drained, completion_owed);
     }
 
     static void markPosted(Workers& workers, Workers::WorkerContext& worker,
@@ -350,15 +364,16 @@ class RdmaEndPointTestPeer {
     }
 
     static void pretendPosted(const std::shared_ptr<RdmaEndPoint>& endpoint,
-                              int qp_index, RdmaSlice* slice) {
-        ASSERT_TRUE(endpoint->reserveQuota(qp_index, 1));
+                              int qp_index, RdmaSlice* slice,
+                              bool signaled = true) {
+        slice->completion_signaled = signaled;
+        ASSERT_TRUE(endpoint->reserveQuota(qp_index, 1, signaled ? 1 : 0));
         slice->qp_index = qp_index;
         slice->ep_weak_ptr = endpoint;
         std::lock_guard<TicketLock> guard(endpoint->queue_lock_list_[qp_index]);
         endpoint->slice_queue_[qp_index].push(slice);
-        // submitSlices() counts the completion the post owes; a stand-in that
-        // skipped it would leave the slice looking settled.
-        slice->completions_owed.fetch_add(1, std::memory_order_acq_rel);
+        if (signaled)
+            slice->completions_owed.fetch_add(1, std::memory_order_acq_rel);
     }
     static void markReady(const std::shared_ptr<RdmaEndPoint>& endpoint) {
         endpoint->status_.store(RdmaEndPoint::EP_READY,
@@ -367,6 +382,10 @@ class RdmaEndPointTestPeer {
     static bool queueEmpty(const std::shared_ptr<RdmaEndPoint>& endpoint,
                            int qp_index) {
         return endpoint->slice_queue_[qp_index].empty();
+    }
+    static size_t queueSize(const std::shared_ptr<RdmaEndPoint>& endpoint,
+                            int qp_index) {
+        return endpoint->slice_queue_[qp_index].count;
     }
     static int wrDepth(const std::shared_ptr<RdmaEndPoint>& endpoint,
                        int qp_index) {
@@ -2782,6 +2801,8 @@ class RdmaWorkersSharedQpTest : public ::testing::Test {
         ibv_cq cq{};
         ibv_qp qp[8]{};
         int next_qp = 0;
+        int post_send_rc = 0;
+        bool post_send_sets_bad_wr = false;
         ibv_mr mr{};
     };
     static FakeState fake;
@@ -2789,6 +2810,8 @@ class RdmaWorkersSharedQpTest : public ::testing::Test {
     // request it is handed, so a poller can replay completions in that order.
     static std::mutex post_mutex;
     static std::vector<RdmaSlice*> post_order;
+    static std::vector<int> post_flags;
+    static std::vector<ibv_wc> cq_completions;
 
     static ibv_cq* createCq(ibv_context*, int, void*, ibv_comp_channel*, int) {
         return &fake.cq;
@@ -2801,12 +2824,26 @@ class RdmaWorkersSharedQpTest : public ::testing::Test {
     static int modifyQp(ibv_qp*, ibv_qp_attr*, int) { return 0; }
     static ibv_mr* regMr(ibv_pd*, void*, size_t, int) { return &fake.mr; }
     static int deregMr(ibv_mr*) { return 0; }
+    static int pollCq(ibv_cq*, int num_entries, ibv_wc* wc) {
+        const int count = std::min(num_entries, (int)cq_completions.size());
+        std::copy_n(cq_completions.begin(), count, wc);
+        cq_completions.erase(cq_completions.begin(),
+                             cq_completions.begin() + count);
+        return count;
+    }
+
     // ibv_post_send is an inline over qp->context->ops, so a fake context
     // with this op lets submitSlices run for real against the fake QPs.
     static int postSend(ibv_qp*, ibv_send_wr* wr, ibv_send_wr** bad_wr) {
         std::lock_guard<std::mutex> guard(post_mutex);
-        for (auto* w = wr; w; w = w->next)
+        if (fake.post_send_rc) {
+            *bad_wr = fake.post_send_sets_bad_wr ? wr : nullptr;
+            return fake.post_send_rc;
+        }
+        for (auto* w = wr; w; w = w->next) {
             post_order.push_back(reinterpret_cast<RdmaSlice*>(w->wr_id));
+            post_flags.push_back(w->send_flags);
+        }
         *bad_wr = nullptr;
         return 0;
     }
@@ -2816,9 +2853,13 @@ class RdmaWorkersSharedQpTest : public ::testing::Test {
         {
             std::lock_guard<std::mutex> guard(post_mutex);
             post_order.clear();
+            post_flags.clear();
+            cq_completions.clear();
         }
         fake.native.num_comp_vectors = 1;
+        fake.native.ops.poll_cq = pollCq;
         fake.native.ops.post_send = postSend;
+        fake.cq.context = &fake.native;
         for (auto& qp : fake.qp) qp.context = &fake.native;
 
         auto topology = std::make_shared<Topology>();
@@ -2877,6 +2918,7 @@ class RdmaWorkersSharedQpTest : public ::testing::Test {
         // quota through the context's completion queue, which
         // unbindResources takes away below.
         endpoint_.reset();
+        tl_wid = -1;
         for (auto* slice : slices_) RdmaSliceStorage::Get().deallocate(slice);
         for (auto* task : tasks_) task->deref();
         if (workers_) RdmaTransportTestPeer::destroyWorkerContexts(*workers_);
@@ -2907,7 +2949,7 @@ class RdmaWorkersSharedQpTest : public ::testing::Test {
 
     // A slice charged to the NIC, owned by `lane`, and posted on the shared
     // queue pair.
-    RdmaSlice* postSlice(int lane, uint64_t enqueue_ts) {
+    RdmaSlice* postSlice(int lane, uint64_t enqueue_ts, bool signaled = true) {
         auto* task = RdmaTaskStorage::Get().allocate();
         task->num_slices = 1;
         task->status_word = PENDING;
@@ -2930,7 +2972,7 @@ class RdmaWorkersSharedQpTest : public ::testing::Test {
         ctx.inflight_slices.fetch_add(1);
         // Posted straight away, as the hook inside submitSlices does it.
         RdmaTransportTestPeer::markPosted(*workers_, ctx, slice, enqueue_ts);
-        RdmaEndPointTestPeer::pretendPosted(endpoint_, 0, slice);
+        RdmaEndPointTestPeer::pretendPosted(endpoint_, 0, slice, signaled);
         tasks_.push_back(task);
         slices_.push_back(slice);
         return slice;
@@ -2938,13 +2980,16 @@ class RdmaWorkersSharedQpTest : public ::testing::Test {
 
     // Drive one completion for `slice` through lane 0's poll path.
     void completeWith(RdmaSlice* slice, ibv_wc_status status,
-                      uint64_t poll_ts = 1'000'000) {
+                      uint64_t poll_ts = 1'000'000,
+                      bool queue_already_drained = false,
+                      bool completion_owed = true) {
         ibv_wc wc{};
         wc.wr_id = reinterpret_cast<uint64_t>(slice);
         wc.status = status;
         RdmaTransportTestPeer::handleCompletion(
             *workers_, RdmaTransportTestPeer::workerContext(*workers_, 0),
-            *context_, wc, poll_ts);
+            *context_, wc, poll_ts, true, queue_already_drained,
+            completion_owed);
     }
 
     // What asyncPostSend does with a re-queued slice on its next pass, minus
@@ -2976,6 +3021,8 @@ class RdmaWorkersSharedQpTest : public ::testing::Test {
 RdmaWorkersSharedQpTest::FakeState RdmaWorkersSharedQpTest::fake;
 std::mutex RdmaWorkersSharedQpTest::post_mutex;
 std::vector<RdmaSlice*> RdmaWorkersSharedQpTest::post_order;
+std::vector<int> RdmaWorkersSharedQpTest::post_flags;
+std::vector<ibv_wc> RdmaWorkersSharedQpTest::cq_completions;
 
 TEST_F(RdmaWorkersSharedQpTest, EndpointPinsConstructionAddressGeneration) {
     const auto endpoint_address =
@@ -2994,6 +3041,71 @@ TEST_F(RdmaWorkersSharedQpTest, EndpointPinsConstructionAddressGeneration) {
     EXPECT_EQ(pinned.gid, endpoint_address.gid);
     EXPECT_EQ(pinned.gid_index, endpoint_address.gid_index);
     EXPECT_NE(context_->address().gid, pinned.gid);
+}
+
+TEST_F(RdmaWorkersSharedQpTest,
+       SelectiveSignalingMarksPeriodicWrAndPostedChainTail) {
+    params_->endpoint.signal_interval = 3;
+    RdmaEndPointTestPeer::markReady(endpoint_);
+    std::vector<RdmaSlice*> slices;
+    for (int index = 0; index < 5; ++index) slices.push_back(makeSlice());
+
+    ASSERT_EQ(endpoint_->submitSlices(slices, /*qp_index=*/0, nullptr), 5);
+    ASSERT_EQ(post_flags.size(), slices.size());
+    EXPECT_EQ(post_flags[0] & IBV_SEND_SIGNALED, 0);
+    EXPECT_EQ(post_flags[1] & IBV_SEND_SIGNALED, 0);
+    EXPECT_NE(post_flags[2] & IBV_SEND_SIGNALED, 0);
+    EXPECT_EQ(post_flags[3] & IBV_SEND_SIGNALED, 0);
+    EXPECT_NE(post_flags[4] & IBV_SEND_SIGNALED, 0);
+    EXPECT_EQ(slices[0]->completions_owed.load(), 0);
+    EXPECT_EQ(slices[1]->completions_owed.load(), 0);
+    EXPECT_EQ(slices[2]->completions_owed.load(), 1);
+    EXPECT_EQ(slices[3]->completions_owed.load(), 0);
+    EXPECT_EQ(slices[4]->completions_owed.load(), 1);
+    EXPECT_EQ(cq_.getQuota(), 2);
+}
+
+TEST_F(RdmaWorkersSharedQpTest,
+       PostFailureWithoutBadWrReleasesAllReservedQuota) {
+    params_->endpoint.signal_interval = 3;
+    fake.post_send_rc = EIO;
+    RdmaEndPointTestPeer::markReady(endpoint_);
+    std::vector<RdmaSlice*> slices;
+    for (int index = 0; index < 5; ++index) slices.push_back(makeSlice());
+
+    EXPECT_EQ(endpoint_->submitSlices(slices, /*qp_index=*/0, nullptr),
+              slices.size());
+    for (auto* slice : slices) EXPECT_TRUE(slice->failed);
+    EXPECT_EQ(RdmaEndPointTestPeer::queueSize(endpoint_, 0), 0u);
+    EXPECT_EQ(RdmaEndPointTestPeer::wrDepth(endpoint_, 0), 0);
+    EXPECT_EQ(cq_.getQuota(), 0);
+}
+
+TEST_F(RdmaWorkersSharedQpTest,
+       CompletionPrefixReturnsPostingOrderWithoutResolvingSlices) {
+    auto* first = makeSlice();
+    auto* second = makeSlice();
+    auto* third = makeSlice();
+    RdmaEndPointTestPeer::pretendPosted(endpoint_, 0, first);
+    RdmaEndPointTestPeer::pretendPosted(endpoint_, 0, second);
+    RdmaEndPointTestPeer::pretendPosted(endpoint_, 0, third);
+    ASSERT_EQ(RdmaEndPointTestPeer::queueSize(endpoint_, 0), 3u);
+    ASSERT_EQ(cq_.getQuota(), 3);
+
+    std::vector<RdmaSlice*> prefix;
+    ASSERT_TRUE(endpoint_->collectCompletionPrefix(third, prefix));
+
+    ASSERT_EQ(prefix.size(), 3u);
+    EXPECT_EQ(cq_.getQuota(), 0);
+    EXPECT_EQ(prefix[0], first);
+    EXPECT_EQ(prefix[1], second);
+    EXPECT_EQ(prefix[2], third);
+    EXPECT_EQ(RdmaEndPointTestPeer::wrDepth(endpoint_, 0), 0);
+    EXPECT_EQ(cq_.getQuota(), 0);
+    for (auto* slice : prefix) {
+        EXPECT_EQ(slice->word, PENDING);
+        EXPECT_EQ(slice->completions_owed.fetch_sub(1), 1);
+    }
 }
 
 TEST_F(RdmaWorkersSharedQpTest, TimeoutSweepGivesTheOtherLaneItsSliceBack) {
@@ -3042,6 +3154,7 @@ TEST_F(RdmaWorkersSharedQpTest, TeardownLeftoversAreReclaimedByTheirLane) {
     ASSERT_EQ(selector_->getPostedBytes(kDev), 2 * kLen);
 
     ASSERT_EQ(endpoint_->deconstruct(), 0);
+    EXPECT_EQ(cq_.getQuota(), 0);
     ASSERT_EQ(ours->word, CANCELED);
     ASSERT_EQ(theirs->word, CANCELED);
 
@@ -3134,6 +3247,94 @@ TEST_F(RdmaWorkersSharedQpTest, CompletionSweepKeepsTheMeterInterval) {
     completeWith(third, IBV_WC_SUCCESS, kPosted + 3 * kLen);
 
     EXPECT_NEAR(selector_->getTransmitBandwidth(kDev), 1e9, 1.0);
+}
+
+TEST_F(RdmaWorkersSharedQpTest,
+       SelectiveCompletionResolvesPrefixBeforeSignaledTail) {
+    auto* first = postSlice(/*lane=*/0, /*enqueue_ts=*/1'000'000,
+                            /*signaled=*/false);
+    auto* second = postSlice(/*lane=*/0, /*enqueue_ts=*/1'000'000,
+                             /*signaled=*/false);
+    auto* tail = postSlice(/*lane=*/0, /*enqueue_ts=*/1'000'000,
+                           /*signaled=*/true);
+    ASSERT_EQ(RdmaEndPointTestPeer::queueSize(endpoint_, 0), 3u);
+
+    std::vector<RdmaSlice*> prefix;
+    ASSERT_TRUE(endpoint_->collectCompletionPrefix(tail, prefix));
+    ASSERT_EQ(prefix.size(), 3u);
+    EXPECT_EQ(cq_.getQuota(), 0);
+    ASSERT_EQ(RdmaEndPointTestPeer::queueSize(endpoint_, 0), 0u);
+
+    completeWith(first, IBV_WC_SUCCESS, 2'000'000,
+                 /*queue_already_drained=*/true,
+                 /*completion_owed=*/false);
+    completeWith(second, IBV_WC_SUCCESS, 2'000'000,
+                 /*queue_already_drained=*/true,
+                 /*completion_owed=*/false);
+    completeWith(tail, IBV_WC_SUCCESS, 2'000'000,
+                 /*queue_already_drained=*/true);
+
+    EXPECT_EQ(first->word, COMPLETED);
+    EXPECT_EQ(second->word, COMPLETED);
+    EXPECT_EQ(tail->word, COMPLETED);
+    EXPECT_EQ(RdmaTransportTestPeer::workerContext(*workers_, 0)
+                  .inflight_slices.load(),
+              0);
+    EXPECT_EQ(selector_->getPostedBytes(kDev), 0u);
+}
+
+TEST_F(RdmaWorkersSharedQpTest,
+       PollPathPropagatesNonFlushErrorToCompletionPrefix) {
+    RdmaTransportTestPeer::params(transport_)->endpoint.signal_interval = 3;
+    RdmaTransportTestPeer::params(transport_)->workers.max_retry_count = 1;
+    const uint64_t now = getCurrentTimeInNano();
+    auto* first = postSlice(/*lane=*/0, now, /*signaled=*/false);
+    auto* second = postSlice(/*lane=*/0, now, /*signaled=*/false);
+    auto* tail = postSlice(/*lane=*/0, now, /*signaled=*/true);
+    ibv_wc wc{};
+    wc.wr_id = reinterpret_cast<uint64_t>(tail);
+    wc.status = IBV_WC_RETRY_EXC_ERR;
+    cq_completions.push_back(wc);
+
+    RdmaTransportTestPeer::setSliceTimeout(*workers_, UINT64_MAX);
+    RdmaTransportTestPeer::pollCompletions(*workers_, /*worker_id=*/0);
+
+    EXPECT_EQ(first->word, FAILED);
+    EXPECT_EQ(second->word, FAILED);
+    EXPECT_EQ(tail->word, FAILED);
+    EXPECT_TRUE(RdmaEndPointTestPeer::queueEmpty(endpoint_, 0));
+    EXPECT_EQ(cq_.getQuota(), 0);
+}
+
+TEST_F(RdmaWorkersSharedQpTest,
+       SelectiveCompletionKeepsNonFlushErrorOnSignaledTail) {
+    RdmaTransportTestPeer::params(transport_)->workers.max_retry_count = 1;
+    auto* first = postSlice(/*lane=*/0, /*enqueue_ts=*/1'000'000,
+                            /*signaled=*/false);
+    auto* second = postSlice(/*lane=*/0, /*enqueue_ts=*/1'000'000,
+                             /*signaled=*/false);
+    auto* tail = postSlice(/*lane=*/0, /*enqueue_ts=*/1'000'000,
+                           /*signaled=*/true);
+    std::vector<RdmaSlice*> prefix;
+    ASSERT_TRUE(endpoint_->collectCompletionPrefix(tail, prefix));
+    ASSERT_EQ(prefix.size(), 3u);
+
+    completeWith(first, IBV_WC_SUCCESS, 2'000'000,
+                 /*queue_already_drained=*/true,
+                 /*completion_owed=*/false);
+    completeWith(second, IBV_WC_SUCCESS, 2'000'000,
+                 /*queue_already_drained=*/true,
+                 /*completion_owed=*/false);
+    completeWith(tail, IBV_WC_RETRY_EXC_ERR, 2'000'000,
+                 /*queue_already_drained=*/true);
+
+    EXPECT_EQ(first->word, COMPLETED);
+    EXPECT_EQ(second->word, COMPLETED);
+    EXPECT_EQ(tail->word, FAILED);
+    EXPECT_EQ(RdmaTransportTestPeer::workerContext(*workers_, 0)
+                  .inflight_slices.load(),
+              0);
+    EXPECT_EQ(selector_->getPostedBytes(kDev), 0u);
 }
 
 // Same retry, on the layout this fixture exists for: lane 1 enqueued the

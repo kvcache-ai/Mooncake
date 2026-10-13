@@ -997,7 +997,8 @@ void Workers::expireTimedOutSlices(WorkerContext& worker, uint64_t now_ns) {
 
 void Workers::handleCompletion(WorkerContext& worker, RdmaContext& context,
                                const ibv_wc& wc, uint64_t poll_ts,
-                               bool last_in_pass) {
+                               bool last_in_pass, bool queue_already_drained,
+                               bool completion_owed) {
     auto slice = (RdmaSlice*)wc.wr_id;
     // The completion this post owed, paid back only once this handler is
     // done with the slice. Paying it on entry is not enough: acknowledge()
@@ -1008,10 +1009,12 @@ void Workers::handleCompletion(WorkerContext& worker, RdmaContext& context,
     // there.
     struct CompletionPaid {
         RdmaSlice* slice;
+        bool owed;
         ~CompletionPaid() {
-            slice->completions_owed.fetch_sub(1, std::memory_order_acq_rel);
+            if (owed)
+                slice->completions_owed.fetch_sub(1, std::memory_order_acq_rel);
         }
-    } completion_paid{slice};
+    } completion_paid{slice, completion_owed};
     // What the acknowledge callbacks below need, behind one reference so
     // the std::function stays in its small-buffer storage (no allocation
     // per completion).
@@ -1112,18 +1115,27 @@ void Workers::handleCompletion(WorkerContext& worker, RdmaContext& context,
             transport_->params_->workers.max_retry_count) {
             LOG(WARNING) << "Slice " << slice
                          << " failed: retry count exceeded";
-            ep->acknowledge(slice, FAILED, [&sweep](RdmaSlice* swept) {
-                sweep.self->retireSweptSlice(*sweep.worker, swept, sweep.now_ns,
-                                             nullptr);
-            });
+            if (queue_already_drained) {
+                retireSweptSlice(worker, slice, poll_ts, nullptr);
+                updateSliceStatus(slice, FAILED);
+            } else {
+                ep->acknowledge(slice, FAILED, [&sweep](RdmaSlice* swept) {
+                    sweep.self->retireSweptSlice(*sweep.worker, swept,
+                                                 sweep.now_ns, nullptr);
+                });
+            }
             disableEndpoint(slice);
         } else {
             // Popped but still in flight: their work requests are
             // live and their completions are still coming, so only
             // the owning lane's count stops tracking them here.
-            ep->acknowledge(slice, PENDING, [&](RdmaSlice* swept) {
-                discountFromOwner(worker, swept);
-            });
+            if (queue_already_drained) {
+                discountFromOwner(worker, slice);
+            } else {
+                ep->acknowledge(slice, PENDING, [&](RdmaSlice* swept) {
+                    discountFromOwner(worker, swept);
+                });
+            }
             disableEndpoint(slice);
             if (slice->task->cancel_requested.load(std::memory_order_acquire)) {
                 updateSliceStatus(slice, CANCELED);
@@ -1132,10 +1144,17 @@ void Workers::handleCompletion(WorkerContext& worker, RdmaContext& context,
             }
         }
     } else {
-        ep->acknowledge(slice, COMPLETED, [&sweep](RdmaSlice* swept) {
-            sweep.self->retireSweptSlice(*sweep.worker, swept, sweep.now_ns,
-                                         nullptr, /*bytes_moved=*/true);
-        });
+        if (queue_already_drained) {
+            retireSweptSlice(worker, slice, poll_ts, nullptr,
+                             /*bytes_moved=*/true);
+            updateSliceStatus(slice, COMPLETED);
+        } else {
+            ep->acknowledge(slice, COMPLETED, [&sweep](RdmaSlice* swept) {
+                sweep.self->retireSweptSlice(*sweep.worker, swept, sweep.now_ns,
+                                             nullptr,
+                                             /*bytes_moved=*/true);
+            });
+        }
         // A successful GPU transfer re-admits any learned GDR
         // unreachability for the (GPU, NIC) pair(s) it used, so a
         // transient exclusion (or a recovered path) heals. Skipped
@@ -1182,9 +1201,40 @@ void Workers::asyncPollCq() {
         int nr_poll = cq->poll(kPollCount, wc);
         if (nr_poll < 0) continue;
         auto poll_ts = getCurrentTimeInNano();
-        for (int i = 0; i < nr_poll; ++i)
-            handleCompletion(worker, *context, wc[i], poll_ts,
-                             i + 1 == nr_poll);
+        thread_local std::vector<RdmaSlice*> completion_prefix;
+        if (completion_prefix.capacity() <
+            static_cast<size_t>(transport_->params_->endpoint.max_qp_wr))
+            completion_prefix.reserve(transport_->params_->endpoint.max_qp_wr);
+        for (int i = 0; i < nr_poll; ++i) {
+            const auto& raw = wc[i];
+            if (transport_->params_->endpoint.signal_interval <= 1 ||
+                raw.status == IBV_WC_WR_FLUSH_ERR) {
+                handleCompletion(worker, *context, raw, poll_ts,
+                                 i + 1 == nr_poll);
+                continue;
+            }
+
+            auto* tail = reinterpret_cast<RdmaSlice*>(raw.wr_id);
+            auto ep = tail ? tail->ep_weak_ptr.lock() : nullptr;
+            if (!ep || !ep->collectCompletionPrefix(tail, completion_prefix)) {
+                handleCompletion(worker, *context, raw, poll_ts,
+                                 i + 1 == nr_poll);
+                continue;
+            }
+            for (size_t index = 0; index < completion_prefix.size(); ++index) {
+                auto logical = raw;
+                logical.wr_id =
+                    reinterpret_cast<uint64_t>(completion_prefix[index]);
+                if (raw.status != IBV_WC_SUCCESS)
+                    logical.status = raw.status;
+                else if (index + 1 != completion_prefix.size())
+                    logical.status = IBV_WC_SUCCESS;
+                handleCompletion(
+                    worker, *context, logical, poll_ts,
+                    i + 1 == nr_poll && index + 1 == completion_prefix.size(),
+                    true, index + 1 == completion_prefix.size());
+            }
+        }
     }
 }
 

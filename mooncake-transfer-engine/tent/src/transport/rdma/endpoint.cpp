@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iomanip>
+#include <limits>
 #include <mutex>
 #include <queue>
 #include <sstream>
@@ -124,6 +125,7 @@ int RdmaEndPoint::construct(RdmaContext* context, EndPointParams* params,
     // prefix of QPs has been created.
     wr_depth_list_ = new WrDepthBlock[total_qp]();
     queue_lock_list_ = new TicketLock[total_qp];
+    recv_cqe_counts_.assign(total_qp, 0);
 
     for (int i = 0; i < total_qp; ++i) {
         wr_depth_list_[i].value.store(0, std::memory_order_relaxed);
@@ -226,6 +228,15 @@ int RdmaEndPoint::deconstructUnlocked() {
     auto current_status = status_.load(std::memory_order_relaxed);
     // Idempotent, including delayed destruction through an external shared_ptr.
     if (current_status == EP_DESTROYED) return 0;
+
+    // Preserve signaled CQE accounting before draining the slice queues.
+    std::vector<size_t> signaled_counts(qp_list_.size());
+    for (size_t i = 0; i < signaled_counts.size(); ++i) {
+        if (i < slice_queue_.size())
+            signaled_counts[i] += slice_queue_[i].signaledCount();
+        if (i < recv_cqe_counts_.size())
+            signaled_counts[i] += recv_cqe_counts_[i];
+    }
     resetInflightSlices();
     peer_qp_num_list_.clear();
 
@@ -285,7 +296,11 @@ int RdmaEndPoint::deconstructUnlocked() {
         if (wr_depth_list_) {
             const int outstanding =
                 wr_depth_list_[i].value.load(std::memory_order_relaxed);
-            if (outstanding != 0) cancelQuota(i, outstanding);
+            if (outstanding != 0) {
+                const int signaled =
+                    i < signaled_counts.size() ? signaled_counts[i] : 0;
+                cancelQuota(i, outstanding, signaled);
+            }
         }
         if (!qp_list_[i]) continue;
         if (context_->verbs_.ibv_destroy_qp(qp_list_[i])) {
@@ -303,6 +318,7 @@ int RdmaEndPoint::deconstructUnlocked() {
         queue_lock_list_ = nullptr;
         delete[] wr_depth_list_;
         wr_depth_list_ = nullptr;
+        recv_cqe_counts_.clear();
     }
 
     if (result == 0 && !notify_qp_ && !notify_recv_mr_ && !notify_send_mr_ &&
@@ -792,14 +808,27 @@ int RdmaEndPoint::submitSlices(std::vector<RdmaSlice*>& slice_list,
     // Check endpoint status before submitting
     if (status_.load(std::memory_order_relaxed) != EP_READY) return 0;
     auto cq = context_->cq(qp_index % context_->cqCount());
+    if (params_->signal_interval <= 0) {
+        LOG(ERROR) << "Invalid RDMA signal interval: "
+                   << params_->signal_interval;
+        return 0;
+    }
+    const int signal_interval = params_->signal_interval;
     int wr_count = std::min(
-        cq->maxCqe() - cq->getQuota(),
-        std::min(params_->max_qp_wr - wr_depth_list_[qp_index].value.load(
-                                          std::memory_order_relaxed),
-                 (int)slice_list.size()));
+        params_->max_qp_wr -
+            wr_depth_list_[qp_index].value.load(std::memory_order_relaxed),
+        (int)slice_list.size());
+    const int available_cqe = cq->maxCqe() - cq->getQuota();
+    if (wr_count <= 0 || available_cqe <= 0) return 0;
+    const int max_wr_for_cq =
+        available_cqe > std::numeric_limits<int>::max() / signal_interval
+            ? std::numeric_limits<int>::max()
+            : available_cqe * signal_interval;
+    wr_count = std::min(wr_count, max_wr_for_cq);
+    const int cqe_count = (wr_count - 1) / signal_interval + 1;
     int sge_count = wr_count * kSgeEntries;
 
-    if (wr_count <= 0 || !reserveQuota(qp_index, wr_count)) return 0;
+    if (!reserveQuota(qp_index, wr_count, cqe_count)) return 0;
 
     std::vector<ibv_send_wr> wr_list(wr_count, ibv_send_wr{});
     std::vector<ibv_sge> sge_list(sge_count);
@@ -824,10 +853,10 @@ int RdmaEndPoint::submitSlices(std::vector<RdmaSlice*>& slice_list,
         wr.opcode = getOpCode(current);
         wr.num_sge = kSgeEntries;
         wr.sg_list = &sge_list[sge_idx];
-        wr.send_flags = IBV_SEND_SIGNALED;
-        // TODO the quota algorithm should be changed as well to keep optimal
-        // allocation
-        // wr.send_flags = (wr_idx + 1 == wr_count) ? IBV_SEND_SIGNALED : 0;
+        const bool periodic = (wr_idx + 1) % signal_interval == 0;
+        const bool chain_tail = wr_idx + 1 == wr_count;
+        current->completion_signaled = periodic || chain_tail;
+        wr.send_flags = current->completion_signaled ? IBV_SEND_SIGNALED : 0;
         wr.next = (wr_idx + 1 == wr_count) ? nullptr : &wr_list[wr_idx + 1];
         wr.imm_data = 0;
         wr.wr.rdma.remote_addr = current->target_addr;
@@ -843,19 +872,24 @@ int RdmaEndPoint::submitSlices(std::vector<RdmaSlice*>& slice_list,
         std::lock_guard<TicketLock> qp_guard(queue_lock_list_[qp_index]);
         rc = ibv_post_send(qp_list_[qp_index], wr_list.data(), &bad_wr);
         if (rc) {
-            while (bad_wr) {
-                slice_list[bad_wr - wr_list.data()]->failed = true;
-                cancelQuota(qp_index, 1);
-                bad_wr = bad_wr->next;
+            // A provider normally returns the first failed WR, but retain no
+            // quota if it cannot identify the boundary: none is known posted.
+            const int first_failed = bad_wr ? bad_wr - wr_list.data() : 0;
+            int failed_cqe = 0;
+            for (int index = first_failed; index < wr_count; ++index) {
+                slice_list[index]->failed = true;
+                if (slice_list[index]->completion_signaled) failed_cqe++;
             }
+            cancelQuota(qp_index, wr_count - first_failed, failed_cqe);
         }
         auto& queue = slice_queue_[qp_index];
         for (int wr_idx = 0; wr_idx < wr_count; ++wr_idx) {
             auto current = slice_list[wr_idx];
             if (current->failed) continue;  // never reached the hardware
             queue.push(current);
-            // One signalled work request, one completion owed.
-            current->completions_owed.fetch_add(1, std::memory_order_acq_rel);
+            if (current->completion_signaled)
+                current->completions_owed.fetch_add(1,
+                                                    std::memory_order_acq_rel);
         }
     }
     if (rc) {
@@ -873,14 +907,16 @@ int RdmaEndPoint::submitRecvImmDataRequest(int qp_index, uint64_t id) {
     ibv_recv_wr wr, *bad_wr;
     memset(&wr, 0, sizeof(ibv_recv_wr));
     wr.wr_id = id;
-    if (!reserveQuota(qp_index, 1)) return 0;
+    if (!reserveQuota(qp_index, 1, 1)) return 0;
+    std::lock_guard<TicketLock> qp_guard(queue_lock_list_[qp_index]);
     int rc = ibv_post_recv(qp_list_[qp_index], &wr, &bad_wr);
     if (rc) {
-        cancelQuota(qp_index, 1);
+        cancelQuota(qp_index, 1, 1);
         LOG(ERROR) << "ibv_post_recv: " << strerror(abs(rc)) << " [" << rc
                    << "]";
         return -1;
     }
+    recv_cqe_counts_[qp_index]++;
     return 1;
 }
 
@@ -909,16 +945,40 @@ size_t RdmaEndPoint::acknowledge(
     auto& queue = slice_queue_[qp_index];
     if (!queue.contains(slice)) return 0;
     int num_entries = 0;
+    int cqe_entries = 0;
     RdmaSlice* current = nullptr;
     do {
         current = queue.pop();
         if (!current) break;
         num_entries++;
+        if (current->completion_signaled) cqe_entries++;
         if (on_each) on_each(current);
         updateSliceStatus(current, status);
     } while (current != slice);
-    cancelQuota(qp_index, num_entries);
+    cancelQuota(qp_index, num_entries, cqe_entries);
     return num_entries;
+}
+
+bool RdmaEndPoint::collectCompletionPrefix(RdmaSlice* tail,
+                                           std::vector<RdmaSlice*>& result) {
+    result.clear();
+    if (!tail) return false;
+    RWSpinlock::ReadGuard guard(lock_);
+    const auto qp_index = tail->qp_index;
+    if (qp_index < 0 || qp_index >= (int)slice_queue_.size()) return false;
+    std::lock_guard<TicketLock> qp_guard(queue_lock_list_[qp_index]);
+    auto& queue = slice_queue_[qp_index];
+    if (!queue.contains(tail)) return false;
+    do {
+        auto* current = queue.pop();
+        if (!current) break;
+        result.push_back(current);
+    } while (result.back() != tail);
+    int cqe_entries = 0;
+    for (auto* current : result)
+        if (current->completion_signaled) cqe_entries++;
+    cancelQuota(qp_index, result.size(), cqe_entries);
+    return true;
 }
 
 std::vector<uint32_t> RdmaEndPoint::qpNum() {
@@ -932,27 +992,27 @@ int RdmaEndPoint::getInflightSlices() const {
     return inflight_slices_.load(std::memory_order_relaxed);
 }
 
-bool RdmaEndPoint::reserveQuota(int qp_index, int num_entries) {
+bool RdmaEndPoint::reserveQuota(int qp_index, int wr_entries, int cqe_entries) {
     assert(qp_index >= 0 && qp_index < (int)qp_list_.size());
     auto cq = context_->cq(qp_index % context_->cqCount());
-    if (!cq->reserveQuota(num_entries)) return false;
+    if (!cq->reserveQuota(cqe_entries)) return false;
     auto prev_depth_list = wr_depth_list_[qp_index].value.fetch_add(
-        num_entries, std::memory_order_acq_rel);
-    inflight_slices_.fetch_add(num_entries, std::memory_order_acq_rel);
-    if (prev_depth_list + num_entries > params_->max_qp_wr) {
-        cancelQuota(qp_index, num_entries);
+        wr_entries, std::memory_order_acq_rel);
+    inflight_slices_.fetch_add(wr_entries, std::memory_order_acq_rel);
+    if (prev_depth_list + wr_entries > params_->max_qp_wr) {
+        cancelQuota(qp_index, wr_entries, cqe_entries);
         return false;
     }
     return true;
 }
 
-void RdmaEndPoint::cancelQuota(int qp_index, int num_entries) {
+void RdmaEndPoint::cancelQuota(int qp_index, int wr_entries, int cqe_entries) {
     assert(qp_index >= 0 && qp_index < (int)qp_list_.size());
-    wr_depth_list_[qp_index].value.fetch_sub(num_entries,
+    wr_depth_list_[qp_index].value.fetch_sub(wr_entries,
                                              std::memory_order_acq_rel);
-    inflight_slices_.fetch_sub(num_entries, std::memory_order_acq_rel);
+    inflight_slices_.fetch_sub(wr_entries, std::memory_order_acq_rel);
     auto cq = context_->cq(qp_index % context_->cqCount());
-    cq->cancelQuota(num_entries);
+    cq->cancelQuota(cqe_entries);
 }
 
 int RdmaEndPoint::setupOneQP(int qp_index, const std::string& peer_gid,

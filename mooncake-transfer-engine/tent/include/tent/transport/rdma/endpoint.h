@@ -37,6 +37,7 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     // (submitSlices / acknowledge) or the endpoint write lock (teardown).
     struct BoundedSliceQueue {
         size_t head, tail, capacity, count;
+        size_t signaled_count = 0;
         std::vector<RdmaSlice*> entries;
         std::unordered_set<RdmaSlice*> slice_set;
 
@@ -55,12 +56,15 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
 
         bool full() const { return count == capacity; }
 
+        size_t signaledCount() const { return signaled_count; }
+
         void push(RdmaSlice* slice) {
             if (count == capacity) throw std::runtime_error("queue overflow");
             entries[tail] = slice;
             tail = (tail + 1) % capacity;
             slice_set.insert(slice);
             count++;
+            if (slice->completion_signaled) signaled_count++;
         }
 
         RdmaSlice* peek() {
@@ -74,6 +78,7 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
             head = (head + 1) % capacity;
             slice_set.erase(cur);
             count--;
+            if (cur->completion_signaled) signaled_count--;
             return cur;
         }
 
@@ -219,6 +224,12 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     size_t acknowledge(RdmaSlice* slice, TransferStatusEnum status,
                        const std::function<void(RdmaSlice*)>& on_each = {});
 
+    // Pop the posting-order prefix ending at `tail` without resolving slice
+    // status. The caller must finish accounting and status handling before it
+    // releases each returned slice's completion ownership. Empty means stale.
+    bool collectCompletionPrefix(RdmaSlice* tail,
+                                 std::vector<RdmaSlice*>& result);
+
     std::atomic<int>* getQuotaCounter(int qp_index) const {
         return &wr_depth_list_[qp_index].value;
     }
@@ -236,9 +247,8 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     // configured (the default single-pool case). Read-only after construct().
     const QpPoolSegment* poolForQp(int qp_index) const;
 
-    bool reserveQuota(int qp_index, int num_entries);
-
-    void cancelQuota(int qp_index, int num_entries);
+    bool reserveQuota(int qp_index, int wr_entries, int cqe_entries);
+    void cancelQuota(int qp_index, int wr_entries, int cqe_entries);
 
    private:
     // Caller must hold lock_ in write mode.
@@ -285,6 +295,9 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     std::vector<BoundedSliceQueue> slice_queue_;
     TicketLock* queue_lock_list_;
     WrDepthBlock* wr_depth_list_;
+    // Receive WRs share the QP/CQ quota but are not represented by slices.
+    // Keep their signaled CQE count separately for teardown accounting.
+    std::vector<size_t> recv_cqe_counts_;
     std::atomic<int> inflight_slices_;
     uint32_t padding_[7];
     RWSpinlock lock_;
