@@ -1314,7 +1314,7 @@ TEST_F(MasterServiceHATest, RestoreFromStandbyPreservesReplicaIds) {
     EXPECT_GE(new_replicas.front().id, 43);
 }
 
-TEST_F(MasterServiceHATest, BatchPromotionDrainsMultipleChunksAndPreservesIds) {
+TEST_F(MasterServiceHATest, BatchPromotionCopiesMultipleChunksAndPreservesIds) {
     MasterService service(
         MasterServiceConfig::builder().set_enable_ha(false).build());
     const std::string endpoint = "batch_promotion_segment";
@@ -1342,8 +1342,12 @@ TEST_F(MasterServiceHATest, BatchPromotionDrainsMultipleChunksAndPreservesIds) {
     handoff.applied_cursor = {.batch_id = 7, .last_seq = 7};
     handoff.max_replica_id = 42;
 
-    ASSERT_TRUE(service.RestoreFromBatchOpLogPromotion(std::move(handoff), 1)
-                    .has_value());
+    ASSERT_TRUE(
+        service.RestoreFromBatchOpLogPromotion(handoff, 1).has_value());
+    ASSERT_TRUE(handoff.metadata_store);
+    EXPECT_EQ(2u, handoff.metadata_store->GetKeyCount());
+    EXPECT_TRUE(handoff.metadata_store->Exists(first.tenant_id, first.key));
+    EXPECT_TRUE(handoff.metadata_store->Exists(second.tenant_id, second.key));
     auto first_descriptors =
         ReplicaDescriptorsForTesting(service, kDefaultTenant, first.key);
     auto second_descriptors = ReplicaDescriptorsForTesting(
@@ -1380,14 +1384,60 @@ TEST_F(MasterServiceHATest, BatchPromotionRejectsCrossChunkOverlap) {
     handoff.applied_cursor = {.batch_id = 7, .last_seq = 7};
     handoff.max_replica_id = 52;
 
-    auto result = service.RestoreFromBatchOpLogPromotion(std::move(handoff), 1);
+    auto result = service.RestoreFromBatchOpLogPromotion(handoff, 1);
 
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, result.error());
+    ASSERT_TRUE(handoff.metadata_store);
+    EXPECT_EQ(2u, handoff.metadata_store->GetKeyCount());
+    EXPECT_TRUE(handoff.metadata_store->Exists(first.tenant_id, first.key));
+    EXPECT_TRUE(handoff.metadata_store->Exists(second.tenant_id, second.key));
     EXPECT_EQ(
         HasMetadataEntryForTesting(service, kDefaultTenant, first.key) +
             HasMetadataEntryForTesting(service, kDefaultTenant, second.key),
         1);
+}
+
+TEST_F(MasterServiceHATest,
+       BatchPromotionRestoreLeavesHandoffIntactForPreserve) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+    const std::string endpoint = "batch_promotion_preserve_segment";
+    auto object = MakeStandbyObject("batch_promotion_preserve_key", endpoint);
+    object.metadata.replicas.front().id = 61;
+    object.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+
+    auto source = std::make_unique<StandbyMetadataStore>();
+    ASSERT_TRUE(
+        source->PutMetadata(object.tenant_id, object.key, object.metadata));
+    BatchOpLogPromotionHandoff handoff;
+    handoff.metadata_store = std::move(source);
+    handoff.segments = {MakeStandbyMemorySegment(endpoint)};
+    handoff.applied_cursor = {.batch_id = 11, .last_seq = 11};
+    handoff.max_replica_id = 61;
+
+    ASSERT_TRUE(
+        service.RestoreFromBatchOpLogPromotion(handoff, 1).has_value());
+    ASSERT_TRUE(handoff.metadata_store);
+    EXPECT_EQ(1u, handoff.metadata_store->GetKeyCount());
+    EXPECT_TRUE(
+        handoff.metadata_store->Exists(object.tenant_id, object.key));
+    auto replicas =
+        ReplicaDescriptorsForTesting(service, kDefaultTenant, object.key);
+    ASSERT_EQ(replicas.size(), 1);
+    EXPECT_EQ(replicas.front().id, 61);
+
+    HotStandbyConfig config;
+    config.enable_verification = false;
+    HotStandbyService standby(config);
+    ASSERT_EQ(ErrorCode::OK,
+              standby.PreservePromotionBaseline(
+                  std::move(handoff.metadata_store), handoff.applied_cursor,
+                  /*producer_view_version=*/7, handoff.segments));
+    EXPECT_EQ(11u, standby.GetSyncStatus().applied_seq_id);
+    EXPECT_EQ(1u, standby.GetMetadataCount());
 }
 
 TEST_F(MasterServiceHATest, RestoreRejectsInvalidReplicaIds) {

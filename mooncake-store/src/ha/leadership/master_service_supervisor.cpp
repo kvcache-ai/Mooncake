@@ -459,7 +459,8 @@ int RunSupervisorLoop(const HABackendSpec& spec,
 
         auto return_to_standby =
             [&](const std::optional<MasterView>& leader_view) {
-                if (promotion_ctx->metadata_store) {
+                if (promotion_ctx->metadata_store &&
+                    promotion_ctx->applied_cursor.last_seq != 0) {
                     const uint64_t applied_seq =
                         promotion_ctx->applied_cursor.last_seq;
                     auto restore_err =
@@ -553,19 +554,16 @@ int RunSupervisorLoop(const HABackendSpec& spec,
 
         // Restore is the serving gate: do not register or expose a candidate
         // service until the complete promotion context has been applied.
+        // Keep the handoff until serving is established so restore failure
+        // or a later lease loss can still resume from the applied cursor.
         SetRuntimeState(admin_server, MasterRuntimeState::kRecovering);
         auto restore_result =
             promotion_ctx->metadata_store
                 ? wrapped_master_service->RestoreFromBatchOpLogPromotion(
-                      BatchOpLogPromotionHandoff{
-                          .metadata_store =
-                              std::move(promotion_ctx->metadata_store),
-                          .segments = std::move(promotion_ctx->segments),
-                          .applied_cursor = promotion_ctx->applied_cursor,
-                          .producer_view_version =
-                              promotion_ctx->producer_view_version,
-                          .max_replica_id = promotion_ctx->max_replica_id,
-                      })
+                      *promotion_ctx->metadata_store,
+                      promotion_ctx->applied_cursor, promotion_ctx->segments,
+                      promotion_ctx->max_replica_id,
+                      static_cast<size_t>(config.snapshot_chunk_object_count))
                 : wrapped_master_service->RestoreFromStandby(
                       promotion_ctx->objects, promotion_ctx->applied_seq_id,
                       promotion_ctx->segments, promotion_ctx->weight_metadata);
@@ -574,9 +572,7 @@ int RunSupervisorLoop(const HABackendSpec& spec,
                        << toString(restore_result.error());
             wrapped_master_service.reset();
             DeactivateServingState(admin_server, label_reconciler);
-            EnterStandbyMode(admin_server, *standby_controller,
-                             accept_standby_runtime_updates,
-                             leadership_session->view);
+            return_to_standby(leadership_session->view);
             SetRuntimeState(admin_server, MasterRuntimeState::kRecovering);
             if (HandleLeadershipPhaseError(
                     "standby restore failure", "restore standby state",
@@ -646,10 +642,9 @@ int RunSupervisorLoop(const HABackendSpec& spec,
                 });
             });
         if (!leadership_monitor) {
+            wrapped_master_service.reset();
             DeactivateServingState(admin_server, label_reconciler);
-            EnterStandbyMode(admin_server, *standby_controller,
-                             accept_standby_runtime_updates,
-                             leadership_session->view);
+            return_to_standby(leadership_session->view);
             if (HandleLeadershipPhaseError(
                     "serve monitor startup failure", "start leadership monitor",
                     leader_coordinator, *leadership_session,
@@ -664,9 +659,9 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         serving_state.RunIfActive([&]() { ec.emplace(server.async_start()); });
         if (!ec.has_value()) {
             StopLeadershipMonitor(leadership_monitor_handle);
+            wrapped_master_service.reset();
             DeactivateServingState(admin_server, label_reconciler);
-            EnterStandbyMode(admin_server, *standby_controller,
-                             accept_standby_runtime_updates, std::nullopt);
+            return_to_standby(std::nullopt);
             LogLeadershipReleaseWarning(
                 "serve startup cancellation",
                 leader_coordinator.ReleaseLeadership(*leadership_session));
@@ -676,10 +671,9 @@ int RunSupervisorLoop(const HABackendSpec& spec,
             LOG(ERROR) << "Failed to start master service: "
                        << ec->result().value();
             StopLeadershipMonitor(leadership_monitor_handle);
+            wrapped_master_service.reset();
             DeactivateServingState(admin_server, label_reconciler);
-            EnterStandbyMode(admin_server, *standby_controller,
-                             accept_standby_runtime_updates,
-                             leadership_session->view);
+            return_to_standby(leadership_session->view);
             auto err =
                 leader_coordinator.ReleaseLeadership(*leadership_session);
             if (err != ErrorCode::OK) {
@@ -699,6 +693,11 @@ int RunSupervisorLoop(const HABackendSpec& spec,
                 serving_state.RunIfActive([&]() {
                     ActivateServingState(admin_server, wrapped_master_service,
                                          label_reconciler);
+                    // Serving owns the restored index now; drop the handoff
+                    // so the standby copy is not held for the whole term.
+                    promotion_ctx->metadata_store.reset();
+                    promotion_ctx->objects.clear();
+                    promotion_ctx->segments.clear();
                 });
             } else {
                 serving_state.RequestShutdown([&]() {
@@ -715,9 +714,8 @@ int RunSupervisorLoop(const HABackendSpec& spec,
             auto server_err = std::move(ec.value()).get();
             LOG(ERROR) << "Master service stopped after readiness failure: "
                        << server_err;
-            EnterStandbyMode(admin_server, *standby_controller,
-                             accept_standby_runtime_updates,
-                             leadership_session->view);
+            wrapped_master_service.reset();
+            return_to_standby(leadership_session->view);
             if (HandleLeadershipPhaseError(
                     "service readiness publication failure",
                     "publish master service readiness", leader_coordinator,
@@ -736,7 +734,13 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         auto err = leader_coordinator.ReleaseLeadership(*leadership_session);
         LOG(INFO) << "Release leadership: " << toString(err);
         auto current_view = leader_coordinator.ReadCurrentView();
-        if (current_view) {
+        wrapped_master_service.reset();
+        // Serving drops the handoff in ActivateServingState. If the listener
+        // stopped before that, preserve the still-populated catch-up cursor.
+        if (promotion_ctx->metadata_store) {
+            return_to_standby(current_view ? current_view.value()
+                                           : std::nullopt);
+        } else if (current_view) {
             EnterStandbyMode(admin_server, *standby_controller,
                              accept_standby_runtime_updates,
                              current_view.value());

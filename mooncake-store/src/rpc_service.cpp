@@ -1797,9 +1797,19 @@ tl::expected<void, ErrorCode> WrappedMasterService::RestoreFromStandby(
 
 tl::expected<void, ErrorCode>
 WrappedMasterService::RestoreFromBatchOpLogPromotion(
-    BatchOpLogPromotionHandoff handoff, size_t chunk_object_count) {
-    return master_service_.RestoreFromBatchOpLogPromotion(std::move(handoff),
+    const BatchOpLogPromotionHandoff& handoff, size_t chunk_object_count) {
+    return master_service_.RestoreFromBatchOpLogPromotion(handoff,
                                                           chunk_object_count);
+}
+
+tl::expected<void, ErrorCode>
+WrappedMasterService::RestoreFromBatchOpLogPromotion(
+    const StandbyMetadataStore& metadata_store, DurablePrefix applied_cursor,
+    const std::vector<StandbySegmentInfo>& segments, ReplicaID max_replica_id,
+    size_t chunk_object_count) {
+    return master_service_.RestoreFromBatchOpLogPromotion(
+        metadata_store, applied_cursor, segments, max_replica_id,
+        chunk_object_count);
 }
 
 void RegisterRpcService(

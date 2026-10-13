@@ -3962,21 +3962,31 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbySnapshot(
 }
 
 tl::expected<void, ErrorCode> MasterService::RestoreFromBatchOpLogPromotion(
-    BatchOpLogPromotionHandoff handoff, size_t chunk_object_count) {
-    if (!handoff.metadata_store || chunk_object_count == 0 ||
-        ((handoff.applied_cursor.batch_id == 0) !=
-         (handoff.applied_cursor.last_seq == 0))) {
+    const BatchOpLogPromotionHandoff& handoff, size_t chunk_object_count) {
+    if (!handoff.metadata_store) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    return RestoreFromStandbyState(nullptr, std::move(handoff.metadata_store),
-                                   handoff.applied_cursor.last_seq,
-                                   handoff.segments, chunk_object_count,
-                                   handoff.max_replica_id, nullptr);
+    return RestoreFromBatchOpLogPromotion(
+        *handoff.metadata_store, handoff.applied_cursor, handoff.segments,
+        handoff.max_replica_id, chunk_object_count);
+}
+
+tl::expected<void, ErrorCode> MasterService::RestoreFromBatchOpLogPromotion(
+    const StandbyMetadataStore& metadata_store, DurablePrefix applied_cursor,
+    const std::vector<StandbySegmentInfo>& segments, ReplicaID max_replica_id,
+    size_t chunk_object_count) {
+    if (chunk_object_count == 0 ||
+        ((applied_cursor.batch_id == 0) != (applied_cursor.last_seq == 0))) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return RestoreFromStandbyState(nullptr, &metadata_store,
+                                   applied_cursor.last_seq, segments,
+                                   chunk_object_count, max_replica_id, nullptr);
 }
 
 tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
     const std::vector<StandbyObjectEntry>* legacy_objects,
-    std::unique_ptr<StandbyMetadataStore> metadata_store,
+    const StandbyMetadataStore* metadata_store,
     uint64_t initial_oplog_sequence_id,
     const std::vector<StandbySegmentInfo>& segments, size_t chunk_object_count,
     std::optional<ReplicaID> expected_max_replica_id,
@@ -4374,9 +4384,14 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
         }
         restored_object_count += *installed;
     } else {
+        // Copy, do not drain. The supervisor keeps the promotion handoff
+        // until serving is established so a failed restore or a lost lease
+        // can still PreservePromotionBaseline from the applied cursor.
         std::vector<StandbyObjectEntry> objects;
+        auto cursor = metadata_store->BeginSnapshotTraversal();
         for (;;) {
-            if (!metadata_store->DrainChunk(chunk_object_count, objects)) {
+            if (!metadata_store->CopyNextSnapshotChunk(chunk_object_count,
+                                                       cursor, objects)) {
                 return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
             }
             if (objects.empty()) {
