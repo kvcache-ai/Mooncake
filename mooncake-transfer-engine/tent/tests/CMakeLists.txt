@@ -735,6 +735,41 @@ if(USE_TPU)
     tent_tpu_transport_test
     PRIVATE MOCK_TPU_PJRT_LIB="$<TARGET_FILE:mock_tpu_pjrt>")
   add_test(NAME tent_tpu_transport_test COMMAND tent_tpu_transport_test)
+
+  # Token registry of the built-in TPU adapter (tent/plugins/tpu). The
+  # registry's symbols are hidden in the adapter library, so the test compiles
+  # its source directly.
+  add_executable(
+    tent_tpu_token_registry_test
+    tpu/tpu_token_registry_test.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../plugins/tpu/tpu_token_registry.cpp)
+  target_link_libraries(tent_tpu_token_registry_test PRIVATE gtest gtest_main)
+  target_include_directories(tent_tpu_token_registry_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../plugins/tpu)
+  add_test(NAME tent_tpu_token_registry_test
+           COMMAND tent_tpu_token_registry_test)
+
+  # Mock TPU buffer provider (tpu_buffer_provider.h) standing in for tpu-sync.
+  add_library(mock_tpu_buffer_provider SHARED tpu/mock_tpu_buffer_provider.cpp)
+  target_include_directories(mock_tpu_buffer_provider
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+
+  # Built-in adapter end to end: provider binding, handle ownership, the
+  # mc_tpu_pjrt_* ABI, and TENT's real TpuPjrtShim loading the adapter.
+  add_executable(tent_tpu_pjrt_adapter_test tpu/tpu_pjrt_adapter_test.cpp)
+  add_dependencies(tent_tpu_pjrt_adapter_test tent_tpu_pjrt_adapter
+                   mock_tpu_buffer_provider)
+  target_link_libraries(
+    tent_tpu_pjrt_adapter_test PRIVATE gtest gtest_main tent_link_group
+                                       ${CMAKE_DL_LIBS})
+  target_include_directories(tent_tpu_pjrt_adapter_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  target_compile_definitions(
+    tent_tpu_pjrt_adapter_test
+    PRIVATE
+      TPU_PJRT_ADAPTER_LIB="$<TARGET_FILE:tent_tpu_pjrt_adapter>"
+      MOCK_TPU_BUFFER_PROVIDER_LIB="$<TARGET_FILE:mock_tpu_buffer_provider>")
+  add_test(NAME tent_tpu_pjrt_adapter_test COMMAND tent_tpu_pjrt_adapter_test)
 endif()
 
 # XPU SYCL platform test: exercises XpuPlatform (device allocation, pointer

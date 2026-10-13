@@ -68,6 +68,9 @@ python -m unittest service_tests/test_http_metadata_server.py
 echo "Running mooncake config test..."
 python unit_tests/test_mooncake_config.py
 
+echo "Running mooncake.tpu helper test..."
+python unit_tests/test_tpu.py
+
 echo "Running reshard contract tests..."
 python -m pip install pytest hypothesis==6.141.0 paramiko
 python -m pytest reshard_tests ssd_tests -q

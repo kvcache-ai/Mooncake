@@ -145,6 +145,17 @@ if(USE_UBSHMEM)
     COMPONENT python)
 endif()
 
+if(USE_TPU)
+  # mooncake.tpu loads the adapter from next to itself and points TENT at the
+  # same file, so both share one registry.
+  message(
+    STATUS
+      "USE_TPU is enabled, libmooncake_tpu_pjrt.so will be installed in the Python package"
+  )
+  install(TARGETS tent_tpu_pjrt_adapter
+          LIBRARY DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR} COMPONENT python)
+endif()
+
 if(WITH_STORE)
   pybind11_add_module(
     store
