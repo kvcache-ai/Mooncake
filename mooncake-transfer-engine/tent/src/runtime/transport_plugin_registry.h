@@ -66,6 +66,26 @@ struct PluginReport {
     std::string detail;
 };
 
+// What TransportPluginRegistry::inspect() found out about one plugin file.
+// The descriptor fields stay zero when the entry point was not reached.
+struct PluginInspection {
+    std::string path;
+    std::string name;  // from the file name
+    std::string version;
+    int builtin_type = UNSPEC;
+    uint32_t flags = 0;
+    uint32_t declared_caps = 0;
+    uint32_t abi_version = 0;
+    uint64_t abi_fingerprint = 0;
+    uint32_t core_abi_version = 0;
+    uint64_t core_fingerprint = 0;
+    // kLoaded: every check that needs no engine passed.
+    PluginOutcome outcome = PluginOutcome::kLoaded;
+    std::string detail;
+    int probe_rc = 0;
+    std::string probe_error;
+};
+
 // Process-wide registry of transport plugins, driven by
 // TransferEngineImpl::construct() in three steps:
 //   ensureLoaded()    before the TransportSelector parses policies, so that
@@ -105,6 +125,14 @@ class TransportPluginRegistry {
 
     // Number of plugin dlopen() calls made by this registry.
     size_t dlopenCount() const;
+
+    // Runs the loader's checks that need no engine on one file (entry point,
+    // ABI version, fingerprint, names, builtin_type, probe()) without loading
+    // it into the registry: no slot is assigned, no report is added and no
+    // process-wide state changes. The file is dlopen()ed RTLD_LOCAL and stays
+    // mapped; a dlopen() failure (an undefined symbol, for example) is
+    // kRejectedBadEntry with the dlerror() text.
+    static PluginInspection inspect(const std::string& path);
 
     // Test hooks. fillSlotsForTest() occupies `count` free plugin slots with
     // placeholder names; resetForTest() forgets all loading state (plugins

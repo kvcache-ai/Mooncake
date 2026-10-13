@@ -631,6 +631,21 @@ if(TARGET tent_xport_loopback)
                    tent_xport_addr_probe plugins/addr_probe.cpp)
   list(APPEND TENT_TEST_PLUGIN_TARGETS tent_test_not_a_plugin
        tent_test_dup_loopback tent_test_addr_probe)
+  # Loopback variants that each break one rule of the conformance suite, each in
+  # a directory of its own.
+  set(TENT_TEST_BADC_PLUGINS c4 c5 c5b c6 c7 c8)
+  foreach(variant IN LISTS TENT_TEST_BADC_PLUGINS)
+    string(TOUPPER ${variant} upper)
+    tent_test_plugin(
+      tent_test_bad${variant}_plugin
+      ${CMAKE_BINARY_DIR}/tent_plugins_bad${variant}
+      tent_xport_bad${variant}
+      plugins/badc_plugins.cpp
+      ../plugins/transport/loopback/loopback_transport.cpp)
+    target_compile_definitions(tent_test_bad${variant}_plugin
+                               PRIVATE NONCONFORMING_${upper})
+    list(APPEND TENT_TEST_PLUGIN_TARGETS tent_test_bad${variant}_plugin)
+  endforeach()
 
   set(TENT_TEST_PLUGIN_DIR_DEFINITIONS
       TENT_TEST_PLUGIN_DIR="${TENT_TEST_LOOPBACK_PLUGIN_DIR}"
@@ -683,6 +698,97 @@ if(TARGET tent_xport_loopback)
   tent_plugin_test(tent_transport_plugin_nohost_test
                    transport_plugin_host_test.cpp OFF TENT_TEST_HOST_EXPORTS=0)
 
+  # tent_plugin_inspect against the broken plugins, loopback and the built-in
+  # plugins.
+  tent_plugin_test(tent_plugin_inspect_test plugin_inspect_test.cpp OFF
+                   TENT_TEST_INSPECT_TOOL="$<TARGET_FILE:tent_plugin_inspect>")
+  add_dependencies(tent_plugin_inspect_test tent_plugin_inspect)
+
+  # The transport conformance suite (C1-C9), run against the plugin named by
+  # TENT_CONFORMANCE_PLUGIN in TENT_CONFORMANCE_PLUGIN_DIR. Loopback runs
+  # asynchronously; in a build with the TCP plugin, its directory provides the
+  # transport C8 fails over to.
+  add_executable(tent_transport_conformance_test transport_conformance_test.cpp)
+  target_link_libraries(tent_transport_conformance_test
+                        PRIVATE gtest gtest_main tent_link_group)
+  target_include_directories(
+    tent_transport_conformance_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include
+            ${CMAKE_CURRENT_SOURCE_DIR}/../src/runtime)
+  set_target_properties(tent_transport_conformance_test
+                        PROPERTIES ENABLE_EXPORTS ON)
+  add_dependencies(tent_transport_conformance_test tent_test_plugins)
+  set(tent_conformance_fallback_dir)
+  if(TENT_XPORT_TCP STREQUAL "plugin")
+    set(tent_conformance_fallback_dir ":${TENT_TRANSPORT_PLUGIN_DIR}")
+  endif()
+  set(tent_conformance_loopback_config
+      "{\"transports/loopback/enable\":true,\"transports/loopback/async\":true}"
+  )
+  # tent_conformance(<test> <plugin> <dir> [CONFIG <json>] [ARGS <args>...])
+  # Without CONFIG, the test takes TENT_CONFORMANCE_CONFIG from the caller.
+  function(tent_conformance test plugin dir)
+    cmake_parse_arguments(arg "" "CONFIG" "ARGS" ${ARGN})
+    add_test(NAME ${test} COMMAND tent_transport_conformance_test ${arg_ARGS})
+    set(env TENT_CONFORMANCE_PLUGIN=${plugin}
+            TENT_CONFORMANCE_PLUGIN_DIR=${dir} TENT_CONFORMANCE_FALLBACK=)
+    if(DEFINED arg_CONFIG)
+      list(APPEND env TENT_CONFORMANCE_CONFIG=${arg_CONFIG})
+    endif()
+    set_tests_properties(${test} PROPERTIES ENVIRONMENT "${env}" TIMEOUT 300)
+  endfunction()
+  tent_conformance(
+    tent_transport_conformance_loopback_test loopback
+    ${TENT_TEST_LOOPBACK_PLUGIN_DIR}${tent_conformance_fallback_dir} CONFIG
+    ${tent_conformance_loopback_config})
+  if(TENT_XPORT_TCP STREQUAL "plugin")
+    tent_conformance(tent_transport_conformance_tcp_test tcp
+                     ${TENT_TRANSPORT_PLUGIN_DIR} CONFIG "{}")
+  endif()
+  # The RDMA entry takes TENT_CONFORMANCE_CONFIG from the caller's environment
+  # (for example each engine's topology/rdma_whitelist); without an RDMA device
+  # that has an active port it is skipped.
+  if(TENT_XPORT_RDMA STREQUAL "plugin")
+    tent_conformance(tent_transport_conformance_rdma_test rdma
+                     ${TENT_TRANSPORT_PLUGIN_DIR})
+  endif()
+  # The suite's own negative controls: each non-conforming plugin fails its case
+  # with the message of the rule it breaks, and passes the other cases; for a
+  # plugin the loader rejects, the suite reports the loader's verdict.
+  # tent_conformance_negative(<plugin> <case> <message regex>)
+  function(tent_conformance_negative plugin case message)
+    set(dir ${CMAKE_BINARY_DIR}/tent_plugins_${plugin})
+    if(plugin MATCHES "^badc")
+      set(dir ${dir}${tent_conformance_fallback_dir})
+      set(config CONFIG ${tent_conformance_loopback_config})
+    else()
+      set(dir ${TENT_TEST_BAD_PLUGIN_DIR})
+      set(config CONFIG "{}")
+    endif()
+    tent_conformance(tent_transport_conformance_${plugin}_fails_${case}
+                     ${plugin} ${dir} ${config} ARGS --gtest_filter=*.${case}_*)
+    set_tests_properties(tent_transport_conformance_${plugin}_fails_${case}
+                         PROPERTIES PASS_REGULAR_EXPRESSION "${message}")
+    if(plugin MATCHES "^badc")
+      tent_conformance(
+        tent_transport_conformance_${plugin}_passes_others ${plugin} ${dir}
+        ${config} ARGS --gtest_filter=-*.${case}_*)
+    endif()
+  endfunction()
+  tent_conformance_negative(badc4 C4
+                            "a refused submission left tasks in the sub-batch")
+  tent_conformance_negative(badc5 C5 "task [0-9]+ is still [0-9]+ after 10 s")
+  tent_conformance_negative(badc5b C5 "completed with 0 of [0-9]+ bytes")
+  tent_conformance_negative(badc6 C6 "notification [0-9]+ out of order")
+  tent_conformance_negative(badc7 C7 "did not end after cancellation")
+  tent_conformance_negative(badc8 C8 "the engine did not fail over to")
+  tent_conformance_negative(
+    caps_overclaim C1
+    "caps_overclaim is not installed in this engine: rejected_caps_overclaim")
+  tent_conformance_negative(
+    install_fails C2
+    "install_fails is not installed in this engine: install_failed")
+
   # A host that uses TENT only through libtent_shared.so.
   add_executable(tent_plugin_host_shared_app plugin_host_shared_app.cpp)
   target_link_libraries(tent_plugin_host_shared_app PRIVATE tent_shared)
@@ -715,8 +821,8 @@ if(TARGET tent_xport_loopback)
   endif()
 
   # The plugin SDK: the example, copied out of the source tree, builds the
-  # loopback sample from the SDK of this build (installed into the build tree)
-  # and is loaded by the host above.
+  # loopback sample from the SDK of this build (installed into the build tree),
+  # is loaded by the host above and passes the conformance suite.
   set(tent_sdk_example ${CMAKE_CURRENT_SOURCE_DIR}/../examples/tent-plugin-sdk)
   if(yalantinglibs_BINARY_DIR)
     add_test(
@@ -728,7 +834,9 @@ if(TARGET tent_xport_loopback)
         "-DGENERATOR=${CMAKE_GENERATOR}" -DMAKE_PROGRAM=${CMAKE_MAKE_PROGRAM}
         -DCXX=${CMAKE_CXX_COMPILER}
         -DHOST=$<TARGET_FILE:tent_plugin_host_shared_app>
-        -DPROBE_DIR=${TENT_TEST_PROBE_PLUGIN_DIR} -P
+        -DPROBE_DIR=${TENT_TEST_PROBE_PLUGIN_DIR}
+        -DCONFORMANCE=$<TARGET_FILE:tent_transport_conformance_test>
+        -DFALLBACK_DIR=${tent_conformance_fallback_dir} -P
         ${CMAKE_CURRENT_SOURCE_DIR}/../plugins/sdk/check_sdk_example.cmake)
     set_tests_properties(tent_plugin_sdk_example_build PROPERTIES TIMEOUT 600)
   endif()

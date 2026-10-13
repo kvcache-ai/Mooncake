@@ -68,6 +68,24 @@ bool isValidPluginName(const std::string& name) {
     });
 }
 
+constexpr char kBadFileName[] =
+    "file name is not libtent_xport_<name>.so with <name> in [a-z0-9_]";
+
+// libtent_xport_<anything>.so; other files in a plugin directory are not
+// looked at.
+bool isPluginFileName(const std::string& file) {
+    return file.size() > sizeof(kPrefix) - 1 + sizeof(kSuffix) - 1 &&
+           file.compare(0, sizeof(kPrefix) - 1, kPrefix) == 0 &&
+           file.compare(file.size() - (sizeof(kSuffix) - 1),
+                        sizeof(kSuffix) - 1, kSuffix) == 0;
+}
+
+std::string pluginNameOf(const std::string& file) {
+    return file.substr(
+        sizeof(kPrefix) - 1,
+        file.size() - (sizeof(kPrefix) - 1) - (sizeof(kSuffix) - 1));
+}
+
 bool isBuiltinTransportName(const std::string& name) {
     if (name == "unknown") return true;
     for (int t = 0; t < kNumBuiltinTransportTypes; ++t) {
@@ -396,12 +414,7 @@ Status TransportPluginRegistry::ensureLoaded(const Config& conf,
         std::vector<fs::path> files;
         fs::directory_iterator it(dir, ec), end;
         for (; !ec && it != end; it.increment(ec)) {
-            const std::string file = it->path().filename().string();
-            if (file.size() <= sizeof(kPrefix) - 1 + sizeof(kSuffix) - 1 ||
-                file.compare(0, sizeof(kPrefix) - 1, kPrefix) != 0 ||
-                file.compare(file.size() - (sizeof(kSuffix) - 1),
-                             sizeof(kSuffix) - 1, kSuffix) != 0)
-                continue;
+            if (!isPluginFileName(it->path().filename().string())) continue;
             std::error_code file_ec;
             if (!it->is_regular_file(file_ec)) continue;
             files.push_back(it->path());
@@ -412,17 +425,12 @@ Status TransportPluginRegistry::ensureLoaded(const Config& conf,
         }
         std::sort(files.begin(), files.end());
         for (const auto& file : files) {
-            const std::string base = file.filename().string();
             Item item;
             item.path = file.string();
-            item.name = base.substr(
-                sizeof(kPrefix) - 1,
-                base.size() - (sizeof(kPrefix) - 1) - (sizeof(kSuffix) - 1));
+            item.name = pluginNameOf(file.filename().string());
             if (!isValidPluginName(item.name)) {
                 item.outcome = PluginOutcome::kRejectedNameMismatch;
-                item.detail =
-                    "file name is not libtent_xport_<name>.so with <name> in "
-                    "[a-z0-9_]";
+                item.detail = kBadFileName;
             } else if (has_load_list && !contains(load_list, item.name)) {
                 item.outcome = PluginOutcome::kDisabledByConfig;
                 item.detail = "not listed in plugins/load";
@@ -465,115 +473,118 @@ Status TransportPluginRegistry::ensureLoaded(const Config& conf,
     return Status::OK();
 }
 
-void TransportPluginRegistry::loadOneLocked(const std::string& path,
-                                            const std::string& name,
-                                            const Topology* topology,
-                                            const Config* conf) {
-    ++dlopen_calls_;
+namespace {
+
+// What examinePlugin() found out about one file.
+struct Examination {
+    PluginOutcome outcome = PluginOutcome::kLoaded;
+    std::string detail;
+    bool described = false;  // the entry point filled in the descriptor
+    int probe_rc = 0;
+    std::string probe_error;
+};
+
+// Opens one plugin file and runs, in the loader's order, every check that
+// needs no engine: the entry point, ABI version and descriptor size,
+// fingerprint, names, builtin_type and probe(). kLoaded means all of them
+// passed. Changes no registry state. Handles are kept even for rejected
+// plugins: their static constructors have already run and unloading is never
+// safe in general.
+Examination examinePlugin(const std::string& path, const std::string& name,
+                          const Topology* topology, const Config* conf,
+                          tent_transport_plugin_t& desc) {
+    Examination result;
+    auto reject = [&result](PluginOutcome outcome, std::string detail) {
+        result.outcome = outcome;
+        result.detail = std::move(detail);
+        return result;
+    };
     dlerror();
     void* handle = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
     if (!handle) {
         const char* error = dlerror();
-        addReportLocked(
-            path, name, PluginOutcome::kRejectedBadEntry,
+        return reject(
+            PluginOutcome::kRejectedBadEntry,
             std::string("dlopen failed: ") + (error ? error : "unknown error"));
-        return;
     }
-    // Handles are kept even for rejected plugins: their static constructors
-    // have already run and unloading is never safe in general.
     dlerror();
     auto entry = reinterpret_cast<tent_transport_plugin_register_fn>(
         dlsym(handle, TENT_TRANSPORT_PLUGIN_ENTRY));
     if (!entry) {
         const char* error = dlerror();
-        addReportLocked(path, name, PluginOutcome::kRejectedBadEntry,
-                        std::string("no ") + TENT_TRANSPORT_PLUGIN_ENTRY +
-                            " symbol: " + (error ? error : "null"));
-        return;
+        return reject(PluginOutcome::kRejectedBadEntry,
+                      std::string("no ") + TENT_TRANSPORT_PLUGIN_ENTRY +
+                          " symbol: " + (error ? error : "null"));
     }
 
-    Plugin plugin;
-    plugin.path = path;
-    plugin.name = name;
-    auto& desc = plugin.desc;
+    desc = {};
     desc.struct_size = sizeof(desc);
     desc.abi_version = TENT_TRANSPORT_PLUGIN_ABI_VERSION;
     int rc = -1;
     try {
         rc = entry(&desc);
     } catch (...) {
-        addReportLocked(path, name, PluginOutcome::kRejectedBadEntry,
-                        "entry point threw an exception");
-        return;
+        return reject(PluginOutcome::kRejectedBadEntry,
+                      "entry point threw an exception");
     }
     if (rc == TENT_XPORT_REGISTER_E_STRUCT_SIZE) {
-        addReportLocked(path, name, PluginOutcome::kRejectedAbiVersion,
-                        "plugin descriptor is larger than the core's (" +
-                            std::to_string(sizeof(desc)) +
-                            " bytes): built against a newer ABI than v" +
-                            std::to_string(TENT_TRANSPORT_PLUGIN_ABI_VERSION));
-        return;
+        return reject(PluginOutcome::kRejectedAbiVersion,
+                      "plugin descriptor is larger than the core's (" +
+                          std::to_string(sizeof(desc)) +
+                          " bytes): built against a newer ABI than v" +
+                          std::to_string(TENT_TRANSPORT_PLUGIN_ABI_VERSION));
     }
     if (rc != TENT_XPORT_REGISTER_OK) {
-        addReportLocked(path, name, PluginOutcome::kRejectedBadEntry,
-                        "entry point returned " + std::to_string(rc));
-        return;
+        return reject(PluginOutcome::kRejectedBadEntry,
+                      "entry point returned " + std::to_string(rc));
     }
+    result.described = true;
     if (desc.abi_version != TENT_TRANSPORT_PLUGIN_ABI_VERSION ||
         desc.struct_size != sizeof(desc)) {
-        addReportLocked(
-            path, name, PluginOutcome::kRejectedAbiVersion,
+        return reject(
+            PluginOutcome::kRejectedAbiVersion,
             "plugin ABI v" + std::to_string(desc.abi_version) + " (" +
                 std::to_string(desc.struct_size) + "-byte descriptor), core v" +
                 std::to_string(TENT_TRANSPORT_PLUGIN_ABI_VERSION) + " (" +
                 std::to_string(sizeof(desc)) + "-byte descriptor)");
-        return;
     }
     const uint64_t core_fingerprint = tent_transport_abi_fingerprint();
     if (desc.abi_fingerprint != core_fingerprint) {
-        addReportLocked(path, name, PluginOutcome::kRejectedAbiFingerprint,
-                        "plugin " + hex(desc.abi_fingerprint) + ", core " +
-                            hex(core_fingerprint) +
-                            " (built with different TENT headers, compiler or "
-                            "C++ library)");
-        return;
+        return reject(PluginOutcome::kRejectedAbiFingerprint,
+                      "plugin " + hex(desc.abi_fingerprint) + ", core " +
+                          hex(core_fingerprint) +
+                          " (built with different TENT headers, compiler or "
+                          "C++ library)");
     }
     if (!desc.name || name != desc.name) {
-        addReportLocked(path, name, PluginOutcome::kRejectedNameMismatch,
-                        std::string("descriptor name '") +
-                            (desc.name ? desc.name : "(null)") +
-                            "' does not match the file name");
-        return;
+        return reject(PluginOutcome::kRejectedNameMismatch,
+                      std::string("descriptor name '") +
+                          (desc.name ? desc.name : "(null)") +
+                          "' does not match the file name");
     }
     if (!desc.create || !desc.destroy) {
-        addReportLocked(path, name, PluginOutcome::kRejectedBadEntry,
-                        "descriptor has no create() or destroy()");
-        return;
+        return reject(PluginOutcome::kRejectedBadEntry,
+                      "descriptor has no create() or destroy()");
     }
     if (desc.builtin_type != UNSPEC) {
         if (desc.builtin_type < 0 ||
             desc.builtin_type >= kNumBuiltinTransportTypes) {
-            addReportLocked(path, name, PluginOutcome::kRejectedBadEntry,
-                            "builtin_type " +
-                                std::to_string(desc.builtin_type) +
-                                " is not a built-in transport");
-            return;
+            return reject(PluginOutcome::kRejectedBadEntry,
+                          "builtin_type " + std::to_string(desc.builtin_type) +
+                              " is not a built-in transport");
         }
         const auto builtin = static_cast<TransportType>(desc.builtin_type);
         if (name != transportTypeName(builtin)) {
-            addReportLocked(path, name, PluginOutcome::kRejectedNameMismatch,
-                            std::string("claims built-in transport '") +
-                                transportTypeName(builtin) +
-                                "' under another name");
-            return;
+            return reject(PluginOutcome::kRejectedNameMismatch,
+                          std::string("claims built-in transport '") +
+                              transportTypeName(builtin) +
+                              "' under another name");
         }
-        plugin.type = builtin;
     } else if (isBuiltinTransportName(name)) {
-        addReportLocked(path, name, PluginOutcome::kRejectedDuplicateName,
-                        "'" + name +
-                            "' is a built-in transport name; a plugin "
-                            "providing it must set builtin_type");
-        return;
+        return reject(PluginOutcome::kRejectedDuplicateName,
+                      "'" + name +
+                          "' is a built-in transport name; a plugin "
+                          "providing it must set builtin_type");
     }
 
     if (desc.probe) {
@@ -590,14 +601,37 @@ void TransportPluginRegistry::loadOneLocked(const std::string& path,
             probe_rc = -1;
             reason = "probe() threw an exception";
         }
+        result.probe_rc = probe_rc;
+        result.probe_error = reason;
         if (probe_rc != 0) {
-            addReportLocked(path, name, PluginOutcome::kNotApplicable,
-                            "probe() returned " + std::to_string(probe_rc) +
-                                (reason.empty() ? "" : ": " + reason));
-            return;
+            return reject(PluginOutcome::kNotApplicable,
+                          "probe() returned " + std::to_string(probe_rc) +
+                              (reason.empty() ? "" : ": " + reason));
         }
     }
 
+    return result;
+}
+
+}  // namespace
+
+void TransportPluginRegistry::loadOneLocked(const std::string& path,
+                                            const std::string& name,
+                                            const Topology* topology,
+                                            const Config* conf) {
+    ++dlopen_calls_;
+    Plugin plugin;
+    plugin.path = path;
+    plugin.name = name;
+    const auto examination =
+        examinePlugin(path, name, topology, conf, plugin.desc);
+    if (examination.outcome != PluginOutcome::kLoaded) {
+        addReportLocked(path, name, examination.outcome, examination.detail);
+        return;
+    }
+    const auto& desc = plugin.desc;
+    if (desc.builtin_type != UNSPEC)
+        plugin.type = static_cast<TransportType>(desc.builtin_type);
     if (plugin.type == UNSPEC) {
         TransportType slot = UNSPEC;
         switch (assignPluginTransportSlot(name, desc.flags, slot)) {
@@ -622,6 +656,36 @@ void TransportPluginRegistry::loadOneLocked(const std::string& path,
                         "slot " + std::to_string(plugin.type) + ", version " +
                             (desc.version ? desc.version : "?"));
     plugins_.push_back(std::move(plugin));
+}
+
+PluginInspection TransportPluginRegistry::inspect(const std::string& path) {
+    PluginInspection result;
+    result.path = path;
+    result.core_abi_version = TENT_TRANSPORT_PLUGIN_ABI_VERSION;
+    result.core_fingerprint = tent_transport_abi_fingerprint();
+    const std::string file = fs::path(path).filename().string();
+    if (isPluginFileName(file)) result.name = pluginNameOf(file);
+    if (!isValidPluginName(result.name)) {
+        result.outcome = PluginOutcome::kRejectedNameMismatch;
+        result.detail = kBadFileName;
+        return result;
+    }
+    tent_transport_plugin_t desc{};
+    const auto examination =
+        examinePlugin(path, result.name, nullptr, nullptr, desc);
+    result.outcome = examination.outcome;
+    result.detail = examination.detail;
+    result.probe_rc = examination.probe_rc;
+    result.probe_error = examination.probe_error;
+    if (examination.described) {
+        result.version = desc.version ? desc.version : "";
+        result.builtin_type = desc.builtin_type;
+        result.flags = desc.flags;
+        result.declared_caps = desc.declared_caps;
+        result.abi_version = desc.abi_version;
+        result.abi_fingerprint = desc.abi_fingerprint;
+    }
+    return result;
 }
 
 std::shared_ptr<Transport> TransportPluginRegistry::wrap(size_t plugin,

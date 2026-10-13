@@ -2,12 +2,15 @@
 # yalantinglibs it fetched) under WORK/root, copies the SDK example out of the
 # source tree so that it builds the sample's sources from the SDK, builds it and
 # loads the result through HOST, which uses libtent_shared.so. DESTDIR keeps an
-# absolute install destination inside WORK as well.
+# absolute install destination inside WORK as well. With CONFORMANCE, the
+# conformance suite then runs against the result, with FALLBACK_DIR (":<dir>")
+# appended to its plugin directory.
 #
 # ~~~
 #   cmake -DBUILD_DIR=<build> -DYLT_BUILD_DIR=<dir> -DEXAMPLE=<dir>
 #         -DWORK=<dir> -DGENERATOR=<generator> -DMAKE_PROGRAM=<build tool>
-#         -DCXX=<compiler> -DHOST=<host app> -DPROBE_DIR=<dir> -P <this>
+#         -DCXX=<compiler> -DHOST=<host app> -DPROBE_DIR=<dir>
+#         [-DCONFORMANCE=<suite> -DFALLBACK_DIR=<:dir>] -P <this>
 # ~~~
 
 function(run what)
@@ -60,3 +63,17 @@ run("Building the example" ${CMAKE_COMMAND} --build ${WORK}/build)
 file(COPY ${WORK}/build/libtent_xport_loopback.so DESTINATION ${WORK}/plugins)
 run("Loading the example" ${HOST} ${WORK}/plugins ${PROBE_DIR})
 message(STATUS "${output}")
+if(CONFORMANCE)
+  string(CONCAT config [[TENT_CONFORMANCE_CONFIG={]]
+                [["transports/loopback/enable":true,]]
+                [["transports/loopback/async":true}]])
+  run("Running the conformance suite on the example"
+      ${CMAKE_COMMAND}
+      -E
+      env
+      TENT_CONFORMANCE_PLUGIN=loopback
+      TENT_CONFORMANCE_PLUGIN_DIR=${WORK}/plugins${FALLBACK_DIR}
+      ${config}
+      ${CONFORMANCE})
+  message(STATUS "${output}")
+endif()
