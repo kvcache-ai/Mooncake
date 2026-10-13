@@ -339,6 +339,27 @@ if(TARGET tent_xport_uring)
       tent_io_uring_transport_test
       --gtest_filter=IOUringTransportTest.SubmitIsAllOrNothingWhenSegmentLookupFailsMidBatch
   )
+  foreach(case RANGE 0 5)
+    add_test(
+      NAME tent_io_uring_read_completion_${case}
+      COMMAND
+        tent_io_uring_transport_test
+        --gtest_filter=AlignedAndStaged/IOUringReadCompletionTest.ReportsActualBytesAndPreservesUnreadTail/${case}
+    )
+  endforeach()
+  foreach(case RANGE 0 3)
+    add_test(
+      NAME tent_io_uring_write_completion_${case}
+      COMMAND
+        tent_io_uring_transport_test
+        --gtest_filter=AlignedAndStaged/IOUringWriteCompletionTest.ShortWriteFailsWithActualByteCount/${case}
+    )
+  endforeach()
+  add_test(
+    NAME tent_io_uring_failed_completion
+    COMMAND
+      tent_io_uring_transport_test
+      --gtest_filter=IOUringTransportTest.FailedCompletionReleasesStagingBuffer)
 endif()
 
 # NOT registered via add_test: the test needs a real GPU (it opens a CUDA IPC
