@@ -22,14 +22,14 @@ py::dict HitToDict(
     py::dict rank_matches;
     for (const auto& [rank, m] : hit.rank_matches) {
         py::dict rm;
-        rm["device"] = m.npu;
+        rm["device"] = m.device;
         rm["cpu_local"] = m.cpu_local;
         rm["cpu_share"] = m.cpu_share;
         rm["disk"] = m.disk;
         rank_matches[py::str(std::to_string(rank))] = std::move(rm);
     }
     d["rank_matches"] = std::move(rank_matches);
-    d["device"] = hit.npu;
+    d["device"] = hit.device;
     d["cpu_local"] = hit.cpu_local;
     d["cpu_share"] = hit.cpu_share;
     d["disk"] = hit.disk;
