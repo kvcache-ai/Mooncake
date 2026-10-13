@@ -353,6 +353,19 @@ if(USE_CUDA)
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 endif()
 
+# NOT registered via add_test: needs a real GPU with POSIX-FD VMM support (the
+# peer buffer is exported by a forked child and imported via pidfd_getfd). Run
+# manually on a GPU box: ./tent_mnnvl_transport_test. MNNVL targets fully
+# connected NVLink domains; on a box whose GPUs lack P2P to each other, pin
+# CUDA_VISIBLE_DEVICES to one card.
+if(USE_CUDA)
+  add_executable(tent_mnnvl_transport_test mnnvl_transport_test.cpp)
+  target_link_libraries(tent_mnnvl_transport_test PRIVATE gtest gtest_main
+                                                          tent_link_group)
+  target_include_directories(tent_mnnvl_transport_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+endif()
+
 add_executable(tent_endpoint_lifecycle_test endpoint_lifecycle_test.cpp)
 target_link_libraries(tent_endpoint_lifecycle_test PRIVATE gtest gtest_main
                                                            tent_link_group)
