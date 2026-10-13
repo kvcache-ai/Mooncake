@@ -8,6 +8,7 @@
 #include <unordered_map>
 
 #include "allocator_metric.h"
+#include "storage_device_metadata.h"
 #include "ylt/metric/counter.hpp"
 #include "ylt/metric/gauge.hpp"
 #include "ylt/metric/histogram.hpp"
@@ -114,6 +115,18 @@ class MasterMetricManager {
     int64_t get_segment_total_nof_capacity(const std::string& segment);
     // Remove all per-segment NoF metric labels for the given segment.
     void remove_nof_segment_metrics(const std::string& segment);
+
+    // Storage Device Metrics
+    void project_storage_devices(
+        const std::vector<StorageDeviceMetadata>& devices,
+        const StorageDeviceMaintenancePlan& plan);
+    void inc_nof_devices_auto_isolated_total(int64_t val = 1);
+    int64_t get_storage_devices_total(const std::string& health);
+    int64_t get_storage_devices_isolated_total();
+    int64_t get_storage_devices_auto_isolated_total();
+    int64_t get_storage_devices_draining_total();
+    int64_t get_storage_device_recovery_candidates();
+    int64_t get_storage_device_gc_candidates();
 
     // File Storage Metrics
     void inc_allocated_file_size(int64_t val = 1);
@@ -604,6 +617,14 @@ class MasterMetricManager {
     ylt::metric::dynamic_gauge_1t
         nof_total_capacity_per_segment_;  // NoF segment capacity update for
                                           // gauge
+
+    // Storage Device Metrics
+    ylt::metric::dynamic_gauge_1t storage_devices_total_;
+    ylt::metric::gauge_t storage_devices_isolated_total_;
+    ylt::metric::counter_t storage_devices_auto_isolated_total_;
+    ylt::metric::gauge_t storage_devices_draining_total_;
+    ylt::metric::gauge_t storage_device_recovery_candidates_;
+    ylt::metric::gauge_t storage_device_gc_candidates_;
 
     // File Storage Metrics
     ylt::metric::gauge_t file_allocated_size_;
