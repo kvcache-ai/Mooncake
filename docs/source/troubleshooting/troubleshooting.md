@@ -17,6 +17,10 @@ The log reports `Failed to construct Transfer Engine instance` with the
 configuration loading error. Check the JSON syntax and ensure the file exists
 and is readable in the worker's environment before retrying startup.
 
+The native `TransferEngine(config_path)` constructor also rejects missing or
+malformed files: `available()` stays false and no RPC server is started. Valid
+environment defaults do not rescue a failed explicit file load.
+
 ## Corrupted Data or Garbled Output
 
 Use object-level checksum diagnostics when a full-object Mooncake Store read returns corrupted data or the application produces garbled output that may originate from stored data. Deploy checksum-capable Mooncake Store client, primary master, and standby master binaries from the same version, then set `MOONCAKE_STORE_CHECKSUM=1` before starting every writer and reader client process:

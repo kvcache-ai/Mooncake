@@ -28,6 +28,7 @@
 
 #include "tent/common/config.h"
 #include "tent/runtime/transfer_engine_impl.h"
+#include "tent/transfer_engine.h"
 
 #ifndef _WIN32
 #include <asio.hpp>
@@ -408,6 +409,28 @@ TEST(TransferEngineConfigOverrideTest,
     ASSERT_TRUE(ConfigHelper().loadFromEnv(config).ok());
 
     EXPECT_TRUE(config.get("transports/rdma/log_slice_affinity", false));
+}
+
+TEST(TransferEngineConfigOverrideTest, InvalidConstructorFilePreventsStartup) {
+    TempConfigFile file("{invalid-json");
+    EnvVarGuard conf_guard("MC_TENT_CONF", "");
+    EnvVarGuard tcp_guard("MC_FORCE_TCP", "1");
+    EnvVarGuard hostname_guard("MOONCAKE_LOCAL_HOSTNAME", kLoopbackHostname);
+    TransferEngine engine(file.path());
+    EXPECT_FALSE(engine.available());
+    EXPECT_EQ(engine.getRpcServerPort(), 0);
+    EXPECT_EQ(engine.getLocalTopology(), nullptr);
+}
+
+TEST(TransferEngineConfigOverrideTest, MissingConstructorFilePreventsStartup) {
+    TempConfigFile file("{}");
+    EnvVarGuard conf_guard("MC_TENT_CONF", "");
+    EnvVarGuard tcp_guard("MC_FORCE_TCP", "1");
+    EnvVarGuard hostname_guard("MOONCAKE_LOCAL_HOSTNAME", kLoopbackHostname);
+    TransferEngine engine(file.path() + ".missing");
+    EXPECT_FALSE(engine.available());
+    EXPECT_EQ(engine.getRpcServerPort(), 0);
+    EXPECT_EQ(engine.getLocalTopology(), nullptr);
 }
 
 TEST(TransferEngineConfigOverrideTest, FilterNicEnvLoadsRdmaWhitelist) {
