@@ -24,6 +24,11 @@ void MasterServiceTestPeer::SetBatchOpLogWriterFactoryForTesting(
     service_.batch_oplog_writer_factory_ = std::move(factory);
 }
 
+std::string MasterServiceTestPeer::SerializeMetadataForOpLogForTesting(
+    MasterService& service, const ObjectMetadata& metadata) {
+    return service.SerializeMetadataForOpLog(metadata);
+}
+
 void MasterServiceTestPeer::RunBatchEvictForTesting(
     double evict_ratio_target, double evict_ratio_lowerbound) {
     service_.BatchEvict(evict_ratio_target, evict_ratio_lowerbound);

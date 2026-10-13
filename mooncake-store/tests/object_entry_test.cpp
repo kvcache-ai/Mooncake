@@ -18,14 +18,14 @@ TEST(ObjectEntryTest, OwnsMetadataEnvelopeFromConstruction) {
     // one and there is nothing to null-check at the call sites.
     entry->WithExclusiveAccess([&](ObjectMetadata& m, ObjectEntry::State&) {
         EXPECT_EQ(&m, raw);
-        EXPECT_EQ(m.size, 128u);
-        m.object_checksum = 42;
+        EXPECT_EQ(m.TotalLength(), 128u);
+        m.MutablePart(0).SetChecksum(42);
     });
 
     entry->WithSharedAccess(
         [&](const ObjectMetadata& m, const ObjectEntry::State& state) {
-            ASSERT_TRUE(m.object_checksum.has_value());
-            EXPECT_EQ(*m.object_checksum, 42u);
+            ASSERT_TRUE(m.GetPart(0).checksum().has_value());
+            EXPECT_EQ(*m.GetPart(0).checksum(), 42u);
             EXPECT_FALSE(state.is_processing);
             EXPECT_FALSE(state.is_torn_down);
         });
