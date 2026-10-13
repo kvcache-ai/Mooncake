@@ -508,40 +508,7 @@ Status TransferEngineImpl::construct() {
 
     staging_proxy_ = std::make_unique<ProxyManager>(this);
 
-    if (runtime_queue_config_.limits.deadline_aware &&
-        runtime_queue_config_.limits.mlu_local_threshold > 0.0) {
-        std::array<std::weak_ptr<Transport>, kSupportedTransportTypes>
-            bandwidth_providers;
-        bool has_bandwidth_provider = false;
-        for (auto type : {TransportType::RDMA, TransportType::UB}) {
-            auto& transport = transport_list_[static_cast<int>(type)];
-            if (transport) {
-                bandwidth_providers[static_cast<int>(type)] = transport;
-                has_bandwidth_provider = true;
-            }
-        }
-        if (has_bandwidth_provider) {
-            runtime_queue_->setTransportDegradationPolicy(
-                [bandwidth_providers](TransportType type) -> double {
-                    if (type < 0 || type >= kSupportedTransportTypes)
-                        return -1.0;
-                    if (auto transport =
-                            bandwidth_providers[static_cast<int>(type)]
-                                .lock()) {
-                        return transport->getEstimatedBandwidth();
-                    }
-                    return -1.0;
-                },
-                DegradationHooks{}, nullptr);
-            LOG(INFO) << "Admission queue degradation: live network bw"
-                      << ", theta_local="
-                      << runtime_queue_config_.limits.mlu_local_threshold;
-        } else {
-            LOG(WARNING)
-                << "Admission queue degradation requested but RDMA and UB "
-                   "transports are unavailable";
-        }
-    }
+    installDegradationPolicy();
 
     if (enable_progress_worker_) {
         progress_worker_ = std::make_unique<ProgressWorker>(
@@ -2540,6 +2507,41 @@ Status TransferEngineImpl::cancelQueuedOwner(QueueOwnerId owner_id) {
     }
     queued_owners_.erase(queued_it);
     return Status::OK();
+}
+
+void TransferEngineImpl::installDegradationPolicy() {
+    if (!runtime_queue_ || !runtime_queue_config_.limits.deadline_aware ||
+        runtime_queue_config_.limits.mlu_local_threshold <= 0.0) {
+        return;
+    }
+    std::array<std::weak_ptr<Transport>, kSupportedTransportTypes>
+        bandwidth_providers;
+    bool has_bandwidth_provider = false;
+    for (auto type : {TransportType::RDMA, TransportType::UB}) {
+        auto& transport = transport_list_[static_cast<int>(type)];
+        if (transport) {
+            bandwidth_providers[static_cast<int>(type)] = transport;
+            has_bandwidth_provider = true;
+        }
+    }
+    if (!has_bandwidth_provider) {
+        LOG(WARNING) << "Admission queue degradation requested but RDMA and UB "
+                        "transports are unavailable";
+        return;
+    }
+    runtime_queue_->setTransportDegradationPolicy(
+        [bandwidth_providers](TransportType type) -> double {
+            if (type < 0 || type >= kSupportedTransportTypes) return -1.0;
+            if (auto transport =
+                    bandwidth_providers[static_cast<int>(type)].lock()) {
+                return transport->getEstimatedBandwidth();
+            }
+            return -1.0;
+        },
+        DegradationHooks{}, nullptr);
+    LOG(INFO) << "Admission queue degradation: live network bw"
+              << ", theta_local="
+              << runtime_queue_config_.limits.mlu_local_threshold;
 }
 
 Status TransferEngineImpl::finishDroppedOwner(QueueOwnerId owner_id) {

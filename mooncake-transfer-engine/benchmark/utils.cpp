@@ -97,6 +97,15 @@ DEFINE_int32(deadline_tight_threads, 0,
              "--workload_classes_json.");
 DEFINE_bool(deadline_bw_arbitration, false,
             "tent only: enable deadline-aware RDMA bandwidth arbitration.");
+DEFINE_bool(deadline_aware, false,
+            "tent only: route transfers through the admission queue "
+            "(enable_runtime_queue) ordered by deadline; required by "
+            "--mlu_local_threshold.");
+DEFINE_double(mlu_local_threshold, 0.0,
+              "tent only: drop a queued transfer whose predicted completion "
+              "time divided by its remaining deadline window (MLU) is at or "
+              "above this value; 0 disables the drop. Acts only on "
+              "RDMA-routed transfers; requires --deadline_aware.");
 DEFINE_int32(local_gpu_id, 0, "Local GPU ID to be used, -1 for all GPUs");
 DEFINE_int32(target_gpu_id, 0, "Target GPU ID to be used, -1 for all GPUs");
 DEFINE_string(metadata_type, "p2p",
@@ -165,6 +174,8 @@ uint64_t XferBenchConfig::request_interval_us = 0;
 uint64_t XferBenchConfig::deadline_us = 0;
 int XferBenchConfig::deadline_tight_threads = 0;
 bool XferBenchConfig::deadline_bw_arbitration = false;
+bool XferBenchConfig::deadline_aware = false;
+double XferBenchConfig::mlu_local_threshold = 0.0;
 
 std::string XferBenchConfig::metadata_type;
 std::string XferBenchConfig::metadata_url_list;
@@ -254,6 +265,8 @@ void XferBenchConfig::loadFromFlags() {
     deadline_us = FLAGS_deadline_us;
     deadline_tight_threads = FLAGS_deadline_tight_threads;
     deadline_bw_arbitration = FLAGS_deadline_bw_arbitration;
+    deadline_aware = FLAGS_deadline_aware;
+    mlu_local_threshold = FLAGS_mlu_local_threshold;
     duration = FLAGS_duration;
 
     metadata_type = FLAGS_metadata_type;
