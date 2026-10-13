@@ -107,6 +107,10 @@ git commit -m "wip: skipping hooks" --no-verify
 But please avoid using `--no-verify` for routine commits to keep code quality high.
 
 #### CI Integration
+The [performance regression gate](scripts/ci/performance/README.md) compares
+baseline and candidate CPU benchmarks, publishes a result table in the Actions
+summary, and fails on regressions beyond the configured thresholds.
+
 GitHub pull-request and push checks validate only added or modified C/C++ line
 ranges relative to the selected base revision. This avoids failing a focused
 change solely because an otherwise untouched part of the same file has older
