@@ -4088,9 +4088,15 @@ tl::expected<void, ErrorCode> Client::RegisterLocalMemory(
 
 tl::expected<void, ErrorCode> Client::unregisterLocalMemory(
     void* addr, bool update_metadata) {
-    if (this->transfer_engine_->unregisterLocalMemory(addr, update_metadata) !=
-        0) {
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    const int rc =
+        transfer_engine_->unregisterLocalMemory(addr, update_metadata);
+    if (rc != 0) {
+        // Distinguish "not registered" from real failures so callers can
+        // tell an already-cleaned buffer apart from a live registration
+        // whose deregistration failed.
+        return tl::unexpected(rc == ERR_ADDRESS_NOT_REGISTERED
+                                  ? ErrorCode::NOT_REGISTERED
+                                  : ErrorCode::INVALID_PARAMS);
     }
     return {};
 }

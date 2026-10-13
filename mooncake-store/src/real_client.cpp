@@ -4208,17 +4208,20 @@ tl::expected<void, ErrorCode> RealClient::unregister_buffer_internal(
     // a harmless false error.
     std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
     if (!unregister_result) {
-        // A previous call may have unregistered TE while the NoF cleanup
-        // failed: when the buffer is still recorded, let this retry reach
-        // the NoF cleanup instead of failing at TE.
-        if (registered_buffer_sizes_.count(buffer) == 0) {
+        // Fall through to the NoF cleanup ONLY when TE reports the buffer as
+        // not registered (a previous call already tore TE down) and the
+        // record is still present. Any other TE failure (e.g. a transient
+        // deregistration error) means the TE registration may still be
+        // alive: keep the record and propagate, so the caller does not free
+        // the buffer under a live registration.
+        if (unregister_result.error() != ErrorCode::NOT_REGISTERED ||
+            registered_buffer_sizes_.count(buffer) == 0) {
             LOG(ERROR) << "Unregister buffer failed with error: "
                        << toString(unregister_result.error());
             return tl::unexpected(unregister_result.error());
         }
-        LOG(WARNING) << "TE unregister failed for recorded buffer " << buffer
-                     << ": " << toString(unregister_result.error())
-                     << "; retrying the NoF cleanup anyway";
+        LOG(WARNING) << "TE reports buffer " << buffer
+                     << " as already unregistered; retrying the NoF cleanup";
     }
     if (nof_runtime_.initiator) {
         auto rc = nof_runtime_.initiator->UnregisterMemory(buffer);

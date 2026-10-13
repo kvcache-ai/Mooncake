@@ -167,8 +167,13 @@ class SpdkEnvGuard {
     };
 
     static std::mutex& RegistryMutex() {
-        static std::mutex m;
-        return m;
+        // Deliberately leaked, like the ShmHelper singleton: a guard whose
+        // last reference is held by an earlier-constructed function static
+        // (e.g. MasterService::DefaultProbeNofSegment's initiator) is
+        // destroyed AFTER this mutex during static destruction, and the
+        // Deleter must never lock a destroyed mutex.
+        static std::mutex* m = new std::mutex();
+        return *m;
     }
     static std::weak_ptr<SpdkEnvGuard>& Registry() {
         static std::weak_ptr<SpdkEnvGuard> w;

@@ -409,6 +409,43 @@ TEST_F(NofPageRegistryTest, ReregisterShrunkRecordRestoresPrefix) {
     EXPECT_EQ(fake_.Depth(page0), 0);
 }
 
+// A shrunk record re-registered with a SMALLER size must still redo the
+// whole dropped prefix — otherwise covered-but-uncharged hole pages could
+// be released from under another owner at teardown.
+TEST_F(NofPageRegistryTest, SmallerReregisterOfShrunkRecordLeavesNoHole) {
+    void* ptr = PageAddr(0);
+    const uintptr_t page0 = reinterpret_cast<uintptr_t>(ptr);
+    const uintptr_t page1 = page0 + kPage;
+    const uintptr_t page2 = page1 + kPage;
+    const uintptr_t page3 = page2 + kPage;
+    ASSERT_EQ(registry_.Register(owner_a_, ptr, 6 * kPage), ErrorCode::OK);
+
+    // Unregister fails at page3: page0-page2 are released, page3 is
+    // quarantined, and the record is shrunk to [page3, end).
+    fake_.fail_unregister_pages.insert(page3);
+    EXPECT_EQ(registry_.Unregister(owner_a_, ptr), ErrorCode::INTERNAL_ERROR);
+
+    // Re-register the same ptr with a smaller size: the redo must cover the
+    // whole dropped prefix [page0, page3), not just page0.
+    fake_.fail_unregister_pages.clear();
+    ASSERT_EQ(registry_.Register(owner_a_, ptr, kPage), ErrorCode::OK);
+
+    // B registers the previously dropped pages page1 and page2.
+    ASSERT_EQ(registry_.Register(owner_b_, PageAddr(1), kPage), ErrorCode::OK);
+    ASSERT_EQ(registry_.Register(owner_b_, PageAddr(2), kPage), ErrorCode::OK);
+
+    // A's teardown drops exactly A's references and fails on the quarantine;
+    // B's pages are never touched.
+    EXPECT_EQ(registry_.Unregister(owner_a_, ptr), ErrorCode::INTERNAL_ERROR);
+    EXPECT_EQ(fake_.Depth(page0), 0);  // A's own page released
+    EXPECT_EQ(fake_.Depth(page1), 1);
+    EXPECT_EQ(fake_.Depth(page2), 1);
+    ASSERT_EQ(registry_.Unregister(owner_b_, PageAddr(1)), ErrorCode::OK);
+    ASSERT_EQ(registry_.Unregister(owner_b_, PageAddr(2)), ErrorCode::OK);
+    EXPECT_EQ(fake_.Depth(page1), 0);
+    EXPECT_EQ(fake_.Depth(page2), 0);
+}
+
 TEST_F(NofPageRegistryTest, UnregisterAllReleasesEverything) {
     void* p0 = PageAddr(0);
     void* p1 = PageAddr(1);

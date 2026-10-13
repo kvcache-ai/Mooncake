@@ -297,6 +297,8 @@ enum class ErrorCode : int32_t {
               ///< retained so teardown retries the unregistration — the range
               ///< must be treated as still registered (quarantine, never
               ///< munmap without a successful unregister).
+    NOT_REGISTERED = -12,  ///< The address is not registered with the transfer
+                           ///< engine.
 
     // Segment selection errors (Range: -100 to -199)
     SHARD_INDEX_OUT_OF_RANGE = -100,  ///< Shard index is out of bounds.

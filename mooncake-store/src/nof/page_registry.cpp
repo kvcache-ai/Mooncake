@@ -26,7 +26,11 @@ ErrorCode NofPageRegistry::Register(void* owner, void* ptr, size_t size) {
     auto& registrations = owner_regs_[owner];
 
     // [skip_from, skip_end): the retained suffix of a record shrunk by a
-    // failed unregister — still charged, must not be re-bumped.
+    // failed unregister — still charged, must not be re-bumped. On a redo,
+    // the walk always covers the whole dropped prefix up to skip_end, even
+    // when the new size is smaller: pages between the new size's end and
+    // skip_from would otherwise become covered-but-uncharged holes that a
+    // later teardown could release from under another owner.
     uintptr_t bump_from = first_page;
     uintptr_t skip_from = 0, skip_end = 0;
     auto existing = registrations.find(ptr);
@@ -46,9 +50,11 @@ ErrorCode NofPageRegistry::Register(void* owner, void* ptr, size_t size) {
             skip_end = covered_end;
         }
     }
+    const uintptr_t walk_end =
+        skip_end != 0 ? std::max(end_page, skip_end) : end_page;
 
     std::vector<uintptr_t> touched;  // pages whose count this call bumped
-    for (uintptr_t page = bump_from; page < end_page; page += kPageSize) {
+    for (uintptr_t page = bump_from; page < walk_end; page += kPageSize) {
         if (page >= skip_from && page < skip_end) {
             continue;  // still charged by this record
         }

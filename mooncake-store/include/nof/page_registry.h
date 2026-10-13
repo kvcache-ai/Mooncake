@@ -41,11 +41,15 @@ namespace mooncake {
 //
 // Each owner record is {size, charged_from}: the covered range is
 // [charged_from ?: first_page, page_align(begin + size)). Charges held by
-// one record are always a contiguous page range — registration failures
-// keep charges contiguous (reverse-order rollback stops at the first
-// failure), and a failed unregister shrinks charged_from to the first
-// unreleasable page, so a retry immediately hits it again and can never
-// touch pages whose remaining references belong to other owners.
+// one record are contiguous up to the first quarantined page — registration
+// failures keep charges contiguous (reverse-order rollback stops at the
+// first failure), and a failed unregister shrinks charged_from to the
+// first unreleasable page, so a retry immediately hits it again and can
+// never touch pages whose remaining references belong to other owners. In
+// the deepest cascade (a redo of a shrunk record failing again before the
+// retained suffix), charges may form two blocks; the gap is skipped safely
+// on teardown, and pages past a quarantine point stay registered — leaked
+// but pinned, which is the fail-stop design.
 class NofPageRegistry {
    public:
     using MemRegisterFn = int (*)(void* addr, size_t len);
