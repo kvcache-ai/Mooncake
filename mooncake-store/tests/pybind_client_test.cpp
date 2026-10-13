@@ -3328,6 +3328,45 @@ TEST_F(RealClientTest, UnregisterBufferPropagatesNofCleanupFailure) {
     EXPECT_TRUE(initiator->WasUnregistered(buffer.data()));
 }
 
+// A second unregister_buffer must reach the NoF cleanup even after the first
+// attempt already unregistered TE (TE then reports the buffer as
+// unregistered and would otherwise return early).
+TEST_F(RealClientTest, UnregisterBufferRetryReachesNofCleanup) {
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
+    master_address_ = master_.master_address();
+
+    NofFactoryGuard guard;
+    auto initiator = std::make_shared<RecordingNofInitiator>();
+    RealClient::SetNofRuntimeFactoryForTesting([initiator]() {
+        return NofRuntime{initiator, std::make_shared<SystemDmaAllocator>()};
+    });
+
+    ASSERT_EQ(py_client_->setup_real("localhost:17935", "P2PHANDSHAKE",
+                                     16 * 1024 * 1024, 16 * 1024 * 1024, "tcp",
+                                     "", master_address_),
+              0);
+
+    std::vector<char> buffer(1 << 20);
+    ASSERT_EQ(py_client_->register_buffer(buffer.data(), buffer.size()), 0);
+
+    initiator->unregister_result_ = ErrorCode::INTERNAL_ERROR;
+    EXPECT_NE(py_client_->unregister_buffer(buffer.data()), 0);
+    EXPECT_EQ(initiator->unregister_calls_, 1);
+
+    // Without closing the client: the retry reaches the NoF cleanup.
+    initiator->unregister_result_ = ErrorCode::OK;
+    EXPECT_EQ(py_client_->unregister_buffer(buffer.data()), 0);
+    EXPECT_EQ(initiator->unregister_calls_, 2);
+    EXPECT_TRUE(initiator->WasUnregistered(buffer.data()));
+
+    // Fully unregistered now: a third call has no record left and returns
+    // the TE error without touching the NoF side.
+    EXPECT_NE(py_client_->unregister_buffer(buffer.data()), 0);
+    EXPECT_EQ(initiator->unregister_calls_, 2);
+
+    ASSERT_EQ(py_client_->tearDownAll(), 0);
+}
+
 }  // namespace testing
 
 }  // namespace mooncake

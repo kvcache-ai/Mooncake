@@ -4166,13 +4166,13 @@ tl::expected<void, ErrorCode> RealClient::register_buffer_internal(
     if (nof_runtime_.initiator) {
         auto rc = nof_runtime_.initiator->RegisterMemory(buffer, size);
         if (rc == ErrorCode::NOF_REGISTRATION_STUCK) {
-            // The backend may still hold translation state for this buffer;
-            // teardown's UnregisterMemory walk retries the cleanup.
+            // The failed page is terminally quarantined (never unregistered,
+            // never munmapped): the buffer must not be freed or remapped.
             LOG(ERROR) << "NoF memory registration left unconfirmed "
                           "translation state for buffer "
                        << buffer << ", size " << size
-                       << "; buffer stays registered with the transfer "
-                          "engine, and teardown will retry the NoF cleanup";
+                       << "; the affected NoF page is quarantined. Do not "
+                          "free or remap this buffer.";
         } else if (rc != ErrorCode::OK) {
             LOG(WARNING) << "NoF memory registration failed for buffer "
                          << buffer << ", size " << size << ": " << toString(rc)
@@ -4200,28 +4200,37 @@ tl::expected<void, ErrorCode> RealClient::unregister_buffer_internal(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     auto unregister_result = client_->unregisterLocalMemory(buffer, true);
+
+    // Record check, NoF cleanup and record erase stay in one critical
+    // section (teardown's unregister walk takes the same lock).
+    std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
     if (!unregister_result) {
-        LOG(ERROR) << "Unregister buffer failed with error: "
-                   << toString(unregister_result.error());
-        return tl::unexpected(unregister_result.error());
+        // A previous call may have unregistered TE while the NoF cleanup
+        // failed: when the buffer is still recorded, let this retry reach
+        // the NoF cleanup instead of failing at TE.
+        if (registered_buffer_sizes_.count(buffer) == 0) {
+            LOG(ERROR) << "Unregister buffer failed with error: "
+                       << toString(unregister_result.error());
+            return tl::unexpected(unregister_result.error());
+        }
+        LOG(WARNING) << "TE unregister failed for recorded buffer " << buffer
+                     << ": " << toString(unregister_result.error())
+                     << "; retrying the NoF cleanup anyway";
     }
     if (nof_runtime_.initiator) {
         auto rc = nof_runtime_.initiator->UnregisterMemory(buffer);
         if (rc != ErrorCode::OK) {
             // The backend may still hold a translation for this buffer:
-            // propagate the failure and keep the record so teardown retries
-            // the cleanup even though TE is already unregistered.
+            // propagate the failure and keep the record so teardown keeps
+            // the NoF pages pinned (quarantined).
             LOG(ERROR) << "NoF memory unregistration failed for buffer "
                        << buffer << ": " << toString(rc)
-                       << "; buffer stays recorded and teardown will retry "
-                          "the cleanup. Do not free or remap this buffer.";
+                       << "; buffer stays recorded and the NoF pages stay "
+                          "quarantined. Do not free or remap this buffer.";
             return tl::unexpected(rc);
         }
     }
-    {
-        std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
-        registered_buffer_sizes_.erase(buffer);
-    }
+    registered_buffer_sizes_.erase(buffer);
     return {};
 }
 
