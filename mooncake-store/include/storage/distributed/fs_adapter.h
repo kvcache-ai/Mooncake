@@ -35,23 +35,6 @@ class FileSystemAdapter {
    public:
     virtual ~FileSystemAdapter() = default;
 
-    // === File I/O ===
-
-    virtual tl::expected<size_t, ErrorCode> WriteFile(
-        const std::string& path, std::span<const char> data) = 0;
-
-    // Read file into a pre-allocated buffer (zero-copy into Slice.ptr)
-    virtual tl::expected<size_t, ErrorCode> ReadFile(const std::string& path,
-                                                     void* buf, size_t len) = 0;
-
-    virtual tl::expected<size_t, ErrorCode> VectorWriteFile(
-        const std::string& path, const iovec* iov, int iovcnt,
-        off_t offset) = 0;
-
-    virtual tl::expected<size_t, ErrorCode> VectorReadFile(
-        const std::string& path, const iovec* iov, int iovcnt,
-        off_t offset) = 0;
-
     // === File management ===
 
     virtual tl::expected<void, ErrorCode> DeleteFile(

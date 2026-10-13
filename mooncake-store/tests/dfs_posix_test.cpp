@@ -1781,10 +1781,9 @@ TEST_F(DfsBackendTest, FailurePaths) {
     ASSERT_FALSE(write.has_value());
     EXPECT_EQ(write.error(), ErrorCode::INVALID_PARAMS);
 
-    auto read =
-        adapter.ReadFile(tmp_->file("does_not_exist"), buf, sizeof(buf));
-    ASSERT_FALSE(read.has_value());
-    EXPECT_EQ(read.error(), ErrorCode::FILE_NOT_FOUND);
+    auto open = adapter.OpenExistingFile(tmp_->file("does_not_exist"));
+    ASSERT_FALSE(open.has_value());
+    EXPECT_EQ(open.error(), ErrorCode::FILE_NOT_FOUND);
 }
 
 TEST(DfsStorageFactoryTest, CreatesDistributedBackendWithPosixAdapter) {
