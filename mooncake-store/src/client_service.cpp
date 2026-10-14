@@ -1034,7 +1034,8 @@ void Client::InitTransferSubmitter() {
             GetCurrentNumaSocketId());
     transfer_submitter_ = std::make_unique<TransferSubmitter>(
         *transfer_engine_, storage_backend_, local_hostname_,
-        metrics_ ? &metrics_->transfer_metric : nullptr, numa_socket_id);
+        metrics_ ? &metrics_->transfer_metric : nullptr, numa_socket_id,
+        metrics_ ? &metrics_->nof_metric : nullptr);
 #else
     transfer_submitter_ = std::make_unique<TransferSubmitter>(
         *transfer_engine_, storage_backend_, local_hostname_,
