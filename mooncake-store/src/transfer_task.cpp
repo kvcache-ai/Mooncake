@@ -115,12 +115,25 @@ static void nof_io_complete(void* ctx, const mooncake::NofIOCompletion& c) {
     }
 
     if (!c.success) {
+        if (task->metric) {
+            if (task->op == NofIOOp::kWrite) {
+                task->metric->RecordWriteErrors();
+            } else {
+                task->metric->RecordReadErrors();
+            }
+        }
         LOG(ERROR) << "nof task I/O failed: sc=" << c.sc << " sct=" << c.sct
                    << " " << c.error_string;
         task->remaining_bytes = 0;
         task->failed = true;
         if (task->error_detail.empty()) {
             task->error_detail = c.error_string;  // keep the first error detail
+        }
+    } else if (task->metric) {
+        if (task->op == NofIOOp::kWrite) {
+            task->metric->ObserveWrite(sub_task->submit_bytes);
+        } else {
+            task->metric->ObserveRead(sub_task->submit_bytes);
         }
     }
 
@@ -558,6 +571,13 @@ void NofWorkerPool::workerThread(int work_idx) {
                             task->seg_handle, submit_ptr, submit_off,
                             submit_bytes, task->op, &sub_task->adaptor);
                         if (ret != 0) {
+                            if (task->metric) {
+                                if (task->op == NofIOOp::kWrite) {
+                                    task->metric->RecordWriteErrors();
+                                } else {
+                                    task->metric->RecordReadErrors();
+                                }
+                            }
                             LOG(ERROR) << "work " << work_idx << ", seg "
                                        << task->seg_handle << " submit io fail";
                             // Return the pool slot: a sub-task taken out
@@ -1030,12 +1050,14 @@ TransferStrategy TransferFuture::strategy() const {
 TransferSubmitter::TransferSubmitter(
     TransferEngine& engine, std::shared_ptr<StorageBackend>& backend,
     const std::string& local_hostname, TransferMetric* transfer_metric,
-    int numa_socket_id, std::shared_ptr<NVMeoFInitiator> nof_initiator)
+    int numa_socket_id, std::shared_ptr<NVMeoFInitiator> nof_initiator,
+    NofMetric* nof_metric)
     : engine_(engine),
       tent_engine_(engine.getTentEngine().get()),
       local_endpoint_(engine.getLocalIpAndPort()),
       memcpy_pool_(std::make_unique<MemcpyWorkerPool>()),
       nof_initiator_(std::move(nof_initiator)),
+      nof_metric_(nof_metric),
       fileread_pool_(std::make_unique<FilereadWorkerPool>(backend)),
       local_hostname_(local_hostname),
       transfer_metric_(transfer_metric) {
@@ -2005,6 +2027,7 @@ std::optional<TransferFuture> TransferSubmitter::submitNofOperation(
         (op_code == TransferRequest::READ) ? NofIOOp::kRead : NofIOOp::kWrite;
     auto state = std::make_shared<NofOperationState>();
     NofTask task(seg_handle, ptr, handle.buffer_address_, size, op, state);
+    task.metric = nof_metric_;
     nof_pool_->submitTask(std::move(task));
 
     VLOG(1) << "NoF transfer submitted to " << handle.transport_endpoint_;

@@ -413,6 +413,7 @@ class MemcpyWorkerPool {
 };
 
 struct NofQos;
+struct NofMetric;
 
 /**
  * @brief NoF operation descriptor (byte-oriented, opaque handle)
@@ -437,6 +438,9 @@ struct NofTask {
     std::shared_ptr<std::atomic<int64_t>> io_count;
     NofQos* nof_qos;
     NofTask* nxt;
+    // Optional metrics sink; wired by TransferSubmitter, nullptr when the
+    // client has no metrics.
+    NofMetric* metric = nullptr;
 
     NofTask(NofSegmentHandle* handle, void* buf, uint64_t byte_off,
             uint64_t byte_len, NofIOOp op_code,
@@ -601,7 +605,8 @@ class TransferSubmitter {
         TransferEngine& engine, std::shared_ptr<StorageBackend>& backend,
         const std::string& local_hostname,
         TransferMetric* transfer_metric = nullptr, int numa_socket_id = 0,
-        std::shared_ptr<NVMeoFInitiator> nof_initiator = nullptr);
+        std::shared_ptr<NVMeoFInitiator> nof_initiator = nullptr,
+        NofMetric* nof_metric = nullptr);
 
     /**
      * @brief Submit an asynchronous transfer operation
@@ -679,6 +684,7 @@ class TransferSubmitter {
     const std::string local_endpoint_;
     std::unique_ptr<MemcpyWorkerPool> memcpy_pool_;
     std::shared_ptr<NVMeoFInitiator> nof_initiator_;
+    NofMetric* nof_metric_ = nullptr;
     std::unique_ptr<NofWorkerPool> nof_pool_;
     std::unique_ptr<FilereadWorkerPool> fileread_pool_;
     bool memcpy_enabled_;
