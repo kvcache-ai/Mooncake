@@ -25,6 +25,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <set>
 #include <thread>
@@ -199,6 +200,8 @@ RdmaTransport::~RdmaTransport() {
 #endif
     metadata_->removeSegmentDesc(local_server_name_);
     batch_desc_set_.clear();
+    for (auto &[_, anchor] : kfd_pin_anchors_) ibv_dereg_mr(anchor.mr);
+    kfd_pin_anchors_.clear();
     context_list_.clear();
 }
 
@@ -370,6 +373,18 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
         DmabufExport &exp;
         ~DmabufCloser() { RdmaContext::closeDmabufExport(exp); }
     } dmabuf_closer{dmabuf_exp};
+
+    // Taken before the first dma-buf pin and dropped after any rollback below.
+    struct KfdPinAnchorGuard {
+        RdmaTransport *transport;
+        void *addr;
+        bool held;
+        ~KfdPinAnchorGuard() {
+            if (held) transport->releaseKfdPinAnchor(addr);
+        }
+    } kfd_pin_anchor{this, addr,
+                     dmabuf_exp.alloc_base &&
+                         acquireKfdPinAnchor(addr, dmabuf_exp.alloc_base)};
 
     // Mooncake#2017: ibv_reg_mr silently truncates a registration to the device
     // max_mr_size, but the metadata would still advertise the full BufferDesc
@@ -660,6 +675,7 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
         for (auto &c : chunks) chunk_addrs.push_back((uint64_t)c.first);
         chunk_map_[(uint64_t)addr] = std::move(chunk_addrs);
     }
+    kfd_pin_anchor.held = false;
     return 0;
 }
 
@@ -750,6 +766,7 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
             std::lock_guard<std::mutex> lock(chunk_map_mutex_);
             chunk_map_.erase((uint64_t)addr);
         }
+        if (!first_err) releaseKfdPinAnchor(addr);
         return first_err;
     }
 
@@ -819,6 +836,7 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
         }
         return dereg_err;
     }
+    releaseKfdPinAnchor(addr);
 
     // Confirmed cleanup: report success so the engine erases its region
     // record and the same range can be registered again.
@@ -837,6 +855,50 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
         pending_dereg_.erase((uint64_t)addr);
     }
     return 0;
+}
+
+bool RdmaTransport::acquireKfdPinAnchor(void *addr, void *alloc_base) {
+    std::lock_guard<std::mutex> lock(kfd_pin_anchor_mutex_);
+    auto base = reinterpret_cast<uintptr_t>(alloc_base);
+    if (!kfd_pin_anchor_of_buffer_
+             .emplace(reinterpret_cast<uintptr_t>(addr), base)
+             .second)
+        return false;
+    auto &anchor = kfd_pin_anchors_[base];
+    if (!anchor.mr) {
+        // The peer-memory client pins the whole allocation for any range.
+        for (auto &context : context_list_) {
+            if (!context->pd()) continue;
+            anchor.mr = ibv_reg_mr(context->pd(), alloc_base, getpagesize(),
+                                   IBV_ACCESS_LOCAL_WRITE);
+            if (anchor.mr) break;
+        }
+        if (!anchor.mr) {
+            LOG_FIRST_N(WARNING, 1)
+                << "amdgpu peer-memory pin unavailable (" << strerror(errno)
+                << "); KFD will count registered GPU memory twice in its "
+                   "free VRAM";
+            kfd_pin_anchors_.erase(base);
+            kfd_pin_anchor_of_buffer_.erase(reinterpret_cast<uintptr_t>(addr));
+            return false;
+        }
+    }
+    ++anchor.refs;
+    return true;
+}
+
+void RdmaTransport::releaseKfdPinAnchor(void *addr) {
+    std::lock_guard<std::mutex> lock(kfd_pin_anchor_mutex_);
+    auto owner =
+        kfd_pin_anchor_of_buffer_.find(reinterpret_cast<uintptr_t>(addr));
+    if (owner == kfd_pin_anchor_of_buffer_.end()) return;
+    auto anchor = kfd_pin_anchors_.find(owner->second);
+    kfd_pin_anchor_of_buffer_.erase(owner);
+    if (--anchor->second.refs) return;
+    int ret = ibv_dereg_mr(anchor->second.mr);
+    if (ret)
+        LOG(WARNING) << "Failed to release KFD pin anchor: " << strerror(ret);
+    kfd_pin_anchors_.erase(anchor);
 }
 
 int RdmaTransport::allocateLocalSegmentID() {
