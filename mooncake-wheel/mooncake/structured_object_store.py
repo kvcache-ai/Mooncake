@@ -6318,7 +6318,7 @@ def _decode_msgpack_ragged_values(payload: dict[str, Any], rows: int) -> list[An
         )
     raw_data = bytes(data) if not isinstance(data, bytes) else data
     if rows == 0 or not bool(nulls.any()):
-        unpacker = _msgpack.Unpacker(raw=False)
+        unpacker = _msgpack.Unpacker(raw=False, strict_map_key=False)
         unpacker.feed(raw_data)
         values = list(unpacker)
         if len(values) != rows:
@@ -6326,7 +6326,7 @@ def _decode_msgpack_ragged_values(payload: dict[str, Any], rows: int) -> list[An
                 f"msgpack_ragged decoded {len(values)} rows, expected {rows}"
             )
         return values
-    unpacker = _msgpack.Unpacker(raw=False)
+    unpacker = _msgpack.Unpacker(raw=False, strict_map_key=False)
     unpacker.feed(raw_data)
     non_null_iter = iter(unpacker)
     values = []
