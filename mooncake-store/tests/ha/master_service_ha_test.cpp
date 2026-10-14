@@ -740,17 +740,13 @@ class MasterServiceHATest : public ::testing::Test {
         auto& tenant_state =
             MasterServiceTestPeer(*service).GetOrCreateTenantState(
                 shard_access.get(), tenant);
-        tenant_state.promotion_tasks.emplace(
-            key, MasterServiceTestPeer::PromotionTask{
-                     .source_id = 0,
-                     .alloc_id = alloc_id,
-                     .object_size = object_size,
-                     .start_time = std::chrono::system_clock::now(),
-                     .holder_id = holder_id});
-    }
-
-    static bool SnapshotManagerCreatedForTesting(const MasterService& service) {
-        return MasterServiceTestPeer::SnapshotManager(service) != nullptr;
+        tenant_state.metadata.at(key).state.promotion_task =
+            MasterServiceTestPeer::PromotionTask{
+                .source_id = 0,
+                .alloc_id = alloc_id,
+                .object_size = object_size,
+                .start_time = std::chrono::system_clock::now(),
+                .holder_id = holder_id};
     }
 
     static bool NeedMemoryEvictionForTesting(const MasterService& service) {
@@ -925,7 +921,7 @@ class MasterServiceHATest : public ::testing::Test {
         }
         const auto metadata = tenant->second.metadata.find(key);
         return metadata != tenant->second.metadata.end() &&
-               metadata->second.HasReplica([](const Replica& replica) {
+               metadata->second.metadata.HasReplica([](const Replica& replica) {
                    return replica.is_memory_replica() && replica.is_completed();
                });
     }
@@ -980,7 +976,7 @@ class MasterServiceHATest : public ::testing::Test {
     static std::unique_lock<std::shared_mutex> LockSnapshotForTesting(
         MasterService& service) {
         return std::unique_lock<std::shared_mutex>(
-            MasterServiceTestPeer::SnapshotMutex(service));
+            MasterServiceTestPeer::MasterStateMutex(service));
     }
 
     static std::unique_lock<SharedMutex> LockMetadataShardForTesting(
@@ -1055,7 +1051,7 @@ class MasterServiceHATest : public ::testing::Test {
             return false;
         }
         std::unique_lock<std::shared_mutex> snapshot_lock(
-            MasterServiceTestPeer::SnapshotMutex(service), std::try_to_lock);
+            MasterServiceTestPeer::MasterStateMutex(service), std::try_to_lock);
         return !snapshot_lock.owns_lock();
     }
 
@@ -3977,21 +3973,6 @@ TEST_F(MasterServiceHATest, OplogRedisInvalidConnstringThrows) {
                       .build();
 
     EXPECT_THROW({ MasterService service(config); }, std::runtime_error);
-}
-
-TEST_F(MasterServiceHATest, BatchPrimaryDoesNotStartSnapshotWorker) {
-    auto config =
-        MasterServiceConfig::builder()
-            .set_enable_ha(true)
-            .set_enable_oplog(true)
-            .set_cluster_id("batch_snapshot_gate")
-            .set_enable_snapshot(true)
-            .set_snapshot_backup_dir(LegacyOpLogRootDir() + "/batch_snapshot")
-            .set_snapshot_object_store_type("local")
-            .build();
-
-    MasterService service(config);
-    EXPECT_FALSE(SnapshotManagerCreatedForTesting(service));
 }
 
 TEST_F(MasterServiceBatchRecordE2ETest,

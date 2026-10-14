@@ -57,6 +57,10 @@ struct GlobalConfig {
     // one it honors the operator's value, clamped to the hardware.  The RDMA
     // transport passes max_wr to ibv_create_qp() and is unaffected.
     bool max_wr_from_env = false;
+    // 1 = signal every RDMA WR (historical). >1 enables unsignaled WRs with
+    // a signaled completion every N WRs plus the end of each ibv_post_send
+    // chain. Override via MC_RDMA_SIGNAL_INTERVAL.
+    int rdma_signal_interval = 1;
     size_t max_inline = 64;
     ibv_mtu mtu_length = IBV_MTU_4096;
     uint16_t handshake_port = 12001;
