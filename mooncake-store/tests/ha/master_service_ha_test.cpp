@@ -749,10 +749,6 @@ class MasterServiceHATest : public ::testing::Test {
                 .holder_id = holder_id};
     }
 
-    static bool SnapshotManagerCreatedForTesting(const MasterService& service) {
-        return MasterServiceTestPeer::SnapshotManager(service) != nullptr;
-    }
-
     static bool NeedMemoryEvictionForTesting(const MasterService& service) {
         return MasterServiceTestPeer::NeedMemEviction(service).load(
             std::memory_order_relaxed);
@@ -980,7 +976,7 @@ class MasterServiceHATest : public ::testing::Test {
     static std::unique_lock<std::shared_mutex> LockSnapshotForTesting(
         MasterService& service) {
         return std::unique_lock<std::shared_mutex>(
-            MasterServiceTestPeer::SnapshotMutex(service));
+            MasterServiceTestPeer::MasterStateMutex(service));
     }
 
     static std::unique_lock<SharedMutex> LockMetadataShardForTesting(
@@ -1055,7 +1051,7 @@ class MasterServiceHATest : public ::testing::Test {
             return false;
         }
         std::unique_lock<std::shared_mutex> snapshot_lock(
-            MasterServiceTestPeer::SnapshotMutex(service), std::try_to_lock);
+            MasterServiceTestPeer::MasterStateMutex(service), std::try_to_lock);
         return !snapshot_lock.owns_lock();
     }
 
@@ -1512,6 +1508,88 @@ TEST_F(MasterServiceHATest, RestoreFromStandbyPreservesHardPinned) {
                         {object}, 7, {MakeStandbyMemorySegment(endpoint)})
                     .has_value());
     EXPECT_TRUE(IsHardPinnedForTesting(service, kDefaultTenant, key));
+}
+
+TEST_F(MasterServiceHATest, BatchPromotionDropsReplicasOnUnloadedSegments) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+
+    const std::string endpoint = "batch_drop_live_segment";
+    const std::string stale_endpoint = "batch_drop_unloaded_segment";
+    auto object = MakeStandbyObject("batch_drop_key", endpoint);
+    object.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    // A replica on a segment that was unloaded before the handoff must not
+    // fail the promotion; it is simply gone.
+    auto stale = MakeStandbyMemoryReplica(stale_endpoint);
+    stale.id = 2;
+    stale.get_memory_descriptor().buffer_descriptor.buffer_address_ =
+        kDefaultSegmentBase + 4096;
+    object.metadata.replicas.push_back(std::move(stale));
+    auto stale_tombstone = MakeStandbyMemoryReplica(stale_endpoint);
+    stale_tombstone.id = 3;
+    stale_tombstone.status = ReplicaStatus::REMOVED;
+    object.metadata.replicas.push_back(std::move(stale_tombstone));
+
+    auto source = std::make_unique<StandbyMetadataStore>();
+    ASSERT_TRUE(
+        source->PutMetadata(object.tenant_id, object.key, object.metadata));
+    BatchOpLogPromotionHandoff handoff;
+    handoff.metadata_store = std::move(source);
+    handoff.segments = {MakeStandbyMemorySegment(endpoint)};
+    handoff.applied_cursor = {.batch_id = 7, .last_seq = 7};
+    handoff.max_replica_id = 3;
+
+    ASSERT_TRUE(service.RestoreFromBatchOpLogPromotion(std::move(handoff), 1)
+                    .has_value());
+
+    auto replicas =
+        ReplicaDescriptorsForTesting(service, kDefaultTenant, "batch_drop_key");
+    ASSERT_EQ(replicas.size(), 1);
+    EXPECT_EQ(replicas.front().id, 1);
+    EXPECT_EQ(replicas.front()
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              endpoint);
+}
+
+TEST_F(MasterServiceHATest, BatchPromotionSkipsObjectWhenAllReplicasAreStale) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+
+    const std::string endpoint = "batch_skip_live_segment";
+    auto good = MakeStandbyObject("batch_skip_good", endpoint);
+    good.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    auto stale_only =
+        MakeStandbyObject("batch_skip_stale", "batch_skip_unloaded_segment");
+    stale_only.metadata.replicas.front().id = 2;
+    auto empty = MakeStandbyObject("batch_skip_empty", endpoint);
+    empty.metadata.replicas.clear();
+
+    auto source = std::make_unique<StandbyMetadataStore>();
+    ASSERT_TRUE(source->PutMetadata(good.tenant_id, good.key, good.metadata));
+    ASSERT_TRUE(source->PutMetadata(stale_only.tenant_id, stale_only.key,
+                                    stale_only.metadata));
+    ASSERT_TRUE(
+        source->PutMetadata(empty.tenant_id, empty.key, empty.metadata));
+    BatchOpLogPromotionHandoff handoff;
+    handoff.metadata_store = std::move(source);
+    handoff.segments = {MakeStandbyMemorySegment(endpoint)};
+    handoff.applied_cursor = {.batch_id = 7, .last_seq = 7};
+    handoff.max_replica_id = 2;
+
+    ASSERT_TRUE(service.RestoreFromBatchOpLogPromotion(std::move(handoff), 1)
+                    .has_value());
+
+    EXPECT_EQ(
+        ReplicaCountForTesting(service, kDefaultTenant, "batch_skip_good"), 1);
+    EXPECT_FALSE(HasMetadataEntryForTesting(service, kDefaultTenant,
+                                            "batch_skip_stale"));
+    EXPECT_TRUE(HasMetadataEntryForTesting(service, kDefaultTenant,
+                                           "batch_skip_empty"));
 }
 
 TEST_F(MasterServiceHATest, RestoreSkipsBadObjectAndKeepsExistingState) {
@@ -3977,21 +4055,6 @@ TEST_F(MasterServiceHATest, OplogRedisInvalidConnstringThrows) {
                       .build();
 
     EXPECT_THROW({ MasterService service(config); }, std::runtime_error);
-}
-
-TEST_F(MasterServiceHATest, BatchPrimaryDoesNotStartSnapshotWorker) {
-    auto config =
-        MasterServiceConfig::builder()
-            .set_enable_ha(true)
-            .set_enable_oplog(true)
-            .set_cluster_id("batch_snapshot_gate")
-            .set_enable_snapshot(true)
-            .set_snapshot_backup_dir(LegacyOpLogRootDir() + "/batch_snapshot")
-            .set_snapshot_object_store_type("local")
-            .build();
-
-    MasterService service(config);
-    EXPECT_FALSE(SnapshotManagerCreatedForTesting(service));
 }
 
 TEST_F(MasterServiceBatchRecordE2ETest,

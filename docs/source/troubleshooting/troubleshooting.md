@@ -25,6 +25,16 @@ An enabled reader skips verification when the object's metadata has no checksum,
 Checksum diagnostics add a full data scan to writes and reads, perform device-to-host staging for GPU buffers, and disable the local hot cache. Disable the switch after diagnosis. See the [Mooncake Store Deployment and Tuning Guide](../deployment/mooncake-store-deployment-guide.md) for deployment and snapshot compatibility details.
 
 ## Metadata and Out-of-Band Communication
+
+### TENT Configuration Parse Diagnostics
+
+JSON parse errors report a parser code and byte position without echoing the
+configuration's input tokens. Check the original `MC_TENT_CONF` value or file
+privately at that position. Errors from probing an inline configuration as a
+filename report the filesystem error without printing the configuration.
+Numeric parsing failures also omit the input literal. Review other log fields
+and attachments for sensitive data before sharing them.
+
 1. At startup, a `TransferMetadata` object is constructed according to the incoming `metadata_server` parameter. During program execution, this object is used to communicate with the etcd server to maintain internal data required for connection.
 2. At startup, the current node is registered with the cluster according to the incoming `connectable_name` parameter and `rpc_port` parameter, and the TCP port specified by the `rpc_port` parameter is listened. Before other nodes send the first read/write request to the current node, they will use the above information, resolve DNS, and initiate a connection through socket's `connect()` method.
 
