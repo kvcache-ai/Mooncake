@@ -24,6 +24,8 @@
 /python/mooncake/mooncake_config.py @ykwd @stmatengss
 /python/mooncake/mooncake_elastic_buffer.py @UNIDY2002 @ympcMark @yuechen-sys
 /python/mooncake/mooncake_ep_buffer.py @UNIDY2002 @ympcMark @yuechen-sys
+/python/mooncake/shared_segment.py @ShangmingCai @alogfans
+/python/tests/engine/ @ShangmingCai @alogfans
 /python/tests/ep/ @UNIDY2002 @ympcMark @yuechen-sys
 /python/tests/services/test_http_metadata_server.py @ykwd @stmatengss @zxpdemonio
 /python/mooncake/cli.py @ykwd @stmatengss @zxpdemonio
