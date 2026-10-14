@@ -953,9 +953,10 @@ void FileStorage::OnDiskError(int err, const char* op) {
     if (action == DiskErrorAction::kCheckFilesystem) {
         // One check at a time; a concurrent failure defers to the running one.
         if (filesystem_check_running_.exchange(true)) return;
-        // syncfs only for write-path failures: reads leave the log nothing to
-        // write (measured: they alone never shut XFS down), and one bad file
-        // would otherwise flush the whole filesystem on every failed read.
+        // syncfs for every failure except a data or metadata read: reads
+        // leave the log nothing to write (measured: they alone never shut XFS
+        // down), and one bad file would otherwise flush the whole filesystem
+        // on every failed read.
         const std::string_view op_name(op);
         const bool sync_first = op_name != "preadv" && op_name != "read";
         check_err = CheckFilesystem(sync_first);
