@@ -12,6 +12,8 @@ bool MasterStoreBackend::CanPublishWeightMutations() const {
 
 PromotionQueueResult MasterStoreBackend::PromoteWeightObject(
     const TenantId& tenant_id, const std::string& key) {
+    // An explicit HOT operation bypasses promotion-on-hit and frequency gates.
+    // Watermark, replica, and in-flight checks still apply.
     return master_.TryPushPromotionQueue(
         master_.MakeObjectIdentity(key, tenant_id), false, true);
 }
@@ -27,9 +29,10 @@ tl::expected<void, ErrorCode> MasterStoreBackend::RemoveObject(
     return master_.RemoveObject(key, tenant_id, force, allow_managed_weight);
 }
 
-void MasterStoreBackend::EvictManagedWeightGroupToCold(
-    const WeightRevisionMetadata& revision) {
-    master_.EvictManagedWeightGroupToCold(revision);
+void MasterStoreBackend::EvictManagedWeightMembersToCold(
+    const WeightRevisionMetadata& revision,
+    const std::vector<std::string>& member_keys) {
+    master_.EvictManagedWeightMembersToCold(revision, member_keys);
 }
 
 bool MasterStoreBackend::IsOpLogEnabled() const {

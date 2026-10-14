@@ -581,10 +581,6 @@ class PyClient {
         const QueryWeightOperationRequest &) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    virtual WeightRpcResult<WeightRevisionMetadata> reconcile_weight_revision(
-        const ReconcileWeightRevisionRequest &) {
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
     virtual WeightRpcResult<WeightRevisionMetadata> delete_weight_revision(
         const DeleteWeightRevisionRequest &) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);

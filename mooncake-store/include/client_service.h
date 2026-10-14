@@ -499,8 +499,6 @@ class Client {
         const StartWeightResidencyOperationRequest& request);
     WeightRpcResult<WeightResidencyOperation> QueryWeightOperation(
         const QueryWeightOperationRequest& request);
-    WeightRpcResult<WeightRevisionMetadata> ReconcileWeightRevision(
-        const ReconcileWeightRevisionRequest& request);
     WeightRpcResult<WeightRevisionMetadata> DeleteWeightRevision(
         const DeleteWeightRevisionRequest& request);
 

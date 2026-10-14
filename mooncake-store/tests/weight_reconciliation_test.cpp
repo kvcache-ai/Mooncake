@@ -68,7 +68,153 @@ class WeightReconciliationTest : public MasterServiceTest {
         EXPECT_TRUE(ready.has_value());
         return *ready;
     }
+
+    void CheckContinuousLeaseTraffic(size_t limit) {
+        MasterService service;
+        const auto context = PrepareSimpleSegment(service);
+        const auto damaged =
+            PublishReady(service, context.client_id, "a-lease-traffic-damaged");
+        const auto leased =
+            PublishReady(service, context.client_id, "z-lease-traffic-healthy");
+        ASSERT_TRUE(
+            MasterServiceTestPeer(service).DropWeightGroupMemberForTesting(
+                damaged.identity, "a-lease-traffic-damaged-payload"));
+        size_t created = 0;
+        size_t previously_released = 0;
+        for (int round = 0; round < 6; ++round) {
+            uint64_t sweep_time = 0;
+            for (size_t i = 0; i < limit; ++i) {
+                const auto lease = service.AcquireWeightRevisionLease({
+                    .identity = leased.identity,
+                    .expected_metadata_generation = leased.metadata_generation,
+                    .holder = "lease-traffic-" + std::to_string(round) + "-" +
+                              std::to_string(i),
+                    .ttl_ms = 60'000,
+                });
+                ASSERT_TRUE(lease);
+                ++created;
+                sweep_time = std::max(sweep_time, lease->expires_at_ms + 1);
+            }
+            EXPECT_LE(MasterServiceTestPeer(service)
+                          .RunWeightReconciliationForTesting(sweep_time, limit),
+                      limit);
+            if ((round + 1) % 2 == 0) {
+                const auto snapshot =
+                    service.GetWeightStoreManager().ExportSnapshot();
+                ASSERT_LE(snapshot.leases.size(), created);
+                const auto released = created - snapshot.leases.size();
+                EXPECT_GT(released, previously_released) << "round=" << round;
+                previously_released = released;
+            }
+        }
+        const auto observed =
+            service.GetWeightRevision({.identity = damaged.identity});
+        ASSERT_TRUE(observed);
+        EXPECT_EQ(WeightAvailabilityState::DEGRADED,
+                  observed->metadata.availability);
+    }
 };
+
+TEST_F(WeightReconciliationTest, RevisionWindowsAdvancePastExaminedRows) {
+    MasterService service;
+    const auto context = PrepareSimpleSegment(service);
+    for (const auto& revision : {"00-fresh-import", "01-fresh-import"}) {
+        ASSERT_TRUE(service.BeginWeightImport({
+            .identity = Identity(revision),
+            .expected_payload_count = 1,
+            .expected_logical_bytes = 1024,
+        }));
+    }
+    std::vector<WeightRevisionIdentity> identities;
+    uint64_t now_ms = 0;
+    for (int i = 0; i < 6; ++i) {
+        const auto revision = "round-robin-" + std::to_string(i);
+        const auto ready = PublishReady(service, context.client_id, revision);
+        identities.push_back(ready.identity);
+        now_ms = std::max(now_ms, ready.updated_at_ms + 1);
+        ASSERT_TRUE(
+            MasterServiceTestPeer(service).DropWeightGroupMemberForTesting(
+                ready.identity, revision + "-payload"));
+    }
+    for (int round = 0; round < 3; ++round) {
+        EXPECT_EQ(
+            2, MasterServiceTestPeer(service).RunWeightReconciliationForTesting(
+                   now_ms, 2));
+    }
+    for (const auto& identity : identities) {
+        const auto observed = service.GetWeightRevision({.identity = identity});
+        ASSERT_TRUE(observed);
+        EXPECT_EQ(WeightAvailabilityState::DEGRADED,
+                  observed->metadata.availability)
+            << identity.revision;
+    }
+}
+
+TEST_F(WeightReconciliationTest, ExpiredLeaseTrafficLeavesRevisionBudget) {
+    CheckContinuousLeaseTraffic(2);
+}
+
+TEST_F(WeightReconciliationTest, UnitBudgetAlternatesUnderExpiredLeaseTraffic) {
+    CheckContinuousLeaseTraffic(1);
+}
+
+TEST_F(WeightReconciliationTest, UnitBudgetWithoutLeasesDoesRevisionWork) {
+    MasterService service;
+    const auto context = PrepareSimpleSegment(service);
+    const auto ready = PublishReady(service, context.client_id, "no-lease");
+    ASSERT_TRUE(MasterServiceTestPeer(service).DropWeightGroupMemberForTesting(
+        ready.identity, "no-lease-payload"));
+    EXPECT_EQ(1,
+              MasterServiceTestPeer(service).RunWeightReconciliationForTesting(
+                  ready.updated_at_ms + 1, 1));
+    const auto observed =
+        service.GetWeightRevision({.identity = ready.identity});
+    ASSERT_TRUE(observed);
+    EXPECT_EQ(WeightAvailabilityState::DEGRADED,
+              observed->metadata.availability);
+}
+
+TEST_F(WeightReconciliationTest,
+       UnboundedReconcileCompletesAbortedImportDelete) {
+    MasterService service;
+    const auto context = PrepareSimpleSegment(service);
+    const auto identity = Identity("unbounded-delete");
+    const auto importing = service.BeginWeightImport({
+        .identity = identity,
+        .expected_payload_count = 1,
+        .expected_logical_bytes = 1024,
+    });
+    ASSERT_TRUE(importing);
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.with_hard_pin = true;
+    config.group_ids =
+        std::vector<std::string>{importing->manifest.payload_group_id};
+    config.data_type = ObjectDataType::WEIGHT;
+    PutCompletedObject(service, context.client_id, "unbounded-delete-payload",
+                       config, 1024);
+    config.data_type = ObjectDataType::METADATA;
+    PutCompletedObject(service, context.client_id, ManifestKey(identity),
+                       config, 128);
+    ASSERT_TRUE(service.AbortWeightImport({
+        .identity = identity,
+        .expected_metadata_generation = importing->metadata_generation,
+    }));
+    const auto deleted =
+        service.ReconcileWeightRevision({.identity = identity});
+    ASSERT_TRUE(deleted);
+    EXPECT_EQ(WeightAvailabilityState::DELETED, deleted->availability);
+    for (const auto& key :
+         {std::string("unbounded-delete-payload"), ManifestKey(identity)}) {
+        const auto exists = service.ExistKey(key, TenantId::Default());
+        ASSERT_TRUE(exists);
+        EXPECT_FALSE(*exists) << key;
+    }
+    const auto retried =
+        service.ReconcileWeightRevision({.identity = identity});
+    ASSERT_TRUE(retried);
+    EXPECT_EQ(*deleted, *retried);
+}
 
 TEST_F(WeightReconciliationTest, ExpiresLeasesAndAbortsAbandonedImports) {
     MasterService service;
@@ -173,12 +319,106 @@ TEST_F(WeightReconciliationTest, MissingPayloadOrManifestBecomesDegraded) {
         ASSERT_TRUE(view.has_value());
         EXPECT_EQ(WeightAvailabilityState::DEGRADED,
                   view->metadata.availability);
-        EXPECT_EQ(WeightResidencyState::MIXED, view->metadata.residency);
+        EXPECT_EQ(WeightResidencyState::HOT, view->metadata.residency);
     }
     EXPECT_EQ(2, MasterMetricManager::instance().get_weight_revision_count(
                      "degraded"));
     EXPECT_EQ(
-        2, MasterMetricManager::instance().get_weight_residency_count("mixed"));
+        2, MasterMetricManager::instance().get_weight_residency_count("hot"));
+}
+
+TEST_F(WeightReconciliationTest, MemberBudgetBoundsDeletionAndResumes) {
+    MasterService service;
+    const auto context = PrepareSimpleSegment(service);
+    const auto identity = Identity("bounded-delete");
+    auto importing = service.BeginWeightImport({
+        .identity = identity,
+        .expected_payload_count = 2,
+        .expected_logical_bytes = 2048,
+    });
+    ASSERT_TRUE(importing);
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.with_hard_pin = true;
+    config.group_ids =
+        std::vector<std::string>{importing->manifest.payload_group_id};
+    config.data_type = ObjectDataType::WEIGHT;
+    PutCompletedObject(service, context.client_id, "bounded-a", config, 1024);
+    PutCompletedObject(service, context.client_id, "bounded-b", config, 1024);
+    config.data_type = ObjectDataType::METADATA;
+    PutCompletedObject(service, context.client_id, ManifestKey(identity),
+                       config, 128);
+    ASSERT_TRUE(service.AbortWeightImport({
+        .identity = identity,
+        .expected_metadata_generation = importing->metadata_generation,
+    }));
+    auto exists = [&](const std::string& key) {
+        auto result = service.ExistKey(key, TenantId::Default());
+        return result && *result;
+    };
+    MasterServiceTestPeer(service).RunWeightReconciliationForTesting(
+        importing->updated_at_ms + 1, 1);
+    EXPECT_EQ(1, int(exists("bounded-a")) + int(exists("bounded-b")));
+    EXPECT_TRUE(exists(ManifestKey(identity)));
+    for (int i = 0; i < 4; ++i) {
+        MasterServiceTestPeer(service).RunWeightReconciliationForTesting(
+            importing->updated_at_ms + 2 + i, 1);
+    }
+    auto deleted = service.GetWeightRevision({.identity = identity});
+    ASSERT_TRUE(deleted);
+    EXPECT_EQ(WeightAvailabilityState::DELETED, deleted->metadata.availability);
+    const auto generation = deleted->metadata.metadata_generation;
+    MasterServiceTestPeer(service).RunWeightReconciliationForTesting(
+        importing->updated_at_ms + 10, 1);
+    deleted = service.GetWeightRevision({.identity = identity});
+    ASSERT_TRUE(deleted);
+    EXPECT_EQ(generation, deleted->metadata.metadata_generation);
+}
+
+TEST_F(WeightReconciliationTest, MemberBudgetIsSharedAcrossRevisions) {
+    MasterService service;
+    const auto context = PrepareSimpleSegment(service);
+    std::vector<std::string> keys;
+    for (const auto& revision : {"shared-a", "shared-b"}) {
+        const auto identity = Identity(revision);
+        const auto importing = service.BeginWeightImport({
+            .identity = identity,
+            .expected_payload_count = 2,
+            .expected_logical_bytes = 2048,
+        });
+        ASSERT_TRUE(importing);
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.with_hard_pin = true;
+        config.group_ids =
+            std::vector<std::string>{importing->manifest.payload_group_id};
+        config.data_type = ObjectDataType::WEIGHT;
+        for (int i = 0; i < 2; ++i) {
+            keys.push_back(std::string(revision) + std::to_string(i));
+            PutCompletedObject(service, context.client_id, keys.back(), config,
+                               1024);
+        }
+        config.data_type = ObjectDataType::METADATA;
+        keys.push_back(ManifestKey(identity));
+        PutCompletedObject(service, context.client_id, keys.back(), config,
+                           128);
+        ASSERT_TRUE(service.AbortWeightImport({
+            .identity = identity,
+            .expected_metadata_generation = importing->metadata_generation,
+        }));
+    }
+    MasterServiceTestPeer(service).RunWeightReconciliationForTesting(1, 3);
+    size_t remaining = 0;
+    for (const auto& key : keys) {
+        const auto exists = service.ExistKey(key, TenantId::Default());
+        remaining += exists && *exists;
+    }
+    EXPECT_EQ(3, remaining);
+    MasterServiceTestPeer(service).RunWeightReconciliationForTesting(2, 3);
+    for (const auto& key : keys) {
+        const auto exists = service.ExistKey(key, TenantId::Default());
+        EXPECT_FALSE(exists && *exists);
+    }
 }
 
 TEST_F(WeightReconciliationTest, ProjectsLeaseAndOperationMetrics) {

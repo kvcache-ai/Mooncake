@@ -4253,11 +4253,6 @@ WeightRpcResult<WeightResidencyOperation> Client::QueryWeightOperation(
     return master_client_.QueryWeightOperation(request);
 }
 
-WeightRpcResult<WeightRevisionMetadata> Client::ReconcileWeightRevision(
-    const ReconcileWeightRevisionRequest& request) {
-    return master_client_.ReconcileWeightRevision(request);
-}
-
 WeightRpcResult<WeightRevisionMetadata> Client::DeleteWeightRevision(
     const DeleteWeightRevisionRequest& request) {
     return master_client_.DeleteWeightRevision(request);

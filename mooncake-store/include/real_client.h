@@ -413,8 +413,6 @@ class RealClient : public PyClient {
         const StartWeightResidencyOperationRequest &request) override;
     WeightRpcResult<WeightResidencyOperation> query_weight_operation(
         const QueryWeightOperationRequest &request) override;
-    WeightRpcResult<WeightRevisionMetadata> reconcile_weight_revision(
-        const ReconcileWeightRevisionRequest &request) override;
     WeightRpcResult<WeightRevisionMetadata> delete_weight_revision(
         const DeleteWeightRevisionRequest &request) override;
 

@@ -6,6 +6,7 @@
 #include <condition_variable>
 #include <limits>
 #include <memory>
+#include <unordered_set>
 
 #include <glog/logging.h>
 
@@ -25,7 +26,7 @@ WeightMetadataStore::Result<T> PersistAndPublish(
     auto completion = std::make_shared<Completion>();
     auto persisted = backend.AppendOpLogWithDurableFinalize(
         type, tenant_id, key, payload,
-        [completion,
+        [completion, error_context,
          publish](const WeightStoreBackend::DurableResult& durable_entry) {
             // Arbitrate terminal callbacks and publish under the same lock.
             std::lock_guard lock(completion->mutex);
@@ -33,6 +34,9 @@ WeightMetadataStore::Result<T> PersistAndPublish(
                 return;
             }
             if (!durable_entry) {
+                LOG(ERROR) << "Failed to durably persist " << error_context
+                           << ", error="
+                           << static_cast<int>(durable_entry.error());
                 completion->result = tl::make_unexpected(
                     WeightManagementError::DURABILITY_FAILED);
             } else {
@@ -425,6 +429,71 @@ WeightStoreManager::QueryWeightOperation(
 WeightMetadataStore::Result<WeightRevisionMetadata>
 WeightStoreManager::ReconcileWeightRevision(
     const ReconcileWeightRevisionRequest& request) {
+    return ReconcileWeightRevisionBounded(request, nullptr);
+}
+
+std::vector<std::string> WeightStoreManager::SelectReconciliationMembers(
+    const WeightRevisionMetadata& revision, size_t* member_budget) {
+    auto keys =
+        backend_.GetGroupMemberKeys(TenantId(revision.identity.tenant_id),
+                                    revision.manifest.payload_group_id);
+    if (!member_budget || keys.empty()) {
+        return keys;
+    }
+    std::sort(keys.begin(), keys.end());
+    const size_t count = std::min(*member_budget, keys.size());
+    {
+        std::lock_guard lock(member_cursor_mutex_);
+        auto& offset =
+            member_cursors_[MakeWeightRevisionMetadataKey(revision.identity)];
+        offset %= keys.size();
+        std::rotate(keys.begin(), keys.begin() + offset, keys.end());
+        offset = (offset + count) % keys.size();
+    }
+    keys.resize(count);
+    *member_budget -= count;
+    return keys;
+}
+
+void WeightStoreManager::ForgetReconciliationCursor(
+    const WeightRevisionIdentity& identity) {
+    std::lock_guard lock(member_cursor_mutex_);
+    member_cursors_.erase(MakeWeightRevisionMetadataKey(identity));
+}
+
+WeightMetadataStore::Result<void> WeightStoreManager::RemoveWeightMembers(
+    const WeightRevisionMetadata& revision, size_t* member_budget) {
+    const TenantId tenant_id(revision.identity.tenant_id);
+    auto keys = backend_.GetGroupMemberKeys(tenant_id,
+                                            revision.manifest.payload_group_id);
+    const auto manifest_key = revision.manifest.manifest_key.empty()
+                                  ? MakeWeightManifestKey(revision.identity)
+                                  : revision.manifest.manifest_key;
+    std::sort(keys.begin(), keys.end(), [&](const auto& lhs, const auto& rhs) {
+        if ((lhs == manifest_key) != (rhs == manifest_key)) {
+            return rhs == manifest_key;
+        }
+        return lhs < rhs;
+    });
+    for (const auto& key : keys) {
+        if (member_budget) {
+            if (*member_budget == 0) {
+                break;
+            }
+            --*member_budget;
+        }
+        auto removed = backend_.RemoveObject(key, tenant_id, true, true);
+        if (!removed && removed.error() != ErrorCode::OBJECT_NOT_FOUND) {
+            // Keep the manifest until every payload removal has succeeded.
+            return tl::make_unexpected(WeightManagementError::BUSY);
+        }
+    }
+    return {};
+}
+
+WeightMetadataStore::Result<WeightRevisionMetadata>
+WeightStoreManager::ReconcileWeightRevisionBounded(
+    const ReconcileWeightRevisionRequest& request, size_t* member_budget) {
     auto group_operation_lock = LockGroup(request.identity);
     const auto now_ms = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -436,14 +505,21 @@ WeightStoreManager::ReconcileWeightRevision(
     }
     const auto current = view->metadata;
     if (current.availability == WeightAvailabilityState::DELETED) {
+        ForgetReconciliationCursor(current.identity);
         return current;
     }
-    if (current.operation == WeightOperationState::EVICTING) {
-        backend_.EvictManagedWeightGroupToCold(current);
+    if (current.availability == WeightAvailabilityState::DELETING) {
+        auto removed = RemoveWeightMembers(current, member_budget);
+        if (!removed) {
+            return tl::make_unexpected(removed.error());
+        }
+    } else if (current.operation == WeightOperationState::EVICTING) {
+        backend_.EvictManagedWeightMembersToCold(
+            current, SelectReconciliationMembers(current, member_budget));
     } else if (current.operation == WeightOperationState::REHYDRATING) {
         const auto tenant_id = TenantId(current.identity.tenant_id);
-        for (const auto& key : backend_.GetGroupMemberKeys(
-                 tenant_id, current.manifest.payload_group_id)) {
+        for (const auto& key :
+             SelectReconciliationMembers(current, member_budget)) {
             const auto result = backend_.PromoteWeightObject(tenant_id, key);
             VLOG(1) << "weight_rehydrate_promotion key=" << key
                     << " result=" << static_cast<int>(result);
@@ -467,14 +543,18 @@ WeightStoreManager::ReconcileWeightRevision(
         if (!mutation) {
             return tl::make_unexpected(mutation.error());
         }
-        return PersistAndPublishWeightMutation(*mutation);
+        auto deleted = PersistAndPublishWeightMutation(*mutation);
+        if (deleted) {
+            ForgetReconciliationCursor(current.identity);
+        }
+        return deleted;
     }
 
     bool complete =
         !absent && members->size() == current.manifest.payload_count + 1;
     bool manifest_found = false;
-    bool all_memory = complete;
-    bool all_cold = complete;
+    bool all_memory = true;
+    bool all_cold = true;
     bool any_readable = false;
     uint64_t logical_bytes = 0;
     std::vector<std::string> payload_keys;
@@ -524,6 +604,7 @@ WeightStoreManager::ReconcileWeightRevision(
             if (!finished) {
                 return tl::make_unexpected(finished.error());
             }
+            ForgetReconciliationCursor(current.identity);
             auto reconciled = weight_metadata_.Get(request.identity, now_ms);
             if (!reconciled) {
                 return tl::make_unexpected(reconciled.error());
@@ -584,7 +665,7 @@ WeightStoreManager::DeleteWeightRevision(
     if (canonical_group.empty()) {
         return tl::make_unexpected(WeightManagementError::INVALID_ARGUMENT);
     }
-    [[maybe_unused]] auto group_operation_lock = LockGroup(request.identity);
+    auto group_operation_lock = LockGroup(request.identity);
     const auto now_ms = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::system_clock::now().time_since_epoch())
@@ -606,20 +687,9 @@ WeightStoreManager::DeleteWeightRevision(
         return tl::make_unexpected(deleting.error());
     }
 
-    auto keys =
-        backend_.GetGroupMemberKeys(TenantId(request.identity.tenant_id),
-                                    deleting->manifest.payload_group_id);
-    std::stable_sort(keys.begin(), keys.end(),
-                     [&](const auto& lhs, const auto& rhs) {
-                         return lhs != deleting->manifest.manifest_key &&
-                                rhs == deleting->manifest.manifest_key;
-                     });
-    for (const auto& key : keys) {
-        auto removed = backend_.RemoveObject(
-            key, TenantId(request.identity.tenant_id), true, true);
-        if (!removed && removed.error() != ErrorCode::OBJECT_NOT_FOUND) {
-            return tl::make_unexpected(WeightManagementError::BUSY);
-        }
+    auto removed = RemoveWeightMembers(*deleting, nullptr);
+    if (!removed) {
+        return tl::make_unexpected(removed.error());
     }
     group_operation_lock.unlock();
     return ReconcileWeightRevision(
@@ -649,7 +719,10 @@ WeightStoreManager::PersistAndPublishWeightOperationMutation(
     return PersistAndPublish<WeightResidencyOperation>(
         backend_, OpType::WEIGHT_METADATA_UPSERT,
         mutation.metadata.identity.tenant_id,
-        MakeWeightRevisionMetadataKey(mutation.metadata.identity), payload, "",
+        MakeWeightRevisionMetadataKey(mutation.metadata.identity), payload,
+        "weight operation mutation, operation_id=" +
+            std::to_string(mutation.next->operation_id) + ", key=" +
+            MakeWeightRevisionMetadataKey(mutation.metadata.identity),
         [this, mutation](const OpLogEntry& durable_entry) {
             auto result = weight_metadata_.Publish(mutation);
             if (!result) {
@@ -668,11 +741,19 @@ size_t WeightStoreManager::ReconcileWeightMetadataStoreOnce(uint64_t now_ms,
     if (limit == 0) {
         return 0;
     }
+    std::lock_guard reconciliation_lock(reconciliation_mutex_);
     constexpr uint64_t kImportAbandonTimeoutMs = 5 * 60 * 1000;
     size_t actions = 0;
 
-    for (const auto& mutation : weight_metadata_.PrepareExpireLeases(now_ms)) {
-        if (actions == limit) {
+    const auto expired_leases = weight_metadata_.PrepareExpireLeases(now_ms);
+    // Reserve revision work even under a continuous stream of expired leases.
+    size_t lease_budget = limit - 1;
+    if (limit == 1 && !expired_leases.empty()) {
+        lease_budget = expire_leases_on_unit_budget_ ? 1 : 0;
+        expire_leases_on_unit_budget_ = !expire_leases_on_unit_budget_;
+    }
+    for (const auto& mutation : expired_leases) {
+        if (actions == lease_budget) {
             break;
         }
         auto group_lock = LockGroup(mutation.previous->identity);
@@ -686,22 +767,42 @@ size_t WeightStoreManager::ReconcileWeightMetadataStoreOnce(uint64_t now_ms,
             current->previous->expires_at_ms > now_ms) {
             continue;
         }
-        if (PersistAndPublishWeightLeaseMutation(*current)) {
-            ++actions;
-        } else {
+        ++actions;
+        if (!PersistAndPublishWeightLeaseMutation(*current)) {
             MasterMetricManager::instance()
                 .inc_weight_reconciliation_failures();
         }
     }
 
+    size_t member_budget = limit - actions;
     const auto snapshot = weight_metadata_.ExportSnapshot();
+    bool has_member_cursors;
+    {
+        std::lock_guard cursor_lock(member_cursor_mutex_);
+        has_member_cursors = !member_cursors_.empty();
+    }
+    if (has_member_cursors) {
+        // Build the lookup outside the cursor lock; retry hints need no
+        // persistence when the owning metadata disappears or is deleted.
+        std::unordered_set<std::string> live_revisions;
+        live_revisions.reserve(snapshot.metadata.size());
+        for (const auto& metadata : snapshot.metadata) {
+            if (metadata.availability != WeightAvailabilityState::DELETED) {
+                live_revisions.insert(
+                    MakeWeightRevisionMetadataKey(metadata.identity));
+            }
+        }
+        std::lock_guard cursor_lock(member_cursor_mutex_);
+        std::erase_if(member_cursors_, [&](const auto& cursor) {
+            return !live_revisions.contains(cursor.first);
+        });
+    }
     const size_t revision_count = snapshot.metadata.size();
     const size_t start = revision_count == 0
                              ? 0
-                             : weight_reconciliation_offset_.fetch_add(
-                                   std::max<size_t>(limit, 1)) %
-                                   revision_count;
-    for (size_t examined = 0; examined < revision_count && actions < limit;
+                             : weight_reconciliation_offset_ % revision_count;
+    size_t examined = 0;
+    for (; examined < revision_count && actions < limit && member_budget > 0;
          ++examined) {
         const auto& metadata =
             snapshot.metadata[(start + examined) % revision_count];
@@ -727,34 +828,29 @@ size_t WeightStoreManager::ReconcileWeightMetadataStoreOnce(uint64_t now_ms,
                         current->metadata.metadata_generation,
                 },
                 now_ms);
+            ++actions;
             if (!mutation || !PersistAndPublishWeightMutation(*mutation)) {
                 MasterMetricManager::instance()
                     .inc_weight_reconciliation_failures();
                 continue;
             }
-            ++actions;
             continue;
         }
 
-        WeightMetadataStore::Result<WeightRevisionMetadata> reconciled =
-            metadata.availability == WeightAvailabilityState::DELETING
-                ? DeleteWeightRevision(DeleteWeightRevisionRequest{
-                      .identity = metadata.identity,
-                      .expected_metadata_generation =
-                          metadata.metadata_generation,
-                  })
-                : ReconcileWeightRevision(ReconcileWeightRevisionRequest{
-                      .identity = metadata.identity,
-                  });
-        if (reconciled) {
-            ++actions;
-        } else if (reconciled.error() !=
-                   WeightManagementError::STALE_GENERATION) {
+        auto reconciled = ReconcileWeightRevisionBounded(
+            ReconcileWeightRevisionRequest{.identity = metadata.identity},
+            &member_budget);
+        ++actions;
+        if (!reconciled &&
+            reconciled.error() != WeightManagementError::STALE_GENERATION) {
             MasterMetricManager::instance()
                 .inc_weight_reconciliation_failures();
         }
     }
 
+    if (examined != 0) {
+        weight_reconciliation_offset_ = (start + examined) % revision_count;
+    }
     MasterMetricManager::instance().project_weight_metadata(
         weight_metadata_.ExportSnapshot(), now_ms);
     return actions;

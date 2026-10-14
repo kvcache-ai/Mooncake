@@ -51,6 +51,25 @@ concurrently. As with single-key removal, physical disk space is reclaimed by
 the existing disk eviction path when eligible; successful metadata removal
 does not promise immediate physical erasure.
 
+Disk reclamation depends on the backend's eviction configuration and pressure
+thresholds. With watermark eviction enabled, the client heartbeat selects
+eligible disk records and asks the Master to release their replica metadata
+before reclaiming storage. A record already removed by the Master is eligible;
+a live managed-weight record is not. A physical bucket containing a live
+protected record cannot be reclaimed as a whole. Disk occupancy below the
+threshold may therefore remain after `RemoveAll`, and metadata accounting is
+not a measurement of physical free disk space.
+
+For independent files, a managed-weight rejection does not authorize deleting
+that file or prevent reclaiming unrelated files in the same batch. Protected
+files rotate behind other candidates so subsequent heartbeat passes can make
+progress. Communication failures retain the pending files for retry.
+
+New clients do not poll the legacy whole-client `PollRemoveAll` mailbox. Its
+RPC remains for older clients, but the Master no longer produces wipe requests:
+such a request cannot safely distinguish tenants, protected weights, or objects
+written after the request was issued.
+
 The group is a logical lifecycle boundary, not a distributed transaction.
 Physical work may be partial while an operation is running. The metadata store keeps
 the operation non-terminal until reconciliation observes the required state
@@ -110,6 +129,10 @@ replica. DRAM eviction changes residency but does not by itself make a revision
 unavailable. Missing required members produce `DEGRADED`; complete physical
 removal produces the retained `DELETED`/`ABSENT` tombstone.
 
+For an incomplete revision, residency describes the members still present;
+`DEGRADED` reports the missing required members. Missing members alone do not
+mean the remaining objects span multiple storage tiers.
+
 Commit, abort, lease acquisition, operation start, and deletion check the
 caller's `expected_metadata_generation`. Lease renewal and release use the
 lease identity; reconciliation prepares mutations against the generation it
@@ -167,13 +190,14 @@ Generic `BatchEvict`, quota eviction, explicit remove, and cleanup paths skip
 managed groups. Only the weight lifecycle path may change their aggregate
 residency or availability.
 
-## Recovery and HA Rollout
+Reconciliation runs on a dedicated Master worker, not the general task-cleanup
+thread, and is not exposed as a client RPC. A background pass shares a bounded
+number of member actions across revisions. This bounds physical action attempts,
+not the time required for a durable write or the cost of observing group metadata.
+Clients use operation and revision queries to observe convergence. The operation
+`cursor` reports progress; it is not a client-controlled resume token.
 
-```{warning}
-The periodic Master snapshot references below describe the retired legacy
-format. New HA recovery uses the standby-generated batch OpLog snapshot
-format.
-```
+## Recovery and HA Rollout
 
 Weight metadata, leases, and operation records use durable-before-visible
 OpLog publication. Standby replay stores them in a separate weight-metadata
@@ -181,6 +205,14 @@ namespace rather than encoding them as fake object metadata. Batch OpLog
 snapshots capture that namespace with object and segment metadata at the same
 durable replay cursor. Derived group indexes are rebuilt from restored
 metadata records.
+
+OpLog replay accepts both the legacy `WeightRevisionMetadata` payload and the
+metadata-plus-operation envelope, distinguished by their serialized type hashes.
+Legacy records can only describe metadata without an active operation. A valid
+envelope with invalid metadata or operation fields is rejected rather than
+retried as a legacy payload. Deploy new readers before enabling writers that
+publish operation envelopes; compatibility decoding does not make an old reader
+understand a new writer's format.
 
 Batch-OpLog snapshots containing weight state use a version-2 manifest with a
 checksummed weight-state artifact captured at the same replay cursor as object

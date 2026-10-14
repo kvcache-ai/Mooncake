@@ -93,8 +93,6 @@ WeightRpcResult<WeightRevisionLease> AcquireWeightRevisionLease(
     const AcquireWeightRevisionLeaseRequest& request);
 WeightRpcResult<WeightResidencyOperation> StartWeightResidencyOperation(
     const StartWeightResidencyOperationRequest& request);
-WeightRpcResult<WeightRevisionMetadata> ReconcileWeightRevision(
-    const ReconcileWeightRevisionRequest& request);
 WeightRpcResult<WeightRevisionMetadata> DeleteWeightRevision(
     const DeleteWeightRevisionRequest& request);
 ```
@@ -103,9 +101,9 @@ The same interface also provides abort, lease renew/release, and operation
 query calls. `WeightRpcResult<T>` preserves weight-management-domain errors
 separately from RPC transport errors. Commit, abort, lease acquisition,
 operation start, and deletion check the caller's expected metadata generation.
-Lease renewal and release use the lease identity; reconciliation uses the
-generation observed by the server. List requests use bounded deterministic
-pagination.
+Lease renewal and release use the lease identity. List requests use bounded
+deterministic pagination. Reconciliation is internal to the Master; clients
+start an operation and observe it through revision and operation queries.
 
 The Weight metadata record contains one immutable manifest reference and aggregate
 lifecycle state. Tensor descriptors stay in `StoredWeightManifest`, while
