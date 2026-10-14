@@ -184,6 +184,16 @@ DEFINE_int32(handler_worker_thread_num, 0,
              "Number of worker threads that run RPC handlers apart from the "
              "io threads, so a slow handler cannot delay a Ping (0 = as "
              "many as rpc_thread_num; non-HA only)");
+DEFINE_validator(handler_worker_thread_num,
+                 [](const char* flagname, int32_t value) {
+                     // The config stores it unsigned, so a negative value
+                     // would become a thread count asio refuses to start.
+                     if (value < 0) {
+                         LOG(ERROR) << flagname << " must not be negative";
+                         return false;
+                     }
+                     return true;
+                 });
 DEFINE_int32(
     rpc_port, 0,
     "Port for RPC server to listen on (0 = use port, preferred over port)");
