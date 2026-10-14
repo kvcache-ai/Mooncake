@@ -3153,6 +3153,201 @@ assert store.batch_get_session_end(keys) == 0
 ```
 </details>
 
+(store-ordered-readplan)=
+### Ordered ReadPlan
+
+#### create_read_plan()
+
+Create a one-shot ordered range-read plan on an initialized real Store client.
+DummyClient does not support the underlying session operations.
+
+```python
+def create_read_plan(self, layouts: List[tuple], num_groups: int) -> ReadPlan
+```
+
+**Parameters:**
+
+- `layouts` (List[tuple]): Read layouts in the form `(keys, rows, packed, groups)`.
+  Each layout has exactly `num_groups` component lists. A component is
+  `(destination_base, destination_row_stride, byte_count, object_source_offset)`.
+  Addresses, strides, sizes, and offsets are in bytes; row `r` writes to
+  `destination_base + r * destination_row_stride`. An empty component list skips
+  that layout for the group.
+- `num_groups` (int): Number of ordered groups; must be positive.
+
+With `packed=True`, one key corresponds to each row, and its components read
+ranges of the same object. For nonempty groups, `len(keys) == len(rows)`.
+With `packed=False`, keys correspond to row/component pairs in row-major order:
+`len(keys) == len(rows) * len(components)`. Nonempty groups in that layout must
+have the same component count.
+
+Within each group and layout, ranges expand by row, then component:
+
+```python
+key = keys[row_index]  # packed=True
+key = keys[row_index * component_count + component_index]  # packed=False
+address = component_base + rows[row_index] * component_stride
+```
+
+`row_index` is the position in `rows`; `rows[row_index]` is the destination row
+number, which may be noncontiguous. Each group reuses the same keys; the group
+index does not enter the key mapping. This is argument expansion order, not a
+requirement that the transport execute individual ranges serially.
+
+**Returns:**
+
+- `ReadPlan`: A plan exposing `run()`, `wait(group)`, and `stats()`.
+
+**Notes:**
+
+- Destination memory is caller-owned. Keep it valid from creation until `run()`
+  exits and registered throughout execution. Even if `wait()` returns or raises,
+  join `run()` before freeing, resizing, or unregistering memory. Keep memory
+  alive for subsequent consumption as well. Never run an unstarted plan after
+  releasing its destinations.
+- Different groups must use disjoint destination ranges, including across
+  layouts; this is not checked. Avoid conflicting writes within a group too.
+- The plan retains its client. `store.close()` rejects unfinished plans,
+  including unstarted plans. Finish them or release abandoned unstarted plans
+  before closing.
+- Concurrent executing plans with overlapping keys on one client are rejected.
+  Do not mix legacy get sessions on those keys with an executing plan.
+
+**Example:**
+
+<details>
+<summary>Click to expand: Ordered range reads with background execution</summary>
+
+```python
+from concurrent.futures import ThreadPoolExecutor
+
+import numpy as np
+
+# Assume store is initialized and objects "a" and "b" each contain eight bytes.
+dst = np.zeros((2, 8), dtype=np.uint8)
+base = dst.ctypes.data
+layouts = [(["a", "b"], [0, 1], True, [
+    [(base,     8, 4, 0)],  # First four bytes of each object.
+    [(base + 4, 8, 4, 4)],  # Remaining four bytes.
+])]
+rc = store.register_buffer(base, dst.nbytes)
+if rc != 0:
+    raise RuntimeError(f"register_buffer failed: {rc}")
+try:
+    plan = store.create_read_plan(layouts, 2)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        running = executor.submit(plan.run)
+        plan.wait(0)
+        first_parts = dst[:, :4].copy()
+        plan.wait(1)
+        running.result()
+finally:
+    # The executor joins run(), including when wait() raises.
+    store.unregister_buffer(base)
+```
+
+The example above has two groups with one component each. To read K and V
+in a single group instead, the following layouts produce the same destination
+rows, assuming K and V are four bytes each:
+
+| Mode | Keys | Components in the single group |
+| --- | --- | --- |
+| `packed=True` | `["page0", "page1"]`, each storing K followed by V | `[(base, 8, 4, 0), (base + 4, 8, 4, 4)]` |
+| `packed=False` | `["page0_k", "page0_v", "page1_k", "page1_v"]`, each storing one component | `[(base, 8, 4, 0), (base + 4, 8, 4, 0)]` |
+
+Both use `rows=[0, 1]` and `num_groups=1`. The key mapping is:
+
+| Row position | Component | Key when packed | Key when unpacked | Destination |
+| --- | --- | --- | --- | --- |
+| 0 | K | `page0` | `page0_k` | `base` |
+| 0 | V | `page0` | `page0_v` | `base + 4` |
+| 1 | K | `page1` | `page1_k` | `base + 8` |
+| 1 | V | `page1` | `page1_v` | `base + 12` |
+
+Here `wait(0)` waits for both K and V in both rows. Changing `rows` to `[3, 7]`
+keeps the key mapping but places the data in destination rows 3 and 7; allocate
+and register enough destination memory before using those row numbers.
+
+</details>
+
+For execution mechanisms and design tradeoffs, see the
+[ReadPlan design](../../design/store/read-plan.md).
+
+---
+
+## ReadPlan Class
+
+A one-shot ordered read plan created by
+`MooncakeDistributedStore.create_read_plan()`. There is no public constructor.
+
+### Methods
+
+#### run()
+
+Execute the plan and wait for reads and session cleanup to finish. Releases the
+Python GIL and may be called only once.
+
+```python
+def run(self) -> None
+```
+
+**Returns:**
+
+- `None`: All reads and session cleanup succeeded.
+
+**Notes:**
+
+- Read, validation, and cleanup failures raise exceptions. In-flight reads drain
+  and cleanup is attempted before failure is reported. Writes are not rolled back.
+- Execution is sequential by default. Setting `MOONCAKE_READ_PLAN_PIPELINE=1`
+  before this call enables a two-group window for multi-group plans. Other
+  values and single-group plans use sequential execution.
+
+---
+
+#### wait()
+
+Wait for a group's validated readiness in publication order. Releases the Python
+GIL and may wait before another thread calls `run()`.
+
+```python
+def wait(self, group: int) -> None
+```
+
+**Parameters:**
+
+- `group` (int): Zero-based group index in `[0, num_groups)`.
+
+**Returns:**
+
+- `None`: The group and all earlier groups have been published successfully.
+  Only final-group success also guarantees successful session cleanup.
+
+**Notes:**
+
+- Already published groups remain successful if a later group fails. Unpublished
+  groups raise after in-flight reads drain and cleanup is attempted.
+- Never consume a group whose wait failed. A successful or failed wait does not
+  replace joining `run()` before releasing destination memory.
+
+---
+
+#### stats()
+
+Return validated-read statistics after the plan finishes, including after failure
+cleanup. Raises while the plan is unfinished.
+
+```python
+def stats(self) -> List[int]
+```
+
+**Returns:**
+
+- `List[int]`: `[validated_calls, validated_key_entries, validated_bytes]` for
+  fully validated nonempty groups. Keys read in different groups count again.
+
+---
+
 ## MooncakeHostMemAllocator Class
 
 The `MooncakeHostMemAllocator` class provides host memory allocation capabilities for Mooncake Store operations.
