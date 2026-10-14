@@ -3,8 +3,6 @@
 #include <algorithm>
 #include <cassert>
 
-#include "ha/snapshot/catalog/snapshot_catalog_store.h"
-
 namespace mooncake::test {
 
 ErrorCode MasterServiceTestPeer::SetBatchOpLogBackendForTesting(
