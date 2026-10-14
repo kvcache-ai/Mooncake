@@ -60,9 +60,17 @@ struct StandbySegmentInfo {
     uint64_t capacity{0};
     bool is_memory_segment{false};
     std::string file_path;  // empty for memory segments
+    // Identity of a memory segment's mount: the id its owner chose, the base
+    // address it registered and the owning client. A store process that
+    // restarts mounts under new ids, so a remount that presents another
+    // identity describes another process's memory even if name, endpoint and
+    // capacity match. Absent in records written before these fields existed.
+    struct_pack::compatible<UUID, 1> segment_id;
+    struct_pack::compatible<uint64_t, 1> base;
+    struct_pack::compatible<UUID, 1> owner_client_id;
 
     YLT_REFL(StandbySegmentInfo, segment_name, transport_endpoint, capacity,
-             is_memory_segment, file_path);
+             is_memory_segment, file_path, segment_id, base, owner_client_id);
 };
 
 /**

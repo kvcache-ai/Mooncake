@@ -772,6 +772,9 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
         op.capacity = segment.size;
         op.is_memory_segment = true;
         op.file_path.clear();
+        op.segment_id = segment.id;
+        op.base = segment.base;
+        op.owner_client_id = client_id;
         auto bytes = struct_pack::serialize(op);
         PersistSegmentOpForHAOrEnqueue("MountSegment", OpType::SEGMENT_MOUNT,
                                        segment.te_endpoint,
@@ -811,7 +814,7 @@ auto MasterService::MountNoFSegment(const NoFSegment& segment,
 }
 
 ErrorCode MasterService::ValidateStandbyRemountSegment(
-    const Segment& segment) const {
+    const Segment& segment, const UUID& client_id) const {
     const StandbySegmentInfo* match = nullptr;
     for (const auto& standby : standby_memory_segments_) {
         if (standby.transport_endpoint == segment.te_endpoint ||
@@ -828,6 +831,19 @@ ErrorCode MasterService::ValidateStandbyRemountSegment(
     if (match != nullptr && (match->segment_name != segment.name ||
                              match->transport_endpoint != segment.te_endpoint ||
                              match->capacity != segment.size)) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    // Where the record knows the mount's identity, only that mount by that
+    // client may take the restored replicas over: a store that restarted
+    // since presents new ids at the same name, endpoint and capacity, and
+    // binding the replicas to its memory would serve bytes it never wrote.
+    if (match != nullptr &&
+        ((match->segment_id && *match->segment_id != segment.id) ||
+         (match->base && *match->base != segment.base) ||
+         (match->owner_client_id && *match->owner_client_id != client_id))) {
+        LOG(WARNING) << "client_id=" << client_id
+                     << ", segment_name=" << segment.name
+                     << ", warn=standby_segment_identity_mismatch";
         return ErrorCode::INVALID_PARAMS;
     }
     return ErrorCode::OK;
@@ -870,7 +886,7 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
             auto segment_access = segment_manager_.getSegmentAccess();
             for (const auto& segment : segments) {
                 auto standby_validation =
-                    ValidateStandbyRemountSegment(segment);
+                    ValidateStandbyRemountSegment(segment, client_id);
                 if (standby_validation != ErrorCode::OK) {
                     discard_provisional_record();
                     return tl::make_unexpected(standby_validation);
@@ -1168,6 +1184,9 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
             op.capacity = seg.size;
             op.is_memory_segment = true;
             op.file_path.clear();
+            op.segment_id = seg.id;
+            op.base = seg.base;
+            op.owner_client_id = client_id;
             auto bytes = struct_pack::serialize(op);
             PersistSegmentOpForHAOrEnqueue(
                 "ReMountSegment", OpType::SEGMENT_MOUNT, seg.name,

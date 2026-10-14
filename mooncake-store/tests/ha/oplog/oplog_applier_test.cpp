@@ -1061,6 +1061,106 @@ TEST_F(OpLogApplierTest, TestApplySegmentMount) {
     EXPECT_EQ("seg1", info->segment_name);
     EXPECT_EQ(1024u, info->capacity);
     EXPECT_TRUE(info->is_memory_segment);
+    EXPECT_FALSE(info->segment_id.has_value());
+    EXPECT_FALSE(info->base.has_value());
+    EXPECT_FALSE(info->owner_client_id.has_value());
+}
+
+TEST_F(OpLogApplierTest, TestApplySegmentMountKeepsIdentity) {
+    SegmentMountOp op;
+    op.segment_name = "seg1";
+    op.transport_endpoint = "192.168.1.1:12345";
+    op.capacity = 1024;
+    op.is_memory_segment = true;
+    op.segment_id = UUID{11, 12};
+    op.base = 0x7f0000000000;
+    op.owner_client_id = UUID{21, 22};
+    auto bytes = struct_pack::serialize(op);
+    OpLogEntry entry = MakeEntry(1, OpType::SEGMENT_MOUNT, "seg1",
+                                 std::string(bytes.begin(), bytes.end()));
+
+    EXPECT_TRUE(applier_->ApplyOpLogEntry(entry));
+
+    auto info = applier_->GetSegmentRegistry().GetSegment("192.168.1.1:12345");
+    ASSERT_TRUE(info.has_value());
+    ASSERT_TRUE(info->segment_id.has_value());
+    EXPECT_EQ((UUID{11, 12}), *info->segment_id);
+    ASSERT_TRUE(info->base.has_value());
+    EXPECT_EQ(0x7f0000000000u, *info->base);
+    ASSERT_TRUE(info->owner_client_id.has_value());
+    EXPECT_EQ((UUID{21, 22}), *info->owner_client_id);
+}
+
+namespace {
+
+// The layouts before the mount identity fields were added.
+struct SegmentMountOpWithoutIdentity {
+    std::string segment_name;
+    std::string transport_endpoint;
+    uint64_t capacity{0};
+    bool is_memory_segment{false};
+    std::string file_path;
+    YLT_REFL(SegmentMountOpWithoutIdentity, segment_name, transport_endpoint,
+             capacity, is_memory_segment, file_path);
+};
+
+struct StandbySegmentInfoWithoutIdentity {
+    std::string segment_name;
+    std::string transport_endpoint;
+    uint64_t capacity{0};
+    bool is_memory_segment{false};
+    std::string file_path;
+    YLT_REFL(StandbySegmentInfoWithoutIdentity, segment_name,
+             transport_endpoint, capacity, is_memory_segment, file_path);
+};
+
+}  // namespace
+
+TEST(SegmentIdentityCodecTest, RecordsWithoutIdentityStillDecode) {
+    SegmentMountOpWithoutIdentity old_op{"seg", "ep", 4096, true, ""};
+    SegmentMountOp op;
+    ASSERT_EQ(struct_pack::errc::ok,
+              struct_pack::deserialize_to(op, struct_pack::serialize(old_op)));
+    EXPECT_EQ("seg", op.segment_name);
+    EXPECT_EQ(4096u, op.capacity);
+    EXPECT_FALSE(op.segment_id.has_value());
+
+    std::vector<StandbySegmentInfoWithoutIdentity> old_segments{
+        {"seg", "ep", 4096, true, ""}};
+    std::vector<StandbySegmentInfo> segments;
+    ASSERT_EQ(struct_pack::errc::ok,
+              struct_pack::deserialize_to(
+                  segments, struct_pack::serialize(old_segments)));
+    ASSERT_EQ(1u, segments.size());
+    EXPECT_EQ("ep", segments[0].transport_endpoint);
+    EXPECT_FALSE(segments[0].base.has_value());
+}
+
+TEST(SegmentIdentityCodecTest, ReadersWithoutIdentitySkipIt) {
+    SegmentMountOp op;
+    op.segment_name = "seg";
+    op.transport_endpoint = "ep";
+    op.capacity = 4096;
+    op.segment_id = UUID{1, 2};
+    op.base = 0x1000;
+    op.owner_client_id = UUID{3, 4};
+    SegmentMountOpWithoutIdentity old_op;
+    ASSERT_EQ(struct_pack::errc::ok,
+              struct_pack::deserialize_to(old_op, struct_pack::serialize(op)));
+    EXPECT_EQ("seg", old_op.segment_name);
+    EXPECT_EQ(4096u, old_op.capacity);
+
+    StandbySegmentInfo info;
+    info.segment_name = "seg";
+    info.transport_endpoint = "ep";
+    info.segment_id = UUID{1, 2};
+    std::vector<StandbySegmentInfoWithoutIdentity> old_segments;
+    ASSERT_EQ(struct_pack::errc::ok,
+              struct_pack::deserialize_to(
+                  old_segments, struct_pack::serialize(
+                                    std::vector<StandbySegmentInfo>{info})));
+    ASSERT_EQ(1u, old_segments.size());
+    EXPECT_EQ("ep", old_segments[0].transport_endpoint);
 }
 
 TEST_F(OpLogApplierTest, TestApplySegmentUnmount) {
