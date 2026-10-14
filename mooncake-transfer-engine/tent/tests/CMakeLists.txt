@@ -181,6 +181,12 @@ target_include_directories(request_merge_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME request_merge_test COMMAND request_merge_test)
 
+# Manual public-submit benchmark using real TCP loopback transfers.
+add_executable(request_submit_bench request_submit_bench.cpp)
+target_link_libraries(request_submit_bench PRIVATE tent_link_group asio_shared)
+target_include_directories(request_submit_bench
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+
 add_executable(local_notification_test local_notification_test.cpp)
 target_link_libraries(local_notification_test PRIVATE gtest gtest_main
                                                       tent_link_group)
