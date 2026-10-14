@@ -6,7 +6,7 @@ This document describes how to build Mooncake.
 
 ### Recommended Version
 - OS: Ubuntu 22.04 LTS+
-- cmake: 3.20.x
+- cmake: 4.x
 - gcc: 9.4+
 
 ### Default Build
@@ -19,15 +19,38 @@ and installs Go.
 sudo bash dependencies.sh
 ```
 
-Then build and install Mooncake:
+For a simple CPU build, use the preset:
 
 ```bash
-mkdir build
-cd build
-cmake ..
-make -j
-sudo make install
+cmake --preset cpu-release
+cmake --build --preset cpu-release
+sudo cmake --install build/cpu-release
 ```
+
+The repository provides a small set of presets for common workflows:
+
+`cpu-release`: Standard CPU Release build with Store and Transfer Engine.
+`cpu-debug`: CPU Debug build with unit tests enabled.
+`cuda-release`: CUDA Release build with Store and Transfer Engine.
+`transfer-engine-only`: Build Transfer Engine only.
+
+The presets are optional. Advanced users can use native CMake commands and
+enable additional features directly:
+
+```bash
+cmake -S . -B build/custom -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DWITH_TE=ON \
+  -DWITH_STORE=ON \
+  -DUSE_CUDA=ON \
+  -DUSE_INTRA_NVLINK=ON
+cmake --build build/custom
+```
+
+Keep different platforms and toolchains in separate build directories, such as
+`build/cpu-release` and `build/custom`. Personal preset combinations can be
+stored in `CMakeUserPresets.json` without modifying the repository's
+`CMakePresets.json`.
 
 ### Build with VRAM Segment
 
@@ -37,11 +60,9 @@ To enable VRAM Segment, install CUDA toolkit and build Mooncake with
 ```bash
 sudo bash dependencies.sh
 
-mkdir build
-cd build
-cmake .. -DUSE_VRAM_SEGMENT=ON
-make -j
-sudo make install
+cmake -B build -G Ninja -DUSE_VRAM_SEGMENT=ON
+cmake --build build
+sudo cmake --install build
 ```
 
 If NVLink is available in your environment, you can also enable it
@@ -50,11 +71,9 @@ with `-DUSE_INTRA_NVLINK=ON`:
 ```bash
 sudo bash dependencies.sh
 
-mkdir build
-cd build
-cmake .. -DUSE_VRAM_SEGMENT=ON -DUSE_INTRA_NVLINK=ON
-make -j
-sudo make install
+cmake -B build -G Ninja -DUSE_VRAM_SEGMENT=ON -DUSE_INTRA_NVLINK=ON
+cmake --build build
+sudo cmake --install build
 ```
 
 ### Build with NVMe-oF SSD Pool
@@ -65,11 +84,9 @@ Mooncake with `USE_NOF` enabled:
 ```bash
 sudo bash dependencies.sh --with-spdk
 
-mkdir build
-cd build
-cmake .. -DUSE_NOF=ON
-make -j
-sudo make install
+cmake -B build -G Ninja -DUSE_NOF=ON
+cmake --build build
+sudo cmake --install build
 ```
 
 `-DUSE_NOF=ON` builds the NoF registration APIs and deployment tools. Use
@@ -231,7 +248,7 @@ eager population behavior; set `MC_DISABLE_MMAP_ARENA=1` if an arena was
 otherwise enabled and deferred direct-mmap population is desired.
 
 ## Advanced Compile Options
-The following options can be passed to `cmake ..`.
+The following options can be passed to `cmake`.
 
 ### Accelerator and Hardware Options
 

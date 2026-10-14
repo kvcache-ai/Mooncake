@@ -1,0 +1,72 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 4,
+    "minor": 0,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "WITH_TE": "ON",
+        "WITH_STORE": "ON",
+        "WITH_STORE_GO": "OFF",
+        "WITH_STORE_RUST": "OFF",
+        "WITH_RUST_EXAMPLE": "OFF",
+        "BUILD_UNIT_TESTS": "OFF",
+        "BUILD_EXAMPLES": "ON",
+        "BUILD_BENCHMARK": "OFF"
+      }
+    },
+    {
+      "name": "cpu-release",
+      "inherits": "base"
+    },
+    {
+      "name": "cpu-debug",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "BUILD_UNIT_TESTS": "ON"
+      }
+    },
+    {
+      "name": "cuda-release",
+      "inherits": "base",
+      "cacheVariables": {
+        "USE_CUDA": "ON"
+      }
+    },
+    {
+      "name": "transfer-engine-only",
+      "inherits": "base",
+      "cacheVariables": {
+        "WITH_STORE": "OFF"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "cpu-release",
+      "configurePreset": "cpu-release"
+    },
+    {
+      "name": "cpu-debug",
+      "configurePreset": "cpu-debug"
+    },
+    {
+      "name": "cuda-release",
+      "configurePreset": "cuda-release"
+    },
+    {
+      "name": "transfer-engine-only",
+      "configurePreset": "transfer-engine-only"
+    }
+  ]
+}
