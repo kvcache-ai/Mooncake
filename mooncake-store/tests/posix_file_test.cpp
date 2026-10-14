@@ -5,9 +5,13 @@
 #include <csignal>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <fcntl.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <sys/uio.h>
@@ -101,6 +105,85 @@ TEST(UringSubmitTest, StopsAfterBoundedNoProgress) {
     EXPECT_EQ(result.submitted, 0U);
     EXPECT_EQ(result.pending, pending);
     EXPECT_EQ(calls, 3U);
+}
+
+// detail::single_sqe_write_max() for max_sectors_kb 128, and for 1280 (the
+// cap).
+constexpr size_t kLimitAt128K = 2 * 128 * 1024;
+constexpr size_t kLimitAt1280K = detail::kSingleSqeWriteCap;
+
+TEST(UringChunkTest, WriteUpToTheLimitGoesOutAsOneSqe) {
+    // A 4 KiB header page plus a 128 KiB value with max_sectors_kb 128, the
+    // same header plus a 1 MiB value with 1280, a write of exactly the
+    // limit, and a sub-page write.
+    EXPECT_EQ(detail::write_chunk_size(135168, 32, 4096, kLimitAt128K),
+              135168U);
+    EXPECT_EQ(detail::write_chunk_size(1052672, 32, 4096, kLimitAt1280K),
+              1052672U);
+    EXPECT_EQ(detail::write_chunk_size(kLimitAt128K, 32, 4096, kLimitAt128K),
+              kLimitAt128K);
+    EXPECT_EQ(detail::write_chunk_size(1000, 32, 4096, kLimitAt128K), 1000U);
+}
+
+TEST(UringChunkTest, LargerWriteKeepsQueueDepthSplit) {
+    // One byte over the limit, the header page plus a 1 MiB value with
+    // max_sectors_kb 128, the header page plus a 2 MiB or a 64 MiB value
+    // with 1280, and any write to an unknown device (limit 0).
+    EXPECT_EQ(
+        detail::write_chunk_size(kLimitAt128K + 1, 32, 4096, kLimitAt128K),
+        16384U);
+    EXPECT_EQ(detail::write_chunk_size(1052672, 32, 4096, kLimitAt128K),
+              65536U);
+    EXPECT_EQ(detail::write_chunk_size(2101248, 32, 4096, kLimitAt1280K),
+              131072U);
+    EXPECT_EQ(detail::write_chunk_size(67112960, 32, 4096, kLimitAt1280K),
+              4194304U);
+    EXPECT_EQ(detail::write_chunk_size(135168, 32, 4096, 0), 8192U);
+}
+
+TEST(UringChunkTest, SingleSqeWriteMaxReadsTheDeviceQueue) {
+    // A fake sysfs: disk 259:0 with max_sectors_kb 128 and its partition
+    // 259:1, and disk 259:2 with 1280, linked from dev/block the way the
+    // kernel links them. A partition has no queue of its own.
+    namespace fs = std::filesystem;
+    const std::string root =
+        ::testing::TempDir() + "uring_fake_sysfs_" + std::to_string(getpid());
+    fs::remove_all(root);
+    fs::create_directories(root + "/devices/disk0/disk0p1");
+    fs::create_directories(root + "/devices/disk0/queue");
+    fs::create_directories(root + "/devices/disk1/queue");
+    fs::create_directories(root + "/devices/disk2/queue");
+    fs::create_directories(root + "/dev/block");
+    std::ofstream(root + "/devices/disk0/queue/max_sectors_kb") << "128\n";
+    std::ofstream(root + "/devices/disk1/queue/max_sectors_kb") << "1280\n";
+    std::ofstream(root + "/devices/disk2/queue/max_sectors_kb") << "none\n";
+    fs::create_directory_symlink("../../devices/disk0",
+                                 root + "/dev/block/259:0");
+    fs::create_directory_symlink("../../devices/disk0/disk0p1",
+                                 root + "/dev/block/259:1");
+    fs::create_directory_symlink("../../devices/disk1",
+                                 root + "/dev/block/259:2");
+    fs::create_directory_symlink("../../devices/disk2",
+                                 root + "/dev/block/259:4");
+
+    EXPECT_EQ(detail::single_sqe_write_max(makedev(259, 0), root),
+              kLimitAt128K);
+    EXPECT_EQ(detail::single_sqe_write_max(makedev(259, 1), root),
+              kLimitAt128K);
+    EXPECT_EQ(detail::single_sqe_write_max(makedev(259, 2), root),
+              kLimitAt1280K);
+    // An unreadable value, no such device, and no block device at all
+    // (tmpfs, NFS, btrfs).
+    EXPECT_EQ(detail::single_sqe_write_max(makedev(259, 4), root), 0U);
+    EXPECT_EQ(detail::single_sqe_write_max(makedev(259, 3), root), 0U);
+    EXPECT_EQ(detail::single_sqe_write_max(makedev(0, 42), root), 0U);
+    fs::remove_all(root);
+}
+
+TEST(UringChunkTest, SplitChunkSizeIsQueueDepthSplit) {
+    EXPECT_EQ(detail::split_chunk_size(135168, 32, 4096), 8192U);
+    EXPECT_EQ(detail::split_chunk_size(2101248, 32, 4096), 131072U);
+    EXPECT_EQ(detail::split_chunk_size(1000, 32, 4096), 4096U);
 }
 #endif
 
@@ -472,6 +555,77 @@ TEST_F(PosixFileTest, UringVectorIoHandlesUnalignedDirectIo) {
     ASSERT_TRUE(neighbor_read.has_value()) << toString(neighbor_read.error());
     EXPECT_EQ(out_neighbor, neighbor);
 
+    remove(direct_filename.c_str());
+}
+
+TEST_F(PosixFileTest, UringFileTakesTheWriteLimitOfItsDevice) {
+    // O_DIRECT files get their device's limit (0 on tmpfs or overlayfs);
+    // buffered files always split.
+    struct stat st;
+    ASSERT_EQ(fstat(test_fd, &st), 0);
+    UringFile direct_file(test_filename, dup(test_fd), 32, true);
+    EXPECT_EQ(direct_file.single_sqe_write_max(),
+              detail::single_sqe_write_max(st.st_dev));
+    UringFile buffered_file(test_filename, dup(test_fd), 32, false);
+    EXPECT_EQ(buffered_file.single_sqe_write_max(), 0U);
+}
+
+TEST_F(PosixFileTest, UringDirectWriteOfRecordShapeRoundTrips) {
+    // The OffsetAllocator record shape: 24-byte header, key, zero padding to
+    // 4 KiB, then a 128 KiB value, written at a 4 KiB offset. It is never
+    // iovec-aligned, so it goes through the bounce buffer as one write call:
+    // one SQE when the file's device allows 132 KiB, split otherwise.
+    const std::string direct_filename = "direct_record_test.bin";
+    remove(direct_filename.c_str());
+    int direct_fd = open(direct_filename.c_str(),
+                         O_CREAT | O_RDWR | O_DIRECT | O_CLOEXEC, 0644);
+    ASSERT_GE(direct_fd, 0) << strerror(errno);
+    if (fallocate(direct_fd, 0, 0, 1 << 20) != 0) {
+        const int err = errno;
+        close(direct_fd);
+        remove(direct_filename.c_str());
+        if (err == EOPNOTSUPP) {
+            GTEST_SKIP() << "fallocate is not supported here";
+        }
+        FAIL() << strerror(err);
+    }
+    UringFile uring_file(direct_filename, direct_fd, 32, true);
+
+    std::array<char, 24> header{};
+    std::memcpy(header.data(), "RECORDHDR", 9);
+    const std::string key = "record-shape-key";
+    const std::string padding(4096 - header.size() - key.size(), '\0');
+    std::string value(128 * 1024, '\0');
+    for (size_t i = 0; i < value.size(); ++i) {
+        value[i] = static_cast<char>('a' + i % 26);
+    }
+    iovec write_iov[4] = {
+        {header.data(), header.size()},
+        {const_cast<char*>(key.data()), key.size()},
+        {const_cast<char*>(padding.data()), padding.size()},
+        {value.data(), value.size()},
+    };
+    constexpr off_t kOffset = 4096;
+    auto write_result = uring_file.vector_write(write_iov, 4, kOffset);
+    ASSERT_TRUE(write_result.has_value()) << toString(write_result.error());
+    EXPECT_EQ(*write_result, 4096 + value.size());
+
+    std::array<char, 24> out_header{};
+    std::string out_key(key.size(), '\0');
+    std::string out_value(value.size(), '\0');
+    iovec header_iov{out_header.data(), out_header.size()};
+    iovec key_iov{out_key.data(), out_key.size()};
+    iovec value_iov{out_value.data(), out_value.size()};
+    ASSERT_TRUE(uring_file.vector_read(&header_iov, 1, kOffset).has_value());
+    ASSERT_TRUE(uring_file
+                    .vector_read(&key_iov, 1,
+                                 kOffset + static_cast<off_t>(header.size()))
+                    .has_value());
+    ASSERT_TRUE(
+        uring_file.vector_read(&value_iov, 1, kOffset + 4096).has_value());
+    EXPECT_EQ(out_header, header);
+    EXPECT_EQ(out_key, key);
+    EXPECT_EQ(out_value, value);
     remove(direct_filename.c_str());
 }
 
