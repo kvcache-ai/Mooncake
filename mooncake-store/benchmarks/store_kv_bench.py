@@ -987,19 +987,29 @@ class BenchmarkRunner:
             stats.end_time = time.perf_counter()
             per_lane_stats[index] = stats
 
-        try:
-            for lane_id, session in enumerate(sessions):
-                thread = threading.Thread(
-                    target=runner,
-                    args=(lane_id, session),
-                    name=f"{phase_name}-lane{lane_id}",
-                )
+        for lane_id, session in enumerate(sessions):
+            thread = threading.Thread(
+                target=runner,
+                args=(lane_id, session),
+                name=f"{phase_name}-lane{lane_id}",
+            )
+            try:
                 thread.start()
-                threads.append(thread)
-        finally:
-            # A later lane may fail to start while earlier lanes still use the store.
-            for thread in threads:
-                thread.join()
+            except BaseException as exc:
+                for started in threads:
+                    started.join()
+                for started_id, error in enumerate(errors):
+                    if error is not None:
+                        LOG.error(
+                            "%s lane %d failed", phase_name, started_id, exc_info=error
+                        )
+                raise RuntimeError(
+                    f"{phase_name} lane {lane_id} failed to start"
+                ) from exc
+            threads.append(thread)
+
+        for thread in threads:
+            thread.join()
 
         # Join every lane before allowing the caller to release shared buffers.
         for lane_id, error in enumerate(errors):
