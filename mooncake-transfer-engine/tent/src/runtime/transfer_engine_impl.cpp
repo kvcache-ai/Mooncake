@@ -1249,6 +1249,28 @@ Status TransferEngineImpl::lazyFreeBatch() {
                 if (++batch->reclaim_failures >= kMaxReclaimAttempts) {
                     batch->reclaim_abandoned = true;
                     TENT_RECORD_BATCH_QUARANTINED();
+                    // The sweep stops touching this batch, so its queue
+                    // owners would keep their dispatch-window slots for
+                    // good. Give those back; the batch stays quarantined.
+                    if (runtime_queue_config_.enabled &&
+                        batch->queue_token != 0) {
+                        if (auto detach =
+                                detachQueuedOwnersOfBatch(batch, CANCELED);
+                            !detach.ok()) {
+                            LOG(WARNING)
+                                << "lazyFreeBatch: quarantined batch " << batch
+                                << ": could not release its queue "
+                                   "owners: "
+                                << detach.ToString();
+                        } else if (auto retire = retireQueueForBatch(batch);
+                                   !retire.ok()) {
+                            LOG(WARNING)
+                                << "lazyFreeBatch: quarantined batch " << batch
+                                << ": could not retire its queue "
+                                   "records: "
+                                << retire.ToString();
+                        }
+                    }
                     LOG(ERROR) << "lazyFreeBatch: batch " << batch << " failed "
                                << batch->reclaim_failures
                                << " consecutive reclaim attempts; giving up "
@@ -1324,6 +1346,25 @@ void TransferEngineImpl::adoptDeferredStageTeardown(
     std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
     for (auto batch_id : deferred.batches) {
         Batch* batch = (Batch*)batch_id;
+        // Nothing will poll this batch to a terminal state any more, so its
+        // queue owners would otherwise hold their dispatch-window slots and
+        // queue bytes until process exit -- enough of them and nothing is
+        // dispatched again. Settle them as CANCELED and retire the batch's
+        // queue records; the batch itself is still parked below.
+        if (runtime_queue_config_.enabled && batch->queue_token != 0) {
+            // Retire only once every owner is terminal; retireBatch() would
+            // refuse otherwise, and the detach failure is the message.
+            if (auto status = detachQueuedOwnersOfBatch(batch, CANCELED);
+                !status.ok()) {
+                LOG(WARNING) << "Deferred staging batch " << batch
+                             << ": could not release its queue owners: "
+                             << status.ToString();
+            } else if (auto retire = retireQueueForBatch(batch); !retire.ok()) {
+                LOG(WARNING) << "Deferred staging batch " << batch
+                             << ": could not retire its queue records: "
+                             << retire.ToString();
+            }
+        }
         // Detach from the normal lifecycle: an undrained batch sits in its
         // shard's active_batches / alive_batches and possibly
         // batch_freelist_ (free_requested, still referenced), so the sweep
@@ -1612,7 +1653,9 @@ struct RequestBoundaryInfo {
 
 struct MergeResult {
     std::vector<Request> request_list;
-    std::map<size_t, size_t> task_lookup;
+    // Original request index -> merged request index. Every input has one
+    // entry.
+    std::vector<size_t> task_lookup;
 };
 
 struct TransferEngineImpl::PreparedSubmit {
@@ -1650,6 +1693,7 @@ bool tryAddUint64(uint64_t lhs, uint64_t rhs, uint64_t& out) {
 MergeResult makePassThroughMergeResult(const std::vector<Request>& requests) {
     MergeResult result;
     result.request_list.reserve(requests.size());
+    result.task_lookup.resize(requests.size());
     for (size_t i = 0; i < requests.size(); ++i) {
         result.request_list.push_back(requests[i]);
         result.task_lookup[i] = i;
@@ -1744,6 +1788,7 @@ MergeResult mergeRequests(const std::vector<Request>& requests,
     merged_items.reserve(items.size());
 
     MergeResult result;
+    result.task_lookup.resize(requests.size());
     for (const auto& item : items) {
         if (merged_items.empty() || !can_merge(merged_items.back(), item)) {
             merged_items.push_back(item);
@@ -2050,7 +2095,9 @@ Status TransferEngineImpl::prepareSubmit(
             }
         }
         if (!tcp_limited.empty()) {
-            for (const auto& [public_id, owner_id] : merged.task_lookup) {
+            for (size_t public_id = 0; public_id < merged.task_lookup.size();
+                 ++public_id) {
+                const size_t owner_id = merged.task_lookup[public_id];
                 if (tcp_limited[owner_id]) {
                     auto& limit = merge_boundaries[public_id].max_merge_bytes;
                     limit = std::min<uint64_t>(
@@ -2093,9 +2140,9 @@ Status TransferEngineImpl::prepareSubmit(
     }
 
     prepared.tasks.reserve(merged.task_lookup.size());
-    for (const auto& kv : merged.task_lookup) {
-        const size_t public_task_index = kv.first;
-        const size_t merged_task_index = kv.second;
+    for (size_t public_task_index = 0;
+         public_task_index < merged.task_lookup.size(); ++public_task_index) {
+        const size_t merged_task_index = merged.task_lookup[public_task_index];
         const size_t task_id = start_task_id + public_task_index;
         auto& owner = prepared.owners[merged_task_index];
         if (!owner.has_owner_task_id) {
@@ -2443,6 +2490,47 @@ Status TransferEngineImpl::cancelQueuedOwner(QueueOwnerId owner_id) {
     return Status::OK();
 }
 
+Status TransferEngineImpl::finishDroppedOwner(QueueOwnerId owner_id) {
+    auto queued_it = queued_owners_.find(owner_id);
+    if (queued_it == queued_owners_.end()) {
+        return Status::InvalidEntry("queued owner not found" LOC_MARK);
+    }
+    auto& queued = queued_it->second;
+    if (queued.in_dispatch_window) {
+        return Status::InternalError(
+            "dropped queue owner was in the dispatch window" LOC_MARK);
+    }
+    // No complete(): the queue turned the owner terminal when it dropped it,
+    // and complete() only accepts a dispatching owner.
+    for (const auto task_id : queued.public_task_ids) {
+        queued.batch->task_list[task_id].status = CANCELED;
+    }
+    queued_owners_.erase(queued_it);
+    return Status::OK();
+}
+
+Status TransferEngineImpl::detachQueuedOwnersOfBatch(
+    Batch* batch, TransferStatusEnum terminal_status) {
+    std::vector<QueueOwnerId> owner_ids;
+    for (const auto& entry : queued_owners_) {
+        if (entry.second.batch == batch) owner_ids.push_back(entry.first);
+    }
+    // Every owner is tried even after one fails: each one released is a
+    // dispatch-window slot given back, and the first error is still reported.
+    Status first_error = Status::OK();
+    for (const auto owner_id : owner_ids) {
+        auto queued_it = queued_owners_.find(owner_id);
+        if (queued_it == queued_owners_.end()) continue;
+        // A dispatched owner completes with the given status, which frees its
+        // dispatch-window slot; one still queued is cancelled where it stands.
+        auto status = queued_it->second.in_dispatch_window
+                          ? finishQueuedOwner(owner_id, terminal_status)
+                          : cancelQueuedOwner(owner_id);
+        if (!status.ok() && first_error.ok()) first_error = status;
+    }
+    return first_error;
+}
+
 Status TransferEngineImpl::retireQueueForBatch(Batch* batch) {
     if (!batch || batch->queue_token == 0) return Status::OK();
     auto status = runtime_queue_->retireBatch(batch->queue_token);
@@ -2547,7 +2635,20 @@ Status TransferEngineImpl::refillDispatchWindow() {
         runtime_queue_config_.max_dispatch_owners - dispatch_inflight_owners_;
     const size_t byte_budget =
         runtime_queue_config_.max_dispatch_bytes - dispatch_inflight_bytes_;
-    auto picked = runtime_queue_->pickForDispatch(owner_budget, byte_budget);
+    std::vector<QueueOwnerId> dropped;
+    auto picked =
+        runtime_queue_->pickForDispatch(owner_budget, byte_budget, &dropped);
+    // The queue has already cancelled these; the impl still holds a record
+    // for each and the batch's own task statuses still read PENDING. Left
+    // alone they would keep the runtime queue "active" and grow the progress
+    // scan for good. A failure here is an accounting bug worth a log line,
+    // not a reason to leave the picked owners undispatched below.
+    for (const auto owner_id : dropped) {
+        if (auto status = finishDroppedOwner(owner_id); !status.ok()) {
+            LOG(ERROR) << "Dropped queue owner " << owner_id
+                       << " could not be settled: " << status.ToString();
+        }
+    }
     for (const auto owner_id : picked) {
         CHECK_STATUS(dispatchQueuedOwner(owner_id));
     }
@@ -2916,6 +3017,13 @@ bool TransferEngineImpl::attemptSubmitStageFailover(Batch* batch,
 Status TransferEngineImpl::pollTaskStatus(Batch* batch, size_t task_id,
                                           TransferStatus& task_status) {
     auto& task = batch->task_list[task_id];
+    // Match batch polling: a logical failure is terminal. A rejected fallback
+    // may not have created a sub-task, but keep its type for metric
+    // attribution.
+    if (task.status == FAILED) {
+        task_status = {FAILED, 0};
+        return Status::OK();
+    }
     if (task.staging) {
         return staging_proxy_->getStatus(&task, task_status);
     }
@@ -3014,23 +3122,27 @@ void TransferEngineImpl::updateTaskStatusAfterPoll(Batch* batch, size_t task_id,
     // request will recover through failover. Close it before task.type is
     // overwritten by resubmitTransferTask().
     finishTransportAttempt(task, FAILED, std::chrono::steady_clock::now());
-    if (resubmitTransferTask(batch, task_id).ok()) {
-        task_status.s = PENDING;
-        task.status = PENDING;
-        for (size_t alias_id = 0; alias_id < batch->task_list.size();
-             ++alias_id) {
-            auto& alias = batch->task_list[alias_id];
-            if (!alias.derived || alias.physical_owner_task_id != task_id)
-                continue;
-            alias.type = task.type;
-            alias.sub_task_id = task.sub_task_id;
-            alias.status = task.status;
-            alias.failover_count = task.failover_count;
-            alias.xport_priority = task.xport_priority;
-            alias.device_mask = task.device_mask;
-            alias.qp_pool = task.qp_pool;
-            alias.staging = task.staging;
+    // A synchronous rejection dispatches no work, so keep trying candidates
+    // within the original budget. An accepted attempt is polled on the next
+    // progress step, rather than spinning here until it completes.
+    while (task.failover_count < task.runtime_policy.max_failover_attempts) {
+        if (resubmitTransferTask(batch, task_id).ok()) {
+            task_status.s = PENDING;
+            task.status = PENDING;
+            break;
         }
+    }
+    for (size_t alias_id = 0; alias_id < batch->task_list.size(); ++alias_id) {
+        auto& alias = batch->task_list[alias_id];
+        if (!alias.derived || alias.physical_owner_task_id != task_id) continue;
+        alias.type = task.type;
+        alias.sub_task_id = task.sub_task_id;
+        alias.status = task.status;
+        alias.failover_count = task.failover_count;
+        alias.xport_priority = task.xport_priority;
+        alias.device_mask = task.device_mask;
+        alias.qp_pool = task.qp_pool;
+        alias.staging = task.staging;
     }
 }
 

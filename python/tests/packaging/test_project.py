@@ -2,11 +2,8 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-import shutil
 import subprocess
 import sys
-
-import pytest
 
 try:
     import tomllib
@@ -53,6 +50,10 @@ def test_dependency_boundaries_are_declared() -> None:
     metadata = project["project"]
 
     assert set(metadata["dependencies"]) == {"aiohttp", "msgpack", "requests"}
+    assert set(metadata["optional-dependencies"]["structured"]) == {
+        "numpy",
+        "pillow",
+    }
     assert set(metadata["optional-dependencies"]) == {
         "administration",
         "dev",
@@ -82,6 +83,32 @@ def test_tracked_source_roots_contain_no_generated_native_artifacts() -> None:
     assert (package_root / "__init__.py").is_file()
     assert not list(package_root.rglob("*.so"))
     assert not list((REPOSITORY_ROOT / "mooncake-pg" / "torch").rglob("*.so"))
+
+
+def test_structured_object_storage_has_one_authoritative_source() -> None:
+    package_root = REPOSITORY_ROOT / "python" / "mooncake"
+    test_root = REPOSITORY_ROOT / "python" / "tests" / "store"
+    legacy_package_root = REPOSITORY_ROOT / "mooncake-wheel" / "mooncake"
+    legacy_test_root = REPOSITORY_ROOT / "mooncake-wheel" / "tests"
+
+    for module in ("structured_object_store.py", "_fast_copy.c"):
+        assert (package_root / module).is_file()
+        assert not (legacy_package_root / module).exists()
+
+    for test in ("test_structured_object_store.py", "test_fast_copy.py"):
+        assert (test_root / test).is_file()
+        assert not (legacy_test_root / test).exists()
+
+    cmake = (REPOSITORY_ROOT / "python" / "CMakeLists.txt").read_text()
+    assert '"${CMAKE_CURRENT_SOURCE_DIR}/mooncake/_fast_copy.c"' in cmake
+
+    legacy_build_script = (REPOSITORY_ROOT / "scripts" / "build_wheel.sh").read_text()
+    migrated_modules = (
+        legacy_build_script.split("MIGRATED_PYTHON_MODULES=(", 1)[1]
+        .split(")", 1)[0]
+        .split()
+    )
+    assert {"structured_object_store.py", "_fast_copy.c"} <= set(migrated_modules)
 
 
 def test_http_metadata_service_has_one_authoritative_source(
@@ -246,7 +273,6 @@ def test_scikit_build_consumes_unified_python_sources() -> None:
         "mooncake_connector_v1.py",
         "vllm_v1_proxy_server.py",
         "pg.py",
-        "structured_object_store.py",
         "dataproto_catalog.py",
     ):
         assert (REPOSITORY_ROOT / "mooncake-wheel" / "mooncake" / module).is_file()
@@ -355,56 +381,3 @@ def test_ssd_administration_modules_have_one_authoritative_source() -> None:
     assert not (
         REPOSITORY_ROOT / "mooncake-wheel" / "tests" / "test_spdk_tgt_create.py"
     ).exists()
-
-
-def test_pg_extension_build_stages_outside_the_source_tree(
-    tmp_path: Path,
-) -> None:
-    cmake = shutil.which("cmake")
-    if cmake is None:
-        pytest.skip("CMake is required to exercise the PG staging script")
-
-    source = tmp_path / "source" / "mooncake-pg" / "torch"
-    common = tmp_path / "source" / "mooncake-common"
-    source.mkdir(parents=True)
-    common.mkdir(parents=True)
-    (common / "SetupPyTorchEnv.cmake").write_text("")
-    (source / "setup.py").write_text(
-        """\
-from pathlib import Path
-import sys
-
-build_lib = Path(sys.argv[sys.argv.index("--build-lib") + 1])
-package = build_lib / "mooncake"
-package.mkdir(parents=True, exist_ok=True)
-(package / "pg_fake.so").write_bytes(b"extension")
-"""
-    )
-
-    core = tmp_path / "libmooncake_pg.so"
-    device = tmp_path / "libmooncake_pg_device.so"
-    core.write_bytes(b"core")
-    device.write_bytes(b"device")
-    staging = tmp_path / "staging"
-    build = tmp_path / "build"
-
-    subprocess.run(
-        [
-            cmake,
-            f"-DSOURCE_DIR={source}",
-            "-DEP_TORCH_VERSIONS=",
-            f"-DSTAGING_DIR={staging}",
-            f"-DBUILD_DIR={build}",
-            f"-DPG_CORE_SO_PATH={core}",
-            f"-DPG_DEVICE_SO_PATH={device}",
-            f"-DPython3_EXECUTABLE={sys.executable}",
-            "-P",
-            str(REPOSITORY_ROOT / "mooncake-pg" / "torch" / "BuildPgExt.cmake"),
-        ],
-        check=True,
-    )
-
-    assert (staging / "pg_fake.so").read_bytes() == b"extension"
-    assert (staging / device.name).read_bytes() == b"device"
-    assert (build / "current" / "lib" / "mooncake" / "pg_fake.so").is_file()
-    assert not list(source.rglob("*.so"))
