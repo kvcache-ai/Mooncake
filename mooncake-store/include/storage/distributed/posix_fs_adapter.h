@@ -49,6 +49,8 @@ class PosixFsAdapter : public FileSystemAdapter {
 
     tl::expected<void, ErrorCode> Shutdown() override;
 
+    bool SupportsFdReopen() const override { return true; }
+
     const char* GetName() const override { return "posix"; }
 
    private:
