@@ -110,6 +110,10 @@ class TransferEngineImplTestPeer {
         return engine.autoDiscoverTransport();
     }
 
+    static bool autoDiscoverUsesEfa(const TransferEngineImpl& engine) {
+        return engine.autoDiscoverUsesEfa();
+    }
+
     static void setUseBarex(TransferEngineImpl& engine, bool use_barex) {
         engine.use_barex_ = use_barex;
     }
@@ -294,6 +298,30 @@ TEST(TransferEngineAutoDiscoverTest, SelectsEfaForEfaProtocol) {
     EXPECT_TRUE(config.enabled);
     EXPECT_EQ(config.protocol, "efa");
     EXPECT_EQ(TransferEngineImplTestPeer::autoDiscoverTransport(engine), "efa");
+}
+
+// EFA discovery must keep EFA NICs and install EFA in every USE_EFA build;
+// any other selection keeps excluding them.
+TEST(TransferEngineAutoDiscoverTest, EfaProtocolKeepsEfaNics) {
+    TransferEngineImpl engine(false);
+    engine.setAutoDiscover({.enabled = true, .protocol = "efa"});
+#ifdef USE_EFA
+    EXPECT_TRUE(TransferEngineImplTestPeer::autoDiscoverUsesEfa(engine));
+#else
+    EXPECT_FALSE(TransferEngineImplTestPeer::autoDiscoverUsesEfa(engine));
+#endif
+
+    TransferEngineImplTestPeer::setUseBarex(engine, true);
+    EXPECT_FALSE(TransferEngineImplTestPeer::autoDiscoverUsesEfa(engine));
+}
+
+TEST(TransferEngineAutoDiscoverTest, OtherProtocolsExcludeEfaNics) {
+    for (const char* protocol : {"", "rdma", "tcp"}) {
+        TransferEngineImpl engine(false);
+        engine.setAutoDiscover({.enabled = true, .protocol = protocol});
+        EXPECT_FALSE(TransferEngineImplTestPeer::autoDiscoverUsesEfa(engine))
+            << "protocol=" << protocol;
+    }
 }
 
 TEST(TransferEngineAutoDiscoverTest, BarexOverrideTakesPrecedence) {
