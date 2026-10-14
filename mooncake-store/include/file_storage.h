@@ -1,9 +1,12 @@
 #pragma once
 
+#include <array>
 #include <condition_variable>
 #include <functional>
+#include <future>
 #include <mutex>
 #include <optional>
+#include <unordered_map>
 #include <unordered_set>
 
 #include "client_service.h"
@@ -183,6 +186,30 @@ class FileStorage {
         FileStorageTest_PutAfterPhysicalWipeHealsDanglingLocalDiskReplica_Test;
     friend class
         FileStorageTest_PutAfterPhysicalWipeHealsDanglingLocalDiskReplicaOnBucket_Test;
+
+    struct AllocatedBatch;
+
+    tl::expected<BatchGetResult, ErrorCode> BatchGetOnce(
+        const std::vector<std::string>& keys, const std::vector<int64_t>& sizes,
+        std::shared_ptr<AllocatedBatch>* staging_out = nullptr);
+
+    /**
+     * @brief Hands a singleflight waiter its own batch id for the staging
+     * buffer its leader has already filled.
+     *
+     * The new id aliases the leader's AllocatedBatch, and the caller holds a
+     * strong reference to it, so the waiter can register its id even if the
+     * leader has already released its own. Every reader releases its own id
+     * and the staging memory goes back to the pool when the last id is gone.
+     * The lease is refreshed because the waiter starts its own read window
+     * now; without that it could outlive the leader's lease and read freed
+     * memory. The refreshed lease still expires once every reader is done or
+     * dead, which is what keeps an abandoned batch reclaimable by GC instead
+     * of pinned forever.
+     */
+    BatchGetResult ShareStagingBuffer(
+        const std::shared_ptr<AllocatedBatch>& staging);
+
     struct AllocatedBatch {
         uint64_t batch_id;
         std::vector<BufferHandle> handles;
@@ -199,6 +226,15 @@ class FileStorage {
         AllocatedBatch& operator=(const AllocatedBatch&) = delete;
 
         ~AllocatedBatch() = default;
+    };
+
+    // What a cold-read flight publishes to its waiters: the leader's result
+    // plus a strong reference to the staging batch behind it. The reference is
+    // what lets a waiter alias the buffer even after the leader released its
+    // own id, instead of falling back to a redundant read.
+    struct ColdReadOutcome {
+        tl::expected<BatchGetResult, ErrorCode> result;
+        std::shared_ptr<AllocatedBatch> staging;
     };
 
     /**
@@ -348,9 +384,22 @@ class FileStorage {
     // Whether client_buffer_allocator_'s buffer is the io_uring fixed buffer,
     // which the destructor must unregister before the buffer is freed.
     bool uring_buffer_registered_ = false;
-    mutable Mutex client_buffer_mutex_;
-    std::unordered_map<uint64_t, std::shared_ptr<AllocatedBatch>> GUARDED_BY(
-        client_buffer_mutex_) client_buffer_allocated_batches_;
+    // A singleflight burst gives every waiter of one key its own batch id at
+    // the same instant, and all of them then register and release that id
+    // here. Striping the table by id keeps the resulting convoy off a single
+    // mutex; ids are handed out sequentially, so this spreads them evenly.
+    static constexpr size_t kClientBufferShards = 16;
+    struct ClientBufferShard {
+        Mutex mutex;
+        std::unordered_map<uint64_t, std::shared_ptr<AllocatedBatch>>
+            GUARDED_BY(mutex) batches;
+    };
+    std::array<ClientBufferShard, kClientBufferShards> client_buffer_shards_;
+
+    ClientBufferShard& ShardFor(uint64_t batch_id) {
+        return client_buffer_shards_[batch_id % kClientBufferShards];
+    }
+
     std::atomic<uint64_t> next_batch_id_{1};
 
     /**
@@ -418,6 +467,16 @@ class FileStorage {
     // in which case the master's TTL reaper reclaims the orphaned tasks.
     std::unordered_map<std::string, OffloadTaskItem>
         deferred_task_by_storage_key_;
+
+    // Singleflight for cold reads. The first reader of a key becomes the
+    // leader and does the SSD I/O; readers that arrive while the flight is
+    // open wait on its shared_future and then take an alias batch id for the
+    // leader's staging buffer. Waiting on a future wakes only that key's
+    // waiters, and if the leader unwinds, the destroyed promise reports a
+    // broken promise instead of parking the waiters forever.
+    std::mutex singleflight_mutex_;
+    std::unordered_map<std::string, std::shared_future<ColdReadOutcome>>
+        inflight_cold_reads_;  // Guarded by singleflight_mutex_.
 
     mutable Mutex offloading_mutex_;
     bool GUARDED_BY(offloading_mutex_) enable_offloading_;
