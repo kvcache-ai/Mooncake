@@ -78,6 +78,8 @@ class DynamicReplicationController {
     // owner calls it before anything `submit` reaches is torn down.
     void Start(SubmitFn submit);
     void Stop();
+    // True while the admission thread exists (started and not yet joined).
+    bool Joinable() const { return admission_thread_.joinable(); }
 
     bool Enabled() const { return mode_ != Mode::kOff; }
     bool Enforcing() const { return mode_ == Mode::kEnforce; }
