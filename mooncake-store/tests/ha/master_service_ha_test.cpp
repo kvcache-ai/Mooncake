@@ -1342,8 +1342,7 @@ TEST_F(MasterServiceHATest, BatchPromotionCopiesMultipleChunksAndPreservesIds) {
     handoff.applied_cursor = {.batch_id = 7, .last_seq = 7};
     handoff.max_replica_id = 42;
 
-    ASSERT_TRUE(
-        service.RestoreFromBatchOpLogPromotion(handoff, 1).has_value());
+    ASSERT_TRUE(service.RestoreFromBatchOpLogPromotion(handoff, 1).has_value());
     ASSERT_TRUE(handoff.metadata_store);
     EXPECT_EQ(2u, handoff.metadata_store->GetKeyCount());
     EXPECT_TRUE(handoff.metadata_store->Exists(first.tenant_id, first.key));
@@ -1418,12 +1417,10 @@ TEST_F(MasterServiceHATest,
     handoff.applied_cursor = {.batch_id = 11, .last_seq = 11};
     handoff.max_replica_id = 61;
 
-    ASSERT_TRUE(
-        service.RestoreFromBatchOpLogPromotion(handoff, 1).has_value());
+    ASSERT_TRUE(service.RestoreFromBatchOpLogPromotion(handoff, 1).has_value());
     ASSERT_TRUE(handoff.metadata_store);
     EXPECT_EQ(1u, handoff.metadata_store->GetKeyCount());
-    EXPECT_TRUE(
-        handoff.metadata_store->Exists(object.tenant_id, object.key));
+    EXPECT_TRUE(handoff.metadata_store->Exists(object.tenant_id, object.key));
     auto replicas =
         ReplicaDescriptorsForTesting(service, kDefaultTenant, object.key);
     ASSERT_EQ(replicas.size(), 1);
@@ -2720,8 +2717,7 @@ TEST_F(MasterServiceHATest,
         disk_owner));
 }
 
-TEST_F(MasterServiceHATest,
-       RestoreDiscardRepairTimeoutThenRetrySucceeds) {
+TEST_F(MasterServiceHATest, RestoreDiscardRepairTimeoutThenRetrySucceeds) {
     const std::string cluster_id = "test_restore_repair_timeout_retry";
     auto backend = std::make_shared<FakeBatchHaKvBackend>();
     auto service_config = MasterServiceConfig::builder()

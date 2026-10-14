@@ -4557,16 +4557,15 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
             if (restore_repair_durable_timeout_ms_ == 0) {
                 durable_future.wait();
             } else {
-                durable_status = durable_future.wait_for(
-                    std::chrono::milliseconds(
+                durable_status =
+                    durable_future.wait_for(std::chrono::milliseconds(
                         restore_repair_durable_timeout_ms_));
             }
             if (durable_status != std::future_status::ready) {
-                LOG(ERROR)
-                    << "RestoreFromStandbySnapshot: repair batch not "
-                       "durable within "
-                    << restore_repair_durable_timeout_ms_
-                    << "ms, failing the restore";
+                LOG(ERROR) << "RestoreFromStandbySnapshot: repair batch not "
+                              "durable within "
+                           << restore_repair_durable_timeout_ms_
+                           << "ms, failing the restore";
                 repair_err = ErrorCode::INTERNAL_ERROR;
             }
         }
