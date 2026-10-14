@@ -264,8 +264,9 @@ FileStorage::LoadBatch(const std::vector<std::string>& keys,
     return allocated_batch;
 }
 
-tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGet(
-    const std::vector<std::string>& keys, const std::vector<int64_t>& sizes) {
+tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGetOnce(
+    const std::vector<std::string>& keys, const std::vector<int64_t>& sizes,
+    std::shared_ptr<AllocatedBatch>* staging_out) {
     auto start_time = std::chrono::steady_clock::now();
     auto load_result = LoadBatch(keys, sizes, false);
     if (!load_result) return tl::make_unexpected(load_result.error());
@@ -273,10 +274,16 @@ tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGet(
     auto allocated_batch = std::move(load_result.value());
     uint64_t batch_id = allocated_batch->batch_id;
     BatchGetResult batch_result{batch_id, allocated_batch->pointers};
+    if (staging_out != nullptr) {
+        // Hand the caller a strong reference to the staging batch, so
+        // singleflight waiters can still alias it after this batch is
+        // released below.
+        *staging_out = allocated_batch;
+    }
 
-    MutexLocker locker(&client_buffer_mutex_);
-    client_buffer_allocated_batches_.emplace(batch_id,
-                                             std::move(allocated_batch));
+    auto& shard = ShardFor(batch_id);
+    MutexLocker locker(&shard.mutex);
+    shard.batches.emplace(batch_id, std::move(allocated_batch));
     auto end_time = std::chrono::steady_clock::now();
     auto elapsed_time = std::chrono::duration_cast<std::chrono::microseconds>(
                             end_time - start_time)
@@ -284,6 +291,94 @@ tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGet(
     VLOG(1) << "Time taken for FileStorage::BatchGet: " << elapsed_time
             << "us, key size: " << keys.size() << ", batch_id: " << batch_id;
     return batch_result;
+}
+
+tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGet(
+    const std::vector<std::string>& keys, const std::vector<int64_t>& sizes) {
+    if (keys.size() != 1) {
+        // Only a single-key read can be deduplicated: a multi-key batch is a
+        // distinct request even when it contains a key already in flight.
+        return BatchGetOnce(keys, sizes);
+    }
+    const std::string& key = keys[0];
+
+    std::shared_future<ColdReadOutcome> inflight;
+    // Only the leader needs a promise, so allocate it on that branch instead
+    // of building a shared state every caller then throws away.
+    std::shared_ptr<std::promise<ColdReadOutcome>> promise;
+    {
+        std::lock_guard<std::mutex> lock(singleflight_mutex_);
+        auto it = inflight_cold_reads_.find(key);
+        if (it == inflight_cold_reads_.end()) {
+            promise = std::make_shared<std::promise<ColdReadOutcome>>();
+            inflight_cold_reads_.emplace(key, promise->get_future().share());
+        } else {
+            inflight = it->second;
+        }
+    }
+
+    if (inflight.valid()) {
+        // Waiter: another reader is already pulling this key off SSD.
+        // get() returns a reference into the shared state, which lives as long
+        // as this future, so the waiter reads the leader's outcome in place
+        // instead of copying it.
+        const ColdReadOutcome* leader = nullptr;
+        try {
+            leader = &inflight.get();
+        } catch (const std::future_error&) {
+            // The leader unwound without publishing a result, so its promise
+            // is gone. Read the key ourselves rather than fail the caller for
+            // somebody else's error.
+            VLOG(1) << "Cold read flight abandoned for key: " << key;
+            return BatchGetOnce(keys, sizes);
+        }
+        if (!leader->result) {
+            // Propagate the leader's failure: retrying would repeat the same
+            // SSD read for the same error.
+            return leader->result;
+        }
+        return ShareStagingBuffer(leader->staging);
+    }
+
+    // Leader: do the SSD IO, then publish it to the waiters.
+    auto forget_flight = [this, &key] {
+        std::lock_guard<std::mutex> lock(singleflight_mutex_);
+        inflight_cold_reads_.erase(key);
+    };
+
+    ColdReadOutcome outcome;
+    try {
+        outcome.result = BatchGetOnce(keys, sizes, &outcome.staging);
+    } catch (...) {
+        // Unregister before unwinding: the destroyed promise then reports a
+        // broken promise to the waiters, instead of leaving them parked on a
+        // key whose flight will never finish.
+        forget_flight();
+        throw;
+    }
+    forget_flight();
+    promise->set_value(outcome);
+    return outcome.result;
+}
+
+FileStorage::BatchGetResult FileStorage::ShareStagingBuffer(
+    const std::shared_ptr<AllocatedBatch>& staging) {
+    uint64_t alias_id = next_batch_id_.fetch_add(1, std::memory_order_relaxed);
+    auto& shard = ShardFor(alias_id);
+    MutexLocker locker(&shard.mutex);
+    // One more reader is about to read from this staging buffer, so the lease
+    // has to cover that reader's window as well. It still expires once every
+    // reader is done or dead, which keeps the batch reclaimable by GC.
+    staging->lease_timeout =
+        std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(config_.client_buffer_gc_ttl_ms);
+    // Alias the leader's batch under a fresh id, so each reader releases its
+    // own id and the shared_ptr returns the staging memory to the pool when
+    // the last one goes away.
+    shard.batches.emplace(alias_id, staging);
+    VLOG(1) << "Sharing staging buffer of batch_id " << staging->batch_id
+            << " as batch_id " << alias_id;
+    return BatchGetResult{alias_id, staging->pointers};
 }
 
 tl::expected<FileStorage::LocalBatchResult, ErrorCode>
@@ -1129,14 +1224,16 @@ FileStorage::AllocateBatch(const std::vector<std::string>& keys,
             &allocator == client_buffer_allocator_.get()) {
             gc_triggered = true;
             {
-                MutexLocker locker(&client_buffer_mutex_);
                 auto gc_now = std::chrono::steady_clock::now();
-                for (auto it = client_buffer_allocated_batches_.begin();
-                     it != client_buffer_allocated_batches_.end();) {
-                    if (gc_now >= it->second->lease_timeout) {
-                        it = client_buffer_allocated_batches_.erase(it);
-                    } else {
-                        ++it;
+                for (auto& shard : client_buffer_shards_) {
+                    MutexLocker locker(&shard.mutex);
+                    for (auto it = shard.batches.begin();
+                         it != shard.batches.end();) {
+                        if (gc_now >= it->second->lease_timeout) {
+                            it = shard.batches.erase(it);
+                        } else {
+                            ++it;
+                        }
                     }
                 }
             }
@@ -1170,15 +1267,15 @@ void FileStorage::ClientBufferGCThreadFunc() {
     LOG(INFO) << "action=client_buffer_gc_thread_started";
     while (client_buffer_gc_running_) {
         {
-            MutexLocker locker(&client_buffer_mutex_);
-            if (!client_buffer_allocated_batches_.empty()) {
-                auto now = std::chrono::steady_clock::now();
-                for (auto it = client_buffer_allocated_batches_.begin();
-                     it != client_buffer_allocated_batches_.end();) {
+            auto now = std::chrono::steady_clock::now();
+            for (auto& shard : client_buffer_shards_) {
+                MutexLocker locker(&shard.mutex);
+                for (auto it = shard.batches.begin();
+                     it != shard.batches.end();) {
                     if (now >= it->second->lease_timeout) {
                         VLOG(1) << "GC releasing batch_id: " << it->first
                                 << " (lease expired)";
-                        it = client_buffer_allocated_batches_.erase(it);
+                        it = shard.batches.erase(it);
                     } else {
                         ++it;
                     }
@@ -1200,12 +1297,16 @@ tl::expected<bool, ErrorCode> FileStorage::Exists(const std::string& key) {
 }
 
 bool FileStorage::ReleaseBuffer(uint64_t batch_id) {
-    MutexLocker locker(&client_buffer_mutex_);
-    auto it = client_buffer_allocated_batches_.find(batch_id);
-    if (it != client_buffer_allocated_batches_.end()) {
+    auto& shard = ShardFor(batch_id);
+    MutexLocker locker(&shard.mutex);
+    auto it = shard.batches.find(batch_id);
+    if (it != shard.batches.end()) {
+        // A singleflight waiter's id aliases its leader's batch, so several
+        // ids can map to one staging buffer; erasing this id drops one
+        // reference and the last one returns the memory to the pool.
         VLOG(1) << "Releasing buffer for batch_id: " << batch_id
                 << " (transfer completed)";
-        client_buffer_allocated_batches_.erase(it);
+        shard.batches.erase(it);
         return true;
     }
     VLOG(1) << "batch_id " << batch_id
