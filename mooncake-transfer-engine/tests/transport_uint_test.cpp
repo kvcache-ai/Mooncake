@@ -176,14 +176,16 @@ class TransferEngineImplTestPeer {
         return slice;
     }
 
-#ifdef USE_EVENT_DRIVEN_COMPLETION
     static void prepareFinishedBatchWithActiveCallback(
         MultiTransport& transport, Transport::BatchID batch_id) {
         auto& batch = Transport::toBatchDesc(batch_id);
         auto& task = batch.task_list.emplace_back();
         task.batch_id = batch_id;
         task.slice_count = 1;
+        task.success_slice_count = 1;
         task.is_finished = true;
+        // Model a completion callback that already published the terminal
+        // slice count but is still unwinding while holding its pin.
         batch.active_completion_callbacks.store(1, std::memory_order_release);
     }
 
@@ -192,7 +194,6 @@ class TransferEngineImplTestPeer {
         auto& batch = Transport::toBatchDesc(batch_id);
         batch.active_completion_callbacks.store(0, std::memory_order_release);
     }
-#endif
 
     static bool isCleanupDeferred(MultiTransport& transport,
                                   Transport::BatchID batch_id) {
@@ -1197,7 +1198,6 @@ TEST_F(TransportTest, TimedOutBatchIsReclaimedAfterCallbacksFinish) {
     EXPECT_TRUE(callback_called.load(std::memory_order_acquire));
 }
 
-#ifdef USE_EVENT_DRIVEN_COMPLETION
 TEST_F(TransportTest, FinishedBatchWaitsForCompletionCallbackQuiescence) {
     std::string server_name = "unit-test-server:1234";
     MultiTransport multi_transport(nullptr, server_name);
@@ -1224,7 +1224,6 @@ TEST_F(TransportTest, FinishedBatchWaitsForCompletionCallbackQuiescence) {
     EXPECT_FALSE(TransferEngineImplTestPeer::isCleanupDeferred(multi_transport,
                                                                batch_id));
 }
-#endif
 
 TEST_F(TransportTest, TransferTaskDestructorRunsSliceCleanup) {
     int cleanup_count = 0;
@@ -1737,7 +1736,10 @@ TEST_F(TransportTest, TcpScatterCombinesRequestsIntoOneTask) {
         }
         ASSERT_EQ(remaining, 0u)
             << "TCP scatter did not reach physical completion";
-        EXPECT_TRUE(engine.freeBatchID(submission.batch_id).ok());
+        // The last io callback may still hold its BatchDesc pin here;
+        // a deferred cleanup is a legal terminal outcome.
+        Status free_status = engine.freeBatchID(submission.batch_id);
+        EXPECT_TRUE(free_status.ok() || free_status.IsBatchCleanupDeferred());
         EXPECT_TRUE(submitted.ok());
         EXPECT_TRUE(successful);
         EXPECT_EQ(memcmp(source, destination, kBytes), 0);
@@ -2120,6 +2122,8 @@ TEST_F(TransportTest, CqMarkSuccessPublishesBatchFinishedTaskCount) {
     EXPECT_FALSE(batch.is_finished.load());
 #endif
     EXPECT_EQ(batch.finished_task_count.load(), 2u);
+    // Completion callbacks drop their BatchDesc pins when they unwind.
+    EXPECT_EQ(batch.active_completion_callbacks.load(), 0u);
 }
 
 TEST_F(TransportTest, SealPublishesWhenAllSlicesCompletedFirst) {
@@ -2141,6 +2145,7 @@ TEST_F(TransportTest, SealPublishesWhenAllSlicesCompletedFirst) {
     Transport::Slice::sealTaskSubmission(&task);
     EXPECT_TRUE(task.completion_published);
     EXPECT_EQ(batch.finished_task_count.load(), 1u);
+    EXPECT_EQ(batch.active_completion_callbacks.load(), 0u);
 }
 
 TEST_F(TransportTest, MarkFailedWithoutBatchIdDoesNotTouchBatchDesc) {
