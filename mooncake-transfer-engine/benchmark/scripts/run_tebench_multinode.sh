@@ -24,7 +24,7 @@ TOPOLOGY=""
 TARGETS_CSV=""
 INITIATORS_CSV=""
 NODES_CSV=""
-TEBENCH="./build/mooncake-transfer-engine/benchmark/tebench"
+TEBENCH=""
 BACKEND="tent"
 XPORT_TYPE=""
 SEG_TYPE="DRAM"
@@ -77,7 +77,7 @@ Required:
   --nodes HOSTS               Comma-separated peers for all_to_all.
 
 Runtime:
-  --tebench PATH              Same absolute tebench path on every host.
+  --tebench PATH              Required absolute path on every host (except dry-run).
   --backend classic|tent      Default: tent.
   --xport-type TYPE           Optional tebench --xport_type.
   --seg-type DRAM|VRAM        Default: DRAM.
@@ -102,7 +102,7 @@ Orchestration:
   --ready-timeout SECONDS     Target/barrier timeout. Default: 60.
   --run-timeout SECONDS       Per-phase timeout. Default: 300.
   --result-dir DIR            Local logs and JSONL destination.
-  --run-id ID                 Optional stable identifier for paths and logs.
+  --run-id ID                 Unique identifier for paths and logs.
   --keep-remote               Keep remote /tmp run directories.
   --dry-run                   Validate and print the launch plan only.
 
@@ -327,6 +327,10 @@ RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$$}"
 REMOTE_DIR="/tmp/mooncake-tebench-${RUN_ID}"
 RESULT_DIR="${RESULT_DIR:-$PWD/tebench-multinode-${RUN_ID}}"
 
+if [[ "$DRY_RUN" -eq 0 ]]; then
+    [[ "$TEBENCH" == /* ]] || die "--tebench must be an absolute path"
+fi
+
 SEGMENTS=()
 if [[ "$DRY_RUN" -eq 1 ]]; then
     echo "topology=$TOPOLOGY backend=$BACKEND operation=$OPERATION"
@@ -431,6 +435,7 @@ done
 
 PROCESS_HOSTS=()
 PROCESS_PIDFILES=()
+RUN_HOSTS=()
 COLLECTED=0
 
 track_process() {
@@ -471,7 +476,7 @@ collect_artifacts() {
     [[ "$COLLECTED" -eq 0 ]] || return 0
     local host destination
     local failed=0
-    for host in "${ALL_HOSTS[@]}"; do
+    for host in "${RUN_HOSTS[@]}"; do
         destination="$RESULT_DIR/$(host_key "$host")"
         mkdir -p "$destination" || {
             failed=1
@@ -506,7 +511,7 @@ remove_remote_dirs() {
     [[ "$KEEP_REMOTE" -eq 0 ]] || return 0
     local host
     local failed=0
-    for host in "${ALL_HOSTS[@]}"; do
+    for host in "${RUN_HOSTS[@]}"; do
         remote_bash "$host" "$REMOTE_DIR" <<'REMOTE_REMOVE' || failed=1
 run_dir="$1"
 case "$run_dir" in
@@ -542,6 +547,14 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
+for host in "${ALL_HOSTS[@]}"; do
+    remote_bash "$host" "$REMOTE_DIR" <<'REMOTE_CREATE' ||
+mkdir -- "$1"
+REMOTE_CREATE
+        die "Cannot create run directory on $host; use a unique --run-id"
+    RUN_HOSTS+=("$host")
+done
 
 start_target() {
     local target_index="$1"

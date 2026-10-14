@@ -465,6 +465,8 @@ target ranges used by the performance run without relying on application data.
 Use `--dry-run` to validate topology expansion, target lists, thread counts,
 and range assignments without connecting to any host. Each run stores logs and
 per-target JSONL files under a new local `tebench-multinode-*` directory.
+An existing run directory is rejected; use a new `--run-id` when rerunning with
+`--keep-remote`.
 
 ---
 

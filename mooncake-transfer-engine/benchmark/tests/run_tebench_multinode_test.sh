@@ -17,12 +17,14 @@
 set -Eeuo pipefail
 
 SCRIPT_PATH="${1:?multinode script path is required}"
+SCRIPT_PATH="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)/$(basename "$SCRIPT_PATH")"
 TEST_DIR="$(mktemp -d)"
 RUN_ID="tebench-script-test-$$"
 REMOTE_DIR="/tmp/mooncake-tebench-${RUN_ID}"
 
 cleanup() {
-    rm -rf "$TEST_DIR" "$REMOTE_DIR"
+    rm -rf "$TEST_DIR" "$REMOTE_DIR" "${REMOTE_DIR}-failure" \
+        "${REMOTE_DIR}-timeout"
 }
 trap cleanup EXIT
 
@@ -88,12 +90,14 @@ target_segment=""
 operation=""
 result_file=""
 mock_pid_file=""
+mock_exit_code=0
 for arg in "$@"; do
     case "$arg" in
         --target_seg_name=*) target_segment="${arg#*=}" ;;
         --op_type=*) operation="${arg#*=}" ;;
         --result_output_jsonl=*) result_file="${arg#*=}" ;;
         --mock_pid_file=*) mock_pid_file="${arg#*=}" ;;
+        --mock_exit_code=*) mock_exit_code="${arg#*=}" ;;
     esac
 done
 
@@ -109,11 +113,29 @@ if [[ -n "$mock_pid_file" ]]; then
     sleep 30
 fi
 
+[[ "$mock_exit_code" -eq 0 ]] || exit "$mock_exit_code"
 echo "operation=$operation target=$target_segment"
 printf '{"operation":"%s","target":"%s"}\n' \
     "$operation" "$target_segment" >"$result_file"
 MOCK
 chmod +x "$MOCK_TEBENCH"
+
+for tebench_path in "" "./mock-tebench"; do
+    tebench_args=()
+    [[ -z "$tebench_path" ]] || tebench_args+=("--tebench=$tebench_path")
+    if (cd "$TEST_DIR" && "$SCRIPT_PATH" --run-id="$RUN_ID" \
+        --topology=m2n --targets=local --initiators=local \
+        "${tebench_args[@]}" \
+        --result-dir="$TEST_DIR/path-results") \
+        >"$TEST_DIR/path.log" 2>&1; then
+        echo "missing or relative tebench path was accepted" >&2
+        exit 1
+    fi
+    assert_contains "$(cat "$TEST_DIR/path.log")" \
+        "--tebench must be an absolute path"
+    test ! -e "$TEST_DIR/path-results"
+    test ! -e "$REMOTE_DIR"
+done
 
 RESULT_DIR="$TEST_DIR/results"
 "$SCRIPT_PATH" --run-id="$RUN_ID" --topology=m2n \
@@ -129,6 +151,36 @@ grep -Fq '"operation":"write_seed"' \
 grep -Fq '"operation":"read_verify"' \
     "$RESULT_DIR/local/verify-initiator-0.jsonl"
 test ! -e "$REMOTE_DIR"
+
+mkdir "$REMOTE_DIR"
+printf 'existing run\n' >"$REMOTE_DIR/marker"
+if "$SCRIPT_PATH" --run-id="$RUN_ID" --topology=m2n \
+    --targets=local --initiators=local --tebench="$MOCK_TEBENCH" \
+    --duration=1 --total-buffer-size=4096 \
+    --result-dir="$TEST_DIR/collision-results" \
+    >"$TEST_DIR/collision.log" 2>&1; then
+    echo "existing run directory was accepted" >&2
+    exit 1
+fi
+assert_contains "$(cat "$TEST_DIR/collision.log")" \
+    "Cannot create run directory"
+test "$(cat "$REMOTE_DIR/marker")" = "existing run"
+test ! -e "$REMOTE_DIR/target-0.log"
+rm -rf "$REMOTE_DIR"
+
+if "$SCRIPT_PATH" --run-id="${RUN_ID}-failure" --topology=m2n \
+    --targets=local --initiators=local --tebench="$MOCK_TEBENCH" \
+    --verify-data --duration=1 --total-buffer-size=4096 \
+    --initiator-arg=--mock_exit_code=7 \
+    --result-dir="$TEST_DIR/failure-results" \
+    >"$TEST_DIR/failure.log" 2>&1; then
+    echo "failed seed phase unexpectedly succeeded" >&2
+    exit 1
+fi
+test "$(cat "$TEST_DIR/failure-results/local/seed-initiator-0.rc")" = 7
+test -f "$TEST_DIR/failure-results/local/target-0.log"
+test ! -e "$TEST_DIR/failure-results/local/verify.start"
+test ! -e "${REMOTE_DIR}-failure"
 
 TIMEOUT_RUN_ID="${RUN_ID}-timeout"
 MOCK_PID_FILE="$TEST_DIR/mock-initiator.pid"
