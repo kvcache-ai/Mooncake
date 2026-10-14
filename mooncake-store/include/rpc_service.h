@@ -308,9 +308,6 @@ class WrappedMasterService {
     WeightMetadataStore::Result<WeightResidencyOperation> QueryWeightOperation(
         const QueryWeightOperationRequest& request,
         const std::string& tenant_id = "default");
-    WeightMetadataStore::Result<WeightRevisionMetadata> ReconcileWeightRevision(
-        const ReconcileWeightRevisionRequest& request,
-        const std::string& tenant_id = "default");
     WeightMetadataStore::Result<WeightRevisionMetadata> DeleteWeightRevision(
         const DeleteWeightRevisionRequest& request,
         const std::string& tenant_id = "default");

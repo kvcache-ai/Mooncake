@@ -2934,9 +2934,6 @@ DEFINE_REAL_WEIGHT_METHOD(start_weight_residency_operation,
                           WeightResidencyOperation)
 DEFINE_REAL_WEIGHT_METHOD(query_weight_operation, QueryWeightOperation,
                           QueryWeightOperationRequest, WeightResidencyOperation)
-DEFINE_REAL_WEIGHT_METHOD(reconcile_weight_revision, ReconcileWeightRevision,
-                          ReconcileWeightRevisionRequest,
-                          WeightRevisionMetadata)
 DEFINE_REAL_WEIGHT_METHOD(delete_weight_revision, DeleteWeightRevision,
                           DeleteWeightRevisionRequest, WeightRevisionMetadata)
 

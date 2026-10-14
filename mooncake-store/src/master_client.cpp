@@ -370,7 +370,6 @@ DEFINE_WEIGHT_RPC_NAME(RenewWeightRevisionLease);
 DEFINE_WEIGHT_RPC_NAME(ReleaseWeightRevisionLease);
 DEFINE_WEIGHT_RPC_NAME(StartWeightResidencyOperation);
 DEFINE_WEIGHT_RPC_NAME(QueryWeightOperation);
-DEFINE_WEIGHT_RPC_NAME(ReconcileWeightRevision);
 DEFINE_WEIGHT_RPC_NAME(DeleteWeightRevision);
 
 #undef DEFINE_WEIGHT_RPC_NAME
@@ -537,9 +536,6 @@ DEFINE_WEIGHT_CLIENT_METHOD(StartWeightResidencyOperation,
                             WeightResidencyOperation)
 DEFINE_WEIGHT_CLIENT_METHOD(QueryWeightOperation, QueryWeightOperationRequest,
                             WeightResidencyOperation)
-DEFINE_WEIGHT_CLIENT_METHOD(ReconcileWeightRevision,
-                            ReconcileWeightRevisionRequest,
-                            WeightRevisionMetadata)
 DEFINE_WEIGHT_CLIENT_METHOD(DeleteWeightRevision, DeleteWeightRevisionRequest,
                             WeightRevisionMetadata)
 

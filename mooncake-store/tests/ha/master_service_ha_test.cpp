@@ -101,10 +101,10 @@ class BlockingBatchHaKvBackend : public FakeBatchHaKvBackend {
         txn_entered_ = false;
     }
 
-    bool WaitForBlockedTxn() {
+    bool WaitForBlockedTxn(
+        std::chrono::seconds timeout = std::chrono::seconds(2)) {
         std::unique_lock<std::mutex> lock(mutex_);
-        return cv_.wait_for(lock, std::chrono::seconds(2),
-                            [&] { return txn_entered_; });
+        return cv_.wait_for(lock, timeout, [&] { return txn_entered_; });
     }
 
     void AllowTxn() {
@@ -3978,6 +3978,7 @@ TEST_F(MasterServiceHATest,
         .revision = "step-100",
         .weight_generation = 7,
     };
+    ::testing::internal::CaptureStderr();
     auto importing = std::async(std::launch::async, [&] {
         return service.BeginWeightImport(BeginWeightImportRequest{
             .identity = identity,
@@ -3991,6 +3992,11 @@ TEST_F(MasterServiceHATest,
     // fails.
     MasterServiceTestPeer::OrderedOplogWriter(service)->Stop();
     const auto result = importing.get();
+    const auto failure_log = ::testing::internal::GetCapturedStderr();
+    EXPECT_NE(std::string::npos,
+              failure_log.find("Failed to durably persist weight metadata"));
+    EXPECT_NE(std::string::npos,
+              failure_log.find(MakeWeightRevisionMetadataKey(identity)));
     EXPECT_TRUE(attempted);
     EXPECT_EQ(std::future_status::ready, completed);
     ASSERT_FALSE(result.has_value());
@@ -3999,6 +4005,75 @@ TEST_F(MasterServiceHATest,
         service
             .GetWeightRevision(GetWeightRevisionRequest{.identity = identity})
             .has_value());
+}
+
+TEST_F(MasterServiceHATest, WeightDurabilityWaitDoesNotBlockTaskCleanup) {
+    auto backend = std::make_shared<BlockingBatchHaKvBackend>();
+    auto config = MasterServiceConfig::builder()
+                      .set_enable_ha(true)
+                      .set_enable_oplog(true)
+                      .set_weight_management_oplog_capability_confirmed(true)
+                      .set_cluster_id("weight_cleanup_isolation")
+                      .set_pending_task_timeout_sec(1)
+                      .build();
+    MasterService service(config);
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
+    const WeightRevisionIdentity identity{
+        .tenant_id = "default",
+        .name_space = "production",
+        .resource_id = "cleanup",
+        .revision = "abandoned",
+        .weight_generation = 1,
+    };
+    ASSERT_TRUE(service.BeginWeightImport({
+        .identity = identity,
+        .expected_payload_count = 1,
+        .expected_logical_bytes = 1024,
+    }));
+    auto snapshot = ExportWeightMetadata(service);
+    snapshot.metadata.front().created_at_ms = 1;
+    snapshot.metadata.front().updated_at_ms = 1;
+    ASSERT_TRUE(MasterServiceTestPeer::WeightMetadata(service).RestoreSnapshot(
+        snapshot));
+    backend->BlockTxn();
+    struct ReleaseOnExit {
+        BlockingBatchHaKvBackend& backend;
+        ~ReleaseOnExit() { backend.AllowTxn(); }
+    } release{*backend};
+    // Let the real background worker enter the abandoned-import durable wait.
+    ASSERT_TRUE(backend->WaitForBlockedTxn(std::chrono::seconds(35)));
+    const auto task_id = generate_uuid();
+    const auto expired =
+        std::chrono::system_clock::now() - std::chrono::seconds(5);
+    {
+        auto tasks =
+            MasterServiceTestPeer::TaskManager(service).get_write_access();
+        tasks.restore_task(Task{
+            .id = task_id,
+            .type = TaskType::REPLICA_COPY,
+            .status = TaskStatus::PENDING,
+            .payload = "{}",
+            .created_at = expired,
+            .last_updated_at = expired,
+            .assigned_client = generate_uuid(),
+            .max_retry_attempts = 0,
+        });
+    }
+    bool cleaned = false;
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(35);
+    while (std::chrono::steady_clock::now() < deadline) {
+        const auto task = service.QueryTask(task_id);
+        if (task && task->status == TaskStatus::FAILED) {
+            cleaned = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    backend->AllowTxn();
+    EXPECT_TRUE(cleaned);
 }
 
 TEST_F(MasterServiceHATest,

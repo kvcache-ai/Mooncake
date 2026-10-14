@@ -1097,6 +1097,7 @@ class MasterService {
     // We need to clean up finished tasks periodically to avoid memory leak
     // And also we can add some task ttl mechanism in the future
     void TaskCleanupThreadFunc();
+    void WeightReconciliationThreadFunc();
     void JobDispatchThreadFunc();
 
     // Internal data structures
@@ -1395,8 +1396,9 @@ class MasterService {
         bool stop_scan{false};
         ErrorCode error{ErrorCode::OK};
     };
-    GroupEvictionResult EvictManagedWeightGroupToCold(
-        const WeightRevisionMetadata& metadata);
+    GroupEvictionResult EvictManagedWeightMembersToCold(
+        const WeightRevisionMetadata& metadata,
+        const std::vector<std::string>& member_keys);
 
     // Evicts every member of `group_id` across its metadata shards. MUST be
     // called WITHOUT holding any metadata shard lock: the caller releases the
@@ -1709,6 +1711,11 @@ class MasterService {
     // Used to wake task cleanup thread immediately during shutdown.
     std::mutex task_cleanup_mutex_;
     std::condition_variable task_cleanup_cv_;
+
+    std::thread weight_reconciliation_thread_;
+    std::atomic<bool> weight_reconciliation_running_{false};
+    std::mutex weight_reconciliation_mutex_;
+    std::condition_variable weight_reconciliation_cv_;
 
     // Helper class for accessing metadata with automatic locking and cleanup
     class MetadataAccessorRW {

@@ -1966,18 +1966,6 @@ WrappedMasterService::QueryWeightOperation(
 }
 
 WeightMetadataStore::Result<WeightRevisionMetadata>
-WrappedMasterService::ReconcileWeightRevision(
-    const ReconcileWeightRevisionRequest& request,
-    const std::string& tenant_id) {
-    return WithWeightRequestTenant(
-        request, tenant_id, master_service_.IsTenantQuotaEnabled(), true,
-        [this](const auto& bound) {
-            return master_service_.GetWeightStoreManager()
-                .ReconcileWeightRevision(bound);
-        });
-}
-
-WeightMetadataStore::Result<WeightRevisionMetadata>
 WrappedMasterService::DeleteWeightRevision(
     const DeleteWeightRevisionRequest& request, const std::string& tenant_id) {
     return WithWeightRequestTenant(
@@ -2110,7 +2098,6 @@ void RegisterRpcService(coro_rpc::coro_rpc_server& server,
         &WrappedMasterService::ReleaseWeightRevisionLease,
         &WrappedMasterService::StartWeightResidencyOperation,
         &WrappedMasterService::QueryWeightOperation,
-        &WrappedMasterService::ReconcileWeightRevision,
         &WrappedMasterService::DeleteWeightRevision>(
         server, wrapped_master_service, worker_pool);
 }

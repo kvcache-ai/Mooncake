@@ -246,6 +246,136 @@ TEST_F(WeightGroupLifecycleTest, RehydrateQueuesAndCompletesWholeManagedGroup) {
     EXPECT_EQ("completed", completed->message);
 }
 
+TEST_F(WeightGroupLifecycleTest, RecreatedMetadataStartsFreshMemberSelection) {
+    const auto config = MasterServiceConfig::builder()
+                            .set_default_kv_lease_ttl(0)
+                            .set_enable_offload(true)
+                            .set_root_fs_dir("/mnt/ssd")
+                            .build();
+    MasterService service(config);
+    const auto context = PrepareSimpleSegment(service);
+    ASSERT_TRUE(service.MountLocalDiskSegment(context.client_id, true));
+    const auto ready = PublishReady(service, context.client_id);
+    const auto attach_cold = [&](const std::string& key, uint64_t size) {
+        ASSERT_TRUE(service.PutEnd(context.client_id, key, TenantId::Default(),
+                                   ReplicaType::DISK));
+        AddLocalDiskReplica(service, context.client_id, key, size,
+                            "test_segment");
+    };
+    attach_cold("payload-a", 1024);
+    attach_cold(ManifestKey(), 128);
+    ASSERT_TRUE(service.StartWeightResidencyOperation({
+        .identity = ready.identity,
+        .expected_metadata_generation = ready.metadata_generation,
+        .target_residency = WeightResidencyState::COLD,
+    }));
+    auto& manager = service.GetWeightStoreManager();
+    const auto initial = manager.ExportSnapshot();
+    ASSERT_EQ(1, manager.ReconcileWeightMetadataStoreOnce(
+                     ready.updated_at_ms + 1, 1));
+
+    // Replace the metadata registry, then let its real sweep observe absence.
+    ASSERT_TRUE(manager.RestoreSnapshot(WeightMetadataSnapshot{}));
+    EXPECT_EQ(0, manager.ReconcileWeightMetadataStoreOnce(
+                     ready.updated_at_ms + 2, 1));
+    // Restore the physical initial state through ordinary object APIs while
+    // the old revision no longer owns the group.
+    ReplicateConfig put;
+    put.replica_num = 1;
+    put.with_hard_pin = true;
+    put.group_ids = std::vector<std::string>{ready.manifest.payload_group_id};
+    for (const auto& key : {std::string("payload-a"), ManifestKey()}) {
+        ASSERT_TRUE(service.Remove(key, TenantId::Default(), true));
+        put.data_type = key == "payload-a" ? ObjectDataType::WEIGHT
+                                           : ObjectDataType::METADATA;
+        const uint64_t size = key == "payload-a" ? 1024 : 128;
+        PutCompletedObject(service, context.client_id, key, put, size);
+        attach_cold(key, size);
+    }
+    ASSERT_TRUE(manager.RestoreSnapshot(initial));
+    ASSERT_EQ(1, manager.ReconcileWeightMetadataStoreOnce(
+                     ready.updated_at_ms + 3, 1));
+    const auto payload =
+        service.GetReplicaList("payload-a", TenantId::Default());
+    ASSERT_TRUE(payload);
+    bool payload_has_memory = false;
+    for (const auto& replica : payload->replicas) {
+        payload_has_memory |= replica.is_memory_replica();
+    }
+    EXPECT_FALSE(payload_has_memory);
+    const auto manifest =
+        service.GetReplicaList(ManifestKey(), TenantId::Default());
+    ASSERT_TRUE(manifest);
+    bool manifest_has_memory = false;
+    for (const auto& replica : manifest->replicas) {
+        manifest_has_memory |= replica.is_memory_replica();
+    }
+    EXPECT_TRUE(manifest_has_memory);
+}
+
+TEST_F(WeightGroupLifecycleTest, MemberBudgetBoundsEvictionAndPromotion) {
+    const auto config = MasterServiceConfig::builder()
+                            .set_default_kv_lease_ttl(0)
+                            .set_enable_offload(true)
+                            .set_root_fs_dir("/mnt/ssd")
+                            .build();
+    MasterService service(config);
+    const auto context = PrepareSimpleSegment(service);
+    const auto client_id = context.client_id;
+    ASSERT_TRUE(service.MountLocalDiskSegment(client_id, true));
+    const auto ready = PublishReady(service, client_id);
+    for (const auto& key : {std::string("payload-a"), ManifestKey()}) {
+        ASSERT_TRUE(service.PutEnd(client_id, key, TenantId::Default(),
+                                   ReplicaType::DISK));
+        AddLocalDiskReplica(service, client_id, key,
+                            key == "payload-a" ? 1024 : 128, "test_segment");
+    }
+    ASSERT_TRUE(service.StartWeightResidencyOperation({
+        .identity = ready.identity,
+        .expected_metadata_generation = ready.metadata_generation,
+        .target_residency = WeightResidencyState::COLD,
+    }));
+    MasterServiceTestPeer(service).RunWeightReconciliationForTesting(
+        ready.updated_at_ms + 1, 1);
+    size_t hot_members = 0;
+    for (const auto& key : {std::string("payload-a"), ManifestKey()}) {
+        const auto replicas = service.GetReplicaList(key, TenantId::Default());
+        ASSERT_TRUE(replicas);
+        for (const auto& replica : replicas->replicas) {
+            hot_members += replica.is_memory_replica();
+        }
+    }
+    EXPECT_EQ(1, hot_members);
+    MasterServiceTestPeer(service).RunWeightReconciliationForTesting(
+        ready.updated_at_ms + 2, 1);
+    const auto cold = service.GetWeightRevision({.identity = ready.identity});
+    ASSERT_TRUE(cold);
+    ASSERT_EQ(WeightResidencyState::COLD, cold->metadata.residency);
+    ASSERT_TRUE(service.StartWeightResidencyOperation({
+        .identity = ready.identity,
+        .expected_metadata_generation = cold->metadata.metadata_generation,
+        .target_residency = WeightResidencyState::HOT,
+    }));
+    for (int i = 0; i < 2; ++i) {
+        MasterServiceTestPeer(service).RunWeightReconciliationForTesting(
+            ready.updated_at_ms + 3 + i, 1);
+        const auto pending = service.PromotionObjectHeartbeat(client_id);
+        ASSERT_TRUE(pending);
+        ASSERT_EQ(1, pending->size());
+        const auto& task = pending->front();
+        ASSERT_TRUE(service.PromotionAllocStart(
+            client_id, task.key, TenantId(task.tenant_id), task.size, {}));
+        ASSERT_TRUE(service.NotifyPromotionSuccess(client_id, task.key,
+                                                   TenantId(task.tenant_id)));
+    }
+    MasterServiceTestPeer(service).RunWeightReconciliationForTesting(
+        ready.updated_at_ms + 5, 1);
+    const auto hot = service.GetWeightRevision({.identity = ready.identity});
+    ASSERT_TRUE(hot);
+    EXPECT_EQ(WeightResidencyState::HOT, hot->metadata.residency);
+    EXPECT_EQ(WeightOperationState::NONE, hot->metadata.operation);
+}
+
 TEST_F(WeightGroupLifecycleTest, PendingOperationReflectsLostReadableMembers) {
     MasterService service;
     const auto segment = PrepareSimpleSegment(service);

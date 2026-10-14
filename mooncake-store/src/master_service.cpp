@@ -441,6 +441,10 @@ MasterService::MasterService(const MasterServiceConfig& config)
         std::thread(&MasterService::TaskCleanupThreadFunc, this);
     VLOG(1) << "action=start_task_cleanup_thread";
 
+    weight_reconciliation_running_ = true;
+    weight_reconciliation_thread_ =
+        std::thread(&MasterService::WeightReconciliationThreadFunc, this);
+
     replica_cleanup_worker_.Start();
 
     // NOTE: The async HTTP metadata cleanup worker is started lazily in
@@ -553,10 +557,16 @@ MasterService::~MasterService() {
     client_monitor_running_ = false;
 
     task_cleanup_running_ = false;
+    {
+        std::lock_guard lock(weight_reconciliation_mutex_);
+        weight_reconciliation_running_ = false;
+    }
     job_dispatch_running_ = false;
     http_metadata_cleanup_running_ = false;
     // Resolve durability waits while every callback target is still alive,
     // before joining workers that may be waiting for an OpLog publication.
+    // This releases publication waiters; in-flight backend I/O still follows
+    // the writer's shutdown contract and is not cancelled by the worker flag.
     if (ordered_oplog_writer_) {
         ordered_oplog_writer_->Stop();
     }
@@ -568,6 +578,7 @@ MasterService::~MasterService() {
 
     // Wake sleepers so join() doesn't block for long sleep intervals.
     task_cleanup_cv_.notify_all();
+    weight_reconciliation_cv_.notify_all();
     http_metadata_cleanup_cv_.notify_all();
 
     if (eviction_thread_.joinable()) {
@@ -583,6 +594,9 @@ MasterService::~MasterService() {
 #endif
     if (task_cleanup_thread_.joinable()) {
         task_cleanup_thread_.join();
+    }
+    if (weight_reconciliation_thread_.joinable()) {
+        weight_reconciliation_thread_.join();
     }
     if (http_metadata_cleanup_thread_.joinable()) {
         http_metadata_cleanup_thread_.join();
@@ -1599,14 +1613,16 @@ MasterService::GroupEvictionResult MasterService::EvictGroupOrObject(
     return result;
 }
 
-MasterService::GroupEvictionResult MasterService::EvictManagedWeightGroupToCold(
-    const WeightRevisionMetadata& revision) {
+MasterService::GroupEvictionResult
+MasterService::EvictManagedWeightMembersToCold(
+    const WeightRevisionMetadata& revision,
+    const std::vector<std::string>& member_keys) {
     const TenantId tenant_id(revision.identity.tenant_id);
-    auto member_keys =
-        GetGroupMemberKeys(tenant_id, revision.manifest.payload_group_id);
     if (member_keys.empty()) {
         return {};
     }
+    const std::unordered_set<std::string> selected_members(member_keys.begin(),
+                                                           member_keys.end());
 
     const auto now = std::chrono::system_clock::now();
     std::vector<std::vector<Replica>> deferred_replicas;
@@ -1618,6 +1634,9 @@ MasterService::GroupEvictionResult MasterService::EvictManagedWeightGroupToCold(
                                ObjectMetadata& metadata,
                                TenantState& tenant_state,
                                MetadataShardAccessorRW&) -> EvictMemberOutcome {
+        if (!selected_members.contains(member_key)) {
+            return {};
+        }
         const bool has_cold =
             metadata.HasReplica([this](const Replica& replica) {
                 return !replica.is_memory_replica() &&
@@ -1678,7 +1697,7 @@ MasterService::GroupEvictionResult MasterService::EvictManagedWeightGroupToCold(
         for (const auto& replica : removed) {
             removed_ids.push_back(replica.id());
         }
-        RecordDynamicReplicaRemoval(metadata, removed_ids);
+        dynamic_replication_.RecordReplicaRemoval(metadata, removed_ids);
         deferred_replicas.emplace_back(std::move(removed));
         const uint64_t after_charge = CompletedMemoryQuotaCharge(metadata);
         if (enable_multi_tenants_ && before_charge > after_charge) {
@@ -2962,14 +2981,29 @@ void MasterService::TaskCleanupThreadFunc() {
         }
         CleanupExpiredSoftPins(std::chrono::system_clock::now());
         CleanupExpiredDynamicReplicationState();
-        shared_lock.unlock();
+    }
+    LOG(INFO) << "Task cleanup thread stopped";
+}
+
+void MasterService::WeightReconciliationThreadFunc() {
+    LOG(INFO) << "Weight reconciliation thread started";
+    while (weight_reconciliation_running_) {
+        {
+            std::unique_lock lock(weight_reconciliation_mutex_);
+            weight_reconciliation_cv_.wait_for(
+                lock, std::chrono::milliseconds(kTaskCleanupThreadSleepMs),
+                [&] { return !weight_reconciliation_running_.load(); });
+        }
+        if (!weight_reconciliation_running_) {
+            break;
+        }
         const auto now_ms = static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::system_clock::now().time_since_epoch())
                 .count());
         weight_manager_.ReconcileWeightMetadataStoreOnce(now_ms, 32);
     }
-    LOG(INFO) << "Task cleanup thread stopped";
+    LOG(INFO) << "Weight reconciliation thread stopped";
 }
 
 auto MasterService::UnmountSegment(const UUID& segment_id,

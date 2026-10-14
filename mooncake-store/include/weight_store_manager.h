@@ -1,9 +1,9 @@
 #pragma once
 
 #include <array>
-#include <atomic>
 #include <mutex>
 #include <shared_mutex>
+#include <unordered_map>
 
 #include "weight_store_backend.h"
 
@@ -77,6 +77,14 @@ class WeightStoreManager {
     ListWeightRevisions(const ListWeightRevisionsRequest& request) const;
 
    private:
+    WeightMetadataStore::Result<WeightRevisionMetadata>
+    ReconcileWeightRevisionBounded(
+        const ReconcileWeightRevisionRequest& request, size_t* member_budget);
+    WeightMetadataStore::Result<void> RemoveWeightMembers(
+        const WeightRevisionMetadata& revision, size_t* member_budget);
+    std::vector<std::string> SelectReconciliationMembers(
+        const WeightRevisionMetadata& revision, size_t* member_budget);
+    void ForgetReconciliationCursor(const WeightRevisionIdentity& identity);
     WeightMetadataStore::Result<WeightResidencyOperation>
     PersistAndPublishWeightOperationMutation(
         const WeightOperationMutation& mutation);
@@ -93,7 +101,12 @@ class WeightStoreManager {
     WeightMetadataStore weight_metadata_;
     std::shared_mutex mutation_mutex_;
     std::array<std::mutex, 4096> group_locks_;
-    std::atomic<size_t> weight_reconciliation_offset_{0};
+    size_t weight_reconciliation_offset_{0};
+    bool expire_leases_on_unit_budget_{true};
+    std::mutex reconciliation_mutex_;
+    std::mutex member_cursor_mutex_;
+    // Retry offsets are local scheduling hints, not durable progress tokens.
+    std::unordered_map<std::string, size_t> member_cursors_;
 };
 
 }  // namespace mooncake

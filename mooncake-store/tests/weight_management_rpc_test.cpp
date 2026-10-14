@@ -10,6 +10,8 @@
 #include "client_service.h"
 #include "common/client_buffer_allocation.h"
 #include "master_client.h"
+#include "rpc_service.h"
+#include "rpc_worker_pool.h"
 #include "test_server_helpers.h"
 
 namespace mooncake::testing {
@@ -30,6 +32,49 @@ const tl::expected<T, WeightManagementError>& Domain(
     const WeightRpcResult<T>& result) {
     EXPECT_TRUE(result.has_value());
     return *result;
+}
+
+TEST(WeightManagementRpcTest,
+     PooledHandlersPreserveWeightResultsAndTenantBinding) {
+    const auto ports = getFreeTcpPorts(1);
+    ASSERT_EQ(1u, ports.size());
+    WrappedMasterServiceConfig config;
+    config.default_kv_lease_ttl = DEFAULT_DEFAULT_KV_LEASE_TTL;
+    config.enable_metric_reporting = false;
+    // Reverse destruction stops the server before draining the pool and
+    // service.
+    WrappedMasterService service(config);
+    RpcWorkerPool pool(2);
+    coro_rpc::coro_rpc_server server(1, ports.front(), "127.0.0.1",
+                                     std::chrono::seconds(0), true);
+    RegisterRpcService(server, service, &pool);
+    auto started = server.async_start();
+    ASSERT_FALSE(started.hasResult());
+    MasterClient client(generate_uuid(), nullptr, "default");
+    ASSERT_EQ(ErrorCode::OK,
+              client.Connect("127.0.0.1:" + std::to_string(ports.front())));
+
+    const auto begin = client.BeginWeightImport({
+        .identity = Identity(),
+        .expected_payload_count = 1,
+        .expected_logical_bytes = 1024,
+    });
+    ASSERT_TRUE(begin.has_value());
+    ASSERT_TRUE(Domain(begin).has_value());
+    EXPECT_EQ("default", Domain(begin)->identity.tenant_id);
+    const auto get = client.GetWeightRevision({.identity = Identity()});
+    ASSERT_TRUE(get.has_value());
+    ASSERT_TRUE(Domain(get).has_value());
+    EXPECT_EQ(*Domain(begin), Domain(get)->metadata);
+    const auto aborted = client.AbortWeightImport({
+        .identity = Identity(),
+        .expected_metadata_generation = Domain(begin)->metadata_generation,
+    });
+    ASSERT_TRUE(aborted.has_value());
+    ASSERT_TRUE(Domain(aborted).has_value());
+    EXPECT_EQ("default", Domain(aborted)->identity.tenant_id);
+    EXPECT_EQ(WeightAvailabilityState::DELETING, Domain(aborted)->availability);
+    server.stop();
 }
 
 TEST(WeightManagementRpcTest, RegistersEveryApiAndBindsTenant) {
@@ -124,15 +169,9 @@ TEST(WeightManagementRpcTest, RegistersEveryApiAndBindsTenant) {
     ASSERT_TRUE(Domain(abort).has_value());
     EXPECT_EQ(WeightAvailabilityState::DELETING, Domain(abort)->availability);
 
-    auto reconcile = client.ReconcileWeightRevision(
-        ReconcileWeightRevisionRequest{.identity = Identity()});
-    ASSERT_TRUE(Domain(reconcile).has_value());
-    EXPECT_EQ(WeightAvailabilityState::DELETED,
-              Domain(reconcile)->availability);
-
     auto deleted = client.DeleteWeightRevision(DeleteWeightRevisionRequest{
         .identity = Identity(),
-        .expected_metadata_generation = Domain(reconcile)->metadata_generation,
+        .expected_metadata_generation = Domain(abort)->metadata_generation,
     });
     ASSERT_TRUE(Domain(deleted).has_value());
     EXPECT_EQ(WeightAvailabilityState::DELETED, Domain(deleted)->availability);
