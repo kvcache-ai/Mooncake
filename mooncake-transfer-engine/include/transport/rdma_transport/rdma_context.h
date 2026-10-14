@@ -119,6 +119,7 @@ struct DmabufExport {
     // unknown. Data Direct registration is only possible on NICs whose Data
     // Direct function sits under the same root.
     std::string pci_root;
+    void *alloc_base = nullptr;  // HIP: base of the exported allocation
 };
 
 // RdmaContext represents the set of resources controlled by each local NIC,
