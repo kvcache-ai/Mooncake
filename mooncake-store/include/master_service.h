@@ -2759,7 +2759,8 @@ class MasterService {
     std::vector<StandbySegmentInfo> standby_memory_segments_;
     std::unordered_map<std::string, uint64_t> standby_accounted_memory_bytes_;
 
-    ErrorCode ValidateStandbyRemountSegment(const Segment& segment) const;
+    ErrorCode ValidateStandbyRemountSegment(const Segment& segment,
+                                            const UUID& client_id) const;
 
     // True while the replica sits on an endpoint in
     // invalid_replica_endpoints_. The read path asks only this, never the set.
