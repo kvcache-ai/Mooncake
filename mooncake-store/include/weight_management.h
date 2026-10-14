@@ -138,6 +138,10 @@ struct WeightRevisionLease {
 YLT_REFL(WeightRevisionLease, lease_id, identity, holder, expires_at_ms,
          fenced_metadata_generation);
 
+// Persisted completion sentinel shared by live queries, snapshots and replay.
+// Keep this value stable: message is part of the existing wire contract.
+inline constexpr char kWeightOperationCompletedMessage[] = "completed";
+
 struct WeightResidencyOperation {
     uint64_t operation_id{0};
     WeightRevisionIdentity identity;

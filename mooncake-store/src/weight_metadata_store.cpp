@@ -786,7 +786,7 @@ WeightMetadataStore::PrepareFinishOperation(
     next_operation.updated_at_ms = operation_time;
     next_operation.processed_members = next_operation.total_members;
     next_operation.cursor.clear();
-    next_operation.message = "completed";
+    next_operation.message = kWeightOperationCompletedMessage;
     return WeightOperationMutation{
         .metadata =
             WeightMetadataMutation{
@@ -822,7 +822,7 @@ WeightMetadataStore::PrepareUpdateOperationProgress(
     }
     if (revision->second.operation_id != operation_id ||
         revision->second.operation != operation->second.operation ||
-        operation->second.message == "completed") {
+        operation->second.message == kWeightOperationCompletedMessage) {
         return tl::make_unexpected(WeightManagementError::CONFLICT);
     }
     auto next_operation = operation->second;
@@ -1202,7 +1202,8 @@ tl::expected<void, WeightManagementError> ValidateWeightMetadataSnapshot(
     std::unordered_set<uint64_t> operations;
     for (const auto& operation : snapshot.operations) {
         const auto revision = revisions.find(operation.identity);
-        const bool completed = operation.message == "completed";
+        const bool completed =
+            operation.message == kWeightOperationCompletedMessage;
         if (operation.operation_id == 0 ||
             !ValidateWeightRevisionIdentity(operation.identity).ok() ||
             !IsValidWeightOperationState(operation.operation) ||

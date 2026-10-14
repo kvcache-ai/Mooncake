@@ -118,6 +118,16 @@ class MockMetadataStore : public MetadataStore {
         return true;
     }
 
+    bool PutWeightMetadataAndOperation(
+        const WeightRevisionMetadata& metadata,
+        const std::optional<WeightResidencyOperation>& operation) override {
+        weight_metadata_[metadata.identity] = metadata;
+        if (operation.has_value()) {
+            weight_operations_[operation->operation_id] = *operation;
+        }
+        return true;
+    }
+
     std::optional<WeightRevisionMetadata> GetWeightMetadata(
         const WeightRevisionIdentity& identity) const override {
         const auto it = weight_metadata_.find(identity);
