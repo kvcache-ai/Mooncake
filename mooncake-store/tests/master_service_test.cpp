@@ -265,6 +265,38 @@ TEST_F(MasterServiceTest, MountUnmountSegmentWithOffsetAllocator) {
     EXPECT_TRUE(unmount_result4.has_value());
 }
 
+// Mixed metadata-mode detection (issue #4536): a master serving the
+// co-located HTTP metadata server must accept a P2PHANDSHAKE-mode segment
+// mount (te_endpoint != name) -- the warning is advisory only -- and a
+// non-P2P segment (te_endpoint == name) must mount unchanged. This test
+// verifies that the warning is advisory; it does not assert on log output.
+TEST_F(MasterServiceTest, MountSegmentAcceptsMixedModeSegments) {
+    auto service_config =
+        MasterServiceConfig::builder().set_serve_http_metadata(true).build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
+
+    // P2PHANDSHAKE-mode writer: te_endpoint is the ephemeral TE RPC port,
+    // which never equals the segment name. Mount must still succeed.
+    auto p2p_segment = MakeSegment("mixed_mode_p2p_segment");
+    p2p_segment.te_endpoint = "10.62.0.55:16414";  // TE RPC port, not name
+    UUID p2p_client = generate_uuid();
+    auto p2p_mount = service_->MountSegment(p2p_segment, p2p_client);
+    EXPECT_TRUE(p2p_mount.has_value())
+        << "P2PHANDSHAKE-mode mount must remain accepted (warning only)";
+
+    // Non-P2P writer: te_endpoint == name. Mount succeeds as before.
+    auto http_segment = MakeSegment("mixed_mode_http_segment");
+    UUID http_client = generate_uuid();
+    auto http_mount = service_->MountSegment(http_segment, http_client);
+    EXPECT_TRUE(http_mount.has_value());
+
+    // Both segments can be unmounted after a successful mount.
+    EXPECT_TRUE(
+        service_->UnmountSegment(p2p_segment.id, p2p_client).has_value());
+    EXPECT_TRUE(
+        service_->UnmountSegment(http_segment.id, http_client).has_value());
+}
+
 TEST_F(MasterServiceTest, SoftPinZeroTtlSkipsSoftPinRegistration) {
     auto service_config = MasterServiceConfig::builder()
                               .set_default_kv_soft_pin_ttl(50)
