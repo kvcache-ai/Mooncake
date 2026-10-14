@@ -1088,9 +1088,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         }
     }
 
-    if (egm_config.enabled &&
-        (client_->transfer_engine_->isUsingTent() ||
-         client_->transfer_engine_->getTransport("nvlink") == nullptr)) {
+    if (egm_config.enabled && !client_->HasClassicTransport("nvlink")) {
         LOG(ERROR) << "EGM Store requires the classic NVLink transport; "
                       "check MC_MS_AUTO_DISC and MC_FORCE_MNNVL";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -1249,32 +1247,29 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
 
             size_t mapped_size = segment_size;
             void *ptr = nullptr;
+            std::unique_ptr<NvlinkHostNumaAllocation> egm_owner;
             std::string seg_location = kWildcardLocation;
             bool use_mmap_segment = !seg_numa_nodes.empty() || use_hugepage_;
 
             if (egm_config.enabled) {
-                // Adopt even a partial Create result before handling failure.
-                egm_segment_ptrs_.emplace_back();
-                auto &owner = egm_segment_ptrs_.back();
                 auto status = NvlinkHostNumaAllocation::Create(
                     egm_numa_nodes[egm_node_index], segment_size, alignment,
-                    owner);
+                    egm_owner);
                 if (!status.ok()) {
                     LOG(ERROR) << "EGM allocation failed: " << status;
-                    if (owner) {
-                        auto cleanup = owner->Release();
+                    if (egm_owner) {
+                        auto cleanup = egm_owner->Release();
                         if (!cleanup.ok()) {
                             LOG(ERROR)
                                 << "EGM partial allocation cleanup failed: "
                                 << cleanup << "; retaining until process exit";
-                            (void)owner.release();
+                            (void)egm_owner.release();
                         }
                     }
-                    egm_segment_ptrs_.pop_back();
                     return tl::unexpected(ErrorCode::INTERNAL_ERROR);
                 }
-                ptr = owner->base();
-                mapped_size = owner->length();
+                ptr = egm_owner->base();
+                mapped_size = egm_owner->length();
             } else if (!seg_numa_nodes.empty()) {
                 // NUMA-segmented allocation: contiguous VMA, per-region binding
                 size_t page_sz = use_hugepage_
@@ -1321,40 +1316,40 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             LOG(INFO) << "Mounting segment: " << mount_size << " bytes, "
                       << current_glbseg_size << " of " << total_glbseg_size;
 
-            if (!egm_config.enabled) {
-                if (this->protocol == "ascend" || this->protocol == "ubshmem") {
-                    if (use_hugepage_ &&
-                        !globalConfig().ascend_use_fabric_mem) {
-                        hugepage_segment_ptrs_.emplace_back(
-                            ptr, HugepageSegmentDeleter{mapped_size});
-                    } else {
-                        ascend_segment_ptrs_.emplace_back(
-                            ptr, AscendSegmentDeleter{this->protocol});
-                    }
-                } else if (this->protocol == "sunrise_link") {
-#if defined(USE_SUNRISE)
-                    sunrise_segment_ptrs_.emplace_back(ptr,
-                                                       SunriseSegmentDeleter{});
-#else
-                    LOG(ERROR)
-                        << "sunrise_link protocol requires USE_SUNRISE build";
-                    return tl::unexpected(ErrorCode::INVALID_PARAMS);
-#endif
-                } else if (this->protocol == "ub") {
-                    ub_segment_ptrs_.emplace_back(
-                        ptr, UbSegmentDeleter{mapped_size});
-                } else if (use_mmap_segment) {
-                    // NUMA-segmented, hugepage or EFA THP: track as mmap
-                    // allocation for munmap cleanup
+            if (egm_config.enabled) {
+                egm_segment_ptrs_.emplace_back(std::move(egm_owner));
+            } else if (this->protocol == "ascend" ||
+                       this->protocol == "ubshmem") {
+                if (use_hugepage_ && !globalConfig().ascend_use_fabric_mem) {
                     hugepage_segment_ptrs_.emplace_back(
                         ptr, HugepageSegmentDeleter{mapped_size});
                 } else {
-#ifdef USE_VRAM_SEGMENT
-                    vram_segment_ptrs_.emplace_back(ptr);
-#else
-                    segment_ptrs_.emplace_back(ptr);
-#endif
+                    ascend_segment_ptrs_.emplace_back(
+                        ptr, AscendSegmentDeleter{this->protocol});
                 }
+            } else if (this->protocol == "sunrise_link") {
+#if defined(USE_SUNRISE)
+                sunrise_segment_ptrs_.emplace_back(ptr,
+                                                   SunriseSegmentDeleter{});
+#else
+                LOG(ERROR)
+                    << "sunrise_link protocol requires USE_SUNRISE build";
+                return tl::unexpected(ErrorCode::INVALID_PARAMS);
+#endif
+            } else if (this->protocol == "ub") {
+                ub_segment_ptrs_.emplace_back(ptr,
+                                              UbSegmentDeleter{mapped_size});
+            } else if (use_mmap_segment) {
+                // NUMA-segmented, hugepage or EFA THP: track as mmap
+                // allocation for munmap cleanup
+                hugepage_segment_ptrs_.emplace_back(
+                    ptr, HugepageSegmentDeleter{mapped_size});
+            } else {
+#ifdef USE_VRAM_SEGMENT
+                vram_segment_ptrs_.emplace_back(ptr);
+#else
+                segment_ptrs_.emplace_back(ptr);
+#endif
             }
 
             // Populate HugeTLB pages in parallel immediately before transfer-
@@ -1748,6 +1743,12 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
             std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
             local_buffer_region_.reset();
         }
+        // Keep EGM Release separate from UnmountSegment above. Unmount only
+        // removes Master metadata and TE registration; replica copy/move
+        // workers may still hold local source slices. If reset drops the last
+        // Client reference, its destructor stops and joins those workers before
+        // we release backing memory. This is not a GPU completion barrier:
+        // transfers that timed out may still require deferred cleanup.
         client_.reset();
     }
     if (embedded_master_) {
