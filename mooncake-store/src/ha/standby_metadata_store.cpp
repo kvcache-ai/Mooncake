@@ -105,6 +105,21 @@ std::optional<WeightRevisionMetadata> StandbyMetadataStore::GetWeightMetadata(
                : std::optional<WeightRevisionMetadata>(it->second);
 }
 
+bool StandbyMetadataStore::PutWeightMetadataAndOperation(
+    const WeightRevisionMetadata& metadata,
+    const std::optional<WeightResidencyOperation>& operation) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    weight_metadata_[metadata.identity] = metadata;
+    if (operation.has_value()) {
+        weight_operations_[operation->operation_id] = *operation;
+        if (operation->operation_id < std::numeric_limits<uint64_t>::max()) {
+            next_weight_operation_id_ = std::max(next_weight_operation_id_,
+                                                 operation->operation_id + 1);
+        }
+    }
+    return true;
+}
+
 std::optional<uint64_t>
 StandbyMetadataStore::GetWeightMetadataTombstoneGeneration(
     const WeightRevisionIdentity& identity) const {
