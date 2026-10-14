@@ -42,6 +42,27 @@
 
 using namespace mooncake;
 
+namespace mooncake {
+class RdmaEndpointStoreNotificationTestPeer {
+   public:
+    static int constructNotification(RdmaEndPoint& endpoint) {
+        return endpoint.constructNotification();
+    }
+
+    static bool hasResources(const RdmaEndPoint& endpoint) {
+        std::lock_guard<std::mutex> guard(endpoint.notify_.mutex);
+        return endpoint.notify_.qp || endpoint.notify_.send_mr ||
+               endpoint.notify_.recv_mr || endpoint.notify_.send_buffer ||
+               endpoint.notify_.recv_buffer;
+    }
+
+    static bool enabled(const RdmaEndPoint& endpoint) {
+        std::lock_guard<std::mutex> guard(endpoint.notify_.mutex);
+        return endpoint.notify_.enabled;
+    }
+};
+}  // namespace mooncake
+
 namespace {
 
 // Build an RdmaEndPoint that owns zero QPs and has active_=false. construct()
@@ -209,6 +230,15 @@ TEST_F(EndpointStoreTest,
         EXPECT_EQ(-1, store.deleteEndpointByPtr(stale_ptr));
     }
     EXPECT_EQ(sentinel, store.getEndpointByPtr(sentinel.get()));
+}
+
+TEST_F(EndpointStoreTest, NotificationConstructionRollsBackWithoutCq) {
+    RdmaEndPoint endpoint(*ctx_);
+    EXPECT_NE(
+        RdmaEndpointStoreNotificationTestPeer::constructNotification(endpoint),
+        0);
+    EXPECT_FALSE(RdmaEndpointStoreNotificationTestPeer::hasResources(endpoint));
+    EXPECT_FALSE(RdmaEndpointStoreNotificationTestPeer::enabled(endpoint));
 }
 
 }  // namespace
