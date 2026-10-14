@@ -32,7 +32,7 @@ class ConductorClient {
 
     // Replaces the previous connection; failure leaves the client unconnected.
     tl::expected<void, ErrorCode> Setup(const ConductorClientConfig& config);
-    void Close();        // idempotent; Setup() may be called again afterwards
+    void Close();  // drains socket cleanup; idempotent; Setup may reconnect
     bool HealthCheck();  // healthy if one ListServices call succeeds
 
     tl::expected<QueryResult, ErrorCode> Query(const QueryRequest& request);
