@@ -115,6 +115,9 @@ static void nof_io_complete(void* ctx, const mooncake::NofIOCompletion& c) {
     }
 
     if (!c.success) {
+#ifdef USE_NOF
+        // NofMetric is only defined in USE_NOF builds (metric is always
+        // nullptr elsewhere).
         if (task->metric) {
             if (task->op == NofIOOp::kWrite) {
                 task->metric->RecordWriteErrors();
@@ -122,6 +125,7 @@ static void nof_io_complete(void* ctx, const mooncake::NofIOCompletion& c) {
                 task->metric->RecordReadErrors();
             }
         }
+#endif
         LOG(ERROR) << "nof task I/O failed: sc=" << c.sc << " sct=" << c.sct
                    << " " << c.error_string;
         task->remaining_bytes = 0;
@@ -129,12 +133,14 @@ static void nof_io_complete(void* ctx, const mooncake::NofIOCompletion& c) {
         if (task->error_detail.empty()) {
             task->error_detail = c.error_string;  // keep the first error detail
         }
+#ifdef USE_NOF
     } else if (task->metric) {
         if (task->op == NofIOOp::kWrite) {
             task->metric->ObserveWrite(sub_task->submit_bytes);
         } else {
             task->metric->ObserveRead(sub_task->submit_bytes);
         }
+#endif
     }
 
     NofTaskCompletion(task);
@@ -571,6 +577,7 @@ void NofWorkerPool::workerThread(int work_idx) {
                             task->seg_handle, submit_ptr, submit_off,
                             submit_bytes, task->op, &sub_task->adaptor);
                         if (ret != 0) {
+#ifdef USE_NOF
                             if (task->metric) {
                                 if (task->op == NofIOOp::kWrite) {
                                     task->metric->RecordWriteErrors();
@@ -578,6 +585,7 @@ void NofWorkerPool::workerThread(int work_idx) {
                                     task->metric->RecordReadErrors();
                                 }
                             }
+#endif
                             LOG(ERROR) << "work " << work_idx << ", seg "
                                        << task->seg_handle << " submit io fail";
                             // Return the pool slot: a sub-task taken out

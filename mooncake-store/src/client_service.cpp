@@ -1036,12 +1036,15 @@ void Client::InitTransferSubmitter() {
     const int numa_socket_id =
         ClientNumaConfig::FromEnvironment().socket_id.value_or(
             GetCurrentNumaSocketId());
-    transfer_submitter_ = std::make_unique<TransferSubmitter>(
-        *transfer_engine_, storage_backend_, local_hostname_,
+    // ClientMetric::nof_metric exists only in USE_NOF builds.
+    NofMetric* nof_metric = nullptr;
+#ifdef USE_NOF
+    nof_metric = metrics_ ? &metrics_->nof_metric : nullptr;
+#endif
     transfer_submitter_ = std::make_unique<TransferSubmitter>(
         *transfer_engine_, storage_backend_, local_hostname_,
         metrics_ ? &metrics_->transfer_metric : nullptr, numa_socket_id,
-        nof_initiator_, metrics_ ? &metrics_->nof_metric : nullptr);
+        nof_initiator_, nof_metric);
 }
 
 void Client::SetDefaultNofInitiatorFactoryForTesting(
