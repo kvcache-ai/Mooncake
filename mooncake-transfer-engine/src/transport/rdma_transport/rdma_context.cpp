@@ -781,14 +781,18 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
         // reference, so all NICs share one dma_buf object (and one BAR1
         // window).
 #ifdef USE_CUDA
-        // A NIC that is not Data Direct-paired with the buffer's GPU cannot
-        // register this memory at all: the Data Direct call fails with
-        // ENOTSUPP, and so does a plain dma-buf registration of the shared
-        // export (it was made with the PCIe mapping flag). Record a region
-        // without an MR (keys read as 0, like a placeholder context); the
-        // topology keeps such NICs out of the GPU's HCA list so no transfer
-        // ever selects them.
-        if (globalConfig().rdma_data_direct && !dataDirectPairedWith(exp)) {
+        // Under MC_RDMA_DATA_DIRECT_PAIRING a NIC that is not Data
+        // Direct-paired with the buffer's GPU cannot register this memory at
+        // all: the Data Direct call fails with ENOTSUPP, and so does a plain
+        // dma-buf registration of the shared export (it was made with the
+        // PCIe mapping flag). Record a region without an MR (keys read as 0,
+        // like a placeholder context); the paired topology never routes a
+        // transfer to such a NIC, and discovery already rejected any layout
+        // where the pairing cannot hold. Without the pairing flag the
+        // registration proceeds and fails loudly, as before this change.
+        if (globalConfig().rdma_data_direct &&
+            globalConfig().rdma_data_direct_pairing &&
+            !dataDirectPairedWith(exp)) {
             mrMeta.mr = nullptr;
             return 0;
         }
