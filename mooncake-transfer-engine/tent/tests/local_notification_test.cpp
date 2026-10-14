@@ -21,6 +21,7 @@
 // notification hung forever. These tests pin the in-process delivery
 // contract without requiring any NIC or a metadata server.
 
+#include <glog/logging.h>
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -76,6 +77,10 @@ class TransferEngineImplTestPeer {
 
     static void deconstruct(tent::TransferEngineImpl& engine) {
         (void)engine.deconstruct();
+    }
+
+    static uint64_t droppedRecvBacklog(tent::TransferEngineImpl& engine) {
+        return engine.notify_backlog_dropped_.load();
     }
 };
 
@@ -226,6 +231,46 @@ TEST(LocalNotificationTest, WorksWithoutAnyNotificationTransport) {
     // deliver the "not supported" error is reported again.
     EXPECT_FALSE(engine.receiveNotification(received).ok());
     EXPECT_TRUE(received.empty());
+}
+
+// Without a TCP transport, what arrives over the control plane is queued
+// here too.
+TEST(LocalNotificationTest, RecvBacklogIsBoundedAndDropsTheOldest) {
+    auto config = makeConfig(/*enable_tcp=*/false);
+    config->set("notification/recv_backlog_max", 4);
+    TransferEngineImpl engine(config);
+    ASSERT_TRUE(engine.available());
+    auto received = [&] {
+        std::vector<Notification> polled;
+        EXPECT_TRUE(engine.receiveNotification(polled).ok());
+        std::vector<std::string> msgs;
+        for (const auto& notifi : polled) msgs.push_back(notifi.msg);
+        return msgs;
+    };
+    const std::vector<std::string> newest{"1000", "1001", "1002", "1003"};
+
+    // 1000 drops: LOG_EVERY_N(1000) logs one of them, whatever ran before.
+    const auto warnings = google::LogMessage::num_messages(google::WARNING);
+    for (int i = 0; i < 1004; ++i) {
+        ASSERT_TRUE(engine
+                        .sendNotification(LOCAL_SEGMENT_ID,
+                                          {kSegmentName, std::to_string(i)})
+                        .ok());
+    }
+    EXPECT_EQ(received(), newest);
+    EXPECT_EQ(Peer::droppedRecvBacklog(engine), 1000u);
+    EXPECT_GE(google::LogMessage::num_messages(google::WARNING) - warnings, 1);
+
+    for (int i = 0; i < 1004; ++i) {
+        ASSERT_TRUE(ControlClient::notify(engine.getSegmentName(),
+                                          {kSegmentName, std::to_string(i)})
+                        .ok());
+    }
+    EXPECT_EQ(received(), newest);
+    EXPECT_EQ(Peer::droppedRecvBacklog(engine), 2000u);
+    std::vector<Notification> again;
+    EXPECT_FALSE(engine.receiveNotification(again).ok());
+    EXPECT_TRUE(again.empty());
 }
 
 // Stands in for the RDMA transport on a self-addressed notification: it

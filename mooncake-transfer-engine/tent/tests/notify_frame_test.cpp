@@ -14,6 +14,7 @@
 
 // The typed frame codec, the sender's stamps and the receiver's filter.
 
+#include <glog/logging.h>
 #include <gtest/gtest.h>
 
 #include <chrono>
@@ -22,6 +23,7 @@
 #include <string>
 #include <vector>
 
+#include "tent/common/config.h"
 #include "tent/common/notify_frame.h"
 
 namespace mooncake {
@@ -427,6 +429,23 @@ TEST(NotifySequencerTest, IdleTargetsGetANewSession) {
     EXPECT_EQ(later.seq, 1u);
     EXPECT_EQ(sequencer.stamp("b", Notification{}, t0 + 11min).session,
               busy.session);  // an active target keeps its session
+}
+
+TEST(NotifyRecvBacklogTest, OutOfRangeKeepsTheDefault) {
+    auto load = [](int64_t value) {
+        Config conf;
+        conf.set("notification/recv_backlog_max", value);
+        return loadNotifyRecvBacklogMax(conf);
+    };
+    const int64_t limit = kNotifyRecvBacklogLimit;
+    EXPECT_EQ(limit, 1048576);
+    EXPECT_EQ(loadNotifyRecvBacklogMax(Config{}), 65536u);
+    EXPECT_EQ(load(1), 1u);
+    EXPECT_EQ(load(limit), kNotifyRecvBacklogLimit);
+    const auto warnings = google::LogMessage::num_messages(google::WARNING);
+    for (const int64_t value : {int64_t{0}, int64_t{-4}, limit + 1})
+        EXPECT_EQ(load(value), 65536u) << value;
+    EXPECT_EQ(google::LogMessage::num_messages(google::WARNING) - warnings, 3);
 }
 
 }  // namespace

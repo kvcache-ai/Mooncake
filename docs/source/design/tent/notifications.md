@@ -101,6 +101,26 @@ dropped. A session idle for the longer of 10 minutes and that ttl is
 forgotten. `notification/proto` 0 sends unstamped notifications, which are
 never dropped as duplicates.
 
+## Receive queues
+
+What arrives waits for `receiveNotification()` in the queue of the transport
+that took it, RDMA, TCP or HP TCP, or in the engine's own queue: notifications
+to its own segment and, with neither the TCP nor the HP TCP transport loaded,
+those that came over the control plane. Each queue holds at most
+`notification/recv_backlog_max` notifications; one that arrives at a full queue
+drops the oldest unread one. Delivery therefore assumes the application keeps
+calling `receiveNotification()`: one that stops polling long enough for a queue
+to fill loses its oldest unread notifications, one per new arrival. The bound
+counts notifications, not bytes; it keeps any peer that can reach the control
+plane from growing the receiver's memory without limit.
+
+A transport's queue drops a stamped notification before duplicate detection
+sees it, so its sequence number stays missing: a copy that arrives later, over
+another path or as a resend, is still delivered; without one, the missing range
+is given up and the loss reported a second time. The engine's own queue checks
+what came over the control plane on arrival, so a later copy of one it dropped
+is refused as a duplicate.
+
 ## Drops
 
 Apart from notifications of transfers never polled to completion (above),
@@ -117,6 +137,7 @@ can repeat is rate-limited and carries the count so far:
 | `Dropped a notification to segment S after N attempt(s)` | a resend that ran out of rounds or of `notification/resend_deadline_ms` |
 | `Dropped N notification resend(s) ...` | resends past the deadline behind a held one, or left when the RDMA transport stops |
 | `Gave up on notifications A..B of session S` | receiver: a missing range expired or was evicted |
+| `Notification receive queue Q full at N, dropped the oldest unread` | receiver: `notification/recv_backlog_max` reached; `Q` is the queue, as in the metrics |
 | `Dropped notifications delivered before or given up on` | receiver: a duplicate, or a late arrival in a range given up |
 
 ## Configuration
@@ -135,3 +156,4 @@ keeps the default; larger values are clamped where noted.
 | `notification/resend_deadline_ms` | `120000` | How long an RDMA resend is held for a peer whose control plane does not answer or does not take it yet. At most 24 h. |
 | `notification/dedup_hole_ttl_ms` | `600000` | How long the receiver waits for a missing sequence. Keep it above the sender's deadlines. |
 | `notification/dedup_max_holes` | `65536` | Missing ranges the receiver keeps per sender session. |
+| `notification/recv_backlog_max` | `65536` | Notifications each receive queue holds before an arrival drops the oldest unread one. 1 to 1048576; any other integer keeps the default, with a warning. |

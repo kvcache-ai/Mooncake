@@ -22,6 +22,8 @@
 #include <limits>
 #include <random>
 
+#include "tent/common/config.h"
+
 namespace mooncake {
 namespace tent {
 
@@ -152,6 +154,18 @@ bool decodeNotifyFrame(const char* data, size_t len, NotifyFrameHeader* header,
     if (8 + name->size() + msg->size() != payload_len) return false;
     *header = decoded;
     return true;
+}
+
+size_t loadNotifyRecvBacklogMax(const Config& conf) {
+    const int64_t value =
+        conf.get("notification/recv_backlog_max",
+                 static_cast<int64_t>(kNotifyRecvBacklogDefault));
+    if (value >= 1 && static_cast<size_t>(value) <= kNotifyRecvBacklogLimit)
+        return static_cast<size_t>(value);
+    LOG(WARNING) << "Invalid notification/recv_backlog_max value: " << value
+                 << ", valid range: 1 to " << kNotifyRecvBacklogLimit
+                 << ", using default " << kNotifyRecvBacklogDefault;
+    return kNotifyRecvBacklogDefault;
 }
 
 Notification NotifySequencer::stamp(const std::string& target,

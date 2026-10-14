@@ -23,6 +23,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <iomanip>
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <thread>
@@ -114,6 +115,7 @@ Status TcpTransport::install(std::string &local_segment_name,
         params_.allow_unsafe_legacy_data_rpc =
             conf->get("transports/tcp/allow_unsafe_legacy_data_rpc",
                       params_.allow_unsafe_legacy_data_rpc);
+        notify_backlog_max_ = loadNotifyRecvBacklogMax(*conf);
     }
 
     if (params_.max_concurrent_tasks == 0) {
@@ -190,6 +192,16 @@ Status TcpTransport::install(std::string &local_segment_name,
     installed_ = true;
     metadata_->setNotifyCallback([&](const Notification &message) -> int {
         RWSpinlock::WriteGuard guard(notify_lock_);
+        if (notify_list_.size() >= notify_backlog_max_) {
+            notify_list_.pop_front();
+            const uint64_t dropped = ++notify_backlog_dropped_;
+            TENT_RECORD_NOTIFY_DROPPED(
+                TentMetrics::NotifyDropReason::RecvBacklog, 1);
+            LOG_EVERY_N(WARNING, 1000)
+                << "Notification receive queue recv_tcp full at "
+                << notify_backlog_max_ << ", dropped the oldest unread, "
+                << dropped << " so far";
+        }
         notify_list_.push_back(message);
         TENT_RECORD_NOTIFY_RECEIVED(TentMetrics::NotifyQueue::RecvTcp,
                                     notify_list_.size());
@@ -591,11 +603,16 @@ Status TcpTransport::sendNotification(SegmentID target_id,
 
 Status TcpTransport::receiveNotification(
     std::vector<Notification> &notify_list) {
-    RWSpinlock::WriteGuard guard(notify_lock_);
     notify_list.clear();
-    notify_list.swap(notify_list_);
-    if (!notify_list.empty())
-        TENT_SET_NOTIFY_QUEUE_DEPTH(TentMetrics::NotifyQueue::RecvTcp, 0);
+    std::unique_lock<RWSpinlock> guard(notify_lock_);
+    if (notify_list_.empty()) return Status::OK();
+    // Arrivals spin on this lock: take the queue whole, move it out after.
+    std::deque<Notification> taken;
+    taken.swap(notify_list_);
+    TENT_SET_NOTIFY_QUEUE_DEPTH(TentMetrics::NotifyQueue::RecvTcp, 0);
+    guard.unlock();
+    notify_list.assign(std::make_move_iterator(taken.begin()),
+                       std::make_move_iterator(taken.end()));
     return Status::OK();
 }
 

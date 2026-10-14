@@ -65,6 +65,14 @@ bool encodeNotifyFrame(const NotifyFrameHeader& header, const std::string& name,
 bool decodeNotifyFrame(const char* data, size_t len, NotifyFrameHeader* header,
                        std::string* name, std::string* msg);
 
+class Config;
+
+// How many notifications a receive queue holds before an arrival drops the
+// oldest unread one: notification/recv_backlog_max, 1 to the limit, else this.
+constexpr size_t kNotifyRecvBacklogDefault = 65536;
+constexpr size_t kNotifyRecvBacklogLimit = size_t{1} << 20;
+size_t loadNotifyRecvBacklogMax(const Config& conf);
+
 // Stamps a sequence number per target segment name, under a random session
 // per name, so reopening a segment continues its count. A notification already
 // stamped for this target (a resend) keeps its stamp; any other is restamped.

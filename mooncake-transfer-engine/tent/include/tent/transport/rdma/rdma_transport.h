@@ -36,6 +36,7 @@
 #include "context.h"
 #include "slice.h"
 #include "quota.h"
+#include "tent/common/notify_frame.h"
 #include "tent/runtime/control_plane.h"
 #include "tent/runtime/transport.h"
 #include "tent/runtime/topology.h"
@@ -186,8 +187,10 @@ class RdmaTransport : public Transport {
 
     // Local notification queue for receiveNotification()
     std::mutex notify_mutex_;
-    std::vector<Notification> notify_list_;
+    std::deque<Notification> notify_list_;
     std::condition_variable notify_cv_;
+    size_t notify_backlog_max_ = kNotifyRecvBacklogDefault;
+    std::atomic<uint64_t> notify_backlog_dropped_{0};
 
     // Slices outliving the batch they belonged to because the completion
     // queue can still name them. Owned here until that is no longer true.
@@ -249,11 +252,12 @@ class RdmaTransport : public Transport {
                                                int device_id);
 
     // The notification/* keys install() reads; a value <= 0 keeps the
-    // default.
+    // default, as does a recv_backlog_max above 1048576.
     struct NotifyConfig {
         bool rpc_fallback = true;
         bool path_probe = true;
         std::chrono::milliseconds resend_deadline{120000};  // at most 24 h
+        size_t recv_backlog_max = kNotifyRecvBacklogDefault;
     };
     static NotifyConfig readNotifyConfig(const Config& conf);
 
