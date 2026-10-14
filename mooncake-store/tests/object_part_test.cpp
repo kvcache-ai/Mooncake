@@ -1,16 +1,18 @@
-// part_test.cpp
+// object_part_test.cpp
 //
 // The content the envelope now holds in a part: the operations on the part
 // itself, the envelope's forwarding to its single part, and the OpLog payload
 // that carries the fields.
 
 #include "object_metadata.h"
-#include "part.h"
+#include "object_part.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <ranges>
 #include <string>
 #include <utility>
 #include <vector>
@@ -61,10 +63,10 @@ std::unique_ptr<ObjectMetadata> MakeEnvelope(size_t length,
 
 // Building the OpLog payload needs a service, so this case carries the logging
 // setup the other service-backed suites use.
-class PartPayloadTest : public ::testing::Test {
+class OplogPayloadTest : public ::testing::Test {
    protected:
     void SetUp() override {
-        google::InitGoogleLogging("PartPayloadTest");
+        google::InitGoogleLogging("OplogPayloadTest");
         FLAGS_logtostderr = true;
     }
 
@@ -73,62 +75,55 @@ class PartPayloadTest : public ::testing::Test {
     void TearDown() override { google::ShutdownGoogleLogging(); }
 };
 
-TEST(PartTest, HoldsItsContentAndItsReplicas) {
-    Part part(kObjectLength, std::vector<Replica>{});
+TEST(ObjectPartTest, HoldsItsLengthAndChecksum) {
+    ObjectPart part(kObjectLength, std::vector<Replica>{});
 
     EXPECT_EQ(part.length(), kObjectLength);
     EXPECT_FALSE(part.checksum().has_value());
-    EXPECT_EQ(part.CountReplicas(), 0u);
+    EXPECT_TRUE(part.replicas().empty());
 
     part.SetChecksum(kChecksum);
     ASSERT_TRUE(part.checksum().has_value());
     EXPECT_EQ(*part.checksum(), kChecksum);
 }
 
-TEST(PartTest, AppendsAndFindsReplicas) {
-    Part part(kObjectLength, std::vector<Replica>{});
+TEST(ObjectPartTest, AppendsReplicasAndReadsThemThroughTheSpan) {
+    ObjectPart part(kObjectLength, std::vector<Replica>{});
     auto replicas =
         MakeDiskReplicas({ReplicaStatus::COMPLETE, ReplicaStatus::PROCESSING});
     const ReplicaID processing_id = replicas.back().id();
     part.AddReplicas(std::move(replicas));
 
-    EXPECT_EQ(part.CountReplicas(), 2u);
-    EXPECT_EQ(part.CountReplicas(&Replica::fn_is_completed), 1u);
-    EXPECT_EQ(part.GetAllReplicas().size(), 2u);
-    EXPECT_TRUE(part.HasReplica(&Replica::fn_is_completed));
-    EXPECT_TRUE(part.HasReplica(&Replica::fn_is_processing));
-    EXPECT_FALSE(part.AllReplicas(&Replica::fn_is_completed));
+    EXPECT_EQ(part.replicas().size(), 2u);
+    EXPECT_TRUE(
+        std::ranges::any_of(part.replicas(), Replica::fn_is_processing));
+    EXPECT_FALSE(
+        std::ranges::all_of(part.replicas(), Replica::fn_is_completed));
+    EXPECT_TRUE(std::ranges::any_of(part.replicas(), [&](const Replica& r) {
+        return r.id() == processing_id;
+    }));
 
-    ASSERT_NE(part.GetReplicaByID(processing_id), nullptr);
-    EXPECT_EQ(part.GetReplicaByID(processing_id)->status(),
-              ReplicaStatus::PROCESSING);
-    EXPECT_EQ(part.GetReplicaByID(0), nullptr);
-
-    // Nothing here is a memory or NoF replica, which the medium predicate the
-    // store reaches for through the part reports from the replica itself.
-    EXPECT_FALSE(part.HasReplica(&Replica::fn_is_memory_replica));
-    EXPECT_FALSE(part.HasReplica(&Replica::fn_is_nof_replica));
+    // These are disk replicas, so the medium predicates answer false for them.
+    EXPECT_FALSE(
+        std::ranges::any_of(part.replicas(), Replica::fn_is_memory_replica));
+    EXPECT_FALSE(
+        std::ranges::any_of(part.replicas(), Replica::fn_is_nof_replica));
 }
 
-TEST(PartTest, VisitsOnlyTheMatchingReplicas) {
-    Part part(kObjectLength, std::vector<Replica>{});
-    part.AddReplicas(
-        MakeDiskReplicas({ReplicaStatus::COMPLETE, ReplicaStatus::PROCESSING,
-                          ReplicaStatus::COMPLETE}));
+TEST(ObjectPartTest, TheSpanReachesTheStoredReplicas) {
+    ObjectPart part(kObjectLength, std::vector<Replica>{});
+    part.AddReplicas(MakeDiskReplicas({ReplicaStatus::PROCESSING}));
 
-    size_t visited = 0;
-    const size_t matched =
-        part.VisitReplicas(&Replica::fn_is_completed, [&](Replica& replica) {
-            ++visited;
-            EXPECT_EQ(replica.status(), ReplicaStatus::COMPLETE);
-        });
+    const auto processing =
+        std::ranges::find_if(part.replicas(), Replica::fn_is_processing);
+    ASSERT_NE(processing, part.replicas().end());
+    processing->mark_complete();
 
-    EXPECT_EQ(matched, 2u);
-    EXPECT_EQ(visited, 2u);
+    EXPECT_TRUE(std::ranges::all_of(part.replicas(), Replica::fn_is_completed));
 }
 
-TEST(PartTest, PopsAndErasesOnlyTheMatchingReplicas) {
-    Part part(kObjectLength, std::vector<Replica>{});
+TEST(ObjectPartTest, PopsOnlyTheMatchingReplicas) {
+    ObjectPart part(kObjectLength, std::vector<Replica>{});
     part.AddReplicas(
         MakeDiskReplicas({ReplicaStatus::COMPLETE, ReplicaStatus::PROCESSING,
                           ReplicaStatus::COMPLETE}));
@@ -136,46 +131,63 @@ TEST(PartTest, PopsAndErasesOnlyTheMatchingReplicas) {
     auto popped = part.PopReplicas(&Replica::fn_is_processing);
     ASSERT_EQ(popped.size(), 1u);
     EXPECT_EQ(popped.front().status(), ReplicaStatus::PROCESSING);
-    EXPECT_EQ(part.CountReplicas(), 2u);
-    EXPECT_TRUE(part.AllReplicas(&Replica::fn_is_completed));
+    EXPECT_EQ(part.replicas().size(), 2u);
+    EXPECT_TRUE(std::ranges::all_of(part.replicas(), Replica::fn_is_completed));
 
-    const ReplicaID kept_id = part.GetAllReplicas().front().id();
-    EXPECT_EQ(part.EraseReplicas([&](const Replica& replica) {
-        return replica.id() == kept_id;
-    }),
-              1u);
-    EXPECT_EQ(part.CountReplicas(), 1u);
+    const ReplicaID kept_id = part.replicas().front().id();
+    auto erased = part.PopReplicas(
+        [&](const Replica& replica) { return replica.id() == kept_id; });
+    EXPECT_EQ(erased.size(), 1u);
+    EXPECT_EQ(part.replicas().size(), 1u);
 
     auto remaining = part.PopReplicas();
     EXPECT_EQ(remaining.size(), 1u);
-    EXPECT_EQ(part.CountReplicas(), 0u);
-    EXPECT_TRUE(part.GetAllReplicas().empty());
+    EXPECT_TRUE(part.replicas().empty());
 }
 
-TEST(PartTest, EraseReplicasReportsTheNumberOfMatches) {
-    Part part(kObjectLength, std::vector<Replica>{});
-    part.AddReplicas(
-        MakeDiskReplicas({ReplicaStatus::COMPLETE, ReplicaStatus::COMPLETE}));
-
-    EXPECT_EQ(part.EraseReplicas(&Replica::fn_is_completed), 2u);
-    EXPECT_EQ(part.CountReplicas(), 0u);
-}
-
-TEST(EnvelopePartTest, TheEnvelopeForwardsToItsSinglePart) {
+TEST(EnvelopePartTest, TheEnvelopeReadsAndWritesItsSinglePart) {
     auto metadata = MakeEnvelope(kObjectLength,
                                  MakeDiskReplicas({ReplicaStatus::COMPLETE}));
     metadata->MutablePart(0).SetChecksum(kChecksum);
 
     // The read accessor and the write accessor name the same part, and the
     // envelope's own operations answer with what that part holds.
-    const Part& part = metadata->GetPart(0);
+    const ObjectPart& part = metadata->GetPart(0);
     EXPECT_EQ(&metadata->MutablePart(0), &part);
     EXPECT_EQ(part.length(), kObjectLength);
     EXPECT_EQ(*part.checksum(), kChecksum);
     EXPECT_EQ(metadata->TotalLength(), part.length());
-    EXPECT_EQ(metadata->CountReplicas(), part.CountReplicas());
-    EXPECT_EQ(&metadata->GetAllReplicas(), &part.GetAllReplicas());
+    EXPECT_EQ(metadata->CountReplicas(), part.replicas().size());
+    EXPECT_EQ(metadata->GetAllReplicas().data(), part.replicas().data());
+    EXPECT_EQ(metadata->GetAllReplicas().size(), part.replicas().size());
     EXPECT_TRUE(metadata->HasReplica(&Replica::fn_is_completed));
+}
+
+TEST(EnvelopePartTest, VisitsAndErasesThroughTheEnvelope) {
+    auto metadata = MakeEnvelope(
+        kObjectLength,
+        MakeDiskReplicas({ReplicaStatus::COMPLETE, ReplicaStatus::PROCESSING,
+                          ReplicaStatus::COMPLETE}));
+
+    size_t visited = 0;
+    const size_t matched = metadata->VisitReplicas(
+        &Replica::fn_is_completed, [&](Replica& replica) {
+            ++visited;
+            EXPECT_EQ(replica.status(), ReplicaStatus::COMPLETE);
+        });
+    EXPECT_EQ(matched, 2u);
+    EXPECT_EQ(visited, 2u);
+
+    // Only the ones the predicate matches leave the part, and what comes out
+    // is dropped because the caller here only wants them gone.
+    EXPECT_EQ(metadata->EraseReplicas(&Replica::fn_is_processing), 1u);
+    EXPECT_EQ(metadata->CountReplicas(), 2u);
+    EXPECT_TRUE(metadata->AllReplicas(&Replica::fn_is_completed));
+
+    const ObjectMetadata& read_only = *metadata;
+    const size_t counted = read_only.VisitReplicas(&Replica::fn_is_completed,
+                                                   [](const Replica&) {});
+    EXPECT_EQ(counted, 2u);
 }
 
 TEST(EnvelopePartTest, ValidityFollowsThePartsLengthAndReplicas) {
@@ -193,7 +205,7 @@ TEST(EnvelopePartTest, ValidityFollowsThePartsLengthAndReplicas) {
 
 // The OpLog payload carries the envelope's own fields and no checksum, so this
 // case pins the length the part holds and the fields beside it.
-TEST_F(PartPayloadTest, TheOplogPayloadCarriesTheEnvelopeFields) {
+TEST_F(OplogPayloadTest, TheOplogPayloadCarriesTheEnvelopeFields) {
     MasterService service{MasterServiceConfig{}};
     auto metadata = MakeEnvelope(kObjectLength, {});
 

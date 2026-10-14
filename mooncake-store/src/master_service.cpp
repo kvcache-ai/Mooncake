@@ -2121,8 +2121,7 @@ MasterService::ObjectMap::iterator MasterService::EraseMetadata(
     return next;
 }
 
-void MasterService::ReleaseLocalDiskUsage(
-    const std::vector<Replica>& replicas) {
+void MasterService::ReleaseLocalDiskUsage(std::span<const Replica> replicas) {
     std::unordered_map<UUID, int64_t, boost::hash<UUID>> bytes_by_client;
     for (const auto& replica : replicas) {
         if (!replica.is_local_disk_replica()) {
@@ -8425,7 +8424,7 @@ bool MasterService::CleanupStaleHandles(
 }
 
 void MasterService::FreeDfsReplicas(const std::string& key,
-                                    const std::vector<Replica>& replicas) {
+                                    std::span<const Replica> replicas) {
     if (!dfs_allocator_) return;
     for (const auto& replica : replicas) {
         if (!replica.is_dfs_replica()) continue;

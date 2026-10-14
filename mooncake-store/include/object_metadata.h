@@ -6,8 +6,9 @@
 // module share one definition. The envelope owns the object identity, the
 // authoritative read lease, the soft-pin state and the tenant quota ledger.
 // The object's content and the replicas holding it live in the envelope's
-// single Part; the envelope keeps the operations over them as forwards, so the
-// call sites that used the envelope's own replica list still read the same.
+// single ObjectPart; the envelope keeps the operations over them as forwards,
+// so the call sites that used the envelope's own replica list still read the
+// same.
 //
 // It has no ownership lock: whoever owns the envelope decides how the
 // envelope as a whole is guarded. The `lock` member below is internal and
@@ -20,6 +21,8 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <ranges>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -29,7 +32,7 @@
 #include "lease.h"
 #include "master_metric_manager.h"
 #include "mutex.h"
-#include "part.h"
+#include "object_part.h"
 #include "replica.h"
 #include "tenant_id.h"
 #include "tenant_quota_ledger.h"
@@ -179,11 +182,11 @@ struct ObjectMetadata {
     // caller holds the owner's shared lock to read it and the owner's exclusive
     // lock to change anything through it: the envelope's own SpinLock covers
     // the lease and the soft-pin deadline, not the parts. A replica pointer or
-    // reference taken from a part is invalidated by any Add, Pop or Erase on
-    // that part.
-    const Part& GetPart(size_t index) const { return parts_.at(index); }
+    // reference taken from a part is invalidated by any add or pop on that
+    // part.
+    const ObjectPart& GetPart(size_t index) const { return parts_.at(index); }
 
-    Part& MutablePart(size_t index) { return parts_.at(index); }
+    ObjectPart& MutablePart(size_t index) { return parts_.at(index); }
 
     // The content length of the whole object, formerly the `size` field: the
     // sum over the parts, which is the one part's length today.
@@ -195,6 +198,10 @@ struct ObjectMetadata {
         return total;
     }
 
+    // The replica operations below read and change part 0. They are temporary:
+    // the multi-part work replaces them with `parts()` and a flattened
+    // `replicas()` view over them, so that each call site says whether it means
+    // one part or the whole object.
     void AddReplicas(std::vector<Replica>&& replicas) {
         MutablePart(0).AddReplicas(std::move(replicas));
     }
@@ -206,51 +213,85 @@ struct ObjectMetadata {
 
     std::vector<Replica> PopReplicas() { return MutablePart(0).PopReplicas(); }
 
+    // The popped replicas are dropped: the caller only wants them gone.
     size_t EraseReplicas(const std::function<bool(const Replica&)>& pred_fn) {
-        return MutablePart(0).EraseReplicas(pred_fn);
+        return MutablePart(0).PopReplicas(pred_fn).size();
     }
 
+    // The callback may change the replica it is handed, and it must not add or
+    // pop replicas: the iteration it runs inside would then walk a container
+    // that moved under it.
     size_t VisitReplicas(const std::function<bool(const Replica&)>& pred_fn,
                          const std::function<void(Replica&)>& visit_fn) {
-        return MutablePart(0).VisitReplicas(pred_fn, visit_fn);
+        size_t num_visited = 0;
+
+        for (auto& replica : MutablePart(0).replicas()) {
+            if (pred_fn(replica)) {
+                visit_fn(replica);
+                num_visited++;
+            }
+        }
+
+        return num_visited;
     }
 
     size_t VisitReplicas(
         const std::function<bool(const Replica&)>& pred_fn,
         const std::function<void(const Replica&)>& visit_fn) const {
-        return GetPart(0).VisitReplicas(pred_fn, visit_fn);
+        size_t num_visited = 0;
+
+        for (const auto& replica : GetPart(0).replicas()) {
+            if (pred_fn(replica)) {
+                visit_fn(replica);
+                num_visited++;
+            }
+        }
+
+        return num_visited;
     }
 
     bool HasReplica(const std::function<bool(const Replica&)>& pred_fn) const {
-        return GetPart(0).HasReplica(pred_fn);
+        return std::ranges::any_of(GetPart(0).replicas(), pred_fn);
     }
 
     bool AllReplicas(const std::function<bool(const Replica&)>& pred_fn) const {
-        return GetPart(0).AllReplicas(pred_fn);
+        return std::ranges::all_of(GetPart(0).replicas(), pred_fn);
     }
 
     size_t CountReplicas(
         const std::function<bool(const Replica&)>& pred_fn) const {
-        return GetPart(0).CountReplicas(pred_fn);
+        return static_cast<size_t>(
+            std::ranges::count_if(GetPart(0).replicas(), pred_fn));
     }
 
-    size_t CountReplicas() const { return GetPart(0).CountReplicas(); }
+    size_t CountReplicas() const { return GetPart(0).replicas().size(); }
 
-    const std::vector<Replica>& GetAllReplicas() const {
-        return GetPart(0).GetAllReplicas();
+    // The object's replicas as a view of the part's own storage. Read-only: a
+    // caller that changes the set goes through the calls above.
+    std::span<const Replica> GetAllReplicas() const {
+        return GetPart(0).replicas();
     }
 
     Replica* GetFirstReplica(
         const std::function<bool(const Replica&)>& pred_fn) {
-        return MutablePart(0).GetFirstReplica(pred_fn);
+        auto replicas = MutablePart(0).replicas();
+        const auto it = std::ranges::find_if(replicas, pred_fn);
+        return it != replicas.end() ? &(*it) : nullptr;
     }
 
     Replica* GetReplicaByID(const ReplicaID& id) {
-        return MutablePart(0).GetReplicaByID(id);
+        return GetFirstReplica(
+            [&id](const Replica& replica) { return replica.id() == id; });
     }
 
     Replica* GetReplicaBySegmentName(const std::string& segment_name) {
-        return MutablePart(0).GetReplicaBySegmentName(segment_name);
+        return GetFirstReplica([&segment_name](const Replica& replica) {
+            const auto names = replica.get_segment_names();
+            return std::ranges::any_of(names,
+                                       [&segment_name](const auto& name_opt) {
+                                           return name_opt == segment_name;
+                                       });
+        });
     }
 
     // Grant a read lease at now() + ttl. Grouped objects extend the shared
@@ -431,14 +472,23 @@ struct ObjectMetadata {
     }
 
     std::vector<std::string> GetReplicaSegmentNames() const {
-        return GetPart(0).GetReplicaSegmentNames();
+        std::vector<std::string> segment_names;
+        for (const auto& replica : GetPart(0).replicas()) {
+            const auto& segment_name_options = replica.get_segment_names();
+            for (const auto& segment_name_opt : segment_name_options) {
+                if (segment_name_opt.has_value()) {
+                    segment_names.push_back(segment_name_opt.value());
+                }
+            }
+        }
+        return segment_names;
     }
 
    private:
     // The object's content and the replicas holding it. One part today, and
     // the length is fixed at construction: nothing adds or removes a part after
     // this, which is what lets the accessors above stand for the whole state.
-    std::vector<Part> parts_;
+    std::vector<ObjectPart> parts_;
 };
 
 }  // namespace mooncake
