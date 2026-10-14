@@ -37,7 +37,11 @@ ErrorCode NofPageRegistry::Register(void* owner, void* ptr, size_t size) {
             AlignUpToPage(begin + existing->second.size);
         if (existing->second.charged_from == 0) {
             if (end_page <= covered_end) {
-                return ErrorCode::OK;
+                // Quarantine means unknown translation state, not usable DMA
+                // coverage.
+                return existing->second.has_quarantined
+                           ? ErrorCode::NOF_REGISTRATION_STUCK
+                           : ErrorCode::OK;
             }
             bump_from = covered_end;
         } else {
@@ -50,6 +54,7 @@ ErrorCode NofPageRegistry::Register(void* owner, void* ptr, size_t size) {
         skip_end != 0 ? std::max(end_page, skip_end) : end_page;
 
     std::vector<uintptr_t> touched;  // pages whose count this call bumped
+    bool saw_quarantined = false;
     for (uintptr_t page = bump_from; page < walk_end; page += kPageSize) {
         if (page >= skip_from && page < skip_end) {
             continue;  // still charged by this record
@@ -61,8 +66,11 @@ ErrorCode NofPageRegistry::Register(void* owner, void* ptr, size_t size) {
             continue;
         }
         if (reg.quarantined) {
+            // Unknown translation state: the range is not usable DMA
+            // coverage, so this registration reports STUCK, not OK.
             LOG(WARNING) << "Register over a quarantined NoF page " << page
                          << " (translation state unknown; page stays pinned)";
+            saw_quarantined = true;
             continue;
         }
         if (reg.count == 0) {
@@ -87,6 +95,7 @@ ErrorCode NofPageRegistry::Register(void* owner, void* ptr, size_t size) {
                         rec.size,
                         static_cast<size_t>((page + kPageSize) - begin));
                     rec.charged_from = 0;
+                    rec.has_quarantined = true;
                     return ErrorCode::NOF_REGISTRATION_STUCK;
                 }
                 page_regs_.erase(page);
@@ -114,6 +123,7 @@ ErrorCode NofPageRegistry::Register(void* owner, void* ptr, size_t size) {
                         rec.size,
                         static_cast<size_t>((*it + kPageSize) - begin));
                     rec.charged_from = 0;
+                    rec.has_quarantined = true;
                     return ErrorCode::NOF_REGISTRATION_STUCK;
                 }
                 // Everything this call touched is confirmed clean.
@@ -126,7 +136,13 @@ ErrorCode NofPageRegistry::Register(void* owner, void* ptr, size_t size) {
     auto& rec = registrations[ptr];
     rec.size = std::max(rec.size, size);
     rec.charged_from = 0;  // full coverage restored
-    return ErrorCode::OK;
+    if (saw_quarantined) {
+        rec.has_quarantined = true;
+    }
+    // Quarantined pages in coverage mean the range is not usable DMA
+    // coverage; only a range with none may report OK.
+    return rec.has_quarantined ? ErrorCode::NOF_REGISTRATION_STUCK
+                               : ErrorCode::OK;
 }
 
 bool NofPageRegistry::ReleaseRangeLocked(void* ptr, OwnerRange& rec) {
@@ -144,6 +160,7 @@ bool NofPageRegistry::ReleaseRangeLocked(void* ptr, OwnerRange& rec) {
         if (pit->second.quarantined) {
             // Terminal: never unregistered, the mapping must stay pinned.
             rec.charged_from = page;
+            rec.has_quarantined = true;
             return false;
         }
         if (pit->second.count > 1) {
@@ -158,6 +175,7 @@ bool NofPageRegistry::ReleaseRangeLocked(void* ptr, OwnerRange& rec) {
                    << reinterpret_cast<void*>(page) << "; quarantining page";
         pit->second.quarantined = true;  // count stays 1, terminal
         rec.charged_from = page;
+        rec.has_quarantined = true;
         return false;
     }
     return true;

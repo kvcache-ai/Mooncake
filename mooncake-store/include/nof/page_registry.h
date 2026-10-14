@@ -74,6 +74,9 @@ class NofPageRegistry {
         // First page still charged (0 = the whole prefix is charged). Set
         // to the first unreleasable page when an unregister fails.
         uintptr_t charged_from = 0;
+        // The covered range includes a quarantined page: the range is not
+        // usable DMA coverage and Register must report STUCK for it.
+        bool has_quarantined = false;
     };
 
     // Releases this registration's charged pages starting at charged_from,

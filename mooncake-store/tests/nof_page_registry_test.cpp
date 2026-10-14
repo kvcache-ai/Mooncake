@@ -262,10 +262,12 @@ TEST_F(NofPageRegistryTest, StuckRetryExtendsOverUntouchedTail) {
     EXPECT_EQ(fake_.Depth(page2), 0);  // tail never attempted
     EXPECT_EQ(fake_.register_calls, 2);
 
-    // Retry: the covered prefix is skipped; only the tail is registered.
+    // Retry: the tail is registered, but the range still contains the
+    // quarantined page1, so it must report STUCK rather than OK.
     fake_.fail_unregister_pages.erase(page1);
     fake_.mark_fail_pages.erase(page1);
-    ASSERT_EQ(registry_.Register(owner_a_, ptr, 3 * kPage), ErrorCode::OK);
+    ASSERT_EQ(registry_.Register(owner_a_, ptr, 3 * kPage),
+              ErrorCode::NOF_REGISTRATION_STUCK);
     EXPECT_EQ(fake_.Depth(page2), 1);
     EXPECT_EQ(fake_.register_calls, 3);  // exactly one new backend call
 
@@ -287,7 +289,10 @@ TEST_F(NofPageRegistryTest, QuarantinedPageStaysPinnedForAllOwners) {
     ASSERT_EQ(registry_.Register(owner_a_, ptr, 4096),
               ErrorCode::NOF_REGISTRATION_STUCK);
 
-    ASSERT_EQ(registry_.Register(owner_b_, ptr, 4096), ErrorCode::OK);
+    // A second owner registering the quarantined page gets STUCK, not OK:
+    // unknown translation state is not usable DMA coverage.
+    ASSERT_EQ(registry_.Register(owner_b_, ptr, 4096),
+              ErrorCode::NOF_REGISTRATION_STUCK);
     EXPECT_EQ(registry_.Unregister(owner_a_, ptr), ErrorCode::INTERNAL_ERROR);
     EXPECT_EQ(registry_.Unregister(owner_b_, ptr), ErrorCode::INTERNAL_ERROR);
     EXPECT_EQ(fake_.Depth(page0), 1);  // pinned
@@ -347,9 +352,11 @@ TEST_F(NofPageRegistryTest, RollbackFailureQuarantinesAndKeepsPrefix) {
     EXPECT_EQ(fake_.Depth(page0), 1);
 
     // The record covers only up to the quarantined page: a retry registers
-    // the untouched tail.
+    // the untouched tail, but the range still reports STUCK (page1 stays
+    // quarantined).
     fake_.mark_fail_pages.erase(page2);
-    ASSERT_EQ(registry_.Register(owner_a_, ptr, 3 * kPage), ErrorCode::OK);
+    ASSERT_EQ(registry_.Register(owner_a_, ptr, 3 * kPage),
+              ErrorCode::NOF_REGISTRATION_STUCK);
     EXPECT_EQ(fake_.Depth(page2), 1);
 
     // Teardown releases the healthy prefix and fails on the quarantine.
@@ -399,8 +406,10 @@ TEST_F(NofPageRegistryTest, ReregisterShrunkRecordRestoresPrefix) {
     fake_.fail_unregister_pages.insert(page1);
     EXPECT_EQ(registry_.Unregister(owner_a_, ptr), ErrorCode::INTERNAL_ERROR);
 
-    // Re-register: page0 is re-charged for A (1 -> 2), page1 stays pinned.
-    ASSERT_EQ(registry_.Register(owner_a_, ptr, 3 * kPage / 2), ErrorCode::OK);
+    // Re-register: page0 is re-charged for A (1 -> 2), page1 stays pinned,
+    // and the range reports STUCK while it contains a quarantined page.
+    ASSERT_EQ(registry_.Register(owner_a_, ptr, 3 * kPage / 2),
+              ErrorCode::NOF_REGISTRATION_STUCK);
 
     // Teardown drops exactly A's page0 reference and fails on page1.
     EXPECT_EQ(registry_.Unregister(owner_a_, ptr), ErrorCode::INTERNAL_ERROR);
@@ -426,9 +435,11 @@ TEST_F(NofPageRegistryTest, SmallerReregisterOfShrunkRecordLeavesNoHole) {
     EXPECT_EQ(registry_.Unregister(owner_a_, ptr), ErrorCode::INTERNAL_ERROR);
 
     // Re-register the same ptr with a smaller size: the redo must cover the
-    // whole dropped prefix [page0, page3), not just page0.
+    // whole dropped prefix [page0, page3), not just page0. The range reports
+    // STUCK while page3 stays quarantined.
     fake_.fail_unregister_pages.clear();
-    ASSERT_EQ(registry_.Register(owner_a_, ptr, kPage), ErrorCode::OK);
+    ASSERT_EQ(registry_.Register(owner_a_, ptr, kPage),
+              ErrorCode::NOF_REGISTRATION_STUCK);
 
     // B registers the previously dropped pages page1 and page2.
     ASSERT_EQ(registry_.Register(owner_b_, PageAddr(1), kPage), ErrorCode::OK);

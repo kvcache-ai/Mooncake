@@ -1631,18 +1631,30 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
 
     // NoF I/O is drained by now (client_.reset() joined the worker pool).
     // Release this client's NoF registrations so a closed client never
-    // leaves orphan entries in the process-global page registry.
+    // leaves orphan entries in the process-global page registry. Failures
+    // are collected and reported: these buffers are caller-owned, so the
+    // caller must be told which of them may still be DMA-translated and
+    // must not be freed or remapped until process exit.
+    std::vector<void *> nof_cleanup_failed;
     if (nof_runtime_.initiator) {
         std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
-        for (const auto &[buffer, size] : registered_buffer_sizes_) {
-            auto rc = nof_runtime_.initiator->UnregisterMemory(buffer);
+        for (auto it = registered_buffer_sizes_.begin();
+             it != registered_buffer_sizes_.end();) {
+            auto rc = nof_runtime_.initiator->UnregisterMemory(it->first);
             if (rc != ErrorCode::OK) {
-                LOG(WARNING) << "Failed to release NoF registration for "
-                                "buffer "
-                             << buffer << " on teardown: " << toString(rc);
+                // Keep the record: this buffer must stay mapped.
+                nof_cleanup_failed.push_back(it->first);
+                ++it;
+            } else {
+                it = registered_buffer_sizes_.erase(it);
             }
         }
-        registered_buffer_sizes_.clear();
+        for (void *buffer : nof_cleanup_failed) {
+            LOG(ERROR) << "NoF registration for buffer " << buffer
+                       << " could not be released on teardown; its NoF pages "
+                          "stay quarantined — do NOT free or remap this "
+                          "buffer before process exit";
+        }
     }
     ReleaseAllMountedSegmentRecords();
     ReleaseAllAllocatedSegmentRecords();
@@ -1715,6 +1727,11 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     // which is safe: they are never munmapped, so SPDK's translations never
     // point at freed/reused virtual addresses.
     RetryQuarantinedShmsLocked();
+    if (!nof_cleanup_failed.empty()) {
+        // Some caller-owned buffers still have live DMA translation state.
+        // The caller must keep them mapped until process exit.
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
     return {};
 }
 
