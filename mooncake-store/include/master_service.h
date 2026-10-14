@@ -919,8 +919,16 @@ class MasterService {
         uint64_t initial_oplog_sequence_id,
         const std::vector<StandbySegmentInfo>& segments,
         const WeightMetadataSnapshot& weight_metadata = {});
+    // Copies objects out of the handoff. The caller keeps ownership so a
+    // failed restore or a later lease loss can still PreservePromotionBaseline.
     tl::expected<void, ErrorCode> RestoreFromBatchOpLogPromotion(
-        BatchOpLogPromotionHandoff handoff,
+        const BatchOpLogPromotionHandoff& handoff,
+        size_t chunk_object_count = kDefaultBatchOpLogPromotionChunkObjects);
+    tl::expected<void, ErrorCode> RestoreFromBatchOpLogPromotion(
+        const StandbyMetadataStore& metadata_store,
+        DurablePrefix applied_cursor,
+        const std::vector<StandbySegmentInfo>& segments,
+        ReplicaID max_replica_id,
         size_t chunk_object_count = kDefaultBatchOpLogPromotionChunkObjects);
 
     /**
@@ -966,7 +974,7 @@ class MasterService {
    private:
     tl::expected<void, ErrorCode> RestoreFromStandbyState(
         const std::vector<StandbyObjectEntry>* legacy_objects,
-        std::unique_ptr<StandbyMetadataStore> metadata_store,
+        const StandbyMetadataStore* metadata_store,
         uint64_t initial_oplog_sequence_id,
         const std::vector<StandbySegmentInfo>& segments,
         size_t chunk_object_count,
@@ -2145,6 +2153,7 @@ class MasterService {
     const bool enable_oplog_;
     const bool weight_management_mutations_enabled_;
     const uint32_t oplog_batch_max_entries_;
+    const uint64_t restore_repair_durable_timeout_ms_;
 
     // cluster id for persistent sub directory
     const std::string cluster_id_;

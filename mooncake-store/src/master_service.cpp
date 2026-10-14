@@ -193,6 +193,8 @@ MasterService::MasterService(const MasterServiceConfig& config)
           !enable_oplog_ ||
           config.weight_management_oplog_capability_confirmed),
       oplog_batch_max_entries_(config.oplog_batch_max_entries),
+      restore_repair_durable_timeout_ms_(
+          config.restore_repair_durable_timeout_ms),
       cluster_id_(config.cluster_id),
       root_fs_dir_(config.root_fs_dir),
       enable_disk_eviction_(config.enable_disk_eviction),
@@ -3708,21 +3710,31 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbySnapshot(
 }
 
 tl::expected<void, ErrorCode> MasterService::RestoreFromBatchOpLogPromotion(
-    BatchOpLogPromotionHandoff handoff, size_t chunk_object_count) {
-    if (!handoff.metadata_store || chunk_object_count == 0 ||
-        ((handoff.applied_cursor.batch_id == 0) !=
-         (handoff.applied_cursor.last_seq == 0))) {
+    const BatchOpLogPromotionHandoff& handoff, size_t chunk_object_count) {
+    if (!handoff.metadata_store) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    return RestoreFromStandbyState(nullptr, std::move(handoff.metadata_store),
-                                   handoff.applied_cursor.last_seq,
-                                   handoff.segments, chunk_object_count,
-                                   handoff.max_replica_id, nullptr);
+    return RestoreFromBatchOpLogPromotion(
+        *handoff.metadata_store, handoff.applied_cursor, handoff.segments,
+        handoff.max_replica_id, chunk_object_count);
+}
+
+tl::expected<void, ErrorCode> MasterService::RestoreFromBatchOpLogPromotion(
+    const StandbyMetadataStore& metadata_store, DurablePrefix applied_cursor,
+    const std::vector<StandbySegmentInfo>& segments, ReplicaID max_replica_id,
+    size_t chunk_object_count) {
+    if (chunk_object_count == 0 ||
+        ((applied_cursor.batch_id == 0) != (applied_cursor.last_seq == 0))) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return RestoreFromStandbyState(nullptr, &metadata_store,
+                                   applied_cursor.last_seq, segments,
+                                   chunk_object_count, max_replica_id, nullptr);
 }
 
 tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
     const std::vector<StandbyObjectEntry>* legacy_objects,
-    std::unique_ptr<StandbyMetadataStore> metadata_store,
+    const StandbyMetadataStore* metadata_store,
     uint64_t initial_oplog_sequence_id,
     const std::vector<StandbySegmentInfo>& segments, size_t chunk_object_count,
     std::optional<ReplicaID> expected_max_replica_id,
@@ -4140,9 +4152,14 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
         }
         restored_object_count += *installed;
     } else {
+        // Copy, do not drain. The supervisor keeps the promotion handoff
+        // until serving is established so a failed restore or a lost lease
+        // can still PreservePromotionBaseline from the applied cursor.
         std::vector<StandbyObjectEntry> objects;
+        auto cursor = metadata_store->BeginSnapshotTraversal();
         for (;;) {
-            if (!metadata_store->DrainChunk(chunk_object_count, objects)) {
+            if (!metadata_store->CopyNextSnapshotChunk(chunk_object_count,
+                                                       cursor, objects)) {
                 return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
             }
             if (objects.empty()) {
@@ -4298,12 +4315,27 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
         if (!appended) {
             repair_err = appended.error();
         }
-        if (repair_err == ErrorCode::OK &&
-            durable_future.wait_for(std::chrono::seconds(10)) !=
-                std::future_status::ready) {
-            LOG(ERROR) << "RestoreFromStandbySnapshot: repair batch not "
-                          "durable within 10s, failing the restore";
-            repair_err = ErrorCode::INTERNAL_ERROR;
+        if (repair_err == ErrorCode::OK) {
+            // Wait on the writer's durability callback. 0 means no cap: a
+            // slow backend should not turn a recoverable delay into a
+            // promotion failure. A positive timeout still fail-closes, and
+            // a later durable completion is left in the log for the retry
+            // to observe rather than rolling it back locally.
+            std::future_status durable_status = std::future_status::ready;
+            if (restore_repair_durable_timeout_ms_ == 0) {
+                durable_future.wait();
+            } else {
+                durable_status =
+                    durable_future.wait_for(std::chrono::milliseconds(
+                        restore_repair_durable_timeout_ms_));
+            }
+            if (durable_status != std::future_status::ready) {
+                LOG(ERROR) << "RestoreFromStandbySnapshot: repair batch not "
+                              "durable within "
+                           << restore_repair_durable_timeout_ms_
+                           << "ms, failing the restore";
+                repair_err = ErrorCode::INTERNAL_ERROR;
+            }
         }
         if (repair_err != ErrorCode::OK) {
             LOG(ERROR) << "RestoreFromStandbySnapshot: durable repair failed, "

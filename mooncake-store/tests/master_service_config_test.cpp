@@ -246,6 +246,18 @@ TEST(MasterServiceConfigTest, OplogBatchMaxEntriesBuilderOverrideRespected) {
     EXPECT_EQ(17u, config.oplog_batch_max_entries);
 }
 
+TEST(MasterServiceConfigTest,
+     RestoreRepairDurableTimeoutBuilderOverrideRespected) {
+    MasterServiceConfig defaults;
+    EXPECT_EQ(DEFAULT_RESTORE_REPAIR_DURABLE_TIMEOUT_MS,
+              defaults.restore_repair_durable_timeout_ms);
+
+    auto config = MasterServiceConfig::builder()
+                      .set_restore_repair_durable_timeout_ms(50)
+                      .build();
+    EXPECT_EQ(50u, config.restore_repair_durable_timeout_ms);
+}
+
 TEST(MasterServiceConfigTest, MetricsBootstrapConfigPropagatesToSupervisor) {
     MasterConfig master_config{};
     master_config.metrics = {
