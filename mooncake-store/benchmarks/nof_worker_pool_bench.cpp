@@ -731,12 +731,13 @@ int main(int argc, char **argv) {
             return 1;
         }
 
+        mooncake::SpdkNofWorkerPool pool;
         std::vector<EndpointContext> endpoints;
         endpoints.reserve(endpoint_strings.size());
         std::unordered_set<mooncake::nof_seg_handle *> unique_handles;
         for (size_t i = 0; i < endpoint_strings.size(); ++i) {
             EndpointContext endpoint(endpoint_strings[i], FLAGS_seed + i);
-            endpoint.seg_handle = wrapper.OpenNofSegment(endpoint.endpoint);
+            endpoint.seg_handle = pool.OpenNofSegment(endpoint.endpoint);
             if (!endpoint.seg_handle) {
                 LOG(ERROR) << "Failed to open NoF endpoint: "
                            << endpoint.endpoint;
@@ -837,7 +838,6 @@ int main(int argc, char **argv) {
         }
 
         std::vector<EndpointStats> endpoint_stats(endpoints.size());
-        mooncake::SpdkNofWorkerPool pool;
 
         TimePoint start = Clock::now();
         TimePoint warmup_end = start + std::chrono::seconds(FLAGS_warmup_sec);

@@ -97,12 +97,12 @@ TEST_F(NoFWorkerPoolConfigTest, PoolConstructionUsesCachedWorkerCount) {
             std::filesystem::directory_iterator("/proc/self/task"),
             std::filesystem::directory_iterator());
     };
-    const auto before = count_threads();
     SpdkNofWorkerPool first;
-    EXPECT_EQ(count_threads() - before, 2);
+    // Include the shared controller thread in the baseline.
+    const auto before = count_threads();
     ASSERT_EQ(setenv("MC_NOF_WORKERS", "3", 1), 0);
     SpdkNofWorkerPool second;
-    EXPECT_EQ(count_threads() - before, 4);
+    EXPECT_EQ(count_threads() - before, 2);
     EXPECT_EQ(NoFWorkerPoolConfig::AtFirstUse().worker_count, 2);
 }
 #endif

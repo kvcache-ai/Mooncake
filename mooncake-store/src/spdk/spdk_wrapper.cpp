@@ -6,6 +6,9 @@
 #include <chrono>
 #include <cstring>
 #include <cstdlib>
+#include <cerrno>
+#include <cassert>
+#include <set>
 #if defined(__linux__)
 #include <pthread.h>
 #include <sched.h>
@@ -60,8 +63,14 @@ void ApplyCtrlrOptsFromEnv(struct spdk_nvme_ctrlr_opts *opts) {
 }  // namespace
 
 struct nof_seg_handle {
-    struct spdk_nvme_qpair *qpair;
-    struct spdk_nvme_ns *ns;
+    struct spdk_nvme_qpair *qpair{nullptr};
+    struct spdk_nvme_ns *ns{nullptr};
+
+    ctrlr_info *controller{nullptr};
+    SpdkWrapper::WorkerId owner{nullptr, -1};
+
+    uint32_t block_size{0};
+    bool disconnecting{false};
 };
 
 struct tr_info {
@@ -71,7 +80,19 @@ struct tr_info {
 };
 
 struct ctrlr_info {
-    struct spdk_nvme_ctrlr *ctrlr;
+    enum class State { Ready, Draining, Disconnecting, Reconnecting, Backoff };
+
+    struct spdk_nvme_ctrlr *ctrlr{nullptr};
+
+    // Fixed at creation, probe-only controllers leave recovery disabled.
+    bool recovery_enabled{false};
+    State state{State::Ready};
+    // One entry per owner worker, shared by its namespaces on this controller.
+    std::set<SpdkWrapper::WorkerId> owners;
+    // Owners still awaiting cleanup acknowledgement in the current recovery.
+    std::set<SpdkWrapper::WorkerId> pending_owners;
+    std::chrono::steady_clock::time_point retry_at{};
+
     std::map<uint32_t, std::unique_ptr<nof_seg_handle>> ns_seg;
     std::mutex ns_mutex;
 };
@@ -141,6 +162,13 @@ bool SpdkWrapper::InitializeEnv() {
 }
 
 void SpdkWrapper::Cleanup() {
+    {
+        std::lock_guard<std::mutex> lock(controller_mutex_);
+        controller_stop_ = true;
+    }
+    controller_cv_.notify_all();
+    if (controller_thread_.joinable()) controller_thread_.join();
+
     if (initialized.load(std::memory_order_acquire)) {
         {
             std::lock_guard<std::mutex> lock(ctrlrs_mutex);
@@ -298,7 +326,9 @@ void SpdkWrapper::RecycleProbeRequestContext(ProbeRequestContext *ctx) {
 
 int64_t SpdkWrapper::NvmePollProcessCompletion(nof_seg_handle *seg,
                                                uint32_t complete_per_seg) {
-    return spdk_nvme_qpair_process_completions(seg->qpair, complete_per_seg);
+    return seg->qpair ? spdk_nvme_qpair_process_completions(seg->qpair,
+                                                            complete_per_seg)
+                      : 0;
 }
 
 int SpdkWrapper::ParseTransPortStr(const std::string &tr_str, tr_info *info) {
@@ -367,7 +397,8 @@ int SpdkWrapper::ConnectController(const struct spdk_nvme_transport_id *trid,
     return spdk_nvme_probe(trid, (void *)info, probe_cb, attach_cb, NULL);
 }
 
-nof_seg_handle *SpdkWrapper::OpenNofSegment(const std::string &tr_str) {
+nof_seg_handle *SpdkWrapper::OpenNofSegment(const std::string &tr_str,
+                                            bool recovery_enabled) {
     // ConnectController -> spdk_nvme_probe() uses env-provided sockets and
     // memory, so the SPDK env must be up. Do not rely on an earlier
     // RegisterMemory() to have initialized it: callers now skip the
@@ -393,6 +424,7 @@ nof_seg_handle *SpdkWrapper::OpenNofSegment(const std::string &tr_str) {
         if (it == connected_ctrlrs.end()) {
             auto new_info = std::make_unique<ctrlr_info>();
             info = new_info.get();
+            info->recovery_enabled = recovery_enabled;
 
             ret = ConnectController(&tr.trid, info);
             if (ret != 0) {
@@ -405,12 +437,22 @@ nof_seg_handle *SpdkWrapper::OpenNofSegment(const std::string &tr_str) {
         }
     }
 
+    // SPDK may reuse a controller for the same transport ID. Never enable
+    // recovery around a legacy probe connection that has no worker owner.
+    if (info->recovery_enabled != recovery_enabled) {
+        LOG(ERROR) << "Cannot mix probe and recoverable client ownership for "
+                   << tr.ctrlr_key;
+        return nullptr;
+    }
+
     nof_seg_handle *seg_handle = nullptr;
     struct spdk_nvme_qpair *qpair = nullptr;
     struct spdk_nvme_ns *ns = nullptr;
     {
         auto &ns_seg = info->ns_seg;
         std::lock_guard<std::mutex> lock(info->ns_mutex);
+        if (info->state != ctrlr_info::State::Ready) return nullptr;
+
         auto ns_it = ns_seg.find(tr.ns);
         if (ns_it != ns_seg.end()) {
             return ns_it->second.get();
@@ -423,15 +465,18 @@ nof_seg_handle *SpdkWrapper::OpenNofSegment(const std::string &tr_str) {
             return nullptr;
         }
 
-        qpair = spdk_nvme_ctrlr_alloc_io_qpair(info->ctrlr, nullptr, 0);
-        if (!qpair) {
-            LOG(ERROR) << "alloc spdk_nvme_qpair failed";
-            return nullptr;
-        }
-
         auto new_seg = std::make_unique<nof_seg_handle>();
+        if (!recovery_enabled) {
+            qpair = spdk_nvme_ctrlr_alloc_io_qpair(info->ctrlr, nullptr, 0);
+            if (!qpair) {
+                LOG(ERROR) << "alloc spdk_nvme_qpair failed";
+                return nullptr;
+            }
+        }
         new_seg->qpair = qpair;
         new_seg->ns = ns;
+        new_seg->controller = info;
+        new_seg->block_size = spdk_nvme_ns_get_sector_size(ns);
         seg_handle = new_seg.get();
         ns_seg[tr.ns] = std::move(new_seg);
     }
@@ -440,11 +485,12 @@ nof_seg_handle *SpdkWrapper::OpenNofSegment(const std::string &tr_str) {
 }
 
 uint32_t SpdkWrapper::GetBlockSize(const nof_seg_handle *seg_handle) {
-    if (!seg_handle || !seg_handle->ns) {
-        return INVALID_BLOCK_SIZE;
+    if (!seg_handle) return INVALID_BLOCK_SIZE;
+    if (!seg_handle->controller->recovery_enabled) {
+        return seg_handle->ns ? spdk_nvme_ns_get_sector_size(seg_handle->ns)
+                              : INVALID_BLOCK_SIZE;
     }
-
-    return spdk_nvme_ns_get_sector_size(seg_handle->ns);
+    return seg_handle->block_size;
 }
 
 int SpdkWrapper::SubmitRequest(const nof_seg_handle *seg_handle, void *ptr,
@@ -562,6 +608,263 @@ bool SpdkWrapper::ProbeNofSegment(const std::string &tr_str,
     }
 
     return ok;
+}
+
+void SpdkWrapper::RegisterRecoveryTaskPoster(RecoveryTaskPoster poster) {
+    // Serialize registration from concurrently constructed worker pools.
+    std::lock_guard<std::mutex> lock(controller_mutex_);
+    CHECK(poster != nullptr);
+    if (post_recovery_task_) {
+        CHECK(post_recovery_task_ == poster);
+        return;
+    }
+    post_recovery_task_ = poster;
+}
+
+ctrlr_info *SpdkWrapper::GetController(const nof_seg_handle *seg) const {
+    return seg->controller;
+}
+
+bool SpdkWrapper::BindSegmentToWorker(nof_seg_handle *seg, WorkerId owner,
+                                      const std::function<void()> &enqueue) {
+    auto *info = seg->controller;
+
+    std::lock_guard<std::mutex> lock(info->ns_mutex);
+    if (!info->recovery_enabled || info->state != ctrlr_info::State::Ready ||
+        !seg->ns || seg->owner.first)
+        return false;
+
+    bool owner_added = info->owners.insert(owner).second;
+    seg->owner = owner;
+    try {
+        enqueue();
+    } catch (...) {
+        seg->owner = {nullptr, -1};
+        if (owner_added) info->owners.erase(owner);
+        return false;
+    }
+    return true;
+}
+
+void SpdkWrapper::RequestRecovery(ctrlr_info *info) {
+    std::lock_guard<std::mutex> lock(info->ns_mutex);
+    if (!info->recovery_enabled || info->state != ctrlr_info::State::Ready)
+        return;
+
+    info->state = ctrlr_info::State::Draining;
+    const auto *trid = spdk_nvme_ctrlr_get_transport_id(info->ctrlr);
+    LOG(WARNING) << "nof_recovery begin traddr=" << trid->traddr
+                 << " trsvcid=" << trid->trsvcid << " subnqn=" << trid->subnqn
+                 << " owners=" << info->owners.size();
+    for (const auto &owner : info->owners) {
+        info->pending_owners.insert(owner);
+        post_recovery_task_(owner, info, false);
+    }
+    controller_cv_.notify_one();
+}
+
+std::vector<nof_seg_handle *> SpdkWrapper::OwnedSegments(ctrlr_info *info,
+                                                         WorkerId owner) {
+    std::lock_guard<std::mutex> lock(info->ns_mutex);
+    std::vector<nof_seg_handle *> result;
+    for (auto &[_, seg] : info->ns_seg) {
+        if (seg->owner == owner) result.push_back(seg.get());
+    }
+    return result;
+}
+
+void SpdkWrapper::OwnerDrained(ctrlr_info *info, WorkerId owner) {
+    std::lock_guard<std::mutex> lock(info->ns_mutex);
+    info->pending_owners.erase(owner);
+    controller_cv_.notify_one();
+}
+
+void SpdkWrapper::UnregisterOwner(ctrlr_info *info, WorkerId owner) {
+    std::lock_guard<std::mutex> lock(info->ns_mutex);
+    for (auto &[_, seg] : info->ns_seg) {
+        if (seg->owner == owner) {
+            assert(seg->qpair == nullptr);
+            seg->owner = {nullptr, -1};
+        }
+    }
+    info->owners.erase(owner);
+    // Safe even if a new recovery added this owner: its qpairs are already
+    // freed.
+    info->pending_owners.erase(owner);
+    controller_cv_.notify_one();
+}
+
+int SpdkWrapper::SetupClientQpairIfNeeded(nof_seg_handle *seg) {
+    // Called only on its owner. The common case never takes a controller lock.
+    if (seg->qpair) return 0;
+
+    auto *info = seg->controller;
+    {
+        std::lock_guard<std::mutex> lock(info->ns_mutex);
+        if (info->state != ctrlr_info::State::Ready) return -EAGAIN;
+        if (!seg->ns) return -ENODEV;
+    }
+
+    // This registered owner cannot acknowledge Cleanup while creating here.
+    // The cleanup barrier protects the controller without holding admission
+    // locked across a potentially slow transport connect.
+    spdk_nvme_io_qpair_opts opts;
+    spdk_nvme_ctrlr_get_default_io_qpair_opts(info->ctrlr, &opts, sizeof(opts));
+    opts.async_mode = true;
+    opts.create_only = true;
+    seg->qpair =
+        spdk_nvme_ctrlr_alloc_io_qpair(info->ctrlr, &opts, sizeof(opts));
+    if (!seg->qpair) return -ENOMEM;
+
+    LOG(INFO) << "nof_qpair_async_connect_start ctrlr=" << info
+              << " nsid=" << spdk_nvme_ns_get_id(seg->ns)
+              << " qpair=" << seg->qpair << " pool=" << seg->owner.first
+              << " worker_idx=" << seg->owner.second;
+
+    // Distinguish queue allocation pressure from a failed transport connect.
+    int rc = spdk_nvme_ctrlr_connect_io_qpair(info->ctrlr, seg->qpair);
+    return rc == 0 ? 0 : -ENXIO;
+}
+
+bool SpdkWrapper::DrainClientQpair(nof_seg_handle *seg) {
+    if (!seg->qpair) return true;
+
+    if (!seg->disconnecting) {
+        seg->disconnecting = true;
+        spdk_nvme_ctrlr_disconnect_io_qpair(seg->qpair);
+    }
+
+    // In SPDK 23.01, explicit disconnect puts the qpair in DISCONNECTING.
+    // process_completions masks -ENXIO to 0 while still disconnecting, and
+    // returns -ENXIO after transport teardown. This is not a generic "error
+    // means drained" rule: it is used only after our explicit disconnect.
+    if (spdk_nvme_qpair_process_completions(seg->qpair, 0) != -ENXIO)
+        return false;
+
+    spdk_nvme_ctrlr_free_io_qpair(seg->qpair);
+    seg->qpair = nullptr;
+    seg->disconnecting = false;
+    return true;
+}
+
+void SpdkWrapper::StartControllerThread() {
+    std::lock_guard<std::mutex> lock(controller_mutex_);
+    assert(post_recovery_task_ != nullptr);
+    if (!controller_thread_.joinable()) {
+        controller_stop_ = false;
+        controller_thread_ = std::thread(&SpdkWrapper::ControllerLoop, this);
+    }
+}
+
+void SpdkWrapper::ControllerLoop() {
+    using State = ctrlr_info::State;
+
+    while (true) {
+        bool stopping;
+        {
+            std::unique_lock<std::mutex> lock(controller_mutex_);
+            controller_cv_.wait_for(lock, std::chrono::milliseconds(10));
+            stopping = controller_stop_;
+        }
+
+        std::vector<ctrlr_info *> controllers;
+        {
+            std::lock_guard<std::mutex> lock(ctrlrs_mutex);
+            for (auto &[_, info] : connected_ctrlrs) {
+                if (info->recovery_enabled) controllers.push_back(info.get());
+            }
+        }
+
+        bool reconnect_in_progress = false;
+        for (auto *info : controllers) {
+            std::unique_lock<std::mutex> lock(info->ns_mutex);
+            auto state = info->state;
+
+            // SPDK holds its controller lock until reconnect succeeds or fails.
+            // Even during shutdown, keep polling on this thread until SPDK
+            // releases the lock; skip all other controller states.
+            if (stopping && state != State::Reconnecting) continue;
+
+            if (state == State::Draining) {
+                if (!info->pending_owners.empty()) continue;
+            } else if (state == State::Backoff &&
+                       std::chrono::steady_clock::now() < info->retry_at) {
+                continue;
+            }
+
+            lock.unlock();
+            if (state == State::Ready) {
+                // In SPDK 23.01, admin polling fetches RDMA connection events
+                // and dispatches them to the affected qpairs. Keep polling even
+                // with keep-alive disabled so workers can detect remote
+                // disconnects.
+                if (spdk_nvme_ctrlr_process_admin_completions(info->ctrlr) < 0)
+                    RequestRecovery(info);
+                // RequestRecovery() may have changed info->state to Draining,
+                // either here or on a worker. Skip writeback of the stale Ready
+                // snapshot.
+                continue;
+            }
+
+            // Only this thread advances recovery after Ready -> Draining.
+            // Keep admission closed and publish the resulting state once.
+            if (state == State::Draining || state == State::Backoff) {
+                spdk_nvme_ctrlr_disconnect(info->ctrlr);
+                state = State::Disconnecting;
+            }
+
+            if (state == State::Disconnecting &&
+                spdk_nvme_ctrlr_process_admin_completions(info->ctrlr) ==
+                    -ENXIO) {
+                spdk_nvme_ctrlr_reconnect_async(info->ctrlr);
+                state = State::Reconnecting;
+            }
+
+            int rc = 0;
+            if (state == State::Reconnecting)
+                rc = spdk_nvme_ctrlr_reconnect_poll_async(info->ctrlr);
+
+            lock.lock();
+            info->state = state;
+            if (state != State::Reconnecting) continue;
+
+            if (rc == -EAGAIN) {
+                reconnect_in_progress = true;
+                continue;
+            }
+
+            if (rc != 0) {
+                info->state = State::Backoff;
+                info->retry_at =
+                    std::chrono::steady_clock::now() + std::chrono::seconds(1);
+                const auto *trid =
+                    spdk_nvme_ctrlr_get_transport_id(info->ctrlr);
+                LOG(WARNING) << "nof_recovery retry traddr=" << trid->traddr
+                             << " trsvcid=" << trid->trsvcid
+                             << " subnqn=" << trid->subnqn << " rc=" << rc
+                             << " retry_after_ms=1000";
+                continue;
+            }
+
+            for (auto &[nsid, seg] : info->ns_seg) {
+                seg->ns = nullptr;
+                if (!spdk_nvme_ctrlr_is_active_ns(info->ctrlr, nsid)) continue;
+                auto *ns = spdk_nvme_ctrlr_get_ns(info->ctrlr, nsid);
+                if (spdk_nvme_ns_get_sector_size(ns) == seg->block_size)
+                    seg->ns = ns;
+            }
+
+            for (const auto &owner : info->owners)
+                post_recovery_task_(owner, info, true);
+            info->state = State::Ready;
+            const auto *trid = spdk_nvme_ctrlr_get_transport_id(info->ctrlr);
+            LOG(INFO) << "nof_recovery ready traddr=" << trid->traddr
+                      << " trsvcid=" << trid->trsvcid
+                      << " subnqn=" << trid->subnqn;
+        }
+
+        if (stopping && !reconnect_in_progress) return;
+    }
 }
 
 }  // namespace mooncake

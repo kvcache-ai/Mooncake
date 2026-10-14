@@ -2,11 +2,15 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <condition_variable>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <stack>
 #include <string>
+#include <thread>
+#include <utility>
 #include <vector>
 #include <spdk/env.h>
 #include <spdk/nvme.h>
@@ -22,6 +26,7 @@ constexpr int kSpdkNofOpNum = 2;
 struct nof_seg_handle;
 struct tr_info;
 struct ctrlr_info;
+class SpdkNofWorkerPool;
 
 class SpdkWrapper {
    public:
@@ -41,8 +46,10 @@ class SpdkWrapper {
     int64_t NvmePollProcessCompletion(nof_seg_handle *seg,
                                       uint32_t complete_per_seg);
 
-    /** @brief Open a NoF segment. */
-    nof_seg_handle *OpenNofSegment(const std::string &tr_str);
+    // When recovery_enabled is true, only prepare the segment metadata;
+    // the owner worker creates the qpair.
+    nof_seg_handle *OpenNofSegment(const std::string &tr_str,
+                                   bool recovery_enabled = false);
 
     uint32_t GetBlockSize(const nof_seg_handle *seg_handle);
 
@@ -99,6 +106,30 @@ class SpdkWrapper {
      */
     static bool IsRegistrableRange(void *addr, size_t size);
 
+    // Non-owning identity; the pool unregisters its workers before destruction.
+    using WorkerId = std::pair<SpdkNofWorkerPool *, int>;
+    // Dispatch through a registered callback to keep SpdkWrapper usable by
+    // Master without linking the client-side SpdkNofWorkerPool implementation.
+    using RecoveryTaskPoster = void (*)(WorkerId, ctrlr_info *, bool resume);
+
+    // Register the client-side dispatcher before any worker is admitted.
+    // Repeated registrations must use the same function.
+    void RegisterRecoveryTaskPoster(RecoveryTaskPoster poster);
+    void StartControllerThread();
+
+    ctrlr_info *GetController(const nof_seg_handle *seg) const;
+    bool BindSegmentToWorker(nof_seg_handle *seg, WorkerId owner,
+                             const std::function<void()> &enqueue);
+
+    void RequestRecovery(ctrlr_info *ctrlr);
+    std::vector<nof_seg_handle *> OwnedSegments(ctrlr_info *ctrlr,
+                                                WorkerId owner);
+    void OwnerDrained(ctrlr_info *ctrlr, WorkerId owner);
+    void UnregisterOwner(ctrlr_info *ctrlr, WorkerId owner);
+
+    int SetupClientQpairIfNeeded(nof_seg_handle *seg);
+    bool DrainClientQpair(nof_seg_handle *seg);
+
    private:
     struct ProbeBuffer {
         void *ptr{nullptr};
@@ -141,10 +172,19 @@ class SpdkWrapper {
     void ReplenishProbeRequestContextPoolLocked(size_t count);
     static void ProbeReadComplete(void *ctx, const struct spdk_nvme_cpl *cpl);
 
+    void ControllerLoop();
+
     std::atomic<bool> initialized{false};
     std::mutex init_mutex;
     std::map<std::string, std::unique_ptr<ctrlr_info>> connected_ctrlrs;
     std::mutex ctrlrs_mutex;
+
+    std::mutex controller_mutex_;
+    std::condition_variable controller_cv_;
+    bool controller_stop_{false};
+    std::thread controller_thread_;
+    RecoveryTaskPoster post_recovery_task_{nullptr};
+
     std::map<std::string, std::unique_ptr<ProbeBuffer>> probe_buffers_;
     std::mutex probe_buffers_mutex_;
     std::vector<std::unique_ptr<ProbeRequestContext>> probe_request_contexts_;

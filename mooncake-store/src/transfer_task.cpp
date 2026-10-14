@@ -341,6 +341,12 @@ SpdkNofWorkerPool::SpdkNofWorkerPool(int numa_socket_id)
     VLOG(1) << "Creating SpdkNofWorkerPool with " << worker_count_
             << " workers";
 
+    SpdkWrapper::GetInstance().RegisterRecoveryTaskPoster(
+        [](SpdkWrapper::WorkerId owner, ctrlr_info* ctrlr, bool resume) {
+            owner.first->PostRecoveryTask(owner.second, ctrlr, resume);
+        });
+    SpdkWrapper::GetInstance().StartControllerThread();
+
     // Start worker threads
     workers_.reserve(worker_count_);
     for (int i = 0; i < worker_count_; ++i) {
@@ -349,11 +355,14 @@ SpdkNofWorkerPool::SpdkNofWorkerPool(int numa_socket_id)
 }
 
 SpdkNofWorkerPool::~SpdkNofWorkerPool() {
-    if (shutdown_.exchange(true)) {
-        return;
+    {
+        std::lock_guard<std::mutex> lock(seg_mutex_);
+        if (shutdown_.exchange(true)) return;
     }
 
     for (int i = 0; i < worker_count_; ++i) {
+        // Take the queue lock so shutdown cannot miss a worker entering wait.
+        std::lock_guard<std::mutex> lock(queue_mutex_[i]);
         queue_cv_[i].notify_all();
     }
 
@@ -380,6 +389,7 @@ void SpdkNofWorkerPool::submitTask(SpdkNofTask task) {
         return;
     }
 
+    std::lock_guard<std::mutex> lock(seg_mutex_);
     if (shutdown_.load()) {
         LOG(WARNING)
             << "Attempting to submit task to shutdown SpdkNofWorkerPool";
@@ -387,31 +397,15 @@ void SpdkNofWorkerPool::submitTask(SpdkNofTask task) {
         return;
     }
 
-    int worker_idx = -1;
-    {
-        std::lock_guard<std::mutex> lock(seg_mutex_);
-        nof_seg_handle* seg = task.seg_handle;
-        bool new_binding = false;
-        if (seg_to_worker_.find(seg) != seg_to_worker_.end()) {
-            worker_idx = seg_to_worker_[seg];
-        } else {
-            worker_idx = (seg_num++ % worker_count_);
-            seg_to_worker_[seg] = worker_idx;
-            new_binding = true;
-        }
-        if (new_binding && IsSpdkNofDebugEnabled()) {
-            LOG(INFO) << "nof_worker_bind seg_handle=" << seg
-                      << " worker_idx=" << worker_idx;
-        }
-    }
-    if (worker_idx < 0 || worker_idx >= worker_count_) {
-        LOG(ERROR) << "seg is not bind to invalid worker " << worker_idx;
+    auto it = seg_to_worker_.find(task.seg_handle);
+    if (it == seg_to_worker_.end()) {
+        LOG(ERROR) << "NoF segment is not bound to this worker pool";
         task.state->set_completed(ErrorCode::TRANSFER_FAIL);
         return;
     }
-
+    int worker_idx = it->second;
     {
-        std::lock_guard<std::mutex> lock(queue_mutex_[worker_idx]);
+        std::lock_guard<std::mutex> queue_lock(queue_mutex_[worker_idx]);
         task_queue_[worker_idx].push(std::move(task));
     }
     queue_cv_[worker_idx].notify_one();
@@ -452,15 +446,93 @@ static inline bool CheckSubTaskPool(
 }
 
 struct SpdkNofWorkerPool::WorkerContext {
+    using Phase = SpdkNofControllerState::Phase;
+
+    SpdkNofWorkerPool& pool;
+    int index;
+    SpdkWrapper& wrapper{SpdkWrapper::GetInstance()};
+
     int64_t total_outstanding_io{0};
+    std::map<ctrlr_info*, SpdkNofControllerState> controllers;
     std::map<nof_seg_handle*, std::unique_ptr<SpdkNofQos>> seg_to_qos;
+
     std::stack<SpdkNofSubTask*> sub_task_pool;
     std::vector<SpdkNofSubTask*> sub_task_chunks;
     std::chrono::steady_clock::time_point last_debug_snapshot{
         std::chrono::steady_clock::now()};
 
+    WorkerContext(SpdkNofWorkerPool& p, int i) : pool(p), index(i) {}
+
     ~WorkerContext() {
         for (auto* sub_tasks : sub_task_chunks) delete[] sub_tasks;
+    }
+
+    SpdkWrapper::WorkerId OwnerId() { return {&pool, index}; }
+
+    bool HasWork() const {
+        if (total_outstanding_io || HasBufferedTask(seg_to_qos)) return true;
+        for (auto& [_, state] : controllers)
+            if (state.phase == Phase::Cleaning) return true;
+        return false;
+    }
+
+    static void FailQueued(SpdkNofQos& qos) {
+        for (int op = 0; op < kSpdkNofOpNum; ++op) {
+            while (qos.head[op]) {
+                auto* task = qos.head[op];
+                qos.PopTask(op);
+                task->on_chain = false;
+                task->remaining_lba = 0;
+                task->failed = true;
+                SpdkNofTaskCompletion(task);
+            }
+        }
+    }
+
+    void BeginControllerCleanup(ctrlr_info* ctrlr) {
+        auto& state = controllers[ctrlr];
+        if (state.phase == Phase::Cleaning) return;
+        if (state.phase == Phase::Paused && !pool.shutdown_.load()) return;
+
+        // On shutdown, conservatively rescan owned segments before
+        // UnregisterOwner(), even if the previous cleanup reached Paused.
+        state.phase = Phase::Cleaning;
+        state.draining_segments = wrapper.OwnedSegments(ctrlr, OwnerId());
+
+        for (auto& [_, qos] : seg_to_qos)
+            if (qos->controller_state == &state) FailQueued(*qos);
+    }
+
+    void AdvanceCleanup() {
+        for (auto& [ctrlr, state] : controllers) {
+            if (state.phase != Phase::Cleaning) continue;
+
+            bool drained = true;
+            for (auto* seg : state.draining_segments)
+                drained &= wrapper.DrainClientQpair(seg);
+            if (!drained) continue;
+
+            for (auto& [_, qos] : seg_to_qos) {
+                if (qos->controller_state == &state) {
+                    assert(qos->Empty());
+                    assert(qos->inflight_blocks[kSpdkNofOpRead] == 0 &&
+                           qos->inflight_blocks[kSpdkNofOpWrite] == 0);
+                }
+            }
+
+            state.draining_segments.clear();
+            state.phase = Phase::Paused;
+            wrapper.OwnerDrained(ctrlr, OwnerId());
+        }
+    }
+
+    void ResumeController(ctrlr_info* ctrlr) {
+        if (pool.shutdown_.load()) return;
+
+        auto it = controllers.find(ctrlr);
+        assert(it != controllers.end());
+        assert(it->second.phase == Phase::Paused);
+        it->second.phase = Phase::Running;
     }
 };
 
@@ -468,7 +540,8 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
     bindToSocket(numa_socket_id_);
     VLOG(2) << "SpdkNofWorkerPool worker thread started";
 
-    WorkerContext ctx;
+    using Phase = SpdkNofControllerState::Phase;
+    WorkerContext ctx(*this, work_idx);
     auto& total_outstanding_io = ctx.total_outstanding_io;
     auto& seg_to_qos = ctx.seg_to_qos;
     auto& sub_task_pool = ctx.sub_task_pool;
@@ -478,32 +551,23 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
     auto& queue_cv = queue_cv_[work_idx];
     auto& queue_mutex = queue_mutex_[work_idx];
     auto& last_debug_snapshot = ctx.last_debug_snapshot;
-
-    if (!CheckSubTaskPool(sub_task_pool, sub_task_chunks, work_idx)) {
-        return;
-    }
-
+    auto& wrapper = ctx.wrapper;
     std::queue<ControlTask> controls;
     std::queue<SpdkNofTask> incoming;
+
     while (true) {
-        // Wait for task or shutdown signal
         {
             std::unique_lock<std::mutex> lock(queue_mutex);
-            queue_cv.wait(lock, [this, &task_queue, &control_queue,
-                                 &total_outstanding_io, &seg_to_qos] {
-                return shutdown_.load() || !task_queue.empty() ||
-                       !control_queue.empty() || total_outstanding_io ||
-                       HasBufferedTask(seg_to_qos);
-            });
-
-            if (shutdown_.load() && task_queue.empty() &&
-                control_queue.empty() && (total_outstanding_io == 0) &&
-                !HasBufferedTask(seg_to_qos)) {
-                break;
-            }
-
-            // Snapshot both queues together so new I/O cannot overtake a
-            // preceding control task while this worker executes callbacks.
+            auto ready = [this, &control_queue, &task_queue, &ctx] {
+                return shutdown_.load() || !control_queue.empty() ||
+                       !task_queue.empty() || ctx.HasWork();
+            };
+            // Poll idle qpairs every 1 ms to advance async connections
+            // and detect reported transport errors.
+            if (seg_to_qos.empty())
+                queue_cv.wait(lock, ready);
+            else
+                queue_cv.wait_for(lock, std::chrono::milliseconds(1), ready);
             controls.swap(control_queue);
             incoming.swap(task_queue);
         }
@@ -513,49 +577,49 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
             controls.pop();
         }
 
+        // Each request's registration task has already run,
+        // so its worker-local QoS entry must exist.
         while (!incoming.empty()) {
             auto incoming_task = std::move(incoming.front());
             incoming.pop();
-            SpdkNofTask* task =
+            auto& qos = seg_to_qos.at(incoming_task.seg_handle);
+            if (qos->controller_state->phase != Phase::Running ||
+                shutdown_.load()) {
+                incoming_task.state->set_completed(ErrorCode::TRANSFER_FAIL);
+                continue;
+            }
+            auto* task =
                 new (std::nothrow) SpdkNofTask(std::move(incoming_task));
-            if (task == nullptr) {
+            if (!task) {
                 LOG(ERROR) << "alloc SpdkNofTask failed, worker " << work_idx;
                 incoming_task.state->set_completed(ErrorCode::TRANSFER_FAIL);
                 continue;
             }
 
-            SpdkNofQos* nof_qos = nullptr;
-            auto it = seg_to_qos.find(task->seg_handle);
-            if (it == seg_to_qos.end()) {
-                auto qos = std::make_unique<SpdkNofQos>(
-                    SpdkWrapper::GetInstance().GetBlockSize(task->seg_handle));
-                if (qos == nullptr) {
-                    LOG(ERROR)
-                        << "alloc SpdkNofQos failed, worker " << work_idx;
-                    delete task;
-                    continue;
-                }
-                nof_qos = qos.get();
-                seg_to_qos[task->seg_handle] = std::move(qos);
-                if (IsSpdkNofDebugEnabled()) {
-                    LOG(INFO)
-                        << "nof_qos_create worker_idx=" << work_idx
-                        << " seg_handle=" << task->seg_handle
-                        << " blocks_per_chunk="
-                        << seg_to_qos[task->seg_handle]->blocks_per_chunk
-                        << " inflight_blocks_limit="
-                        << seg_to_qos[task->seg_handle]->inflight_blocks_limit;
-                }
-            } else {
-                nof_qos = it->second.get();
-            }
             task->io_count = &total_outstanding_io;
-            task->nof_qos = nof_qos;
+            task->nof_qos = qos.get();
             task->on_chain = true;
-            nof_qos->PushTask(task);
+            qos->PushTask(task);
+        }
+
+        // Use one shutdown snapshot for cleanup and exit in this iteration.
+        const bool stopping = shutdown_.load();
+        if (stopping) {
+            for (auto& [ctrlr, _] : ctx.controllers)
+                ctx.BeginControllerCleanup(ctrlr);
         }
 
         for (auto& [seg_handle, nof_qos] : seg_to_qos) {
+            if (nof_qos->controller_state->phase != Phase::Running ||
+                nof_qos->Empty())
+                continue;
+            int connect_rc = wrapper.SetupClientQpairIfNeeded(seg_handle);
+            if (connect_rc != 0) {
+                if (connect_rc == -ENXIO)
+                    wrapper.RequestRecovery(wrapper.GetController(seg_handle));
+                ctx.FailQueued(*nof_qos);
+                continue;
+            }
             uint32_t block_size =
                 SpdkWrapper::GetInstance().GetBlockSize(seg_handle);
             for (int i = 0; i < kSpdkNofOpNum; ++i) {
@@ -591,7 +655,13 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                             sub_task);
                         if (ret != 0) {
                             LOG(ERROR) << "work " << work_idx << ", seg "
-                                       << task->seg_handle << " submit io fail";
+                                       << task->seg_handle << " submit io fail"
+                                       << ", ret " << ret << ", op " << task->op
+                                       << ", lba " << submit_lba
+                                       << ", lba_count " << submit_lba_count;
+                            if (ret == -ENXIO)
+                                wrapper.RequestRecovery(
+                                    wrapper.GetController(seg_handle));
                             task->failed = true;
                             task->remaining_lba = 0;
                         } else {
@@ -612,16 +682,16 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
             }
         }
 
-        if (total_outstanding_io > 0) {
-            int64_t ret = 0;
-            for (auto& it : seg_to_qos) {
-                ret = SpdkWrapper::GetInstance().NvmePollProcessCompletion(
-                    it.first, 0);
-                if (ret < 0) {
-                    LOG(ERROR) << "poll completion error: ret " << ret;
-                }
+        for (auto& [seg, qos] : seg_to_qos) {
+            if (qos->controller_state->phase != Phase::Running) continue;
+            int64_t rc = wrapper.NvmePollProcessCompletion(seg, 0);
+            if (rc < 0) {
+                LOG(ERROR) << "poll completion error: ret " << rc;
+                wrapper.RequestRecovery(wrapper.GetController(seg));
             }
         }
+
+        ctx.AdvanceCleanup();
 
         if (IsSpdkNofDebugEnabled()) {
             auto now = std::chrono::steady_clock::now();
@@ -645,9 +715,96 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                 last_debug_snapshot = now;
             }
         }
+
+        if (stopping && !ctx.HasWork()) {
+            // Unregister under the controller's publication lock. No further
+            // recovery tasks can reference this worker after these calls.
+            for (auto& [ctrlr, _] : ctx.controllers)
+                ctx.wrapper.UnregisterOwner(ctrlr, ctx.OwnerId());
+            std::lock_guard<std::mutex> lock(queue_mutex);
+            if (control_queue.empty() && task_queue.empty()) break;
+        }
     }
 
     VLOG(2) << "SpdkNofWorkerPool worker thread exiting";
+}
+
+nof_seg_handle* SpdkNofWorkerPool::OpenNofSegment(const std::string& tr_str) {
+    if (shutdown_.load()) return nullptr;
+    auto& wrapper = SpdkWrapper::GetInstance();
+    auto* seg = wrapper.OpenNofSegment(tr_str, true);
+    if (!seg) return nullptr;
+
+    std::lock_guard<std::mutex> lock(seg_mutex_);
+    if (shutdown_.load()) return nullptr;
+    if (seg_to_worker_.find(seg) != seg_to_worker_.end()) return seg;
+
+    int worker_idx = seg_num % worker_count_;
+    seg_to_worker_.emplace(seg, worker_idx);
+    try {
+        if (!wrapper.BindSegmentToWorker(seg, {this, worker_idx}, [&] {
+                PostControlTask(
+                    worker_idx, [seg, worker_idx](WorkerContext& ctx) {
+                        auto* ctrlr = ctx.wrapper.GetController(seg);
+                        auto& state = ctx.controllers[ctrlr];
+                        auto qos = std::make_unique<SpdkNofQos>(
+                            ctx.wrapper.GetBlockSize(seg));
+                        qos->controller_state = &state;
+                        if (IsSpdkNofDebugEnabled()) {
+                            LOG(INFO)
+                                << "nof_qos_create worker_idx=" << worker_idx
+                                << " seg_handle=" << seg
+                                << " blocks_per_chunk=" << qos->blocks_per_chunk
+                                << " inflight_blocks_limit="
+                                << qos->inflight_blocks_limit;
+                        }
+                        ctx.seg_to_qos.emplace(seg, std::move(qos));
+                        // SpdkWrapper::BindSegmentToWorker() published this
+                        // owner before PostControlTask() queued this task.
+                        // Shutdown may start before the task executes.
+                        // SpdkNofWorkerPool::workerThread() traverses
+                        // ctx.controllers and calls
+                        // SpdkWrapper::UnregisterOwner() before exiting. Keep
+                        // the local registration above so it finds this
+                        // controller; otherwise the controller could retain an
+                        // owner referencing a destroyed pool. Skip only
+                        // SpdkWrapper::SetupClientQpairIfNeeded() below.
+                        if (ctx.pool.shutdown_.load() ||
+                            state.phase != WorkerContext::Phase::Running)
+                            return;
+
+                        int rc = ctx.wrapper.SetupClientQpairIfNeeded(seg);
+                        if (rc == -ENXIO) ctx.wrapper.RequestRecovery(ctrlr);
+                        if (rc != 0 && rc != -EAGAIN) {
+                            LOG(WARNING)
+                                << "NoF initial qpair setup failed: seg=" << seg
+                                << ", ret=" << rc;
+                        }
+                    });
+            })) {
+            seg_to_worker_.erase(seg);
+            return nullptr;
+        }
+    } catch (...) {
+        seg_to_worker_.erase(seg);
+        return nullptr;
+    }
+    ++seg_num;
+    if (IsSpdkNofDebugEnabled()) {
+        LOG(INFO) << "nof_worker_bind seg_handle=" << seg
+                  << " worker_idx=" << worker_idx;
+    }
+    return seg;
+}
+
+void SpdkNofWorkerPool::PostRecoveryTask(int worker_idx, ctrlr_info* ctrlr,
+                                         bool resume) {
+    PostControlTask(worker_idx, [ctrlr, resume](WorkerContext& ctx) {
+        if (resume)
+            ctx.ResumeController(ctrlr);
+        else
+            ctx.BeginControllerCleanup(ctrlr);
+    });
 }
 #endif
 
@@ -1995,7 +2152,7 @@ std::optional<TransferFuture> TransferSubmitter::submitSpdkNofOperation(
     }
 
     nof_seg_handle* seg_handle =
-        SpdkWrapper::GetInstance().OpenNofSegment(handle.transport_endpoint_);
+        spdk_nvmf_pool_->OpenNofSegment(handle.transport_endpoint_);
     if (!seg_handle) {
         LOG(ERROR) << "Failed to open NoF segment endpoint="
                    << handle.transport_endpoint_;
