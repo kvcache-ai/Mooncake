@@ -58,6 +58,7 @@ cp ${BUILD_DIR}/mooncake-common/libasio.so mooncake-wheel/mooncake/libasio.so
 if compgen -G "${BUILD_DIR}/mooncake-integration/store.*.so" >/dev/null; then
     echo "Copying store.so..."
     cp ${BUILD_DIR}/mooncake-integration/store.*.so mooncake-wheel/mooncake/store.so
+    cp "${BUILD_DIR}"/mooncake-integration/_kv_codec.*.so mooncake-wheel/mooncake/
     echo "Copying master binary..."
     # Copy master binary
     cp ${BUILD_DIR}/mooncake-store/src/mooncake_master mooncake-wheel/mooncake/
@@ -185,6 +186,7 @@ echo "Building wheel package..."
 MIGRATED_PYTHON_SOURCE_DIR="python/mooncake"
 MIGRATED_PYTHON_STAGING_DIR="$(pwd)/mooncake-wheel/mooncake"
 MIGRATED_PYTHON_MODULES=(
+    codec_store.py
     http_metadata_server.py
     _launcher.py
     cli.py

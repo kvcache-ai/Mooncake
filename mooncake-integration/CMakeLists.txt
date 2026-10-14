@@ -154,6 +154,14 @@ if(WITH_STORE)
     store/buffer_pool.cpp
     store/engram_store_py.cpp
     integration_utils.h)
+  pybind11_add_module(_kv_codec store/kv_codec_py.cpp)
+  target_link_libraries(_kv_codec PRIVATE mooncake_kv_codec)
+  install(TARGETS _kv_codec LIBRARY DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR}
+                                    COMPONENT python)
+  install(
+    FILES "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/codec_store.py"
+    DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR}
+    COMPONENT python)
   set_target_properties(store PROPERTIES INSTALL_RPATH "$ORIGIN")
   if(USE_TENT)
     target_link_libraries(store PRIVATE tent)
