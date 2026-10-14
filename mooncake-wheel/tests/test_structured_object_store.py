@@ -4487,6 +4487,24 @@ def test_dataproto_helper_object_non_tensor_codecs_roundtrip() -> None:
     assert result["non_tensor_batch"]["nullable_int"].tolist() == [1, None, 3, 4]
 
 
+def test_dataproto_helper_int_list_rows_with_empty_row_keep_int_dtype() -> None:
+    _store, transfer = make_transfer()
+    big = 2**53 + 1
+    rows = np.empty(3, dtype=object)
+    rows[:] = [[1, 2], [], [big]]
+    data = SimpleDataProto(non_tensor_batch={"token_ids": rows})
+
+    ref = transfer.put_dataproto(data)
+    result = transfer.get_dataproto(ref)
+
+    # An empty Python list has no element dtype; it must not promote the
+    # integer rows to float64 (which changes the row type and loses precision).
+    values = result["non_tensor_batch"]["token_ids"].tolist()
+    assert values == [[1, 2], [], [big]]
+    assert all(isinstance(item, int) for row in values for item in row)
+    assert ref.encoded_non_tensor["token_ids"]["metadata"]["dtype"] == "int64"
+
+
 def test_msgpack_ragged_decode_validates_row_count() -> None:
     payload, _metadata = sos._encode_msgpack_ragged_values(
         "json", [{"a": 1}, {"b": 2}]
