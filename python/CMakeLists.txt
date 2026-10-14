@@ -22,7 +22,10 @@ install(
   COMPONENT python
   FILES_MATCHING
   PATTERN "*.py"
-  PATTERN "__init__.py" EXCLUDE)
+  PATTERN "__init__.py" EXCLUDE
+  PATTERN "allocator.py" EXCLUDE
+  PATTERN "allocator_ascend_npu.py" EXCLUDE
+  PATTERN "fabric_allocator_utils.py" EXCLUDE)
 install(
   DIRECTORY
     "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-reshard/python/mooncake/reshard/"

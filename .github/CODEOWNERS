@@ -15,6 +15,10 @@
 /mooncake-reshard @ShangmingCai @stmatengss @Bo-Vincent @zxpdemonio
 /mooncake-store @ykwd @stmatengss @XucSh @YiXR
 /mooncake-store/*/ha/ @Libotry @YiXR @00fish0 @Icedcoco @Aionw
+/python/mooncake/allocator.py @ShangmingCai @alogfans
+/python/mooncake/allocator_ascend_npu.py @ShangmingCai @alogfans @ascend-direct-dev
+/python/mooncake/fabric_allocator_utils.py @ShangmingCai @alogfans
+/python/tests/allocators/ @ShangmingCai @alogfans
 /python/mooncake/http_metadata_server.py @ykwd @stmatengss @zxpdemonio
 /python/mooncake/async_store.py @ykwd @stmatengss @zxpdemonio
 /python/tests/store/async_store_integration.py @ykwd @stmatengss @zxpdemonio

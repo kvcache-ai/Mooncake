@@ -1,10 +1,12 @@
+from __future__ import annotations
+
 import ctypes
+from enum import IntEnum
+from importlib import resources
 import logging
 import os
 import threading
-from importlib import resources
 from typing import Dict, Final
-from enum import IntEnum
 
 from torch import device as torch_device
 from torch.cuda.memory import CUDAPluggableAllocator
