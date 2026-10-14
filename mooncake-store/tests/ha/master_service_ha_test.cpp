@@ -1390,10 +1390,171 @@ TEST_F(MasterServiceHATest, BatchPromotionRejectsCrossChunkOverlap) {
     EXPECT_EQ(2u, handoff.metadata_store->GetKeyCount());
     EXPECT_TRUE(handoff.metadata_store->Exists(first.tenant_id, first.key));
     EXPECT_TRUE(handoff.metadata_store->Exists(second.tenant_id, second.key));
-    EXPECT_EQ(
-        HasMetadataEntryForTesting(service, kDefaultTenant, first.key) +
-            HasMetadataEntryForTesting(service, kDefaultTenant, second.key),
-        1);
+    // A failed restore installs nothing, whichever chunk failed.
+    EXPECT_FALSE(
+        HasMetadataEntryForTesting(service, kDefaultTenant, first.key));
+    EXPECT_FALSE(
+        HasMetadataEntryForTesting(service, kDefaultTenant, second.key));
+}
+
+namespace {
+
+// `count` objects of 1 KiB, alternating between `endpoints`, packed from
+// kBase on each endpoint, with replica ids 1..count.
+std::unique_ptr<StandbyMetadataStore> MakeParallelRestoreSource(
+    size_t count, const std::vector<std::string>& endpoints, uint64_t base) {
+    auto source = std::make_unique<StandbyMetadataStore>();
+    std::vector<uint64_t> next(endpoints.size(), base);
+    for (size_t i = 0; i < count; ++i) {
+        const size_t e = i % endpoints.size();
+        StandbyObjectMetadata metadata;
+        metadata.client_id = generate_uuid();
+        metadata.size = 1024;
+        Replica::Descriptor replica;
+        replica.id = i + 1;
+        replica.status = ReplicaStatus::COMPLETE;
+        MemoryDescriptor memory;
+        memory.buffer_descriptor.transport_endpoint_ = endpoints[e];
+        memory.buffer_descriptor.buffer_address_ = next[e];
+        memory.buffer_descriptor.size_ = 1024;
+        replica.descriptor_variant = std::move(memory);
+        metadata.replicas.push_back(std::move(replica));
+        next[e] += 1024;
+        EXPECT_TRUE(source->PutMetadata(
+            "default", "parallel_" + std::to_string(i), metadata));
+    }
+    return source;
+}
+
+}  // namespace
+
+TEST_F(MasterServiceHATest, BatchPromotionRestoresInParallel) {
+    constexpr size_t kObjects = 5000;
+    const std::vector<std::string> endpoints = {"parallel_segment_a",
+                                                "parallel_segment_b"};
+    for (const size_t workers : {size_t{1}, size_t{4}}) {
+        MasterService service(
+            MasterServiceConfig::builder().set_enable_ha(false).build());
+        auto source =
+            MakeParallelRestoreSource(kObjects, endpoints, kDefaultSegmentBase);
+        ASSERT_TRUE(service
+                        .RestoreFromBatchOpLogPromotion(
+                            *source, {.batch_id = 3, .last_seq = 3},
+                            {MakeStandbyMemorySegment(endpoints[0]),
+                             MakeStandbyMemorySegment(endpoints[1])},
+                            kObjects, /*chunk_object_count=*/64, workers)
+                        .has_value())
+            << "workers=" << workers;
+        EXPECT_EQ(kObjects, service.GetKeyCount()) << "workers=" << workers;
+        for (const size_t i : {size_t{0}, size_t{1}, kObjects - 1}) {
+            auto replicas = ReplicaDescriptorsForTesting(
+                service, kDefaultTenant, "parallel_" + std::to_string(i));
+            ASSERT_EQ(replicas.size(), 1);
+            EXPECT_EQ(replicas.front().id, i + 1);
+            const auto& buffer =
+                replicas.front().get_memory_descriptor().buffer_descriptor;
+            EXPECT_EQ(buffer.transport_endpoint_, endpoints[i % 2]);
+            EXPECT_EQ(buffer.buffer_address_,
+                      kDefaultSegmentBase + (i / 2) * 1024);
+        }
+    }
+}
+
+TEST_F(MasterServiceHATest, BatchPromotionFailureInParallelInstallsNothing) {
+    constexpr size_t kObjects = 2000;
+    const std::string endpoint = "parallel_failure_segment";
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+    auto source =
+        MakeParallelRestoreSource(kObjects, {endpoint}, kDefaultSegmentBase);
+    // One object whose descriptor does not match its size.
+    auto bad = MakeStandbyObject("parallel_failure_bad", endpoint);
+    bad.metadata.replicas.front().id = kObjects + 1;
+    bad.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.size_ = 512;
+    ASSERT_TRUE(source->PutMetadata(bad.tenant_id, bad.key, bad.metadata));
+
+    auto result = service.RestoreFromBatchOpLogPromotion(
+        *source, {.batch_id = 3, .last_seq = 3},
+        {MakeStandbyMemorySegment(endpoint)}, kObjects + 1,
+        /*chunk_object_count=*/32, /*restore_workers=*/4);
+
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, result.error());
+    EXPECT_EQ(0u, service.GetKeyCount());
+}
+
+TEST_F(MasterServiceHATest, BatchPromotionRejectsRangesBeyondCapacity) {
+    // Ranges from different chunks that only together exceed the segment.
+    constexpr size_t kObjects = 64;
+    const std::string endpoint = "parallel_capacity_segment";
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+    auto source =
+        MakeParallelRestoreSource(kObjects, {endpoint}, kDefaultSegmentBase);
+
+    auto result = service.RestoreFromBatchOpLogPromotion(
+        *source, {.batch_id = 3, .last_seq = 3},
+        {MakeStandbyMemorySegment(endpoint, (kObjects - 1) * 1024)}, kObjects,
+        /*chunk_object_count=*/8, /*restore_workers=*/4);
+
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, result.error());
+    EXPECT_EQ(0u, service.GetKeyCount());
+}
+
+TEST_F(MasterServiceHATest, BatchPromotionCountsRestoredDiskObjects) {
+    // An object restored with a completed LOCAL_DISK replica counts as a disk
+    // object, as one whose replica came through AddReplica does, and a failed
+    // restore takes the count back out with the objects.
+    constexpr size_t kObjects = 200;
+    constexpr size_t kDiskObjects = 10;
+    const std::string endpoint = "parallel_disk_segment";
+    const UUID disk_owner = generate_uuid();
+    for (const bool fail : {false, true}) {
+        MasterService service(
+            MasterServiceConfig::builder().set_enable_ha(false).build());
+        auto source = MakeParallelRestoreSource(kObjects, {endpoint},
+                                                kDefaultSegmentBase);
+        for (size_t i = 0; i < kDiskObjects; ++i) {
+            StandbyObjectMetadata metadata;
+            metadata.client_id = generate_uuid();
+            metadata.size = 1024;
+            metadata.replicas.push_back(
+                MakeStandbyLocalDiskReplica(disk_owner, "parallel_disk_owner"));
+            metadata.replicas.front().id = kObjects + 1 + i;
+            ASSERT_TRUE(source->PutMetadata(
+                "default", "parallel_disk_" + std::to_string(i), metadata));
+        }
+        ReplicaID max_replica_id = kObjects + kDiskObjects;
+        if (fail) {
+            // One object whose descriptor does not match its size.
+            auto bad = MakeStandbyObject("parallel_disk_bad", endpoint);
+            bad.metadata.replicas.front().id = ++max_replica_id;
+            bad.metadata.replicas.front()
+                .get_memory_descriptor()
+                .buffer_descriptor.size_ = 512;
+            ASSERT_TRUE(
+                source->PutMetadata(bad.tenant_id, bad.key, bad.metadata));
+        }
+
+        auto result = service.RestoreFromBatchOpLogPromotion(
+            *source, {.batch_id = 3, .last_seq = 3},
+            {MakeStandbyMemorySegment(endpoint)}, max_replica_id,
+            /*chunk_object_count=*/16, /*restore_workers=*/4);
+
+        if (fail) {
+            ASSERT_FALSE(result.has_value());
+            EXPECT_EQ(0u, service.GetKeyCount());
+            EXPECT_EQ(DiskObjectCountForTesting(service), 0);
+        } else {
+            ASSERT_TRUE(result.has_value());
+            EXPECT_EQ(kObjects + kDiskObjects, service.GetKeyCount());
+            EXPECT_EQ(DiskObjectCountForTesting(service),
+                      static_cast<long>(kDiskObjects));
+        }
+    }
 }
 
 TEST_F(MasterServiceHATest,
