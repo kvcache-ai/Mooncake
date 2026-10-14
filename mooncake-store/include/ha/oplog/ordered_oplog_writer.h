@@ -6,6 +6,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <vector>
 
 #include <async_simple/Future.h>
 #include <async_simple/Promise.h>
@@ -54,10 +55,11 @@ class OrderedOpLogWriter {
 
        private:
         friend class OrderedOpLogWriter;
-        Reservation(OrderedOpLogWriter* writer, uint64_t id);
+        Reservation(OrderedOpLogWriter* writer, uint64_t id, uint64_t slots);
 
         OrderedOpLogWriter* writer_{nullptr};
         uint64_t id_{0};
+        uint64_t slots_{0};
     };
 
     class PendingHandle {
@@ -78,8 +80,22 @@ class OrderedOpLogWriter {
     virtual ~OrderedOpLogWriter();
 
     tl::expected<Reservation, ErrorCode> Reserve();
+    // Reserve slots for one indivisible group of entries, to be committed
+    // together via CommitBatch. The same admission cap applies, so a group
+    // larger than max_entries_per_batch is rejected up front instead of
+    // producing an oversized record the backend might refuse.
+    tl::expected<Reservation, ErrorCode> ReserveBatch(size_t entry_count);
     virtual tl::expected<PendingHandle, ErrorCode> Commit(
         Reservation&& reservation, OpLogEntry entry, DurableCallback callback);
+    // Commit all entries as one indivisible group: they are sealed into a
+    // single batch record, so the durable prefix either covers every entry
+    // or none of them. Splitting a repair-like set across records would let
+    // a durable prefix capture a proper subset. The callback fires once per
+    // entry, same as committing each entry on its own. The reservation must
+    // come from ReserveBatch with a matching entry_count.
+    virtual tl::expected<std::vector<PendingHandle>, ErrorCode> CommitBatch(
+        Reservation&& reservation, std::vector<OpLogEntry> entries,
+        DurableCallback callback);
     void Abort(Reservation&& reservation);
 
     // Return a future for durability, independently of callback completion,

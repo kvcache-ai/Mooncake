@@ -4,6 +4,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <utility>
 
 #include <glog/logging.h>
 
@@ -11,7 +12,6 @@
 #include "ha/snapshot/batch_oplog/batch_oplog_snapshot_coordinator.h"
 #include "ha/snapshot/batch_oplog/batch_oplog_snapshot_provider.h"
 #include "ha/snapshot/batch_oplog/metadata.h"
-#include "ha/snapshot/catalog_backed_snapshot_provider.h"
 #include "ha/snapshot/object/snapshot_object_store.h"
 #include "hot_standby_service.h"
 
@@ -34,8 +34,7 @@ std::unique_ptr<HotStandbyService> CreateStandbyService(
         .verification_interval_sec = 30,
         .max_replication_lag_entries = 1000,
         .enable_verification = false,
-        .enable_snapshot_bootstrap =
-            config.enable_oplog_snapshot || config.enable_snapshot_restore,
+        .enable_snapshot_bootstrap = config.enable_oplog_snapshot,
         .enable_oplog_following = capabilities.has_oplog_following,
         .oplog_poll_interval_ms = config.oplog_poll_interval_ms,
         .batch_oplog_retry_timeout_sec = config.batch_oplog_retry_timeout_sec,
@@ -45,10 +44,9 @@ std::unique_ptr<HotStandbyService> CreateStandbyService(
 StandbyRuntimeCapabilities BuildStandbyRuntimeCapabilities(
     const HABackendSpec& spec, const MasterServiceSupervisorConfig& config) {
     StandbyRuntimeCapabilities capabilities;
-    capabilities.has_snapshot_bootstrap =
-        config.enable_oplog_snapshot || config.enable_snapshot_restore;
+    capabilities.has_snapshot_bootstrap = config.enable_oplog_snapshot;
     capabilities.has_oplog_following =
-        config.enable_oplog && spec.type == HABackendType::ETCD;
+        config.enable_oplog && HaBackendSupportsOpLog(spec.type);
     return capabilities;
 }
 
@@ -114,28 +112,17 @@ class NoopStandbyController final : public StandbyController {
 class CapabilityDrivenStandbyController final : public StandbyController {
    public:
     CapabilityDrivenStandbyController(
-        const HABackendSpec& spec, const MasterServiceSupervisorConfig& config)
+        const HABackendSpec& spec, const MasterServiceSupervisorConfig& config,
+        StartErrorInjector start_error_injector)
         : spec_(spec),
           config_(config),
           capabilities_(BuildStandbyRuntimeCapabilities(spec, config)),
-          standby_service_(CreateStandbyService(config, capabilities_)) {
-        if (config_.enable_snapshot_restore && !config_.enable_oplog_snapshot) {
-            auto snapshot_provider =
-                CreateCatalogBackedSnapshotProvider(config_);
-            if (!snapshot_provider) {
-                dependency_init_error_ = snapshot_provider.error();
-                LOG(ERROR) << "Failed to initialize standby snapshot provider, "
-                           << "backend=" << HABackendTypeToString(spec_.type)
-                           << ", error=" << toString(dependency_init_error_);
-            } else {
-                standby_service_->SetSnapshotProvider(
-                    std::move(snapshot_provider.value()));
-            }
-        }
-
+          standby_service_(CreateStandbyService(config, capabilities_)),
+          start_error_injector_(std::move(start_error_injector)) {
         if (config_.enable_oplog_snapshot) {
             try {
-                if (!capabilities_.has_oplog_following ||
+                if (spec_.type != HABackendType::ETCD ||
+                    !capabilities_.has_oplog_following ||
                     config_.snapshot_chunk_object_count == 0) {
                     throw std::invalid_argument(
                         "batch snapshot requires etcd OpLog and positive chunk "
@@ -175,6 +162,7 @@ class CapabilityDrivenStandbyController final : public StandbyController {
         }
 
         if (capabilities_.has_oplog_following) {
+            standby_service_->SetOpLogBackendType(spec_.type);
             oplog_connstring_ = config_.ha_backend_connstring.empty()
                                     ? config_.etcd_endpoints
                                     : config_.ha_backend_connstring;
@@ -210,6 +198,15 @@ class CapabilityDrivenStandbyController final : public StandbyController {
         if (standby_running) {
             NotifyRuntimeStateIfChanged();
             return ErrorCode::OK;
+        }
+
+        if (start_error_injector_) {
+            const auto injected_error = start_error_injector_();
+            if (injected_error != ErrorCode::OK) {
+                std::lock_guard<std::mutex> lock(state_mutex_);
+                last_standby_error_ = injected_error;
+                return injected_error;
+            }
         }
 
         if (dependency_init_error_ != ErrorCode::OK) {
@@ -345,7 +342,8 @@ class CapabilityDrivenStandbyController final : public StandbyController {
             return ctx;
         }
 
-        // Atomic legacy promote + export (final catch-up happens inside).
+        // Export the in-memory OpLog state when snapshot production is
+        // disabled.
         StandbySnapshot snapshot;
         ErrorCode err = standby_service_->PromoteAndExportSnapshot(snapshot);
         if (err != ErrorCode::OK) {
@@ -440,6 +438,7 @@ class CapabilityDrivenStandbyController final : public StandbyController {
     std::unique_ptr<BatchOpLogSnapshotCoordinator>
         batch_oplog_snapshot_coordinator_;
     ErrorCode dependency_init_error_{ErrorCode::OK};
+    StartErrorInjector start_error_injector_;
     std::string oplog_connstring_;
 
     mutable std::mutex state_mutex_;
@@ -455,12 +454,13 @@ class CapabilityDrivenStandbyController final : public StandbyController {
 }  // namespace
 
 std::unique_ptr<StandbyController> CreateStandbyController(
-    const HABackendSpec& spec, const MasterServiceSupervisorConfig& config) {
+    const HABackendSpec& spec, const MasterServiceSupervisorConfig& config,
+    StandbyController::StartErrorInjector start_error_injector) {
     const auto capabilities = BuildStandbyRuntimeCapabilities(spec, config);
     if (capabilities.has_snapshot_bootstrap ||
         capabilities.has_oplog_following) {
-        return std::make_unique<CapabilityDrivenStandbyController>(spec,
-                                                                   config);
+        return std::make_unique<CapabilityDrivenStandbyController>(
+            spec, config, std::move(start_error_injector));
     }
 
     LOG(INFO) << "HA standby controller falls back to noop, backend_type="

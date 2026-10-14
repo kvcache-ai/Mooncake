@@ -493,3 +493,38 @@ def test_partial_token_release_failure_never_replays_completed_token() -> None:
     )
     assert transient.calls == 1
     assert completed.calls == 1
+
+
+def test_pending_unregister_interruption_never_replays_unknown_address() -> None:
+    class InterruptAfterUnregisterResult(int):
+        def __new__(cls):
+            return super().__new__(cls, 0)
+
+        def __ne__(self, other) -> bool:
+            raise KeyboardInterrupt("interrupted after unregister returned")
+
+    engine = TicketEngine()
+    engine.unregister_calls = []
+
+    def unregister_memory(address: int):
+        engine.unregister_calls.append(address)
+        return InterruptAfterUnregisterResult()
+
+    engine.unregister_memory = unregister_memory
+    executor = MooncakeTransferEngineExecutor(engine)
+    pending_transfer_id = executor.retain_pending_registration_cleanup(
+        terminal_state=TerminalTransferState.COMPLETED,
+        registrations=(0x1000, 0x2000),
+        resources=(),
+    )
+
+    with pytest.raises(KeyboardInterrupt, match="after unregister returned"):
+        executor.drain_pending_transfer(pending_transfer_id, timeout_ms=0)
+
+    assert executor.pending_transfer_status(pending_transfer_id) == (
+        "COMPLETION_UNKNOWN_RESTART_REQUIRED"
+    )
+    assert executor.drain_pending_transfer(pending_transfer_id, timeout_ms=0) == (
+        "COMPLETION_UNKNOWN"
+    )
+    assert engine.unregister_calls == [0x2000]

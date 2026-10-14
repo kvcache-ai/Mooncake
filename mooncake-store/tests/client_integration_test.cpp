@@ -26,7 +26,7 @@
 #include "test_server_helpers.h"
 #include "default_config.h"
 #include "crc_checksum.h"
-#include "environ.h"
+#include "../src/config/client_object_checksum_config.h"
 
 DEFINE_string(protocol, "tcp", "Transfer protocol: rdma|tcp");
 DEFINE_string(device_name, "", "Device name to use, valid if protocol=rdma");
@@ -65,7 +65,7 @@ class ObjectChecksumClient : public Client {
 };
 
 TEST(ObjectChecksumTest, ClientVerifiesOnlyLogicalObjectBytes) {
-    if (!Environ::Get().GetStoreChecksumEnabled()) {
+    if (!ClientObjectChecksumConfig::IsEnabledAtFirstUse()) {
         GTEST_SKIP() << "MOONCAKE_STORE_CHECKSUM is not enabled";
     }
 
@@ -92,7 +92,7 @@ TEST(ObjectChecksumTest, ClientVerifiesOnlyLogicalObjectBytes) {
 }
 
 TEST(ObjectChecksumTest, BatchPutStopsAfterChecksumPrecomputeFailure) {
-    if (!Environ::Get().GetStoreChecksumEnabled()) {
+    if (!ClientObjectChecksumConfig::IsEnabledAtFirstUse()) {
         GTEST_SKIP() << "MOONCAKE_STORE_CHECKSUM is not enabled";
     }
 
@@ -398,7 +398,7 @@ TEST_F(ClientIntegrationTest, BasicPutGetOperations) {
 }
 
 TEST_F(ClientIntegrationTest, ObjectChecksumRejectsCorruptedObject) {
-    if (!Environ::Get().GetStoreChecksumEnabled()) {
+    if (!ClientObjectChecksumConfig::IsEnabledAtFirstUse()) {
         GTEST_SKIP() << "MOONCAKE_STORE_CHECKSUM is not enabled";
     }
 
@@ -436,7 +436,7 @@ TEST_F(ClientIntegrationTest, ObjectChecksumRejectsCorruptedObject) {
 }
 
 TEST_F(ClientIntegrationTest, BatchPutPreservesObjectChecksumPairing) {
-    if (!Environ::Get().GetStoreChecksumEnabled()) {
+    if (!ClientObjectChecksumConfig::IsEnabledAtFirstUse()) {
         GTEST_SKIP() << "MOONCAKE_STORE_CHECKSUM is not enabled";
     }
 

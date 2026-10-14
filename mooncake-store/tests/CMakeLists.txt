@@ -75,6 +75,8 @@ endif()
 add_subdirectory(master_service)
 
 add_store_test(master_service_test master_service_test.cpp)
+add_store_test(master_metadata_config_test master_metadata_config_test.cpp)
+add_store_test(dfs_enablement_config_test dfs_enablement_config_test.cpp)
 add_store_test(master_service_weight_management_test
                master_service_weight_management_test.cpp)
 add_store_test(master_service_group_test master_service_group_test.cpp)
@@ -137,10 +139,6 @@ add_store_test(offload_on_evict_test offload_on_evict_test.cpp)
 add_store_test(promotion_on_hit_test promotion_on_hit_test.cpp)
 add_store_test(dynamic_replication_test dynamic_replication_test.cpp)
 add_store_test(file_storage_promotion_test file_storage_promotion_test.cpp)
-add_store_test(master_service_ssd_test_for_snapshot
-               ha/snapshot/master_service_ssd_test_for_snapshot.cpp)
-add_store_test(master_service_promotion_test_for_snapshot
-               ha/snapshot/master_service_promotion_test_for_snapshot.cpp)
 if(USE_NOF)
   add_store_test(nof_heartbeat_test nof_heartbeat_test.cpp)
 endif()
@@ -169,6 +167,8 @@ add_store_test(posix_file_test posix_file_test.cpp)
 add_store_test(thread_pool_test thread_pool_test.cpp)
 add_store_test(transfer_task_test transfer_task_test.cpp)
 if(USE_TENT)
+  target_compile_definitions(transfer_task_test PRIVATE USE_TENT)
+  target_link_libraries(transfer_task_test PRIVATE tent)
   add_test(
     NAME transfer_task_tent_completion_test
     COMMAND transfer_task_test
@@ -187,25 +187,37 @@ endif()
 if(USE_CUDA)
   find_package(CUDAToolkit REQUIRED)
   target_compile_definitions(transfer_task_test PRIVATE USE_CUDA)
-  if(USE_TENT)
-    add_test(
-      NAME transfer_scatter_tent_test
-      COMMAND
-        transfer_task_test
-        --gtest_filter=TransferTaskTest.TransferScatterWritesGpuDestinationDirectly
-    )
-    set_tests_properties(transfer_scatter_tent_test PROPERTIES ENVIRONMENT
-                                                               "MC_USE_TENT=1")
-  endif()
+endif()
+if(USE_TENT)
+  add_test(
+    NAME transfer_scatter_tent_test
+    COMMAND
+      transfer_task_test
+      --gtest_filter=TransferTaskTest.TransferScatterHandlesFragmentedCpuBuffers
+  )
+  set_tests_properties(transfer_scatter_tent_test PROPERTIES ENVIRONMENT
+                                                           "MC_USE_TENT=1")
+  add_test(
+    NAME transfer_submitter_scatter_tent_test
+    COMMAND
+      transfer_task_test
+      --gtest_filter=TransferTaskTest.TransferSubmitterScatterUsesTentDataPath
+  )
+  set_tests_properties(transfer_submitter_scatter_tent_test PROPERTIES
+                       ENVIRONMENT "MC_USE_TENT=1")
 endif()
 add_store_test(tenant_quota_test tenant_quota_test.cpp)
+add_store_test(tenant_quota_manager_test tenant_quota_manager_test.cpp)
 add_store_test(tenant_quota_ledger_test tenant_quota_ledger_test.cpp)
 add_store_test(tenant_id_test tenant_id_test.cpp)
 add_store_test(object_entry_test object_entry_test.cpp)
 add_store_test(object_index_test object_index_test.cpp)
+add_store_test(heap_optional_test heap_optional_test.cpp)
 add_store_test(dynamic_replication_lease_table_test
                dynamic_replication_lease_table_test.cpp)
 add_store_test(group_index_test group_index_test.cpp)
+add_store_test(metadata_tenant_test metadata_tenant_test.cpp)
+add_store_test(metadata_tenant_registry_test metadata_tenant_registry_test.cpp)
 add_store_test(segment_test segment_test.cpp)
 add_executable(local_ssd_test local_ssd/local_ssd_test.cpp)
 target_include_directories(local_ssd_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
@@ -219,28 +231,57 @@ add_store_test(offset_allocator_test offset_allocator_test.cpp)
 add_store_test(byte_size_test byte_size_test.cpp)
 add_store_test(network_test network_test.cpp)
 add_store_test(hugepage_config_test hugepage_config_test.cpp)
+add_store_test(shm_spdk_registration_config_test
+               shm_spdk_registration_config_test.cpp)
 add_store_test(hugepage_size_env_test hugepage_size_env_test.cpp)
 add_store_test(random_test random_test.cpp)
 add_store_test(client_buffer_test client_buffer_test.cpp)
 add_store_test(client_auto_port_config_test client_auto_port_config_test.cpp)
 add_store_test(client_auto_discovery_config_test
                client_auto_discovery_config_test.cpp)
+add_store_test(client_object_checksum_config_test
+               client_object_checksum_config_test.cpp)
 add_store_test(cxl_segment_config_test cxl_segment_config_test.cpp)
 add_store_test(client_numa_config_test client_numa_config_test.cpp)
 add_store_test(local_hot_cache_config_test local_hot_cache_config_test.cpp)
 add_store_test(client_local_hot_cache_test client_local_hot_cache_test.cpp)
+add_store_test(real_client_hugepage_register_test real_client_hugepage_register_test.cpp)
+add_store_test(real_client_regular_page_register_test real_client_regular_page_register_test.cpp)
 add_store_test(client_tcp_local_memcpy_test client_tcp_local_memcpy_test.cpp)
 add_store_test(pybind_client_test pybind_client_test.cpp)
+add_store_test(standalone_client_test standalone_client_test.cpp)
+add_store_test(embedded_master_test embedded_master_test.cpp)
+if(USE_TENT)
+  add_test(NAME standalone_client_tent_test
+           COMMAND standalone_client_test --gtest_filter=MetadataModes/*)
+  set_tests_properties(standalone_client_tent_test
+                       PROPERTIES ENVIRONMENT "MC_USE_TENT=1;MC_FORCE_TCP=1")
+endif()
 if(USE_CUDA)
   target_compile_definitions(pybind_client_test PRIVATE MOONCAKE_TEST_CUDA_H2D)
   target_link_libraries(pybind_client_test PRIVATE CUDA::cudart)
+elseif(USE_XPU)
+  # -fsycl already propagates from transfer_engine (TENT platform_xpu).
+  target_compile_definitions(pybind_client_test PRIVATE MOONCAKE_TEST_XPU_H2D)
 endif()
 add_store_test(ipv6_client_test ipv6_client_test.cpp)
 add_store_test(host_port_fix_test host_port_fix_test.cpp)
 add_store_test(client_metrics_test client_metrics_test.cpp)
+if(USE_NOF)
+  add_store_test(nof_metrics_test nof_metrics_test.cpp)
+  target_include_directories(nof_metrics_test PRIVATE ${SPDK_INCLUDE_DIR}
+                                                      ${DPDK_INCLUDE_DIR})
+endif()
 add_store_test(client_host_identity_config_test
                client_host_identity_config_test.cpp)
 add_store_test(client_metric_config_test client_metric_config_test.cpp)
+add_test(
+  NAME client_metric_cluster_id_test
+  COMMAND
+    client_metric_config_test
+    --gtest_filter=ClientMetricClusterIdTest.MergeLabelsUsesConfiguredClusterId)
+set_tests_properties(client_metric_cluster_id_test
+                     PROPERTIES ENVIRONMENT "MC_STORE_CLUSTER_ID=test-cluster")
 add_store_test(ssd_metrics_test ssd_metrics_test.cpp)
 add_store_test(allocator_metric_test allocator_metric_test.cpp)
 add_store_test(serializer_test serializer_test.cpp)
@@ -265,10 +306,6 @@ set_tests_properties(dfs_read_checksum_test
 if(USE_3FS)
   add_store_test(dfs_hf3fs_test dfs_hf3fs_test.cpp)
 endif()
-add_store_test(
-  embedded_snapshot_catalog_store_test
-  ha/snapshot/catalog/backends/embedded/embedded_snapshot_catalog_store_test.cpp
-)
 add_store_test(zstd_util_test zstd_util_test.cpp)
 add_store_test(local_file_snapshot_config_test
                local_file_snapshot_config_test.cpp)
@@ -277,10 +314,6 @@ add_store_test(
   local_file_snapshot_object_store_test
   ha/snapshot/object/backends/local/local_file_snapshot_object_store_test.cpp)
 add_store_test(file_util_test file_util_test.cpp)
-add_store_test(snapshot_child_process_test
-               ha/snapshot/snapshot_child_process_test.cpp)
-add_store_test(master_snapshot_codec_test
-               ha/snapshot/master_snapshot_codec_test.cpp)
 add_ha_test(batch_oplog_snapshot_types_test
             ha/snapshot/batch_oplog/metadata_test.cpp)
 add_ha_test(batch_oplog_snapshot_codec_test
@@ -300,10 +333,9 @@ add_ha_test(batch_oplog_snapshot_promotion_test
             ha/snapshot/batch_oplog/promotion_test.cpp)
 add_ha_test(batch_oplog_snapshot_rebootstrap_test
             ha/snapshot/batch_oplog/rebootstrap_test.cpp)
-add_store_test(master_service_test_for_snapshot
-               ha/snapshot/master_service_test_for_snapshot.cpp)
 add_store_test(non_ha_reconnect_test non_ha_reconnect_test.cpp)
 add_store_test(nvme_kv_connector_config_test nvme_kv/connector_config_test.cpp)
+add_store_test(nvme_kv_executor_config_test nvme_kv/executor_config_test.cpp)
 add_store_test(ha_cluster_namespace_config_test
                ha_cluster_namespace_config_test.cpp)
 add_store_test(redis_connection_config_test redis_connection_config_test.cpp)
@@ -322,6 +354,8 @@ add_store_test(file_storage_test file_storage_test.cpp)
 add_store_test(file_storage_config_test file_storage_config_test.cpp)
 add_store_test(fileread_worker_pool_config_test
                fileread_worker_pool_config_test.cpp)
+add_store_test(nof_worker_pool_config_test nof_worker_pool_config_test.cpp)
+add_store_test(nof_debug_config_test nof_debug_config_test.cpp)
 add_store_test(fileread_worker_pool_test fileread_worker_pool_test.cpp)
 if(MOONCAKE_OSS_ADAPTER_ENABLED)
   target_compile_definitions(file_storage_test PRIVATE HAVE_OSS_ADAPTER)
@@ -361,25 +395,6 @@ if(STORE_USE_REDIS)
     PRIVATE ha/leadership/backends/redis/high_availability_redis_test.cpp)
   target_link_libraries(high_availability_test PRIVATE Mooncake::hiredis)
 
-  add_executable(
-    redis_snapshot_catalog_store_test
-    ha/snapshot/catalog/backends/redis/redis_snapshot_catalog_store_test.cpp)
-  target_include_directories(redis_snapshot_catalog_store_test
-                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-  target_link_libraries(
-    redis_snapshot_catalog_store_test
-    PUBLIC mooncake_store
-           transfer_engine
-           cachelib_memory_allocator
-           ${ETCD_WRAPPER_LIB}
-           glog::glog
-           gflags::gflags
-           ibverbs
-           gtest
-           pthread
-    PRIVATE Mooncake::hiredis)
-  add_test(NAME redis_snapshot_catalog_store_test
-           COMMAND redis_snapshot_catalog_store_test)
 endif()
 if(STORE_USE_K8S_LEASE)
   target_sources(
@@ -409,6 +424,19 @@ add_ha_test(ha_backend_availability_test
 add_ha_test(leader_label_reconciler_test
             ha/leadership/leader_label_reconciler_test.cpp)
 add_ha_test(oplog_batch_storage_test ha/oplog/oplog_batch_storage_test.cpp)
+add_ha_test(redis_ha_kv_backend_test ha/kv/redis_ha_kv_backend_test.cpp)
+if(STORE_USE_REDIS)
+  target_sources(redis_ha_kv_backend_test
+                 PRIVATE ha/kv/redis_oplog_ha_recovery_test.cpp)
+  target_link_libraries(redis_ha_kv_backend_test PRIVATE Mooncake::hiredis)
+  # gtest_main never calls gflags::ParseCommandLineFlags, so --redis_endpoint
+  # would stay empty. This target provides main() instead.
+  get_target_property(_redis_kv_test_libs redis_ha_kv_backend_test
+                      LINK_LIBRARIES)
+  list(REMOVE_ITEM _redis_kv_test_libs gtest_main)
+  set_property(TARGET redis_ha_kv_backend_test PROPERTY LINK_LIBRARIES
+                                                        ${_redis_kv_test_libs})
+endif()
 add_ha_test(oplog_batch_auditor_test ha/oplog/oplog_batch_auditor_test.cpp)
 target_sources(oplog_batch_auditor_test
                PRIVATE ../tools/oplog_batch_auditor.cpp)
@@ -434,8 +462,7 @@ add_ha_test(ha_metric_manager_test ha/standby/ha_metric_manager_test.cpp)
 add_ha_test(hot_standby_service_test ha/standby/hot_standby_service_test.cpp)
 add_ha_test(standby_metadata_store_test
             ha/standby/standby_metadata_store_test.cpp)
-add_ha_test(hot_standby_snapshot_bootstrap_test
-            ha/standby/hot_standby_snapshot_bootstrap_test.cpp)
+add_ha_test(standby_controller_test ha/standby/standby_controller_test.cpp)
 add_ha_test(oplog_applier_test ha/oplog/oplog_applier_test.cpp)
 add_ha_test(oplog_types_test ha/oplog/oplog_types_test.cpp)
 add_ha_test(oplog_batch_codec_test ha/oplog/oplog_batch_codec_test.cpp)
@@ -459,14 +486,6 @@ target_link_libraries(oplog_test_failpoint_test PRIVATE glog::glog gtest
                                                         gtest_main pthread)
 add_test(NAME oplog_test_failpoint_test COMMAND oplog_test_failpoint_test)
 add_ha_test(master_service_ha_test ha/master_service_ha_test.cpp)
-add_ha_test(catalog_backed_snapshot_provider_test
-            ha/snapshot/catalog_backed_snapshot_provider_test.cpp)
-if(STORE_USE_REDIS)
-  foreach(target catalog_backed_snapshot_provider_test
-                 hot_standby_snapshot_bootstrap_test)
-    target_link_libraries(${target} PRIVATE Mooncake::hiredis)
-  endforeach()
-endif()
 
 foreach(
   target

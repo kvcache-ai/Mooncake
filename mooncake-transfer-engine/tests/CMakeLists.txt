@@ -21,8 +21,21 @@ if(USE_TENT)
   # Match the compatibility shim public class definition and enable the
   # MC_USE_TENT regression cases in transport_uint_test.cpp.
   target_compile_definitions(transport_uint_test PRIVATE USE_TENT)
+  add_test(
+    NAME tent_compat_notify_test
+    COMMAND
+      transport_uint_test
+      --gtest_filter=TransferEngineTentCompatibilityTest.NotifyByNamePreservesOpenSegment
+  )
 endif()
 add_test(NAME transport_uint_test COMMAND transport_uint_test)
+
+# Hardware-free checks that updateGlobalConfig() clamps the RD-atomic depths to
+# the device's advertised limits; no RDMA device required.
+add_executable(rdma_atomic_cap_test ${WORKSPACE}/rdma_atomic_cap_test.cpp)
+target_link_libraries(rdma_atomic_cap_test PUBLIC transfer_engine gtest
+                                                  gtest_main)
+add_test(NAME rdma_atomic_cap_test COMMAND rdma_atomic_cap_test)
 
 # Hardware-free tests for FlagCX transport range and descriptor validation.
 add_executable(flagcx_transport_internal_test
@@ -52,6 +65,11 @@ add_executable(rdma_endpoint_state_test
 target_link_libraries(rdma_endpoint_state_test PUBLIC transfer_engine gtest
                                                       gtest_main)
 add_test(NAME rdma_endpoint_state_test COMMAND rdma_endpoint_state_test)
+
+add_executable(rdma_posted_fifo_test ${WORKSPACE}/rdma_posted_fifo_test.cpp)
+target_link_libraries(rdma_posted_fifo_test PUBLIC transfer_engine gtest
+                                                   gtest_main)
+add_test(NAME rdma_posted_fifo_test COMMAND rdma_posted_fifo_test)
 
 # Hardware-free regression tests for peer-rail pausing and the local-WC context
 # breaker. Both are plain per-worker-pool state, so this runs on every CI runner
@@ -131,7 +149,8 @@ target_link_libraries(rdma_endpoint_reestablish_test PUBLIC transfer_engine
 if(UNIX AND NOT APPLE)
   target_link_options(
     rdma_endpoint_reestablish_test PRIVATE "-Wl,--wrap=ibv_modify_qp"
-    "-Wl,--wrap=ibv_query_gid" "-Wl,--wrap=_ibv_query_gid_ex")
+    "-Wl,--wrap=ibv_query_qp" "-Wl,--wrap=ibv_query_gid"
+    "-Wl,--wrap=_ibv_query_gid_ex")
 endif()
 add_test(NAME rdma_endpoint_reestablish_test
          COMMAND rdma_endpoint_reestablish_test)
@@ -231,6 +250,16 @@ add_executable(dmabuf_export_test ${WORKSPACE}/dmabuf_export_test.cpp)
 target_link_libraries(dmabuf_export_test PUBLIC transfer_engine gtest
                                                 gtest_main)
 add_test(NAME dmabuf_export_test COMMAND dmabuf_export_test)
+if(USE_CUDA AND NOT USE_HIP)
+  # GPU sub-range export test (skipped at runtime without a CUDA device).
+  # WITH_NVIDIA_PEERMEM defaults to true, which selects ibv_reg_mr instead of
+  # the DMA-BUF export under test.
+  target_include_directories(dmabuf_export_test
+                             PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+  target_link_libraries(dmabuf_export_test PUBLIC CUDA::cudart)
+  set_tests_properties(dmabuf_export_test PROPERTIES ENVIRONMENT
+                                                     "WITH_NVIDIA_PEERMEM=0")
+endif()
 
 if(USE_MNNVL)
   add_executable(nvlink_transport_test ${WORKSPACE}/nvlink_transport_test.cpp)
@@ -281,6 +310,11 @@ if(USE_EFA)
   target_link_libraries(efa_transport_test PUBLIC transfer_engine gtest
                                                   gtest_main)
   add_test(NAME efa_transport_test COMMAND efa_transport_test)
+
+  add_executable(efa_select_device_test ${WORKSPACE}/efa_select_device_test.cpp)
+  target_link_libraries(efa_select_device_test PUBLIC transfer_engine gtest
+                                                       gtest_main)
+  add_test(NAME efa_select_device_test COMMAND efa_select_device_test)
 
   add_executable(efa_c_api_test ${WORKSPACE}/efa_c_api_test.cpp)
   target_link_libraries(efa_c_api_test PUBLIC transfer_engine gtest gtest_main)
@@ -443,6 +477,12 @@ target_link_libraries(rdma_context_reprobe_test PUBLIC transfer_engine gtest
                                                        gtest_main)
 add_test(NAME rdma_context_reprobe_test COMMAND rdma_context_reprobe_test)
 
+add_executable(rdma_memory_location_test
+               ${WORKSPACE}/rdma_memory_location_test.cpp)
+target_link_libraries(rdma_memory_location_test PUBLIC transfer_engine gtest
+                                                       gtest_main)
+add_test(NAME rdma_memory_location_test COMMAND rdma_memory_location_test)
+
 add_executable(rdma_transport_submit_task_test
                ${WORKSPACE}/rdma_transport_submit_task_test.cpp)
 target_link_libraries(rdma_transport_submit_task_test PUBLIC transfer_engine
@@ -546,3 +586,8 @@ if(USE_NCCL_DEVICE AND NOT USE_CXI)
     endif()
   endif()
 endif()
+
+add_executable(batch_counter_wait_test ${WORKSPACE}/batch_counter_wait_test.cpp)
+target_link_libraries(batch_counter_wait_test PUBLIC transfer_engine gtest
+                                                     gtest_main)
+add_test(NAME batch_counter_wait_test COMMAND batch_counter_wait_test)

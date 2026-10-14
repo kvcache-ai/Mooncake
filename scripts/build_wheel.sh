@@ -25,6 +25,11 @@ rm -rf mooncake-wheel/mooncake_transfer_engine*
 rm -rf mooncake-wheel/build/
 rm -f mooncake-wheel/mooncake/*.so
 
+if [ -d "${BUILD_DIR_ABS}/ep_pg_staging/_pg_jit" ]; then
+    rm -rf mooncake-wheel/mooncake/_pg_jit
+    cp -R "${BUILD_DIR_ABS}/ep_pg_staging/_pg_jit" mooncake-wheel/mooncake/
+fi
+
 echo "Creating directory structure..."
 
 # Copy shared allocator helper used by both CUDA and Ascend pluggable allocators.
@@ -186,6 +191,8 @@ MIGRATED_PYTHON_SOURCE_DIR="python/mooncake"
 MIGRATED_PYTHON_STAGING_DIR="$(pwd)/mooncake-wheel/mooncake"
 MIGRATED_PYTHON_MODULES=(
     mooncake_store_service.py
+    structured_object_store.py
+    _fast_copy.c
     http_metadata_server.py
     _launcher.py
     cli.py
@@ -466,6 +473,7 @@ ${AUDITWHEEL_CMD} repair ${OUTPUT_DIR}/*.whl \
     --exclude libcurl.so* \
     --exclude libfabric.so* \
     --exclude libefa.so* \
+    --exclude libhwloc.so* \
     --exclude libibverbs.so* \
     --exclude libmlx5.so* \
     --exclude libnuma.so* \
@@ -510,6 +518,7 @@ ${AUDITWHEEL_CMD} repair ${OUTPUT_DIR}/*.whl \
     --exclude libmusa.so* \
     --exclude libmusart.so* \
     --exclude libamdhip64.so* \
+    --exclude libgalaxyhip.so* \
     --exclude libhsa-runtime64.so* \
     --exclude librocprofiler-register.so* \
     --exclude libc10.so* \

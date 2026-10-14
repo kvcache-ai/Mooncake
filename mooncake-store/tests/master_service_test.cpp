@@ -26,7 +26,7 @@
 
 #include <unistd.h>
 
-#include "tenant_quota_policy_store.h"
+#include "tenant/quota_policy_store.h"
 #include "types.h"
 #include "master_service_test_fixture.h"
 
@@ -1152,6 +1152,85 @@ TEST_F(MasterServiceTest, TenantScopedRemoveAllSuppressesClearOnRace) {
               MasterServiceTestPeer(service).GetKvClearedPublishedForTesting());
     EXPECT_EQ(
         1u, MasterServiceTestPeer(service).GetKvClearedSuppressedForTesting());
+}
+
+namespace {
+
+StandbyObjectEntry MakeStandbyEntry(const std::string& key, uint64_t obj_size,
+                                    uintptr_t addr,
+                                    const std::string& endpoint) {
+    StandbyObjectEntry entry;
+    entry.tenant_id = TenantId::Default().value();
+    entry.key = key;
+    entry.metadata.client_id = generate_uuid();
+    entry.metadata.size = obj_size;
+    AllocatedBuffer::Descriptor buf;
+    buf.size_ = obj_size;
+    buf.buffer_address_ = addr;
+    buf.transport_endpoint_ = endpoint;
+    Replica::Descriptor desc;
+    desc.id = addr;
+    desc.descriptor_variant = MemoryDescriptor{buf};
+    desc.status = ReplicaStatus::COMPLETE;
+    entry.metadata.replicas.push_back(desc);
+    return entry;
+}
+
+StandbySegmentInfo MakeStandbySegment(const std::string& name,
+                                      const std::string& endpoint,
+                                      uint64_t capacity) {
+    StandbySegmentInfo seg;
+    seg.segment_name = name;
+    seg.transport_endpoint = endpoint;
+    seg.capacity = capacity;
+    seg.is_memory_segment = true;
+    return seg;
+}
+
+}  // namespace
+
+TEST_F(MasterServiceTest, StandbyRestoreSkipsInvalidObjectAndRestoresTheRest) {
+    // #3760: one bad descriptor must not cost the whole index.
+    MasterService service(MakeStrictTenantConfig({"default"}));
+    // Mount the endpoint live: replicas restored onto an unmounted endpoint
+    // stay unreadable until the segment comes back, which is not what this
+    // test checks.
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(service, "ep1");
+    const auto seg = MakeStandbySegment("seg", "ep1", 4096);
+    auto good = MakeStandbyEntry("good_key", 128, 0x1000, "ep1");
+    auto bad = MakeStandbyEntry("bad_key", 128, 0x2000, "ep1");
+    bad.metadata.size = 256;  // descriptor size no longer matches metadata
+
+    auto result = service.RestoreFromStandbySnapshot(
+        {good, bad},
+        /*initial_oplog_sequence_id=*/0, {seg});
+    ASSERT_TRUE(result.has_value());
+    EXPECT_TRUE(
+        service.ExistKey("good_key", TenantId::Default()).value_or(false));
+    EXPECT_FALSE(
+        service.ExistKey("bad_key", TenantId::Default()).value_or(true));
+}
+
+TEST_F(MasterServiceTest, StandbyRestoreDiscardsAmbiguousOverlap) {
+    // #3760: eviction frees and reallocates a buffer; a standby that missed
+    // the removal replays both replicas at the same address. No replay order
+    // reaches the promotion context, so neither side can prove it is newer:
+    // both are discarded, and with nothing restored the restore fails closed.
+    MasterService service(MakeStrictTenantConfig({"default"}));
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(service, "ep1");
+    const auto seg = MakeStandbySegment("seg", "ep1", 4096);
+    auto stale = MakeStandbyEntry("stale_key", 128, 0x1000, "ep1");
+    auto fresh = MakeStandbyEntry("fresh_key", 128, 0x1040, "ep1");
+
+    auto result = service.RestoreFromStandbySnapshot(
+        {stale, fresh},
+        /*initial_oplog_sequence_id=*/0, {seg});
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+    EXPECT_FALSE(
+        service.ExistKey("stale_key", TenantId::Default()).value_or(true));
+    EXPECT_FALSE(
+        service.ExistKey("fresh_key", TenantId::Default()).value_or(false));
 }
 
 TEST_F(MasterServiceTest, StandbySnapshotRestorePreservesTenantScopedKeys) {
@@ -3176,6 +3255,117 @@ TEST_F(MasterServiceTest, DrainJobFailsAfterRetryBudgetExhausted) {
     auto segment_status = service_->QuerySegmentStatus("segment_0");
     ASSERT_TRUE(segment_status.has_value());
     EXPECT_EQ(segment_status.value(), SegmentStatus::OK);
+}
+
+TEST_F(MasterServiceTest, SetSegmentStatusStopsAndRestoresAllocation) {
+    auto service_config =
+        MasterServiceConfig::builder().set_default_kv_lease_ttl(0).build();
+    auto service_ = std::make_unique<MasterService>(service_config);
+
+    const auto ctx0 = PrepareSimpleSegment(*service_, "segment_0", 0x300000000,
+                                           kDefaultSegmentSize);
+    [[maybe_unused]] const auto ctx1 = PrepareSimpleSegment(
+        *service_, "segment_1", 0x400000000, kDefaultSegmentSize);
+
+    auto replica_endpoints = [&](const std::string& key) {
+        std::unordered_set<std::string> endpoints;
+        auto replicas = service_->GetReplicaList(key, TenantId::Default());
+        EXPECT_TRUE(replicas.has_value());
+        if (replicas.has_value()) {
+            for (const auto& replica : replicas->replicas) {
+                endpoints.insert(replica.get_memory_descriptor()
+                                     .buffer_descriptor.transport_endpoint_);
+            }
+        }
+        return endpoints;
+    };
+    auto put_preferring_segment_0 = [&] {
+        return replica_endpoints(
+            PutObjectOnSegment(*service_, ctx0.client_id, "segment_0"));
+    };
+
+    const std::string existing_key =
+        PutObjectOnSegment(*service_, ctx0.client_id, "segment_0");
+
+    ASSERT_TRUE(service_->SetSegmentStatus("segment_0", SegmentStatus::DRAINING)
+                    .has_value());
+    ASSERT_TRUE(service_->SetSegmentStatus("segment_0", SegmentStatus::DRAINING)
+                    .has_value());
+    auto status = service_->QuerySegmentStatus("segment_0");
+    ASSERT_TRUE(status.has_value());
+    EXPECT_EQ(status.value(), SegmentStatus::DRAINING);
+
+    EXPECT_EQ(put_preferring_segment_0(),
+              std::unordered_set<std::string>{"segment_1"});
+    EXPECT_EQ(replica_endpoints(existing_key),
+              std::unordered_set<std::string>{"segment_0"});
+
+    ASSERT_TRUE(
+        service_->SetSegmentStatus("segment_0", SegmentStatus::OK).has_value());
+    status = service_->QuerySegmentStatus("segment_0");
+    ASSERT_TRUE(status.has_value());
+    EXPECT_EQ(status.value(), SegmentStatus::OK);
+
+    EXPECT_EQ(put_preferring_segment_0(),
+              std::unordered_set<std::string>{"segment_0"});
+}
+
+TEST_F(MasterServiceTest, SetSegmentStatusRejectsOtherTargetStatuses) {
+    auto service_ = std::make_unique<MasterService>();
+    [[maybe_unused]] const auto ctx0 = PrepareSimpleSegment(
+        *service_, "segment_0", 0x300000000, kDefaultSegmentSize);
+
+    for (auto target :
+         {SegmentStatus::UNDEFINED, SegmentStatus::DRAINED,
+          SegmentStatus::GRACEFULLY_UNMOUNTING, SegmentStatus::UNMOUNTING}) {
+        auto result = service_->SetSegmentStatus("segment_0", target);
+        ASSERT_FALSE(result.has_value());
+        EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+    }
+
+    auto status = service_->QuerySegmentStatus("segment_0");
+    ASSERT_TRUE(status.has_value());
+    EXPECT_EQ(status.value(), SegmentStatus::OK);
+}
+
+TEST_F(MasterServiceTest, SetSegmentStatusRejectsUnknownSegment) {
+    auto service_ = std::make_unique<MasterService>();
+
+    auto result =
+        service_->SetSegmentStatus("no_such_segment", SegmentStatus::DRAINING);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::SEGMENT_NOT_FOUND);
+}
+
+TEST_F(MasterServiceTest, SetSegmentStatusRejectsSegmentUnderDrainJob) {
+    auto service_config =
+        MasterServiceConfig::builder().set_default_kv_lease_ttl(0).build();
+    auto service_ = std::make_unique<MasterService>(service_config);
+
+    const auto ctx0 = PrepareSimpleSegment(*service_, "segment_0", 0x300000000,
+                                           kDefaultSegmentSize);
+    [[maybe_unused]] const auto ctx1 = PrepareSimpleSegment(
+        *service_, "segment_1", 0x400000000, kDefaultSegmentSize);
+
+    // The object keeps the job unfinished because no one runs its move task.
+    PutObjectOnSegment(*service_, ctx0.client_id, "segment_0");
+
+    CreateDrainJobRequest request;
+    request.segments = {"segment_0"};
+    request.target_segments = {"segment_1"};
+    request.max_concurrency = 1;
+    auto job_id = service_->CreateDrainJob(request);
+    ASSERT_TRUE(job_id.has_value());
+
+    for (auto target : {SegmentStatus::OK, SegmentStatus::DRAINING}) {
+        auto result = service_->SetSegmentStatus("segment_0", target);
+        ASSERT_FALSE(result.has_value());
+        EXPECT_EQ(result.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+
+    auto status = service_->QuerySegmentStatus("segment_0");
+    ASSERT_TRUE(status.has_value());
+    EXPECT_EQ(status.value(), SegmentStatus::DRAINING);
 }
 
 // ===================== Client Offboarding Tests =====================

@@ -18,7 +18,7 @@
 #include <unistd.h>
 
 #include "client_service.h"
-#include "environ.h"
+#include "../src/config/client_object_checksum_config.h"
 #include "storage/distributed/shard_allocator.h"
 #include "storage/distributed/distributed_storage_backend.h"
 #include "storage/distributed/posix_fs_adapter.h"
@@ -36,7 +36,13 @@ class FailingPosixFsAdapter : public PosixFsAdapter {
                                             int iovcnt,
                                             int64_t offset) override {
         const int call = ++write_calls_;
-        if (call == fail_write_call_.load()) {
+        const int fail = fail_write_call_.load();
+        // Model a genuine, non-recoverable write failure: once the armed call
+        // is reached, keep failing. The backend retries POSIX write failures
+        // once after an fd reopen (SupportsFdReopen), so a single-call failure
+        // would be masked by the retry; a persistent failure correctly
+        // surfaces to the caller.
+        if (fail > 0 && call >= fail) {
             return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
         }
         return PosixFsAdapter::WriteAt(fd, iov, iovcnt, offset);
@@ -392,7 +398,7 @@ TEST_F(DfsSyncClientTest, BatchGetUsesExplicitDfsDescriptors) {
 }
 
 TEST_F(DfsSyncClientTest, BatchGetVerifiesDfsChecksum) {
-    if (!Environ::Get().GetStoreChecksumEnabled()) {
+    if (!ClientObjectChecksumConfig::IsEnabledAtFirstUse()) {
         GTEST_SKIP() << "MOONCAKE_STORE_CHECKSUM is not enabled";
     }
 
@@ -420,7 +426,7 @@ TEST_F(DfsSyncClientTest, BatchGetVerifiesDfsChecksum) {
 }
 
 TEST_F(DfsSyncClientTest, GetVerifiesDfsChecksumAndRecordsError) {
-    if (!Environ::Get().GetStoreChecksumEnabled()) {
+    if (!ClientObjectChecksumConfig::IsEnabledAtFirstUse()) {
         GTEST_SKIP() << "MOONCAKE_STORE_CHECKSUM is not enabled";
     }
     auto* metric = writer_->GetDfsMetricPtr();

@@ -413,31 +413,26 @@ def _unregister_owned_allocations(
 ) -> None:
     ordered = tuple(reversed(owned))
     failures: list[tuple[int, Union[str, int]]] = []
-    for index, address in enumerate(ordered):
-        try:
+    unresolved = set(ordered)
+    try:
+        for address in ordered:
             result = engine.unregister_memory(address)
-        except BaseException as error:
-            unresolved = tuple(
-                dict.fromkeys(
-                    (
-                        *[failed_address for failed_address, _ in failures],
-                        *ordered[index:],
-                    )
-                )
-            )
-            _quarantine_unknown_registration_cleanup(
-                pending_owner,
-                label=label,
-                operation="unregister_memory",
-                registrations=unresolved,
-                error=error,
-                primary_error=primary_error,
-                body_entered=body_entered,
-                resources=resources,
-                lifetime_tokens=lifetime_tokens,
-            )
-        if result != 0:
-            failures.append((address, result))
+            if result != 0:
+                failures.append((address, result))
+            else:
+                unresolved.remove(address)
+    except BaseException as error:
+        _quarantine_unknown_registration_cleanup(
+            pending_owner,
+            label=label,
+            operation="unregister_memory",
+            registrations=tuple(sorted(unresolved, reverse=True)),
+            error=error,
+            primary_error=primary_error,
+            body_entered=body_entered,
+            resources=resources,
+            lifetime_tokens=lifetime_tokens,
+        )
     if failures:
         _raise_pending_registration_cleanup(
             pending_owner,

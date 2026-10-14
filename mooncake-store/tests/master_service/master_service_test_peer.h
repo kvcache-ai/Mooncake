@@ -19,7 +19,6 @@ class MasterServiceTestPeer {
     using GroupDomainAccessorRW = MasterService::GroupDomainAccessorRW;
     using MetadataAccessorRO = MasterService::MetadataAccessorRO;
     using MetadataAccessorRW = MasterService::MetadataAccessorRW;
-    using MetadataSerializer = MasterService::MetadataSerializer;
     using MetadataShard = MasterService::MetadataShard;
     using MetadataShardAccessorRO = MasterService::MetadataShardAccessorRO;
     using MetadataShardAccessorRW = MasterService::MetadataShardAccessorRW;
@@ -238,32 +237,11 @@ class MasterServiceTestPeer {
         return service.segment_manager_;
     }
 
-    static auto& SnapshotCatalogStore(MasterService& service) {
-        return service.snapshot_catalog_store_;
+    static auto& MasterStateMutex(MasterService& service) {
+        return service.master_state_mutex_;
     }
-    static const auto& SnapshotCatalogStore(const MasterService& service) {
-        return service.snapshot_catalog_store_;
-    }
-
-    static auto& SnapshotManager(MasterService& service) {
-        return service.snapshot_manager_;
-    }
-    static const auto& SnapshotManager(const MasterService& service) {
-        return service.snapshot_manager_;
-    }
-
-    static auto& SnapshotMutex(MasterService& service) {
-        return service.snapshot_mutex_;
-    }
-    static const auto& SnapshotMutex(const MasterService& service) {
-        return service.snapshot_mutex_;
-    }
-
-    static auto& SnapshotObjectStore(MasterService& service) {
-        return service.snapshot_object_store_;
-    }
-    static const auto& SnapshotObjectStore(const MasterService& service) {
-        return service.snapshot_object_store_;
+    static const auto& MasterStateMutex(const MasterService& service) {
+        return service.master_state_mutex_;
     }
 
     static auto& SoftPinDeadlineIndex(MasterService& service) {
@@ -281,31 +259,31 @@ class MasterServiceTestPeer {
     }
 
     static auto& TenantQuotaPolicyMutex(MasterService& service) {
-        return service.tenant_quota_policy_mutex_;
+        return service.tenant_quota_manager_.policy_mutex_;
     }
     static const auto& TenantQuotaPolicyMutex(const MasterService& service) {
-        return service.tenant_quota_policy_mutex_;
+        return service.tenant_quota_manager_.policy_mutex_;
     }
 
     static auto& TenantQuotaPolicyStore(MasterService& service) {
-        return service.tenant_quota_policy_store_;
+        return service.tenant_quota_manager_.policy_store_;
     }
     static const auto& TenantQuotaPolicyStore(const MasterService& service) {
-        return service.tenant_quota_policy_store_;
+        return service.tenant_quota_manager_.policy_store_;
     }
 
     static auto& TenantQuotaRecomputeMutex(MasterService& service) {
-        return service.tenant_quota_recompute_mutex_;
+        return service.tenant_quota_manager_.recompute_mutex_;
     }
     static const auto& TenantQuotaRecomputeMutex(const MasterService& service) {
-        return service.tenant_quota_recompute_mutex_;
+        return service.tenant_quota_manager_.recompute_mutex_;
     }
 
     static auto& TenantQuotaTable(MasterService& service) {
-        return service.tenant_quota_table_;
+        return service.tenant_quota_manager_.table_;
     }
     static const auto& TenantQuotaTable(const MasterService& service) {
-        return service.tenant_quota_table_;
+        return service.tenant_quota_manager_.table_;
     }
 
     static auto& WeightMetadata(MasterService& service) {
@@ -366,9 +344,6 @@ class MasterServiceTestPeer {
         const std::unordered_set<UUID, boost::hash<UUID>>& retaining_clients) {
         service_.ClearInvalidHandles(retaining_clients);
     }
-
-    std::unique_ptr<ha::SnapshotCatalogStore> CreateSnapshotCatalogStore(
-        const MasterServiceConfig& config);
 
     void DiscardExpiredProcessingReplicas(
         MetadataShardAccessorRW& shard,
@@ -447,7 +422,7 @@ class MasterServiceTestPeer {
     }
 
     void LoadTenantQuotaPoliciesFromStoreOrThrow() {
-        service_.LoadTenantQuotaPoliciesFromStoreOrThrow();
+        service_.tenant_quota_manager_.LoadPoliciesOrThrow();
     }
 
     ObjectIdentity MakeObjectIdentityForRequest(

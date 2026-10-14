@@ -155,6 +155,9 @@ if(WITH_STORE)
     store/engram_store_py.cpp
     integration_utils.h)
   set_target_properties(store PROPERTIES INSTALL_RPATH "$ORIGIN")
+  if(USE_TENT)
+    target_link_libraries(store PRIVATE tent)
+  endif()
   if(USE_ASCEND_DIRECT)
     target_link_libraries(
       store PUBLIC ascendcl transfer_engine glog::glog gflags::gflags
@@ -164,6 +167,14 @@ if(WITH_STORE)
       store PUBLIC transfer_engine glog::glog gflags::gflags mooncake_store
                    cachelib_memory_allocator)
   endif()
+endif()
+
+if(WITH_CONDUCTOR)
+  pybind11_add_module(_conductor conductor/conductor_py.cpp)
+  set_target_properties(_conductor PROPERTIES INSTALL_RPATH "$ORIGIN")
+  target_link_libraries(_conductor PRIVATE conductor_cpp_core glog::glog)
+  install(TARGETS _conductor LIBRARY DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR}
+                                     COMPONENT python)
 endif()
 
 if(NOT SKBUILD)
@@ -204,6 +215,11 @@ endif()
 
 install(
   FILES "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/async_store.py"
+  DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR}
+  COMPONENT python)
+
+install(
+  FILES "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/conductor.py"
   DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR}
   COMPONENT python)
 
@@ -262,17 +278,21 @@ if(WITH_STORE)
                                 COMPONENT python)
 endif()
 
+if(WITH_TE OR WITH_CONDUCTOR)
+  install(TARGETS asio_shared LIBRARY DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR}
+                                      COMPONENT python)
+endif()
+
 if(WITH_TE)
-  install(TARGETS engine asio_shared
-          LIBRARY DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR} COMPONENT python)
+  install(TARGETS engine LIBRARY DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR}
+                                 COMPONENT python)
   # Co-locate libtent_metrics.so with the python C extensions so engine.so and
-  # store.so resolve it via $ORIGIN RPATH. The shared TentMetrics singleton
-  # must be loadable wherever the extensions are installed; otherwise
-  # `import mooncake.engine` / `mooncake.store` fails with a missing library.
+  # store.so resolve it via $ORIGIN RPATH. The shared TentMetrics singleton must
+  # be loadable wherever the extensions are installed; otherwise `import
+  # mooncake.engine` / `mooncake.store` fails with a missing library.
   if(TARGET tent_metrics)
     install(TARGETS tent_metrics
-            LIBRARY DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR}
-            COMPONENT python)
+            LIBRARY DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR} COMPONENT python)
   endif()
 endif()
 

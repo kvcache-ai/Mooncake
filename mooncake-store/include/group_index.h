@@ -2,6 +2,7 @@
 
 #include <array>
 #include <atomic>
+#include <cassert>
 #include <cstddef>
 #include <memory>
 #include <mutex>
@@ -30,6 +31,10 @@ namespace mooncake {
 // a map plus a lock and every tenant holds one table, so the count trades
 // tenant memory for write concurrency and is a template parameter rather than
 // a constant.
+//
+// Membership is a set of member keys. Which publication a member belongs to is
+// settled by the caller (see Tenant::RemoveObject) before a membership is
+// dropped, so this table keeps no identity of its own.
 template <size_t StripeCount>
 class StripedGroupIndex {
    public:
@@ -59,6 +64,9 @@ class StripedGroupIndex {
         return it->second.lease;
     }
 
+    // Drops a membership. The caller has already established that the member
+    // it is unwinding is the one the route publishes, so a teardown of an older
+    // object of the same key never reaches this call.
     [[nodiscard]] bool RemoveMember(std::string_view group_id,
                                     std::string_view member_key) {
         auto& stripe = StripeFor(group_id);
@@ -89,7 +97,12 @@ class StripedGroupIndex {
         if (it == stripe.groups.end()) {
             return {};
         }
-        return {it->second.member_keys.begin(), it->second.member_keys.end()};
+        std::vector<std::string> members;
+        members.reserve(it->second.member_keys.size());
+        for (const auto& member : it->second.member_keys) {
+            members.push_back(member);
+        }
+        return members;
     }
 
     // Materialized groups, counted as they are created and dropped, so this
@@ -133,8 +146,15 @@ class StripedGroupIndex {
     std::atomic<size_t> group_count_{0};
 };
 
-// 64 stripes: the shipped default. A grouping-heavy workload can raise it by
-// instantiating the template with a larger count.
+// 64 stripes: the shipped default. Striping trades per-tenant memory for write
+// concurrency, a stripe costing ~120 bytes: 7.7 kB per tenant here against
+// 30.7 kB at 256. One stripe serializes a tenant's grouped writes: with 16
+// writer threads on an 8-core, 16-thread host, 64 stripes sustain about 18x the
+// member writes per second of one stripe, and each doubling past 64 buys less,
+// about half again at 128 and a third again at 256.
+// A grouping-heavy workload can raise the count by instantiating the template
+// with a larger one. Measurements are in
+// benchmarks/group_index_contention_bench.cpp.
 using GroupIndex = StripedGroupIndex<64>;
 
 }  // namespace mooncake

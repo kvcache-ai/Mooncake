@@ -49,13 +49,19 @@ class QueryResult {
     const std::chrono::steady_clock::time_point lease_timeout;
     /** @brief Optional full-object checksum */
     const std::optional<uint64_t> object_checksum;
+    /** @brief Tenant scope the master resolved the query to, when the master
+     * reports it; readers forward it to disk-replica verify requests */
+    const std::optional<std::string> resolved_tenant_id;
 
-    QueryResult(std::vector<Replica::Descriptor>&& replicas_param,
-                std::chrono::steady_clock::time_point lease_timeout_param,
-                std::optional<uint64_t> object_checksum_param = std::nullopt)
+    QueryResult(
+        std::vector<Replica::Descriptor>&& replicas_param,
+        std::chrono::steady_clock::time_point lease_timeout_param,
+        std::optional<uint64_t> object_checksum_param = std::nullopt,
+        std::optional<std::string> resolved_tenant_id_param = std::nullopt)
         : replicas(std::move(replicas_param)),
           lease_timeout(lease_timeout_param),
-          object_checksum(object_checksum_param) {}
+          object_checksum(object_checksum_param),
+          resolved_tenant_id(std::move(resolved_tenant_id_param)) {}
 
     bool IsLeaseExpired() const {
         return std::chrono::steady_clock::now() >= lease_timeout;
@@ -197,7 +203,12 @@ class Client {
                                       std::vector<Slice>& slices,
                                       uint64_t src_offset);
     std::optional<TransferEngine::ScatterTransferOperation> SubmitScatter(
-        const std::vector<TransferEngine::ScatterTransferRange>& transfers);
+        const std::vector<TransferEngine::ScatterTransferRange>& transfers,
+        TransferIntent intent = TransferIntent::kUnspecified);
+
+    std::optional<StoreScatterTransferOperation> SubmitScatterNative(
+        const std::vector<TransferEngine::ScatterTransferRange>& transfers,
+        TransferIntent intent = TransferIntent::kUnspecified);
 
     /**
      * @brief Transfers data using pre-queried object information
@@ -251,10 +262,28 @@ class Client {
      * entries are issued as one scatter transfer so the transport can coalesce
      * everything bound for the same segment, then awaited together. Requires
      * memory replicas. Returns per-entry total bytes transferred or an
-     * ErrorCode. Used by RealClient get sessions. No Master RPC.
+     * ErrorCode. Used by session get. No Master RPC.
      */
     std::vector<tl::expected<int64_t, ErrorCode>> BatchTransferReadRanges(
         const std::vector<Replica::Descriptor>& replicas,
+        const std::vector<std::vector<Slice>>& slices,
+        const std::vector<std::vector<uint64_t>>& src_offsets,
+        TransferIntent intent = TransferIntent::kUnspecified);
+
+    /**
+     * @brief Batch ranged read from restored LOCAL_DISK arenas.
+     *
+     * Counterpart of BatchTransferReadRanges the same way BatchGetOffloadObject
+     * is the counterpart of BatchGet: one transfer_engine_addr for the batch,
+     * plus a restore pointer and object size per entry. Fragments use
+     * src_offsets into that restored object. Used by session get after RPC
+     * restore into the owner's TE-registered client buffer. No Master RPC.
+     */
+    std::vector<tl::expected<int64_t, ErrorCode>>
+    BatchTransferReadOffloadRanges(
+        const std::string& transfer_engine_addr,
+        const std::vector<uint64_t>& remote_bases,
+        const std::vector<size_t>& remote_sizes,
         const std::vector<std::vector<Slice>>& slices,
         const std::vector<std::vector<uint64_t>>& src_offsets);
 
@@ -263,12 +292,13 @@ class Client {
      * from all entries and all memory replicas are issued as one scatter
      * transfer, then awaited together. Returns per-entry logical bytes
      * transferred (counted once, not per replica) or an ErrorCode. Used by
-     * RealClient put sessions.
+     * session put.
      */
     std::vector<tl::expected<int64_t, ErrorCode>> BatchTransferWriteRanges(
         const std::vector<std::vector<Replica::Descriptor>>& replicas_per_entry,
         const std::vector<std::vector<Slice>>& slices,
-        const std::vector<std::vector<uint64_t>>& dst_offsets);
+        const std::vector<std::vector<uint64_t>>& dst_offsets,
+        TransferIntent intent = TransferIntent::kUnspecified);
 
     /**
      * @brief Upserts data: inserts if key doesn't exist, updates if it does
@@ -341,6 +371,13 @@ class Client {
     tl::expected<void, ErrorCode> EvictDiskReplica(const std::string& key,
                                                    const std::string& tenant_id,
                                                    ReplicaType replica_type);
+
+    // Conditional variant: the master evicts only when its current record is
+    // still the replica the caller failed on. See MasterClient for the
+    // mixed-version behavior.
+    tl::expected<bool, ErrorCode> EvictDiskReplicaIfCurrent(
+        const std::string& key, const std::string& tenant_id,
+        ReplicaType replica_type, ReplicaID expected_replica_id);
 
     std::vector<tl::expected<void, ErrorCode>> BatchEvictDiskReplica(
         const std::vector<std::string>& keys, ReplicaType replica_type);
@@ -593,7 +630,8 @@ class Client {
         const std::vector<std::string>& keys,
         const std::vector<uintptr_t>& pointers,
         const std::unordered_map<std::string, std::vector<Slice>>& batch_slices,
-        OffloadBufferAccess buffer_access);
+        OffloadBufferAccess buffer_access,
+        TransferIntent intent = TransferIntent::kForegroundGet);
 
     /**
      * @brief Notifies the master that offloading of specified objects has
@@ -781,6 +819,32 @@ class Client {
         const std::vector<std::string>& keys,
         ReplicaType replica_type = ReplicaType::ALL);
 
+    // What the dangling-replica probe established for one key. The Put path
+    // retries only on kEvicted; the batch-get path also retries on kPresent,
+    // because a batch read dies wholesale and a healthy key swept in by a
+    // sibling's wiped file must be re-read, not just left unevicted.
+    enum class DiskReplicaHealResult {
+        // Not a lone client-owned LOCAL_DISK replica; nothing to heal.
+        kNotDangling,
+        // The probe could not answer (transport/config trouble); leave
+        // everything as it was.
+        kUnknown,
+        // The backing file provably exists; nothing was evicted.
+        kPresent,
+        // The backing file is proven gone and the dangling replica was
+        // evicted, so the operation can be retried.
+        kEvicted,
+    };
+
+    // When PutStart reports OBJECT_ALREADY_EXISTS, check whether every
+    // completed replica is a LOCAL_DISK replica owned by this client, and ask
+    // the installed probe (FileStorage::Exists over the offload files) whether
+    // the backing file is gone (issue #3709). Only then evict the dangling
+    // replica so the Put can be retried; any other outcome keeps the old
+    // idempotent path. The batch-get path uses the same heal after a failed
+    // SSD read (#3884).
+    DiskReplicaHealResult healDanglingLocalDiskReplica(const ObjectKey& key);
+
    protected:
     /**
      * @brief Constructor exposed to subclasses for testing only; production
@@ -807,13 +871,6 @@ class Client {
      * @brief Internal helper functions for initialization and data transfer
      */
     ErrorCode ConnectToMaster(const std::string& master_server_entry);
-    // When PutStart reports OBJECT_ALREADY_EXISTS, check whether every
-    // completed replica is a LOCAL_DISK replica owned by this client, and ask
-    // the installed probe (FileStorage::Exists over the offload files) whether
-    // the backing file is gone (issue #3709). Only then evict the dangling
-    // replica so the Put can be retried; any other outcome keeps the old
-    // idempotent path. Returns true only when a replica was actually evicted.
-    bool healDanglingLocalDiskReplica(const ObjectKey& key);
     // The BatchPutStart counterpart: heals the OBJECT_ALREADY_EXISTS subset
     // with one batched replica-list query and one batched evict, then retries
     // PutStart for just the evicted keys and splices the responses back, so a
@@ -832,9 +889,10 @@ class Client {
         const std::string& metadata_connstring, const std::string& protocol,
         const std::optional<std::string>& device_names);
     void InitTransferSubmitter();
-    ErrorCode TransferData(const Replica::Descriptor& replica_descriptor,
-                           std::vector<Slice>& slices,
-                           TransferRequest::OpCode op_code);
+    ErrorCode TransferData(
+        const Replica::Descriptor& replica_descriptor,
+        std::vector<Slice>& slices, TransferRequest::OpCode op_code,
+        TransferIntent intent = TransferIntent::kUnspecified);
     ErrorCode TransferReadInternal(
         const Replica::Descriptor& replica_descriptor,
         std::vector<Slice>& slices, uint64_t src_offset);
@@ -847,10 +905,14 @@ class Client {
     std::optional<TransferFuture> SubmitRangeWrite(
         const Replica::Descriptor& replica_descriptor,
         std::vector<Slice>& slices, uint64_t dst_offset);
-    ErrorCode TransferWrite(const Replica::Descriptor& replica_descriptor,
-                            std::vector<Slice>& slices);
-    ErrorCode TransferRead(const Replica::Descriptor& replica_descriptor,
-                           std::vector<Slice>& slices);
+    ErrorCode TransferWrite(
+        const Replica::Descriptor& replica_descriptor,
+        std::vector<Slice>& slices,
+        TransferIntent intent = TransferIntent::kUnspecified);
+    ErrorCode TransferRead(
+        const Replica::Descriptor& replica_descriptor,
+        std::vector<Slice>& slices,
+        TransferIntent intent = TransferIntent::kUnspecified);
     ErrorCode TransferReadRange(const Replica::Descriptor& replica_descriptor,
                                 std::vector<Slice>& slices,
                                 uint64_t src_offset);

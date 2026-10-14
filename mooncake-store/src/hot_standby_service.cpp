@@ -6,10 +6,7 @@
 #include <chrono>
 #include <thread>
 
-#include "etcd_helper.h"
-#ifdef STORE_USE_ETCD
-#include "ha/kv/etcd_ha_kv_backend.h"
-#endif
+#include "ha/kv/ha_kv_backend_factory.h"
 #include "ha_metric_manager.h"
 #include "ha/oplog/oplog_applier.h"
 #include "ha/oplog/oplog_batch_standby_reader.h"
@@ -118,21 +115,24 @@ ErrorCode HotStandbyService::Start(const std::string& primary_address,
         // Injected test backends exercise the production Start/replication
         // path without a live etcd cluster (and without STORE_USE_ETCD).
         if (!catch_up_batch_kv_backend_for_testing_) {
-#ifdef STORE_USE_ETCD
-            ErrorCode err =
-                EtcdHelper::ConnectToEtcdStoreClient(oplog_endpoints.c_str());
-            if (err != ErrorCode::OK) {
-                LOG(ERROR) << "Failed to connect to etcd: " << oplog_endpoints;
+            ha::HABackendSpec spec;
+            spec.type = oplog_backend_type_;
+            spec.connstring = oplog_endpoints;
+            spec.cluster_namespace = cluster_id;
+            auto backend = CreateHaKvBackend(spec);
+            if (!backend) {
+                if (backend.error() == ErrorCode::UNAVAILABLE_IN_CURRENT_MODE) {
+                    state_machine_.ProcessEvent(StandbyEvent::FATAL_ERROR);
+                    LOG(ERROR) << "Batch-record OpLog backend is not compiled "
+                                  "in";
+                    return ErrorCode::INTERNAL_ERROR;
+                }
+                LOG(ERROR) << "Failed to open OpLog backend: "
+                           << toString(backend.error());
                 state_machine_.ProcessEvent(StandbyEvent::CONNECTION_FAILED);
-                return err;
+                return backend.error();
             }
-#else
-            // Without STORE_USE_ETCD, the following loop needs an injected
-            // test backend.
-            state_machine_.ProcessEvent(StandbyEvent::FATAL_ERROR);
-            LOG(ERROR) << "Batch-record OpLog requires STORE_USE_ETCD";
-            return ErrorCode::INTERNAL_ERROR;
-#endif
+            batch_standby_kv_backend_ = std::move(backend.value());
         }
     }
 
@@ -181,21 +181,6 @@ ErrorCode HotStandbyService::PrepareBootstrapBaselineLocked(
     if (batch_oplog_snapshot_provider_ && config_.enable_snapshot_bootstrap) {
         return LoadBatchOpLogSnapshotBaselineLocked(baseline_seq_id);
     }
-    if (!config_.enable_oplog_following) {
-        if (metadata_store_ && metadata_store_->GetKeyCount() > 0) {
-            LOG(INFO) << "Snapshot-only restart discards local metadata and "
-                         "reloads the latest catalog snapshot";
-        }
-
-        auto snapshot_err = LoadSnapshotBaselineLocked(baseline_seq_id);
-        if (snapshot_err != ErrorCode::OK) {
-            return snapshot_err;
-        }
-        applied_seq_id_.store(baseline_seq_id, std::memory_order_release);
-        primary_seq_id_.store(baseline_seq_id, std::memory_order_release);
-        return ErrorCode::OK;
-    }
-
     if (has_recoverable_local_state) {
         LOG(INFO) << "Standby warm start: reuse local metadata (keys="
                   << metadata_store_->GetKeyCount()
@@ -219,61 +204,6 @@ ErrorCode HotStandbyService::LoadSnapshotBaselineLocked(
     baseline_seq_id = 0;
     metadata_store_->Clear();
     oplog_applier_->Recover(0);
-
-    if (!config_.enable_snapshot_bootstrap || !snapshot_provider_) {
-        return ErrorCode::OK;
-    }
-
-    auto snapshot_result = snapshot_provider_->LoadLatestSnapshot(cluster_id_);
-    if (!snapshot_result) {
-        if (config_.enable_oplog_following) {
-            LOG(WARNING) << "Failed to load snapshot baseline, falling back "
-                            "to OpLog-only bootstrap: "
-                         << toString(snapshot_result.error());
-            return ErrorCode::OK;
-        }
-        LOG(ERROR) << "Failed to load snapshot baseline for snapshot-only "
-                   << "standby bootstrap: "
-                   << toString(snapshot_result.error());
-        return snapshot_result.error();
-    }
-
-    if (!snapshot_result->has_value()) {
-        if (config_.enable_oplog_following) {
-            LOG(INFO) << "No snapshot available, falling back to OpLog-only "
-                         "bootstrap";
-        } else {
-            LOG(INFO) << "No snapshot available for snapshot-only bootstrap; "
-                         "standby starts from empty baseline";
-        }
-        return ErrorCode::OK;
-    }
-
-    const auto& snapshot = snapshot_result->value();
-    LOG(INFO) << "Loaded snapshot baseline: snapshot_id="
-              << snapshot.snapshot_id
-              << ", snapshot_seq_id=" << snapshot.snapshot_sequence_id
-              << ", keys=" << snapshot.metadata.size();
-    for (const auto& entry : snapshot.metadata) {
-        if (!metadata_store_->RestoreMetadata(entry.tenant_id, entry.key,
-                                              entry.metadata)) {
-            LOG(ERROR) << "Snapshot baseline contains duplicate object: tenant="
-                       << entry.tenant_id << ", key=" << entry.key;
-            metadata_store_->Clear();
-            return ErrorCode::DESERIALIZE_FAIL;
-        }
-    }
-    if (!metadata_store_->RestoreWeightMetadata(snapshot.weight_metadata)) {
-        LOG(ERROR) << "Snapshot baseline contains invalid weight metadata";
-        metadata_store_->Clear();
-        return ErrorCode::DESERIALIZE_FAIL;
-    }
-    // Load segment registry from snapshot
-    if (oplog_applier_) {
-        oplog_applier_->LoadSegmentRegistry(snapshot.segments);
-    }
-    oplog_applier_->Recover(snapshot.snapshot_sequence_id);
-    baseline_seq_id = snapshot.snapshot_sequence_id;
     return ErrorCode::OK;
 }
 
@@ -315,14 +245,10 @@ ErrorCode HotStandbyService::StartOplogFollowingLocked(
     (void)baseline_seq_id;
     if (catch_up_batch_kv_backend_for_testing_) {
         batch_standby_kv_backend_ = catch_up_batch_kv_backend_for_testing_;
-    } else {
-#ifdef STORE_USE_ETCD
-        batch_standby_kv_backend_ = std::make_shared<EtcdHaKvBackend>();
-#else
+    } else if (!batch_standby_kv_backend_) {
         state_machine_.ProcessEvent(StandbyEvent::FATAL_ERROR);
-        LOG(ERROR) << "Batch-record OpLog requires STORE_USE_ETCD";
+        LOG(ERROR) << "Batch-record OpLog backend was not opened";
         return ErrorCode::INTERNAL_ERROR;
-#endif
     }
     batch_standby_reader_ = std::make_unique<OpLogBatchStandbyReader>(
         cluster_id_, *batch_standby_kv_backend_, *oplog_applier_);
@@ -381,6 +307,10 @@ void HotStandbyService::NotifySyncStatus() {
 void HotStandbyService::SetCatchUpBatchKvBackendForTesting(
     std::shared_ptr<HaKvBackend> backend) {
     catch_up_batch_kv_backend_for_testing_ = std::move(backend);
+}
+
+void HotStandbyService::SetOpLogBackendType(ha::HABackendType type) {
+    oplog_backend_type_ = type;
 }
 
 void HotStandbyService::StopReplicationLoop() {
@@ -542,14 +472,24 @@ ErrorCode HotStandbyService::FinalCatchUpForPromotionLocked(
         return FinalCatchUpBatchRecordsLocked(
             *catch_up_batch_kv_backend_for_testing_, policy);
     }
+    if (batch_standby_kv_backend_) {
+        return FinalCatchUpBatchRecordsLocked(*batch_standby_kv_backend_,
+                                              policy);
+    }
 
-#ifdef STORE_USE_ETCD
-    EtcdHaKvBackend batch_backend;
-    return FinalCatchUpBatchRecordsLocked(batch_backend, policy);
-#else
-    LOG(ERROR) << "Final OpLog catch-up requires STORE_USE_ETCD";
-    return ErrorCode::INTERNAL_ERROR;
-#endif
+    ha::HABackendSpec spec;
+    spec.type = oplog_backend_type_;
+    spec.connstring = oplog_endpoints_;
+    spec.cluster_namespace = cluster_id_;
+    auto backend = CreateHaKvBackend(spec);
+    if (!backend) {
+        LOG(ERROR) << "Final OpLog catch-up failed to open backend: "
+                   << toString(backend.error());
+        return backend.error() == ErrorCode::UNAVAILABLE_IN_CURRENT_MODE
+                   ? ErrorCode::INTERNAL_ERROR
+                   : backend.error();
+    }
+    return FinalCatchUpBatchRecordsLocked(*backend.value(), policy);
 }
 
 ErrorCode HotStandbyService::FinalCatchUpBatchRecordsLocked(
@@ -1023,16 +963,6 @@ void HotStandbyService::CancelSnapshotCapture() {
         state->cv.notify_all();
     }
     ready_capture.reset();
-}
-
-void HotStandbyService::SetSnapshotProvider(
-    std::unique_ptr<SnapshotProvider> provider) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (provider) {
-        snapshot_provider_ = std::move(provider);
-    } else {
-        snapshot_provider_ = std::make_unique<NoopSnapshotProvider>();
-    }
 }
 
 void HotStandbyService::SetBatchOpLogSnapshotProvider(
