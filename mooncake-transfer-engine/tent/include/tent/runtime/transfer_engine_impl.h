@@ -236,7 +236,7 @@ class TransferEngineImpl {
     TransferEngineImpl();
 
     TransferEngineImpl(std::shared_ptr<Config> config,
-                       Status config_load_status = Status::OK());
+                       bool config_loaded = true);
 
     ~TransferEngineImpl();
 

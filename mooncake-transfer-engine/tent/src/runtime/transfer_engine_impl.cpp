@@ -286,17 +286,17 @@ TransferEngineImpl::TransferEngineImpl()
 }
 
 TransferEngineImpl::TransferEngineImpl(std::shared_ptr<Config> conf,
-                                       Status config_load_status)
+                                       bool config_loaded)
     : conf_(conf),
       available_(false),
       port_(0),
       ipv6_(false),
       merge_requests_(true) {
+    if (!config_loaded) return;
     auto preserved = captureExplicitTransferEngineConfig(*conf_);
     // Allow MC_TENT_CONF to supply shared defaults while keeping the caller's
     // explicit metadata identity intact.
-    auto status = std::move(config_load_status);
-    if (status.ok()) status = ConfigHelper().loadFromEnv(*conf_);
+    auto status = ConfigHelper().loadFromEnv(*conf_);
     restoreExplicitTransferEngineConfig(*conf_, preserved);
     if (status.ok()) status = construct();
     if (!status.ok()) {
