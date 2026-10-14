@@ -959,15 +959,23 @@ class MasterService {
         const WeightMetadataSnapshot& weight_metadata = {});
     // Copies objects out of the handoff. The caller keeps ownership so a
     // failed restore or a later lease loss can still PreservePromotionBaseline.
+    // `restore_workers` threads validate and install chunks in parallel (0:
+    // DefaultRestoreWorkers()); together they hold about one chunk of
+    // copies at a time. A failed restore installs nothing.
     tl::expected<void, ErrorCode> RestoreFromBatchOpLogPromotion(
         const BatchOpLogPromotionHandoff& handoff,
-        size_t chunk_object_count = kDefaultBatchOpLogPromotionChunkObjects);
+        size_t chunk_object_count = kDefaultBatchOpLogPromotionChunkObjects,
+        size_t restore_workers = 0);
     tl::expected<void, ErrorCode> RestoreFromBatchOpLogPromotion(
         const StandbyMetadataStore& metadata_store,
         DurablePrefix applied_cursor,
         const std::vector<StandbySegmentInfo>& segments,
         ReplicaID max_replica_id,
-        size_t chunk_object_count = kDefaultBatchOpLogPromotionChunkObjects);
+        size_t chunk_object_count = kDefaultBatchOpLogPromotionChunkObjects,
+        size_t restore_workers = 0);
+    // min(hardware threads, kMaxRestoreWorkers).
+    static size_t DefaultRestoreWorkers();
+    static constexpr size_t kMaxRestoreWorkers = 8;
 
     /**
      * @brief Query the status of a task
@@ -1017,7 +1025,8 @@ class MasterService {
         const std::vector<StandbySegmentInfo>& segments,
         size_t chunk_object_count,
         std::optional<ReplicaID> expected_max_replica_id,
-        const WeightMetadataSnapshot* legacy_weight_metadata);
+        const WeightMetadataSnapshot* legacy_weight_metadata,
+        size_t restore_workers);
 
     // Tolerant legacy snapshot restore (#3760), one phase per method so each
     // stays single-purpose.
@@ -1040,6 +1049,51 @@ class MasterService {
     tl::expected<void, ErrorCode> PublishRestoredObjects(
         std::vector<PreparedObject>& objects,
         std::vector<std::pair<TenantId, route::ObjectRef>>& installed);
+
+    // Parallel bounded restore of a batch OpLog promotion. An object built
+    // from a snapshot entry, ready to be published under its own key.
+    struct RestoredObject {
+        TenantId tenant_id;
+        std::string user_key;
+        const StandbyObjectEntry* entry{nullptr};
+        std::vector<Replica> replicas;
+        // Per memory replica, in replica order: the index of its segment, or
+        // kUntrackedRange for a replica that holds no range.
+        std::vector<uint32_t> memory_segments;
+    };
+    static constexpr uint32_t kUntrackedRange =
+        std::numeric_limits<uint32_t>::max();
+    // A memory range restored onto a segment and the replica that holds it.
+    struct RestoredRange {
+        uintptr_t address{0};
+        uint64_t size{0};
+        Replica* replica{nullptr};
+    };
+    struct BatchRestoreContext;
+    // Runs step(worker) on `workers` threads until every call returns false
+    // (no work left) or one fails. Returns the first error.
+    static tl::expected<void, ErrorCode> RunRestoreWorkers(
+        size_t workers,
+        const std::function<tl::expected<bool, ErrorCode>(size_t)>& step);
+    // Copies the next slice of the metadata store and installs it. Returns
+    // false once the store is exhausted.
+    tl::expected<bool, ErrorCode> RestoreBatchOpLogChunk(
+        BatchRestoreContext& ctx, size_t worker_index);
+    // Publishes each of `objects` under its own key, as
+    // PublishRestoredObjects does, appends every publication to `installed`
+    // and every tracked memory range to `ranges[segment]`. Fails with
+    // OBJECT_ALREADY_EXISTS on a key the index already holds; what was
+    // published before it stays in `installed`.
+    tl::expected<void, ErrorCode> InstallRestoredObjects(
+        std::vector<RestoredObject>& objects,
+        std::vector<std::pair<TenantId, route::ObjectRef>>& installed,
+        std::vector<std::vector<RestoredRange>>& ranges);
+    // Sorts the ranges of each segment by address and checks that they do
+    // not overlap and fit the segment's capacity. Returns the bytes in use
+    // per segment.
+    static tl::expected<std::vector<uint64_t>, ErrorCode> CheckRestoredRanges(
+        const std::vector<StandbySegmentInfo>& segments,
+        std::vector<std::vector<RestoredRange>>& ranges, size_t workers);
 
     // A restored local-disk replica reads only while its owner has a liveness
     // record; share the existing one or stage a fresh record for install.
