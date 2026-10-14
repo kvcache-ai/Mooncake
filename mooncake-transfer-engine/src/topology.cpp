@@ -607,8 +607,8 @@ static std::vector<TopologyEntry> discoverCudaTopology(
                     preferred_hca.push_back(hca.name);
             }
             if (preferred_hca.empty()) {
-                LOG(ERROR) << "MC_RDMA_DATA_DIRECT_PAIRING: " << GPU_PREFIX
-                           << i << " (" << pci_bus_id << ", root \"" << gpu_root
+                LOG(ERROR) << "MC_RDMA_DATA_DIRECT_PAIRING: " << GPU_PREFIX << i
+                           << " (" << pci_bus_id << ", root \"" << gpu_root
                            << "\") has no Data Direct NIC on its PCI root; "
                               "rejecting discovery instead of falling back to "
                               "PCIe distance";
