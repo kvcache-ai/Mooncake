@@ -878,13 +878,9 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
         }
     }
 
-    // === STEP 2: Poll whether master requested a full SSD clear ===
-    auto remove_all_result = client_->PollRemoveAll();
-    if (remove_all_result && remove_all_result.value()) {
-        RemoveAll();
-    }
-
-    // === STEP 3: Persist offloaded objects (trigger actual data migration) ===
+    // Generic removal reclaims files through metadata-checked eviction, not a
+    // backend-wide wipe that could remove managed objects or another tenant.
+    // === STEP 2: Persist offloaded objects (trigger actual data migration) ===
     if (!offloading_objects.empty()) {
         auto offload_result = OffloadObjects(offloading_objects);
         if (!offload_result) {
