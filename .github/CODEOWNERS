@@ -15,6 +15,9 @@
 /mooncake-reshard @ShangmingCai @stmatengss @Bo-Vincent @zxpdemonio
 /mooncake-store @ykwd @stmatengss @XucSh @YiXR
 /mooncake-store/*/ha/ @Libotry @YiXR @00fish0 @Icedcoco @Aionw
+/python/mooncake/mooncake_connector_v1.py @stmatengss @ShangmingCai
+/python/mooncake/vllm_v1_proxy_server.py @stmatengss @ShangmingCai
+/python/tests/vllm/ @stmatengss @ShangmingCai
 /python/mooncake/http_metadata_server.py @ykwd @stmatengss @zxpdemonio
 /python/mooncake/async_store.py @ykwd @stmatengss @zxpdemonio
 /python/tests/store/async_store_integration.py @ykwd @stmatengss @zxpdemonio
