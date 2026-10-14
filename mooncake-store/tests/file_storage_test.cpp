@@ -1646,7 +1646,7 @@ TEST_F(FileStorageTest, DiskFenceSkipsCheckWhileOneIsRunning) {
     EXPECT_TRUE(fenced);
 }
 
-// A drain whose unmount RPC fails keeps its latch (R3): the heartbeat must
+// A drain whose unmount RPC fails keeps its latch: the heartbeat must
 // not re-mount, and once the master answers again the heartbeat retries the
 // unmount. The master is restarted and the segment re-mounted behind the
 // store's back, standing in for a master that kept the registration after

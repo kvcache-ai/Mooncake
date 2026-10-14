@@ -374,15 +374,15 @@ TEST_F(PosixFileTest, FailedSyscallKeepsFirstErrno) {
     }
 
     // preadv on a write-only descriptor fails with EBADF.
-    int wronly_fd = open(test_filename.c_str(), O_WRONLY);
-    ASSERT_GE(wronly_fd, 0);
-    PosixFile wronly(test_filename, wronly_fd);
+    int write_only_fd = open(test_filename.c_str(), O_WRONLY);
+    ASSERT_GE(write_only_fd, 0);
+    PosixFile write_only(test_filename, write_only_fd);
     char buf[16];
     iovec iov{buf, sizeof(buf)};
-    auto read = wronly.vector_read(&iov, 1, 0);
+    auto read = write_only.vector_read(&iov, 1, 0);
     ASSERT_FALSE(read);
     EXPECT_EQ(read.error(), ErrorCode::FILE_READ_FAIL);
-    EXPECT_EQ(wronly.sys_errno(), EBADF);
+    EXPECT_EQ(write_only.sys_errno(), EBADF);
 }
 
 // A short read is a logical failure: no syscall failed, so errno stays 0.
@@ -857,21 +857,22 @@ static bool UringAvailable() {
 TEST_F(PosixFileTest, UringFailedCqeKeepsErrno) {
     if (!UringAvailable()) GTEST_SKIP() << "io_uring is unavailable";
     // Reads on a write-only descriptor fail with EBADF.
-    int wronly_fd = open(test_filename.c_str(), O_WRONLY);
-    ASSERT_GE(wronly_fd, 0);
-    UringFile wronly(test_filename, wronly_fd, 32, false);
-    EXPECT_EQ(wronly.sys_errno(), 0);
+    int write_only_fd = open(test_filename.c_str(), O_WRONLY);
+    ASSERT_GE(write_only_fd, 0);
+    UringFile write_only(test_filename, write_only_fd, 32, false);
+    EXPECT_EQ(write_only.sys_errno(), 0);
     std::array<char, 16> buf{};
     UringFile::ReadDesc desc{buf.data(), buf.size(), 0};
-    ASSERT_FALSE(wronly.batch_read(&desc, 1));
-    EXPECT_EQ(wronly.sys_errno(), EBADF);
-    // A new file: the first errno wins, so `wronly` would keep EBADF anyway.
-    int wronly_fd2 = open(test_filename.c_str(), O_WRONLY);
-    ASSERT_GE(wronly_fd2, 0);
-    UringFile wronly2(test_filename, wronly_fd2, 32, false);
+    ASSERT_FALSE(write_only.batch_read(&desc, 1));
+    EXPECT_EQ(write_only.sys_errno(), EBADF);
+    // A new file: the first errno wins, so `write_only` would keep EBADF
+    // anyway.
+    int write_only_fd2 = open(test_filename.c_str(), O_WRONLY);
+    ASSERT_GE(write_only_fd2, 0);
+    UringFile write_only2(test_filename, write_only_fd2, 32, false);
     iovec iov{buf.data(), buf.size()};
-    ASSERT_FALSE(wronly2.vector_read(&iov, 1, 0));
-    EXPECT_EQ(wronly2.sys_errno(), EBADF);
+    ASSERT_FALSE(write_only2.vector_read(&iov, 1, 0));
+    EXPECT_EQ(write_only2.sys_errno(), EBADF);
 }
 
 #if defined(RLIMIT_FSIZE) && defined(SIGXFSZ)
