@@ -3627,6 +3627,44 @@ TEST_F(MasterServiceHATest, RemountRejectsStandbySegmentEndpointMismatch) {
     ASSERT_TRUE(service.ReMountSegment({correct}, generate_uuid()).has_value());
 }
 
+TEST_F(MasterServiceHATest, RemountRejectsStandbySegmentOfAnotherMount) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+    const std::string endpoint = "standby_identity_mount";
+    const UUID owner = generate_uuid();
+    const Segment original = MakeSegment(endpoint);
+    StandbySegmentInfo standby = MakeStandbyMemorySegment(endpoint);
+    standby.segment_id = original.id;
+    standby.base = original.base;
+    standby.owner_client_id = owner;
+    auto object = MakeStandbyObject("standby_identity_object", endpoint);
+    object.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    ASSERT_TRUE(
+        service.RestoreFromStandbySnapshot({object}, 7, {standby}).has_value());
+
+    // A store that restarted mounts the same name, endpoint and range under
+    // a new segment id.
+    const Segment restarted = MakeSegment(endpoint);
+    auto failed = service.ReMountSegment({restarted}, generate_uuid());
+    ASSERT_FALSE(failed.has_value());
+    EXPECT_EQ(failed.error(), ErrorCode::INVALID_PARAMS);
+
+    Segment moved = original;
+    moved.base = kDefaultSegmentBase + kDefaultSegmentSize;
+    failed = service.ReMountSegment({moved}, owner);
+    ASSERT_FALSE(failed.has_value());
+    EXPECT_EQ(failed.error(), ErrorCode::INVALID_PARAMS);
+
+    failed = service.ReMountSegment({original}, generate_uuid());
+    ASSERT_FALSE(failed.has_value());
+    EXPECT_EQ(failed.error(), ErrorCode::INVALID_PARAMS);
+
+    ASSERT_TRUE(service.ReMountSegment({original}, owner).has_value());
+    EXPECT_EQ(SegmentAllocatedSizeForTesting(service, endpoint), 1024);
+}
+
 TEST_F(MasterServiceHATest, RemountRejectsCxlForStandbyMemorySegment) {
     MasterService service(
         MasterServiceConfig::builder().set_enable_ha(false).build());
@@ -6018,6 +6056,22 @@ TEST_F(MasterServiceHATest, SegmentLifecycleWritesBatchRecordOpLogs) {
     EXPECT_EQ(OpType::SEGMENT_MOUNT, remount_batch.entries[0].op_type);
     EXPECT_EQ(2u, remount_batch.entries[0].sequence_id);
     EXPECT_FALSE(remount_batch.entries[0].payload.empty());
+
+    // Both mount records carry the mount's identity.
+    for (const auto& [entry, segment, owner] :
+         {std::tuple{&mount_batch.entries[0], &mounted, client_id},
+          std::tuple{&remount_batch.entries[0], &remounted,
+                     remount_client_id}}) {
+        SegmentMountOp op;
+        ASSERT_EQ(struct_pack::errc::ok,
+                  struct_pack::deserialize_to(op, entry->payload));
+        ASSERT_TRUE(op.segment_id.has_value());
+        EXPECT_EQ(*op.segment_id, segment->id);
+        ASSERT_TRUE(op.base.has_value());
+        EXPECT_EQ(*op.base, segment->base);
+        ASSERT_TRUE(op.owner_client_id.has_value());
+        EXPECT_EQ(*op.owner_client_id, owner);
+    }
 
     ASSERT_EQ(1u, unmount_batch.entries.size());
     EXPECT_EQ(OpType::SEGMENT_UNMOUNT, unmount_batch.entries[0].op_type);
