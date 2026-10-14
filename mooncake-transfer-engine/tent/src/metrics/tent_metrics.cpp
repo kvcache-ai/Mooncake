@@ -100,10 +100,10 @@ constexpr const char* kNotifyQueueNames[] = {
     "outbox",   "resend",      "resend_held", "recv_rdma",
     "recv_tcp", "recv_hp_tcp", "recv_local"};
 constexpr const char* kNotifyDropNames[] = {
-    "resend_deadline",  "resend_exhausted",  "resend_encode",
-    "outbox_deadline",  "outbox_full",       "outbox_unretryable",
-    "outbox_encode",    "shutdown",          "recv_decode",
-    "recv_no_callback", "recv_endpoint_gone"};
+    "resend_deadline",  "resend_exhausted",   "resend_encode",
+    "outbox_deadline",  "outbox_full",        "outbox_unretryable",
+    "outbox_encode",    "shutdown",           "recv_decode",
+    "recv_no_callback", "recv_endpoint_gone", "recv_backlog"};
 constexpr const char* kNotifyDedupNames[] = {"duplicate", "expired"};
 constexpr const char* kNotifyHoleNames[] = {"ttl", "cap"};
 

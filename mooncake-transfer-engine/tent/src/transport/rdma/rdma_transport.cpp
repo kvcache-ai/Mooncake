@@ -29,6 +29,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <future>
+#include <iterator>
 #include <limits>
 #include <sstream>
 
@@ -357,6 +358,7 @@ RdmaTransport::NotifyConfig RdmaTransport::readNotifyConfig(
         config.resend_deadline =
             std::chrono::milliseconds(std::min(deadline_ms, kMaxDeadlineMs));
     }
+    config.recv_backlog_max = loadNotifyRecvBacklogMax(conf);
     return config;
 }
 
@@ -388,6 +390,7 @@ Status RdmaTransport::install(std::string& local_segment_name,
     notify_rpc_fallback_ = notify.rpc_fallback;
     notify_path_probe_ = notify.path_probe;
     notify_resend_deadline_ = notify.resend_deadline;
+    notify_backlog_max_ = notify.recv_backlog_max;
     local_segment_name_ = local_segment_name;
     local_topology_ = local_topology;
 
@@ -1386,18 +1389,32 @@ void RdmaTransport::notifyResendThread() {
 
 Status RdmaTransport::receiveNotification(
     std::vector<Notification>& notify_list) {
-    std::lock_guard<std::mutex> lock(notify_mutex_);
+    std::unique_lock<std::mutex> lock(notify_mutex_);
     if (notify_list_.empty()) {
         return Status::OK();
     }
-    notify_list = std::move(notify_list_);
-    notify_list_.clear();
+    // Arrivals wait on this lock: take the queue whole, move it out after.
+    std::deque<Notification> taken;
+    taken.swap(notify_list_);
     TENT_SET_NOTIFY_QUEUE_DEPTH(TentMetrics::NotifyQueue::RecvRdma, 0);
+    lock.unlock();
+    notify_list.assign(std::make_move_iterator(taken.begin()),
+                       std::make_move_iterator(taken.end()));
     return Status::OK();
 }
 
 void RdmaTransport::addNotificationToQueue(const Notification& notifi) {
     std::lock_guard<std::mutex> lock(notify_mutex_);
+    if (notify_list_.size() >= notify_backlog_max_) {
+        notify_list_.pop_front();
+        const uint64_t dropped = ++notify_backlog_dropped_;
+        TENT_RECORD_NOTIFY_DROPPED(TentMetrics::NotifyDropReason::RecvBacklog,
+                                   1);
+        LOG_EVERY_N(WARNING, 1000)
+            << "Notification receive queue recv_rdma full at "
+            << notify_backlog_max_ << ", dropped the oldest unread, " << dropped
+            << " so far";
+    }
     notify_list_.push_back(notifi);
     TENT_RECORD_NOTIFY_RECEIVED(TentMetrics::NotifyQueue::RecvRdma,
                                 notify_list_.size());

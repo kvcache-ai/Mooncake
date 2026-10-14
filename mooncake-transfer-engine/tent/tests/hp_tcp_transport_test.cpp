@@ -6,6 +6,7 @@
 //
 //     http://www.apache.org/licenses/LICENSE-2.0
 
+#include <glog/logging.h>
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -20,6 +21,7 @@
 #include <thread>
 #include <vector>
 
+#include "tent/common/config.h"
 #include "tent/runtime/control_plane.h"
 #include "tent/runtime/platform.h"
 #include "tent/transfer_engine.h"
@@ -60,6 +62,11 @@ class HighPerformanceTcpTransportTestPeer {
             out.push_back(lane.load(std::memory_order_relaxed));
         }
         return out;
+    }
+
+    static uint64_t droppedRecvBacklog(
+        const HighPerformanceTcpTransport& transport) {
+        return transport.notify_backlog_dropped_.load();
     }
 };
 
@@ -169,6 +176,36 @@ TEST(HighPerformanceTcpTransportTest, UnknownWriteOutcomeIsPermanent) {
     EXPECT_TRUE(unsafe_replay.IsInvalidEntry()) << unsafe_replay.ToString();
     EXPECT_EQ(status.s, FAILED);
     EXPECT_TRUE(transport.freeSubBatch(batch).ok());
+}
+
+TEST(HighPerformanceTcpTransportTest, RecvBacklogIsBoundedAndDropsTheOldest) {
+    auto conf = std::make_shared<Config>();
+    conf->set("notification/recv_backlog_max", 4);
+    auto metadata = MakeLocalMetadata();
+    HighPerformanceTcpTransport transport(MakeParams());
+    std::string segment_name = "hp_transport_test";
+    ASSERT_TRUE(transport.install(segment_name, metadata, nullptr, conf).ok());
+    uint16_t port = 0;
+    ASSERT_TRUE(metadata->start(port).ok());
+    const std::string addr = "127.0.0.1:" + std::to_string(port);
+
+    // 1000 drops: LOG_EVERY_N(1000) logs one of them, whatever ran before.
+    const auto warnings = google::LogMessage::num_messages(google::WARNING);
+    for (int i = 0; i < 1004; ++i)
+        ASSERT_TRUE(ControlClient::notify(addr, {"n", std::to_string(i)}).ok());
+    std::vector<Notification> received;
+    ASSERT_TRUE(transport.receiveNotification(received).ok());
+    std::vector<std::string> msgs;
+    for (const auto& notifi : received) msgs.push_back(notifi.msg);
+    EXPECT_EQ(msgs, (std::vector<std::string>{"1000", "1001", "1002", "1003"}));
+    EXPECT_EQ(
+        HighPerformanceTcpTransportTestPeer::droppedRecvBacklog(transport),
+        1000u);
+    EXPECT_GE(google::LogMessage::num_messages(google::WARNING) - warnings, 1);
+    ASSERT_TRUE(transport.receiveNotification(received).ok());
+    EXPECT_TRUE(received.empty());
+
+    EXPECT_TRUE(transport.uninstall().ok());
 }
 
 TEST(HighPerformanceTcpTransportTest,

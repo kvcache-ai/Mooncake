@@ -3,6 +3,7 @@
 #define TENT_HP_TCP_TRANSPORT_H_
 
 #include <atomic>
+#include <deque>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -10,6 +11,7 @@
 #include <string>
 #include <vector>
 
+#include "tent/common/notify_frame.h"
 #include "tent/runtime/hp_tcp_transport_config.h"
 #include "tent/runtime/transport.h"
 #include "tent/transport/hp_tcp/hp_tcp_buffer_registry.h"
@@ -104,7 +106,9 @@ class HighPerformanceTcpTransport final : public Transport {
     mutable std::mutex lifecycle_mutex_;
 
     RWSpinlock notify_lock_;
-    std::vector<Notification> notifications_;
+    std::deque<Notification> notifications_;
+    size_t notify_backlog_max_ = kNotifyRecvBacklogDefault;
+    std::atomic<uint64_t> notify_backlog_dropped_{0};
 };
 
 }  // namespace mooncake::tent

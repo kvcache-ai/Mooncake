@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <glog/logging.h>
 #include <gtest/gtest.h>
 
 #include <array>
@@ -31,6 +32,9 @@ class TcpTransportTestPeer {
    public:
     static const TcpParams& params(const TcpTransport& transport) {
         return transport.params_;
+    }
+    static uint64_t droppedRecvBacklog(const TcpTransport& transport) {
+        return transport.notify_backlog_dropped_.load();
     }
 };
 
@@ -144,6 +148,34 @@ TEST(TcpTransportCapabilityTest, CpuPlatformCanSelectPeerGpu) {
     }
 
     EXPECT_TRUE(transport->uninstall().ok());
+}
+
+TEST(TcpTransportNotifyTest, RecvBacklogIsBoundedAndDropsTheOldest) {
+    auto conf = std::make_shared<Config>();
+    conf->set("notification/recv_backlog_max", 4);
+    TcpTransport transport;
+    auto metadata = makeP2PMetadata();
+    std::string name = "tcp-recv-backlog";
+    ASSERT_TRUE(transport.install(name, metadata, nullptr, conf).ok());
+    uint16_t port = 0;
+    ASSERT_TRUE(metadata->start(port).ok());
+    const std::string addr = "127.0.0.1:" + std::to_string(port);
+
+    // 1000 drops: LOG_EVERY_N(1000) logs one of them, whatever ran before.
+    const auto warnings = google::LogMessage::num_messages(google::WARNING);
+    for (int i = 0; i < 1004; ++i)
+        ASSERT_TRUE(ControlClient::notify(addr, {"n", std::to_string(i)}).ok());
+    std::vector<Notification> received;
+    ASSERT_TRUE(transport.receiveNotification(received).ok());
+    std::vector<std::string> msgs;
+    for (const auto& notifi : received) msgs.push_back(notifi.msg);
+    EXPECT_EQ(msgs, (std::vector<std::string>{"1000", "1001", "1002", "1003"}));
+    EXPECT_EQ(TcpTransportTestPeer::droppedRecvBacklog(transport), 1000u);
+    EXPECT_GE(google::LogMessage::num_messages(google::WARNING) - warnings, 1);
+    ASSERT_TRUE(transport.receiveNotification(received).ok());
+    EXPECT_TRUE(received.empty());
+
+    EXPECT_TRUE(transport.uninstall().ok());
 }
 
 TEST(TcpSubBatchTest, PointerStabilityAfterReserve) {

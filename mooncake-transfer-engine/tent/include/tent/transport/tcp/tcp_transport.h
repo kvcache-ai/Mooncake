@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <iostream>
 #include <memory>
@@ -26,6 +27,7 @@
 #include <string>
 
 #include "tent/common/concurrent/thread_pool.h"
+#include "tent/common/notify_frame.h"
 #include "tent/runtime/control_plane.h"
 #include "tent/runtime/transport.h"
 
@@ -136,7 +138,9 @@ class TcpTransport : public Transport {
     std::atomic<bool> shutting_down_{false};
 
     RWSpinlock notify_lock_;
-    std::vector<Notification> notify_list_;
+    std::deque<Notification> notify_list_;
+    size_t notify_backlog_max_ = kNotifyRecvBacklogDefault;
+    std::atomic<uint64_t> notify_backlog_dropped_{0};
 };
 }  // namespace tent
 }  // namespace mooncake

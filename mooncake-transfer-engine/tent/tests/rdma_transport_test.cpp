@@ -16,6 +16,7 @@
 #include <fcntl.h>
 #include <cerrno>
 #include <dlfcn.h>
+#include <glog/logging.h>
 #include <gtest/gtest.h>
 #include <infiniband/verbs.h>
 #include <netinet/in.h>
@@ -386,6 +387,15 @@ class RdmaTransportTestPeer {
     static uint64_t droppedResends(const RdmaTransport& transport) {
         return transport.notify_resend_dropped_.load();
     }
+    static void setRecvBacklogMax(RdmaTransport& transport, size_t max) {
+        transport.notify_backlog_max_ = max;
+    }
+    static size_t recvBacklogMax(const RdmaTransport& transport) {
+        return transport.notify_backlog_max_;
+    }
+    static uint64_t droppedRecvBacklog(const RdmaTransport& transport) {
+        return transport.notify_backlog_dropped_.load();
+    }
     // Started and serving: the thread returns only once running is false.
     static bool resendThreadStarted(const RdmaTransport& transport) {
         return transport.notify_resend_running_ &&
@@ -570,6 +580,17 @@ class RdmaEndPointTestPeer {
     static size_t resendable(const std::shared_ptr<RdmaEndPoint>& endpoint) {
         std::lock_guard<std::mutex> lock(endpoint->notify_send_mutex_);
         return endpoint->notify_resendable_.size();
+    }
+    // Writes what a peer's send would land in the receive slot `idx`.
+    static uint32_t fillRecvSlot(const std::shared_ptr<RdmaEndPoint>& endpoint,
+                                 size_t idx, const std::string& msg) {
+        uint32_t len = 0;
+        EXPECT_TRUE(
+            encodeNotifyPayload("n", msg,
+                                RdmaEndPoint::notifySlotPtr(
+                                    endpoint->notify_recv_buffer_.data(), idx),
+                                RdmaEndPoint::kNotifyBufferSize, &len));
+        return len;
     }
 };
 
@@ -1856,6 +1877,23 @@ TEST(RdmaNotifyPathTest, InstallReadsTheRpcFallbackSwitch) {
     }
 }
 
+// install() takes the notification keys before it opens a device, so a
+// device that is not there fails it without an RNIC being needed.
+TEST(RdmaNotifyPathTest, InstallTakesTheRecvBacklogBound) {
+    if (!IbvLoader::Instance().available()) GTEST_SKIP() << "no libibverbs";
+    auto conf = std::make_shared<Config>();
+    conf->set("notification/recv_backlog_max", 4);
+    auto topology = topologyWithRdmaNics(1);
+    topology->nic_list_[0].name = "no_such_rnic";
+    RdmaTransport transport;
+    std::string name = "127.0.0.1:1";
+    const Status installed = transport.install(
+        name, std::make_shared<ControlService>("p2p", "", nullptr), topology,
+        conf);
+    EXPECT_FALSE(installed.ok());
+    EXPECT_EQ(RdmaTransportTestPeer::recvBacklogMax(transport), 4u);
+}
+
 // The notification keys, read without a device: unset or <= 0 keeps the
 // default, and a resend deadline past 24 h is clamped, so that the hold's
 // deadline arithmetic cannot overflow.
@@ -1870,6 +1908,7 @@ TEST(RdmaNotifyPathTest, NotifyKeysKeepTheirDefaultsAndBounds) {
     EXPECT_TRUE(config.rpc_fallback);
     EXPECT_TRUE(config.path_probe);
     EXPECT_EQ(config.resend_deadline, milliseconds(120000));
+    EXPECT_EQ(config.recv_backlog_max, 65536u);
     for (const int64_t ms : {int64_t{0}, int64_t{-5}}) {
         config = read([ms](Config& conf) {
             conf.set("notification/resend_deadline_ms", ms);
@@ -1880,10 +1919,12 @@ TEST(RdmaNotifyPathTest, NotifyKeysKeepTheirDefaultsAndBounds) {
         conf.set("notification/rpc_fallback", false);
         conf.set("notification/path_probe", false);
         conf.set("notification/resend_deadline_ms", 5000);
+        conf.set("notification/recv_backlog_max", 4);
     });
     EXPECT_FALSE(config.rpc_fallback);
     EXPECT_FALSE(config.path_probe);
     EXPECT_EQ(config.resend_deadline, milliseconds(5000));
+    EXPECT_EQ(config.recv_backlog_max, 4u);
     const int64_t huge = std::numeric_limits<int64_t>::max() / 1000000 + 1;
     config = read([huge](Config& conf) {
         conf.set("notification/resend_deadline_ms", huge);
@@ -5312,6 +5353,27 @@ TEST_F(RdmaWorkersSharedQpTest, RetiringTheEndpointHandsBackPendingSends) {
     EXPECT_EQ(RdmaTransportTestPeer::resendQueue(transport_).size(), 2u);
 }
 
+// 1000 drops: LOG_EVERY_N(1000) logs one of them, whatever ran before.
+TEST_F(RdmaWorkersSharedQpTest, RecvBacklogIsBoundedAndDropsTheOldest) {
+    RdmaTransportTestPeer::setRecvBacklogMax(transport_, 4);
+    const auto warnings = google::LogMessage::num_messages(google::WARNING);
+    for (int i = 0; i < 1004; ++i) {
+        const uint32_t len =
+            RdmaEndPointTestPeer::fillRecvSlot(endpoint_, 0, std::to_string(i));
+        ASSERT_TRUE(endpoint_->handleNotifyRecv(0, len));
+    }
+    std::vector<Notification> polled;
+    ASSERT_TRUE(transport_.receiveNotification(polled).ok());
+    std::vector<std::string> msgs;
+    for (const auto& notifi : polled) msgs.push_back(notifi.msg);
+    EXPECT_EQ(msgs, (std::vector<std::string>{"1000", "1001", "1002", "1003"}));
+    EXPECT_EQ(RdmaTransportTestPeer::droppedRecvBacklog(transport_), 1000u);
+    EXPECT_GE(google::LogMessage::num_messages(google::WARNING) - warnings, 1);
+    std::vector<Notification> again;
+    ASSERT_TRUE(transport_.receiveNotification(again).ok());
+    EXPECT_TRUE(again.empty());
+}
+
 TEST_F(RdmaWorkersSharedQpTest, TimeoutSweepGivesTheOtherLaneItsSliceBack) {
     // Lane 1 posted first, so lane 0's timeout marks it along with lane 0's
     // own slice. Both remain on the queue pair until their completions drain.
@@ -7386,6 +7448,18 @@ TEST(RdmaNotifyMetricsTest, ReceivedNotificationsAreCountedUntilPolled) {
     ASSERT_TRUE(transport.receiveNotification(polled).ok());
     EXPECT_EQ(polled.size(), 2u);
     EXPECT_EQ(metrics.series(depth), 0);
+}
+
+TEST(RdmaNotifyMetricsTest, RecvBacklogDropsAreCountedAtTheBound) {
+    NotifyMetricsScope metrics;
+    const std::string depth = "tent_notify_queue_depth{queue=\"recv_rdma\"}";
+    const double backlog0 = metrics.series(notifyDropped("recv_backlog"));
+    RdmaTransport transport;
+    RdmaTransportTestPeer::setRecvBacklogMax(transport, 4);
+    for (int i = 0; i < 9; ++i)
+        transport.addNotificationToQueue({"n", std::to_string(i), 0, 0});
+    EXPECT_EQ(metrics.series(notifyDropped("recv_backlog")) - backlog0, 5);
+    EXPECT_EQ(metrics.series(depth), 4);
 }
 
 TEST(RdmaNotifyMetricsTest, ResendsAreCountedAsResentOrDropped) {

@@ -195,6 +195,7 @@ class TentMetrics {
         RecvDecode,
         RecvNoCallback,
         RecvEndpointGone,
+        RecvBacklog,
         kCount,
     };
     enum class NotifyDedupReason { Duplicate, Expired, kCount };

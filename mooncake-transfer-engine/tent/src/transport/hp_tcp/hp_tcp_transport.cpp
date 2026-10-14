@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <atomic>
 #include <iomanip>
+#include <iterator>
 #include <limits>
 #include <random>
 #include <sstream>
@@ -229,7 +230,7 @@ Status HighPerformanceTcpTransport::rollbackPublishedEndpoint(
 
 Status HighPerformanceTcpTransport::install(
     std::string&, std::shared_ptr<ControlService> metadata,
-    std::shared_ptr<Topology>, std::shared_ptr<Config>) {
+    std::shared_ptr<Topology>, std::shared_ptr<Config> conf) {
     std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
     if (installed_.load(std::memory_order_acquire) || workers_ || server_ ||
         client_ || admission_) {
@@ -365,8 +366,19 @@ Status HighPerformanceTcpTransport::install(
         return status;
     }
 
+    if (conf) notify_backlog_max_ = loadNotifyRecvBacklogMax(*conf);
     metadata_->setNotifyCallback([this](const Notification& notification) {
         RWSpinlock::WriteGuard guard(notify_lock_);
+        if (notifications_.size() >= notify_backlog_max_) {
+            notifications_.pop_front();
+            const uint64_t dropped = ++notify_backlog_dropped_;
+            TENT_RECORD_NOTIFY_DROPPED(
+                TentMetrics::NotifyDropReason::RecvBacklog, 1);
+            LOG_EVERY_N(WARNING, 1000)
+                << "Notification receive queue recv_hp_tcp full at "
+                << notify_backlog_max_ << ", dropped the oldest unread, "
+                << dropped << " so far";
+        }
         notifications_.push_back(notification);
         TENT_RECORD_NOTIFY_RECEIVED(TentMetrics::NotifyQueue::RecvHpTcp,
                                     notifications_.size());
@@ -959,11 +971,16 @@ Status HighPerformanceTcpTransport::sendNotification(
 
 Status HighPerformanceTcpTransport::receiveNotification(
     std::vector<Notification>& notifications) {
-    RWSpinlock::WriteGuard guard(notify_lock_);
     notifications.clear();
-    notifications.swap(notifications_);
-    if (!notifications.empty())
-        TENT_SET_NOTIFY_QUEUE_DEPTH(TentMetrics::NotifyQueue::RecvHpTcp, 0);
+    std::unique_lock<RWSpinlock> guard(notify_lock_);
+    if (notifications_.empty()) return Status::OK();
+    // Arrivals spin on this lock: take the queue whole, move it out after.
+    std::deque<Notification> taken;
+    taken.swap(notifications_);
+    TENT_SET_NOTIFY_QUEUE_DEPTH(TentMetrics::NotifyQueue::RecvHpTcp, 0);
+    guard.unlock();
+    notifications.assign(std::make_move_iterator(taken.begin()),
+                         std::make_move_iterator(taken.end()));
     return Status::OK();
 }
 

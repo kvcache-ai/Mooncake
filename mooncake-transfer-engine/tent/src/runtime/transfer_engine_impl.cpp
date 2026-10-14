@@ -471,6 +471,7 @@ Status TransferEngineImpl::construct() {
     merge_requests_ = conf_->get("merge_requests", true);
     notify_rpc_fallback_ = conf_->get("notification/rpc_fallback", true);
     notify_proto_ = conf_->get("notification/proto", 1);
+    notify_backlog_max_ = loadNotifyRecvBacklogMax(*conf_);
     {
         NotifyDedupFilter::Config dedup;
         const int64_t ttl_ms =
@@ -579,7 +580,7 @@ Status TransferEngineImpl::construct() {
                            notify_dedup_.admit(notifi.session, notifi.seq);
         if (!fresh) noteRefusedNotifications(1);
         std::lock_guard<std::mutex> lk(local_notifi_mutex_);
-        if (fresh) local_notifi_list_.push_back(notifi);
+        if (fresh) queueLocalNotificationLocked(notifi);
         TENT_RECORD_NOTIFY_RECEIVED(TentMetrics::NotifyQueue::RecvLocal,
                                     local_notifi_list_.size());
         return 0;
@@ -3531,7 +3532,7 @@ Status TransferEngineImpl::sendNotification(SegmentID target_id,
         // establishes a notification QP, so sending fails and the receiver
         // polls forever.
         std::lock_guard<std::mutex> lk(local_notifi_mutex_);
-        local_notifi_list_.push_back(notifi);
+        queueLocalNotificationLocked(notifi);
         TENT_RECORD_NOTIFY_SENT(TentMetrics::NotifyPath::Local, {});
         TENT_RECORD_NOTIFY_RECEIVED(TentMetrics::NotifyQueue::RecvLocal,
                                     local_notifi_list_.size());
@@ -3539,6 +3540,21 @@ Status TransferEngineImpl::sendNotification(SegmentID target_id,
     }
     return sendNotificationOnce(target_id, stampNotification(target_id, notifi),
                                 false);
+}
+
+void TransferEngineImpl::queueLocalNotificationLocked(
+    const Notification& notifi) {
+    if (local_notifi_list_.size() >= notify_backlog_max_) {
+        local_notifi_list_.pop_front();
+        const uint64_t dropped = ++notify_backlog_dropped_;
+        TENT_RECORD_NOTIFY_DROPPED(TentMetrics::NotifyDropReason::RecvBacklog,
+                                   1);
+        LOG_EVERY_N(WARNING, 1000)
+            << "Notification receive queue recv_local full at "
+            << notify_backlog_max_ << ", dropped the oldest unread, " << dropped
+            << " so far";
+    }
+    local_notifi_list_.push_back(notifi);
 }
 
 Notification TransferEngineImpl::stampNotification(SegmentID target_id,
@@ -3835,14 +3851,16 @@ Status TransferEngineImpl::receiveNotification(
     // are deliverable even when no transport supports notifications at all,
     // and they do not depend on the transport poll having succeeded.
     {
-        std::lock_guard<std::mutex> lk(local_notifi_mutex_);
+        std::unique_lock<std::mutex> lk(local_notifi_mutex_);
         if (!local_notifi_list_.empty()) {
-            notifi_list.insert(
-                notifi_list.end(),
-                std::make_move_iterator(local_notifi_list_.begin()),
-                std::make_move_iterator(local_notifi_list_.end()));
-            local_notifi_list_.clear();
+            // Arrivals wait on this lock: take the queue whole, move it after.
+            std::deque<Notification> taken;
+            taken.swap(local_notifi_list_);
             TENT_SET_NOTIFY_QUEUE_DEPTH(TentMetrics::NotifyQueue::RecvLocal, 0);
+            lk.unlock();
+            notifi_list.insert(notifi_list.end(),
+                               std::make_move_iterator(taken.begin()),
+                               std::make_move_iterator(taken.end()));
         }
     }
     // Whatever landed in the list has been consumed from its queue, so the

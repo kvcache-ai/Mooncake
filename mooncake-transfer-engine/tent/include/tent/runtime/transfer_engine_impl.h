@@ -558,6 +558,9 @@ class TransferEngineImpl {
     Notification stampNotification(SegmentID target_id,
                                    const Notification& notifi);
 
+    // Under local_notifi_mutex_.
+    void queueLocalNotificationLocked(const Notification& notifi);
+
     // sendNotification() past the stamp. hook_path: a single try on the first
     // notification transport, over a channel that is already up.
     Status sendNotificationOnce(
@@ -673,7 +676,9 @@ class TransferEngineImpl {
     // Self-targeted notifications (target == LOCAL_SEGMENT_ID) are delivered
     // in-process rather than through a transport; see sendNotification().
     std::mutex local_notifi_mutex_;
-    std::vector<Notification> local_notifi_list_;
+    std::deque<Notification> local_notifi_list_;
+    size_t notify_backlog_max_ = kNotifyRecvBacklogDefault;
+    std::atomic<uint64_t> notify_backlog_dropped_{0};
 
     int notify_proto_{1};  // notification/proto; 0 = raw, no stamp, no dedup
     NotifySequencer notify_sequencer_;

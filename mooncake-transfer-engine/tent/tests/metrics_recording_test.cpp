@@ -2246,6 +2246,58 @@ TEST_F(MetricsRecordingTest, HpTcpNotificationsAreRecordedByTheTransport) {
     EXPECT_EQ(MetricsSnapshot(m).series(depth), 0);
 }
 
+// The RDMA queue's drops are checked in rdma_transport_test.
+TEST_F(MetricsRecordingTest, RecvBacklogDropsAreCountedByEachQueue) {
+    auto& m = TentMetrics::instance();
+    const std::string dropped =
+        "tent_notify_dropped_total{reason=\"recv_backlog\"}";
+    auto bounded = [](std::shared_ptr<Config> config) {
+        config->set("notification/recv_backlog_max", 4);
+        return config;
+    };
+    auto config = [](bool hp_tcp) {
+        auto config = makeNotifyTestConfig(!hp_tcp);
+        if (hp_tcp) {
+            config->set("transports/hp_tcp/enable", true);
+            config->set("transports/hp_tcp/bind_address", "127.0.0.1");
+            config->set("transports/hp_tcp/advertise_address", "127.0.0.1");
+            config->set("transports/hp_tcp/port", 0);
+        }
+        return config;
+    };
+    auto fill = [&](TransferEngineImpl& sender, SegmentID target,
+                    const std::string& queue) {
+        const std::string received =
+            "tent_notify_received_total{queue=\"" + queue + "\"}";
+        const auto before = MetricsSnapshot(m);
+        for (int i = 0; i < 9; ++i) {
+            ASSERT_TRUE(
+                sender.sendNotification(target, makeNotify(std::to_string(i)))
+                    .ok());
+        }
+        EXPECT_TRUE(seriesReaches(dropped, before.series(dropped) + 5))
+            << queue;
+        EXPECT_TRUE(seriesReaches(
+            "tent_notify_queue_depth{queue=\"" + queue + "\"}", 4))
+            << queue;
+        EXPECT_EQ(MetricsSnapshot(m).series(received) - before.series(received),
+                  9)
+            << queue;
+    };
+    for (const bool hp_tcp : {false, true}) {
+        TransferEngineImpl receiver(bounded(config(hp_tcp)));
+        ASSERT_TRUE(receiver.available());
+        TransferEngineImpl sender(config(hp_tcp));
+        ASSERT_TRUE(sender.available());
+        SegmentID remote = 0;
+        ASSERT_TRUE(sender.openSegment(remote, receiver.getSegmentName()).ok());
+        fill(sender, remote, hp_tcp ? "recv_hp_tcp" : "recv_tcp");
+    }
+    TransferEngineImpl engine(bounded(makeNotifyTestConfig(false)));
+    ASSERT_TRUE(engine.available());
+    fill(engine, LOCAL_SEGMENT_ID, "recv_local");
+}
+
 #else  // !TENT_METRICS_ENABLED
 
 // When metrics are disabled at compile time, the recording path is a no-op

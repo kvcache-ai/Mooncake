@@ -751,6 +751,48 @@ TEST(NotificationFallbackTest, RpcCopyIsDedupedWithoutTcpTransport) {
     EXPECT_TRUE(received.empty());
 }
 
+// A transport's queue drops before duplicate detection, so a later copy of
+// what it dropped is delivered; the engine's queue checks on arrival first.
+TEST(NotificationFallbackTest,
+     ACopyOfABacklogDropIsDeliveredByATransportQueue) {
+    for (const bool tcp : {true, false}) {
+        auto receiver_config = makeConfig();
+        receiver_config->set("notification/recv_backlog_max", 1);
+        receiver_config->set("transports/tcp/enable", tcp);
+        TransferEngineImpl receiver(receiver_config);
+        ASSERT_TRUE(receiver.available());
+        installStub(receiver, RDMA, "<rdma>", Status::OK());
+        TransferEngineImpl sender(makeConfig());
+        ASSERT_TRUE(sender.available());
+        installStub(sender, RDMA, "<rdma-down>",
+                    Status::RdmaError("RDMA notification channel unavailable"));
+        SegmentID remote = ~0ull;
+        ASSERT_TRUE(sender.openSegment(remote, receiver.getSegmentName()).ok());
+        std::vector<Notification> got;
+        ASSERT_TRUE(
+            sender.sendNotification(remote, makeNotification("a")).ok());
+        ASSERT_TRUE(receiver.receiveNotification(got).ok());
+        ASSERT_EQ(got.size(), 1u) << tcp;
+        ASSERT_TRUE(
+            sender.sendNotification(remote, makeNotification("b")).ok());
+        ASSERT_TRUE(
+            sender.sendNotification(remote, makeNotification("c")).ok());
+        ASSERT_TRUE(receiver.receiveNotification(got).ok());
+        ASSERT_EQ(got.size(), 1u) << tcp;
+        EXPECT_EQ(got[0].msg, "c");
+
+        Notification copy = got[0];
+        copy.seq -= 1;
+        copy.msg = "b-copy";
+        ASSERT_TRUE(sender.sendNotification(remote, copy).ok());
+        ASSERT_TRUE(receiver.receiveNotification(got).ok());
+        EXPECT_EQ(got.size(), tcp ? 1u : 0u) << tcp;
+        ASSERT_TRUE(sender.sendNotification(remote, copy).ok());
+        ASSERT_TRUE(receiver.receiveNotification(got).ok());
+        EXPECT_TRUE(got.empty()) << tcp;
+    }
+}
+
 // Reopening a segment continues its count instead of repeating a stamp.
 TEST(NotificationFallbackTest, ReopenedSegmentDoesNotRepeatAStamp) {
     TransferEngineImpl engine(makeConfig());
