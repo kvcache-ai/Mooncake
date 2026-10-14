@@ -182,6 +182,19 @@ class Buffer:
         return wrapped_hook
 
     def connect(self, is_update: bool = False):
+        if is_update:
+            if not self._use_fallback:
+                self.runtime.update_local_qpns()
+            ibgda_failed = torch.tensor(
+                [int(self._use_fallback or self.runtime.ibgda_disabled())],
+                dtype=torch.int32,
+                device="cuda",
+            )
+            dist.all_reduce(ibgda_failed, op=dist.ReduceOp.MAX, group=self.group)
+            if bool(ibgda_failed.item()):
+                self._use_fallback = True
+                return self.connect(False)
+
         if not self._use_fallback:
             (raddr, rkey) = self.runtime.get_mr_info()
             # torchada maps the CUDA device namespace to MUSA when enabled.
@@ -201,9 +214,6 @@ class Buffer:
             ]
             dist.all_gather(rkeys, rkey, self.group)
             rkeys = torch.cat(rkeys).tolist()
-
-            if is_update:
-                self.runtime.update_local_qpns()
 
             local_qpns = self.runtime.get_local_qpns()
             all_to_all_size = len(local_qpns) // self.group_size
