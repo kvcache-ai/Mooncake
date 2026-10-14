@@ -364,9 +364,10 @@ These are pull-based snapshots, not Prometheus series: UB rail health
 and is read through the transport rather than scraped. See {ref}`TENT Failover
 <tent-failover>` for how those counters drive rail selection.
 
+(tent-metrics-notifications)=
 ### Notification Metrics
 
-The `tent_notify_*` metrics follow a notification from the sender to the application polling `receiveNotification()`:
+{ref}`TENT Notifications <tent-notification>` describes the paths, queues and drops these metrics count. The `tent_notify_*` metrics follow a notification from the sender to the application polling `receiveNotification()`:
 
 - `tent_notify_sent_total` counts each notification once, under the path that took it: `rdma` (a notify QP), `tcp` or `hp_tcp` (that transport's control-plane send), `rpc` (the engine's own control-plane fallback) or `local` (a notification to the engine's own segment). A resend after its notify QP failed counts in `tent_notify_resent_total` instead.
 - `tent_notify_received_total` counts arrivals in the receive queue that took them, `recv_rdma`, `recv_tcp`, `recv_hp_tcp` or `recv_local`. A receiver cannot tell a TCP transport send from the RPC fallback, hence queues rather than paths. A copy that arrives twice is counted twice here, then refused once by deduplication; one that a full queue later drops (`recv_backlog`) stays counted.
