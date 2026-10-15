@@ -1174,6 +1174,122 @@ TEST_F(MasterServiceSSDTest, DrainedItemsOfAnotherTaskAreDropped) {
     EXPECT_EQ(OffloadTaskId(*service, "foreign_key"), current);
 }
 
+// A mirror that did not get the pinned source copies from a buffer nothing
+// pins, so only the source owner's completion is registered.
+TEST_F(MasterServiceSSDTest, OnlyTheSourceOwnersCompletionIsRegistered) {
+    auto service = CreateSsdAwareOffloadService();
+    const UUID client_a = generate_uuid();
+    const UUID client_b = generate_uuid();
+    MountMemoryAndLocalDisk(*service, client_a, "mirror_a", 0x370000000);
+    MountMemoryAndLocalDisk(*service, client_b, "mirror_b", 0x380000000);
+    ReplicateConfig config;
+    config.replica_num = 2;
+    ASSERT_TRUE(service
+                    ->PutStart(client_a, "mirror_key", TenantId::Default(),
+                               4096, config)
+                    .has_value());
+    ASSERT_TRUE(service
+                    ->PutEnd(client_a, "mirror_key", TenantId::Default(),
+                             ReplicaType::MEMORY)
+                    .has_value());
+    auto from_a = service->OffloadObjectHeartbeat(client_a, true);
+    auto from_b = service->OffloadObjectHeartbeat(client_b, true);
+    ASSERT_TRUE(from_a.has_value());
+    ASSERT_TRUE(from_b.has_value());
+    ASSERT_EQ(from_a->size(), 1u);
+    ASSERT_EQ(from_b->size(), 1u);
+
+    // Find which store owns the pinned source: the first memory replica.
+    auto replicas = service->GetReplicaList("mirror_key", TenantId::Default());
+    ASSERT_TRUE(replicas.has_value());
+    ASSERT_EQ(replicas->replicas.size(), 2u);
+    const auto& first_name = replicas->replicas[0]
+                                 .get_memory_descriptor()
+                                 .buffer_descriptor.transport_endpoint_;
+    const bool a_is_source = first_name == "mirror_a";
+    const UUID source = a_is_source ? client_a : client_b;
+    const UUID other = a_is_source ? client_b : client_a;
+    const auto& source_items = a_is_source ? *from_a : *from_b;
+    const auto& other_items = a_is_source ? *from_b : *from_a;
+
+    StorageObjectMetadata file;
+    file.data_size = 4096;
+    file.transport_endpoint = "disk_endpoint";
+    // The other mirror reports first: refused, and it ends the task.
+    ASSERT_TRUE(
+        service->NotifyOffloadSuccess(other, other_items, {file}).has_value());
+    auto after_other =
+        service->GetReplicaList("mirror_key", TenantId::Default());
+    ASSERT_TRUE(after_other.has_value());
+    EXPECT_EQ(after_other->replicas.size(), 2u);
+    // The source owner's report now finds no task it took: refused as well.
+    ASSERT_TRUE(service->NotifyOffloadSuccess(source, source_items, {file})
+                    .has_value());
+    auto after_source =
+        service->GetReplicaList("mirror_key", TenantId::Default());
+    ASSERT_TRUE(after_source.has_value());
+    EXPECT_EQ(after_source->replicas.size(), 2u);
+
+    // A second object: the source owner reports first and is registered.
+    ASSERT_TRUE(service
+                    ->PutStart(client_a, "mirror_key2", TenantId::Default(),
+                               4096, config)
+                    .has_value());
+    ASSERT_TRUE(service
+                    ->PutEnd(client_a, "mirror_key2", TenantId::Default(),
+                             ReplicaType::MEMORY)
+                    .has_value());
+    auto from_a2 = service->OffloadObjectHeartbeat(client_a, true);
+    auto from_b2 = service->OffloadObjectHeartbeat(client_b, true);
+    ASSERT_TRUE(from_a2.has_value());
+    ASSERT_TRUE(from_b2.has_value());
+    auto replicas2 =
+        service->GetReplicaList("mirror_key2", TenantId::Default());
+    ASSERT_TRUE(replicas2.has_value());
+    const bool a_is_source2 =
+        replicas2->replicas[0]
+            .get_memory_descriptor()
+            .buffer_descriptor.transport_endpoint_ == "mirror_a";
+    ASSERT_TRUE(service
+                    ->NotifyOffloadSuccess(a_is_source2 ? client_a : client_b,
+                                           a_is_source2 ? *from_a2 : *from_b2,
+                                           {file})
+                    .has_value());
+    auto registered =
+        service->GetReplicaList("mirror_key2", TenantId::Default());
+    ASSERT_TRUE(registered.has_value());
+    EXPECT_EQ(registered->replicas.size(), 3u);
+}
+
+// An offload completion whose size differs from the object is refused.
+TEST_F(MasterServiceSSDTest, OffloadCompletionWithAnotherSizeIsRefused) {
+    auto service = CreateSsdAwareOffloadService();
+    const UUID client_id = generate_uuid();
+    MountMemoryAndLocalDisk(*service, client_id, "size_segment", 0x330000000);
+    ReplicateConfig config;
+    config.replica_num = 1;
+    ASSERT_TRUE(
+        service
+            ->PutStart(client_id, "size_key", TenantId::Default(), 4096, config)
+            .has_value());
+    ASSERT_TRUE(service
+                    ->PutEnd(client_id, "size_key", TenantId::Default(),
+                             ReplicaType::MEMORY)
+                    .has_value());
+    auto tasks = service->OffloadObjectHeartbeat(client_id, true);
+    ASSERT_TRUE(tasks.has_value());
+    ASSERT_EQ(tasks->size(), 1u);
+    StorageObjectMetadata file;
+    file.data_size = 2048;
+    file.transport_endpoint = "disk_endpoint";
+    ASSERT_TRUE(
+        service->NotifyOffloadSuccess(client_id, *tasks, {file}).has_value());
+    auto replicas = service->GetReplicaList("size_key", TenantId::Default());
+    ASSERT_TRUE(replicas.has_value());
+    ASSERT_EQ(replicas->replicas.size(), 1u);
+    EXPECT_TRUE(replicas->replicas[0].is_memory_replica());
+}
+
 }  // namespace mooncake::test
 
 int main(int argc, char** argv) {

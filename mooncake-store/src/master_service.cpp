@@ -5628,17 +5628,22 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
         const L4TaskId task_id = NextL4TaskId();
         std::optional<ReplicaID> source_id;
         std::vector<UUID> mirror_clients;
+        std::vector<UUID> source_clients;
         metadata.VisitReplicas(
             [](const Replica& replica) {
                 return replica.is_completed() && replica.is_memory_replica();
             },
-            [this, &object_id, &task_id, &source_id,
-             &mirror_clients](Replica& replica) {
+            [this, &object_id, &task_id, &source_id, &mirror_clients,
+             &source_clients](Replica& replica) {
+                const size_t pushed_before = mirror_clients.size();
                 auto result = PushOffloadingQueue(object_id, replica, task_id,
                                                   &mirror_clients);
                 if (result && !source_id.has_value()) {
                     replica.inc_refcnt();
                     source_id = replica.id();
+                    source_clients.assign(
+                        mirror_clients.begin() + pushed_before,
+                        mirror_clients.end());
                 }
             });
         if (source_id.has_value()) {
@@ -5646,6 +5651,7 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
                 OffloadingTask{.source_id = *source_id,
                                .start_time = std::chrono::system_clock::now(),
                                .mirror_clients = std::move(mirror_clients),
+                               .source_clients = std::move(source_clients),
                                .takers = {},
                                .task_id = task_id};
         }
@@ -8630,6 +8636,10 @@ auto MasterService::NotifyOffloadSuccess(
     // client took: re-registrations (a store's rescan of files it already
     // had) and reports of a client that never took the task.
     size_t refused_untasked = 0;
+    // Task-backed completions refused because the copy may not hold this
+    // object's bytes: its size differs, or it was not copied from the
+    // pinned source replica.
+    size_t refused_stale = 0;
     // Completions refused by their task id: none (a store that predates
     // task ids, or a rescan entry) or another task's (a late report of an
     // earlier offload of the key, possibly from an earlier master).
@@ -8748,12 +8758,32 @@ auto MasterService::NotifyOffloadSuccess(
                     }
                     const auto previous_kv_media =
                         KvMediaSnapshot(obj_metadata);
+                    // The copy holds this object's bytes only if the store
+                    // read the buffer the task pins: the source replica must
+                    // be this client's and must still exist (a replica that
+                    // existed at the push and still exists was never freed).
+                    const auto& source_clients =
+                        offloading_task->source_clients;
+                    const Replica* source =
+                        obj_metadata.GetReplicaByID(offloading_task->source_id);
+                    const bool from_pinned_source =
+                        source != nullptr && source->is_memory_replica() &&
+                        source->is_completed() &&
+                        std::find(source_clients.begin(), source_clients.end(),
+                                  client_id) != source_clients.end();
                     ReleaseOffloadingTask(&obj_metadata, offloading_task);
 
                     if (!segment_mounted) {
                         // The offload bookkeeping above still ran; only the
                         // registration is refused.
                         refused_unmounted = true;
+                    } else if (!from_pinned_source ||
+                               metadata.data_size !=
+                                   static_cast<int64_t>(
+                                       obj_metadata.TotalLength())) {
+                        // The file may not describe this object; never let a
+                        // read reach it.
+                        ++refused_stale;
                     } else if (!obj_metadata.HasReplica(
                                    &Replica::fn_is_local_disk_replica)) {
                         std::vector<Replica> replicas;
@@ -8811,6 +8841,11 @@ auto MasterService::NotifyOffloadSuccess(
                   << ", action=notify_offload_success_refused"
                   << ", reason=no_offload_task_taken, count="
                   << refused_untasked;
+    }
+    if (refused_stale > 0) {
+        LOG(WARNING) << "client_id=" << client_id
+                     << ", action=notify_offload_success_refused"
+                     << ", reason=stale_disk_replica, count=" << refused_stale;
     }
     if (refused_no_task_id > 0) {
         LOG(INFO) << "client_id=" << client_id
@@ -10322,12 +10357,16 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
                     task_id, &mirror_clients);
                 if (result) {
                     replica.inc_refcnt();
+                    // Only this replica was pushed, so every mirror copies
+                    // from the pinned source.
+                    auto source_clients = mirror_clients;
                     state.offloading_task = OffloadingTask{
-                            .source_id = replica.id(),
-                            .start_time = now,
-                            .mirror_clients = std::move(mirror_clients),
-                            .takers = {},
-                            .task_id = task_id};
+                        .source_id = replica.id(),
+                        .start_time = now,
+                        .mirror_clients = std::move(mirror_clients),
+                        .source_clients = std::move(source_clients),
+                        .takers = {},
+                        .task_id = task_id};
                     queued = true;
                 }
             });
@@ -10624,12 +10663,16 @@ void MasterService::BatchEvict(double evict_ratio_target,
                                         replica, task_id, &mirror_clients);
                 if (result) {
                     replica.inc_refcnt();
+                    // Only this replica was pushed, so every mirror copies
+                    // from the pinned source.
+                    auto source_clients = mirror_clients;
                     state.offloading_task = OffloadingTask{
-                            .source_id = replica.id(),
-                            .start_time = now,
-                            .mirror_clients = std::move(mirror_clients),
-                            .takers = {},
-                            .task_id = task_id};
+                        .source_id = replica.id(),
+                        .start_time = now,
+                        .mirror_clients = std::move(mirror_clients),
+                        .source_clients = std::move(source_clients),
+                        .takers = {},
+                        .task_id = task_id};
                     queued = true;
                 }
             });
