@@ -256,11 +256,6 @@ class RdmaContext {
 
     bool autoGidSelectionEnabled() const { return auto_gid_selection_enabled_; }
 
-    bool reprobeAutoGid(
-        const GidSelectionSnapshot &expected_selection,
-        const std::vector<AutoGidSelectionIdentity> &tried_selections = {},
-        std::string *previous_gid = nullptr, std::string *next_gid = nullptr);
-
     PeerAutoGidSelection preparePeerGidSelection(
         const std::string &peer_nic_path,
         std::string_view auto_gid_reprobe_from = {});

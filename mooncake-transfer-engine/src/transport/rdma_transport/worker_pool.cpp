@@ -1381,11 +1381,11 @@ bool WorkerPool::handleContextEvent(ibv_event_type event_type,
                                         : "fatal event: ")
                   << event_type;
     } else if (event_type == IBV_EVENT_GID_CHANGE) {
-        auto gid_refresh_result = refreshPublishedLocalGid();
         if (event != nullptr) ibv_ack_async_event(event);
+        auto gid_refresh_result = refreshPublishedLocalGid();
 
-        if (gid_refresh_result != GidRefreshResult::UNCHANGED ||
-            context_.autoGidSelectionEnabled()) {
+        // refreshCurrentGid already retires invalid per-peer GID bindings.
+        if (gid_refresh_result != GidRefreshResult::UNCHANGED) {
             auto endpoint_lifecycle_locks =
                 context_.lockAllEndpointLifecycles();
             context_.disconnectAllEndpoints();
@@ -1446,8 +1446,7 @@ void WorkerPool::maybeActivateRecoveredContext() {
                         "keeping inactive";
         return;
     }
-    if (gid_refresh_result == GidRefreshResult::CHANGED ||
-        context_.autoGidSelectionEnabled()) {
+    if (gid_refresh_result == GidRefreshResult::CHANGED) {
         auto endpoint_lifecycle_locks = context_.lockAllEndpointLifecycles();
         context_.disconnectAllEndpoints();
         LOG(INFO) << "Worker: Context " << context_.deviceName()
