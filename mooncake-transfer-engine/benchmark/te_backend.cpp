@@ -631,6 +631,14 @@ double TEBenchRunner::runSingleTransfer(uint64_t local_addr, uint64_t target_id,
         entry.target_offset = target_addr + block_size * i;
         requests.emplace_back(entry);
     }
+    // A deferred free means transport work may still own the buffers (see
+    // TransferEngine::freeBatchID), e.g. a TIMEOUT task whose slices are
+    // still waiting. Keep freeBuffers() from releasing them at exit.
+    auto releaseUnfinishedBatch = [&] {
+        if (engine_->freeBatchID(batch_id).IsBatchCleanupDeferred()) {
+            abandoned_batches_.fetch_add(1);
+        }
+    };
     auto fail = [&](const char* what, const mooncake::Status& status) {
         LOG(ERROR) << what << ": " << status.ToString();
         noteTransferFailed();
@@ -640,7 +648,7 @@ double TEBenchRunner::runSingleTransfer(uint64_t local_addr, uint64_t target_id,
     XferBenchTimer timer;
     auto submitted = engine_->submitTransfer(batch_id, requests);
     if (!submitted.ok()) {
-        (void)engine_->freeBatchID(batch_id);
+        releaseUnfinishedBatch();
         return fail("Failed to submit transfer", submitted);
     }
     const uint64_t submit_us = timer.lap_us(false);
@@ -657,10 +665,12 @@ double TEBenchRunner::runSingleTransfer(uint64_t local_addr, uint64_t target_id,
         if (!released.ok()) return fail("Failed to free batch", released);
         return static_cast<double>(total_us);
     }
-    // Abandoned after a stop, or terminal failure. freeBatchID defers the
-    // cleanup of a batch that is still busy.
-    (void)engine_->freeBatchID(batch_id);
-    if (overall_status.s == TransferStatusEnum::PENDING) return -1.0;
+    if (overall_status.s == TransferStatusEnum::PENDING) {
+        // Abandoned after a stop; waitForBatch() already counted it.
+        (void)engine_->freeBatchID(batch_id);
+        return -1.0;
+    }
+    releaseUnfinishedBatch();
     LOG(ERROR) << "Failed transfer detected";
     noteTransferFailed();
     return -1.0;
