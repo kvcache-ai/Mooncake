@@ -297,6 +297,11 @@ extra_config:
   warning instead of failing `register_buffer`.
 - The parameters in `extra_config` should use the same Mooncake master,
   metadata server, protocol, and RDMA device as the store service.
+- Each Mooncake process component (store client, embedded-master probe) keeps
+  its own NVMe-oF connection per endpoint instead of sharing one
+  process-wide connection. A process embedding both therefore opens two
+  connections per target endpoint; plan target-side queue/connection limits
+  accordingly.
 
 | Environment Variable | Description | Default |
 |----------------------|-------------|---------|

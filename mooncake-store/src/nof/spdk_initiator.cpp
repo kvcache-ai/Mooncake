@@ -211,8 +211,12 @@ struct NofRegistryBundle {
 };
 
 NofRegistryBundle& GetNofRegistryBundle() {
-    static NofRegistryBundle bundle;
-    return bundle;
+    // Deliberately leaked (like RegistryMutex and the ShmHelper singleton): a
+    // probe initiator's function-static shared_ptr can be destroyed AFTER a
+    // function-static bundle, and its ~Impl backstop UnregisterAll would then
+    // touch a destroyed registry.
+    static NofRegistryBundle* bundle = new NofRegistryBundle();
+    return *bundle;
 }
 #endif  // HAVE_SPDK_MEM_REGISTER
 
@@ -239,6 +243,12 @@ struct ctrlr_info {
     std::map<uint32_t, std::unique_ptr<NofSegmentHandle>> ns_seg;
     std::mutex ns_mutex;
 };
+
+// Process-unique owner tokens for the page registry. A monotonically
+// increasing id can never be recycled, unlike an Impl's heap address (a new
+// Impl allocated over a dead one's storage would otherwise inherit its
+// leftover registration records).
+std::atomic<uint64_t> g_nof_owner_token{1};
 
 }  // namespace
 
@@ -288,7 +298,7 @@ class SpdkInitiator::Impl {
         // Backstop, after all I/O teardown above: release every page
         // registration this instance still holds, in case the real-client
         // teardown path missed any.
-        if (GetNofRegistryBundle().registry.UnregisterAll(this) !=
+        if (GetNofRegistryBundle().registry.UnregisterAll(owner_token_) !=
             ErrorCode::OK) {
             LOG(ERROR) << "NoF initiator teardown could not release all page "
                           "registrations; they stay registered until process "
@@ -437,7 +447,8 @@ class SpdkInitiator::Impl {
         }
         // `this` is the owner token: registrations are charged per initiator
         // instance.
-        return GetNofRegistryBundle().registry.Register(this, ptr, size);
+        return GetNofRegistryBundle().registry.Register(owner_token_, ptr,
+                                                        size);
 #else
         LOG(WARNING) << "SPDK build lacks spdk_mem_register; NoF over RDMA "
                         "will fail for unregistered user buffers (#3131)";
@@ -447,7 +458,7 @@ class SpdkInitiator::Impl {
 
     ErrorCode UnregisterMemory(void* ptr) {
 #ifdef HAVE_SPDK_MEM_REGISTER
-        return GetNofRegistryBundle().registry.Unregister(this, ptr);
+        return GetNofRegistryBundle().registry.Unregister(owner_token_, ptr);
 #else
         (void)ptr;
         return ErrorCode::OK;
@@ -718,6 +729,10 @@ class SpdkInitiator::Impl {
     // Member order matters: env_guard_ is declared FIRST so it is destroyed
     // LAST — all qpairs/ctrlrs are detached before spdk_env_fini runs.
     std::shared_ptr<SpdkEnvGuard> env_guard_;
+    // Process-unique registry owner token (see g_nof_owner_token). Trivially
+    // destructible, so its position in the destruction order is irrelevant.
+    const uint64_t owner_token_ =
+        g_nof_owner_token.fetch_add(1, std::memory_order_relaxed);
     std::mutex env_mutex_;
     std::map<std::string, std::unique_ptr<ctrlr_info>> connected_ctrlrs_;
     std::mutex ctrlrs_mutex_;

@@ -369,6 +369,14 @@ class RealClient : public PyClient {
     static void SetNofRuntimeFactoryForTesting(
         std::function<NofRuntime()> factory);
 
+    // Test-only seam: when set, unregister_buffer_internal() calls this hook
+    // instead of Client::unregisterLocalMemory, so a test can replay a TE
+    // failure sequence (e.g. partial deregistration failure followed by
+    // NOT_REGISTERED) that TCP cannot produce. Not thread-safe; reset (pass
+    // nullptr) after the test.
+    static void SetTeUnregisterHookForTesting(
+        std::function<tl::expected<void, ErrorCode>(void *)> hook);
+
     int health_check() override;
 
     /**
@@ -801,6 +809,12 @@ class RealClient : public PyClient {
 
     tl::expected<void, ErrorCode> tearDownAll_internal();
 
+    // Releases this client's NoF registrations for every recorded user buffer
+    // (idempotent). Failures keep their records and latch
+    // nof_buffer_cleanup_failed_ so repeated teardown calls keep reporting
+    // the failure instead of decaying into success.
+    ErrorCode CleanupNofRegisteredBuffers();
+
     tl::expected<bool, ErrorCode> isExist_internal(const std::string &key);
 
     std::vector<tl::expected<bool, ErrorCode>> batchIsExist_internal(
@@ -1117,7 +1131,20 @@ class RealClient : public PyClient {
     std::unordered_map<UUID, ShmContext, boost::hash<UUID>> shm_contexts_;
 
     mutable std::shared_mutex registered_buffer_mutex_;
-    std::unordered_map<void *, size_t> registered_buffer_sizes_;
+    struct BufferRegistrationRecord {
+        size_t size;
+        // TE cleanup was confirmed (unregisterLocalMemory returned OK, or
+        // NOT_REGISTERED — truthful since the TE-side fix: RdmaTransport
+        // retries the per-context MR deregistration before reporting
+        // NOT_REGISTERED, so it can no longer hide a live MR). NoF cleanup
+        // may still be pending.
+        bool te_cleanup_confirmed = false;
+    };
+    // A present record means "registered OR cleanup-pending": a record is
+    // retained when NoF/TE cleanup failed, in which case the buffer must
+    // stay mapped until the cleanup retry succeeds (or process exit).
+    std::unordered_map<void *, BufferRegistrationRecord>
+        registered_buffer_sizes_;
     std::optional<WritableBufferRegion> local_buffer_region_;
 
     // KV transfer sessions (process-local; not shared with DummyClient).
@@ -1186,6 +1213,12 @@ class RealClient : public PyClient {
 
     // Ensure cleanup executes at most once across multiple entry points
     std::atomic<bool> closed_{false};
+
+    // Latched when a teardown's NoF buffer cleanup failed: repeat teardown
+    // calls re-run the idempotent cleanup walk and keep reporting the
+    // failure until it heals, instead of returning success on a buffer that
+    // may still be DMA-translated.
+    std::atomic<bool> nof_buffer_cleanup_failed_{false};
 
     // Counts every LOCAL_DISK read served via peer offload-RPC.
     std::atomic<int64_t> offload_rpc_read_count_{0};

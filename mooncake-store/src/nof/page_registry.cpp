@@ -17,7 +17,7 @@ NofPageRegistry::NofPageRegistry(MemRegisterFn register_fn,
                                  MemUnregisterFn unregister_fn)
     : register_fn_(register_fn), unregister_fn_(unregister_fn) {}
 
-ErrorCode NofPageRegistry::Register(void* owner, void* ptr, size_t size) {
+ErrorCode NofPageRegistry::Register(uint64_t owner, void* ptr, size_t size) {
     const uintptr_t begin = reinterpret_cast<uintptr_t>(ptr);
     const uintptr_t first_page = begin & ~kPageMask;
     const uintptr_t end_page = AlignUpToPage(begin + size);
@@ -181,7 +181,7 @@ bool NofPageRegistry::ReleaseRangeLocked(void* ptr, OwnerRange& rec) {
     return true;
 }
 
-ErrorCode NofPageRegistry::Unregister(void* owner, void* ptr) {
+ErrorCode NofPageRegistry::Unregister(uint64_t owner, void* ptr) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto owner_it = owner_regs_.find(owner);
     if (owner_it == owner_regs_.end()) {
@@ -203,7 +203,7 @@ ErrorCode NofPageRegistry::Unregister(void* owner, void* ptr) {
     return ErrorCode::OK;
 }
 
-ErrorCode NofPageRegistry::UnregisterAll(void* owner) {
+ErrorCode NofPageRegistry::UnregisterAll(uint64_t owner) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto owner_it = owner_regs_.find(owner);
     if (owner_it == owner_regs_.end()) {

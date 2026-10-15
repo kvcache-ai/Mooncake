@@ -18,7 +18,9 @@
 #include <cstdlib>
 #include <iomanip>
 #include <limits>
+#if defined(__linux__)
 #include <numa.h>
+#endif
 #include <optional>
 #include <ranges>
 #include <span>
@@ -84,6 +86,7 @@ class ScopedObjectChecksumBuffer {
 };
 
 int GetCurrentNumaSocketId() {
+#if defined(__linux__)
     if (numa_available() < 0) {
         return 0;
     }
@@ -93,6 +96,10 @@ int GetCurrentNumaSocketId() {
     }
     int node = numa_node_of_cpu(cpu);
     return node < 0 ? 0 : node;
+#else
+    // libnuma is Linux-only; default to socket 0 elsewhere.
+    return 0;
+#endif
 }
 
 // Backing slot for Client::SetDefaultNofInitiatorFactoryForTesting.

@@ -3424,6 +3424,13 @@ struct NofFactoryGuard {
     ~NofFactoryGuard() { RealClient::SetNofRuntimeFactoryForTesting(nullptr); }
 };
 
+// Clears the TE unregister hook even when the test body fails.
+struct TeUnregisterHookGuard {
+    ~TeUnregisterHookGuard() {
+        RealClient::SetTeUnregisterHookForTesting(nullptr);
+    }
+};
+
 }  // namespace
 
 // Regression test: closing a client without manually unregistering every
@@ -3580,7 +3587,9 @@ TEST_F(RealClientTest, UnregisterBufferRetryReachesNofCleanup) {
 
 // Regression test: teardown must NOT report success when a NoF cleanup
 // fails — caller-owned buffers may still be DMA-translated, so the failure
-// must surface (and the buffer stays recorded).
+// must surface (and the buffer stays recorded). A repeated teardown must
+// keep reporting the failure instead of decaying into success, and must
+// heal once the backend recovers.
 TEST_F(RealClientTest, TearDownReportsNofCleanupFailure) {
     ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
     master_address_ = master_.master_address();
@@ -3602,6 +3611,75 @@ TEST_F(RealClientTest, TearDownReportsNofCleanupFailure) {
     initiator->unregister_result_ = ErrorCode::INTERNAL_ERROR;
     EXPECT_NE(py_client_->tearDownAll(), 0);
     EXPECT_EQ(initiator->unregister_calls_, 1);
+
+    // The first teardown latched closed_, but the failure is terminal until
+    // the cleanup actually succeeds: a second call retries the cleanup walk
+    // and must still report the failure.
+    EXPECT_NE(py_client_->tearDownAll(), 0);
+    EXPECT_EQ(initiator->unregister_calls_, 2);
+
+    // The backend recovers: the retry heals and teardown reports success.
+    initiator->unregister_result_ = ErrorCode::OK;
+    EXPECT_EQ(py_client_->tearDownAll(), 0);
+    EXPECT_EQ(initiator->unregister_calls_, 3);
+    EXPECT_TRUE(initiator->WasUnregistered(buffer.data()));
+}
+
+// Regression test for a partially failed TE deregistration: the first
+// unregister_buffer attempt fails inside TE (e.g. ibv_dereg_mr), and the
+// retry sees NOT_REGISTERED because TE metadata was already removed. The
+// store must still reach the NoF cleanup on the retry and must not report
+// success before every layer is clean.
+TEST_F(RealClientTest, UnregisterBufferRecoversAfterTePartialFailure) {
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
+    master_address_ = master_.master_address();
+
+    NofFactoryGuard guard;
+    auto initiator = std::make_shared<RecordingNofInitiator>();
+    RealClient::SetNofRuntimeFactoryForTesting([initiator]() {
+        return NofRuntime{initiator, std::make_shared<SystemDmaAllocator>()};
+    });
+
+    ASSERT_EQ(py_client_->setup_real("localhost:17937", "P2PHANDSHAKE",
+                                     16 * 1024 * 1024, 16 * 1024 * 1024, "tcp",
+                                     "", master_address_),
+              0);
+
+    std::vector<char> buffer(1 << 20);
+    ASSERT_EQ(py_client_->register_buffer(buffer.data(), buffer.size()), 0);
+    EXPECT_EQ(initiator->unregister_calls_, 0);
+
+    // Replay the TE failure sequence: the first call fails as a partial
+    // deregistration, the second reports NOT_REGISTERED (TE metadata was
+    // removed before the MR deregistration failed).
+    TeUnregisterHookGuard hook_guard;
+    int hook_calls = 0;
+    RealClient::SetTeUnregisterHookForTesting(
+        [&hook_calls](void*) -> tl::expected<void, ErrorCode> {
+            ++hook_calls;
+            if (hook_calls == 1) {
+                return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+            }
+            return tl::unexpected(ErrorCode::NOT_REGISTERED);
+        });
+
+    // First attempt: real TE failure propagates, record kept, NoF untouched.
+    EXPECT_NE(py_client_->unregister_buffer(buffer.data()), 0);
+    EXPECT_EQ(initiator->unregister_calls_, 0);
+
+    // Retry: NOT_REGISTERED is a truthful "TE clean" (the TE side retries a
+    // stuck MR deregistration before reporting it), so the store proceeds to
+    // the NoF cleanup and completes.
+    EXPECT_EQ(py_client_->unregister_buffer(buffer.data()), 0);
+    EXPECT_EQ(initiator->unregister_calls_, 1);
+    EXPECT_TRUE(initiator->WasUnregistered(buffer.data()));
+
+    // Fully cleaned: a third call has no record and fails without touching
+    // the NoF side.
+    EXPECT_NE(py_client_->unregister_buffer(buffer.data()), 0);
+    EXPECT_EQ(initiator->unregister_calls_, 1);
+
+    ASSERT_EQ(py_client_->tearDownAll(), 0);
 }
 
 // Regression for the read-side half of the dangling-replica problem: a

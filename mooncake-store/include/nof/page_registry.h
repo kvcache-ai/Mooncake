@@ -22,9 +22,11 @@ namespace mooncake {
 //     not roll back on failure; -EINVAL on unregister covers both "nothing
 //     marked" and "partially translated" — the two cannot be told apart.
 //
-// Ownership: registrations are charged to an explicit owner token (the
-// registering initiator instance). Per-page refcounts are process-wide, so
-// one owner's Unregister never unmaps pages another owner still relies on.
+// Ownership: registrations are charged to an explicit owner token (a unique
+// id per registering initiator instance — NOT its address, which could be
+// reused by a later allocation and would let the new instance inherit the
+// dead one's leftover records). Per-page refcounts are process-wide, so one
+// owner's Unregister never unmaps pages another owner still relies on.
 //
 // Failure handling is fail-stop (the baseline SpdkWrapper contract): a
 // failed registration is cleaned up once; anything whose cleanup cannot be
@@ -53,9 +55,9 @@ class NofPageRegistry {
     NofPageRegistry(const NofPageRegistry&) = delete;
     NofPageRegistry& operator=(const NofPageRegistry&) = delete;
 
-    ErrorCode Register(void* owner, void* ptr, size_t size);
-    ErrorCode Unregister(void* owner, void* ptr);
-    ErrorCode UnregisterAll(void* owner);
+    ErrorCode Register(uint64_t owner, void* ptr, size_t size);
+    ErrorCode Unregister(uint64_t owner, void* ptr);
+    ErrorCode UnregisterAll(uint64_t owner);
 
    private:
     static constexpr uintptr_t kPageSize = 2ULL << 20;  // 2MB hugepage
@@ -89,7 +91,7 @@ class NofPageRegistry {
     MemUnregisterFn unregister_fn_;
     std::map<uint64_t, PageReg> page_regs_;  // key: 2MB-aligned page base
     // owner token -> (user ptr -> registration record)
-    std::map<void*, std::map<void*, OwnerRange>> owner_regs_;
+    std::map<uint64_t, std::map<void*, OwnerRange>> owner_regs_;
     std::mutex mutex_;
 };
 

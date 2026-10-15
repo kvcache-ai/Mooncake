@@ -677,14 +677,16 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
         std::lock_guard<std::mutex> lock(chunk_map_mutex_);
         auto it = chunk_map_.find((uint64_t)addr);
         if (it != chunk_map_.end()) {
-            chunk_addrs = std::move(it->second);
-            chunk_map_.erase(it);
+            // Copy, but keep the entry until the whole unregister succeeds:
+            // chunk metadata is removed below, so a retry after a partial
+            // failure can only re-enumerate the chunks through this map.
+            chunk_addrs = it->second;
         }
     }
     if (!chunk_addrs.empty()) {
-        // Unregister EVERY chunk even if one fails; chunk_map_ was already
-        // erased, so an early return would leak the remaining chunks' MRs +
-        // metadata. Remember the first error and report it at the end.
+        // Unregister EVERY chunk even if one fails; remember the first error
+        // and report it at the end. The chunk_map_ entry is erased only on
+        // full success so a later retry re-runs the complete cleanup.
         int first_err = 0;
 
         // Metadata: remove each chunk from the local desc WITHOUT publishing (a
@@ -693,7 +695,11 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
         for (uint64_t ca : chunk_addrs) {
             int rc = metadata_->removeLocalMemoryBuffer(
                 reinterpret_cast<void *>(ca), /*update_metadata=*/false);
-            if (rc && !first_err) first_err = rc;
+            // ERR_ADDRESS_NOT_REGISTERED means an earlier attempt already
+            // removed this chunk's metadata and then failed partway through
+            // deregistration: tolerate it so the retry reaches the MR cleanup.
+            if (rc && rc != ERR_ADDRESS_NOT_REGISTERED && !first_err)
+                first_err = rc;
         }
 
         // MRs: unregister across contexts in PARALLEL (one thread per context,
@@ -740,11 +746,22 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
             int rc = metadata_->updateLocalSegmentDesc();
             if (rc && !first_err) first_err = rc;
         }
+        if (!first_err) {
+            std::lock_guard<std::mutex> lock(chunk_map_mutex_);
+            chunk_map_.erase((uint64_t)addr);
+        }
         return first_err;
     }
 
     int rc = metadata_->removeLocalMemoryBuffer(addr, update_metadata);
-    if (rc) return rc;
+    // A missing metadata entry does NOT prove the MRs are gone: this path
+    // removes the metadata BEFORE deregistering, so a partial ibv_dereg_mr
+    // failure on an earlier attempt leaves live MRs behind a missing entry.
+    // Fall through and retry the per-context deregistration; a genuinely
+    // clean address no-ops in RdmaContext::unregisterMemoryRegion. Only then
+    // is ERR_ADDRESS_NOT_REGISTERED a truthful "nothing remains" signal.
+    const bool metadata_missing = (rc == ERR_ADDRESS_NOT_REGISTERED);
+    if (rc && !metadata_missing) return rc;
 
     // force_sequential is used by batch operations to avoid nested parallelism
     int use_parallel_unreg = 0;
@@ -788,7 +805,10 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
         }
     }
 
-    return 0;
+    // Preserve the "nothing was registered" signal for an address whose
+    // metadata was already gone and whose MR cleanup above was a no-op (or a
+    // successful retry of a previously failed deregistration).
+    return metadata_missing ? ERR_ADDRESS_NOT_REGISTERED : 0;
 }
 
 int RdmaTransport::allocateLocalSegmentID() {

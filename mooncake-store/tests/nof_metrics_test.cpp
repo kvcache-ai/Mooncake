@@ -144,7 +144,7 @@ class StubInitiator : public NVMeoFInitiator {
         return completed;
     }
     ErrorCode RegisterMemory(void*, size_t) override { return ErrorCode::OK; }
-    ErrorCode UnregisterMemory(void*, size_t) override { return ErrorCode::OK; }
+    ErrorCode UnregisterMemory(void*) override { return ErrorCode::OK; }
     NofCapabilities GetCapabilities() const override { return {}; }
 
     int reject_call = 0;

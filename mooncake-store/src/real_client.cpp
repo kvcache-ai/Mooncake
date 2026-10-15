@@ -298,8 +298,8 @@ std::function<NofRuntime()> &NofRuntimeFactoryForTestingSlot() {
 }
 
 // Backing slot for RealClient::SetTeUnregisterHookForTesting.
-std::function<tl::expected<void, ErrorCode>(void *)>
-    &TeUnregisterHookForTestingSlot() {
+std::function<tl::expected<void, ErrorCode>(void *)> &
+TeUnregisterHookForTestingSlot() {
     static std::function<tl::expected<void, ErrorCode>(void *)> hook;
     return hook;
 }
@@ -1937,7 +1937,8 @@ ErrorCode RealClient::CleanupNofRegisteredBuffers() {
     std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
     for (auto it = registered_buffer_sizes_.begin();
          it != registered_buffer_sizes_.end();) {
-        const ErrorCode rc = nof_runtime_.initiator->UnregisterMemory(it->first);
+        const ErrorCode rc =
+            nof_runtime_.initiator->UnregisterMemory(it->first);
         if (rc != ErrorCode::OK) {
             // Keep the record: this buffer must stay mapped — its DMA
             // translation state is unconfirmed, so freeing or remapping it
@@ -4530,8 +4531,8 @@ tl::expected<void, ErrorCode> RealClient::register_buffer_internal(
     // registers the same (possibly widened) range as TE so the two layers
     // never disagree about coverage.
     if (nof_runtime_.initiator) {
-        auto rc = nof_runtime_.initiator->RegisterMemory(buffer,
-                                                       registration_size);
+        auto rc =
+            nof_runtime_.initiator->RegisterMemory(buffer, registration_size);
         if (rc == ErrorCode::NOF_REGISTRATION_STUCK) {
             // The failed page is terminally quarantined (never unregistered,
             // never munmapped): the buffer must not be freed or remapped.

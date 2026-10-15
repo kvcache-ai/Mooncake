@@ -25,6 +25,8 @@
 #endif
 #include "nof/nvmeof_initiator.h"
 
+namespace mooncake {
+
 static int GetPositiveEnvOrDefault(const char* name, int default_value) {
     const char* raw_value = std::getenv(name);
     if (!raw_value || raw_value[0] == '\0') {
@@ -147,7 +149,6 @@ static void nof_io_complete(void* ctx, const mooncake::NofIOCompletion& c) {
 
     sub_task->sub_task_pool->push(sub_task);
 }
-namespace mooncake {
 namespace {
 
 #ifdef USE_TENT
@@ -471,9 +472,11 @@ void NofWorkerPool::workerThread(int work_idx) {
     auto& queue_mutex = queue_mutex_[work_idx];
     auto last_debug_snapshot = std::chrono::steady_clock::now();
 
-    if (!CheckSubTaskPool(sub_task_pool, sub_task_chunks, work_idx)) {
-        return;
-    }
+    // Best-effort preallocation only: on failure the submit loop below
+    // retries CheckSubTaskPool on demand and fails the affected task, so the
+    // worker must NOT exit here (a dead worker strands every queued task and
+    // hangs teardown at join()).
+    (void)CheckSubTaskPool(sub_task_pool, sub_task_chunks, work_idx);
 
     while (true) {
         // Wait for task or shutdown signal
@@ -498,6 +501,14 @@ void NofWorkerPool::workerThread(int work_idx) {
                     new (std::nothrow) NofTask(std::move(task_queue.front()));
                 if (task == nullptr) {
                     LOG(ERROR) << "alloc NofTask failed, worker " << work_idx;
+                    // The queue front was not moved from: pop it and fail it
+                    // loudly. Retrying the same front would spin forever and
+                    // wedge the worker (teardown then hangs at join()).
+                    auto& front = task_queue.front();
+                    if (front.state) {
+                        front.state->set_completed(ErrorCode::TRANSFER_FAIL);
+                    }
+                    task_queue.pop();
                     continue;
                 }
 
@@ -509,7 +520,15 @@ void NofWorkerPool::workerThread(int work_idx) {
                     if (qos == nullptr) {
                         LOG(ERROR)
                             << "alloc NofQos failed, worker " << work_idx;
+                        // task owns the moved-out state: fail it, drop the
+                        // task, and pop the moved-from front so it is never
+                        // re-enqueued with a null state.
+                        if (task->state) {
+                            task->state->set_completed(
+                                ErrorCode::TRANSFER_FAIL);
+                        }
                         delete task;
+                        task_queue.pop();
                         continue;
                     }
                     nof_qos = qos.get();

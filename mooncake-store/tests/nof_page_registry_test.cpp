@@ -84,8 +84,8 @@ class NofPageRegistryTest : public ::testing::Test {
 
     FakeTranslationTable fake_;
     NofPageRegistry registry_{&FakeRegister, &FakeUnregister};
-    void* owner_a_ = reinterpret_cast<void*>(0xA000);
-    void* owner_b_ = reinterpret_cast<void*>(0xB000);
+    const uint64_t owner_a_ = 1;
+    const uint64_t owner_b_ = 2;
 };
 
 TEST_F(NofPageRegistryTest, SameOwnerSameRangeIsIdempotent) {
