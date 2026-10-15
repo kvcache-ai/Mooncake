@@ -333,9 +333,8 @@ class ObjectRoute {
 
     // Guards and cursors point into the route, so none may outlive it: the
     // owner keeps the route alive for as long as it hands them out (a tenant's
-    // route through the registry's shared_ptr to the tenant). A route
-    // destroyed under a guard or a cursor's set-aside slot aborts in every
-    // build rather than leave the holder on freed memory.
+    // route through the registry's shared_ptr to the tenant). Debug builds
+    // abort when a route is destroyed under a guard or a cursor.
     ~ObjectRoute();
 
     // The object under `key`, held shared; nullopt when the key holds none.
@@ -552,8 +551,8 @@ class ObjectRoute::Cursor {
     Cursor& operator=(const Cursor&) = delete;
     ~Cursor() {
         AssertInFlightUnchanged();
-        slot_lock_ = Lock();
-        ReleaseStripe();
+        UnlockSlot();
+        UnlockStripe();
     }
 
     Iterator begin() { return Iterator(this); }
@@ -566,18 +565,13 @@ class ObjectRoute::Cursor {
 
     void Advance() {
         AssertInFlightUnchanged();
-        slot_lock_ = Lock();
-        if (stripe_ < kStripeCount) {
-            ++slot_it_;
-        } else {
-            deferred_[deferred_pos_].reset();
-            ++deferred_pos_;
-        }
+        UnlockSlot();
         Settle();
     }
 
-    // Moves to the first object at or after the current position whose
-    // lock it obtains, or to the end.
+    // Moves to the next object not yet passed whose lock it obtains, or to
+    // the end. The position is always past the slot stood on, so this
+    // resumes from it whichever phase the cursor is in.
     void Settle() NO_THREAD_SAFETY_ANALYSIS {
         for (; stripe_ < kStripeCount; ++stripe_) {
             Stripe& stripe = route_.stripes_[stripe_];
@@ -587,8 +581,8 @@ class ObjectRoute::Cursor {
                 ++cursor_stripes_;
                 slot_it_ = stripe.slots.begin();
             }
-            for (; slot_it_ != stripe.slots.end(); ++slot_it_) {
-                KeySlot& slot = slot_it_->second;
+            while (slot_it_ != stripe.slots.end()) {
+                KeySlot& slot = (slot_it_++)->second;
                 Lock lock(slot.mutex_, std::try_to_lock);
                 if (!lock.owns_lock()) {
                     deferred_.emplace_back(stripe, slot);
@@ -599,20 +593,18 @@ class ObjectRoute::Cursor {
                     return;
                 }
             }
-            ReleaseStripe();
+            UnlockStripe();
         }
-        for (; deferred_pos_ < deferred_.size(); ++deferred_pos_) {
-            SlotHandle& handle = deferred_[deferred_pos_];
-            Lock lock(handle->mutex_);
-            if (handle->record_.has_value()) {
-                Stand(*handle, std::move(lock));
+        while (deferred_pos_ < deferred_.size()) {
+            KeySlot& slot = *deferred_[deferred_pos_++];
+            Lock lock(slot.mutex_);
+            if (slot.record_.has_value()) {
+                Stand(slot, std::move(lock));
                 return;
             }
-            // Done with it. No stripe is held any more, so the release may
-            // drop the slot.
-            lock.unlock();
-            handle.reset();
         }
+        // No lock is held any more, so these releases may drop empty slots.
+        deferred_.clear();
         current_ = nullptr;
     }
 
@@ -632,7 +624,13 @@ class ObjectRoute::Cursor {
         visited_in_flight_ = slot.record_->state.HasWorkInFlight();
     }
 
-    void ReleaseStripe() {
+    void UnlockSlot() {
+        if (slot_lock_.owns_lock()) {
+            slot_lock_.unlock();
+        }
+    }
+
+    void UnlockStripe() {
         if (stripe_lock_.owns_lock()) {
             stripe_lock_.unlock();
             --cursor_stripes_;
@@ -642,9 +640,10 @@ class ObjectRoute::Cursor {
     const ObjectRoute& route_;
     size_t stripe_ = 0;
     std::shared_lock<std::shared_mutex> stripe_lock_;
+    // The next slot to try in the stripe held.
     typename SlotMap::iterator slot_it_;
-    // Slots that were busy when the cursor passed their stripe; each
-    // handle keeps its slot in the map until the cursor is done with it.
+    // Slots that were busy when the cursor passed their stripe; the handles
+    // keep them in the map until the cursor has visited them all.
     std::vector<SlotHandle> deferred_;
     size_t deferred_pos_ = 0;
     Lock slot_lock_;
@@ -656,10 +655,19 @@ class ObjectRoute::Cursor {
 // --- ObjectRoute ------------------------------------------------------------
 
 inline ObjectRoute::~ObjectRoute() {
-    // A slot with no holder and no object is already gone, so this walks the
-    // objects plus the slots someone still holds. A holder lets go before its
-    // owner lets go of the route, so a relaxed load sees every release.
-    for (const Stripe& stripe : stripes_) {
+#ifndef NDEBUG
+    // A route goes only with its owner, once nothing reaches it any more, so a
+    // holder left here is a caller bug, which debug builds catch. A cursor
+    // standing on an object in its stripe pass holds that stripe and no
+    // handle, so a stripe still locked is a cursor still in use. A slot with
+    // no holder and no object is already gone, so the walk covers the objects
+    // plus the slots someone still holds. A holder lets go before its owner
+    // lets go of the route, so a relaxed load sees every release.
+    for (Stripe& stripe : stripes_) {
+        if (!stripe.lock.try_lock()) {
+            LOG(FATAL) << "ObjectRoute destroyed under a locked stripe";
+        }
+        stripe.lock.unlock();
         for (const auto& [key, slot] : stripe.slots) {
             if ((slot.state_.load(std::memory_order_relaxed) &
                  ~KeySlot::kOccupied) != 0) {
@@ -668,6 +676,7 @@ inline ObjectRoute::~ObjectRoute() {
             }
         }
     }
+#endif
 }
 
 inline SlotHandle ObjectRoute::FindSlot(std::string_view key) const {

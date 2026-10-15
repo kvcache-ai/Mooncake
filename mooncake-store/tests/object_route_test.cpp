@@ -753,6 +753,7 @@ TEST(ObjectRouteDeathTest, TearDownOfAnEmptyKeyAborts) {
     EXPECT_DEATH(route.WriteKey("k1").TearDown(), "holds no object");
 }
 
+#ifndef NDEBUG
 TEST(ObjectRouteDeathTest, DestroyingARouteUnderAGuardAborts) {
     EXPECT_DEATH(
         {
@@ -763,7 +764,19 @@ TEST(ObjectRouteDeathTest, DestroyingARouteUnderAGuardAborts) {
         "is still held");
 }
 
-#ifndef NDEBUG
+TEST(ObjectRouteDeathTest, DestroyingARouteUnderACursorAborts) {
+    EXPECT_DEATH(
+        {
+            auto route = std::make_unique<ObjectRoute>();
+            (void)PublishObject(*route, "k1");
+            for (auto object : route->ReadCursor()) {
+                (void)object;
+                route.reset();
+            }
+        },
+        "under a locked stripe");
+}
+
 TEST(ObjectRouteDeathTest, RouteAccessFromACursorAsserts) {
     ObjectRoute route;
     ASSERT_NE(PublishObject(route, "k1"), 0u);
