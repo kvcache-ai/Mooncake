@@ -18,26 +18,6 @@
 
 namespace mooncake {
 
-namespace {
-
-std::vector<OffloadTaskItem> BuildOffloadTasksFromStorageKeys(
-    const std::vector<std::string>& storage_keys,
-    const std::vector<StorageObjectMetadata>& metadatas) {
-    std::vector<OffloadTaskItem> tasks;
-    tasks.reserve(storage_keys.size());
-    for (size_t i = 0; i < storage_keys.size(); ++i) {
-        auto [tenant_id, key] = TenantId::ParseScopedKey(storage_keys[i]);
-        const int64_t size =
-            i < metadatas.size() ? metadatas[i].data_size : int64_t{0};
-        tasks.push_back(OffloadTaskItem{.tenant_id = tenant_id.value(),
-                                        .key = std::move(key),
-                                        .size = size});
-    }
-    return tasks;
-}
-
-}  // namespace
-
 FileStorage::FileStorage(const FileStorageConfig& config,
                          std::shared_ptr<Client> client,
                          const std::string& local_rpc_addr,
@@ -181,34 +161,12 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
         }
     }
 
-    auto scan_meta_result = storage_backend_->ScanMeta(
-        [this](const std::vector<std::string>& keys,
-               std::vector<StorageObjectMetadata>& metadatas) {
-            for (auto& metadata : metadatas) {
-                metadata.transport_endpoint = local_rpc_addr_;
-            }
-            auto tasks = BuildOffloadTasksFromStorageKeys(keys, metadatas);
-            auto add_object_result =
-                client_->NotifyOffloadSuccess(tasks, metadatas);
-            if (!add_object_result) {
-                LOG(ERROR) << "Failed to add object to master: "
-                           << add_object_result.error();
-                return add_object_result.error();
-            }
-            return ErrorCode::OK;
-        });
-
-    if (!scan_meta_result) {
-        if (config_.enable_dfs &&
-            scan_meta_result.error() == ErrorCode::NOT_SUPPORTED) {
-            LOG(INFO) << "Currently, DFS backend does not support ScanMeta; "
-                         "skip re-registering offloaded objects";
-        } else {
-            LOG(ERROR) << "Failed to scan meta and send to master: "
-                       << scan_meta_result.error();
-            return scan_meta_result;
-        }
-    }
+    // The master registers a LOCAL_DISK replica only as the completion of an
+    // offload task this registration took, never from a file the store
+    // already has. Files of an earlier process can therefore never become
+    // readable again; drop them before taking any task, so they neither use
+    // space nor block a fresh offload of their keys.
+    DropUnregisteredFiles("init");
 
     heartbeat_running_.store(true);
     heartbeat_thread_ = std::thread([this]() {
@@ -769,32 +727,12 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
 
     // A drain deregistered the disk tier on purpose. Skipping the whole tick
     // matters for the SEGMENT_NOT_FOUND branch below, which would re-mount the
-    // segment and re-register every object; there is also no point taking new
+    // segment and drop every offloaded file; there is also no point taking new
     // offload work for a store that is leaving. The client TTL is renewed by
     // Ping on the storage heartbeat thread, not here, so the client stays
     // alive for its memory segments.
     if (draining_.load()) {
         return {};
-    }
-
-    // Join previous rescan if completed
-    if (rescan_future_.valid() && rescan_future_.wait_for(std::chrono::seconds(
-                                      0)) == std::future_status::ready) {
-        rescan_future_ = std::future<void>();
-    }
-
-    // Retry metadata resync if previous attempt failed.
-    if (metadata_resync_pending_.load() && !rescan_future_.valid()) {
-        LOG(INFO) << "Retrying background metadata rescan";
-        rescan_future_ = std::async(std::launch::async, [this]() {
-            auto result = ReRegisterOffloadedObjects();
-            if (!result) {
-                LOG(ERROR) << "Background metadata rescan retry "
-                           << "failed: " << result.error();
-            } else {
-                metadata_resync_pending_.store(false);
-            }
-        });
     }
 
     std::vector<OffloadTaskItem>
@@ -819,16 +757,17 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
         if (!heartbeat_result) {
             ErrorCode err = heartbeat_result.error();
             if (err == ErrorCode::SEGMENT_NOT_FOUND) {
-                // Master lost our LOCAL_DISK segment (likely restarted).
-                // Re-register the segment, retry the heartbeat, and
-                // trigger async ScanMeta to re-register object metadata.
+                // Master lost our LOCAL_DISK segment (restart, client
+                // expiry). Mount it again; the files this store holds are
+                // unknown to the new registration and are dropped before
+                // any task is taken (see Init).
                 LOG(WARNING) << "OffloadObjectHeartbeat returned "
                              << "SEGMENT_NOT_FOUND, attempting to "
-                             << "re-register local disk segment and "
-                             << "re-register object metadata";
+                             << "re-register local disk segment";
                 auto remount_result =
                     client_->MountLocalDiskSegment(enable_offloading_);
                 if (remount_result) {
+                    DropUnregisteredFiles("remount");
                     // Report configured SSD capacity so the Master can
                     // restore file_total_capacity_ (the denominator in
                     // "SSD Storage: X / Y").  This was lost on restart;
@@ -847,24 +786,6 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
                         LOG(ERROR) << "Heartbeat failed after re-registration: "
                                    << heartbeat_result.error();
                         return heartbeat_result;
-                    }
-                    // Master lost all object metadata on restart.
-                    // Trigger async ScanMeta to re-register them,
-                    // same as what Init() does on startup.
-                    if (!rescan_future_.valid()) {
-                        LOG(INFO) << "Triggering background metadata rescan "
-                                  << "after LOCAL_DISK segment re-registration";
-                        metadata_resync_pending_.store(true);
-                        rescan_future_ =
-                            std::async(std::launch::async, [this]() {
-                                auto result = ReRegisterOffloadedObjects();
-                                if (!result) {
-                                    LOG(ERROR) << "Background metadata rescan "
-                                               << "failed: " << result.error();
-                                } else {
-                                    metadata_resync_pending_.store(false);
-                                }
-                            });
                     }
                 } else {
                     LOG(ERROR) << "Failed to re-register local disk segment: "
@@ -1418,76 +1339,22 @@ bool FileStorage::ReleaseBuffer(uint64_t batch_id) {
     return false;
 }
 
-tl::expected<void, ErrorCode> FileStorage::ReRegisterOffloadedObjects() {
-    LOG(INFO) << "ReRegisterOffloadedObjects: starting ScanMeta to re-register "
-              << "offloaded objects with master";
-    int total_keys = 0;
-    int total_batches = 0;
-    int total_failures = 0;
-    // Reset the scan iterator so ScanMeta starts from the beginning.
-    // BucketStorageBackend uses cursor-based iteration (next_bucket_);
-    // after Init() completes the cursor is 0 and HasNext() returns false,
-    // which would make ScanMeta skip all buckets.
-    storage_backend_->ResetScanIterator();
-    LOG(INFO) << "ReRegisterOffloadedObjects: about to call "
-                 "storage_backend_->ScanMeta()";
-    auto scan_meta_result =
-        storage_backend_->ScanMeta(
-            [this, &total_keys, &total_batches, &total_failures](
-                const std::vector<std::string>& keys,
-                std::vector<StorageObjectMetadata>& metadatas) {
-                // A rescan can be mid-flight when a drain deregisters the
-                // disk tier; every batch it would register from here on
-                // re-advertises the departing store. The master refuses such
-                // registrations anyway (the segment entry is gone), so this
-                // stops the scan on the first batch instead of on a refused
-                // RPC.
-                if (draining_.load()) {
-                    LOG(INFO) << "ReRegisterOffloadedObjects: aborting scan, "
-                              << "the disk tier is draining";
-                    return ErrorCode::SEGMENT_NOT_FOUND;
-                }
-                total_batches++;
-                total_keys += keys.size();
-                for (auto& metadata : metadatas) {
-                    metadata.transport_endpoint = local_rpc_addr_;
-                }
-                auto tasks = BuildOffloadTasksFromStorageKeys(keys, metadatas);
-                auto add_object_result =
-                    client_->NotifyOffloadSuccess(tasks, metadatas);
-                if (!add_object_result) {
-                    total_failures++;
-                    LOG(ERROR)
-                        << "ReRegisterOffloadedObjects: NotifyOffloadSuccess "
-                        << "failed for batch " << total_batches << " with "
-                        << keys.size()
-                        << " keys, error: " << add_object_result.error();
-                    return add_object_result.error();
-                }
-                LOG(INFO) << "ReRegisterOffloadedObjects: NotifyOffloadSuccess "
-                          << "succeeded for batch " << total_batches << " with "
-                          << keys.size() << " keys";
-                return ErrorCode::OK;
-            });
-
-    LOG(INFO) << "ReRegisterOffloadedObjects: ScanMeta returned. success="
-              << scan_meta_result.has_value();
-    if (!scan_meta_result) {
-        if (config_.enable_dfs &&
-            scan_meta_result.error() == ErrorCode::NOT_SUPPORTED) {
-            LOG(INFO) << "ReRegisterOffloadedObjects: Currently, DFS ScanMeta "
-                         "is not supported; skip";
-            return {};
-        }
-        LOG(ERROR) << "ReRegisterOffloadedObjects: ScanMeta failed: "
-                   << scan_meta_result.error();
-        return scan_meta_result;
+void FileStorage::DropUnregisteredFiles(const char* reason) {
+    // A shared backend (object storage) may hold other stores' files, which
+    // their own registrations still advertise; leave it alone. The files kept
+    // there can only be skipped by a later offload of their keys, never
+    // registered.
+    if (std::dynamic_pointer_cast<DistributedStorageBackend>(
+            storage_backend_)) {
+        LOG(INFO) << "FileStorage: keeping offloaded files of a shared "
+                     "backend on a new LOCAL_DISK registration, reason="
+                  << reason;
+        return;
     }
-    LOG(INFO) << "ReRegisterOffloadedObjects: completed. "
-              << "total_keys=" << total_keys
-              << " total_batches=" << total_batches
-              << " total_failures=" << total_failures;
-    return {};
+    RemoveAll();
+    LOG(INFO) << "FileStorage: dropped offloaded files unknown to the new "
+                 "LOCAL_DISK registration, reason="
+              << reason;
 }
 
 }  // namespace mooncake
