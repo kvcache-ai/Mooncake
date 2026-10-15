@@ -149,6 +149,7 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     config/rpc_timeout_config.cpp
     config/spdk_controller_config.cpp
     config/transfer_submitter_config.cpp
+    config/egm_store_pool_config.cpp
     device/accelerator_device.cpp
     device/accelerator_registry.cpp
     device/runtime_accelerator.cpp
@@ -674,6 +675,7 @@ if(USE_SUNRISE)
 endif()
 
 if(BUILD_SHARED_LIBS)
+  set_target_properties(mooncake_store PROPERTIES INSTALL_RPATH "$ORIGIN")
   install(TARGETS mooncake_store DESTINATION lib)
 endif()
 

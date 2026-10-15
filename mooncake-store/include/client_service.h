@@ -33,7 +33,6 @@ namespace mooncake {
 
 class PutOperation;
 class DistributedStorageBackend;
-class RealClient;
 
 std::optional<size_t> GetTransportRegistrationLimit(
     const std::string& protocol);
@@ -727,6 +726,11 @@ class Client {
     }
 
     [[nodiscard]] const std::string& GetProtocol() const { return protocol_; }
+
+    [[nodiscard]] bool HasClassicTransport(const std::string& protocol) const {
+        return transfer_engine_ && !transfer_engine_->isUsingTent() &&
+               transfer_engine_->getTransport(protocol) != nullptr;
+    }
 
     [[nodiscard]] bool CanUseLocalMemcpy(const std::string& endpoint) const {
         return transfer_submitter_ != nullptr &&
