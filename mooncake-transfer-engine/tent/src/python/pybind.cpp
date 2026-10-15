@@ -47,6 +47,8 @@ static_assert(static_cast<int>(TransportType::HYLINK) == TRANSPORT_HYLINK,
               "HYLINK wire value must match the C API macro");
 static_assert(static_cast<int>(TransportType::FABRIC) == TRANSPORT_FABRIC,
               "FABRIC wire value must match the C API macro");
+static_assert(static_cast<int>(TransportType::MEMFABRIC) == TRANSPORT_MEMFABRIC,
+              "MEMFABRIC wire value must match the C API macro");
 
 // =============================================================================
 // Custom Exception Hierarchy
@@ -328,6 +330,7 @@ PYBIND11_MODULE(tent, m) {
         .value("MLU", TransportType::MLU)
         .value("HYLINK", TransportType::HYLINK)
         .value("FABRIC", TransportType::FABRIC)
+        .value("MEMFABRIC", TransportType::MEMFABRIC)
         .export_values();
 
     py::enum_<IntentType>(m, "IntentType")

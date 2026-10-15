@@ -1,4 +1,6 @@
-if(USE_ASCEND OR USE_ASCEND_DIRECT)
+if(USE_ASCEND
+   OR USE_ASCEND_DIRECT
+   OR USE_MEMFABRIC)
   file(GLOB TENT_PLATFORM_ASCEND_SOURCES "*.cpp")
   add_library(platform_ascend STATIC ${TENT_PLATFORM_ASCEND_SOURCES})
   target_link_libraries(platform_ascend PUBLIC tent_common ascendcl)

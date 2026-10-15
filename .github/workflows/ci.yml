@@ -642,6 +642,18 @@ jobs:
             cmake_flags: '-DUSE_CUDA=OFF -DUSE_UB=ON -DCMAKE_BUILD_TYPE=Debug'
             need_cuda: false
             metrics_flags: ''
+          # Compile production sources into isolated test executables with
+          # private ACL mocks; no CANN, NPU, or libmf_smem is required.
+          - name: memfabric-mock
+            cmake_flags: >-
+              -DUSE_CUDA=OFF -DUSE_MEMFABRIC=OFF -DUSE_ASCEND=OFF
+              -DUSE_ASCEND_DIRECT=OFF -DUSE_UBSHMEM=OFF
+              -DTENT_BUILD_MEMFABRIC_MOCK_TESTS=ON
+              -DWITH_STORE=OFF -DWITH_STORE_RUST=OFF
+              -DBUILD_EXAMPLES=OFF -DBUILD_BENCHMARK=OFF
+              -DCMAKE_BUILD_TYPE=Debug
+            need_cuda: false
+            metrics_flags: ''
     name: tent-ci (${{ matrix.name }})
     env:
       CI: "true"
@@ -677,6 +689,7 @@ jobs:
       shell: bash
 
     - name: Install Rust toolchain
+      if: matrix.name != 'memfabric-mock'
       uses: dtolnay/rust-toolchain@stable
 
     - name: Configure project with TENT
@@ -693,15 +706,19 @@ jobs:
           export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
         fi
         cd build-tent
-        cmake --build .
-        sudo cmake --install .
+        if [ "${{ matrix.name }}" = "memfabric-mock" ]; then
+          cmake --build . --target tent_memfabric_transport_test tent_ascend_platform_mock_test
+        else
+          cmake --build .
+          sudo cmake --install .
+        fi
       shell: bash
 
     # Check the Transfer Engine Rust crate against the freshly built C++
-    # libraries. This is a compile/link check, so it is safe to run on every
-    # matrix leg (including the cuda-on leg, which only verifies that the
-    # USE_CUDA code paths compile).
+    # libraries on the full-build legs, including cuda-on. The MemFabric leg
+    # only builds its isolated mock test executables.
     - name: Check Transfer Engine Rust bindings, examples, and tests
+      if: matrix.name != 'memfabric-mock'
       run: |
         if [ -f /usr/local/cuda/lib64/stubs/libcuda.so ] && \
            [ ! -e /usr/local/cuda/lib64/stubs/libcuda.so.1 ]; then
@@ -733,7 +750,7 @@ jobs:
           -R '^tent_compat_notify_test$'
       shell: bash
 
-    # Only run tests on the cuda-off leg. GitHub runners have no real GPU;
+    # Only run tests on legs with CUDA disabled. GitHub runners have no real GPU;
     # with USE_CUDA=ON tent's cuda_probe hits the CUDA stub library at
     # runtime and drives some dispatch paths past the fake objects the
     # unit tests rely on, causing false failures. cuda-on still validates
@@ -744,9 +761,19 @@ jobs:
       run: |
         cd build-tent
         mkdir -p test-results
-        ctest --test-dir mooncake-transfer-engine/tent/tests -j \
-          --output-on-failure \
-          --output-junit "$GITHUB_WORKSPACE/build-tent/test-results/ctest.xml"
+        if [ "${{ matrix.name }}" = "memfabric-mock" ]; then
+          # Require each isolated test to be registered; matching just one
+          # executable must not hide a missing CTest entry for the other.
+          for test in tent_memfabric_transport_test tent_ascend_platform_mock_test; do
+            ctest --test-dir mooncake-transfer-engine/tent/tests \
+              -R "^${test}$" --output-on-failure --no-tests=error --timeout 120 \
+              --output-junit "$GITHUB_WORKSPACE/build-tent/test-results/${test}.xml"
+          done
+        else
+          ctest --test-dir mooncake-transfer-engine/tent/tests -j \
+            --output-on-failure \
+            --output-junit "$GITHUB_WORKSPACE/build-tent/test-results/ctest.xml"
+        fi
       shell: bash
 
     - name: Preserve TENT CTest diagnostics
@@ -755,12 +782,12 @@ jobs:
       with:
         summary-title: TENT CTest failure (${{ matrix.name }})
         artifact-name: ctest-diagnostics-tent-${{ matrix.name }}
-        junit-report: build-tent/test-results/ctest.xml
+        junit-report: build-tent/test-results/*.xml
         failed-tests-log: build-tent/mooncake-transfer-engine/tent/tests/Testing/Temporary/LastTestsFailed.log
         last-test-log: build-tent/mooncake-transfer-engine/tent/tests/Testing/Temporary/LastTest.log
 
     - name: Start Metadata Server
-      if: '!matrix.need_cuda'
+      if: ${{ !matrix.need_cuda && matrix.name != 'memfabric-mock' }}
       run: |
         cd mooncake-transfer-engine/example/http-metadata-server-python
         pip install aiohttp
@@ -769,7 +796,7 @@ jobs:
       shell: bash
 
     - name: Run Transfer Engine Rust smoke test
-      if: '!matrix.need_cuda'
+      if: ${{ !matrix.need_cuda && matrix.name != 'memfabric-mock' }}
       env:
         MOONCAKE_BUILD_DIR: ${{ github.workspace }}/build-tent
         MOONCAKE_TE_RUST_LINK_ASAN: "0"

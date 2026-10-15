@@ -208,6 +208,7 @@ foreach(
   tent_xport_mpcomm
   tent_xport_hylink
   tent_xport_fabric
+  tent_xport_memfabric
   tent_metrics)
   if(TARGET ${tgt})
     target_link_libraries(tent_link_group INTERFACE ${tgt})

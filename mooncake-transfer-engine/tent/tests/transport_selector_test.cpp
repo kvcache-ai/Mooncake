@@ -249,6 +249,7 @@ TEST(TransportSelectorTest, TransportTypeNameMapping) {
     EXPECT_STREQ(transportTypeName(UB), "ub");
     EXPECT_STREQ(transportTypeName(MPCOMM), "mpcomm");
     EXPECT_STREQ(transportTypeName(HP_TCP), "hp_tcp");
+    EXPECT_STREQ(transportTypeName(MEMFABRIC), "memfabric");
 }
 
 TEST(TransportSelectorTest, ParseTransportType) {
@@ -265,6 +266,7 @@ TEST(TransportSelectorTest, ParseTransportType) {
     EXPECT_EQ(parseTransportType("ub"), UB);
     EXPECT_EQ(parseTransportType("mpcomm"), MPCOMM);
     EXPECT_EQ(parseTransportType("hp_tcp"), HP_TCP);
+    EXPECT_EQ(parseTransportType("memfabric"), MEMFABRIC);
     EXPECT_EQ(parseTransportType("unknown"), UNSPEC);
 }
 
@@ -293,7 +295,8 @@ TEST(TransportTypeTest, WireValuesRemainStableWithXpuAppended) {
     EXPECT_EQ(static_cast<int>(HYLINK), 15);
     EXPECT_EQ(static_cast<int>(FABRIC), 16);
     EXPECT_EQ(static_cast<int>(MLU), 17);
-    EXPECT_EQ(static_cast<int>(kNumTransportTypes), 18);
+    EXPECT_EQ(static_cast<int>(MEMFABRIC), 18);
+    EXPECT_EQ(static_cast<int>(kNumTransportTypes), 19);
 }
 
 // MPComm is appended after UB, so it takes wire value 12. The same integer is

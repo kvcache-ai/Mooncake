@@ -1042,11 +1042,26 @@ class RealClient : public PyClient {
     };
 #endif
 
+#ifdef USE_MEMFABRIC
+    struct MemFabricSegmentDeleter {
+        std::string protocol = "ascend";
+        void operator()(void *ptr) {
+            if (ptr) {
+                free_memory(protocol.c_str(), ptr);
+            }
+        }
+    };
+#endif
+
     std::vector<std::unique_ptr<void, HugepageSegmentDeleter>>
         hugepage_segment_ptrs_;
     std::vector<std::unique_ptr<void, SegmentDeleter>> segment_ptrs_;
     std::vector<std::unique_ptr<void, AscendSegmentDeleter>>
         ascend_segment_ptrs_;
+#ifdef USE_MEMFABRIC
+    std::vector<std::unique_ptr<void, MemFabricSegmentDeleter>>
+        memfabric_segment_ptrs_;
+#endif
     std::vector<std::unique_ptr<void, UbSegmentDeleter>> ub_segment_ptrs_;
 #ifdef USE_VRAM_SEGMENT
     std::vector<std::unique_ptr<void, VRAMSegmentDeleter>> vram_segment_ptrs_;

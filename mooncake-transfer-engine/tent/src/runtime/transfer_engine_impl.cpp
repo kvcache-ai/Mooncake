@@ -939,6 +939,7 @@ std::vector<TransportType> TransferEngineImpl::getSupportedTransports(
     if (transport_list_[MPCOMM]) result.push_back(MPCOMM);
     if (transport_list_[TPU]) result.push_back(TPU);
     if (transport_list_[HYLINK]) result.push_back(HYLINK);
+    if (transport_list_[MEMFABRIC]) result.push_back(MEMFABRIC);
     return result;
 }
 

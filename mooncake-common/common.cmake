@@ -130,6 +130,7 @@ option(USE_FABRIC
        OFF)
 option(USE_SHCA "option for using ScaleFabric SHCA InfiniBand" OFF)
 option(USE_HYLINK "option for enabling hylink transport for Hygon DCU/DTK" OFF)
+option(USE_MEMFABRIC "option for using memfabric transport" OFF)
 
 if(USE_UB)
   add_compile_definitions(USE_UB)
@@ -634,13 +635,19 @@ if(USE_TCP)
   add_compile_definitions(USE_TCP)
 endif()
 
+if(USE_MEMFABRIC)
+  add_compile_definitions(USE_MEMFABRIC)
+  message(STATUS "memfabric transport is enabled")
+endif()
+
 if(USE_BAREX)
   add_compile_definitions(USE_BAREX)
 endif()
 
 if(USE_ASCEND
    OR USE_ASCEND_DIRECT
-   OR USE_UBSHMEM)
+   OR USE_UBSHMEM
+   OR USE_MEMFABRIC)
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DOPEN_BUILD_PROJECT ")
   set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -DOPEN_BUILD_PROJECT ")
   string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" CURRENT_CPU)
