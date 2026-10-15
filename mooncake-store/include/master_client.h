@@ -668,6 +668,15 @@ class MasterClient {
         const UUID& task_id);
 
     /**
+     * List task summaries in this client's tenant (request.tenant_id is
+     * replaced). Keep filters fixed while following next_page_token.
+     * Pages reflect current state, not a snapshot across calls; completed
+     * tasks may disappear when task-history retention prunes them.
+     */
+    [[nodiscard]] tl::expected<ListTasksResponse, ErrorCode> ListTasks(
+        TaskListRequest request = {});
+
+    /**
      * @brief Fetch tasks assigned to a client
      * @param batch_size Number of tasks to fetch
      * @return tl::expected<std::vector<TaskAssignment>, ErrorCode> list of

@@ -4,6 +4,9 @@
 
 #include <csignal>
 #include <chrono>
+#include <filesystem>
+#include <fstream>
+#include <limits>
 #include <memory>
 #include <set>
 #include <string>
@@ -11,12 +14,16 @@
 #include <vector>
 
 #include <ylt/coro_http/coro_http_client.hpp>
+#include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include <ylt/struct_json/json_reader.h>
 #include <ylt/struct_json/json_writer.h>
 #include <ylt/reflection/user_reflect_macro.hpp>
 
 #include "client_service.h"
 #include "master_client.h"
+#include "master_config.h"
+#include "rpc_service.h"
+#include "tenant/quota_policy_store.h"
 #include "task_manager.h"
 #include "types.h"
 #include "common/client_buffer_allocation.h"
@@ -956,4 +963,233 @@ TEST_F(TaskExecutorIntegrationTest, ConcurrentCopyAndMoveOperations) {
 }
 
 }  // namespace testing
+}  // namespace mooncake
+
+namespace mooncake {
+namespace {
+
+class TaskListingRpcTest : public ::testing::Test {
+   protected:
+    virtual bool MultiTenant() const { return true; }
+
+    void SetUp() override {
+        const UUID suffix = generate_uuid();
+        policy_path_ = std::filesystem::temp_directory_path() /
+                       ("task_listing_" + std::to_string(suffix.first) + "_" +
+                        std::to_string(suffix.second) + ".yaml");
+        TenantQuotaPolicySnapshot policy;
+        policy.tenant_quotas = {{"default", 64 * 1024 * 1024},
+                                {"tenant-a", 64 * 1024 * 1024}};
+        {
+            std::ofstream output(policy_path_);
+            ASSERT_TRUE(output.is_open());
+            output << FormatTenantQuotaPolicyYaml(policy);
+            ASSERT_TRUE(output.good());
+        }
+        WrappedMasterServiceConfig config;
+        config.default_kv_lease_ttl = 0;
+        config.enable_metric_reporting = false;
+        config.enable_multi_tenants = MultiTenant();
+        config.tenant_quota_connector_type = "file";
+        config.tenant_quota_connector_uri = policy_path_.string();
+        service_ = std::make_shared<WrappedMasterService>(config);
+
+        const auto ports = getFreeTcpPorts(1);
+        ASSERT_EQ(ports.size(), 1u);
+        server_ = std::make_unique<coro_rpc::coro_rpc_server>(
+            2, ports.front(), "127.0.0.1", std::chrono::seconds(0), true);
+        RegisterRpcService(*server_, *service_);
+        auto started = server_->async_start();
+        ASSERT_FALSE(started.hasResult());
+        client_ = std::make_unique<MasterClient>(source_id_);
+        tenant_client_ =
+            std::make_unique<MasterClient>(source_id_, nullptr, "tenant-a");
+        const std::string endpoint =
+            "127.0.0.1:" + std::to_string(ports.front());
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        ErrorCode connected;
+        do {
+            connected = client_->Connect(endpoint);
+            if (connected == ErrorCode::OK) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        } while (std::chrono::steady_clock::now() < deadline);
+        ASSERT_EQ(connected, ErrorCode::OK);
+        ASSERT_EQ(tenant_client_->Connect(endpoint), ErrorCode::OK);
+        Mount(source_id_, "listing-source", 0x300000000);
+        ASSERT_FALSE(HasFatalFailure());
+        Mount(target_id_, "listing-target", 0x400000000);
+        ASSERT_FALSE(HasFatalFailure());
+        ASSERT_TRUE(client_->Ping().has_value());
+    }
+
+    void TearDown() override {
+        tenant_client_.reset();
+        client_.reset();
+        if (server_) server_->stop();
+        server_.reset();
+        service_.reset();
+        std::error_code ignored;
+        std::filesystem::remove(policy_path_, ignored);
+    }
+
+    void Mount(const UUID& client, const std::string& name, uint64_t base) {
+        Segment segment;
+        segment.id = generate_uuid();
+        segment.name = name;
+        segment.base = base;
+        segment.size = 16 * 1024 * 1024;
+        ASSERT_TRUE(service_->MountSegment(segment, client).has_value());
+    }
+
+    void Put(const std::string& key, const std::string& tenant = "default") {
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.preferred_segments = {"listing-source"};
+        auto put = service_->PutStart(source_id_, key, 1024, config, tenant);
+        ASSERT_TRUE(put.has_value()) << toString(put.error());
+        ASSERT_TRUE(service_
+                        ->PutEnd(source_id_, ObjectMeta{key, std::nullopt},
+                                 ReplicaType::MEMORY, tenant)
+                        .has_value());
+    }
+
+    UUID source_id_ = generate_uuid();
+    UUID target_id_ = generate_uuid();
+    std::filesystem::path policy_path_;
+    std::shared_ptr<WrappedMasterService> service_;
+    std::unique_ptr<coro_rpc::coro_rpc_server> server_;
+    std::unique_ptr<MasterClient> client_;
+    std::unique_ptr<MasterClient> tenant_client_;
+};
+
+TEST_F(TaskListingRpcTest, PagesAndFiltersWithoutConsumingAssignments) {
+    Put("copy-key");
+    ASSERT_FALSE(HasFatalFailure());
+    Put("move-key");
+    ASSERT_FALSE(HasFatalFailure());
+    auto copy = client_->CreateCopyTask("copy-key", {"listing-target"});
+    auto move =
+        client_->CreateMoveTask("move-key", "listing-source", "listing-target");
+    ASSERT_TRUE(copy.has_value());
+    ASSERT_TRUE(move.has_value());
+    const std::set<UUID> expected{*copy, *move};
+
+    TaskListRequest request;
+    request.limit = 1;
+    auto first = client_->ListTasks(request);
+    ASSERT_TRUE(first.has_value());
+    ASSERT_EQ(first->tasks.size(), 1u);
+    ASSERT_FALSE(first->next_page_token.empty());
+    request.page_token = first->next_page_token;
+    auto second = client_->ListTasks(request);
+    ASSERT_TRUE(second.has_value());
+    ASSERT_EQ(second->tasks.size(), 1u);
+    EXPECT_TRUE(second->next_page_token.empty());
+    EXPECT_EQ((std::set<UUID>{first->tasks[0].id, second->tasks[0].id}),
+              expected);
+
+    request = {};
+    request.key = "copy-key";
+    request.type = TaskType::REPLICA_COPY;
+    request.status = TaskStatus::PENDING;
+    request.assigned_client = source_id_;
+    auto filtered = client_->ListTasks(request);
+    ASSERT_TRUE(filtered.has_value());
+    ASSERT_EQ(filtered->tasks.size(), 1u);
+    EXPECT_EQ(filtered->tasks[0].id, *copy);
+    EXPECT_EQ(filtered->tasks[0].status, TaskStatus::PENDING);
+    request.key = "missing-key";
+    auto other_key = client_->ListTasks(request);
+    ASSERT_TRUE(other_key.has_value());
+    EXPECT_TRUE(other_key->tasks.empty());
+    request.key = "copy-key";
+    request.assigned_client = target_id_;
+    auto other_client = client_->ListTasks(request);
+    ASSERT_TRUE(other_client.has_value());
+    EXPECT_TRUE(other_client->tasks.empty());
+    request.assigned_client = source_id_;
+    request.type = TaskType::REPLICA_MOVE;
+    auto other_type = client_->ListTasks(request);
+    ASSERT_TRUE(other_type.has_value());
+    EXPECT_TRUE(other_type->tasks.empty());
+    request.type = TaskType::REPLICA_COPY;
+    request.status = TaskStatus::PROCESSING;
+    auto other_status = client_->ListTasks(request);
+    ASSERT_TRUE(other_status.has_value());
+    EXPECT_TRUE(other_status->tasks.empty());
+
+    auto before = client_->QueryTask(*copy);
+    ASSERT_TRUE(before.has_value());
+    EXPECT_EQ(before->status, TaskStatus::PENDING);
+    auto fetched = client_->FetchTasks(10);
+    ASSERT_TRUE(fetched.has_value());
+    ASSERT_EQ(fetched->size(), 2u);
+    EXPECT_EQ((std::set<UUID>{(*fetched)[0].id, (*fetched)[1].id}), expected);
+    auto after = client_->QueryTask(*copy);
+    ASSERT_TRUE(after.has_value());
+    EXPECT_EQ(after->status, TaskStatus::PROCESSING);
+}
+
+TEST_F(TaskListingRpcTest, ClientTenantBindingKeepsSameKeysIsolated) {
+    Put("shared-key");
+    ASSERT_FALSE(HasFatalFailure());
+    Put("shared-key", "tenant-a");
+    ASSERT_FALSE(HasFatalFailure());
+    auto default_copy =
+        client_->CreateCopyTask("shared-key", {"listing-target"});
+    auto tenant_copy =
+        tenant_client_->CreateCopyTask("shared-key", {"listing-target"});
+    ASSERT_TRUE(default_copy.has_value());
+    ASSERT_TRUE(tenant_copy.has_value());
+
+    TaskListRequest request;
+    request.key = "shared-key";
+    request.tenant_id = "tenant-a";
+    auto defaults = client_->ListTasks(request);
+    ASSERT_TRUE(defaults.has_value());
+    ASSERT_EQ(defaults->tasks.size(), 1u);
+    EXPECT_EQ(defaults->tasks[0].id, *default_copy);
+    request.tenant_id = "default";
+    auto tenant = tenant_client_->ListTasks(request);
+    ASSERT_TRUE(tenant.has_value());
+    ASSERT_EQ(tenant->tasks.size(), 1u);
+    EXPECT_EQ(tenant->tasks[0].id, *tenant_copy);
+}
+
+TEST_F(TaskListingRpcTest, RejectsInvalidLimitsAndCursorOverRpc) {
+    for (const uint32_t limit : {0u, std::numeric_limits<uint32_t>::max()}) {
+        TaskListRequest request;
+        request.limit = limit;
+        auto result = client_->ListTasks(request);
+        ASSERT_FALSE(result.has_value());
+        EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+    }
+    TaskListRequest request;
+    request.page_token = "not-a-task-cursor";
+    auto result = client_->ListTasks(request);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+}
+
+class TaskListingSingleTenantRpcTest : public TaskListingRpcTest {
+   protected:
+    bool MultiTenant() const override { return false; }
+};
+
+TEST_F(TaskListingSingleTenantRpcTest, ResolvesClientTenantToDefault) {
+    Put("single-tenant-key");
+    ASSERT_FALSE(HasFatalFailure());
+    auto copy =
+        client_->CreateCopyTask("single-tenant-key", {"listing-target"});
+    ASSERT_TRUE(copy.has_value());
+    TaskListRequest request;
+    request.key = "single-tenant-key";
+    auto listed = tenant_client_->ListTasks(request);
+    ASSERT_TRUE(listed.has_value());
+    ASSERT_EQ(listed->tasks.size(), 1u);
+    EXPECT_EQ(listed->tasks.front().id, *copy);
+}
+
+}  // namespace
 }  // namespace mooncake

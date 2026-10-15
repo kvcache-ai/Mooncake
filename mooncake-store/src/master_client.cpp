@@ -325,6 +325,11 @@ struct RpcNameTraits<&WrappedMasterService::QueryTask> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::ListTasks> {
+    static constexpr const char* value = "ListTasks";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::FetchTasks> {
     static constexpr const char* value = "FetchTasks";
 };
@@ -1280,6 +1285,19 @@ tl::expected<QueryTaskResponse, ErrorCode> MasterClient::QueryTask(
     auto result =
         invoke_rpc<&WrappedMasterService::QueryTask, QueryTaskResponse>(
             task_id);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<ListTasksResponse, ErrorCode> MasterClient::ListTasks(
+    TaskListRequest request) {
+    request.tenant_id = tenant_id_.value();
+    ScopedVLogTimer timer(1, "MasterClient::ListTasks");
+    timer.LogRequest("tenant_id=", request.tenant_id,
+                     ", limit=", request.limit);
+    auto result =
+        invoke_rpc<&WrappedMasterService::ListTasks, ListTasksResponse>(
+            request);
     timer.LogResponseExpected(result);
     return result;
 }

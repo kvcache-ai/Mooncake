@@ -91,6 +91,23 @@ struct Task {
     }
 };
 
+struct TaskListRequest {
+    std::string tenant_id = "default";
+    std::optional<TaskStatus> status;
+    std::optional<TaskType> type;
+    std::optional<UUID> assigned_client;
+    std::optional<std::string> key;
+    std::string page_token;
+    uint32_t limit = 100;
+};
+YLT_REFL(TaskListRequest, tenant_id, status, type, assigned_client, key,
+         page_token, limit);
+
+struct TaskListPage {
+    std::vector<Task> tasks;
+    std::string next_page_token;
+};
+
 struct ReplicaCopyPayload {
     std::string tenant_id = "default";
     std::string key;
@@ -145,6 +162,11 @@ class ScopedTaskReadAccess {
     ~ScopedTaskReadAccess() = default;
 
     std::optional<Task> find_task_by_id(const UUID& task_id) const;
+
+    // Lists currently retained tasks in UUID order. Continuations are live
+    // reads, so pruning and state changes can affect subsequent pages.
+    tl::expected<TaskListPage, ErrorCode> list_tasks(
+        const TaskListRequest& request) const;
 
     using task_iterator =
         std::unordered_map<UUID, Task, boost::hash<UUID>>::const_iterator;

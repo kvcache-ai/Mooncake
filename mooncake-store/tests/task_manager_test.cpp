@@ -24,6 +24,31 @@ class ClientTaskManagerTest : public ::testing::Test {
     void TearDown() override { google::ShutdownGoogleLogging(); }
 };
 
+namespace {
+Task listing_task(uint64_t id, TaskStatus status = TaskStatus::PENDING,
+                  TaskType type = TaskType::REPLICA_COPY,
+                  const std::string& tenant = "default",
+                  const std::string& key = "key", UUID client = {1, 1}) {
+    Task task{};
+    task.id = {id, 0};
+    task.type = type;
+    task.status = status;
+    task.assigned_client = client;
+    task.created_at = task.last_updated_at = std::chrono::system_clock::now();
+    task.payload =
+        type == TaskType::REPLICA_COPY
+            ? serialize_payload(ReplicaCopyPayload{.tenant_id = tenant,
+                                                   .key = key,
+                                                   .source = "source",
+                                                   .targets = {"target"}})
+            : serialize_payload(ReplicaMovePayload{.tenant_id = tenant,
+                                                   .key = key,
+                                                   .source = "source",
+                                                   .target = "target"});
+    return task;
+}
+}  // namespace
+
 TEST_F(ClientTaskManagerTest, SubmitAndPopTask) {
     ClientTaskManager manager({10000, 10000, 10000, 0, 0, 3});
     UUID client_id = generate_uuid();
@@ -40,6 +65,277 @@ TEST_F(ClientTaskManagerTest, SubmitAndPopTask) {
     ASSERT_EQ(tasks.size(), 1);
     EXPECT_EQ(tasks[0].id, task_id);
     EXPECT_EQ(tasks[0].status, TaskStatus::PROCESSING);
+}
+
+TEST_F(ClientTaskManagerTest, ListTasksReturnsTasksWithoutDispatching) {
+    ClientTaskManager manager({10, 1, 1, 0, 0, 3});
+    const UUID client = generate_uuid();
+    const ReplicaCopyPayload payload{
+        .key = "key", .source = "source", .targets = {"target"}};
+    const auto id =
+        manager.get_write_access().submit_task_typed<TaskType::REPLICA_COPY>(
+            client, payload);
+    ASSERT_TRUE(id.has_value());
+    const auto page = manager.get_read_access().list_tasks(TaskListRequest{});
+    ASSERT_TRUE(page.has_value());
+    ASSERT_EQ(page->tasks.size(), 1u);
+    EXPECT_EQ(page->tasks.front().id, *id);
+    EXPECT_EQ(page->tasks.front().status, TaskStatus::PENDING);
+    EXPECT_TRUE(page->next_page_token.empty());
+    const auto rejected =
+        manager.get_write_access().submit_task_typed<TaskType::REPLICA_COPY>(
+            client, payload);
+    ASSERT_FALSE(rejected.has_value());
+    EXPECT_EQ(rejected.error(), ErrorCode::TASK_PENDING_LIMIT_EXCEEDED);
+    const auto popped = manager.get_write_access().pop_tasks(client, 1);
+    ASSERT_EQ(popped.size(), 1u);
+    EXPECT_EQ(popped.front().id, *id);
+    const auto processing =
+        manager.get_read_access().list_tasks(TaskListRequest{});
+    ASSERT_TRUE(processing.has_value());
+    ASSERT_EQ(processing->tasks.size(), 1u);
+    EXPECT_EQ(processing->tasks.front().status, TaskStatus::PROCESSING);
+    ASSERT_TRUE(manager.get_write_access()
+                    .submit_task_typed<TaskType::REPLICA_COPY>(client, payload)
+                    .has_value());
+    EXPECT_TRUE(manager.get_write_access().pop_tasks(client, 1).empty());
+}
+
+TEST_F(ClientTaskManagerTest, ListTasksFiltersAndPagesInUuidOrder) {
+    ClientTaskManager manager({100, 100, 100, 0, 0, 3});
+    for (uint64_t id : {7, 1, 5, 3}) {
+        manager.get_write_access().restore_task(listing_task(id));
+    }
+    manager.get_write_access().restore_task(listing_task(
+        2, TaskStatus::PROCESSING, TaskType::REPLICA_MOVE, "tenant-b", "key"));
+    manager.get_write_access().restore_task(listing_task(
+        4, TaskStatus::SUCCESS, TaskType::REPLICA_COPY, "default", "other"));
+    manager.get_write_access().restore_task(
+        listing_task(6, TaskStatus::FAILED, TaskType::REPLICA_MOVE, "default",
+                     "key", {2, 2}));
+    TaskListRequest request;
+    request.status = TaskStatus::PENDING;
+    request.type = TaskType::REPLICA_COPY;
+    request.assigned_client = UUID{1, 1};
+    request.key = "key";
+    request.limit = 2;
+    auto page = manager.get_read_access().list_tasks(request);
+    ASSERT_TRUE(page.has_value());
+    ASSERT_EQ(page->tasks.size(), 2u);
+    EXPECT_EQ(page->tasks[0].id, (UUID{1, 0}));
+    EXPECT_EQ(page->tasks[1].id, (UUID{3, 0}));
+    EXPECT_FALSE(page->next_page_token.empty());
+    request.page_token = page->next_page_token;
+    page = manager.get_read_access().list_tasks(request);
+    ASSERT_TRUE(page.has_value());
+    ASSERT_EQ(page->tasks.size(), 2u);
+    EXPECT_EQ(page->tasks[0].id, (UUID{5, 0}));
+    EXPECT_EQ(page->tasks[1].id, (UUID{7, 0}));
+    EXPECT_TRUE(page->next_page_token.empty());
+    request = TaskListRequest{};
+    request.tenant_id = "tenant-b";
+    page = manager.get_read_access().list_tasks(request);
+    ASSERT_TRUE(page.has_value());
+    ASSERT_EQ(page->tasks.size(), 1u);
+    EXPECT_EQ(page->tasks.front().id, (UUID{2, 0}));
+}
+
+TEST_F(ClientTaskManagerTest, ListTasksRejectsInvalidRequests) {
+    ClientTaskManager manager({100, 100, 100, 0, 0, 3});
+    manager.get_write_access().restore_task(listing_task(1));
+    const auto invalid = [&](const TaskListRequest& request) {
+        const auto result = manager.get_read_access().list_tasks(request);
+        return !result.has_value() &&
+               result.error() == ErrorCode::INVALID_PARAMS;
+    };
+    TaskListRequest request;
+    request.limit = 1001;
+    ASSERT_TRUE(invalid(request));
+    request.limit = 0;
+    ASSERT_TRUE(invalid(request));
+    request = TaskListRequest{};
+    request.status = static_cast<TaskStatus>(-1);
+    ASSERT_TRUE(invalid(request));
+    request.status = static_cast<TaskStatus>(4);
+    ASSERT_TRUE(invalid(request));
+    request.status.reset();
+    request.type = static_cast<TaskType>(-1);
+    ASSERT_TRUE(invalid(request));
+    request.type = static_cast<TaskType>(2);
+    ASSERT_TRUE(invalid(request));
+    request = TaskListRequest{};
+    for (const std::string& tenant : std::vector<std::string>{
+             "_internal", "bad\ntenant", std::string("bad\0tenant", 10)}) {
+        request.tenant_id = tenant;
+        ASSERT_TRUE(invalid(request));
+    }
+    request = TaskListRequest{};
+    for (const std::string token :
+         {"v2:1-0", "1-0", "v1:", "v1:1", "v1:-1-0", "v1:+1-0", "v1:01-0",
+          "v1:1-00", "v1:1-0x", "v1:1-0 ", "v1:1-0:extra",
+          "v1:18446744073709551616-0"}) {
+        request.page_token = token;
+        ASSERT_TRUE(invalid(request));
+    }
+    request = TaskListRequest{};
+    request.limit = 1000;
+    EXPECT_TRUE(manager.get_read_access().list_tasks(request).has_value());
+    request.page_token = "v1:18446744073709551615-18446744073709551615";
+    const auto empty = manager.get_read_access().list_tasks(request);
+    ASSERT_TRUE(empty.has_value());
+    EXPECT_TRUE(empty->tasks.empty());
+    EXPECT_TRUE(empty->next_page_token.empty());
+}
+
+TEST_F(ClientTaskManagerTest, ListTasksIsolatesLegacyAndMalformedPayloads) {
+    ClientTaskManager manager({100, 100, 100, 0, 0, 3});
+    Task legacy = listing_task(1);
+    legacy.payload = R"({"key":"key","source":"source","targets":["target"]})";
+    manager.get_write_access().restore_task(std::move(legacy));
+    manager.get_write_access().restore_task(listing_task(
+        2, TaskStatus::PENDING, TaskType::REPLICA_MOVE, "tenant-b"));
+    uint64_t id = 3;
+    for (const std::string payload :
+         {"", "{", "[]", "not json", R"({"tenant_id":3,"key":"key"})",
+          R"({"tenant_id":"tenant-b","key":4})",
+          R"({"tenant_id":"tenant-b","key":"key"})garbage",
+             R"({"tenant_id":"tenant-b","tenant_id":"default","key":"key"})",
+          R"({"key":"key","source":"source","targets":[])"}) {
+        Task malformed = listing_task(id++);
+        malformed.payload = payload;
+        manager.get_write_access().restore_task(std::move(malformed));
+    }
+    auto page = manager.get_read_access().list_tasks(TaskListRequest{});
+    ASSERT_TRUE(page.has_value());
+    ASSERT_EQ(page->tasks.size(), 1u);
+    EXPECT_EQ(page->tasks.front().id, (UUID{1, 0}));
+    TaskListRequest request;
+    request.tenant_id = "tenant-b";
+    page = manager.get_read_access().list_tasks(request);
+    ASSERT_TRUE(page.has_value());
+    ASSERT_EQ(page->tasks.size(), 1u);
+    EXPECT_EQ(page->tasks.front().id, (UUID{2, 0}));
+    request.tenant_id = "";
+    page = manager.get_read_access().list_tasks(request);
+    ASSERT_TRUE(page.has_value());
+    ASSERT_EQ(page->tasks.size(), 1u);
+    EXPECT_EQ(page->tasks.front().id, (UUID{1, 0}));
+}
+
+TEST_F(ClientTaskManagerTest, ListTasksSupportsEveryStatusAndTypeFilter) {
+    ClientTaskManager manager({100, 100, 100, 0, 0, 3});
+    uint64_t id = 0;
+    for (const auto status : {TaskStatus::PENDING, TaskStatus::PROCESSING,
+                              TaskStatus::FAILED, TaskStatus::SUCCESS}) {
+        for (const auto type :
+             {TaskType::REPLICA_COPY, TaskType::REPLICA_MOVE}) {
+            manager.get_write_access().restore_task(
+                listing_task(++id, status, type));
+        }
+    }
+    for (const auto status : {TaskStatus::PENDING, TaskStatus::PROCESSING,
+                              TaskStatus::FAILED, TaskStatus::SUCCESS}) {
+        TaskListRequest request;
+        request.status = status;
+        auto page = manager.get_read_access().list_tasks(request);
+        ASSERT_TRUE(page.has_value());
+        ASSERT_EQ(page->tasks.size(), 2u);
+        for (const auto& task : page->tasks) {
+            EXPECT_EQ(task.status, status);
+        }
+        for (const auto type :
+             {TaskType::REPLICA_COPY, TaskType::REPLICA_MOVE}) {
+            request.type = type;
+            page = manager.get_read_access().list_tasks(request);
+            ASSERT_TRUE(page.has_value());
+            ASSERT_EQ(page->tasks.size(), 1u);
+            EXPECT_EQ(page->tasks.front().type, type);
+        }
+    }
+    for (const auto type : {TaskType::REPLICA_COPY, TaskType::REPLICA_MOVE}) {
+        TaskListRequest request;
+        request.type = type;
+        const auto page = manager.get_read_access().list_tasks(request);
+        ASSERT_TRUE(page.has_value());
+        ASSERT_EQ(page->tasks.size(), 4u);
+        for (const auto& task : page->tasks) {
+            EXPECT_EQ(task.type, type);
+        }
+    }
+    TaskListRequest request;
+    request.assigned_client = UUID{99, 99};
+    EXPECT_TRUE(manager.get_read_access().list_tasks(request)->tasks.empty());
+    request = TaskListRequest{};
+    request.key = "";
+    EXPECT_TRUE(manager.get_read_access().list_tasks(request)->tasks.empty());
+}
+
+TEST_F(ClientTaskManagerTest,
+       ListTasksContinuationSurvivesPruneAndSeesChanges) {
+    ClientTaskManager manager({0, 100, 100, 0, 0, 3});
+    for (uint64_t id : {10, 30, 40}) {
+        manager.get_write_access().restore_task(listing_task(id));
+    }
+    manager.get_write_access().restore_task(
+        listing_task(20, TaskStatus::PROCESSING));
+    TaskListRequest request;
+    request.limit = 1;
+    const auto first = manager.get_read_access().list_tasks(request);
+    ASSERT_TRUE(first.has_value());
+    ASSERT_EQ(first->tasks.size(), 1u);
+    EXPECT_EQ(first->tasks.front().id, (UUID{10, 0}));
+    ASSERT_EQ(manager.get_write_access().complete_task(
+                  {1, 1}, {10, 0}, TaskStatus::SUCCESS, "done"),
+              ErrorCode::OK);
+    manager.get_write_access().prune_finished_tasks();
+    EXPECT_FALSE(
+        manager.get_read_access().find_task_by_id({10, 0}).has_value());
+    ASSERT_EQ(manager.get_write_access().complete_task(
+                  {1, 1}, {20, 0}, TaskStatus::SUCCESS, "new status"),
+              ErrorCode::OK);
+    manager.get_write_access().restore_task(listing_task(5));
+    manager.get_write_access().restore_task(listing_task(15));
+    request.limit = 100;
+    request.page_token = first->next_page_token;
+    const auto next = manager.get_read_access().list_tasks(request);
+    ASSERT_TRUE(next.has_value());
+    ASSERT_EQ(next->tasks.size(), 4u);
+    EXPECT_EQ(next->tasks[0].id, (UUID{15, 0}));
+    EXPECT_EQ(next->tasks[1].id, (UUID{20, 0}));
+    EXPECT_EQ(next->tasks[1].status, TaskStatus::SUCCESS);
+    EXPECT_EQ(next->tasks[1].message, "new status");
+    EXPECT_EQ(next->tasks[2].id, (UUID{30, 0}));
+    EXPECT_EQ(next->tasks[3].id, (UUID{40, 0}));
+    EXPECT_TRUE(next->next_page_token.empty());
+}
+
+TEST_F(ClientTaskManagerTest, ListTasksPreservesSerializerAndRestoredRecords) {
+    ClientTaskManager manager({100, 100, 100, 0, 0, 3});
+    for (uint64_t id : {3, 1, 2}) {
+        manager.get_write_access().restore_task(listing_task(id));
+    }
+    TaskManagerSerializer serializer(&manager);
+    const auto before = serializer.Serialize();
+    ASSERT_TRUE(before.has_value());
+    const auto page = manager.get_read_access().list_tasks(TaskListRequest{});
+    ASSERT_TRUE(page.has_value());
+    const auto after = serializer.Serialize();
+    ASSERT_TRUE(after.has_value());
+    EXPECT_EQ(*before, *after);
+    ClientTaskManager restored({100, 100, 100, 0, 0, 3});
+    TaskManagerSerializer restored_serializer(&restored);
+    ASSERT_TRUE(restored_serializer.Deserialize(*before).has_value());
+    const auto restored_page =
+        restored.get_read_access().list_tasks(TaskListRequest{});
+    ASSERT_TRUE(restored_page.has_value());
+    ASSERT_EQ(restored_page->tasks.size(), page->tasks.size());
+    for (size_t i = 0; i < page->tasks.size(); ++i) {
+        EXPECT_EQ(restored_page->tasks[i].id, page->tasks[i].id);
+        EXPECT_EQ(restored_page->tasks[i].payload, page->tasks[i].payload);
+        EXPECT_EQ(restored_page->tasks[i].status, page->tasks[i].status);
+        EXPECT_EQ(restored_page->tasks[i].assigned_client,
+                  page->tasks[i].assigned_client);
+    }
 }
 
 TEST_F(ClientTaskManagerTest, MarkTaskComplete) {
