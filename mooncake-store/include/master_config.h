@@ -161,24 +161,11 @@ struct MasterConfig {
     std::string tenant_quota_connector_type = "file";
     std::string tenant_quota_connector_uri;
 
-    bool enable_snapshot_restore;
-    bool enable_snapshot;
-    std::string snapshot_backup_dir;
     uint64_t snapshot_interval_seconds;
-    uint64_t snapshot_child_timeout_seconds;
-    uint32_t snapshot_retention_count;
 
     // Snapshot object store type: "local" or "s3", required when
-    // snapshot or restore is enabled
+    // batch OpLog snapshot is enabled
     std::string snapshot_object_store_type;
-
-    // Snapshot catalog store type: ""/"embedded" or "redis". Empty keeps the
-    // embedded catalog behavior. "payload" remains a deprecated alias.
-    std::string snapshot_catalog_store_type;
-
-    // Optional connection string for snapshot catalog store. When empty, the
-    // implementation may fall back to a backend-specific default.
-    std::string snapshot_catalog_store_connstring;
 
     // Task manager configuration
     uint32_t max_total_finished_tasks;
@@ -299,16 +286,8 @@ class MasterServiceSupervisorConfig {
         DEFAULT_PROCESSING_TASK_TIMEOUT_SEC;  // 0 = no timeout(infinite)
     uint32_t max_retry_attempts = DEFAULT_MAX_RETRY_ATTEMPTS;
 
-    bool enable_snapshot_restore = false;
-    bool enable_snapshot = false;
-    std::string snapshot_backup_dir = DEFAULT_SNAPSHOT_BACKUP_DIR;
     uint64_t snapshot_interval_seconds = DEFAULT_SNAPSHOT_INTERVAL_SEC;
-    uint64_t snapshot_child_timeout_seconds =
-        DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC;
-    uint32_t snapshot_retention_count = DEFAULT_SNAPSHOT_RETENTION_COUNT;
     std::string snapshot_object_store_type;
-    std::string snapshot_catalog_store_type;
-    std::string snapshot_catalog_store_connstring;
 
     std::string cxl_path = DEFAULT_CXL_PATH;
     size_t cxl_size = DEFAULT_CXL_SIZE;
@@ -463,16 +442,8 @@ class MasterServiceSupervisorConfig {
         tenant_quota_connector_type = config.tenant_quota_connector_type;
         tenant_quota_connector_uri = config.tenant_quota_connector_uri;
 
-        enable_snapshot_restore = config.enable_snapshot_restore;
-        enable_snapshot = config.enable_snapshot;
-        snapshot_backup_dir = config.snapshot_backup_dir;
         snapshot_interval_seconds = config.snapshot_interval_seconds;
-        snapshot_child_timeout_seconds = config.snapshot_child_timeout_seconds;
-        snapshot_retention_count = config.snapshot_retention_count;
         snapshot_object_store_type = config.snapshot_object_store_type;
-        snapshot_catalog_store_type = config.snapshot_catalog_store_type;
-        snapshot_catalog_store_connstring =
-            config.snapshot_catalog_store_connstring;
         max_total_finished_tasks = config.max_total_finished_tasks;
         max_total_pending_tasks = config.max_total_pending_tasks;
         max_total_processing_tasks = config.max_total_processing_tasks;
@@ -624,16 +595,8 @@ class WrappedMasterServiceConfig {
     std::string tenant_quota_connector_type = "file";
     std::string tenant_quota_connector_uri;
 
-    bool enable_snapshot_restore = false;
-    bool enable_snapshot = false;
-    std::string snapshot_backup_dir = DEFAULT_SNAPSHOT_BACKUP_DIR;
     uint64_t snapshot_interval_seconds = DEFAULT_SNAPSHOT_INTERVAL_SEC;
-    uint64_t snapshot_child_timeout_seconds =
-        DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC;
-    uint32_t snapshot_retention_count = DEFAULT_SNAPSHOT_RETENTION_COUNT;
     std::string snapshot_object_store_type;
-    std::string snapshot_catalog_store_type;
-    std::string snapshot_catalog_store_connstring;
     uint32_t max_total_finished_tasks = DEFAULT_MAX_TOTAL_FINISHED_TASKS;
     uint32_t max_total_pending_tasks = DEFAULT_MAX_TOTAL_PENDING_TASKS;
     uint32_t max_total_processing_tasks = DEFAULT_MAX_TOTAL_PROCESSING_TASKS;
@@ -756,16 +719,8 @@ class WrappedMasterServiceConfig {
         put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
         put_start_release_timeout_sec = config.put_start_release_timeout_sec;
 
-        enable_snapshot_restore = config.enable_snapshot_restore;
-        enable_snapshot = config.enable_snapshot;
-        snapshot_backup_dir = config.snapshot_backup_dir;
         snapshot_interval_seconds = config.snapshot_interval_seconds;
-        snapshot_child_timeout_seconds = config.snapshot_child_timeout_seconds;
-        snapshot_retention_count = config.snapshot_retention_count;
         snapshot_object_store_type = config.snapshot_object_store_type;
-        snapshot_catalog_store_type = config.snapshot_catalog_store_type;
-        snapshot_catalog_store_connstring =
-            config.snapshot_catalog_store_connstring;
         max_total_finished_tasks = config.max_total_finished_tasks;
         max_total_pending_tasks = config.max_total_pending_tasks;
         max_total_processing_tasks = config.max_total_processing_tasks;
@@ -861,16 +816,8 @@ class WrappedMasterServiceConfig {
         put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
         put_start_release_timeout_sec = config.put_start_release_timeout_sec;
 
-        enable_snapshot = config.enable_snapshot;
-        enable_snapshot_restore = config.enable_snapshot_restore;
-        snapshot_backup_dir = config.snapshot_backup_dir;
         snapshot_interval_seconds = config.snapshot_interval_seconds;
-        snapshot_child_timeout_seconds = config.snapshot_child_timeout_seconds;
-        snapshot_retention_count = config.snapshot_retention_count;
         snapshot_object_store_type = config.snapshot_object_store_type;
-        snapshot_catalog_store_type = config.snapshot_catalog_store_type;
-        snapshot_catalog_store_connstring =
-            config.snapshot_catalog_store_connstring;
         max_total_finished_tasks = config.max_total_finished_tasks;
         max_total_pending_tasks = config.max_total_pending_tasks;
         max_total_processing_tasks = config.max_total_processing_tasks;
@@ -923,6 +870,8 @@ class MasterServiceConfigBuilder {
     uint64_t snapshot_chunk_object_count_ = 1000000;
     int oplog_poll_interval_ms_ = 1000;
     uint32_t oplog_batch_max_entries_ = 1024;
+    uint64_t restore_repair_durable_timeout_ms_ =
+        DEFAULT_RESTORE_REPAIR_DURABLE_TIMEOUT_MS;
     std::string cluster_id_ = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir_ = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size_ = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
@@ -936,16 +885,8 @@ class MasterServiceConfigBuilder {
     std::string tenant_quota_connector_uri_;
     uint64_t put_start_discard_timeout_sec_ = DEFAULT_PUT_START_DISCARD_TIMEOUT;
     uint64_t put_start_release_timeout_sec_ = DEFAULT_PUT_START_RELEASE_TIMEOUT;
-    bool enable_snapshot_restore_ = false;
-    bool enable_snapshot_ = false;
-    std::string snapshot_backup_dir_ = DEFAULT_SNAPSHOT_BACKUP_DIR;
     uint64_t snapshot_interval_seconds_ = DEFAULT_SNAPSHOT_INTERVAL_SEC;
-    uint64_t snapshot_child_timeout_seconds_ =
-        DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC;
-    uint32_t snapshot_retention_count_ = DEFAULT_SNAPSHOT_RETENTION_COUNT;
     std::string snapshot_object_store_type_;
-    std::string snapshot_catalog_store_type_;
-    std::string snapshot_catalog_store_connstring_;
     uint32_t max_total_finished_tasks_ = DEFAULT_MAX_TOTAL_FINISHED_TASKS;
     uint32_t max_total_pending_tasks_ = DEFAULT_MAX_TOTAL_PENDING_TASKS;
     uint32_t max_total_processing_tasks_ = DEFAULT_MAX_TOTAL_PROCESSING_TASKS;
@@ -1102,6 +1043,12 @@ class MasterServiceConfigBuilder {
         return *this;
     }
 
+    MasterServiceConfigBuilder& set_restore_repair_durable_timeout_ms(
+        uint64_t timeout_ms) {
+        restore_repair_durable_timeout_ms_ = timeout_ms;
+        return *this;
+    }
+
     MasterServiceConfigBuilder& set_cluster_id(const std::string& id) {
         cluster_id_ = id;
         return *this;
@@ -1159,36 +1106,9 @@ class MasterServiceConfigBuilder {
         return *this;
     }
 
-    MasterServiceConfigBuilder& set_enable_snapshot_restore(bool enable) {
-        enable_snapshot_restore_ = enable;
-        return *this;
-    }
-
-    MasterServiceConfigBuilder& set_enable_snapshot(bool enable) {
-        enable_snapshot_ = enable;
-        return *this;
-    }
-
-    MasterServiceConfigBuilder& set_snapshot_backup_dir(
-        const std::string& dir) {
-        snapshot_backup_dir_ = dir;
-        return *this;
-    }
-
     MasterServiceConfigBuilder& set_snapshot_interval_seconds(
         uint64_t seconds) {
         snapshot_interval_seconds_ = seconds;
-        return *this;
-    }
-
-    MasterServiceConfigBuilder& set_snapshot_child_timeout_seconds(
-        uint64_t seconds) {
-        snapshot_child_timeout_seconds_ = seconds;
-        return *this;
-    }
-
-    MasterServiceConfigBuilder& set_snapshot_retention_count(uint32_t count) {
-        snapshot_retention_count_ = count;
         return *this;
     }
 
@@ -1196,39 +1116,6 @@ class MasterServiceConfigBuilder {
         const std::string& type) {
         snapshot_object_store_type_ = type;
         return *this;
-    }
-
-    // Deprecated compatibility shims for older tests and call sites.
-    MasterServiceConfigBuilder& set_snapshot_payload_store_type(
-        const std::string& type) {
-        return set_snapshot_object_store_type(type);
-    }
-
-    MasterServiceConfigBuilder& set_snapshot_payload_backend_type(
-        const std::string& type) {
-        return set_snapshot_object_store_type(type);
-    }
-
-    MasterServiceConfigBuilder& set_snapshot_catalog_store_type(
-        const std::string& type) {
-        snapshot_catalog_store_type_ = type;
-        return *this;
-    }
-
-    MasterServiceConfigBuilder& set_snapshot_catalog_backend_type(
-        const std::string& type) {
-        return set_snapshot_catalog_store_type(type);
-    }
-
-    MasterServiceConfigBuilder& set_snapshot_catalog_store_connstring(
-        const std::string& connstring) {
-        snapshot_catalog_store_connstring_ = connstring;
-        return *this;
-    }
-
-    MasterServiceConfigBuilder& set_snapshot_catalog_backend_connstring(
-        const std::string& connstring) {
-        return set_snapshot_catalog_store_connstring(connstring);
     }
 
     MasterServiceConfigBuilder& set_max_total_finished_tasks(
@@ -1353,6 +1240,8 @@ class MasterServiceConfig {
     uint64_t snapshot_chunk_object_count = 1000000;
     int oplog_poll_interval_ms = 1000;
     uint32_t oplog_batch_max_entries = 1024;
+    uint64_t restore_repair_durable_timeout_ms =
+        DEFAULT_RESTORE_REPAIR_DURABLE_TIMEOUT_MS;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
@@ -1367,16 +1256,8 @@ class MasterServiceConfig {
     std::string tenant_quota_connector_type = "file";
     std::string tenant_quota_connector_uri;
 
-    bool enable_snapshot_restore = false;
-    bool enable_snapshot = false;
-    std::string snapshot_backup_dir = DEFAULT_SNAPSHOT_BACKUP_DIR;
     uint64_t snapshot_interval_seconds = DEFAULT_SNAPSHOT_INTERVAL_SEC;
-    uint64_t snapshot_child_timeout_seconds =
-        DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC;
-    uint32_t snapshot_retention_count = DEFAULT_SNAPSHOT_RETENTION_COUNT;
     std::string snapshot_object_store_type;
-    std::string snapshot_catalog_store_type;
-    std::string snapshot_catalog_store_connstring;
     TaskManagerConfig task_manager_config = {
         .max_total_finished_tasks = DEFAULT_MAX_TOTAL_FINISHED_TASKS,
         .max_total_pending_tasks = DEFAULT_MAX_TOTAL_PENDING_TASKS,
@@ -1466,16 +1347,8 @@ class MasterServiceConfig {
         put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
         put_start_release_timeout_sec = config.put_start_release_timeout_sec;
 
-        enable_snapshot_restore = config.enable_snapshot_restore;
-        enable_snapshot = config.enable_snapshot;
-        snapshot_backup_dir = config.snapshot_backup_dir;
         snapshot_interval_seconds = config.snapshot_interval_seconds;
-        snapshot_child_timeout_seconds = config.snapshot_child_timeout_seconds;
-        snapshot_retention_count = config.snapshot_retention_count;
         snapshot_object_store_type = config.snapshot_object_store_type;
-        snapshot_catalog_store_type = config.snapshot_catalog_store_type;
-        snapshot_catalog_store_connstring =
-            config.snapshot_catalog_store_connstring;
 
         task_manager_config.max_total_finished_tasks =
             config.max_total_finished_tasks;
@@ -1535,6 +1408,8 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.snapshot_chunk_object_count = snapshot_chunk_object_count_;
     config.oplog_poll_interval_ms = oplog_poll_interval_ms_;
     config.oplog_batch_max_entries = oplog_batch_max_entries_;
+    config.restore_repair_durable_timeout_ms =
+        restore_repair_durable_timeout_ms_;
     config.cluster_id = cluster_id_;
     config.root_fs_dir = root_fs_dir_;
     config.global_file_segment_size = global_file_segment_size_;
@@ -1547,16 +1422,8 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.enable_multi_tenants = enable_multi_tenants_;
     config.tenant_quota_connector_type = tenant_quota_connector_type_;
     config.tenant_quota_connector_uri = tenant_quota_connector_uri_;
-    config.enable_snapshot_restore = enable_snapshot_restore_;
-    config.enable_snapshot = enable_snapshot_;
-    config.snapshot_backup_dir = snapshot_backup_dir_;
     config.snapshot_interval_seconds = snapshot_interval_seconds_;
-    config.snapshot_child_timeout_seconds = snapshot_child_timeout_seconds_;
-    config.snapshot_retention_count = snapshot_retention_count_;
     config.snapshot_object_store_type = snapshot_object_store_type_;
-    config.snapshot_catalog_store_type = snapshot_catalog_store_type_;
-    config.snapshot_catalog_store_connstring =
-        snapshot_catalog_store_connstring_;
     config.task_manager_config.max_total_finished_tasks =
         max_total_finished_tasks_;
     config.task_manager_config.max_total_pending_tasks =
@@ -1593,6 +1460,8 @@ struct InProcMasterConfig {
     std::optional<std::string> root_fs_dir;
     std::optional<bool> enable_disk_eviction;
     std::optional<uint64_t> quota_bytes;
+    std::optional<bool> enable_multi_tenants;
+    std::optional<std::string> tenant_quota_connector_uri;
 };
 
 // Builder class for InProcMasterConfig
@@ -1610,6 +1479,8 @@ class InProcMasterConfigBuilder {
     std::optional<std::string> root_fs_dir_ = std::nullopt;
     std::optional<bool> enable_disk_eviction_ = std::nullopt;
     std::optional<uint64_t> quota_bytes_ = std::nullopt;
+    std::optional<bool> enable_multi_tenants_ = std::nullopt;
+    std::optional<std::string> tenant_quota_connector_uri_ = std::nullopt;
 
    public:
     InProcMasterConfigBuilder() = default;
@@ -1678,6 +1549,17 @@ class InProcMasterConfigBuilder {
         return *this;
     }
 
+    InProcMasterConfigBuilder& set_enable_multi_tenants(bool enable) {
+        enable_multi_tenants_ = enable;
+        return *this;
+    }
+
+    InProcMasterConfigBuilder& set_tenant_quota_connector_uri(
+        const std::string& uri) {
+        tenant_quota_connector_uri_ = uri;
+        return *this;
+    }
+
     InProcMasterConfig build() const;
 };
 
@@ -1696,6 +1578,8 @@ inline InProcMasterConfig InProcMasterConfigBuilder::build() const {
     config.root_fs_dir = root_fs_dir_;
     config.enable_disk_eviction = enable_disk_eviction_;
     config.quota_bytes = quota_bytes_;
+    config.enable_multi_tenants = enable_multi_tenants_;
+    config.tenant_quota_connector_uri = tenant_quota_connector_uri_;
     return config;
 }
 

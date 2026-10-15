@@ -154,7 +154,8 @@ if(WITH_STORE)
     store/buffer_pool.cpp
     store/engram_store_py.cpp
     integration_utils.h)
-  set_target_properties(store PROPERTIES INSTALL_RPATH "$ORIGIN")
+  set_target_properties(
+    store PROPERTIES OUTPUT_NAME "_store" INSTALL_RPATH "$ORIGIN")
   if(USE_TENT)
     target_link_libraries(store PRIVATE tent)
   endif()
@@ -167,6 +168,14 @@ if(WITH_STORE)
       store PUBLIC transfer_engine glog::glog gflags::gflags mooncake_store
                    cachelib_memory_allocator)
   endif()
+endif()
+
+if(WITH_CONDUCTOR)
+  pybind11_add_module(_conductor conductor/conductor_py.cpp)
+  set_target_properties(_conductor PROPERTIES INSTALL_RPATH "$ORIGIN")
+  target_link_libraries(_conductor PRIVATE conductor_cpp_core glog::glog)
+  install(TARGETS _conductor LIBRARY DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR}
+                                     COMPONENT python)
 endif()
 
 if(NOT SKBUILD)
@@ -210,6 +219,11 @@ install(
   DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR}
   COMPONENT python)
 
+install(
+  FILES "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/conductor.py"
+  DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR}
+  COMPONENT python)
+
 if(WITH_TE)
   install(
     FILES "${CMAKE_CURRENT_SOURCE_DIR}/shared_segment.py"
@@ -222,6 +236,8 @@ endif()
 if(NOT SKBUILD)
   install(
     FILES
+      "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/__init__.py"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/buffer_pool.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/http_metadata_server.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/_launcher.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/cli_bench.py"
@@ -229,6 +245,13 @@ if(NOT SKBUILD)
       "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/mooncake_connector_v1.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/vllm_v1_proxy_server.py"
     DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR})
+
+  install(
+    DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/store/"
+    DESTINATION "${MOONCAKE_PYTHON_INSTALL_DIR}/store"
+    COMPONENT python
+    FILES_MATCHING
+    PATTERN "*.py")
 
   if(WITH_STORE)
     install(
@@ -250,14 +273,6 @@ if(NOT SKBUILD)
     endif()
   endif()
 
-  install(DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/${PYTHON_PACKAGE_NAME}/
-          DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR})
-
-  install(
-    CODE "
-          execute_process(COMMAND chmod 767 \"${MOONCAKE_PYTHON_INSTALL_DIR}\")
-          execute_process(COMMAND chmod 766 \"${MOONCAKE_PYTHON_INSTALL_DIR}/__init__.py\")
-      ")
 endif()
 
 if(WITH_STORE)
@@ -265,17 +280,21 @@ if(WITH_STORE)
                                 COMPONENT python)
 endif()
 
+if(WITH_TE OR WITH_CONDUCTOR)
+  install(TARGETS asio_shared LIBRARY DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR}
+                                      COMPONENT python)
+endif()
+
 if(WITH_TE)
-  install(TARGETS engine asio_shared
-          LIBRARY DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR} COMPONENT python)
-  # Co-locate libtent_metrics.so with the python C extensions so engine.so and
-  # store.so resolve it via $ORIGIN RPATH. The shared TentMetrics singleton
+  install(TARGETS engine LIBRARY DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR}
+                                 COMPONENT python)
+  # Co-locate libtent_metrics.so with the Python C extensions so engine.so and
+  # _store.so resolve it via $ORIGIN RPATH. The shared TentMetrics singleton
   # must be loadable wherever the extensions are installed; otherwise
   # `import mooncake.engine` / `mooncake.store` fails with a missing library.
   if(TARGET tent_metrics)
     install(TARGETS tent_metrics
-            LIBRARY DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR}
-            COMPONENT python)
+            LIBRARY DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR} COMPONENT python)
   endif()
 endif()
 
