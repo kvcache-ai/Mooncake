@@ -16,13 +16,20 @@ ErrorCode LocalSsdTaskMailbox::EnqueueOffload(OffloadTaskItem task,
     if (!enable_offloading_) {
         return ErrorCode::UNABLE_OFFLOADING;
     }
+    auto index = TenantId(task.tenant_id).MakeScopedKey(task.key);
+    auto it = pending_offloads_.find(index);
+    if (it != pending_offloads_.end()) {
+        // An item still queued for the key belongs to an earlier task of it
+        // (the master queues a key's next task only after the previous one
+        // ended), so no store can report it any more. The new task's item
+        // takes its place; the queue does not grow.
+        it->second = std::move(task);
+        return ErrorCode::OK;
+    }
     if (pending_offloads_.size() >= limit) {
         return ErrorCode::KEYS_ULTRA_LIMIT;
     }
-    auto index = TenantId(task.tenant_id).MakeScopedKey(task.key);
-    if (!pending_offloads_.emplace(std::move(index), std::move(task)).second) {
-        return ErrorCode::OBJECT_ALREADY_EXISTS;
-    }
+    pending_offloads_.emplace(std::move(index), std::move(task));
     return ErrorCode::OK;
 }
 

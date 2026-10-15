@@ -229,30 +229,26 @@ class PromotionOnHitTest : public ::testing::Test {
     }
 
     // Inject a synthetic LOCAL_DISK replica for `key` on `client_id`'s
-    // segment via NotifyOffloadSuccess. Lets tests put a key into
-    // LOCAL_DISK-only state without running the full offload pipeline.
+    // segment via AddReplica (creating the object if it does not exist).
+    // Lets tests put a key into LOCAL_DISK-only state without running the
+    // full offload pipeline; NotifyOffloadSuccess only registers the
+    // completion of an offload task the client took.
     bool InjectLocalDiskReplica(
         MasterService& service, const UUID& client_id, const std::string& key,
         int64_t size, const std::string& transport_endpoint,
         std::string tenant_id = std::string(TenantId::kDefaultValue)) {
-        // NotifyOffloadSuccess registers replicas only for a client with a
-        // mounted LOCAL_DISK segment, the way the real offload pipeline
-        // mounts before registering. Idempotent, so repeat injections for
-        // the same client are fine.
+        // Disk replicas are registered only for a client with a mounted
+        // LOCAL_DISK segment, the way the real offload pipeline mounts
+        // before registering. Idempotent, so repeat injections for the same
+        // client are fine.
         auto mount = service.MountLocalDiskSegment(client_id, true);
         if (!mount.has_value()) {
             return false;
         }
-        std::vector<OffloadTaskItem> tasks{
-            OffloadTaskItem{.tenant_id = tenant_id, .key = key, .size = size}};
-        StorageObjectMetadata sm;
-        sm.bucket_id = 0;
-        sm.offset = 0;
-        sm.key_size = static_cast<int64_t>(key.size());
-        sm.data_size = size;
-        sm.transport_endpoint = transport_endpoint;
-        std::vector<StorageObjectMetadata> metas{sm};
-        auto res = service.NotifyOffloadSuccess(client_id, tasks, metas);
+        Replica replica(client_id, static_cast<uint64_t>(size),
+                        transport_endpoint, ReplicaStatus::COMPLETE);
+        auto res =
+            service.AddReplica(client_id, key, TenantId(tenant_id), replica);
         return res.has_value();
     }
 
@@ -722,7 +718,7 @@ TEST_F(PromotionOnHitTest, RacingReadersDedup) {
     auto ctx =
         PrepareSegment(*service, "test_segment", kDefaultSegmentBase, seg_size);
 
-    // LOCAL_DISK-only key: NotifyOffloadSuccess on a never-PUT key creates
+    // LOCAL_DISK-only key: AddReplica on a never-PUT key creates
     // metadata with only the LOCAL_DISK replica (AddReplica's Create-on-
     // missing path).
     ASSERT_TRUE(InjectLocalDiskReplica(*service, ctx.client_id, "k_cold", 1024,
