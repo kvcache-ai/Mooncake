@@ -91,14 +91,18 @@ count and produced tens-of-seconds TTFT p99 spikes when prefetch was on.
 
 The deadline is also **capped by the batch's earliest lease expiry** (minus a
 margin for the fallback transfer itself): the batch query grants every key's
-lease up front and transfers are submitted after the wait loop, so a wait
-outliving a lease would turn co-resident keys' successful transfers into
-`LEASE_EXPIRED`. The wait helper itself returns only an outcome (skipped /
-completed / failed / timed out) and never issues an RPC. Keys that actually
-waited or completed are refreshed with **one batch lease-granting query**
-after the loop, and their transfer operations are built from the fresh
-descriptors and leases — so no serial per-key re-queries, and no transfer
-runs on a nearly-spent lease.
+lease up front, so a wait outliving a lease would turn the waited keys'
+fallback transfers into `LEASE_EXPIRED`. Memory-headed keys are not exposed
+to the wait at all: their transfers are submitted in a **first transfer
+phase** before the wait loop, on the fresh leases from the batch query, so a
+slow promotion or a slow refresh RPC can neither delay them nor expire their
+leases. The wait helper itself returns only an outcome (skipped / completed /
+failed / timed out) and never issues an RPC. Only keys that actually waited
+or completed are refreshed, with **one batch lease-granting query** after the
+wait, and their transfer operations are built from the fresh descriptors and
+leases. Replicas promoted during the wait are then transferred in a **second,
+smaller transfer phase** — the price of never delaying co-batch memory reads
+behind the wait.
 
 Wait only when this process has a live local promotion (`kInFlight` /
 `kCompleted`). Do **not** wait on `kTriggered` (pool job still queued),
@@ -120,10 +124,10 @@ promotions that then fail under pressure.
 
 If nothing is in flight, fall through to SSD immediately.
 
-The re-query is read-only and grants no lease; between observing a COMPLETE
-MEMORY replica and the actual transfer the replica could in principle be
-evicted. That race is accepted (best-effort): the transfer simply fails and
-the caller retries/falls back per the existing error path.
+Between the refresh observing a COMPLETE MEMORY replica and the actual
+transfer, the replica could in principle be evicted. That race is accepted
+(best-effort): the transfer simply fails and the caller retries/falls back
+per the existing error path.
 
 Measured TTFT results and the A/B methodology (fill → overflow → settle →
 measure) are in PR #4272's description.
@@ -293,10 +297,12 @@ completion callback that drives the throttle states above.
   TriggerPrefetch. Synchronous cost: one dedup lookup + one pool enqueue.
 - **get** (`ssd_get_wait_ms > 0`, default 0 = off): one deadline shared by
   the whole batch; a key is waited on only while a local promotion is
-  `kInFlight`/`kCompleted`; re-queries are read-only. A batch headed for
-  SSD also gets one demand-side kick (see "get() wait" above) that bypasses
-  only the client-side throttle backoff. On a COMPLETE MEMORY replica the
-  transfer plan is rebuilt from the refreshed replica list
+  `kInFlight`/`kCompleted`. Memory-headed keys transfer before the wait
+  (first phase); only waited keys are re-queried, in one batch lease-granting
+  query, and promoted replicas transfer after it (second phase). A batch
+  headed for SSD also gets one demand-side kick (see "get() wait" above)
+  that bypasses only the client-side throttle backoff. On a COMPLETE MEMORY
+  replica the transfer plan is rebuilt from the refreshed replica list
   (`FilterQueryResult`); otherwise the SSD read proceeds immediately.
 
 ## Rolling-upgrade compatibility

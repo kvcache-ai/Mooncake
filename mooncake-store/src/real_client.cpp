@@ -7848,10 +7848,10 @@ RealClient::batch_get_into_multi_buffers_internal(
         const int64_t now_ms = PrefetchThrottle::NowMs();
         get_wait_deadline = now_ms + ssd_get_wait_ms_;
         // Cap the wait by the batch's earliest lease deadline: the batch
-        // query granted every key's lease up front and transfers are
-        // submitted only after the wait loop, so a wait outliving a lease
-        // would turn the co-batch keys' successful transfers into
-        // LEASE_EXPIRED.
+        // query granted every key's lease up front. Memory-headed keys are
+        // transferred before the wait (see below), so this cap protects the
+        // waited keys' own refreshed leases and fallback transfers — a wait
+        // outliving the lease floor would turn those into LEASE_EXPIRED.
         int64_t lease_floor_ms = std::numeric_limits<int64_t>::max();
         for (const auto &query_result : query_results) {
             if (query_result && !query_result->replicas.empty()) {
@@ -7896,11 +7896,14 @@ RealClient::batch_get_into_multi_buffers_internal(
             prefetcher_->TriggerPrefetch(disk_keys, /*ignore_cooldown=*/true);
         }
     }
-    // Shared by the main loop (unwaited keys) and the post-wait refresh
-    // rebuild below: registers the transfer operation for key i from the
-    // chosen replica and the given (possibly refreshed) query result.
+    // Shared by the classification loop (unwaited keys) and the post-wait
+    // refresh rebuild below: registers the transfer operation for key i from
+    // the chosen replica and the given (possibly refreshed) query result.
+    // Memory ops go to mem_ops (the caller picks the round-1 or round-2
+    // vector); disk ops always go to valid_local_disk_ops/duplicate_disk_ops.
     auto build_transfer_op = [&](size_t i, const QueryResult &qr_values,
-                                 const Replica::Descriptor &replica) {
+                                 const Replica::Descriptor &replica,
+                                 std::vector<ValidKeyInfo> &mem_ops) {
         const auto &key = keys[i];
         uint64_t total_size = calculate_total_size(replica);
         const auto &sizes = all_sizes[i];
@@ -7960,7 +7963,7 @@ RealClient::batch_get_into_multi_buffers_internal(
             return;
         }
 
-        valid_operations.push_back(
+        mem_ops.push_back(
             {.key = key,
              .original_index = i,
              .query_result = FilterQueryResult(qr_values, replica),
@@ -7970,7 +7973,66 @@ RealClient::batch_get_into_multi_buffers_internal(
         results[i] = static_cast<int64_t>(total_size);
     };
 
-    std::vector<size_t> refresh_pending;
+    // Submit one round of MEMORY/NOF transfers (existing BatchGet path).
+    // Round 1 runs before any prefetch wait so that co-batch memory reads
+    // are neither delayed by the wait nor exposed to lease expiry from the
+    // wait or the refresh RPC. Round 2 runs after the wait + refresh and
+    // carries only replicas promoted during the wait.
+    auto submit_memory_batch = [&](std::vector<ValidKeyInfo> &ops) {
+        if (ops.empty()) {
+            return;
+        }
+        std::vector<std::string> batch_keys;
+        std::vector<QueryResult> batch_query_results;
+        std::unordered_map<std::string, std::vector<Slice>> batch_slices;
+        batch_keys.reserve(ops.size());
+        batch_query_results.reserve(ops.size());
+        // The slice map is keyed by string, so duplicate keys would collapse
+        // onto one destination. Transfer each unique key once (first
+        // occurrence as primary) and fan the verified bytes out locally.
+        const auto dedup = PlanDuplicateKeys(ops);
+        for (const size_t op_idx : dedup.primaries) {
+            const auto &op = ops[op_idx];
+            batch_keys.push_back(op.key);
+            batch_query_results.push_back(op.query_result);
+            batch_slices[op.key] = op.slices;
+        }
+
+        auto batch_get_results =
+            client_->BatchGet(batch_keys, batch_query_results, batch_slices,
+                              prefer_alloc_in_same_node);
+
+        for (size_t j = 0; j < batch_get_results.size(); ++j) {
+            const auto &op = ops[dedup.primaries[j]];
+            if (!batch_get_results[j]) {
+                const auto error = batch_get_results[j].error();
+                LOG(ERROR) << "BatchGet failed for key '" << op.key
+                           << "': " << toString(error);
+                results[op.original_index] = tl::unexpected(error);
+            }
+        }
+
+        std::vector<DuplicateFanOutJob> dup_jobs;
+        for (const auto &[dup_idx, primary_idx] : dedup.duplicates) {
+            const auto &dup_op = ops[dup_idx];
+            const auto &primary_op = ops[primary_idx];
+            dup_jobs.push_back(DuplicateFanOutJob{
+                .dup_result_index = dup_op.original_index,
+                .primary_result_index = primary_op.original_index,
+                .key = dup_op.key,
+                .dup_bytes = dup_op.total_size,
+                .primary_bytes = primary_op.total_size,
+                .copy = [dst = dup_op.slices, src = primary_op.slices,
+                         size = dup_op.total_size, key = dup_op.key]() {
+                    return CopySlicesMaybeDevice(
+                        dst, src, size, "duplicate fan-out, key: " + key);
+                }});
+        }
+        FanOutDuplicates(dup_jobs, results);
+    };
+
+    // SSD-only keys deferred for the get-side wait (indices into keys).
+    std::vector<size_t> ssd_wait_candidates;
     for (size_t i = 0; i < num_keys; ++i) {
         const auto &key = keys[i];
         // Handle query failures
@@ -8001,32 +8063,63 @@ RealClient::batch_get_into_multi_buffers_internal(
             continue;
         }
 
-        // Optional get-side wait for SSD prefetch. Budget is shared across
-        // this batch (remaining time until get_wait_deadline).
+        // With the get-side wait enabled, SSD-only keys are deferred to the
+        // wait loop below. This classification loop never waits, so memory
+        // ops accumulate without any exposure to the wait.
         if (get_wait && best_replica->is_local_disk_replica()) {
-            const int64_t remaining =
-                get_wait_deadline - PrefetchThrottle::NowMs();
-            auto outcome = SsdPrefetcher::WaitOutcome::kSkipped;
-            if (remaining > 0) {
-                outcome = prefetcher_->WaitIfPromotionInFlight(key, remaining);
-            }
-            if (outcome != SsdPrefetcher::WaitOutcome::kSkipped) {
-                // After an actual wait or an observed completion the original
-                // query result is stale: its lease is nearly spent (the
-                // deadline is capped by it), and a completed promotion means
-                // a fresh MEMORY replica to pick up. Defer op-building to the
-                // single batch refresh after this loop.
-                refresh_pending.push_back(i);
-                results[i] = tl::unexpected(ErrorCode::INTERNAL_ERROR);
-                continue;
-            }
+            ssd_wait_candidates.push_back(i);
+            continue;
         }
 
-        build_transfer_op(i, query_result_values, *best_replica);
+        build_transfer_op(i, query_result_values, *best_replica,
+                          valid_operations);
+    }
+
+    // Early return if nothing to transfer and nothing to wait on.
+    if (valid_operations.empty() && valid_local_disk_ops.empty() &&
+        ssd_wait_candidates.empty()) {
+        return results;
+    }
+
+    // Round 1: memory/NOF transfers run BEFORE any prefetch wait, so a slow
+    // promotion (or a slow refresh RPC) can neither delay co-batch memory
+    // reads nor expire their leases.
+    submit_memory_batch(valid_operations);
+
+    // Wait on the deferred SSD keys only, under the shared batch deadline.
+    // Skipped keys (no local promotion in flight) read SSD immediately with
+    // the original metadata; keys that waited or completed are refreshed
+    // below.
+    std::vector<size_t> refresh_pending;
+    std::vector<ValidKeyInfo> promoted_operations;
+    for (const size_t idx : ssd_wait_candidates) {
+        const int64_t remaining = get_wait_deadline - PrefetchThrottle::NowMs();
+        auto outcome = SsdPrefetcher::WaitOutcome::kSkipped;
+        if (remaining > 0) {
+            outcome =
+                prefetcher_->WaitIfPromotionInFlight(keys[idx], remaining);
+        }
+        if (outcome == SsdPrefetcher::WaitOutcome::kSkipped) {
+            const auto &qr = query_results[idx].value();
+            const auto *best = SelectBestReplica(qr.replicas, local_endpoints);
+            if (best == nullptr) {
+                LOG(ERROR) << "No usable replica for key: " << keys[idx];
+                results[idx] = tl::unexpected(ErrorCode::INVALID_REPLICA);
+                continue;
+            }
+            build_transfer_op(idx, qr, *best, promoted_operations);
+            continue;
+        }
+        // After an actual wait or an observed completion the original query
+        // result is stale: its lease is nearly spent (the deadline is capped
+        // by it), and a completed promotion means a fresh MEMORY replica to
+        // pick up. Defer op-building to the single batch refresh below.
+        refresh_pending.push_back(idx);
+        results[idx] = tl::unexpected(ErrorCode::INTERNAL_ERROR);
     }
 
     // Keys that actually waited (or completed mid-wait) have stale entries:
-    // the batch query granted their leases before the loop, and a completed
+    // the batch query granted their leases before the wait, and a completed
     // promotion means a fresh MEMORY replica to pick up. Refresh them with
     // one batch lease-granting query, then build their transfer operations
     // from the fresh descriptors and leases — one bounded RPC, not N serial
@@ -8055,64 +8148,14 @@ RealClient::batch_get_into_multi_buffers_internal(
                 results[idx] = tl::unexpected(ErrorCode::INVALID_REPLICA);
                 continue;
             }
-            build_transfer_op(idx, *qr, *best);
+            build_transfer_op(idx, *qr, *best, promoted_operations);
         }
     }
-    // Early return if no valid operations
-    if (valid_operations.empty() && valid_local_disk_ops.empty()) {
-        return results;
-    }
 
-    // ---- Memory/NOF replica: existing BatchGet path ----
-    if (!valid_operations.empty()) {
-        std::vector<std::string> batch_keys;
-        std::vector<QueryResult> batch_query_results;
-        std::unordered_map<std::string, std::vector<Slice>> batch_slices;
-        batch_keys.reserve(valid_operations.size());
-        batch_query_results.reserve(valid_operations.size());
-        // The slice map is keyed by string, so duplicate keys would collapse
-        // onto one destination. Transfer each unique key once (first
-        // occurrence as primary) and fan the verified bytes out locally.
-        const auto dedup = PlanDuplicateKeys(valid_operations);
-        for (const size_t op_idx : dedup.primaries) {
-            const auto &op = valid_operations[op_idx];
-            batch_keys.push_back(op.key);
-            batch_query_results.push_back(op.query_result);
-            batch_slices[op.key] = op.slices;
-        }
-
-        auto batch_get_results =
-            client_->BatchGet(batch_keys, batch_query_results, batch_slices,
-                              prefer_alloc_in_same_node);
-
-        for (size_t j = 0; j < batch_get_results.size(); ++j) {
-            const auto &op = valid_operations[dedup.primaries[j]];
-            if (!batch_get_results[j]) {
-                const auto error = batch_get_results[j].error();
-                LOG(ERROR) << "BatchGet failed for key '" << op.key
-                           << "': " << toString(error);
-                results[op.original_index] = tl::unexpected(error);
-            }
-        }
-
-        std::vector<DuplicateFanOutJob> dup_jobs;
-        for (const auto &[dup_idx, primary_idx] : dedup.duplicates) {
-            const auto &dup_op = valid_operations[dup_idx];
-            const auto &primary_op = valid_operations[primary_idx];
-            dup_jobs.push_back(DuplicateFanOutJob{
-                .dup_result_index = dup_op.original_index,
-                .primary_result_index = primary_op.original_index,
-                .key = dup_op.key,
-                .dup_bytes = dup_op.total_size,
-                .primary_bytes = primary_op.total_size,
-                .copy = [dst = dup_op.slices, src = primary_op.slices,
-                         size = dup_op.total_size, key = dup_op.key]() {
-                    return CopySlicesMaybeDevice(
-                        dst, src, size, "duplicate fan-out, key: " + key);
-                }});
-        }
-        FanOutDuplicates(dup_jobs, results);
-    }
+    // Round 2: transfers for replicas promoted during the wait — a second,
+    // smaller transfer phase, which is the price of not delaying round-1
+    // memory reads behind the wait.
+    submit_memory_batch(promoted_operations);
 
     // ---- LOCAL_DISK / file-backed replica read paths ----
     if (!valid_local_disk_ops.empty()) {
