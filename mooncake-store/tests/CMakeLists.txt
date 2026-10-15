@@ -67,6 +67,7 @@ set_tests_properties(replica_selection_env_opt_in_test
 add_store_test(eviction_strategy_test eviction_strategy_test.cpp)
 add_store_test(deadline_scheduler_test deadline_scheduler_test.cpp)
 add_store_test(background_worker_test background_worker_test.cpp)
+add_store_test(session_tag_test session_tag_test.cpp)
 add_store_test(kv_event_publisher_test kv_event_publisher_test.cpp)
 if(ENABLE_KV_EVENTS)
   target_compile_definitions(kv_event_publisher_test

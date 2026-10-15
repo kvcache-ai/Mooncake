@@ -4,6 +4,9 @@
 
 #include <boost/functional/hash.hpp>
 
+#include <algorithm>
+#include <ylt/struct_pack/compatible.hpp>
+
 #include <atomic>
 #include <cstdint>
 #include <memory>
@@ -125,11 +128,31 @@ struct ReplicateConfig {
     // always hash(tenant, key) and is decoupled from groups.
     std::optional<std::vector<std::string>> group_ids{};
 
+    // Per-key write attribution, independent of key identity and eviction
+    // groups. Compatible field keeps pre-session RPC payloads readable in both
+    // directions.
+    struct_pack::compatible<std::vector<std::string>, 1> session_ids;
+
+    bool ValidSessionIds(size_t key_count) const {
+        return !session_ids ||
+               (session_ids->size() == key_count &&
+                std::all_of(session_ids->begin(), session_ids->end(),
+                            [](const auto& id) { return id.size() <= 256; }));
+    }
+
+    std::string SessionId() const {
+        return session_ids && !session_ids->empty() ? session_ids->front() : "";
+    }
+
     ReplicateConfig ForSingleKey(size_t key_index) const {
         ReplicateConfig key_config = *this;
         if (group_ids.has_value()) {
             key_config.group_ids =
                 std::vector<std::string>{group_ids->at(key_index)};
+        }
+        if (session_ids) {
+            key_config.session_ids =
+                std::vector<std::string>{session_ids->at(key_index)};
         }
         return key_config;
     }

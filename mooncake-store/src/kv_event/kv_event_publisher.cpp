@@ -54,7 +54,7 @@ size_t ComputeEventMapSize(bool is_stored, bool is_cleared, bool emit_legacy,
         map_size += 1;  // object_key
     }
     if (is_stored) {
-        map_size += 3;  // base_block_idx, parent_hash, token_ids
+        map_size += 4;  // base_block_idx, parent_hash, token_ids, session_id
         if (emit_legacy) {
             map_size += 1;  // parent_block_hash
         }
@@ -174,7 +174,8 @@ KvEventPublisher::~KvEventPublisher() {
 void KvEventPublisher::PublishStored(const std::string& object_key,
                                      const std::string& medium,
                                      const std::string& tenant_id,
-                                     const std::string& group_id) {
+                                     const std::string& group_id,
+                                     const std::string& session_id) {
     if (!config_.enabled) {
         return;
     }
@@ -185,7 +186,8 @@ void KvEventPublisher::PublishStored(const std::string& object_key,
     }
     std::vector<PendingEvent> events;
     events.push_back(PendingEvent{EventKind::kStored, object_key, medium,
-                                  NormalizeTenant(tenant_id), group_id});
+                                  NormalizeTenant(tenant_id), group_id,
+                                  session_id});
     EnqueueBatch(std::move(events));
 }
 
@@ -202,8 +204,12 @@ void KvEventPublisher::PublishRemoved(const std::string& object_key,
         return;
     }
     std::vector<PendingEvent> events;
-    events.push_back(PendingEvent{EventKind::kRemoved, object_key, medium,
-                                  NormalizeTenant(tenant_id), group_id});
+    events.push_back(PendingEvent{EventKind::kRemoved,
+                                  object_key,
+                                  medium,
+                                  NormalizeTenant(tenant_id),
+                                  group_id,
+                                  {}});
     EnqueueBatch(std::move(events));
 }
 
@@ -212,15 +218,15 @@ void KvEventPublisher::PublishCleared(const std::string& tenant_id) {
         return;
     }
     std::vector<PendingEvent> events;
-    events.push_back(PendingEvent{EventKind::kCleared, "", "",
-                                  NormalizeTenant(tenant_id), ""});
+    events.push_back(PendingEvent{
+        EventKind::kCleared, "", "", NormalizeTenant(tenant_id), "", {}});
     EnqueueBatch(std::move(events));
 }
 
 void KvEventPublisher::PublishCommitted(
     const std::string& object_key,
     const std::vector<std::string>& current_media, const std::string& tenant_id,
-    const std::string& group_id) {
+    const std::string& group_id, const std::string& session_id) {
     if (!config_.enabled) {
         return;
     }
@@ -232,7 +238,7 @@ void KvEventPublisher::PublishCommitted(
     // the previous contents.
     for (const auto& medium : SortedMedia(NormalizeMedia(current_media))) {
         events.push_back(PendingEvent{EventKind::kStored, object_key, medium,
-                                      normalized_tenant, group_id});
+                                      normalized_tenant, group_id, session_id});
     }
     EnqueueBatch(std::move(events));
 }
@@ -247,8 +253,12 @@ void KvEventPublisher::PublishObjectRemoved(
     const std::string normalized_tenant = NormalizeTenant(tenant_id);
     std::vector<PendingEvent> events;
     for (const auto& medium : SortedMedia(NormalizeMedia(previous_media))) {
-        events.push_back(PendingEvent{EventKind::kRemoved, object_key, medium,
-                                      normalized_tenant, group_id});
+        events.push_back(PendingEvent{EventKind::kRemoved,
+                                      object_key,
+                                      medium,
+                                      normalized_tenant,
+                                      group_id,
+                                      {}});
     }
     EnqueueBatch(std::move(events));
 }
@@ -256,8 +266,8 @@ void KvEventPublisher::PublishObjectRemoved(
 void KvEventPublisher::SyncObjectState(
     const std::string& object_key,
     const std::vector<std::string>& current_media, const std::string& tenant_id,
-    const std::string& group_id,
-    const std::vector<std::string>& previous_media) {
+    const std::string& group_id, const std::vector<std::string>& previous_media,
+    const std::string& session_id) {
     if (!config_.enabled) {
         return;
     }
@@ -268,14 +278,19 @@ void KvEventPublisher::SyncObjectState(
     std::vector<PendingEvent> events;
     for (const auto& medium : SortedMedia(previous_set)) {
         if (!new_set.contains(medium)) {
-            events.push_back(PendingEvent{EventKind::kRemoved, object_key,
-                                          medium, normalized_tenant, group_id});
+            events.push_back(PendingEvent{EventKind::kRemoved,
+                                          object_key,
+                                          medium,
+                                          normalized_tenant,
+                                          group_id,
+                                          {}});
         }
     }
     for (const auto& medium : SortedMedia(new_set)) {
         if (!previous_set.contains(medium)) {
             events.push_back(PendingEvent{EventKind::kStored, object_key,
-                                          medium, normalized_tenant, group_id});
+                                          medium, normalized_tenant, group_id,
+                                          session_id});
         }
     }
     EnqueueBatch(std::move(events));
@@ -446,6 +461,8 @@ void KvEventPublisher::PublishBatch(const std::vector<PendingEvent>& batch) {
         }
 
         if (is_stored) {
+            packer.pack("session_id");
+            PackOptionalString(packer, item.pending.session_id);
             packer.pack("base_block_idx");
             packer.pack_nil();
             packer.pack("parent_hash");

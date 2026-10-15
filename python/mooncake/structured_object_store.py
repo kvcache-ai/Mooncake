@@ -6738,6 +6738,7 @@ def _call_write_with_optional_config(fn: Any, *args: Any, config: Any = None) ->
 _WRITE_CONFIG_COPY_FIELDS = (
     "data_type",
     "group_ids",
+    "session_ids",
     "nof_replica_num",
     "prefer_alloc_in_same_node",
     "preferred_nof_segments",
@@ -6750,31 +6751,32 @@ _WRITE_CONFIG_COPY_FIELDS = (
 
 
 def _config_for_grouped_keys(config: Any, key_count: int) -> Any:
-    """Return a write config whose group_ids match the physical key count."""
+    """Expand logical group/session attribution to the physical key count."""
     if config is None or key_count <= 0:
         return config
-    group_ids = getattr(config, "group_ids", None)
-    if group_ids is None:
-        return config
-    normalize_to_list = isinstance(group_ids, str)
-    if normalize_to_list:
-        group_ids = [group_ids]
-    else:
-        group_ids = list(group_ids)
-    if not group_ids:
-        ungrouped_config = _copy_write_config(config)
-        ungrouped_config.group_ids = None
-        return ungrouped_config
-    if len(group_ids) != 1:
-        raise ValueError(
-            "structured object store config.group_ids must contain exactly one "
-            "logical group id; it is expanded across internal Mooncake keys"
-        )
-    if key_count == 1 and not normalize_to_list:
-        return config
-    grouped_config = _copy_write_config(config)
-    grouped_config.group_ids = [group_ids[0]] * key_count
-    return grouped_config
+    expanded = config
+    for field_name in ("group_ids", "session_ids"):
+        ids = getattr(config, field_name, None)
+        if ids is None:
+            continue
+        normalize_to_list = isinstance(ids, str)
+        ids = [ids] if normalize_to_list else list(ids)
+        if not ids and field_name == "group_ids":
+            if expanded is config:
+                expanded = _copy_write_config(config)
+            expanded.group_ids = None
+            continue
+        if len(ids) != 1:
+            raise ValueError(
+                f"structured object store config.{field_name} must contain exactly one "
+                "logical id; it is expanded across internal Mooncake keys"
+            )
+        if key_count == 1 and not normalize_to_list:
+            continue
+        if expanded is config:
+            expanded = _copy_write_config(config)
+        setattr(expanded, field_name, ids * key_count)
+    return expanded
 
 
 def _copy_write_config(config: Any) -> Any:

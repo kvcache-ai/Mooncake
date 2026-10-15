@@ -1171,47 +1171,38 @@ class MooncakeStorePyWrapper {
     ReplicateConfig MakeIndexedConfig(
         const ReplicateConfig &config,
         const std::vector<size_t> &original_indices) const {
-        if (!config.group_ids.has_value()) {
-            return config;
-        }
-
-        ReplicateConfig indexed_config = config;
-        std::vector<std::string> group_ids;
-        group_ids.reserve(original_indices.size());
-        for (size_t index : original_indices) {
-            group_ids.push_back(config.group_ids->at(index));
-        }
-        indexed_config.group_ids = std::move(group_ids);
-        return indexed_config;
+        return MakeRepeatedIndexedConfig(config, original_indices, 1);
     }
 
     ReplicateConfig MakeRepeatedIndexedConfig(
         const ReplicateConfig &config,
         const std::vector<size_t> &original_indices, int repeat_count) const {
-        if (!config.group_ids.has_value()) {
-            return config;
-        }
-
         ReplicateConfig indexed_config = config;
-        std::vector<std::string> group_ids;
-        group_ids.reserve(original_indices.size() *
-                          static_cast<size_t>(repeat_count));
-        for (size_t index : original_indices) {
-            for (int i = 0; i < repeat_count; ++i) {
-                group_ids.push_back(config.group_ids->at(index));
+        auto select = [&](auto &field) {
+            if (!field.has_value()) return;
+            std::vector<std::string> ids;
+            ids.reserve(original_indices.size() *
+                        static_cast<size_t>(repeat_count));
+            for (size_t index : original_indices) {
+                for (int i = 0; i < repeat_count; ++i) {
+                    ids.push_back(field->at(index));
+                }
             }
-        }
-        indexed_config.group_ids = std::move(group_ids);
+            field = std::move(ids);
+        };
+        select(indexed_config.group_ids);
+        select(indexed_config.session_ids);
         return indexed_config;
     }
 
     std::vector<int> ValidateGroupIdsForBatchConfig(
         const ReplicateConfig &config, size_t key_count,
         const char *operation_name) const {
-        if (config.group_ids.has_value() &&
-            config.group_ids->size() != key_count) {
+        if (!config.ValidSessionIds(key_count) ||
+            (config.group_ids.has_value() &&
+             config.group_ids->size() != key_count)) {
             LOG(ERROR) << operation_name
-                       << ": group_ids size must match keys size";
+                       << ": invalid per-key group/session IDs";
             return std::vector<int>(key_count,
                                     to_py_ret(ErrorCode::INVALID_PARAMS));
         }
@@ -1222,6 +1213,9 @@ class MooncakeStorePyWrapper {
         const std::string &key, pybind11::object tensor,
         const ReplicateConfig &config = ReplicateConfig{}, int tp_rank = 0,
         int tp_size = 1, int split_dim = 0) {
+        auto config_errors =
+            ValidateGroupIdsForBatchConfig(config, 1, "put_tensor_with_tp");
+        if (!config_errors.empty()) return config_errors.front();
         try {
             std::vector<std::string> tp_keys;
             tp_keys.reserve(tp_size);
@@ -1234,7 +1228,9 @@ class MooncakeStorePyWrapper {
             if (!infos.has_value()) {
                 return to_py_ret(ErrorCode::INVALID_PARAMS);
             }
-            auto results = batch_put_tensor_infos_impl(tp_keys, *infos, config);
+            auto results = batch_put_tensor_infos_impl(
+                tp_keys, *infos,
+                MakeRepeatedIndexedConfig(config, {0}, tp_size));
             for (int ret : results) {
                 if (ret != 0) return ret;
             }
@@ -1352,10 +1348,10 @@ class MooncakeStorePyWrapper {
         std::vector<size_t> processed_indices;
         std::vector<int> final_results(base_keys.size(),
                                        to_py_ret(ErrorCode::INVALID_PARAMS));
-        auto group_ids_error = ValidateGroupIdsForBatchConfig(
+        auto per_key_ids_error = ValidateGroupIdsForBatchConfig(
             config, base_keys.size(), "batch_put_tensor_with_tp");
-        if (!group_ids_error.empty()) {
-            return group_ids_error;
+        if (!per_key_ids_error.empty()) {
+            return per_key_ids_error;
         }
         try {
             for (size_t i = 0; i < base_keys.size(); ++i) {
@@ -2155,6 +2151,18 @@ PYBIND11_MODULE(_store, m) {
                        &ReplicateConfig::prefer_alloc_in_same_node)
         .def_readwrite("data_type", &ReplicateConfig::data_type)
         .def_readwrite("group_ids", &ReplicateConfig::group_ids)
+        .def_property(
+            "session_ids",
+            [](const ReplicateConfig &config)
+                -> std::optional<std::vector<std::string>> {
+                if (!config.session_ids) return std::nullopt;
+                return *config.session_ids;
+            },
+            [](ReplicateConfig &config,
+               std::optional<std::vector<std::string>> ids) {
+                config.session_ids.reset();
+                if (ids) config.session_ids = std::move(*ids);
+            })
         .def("__str__", [](const ReplicateConfig &config) {
             std::ostringstream oss;
             oss << config;
