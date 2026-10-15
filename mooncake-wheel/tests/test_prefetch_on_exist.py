@@ -299,11 +299,15 @@ class TestPrefetchOnExist(unittest.TestCase):
         mem_value = os.urandom(1024 * 1024)
         big_key = f"prefetch_waitmix_big_{timestamp}"
         big_value = os.urandom(8 * 1024 * 1024)
-        self.assertEqual(self.store.put(mem_key, mem_value), 0)
         self.assertEqual(self.store.put(big_key, big_value), 0)
-        # The put lease (default_kv_lease_ttl=500ms) blocks eviction; wait it
-        # out before applying overflow pressure.
+        # Evict ONLY the big key: wait out its put lease
+        # (default_kv_lease_ttl=500ms), then put the small key and flood
+        # within the small key's own lease window. The overflow burst fits
+        # inside that window (see test_get_wait_success_carries_live_lease),
+        # so the small key stays lease-pinned in DRAM while the unleased big
+        # key is forced out.
         time.sleep(1.5)
+        self.assertEqual(self.store.put(mem_key, mem_value), 0)
         self._make_cold_keys("waitmix")
         # Same probing pattern as test_get_wait_success_carries_live_lease:
         # rare probes (2s) and pressure only while the big key is unleased.
