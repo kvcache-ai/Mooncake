@@ -492,16 +492,19 @@ size_t OffsetBufferAllocator::getLargestFreeRegion() const {
     }
 }
 
-std::optional<RestoredOffsetBufferAllocator> ImportOffsetBufferAllocator(
-    std::string segment_name, size_t base, size_t size,
-    std::string transport_endpoint,
-    const std::vector<LiveAllocation>& allocations, ReplicaType replica_type) {
+bool ImportOffsetBufferAllocations(
+    const std::shared_ptr<OffsetBufferAllocator>& allocator,
+    const std::vector<LiveAllocation>& allocations,
+    const ImportedBufferSink& sink) {
+    if (!allocator || allocator->size() != 0) {
+        return false;
+    }
+    const size_t base = allocator->base();
+    const size_t size = allocator->capacity();
     if (base > std::numeric_limits<size_t>::max() - size) {
-        return std::nullopt;
+        return false;
     }
     const size_t end = base + size;
-    auto allocator = std::make_shared<OffsetBufferAllocator>(
-        std::move(segment_name), base, size, transport_endpoint, replica_type);
     const auto offset_allocator = allocator->getOffsetAllocator();
 
     std::vector<size_t> order(allocations.size());
@@ -511,7 +514,6 @@ std::optional<RestoredOffsetBufferAllocator> ImportOffsetBufferAllocator(
                allocations[rhs].offset_from_base;
     });
 
-    std::vector<std::unique_ptr<AllocatedBuffer>> buffers(allocations.size());
     std::vector<std::unique_ptr<AllocatedBuffer>> gaps;
     size_t cursor = base;
 
@@ -553,27 +555,48 @@ std::optional<RestoredOffsetBufferAllocator> ImportOffsetBufferAllocator(
     for (const size_t index : order) {
         const auto& allocation = allocations[index];
         if (!IsValidAllocation(allocation, size)) {
-            return std::nullopt;
+            return false;
         }
         const size_t address = base + allocation.offset_from_base;
         if (address < cursor) {
-            return std::nullopt;
+            return false;
         }
         const uint64_t occupied = offset_allocator->normalizedAllocationSize(
             allocation.requested_size);
         if (occupied == 0 || occupied > end - address ||
             !fill_gap(address - cursor)) {
-            return std::nullopt;
+            return false;
         }
         auto buffer = allocator->allocate(allocation.requested_size);
         if (!buffer || reinterpret_cast<size_t>(buffer->data()) != address) {
-            return std::nullopt;
+            return false;
         }
         cursor = address + occupied;
-        buffers[index] = std::move(buffer);
+        sink(index, std::move(buffer));
     }
 
     gaps.clear();
+    return true;
+}
+
+std::optional<RestoredOffsetBufferAllocator> ImportOffsetBufferAllocator(
+    std::string segment_name, size_t base, size_t size,
+    std::string transport_endpoint,
+    const std::vector<LiveAllocation>& allocations, ReplicaType replica_type) {
+    if (base > std::numeric_limits<size_t>::max() - size) {
+        return std::nullopt;
+    }
+    auto allocator = std::make_shared<OffsetBufferAllocator>(
+        std::move(segment_name), base, size, transport_endpoint, replica_type);
+    std::vector<std::unique_ptr<AllocatedBuffer>> buffers(allocations.size());
+    const bool imported = ImportOffsetBufferAllocations(
+        allocator, allocations,
+        [&buffers](size_t index, std::unique_ptr<AllocatedBuffer> buffer) {
+            buffers[index] = std::move(buffer);
+        });
+    if (!imported) {
+        return std::nullopt;
+    }
     return RestoredOffsetBufferAllocator{std::move(allocator),
                                          std::move(buffers)};
 }
