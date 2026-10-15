@@ -703,7 +703,8 @@ class RealClient : public PyClient {
         const std::vector<std::string> &keys,
         const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
         const std::vector<tl::expected<QueryResult, ErrorCode>> &query_results,
-        const LocalDiskOffloadReader &local_disk_reader);
+        const LocalDiskOffloadReader &local_disk_reader,
+        bool heal_dangling_disk_replica = true);
 
     std::vector<tl::expected<int64_t, ErrorCode>>
     batch_get_into_multi_buffers_internal(

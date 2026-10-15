@@ -6076,7 +6076,8 @@ RealClient::batch_get_into_internal(
     const std::vector<std::string> &keys, const std::vector<void *> &buffers,
     const std::vector<size_t> &sizes,
     const std::vector<tl::expected<QueryResult, ErrorCode>> &query_results,
-    const LocalDiskOffloadReader &local_disk_reader) {
+    const LocalDiskOffloadReader &local_disk_reader,
+    bool heal_dangling_disk_replica) {
     [[maybe_unused]] auto start_time = std::chrono::steady_clock::now();
     // Validate preconditions
     if (!client_) {
@@ -6426,9 +6427,36 @@ RealClient::batch_get_into_internal(
             LOG(ERROR) << "Batch get store object failed with error: "
                        << batch_get_offload_result.error();
             for (const auto &offload_object_it : offload_objects_it.second) {
-                results[valid_local_disk_operations.at(offload_object_it.first)
-                            .original_index] =
-                    tl::make_unexpected(batch_get_offload_result.error());
+                const auto &op =
+                    valid_local_disk_operations.at(offload_object_it.first);
+                auto &result = results[op.original_index];
+                result = tl::make_unexpected(batch_get_offload_result.error());
+
+                if (!heal_dangling_disk_replica || !client_) {
+                    continue;
+                }
+
+                const auto heal = heal_disk_replica_for_read(
+                    op.key, op.replica, op.query_result.resolved_tenant_id);
+                if (heal == DiskReadHealResult::kUnknown) {
+                    continue;
+                }
+
+                // The repair may remove the selected LOCAL_DISK replica or
+                // merely prove that its file exists. Re-query so replica
+                // selection can fall back to a surviving replica, and retry
+                // this user buffer at most once.
+                auto retry_query = client_->BatchQuery({op.key});
+                if (retry_query.size() != 1 || !retry_query.front()) {
+                    continue;
+                }
+                auto retry = batch_get_into_internal(
+                    {op.key}, {buffers[op.original_index]},
+                    {sizes[op.original_index]}, retry_query, local_disk_reader,
+                    /*heal_dangling_disk_replica=*/false);
+                if (retry.size() == 1 && retry.front()) {
+                    result = retry.front();
+                }
             }
             continue;
         }
