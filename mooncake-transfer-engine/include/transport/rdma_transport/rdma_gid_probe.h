@@ -166,8 +166,8 @@ class PeerAutoGidStateTable {
             return AutoGidDataPathAction::kIgnoreDuplicate;
         }
         if (success) {
-            clearRecovery(state);
-            state.first_failed_endpoint_id = 0;
+            // Keep the epoch valid for subsequent posts on this connection.
+            if (state.recovery_active) resetRecovery(state);
             return AutoGidDataPathAction::kIgnoreDuplicate;
         }
         if (state.exhausted) {
@@ -194,7 +194,6 @@ class PeerAutoGidStateTable {
         if (!enabled_) return;
         std::lock_guard<std::mutex> guard(mutex_);
         auto iter = getOrCreate(peer, default_selection);
-        if (iter == states_.end()) return;
         State& state = iter->second.state;
         if (!state.advance_pending) {
             state.advance_pending = true;
@@ -306,11 +305,16 @@ class PeerAutoGidStateTable {
         }
     }
 
-    void clearRecovery(State& state) {
+    void resetRecovery(State& state) {
         state.advance_pending = false;
         state.advance_requested_locally = false;
         state.recovery_active = false;
         state.exhausted = false;
+        state.first_failed_endpoint_id = 0;
+        state.advances_used = 0;
+        state.tried_gids.clear();
+        state.tried_gids.insert(state.current.gid);
+        state.auto_gid_reprobe_from.clear();
     }
 
     static void clearAdvanceRequest(State& state) {
@@ -333,9 +337,6 @@ class PeerAutoGidStateTable {
         if (!enabled_) return {default_selection, 0, false, false, {}};
         std::lock_guard<std::mutex> guard(mutex_);
         auto iter = getOrCreate(peer, default_selection);
-        if (iter == states_.end()) {
-            return {default_selection, 0, false, false, {}};
-        }
         touch(iter);
         State& state = iter->second.state;
         bool should_advance = state.advance_pending;
@@ -348,15 +349,14 @@ class PeerAutoGidStateTable {
         if (candidates &&
             state.candidate_generation_seen != candidate_generation_) {
             state.candidate_generation_seen = candidate_generation_;
+            // A refreshed table starts a new bounded search without replacing
+            // a still-usable selection. Old connection completions are stale.
+            resetRecovery(state);
+            state.selection_epoch = nextSelectionEpoch();
             const AutoGidSelection* rebound =
                 findByGid(*candidates, state.current.gid);
             if (rebound) {
-                if (rebound->gid_index != state.current.gid_index) {
-                    state.current = *rebound;
-                    state.selection_epoch = nextSelectionEpoch();
-                    state.first_failed_endpoint_id = 0;
-                    state.exhausted = false;
-                }
+                state.current = *rebound;
             } else {
                 should_advance = true;
             }

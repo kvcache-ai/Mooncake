@@ -1384,6 +1384,8 @@ bool WorkerPool::handleContextEvent(ibv_event_type event_type,
         auto gid_refresh_result = refreshPublishedLocalGid();
         if (event != nullptr) ibv_ack_async_event(event);
 
+        // UNCHANGED only describes the context default; a peer's fallback
+        // GID may have disappeared or moved. Rebuild to rebind its selection.
         if (gid_refresh_result != GidRefreshResult::UNCHANGED ||
             context_.autoGidSelectionEnabled()) {
             auto endpoint_lifecycle_locks =
@@ -1446,6 +1448,7 @@ void WorkerPool::maybeActivateRecoveredContext() {
                         "keeping inactive";
         return;
     }
+    // Peer fallback selections can change even when the default is unchanged.
     if (gid_refresh_result == GidRefreshResult::CHANGED ||
         context_.autoGidSelectionEnabled()) {
         auto endpoint_lifecycle_locks = context_.lockAllEndpointLifecycles();
