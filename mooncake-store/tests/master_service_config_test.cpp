@@ -196,6 +196,10 @@ TEST(MasterServiceConfigTest, ValidatesOplogSnapshotConfiguration) {
     config.snapshot_object_store_type = "local";
     EXPECT_FALSE(ValidateBatchOpLogSnapshotConfig(config).has_value());
 
+    config.ha_backend_type = "redis";
+    EXPECT_TRUE(ValidateBatchOpLogSnapshotConfig(config).has_value());
+    config.ha_backend_type = "etcd";
+
     config.snapshot_chunk_object_count = 0;
     EXPECT_TRUE(ValidateBatchOpLogSnapshotConfig(config).has_value());
     config.snapshot_chunk_object_count = 1;
@@ -240,6 +244,18 @@ TEST(MasterServiceConfigTest, OplogBatchMaxEntriesBuilderOverrideRespected) {
         MasterServiceConfig::builder().set_oplog_batch_max_entries(17).build();
 
     EXPECT_EQ(17u, config.oplog_batch_max_entries);
+}
+
+TEST(MasterServiceConfigTest,
+     RestoreRepairDurableTimeoutBuilderOverrideRespected) {
+    MasterServiceConfig defaults;
+    EXPECT_EQ(DEFAULT_RESTORE_REPAIR_DURABLE_TIMEOUT_MS,
+              defaults.restore_repair_durable_timeout_ms);
+
+    auto config = MasterServiceConfig::builder()
+                      .set_restore_repair_durable_timeout_ms(50)
+                      .build();
+    EXPECT_EQ(50u, config.restore_repair_durable_timeout_ms);
 }
 
 TEST(MasterServiceConfigTest, MetricsBootstrapConfigPropagatesToSupervisor) {

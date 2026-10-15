@@ -1,0 +1,15 @@
+[package]
+name = "mooncake-store-test-utils"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+mooncake-store-core           = { path = "../mooncake-store-core" }
+mooncake-store-transport-core = { path = "../mooncake-store-transport-core" }
+mooncake-store-rs-transport            = { path = "../mooncake-store-rs-transport" }
+mooncake-store-rs-metadata             = { path = "../mooncake-store-rs-metadata" }
+parking_lot.workspace = true
+
+[lints]
+workspace = true

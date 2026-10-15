@@ -91,6 +91,8 @@ At the center of Mooncake is a KVCache-centric scheduler that balances effective
 
 getting_started/quick-start
 getting_started/build
+getting_started/store-rs
+getting_started/store-rs-features
 
 :::
 
@@ -101,6 +103,7 @@ getting_started/build
 :maxdepth: 1
 
 deployment/mooncake-store-deployment-guide
+deployment/store-rs/index
 deployment/kubernetes-deployment-guide/index
 deployment/integrations/sglang/index
 deployment/integrations/vllm/index
@@ -129,6 +132,7 @@ design/architecture
 design/transfer-engine/index
 design/tent/overview
 design/store/mooncake-store
+design/store/store-rs/index
 design/mooncake-backend-pg
 design/mooncake-ep
 design/conductor/index
@@ -158,6 +162,7 @@ api-reference/rust/index
 troubleshooting/error-code
 troubleshooting/troubleshooting
 troubleshooting/pg-ep-troubleshooting
+troubleshooting/store-rs-key-access
 :::
 
 

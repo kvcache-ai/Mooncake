@@ -125,6 +125,9 @@ option(
   OFF)
 option(USE_VRAM_SEGMENT "option for vram segment" OFF)
 option(USE_MPCOMM "option for using MPComm transport in TENT" OFF)
+option(USE_FABRIC
+       "option for the libfabric transport in TENT (implied by USE_EFA/USE_CXI)"
+       OFF)
 option(USE_SHCA "option for using ScaleFabric SHCA InfiniBand" OFF)
 option(USE_HYLINK "option for enabling hylink transport for Hygon DCU/DTK" OFF)
 
@@ -135,30 +138,25 @@ if(USE_UB)
 endif()
 
 if(USE_EFA)
-  # Find libfabric headers and library; default to AWS EFA installer path
+  # The EFA transport dlopens libfabric at runtime, so only the headers are
+  # needed here; default to the AWS EFA installer path.
   find_path(
     LIBFABRIC_INCLUDE_DIR rdma/fabric.h
     HINTS /opt/amazon/efa/include
     PATH_SUFFIXES include)
-  find_library(
-    LIBFABRIC_LIBRARY fabric
-    HINTS /opt/amazon/efa/lib
-    PATH_SUFFIXES lib lib64)
 
-  if(NOT LIBFABRIC_INCLUDE_DIR OR NOT LIBFABRIC_LIBRARY)
+  if(NOT LIBFABRIC_INCLUDE_DIR)
     message(
       FATAL_ERROR
-        "libfabric not found. Install AWS EFA or set LIBFABRIC_INCLUDE_DIR/LIBFABRIC_LIBRARY."
+        "libfabric headers not found. Install libfabric-dev or AWS EFA, or set LIBFABRIC_INCLUDE_DIR."
     )
   endif()
 
-  get_filename_component(LIBFABRIC_LIB_DIR ${LIBFABRIC_LIBRARY} DIRECTORY)
   include_directories(${LIBFABRIC_INCLUDE_DIR})
-  link_directories(${LIBFABRIC_LIB_DIR})
   add_compile_definitions(USE_EFA)
   message(STATUS "AWS EFA (libfabric) transport is enabled")
   message(STATUS "  libfabric include: ${LIBFABRIC_INCLUDE_DIR}")
-  message(STATUS "  libfabric library: ${LIBFABRIC_LIBRARY}")
+  message(STATUS "  libfabric is loaded at runtime (dlopen)")
 endif()
 if(USE_CXI)
   # Find libfabric headers and library; default to AWS EFA installer path
@@ -788,6 +786,7 @@ if(USE_FLAGCX)
       PROPERTIES IMPORTED_LOCATION "${FLAGCX_LIBRARY}"
                  INTERFACE_INCLUDE_DIRECTORIES "${FLAGCX_INCLUDE_DIR}")
   endif()
+  include_directories(${FLAGCX_INCLUDE_DIR})
   add_compile_definitions(USE_FLAGCX)
   message(
     STATUS
