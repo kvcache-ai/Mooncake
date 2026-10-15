@@ -389,10 +389,10 @@ TEST_F(WeightGroupLifecycleTest, RehydrateQueuesAndCompletesWholeManagedGroup) {
         ASSERT_TRUE(pending.has_value());
         ASSERT_FALSE(pending->empty());
         for (const auto& task : *pending) {
-            ASSERT_TRUE(service.PromotionAllocStart(
-                client_id, task.key, TenantId(task.tenant_id), task.size, {}));
-            ASSERT_TRUE(service.NotifyPromotionSuccess(
-                client_id, task.key, TenantId(task.tenant_id)));
+            ASSERT_TRUE(service.PromotionTaskAllocStart(
+                client_id, task, TenantId(task.tenant_id), {}));
+            ASSERT_TRUE(service.NotifyPromotionTaskSuccess(
+                client_id, task, TenantId(task.tenant_id)));
             ++promoted;
         }
     }
@@ -526,10 +526,10 @@ TEST_F(WeightGroupLifecycleTest, MemberBudgetBoundsEvictionAndPromotion) {
         ASSERT_TRUE(pending);
         ASSERT_EQ(1, pending->size());
         const auto& task = pending->front();
-        ASSERT_TRUE(service.PromotionAllocStart(
-            client_id, task.key, TenantId(task.tenant_id), task.size, {}));
-        ASSERT_TRUE(service.NotifyPromotionSuccess(client_id, task.key,
-                                                   TenantId(task.tenant_id)));
+        ASSERT_TRUE(service.PromotionTaskAllocStart(
+            client_id, task, TenantId(task.tenant_id), {}));
+        ASSERT_TRUE(service.NotifyPromotionTaskSuccess(
+            client_id, task, TenantId(task.tenant_id)));
     }
     MasterServiceTestPeer(service).RunWeightReconciliationForTesting(
         ready.updated_at_ms + 5, 1);

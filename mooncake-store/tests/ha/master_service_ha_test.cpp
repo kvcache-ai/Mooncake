@@ -857,6 +857,17 @@ class MasterServiceHATest : public ::testing::Test {
             prefix);
     }
 
+    // The task id of every seeded promotion task; SeededPromotionItem
+    // carries it, as the holder's drained item would.
+    static constexpr L4TaskId kSeededPromotionTaskId{1, 1};
+    static PromotionTaskItem SeededPromotionItem(const TenantId& tenant,
+                                                 const std::string& key) {
+        return PromotionTaskItem{.tenant_id = tenant.value(),
+                                 .key = key,
+                                 .size = 0,
+                                 .task_id = kSeededPromotionTaskId};
+    }
+
     // Use the test peer to seed an in-flight PromotionTask for a
     // given (tenant, key) so NotifyPromotionSuccess can proceed without
     // going through the on-hit admission gate (which is currently
@@ -878,7 +889,8 @@ class MasterServiceHATest : public ::testing::Test {
                 .alloc_id = alloc_id,
                 .object_size = object_size,
                 .start_time = std::chrono::system_clock::now(),
-                .holder_id = holder_id};
+                .holder_id = holder_id,
+                .task_id = kSeededPromotionTaskId};
     }
 
     static bool NeedMemoryEvictionForTesting(const MasterService& service) {
@@ -5531,8 +5543,10 @@ TEST_F(MasterServiceBatchRecordE2ETest,
                                 mounted.client_id, put_start->front().id, 1024);
 
     ASSERT_TRUE(service
-                    .NotifyPromotionSuccess(mounted.client_id, promotion_key,
-                                            kDefaultTenant)
+                    .NotifyPromotionTaskSuccess(
+                        mounted.client_id,
+                        SeededPromotionItem(kDefaultTenant, promotion_key),
+                        kDefaultTenant)
                     .has_value());
     ReadBatchEventually(storage, 4, batch);
 
@@ -6164,8 +6178,9 @@ TEST_F(MasterServiceHATest, NotifyPromotionSuccessWritesBatchRecordOpLog) {
     SeedPromotionTaskForTesting(&service, kDefaultTenant, key,
                                 mounted.client_id, put_start->front().id, 1024);
 
-    auto res =
-        service.NotifyPromotionSuccess(mounted.client_id, key, kDefaultTenant);
+    auto res = service.NotifyPromotionTaskSuccess(
+        mounted.client_id, SeededPromotionItem(kDefaultTenant, key),
+        kDefaultTenant);
     ASSERT_TRUE(res.has_value());
 
     for (int i = 0; i < 50; ++i) {
@@ -6218,8 +6233,9 @@ TEST_F(MasterServiceHATest,
                                 mounted.client_id, put_start->front().id, 1024);
 
     backend->BlockTxn();
-    auto promotion =
-        service.NotifyPromotionSuccess(mounted.client_id, key, kDefaultTenant);
+    auto promotion = service.NotifyPromotionTaskSuccess(
+        mounted.client_id, SeededPromotionItem(kDefaultTenant, key),
+        kDefaultTenant);
     EXPECT_TRUE(promotion.has_value());
 
     auto replicas = service.GetReplicaList(key, kDefaultTenant);

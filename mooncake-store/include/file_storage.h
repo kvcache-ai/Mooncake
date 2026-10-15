@@ -252,13 +252,14 @@ class FileStorage {
      * NotifyPromotionFailure on every failure path (RAII guard).
      *
      * Shared by the heartbeat-driven promotion-on-hit path
-     * (ProcessPromotionTasks) and the prefetch path (PrefetchKeys).
+     * (ProcessPromotionTasks) and the prefetch path (PrefetchKeys). Every
+     * call names the task by `task`'s task id; an item without one stages
+     * nothing and only ends its task.
      * @param dram_pressure Optional out-flag set when PromotionAllocStart
      *        failed with NO_AVAILABLE_HANDLE (master out of DRAM).
      */
     tl::expected<void, ErrorCode> PromoteOneKeyFromLocalDisk(
-        const std::string& key, const std::string& tenant_id, int64_t size,
-        bool* dram_pressure);
+        const PromotionTaskItem& task, bool* dram_pressure);
 
     tl::expected<bool, ErrorCode> IsEnableOffloading();
 

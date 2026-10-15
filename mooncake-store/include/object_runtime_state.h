@@ -142,6 +142,12 @@ struct PromotionTask {
     // SSD prefetch admission. NotifyPromotionSuccess grants a read lease
     // so the promoted replica survives until the follow-up get.
     bool from_prefetch{false};
+    // Identity of this task (MasterService::NextL4TaskId), carried by the
+    // holder's PromotionTaskItem. AllocStart, Success and Failure act on this
+    // task only if they echo it: a late call for an earlier promotion of the
+    // key carries another id and must not stage, commit or free a buffer of
+    // this one.
+    L4TaskId task_id;
 };
 
 }  // namespace mooncake

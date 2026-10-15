@@ -4631,6 +4631,24 @@ tl::expected<void, ErrorCode> Client::NotifyPromotionFailure(
     return master_client_.NotifyPromotionFailure(client_id_, key, tenant_id);
 }
 
+tl::expected<PromotionAllocStartResponse, ErrorCode>
+Client::PromotionTaskAllocStart(
+    const PromotionTaskItem& item,
+    const std::vector<std::string>& preferred_segments) {
+    return master_client_.PromotionTaskAllocStart(client_id_, item,
+                                                  preferred_segments);
+}
+
+tl::expected<void, ErrorCode> Client::NotifyPromotionTaskSuccess(
+    const PromotionTaskItem& item) {
+    return master_client_.NotifyPromotionTaskSuccess(client_id_, item);
+}
+
+tl::expected<void, ErrorCode> Client::NotifyPromotionTaskFailure(
+    const PromotionTaskItem& item) {
+    return master_client_.NotifyPromotionTaskFailure(client_id_, item);
+}
+
 ErrorCode Client::PromotionWrite(const Replica::Descriptor& memory_descriptor,
                                  std::vector<Slice>& slices) {
     return TransferWrite(memory_descriptor, slices);

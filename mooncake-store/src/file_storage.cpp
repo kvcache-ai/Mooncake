@@ -940,22 +940,22 @@ namespace {
 // destructor notifies the master that promotion failed so the staged
 // PROCESSING replica and the in-flight slot are released eagerly instead of
 // waiting for the reaper TTL. NotifyPromotionFailure is idempotent and
-// best-effort - the reaper is the long-stop.
+// best-effort - the reaper is the long-stop. The failure names the task by
+// the item's task id, so it can never free a buffer of a newer promotion of
+// the key.
 class PromotionStateGuard {
    public:
-    PromotionStateGuard(Client* client, std::string key, std::string tenant_id)
-        : client_(client),
-          key_(std::move(key)),
-          tenant_id_(std::move(tenant_id)) {}
+    PromotionStateGuard(Client* client, const PromotionTaskItem& task)
+        : client_(client), task_(task) {}
 
     ~PromotionStateGuard() {
         if (dismissed_ || client_ == nullptr) {
             return;
         }
-        auto release = client_->NotifyPromotionFailure(key_, tenant_id_);
+        auto release = client_->NotifyPromotionTaskFailure(task_);
         if (!release) {
             VLOG(1) << "Promotion: NotifyPromotionFailure failed for key="
-                    << key_ << ", error=" << release.error()
+                    << task_.key << ", error=" << release.error()
                     << "; master reaper will reclaim on TTL expiry";
         }
     }
@@ -967,20 +967,33 @@ class PromotionStateGuard {
 
    private:
     Client* client_;
-    std::string key_;
-    std::string tenant_id_;
+    PromotionTaskItem task_;
     bool dismissed_{false};
 };
 
 }  // namespace
 
 tl::expected<void, ErrorCode> FileStorage::PromoteOneKeyFromLocalDisk(
-    const std::string& key, const std::string& tenant_id, int64_t size,
-    bool* dram_pressure) {
+    const PromotionTaskItem& task, bool* dram_pressure) {
+    const auto& key = task.key;
+    const auto& tenant_id = task.tenant_id;
+    const int64_t size = task.size;
     const auto storage_key = TenantId(tenant_id).MakeScopedKey(key);
     if (size <= 0) {
         LOG(WARNING) << "Promotion: skipping key=" << key
                      << " with non-positive size=" << size;
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (!task.task_id.has_value()) {
+        // A master that predates task ids matches promotion calls by key
+        // alone, so a late call could act on a newer promotion of the key.
+        // Never stage a buffer for it; end its task (no buffer is staged
+        // yet, so the key-only failure is safe).
+        auto release = client_->NotifyPromotionFailure(key, tenant_id);
+        if (!release) {
+            VLOG(1) << "Promotion: NotifyPromotionFailure failed for key="
+                    << key << ", error=" << release.error();
+        }
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
@@ -988,8 +1001,8 @@ tl::expected<void, ErrorCode> FileStorage::PromoteOneKeyFromLocalDisk(
     // DRAM segment.
     const std::vector<std::string> preferred_segments;
 
-    auto alloc_result = client_->PromotionAllocStart(
-        key, tenant_id, static_cast<uint64_t>(size), preferred_segments);
+    auto alloc_result =
+        client_->PromotionTaskAllocStart(task, preferred_segments);
     if (!alloc_result) {
         // AllocStart failed (typically NO_AVAILABLE_HANDLE under
         // DRAM pressure). No staged buffer to release, but the
@@ -1006,7 +1019,7 @@ tl::expected<void, ErrorCode> FileStorage::PromoteOneKeyFromLocalDisk(
             alloc_result.error() == ErrorCode::NO_AVAILABLE_HANDLE) {
             *dram_pressure = true;
         }
-        auto release = client_->NotifyPromotionFailure(key, tenant_id);
+        auto release = client_->NotifyPromotionTaskFailure(task);
         if (!release) {
             VLOG(1) << "Promotion: NotifyPromotionFailure failed for key="
                     << key << ", error=" << release.error()
@@ -1021,7 +1034,7 @@ tl::expected<void, ErrorCode> FileStorage::PromoteOneKeyFromLocalDisk(
     // reclaimed and the slot is freed; otherwise transient SSD
     // throttling or RDMA flakes saturate promotion_queue_limit_
     // for the full reaper TTL.
-    PromotionStateGuard guard(client_.get(), key, tenant_id);
+    PromotionStateGuard guard(client_.get(), task);
 
     // (a) Allocate an O_DIRECT-aligned staging buffer and read the bytes
     // from the local SSD backend into it. AllocateBatch returns a
@@ -1063,7 +1076,7 @@ tl::expected<void, ErrorCode> FileStorage::PromoteOneKeyFromLocalDisk(
 
     // (c) Commit. Master flips the PROCESSING replica to COMPLETE and it
     // becomes visible to readers.
-    auto notify_res = client_->NotifyPromotionSuccess(key, tenant_id);
+    auto notify_res = client_->NotifyPromotionTaskSuccess(task);
     if (!notify_res) {
         // The write landed but the commit failed. We can't retry the
         // commit (the success path is one-shot via alloc_id), and we
@@ -1100,8 +1113,12 @@ tl::expected<void, ErrorCode> FileStorage::PrefetchKeys(
         const auto& key = keys[i];
         const int64_t size = sizes[i];
         bool key_dram_pressure = false;
-        auto result = PromoteOneKeyFromLocalDisk(key, effective_tenant, size,
-                                                 &key_dram_pressure);
+        // A prefetch task carries no task id yet, so the promotion chain
+        // only ends it (see PromoteOneKeyFromLocalDisk).
+        auto result = PromoteOneKeyFromLocalDisk(
+            PromotionTaskItem{
+                .tenant_id = effective_tenant, .key = key, .size = size},
+            &key_dram_pressure);
         if (key_dram_pressure && dram_pressure != nullptr) {
             *dram_pressure = true;
         }
@@ -1181,6 +1198,7 @@ tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {
     VLOG(1) << "ProcessPromotionTasks pulled " << promotion_objects.size()
             << " promotion candidate(s) from master";
 
+    size_t items_without_task_id = 0;
     // The master caps per-heartbeat work via PromotionObjectHeartbeat,
     // returning at most one task per call so the heartbeat thread stays
     // within the client-liveness window even for large objects. Leftover
@@ -1188,8 +1206,15 @@ tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {
     // returned on subsequent heartbeats; we process whatever we received
     // here without a second client-side cap.
     for (const auto& task : promotion_objects) {
-        PromoteOneKeyFromLocalDisk(task.key, task.tenant_id, task.size,
-                                   nullptr);
+        if (!task.task_id.has_value()) {
+            ++items_without_task_id;
+        }
+        PromoteOneKeyFromLocalDisk(task, nullptr);
+    }
+    if (items_without_task_id > 0) {
+        LOG(WARNING) << "action=release_promotion_items, reason=no_task_id"
+                     << ", promotion_items_without_task_id="
+                     << items_without_task_id;
     }
 
     return {};
