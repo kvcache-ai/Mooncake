@@ -314,7 +314,10 @@ static Status prepareCallerSync(CallerSync &sync) {
     sync.event = nullptr;
 
     int current_device = 0;
-    cudaGetDevice(&current_device);
+    if (!checkCudaErrorReturn(cudaGetDevice(&current_device),
+                              "MacaTransport: failed to get device")) {
+        return Status::Context("MacaTransport: failed to get device");
+    }
     cudaEvent_t event = thread_local_event_pool.getOrCreate(current_device);
     if (!event) {
         return Status::Context("MacaTransport: failed to create sync event");
@@ -562,10 +565,6 @@ Status MacaTransport::submitTransferTask(
     }();
     (void)logged_batchflag_threshold;
 
-    CallerSync caller_sync;
-    Status sync_status = prepareCallerSync(caller_sync);
-    if (!sync_status.ok()) return sync_status;
-
     struct DeviceStream {
         int device_id;
         cudaStream_t stream;
@@ -581,10 +580,15 @@ Status MacaTransport::submitTransferTask(
 
     int original_device = -1;
     cudaGetDevice(&original_device);
-    int active_copy_device = -1;
 
     auto getStream = [&](int device_id, cudaStream_t &stream,
                          size_t &stream_index) -> bool {
+        // Select the registered buffer's device even when reusing a stream.
+        // Event recording and copy submission use the current device context.
+        if (!checkCudaErrorReturn(cudaSetDevice(device_id),
+                                  "MacaTransport: failed to set device")) {
+            return false;
+        }
         auto iter = stream_index_by_device.find(device_id);
         if (iter != stream_index_by_device.end()) {
             stream_index = iter->second;
@@ -592,8 +596,11 @@ Status MacaTransport::submitTransferTask(
             return true;
         }
 
-        if (!checkCudaErrorReturn(cudaSetDevice(device_id),
-                                  "MacaTransport: failed to set device")) {
+        CallerSync caller_sync;
+        Status sync_status = prepareCallerSync(caller_sync);
+        if (!sync_status.ok()) {
+            LOG(ERROR) << sync_status.ToString();
+            if (first_error.ok()) first_error = sync_status;
             return false;
         }
 
@@ -652,14 +659,17 @@ Status MacaTransport::submitTransferTask(
         }
         slice->local.dest_addr = (char *)dest_addr;
 
-        int target_device = getDeviceFromPointer(request.source);
-        if (target_device < 0)
-            target_device = getDeviceFromPointer((void *)dest_addr);
+        // request.source is the local buffer for both READ and WRITE. Use
+        // its registered allocation's device, not the worker's default GPU.
+        int target_device = getRegisteredDevice(request.source, request.length);
+        if (target_device < 0 && request.target_id == LOCAL_SEGMENT_ID)
+            target_device =
+                getRegisteredDevice((void *)dest_addr, request.length);
         if (target_device < 0) {
             slice->markFailed();
             if (first_error.ok())
                 first_error =
-                    Status::InvalidArgument("Cannot infer MACA device");
+                    Status::InvalidArgument("No registered local MACA buffer");
             continue;
         }
 
@@ -671,19 +681,6 @@ Status MacaTransport::submitTransferTask(
                 first_error =
                     Status::Memory("MacaTransport: failed to get MACA stream");
             continue;
-        }
-
-        if (active_copy_device != target_device) {
-            if (!checkCudaErrorReturn(cudaSetDevice(target_device),
-                                      "MacaTransport: failed to set device")) {
-                slice->markFailed();
-                streams[stream_index].ok = false;
-                if (first_error.ok())
-                    first_error =
-                        Status::Context("MacaTransport: failed to set device");
-                continue;
-            }
-            active_copy_device = target_device;
         }
 
         if (shouldUseBatchFlag(api, slice->length)) {
@@ -780,6 +777,22 @@ Status MacaTransport::submitTransferTask(
     return first_error;
 }
 
+int MacaTransport::getRegisteredDevice(void *addr, size_t length) {
+    const uint64_t address = reinterpret_cast<uint64_t>(addr);
+    std::lock_guard<std::mutex> lock(register_mutex_);
+    auto iter = registered_buffers_.upper_bound(address);
+    if (iter == registered_buffers_.begin()) return -1;
+    --iter;
+    const uint64_t offset = address - iter->first;
+    // Sub-allocated tensors must fit entirely in the registered allocation.
+    // Subtraction avoids overflow when checking address + length.
+    if (offset >= iter->second.length ||
+        length > iter->second.length - offset) {
+        return -1;
+    }
+    return iter->second.device_id;
+}
+
 int MacaTransport::registerLocalMemory(void *addr, size_t length,
                                        const std::string &location,
                                        bool remote_accessible,
@@ -799,6 +812,10 @@ int MacaTransport::registerLocalMemory(void *addr, size_t length,
         LOG(ERROR) << "Unsupported memory type, " << addr << " " << attr.type;
         return -1;
     }
+    if (attr.device < 0) {
+        LOG(ERROR) << "MacaTransport: registered buffer has no device";
+        return -1;
+    }
 
     // Resolve the true cudaMalloc base address. Framework caching allocators
     // (PyTorch, etc.) sub-allocate tensors within larger cudaMalloc segments.
@@ -815,7 +832,7 @@ int MacaTransport::registerLocalMemory(void *addr, size_t length,
     }
 
     // Skip if this cudaMalloc block is already registered
-    if (registered_base_addrs_.count((uint64_t)base_ptr)) {
+    if (registered_buffers_.count((uint64_t)base_ptr)) {
         return 0;
     }
 
@@ -837,7 +854,8 @@ int MacaTransport::registerLocalMemory(void *addr, size_t length,
 #endif
     int rc = metadata_->addLocalMemoryBuffer(desc, true);
     if (rc == 0) {
-        registered_base_addrs_.insert((uint64_t)base_ptr);
+        registered_buffers_.emplace((uint64_t)base_ptr,
+                                    RegisteredBuffer{alloc_size, attr.device});
     }
     return rc;
 }
@@ -860,7 +878,7 @@ int MacaTransport::unregisterLocalMemory(void *addr, bool update_metadata) {
 
     {
         std::lock_guard<std::mutex> lock(register_mutex_);
-        registered_base_addrs_.erase((uint64_t)key_ptr);
+        registered_buffers_.erase((uint64_t)key_ptr);
     }
     return metadata_->removeLocalMemoryBuffer(key_ptr, update_metadata);
 }

@@ -19,10 +19,10 @@
 
 #include <functional>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
-#include <unordered_set>
 #include <vector>
 #include <utility>
 
@@ -77,6 +77,8 @@ class MacaTransport : public Transport {
     const char* getName() const override { return "maca"; }
 
    private:
+    int getRegisteredDevice(void* addr, size_t length);
+
     std::atomic_bool running_;
 
     struct OpenedShmEntry {
@@ -89,7 +91,11 @@ class MacaTransport : public Transport {
     RWSpinlock remap_lock_;
 
     std::mutex register_mutex_;
-    std::unordered_set<uint64_t> registered_base_addrs_;
+    struct RegisteredBuffer {
+        size_t length;
+        int device_id;
+    };
+    std::map<uint64_t, RegisteredBuffer> registered_buffers_;
 };
 
 }  // namespace mooncake
