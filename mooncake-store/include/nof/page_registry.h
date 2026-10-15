@@ -31,9 +31,9 @@ namespace mooncake {
 // failed registration is cleaned up once; anything whose cleanup cannot be
 // confirmed is QUARANTINED — terminally pinned, never unregistered, never
 // re-registered, never munmapped (the kernel reclaims it at process exit).
-// A later registration treats a quarantined page like an external one
-// (covered, OK) and fails to release it at teardown, keeping the mapping
-// pinned.
+// A quarantined page is unknown translation state, NOT usable coverage: any
+// registration whose range contains one reports NOF_REGISTRATION_STUCK, and
+// teardown fails to release it, keeping the mapping pinned.
 //
 // Each owner record is {size, charged_from}: the covered range is
 // [charged_from ?: first_page, page_align(begin + size)). Charges are

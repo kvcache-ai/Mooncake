@@ -279,8 +279,9 @@ TEST_F(NofPageRegistryTest, StuckRetryExtendsOverUntouchedTail) {
     EXPECT_EQ(fake_.Depth(page2), 1);
 }
 
-// A quarantined page is treated like an external one by later registrations
-// (OK), but is terminally unreleasable for every owner.
+// A quarantined page reports STUCK to every later registration (unknown
+// translation state is not usable coverage) and is terminally unreleasable
+// for every owner.
 TEST_F(NofPageRegistryTest, QuarantinedPageStaysPinnedForAllOwners) {
     void* ptr = PageAddr(0);
     const uintptr_t page0 = reinterpret_cast<uintptr_t>(ptr);

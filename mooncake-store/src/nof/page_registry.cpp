@@ -60,8 +60,9 @@ ErrorCode NofPageRegistry::Register(uint64_t owner, void* ptr, size_t size) {
             continue;  // still charged by this record
         }
         auto& reg = page_regs_[page];
-        // External and quarantined pages are treated alike: pinned, never
-        // (un)registered by us.
+        // External pages are pinned and never (un)registered by us; a
+        // quarantined page additionally makes the whole range report STUCK
+        // (unknown translation state is not usable DMA coverage).
         if (reg.external) {
             continue;
         }

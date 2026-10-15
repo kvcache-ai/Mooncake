@@ -106,8 +106,8 @@ class NVMeoFInitiator {
     // any instance.
     //
     // Return contract:
-    //   - OK: the range is fully registered (external or quarantined pages
-    //     count as covered).
+    //   - OK: the range is fully registered (external pages count as
+    //     covered).
     //   - other errors except NOF_REGISTRATION_STUCK: failed, everything
     //     touched is confirmed clean; the caller may munmap without a
     //     pairing UnregisterMemory.
