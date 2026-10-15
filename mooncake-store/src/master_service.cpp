@@ -43,10 +43,6 @@
 #include "nof/nof_runtime.h"
 #include "ha/ha_types.h"
 #include "ha/kv/ha_kv_backend_factory.h"
-#ifdef STORE_USE_ETCD
-#include "etcd_helper.h"
-#include "ha/kv/etcd_ha_kv_backend.h"
-#endif
 #include "ha/oplog/oplog_batch_storage.h"
 #include "ha/oplog/ordered_oplog_writer.h"
 #include "types.h"
