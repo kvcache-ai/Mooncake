@@ -910,7 +910,8 @@ void dumpGlobalConfig() {
     }
     LOG(INFO) << "mlx5_qp_lag_port_balance = "
               << (config.mlx5_qp_lag_port_balance ? "true" : "false");
-    LOG(INFO) << "enable_dest_local_rail = " << config.enable_dest_local_rail;
+    LOG(INFO) << "enable_dest_local_rail = "
+              << (config.enable_dest_local_rail ? "true" : "false");
     LOG(INFO) << "log_rdma_slice_affinity = "
               << (config.log_rdma_slice_affinity ? "true" : "false");
     LOG(INFO) << "track_rdma_posted_slices = "
