@@ -101,6 +101,14 @@ std::shared_ptr<Config> loadConfig() {
     return config;
 }
 
+// With --mlu_local_threshold the admission queue cancels transfers it
+// predicts will miss their deadline. That is the behaviour being measured,
+// not a failure, so it must not stop the run.
+static bool deadlineDropEnabled() {
+    return XferBenchConfig::deadline_aware &&
+           XferBenchConfig::mlu_local_threshold > 0.0;
+}
+
 static TransportType getTransportType(const std::string& xport_type) {
     if (xport_type == "rdma") return RDMA;
     if (xport_type == "shm") return SHM;
@@ -552,6 +560,10 @@ double TENTBenchRunner::runSingleTransfer(
             if (overall_status.s == TransferStatusEnum::COMPLETED) {
                 return finish(timer.lap_us());
             }
+            if (overall_status.s == TransferStatusEnum::CANCELED &&
+                deadlineDropEnabled()) {
+                return finish(kTransferDropped);
+            }
             if (overall_status.s == TransferStatusEnum::FAILED ||
                 overall_status.s == TransferStatusEnum::TIMEOUT ||
                 overall_status.s == TransferStatusEnum::CANCELED ||
@@ -593,6 +605,10 @@ double TENTBenchRunner::runSingleTransfer(
             const uint64_t wait_us = wait_timer.lap_us();
             logSplitXfer({batch_size, submit_us, wait_us, polls});
             return finish(static_cast<double>(submit_us + wait_us));
+        }
+        if (overall_status.s == TransferStatusEnum::CANCELED &&
+            deadlineDropEnabled()) {
+            return finish(kTransferDropped);
         }
         if (overall_status.s == TransferStatusEnum::FAILED ||
             overall_status.s == TransferStatusEnum::TIMEOUT ||

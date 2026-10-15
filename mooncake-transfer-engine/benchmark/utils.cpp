@@ -350,15 +350,19 @@ void printStats(size_t block_size, size_t batch_size, XferBenchStats& stats,
 void printDeadlineGroupStats(const char* group, size_t block_size,
                              size_t batch_size, XferBenchStats& stats,
                              int num_threads, uint64_t deadline_us) {
-    if (num_threads <= 0 || stats.transfer_duration.count() == 0) return;
+    if (num_threads <= 0 ||
+        (stats.transfer_duration.count() == 0 && stats.dropped == 0))
+        return;
     const double duration_s = stats.total_duration.avg() / 1e6;
     const double bytes = static_cast<double>(block_size) * batch_size *
                          stats.transfer_duration.count();
     const double throughput_gbs = bytes / 1e9 / duration_s;
     std::cout << "  [deadline-" << group << "] threads=" << num_threads;
     if (deadline_us != 0) std::cout << " deadline_us=" << deadline_us;
-    std::cout << " operations=" << stats.transfer_duration.count()
-              << " throughput=" << std::fixed << std::setprecision(6)
+    std::cout << " operations=" << stats.transfer_duration.count();
+    if (XferBenchConfig::mlu_local_threshold > 0.0)
+        std::cout << " dropped=" << stats.dropped;
+    std::cout << " throughput=" << std::fixed << std::setprecision(6)
               << throughput_gbs << " GB/s" << std::endl;
 }
 

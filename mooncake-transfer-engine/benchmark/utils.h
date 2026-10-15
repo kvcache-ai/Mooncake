@@ -160,6 +160,9 @@ struct XferBenchStats {
     XferMetricStats total_duration;
     XferMetricStats transfer_duration;
     XferMetricStats instant_bandwidth;
+    // Operations the admission queue dropped (--mlu_local_threshold); they
+    // are not in transfer_duration or instant_bandwidth.
+    uint64_t dropped = 0;
 };
 
 class XferBenchTimer {
