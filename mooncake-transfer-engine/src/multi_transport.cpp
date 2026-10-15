@@ -838,8 +838,8 @@ Status MultiTransport::selectTransport(const TransferRequest& entry,
                     : buffer.addr;
             if (entry.target_offset >= start &&
                 entry.target_offset < start + buffer.length) {
-                if ((buffer.protocol == "hip" || buffer.protocol == "musa" ||
-                     buffer.protocol == "shm") &&
+                if ((buffer.protocol == "hip" || buffer.protocol == "maca" ||
+                     buffer.protocol == "musa" || buffer.protocol == "shm") &&
                     !local_ipc_reachable) {
                     continue;
                 }
@@ -914,11 +914,12 @@ Status MultiTransport::mp_selectTransport(const TransferRequest& entry,
         if (!item.empty()) protos.push_back(item);
     }
 
-    // hip GPU IPC and POSIX SHM cannot reach a remote host; downgrade an
-    // explicit intra-node preference to a cross-host-capable transport
-    // (mirrors the locality gate in selectTransport). Prefer rdma, then tcp.
-    if ((preferred_proto == "hip" || preferred_proto == "musa" ||
-         preferred_proto == "shm") &&
+    // GPU IPC (HIP/MUSA/MACA) and POSIX SHM are intra-host only.
+    // Downgrade an explicit intra-node preference to a cross-host-capable
+    // transport (mirrors the locality gate in selectTransport).
+    // Prefer RDMA, then TCP.
+    if ((preferred_proto == "hip" || preferred_proto == "maca" ||
+         preferred_proto == "musa" || preferred_proto == "shm") &&
         !isLocalIpcReachableTarget(target_segment_desc->name,
                                    local_server_name_)) {
         std::string fallback;
