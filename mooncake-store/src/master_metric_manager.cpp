@@ -386,7 +386,8 @@ MasterMetricManager::MasterMetricManager()
       eviction_duration_ms_(
           "master_eviction_duration_ms",
           "Wall-clock duration of one BatchEvict cycle in milliseconds",
-          {1, 5, 10, 25, 50, 100, 250, 500, 1000, 5000, 30000}),
+          {1, 5, 10, 50, 100, 250, 500, 1000, 5000, 15000, 30000, 60000,
+           120000, 300000, 600000}),
 
       // Initialize Discarded Replicas Counters
       put_start_discard_cnt_("master_put_start_discard_cnt",
