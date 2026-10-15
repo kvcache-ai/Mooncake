@@ -1,10 +1,16 @@
 #include "common/file_util.h"
 #include <algorithm>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <functional>
 #include <limits>
 #include <string_view>
+#include <tuple>
+#include <utility>
+
+#include <fcntl.h>
+#include <sys/stat.h>
 
 namespace mooncake {
 namespace {
@@ -64,6 +70,35 @@ tl::expected<void, std::string> WriteChunks(std::ofstream &file,
 }
 
 }  // namespace
+
+void FileUtil::SortByCreationTime(std::vector<fs::directory_entry> &files) {
+    using TimeKey = std::tuple<bool, int64_t, uint32_t>;
+    std::vector<std::pair<TimeKey, fs::directory_entry>> timed_files;
+    timed_files.reserve(files.size());
+    for (const auto &entry : files) {
+        struct statx info{};
+        const bool has_birth_time =
+            statx(AT_FDCWD, entry.path().c_str(), 0, STATX_BTIME, &info) == 0 &&
+            (info.stx_mask & STATX_BTIME) != 0;
+        timed_files.emplace_back(
+            TimeKey{!has_birth_time, has_birth_time ? info.stx_btime.tv_sec : 0,
+                    has_birth_time ? info.stx_btime.tv_nsec : 0},
+            entry);
+    }
+
+    // No filesystem operations in the comparator: a disappearing file must
+    // not become equivalent to every other entry or change a comparison key.
+    std::sort(timed_files.begin(), timed_files.end(),
+              [](const auto &a, const auto &b) {
+                  if (a.first != b.first) {
+                      return a.first < b.first;
+                  }
+                  return a.second.path() < b.second.path();
+              });
+    for (size_t i = 0; i < files.size(); ++i) {
+        files[i] = std::move(timed_files[i].second);
+    }
+}
 
 std::string FileUtil::ResolvePathFromKey(const std::string &key,
                                          const std::string &root_dir,
