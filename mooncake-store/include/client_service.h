@@ -634,17 +634,18 @@ class Client {
         TransferIntent intent = TransferIntent::kForegroundGet);
 
     /**
-     * @brief Notifies the master that offloading of specified objects has
-     * succeeded.
-     * @param keys         A list of object keys (names) that were successfully
-     * offloaded.
-     * @param metadatas    The corresponding metadata for each offloaded object,
-     * including size, storage location, etc.
+     * @brief Reports offload NACKs (data_size < 0) for the items this client
+     * drained, echoing each item (task id included).
+     * @param tasks        The drained items.
+     * @param metadatas    The corresponding metadata for each item.
      */
     tl::expected<void, ErrorCode> NotifyOffloadSuccess(
-        const std::vector<std::string>& keys,
+        const std::vector<OffloadTaskItem>& tasks,
         const std::vector<StorageObjectMetadata>& metadatas);
-    tl::expected<void, ErrorCode> NotifyOffloadSuccess(
+    // Completions are registered only through this RPC name (see
+    // MasterClient::NotifyOffloadTaskSuccess); NotifyOffloadSuccess above
+    // carries NACKs.
+    tl::expected<void, ErrorCode> NotifyOffloadTaskSuccess(
         const std::vector<OffloadTaskItem>& tasks,
         const std::vector<StorageObjectMetadata>& metadatas);
     void SetDfsStorageBackend(
