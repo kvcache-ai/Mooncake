@@ -380,18 +380,18 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
                 [&] { return cudaStreamSynchronize(stream); },
                 [&] {
                     const auto devctx = initialQueuePairDeviceContext(qp);
-                    return cudaMemcpy(
-                        static_cast<char*>(qp_devctxs_) +
-                            i * sizeof(mlx5gda_qp_devctx),
-                        &devctx, sizeof(mlx5gda_qp_devctx),
-                        cudaMemcpyHostToDevice);
+                    return cudaMemcpy(static_cast<char*>(qp_devctxs_) +
+                                          i * sizeof(mlx5gda_qp_devctx),
+                                      &devctx, sizeof(mlx5gda_qp_devctx),
+                                      cudaMemcpyHostToDevice);
                 });
             if (cuda_status != cudaSuccess) {
-                LOG(ERROR) << "[EP IBGDA] Failed to "
-                           << (failed_operation == 0
-                                   ? "synchronize stream before initializing QP "
-                                   : "copy device context for QP ")
-                           << i << ": " << cudaGetErrorString(cuda_status);
+                LOG(ERROR)
+                    << "[EP IBGDA] Failed to "
+                    << (failed_operation == 0
+                            ? "synchronize stream before initializing QP "
+                            : "copy device context for QP ")
+                    << i << ": " << cudaGetErrorString(cuda_status);
                 return -1;
             }
             if (i == 0 && ctrl_buf_mode_ == ControlMemoryMode::kGpuDmabuf) {
@@ -604,8 +604,7 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
                                 : static_cast<uint32_t>(remote_keys[i]);
             size_t failed_operation = 0;
             const auto cuda_status = initializePeerAddressTable(
-                cudaSuccess, [this] { destroyQueuePairs(); },
-                &failed_operation,
+                cudaSuccess, [this] { destroyQueuePairs(); }, &failed_operation,
                 [&] {
                     return cudaMemcpy(
                         static_cast<char*>(raddrs_) + i * sizeof(uint64_t),

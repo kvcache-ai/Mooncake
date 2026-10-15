@@ -39,7 +39,8 @@ TEST(IbgdaCudaErrorTest, QueuePairSetupStopsOnStreamFailure) {
 
     const int status = initializeQueuePairDeviceContext(
         kSuccess, [&] { ++cleanup_count; }, &failed_operation,
-        [] { return kFailure; }, [&] {
+        [] { return kFailure; },
+        [&] {
             ++copy_count;
             return kSuccess;
         });
@@ -74,7 +75,8 @@ TEST(IbgdaCudaErrorTest, PeerTableSetupStopsOnAddressCopyFailure) {
 
     const int status = initializePeerAddressTable(
         kSuccess, [&] { ++cleanup_count; }, &failed_operation,
-        [] { return kFailure; }, [&] {
+        [] { return kFailure; },
+        [&] {
             ++key_copy_count;
             return kSuccess;
         });

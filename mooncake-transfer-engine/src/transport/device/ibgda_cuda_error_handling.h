@@ -33,10 +33,10 @@ Status initializeQueuePairDeviceContext(Status success, Cleanup&& cleanup,
                                         std::size_t* failed_operation,
                                         Synchronize&& synchronize,
                                         CopyContext&& copy_context) {
-    return runCudaOperationsOrCleanup(
-        success, std::forward<Cleanup>(cleanup), failed_operation,
-        std::forward<Synchronize>(synchronize),
-        std::forward<CopyContext>(copy_context));
+    return runCudaOperationsOrCleanup(success, std::forward<Cleanup>(cleanup),
+                                      failed_operation,
+                                      std::forward<Synchronize>(synchronize),
+                                      std::forward<CopyContext>(copy_context));
 }
 
 template <typename Status, typename Cleanup, typename CopyAddress,
@@ -45,10 +45,10 @@ Status initializePeerAddressTable(Status success, Cleanup&& cleanup,
                                   std::size_t* failed_operation,
                                   CopyAddress&& copy_address,
                                   CopyKey&& copy_key) {
-    return runCudaOperationsOrCleanup(
-        success, std::forward<Cleanup>(cleanup), failed_operation,
-        std::forward<CopyAddress>(copy_address),
-        std::forward<CopyKey>(copy_key));
+    return runCudaOperationsOrCleanup(success, std::forward<Cleanup>(cleanup),
+                                      failed_operation,
+                                      std::forward<CopyAddress>(copy_address),
+                                      std::forward<CopyKey>(copy_key));
 }
 
 }  // namespace mooncake::device
