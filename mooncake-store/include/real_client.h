@@ -1132,10 +1132,6 @@ class RealClient : public PyClient {
     mutable std::shared_mutex registered_buffer_mutex_;
     struct BufferRegistrationRecord {
         size_t size;
-        // TE cleanup was confirmed (OK, or NOT_REGISTERED — truthful since
-        // RdmaTransport retries any stuck MR deregistration first). NoF
-        // cleanup may still be pending.
-        bool te_cleanup_confirmed = false;
     };
     // A present record means "registered OR cleanup-pending": a record is
     // retained when NoF/TE cleanup failed, in which case the buffer must

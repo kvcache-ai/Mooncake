@@ -4542,7 +4542,7 @@ tl::expected<void, ErrorCode> RealClient::register_buffer_internal(
         std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
         // The record keeps the logical size: writable-region resolution must
         // not expose the physical segment beyond what the caller registered.
-        registered_buffer_sizes_[buffer] = {size, false};
+        registered_buffer_sizes_[buffer] = {size};
     }
     return result;
 }
@@ -4583,9 +4583,6 @@ tl::expected<void, ErrorCode> RealClient::unregister_buffer_internal(
         }
         LOG(WARNING) << "TE reports buffer " << buffer
                      << " as already unregistered; retrying the NoF cleanup";
-    }
-    if (rec_it != registered_buffer_sizes_.end()) {
-        rec_it->second.te_cleanup_confirmed = true;
     }
     if (nof_runtime_.initiator) {
         auto rc = nof_runtime_.initiator->UnregisterMemory(buffer);
