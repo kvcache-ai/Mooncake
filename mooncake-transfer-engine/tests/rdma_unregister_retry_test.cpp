@@ -35,15 +35,14 @@
 
 using namespace mooncake;
 
-namespace {
-
-// ibv_dereg_mr is an inline forwarding to mr->context->ops.dereg_mr, so a
-// fake ibv_context ops table lets us script deregistration failures without
-// RDMA hardware.
+// Interpose the libibverbs boundary for this test binary (same mechanism as
+// rdma_context_reprobe_test.cpp): rdma-core implements ibv_dereg_mr as an
+// exported library symbol, so this definition takes precedence and lets the
+// test script deregistration failures without RDMA hardware.
 int g_fake_dereg_failures_remaining = 0;
 int g_fake_dereg_calls = 0;
 
-int fakeDeregMr(ibv_mr *) {
+extern "C" int ibv_dereg_mr(ibv_mr *) {
     ++g_fake_dereg_calls;
     if (g_fake_dereg_failures_remaining > 0) {
         --g_fake_dereg_failures_remaining;
@@ -52,17 +51,7 @@ int fakeDeregMr(ibv_mr *) {
     return 0;
 }
 
-struct FakeMr {
-    ibv_context verbs_ctx = {};
-    ibv_mr mr = {};
-
-    FakeMr(void *addr, size_t length) {
-        verbs_ctx.ops.dereg_mr = &fakeDeregMr;
-        mr.context = &verbs_ctx;
-        mr.addr = addr;
-        mr.length = length;
-    }
-};
+namespace {
 
 class RdmaUnregisterRetryTest : public ::testing::Test {
    protected:
@@ -89,11 +78,22 @@ class RdmaUnregisterRetryTest : public ::testing::Test {
 
         g_fake_dereg_failures_remaining = 0;
         g_fake_dereg_calls = 0;
+
+        // A synthetic MR record: only addr/length are read by
+        // RdmaContext::unregisterMemoryRegion (plus mr itself, handed to the
+        // interposed ibv_dereg_mr above).
+        mr_ = {};
+        mr_.addr = buffer_;
+        mr_.length = kLength;
+        RdmaContextTestPeer::seedMemoryRegion(*context_, buffer_, kLength,
+                                              &mr_);
     }
 
     void TearDown() override {
         // Destroy the transport (and its contexts) before unmapping so no
-        // deferred cleanup can touch the buffer.
+        // deferred cleanup can touch the buffer. The MR map must be empty by
+        // now: a leaked entry would dangle a pointer to the stack mr_.
+        EXPECT_FALSE(RdmaContextTestPeer::hasMemoryRegion(*context_, buffer_));
         transport_.reset();
         context_.reset();
         if (buffer_ != MAP_FAILED) munmap(buffer_, kLength);
@@ -112,15 +112,13 @@ class RdmaUnregisterRetryTest : public ::testing::Test {
     std::shared_ptr<TransferMetadata> metadata_;
     std::unique_ptr<RdmaTransport> transport_;
     std::shared_ptr<RdmaContext> context_;
+    ibv_mr mr_{};
 };
 
 // A failed ibv_dereg_mr after the metadata entry was removed must surface the
 // real error (not NOT_REGISTERED), and the retry must reach the MR cleanup
 // behind the missing metadata entry instead of short-circuiting.
 TEST_F(RdmaUnregisterRetryTest, RetryReachesLiveMrBehindMissingMetadata) {
-    FakeMr fake(buffer_, kLength);
-    RdmaContextTestPeer::seedMemoryRegion(*context_, buffer_, kLength,
-                                          &fake.mr);
     addMetadataEntry();
 
     // First attempt: metadata is removed, then the MR deregistration fails.
@@ -146,9 +144,6 @@ TEST_F(RdmaUnregisterRetryTest, RetryReachesLiveMrBehindMissingMetadata) {
 // While an MR survives, the retry must keep failing: NOT_REGISTERED may only
 // be reported once the per-context deregistration has actually succeeded.
 TEST_F(RdmaUnregisterRetryTest, RetryKeepsFailingWhileMrSurvives) {
-    FakeMr fake(buffer_, kLength);
-    RdmaContextTestPeer::seedMemoryRegion(*context_, buffer_, kLength,
-                                          &fake.mr);
     addMetadataEntry();
 
     g_fake_dereg_failures_remaining = 2;
