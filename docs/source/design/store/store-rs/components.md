@@ -231,7 +231,7 @@ See the [benchmark guide](../../../performance/mooncake/store-rs-benchmark.md) f
 
 ## Suggested Reading Order
 
-1. [Source-checkout quickstart](../../../getting_started/store-rs.md)
+1. {ref}`Build with Store-RS <build-with-store-rs>`
 2. [Deployment](../../../deployment/store-rs/deployment.md)
 3. [Rust API](../../../api-reference/rust/store-rs.md)
 4. [Configuration](../../../deployment/store-rs/configuration.md)

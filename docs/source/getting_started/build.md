@@ -75,6 +75,54 @@ sudo make install
 `-DUSE_NOF=ON` builds the NoF registration APIs and deployment tools. Use
 `-DUSE_NOF=OFF` or omit the option when the NVMe-oF SSD pool is not needed.
 
+(build-with-store-rs)=
+### Build with Store-RS
+
+Store-RS is an optional Rust-native Mooncake Store. The default CMake build
+leaves it disabled, and the Python Store facade uses the C++ backend. Enable
+it when a root wheel should include the Rust backend and the standalone
+`mooncake-store-rs-client`, `mooncake-store-rs-admin`, and
+`mooncake-store-rs-bench` commands.
+
+The build needs a root checkout with submodules, CMake, a C++ toolchain, Rust
+(`cargo` on `PATH`), and Python 3.10 or newer. A multi-client runtime also
+needs Redis or etcd.
+
+```bash
+mkdir build
+cd build
+cmake .. \
+  -DWITH_STORE=ON \
+  -DWITH_STORE_RUST=OFF \
+  -DWITH_STORE_RS=ON \
+  -DWITH_TE=ON \
+  -DUSE_TENT=ON \
+  -DBUILD_SHARED_LIBS=ON
+cmake --build . --target build_store_rs --parallel
+```
+
+`WITH_STORE_RS=ON` requires `WITH_TE=ON` and `USE_TENT=ON`. This build produces
+the native artifacts and standalone binaries. For a Python wheel, skip that
+CMake build and let the wheel builder configure its own tree:
+
+```bash
+SKBUILD_CMAKE_ARGS="-DWITH_STORE=ON -DWITH_STORE_RUST=OFF \
+  -DWITH_STORE_RS=ON -DWITH_TE=ON -DUSE_TENT=ON \
+  -DBUILD_SHARED_LIBS=ON" \
+  python3 -m pip wheel . --no-deps --wheel-dir dist
+```
+
+Install that wheel into one environment. Set `MOONCAKE_STORE_BACKEND` before
+the first import of `mooncake.store`: leave it unset or set it to `cpp` for
+the C++ Store, or set it to `rs` for Store-RS. The setting does not change the
+standalone command names.
+
+Configuration, validation, and API details are in the
+[Store-RS deployment guides](../deployment/store-rs/index.md), the
+[Rust API](../api-reference/rust/store-rs.md), the
+[Python API](../api-reference/python/store-rs.md), and the
+[Admin HTTP API](../api-reference/http/store-rs-admin.md).
+
 ### RISC-V Build
 
 Mooncake supports native 64-bit RISC-V Linux builds with `USE_RISCV` enabled.
@@ -301,6 +349,7 @@ The following options can be passed to `cmake ..`.
 | `-DWITH_P2P_STORE=ON/OFF` | `OFF` | Enable Golang support and build the P2P Store component. Requires Go 1.23+. |
 | `-DWITH_RUST_EXAMPLE=ON/OFF` | `OFF` | Build the Transfer Engine Rust library (`transfer_engine_rust`), tests, and sample benchmark. |
 | `-DWITH_STORE_RUST=ON/OFF` | `ON` | Build Mooncake Store Rust bindings and CMake Rust targets. |
+| `-DWITH_STORE_RS=ON/OFF` | `OFF` | Build the Rust-native Mooncake Store (Store-RS), its Python extension, and the standalone commands. Requires `-DWITH_TE=ON`, `-DUSE_TENT=ON`, and `cargo`. See {ref}`Build with Store-RS <build-with-store-rs>`. |
 | `-DWITH_EP=ON/OFF` | `OFF` | Build Mooncake EP and the native Mooncake PG core/device libraries. The Torch-facing PG adapter is compiled by the installed package at first `import mooncake.pg`. |
 
 ### Build Behavior Options

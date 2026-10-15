@@ -92,7 +92,6 @@ At the center of Mooncake is a KVCache-centric scheduler that balances effective
 
 getting_started/quick-start
 getting_started/build
-getting_started/store-rs
 
 :::
 
