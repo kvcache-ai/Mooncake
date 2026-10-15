@@ -250,7 +250,8 @@ class RdmaTransportTestPeer {
                                           slice.target_addr, slice.length));
         const int previous = tl_wid;
         tl_wid = 0;
-        auto status = workers.selectOptimalDevice(source, target, &slice);
+        auto status =
+            workers.selectOptimalDevice(source, target, &slice, nullptr);
         tl_wid = previous;
         return status;
     }
@@ -927,6 +928,13 @@ TEST_P(RdmaPeerRailAllocationTest, LazyAllocationDoesNotNeedRailFallback) {
 
 TEST_P(RdmaPeerRailAllocationTest, EmptyPolicyIntersectionNeverAllocates) {
     batch_->device_mask = 1ULL;
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+    RdmaTransportTestPeer::enableCongestionControl(*workers_, 1);
+    workers_->getDeviceSelector()->setDeviceAvailable(0, false);
+    auto observation = std::make_shared<
+        adaptive_congestion_control::TaskCongestionObservation>(0, 0);
+    transport_.setTaskCongestionObservation(batch_, 0, observation, 1);
+#endif
     ASSERT_TRUE(transport_.submitTransferTasks(batch_, {request_}).ok());
     for (auto* first : static_cast<RdmaSubBatch*>(batch_)->slice_chain) {
         for (auto* slice = first; slice; slice = slice->next) {
@@ -936,6 +944,13 @@ TEST_P(RdmaPeerRailAllocationTest, EmptyPolicyIntersectionNeverAllocates) {
             EXPECT_EQ(slice->charged_dev, -1);
         }
     }
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+    // Peer policy excludes this NIC before its health can block admission.
+    EXPECT_EQ(observation->state(), TaskCongestionState::kNormal);
+    const auto detail = observation->detail();
+    EXPECT_FALSE(detail.reason.observed);
+    EXPECT_FALSE(detail.failure_scope.observed);
+#endif
 }
 
 TEST_P(RdmaPeerRailAllocationTest, CoalescedRegionsUseSliceSpecificCandidates) {
