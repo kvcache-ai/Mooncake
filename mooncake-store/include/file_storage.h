@@ -192,6 +192,14 @@ class FileStorage {
         const std::vector<OffloadTaskItem>& offloading_objects);
 
     /**
+     * @brief Handles the offload items of one heartbeat drain: NACKs items
+     * without a task id without copying them and offloads the rest
+     * (OffloadObjects).
+     */
+    tl::expected<void, ErrorCode> ProcessDrainedOffloads(
+        std::vector<OffloadTaskItem> drained);
+
+    /**
      * @brief Classifies a BatchOffload error as affecting only the current
      * bucket rather than the whole offload cycle.
      *
