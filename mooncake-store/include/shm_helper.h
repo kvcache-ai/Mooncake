@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -33,7 +34,11 @@ class ShmHelper {
         // don't re-derive the alignment.
         size_t requested_size = 0;
         std::string name;
-        bool registered = false;
+        // Whether RealClient currently has this segment mapped. Read and
+        // written from both batch-op threads and register_buffer() callers, so
+        // it must be atomic even though the check-then-act sequences around it
+        // tolerate benign interleavings.
+        std::atomic<bool> registered{false};
         bool spdk_registered = false;
         bool is_local = false;
     };
