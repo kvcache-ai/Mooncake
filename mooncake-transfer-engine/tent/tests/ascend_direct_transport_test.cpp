@@ -213,7 +213,6 @@ const char* kEnvKeys[] = {
     "HCCL_RDMA_SL",
     "HCCL_INTRA_ROCE_ENABLE",
     "ASCEND_BASE_PORT",
-    "MC_CUSTOM_TOPO_JSON",
 };
 
 void ClearAscendEnv() {
@@ -793,39 +792,27 @@ TEST(AscendDirectResourceConfigTest, WithHixlListenPortReplacesFlatPort) {
     EXPECT_EQ(parsed.at("comm_resource_config.listen_port"), 52067);
 }
 
-namespace {
-struct CustomTopoJsonScope {
-    explicit CustomTopoJsonScope(const char* value) {
-        if (value == nullptr) {
-            unsetenv("MC_CUSTOM_TOPO_JSON");
-        } else {
-            setenv("MC_CUSTOM_TOPO_JSON", value, 1);
-        }
-    }
-    ~CustomTopoJsonScope() { unsetenv("MC_CUSTOM_TOPO_JSON"); }
-};
-}  // namespace
-
 TEST(AscendDirectResourceConfigTest, InjectNicTopoPath_EmptyConfigCreates) {
-    CustomTopoJsonScope env("/etc/mooncake/nic_topo.json");
-    auto out = InjectNicTopoPathFromCustomTopoEnvTent("");
+    auto out = InjectNicTopoPathFromCustomTopoTent(
+        "", "/etc/mooncake/nic_topo.json");
     const auto parsed = nlohmann::json::parse(out);
     EXPECT_EQ(parsed.at("comm_resource_config.nic_topo_path"),
               "/etc/mooncake/nic_topo.json");
 }
 
 TEST(AscendDirectResourceConfigTest, InjectNicTopoPath_ExplicitWins) {
-    CustomTopoJsonScope env("/etc/mooncake/nic_topo.json");
     const std::string cfg =
         R"({"comm_resource_config.nic_topo_path":"/explicit.json"})";
-    EXPECT_EQ(InjectNicTopoPathFromCustomTopoEnvTent(cfg), cfg);
+    EXPECT_EQ(InjectNicTopoPathFromCustomTopoTent(
+                  cfg, "/etc/mooncake/nic_topo.json"),
+              cfg);
 }
 
 TEST(AscendDirectResourceConfigTest, InjectNicTopoPath_NestedDropsFlat) {
-    CustomTopoJsonScope env("/etc/mooncake/nic_topo.json");
-    const std::string out = InjectNicTopoPathFromCustomTopoEnvTent(
+    const std::string out = InjectNicTopoPathFromCustomTopoTent(
         R"({"comm_resource_config":{"protocol_desc":"roce:host"},)"
-        R"("comm_resource_config.nic_topo_path":""})");
+        R"("comm_resource_config.nic_topo_path":""})",
+        "/etc/mooncake/nic_topo.json");
     const auto parsed = nlohmann::json::parse(out);
     EXPECT_EQ(parsed.at("comm_resource_config").at("nic_topo_path"),
               "/etc/mooncake/nic_topo.json");
@@ -834,15 +821,16 @@ TEST(AscendDirectResourceConfigTest, InjectNicTopoPath_NestedDropsFlat) {
 }
 
 TEST(AscendDirectResourceConfigTest, InjectNicTopoPath_InvalidJsonUnchanged) {
-    CustomTopoJsonScope env("/etc/mooncake/nic_topo.json");
     const std::string cfg = "{not json";
-    EXPECT_EQ(InjectNicTopoPathFromCustomTopoEnvTent(cfg), cfg);
+    EXPECT_EQ(InjectNicTopoPathFromCustomTopoTent(
+                  cfg, "/etc/mooncake/nic_topo.json"),
+              cfg);
 }
 
 TEST(AscendDirectResourceConfigTest, LoadOptionsInjectsCustomTopoJson) {
     ClearAscendEnv();
-    CustomTopoJsonScope env("/etc/mooncake/nic_topo.json");
     auto conf = std::make_shared<Config>();
+    conf->set("topology/custom_json_path", "/etc/mooncake/nic_topo.json");
     conf->set("transports/ascend_direct/global_resource_config",
               R"({"comm_resource_config":{"protocol_desc":"roce:host"}})");
     auto options = LoadAscendDirectOptions(conf);
@@ -857,8 +845,8 @@ TEST(AscendDirectResourceConfigTest, LoadOptionsInjectsCustomTopoJson) {
 // Injection is scenario-agnostic: HIXL decides whether to use nic_topo_path.
 TEST(AscendDirectResourceConfigTest, LoadOptionsInjectsForNonRoceToo) {
     ClearAscendEnv();
-    CustomTopoJsonScope env("/etc/mooncake/nic_topo.json");
     auto conf = std::make_shared<Config>();
+    conf->set("topology/custom_json_path", "/etc/mooncake/nic_topo.json");
     conf->set("transports/ascend_direct/global_resource_config",
               R"({"comm_resource_config":{"protocol_desc":"hccs:device"}})");
     auto options = LoadAscendDirectOptions(conf);
@@ -870,7 +858,6 @@ TEST(AscendDirectResourceConfigTest, LoadOptionsInjectsForNonRoceToo) {
 
 TEST(AscendDirectResourceConfigTest, LoadOptionsNoCustomTopoJsonUnchanged) {
     ClearAscendEnv();
-    CustomTopoJsonScope env(nullptr);
     auto conf = std::make_shared<Config>();
     conf->set("transports/ascend_direct/global_resource_config",
               R"({"comm_resource_config":{"protocol_desc":"roce:host"}})");

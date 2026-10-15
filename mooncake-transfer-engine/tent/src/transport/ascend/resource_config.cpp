@@ -48,7 +48,6 @@ constexpr const char* kCommResourceConfigKey = "comm_resource_config";
 constexpr const char* kNicTopoPathKey = "nic_topo_path";
 constexpr const char* kNicTopoPathFlatKey =
     "comm_resource_config.nic_topo_path";
-constexpr const char* kCustomTopoJsonEnv = "MC_CUSTOM_TOPO_JSON";
 
 using json = nlohmann::json;
 
@@ -186,11 +185,11 @@ bool ParseEnvEnabled(const char* name) {
     return EnvFlagIsOne(std::getenv(name));
 }
 
-std::string InjectNicTopoPathFromCustomTopoEnvTent(
-    const std::string& resolved_config) {
+std::string InjectNicTopoPathFromCustomTopoTent(
+    const std::string& resolved_config,
+    const std::string& custom_topo_json) {
     // TE support for configuring HIXL's comm_resource_config.nic_topo_path:
-    // the MC_CUSTOM_TOPO_JSON path is written into it when it is empty.
-    const std::string custom_topo_json = EnvOrEmpty(kCustomTopoJsonEnv);
+    // the custom topology path is written into it when it is empty.
     if (custom_topo_json.empty()) {
         return resolved_config;
     }
@@ -202,15 +201,15 @@ std::string InjectNicTopoPathFromCustomTopoEnvTent(
         root = json::parse(resolved_config, nullptr, false);
         if (root.is_discarded() || !root.is_object()) {
             LOG(WARNING)
-                << "Cannot inject MC_CUSTOM_TOPO_JSON into "
+                << "Cannot inject custom topology path into "
                    "comm_resource_config.nic_topo_path: GlobalResourceConfig "
                    "is not a JSON object";
             return resolved_config;
         }
     }
 
-    // An explicitly configured nic_topo_path always wins over
-    // MC_CUSTOM_TOPO_JSON.
+    // An explicitly configured nic_topo_path always wins over the custom
+    // topology path.
     if (NicTopoPathIsSet(root)) {
         return resolved_config;
     }
@@ -226,7 +225,7 @@ std::string InjectNicTopoPathFromCustomTopoEnvTent(
         root[kNicTopoPathFlatKey] = custom_topo_json;
     }
     LOG(INFO) << "[AscendTE] comm_resource_config.nic_topo_path is empty, "
-                 "injecting MC_CUSTOM_TOPO_JSON: "
+                 "injecting custom topology path: "
               << custom_topo_json;
     return root.dump();
 }
@@ -313,10 +312,14 @@ AscendDirectOptions LoadAscendDirectOptions(
 
     options.roce_mode = ParseEnvEnabled("HCCL_INTRA_ROCE_ENABLE") ||
                         HasRoceProtocolDesc(resolved);
-    // TE support for configuring HIXL's nic_topo_path from MC_CUSTOM_TOPO_JSON
-    // (if set). HIXL decides whether to consume it based on protocol_desc.
-    options.global_resource_config =
-        InjectNicTopoPathFromCustomTopoEnvTent(options.global_resource_config);
+    // TE support for configuring HIXL's nic_topo_path from the custom topology
+    // path (topology/custom_json_path). HIXL decides whether to consume it
+    // based on protocol_desc.
+    const std::string custom_topo_json =
+        conf ? conf->get("topology/custom_json_path", std::string())
+             : std::string();
+    options.global_resource_config = InjectNicTopoPathFromCustomTopoTent(
+        options.global_resource_config, custom_topo_json);
     return options;
 }
 
