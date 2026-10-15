@@ -458,6 +458,12 @@ gpu_id + thread_id
   (`runtime_queue/mlu_local_threshold`); `0` disables the drop. Requires
   `--deadline_aware`. The drop reads the RDMA transport's bandwidth estimate
   and only acts on RDMA-routed transfers; on a TCP-only host it does nothing.
+  A dropped transfer is counted, not treated as a failure: it is left out of
+  the latency and bandwidth columns, the case ends with a
+  `[deadline-drop] ... completed=<N> dropped=<M>` line, and the
+  `[deadline-tight]` / `[deadline-loose]` lines gain a `dropped=` field.
+  `Avg Lat` divides wall time by completed operations, so it also absorbs the
+  time spent on dropped attempts; read transfer latency from `Avg Tx`.
 * `--deadline_bw_arbitration` : order slices most-urgent-first before posting
   on a NIC (`transports/rdma/deadline_bw_arbitration`).
 
