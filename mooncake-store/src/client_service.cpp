@@ -5583,8 +5583,7 @@ void Client::StorageHeartbeatThreadMain() {
         }
         // Note: LOCAL_DISK segment remount is NOT done here.
         // It is handled by FileStorage::Heartbeat() when it detects
-        // SEGMENT_NOT_FOUND, which also triggers ScanMeta to
-        // re-register offloaded object metadata.
+        // SEGMENT_NOT_FOUND.
     };
     // Use another thread to remount segments to avoid blocking the ping
     // thread
