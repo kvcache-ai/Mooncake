@@ -939,41 +939,43 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                 for (auto& [key, record] : tenant.metadata) {
                     auto& metadata = record.metadata;
                     (void)key;
-                    metadata.VisitReplicas(
-                        [](const Replica& replica) {
-                            return replica.is_memory_replica() &&
-                                   replica.status() != ReplicaStatus::REMOVED &&
-                                   replica.status() != ReplicaStatus::FAILED;
-                        },
-                        [&](Replica& replica) {
-                            auto descriptor = replica.get_descriptor()
-                                                  .get_memory_descriptor()
-                                                  .buffer_descriptor;
-                            SegmentRestore* match = nullptr;
-                            for (auto& restore : restores) {
-                                if (descriptor.transport_endpoint_ ==
-                                        restore.segment.te_endpoint ||
-                                    descriptor.transport_endpoint_ ==
-                                        restore.segment.name) {
-                                    if (match != nullptr) {
-                                        ambiguous_endpoint = true;
-                                        return;
-                                    }
-                                    match = &restore;
-                                }
-                            }
-                            if (match != nullptr) {
-                                if (descriptor.protocol_ == "cxl") {
-                                    unsupported_cxl = true;
+                    auto visit_replica = [&](Replica& replica) {
+                        auto descriptor = replica.get_descriptor()
+                                              .get_memory_descriptor()
+                                              .buffer_descriptor;
+                        SegmentRestore* match = nullptr;
+                        for (auto& restore : restores) {
+                            if (descriptor.transport_endpoint_ ==
+                                    restore.segment.te_endpoint ||
+                                descriptor.transport_endpoint_ ==
+                                    restore.segment.name) {
+                                if (match != nullptr) {
+                                    ambiguous_endpoint = true;
                                     return;
                                 }
-                                descriptor.transport_endpoint_ =
-                                    match->segment.te_endpoint;
-                                match->replicas.push_back(&replica);
-                                match->descriptors.push_back(descriptor);
-                                affected_objects.insert(&metadata);
+                                match = &restore;
                             }
-                        });
+                        }
+                        if (match != nullptr) {
+                            if (descriptor.protocol_ == "cxl") {
+                                unsupported_cxl = true;
+                                return;
+                            }
+                            descriptor.transport_endpoint_ =
+                                match->segment.te_endpoint;
+                            match->replicas.push_back(&replica);
+                            match->descriptors.push_back(descriptor);
+                            affected_objects.insert(&metadata);
+                        }
+                    };
+                    for (auto& replica : metadata.MutablePart(0).replicas()) {
+                        if (!(replica.is_memory_replica() &&
+                              replica.status() != ReplicaStatus::REMOVED &&
+                              replica.status() != ReplicaStatus::FAILED)) {
+                            continue;
+                        }
+                        visit_replica(replica);
+                    }
                 }
             }
         }
@@ -1623,27 +1625,32 @@ void MasterService::RebuildCacheTotalAccounting() {
     }
 }
 
-std::vector<Replica> MasterService::PopReplicasWithCacheTotalAccounting(
+std::vector<Replica> MasterService::PopPartReplicasWithCacheTotalAccounting(
     ObjectMetadata& metadata,
     const std::function<bool(const Replica&)>& pred_fn) {
-    auto replicas = metadata.PopReplicas(pred_fn);
+    auto replicas = metadata.MutablePart(0).PopReplicas(pred_fn);
     SyncCacheTotalAccounting(metadata);
     return replicas;
 }
 
-std::vector<Replica> MasterService::PopReplicasWithCacheTotalAccounting(
-    ObjectMetadata& metadata) {
-    auto replicas = metadata.PopReplicas();
-    SyncCacheTotalAccounting(metadata);
-    return replicas;
-}
-
-size_t MasterService::EraseReplicasWithCacheTotalAccounting(
+std::vector<Replica> MasterService::PopAllReplicasWithCacheTotalAccounting(
     ObjectMetadata& metadata,
-    const std::function<bool(const Replica&)>& pred_fn,
+    const std::function<bool(const Replica&)>& pred_fn) {
+    auto replicas = metadata.PopAllReplicas(pred_fn);
+    SyncCacheTotalAccounting(metadata);
+    return replicas;
+}
+
+std::vector<Replica> MasterService::PopAllReplicasWithCacheTotalAccounting(
+    ObjectMetadata& metadata) {
+    auto replicas = metadata.PopAllReplicas();
+    SyncCacheTotalAccounting(metadata);
+    return replicas;
+}
+
+size_t MasterService::AccountErasedReplicas(
+    ObjectMetadata& metadata, std::vector<Replica> erased_replicas,
     std::vector<ReplicaID>* erased_replica_ids) {
-    auto erased_replicas =
-        PopReplicasWithCacheTotalAccounting(metadata, pred_fn);
     if (erased_replica_ids != nullptr) {
         erased_replica_ids->reserve(erased_replica_ids->size() +
                                     erased_replicas.size());
@@ -1662,6 +1669,24 @@ size_t MasterService::EraseReplicasWithCacheTotalAccounting(
     ReleaseLocalDiskUsage(erased_replicas);
     FreeDfsReplicas(metadata.user_key, erased_replicas);
     return erased_replicas.size();
+}
+
+size_t MasterService::EraseReplicasWithCacheTotalAccounting(
+    ObjectMetadata& metadata,
+    const std::function<bool(const Replica&)>& pred_fn,
+    std::vector<ReplicaID>* erased_replica_ids) {
+    return AccountErasedReplicas(
+        metadata, PopPartReplicasWithCacheTotalAccounting(metadata, pred_fn),
+        erased_replica_ids);
+}
+
+size_t MasterService::EraseAllReplicasWithCacheTotalAccounting(
+    ObjectMetadata& metadata,
+    const std::function<bool(const Replica&)>& pred_fn,
+    std::vector<ReplicaID>* erased_replica_ids) {
+    return AccountErasedReplicas(
+        metadata, PopAllReplicasWithCacheTotalAccounting(metadata, pred_fn),
+        erased_replica_ids);
 }
 
 tl::expected<void, ErrorCode> MasterService::SettlePrimaryWriteQuotaIfReady(
@@ -1723,7 +1748,7 @@ void MasterService::FinalizeRemovedReplicasAfterDurable(
     auto previous_media = KvRemovalSnapshot(metadata);
     previous_media.insert(previous_media.end(), previous_media_hint.begin(),
                           previous_media_hint.end());
-    auto erased_replicas = PopReplicasWithCacheTotalAccounting(
+    auto erased_replicas = PopAllReplicasWithCacheTotalAccounting(
         metadata, [&ids](const Replica& replica) {
             return replica.status() == ReplicaStatus::REMOVED &&
                    ids.contains(replica.id());
@@ -1830,7 +1855,7 @@ void MasterService::FinalizeExpiredProcessingReplicasAfterDurable(
     // the publisher needs the pre-pop set to compute the removal delta. Mirrors
     // FinalizeExpiredReplicationTaskAfterDurable.
     const auto previous_media = KvRemovalSnapshot(metadata);
-    auto replicas = PopReplicasWithCacheTotalAccounting(
+    auto replicas = PopPartReplicasWithCacheTotalAccounting(
         metadata, &Replica::fn_is_processing);
     if (!replicas.empty()) {
         FreeDfsReplicas(metadata.user_key, replicas);
@@ -1886,7 +1911,7 @@ void MasterService::FinalizeExpiredReplicationTaskAfterDurable(
     // medium would otherwise be unrecoverable for the remove delta.
     const auto previous_media = KvRemovalSnapshot(metadata);
     std::unordered_set<ReplicaID> ids(target_ids.begin(), target_ids.end());
-    auto replicas = PopReplicasWithCacheTotalAccounting(
+    auto replicas = PopPartReplicasWithCacheTotalAccounting(
         metadata,
         [&ids](const Replica& replica) { return ids.contains(replica.id()); });
     std::vector<ReplicaID> erased_replica_ids;
@@ -1944,16 +1969,19 @@ MasterService::BuildStaleHandleCleanupPlan(
     const std::function<bool(const Replica&)>& is_stale) const {
     StaleHandleCleanupPlan plan;
     bool has_valid_after_cleanup = false;
-    for (const auto& replica : metadata.GetAllReplicas()) {
-        if (is_stale(replica)) {
-            plan.removed_ids.push_back(replica.id());
-            continue;
-        }
-        if (replica.status() == ReplicaStatus::COMPLETE) {
-            plan.remaining.push_back(replica.get_descriptor());
-        }
-        if (!replica.is_memory_replica() || !replica.has_invalid_mem_handle()) {
-            has_valid_after_cleanup = true;
+    for (size_t i = 0; i < metadata.PartCount(); ++i) {
+        for (const auto& replica : metadata.GetPart(i).replicas()) {
+            if (is_stale(replica)) {
+                plan.removed_ids.push_back(replica.id());
+                continue;
+            }
+            if (replica.status() == ReplicaStatus::COMPLETE) {
+                plan.remaining.push_back(replica.get_descriptor());
+            }
+            if (!replica.is_memory_replica() ||
+                !replica.has_invalid_mem_handle()) {
+                has_valid_after_cleanup = true;
+            }
         }
     }
     plan.would_invalidate =
@@ -1981,9 +2009,14 @@ tl::expected<void, ErrorCode> MasterService::PersistStaleHandleCleanupForHA(
     }
     const std::unordered_set<ReplicaID> ids(plan.removed_ids.begin(),
                                             plan.removed_ids.end());
-    metadata.VisitReplicas(
-        [&ids](const Replica& replica) { return ids.contains(replica.id()); },
-        [](Replica& replica) { replica.mark_removed(); });
+    for (size_t i = 0; i < metadata.PartCount(); ++i) {
+        for (auto& replica : metadata.MutablePart(i).replicas()) {
+            if (!ids.contains(replica.id())) {
+                continue;
+            }
+            replica.mark_removed();
+        }
+    }
     auto result = AppendReservedOpLogWithDurableFinalize(
         std::move(reservation.value()), op_type, tenant_id.value(), key,
         payload,
@@ -1993,11 +2026,14 @@ tl::expected<void, ErrorCode> MasterService::PersistStaleHandleCleanupForHA(
                                                 QuotaEraseMode::kFull);
         });
     if (!result) {
-        metadata.VisitReplicas(
-            [&ids](const Replica& replica) {
-                return ids.contains(replica.id());
-            },
-            [](Replica& replica) { replica.cancel_remove(); });
+        for (size_t i = 0; i < metadata.PartCount(); ++i) {
+            for (auto& replica : metadata.MutablePart(i).replicas()) {
+                if (!ids.contains(replica.id())) {
+                    continue;
+                }
+                replica.cancel_remove();
+            }
+        }
         LOG(WARNING) << why
                      << ": stale cleanup OpLog queue failed for key=" << key
                      << ", err=" << static_cast<int>(result.error());
@@ -2081,8 +2117,10 @@ MasterService::ObjectMap::iterator MasterService::EraseMetadata(
     // hold its slot toward the candidate limit until the retry loop reached it.
     promotion_candidates_.EraseLocked(tenant_id, key, state);
 
-    ReleaseLocalDiskUsage(metadata.GetAllReplicas());
-    FreeDfsReplicas(key, metadata.GetAllReplicas());
+    for (size_t i = 0; i < metadata.PartCount(); ++i) {
+        ReleaseLocalDiskUsage(metadata.GetPart(i).replicas());
+        FreeDfsReplicas(key, metadata.GetPart(i).replicas());
+    }
     AccountCacheTotalRemoval(metadata);
     if (metadata.GetCommittedSoftPinTimeout()) {
         soft_pin_deadline_index_.Remove(tenant_id.MakeScopedKey(key));
@@ -3003,7 +3041,7 @@ auto MasterService::ExistKeyImpl(const std::string& key,
     }
 
     const auto& metadata = accessor.Get();
-    if (!HasReadableReplica(metadata)) {
+    if (!IsReadable(metadata)) {
         return false;
     }
 
@@ -3077,7 +3115,7 @@ std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchExistKeyImpl(
             }
 
             const auto& metadata = it->second.metadata;
-            if (!HasReadableReplica(metadata)) {
+            if (!IsReadable(metadata)) {
                 results[i] = false;
                 continue;
             }
@@ -3103,7 +3141,7 @@ auto MasterService::GetAllKeys(const TenantId& tenant_id)
             continue;
         }
         for (const auto& item : tenant_it->second.metadata) {
-            if (!HasReadableReplica(item.second.metadata)) {
+            if (!IsReadable(item.second.metadata)) {
                 continue;
             }
             all_keys.push_back(item.second.metadata.user_key.empty()
@@ -4467,12 +4505,16 @@ auto MasterService::BatchReplicaClear(
                         continue;
                     }
                     std::vector<ReplicaID> removed_ids;
-                    metadata.VisitReplicas(
-                        &Replica::fn_is_completed,
-                        [&removed_ids](Replica& replica) {
+                    for (size_t i = 0; i < metadata.PartCount(); ++i) {
+                        for (auto& replica :
+                             metadata.MutablePart(i).replicas()) {
+                            if (!Replica::fn_is_completed(replica)) {
+                                continue;
+                            }
                             removed_ids.push_back(replica.id());
                             replica.mark_removed();
-                        });
+                        }
+                    }
                     auto persist_result =
                         AppendReservedOpLogWithDurableFinalize(
                             std::move(reservation.value()), OpType::REMOVE,
@@ -4552,12 +4594,16 @@ auto MasterService::BatchReplicaClear(
                             return match_replica_on_segment(r);
                         });
                     std::vector<ReplicaID> removed_ids;
-                    metadata.VisitReplicas(
-                        match_replica_on_segment,
-                        [&removed_ids](Replica& replica) {
+                    for (size_t i = 0; i < metadata.PartCount(); ++i) {
+                        for (auto& replica :
+                             metadata.MutablePart(i).replicas()) {
+                            if (!match_replica_on_segment(replica)) {
+                                continue;
+                            }
                             removed_ids.push_back(replica.id());
                             replica.mark_removed();
-                        });
+                        }
+                    }
 
                     tl::expected<OpLogEntry, ErrorCode> persist_result;
                     if (remaining.empty()) {
@@ -4595,8 +4641,8 @@ auto MasterService::BatchReplicaClear(
                 }
             }
 
-            EraseReplicasWithCacheTotalAccounting(metadata,
-                                                  match_replica_on_segment);
+            EraseAllReplicasWithCacheTotalAccounting(metadata,
+                                                     match_replica_on_segment);
 
             if (had_completed_disk_on_segment &&
                 !metadata.HasReplica([](const Replica& r) {
@@ -4645,18 +4691,11 @@ bool MasterService::TryGetReadableReplicaDescriptor(
 }
 
 std::vector<Replica::Descriptor> MasterService::GetReadableReplicaDescriptors(
-    const ObjectMetadata& metadata) const {
-    std::vector<Replica::Descriptor> descriptors;
-    descriptors.reserve(metadata.CountReplicas());
-    metadata.VisitReplicas(
-        [](const Replica&) { return true; },
-        [this, &descriptors](const Replica& replica) {
-            Replica::Descriptor descriptor;
-            if (TryGetReadableReplicaDescriptor(replica, descriptor)) {
-                descriptors.push_back(std::move(descriptor));
-            }
+    const ObjectPart& part) const {
+    return part.ReadableDescriptors(
+        [this](const Replica& replica, Replica::Descriptor& descriptor) {
+            return TryGetReadableReplicaDescriptor(replica, descriptor);
         });
-    return descriptors;
 }
 
 bool MasterService::IsReplicaReadable(const Replica& replica) const {
@@ -4664,8 +4703,8 @@ bool MasterService::IsReplicaReadable(const Replica& replica) const {
            !IsAwaitingRemount(replica);
 }
 
-bool MasterService::HasReadableReplica(const ObjectMetadata& metadata) const {
-    return metadata.HasReplica(
+bool MasterService::IsReadable(const ObjectMetadata& metadata) const {
+    return metadata.IsReadable(
         [this](const Replica& replica) { return IsReplicaReadable(replica); });
 }
 
@@ -4701,7 +4740,8 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern,
         for (const auto& [key, record] : tenant_it->second.metadata) {
             const auto& metadata = record.metadata;
             if (std::regex_search(key, pattern)) {
-                auto replica_list = GetReadableReplicaDescriptors(metadata);
+                auto replica_list =
+                    GetReadableReplicaDescriptors(metadata.GetPart(0));
 
                 if (replica_list.empty()) {
                     LOG(WARNING)
@@ -4740,7 +4780,7 @@ auto MasterService::GetReplicaList(const std::string& key,
         }
         const auto& metadata = accessor.Get();
 
-        auto replica_list = GetReadableReplicaDescriptors(metadata);
+        auto replica_list = GetReadableReplicaDescriptors(metadata.GetPart(0));
         if (dfs_allocator_) {
             for (const auto& replica : replica_list) {
                 if (replica.is_dfs_replica()) {
@@ -4835,7 +4875,7 @@ auto MasterService::GetReplicaListForAdmin(const std::string& key,
     }
     const auto& metadata = accessor.Get();
 
-    auto replica_list = GetReadableReplicaDescriptors(metadata);
+    auto replica_list = GetReadableReplicaDescriptors(metadata.GetPart(0));
 
     if (replica_list.empty()) {
         LOG(WARNING) << "key=" << key << ", error=replica_not_ready";
@@ -4912,7 +4952,8 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
                 }
 
                 const auto& metadata = metadata_it->second.metadata;
-                auto replica_list = GetReadableReplicaDescriptors(metadata);
+                auto replica_list =
+                    GetReadableReplicaDescriptors(metadata.GetPart(0));
 
                 if (dfs_allocator_) {
                     for (const auto& replica : replica_list) {
@@ -5065,7 +5106,8 @@ MasterService::BatchGetReplicaListForAdmin(const std::vector<std::string>& keys,
                 }
 
                 const auto& metadata = metadata_it->second.metadata;
-                auto replica_list = GetReadableReplicaDescriptors(metadata);
+                auto replica_list =
+                    GetReadableReplicaDescriptors(metadata.GetPart(0));
 
                 if (replica_list.empty()) {
                     results[original_idx] =
@@ -5330,7 +5372,7 @@ auto MasterService::InsertMetadata(
         if (!adopt_result) {
             LogTenantQuotaLedgerError(adopt_result, "adopt_pending", tenant_id,
                                       key);
-            auto failed_replicas = it->second.metadata.PopReplicas();
+            auto failed_replicas = it->second.metadata.PopAllReplicas();
             FreeDfsReplicas(key, failed_replicas);
             tenant_state.metadata.erase(it);
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
@@ -5546,7 +5588,10 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                             return tl::make_unexpected(err.error());
                         }
                     }
-                    auto replicas = PopReplicasWithCacheTotalAccounting(
+                    // The object's own stale write is what comes out here, so
+                    // this asks the object's part; the entry itself is erased
+                    // and rebuilt below.
+                    auto replicas = PopPartReplicasWithCacheTotalAccounting(
                         metadata, &Replica::fn_is_processing);
                     if (!replicas.empty()) {
                         FreeDfsReplicas(key, replicas);
@@ -5617,6 +5662,8 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
         return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
     }
 
+    // This entry names no part: it ends the write of the object's content, and
+    // that content lives in the object's part.
     auto is_target_replica = [replica_type](const Replica& replica) {
         if (replica_type == ReplicaType::ALL) {
             return (replica.is_memory_replica() &&
@@ -5643,7 +5690,7 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
     if (!accessor.InProcessing()) {
         bool has_target_replica = false;
         bool all_target_replicas_complete = true;
-        for (const auto& replica : metadata.GetAllReplicas()) {
+        for (const auto& replica : metadata.GetPart(0).replicas()) {
             if (!is_target_replica(replica)) {
                 continue;
             }
@@ -5663,13 +5710,12 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
     if (bucket_allocator_ != nullptr && (replica_type == ReplicaType::ALL ||
                                          replica_type == ReplicaType::DFS)) {
         std::vector<DistributedFSDescriptor> pending_descriptors;
-        metadata.VisitReplicas(
-            [](const Replica& replica) {
-                return replica.is_dfs_replica() && replica.is_processing();
-            },
-            [&pending_descriptors](const Replica& replica) {
-                pending_descriptors.push_back(replica.get_dfs_descriptor());
-            });
+        for (const auto& replica : metadata.GetPart(0).replicas()) {
+            if (!(replica.is_dfs_replica() && replica.is_processing())) {
+                continue;
+            }
+            pending_descriptors.push_back(replica.get_dfs_descriptor());
+        }
         for (const auto& descriptor : pending_descriptors) {
             if (!bucket_allocator_->MarkCommitted(key, descriptor)) {
                 LOG(ERROR) << "key=" << key
@@ -5683,21 +5729,19 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
     const bool had_completed_replica =
         metadata.HasReplica(&Replica::fn_is_completed);
     bool completed_pending_replica = false;
-    metadata.VisitReplicas(
-        [&is_target_replica](const Replica& replica) {
-            return replica.is_processing() && is_target_replica(replica);
-        },
-        [this, &key, &metadata, &completed_pending_replica](Replica& replica) {
-            if (replica.is_processing() &&
-                metadata.PendingSoftPinOwnsReplica(replica.id())) {
-                completed_pending_replica = true;
-            }
-            replica.mark_complete();
-            if (replica.is_dfs_replica() && dfs_allocator_) {
-                const auto& desc = replica.get_dfs_descriptor();
-                dfs_allocator_->UpdateAccess(key, desc);
-            }
-        });
+    for (auto& replica : metadata.MutablePart(0).replicas()) {
+        if (!(replica.is_processing() && is_target_replica(replica))) {
+            continue;
+        }
+        if (metadata.PendingSoftPinOwnsReplica(replica.id())) {
+            completed_pending_replica = true;
+        }
+        replica.mark_complete();
+        if (replica.is_dfs_replica() && dfs_allocator_) {
+            const auto& desc = replica.get_dfs_descriptor();
+            dfs_allocator_->UpdateAccess(key, desc);
+        }
+    }
 
     if (!had_completed_replica && completed_pending_replica &&
         metadata.HasReplica(&Replica::fn_is_completed)) {
@@ -5728,18 +5772,17 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
         // collected before the marker is recorded.
         std::optional<ReplicaID> source_id;
         std::vector<UUID> mirror_clients;
-        metadata.VisitReplicas(
-            [](const Replica& replica) {
-                return replica.is_completed() && replica.is_memory_replica();
-            },
-            [this, &object_id, &source_id, &mirror_clients](Replica& replica) {
-                auto result =
-                    PushOffloadingQueue(object_id, replica, &mirror_clients);
-                if (result && !source_id.has_value()) {
-                    replica.inc_refcnt();
-                    source_id = replica.id();
-                }
-            });
+        for (auto& replica : metadata.MutablePart(0).replicas()) {
+            if (!(replica.is_completed() && replica.is_memory_replica())) {
+                continue;
+            }
+            auto result =
+                PushOffloadingQueue(object_id, replica, &mirror_clients);
+            if (result && !source_id.has_value()) {
+                replica.inc_refcnt();
+                source_id = replica.id();
+            }
+        }
         if (source_id.has_value() && !state.offloading_task) {
             state.offloading_task =
                 OffloadingTask{*source_id, std::chrono::system_clock::now(),
@@ -5835,7 +5878,7 @@ auto MasterService::AddReplicaForRetainedClient(const UUID& client_id,
 
     if (enable_oplog_ && ordered_oplog_writer_) {
         std::vector<Replica::Descriptor> post;
-        for (const auto& existing : metadata.GetAllReplicas()) {
+        for (const auto& existing : metadata.GetPart(0).replicas()) {
             if (existing.status() != ReplicaStatus::COMPLETE) continue;
             if (replacing_existing &&
                 existing.type() == ReplicaType::LOCAL_DISK &&
@@ -5873,7 +5916,7 @@ auto MasterService::AddReplicaForRetainedClient(const UUID& client_id,
     if (!replacing_existing) {
         std::vector<Replica> replicas;
         replicas.emplace_back(std::move(replica));
-        metadata.AddReplicas(std::move(replicas));
+        metadata.MutablePart(0).AddReplicas(std::move(replicas));
         auto& shard = accessor.GetShard();
         shard.OnDiskReplicaAdded(metadata);
         SyncCacheTotalAccounting(metadata);
@@ -5882,23 +5925,19 @@ auto MasterService::AddReplicaForRetainedClient(const UUID& client_id,
         return true;
     }
 
-    metadata.VisitReplicas(
-        [client_id](const Replica& rep) {
-            return rep.type() == ReplicaType::LOCAL_DISK &&
-                   rep.get_descriptor().get_local_disk_descriptor().client_id ==
-                       client_id;
-        },
-        [&replica](Replica& rep) {
-            rep.get_descriptor()
+    for (auto& rep : metadata.MutablePart(0).replicas()) {
+        if (!(rep.type() == ReplicaType::LOCAL_DISK &&
+              rep.get_descriptor().get_local_disk_descriptor().client_id ==
+                  client_id)) {
+            continue;
+        }
+        rep.get_descriptor().get_local_disk_descriptor().transport_endpoint =
+            replica.get_descriptor()
                 .get_local_disk_descriptor()
-                .transport_endpoint = replica.get_descriptor()
-                                          .get_local_disk_descriptor()
-                                          .transport_endpoint;
-            rep.get_descriptor().get_local_disk_descriptor().object_size =
-                replica.get_descriptor()
-                    .get_local_disk_descriptor()
-                    .object_size;
-        });
+                .transport_endpoint;
+        rep.get_descriptor().get_local_disk_descriptor().object_size =
+            replica.get_descriptor().get_local_disk_descriptor().object_size;
+    }
     return false;
 }
 
@@ -5927,6 +5966,8 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
         return tl::make_unexpected(ErrorCode::INVALID_WRITE);
     }
 
+    // This entry names no part: it revokes the write of the object's content,
+    // and that content lives in the object's part.
     auto processing_rep =
         metadata.GetFirstReplica([replica_type](const Replica& replica) {
             if (replica_type == ReplicaType::ALL) {
@@ -5961,10 +6002,13 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
         if (!reservation) {
             return tl::make_unexpected(reservation.error());
         }
-        metadata.VisitReplicas(target_pred, [&removed_ids](Replica& r) {
+        for (auto& r : metadata.MutablePart(0).replicas()) {
+            if (!target_pred(r)) {
+                continue;
+            }
             removed_ids.push_back(r.id());
             r.mark_removed();
-        });
+        }
         metadata.ClearPendingSoftPinIfNoViableReplica();
 
         tl::expected<OpLogEntry, ErrorCode> persist_result;
@@ -6291,7 +6335,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 // preempts immediately.
                 if (state.is_processing) {
                     auto processing_replicas =
-                        metadata.PopReplicas(&Replica::fn_is_processing);
+                        metadata.PopAllReplicas(&Replica::fn_is_processing);
                     metadata.ClearPendingSoftPinAction();
                     if (!processing_replicas.empty()) {
                         FreeDfsReplicas(key, processing_replicas);
@@ -6411,12 +6455,16 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     // data mid-transfer.  The key becomes unreadable until
                     // UpsertEnd.
                     std::unordered_set<ReplicaID> eligible_replica_ids;
-                    metadata.VisitReplicas(
-                        &Replica::fn_is_completed,
-                        [&eligible_replica_ids](Replica& replica) {
+                    for (size_t i = 0; i < metadata.PartCount(); ++i) {
+                        for (auto& replica :
+                             metadata.MutablePart(i).replicas()) {
+                            if (!Replica::fn_is_completed(replica)) {
+                                continue;
+                            }
                             eligible_replica_ids.insert(replica.id());
                             replica.mark_processing();
-                        });
+                        }
+                    }
                     metadata.BeginSoftPinAction(
                         *soft_pin_request, std::move(eligible_replica_ids));
                     SyncCacheTotalAccounting(metadata);
@@ -6428,10 +6476,12 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     // Return the existing descriptors — same buffer addresses
                     // as before.
                     std::vector<Replica::Descriptor> replica_list;
-                    const auto& all_replicas = metadata.GetAllReplicas();
-                    replica_list.reserve(all_replicas.size());
-                    for (const auto& replica : all_replicas) {
-                        replica_list.emplace_back(replica.get_descriptor());
+                    replica_list.reserve(metadata.CountReplicas());
+                    for (size_t i = 0; i < metadata.PartCount(); ++i) {
+                        for (const auto& replica :
+                             metadata.GetPart(i).replicas()) {
+                            replica_list.emplace_back(replica.get_descriptor());
+                        }
                     }
 
                     VLOG(1) << "key=" << key
@@ -6520,8 +6570,11 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                         std::chrono::milliseconds(default_kv_lease_ttl_),
                         std::chrono::duration_cast<std::chrono::milliseconds>(
                             put_start_release_timeout_sec_));
+                // Upsert replaces the object's content as a whole, so this is
+                // an object-level entry: it takes every replica the entry holds
+                // before erasing it and allocating the replacement.
                 auto old_replicas =
-                    PopReplicasWithCacheTotalAccounting(metadata);
+                    PopAllReplicasWithCacheTotalAccounting(metadata);
                 if (!old_replicas.empty()) {
                     FreeDfsReplicas(key, old_replicas);
                     std::lock_guard lock(discarded_replicas_mutex_);
@@ -6758,11 +6811,15 @@ auto MasterService::EvictDiskReplicaImpl(const UUID& client_id,
                 return tl::make_unexpected(reservation.error());
             }
             std::vector<ReplicaID> removed_ids;
-            metadata.VisitReplicas(target_pred,
-                                   [&removed_ids](Replica& replica) {
-                                       removed_ids.push_back(replica.id());
-                                       replica.mark_removed();
-                                   });
+            for (size_t i = 0; i < metadata.PartCount(); ++i) {
+                for (auto& replica : metadata.MutablePart(i).replicas()) {
+                    if (!target_pred(replica)) {
+                        continue;
+                    }
+                    removed_ids.push_back(replica.id());
+                    replica.mark_removed();
+                }
+            }
 
             tl::expected<OpLogEntry, ErrorCode> persist_result;
             if (remaining.empty()) {
@@ -6808,13 +6865,17 @@ auto MasterService::EvictDiskReplicaImpl(const UUID& client_id,
         }
     }
 
+    // Evicting a medium takes the object as a whole, so every part it holds is
+    // asked. The OpLog payload persisted just above carries one replica list,
+    // which is the object's part: the object these two calls can describe is
+    // the single-part one.
     if (replica_type == ReplicaType::DISK) {
-        EraseReplicasWithCacheTotalAccounting(metadata, target_pred);
+        EraseAllReplicasWithCacheTotalAccounting(metadata, target_pred);
     } else if (replica_type == ReplicaType::LOCAL_DISK) {
         bool had_completed_disk = metadata.HasReplica([](const Replica& r) {
             return r.is_local_disk_replica() && r.is_completed();
         });
-        EraseReplicasWithCacheTotalAccounting(metadata, target_pred);
+        EraseAllReplicasWithCacheTotalAccounting(metadata, target_pred);
         if (had_completed_disk) {
             auto& shard = accessor.GetShard();
             shard.OnDiskReplicaRemoved(had_completed_disk, metadata);
@@ -7063,7 +7124,7 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
 
     // Add replicas to the object.
     // DO NOT ACCESS source AFTER THIS !!!
-    metadata.AddReplicas(std::move(replicas));
+    metadata.MutablePart(0).AddReplicas(std::move(replicas));
 
     return response;
 }
@@ -7205,10 +7266,12 @@ tl::expected<void, ErrorCode> MasterService::CopyEnd(
 
     if (enable_oplog_ && ordered_oplog_writer_) {
         std::vector<Replica::Descriptor> post;
-        metadata.VisitReplicas(&Replica::fn_is_completed,
-                               [&post](const Replica& replica) {
-                                   post.push_back(replica.get_descriptor());
-                               });
+        for (const auto& replica : metadata.GetPart(0).replicas()) {
+            if (!Replica::fn_is_completed(replica)) {
+                continue;
+            }
+            post.push_back(replica.get_descriptor());
+        }
         auto payload =
             SerializeMetadataForOpLogFromReplicaDescriptors(metadata, post);
         if (batch_reservation) {
@@ -7476,7 +7539,7 @@ tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
 
     // Add replicas to the object.
     // DO NOT ACCESS source AFTER THIS !!!
-    metadata.AddReplicas(std::move(replicas));
+    metadata.MutablePart(0).AddReplicas(std::move(replicas));
 
     return response;
 }
@@ -7582,7 +7645,7 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(
         //   popped)
         //   - target (if any) flipped to COMPLETE
         std::vector<Replica::Descriptor> post;
-        for (const auto& rep : metadata.GetAllReplicas()) {
+        for (const auto& rep : metadata.GetPart(0).replicas()) {
             if (rep.id() == source_id) continue;
             if (rep.status() == ReplicaStatus::COMPLETE) {
                 post.push_back(rep.get_descriptor());
@@ -7644,7 +7707,7 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(
 
     if (!(enable_ha_ && enable_oplog_)) {
         // Remove the source replica and release its space later.
-        auto source_replica = PopReplicasWithCacheTotalAccounting(
+        auto source_replica = PopPartReplicasWithCacheTotalAccounting(
             metadata, [&source_id](const Replica& replica) {
                 return replica.id() == source_id;
             });
@@ -7780,11 +7843,15 @@ auto MasterService::Remove(const std::string& key, const TenantId& tenant_id,
                 return tl::make_unexpected(reservation.error());
             }
             std::vector<ReplicaID> removed_ids;
-            metadata.VisitReplicas(&Replica::fn_is_completed,
-                                   [&removed_ids](Replica& replica) {
-                                       removed_ids.push_back(replica.id());
-                                       replica.mark_removed();
-                                   });
+            for (size_t i = 0; i < metadata.PartCount(); ++i) {
+                for (auto& replica : metadata.MutablePart(i).replicas()) {
+                    if (!Replica::fn_is_completed(replica)) {
+                        continue;
+                    }
+                    removed_ids.push_back(replica.id());
+                    replica.mark_removed();
+                }
+            }
             auto persist_result = AppendReservedOpLogWithDurableFinalize(
                 std::move(reservation.value()), OpType::REMOVE,
                 object_id.tenant_id.value(), key, {},
@@ -7871,12 +7938,18 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern,
                             continue;
                         }
                         std::vector<ReplicaID> removed_ids;
-                        it->second.metadata.VisitReplicas(
-                            &Replica::fn_is_completed,
-                            [&removed_ids](Replica& replica) {
+                        for (size_t i = 0; i < it->second.metadata.PartCount();
+                             ++i) {
+                            for (auto& replica :
+                                 it->second.metadata.MutablePart(i)
+                                     .replicas()) {
+                                if (!Replica::fn_is_completed(replica)) {
+                                    continue;
+                                }
                                 removed_ids.push_back(replica.id());
                                 replica.mark_removed();
-                            });
+                            }
+                        }
                         auto persist_result =
                             AppendReservedOpLogWithDurableFinalize(
                                 std::move(reservation.value()), OpType::REMOVE,
@@ -7974,12 +8047,19 @@ long MasterService::RemoveAll(bool force) {
                                     continue;
                                 }
                                 std::vector<ReplicaID> removed_ids;
-                                it->second.metadata.VisitReplicas(
-                                    &Replica::fn_is_completed,
-                                    [&removed_ids](Replica& replica) {
+                                for (size_t i = 0;
+                                     i < it->second.metadata.PartCount(); ++i) {
+                                    for (auto& replica :
+                                         it->second.metadata.MutablePart(i)
+                                             .replicas()) {
+                                        if (!Replica::fn_is_completed(
+                                                replica)) {
+                                            continue;
+                                        }
                                         removed_ids.push_back(replica.id());
                                         replica.mark_removed();
-                                    });
+                                    }
+                                }
                                 auto persist_result =
                                     AppendReservedOpLogWithDurableFinalize(
                                         std::move(reservation.value()),
@@ -8098,14 +8178,19 @@ long MasterService::RemoveAll(const TenantId& tenant_id, bool force) {
                     it->second.metadata.AllReplicas(
                         &Replica::fn_is_completed) &&
                     !it->second.state.replication_task) {
-                    it->second.metadata.VisitReplicas(
-                        &Replica::fn_is_local_disk_replica,
-                        [&clients_with_disk_replicas](const Replica& replica) {
+                    for (size_t i = 0; i < it->second.metadata.PartCount();
+                         ++i) {
+                        for (const auto& replica :
+                             it->second.metadata.GetPart(i).replicas()) {
+                            if (!Replica::fn_is_local_disk_replica(replica)) {
+                                continue;
+                            }
                             auto cid = replica.get_local_disk_client_id();
                             if (cid) {
                                 clients_with_disk_replicas.insert(*cid);
                             }
-                        });
+                        }
+                    }
                     auto mem_rep_count = it->second.metadata.CountReplicas(
                         &Replica::fn_is_memory_replica);
                     if (enable_ha_) {
@@ -8118,12 +8203,18 @@ long MasterService::RemoveAll(const TenantId& tenant_id, bool force) {
                                 continue;
                             }
                             std::vector<ReplicaID> removed_ids;
-                            it->second.metadata.VisitReplicas(
-                                &Replica::fn_is_completed,
-                                [&removed_ids](Replica& replica) {
+                            for (size_t i = 0;
+                                 i < it->second.metadata.PartCount(); ++i) {
+                                for (auto& replica :
+                                     it->second.metadata.MutablePart(i)
+                                         .replicas()) {
+                                    if (!Replica::fn_is_completed(replica)) {
+                                        continue;
+                                    }
                                     removed_ids.push_back(replica.id());
                                     replica.mark_removed();
-                                });
+                                }
+                            }
                             auto persist_result =
                                 AppendReservedOpLogWithDurableFinalize(
                                     std::move(reservation.value()),
@@ -8303,12 +8394,16 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
                         continue;
                     }
                     std::vector<ReplicaID> removed_ids;
-                    metadata.VisitReplicas(
-                        &Replica::fn_is_completed,
-                        [&removed_ids](Replica& replica) {
+                    for (size_t i = 0; i < metadata.PartCount(); ++i) {
+                        for (auto& replica :
+                             metadata.MutablePart(i).replicas()) {
+                            if (!Replica::fn_is_completed(replica)) {
+                                continue;
+                            }
                             removed_ids.push_back(replica.id());
                             replica.mark_removed();
-                        });
+                        }
+                    }
                     auto persist_result =
                         AppendReservedOpLogWithDurableFinalize(
                             std::move(reservation.value()), OpType::REMOVE,
@@ -8401,8 +8496,12 @@ bool MasterService::CleanupStaleHandles(
     });
     const uint64_t before_charge = CompletedMemoryQuotaCharge(metadata);
     std::vector<ReplicaID> removed_replica_ids;
-    EraseReplicasWithCacheTotalAccounting(metadata, is_stale,
-                                          &removed_replica_ids);
+    // The sweep covers the object's handles as a whole, so every part it holds
+    // is asked. The HA record the callers persist beside it carries one replica
+    // list, which is the object's part: the object this sweep can serve is the
+    // single-part one.
+    EraseAllReplicasWithCacheTotalAccounting(metadata, is_stale,
+                                             &removed_replica_ids);
     CancelPromotionTaskForRemovedReplicas(tenant_state, record,
                                           removed_replica_ids);
     const uint64_t after_charge = CompletedMemoryQuotaCharge(metadata);
@@ -8573,9 +8672,12 @@ bool MasterService::RunBucketDfsEvictionInternal(bool force_one) {
                         }
                         auto& metadata = metadata_it->second.metadata;
                         const size_t erased =
-                            metadata.EraseReplicas([&](const Replica& replica) {
-                                return matches_candidate(replica, candidate);
-                            });
+                            metadata
+                                .PopAllReplicas([&](const Replica& replica) {
+                                    return matches_candidate(replica,
+                                                             candidate);
+                                })
+                                .size();
                         if (erased > 0) {
                             PublishKvRemovedAfterEvict(candidate.key, erased,
                                                        "disk", metadata,
@@ -8726,10 +8828,12 @@ void MasterService::RunShardDfsEviction() {
                 // the accepted descriptor before its allocator extent can be
                 // committed and reused.
                 const size_t erased =
-                    metadata.EraseReplicas([&](const Replica& replica) {
-                        return matches_candidate(replica, candidate) &&
-                               !replica.is_processing();
-                    });
+                    metadata
+                        .PopAllReplicas([&](const Replica& replica) {
+                            return matches_candidate(replica, candidate) &&
+                                   !replica.is_processing();
+                        })
+                        .size();
                 if (erased > 0) {
                     PublishKvRemovedAfterEvict(candidate.key, erased, "disk",
                                                metadata, tenant_id);
@@ -9119,7 +9223,8 @@ auto MasterService::NotifyOffloadSuccess(
                                    &Replica::fn_is_local_disk_replica)) {
                         std::vector<Replica> replicas;
                         replicas.emplace_back(std::move(replica));
-                        obj_metadata.AddReplicas(std::move(replicas));
+                        obj_metadata.MutablePart(0).AddReplicas(
+                            std::move(replicas));
                         auto& shard = accessor.GetShard();
                         shard.OnDiskReplicaAdded(obj_metadata);
                         SyncCacheTotalAccounting(obj_metadata);
@@ -9127,27 +9232,26 @@ auto MasterService::NotifyOffloadSuccess(
                             UuidToString(client_id));
                         added_new_local_disk_replica = true;
                     } else {
-                        obj_metadata.VisitReplicas(
-                            [client_id](const Replica& rep) {
-                                return rep.type() == ReplicaType::LOCAL_DISK &&
-                                       rep.get_descriptor()
-                                               .get_local_disk_descriptor()
-                                               .client_id == client_id;
-                            },
-                            [&replica](Replica& rep) {
-                                rep.get_descriptor()
+                        for (auto& rep :
+                             obj_metadata.MutablePart(0).replicas()) {
+                            if (!(rep.type() == ReplicaType::LOCAL_DISK &&
+                                  rep.get_descriptor()
+                                          .get_local_disk_descriptor()
+                                          .client_id == client_id)) {
+                                continue;
+                            }
+                            rep.get_descriptor()
+                                .get_local_disk_descriptor()
+                                .transport_endpoint =
+                                replica.get_descriptor()
                                     .get_local_disk_descriptor()
-                                    .transport_endpoint =
-                                    replica.get_descriptor()
-                                        .get_local_disk_descriptor()
-                                        .transport_endpoint;
-                                rep.get_descriptor()
-                                    .get_local_disk_descriptor()
-                                    .object_size =
-                                    replica.get_descriptor()
-                                        .get_local_disk_descriptor()
-                                        .object_size;
-                            });
+                                    .transport_endpoint;
+                            rep.get_descriptor()
+                                .get_local_disk_descriptor()
+                                .object_size = replica.get_descriptor()
+                                                   .get_local_disk_descriptor()
+                                                   .object_size;
+                        }
                     }
                     handled_existing_object = true;
                     SyncKvObjectState(request_object_id.user_key, obj_metadata,
@@ -9746,10 +9850,14 @@ PromotionQueueResult MasterService::TryPushPromotionQueue(
 
     // Find the LOCAL_DISK source replica.
     Replica* source = nullptr;
-    metadata.VisitReplicas(&Replica::fn_is_local_disk_replica,
-                           [&source](Replica& r) {
-                               if (source == nullptr) source = &r;
-                           });
+    for (auto& r : metadata.MutablePart(0).replicas()) {
+        if (!Replica::fn_is_local_disk_replica(r)) {
+            continue;
+        }
+        if (source == nullptr) {
+            source = &r;
+        }
+    }
     if (source == nullptr) {
         promotion_candidates_.EraseLocked(object_id.tenant_id, key, state);
         return PromotionQueueResult::kNoLocalDiskSource;
@@ -9960,7 +10068,7 @@ auto MasterService::PromotionAllocStart(
     const ReplicaID new_id = staged_replicas[0].id();
     std::vector<Replica> to_add;
     to_add.push_back(std::move(staged_replicas[0]));
-    metadata.AddReplicas(std::move(to_add));
+    metadata.MutablePart(0).AddReplicas(std::move(to_add));
 
     // Record the new replica's ID on the in-flight PromotionTask so
     // NotifyPromotionSuccess knows exactly which replica to commit. A
@@ -10034,10 +10142,12 @@ auto MasterService::NotifyPromotionSuccess(const UUID& client_id,
         committed = true;
         if (enable_oplog_ && ordered_oplog_writer_) {
             std::vector<Replica::Descriptor> post;
-            metadata.VisitReplicas(&Replica::fn_is_completed,
-                                   [&post](const Replica& replica) {
-                                       post.push_back(replica.get_descriptor());
-                                   });
+            for (const auto& replica : metadata.GetPart(0).replicas()) {
+                if (!Replica::fn_is_completed(replica)) {
+                    continue;
+                }
+                post.push_back(replica.get_descriptor());
+            }
 
             const auto payload =
                 SerializeMetadataForOpLogFromReplicaDescriptors(metadata, post);
@@ -10444,8 +10554,8 @@ void MasterService::DiscardExpiredProcessingReplicas(
                 }
 
                 // Persist OK (or HA disabled / never published) — apply.
-                auto replicas =
-                    metadata.PopReplicas(&Replica::fn_is_processing);
+                auto replicas = metadata.MutablePart(0).PopReplicas(
+                    &Replica::fn_is_processing);
                 metadata.ClearPendingSoftPinIfNoViableReplica();
                 if (!replicas.empty()) {
                     FreeDfsReplicas(it->first, replicas);
@@ -10558,7 +10668,7 @@ void MasterService::DiscardExpiredProcessingReplicas(
             }
 
             auto replicas =
-                PopReplicasWithCacheTotalAccounting(metadata, target_pred);
+                PopPartReplicasWithCacheTotalAccounting(metadata, target_pred);
             std::vector<ReplicaID> erased_replica_ids;
             erased_replica_ids.reserve(replicas.size());
             for (const auto& replica : replicas) {
@@ -10701,7 +10811,7 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
         [&, this](TenantState& tenant_state, ObjectMetadata& metadata,
                   std::vector<std::vector<Replica>>& deferred_replicas) {
             const uint64_t before_charge = CompletedMemoryQuotaCharge(metadata);
-            auto replicas = PopReplicasWithCacheTotalAccounting(
+            auto replicas = PopAllReplicasWithCacheTotalAccounting(
                 metadata, is_evictable_memory_replica);
             std::vector<ReplicaID> erased_ids;
             erased_ids.reserve(replicas.size());
@@ -10752,28 +10862,28 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
         }
 
         bool queued = false;
-        metadata.VisitReplicas(
-            is_evictable_memory_replica,
-            [this, &key, &normalized_tenant, &tenant_state, &queued,
-             &now](Replica& replica) {
-                if (queued) {
-                    return;
+        for (auto& replica : metadata.MutablePart(0).replicas()) {
+            if (!is_evictable_memory_replica(replica)) {
+                continue;
+            }
+            if (queued) {
+                continue;
+            }
+            std::vector<UUID> mirror_clients;
+            auto result =
+                PushOffloadingQueue(MakeObjectIdentity(key, normalized_tenant),
+                                    replica, &mirror_clients);
+            if (result) {
+                replica.inc_refcnt();
+                auto& task =
+                    tenant_state.metadata.at(key).state.offloading_task;
+                if (!task) {
+                    task = OffloadingTask{replica.id(), now,
+                                          std::move(mirror_clients)};
                 }
-                std::vector<UUID> mirror_clients;
-                auto result = PushOffloadingQueue(
-                    MakeObjectIdentity(key, normalized_tenant), replica,
-                    &mirror_clients);
-                if (result) {
-                    replica.inc_refcnt();
-                    auto& task =
-                        tenant_state.metadata.at(key).state.offloading_task;
-                    if (!task) {
-                        task = OffloadingTask{replica.id(), now,
-                                              std::move(mirror_clients)};
-                    }
-                    queued = true;
-                }
-            });
+                queued = true;
+            }
+        }
 
         if (queued) {
             ++offload_queued_this_call;
@@ -11009,7 +11119,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                        });
             }
             const uint64_t before_charge = CompletedMemoryQuotaCharge(metadata);
-            auto replicas = PopReplicasWithCacheTotalAccounting(
+            auto replicas = PopAllReplicasWithCacheTotalAccounting(
                 metadata, is_evictable_memory_replica);
             std::vector<ReplicaID> erased_ids;
             erased_ids.reserve(replicas.size());
@@ -11077,25 +11187,27 @@ void MasterService::BatchEvict(double evict_ratio_target,
 
         // Queue one MEMORY replica for offload; others will be evicted below.
         bool queued = false;
-        metadata.VisitReplicas(
-            is_evictable_memory_replica, [this, &tenant_id, &key, &tenant_state,
-                                          &queued, &now](Replica& replica) {
-                if (queued) return;  // only need to pin one replica for offload
-                std::vector<UUID> mirror_clients;
-                auto result =
-                    PushOffloadingQueue(MakeObjectIdentity(key, tenant_id),
-                                        replica, &mirror_clients);
-                if (result) {
-                    replica.inc_refcnt();
-                    auto& task =
-                        tenant_state.metadata.at(key).state.offloading_task;
-                    if (!task) {
-                        task = OffloadingTask{replica.id(), now,
-                                              std::move(mirror_clients)};
-                    }
-                    queued = true;
+        for (auto& replica : metadata.MutablePart(0).replicas()) {
+            if (!is_evictable_memory_replica(replica)) {
+                continue;
+            }
+            if (queued) {
+                continue;  // only need to pin one replica for offload
+            }
+            std::vector<UUID> mirror_clients;
+            auto result = PushOffloadingQueue(
+                MakeObjectIdentity(key, tenant_id), replica, &mirror_clients);
+            if (result) {
+                replica.inc_refcnt();
+                auto& task =
+                    tenant_state.metadata.at(key).state.offloading_task;
+                if (!task) {
+                    task = OffloadingTask{replica.id(), now,
+                                          std::move(mirror_clients)};
                 }
-            });
+                queued = true;
+            }
+        }
 
         if (queued) {
             offload_queued_this_cycle++;
@@ -11142,11 +11254,15 @@ void MasterService::BatchEvict(double evict_ratio_target,
             return tl::make_unexpected(reservation.error());
         }
         std::vector<ReplicaID> removed_ids;
-        metadata.VisitReplicas(is_evictable_memory_replica,
-                               [&removed_ids](Replica& replica) {
-                                   removed_ids.push_back(replica.id());
-                                   replica.mark_removed();
-                               });
+        for (size_t i = 0; i < metadata.PartCount(); ++i) {
+            for (auto& replica : metadata.MutablePart(i).replicas()) {
+                if (!is_evictable_memory_replica(replica)) {
+                    continue;
+                }
+                removed_ids.push_back(replica.id());
+                replica.mark_removed();
+            }
+        }
         tl::expected<OpLogEntry, ErrorCode> persist_result;
         if (remaining.empty()) {
             persist_result = AppendReservedOpLogWithDurableFinalize(
@@ -11934,12 +12050,16 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
                             continue;
                         }
                         std::vector<ReplicaID> removed_ids;
-                        metadata.VisitReplicas(
-                            is_evictable_nof_replica,
-                            [&removed_ids](Replica& replica) {
+                        for (size_t i = 0; i < metadata.PartCount(); ++i) {
+                            for (auto& replica :
+                                 metadata.MutablePart(i).replicas()) {
+                                if (!is_evictable_nof_replica(replica)) {
+                                    continue;
+                                }
                                 removed_ids.push_back(replica.id());
                                 replica.mark_removed();
-                            });
+                            }
+                        }
                         const size_t removed_count = removed_ids.size();
                         tl::expected<OpLogEntry, ErrorCode> persist_result;
                         if (remaining.empty()) {
@@ -12010,7 +12130,7 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
                 }
 
                 const size_t erased =
-                    metadata.EraseReplicas(is_evictable_nof_replica);
+                    metadata.PopAllReplicas(is_evictable_nof_replica).size();
                 if (erased == 0) {
                     ++it;
                     continue;
@@ -12486,26 +12606,25 @@ tl::expected<UUID, ErrorCode> MasterService::CreateCopyTask(
             }
         }
 
-        metadata.VisitReplicas(
-            [this](const Replica& replica) {
-                return IsReplicaReadable(replica);
-            },
-            [&](const Replica& replica) {
-                for (const auto& segment_name : replica.get_segment_names()) {
-                    if (!segment_name) {
-                        continue;
-                    }
-                    UUID owner;
-                    if (segment_accessor.GetClientIdBySegmentName(
-                            *segment_name, owner) == ErrorCode::OK) {
-                        const auto liveness = replica.getClientLiveness();
-                        if (liveness) {
-                            serving_sources.emplace_back(*segment_name, owner,
-                                                         std::move(liveness));
-                        }
+        for (const auto& replica : metadata.GetPart(0).replicas()) {
+            if (!IsReplicaReadable(replica)) {
+                continue;
+            }
+            for (const auto& segment_name : replica.get_segment_names()) {
+                if (!segment_name) {
+                    continue;
+                }
+                UUID owner;
+                if (segment_accessor.GetClientIdBySegmentName(
+                        *segment_name, owner) == ErrorCode::OK) {
+                    const auto liveness = replica.getClientLiveness();
+                    if (liveness) {
+                        serving_sources.emplace_back(*segment_name, owner,
+                                                     std::move(liveness));
                     }
                 }
-            });
+            }
+        }
     }
     if (serving_sources.empty()) {
         LOG(ERROR) << "key=" << key << ", error=no_valid_source_replicas";
@@ -12603,23 +12722,20 @@ tl::expected<UUID, ErrorCode> MasterService::CreateMoveTask(
                 ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
         }
 
-        metadata.VisitReplicas(
-            [](const Replica&) { return true; },
-            [this, &source, &source_exists, &source_is_serving,
-             &source_liveness](const Replica& replica) {
-                const auto names = replica.get_segment_names();
-                const bool matches = std::any_of(
-                    names.begin(), names.end(), [&source](const auto& name) {
-                        return name && *name == source;
-                    });
-                if (matches) {
-                    source_exists = true;
-                    if (IsReplicaReadable(replica)) {
-                        source_is_serving = true;
-                        source_liveness = replica.getClientLiveness();
-                    }
+        for (const auto& replica : metadata.GetPart(0).replicas()) {
+            const auto names = replica.get_segment_names();
+            const bool matches = std::any_of(names.begin(), names.end(),
+                                             [&source](const auto& name) {
+                                                 return name && *name == source;
+                                             });
+            if (matches) {
+                source_exists = true;
+                if (IsReplicaReadable(replica)) {
+                    source_is_serving = true;
+                    source_liveness = replica.getClientLiveness();
                 }
-            });
+            }
+        }
         if (!source_exists) {
             LOG(ERROR) << "key=" << key << ", source_segment=" << source
                        << ", error=source_replica_not_found";
@@ -12919,7 +13035,16 @@ std::optional<std::string> MasterService::SelectDrainTargetForKey(
         }
     }
 
-    const auto existing_segments = metadata.GetReplicaSegmentNames();
+    std::vector<std::string> existing_segments;
+    for (size_t i = 0; i < metadata.PartCount(); ++i) {
+        for (const auto& replica : metadata.GetPart(i).replicas()) {
+            for (const auto& segment_name : replica.get_segment_names()) {
+                if (segment_name.has_value()) {
+                    existing_segments.push_back(*segment_name);
+                }
+            }
+        }
+    }
     double best_util = std::numeric_limits<double>::max();
     std::optional<std::string> best_target;
     for (const auto& candidate : candidate_segments) {
@@ -13032,8 +13157,19 @@ void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
                             continue;
                         }
 
-                        const auto replica_segments =
-                            metadata.GetReplicaSegmentNames();
+                        std::vector<std::string> replica_segments;
+                        for (size_t i = 0; i < metadata.PartCount(); ++i) {
+                            for (const auto& replica :
+                                 metadata.GetPart(i).replicas()) {
+                                for (const auto& segment_name :
+                                     replica.get_segment_names()) {
+                                    if (segment_name.has_value()) {
+                                        replica_segments.push_back(
+                                            *segment_name);
+                                    }
+                                }
+                            }
+                        }
                         if (std::find(replica_segments.begin(),
                                       replica_segments.end(), source_segment) ==
                             replica_segments.end()) {
@@ -13041,21 +13177,24 @@ void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
                         }
 
                         bool source_is_serving = false;
-                        metadata.VisitReplicas(
-                            [this, &source_segment](const Replica& replica) {
+                        for (size_t i = 0; i < metadata.PartCount(); ++i) {
+                            for (const auto& replica :
+                                 metadata.GetPart(i).replicas()) {
                                 if (!IsReplicaReadable(replica)) {
-                                    return false;
+                                    continue;
                                 }
                                 const auto names = replica.get_segment_names();
-                                return std::any_of(
-                                    names.begin(), names.end(),
-                                    [&source_segment](const auto& name) {
-                                        return name && *name == source_segment;
-                                    });
-                            },
-                            [&source_is_serving](const Replica&) {
+                                if (!std::any_of(
+                                        names.begin(), names.end(),
+                                        [&source_segment](const auto& name) {
+                                            return name &&
+                                                   *name == source_segment;
+                                        })) {
+                                    continue;
+                                }
                                 source_is_serving = true;
-                            });
+                            }
+                        }
                         if (!source_is_serving) {
                             blocked_unit_keys.insert(unit_key);
                             continue;
@@ -13136,8 +13275,18 @@ bool MasterService::MaybeCompleteDrainJob(DrainJob& job) {
             MetadataShardAccessorRO shard(this, i);
             for (const auto& [tenant_id, tenant_state] : shard->tenants) {
                 for (const auto& [key, record] : tenant_state.metadata) {
-                    const auto replica_segments =
-                        record.metadata.GetReplicaSegmentNames();
+                    std::vector<std::string> replica_segments;
+                    for (size_t i = 0; i < record.metadata.PartCount(); ++i) {
+                        for (const auto& replica :
+                             record.metadata.GetPart(i).replicas()) {
+                            for (const auto& segment_name :
+                                 replica.get_segment_names()) {
+                                if (segment_name.has_value()) {
+                                    replica_segments.push_back(*segment_name);
+                                }
+                            }
+                        }
+                    }
                     for (const auto& source_segment : job.request.segments) {
                         if (std::find(replica_segments.begin(),
                                       replica_segments.end(), source_segment) !=
@@ -13261,9 +13410,11 @@ std::vector<std::string> MasterService::KvMediaForMetadata(
     const ObjectMetadata& metadata) {
     bool has_cpu = false;
     bool has_disk = false;
-    metadata.VisitReplicas(
-        [](const Replica& replica) { return replica.is_completed(); },
-        [&](const Replica& replica) {
+    for (size_t i = 0; i < metadata.PartCount(); ++i) {
+        for (const auto& replica : metadata.GetPart(i).replicas()) {
+            if (!replica.is_completed()) {
+                continue;
+            }
             if (replica.is_memory_replica() &&
                 !replica.has_invalid_mem_handle()) {
                 has_cpu = true;
@@ -13275,7 +13426,8 @@ std::vector<std::string> MasterService::KvMediaForMetadata(
                        replica.is_dfs_replica()) {
                 has_disk = true;
             }
-        });
+        }
+    }
     std::vector<std::string> media;
     if (has_cpu) {
         media.emplace_back("cpu");
@@ -13296,12 +13448,12 @@ std::vector<std::string> MasterService::KvMediaForRemoval(
     // can run after a replica has moved to PROCESSING or REMOVED, and both
     // states still had their medium announced to subscribers, so both must
     // appear in the removal delta or the tier is never retracted.
-    metadata.VisitReplicas(
-        [](const Replica& replica) {
-            return replica.status() == ReplicaStatus::REMOVED ||
-                   replica.status() == ReplicaStatus::PROCESSING;
-        },
-        [&](const Replica& replica) {
+    for (size_t i = 0; i < metadata.PartCount(); ++i) {
+        for (const auto& replica : metadata.GetPart(i).replicas()) {
+            if (replica.status() != ReplicaStatus::REMOVED &&
+                replica.status() != ReplicaStatus::PROCESSING) {
+                continue;
+            }
             if (replica.is_memory_replica()) {
                 has_cpu = true;
             } else if (replica.is_nof_replica() || replica.is_disk_replica() ||
@@ -13309,7 +13461,8 @@ std::vector<std::string> MasterService::KvMediaForRemoval(
                        replica.is_dfs_replica()) {
                 has_disk = true;
             }
-        });
+        }
+    }
     if (has_cpu &&
         std::find(media.begin(), media.end(), "cpu") == media.end()) {
         media.emplace_back("cpu");
@@ -13562,7 +13715,7 @@ std::string MasterService::SerializeMetadataForOpLog(
     payload.hard_pinned = metadata.IsHardPinned();
 
     // Extract replica descriptors - get them all at once
-    const auto& replicas = metadata.GetAllReplicas();
+    const auto& replicas = metadata.GetPart(0).replicas();
     payload.replicas.reserve(replicas.size());
     for (const auto& replica : replicas) {
         payload.replicas.push_back(replica.get_descriptor());
@@ -13587,7 +13740,7 @@ std::string MasterService::SerializeMetadataForOpLogWithoutMemReplicas(
     payload.data_type = metadata.data_type;
     payload.hard_pinned = metadata.IsHardPinned();
 
-    const auto& replicas = metadata.GetAllReplicas();
+    const auto& replicas = metadata.GetPart(0).replicas();
     payload.replicas.reserve(replicas.size());
     for (const auto& replica : replicas) {
         if (replica.type() == ReplicaType::MEMORY) {
@@ -13844,7 +13997,7 @@ MasterService::BuildRemainingReplicaDescriptors(
     const ObjectMetadata& metadata,
     const std::function<bool(const Replica&)>& should_remove) const {
     std::vector<Replica::Descriptor> remaining;
-    for (const auto& replica : metadata.GetAllReplicas()) {
+    for (const auto& replica : metadata.GetPart(0).replicas()) {
         if (!should_remove(replica) &&
             replica.status() == ReplicaStatus::COMPLETE) {
             remaining.push_back(replica.get_descriptor());

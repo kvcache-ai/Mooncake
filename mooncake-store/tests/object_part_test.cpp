@@ -20,6 +20,7 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include "client_liveness.h"
 #include "master_config.h"
 #include "master_service.h"
 #include "master_service/master_service_test_peer.h"
@@ -32,6 +33,7 @@ namespace {
 constexpr size_t kObjectLength = 4096;
 constexpr uint64_t kChecksum = 77;
 constexpr const char* kGroupId = "group-1";
+constexpr const char* kSegmentEndpoint = "part-test-segment";
 constexpr auto kWriteTime =
     std::chrono::system_clock::time_point(std::chrono::seconds(1700000000));
 
@@ -51,6 +53,22 @@ std::vector<Replica> MakeDiskReplicas(
     return replicas;
 }
 
+// A completed replica on a segment whose owning client is serving: the service
+// finds this one readable until the segment's endpoint is awaiting a remount.
+Replica MakeServingDiskReplica() {
+    Replica replica(UUID{7, 7}, kObjectLength, kSegmentEndpoint,
+                    ReplicaStatus::COMPLETE);
+    replica.bindClientLiveness(std::make_shared<ClientLivenessRecord>(
+        ClientLivenessRecord::Clock::now()));
+    return replica;
+}
+
+std::vector<Replica> MakeServingDiskReplicas() {
+    std::vector<Replica> replicas;
+    replicas.push_back(MakeServingDiskReplica());
+    return replicas;
+}
+
 std::unique_ptr<ObjectMetadata> MakeEnvelope(size_t length,
                                              std::vector<Replica>&& replicas) {
     return std::make_unique<ObjectMetadata>(
@@ -61,12 +79,12 @@ std::unique_ptr<ObjectMetadata> MakeEnvelope(size_t length,
 
 }  // namespace
 
-// Building the OpLog payload needs a service, so this case carries the logging
-// setup the other service-backed suites use.
-class OplogPayloadTest : public ::testing::Test {
+// A case that builds a service needs the logging setup the service-backed
+// suites use.
+class ServiceBackedTest : public ::testing::Test {
    protected:
     void SetUp() override {
-        google::InitGoogleLogging("OplogPayloadTest");
+        google::InitGoogleLogging("ObjectPartTest");
         FLAGS_logtostderr = true;
     }
 
@@ -74,6 +92,9 @@ class OplogPayloadTest : public ::testing::Test {
     // case releases the one it took.
     void TearDown() override { google::ShutdownGoogleLogging(); }
 };
+
+// Building the OpLog payload needs a service.
+class OplogPayloadTest : public ServiceBackedTest {};
 
 TEST(ObjectPartTest, HoldsItsLengthAndChecksum) {
     ObjectPart part(kObjectLength, std::vector<Replica>{});
@@ -145,6 +166,48 @@ TEST(ObjectPartTest, PopsOnlyTheMatchingReplicas) {
     EXPECT_TRUE(part.replicas().empty());
 }
 
+TEST(ObjectPartTest, ReportsWhetherAReplicaIsReadable) {
+    ObjectPart part(kObjectLength, std::vector<Replica>{});
+    part.AddReplicas(
+        MakeDiskReplicas({ReplicaStatus::COMPLETE, ReplicaStatus::PROCESSING}));
+
+    // The part does not own the rule: the caller hands it in, and the part
+    // reports whether any of its replicas passes it.
+    EXPECT_TRUE(part.HasReadableReplica(Replica::fn_is_completed));
+    EXPECT_TRUE(part.HasReadableReplica(Replica::fn_is_processing));
+    EXPECT_FALSE(part.HasReadableReplica(
+        [](const Replica& replica) { return replica.is_memory_replica(); }));
+
+    ObjectPart without_replicas(kObjectLength, std::vector<Replica>{});
+    EXPECT_FALSE(without_replicas.HasReadableReplica(Replica::fn_is_completed));
+}
+
+TEST(ObjectPartTest, ReadableDescriptorsKeepOnlyWhatTheCallerAccepts) {
+    ObjectPart part(kObjectLength, std::vector<Replica>{});
+    part.AddReplicas(
+        MakeDiskReplicas({ReplicaStatus::COMPLETE, ReplicaStatus::PROCESSING}));
+
+    // The caller answers readability and fills the descriptor in one step, so a
+    // replica it refuses leaves no descriptor behind: this is the path a
+    // replica whose storage went away takes.
+    auto descriptors = part.ReadableDescriptors(
+        [](const Replica& replica, Replica::Descriptor& descriptor) {
+            if (!replica.is_completed()) {
+                return false;
+            }
+            descriptor = replica.get_descriptor();
+            return true;
+        });
+    ASSERT_EQ(descriptors.size(), 1u);
+    EXPECT_TRUE(descriptors.front().is_disk_replica());
+
+    // A caller that refuses every replica leaves the reader with nothing, which
+    // is what the read path turns into "not ready".
+    auto none = part.ReadableDescriptors(
+        [](const Replica&, Replica::Descriptor&) { return false; });
+    EXPECT_TRUE(none.empty());
+}
+
 TEST(EnvelopePartTest, TheEnvelopeReadsAndWritesItsSinglePart) {
     auto metadata = MakeEnvelope(kObjectLength,
                                  MakeDiskReplicas({ReplicaStatus::COMPLETE}));
@@ -158,36 +221,38 @@ TEST(EnvelopePartTest, TheEnvelopeReadsAndWritesItsSinglePart) {
     EXPECT_EQ(*part.checksum(), kChecksum);
     EXPECT_EQ(metadata->TotalLength(), part.length());
     EXPECT_EQ(metadata->CountReplicas(), part.replicas().size());
-    EXPECT_EQ(metadata->GetAllReplicas().data(), part.replicas().data());
-    EXPECT_EQ(metadata->GetAllReplicas().size(), part.replicas().size());
+    EXPECT_EQ(metadata->MutablePart(0).replicas().data(),
+              part.replicas().data());
+    EXPECT_EQ(metadata->MutablePart(0).replicas().size(),
+              part.replicas().size());
     EXPECT_TRUE(metadata->HasReplica(&Replica::fn_is_completed));
 }
 
-TEST(EnvelopePartTest, VisitsAndErasesThroughTheEnvelope) {
+TEST(EnvelopePartTest, TheEnvelopeAnswersItsQueriesAndPopsFromItsPart) {
     auto metadata = MakeEnvelope(
         kObjectLength,
         MakeDiskReplicas({ReplicaStatus::COMPLETE, ReplicaStatus::PROCESSING,
                           ReplicaStatus::COMPLETE}));
 
-    size_t visited = 0;
-    const size_t matched = metadata->VisitReplicas(
-        &Replica::fn_is_completed, [&](Replica& replica) {
-            ++visited;
-            EXPECT_EQ(replica.status(), ReplicaStatus::COMPLETE);
-        });
-    EXPECT_EQ(matched, 2u);
-    EXPECT_EQ(visited, 2u);
+    // The envelope's queries answer over the replicas its part holds.
+    EXPECT_EQ(metadata->CountReplicas(), 3u);
+    EXPECT_EQ(metadata->CountReplicas(&Replica::fn_is_completed), 2u);
+    EXPECT_TRUE(metadata->HasReplica(&Replica::fn_is_processing));
+    EXPECT_FALSE(metadata->AllReplicas(&Replica::fn_is_completed));
 
-    // Only the ones the predicate matches leave the part, and what comes out
-    // is dropped because the caller here only wants them gone.
-    EXPECT_EQ(metadata->EraseReplicas(&Replica::fn_is_processing), 1u);
+    // Taking replicas out through the envelope takes every part's replicas the
+    // predicate matches, and only those.
+    auto erased = metadata->PopAllReplicas(&Replica::fn_is_processing);
+    ASSERT_EQ(erased.size(), 1u);
+    EXPECT_EQ(erased.front().status(), ReplicaStatus::PROCESSING);
+
     EXPECT_EQ(metadata->CountReplicas(), 2u);
     EXPECT_TRUE(metadata->AllReplicas(&Replica::fn_is_completed));
 
-    const ObjectMetadata& read_only = *metadata;
-    const size_t counted = read_only.VisitReplicas(&Replica::fn_is_completed,
-                                                   [](const Replica&) {});
-    EXPECT_EQ(counted, 2u);
+    // The part the envelope names is what stayed behind.
+    const ObjectPart& part = metadata->GetPart(0);
+    EXPECT_EQ(part.replicas().size(), 2u);
+    EXPECT_TRUE(std::ranges::all_of(part.replicas(), Replica::fn_is_completed));
 }
 
 TEST(EnvelopePartTest, ValidityFollowsThePartsLengthAndReplicas) {
@@ -201,6 +266,101 @@ TEST(EnvelopePartTest, ValidityFollowsThePartsLengthAndReplicas) {
     auto without_content =
         MakeEnvelope(0, MakeDiskReplicas({ReplicaStatus::COMPLETE}));
     EXPECT_FALSE(without_content->IsValid());
+}
+
+TEST(EnvelopePartTest, ReadabilityFollowsTheReplicasThePartHolds) {
+    auto completed = MakeEnvelope(kObjectLength,
+                                  MakeDiskReplicas({ReplicaStatus::COMPLETE}));
+    EXPECT_TRUE(completed->IsReadable(Replica::fn_is_completed));
+    EXPECT_FALSE(completed->IsReadable(Replica::fn_is_processing));
+
+    auto still_writing = MakeEnvelope(
+        kObjectLength, MakeDiskReplicas({ReplicaStatus::PROCESSING}));
+    EXPECT_FALSE(still_writing->IsReadable(Replica::fn_is_completed));
+
+    // Nothing to read: an object whose replicas are all gone is not readable,
+    // whatever rule the caller brings.
+    auto without_replicas = MakeEnvelope(kObjectLength, {});
+    EXPECT_FALSE(
+        without_replicas->IsReadable([](const Replica&) { return true; }));
+}
+
+// The readability rule lives with the service and is handed to the part and the
+// envelope. A replica whose segment is not mounted yet is the case the part
+// cannot see on its own, so this reaches both through the service's rule.
+class ReadableReplicaTest : public ServiceBackedTest {};
+
+TEST_F(ReadableReplicaTest, TheRemountShieldWithholdsTheDescriptor) {
+    MasterService service{MasterServiceConfig{}};
+    test::MasterServiceTestPeer peer(service);
+    ObjectPart part(kObjectLength, MakeServingDiskReplicas());
+    auto metadata = MakeEnvelope(kObjectLength, MakeServingDiskReplicas());
+    const auto is_readable = [&peer](const Replica& replica) {
+        return peer.IsReplicaReadable(replica);
+    };
+
+    ASSERT_TRUE(peer.IsReplicaReadable(part.replicas().front()));
+    EXPECT_EQ(peer.GetReadableReplicaDescriptors(part).size(), 1u);
+    EXPECT_TRUE(metadata->IsReadable(is_readable));
+
+    peer.MarkEndpointAwaitingRemount(kSegmentEndpoint);
+
+    EXPECT_FALSE(peer.IsReplicaReadable(part.replicas().front()));
+    EXPECT_TRUE(peer.GetReadableReplicaDescriptors(part).empty());
+    EXPECT_FALSE(metadata->IsReadable(is_readable));
+    // The part is unchanged: it held a replica the whole time, and whether that
+    // replica can be read was never its to decide.
+    EXPECT_TRUE(part.HasReadableReplica([](const Replica&) { return true; }));
+}
+
+// The two pops the service offers are named for the range they cover, and the
+// cache-total accounting they carry follows that range. An object holds one
+// part, so the case builds a second one to see the difference.
+class ObjectPopRangeTest : public ServiceBackedTest {};
+
+TEST_F(ObjectPopRangeTest, ThePartPopAndTheAllPopCoverTheirOwnParts) {
+    MasterService service{MasterServiceConfig{}};
+    test::MasterServiceTestPeer peer(service);
+    auto metadata = MakeEnvelope(kObjectLength,
+                                 MakeDiskReplicas({ReplicaStatus::COMPLETE}));
+    test::MasterServiceTestPeer::AppendPart(
+        *metadata, kObjectLength,
+        MakeDiskReplicas({ReplicaStatus::COMPLETE, ReplicaStatus::PROCESSING}));
+    ASSERT_EQ(metadata->PartCount(), 2u);
+    const int64_t file_cache_before =
+        MasterMetricManager::instance().get_file_cache_nums();
+
+    // The part pop asks the object's part. The processing replica the other
+    // part holds matches the predicate and stays where it is.
+    auto from_the_part = peer.PopPartReplicasWithCacheTotalAccounting(
+        *metadata, &Replica::fn_is_processing);
+    EXPECT_TRUE(from_the_part.empty());
+    EXPECT_EQ(metadata->GetPart(0).replicas().size(), 1u);
+    EXPECT_EQ(metadata->GetPart(1).replicas().size(), 2u);
+
+    // The accounting follows the range: the object's part still holds a
+    // completed cache replica, so the object is still counted as one.
+    EXPECT_TRUE(metadata->disk_cache_total_accounted);
+    EXPECT_EQ(MasterMetricManager::instance().get_file_cache_nums(),
+              file_cache_before + 1);
+
+    // The all pop asks every part, so the same predicate takes the processing
+    // replica out of the other part too.
+    auto from_every_part = peer.PopAllReplicasWithCacheTotalAccounting(
+        *metadata, &Replica::fn_is_processing);
+    ASSERT_EQ(from_every_part.size(), 1u);
+    EXPECT_EQ(from_every_part.front().status(), ReplicaStatus::PROCESSING);
+    EXPECT_EQ(metadata->GetPart(1).replicas().size(), 1u);
+
+    // The pop without a predicate leaves the object with nothing, and the
+    // accounting comes back down with it.
+    auto every_replica = peer.PopAllReplicasWithCacheTotalAccounting(*metadata);
+    EXPECT_EQ(every_replica.size(), 2u);
+    EXPECT_TRUE(metadata->GetPart(0).replicas().empty());
+    EXPECT_TRUE(metadata->GetPart(1).replicas().empty());
+    EXPECT_FALSE(metadata->disk_cache_total_accounted);
+    EXPECT_EQ(MasterMetricManager::instance().get_file_cache_nums(),
+              file_cache_before);
 }
 
 // The OpLog payload carries the envelope's own fields and no checksum, so this

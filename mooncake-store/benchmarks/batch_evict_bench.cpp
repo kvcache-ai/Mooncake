@@ -193,7 +193,7 @@ class BatchEvictBench {
                     if (!metadata.IsLeaseExpired(now)) {
                         ++stats.unexpired_leases;
                     }
-                    for (const auto& replica : metadata.GetAllReplicas()) {
+                    for (const auto& replica : metadata.GetPart(0).replicas()) {
                         if (replica.is_memory_replica()) {
                             if (replica.is_completed()) {
                                 ++stats.completed_memory_replicas;
