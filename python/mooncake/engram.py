@@ -1,7 +1,6 @@
 """Immutable byte tables with synchronous host and stream-ordered CUDA lookup.
 
 The table API deliberately knows nothing about embedding dtypes or model layers.
-The existing layer API remains available through the same EngramStore class.
 """
 
 from __future__ import annotations
@@ -35,35 +34,18 @@ class EngramStore:
 
     def __init__(
         self,
-        layers=None,
-        store=None,
         *,
-        tables=None,
-        namespace=None,
+        tables,
+        namespace,
         local_dir=None,
         store_client=None,
         persistent=True,
     ):
-        self._legacy = None
         self._closed = False
         self._lock = threading.RLock()
         self._mappings = {}
         self._cuda_tables = {}
         self._cuda_lookups = {}
-        if tables is None:
-            if (
-                namespace is not None
-                or local_dir is not None
-                or store_client is not None
-                or not persistent
-            ):
-                raise ValueError("namespace/local_dir/store_client require tables")
-            from mooncake import _store
-
-            self._legacy = _store.EngramStore(layers, store)
-            return
-        if layers is not None or store is not None:
-            raise ValueError("Use either the layer API or the table API")
         if not isinstance(namespace, str) or not namespace:
             raise ValueError("A nonempty namespace is required")
         if (local_dir is None) == (store_client is None):
@@ -92,17 +74,9 @@ class EngramStore:
                 self._root /= hashlib.sha256(namespace.encode()).hexdigest()
             self._root.mkdir(parents=True, exist_ok=True)
 
-    def __getattr__(self, name):
-        legacy = self.__dict__.get("_legacy")
-        if legacy is not None and not self.__dict__.get("_closed", False):
-            return getattr(legacy, name)
-        raise AttributeError(name)
-
     def _spec(self, name):
         if self._closed:
             raise RuntimeError("EngramStore is closed")
-        if self._legacy is not None:
-            raise TypeError("This operation requires the table API")
         return self._specs[name]
 
     def get_table_spec(self, table_id):
@@ -123,10 +97,6 @@ class EngramStore:
         return value.detach().numpy()
 
     def populate(self, table_id, rows, config=None):
-        if self._legacy is not None:
-            if config is None:
-                return self._legacy.populate(table_id, rows)
-            return self._legacy.populate(table_id, rows, config)
         with self._lock:
             spec = self._spec(table_id)
             rows = self._array(rows)
@@ -245,7 +215,7 @@ class EngramStore:
         destroy captured graphs before closing this Store.
 
         Store-backed reads currently use the synchronous host path, with
-        caller-registered output, as in the original Mooncake layer API.
+        caller-registered output.
         """
         with self._lock:
             specs = [self._spec(name) for name in table_ids]
@@ -328,12 +298,9 @@ class EngramStore:
             _engram_cuda.require_warmup(stream)
             tables = []
             for name in names:
-                table_key = name
-                if table_key not in self._cuda_tables:
-                    self._cuda_tables[table_key] = _engram_cuda.LocalTable(
-                        self._open(name)
-                    )
-                tables.append(self._cuda_tables[table_key])
+                if name not in self._cuda_tables:
+                    self._cuda_tables[name] = _engram_cuda.LocalTable(self._open(name))
+                tables.append(self._cuda_tables[name])
             self._cuda_lookups[key] = _engram_cuda.Lookup(tables, offsets)
         self._cuda_lookups[key].run(ids, out, stream)
 
@@ -391,7 +358,6 @@ class EngramStore:
                 del array
                 if mapping is not None:
                     mapping.close()
-            self._legacy = None
             self._closed = True
 
     def __enter__(self):

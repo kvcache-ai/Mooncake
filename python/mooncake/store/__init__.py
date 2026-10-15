@@ -30,7 +30,6 @@ _CPP_EXPORTS = frozenset(
         "MooncakeHostMemAllocator",
         "MooncakeDistributedNoFRegister",
         "MooncakeDistributedStore",
-        "EngramStoreConfig",
         "EngramStore",
         "bind_to_numa_node",
         "get_alloc_func_addr",
@@ -63,7 +62,6 @@ _CPP_INTERNAL_EXPORTS = frozenset(
         "_serialize_tensor",
         "_tensor_metadata_size",
         "_deserialize_tensor",
-        "_get_pyclient_from_wrapper",
     }
 )
 

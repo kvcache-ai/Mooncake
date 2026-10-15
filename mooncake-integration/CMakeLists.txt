@@ -158,13 +158,8 @@ if(WITH_STORE)
             LIBRARY DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR} COMPONENT python)
   endif()
   pybind11_add_module(
-    store
-    ${SOURCES}
-    ${CACHE_ALLOCATOR_SOURCES}
-    store/store_py.cpp
-    store/buffer_pool.cpp
-    store/engram_store_py.cpp
-    integration_utils.h)
+    store ${SOURCES} ${CACHE_ALLOCATOR_SOURCES} store/store_py.cpp
+    store/buffer_pool.cpp integration_utils.h)
   set_target_properties(store PROPERTIES OUTPUT_NAME "_store" INSTALL_RPATH
                                                               "$ORIGIN")
   if(USE_TENT)

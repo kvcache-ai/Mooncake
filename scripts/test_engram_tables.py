@@ -8,25 +8,6 @@ import pytest
 from mooncake.engram import EngramStore
 
 
-def test_existing_layer_api_remains_available():
-    pytest.importorskip("mooncake._store")
-    from mooncake.store import EngramStore as ExportedStore, EngramStoreConfig
-
-    assert ExportedStore is EngramStore
-    config = EngramStoreConfig()
-    config.table_vocab_sizes = [5, 7]
-    config.row_bytes = 17
-    with EngramStore({9: config}) as store:
-        assert store.get_layer_ids() == [9]
-        assert store.get_table_vocab_sizes(9) == [5, 7]
-        rows = [np.full((count, 17), count, np.uint8) for count in (5, 7)]
-        store.bind_local(9, rows)
-        output = np.empty((1, 1, 2, 17), np.uint8)
-        store.lookup_into(9, np.array([[[4, 6]]], np.int64), output)
-        np.testing.assert_array_equal(output[0, 0, 0], rows[0][4])
-        np.testing.assert_array_equal(output[0, 0, 1], rows[1][6])
-
-
 def make_store(path, width=17, persistent=True):
     tables = {name: {"num_rows": 11, "row_bytes": width} for name in ("a", "b")}
     store = EngramStore(
