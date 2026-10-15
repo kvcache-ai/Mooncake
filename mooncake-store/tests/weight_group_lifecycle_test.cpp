@@ -2,6 +2,8 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -62,18 +64,48 @@ class WeightGroupLifecycleTest : public MasterServiceTest {
         return *ready;
     }
 
-    static void AddLocalDiskReplica(MasterService& service,
-                                    const UUID& client_id,
-                                    const std::string& key, int64_t size,
-                                    const std::string& endpoint) {
-        std::vector<OffloadTaskItem> tasks{
-            OffloadTaskItem{.tenant_id = "default", .key = key, .size = size}};
-        StorageObjectMetadata metadata;
-        metadata.key_size = key.size();
-        metadata.data_size = size;
-        metadata.transport_endpoint = endpoint;
-        ASSERT_TRUE(service.NotifyOffloadSuccess(client_id, tasks, {metadata}));
+    // Gives the key a LOCAL_DISK replica on `client_id`. The master registers
+    // one only from the completion of an offload task the store took, and
+    // that completion also ends the task, which unpins its source replica. So
+    // if the client has an offload task queued for the key, the helper drains
+    // it and reports it done, as FileStorage does; otherwise (the disk client
+    // is not the one the task was queued to) the replica is added directly.
+    void AddLocalDiskReplica(MasterService& service, const UUID& client_id,
+                             const std::string& key, int64_t size,
+                             const std::string& endpoint) {
+        if (!drained_offloads_.contains(key)) {
+            auto drained = service.OffloadObjectHeartbeat(client_id, true);
+            ASSERT_TRUE(drained.has_value()) << toString(drained.error());
+            for (auto& item : *drained) {
+                drained_offloads_.insert_or_assign(item.key, std::move(item));
+            }
+        }
+        if (auto it = drained_offloads_.find(key);
+            it != drained_offloads_.end()) {
+            StorageObjectMetadata metadata;
+            metadata.key_size = key.size();
+            metadata.data_size = size;
+            metadata.transport_endpoint = endpoint;
+            ASSERT_TRUE(service.NotifyOffloadSuccess(client_id, {it->second},
+                                                     {metadata}));
+            drained_offloads_.erase(it);
+        } else {
+            Replica disk_replica(client_id, size, endpoint,
+                                 ReplicaStatus::COMPLETE);
+            ASSERT_TRUE(service.AddReplica(client_id, key, TenantId::Default(),
+                                           disk_replica));
+        }
+        // The batch result is OK even for a refused entry: check the replica.
+        auto replicas = service.GetReplicaList(key, TenantId::Default());
+        ASSERT_TRUE(replicas.has_value()) << toString(replicas.error());
+        EXPECT_TRUE(std::any_of(replicas->replicas.begin(),
+                                replicas->replicas.end(),
+                                [](const Replica::Descriptor& replica) {
+                                    return replica.is_local_disk_replica();
+                                }));
     }
+
+    std::map<std::string, OffloadTaskItem> drained_offloads_;
 };
 
 TEST_F(WeightGroupLifecycleTest, LeaseBlocksOperationAndDelete) {
