@@ -1652,4 +1652,77 @@ TEST_F(FileStorageTest, RemountAfterSegmentNotFoundDropsUnregisteredFiles) {
     EXPECT_EQ(query.error(), ErrorCode::OBJECT_NOT_FOUND);
 }
 
+// The store reports an offload only if the memory replica it copied from
+// still exists after the copy: a removed and re-put key has a new replica.
+TEST_F(FileStorageTest, OffloadSourcesUnchangedDetectsAReplacedSource) {
+    std::filesystem::path master_root =
+        std::filesystem::path(data_path) / "source_check_master";
+    std::filesystem::create_directories(master_root);
+
+    testing::InProcMaster master;
+    // No root_fs_dir: a DISK replica still being written would make the
+    // force remove below fail with REPLICA_IS_NOT_READY.
+    auto master_config =
+        InProcMasterConfigBuilder().set_enable_offload(true).build();
+    ASSERT_TRUE(master.Start(master_config));
+
+    std::string local_rpc_addr =
+        "127.0.0.1:" + std::to_string(getFreeTcpPort());
+    auto client = Client::Create(local_rpc_addr, master.metadata_url(), "tcp",
+                                 std::nullopt, master.master_address());
+    ASSERT_TRUE(client.has_value());
+    constexpr size_t kSegSize = 64 * 1024 * 1024;
+    void* seg_ptr = allocate_buffer_allocator_memory(kSegSize);
+    ASSERT_NE(seg_ptr, nullptr);
+    ASSERT_TRUE(
+        client.value()->MountSegment(seg_ptr, kSegSize, "tcp").has_value());
+    SimpleAllocator allocator(16 * 1024 * 1024);
+    ASSERT_TRUE(client.value()
+                    ->RegisterLocalMemory(allocator.getBase(), 16 * 1024 * 1024,
+                                          "cpu:0", false, false)
+                    .has_value());
+
+    FileStorageConfig config = FileStorageConfig::FromEnvironment();
+    config.storage_backend_type = StorageBackendType::kFilePerKey;
+    config.storage_filepath = data_path + "/source_check";
+    config.local_buffer_size = 4 * 1024 * 1024;
+    fs::create_directories(config.storage_filepath);
+    FileStorage file_storage(config, client.value(), local_rpc_addr);
+
+    const std::string key = "source_check_key";
+    auto put = [&](char fill) {
+        void* buf = allocator.allocate(512);
+        ASSERT_NE(buf, nullptr);
+        std::memset(buf, fill, 512);
+        std::vector<Slice> slices{Slice{buf, 512}};
+        ReplicateConfig cfg;
+        cfg.replica_num = 1;
+        ASSERT_TRUE(client.value()->Put(key, slices, cfg).has_value());
+        allocator.deallocate(buf, 512);
+    };
+    put('a');
+    std::unordered_map<std::string, std::vector<Slice>> slices;
+    std::unordered_map<std::string, ReplicaID> ids;
+    ASSERT_TRUE(
+        file_storage.BatchQuerySegmentSlices({key}, "default", slices, &ids));
+    ASSERT_EQ(ids.size(), 1u);
+    const std::string storage_key = TenantId("default").MakeScopedKey(key);
+    const std::unordered_map<std::string, OffloadTaskItem> tasks{
+        {storage_key,
+         OffloadTaskItem{.tenant_id = "default", .key = key, .size = 512}}};
+    const std::unordered_map<std::string, ReplicaID> sources{
+        {storage_key, ids.at(key)}};
+    EXPECT_TRUE(
+        file_storage.OffloadSourcesUnchanged({storage_key}, tasks, sources));
+
+    // The key is removed and put again while the store would be copying.
+    ASSERT_TRUE(client.value()->Remove(key, true).has_value());
+    put('b');
+    EXPECT_FALSE(
+        file_storage.OffloadSourcesUnchanged({storage_key}, tasks, sources));
+
+    EXPECT_TRUE(client.value()->UnmountSegment(seg_ptr, kSegSize).has_value());
+    std::free(seg_ptr);
+}
+
 }  // namespace mooncake
