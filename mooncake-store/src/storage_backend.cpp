@@ -2344,6 +2344,14 @@ tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
         while (static_cast<int64_t>(bucket_keys.size()) <
                bucket_backend_config_.bucket_keys_limit) {
             if (it == offloading_objects.cend()) {
+                if (bucket_backend_config_.flush_partial_buckets) {
+                    // Keep these keys in the current cycle, while FileStorage
+                    // still has their tasks and source replicas are pinned.
+                    if (!bucket_keys.empty()) {
+                        buckets_keys.push_back(std::move(bucket_keys));
+                    }
+                    return {};
+                }
                 for (const auto& bucket_object : bucket_objects) {
                     ungrouped_offloading_objects.emplace(bucket_object.first,
                                                          bucket_object.second);
