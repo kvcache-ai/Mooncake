@@ -1977,6 +1977,10 @@ TEST_F(RdmaContextEnableTest, OpenDeviceFallsBackToTheEncodedRate) {
     EXPECT_EQ(fake_rnic.query_speed_calls, 1);
     EXPECT_DOUBLE_EQ(context_->linkSpeedGbps(), 400.0);  // NDR 4x encoded
 }
+
+// Keep these stand-ins separate from the multi-NIC registration test helpers.
+namespace dmabuf_registration {
+
 // Memory-registration verbs stand-ins. registerMemReg() picks between
 // ibv_reg_mr and ibv_reg_dmabuf_mr from what the platform's dma-buf exporter
 // says about the address; the fake records which one it was handed and the
@@ -2188,6 +2192,8 @@ TEST(RdmaContextDmabufSymbolTest, LoaderExposesOptionalDmabufVerb) {
     EXPECT_EQ(context.supportsDmabuf(),
               loader.sym().ibv_reg_dmabuf_mr != nullptr);
 }
+
+}  // namespace dmabuf_registration
 
 // The whole runtime chain: an async event reaches Workers::applyContextEvent,
 // the context re-reads its (fake) port, and the selector is re-seeded only
