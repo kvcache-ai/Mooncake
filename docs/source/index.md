@@ -82,13 +82,12 @@ At the center of Mooncake is a KVCache-centric scheduler that balances effective
 
 :::
 
-## Documentation
-
 % How to start using Mooncake?
 
 :::{toctree}
 :caption: Getting Started
 :maxdepth: 1
+:hidden:
 
 getting_started/quick-start
 getting_started/build
@@ -102,6 +101,7 @@ getting_started/store-rs-features
 :::{toctree}
 :caption: Deployment
 :maxdepth: 1
+:hidden:
 
 deployment/mooncake-store-deployment-guide
 deployment/store-rs/index
@@ -118,6 +118,7 @@ Mooncake x LMDeploy Integration<deployment/integrations/lmdeploy>
 :::{toctree}
 :caption: Performance
 :maxdepth: 1
+:hidden:
 performance/mooncake/index
 performance/sglang/index
 performance/vllm/index
@@ -128,6 +129,7 @@ performance/vllm/index
 :::{toctree}
 :caption: Design Documents
 :maxdepth: 1
+:hidden:
 
 design/architecture
 design/transfer-engine/index
@@ -147,6 +149,7 @@ design/hicache-design
 :::{toctree}
 :caption: API Reference
 :maxdepth: 1
+:hidden:
 
 api-reference/python/index
 api-reference/cpp/index
@@ -159,6 +162,7 @@ api-reference/rust/index
 :::{toctree}
 :caption: Troubleshooting
 :maxdepth: 1
+:hidden:
 
 troubleshooting/error-code
 troubleshooting/troubleshooting
@@ -172,15 +176,7 @@ troubleshooting/store-rs-key-access
 :::{toctree}
 :caption: Community
 :maxdepth: 1
+:hidden:
 
 community/governance
 :::
-
-% Archived content
-
-### Archived
-
-- [Guide: vLLM MooncakeStoreConnector](deployment/integrations/vllm/vllm-mooncakestoreconnector)
-- [vLLM V0 Disaggregated Serving Demo](deployment/integrations/vllm/vllm-integration-v0.2)
-- [vLLM V0 Disaggregated Serving with MooncakeStore](deployment/integrations/vllm/vllm-integration-v0.3)
-- [vLLM v1 backend Disaggregated Serving with MooncakeConnector](deployment/integrations/vllm/vllm-integration-v1.0)
