@@ -141,6 +141,43 @@ static void nvmf_io_complete(void* ctx, const struct spdk_nvme_cpl* cpl) {
 
     sub_task->sub_task_pool->push(sub_task);
 }
+
+// TryRecoverNofSegment never blocks on the target, but each failed attempt
+// can queue a controller reset, so pace attempts while the target is down.
+constexpr int kSpdkNofRecoverIntervalMs = 1000;
+
+// Heal a segment whose io qpair failed, e.g. because the NoF target went away.
+// SpdkWrapper caches one qpair per namespace, so without this the worker would
+// keep submitting to the failed qpair and never recover once the target is
+// back. Must be called on the worker that owns the qpair, holding the
+// segment's io lock.
+static void MaybeRecoverSpdkNofSegment(
+    mooncake::nof_seg_handle* seg_handle,
+    std::map<mooncake::nof_seg_handle*, std::chrono::steady_clock::time_point>&
+        next_recover_at,
+    int work_idx) {
+    auto& wrapper = mooncake::SpdkWrapper::GetInstance();
+    if (!wrapper.IsNofSegmentFailed(seg_handle)) {
+        next_recover_at.erase(seg_handle);
+        return;
+    }
+
+    auto now = std::chrono::steady_clock::now();
+    auto it = next_recover_at.find(seg_handle);
+    if (it != next_recover_at.end() && now < it->second) {
+        return;
+    }
+
+    if (wrapper.TryRecoverNofSegment(seg_handle)) {
+        LOG(INFO) << "work " << work_idx << ", seg " << seg_handle
+                  << " recovered";
+        next_recover_at.erase(seg_handle);
+        return;
+    }
+
+    next_recover_at[seg_handle] =
+        now + std::chrono::milliseconds(kSpdkNofRecoverIntervalMs);
+}
 #endif
 namespace mooncake {
 namespace {
@@ -465,6 +502,8 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
     int64_t total_outstanding_io = 0;
     // std::set<nof_seg_handle *> seg_set;
     std::map<nof_seg_handle*, std::unique_ptr<SpdkNofQos>> seg_to_qos;
+    std::map<nof_seg_handle*, std::chrono::steady_clock::time_point>
+        seg_next_recover_at;
     std::stack<SpdkNofSubTask*> sub_task_pool;
     std::vector<SpdkNofSubTask*> sub_task_chunks;
     auto& task_queue = task_queue_[work_idx];
@@ -536,6 +575,18 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
         }
 
         for (auto& [seg_handle, nof_qos] : seg_to_qos) {
+            if (nof_qos->Empty()) {
+                continue;
+            }
+            // Skip, rather than wait for, a segment whose controller is being
+            // reset, so other segments on this worker keep moving.
+            auto io_lock =
+                SpdkWrapper::GetInstance().TryLockNofSegmentIo(seg_handle);
+            if (!io_lock.owns_lock()) {
+                continue;
+            }
+            MaybeRecoverSpdkNofSegment(seg_handle, seg_next_recover_at,
+                                       work_idx);
             uint32_t block_size =
                 SpdkWrapper::GetInstance().GetBlockSize(seg_handle);
             for (int i = 0; i < kSpdkNofOpNum; ++i) {
@@ -602,6 +653,11 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
         if (total_outstanding_io > 0) {
             int64_t ret = 0;
             for (auto& it : seg_to_qos) {
+                auto io_lock =
+                    SpdkWrapper::GetInstance().TryLockNofSegmentIo(it.first);
+                if (!io_lock.owns_lock()) {
+                    continue;
+                }
                 ret = SpdkWrapper::GetInstance().NvmePollProcessCompletion(
                     it.first, 0);
                 if (ret < 0) {
