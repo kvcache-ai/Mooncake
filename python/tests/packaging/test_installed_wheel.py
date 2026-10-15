@@ -59,6 +59,7 @@ def test_wheel_imports_outside_the_repository(
 from importlib import import_module, metadata, util
 from pathlib import Path
 import sys
+
 import mooncake
 
 cli_modules = (
@@ -78,6 +79,7 @@ assert "mooncake.engine" not in sys.modules
 
 import mooncake.async_store
 import mooncake.engine
+import mooncake.mooncake_store_service
 import mooncake.http_metadata_server
 import mooncake.mooncake_config
 import mooncake.reshard
@@ -95,6 +97,14 @@ assert issubclass(
 )
 assert Path(mooncake.async_store.__file__).resolve().parent == package_path.parent
 assert mooncake.engine.TransferEngine is not None
+assert mooncake.mooncake_store_service.MooncakeStoreService is not None
+store_entry_points = metadata.entry_points(
+    group="console_scripts", name="mc_store_rest_server"
+)
+assert len(store_entry_points) == 1
+store_entry_point = store_entry_points[0]
+assert store_entry_point.value == "mooncake.mooncake_store_service:sync_main"
+assert store_entry_point.load() is mooncake.mooncake_store_service.sync_main
 assert mooncake.http_metadata_server.KVBootstrapServer is not None
 assert mooncake.mooncake_config.MooncakeConfig is not None
 for ep_module in (

@@ -7,6 +7,7 @@ store:
   - changed-files:
     - any-glob-to-any-file:
       - 'mooncake-store/**/*'
+      - 'python/mooncake/mooncake_store_service.py'
       - 'python/mooncake/_fast_copy.c'
       - 'python/mooncake/structured_object_store.py'
       - 'python/mooncake/http_metadata_server.py'

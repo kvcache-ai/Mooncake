@@ -41,9 +41,7 @@ def _shm_name_to_path(name):
 
 def _unblock_shutdown_signals():
     try:
-        signal.pthread_sigmask(
-            signal.SIG_UNBLOCK, {signal.SIGINT, signal.SIGTERM}
-        )
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGINT, signal.SIGTERM})
     except AttributeError:
         pass
 
@@ -126,9 +124,7 @@ class MooncakeStoreService:
             format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
         )
 
-    async def start_store_service(
-        self, max_wait_time: float = 60, shutdown_event=None
-    ):
+    async def start_store_service(self, max_wait_time: float = 60, shutdown_event=None):
         """
         Start the store service with retry mechanism.
 
@@ -191,9 +187,7 @@ class MooncakeStoreService:
                     # chance to publish a shutdown requested while it ran.
                     await asyncio.sleep(0)
                     if shutdown_event.is_set():
-                        logging.info(
-                            "Store startup cancelled by shutdown request"
-                        )
+                        logging.info("Store startup cancelled by shutdown request")
                         await self.stop()
                         return False
 
@@ -228,9 +222,7 @@ class MooncakeStoreService:
                                 shutdown_event.wait(),
                                 timeout=actual_sleep_time,
                             )
-                            logging.info(
-                                "Store startup cancelled by shutdown request"
-                            )
+                            logging.info("Store startup cancelled by shutdown request")
                             return False
                         except asyncio.TimeoutError:
                             pass
