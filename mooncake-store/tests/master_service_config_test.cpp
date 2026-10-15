@@ -1,13 +1,16 @@
 #include <gtest/gtest.h>
 
-#include <cstdlib>
+#include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <string>
 
-#include "../src/config/metrics_bootstrap_config_loader.h"
+#include "config/metrics_bootstrap_config_loader.h"
+#include "config/rpc_connection_bootstrap_config_loader.h"
 #include "default_config.h"
 #include "ha/snapshot/batch_oplog/config.h"
 #include "master_config.h"
@@ -144,6 +147,115 @@ TEST_F(MetricsBootstrapConfigTest, RejectsOutOfRangeCommandLinePort) {
     command_line.port = UINT32_MAX;
     EXPECT_THROW(ResolveMetricsBootstrapConfig(nullptr, command_line),
                  std::invalid_argument);
+}
+
+class RpcConnectionBootstrapConfigTest : public ::testing::Test {
+   protected:
+    void SetUp() override {
+        std::string pattern = (std::filesystem::temp_directory_path() /
+                               "rpc_connection_bootstrap_test_XXXXXX")
+                                  .string();
+        char* directory = mkdtemp(pattern.data());
+        ASSERT_NE(directory, nullptr);
+        temp_dir_ = directory;
+    }
+
+    void TearDown() override {
+        if (!temp_dir_.empty()) {
+            std::filesystem::remove_all(temp_dir_);
+        }
+    }
+
+    std::unique_ptr<DefaultConfig> LoadConfig(const std::string& extension,
+                                              const std::string& contents) {
+        const auto path = temp_dir_ / ("config" + extension);
+        {
+            std::ofstream file(path);
+            EXPECT_TRUE(file.is_open());
+            file << contents;
+        }
+        auto config = std::make_unique<DefaultConfig>();
+        config->SetPath(path.string());
+        config->Load();
+        return config;
+    }
+
+    std::filesystem::path temp_dir_;
+};
+
+TEST_F(RpcConnectionBootstrapConfigTest, UsesExistingDefaults) {
+    const auto resolved = ResolveRpcConnectionBootstrapConfig(nullptr, {});
+    EXPECT_EQ(resolved.timeout, std::chrono::seconds(0));
+    EXPECT_TRUE(resolved.tcp_no_delay);
+}
+
+TEST_F(RpcConnectionBootstrapConfigTest, LoadsExistingFlatYamlAndJsonKeys) {
+    const auto yaml = LoadConfig(
+        ".yaml",
+        "rpc_conn_timeout_seconds: 12\nrpc_enable_tcp_no_delay: false\n");
+    const auto from_yaml = ResolveRpcConnectionBootstrapConfig(yaml.get(), {});
+    EXPECT_EQ(from_yaml.timeout, std::chrono::seconds(12));
+    EXPECT_FALSE(from_yaml.tcp_no_delay);
+
+    const auto json = LoadConfig(
+        ".json",
+        R"({"rpc_conn_timeout_seconds":-3,"rpc_enable_tcp_no_delay":false})");
+    const auto from_json = ResolveRpcConnectionBootstrapConfig(json.get(), {});
+    EXPECT_EQ(from_json.timeout, std::chrono::seconds(-3));
+    EXPECT_FALSE(from_json.tcp_no_delay);
+}
+
+TEST_F(RpcConnectionBootstrapConfigTest, ExplicitCliOverridesFileValues) {
+    const auto file = LoadConfig(
+        ".yaml",
+        "rpc_conn_timeout_seconds: 12\nrpc_enable_tcp_no_delay: true\n");
+    const RpcConnectionCommandLineOverrides command_line{.timeout_seconds = 0,
+                                                         .tcp_no_delay = false};
+
+    const auto resolved =
+        ResolveRpcConnectionBootstrapConfig(file.get(), command_line);
+    EXPECT_EQ(resolved.timeout, std::chrono::seconds(0));
+    EXPECT_FALSE(resolved.tcp_no_delay);
+
+    const auto without_cli =
+        ResolveRpcConnectionBootstrapConfig(file.get(), {});
+    EXPECT_EQ(without_cli.timeout, std::chrono::seconds(12));
+    EXPECT_TRUE(without_cli.tcp_no_delay);
+}
+
+TEST_F(RpcConnectionBootstrapConfigTest, PreservesSignedBoundaryValues) {
+    const auto yaml =
+        LoadConfig(".yaml", "rpc_conn_timeout_seconds: -2147483648\n");
+    const auto json =
+        LoadConfig(".json", R"({"rpc_conn_timeout_seconds":2147483647})");
+    EXPECT_EQ(ResolveRpcConnectionBootstrapConfig(yaml.get(), {}).timeout,
+              std::chrono::seconds(std::numeric_limits<int32_t>::min()));
+    EXPECT_EQ(ResolveRpcConnectionBootstrapConfig(json.get(), {}).timeout,
+              std::chrono::seconds(std::numeric_limits<int32_t>::max()));
+
+    RpcConnectionCommandLineOverrides command_line;
+    command_line.timeout_seconds = std::numeric_limits<int32_t>::min();
+    EXPECT_EQ(
+        ResolveRpcConnectionBootstrapConfig(nullptr, command_line).timeout,
+        std::chrono::seconds(std::numeric_limits<int32_t>::min()));
+}
+
+TEST_F(RpcConnectionBootstrapConfigTest, KeepsInvalidYamlFailure) {
+    const auto file =
+        LoadConfig(".yaml", "rpc_conn_timeout_seconds: invalid\n");
+    EXPECT_THROW(ResolveRpcConnectionBootstrapConfig(file.get(), {}),
+                 std::exception);
+}
+
+TEST(RpcConnectionBootstrapConfigPropagationTest, ReachesHaSupervisor) {
+    MasterConfig master_config{};
+    master_config.allocation_strategy = "random";
+    master_config.rpc_connection.timeout = std::chrono::seconds(-9);
+    master_config.rpc_connection.tcp_no_delay = false;
+
+    MasterServiceSupervisorConfig supervisor_config(master_config);
+    EXPECT_EQ(supervisor_config.rpc_conn_timeout, std::chrono::seconds(-9));
+    EXPECT_FALSE(supervisor_config.rpc_enable_tcp_no_delay);
 }
 
 TEST(MasterServiceConfigTest, OplogBatchMaxEntriesDefaultsTo1024) {
