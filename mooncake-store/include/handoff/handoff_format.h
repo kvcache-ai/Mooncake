@@ -16,6 +16,9 @@
 //   handoff_quarantine.bin  memory ranges that a writer or reader of the old
 //                           master may still use, each with the time the old
 //                           master would still have held it back.
+//   handoff_local_disk.bin  (schema 2) the LocalSSD (L4) registration of each
+//                           store whose LOCAL_DISK replicas are carried in the
+//                           object chunks.
 //
 // Each segment's identity (segment id, base, owner) travels in its
 // StandbySegmentInfo record.
@@ -33,6 +36,7 @@
 
 #include "ha/snapshot/batch_oplog/metadata.h"
 #include "metadata_store.h"
+#include "local_ssd/manager.h"
 #include "segment/status.h"
 #include "types.h"
 #include "weight_metadata_store.h"
@@ -40,9 +44,14 @@
 namespace mooncake::handoff {
 
 inline constexpr char kHandoffFormat[] = "mooncake-handoff";
-inline constexpr uint32_t kHandoffSchemaVersion = 1;
+// Schema 2 adds the L4 state (LOCAL_DISK replicas in the chunks and the
+// handoff_local_disk.bin registrations). A schema-1 snapshot carries memory
+// replicas only and is still restored.
+inline constexpr uint32_t kHandoffSchemaVersion = 2;
+inline constexpr uint32_t kHandoffMinSchemaVersion = 1;
 inline constexpr char kHandoffManifestFile[] = "handoff_manifest";
 inline constexpr char kHandoffQuarantineFile[] = "handoff_quarantine.bin";
+inline constexpr char kHandoffLocalDiskFile[] = "handoff_local_disk.bin";
 inline constexpr char kHandoffSnapshotRoot[] = "handoff";
 
 // The part of a memory segment that its StandbySegmentInfo record does not
@@ -95,6 +104,7 @@ struct CodecFingerprint {
     uint32_t object_entry{0};
     uint32_t segments{0};
     uint32_t quarantine{0};
+    uint32_t local_disk{0};
     bool operator==(const CodecFingerprint&) const = default;
 };
 CodecFingerprint CurrentCodecFingerprint();
@@ -107,6 +117,14 @@ struct WriterStats {
     uint64_t dropped_non_memory_replicas{0};
     uint64_t dropped_incomplete_replicas{0};
     uint64_t dropped_unknown_segment_replicas{0};
+    // L4: carried LOCAL_DISK replicas (at most one per object), objects
+    // without a memory replica, and LOCAL_DISK replicas left out (not
+    // complete, of a store whose registration is not carried, a second one
+    // of the object, or not describing the object).
+    uint64_t local_disk_clients{0};
+    uint64_t local_disk_replicas{0};
+    uint64_t disk_only_objects{0};
+    uint64_t dropped_local_disk_replicas{0};
     uint64_t quarantine_ranges{0};
     uint64_t quarantine_bytes{0};
     // Ranges of discarded replicas the old master still held back, and those
@@ -135,6 +153,11 @@ struct Manifest {
     std::vector<SegmentAttributes> segments;
     BlobInfo quarantine;
     uint64_t quarantine_ranges{0};
+    // Schema 2: the L4 registrations, and the counts the restore checks.
+    // Absent (and 0) in schema 1.
+    std::optional<BlobInfo> local_disk;
+    uint64_t local_disk_clients{0};
+    uint64_t local_disk_replicas{0};
     WriterStats writer;
 };
 
@@ -164,6 +187,11 @@ std::optional<std::string> ValidateSegments(
 std::string EncodeManifest(const Manifest& manifest);
 tl::expected<Manifest, std::string> DecodeManifest(std::string_view file);
 
+std::vector<uint8_t> EncodeLocalDiskClients(
+    const std::vector<LocalSsdHandoffClient>& clients);
+tl::expected<std::vector<LocalSsdHandoffClient>, std::string>
+DecodeLocalDiskClients(const std::vector<uint8_t>& bytes);
+
 std::vector<uint8_t> EncodeQuarantine(
     const std::vector<QuarantineRange>& ranges);
 tl::expected<std::vector<QuarantineRange>, std::string> DecodeQuarantine(
@@ -191,6 +219,9 @@ struct SnapshotContents {
     std::vector<HandoffSegment> segments;
     std::optional<WeightMetadataSnapshot> weight_metadata;
     std::vector<QuarantineRange> quarantine;
+    // Schema 2: one entry per store whose LOCAL_DISK replicas are carried;
+    // each owns a restored segment and appears once.
+    std::vector<LocalSsdHandoffClient> local_disk_clients;
 };
 tl::expected<SnapshotContents, std::string> ReadSnapshot(
     const std::string& dir);

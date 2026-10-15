@@ -463,8 +463,15 @@ DEFINE_int32(handoff_max_age_sec, 120,
              "survives next to a master that does not know the handoff "
              "(rollback)");
 DEFINE_uint64(handoff_restore_bytes_per_object, 1144,
-              "Restore admission: peak RSS per object (measured, before the "
+              "Restore admission: peak RSS per object that has a memory "
+              "replica (measured, before the margin)");
+DEFINE_uint64(handoff_restore_bytes_per_disk_replica, 184,
+              "Restore admission: peak RSS per LOCAL_DISK (L4) replica of an "
+              "object that also has a memory replica (measured, before the "
               "margin)");
+DEFINE_uint64(handoff_restore_bytes_per_disk_only_object, 904,
+              "Restore admission: peak RSS per object whose only replica is "
+              "a LOCAL_DISK (L4) replica (measured, before the margin)");
 DEFINE_uint32(handoff_restore_margin_percent, 15,
               "Restore admission: safety margin added to the predicted "
               "restore memory, in percent of the prediction");
@@ -1481,7 +1488,11 @@ struct HandoffContext {
 
 mooncake::handoff::RestoreCostModel HandoffRestoreCostModel() {
     mooncake::handoff::RestoreCostModel model;
-    model.bytes_per_object = FLAGS_handoff_restore_bytes_per_object;
+    model.bytes_per_memory_object = FLAGS_handoff_restore_bytes_per_object;
+    model.bytes_per_extra_disk_replica =
+        FLAGS_handoff_restore_bytes_per_disk_replica;
+    model.bytes_per_disk_only_object =
+        FLAGS_handoff_restore_bytes_per_disk_only_object;
     model.margin_percent = FLAGS_handoff_restore_margin_percent;
     return model;
 }
@@ -1566,6 +1577,7 @@ void RunHandoffAtStartup(
             return tl::make_unexpected(restored.error());
         }
         return h::RestoreSummary{restored->objects, restored->segments,
+                                 restored->local_disk_replicas,
                                  restored->ToJson()};
     };
     // Retries of a claim or POISON write that failed on I/O: wait with
@@ -1598,6 +1610,10 @@ void RunHandoffAtStartup(
             *pending = service->HandoffPendingSegmentCount();
             *confirmed = service->HandoffSegmentsConfirmed();
             *dropped = service->HandoffSegmentsDropped();
+        });
+    h::HandoffMetrics::Instance().SetLocalDiskCounters(
+        [service](uint64_t* pending) {
+            *pending = service->HandoffDiskClientsPending();
         });
 }
 
@@ -1647,6 +1663,9 @@ void RunHandoffAtStartup(
     }
     steps.read_memory = [&ctx]() { return h::ReadMemorySnapshot(ctx.cgroup); };
     steps.object_count = [&service]() { return service.HandoffObjectCount(); };
+    steps.local_disk_count = [&service]() {
+        return service.HandoffLocalDiskObjectCount();
+    };
     steps.disk_free = [](const std::string& path) {
         return h::FreeDiskBytes(path);
     };
@@ -1661,9 +1680,10 @@ void RunHandoffAtStartup(
         options.durable = true;
         auto written = mooncake::WriteHandoffSnapshot(service, options);
         if (!written) return tl::make_unexpected(written.error());
-        return h::ShutdownWriteResult{written->stats.objects,
-                                      written->stats.total_bytes,
-                                      written->ToJson()};
+        return h::ShutdownWriteResult{
+            written->stats.objects, written->stats.total_bytes,
+            written->stats.local_disk_replicas,
+            written->stats.disk_only_objects, written->ToJson()};
     };
     h::ShutdownOptions options;
     options.root = ctx.root;
@@ -1780,12 +1800,6 @@ int main(int argc, char* argv[]) {
                 master_config.memory_allocator)) {
             LOG(FATAL) << "--handoff_dir: " << *error;
             return 1;
-        }
-        if (master_config.enable_offload) {
-            LOG(WARNING) << "--handoff_dir: the shutdown handoff carries "
-                            "memory replicas only; LOCAL_DISK replicas are "
-                            "registered again by their stores as after a "
-                            "cold start";
         }
     }
     if (!master_config.enable_ha && (!ha_backend_connstring.empty() ||
