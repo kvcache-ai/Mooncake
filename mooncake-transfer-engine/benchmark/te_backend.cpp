@@ -82,6 +82,16 @@ static inline int getSunriseDeviceNumaID(int dev_id) {
 static inline int getCudaDeviceNumaID(int cuda_id) { return 0; }
 #endif
 
+// freeBatchID() returns BatchCleanupDeferred when a completion callback is
+// still unwinding (#4569). The handle is already released and the engine
+// finishes the cleanup, so for a finished batch this is success.
+static mooncake::Status releaseFinishedBatch(mooncake::TransferEngine& engine,
+                                             BatchID batch_id) {
+    mooncake::Status status = engine.freeBatchID(batch_id);
+    if (status.IsBatchCleanupDeferred()) return mooncake::Status::OK();
+    return status;
+}
+
 volatile bool g_te_running = true;
 volatile bool g_te_triggered_sig = false;
 
@@ -577,7 +587,7 @@ double TEBenchRunner::runSingleTransfer(uint64_t local_addr, uint64_t target_id,
                 engine_->getBatchTransferStatus(batch_id, overall_status));
             if (overall_status.s == TransferStatusEnum::COMPLETED) {
                 auto duration = timer.lap_us();
-                CHECK_FAIL(engine_->freeBatchID(batch_id));
+                CHECK_FAIL(releaseFinishedBatch(*engine_, batch_id));
                 return duration;
             }
             if (overall_status.s == TransferStatusEnum::FAILED ||
@@ -604,7 +614,7 @@ double TEBenchRunner::runSingleTransfer(uint64_t local_addr, uint64_t target_id,
         if (overall_status.s == TransferStatusEnum::COMPLETED) {
             const uint64_t wait_us = wait_timer.lap_us();
             logSplitXfer({batch_size, submit_us, wait_us, polls});
-            CHECK_FAIL(engine_->freeBatchID(batch_id));
+            CHECK_FAIL(releaseFinishedBatch(*engine_, batch_id));
             return static_cast<double>(submit_us + wait_us);
         }
         if (overall_status.s == TransferStatusEnum::FAILED ||
