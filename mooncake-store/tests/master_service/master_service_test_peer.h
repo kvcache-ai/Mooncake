@@ -46,6 +46,11 @@ class MasterServiceTestPeer {
     void SetBatchOpLogWriterFactoryForTesting(
         MasterService::BatchOpLogWriterFactory factory);
 
+    // The OpLog payload built from one object's metadata, so a suite can name
+    // the fields that payload carries.
+    static std::string SerializeMetadataForOpLogForTesting(
+        MasterService& service, const ObjectMetadata& metadata);
+
     // Drive one eviction cycle synchronously, without the periodic worker.
     void RunBatchEvictForTesting(double evict_ratio_target,
                                  double evict_ratio_lowerbound);

@@ -16,6 +16,7 @@
 #include <optional>
 #include <queue>
 #include <shared_mutex>
+#include <span>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -1407,7 +1408,7 @@ class MasterService {
     ObjectMap::iterator EraseMetadata(TenantState& tenant_state,
                                       ObjectMap::iterator it,
                                       const TenantId& tenant_id);
-    void ReleaseLocalDiskUsage(const std::vector<Replica>& replicas);
+    void ReleaseLocalDiskUsage(std::span<const Replica> replicas);
     enum class QuotaEraseMode {
         kFull,
         kPreserveOld,
@@ -1552,7 +1553,7 @@ class MasterService {
         MetadataShardAccessorRW& shard,
         const std::chrono::system_clock::time_point& now);
     void FreeDfsReplicas(const std::string& key,
-                         const std::vector<Replica>& replicas);
+                         std::span<const Replica> replicas);
     void RunDfsEviction();
     void RunShardDfsEviction();
     void RunBucketDfsEviction();

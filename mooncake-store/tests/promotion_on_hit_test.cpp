@@ -1210,8 +1210,8 @@ TEST_F(PromotionOnHitTest, ReaperPopsStagedMemoryReplicaOnExpiry) {
         << "(allocator-tracked PROCESSING MEMORY replica)";
 
     // Wait past the staleness window; the eviction thread reaps the
-    // task and (with the fix) pops the staged replica via
-    // EraseReplicaByID, which releases the buffer back to the allocator.
+    // task and (with the fix) pops the staged replica by its allocation
+    // id, which releases the buffer back to the allocator.
     // Poll instead of a fixed sleep — the eviction thread cadence and
     // the test runner's scheduling jitter (especially under suite load)
     // both vary, so a hard 2s sleep is flaky here.
@@ -1314,8 +1314,8 @@ TEST_F(PromotionOnHitTest, QueueLimitRejectsCrossShard) {
 // the queue-wait phase. Without the reset, a task that waited in the
 // holder's promotion_objects queue for most of the original TTL could
 // enter active transfer with little budget left; if the SSD read + RDMA
-// write of a large object then ran past expiry, the reaper would
-// EraseReplicaByID on the staged MEMORY replica mid-flight and the
+// write of a large object then ran past expiry, the reaper would erase
+// the staged MEMORY replica by its allocation id mid-flight and the
 // allocator could hand the freed buffer to a concurrent Put while the
 // client's RDMA write is still landing into it (use-after-free in the
 // allocator + silent data corruption for the concurrent Put).
@@ -1342,7 +1342,7 @@ TEST_F(PromotionOnHitTest, QueueLimitRejectsCrossShard) {
 // the reset is wired up correctly.
 //
 // QuerySegments(seg).first (used bytes) is the observable: AllocStart
-// bumps it, the reaper's EraseReplicaByID returns it to baseline. We
+// bumps it, the reaper's erase by allocation id returns it to baseline. We
 // can't use GetReplicaList because the master filters out PROCESSING
 // replicas from the response.
 TEST_F(PromotionOnHitTest, AllocStartResetsTaskDeadline) {
@@ -1391,8 +1391,9 @@ TEST_F(PromotionOnHitTest, AllocStartResetsTaskDeadline) {
 
     // T=Wq+Wa : total elapsed since admission is 3.0s > TTL=2s. If the
     // reset is missing, the reaper sees the original start_time = 0
-    // and expires the task here, calling EraseReplicaByID which would
-    // free the staged buffer mid-RDMA-write in production. With the
+    // and expires the task here, erasing the staged replica by its
+    // allocation id, which would free the buffer mid-RDMA-write in
+    // production. With the
     // reset, start_time was bumped at AllocStart so age-since-reset is
     // only 1.5s < TTL=2s and the task stays alive. This is the
     // assertion that proves the reset is in place.
@@ -1417,7 +1418,7 @@ TEST_F(PromotionOnHitTest, AllocStartResetsTaskDeadline) {
     EXPECT_EQ(seg_after_reap->first, used_baseline)
         << "after the active-transfer phase's own TTL expires "
         << "(4.5s > 2s since AllocStart), the reaper must fire and "
-        << "free the staged buffer via EraseReplicaByID";
+        << "erase the staged replica by its allocation id";
 
     service->RemoveAll();
 }
@@ -1604,7 +1605,7 @@ TEST_F(PromotionOnHitTest, AllocStartRejectsReapedTask) {
 
     // Wait past the TTL so the reaper sweeps the task. AllocStart has
     // not yet been called, so alloc_id is 0; the reaper's
-    // EraseReplicaByID branch is a no-op and only the task entry is
+    // erase-by-allocation branch is a no-op and only the task entry is
     // removed. We can't easily poll for reap externally (the only
     // user-facing observable would be re-admitting through the gate,
     // which would create a fresh task and defeat the test), so use a
@@ -1780,7 +1781,7 @@ TEST_F(PromotionOnHitTest, NotifyFailureReleasesStateImmediately) {
 
     // The staged buffer must be freed back to the DRAM allocator. If
     // this fires, NotifyPromotionFailure did not pop the staged replica
-    // via EraseReplicaByID — same orphan-replica shape that originally
+    // by its allocation id — same orphan-replica shape that originally
     // motivated the reaper fix.
     auto seg_after_release = service->QuerySegments(seg.segment_name);
     ASSERT_TRUE(seg_after_release.has_value());

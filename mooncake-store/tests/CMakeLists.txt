@@ -213,6 +213,7 @@ add_store_test(tenant_quota_ledger_test tenant_quota_ledger_test.cpp)
 add_store_test(tenant_id_test tenant_id_test.cpp)
 add_store_test(object_entry_test object_entry_test.cpp)
 add_store_test(object_index_test object_index_test.cpp)
+add_store_test(object_part_test object_part_test.cpp)
 add_store_test(heap_optional_test heap_optional_test.cpp)
 add_store_test(dynamic_replication_controller_test
                dynamic_replication_controller_test.cpp)
