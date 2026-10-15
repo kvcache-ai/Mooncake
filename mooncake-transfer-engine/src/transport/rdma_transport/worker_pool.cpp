@@ -125,58 +125,6 @@ static ActiveEndpointSetupExecutor &activeEndpointSetupExecutor() {
     return executor;
 }
 
-static ActiveEndpointSetupResult setupEndpointByActiveOutsideLifecycleGate(
-    RdmaContext &context, const std::string &peer_nic_path,
-    const std::shared_ptr<RdmaEndPoint> &endpoint,
-    std::unique_lock<std::mutex> &endpoint_lifecycle_lock,
-    const std::function<int()> &drain_cq_while_waiting) {
-    const bool had_lifecycle_gate = endpoint_lifecycle_lock.owns_lock();
-    if (had_lifecycle_gate) endpoint_lifecycle_lock.unlock();
-
-    // The owner worker also polls this peer's CQ. Keep it draining while the
-    // active handshake can block on TCP connect/read timeouts.
-    int ret = ERR_ENDPOINT;
-    try {
-        auto setup_future = activeEndpointSetupExecutor().submit(endpoint);
-        auto wait_period = std::chrono::milliseconds(1);
-        constexpr auto kMaxWaitPeriod = std::chrono::milliseconds(25);
-        while (setup_future.wait_for(std::chrono::milliseconds(0)) !=
-               std::future_status::ready) {
-            bool made_progress = false;
-            while (setup_future.wait_for(std::chrono::milliseconds(0)) !=
-                   std::future_status::ready) {
-                const int drained = drain_cq_while_waiting();
-                if (drained <= 0) break;
-                made_progress = true;
-            }
-            if (setup_future.wait_for(std::chrono::milliseconds(0)) ==
-                std::future_status::ready) {
-                break;
-            }
-            if (made_progress) {
-                wait_period = std::chrono::milliseconds(1);
-            } else {
-                if (setup_future.wait_for(wait_period) ==
-                    std::future_status::ready) {
-                    break;
-                }
-                wait_period = std::min(wait_period * 2, kMaxWaitPeriod);
-            }
-        }
-        ret = setup_future.get();
-    } catch (const std::exception &ex) {
-        LOG(ERROR) << "Worker: Active endpoint setup threw: " << ex.what();
-    } catch (...) {
-        LOG(ERROR)
-            << "Worker: Active endpoint setup threw an unknown exception";
-    }
-
-    if (had_lifecycle_gate) endpoint_lifecycle_lock.lock();
-    auto current_endpoint = context.findEndpoint(peer_nic_path);
-    return {ret, current_endpoint.get() == endpoint.get() &&
-                     endpoint->active() && !endpoint->retired()};
-}
-
 static int selectPeerDevice(RdmaTransport::SegmentDesc *peer_segment_desc,
                             uint64_t offset, size_t length,
                             const std::string &local_hca, int &buffer_id,
@@ -228,6 +176,7 @@ WorkerPool::WorkerPool(RdmaContext &context, int numa_socket_id)
     : context_(context),
       numa_socket_id_(numa_socket_id),
       worker_count_(context.transferWorkerCount()),
+      pending_handshakes_(worker_count_),
       workers_running_(true),
       parked_worker_count_(0),
       redispatch_counter_(0),
@@ -291,6 +240,47 @@ WorkerPool::~WorkerPool() {
         workers_running_.store(false);
         for (auto &entry : worker_thread_) entry.join();
     }
+
+    // The executor is process-global, so make sure tasks submitted by this
+    // pool finish before their endpoints and context are destroyed.
+    for (auto &pending : pending_handshakes_)
+        for (auto &entry : pending) entry.second.result.wait();
+}
+
+std::optional<int> WorkerPool::progressHandshake(
+    int thread_id, const std::string &peer_nic_path,
+    const std::shared_ptr<RdmaEndPoint> &endpoint) {
+    auto &pending = pending_handshakes_[thread_id];
+    auto it = pending.find(peer_nic_path);
+    if (it != pending.end() && it->second.endpoint != endpoint) {
+        // The executor keeps the old task and its captured endpoint alive
+        // until the task completes.
+        pending.erase(it);
+        it = pending.end();
+    }
+
+    if (it == pending.end()) {
+        auto result = activeEndpointSetupExecutor().submit(endpoint);
+        pending.emplace(peer_nic_path,
+                        PendingHandshake{endpoint, std::move(result)});
+        return std::nullopt;
+    }
+
+    if (it->second.result.wait_for(std::chrono::seconds(0)) !=
+        std::future_status::ready)
+        return std::nullopt;
+
+    int ret = ERR_ENDPOINT;
+    try {
+        ret = it->second.result.get();
+    } catch (const std::exception &ex) {
+        LOG(ERROR) << "Worker: Active endpoint setup threw: " << ex.what();
+    } catch (...) {
+        LOG(ERROR)
+            << "Worker: Active endpoint setup threw an unknown exception";
+    }
+    pending.erase(it);
+    return ret;
 }
 
 int WorkerPool::submitPostSend(
@@ -590,6 +580,8 @@ void WorkerPool::performPostSend(int thread_id) {
         worker_slice_queue_[thread_id].clear();
     }
 
+    auto &pending = pending_handshakes_[thread_id];
+
     // If this local RNIC is inactive/unhealthy, the remote rail is not the
     // problem. Move queued work to another local RNIC while preserving the
     // already selected peer rail.
@@ -647,6 +639,15 @@ void WorkerPool::performPostSend(int thread_id) {
             entry.second.clear();
             continue;
         }
+        auto pending_it = pending.find(entry.first);
+        if (pending_it != pending.end() &&
+            pending_it->second.result.wait_for(std::chrono::seconds(0)) !=
+                std::future_status::ready) {
+            // Do not repeatedly take the lifecycle gate while the RPC is in
+            // flight. Besides avoiding needless contention, this keeps the
+            // gate continuously available to simultaneous passive setup.
+            continue;
+        }
         auto endpoint_lifecycle_lock =
             context_.lockEndpointLifecycle(entry.first);
 #ifdef CONFIG_CACHE_ENDPOINT
@@ -663,13 +664,17 @@ void WorkerPool::performPostSend(int thread_id) {
             entry.second.clear();
             continue;
         }
-        if (!endpoint->connected()) {
-            auto setup_result = setupEndpointByActiveOutsideLifecycleGate(
-                context_, entry.first, endpoint, endpoint_lifecycle_lock,
-                [this, thread_id] {
-                    if (!hasOutstandingCq(thread_id)) return 0;
-                    return performPollCq(thread_id, true);
-                });
+        if (!endpoint->connected() || pending.count(entry.first)) {
+            auto result = progressHandshake(thread_id, entry.first, endpoint);
+            if (!result) {
+                // Keep this peer's slices queued, but do not hold up other
+                // peers owned by the same worker. The normal worker loop will
+                // also continue polling this owner's CQ.
+                continue;
+            }
+            auto setup_result = ActiveEndpointSetupResult{
+                *result, context_.findEndpoint(entry.first) == endpoint &&
+                             endpoint->active() && !endpoint->retired()};
             if (!setup_result.endpoint_current) {
                 LOG(WARNING)
                     << "Worker: Endpoint changed while active handshake was "

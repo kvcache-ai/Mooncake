@@ -149,6 +149,10 @@ class WorkerPoolTestPeer {
         pool.performPostSend(thread_id);
     }
 
+    static int performPollCq(WorkerPool &pool, int thread_id) {
+        return pool.performPollCq(thread_id);
+    }
+
     static void clearQueuedSlices(WorkerPool &pool) {
         for (auto &queue : pool.collective_slice_queue_) queue.clear();
         for (auto &queue : pool.worker_slice_queue_) queue.clear();
@@ -548,6 +552,16 @@ TEST(RdmaEndpointLifecycleGateTest,
     active_a.get();
     active_b.get();
 
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while ((!peer_a.context->findEndpoint(a_to_b)->readyToSend() ||
+            !peer_b.context->findEndpoint(b_to_a)->readyToSend()) &&
+           std::chrono::steady_clock::now() < deadline) {
+        WorkerPoolTestPeer::performPostSend(*peer_a.worker_pool, 0);
+        WorkerPoolTestPeer::performPostSend(*peer_b.worker_pool, 0);
+        std::this_thread::yield();
+    }
+
     EXPECT_TRUE(peer_a.transport->lifecycleGateWasFree());
     EXPECT_TRUE(peer_b.transport->lifecycleGateWasFree());
 
@@ -562,7 +576,8 @@ TEST(RdmaEndpointLifecycleGateTest,
     WorkerPoolTestPeer::clearQueuedSlices(*peer_b.worker_pool);
 }
 
-TEST(RdmaEndpointLifecycleGateTest, ActiveHandshakeWaitDrainsOwnerCq) {
+TEST(RdmaEndpointLifecycleGateTest,
+     ActiveHandshakePendingDoesNotBlockOwnerPostOrPoll) {
     auto barrier = std::make_shared<InProcessRdmaTransport::Barrier>();
     FakeRdmaPeer peer;
 
@@ -575,8 +590,8 @@ TEST(RdmaEndpointLifecycleGateTest, ActiveHandshakeWaitDrainsOwnerCq) {
     ASSERT_NO_FATAL_FAILURE(installZeroQpEndpoint(peer, peer_nic_path));
 
     // The fake CQ is not a real verbs object. Clearing the native pointer keeps
-    // the regression hardware-free while still proving the owner worker enters
-    // its CQ poll path during the blocked active handshake.
+    // the regression hardware-free while still proving the owner can enter its
+    // CQ poll path after scheduling a blocked active handshake.
     RdmaContextTestPeer::clearNativeCompletionQueue(*peer.context, 0);
     peer.context->cqOutstandingCount(0)->store(1, std::memory_order_relaxed);
 
@@ -596,18 +611,19 @@ TEST(RdmaEndpointLifecycleGateTest, ActiveHandshakeWaitDrainsOwnerCq) {
         }));
     }
 
-    EXPECT_TRUE(WorkerPoolTestPeer::waitForPollTs(*peer.worker_pool,
-                                                  std::chrono::seconds(5)));
+    const bool post_returned =
+        active.wait_for(std::chrono::seconds(1)) == std::future_status::ready;
+    EXPECT_TRUE(post_returned);
+    if (post_returned) active.get();
+    EXPECT_EQ(WorkerPoolTestPeer::performPollCq(*peer.worker_pool, 0), 0);
+    EXPECT_NE(WorkerPoolTestPeer::lastPollTs(*peer.worker_pool), 0);
 
     {
         std::lock_guard<std::mutex> lock(barrier->mutex);
         barrier->released = true;
     }
     barrier->cv.notify_all();
-
-    ASSERT_EQ(active.wait_for(std::chrono::seconds(5)),
-              std::future_status::ready);
-    active.get();
+    if (!post_returned) active.get();
 
     WorkerPoolTestPeer::clearQueuedSlices(*peer.worker_pool);
 }

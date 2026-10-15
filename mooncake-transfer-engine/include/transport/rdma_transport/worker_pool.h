@@ -17,7 +17,9 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <future>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -59,6 +61,14 @@ class WorkerPool {
     void enqueueSlicesToOwner(int owner_thread, const SliceList &slices);
     int postingThreadForPeer(const std::string &peer_nic_path) const;
     int cqIndexForPostingThread(int thread_id) const;
+
+    struct PendingHandshake {
+        std::shared_ptr<RdmaEndPoint> endpoint;
+        std::future<int> result;
+    };
+    std::optional<int> progressHandshake(
+        int thread_id, const std::string &peer_nic_path,
+        const std::shared_ptr<RdmaEndPoint> &endpoint);
 
     void performPostSend(int thread_id);
 
@@ -125,6 +135,10 @@ class WorkerPool {
     RdmaContext &context_;
     const int numa_socket_id_;
     const int worker_count_;
+
+    // Only the owner worker accesses its pending map.
+    std::vector<std::unordered_map<std::string, PendingHandshake>>
+        pending_handshakes_;
 
     std::vector<std::thread> worker_thread_;
     std::atomic<bool> workers_running_;
