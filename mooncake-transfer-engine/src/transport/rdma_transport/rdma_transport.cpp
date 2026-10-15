@@ -756,7 +756,9 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
     // A missing metadata entry does NOT prove the MRs are gone: a partial
     // ibv_dereg_mr failure on an earlier attempt leaves live MRs behind it.
     // Fall through and retry the per-context deregistration (a clean address
-    // no-ops), so ERR_ADDRESS_NOT_REGISTERED means "nothing remains".
+    // no-ops), so ERR_ADDRESS_NOT_REGISTERED means "nothing remains locally".
+    // Local state only: a failed publishSegmentDesc may leave remote metadata
+    // stale (pre-existing gap, tracked separately).
     const bool metadata_missing = (rc == ERR_ADDRESS_NOT_REGISTERED);
     if (rc && !metadata_missing) return rc;
 

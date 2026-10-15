@@ -331,16 +331,22 @@ class SpdkInitiator::Impl {
             if (ConnectController(&tr.trid, new_info.get()) != 0) {
                 return nullptr;
             }
-            std::lock_guard<std::mutex> lock(ctrlrs_mutex_);
-            auto it = connected_ctrlrs_.find(tr.ctrlr_key);
-            if (it != connected_ctrlrs_.end()) {
-                // Lost a concurrent first-open race: detach our duplicate
-                // and use the winner.
+            bool detach_duplicate = false;
+            {
+                std::lock_guard<std::mutex> lock(ctrlrs_mutex_);
+                auto it = connected_ctrlrs_.find(tr.ctrlr_key);
+                if (it != connected_ctrlrs_.end()) {
+                    // Lost a concurrent first-open race: use the winner;
+                    // detach our duplicate outside the mutex (can block).
+                    info = it->second.get();
+                    detach_duplicate = true;
+                } else {
+                    info = new_info.get();
+                    connected_ctrlrs_[tr.ctrlr_key] = std::move(new_info);
+                }
+            }
+            if (detach_duplicate) {
                 spdk_nvme_detach(new_info->ctrlr);
-                info = it->second.get();
-            } else {
-                info = new_info.get();
-                connected_ctrlrs_[tr.ctrlr_key] = std::move(new_info);
             }
         }
 
@@ -715,6 +721,9 @@ class SpdkInitiator::Impl {
                 }
                 PollCompletion(ctx->seg, 0);
                 pending = pending || !ctx->done.load(std::memory_order_acquire);
+            }
+            if (pending) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
         }
         if (pending) {

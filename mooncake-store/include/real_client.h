@@ -1380,8 +1380,9 @@ class RealClient : public PyClient {
     std::vector<MappedShm> quarantine_shms_;
 
     // Re-attempt TE + SPDK unregister and munmap of quarantine_shms_. Caller
-    // must hold dummy_client_mutex_. Failures stay quarantined.
-    void RetryQuarantinedShmsLocked();
+    // must hold dummy_client_mutex_. Failures stay quarantined; returns OK
+    // only when nothing remains quarantined.
+    ErrorCode RetryQuarantinedShmsLocked();
 };
 
 }  // namespace mooncake

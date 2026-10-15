@@ -1751,14 +1751,22 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     bool expected = false;
     if (!closed_.compare_exchange_strong(expected, true,
                                          std::memory_order_acq_rel)) {
-        // A previous teardown's NoF cleanup failure must not decay into
-        // success on repeat calls: retry the idempotent cleanup and keep
-        // reporting failure until it heals.
+        // A previous teardown's cleanup failure must not decay into success
+        // on repeat calls: retry the idempotent cleanups and keep reporting
+        // failure until they heal.
         if (nof_buffer_cleanup_failed_.load(std::memory_order_acquire)) {
             const ErrorCode rc = CleanupNofRegisteredBuffers();
             if (rc != ErrorCode::OK) {
                 return tl::unexpected(rc);
             }
+        }
+        ErrorCode shm_rc;
+        {
+            std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
+            shm_rc = RetryQuarantinedShmsLocked();
+        }
+        if (shm_rc != ErrorCode::OK) {
+            return tl::unexpected(shm_rc);
         }
         return {};
     }
@@ -1910,10 +1918,13 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
         shm_it = shm_contexts_.erase(shm_it);
     }
     // Re-attempt quarantined segments (unregister failed during this teardown
-    // or an earlier one). Any that still fail are retained until process exit,
-    // which is safe: they are never munmapped, so SPDK's translations never
-    // point at freed/reused virtual addresses.
-    RetryQuarantinedShmsLocked();
+    // or an earlier one). Failures stay pinned (never munmapped) until process
+    // exit, and are reported so teardown does not claim success while
+    // translations stay live.
+    if (RetryQuarantinedShmsLocked() != ErrorCode::OK &&
+        cleanup_error == ErrorCode::OK) {
+        cleanup_error = ErrorCode::INTERNAL_ERROR;
+    }
     if (cleanup_error != ErrorCode::OK) return tl::unexpected(cleanup_error);
     return {};
 }
@@ -1946,7 +1957,7 @@ ErrorCode RealClient::CleanupNofRegisteredBuffers() {
     return failed ? ErrorCode::INTERNAL_ERROR : ErrorCode::OK;
 }
 
-void RealClient::RetryQuarantinedShmsLocked() {
+ErrorCode RealClient::RetryQuarantinedShmsLocked() {
     auto it = quarantine_shms_.begin();
     while (it != quarantine_shms_.end()) {
         // The transfer engine may still hold this region (unregisterLocalMemory
@@ -1990,6 +2001,7 @@ void RealClient::RetryQuarantinedShmsLocked() {
                   << ", size: " << it->shm_size;
         it = quarantine_shms_.erase(it);
     }
+    return quarantine_shms_.empty() ? ErrorCode::OK : ErrorCode::INTERNAL_ERROR;
 }
 
 int RealClient::tearDownAll() { return to_py_ret(tearDownAll_internal()); }
@@ -3161,8 +3173,8 @@ tl::expected<void, ErrorCode> RealClient::unmap_shm_internal(
     context.client_buffer_allocator.reset();
 
     // Retry previously quarantined segments (unregister failed earlier) before
-    // tearing down this context.
-    RetryQuarantinedShmsLocked();
+    // tearing down this context. Failures stay quarantined for teardown.
+    (void)RetryQuarantinedShmsLocked();
 
     bool failed = false;
     // Keep the quarantine push_back below from reallocating (and throwing
@@ -3452,8 +3464,8 @@ tl::expected<void, ErrorCode> RealClient::ascend_unmap_shm_internal(
     context.client_buffer_allocator.reset();
 
     // Retry previously quarantined segments (unregister failed earlier) before
-    // tearing down this context.
-    RetryQuarantinedShmsLocked();
+    // tearing down this context. Failures stay quarantined for teardown.
+    (void)RetryQuarantinedShmsLocked();
 
     // Move regions out before cleanup so failure paths cannot erase the map
     // entry while iterating (undefined behavior) or double-erase at the end.
@@ -3583,8 +3595,8 @@ tl::expected<void, ErrorCode> RealClient::unregister_shm_buffer_internal(
     bool unregister_failed = false;
 
     // Retry previously quarantined segments (unregister failed earlier) before
-    // handling this buffer.
-    RetryQuarantinedShmsLocked();
+    // handling this buffer. Failures stay quarantined for teardown.
+    (void)RetryQuarantinedShmsLocked();
 
     // Find the shm corresponding to this dummy address
     auto shm_it = context.mapped_shms.end();
