@@ -980,11 +980,13 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                                     descriptor.transport_endpoint_ ==
                                         restore.segment.name) {
                                     endpoint_match = true;
-                                    if (descriptor.buffer_address_ <
-                                            restore.segment.base ||
-                                        descriptor.buffer_address_ -
-                                                restore.segment.base >=
-                                            restore.segment.size)
+                                    // Reject CXL via the existing check below.
+                                    if (descriptor.protocol_ != "cxl" &&
+                                        (descriptor.buffer_address_ <
+                                             restore.segment.base ||
+                                         descriptor.buffer_address_ -
+                                                 restore.segment.base >=
+                                             restore.segment.size))
                                         continue;
                                     if (match != nullptr) {
                                         ambiguous_endpoint = true;
