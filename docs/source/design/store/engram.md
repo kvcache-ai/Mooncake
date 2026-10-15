@@ -1,5 +1,112 @@
 # EngramStore Backend
 
+EngramStore reads immutable tables of opaque byte rows. Models own hashing,
+quantization, scales, projections and distributed communication.
+
+## Table API
+
+The table API adds no public configuration or lookup-handle class. Import
+`EngramStore` from `mooncake.engram`, or from `mooncake.store` with the C++ Store
+backend. The existing layer API remains supported (see below).
+
+```python
+import numpy as np
+from mooncake.engram import EngramStore
+
+specs = {"layer1/head0": {"num_rows": 17, "row_bytes": 264}}
+store = EngramStore(tables=specs, namespace="model-revision/layout-v1",
+                    local_dir="/dev/shm/engram")
+rows = np.zeros((17, 264), dtype=np.uint8)
+store.populate("layer1/head0", rows)
+ids = np.array([[0], [16]], dtype=np.int64)
+output = np.empty((2, 1, 264), dtype=np.uint8)
+store.lookup(["layer1/head0"], ids, output)
+store.close()
+```
+
+- `EngramStore(*, tables, namespace, local_dir=None, store_client=None, persistent=True)`:
+  exactly one storage backend is required. Each table has a nonnegative
+  `num_rows` and positive `row_bytes`. The namespace identifies immutable
+  weights and their physical layout, including any rank-specific sharding.
+- `populate(table_id, rows, config=None)`: copies contiguous CPU `uint8 [N,R]`
+  data. Local publication is create-only, locked across processes and atomic.
+  The input can be released after return. Existing tables are never overwritten.
+- `lookup(table_ids, row_ids, output, *, stream=None, offsets=None)`: reads IDs
+  `[T,K]` into caller-owned `uint8 [T,K,R]` output. The K table names may repeat,
+  and all selected rows have width R. CPU IDs are NumPy arrays or CPU tensors
+  of int32/int64; CUDA IDs and output are CUDA tensors on the current device.
+- `get_table_spec(table_id)`: returns a copy of the two-field layout.
+- `close()`: waits for outstanding local CUDA work and releases mappings.
+  Idempotent; also available through the context-manager protocol.
+- `remove(table_id)`: explicitly removes a published table. Close all readers
+  first, then remove through a separate instance that has not mapped the table.
+
+`offsets` contains one nonnegative int64 offset per selected table. A valid ID
+is converted to a physical row by subtracting that offset. ID -1 is handled
+first and leaves the corresponding output bytes untouched. Every other ID must
+lie in the selected table's range. CPU bounds errors are raised before writes;
+CUDA bounds errors are reported asynchronously as device errors, and output is
+invalid. Do not use invalid IDs to request zero padding: initialize output and
+use -1 instead.
+
+Row bytes must be contiguous. Nonoverlapping positive outer strides support
+both token-major and head-major output; strided ID matrices are also accepted.
+IDs and output must not overlap. Empty token batches are supported.
+
+## Local CUDA execution
+
+Build with `USE_CUDA=ON` (for wheel builds, pass
+`-Ccmake.define.USE_CUDA=ON` to pip). The private CUDA extension has no PyTorch
+build dependency. Local tables are memory mapped and registered as portable
+CUDA host memory. The device gather kernel reads requested rows directly from
+host memory and writes output on the supplied stream.
+
+```bash
+pip install '.[engram]' -Ccmake.define.USE_CUDA=ON
+```
+
+```python
+import torch
+
+ids = torch.tensor([[0], [16]], dtype=torch.int64, device="cuda")
+output = torch.empty((2, 1, 264), dtype=torch.uint8, device="cuda")
+store = EngramStore(tables=specs, namespace="model-revision/layout-v1",
+                    local_dir="/dev/shm/engram")
+stream = torch.cuda.current_stream()
+store.lookup(["layer1/head0"], ids, output, stream=stream.cuda_stream)
+# Subsequent work on this stream sees complete rows.
+stream.synchronize()
+store.close()
+```
+
+The CPU overload is synchronous. Supplying a CUDA stream enqueues the complete
+lookup and returns `None`; consumers use ordinary stream ordering or CUDA
+events. Keep IDs, output, and the Store alive until completion. Warm up each
+(table names, offsets, device) combination before capturing a CUDA graph, and
+destroy all graphs referring to a Store before closing it. Replays read current
+IDs from the captured tensor addresses.
+
+With the default `persistent=True`, local files survive close and can be reopened using the same namespace and
+layout. Reopening checks the stored layout and file length. Host RAM must fit
+all registered table pages, even when the directory is on disk. This initial
+implementation pins entire selected tables and does not implement a page cache.
+
+For worker-private tables, pass `persistent=False` with `local_dir`. Population
+creates an anonymous file mapping on that filesystem; it has no named file to
+leave behind after a worker is killed. These tables are isolated per Store
+instance, cannot be reopened by namespace, and are released by `close()` or
+process exit. `remove()` is not needed or supported in this mode.
+
+## Store-backed table execution
+
+`store_client` selects the existing Store transport. CPU population uses
+`batch_put_from`; lookup uses `get_into_ranges` with caller-registered output,
+as in the layer API. Keys include the namespace and table name. Use one writer
+per namespace when publishing remote tables. Remote CUDA execution and
+pipelined transport optimizations are outside this change.
+
+## Legacy layer API
+
 Mooncake provides EngramStore as the storage backend for Engram embedding tables.
 
 The scope is intentionally narrow:
@@ -12,14 +119,14 @@ The scope is intentionally narrow:
 Mooncake does not implement tokenizer compression, N-gram hashing, query logic,
 or any other model-side Engram algorithm.
 
-## Current Backend Boundary
+### Current Backend Boundary
 
 EngramStore uses the existing `batch_put_from`, `batch_query`, and
 `get_into_ranges` Store interfaces. It stores one object per head and reads only
 the requested byte ranges. Lookup is synchronous; the Python binding releases
 the GIL during I/O. There is no model-specific hashing or GPU execution here.
 
-## Configuration
+### Configuration
 
 `EngramStore` manages all Engram layers of a model. Its constructor accepts a
 map from layer ID to `EngramStoreConfig`; each config describes one layer:
@@ -52,7 +159,7 @@ contains 256 FP8 bytes followed by 8 E8M0 scale bytes, so `row_bytes = 264`.
 There is no dtype mode or configurable key prefix. Models with overlapping layer
 IDs need separate Store deployments or explicit removal before replacement.
 
-## Public Interface
+### Public Interface
 
 Python:
 
@@ -70,7 +177,7 @@ Python:
 The Python `store` argument accepts the existing `MooncakeDistributedStore`
 wrapper, or `None` for metadata-only construction or local table binding.
 
-### Local table mode
+#### Local table mode
 
 Construct without a Store client and bind immutable, contiguous `uint8` tables
 before starting lookup workers:
@@ -107,7 +214,7 @@ C++:
 - `remove_from_store(...)`
 - metadata getters matching the Python surface
 
-## Data Contract
+### Data Contract
 
 Populate expects one C-contiguous NumPy `uint8` array per head; it does not
 cast numeric arrays to bytes:
@@ -152,7 +259,7 @@ To store existing floating-point arrays, explicitly expose their bytes, e.g.
 `table.view(np.uint8).reshape(num_rows, row_bytes)`. The caller is responsible for
 the dtype and layout when interpreting lookup results.
 
-## Populate Flow
+### Populate Flow
 
 Populate follows the existing Store write path:
 
@@ -170,7 +277,7 @@ If upload fails after some head tables have already been written, or if publish
 finishes but post-write buffer cleanup fails, the backend best-effort removes
 the keys written by the failed populate attempt before returning an error.
 
-## Lookup Flow
+### Lookup Flow
 
 Each Store-backed lookup follows this flow (local mode validates IDs and copies
 rows directly):
@@ -183,7 +290,7 @@ rows directly):
 The binding builds ranges directly from contiguous NumPy row IDs.
 It rejects Python lists and implicit dtype or layout conversion.
 
-## Validation
+### Validation
 
 The backend enforces these invariants:
 
@@ -196,7 +303,7 @@ The backend enforces these invariants:
 - `lookup_into(...)` receives matching `[B, L, H]` IDs and registered output
 - every row id satisfies `0 <= row_ids[..., h] < N_h`
 
-## Validation Status
+### Validation Status
 
 This backend is covered by:
 
@@ -211,7 +318,7 @@ By default, the benchmark exercises `engram_store.populate(...)` directly. Its
 fallback populate paths are gated behind `ENGRAM_ALLOW_POPULATE_FALLBACK=1` so
 they do not silently mask regressions in the current implementation.
 
-## Client Instances and Storage
+### Client Instances and Storage
 
 SGLang shares one EngramStore and one Store client across all Engram layers in
 each rank. Each layer still owns its fixed pinned output buffers for CUDA Graph.

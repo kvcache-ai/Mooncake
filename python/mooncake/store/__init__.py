@@ -124,6 +124,10 @@ __all__ = sorted(_EXPORTS)
 
 
 def __getattr__(name: str):
+    if name == "EngramStore" and _BACKEND == "cpp":
+        from mooncake.engram import EngramStore
+
+        return EngramStore
     if name in _EXPORTS:
         return getattr(_IMPLEMENTATION, name)
     if _BACKEND == "cpp" and name in _CPP_INTERNAL_EXPORTS:

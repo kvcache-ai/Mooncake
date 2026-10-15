@@ -46,6 +46,9 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
+engram = [
+    "numpy>=1.24",
+]
 structured = [
     "numpy",
     "pillow",
