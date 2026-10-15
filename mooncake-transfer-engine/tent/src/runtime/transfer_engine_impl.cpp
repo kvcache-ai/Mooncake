@@ -1653,7 +1653,9 @@ struct RequestBoundaryInfo {
 
 struct MergeResult {
     std::vector<Request> request_list;
-    std::map<size_t, size_t> task_lookup;
+    // Original request index -> merged request index. Every input has one
+    // entry.
+    std::vector<size_t> task_lookup;
 };
 
 struct TransferEngineImpl::PreparedSubmit {
@@ -1691,6 +1693,7 @@ bool tryAddUint64(uint64_t lhs, uint64_t rhs, uint64_t& out) {
 MergeResult makePassThroughMergeResult(const std::vector<Request>& requests) {
     MergeResult result;
     result.request_list.reserve(requests.size());
+    result.task_lookup.resize(requests.size());
     for (size_t i = 0; i < requests.size(); ++i) {
         result.request_list.push_back(requests[i]);
         result.task_lookup[i] = i;
@@ -1785,6 +1788,7 @@ MergeResult mergeRequests(const std::vector<Request>& requests,
     merged_items.reserve(items.size());
 
     MergeResult result;
+    result.task_lookup.resize(requests.size());
     for (const auto& item : items) {
         if (merged_items.empty() || !can_merge(merged_items.back(), item)) {
             merged_items.push_back(item);
@@ -2091,7 +2095,9 @@ Status TransferEngineImpl::prepareSubmit(
             }
         }
         if (!tcp_limited.empty()) {
-            for (const auto& [public_id, owner_id] : merged.task_lookup) {
+            for (size_t public_id = 0; public_id < merged.task_lookup.size();
+                 ++public_id) {
+                const size_t owner_id = merged.task_lookup[public_id];
                 if (tcp_limited[owner_id]) {
                     auto& limit = merge_boundaries[public_id].max_merge_bytes;
                     limit = std::min<uint64_t>(
@@ -2134,9 +2140,9 @@ Status TransferEngineImpl::prepareSubmit(
     }
 
     prepared.tasks.reserve(merged.task_lookup.size());
-    for (const auto& kv : merged.task_lookup) {
-        const size_t public_task_index = kv.first;
-        const size_t merged_task_index = kv.second;
+    for (size_t public_task_index = 0;
+         public_task_index < merged.task_lookup.size(); ++public_task_index) {
+        const size_t merged_task_index = merged.task_lookup[public_task_index];
         const size_t task_id = start_task_id + public_task_index;
         auto& owner = prepared.owners[merged_task_index];
         if (!owner.has_owner_task_id) {
@@ -3011,6 +3017,13 @@ bool TransferEngineImpl::attemptSubmitStageFailover(Batch* batch,
 Status TransferEngineImpl::pollTaskStatus(Batch* batch, size_t task_id,
                                           TransferStatus& task_status) {
     auto& task = batch->task_list[task_id];
+    // Match batch polling: a logical failure is terminal. A rejected fallback
+    // may not have created a sub-task, but keep its type for metric
+    // attribution.
+    if (task.status == FAILED) {
+        task_status = {FAILED, 0};
+        return Status::OK();
+    }
     if (task.staging) {
         return staging_proxy_->getStatus(&task, task_status);
     }
@@ -3109,23 +3122,27 @@ void TransferEngineImpl::updateTaskStatusAfterPoll(Batch* batch, size_t task_id,
     // request will recover through failover. Close it before task.type is
     // overwritten by resubmitTransferTask().
     finishTransportAttempt(task, FAILED, std::chrono::steady_clock::now());
-    if (resubmitTransferTask(batch, task_id).ok()) {
-        task_status.s = PENDING;
-        task.status = PENDING;
-        for (size_t alias_id = 0; alias_id < batch->task_list.size();
-             ++alias_id) {
-            auto& alias = batch->task_list[alias_id];
-            if (!alias.derived || alias.physical_owner_task_id != task_id)
-                continue;
-            alias.type = task.type;
-            alias.sub_task_id = task.sub_task_id;
-            alias.status = task.status;
-            alias.failover_count = task.failover_count;
-            alias.xport_priority = task.xport_priority;
-            alias.device_mask = task.device_mask;
-            alias.qp_pool = task.qp_pool;
-            alias.staging = task.staging;
+    // A synchronous rejection dispatches no work, so keep trying candidates
+    // within the original budget. An accepted attempt is polled on the next
+    // progress step, rather than spinning here until it completes.
+    while (task.failover_count < task.runtime_policy.max_failover_attempts) {
+        if (resubmitTransferTask(batch, task_id).ok()) {
+            task_status.s = PENDING;
+            task.status = PENDING;
+            break;
         }
+    }
+    for (size_t alias_id = 0; alias_id < batch->task_list.size(); ++alias_id) {
+        auto& alias = batch->task_list[alias_id];
+        if (!alias.derived || alias.physical_owner_task_id != task_id) continue;
+        alias.type = task.type;
+        alias.sub_task_id = task.sub_task_id;
+        alias.status = task.status;
+        alias.failover_count = task.failover_count;
+        alias.xport_priority = task.xport_priority;
+        alias.device_mask = task.device_mask;
+        alias.qp_pool = task.qp_pool;
+        alias.staging = task.staging;
     }
 }
 

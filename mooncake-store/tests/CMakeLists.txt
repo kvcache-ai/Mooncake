@@ -213,6 +213,8 @@ add_store_test(tenant_id_test tenant_id_test.cpp)
 add_store_test(object_entry_test object_entry_test.cpp)
 add_store_test(object_index_test object_index_test.cpp)
 add_store_test(heap_optional_test heap_optional_test.cpp)
+add_store_test(dynamic_replication_controller_test
+               dynamic_replication_controller_test.cpp)
 add_store_test(dynamic_replication_lease_table_test
                dynamic_replication_lease_table_test.cpp)
 add_store_test(group_index_test group_index_test.cpp)
@@ -260,10 +262,18 @@ endif()
 if(USE_CUDA)
   target_compile_definitions(pybind_client_test PRIVATE MOONCAKE_TEST_CUDA_H2D)
   target_link_libraries(pybind_client_test PRIVATE CUDA::cudart)
+elseif(USE_XPU)
+  # -fsycl already propagates from transfer_engine (TENT platform_xpu).
+  target_compile_definitions(pybind_client_test PRIVATE MOONCAKE_TEST_XPU_H2D)
 endif()
 add_store_test(ipv6_client_test ipv6_client_test.cpp)
 add_store_test(host_port_fix_test host_port_fix_test.cpp)
 add_store_test(client_metrics_test client_metrics_test.cpp)
+if(USE_NOF)
+  add_store_test(nof_metrics_test nof_metrics_test.cpp)
+  target_include_directories(nof_metrics_test PRIVATE ${SPDK_INCLUDE_DIR}
+                                                      ${DPDK_INCLUDE_DIR})
+endif()
 add_store_test(client_host_identity_config_test
                client_host_identity_config_test.cpp)
 add_store_test(client_metric_config_test client_metric_config_test.cpp)

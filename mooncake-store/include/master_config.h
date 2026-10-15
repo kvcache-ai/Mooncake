@@ -870,6 +870,8 @@ class MasterServiceConfigBuilder {
     uint64_t snapshot_chunk_object_count_ = 1000000;
     int oplog_poll_interval_ms_ = 1000;
     uint32_t oplog_batch_max_entries_ = 1024;
+    uint64_t restore_repair_durable_timeout_ms_ =
+        DEFAULT_RESTORE_REPAIR_DURABLE_TIMEOUT_MS;
     std::string cluster_id_ = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir_ = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size_ = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
@@ -1038,6 +1040,12 @@ class MasterServiceConfigBuilder {
 
     MasterServiceConfigBuilder& set_oplog_batch_max_entries(uint32_t entries) {
         oplog_batch_max_entries_ = entries;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_restore_repair_durable_timeout_ms(
+        uint64_t timeout_ms) {
+        restore_repair_durable_timeout_ms_ = timeout_ms;
         return *this;
     }
 
@@ -1232,6 +1240,8 @@ class MasterServiceConfig {
     uint64_t snapshot_chunk_object_count = 1000000;
     int oplog_poll_interval_ms = 1000;
     uint32_t oplog_batch_max_entries = 1024;
+    uint64_t restore_repair_durable_timeout_ms =
+        DEFAULT_RESTORE_REPAIR_DURABLE_TIMEOUT_MS;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
@@ -1398,6 +1408,8 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.snapshot_chunk_object_count = snapshot_chunk_object_count_;
     config.oplog_poll_interval_ms = oplog_poll_interval_ms_;
     config.oplog_batch_max_entries = oplog_batch_max_entries_;
+    config.restore_repair_durable_timeout_ms =
+        restore_repair_durable_timeout_ms_;
     config.cluster_id = cluster_id_;
     config.root_fs_dir = root_fs_dir_;
     config.global_file_segment_size = global_file_segment_size_;
@@ -1448,6 +1460,8 @@ struct InProcMasterConfig {
     std::optional<std::string> root_fs_dir;
     std::optional<bool> enable_disk_eviction;
     std::optional<uint64_t> quota_bytes;
+    std::optional<bool> enable_multi_tenants;
+    std::optional<std::string> tenant_quota_connector_uri;
 };
 
 // Builder class for InProcMasterConfig
@@ -1465,6 +1479,8 @@ class InProcMasterConfigBuilder {
     std::optional<std::string> root_fs_dir_ = std::nullopt;
     std::optional<bool> enable_disk_eviction_ = std::nullopt;
     std::optional<uint64_t> quota_bytes_ = std::nullopt;
+    std::optional<bool> enable_multi_tenants_ = std::nullopt;
+    std::optional<std::string> tenant_quota_connector_uri_ = std::nullopt;
 
    public:
     InProcMasterConfigBuilder() = default;
@@ -1533,6 +1549,17 @@ class InProcMasterConfigBuilder {
         return *this;
     }
 
+    InProcMasterConfigBuilder& set_enable_multi_tenants(bool enable) {
+        enable_multi_tenants_ = enable;
+        return *this;
+    }
+
+    InProcMasterConfigBuilder& set_tenant_quota_connector_uri(
+        const std::string& uri) {
+        tenant_quota_connector_uri_ = uri;
+        return *this;
+    }
+
     InProcMasterConfig build() const;
 };
 
@@ -1551,6 +1578,8 @@ inline InProcMasterConfig InProcMasterConfigBuilder::build() const {
     config.root_fs_dir = root_fs_dir_;
     config.enable_disk_eviction = enable_disk_eviction_;
     config.quota_bytes = quota_bytes_;
+    config.enable_multi_tenants = enable_multi_tenants_;
+    config.tenant_quota_connector_uri = tenant_quota_connector_uri_;
     return config;
 }
 

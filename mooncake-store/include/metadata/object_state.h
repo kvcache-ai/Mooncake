@@ -1,5 +1,7 @@
 #pragma once
 
+#include <chrono>
+
 #include "common/heap_optional.h"
 #include "object_runtime_state.h"
 
@@ -18,6 +20,11 @@ struct ObjectState {
     HeapOptional<ReplicationTask> replication_task;
     HeapOptional<OffloadingTask> offloading_task;
     HeapOptional<PromotionTask> promotion_task;
+    // The dynamic replica proposal admitted for this key and not yet started
+    // by its CopyStart, and how long the key waits before the next one. Owned
+    // by DynamicReplicationController; neither is work in flight.
+    HeapOptional<DynamicReplicaPending> dynamic_replication_pending;
+    std::chrono::steady_clock::time_point dynamic_replication_cooldown{};
 
     bool HasWorkInFlight() const {
         return is_processing || replication_task || offloading_task ||

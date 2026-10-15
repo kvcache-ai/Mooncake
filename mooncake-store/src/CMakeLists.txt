@@ -30,6 +30,7 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     config/s3_client_config.cpp
     segment_allocator_registration.cpp
     client_offboarding.cpp
+    dynamic_replication_controller.cpp
     master_service.cpp
     master_store_backend.cpp
     weight_store_manager.cpp
@@ -156,6 +157,7 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     device/hip_accelerator_device.cpp
     device/ascend_accelerator_device.cpp
     device/sunrise_accelerator_device.cpp
+    device/xpu_accelerator_device.cpp
     local_hot_cache.cpp
     store_c.cpp
     memory_alloc.cpp
@@ -568,6 +570,11 @@ if(USE_CUDA)
 elseif(USE_HIP)
   message(STATUS "mooncake_store: HIP enabled, enabling D2H staging")
   target_compile_definitions(mooncake_store_client_objects PRIVATE USE_HIP)
+elseif(USE_XPU)
+  # USE_XPU is a global compile definition (common.cmake) and -fsycl propagates
+  # from TENT's platform_xpu through transfer_engine, so the SYCL-based
+  # accelerator device needs no extra include dirs or link libraries here.
+  message(STATUS "mooncake_store: XPU enabled, enabling D2H staging")
 endif()
 if(USE_ASCEND
    OR USE_ASCEND_DIRECT

@@ -3990,7 +3990,10 @@ TEST(TcpWriteVisibilityTest,
     EXPECT_EQ(final_status, TransferStatusEnum::FAILED);
     expectEverySliceCompletedExactlyOnce(batch_id);
     EXPECT_EQ(session_dirty_terminal_count.load(std::memory_order_acquire), 1);
-    ASSERT_TRUE(h.engine->freeBatchID(batch_id).ok());
+    // The terminal io callback may still hold its BatchDesc pin; a deferred
+    // cleanup is a legal outcome here.
+    Status free_status = h.engine->freeBatchID(batch_id);
+    ASSERT_TRUE(free_status.ok() || free_status.IsBatchCleanupDeferred());
     fake_peer.release();
 }
 
@@ -4029,7 +4032,10 @@ TEST(TcpWriteVisibilityTest, WritePayloadNoProgressFailsWithinBoundedDeadline) {
     if (waitForTaskTerminal(h.engine.get(), batch_id,
                             std::chrono::seconds(5))) {
         expectEverySliceCompletedExactlyOnce(batch_id);
-        EXPECT_TRUE(h.engine->freeBatchID(batch_id).ok());
+        // The terminal io callback may still hold its BatchDesc pin; a
+        // deferred cleanup is a legal outcome here.
+        Status free_status = h.engine->freeBatchID(batch_id);
+        EXPECT_TRUE(free_status.ok() || free_status.IsBatchCleanupDeferred());
     } else {
         h.engine.reset();
         reclaimBatchDescAfterEngineShutdownForTest(batch_id);
@@ -4075,7 +4081,10 @@ TEST(TcpWriteVisibilityTest,
     if (waitForTaskTerminal(h.engine.get(), batch_id,
                             std::chrono::seconds(5))) {
         expectEverySliceCompletedExactlyOnce(batch_id);
-        EXPECT_TRUE(h.engine->freeBatchID(batch_id).ok());
+        // The terminal io callback may still hold its BatchDesc pin; a
+        // deferred cleanup is a legal outcome here.
+        Status free_status = h.engine->freeBatchID(batch_id);
+        EXPECT_TRUE(free_status.ok() || free_status.IsBatchCleanupDeferred());
     } else {
         h.engine.reset();
         reclaimBatchDescAfterEngineShutdownForTest(batch_id);
