@@ -2002,4 +2002,69 @@ TEST_F(FileStorageTest,
     RunBatchPutHealWipeScenario(data_path, true);
 }
 
+// A store whose LOCAL_DISK registration is new (here: re-mounted after the
+// master forgot it) drops the files it holds before it takes any task. The
+// master never registers a file the store already had, so such files could
+// only block a fresh offload of their keys.
+TEST_F(FileStorageTest, RemountAfterSegmentNotFoundDropsUnregisteredFiles) {
+    std::filesystem::path master_root =
+        std::filesystem::path(data_path) / "remount_wipe_master";
+    std::filesystem::create_directories(master_root);
+
+    testing::InProcMaster master;
+    auto master_config = InProcMasterConfigBuilder()
+                             .set_enable_offload(true)
+                             .set_root_fs_dir(master_root.string())
+                             .build();
+    ASSERT_TRUE(master.Start(master_config));
+
+    std::string local_rpc_addr =
+        "127.0.0.1:" + std::to_string(getFreeTcpPort());
+    auto client = Client::Create(local_rpc_addr, master.metadata_url(), "tcp",
+                                 std::nullopt, master.master_address());
+    ASSERT_TRUE(client.has_value());
+    ASSERT_TRUE(client.value()->MountLocalDiskSegment(true).has_value());
+
+    FileStorageConfig config = FileStorageConfig::FromEnvironment();
+    config.storage_backend_type = StorageBackendType::kFilePerKey;
+    config.storage_filepath = data_path + "/remount_wipe";
+    config.local_buffer_size = 4 * 1024 * 1024;
+    fs::create_directories(config.storage_filepath);
+    FileStorage file_storage(config, client.value(), local_rpc_addr);
+    ASSERT_TRUE(file_storage.storage_backend_->Init());
+    {
+        MutexLocker locker(&file_storage.offloading_mutex_);
+        file_storage.enable_offloading_ = true;
+    }
+
+    // A file the master does not know (e.g. left by a removed key).
+    const std::string key = "remount_wipe_key";
+    std::string bytes(512, 'o');
+    std::unordered_map<std::string, std::vector<Slice>> batch_object;
+    batch_object.emplace(key, std::vector<Slice>{Slice{bytes.data(), 512}});
+    ASSERT_TRUE(file_storage.storage_backend_
+                    ->BatchOffload(batch_object,
+                                   [](const std::vector<std::string>&,
+                                      std::vector<StorageObjectMetadata>&) {
+                                       return ErrorCode::OK;
+                                   })
+                    .has_value());
+    ASSERT_TRUE(file_storage.Exists(key).value_or(false));
+
+    // The master forgets the store's LOCAL_DISK segment.
+    ASSERT_TRUE(client.value()->UnmountLocalDiskSegment().has_value());
+
+    ASSERT_TRUE(FileStorageHeartbeat(file_storage).has_value());
+    auto exists = file_storage.Exists(key);
+    ASSERT_TRUE(exists.has_value());
+    EXPECT_FALSE(exists.value());
+    // The segment is registered again, and nothing was registered from the
+    // dropped file.
+    std::vector<OffloadTaskItem> items;
+    EXPECT_TRUE(client.value()->OffloadObjectHeartbeat(true, items));
+    auto query = client.value()->Query(key);
+    ASSERT_FALSE(query.has_value());
+    EXPECT_EQ(query.error(), ErrorCode::OBJECT_NOT_FOUND);
+}
+
 }  // namespace mooncake
