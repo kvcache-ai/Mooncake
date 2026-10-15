@@ -15,15 +15,17 @@ path.
 | --- | ---: | --- |
 | `MC_ADAPTIVE_CONGESTION_CONTROL_HIGH_PRESSURE_EPOCHS` | 2 | Consecutive high-pressure epochs required before shrinking the window. |
 | `MC_ADAPTIVE_CONGESTION_CONTROL_LOW_PRESSURE_EPOCHS` | 3 | Consecutive low-pressure epochs required before growing the window. |
-| `MC_ADAPTIVE_CONGESTION_CONTROL_HARD_ERROR_THRESHOLD` | 3 | Hard-error count required before quarantining the path. |
-| `MC_ADAPTIVE_CONGESTION_CONTROL_COOLDOWN_MS` | 30000 | Quarantine cooldown in milliseconds. |
-| `MC_ADAPTIVE_CONGESTION_CONTROL_PROBE_WINDOW_BYTES` | 65536 | Byte window used for recovery probes. |
 
-These five variables accept only positive decimal integers. Epoch counts and
-the hard-error threshold must fit in an unsigned 32-bit integer, and the
-cooldown must fit in an unsigned 64-bit integer after conversion to
-nanoseconds. An explicitly configured probe window must not exceed
-`MC_ADAPTIVE_CONGESTION_CONTROL_MIN_WINDOW_BYTES`. Invalid input makes the
+These variables accept only positive decimal integers. Epoch counts must fit
+in an unsigned 32-bit integer. Invalid input makes the
 shared loader return an invalid result with adaptive control disabled. An
 adapter consuming this loader must log the initialization error and preserve
 the original transfer behavior.
+
+Hard-error thresholds, cooldowns, and recovery probes belong to the existing
+transport health mechanisms, not the adaptive window controller. The draft's
+`MC_ADAPTIVE_CONGESTION_CONTROL_HARD_ERROR_THRESHOLD`,
+`MC_ADAPTIVE_CONGESTION_CONTROL_COOLDOWN_MS`, and
+`MC_ADAPTIVE_CONGESTION_CONTROL_PROBE_WINDOW_BYTES` settings have been removed.
+See [pressure and recovery](adaptive-rdma-control.md#pressure-and-recovery) for
+the ownership boundary and migration guidance.

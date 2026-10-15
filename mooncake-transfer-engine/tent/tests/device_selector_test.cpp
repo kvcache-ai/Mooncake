@@ -238,6 +238,56 @@ TEST(DeviceSelectorAvailabilityTest, AllDevicesUnavailable) {
     EXPECT_LT(sel->getAggregateEwmaBandwidth(), 0.0);
 }
 
+TEST(DeviceSelectorAvailabilityTest, RejectionEvidenceHonorsPolicyAndRecovery) {
+    for (bool smart : {false, true}) {
+        auto selector = makeTwoNicSelector();
+        selector->setSmartSelection(smart);
+        ASSERT_TRUE(selector->setDeviceAvailable(kDev0, false).ok());
+        ASSERT_TRUE(selector->setDeviceAvailable(kDev1, false).ok());
+        int selected = -1, unavailable = 42;
+        EXPECT_FALSE(
+            selector
+                ->allocate(kMiB, "cpu:0", selected, PRIO_HIGH, 0, &unavailable)
+                .ok());
+        EXPECT_EQ(unavailable, -1);
+        EXPECT_FALSE(selector
+                         ->allocate(kMiB, "cpu:0", selected, PRIO_HIGH,
+                                    1ULL << kDev0, &unavailable)
+                         .ok());
+        EXPECT_EQ(unavailable, kDev0);
+        ASSERT_TRUE(selector->setDeviceAvailable(kDev1, true).ok());
+        ASSERT_TRUE(selector
+                        ->allocate(kMiB, "cpu:0", selected, PRIO_HIGH, ~0ULL,
+                                   &unavailable)
+                        .ok());
+        EXPECT_EQ(selected, kDev1);
+        EXPECT_EQ(unavailable, -1);
+        ASSERT_TRUE(selector->release(selected, kMiB, 0.0).ok());
+    }
+}
+
+TEST(DeviceSelectorAvailabilityTest, NumaExclusionIsNotHealthEvidence) {
+    for (bool smart : {false, true}) {
+        auto topology = twoRdmaNics();
+        topology->nic_list_[kDev0].numa_node = 1;
+        topology->nic_list_[kDev1].numa_node = 1;
+        DeviceSelector selector;
+        ASSERT_TRUE(selector.loadTopology(topology).ok());
+        DeviceSelector::SchedulingParams params;
+        params.strict_local_numa = true;
+        selector.setSchedulingParams(params);
+        selector.setSmartSelection(smart);
+        ASSERT_TRUE(selector.setDeviceAvailable(kDev0, false).ok());
+        ASSERT_TRUE(selector.setDeviceAvailable(kDev1, false).ok());
+        int selected = -1, unavailable = 42;
+        EXPECT_FALSE(selector
+                         .allocate(kMiB, "cpu:0", selected, PRIO_HIGH, ~0ULL,
+                                   &unavailable)
+                         .ok());
+        EXPECT_EQ(unavailable, -1);
+    }
+}
+
 TEST(DeviceSelectorAvailabilityTest, PriorityFallbackKeepsUnavailableOut) {
     // Priority filtering can reject every candidate, after which
     // buildCandidates falls back to "all devices". That fallback must still

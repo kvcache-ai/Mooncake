@@ -19,6 +19,7 @@
 #include <condition_variable>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -28,6 +29,7 @@
 #include "rdma_context.h"
 #ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
 #include "adaptive_congestion_control.h"
+#include "task_congestion_status.h"
 #endif
 
 namespace mooncake {
@@ -53,14 +55,16 @@ class ClassicRdmaCongestionControl {
     void bindEndpoint(Transport::Slice *slice, RdmaEndPoint *endpoint);
     void retireEndpoint(const std::string &peer_nic_path,
                         RdmaEndPoint *endpoint);
-    size_t gate(SliceList &queued, SliceList &avoided);
+    size_t gate(SliceList &queued);
+    void observeUnavailable(
+        Transport::Slice *slice, const std::string &peer_nic_path,
+        TaskCongestionFailureScope scope,
+        std::optional<uint64_t> retry_after_ns = std::nullopt);
     void complete(Transport::Slice *slice, ibv_wc_status status,
                   uint32_t vendor_error = 0);
     void releaseUnposted(Transport::Slice *slice);
     void tick(uint64_t now_ns);
     void resetDevice();
-    void recordAsyncEvent(ibv_event_type event,
-                          const std::string *peer_nic_path = nullptr);
 
    private:
     struct RouteState;
@@ -136,9 +140,17 @@ class WorkerPool {
         uint64_t last_error_ns = 0;   // Timestamp (ns) of the last error
     };
 
+    struct RailHealthSnapshot {
+        bool paused = false;
+        uint64_t retry_after_ns = 0;
+        int error_count = 0;
+    };
+
     void markRailFailed(const std::string &peer_nic_path,
                         bool immediate_pause = false);
-    bool isRailAvailable(const std::string &peer_nic_path);
+    // Optionally copy health evidence while the existing gate expires pauses.
+    bool isRailAvailable(const std::string &peer_nic_path,
+                         RailHealthSnapshot *health = nullptr);
 
     // Retry helper: increment retry count and return whether retry is allowed
     static bool shouldRetrySlice(Transport::Slice *slice);

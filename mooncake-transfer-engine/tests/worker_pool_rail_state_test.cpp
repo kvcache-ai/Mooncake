@@ -26,9 +26,11 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 
 #include <glog/logging.h>
@@ -37,6 +39,9 @@
 #include "transport/rdma_transport/rdma_context.h"
 #include "transport/rdma_transport/rdma_transport.h"
 #include "transport/rdma_transport/worker_pool.h"
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+#include "task_congestion_observation.h"
+#endif
 
 #if defined(__has_feature)
 #define MC_HAS_FEATURE(x) __has_feature(x)
@@ -87,6 +92,18 @@ class WorkerPoolTestPeer {
 
     static bool isRailAvailable(WorkerPool &pool, const std::string &path) {
         return pool.isRailAvailable(path);
+    }
+
+    static auto railHealth(WorkerPool &pool, const std::string &path) {
+        WorkerPool::RailHealthSnapshot health;
+        pool.isRailAvailable(path, &health);
+        return health;
+    }
+
+    static void postQueuedSlice(WorkerPool &pool, const std::string &path,
+                                Transport::Slice *slice) {
+        pool.collective_slice_queue_[0][path].push_back(slice);
+        pool.performPostSend(0);
     }
 
     // Moves the recorded error timestamp back so the decay window can be
@@ -233,6 +250,100 @@ TEST_F(WorkerPoolRailStateTest, UnknownRailIsAvailable) {
     EXPECT_TRUE(railAvailable(kPeerA));
     EXPECT_EQ(WorkerPoolTestPeer::pausedRailCount(*worker_pool_), 0);
 }
+
+TEST_F(WorkerPoolRailStateTest, HealthSnapshotUsesExistingPauseAndExpiry) {
+    failRail(kPeerA, true);
+    const auto health = WorkerPoolTestPeer::railHealth(*worker_pool_, kPeerA);
+    EXPECT_TRUE(health.paused);
+    EXPECT_GT(health.retry_after_ns, 0u);
+    EXPECT_EQ(health.error_count, WorkerPoolTestPeer::errorThreshold());
+    EXPECT_EQ(WorkerPoolTestPeer::pausedRailCount(*worker_pool_), 1);
+    WorkerPoolTestPeer::expirePause(*worker_pool_, kPeerA);
+    const auto recovered =
+        WorkerPoolTestPeer::railHealth(*worker_pool_, kPeerA);
+    EXPECT_FALSE(recovered.paused);
+    EXPECT_EQ(recovered.retry_after_ns, 0u);
+    EXPECT_EQ(recovered.error_count, 0);
+    EXPECT_EQ(WorkerPoolTestPeer::pausedRailCount(*worker_pool_), 0);
+}
+
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+class WorkerPoolCongestionHealthTest : public WorkerPoolRailStateTest {
+   protected:
+    void SetUp() override {
+        const char *previous =
+            std::getenv("MC_ADAPTIVE_CONGESTION_CONTROL_MODE");
+        const std::optional<std::string> saved =
+            previous ? std::optional<std::string>(previous) : std::nullopt;
+        setenv("MC_ADAPTIVE_CONGESTION_CONTROL_MODE", mode(), 1);
+        WorkerPoolRailStateTest::SetUp();
+        if (saved)
+            setenv("MC_ADAPTIVE_CONGESTION_CONTROL_MODE", saved->c_str(), 1);
+        else
+            unsetenv("MC_ADAPTIVE_CONGESTION_CONTROL_MODE");
+    }
+    virtual const char *mode() { return "enforce"; }
+};
+
+TEST_F(WorkerPoolCongestionHealthTest, PostingPausedRailPublishesLegacyHealth) {
+    WorkerPoolTestPeer::setContextActive(*worker_pool_, true);
+    failRail(kPeerA, true);
+    Transport::TransferTask task;
+    task.slice_count = 1;
+    Transport::Slice slice{};
+    slice.task = &task;
+    slice.length = 64;
+    slice.rdma.max_retry_cnt = 0;
+    WorkerPoolTestPeer::postQueuedSlice(*worker_pool_, kPeerA, &slice);
+    ASSERT_NE(task.congestion_observation, nullptr);
+    const auto detail = task.congestion_observation->detail();
+    EXPECT_EQ(detail.state, TaskCongestionState::kLongUnavailable);
+    EXPECT_EQ(detail.reason.value, TaskCongestionReason::kPathQuarantined);
+    EXPECT_EQ(detail.failure_scope.value, TaskCongestionFailureScope::kRoute);
+    EXPECT_EQ(detail.affected_path.value, kPeerA);
+    ASSERT_TRUE(detail.retry_after_ns.observed);
+    EXPECT_GT(detail.retry_after_ns.value, 0u);
+    EXPECT_EQ(WorkerPoolTestPeer::pausedRailCount(*worker_pool_), 1);
+}
+
+TEST_F(WorkerPoolCongestionHealthTest, InactiveContextPublishesDeviceHealth) {
+    WorkerPoolTestPeer::setContextActive(*worker_pool_, false);
+    Transport::TransferTask task;
+    task.slice_count = 1;
+    Transport::Slice slice{};
+    slice.task = &task;
+    slice.length = 64;
+    slice.rdma.max_retry_cnt = 0;
+    WorkerPoolTestPeer::postQueuedSlice(*worker_pool_, kPeerA, &slice);
+    ASSERT_NE(task.congestion_observation, nullptr);
+    const auto detail = task.congestion_observation->detail();
+    EXPECT_EQ(detail.state, TaskCongestionState::kLongUnavailable);
+    EXPECT_EQ(detail.failure_scope.value, TaskCongestionFailureScope::kDevice);
+    EXPECT_FALSE(detail.retry_after_ns.observed);
+    EXPECT_FALSE(WorkerPoolTestPeer::contextActive(*worker_pool_));
+}
+
+class WorkerPoolCongestionOffHealthTest
+    : public WorkerPoolCongestionHealthTest {
+   protected:
+    const char *mode() override { return "off"; }
+};
+
+TEST_F(WorkerPoolCongestionOffHealthTest,
+       PostingPausedRailAllocatesNoObservation) {
+    WorkerPoolTestPeer::setContextActive(*worker_pool_, true);
+    failRail(kPeerA, true);
+    Transport::TransferTask task;
+    task.slice_count = 1;
+    Transport::Slice slice{};
+    slice.task = &task;
+    slice.length = 64;
+    slice.rdma.max_retry_cnt = 0;
+    WorkerPoolTestPeer::postQueuedSlice(*worker_pool_, kPeerA, &slice);
+    EXPECT_EQ(task.congestion_observation, nullptr);
+    EXPECT_EQ(slice.status, Transport::Slice::FAILED);
+}
+#endif
 
 TEST_F(WorkerPoolRailStateTest, FailuresBelowThresholdDoNotPauseCount) {
     for (int i = 0; i < WorkerPoolTestPeer::errorThreshold() - 1; ++i)

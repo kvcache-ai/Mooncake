@@ -135,43 +135,6 @@ TEST(TentAdaptiveCongestionControlTest,
         adaptive_congestion_control::FailureScope::kOperation));
 }
 
-TEST(TentAdaptiveCongestionControlTest, QuarantineAvoidsCurrentSliceOnly) {
-    auto config = testConfig();
-    config.hard_error_threshold = 1;
-    adaptive_congestion_control::DomainState device(config, 3);
-    TentRdmaCongestionControlRoute route(config);
-    adaptive_congestion_control::Signals failure;
-    failure.fatal_failures = 1;
-    adaptive_congestion_control::recordSignals(route.domain, 1, failure);
-    adaptive_congestion_control::controlTick(route.domain, 1);
-    ASSERT_EQ(adaptive_congestion_control::snapshot(route.domain).state,
-              adaptive_congestion_control::PathState::kQuarantined);
-
-    auto observation = std::make_shared<
-        adaptive_congestion_control::TaskCongestionObservation>(2, 1);
-    RdmaTask task{};
-    task.congestion_observation = observation;
-    task.congestion_attempt_id = 1;
-    RdmaSlice slice{};
-    slice.task = &task;
-    slice.slice_idx = 1;
-    slice.length = 128;
-    adaptive_congestion_control::PathHandle path{&device, &route.domain, 3, 1};
-    EXPECT_EQ(acquireTentCongestionControlAttempt(slice, &route, path,
-                                                  slice.length, 7),
-              adaptive_congestion_control::Decision::kAvoid);
-    EXPECT_EQ(observation->state(), TaskCongestionState::kLongUnavailable);
-    auto detail = observation->detail();
-    ASSERT_TRUE(detail.reason.observed);
-    EXPECT_EQ(detail.reason.value, TaskCongestionReason::kPathQuarantined);
-    EXPECT_EQ(detail.slice_id.value, 1);
-
-    ASSERT_TRUE(observation->beginAttempt(2, 2));
-    EXPECT_EQ(observation->state(), TaskCongestionState::kNormal);
-    EXPECT_FALSE(observation->avoid(1, 1, {}));
-    EXPECT_EQ(observation->state(), TaskCongestionState::kNormal);
-}
-
 TEST(TentAdaptiveCongestionControlTest, OldEndpointFailureIsIgnored) {
     adaptive_congestion_control::DomainState device(testConfig(), 3);
     auto route = std::make_shared<TentRdmaCongestionControlRoute>(testConfig());
@@ -267,9 +230,8 @@ TEST(TentAdaptiveCongestionControlTest,
 }
 
 TEST(TentAdaptiveCongestionControlTest,
-     CurrentEndpointFailureQuarantinesRoute) {
+     CurrentEndpointFailureLeavesHealthToRailMonitor) {
     auto config = testConfig();
-    config.hard_error_threshold = 1;
     adaptive_congestion_control::DomainState device(config, 3);
     auto route = std::make_shared<TentRdmaCongestionControlRoute>(config);
     RdmaSlice slice;
@@ -284,22 +246,16 @@ TEST(TentAdaptiveCongestionControlTest,
     adaptive_congestion_control::controlTick(route->domain, 1);
 
     EXPECT_EQ(adaptive_congestion_control::snapshot(route->domain).state,
-              adaptive_congestion_control::PathState::kQuarantined);
+              adaptive_congestion_control::PathState::kHealthy);
 }
 
-TEST(TentAdaptiveCongestionControlTest, LargeSliceCanMakeProgressDuringProbe) {
+TEST(TentAdaptiveCongestionControlTest,
+     LargeSliceCanMakeProgressWithSmallWindow) {
     adaptive_congestion_control::Config config;
     config.mode = adaptive_congestion_control::Mode::kEnforce;
-    config.cooldown_ns = 1;
+    config.min_window_bytes = config.max_window_bytes = 1024;
     adaptive_congestion_control::DomainState device(config);
     TentRdmaCongestionControlRoute route(config);
-    adaptive_congestion_control::Signals failure;
-    failure.fatal_failures = 1;
-    adaptive_congestion_control::recordSignals(route.domain, 1, failure);
-    adaptive_congestion_control::controlTick(route.domain, 1);
-    adaptive_congestion_control::controlTick(route.domain, 2);
-    ASSERT_EQ(adaptive_congestion_control::snapshot(route.domain).state,
-              adaptive_congestion_control::PathState::kProbing);
     RdmaSlice first, second;
     // A default 4 MiB write is capped at 32 slices of 128 KiB each.
     first.length = second.length = 128ULL << 10;

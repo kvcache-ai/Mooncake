@@ -32,11 +32,9 @@ TEST(ClassicRdmaCongestionControlTest, RuntimeOffLeavesQueueUnchanged) {
     Transport::Slice slice{};
     slice.length = 64;
     std::vector<Transport::Slice *> queued{&slice};
-    std::vector<Transport::Slice *> avoided;
 
-    EXPECT_EQ(adapter.gate(queued, avoided), 1u);
+    EXPECT_EQ(adapter.gate(queued), 1u);
 
-    EXPECT_TRUE(avoided.empty());
     EXPECT_EQ(queued, std::vector<Transport::Slice *>({&slice}));
 }
 
@@ -62,11 +60,10 @@ TEST(ClassicRdmaCongestionControlTest,
     first.length = 64;
     std::vector<Transport::Slice *> first_queue{&first};
     std::vector<Transport::Slice *> target_queue{deferred};
-    std::vector<Transport::Slice *> avoided;
     adapter.prepare(&first, "peer@nic");
     adapter.prepare(deferred, "peer@nic");
-    ASSERT_EQ(adapter.gate(first_queue, avoided), 1u);
-    ASSERT_EQ(adapter.gate(target_queue, avoided), 0u);
+    ASSERT_EQ(adapter.gate(first_queue), 1u);
+    ASSERT_EQ(adapter.gate(target_queue), 0u);
     EXPECT_TRUE(deferred->rdma_congestion_control_observed_blocked.load());
 
     TaskCongestionState state = TaskCongestionState::kUnknown;
@@ -76,6 +73,9 @@ TEST(ClassicRdmaCongestionControlTest,
     ASSERT_TRUE(transports.getTaskCongestionDetail(batch_id, 0, detail).ok());
     EXPECT_TRUE(detail.reason.observed);
     EXPECT_EQ(detail.reason.value, TaskCongestionReason::kByteWindow);
+    // Both route and device windows are full; admission checks device first.
+    ASSERT_TRUE(detail.failure_scope.observed);
+    EXPECT_EQ(detail.failure_scope.value, TaskCongestionFailureScope::kDevice);
 
     adapter.releaseUnposted(&first);
     task.is_finished = true;
@@ -101,8 +101,8 @@ TEST(ClassicRdmaCongestionControlTest,
     auto *endpoint = reinterpret_cast<RdmaEndPoint *>(uintptr_t{1});
     adapter.prepare(slice, "peer@nic");
     adapter.bindEndpoint(slice, endpoint);
-    std::vector<Transport::Slice *> queued{slice}, avoided;
-    ASSERT_EQ(adapter.gate(queued, avoided), 1u);
+    std::vector<Transport::Slice *> queued{slice};
+    ASSERT_EQ(adapter.gate(queued), 1u);
     EXPECT_FALSE(slice->rdma_congestion_control_observed_blocked.load());
     adapter.complete(slice, IBV_WC_RNR_RETRY_EXC_ERR);
     EXPECT_TRUE(slice->rdma_congestion_control_observed_blocked.load());
@@ -139,8 +139,8 @@ TEST(ClassicRdmaCongestionControlTest,
     auto *endpoint = reinterpret_cast<RdmaEndPoint *>(uintptr_t{1});
     adapter.prepare(slice, "peer@nic");
     adapter.bindEndpoint(slice, endpoint);
-    std::vector<Transport::Slice *> queued{slice}, avoided;
-    ASSERT_EQ(adapter.gate(queued, avoided), 1u);
+    std::vector<Transport::Slice *> queued{slice};
+    ASSERT_EQ(adapter.gate(queued), 1u);
     adapter.complete(slice, IBV_WC_RETRY_EXC_ERR);
 
     TaskCongestionDetail detail;
@@ -180,11 +180,9 @@ TEST(ClassicRdmaCongestionControlTest,
 }
 
 TEST(ClassicRdmaCongestionControlTest,
-     QuarantineAvoidResolvesAfterProbeAdmission) {
+     LegacyUnavailableResolvesAfterAdmission) {
     adaptive_congestion_control::Config config;
     config.mode = adaptive_congestion_control::Mode::kEnforce;
-    config.hard_error_threshold = 1;
-    config.cooldown_ns = 1;
     ClassicRdmaCongestionControl adapter(config);
     std::string local_name = "local";
     MultiTransport transports(nullptr, local_name);
@@ -200,10 +198,9 @@ TEST(ClassicRdmaCongestionControlTest,
     task.slice_count = 1;
     const std::string path = "peer@nic";
     adapter.prepare(slice, path);
-    adapter.recordAsyncEvent(IBV_EVENT_QP_FATAL, &path);
-    adapter.tick(1);
-    std::vector<Transport::Slice *> queued{slice}, avoided;
-    ASSERT_EQ(adapter.gate(queued, avoided), 0u);
+    adapter.observeUnavailable(slice, path, TaskCongestionFailureScope::kRoute,
+                               1000);
+    std::vector<Transport::Slice *> queued{slice};
     EXPECT_TRUE(slice->rdma_congestion_control_observed_blocked.load());
 
     TaskCongestionDetail detail;
@@ -217,8 +214,7 @@ TEST(ClassicRdmaCongestionControlTest,
 
     adapter.tick(2);
     queued = {slice};
-    avoided.clear();
-    ASSERT_EQ(adapter.gate(queued, avoided), 1u);
+    ASSERT_EQ(adapter.gate(queued), 1u);
     EXPECT_FALSE(slice->rdma_congestion_control_observed_blocked.load());
     ASSERT_TRUE(transports.getTaskCongestionDetail(batch_id, 0, detail).ok());
     EXPECT_EQ(detail.state, TaskCongestionState::kNormal);
@@ -234,8 +230,6 @@ TEST(ClassicRdmaCongestionControlTest,
     config.mode = adaptive_congestion_control::Mode::kEnforce;
     config.min_window_bytes = 64;
     config.max_window_bytes = 64;
-    config.hard_error_threshold = 1;
-    config.cooldown_ns = 1;
     ClassicRdmaCongestionControl adapter(config);
     std::string local_name = "local";
     MultiTransport transports(nullptr, local_name);
@@ -261,13 +255,11 @@ TEST(ClassicRdmaCongestionControlTest,
     adapter.prepare(deferred, "peer-a@nic");
     adapter.prepare(unavailable, "peer-b@nic");
     const std::string unavailable_path = "peer-b@nic";
-    adapter.recordAsyncEvent(IBV_EVENT_QP_FATAL, &unavailable_path);
-    adapter.tick(1);
-    std::vector<Transport::Slice *> first_queue{&first},
-        queued{deferred, unavailable};
-    std::vector<Transport::Slice *> avoided;
-    ASSERT_EQ(adapter.gate(first_queue, avoided), 1u);
-    ASSERT_EQ(adapter.gate(queued, avoided), 0u);
+    adapter.observeUnavailable(unavailable, unavailable_path,
+                               TaskCongestionFailureScope::kRoute, 1000);
+    std::vector<Transport::Slice *> first_queue{&first}, queued{deferred};
+    ASSERT_EQ(adapter.gate(first_queue), 1u);
+    ASSERT_EQ(adapter.gate(queued), 0u);
 
     TaskCongestionDetail detail;
     ASSERT_TRUE(transports.getTaskCongestionDetail(batch_id, 0, detail).ok());
@@ -277,14 +269,13 @@ TEST(ClassicRdmaCongestionControlTest,
     adapter.tick(2);
     adapter.releaseUnposted(&first);
     queued = {unavailable};
-    avoided.clear();
-    ASSERT_EQ(adapter.gate(queued, avoided), 1u);
+    ASSERT_EQ(adapter.gate(queued), 1u);
     ASSERT_TRUE(transports.getTaskCongestionDetail(batch_id, 0, detail).ok());
     EXPECT_EQ(detail.state, TaskCongestionState::kCongested);
     EXPECT_EQ(detail.slice_id.value, 0u);
     adapter.releaseUnposted(unavailable);
     queued = {deferred};
-    ASSERT_EQ(adapter.gate(queued, avoided), 1u);
+    ASSERT_EQ(adapter.gate(queued), 1u);
     ASSERT_TRUE(transports.getTaskCongestionDetail(batch_id, 0, detail).ok());
     EXPECT_EQ(detail.state, TaskCongestionState::kNormal);
     adapter.releaseUnposted(deferred);
@@ -312,8 +303,8 @@ TEST(ClassicRdmaCongestionControlTest,
     auto *endpoint = reinterpret_cast<RdmaEndPoint *>(uintptr_t{1});
     adapter.prepare(slice, "peer@nic");
     adapter.bindEndpoint(slice, endpoint);
-    std::vector<Transport::Slice *> queued{slice}, avoided;
-    ASSERT_EQ(adapter.gate(queued, avoided), 1u);
+    std::vector<Transport::Slice *> queued{slice};
+    ASSERT_EQ(adapter.gate(queued), 1u);
     adapter.resetDevice();
     adapter.complete(slice, IBV_WC_RNR_RETRY_EXC_ERR);
 
@@ -329,7 +320,6 @@ TEST(ClassicRdmaCongestionControlTest,
      LocalWorkerFailoverResolvesOldUnavailablePath) {
     adaptive_congestion_control::Config config;
     config.mode = adaptive_congestion_control::Mode::kEnforce;
-    config.hard_error_threshold = 1;
     ClassicRdmaCongestionControl failed_adapter(config),
         healthy_adapter(config);
     std::string local_name = "local";
@@ -346,10 +336,9 @@ TEST(ClassicRdmaCongestionControlTest,
     task.slice_count = 1;
     const std::string path = "peer@nic";
     failed_adapter.prepare(slice, path);
-    failed_adapter.recordAsyncEvent(IBV_EVENT_QP_FATAL, &path);
-    failed_adapter.tick(1);
-    std::vector<Transport::Slice *> queued{slice}, avoided;
-    ASSERT_EQ(failed_adapter.gate(queued, avoided), 0u);
+    failed_adapter.observeUnavailable(slice, path,
+                                      TaskCongestionFailureScope::kDevice);
+    std::vector<Transport::Slice *> queued{slice};
     TaskCongestionState state;
     ASSERT_TRUE(transports.getTaskCongestionState(batch_id, 0, state).ok());
     ASSERT_EQ(state, TaskCongestionState::kLongUnavailable);
@@ -359,8 +348,7 @@ TEST(ClassicRdmaCongestionControlTest,
     ASSERT_TRUE(transports.getTaskCongestionDetail(batch_id, 0, detail).ok());
     EXPECT_EQ(detail.state, TaskCongestionState::kLongUnavailable);
     queued = {slice};
-    avoided.clear();
-    EXPECT_EQ(healthy_adapter.gate(queued, avoided), 1u);
+    EXPECT_EQ(healthy_adapter.gate(queued), 1u);
     ASSERT_TRUE(transports.getTaskCongestionDetail(batch_id, 0, detail).ok());
     EXPECT_EQ(detail.state, TaskCongestionState::kNormal);
     EXPECT_TRUE(detail.resolved);
@@ -370,10 +358,9 @@ TEST(ClassicRdmaCongestionControlTest,
 }
 
 TEST(ClassicRdmaCongestionControlTest,
-     QuarantinedReplacementDoesNotClearUnavailableTask) {
+     UnavailableReplacementDoesNotClearUnavailableTask) {
     adaptive_congestion_control::Config config;
     config.mode = adaptive_congestion_control::Mode::kEnforce;
-    config.hard_error_threshold = 1;
     ClassicRdmaCongestionControl first_adapter(config),
         replacement_adapter(config);
     std::string local_name = "local";
@@ -390,25 +377,24 @@ TEST(ClassicRdmaCongestionControlTest,
     task.slice_count = 1;
     const std::string path = "peer@nic";
     first_adapter.prepare(slice, path);
-    first_adapter.recordAsyncEvent(IBV_EVENT_QP_FATAL, &path);
-    first_adapter.tick(1);
-    std::vector<Transport::Slice *> queued{slice}, avoided;
-    ASSERT_EQ(first_adapter.gate(queued, avoided), 0u);
+    first_adapter.observeUnavailable(slice, path,
+                                     TaskCongestionFailureScope::kRoute);
+    std::vector<Transport::Slice *> queued{slice};
     TaskCongestionState state;
     ASSERT_TRUE(transports.getTaskCongestionState(batch_id, 0, state).ok());
     ASSERT_EQ(state, TaskCongestionState::kLongUnavailable);
 
     Transport::Slice seed{};
     replacement_adapter.prepare(&seed, path);
-    replacement_adapter.recordAsyncEvent(IBV_EVENT_QP_FATAL, &path);
-    replacement_adapter.tick(1);
+    replacement_adapter.observeUnavailable(slice, path,
+                                           TaskCongestionFailureScope::kRoute);
     replacement_adapter.prepare(slice, path);
     ASSERT_TRUE(transports.getTaskCongestionState(batch_id, 0, state).ok());
     EXPECT_EQ(state, TaskCongestionState::kLongUnavailable);
 
     queued = {slice};
-    avoided.clear();
-    EXPECT_EQ(replacement_adapter.gate(queued, avoided), 0u);
+    replacement_adapter.observeUnavailable(slice, path,
+                                           TaskCongestionFailureScope::kRoute);
     ASSERT_TRUE(transports.getTaskCongestionState(batch_id, 0, state).ok());
     EXPECT_EQ(state, TaskCongestionState::kLongUnavailable);
     task.is_finished = true;
@@ -436,8 +422,8 @@ TEST(ClassicRdmaCongestionControlTest,
     first.length = 64;
     adapter.prepare(&first, "peer@nic");
     adapter.prepare(deferred, "peer@nic");
-    std::vector<Transport::Slice *> first_queue{&first}, avoided;
-    ASSERT_EQ(adapter.gate(first_queue, avoided), 1u);
+    std::vector<Transport::Slice *> first_queue{&first};
+    ASSERT_EQ(adapter.gate(first_queue), 1u);
 
     std::atomic<bool> writing{false};
     std::atomic<bool> done{false};
@@ -456,7 +442,7 @@ TEST(ClassicRdmaCongestionControlTest,
     while (!writing.load(std::memory_order_acquire)) std::this_thread::yield();
     std::vector<Transport::Slice *> deferred_queue{deferred};
     do {
-        adapter.gate(deferred_queue, avoided);
+        adapter.gate(deferred_queue);
     } while (!done.load(std::memory_order_acquire));
     writer.join();
     TaskCongestionState state;
@@ -479,15 +465,13 @@ TEST(ClassicRdmaCongestionControlTest, DeferredSliceStaysOnOwnerPathQueue) {
     deferred.length = 64;
     std::vector<Transport::Slice *> first_queue{&first};
     std::vector<Transport::Slice *> second_queue{&deferred};
-    std::vector<Transport::Slice *> avoided;
 
     adapter.prepare(&first, "peer@nic");
     adapter.prepare(&deferred, "peer@nic");
-    const size_t first_admitted = adapter.gate(first_queue, avoided);
+    const size_t first_admitted = adapter.gate(first_queue);
 
     ASSERT_EQ(first_admitted, 1u);
-    adapter.gate(second_queue, avoided);
-    EXPECT_TRUE(avoided.empty());
+    adapter.gate(second_queue);
     ASSERT_EQ(second_queue.size(), 1u);
     EXPECT_EQ(second_queue.front(), &deferred);
 }
@@ -503,13 +487,11 @@ TEST(ClassicRdmaCongestionControlTest, BatchPrepareSharesOneRouteWindow) {
     Transport::Slice second{};
     second.length = 64;
     std::vector<Transport::Slice *> queued{&first, &second};
-    std::vector<Transport::Slice *> avoided;
 
     adapter.prepare(queued, "peer@nic");
 
-    EXPECT_EQ(adapter.gate(queued, avoided), 1u);
+    EXPECT_EQ(adapter.gate(queued), 1u);
     EXPECT_EQ(queued.size(), 2u);
-    EXPECT_TRUE(avoided.empty());
 }
 
 TEST(ClassicRdmaCongestionControlTest, CompletionLetsRetryReacquire) {
@@ -521,19 +503,17 @@ TEST(ClassicRdmaCongestionControlTest, CompletionLetsRetryReacquire) {
     Transport::Slice slice{};
     slice.length = 64;
     std::vector<Transport::Slice *> queued{&slice};
-    std::vector<Transport::Slice *> avoided;
     adapter.prepare(&slice, "peer@nic");
-    ASSERT_EQ(adapter.gate(queued, avoided), 1u);
+    ASSERT_EQ(adapter.gate(queued), 1u);
 
     adapter.complete(&slice, IBV_WC_RETRY_EXC_ERR);
     queued = {&slice};
-    EXPECT_EQ(adapter.gate(queued, avoided), 1u);
+    EXPECT_EQ(adapter.gate(queued), 1u);
 }
 
 TEST(ClassicRdmaCongestionControlTest, LocalHandoffRebindsRouteOwner) {
     adaptive_congestion_control::Config config;
     config.mode = adaptive_congestion_control::Mode::kEnforce;
-    config.hard_error_threshold = 1;
     const std::string path = "peer@nic";
     for (bool batch : {false, true}) {
         ClassicRdmaCongestionControl failed_adapter(config),
@@ -541,27 +521,24 @@ TEST(ClassicRdmaCongestionControlTest, LocalHandoffRebindsRouteOwner) {
         Transport::Slice slice{};
         slice.length = 64;
         failed_adapter.prepare(&slice, path);
-        failed_adapter.recordAsyncEvent(IBV_EVENT_QP_FATAL, &path);
-        failed_adapter.tick(1);
-        std::vector<Transport::Slice *> queued{&slice}, avoided;
+        std::vector<Transport::Slice *> queued{&slice};
         // Local failover retains the remote NIC path on the same slice.
         if (batch) {
             healthy_adapter.prepare(queued, path);
         } else {
             healthy_adapter.prepare(&slice, path);
         }
-        EXPECT_EQ(healthy_adapter.gate(queued, avoided), 1u);
-        EXPECT_TRUE(avoided.empty());
+        EXPECT_EQ(healthy_adapter.gate(queued), 1u);
         healthy_adapter.releaseUnposted(&slice);
     }
 }
 
-TEST(ClassicRdmaCongestionControlTest, CurrentEndpointFailureAvoidsRoute) {
+TEST(ClassicRdmaCongestionControlTest,
+     CurrentEndpointFailureDoesNotCreateAnotherHealthGate) {
     adaptive_congestion_control::Config config;
     config.mode = adaptive_congestion_control::Mode::kEnforce;
     config.min_window_bytes = 64;
     config.max_window_bytes = 64;
-    config.hard_error_threshold = 1;
     ClassicRdmaCongestionControl adapter(config);
     Transport::Slice failed{};
     failed.length = 64;
@@ -569,19 +546,17 @@ TEST(ClassicRdmaCongestionControlTest, CurrentEndpointFailureAvoidsRoute) {
     next.length = 64;
     auto *endpoint = reinterpret_cast<RdmaEndPoint *>(uintptr_t{1});
     std::vector<Transport::Slice *> queued{&failed};
-    std::vector<Transport::Slice *> avoided;
 
     adapter.prepare(&failed, "peer@nic");
     adapter.bindEndpoint(&failed, endpoint);
-    ASSERT_EQ(adapter.gate(queued, avoided), 1u);
+    ASSERT_EQ(adapter.gate(queued), 1u);
     adapter.complete(&failed, IBV_WC_FATAL_ERR);
     adapter.tick(1);
 
     adapter.prepare(&next, "peer@nic");
     queued = {&next};
-    EXPECT_EQ(adapter.gate(queued, avoided), 0u);
-    ASSERT_EQ(avoided.size(), 1u);
-    EXPECT_EQ(avoided.front(), &next);
+    EXPECT_EQ(adapter.gate(queued), 1u);
+    adapter.releaseUnposted(&next);
 }
 
 TEST(ClassicRdmaCongestionControlTest, StaleEndpointFailureIsIgnored) {
@@ -589,7 +564,6 @@ TEST(ClassicRdmaCongestionControlTest, StaleEndpointFailureIsIgnored) {
     config.mode = adaptive_congestion_control::Mode::kEnforce;
     config.min_window_bytes = 64;
     config.max_window_bytes = 64;
-    config.hard_error_threshold = 1;
     ClassicRdmaCongestionControl adapter(config);
     Transport::Slice stale{};
     stale.length = 64;
@@ -598,19 +572,17 @@ TEST(ClassicRdmaCongestionControlTest, StaleEndpointFailureIsIgnored) {
     auto *old_endpoint = reinterpret_cast<RdmaEndPoint *>(uintptr_t{1});
     auto *new_endpoint = reinterpret_cast<RdmaEndPoint *>(uintptr_t{2});
     std::vector<Transport::Slice *> queued{&stale};
-    std::vector<Transport::Slice *> avoided;
 
     adapter.prepare(&stale, "peer@nic");
     adapter.bindEndpoint(&stale, old_endpoint);
-    ASSERT_EQ(adapter.gate(queued, avoided), 1u);
+    ASSERT_EQ(adapter.gate(queued), 1u);
     adapter.bindEndpoint(&stale, new_endpoint);
     adapter.complete(&stale, IBV_WC_FATAL_ERR);
     adapter.tick(1);
 
     adapter.prepare(&next, "peer@nic");
     queued = {&next};
-    EXPECT_EQ(adapter.gate(queued, avoided), 1u);
-    EXPECT_TRUE(avoided.empty());
+    EXPECT_EQ(adapter.gate(queued), 1u);
 }
 
 TEST(ClassicRdmaCongestionControlTest,
@@ -619,7 +591,6 @@ TEST(ClassicRdmaCongestionControlTest,
     config.mode = adaptive_congestion_control::Mode::kEnforce;
     config.min_window_bytes = 64;
     config.max_window_bytes = 64;
-    config.hard_error_threshold = 1;
     ClassicRdmaCongestionControl adapter(config);
     Transport::Slice stale{};
     stale.length = 64;
@@ -629,11 +600,10 @@ TEST(ClassicRdmaCongestionControlTest,
     next.length = 64;
     auto *reused_endpoint = reinterpret_cast<RdmaEndPoint *>(uintptr_t{1});
     std::vector<Transport::Slice *> queued{&stale};
-    std::vector<Transport::Slice *> avoided;
 
     adapter.prepare(&stale, "peer@nic");
     adapter.bindEndpoint(&stale, reused_endpoint);
-    ASSERT_EQ(adapter.gate(queued, avoided), 1u);
+    ASSERT_EQ(adapter.gate(queued), 1u);
     adapter.retireEndpoint("peer@nic", reused_endpoint);
     adapter.prepare(&replacement, "peer@nic");
     adapter.bindEndpoint(&replacement, reused_endpoint);
@@ -643,72 +613,7 @@ TEST(ClassicRdmaCongestionControlTest,
 
     adapter.prepare(&next, "peer@nic");
     queued = {&next};
-    EXPECT_EQ(adapter.gate(queued, avoided), 1u);
-    EXPECT_TRUE(avoided.empty());
-}
-
-TEST(ClassicRdmaCongestionControlTest, QpEventAccumulatesOnItsRoute) {
-    adaptive_congestion_control::Config config;
-    config.mode = adaptive_congestion_control::Mode::kEnforce;
-    config.hard_error_threshold = 1;
-    ClassicRdmaCongestionControl adapter(config);
-    Transport::Slice slice{};
-    slice.length = 64;
-    std::vector<Transport::Slice *> queued{&slice};
-    std::vector<Transport::Slice *> avoided;
-    const std::string peer_path = "peer@nic";
-
-    adapter.prepare(&slice, peer_path);
-    adapter.recordAsyncEvent(IBV_EVENT_QP_FATAL, &peer_path);
-    adapter.tick(1);
-
-    EXPECT_EQ(adapter.gate(queued, avoided), 0u);
-    ASSERT_EQ(avoided.size(), 1u);
-    EXPECT_EQ(avoided.front(), &slice);
-}
-
-TEST(ClassicRdmaCongestionControlTest, LargeSliceRecoversAfterQuarantine) {
-    adaptive_congestion_control::Config config;
-    config.mode = adaptive_congestion_control::Mode::kEnforce;
-    config.hard_error_threshold = 1;
-    config.cooldown_ns = 1;
-    ClassicRdmaCongestionControl adapter(config);
-    Transport::Slice slice{};
-    slice.length = 128ULL << 10;
-    const std::string path = "peer@nic";
-    adapter.prepare(&slice, path);
-    adapter.recordAsyncEvent(IBV_EVENT_QP_FATAL, &path);
-    adapter.tick(1);
-    adapter.tick(2);
-    std::vector<Transport::Slice *> queued{&slice}, avoided;
-    ASSERT_EQ(adapter.gate(queued, avoided), 1u);
-    adapter.complete(&slice, IBV_WC_SUCCESS);
-    adapter.tick(3);
-    EXPECT_EQ(adapter.gate(queued, avoided), 1u);
-    adapter.releaseUnposted(&slice);
-    EXPECT_TRUE(avoided.empty());
-}
-
-TEST(ClassicRdmaCongestionControlTest, CqEventQuarantinesAllRoutes) {
-    adaptive_congestion_control::Config config;
-    config.mode = adaptive_congestion_control::Mode::kEnforce;
-    ClassicRdmaCongestionControl adapter(config);
-    Transport::Slice first{};
-    first.length = 64;
-    Transport::Slice second{};
-    second.length = 64;
-    std::vector<Transport::Slice *> first_queue{&first};
-    std::vector<Transport::Slice *> second_queue{&second};
-    std::vector<Transport::Slice *> avoided;
-
-    adapter.prepare(&first, "peer-a@nic");
-    adapter.prepare(&second, "peer-b@nic");
-    adapter.recordAsyncEvent(IBV_EVENT_CQ_ERR);
-    adapter.tick(1);
-
-    EXPECT_EQ(adapter.gate(first_queue, avoided), 0u);
-    EXPECT_EQ(adapter.gate(second_queue, avoided), 0u);
-    EXPECT_EQ(avoided.size(), 2u);
+    EXPECT_EQ(adapter.gate(queued), 1u);
 }
 
 }  // namespace

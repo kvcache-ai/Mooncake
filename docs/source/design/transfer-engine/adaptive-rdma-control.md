@@ -5,8 +5,8 @@ for RDMA. It limits bytes in flight on a resolved local device and remote route
 immediately before posting work. It is disabled at both build time and runtime
 by default.
 
-The controller is intended to reduce sustained queue pressure and repeated use
-of unhealthy paths. It does not configure NIC congestion control, ECN, or PFC,
+The controller is intended to reduce sustained queue pressure. Existing rail
+health mechanisms remain responsible for avoiding unhealthy paths. It does not configure NIC congestion control, ECN, or PFC,
 and it does not replace transport queues, QoS ordering, endpoint recovery, or
 application timeouts. Other transport backends are unaffected by this feature.
 
@@ -23,7 +23,7 @@ Set `MC_ADAPTIVE_CONGESTION_CONTROL_MODE` before starting the application:
 | --- | --- |
 | `off` (default) | Bypass adaptive admission and feedback. Existing transport behavior remains in charge. |
 | `observe` | Collect feedback and compute control state without deferring or avoiding work. Existing failover remains active. |
-| `enforce` | Apply device/route byte windows and quarantine decisions before RDMA post. |
+| `enforce` | Apply device/route byte windows before RDMA post. Existing rail health still controls recovery. |
 
 For an initial observation run:
 
@@ -45,41 +45,42 @@ the launching shell's environment does not reconfigure running workers.
 | `MC_ADAPTIVE_CONGESTION_CONTROL_TARGET_DRAIN_US` | `2000` | Target estimated queue-drain time, in microseconds. |
 | `MC_ADAPTIVE_CONGESTION_CONTROL_HIGH_PRESSURE_EPOCHS` | `2` | Consecutive high-pressure epochs before shrinking the window. |
 | `MC_ADAPTIVE_CONGESTION_CONTROL_LOW_PRESSURE_EPOCHS` | `3` | Consecutive low-pressure epochs before growing the window. |
-| `MC_ADAPTIVE_CONGESTION_CONTROL_HARD_ERROR_THRESHOLD` | `3` | Hard errors before quarantining the path. |
-| `MC_ADAPTIVE_CONGESTION_CONTROL_COOLDOWN_MS` | `30000` | Quarantine cooldown, in milliseconds. |
-| `MC_ADAPTIVE_CONGESTION_CONTROL_PROBE_WINDOW_BYTES` | `65536` | Recovery probe window, in bytes. |
 
 Byte and time settings must be positive decimal integers; the minimum window
-must not exceed the maximum. Explicit probe windows must not exceed the minimum
-window; epoch counts and the hard-error threshold must fit in 32 bits. Invalid
+must not exceed the maximum. Epoch counts must fit in 32 bits. Invalid
 or overflowing settings disable the
 controller and produce an initialization error message. The application still
 uses its existing transport behavior. Leaving all settings unset keeps it off.
 
-See the [Chinese startup-parameter reference](adaptive-congestion-control-startup-config.md)
+See the [startup-parameter reference](adaptive-congestion-control-startup-config.md)
 for the shared TE/TENT defaults and units.
 
 The windows control admission, not memory registration or the transport's
 static queue capacity. A valid slice is indivisible at this boundary: if a
 domain is empty, it may admit one slice larger than its current window. The full
 slice length is reserved and prevents additional over-window admission until
-it drains. This rule also applies to the smaller recovery probe window, so that
-window is not an absolute transfer-size limit.
+it drains. The window is not an absolute transfer-size limit.
 
 ## Pressure and recovery
 
-The shared policy uses five states: healthy, congested, suspect, quarantined,
-and probing. Sustained pressure reduces the window; successful low-pressure
-epochs increase it. Quarantine stops new admission on the affected path until
-a cooldown permits a limited probe. Success or failure of current-generation
-attempts determines the next state.
+The shared controller tracks healthy or congested pressure. Sustained pressure
+reduces the window; successful low-pressure epochs increase it. It does not
+maintain a second hard-error threshold, quarantine timer, or recovery probe.
+Classic TE's existing rail/context availability and TENT's `RailMonitor` own
+those transport recovery decisions, with their existing thresholds and timing.
 
 Deferral leaves work with its existing queue owner. Avoiding an unhealthy route
 uses existing redispatch and failover machinery; the controller does not create
 a second retry queue or rebuild QPs itself. Old-generation feedback cannot
-update replacement-path health. Application completion/status APIs remain
+update replacement-path pressure. A stale controller generation requests
+redispatch; it is not evidence of long-term path failure. Application completion/status APIs remain
 unchanged. A separate [task congestion query](task-congestion-status-api.md)
-reads bounded evidence for one logical task without advancing progress.
+reads bounded evidence for one logical task without advancing progress. Window
+deferrals use the exact blocking domain reported by admission. Legacy health
+gates provide unavailability evidence without adding recovery transitions.
+Classic copies evidence during its existing availability check; TENT exposes a
+pure snapshot that does not advance cooldowns or consume probe tokens. Runtime `off` bypasses
+this additional observation while leaving legacy recovery active.
 
 Failure evidence must retain its scope:
 
@@ -90,8 +91,9 @@ Failure evidence must retain its scope:
 - Local configuration errors and remote metadata errors are not treated as
   ordinary congestion.
 - Flush completions are consequences of teardown, not independent root causes.
-- QP, CQ, port, and device events affect their corresponding scopes. Events for
-  another port do not quarantine the current device domain.
+- QP, CQ, port, and device events retain their existing transport recovery
+  handling and corresponding scopes; the adaptive controller adds no teardown
+  or quarantine policy.
 
 No finite sequence of timeouts establishes that a remote host is permanently
 lost. Recovery may still require transport reconnection, metadata refresh, or
@@ -114,6 +116,13 @@ cooldown-only behavior. This switch does not change wire metadata or public
 completion APIs.
 
 ## Rollback and compatibility
+
+The draft's `MC_ADAPTIVE_CONGESTION_CONTROL_HARD_ERROR_THRESHOLD`,
+`MC_ADAPTIVE_CONGESTION_CONTROL_COOLDOWN_MS`, and
+`MC_ADAPTIVE_CONGESTION_CONTROL_PROBE_WINDOW_BYTES` settings no longer control
+recovery. Remove them from launch configurations and use the existing
+transport-specific recovery settings when needed. There is no automatic mapping
+because Classic TE and TENT have different existing recovery policies.
 
 To stop enforcement, stop admitting application work, drain outstanding
 transfers, and restart with `MC_ADAPTIVE_CONGESTION_CONTROL_MODE=off`. There is no live mode-switch

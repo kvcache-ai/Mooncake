@@ -192,6 +192,15 @@ class RdmaTransportTestPeer {
         }
         return *workers.congestion_control_devices_[dev_id];
     }
+
+    static void setBlockSize(RdmaTransport& transport, uint64_t bytes) {
+        transport.params_->workers.block_size = bytes;
+    }
+
+    static void disableCongestionControl(Workers& workers) {
+        workers.congestion_control_config_.mode =
+            adaptive_congestion_control::Mode::kOff;
+    }
 #endif
 
     // Runs the monitorThread() 1 Hz safety net for contexts whose
@@ -1325,8 +1334,12 @@ TEST_F(RdmaContextEventTest, OtherPortFailureDoesNotBlockCongestionAdmission) {
 
     fire(IBV_EVENT_PORT_ERR, ourPort());
     adaptive_congestion_control::controlTick(domain, 2);
+    EXPECT_FALSE(selector_->isDeviceAvailable(kDev));
     EXPECT_EQ(adaptive_congestion_control::tryAcquire(path, 64, permit),
-              adaptive_congestion_control::Decision::kAvoid);
+              adaptive_congestion_control::Decision::kAllow);
+    adaptive_congestion_control::complete(
+        permit, adaptive_congestion_control::OutcomeClass::kDerivedFlush,
+        adaptive_congestion_control::FailureScope::kOperation);
 }
 #endif
 
@@ -3326,6 +3339,10 @@ std::vector<RdmaSlice*> RdmaWorkersSharedQpTest::post_order;
 #ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
 class RdmaWorkersAvoidTest : public RdmaWorkersSharedQpTest {
    protected:
+    void exerciseLegacyRailRecovery(bool observe);
+    void exerciseDeviceFailure(bool before_submit, bool inject_fault = true,
+                               bool observe = true);
+
     void SetUp() override {
         ASSERT_NO_FATAL_FAILURE(RdmaWorkersSharedQpTest::SetUp());
         RdmaTransportTestPeer::destroyWorkerContexts(*workers_);
@@ -3426,15 +3443,29 @@ class RdmaWorkersAvoidTest : public RdmaWorkersSharedQpTest {
     size_t completed_ = 0;
 };
 
-TEST_F(RdmaWorkersAvoidTest, UnpostedAvoidDoesNotPauseRailAndProbeRecovers) {
-    adaptive_congestion_control::Signals failure;
-    failure.fatal_failures = 1;
-    adaptive_congestion_control::recordSignals(
-        route_->domain, adaptive_congestion_control::generation(route_->domain),
-        failure);
-    adaptive_congestion_control::controlTick(route_->domain, 1);
-    ASSERT_EQ(adaptive_congestion_control::snapshot(route_->domain).state,
-              adaptive_congestion_control::PathState::kQuarantined);
+void RdmaWorkersAvoidTest::exerciseLegacyRailRecovery(bool observe) {
+    if (!observe) RdmaTransportTestPeer::disableCongestionControl(*active_);
+    auto local = metadata_->segmentManager().getLocal();
+    SegmentDescRef remote;
+    ASSERT_TRUE(
+        metadata_->segmentManager().getRemoteCached(remote, target_).ok());
+    auto& worker = RdmaTransportTestPeer::workerContext(*active_, 0);
+    auto monitor = std::make_unique<RailMonitor>();
+    Config config;
+    config.set(RailMonitor::kCfgCooldownSecs, 0);
+    ASSERT_TRUE(
+        monitor
+            ->load(std::shared_ptr<const Topology>(
+                       local,
+                       &std::get<MemorySegmentDesc>(local->detail).topology),
+                   std::shared_ptr<const Topology>(
+                       remote,
+                       &std::get<MemorySegmentDesc>(remote->detail).topology),
+                   "", &config, static_cast<uint64_t>(target_))
+            .ok());
+    for (int i = 0; i < 3; ++i) monitor->markFailed(kDev, kDev);
+    auto* rail = monitor.get();
+    worker.rails[remote->machine_id] = std::move(monitor);
 
     Request request{};
     request.opcode = Request::WRITE;
@@ -3446,58 +3477,136 @@ TEST_F(RdmaWorkersAvoidTest, UnpostedAvoidDoesNotPauseRailAndProbeRecovers) {
         adaptive_congestion_control::TaskCongestionObservation>(0, 0);
     transport_.setTaskCongestionObservation(batch_, 0, observation, 1);
     ASSERT_TRUE(transport_.submitTransferTasks(batch_, {request}).ok());
-    auto* batch = static_cast<RdmaSubBatch*>(batch_);
-    ASSERT_EQ(batch->task_list[0]->num_slices, 3u);
     RdmaTransportTestPeer::postTick(*active_);
 
-    EXPECT_EQ(observation->state(), TaskCongestionState::kLongUnavailable);
-    auto detail = observation->detail();
-    ASSERT_TRUE(detail.reason.observed);
-    EXPECT_EQ(detail.reason.value, TaskCongestionReason::kPathQuarantined);
-    ASSERT_TRUE(detail.affected_path.observed);
-    EXPECT_NE(detail.affected_path.value.find("avoid-remote-machine"),
-              std::string::npos);
-    ASSERT_TRUE(detail.controller_mode.observed);
-    EXPECT_EQ(detail.controller_mode.value,
-              TaskCongestionControllerMode::kEnforce);
-    EXPECT_TRUE(detail.controller_generation.observed);
-    EXPECT_TRUE(detail.window_bytes.observed);
-    EXPECT_TRUE(detail.inflight_bytes.observed);
-    EXPECT_FALSE(detail.resolved);
-
-    EXPECT_TRUE(post_order.empty()) << "quarantine must not post any WR";
-    auto* slice = batch->slice_chain[0];
-    for (int i = 0; i < 3; ++i, slice = slice->next) {
-        ASSERT_NE(slice, nullptr);
-        EXPECT_EQ(slice->word, PENDING);
-        EXPECT_EQ(slice->retry_count, 1);
-        EXPECT_EQ(slice->posted_dev.load(), -1);
-        EXPECT_TRUE(slice->ep_weak_ptr.expired());
-        ASSERT_NE(slice->rail_monitor, nullptr);
-        EXPECT_TRUE(slice->rail_monitor->isAvailable(kDev, kDev))
-            << "avoiding unposted slices must not count new rail failures";
+    ASSERT_EQ(post_order.size(), 1u) << "Only the legacy recovery trial posts";
+    EXPECT_TRUE(rail->healthSnapshot(kDev, kDev).probe_in_progress);
+    EXPECT_EQ(observation->state(), observe
+                                        ? TaskCongestionState::kLongUnavailable
+                                        : TaskCongestionState::kNormal);
+    const auto detail = observation->detail();
+    ASSERT_EQ(detail.reason.observed, observe);
+    ASSERT_EQ(detail.affected_path.observed, observe);
+    if (observe) {
+        EXPECT_EQ(detail.reason.value, TaskCongestionReason::kPathQuarantined);
+        EXPECT_NE(detail.affected_path.value.find("avoid-remote-machine"),
+                  std::string::npos);
     }
+    EXPECT_FALSE(detail.retry_after_ns.observed);
+    EXPECT_FALSE(detail.controller_generation.observed);
+    EXPECT_FALSE(detail.window_bytes.observed);
+    EXPECT_FALSE(detail.inflight_bytes.observed);
 
-    // Advance only the congestion control cooldown. Rail recovery must not be
-    // forced or awaited: a healthy rail should remain selectable for the probe.
-    const auto probe_ts = adaptive_congestion_control::Config{}.cooldown_ns + 1;
-    adaptive_congestion_control::controlTick(route_->domain, probe_ts);
-    ASSERT_EQ(adaptive_congestion_control::snapshot(route_->domain).state,
-              adaptive_congestion_control::PathState::kProbing);
+    // The real completion callback closes the legacy rail before siblings
+    // retry.
+    drainCompletions();
+    EXPECT_FALSE(rail->healthSnapshot(kDev, kDev).paused);
     for (int tick = 0; tick < 3; ++tick) {
         RdmaTransportTestPeer::postTick(*active_);
         drainCompletions();
-        tickTentCongestionControlRoute(*route_, probe_ts + 1 + tick, 1);
     }
     TransferStatus status;
     ASSERT_TRUE(transport_.getTransferStatus(batch_, 0, status).ok());
     EXPECT_EQ(status.s, COMPLETED);
     EXPECT_EQ(status.transferred_bytes, source_.size());
     EXPECT_EQ(post_order.size(), 3u);
-    EXPECT_EQ(adaptive_congestion_control::snapshot(route_->domain).state,
-              adaptive_congestion_control::PathState::kHealthy);
     EXPECT_EQ(observation->state(), TaskCongestionState::kNormal);
-    EXPECT_TRUE(observation->detail().resolved);
+    EXPECT_EQ(observation->detail().resolved, observe);
+}
+
+void RdmaWorkersAvoidTest::exerciseDeviceFailure(bool before_submit,
+                                                 bool inject_fault,
+                                                 bool observe) {
+    if (!observe) RdmaTransportTestPeer::disableCongestionControl(*active_);
+    SegmentDescRef remote;
+    ASSERT_TRUE(
+        metadata_->segmentManager().getRemoteCached(remote, target_).ok());
+    const auto placements =
+        Platform::getLoader().getLocation(source_.data(), 1, true);
+    const auto location =
+        placements.empty() ? kWildcardLocation : placements.front().location;
+    auto topology = selector_->getTopology();
+    if (!topology->getMemEntry(location)) {
+        auto entry = *topology->getMemEntry("cpu:0");
+        entry.name = location;
+        topology->mem_list_.push_back(entry);
+    }
+    // Force the public submit path to allocate devices for all slices.
+    RdmaTransportTestPeer::setBlockSize(transport_, kLen / 8);
+    auto fail_device = [&] {
+        ibv_async_event event{};
+        event.event_type = IBV_EVENT_DEVICE_FATAL;
+        RdmaTransportTestPeer::applyContextEvent(*active_, kDev, *context_,
+                                                 event);
+        ASSERT_FALSE(selector_->isDeviceAvailable(kDev));
+        ASSERT_EQ(context_->status(), RdmaContext::DEVICE_PAUSED);
+    };
+    if (before_submit && inject_fault) fail_device();
+    Request request{};
+    request.opcode = Request::WRITE;
+    request.source = source_.data();
+    request.target_id = target_;
+    request.target_offset = kTarget;
+    request.length = source_.size();
+    auto observation = std::make_shared<
+        adaptive_congestion_control::TaskCongestionObservation>(0, 0);
+    transport_.setTaskCongestionObservation(batch_, 0, observation, 1);
+    ASSERT_TRUE(transport_.submitTransferTasks(batch_, {request}).ok());
+    if (!before_submit || !inject_fault) {
+        auto* batch = static_cast<RdmaSubBatch*>(batch_);
+        ASSERT_EQ(batch->task_list[0]->num_slices, 24);
+        for (auto* slice = batch->slice_chain[0]; slice; slice = slice->next) {
+            ASSERT_EQ(slice->source_dev_id, kDev);
+            ASSERT_EQ(slice->charged_dev.load(), kDev);
+        }
+    }
+    if (!before_submit && inject_fault) fail_device();
+    RdmaTransportTestPeer::postTick(*active_);
+    if (!inject_fault) {
+        ASSERT_EQ(post_order.size(), 24u);
+        drainCompletions();
+        TransferStatus status;
+        ASSERT_TRUE(transport_.getTransferStatus(batch_, 0, status).ok());
+        EXPECT_EQ(status.s, COMPLETED);
+        EXPECT_EQ(observation->state(), TaskCongestionState::kNormal);
+        return;
+    }
+    EXPECT_TRUE(post_order.empty());
+    if (!observe) {
+        EXPECT_FALSE(observation->detail().reason.observed);
+        EXPECT_FALSE(observation->detail().failure_scope.observed);
+        return;
+    }
+    EXPECT_EQ(observation->state(), TaskCongestionState::kLongUnavailable);
+    const auto detail = observation->detail();
+    ASSERT_TRUE(detail.failure_scope.observed);
+    EXPECT_EQ(detail.failure_scope.value, TaskCongestionFailureScope::kDevice);
+    EXPECT_FALSE(detail.window_bytes.observed);
+    EXPECT_FALSE(detail.controller_generation.observed);
+}
+
+TEST_F(RdmaWorkersAvoidTest, DeviceFatalBeforeAllocationReportsUnavailable) {
+    exerciseDeviceFailure(true);
+}
+
+TEST_F(RdmaWorkersAvoidTest, DeviceFatalAfterAllocationReportsUnavailable) {
+    exerciseDeviceFailure(false);
+}
+
+TEST_F(RdmaWorkersAvoidTest, DeviceHealthHealthyControlPostsAndCompletes) {
+    exerciseDeviceFailure(false, false);
+}
+
+TEST_F(RdmaWorkersAvoidTest, DeviceFatalOffDoesNotObserveHealthRejection) {
+    exerciseDeviceFailure(false, true, false);
+}
+
+TEST_F(RdmaWorkersAvoidTest, LegacyRailProbeRecoversTaskObservation) {
+    exerciseLegacyRailRecovery(true);
+}
+
+TEST_F(RdmaWorkersAvoidTest, OffPreservesLegacyRailRecoveryWithoutObservation) {
+    exerciseLegacyRailRecovery(false);
 }
 #endif
 

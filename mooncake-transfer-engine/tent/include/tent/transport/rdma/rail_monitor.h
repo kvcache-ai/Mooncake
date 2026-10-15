@@ -83,6 +83,15 @@ class RailMonitor {
     uint64_t localDeviceMask(const Topology::MemEntry &remote_memory,
                              bool same_machine = false) const;
 
+    struct HealthSnapshot {
+        bool paused = false;
+        bool probe_in_progress = false;
+        uint64_t retry_after_ns = 0;
+    };
+
+    // Read-only evidence from the existing recovery policy.
+    HealthSnapshot healthSnapshot(int local_nic, int remote_nic) const;
+
     // Mutating admit: the ONLY path that arms a probe/trial. Returns true when
     // a transfer may use this rail -- Closed (no-op), or an exploratory probe /
     // Half-Open trial. Sets probe_in_flight for paused rails so a second probe

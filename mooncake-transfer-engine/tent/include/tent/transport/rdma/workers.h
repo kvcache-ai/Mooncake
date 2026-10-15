@@ -349,7 +349,8 @@ class Workers {
     TentRdmaCongestionControlRoute* getCongestionRoute(const PostPath& path);
 #endif
 
-    std::shared_ptr<RdmaEndPoint> getEndpoint(PostPath path);
+    std::shared_ptr<RdmaEndPoint> getEndpoint(
+        PostPath path, bool* context_unavailable = nullptr);
 
     void disableEndpoint(RdmaSlice* slice);
 

@@ -230,8 +230,7 @@ void ClassicRdmaCongestionControl::retireEndpoint(
     state->endpoint.store(nullptr, std::memory_order_release);
 }
 
-size_t ClassicRdmaCongestionControl::gate(SliceList &queued,
-                                          SliceList &avoided) {
+size_t ClassicRdmaCongestionControl::gate(SliceList &queued) {
     if (!enabled()) return queued.size();
     size_t admitted_count = 0;
     size_t cursor = 0;
@@ -247,91 +246,54 @@ size_t ClassicRdmaCongestionControl::gate(SliceList &queued,
             device_.get(), &state->domain,
             adaptive_congestion_control::generation(*device_),
             adaptive_congestion_control::generation(state->domain)};
-        const bool permit_was_active =
-            slice->rdma_congestion_control_permit.active();
-        switch (adaptive_congestion_control::tryAcquire(
-            path, slice->length, slice->rdma_congestion_control_permit)) {
-            case adaptive_congestion_control::Decision::kAllow:
-                slice->rdma_congestion_control_endpoint =
-                    state->endpoint.load(std::memory_order_acquire);
-                slice->rdma_congestion_control_endpoint_generation =
-                    state->endpoint_generation.load(std::memory_order_acquire);
-                resolveCongestion(slice);
-                std::swap(queued[admitted_count++], queued[cursor++]);
-                break;
-            case adaptive_congestion_control::Decision::kAvoid: {
-                const auto device =
-                    adaptive_congestion_control::snapshot(*device_);
-                const auto route =
-                    adaptive_congestion_control::snapshot(state->domain);
-                if (!permit_was_active &&
-                    device.generation == path.device_generation &&
-                    route.generation == path.route_generation) {
-                    if (route.state ==
-                        adaptive_congestion_control::PathState::kQuarantined)
-                        recordCongestion(slice, route, state->peer_nic_path,
-                                         TaskCongestionReason::kPathQuarantined,
-                                         true);
-                    else if (device.state == adaptive_congestion_control::
-                                                 PathState::kQuarantined)
-                        recordCongestion(slice, device, state->peer_nic_path,
-                                         TaskCongestionReason::kPathQuarantined,
-                                         true);
-                }
-                avoided.push_back(slice);
-                queued[cursor] = queued.back();
-                queued.pop_back();
-                break;
-            }
-            case adaptive_congestion_control::Decision::kDefer: {
-                const auto device =
-                    adaptive_congestion_control::snapshot(*device_);
-                const auto route =
-                    adaptive_congestion_control::snapshot(state->domain);
-                if (!permit_was_active &&
-                    device.generation == path.device_generation &&
-                    route.generation == path.route_generation) {
-                    if (route.state ==
-                        adaptive_congestion_control::PathState::kQuarantined) {
-                        recordCongestion(slice, route, state->peer_nic_path,
-                                         TaskCongestionReason::kPathQuarantined,
-                                         true);
-                        ++cursor;
-                        break;
-                    }
-                    if (device.state ==
-                        adaptive_congestion_control::PathState::kQuarantined) {
-                        recordCongestion(slice, device, state->peer_nic_path,
-                                         TaskCongestionReason::kPathQuarantined,
-                                         true);
-                        ++cursor;
-                        break;
-                    }
-                    const bool route_window =
-                        route.inflight_bytes != 0 &&
-                        (slice->length > route.window_bytes ||
-                         route.inflight_bytes >
-                             route.window_bytes - slice->length);
-                    const bool device_window =
-                        device.inflight_bytes != 0 &&
-                        (slice->length > device.window_bytes ||
-                         device.inflight_bytes >
-                             device.window_bytes - slice->length);
-                    if (route_window)
-                        recordCongestion(slice, route, state->peer_nic_path,
-                                         TaskCongestionReason::kByteWindow,
-                                         false);
-                    else if (device_window)
-                        recordCongestion(slice, device, state->peer_nic_path,
-                                         TaskCongestionReason::kByteWindow,
-                                         false);
-                }
-                ++cursor;
-                break;
-            }
+        adaptive_congestion_control::AdmissionEvidence evidence;
+        const auto decision = adaptive_congestion_control::tryAcquire(
+            path, slice->length, slice->rdma_congestion_control_permit,
+            &evidence);
+        if (decision == adaptive_congestion_control::Decision::kAllow) {
+            slice->rdma_congestion_control_endpoint =
+                state->endpoint.load(std::memory_order_acquire);
+            slice->rdma_congestion_control_endpoint_generation =
+                state->endpoint_generation.load(std::memory_order_acquire);
+            resolveCongestion(slice);
+            std::swap(queued[admitted_count++], queued[cursor++]);
+        } else {
+            if (evidence.reason ==
+                adaptive_congestion_control::AdmissionReason::kWindow)
+                recordCongestion(slice, evidence.snapshot, state->peer_nic_path,
+                                 TaskCongestionReason::kByteWindow, false,
+                                 evidence.domain ==
+                                         adaptive_congestion_control::
+                                             AdmissionDomain::kDevice
+                                     ? TaskCongestionFailureScope::kDevice
+                                     : TaskCongestionFailureScope::kRoute);
+            // A generation race is retried on the owner queue. It is not
+            // evidence that the legacy health gate considers the path failed.
+            ++cursor;
         }
     }
     return admitted_count;
+}
+
+void ClassicRdmaCongestionControl::observeUnavailable(
+    Transport::Slice *slice, const std::string &peer_nic_path,
+    TaskCongestionFailureScope scope, std::optional<uint64_t> retry_after_ns) {
+    if (!enabled()) return;
+    const auto slice_id = congestionSliceId(slice);
+    if (!slice_id) return;
+    adaptive_congestion_control::TaskCongestionEvidence evidence;
+    evidence.reason = TaskCongestionReason::kPathQuarantined;
+    evidence.path = peer_nic_path;
+    evidence.observed_at_ns = getCurrentTimeInNano();
+    evidence.controller_mode =
+        mode_ == adaptive_congestion_control::Mode::kEnforce
+            ? TaskCongestionControllerMode::kEnforce
+            : TaskCongestionControllerMode::kObserve;
+    evidence.failure_scope = scope;
+    evidence.retry_after_ns = retry_after_ns;
+    if (congestionObservation(slice->task)->avoid(*slice_id, 1, evidence))
+        slice->rdma_congestion_control_observed_blocked.store(
+            true, std::memory_order_release);
 }
 
 void ClassicRdmaCongestionControl::complete(Transport::Slice *slice,
@@ -465,37 +427,6 @@ void ClassicRdmaCongestionControl::resetDevice() {
     const uint32_t generation =
         adaptive_congestion_control::generation(*device_) + 1;
     adaptive_congestion_control::resetGeneration(*device_, generation);
-}
-
-void ClassicRdmaCongestionControl::recordAsyncEvent(
-    ibv_event_type event, const std::string *peer_nic_path) {
-    if (!enabled()) return;
-    const auto result = adaptive_congestion_control::classifyAsyncEvent(event);
-    if (!result || !result->root_failure) return;
-    adaptive_congestion_control::Signals signals;
-    if (result->scope == adaptive_congestion_control::FailureScope::kPort ||
-        result->scope == adaptive_congestion_control::FailureScope::kDevice) {
-        signals.fatal_failures = 1;
-        adaptive_congestion_control::recordSignals(
-            *device_, adaptive_congestion_control::generation(*device_),
-            signals);
-    } else if (result->scope ==
-               adaptive_congestion_control::FailureScope::kCq) {
-        signals.fatal_failures = 1;
-        std::lock_guard<std::mutex> lock(routes_mutex_);
-        for (auto &[_, state] : routes_) {
-            adaptive_congestion_control::recordSignals(
-                state->domain,
-                adaptive_congestion_control::generation(state->domain),
-                signals);
-        }
-    } else if (peer_nic_path != nullptr) {
-        signals.hard_errors = 1;
-        RouteState *state = route(*peer_nic_path);
-        adaptive_congestion_control::recordSignals(
-            state->domain,
-            adaptive_congestion_control::generation(state->domain), signals);
-    }
 }
 
 static adaptive_congestion_control::Config
@@ -1078,8 +1009,14 @@ void WorkerPool::performPostSend(int thread_id) {
     if (!context_.active()) {
         auto local_slice_queue_clone = local_slice_queue;
         local_slice_queue.clear();
-        for (auto &entry : local_slice_queue_clone)
+        for (auto &entry : local_slice_queue_clone) {
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+            for (auto *slice : entry.second)
+                adaptive_congestion_control_.observeUnavailable(
+                    slice, entry.first, TaskCongestionFailureScope::kDevice);
+#endif
             redispatch(entry.second, thread_id, true);
+        }
         return;
     }
 
@@ -1123,8 +1060,21 @@ void WorkerPool::performPostSend(int thread_id) {
         // delete the endpoint, and refresh the pause without attempting a
         // connection. Keeping the check here gives the pause a hard retry
         // deadline; only a genuine connection/QP failure can arm or extend it.
-        if (!isRailAvailable(entry.first) ||
+        RailHealthSnapshot *health_output = nullptr;
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+        RailHealthSnapshot health;
+        if (adaptive_congestion_control_.enabled()) health_output = &health;
+#endif
+        if (!isRailAvailable(entry.first, health_output) ||
             context_.isConnectPaused(entry.first)) {
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+            for (auto *slice : entry.second)
+                adaptive_congestion_control_.observeUnavailable(
+                    slice, entry.first, TaskCongestionFailureScope::kRoute,
+                    health.paused
+                        ? std::optional<uint64_t>(health.retry_after_ns)
+                        : std::nullopt);
+#endif
             for (auto &slice : entry.second) failed_slice_list.push_back(slice);
             entry.second.clear();
             continue;
@@ -1238,11 +1188,8 @@ void WorkerPool::performPostSend(int thread_id) {
             adaptive_congestion_control_.prepare(entry.second, entry.first);
             adaptive_congestion_control_.bindEndpoint(entry.second.front(),
                                                       endpoint.get());
-            SliceList avoided;
             const size_t admitted_count =
-                adaptive_congestion_control_.gate(entry.second, avoided);
-            failed_slice_list.insert(failed_slice_list.end(), avoided.begin(),
-                                     avoided.end());
+                adaptive_congestion_control_.gate(entry.second);
             if (admitted_count != 0) {
                 for (size_t i = 0; i < admitted_count; ++i)
                     entry.second[i]->rdma.endpoint = endpoint.get();
@@ -1812,14 +1759,7 @@ int WorkerPool::doProcessContextEvents() {
         LOG(WARNING) << "Worker: Received context async event "
                      << ibv_event_type_str(event.event_type) << " for context "
                      << context_.deviceName();
-        bool endpoint_event = event.event_type == IBV_EVENT_QP_FATAL;
-#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
-        endpoint_event =
-            endpoint_event || (adaptive_congestion_control_.enabled() &&
-                               (event.event_type == IBV_EVENT_QP_REQ_ERR ||
-                                event.event_type == IBV_EVENT_QP_ACCESS_ERR ||
-                                event.event_type == IBV_EVENT_PATH_MIG_ERR));
-#endif
+        const bool endpoint_event = event.event_type == IBV_EVENT_QP_FATAL;
         if (endpoint_event) {
             auto endpoint_ptr = (RdmaEndPoint *)event.element.qp->qp_context;
             auto endpoint = context_.getEndpointByPtr(endpoint_ptr);
@@ -1849,8 +1789,6 @@ int WorkerPool::doProcessContextEvents() {
                 auto endpoint_lifecycle_lock =
                     context_.lockEndpointLifecycle(peer_nic_path);
 #ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
-                adaptive_congestion_control_.recordAsyncEvent(event.event_type,
-                                                              &peer_nic_path);
                 adaptive_congestion_control_.retireEndpoint(peer_nic_path,
                                                             endpoint.get());
 #endif
@@ -1879,9 +1817,6 @@ void WorkerPool::processContextEventForTest(ibv_event_type event_type) {
 bool WorkerPool::handleContextEvent(ibv_event_type event_type,
                                     bool injected_for_test,
                                     struct ibv_async_event *event) {
-#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
-    adaptive_congestion_control_.recordAsyncEvent(event_type);
-#endif
     if (event_type == IBV_EVENT_DEVICE_FATAL ||
         event_type == IBV_EVENT_CQ_ERR || event_type == IBV_EVENT_WQ_FATAL ||
         event_type == IBV_EVENT_PORT_ERR ||
@@ -2241,7 +2176,9 @@ void WorkerPool::markRailFailed(const std::string &peer_nic_path,
     }
 }
 
-bool WorkerPool::isRailAvailable(const std::string &peer_nic_path) {
+bool WorkerPool::isRailAvailable(const std::string &peer_nic_path,
+                                 RailHealthSnapshot *health) {
+    if (health) *health = {};
     if (paused_rail_count_.load(std::memory_order_acquire) == 0) return true;
     std::lock_guard<std::mutex> lock(rail_state_lock_);
     // Drop every expired pause while the lock is already held. Otherwise a
@@ -2262,6 +2199,12 @@ bool WorkerPool::isRailAvailable(const std::string &peer_nic_path) {
 
     auto it = rail_states_.find(peer_nic_path);
     if (it == rail_states_.end()) return true;
+    if (health) {
+        health->paused = it->second.pause_until_ns != 0;
+        health->retry_after_ns =
+            health->paused ? it->second.pause_until_ns - now : 0;
+        health->error_count = it->second.error_count;
+    }
     return it->second.pause_until_ns == 0;
 }
 

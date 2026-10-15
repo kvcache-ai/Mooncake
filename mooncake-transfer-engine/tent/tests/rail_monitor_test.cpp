@@ -108,6 +108,59 @@ static std::shared_ptr<Topology> makeTwoNicTopology(const std::string& first,
     return topo;
 }
 
+TEST(RailMonitorHealthSnapshotTest, ReadsPreserveMetadataProbeOwnership) {
+    auto local = makeSingleNicTopology("mlx5_0");
+    auto remote = makeSingleNicTopology("mlx5_1");
+    RailMonitor rail;
+    Config config;
+    config.set(RailMonitor::kCfgProbeIntervalSecs, 20);
+    ASSERT_TRUE(rail.load(local, remote, "", &config).ok());
+    for (int i = 0; i < 3; ++i) rail.markFailed(0, 0);
+    uint64_t previous = 20'000'000'000ULL;
+    for (int i = 0; i < 10; ++i) {
+        const auto health = rail.healthSnapshot(0, 0);
+        EXPECT_TRUE(health.paused);
+        EXPECT_FALSE(health.probe_in_progress);
+        EXPECT_GT(health.retry_after_ns, 0u);
+        EXPECT_LE(health.retry_after_ns, previous);
+        previous = health.retry_after_ns;
+    }
+    EXPECT_FALSE(rail.admit(0, 0));
+    auto refreshed = makeSingleNicTopology("mlx5_1");
+    ASSERT_TRUE(rail.load(local, refreshed).ok());
+    for (int i = 0; i < 10; ++i)
+        EXPECT_FALSE(rail.healthSnapshot(0, 0).probe_in_progress);
+    uint64_t token = 0;
+    ASSERT_TRUE(rail.tryRecoveryProbe(0, 0, token));
+    EXPECT_NE(token, 0u);
+    EXPECT_TRUE(rail.healthSnapshot(0, 0).probe_in_progress);
+    EXPECT_EQ(rail.healthSnapshot(0, 0).retry_after_ns, 0u);
+}
+
+TEST(RailMonitorHealthSnapshotTest, ExpiryReadsDoNotArmTrialOrRecover) {
+    RailMonitor rail;
+    Config config;
+    config.set(RailMonitor::kCfgCooldownSecs, 0);
+    ASSERT_TRUE(rail.load(makeSingleNicTopology("mlx5_0"),
+                          makeSingleNicTopology("mlx5_1"), "", &config)
+                    .ok());
+    for (int i = 0; i < 3; ++i) rail.markFailed(0, 0);
+    for (int i = 0; i < 10; ++i) {
+        const auto health = rail.healthSnapshot(0, 0);
+        EXPECT_TRUE(health.paused);
+        EXPECT_FALSE(health.probe_in_progress);
+        EXPECT_EQ(health.retry_after_ns, 0u);
+        EXPECT_FALSE(rail.isAvailable(0, 0));
+    }
+    ASSERT_TRUE(rail.admit(0, 0));
+    EXPECT_TRUE(rail.healthSnapshot(0, 0).probe_in_progress);
+    EXPECT_FALSE(rail.admit(0, 0));
+    rail.markRecovered(0, 0);
+    EXPECT_FALSE(rail.healthSnapshot(0, 0).paused);
+    EXPECT_FALSE(rail.healthSnapshot(0, 0).probe_in_progress);
+    EXPECT_EQ(rail.healthSnapshot(0, 0).retry_after_ns, 0u);
+}
+
 TEST(RailMonitorConfigTest, CustomJsonOverridesAutomaticPeerMapping) {
     auto local = makeTwoNicTopology("local0", "local1");
     auto remote = makeTwoNicTopology("remote0", "remote1");

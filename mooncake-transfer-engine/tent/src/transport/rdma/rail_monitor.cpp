@@ -14,6 +14,8 @@
 
 #include "tent/transport/rdma/rail_monitor.h"
 
+#include <algorithm>
+
 namespace mooncake {
 namespace tent {
 
@@ -170,6 +172,27 @@ uint64_t RailMonitor::localDeviceMask(const Topology::MemEntry& remote_memory,
         }
     }
     return mask;
+}
+
+RailMonitor::HealthSnapshot RailMonitor::healthSnapshot(int local_nic,
+                                                        int remote_nic) const {
+    const auto it = rail_states_.find(std::make_pair(local_nic, remote_nic));
+    if (it == rail_states_.end()) return {};
+    const auto& state = it->second;
+    HealthSnapshot snapshot;
+    snapshot.paused = state.paused();
+    snapshot.probe_in_progress =
+        state.probe_in_flight || state.active_probe_token != 0;
+    const auto now = std::chrono::steady_clock::now();
+    const auto next_admission =
+        std::min(state.resume_time, state.last_probe_time + probe_interval_);
+    if (state.paused() && !snapshot.probe_in_progress && next_admission > now) {
+        snapshot.retry_after_ns =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                next_admission - now)
+                .count();
+    }
+    return snapshot;
 }
 
 bool RailMonitor::admit(int local_nic, int remote_nic) {

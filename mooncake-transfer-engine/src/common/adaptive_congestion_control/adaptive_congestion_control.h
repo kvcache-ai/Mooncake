@@ -17,7 +17,6 @@
 
 #include <atomic>
 #include <cstdint>
-#include <mutex>
 
 namespace mooncake::adaptive_congestion_control {
 
@@ -30,6 +29,7 @@ enum class Decision : uint8_t { kAllow, kDefer, kAvoid };
 enum class PathState : uint8_t {
     kHealthy,
     kCongested,
+    // Legacy values retained for compatibility; the core never emits them.
     kSuspect,
     kQuarantined,
     kProbing,
@@ -60,9 +60,6 @@ struct Config {
     uint64_t target_drain_time_ns = 2'000'000;
     uint32_t high_pressure_epochs = 2;
     uint32_t low_pressure_epochs = 3;
-    uint32_t hard_error_threshold = 3;
-    uint64_t cooldown_ns = 30'000'000'000ULL;
-    uint64_t probe_window_bytes = 64ULL << 10;
 };
 
 struct Signals {
@@ -71,6 +68,7 @@ struct Signals {
     uint64_t completed_bytes = 0;
     uint64_t successful_completions = 0;
     uint64_t receiver_pressure = 0;
+    // Legacy health signals are accepted but do not affect the window.
     uint64_t route_timeouts = 0;
     uint64_t hard_errors = 0;
     uint64_t fatal_failures = 0;
@@ -86,6 +84,15 @@ struct Snapshot {
     uint32_t generation = 0;
 };
 
+enum class AdmissionDomain : uint8_t { kNone, kDevice, kRoute };
+enum class AdmissionReason : uint8_t { kNone, kWindow, kStaleGeneration };
+
+struct AdmissionEvidence {
+    AdmissionDomain domain = AdmissionDomain::kNone;
+    AdmissionReason reason = AdmissionReason::kNone;
+    Snapshot snapshot;
+};
+
 class DomainState {
    public:
     explicit DomainState(Config config, uint32_t generation = 1);
@@ -96,7 +103,8 @@ class DomainState {
    private:
     friend struct CoreAccess;
     friend class Permit;
-    friend Decision tryAcquire(const struct PathHandle&, uint64_t, Permit&);
+    friend Decision tryAcquire(const PathHandle&, uint64_t, Permit&,
+                               AdmissionEvidence*);
     friend bool complete(Permit&, OutcomeClass, FailureScope);
     friend void recordSignals(DomainState&, uint32_t, const Signals&);
     friend void controlTick(DomainState&, uint64_t);
@@ -119,22 +127,8 @@ class DomainState {
     std::atomic<uint64_t> completed_bytes_{0};
     std::atomic<uint64_t> successful_completions_{0};
     std::atomic<uint64_t> receiver_pressure_{0};
-    std::atomic<uint64_t> route_timeouts_{0};
-    std::atomic<uint64_t> hard_errors_{0};
-    std::atomic<uint64_t> fatal_failures_{0};
-    std::atomic<uint64_t> probe_successes_{0};
-    std::atomic<uint64_t> probe_failures_{0};
-    std::atomic<uint64_t> probe_epoch_{0};
-    std::atomic<bool> poller_stalled_{false};
-
-    std::mutex probe_mutex_;
-    uint64_t active_probe_permits_ = 0;
-    bool probe_draining_ = false;
-
     uint32_t high_pressure_streak_ = 0;
     uint32_t low_pressure_streak_ = 0;
-    uint32_t hard_error_streak_ = 0;
-    uint64_t quarantine_until_ns_ = 0;
 };
 
 // DomainState instances must outlive their PathHandle and every active Permit.
@@ -159,7 +153,8 @@ class Permit {
     bool active() const { return active_.load(std::memory_order_acquire); }
 
    private:
-    friend Decision tryAcquire(const PathHandle&, uint64_t, Permit&);
+    friend Decision tryAcquire(const PathHandle&, uint64_t, Permit&,
+                               AdmissionEvidence*);
     friend bool complete(Permit&, OutcomeClass, FailureScope);
     friend bool isCurrentGeneration(const Permit&);
 
@@ -171,16 +166,16 @@ class Permit {
     uint32_t route_generation_ = 0;
     bool device_reserved_ = false;
     bool route_reserved_ = false;
-    uint64_t device_probe_epoch_ = 0;
-    uint64_t route_probe_epoch_ = 0;
 
     void moveFrom(Permit& other) noexcept;
 };
 
 // A domain with no inflight bytes admits one indivisible slice even when it
-// exceeds the window (including probing). The full byte count is reserved;
+// exceeds the window. The full byte count is reserved;
 // transport-level static limits must still be enforced by the caller.
-Decision tryAcquire(const PathHandle& path, uint64_t bytes, Permit& permit);
+// Evidence is written only on rejection, with the device checked first.
+Decision tryAcquire(const PathHandle& path, uint64_t bytes, Permit& permit,
+                    AdmissionEvidence* evidence = nullptr);
 bool isCurrentGeneration(const Permit& permit);
 bool complete(Permit& permit, OutcomeClass outcome, FailureScope scope);
 void recordSignals(DomainState& state, uint32_t generation,

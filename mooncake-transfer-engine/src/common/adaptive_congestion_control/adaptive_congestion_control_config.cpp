@@ -101,30 +101,6 @@ ConfigLoadResult loadConfigFromEnvironment() {
             result.config.low_pressure_epochs)) {
         return invalid("MC_ADAPTIVE_CONGESTION_CONTROL_LOW_PRESSURE_EPOCHS");
     }
-    if (!parsePositiveCount(
-            "MC_ADAPTIVE_CONGESTION_CONTROL_HARD_ERROR_THRESHOLD",
-            result.config.hard_error_threshold)) {
-        return invalid("MC_ADAPTIVE_CONGESTION_CONTROL_HARD_ERROR_THRESHOLD");
-    }
-
-    uint64_t cooldown_ms = result.config.cooldown_ns / 1'000'000;
-    if (!parsePositive("MC_ADAPTIVE_CONGESTION_CONTROL_COOLDOWN_MS",
-                       cooldown_ms) ||
-        cooldown_ms > std::numeric_limits<uint64_t>::max() / 1'000'000) {
-        return invalid("MC_ADAPTIVE_CONGESTION_CONTROL_COOLDOWN_MS");
-    }
-    result.config.cooldown_ns = cooldown_ms * 1'000'000;
-
-    constexpr const char* probe_name =
-        "MC_ADAPTIVE_CONGESTION_CONTROL_PROBE_WINDOW_BYTES";
-    const bool probe_override = std::getenv(probe_name) != nullptr;
-    if (!parsePositive(probe_name, result.config.probe_window_bytes)) {
-        return invalid(probe_name);
-    }
-    if (probe_override &&
-        result.config.probe_window_bytes > result.config.min_window_bytes) {
-        return invalid("adaptive congestion probe window range");
-    }
     return result;
 }
 

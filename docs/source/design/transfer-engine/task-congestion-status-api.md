@@ -13,6 +13,8 @@ Classic TE 和 TENT 为已提交的逻辑传输任务提供两套独立接口：
 
 多 slice 任务以尚未解决的最严重情况为准：`LONG_UNAVAILABLE` 高于 `CONGESTED`。详细结果的 `resolved` 表示所保留异常已经解决；其窗口、在途字节和控制器数据是异常发生时的 best-effort 记录，不是查询时刻的实时读数。未观测字段在 C++ 中有 `observed=false`，在 C 中没有对应 bit，在 Python 中为 `None`。首版只记录 RDMA 拥塞证据，接口名称和类型不限定后续 transport。
 
+窗口拥塞证据来自共享 controller 的准入结果；路径不可用证据来自 Classic TE 原有 rail/context 健康判断或 TENT 的 `RailMonitor`。controller 不再另行维护故障隔离、冷却和恢复探测状态机。健康快照只读取已有状态，不触发探测或改变恢复策略。旧 generation 需要重新选择路径，并不单独构成 `LONG_UNAVAILABLE` 的依据。模式为 `off` 时保留原有恢复行为，但不增加这套 task 异常记录。
+
 无效、未提交或已释放的 batch/task 不能查询。`submitTransfer` 在创建 task 前失败时没有可供查询的 `task_id`，调用方继续使用提交错误。查询不延长 batch 生命周期；不要与释放同一个 batch 并发使用。
 
 ## C++
