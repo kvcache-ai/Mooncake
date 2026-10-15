@@ -271,6 +271,19 @@ class WrappedMasterService {
         const UUID& client_id, const std::string& key,
         const std::string& tenant_id);
 
+    // Promotion RPCs that name their task by the drained item's task id (see
+    // MasterService::PromotionTaskAllocStart). The tenant is the item's.
+    tl::expected<PromotionAllocStartResponse, ErrorCode>
+    PromotionTaskAllocStart(const UUID& client_id,
+                            const PromotionTaskItem& item,
+                            const std::vector<std::string>& preferred_segments);
+
+    tl::expected<void, ErrorCode> NotifyPromotionTaskSuccess(
+        const UUID& client_id, const PromotionTaskItem& item);
+
+    tl::expected<void, ErrorCode> NotifyPromotionTaskFailure(
+        const UUID& client_id, const PromotionTaskItem& item);
+
     // Admin-only, grow-only DFS capacity management. Existing placements remain
     // valid.
     tl::expected<int, ErrorCode> GetDfsShardCount() const;

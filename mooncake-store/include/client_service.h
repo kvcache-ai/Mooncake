@@ -648,6 +648,19 @@ class Client {
         const std::string& key, const std::string& tenant_id);
 
     /**
+     * @brief The promotion calls for a drained item: they name the task by
+     * the item's task id, so a late call for an earlier promotion of the key
+     * can never stage, commit or free a buffer of a newer one.
+     */
+    virtual tl::expected<PromotionAllocStartResponse, ErrorCode>
+    PromotionTaskAllocStart(const PromotionTaskItem& item,
+                            const std::vector<std::string>& preferred_segments);
+    virtual tl::expected<void, ErrorCode> NotifyPromotionTaskSuccess(
+        const PromotionTaskItem& item);
+    virtual tl::expected<void, ErrorCode> NotifyPromotionTaskFailure(
+        const PromotionTaskItem& item);
+
+    /**
      * @brief Write `slices` into the memory replica described by
      * `memory_descriptor` via Transfer Engine. Used by FileStorage to fill a
      * PROCESSING memory replica staged by PromotionAllocStart before calling
