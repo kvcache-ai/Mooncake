@@ -67,6 +67,18 @@ struct QueueLimits {
     // NowProvider (via setDegradationPolicy) or defaults to steady_clock.
     // 0 (default) disables promotion entirely.
     uint64_t promotion_slack_ns{0};
+
+    Status validate() const {
+        if (staging_owner_reserve > max_outstanding_owners) {
+            return Status::InvalidArgument(
+                "staging owner reserve exceeds owner limit" LOC_MARK);
+        }
+        if (staging_byte_reserve > max_outstanding_bytes) {
+            return Status::InvalidArgument(
+                "staging byte reserve exceeds byte limit" LOC_MARK);
+        }
+        return Status::OK();
+    }
 };
 
 struct QueueOwnerInput {

@@ -34,6 +34,14 @@ target_include_directories(config_lifecycle_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME config_lifecycle_test COMMAND config_lifecycle_test)
 
+# Candidate validation/diff is pure: no engine, transports or live services.
+add_executable(config_validation_test config_validation_test.cpp)
+target_link_libraries(config_validation_test PRIVATE tent_common gtest
+                                                     gtest_main)
+target_include_directories(config_validation_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME config_validation_test COMMAND config_validation_test)
+
 # TENT Metrics HTTP server test: validates that initialize() detects a busy
 # metrics port and degrades to log-only metrics instead of falsely reporting a
 # listening endpoint.
