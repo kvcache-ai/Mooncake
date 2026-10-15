@@ -564,6 +564,19 @@ class MasterClient {
         const std::string& tenant_id);
 
     /**
+     * @brief The promotion calls of a store that names the task by the item
+     * it drained (task id; see MasterService::PromotionTaskAllocStart).
+     */
+    [[nodiscard]] tl::expected<PromotionAllocStartResponse, ErrorCode>
+    PromotionTaskAllocStart(const UUID& client_id,
+                            const PromotionTaskItem& item,
+                            const std::vector<std::string>& preferred_segments);
+    [[nodiscard]] tl::expected<void, ErrorCode> NotifyPromotionTaskSuccess(
+        const UUID& client_id, const PromotionTaskItem& item);
+    [[nodiscard]] tl::expected<void, ErrorCode> NotifyPromotionTaskFailure(
+        const UUID& client_id, const PromotionTaskItem& item);
+
+    /**
      * @brief Commit a staged MEMORY replica to COMPLETE; called after the
      * client has written the bytes via Transfer Engine.
      */
