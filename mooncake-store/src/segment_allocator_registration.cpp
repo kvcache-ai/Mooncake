@@ -5,9 +5,10 @@
 namespace mooncake {
 
 SegmentAllocatorRegistration::SegmentAllocatorRegistration(
-    std::shared_ptr<BufferAllocatorBase> allocator,
+    std::shared_ptr<BufferAllocatorBase> allocator, std::string host,
     std::shared_ptr<ClientLivenessRecord> client_liveness)
     : allocator_(std::move(allocator)),
+      host_(std::move(host)),
       client_liveness_(std::move(client_liveness)) {}
 
 bool SegmentAllocatorRegistration::IsServing() const {

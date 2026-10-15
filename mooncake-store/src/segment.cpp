@@ -219,7 +219,8 @@ ErrorCode ScopedSegmentAccess::MountSegment(
             }
             auto registration =
                 segment_manager_->allocator_manager_.addAllocator(
-                    segment.name, allocator, std::move(client_liveness));
+                    segment.name, allocator, segment.host_id,
+                    std::move(client_liveness));
             segment_manager_->client_segments_[client_id].push_back(segment.id);
             segment_manager_->mounted_segments_[segment.id] = {
                 segment, SegmentStatus::OK, allocator, registration};
@@ -261,7 +262,7 @@ ErrorCode ScopedSegmentAccess::MountSegment(
 
     allocator->AttachUsageTracker(segment_manager_->usage_tracker_);
     auto registration = segment_manager_->allocator_manager_.addAllocator(
-        segment.name, allocator, std::move(client_liveness));
+        segment.name, allocator, segment.host_id, std::move(client_liveness));
     segment_manager_->client_segments_[client_id].push_back(segment.id);
     segment_manager_->mounted_segments_[segment.id] = {
         segment, SegmentStatus::OK, std::move(allocator), registration};
@@ -1108,8 +1109,9 @@ SegmentSerializer::Deserialize(const std::vector<uint8_t>& data) {
         }
         mounted_segment.allocator_registration =
             std::shared_ptr<SegmentAllocatorRegistration>(
-                new SegmentAllocatorRegistration(mounted_segment.buf_allocator,
-                                                 nullptr));
+                new SegmentAllocatorRegistration(
+                    mounted_segment.buf_allocator,
+                    mounted_segment.segment.host_id, nullptr));
         if (mounted_segment.status != SegmentStatus::OK) {
             mounted_segment.allocator_registration->SetAllocatable(false);
         }
