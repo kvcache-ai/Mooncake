@@ -396,10 +396,16 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             }
             tasks.push_back(it->second);
         }
-        auto result = client_->NotifyOffloadSuccess(tasks, metadatas);
+        // Under the RPC name only masters with task ids know: an older
+        // master (which would match the completion by key alone) answers
+        // with an error, and the bucket is rolled back and NACKed.
+        auto result = test_offload_completion_rpc_
+                          ? test_offload_completion_rpc_(tasks, metadatas)
+                          : client_->NotifyOffloadTaskSuccess(tasks, metadatas);
         if (!result) {
-            LOG(ERROR) << "[OFFLOAD] NotifyOffloadSuccess failed with error: "
-                       << result.error() << " keys count: " << keys.size();
+            LOG(ERROR)
+                << "[OFFLOAD] NotifyOffloadTaskSuccess failed with error: "
+                << result.error() << " keys count: " << keys.size();
             return result.error();
         }
         return ErrorCode::OK;

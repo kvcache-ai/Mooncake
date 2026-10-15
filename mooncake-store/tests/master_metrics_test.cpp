@@ -1075,7 +1075,7 @@ TEST_F(MasterMetricsTest, SsdOffloadCacheHitAndTotalConsistent) {
         .data_size = static_cast<int64_t>(value_length),
         .transport_endpoint = "tcp://127.0.0.1:9999"};
     auto offload_result =
-        service_.NotifyOffloadSuccess(client_id, {task}, {obj_meta});
+        service_.NotifyOffloadTaskSuccess(client_id, {task}, {obj_meta});
     ASSERT_TRUE(offload_result.has_value());
 
     // After offload: SSD_TOTAL should increment by 1, MEMORY_TOTAL unchanged.
@@ -1122,7 +1122,7 @@ TEST_F(MasterMetricsTest, SsdOffloadCacheHitAndTotalConsistent) {
         .data_size = static_cast<int64_t>(value_length),
         .transport_endpoint = "tcp://127.0.0.1:9998"};
     auto offload_result2 =
-        service_.NotifyOffloadSuccess(client_id, {task2}, {obj_meta2});
+        service_.NotifyOffloadTaskSuccess(client_id, {task2}, {obj_meta2});
     ASSERT_TRUE(offload_result2.has_value());
     std::this_thread::sleep_for(std::chrono::milliseconds(150));
     auto cleared =
