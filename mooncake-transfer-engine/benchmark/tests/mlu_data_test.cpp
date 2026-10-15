@@ -50,8 +50,8 @@ TEST_F(MluDataTest, InteriorDeviceDataMatchesHostPatternOnFreshWorker) {
     auto* ptr = static_cast<uint8_t*>(device_) + kOffset;
     std::thread worker([&] {
         std::vector<uint8_t> expected(kSize), actual(kSize);
-        EXPECT_FALSE(isGpuMemory(expected.data()));
-        ASSERT_TRUE(isGpuMemory(ptr));
+        EXPECT_FALSE(isMluMemory(expected.data()));
+        ASSERT_TRUE(isMluMemory(ptr));
         for (const auto* transport : {"tcp", "hp_tcp"}) {
             XferBenchConfig::xport_type = transport;
             for (bool check : {false, true}) {

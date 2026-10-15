@@ -245,19 +245,6 @@ static inline bool isMluMemory(void* ptr) {
 }
 #endif
 
-static inline bool isGpuMemory(void* ptr) {
-#if defined(USE_CUDA) || defined(USE_SUNRISE)
-    if (isCudaMemory(ptr)) return true;
-#endif
-#ifdef USE_HIP
-    if (isHipMemory(ptr)) return true;
-#endif
-#ifdef USE_MLU
-    if (isMluMemory(ptr)) return true;
-#endif
-    return false;
-}
-
 #ifdef USE_MLU
 static inline void copyMluData(void* host, void* device, size_t length,
                                bool to_device) {
