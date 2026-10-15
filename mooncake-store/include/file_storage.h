@@ -125,6 +125,8 @@ class FileStorage {
         FileStorageTest_PutAfterPhysicalWipeHealsDanglingLocalDiskReplicaOnBucket_Test;
     friend class
         FileStorageTest_RemountAfterSegmentNotFoundDropsUnregisteredFiles_Test;
+    friend class
+        FileStorageTest_OffloadSourcesUnchangedDetectsAReplacedSource_Test;
     struct AllocatedBatch {
         uint64_t batch_id;
         std::vector<BufferHandle> handles;
@@ -206,9 +208,19 @@ class FileStorage {
     tl::expected<void, ErrorCode> BatchLoad(
         std::unordered_map<std::string, Slice>& batch_object);
 
+    // Slices of each key's first readable memory replica in this process's
+    // segments; `replica_ids` (optional) receives that replica's id.
     tl::expected<void, ErrorCode> BatchQuerySegmentSlices(
         const std::vector<std::string>& keys, const std::string& tenant_id,
-        std::unordered_map<std::string, std::vector<Slice>>& batched_slices);
+        std::unordered_map<std::string, std::vector<Slice>>& batched_slices,
+        std::unordered_map<std::string, ReplicaID>* replica_ids = nullptr);
+
+    // True if every key's copied source replica (by id) is still the key's
+    // first readable local memory replica.
+    bool OffloadSourcesUnchanged(
+        const std::vector<std::string>& storage_keys,
+        const std::unordered_map<std::string, OffloadTaskItem>& tasks,
+        const std::unordered_map<std::string, ReplicaID>& sources);
 
     tl::expected<void, ErrorCode> RegisterLocalMemory();
 

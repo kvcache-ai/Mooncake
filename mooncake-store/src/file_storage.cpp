@@ -413,6 +413,9 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
     // through to the NACK flush below before returning it, so no drained key is
     // left waiting on the TTL reaper.
     std::optional<ErrorCode> abort_error;
+    // The memory replica each key is copied from (see
+    // OffloadSourcesUnchanged).
+    std::unordered_map<std::string, ReplicaID> source_replicas;
 
     for (const auto& keys : buckets_keys) {
         for (const auto& k : keys) all_bucket_keys.insert(k);
@@ -434,8 +437,9 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             }
             std::unordered_map<std::string, std::vector<Slice>>
                 user_batch_object;
+            std::unordered_map<std::string, ReplicaID> user_sources;
             [[maybe_unused]] auto query_result = BatchQuerySegmentSlices(
-                user_keys, tenant_id, user_batch_object);
+                user_keys, tenant_id, user_batch_object, &user_sources);
             // BatchQuerySegmentSlices is now best-effort: it always returns
             // OK. Keys present in user_batch_object go to batch_object; the
             // rest are reported as failed.
@@ -444,6 +448,7 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
                 auto it = user_batch_object.find(task.key);
                 if (it != user_batch_object.end()) {
                     batch_object.emplace(storage_key, std::move(it->second));
+                    source_replicas[storage_key] = user_sources.at(task.key);
                 } else {
                     failed_tasks.push_back(task);
                 }
@@ -509,9 +514,19 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         std::unordered_set<std::string> reported_keys;
         reported_keys.reserve(host_batch_object.size());
         auto bucket_complete_handler =
-            [this, offload_start, complete_handler, &reported_keys](
+            [this, offload_start, complete_handler, &reported_keys,
+             &task_by_storage_key, &source_replicas](
                 const std::vector<std::string>& keys,
                 std::vector<StorageObjectMetadata>& metadatas) -> ErrorCode {
+            // The bytes are now on disk. Report them only if every source
+            // replica still exists: a replica id that is present before and
+            // after the copy was never freed in between, so the copy holds
+            // that object's bytes and not a reused buffer. Otherwise the
+            // bucket is rolled back and its keys are NACKed.
+            if (!OffloadSourcesUnchanged(keys, task_by_storage_key,
+                                         source_replicas)) {
+                return ErrorCode::INVALID_READ;
+            }
             auto res = complete_handler(keys, metadatas);
             if (res == ErrorCode::OK) {
                 reported_keys.insert(keys.begin(), keys.end());
@@ -1061,7 +1076,8 @@ tl::expected<void, ErrorCode> FileStorage::BatchLoad(
 
 tl::expected<void, ErrorCode> FileStorage::BatchQuerySegmentSlices(
     const std::vector<std::string>& keys, const std::string& tenant_id,
-    std::unordered_map<std::string, std::vector<Slice>>& batched_slices) {
+    std::unordered_map<std::string, std::vector<Slice>>& batched_slices,
+    std::unordered_map<std::string, ReplicaID>* replica_ids) {
     auto batched_query_results = client_->BatchQuery(keys, tenant_id);
     if (batched_query_results.empty()) {
         return {};
@@ -1079,6 +1095,9 @@ tl::expected<void, ErrorCode> FileStorage::BatchQuerySegmentSlices(
                     slices.emplace_back(Slice{
                         slice_ptr, memory_descriptor.buffer_descriptor.size_});
                     batched_slices.insert({keys[i], std::move(slices)});
+                    if (replica_ids != nullptr) {
+                        replica_ids->insert({keys[i], descriptor.id});
+                    }
                     break;
                 }
             }
@@ -1226,6 +1245,38 @@ bool FileStorage::ReleaseBuffer(uint64_t batch_id) {
     VLOG(1) << "batch_id " << batch_id
             << " not found (may have been GC'd already)";
     return false;
+}
+
+bool FileStorage::OffloadSourcesUnchanged(
+    const std::vector<std::string>& storage_keys,
+    const std::unordered_map<std::string, OffloadTaskItem>& tasks,
+    const std::unordered_map<std::string, ReplicaID>& sources) {
+    std::unordered_map<std::string, std::vector<std::string>> keys_by_tenant;
+    for (const auto& storage_key : storage_keys) {
+        const auto task = tasks.find(storage_key);
+        if (task == tasks.end() || !sources.contains(storage_key)) {
+            return false;
+        }
+        keys_by_tenant[task->second.tenant_id].push_back(task->second.key);
+    }
+    for (const auto& [tenant_id, user_keys] : keys_by_tenant) {
+        std::unordered_map<std::string, std::vector<Slice>> slices;
+        std::unordered_map<std::string, ReplicaID> now;
+        (void)BatchQuerySegmentSlices(user_keys, tenant_id, slices, &now);
+        for (const auto& key : user_keys) {
+            const auto copied =
+                sources.find(TenantId(tenant_id).MakeScopedKey(key));
+            const auto current = now.find(key);
+            if (copied == sources.end() || current == now.end() ||
+                current->second != copied->second) {
+                LOG(WARNING) << "[OFFLOAD] source replica changed during the "
+                                "copy, not reporting the bucket; key="
+                             << key << ", tenant_id=" << tenant_id;
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 void FileStorage::DropUnregisteredFiles(const char* reason) {
