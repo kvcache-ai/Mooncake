@@ -1689,8 +1689,8 @@ TEST_F(MasterAdminServerTest, BatchQueryKeysReturnsLocalDiskReplicaInfo) {
     sm.key_size = static_cast<int64_t>(key.size());
     sm.data_size = 2048;
     sm.transport_endpoint = endpoint;
-    ASSERT_TRUE(
-        service->NotifyOffloadSuccess(client_id, *drained, {sm}).has_value());
+    ASSERT_TRUE(service->NotifyOffloadTaskSuccess(client_id, *drained, {sm})
+                    .has_value());
     auto cleared = service->BatchReplicaClear({key}, client_id, segment.name);
     ASSERT_TRUE(cleared.has_value());
     ASSERT_EQ(cleared->size(), 1u);
