@@ -78,18 +78,18 @@ Heartbeat Thread          Master                  Local Memory Segment
       │                     │                             │
       │  BatchOffload(slices) → StorageBackend → SSD      │
       │                     │                             │
-      │─ NotifyOffloadSuccess(keys, metadata) ───────────▶│
+      │─ NotifyOffloadTaskSuccess(items, metadata) ──────▶│
       │                     │  (master adds LOCAL_DISK    │
       │                     │   replica to object entry)  │
 ```
 
 Step by step:
 
-1. **Heartbeat**: The heartbeat thread wakes up every `MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS` seconds and calls `client_->OffloadObjectHeartbeat(enable_offloading_, offloading_objects)`. The master replies with a map of `{key → size}` for objects it has selected to evict from memory.
+1. **Heartbeat**: The heartbeat thread wakes up every `MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS` seconds and calls `client_->OffloadObjectHeartbeat(enable_offloading_, offloading_objects)`. The master replies with the offload items (`tenant_id`, `key`, `size`, `task_id`) of the objects it has selected to offload, and records this client as a taker of each item's task. Every offload task has an L4 task id (`L4TaskId{epoch, seq}`; the epoch is drawn at random for every master instance). An item without a task id comes from a master that predates task ids; the store NACKs it without copying.
 2. **Read slices from memory**: `FileStorage::OffloadObjects` groups the keys into buckets (for `BucketStorageBackend`) and calls `BatchQuerySegmentSlices` to obtain `{key → Slice}` from the local memory segment via `client_->BatchQuery`.
 3. **Eviction** (if capacity limit is set): Before writing, `PrepareEviction` removes old buckets from metadata under the exclusive lock and collects their keys. The `eviction_handler` callback calls `client_->BatchEvictDiskReplica` to notify the master in one batched RPC. `FinalizeEviction` then deletes the corresponding files.
 4. **Write to SSD**: `StorageBackend::BatchOffload` serializes and writes the key-value data to disk.
-5. **Notify master**: On success, the `complete_handler` calls `client_->NotifyOffloadSuccess(keys, metadatas)`. The master adds a `LOCAL_DISK` replica entry (carrying the real client's RPC address as `transport_endpoint`) to the object's replica list.
+5. **Notify master**: After the bucket is written, the store checks that the memory replica each key was copied from still exists (otherwise the bucket is rolled back and NACKed), then the `complete_handler` calls `client_->NotifyOffloadTaskSuccess(items, metadatas)`, echoing the drained items. The master adds a `LOCAL_DISK` replica entry (carrying the real client's RPC address as `transport_endpoint`) to the object's replica list only if the item names the key's current offload task, this client took it, the copy came from the replica the task pins, and the size matches. Anything else is refused and never creates an object. NACKs (`data_size < 0`) go through `NotifyOffloadSuccess`, and end only the task they name.
 
 ### Load (SSD → memory)
 
@@ -290,6 +290,6 @@ To prevent `io_uring`'s `FOLL_LONGTERM` page pinning from failing on systems wit
 
 ## Metadata Recovery on Restart
 
-On startup, `FileStorage::Init` calls `StorageBackend::ScanMeta`, which reads on-disk metadata and invokes a callback for each discovered object. The callback calls `MasterClient::NotifyOffloadSuccess` to re-register the objects with the master. This restores the full disk-replica view without any application-level intervention for the backends that preserve restart metadata, namely `BucketStorageBackend` and the file-per-key backend.
+Offloaded files are not re-registered with the master. A file the store already has can predate the current object of its key (`Remove` does not delete it), so the master registers a `LOCAL_DISK` replica only as the completion of an offload task. When the store's LOCAL_DISK registration is new (`FileStorage::Init`, and the re-mount after the master answers `SEGMENT_NOT_FOUND`), the store drops its offloaded files before it takes any offload task. A shared backend (object storage) is left untouched. L4 contents therefore do not survive a store restart or a master restart; later offloads repopulate them.
 
 `OffsetAllocatorStorageBackend` is the exception. It truncates its pre-allocated data file during initialization and clears its in-memory metadata, so previously offloaded objects are not recoverable after a real client restart.
