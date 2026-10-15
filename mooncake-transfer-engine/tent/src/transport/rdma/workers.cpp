@@ -1598,7 +1598,8 @@ Status Workers::selectOptimalDevice(RouteHint& source, RouteHint& target,
                                     RdmaSlice* slice) {
     auto& worker = worker_context_[tl_wid];
     auto& rail = getOrCreateRail(worker.rails, target.segment->machine_id);
-    if (!rail.ready() || target.topo != rail.remote())
+    if (!rail.ready() || source.topo != rail.local() ||
+        target.topo != rail.remote())
         CHECK_STATUS(
             rail.load(std::shared_ptr<const Topology>(source.pin, source.topo),
                       std::shared_ptr<const Topology>(target.pin, target.topo),
@@ -1785,6 +1786,13 @@ Status Workers::selectFallbackDevice(RouteHint& source, RouteHint& target,
         same_machine
             ? nullptr
             : &getOrCreateRail(worker.rails, target.segment->machine_id);
+    if (rail_mon && (!rail_mon->ready() || source.topo != rail_mon->local() ||
+                     target.topo != rail_mon->remote())) {
+        CHECK_STATUS(rail_mon->load(
+            std::shared_ptr<const Topology>(source.pin, source.topo),
+            std::shared_ptr<const Topology>(target.pin, target.topo),
+            rail_topo_json_, transport_->conf_.get()));
+    }
     size_t start =
         static_cast<size_t>(slice->last_fallback_idx + 1) % total_combos;
     const uint64_t device_mask = slice->task->device_mask;
