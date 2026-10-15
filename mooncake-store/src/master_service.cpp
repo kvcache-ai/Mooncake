@@ -722,6 +722,20 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
     ErrorCode mount_result = ErrorCode::INTERNAL_ERROR;
     {
         std::unique_lock<std::shared_mutex> client_lock(client_mutex_);
+        if (!pending_restored_segments_.empty()) {
+            // Handoff restore: a mount that proves a restored segment stale
+            // (e.g. its store restarted during the roll) drops it first.
+            const auto mismatched =
+                FindHandoffMismatchesLocked({segment}, client_id, false);
+            if (!mismatched.empty()) {
+                std::unique_lock<std::shared_mutex> state_lock(
+                    master_state_mutex_);
+                for (const auto& segment_id : mismatched) {
+                    DropPendingRestoredSegmentLocked(segment_id,
+                                                     "conflicting_mount");
+                }
+            }
+        }
         auto [record_it, inserted] = client_liveness_records_.try_emplace(
             client_id, std::make_shared<ClientLivenessRecord>(
                            ClientLivenessRecord::Clock::now()));
@@ -877,6 +891,15 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                 ClientLivenessState::ACTIVE);
         };
         std::unique_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
+        if (!pending_restored_segments_.empty()) {
+            // Handoff restore: drop restored segments this remount proves
+            // stale before the normal validation sees them.
+            for (const auto& segment_id :
+                 FindHandoffMismatchesLocked(segments, client_id, true)) {
+                DropPendingRestoredSegmentLocked(segment_id,
+                                                 "remount_identity_mismatch");
+            }
+        }
         for (const auto& segment : segments) {
             if (!segment.host_id.empty()) {
                 client_host_id_[client_id] = segment.host_id;
@@ -1156,6 +1179,13 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                 accessor.Get().GrantReadLease(
                     std::chrono::milliseconds(default_kv_lease_ttl_));
             }
+        }
+
+        if (!pending_restored_segments_.empty()) {
+            // Handoff restore: the owner presented the exact restored
+            // identity, so its objects are intact. The read gate was lifted
+            // above; open the segment for allocation.
+            ConfirmPendingRestoredSegmentsLocked(segments, client_id);
         }
 
         // Change the client status to OK
@@ -2734,6 +2764,11 @@ void MasterService::TaskCleanupThreadFunc() {
         }
         CleanupExpiredSoftPins(std::chrono::system_clock::now());
         CleanupExpiredDynamicReplicationState();
+        shared_lock.unlock();
+        // Shutdown handoff: both take their own locks (the reconcile step
+        // needs client_mutex_ and master_state_mutex_ exclusively).
+        ReleaseExpiredHandoffQuarantine(std::chrono::steady_clock::now());
+        (void)ReconcileHandoffPendingSegments();
     }
     LOG(INFO) << "Task cleanup thread stopped";
 }
@@ -3611,8 +3646,9 @@ struct MasterService::BatchRestoreContext {
 
 tl::expected<void, ErrorCode> MasterService::InstallRestoredObjects(
     std::vector<RestoredObject>& objects,
-    std::vector<std::pair<TenantId, route::ObjectRef>>& installed,
-    std::vector<std::vector<RestoredRange>>& ranges) {
+    std::vector<std::pair<TenantId, route::ObjectRef>>* installed,
+    std::vector<std::vector<RestoredRange>>& ranges,
+    const std::function<void(ObjectMetadata&)>& finish) {
     const auto now = std::chrono::system_clock::now();
     for (auto& object : objects) {
         const auto& standby_meta = object.entry->metadata;
@@ -3662,8 +3698,14 @@ tl::expected<void, ErrorCode> MasterService::InstallRestoredObjects(
                 ranges[segment].push_back(
                     {buffer.buffer_address_, buffer.size_, &replica});
             });
-        installed.emplace_back(object.tenant_id,
-                               route::ObjectRef{object.user_key, generation});
+        if (installed) {
+            installed->emplace_back(
+                object.tenant_id,
+                route::ObjectRef{object.user_key, generation});
+        }
+        if (finish) {
+            finish(metadata);
+        }
     }
     return {};
 }
@@ -3882,7 +3924,7 @@ tl::expected<bool, ErrorCode> MasterService::RestoreBatchOpLogChunk(
     }
 
     auto installed =
-        InstallRestoredObjects(prepared, worker.installed, worker.ranges);
+        InstallRestoredObjects(prepared, &worker.installed, worker.ranges);
     if (!installed) {
         return tl::make_unexpected(installed.error());
     }
