@@ -678,8 +678,7 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
         auto it = chunk_map_.find((uint64_t)addr);
         if (it != chunk_map_.end()) {
             // Copy, but keep the entry until the whole unregister succeeds:
-            // chunk metadata is removed below, so a retry after a partial
-            // failure can only re-enumerate the chunks through this map.
+            // a retry re-enumerates the chunks through this map.
             chunk_addrs = it->second;
         }
     }
@@ -754,12 +753,10 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
     }
 
     int rc = metadata_->removeLocalMemoryBuffer(addr, update_metadata);
-    // A missing metadata entry does NOT prove the MRs are gone: this path
-    // removes the metadata BEFORE deregistering, so a partial ibv_dereg_mr
-    // failure on an earlier attempt leaves live MRs behind a missing entry.
-    // Fall through and retry the per-context deregistration; a genuinely
-    // clean address no-ops in RdmaContext::unregisterMemoryRegion. Only then
-    // is ERR_ADDRESS_NOT_REGISTERED a truthful "nothing remains" signal.
+    // A missing metadata entry does NOT prove the MRs are gone: a partial
+    // ibv_dereg_mr failure on an earlier attempt leaves live MRs behind it.
+    // Fall through and retry the per-context deregistration (a clean address
+    // no-ops), so ERR_ADDRESS_NOT_REGISTERED means "nothing remains".
     const bool metadata_missing = (rc == ERR_ADDRESS_NOT_REGISTERED);
     if (rc && !metadata_missing) return rc;
 
@@ -805,9 +802,8 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
         }
     }
 
-    // Preserve the "nothing was registered" signal for an address whose
-    // metadata was already gone and whose MR cleanup above was a no-op (or a
-    // successful retry of a previously failed deregistration).
+    // Preserve the "nothing was registered" signal once the MR cleanup above
+    // has confirmed (or completed) that nothing remains.
     return metadata_missing ? ERR_ADDRESS_NOT_REGISTERED : 0;
 }
 

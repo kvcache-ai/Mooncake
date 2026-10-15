@@ -1000,8 +1000,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         LOG(ERROR) << "Client is already initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
-    // A previous teardown latched closed_; reset it so this new instance can
-    // be torn down again (teardown is otherwise a one-shot no-op).
+    // Reset the teardown latch so this instance can be torn down again.
     closed_.store(false, std::memory_order_release);
 
     this->protocol = protocol;
@@ -1148,13 +1147,9 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             use_hugepage_ && !globalConfig().ascend_use_fabric_mem,
             nof_runtime_.initiator ? nof_runtime_.dma_allocator : nullptr);
     } catch (const std::bad_alloc &) {
-        // The DMA allocator returns nullptr when the SPDK env is unavailable
-        // (lazy init means setup no longer fail-fasts on it), and
-        // ClientBufferAllocator throws on a null buffer. Turn the exception
-        // into an error code so the pybind boundary keeps its int-return
-        // contract. Deliberately no silent fallback to generic allocation:
-        // the operator enabled NoF, and a silent fallback would surface as
-        // harder-to-debug NoF registration failures later.
+        // The NoF DMA allocator yields nullptr when the SPDK env is
+        // unavailable; report an error instead of a silent generic-allocation
+        // fallback that would surface later as NoF registration failures.
         LOG(ERROR) << "Failed to allocate client buffer memory (NoF DMA "
                       "allocator unavailable or out of memory; check the "
                       "hugepage/SPDK environment)";
@@ -1756,11 +1751,9 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     bool expected = false;
     if (!closed_.compare_exchange_strong(expected, true,
                                          std::memory_order_acq_rel)) {
-        // A previous teardown ran the one-shot cleanup. If its NoF buffer
-        // cleanup failed, that failure must not decay into success on repeat
-        // calls: the caller-owned buffers may still be DMA-translated. Retry
-        // the (idempotent) cleanup walk and keep reporting the failure until
-        // it actually heals.
+        // A previous teardown's NoF cleanup failure must not decay into
+        // success on repeat calls: retry the idempotent cleanup and keep
+        // reporting failure until it heals.
         if (nof_buffer_cleanup_failed_.load(std::memory_order_acquire)) {
             const ErrorCode rc = CleanupNofRegisteredBuffers();
             if (rc != ErrorCode::OK) {
@@ -1828,11 +1821,8 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
         embedded_master_.reset();
     }
     // NoF I/O is drained by now (client_.reset() joined the worker pool).
-    // Release this client's NoF registrations so a closed client never leaves
-    // orphan entries in the process-global page registry. Failures are
-    // reported: these buffers are caller-owned, so the caller must be told
-    // that they may still be DMA-translated and must not be freed or remapped
-    // until process exit.
+    // Release this client's NoF registrations; on failure the caller-owned
+    // buffers may still be DMA-translated and must not be freed or remapped.
     {
         const ErrorCode nof_rc = CleanupNofRegisteredBuffers();
         if (nof_rc != ErrorCode::OK && cleanup_error == ErrorCode::OK) {
@@ -1940,9 +1930,8 @@ ErrorCode RealClient::CleanupNofRegisteredBuffers() {
         const ErrorCode rc =
             nof_runtime_.initiator->UnregisterMemory(it->first);
         if (rc != ErrorCode::OK) {
-            // Keep the record: this buffer must stay mapped — its DMA
-            // translation state is unconfirmed, so freeing or remapping it
-            // could let NoF write into reused memory.
+            // Keep the record: the DMA translation state is unconfirmed,
+            // so the buffer must stay mapped.
             LOG(ERROR) << "NoF registration for buffer " << it->first
                        << " could not be released; its NoF pages stay "
                           "quarantined — do NOT free or remap this buffer "
@@ -4526,10 +4515,8 @@ tl::expected<void, ErrorCode> RealClient::register_buffer_internal(
         return result;
     }
     // #3131: SPDK's RDMA transport keeps its own translation table, which TE
-    // registration does not cover. Failure is non-fatal (same policy as the
-    // shm paths): the buffer stays usable for non-NoF transfers. The NoF side
-    // registers the same (possibly widened) range as TE so the two layers
-    // never disagree about coverage.
+    // registration does not cover. Register the same (possibly widened) range
+    // as TE; failure is non-fatal (same policy as the shm paths).
     if (nof_runtime_.initiator) {
         auto rc =
             nof_runtime_.initiator->RegisterMemory(buffer, registration_size);
@@ -4583,14 +4570,11 @@ tl::expected<void, ErrorCode> RealClient::unregister_buffer_internal(
     std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
     auto rec_it = registered_buffer_sizes_.find(buffer);
     if (!unregister_result) {
-        // Fall through to the NoF cleanup ONLY when TE reports the buffer as
+        // Fall through to the NoF cleanup only when TE reports the buffer as
         // not registered and the record is still present. NOT_REGISTERED is
-        // truthful since the TE-side fix in this PR: RdmaTransport retries
-        // the per-context MR deregistration behind a missing metadata entry
-        // and returns the real error when an MR is still live, so
-        // NOT_REGISTERED can no longer hide a partial deregistration. Any
-        // other TE failure means the TE registration may still be alive:
-        // keep the record and propagate.
+        // truthful: RdmaTransport retries any stuck MR deregistration before
+        // reporting it. Any other TE failure may leave the TE registration
+        // alive: keep the record and propagate.
         if (unregister_result.error() != ErrorCode::NOT_REGISTERED ||
             rec_it == registered_buffer_sizes_.end()) {
             LOG(ERROR) << "Unregister buffer failed with error: "

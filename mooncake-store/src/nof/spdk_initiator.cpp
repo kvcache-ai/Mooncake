@@ -211,10 +211,9 @@ struct NofRegistryBundle {
 };
 
 NofRegistryBundle& GetNofRegistryBundle() {
-    // Deliberately leaked (like RegistryMutex and the ShmHelper singleton): a
-    // probe initiator's function-static shared_ptr can be destroyed AFTER a
-    // function-static bundle, and its ~Impl backstop UnregisterAll would then
-    // touch a destroyed registry.
+    // Deliberately leaked (like RegistryMutex and the ShmHelper singleton):
+    // avoids static-destruction-order issues with probe initiators' backstop
+    // UnregisterAll.
     static NofRegistryBundle* bundle = new NofRegistryBundle();
     return *bundle;
 }
@@ -244,10 +243,9 @@ struct ctrlr_info {
     std::mutex ns_mutex;
 };
 
-// Process-unique owner tokens for the page registry. A monotonically
-// increasing id can never be recycled, unlike an Impl's heap address (a new
-// Impl allocated over a dead one's storage would otherwise inherit its
-// leftover registration records).
+// Process-unique owner tokens for the page registry: unlike an Impl's heap
+// address, a monotonically increasing id is never recycled (a new Impl could
+// otherwise inherit a dead one's leftover registration records).
 std::atomic<uint64_t> g_nof_owner_token{1};
 
 }  // namespace
@@ -728,8 +726,7 @@ class SpdkInitiator::Impl {
     // Member order matters: env_guard_ is declared FIRST so it is destroyed
     // LAST — all qpairs/ctrlrs are detached before spdk_env_fini runs.
     std::shared_ptr<SpdkEnvGuard> env_guard_;
-    // Process-unique registry owner token (see g_nof_owner_token). Trivially
-    // destructible, so its position in the destruction order is irrelevant.
+    // Process-unique registry owner token (see g_nof_owner_token).
     const uint64_t owner_token_ =
         g_nof_owner_token.fetch_add(1, std::memory_order_relaxed);
     std::mutex env_mutex_;

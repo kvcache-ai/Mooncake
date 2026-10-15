@@ -301,10 +301,8 @@ enum class ErrorCode : int32_t {
     // Memory registration errors
     NOF_REGISTRATION_STUCK =
         -11,  ///< NoF DMA registration failed after partially changing backend
-              ///< state; cleanup could not be confirmed. Bookkeeping is
-              ///< retained so teardown retries the unregistration — the range
-              ///< must be treated as still registered (quarantine, never
-              ///< munmap without a successful unregister).
+              ///< state; cleanup could not be confirmed. The range stays
+              ///< quarantined (never munmap without a successful unregister).
     NOT_REGISTERED = -12,  ///< The address is not registered with the transfer
                            ///< engine.
 

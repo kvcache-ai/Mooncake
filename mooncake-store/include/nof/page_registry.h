@@ -22,11 +22,10 @@ namespace mooncake {
 //     not roll back on failure; -EINVAL on unregister covers both "nothing
 //     marked" and "partially translated" — the two cannot be told apart.
 //
-// Ownership: registrations are charged to an explicit owner token (a unique
-// id per registering initiator instance — NOT its address, which could be
-// reused by a later allocation and would let the new instance inherit the
-// dead one's leftover records). Per-page refcounts are process-wide, so one
-// owner's Unregister never unmaps pages another owner still relies on.
+// Ownership: registrations are charged to an owner token (a unique,
+// never-recycled id per initiator instance). Per-page refcounts are
+// process-wide, so one owner's Unregister never unmaps pages another owner
+// still relies on.
 //
 // Failure handling is fail-stop (the baseline SpdkWrapper contract): a
 // failed registration is cleaned up once; anything whose cleanup cannot be

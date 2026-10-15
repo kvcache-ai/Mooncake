@@ -472,10 +472,8 @@ void NofWorkerPool::workerThread(int work_idx) {
     auto& queue_mutex = queue_mutex_[work_idx];
     auto last_debug_snapshot = std::chrono::steady_clock::now();
 
-    // Best-effort preallocation only: on failure the submit loop below
-    // retries CheckSubTaskPool on demand and fails the affected task, so the
-    // worker must NOT exit here (a dead worker strands every queued task and
-    // hangs teardown at join()).
+    // Best-effort preallocation: the submit loop retries on demand. The
+    // worker must not exit here — a dead worker hangs teardown at join().
     (void)CheckSubTaskPool(sub_task_pool, sub_task_chunks, work_idx);
 
     while (true) {
@@ -501,9 +499,8 @@ void NofWorkerPool::workerThread(int work_idx) {
                     new (std::nothrow) NofTask(std::move(task_queue.front()));
                 if (task == nullptr) {
                     LOG(ERROR) << "alloc NofTask failed, worker " << work_idx;
-                    // The queue front was not moved from: pop it and fail it
-                    // loudly. Retrying the same front would spin forever and
-                    // wedge the worker (teardown then hangs at join()).
+                    // The front was not moved from: fail it and pop, or the
+                    // worker spins forever and teardown hangs at join().
                     auto& front = task_queue.front();
                     if (front.state) {
                         front.state->set_completed(ErrorCode::TRANSFER_FAIL);
@@ -520,9 +517,8 @@ void NofWorkerPool::workerThread(int work_idx) {
                     if (qos == nullptr) {
                         LOG(ERROR)
                             << "alloc NofQos failed, worker " << work_idx;
-                        // task owns the moved-out state: fail it, drop the
-                        // task, and pop the moved-from front so it is never
-                        // re-enqueued with a null state.
+                        // task owns the moved-out state: fail it, then drop
+                        // the task and the moved-from queue front.
                         if (task->state) {
                             task->state->set_completed(
                                 ErrorCode::TRANSFER_FAIL);

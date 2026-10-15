@@ -809,10 +809,9 @@ class RealClient : public PyClient {
 
     tl::expected<void, ErrorCode> tearDownAll_internal();
 
-    // Releases this client's NoF registrations for every recorded user buffer
-    // (idempotent). Failures keep their records and latch
-    // nof_buffer_cleanup_failed_ so repeated teardown calls keep reporting
-    // the failure instead of decaying into success.
+    // Idempotently releases this client's NoF registrations for all recorded
+    // user buffers; failures keep their records and latch
+    // nof_buffer_cleanup_failed_.
     ErrorCode CleanupNofRegisteredBuffers();
 
     tl::expected<bool, ErrorCode> isExist_internal(const std::string &key);
@@ -1133,11 +1132,9 @@ class RealClient : public PyClient {
     mutable std::shared_mutex registered_buffer_mutex_;
     struct BufferRegistrationRecord {
         size_t size;
-        // TE cleanup was confirmed (unregisterLocalMemory returned OK, or
-        // NOT_REGISTERED — truthful since the TE-side fix: RdmaTransport
-        // retries the per-context MR deregistration before reporting
-        // NOT_REGISTERED, so it can no longer hide a live MR). NoF cleanup
-        // may still be pending.
+        // TE cleanup was confirmed (OK, or NOT_REGISTERED — truthful since
+        // RdmaTransport retries any stuck MR deregistration first). NoF
+        // cleanup may still be pending.
         bool te_cleanup_confirmed = false;
     };
     // A present record means "registered OR cleanup-pending": a record is
@@ -1214,10 +1211,8 @@ class RealClient : public PyClient {
     // Ensure cleanup executes at most once across multiple entry points
     std::atomic<bool> closed_{false};
 
-    // Latched when a teardown's NoF buffer cleanup failed: repeat teardown
-    // calls re-run the idempotent cleanup walk and keep reporting the
-    // failure until it heals, instead of returning success on a buffer that
-    // may still be DMA-translated.
+    // Latched when teardown's NoF buffer cleanup failed: repeat teardown
+    // calls retry the cleanup and keep reporting the failure until it heals.
     std::atomic<bool> nof_buffer_cleanup_failed_{false};
 
     // Counts every LOCAL_DISK read served via peer offload-RPC.
