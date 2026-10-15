@@ -1,6 +1,7 @@
 #include "file_storage.h"
 
 #include <algorithm>
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <utility>
@@ -719,8 +720,10 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
     }
 
     // === STEP 3: Persist offloaded objects (trigger actual data migration) ===
+    const size_t drained_count = offloading_objects.size();
     if (!offloading_objects.empty()) {
-        auto offload_result = OffloadObjects(offloading_objects);
+        auto offload_result =
+            ProcessDrainedOffloads(std::move(offloading_objects));
         if (!offload_result) {
             LOG(ERROR) << "Failed to persist objects with error: "
                        << offload_result.error();
@@ -729,7 +732,7 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
     }
 
     VLOG(1) << "Completed heartbeat with offloaded objects count: "
-            << offloading_objects.size();
+            << drained_count;
 
     // Drive any pending L2->L1 promotion work for this client. Failures
     // inside ProcessPromotionTasks are logged per-key and do not propagate;
@@ -745,6 +748,36 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
                      << disk_eviction_result.error();
     }
     return {};
+}
+
+tl::expected<void, ErrorCode> FileStorage::ProcessDrainedOffloads(
+    std::vector<OffloadTaskItem> drained) {
+    // The master registers a completion only if it echoes the task id of the
+    // item (MasterService::NotifyOffloadSuccess). An item without one comes
+    // from a master that predates task ids and matches reports by key alone,
+    // so a copy made for it could be registered for another object of the
+    // key. Such items are NACKed (the master ends their tasks) and never
+    // copied: with such a master, L4 stays empty.
+    std::vector<OffloadTaskItem> without_id;
+    auto with_id_end = std::stable_partition(
+        drained.begin(), drained.end(),
+        [](const OffloadTaskItem& item) { return item.task_id.has_value(); });
+    without_id.assign(std::make_move_iterator(with_id_end),
+                      std::make_move_iterator(drained.end()));
+    drained.erase(with_id_end, drained.end());
+    if (!without_id.empty()) {
+        std::vector<StorageObjectMetadata> nacks(
+            without_id.size(), StorageObjectMetadata{-1, 0, 0, -1, ""});
+        auto result = client_->NotifyOffloadSuccess(without_id, nacks);
+        LOG(WARNING) << "action=nack_offload_items, reason=no_task_id"
+                     << ", offload_items_without_task_id=" << without_id.size()
+                     << ", result="
+                     << (result ? ErrorCode::OK : result.error());
+    }
+    if (drained.empty()) {
+        return {};
+    }
+    return OffloadObjects(drained);
 }
 
 void FileStorage::RemoveAll() {
