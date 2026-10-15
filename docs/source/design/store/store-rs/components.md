@@ -236,6 +236,6 @@ See the [benchmark guide](../../../performance/mooncake/store-rs-benchmark.md) f
 3. [Rust API](../../../api-reference/rust/store-rs.md)
 4. [Configuration](../../../deployment/store-rs/configuration.md)
 5. `crates/mooncake-store-core`
-6. [Features](../../../getting_started/store-rs-features.md)
+6. [Features](features.md)
 7. [Architecture](architecture.md)
 8. [Test and validation guide](../../../deployment/store-rs/testing.md)
