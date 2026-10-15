@@ -319,8 +319,12 @@ request as if it were served serially; in practice those bytes are spread over
 several NICs and queue pairs and move in parallel, and the new request's own
 slices are spread the same way. So a predicted MLU of 1.1 usually still lands
 on time. θ in the range 1.2 to 1.5 absorbs that bias and drops only requests
-the wait alone rules out. The code does not currently validate the lower
-bound; treat 1.0 as the floor.
+the wait alone rules out. Treat 1.0 as the floor: with the runtime queue and
+`deadline_aware` on, the engine logs a warning at construction for a threshold
+in (0, 1) but still applies it. A negative, NaN or infinite threshold turns the
+drop off, because the drop needs a positive threshold and the predicted MLU
+never exceeds `DBL_MAX`; the engine warns about that as well and points to
+`0`.
 
 ### Dispatch Window and Progress
 
@@ -489,7 +493,7 @@ Device selection is documented in [Slice Spraying](slice-spraying.md).
 | `max_dispatch_bytes` | int | `67108864` (64 MiB) | Bytes in flight at the transports at once; a single request longer than this is rejected at submit |
 | `deadline_aware` | bool | `false` | Earliest-deadline-first dispatch; owners without a deadline keep FIFO order behind those with one. Required by promotion and drop |
 | `promotion_slack_ns` | int | `0` | Owners with less remaining slack than this move to the front of the queue. `0` disables promotion |
-| `mlu_local_threshold` | float | `0.0` | θ_local. Eligible owners whose predicted MLU reaches this value are canceled instead of dispatched. `0` disables the drop. Values below `1.0` cancel requests predicted to succeed |
+| `mlu_local_threshold` | float | `0.0` | θ_local. Eligible owners whose predicted MLU reaches this value are canceled instead of dispatched. `0` disables the drop. Values in (0, 1) cancel requests predicted to succeed; negative, NaN or infinite values disable the drop. The engine logs a warning for both but applies them |
 | `progress_fallback_interval_us` | int | `50000` | Timer on which the progress worker refills the dispatch window when no completion wake arrives. `0` disables the timer |
 
 ### RDMA Arbitration and the Transmit Estimate
@@ -584,8 +588,9 @@ See the [tebench guide](../../performance/mooncake/tebench.md).
   there is no public API to register one, so a caller learns of a drop only by
   observing `CANCELED`. The hook exists for an upper layer to trigger local
   recompute.
-- **Threshold validation.** `mlu_local_threshold` below `1.0` is accepted and
-  cancels requests the predictor expects to succeed. Treat `1.0` as the floor.
+- **Threshold validation.** `mlu_local_threshold` in (0, 1) is accepted with
+  a startup warning and cancels requests the predictor expects to succeed.
+  Treat `1.0` as the floor.
 - **Mixed submits.** A submit that mixes staged and non-staged owners bypasses
   the queue as a whole, so its RDMA owners do not enter `dispatching_bytes_`
   and the drop predictor underestimates the queue ahead of later requests.
