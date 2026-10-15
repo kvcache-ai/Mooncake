@@ -15,7 +15,7 @@ Mooncake provides broad support for heterogeneous hardware and deployment enviro
 
 ## Core components
 
-### Transfer Engine: high-performance data transfering
+### Transfer Engine: high-performance data transferring
 
 [Mooncake Transfer Engine](transfer-engine/index.md) is a library embedded in the process that owns or consumes data. It exposes two central abstractions:
 
