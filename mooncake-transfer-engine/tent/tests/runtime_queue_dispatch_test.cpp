@@ -16,8 +16,10 @@
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <string>
 #include <thread>
@@ -26,6 +28,7 @@
 
 #include "tent/common/config.h"
 #include "tent/common/types.h"
+#include "tent/runtime/deadline_mlu.h"
 #include "tent/runtime/segment.h"
 #include "tent/runtime/control_plane.h"
 #include "tent/runtime/transfer_engine_impl.h"
@@ -332,6 +335,45 @@ TEST(RuntimeQueueDispatch, RejectsEmptyDispatchWindowConfig) {
     TransferEngineImpl byte_window_engine(cfg);
 
     EXPECT_FALSE(byte_window_engine.available());
+}
+
+// The engine warns on kDropsFeasible and kSilentlyDisabled, so the split
+// between them decides which warning text a config gets.
+TEST(RuntimeQueueDispatch, ClassifiesMluLocalThreshold) {
+    const double inf = std::numeric_limits<double>::infinity();
+    EXPECT_EQ(ClassifyMluLocalThreshold(0.0), MluThresholdEffect::kDisabled);
+    EXPECT_EQ(ClassifyMluLocalThreshold(-0.0), MluThresholdEffect::kDisabled);
+    for (double theta : {0.5, 0.999, std::numeric_limits<double>::min()}) {
+        EXPECT_EQ(ClassifyMluLocalThreshold(theta),
+                  MluThresholdEffect::kDropsFeasible)
+            << "theta=" << theta;
+    }
+    for (double theta : {1.0, 1.5, std::numeric_limits<double>::max()}) {
+        EXPECT_EQ(ClassifyMluLocalThreshold(theta),
+                  MluThresholdEffect::kRecommended)
+            << "theta=" << theta;
+    }
+    for (double theta : {-1.0, -inf, inf, std::nan("")}) {
+        EXPECT_EQ(ClassifyMluLocalThreshold(theta),
+                  MluThresholdEffect::kSilentlyDisabled)
+            << "theta=" << theta;
+    }
+    // Why +inf disables the drop: a missed deadline yields DBL_MAX, not inf,
+    // so `mlu >= theta` never holds.
+    EXPECT_LT(DeadlineMlu(0, 1, /*deadline_ns=*/1, /*now_ns=*/2, 1e9), inf);
+}
+
+// Values outside 0 or [1.0, inf) only log a warning: existing configs keep
+// constructing.
+TEST(RuntimeQueueDispatch, AcceptsMluLocalThresholdOutsideRecommendedRange) {
+    for (double theta : {0.0, 0.5, 0.999, 1.0, 1.5, -1.0, std::nan(""),
+                         std::numeric_limits<double>::infinity()}) {
+        auto cfg = makeRuntimeQueueConfig(1, 1UL << 20);
+        cfg->set("runtime_queue/deadline_aware", true);
+        cfg->set("runtime_queue/mlu_local_threshold", theta);
+        TransferEngineImpl engine(cfg);
+        EXPECT_TRUE(engine.available()) << "theta=" << theta;
+    }
 }
 
 TEST(RuntimeQueueDispatch, DispatchesOnlyOneWindowOnSubmit) {

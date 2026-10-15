@@ -104,7 +104,9 @@ DEFINE_bool(deadline_aware, false,
 DEFINE_double(mlu_local_threshold, 0.0,
               "tent only: drop a queued transfer whose predicted completion "
               "time divided by its remaining deadline window (MLU) is at or "
-              "above this value; 0 disables the drop. Acts only on "
+              "above this value; 0 disables the drop. Values below 1.0 also "
+              "drop transfers predicted to meet their deadline (the engine "
+              "warns); 1.2-1.5 is recommended. Acts only on "
               "RDMA-routed transfers; requires --deadline_aware.");
 DEFINE_int32(local_gpu_id, 0, "Local GPU ID to be used, -1 for all GPUs");
 DEFINE_int32(target_gpu_id, 0, "Target GPU ID to be used, -1 for all GPUs");

@@ -30,6 +30,7 @@
 #include "tent/common/config.h"
 #include "tent/common/status.h"
 #include "tent/runtime/control_plane.h"
+#include "tent/runtime/deadline_mlu.h"
 #include "tent/runtime/segment.h"
 #include "tent/runtime/segment_tracker.h"
 #include "tent/runtime/progress_worker.h"
@@ -422,6 +423,30 @@ Status TransferEngineImpl::construct() {
          runtime_queue_config_.max_dispatch_bytes == 0)) {
         return Status::InvalidArgument(
             "runtime queue dispatch window must be non-zero" LOC_MARK);
+    }
+    // The threshold only matters with the queue on and deadline_aware set.
+    // Values outside 0 or [1.0, inf) are still applied, so existing configs
+    // keep working; the warning says what they actually do.
+    if (runtime_queue_config_.enabled &&
+        runtime_queue_config_.limits.deadline_aware) {
+        const double theta = runtime_queue_config_.limits.mlu_local_threshold;
+        switch (ClassifyMluLocalThreshold(theta)) {
+            case MluThresholdEffect::kDropsFeasible:
+                LOG(WARNING) << "runtime_queue/mlu_local_threshold=" << theta
+                             << " is below 1.0, the predicted met/missed "
+                                "boundary; it also cancels requests predicted "
+                                "to meet their deadline";
+                break;
+            case MluThresholdEffect::kSilentlyDisabled:
+                LOG(WARNING) << "runtime_queue/mlu_local_threshold=" << theta
+                             << " disables the deadline drop; set it to 0 to "
+                                "disable the drop, or to a finite value >= "
+                                "1.0 to enable it";
+                break;
+            case MluThresholdEffect::kDisabled:
+            case MluThresholdEffect::kRecommended:
+                break;
+        }
     }
     runtime_queue_ = std::make_unique<LocalTransferAdmissionQueue>(
         runtime_queue_config_.limits);

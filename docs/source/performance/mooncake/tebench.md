@@ -418,9 +418,15 @@ gpu_id + thread_id
   deadline.
 * `--mlu_local_threshold` : drop a queued transfer whose predicted completion
   time divided by its remaining window (MLU) reaches this value
-  (`runtime_queue/mlu_local_threshold`); `0` disables the drop. Requires
-  `--deadline_aware`. The drop reads the RDMA transport's bandwidth estimate
-  and only acts on RDMA-routed transfers; on a TCP-only host it does nothing.
+  (`runtime_queue/mlu_local_threshold`); `0` disables the drop. MLU `1.0` is
+  the predicted met/missed boundary, so a value below `1.0` also drops
+  transfers the predictor expects to make their deadline; the engine accepts
+  it with a warning, which is useful to force drops in a measurement. `1.2`
+  to `1.5` is the recommended range ("Choosing θ_local" in the
+  [deadline scheduling design](../../design/tent/deadline-scheduling.md)).
+  Requires `--deadline_aware`. The drop reads the bandwidth estimate of the
+  RDMA or UB transport that carries the transfer and only acts on transfers
+  routed over those two; on a TCP-only host it does nothing.
   A dropped transfer is counted, not treated as a failure: it is left out of
   the latency and bandwidth columns, the case ends with a
   `[deadline-drop] ... completed=<N> dropped=<M>` line, and the
