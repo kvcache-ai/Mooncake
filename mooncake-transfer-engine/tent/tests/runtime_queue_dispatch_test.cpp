@@ -877,6 +877,60 @@ TEST(RuntimeQueueDispatch, PollingDerivedTaskCompletesMergedOwner) {
     }
 }
 
+TEST(RuntimeQueueDispatch, AppendedShuffledRequestsKeepPublicTaskIds) {
+    for (bool merge : {false, true}) {
+        SCOPED_TRACE(merge);
+        auto cfg = makeRuntimeQueueConfig(8, 1UL << 20, merge);
+        cfg->set("enable_runtime_queue", false);
+        cfg->set("enable_progress_worker", false);
+        cfg->set("enable_auto_failover_on_poll", false);
+        TransferEngineImpl engine(cfg);
+        ASSERT_TRUE(engine.available());
+        std::vector<uint8_t> buffer(1024);
+        auto fake = std::make_shared<FakeTransport>(
+            RDMA, [&](const Request& request, int) -> TransferStatus {
+                const auto offset =
+                    static_cast<uint8_t*>(request.source) - buffer.data();
+                if (offset >= 128 && offset < 256) return {FAILED, 0};
+                return {COMPLETED, request.length};
+            });
+        installFakeRdma(engine, fake);
+        ASSERT_TRUE(
+            engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+
+        auto batch = engine.allocateBatch(5);
+        ASSERT_NE(batch, (BatchID)0);
+        ASSERT_TRUE(
+            engine
+                .submitTransfer(batch, {makeLocalWrite(buffer.data() + 512, 8)})
+                .ok());
+        // Sorting produces two owners in address order, whereas the public
+        // task ids retain submission order and start after the first submit.
+        ASSERT_TRUE(
+            engine
+                .submitTransfer(batch, {makeLocalWrite(buffer.data() + 160, 16),
+                                        makeLocalWrite(buffer.data(), 16),
+                                        makeLocalWrite(buffer.data() + 128, 32),
+                                        makeLocalWrite(buffer.data() + 16, 48)})
+                .ok());
+        const std::vector<TransferStatus> expected{{COMPLETED, 8},
+                                                   {FAILED, 0},
+                                                   {COMPLETED, 16},
+                                                   {FAILED, 0},
+                                                   {COMPLETED, 48}};
+        for (size_t i = 0; i < expected.size(); ++i) {
+            TransferStatus status{};
+            ASSERT_TRUE(engine.getTransferStatus(batch, i, status).ok());
+            EXPECT_EQ(status.s, expected[i].s) << "task " << i;
+            EXPECT_EQ(status.transferred_bytes, expected[i].transferred_bytes)
+                << "task " << i;
+        }
+        EXPECT_TRUE(engine.freeBatch(batch).ok());
+        EXPECT_TRUE(
+            engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
+    }
+}
+
 TEST(RuntimeQueueDispatch, BatchNotificationsFollowSubmitIntervals) {
     for (auto initial : {FAILED, PENDING}) {
         for (bool same_submit : {false, true}) {

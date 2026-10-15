@@ -22,6 +22,7 @@
 #include <span>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "real_client.h"
@@ -41,6 +42,7 @@
 #include "bool_parser.h"
 #include "client_auto_port_config.h"
 #include "config/cxl_segment_config.h"
+#include "config/egm_store_pool_config.h"
 #include "config/hugepage_config.h"
 #include "integer_parser.h"
 #include "mutex.h"
@@ -57,6 +59,7 @@
 #include "memory_location.h"
 #include "nof/nof_runtime.h"
 #include "version.h"
+#include "transport/nvlink_transport/nvlink_host_numa_allocation.h"
 #ifdef USE_ASCEND_DIRECT
 #include "acl/acl_rt.h"
 #include "transport/ascend_transport/ascend_direct_transport/context_manager.h"
@@ -292,6 +295,13 @@ std::vector<tl::expected<void, ErrorCode>> BatchWriteFromMultiBuffers(
 std::function<NofRuntime()> &NofRuntimeFactoryForTestingSlot() {
     static std::function<NofRuntime()> factory;
     return factory;
+}
+
+// Backing slot for RealClient::SetTeUnregisterHookForTesting.
+std::function<tl::expected<void, ErrorCode>(void *)>
+    &TeUnregisterHookForTestingSlot() {
+    static std::function<tl::expected<void, ErrorCode>(void *)> hook;
+    return hook;
 }
 
 #ifdef USE_ASCEND_DIRECT
@@ -890,7 +900,12 @@ RealClient::~RealClient() {
     }
     // Ensure resources are cleaned even if not explicitly closed
     stop_http_server();
-    tearDownAll_internal();
+    // A destructor cannot propagate errors, but a teardown failure (e.g.
+    // unconfirmed NoF cleanup) must still leave a trace.
+    if (!tearDownAll_internal()) {
+        LOG(ERROR) << "RealClient teardown completed with cleanup failures; "
+                      "some buffers must stay mapped until process exit";
+    }
 }
 
 std::shared_ptr<RealClient> RealClient::create() {
@@ -943,6 +958,11 @@ void RealClient::SetNofRuntimeFactoryForTesting(
     NofRuntimeFactoryForTestingSlot() = std::move(factory);
 }
 
+void RealClient::SetTeUnregisterHookForTesting(
+    std::function<tl::expected<void, ErrorCode>(void *)> hook) {
+    TeUnregisterHookForTestingSlot() = std::move(hook);
+}
+
 tl::expected<void, ErrorCode> RealClient::setup_internal(
     const std::string &local_hostname, const std::string &metadata_server,
     size_t global_segment_size, size_t local_buffer_size,
@@ -954,6 +974,36 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     const std::string &ssd_offload_path, const std::string &tenant_id,
     bool enable_client_http_server, int client_http_port,
     bool enable_embedded_master) {
+    return setup_internal(EgmStorePoolConfig{}, local_hostname, metadata_server,
+                          global_segment_size, local_buffer_size, protocol,
+                          rdma_devices, master_server_addr, transfer_engine,
+                          ipc_socket_path, local_rpc_port, enable_ssd_offload,
+                          start_offload_rpc_server, ssd_offload_path, tenant_id,
+                          enable_client_http_server, client_http_port,
+                          enable_embedded_master);
+}
+
+tl::expected<void, ErrorCode> RealClient::setup_internal(
+    const EgmStorePoolConfig &egm_config, const std::string &local_hostname,
+    const std::string &metadata_server, size_t global_segment_size,
+    size_t local_buffer_size, const std::string &protocol,
+    const std::string &rdma_devices, const std::string &master_server_addr,
+    const std::shared_ptr<TransferEngine> &transfer_engine,
+    const std::string &ipc_socket_path, int local_rpc_port,
+    bool enable_ssd_offload, bool start_offload_rpc_server,
+    const std::string &ssd_offload_path, const std::string &tenant_id,
+    bool enable_client_http_server, int client_http_port,
+    bool enable_embedded_master) {
+    // Re-entry guard (mirrors initAll_internal): a second setup would
+    // overwrite client_ and skip the first instance's ordered cleanup.
+    if (client_) {
+        LOG(ERROR) << "Client is already initialized";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    // A previous teardown latched closed_; reset it so this new instance can
+    // be torn down again (teardown is otherwise a one-shot no-op).
+    closed_.store(false, std::memory_order_release);
+
     this->protocol = protocol;
     this->ipc_socket_path_ = ipc_socket_path;
     if (!enable_embedded_master &&
@@ -1077,6 +1127,12 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         }
     }
 
+    if (egm_config.enabled && !client_->HasClassicTransport("nvlink")) {
+        LOG(ERROR) << "EGM Store requires the classic NVLink transport; "
+                      "check MC_MS_AUTO_DISC and MC_FORCE_MNNVL";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
     // Local_buffer_size is allowed to be 0, but we only register memory when
     // local_buffer_size > 0. Invoke ibv_reg_mr() with size=0 is UB, and may
     // fail in some rdma implementations.
@@ -1086,10 +1142,24 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     // otherwise pass nullptr so allocate_buffer_allocator_memory falls
     // through to exactly the same path as use_spdk_dma=false today
     // (protocol-specific allocation -> VRAM -> aligned_alloc).
-    client_buffer_allocator_ = ClientBufferAllocator::create(
-        local_buffer_size, this->protocol,
-        use_hugepage_ && !globalConfig().ascend_use_fabric_mem,
-        nof_runtime_.initiator ? nof_runtime_.dma_allocator : nullptr);
+    try {
+        client_buffer_allocator_ = ClientBufferAllocator::create(
+            local_buffer_size, this->protocol,
+            use_hugepage_ && !globalConfig().ascend_use_fabric_mem,
+            nof_runtime_.initiator ? nof_runtime_.dma_allocator : nullptr);
+    } catch (const std::bad_alloc &) {
+        // The DMA allocator returns nullptr when the SPDK env is unavailable
+        // (lazy init means setup no longer fail-fasts on it), and
+        // ClientBufferAllocator throws on a null buffer. Turn the exception
+        // into an error code so the pybind boundary keeps its int-return
+        // contract. Deliberately no silent fallback to generic allocation:
+        // the operator enabled NoF, and a silent fallback would surface as
+        // harder-to-debug NoF registration failures later.
+        LOG(ERROR) << "Failed to allocate client buffer memory (NoF DMA "
+                      "allocator unavailable or out of memory; check the "
+                      "hugepage/SPDK environment)";
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
     if (local_buffer_size > 0 && protocol != "cxl") {
         LOG(INFO) << "Registering local memory: " << local_buffer_size
                   << " bytes";
@@ -1139,7 +1209,47 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         uint64_t current_glbseg_size = 0;                  // For logging
 
         auto split_limit = GetTransportRegistrationLimit(protocol);
-        const size_t alignment = facebook::cachelib::Slab::kSize;
+        size_t alignment = facebook::cachelib::Slab::kSize;
+        std::vector<int> egm_numa_nodes;
+        std::vector<size_t> egm_node_sizes;
+        size_t egm_node_index = 0;
+        if (egm_config.enabled) {
+            if (egm_config.auto_numa_nodes) {
+                auto status = NvlinkHostNumaAllocation::DiscoverHostNumaNodes(
+                    egm_numa_nodes);
+                if (!status.ok()) {
+                    LOG(ERROR) << "EGM NUMA discovery failed: " << status;
+                    return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+                }
+            } else {
+                egm_numa_nodes = egm_config.numa_nodes;
+            }
+            std::vector<size_t> granularities;
+            for (int node : egm_numa_nodes) {
+                size_t granularity = 0;
+                auto status =
+                    NvlinkHostNumaAllocation::GetAllocationGranularity(
+                        node, granularity);
+                if (!status.ok()) {
+                    LOG(ERROR) << "EGM granularity query failed for NUMA node "
+                               << node << ": " << status;
+                    return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+                }
+                granularities.push_back(granularity);
+            }
+            auto capacity = CalculateEgmStorePoolCapacity(
+                global_segment_size, granularities, alignment,
+                static_cast<size_t>(globalConfig().max_mr_size));
+            if (!capacity) return tl::unexpected(capacity.error());
+            alignment = capacity->alignment;
+            split_limit = capacity->max_chunk_size;
+            egm_node_sizes = std::move(capacity->node_sizes);
+            global_segment_size = (global_segment_size / alignment) * alignment;
+            LOG(INFO) << "EGM Store capacity: requested=" << total_glbseg_size
+                      << " effective=" << global_segment_size
+                      << " alignment=" << alignment;
+            total_glbseg_size = global_segment_size;
+        }
 #ifdef USE_ASCEND_DIRECT
         if (protocol == "ascend" && globalConfig().ascend_agent_mode) {
             const size_t cap = AgentModeStoreChunkCap(global_segment_size);
@@ -1177,8 +1287,10 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             protocol == "rdma" && use_hugepage_;
 
         while (global_segment_size > 0) {
-            size_t segment_size =
-                GetNextSegmentSize(global_segment_size, split_limit, alignment);
+            size_t segment_size = GetNextSegmentSize(
+                egm_config.enabled ? egm_node_sizes[egm_node_index]
+                                   : global_segment_size,
+                split_limit, alignment);
             if (segment_size == 0) {
                 LOG(ERROR) << "Registration limit is smaller than segment "
                               "alignment";
@@ -1188,10 +1300,30 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
 
             size_t mapped_size = segment_size;
             void *ptr = nullptr;
+            std::unique_ptr<NvlinkHostNumaAllocation> egm_owner;
             std::string seg_location = kWildcardLocation;
             bool use_mmap_segment = !seg_numa_nodes.empty() || use_hugepage_;
 
-            if (!seg_numa_nodes.empty()) {
+            if (egm_config.enabled) {
+                auto status = NvlinkHostNumaAllocation::Create(
+                    egm_numa_nodes[egm_node_index], segment_size, alignment,
+                    egm_owner);
+                if (!status.ok()) {
+                    LOG(ERROR) << "EGM allocation failed: " << status;
+                    if (egm_owner) {
+                        auto cleanup = egm_owner->Release();
+                        if (!cleanup.ok()) {
+                            LOG(ERROR)
+                                << "EGM partial allocation cleanup failed: "
+                                << cleanup << "; retaining until process exit";
+                            (void)egm_owner.release();
+                        }
+                    }
+                    return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+                }
+                ptr = egm_owner->base();
+                mapped_size = egm_owner->length();
+            } else if (!seg_numa_nodes.empty()) {
                 // NUMA-segmented allocation: contiguous VMA, per-region binding
                 size_t page_sz = use_hugepage_
                                      ? get_hugepage_size_from_env()
@@ -1231,12 +1363,16 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                 return tl::unexpected(ErrorCode::INVALID_PARAMS);
             }
             const size_t mount_size =
-                split_limit.has_value() ? segment_size : mapped_size;
+                egm_config.enabled || !split_limit.has_value() ? mapped_size
+                                                               : segment_size;
             current_glbseg_size += mount_size;
             LOG(INFO) << "Mounting segment: " << mount_size << " bytes, "
                       << current_glbseg_size << " of " << total_glbseg_size;
 
-            if (this->protocol == "ascend" || this->protocol == "ubshmem") {
+            if (egm_config.enabled) {
+                egm_segment_ptrs_.emplace_back(std::move(egm_owner));
+            } else if (this->protocol == "ascend" ||
+                       this->protocol == "ubshmem") {
                 if (use_hugepage_ && !globalConfig().ascend_use_fabric_mem) {
                     hugepage_segment_ptrs_.emplace_back(
                         ptr, HugepageSegmentDeleter{mapped_size});
@@ -1297,6 +1433,10 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             if (pinned_region) {
                 setup_segment_pinned_regions_.push_back(
                     std::move(pinned_region));
+            }
+            if (egm_config.enabled) {
+                egm_node_sizes[egm_node_index] -= segment_size;
+                if (egm_node_sizes[egm_node_index] == 0) ++egm_node_index;
             }
         }
         if (total_glbseg_size == 0) {
@@ -1570,11 +1710,25 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     }
     int client_http_port = client_http_port_opt.value();
 
-    return setup_internal(
-        local_hostname, metadata_server, global_segment_size, local_buffer_size,
-        protocol, rdma_devices, master_server_addr, nullptr, ipc_socket_path,
-        50052, enable_ssd_offload, true, ssd_offload_path, tenant_id,
-        enable_client_http_server, client_http_port, enable_embedded_master);
+    auto egm_config = ParseEgmStorePoolConfig(
+        config, protocol, global_segment_size, local_buffer_size);
+    if (!egm_config) return tl::unexpected(egm_config.error());
+    try {
+        auto result = setup_internal(
+            *egm_config, local_hostname, metadata_server, global_segment_size,
+            local_buffer_size, protocol, rdma_devices, master_server_addr,
+            nullptr, ipc_socket_path, 50052, enable_ssd_offload, true,
+            ssd_offload_path, tenant_id, enable_client_http_server,
+            client_http_port, enable_embedded_master);
+        if (!result && egm_config->enabled) {
+            (void)tearDownAll_internal();
+        }
+        return result;
+    } catch (...) {
+        // The Python wrapper still owns this client when setup throws.
+        if (egm_config->enabled) (void)tearDownAll_internal();
+        throw;
+    }
 }
 
 tl::expected<void, ErrorCode> RealClient::initAll_internal(
@@ -1602,6 +1756,17 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     bool expected = false;
     if (!closed_.compare_exchange_strong(expected, true,
                                          std::memory_order_acq_rel)) {
+        // A previous teardown ran the one-shot cleanup. If its NoF buffer
+        // cleanup failed, that failure must not decay into success on repeat
+        // calls: the caller-owned buffers may still be DMA-translated. Retry
+        // the (idempotent) cleanup walk and keep reporting the failure until
+        // it actually heals.
+        if (nof_buffer_cleanup_failed_.load(std::memory_order_acquire)) {
+            const ErrorCode rc = CleanupNofRegisteredBuffers();
+            if (rc != ErrorCode::OK) {
+                return tl::unexpected(rc);
+            }
+        }
         return {};
     }
 
@@ -1609,7 +1774,35 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     stop_dummy_client_monitor();
     stop_http_server();
 
+    ErrorCode cleanup_error = ErrorCode::OK;
     if (client_) {
+        if (!egm_segment_ptrs_.empty()) {
+            // Callers must quiesce in-flight requests before close. FileStorage
+            // owns a Client reference and workers that access segments.
+            if (offload_rpc_server_) {
+                offload_rpc_server_->stop();
+                offload_rpc_server_.reset();
+            }
+            file_storage_.reset();
+            for (auto it = egm_segment_ptrs_.rbegin();
+                 it != egm_segment_ptrs_.rend(); ++it) {
+                auto &owner = *it;
+                if (!owner) continue;
+                auto result =
+                    client_->UnmountSegment(owner->base(), owner->length());
+                if (!result) {
+                    // Failed mounts may have no Client record even if
+                    // publication is uncertain. Retain memory unless unmount
+                    // confirms cleanup.
+                    LOG(ERROR)
+                        << "EGM unmount failed: " << toString(result.error())
+                        << "; retaining allocation until process exit";
+                    if (cleanup_error == ErrorCode::OK)
+                        cleanup_error = result.error();
+                    (void)owner.release();
+                }
+            }
+        }
         if (client_buffer_allocator_ && client_buffer_allocator_->size() > 0 &&
             protocol != "cxl") {
             auto unregister_result = client_->unregisterLocalMemory(
@@ -1622,40 +1815,44 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
             std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
             local_buffer_region_.reset();
         }
+        // Keep EGM Release separate from UnmountSegment above. Unmount only
+        // removes Master metadata and TE registration; replica copy/move
+        // workers may still hold local source slices. If reset drops the last
+        // Client reference, its destructor stops and joins those workers before
+        // we release backing memory. This is not a GPU completion barrier:
+        // transfers that timed out may still require deferred cleanup.
         client_.reset();
     }
     if (embedded_master_) {
         embedded_master_->Stop();
         embedded_master_.reset();
     }
-
     // NoF I/O is drained by now (client_.reset() joined the worker pool).
-    // Release this client's NoF registrations so a closed client never
-    // leaves orphan entries in the process-global page registry. Failures
-    // are collected and reported: these buffers are caller-owned, so the
-    // caller must be told which of them may still be DMA-translated and
-    // must not be freed or remapped until process exit.
-    std::vector<void *> nof_cleanup_failed;
-    if (nof_runtime_.initiator) {
-        std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
-        for (auto it = registered_buffer_sizes_.begin();
-             it != registered_buffer_sizes_.end();) {
-            auto rc = nof_runtime_.initiator->UnregisterMemory(it->first);
-            if (rc != ErrorCode::OK) {
-                // Keep the record: this buffer must stay mapped.
-                nof_cleanup_failed.push_back(it->first);
-                ++it;
-            } else {
-                it = registered_buffer_sizes_.erase(it);
-            }
-        }
-        for (void *buffer : nof_cleanup_failed) {
-            LOG(ERROR) << "NoF registration for buffer " << buffer
-                       << " could not be released on teardown; its NoF pages "
-                          "stay quarantined — do NOT free or remap this "
-                          "buffer before process exit";
+    // Release this client's NoF registrations so a closed client never leaves
+    // orphan entries in the process-global page registry. Failures are
+    // reported: these buffers are caller-owned, so the caller must be told
+    // that they may still be DMA-translated and must not be freed or remapped
+    // until process exit.
+    {
+        const ErrorCode nof_rc = CleanupNofRegisteredBuffers();
+        if (nof_rc != ErrorCode::OK && cleanup_error == ErrorCode::OK) {
+            cleanup_error = nof_rc;
         }
     }
+    for (auto it = egm_segment_ptrs_.rbegin(); it != egm_segment_ptrs_.rend();
+         ++it) {
+        auto &owner = *it;
+        if (!owner) continue;
+        auto status = owner->Release();
+        if (!status.ok()) {
+            LOG(ERROR) << "EGM release failed: " << status
+                       << "; retaining allocation until process exit";
+            if (cleanup_error == ErrorCode::OK)
+                cleanup_error = ErrorCode::INTERNAL_ERROR;
+            (void)owner.release();
+        }
+    }
+    egm_segment_ptrs_.clear();
     ReleaseAllMountedSegmentRecords();
     ReleaseAllAllocatedSegmentRecords();
     client_buffer_allocator_.reset();
@@ -1727,12 +1924,36 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     // which is safe: they are never munmapped, so SPDK's translations never
     // point at freed/reused virtual addresses.
     RetryQuarantinedShmsLocked();
-    if (!nof_cleanup_failed.empty()) {
-        // Some caller-owned buffers still have live DMA translation state.
-        // The caller must keep them mapped until process exit.
-        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
-    }
+    if (cleanup_error != ErrorCode::OK) return tl::unexpected(cleanup_error);
     return {};
+}
+
+ErrorCode RealClient::CleanupNofRegisteredBuffers() {
+    if (!nof_runtime_.initiator) {
+        nof_buffer_cleanup_failed_.store(false, std::memory_order_release);
+        return ErrorCode::OK;
+    }
+    bool failed = false;
+    std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
+    for (auto it = registered_buffer_sizes_.begin();
+         it != registered_buffer_sizes_.end();) {
+        const ErrorCode rc = nof_runtime_.initiator->UnregisterMemory(it->first);
+        if (rc != ErrorCode::OK) {
+            // Keep the record: this buffer must stay mapped — its DMA
+            // translation state is unconfirmed, so freeing or remapping it
+            // could let NoF write into reused memory.
+            LOG(ERROR) << "NoF registration for buffer " << it->first
+                       << " could not be released; its NoF pages stay "
+                          "quarantined — do NOT free or remap this buffer "
+                          "before process exit";
+            failed = true;
+            ++it;
+        } else {
+            it = registered_buffer_sizes_.erase(it);
+        }
+    }
+    nof_buffer_cleanup_failed_.store(failed, std::memory_order_release);
+    return failed ? ErrorCode::INTERNAL_ERROR : ErrorCode::OK;
 }
 
 void RealClient::RetryQuarantinedShmsLocked() {
@@ -4305,20 +4526,24 @@ tl::expected<void, ErrorCode> RealClient::register_buffer_internal(
     }
     // #3131: SPDK's RDMA transport keeps its own translation table, which TE
     // registration does not cover. Failure is non-fatal (same policy as the
-    // shm paths): the buffer stays usable for non-NoF transfers.
+    // shm paths): the buffer stays usable for non-NoF transfers. The NoF side
+    // registers the same (possibly widened) range as TE so the two layers
+    // never disagree about coverage.
     if (nof_runtime_.initiator) {
-        auto rc = nof_runtime_.initiator->RegisterMemory(buffer, size);
+        auto rc = nof_runtime_.initiator->RegisterMemory(buffer,
+                                                       registration_size);
         if (rc == ErrorCode::NOF_REGISTRATION_STUCK) {
             // The failed page is terminally quarantined (never unregistered,
             // never munmapped): the buffer must not be freed or remapped.
             LOG(ERROR) << "NoF memory registration left unconfirmed "
                           "translation state for buffer "
-                       << buffer << ", size " << size
+                       << buffer << ", size " << registration_size
                        << "; the affected NoF page is quarantined. Do not "
                           "free or remap this buffer.";
         } else if (rc != ErrorCode::OK) {
             LOG(WARNING) << "NoF memory registration failed for buffer "
-                         << buffer << ", size " << size << ": " << toString(rc)
+                         << buffer << ", size " << registration_size << ": "
+                         << toString(rc)
                          << "; buffer stays registered with the transfer "
                             "engine, but NoF I/O to it will fail. Use "
                             "hugepage-backed memory for NoF, or set "
@@ -4327,7 +4552,9 @@ tl::expected<void, ErrorCode> RealClient::register_buffer_internal(
     }
     {
         std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
-        registered_buffer_sizes_[buffer] = size;
+        // The record keeps the logical size: writable-region resolution must
+        // not expose the physical segment beyond what the caller registered.
+        registered_buffer_sizes_[buffer] = {size, false};
     }
     return result;
 }
@@ -4342,24 +4569,38 @@ tl::expected<void, ErrorCode> RealClient::unregister_buffer_internal(
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
-    auto unregister_result = client_->unregisterLocalMemory(buffer, true);
+    auto unregister_result = [&]() -> tl::expected<void, ErrorCode> {
+        auto &hook = TeUnregisterHookForTestingSlot();
+        if (hook) {
+            return hook(buffer);
+        }
+        return client_->unregisterLocalMemory(buffer, true);
+    }();
 
     // Record check, NoF cleanup and record erase stay in one critical
     // section (teardown's unregister walk takes the same lock).
     std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
+    auto rec_it = registered_buffer_sizes_.find(buffer);
     if (!unregister_result) {
         // Fall through to the NoF cleanup ONLY when TE reports the buffer as
-        // not registered (a previous call already tore TE down) and the
-        // record is still present. Any other TE failure means the TE
-        // registration may still be alive: keep the record and propagate.
+        // not registered and the record is still present. NOT_REGISTERED is
+        // truthful since the TE-side fix in this PR: RdmaTransport retries
+        // the per-context MR deregistration behind a missing metadata entry
+        // and returns the real error when an MR is still live, so
+        // NOT_REGISTERED can no longer hide a partial deregistration. Any
+        // other TE failure means the TE registration may still be alive:
+        // keep the record and propagate.
         if (unregister_result.error() != ErrorCode::NOT_REGISTERED ||
-            registered_buffer_sizes_.count(buffer) == 0) {
+            rec_it == registered_buffer_sizes_.end()) {
             LOG(ERROR) << "Unregister buffer failed with error: "
                        << toString(unregister_result.error());
             return tl::unexpected(unregister_result.error());
         }
         LOG(WARNING) << "TE reports buffer " << buffer
                      << " as already unregistered; retrying the NoF cleanup";
+    }
+    if (rec_it != registered_buffer_sizes_.end()) {
+        rec_it->second.te_cleanup_confirmed = true;
     }
     if (nof_runtime_.initiator) {
         auto rc = nof_runtime_.initiator->UnregisterMemory(buffer);
@@ -4373,7 +4614,9 @@ tl::expected<void, ErrorCode> RealClient::unregister_buffer_internal(
             return tl::unexpected(rc);
         }
     }
-    registered_buffer_sizes_.erase(buffer);
+    if (rec_it != registered_buffer_sizes_.end()) {
+        registered_buffer_sizes_.erase(rec_it);
+    }
     return {};
 }
 
@@ -4385,17 +4628,16 @@ std::optional<RealClient::WritableBufferRegion>
 RealClient::resolve_writable_buffer_region(void *buffer) const {
     std::shared_lock<std::shared_mutex> lock(registered_buffer_mutex_);
     const auto target = reinterpret_cast<uintptr_t>(buffer);
-    for (const auto &[registered_buffer, registered_size] :
-         registered_buffer_sizes_) {
+    for (const auto &[registered_buffer, record] : registered_buffer_sizes_) {
         const auto base = reinterpret_cast<uintptr_t>(registered_buffer);
         if (target < base) {
             continue;
         }
         const auto offset = target - base;
-        if (offset < registered_size) {
+        if (offset < record.size) {
             return WritableBufferRegion{
                 .base = registered_buffer,
-                .size = registered_size,
+                .size = record.size,
                 .offset = static_cast<size_t>(offset),
             };
         }

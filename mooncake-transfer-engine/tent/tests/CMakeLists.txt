@@ -181,6 +181,12 @@ target_include_directories(request_merge_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME request_merge_test COMMAND request_merge_test)
 
+# Manual public-submit benchmark using real TCP loopback transfers.
+add_executable(request_submit_bench request_submit_bench.cpp)
+target_link_libraries(request_submit_bench PRIVATE tent_link_group asio_shared)
+target_include_directories(request_submit_bench
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+
 add_executable(local_notification_test local_notification_test.cpp)
 target_link_libraries(local_notification_test PRIVATE gtest gtest_main
                                                       tent_link_group)
@@ -314,31 +320,19 @@ target_include_directories(tent_shm_transport_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_shm_transport_test COMMAND tent_shm_transport_test)
 
-# io_uring submission-contract tests (two-phase all-or-nothing submit,
-# short-submit handling). No special hardware needed; only built when liburing
+# io_uring transport tests. No special hardware needed; only built when liburing
 # was found, and skipped at runtime where the kernel blocks io_uring (e.g.
-# restrictive seccomp profiles). Each case runs in its own process: the
-# transport's thread-local file context cache is keyed by segment ID only, so
-# consecutive transports in one process (each backed by its own temp file) would
-# reuse the first test's file context.
+# restrictive seccomp profiles). Run in one process to exercise file context
+# isolation across live and retired transports.
 if(TARGET tent_xport_uring)
   add_executable(tent_io_uring_transport_test io_uring_transport_test.cpp)
   target_link_libraries(tent_io_uring_transport_test PRIVATE gtest gtest_main
                                                              tent_link_group)
   target_include_directories(tent_io_uring_transport_test
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
-  add_test(
-    NAME tent_io_uring_transport_test_short_submit
-    COMMAND
-      tent_io_uring_transport_test
-      --gtest_filter=IOUringTransportTest.ShortSubmitIsNotAnErrorAndExecutesExactlyOnce
-  )
-  add_test(
-    NAME tent_io_uring_transport_test_all_or_nothing
-    COMMAND
-      tent_io_uring_transport_test
-      --gtest_filter=IOUringTransportTest.SubmitIsAllOrNothingWhenSegmentLookupFailsMidBatch
-  )
+  add_test(NAME tent_io_uring_transport_test
+           COMMAND tent_io_uring_transport_test)
+  set_tests_properties(tent_io_uring_transport_test PROPERTIES TIMEOUT 120)
 endif()
 
 # NOT registered via add_test: the test needs a real GPU (it opens a CUDA IPC
@@ -436,7 +430,9 @@ if(TARGET tent_xport_gds)
                                                                tent_link_group)
   target_link_options(
     tent_gds_transport_status_test PRIVATE "-Wl,--wrap=cuFileDriverOpen"
-    "-Wl,--wrap=cuFileBatchIOGetStatus" "-Wl,--wrap=cuFileBatchIOCancel")
+    "-Wl,--wrap=cuFileBatchIOGetStatus" "-Wl,--wrap=cuFileBatchIOCancel"
+    "-Wl,--wrap=cuFileBatchIOSubmit" "-Wl,--wrap=cuFileHandleRegister"
+    "-Wl,--wrap=cuFileHandleDeregister")
   target_include_directories(tent_gds_transport_status_test
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
   add_test(NAME tent_gds_transport_status_test

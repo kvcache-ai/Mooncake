@@ -259,6 +259,11 @@ class GatedOrderedOpLogWriter : public OrderedOpLogWriter {
         cv_.notify_all();
     }
 
+    void HoldCallbacks() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        released_through_ = 0;
+    }
+
    private:
     std::mutex mutex_;
     std::condition_variable cv_;
@@ -1305,7 +1310,7 @@ TEST_F(MasterServiceHATest, RestoreFromStandbyPreservesReplicaIds) {
     EXPECT_GE(new_replicas.front().id, 43);
 }
 
-TEST_F(MasterServiceHATest, BatchPromotionDrainsMultipleChunksAndPreservesIds) {
+TEST_F(MasterServiceHATest, BatchPromotionCopiesMultipleChunksAndPreservesIds) {
     MasterService service(
         MasterServiceConfig::builder().set_enable_ha(false).build());
     const std::string endpoint = "batch_promotion_segment";
@@ -1333,8 +1338,11 @@ TEST_F(MasterServiceHATest, BatchPromotionDrainsMultipleChunksAndPreservesIds) {
     handoff.applied_cursor = {.batch_id = 7, .last_seq = 7};
     handoff.max_replica_id = 42;
 
-    ASSERT_TRUE(service.RestoreFromBatchOpLogPromotion(std::move(handoff), 1)
-                    .has_value());
+    ASSERT_TRUE(service.RestoreFromBatchOpLogPromotion(handoff, 1).has_value());
+    ASSERT_TRUE(handoff.metadata_store);
+    EXPECT_EQ(2u, handoff.metadata_store->GetKeyCount());
+    EXPECT_TRUE(handoff.metadata_store->Exists(first.tenant_id, first.key));
+    EXPECT_TRUE(handoff.metadata_store->Exists(second.tenant_id, second.key));
     auto first_descriptors =
         ReplicaDescriptorsForTesting(service, kDefaultTenant, first.key);
     auto second_descriptors = ReplicaDescriptorsForTesting(
@@ -1371,14 +1379,58 @@ TEST_F(MasterServiceHATest, BatchPromotionRejectsCrossChunkOverlap) {
     handoff.applied_cursor = {.batch_id = 7, .last_seq = 7};
     handoff.max_replica_id = 52;
 
-    auto result = service.RestoreFromBatchOpLogPromotion(std::move(handoff), 1);
+    auto result = service.RestoreFromBatchOpLogPromotion(handoff, 1);
 
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, result.error());
+    ASSERT_TRUE(handoff.metadata_store);
+    EXPECT_EQ(2u, handoff.metadata_store->GetKeyCount());
+    EXPECT_TRUE(handoff.metadata_store->Exists(first.tenant_id, first.key));
+    EXPECT_TRUE(handoff.metadata_store->Exists(second.tenant_id, second.key));
     EXPECT_EQ(
         HasMetadataEntryForTesting(service, kDefaultTenant, first.key) +
             HasMetadataEntryForTesting(service, kDefaultTenant, second.key),
         1);
+}
+
+TEST_F(MasterServiceHATest,
+       BatchPromotionRestoreLeavesHandoffIntactForPreserve) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+    const std::string endpoint = "batch_promotion_preserve_segment";
+    auto object = MakeStandbyObject("batch_promotion_preserve_key", endpoint);
+    object.metadata.replicas.front().id = 61;
+    object.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+
+    auto source = std::make_unique<StandbyMetadataStore>();
+    ASSERT_TRUE(
+        source->PutMetadata(object.tenant_id, object.key, object.metadata));
+    BatchOpLogPromotionHandoff handoff;
+    handoff.metadata_store = std::move(source);
+    handoff.segments = {MakeStandbyMemorySegment(endpoint)};
+    handoff.applied_cursor = {.batch_id = 11, .last_seq = 11};
+    handoff.max_replica_id = 61;
+
+    ASSERT_TRUE(service.RestoreFromBatchOpLogPromotion(handoff, 1).has_value());
+    ASSERT_TRUE(handoff.metadata_store);
+    EXPECT_EQ(1u, handoff.metadata_store->GetKeyCount());
+    EXPECT_TRUE(handoff.metadata_store->Exists(object.tenant_id, object.key));
+    auto replicas =
+        ReplicaDescriptorsForTesting(service, kDefaultTenant, object.key);
+    ASSERT_EQ(replicas.size(), 1);
+    EXPECT_EQ(replicas.front().id, 61);
+
+    HotStandbyConfig config;
+    config.enable_verification = false;
+    HotStandbyService standby(config);
+    ASSERT_EQ(ErrorCode::OK,
+              standby.PreservePromotionBaseline(
+                  std::move(handoff.metadata_store), handoff.applied_cursor,
+                  /*producer_view_version=*/7, handoff.segments));
+    EXPECT_EQ(11u, standby.GetSyncStatus().applied_seq_id);
+    EXPECT_EQ(1u, standby.GetMetadataCount());
 }
 
 TEST_F(MasterServiceHATest, RestoreRejectsInvalidReplicaIds) {
@@ -2741,6 +2793,71 @@ TEST_F(MasterServiceHATest,
               0);
     EXPECT_TRUE(MasterServiceTestPeer::ClientLivenessRecords(service).contains(
         disk_owner));
+}
+
+TEST_F(MasterServiceHATest, RestoreDiscardRepairTimeoutThenRetrySucceeds) {
+    const std::string cluster_id = "test_restore_repair_timeout_retry";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_batch_max_entries(2)
+                              .set_restore_repair_durable_timeout_ms(50)
+                              .build();
+    MasterService service(service_config);
+    auto* writer = InstallGatedWriter(service, backend);
+    writer->HoldCallbacks();
+
+    const std::string endpoint = "standby_repair_timeout_segment";
+    auto survivor =
+        MakeStandbyObject("standby_repair_timeout_survivor", endpoint);
+    auto lost = MakeStandbyObject("standby_repair_timeout_lost", endpoint);
+    survivor.metadata.replicas.push_back(MakeStandbyMemoryReplica(endpoint));
+    survivor.metadata.replicas[1].id = 2;
+    survivor.metadata.replicas[0]
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    survivor.metadata.replicas[1]
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase + 8192;
+    lost.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+
+    const auto metric_before =
+        MasterMetricManager::instance().get_allocated_mem_size();
+
+    auto result = service.RestoreFromStandbySnapshot(
+        {survivor, lost}, 7, {MakeStandbyMemorySegment(endpoint)});
+
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(ErrorCode::INTERNAL_ERROR, result.error());
+    EXPECT_EQ(MasterMetricManager::instance().get_allocated_mem_size(),
+              metric_before);
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
+                                     "standby_repair_timeout_survivor"),
+              0);
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
+                                     "standby_repair_timeout_lost"),
+              0);
+    EXPECT_TRUE(MasterServiceTestPeer::ClientLivenessRecords(service).empty());
+
+    // The first repair may still become durable after the local restore
+    // has rolled back. Resume the writer, then retry the same snapshot.
+    writer->ResumeCallbacks();
+    auto retry = service.RestoreFromStandbySnapshot(
+        {survivor, lost}, 7, {MakeStandbyMemorySegment(endpoint)});
+    ASSERT_TRUE(retry.has_value());
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
+                                     "standby_repair_timeout_survivor"),
+              1);
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
+                                     "standby_repair_timeout_lost"),
+              0);
+    EXPECT_EQ(MasterMetricManager::instance().get_allocated_mem_size(),
+              metric_before + 1024);
 }
 
 TEST_F(MasterServiceHATest, RestoreDiscardRepairWithoutWriterFailsRestore) {
