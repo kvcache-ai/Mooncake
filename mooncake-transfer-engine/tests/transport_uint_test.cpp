@@ -200,6 +200,18 @@ class TransferEngineImplTestPeer {
         std::lock_guard<std::mutex> guard(transport.deferred_cleanup_mutex_);
         return transport.deferred_cleanup_batches_.count(batch_id) != 0;
     }
+
+    // Why freeBatchID() would defer this batch: true if a task is still
+    // running, false if only completion callbacks are unwinding. The batch
+    // must be busy; a free batch would be deleted here.
+    static bool busyWithTasksInFlight(MultiTransport& transport,
+                                      Transport::BatchID batch_id) {
+        bool tasks_in_flight = false;
+        Status status = transport.tryFreeBatchID(
+            batch_id, std::function<void()>(), &tasks_in_flight);
+        EXPECT_TRUE(status.IsBatchBusy()) << status.ToString();
+        return tasks_in_flight;
+    }
 };
 
 #ifdef USE_TENT
@@ -1143,6 +1155,10 @@ TEST_F(TransportTest, RealSliceTimeoutDefersBatchCleanup) {
     ASSERT_EQ(multi_transport.getTransferStatus(batch_id, 0, status),
               Status::OK());
     EXPECT_EQ(status.s, Transport::TransferStatusEnum::TIMEOUT);
+    // A timed-out task is still in flight: the deferral is logged as a
+    // warning.
+    EXPECT_TRUE(TransferEngineImplTestPeer::busyWithTasksInFlight(
+        multi_transport, batch_id));
 
     Status free_status = multi_transport.freeBatchID(batch_id);
     EXPECT_TRUE(free_status.IsBatchCleanupDeferred());
@@ -1173,6 +1189,8 @@ TEST_F(TransportTest, TimedOutBatchIsReclaimedAfterCallbacksFinish) {
     auto batch_id = multi_transport.allocateBatchID(1);
     TransferEngineImplTestPeer::prepareBusyBatch(multi_transport, batch_id,
                                                  &task_transport);
+    EXPECT_TRUE(TransferEngineImplTestPeer::busyWithTasksInFlight(
+        multi_transport, batch_id));
 
     std::atomic<bool> callback_called{false};
     Status free_status = TransferEngineImplTestPeer::freeBatchWithCallback(
@@ -1204,6 +1222,10 @@ TEST_F(TransportTest, FinishedBatchWaitsForCompletionCallbackQuiescence) {
     auto batch_id = multi_transport.allocateBatchID(1);
     TransferEngineImplTestPeer::prepareFinishedBatchWithActiveCallback(
         multi_transport, batch_id);
+    // Every task is terminal; only the callback pin holds the batch. This is
+    // the routine race, logged at VLOG(1) rather than as a warning.
+    EXPECT_FALSE(TransferEngineImplTestPeer::busyWithTasksInFlight(
+        multi_transport, batch_id));
 
     Status free_status = multi_transport.freeBatchID(batch_id);
     EXPECT_TRUE(free_status.IsBatchCleanupDeferred());

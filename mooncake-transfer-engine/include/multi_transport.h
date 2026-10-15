@@ -117,8 +117,12 @@ class MultiTransport {
     Status selectTransport(const TransferRequest &entry, Transport *&transport,
                            bool *allows_reuse = nullptr);
 
+    // On BatchBusy, *tasks_in_flight (if given) tells whether a task is still
+    // running (true) or every task is terminal and only completion callbacks
+    // are still unwinding (false).
     Status tryFreeBatchID(BatchID batch_id,
-                          const std::function<void()> &before_delete);
+                          const std::function<void()> &before_delete,
+                          bool *tasks_in_flight = nullptr);
 
     void deferredCleanupLoop();
 

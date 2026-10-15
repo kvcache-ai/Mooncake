@@ -131,7 +131,8 @@ Status MultiTransport::freeBatchID(BatchID batch_id,
             "BatchID is invalid because cleanup has already been deferred");
     }
 
-    Status status = tryFreeBatchID(batch_id, before_delete);
+    bool tasks_in_flight = false;
+    Status status = tryFreeBatchID(batch_id, before_delete, &tasks_in_flight);
     if (!status.IsBatchBusy()) {
         return status;
     }
@@ -145,14 +146,27 @@ Status MultiTransport::freeBatchID(BatchID batch_id,
             std::thread(&MultiTransport::deferredCleanupLoop, this);
     }
     deferred_cleanup_cv_.notify_one();
-    LOG(WARNING) << "Batch " << batch_id
-                 << " is still busy; cleanup has been deferred";
+    if (tasks_in_flight) {
+        // The caller released a batch whose transfers have not finished
+        // (e.g. after a timeout): worth surfacing.
+        LOG(WARNING) << "Batch " << batch_id
+                     << " is still busy; cleanup has been deferred";
+    } else {
+        // Every task is terminal and a completion callback is still
+        // unwinding (#4569). This is a routine race on fast completions and
+        // clears on the next cleanup pass.
+        VLOG(1) << "Batch " << batch_id
+                << " finished but its completion callback is still running; "
+                   "cleanup has been deferred";
+    }
     return Status::BatchCleanupDeferred(
         "BatchID is invalid because cleanup has been deferred");
 }
 
 Status MultiTransport::tryFreeBatchID(
-    BatchID batch_id, const std::function<void()>& before_delete) {
+    BatchID batch_id, const std::function<void()>& before_delete,
+    bool* tasks_in_flight) {
+    if (tasks_in_flight) *tasks_in_flight = false;
     auto& batch_desc = *((BatchDesc*)(batch_id));
     const size_t task_count = batch_desc.task_list.size();
     for (size_t task_id = 0; task_id < task_count; task_id++) {
@@ -176,6 +190,7 @@ Status MultiTransport::tryFreeBatchID(
         // counter reaches zero below.
         if (status.s != Transport::TransferStatusEnum::COMPLETED &&
             status.s != Transport::TransferStatusEnum::FAILED) {
+            if (tasks_in_flight) *tasks_in_flight = true;
             return Status::BatchBusy(
                 "BatchID cannot be freed until all tasks are done");
         }
