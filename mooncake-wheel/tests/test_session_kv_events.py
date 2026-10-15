@@ -200,8 +200,12 @@ def test_tensor_filtering_and_tp_session_mapping(session_store):
     )
     assert results[0] != 0 and results[1] == 0
     assert receive(1)[0]["session_id"] == "right"
-    assert store.pub_tensor_with_tp("tp", tensor, tagged("tp-session"), tp_size=2) == 0
-    assert [e["session_id"] for e in receive(2)] == ["tp-session"] * 2
+    config = tagged("tp-session")
+    config.group_ids = ["tp-left", "tp-right"]
+    assert store.pub_tensor_with_tp("tp", tensor, config, tp_size=2) == 0
+    events = receive(2)
+    assert [e["session_id"] for e in events] == ["tp-session"] * 2
+    assert sorted(e["group_id"] for e in events) == ["tp-left", "tp-right"]
     results = store.batch_pub_tensor_with_tp(
         ["tp-a", "tp-b"], [tensor, tensor], tagged("a", "b"), tp_size=2
     )

@@ -204,12 +204,8 @@ void KvEventPublisher::PublishRemoved(const std::string& object_key,
         return;
     }
     std::vector<PendingEvent> events;
-    events.push_back(PendingEvent{EventKind::kRemoved,
-                                  object_key,
-                                  medium,
-                                  NormalizeTenant(tenant_id),
-                                  group_id,
-                                  {}});
+    events.push_back(PendingEvent{EventKind::kRemoved, object_key, medium,
+                                  NormalizeTenant(tenant_id), group_id});
     EnqueueBatch(std::move(events));
 }
 
@@ -218,8 +214,8 @@ void KvEventPublisher::PublishCleared(const std::string& tenant_id) {
         return;
     }
     std::vector<PendingEvent> events;
-    events.push_back(PendingEvent{
-        EventKind::kCleared, "", "", NormalizeTenant(tenant_id), "", {}});
+    events.push_back(PendingEvent{EventKind::kCleared, "", "",
+                                  NormalizeTenant(tenant_id), ""});
     EnqueueBatch(std::move(events));
 }
 
@@ -253,12 +249,8 @@ void KvEventPublisher::PublishObjectRemoved(
     const std::string normalized_tenant = NormalizeTenant(tenant_id);
     std::vector<PendingEvent> events;
     for (const auto& medium : SortedMedia(NormalizeMedia(previous_media))) {
-        events.push_back(PendingEvent{EventKind::kRemoved,
-                                      object_key,
-                                      medium,
-                                      normalized_tenant,
-                                      group_id,
-                                      {}});
+        events.push_back(PendingEvent{EventKind::kRemoved, object_key, medium,
+                                      normalized_tenant, group_id});
     }
     EnqueueBatch(std::move(events));
 }
@@ -278,12 +270,8 @@ void KvEventPublisher::SyncObjectState(
     std::vector<PendingEvent> events;
     for (const auto& medium : SortedMedia(previous_set)) {
         if (!new_set.contains(medium)) {
-            events.push_back(PendingEvent{EventKind::kRemoved,
-                                          object_key,
-                                          medium,
-                                          normalized_tenant,
-                                          group_id,
-                                          {}});
+            events.push_back(PendingEvent{EventKind::kRemoved, object_key,
+                                          medium, normalized_tenant, group_id});
         }
     }
     for (const auto& medium : SortedMedia(new_set)) {

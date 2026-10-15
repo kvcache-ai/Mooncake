@@ -100,7 +100,7 @@ class KvEventPublisher {
         std::string medium;
         std::string tenant_id;
         std::string group_id;
-        std::string session_id;
+        std::string session_id{};
     };
 
     void EnqueueBatch(std::vector<PendingEvent> events);
