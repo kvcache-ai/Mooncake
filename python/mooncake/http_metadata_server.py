@@ -8,6 +8,7 @@ used by Mooncake. It can be used as an alternative to etcd for metadata storage.
 
 import argparse
 import asyncio
+import json
 import logging
 import signal
 import sys
@@ -16,6 +17,96 @@ from enum import Enum
 from time import sleep
 
 from aiohttp import web
+
+
+# Path-segment marker shared with the C++ client (transfer_metadata.cpp builds
+# keys as <rpc_meta_prefix_><server_name> where the prefix ends with "/rpc_meta/").
+# We require the literal path segment "rpc_meta" to avoid misclassifying any
+# other key that just happens to contain the substring "rpc_meta" (e.g. a
+# segment key named "rpc_meta_cache").
+_RPC_META_SEGMENT = "rpc_meta"
+
+
+def _is_rpc_meta_key(key: str) -> bool:
+    parts = [p for p in key.split("/") if p]
+    return _RPC_META_SEGMENT in parts
+
+
+def _extract_json(payload: bytes):
+    """Parse payload as JSON; return None on failure."""
+    try:
+        return json.loads(payload)
+    except (ValueError, TypeError):
+        return None
+
+
+def _field_value(obj, *names):
+    """Return the first found field value from a JSON object, or None."""
+    if isinstance(obj, dict):
+        for name in names:
+            if name in obj and obj[name] is not None:
+                return obj[name]
+    return None
+
+
+def _put_rpc_meta_is_valid(new_payload: bytes, existing_payload: bytes):
+    """Return (ok, reason) for an rpc_meta PUT against an existing entry.
+
+    Returns True for idempotent or legitimate version-bumping updates.
+    Returns False only for: malformed JSON, a lower-or-equal metadata_version
+    rollback, or a conflicting ip_or_host_name / rpc_port identity change.
+    """
+    if new_payload == existing_payload:
+        return True, "unchanged"
+
+    new_obj = _extract_json(new_payload)
+    old_obj = _extract_json(existing_payload)
+
+    # If we cannot parse JSON we cannot reason about idempotency. Allow the
+    # overwrite only when the old value is also unparsed (raw bytes path).
+    if new_obj is None or old_obj is None:
+        if new_obj is None and old_obj is None:
+            return True, "unchanged-raw-bytes"
+        return False, "payload-not-json"
+
+    new_version = _field_value(new_obj, "metadata_version")
+    old_version = _field_value(old_obj, "metadata_version")
+    # Strict rollback is never OK. Missing version stays compatible because
+    # the client (transfer_metadata.cpp) always publishes one; an admin tool
+    # that omits the field cannot regress.
+    if (
+        isinstance(new_version, int)
+        and isinstance(old_version, int)
+        and new_version < old_version
+    ):
+        return False, "metadata_version-rollback"
+    if (
+        isinstance(new_version, int)
+        and isinstance(old_version, int)
+        and new_version == old_version
+        and new_obj != old_obj
+    ):
+        return False, "metadata_version-conflict"
+
+    # Identity fields must not change across republish. C++ client uses these
+    # plus metadata_version as its liveness identity.
+    new_host = _field_value(new_obj, "ip_or_host_name")
+    old_host = _field_value(old_obj, "ip_or_host_name")
+    new_port = _field_value(new_obj, "rpc_port")
+    old_port = _field_value(old_obj, "rpc_port")
+    if (
+        new_host is not None
+        and old_host is not None
+        and new_host != old_host
+    ) or (
+        new_port is not None
+        and old_port is not None
+        and int(new_port) != int(old_port)
+    ):
+        return False, "identity-conflict"
+
+    return True, "version-bumped"
+
 
 
 class KVPoll(Enum):
@@ -93,19 +184,26 @@ class KVBootstrapServer:
         """Handle PUT requests."""
         data = await request.read()
         async with self.lock:
-            if key.find("rpc_meta") != -1 and key in self.store:
-                # Re-publishing the same rpc_meta value is idempotent; only a
-                # conflicting value is rejected. Mirrors the C++ metadata server
-                # fix in #2311.
-                if self.store[key] == data:
+            if _is_rpc_meta_key(key) and key in self.store:
+                ok, reason = _put_rpc_meta_is_valid(data, self.store[key])
+                if not ok:
+                    return web.Response(
+                        text=f"rpc_meta conflict: {reason}",
+                        status=400,
+                        content_type="application/json",
+                    )
+                if reason in ("unchanged", "unchanged-raw-bytes"):
                     return web.Response(
                         text="metadata unchanged",
                         status=200,
                         content_type="application/json",
                     )
+                # Legitimate version bump (C++ TransferMetadata::rePublishRpcMetaEntry
+                # always increments metadata_version on a re-publish).
+                self.store[key] = data
                 return web.Response(
-                    text="Duplicate rpc_meta key not allowed",
-                    status=400,
+                    text="metadata republished",
+                    status=200,
                     content_type="application/json",
                 )
             self.store[key] = data
