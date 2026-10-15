@@ -37,6 +37,10 @@ class WrappedMasterService {
 
     ~WrappedMasterService();
 
+    // Shutdown handoff: the restore at startup and the export at SIGTERM run
+    // directly on the wrapped service, outside any RPC.
+    MasterService& GetMasterServiceForHandoff() { return master_service_; }
+
     tl::expected<bool, ErrorCode> ExistKey(
         const std::string& key, const std::string& tenant_id = "default");
 
