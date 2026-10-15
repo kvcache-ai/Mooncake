@@ -211,7 +211,14 @@ if(USE_TENT)
 endif()
 
 if(USE_MEMFABRIC)
-  target_link_libraries(transfer_engine PUBLIC ascendcl)
+  if(BUILD_UNIT_TESTS)
+    # Embed the implementation in libtransfer_engine.a so Cargo's native link
+    # resolves ACL calls from the TENT archives without a separate mock library.
+    target_sources(transfer_engine PRIVATE ../tent/tests/mock_acl/acl_stub.cpp)
+    target_include_directories(transfer_engine PRIVATE ../tent/tests/mock_acl)
+  else()
+    target_link_libraries(transfer_engine PUBLIC ascendcl)
+  endif()
 endif()
 
 if(USE_INTRA_NVLINK)

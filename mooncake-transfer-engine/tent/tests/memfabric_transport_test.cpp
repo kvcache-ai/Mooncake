@@ -97,6 +97,37 @@ aclError aclrtFreeHost(void* hostPtr) {
     return ACL_ERROR_NONE;
 }
 
+aclError aclrtGetPhyDevIdByLogicDevId(int32_t, int32_t* phyDevId) {
+    *phyDevId = 0;
+    return ACL_SUCCESS;
+}
+
+aclError aclrtMallocPhysical(aclrtDrvMemHandle*, size_t,
+                             const aclrtPhysicalMemProp*, uint64_t) {
+    return ACL_SUCCESS;
+}
+
+aclError aclrtFreePhysical(aclrtDrvMemHandle) { return ACL_SUCCESS; }
+
+aclError aclrtReserveMemAddress(void** va, size_t, uint64_t, void*, size_t) {
+    *va = nullptr;
+    return ACL_ERROR_NONE;
+}
+
+aclError aclrtMapMem(void*, size_t, uint64_t, aclrtDrvMemHandle, uint64_t) {
+    return ACL_ERROR_NONE;
+}
+
+aclError aclrtUnmapMem(void*) { return ACL_ERROR_NONE; }
+
+aclError aclrtReleaseMemAddress(void*) { return ACL_ERROR_NONE; }
+
+aclError aclrtMemcpy(void*, size_t, const void*, size_t, aclrtMemcpyKind) {
+    return ACL_SUCCESS;
+}
+
+const char* aclGetRecentErrMsg() { return ""; }
+
 }  // extern "C"
 
 namespace mooncake {

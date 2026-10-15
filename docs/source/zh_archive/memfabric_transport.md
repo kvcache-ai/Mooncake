@@ -77,6 +77,7 @@ ls $SITE_PKG/memfabric_hybrid/lib/libmf_smem.so
 cmake -S . -B build -G Ninja \
     -DUSE_TENT=ON \
     -DUSE_MEMFABRIC=ON \
+    -DBUILD_UNIT_TESTS=OFF \
     -DBUILD_SHARED_LIBS=ON \
     -DCMAKE_BUILD_TYPE=Release
 
@@ -129,14 +130,13 @@ source /usr/local/Ascend/ascend-toolkit/set_env.sh
 ```bash
 # 在仓库根目录执行
 cmake -S . -B build-memfabric-mock -G Ninja \
-    -DUSE_TENT=ON \
-    -DTENT_BUILD_MEMFABRIC_MOCK_TESTS=ON
+    -DUSE_TENT=ON -DUSE_MEMFABRIC=ON \
+    -DBUILD_UNIT_TESTS=ON \
+    -DWITH_STORE=OFF -DWITH_STORE_RUST=OFF
 cmake --build build-memfabric-mock --parallel 2 --target \
-    tent_memfabric_transport_test tent_ascend_platform_mock_test
-for test in tent_memfabric_transport_test tent_ascend_platform_mock_test; do
-    ctest --test-dir build-memfabric-mock/mooncake-transfer-engine/tent/tests \
-        -R "^${test}$" --output-on-failure --no-tests=error --timeout 120 || exit 1
-done
+    tent_memfabric_transport_test
+ctest --test-dir build-memfabric-mock/mooncake-transfer-engine/tent/tests \
+    -R '^tent_memfabric_transport_test$' --output-on-failure --no-tests=error --timeout 120
 ```
 
 

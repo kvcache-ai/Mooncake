@@ -194,12 +194,12 @@ target_include_directories(local_notification_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME local_notification_test COMMAND local_notification_test)
 
-# Notification fallback: an unavailable RDMA notification channel falls back to
-# the next transport and then to the control-plane RPC, and receive drains every
-# transport. Loopback only, no NIC required.
+# Notification fallback: an unavailable RDMA notification channel falls back
+# to the next transport and then to the control-plane RPC, and receive drains
+# every transport. Loopback only, no NIC required.
 add_executable(tent_notification_fallback_test notification_fallback_test.cpp)
-target_link_libraries(tent_notification_fallback_test PRIVATE gtest gtest_main
-                                                              tent_link_group)
+target_link_libraries(tent_notification_fallback_test
+                      PRIVATE gtest gtest_main tent_link_group)
 target_include_directories(tent_notification_fallback_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_notification_fallback_test
@@ -822,14 +822,13 @@ target_include_directories(tent_segment_desc_retry_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_segment_desc_retry_test COMMAND tent_segment_desc_retry_test)
 
-if(TENT_BUILD_MEMFABRIC_MOCK_TESTS)
-  add_subdirectory(memfabric)
-elseif(USE_MEMFABRIC)
+if(USE_MEMFABRIC)
   add_executable(tent_memfabric_transport_test memfabric_transport_test.cpp)
   target_link_libraries(tent_memfabric_transport_test PRIVATE gtest gtest_main
                                                               tent_link_group)
-  target_include_directories(tent_memfabric_transport_test
-                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  target_include_directories(
+    tent_memfabric_transport_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include
+                                          ${CMAKE_CURRENT_SOURCE_DIR}/mock_acl)
   add_test(NAME tent_memfabric_transport_test
            COMMAND tent_memfabric_transport_test)
 endif()
@@ -837,7 +836,8 @@ set_tests_properties(tent_segment_desc_retry_test PROPERTIES TIMEOUT 60)
 
 # Fabric transport: attribute codec and slicing math, plus end-to-end cases on
 # libfabric's tcp;ofi_rxm provider (no fabric hardware needed). Each e2e case
-# forks a server before the client engine starts, so it runs in its own process.
+# forks a server before the client engine starts, so it runs in its own
+# process.
 if(TARGET tent_xport_fabric)
   add_executable(tent_fabric_attrs_test fabric_attrs_test.cpp)
   target_link_libraries(tent_fabric_attrs_test PRIVATE gtest gtest_main

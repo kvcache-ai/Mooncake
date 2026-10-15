@@ -96,8 +96,8 @@ else()
   message(STATUS "RDMA: Disabled")
 endif()
 
-# libfabric (EFA, and tcp;ofi_rxm for tests). USE_EFA/USE_CXI already resolve
-# libfabric in mooncake-common/common.cmake.
+# libfabric (EFA, and tcp;ofi_rxm for tests). USE_EFA/USE_CXI already
+# resolve libfabric in mooncake-common/common.cmake.
 if(USE_FABRIC
    OR USE_EFA
    OR USE_CXI)
