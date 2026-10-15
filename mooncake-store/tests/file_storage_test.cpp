@@ -551,6 +551,15 @@ class FileStorageTest : public ::testing::Test {
         return fileStorage.ProcessDrainedOffloads(std::move(drained));
     }
 
+    static void SetOffloadCompletionRpc(
+        FileStorage& fileStorage,
+        std::function<tl::expected<void, ErrorCode>(
+            const std::vector<OffloadTaskItem>&,
+            const std::vector<StorageObjectMetadata>&)>
+            rpc) {
+        fileStorage.test_offload_completion_rpc_ = std::move(rpc);
+    }
+
     static tl::expected<void, ErrorCode> InitStorageBackend(
         FileStorage& fileStorage) {
         return fileStorage.storage_backend_->Init();
@@ -802,7 +811,7 @@ class FileStorageTest : public ::testing::Test {
                 for (auto& metadata : metadatas) {
                     metadata.transport_endpoint = fileStorage.local_rpc_addr_;
                 }
-                auto result = fileStorage.client_->NotifyOffloadSuccess(
+                auto result = fileStorage.client_->NotifyOffloadTaskSuccess(
                     DrainedItemsFor(drained, keys), metadatas);
                 if (!result) {
                     return result.error();
@@ -913,7 +922,7 @@ class FileStorageTest : public ::testing::Test {
                 for (auto& metadata : metadatas) {
                     metadata.transport_endpoint = file_storage.local_rpc_addr_;
                 }
-                auto result = file_storage.client_->NotifyOffloadSuccess(
+                auto result = file_storage.client_->NotifyOffloadTaskSuccess(
                     DrainedItemsFor(drained, keys), metadatas);
                 return result ? ErrorCode::OK : result.error();
             });
@@ -1042,7 +1051,7 @@ class FileStorageTest : public ::testing::Test {
                 for (auto& metadata : metadatas) {
                     metadata.transport_endpoint = file_storage.local_rpc_addr_;
                 }
-                auto result = file_storage.client_->NotifyOffloadSuccess(
+                auto result = file_storage.client_->NotifyOffloadTaskSuccess(
                     DrainedItemsFor(drained, keys), metadatas);
                 return result ? ErrorCode::OK : result.error();
             });
@@ -1870,7 +1879,7 @@ TEST_F(FileStorageTest, NotifyEvictedDiskReplicasUsesTenantScopedKeys) {
             .transport_endpoint = local_rpc_addr,
         });
     }
-    ASSERT_TRUE(client.value()->NotifyOffloadSuccess(tasks, metadatas));
+    ASSERT_TRUE(client.value()->NotifyOffloadTaskSuccess(tasks, metadatas));
     DropMemoryCopies(master, *client.value(), {key}, source_segment);
 
     for (const auto& task : tasks) {
@@ -2274,6 +2283,71 @@ TEST_F(FileStorageTest, ItemsWithoutTaskIdAreNackedNotCopied) {
 
     EXPECT_TRUE(StorageKeyExists(file_storage, "tagged_key"));
     EXPECT_EQ(rig.DiskReplicas("tagged_key"), 1u);
+    rig.Stop();
+}
+
+// A completion is registered only through NotifyOffloadTaskSuccess; the old
+// RPC name carries NACKs (and refuses completions), so a master that predates
+// task ids, which only knows the old name, can never register one.
+TEST_F(FileStorageTest, CompletionsRegisterOnlyThroughTheTaskRpc) {
+    OffloadRig rig;
+    rig.Start();
+    rig.Put("done_key", std::string(128, 'd'));
+    rig.Put("nack_key", std::string(128, 'n'));
+    auto items = rig.Drain();
+    ASSERT_EQ(items.size(), 2u);
+    std::vector<OffloadTaskItem> done, nacked;
+    for (const auto& item : items) {
+        (item.key == "done_key" ? done : nacked).push_back(item);
+    }
+    StorageObjectMetadata file{.bucket_id = 1,
+                               .offset = 0,
+                               .key_size = 8,
+                               .data_size = 128,
+                               .transport_endpoint = rig.endpoint};
+    ASSERT_TRUE(rig.client->NotifyOffloadSuccess(done, {file}));
+    EXPECT_EQ(rig.DiskReplicas("done_key"), 0u);
+    EXPECT_TRUE(rig.HasOffloadTask("done_key"));
+    ASSERT_TRUE(rig.client->NotifyOffloadTaskSuccess(done, {file}));
+    EXPECT_EQ(rig.DiskReplicas("done_key"), 1u);
+
+    StorageObjectMetadata nack{-1, 0, 0, -1, ""};
+    ASSERT_TRUE(rig.HasOffloadTask("nack_key"));
+    ASSERT_TRUE(rig.client->NotifyOffloadSuccess(nacked, {nack}));
+    EXPECT_FALSE(rig.HasOffloadTask("nack_key"));
+    rig.Stop();
+}
+
+// When the completion RPC fails (e.g. "function not registered" from a master
+// that predates task ids), the store rolls the bucket back and NACKs: no file
+// stays behind that a key-only master could register.
+TEST_F(FileStorageTest, CompletionRpcErrorRollsTheBucketBack) {
+    OffloadRig rig;
+    rig.Start();
+    rig.Put("rollback_key", std::string(128, 'r'));
+    auto items = rig.Drain();
+    ASSERT_EQ(items.size(), 1u);
+
+    SetEnv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "1");
+    auto config = FileStorageConfig::FromEnvironment();
+    config.storage_filepath = data_path + "/rollback_ssd";
+    config.local_buffer_size = 1024 * 1024;
+    fs::create_directories(config.storage_filepath);
+    FileStorage file_storage(config, rig.client, rig.endpoint);
+    ASSERT_TRUE(InitStorageBackend(file_storage));
+    int completion_calls = 0;
+    SetOffloadCompletionRpc(file_storage,
+                            [&completion_calls](const auto&, const auto&) {
+                                ++completion_calls;
+                                return tl::expected<void, ErrorCode>(
+                                    tl::make_unexpected(ErrorCode::RPC_FAIL));
+                            });
+    (void)FileStorageProcessDrainedOffloads(file_storage, items);
+
+    EXPECT_EQ(completion_calls, 1);
+    EXPECT_FALSE(StorageKeyExists(file_storage, "rollback_key"));
+    EXPECT_EQ(rig.DiskReplicas("rollback_key"), 0u);
+    EXPECT_FALSE(rig.HasOffloadTask("rollback_key"));  // NACKed
     rig.Stop();
 }
 
