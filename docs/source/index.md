@@ -82,6 +82,54 @@ At the center of Mooncake is a KVCache-centric scheduler that balances effective
 
 :::
 
+<h2 id="blogs">📰 Blogs</h2>
+
+::::{grid} 1 2 2 2
+:gutter: 2
+:class-container: latest-blogs
+
+:::{grid-item-card} Over One Trillion Tokens per Day: How Mooncake Powers Approaching.AI’s Token Factory
+:img-top: https://kvcache.ai/blog/mooncake-in-approaching-ai/featured_hue86b549ecdd836b0c6b3aa760df33338_1244829_2a2b63e1a97ff4921bf0e665a65e1403.webp
+:img-alt: The HiCache + Mooncake Store Architecture within a PD Group
+:link: https://kvcache.ai/blog/mooncake-in-approaching-ai/
+:link-alt: Over One Trillion Tokens per Day: How Mooncake Powers Approaching.AI’s Token Factory
+:class-body: blog-card-date
+
+September 15, 2026
+:::
+
+:::{grid-item-card} Mooncake for Miles: From Fragmented Rollout Data to Efficient Bulk I/O
+:img-top: https://kvcache.ai/blog/mooncake-rl-rollout-data-transfer/featured_hue655d0112fa862027ab204efc8ff95c7_58042_8bb94c00d58ac807a3ff4bc8f8df21e2.webp
+:img-alt: Miles rollout data transfer with Mooncake
+:link: https://kvcache.ai/blog/mooncake-rl-rollout-data-transfer/
+:link-alt: Mooncake for Miles: From Fragmented Rollout Data to Efficient Bulk I/O
+:class-body: blog-card-date
+
+August 20, 2026
+:::
+
+:::{grid-item-card} Scaling KV Cache Beyond Memory with Mooncake SSD Offloading
+:img-top: https://kvcache.ai/blog/scaling-kv-cache-beyond-memory/featured_huc52d82bb227581a966940933903d5e2c_479035_349926621d7fc55e030b6d364f46602b.webp
+:img-alt: Mooncake SSD Offloading Architecture
+:link: https://kvcache.ai/blog/scaling-kv-cache-beyond-memory/
+:link-alt: Scaling KV Cache Beyond Memory with Mooncake SSD Offloading
+:class-body: blog-card-date
+
+July 15, 2026
+:::
+
+:::{grid-item-card} How Much KV Cache Budget Do We Need for LLM Serving?
+:img-top: https://kvcache.ai/blog/calculate-kvcache-cache-budge/featured_hu137d5fd64784a367d2cae0088c081616_54073_4242cb61033db09c45fd8739c71f32e2.webp
+:img-alt: KV Cache Hit Rate Figure
+:link: https://kvcache.ai/blog/calculate-kvcache-cache-budge/
+:link-alt: How Much KV Cache Budget Do We Need for LLM Serving?
+:class-body: blog-card-date
+
+June 26, 2026
+:::
+
+::::
+
 % How to start using Mooncake?
 
 :::{toctree}
