@@ -358,6 +358,43 @@ tl::expected<bool, ErrorCode> LocalSsdManager::ConsumeRemoveAll(
     return client->record->mailbox.ConsumeRemoveAll();
 }
 
+std::vector<LocalSsdHandoffClient> LocalSsdManager::ExportHandoffClients()
+    const {
+    auto clients = SnapshotClients();
+    std::vector<LocalSsdHandoffClient> out;
+    out.reserve(clients.size());
+    for (const auto& client_access : clients) {
+        const auto& record = client_access.record;
+        LocalSsdHandoffClient client;
+        client.client_id = client_access.client_id;
+        {
+            MutexLocker stats_lock(&record->stats_mutex);
+            client.total_capacity_bytes = record->total_capacity_bytes;
+        }
+        {
+            MutexLocker mailbox_lock(&record->mailbox.mutex_);
+            client.enable_offloading = record->mailbox.enable_offloading_;
+        }
+        out.push_back(client);
+    }
+    return out;
+}
+
+ErrorCode LocalSsdManager::RestoreHandoffClient(
+    const LocalSsdHandoffClient& client, int64_t used_bytes) {
+    auto record = std::make_shared<ClientRecord>(client.enable_offloading);
+    {
+        MutexLocker stats_lock(&record->stats_mutex);
+        record->total_capacity_bytes = client.total_capacity_bytes;
+    }
+    record->used_bytes.store(used_bytes, std::memory_order_relaxed);
+    std::unique_lock lock(mutex_);
+    if (!clients_.emplace(client.client_id, std::move(record)).second) {
+        return ErrorCode::SEGMENT_ALREADY_EXISTS;
+    }
+    return ErrorCode::OK;
+}
+
 void LocalSsdManager::Clear() {
     ClientMap clients;
     {

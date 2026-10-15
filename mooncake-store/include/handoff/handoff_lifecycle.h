@@ -52,6 +52,12 @@ struct ReadyMarker {
     // anything is read.
     uint64_t objects{0};
     uint64_t bytes{0};
+    // Objects with a LOCAL_DISK replica (schema 2; absent in older markers
+    // and then 0). Used by the restore admission.
+    uint64_t disk_replicas{0};
+    // Objects without a memory replica (absent in older markers and then 0,
+    // which makes the restore admission over-estimate, never under-).
+    uint64_t disk_only_objects{0};
 };
 
 // "MOONCAKE-HANDOFF-READY 1 <crc32c of body> <body bytes>\n<body>", body is

@@ -7,20 +7,33 @@
 //   headroom = limit - memory.current            (page cache counts as used)
 //   safety   = max(512 MiB, 3% of limit)
 //   per_wkr  = 16 MiB + ceil(objects / 1024) * 1350 B
-//              (one shard's StandbyObjectEntry copies + encoded chunk)
+//                     + ceil(disk / 1024) * 200 B
+//              (one shard's StandbyObjectEntry copies + encoded chunk;
+//              disk = objects with a LOCAL_DISK replica, schema 2)
 //   base     = 64 MiB                            (segments, chunk index, ...)
 //   W        = min(max_workers, cpus, floor((headroom - safety - base) /
 //                                           per_wkr))
 //   skip if W == 0 ("memory_headroom"), if the free space of the handoff
-//   file system is below 1.3 * (objects * 200 B + 16 MiB) ("disk_space"), or
-//   if the predicted restore need (below) exceeds what the next master can
-//   spend ("restore_memory"; it would start empty anyway).
+//   file system is below 1.3 * (objects * 200 B + disk * 100 B + 16 MiB)
+//   ("disk_space"), or if the predicted restore need (below) exceeds what
+//   the next master can spend ("restore_memory"; it would start empty
+//   anyway). Before the write the split of `disk` (objects with a LOCAL_DISK
+//   replica) into disk-only objects and extra disk replicas is unknown, so
+//   the cheapest split is assumed (lower bound); after the write the exact
+//   counts are checked again and the snapshot is not published if they do
+//   not fit. The snapshot always includes L4: there is no memory-only
+//   fallback.
 //
 // Restore (after the claim, before anything is allocated):
-//   need  = objects * bytes_per_object * (100 + margin_percent) / 100
+//   raw   = memory_objects     * bytes_per_memory_object
+//           + extra_disk       * bytes_per_extra_disk_replica
+//           + disk_only        * bytes_per_disk_only_object
+//   need  = raw * (100 + margin_percent) / 100
+//   memory_objects = objects with a memory replica = objects - disk_only,
+//   extra_disk     = LOCAL_DISK replicas of those    = disk - disk_only.
 //   skip if need > headroom ("memory_headroom") -> cold start.
-//   bytes_per_object is the measured peak RSS (VmHWM) per object of a
-//   restore at 25M objects, rounded up; the margin is the only safety term.
+//   The per-item costs are the measured peak RSS (VmHWM) per item of
+//   restores at scale, rounded up; the margin is the only safety term.
 //
 // All inputs are read through injectable file paths so tests can feed fake
 // cgroup files.
@@ -80,20 +93,43 @@ uint64_t AdmissionSafetyBytes(uint64_t limit);
 // refused at startup for lack of headroom.
 uint64_t RestoreBudgetBytes(uint64_t limit);
 
+// Restore memory model. Defaults: measured VmHWM per item (incl. the empty
+// master) at 25M / 32M memory objects, case O (24M extra disk replicas) and
+// case D (24M disk-only objects), rounded up to a multiple of 8.
 struct RestoreCostModel {
-    // Peak RSS per restored object (incl. its memory replicas and the empty
-    // master), measured at 25M objects and rounded up.
-    uint64_t bytes_per_object{1144};
+    // An object with at least one memory replica (and its memory replica).
+    uint64_t bytes_per_memory_object{1144};
+    // A LOCAL_DISK replica of an object that also has a memory replica.
+    uint64_t bytes_per_extra_disk_replica{184};
+    // An object whose only replica is a LOCAL_DISK replica.
+    uint64_t bytes_per_disk_only_object{904};
     // One explicit safety margin on the total.
     uint32_t margin_percent{15};
 };
 
-// need = objects * bytes_per_object * (100 + margin) / 100, rounded up.
-uint64_t RestoreNeedBytes(uint64_t objects, const RestoreCostModel& model);
+struct RestoreCounts {
+    uint64_t objects{0};        // all objects in the snapshot
+    uint64_t disk_replicas{0};  // objects with a LOCAL_DISK replica
+    // Objects without a memory replica. Unknown (e.g. a marker written
+    // before this field existed) is 0, which charges every disk object as
+    // a memory object plus an extra disk replica: an over-estimate.
+    uint64_t disk_only_objects{0};
+};
+
+// need = raw * (100 + margin) / 100, rounded up (see the header comment).
+// disk_only_objects is clamped to min(objects, disk_replicas).
+uint64_t RestoreNeedBytes(const RestoreCounts& counts,
+                          const RestoreCostModel& model);
+
+// Smallest need over every possible disk-only split of `disk_replicas`
+// (used before the write, when the split is not known yet).
+uint64_t RestoreNeedLowerBound(uint64_t objects, uint64_t disk_replicas,
+                               const RestoreCostModel& model);
 
 struct ShutdownAdmissionInput {
     MemorySnapshot memory;
     uint64_t objects{0};
+    uint64_t local_disk_objects{0};
     uint64_t disk_free_bytes{0};
     RestoreCostModel restore_cost;
     size_t max_workers{8};
@@ -109,8 +145,8 @@ struct ShutdownAdmission {
     uint64_t per_worker{0};
     uint64_t base{0};
     uint64_t disk_needed{0};
-    // Predicted restore need of every object (incl. the margin); the need
-    // of the objects actually written is checked again after the write.
+    // Predicted restore need (lower bound over the disk-only split, incl.
+    // the margin); the exact need is checked after the write.
     uint64_t restore_needed{0};
     std::string ToJson() const;
 };
@@ -125,7 +161,7 @@ struct RestoreAdmission {
 };
 
 RestoreAdmission DecideRestoreAdmission(const MemorySnapshot& memory,
-                                        uint64_t objects,
+                                        const RestoreCounts& counts,
                                         const RestoreCostModel& model);
 
 }  // namespace mooncake::handoff

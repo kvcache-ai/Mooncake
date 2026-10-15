@@ -49,6 +49,9 @@ class Watchdog {
 struct ShutdownWriteResult {
     uint64_t objects{0};
     uint64_t bytes{0};
+    // Objects with a LOCAL_DISK replica, and those without a memory one.
+    uint64_t disk_replicas{0};
+    uint64_t disk_only_objects{0};
     std::string json;  // writer stats
 };
 
@@ -63,6 +66,8 @@ struct ShutdownSteps {
     std::function<void()> trim;
     std::function<tl::expected<MemorySnapshot, std::string>()> read_memory;
     std::function<uint64_t()> object_count;
+    // Objects with a LOCAL_DISK replica; may be empty (0).
+    std::function<uint64_t()> local_disk_count;
     std::function<uint64_t(const std::string&)> disk_free;
     // Writes a complete, fsynced snapshot into `dir` (created by the step).
     std::function<tl::expected<ShutdownWriteResult, std::string>(
@@ -88,7 +93,9 @@ struct ShutdownReport {
     std::string detail;
     std::string snapshot;
     uint64_t objects{0};
-    // Predicted restore need of the written snapshot (0 before).
+    uint64_t local_disk_objects{0};
+    uint64_t disk_only_objects{0};
+    // Exact predicted restore need of the written snapshot (0 before).
     uint64_t restore_needed{0};
     uint64_t bytes{0};
     size_t workers{0};
@@ -107,8 +114,8 @@ struct ShutdownReport {
 
 // Order: stop_serving -> quiesce -> ownership / poison checks -> reset the
 // directory -> admission (trim and re-check if short) -> write into
-// snap-<id>.tmp -> restore-need check of what was written -> poison re-check
-// -> publish (rename + READY). Writes last_shutdown at the end.
+// snap-<id>.tmp -> exact restore-need check of what was written -> poison
+// re-check -> publish (rename + READY). Writes last_shutdown at the end.
 // Never throws; the caller exits the process afterwards.
 ShutdownReport RunHandoffShutdown(const ShutdownSteps& steps,
                                   const ShutdownOptions& options,
@@ -119,6 +126,7 @@ ShutdownReport RunHandoffShutdown(const ShutdownSteps& steps,
 struct RestoreSummary {
     uint64_t objects{0};
     uint64_t segments{0};
+    uint64_t local_disk_replicas{0};
     std::string json;  // restore stats
 };
 
@@ -159,6 +167,7 @@ struct StartupReport {
     std::string snapshot;
     uint64_t objects{0};
     uint64_t segments{0};
+    uint64_t local_disk_replicas{0};
     uint64_t age_ms{0};
     uint64_t claim_ns{0};
     uint64_t restore_ns{0};
@@ -192,6 +201,8 @@ class HandoffMetrics {
     // Live counters of restored segments (pending / confirmed / dropped).
     void SetSegmentCounters(
         std::function<void(uint64_t*, uint64_t*, uint64_t*)> provider);
+    // Restored L4 owners whose disk replicas are still unreadable.
+    void SetLocalDiskCounters(std::function<void(uint64_t*)> provider);
     std::string Serialize() const;
 
    private:
@@ -200,6 +211,7 @@ class HandoffMetrics {
     StartupReport startup_;
     std::string last_shutdown_json_;
     std::function<void(uint64_t*, uint64_t*, uint64_t*)> segment_counters_;
+    std::function<void(uint64_t*)> local_disk_counters_;
 };
 
 // ------------------------------------------------------------------ config

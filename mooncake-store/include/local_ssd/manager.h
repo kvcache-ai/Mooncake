@@ -56,6 +56,19 @@ class LocalSsdTaskMailbox {
     friend class LocalSsdManager;
 };
 
+// Per-client LocalSSD state carried by the shutdown handoff snapshot. Queued
+// offloads and promotions are not carried (a new master draws a new L4 task
+// epoch, so reports of the old master's tasks are refused anyway); used bytes
+// are recomputed from the restored LOCAL_DISK replicas. There is no
+// whole-client remove-all request to carry: the master no longer issues one.
+struct LocalSsdHandoffClient {
+    UUID client_id{0, 0};
+    bool enable_offloading{false};
+    int64_t total_capacity_bytes{0};
+    YLT_REFL(LocalSsdHandoffClient, client_id, enable_offloading,
+             total_capacity_bytes);
+};
+
 class LocalSsdManager {
    public:
     struct CapacityChange {
@@ -105,6 +118,12 @@ class LocalSsdManager {
     void RequestRemoveAll(const std::vector<UUID>& clients);
     tl::expected<bool, ErrorCode> ConsumeRemoveAll(const UUID& client_id);
 
+    // Shutdown handoff.
+    std::vector<LocalSsdHandoffClient> ExportHandoffClients() const;
+    // Registers a client restored from a handoff snapshot. Fails with
+    // SEGMENT_ALREADY_EXISTS if the client is already registered.
+    ErrorCode RestoreHandoffClient(const LocalSsdHandoffClient& client,
+                                   int64_t used_bytes);
     void Clear();
 
    private:

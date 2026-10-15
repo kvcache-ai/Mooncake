@@ -132,6 +132,11 @@ std::string HandoffWriteResult::ToJson() const {
       << stats.dropped_incomplete_replicas
       << ",\"dropped_unknown_segment_replicas\":"
       << stats.dropped_unknown_segment_replicas
+      << ",\"local_disk_clients\":" << stats.local_disk_clients
+      << ",\"local_disk_replicas\":" << stats.local_disk_replicas
+      << ",\"disk_only_objects\":" << stats.disk_only_objects
+      << ",\"dropped_local_disk_replicas\":"
+      << stats.dropped_local_disk_replicas
       << ",\"quarantine_ranges\":" << stats.quarantine_ranges
       << ",\"quarantine_bytes\":" << stats.quarantine_bytes
       << ",\"discarded_ranges\":" << stats.discarded_ranges
@@ -178,6 +183,13 @@ tl::expected<HandoffWriteResult, std::string> WriteHandoffSnapshot(
     auto t = SteadyClock::now();
     const auto segments = service.ExportHandoffSegments();
     const handoff::SegmentLocator locator(segments);
+    // L4: the registrations whose LOCAL_DISK replicas the chunks carry.
+    const auto local_disk_clients =
+        service.ExportHandoffLocalDiskClients(segments);
+    MasterService::HandoffClientSet disk_owners;
+    for (const auto& client : local_disk_clients) {
+        disk_owners.insert(client.client_id);
+    }
     result.segments_ns = NsSince(t);
 
     // ---- Object chunks: one per non-empty metadata shard, written as they
@@ -211,8 +223,8 @@ tl::expected<HandoffWriteResult, std::string> WriteHandoffSnapshot(
             if (shard >= num_shards || failed.load()) break;
             auto ts = SteadyClock::now();
             std::vector<StandbyObjectEntry> objects;
-            service.ExportHandoffShard(shard, locator, objects, st.quarantine,
-                                       st.stats);
+            service.ExportHandoffShard(shard, locator, disk_owners, objects,
+                                       st.quarantine, st.stats);
             st.export_ns += NsSince(ts);
 
             const uint64_t count = objects.size();
@@ -279,6 +291,9 @@ tl::expected<HandoffWriteResult, std::string> WriteHandoffSnapshot(
         s.dropped_incomplete_replicas += st.stats.dropped_incomplete_replicas;
         s.dropped_unknown_segment_replicas +=
             st.stats.dropped_unknown_segment_replicas;
+        s.local_disk_replicas += st.stats.local_disk_replicas;
+        s.disk_only_objects += st.stats.disk_only_objects;
+        s.dropped_local_disk_replicas += st.stats.dropped_local_disk_replicas;
         s.quarantine_ranges += st.stats.quarantine_ranges;
         s.quarantine_bytes += st.stats.quarantine_bytes;
         s.total_bytes += st.stats.total_bytes;
@@ -294,6 +309,9 @@ tl::expected<HandoffWriteResult, std::string> WriteHandoffSnapshot(
                                              manifest.writer);
     manifest.object_count = manifest.writer.objects;
     manifest.replica_count = manifest.writer.replicas;
+    manifest.writer.local_disk_clients = local_disk_clients.size();
+    manifest.local_disk_clients = local_disk_clients.size();
+    manifest.local_disk_replicas = manifest.writer.local_disk_replicas;
     // Read after the export: every id the old master handed out is below it,
     // including ids of objects that were left out.
     manifest.next_replica_id = MasterService::HandoffNextReplicaId();
@@ -354,6 +372,14 @@ tl::expected<HandoffWriteResult, std::string> WriteHandoffSnapshot(
     if (!quarantine_blob) return tl::make_unexpected(quarantine_blob.error());
     manifest.quarantine = *quarantine_blob;
     manifest.quarantine_ranges = quarantine.size();
+
+    const auto local_disk_bytes =
+        handoff::EncodeLocalDiskClients(local_disk_clients);
+    auto local_disk_blob =
+        WriteBlob(root, handoff::kHandoffLocalDiskFile, local_disk_bytes.data(),
+                  local_disk_bytes.size(), options.durable);
+    if (!local_disk_blob) return tl::make_unexpected(local_disk_blob.error());
+    manifest.local_disk = *local_disk_blob;
 
     if (options.durable) {
         // Directory entries of every file written so far.
