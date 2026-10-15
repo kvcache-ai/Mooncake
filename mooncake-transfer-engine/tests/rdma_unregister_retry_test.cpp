@@ -75,10 +75,10 @@ class RdmaUnregisterRetryTest : public ::testing::Test {
         auto local_desc = std::make_shared<TransferMetadata::SegmentDesc>();
         local_desc->name = "local-rdma-segment";
         local_desc->protocol = "rdma";
-        ASSERT_EQ(metadata_->addLocalSegment(LOCAL_SEGMENT_ID,
-                                             "local-rdma-segment",
-                                             std::move(local_desc)),
-                  0);
+        ASSERT_EQ(
+            metadata_->addLocalSegment(LOCAL_SEGMENT_ID, "local-rdma-segment",
+                                       std::move(local_desc)),
+            0);
 
         transport_ = std::make_unique<RdmaTransport>();
         RdmaTransportTestPeer::bindMetadata(*transport_, metadata_,

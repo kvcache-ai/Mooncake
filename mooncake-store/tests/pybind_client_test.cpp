@@ -3600,7 +3600,7 @@ TEST_F(RealClientTest, TearDownReportsNofCleanupFailure) {
         return NofRuntime{initiator, std::make_shared<SystemDmaAllocator>()};
     });
 
-    ASSERT_EQ(py_client_->setup_real("localhost:17936", "P2PHANDSHAKE",
+    ASSERT_EQ(py_client_->setup_real("localhost:17943", "P2PHANDSHAKE",
                                      16 * 1024 * 1024, 16 * 1024 * 1024, "tcp",
                                      "", master_address_),
               0);
@@ -3640,7 +3640,7 @@ TEST_F(RealClientTest, UnregisterBufferRecoversAfterTePartialFailure) {
         return NofRuntime{initiator, std::make_shared<SystemDmaAllocator>()};
     });
 
-    ASSERT_EQ(py_client_->setup_real("localhost:17937", "P2PHANDSHAKE",
+    ASSERT_EQ(py_client_->setup_real("localhost:17944", "P2PHANDSHAKE",
                                      16 * 1024 * 1024, 16 * 1024 * 1024, "tcp",
                                      "", master_address_),
               0);

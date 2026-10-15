@@ -92,9 +92,8 @@ class RdmaContextTestPeer {
 
     static bool hasMemoryRegion(RdmaContext &context, void *addr) {
         RWSpinlock::ReadGuard guard(context.memory_regions_lock_);
-        return context.findMemoryRegionContaining(
-                   reinterpret_cast<uintptr_t>(addr)) !=
-               context.memory_region_map_.end();
+        return context.findMemoryRegionContaining(reinterpret_cast<uintptr_t>(
+                   addr)) != context.memory_region_map_.end();
     }
 };
 

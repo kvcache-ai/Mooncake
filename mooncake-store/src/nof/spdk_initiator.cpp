@@ -445,8 +445,7 @@ class SpdkInitiator::Impl {
                             "containing 2MB pages, which must be mapped "
                             "and hugepage-backed";
         }
-        // `this` is the owner token: registrations are charged per initiator
-        // instance.
+        // Registrations are charged per initiator instance via owner_token_.
         return GetNofRegistryBundle().registry.Register(owner_token_, ptr,
                                                         size);
 #else
