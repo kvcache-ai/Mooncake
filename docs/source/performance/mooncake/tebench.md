@@ -84,6 +84,39 @@ When pacing is enabled, `Avg Lat (us)` includes the pacing gap because it is
 computed from wall-clock runtime, while `Avg Tx (us)` and Tx percentiles only
 measure transfer execution time.
 
+### 3.4 MLU Device Memory
+
+Build with `USE_TENT=ON`, `USE_MLU=ON`, `USE_CUDA=OFF` and
+`BUILD_BENCHMARK=ON`. Set `NEUWARE_ROOT` to the installed Neuware SDK.
+In this build, `--backend=tent --seg_type=VRAM` allocates MLU memory.
+`--local_gpu_id=N` selects a visible MLU ordinal; `-1` allocates a buffer on
+each visible MLU. `--seg_type_mix=dram,vram` includes both host and MLU buffers.
+
+Start the target:
+
+```bash
+./tebench --backend=tent --metadata_type=p2p --seg_type=VRAM \
+  --local_gpu_id=0 --xport_type=tcp --total_buffer_size=33554432
+```
+
+Use the printed segment name on the initiator:
+
+```bash
+./tebench --backend=tent --metadata_type=p2p --seg_type=VRAM \
+  --local_gpu_id=0 --xport_type=tcp --total_buffer_size=33554432 \
+  --target_seg_name=<SEG_NAME_FROM_TARGET> \
+  --start_block_size=65536 --max_block_size=65536 \
+  --start_batch_size=1 --max_batch_size=1 \
+  --start_num_threads=1 --max_num_threads=1 \
+  --check_consistency=true --duration=5
+```
+
+For separate hosts, configure `rpc_server_hostname` in `MC_TENT_CONF` with an
+address reachable from the peer. MLU transfers over TCP or HP TCP use host
+staging. `--check_consistency` performs WRITE/READ round trips and copies the
+result back to host memory for comparison. For throughput measurements without
+payload checks, use `--check_consistency=false --op_type=read` or `write`.
+
 ## 4. Output Metrics
 
 Each output row corresponds to one benchmark configuration.
