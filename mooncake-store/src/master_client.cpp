@@ -248,6 +248,11 @@ struct RpcNameTraits<&WrappedMasterService::NotifyOffloadSuccess> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::NotifyOffloadTaskSuccess> {
+    static constexpr const char* value = "NotifyOffloadTaskSuccess";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::PromotionObjectHeartbeat> {
     static constexpr const char* value = "PromotionObjectHeartbeat";
 };
@@ -1139,18 +1144,6 @@ tl::expected<void, ErrorCode> MasterClient::ReportSsdCapacity(
 }
 
 tl::expected<void, ErrorCode> MasterClient::NotifyOffloadSuccess(
-    const UUID& client_id, const std::vector<std::string>& keys,
-    const std::vector<StorageObjectMetadata>& metadatas) {
-    std::vector<OffloadTaskItem> tasks;
-    tasks.reserve(keys.size());
-    for (const auto& key : keys) {
-        tasks.push_back(OffloadTaskItem{
-            .tenant_id = tenant_id_.value(), .key = key, .size = 0});
-    }
-    return NotifyOffloadSuccess(client_id, tasks, metadatas);
-}
-
-tl::expected<void, ErrorCode> MasterClient::NotifyOffloadSuccess(
     const UUID& client_id, const std::vector<OffloadTaskItem>& tasks,
     const std::vector<StorageObjectMetadata>& metadatas) {
     ScopedVLogTimer timer(1, "MasterClient::NotifyOffloadSuccess");
@@ -1159,6 +1152,19 @@ tl::expected<void, ErrorCode> MasterClient::NotifyOffloadSuccess(
 
     auto result = invoke_rpc<&WrappedMasterService::NotifyOffloadSuccess, void>(
         client_id, tasks, metadatas);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<void, ErrorCode> MasterClient::NotifyOffloadTaskSuccess(
+    const UUID& client_id, const std::vector<OffloadTaskItem>& tasks,
+    const std::vector<StorageObjectMetadata>& metadatas) {
+    ScopedVLogTimer timer(1, "MasterClient::NotifyOffloadTaskSuccess");
+    timer.LogRequest("client_id=", client_id, ", tasks_count=", tasks.size(),
+                     ", metadatas_count=", metadatas.size());
+    auto result =
+        invoke_rpc<&WrappedMasterService::NotifyOffloadTaskSuccess, void>(
+            client_id, tasks, metadatas);
     timer.LogResponseExpected(result);
     return result;
 }

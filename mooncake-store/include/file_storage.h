@@ -1,5 +1,7 @@
 #pragma once
 
+#include <functional>
+
 #include "client_service.h"
 #include "client_buffer.h"
 #include "storage_backend.h"
@@ -271,6 +273,12 @@ class FileStorage {
     // offloading_mutex_ before the heartbeat RPC, because a tick parked on that
     // lock passed the entry check before the drain latched.
     std::atomic<bool> draining_{false};
+    // Test-only replacement for the offload completion RPC
+    // (Client::NotifyOffloadTaskSuccess).
+    std::function<tl::expected<void, ErrorCode>(
+        const std::vector<OffloadTaskItem>&,
+        const std::vector<StorageObjectMetadata>&)>
+        test_offload_completion_rpc_;
 };
 
 }  // namespace mooncake
