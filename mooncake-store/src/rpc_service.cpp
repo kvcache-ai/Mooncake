@@ -310,13 +310,22 @@ WrappedMasterService::GetReplicaList(const std::string& key,
     return execute_rpc(
         "GetReplicaList",
         [&] {
-            return WithRequestTenant(master_service_.IsTenantQuotaEnabled()
-                                         ? std::string_view(tenant_id)
-                                         : TenantId::kDefaultValue,
-                                     [&](const TenantId& resolved_tenant_id) {
-                                         return master_service_.GetReplicaList(
-                                             key, resolved_tenant_id);
-                                     });
+            return WithRequestTenant(
+                master_service_.IsTenantQuotaEnabled()
+                    ? std::string_view(tenant_id)
+                    : TenantId::kDefaultValue,
+                [&](const TenantId& resolved_tenant_id) {
+                    auto result =
+                        master_service_.GetReplicaList(key, resolved_tenant_id);
+                    // Tell the reader which scope the
+                    // object actually lives in, so its
+                    // disk-replica verify requests can
+                    // name the write scope exactly.
+                    if (result) {
+                        result->resolved_tenant_id = resolved_tenant_id.value();
+                    }
+                    return result;
+                });
         },
         [&](auto& timer) { timer.LogRequest("key=", key); },
         [] { MasterMetricManager::instance().inc_get_replica_list_requests(); },
@@ -341,8 +350,14 @@ WrappedMasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
         master_service_.IsTenantQuotaEnabled() ? std::string_view(tenant_id)
                                                : TenantId::kDefaultValue,
         keys.size(), [&](const TenantId& resolved_tenant_id) {
-            return master_service_.BatchGetReplicaList(keys,
-                                                       resolved_tenant_id);
+            auto batch =
+                master_service_.BatchGetReplicaList(keys, resolved_tenant_id);
+            for (auto& result : batch) {
+                if (result) {
+                    result->resolved_tenant_id = resolved_tenant_id.value();
+                }
+            }
+            return batch;
         });
 
     size_t failure_count = 0;
@@ -1357,6 +1372,36 @@ tl::expected<void, ErrorCode> WrappedMasterService::EvictDiskReplica(
         });
 }
 
+tl::expected<bool, ErrorCode> WrappedMasterService::EvictDiskReplicaIfCurrent(
+    const UUID& client_id, const std::string& key, const std::string& tenant_id,
+    ReplicaType replica_type, ReplicaID expected_replica_id) {
+    return execute_rpc(
+        "EvictDiskReplicaIfCurrent",
+        [&] {
+            return WithRequestTenant(
+                master_service_.IsTenantQuotaEnabled()
+                    ? std::string_view(tenant_id)
+                    : TenantId::kDefaultValue,
+                [&](const TenantId& resolved_tenant_id) {
+                    return master_service_.EvictDiskReplicaIfCurrent(
+                        client_id, key, resolved_tenant_id, replica_type,
+                        expected_replica_id);
+                });
+        },
+        [&](auto& timer) {
+            timer.LogRequest("client_id=", client_id, ", key=", key,
+                             ", tenant_id=", tenant_id,
+                             ", replica_type=", replica_type,
+                             ", expected_replica_id=", expected_replica_id);
+        },
+        [] {
+            MasterMetricManager::instance().inc_evict_disk_replica_requests();
+        },
+        [] {
+            MasterMetricManager::instance().inc_evict_disk_replica_failures();
+        });
+}
+
 std::vector<tl::expected<void, ErrorCode>>
 WrappedMasterService::BatchEvictDiskReplica(
     const UUID& client_id, const std::vector<std::string>& keys,
@@ -1813,9 +1858,19 @@ tl::expected<void, ErrorCode> WrappedMasterService::RestoreFromStandby(
 
 tl::expected<void, ErrorCode>
 WrappedMasterService::RestoreFromBatchOpLogPromotion(
-    BatchOpLogPromotionHandoff handoff, size_t chunk_object_count) {
-    return master_service_.RestoreFromBatchOpLogPromotion(std::move(handoff),
+    const BatchOpLogPromotionHandoff& handoff, size_t chunk_object_count) {
+    return master_service_.RestoreFromBatchOpLogPromotion(handoff,
                                                           chunk_object_count);
+}
+
+tl::expected<void, ErrorCode>
+WrappedMasterService::RestoreFromBatchOpLogPromotion(
+    const StandbyMetadataStore& metadata_store, DurablePrefix applied_cursor,
+    const std::vector<StandbySegmentInfo>& segments, ReplicaID max_replica_id,
+    size_t chunk_object_count) {
+    return master_service_.RestoreFromBatchOpLogPromotion(
+        metadata_store, applied_cursor, segments, max_replica_id,
+        chunk_object_count);
 }
 
 void RegisterRpcService(
@@ -1968,6 +2023,9 @@ void RegisterRpcService(
     server.register_handler<&mooncake::WrappedMasterService::MoveRevoke>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::EvictDiskReplica>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::EvictDiskReplicaIfCurrent>(
         &wrapped_master_service);
     server.register_handler<
         &mooncake::WrappedMasterService::BatchEvictDiskReplica>(

@@ -19,9 +19,12 @@ on:
 permissions:
   contents: read
 
+# A branch push lets the running build finish: a full run outlasts the gap
+# between merges, so cancelling on every push left main with no completed
+# result. Newer pushes still replace the one pending run.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name != 'push' }}
 
 env:
   # Only push/schedule builds write: PR-scoped entries are invisible to
@@ -132,6 +135,8 @@ jobs:
       if: matrix.ubuntu-version == 'ubuntu-22.04' && matrix.python-version == '3.12'
       env:
         MC_FORCE_TCP: "true"
+        # The runner has CUDA headers/nvcc but no usable GPU for arch detection.
+        TORCH_CUDA_ARCH_LIST: "8.0"
       run: |
         source test_env/bin/activate
         export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}:/usr/local/lib
@@ -582,6 +587,19 @@ jobs:
       artifact-prefix: mooncake-wheel-cu130
       version-override: 0.0.0.dev0
 
+  # arm64 default wheels use a different transport set (USE_MNNVL) than
+  # x86_64 (USE_INTRA_NVLINK), so build one here instead of only at release.
+  build-wheel-cu13-arm64:
+    needs: [spell-check, clang-format, check-paths]
+    if: *run-ci-for-source-changes
+    uses: ./.github/workflows/_build-wheel.yaml
+    with:
+      variant: cuda13
+      architecture: arm64
+      python-versions: '["3.12"]'
+      artifact-prefix: mooncake-wheel-cu130-arm64
+      version-override: 0.0.0.dev0
+
   build-wheel-efa:
     needs: [spell-check, clang-format, check-paths]
     if: *run-ci-for-source-changes
@@ -704,6 +722,13 @@ jobs:
           -R '^(transfer_task_tent_completion_test|standalone_client_tent_test)$'
       shell: bash
 
+    - name: Test TENT notification handle ownership
+      if: matrix.name == 'cuda-off'
+      run: |
+        ctest --test-dir build-tent --output-on-failure --no-tests=error \
+          -R '^tent_compat_notify_test$'
+      shell: bash
+
     # Only run tests on the cuda-off leg. GitHub runners have no real GPU;
     # with USE_CUDA=ON tent's cuda_probe hits the CUDA stub library at
     # runtime and drives some dispatch paths past the fake objects the
@@ -754,7 +779,10 @@ jobs:
 
   ci-gate:
     name: CI Gate
-    if: always()
+    # A cancelled branch push run reports no result rather than a failed gate.
+    # Everywhere else the gate must fail: a skipped gate would satisfy the
+    # required check for a PR head whose run was cancelled.
+    if: ${{ (github.event_name != 'push' && always()) || !cancelled() }}
     needs:
       - check-paths
       - spell-check
@@ -769,6 +797,7 @@ jobs:
       - build-flags
       - test-wheel-ubuntu
       - build-wheel-cu13
+      - build-wheel-cu13-arm64
       - build-wheel-efa
       - build-wheel-rocm
       - tent-ci
@@ -800,6 +829,7 @@ jobs:
             ${{ needs.build-flags.result }}
             ${{ needs.test-wheel-ubuntu.result }}
             ${{ needs.build-wheel-cu13.result }}
+            ${{ needs.build-wheel-cu13-arm64.result }}
             ${{ needs.build-wheel-efa.result }}
             ${{ needs.build-wheel-rocm.result }}
         run: |

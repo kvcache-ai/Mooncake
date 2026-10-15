@@ -12,6 +12,9 @@ namespace device {
     defined(USE_HYGON) || defined(USE_COREX) || defined(USE_SUPA)
 void EnsureCudaLikeAcceleratorDeviceLinked();
 #endif
+#if defined(USE_XPU)
+void EnsureXpuAcceleratorDeviceLinked();
+#endif
 
 namespace {
 
@@ -99,6 +102,9 @@ const AcceleratorRegistry& GetAcceleratorRegistry() {
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA) || \
     defined(USE_HYGON) || defined(USE_COREX) || defined(USE_SUPA)
     EnsureCudaLikeAcceleratorDeviceLinked();
+#endif
+#if defined(USE_XPU)
+    EnsureXpuAcceleratorDeviceLinked();
 #endif
     return MutableRegistry();
 }

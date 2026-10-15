@@ -2,8 +2,10 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <csignal>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string_view>
 #include <thread>
@@ -86,6 +88,70 @@ bool IsFatalHABackendError(ErrorCode err) {
     return err == ErrorCode::INVALID_PARAMS ||
            err == ErrorCode::UNAVAILABLE_IN_CURRENT_MODE;
 }
+
+// Polls RenewLeadership on a side thread so a long Oplog catch-up cannot
+// outlive the lease. Etcd keepalive starts on the first successful renew and
+// keeps running after this guard stops; the guard only stops polling.
+class LeadershipRenewalGuard {
+   public:
+    LeadershipRenewalGuard(LeaderCoordinator& coordinator,
+                           const LeadershipSession& session)
+        : coordinator_(coordinator) {
+        worker_ = std::thread([this, &session] {
+            bool logged_start = false;
+            while (!stop_.load(std::memory_order_acquire)) {
+                auto renewed = coordinator_.RenewLeadership(session);
+                if (!renewed) {
+                    LOG(WARNING)
+                        << "Leadership renewal failed during recovery: "
+                        << toString(renewed.error());
+                    lost_.store(true, std::memory_order_release);
+                    return;
+                }
+                if (!renewed.value()) {
+                    LOG(WARNING) << "Leadership lease lost during recovery";
+                    lost_.store(true, std::memory_order_release);
+                    return;
+                }
+                if (!logged_start) {
+                    logged_start = true;
+                    LOG(INFO) << "Leadership keepalive covers oplog catch-up, "
+                              << "lease_ttl_sec=" << session.lease_ttl.count();
+                }
+                std::unique_lock<std::mutex> lock(mutex_);
+                cv_.wait_for(lock, kRenewCheckInterval, [this] {
+                    return stop_.load(std::memory_order_acquire);
+                });
+            }
+        });
+    }
+
+    ~LeadershipRenewalGuard() { Stop(); }
+
+    LeadershipRenewalGuard(const LeadershipRenewalGuard&) = delete;
+    LeadershipRenewalGuard& operator=(const LeadershipRenewalGuard&) = delete;
+
+    void Stop() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stop_.store(true, std::memory_order_release);
+        }
+        cv_.notify_all();
+        if (worker_.joinable()) {
+            worker_.join();
+        }
+    }
+
+    bool Lost() const { return lost_.load(std::memory_order_acquire); }
+
+   private:
+    LeaderCoordinator& coordinator_;
+    std::thread worker_;
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    std::atomic<bool> stop_{false};
+    std::atomic<bool> lost_{false};
+};
 
 void LogLeadershipReleaseWarning(std::string_view context, ErrorCode err) {
     if (err == ErrorCode::OK) {
@@ -212,6 +278,9 @@ ErrorCode ClaimProducerViewForServing(
         return ErrorCode::INVALID_PARAMS;
     }
 
+    // Fence the previous producer through the backend selected by spec, not
+    // etcd alone. Redis already implements the transactional compare-and-swap
+    // ClaimProducerView needs, so an old Redis primary must be fenced too.
     auto backend = CreateHaKvBackend(spec);
     if (!backend) {
         return backend.error();
@@ -353,6 +422,11 @@ int RunSupervisorLoop(const HABackendSpec& spec,
             continue;
         }
 
+        // Start the lease keepalive before catch-up. The grant happens in
+        // TryAcquireLeadership, but etcd KeepAlive previously started only in
+        // the warmup phase, so a large Oplog replay expired the lease first.
+        LeadershipRenewalGuard renewal(leader_coordinator, *leadership_session);
+
         auto claim_error = ClaimProducerViewForServing(
             spec, config, leadership_session->view.view_version);
         if (claim_error != ErrorCode::OK) {
@@ -383,14 +457,46 @@ int RunSupervisorLoop(const HABackendSpec& spec,
             continue;
         }
 
+        auto return_to_standby =
+            [&](const std::optional<MasterView>& leader_view) {
+                if (promotion_ctx->metadata_store &&
+                    promotion_ctx->applied_cursor.last_seq != 0) {
+                    const uint64_t applied_seq =
+                        promotion_ctx->applied_cursor.last_seq;
+                    auto restore_err =
+                        standby_controller->RestorePromotionBaseline(
+                            std::move(*promotion_ctx));
+                    if (restore_err != ErrorCode::OK) {
+                        LOG(ERROR)
+                            << "Failed to preserve catch-up cursor seq="
+                            << applied_seq << ": " << toString(restore_err);
+                    } else {
+                        LOG(INFO) << "Preserved catch-up cursor for retry, "
+                                  << "applied_seq=" << applied_seq;
+                    }
+                }
+                EnterStandbyMode(admin_server, *standby_controller,
+                                 accept_standby_runtime_updates, leader_view);
+            };
+
+        if (renewal.Lost()) {
+            LOG(WARNING) << "Leadership expired during oplog catch-up, "
+                         << "applied_seq="
+                         << promotion_ctx->applied_cursor.last_seq;
+            return_to_standby(std::nullopt);
+            LogLeadershipReleaseWarning(
+                "catch-up lease loss",
+                leader_coordinator.ReleaseLeadership(*leadership_session));
+            admin_server.SetObservedLeader(std::nullopt);
+            continue;
+        }
+
         LOG(INFO) << "Entering warmup phase...";
         SetRuntimeState(admin_server, MasterRuntimeState::kLeaderWarmup);
         auto warmup_result =
             WarmupLeadership(leader_coordinator, *leadership_session);
         if (!warmup_result) {
-            EnterStandbyMode(admin_server, *standby_controller,
-                             accept_standby_runtime_updates,
-                             leadership_session->view);
+            return_to_standby(leadership_session->view);
             if (HandleLeadershipPhaseError(
                     "renewal startup failure", "start leadership renewal",
                     leader_coordinator, *leadership_session,
@@ -400,8 +506,7 @@ int RunSupervisorLoop(const HABackendSpec& spec,
             continue;
         }
         if (!warmup_result.value()) {
-            EnterStandbyMode(admin_server, *standby_controller,
-                             accept_standby_runtime_updates, std::nullopt);
+            return_to_standby(std::nullopt);
             LogLeadershipReleaseWarning(
                 "warmup expiration",
                 leader_coordinator.ReleaseLeadership(*leadership_session));
@@ -425,9 +530,6 @@ int RunSupervisorLoop(const HABackendSpec& spec,
 
         mooncake::WrappedMasterServiceConfig wrapped_config(
             config, leadership_session->view.view_version);
-        // In HA serving-primary mode, snapshot bootstrap belongs to standby.
-        // The new primary must restore from PromotionContext only.
-        wrapped_config.enable_snapshot_restore = false;
         // The serving primary handles heartbeats/unmounts, so forward the
         // metadata cleanup config here like the non-HA path does.
         // Keep the gate alive until after the service is destroyed because the
@@ -449,19 +551,16 @@ int RunSupervisorLoop(const HABackendSpec& spec,
 
         // Restore is the serving gate: do not register or expose a candidate
         // service until the complete promotion context has been applied.
+        // Keep the handoff until serving is established so restore failure
+        // or a later lease loss can still resume from the applied cursor.
         SetRuntimeState(admin_server, MasterRuntimeState::kRecovering);
         auto restore_result =
             promotion_ctx->metadata_store
                 ? wrapped_master_service->RestoreFromBatchOpLogPromotion(
-                      BatchOpLogPromotionHandoff{
-                          .metadata_store =
-                              std::move(promotion_ctx->metadata_store),
-                          .segments = std::move(promotion_ctx->segments),
-                          .applied_cursor = promotion_ctx->applied_cursor,
-                          .producer_view_version =
-                              promotion_ctx->producer_view_version,
-                          .max_replica_id = promotion_ctx->max_replica_id,
-                      })
+                      *promotion_ctx->metadata_store,
+                      promotion_ctx->applied_cursor, promotion_ctx->segments,
+                      promotion_ctx->max_replica_id,
+                      static_cast<size_t>(config.snapshot_chunk_object_count))
                 : wrapped_master_service->RestoreFromStandby(
                       promotion_ctx->objects, promotion_ctx->applied_seq_id,
                       promotion_ctx->segments, promotion_ctx->weight_metadata);
@@ -470,9 +569,7 @@ int RunSupervisorLoop(const HABackendSpec& spec,
                        << toString(restore_result.error());
             wrapped_master_service.reset();
             DeactivateServingState(admin_server, label_reconciler);
-            EnterStandbyMode(admin_server, *standby_controller,
-                             accept_standby_runtime_updates,
-                             leadership_session->view);
+            return_to_standby(leadership_session->view);
             SetRuntimeState(admin_server, MasterRuntimeState::kRecovering);
             if (HandleLeadershipPhaseError(
                     "standby restore failure", "restore standby state",
@@ -482,17 +579,31 @@ int RunSupervisorLoop(const HABackendSpec& spec,
             }
             continue;
         }
-        SetRuntimeState(admin_server, MasterRuntimeState::kLeaderWarmup);
 
-        mooncake::RegisterRpcService(server, *wrapped_master_service);
+        // Restore can outlast catch-up. Recheck the side-thread guard and
+        // renew once more before registering RPC or publishing a serving
+        // endpoint, otherwise a lease lost mid-restore keeps recovering.
+        if (renewal.Lost()) {
+            LOG(WARNING) << "Leadership expired during restore, applied_seq="
+                         << promotion_ctx->applied_cursor.last_seq;
+            wrapped_master_service.reset();
+            DeactivateServingState(admin_server, label_reconciler);
+            return_to_standby(std::nullopt);
+            LogLeadershipReleaseWarning(
+                "restore lease loss",
+                leader_coordinator.ReleaseLeadership(*leadership_session));
+            admin_server.SetObservedLeader(std::nullopt);
+            continue;
+        }
+
+        SetRuntimeState(admin_server, MasterRuntimeState::kLeaderWarmup);
 
         auto serve_preflight =
             leader_coordinator.RenewLeadership(*leadership_session);
         if (!serve_preflight) {
+            wrapped_master_service.reset();
             DeactivateServingState(admin_server, label_reconciler);
-            EnterStandbyMode(admin_server, *standby_controller,
-                             accept_standby_runtime_updates,
-                             leadership_session->view);
+            return_to_standby(leadership_session->view);
             if (HandleLeadershipPhaseError(
                     "serve preflight failure",
                     "validate leadership before serving", leader_coordinator,
@@ -502,9 +613,9 @@ int RunSupervisorLoop(const HABackendSpec& spec,
             continue;
         }
         if (!serve_preflight.value()) {
+            wrapped_master_service.reset();
             DeactivateServingState(admin_server, label_reconciler);
-            EnterStandbyMode(admin_server, *standby_controller,
-                             accept_standby_runtime_updates, std::nullopt);
+            return_to_standby(std::nullopt);
             LogLeadershipReleaseWarning(
                 "serve preflight expiration",
                 leader_coordinator.ReleaseLeadership(*leadership_session));
@@ -512,6 +623,8 @@ int RunSupervisorLoop(const HABackendSpec& spec,
             admin_server.SetObservedLeader(std::nullopt);
             continue;
         }
+
+        mooncake::RegisterRpcService(server, *wrapped_master_service);
 
         auto leadership_monitor = leader_coordinator.StartLeadershipMonitor(
             *leadership_session, [&server, &admin_server, &serving_state,
@@ -526,10 +639,9 @@ int RunSupervisorLoop(const HABackendSpec& spec,
                 });
             });
         if (!leadership_monitor) {
+            wrapped_master_service.reset();
             DeactivateServingState(admin_server, label_reconciler);
-            EnterStandbyMode(admin_server, *standby_controller,
-                             accept_standby_runtime_updates,
-                             leadership_session->view);
+            return_to_standby(leadership_session->view);
             if (HandleLeadershipPhaseError(
                     "serve monitor startup failure", "start leadership monitor",
                     leader_coordinator, *leadership_session,
@@ -544,9 +656,9 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         serving_state.RunIfActive([&]() { ec.emplace(server.async_start()); });
         if (!ec.has_value()) {
             StopLeadershipMonitor(leadership_monitor_handle);
+            wrapped_master_service.reset();
             DeactivateServingState(admin_server, label_reconciler);
-            EnterStandbyMode(admin_server, *standby_controller,
-                             accept_standby_runtime_updates, std::nullopt);
+            return_to_standby(std::nullopt);
             LogLeadershipReleaseWarning(
                 "serve startup cancellation",
                 leader_coordinator.ReleaseLeadership(*leadership_session));
@@ -556,10 +668,9 @@ int RunSupervisorLoop(const HABackendSpec& spec,
             LOG(ERROR) << "Failed to start master service: "
                        << ec->result().value();
             StopLeadershipMonitor(leadership_monitor_handle);
+            wrapped_master_service.reset();
             DeactivateServingState(admin_server, label_reconciler);
-            EnterStandbyMode(admin_server, *standby_controller,
-                             accept_standby_runtime_updates,
-                             leadership_session->view);
+            return_to_standby(leadership_session->view);
             auto err =
                 leader_coordinator.ReleaseLeadership(*leadership_session);
             if (err != ErrorCode::OK) {
@@ -579,6 +690,11 @@ int RunSupervisorLoop(const HABackendSpec& spec,
                 serving_state.RunIfActive([&]() {
                     ActivateServingState(admin_server, wrapped_master_service,
                                          label_reconciler);
+                    // Serving owns the restored index now; drop the handoff
+                    // so the standby copy is not held for the whole term.
+                    promotion_ctx->metadata_store.reset();
+                    promotion_ctx->objects.clear();
+                    promotion_ctx->segments.clear();
                 });
             } else {
                 serving_state.RequestShutdown([&]() {
@@ -595,9 +711,8 @@ int RunSupervisorLoop(const HABackendSpec& spec,
             auto server_err = std::move(ec.value()).get();
             LOG(ERROR) << "Master service stopped after readiness failure: "
                        << server_err;
-            EnterStandbyMode(admin_server, *standby_controller,
-                             accept_standby_runtime_updates,
-                             leadership_session->view);
+            wrapped_master_service.reset();
+            return_to_standby(leadership_session->view);
             if (HandleLeadershipPhaseError(
                     "service readiness publication failure",
                     "publish master service readiness", leader_coordinator,
@@ -616,7 +731,13 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         auto err = leader_coordinator.ReleaseLeadership(*leadership_session);
         LOG(INFO) << "Release leadership: " << toString(err);
         auto current_view = leader_coordinator.ReadCurrentView();
-        if (current_view) {
+        wrapped_master_service.reset();
+        // Serving drops the handoff in ActivateServingState. If the listener
+        // stopped before that, preserve the still-populated catch-up cursor.
+        if (promotion_ctx->metadata_store) {
+            return_to_standby(current_view ? current_view.value()
+                                           : std::nullopt);
+        } else if (current_view) {
             EnterStandbyMode(admin_server, *standby_controller,
                              accept_standby_runtime_updates,
                              current_view.value());

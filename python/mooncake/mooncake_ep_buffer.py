@@ -96,7 +96,7 @@ class Buffer:
     def __init__(
         self,
         group: dist.ProcessGroup,
-        num_ep_buffer_bytes: int = 0,
+        num_ep_buffer_bytes: int,
         disable_p2p: bool = False,
     ):
         from mooncake import ep

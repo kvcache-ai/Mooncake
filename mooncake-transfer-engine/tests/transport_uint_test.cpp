@@ -110,6 +110,10 @@ class TransferEngineImplTestPeer {
         return engine.autoDiscoverTransport();
     }
 
+    static bool autoDiscoverUsesEfa(const TransferEngineImpl& engine) {
+        return engine.autoDiscoverUsesEfa();
+    }
+
     static void setUseBarex(TransferEngineImpl& engine, bool use_barex) {
         engine.use_barex_ = use_barex;
     }
@@ -172,14 +176,16 @@ class TransferEngineImplTestPeer {
         return slice;
     }
 
-#ifdef USE_EVENT_DRIVEN_COMPLETION
     static void prepareFinishedBatchWithActiveCallback(
         MultiTransport& transport, Transport::BatchID batch_id) {
         auto& batch = Transport::toBatchDesc(batch_id);
         auto& task = batch.task_list.emplace_back();
         task.batch_id = batch_id;
         task.slice_count = 1;
+        task.success_slice_count = 1;
         task.is_finished = true;
+        // Model a completion callback that already published the terminal
+        // slice count but is still unwinding while holding its pin.
         batch.active_completion_callbacks.store(1, std::memory_order_release);
     }
 
@@ -188,7 +194,6 @@ class TransferEngineImplTestPeer {
         auto& batch = Transport::toBatchDesc(batch_id);
         batch.active_completion_callbacks.store(0, std::memory_order_release);
     }
-#endif
 
     static bool isCleanupDeferred(MultiTransport& transport,
                                   Transport::BatchID batch_id) {
@@ -294,6 +299,30 @@ TEST(TransferEngineAutoDiscoverTest, SelectsEfaForEfaProtocol) {
     EXPECT_TRUE(config.enabled);
     EXPECT_EQ(config.protocol, "efa");
     EXPECT_EQ(TransferEngineImplTestPeer::autoDiscoverTransport(engine), "efa");
+}
+
+// EFA discovery must keep EFA NICs and install EFA in every USE_EFA build;
+// any other selection keeps excluding them.
+TEST(TransferEngineAutoDiscoverTest, EfaProtocolKeepsEfaNics) {
+    TransferEngineImpl engine(false);
+    engine.setAutoDiscover({.enabled = true, .protocol = "efa"});
+#ifdef USE_EFA
+    EXPECT_TRUE(TransferEngineImplTestPeer::autoDiscoverUsesEfa(engine));
+#else
+    EXPECT_FALSE(TransferEngineImplTestPeer::autoDiscoverUsesEfa(engine));
+#endif
+
+    TransferEngineImplTestPeer::setUseBarex(engine, true);
+    EXPECT_FALSE(TransferEngineImplTestPeer::autoDiscoverUsesEfa(engine));
+}
+
+TEST(TransferEngineAutoDiscoverTest, OtherProtocolsExcludeEfaNics) {
+    for (const char* protocol : {"", "rdma", "tcp"}) {
+        TransferEngineImpl engine(false);
+        engine.setAutoDiscover({.enabled = true, .protocol = protocol});
+        EXPECT_FALSE(TransferEngineImplTestPeer::autoDiscoverUsesEfa(engine))
+            << "protocol=" << protocol;
+    }
 }
 
 TEST(TransferEngineAutoDiscoverTest, BarexOverrideTakesPrecedence) {
@@ -420,6 +449,63 @@ TEST(TransferEngineTentCompatibilityTest, CheckSegmentStatusRejectsDeadPeer) {
     // wrapper's handle_map_ never dropped a dead peer and kept reusing the same
     // stale handle forever. Refs #3995 (P0-stale-handle).
     EXPECT_FALSE(engine.CheckSegmentStatus(1ull << 40).ok());
+}
+
+TEST(TransferEngineTentCompatibilityTest, NotifyByNamePreservesOpenSegment) {
+    ScopedEnvVar use_tent("MC_USE_TENT", "1");
+    ScopedEnvVar force_tcp("MC_FORCE_TCP", nullptr);
+    ScopedEnvVar hostname("MOONCAKE_LOCAL_HOSTNAME", "127.0.0.1");
+    ScopedEnvVar conf("MC_TENT_CONF", kTentConfPrefersRdma);
+    std::array<char, 4096> source{};
+    std::array<char, 4096> destination{};
+    source.fill('n');
+    TransferEngine target(true);
+    TransferEngine initiator(true);
+    ASSERT_EQ(target.init(P2PHANDSHAKE, "", "", 0, "tcp"), 0);
+    ASSERT_EQ(initiator.init(P2PHANDSHAKE, "", "", 0, "tcp"), 0);
+    ASSERT_EQ(
+        target.registerLocalMemory(destination.data(), destination.size()), 0);
+    ASSERT_EQ(initiator.registerLocalMemory(source.data(), source.size()), 0);
+    const std::string target_name =
+        "127.0.0.1:" + std::to_string(target.getRpcPort());
+    const auto peer = initiator.openSegment(target_name);
+    ASSERT_NE(peer, static_cast<Transport::SegmentHandle>(-1));
+
+    ASSERT_EQ(initiator.sendNotifyByName(target_name, {"test", "ready"}), 0);
+    std::vector<TransferMetadata::NotifyDesc> notifications;
+    ASSERT_EQ(target.getNotifies(notifications), 0);
+    ASSERT_EQ(notifications.size(), 1u);
+    EXPECT_EQ(notifications.front().notify_msg, "ready");
+    EXPECT_TRUE(initiator.CheckSegmentStatus(peer).ok());
+    EXPECT_EQ(initiator.openSegment(target_name), peer);
+
+    const auto batch = initiator.allocateBatchID(1);
+    TransferRequest request;
+    request.opcode = TransferRequest::WRITE;
+    request.source = source.data();
+    request.target_id = peer;
+    request.target_offset = reinterpret_cast<uint64_t>(destination.data());
+    request.length = source.size();
+    auto submitted = initiator.submitTransfer(batch, {request});
+    EXPECT_TRUE(submitted.ok()) << submitted.ToString();
+    if (submitted.ok()) {
+        TransferStatus status;
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        do {
+            ASSERT_TRUE(initiator.getTransferStatus(batch, 0, status).ok());
+            if (status.s != TransferStatusEnum::WAITING &&
+                status.s != TransferStatusEnum::PENDING)
+                break;
+            std::this_thread::yield();
+        } while (std::chrono::steady_clock::now() < deadline);
+        EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
+        EXPECT_EQ(source, destination);
+    }
+    EXPECT_TRUE(initiator.freeBatchID(batch).ok());
+    EXPECT_EQ(initiator.closeSegment(peer), 0);
+    EXPECT_EQ(initiator.unregisterLocalMemory(source.data()), 0);
+    EXPECT_EQ(target.unregisterLocalMemory(destination.data()), 0);
 }
 
 TEST(TransferEngineTentCompatibilityTest, TcpProtocolForcesTcpTransport) {
@@ -1112,7 +1198,6 @@ TEST_F(TransportTest, TimedOutBatchIsReclaimedAfterCallbacksFinish) {
     EXPECT_TRUE(callback_called.load(std::memory_order_acquire));
 }
 
-#ifdef USE_EVENT_DRIVEN_COMPLETION
 TEST_F(TransportTest, FinishedBatchWaitsForCompletionCallbackQuiescence) {
     std::string server_name = "unit-test-server:1234";
     MultiTransport multi_transport(nullptr, server_name);
@@ -1139,7 +1224,6 @@ TEST_F(TransportTest, FinishedBatchWaitsForCompletionCallbackQuiescence) {
     EXPECT_FALSE(TransferEngineImplTestPeer::isCleanupDeferred(multi_transport,
                                                                batch_id));
 }
-#endif
 
 TEST_F(TransportTest, TransferTaskDestructorRunsSliceCleanup) {
     int cleanup_count = 0;
@@ -1652,7 +1736,10 @@ TEST_F(TransportTest, TcpScatterCombinesRequestsIntoOneTask) {
         }
         ASSERT_EQ(remaining, 0u)
             << "TCP scatter did not reach physical completion";
-        EXPECT_TRUE(engine.freeBatchID(submission.batch_id).ok());
+        // The last io callback may still hold its BatchDesc pin here;
+        // a deferred cleanup is a legal terminal outcome.
+        Status free_status = engine.freeBatchID(submission.batch_id);
+        EXPECT_TRUE(free_status.ok() || free_status.IsBatchCleanupDeferred());
         EXPECT_TRUE(submitted.ok());
         EXPECT_TRUE(successful);
         EXPECT_EQ(memcmp(source, destination, kBytes), 0);
@@ -2035,6 +2122,8 @@ TEST_F(TransportTest, CqMarkSuccessPublishesBatchFinishedTaskCount) {
     EXPECT_FALSE(batch.is_finished.load());
 #endif
     EXPECT_EQ(batch.finished_task_count.load(), 2u);
+    // Completion callbacks drop their BatchDesc pins when they unwind.
+    EXPECT_EQ(batch.active_completion_callbacks.load(), 0u);
 }
 
 TEST_F(TransportTest, SealPublishesWhenAllSlicesCompletedFirst) {
@@ -2056,6 +2145,7 @@ TEST_F(TransportTest, SealPublishesWhenAllSlicesCompletedFirst) {
     Transport::Slice::sealTaskSubmission(&task);
     EXPECT_TRUE(task.completion_published);
     EXPECT_EQ(batch.finished_task_count.load(), 1u);
+    EXPECT_EQ(batch.active_completion_callbacks.load(), 0u);
 }
 
 TEST_F(TransportTest, MarkFailedWithoutBatchIdDoesNotTouchBatchDesc) {
