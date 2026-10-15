@@ -114,6 +114,22 @@ For standard TCP, `transports/tcp/max_concurrent_tasks` controls the worker
 thread count and must be greater than zero. A zero value makes TCP installation
 return `InvalidArgument`; it does not select an automatic worker count.
 
+### Staging Buffer Admission
+
+`staging/buffer_wait_timeout_ms` sets the wait budget for reserving staging
+buffers per transfer attempt (default: 1000 ms). Set it to `0` to fail
+immediately when the pool is full. Negative values are treated as `0`.
+
+While capacity is unavailable, the proxy releases partial reservations and
+retries with exponential backoff from 1 to 16 ms. Existing in-flight operations
+retain their buffers until they reach a terminal state. Non-capacity errors
+fail immediately, and shutdown interrupts the admission wait.
+
+This setting applies to every transport using the staging proxy. Waiting
+occupies a proxy worker and can delay later tasks on that worker. RPC timeouts
+remain separate from the admission budget; this is not an end-to-end transfer
+deadline.
+
 (custom-nic-priority-matrix)=
 ### Custom NIC Priority Matrix
 

@@ -27,6 +27,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <thread>
@@ -160,6 +161,171 @@ std::shared_ptr<Config> makeMinimalP2PConfig() {
 
     cfg->set("max_failover_attempts", 3);
     return cfg;
+}
+
+// Complete actual host copies synchronously so admission tests do not depend
+// on networking or accelerator hardware.
+class CompletingTransport : public NeverCompletingTransport {
+   public:
+    bool reject_allocation = false;
+    Status allocateLocalMemory(void** addr, size_t size,
+                               MemoryOptions& options) override {
+        if (reject_allocation)
+            return Status::InvalidArgument("injected allocation rejection");
+        return NeverCompletingTransport::allocateLocalMemory(addr, size,
+                                                             options);
+    }
+
+    Status submitTransferTasks(SubBatchRef batch,
+                               const std::vector<Request>& requests) override {
+        CHECK_STATUS(
+            NeverCompletingTransport::submitTransferTasks(batch, requests));
+        for (const auto& request : requests) {
+            auto* target = reinterpret_cast<void*>(request.target_offset);
+            if (request.opcode == Request::WRITE)
+                std::memcpy(target, request.source, request.length);
+            else
+                std::memcpy(request.source, target, request.length);
+        }
+        return Status::OK();
+    }
+    Status getTransferStatus(SubBatchRef batch, int id,
+                             TransferStatus& status) override {
+        auto* b = static_cast<NeverCompletingSubBatch*>(batch);
+        status = {COMPLETED, b->requests.at(id).length};
+        return Status::OK();
+    }
+};
+
+class ProxyBufferAdmissionTest : public ::testing::Test {
+   protected:
+    void prepare(long wait_ms) {
+        auto cfg = makeMinimalP2PConfig();
+        cfg->set("staging/buffer_wait_timeout_ms", wait_ms);
+        engine = std::make_unique<TransferEngineImpl>(cfg);
+        ASSERT_TRUE(engine->available());
+        transport = std::make_shared<CompletingTransport>();
+        engine->swapTransportForTest(TCP, transport);
+        ASSERT_TRUE(
+            engine->registerLocalMemory(source.data(), source.size()).ok());
+        ASSERT_TRUE(
+            engine->registerLocalMemory(target.data(), target.size()).ok());
+        manager = std::make_unique<ProxyManager>(engine.get(), 64, 2);
+        task.request.opcode = Request::WRITE;
+        task.request.source = source.data();
+        task.request.target_id = LOCAL_SEGMENT_ID;
+        task.request.target_offset = reinterpret_cast<uint64_t>(target.data());
+        task.request.length = source.size();
+        task.staging = true;
+    }
+    void submit() {
+        ASSERT_TRUE(
+            manager->submit(&task, 0, {"", kWildcardLocation, ""}).ok());
+    }
+    TransferStatusEnum wait() {
+        auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (task.staging_status.load() == PENDING &&
+               std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        return task.staging_status.load();
+    }
+    void TearDown() override {
+        manager.reset();
+        if (!engine) return;
+        EXPECT_EQ(engine->aliveBatchCountForTest(), 0u);
+        EXPECT_EQ(engine->deferredStageTeardownBatchCountForTest(), 0u);
+        EXPECT_TRUE(
+            engine->unregisterLocalMemory(source.data(), source.size()).ok());
+        EXPECT_TRUE(
+            engine->unregisterLocalMemory(target.data(), target.size()).ok());
+        engine.reset();
+    }
+    std::unique_ptr<TransferEngineImpl> engine;
+    std::shared_ptr<CompletingTransport> transport;
+    std::vector<uint8_t> source = std::vector<uint8_t>(128, 0x91);
+    std::vector<uint8_t> target = std::vector<uint8_t>(128, 0);
+    TaskInfo task;
+    std::unique_ptr<ProxyManager> manager;
+};
+
+TEST_F(ProxyBufferAdmissionTest, ReleasesPartialPinsWhileWaitingThenCompletes) {
+    ASSERT_NO_FATAL_FAILURE(prepare(1000));
+    uint64_t held = 0;
+    ASSERT_TRUE(manager->pinStageBuffer(kWildcardLocation, held).ok());
+    ASSERT_NO_FATAL_FAILURE(submit());
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    EXPECT_EQ(task.staging_status.load(), PENDING);
+    EXPECT_EQ(transport->submit_calls.load(), 0);
+    // A competing caller must still be able to borrow the other slot while
+    // the request waits for a complete reservation.
+    uint64_t spare = 0;
+    auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+    while (!manager->pinStageBuffer(kWildcardLocation, spare).ok() &&
+           std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+    ASSERT_NE(spare, 0u);
+    EXPECT_NE(spare, held);
+    ASSERT_TRUE(manager->unpinStageBuffer(spare).ok());
+    ASSERT_TRUE(manager->unpinStageBuffer(held).ok());
+    EXPECT_EQ(wait(), COMPLETED);
+    EXPECT_EQ(source, target);
+}
+
+TEST_F(ProxyBufferAdmissionTest, PersistentPressureHasBoundedWait) {
+    ASSERT_NO_FATAL_FAILURE(prepare(50));
+    uint64_t held = 0;
+    ASSERT_TRUE(manager->pinStageBuffer(kWildcardLocation, held).ok());
+    auto start = std::chrono::steady_clock::now();
+    ASSERT_NO_FATAL_FAILURE(submit());
+    EXPECT_EQ(wait(), FAILED);
+    auto elapsed = std::chrono::steady_clock::now() - start;
+    EXPECT_GE(elapsed, std::chrono::milliseconds(50));
+    EXPECT_LT(elapsed, std::chrono::seconds(1));
+    EXPECT_EQ(transport->submit_calls.load(), 0);
+    EXPECT_EQ(target, std::vector<uint8_t>(128, 0));
+    ASSERT_TRUE(manager->unpinStageBuffer(held).ok());
+}
+
+TEST_F(ProxyBufferAdmissionTest, ZeroWaitPreservesFailFastAdmission) {
+    ASSERT_NO_FATAL_FAILURE(prepare(0));
+    uint64_t held = 0;
+    ASSERT_TRUE(manager->pinStageBuffer(kWildcardLocation, held).ok());
+    auto start = std::chrono::steady_clock::now();
+    ASSERT_NO_FATAL_FAILURE(submit());
+    EXPECT_EQ(wait(), FAILED);
+    EXPECT_LT(std::chrono::steady_clock::now() - start,
+              std::chrono::seconds(1));
+    EXPECT_EQ(transport->submit_calls.load(), 0);
+    ASSERT_TRUE(manager->unpinStageBuffer(held).ok());
+}
+
+TEST_F(ProxyBufferAdmissionTest, NonCapacityErrorIsNotRetried) {
+    ASSERT_NO_FATAL_FAILURE(prepare(10000));
+    transport->reject_allocation = true;
+    auto start = std::chrono::steady_clock::now();
+    ASSERT_NO_FATAL_FAILURE(submit());
+    EXPECT_EQ(wait(), FAILED);
+    EXPECT_LT(std::chrono::steady_clock::now() - start,
+              std::chrono::seconds(1));
+    EXPECT_EQ(transport->submit_calls.load(), 0);
+}
+
+TEST_F(ProxyBufferAdmissionTest, ShutdownInterruptsAdmissionWait) {
+    ASSERT_NO_FATAL_FAILURE(prepare(10000));
+    uint64_t held = 0;
+    ASSERT_TRUE(manager->pinStageBuffer(kWildcardLocation, held).ok());
+    ASSERT_NO_FATAL_FAILURE(submit());
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    ASSERT_EQ(task.staging_status.load(), PENDING);
+    auto start = std::chrono::steady_clock::now();
+    manager.reset();
+    EXPECT_LT(std::chrono::steady_clock::now() - start,
+              std::chrono::seconds(1));
+    EXPECT_EQ(task.staging_status.load(), FAILED);
+    EXPECT_EQ(transport->submit_calls.load(), 0);
+    EXPECT_EQ(transport->free_local_memory_calls.load(), 1);
 }
 
 TEST(ProxyShutdownTimeout, TimedOutDrainHandsResourcesToDeferredTeardown) {

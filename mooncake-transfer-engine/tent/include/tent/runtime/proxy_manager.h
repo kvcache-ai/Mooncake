@@ -76,8 +76,6 @@ class ProxyManager {
         std::vector<std::shared_ptr<internal::RemoteStageOperation>>&
             undrained_remote_operations);
 
-    Status transferSync(StagingTask& task, StageBufferCache* cache);
-
     Status allocateStageBuffers(const std::string& location);
 
     Status freeStageBuffers(const std::string& location);
@@ -90,16 +88,6 @@ class ProxyManager {
     BatchID submitLocalStage(const Request& request,
                              uint64_t local_stage_buffer, uint64_t chunk_length,
                              uint64_t offset);
-
-    Status waitCrossStage(const Request& request, uint64_t local_stage_buffer,
-                          uint64_t remote_stage_buffer, uint64_t chunk_length);
-
-    Status waitLocalStage(const Request& request, uint64_t local_stage_buffer,
-                          uint64_t chunk_length, uint64_t offset);
-
-    Status waitRemoteStage(const std::string& server_addr,
-                           const Request& request, uint64_t remote_stage_buffer,
-                           uint64_t chunk_length, uint64_t offset);
 
     void submitRemoteStage(
         const std::string& server_addr, const Request& request,
@@ -120,6 +108,8 @@ class ProxyManager {
     const size_t chunk_size_;
     const size_t chunk_count_;
     TransferEngineImpl* impl_;
+    // Per-attempt slot reservation budget; zero keeps fail-fast admission.
+    const std::chrono::milliseconds buffer_wait_timeout_;
     // How long deconstruct() waits for in-flight staging batches to reach a
     // terminal state before handing the survivors to the engine for deferred
     // teardown. Read from "staging/shutdown_drain_timeout_ms" so a regression
