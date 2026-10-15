@@ -30,6 +30,19 @@ const char* ToString(DfsAllocatorType type) {
 }
 
 bool DistributedStorageConfig::Validate() const {
+    if (UsesKvcs()) {
+        if (provider_query_timeout_ms == 0) {
+            LOG(ERROR) << "DistributedStorageConfig: provider query timeout "
+                          "must be positive";
+            return false;
+        }
+        if (!single_tenant) {
+            LOG(ERROR) << "DistributedStorageConfig: KVCS currently requires "
+                          "single_tenant=true";
+            return false;
+        }
+        return true;
+    }
     if (fsdir.empty()) {
         LOG(ERROR) << "DistributedStorageConfig: fsdir is empty";
         return false;
@@ -46,7 +59,7 @@ bool DistributedStorageConfig::Validate() const {
                    << fs_adapter_type;
         return false;
     }
-    if (fs_adapter_type == "oss") {
+    if (UsesObjectStorage()) {
         return true;
     }
     const auto parsed_allocator = ParseDfsAllocatorType(allocator_type);
@@ -94,7 +107,7 @@ bool DistributedStorageConfig::Validate() const {
 
 bool DistributedStorageConfig::ValidateForAllocator() const {
     if (!Validate()) return false;
-    if (fs_adapter_type == "oss") {
+    if (UsesObjectStorage()) {
         LOG(ERROR) << "DistributedStorageConfig: DFS allocator requires a "
                       "filesystem adapter";
         return false;
@@ -142,9 +155,27 @@ DistributedStorageConfig DistributedStorageConfig::FromEnvironment() {
         Environ::ReadOr(Variables::MOONCAKE_DFS_FS_ADAPTER, legacy_fs_adapter);
     config.allocator_type = Environ::ReadOr(Variables::MOONCAKE_DFS_ALLOCATOR,
                                             config.allocator_type);
+    const auto kvcs_mode = Environ::GetString("MOONCAKE_KVCS_MODE", "");
+    if (kvcs_mode == "low-level" || kvcs_mode == "kvcs") {
+        config.fs_adapter_type = "kvcs-lowlevel";
+    } else if (!kvcs_mode.empty()) {
+        config.fs_adapter_type = kvcs_mode;
+    }
+    config.object_storage_config_path = Environ::GetString(
+        "MOONCAKE_KVCS_EFC_CONFIG", config.object_storage_config_path);
+    const auto provider_query_timeout_ms = Environ::GetUInt64(
+        "MOONCAKE_KVCS_QUERY_TIMEOUT_MS", config.provider_query_timeout_ms);
+    if (provider_query_timeout_ms > std::numeric_limits<uint32_t>::max()) {
+        LOG(ERROR) << "MOONCAKE_KVCS_QUERY_TIMEOUT_MS exceeds uint32_t";
+        config.provider_query_timeout_ms = 0;
+    } else {
+        config.provider_query_timeout_ms =
+            static_cast<uint32_t>(provider_query_timeout_ms);
+    }
     config.enable_health_check =
         Environ::ReadOr(Variables::MOONCAKE_DISTRIBUTED_HEALTH_CHECK,
-                        config.enable_health_check);
+                        config.fs_adapter_type == "kvcs-lowlevel" ||
+                            config.enable_health_check);
     config.shard_count = Environ::ReadOr(Variables::MOONCAKE_DFS_SHARD_COUNT,
                                          config.shard_count);
     config.shard_capacity = Environ::ReadOr(
@@ -155,8 +186,11 @@ DistributedStorageConfig DistributedStorageConfig::FromEnvironment() {
         Variables::MOONCAKE_DFS_MAX_BUCKET_COUNT, config.max_bucket_count);
     config.alignment =
         Environ::ReadOr(Variables::MOONCAKE_DFS_ALIGNMENT, config.alignment);
-    config.single_tenant = Environ::ReadOr(
-        Variables::MOONCAKE_DFS_SINGLE_TENANT, config.single_tenant);
+    config.single_tenant =
+        config.UsesKvcs()
+            ? Environ::GetBool("MOONCAKE_KVCS_SINGLE_TENANT", true)
+            : Environ::ReadOr(Variables::MOONCAKE_DFS_SINGLE_TENANT,
+                              config.single_tenant);
     config.eviction_enabled = Environ::ReadOr(
         Variables::MOONCAKE_DFS_EVICTION_ENABLED, config.eviction_enabled);
 
@@ -193,7 +227,9 @@ std::string DistributedStorageConfig::FormatStr() const {
         << ", eviction_low_watermark=" << eviction_low_watermark
         << ", deferred_free_seconds=" << deferred_free_duration.count()
         << ", eviction_check_interval_seconds="
-        << eviction_check_interval.count();
+        << eviction_check_interval.count()
+        << ", object_storage_config_path=" << object_storage_config_path
+        << ", provider_query_timeout_ms=" << provider_query_timeout_ms;
     return oss.str();
 }
 

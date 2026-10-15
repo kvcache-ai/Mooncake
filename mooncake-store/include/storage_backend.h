@@ -233,9 +233,12 @@ struct FileStorageConfig {
     // Use io_uring for file I/O instead of POSIX pread/pwrite
     bool use_uring = false;
 
-    // DFS page-offset mode. Enabled for filesystem-mode distributed storage;
-    // object storage uses the regular offload control plane.
+    // DFS control-plane mode. Enabled for filesystem-mode distributed storage
+    // and KVCS; other object stores use the regular offload control plane.
     bool enable_dfs = false;
+    // KVCS tenant key isolation, used only when MOONCAKE_KVCS_MODE selects
+    // the KVCS object adapter.
+    std::string kvcs_tenant_id = "default";
     // Proactively evict local disk objects from the heartbeat thread once
     // backend usage crosses the high watermark.
     bool enable_disk_watermark_eviction = true;

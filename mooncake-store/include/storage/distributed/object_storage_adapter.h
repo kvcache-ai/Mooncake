@@ -2,6 +2,7 @@
 
 #include <sys/uio.h>
 
+#include <chrono>
 #include <span>
 #include <string>
 #include <vector>
@@ -28,6 +29,21 @@ struct ObjectGetRequest {
     void* buffer = nullptr;
     size_t size = 0;
 };
+
+struct ObjectStoragePutRequest {
+    std::string logical_key;
+    std::vector<Slice> slices;
+    bool replace_existing = false;
+};
+
+struct ObjectStorageGetRequest {
+    std::string logical_key;
+    std::vector<Slice> slices;
+    size_t expected_size = 0;
+};
+
+using ObjectStorageIoResults = std::vector<tl::expected<void, ErrorCode>>;
+using ObjectStorageQueryResults = ObjectStorageIoResults;
 
 /**
  * @brief Adapts object storage services to the distributed backend's
@@ -86,6 +102,26 @@ class ObjectStorageAdapter {
     virtual tl::expected<void, ErrorCode> Delete(
         const std::string& logical_key) = 0;
 
+    // Compatibility implementations preserve behavior for existing object
+    // stores. Providers may override these methods to validate and process a
+    // Mooncake batch without changing the existing PutV/Get API.
+    virtual ObjectStorageIoResults BatchPutV(
+        std::span<const ObjectStoragePutRequest> requests);
+    virtual ObjectStorageIoResults BatchGetInto(
+        std::span<const ObjectStorageGetRequest> requests);
+    virtual ObjectStorageIoResults BatchDelete(
+        std::span<const std::string> logical_keys);
+
+    // A successful query proves presence, not size or layout. The Master owns
+    // the object size; Get must check that the provider returns exactly it.
+    virtual bool SupportsProviderQuery() const { return false; }
+    virtual ObjectStorageQueryResults BatchQueryProvider(
+        std::span<const std::string> logical_keys);
+    virtual ObjectStorageQueryResults BatchQueryProviderUntil(
+        std::span<const std::string> logical_keys,
+        std::chrono::steady_clock::time_point deadline) {
+        return BatchQueryProvider(logical_keys);
+    }
     // Pagination is an implementation detail. Returns decoded logical keys
     // from the adapter's configured physical namespace.
     virtual tl::expected<std::vector<KeyInfo>, ErrorCode> ListKeys() = 0;
