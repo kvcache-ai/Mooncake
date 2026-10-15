@@ -56,14 +56,12 @@ ErrorCode LocalSsdTaskMailbox::EnqueuePromotion(PromotionTaskItem task) {
     MutexLocker lock(&mutex_);
     auto index = TenantId(task.tenant_id).MakeScopedKey(task.key);
     const uint64_t seq = ++promotion_seq_;
-    auto [it, inserted] = pending_promotions_.emplace(
-        std::move(index), PromotionEntry{std::move(task), seq});
-    if (!inserted) {
-        // Already queued: keep the dedup contract but refresh recency, so a
-        // repeated admission moves ahead of stale entries.
-        it->second.seq = seq;
-        return ErrorCode::OBJECT_ALREADY_EXISTS;
-    }
+    // An item still queued for the key belongs to an earlier task of it (the
+    // master admits a key's next promotion only after the previous one
+    // ended), so the holder could not act on it any more. The new task's item
+    // takes its place, with fresh recency.
+    pending_promotions_.insert_or_assign(std::move(index),
+                                         PromotionEntry{std::move(task), seq});
     return ErrorCode::OK;
 }
 
