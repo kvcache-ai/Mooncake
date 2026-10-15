@@ -870,6 +870,7 @@ tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {
     // DRAM segment.
     const std::vector<std::string> preferred_segments;
 
+    size_t items_without_task_id = 0;
     // The master caps per-heartbeat work via PromotionObjectHeartbeat,
     // returning at most one task per call so the heartbeat thread stays
     // within the client-liveness window even for large objects. Leftover
@@ -886,9 +887,22 @@ tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {
                          << " with non-positive size=" << size;
             continue;
         }
+        if (!task.task_id.has_value()) {
+            // A master that predates task ids matches promotion calls by key
+            // alone, so a late call could act on a newer promotion of the
+            // key. Never stage a buffer for it; end its task (no buffer is
+            // staged yet, so the key-only failure is safe).
+            ++items_without_task_id;
+            auto release = client_->NotifyPromotionFailure(key, tenant_id);
+            if (!release) {
+                VLOG(1) << "Promotion: NotifyPromotionFailure failed for key="
+                        << key << ", error=" << release.error();
+            }
+            continue;
+        }
 
-        auto alloc_result = client_->PromotionAllocStart(
-            key, tenant_id, static_cast<uint64_t>(size), preferred_segments);
+        auto alloc_result =
+            client_->PromotionTaskAllocStart(task, preferred_segments);
         if (!alloc_result) {
             // AllocStart failed (typically NO_AVAILABLE_HANDLE under
             // DRAM pressure). No staged buffer to release, but the
@@ -901,7 +915,7 @@ tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {
             VLOG(1) << "PromotionAllocStart failed for key=" << key
                     << ", error=" << alloc_result.error()
                     << " (likely no free DRAM); releasing master slot";
-            auto release = client_->NotifyPromotionFailure(key, tenant_id);
+            auto release = client_->NotifyPromotionTaskFailure(task);
             if (!release) {
                 VLOG(1) << "Promotion: NotifyPromotionFailure failed for key="
                         << key << ", error=" << release.error()
@@ -917,8 +931,8 @@ tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {
         // throttling or RDMA flakes saturate promotion_queue_limit_
         // for the full reaper TTL. NotifyPromotionFailure is
         // idempotent and best-effort — the reaper is the long-stop.
-        auto release_master_state = [this, &key, &tenant_id]() {
-            auto release = client_->NotifyPromotionFailure(key, tenant_id);
+        auto release_master_state = [this, &key, &task]() {
+            auto release = client_->NotifyPromotionTaskFailure(task);
             if (!release) {
                 VLOG(1) << "Promotion: NotifyPromotionFailure failed for key="
                         << key << ", error=" << release.error()
@@ -970,7 +984,7 @@ tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {
 
         // (c) Commit. Master flips the PROCESSING replica to COMPLETE and it
         // becomes visible to readers.
-        auto notify_res = client_->NotifyPromotionSuccess(key, tenant_id);
+        auto notify_res = client_->NotifyPromotionTaskSuccess(task);
         if (!notify_res) {
             // The write landed but the commit failed. We can't retry the
             // commit (the success path is one-shot via alloc_id), and we
@@ -985,6 +999,11 @@ tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {
         }
 
         VLOG(1) << "Promotion completed for key=" << key << ", size=" << size;
+    }
+    if (items_without_task_id > 0) {
+        LOG(WARNING) << "action=release_promotion_items, reason=no_task_id"
+                     << ", promotion_items_without_task_id="
+                     << items_without_task_id;
     }
 
     return {};

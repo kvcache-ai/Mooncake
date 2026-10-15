@@ -1831,6 +1831,54 @@ tl::expected<void, ErrorCode> WrappedMasterService::NotifyPromotionFailure(
     return result;
 }
 
+tl::expected<PromotionAllocStartResponse, ErrorCode>
+WrappedMasterService::PromotionTaskAllocStart(
+    const UUID& client_id, const PromotionTaskItem& item,
+    const std::vector<std::string>& preferred_segments) {
+    ScopedVLogTimer timer(1, "PromotionTaskAllocStart");
+    timer.LogRequest("action=promotion_task_alloc_start");
+    auto result = WithWriteTenant(
+        item.tenant_id, master_service_.IsTenantQuotaEnabled(),
+        [&](const TenantId& resolved_tenant_id) {
+            return master_service_.PromotionTaskAllocStart(
+                client_id, item, resolved_tenant_id, preferred_segments);
+        });
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<void, ErrorCode> WrappedMasterService::NotifyPromotionTaskSuccess(
+    const UUID& client_id, const PromotionTaskItem& item) {
+    ScopedVLogTimer timer(1, "NotifyPromotionTaskSuccess");
+    timer.LogRequest("action=notify_promotion_task_success");
+    auto result =
+        WithRequestTenant(master_service_.IsTenantQuotaEnabled()
+                              ? std::string_view(item.tenant_id)
+                              : TenantId::kDefaultValue,
+                          [&](const TenantId& resolved_tenant_id) {
+                              return master_service_.NotifyPromotionTaskSuccess(
+                                  client_id, item, resolved_tenant_id);
+                          });
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<void, ErrorCode> WrappedMasterService::NotifyPromotionTaskFailure(
+    const UUID& client_id, const PromotionTaskItem& item) {
+    ScopedVLogTimer timer(1, "NotifyPromotionTaskFailure");
+    timer.LogRequest("action=notify_promotion_task_failure");
+    auto result =
+        WithRequestTenant(master_service_.IsTenantQuotaEnabled()
+                              ? std::string_view(item.tenant_id)
+                              : TenantId::kDefaultValue,
+                          [&](const TenantId& resolved_tenant_id) {
+                              return master_service_.NotifyPromotionTaskFailure(
+                                  client_id, item, resolved_tenant_id);
+                          });
+    timer.LogResponseExpected(result);
+    return result;
+}
+
 tl::expected<int, ErrorCode> WrappedMasterService::GetDfsShardCount() const {
     return master_service_.GetDfsShardCount();
 }
@@ -2021,6 +2069,15 @@ void RegisterRpcService(
         &wrapped_master_service);
     server.register_handler<
         &mooncake::WrappedMasterService::NotifyPromotionFailure>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::PromotionTaskAllocStart>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::NotifyPromotionTaskSuccess>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::NotifyPromotionTaskFailure>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::CopyStart>(
         &wrapped_master_service);

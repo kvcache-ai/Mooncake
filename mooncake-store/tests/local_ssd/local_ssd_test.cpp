@@ -72,9 +72,14 @@ TEST(LocalSsdTaskMailboxTest, PromotionsAreBatchedAndRemoveAllIsConsumed) {
                 ErrorCode::OK);
     EXPECT_TRUE(mailbox.EnqueuePromotion(Promotion("b", "key", 2)) ==
                 ErrorCode::OK);
+    // A queued key is replaced (the newest item of the key wins) and moves
+    // ahead: it is taken first.
     EXPECT_TRUE(mailbox.EnqueuePromotion(Promotion("a", "key", 3)) ==
-                ErrorCode::OBJECT_ALREADY_EXISTS);
-    EXPECT_EQ(mailbox.TakePromotions(1).size(), 1);
+                ErrorCode::OK);
+    auto first = mailbox.TakePromotions(1);
+    ASSERT_EQ(first.size(), 1);
+    EXPECT_EQ(first.front().tenant_id, "a");
+    EXPECT_EQ(first.front().size, 3);
     EXPECT_EQ(mailbox.TakePromotions(10).size(), 1);
     EXPECT_TRUE(mailbox.TakePromotions(10).empty());
 
@@ -104,9 +109,10 @@ TEST(LocalSsdTaskMailboxTest, PromotionsAreDeliveredByRecency) {
     ASSERT_EQ(second.size(), 1);
     EXPECT_EQ(second.front(), Promotion("t", "a", 1));
 
-    // A duplicate enqueue keeps the dedup contract but refreshes recency.
+    // A duplicate enqueue replaces the queued item (one per key) and
+    // refreshes recency.
     ASSERT_TRUE(mailbox.EnqueuePromotion(Promotion("t", "b", 2)) ==
-                ErrorCode::OBJECT_ALREADY_EXISTS);
+                ErrorCode::OK);
     auto third = mailbox.TakePromotions(1);
     ASSERT_EQ(third.size(), 1);
     EXPECT_EQ(third.front(), Promotion("t", "b", 2));
