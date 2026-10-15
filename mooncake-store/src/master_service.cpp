@@ -8734,7 +8734,8 @@ bool MasterService::CancelQueuedOffloadTask(ObjectRecord& record,
 // via the LOCAL_DISK replica's embedded client_id rather than via the
 // segment-name reverse lookup.
 tl::expected<void, ErrorCode> MasterService::PushPromotionQueue(
-    const ObjectIdentity& object_id, Replica& source_replica) {
+    const ObjectIdentity& object_id, Replica& source_replica,
+    const L4TaskId& task_id) {
     auto holder_id = source_replica.get_local_disk_client_id();
     if (!holder_id.has_value()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
@@ -8754,7 +8755,8 @@ tl::expected<void, ErrorCode> MasterService::PushPromotionQueue(
                                       .size = static_cast<int64_t>(
                                           source_replica.get_descriptor()
                                               .get_local_disk_descriptor()
-                                              .object_size)});
+                                              .object_size),
+                                      .task_id = task_id});
     if (err == ErrorCode::SEGMENT_NOT_FOUND) {
         // Holder client expired or never registered LocalSSD;
         // the LOCAL_DISK replica will be cleaned up by ClientMonitorFunc on
@@ -9193,7 +9195,8 @@ PromotionQueueResult MasterService::TryPushPromotionQueue(
         source->get_descriptor().get_local_disk_descriptor().object_size;
 
     // Try to enqueue on the holder client. On failure, drop the refcnt back.
-    auto push_result = PushPromotionQueue(object_id, *source);
+    const L4TaskId task_id = NextL4TaskId();
+    auto push_result = PushPromotionQueue(object_id, *source, task_id);
     if (!push_result) {
         source->dec_refcnt();
         VLOG(1) << "promotion_push_failed key=" << key
@@ -9233,7 +9236,8 @@ PromotionQueueResult MasterService::TryPushPromotionQueue(
                       .object_size = object_size,
                       .start_time = std::chrono::system_clock::now(),
                       .holder_id = holder_id,
-                      .execution_failures = execution_failures};
+                      .execution_failures = execution_failures,
+                      .task_id = task_id};
     promotion_in_flight_.fetch_add(1, std::memory_order_relaxed);
     MasterMetricManager::instance().inc_promotion_in_flight();
     MasterMetricManager::instance().inc_promotion_admitted();
@@ -9257,13 +9261,64 @@ auto MasterService::PromotionObjectHeartbeat(const UUID& client_id)
     // stay queued in the mailbox for subsequent heartbeats. The
     // cap must live here (server side) rather than on the client so
     // leftover work isn't silently dropped.
-    return local_ssd_manager_.TakePromotions(client_id,
-                                             promotion_max_per_heartbeat_);
+    auto taken = local_ssd_manager_.TakePromotions(
+        client_id, promotion_max_per_heartbeat_);
+    if (!taken) {
+        return taken;
+    }
+    // Hand out only items of the key's current task held by this client: an
+    // item left over from an earlier promotion of the key names a task that
+    // no longer exists, and the holder could not act on it.
+    std::vector<PromotionTaskItem> current;
+    current.reserve(taken->size());
+    for (auto& item : *taken) {
+        if (!item.task_id.has_value()) {
+            continue;
+        }
+        const TenantId item_tenant = enable_multi_tenants_
+                                         ? TenantId(item.tenant_id)
+                                         : TenantId::Default();
+        const auto object_id =
+            MakeObjectIdentityForRequest(item.key, item_tenant);
+        MetadataAccessorRW accessor(this, object_id);
+        if (!accessor.Exists()) {
+            continue;
+        }
+        const auto& task = accessor.GetState().promotion_task;
+        if (!task || task->task_id != *item.task_id ||
+            task->holder_id != client_id) {
+            continue;
+        }
+        current.push_back(std::move(item));
+    }
+    return current;
 }
 
 auto MasterService::PromotionAllocStart(
     const UUID& client_id, const std::string& key, const TenantId& tenant_id,
     uint64_t size, const std::vector<std::string>& preferred_segments)
+    -> tl::expected<PromotionAllocStartResponse, ErrorCode> {
+    return PromotionAllocStartFor(client_id, key, tenant_id, size,
+                                  preferred_segments, std::nullopt);
+}
+
+auto MasterService::PromotionTaskAllocStart(
+    const UUID& client_id, const PromotionTaskItem& item,
+    const TenantId& tenant_id,
+    const std::vector<std::string>& preferred_segments)
+    -> tl::expected<PromotionAllocStartResponse, ErrorCode> {
+    if (item.size < 0) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return PromotionAllocStartFor(client_id, item.key, tenant_id,
+                                  static_cast<uint64_t>(item.size),
+                                  preferred_segments, item.task_id);
+}
+
+auto MasterService::PromotionAllocStartFor(
+    const UUID& client_id, const std::string& key, const TenantId& tenant_id,
+    uint64_t size, const std::vector<std::string>& preferred_segments,
+    const std::optional<L4TaskId>& task_id)
     -> tl::expected<PromotionAllocStartResponse, ErrorCode> {
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
     const auto record = FindClientRecord(client_id);
@@ -9297,6 +9352,11 @@ auto MasterService::PromotionAllocStart(
     const TenantQuotaHandle quota_account = accessor.QuotaAccount();
     auto& promotion_task = accessor.GetState().promotion_task;
     if (!promotion_task) {
+        return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
+    }
+    // The caller's task must be this one (see PromotionTask::task_id); a
+    // key-only call cannot name it and never stages a buffer.
+    if (!task_id.has_value() || *task_id != promotion_task->task_id) {
         return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
     }
 
@@ -9399,6 +9459,20 @@ auto MasterService::NotifyPromotionSuccess(const UUID& client_id,
                                            const std::string& key,
                                            const TenantId& tenant_id)
     -> tl::expected<void, ErrorCode> {
+    return NotifyPromotionSuccessFor(client_id, key, tenant_id, std::nullopt);
+}
+
+auto MasterService::NotifyPromotionTaskSuccess(const UUID& client_id,
+                                               const PromotionTaskItem& item,
+                                               const TenantId& tenant_id)
+    -> tl::expected<void, ErrorCode> {
+    return NotifyPromotionSuccessFor(client_id, item.key, tenant_id,
+                                     item.task_id);
+}
+
+auto MasterService::NotifyPromotionSuccessFor(
+    const UUID& client_id, const std::string& key, const TenantId& tenant_id,
+    const std::optional<L4TaskId>& task_id) -> tl::expected<void, ErrorCode> {
     const auto record = FindClientRecord(client_id);
     auto retaining_guard =
         record ? record->TryAcquireRetainingGuard() : std::nullopt;
@@ -9422,6 +9496,12 @@ auto MasterService::NotifyPromotionSuccess(const UUID& client_id,
     // replica.
     auto& promotion_task = accessor.GetState().promotion_task;
     if (!promotion_task || promotion_task->alloc_id == 0) {
+        return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
+    }
+    // Only the report of this task commits its staged replica: a late
+    // success of an earlier promotion of the key would make a buffer the
+    // holder is still writing readable. A key-only call is never accepted.
+    if (!task_id.has_value() || *task_id != promotion_task->task_id) {
         return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
     }
 
@@ -9527,6 +9607,22 @@ auto MasterService::NotifyPromotionFailure(const UUID& client_id,
                                            const std::string& key,
                                            const TenantId& tenant_id)
     -> tl::expected<void, ErrorCode> {
+    return NotifyPromotionFailureFor(client_id, key, tenant_id, std::nullopt);
+}
+
+auto MasterService::NotifyPromotionTaskFailure(const UUID& client_id,
+                                               const PromotionTaskItem& item,
+                                               const TenantId& tenant_id)
+    -> tl::expected<void, ErrorCode> {
+    // An item without an id names no task of this master (every task id
+    // has a non-zero epoch), so it ends nothing.
+    return NotifyPromotionFailureFor(client_id, item.key, tenant_id,
+                                     item.task_id.value_or(L4TaskId{}));
+}
+
+auto MasterService::NotifyPromotionFailureFor(
+    const UUID& client_id, const std::string& key, const TenantId& tenant_id,
+    const std::optional<L4TaskId>& task_id) -> tl::expected<void, ErrorCode> {
     const auto record = FindClientRecord(client_id);
     auto retaining_guard =
         record ? record->TryAcquireRetainingGuard() : std::nullopt;
@@ -9548,6 +9644,17 @@ auto MasterService::NotifyPromotionFailure(const UUID& client_id,
         // client never had a task here. Return OK to keep this RPC
         // idempotent — repeated failure notifications on the same key
         // should be safe.
+        return {};
+    }
+
+    // Only the failure of this task ends it: a late failure of an earlier
+    // promotion of the key must not free the buffer this one's holder is
+    // writing into (the range could be handed to another put meanwhile). A
+    // key-only call cannot name the task; it ends only a task that has no
+    // staged replica, which is the only kind such a caller can hold (its
+    // AllocStart is refused).
+    if (task_id.has_value() ? *task_id != promotion_task->task_id
+                            : promotion_task->alloc_id != 0) {
         return {};
     }
 
