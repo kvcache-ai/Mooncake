@@ -731,8 +731,8 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
                 std::unique_lock<std::shared_mutex> state_lock(
                     master_state_mutex_);
                 for (const auto& segment_id : mismatched) {
-                    DropPendingRestoredSegmentLocked(segment_id,
-                                                     "conflicting_mount");
+                    DropPendingRestoredSegmentLocked(
+                        segment_id, "conflicting_mount", client_id);
                 }
             }
         }
@@ -896,10 +896,13 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
             // stale before the normal validation sees them.
             for (const auto& segment_id :
                  FindHandoffMismatchesLocked(segments, client_id, true)) {
-                DropPendingRestoredSegmentLocked(segment_id,
-                                                 "remount_identity_mismatch");
+                DropPendingRestoredSegmentLocked(
+                    segment_id, "remount_identity_mismatch", client_id);
             }
         }
+        // Handoff restore: the owner process is alive, so its restored L4
+        // (LOCAL_DISK) replicas describe its own disk index.
+        OpenHandoffDiskGate(client_id);
         for (const auto& segment : segments) {
             if (!segment.host_id.empty()) {
                 client_host_id_[client_id] = segment.host_id;
@@ -4745,8 +4748,20 @@ std::vector<Replica::Descriptor> MasterService::GetReadableReplicaDescriptors(
 }
 
 bool MasterService::IsReplicaReadable(const Replica& replica) const {
-    return replica.is_completed() && replica.is_available() &&
-           !IsAwaitingRemount(replica);
+    if (!replica.is_completed() || !replica.is_available() ||
+        IsAwaitingRemount(replica)) {
+        return false;
+    }
+    // Handoff restore: a restored LOCAL_DISK replica stays unreadable until
+    // its owner process shows up (see OpenHandoffDiskGate).
+    if (handoff_disk_gate_.active.load(std::memory_order_acquire) &&
+        replica.is_local_disk_replica()) {
+        const auto owner = replica.get_local_disk_client_id();
+        if (owner && HandoffDiskGated(*owner)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 bool MasterService::HasReadableReplica(const ObjectMetadata& metadata) const {
@@ -8389,6 +8404,9 @@ auto MasterService::Ping(const UUID& client_id)
             LOG(INFO) << "client_id=" << client_id
                       << ", action=client_liveness_recovered, signal=ping";
         }
+        if (observation_accepted) {
+            OpenHandoffDiskGate(client_id);
+        }
     }
     const ClientStatus client_status =
         observation_accepted && ok_client_.contains(client_id)
@@ -8462,6 +8480,7 @@ auto MasterService::MountLocalDiskSegment(const UUID& client_id,
                   << ", action=client_liveness_recovered, "
                      "signal=local_disk_mount";
     }
+    OpenHandoffDiskGate(client_id);
 
     return {};
 }
@@ -8540,6 +8559,7 @@ auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
                    << client_id;
         return tl::make_unexpected(pending.error());
     }
+    OpenHandoffDiskGate(client_id);
     if (enable_offloading) {
         return RecordOffloadTakers(client_id, *pending);
     }
@@ -8816,6 +8836,13 @@ auto MasterService::NotifyOffloadSuccess(
                                   client_id) != source_clients.end();
                     ReleaseOffloadingTask(&obj_metadata, offloading_task);
 
+                    if (segment_mounted) {
+                        // A disk replica of an owner that is no longer
+                        // registered (e.g. a store restarted during a
+                        // handoff roll) must not block this client's copy.
+                        EraseUnregisteredOwnerDiskReplica(
+                            accessor, obj_metadata, client_id);
+                    }
                     if (!segment_mounted) {
                         // The offload bookkeeping above still ran; only the
                         // registration is refused.

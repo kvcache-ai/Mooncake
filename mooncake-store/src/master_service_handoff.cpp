@@ -19,8 +19,17 @@
 // segment (ConfirmPendingRestoredSegmentsLocked); a mismatch drops it
 // (FindHandoffMismatchesLocked / DropPendingRestoredSegmentLocked).
 //
-// Only memory replicas are carried. LOCAL_DISK, DISK, NoF and DFS replicas
-// are left out; an object without a memory replica is not exported.
+// L4: completed LOCAL_DISK replicas travel in the same chunks (at most one
+// per object; an object may have only that one). For every store that owns
+// an exported memory segment, its LocalSSD registration is carried too, so
+// its next offload heartbeat succeeds and it keeps its offloaded files (a
+// store drops them whenever it has to register its disk tier anew). A
+// restored LOCAL_DISK replica is unreadable until an RPC with its owner's
+// client id arrives (the id is random per process, so a restarted store can
+// never open it); see OpenHandoffDiskGate. No offload or promotion state is
+// carried: a late report of an old master's task names that master's L4
+// task epoch, which no task of the new master has, so it is refused.
+// DISK, NoF and DFS replicas are left out.
 
 #include <algorithm>
 #include <atomic>
@@ -31,6 +40,7 @@
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -73,6 +83,9 @@ std::string MasterService::HandoffRestoreStats::ToJson() const {
     o << "{\"objects\":" << objects << ",\"replicas\":" << replicas
       << ",\"segments\":" << segments << ",\"chunks\":" << chunks
       << ",\"quarantine_ranges\":" << quarantine_ranges
+      << ",\"local_disk_clients\":" << local_disk_clients
+      << ",\"local_disk_replicas\":" << local_disk_replicas
+      << ",\"disk_only_objects\":" << disk_only_objects
       << ",\"workers\":" << workers << ",\"manifest_ns\":" << manifest_ns
       << ",\"mount_ns\":" << mount_ns
       << ",\"insert_wall_ns\":" << insert_wall_ns
@@ -117,8 +130,29 @@ std::vector<handoff::HandoffSegment> MasterService::ExportHandoffSegments() {
     return out;
 }
 
+std::vector<LocalSsdHandoffClient> MasterService::ExportHandoffLocalDiskClients(
+    const std::vector<handoff::HandoffSegment>& segments) const {
+    HandoffClientSet owners;
+    for (const auto& segment : segments) {
+        owners.insert(segment.Owner());
+    }
+    std::vector<LocalSsdHandoffClient> out;
+    for (auto& client : local_ssd_manager_.ExportHandoffClients()) {
+        if (owners.contains(client.client_id)) {
+            out.push_back(client);
+        }
+    }
+    std::sort(
+        out.begin(), out.end(),
+        [](const LocalSsdHandoffClient& a, const LocalSsdHandoffClient& b) {
+            return a.client_id < b.client_id;
+        });
+    return out;
+}
+
 void MasterService::ExportHandoffShard(
     size_t shard_idx, const handoff::SegmentLocator& locator,
+    const HandoffClientSet& disk_clients,
     std::vector<StandbyObjectEntry>& objects,
     std::vector<handoff::QuarantineRange>& quarantine,
     handoff::WriterStats& stats) const {
@@ -136,9 +170,29 @@ void MasterService::ExportHandoffShard(
             // its ranges are quarantined below.
             const bool processing = record.state.is_processing;
             StandbyObjectEntry entry;
+            bool has_disk = false;
+            size_t memory_replicas = 0;
             for (const auto& replica : metadata.GetAllReplicas()) {
+                if (replica.is_local_disk_replica()) {
+                    // Kept only for an exported owner, complete, describing
+                    // the object, and once per object (the restore admits
+                    // one).
+                    const auto owner = replica.get_local_disk_client_id();
+                    auto descriptor = replica.get_descriptor();
+                    const auto& disk = descriptor.get_local_disk_descriptor();
+                    if (processing || has_disk || !replica.is_completed() ||
+                        !owner || !disk_clients.contains(*owner) ||
+                        disk.object_size != metadata.TotalLength() ||
+                        disk.transport_endpoint.empty()) {
+                        ++stats.dropped_local_disk_replicas;
+                        continue;
+                    }
+                    entry.metadata.replicas.push_back(std::move(descriptor));
+                    has_disk = true;
+                    continue;
+                }
                 if (!replica.is_memory_replica()) {
-                    // LOCAL_DISK, DISK, NoF and DFS replicas are not carried.
+                    // DISK, NoF and DFS replicas are not carried.
                     ++stats.dropped_non_memory_replicas;
                     continue;
                 }
@@ -171,6 +225,7 @@ void MasterService::ExportHandoffShard(
                     continue;
                 }
                 entry.metadata.replicas.push_back(std::move(descriptor));
+                ++memory_replicas;
             }
             if (entry.metadata.replicas.empty()) {
                 if (processing) {
@@ -190,6 +245,10 @@ void MasterService::ExportHandoffShard(
             entry.metadata.session_id = metadata.session_id;
             ++stats.objects;
             stats.replicas += entry.metadata.replicas.size();
+            if (has_disk) {
+                ++stats.local_disk_replicas;
+                if (memory_replicas == 0) ++stats.disk_only_objects;
+            }
             objects.push_back(std::move(entry));
         }
     }
@@ -273,6 +332,17 @@ void MasterService::ExportHandoffDiscardedQuarantine(
 
 WeightMetadataSnapshot MasterService::ExportHandoffWeightMetadata() const {
     return weight_manager_.ExportSnapshot();
+}
+
+uint64_t MasterService::HandoffLocalDiskObjectCount() const {
+    uint64_t count = 0;
+    for (size_t s = 0; s < kNumShards; ++s) {
+        MetadataShardAccessorRO shard(this, s);
+        if (shard->disk_object_count > 0) {
+            count += static_cast<uint64_t>(shard->disk_object_count);
+        }
+    }
+    return count;
 }
 
 uint64_t MasterService::HandoffObjectCount() const {
@@ -368,6 +438,13 @@ MasterService::RestoreFromHandoffLocked(const std::string& dir,
     if (manifest.multi_tenant != enable_multi_tenants_) {
         return tl::make_unexpected("multi-tenant mode mismatch");
     }
+    const auto& disk_clients = contents->local_disk_clients;
+    if (!disk_clients.empty() && !enable_offload_) {
+        // Never restore without the L4 state the snapshot carries.
+        return tl::make_unexpected(
+            "snapshot carries L4 state but offload is disabled");
+    }
+    stats.local_disk_clients = disk_clients.size();
     const auto read_blob = [&dir](const std::string& key, uint64_t bytes,
                                   uint32_t crc32c) {
         return handoff::ReadVerifiedBlob(dir, key, bytes, crc32c);
@@ -429,6 +506,14 @@ MasterService::RestoreFromHandoffLocked(const std::string& dir,
         client_liveness_records_.emplace(client_id, record);
         MasterMetricManager::instance().client_liveness_record_created();
     }
+    // Restored LOCAL_DISK replicas are bound to their owner's restored
+    // liveness record (ReadSnapshot checked that every owner has one).
+    std::unordered_map<UUID, std::shared_ptr<ClientLivenessRecord>,
+                       boost::hash<UUID>>
+        disk_records;
+    for (const auto& client : disk_clients) {
+        disk_records.emplace(client.client_id, records.at(client.client_id));
+    }
     stats.mount_ns = NsSince(phase_start);
 
     // ---- Phase 1: read chunks and install objects with placeholders.
@@ -437,6 +522,10 @@ MasterService::RestoreFromHandoffLocked(const std::string& dir,
         ReplicaID max_id{0};
         uint64_t objects{0};
         uint64_t replicas{0};
+        uint64_t memory_replicas{0};
+        uint64_t disk_replicas{0};
+        uint64_t disk_only_objects{0};
+        std::unordered_map<UUID, int64_t, boost::hash<UUID>> disk_bytes;
         std::string error;
     };
     std::vector<WorkerState> states(workers);
@@ -454,8 +543,13 @@ MasterService::RestoreFromHandoffLocked(const std::string& dir,
         std::chrono::milliseconds(default_kv_lease_ttl_);
     const auto finish = [&lease_floor](ObjectMetadata& metadata) {
         metadata.lease_->ExtendTo(lease_floor);
-        // Every restored object has a completed memory replica.
-        metadata.memory_cache_total_accounted = true;
+        // Every restored replica is complete; the cache totals are counted
+        // in bulk below. InstallRestoredObjects already counted a LOCAL_DISK
+        // replica in its shard's disk_object_count.
+        metadata.memory_cache_total_accounted =
+            metadata.HasReplica(&Replica::fn_is_memory_replica);
+        metadata.disk_cache_total_accounted =
+            metadata.HasReplica(&Replica::fn_is_local_disk_replica);
     };
     std::atomic<size_t> next_chunk{0};
     phase_start = SteadyClock::now();
@@ -503,6 +597,7 @@ MasterService::RestoreFromHandoffLocked(const std::string& dir,
                 RestoredObject object;
                 object.entry = &entry;
                 object.replicas.reserve(meta.replicas.size());
+                bool has_disk = false;
                 for (size_t r = 0; r < meta.replicas.size(); ++r) {
                     const auto& desc = meta.replicas[r];
                     if (desc.id == 0 ||
@@ -513,6 +608,26 @@ MasterService::RestoreFromHandoffLocked(const std::string& dir,
                         if (meta.replicas[q].id == desc.id) {
                             return fail("duplicate replica id");
                         }
+                    }
+                    if (desc.status == ReplicaStatus::COMPLETE &&
+                        desc.is_local_disk_replica()) {
+                        const auto& disk = desc.get_local_disk_descriptor();
+                        const auto owner = disk_records.find(disk.client_id);
+                        if (has_disk || owner == disk_records.end() ||
+                            disk.object_size != meta.size ||
+                            disk.transport_endpoint.empty()) {
+                            return fail("invalid local disk descriptor");
+                        }
+                        st.max_id = std::max(st.max_id, desc.id);
+                        object.replicas.push_back(
+                            Replica(desc.id, disk.client_id, disk.object_size,
+                                    disk.transport_endpoint, desc.status,
+                                    owner->second));
+                        has_disk = true;
+                        ++st.disk_replicas;
+                        st.disk_bytes[disk.client_id] +=
+                            static_cast<int64_t>(disk.object_size);
+                        continue;
                     }
                     if (desc.status != ReplicaStatus::COMPLETE ||
                         !desc.is_memory_replica()) {
@@ -539,6 +654,10 @@ MasterService::RestoreFromHandoffLocked(const std::string& dir,
                                     placeholders[*si], buffer),
                                 desc.status));
                     object.memory_segments.push_back(*si);
+                    ++st.memory_replicas;
+                }
+                if (has_disk && object.memory_segments.empty()) {
+                    ++st.disk_only_objects;
                 }
                 st.replicas += object.replicas.size();
                 object.tenant_id = std::move(tenant_id);
@@ -563,10 +682,18 @@ MasterService::RestoreFromHandoffLocked(const std::string& dir,
     }
     ReplicaID max_live_id = 0;
     std::vector<std::vector<RestoredRange>> ranges(nseg);
+    uint64_t memory_replicas = 0;
+    std::unordered_map<UUID, int64_t, boost::hash<UUID>> disk_bytes;
     for (auto& st : states) {
         max_live_id = std::max(max_live_id, st.max_id);
         stats.objects += st.objects;
         stats.replicas += st.replicas;
+        memory_replicas += st.memory_replicas;
+        stats.local_disk_replicas += st.disk_replicas;
+        stats.disk_only_objects += st.disk_only_objects;
+        for (const auto& [client_id, bytes] : st.disk_bytes) {
+            disk_bytes[client_id] += bytes;
+        }
         for (size_t si = 0; si < nseg; ++si) {
             ranges[si].insert(ranges[si].end(), st.ranges[si].begin(),
                               st.ranges[si].end());
@@ -574,7 +701,8 @@ MasterService::RestoreFromHandoffLocked(const std::string& dir,
         st = {};
     }
     if (stats.objects != manifest.object_count ||
-        stats.replicas != manifest.replica_count) {
+        stats.replicas != manifest.replica_count ||
+        stats.local_disk_replicas != manifest.local_disk_replicas) {
         return tl::make_unexpected("object or replica count mismatch");
     }
     if (max_live_id != 0 && max_live_id >= manifest.next_replica_id) {
@@ -663,7 +791,7 @@ MasterService::RestoreFromHandoffLocked(const std::string& dir,
     // Every placeholder buffer must have been replaced by an imported one.
     uint64_t total_swapped = 0;
     for (const uint64_t n : swapped) total_swapped += n;
-    if (total_swapped != stats.replicas) {
+    if (total_swapped != memory_replicas) {
         return tl::make_unexpected("not every restored replica was rebound");
     }
     placeholders.clear();
@@ -684,7 +812,28 @@ MasterService::RestoreFromHandoffLocked(const std::string& dir,
         RebuildTenantQuotaUsageFromMetadata();
     }
     MasterMetricManager::instance().inc_mem_cache_nums(
-        static_cast<int64_t>(stats.objects));
+        static_cast<int64_t>(stats.objects - stats.disk_only_objects));
+    MasterMetricManager::instance().inc_file_cache_nums(
+        static_cast<int64_t>(stats.local_disk_replicas));
+    // L4 registrations: their owners' next offload heartbeat finds them, so
+    // they keep their offloaded files. Their restored LOCAL_DISK replicas
+    // stay unreadable until an RPC with the owner's client id arrives.
+    for (const auto& client : disk_clients) {
+        const auto it = disk_bytes.find(client.client_id);
+        const int64_t used = it == disk_bytes.end() ? 0 : it->second;
+        if (local_ssd_manager_.RestoreHandoffClient(client, used) !=
+            ErrorCode::OK) {
+            return tl::make_unexpected("L4 client already registered");
+        }
+        if (client.total_capacity_bytes > 0) {
+            MasterMetricManager::instance().inc_total_file_capacity(
+                client.total_capacity_bytes);
+        }
+        handoff_disk_gate_.opened.emplace(
+            client.client_id, std::make_unique<std::atomic<bool>>(false));
+    }
+    handoff_disk_gate_.active.store(!handoff_disk_gate_.opened.empty(),
+                                    std::memory_order_release);
     {
         // Each range is held for the rest of the time the old master would
         // have held it, counted from now (the gap only adds to it).
@@ -756,7 +905,8 @@ std::vector<UUID> MasterService::FindHandoffMismatchesLocked(
 }
 
 void MasterService::DropPendingRestoredSegmentLocked(const UUID& segment_id,
-                                                     const char* reason) {
+                                                     const char* reason,
+                                                     const UUID& requester) {
     const auto it = pending_restored_segments_.find(segment_id);
     if (it == pending_restored_segments_.end()) {
         return;
@@ -776,6 +926,22 @@ void MasterService::DropPendingRestoredSegmentLocked(const UUID& segment_id,
         }
     }
     ForgetPendingRestoredSegmentLocked(it);
+    if (requester != pending.owner && HandoffDiskGated(pending.owner)) {
+        // Another store process took over the owner's endpoint: the owner
+        // restarted during the roll, and its disk index is gone with it (the
+        // new process drops its files when it registers its disk tier).
+        // Drop the restored L4 registration; its still unreadable disk
+        // replicas no longer block a new copy of their keys
+        // (EraseUnregisteredOwnerDiskReplica), and the TTL offboarding of
+        // the old client erases the rest.
+        const auto capacity =
+            local_ssd_manager_.UnregisterClient(pending.owner);
+        if (capacity && *capacity > 0) {
+            MasterMetricManager::instance().dec_total_file_capacity(*capacity);
+        }
+        LOG(WARNING) << "handoff_local_disk=dropped, owner=" << pending.owner
+                     << ", reason=" << reason;
+    }
     replica_cleanup_worker_.Schedule();
     handoff_segments_dropped_.fetch_add(1, std::memory_order_relaxed);
     LOG(WARNING) << "handoff_segment=dropped, segment_name="
@@ -893,6 +1059,59 @@ void MasterService::ReleaseExpiredHandoffQuarantine(
         }
     }
     LOG(INFO) << "handoff_quarantine=released, ranges=" << released.size();
+}
+
+// ------------------------------------------------------------- L4 gate
+
+bool MasterService::HandoffDiskGated(const UUID& client_id) const {
+    if (!handoff_disk_gate_.active.load(std::memory_order_acquire)) {
+        return false;
+    }
+    const auto it = handoff_disk_gate_.opened.find(client_id);
+    return it != handoff_disk_gate_.opened.end() &&
+           !it->second->load(std::memory_order_acquire);
+}
+
+void MasterService::OpenHandoffDiskGate(const UUID& client_id) {
+    if (!handoff_disk_gate_.active.load(std::memory_order_acquire)) {
+        return;
+    }
+    const auto it = handoff_disk_gate_.opened.find(client_id);
+    if (it == handoff_disk_gate_.opened.end() ||
+        it->second->exchange(true, std::memory_order_acq_rel)) {
+        return;
+    }
+    LOG(INFO) << "handoff_local_disk=opened, owner=" << client_id;
+}
+
+size_t MasterService::HandoffDiskClientsPending() const {
+    if (!handoff_disk_gate_.active.load(std::memory_order_acquire)) return 0;
+    size_t pending = 0;
+    for (const auto& [client_id, opened] : handoff_disk_gate_.opened) {
+        (void)client_id;
+        if (!opened->load(std::memory_order_acquire)) ++pending;
+    }
+    return pending;
+}
+
+bool MasterService::EraseUnregisteredOwnerDiskReplica(
+    MetadataAccessorRW& accessor, ObjectMetadata& metadata,
+    const UUID& client_id) {
+    const auto stale = [this, &client_id](const Replica& replica) {
+        if (!replica.is_local_disk_replica()) return false;
+        const auto owner = replica.get_local_disk_client_id();
+        return owner && *owner != client_id &&
+               !HasMountedLocalDiskSegment(*owner);
+    };
+    if (!metadata.HasReplica(stale)) return false;
+    const bool had_completed_disk = metadata.HasReplica([](const Replica& r) {
+        return r.is_local_disk_replica() && r.is_completed();
+    });
+    if (EraseReplicasWithCacheTotalAccounting(metadata, stale) == 0) {
+        return false;
+    }
+    accessor.OnDiskReplicaRemoved(had_completed_disk, metadata);
+    return true;
 }
 
 }  // namespace mooncake

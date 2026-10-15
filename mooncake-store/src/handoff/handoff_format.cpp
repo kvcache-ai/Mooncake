@@ -8,6 +8,7 @@
 #include <charconv>
 #include <cstring>
 #include <memory>
+#include <unordered_map>
 #include <unordered_set>
 
 #include <boost/functional/hash.hpp>
@@ -119,6 +120,8 @@ CodecFingerprint CurrentCodecFingerprint() {
     fp.object_entry = struct_pack::get_type_code<StandbyObjectEntry>();
     fp.segments = struct_pack::get_type_code<std::vector<StandbySegmentInfo>>();
     fp.quarantine = struct_pack::get_type_code<std::vector<QuarantineRange>>();
+    fp.local_disk =
+        struct_pack::get_type_code<std::vector<LocalSsdHandoffClient>>();
     return fp;
 }
 
@@ -204,6 +207,9 @@ std::string EncodeManifest(const Manifest& m) {
     codec["object_entry"] = Json::UInt(m.codec.object_entry);
     codec["segments"] = Json::UInt(m.codec.segments);
     codec["quarantine"] = Json::UInt(m.codec.quarantine);
+    if (m.schema_version >= 2) {
+        codec["local_disk"] = Json::UInt(m.codec.local_disk);
+    }
     root["codec"] = codec;
     root["multi_tenant"] = m.multi_tenant;
     root["next_replica_id"] = Json::UInt64(m.next_replica_id);
@@ -222,6 +228,11 @@ std::string EncodeManifest(const Manifest& m) {
     root["segments"] = segments;
     root["quarantine"] = EncodeBlob(m.quarantine);
     root["quarantine_ranges"] = Json::UInt64(m.quarantine_ranges);
+    if (m.schema_version >= 2) {
+        root["local_disk"] = EncodeBlob(m.local_disk.value_or(BlobInfo{}));
+        root["local_disk_clients"] = Json::UInt64(m.local_disk_clients);
+        root["local_disk_replicas"] = Json::UInt64(m.local_disk_replicas);
+    }
     Json::Value w(Json::objectValue);
     w["objects"] = Json::UInt64(m.writer.objects);
     w["replicas"] = Json::UInt64(m.writer.replicas);
@@ -234,6 +245,11 @@ std::string EncodeManifest(const Manifest& m) {
         Json::UInt64(m.writer.dropped_incomplete_replicas);
     w["dropped_unknown_segment_replicas"] =
         Json::UInt64(m.writer.dropped_unknown_segment_replicas);
+    w["local_disk_clients"] = Json::UInt64(m.writer.local_disk_clients);
+    w["local_disk_replicas"] = Json::UInt64(m.writer.local_disk_replicas);
+    w["disk_only_objects"] = Json::UInt64(m.writer.disk_only_objects);
+    w["dropped_local_disk_replicas"] =
+        Json::UInt64(m.writer.dropped_local_disk_replicas);
     w["quarantine_ranges"] = Json::UInt64(m.writer.quarantine_ranges);
     w["quarantine_bytes"] = Json::UInt64(m.writer.quarantine_bytes);
     w["discarded_ranges"] = Json::UInt64(m.writer.discarded_ranges);
@@ -283,7 +299,7 @@ tl::expected<Manifest, std::string> DecodeManifest(std::string_view file) {
         !parse(parts[3], size)) {
         return tl::make_unexpected("manifest header malformed");
     }
-    if (schema != kHandoffSchemaVersion) {
+    if (schema < kHandoffMinSchemaVersion || schema > kHandoffSchemaVersion) {
         return tl::make_unexpected("unsupported handoff schema " +
                                    std::to_string(schema));
     }
@@ -335,6 +351,20 @@ tl::expected<Manifest, std::string> DecodeManifest(std::string_view file) {
     m.codec.segments = codec["segments"].asUInt();
     m.codec.quarantine = codec["quarantine"].asUInt();
     m.multi_tenant = root["multi_tenant"].asBool();
+    if (m.schema_version >= 2) {
+        BlobInfo local_disk;
+        if (!codec["local_disk"].isUInt() ||
+            !DecodeBlob(root["local_disk"], local_disk) ||
+            !GetU64(root, "local_disk_clients", m.local_disk_clients) ||
+            !GetU64(root, "local_disk_replicas", m.local_disk_replicas)) {
+            return tl::make_unexpected("manifest field missing or mistyped");
+        }
+        m.codec.local_disk = codec["local_disk"].asUInt();
+        m.local_disk = std::move(local_disk);
+    } else {
+        // Schema 1 has no L4 file; nothing to check its layout against.
+        m.codec.local_disk = CurrentCodecFingerprint().local_disk;
+    }
     for (const auto& v : root["segments"]) {
         SegmentAttributes s;
         std::string status;
@@ -358,6 +388,11 @@ tl::expected<Manifest, std::string> DecodeManifest(std::string_view file) {
                m.writer.dropped_incomplete_replicas);
         GetU64(w, "dropped_unknown_segment_replicas",
                m.writer.dropped_unknown_segment_replicas);
+        GetU64(w, "local_disk_clients", m.writer.local_disk_clients);
+        GetU64(w, "local_disk_replicas", m.writer.local_disk_replicas);
+        GetU64(w, "disk_only_objects", m.writer.disk_only_objects);
+        GetU64(w, "dropped_local_disk_replicas",
+               m.writer.dropped_local_disk_replicas);
         GetU64(w, "quarantine_ranges", m.writer.quarantine_ranges);
         GetU64(w, "quarantine_bytes", m.writer.quarantine_bytes);
         GetU64(w, "discarded_ranges", m.writer.discarded_ranges);
@@ -369,6 +404,20 @@ tl::expected<Manifest, std::string> DecodeManifest(std::string_view file) {
         GetU64(w, "peak_rss_kib", m.writer.peak_rss_kib);
     }
     return m;
+}
+
+std::vector<uint8_t> EncodeLocalDiskClients(
+    const std::vector<LocalSsdHandoffClient>& clients) {
+    return struct_pack::serialize<std::vector<uint8_t>>(clients);
+}
+
+tl::expected<std::vector<LocalSsdHandoffClient>, std::string>
+DecodeLocalDiskClients(const std::vector<uint8_t>& bytes) {
+    std::vector<LocalSsdHandoffClient> clients;
+    if (struct_pack::deserialize_to(clients, bytes) != struct_pack::errc::ok) {
+        return tl::make_unexpected("local disk clients decode failed");
+    }
+    return clients;
 }
 
 std::vector<uint8_t> EncodeQuarantine(
@@ -524,6 +573,38 @@ tl::expected<SnapshotContents, std::string> ReadSnapshot(
         contents.quarantine = std::move(*decoded);
         if (contents.quarantine.size() != manifest.quarantine_ranges) {
             return tl::make_unexpected("quarantine range count mismatch");
+        }
+    }
+    if (manifest.local_disk) {
+        auto bytes =
+            read_blob(manifest.local_disk->key, manifest.local_disk->bytes,
+                      manifest.local_disk->crc32c);
+        if (!bytes) return tl::make_unexpected(bytes.error());
+        auto decoded = DecodeLocalDiskClients(*bytes);
+        if (!decoded) return tl::make_unexpected(decoded.error());
+        contents.local_disk_clients = std::move(*decoded);
+        if (contents.local_disk_clients.size() != manifest.local_disk_clients) {
+            return tl::make_unexpected("local disk client count mismatch");
+        }
+    }
+    if (manifest.local_disk_replicas > 0 &&
+        contents.local_disk_clients.empty()) {
+        return tl::make_unexpected("LOCAL_DISK replicas without owners");
+    }
+    {
+        // Each carried registration belongs to the owner of a restored
+        // segment (its liveness record is the one the segments get), once.
+        std::unordered_map<UUID, bool, boost::hash<UUID>> owners;
+        for (const auto& segment : segments) {
+            owners.emplace(segment.Owner(), false);
+        }
+        for (const auto& client : contents.local_disk_clients) {
+            const auto it = owners.find(client.client_id);
+            if (client.client_id == UUID{0, 0} || it == owners.end() ||
+                it->second || client.total_capacity_bytes < 0) {
+                return tl::make_unexpected("invalid local disk client entry");
+            }
+            it->second = true;
         }
     }
     const SegmentLocator locator(segments);
