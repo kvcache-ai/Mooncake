@@ -11,9 +11,9 @@
 // affinity so a better memory replica can be picked.
 //
 // Design constraints:
-//   * Disabled by default — behaviour is byte-identical to the historical
-//     "first remote MEMORY" pick unless the operator sets
-//     MC_STORE_REPLICA_SCORING=1, injects a scorer or supplies HCA hints.
+//   * Remote protocol scoring is opt-in via MC_STORE_REPLICA_SCORING=1 or an
+//     injected scorer. HCA hints rank affinity tiers, but tied tiers preserve
+//     the historical "first remote MEMORY" pick when scoring is disabled.
 //   * This layer only sees what a replica descriptor carries (endpoint,
 //     protocol, storage locality). Richer signals (NIC role, NUMA distance,
 //     live load) live in
