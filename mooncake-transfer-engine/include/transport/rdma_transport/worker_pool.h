@@ -69,6 +69,7 @@ class WorkerPool {
     std::optional<int> progressHandshake(
         int thread_id, const std::string &peer_nic_path,
         const std::shared_ptr<RdmaEndPoint> &endpoint);
+    void reapCompletedHandshakes(int thread_id);
 
     void performPostSend(int thread_id);
 

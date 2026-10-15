@@ -283,6 +283,38 @@ std::optional<int> WorkerPool::progressHandshake(
     return ret;
 }
 
+void WorkerPool::reapCompletedHandshakes(int thread_id) {
+    auto &pending = pending_handshakes_[thread_id];
+    if (pending.empty()) return;
+    auto &local_queue = collective_slice_queue_[thread_id];
+    std::lock_guard<std::mutex> lock(worker_slice_queue_lock_[thread_id]);
+    auto &shared_queue = worker_slice_queue_[thread_id];
+    for (auto it = pending.begin(); it != pending.end();) {
+        auto local_it = local_queue.find(it->first);
+        auto shared_it = shared_queue.find(it->first);
+        const bool has_queued_slices =
+            (local_it != local_queue.end() && !local_it->second.empty()) ||
+            (shared_it != shared_queue.end() && !shared_it->second.empty());
+        if (has_queued_slices ||
+            it->second.result.wait_for(std::chrono::seconds(0)) !=
+                std::future_status::ready) {
+            ++it;
+            continue;
+        }
+
+        try {
+            it->second.result.get();
+        } catch (const std::exception &ex) {
+            LOG(ERROR) << "Worker: Abandoned active endpoint setup threw: "
+                       << ex.what();
+        } catch (...) {
+            LOG(ERROR) << "Worker: Abandoned active endpoint setup threw an "
+                          "unknown exception";
+        }
+        it = pending.erase(it);
+    }
+}
+
 int WorkerPool::submitPostSend(
     const std::vector<Transport::Slice *> &slice_list) {
 #ifdef CONFIG_CACHE_SEGMENT_DESC
@@ -650,38 +682,51 @@ void WorkerPool::performPostSend(int thread_id) {
         }
         auto endpoint_lifecycle_lock =
             context_.lockEndpointLifecycle(entry.first);
+        std::shared_ptr<RdmaEndPoint> endpoint;
+        std::optional<int> handshake_result;
+        if (pending_it != pending.end()) {
+            // Consume the result for the endpoint that actually performed the
+            // handshake before endpoint() can insert a replacement and evict
+            // another completed setup from the bounded endpoint store.
+            endpoint = pending_it->second.endpoint;
+            handshake_result =
+                progressHandshake(thread_id, entry.first, endpoint);
+        } else {
 #ifdef CONFIG_CACHE_ENDPOINT
-        auto &endpoint = endpoint_map[entry.first];
-        if (endpoint == nullptr || !endpoint->active())
+            auto &cached_endpoint = endpoint_map[entry.first];
+            if (cached_endpoint == nullptr || !cached_endpoint->active())
+                cached_endpoint = context_.endpoint(
+                    entry.first, cqIndexForPostingThread(thread_id));
+            endpoint = cached_endpoint;
+#else
             endpoint = context_.endpoint(entry.first,
                                          cqIndexForPostingThread(thread_id));
-#else
-        auto endpoint =
-            context_.endpoint(entry.first, cqIndexForPostingThread(thread_id));
 #endif
+        }
         if (!endpoint) {
             for (auto &slice : entry.second) failed_slice_list.push_back(slice);
             entry.second.clear();
             continue;
         }
-        if (!endpoint->connected() || pending.count(entry.first)) {
-            auto result = progressHandshake(thread_id, entry.first, endpoint);
-            if (!result) {
-                // Keep this peer's slices queued, but do not hold up other
-                // peers owned by the same worker. The normal worker loop will
-                // also continue polling this owner's CQ.
-                continue;
-            }
+        if (!handshake_result && !endpoint->connected()) {
+            // Neither the active RPC nor its wait may hold this gate: passive
+            // setup needs it to make simultaneous-open progress.
+            endpoint_lifecycle_lock.unlock();
+            progressHandshake(thread_id, entry.first, endpoint);
+            continue;
+        }
+        if (handshake_result) {
             auto setup_result = ActiveEndpointSetupResult{
-                *result, context_.findEndpoint(entry.first) == endpoint &&
-                             endpoint->active() && !endpoint->retired()};
+                *handshake_result,
+                context_.findEndpoint(entry.first) == endpoint &&
+                    endpoint->active() && !endpoint->retired()};
             if (!setup_result.endpoint_current) {
                 LOG(WARNING)
                     << "Worker: Endpoint changed while active handshake was "
                        "outstanding: "
                     << entry.first << ", retrying queued slices";
 #ifdef CONFIG_CACHE_ENDPOINT
-                endpoint.reset();
+                endpoint_map[entry.first].reset();
 #endif
                 for (auto &slice : entry.second)
                     failed_slice_list.push_back(slice);
@@ -1222,6 +1267,7 @@ void WorkerPool::transferWorker(int thread_id) {
         globalConfig().rdma_worker_idle_spin_us * 1000;
     uint64_t last_wait_ts = getCurrentTimeInNano();
     while (workers_running_.load(std::memory_order_relaxed)) {
+        reapCompletedHandshakes(thread_id);
         auto processed_slice_count =
             processed_slice_count_.load(std::memory_order_relaxed);
         auto submitted_slice_count =
