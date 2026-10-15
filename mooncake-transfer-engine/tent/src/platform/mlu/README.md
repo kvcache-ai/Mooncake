@@ -1,8 +1,7 @@
 # Native MLU support in TENT
 
 Build TENT with `USE_MLU=ON` to select `MluPlatform` and enable the `mlu`
-transport. Neuware headers, `libcnrt`, and `libcndrv` are required. This uses the
-native SDK and does not require PyTorch or `torch_mlu`.
+transport. Neuware headers, `libcnrt`, and `libcndrv` are required.
 
 From the repository root, with the normal Mooncake build dependencies installed:
 
@@ -16,9 +15,9 @@ ctest --test-dir build-mlu --output-on-failure -R '^tent_mlu_.*_test$'
 ```
 
 Use `mlu:N` for a visible device ordinal (`mlu` means device 0), or `cpu:N`
-for host memory. Existing device allocations can be registered without copying
-ownership to the engine. Pointer classification and allocation bounds come from
-Neuware, including interior pointers used by chunked transfers. Keep allocations
+for host memory. Applications retain ownership of registered device allocations.
+Pointer classification and allocation bounds come from Neuware, including
+interior pointers used by chunked transfers. Keep allocations
 alive until transfers finish, and synchronize producer work before submitting a
 transfer that reads its output.
 
@@ -70,6 +69,7 @@ The tests cover real SDK allocations, fresh worker threads, interior pointers,
 out-of-bounds rejection, transport routing, and READ/WRITE payload equality.
 The engine suite covers TCP/HP TCP, legacy/policy selection, and runtime queues.
 The process suite starts a second executable with independent allocations and
-passes payloads through loopback TCP; test pipes carry only commands and metadata.
+passes payloads through loopback TCP/HP TCP; test pipes carry only commands
+and metadata.
 Run it on each supported SDK/device combination. Single-host success does not
 establish multi-host bandwidth or RDMA support.
