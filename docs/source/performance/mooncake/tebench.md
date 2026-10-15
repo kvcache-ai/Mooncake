@@ -422,7 +422,8 @@ hotspot routing, and arbitrary custom target plans remain outside this
 launcher's scope.
 
 Every host must provide Bash and `setsid`, and the same absolute `tebench` path
-must exist on each host. SSH public-key authentication and host-key verification
+must exist on each host. The launcher host also needs Python 3 to combine
+results. SSH public-key authentication and host-key verification
 must already be configured. Use the literal host name `local` for a role that
 should run without SSH.
 
@@ -465,6 +466,13 @@ target ranges used by the performance run without relying on application data.
 Use `--dry-run` to validate topology expansion, target lists, thread counts,
 and range assignments without connecting to any host. Each run stores logs and
 per-target JSONL files under a new local `tebench-multinode-*` directory.
+The directory also contains `results.json`, a single JSON object with
+`schema_version`, `run_id`, `topology`, `backend`, and a `results` array.
+Each entry identifies the `host`, `phase`, `initiator_index`, and `exit_code`,
+and includes the original JSONL objects in `records`, preserving all per-target
+metrics. Failed runs include available records; an unavailable exit code is
+`null`. Invalid JSON causes collection to fail instead of publishing a partial
+summary. Original logs and JSONL files are retained.
 An existing run directory is rejected; use a new `--run-id` when rerunning with
 `--keep-remote`.
 

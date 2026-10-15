@@ -24,7 +24,7 @@ REMOTE_DIR="/tmp/mooncake-tebench-${RUN_ID}"
 
 cleanup() {
     rm -rf "$TEST_DIR" "$REMOTE_DIR" "${REMOTE_DIR}-failure" \
-        "${REMOTE_DIR}-timeout"
+        "${REMOTE_DIR}-timeout" "${REMOTE_DIR}-invalid-json"
 }
 trap cleanup EXIT
 
@@ -91,6 +91,7 @@ operation=""
 result_file=""
 mock_pid_file=""
 mock_exit_code=0
+mock_invalid_json=0
 for arg in "$@"; do
     case "$arg" in
         --target_seg_name=*) target_segment="${arg#*=}" ;;
@@ -98,6 +99,7 @@ for arg in "$@"; do
         --result_output_jsonl=*) result_file="${arg#*=}" ;;
         --mock_pid_file=*) mock_pid_file="${arg#*=}" ;;
         --mock_exit_code=*) mock_exit_code="${arg#*=}" ;;
+        --mock_invalid_json=*) mock_invalid_json="${arg#*=}" ;;
     esac
 done
 
@@ -114,9 +116,15 @@ if [[ -n "$mock_pid_file" ]]; then
 fi
 
 [[ "$mock_exit_code" -eq 0 ]] || exit "$mock_exit_code"
+if [[ "$mock_invalid_json" -eq 1 ]]; then
+    printf 'invalid json\n' >"$result_file"
+    exit 0
+fi
 echo "operation=$operation target=$target_segment"
 printf '{"operation":"%s","target":"%s"}\n' \
     "$operation" "$target_segment" >"$result_file"
+printf '{"operation":"%s","target":"%s","case":2}\n' \
+    "$operation" "$target_segment" >>"$result_file"
 MOCK
 chmod +x "$MOCK_TEBENCH"
 
@@ -152,6 +160,29 @@ grep -Fq '"operation":"read_verify"' \
     "$RESULT_DIR/local/verify-initiator-0.jsonl"
 test ! -e "$REMOTE_DIR"
 
+python3 - "$RESULT_DIR" "$RUN_ID" <<'PYTHON'
+import json
+import sys
+from pathlib import Path
+
+result_dir = Path(sys.argv[1])
+summary = json.loads((result_dir / "results.json").read_text())
+assert summary["schema_version"] == 1
+assert summary["run_id"] == sys.argv[2]
+assert summary["topology"] == "m2n"
+assert summary["backend"] == "tent"
+assert len(summary["results"]) == 2
+for result, phase in zip(summary["results"], ["seed", "verify"]):
+    assert result["host"] == "local"
+    assert result["phase"] == phase
+    assert result["initiator_index"] == 0
+    assert result["exit_code"] == 0
+    path = result_dir / "local" / (phase + "-initiator-0.jsonl")
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    assert result["records"] == records
+    assert len(records) == 2
+PYTHON
+
 mkdir "$REMOTE_DIR"
 printf 'existing run\n' >"$REMOTE_DIR/marker"
 if "$SCRIPT_PATH" --run-id="$RUN_ID" --topology=m2n \
@@ -181,6 +212,30 @@ test "$(cat "$TEST_DIR/failure-results/local/seed-initiator-0.rc")" = 7
 test -f "$TEST_DIR/failure-results/local/target-0.log"
 test ! -e "$TEST_DIR/failure-results/local/verify.start"
 test ! -e "${REMOTE_DIR}-failure"
+python3 - "$TEST_DIR/failure-results/results.json" <<'PYTHON'
+import json
+import sys
+
+results = json.load(open(sys.argv[1]))["results"]
+assert len(results) == 1
+assert results[0]["phase"] == "seed"
+assert results[0]["exit_code"] == 7
+assert results[0]["records"] == []
+PYTHON
+
+if "$SCRIPT_PATH" --run-id="${RUN_ID}-invalid-json" --topology=m2n \
+    --targets=local --initiators=local --tebench="$MOCK_TEBENCH" \
+    --duration=1 --total-buffer-size=4096 \
+    --initiator-arg=--mock_invalid_json=1 \
+    --result-dir="$TEST_DIR/invalid-json-results" \
+    >"$TEST_DIR/invalid-json.log" 2>&1; then
+    echo "invalid JSON result unexpectedly succeeded" >&2
+    exit 1
+fi
+test -f "$TEST_DIR/invalid-json-results/local/benchmark-initiator-0.jsonl"
+test ! -e "$TEST_DIR/invalid-json-results/results.json"
+test ! -e "$TEST_DIR/invalid-json-results/results.json.tmp"
+test ! -e "${REMOTE_DIR}-invalid-json"
 
 TIMEOUT_RUN_ID="${RUN_ID}-timeout"
 MOCK_PID_FILE="$TEST_DIR/mock-initiator.pid"
@@ -198,3 +253,13 @@ if kill -0 "$(cat "$MOCK_PID_FILE")" 2>/dev/null; then
     exit 1
 fi
 test ! -e "/tmp/mooncake-tebench-${TIMEOUT_RUN_ID}"
+python3 - "$TEST_DIR/timeout-results/results.json" <<'PYTHON'
+import json
+import sys
+
+results = json.load(open(sys.argv[1]))["results"]
+assert len(results) == 1
+assert results[0]["phase"] == "benchmark"
+assert results[0]["exit_code"] is None
+assert results[0]["records"] == []
+PYTHON

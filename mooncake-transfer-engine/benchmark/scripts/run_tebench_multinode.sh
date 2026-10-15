@@ -108,7 +108,8 @@ Orchestration:
 
 Use the literal host name "local" to run a role without SSH. Host names must
 be unique within each list. The script assumes tebench already exists at the
-same path on every selected host.
+same path on every selected host. Python 3 is required on the launcher host
+to combine process results into results.json.
 EOF
 }
 
@@ -329,6 +330,7 @@ RESULT_DIR="${RESULT_DIR:-$PWD/tebench-multinode-${RUN_ID}}"
 
 if [[ "$DRY_RUN" -eq 0 ]]; then
     [[ "$TEBENCH" == /* ]] || die "--tebench must be an absolute path"
+    command -v python3 >/dev/null || die "python3 is required on the launcher host"
 fi
 
 SEGMENTS=()
@@ -507,6 +509,64 @@ REMOTE_ARCHIVE
     return "$failed"
 }
 
+aggregate_results() {
+    python3 - "$RESULT_DIR" "$RUN_ID" "$TOPOLOGY" "$BACKEND" \
+        "${PROCESS_HOSTS[@]}" "${PROCESS_PIDFILES[@]}" <<'PYTHON'
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+result_dir, run_id, topology, backend = sys.argv[1:5]
+count = (len(sys.argv) - 5) // 2
+hosts = sys.argv[5:5 + count]
+pidfiles = sys.argv[5 + count:]
+results = []
+for host, pidfile in zip(hosts, pidfiles):
+    name = Path(pidfile).stem
+    if "-initiator-" not in name:
+        continue
+    phase, index = name.rsplit("-initiator-", 1)
+    directory = Path(result_dir) / re.sub(r"[^A-Za-z0-9._-]", "_", host)
+    record_file = directory / (name + ".jsonl")
+    rc_file = directory / (name + ".rc")
+    records = []
+    if record_file.exists():
+        with record_file.open() as source:
+            for line in source:
+                if line.strip():
+                    record = json.loads(line)
+                    if not isinstance(record, dict):
+                        raise ValueError("Expected a JSON object in " + str(record_file))
+                    records.append(record)
+    results.append({
+        "host": host,
+        "phase": phase,
+        "initiator_index": int(index),
+        "exit_code": int(rc_file.read_text()) if rc_file.exists() else None,
+        "records": records,
+    })
+
+output = Path(result_dir) / "results.json"
+temporary = output.with_suffix(".json.tmp")
+try:
+    with temporary.open("w") as destination:
+        json.dump({
+            "schema_version": 1,
+            "run_id": run_id,
+            "topology": topology,
+            "backend": backend,
+            "results": results,
+        }, destination, indent=2, allow_nan=False)
+        destination.write("\n")
+    os.replace(temporary, output)
+finally:
+    if temporary.exists():
+        temporary.unlink()
+PYTHON
+}
+
 remove_remote_dirs() {
     [[ "$KEEP_REMOTE" -eq 0 ]] || return 0
     local host
@@ -534,6 +594,7 @@ cleanup() {
             "${PROCESS_PIDFILES[$i]}" || cleanup_failed=1
     done
     collect_artifacts || cleanup_failed=1
+    aggregate_results || cleanup_failed=1
     remove_remote_dirs || cleanup_failed=1
     if [[ "$rc" -eq 0 && "$cleanup_failed" -ne 0 ]]; then
         rc=1
