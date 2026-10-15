@@ -906,9 +906,10 @@ std::vector<TransportType> TransferEngineImpl::getSupportedTransports(
     }
     if (transport_list_[MNNVL]) result.push_back(MNNVL);
     if (transport_list_[NVLINK]) result.push_back(NVLINK);
-    // Prefer the local XPU copy over TCP's device-copy fallback. XPU does
-    // not advertise host-to-host capability, so host network order is intact.
+    // Prefer XPU/MLU local copies over TCP's device-copy fallback. Neither
+    // advertises host-to-host capability, so host network order is intact.
     if (transport_list_[XPU]) result.push_back(XPU);
+    if (transport_list_[MLU]) result.push_back(MLU);
     if (transport_list_[RDMA]) result.push_back(RDMA);
     if (transport_list_[FABRIC]) result.push_back(FABRIC);
     if (transport_list_[SUNRISE_LINK]) result.push_back(SUNRISE_LINK);
@@ -958,6 +959,9 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
         // NUMA probe: skip prefault if warm-up already pinned pages
         auto entries = Platform::getLoader().getLocation(
             addr_list[i], size_list[i], pages_pinned);
+        if (entries.empty())
+            return Status::InvalidArgument(
+                "Unable to locate registered memory range" LOC_MARK);
         if (entries.size() == 1) {
             desc.location = entries[0].location;
         } else {
@@ -1455,6 +1459,7 @@ static MemoryType getTypeEnum(const std::string& type) {
     if (isAmdGpuLocationType(type)) return MTYPE_ROCM;
     if (type == "tpu") return MTYPE_TPU;
     if (type == "xpu") return MTYPE_XPU;
+    if (type == "mlu") return MTYPE_MLU;
     return MTYPE_UNKNOWN;
 }
 
@@ -1492,32 +1497,33 @@ SelectionResult TransferEngineImpl::getTransportType(const Request& request,
 
     const TransportType hint = request.transport_hint;
 
-    // XPU has no direct peer-memory path. Plan staging before requiring a
-    // direct device route: HP TCP (and non-GDR RDMA) only advertises DRAM
-    // capability. Keep the original memory types for policy matching.
-    std::vector<std::string> xpu_staging_params;
+    // Plan XPU/MLU staging before selecting a host-only network transport.
+    // Keep the original memory types for policy matching.
+    std::vector<std::string> host_staging_params;
     std::vector<TransportType> staging_transports;
     if (desc->type == SegmentType::Memory &&
-        request.target_id != LOCAL_SEGMENT_ID && transport_list_[XPU]) {
+        request.target_id != LOCAL_SEGMENT_ID) {
         auto* entry = desc->findBuffer(request.target_offset, request.length);
         if (!entry) return SelectionResult{};
         auto remote_mtype = getTypeEnum(LocationParser(entry->location).type());
-        if (local_mtype == MTYPE_XPU || remote_mtype == MTYPE_XPU) {
-            findStagingPolicy(request, xpu_staging_params);
-            if (xpu_staging_params.empty()) return SelectionResult{};
+        if ((transport_list_[XPU] &&
+             (local_mtype == MTYPE_XPU || remote_mtype == MTYPE_XPU)) ||
+            local_mtype == MTYPE_MLU || remote_mtype == MTYPE_MLU) {
+            findStagingPolicy(request, host_staging_params);
+            if (host_staging_params.empty()) return SelectionResult{};
             // A staged side is replaced by a freshly registered host stage
             // buffer, so its own tags are irrelevant. An unstaged host buffer
             // on either side is used as-is and must already carry the
             // network transport.
             const BufferDesc* local_entry = nullptr;
-            if (xpu_staging_params[1].empty()) {
+            if (host_staging_params[1].empty()) {
                 auto local_desc = metadata_->segmentManager().getLocal();
                 if (local_desc)
                     local_entry = local_desc->findBuffer(
                         (uint64_t)request.source, request.length);
             }
             const BufferDesc* remote_entry =
-                xpu_staging_params[2].empty() ? entry : nullptr;
+                host_staging_params[2].empty() ? entry : nullptr;
             auto carries = [](const BufferDesc* buffer, TransportType type) {
                 return !buffer || std::find(buffer->transports.begin(),
                                             buffer->transports.end(),
@@ -1531,7 +1537,7 @@ SelectionResult TransferEngineImpl::getTransportType(const Request& request,
             }
         }
     }
-    const bool xpu_staging = !xpu_staging_params.empty();
+    const bool host_staging = !host_staging_params.empty();
 
     // Legacy mode: use original logic (before TransportSelector)
     if (transport_selector_ && transport_selector_->isLegacyMode() &&
@@ -1557,20 +1563,20 @@ SelectionResult TransferEngineImpl::getTransportType(const Request& request,
                 auto remote_mtype =
                     getTypeEnum(LocationParser(entry->location).type());
                 const auto& candidates =
-                    xpu_staging ? staging_transports : entry->transports;
+                    host_staging ? staging_transports : entry->transports;
                 for (auto type : candidates) {
-                    // NVLINK/SHM are same-machine only; TPU and Intel XPU are
-                    // local-stage-only executors and must never carry a remote
-                    // hop.
-                    if (type == XPU && request.target_id != LOCAL_SEGMENT_ID)
+                    // XPU/MLU require the local segment. NVLINK/SHM/TPU
+                    // require both segments to be on the same machine.
+                    if ((type == XPU || type == MLU) &&
+                        request.target_id != LOCAL_SEGMENT_ID)
                         continue;
                     if ((type == NVLINK || type == SHM || type == TPU) &&
                         !same_machine)
                         continue;
                     if (checkAvailability(
                             transport_list_[type],
-                            xpu_staging ? MTYPE_CPU : local_mtype,
-                            xpu_staging ? MTYPE_CPU : remote_mtype)) {
+                            host_staging ? MTYPE_CPU : local_mtype,
+                            host_staging ? MTYPE_CPU : remote_mtype)) {
                         raw.push_back(type);
                     }
                 }
@@ -1584,7 +1590,7 @@ SelectionResult TransferEngineImpl::getTransportType(const Request& request,
         if (transport_index >= 0 &&
             (size_t)transport_index < candidates->size()) {
             result.transport = (*candidates)[transport_index];
-            result.staging_params = std::move(xpu_staging_params);
+            result.staging_params = std::move(host_staging_params);
         }
         return result;
     }
@@ -1598,7 +1604,7 @@ SelectionResult TransferEngineImpl::getTransportType(const Request& request,
     ctx.policy_name = request.policy_name;  // Optional: bind to specific policy
     ctx.intent_type = request.intent_type;  // Business intent policy filter
     ctx.local_segment = request.target_id == LOCAL_SEGMENT_ID;
-    ctx.host_staging = xpu_staging;
+    ctx.host_staging = host_staging;
 
     if (desc->type == SegmentType::File) {
         // File segment: use selector with empty buffer_transports
@@ -1621,13 +1627,13 @@ SelectionResult TransferEngineImpl::getTransportType(const Request& request,
         ctx.local_memory_type = local_mtype;
         ctx.remote_memory_type = remote_mtype;
         ctx.buffer_transports =
-            xpu_staging ? &staging_transports : &entry->transports;
+            host_staging ? &staging_transports : &entry->transports;
     }
 
     auto result = transport_selector_->select(ctx, transport_list_,
                                               transport_index, hint);
     if (result.transport != UNSPEC)
-        result.staging_params = std::move(xpu_staging_params);
+        result.staging_params = std::move(host_staging_params);
     return result;
 }
 
@@ -1911,8 +1917,10 @@ void TransferEngineImpl::findStagingPolicy(const Request& request,
         });
 
     if (!status.ok()) return;
-    auto local =
-        Platform::getLoader().getLocation(request.source, 1)[0].location;
+    policy.clear();
+    auto locations = Platform::getLoader().getLocation(request.source, 1);
+    if (locations.empty()) return;
+    auto local = locations[0].location;
     auto remote = entry->location;
     auto local_mtype = getTypeEnum(LocationParser(local).type());
     auto remote_mtype = getTypeEnum(LocationParser(remote).type());
@@ -1991,20 +1999,14 @@ void TransferEngineImpl::findStagingPolicy(const Request& request,
             policy.push_back(desc->getMemory().topology.findNearMem(remote));
         }
     }
-    // case 4: Intel XPU. VRAM is not NIC-addressable, so any hop touching XPU
-    // memory is staged through host DRAM: XpuTransport performs the local
-    // VRAM<->host copy (via the SYCL backend) and the host<->host hop is
-    // carried by whatever host-DRAM network transport is present. We gate on
-    // RDMA/TCP/HP_TCP (the cross stage is routed by capability, so TCP is
-    // selected when RDMA is absent) and require XpuTransport (the local
-    // VRAM<->host executor), mirroring how the CUDA cases gate on NVLINK.
-    // Every device side is staged, including a mixed CUDA/ROCm/TPU peer whose
-    // direct-DMA capability is unknown here; a host DRAM side is not (empty
-    // stage location). A device side without a host DRAM stage location in
-    // its topology leaves the policy empty so the request fails closed rather
-    // than handing VRAM to a host-only transport.
-    if ((local_mtype == MTYPE_XPU || remote_mtype == MTYPE_XPU) &&
-        transport_list_[XPU] &&
+    // XPU and MLU stage device memory through host DRAM. The local device
+    // needs its copy transport; a host-only caller can delegate a peer's MLU
+    // copy to that peer. Each device side needs a resolvable host stage. Fail
+    // closed when topology or the local copy transport is unavailable.
+    if (((transport_list_[XPU] &&
+          (local_mtype == MTYPE_XPU || remote_mtype == MTYPE_XPU)) ||
+         ((local_mtype == MTYPE_MLU || remote_mtype == MTYPE_MLU) &&
+          (local_mtype != MTYPE_MLU || transport_list_[MLU]))) &&
         (transport_list_[RDMA] || transport_list_[FABRIC] ||
          transport_list_[TCP] || transport_list_[HP_TCP])) {
         std::string local_stage, remote_stage;
@@ -2950,7 +2952,7 @@ Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {
             << ", generation " << task.runtime_policy.config_generation << ")";
     TENT_RECORD_TRANSPORT_FAILOVER(prev_type, type);
 
-    // A failed XPU staging operation must never fall through to submitting
+    // A failed device staging operation must never fall through to submitting
     // the original VRAM addresses to a host-only network transport.
     if (!result.staging_params.empty()) {
         task.type = type;

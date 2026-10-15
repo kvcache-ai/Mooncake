@@ -50,6 +50,10 @@
 #include "tent/transport/tpu/tpu_transport.h"
 #endif
 
+#ifdef USE_MLU
+#include "tent/transport/mlu/mlu_transport.h"
+#endif
+
 #ifdef USE_XPU
 #include "tent/transport/xpu/xpu_transport.h"
 #endif
@@ -134,6 +138,11 @@ Status TransferEngineImpl::loadTransports() {
 #ifdef USE_TPU
     if (conf_->get("transports/tpu/enable", true))
         transport_list_[TPU] = std::make_shared<TpuTransport>();
+#endif
+
+#ifdef USE_MLU
+    if (conf_->get("transports/mlu/enable", true))
+        transport_list_[MLU] = std::make_shared<MluTransport>();
 #endif
 
 #ifdef USE_XPU

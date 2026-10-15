@@ -116,6 +116,7 @@ typedef struct tent_notifi_info tent_notifi_info;
 #define TRANSPORT_XPU (14)
 #define TRANSPORT_HYLINK (15)
 #define TRANSPORT_FABRIC (16)
+#define TRANSPORT_MLU (17)
 
 struct tent_memory_options {
     char location[64];

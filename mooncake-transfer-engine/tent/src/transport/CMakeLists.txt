@@ -11,6 +11,7 @@ add_subdirectory(ascend)
 add_subdirectory(sunrise_link)
 add_subdirectory(tpu)
 add_subdirectory(xpu)
+add_subdirectory(mlu)
 add_subdirectory(ub)
 add_subdirectory(mpcomm)
 add_subdirectory(hylink)
@@ -33,6 +34,7 @@ foreach(
   tent_xport_sunrise_link
   tent_xport_tpu
   tent_xport_xpu
+  tent_xport_mlu
   tent_xport_mpcomm
   tent_xport_hylink
   tent_xport_fabric)
