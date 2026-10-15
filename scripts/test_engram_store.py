@@ -28,13 +28,13 @@ import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BUILD_DIR = os.environ.get("MOONCAKE_BUILD_DIR", "build")
-BUILD_STORE = REPO_ROOT / BUILD_DIR / "mooncake-integration"
-WHEEL_DIR = REPO_ROOT / "mooncake-wheel"
 MASTER_BINARY = REPO_ROOT / BUILD_DIR / "mooncake-store" / "src" / "mooncake_master"
 
-for path in (BUILD_STORE, WHEEL_DIR):
-    if path.is_dir() and str(path) not in sys.path:
-        sys.path.insert(0, str(path))
+if not os.environ.get("MOONCAKE_PYTHON_BIN"):
+    raise RuntimeError("MOONCAKE_PYTHON_BIN must identify the root-wheel virtualenv")
+if Path(sys.executable).resolve() != Path(os.environ["MOONCAKE_PYTHON_BIN"]).resolve():
+    raise RuntimeError("run this test with the interpreter in MOONCAKE_PYTHON_BIN")
+os.environ["MOONCAKE_STORE_BACKEND"] = "cpp"
 
 from mooncake.mooncake_config import MooncakeConfig  # noqa: E402
 
@@ -47,14 +47,9 @@ MASTER_LOG_FILE = None
 
 
 def import_store_module():
-    if not BUILD_STORE.is_dir():
-        raise ImportError(
-            f"{BUILD_STORE} not found. Build Mooncake with store support: "
-            "cd build && cmake .. -DWITH_STORE=ON && make -j 128"
-        )
-
-    store_module = importlib.import_module("store")
-    print(f"✅ store.so imported successfully from {BUILD_STORE}")
+    store_module = importlib.import_module("mooncake.store")
+    cpp_module = importlib.import_module("mooncake._store")
+    print(f"✅ C++ Store facade loaded from {cpp_module.__file__}")
     return store_module
 
 

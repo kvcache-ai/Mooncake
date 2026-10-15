@@ -20,6 +20,19 @@ For Transfer Engine metadata, use the `P2PHANDSHAKE` connection string for
 decentralized peer discovery, enable the master's embedded HTTP metadata
 server, or provide an external metadata service.
 
+## Backend Selection
+
+The Python facade in mooncake.store uses the C++ Store when
+MOONCAKE_STORE_BACKEND is unset or set to cpp. A root wheel built with Store-RS
+enabled also supports rs. The setting is read when mooncake.store is first
+imported and accepts cpp or rs.
+
+This page describes the shared facade and the default C++ backend. See the
+[Store-RS Python API](store-rs.md) for backend-specific runtime behavior, API
+coverage, and compatibility notes. The
+[source-checkout quickstart](../../getting_started/store-rs.md) shows how to
+build the root wheel with Store-RS enabled.
+
 ## Quick Start
 
 ### Start Master (with HTTP enabled)
