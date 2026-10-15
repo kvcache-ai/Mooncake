@@ -792,6 +792,9 @@ class MasterService {
         const std::vector<StorageObjectMetadata>& metadatas)
         -> tl::expected<void, ErrorCode>;
 
+    // The epoch of this instance's L4 task ids (see NextL4TaskId).
+    uint64_t L4TaskEpoch() const { return l4_task_epoch_; }
+
     /**
      * @brief Heartbeat-driven pull of pending promotion work for a client.
      * Returns tenant-scoped promotion tasks for the holder client and clears
@@ -1652,11 +1655,38 @@ class MasterService {
                          std::string* error_reason);
 
     // Pushes an offload mirror for `replica` onto its host client's LocalSSD
-    // mailbox. When `mirror_clients` is non-null, the destination client is
-    // appended to it on success.
+    // mailbox, as an item of the offload task `task_id`. When
+    // `mirror_clients` is non-null, the destination client is appended to it
+    // on success.
     tl::expected<void, ErrorCode> PushOffloadingQueue(
         const ObjectIdentity& object_id, Replica& replica,
-        std::vector<UUID>* mirror_clients = nullptr);
+        const L4TaskId& task_id, std::vector<UUID>* mirror_clients = nullptr);
+
+    // A new id for an L4 offload or promotion task of this instance:
+    // l4_task_epoch_ and the next sequence number.
+    L4TaskId NextL4TaskId() {
+        return L4TaskId{l4_task_epoch_, next_l4_task_seq_.fetch_add(
+                                            1, std::memory_order_relaxed)};
+    }
+
+    // Drops the offload task `task` and releases its source refcnt (when
+    // `metadata` is given and still holds the source). A taker that still
+    // reports it is refused: its report names a task that no longer exists.
+    static void ReleaseOffloadingTask(ObjectMetadata* metadata,
+                                      HeapOptional<OffloadingTask>& task);
+
+    // Marks `client_id` as a taker of the current offload task of each key
+    // it has just drained (OffloadObjectHeartbeat) and returns the items it
+    // took; only those are handed to the store.
+    std::vector<OffloadTaskItem> RecordOffloadTakers(
+        const UUID& client_id, const std::vector<OffloadTaskItem>& drained);
+
+    // L4 task ids (NextL4TaskId). The epoch is drawn from OS randomness for
+    // every instance, so a report of a task of an earlier master (before a
+    // restart or a fail-over) never matches a task of this one.
+    static uint64_t DrawL4TaskEpoch();
+    const uint64_t l4_task_epoch_{DrawL4TaskEpoch()};
+    std::atomic<uint64_t> next_l4_task_seq_{1};
 
     // Cancels the offload task on `object_id`, releasing the source refcnt
     // and dropping the task marker along with its mirrors. Returns false

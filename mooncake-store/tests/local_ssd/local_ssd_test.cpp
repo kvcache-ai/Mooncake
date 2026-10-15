@@ -24,8 +24,9 @@ TEST(LocalSsdTaskMailboxTest, OffloadsAreTenantScopedDeduplicatedAndLimited) {
                 ErrorCode::OK);
     EXPECT_TRUE(mailbox.EnqueueOffload(Offload("tenant-b", "key", 2), 2) ==
                 ErrorCode::OK);
-    EXPECT_TRUE(mailbox.EnqueueOffload(Offload("tenant-a", "key", 3), 3) ==
-                ErrorCode::OBJECT_ALREADY_EXISTS);
+    // A queued key is replaced, not added: the full queue takes it.
+    EXPECT_TRUE(mailbox.EnqueueOffload(Offload("tenant-a", "key", 3), 2) ==
+                ErrorCode::OK);
     EXPECT_TRUE(mailbox.EnqueueOffload(Offload("tenant-c", "key", 3), 2) ==
                 ErrorCode::KEYS_ULTRA_LIMIT);
 
@@ -35,6 +36,24 @@ TEST(LocalSsdTaskMailboxTest, OffloadsAreTenantScopedDeduplicatedAndLimited) {
     ASSERT_EQ(tasks.size(), 1);
     EXPECT_EQ(tasks.front(), Offload("tenant-b", "key", 2));
     EXPECT_TRUE(mailbox.SetOffloadingAndTakePending(true).empty());
+}
+
+// The master queues a key's next offload task only after the previous one
+// ended, so a queued item of the key belongs to a task no store can report:
+// the new task's item (its id and size) replaces it.
+TEST(LocalSsdTaskMailboxTest, ANewTaskReplacesTheQueuedItemOfItsKey) {
+    LocalSsdTaskMailbox mailbox(true);
+    auto first = Offload("tenant", "key", 1);
+    first.task_id = L4TaskId{7, 1};
+    auto second = Offload("tenant", "key", 2);
+    second.task_id = L4TaskId{7, 2};
+    ASSERT_TRUE(mailbox.EnqueueOffload(first, 10) == ErrorCode::OK);
+    ASSERT_TRUE(mailbox.EnqueueOffload(second, 10) == ErrorCode::OK);
+    auto tasks = mailbox.SetOffloadingAndTakePending(true);
+    ASSERT_EQ(tasks.size(), 1u);
+    EXPECT_EQ(tasks.front().size, 2);
+    ASSERT_TRUE(tasks.front().task_id.has_value());
+    EXPECT_EQ(*tasks.front().task_id, (L4TaskId{7, 2}));
 }
 
 TEST(LocalSsdTaskMailboxTest, DisabledOffloadingDrainsPendingTasks) {

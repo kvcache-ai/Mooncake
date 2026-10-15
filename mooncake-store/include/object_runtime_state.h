@@ -48,6 +48,14 @@ struct OffloadingTask {
     // offload is pushed once per completed MEMORY replica and those
     // replicas may live on different clients.
     std::vector<UUID> mirror_clients;
+    // Mirrors that drained this task from their queue while it was the
+    // key's current task. A completion only describes this object's bytes
+    // if it comes from one of them: the store copies after the drain.
+    std::vector<UUID> takers;
+    // Identity of this task (MasterService::NextL4TaskId). Every mirror's
+    // item carries it, and a report counts for this task only if it echoes
+    // it: a report of an earlier task of the key carries another id.
+    L4TaskId task_id;
 };
 
 // Tracks an in-flight LOCAL_DISK -> MEMORY copy. The source

@@ -1610,17 +1610,32 @@ TEST_F(MasterAdminServerTest, BatchQueryKeysReturnsLocalDiskReplicaInfo) {
     ASSERT_TRUE(service->MountSegment(segment, client_id).has_value());
     ASSERT_TRUE(service->MountLocalDiskSegment(client_id, true).has_value());
 
+    // A LOCAL_DISK-only object: put, offload (completion of the drained
+    // task), then clear the memory replica.
     const std::string key = "ld_only_key";
     const std::string endpoint = "127.0.0.1:9999";
+    ReplicateConfig put_config;
+    put_config.replica_num = 1;
+    ASSERT_TRUE(
+        service->PutStart(client_id, key, 2048, put_config).has_value());
+    ASSERT_TRUE(service
+                    ->PutEnd(client_id, ObjectMeta{key, std::nullopt},
+                             ReplicaType::MEMORY)
+                    .has_value());
+    auto drained = service->OffloadObjectHeartbeat(client_id, true);
+    ASSERT_TRUE(drained.has_value());
+    ASSERT_EQ(drained->size(), 1u);
     StorageObjectMetadata sm;
     sm.bucket_id = 0;
     sm.offset = 0;
     sm.key_size = static_cast<int64_t>(key.size());
     sm.data_size = 2048;
     sm.transport_endpoint = endpoint;
-    OffloadTaskItem task{.tenant_id = "default", .key = key, .size = 2048};
     ASSERT_TRUE(
-        service->NotifyOffloadSuccess(client_id, {task}, {sm}).has_value());
+        service->NotifyOffloadSuccess(client_id, *drained, {sm}).has_value());
+    auto cleared = service->BatchReplicaClear({key}, client_id, segment.name);
+    ASSERT_TRUE(cleared.has_value());
+    ASSERT_EQ(cleared->size(), 1u);
 
     int port = getFreeTcpPort();
     MasterAdminServer admin(static_cast<uint16_t>(port), false);

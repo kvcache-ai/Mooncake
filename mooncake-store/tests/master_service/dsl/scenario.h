@@ -1334,6 +1334,10 @@ struct CompleteOffloadAction {
     std::string node;
     std::optional<int64_t> size{};
     std::optional<ErrorCode> expected_error{};
+    // A store completes what its offload heartbeat drained, so the action
+    // drains the actor's queue first. A re-registration (the store's rescan
+    // of files it already had) reports without draining.
+    bool re_registration{false};
 
     CompleteOffloadAction& By(std::string value) {
         actor = std::move(value);
@@ -1357,6 +1361,11 @@ struct CompleteOffloadAction {
 
     CompleteOffloadAction& ExpectError(ErrorCode value) {
         expected_error = value;
+        return *this;
+    }
+
+    CompleteOffloadAction& AsReRegistration() {
+        re_registration = true;
         return *this;
     }
 };
