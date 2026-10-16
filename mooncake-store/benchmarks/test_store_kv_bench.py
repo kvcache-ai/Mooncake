@@ -346,6 +346,109 @@ class WorkerFailureTest(unittest.TestCase):
         self.assertEqual(stats.successful_requests, 3)
         self.assertEqual(stats.failed_requests, 0)
 
+    def test_start_failure_joins_started_lanes_before_returning(self):
+        self.runner.lane_count = 3
+        self.runner._sessions = [Mock(), Mock(), Mock()]
+        original_start = threading.Thread.start
+        original_join = threading.Thread.join
+
+        for failed_lane in (0, 2):
+            with self.subTest(failed_lane=failed_lane):
+                start_error = RuntimeError("can't start new thread")
+                started = []
+                gates = [threading.Event() for _ in range(3)]
+                finished = set()
+
+                def start(thread):
+                    if len(started) == failed_lane:
+                        raise start_error
+                    original_start(thread)
+                    started.append(thread)
+
+                def join(thread, *args, **kwargs):
+                    gates[started.index(thread)].set()
+                    return original_join(thread, *args, **kwargs)
+
+                def build(session, lane):
+                    def work(stats):
+                        if not gates[lane].wait(timeout=5):
+                            raise RuntimeError("test worker was not released")
+                        finished.add(lane)
+
+                    return work
+
+                try:
+                    with (
+                        patch.object(threading.Thread, "start", start),
+                        patch.object(threading.Thread, "join", join),
+                    ):
+                        with self.assertRaisesRegex(
+                            RuntimeError, f"probe lane {failed_lane} failed to start"
+                        ) as caught:
+                            self.runner._run_threads("probe", build)
+                        self.assertIs(caught.exception.__cause__, start_error)
+                        self.assertEqual(finished, set(range(failed_lane)))
+                        self.assertFalse(any(thread.is_alive() for thread in started))
+                finally:
+                    # Unblock real workers even when the regression assertion fails.
+                    for gate in gates:
+                        gate.set()
+                    for thread in started:
+                        original_join(thread)
+
+    def test_start_failure_logs_errors_from_joined_lanes(self):
+        self.runner.lane_count = 3
+        self.runner._sessions = [Mock(), Mock(), Mock()]
+        start_error = RuntimeError("can't start new thread")
+        worker_errors = [
+            ValueError("first worker failed"),
+            RuntimeError("second failed"),
+        ]
+        gates = [threading.Event(), threading.Event()]
+        started = []
+        original_start = threading.Thread.start
+        original_join = threading.Thread.join
+
+        def start(thread):
+            if len(started) == 2:
+                raise start_error
+            original_start(thread)
+            started.append(thread)
+
+        def join(thread, *args, **kwargs):
+            gates[started.index(thread)].set()
+            return original_join(thread, *args, **kwargs)
+
+        def build(session, lane):
+            def work(stats):
+                if not gates[lane].wait(timeout=5):
+                    raise RuntimeError("test worker was not released")
+                raise worker_errors[lane]
+
+            return work
+
+        try:
+            with (
+                patch.object(threading.Thread, "start", start),
+                patch.object(threading.Thread, "join", join),
+                self.assertLogs(bench.LOG, level="ERROR") as logs,
+            ):
+                with self.assertRaises(RuntimeError):
+                    self.runner._run_threads("probe", build)
+                self.assertFalse(any(thread.is_alive() for thread in started))
+            self.assertEqual(
+                [record.getMessage() for record in logs.records],
+                ["probe lane 0 failed", "probe lane 1 failed"],
+            )
+            self.assertEqual(
+                [record.exc_info[1] for record in logs.records], worker_errors
+            )
+        finally:
+            for gate in gates:
+                gate.set()
+            for thread in started:
+                original_join(thread)
+
     def test_cli_fails_without_writing_success_and_closes_store(self):
         for scenario, operation in (("metadata_smoke", "put"), ("verify_write", "get")):
             with self.subTest(scenario=scenario), TemporaryDirectory() as directory:
