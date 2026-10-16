@@ -3664,6 +3664,8 @@ tl::expected<size_t, ErrorCode> MasterService::InstallLegacyStandbyObjects(
                     standby_meta.data_type, standby_meta.group_id,
                     object.tenant_id, object.user_key));
             (void)inserted;
+            it->second.metadata.session_id =
+                standby_meta.session_id.value_or("");
             if (!standby_meta.group_id.empty()) {
                 it->second.metadata.lease_ = RegisterGroupMember(
                     object.tenant_id, object.user_key, standby_meta.group_id);
@@ -4133,6 +4135,8 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
                         standby_meta.data_type, standby_meta.group_id,
                         object.tenant_id, object.user_key));
                 (void)inserted;
+                it->second.metadata.session_id =
+                    standby_meta.session_id.value_or("");
                 if (!standby_meta.group_id.empty()) {
                     it->second.metadata.lease_ =
                         RegisterGroupMember(object.tenant_id, object.user_key,
@@ -5383,6 +5387,8 @@ auto MasterService::InsertMetadata(
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         }
     }
+    it->second.metadata.BeginSessionTag(config.SessionId(),
+                                        eligible_replica_ids);
     it->second.metadata.BeginSoftPinAction(soft_pin_request,
                                            std::move(eligible_replica_ids));
     if (deadline_to_index) {
@@ -5519,6 +5525,9 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
     VLOG(1) << "key=" << key << ", value_length=" << slice_length
             << ", config=" << config << ", action=put_start_begin";
 
+    if (!config.ValidSessionIds(1)) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
     auto group_id_result = GetGroupIdForKey(config, 1, 0);
     if (!group_id_result) {
         return tl::make_unexpected(group_id_result.error());
@@ -5739,6 +5748,7 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
                 metadata.PendingSoftPinOwnsReplica(replica.id())) {
                 completed_pending_replica = true;
             }
+            metadata.CommitSessionTag(replica.id());
             replica.mark_complete();
             if (replica.is_dfs_replica() && dfs_allocator_) {
                 const auto& desc = replica.get_dfs_descriptor();
@@ -6013,6 +6023,7 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
             r.mark_removed();
         });
         metadata.ClearPendingSoftPinIfNoViableReplica();
+        metadata.ClearSessionTagIfNoViableReplica();
 
         tl::expected<OpLogEntry, ErrorCode> persist_result;
         if (remaining.empty()) {
@@ -6045,6 +6056,7 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
     const uint64_t before_charge = CompletedMemoryQuotaCharge(metadata);
     EraseReplicasWithCacheTotalAccounting(metadata, target_pred);
     metadata.ClearPendingSoftPinIfNoViableReplica();
+    metadata.ClearSessionTagIfNoViableReplica();
     const uint64_t after_charge = CompletedMemoryQuotaCharge(metadata);
     if (enable_multi_tenants_ && before_charge > after_charge) {
         auto release_result = metadata.quota_ledger.ReleaseCommitted(
@@ -6205,6 +6217,9 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
     VLOG(1) << "key=" << key << ", value_length=" << slice_length
             << ", config=" << config << ", action=upsert_start_begin";
 
+    if (!config.ValidSessionIds(1)) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
     auto group_id_result = GetGroupIdForKey(config, 1, 0);
     if (!group_id_result) {
         return tl::make_unexpected(group_id_result.error());
@@ -6216,6 +6231,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
     bool dfs_allocation_failed = false;
     ReplicateConfig allocation_config = config;
     std::string allocation_group_id = group_id;
+    std::string allocation_session_id;
     std::optional<std::chrono::system_clock::time_point>
         allocation_committed_soft_pin_timeout;
     auto admit =
@@ -6340,6 +6356,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     auto processing_replicas =
                         metadata.PopReplicas(&Replica::fn_is_processing);
                     metadata.ClearPendingSoftPinAction();
+                    metadata.pending_session_tag.reset();
                     if (!processing_replicas.empty()) {
                         FreeDfsReplicas(key, processing_replicas);
                         std::lock_guard lock(discarded_replicas_mutex_);
@@ -6352,6 +6369,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     // If no COMPLETE replicas survive the preemption, this key
                     // effectively does not exist — fall through to Case A.
                     if (!metadata.HasReplica(&Replica::fn_is_completed)) {
+                        allocation_session_id = metadata.session_id;
                         allocation_committed_soft_pin_timeout =
                             metadata.GetCommittedSoftPinTimeout();
                         if (allocation_committed_soft_pin_timeout &&
@@ -6376,12 +6394,17 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
             // routed by hash(tenant, key); group_id does not affect routing.
             if (it == tenant_state.metadata.end()) {
                 VLOG(1) << "key=" << key << ", action=upsert_start_case_a";
-                return AllocateAndInsertMetadata(
+                auto result = AllocateAndInsertMetadata(
                     shard, client_id, key, slice_length, allocation_config,
                     writer_host_id, allocation_group_id, object_id.tenant_id,
                     now, *soft_pin_request,
                     allocation_committed_soft_pin_timeout,
                     &dfs_allocation_failed);
+                if (result) {
+                    tenant_state.metadata.at(key).metadata.session_id =
+                        allocation_session_id;
+                }
+                return result;
             } else {
                 // --- Step 2: key exists with COMPLETE replicas → Case B or C
                 // ---
@@ -6464,6 +6487,8 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                             eligible_replica_ids.insert(replica.id());
                             replica.mark_processing();
                         });
+                    metadata.BeginSessionTag(config.SessionId(),
+                                             eligible_replica_ids);
                     metadata.BeginSoftPinAction(
                         *soft_pin_request, std::move(eligible_replica_ids));
                     SyncCacheTotalAccounting(metadata);
@@ -6507,6 +6532,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 }
 
                 allocation_group_id = metadata.group_id;
+                allocation_session_id = metadata.session_id;
                 const auto previous_kv_media = KvMediaSnapshot(metadata);
                 TenantQuotaLedger replacement_charge;
                 auto* quota_account = GetBoundTenantQuotaHandle(tenant_state);
@@ -6614,6 +6640,9 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     return allocate_result;
                 }
                 auto new_it = tenant_state.metadata.find(key);
+                if (new_it != tenant_state.metadata.end()) {
+                    new_it->second.metadata.session_id = allocation_session_id;
+                }
                 if (has_replacement_charge) {
                     if (new_it == tenant_state.metadata.end()) {
                         auto rollback_result =
@@ -6715,6 +6744,9 @@ MasterService::BatchUpsertStart(const UUID& client_id,
         return std::vector<
             tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>(
             keys.size(), tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+    }
+    if (!config.ValidSessionIds(keys.size())) {
+        return {keys.size(), tl::make_unexpected(ErrorCode::INVALID_PARAMS)};
     }
     if (config.group_ids.has_value() &&
         config.group_ids->size() != keys.size()) {
@@ -10427,6 +10459,7 @@ void MasterService::DiscardExpiredProcessingReplicas(
             if (!metadata.IsValid() ||
                 metadata.AllReplicas(&Replica::fn_is_completed)) {
                 metadata.ClearPendingSoftPinIfNoViableReplica();
+                metadata.ClearSessionTagIfNoViableReplica();
                 if (!metadata.IsValid()) {
                     EraseMetadata(tenant_state, it, tenant_it->first,
                                   QuotaEraseMode::kFull, &shard);
@@ -10494,6 +10527,7 @@ void MasterService::DiscardExpiredProcessingReplicas(
                 auto replicas =
                     metadata.PopReplicas(&Replica::fn_is_processing);
                 metadata.ClearPendingSoftPinIfNoViableReplica();
+                metadata.ClearSessionTagIfNoViableReplica();
                 if (!replicas.empty()) {
                     FreeDfsReplicas(it->first, replicas);
                     discarded_replicas.emplace_back(std::move(replicas), ttl);
@@ -13380,7 +13414,8 @@ void MasterService::PublishKvStored(const std::string& key,
         return;
     }
     kv_event_publisher_->PublishCommitted(key, KvMediaForMetadata(metadata),
-                                          tenant_id.value(), metadata.group_id);
+                                          tenant_id.value(), metadata.group_id,
+                                          metadata.session_id);
 }
 
 void MasterService::SyncKvObjectState(
@@ -13403,8 +13438,8 @@ void MasterService::SyncKvObjectState(
         return;
     }
     kv_event_publisher_->SyncObjectState(key, current_media, tenant_id.value(),
-                                         metadata.group_id,
-                                         previous_media_hint);
+                                         metadata.group_id, previous_media_hint,
+                                         metadata.session_id);
 }
 
 void MasterService::PublishKvRemoved(
@@ -13605,6 +13640,7 @@ std::string MasterService::SerializeMetadataForOpLog(
     payload.client_id = metadata.client_id;
     payload.size = metadata.TotalLength();
     payload.group_id = metadata.group_id;
+    payload.session_id = metadata.session_id;
     payload.data_type = metadata.data_type;
     payload.hard_pinned = metadata.IsHardPinned();
 
@@ -13631,6 +13667,7 @@ std::string MasterService::SerializeMetadataForOpLogWithoutMemReplicas(
     payload.client_id = metadata.client_id;
     payload.size = metadata.TotalLength();
     payload.group_id = metadata.group_id;
+    payload.session_id = metadata.session_id;
     payload.data_type = metadata.data_type;
     payload.hard_pinned = metadata.IsHardPinned();
 
@@ -13655,6 +13692,7 @@ std::string MasterService::SerializeMetadataForOpLogFromReplicaDescriptors(
     payload.size = metadata.TotalLength();
     payload.replicas = replicas;
     payload.group_id = metadata.group_id;
+    payload.session_id = metadata.session_id;
     payload.data_type = metadata.data_type;
     payload.hard_pinned = metadata.IsHardPinned();
     auto result = struct_pack::serialize(payload);

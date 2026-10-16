@@ -6738,6 +6738,7 @@ def _call_write_with_optional_config(fn: Any, *args: Any, config: Any = None) ->
 _WRITE_CONFIG_COPY_FIELDS = (
     "data_type",
     "group_ids",
+    "session_ids",
     "nof_replica_num",
     "prefer_alloc_in_same_node",
     "preferred_nof_segments",
@@ -6753,6 +6754,18 @@ def _config_for_grouped_keys(config: Any, key_count: int) -> Any:
     """Return a write config whose group_ids match the physical key count."""
     if config is None or key_count <= 0:
         return config
+    session_ids = getattr(config, "session_ids", None)
+    if session_ids is not None:
+        session_ids = (
+            [session_ids] if isinstance(session_ids, str) else list(session_ids)
+        )
+        if len(session_ids) != 1:
+            raise ValueError(
+                "config.session_ids must contain exactly one logical session id"
+            )
+        if key_count != 1 or isinstance(config.session_ids, str):
+            config = _copy_write_config(config)
+            config.session_ids = session_ids * key_count
     group_ids = getattr(config, "group_ids", None)
     if group_ids is None:
         return config
