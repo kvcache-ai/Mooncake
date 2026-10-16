@@ -10844,10 +10844,8 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
             const size_t shard_idx = (start_shard + scanned) % kNumShards;
             std::vector<std::vector<Replica>> deferred_replicas;
             // Snapshot the candidate keys under the shard lock, then evict each
-            // outside it: for a grouped object the trigger lock must not be
-            // held while other member shard locks are acquired
-            // (EvictGroupOrObject owns the lock acquisition in canonical
-            // order).
+            // outside it: EvictGroupOrObject holds each member's key on its
+            // own, one at a time, and must not be entered holding any.
             std::vector<std::string> candidate_keys;
             {
                 MetadataShardAccessorRW shard(this, shard_idx);
@@ -11134,13 +11132,9 @@ void MasterService::BatchEvict(double evict_ratio_target,
     };
 
     // Evicts a single object or a whole group. MUST be called WITHOUT holding
-    // any metadata shard lock: it acquires the trigger/member shard locks
-    // itself, and for a grouped object it never holds the trigger lock while
-    // acquiring the other member shard locks (they are taken in canonical
-    // ascending order inside EvictGroupOrObject). This removes the AB/BA
-    // cross-shard deadlock between concurrent evictions. Because the trigger
-    // lock is not held across the member traversal, members are re-looked-up
-    // and re-validated under their own locks.
+    // any key: EvictGroupOrObject holds one member at a time and never two,
+    // re-looking-up and re-validating each under its own key, so no two
+    // evictions wait on each other's keys.
     auto try_evict_group_or_object =
         [&, this](const TenantId& tenant_id, const std::string& key,
                   bool allow_soft_pinned,
