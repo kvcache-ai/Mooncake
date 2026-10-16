@@ -10636,6 +10636,73 @@ uint64_t MasterService::ReleaseExpiredDiscardedReplicas(
     return released_cnt;
 }
 
+tl::expected<void, ErrorCode> MasterService::PersistMemoryEvictionToOpLog(
+    const TenantId& tenant_id, const std::string& key, ObjectMetadata& metadata,
+    std::string_view caller) {
+    if (!enable_oplog_) {
+        return {};
+    }
+
+    // HA strong-consistency: persist the post-eviction state before the
+    // caller mutates metadata. Keep the removed IDs local until submission
+    // succeeds so a consumed reservation cannot strand REMOVED replicas.
+    auto is_evictable_memory_replica = [this](const Replica& replica) {
+        return IsEvictableMemoryReplica(replica);
+    };
+
+    // Predict the descriptor list after eviction: drop COMPLETE memory
+    // replicas with refcnt==0; keep everything else that is COMPLETE.
+    auto remaining =
+        BuildRemainingReplicaDescriptors(metadata, is_evictable_memory_replica);
+
+    auto reservation = ReserveBatchOpLogSlot();
+    if (!reservation) {
+        LOG(WARNING) << caller << ": OpLog reservation failed for key=" << key
+                     << ", err=" << static_cast<int>(reservation.error())
+                     << ", stopping eviction scan";
+        return tl::make_unexpected(reservation.error());
+    }
+    std::vector<ReplicaID> removed_ids;
+    metadata.VisitReplicas(is_evictable_memory_replica,
+                           [&removed_ids](Replica& replica) {
+                               removed_ids.push_back(replica.id());
+                               replica.mark_removed();
+                           });
+    tl::expected<OpLogEntry, ErrorCode> persist_result;
+    if (remaining.empty()) {
+        persist_result = AppendReservedOpLogWithDurableFinalize(
+            std::move(reservation.value()), OpType::REMOVE, tenant_id.value(),
+            key, {}, [this, removed_ids](const OpLogEntry& durable_entry) {
+                FinalizeRemovedReplicasAfterDurable(durable_entry, removed_ids,
+                                                    QuotaEraseMode::kFull);
+            });
+    } else {
+        persist_result = AppendReservedOpLogWithDurableFinalize(
+            std::move(reservation.value()), OpType::PUT_END, tenant_id.value(),
+            key,
+            SerializeMetadataForOpLogFromReplicaDescriptors(metadata,
+                                                            remaining),
+            [this, removed_ids](const OpLogEntry& durable_entry) {
+                FinalizeRemovedReplicasAfterDurable(durable_entry, removed_ids,
+                                                    QuotaEraseMode::kFull);
+            });
+    }
+    if (!persist_result) {
+        const ErrorCode error = persist_result.error();
+        for (const auto& id : removed_ids) {
+            if (auto* replica = metadata.GetReplicaByID(id);
+                replica != nullptr) {
+                replica->cancel_remove();
+            }
+        }
+        LOG(WARNING) << caller << ": OpLog persist failed for key=" << key
+                     << ", err=" << static_cast<int>(error)
+                     << ", stopping eviction scan";
+        return tl::make_unexpected(error);
+    }
+    return {};
+}
+
 MasterService::TenantQuotaEvictionResult
 MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
                                          uint64_t target_bytes) {
@@ -10660,6 +10727,15 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
     auto evict_replicas =
         [&, this](TenantQuotaHandle quota_account, ObjectMetadata& metadata,
                   std::vector<std::vector<Replica>>& deferred_replicas) {
+            if (enable_oplog_) {
+                // PersistMemoryEvictionToOpLog marked them REMOVED; the
+                // durable finalize frees them and releases their quota.
+                return metadata.TotalLength() *
+                       metadata.CountReplicas([](const Replica& replica) {
+                           return replica.is_memory_replica() &&
+                                  replica.status() == ReplicaStatus::REMOVED;
+                       });
+            }
             const uint64_t before_charge = CompletedMemoryQuotaCharge(metadata);
             auto replicas = PopReplicasWithCacheTotalAccounting(
                 metadata, is_evictable_memory_replica);
@@ -10698,7 +10774,7 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
                                           route::ObjectState& state,
                                           std::vector<std::vector<Replica>>&
                                               deferred_replicas) {
-        if (!offload_on_evict_) {
+        if (enable_oplog_ || !offload_on_evict_) {
             return evict_replicas(quota_account, metadata, deferred_replicas);
         }
 
@@ -10770,17 +10846,22 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
                 return {};
             }
             if (!metadata.IsGrouped()) {
+                if (!PersistMemoryEvictionToOpLog(
+                        normalized_tenant, key, metadata,
+                        "EvictTenantMemoryForQuota")) {
+                    return {.stop_scan = true};
+                }
                 uint64_t freed =
                     try_evict_or_offload(key, metadata, trigger.QuotaAccount(),
                                          trigger.GetState(), deferred_replicas);
                 TenantQuotaEvictionResult result{
                     .freed_bytes = freed,
                     .evicted_objects = freed > 0 ? 1U : 0U};
-                if (freed > 0) {
+                if (!enable_oplog_ && freed > 0) {
                     PublishKvRemovedAfterEvict(key, 1, "cpu", metadata,
                                                normalized_tenant);
                 }
-                if (!metadata.IsValid()) {
+                if (!enable_oplog_ && !metadata.IsValid()) {
                     trigger.Erase();
                 }
                 return result;
@@ -10801,16 +10882,22 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
             [&, this](MetadataAccessorRW& member) -> EvictMemberOutcome {
             const std::string& member_key = member.GetKey();
             auto& member_metadata = member.Get();
+            if (!PersistMemoryEvictionToOpLog(normalized_tenant, member_key,
+                                              member_metadata,
+                                              "EvictTenantMemoryForQuota")) {
+                return {.stop_scan = true};
+            }
             const uint64_t freed = try_evict_or_offload(
                 member_key, member_metadata, member.QuotaAccount(),
                 member.GetState(), deferred_replicas);
             EvictMemberOutcome outcome{.freed_bytes = freed,
                                        .evicted_objects = freed > 0 ? 1 : 0};
-            if (freed > 0) {
+            if (!enable_oplog_ && freed > 0) {
                 PublishKvRemovedAfterEvict(member_key, 1, "cpu",
                                            member_metadata, normalized_tenant);
             }
-            if (member_key != key && !member_metadata.IsValid()) {
+            if (member_key != key && !enable_oplog_ &&
+                !member_metadata.IsValid()) {
                 member.Erase();
             }
             return outcome;
@@ -10822,14 +10909,16 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
         TenantQuotaEvictionResult result{
             .freed_bytes = group_result.freed_bytes,
             .evicted_objects =
-                static_cast<uint64_t>(group_result.evicted_objects)};
+                static_cast<uint64_t>(group_result.evicted_objects),
+            .stop_scan = group_result.stop_scan};
 
         // The callback erased every member except the trigger; re-look-up the
         // trigger to erase it if it is now invalid.
         {
             MetadataAccessorRW trigger(this,
                                        ObjectIdentity{normalized_tenant, key});
-            if (trigger.IsPublished() && !trigger.Get().IsValid()) {
+            if (!enable_oplog_ && trigger.IsPublished() &&
+                !trigger.Get().IsValid()) {
                 trigger.Erase();
             }
         }
@@ -10838,8 +10927,8 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
 
     auto pass = [&](bool allow_soft_pinned) {
         const size_t start_shard = randomIndex(kNumShards);
-        for (size_t scanned = 0;
-             scanned < kNumShards && total.freed_bytes < target_bytes;
+        for (size_t scanned = 0; scanned < kNumShards && !total.stop_scan &&
+                                 total.freed_bytes < target_bytes;
              ++scanned) {
             const size_t shard_idx = (start_shard + scanned) % kNumShards;
             std::vector<std::vector<Replica>> deferred_replicas;
@@ -10875,12 +10964,17 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
                     key, allow_soft_pinned, deferred_replicas);
                 total.freed_bytes += evict_result.freed_bytes;
                 total.evicted_objects += evict_result.evicted_objects;
+                if (evict_result.stop_scan) {
+                    total.stop_scan = true;
+                    break;
+                }
             }
         }
     };
 
     pass(/*allow_soft_pinned=*/false);
-    if (allow_evict_soft_pinned_objects_ && total.freed_bytes < target_bytes) {
+    if (allow_evict_soft_pinned_objects_ && !total.stop_scan &&
+        total.freed_bytes < target_bytes) {
         pass(/*allow_soft_pinned=*/true);
     }
 
@@ -11055,70 +11149,11 @@ void MasterService::BatchEvict(double evict_ratio_target,
         return 0;
     };
 
-    // HA strong-consistency: persist the post-eviction state before the
-    // helper mutates metadata. Keep the removed IDs local until submission
-    // succeeds so a consumed reservation cannot strand REMOVED replicas.
-    auto persist_evict_oplog_or_skip =
-        [&, this](const TenantId& tenant_id, const std::string& key,
-                  ObjectMetadata& metadata) -> tl::expected<void, ErrorCode> {
-        if (!enable_oplog_) {
-            return {};
-        }
-
-        // Predict the descriptor list after evict_replicas() runs:
-        // drop COMPLETE memory replicas with refcnt==0; keep everything else
-        // that is COMPLETE.
-        auto remaining = BuildRemainingReplicaDescriptors(
-            metadata, is_evictable_memory_replica);
-
-        auto reservation = ReserveBatchOpLogSlot();
-        if (!reservation) {
-            LOG(WARNING) << "BatchEvict: OpLog reservation failed for key="
-                         << key
-                         << ", err=" << static_cast<int>(reservation.error())
-                         << ", stopping eviction scan";
-            return tl::make_unexpected(reservation.error());
-        }
-        std::vector<ReplicaID> removed_ids;
-        metadata.VisitReplicas(is_evictable_memory_replica,
-                               [&removed_ids](Replica& replica) {
-                                   removed_ids.push_back(replica.id());
-                                   replica.mark_removed();
-                               });
-        tl::expected<OpLogEntry, ErrorCode> persist_result;
-        if (remaining.empty()) {
-            persist_result = AppendReservedOpLogWithDurableFinalize(
-                std::move(reservation.value()), OpType::REMOVE,
-                tenant_id.value(), key, {},
-                [this, removed_ids](const OpLogEntry& durable_entry) {
-                    FinalizeRemovedReplicasAfterDurable(
-                        durable_entry, removed_ids, QuotaEraseMode::kFull);
-                });
-        } else {
-            persist_result = AppendReservedOpLogWithDurableFinalize(
-                std::move(reservation.value()), OpType::PUT_END,
-                tenant_id.value(), key,
-                SerializeMetadataForOpLogFromReplicaDescriptors(metadata,
-                                                                remaining),
-                [this, removed_ids](const OpLogEntry& durable_entry) {
-                    FinalizeRemovedReplicasAfterDurable(
-                        durable_entry, removed_ids, QuotaEraseMode::kFull);
-                });
-        }
-        if (!persist_result) {
-            const ErrorCode error = persist_result.error();
-            for (const auto& id : removed_ids) {
-                if (auto* replica = metadata.GetReplicaByID(id);
-                    replica != nullptr) {
-                    replica->cancel_remove();
-                }
-            }
-            LOG(WARNING) << "BatchEvict: OpLog persist failed for key=" << key
-                         << ", err=" << static_cast<int>(error)
-                         << ", stopping eviction scan";
-            return tl::make_unexpected(error);
-        }
-        return {};
+    auto persist_evict_oplog_or_skip = [this](const TenantId& tenant_id,
+                                              const std::string& key,
+                                              ObjectMetadata& metadata) {
+        return PersistMemoryEvictionToOpLog(tenant_id, key, metadata,
+                                            "BatchEvict");
     };
 
     struct EvictionResult {

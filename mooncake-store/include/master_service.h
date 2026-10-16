@@ -1039,6 +1039,9 @@ class MasterService {
     struct TenantQuotaEvictionResult {
         uint64_t freed_bytes{0};
         uint64_t evicted_objects{0};
+        // Set when the OpLog could not take an eviction record; the pass
+        // stops, as BatchEvict does.
+        bool stop_scan{false};
     };
     TenantQuotaEvictionResult EvictTenantMemoryForQuota(
         const TenantId& tenant_id, uint64_t target_bytes);
@@ -2466,6 +2469,17 @@ class MasterService {
     std::vector<Replica::Descriptor> BuildRemainingReplicaDescriptors(
         const ObjectMetadata& metadata,
         const std::function<bool(const Replica&)>& should_remove) const;
+
+    /**
+     * HA strong-consistency for memory eviction: mark the evictable memory
+     * replicas REMOVED and append the post-eviction state (REMOVE, or PUT_END
+     * with the remaining replicas) with a durable finalize that frees them
+     * and releases their quota. No-op when the OpLog is disabled. On error
+     * the replicas are restored and the caller must stop its scan.
+     */
+    tl::expected<void, ErrorCode> PersistMemoryEvictionToOpLog(
+        const TenantId& tenant_id, const std::string& key,
+        ObjectMetadata& metadata, std::string_view caller);
 };
 
 }  // namespace mooncake
