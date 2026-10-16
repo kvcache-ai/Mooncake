@@ -43,16 +43,35 @@
 #ifndef MFD_CLOEXEC
 #define MFD_CLOEXEC 0x0001U
 #endif
+#ifndef MFD_HUGETLB
+#define MFD_HUGETLB 0x0004U
+#endif
+#ifndef MFD_HUGE_SHIFT
+#define MFD_HUGE_SHIFT 26
+#endif
+#ifndef MFD_HUGE_2MB
+#define MFD_HUGE_2MB (21U << MFD_HUGE_SHIFT)
+#endif
+#ifndef MFD_HUGE_1GB
+#define MFD_HUGE_1GB (30U << MFD_HUGE_SHIFT)
+#endif
+#ifndef MFD_HUGE_512MB
+#define MFD_HUGE_512MB (29U << MFD_HUGE_SHIFT)
+#endif
 
 namespace mooncake {
 namespace {
 constexpr uint16_t kMmapBackendId = 3;
 // Matches the common PMD THP size when sysfs is unavailable.
 constexpr uint64_t kFallbackHugePageSize = 2ULL * 1024 * 1024;
+constexpr uint64_t kTwoMiB = 2ULL * 1024 * 1024;
+constexpr uint64_t kFiveTwelveMiB = 512ULL * 1024 * 1024;
+constexpr uint64_t kOneGiB = 1024ULL * 1024 * 1024;
 constexpr const char* kThpPmdSizePath =
     "/sys/kernel/mm/transparent_hugepage/hpage_pmd_size";
 constexpr const char* kShmemThpEnabledPath =
     "/sys/kernel/mm/transparent_hugepage/shmem_enabled";
+constexpr const char* kMemInfoPath = "/proc/meminfo";
 
 // memfd without MFD_HUGETLB is a tmpfs/shmem inode, so shmem THP applies.
 // Sysfs looks like "always within_size [advise] never deny force".
@@ -98,6 +117,46 @@ uint64_t HugePageSize() {
     return kSize;
 }
 
+// Default HugeTLB page size from /proc/meminfo, not the THP PMD size. On
+// arm64 with 64KiB base pages those two often differ (2MiB vs 512MiB).
+uint64_t HugeTlbPageSize() {
+    static const uint64_t kSize = []() -> uint64_t {
+        FILE* fp = std::fopen(kMemInfoPath, "r");
+        if (fp != nullptr) {
+            char line[256];
+            while (std::fgets(line, sizeof(line), fp) != nullptr) {
+                unsigned long long kib = 0;
+                if (std::sscanf(line, "Hugepagesize: %llu kB", &kib) == 1 &&
+                    kib > 0) {
+                    std::fclose(fp);
+                    return static_cast<uint64_t>(kib) * 1024ULL;
+                }
+            }
+            std::fclose(fp);
+        }
+        return kFallbackHugePageSize;
+    }();
+    return kSize;
+}
+
+unsigned int HugeTlbMemFdSizeFlag() {
+    const uint64_t size = HugeTlbPageSize();
+    if (size == kTwoMiB) {
+        return MFD_HUGE_2MB;
+    }
+    if (size == kFiveTwelveMiB) {
+        return MFD_HUGE_512MB;
+    }
+    if (size == kOneGiB) {
+        return MFD_HUGE_1GB;
+    }
+    return 0;
+}
+
+uint64_t MappingAlign(const SharedSegmentOptions& options) {
+    return options.hugetlb ? HugeTlbPageSize() : HugePageSize();
+}
+
 void AdviseTransparentHugePages(void* addr, uint64_t size) {
 #ifdef MADV_HUGEPAGE
     if (addr == nullptr || size == 0) {
@@ -128,10 +187,21 @@ void AdviseDontFork(void* addr, uint64_t size) {
 #endif
 }
 
-int CreateAnonymousMemFd() {
+int CreateAnonymousMemFd(bool hugetlb) {
 #ifdef __NR_memfd_create
-    return static_cast<int>(syscall(__NR_memfd_create, "mcss", MFD_CLOEXEC));
+    unsigned int flags = MFD_CLOEXEC;
+    if (!hugetlb) {
+        return static_cast<int>(syscall(__NR_memfd_create, "mcss", flags));
+    }
+    const unsigned int sized = flags | MFD_HUGETLB | HugeTlbMemFdSizeFlag();
+    int fd = static_cast<int>(syscall(__NR_memfd_create, "mcss", sized));
+    if (fd < 0 && errno == EINVAL && HugeTlbMemFdSizeFlag() != 0) {
+        fd = static_cast<int>(
+            syscall(__NR_memfd_create, "mcss", flags | MFD_HUGETLB));
+    }
+    return fd;
 #else
+    (void)hugetlb;
     errno = ENOSYS;
     return -1;
 #endif
@@ -177,10 +247,13 @@ void PrefaultAnonymousRange(void* addr, uint64_t size, uint64_t stride) {
     bytes[size - 1] = 0;
 }
 
-Status MapMemFd(int fd, uint64_t size, void* hint, void*& addr) {
+Status MapMemFd(int fd, uint64_t size, void* hint, void*& addr, bool populate) {
     int map_flags = MAP_SHARED;
     if (hint != nullptr) {
         map_flags |= MAP_FIXED;
+    }
+    if (populate) {
+        map_flags |= MAP_POPULATE;
     }
     void* mapped = mmap(hint, size, PROT_READ | PROT_WRITE, map_flags, fd, 0);
     if (mapped == MAP_FAILED) {
@@ -191,38 +264,57 @@ Status MapMemFd(int fd, uint64_t size, void* hint, void*& addr) {
     return Status::OK();
 }
 
-// Unnamed memfd (no MFD_HUGETLB, no nr_hugepages). MADV_HUGEPAGE is applied
-// before any page is faulted so the kernel can use THP; otherwise 4KiB pages.
-Status CreateAndMapMemFd(uint64_t size, int& fd, void*& addr) {
-    fd = CreateAnonymousMemFd();
+// mmap=true, hugetlb=false: unnamed memfd (no MFD_HUGETLB, no nr_hugepages).
+// MADV_HUGEPAGE is applied before any page is faulted so the kernel can use
+// THP; otherwise 4KiB pages.
+// mmap=true, hugetlb=true: unnamed memfd with MFD_HUGETLB. MAP_POPULATE
+// consumes the HugeTLB pool immediately and fails if it cannot.
+Status CreateAndMapMemFd(uint64_t size, bool hugetlb, int& fd, void*& addr) {
+    fd = CreateAnonymousMemFd(hugetlb);
     if (fd < 0) {
-        return Status::Memory(std::string("memfd_create failed: ") +
-                              std::strerror(errno));
+        std::string msg = "memfd_create failed: ";
+        msg += std::strerror(errno);
+        if (hugetlb) {
+            msg += " (HugeTLB; check /proc/sys/vm/nr_hugepages)";
+        }
+        return Status::Memory(msg);
     }
     if (ftruncate(fd, static_cast<off_t>(size)) != 0) {
         const int err = errno;
         close(fd);
         fd = -1;
-        return Status::Memory(std::string("ftruncate failed: ") +
-                              std::strerror(err));
+        std::string msg = "ftruncate failed: ";
+        msg += std::strerror(err);
+        if (hugetlb) {
+            msg += " (HugeTLB size must be a multiple of Hugepagesize)";
+        }
+        return Status::Memory(msg);
     }
-    void* hint = ReserveAlignedWindow(size, HugePageSize());
+    const uint64_t align = hugetlb ? HugeTlbPageSize() : HugePageSize();
+    void* hint = ReserveAlignedWindow(size, align);
     if (hint == MAP_FAILED) {
         hint = nullptr;
     }
-    auto status = MapMemFd(fd, size, hint, addr);
+    auto status = MapMemFd(fd, size, hint, addr, /*populate=*/hugetlb);
     if (!status.ok() && hint != nullptr) {
         (void)munmap(hint, size);
         hint = nullptr;
-        status = MapMemFd(fd, size, nullptr, addr);
+        status = MapMemFd(fd, size, nullptr, addr, /*populate=*/hugetlb);
     }
     if (!status.ok()) {
         close(fd);
         fd = -1;
+        if (hugetlb) {
+            return Status::Memory(
+                std::string(status.message()) +
+                " (HugeTLB; check /proc/sys/vm/nr_hugepages)");
+        }
         return status;
     }
-    AdviseTransparentHugePages(addr, size);
-    PrefaultAnonymousRange(addr, size, HugePageSize());
+    if (!hugetlb) {
+        AdviseTransparentHugePages(addr, size);
+        PrefaultAnonymousRange(addr, size, HugePageSize());
+    }
     AdviseDontFork(addr, size);
     return Status::OK();
 }
@@ -288,11 +380,10 @@ class MmapSharedSegmentBackend : public SharedSegmentBackend {
    public:
     ~MmapSharedSegmentBackend() override { Release(); }
 
-    uint64_t Granularity(
-        const SharedSegmentOptions& /*options*/) const override {
-        // Align length to the THP PMD size so MADV_HUGEPAGE can use 2MiB
-        // pages. 4KiB fallback still accepts a PMD-aligned length.
-        return HugePageSize();
+    uint64_t Granularity(const SharedSegmentOptions& options) const override {
+        // HugeTLB must match Hugepagesize. THP aligns to the PMD size so
+        // MADV_HUGEPAGE can use 2MiB pages; 4KiB fallback still accepts it.
+        return MappingAlign(options);
     }
 
     Status CreateOwner(uint64_t size, const SharedSegmentOptions& options,
@@ -341,13 +432,18 @@ Status MmapSharedSegmentBackend::CreateOwner(
     std::vector<uint8_t>& handle) {
     int fd = -1;
     void* mapped = nullptr;
-    auto status = CreateAndMapMemFd(size, fd, mapped);
+    auto status = CreateAndMapMemFd(size, options.hugetlb, fd, mapped);
     if (!status.ok()) {
         return status;
     }
-    LOG(INFO) << "Shared segment mmap: unnamed memfd + THP hint (no HugeTLB), "
-              << "size " << size
-              << ", shmem_thp=" << (ShmemThpEnabled() ? "on" : "off");
+    if (options.hugetlb) {
+        LOG(INFO) << "Shared segment mmap: unnamed memfd + HugeTLB, size "
+                  << size << ", hugepage=" << HugeTlbPageSize();
+    } else {
+        LOG(INFO) << "Shared segment mmap: unnamed memfd + THP hint "
+                  << "(no HugeTLB), size " << size
+                  << ", shmem_thp=" << (ShmemThpEnabled() ? "on" : "off");
+    }
 
     addr_ = mapped;
     size_ = size;
@@ -363,9 +459,8 @@ Status MmapSharedSegmentBackend::CreateOwner(
 }
 
 Status MmapSharedSegmentBackend::ReserveLocal(
-    uint64_t size, const SharedSegmentOptions& /*options*/,
-    uintptr_t& base_addr) {
-    void* reserved = ReserveAlignedWindow(size, HugePageSize());
+    uint64_t size, const SharedSegmentOptions& options, uintptr_t& base_addr) {
+    void* reserved = ReserveAlignedWindow(size, MappingAlign(options));
     if (reserved == MAP_FAILED) {
         return Status::Memory(std::string("mmap reserve failed: ") +
                               std::strerror(errno));
@@ -404,13 +499,15 @@ Status MmapSharedSegmentBackend::ImportAndMap(
     }
 
     void* mapped = addr_;
-    auto status = MapMemFd(fd, size, mapped, mapped);
+    auto status = MapMemFd(fd, size, mapped, mapped, /*populate=*/false);
     close(fd);
     if (!status.ok()) {
         return status;
     }
     addr_ = mapped;
-    AdviseTransparentHugePages(addr_, size);
+    if (!options.hugetlb) {
+        AdviseTransparentHugePages(addr_, size);
+    }
     AdviseDontFork(addr_, size);
     status = RegisterMapped(options);
     if (!status.ok()) {

@@ -40,6 +40,86 @@ SharedSegmentOptions KvOptions(uint32_t rank_id = 0, uint32_t world_size = 2) {
     options.owner_rank = 0;
     return options;
 }
+
+uint64_t ReadMemInfoKb(const char* field) {
+    FILE* fp = std::fopen("/proc/meminfo", "r");
+    if (fp == nullptr) {
+        return 0;
+    }
+    char line[256];
+    const std::string prefix = std::string(field) + ":";
+    while (std::fgets(line, sizeof(line), fp) != nullptr) {
+        if (std::strncmp(line, prefix.c_str(), prefix.size()) != 0) {
+            continue;
+        }
+        unsigned long long kib = 0;
+        if (std::sscanf(line + prefix.size(), "%llu", &kib) == 1) {
+            std::fclose(fp);
+            return static_cast<uint64_t>(kib);
+        }
+    }
+    std::fclose(fp);
+    return 0;
+}
+
+uint64_t HugeTlbPageBytes() {
+    const uint64_t kib = ReadMemInfoKb("Hugepagesize");
+    return kib == 0 ? 0 : kib * 1024ULL;
+}
+
+uint64_t HugeTlbFreeBytes() {
+    return ReadMemInfoKb("HugePages_Free") * HugeTlbPageBytes();
+}
+
+bool HugeTlbPoolReady() {
+    const uint64_t page = HugeTlbPageBytes();
+    return page > 0 && HugeTlbFreeBytes() >= page;
+}
+
+bool MappingIsHugeTlb(uintptr_t addr) {
+    FILE* fp = std::fopen("/proc/self/smaps", "r");
+    if (fp == nullptr) {
+        return false;
+    }
+    char line[512];
+    bool in_vma = false;
+    uint64_t kernel_page_kib = 0;
+    while (std::fgets(line, sizeof(line), fp) != nullptr) {
+        unsigned long long start = 0;
+        unsigned long long end = 0;
+        if (std::sscanf(line, "%llx-%llx ", &start, &end) == 2) {
+            in_vma = addr >= static_cast<uintptr_t>(start) &&
+                     addr < static_cast<uintptr_t>(end);
+            kernel_page_kib = 0;
+            continue;
+        }
+        if (!in_vma) {
+            continue;
+        }
+        unsigned long long kib = 0;
+        if (std::sscanf(line, "KernelPageSize: %llu kB", &kib) == 1) {
+            kernel_page_kib = kib;
+        }
+        if (std::strncmp(line, "VmFlags:", 8) == 0) {
+            const bool ht = std::strstr(line, " ht") != nullptr ||
+                            std::strstr(line, "\tht") != nullptr;
+            const uint64_t page = HugeTlbPageBytes();
+            const bool size_ok = page == 0 || kernel_page_kib * 1024ULL == page;
+            std::fclose(fp);
+            return ht && size_ok;
+        }
+    }
+    std::fclose(fp);
+    return false;
+}
+
+SharedSegmentOptions HugeTlbOptions(uint32_t rank_id = 0,
+                                    uint32_t world_size = 1) {
+    SharedSegmentOptions options = KvOptions(rank_id, world_size);
+    options.mmap = true;
+    options.hugetlb = true;
+    return options;
+}
 }  // namespace
 
 TEST(SharedSegmentFingerprintTest, ChangesWithEveryDeclaredField) {
@@ -76,6 +156,11 @@ TEST(SharedSegmentFingerprintTest, ChangesWithEveryDeclaredField) {
     EXPECT_NE(
         ComputeSegmentFingerprint("kv", kSegmentSize, different_host_register),
         base);
+
+    auto different_hugetlb = options;
+    different_hugetlb.hugetlb = !options.hugetlb;
+    EXPECT_NE(ComputeSegmentFingerprint("kv", kSegmentSize, different_hugetlb),
+              base);
 }
 
 TEST(SharedSegmentBlobTest, RoundTripsHeaderAndHandle) {
@@ -178,6 +263,12 @@ TEST(SharedSegmentTest, RejectsInvalidOptions) {
     EXPECT_TRUE(
         SharedSegment::Create("kv", kSegmentSize, options, segment, blob)
             .IsInvalidArgument());
+
+    options.host_register = false;
+    options.hugetlb = true;
+    EXPECT_TRUE(
+        SharedSegment::Create("kv", kSegmentSize, options, segment, blob)
+            .IsInvalidArgument());
 }
 
 TEST(SharedSegmentBackendFactoryTest, RejectsUnknownImplementation) {
@@ -208,6 +299,10 @@ TEST(SharedSegmentMmapTest, SupportedForMmapAndOptionalHostRegister) {
 #endif
     EXPECT_FALSE(
         SharedSegment::Supported(/*mmap=*/false, /*host_register=*/true));
+    EXPECT_TRUE(SharedSegment::Supported(/*mmap=*/true, /*host_register=*/false,
+                                         /*hugetlb=*/true));
+    EXPECT_FALSE(SharedSegment::Supported(
+        /*mmap=*/false, /*host_register=*/false, /*hugetlb=*/true));
 }
 
 TEST(SharedSegmentMmapTest, SingleRankRoundTrip) {
@@ -395,13 +490,207 @@ TEST(SharedSegmentMmapTest, TwoProcessesSharePages) {
     EXPECT_EQ(WEXITSTATUS(wstatus), 0);
 }
 
+TEST(SharedSegmentMmapTest, DefaultPathDoesNotConsumeHugeTlbPool) {
+    if (!SharedSegment::Supported(/*mmap=*/true)) {
+        GTEST_SKIP() << "mmap shared segment unavailable";
+    }
+    const uint64_t free_before = HugeTlbFreeBytes();
+    SharedSegmentOptions options = KvOptions(0, 1);
+    options.mmap = true;
+    options.hugetlb = false;
+
+    std::string blob;
+    std::shared_ptr<SharedSegment> segment;
+    auto status =
+        SharedSegment::Create("mmap-thp", kSegmentSize, options, segment, blob);
+    ASSERT_TRUE(status.ok()) << status.ToString();
+    ASSERT_TRUE(segment->Complete({blob}).ok());
+    EXPECT_EQ(HugeTlbFreeBytes(), free_before);
+    EXPECT_FALSE(MappingIsHugeTlb(segment->base_addr()));
+}
+
+TEST(SharedSegmentHugeTlbTest, SingleRankUsesHugeTlbPages) {
+    if (!SharedSegment::Supported(/*mmap=*/true, /*host_register=*/false,
+                                  /*hugetlb=*/true)) {
+        GTEST_SKIP() << "HugeTLB shared segment unavailable in this build";
+    }
+    if (!HugeTlbPoolReady()) {
+        GTEST_SKIP() << "HugeTLB pool is empty; set vm.nr_hugepages";
+    }
+    SharedSegmentOptions options = HugeTlbOptions(0, 1);
+    std::string blob;
+    std::shared_ptr<SharedSegment> segment;
+    const uint64_t free_before = HugeTlbFreeBytes();
+    auto status = SharedSegment::Create("hugetlb-kv", kSegmentSize, options,
+                                        segment, blob);
+    ASSERT_TRUE(status.ok()) << status.ToString();
+    ASSERT_TRUE(segment->Complete({blob}).ok());
+    ASSERT_TRUE(segment->ready());
+    EXPECT_TRUE(MappingIsHugeTlb(segment->base_addr()))
+        << "expected VmFlags ht and KernelPageSize=" << HugeTlbPageBytes();
+    EXPECT_LT(HugeTlbFreeBytes(), free_before);
+
+    auto* bytes = reinterpret_cast<uint8_t*>(segment->base_addr());
+    bytes[0] = 0x3C;
+    bytes[kSegmentSize - 1] = 0xC3;
+    EXPECT_EQ(bytes[0], 0x3C);
+    EXPECT_EQ(bytes[kSegmentSize - 1], 0xC3);
+}
+
+TEST(SharedSegmentHugeTlbTest, TwoRanksSharePagesInOneProcess) {
+    if (!SharedSegment::Supported(/*mmap=*/true, /*host_register=*/false,
+                                  /*hugetlb=*/true)) {
+        GTEST_SKIP() << "HugeTLB shared segment unavailable in this build";
+    }
+    if (!HugeTlbPoolReady()) {
+        GTEST_SKIP() << "HugeTLB pool is empty; set vm.nr_hugepages";
+    }
+    SharedSegmentOptions owner_opts = HugeTlbOptions(0, 2);
+    SharedSegmentOptions peer_opts = HugeTlbOptions(1, 2);
+    std::string owner_blob;
+    std::string peer_blob;
+    std::shared_ptr<SharedSegment> owner;
+    std::shared_ptr<SharedSegment> peer;
+    auto status = SharedSegment::Create("hugetlb-tp", kSegmentSize, owner_opts,
+                                        owner, owner_blob);
+    ASSERT_TRUE(status.ok()) << status.ToString();
+    ASSERT_TRUE(SharedSegment::Create("hugetlb-tp", kSegmentSize, peer_opts,
+                                      peer, peer_blob)
+                    .ok());
+    const std::vector<std::string> blobs = {owner_blob, peer_blob};
+    ASSERT_TRUE(owner->Complete(blobs).ok());
+    ASSERT_TRUE(peer->Complete(blobs).ok());
+    EXPECT_TRUE(MappingIsHugeTlb(owner->base_addr()));
+    EXPECT_TRUE(MappingIsHugeTlb(peer->base_addr()));
+
+    auto* owner_bytes = reinterpret_cast<uint8_t*>(owner->base_addr());
+    auto* peer_bytes = reinterpret_cast<uint8_t*>(peer->base_addr());
+    owner_bytes[0] = 0xAB;
+    owner_bytes[4095] = 0xCD;
+    EXPECT_EQ(peer_bytes[0], 0xAB);
+    EXPECT_EQ(peer_bytes[4095], 0xCD);
+    EXPECT_NE(owner->base_addr(), peer->base_addr());
+}
+
+TEST(SharedSegmentHugeTlbTest, RejectsThpPeerBlob) {
+    if (!SharedSegment::Supported(/*mmap=*/true, /*host_register=*/false,
+                                  /*hugetlb=*/true)) {
+        GTEST_SKIP() << "HugeTLB shared segment unavailable in this build";
+    }
+    if (!HugeTlbPoolReady()) {
+        GTEST_SKIP() << "HugeTLB pool is empty; set vm.nr_hugepages";
+    }
+    SharedSegmentOptions owner_opts = HugeTlbOptions(0, 2);
+    SharedSegmentOptions peer_opts = KvOptions(1, 2);
+    peer_opts.mmap = true;
+    peer_opts.hugetlb = false;
+
+    std::string owner_blob;
+    std::string peer_blob;
+    std::shared_ptr<SharedSegment> owner;
+    std::shared_ptr<SharedSegment> peer;
+    auto status = SharedSegment::Create("hugetlb-mix", kSegmentSize, owner_opts,
+                                        owner, owner_blob);
+    ASSERT_TRUE(status.ok()) << status.ToString();
+    ASSERT_TRUE(SharedSegment::Create("hugetlb-mix", kSegmentSize, peer_opts,
+                                      peer, peer_blob)
+                    .ok());
+    const std::vector<std::string> blobs = {owner_blob, peer_blob};
+    EXPECT_TRUE(owner->Complete(blobs).IsInvalidArgument());
+    EXPECT_TRUE(peer->Complete(blobs).IsInvalidArgument());
+}
+
+TEST(SharedSegmentHugeTlbTest, TwoProcessesSharePages) {
+    if (!SharedSegment::Supported(/*mmap=*/true, /*host_register=*/false,
+                                  /*hugetlb=*/true)) {
+        GTEST_SKIP() << "HugeTLB shared segment unavailable in this build";
+    }
+    if (!HugeTlbPoolReady()) {
+        GTEST_SKIP() << "HugeTLB pool is empty; set vm.nr_hugepages";
+    }
+
+    int to_peer[2];
+    int to_owner[2];
+    ASSERT_EQ(pipe(to_peer), 0);
+    ASSERT_EQ(pipe(to_owner), 0);
+
+    const pid_t child = fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        close(to_peer[1]);
+        close(to_owner[0]);
+        SharedSegmentOptions peer_opts = HugeTlbOptions(1, 2);
+        std::string peer_blob;
+        std::shared_ptr<SharedSegment> peer;
+        auto status = SharedSegment::Create("hugetlb-fork", kSegmentSize,
+                                            peer_opts, peer, peer_blob);
+        if (!status.ok() ||
+            write(to_owner[1], peer_blob.data(), peer_blob.size()) !=
+                static_cast<ssize_t>(peer_blob.size())) {
+            _exit(2);
+        }
+        std::string owner_blob(kSegmentBlobBytes, '\0');
+        if (read(to_peer[0], owner_blob.data(), owner_blob.size()) !=
+            static_cast<ssize_t>(owner_blob.size())) {
+            _exit(3);
+        }
+        const std::vector<std::string> blobs = {owner_blob, peer_blob};
+        if (!peer->Complete(blobs).ok()) {
+            _exit(4);
+        }
+        uint8_t ready = 1;
+        if (write(to_owner[1], &ready, 1) != 1) {
+            _exit(5);
+        }
+        if (read(to_peer[0], &ready, 1) != 1) {
+            _exit(6);
+        }
+        auto* bytes = reinterpret_cast<uint8_t*>(peer->base_addr());
+        const int ok = (bytes[0] == 0xA5 && bytes[4095] == 0x5A &&
+                        MappingIsHugeTlb(peer->base_addr()))
+                           ? 0
+                           : 7;
+        _exit(ok);
+    }
+
+    close(to_peer[0]);
+    close(to_owner[1]);
+    SharedSegmentOptions owner_opts = HugeTlbOptions(0, 2);
+    std::string owner_blob;
+    std::shared_ptr<SharedSegment> owner;
+    auto status = SharedSegment::Create("hugetlb-fork", kSegmentSize,
+                                        owner_opts, owner, owner_blob);
+    ASSERT_TRUE(status.ok()) << status.ToString();
+    ASSERT_EQ(write(to_peer[1], owner_blob.data(), owner_blob.size()),
+              static_cast<ssize_t>(owner_blob.size()));
+
+    std::string peer_blob(kSegmentBlobBytes, '\0');
+    ASSERT_EQ(read(to_owner[0], peer_blob.data(), peer_blob.size()),
+              static_cast<ssize_t>(peer_blob.size()));
+    const std::vector<std::string> blobs = {owner_blob, peer_blob};
+    ASSERT_TRUE(owner->Complete(blobs).ok());
+    EXPECT_TRUE(MappingIsHugeTlb(owner->base_addr()));
+
+    uint8_t ready = 0;
+    ASSERT_EQ(read(to_owner[0], &ready, 1), 1);
+    auto* bytes = reinterpret_cast<uint8_t*>(owner->base_addr());
+    bytes[0] = 0xA5;
+    bytes[4095] = 0x5A;
+    ASSERT_EQ(write(to_peer[1], &ready, 1), 1);
+
+    int wstatus = 0;
+    ASSERT_EQ(waitpid(child, &wstatus, 0), child);
+    ASSERT_TRUE(WIFEXITED(wstatus));
+    EXPECT_EQ(WEXITSTATUS(wstatus), 0);
+}
+
 #if defined(USE_ASCEND_DIRECT)
 TEST(SharedSegmentMmapTest, HostRegisterTwoRanksSharePages) {
     if (!SharedSegment::Supported(/*mmap=*/true, /*host_register=*/true)) {
         GTEST_SKIP() << "HostRegister unavailable in this build";
     }
-    if (aclInit(nullptr) != ACL_ERROR_NONE ||
-        aclrtSetDevice(0) != ACL_ERROR_NONE) {
+    (void)aclInit(nullptr);
+    if (aclrtSetDevice(0) != ACL_ERROR_NONE) {
         GTEST_SKIP() << "aclrtSetDevice(0) unavailable";
     }
     SharedSegmentOptions owner_opts = KvOptions(0, 2);
@@ -430,6 +719,56 @@ TEST(SharedSegmentMmapTest, HostRegisterTwoRanksSharePages) {
     ASSERT_TRUE(peer->Complete(blobs).ok()) << "peer complete";
     ASSERT_NE(owner->device_addr(), 0u);
     ASSERT_NE(peer->device_addr(), 0u);
+
+    auto* owner_bytes = reinterpret_cast<uint8_t*>(owner->base_addr());
+    auto* peer_bytes = reinterpret_cast<uint8_t*>(peer->base_addr());
+    owner_bytes[0] = 0x11;
+    owner_bytes[4095] = 0x22;
+    EXPECT_EQ(peer_bytes[0], 0x11);
+    EXPECT_EQ(peer_bytes[4095], 0x22);
+}
+
+TEST(SharedSegmentHugeTlbTest, HostRegisterTwoRanksSharePages) {
+    if (!SharedSegment::Supported(/*mmap=*/true, /*host_register=*/true,
+                                  /*hugetlb=*/true)) {
+        GTEST_SKIP() << "HostRegister HugeTLB unavailable in this build";
+    }
+    if (!HugeTlbPoolReady()) {
+        GTEST_SKIP() << "HugeTLB pool is empty; set vm.nr_hugepages";
+    }
+    (void)aclInit(nullptr);
+    if (aclrtSetDevice(0) != ACL_ERROR_NONE) {
+        GTEST_SKIP() << "aclrtSetDevice(0) unavailable";
+    }
+    SharedSegmentOptions owner_opts = HugeTlbOptions(0, 2);
+    owner_opts.host_register = true;
+    owner_opts.device_id = 0;
+    SharedSegmentOptions peer_opts = owner_opts;
+    peer_opts.rank_id = 1;
+
+    std::string owner_blob;
+    std::string peer_blob;
+    std::shared_ptr<SharedSegment> owner;
+    std::shared_ptr<SharedSegment> peer;
+    auto status = SharedSegment::Create("hugetlb-hr-tp", kSegmentSize,
+                                        owner_opts, owner, owner_blob);
+    if (!status.ok()) {
+        GTEST_SKIP() << "HugeTLB HostRegister create failed: "
+                     << status.ToString();
+    }
+    status = SharedSegment::Create("hugetlb-hr-tp", kSegmentSize, peer_opts,
+                                   peer, peer_blob);
+    if (!status.ok()) {
+        GTEST_SKIP() << "peer HugeTLB HostRegister failed: "
+                     << status.ToString();
+    }
+    const std::vector<std::string> blobs = {owner_blob, peer_blob};
+    ASSERT_TRUE(owner->Complete(blobs).ok()) << "owner complete";
+    ASSERT_TRUE(peer->Complete(blobs).ok()) << "peer complete";
+    ASSERT_NE(owner->device_addr(), 0u);
+    ASSERT_NE(peer->device_addr(), 0u);
+    EXPECT_TRUE(MappingIsHugeTlb(owner->base_addr()));
+    EXPECT_TRUE(MappingIsHugeTlb(peer->base_addr()));
 
     auto* owner_bytes = reinterpret_cast<uint8_t*>(owner->base_addr());
     auto* peer_bytes = reinterpret_cast<uint8_t*>(peer->base_addr());

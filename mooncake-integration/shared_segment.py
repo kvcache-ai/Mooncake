@@ -61,6 +61,7 @@ def create_shared_segment(
     comm_group: Any = None,
     mmap: bool = True,
     host_register: bool = False,
+    hugetlb: bool = False,
     *,
     tp_group: Any = None,
 ) -> SharedSegment:
@@ -75,8 +76,10 @@ def create_shared_segment(
 
     ``mmap`` (default True) uses an unnamed memfd and asks the kernel for THP
     (``MADV_HUGEPAGE``) so the span can be 2MiB pages without a HugeTLB pool;
-    4KiB pages if THP cannot allocate. Ranks share those pages through the
-    memfd. Set ``mmap=False`` for the platform VMM fabric path.
+    4KiB pages if THP cannot allocate. Set ``hugetlb=True`` to use
+    ``MFD_HUGETLB`` instead; that consumes ``vm.nr_hugepages`` and fails if
+    the pool cannot back the span. Ranks share those pages through the memfd.
+    Set ``mmap=False`` for the platform VMM fabric path.
     ``host_register`` (default False) HostRegister's mmap pages for
     ``device_id`` so ``tensors().data_ptr()`` is a device VA suitable for TE
     ``location=\"npu\"`` ROCE D2rH; requires ``mmap=True``. Ascend VMM
@@ -87,7 +90,11 @@ def create_shared_segment(
     comm_group = _select_comm_group(comm_group, tp_group)
     if host_register and not mmap:
         raise SharedSegmentError("host_register requires mmap=True")
-    if not shared_segment_supported(mmap=mmap, host_register=host_register):
+    if hugetlb and not mmap:
+        raise SharedSegmentError("hugetlb requires mmap=True")
+    if not shared_segment_supported(
+        mmap=mmap, host_register=host_register, hugetlb=hugetlb
+    ):
         if not mmap:
             raise SharedSegmentError(
                 "This mooncake build has no VMM backend for shared segments"
@@ -95,6 +102,10 @@ def create_shared_segment(
         if host_register:
             raise SharedSegmentError(
                 "This mooncake build cannot HostRegister shared-segment pages"
+            )
+        if hugetlb:
+            raise SharedSegmentError(
+                "This mooncake build cannot allocate HugeTLB shared-segment pages"
             )
         raise SharedSegmentError(
             "This mooncake build has no mmap shared-segment backend"
@@ -126,6 +137,7 @@ def create_shared_segment(
             device,
             mmap,
             host_register,
+            hugetlb,
         )
     except RuntimeError as exc:
         create_error = str(exc)
@@ -214,8 +226,10 @@ class SharedSegment:
         return self._segment.size()
 
 
-def shared_segment_supported(mmap: bool = True, host_register: bool = False) -> bool:
-    return _CppSharedSegment.supported(mmap, host_register)
+def shared_segment_supported(
+    mmap: bool = True, host_register: bool = False, hugetlb: bool = False
+) -> bool:
+    return _CppSharedSegment.supported(mmap, host_register, hugetlb)
 
 
 @dataclass(frozen=True)

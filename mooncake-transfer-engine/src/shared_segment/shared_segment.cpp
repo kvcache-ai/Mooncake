@@ -76,6 +76,10 @@ Status ValidateOptions(const SharedSegmentOptions& options) {
         return Status::InvalidArgument(
             "Shared segment host_register requires mmap=true");
     }
+    if (options.hugetlb && !options.mmap) {
+        return Status::InvalidArgument(
+            "Shared segment hugetlb requires mmap=true");
+    }
     return Status::OK();
 }
 
@@ -150,6 +154,7 @@ uint64_t ComputeSegmentFingerprint(const std::string& name, uint64_t size,
     hash = HashValue(hash, options.owner_rank);
     hash = HashValue(hash, options.mmap ? 1ULL : 0ULL);
     hash = HashValue(hash, options.host_register ? 1ULL : 0ULL);
+    hash = HashValue(hash, options.hugetlb ? 1ULL : 0ULL);
     return hash;
 }
 
@@ -220,8 +225,8 @@ uintptr_t SharedSegment::device_addr() const {
     return backend_ == nullptr ? 0 : backend_->DeviceAddr();
 }
 
-bool SharedSegment::Supported(bool mmap, bool host_register) {
-    if (host_register && !mmap) {
+bool SharedSegment::Supported(bool mmap, bool host_register, bool hugetlb) {
+    if ((host_register || hugetlb) && !mmap) {
         return false;
     }
     if (!mmap) {
