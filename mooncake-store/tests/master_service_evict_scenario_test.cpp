@@ -544,6 +544,72 @@ TEST_F(MasterServiceEvictScenarioTest, TenantWatermarkEvictionWritesOpLog) {
 }
 
 TEST_F(MasterServiceEvictScenarioTest,
+       TenantWatermarkEvictionKeepsLastCopyWhenOffloadCannotQueue) {
+    // offload_on_evict without offload_force_evict: a memory-only object may
+    // leave memory only after its offload has been queued. "memory" has no
+    // local disk, so the offload cannot queue and the tenant pass must keep
+    // the last copy and write no eviction record.
+    const std::string cluster_id = "evict_scenario_tenant_offload_unqueued";
+    auto backend = std::make_shared<EvictFakeBatchHaKvBackend>();
+    auto config = HaConfig(cluster_id, {{"tenant-a", kObjectSize}});
+    config.enable_offload = true;
+    config.offload_on_evict = true;
+    config.offload_force_evict = false;
+    MasterScenario scenario("tenant watermark eviction keeps unoffloaded copy",
+                            config, backend);
+    scenario.Given(MemoryNode("memory"))
+        .Given(Objects({"cold"})
+                   .Size(kObjectSize)
+                   .ForTenant("tenant-a")
+                   .By("memory")
+                   .CompleteOn("memory")
+                   .ExpiresAt(ExpiredBase()));
+
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ReadBatchEventually(storage, 2, batch);
+
+    // The tenant pass runs once per second; two seconds covers a full period.
+    scenario.When(WaitFor(std::chrono::seconds(2)))
+        .Then(Object("cold").ForTenant("tenant-a").IsReadable());
+    EXPECT_EQ(storage.ReadBatch(3, batch), ErrorCode::ETCD_KEY_NOT_EXIST);
+}
+
+TEST_F(MasterServiceEvictScenarioTest,
+       TenantWatermarkEvictionQueuesOffloadBeforeEvicting) {
+    // Same configuration with a local disk: the tenant pass queues the
+    // offload and pins its source, so the only memory copy stays readable,
+    // nothing is evicted (no record), and the node's heartbeat takes the task.
+    const std::string cluster_id = "evict_scenario_tenant_offload_queued";
+    auto backend = std::make_shared<EvictFakeBatchHaKvBackend>();
+    auto config = HaConfig(cluster_id, {{"tenant-a", kObjectSize}});
+    config.enable_offload = true;
+    config.offload_on_evict = true;
+    config.offload_force_evict = false;
+    MasterScenario scenario("tenant watermark eviction queues offload first",
+                            config, backend);
+    scenario.Given(MemoryNode("memory"))
+        .When(MountLocalDisk("memory"))
+        .Given(Objects({"cold"})
+                   .Size(kObjectSize)
+                   .ForTenant("tenant-a")
+                   .By("memory")
+                   .CompleteOn("memory")
+                   .ExpiresAt(ExpiredBase()));
+
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ReadBatchEventually(storage, 2, batch);
+
+    scenario.When(WaitFor(std::chrono::seconds(2)))
+        .Then(Object("cold").ForTenant("tenant-a").IsReadable())
+        .When(OffloadHeartbeat("memory")
+                  .ForTenant("tenant-a")
+                  .ExpectTasks({"cold"}, kObjectSize));
+    EXPECT_EQ(storage.ReadBatch(3, batch), ErrorCode::ETCD_KEY_NOT_EXIST);
+}
+
+TEST_F(MasterServiceEvictScenarioTest,
        OpLogDurabilityGatesTenantQuotaReclamation) {
     const std::string cluster_id = "evict_scenario_durability";
     const std::string tenant = TenantId::Default().value();

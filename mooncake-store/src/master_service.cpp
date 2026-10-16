@@ -10809,22 +10809,49 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
             ? static_cast<long>(offloading_queue_limit_ * offload_cap_ratio_)
             : 0;
 
+    // With the OpLog on, persist an eviction right before it happens, after
+    // the offload decision below: an object that has to wait for its offload
+    // (offload_on_evict without offload_force_evict) is then neither marked
+    // REMOVED nor recorded, and a source pinned by a queued offload is not
+    // evictable here.
+    bool oplog_stop = false;
+    auto persist_and_evict =
+        [&, this](
+            const std::string& key, ObjectMetadata& metadata,
+            TenantState& tenant_state,
+            std::vector<std::vector<Replica>>& deferred_replicas) -> uint64_t {
+        if (enable_oplog_) {
+            if (!can_evict_replicas(metadata)) {
+                return 0;
+            }
+            if (!PersistMemoryEvictionToOpLog(normalized_tenant, key, metadata,
+                                              "EvictTenantMemoryForQuota")) {
+                oplog_stop = true;
+                return 0;
+            }
+        }
+        return evict_replicas(tenant_state, metadata, deferred_replicas);
+    };
+
     auto try_evict_or_offload = [&, this](const std::string& key,
                                           ObjectMetadata& metadata,
                                           TenantState& tenant_state,
                                           std::vector<std::vector<Replica>>&
                                               deferred_replicas) {
-        if (enable_oplog_ || !offload_on_evict_) {
-            return evict_replicas(tenant_state, metadata, deferred_replicas);
+        if (!offload_on_evict_) {
+            return persist_and_evict(key, metadata, tenant_state,
+                                     deferred_replicas);
         }
 
         if (has_local_disk_replica(metadata)) {
-            return evict_replicas(tenant_state, metadata, deferred_replicas);
+            return persist_and_evict(key, metadata, tenant_state,
+                                     deferred_replicas);
         }
 
         if (offload_force_evict_ && offload_queued_this_call >= offload_cap) {
             ++offload_cap_forced_count;
-            return evict_replicas(tenant_state, metadata, deferred_replicas);
+            return persist_and_evict(key, metadata, tenant_state,
+                                     deferred_replicas);
         }
 
         bool queued = false;
@@ -10854,12 +10881,14 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
         if (queued) {
             ++offload_queued_this_call;
             ++offload_deferred_count;
-            return evict_replicas(tenant_state, metadata, deferred_replicas);
+            return persist_and_evict(key, metadata, tenant_state,
+                                     deferred_replicas);
         }
 
         if (offload_force_evict_) {
             ++offload_push_failed_forced;
-            return evict_replicas(tenant_state, metadata, deferred_replicas);
+            return persist_and_evict(key, metadata, tenant_state,
+                                     deferred_replicas);
         }
         return uint64_t{0};
     };
@@ -10893,13 +10922,11 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
                 return {};
             }
             if (!metadata.IsGrouped()) {
-                if (!PersistMemoryEvictionToOpLog(
-                        normalized_tenant, key, metadata,
-                        "EvictTenantMemoryForQuota")) {
-                    return {.stop_scan = true};
-                }
                 uint64_t freed = try_evict_or_offload(
                     key, metadata, tenant_state, deferred_replicas);
+                if (oplog_stop) {
+                    return {.stop_scan = true};
+                }
                 TenantQuotaEvictionResult result{
                     .freed_bytes = freed,
                     .evicted_objects = freed > 0 ? 1U : 0U};
@@ -10932,13 +10959,11 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
             [&, this](const std::string& member_key,
                       ObjectMetadata& member_metadata, TenantState& state,
                       MetadataShardAccessorRW& accessor) -> EvictMemberOutcome {
-            if (!PersistMemoryEvictionToOpLog(normalized_tenant, member_key,
-                                              member_metadata,
-                                              "EvictTenantMemoryForQuota")) {
-                return {.stop_scan = true};
-            }
             const uint64_t freed = try_evict_or_offload(
                 member_key, member_metadata, state, deferred_replicas);
+            if (oplog_stop) {
+                return {.stop_scan = true};
+            }
             EvictMemberOutcome outcome{.freed_bytes = freed,
                                        .evicted_objects = freed > 0 ? 1 : 0};
             if (!enable_oplog_ && freed > 0) {
