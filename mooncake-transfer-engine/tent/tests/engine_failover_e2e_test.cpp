@@ -31,6 +31,7 @@
 // ---------------------------------------------------------------------------
 
 #include <gtest/gtest.h>
+#include <sys/mman.h>
 
 #include <atomic>
 #include <chrono>
@@ -41,6 +42,7 @@
 #include <set>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -1740,6 +1742,154 @@ TEST(EngineFailoverE2E, PollStageFailoverWithDerivedTasksRunsOnce) {
     EXPECT_TRUE(engine.freeBatch(batch_id).ok());
     EXPECT_TRUE(
         engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
+}
+
+class PollStageRejectedFallbackTest
+    : public ::testing::TestWithParam<std::tuple<bool, int, int>> {};
+
+TEST_P(PollStageRejectedFallbackTest, ContinuesWithinRemainingBudget) {
+    const auto [queued, poll_mode, max_attempts] = GetParam();
+    auto cfg = makeMinimalP2PConfig();
+    cfg->set("merge_requests", true);
+    cfg->set("max_failover_attempts", max_attempts);
+    cfg->set("enable_runtime_queue", queued);
+    cfg->set("runtime_queue/max_outstanding_owners", 16UL);
+    cfg->set("runtime_queue/max_outstanding_bytes", 1UL << 20);
+    cfg->set("runtime_queue/max_dispatch_owners", 16UL);
+    cfg->set("runtime_queue/max_dispatch_bytes", 1UL << 20);
+    cfg->set("runtime_queue/staging_owner_reserve", 0UL);
+    cfg->set("runtime_queue/staging_byte_reserve", 0UL);
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    // Buffer registration advertises these in RDMA -> SHM -> TCP order.
+    auto primary = std::make_shared<FakeTransport>(
+        RDMA, FakeTransport::StatusFactory{},
+        [](const Request&, int) { return TransferStatus{FAILED, 0}; });
+    auto rejected = std::make_shared<FakeTransport>(
+        SHM, FakeTransport::StatusFactory{}, FakeTransport::PollStatusFactory{},
+        /*force_submit_fail=*/true);
+    auto healthy = std::make_shared<FakeTransport>(TCP);
+    engine.swapTransportForTest(RDMA, primary);
+    engine.swapTransportForTest(SHM, rejected);
+    engine.swapTransportForTest(TCP, healthy);
+
+    constexpr size_t kHalf = 2048;
+    std::vector<uint8_t> buffer(kHalf * 2, 0x6c);
+    ASSERT_TRUE(engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+    const auto batch_id = engine.allocateBatch(2);
+    ASSERT_NE(batch_id, static_cast<BatchID>(0));
+    Request first{Request::WRITE, buffer.data(), LOCAL_SEGMENT_ID,
+                  reinterpret_cast<uint64_t>(buffer.data()), kHalf};
+    Request second = first;
+    second.source = buffer.data() + kHalf;
+    second.target_offset += kHalf;
+    ASSERT_TRUE(engine.submitTransfer(batch_id, {first, second}).ok());
+
+    TransferStatus status{PENDING, 0};
+    for (int step = 0; step < 3 && status.s == PENDING; ++step) {
+        Status result;
+        if (poll_mode == 0) {
+            // Poll the derived task first to exercise physical-owner routing.
+            result = engine.getTransferStatus(batch_id, 1, status);
+        } else if (poll_mode == 1) {
+            result = engine.getTransferStatus(batch_id, status);
+        } else {
+            result = engine.progressBatch(batch_id, status);
+        }
+        EXPECT_TRUE(result.ok()) << result.ToString();
+        if (!result.ok()) break;
+    }
+    const auto expected = max_attempts == 2 ? COMPLETED : FAILED;
+    EXPECT_EQ(status.s, expected);
+
+    // A rejected submit creates no sub-batch slot. Repeated public polls
+    // must return the final outcome without touching that nonexistent slot.
+    for (size_t task_id : {0U, 1U}) {
+        const auto result = engine.getTransferStatus(batch_id, task_id, status);
+        EXPECT_TRUE(result.ok()) << result.ToString();
+        EXPECT_EQ(status.s, expected);
+        if (expected == COMPLETED) EXPECT_EQ(status.transferred_bytes, kHalf);
+    }
+    EXPECT_EQ(primary->submitted_request_count.load(), 1);
+    EXPECT_EQ(rejected->submit_calls.load(), 1);
+    EXPECT_EQ(rejected->submitted_request_count.load(), 1);
+    EXPECT_EQ(rejected->status_calls.load(), 0);
+    EXPECT_EQ(healthy->submit_calls.load(), max_attempts == 2 ? 1 : 0);
+    EXPECT_EQ(healthy->submitted_request_count.load(),
+              max_attempts == 2 ? 1 : 0);
+
+    EXPECT_TRUE(engine.freeBatch(batch_id).ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
+}
+
+INSTANTIATE_TEST_SUITE_P(EngineFailoverE2E, PollStageRejectedFallbackTest,
+                         ::testing::Combine(::testing::Bool(),
+                                            ::testing::Values(0, 1, 2),
+                                            ::testing::Values(1, 2)));
+
+TEST(EngineFailoverE2E, PollFailureSkipsUnlinkedShmAndTransfersOverHpTcp) {
+    auto cfg = makeMinimalP2PConfig();
+    cfg->set("max_failover_attempts", 2);
+    cfg->set("transports/shm/enable", true);
+    cfg->set("transports/hp_tcp/enable", true);
+    cfg->set("transports/hp_tcp/bind_address", "127.0.0.1");
+    cfg->set("transports/hp_tcp/advertise_address", "127.0.0.1");
+    cfg->set("transports/hp_tcp/port", 0);
+    cfg->set("transports/hp_tcp/worker_count", 1);
+    cfg->set("transports/hp_tcp/connect_timeout_ms", 1000);
+    cfg->set("transports/hp_tcp/progress_timeout_ms", 1000);
+
+    constexpr size_t kLength = 4096;
+    std::vector<uint8_t> local(kLength);
+    TransferEngineImpl target(cfg);
+    TransferEngineImpl initiator(cfg);
+    ASSERT_TRUE(target.available());
+    ASSERT_TRUE(initiator.available());
+    auto primary = std::make_shared<FakeTransport>(
+        RDMA, FakeTransport::StatusFactory{},
+        [](const Request&, int) { return TransferStatus{FAILED, 0}; });
+    initiator.swapTransportForTest(RDMA, primary);
+    target.swapTransportForTest(RDMA, std::make_shared<FakeTransport>(RDMA));
+
+    MemoryOptions options;
+    options.type = SHM;
+    void* remote = nullptr;
+    ASSERT_TRUE(target.allocateLocalMemory(&remote, kLength, options).ok());
+    ASSERT_FALSE(options.shm_path.empty());
+    // Register all three routes, keeping the real SHM allocation metadata.
+    options.type = UNSPEC;
+    ASSERT_TRUE(target.registerLocalMemory({remote}, {kLength}, options).ok());
+    ASSERT_TRUE(initiator.registerLocalMemory(local.data(), local.size()).ok());
+    SegmentID peer;
+    ASSERT_TRUE(initiator.openSegment(peer, target.getSegmentName()).ok());
+
+    // Unlinking preserves the target mapping but prevents a new SHM consumer
+    // from opening it. The real SHM transport must reject before copying;
+    // recovery then needs the real HP TCP loopback data path.
+    ASSERT_EQ(shm_unlink(options.shm_path.c_str()), 0);
+    for (const auto opcode : {Request::READ, Request::WRITE}) {
+        for (size_t i = 0; i < kLength; ++i) {
+            local[i] = static_cast<uint8_t>(i * 7);
+            static_cast<uint8_t*>(remote)[i] = static_cast<uint8_t>(i * 13 + 3);
+        }
+        const auto batch_id = initiator.allocateBatch(1);
+        ASSERT_NE(batch_id, static_cast<BatchID>(0));
+        Request request{opcode, local.data(), peer,
+                        reinterpret_cast<uint64_t>(remote), kLength};
+        ASSERT_TRUE(initiator.submitTransfer(batch_id, {request}).ok());
+        const auto status = pollUntilDone(initiator, batch_id, 0);
+        EXPECT_EQ(status.s, COMPLETED);
+        EXPECT_EQ(status.transferred_bytes, kLength);
+        EXPECT_EQ(std::memcmp(local.data(), remote, kLength), 0);
+        EXPECT_TRUE(initiator.freeBatch(batch_id).ok());
+    }
+    EXPECT_EQ(primary->submit_calls.load(), 2);
+    EXPECT_TRUE(initiator.closeSegment(peer).ok());
+    EXPECT_TRUE(initiator.unregisterLocalMemory(local.data()).ok());
+    EXPECT_TRUE(target.unregisterLocalMemory(remote).ok());
+    EXPECT_TRUE(target.freeLocalMemory(remote).ok());
 }
 
 TEST(EngineFailoverE2E, DerivedCancellationFollowsPollStageFailoverOwner) {
