@@ -96,3 +96,13 @@ add_executable(oplog_batch_e2e_test oplog_batch_e2e_test.cpp process_handler.cpp
 target_link_libraries(oplog_batch_e2e_test PUBLIC glog::glog gtest pthread)
 add_test(NAME oplog_batch_e2e_test COMMAND oplog_batch_e2e_test)
 set_tests_properties(oplog_batch_e2e_test PROPERTIES LABELS oplog_batch_smoke)
+
+# Run through run_nof_controller_recovery_tcp_e2e.sh, which manages the target.
+if(USE_NOF)
+  add_executable(nof_controller_recovery_e2e nof_controller_recovery_e2e.cpp)
+  target_include_directories(nof_controller_recovery_e2e
+                             PRIVATE ${SPDK_INCLUDE_DIR} ${DPDK_INCLUDE_DIR})
+  target_link_libraries(
+    nof_controller_recovery_e2e PRIVATE mooncake_store gflags::gflags
+                                        glog::glog pthread)
+endif()
