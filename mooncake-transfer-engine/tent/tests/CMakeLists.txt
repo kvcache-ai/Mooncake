@@ -528,6 +528,41 @@ target_include_directories(tent_topology_priority_matrix_test
 add_test(NAME tent_topology_priority_matrix_test
          COMMAND tent_topology_priority_matrix_test)
 
+# Exercise the CPU probe with deterministic verbs devices, without an RNIC.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux"
+   AND NOT USE_CUDA
+   AND NOT USE_HIP
+   AND NOT USE_ASCEND
+   AND NOT USE_ASCEND_DIRECT
+   AND NOT USE_SUNRISE
+   AND NOT USE_TPU
+   AND NOT USE_MLU
+   AND NOT USE_MEMFABRIC
+   AND NOT USE_XPU)
+  add_executable(tent_platform_config_test platform_config_test.cpp)
+  target_link_libraries(tent_platform_config_test PRIVATE gtest gtest_main
+                                                          tent_link_group)
+  target_include_directories(tent_platform_config_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  foreach(
+    symbol
+    ibv_get_device_list
+    ibv_free_device_list
+    ibv_get_device_name
+    ibv_open_device
+    ibv_close_device
+    ibv_query_device
+    ibv_query_port
+    stat
+    access
+    realpath
+    __realpath_chk)
+    target_link_options(tent_platform_config_test PRIVATE
+                        "-Wl,--wrap=${symbol}")
+  endforeach()
+  add_test(NAME tent_platform_config_test COMMAND tent_platform_config_test)
+endif()
+
 add_executable(tent_strict_local_numa_test strict_local_numa_test.cpp)
 target_link_libraries(tent_strict_local_numa_test PRIVATE gtest gtest_main
                                                           tent_link_group)

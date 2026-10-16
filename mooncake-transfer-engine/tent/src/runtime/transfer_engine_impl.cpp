@@ -431,8 +431,11 @@ Status TransferEngineImpl::construct() {
         CHECK_STATUS(discoverLocalIpAddress(hostname_, ipv6_));
 
     topology_ = std::make_shared<Topology>();
-    auto loader = &Platform::getLoader(conf_);
-    CHECK_STATUS(topology_->loadFromConfig(*conf_, {loader}));
+    // Keep the shared allocator/copy platform, but probe topology with this
+    // engine's configuration rather than the first engine's NIC filters.
+    (void)Platform::getLoader(conf_);
+    auto topology_loader = Platform::create(conf_);
+    CHECK_STATUS(topology_->loadFromConfig(*conf_, {topology_loader.get()}));
 
     metadata_ =
         std::make_shared<ControlService>(metadata_type, metadata_servers, this);

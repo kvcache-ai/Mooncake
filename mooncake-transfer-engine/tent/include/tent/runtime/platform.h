@@ -40,6 +40,9 @@ inline bool isGpuMemoryType(MemoryType t) {
 
 class Platform {
    public:
+    // Topology probes need an instance with the current engine's NIC filters.
+    static std::unique_ptr<Platform> create(std::shared_ptr<Config> conf);
+
     static Platform &getLoader(std::shared_ptr<Config> conf = nullptr);
 
     Platform() {}
