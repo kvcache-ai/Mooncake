@@ -314,6 +314,37 @@ class StorageBackendInterface {
         return std::vector<std::string>{};
     }
 
+    // Zero-copy reads: a backend whose values already sit in byte-addressable
+    // memory that a NIC can reach exposes that memory here so FileStorage can
+    // register it with the transfer engine. std::nullopt means "copy path
+    // only". The region must stay mapped for the backend's lifetime.
+    // `location` is the transfer-engine location to register it under
+    // ("cpu:N"), or empty when unknown.
+    struct ZeroCopyRegionInfo {
+        void* base;
+        size_t size;
+        std::string location;
+    };
+    virtual std::optional<ZeroCopyRegionInfo> ZeroCopyRegion() const {
+        return std::nullopt;
+    }
+
+    // Values of a pinned batch, addressed in place inside ZeroCopyRegion().
+    // `owner` holds the extents (and the mapping) until it is dropped; until
+    // then the backend will not reuse those bytes.
+    struct PinnedBatch {
+        std::vector<uint64_t> pointers;
+        std::shared_ptr<void> owner;
+    };
+
+    // Pins `keys` in place instead of copying them. Fails as a whole (no
+    // partial batches); callers fall back to BatchLoad on any error.
+    virtual tl::expected<PinnedBatch, ErrorCode> BatchPin(
+        const std::vector<std::string>& /* keys */,
+        const std::vector<int64_t>& /* sizes */) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+    }
+
     FileStorageConfig file_storage_config_;
 };
 
@@ -1224,6 +1255,21 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
 
     void RemoveAll() override;
 
+    // Non-empty only for a DAX arena with dax_zero_copy set.
+    std::optional<ZeroCopyRegionInfo> ZeroCopyRegion() const override;
+
+    // Pins each record's extent and returns the value's address inside the
+    // DAX mapping. Refuses (BUFFER_OVERFLOW) once the bytes held by
+    // outstanding pins would exceed local_buffer_size, the same in-flight
+    // bound the copy path gets from ClientBuffer.
+    tl::expected<PinnedBatch, ErrorCode> BatchPin(
+        const std::vector<std::string>& keys,
+        const std::vector<int64_t>& sizes) override;
+
+    int64_t GetPinnedBytesForTest() const {
+        return pinned_bytes_->load(std::memory_order_relaxed);
+    }
+
     // On-disk record layout v3 (single definition, shared by the write,
     // read and recovery paths of this backend, and by future DMA writers
     // such as GDS):
@@ -1422,6 +1468,11 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
     // Returns full path to data file: {storage_path_}/kv_cache.data
     std::string GetDataFilePath() const;
 
+    // Maps cfg_.dax_device_path as the data arena (see DaxFile), binding
+    // data_file_path_ and data_file_. Used instead of the file open paths
+    // whenever dax_device_path is set.
+    tl::expected<void, ErrorCode> OpenDaxDataFile();
+
     static constexpr size_t kNumShards =
         1024;  // Number of shards (must be power of 2 for bitwise optimization)
 
@@ -1490,6 +1541,15 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
     // Counter for keys skipped due to fallback eviction exhaustion.
     // See GetEvictionSkips() for the public accessor.
     std::atomic<int64_t> eviction_skips_{0};
+
+    // Transfer-engine location of the DAX mapping, resolved once when it is
+    // mapped (see ZeroCopyRegion). Empty when unknown.
+    std::string dax_location_;
+
+    // Value bytes held by outstanding BatchPin owners. Shared with each
+    // owner's deleter so a release never touches a destroyed backend.
+    std::shared_ptr<std::atomic<int64_t>> pinned_bytes_ =
+        std::make_shared<std::atomic<int64_t>>(0);
 
     // Mutex protecting fifo_index_ and insert_seq_. Must be acquired BEFORE
     // any shard mutex (shards_[i].mutex) when both are held.
@@ -1604,6 +1664,7 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
     int64_t GetMetadataConsecutiveFailures() const {
         return metadata_consecutive_failures_.load(std::memory_order_relaxed);
     }
+    uint64_t GetCapacityForTest() const { return capacity_; }
 
    private:
 };
