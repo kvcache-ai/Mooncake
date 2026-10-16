@@ -163,12 +163,14 @@ starting Mooncake to use DMA-BUF. Set `WITH_NVIDIA_PEERMEM=1` to use the legacy
 https://docs.nvidia.com/cuda/gpudirect-rdma/ for `nvidia-peermem` installation
 instructions.
 
-When `WITH_NVIDIA_PEERMEM` is **unset**, Mooncake uses the legacy `ibv_reg_mr`
-path. On hosts without `nvidia-peermem` (for example the NVIDIA open kernel
-modules with the inbox RDMA stack and no MLNX_OFED), GPU memory registration
-then fails with `Failed to register memory 0x...: Bad address [14]`; set
-`WITH_NVIDIA_PEERMEM=0` there. DMA-BUF needs the NVIDIA open kernel modules and
-Linux 5.12 or later.
+When `WITH_NVIDIA_PEERMEM` is **unset**, classic Transfer Engine uses the
+legacy `ibv_reg_mr` path. On hosts without `nvidia-peermem` (for example the
+NVIDIA open kernel modules with the inbox RDMA stack and no MLNX_OFED), GPU
+memory registration then fails with `Failed to register memory 0x...: Bad
+address [14]`; set `WITH_NVIDIA_PEERMEM=0` there. DMA-BUF needs the NVIDIA
+open kernel modules and Linux 5.12 or later. TENT defaults to DMA-BUF when
+the variable is unset, and falls back to `ibv_reg_mr` if DMA-BUF export is
+unsupported (CUDA error 801).
 ```
 
 ## Use Mooncake in Docker Containers
