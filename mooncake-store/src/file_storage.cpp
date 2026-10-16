@@ -268,6 +268,8 @@ tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGetOnce(
     const std::vector<std::string>& keys, const std::vector<int64_t>& sizes,
     std::shared_ptr<AllocatedBatch>* staging_out) {
     auto start_time = std::chrono::steady_clock::now();
+    auto lease_timeout =
+        start_time + std::chrono::milliseconds(config_.client_buffer_gc_ttl_ms);
     auto load_result = LoadBatch(keys, sizes, false);
     if (!load_result) return tl::make_unexpected(load_result.error());
 
@@ -283,7 +285,8 @@ tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGetOnce(
 
     auto& shard = ShardFor(batch_id);
     MutexLocker locker(&shard.mutex);
-    shard.batches.emplace(batch_id, std::move(allocated_batch));
+    shard.batches.emplace(
+        batch_id, ClientBufferEntry{std::move(allocated_batch), lease_timeout});
     auto end_time = std::chrono::steady_clock::now();
     auto elapsed_time = std::chrono::duration_cast<std::chrono::microseconds>(
                             end_time - start_time)
@@ -364,18 +367,18 @@ tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGet(
 FileStorage::BatchGetResult FileStorage::ShareStagingBuffer(
     const std::shared_ptr<AllocatedBatch>& staging) {
     uint64_t alias_id = next_batch_id_.fetch_add(1, std::memory_order_relaxed);
-    auto& shard = ShardFor(alias_id);
-    MutexLocker locker(&shard.mutex);
-    // One more reader is about to read from this staging buffer, so the lease
-    // has to cover that reader's window as well. It still expires once every
-    // reader is done or dead, which keeps the batch reclaimable by GC.
-    staging->lease_timeout =
+    auto lease_timeout =
         std::chrono::steady_clock::now() +
         std::chrono::milliseconds(config_.client_buffer_gc_ttl_ms);
+    auto& shard = ShardFor(alias_id);
+    MutexLocker locker(&shard.mutex);
+    // The alias lease belongs to this table entry, not the shared staging
+    // object. Alias ids can land in different shards, so a shared deadline
+    // would otherwise be read and written under unrelated mutexes.
     // Alias the leader's batch under a fresh id, so each reader releases its
     // own id and the shared_ptr returns the staging memory to the pool when
     // the last one goes away.
-    shard.batches.emplace(alias_id, staging);
+    shard.batches.emplace(alias_id, ClientBufferEntry{staging, lease_timeout});
     VLOG(1) << "Sharing staging buffer of batch_id " << staging->batch_id
             << " as batch_id " << alias_id;
     return BatchGetResult{alias_id, staging->pointers};
@@ -1195,10 +1198,6 @@ FileStorage::AllocateBatch(const std::vector<std::string>& keys,
     }
     auto result = std::make_shared<AllocatedBatch>();
     result->batch_id = next_batch_id_.fetch_add(1, std::memory_order_relaxed);
-    std::chrono::steady_clock::time_point now =
-        std::chrono::steady_clock::now();
-    auto lease_timeout =
-        now + std::chrono::milliseconds(config_.client_buffer_gc_ttl_ms);
     static constexpr size_t kDirectIOAlignment = 4096;
 
     u_int64_t total_size = 0;
@@ -1229,7 +1228,7 @@ FileStorage::AllocateBatch(const std::vector<std::string>& keys,
                     MutexLocker locker(&shard.mutex);
                     for (auto it = shard.batches.begin();
                          it != shard.batches.end();) {
-                        if (gc_now >= it->second->lease_timeout) {
+                        if (gc_now >= it->second.lease_timeout) {
                             it = shard.batches.erase(it);
                         } else {
                             ++it;
@@ -1257,7 +1256,6 @@ FileStorage::AllocateBatch(const std::vector<std::string>& keys,
         // correction)
         result->pointers.emplace_back(reinterpret_cast<uintptr_t>(data_ptr));
         result->handles.emplace_back(std::move(alloc_result.value()));
-        result->lease_timeout = lease_timeout;
     }
     result->total_size = total_size;
     return result;
@@ -1272,7 +1270,7 @@ void FileStorage::ClientBufferGCThreadFunc() {
                 MutexLocker locker(&shard.mutex);
                 for (auto it = shard.batches.begin();
                      it != shard.batches.end();) {
-                    if (now >= it->second->lease_timeout) {
+                    if (now >= it->second.lease_timeout) {
                         VLOG(1) << "GC releasing batch_id: " << it->first
                                 << " (lease expired)";
                         it = shard.batches.erase(it);
