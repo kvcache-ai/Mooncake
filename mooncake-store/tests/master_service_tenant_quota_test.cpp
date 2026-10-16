@@ -520,8 +520,9 @@ TEST_F(MasterServiceTenantQuotaTest,
 
     auto result = service.NotifyOffloadSuccess(client_id, tasks, {metadata});
 
-    ASSERT_FALSE(result.has_value());
-    EXPECT_EQ(result.error(), ErrorCode::TENANT_NOT_REGISTERED);
+    // A completion without an offload task never creates an object; the
+    // entry is refused without failing the batch.
+    ASSERT_TRUE(result.has_value()) << toString(result.error());
     auto missing = service.ExistKey("ghost", TenantId("tenant-b"));
     ASSERT_TRUE(missing.has_value()) << toString(missing.error());
     EXPECT_FALSE(missing.value());
@@ -529,22 +530,33 @@ TEST_F(MasterServiceTenantQuotaTest,
 
 TEST_F(MasterServiceTenantQuotaTest,
        MultiTenantModeAllowsRegisteredOffloadSuccess) {
-    MasterService service(MakeConfig({{TenantId("tenant-a"), 1000}}));
+    auto config = MakeConfig({{TenantId("tenant-a"), 1000}});
+    config.enable_offload = true;
+    MasterService service(config);
     UUID client_id = MountSegment(service);
+    ASSERT_TRUE(service.MountLocalDiskSegment(client_id, true).has_value());
+    PutComplete(service, client_id, "cold", TenantId("tenant-a"), 128);
+    const int64_t charged =
+        Snapshot(service, TenantId("tenant-a")).charged_bytes;
+    auto tasks = service.OffloadObjectHeartbeat(client_id, true);
+    ASSERT_TRUE(tasks.has_value()) << toString(tasks.error());
+    ASSERT_EQ(tasks->size(), 1u);
 
     StorageObjectMetadata metadata;
     metadata.data_size = 128;
     metadata.transport_endpoint = "disk-endpoint";
-    std::vector<OffloadTaskItem> tasks{
-        OffloadTaskItem{.tenant_id = "tenant-a", .key = "cold", .size = 128}};
-
-    auto result = service.NotifyOffloadSuccess(client_id, tasks, {metadata});
+    auto result = service.NotifyOffloadSuccess(client_id, *tasks, {metadata});
 
     ASSERT_TRUE(result.has_value()) << toString(result.error());
-    auto exists = service.ExistKey("cold", TenantId("tenant-a"));
-    ASSERT_TRUE(exists.has_value()) << toString(exists.error());
-    EXPECT_TRUE(exists.value());
-    EXPECT_EQ(Snapshot(service, TenantId("tenant-a")).charged_bytes, 0);
+    auto replicas = service.GetReplicaList("cold", TenantId("tenant-a"));
+    ASSERT_TRUE(replicas.has_value()) << toString(replicas.error());
+    EXPECT_TRUE(std::any_of(replicas->replicas.begin(),
+                            replicas->replicas.end(),
+                            [](const Replica::Descriptor& replica) {
+                                return replica.is_local_disk_replica();
+                            }));
+    // The disk copy is not charged to the tenant.
+    EXPECT_EQ(Snapshot(service, TenantId("tenant-a")).charged_bytes, charged);
 }
 
 TEST_F(MasterServiceTenantQuotaTest,
@@ -558,14 +570,8 @@ TEST_F(MasterServiceTenantQuotaTest,
                       .build();
     MasterService service(config);
     UUID client_id = MountSegment(service);
-
-    StorageObjectMetadata metadata;
-    metadata.data_size = 128;
-    metadata.transport_endpoint = "disk-endpoint";
-    std::vector<OffloadTaskItem> tasks{
-        OffloadTaskItem{.tenant_id = "tenant-b", .key = "cold", .size = 128}};
-    ASSERT_TRUE(
-        service.NotifyOffloadSuccess(client_id, tasks, {metadata}).has_value());
+    AddCompletedDiskReplica(service, client_id, "cold", TenantId("tenant-b"),
+                            128);
 
     {
         std::ofstream out(initial_policy);
@@ -614,10 +620,12 @@ TEST_F(MasterServiceTenantQuotaTest,
     StorageObjectMetadata metadata;
     metadata.data_size = 128;
     metadata.transport_endpoint = "disk-endpoint";
-    std::vector<OffloadTaskItem> tasks{OffloadTaskItem{
-        .tenant_id = "tenant-b", .key = "warming", .size = 128}};
+    // The store drained the offload task queued at PutEnd.
+    auto tasks = service.OffloadObjectHeartbeat(client_id, true);
+    ASSERT_TRUE(tasks.has_value()) << toString(tasks.error());
+    ASSERT_EQ(tasks->size(), 1u);
 
-    auto result = service.NotifyOffloadSuccess(client_id, tasks, {metadata});
+    auto result = service.NotifyOffloadSuccess(client_id, *tasks, {metadata});
 
     ASSERT_TRUE(result.has_value()) << toString(result.error());
     auto replicas = service.GetReplicaList("warming", TenantId("tenant-b"));
@@ -659,8 +667,16 @@ TEST_F(MasterServiceTenantQuotaTest,
 
     auto result = service.NotifyOffloadSuccess(client_id, tasks, {metadata});
 
-    ASSERT_FALSE(result.has_value());
-    EXPECT_EQ(result.error(), ErrorCode::TENANT_NOT_REGISTERED);
+    // Without an offload task the registration is refused (the entry, not
+    // the batch), so the orphan tenant's object stays memory-only.
+    ASSERT_TRUE(result.has_value()) << toString(result.error());
+    auto replicas = service.GetReplicaList("warming", TenantId("tenant-b"));
+    ASSERT_TRUE(replicas.has_value()) << toString(replicas.error());
+    EXPECT_TRUE(std::none_of(replicas->replicas.begin(),
+                             replicas->replicas.end(),
+                             [](const Replica::Descriptor& replica) {
+                                 return replica.is_local_disk_replica();
+                             }));
 }
 
 TEST_F(MasterServiceTenantQuotaTest,
@@ -678,24 +694,31 @@ TEST_F(MasterServiceTenantQuotaTest,
     ASSERT_TRUE(service.MountLocalDiskSegment(client_a, true).has_value());
     ASSERT_TRUE(service.MountLocalDiskSegment(client_b, true).has_value());
 
-    StorageObjectMetadata first_metadata;
-    first_metadata.data_size = 128;
-    first_metadata.transport_endpoint = "disk-endpoint-a";
-    std::vector<OffloadTaskItem> tasks{
-        OffloadTaskItem{.tenant_id = "tenant-a", .key = "cold", .size = 128}};
-    ASSERT_TRUE(service.NotifyOffloadSuccess(client_a, tasks, {first_metadata})
-                    .has_value());
-    EXPECT_EQ(LocalDiskUsedBytes(service, client_a), 128);
-    EXPECT_EQ(LocalDiskUsedBytes(service, client_b), 0);
+    // "cold" is in client_a's memory with an offload task, and already has
+    // a disk replica of client_b. client_a's completion then only takes the
+    // update path, which must not count as new disk usage.
+    auto config_a = MemoryConfig();
+    config_a.preferred_segment = "quota_segment_a";
+    ASSERT_TRUE(
+        service.PutStart(client_a, "cold", TenantId("tenant-a"), 128, config_a)
+            .has_value());
+    ASSERT_TRUE(
+        service
+            .PutEnd(client_a, "cold", TenantId("tenant-a"), ReplicaType::MEMORY)
+            .has_value());
+    AddCompletedDiskReplica(service, client_b, "cold", TenantId("tenant-a"),
+                            128);
+    auto tasks = service.OffloadObjectHeartbeat(client_a, true);
+    ASSERT_TRUE(tasks.has_value()) << toString(tasks.error());
+    ASSERT_EQ(tasks->size(), 1u);
 
-    StorageObjectMetadata second_metadata;
-    second_metadata.data_size = 128;
-    second_metadata.transport_endpoint = "disk-endpoint-b";
-    auto result =
-        service.NotifyOffloadSuccess(client_b, tasks, {second_metadata});
+    StorageObjectMetadata metadata;
+    metadata.data_size = 128;
+    metadata.transport_endpoint = "disk-endpoint-a";
+    auto result = service.NotifyOffloadSuccess(client_a, *tasks, {metadata});
 
     ASSERT_TRUE(result.has_value()) << toString(result.error());
-    EXPECT_EQ(LocalDiskUsedBytes(service, client_a), 128);
+    EXPECT_EQ(LocalDiskUsedBytes(service, client_a), 0);
     EXPECT_EQ(LocalDiskUsedBytes(service, client_b), 0);
 }
 
@@ -769,14 +792,7 @@ TEST_F(MasterServiceTenantQuotaTest,
     const TenantId tenant_id("tenant-a");
     MasterService service(MakeConfig({{tenant_id, 1000}}));
     UUID client_id = MountSegment(service);
-
-    StorageObjectMetadata metadata;
-    metadata.data_size = 100;
-    metadata.transport_endpoint = "disk-endpoint";
-    std::vector<OffloadTaskItem> tasks{OffloadTaskItem{
-        .tenant_id = tenant_id.value(), .key = "key", .size = 100}};
-    ASSERT_TRUE(
-        service.NotifyOffloadSuccess(client_id, tasks, {metadata}).has_value());
+    AddCompletedDiskReplica(service, client_id, "key", tenant_id, 100);
     ASSERT_EQ(Snapshot(service, tenant_id).charged_bytes, 0);
 
     auto upsert =
