@@ -1,5 +1,8 @@
 from pathlib import Path
+import os
 import re
+import subprocess
+import tempfile
 import unittest
 
 import yaml
@@ -75,6 +78,55 @@ def matches(patterns, tag):
     return any(github_filter_to_regex(p).fullmatch(tag) for p in patterns)
 
 
+# Stable workflows that build through a reusable workflow carry the version
+# check there; the others run it in their own build job.
+VERSION_CHECK_SOURCES = {
+    "release.yaml": "_build-wheel.yaml",
+    "release-cuda13.yaml": "_build-wheel.yaml",
+    "release-non-cuda.yaml": "_build-wheel.yaml",
+    "release-efa.yaml": "_build-efa-wheel.yaml",
+    "release-efa-cuda13.yaml": "_build-efa-wheel.yaml",
+    "release-efa-non-cuda.yaml": "_build-efa-wheel.yaml",
+    "release-musa.yaml": "release-musa.yaml",
+    "release-npu.yaml": "release-npu.yaml",
+    "release-rocm.yaml": "release-rocm.yaml",
+}
+VERSION_CHECK_STEP = "Check tag matches wheel version"
+
+
+def version_check_script(name):
+    with (WORKFLOWS / name).open() as workflow_file:
+        workflow = yaml.safe_load(workflow_file)
+    scripts = [
+        step["run"]
+        for job in workflow["jobs"].values()
+        for step in job.get("steps", [])
+        if step.get("name") == VERSION_CHECK_STEP
+    ]
+    if len(scripts) != 1:
+        raise AssertionError(f"{name}: expected one '{VERSION_CHECK_STEP}' step")
+    return scripts[0]
+
+
+def run_version_check(script, tag, pyproject_version):
+    with tempfile.TemporaryDirectory() as root:
+        wheel_dir = Path(root) / "mooncake-wheel"
+        wheel_dir.mkdir()
+        (wheel_dir / "pyproject.toml").write_text(
+            "[project]\n"
+            'name = "mooncake-transfer-engine"\n'
+            f'version = "{pyproject_version}"\n'
+        )
+        env = dict(os.environ, RELEASE_TAG=tag)
+        return subprocess.run(
+            ["bash", "-c", script],
+            cwd=root,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+
+
 class ReleaseTagFilterTest(unittest.TestCase):
     def test_stable_release_workflows_only_trigger_on_stable_tags(self):
         for name in STABLE_RELEASE_WORKFLOWS:
@@ -94,6 +146,33 @@ class ReleaseTagFilterTest(unittest.TestCase):
         for tag in STABLE_TAGS:
             with self.subTest(tag=tag):
                 self.assertFalse(matches(patterns, tag))
+
+
+class ReleaseVersionCheckTest(unittest.TestCase):
+    def test_every_stable_workflow_has_a_version_check(self):
+        self.assertEqual(set(STABLE_RELEASE_WORKFLOWS), set(VERSION_CHECK_SOURCES))
+
+    def test_matching_tag_passes(self):
+        for name in sorted(set(VERSION_CHECK_SOURCES.values())):
+            script = version_check_script(name)
+            for tag, version in (
+                ("v0.3.14", "0.3.14"),
+                ("v0.3.13.post1", "0.3.13.post1"),
+            ):
+                with self.subTest(workflow=name, tag=tag):
+                    result = run_version_check(script, tag, version)
+                    self.assertEqual(
+                        0, result.returncode, result.stdout + result.stderr
+                    )
+
+    def test_valid_stable_tag_with_stale_pyproject_fails(self):
+        for name in sorted(set(VERSION_CHECK_SOURCES.values())):
+            script = version_check_script(name)
+            for tag, version in (("v0.3.14", "0.3.13"), ("v0.3.13.post1", "0.3.13")):
+                with self.subTest(workflow=name, tag=tag):
+                    result = run_version_check(script, tag, version)
+                    self.assertNotEqual(0, result.returncode)
+                    self.assertIn("does not match", result.stdout)
 
 
 if __name__ == "__main__":
