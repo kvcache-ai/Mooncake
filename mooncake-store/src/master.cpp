@@ -51,6 +51,9 @@ static_assert(mooncake::DEFAULT_MAX_KV_SOFT_PIN_TTL_MS == 24 * 60 * 60 * 1000,
 constexpr char kDefaultKvLeaseTtlFlagValue[] = "10000";
 constexpr char kDefaultKvSoftPinTtlFlagValue[] = "1800000";
 constexpr char kDefaultMaxKvSoftPinTtlFlagValue[] = "86400000";
+// Allowed range of --ha_leader_lease_ttl_sec.
+constexpr int64_t kMinHaLeaderLeaseTtlSec = 2;
+constexpr int64_t kMaxHaLeaderLeaseTtlSec = 60;
 
 namespace {
 
@@ -322,6 +325,20 @@ DEFINE_uint32(kv_events_queue_capacity, 65536,
               "the queue is full (0 = unbounded)");
 DEFINE_string(ha_backend_type, "etcd",
               "HA backend type, e.g. etcd | redis | k8s");
+DEFINE_int64(ha_leader_lease_ttl_sec,
+             mooncake::DEFAULT_MASTER_VIEW_LEASE_TTL_SEC,
+             "Leadership lease TTL in seconds for the etcd HA backend. A "
+             "longer TTL tolerates longer etcd apply stalls but delays "
+             "failover after a leader crash (range 2..60)");
+DEFINE_validator(ha_leader_lease_ttl_sec, [](const char* flagname,
+                                             int64_t value) {
+    if (value < kMinHaLeaderLeaseTtlSec || value > kMaxHaLeaderLeaseTtlSec) {
+        LOG(ERROR) << flagname << " must be in [" << kMinHaLeaderLeaseTtlSec
+                   << ", " << kMaxHaLeaderLeaseTtlSec << "], got " << value;
+        return false;
+    }
+    return true;
+});
 DEFINE_string(ha_backend_connstring, "",
               "HA backend connection string. If unset, only backend_type=etcd "
               "falls back to etcd_endpoints for backward compatibility");
@@ -655,6 +672,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetString("ha_backend_connstring",
                              &master_config.ha_backend_connstring,
                              FLAGS_ha_backend_connstring);
+    default_config.GetInt64("ha_leader_lease_ttl_sec",
+                            &master_config.ha_leader_lease_ttl_sec,
+                            FLAGS_ha_leader_lease_ttl_sec);
     default_config.GetString("etcd_endpoints", &master_config.etcd_endpoints,
                              FLAGS_etcd_endpoints);
     default_config.GetString("cluster_id", &master_config.cluster_id,
@@ -1084,6 +1104,17 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
          !info.is_default) ||
         !conf_set) {
         master_config.ha_backend_connstring = FLAGS_ha_backend_connstring;
+    }
+    if ((google::GetCommandLineFlagInfo("ha_leader_lease_ttl_sec", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.ha_leader_lease_ttl_sec = FLAGS_ha_leader_lease_ttl_sec;
+    }
+    if (master_config.ha_leader_lease_ttl_sec < kMinHaLeaderLeaseTtlSec ||
+        master_config.ha_leader_lease_ttl_sec > kMaxHaLeaderLeaseTtlSec) {
+        LOG(FATAL) << "ha_leader_lease_ttl_sec must be in ["
+                   << kMinHaLeaderLeaseTtlSec << ", " << kMaxHaLeaderLeaseTtlSec
+                   << "], got " << master_config.ha_leader_lease_ttl_sec;
     }
     if ((google::GetCommandLineFlagInfo("etcd_endpoints", &info) &&
          !info.is_default) ||
@@ -1569,6 +1600,7 @@ int main(int argc, char* argv[]) {
         << ", offload_cap_ratio=" << master_config.offload_cap_ratio
         << ", ha_backend_type=" << master_config.ha_backend_type
         << ", ha_backend_connstring=" << ha_backend_connstring
+        << ", ha_leader_lease_ttl_sec=" << master_config.ha_leader_lease_ttl_sec
         << ", etcd_endpoints=" << master_config.etcd_endpoints
         << ", client_active_ttl_sec=" << master_config.client_active_ttl_sec
         << ", client_suspicion_ttl_sec="
