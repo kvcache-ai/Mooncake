@@ -59,14 +59,29 @@ can fail a request; applications decide whether and when to resubmit. A failed
 transfer may have completed some chunks, so callers must account for partial
 writes and keep buffers alive while any physical operations remain in flight.
 
-Device copies are synchronous in this version. There is no MLU peer-to-peer,
-MLU IPC, direct device RDMA, or copy/network overlap implementation here. The
-existing host staging planner can also select HP TCP. An invalid allocation
+The MLU transport submits copies involving SDK-pinned host memory to per-context
+device queues and reports completion after a notifier finishes. Internal staging
+buffers use `cnrtHostMalloc`, so the existing chunk scheduler can overlap device
+copies with TCP or HP TCP transfers. Host allocations requested explicitly through
+the MLU transport also use this allocator; their NUMA placement is determined by
+the SDK. Host-to-MLU copies of at most 64 KiB retain synchronous copies to avoid
+the queue overhead for small transfers. Ordinary pageable host buffers also use
+synchronous copies. Applications must keep both allocations alive until the
+transfer reaches a terminal state.
+
+Freeing a sub-batch, unregistering its buffers, or shutting down the transport
+drains outstanding copies before reclaiming resources. A notifier-record failure
+keeps the task pending until its queue drains, since the copy may already have
+been submitted. External pinned allocations remain owned by the caller.
+
+There is no MLU peer-to-peer, MLU IPC, or direct device RDMA. An invalid allocation
 range, missing local copy transport, or missing staging location fails instead
 of submitting device pointers to the host network path.
 
 The tests cover real SDK allocations, fresh worker threads, interior pointers,
 out-of-bounds rejection, transport routing, and READ/WRITE payload equality.
+Transport tests hold real device queues to check pending status and resource
+lifetimes, and inject notifier-record failure after a copy is submitted.
 The engine suite covers TCP/HP TCP, legacy/policy selection, and runtime queues.
 The process suite starts a second executable with independent allocations and
 passes payloads through loopback TCP/HP TCP; test pipes carry only commands

@@ -796,8 +796,10 @@ Status TransferEngineImpl::allocateLocalMemory(void** addr, size_t size,
     options.internal = internal;
     if (location == kWildcardLocation ||
         LocationParser(location).type() == "cpu") {
-        if (transport_list_[MNNVL] &&
-            transport_list_[MNNVL]->capabilities().dram_to_dram)
+        if (internal && transport_list_[MLU])
+            options.type = MLU;  // SDK-pinned staging for asynchronous copies
+        else if (transport_list_[MNNVL] &&
+                 transport_list_[MNNVL]->capabilities().dram_to_dram)
             options.type = MNNVL;  // EGM: host memory NVLink peers can address
         else if (transport_list_[SHM])
             options.type = SHM;
