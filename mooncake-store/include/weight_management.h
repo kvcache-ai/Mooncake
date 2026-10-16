@@ -141,6 +141,12 @@ YLT_REFL(WeightRevisionLease, lease_id, identity, holder, expires_at_ms,
 // Persisted completion sentinel shared by live queries, snapshots and replay.
 // Keep this value stable: message is part of the existing wire contract.
 inline constexpr char kWeightOperationCompletedMessage[] = "completed";
+inline constexpr char kWeightOperationCancelledMessage[] = "cancelled";
+
+inline bool IsWeightOperationTerminal(const std::string& message) {
+    return message == kWeightOperationCompletedMessage ||
+           message == kWeightOperationCancelledMessage;
+}
 
 struct WeightResidencyOperation {
     uint64_t operation_id{0};

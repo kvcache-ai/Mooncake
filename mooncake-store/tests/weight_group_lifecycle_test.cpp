@@ -106,12 +106,101 @@ TEST_F(WeightGroupLifecycleTest, LeaseBlocksOperationAndDelete) {
     EXPECT_EQ(WeightManagementError::BUSY, deleted.error());
 }
 
-TEST_F(WeightGroupLifecycleTest, OperationRemainsPendingUntilTargetObserved) {
+TEST_F(WeightGroupLifecycleTest,
+       RejectsColdOperationWithoutReadableColdCopies) {
     MasterService service;
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(service);
+    const auto ready = PublishReady(service, context.client_id);
+    const auto started = service.StartWeightResidencyOperation({
+        .identity = ready.identity,
+        .expected_metadata_generation = ready.metadata_generation,
+        .target_residency = WeightResidencyState::COLD,
+    });
+    ASSERT_FALSE(started.has_value());
+    EXPECT_EQ(WeightManagementError::NOT_READY, started.error());
+}
+
+TEST_F(WeightGroupLifecycleTest, DeleteCancelsPendingResidencyOperation) {
+    MasterService service;
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(service);
+    const auto ready = PublishReady(service, context.client_id);
+    const auto started = service.StartWeightResidencyOperation({
+        .identity = ready.identity,
+        .expected_metadata_generation = ready.metadata_generation,
+        .target_residency = WeightResidencyState::HOT,
+    });
+    ASSERT_TRUE(started.has_value());
+    const auto deleted = service.DeleteWeightRevision({
+        .identity = ready.identity,
+        .expected_metadata_generation = started->fenced_metadata_generation,
+    });
+    ASSERT_TRUE(deleted.has_value());
+    EXPECT_EQ(WeightAvailabilityState::DELETED, deleted->availability);
+    const auto operation = service.QueryWeightOperation({
+        .operation_id = started->operation_id,
+    });
+    ASSERT_TRUE(operation.has_value());
+    EXPECT_EQ("cancelled", operation->message);
+}
+
+TEST_F(WeightGroupLifecycleTest, DeleteCancelsOperationAfterMemberLoss) {
+    MasterService service;
+    const auto context = PrepareSimpleSegment(service);
+    const auto ready = PublishReady(service, context.client_id);
+    const auto started = service.StartWeightResidencyOperation({
+        .identity = ready.identity,
+        .expected_metadata_generation = ready.metadata_generation,
+        .target_residency = WeightResidencyState::HOT,
+    });
+    ASSERT_TRUE(started);
+    ASSERT_TRUE(MasterServiceTestPeer(service).DropWeightGroupMemberForTesting(
+        ready.identity, "payload-a"));
+    const auto damaged =
+        service.ReconcileWeightRevision({.identity = ready.identity});
+    ASSERT_TRUE(damaged);
+    ASSERT_EQ(WeightAvailabilityState::DEGRADED, damaged->availability);
+    const auto stale = service.DeleteWeightRevision({
+        .identity = ready.identity,
+        .expected_metadata_generation = ready.metadata_generation,
+    });
+    ASSERT_FALSE(stale);
+    EXPECT_EQ(WeightManagementError::STALE_GENERATION, stale.error());
+    const auto before =
+        service.QueryWeightOperation({.operation_id = started->operation_id});
+    ASSERT_TRUE(before);
+    const auto deleted = service.DeleteWeightRevision({
+        .identity = ready.identity,
+        .expected_metadata_generation = damaged->metadata_generation,
+    });
+    ASSERT_TRUE(deleted);
+    EXPECT_EQ(WeightAvailabilityState::DELETED, deleted->availability);
+    const auto after =
+        service.QueryWeightOperation({.operation_id = started->operation_id});
+    ASSERT_TRUE(after);
+    EXPECT_EQ("cancelled", after->message);
+    EXPECT_EQ(before->target_residency, after->target_residency);
+    EXPECT_EQ(before->processed_members, after->processed_members);
+    EXPECT_EQ(before->cursor, after->cursor);
+    EXPECT_TRUE(service.DeleteWeightRevision({
+        .identity = ready.identity,
+        .expected_metadata_generation = deleted->metadata_generation,
+    }));
+}
+
+TEST_F(WeightGroupLifecycleTest, OperationRemainsPendingUntilTargetObserved) {
+    MasterService service(MasterServiceConfig::builder()
+                              .set_root_fs_dir("/mnt/ssd")
+                              .set_default_kv_lease_ttl(60'000)
+                              .build());
     [[maybe_unused]] const auto context = PrepareSimpleSegment(service);
     const UUID client_id = generate_uuid();
     auto ready = PublishReady(service, client_id);
 
+    for (const auto& key : {std::string("payload-a"), ManifestKey()}) {
+        ASSERT_TRUE(service.PutEnd(client_id, key, TenantId::Default(),
+                                   ReplicaType::DISK));
+        ASSERT_TRUE(service.GetReplicaList(key, TenantId::Default()));
+    }
     auto started = service.StartWeightResidencyOperation(
         StartWeightResidencyOperationRequest{
             .identity = ready.identity,
@@ -137,6 +226,48 @@ TEST_F(WeightGroupLifecycleTest, OperationRemainsPendingUntilTargetObserved) {
     ASSERT_TRUE(progress.has_value());
     EXPECT_EQ(0, progress->processed_members);
     EXPECT_EQ(2, progress->total_members);
+}
+
+TEST_F(WeightGroupLifecycleTest,
+       ReadableColdMembersDetermineDegradedResidency) {
+    MasterService service(MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(0)
+                              .set_root_fs_dir("/mnt/ssd")
+                              .build());
+    const auto context = PrepareSimpleSegment(service);
+    const auto ready = PublishReady(service, context.client_id);
+    for (const auto& key : {std::string("payload-a"), ManifestKey()}) {
+        ASSERT_TRUE(service.PutEnd(context.client_id, key, TenantId::Default(),
+                                   ReplicaType::DISK));
+    }
+    ASSERT_TRUE(service.StartWeightResidencyOperation({
+        .identity = ready.identity,
+        .expected_metadata_generation = ready.metadata_generation,
+        .target_residency = WeightResidencyState::COLD,
+    }));
+    const auto cold =
+        service.ReconcileWeightRevision({.identity = ready.identity});
+    ASSERT_TRUE(cold);
+    ASSERT_EQ(WeightOperationState::NONE, cold->operation);
+    ASSERT_EQ(WeightResidencyState::COLD, cold->residency);
+    for (const auto& key : {std::string("payload-a"), ManifestKey()}) {
+        {
+            MasterServiceTestPeer::MetadataAccessorRW member(
+                &service, MasterServiceTestPeer::ObjectIdentity{
+                              TenantId::Default(), key});
+            ASSERT_TRUE(member.Exists());
+            member.Get().VisitReplicas(
+                [](const Replica&) { return true; },
+                [](Replica& replica) { replica.mark_processing(); });
+        }
+        const auto observed =
+            service.ReconcileWeightRevision({.identity = ready.identity});
+        ASSERT_TRUE(observed);
+        EXPECT_EQ(WeightAvailabilityState::DEGRADED, observed->availability);
+        EXPECT_EQ(key == "payload-a" ? WeightResidencyState::COLD
+                                     : WeightResidencyState::ABSENT,
+                  observed->residency);
+    }
 }
 
 TEST_F(WeightGroupLifecycleTest, ColdOperationEvictsWholeManagedGroup) {
@@ -269,7 +400,7 @@ TEST_F(WeightGroupLifecycleTest, RecreatedMetadataStartsFreshMemberSelection) {
         .expected_metadata_generation = ready.metadata_generation,
         .target_residency = WeightResidencyState::COLD,
     }));
-    auto& manager = service.GetWeightStoreManager();
+    auto& manager = MasterServiceTestPeer::WeightManager(service);
     const auto initial = manager.ExportSnapshot();
     ASSERT_EQ(1, manager.ReconcileWeightMetadataStoreOnce(
                      ready.updated_at_ms + 1, 1));
@@ -383,7 +514,7 @@ TEST_F(WeightGroupLifecycleTest, PendingOperationReflectsLostReadableMembers) {
     const auto started = service.StartWeightResidencyOperation({
         .identity = ready.identity,
         .expected_metadata_generation = ready.metadata_generation,
-        .target_residency = WeightResidencyState::COLD,
+        .target_residency = WeightResidencyState::HOT,
     });
     ASSERT_TRUE(started);
     ASSERT_TRUE(service.UnmountSegment(segment.segment_id, segment.client_id));
@@ -398,7 +529,7 @@ TEST_F(WeightGroupLifecycleTest, PendingOperationReflectsLostReadableMembers) {
     ASSERT_TRUE(reconciled);
     EXPECT_EQ(WeightAvailabilityState::DEGRADED, reconciled->availability);
     EXPECT_EQ(WeightResidencyState::ABSENT, reconciled->residency);
-    EXPECT_EQ(WeightOperationState::EVICTING, reconciled->operation);
+    EXPECT_EQ(WeightOperationState::REHYDRATING, reconciled->operation);
     EXPECT_EQ(started->operation_id, reconciled->operation_id);
     EXPECT_EQ(started->fenced_metadata_generation + 1,
               reconciled->metadata_generation);

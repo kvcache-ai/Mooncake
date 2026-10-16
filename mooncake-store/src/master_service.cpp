@@ -239,6 +239,13 @@ MasterService::MasterService(const MasterServiceConfig& config)
         throw std::invalid_argument("Invalid soft-pin TTL configuration");
     }
 
+    if (config.weight_import_idle_timeout_ms == 0) {
+        throw std::invalid_argument(
+            "weight_import_idle_timeout_ms must be positive");
+    }
+    weight_manager_.SetImportIdleTimeoutMs(
+        config.weight_import_idle_timeout_ms);
+
     // Initialize the HTTP metadata key prefix from its component-owned
     // startup configuration.
     http_metadata_prefix_ =
@@ -5434,6 +5441,9 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
         MasterMetricManager::instance().inc_tenant_quota_reject(
             object_id.tenant_id.value(), "quota_exceeded");
     }
+    if (result && weight_group_operation_lock) {
+        weight_manager_.RecordImportWrite(object_id.tenant_id, plan->group_id);
+    }
     return result;
 }
 
@@ -5499,6 +5509,14 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
         return tl::make_unexpected(ErrorCode::INVALID_WRITE);
     }
 
+    // Do not take the group lock while holding the object shard. The guard
+    // arbitrates timeout admission without holding a lock across durability.
+    auto import_write = weight_manager_.TrackImportWrite(object_id.tenant_id,
+                                                         metadata.group_id);
+    if (!import_write) {
+        return tl::make_unexpected(import_write.error());
+    }
+
     if (bucket_allocator_ != nullptr && (replica_type == ReplicaType::ALL ||
                                          replica_type == ReplicaType::DFS)) {
         std::vector<DistributedFSDescriptor> pending_descriptors;
@@ -5521,6 +5539,10 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
 
     const bool had_completed_replica =
         metadata.HasReplica(&Replica::fn_is_completed);
+    const bool advanced_primary_write =
+        metadata.HasReplica([&is_target_replica](const Replica& replica) {
+            return replica.is_processing() && is_target_replica(replica);
+        });
     bool completed_pending_replica = false;
     metadata.VisitReplicas(
         [&is_target_replica](const Replica& replica) {
@@ -5606,6 +5628,9 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
             LOG(WARNING) << "PutEnd: OpLog queue failed for key=" << key
                          << ", err=" << static_cast<int>(result.error());
         }
+    }
+    if (advanced_primary_write) {
+        import_write->Accept();
     }
     return {};
 }
@@ -5949,6 +5974,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
     std::string allocation_session_id;
     std::optional<std::chrono::system_clock::time_point>
         allocation_committed_soft_pin_timeout;
+    std::optional<WeightStoreManager::ImportWriteGuard> inherited_import_write;
     auto admit = [&](bool* dfs_allocation_failed)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
         auto now = std::chrono::system_clock::now();
@@ -5989,6 +6015,19 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     LOG(ERROR) << "key=" << key
                                << ", error=group_membership_is_immutable";
                     return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+                }
+
+                // Upsert may inherit the existing group when the request omits
+                // group_ids. Admit that write without reversing group/shard
+                // locks.
+                if (!weight_group_operation_lock &&
+                    !metadata.group_id.empty()) {
+                    auto tracked = weight_manager_.TrackImportWrite(
+                        object_id.tenant_id, metadata.group_id);
+                    if (!tracked) {
+                        return tl::make_unexpected(tracked.error());
+                    }
+                    inherited_import_write.emplace(std::move(*tracked));
                 }
 
                 // Reject if a Copy/Move task is actively reading this key's
@@ -6372,6 +6411,12 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
     if (!result && result.error() == ErrorCode::TENANT_QUOTA_EXCEEDED) {
         MasterMetricManager::instance().inc_tenant_quota_reject(
             object_id.tenant_id.value(), "quota_exceeded");
+    }
+    if (result && weight_group_operation_lock) {
+        weight_manager_.RecordImportWrite(object_id.tenant_id, group_id);
+    }
+    if (result && inherited_import_write) {
+        inherited_import_write->Accept();
     }
     return result;
 }

@@ -4020,6 +4020,7 @@ TEST_F(MasterServiceHATest, WeightDurabilityWaitDoesNotBlockTaskCleanup) {
                       .set_enable_oplog(true)
                       .set_weight_management_oplog_capability_confirmed(true)
                       .set_cluster_id("weight_cleanup_isolation")
+                      .set_weight_import_idle_timeout_ms(1)
                       .set_pending_task_timeout_sec(1)
                       .build();
     MasterService service(config);
@@ -4038,11 +4039,6 @@ TEST_F(MasterServiceHATest, WeightDurabilityWaitDoesNotBlockTaskCleanup) {
         .expected_payload_count = 1,
         .expected_logical_bytes = 1024,
     }));
-    auto snapshot = ExportWeightMetadata(service);
-    snapshot.metadata.front().created_at_ms = 1;
-    snapshot.metadata.front().updated_at_ms = 1;
-    ASSERT_TRUE(MasterServiceTestPeer::WeightMetadata(service).RestoreSnapshot(
-        snapshot));
     backend->BlockTxn();
     struct ReleaseOnExit {
         BlockingBatchHaKvBackend& backend;
@@ -7563,12 +7559,12 @@ TEST_F(MasterServiceHATest,
     ASSERT_EQ("completed", completed->message);
     verify_restored(*completed);
 
-    const auto evicting = service.StartWeightResidencyOperation({
+    const auto rehydrating = service.StartWeightResidencyOperation({
         .identity = identity,
         .expected_metadata_generation = finished->metadata_generation,
-        .target_residency = WeightResidencyState::COLD,
+        .target_residency = WeightResidencyState::HOT,
     });
-    ASSERT_TRUE(evicting);
+    ASSERT_TRUE(rehydrating);
     ASSERT_TRUE(service.UnmountSegment(segment.segment_id, segment.client_id));
     for (const auto& key : {payload_key, manifest_key}) {
         const auto readable = service.ExistKey(key, kDefaultTenant);
@@ -7580,12 +7576,12 @@ TEST_F(MasterServiceHATest,
     ASSERT_TRUE(degraded);
     EXPECT_EQ(WeightAvailabilityState::DEGRADED, degraded->availability);
     EXPECT_EQ(WeightResidencyState::ABSENT, degraded->residency);
-    EXPECT_EQ(WeightOperationState::EVICTING, degraded->operation);
-    EXPECT_EQ(evicting->operation_id, degraded->operation_id);
-    EXPECT_EQ(evicting->fenced_metadata_generation + 1,
+    EXPECT_EQ(WeightOperationState::REHYDRATING, degraded->operation);
+    EXPECT_EQ(rehydrating->operation_id, degraded->operation_id);
+    EXPECT_EQ(rehydrating->fenced_metadata_generation + 1,
               degraded->metadata_generation);
     const auto pending = service.QueryWeightOperation({
-        .operation_id = evicting->operation_id,
+        .operation_id = rehydrating->operation_id,
     });
     ASSERT_TRUE(pending);
     EXPECT_EQ(degraded->metadata_generation,

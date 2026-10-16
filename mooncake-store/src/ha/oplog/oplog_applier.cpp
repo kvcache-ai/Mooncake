@@ -275,8 +275,13 @@ bool OpLogApplier::ApplyWeightMetadataUpsert(const OpLogEntry& entry) {
         (next.operation == WeightOperationState::NONE &&
          upsert.operation.has_value() &&
          (upsert.operation->identity != next.identity ||
-          upsert.operation->message != kWeightOperationCompletedMessage ||
-          upsert.operation->target_residency != next.residency))) {
+          !IsWeightOperationTerminal(upsert.operation->message) ||
+          upsert.operation->fenced_metadata_generation >=
+              next.metadata_generation ||
+          (upsert.operation->message == kWeightOperationCompletedMessage &&
+           upsert.operation->target_residency != next.residency) ||
+          (upsert.operation->message == kWeightOperationCancelledMessage &&
+           next.availability != WeightAvailabilityState::DELETING)))) {
         LOG(ERROR) << "OpLogApplier: inconsistent weight operation payload, "
                       "key="
                    << entry.object_key << ", sequence_id=" << entry.sequence_id;
@@ -297,6 +302,10 @@ bool OpLogApplier::ApplyWeightMetadataUpsert(const OpLogEntry& entry) {
 
     const auto current = metadata_store_->GetWeightMetadata(next.identity);
     if (!current.has_value()) {
+        if (upsert.operation.has_value() &&
+            upsert.operation->message == kWeightOperationCancelledMessage) {
+            return false;
+        }
         if (next.metadata_generation != 1) {
             LOG(ERROR) << "OpLogApplier: initial weight metadata generation "
                           "must be one, key="
@@ -307,10 +316,37 @@ bool OpLogApplier::ApplyWeightMetadataUpsert(const OpLogEntry& entry) {
         return publish();
     }
     if (*current == next) {
+        if (upsert.operation.has_value() &&
+            upsert.operation->message == kWeightOperationCancelledMessage) {
+            return metadata_store_->GetWeightOperation(
+                       upsert.operation->operation_id) == upsert.operation;
+        }
         return !upsert.operation.has_value() ||
                metadata_store_->GetWeightOperation(
                    upsert.operation->operation_id) == upsert.operation ||
                publish();
+    }
+    if (upsert.operation.has_value() &&
+        upsert.operation->message == kWeightOperationCancelledMessage) {
+        const auto previous =
+            metadata_store_->GetWeightOperation(upsert.operation->operation_id);
+        if (!previous ||
+            current->operation_id != upsert.operation->operation_id ||
+            current->operation != previous->operation ||
+            current->metadata_generation !=
+                previous->fenced_metadata_generation ||
+            IsWeightOperationTerminal(previous->message) ||
+            upsert.operation->updated_at_ms < previous->updated_at_ms) {
+            return false;
+        }
+        // Cancellation changes only the terminal message and update time.
+        // Preserve the exact operation lineage, target and progress on replay.
+        auto unchanged = *upsert.operation;
+        unchanged.message = previous->message;
+        unchanged.updated_at_ms = previous->updated_at_ms;
+        if (unchanged != *previous) {
+            return false;
+        }
     }
     if (!CanAdvanceWeightMetadataGeneration(current->metadata_generation) ||
         next.metadata_generation != current->metadata_generation + 1 ||

@@ -433,7 +433,7 @@ TEST_F(MasterServiceWeightManagementTest,
             StartWeightResidencyOperationRequest{
                 .identity = ready->identity,
                 .expected_metadata_generation = ready->metadata_generation,
-                .target_residency = WeightResidencyState::COLD,
+                .target_residency = WeightResidencyState::HOT,
             });
     });
     entered.wait();
@@ -444,7 +444,7 @@ TEST_F(MasterServiceWeightManagementTest,
 
     auto result = operation.get();
     ASSERT_TRUE(result.has_value());
-    EXPECT_EQ(WeightOperationState::EVICTING, result->operation);
+    EXPECT_EQ(WeightOperationState::REHYDRATING, result->operation);
 }
 
 }  // namespace

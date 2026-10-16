@@ -152,7 +152,8 @@ class MasterServiceTest : public ::testing::Test {
     std::unique_lock<std::mutex> AcquireWeightGroupOperationLockForTest(
         MasterService& service, const TenantId& tenant_id,
         const std::string& group_id) {
-        return service.GetWeightStoreManager().LockGroup(tenant_id, group_id);
+        return MasterServiceTestPeer::WeightManager(service).LockGroup(
+            tenant_id, group_id);
     }
 
     size_t MetadataShardIndex(MasterService& service, const std::string& key,

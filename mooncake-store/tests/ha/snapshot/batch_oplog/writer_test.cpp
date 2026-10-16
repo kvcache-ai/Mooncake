@@ -14,6 +14,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include <ylt/struct_pack.hpp>
@@ -74,6 +75,9 @@ class FakeHaKvBackend final : public HaKvBackend {
     bool SupportsTxn() const override { return true; }
     ErrorCode Txn(const KvTxn& txn) override {
         std::unique_lock lock(mutex_);
+        if (fail_txn_) {
+            return ErrorCode::INVALID_PARAMS;
+        }
         if (block_txn_) {
             txn_entered_ = true;
             cv_.notify_all();
@@ -102,6 +106,11 @@ class FakeHaKvBackend final : public HaKvBackend {
         txn_entered_ = false;
     }
 
+    void FailTransactions() {
+        std::lock_guard lock(mutex_);
+        fail_txn_ = true;
+    }
+
     bool WaitForBlockedTxn() {
         std::unique_lock lock(mutex_);
         return cv_.wait_for(lock, std::chrono::seconds(5),
@@ -119,7 +128,51 @@ class FakeHaKvBackend final : public HaKvBackend {
     std::map<std::string, std::string> values_;
     std::condition_variable cv_;
     bool block_txn_{false};
+    bool fail_txn_{false};
     bool txn_entered_{false};
+};
+
+class PutEndAppendGate final : public OrderedOpLogWriter {
+   public:
+    using OrderedOpLogWriter::OrderedOpLogWriter;
+    ~PutEndAppendGate() override { Stop(); }
+
+    tl::expected<PendingHandle, ErrorCode> Commit(
+        Reservation&& reservation, OpLogEntry entry,
+        DurableCallback callback) override {
+        if (entry.op_type == OpType::PUT_END &&
+            entry.object_key == "inflight-import-payload") {
+            std::unique_lock lock(mutex_);
+            entered_ = true;
+            cv_.notify_all();
+            cv_.wait(lock, [&] { return released_; });
+        }
+        return OrderedOpLogWriter::Commit(
+            std::move(reservation), std::move(entry), std::move(callback));
+    }
+
+    bool WaitUntilEntered() {
+        std::unique_lock lock(mutex_);
+        return cv_.wait_for(lock, std::chrono::seconds(5),
+                            [&] { return entered_; });
+    }
+
+    void Release() {
+        std::lock_guard lock(mutex_);
+        released_ = true;
+        cv_.notify_all();
+    }
+
+    void Stop() override {
+        Release();
+        OrderedOpLogWriter::Stop();
+    }
+
+   private:
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    bool entered_{false};
+    bool released_{false};
 };
 
 class FakeObjectStore final : public SnapshotObjectStore {
@@ -351,6 +404,8 @@ class BatchOpLogSnapshotWriterTest : public ::testing::Test {
                        WeightMetadataUpsertOp{.metadata = importing});
                 auto ready = metadata;
                 ready.metadata_generation = 2;
+                ready.availability = WeightAvailabilityState::READY;
+                ready.residency = WeightResidencyState::HOT;
                 ready.operation = WeightOperationState::NONE;
                 ready.operation_id = 0;
                 append(OpType::WEIGHT_METADATA_UPSERT,
@@ -510,6 +565,140 @@ class BatchOpLogSnapshotWriterTest : public ::testing::Test {
         VerifyPromotion(*restored, expected, cursor);
     }
 
+    void CheckPublicDeleteCancellation(bool fail_append) {
+        auto before = MakeWeightSnapshot(true);
+        before.leases.clear();
+        before.next_lease_id = 1;
+        // Missing members keep this rehydration pending even if the worker
+        // runs.
+        before.metadata.front().availability =
+            WeightAvailabilityState::DEGRADED;
+        before.metadata.front().residency = WeightResidencyState::ABSENT;
+        const auto identity = before.metadata.front().identity;
+        auto capture = StartCapture(0, &before);
+        ASSERT_TRUE(capture);
+        ASSERT_EQ(before, capture->weight_metadata);
+        const DurablePrefix baseline_cursor{
+            .batch_id = capture->last_included_batch_id,
+            .last_seq = capture->last_included_seq,
+        };
+        FakeObjectStore object_store;
+        BatchOpLogSnapshotWriter writer(object_store);
+        const auto descriptor =
+            writer.Write(*standby_, *capture, "snapshots", "1-45", 2, 1234);
+        ASSERT_TRUE(descriptor) << descriptor.error();
+        standby_->Stop();
+        ASSERT_EQ(
+            ErrorCode::OK,
+            backend_->Put(ha::BuildBatchOpLogSnapshotLatestKey(kClusterId),
+                          *descriptor));
+        auto source = Bootstrap(backend_, object_store);
+        auto handoff = source->PromoteAndDetachBatchOpLogStore();
+        ASSERT_TRUE(handoff);
+        ASSERT_EQ(before, handoff->metadata_store->SnapshotWeightMetadata());
+        MasterService primary(
+            MasterServiceConfig::builder()
+                .set_enable_ha(true)
+                .set_enable_oplog(true)
+                .set_weight_management_oplog_capability_confirmed(true)
+                .set_cluster_id(kClusterId)
+                .set_oplog_batch_max_entries(1)
+                .build());
+        ASSERT_TRUE(
+            primary.RestoreFromBatchOpLogPromotion(std::move(*handoff)));
+        ASSERT_EQ(ErrorCode::OK,
+                  MasterServiceTestPeer(primary).SetBatchOpLogBackendForTesting(
+                      backend_));
+        auto& metadata_store = MasterServiceTestPeer::WeightMetadata(primary);
+        const auto late_progress =
+            metadata_store.PrepareUpdateOperationProgress(
+                9, 1, 3, "late-member", WeightAvailabilityState::DEGRADED,
+                WeightResidencyState::ABSENT, 201);
+        ASSERT_TRUE(late_progress);
+        if (fail_append) {
+            backend_->FailTransactions();
+        }
+        // Cancellation must be emitted by the public Delete producer.
+        const auto deleted = primary.DeleteWeightRevision({
+            .identity = identity,
+            .expected_metadata_generation =
+                before.metadata.front().metadata_generation,
+        });
+        MasterServiceTestPeer::OrderedOplogWriter(primary)->Stop();
+        OpLogBatchStorage storage(kClusterId, *backend_);
+        DurablePrefix final_cursor;
+        ASSERT_EQ(ErrorCode::OK, storage.ReadDurablePrefix(final_cursor));
+        if (fail_append) {
+            ASSERT_FALSE(deleted);
+            EXPECT_EQ(WeightManagementError::DURABILITY_FAILED,
+                      deleted.error());
+            EXPECT_EQ(baseline_cursor, final_cursor);
+            EXPECT_EQ(before, metadata_store.ExportSnapshot());
+            const auto view = primary.GetWeightRevision({identity});
+            ASSERT_TRUE(view);
+            EXPECT_EQ(before.metadata.front(), view->metadata);
+            const auto operation =
+                primary.QueryWeightOperation({.operation_id = 9});
+            ASSERT_TRUE(operation);
+            EXPECT_EQ(before.operations.front(), *operation);
+            auto restored = Bootstrap(backend_, object_store);
+            VerifyPromotion(*restored, before, baseline_cursor);
+            return;
+        }
+        ASSERT_TRUE(deleted);
+        EXPECT_EQ(WeightAvailabilityState::DELETED, deleted->availability);
+        const auto expected = metadata_store.ExportSnapshot();
+        ASSERT_EQ(1u, expected.operations.size());
+        EXPECT_EQ(kWeightOperationCancelledMessage,
+                  expected.operations.front().message);
+        EXPECT_EQ(before.operations.front().target_residency,
+                  expected.operations.front().target_residency);
+        EXPECT_EQ(before.operations.front().processed_members,
+                  expected.operations.front().processed_members);
+        EXPECT_FALSE(metadata_store.Publish(*late_progress));
+        EXPECT_EQ(expected, metadata_store.ExportSnapshot());
+
+        StandbyMetadataStore replayed;
+        OpLogApplier applier(&replayed, kClusterId);
+        size_t cancellation_envelopes = 0;
+        for (uint64_t id = 1; id <= final_cursor.batch_id; ++id) {
+            OpLogBatchRecord batch;
+            ASSERT_EQ(ErrorCode::OK, storage.ReadBatch(id, batch));
+            for (const auto& entry : batch.entries) {
+                ASSERT_TRUE(applier.ApplyOpLogEntry(entry));
+                if (entry.op_type != OpType::WEIGHT_METADATA_UPSERT) {
+                    continue;
+                }
+                WeightMetadataUpsertOp upsert;
+                ASSERT_EQ(struct_pack::errc::ok,
+                          struct_pack::deserialize_to(upsert, entry.payload));
+                if (!upsert.operation || upsert.operation->message !=
+                                             kWeightOperationCancelledMessage) {
+                    continue;
+                }
+                ++cancellation_envelopes;
+                EXPECT_EQ(WeightAvailabilityState::DELETING,
+                          upsert.metadata.availability);
+                EXPECT_EQ(WeightOperationState::NONE,
+                          upsert.metadata.operation);
+                EXPECT_EQ(0u, upsert.metadata.operation_id);
+                const auto snapshot = replayed.SnapshotWeightMetadata();
+                WeightMetadataStore restored;
+                ASSERT_TRUE(restored.RestoreSnapshot(snapshot));
+                const auto queried = restored.QueryOperation(9);
+                ASSERT_TRUE(queried);
+                EXPECT_EQ(*upsert.operation, *queried);
+                EXPECT_FALSE(restored.Publish(*late_progress));
+                EXPECT_EQ(snapshot, restored.ExportSnapshot());
+            }
+        }
+        EXPECT_EQ(1u, cancellation_envelopes);
+        EXPECT_EQ(final_cursor.last_seq + 1, applier.GetExpectedSequenceId());
+        EXPECT_EQ(expected, replayed.SnapshotWeightMetadata());
+        auto restored = Bootstrap(backend_, object_store);
+        VerifyPromotion(*restored, expected, final_cursor);
+    }
+
     std::shared_ptr<FakeHaKvBackend> backend_;
     std::unique_ptr<HotStandbyService> standby_;
 };
@@ -601,6 +790,105 @@ TEST_F(BatchOpLogSnapshotWriterTest,
 TEST_F(BatchOpLogSnapshotWriterTest,
        PromotesNewerWeightMetadataSuffixAfterCompactedSnapshot) {
     CheckCompactedWeightPromotion(true);
+}
+
+TEST_F(BatchOpLogSnapshotWriterTest,
+       PublicDeleteCancellationReplaysAndSurvivesPromotion) {
+    CheckPublicDeleteCancellation(false);
+}
+
+TEST_F(BatchOpLogSnapshotWriterTest,
+       FailedPublicDeleteAppendPreservesPendingOperation) {
+    CheckPublicDeleteCancellation(true);
+}
+
+TEST_F(BatchOpLogSnapshotWriterTest,
+       InflightPutEndExcludesImportAbandonmentAndRefreshesActivity) {
+    auto backend = std::make_shared<FakeHaKvBackend>();
+    MasterService primary(
+        MasterServiceConfig::builder()
+            .set_enable_ha(true)
+            .set_enable_oplog(true)
+            .set_weight_management_oplog_capability_confirmed(true)
+            .set_cluster_id(kClusterId)
+            .set_oplog_batch_max_entries(1)
+            .build());
+    MasterServiceTestPeer(primary).SetBatchOpLogWriterFactoryForTesting(
+        [](OrderedOpLogWriterConfig config,
+           OrderedOpLogWriter::WriteBatchFn write_batch) {
+            return std::make_unique<PutEndAppendGate>(std::move(config),
+                                                      std::move(write_batch));
+        });
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(primary).SetBatchOpLogBackendForTesting(backend));
+    auto* gate = static_cast<PutEndAppendGate*>(
+        MasterServiceTestPeer::OrderedOplogWriter(primary).get());
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "inflight-import-segment";
+    segment.te_endpoint = segment.name;
+    segment.base = 0x100000000ULL;
+    segment.size = 16 * 1024 * 1024;
+    const auto client = generate_uuid();
+    ASSERT_TRUE(primary.MountSegment(segment, client));
+    const auto identity = MakeWeightSnapshot(false).metadata.front().identity;
+    const auto importing = primary.BeginWeightImport({
+        .identity = identity,
+        .expected_payload_count = 1,
+        .expected_logical_bytes = 1024,
+    });
+    ASSERT_TRUE(importing);
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.data_type = ObjectDataType::WEIGHT;
+    config.group_ids =
+        std::vector<std::string>{importing->manifest.payload_group_id};
+    ASSERT_TRUE(primary.PutStart(client, "inflight-import-payload",
+                                 TenantId::Default(), 1024, config));
+    const auto now_ms = [] {
+        return static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch())
+                .count());
+    };
+    const auto before_end_ms = now_ms();
+    const auto sweep_time = before_end_ms + 300'001;
+    std::future<tl::expected<void, ErrorCode>> ending;
+    std::future<size_t> sweeping;
+    struct ReleaseGate {
+        PutEndAppendGate& gate;
+        ~ReleaseGate() { gate.Release(); }
+    } release{*gate};
+    ending = std::async(std::launch::async, [&] {
+        return primary.PutEnd(client, "inflight-import-payload",
+                              TenantId::Default(), ReplicaType::MEMORY);
+    });
+    ASSERT_TRUE(gate->WaitUntilEntered());
+    sweeping = std::async(std::launch::async, [&] {
+        return MasterServiceTestPeer(primary).RunWeightReconciliationForTesting(
+            sweep_time, 32);
+    });
+    const auto sweep_status = sweeping.wait_for(std::chrono::seconds(5));
+    const auto while_inflight = primary.GetWeightRevision({identity});
+    // Make the successful End's activity timestamp strictly newer than the
+    // cutoff used by both sweeps; the gate remains held throughout this wait.
+    while (now_ms() <= before_end_ms + 1) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    gate->Release();
+    EXPECT_EQ(std::future_status::ready, sweep_status);
+    EXPECT_EQ(0u, sweeping.get());
+    ASSERT_TRUE(ending.get());
+    ASSERT_TRUE(while_inflight);
+    EXPECT_EQ(WeightAvailabilityState::IMPORTING,
+              while_inflight->metadata.availability);
+    EXPECT_EQ(0u,
+              MasterServiceTestPeer(primary).RunWeightReconciliationForTesting(
+                  sweep_time, 32));
+    const auto after = primary.GetWeightRevision({identity});
+    ASSERT_TRUE(after);
+    EXPECT_EQ(WeightAvailabilityState::IMPORTING, after->metadata.availability);
 }
 
 TEST_F(BatchOpLogSnapshotWriterTest,
@@ -700,7 +988,7 @@ TEST_F(BatchOpLogSnapshotWriterTest,
         return primary.StartWeightResidencyOperation({
             .identity = identity,
             .expected_metadata_generation = ready->metadata_generation,
-            .target_residency = WeightResidencyState::COLD,
+            .target_residency = WeightResidencyState::HOT,
         });
     });
     ASSERT_TRUE(backend_->WaitForBlockedTxn());
