@@ -37,7 +37,9 @@ This installs all system packages, git submodules (pybind11), and Go.
 
 ## Installing from PyPI (recommended)
 
-Pre-built EFA wheels are published to PyPI by the official release pipeline, so most users do not need to build from source. The EFA transport's memory path is CUDA-aware, so separate CUDA 12, CUDA 13, and non-CUDA variants are published:
+The default wheels (`mooncake-transfer-engine`, `-cuda13`, `-non-cuda`) are built with the EFA transport, so the same package works on AWS EFA and on IB/RoCE. Use `protocol=efa` (e.g. `MOONCAKE_PROTOCOL=efa` in SGLang) on EFA. With `rdma`, EFA NICs are skipped and IB/RoCE NICs are used when present. Unlike the dedicated EFA wheels below, the default wheels also include Mooncake EP/PG.
+
+Pre-built EFA wheels are also published to PyPI by the official release pipeline, so most users do not need to build from source. The EFA transport's memory path is CUDA-aware, so separate CUDA 12, CUDA 13, and non-CUDA variants are published:
 
 ```bash
 # GPU memory transfers with CUDA 12 — built with USE_CUDA=ON
@@ -53,6 +55,8 @@ pip install mooncake-transfer-engine-efa-non-cuda
 The CUDA 13 wheel requires an NVIDIA 580-series or newer driver, following the [CUDA compatibility requirements](https://docs.nvidia.com/deploy/cuda-compatibility/minor-version-compatibility.html).
 
 > **Note:** These wheels deliberately do **not** bundle `libfabric`/`libefa` (see the runtime note in [Building a Distributable Wheel](#efa-distributable-wheel)). They resolve to the system AWS EFA installation at runtime, so the EFA driver and libfabric from the [Prerequisites](#efa-prerequisites-driver) must still be present on the instance. Make sure `/opt/amazon/efa/lib` is on `LD_LIBRARY_PATH`.
+>
+> libfabric is loaded with `dlopen` when the EFA transport is installed (`protocol=efa`), not at import time, so the wheel imports and serves other protocols on hosts without libfabric. Mooncake loads `libfabric.so.1` through the normal library search path and falls back to `/opt/amazon/efa/lib/libfabric.so.1`. Set `MC_LIBFABRIC_PATH` to use a specific file. libfabric 1.18 or newer is required, and the distro package (e.g. 1.17 on Ubuntu 24.04) is rejected with an explicit error. The AWS libfabric must be used together with the AWS `libefa`/`libibverbs`, which is why its lib directory belongs on `LD_LIBRARY_PATH`.
 
 To build from source instead (for development, an unreleased revision, or a custom configuration), follow the sections below.
 

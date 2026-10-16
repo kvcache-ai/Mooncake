@@ -51,7 +51,7 @@ class BatchEvictBench {
         return true;
     }
 
-    static bool RunSingleWaiterSnapshotMutexProbe() {
+    static bool RunSingleWaiterMasterStateMutexProbe() {
         if (std::getenv("MOONCAKE_EVICT_BENCH_LOCK_PROBE") == nullptr) {
             return true;
         }
@@ -180,7 +180,8 @@ class BatchEvictBench {
                 if (tenant_id != TenantId::Default()) {
                     continue;
                 }
-                for (auto& [key, metadata] : tenant_state.metadata) {
+                for (auto& [key, record] : tenant_state.metadata) {
+                    auto& metadata = record.metadata;
                     {
                         SpinLocker locker(&metadata.lock);
                         metadata.lease_->SetDeadline(
@@ -276,7 +277,7 @@ class BatchEvictBench {
         uint64_t wait_us = 0;
         {
             std::unique_lock<std::shared_mutex> lock(
-                MasterServiceTestPeer::SnapshotMutex(service));
+                MasterServiceTestPeer::MasterStateMutex(service));
             const auto wait_end = std::chrono::steady_clock::now();
             wait_us = std::chrono::duration_cast<std::chrono::microseconds>(
                           wait_end - wait_start)
@@ -460,7 +461,7 @@ int main(int argc, char** argv) {
 
     using mooncake::benchmarks::BatchEvictBench;
     const bool ok = BatchEvictBench::RunRealBatchEvictScales() &&
-                    BatchEvictBench::RunSingleWaiterSnapshotMutexProbe();
+                    BatchEvictBench::RunSingleWaiterMasterStateMutexProbe();
 
     google::ShutdownGoogleLogging();
     return ok ? 0 : 1;

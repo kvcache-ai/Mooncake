@@ -368,7 +368,7 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
 
     // Collect keys drained from master queue but not actually offloaded.
     // Report them back with data_size=-1 sentinel so the master can clean up
-    // orphaned offloading_tasks and release source replica refcounts.
+    // orphaned offloading tasks and release source replica refcounts.
     std::vector<OffloadTaskItem> failed_tasks;
     std::unordered_set<std::string> all_bucket_keys;
     // Set when a whole-cycle error aborts the bucket loop early. We still fall
