@@ -487,6 +487,17 @@ inline tl::expected<void, ErrorCode> gather_maybe_device_to_host(
 // replica_selection.h (included above) so they can be unit-tested directly.
 using mooncake::SelectBestReplica;
 
+// File and shared KV reads use host buffers before scattering to caller memory.
+bool NeedsHostReadBuffer(const Replica::Descriptor &replica) {
+    return replica.is_disk_replica() || replica.is_dfs_replica() ||
+           replica.is_shared_kv_replica();
+}
+
+const char *HostReadReplicaName(const Replica::Descriptor &replica) {
+    if (replica.is_shared_kv_replica()) return "SHARED_NVME_KV";
+    return replica.is_dfs_replica() ? "DFS" : "DISK";
+}
+
 // Build a QueryResult containing only the chosen replica so that
 // Client::Get / Client::BatchGet (which internally call
 // FindFirstCompleteReplica) cannot pick a different replica type.
@@ -3760,9 +3771,9 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
     }
 
     // Select best replica: prefer local MEMORY, any MEMORY, local NOF, any NOF,
-    // LOCAL_DISK, DFS, then DISK.
+    // SHARED_NVME_KV, LOCAL_DISK, DFS, then DISK.
     // LOCAL_DISK data is on a remote node's SSD — must use offload RPC.
-    // MEMORY / DISK / DFS are handled via client_->Get below.
+    // MEMORY / DISK / DFS / SHARED_NVME_KV are handled via client_->Get below.
     auto local_endpoints = client_->GetLocalEndpoints();
     const auto *best_replica = SelectBestReplica(replica_list, local_endpoints);
     if (!best_replica) {
@@ -3825,9 +3836,9 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
         return buffer_handle;
     }
 
-    // MEMORY / DISK / DFS: use client_->Get. FilterQueryResult ensures
-    // Client::Get internal FindFirstCompleteReplica can only see
-    // the replica we selected, preventing accidental LOCAL_DISK picks.
+    // MEMORY / DISK / DFS / SHARED_NVME_KV: use client_->Get. FilterQueryResult
+    // ensures Client::Get internal FindFirstCompleteReplica can only see the
+    // replica we selected, preventing accidental LOCAL_DISK picks.
     auto runtime_accelerator =
         device::GetAcceleratorRegistry().RuntimeAccelerators();
     if ((replica.is_disk_replica() || replica.is_dfs_replica()) &&
@@ -4149,7 +4160,7 @@ RealClient::batch_get_buffer_internal(
         }
 
         // Select best replica: prefer local MEMORY, any MEMORY, local NOF,
-        // any NOF, LOCAL_DISK, DFS, then DISK.
+        // any NOF, SHARED_NVME_KV, LOCAL_DISK, DFS, then DISK.
         const auto *best_replica =
             SelectBestReplica(query_result_values.replicas, local_endpoints);
         if (!best_replica) {
@@ -4661,11 +4672,10 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
             return static_cast<int64_t>(total_size);
         }
 
-        if (replica.is_disk_replica() || replica.is_dfs_replica()) {
+        if (NeedsHostReadBuffer(replica)) {
             // File-backed full read: use a contiguous temp buffer, then
             // scatter to the requested destination.
-            const char *replica_type =
-                replica.is_dfs_replica() ? "DFS" : "DISK";
+            const char *replica_type = HostReadReplicaName(replica);
             auto alloc_result = client_buffer_allocator_->allocate(total_size);
             if (!alloc_result) {
                 LOG(ERROR) << "Failed to allocate temp buffer for "
@@ -4810,10 +4820,10 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
             src_offset + size);
     }
 
-    if (replica.is_disk_replica() || replica.is_dfs_replica()) {
-        // DISK/DFS: client_->Get + allocateSlices requires full-object slices,
-        // so we must allocate total_size.
-        const char *replica_type = replica.is_dfs_replica() ? "DFS" : "DISK";
+    if (NeedsHostReadBuffer(replica)) {
+        // DISK/DFS/SHARED_NVME_KV: client_->Get + allocateSlices requires
+        // full-object slices, so we must allocate total_size.
+        const char *replica_type = HostReadReplicaName(replica);
         return partial_disk_read(
             [&](void *tmp_buf) -> tl::expected<void, ErrorCode> {
                 std::vector<mooncake::Slice> tmp_slices;
@@ -6395,7 +6405,7 @@ RealClient::batch_get_into_internal(
         }
 
         // Select best replica: prefer local MEMORY, any MEMORY, local NOF,
-        // any NOF, LOCAL_DISK, DFS, then DISK.
+        // any NOF, SHARED_NVME_KV, LOCAL_DISK, DFS, then DISK.
         const auto *best_replica =
             SelectBestReplica(query_result_values.replicas, local_endpoints);
         if (!best_replica) {
@@ -6452,9 +6462,10 @@ RealClient::batch_get_into_internal(
             results[i] = static_cast<int64_t>(total_size);
             continue;
         }
-        if (replica.is_disk_replica() || replica.is_dfs_replica()) {
+        if (NeedsHostReadBuffer(replica)) {
             // File-backed replicas cannot safely read directly into arbitrary
             // user buffers. Use a contiguous temp buffer, then scatter.
+            // Shared KV also requires host staging for device destinations.
             disk_operations.emplace_back(
                 DiskKeyInfo{.key = key,
                             .original_index = i,
@@ -6555,8 +6566,7 @@ RealClient::batch_get_into_internal(
         for (const size_t di : disk_dedup.primaries) {
             auto &op = disk_operations[di];
             const auto &replica = op.replica;
-            const char *replica_type =
-                replica.is_dfs_replica() ? "DFS" : "DISK";
+            const char *replica_type = HostReadReplicaName(replica);
             auto alloc_result =
                 client_buffer_allocator_->allocate(op.total_size);
             if (!alloc_result) {
@@ -6587,8 +6597,7 @@ RealClient::batch_get_into_internal(
                 const auto &key = disk_batch_keys[di];
                 auto &op = disk_operations[disk_batch_indices[di]];
                 auto handle_it = disk_temp_handles.find(key);
-                const char *replica_type =
-                    op.replica.is_dfs_replica() ? "DFS" : "DISK";
+                const char *replica_type = HostReadReplicaName(op.replica);
                 if (!disk_results[di]) {
                     LOG(ERROR)
                         << replica_type << " BatchGet failed for key '" << key
@@ -6620,17 +6629,16 @@ RealClient::batch_get_into_internal(
                 .primary_bytes = primary_op.total_size,
                 .copy = [&disk_temp_handles, dst = dup_op.dst_buffer,
                          size = dup_op.total_size, key = dup_op.key,
-                         is_dfs = dup_op.replica.is_dfs_replica()]()
+                         replica_name = HostReadReplicaName(dup_op.replica)]()
                     -> tl::expected<void, ErrorCode> {
                     auto handle_it = disk_temp_handles.find(key);
                     if (handle_it == disk_temp_handles.end()) {
                         return tl::make_unexpected(
                             ErrorCode::NO_AVAILABLE_HANDLE);
                     }
-                    return CopyMaybeDevice(
-                        dst, handle_it->second->ptr(), size,
-                        std::string(is_dfs ? "DFS" : "DISK") +
-                            " duplicate read, key: " + key);
+                    return CopyMaybeDevice(dst, handle_it->second->ptr(), size,
+                                           std::string(replica_name) +
+                                               " duplicate read, key: " + key);
                 }});
         }
         FanOutDuplicates(dup_jobs, results);
@@ -7500,6 +7508,12 @@ std::vector<int> RealClient::batch_put_session_start(
             keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
     }
 
+    // Session writes do not yet assemble and store shared KV values.
+    if (config.shared_nvme_kv_replica_num > 0) {
+        return std::vector<int>(
+            keys.size(), static_cast<int>(toInt(ErrorCode::NOT_SUPPORTED)));
+    }
+
     const auto write_mode = DetermineReplicaWriteMode(config);
     if (config.nof_replica_num > 0 &&
         write_mode != ReplicaWriteMode::FLEXIBLE_DUAL_REPLICA) {
@@ -8023,8 +8037,8 @@ RealClient::batch_get_into_multi_buffers_internal(
             continue;
         }
         // Select best replica: prefer local MEMORY, any MEMORY, local NOF,
-        // any NOF, LOCAL_DISK, DFS, then DISK. Master may return multiple
-        // replicas in any order, so always scan.
+        // any NOF, SHARED_NVME_KV, LOCAL_DISK, DFS, then DISK. Master may
+        // return multiple replicas in any order, so always scan.
         const auto *best_replica =
             SelectBestReplica(query_result_values.replicas, local_endpoints);
         if (!best_replica) {
@@ -8056,7 +8070,7 @@ RealClient::batch_get_into_multi_buffers_internal(
                 key_slices.emplace_back(Slice{buffers[j], sizes[j]});
             }
         } else if (replica.is_local_disk_replica() ||
-                   replica.is_disk_replica() || replica.is_dfs_replica()) {
+                   NeedsHostReadBuffer(replica)) {
             // LOCAL_DISK: GPU buffers passed directly as scatter-gather slices
             // (zero-copy). DISK/DFS use a contiguous temp buffer at read time.
             if (valid_local_disk_ops.count(key)) {
@@ -8267,8 +8281,7 @@ RealClient::batch_get_into_multi_buffers_internal(
                         std::min(op.sizes[j],
                                  static_cast<size_t>(op.total_size - offset));
                     void *dst = op.buffers[j];
-                    const char *replica_type =
-                        op.replica.is_dfs_replica() ? "DFS" : "DISK";
+                    const char *replica_type = HostReadReplicaName(op.replica);
                     if (auto r = scatter_host_to_maybe_device(
                             dst, src + offset, sz,
                             std::string(replica_type) +
@@ -8294,8 +8307,7 @@ RealClient::batch_get_into_multi_buffers_internal(
             for (auto &[key, op] : valid_local_disk_ops) {
                 if (op.is_local_disk) continue;
                 const auto &replica = op.replica;
-                const char *replica_type =
-                    replica.is_dfs_replica() ? "DFS" : "DISK";
+                const char *replica_type = HostReadReplicaName(replica);
                 auto alloc_result =
                     client_buffer_allocator_->allocate(op.total_size);
                 if (!alloc_result) {
@@ -8327,8 +8339,7 @@ RealClient::batch_get_into_multi_buffers_internal(
                     const auto &key = disk_key_order[di];
                     auto &op = valid_local_disk_ops.at(key);
                     auto handle_it = temp_handles.find(key);
-                    const char *replica_type =
-                        op.replica.is_dfs_replica() ? "DFS" : "DISK";
+                    const char *replica_type = HostReadReplicaName(op.replica);
                     if (!disk_results[di]) {
                         LOG(ERROR)
                             << replica_type << " BatchGet failed for key '"
@@ -8360,7 +8371,8 @@ RealClient::batch_get_into_multi_buffers_internal(
                     .copy = [&temp_handles,
                              dst = SlicesFromBuffers(dup.buffers, dup.sizes),
                              size = dup.total_size, key = dup.key,
-                             is_dfs = primary_op.replica.is_dfs_replica()]()
+                             replica_name =
+                                 HostReadReplicaName(primary_op.replica)]()
                         -> tl::expected<void, ErrorCode> {
                         auto handle_it = temp_handles.find(key);
                         if (handle_it == temp_handles.end()) {
@@ -8372,7 +8384,7 @@ RealClient::batch_get_into_multi_buffers_internal(
                             {Slice{handle_it->second->ptr(),
                                    static_cast<size_t>(size)}},
                             size,
-                            std::string(is_dfs ? "DFS" : "DISK") +
+                            std::string(replica_name) +
                                 " duplicate read, key: " + key);
                     }});
             }

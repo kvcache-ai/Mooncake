@@ -105,6 +105,7 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     config/mmap_arena_config.cpp
     common/mmap_buffer.cpp
     client_service.cpp
+    shared_nvme_kv_backend.cpp
     client_metric.cpp
     master_client.cpp
     storage_backend.cpp
@@ -120,6 +121,7 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     nvme_kv/key_codec.cpp
     nvme_kv/key_conflict_policy.cpp
     nvme_kv/object_layout.cpp
+    config/shared_nvme_kv_config.cpp
     shared_nvme_kv.cpp
     transfer_task.cpp
     config/nof_debug_config.cpp
