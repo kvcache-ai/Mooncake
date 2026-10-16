@@ -62,8 +62,10 @@
 #ifdef USE_NOF
 #include "spdk/spdk_wrapper.h"
 #endif
-#ifdef USE_ASCEND_DIRECT
+#if defined(USE_ASCEND_DIRECT) || defined(USE_MEMFABRIC)
 #include "acl/acl_rt.h"
+#endif
+#ifdef USE_ASCEND_DIRECT
 #include "transport/ascend_transport/ascend_direct_transport/context_manager.h"
 #endif
 #ifdef USE_CUDA
@@ -74,6 +76,9 @@
 #endif
 #if defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
 #include "ascend_allocator.h"
+#endif
+#ifdef USE_MEMFABRIC
+#include "memfabric_allocator.h"
 #endif
 
 DEFINE_bool(enable_http_server, false,
@@ -338,6 +343,31 @@ tl::expected<void, ErrorCode> set_context_from_dummy_shms(
         }
     }
     return set_context_if_needed(protocol, device_id, action);
+}
+#endif
+
+#ifdef USE_MEMFABRIC
+void *AllocateMemFabricStoreSegment(size_t segment_size,
+                                    const std::string &protocol,
+                                    bool use_hugepage, bool defer_hugetlb,
+                                    size_t *mapped_size) {
+    size_t actual_size = 0;
+    MemFabricHostAllocFn host_alloc = nullptr;
+    size_t host_align = 0;
+    size_t alloc_size = segment_size;
+    if (use_hugepage) {
+        host_align = get_hugepage_size_from_env();
+        alloc_size = align_up(segment_size, host_align);
+        host_alloc =
+            static_cast<MemFabricHostAllocFn>(allocate_buffer_mmap_memory);
+    }
+    void *ptr = memfabric_allocate_memory_best_effort(
+        alloc_size, protocol, &actual_size, host_alloc, host_align,
+        defer_hugetlb);
+    if (ptr != nullptr) {
+        *mapped_size = actual_size;
+    }
+    return ptr;
 }
 #endif
 
@@ -1290,6 +1320,11 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                 ptr = AllocateAscendStoreSegment(
                     segment_size, this->protocol, use_hugepage_,
                     parallel_hugetlb_population, &mapped_size);
+#elif defined(USE_MEMFABRIC)
+            } else if (protocol == "ascend") {
+                ptr = AllocateMemFabricStoreSegment(
+                    segment_size, this->protocol, use_hugepage_,
+                    parallel_hugetlb_population, &mapped_size);
 #endif
             } else if (use_hugepage_) {
                 mapped_size =
@@ -1325,6 +1360,15 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                 egm_segment_ptrs_.emplace_back(std::move(egm_owner));
             } else if (this->protocol == "ascend" ||
                        this->protocol == "ubshmem") {
+#ifdef USE_MEMFABRIC
+                if (use_hugepage_) {
+                    hugepage_segment_ptrs_.emplace_back(
+                        ptr, HugepageSegmentDeleter{mapped_size});
+                } else {
+                    memfabric_segment_ptrs_.emplace_back(
+                        ptr, MemFabricSegmentDeleter{this->protocol});
+                }
+#else
                 if (use_hugepage_ && !globalConfig().ascend_use_fabric_mem) {
                     hugepage_segment_ptrs_.emplace_back(
                         ptr, HugepageSegmentDeleter{mapped_size});
@@ -1332,6 +1376,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                     ascend_segment_ptrs_.emplace_back(
                         ptr, AscendSegmentDeleter{this->protocol});
                 }
+#endif
             } else if (this->protocol == "sunrise_link") {
 #if defined(USE_SUNRISE)
                 sunrise_segment_ptrs_.emplace_back(ptr,
@@ -1791,10 +1836,16 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     if (!setup_segments_safe_to_free || setup_segment_memory_must_leak_) {
         for (auto &ptr : hugepage_segment_ptrs_) ptr.release();
         for (auto &ptr : segment_ptrs_) ptr.release();
+#ifdef USE_MEMFABRIC
+        for (auto &ptr : memfabric_segment_ptrs_) ptr.release();
+#endif
         setup_segment_memory_must_leak_ = false;
     }
     hugepage_segment_ptrs_.clear();
     segment_ptrs_.clear();
+#ifdef USE_MEMFABRIC
+    memfabric_segment_ptrs_.clear();
+#endif
     ub_segment_ptrs_.clear();
 #ifdef USE_VRAM_SEGMENT
     vram_segment_ptrs_.clear();
@@ -2833,9 +2884,9 @@ int RealClient::probeKey(const std::string &key) {
     }
 }
 
-std::vector<int> RealClient::batchProbeKey(
-    const std::vector<std::string> &keys) {
-    auto internal_results = batchProbeKey_internal(keys);
+std::vector<int> RealClient::batchProbeKey(const std::vector<std::string> &keys,
+                                           const GrantLeasePolicy &policy) {
+    auto internal_results = batchProbeKey_internal(keys, policy);
     std::vector<int> results;
     results.reserve(internal_results.size());
 
@@ -4516,6 +4567,24 @@ RealClient::resolve_writable_buffer_region(void *buffer) const {
     return std::nullopt;
 }
 
+bool RealClient::can_use_direct_memory_read(const Replica::Descriptor &replica,
+                                            void *buffer, size_t size) const {
+    if (!replica.is_memory_replica()) return false;
+    // The selected replica's descriptor controls Transfer Engine routing.
+    // NVLink accepts ordinary CUDA allocations as local endpoints, while RDMA
+    // requires the destination range to have a local memory registration.
+    const std::string &replica_protocol =
+        replica.get_memory_descriptor().buffer_descriptor.protocol_;
+    if (replica_protocol == "nvlink") {
+        return true;
+    }
+    if (replica_protocol != "rdma") {
+        return false;
+    }
+    auto region = resolve_writable_buffer_region(buffer);
+    return region.has_value() && size <= region->size - region->offset;
+}
+
 tl::expected<RealClient::RangedReadMetadata, ErrorCode>
 RealClient::resolve_ranged_read_metadata(
     const std::string &key, const QueryResultCache *query_result_cache,
@@ -4630,7 +4699,8 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
             device::GetAcceleratorRegistry().RuntimeAccelerators();
         void *dst = static_cast<char *>(buffer) + dst_offset;
         if (runtime_accelerator.FindDeviceForPointer(dst) &&
-            (!client_->CanUseLocalMemcpy(replica) ||
+            ((!client_->CanUseLocalMemcpy(replica) &&
+              !can_use_direct_memory_read(replica, dst, total_size)) ||
              client_->IsHotCacheEnabled())) {
             if (!client_buffer_allocator_) {
                 LOG(ERROR) << "Client buffer allocator is not provided";
@@ -4772,7 +4842,8 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
     void *dst = static_cast<char *>(buffer) + dst_offset;
     auto filtered_qr = FilterQueryResult(query_result, replica, false);
     if (runtime_accelerator.FindDeviceForPointer(dst) &&
-        !client_->CanUseLocalMemcpy(replica)) {
+        !client_->CanUseLocalMemcpy(replica) &&
+        !can_use_direct_memory_read(replica, dst, size)) {
         if (!client_buffer_allocator_) {
             LOG(ERROR) << "Client buffer allocator is not provided";
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -6654,7 +6725,7 @@ tl::expected<bool, ErrorCode> RealClient::probeKey_internal(
 }
 
 std::vector<tl::expected<bool, ErrorCode>> RealClient::batchProbeKey_internal(
-    const std::vector<std::string> &keys) {
+    const std::vector<std::string> &keys, const GrantLeasePolicy &policy) {
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
         return std::vector<tl::expected<bool, ErrorCode>>(
@@ -6667,7 +6738,7 @@ std::vector<tl::expected<bool, ErrorCode>> RealClient::batchProbeKey_internal(
     }
 
     // Call client BatchProbeKey and return the vector<expected> directly
-    return client_->BatchProbeKey(keys);
+    return client_->BatchProbeKey(keys, policy);
 }
 
 int RealClient::put_from_with_metadata(const std::string &key, void *buffer,

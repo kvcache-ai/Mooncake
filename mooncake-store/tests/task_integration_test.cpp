@@ -23,6 +23,7 @@
 #include "master_client.h"
 #include "master_config.h"
 #include "rpc_service.h"
+#include "rpc_worker_pool.h"
 #include "tenant/quota_policy_store.h"
 #include "task_manager.h"
 #include "types.h"
@@ -971,6 +972,7 @@ namespace {
 class TaskListingRpcTest : public ::testing::Test {
    protected:
     virtual bool MultiTenant() const { return true; }
+    virtual bool UseWorkerPool() const { return false; }
 
     void SetUp() override {
         const UUID suffix = generate_uuid();
@@ -998,7 +1000,8 @@ class TaskListingRpcTest : public ::testing::Test {
         ASSERT_EQ(ports.size(), 1u);
         server_ = std::make_unique<coro_rpc::coro_rpc_server>(
             2, ports.front(), "127.0.0.1", std::chrono::seconds(0), true);
-        RegisterRpcService(*server_, *service_);
+        if (UseWorkerPool()) worker_pool_ = std::make_unique<RpcWorkerPool>(2);
+        RegisterRpcService(*server_, *service_, worker_pool_.get());
         auto started = server_->async_start();
         ASSERT_FALSE(started.hasResult());
         client_ = std::make_unique<MasterClient>(source_id_);
@@ -1028,6 +1031,7 @@ class TaskListingRpcTest : public ::testing::Test {
         client_.reset();
         if (server_) server_->stop();
         server_.reset();
+        worker_pool_.reset();
         service_.reset();
         std::error_code ignored;
         std::filesystem::remove(policy_path_, ignored);
@@ -1058,6 +1062,7 @@ class TaskListingRpcTest : public ::testing::Test {
     UUID target_id_ = generate_uuid();
     std::filesystem::path policy_path_;
     std::shared_ptr<WrappedMasterService> service_;
+    std::unique_ptr<RpcWorkerPool> worker_pool_;
     std::unique_ptr<coro_rpc::coro_rpc_server> server_;
     std::unique_ptr<MasterClient> client_;
     std::unique_ptr<MasterClient> tenant_client_;
@@ -1189,6 +1194,25 @@ TEST_F(TaskListingSingleTenantRpcTest, ResolvesClientTenantToDefault) {
     ASSERT_TRUE(listed.has_value());
     ASSERT_EQ(listed->tasks.size(), 1u);
     EXPECT_EQ(listed->tasks.front().id, *copy);
+}
+
+class TaskListingPooledRpcTest : public TaskListingRpcTest {
+   protected:
+    bool UseWorkerPool() const override { return true; }
+};
+
+TEST_F(TaskListingPooledRpcTest, ListsTasksThroughWorkerPool) {
+    Put("pooled-list-key");
+    ASSERT_FALSE(HasFatalFailure());
+    auto copy = client_->CreateCopyTask("pooled-list-key", {"listing-target"});
+    ASSERT_TRUE(copy.has_value());
+    TaskListRequest request;
+    request.key = "pooled-list-key";
+    auto listed = client_->ListTasks(request);
+    ASSERT_TRUE(listed.has_value());
+    ASSERT_EQ(listed->tasks.size(), 1u);
+    EXPECT_EQ(listed->tasks.front().id, *copy);
+    EXPECT_EQ(listed->tasks.front().status, TaskStatus::PENDING);
 }
 
 }  // namespace
