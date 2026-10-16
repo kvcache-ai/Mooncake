@@ -45,7 +45,7 @@ tagged with `rfc-required` and might not be reviewed until an RFC is provided.
 
 ### Development Workflow & Pre-commit Hooks
 
-Mooncake uses [pre-commit](https://pre-commit.com/) to enforce consistent formatting and lightweight static checks across Python, C++ and CMake sources.
+Mooncake uses [pre-commit](https://pre-commit.com/) to enforce consistent formatting and lightweight static checks across Python, C++, CMake, and Store-RS Rust sources.
 
 #### Included Hooks
 | Type | Tool | Purpose |
@@ -53,6 +53,7 @@ Mooncake uses [pre-commit](https://pre-commit.com/) to enforce consistent format
 | Generic | trailing-whitespace / end-of-file-fixer | Basic hygiene |
 | Project | `./scripts/code_format.sh --staged` | Format staged C/C++ changes before commit |
 | Python | ruff / ruff-format | Lint + format (includes import sorting) |
+| Store-RS Rust | `cargo fmt` / `cargo clippy` | Check Store-RS formatting and lint its Rust crates |
 | Spelling | codespell | Catch common typos (ignores domain-specific words) |
 | CMake | cmake-format | Keep build scripts readable |
 | Meta | check-yaml / check-merge-conflict / check-added-large-files | Prevent bad commits |
@@ -74,6 +75,12 @@ staged files (the first run may install hook environments):
 ```bash
 pre-commit run
 ```
+
+The Store-RS Rust hooks run only when files under `mooncake-store-rs/` change.
+Clippy uses the configured CMake build and its native shim libraries. Set
+`MOONCAKE_ROOT_DIR`, `MOONCAKE_BUILD_DIR`,
+`MOONCAKE_CLASSIC_SHIM_LIB_PATH`, and `MOONCAKE_TENT_SHIM_LIB_PATH` to the
+absolute paths from that build before running the hook.
 Before opening a PR, run hooks only on files changed against the PR base
 (default `origin/main`). The C/C++ hook remains limited to staged or changed
 line ranges:
@@ -117,6 +124,21 @@ The configuration also supports automatic fixing PRs via `pre-commit.ci` if
 enabled. To activate, add the repository in the pre-commit.ci dashboard; no
 further changes are needed.
 
+
+## Store-RS Test Entry Point
+
+Run the root Store-RS smoke entry point from the repository root after building
+the Rust workspace and installing the `python` CMake component to a prefix:
+
+```bash
+scripts/ci/run_store_rs_smoke.sh
+```
+
+It runs Store-RS library and binary unit tests, checks both installed Python
+backends and all three commands, then validates dummy and routed TCP/classic-TE
+read/write paths against the installed package. See the [Store-RS validation
+guide](docs/source/deployment/store-rs/testing.md) for its required paths and
+the scenario-specific commands for heavier coverage.
 
 ## Code Quality
 

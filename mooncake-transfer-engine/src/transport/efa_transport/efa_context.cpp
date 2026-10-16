@@ -17,6 +17,7 @@
 #include <fcntl.h>
 #include <sys/epoll.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cassert>
 #include <cstring>
@@ -1052,11 +1053,11 @@ int EfaContext::submitSlicesOnPeer(
     std::vector<Transport::Slice*> retry_slices;
     while (cursor < slice_list.size() || !retry_slices.empty()) {
         if (!retry_slices.empty()) {
-            // Splice retry slices back in at the current cursor so the next
-            // pass picks them up.  O(retry_slices.size()) per retry wave,
-            // which is bounded by valid_count of the last batch.
-            slice_list.insert(slice_list.begin() + cursor, retry_slices.begin(),
-                              retry_slices.end());
+            // Rewind into the slots the last pass consumed, so the list keeps
+            // its size across EAGAIN waves.
+            cursor -= retry_slices.size();
+            std::copy(retry_slices.begin(), retry_slices.end(),
+                      slice_list.begin() + cursor);
             retry_slices.clear();
             std::this_thread::yield();
         }

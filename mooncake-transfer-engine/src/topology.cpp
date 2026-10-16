@@ -34,6 +34,9 @@
 #include "cuda_alike.h"
 #include "config.h"
 #include "memory_location.h"
+#if defined(USE_CUDA) && !defined(USE_CXI)
+#include "transport/rdma_transport/data_direct_topology.h"
+#endif
 #include "topology.h"
 #include "char_util.h"
 #ifdef USE_UB
@@ -551,12 +554,38 @@ static bool isSameNumaNode(const char *bus1, const char *bus2) {
 }
 
 static std::vector<TopologyEntry> discoverCudaTopology(
-    const std::vector<InfinibandDevice> &all_hca) {
+    const std::vector<InfinibandDevice> &all_hca, int *rc) {
     std::vector<TopologyEntry> topology;
     int device_count;
     if (cudaGetDeviceCount(&device_count) != cudaSuccess) {
         device_count = 0;
     }
+#if defined(USE_CUDA) && !defined(USE_CXI)
+    // With MC_RDMA_DATA_DIRECT_PAIRING a GPU's memory is registered (and so
+    // transferred) only through the NICs whose Data Direct function sits on
+    // the GPU's PCI root; PCIe distance cannot see that pairing inside a VM
+    // where every device is its own segment. The mapping is fail-closed: a
+    // NIC without a Data Direct function or a GPU without a paired NIC
+    // rejects discovery rather than falling back to PCIe distance, which
+    // could select a NIC that cannot register the memory (lkey/rkey 0).
+    const bool pair_data_direct = globalConfig().rdma_data_direct &&
+                                  globalConfig().rdma_data_direct_pairing;
+    std::map<std::string, std::string> data_direct_roots;
+    if (pair_data_direct) {
+        std::vector<std::string> names;
+        for (const auto &hca : all_hca) names.push_back(hca.name);
+        data_direct_roots = dataDirectRootsByDevice(names);
+        for (const auto &hca : all_hca) {
+            if (!data_direct_roots.count(hca.name)) {
+                LOG(ERROR) << "MC_RDMA_DATA_DIRECT_PAIRING: " << hca.name
+                           << " reports no Data Direct function; every NIC "
+                              "must satisfy the pairing rule";
+                if (rc) *rc = ERR_DEVICE_NOT_FOUND;
+                return {};
+            }
+        }
+    }
+#endif
     for (int i = 0; i < device_count; i++) {
         char pci_bus_id[20];
         if (cudaDeviceGetPCIBusId(pci_bus_id, sizeof(pci_bus_id), i) !=
@@ -567,6 +596,38 @@ static std::vector<TopologyEntry> discoverCudaTopology(
 
         std::vector<std::string> preferred_hca;
         std::vector<std::string> avail_hca;
+
+#if defined(USE_CUDA) && !defined(USE_CXI)
+        if (pair_data_direct) {
+            const std::string gpu_root = pciSysfsRoot(pci_bus_id);
+            for (const auto &hca : all_hca) {
+                auto it = data_direct_roots.find(hca.name);
+                if (!gpu_root.empty() && it != data_direct_roots.end() &&
+                    it->second == gpu_root)
+                    preferred_hca.push_back(hca.name);
+            }
+            if (preferred_hca.empty()) {
+                LOG(ERROR) << "MC_RDMA_DATA_DIRECT_PAIRING: " << GPU_PREFIX << i
+                           << " (" << pci_bus_id << ", root \"" << gpu_root
+                           << "\") has no Data Direct NIC on its PCI root; "
+                              "rejecting discovery instead of falling back to "
+                              "PCIe distance";
+                if (rc) *rc = ERR_DEVICE_NOT_FOUND;
+                return {};
+            }
+            std::string list;
+            for (const auto &name : preferred_hca)
+                list += (list.empty() ? "" : ",") + name;
+            LOG(INFO) << GPU_PREFIX << i << " (" << pci_bus_id << ", root "
+                      << gpu_root << "): Data Direct NICs " << list
+                      << "; other NICs excluded";
+            topology.push_back(
+                TopologyEntry{.name = GPU_PREFIX + std::to_string(i),
+                              .preferred_hca = std::move(preferred_hca),
+                              .avail_hca = {}});
+            continue;
+        }
+#endif
 
         // Find HCAs with minimum distance in one pass.
         int min_distance = INT_MAX;
@@ -651,9 +712,11 @@ int Topology::discover(const std::vector<std::string> &filter,
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX) || defined(USE_SUPA)
-    for (auto &ent : discoverCudaTopology(all_hca)) {
+    int cuda_rc = 0;
+    for (auto &ent : discoverCudaTopology(all_hca, &cuda_rc)) {
         matrix_[ent.name] = ent;
     }
+    if (cuda_rc) return cuda_rc;
 #endif
 #ifdef USE_UB
     auto ub_all_hca = listUBDevices(filter);

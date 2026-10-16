@@ -38,8 +38,6 @@ Under real workloads, Mooncake’s innovative architecture enables Kimi to handl
 - **Oct 10, 2026**: TensorRT-LLM merged a native [Mooncake Store connector](https://github.com/NVIDIA/TensorRT-LLM/pull/19171) into KVCMv2, enabling content-addressed KV cache pooling and prefix reuse across serving instances.
 - **Oct 6, 2026**: [TokenSpeed v0.1.1](https://github.com/lightseekorg/tokenspeed/releases/tag/v0.1.1) includes Mooncake Store as an L3 KV cache backend beneath its host cache, alongside Mooncake Transfer Engine support for PD and EPD disaggregation.
 - **Sept 17, 2026**: vLLM added [cross-encoder embedding reuse](https://github.com/vllm-project/vllm/pull/56242) through Mooncake Store, complementing its [encoder-cache transfer connector](https://github.com/vllm-project/vllm/pull/41567) for multimodal disaggregated serving. Both capabilities are included in [vLLM v0.31.0](https://github.com/vllm-project/vllm/releases/tag/v0.31.0).
-- **Sept 10, 2026**: NeMo RL added optional [GPUDirect RDMA support](https://github.com/NVIDIA-NeMo/RL/pull/3501) to its TransferQueue-backed Mooncake data plane. GPU clients can transfer tensors through GDR while queued objects remain in the shared host-memory pool.
-- **Aug 30, 2026**: LMCache added [Mooncake Transfer Engine as a P2P sharing backend](https://github.com/LMCache/LMCache/pull/4182), extending its Mooncake integration beyond distributed Store access. Available in [LMCache v0.5.5](https://github.com/LMCache/LMCache/releases/tag/v0.5.5).
 - **Aug 28, 2026**: LMDeploy merged [Mooncake Store support](https://github.com/InternLM/lmdeploy/pull/4903), enabling shared KV cache pooling and prefix reuse across PyTorch inference instances. Included in [LMDeploy v0.18.0](https://github.com/InternLM/lmdeploy/releases/tag/v0.18.0).
 - **Aug 24, 2026**: [AgentX / InferenceX v3](https://newsletter.semianalysis.com/p/agentx-inferencexv3-does-cuda-moat) highlights Mooncake's contributions to agentic inference workloads, including ROCm wheels, CI, and packaging improvements. [Mooncake optimization details](https://inferencex.semianalysis.com/agentx/optimizations/mooncake).
 
@@ -272,29 +270,6 @@ pip install mooncake-transfer-engine
 ```bash
 pip install mooncake-transfer-engine-cuda13
 ```
-
-#### Master image
-
-The multi-architecture master image publishes explicit CUDA flavor tags:
-
-```bash
-# Fixed versions, recommended for production
-docker pull kvcacheai/mooncake:0.3.14-cuda12
-docker pull kvcacheai/mooncake:0.3.14-cuda13
-
-# CUDA 13 is the default flavor
-docker pull kvcacheai/mooncake:0.3.14
-docker pull kvcacheai/mooncake:latest
-
-# Floating flavor aliases
-docker pull kvcacheai/mooncake:cuda12
-docker pull kvcacheai/mooncake:cuda13
-```
-
-The unqualified `:<version>` and `:latest` tags point to CUDA 13 starting with the first
-release published by the new tagging workflow. Existing releases keep their original contents;
-use `:cuda12` or `:<version>-cuda12` when CUDA 12 is required. The former `:latest-cuda13` tag
-is deprecated and is not part of the new naming contract.
 
 In addition to CUDA, Mooncake also supports other accelerator backends, along with flexible installation and deployment options. See the guides below for details:
 

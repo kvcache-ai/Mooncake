@@ -116,7 +116,8 @@ class DynamicReplicationTest : public ::testing::Test {
             proposal.observed_version_epoch =
                 MasterServiceTestPeer(service).DynamicReplicationVersionEpoch(
                     metadata);
-            proposal.object_size_bytes = static_cast<uint64_t>(metadata.size);
+            proposal.object_size_bytes =
+                static_cast<uint64_t>(metadata.TotalLength());
         }
         if (admit) {
             AdmitDynamicReplication(service, key);

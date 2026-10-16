@@ -16,6 +16,7 @@
 #include <optional>
 #include <queue>
 #include <shared_mutex>
+#include <span>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -46,6 +47,7 @@
 #include "object_metadata.h"
 #include "object_runtime_state.h"
 #include "metadata/object_state.h"
+#include "promotion_candidate_tracker.h"
 #include "rpc_types.h"
 #include "replica.h"
 #include "ha/ha_types.h"
@@ -1108,12 +1110,8 @@ class MasterService {
     struct TenantState {
         TenantQuotaHandle quota_account{nullptr};
         ObjectMap metadata;
-        std::unordered_map<std::string, PromotionCandidate>
-            promotion_candidates;
 
-        bool Empty() const {
-            return metadata.empty() && promotion_candidates.empty();
-        }
+        bool Empty() const { return metadata.empty(); }
     };
 
     // Sharded metadata maps and their mutexes
@@ -1410,7 +1408,7 @@ class MasterService {
     ObjectMap::iterator EraseMetadata(TenantState& tenant_state,
                                       ObjectMap::iterator it,
                                       const TenantId& tenant_id);
-    void ReleaseLocalDiskUsage(const std::vector<Replica>& replicas);
+    void ReleaseLocalDiskUsage(std::span<const Replica> replicas);
     enum class QuotaEraseMode {
         kFull,
         kPreserveOld,
@@ -1555,7 +1553,7 @@ class MasterService {
         MetadataShardAccessorRW& shard,
         const std::chrono::system_clock::time_point& now);
     void FreeDfsReplicas(const std::string& key,
-                         const std::vector<Replica>& replicas);
+                         std::span<const Replica> replicas);
     void RunDfsEviction();
     void RunShardDfsEviction();
     void RunBucketDfsEviction();
@@ -1621,20 +1619,10 @@ class MasterService {
      */
     PromotionQueueResult TryPushPromotionQueue(const ObjectIdentity& object_id,
                                                bool record_candidate = true);
-    void RecordOrUpdateCandidate(TenantState& tenant_state,
-                                 const std::string& key, uint8_t sketch_score,
-                                 PromotionCandidateReason reason,
-                                 ErrorCode last_error,
-                                 uint32_t execution_failures = 0);
-    void EraseCandidate(TenantState& tenant_state, const std::string& key);
     void EraseCandidate(const ObjectIdentity& object_id);
-    void DecrementCandidateCount();
     void BackoffCandidate(const ObjectIdentity& object_id,
                           PromotionQueueResult result);
     void ClearCandidatesForReload();
-    std::chrono::milliseconds CandidateBackoff(uint32_t retry_count) const;
-    bool IsTransientResult(PromotionQueueResult result) const;
-    size_t RunPromotionCandidateRetry(size_t max_shards_to_scan);
     size_t RunPromotionCandidateRetry();
 
     // Erase the object's in-flight PromotionTask, refund its pending charge,
@@ -2023,25 +2011,10 @@ class MasterService {
     // promotion task reaper after the task entry is erased. Relaxed memory
     // order is safe — the value is an advisory soft cap, not a barrier.
     std::atomic<uint64_t> promotion_in_flight_{0};
-    // Promotion retry candidate state.
-    std::atomic<uint64_t> promotion_candidate_count_{0};
-    std::atomic<size_t> promotion_retry_cursor_{0};
-    static constexpr size_t kPromotionCandidateLimit = 50000;
-    // Retry budget is sized to the condition it waits on: the watermark /
-    // queue-cap / push-failure gates clear on the client's offload heartbeat
-    // (10s-scale), not in milliseconds. The old budget (8 retries ≈ 2.3s)
-    // expired candidates long before their condition could clear, silently
-    // killing promotions whose only trigger was a one-off read. 64 retries
-    // with a 5s backoff cap spans ~5 minutes (≈ 30 heartbeat ticks); the TTL
-    // bounds how long an unread key can keep a slot.
-    static constexpr uint32_t kPromotionCandidateMaxRetries = 64;
+    // Promotion retry candidates: the index of due keys and the retry rules.
+    PromotionCandidateTracker promotion_candidates_;
+    // At most this many due candidates are tried per retry round.
     static constexpr size_t kPromotionRetryBatchSize = 128;
-    static constexpr size_t kPromotionRetryShardBatch = 64;
-    static constexpr std::chrono::milliseconds kPromotionCandidateTtl{300000};
-    static constexpr std::chrono::milliseconds
-        kPromotionCandidateInitialBackoff{10};
-    static constexpr std::chrono::milliseconds kPromotionCandidateMaxBackoff{
-        5000};
     // Bound on self-sustaining execution-failure cycles: a key whose
     // promotion keeps failing at execution time (AllocStart under DRAM
     // pressure, TE-write flake, SSD error) is re-recorded at most this many

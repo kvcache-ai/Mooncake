@@ -194,12 +194,12 @@ target_include_directories(local_notification_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME local_notification_test COMMAND local_notification_test)
 
-# Notification fallback: an unavailable RDMA notification channel falls back
-# to the next transport and then to the control-plane RPC, and receive drains
-# every transport. Loopback only, no NIC required.
+# Notification fallback: an unavailable RDMA notification channel falls back to
+# the next transport and then to the control-plane RPC, and receive drains every
+# transport. Loopback only, no NIC required.
 add_executable(tent_notification_fallback_test notification_fallback_test.cpp)
-target_link_libraries(tent_notification_fallback_test
-                      PRIVATE gtest gtest_main tent_link_group)
+target_link_libraries(tent_notification_fallback_test PRIVATE gtest gtest_main
+                                                              tent_link_group)
 target_include_directories(tent_notification_fallback_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_notification_fallback_test
@@ -320,52 +320,19 @@ target_include_directories(tent_shm_transport_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_shm_transport_test COMMAND tent_shm_transport_test)
 
-# io_uring submission-contract tests (two-phase all-or-nothing submit,
-# short-submit handling). No special hardware needed; only built when liburing
+# io_uring transport tests. No special hardware needed; only built when liburing
 # was found, and skipped at runtime where the kernel blocks io_uring (e.g.
-# restrictive seccomp profiles). Each case runs in its own process: the
-# transport's thread-local file context cache is keyed by segment ID only, so
-# consecutive transports in one process (each backed by its own temp file) would
-# reuse the first test's file context.
+# restrictive seccomp profiles). Run in one process to exercise file context
+# isolation across live and retired transports.
 if(TARGET tent_xport_uring)
   add_executable(tent_io_uring_transport_test io_uring_transport_test.cpp)
   target_link_libraries(tent_io_uring_transport_test PRIVATE gtest gtest_main
                                                              tent_link_group)
   target_include_directories(tent_io_uring_transport_test
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
-  add_test(
-    NAME tent_io_uring_transport_test_short_submit
-    COMMAND
-      tent_io_uring_transport_test
-      --gtest_filter=IOUringTransportTest.ShortSubmitIsNotAnErrorAndExecutesExactlyOnce
-  )
-  add_test(
-    NAME tent_io_uring_transport_test_all_or_nothing
-    COMMAND
-      tent_io_uring_transport_test
-      --gtest_filter=IOUringTransportTest.SubmitIsAllOrNothingWhenSegmentLookupFailsMidBatch
-  )
-  foreach(case RANGE 0 5)
-    add_test(
-      NAME tent_io_uring_read_completion_${case}
-      COMMAND
-        tent_io_uring_transport_test
-        --gtest_filter=AlignedAndStaged/IOUringReadCompletionTest.ReportsActualBytesAndPreservesUnreadTail/${case}
-    )
-  endforeach()
-  foreach(case RANGE 0 3)
-    add_test(
-      NAME tent_io_uring_write_completion_${case}
-      COMMAND
-        tent_io_uring_transport_test
-        --gtest_filter=AlignedAndStaged/IOUringWriteCompletionTest.ShortWriteFailsWithActualByteCount/${case}
-    )
-  endforeach()
-  add_test(
-    NAME tent_io_uring_failed_completion
-    COMMAND
-      tent_io_uring_transport_test
-      --gtest_filter=IOUringTransportTest.FailedCompletionReleasesStagingBuffer)
+  add_test(NAME tent_io_uring_transport_test
+           COMMAND tent_io_uring_transport_test)
+  set_tests_properties(tent_io_uring_transport_test PROPERTIES TIMEOUT 120)
 endif()
 
 # NOT registered via add_test: the test needs a real GPU (it opens a CUDA IPC
@@ -463,7 +430,9 @@ if(TARGET tent_xport_gds)
                                                                tent_link_group)
   target_link_options(
     tent_gds_transport_status_test PRIVATE "-Wl,--wrap=cuFileDriverOpen"
-    "-Wl,--wrap=cuFileBatchIOGetStatus" "-Wl,--wrap=cuFileBatchIOCancel")
+    "-Wl,--wrap=cuFileBatchIOGetStatus" "-Wl,--wrap=cuFileBatchIOCancel"
+    "-Wl,--wrap=cuFileBatchIOSubmit" "-Wl,--wrap=cuFileHandleRegister"
+    "-Wl,--wrap=cuFileHandleDeregister")
   target_include_directories(tent_gds_transport_status_test
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
   add_test(NAME tent_gds_transport_status_test
@@ -574,7 +543,8 @@ if(USE_UB)
   add_executable(
     tent_ub_teardown_test
     ub_teardown_test.cpp ../src/transport/ub/buffers.cpp
-    ../src/transport/ub/context.cpp ../src/transport/ub/jfc.cpp)
+    ../src/transport/ub/context.cpp ../src/transport/ub/endpoint.cpp
+    ../src/transport/ub/endpoint_store.cpp ../src/transport/ub/jfc.cpp)
   target_link_libraries(tent_ub_teardown_test PRIVATE tent_common gtest
                                                       gtest_main)
   target_include_directories(tent_ub_teardown_test
@@ -851,8 +821,7 @@ set_tests_properties(tent_segment_desc_retry_test PROPERTIES TIMEOUT 60)
 
 # Fabric transport: attribute codec and slicing math, plus end-to-end cases on
 # libfabric's tcp;ofi_rxm provider (no fabric hardware needed). Each e2e case
-# forks a server before the client engine starts, so it runs in its own
-# process.
+# forks a server before the client engine starts, so it runs in its own process.
 if(TARGET tent_xport_fabric)
   add_executable(tent_fabric_attrs_test fabric_attrs_test.cpp)
   target_link_libraries(tent_fabric_attrs_test PRIVATE gtest gtest_main

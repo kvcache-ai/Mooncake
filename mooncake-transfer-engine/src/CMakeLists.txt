@@ -67,6 +67,7 @@ if(USE_HTTP)
 endif()
 
 add_library(transfer_engine ${ENGINE_SOURCES} $<TARGET_OBJECTS:transport>)
+set_target_properties(transfer_engine PROPERTIES INSTALL_RPATH "$ORIGIN")
 target_include_directories(
   transfer_engine
   PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>

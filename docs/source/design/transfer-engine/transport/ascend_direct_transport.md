@@ -82,7 +82,7 @@ The following environment variables can be configured to control Ascend Direct T
 5. **Timeout Configuration**:
    - Use the `ASCEND_CONNECT_TIMEOUT` environment variable to control link establishment timeout (default: 10 seconds)
    - Use the `ASCEND_TRANSFER_TIMEOUT` environment variable to control data transfer timeout (default: 10 seconds)
-   - When the caller drives transfers through the Python API, ensure the outer `MC_TRANSFER_TIMEOUT` (seconds, default 30) is **strictly greater** than `ASCEND_TRANSFER_TIMEOUT` (milliseconds). If the outer timeout fires first, the transfer can still be in flight inside the Ascend transport, and the caller cannot tell whether it has quiesced — so do not reuse or unregister the target buffer until the transfer is known to have drained.
+   - When the caller drives transfers through the Python API, keep the outer `MC_TRANSFER_TIMEOUT` (seconds, default 30) **strictly greater than twice** `ASCEND_TRANSFER_TIMEOUT` (milliseconds, default 10000). A transfer that hits the inner timeout is retried, so the inner budget can be spent twice; the outer deadline has to cover both attempts. If the outer timeout fires first, the transfer can still be in flight inside the Ascend transport, and the caller cannot tell whether it has quiesced — so do not reuse or unregister the target buffer until the transfer is known to have drained. Ascend Direct checks this when it initializes a transfer executor and logs a warning naming both values if the outer deadline is too small.
 
 6. **RDMA Timeout and Retry Configuration**:
    - Use `HCCL_RDMA_TIMEOUT` to configure the RDMA NIC packet retransmission timeout coefficient. The actual packet retransmission timeout is `4.096us * 2 ^ $HCCL_RDMA_TIMEOUT`

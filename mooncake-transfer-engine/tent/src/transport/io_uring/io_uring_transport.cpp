@@ -158,7 +158,7 @@ std::string IOUringTransport::getIOUringFilePath(SegmentID target_id) {
 }
 
 IOUringFileContext* IOUringTransport::findFileContext(SegmentID target_id) {
-    thread_local FileContextMap tl_file_context_map;
+    auto& tl_file_context_map = tl_file_context_map_.get();
     if (tl_file_context_map.count(target_id))
         return tl_file_context_map[target_id].get();
 
