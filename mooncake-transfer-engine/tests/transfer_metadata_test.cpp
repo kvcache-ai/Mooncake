@@ -849,6 +849,99 @@ TEST(TransferMetadataPublicationTest, PreservesLocalOnlyBufferWithoutRkey) {
     EXPECT_TRUE(remote_desc->buffers[1].rkey.empty());
 }
 
+TEST(TransferMetadataCompatibilityTest,
+     LegacySegmentWithoutTcpInstanceIdDecodesEmpty) {
+    TransferMetadata server(P2PHANDSHAKE);
+    int sockfd = -1;
+    const uint16_t port = findAvailableTcpPort(sockfd);
+    ASSERT_GT(port, 0);
+    const std::string host = globalConfig().use_ipv6 ? "::1" : "127.0.0.1";
+    const std::string server_name =
+        maybeWrapIpV6(host) + ":" + std::to_string(port);
+
+    auto server_segment = makeRdmaSegmentDesc(server_name, 0x1000);
+    server_segment->tcp_data_port = port;
+    server_segment->tcp_proto_version = 1;
+    ASSERT_EQ(server.addLocalSegment(LOCAL_SEGMENT_ID, server_name,
+                                     std::move(server_segment)),
+              0);
+    TransferMetadata::RpcMetaDesc rpc;
+    rpc.ip_or_host_name = host;
+    rpc.rpc_port = port;
+    rpc.sockfd = sockfd;
+    ASSERT_EQ(server.addRpcMetaEntry(server_name, rpc), 0);
+
+    TransferMetadata client(P2PHANDSHAKE);
+    auto client_segment = std::make_shared<TransferMetadata::SegmentDesc>();
+    client_segment->name = "client";
+    client_segment->protocol = "rdma";
+    ASSERT_EQ(client.addLocalSegment(LOCAL_SEGMENT_ID, "client",
+                                     std::move(client_segment)),
+              0);
+
+    auto decoded = client.getSegmentDesc(server_name);
+    ASSERT_NE(decoded, nullptr);
+    EXPECT_TRUE(decoded->tcp_instance_id.empty());
+    EXPECT_EQ(decoded->tcp_proto_version, 1);
+}
+
+TEST(TransferMetadataValidationTest, ValidatesTcpInstanceId) {
+    const struct {
+        Json::Value id;
+        bool valid;
+    } cases[] = {{"", true},
+                 {"0123456789abcdef0123456789abcdef", true},
+                 {std::string(31, 'a'), false},
+                 {std::string(33, 'a'), false},
+                 {std::string(32, 'g'), false},
+                 {std::string(32, 'A'), false},
+                 {42, false},
+                 {Json::Value(), false}};
+    std::vector<Json::Value> protocols = {"tcp"};
+#ifdef ENABLE_MULTI_PROTOCOL
+    Json::Value mixed(Json::arrayValue);
+    mixed.append("tcp");
+    mixed.append("cxl");
+    protocols.push_back(mixed);
+#endif
+    for (const auto& protocol : protocols) {
+        for (const auto& test_case : cases) {
+            SCOPED_TRACE(protocol.toStyledString() +
+                         test_case.id.toStyledString());
+            auto server = HandShakePlugin::Create(P2PHANDSHAKE);
+            ASSERT_NE(server, nullptr);
+            int sockfd = -1;
+            const uint16_t port = findAvailableTcpPort(sockfd);
+            ASSERT_GT(port, 0);
+            const std::string host =
+                globalConfig().use_ipv6 ? "::1" : "127.0.0.1";
+            const std::string name =
+                maybeWrapIpV6(host) + ":" + std::to_string(port);
+            Json::Value response;
+            response["name"] = name;
+            response["protocol"] = protocol;
+            response["tcp_instance_id"] = test_case.id;
+            server->registerOnMetadataCallBack(
+                [response](const Json::Value&, Json::Value& peer) {
+                    peer = response;
+                    return 0;
+                });
+            ASSERT_EQ(server->startDaemon(port, sockfd), 0);
+
+            TransferMetadata client(P2PHANDSHAKE);
+            ASSERT_EQ(
+                client.addLocalSegment(LOCAL_SEGMENT_ID, "client",
+                                       makeRdmaSegmentDesc("client", 0x1000)),
+                0);
+            auto decoded = client.getSegmentDesc(name);
+            ASSERT_EQ(decoded != nullptr, test_case.valid);
+            if (decoded) {
+                EXPECT_EQ(decoded->tcp_instance_id, test_case.id.asString());
+            }
+        }
+    }
+}
+
 // A peer descriptor whose key vector is longer than its device list lets the
 // topology-selected device_id pass the rkey bound in selectPeerDevice() and
 // still index devices[] out of bounds. Such a descriptor must be rejected at
