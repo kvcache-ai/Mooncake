@@ -97,8 +97,14 @@ class WorkerPool {
     GidRefreshResult refreshPublishedLocalGid();
     bool handleContextEvent(ibv_event_type event_type, bool injected_for_test,
                             struct ibv_async_event *event = nullptr);
-    void scheduleContextRecovery(uint64_t delay_ns = kContextRecoveryDelayNs);
+    void scheduleContextRecovery(uint64_t delay_ns = kContextRecoveryDelayNs,
+                                 bool override_breaker = true);
     void maybeActivateRecoveredContext();
+    // Safety net for a PORT_ERR whose PORT_ACTIVE never arrived. At most the
+    // 1 Hz monitor tick calls this; on IBV_PORT_ACTIVE it arms the same
+    // delayed GID probe as the event path. Breaker-owned pauses are left
+    // alone so TTL reactivation still owns local-WC downtime.
+    void resumePausedContext();
     bool hasAvailablePeerRailAlternative(Transport::Slice *slice,
                                          const std::string &failed_peer_path);
 
