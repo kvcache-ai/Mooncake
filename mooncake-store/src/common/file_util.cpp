@@ -76,14 +76,28 @@ void FileUtil::SortByCreationTime(std::vector<fs::directory_entry> &files) {
     std::vector<std::pair<TimeKey, fs::directory_entry>> timed_files;
     timed_files.reserve(files.size());
     for (const auto &entry : files) {
+        bool has_birth_time = false;
+        int64_t seconds = 0;
+        uint32_t nanoseconds = 0;
+#if defined(__linux__)
         struct statx info{};
-        const bool has_birth_time =
+        has_birth_time =
             statx(AT_FDCWD, entry.path().c_str(), 0, STATX_BTIME, &info) == 0 &&
             (info.stx_mask & STATX_BTIME) != 0;
-        timed_files.emplace_back(
-            TimeKey{!has_birth_time, has_birth_time ? info.stx_btime.tv_sec : 0,
-                    has_birth_time ? info.stx_btime.tv_nsec : 0},
-            entry);
+        if (has_birth_time) {
+            seconds = info.stx_btime.tv_sec;
+            nanoseconds = info.stx_btime.tv_nsec;
+        }
+#elif defined(__APPLE__)
+        struct stat info{};
+        has_birth_time = stat(entry.path().c_str(), &info) == 0;
+        if (has_birth_time) {
+            seconds = info.st_birthtimespec.tv_sec;
+            nanoseconds = info.st_birthtimespec.tv_nsec;
+        }
+#endif
+        timed_files.emplace_back(TimeKey{!has_birth_time, seconds, nanoseconds},
+                                 entry);
     }
 
     // No filesystem operations in the comparator: a disappearing file must

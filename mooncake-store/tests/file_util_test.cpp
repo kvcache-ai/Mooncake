@@ -77,6 +77,7 @@ TEST_F(FileUtilTest, SortByCreationTime_MissingFileKeepsKnownFilesOrdered) {
     std::this_thread::sleep_for(std::chrono::milliseconds(25));
     std::ofstream(late) << "late";
 
+#if defined(__linux__)
     struct statx early_stat{}, late_stat{};
     ASSERT_EQ(statx(AT_FDCWD, early.c_str(), 0, STATX_BTIME, &early_stat), 0);
     ASSERT_EQ(statx(AT_FDCWD, late.c_str(), 0, STATX_BTIME, &late_stat), 0);
@@ -86,6 +87,19 @@ TEST_F(FileUtilTest, SortByCreationTime_MissingFileKeepsKnownFilesOrdered) {
             std::tie(late_stat.stx_btime.tv_sec, late_stat.stx_btime.tv_nsec)) {
         GTEST_SKIP() << "Filesystem did not provide distinct birth times";
     }
+#elif defined(__APPLE__)
+    struct stat early_stat{}, late_stat{};
+    ASSERT_EQ(stat(early.c_str(), &early_stat), 0);
+    ASSERT_EQ(stat(late.c_str(), &late_stat), 0);
+    if (std::tie(early_stat.st_birthtimespec.tv_sec,
+                 early_stat.st_birthtimespec.tv_nsec) >=
+        std::tie(late_stat.st_birthtimespec.tv_sec,
+                 late_stat.st_birthtimespec.tv_nsec)) {
+        GTEST_SKIP() << "Filesystem did not provide distinct birth times";
+    }
+#else
+    GTEST_SKIP() << "Birth-time queries are not supported on this platform";
+#endif
 
     const std::vector<fs::directory_entry> entries{
         fs::directory_entry(early), fs::directory_entry(late), missing_entry};
@@ -133,6 +147,7 @@ TEST_F(FileUtilTest, SortByCreationTime_EqualBirthTimesUsePath) {
     EXPECT_EQ(ReadFileContent(z.string()), "data");
 }
 
+#if defined(__linux__)
 TEST_F(FileUtilTest, SortByCreationTime_RetainsReadableFileWithoutBirthTime) {
     const fs::path without_birth_time = "/proc/self/status";
     struct statx info{};
@@ -155,6 +170,7 @@ TEST_F(FileUtilTest, SortByCreationTime_RetainsReadableFileWithoutBirthTime) {
     EXPECT_EQ(files[1].path(), without_birth_time);
     EXPECT_FALSE(ReadFileContent(without_birth_time.string()).empty());
 }
+#endif
 
 // ========== SaveStringToFile ==========
 
