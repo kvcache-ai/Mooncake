@@ -275,7 +275,7 @@ Keyspace behavior is conditional:
 
 ## Build
 
-Configure the root CMake project as described in the [Store-RS source-checkout quickstart](../../getting_started/store-rs.md), then build the build_store_rs_cli target. The unified root wheel installs the client, admin, and benchmark commands for direct use from its Python environment.
+Configure the root CMake project as described in {ref}`Build with Store-RS <build-with-store-rs>`, then build the build_store_rs_cli target. The unified root wheel installs the client, admin, and benchmark commands for direct use from its Python environment.
 
 ## Next reading
 
