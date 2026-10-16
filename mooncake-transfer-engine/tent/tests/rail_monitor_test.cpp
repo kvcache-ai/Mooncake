@@ -14,6 +14,8 @@
 
 #include <gtest/gtest.h>
 
+#include <arpa/inet.h>
+
 #include <chrono>
 #include <thread>
 
@@ -683,6 +685,214 @@ TEST(RailMonitorProbeTest, CancelProbeRevertsArmedTrial) {
     rail.markRecovered(0, 0);
     rail.cancelProbe(0, 0);
     EXPECT_TRUE(rail.isAvailable(0, 0)) << "cancelProbe no-op on a Closed rail";
+}
+
+// ---------------------------------------------------------------------------
+// Remote NIC selection must not pair a rail NIC with a peer NIC it has no
+// path to. A front-end NIC on the management network and the rail NICs on
+// their own subnets share no route, yet nothing above RailMonitor knows that:
+// before #4662 every such pair was a rail, and each one cost a full RC retry
+// timeout per worker before it was paused. The published RoCE v2 GIDs make
+// the disjoint subnets visible, so those pairs never become rails.
+// ---------------------------------------------------------------------------
+
+// Builds the 16-byte colon-separated GID string an IPv4-mapped RoCE v2 NIC
+// publishes in DeviceDesc.
+static std::string makeRoceV2Gid(const std::string& ipv4) {
+    in_addr addr{};
+    EXPECT_EQ(inet_pton(AF_INET, ipv4.c_str(), &addr), 1) << ipv4;
+    const auto* bytes = reinterpret_cast<const uint8_t*>(&addr.s_addr);
+    char buf[64];
+    snprintf(buf, sizeof(buf),
+             "00:00:00:00:00:00:00:00:00:00:ff:ff:%02x:%02x:%02x:%02x",
+             bytes[0], bytes[1], bytes[2], bytes[3]);
+    return buf;
+}
+
+// One front-end NIC plus two rail NICs, all RDMA on NUMA 0, with a host
+// memory entry that lists every one of them -- the default deployment where
+// no NIC has been filtered out.
+static std::shared_ptr<Topology> makeFrontEndAndRailTopology() {
+    auto topo = std::make_shared<Topology>();
+    auto status = topo->parse(R"({
+        "nics": [
+            {"name": "mlx5_0", "type": 0, "numa_node": 0},
+            {"name": "mlx5_1", "type": 0, "numa_node": 0},
+            {"name": "mlx5_2", "type": 0, "numa_node": 0}
+        ],
+        "mems": [{
+            "name": "host0",
+            "type": 0,
+            "numa_node": 0,
+            "device_list": {"rank0": [0, 1, 2]}
+        }]
+    })");
+    if (!status.ok()) {
+        ADD_FAILURE() << "Topology::parse failed: " << status.ToString();
+    }
+    return topo;
+}
+
+static std::vector<DeviceDesc> makeDevices(
+    const std::vector<std::pair<std::string, std::string>>& nic_to_ipv4) {
+    std::vector<DeviceDesc> devices;
+    for (const auto& [nic, ipv4] : nic_to_ipv4) {
+        DeviceDesc device;
+        device.name = nic;
+        device.lid = 0;
+        device.gid = ipv4.empty() ? "" : makeRoceV2Gid(ipv4);
+        devices.push_back(std::move(device));
+    }
+    return devices;
+}
+
+TEST(RailMonitorSubnetTest, CrossSubnetPairsAreNotRails) {
+    auto local = makeFrontEndAndRailTopology();
+    auto remote = makeFrontEndAndRailTopology();
+    // mlx5_0 is the front-end NIC; mlx5_1 / mlx5_2 are rails, each on its own
+    // subnet. Only same-index pairs have a path.
+    auto local_devices = makeDevices({{"mlx5_0", "10.0.0.1"},
+                                      {"mlx5_1", "192.168.1.1"},
+                                      {"mlx5_2", "192.168.2.1"}});
+    auto remote_devices = makeDevices({{"mlx5_0", "10.0.0.2"},
+                                       {"mlx5_1", "192.168.1.2"},
+                                       {"mlx5_2", "192.168.2.2"}});
+    RailMonitor rail;
+    ASSERT_TRUE(
+        rail.load(local, remote, "", nullptr, &local_devices, &remote_devices)
+            .ok());
+
+    for (int nic = 0; nic < 3; ++nic) {
+        SCOPED_TRACE(nic);
+        EXPECT_TRUE(rail.isAvailable(nic, nic)) << "same-subnet pair";
+        EXPECT_EQ(rail.findBestRemoteDevice(nic, /*remote_numa=*/0), nic);
+    }
+    // A rail NIC must never be offered the peer front-end NIC, and admit()
+    // must refuse it so no slice is ever posted on it.
+    EXPECT_FALSE(rail.isAvailable(/*local_nic=*/1, /*remote_nic=*/0));
+    EXPECT_FALSE(rail.admit(/*local_nic=*/1, /*remote_nic=*/0));
+    EXPECT_FALSE(rail.isAvailable(/*local_nic=*/0, /*remote_nic=*/2));
+    EXPECT_FALSE(rail.admit(/*local_nic=*/0, /*remote_nic=*/2));
+
+    // Allocation follows: only the local NIC that can reach the peer NIC in
+    // the target memory entry may be charged.
+    Topology::MemEntry target;
+    target.device_list[0] = {0};
+    EXPECT_EQ(rail.localDeviceMask(target), 1ULL);
+    target.device_list[0] = {1};
+    EXPECT_EQ(rail.localDeviceMask(target), 2ULL);
+}
+
+TEST(RailMonitorSubnetTest, UnmatchedSubnetKeepsEveryPair) {
+    auto local = makeFrontEndAndRailTopology();
+    auto remote = makeFrontEndAndRailTopology();
+    // A routed fabric: no peer NIC shares a /24 with any local NIC. The
+    // prefix says nothing useful here, so pruning must not happen -- it would
+    // strand every NIC.
+    auto local_devices = makeDevices({{"mlx5_0", "10.0.0.1"},
+                                      {"mlx5_1", "10.0.1.1"},
+                                      {"mlx5_2", "10.0.2.1"}});
+    auto remote_devices = makeDevices({{"mlx5_0", "10.0.3.1"},
+                                       {"mlx5_1", "10.0.4.1"},
+                                       {"mlx5_2", "10.0.5.1"}});
+    RailMonitor rail;
+    ASSERT_TRUE(
+        rail.load(local, remote, "", nullptr, &local_devices, &remote_devices)
+            .ok());
+
+    for (int local_nic = 0; local_nic < 3; ++local_nic)
+        for (int remote_nic = 0; remote_nic < 3; ++remote_nic)
+            EXPECT_TRUE(rail.isAvailable(local_nic, remote_nic))
+                << local_nic << " -> " << remote_nic;
+    // Same-name matching still decides the preferred peer.
+    EXPECT_EQ(rail.findBestRemoteDevice(/*local_nic=*/1, /*remote_numa=*/0), 1);
+}
+
+TEST(RailMonitorSubnetTest, UnpublishedGidsKeepEveryPair) {
+    auto local = makeFrontEndAndRailTopology();
+    auto remote = makeFrontEndAndRailTopology();
+    // An IB fabric publishes no IPv4-mapped GID, and a peer that has not
+    // published its devices yet supplies none at all.
+    auto local_devices =
+        makeDevices({{"mlx5_0", ""}, {"mlx5_1", ""}, {"mlx5_2", ""}});
+    RailMonitor rail;
+    ASSERT_TRUE(
+        rail.load(local, remote, "", nullptr, &local_devices, nullptr).ok());
+
+    for (int local_nic = 0; local_nic < 3; ++local_nic)
+        for (int remote_nic = 0; remote_nic < 3; ++remote_nic)
+            EXPECT_TRUE(rail.isAvailable(local_nic, remote_nic))
+                << local_nic << " -> " << remote_nic;
+}
+
+TEST(RailMonitorSubnetTest, PrefixLenZeroDisablesFiltering) {
+    auto local = makeFrontEndAndRailTopology();
+    auto remote = makeFrontEndAndRailTopology();
+    auto local_devices = makeDevices({{"mlx5_0", "10.0.0.1"},
+                                      {"mlx5_1", "192.168.1.1"},
+                                      {"mlx5_2", "192.168.2.1"}});
+    auto remote_devices = makeDevices({{"mlx5_0", "10.0.0.2"},
+                                       {"mlx5_1", "192.168.1.2"},
+                                       {"mlx5_2", "192.168.2.2"}});
+    Config cfg;
+    cfg.set(RailMonitor::kCfgSubnetPrefixLen, 0);
+    RailMonitor rail;
+    ASSERT_TRUE(
+        rail.load(local, remote, "", &cfg, &local_devices, &remote_devices)
+            .ok());
+
+    for (int local_nic = 0; local_nic < 3; ++local_nic)
+        for (int remote_nic = 0; remote_nic < 3; ++remote_nic)
+            EXPECT_TRUE(rail.isAvailable(local_nic, remote_nic))
+                << local_nic << " -> " << remote_nic;
+}
+
+TEST(RailMonitorSubnetTest, ExplicitRailTopologyIsNotFiltered) {
+    auto local = makeFrontEndAndRailTopology();
+    auto remote = makeFrontEndAndRailTopology();
+    auto local_devices = makeDevices({{"mlx5_0", "10.0.0.1"},
+                                      {"mlx5_1", "192.168.1.1"},
+                                      {"mlx5_2", "192.168.2.1"}});
+    auto remote_devices = makeDevices({{"mlx5_0", "10.0.0.2"},
+                                       {"mlx5_1", "192.168.1.2"},
+                                       {"mlx5_2", "192.168.2.2"}});
+    // An operator who declares a cross-subnet pair knows the fabric routes it.
+    const std::string rail_json = R"({
+        "all": [{"local": "mlx5_1", "remote": "mlx5_0"}],
+        "direct": [{"local": "mlx5_1", "remote": "mlx5_0"}]
+    })";
+    RailMonitor rail;
+    ASSERT_TRUE(rail.load(local, remote, rail_json, nullptr, &local_devices,
+                          &remote_devices)
+                    .ok());
+    EXPECT_TRUE(rail.isAvailable(/*local_nic=*/1, /*remote_nic=*/0));
+    EXPECT_FALSE(rail.isAvailable(/*local_nic=*/1, /*remote_nic=*/1));
+}
+
+TEST(RailMonitorSubnetTest, GidRefreshRebuildsRails) {
+    auto local = makeFrontEndAndRailTopology();
+    auto remote = makeFrontEndAndRailTopology();
+    auto local_devices = makeDevices({{"mlx5_0", "10.0.0.1"},
+                                      {"mlx5_1", "192.168.1.1"},
+                                      {"mlx5_2", "192.168.2.1"}});
+    auto remote_devices = makeDevices({{"mlx5_0", "10.0.0.2"},
+                                       {"mlx5_1", "192.168.1.2"},
+                                       {"mlx5_2", "192.168.2.2"}});
+    RailMonitor rail;
+    ASSERT_TRUE(
+        rail.load(local, remote, "", nullptr, &local_devices, &remote_devices)
+            .ok());
+    ASSERT_FALSE(rail.isAvailable(/*local_nic=*/1, /*remote_nic=*/2));
+
+    // The peer re-reads its GIDs and mlx5_2 lands on the rail-1 subnet. The
+    // NIC/memory layout is untouched, so only the GIDs can trigger a rebuild.
+    remote_devices = makeDevices({{"mlx5_0", "10.0.0.2"},
+                                  {"mlx5_1", "192.168.1.2"},
+                                  {"mlx5_2", "192.168.1.3"}});
+    ASSERT_TRUE(
+        rail.load(local, remote, "", nullptr, &local_devices, &remote_devices)
+            .ok());
+    EXPECT_TRUE(rail.isAvailable(/*local_nic=*/1, /*remote_nic=*/2));
 }
 
 }  // namespace
