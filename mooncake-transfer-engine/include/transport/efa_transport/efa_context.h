@@ -17,12 +17,7 @@
 
 #include <gflags/gflags.h>
 #include <glog/logging.h>
-#include <rdma/fabric.h>
-#include <rdma/fi_domain.h>
-#include <rdma/fi_endpoint.h>
-#include <rdma/fi_cm.h>
-#include <rdma/fi_rma.h>
-#include <rdma/fi_errno.h>
+#include "transport/efa_transport/efa_fabric.h"
 // FI_OPT_EFA_* provider-specific setopt values (FI_OPT_EFA_HOMOGENEOUS_PEERS).
 // Not a mandatory libfabric header: the AWS EFA installer ships it, but the
 // distro libfabric-dev package -- what the wheel CI builds against -- does not.

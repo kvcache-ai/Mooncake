@@ -879,6 +879,24 @@ def test_runtime_binding_set_rejects_cross_participant_address_overlap() -> None
         )
 
 
+def test_runtime_binding_set_rejects_cross_participant_fragment_id_duplicate() -> None:
+    placement = _manifest()
+    left = _binding(placement, "worker-0", instance_id="source-0")
+    right = _binding(placement, "worker-1", instance_id="source-1")
+    duplicate = replace(
+        right.fragments[0],
+        fragment_id=left.fragments[0].fragment_id,
+    )
+
+    with pytest.raises(
+        ValueError, match="duplicate runtime fragment_id across participants"
+    ):
+        validate_runtime_bindings(
+            placement,
+            (left, replace(right, fragments=(duplicate,))),
+        )
+
+
 def test_runtime_binding_set_requires_every_global_part_exactly_once() -> None:
     placement = _manifest()
     left = _binding(placement, "worker-0", instance_id="source-0")

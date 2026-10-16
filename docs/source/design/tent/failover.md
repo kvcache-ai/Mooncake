@@ -7,7 +7,7 @@ This document describes how the recovery works, which knobs control it, and how 
 The design has two layers:
 
 1. **Cross-transport failover** in `TransferEngineImpl`. When a transport fails a task at the completion stage, the engine moves that task to the next available transport (for example RDMA → TCP). Submit-stage failures are not retried today; see Known Gaps.
-2. **Intra-RDMA rail recovery** in `RailMonitor`. When a specific (local NIC, remote NIC) rail keeps failing, the monitor pauses it with exponential cooldown; a successful transfer or the cooldown expiry brings it back.
+2. **Intra-RDMA rail recovery** in `RailMonitor`. When a specific (local NIC, remote NIC) rail keeps failing, the monitor pauses it with exponential cooldown; a successful transfer, or a probe / Half-Open trial on the paused rail, brings it back early.
 
 Application code submits a batch and polls `getTransferStatus`. It never sees a `FAILED` task as long as any healthy path remains and the failover budget is not exhausted.
 
@@ -82,13 +82,16 @@ Inside `RdmaTransport`, each completion drives the rail monitor:
 * Bad completion → `rail.markFailed(local_nic, remote_nic)`
 * Good completion → `rail.markRecovered(local_nic, remote_nic)`
 
-`markFailed` bumps `error_count` inside `error_window_`. Once the count hits `error_threshold_` the rail is paused until `now + cooldown_`; the cooldown doubles on every repeat failure up to `kMaxCooldown` (300 s).
+`markFailed` bumps `error_count` inside `error_window_`. Once the count hits `error_threshold_` the rail is paused until `now + cooldown_`; the cooldown escalates only when a *fresh* pause arms (`was_paused == false`), never within one burst — a single outage of N error WQEs in one window is one trip, not N. On a repeat failure across recovery cycles it doubles up to `kMaxCooldown` (300 s).
 
 `markRecovered` clears the error count, un-pauses the rail, and resets the exponential-backoff memory so the next failure cycle starts from the initial cooldown. A fast path returns without work when the rail is already healthy, which is the common case on the completion hot path.
 
-`available(local, remote)` is the gate every work request passes through before posting. If the cooldown has expired, `available` itself resets all backoff state (error count, resume time, cooldown) and logs `Rail recovered: ... (cooldown expired)`. Otherwise it returns false and the scheduler picks another rail via `findBestRemoteDevice`.
+The admission gate is split into a pure predicate and a mutating admit:
 
-This produces two independent recovery signals — cooldown expiry and live success — so a flaky rail does not stall forever if no other rail is posted to, and a recovered rail returns to service at the first good completion instead of waiting for the full cooldown.
+* `isAvailable(local, remote) const` returns true only for a Closed/healthy rail. It never mutates state and never calls `updateBestMapping`, so it is safe to call from `updateBestMapping` (the mapping rebuild) without the recursion the old single `available()` had.
+* `admit(local, remote)` is the only path that arms a probe/trial. For a Closed rail it returns true with no mutation. While a rail is Open (cooldown running) it admits one exploratory probe every `probe_interval_`; a probe success closes the rail early (transient-fault recovery in seconds rather than the full cooldown), a probe failure is a no-op for escalation (the rail was already paused, so defect A holds). When the cooldown expires without a probe proving the rail healthy, `admit` transitions to Half-Open and admits exactly ONE trial — it does not fully reopen. Escalation happens only if that trial fails (`markFailed` doubles the cooldown and re-arms); a trial success closes the rail. Elapsed time alone never proves the path is healthy, so clock expiry alone never escalates and never floods a still-dead peer with every slice. `probe_in_flight` gates a second probe/trial from racing the first while it is on the wire (single-threaded per-worker ownership makes a bool sufficient); a pre-wire failure that armed a probe but never reached the wire calls `cancelProbe` to roll the admission back.
+
+This produces two recovery signals — a probe/trial result, and a live success on a posted transfer — so a flaky rail returns to service at the first good completion instead of waiting for the full cooldown, and a still-dead peer is probed at one trial per `probe_interval_` rather than slammed every cycle.
 
 ## Configuration
 
@@ -100,7 +103,8 @@ All knobs live in the top-level `transfer-engine.json`. Defaults are safe for pr
 | `max_failover_attempts` | `3` | Upper bound on `resubmitTransferTask` calls per task. `0` disables cross-transport failover entirely. `1` allows exactly one switch. |
 | `transports/rdma/rail_error_threshold` | `3` | Number of failures inside `rail_error_window_secs` that trips a rail into the paused state. |
 | `transports/rdma/rail_error_window_secs` | `10` | Sliding window for counting rail errors. A failure older than the window resets `error_count` to 1. |
-| `transports/rdma/rail_cooldown_secs` | `30` | Initial cooldown after tripping. Doubles on each repeat failure, capped at 300 s. |
+| `transports/rdma/rail_cooldown_secs` | `30` | Initial cooldown after tripping. Escalates on a fresh pause across recovery cycles, capped at 300 s. |
+| `transports/rdma/rail_probe_interval_secs` | `1` | While a rail is paused, `admit` arms one exploratory probe / Half-Open trial every this many seconds; `0` disables probing. |
 
 The RDMA keys are read by `RailMonitor::load`. Example:
 
@@ -133,8 +137,9 @@ The counter is only built when TENT is compiled with `-DTENT_METRICS_ENABLED=ON`
 | `Transport failover: X -> Y (attempt N/M)` | A task has successfully switched transports. |
 | `Task failover limit reached (M), last transport=X` | Task exhausted its budget and will surface `FAILED`. |
 | `No more transports available after X failed` | `resolveTransport` returned `UNSPEC`; no further fallback exists for this request. |
-| `Rail recovered: local_nic=... remote_nic=... (cooldown expired)` | Cooldown elapsed and the rail is back in service. |
-| `Rail recovered: ... (un-paused by successful transfer)` | Live success on a previously paused rail brought it back early. |
+| `Rail recovered: local_nic=... remote_nic=... (cooldown expired)` | Cooldown elapsed; the next `admit` transitions the rail to Half-Open and arms one trial. |
+| `Rail recovered: ... (un-paused by successful transfer)` | Live success (or a successful probe/trial) brought a previously paused rail back early. |
+| `Rail half-open: local_nic=... remote_nic=... (cooldown=Ns retained, trial admitted)` | Cooldown expired and `admit` armed a single Half-Open trial; escalation occurs only if the trial fails. |
 
 (tent-failover-testing)=
 ## Testing
@@ -144,18 +149,20 @@ Real hardware faults are hard to stage, so failover is tested by driving the rea
 The harness — why a fake `Transport` is enough, how fakes are swapped in, and what this can and cannot prove — is in {ref}`TENT Testing <tent-testing>`. That page is the mechanism; this section only notes what failover uses it for:
 
 * Completion-stage `FAILED` on the primary must resubmit on the next available transport.
+* Submit-stage failure: a synchronous non-OK from `submitTransferTasks` must fail the owner task over to the remaining candidates (bounded by `max_failover_attempts`) instead of terminal-failing it.
+* Derived (merged) alias tasks must follow their owner's recovered route and must not cause a duplicate physical submission.
 * Exhausting `max_failover_attempts` (including `0` and `1`) must surface `FAILED` and must not touch a transport beyond the budget.
 * `failover_count` is per-task: one failing request must not spend another request's budget.
 * With `enable_auto_failover_on_poll=false`, status polling is observational; `progressBatch` / `waitTransferCompletion` / `transferSync` still recover.
 
-Submit-stage failures are intentionally not covered here; see Known Gaps.
+Submit-stage recovery is exercised through the same FakeTransport harness with `force_submit_fail` backends (see `SubmitStageFailureFailsOverToSecondary` and friends in `engine_failover_e2e_test.cpp`).
 
 ## Known Gaps
 
-* **Submit-stage failures do not trigger failover.** When `submitTransferTasks` returns non-OK, every task in that call is marked `UNSPEC` and surfaces as `FAILED`. A naive retry loop here is unsafe for two reasons:
-  1. **Merged requests.** When `merge_requests` is enabled (default), `task_id_list[type]` contains both the real merged task and its derived aliases. Resubmitting per task-id re-posts one logical transfer multiple times on the fallback transport, breaking the deduplication the merge pass established.
-  2. **Partial enqueue.** Some transports (for example `ShmTransport::submitTransferTasks`, `NVLinkTransport::submitTransferTasks`) enqueue or start work for earlier requests in `request_list` before returning an error on a later one. The return status alone does not tell us which tasks partially succeeded, so a blanket resubmit would duplicate already-started transfers.
-  A safe submit-stage recovery needs either (a) a transport-level "atomic submit" capability flag plus per-task skip of derived ids, or (b) per-request status returned from `submitTransferTasks`. Neither exists today.
-* `markRecovered` (and cooldown expiry in `available`) clears the exponential-backoff memory entirely. A rail that flaps repeatedly therefore does not accumulate a growing cooldown across recovery cycles. If this becomes a problem the fix is to decay rather than reset.
+* **Submit-stage failure recovery is implemented** (previously a gap): a synchronous non-OK from `submitTransferTasks` fails the owner tasks over to the remaining candidate transports (bounded by `max_failover_attempts`), reusing `resubmitTransferTask`. The two hazards that originally made a naive retry unsafe are handled as follows:
+  1. **Merged requests.** Only the owner task of each merged request is resubmitted; derived aliases mirror the owner's recovered route (transport, sub-batch slot, status) instead of being resubmitted themselves, preserving the merge pass's deduplication.
+  2. **Partial enqueue.** `NVLinkTransport::submitTransferTasks` rolls back its half-appended task entries on synchronous failure (no I/O has started at that point). Transports that start per-request work inside the submit loop (e.g. `ShmTransport`, whose copies are synchronous and idempotent) may still cause a duplicate same-content transfer on the fallback; re-posting an identical request is a data-level no-op for KV-cache-style workloads.
+  A failover target whose own synchronous submit also fails is retried within the same budget; a task that exhausts all candidates surfaces `FAILED` attributed to the last attempted transport (never `unspec`).
+* A Closed rail resets its backoff memory entirely on recovery (`markRecovered`, or expiry reopen in `isAvailable`'s predecessor behavior). Escalation across cycles now happens via a Half-Open trial failure (`markFailed` doubles the cooldown and re-arms), not via clock expiry — so a rail that flaps does back off harder when its trial probes keep failing, while a proven-healthy recovery starts fresh. If this ever proves too aggressive the fix is to decay rather than escalate on trial failure.
 * Cross-transport failover is driven purely by return status; there is no latency-based "this transport is healthy but too slow, try another" signal. That belongs to the scheduler, not this document.
 * Runtime-layer failover is covered by FakeTransport tests in the `tent-ci` `cuda-off` legs. DMA integrity, real WC errors, and staging under NVLink still need hardware runners; see {ref}`TENT Testing <tent-testing>`.

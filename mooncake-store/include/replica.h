@@ -119,9 +119,10 @@ struct ReplicateConfig {
     bool prefer_alloc_in_same_node{false};
     ObjectDataType data_type{ObjectDataType::UNKNOWN};
     std::string host_id{};
-    // Optional per-key routing group IDs. Empty string keeps that key
-    // ungrouped. Grouped keys share metadata routing, coalesced lease refresh,
-    // and memory eviction behavior.
+    // Optional per-key group IDs. Empty string keeps that key
+    // ungrouped. Group IDs tie keys into a lifecycle group: the background
+    // eviction treats the group as a unit (all-or-none). Object routing is
+    // always hash(tenant, key) and is decoupled from groups.
     std::optional<std::vector<std::string>> group_ids{};
 
     ReplicateConfig ForSingleKey(size_t key_index) const {
@@ -217,6 +218,12 @@ struct LocalDiskReplicaData {
     UUID client_id;
     uint64_t object_size = 0;
     std::string transport_endpoint;
+    // Process-local affiliation with the exact Client incarnation. This is
+    // rebuilt after restore and deliberately excluded from descriptors. Like
+    // the buffer bindings in AllocatedBuffer, it is set before the replica is
+    // published and not changed while readers can see it, so it needs no
+    // atomic access.
+    std::shared_ptr<ClientLivenessRecord> client_liveness;
 };
 
 struct DistributedFSDescriptor {
@@ -262,51 +269,30 @@ class Replica {
 
     // memory replica constructor
     Replica(std::unique_ptr<AllocatedBuffer> buffer, ReplicaStatus status)
-        : id_(next_id_.fetch_add(1)),
-          data_(MemoryReplicaData{std::move(buffer)}),
-          status_(status),
-          refcnt_(0) {}
+        : Replica(next_id_.fetch_add(1), std::move(buffer), status) {}
 
     // nof ssd replica constructor
     Replica(std::unique_ptr<AllocatedBuffer> buffer, ReplicaStatus status,
             ReplicaType replica_type)
-        : id_(next_id_.fetch_add(1)), status_(status), refcnt_(0) {
-        if (replica_type == ReplicaType::MEMORY) {
-            data_ = MemoryReplicaData{std::move(buffer)};
-        } else if (replica_type == ReplicaType::NOF_SSD) {
-            data_ = NoFReplicaData{std::move(buffer)};
-        } else {
-            LOG(ERROR) << "Invalid buffered replica type: " << replica_type;
-        }
-    }
+        : Replica(next_id_.fetch_add(1), std::move(buffer), status,
+                  replica_type) {}
 
     // disk replica constructor
     Replica(std::string file_path, uint64_t object_size, ReplicaStatus status)
-        : id_(next_id_.fetch_add(1)),
-          data_(DiskReplicaData{std::move(file_path), object_size}),
-          status_(status),
-          refcnt_(0) {
-        // Automatic update allocated_file_size via RAII
-        MasterMetricManager::instance().inc_allocated_file_size(object_size);
-    }
+        : Replica(next_id_.fetch_add(1), std::move(file_path), object_size,
+                  status) {}
 
     // local disk replica constructor
     Replica(UUID client_id, uint64_t object_size,
-            std::string transport_endpoint, ReplicaStatus status)
-        : id_(next_id_.fetch_add(1)),
-          data_(LocalDiskReplicaData{client_id, object_size,
-                                     std::move(transport_endpoint)}),
-          status_(status),
-          refcnt_(0) {
-        MasterMetricManager::instance().inc_allocated_file_size(object_size);
-    }
+            std::string transport_endpoint, ReplicaStatus status,
+            std::shared_ptr<ClientLivenessRecord> client_liveness = nullptr)
+        : Replica(next_id_.fetch_add(1), client_id, object_size,
+                  std::move(transport_endpoint), status,
+                  std::move(client_liveness)) {}
 
     // dfs replica constructor
     Replica(DistributedFSDescriptor descriptor, ReplicaStatus status)
-        : id_(next_id_.fetch_add(1)),
-          data_(DfsReplicaData{std::move(descriptor)}),
-          status_(status),
-          refcnt_(0) {}
+        : Replica(next_id_.fetch_add(1), std::move(descriptor), status) {}
 
     ~Replica() {
         if (status_ == ReplicaStatus::UNDEFINED) return;
@@ -362,6 +348,37 @@ class Replica {
     }
 
     [[nodiscard]] Descriptor get_descriptor() const;
+
+    // The endpoint get_descriptor() would send a reader to, without building
+    // the descriptor; none for kinds whose descriptor names no endpoint.
+    [[nodiscard]] std::optional<std::string> transport_endpoint() const;
+
+    // True while the replica's storage can serve a read: a buffer still
+    // allocated on a live segment whose client is serving, or a local-disk
+    // owner that is still serving. Other kinds carry no such state.
+    [[nodiscard]] bool is_available() const {
+        if (const auto* data = std::get_if<MemoryReplicaData>(&data_)) {
+            return data->buffer && data->buffer->isAvailable();
+        }
+        if (const auto* data = std::get_if<NoFReplicaData>(&data_)) {
+            return data->buffer && data->buffer->isAvailable();
+        }
+        if (const auto* data = std::get_if<LocalDiskReplicaData>(&data_)) {
+            const ClientLivenessRecord* record = data->client_liveness.get();
+            return record != nullptr && record->IsServing();
+        }
+        return true;
+    }
+
+    [[nodiscard]] bool getDescriptorIfAvailable(Descriptor& descriptor) const {
+        if (!is_available()) {
+            return false;
+        }
+        descriptor = get_descriptor();
+        // Checked again: the storage can go away while the descriptor is
+        // built, and a reader must not be handed one that already has.
+        return is_available();
+    }
 
     [[nodiscard]] ReplicaID id() const { return id_; }
 
@@ -453,7 +470,14 @@ class Replica {
         if (!buffer || !is_memory_replica()) {
             return false;
         }
-        std::get<MemoryReplicaData>(data_).buffer = std::move(buffer);
+        auto& memory = std::get<MemoryReplicaData>(data_);
+        if (!memory.buffer ||
+            !buffer->copyTransferProtocolFrom(*memory.buffer)) {
+            return false;
+        }
+        // Allocator import rebuilds address ownership; the replica keeps the
+        // transfer protocol advertised before remount.
+        memory.buffer = std::move(buffer);
         return true;
     }
 
@@ -466,18 +490,19 @@ class Replica {
     }
 
     /**
-     * @brief Check if a local_disk replica's owner client is still alive.
+     * @brief Check if a local_disk replica's owner still retains resources.
      * Used by CleanupStaleHandles to remove replicas belonging to expired
      * clients. For non-local_disk replicas, always returns false.
-     * @param alive_clients Set of currently alive client IDs.
-     * @return true if this is a local_disk replica whose client is not alive.
+     * @param retaining_clients Clients whose resources must be retained.
+     * @return true if this replica's owner no longer retains resources.
      */
     [[nodiscard]] bool has_stale_local_disk_client(
-        const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients)
+        const std::unordered_set<UUID, boost::hash<UUID>>& retaining_clients)
         const {
         auto client_id = get_local_disk_client_id();
         if (client_id.has_value()) {
-            return alive_clients.find(client_id.value()) == alive_clients.end();
+            return retaining_clients.find(client_id.value()) ==
+                   retaining_clients.end();
         }
         return false;
     }
@@ -493,6 +518,46 @@ class Replica {
             return disk_data.client_id;
         }
         return std::nullopt;
+    }
+
+    void bindClientLiveness(
+        std::shared_ptr<ClientLivenessRecord> client_liveness) {
+        if (is_memory_replica()) {
+            auto& data = std::get<MemoryReplicaData>(data_);
+            if (data.buffer) {
+                data.buffer->bindClientLiveness(std::move(client_liveness));
+            }
+        } else if (is_local_disk_replica()) {
+            std::get<LocalDiskReplicaData>(data_).client_liveness =
+                std::move(client_liveness);
+        }
+    }
+
+    [[nodiscard]] std::shared_ptr<ClientLivenessRecord> getClientLiveness()
+        const {
+        if (is_memory_replica()) {
+            const auto& data = std::get<MemoryReplicaData>(data_);
+            return data.buffer ? data.buffer->getClientLiveness() : nullptr;
+        }
+        if (is_local_disk_replica()) {
+            const auto& data = std::get<LocalDiskReplicaData>(data_);
+            return data.client_liveness;
+        }
+        return nullptr;
+    }
+
+    [[nodiscard]] bool isAffiliatedWith(
+        const std::shared_ptr<ClientLivenessRecord>& client_liveness) const {
+        if (is_memory_replica()) {
+            const auto& data = std::get<MemoryReplicaData>(data_);
+            return data.buffer &&
+                   data.buffer->getClientLiveness() == client_liveness;
+        }
+        if (is_local_disk_replica()) {
+            const auto& data = std::get<LocalDiskReplicaData>(data_);
+            return data.client_liveness == client_liveness;
+        }
+        return false;
     }
 
     [[nodiscard]] size_t get_memory_buffer_size() const {
@@ -537,6 +602,14 @@ class Replica {
         }
     }
 
+    void cancel_remove() {
+        if (status_ == ReplicaStatus::REMOVED) {
+            status_ = ReplicaStatus::COMPLETE;
+        } else {
+            LOG(ERROR) << "Cannot cancel_remove from status: " << status_;
+        }
+    }
+
     void inc_refcnt() { refcnt_.fetch_add(1); }
 
     void dec_refcnt() { refcnt_.fetch_sub(1); }
@@ -564,7 +637,7 @@ class Replica {
     };
 
     struct Descriptor {
-        ReplicaID id;
+        ReplicaID id{0};
         std::variant<MemoryDescriptor, NoFDescriptor, DiskDescriptor,
                      LocalDiskDescriptor, DistributedFSDescriptor>
             descriptor_variant;
@@ -694,6 +767,57 @@ class Replica {
     };
 
    private:
+    // Restore-only constructors preserve IDs without consuming next_id_.
+    Replica(ReplicaID id, std::unique_ptr<AllocatedBuffer> buffer,
+            ReplicaStatus status)
+        : id_(id),
+          data_(MemoryReplicaData{std::move(buffer)}),
+          status_(status),
+          refcnt_(0) {}
+
+    Replica(ReplicaID id, std::unique_ptr<AllocatedBuffer> buffer,
+            ReplicaStatus status, ReplicaType replica_type)
+        : id_(id), status_(status), refcnt_(0) {
+        if (replica_type == ReplicaType::MEMORY) {
+            data_ = MemoryReplicaData{std::move(buffer)};
+        } else if (replica_type == ReplicaType::NOF_SSD) {
+            data_ = NoFReplicaData{std::move(buffer)};
+        } else {
+            LOG(ERROR) << "Invalid buffered replica type: " << replica_type;
+        }
+    }
+
+    Replica(ReplicaID id, std::string file_path, uint64_t object_size,
+            ReplicaStatus status)
+        : id_(id),
+          data_(DiskReplicaData{std::move(file_path), object_size}),
+          status_(status),
+          refcnt_(0) {
+        MasterMetricManager::instance().inc_allocated_file_size(object_size);
+    }
+
+    Replica(ReplicaID id, UUID client_id, uint64_t object_size,
+            std::string transport_endpoint, ReplicaStatus status,
+            std::shared_ptr<ClientLivenessRecord> client_liveness = nullptr)
+        : id_(id),
+          data_(LocalDiskReplicaData{client_id, object_size,
+                                     std::move(transport_endpoint),
+                                     std::move(client_liveness)}),
+          status_(status),
+          refcnt_(0) {
+        MasterMetricManager::instance().inc_allocated_file_size(object_size);
+    }
+
+    Replica(ReplicaID id, DistributedFSDescriptor descriptor,
+            ReplicaStatus status)
+        : id_(id),
+          data_(DfsReplicaData{std::move(descriptor)}),
+          status_(status),
+          refcnt_(0) {}
+
+    // Process-wide and monotonic. Standby restores bump it past the max
+    // restored id and never roll back: a failed restore keeps the counter
+    // advanced so ids are never reused.
     inline static std::atomic<ReplicaID> next_id_{1};
 
     ReplicaID id_;
@@ -754,6 +878,21 @@ inline Replica::Descriptor Replica::get_descriptor() const {
     }
 
     return desc;
+}
+
+inline std::optional<std::string> Replica::transport_endpoint() const {
+    if (const auto* data = std::get_if<MemoryReplicaData>(&data_)) {
+        return data->buffer ? data->buffer->getTransportEndpoint()
+                            : std::string();
+    }
+    if (const auto* data = std::get_if<NoFReplicaData>(&data_)) {
+        return data->buffer ? data->buffer->getTransportEndpoint()
+                            : std::string();
+    }
+    if (const auto* data = std::get_if<LocalDiskReplicaData>(&data_)) {
+        return data->transport_endpoint;
+    }
+    return std::nullopt;
 }
 
 inline std::vector<std::optional<std::string>> Replica::get_segment_names()

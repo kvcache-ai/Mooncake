@@ -1,7 +1,10 @@
 #define MOONCAKE_STORE_TEST
 #include "../src/registered_pinned_memory.h"
+#include "../src/config/registered_pinned_memory_config.h"
 
 #include <array>
+#include <cstdlib>
+#include <optional>
 
 #include <gtest/gtest.h>
 
@@ -10,6 +13,70 @@ namespace {
 
 using Manager = RegisteredPinnedMemoryManager;
 using UnregisterResult = Manager::UnregisterResult;
+
+class ScopedEnvVar {
+   public:
+    explicit ScopedEnvVar(const char* name) : name_(name) {
+        if (const char* value = std::getenv(name)) {
+            original_ = value;
+        }
+        unsetenv(name_.c_str());
+    }
+
+    ~ScopedEnvVar() {
+        if (original_.has_value()) {
+            setenv(name_.c_str(), original_->c_str(), 1);
+        } else {
+            unsetenv(name_.c_str());
+        }
+    }
+
+    ScopedEnvVar(const ScopedEnvVar&) = delete;
+    ScopedEnvVar& operator=(const ScopedEnvVar&) = delete;
+
+    void Set(const char* value) { setenv(name_.c_str(), value, 1); }
+
+   private:
+    std::string name_;
+    std::optional<std::string> original_;
+};
+
+class RegisteredPinnedMemoryConfigTest : public ::testing::Test {
+   protected:
+    ScopedEnvVar max_bytes{"MC_STORE_PIN_MEMORY_MAX_BYTES"};
+};
+
+TEST_F(RegisteredPinnedMemoryConfigTest, UnsetAndEmptyDisableWithoutWarning) {
+    ::testing::internal::CaptureStderr();
+    EXPECT_EQ(RegisteredPinnedMemoryConfig::FromEnvironment().max_bytes, 0);
+    EXPECT_TRUE(::testing::internal::GetCapturedStderr().empty());
+
+    max_bytes.Set("");
+    ::testing::internal::CaptureStderr();
+    EXPECT_EQ(RegisteredPinnedMemoryConfig::FromEnvironment().max_bytes, 0);
+    EXPECT_TRUE(::testing::internal::GetCapturedStderr().empty());
+}
+
+TEST_F(RegisteredPinnedMemoryConfigTest, ReadsZeroAndPositiveByteLimits) {
+    max_bytes.Set("0");
+    EXPECT_EQ(RegisteredPinnedMemoryConfig::FromEnvironment().max_bytes, 0);
+
+    max_bytes.Set(" 4096\t");
+    EXPECT_EQ(RegisteredPinnedMemoryConfig::FromEnvironment().max_bytes, 4096);
+}
+
+TEST_F(RegisteredPinnedMemoryConfigTest, InvalidValuesWarnAndDisable) {
+    for (const char* value :
+         {"-1", "+1", "1suffix", "   ", "18446744073709551616"}) {
+        max_bytes.Set(value);
+        ::testing::internal::CaptureStderr();
+        EXPECT_EQ(RegisteredPinnedMemoryConfig::FromEnvironment().max_bytes, 0)
+            << value;
+        const std::string logs = ::testing::internal::GetCapturedStderr();
+        EXPECT_NE(logs.find("MC_STORE_PIN_MEMORY_MAX_BYTES"), std::string::npos)
+            << value;
+    }
+}
 
 struct FakePinState {
     bool register_succeeds = true;
@@ -44,7 +111,7 @@ class RegisteredPinnedMemoryManagerTest : public ::testing::Test {
     void SetUp() override { State() = FakePinState(); }
 
     Manager MakeManager(size_t limit) {
-        return Manager({true, limit}, {FakeRegister, FakeUnregister});
+        return Manager({.max_bytes = limit}, {FakeRegister, FakeUnregister});
     }
 
     std::shared_ptr<RegisteredPinnedRegion> Pin(Manager& manager, size_t offset,

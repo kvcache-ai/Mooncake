@@ -25,6 +25,11 @@ rm -rf mooncake-wheel/mooncake_transfer_engine*
 rm -rf mooncake-wheel/build/
 rm -f mooncake-wheel/mooncake/*.so
 
+if [ -d "${BUILD_DIR_ABS}/ep_pg_staging/_pg_jit" ]; then
+    rm -rf mooncake-wheel/mooncake/_pg_jit
+    cp -R "${BUILD_DIR_ABS}/ep_pg_staging/_pg_jit" mooncake-wheel/mooncake/
+fi
+
 echo "Creating directory structure..."
 
 # Copy shared allocator helper used by both CUDA and Ascend pluggable allocators.
@@ -54,19 +59,19 @@ cp mooncake-integration/shared_segment.py mooncake-wheel/mooncake/shared_segment
 # Copy libasio.so to mooncake directory (runtime dependency of engine.so)
 cp ${BUILD_DIR}/mooncake-common/libasio.so mooncake-wheel/mooncake/libasio.so
 
-# Copy store.so to mooncake directory
-if compgen -G "${BUILD_DIR}/mooncake-integration/store.*.so" >/dev/null; then
-    echo "Copying store.so..."
-    cp ${BUILD_DIR}/mooncake-integration/store.*.so mooncake-wheel/mooncake/store.so
+# Copy the private C++ Store extension to the mooncake package.
+if compgen -G "${BUILD_DIR}/mooncake-integration/_store.*.so" >/dev/null; then
+    echo "Copying _store extension..."
+    cp ${BUILD_DIR}/mooncake-integration/_store.*.so mooncake-wheel/mooncake/
     echo "Copying master binary..."
     # Copy master binary
     cp ${BUILD_DIR}/mooncake-store/src/mooncake_master mooncake-wheel/mooncake/
     # Copy client binary
     cp ${BUILD_DIR}/mooncake-store/src/mooncake_client mooncake-wheel/mooncake/
-    # Copy async_store.py
-    cp mooncake-integration/store/async_store.py mooncake-wheel/mooncake/async_store.py
+    # Stage the canonical async Store client for the legacy wheel builder.
+    cp python/mooncake/async_store.py mooncake-wheel/mooncake/async_store.py
 else
-    echo "Skipping store.so (not built - likely WITH_STORE is set to OFF)"
+    echo "Skipping _store extension (not built - likely WITH_STORE is set to OFF)"
 fi
 
 # Copy libmooncake_store.so to mooncake directory (only when BUILD_SHARED_LIBS is set)
@@ -180,15 +185,59 @@ if [ "$NPU_BUILD" = "1" ]; then
 fi
 
 echo "Building wheel package..."
-# Stage the reshard Python package for the combined Mooncake wheel. The tracked
-# source of truth remains in the top-level module.
+# Stage migrated root Python modules and the legacy Reshard package for the
+# combined-wheel builder. Each tracked source remains in its authoritative tree.
+MIGRATED_PYTHON_SOURCE_DIR="python/mooncake"
+MIGRATED_PYTHON_STAGING_DIR="$(pwd)/mooncake-wheel/mooncake"
+STORE_FACADE_SOURCE_DIR="python/mooncake/store"
+STORE_FACADE_STAGING_DIR="${MIGRATED_PYTHON_STAGING_DIR}/store"
+MIGRATED_PYTHON_INIT_BACKUP=""
+MIGRATED_PYTHON_MODULES=(
+    __init__.py
+    structured_object_store.py
+    _fast_copy.c
+    http_metadata_server.py
+    _launcher.py
+    cli.py
+    cli_bench.py
+    cli_client.py
+    transfer_engine_topology_dump.py
+    buffer_pool.py
+    mooncake_config.py
+    ep.py
+    mooncake_ep_buffer.py
+    mooncake_elastic_buffer.py
+    _administration.py
+    mooncake_ssd_register.py
+    mooncake_ssd_unregister.py
+    spdk_tgt_create.py
+)
 RESHARD_SOURCE_DIR="mooncake-reshard/python/mooncake/reshard"
 RESHARD_STAGING_DIR="$(pwd)/mooncake-wheel/mooncake/reshard"
-cleanup_reshard_staging() {
+cleanup_migrated_python_staging() {
+    for module in "${MIGRATED_PYTHON_MODULES[@]}"; do
+        if [ "${module}" = "__init__.py" ]; then
+            continue
+        fi
+        rm -f "${MIGRATED_PYTHON_STAGING_DIR}/${module}"
+    done
+    if [ -n "${MIGRATED_PYTHON_INIT_BACKUP}" ]; then
+        cp "${MIGRATED_PYTHON_INIT_BACKUP}" "${MIGRATED_PYTHON_STAGING_DIR}/__init__.py"
+        rm -f "${MIGRATED_PYTHON_INIT_BACKUP}"
+        MIGRATED_PYTHON_INIT_BACKUP=""
+    fi
+    rm -rf "${STORE_FACADE_STAGING_DIR}"
     rm -rf "${RESHARD_STAGING_DIR}"
 }
-trap cleanup_reshard_staging EXIT
-rm -rf "${RESHARD_STAGING_DIR}"
+trap cleanup_migrated_python_staging EXIT
+cleanup_migrated_python_staging
+MIGRATED_PYTHON_INIT_BACKUP=$(mktemp)
+cp "${MIGRATED_PYTHON_STAGING_DIR}/__init__.py" "${MIGRATED_PYTHON_INIT_BACKUP}"
+for module in "${MIGRATED_PYTHON_MODULES[@]}"; do
+    cp "${MIGRATED_PYTHON_SOURCE_DIR}/${module}" \
+       "${MIGRATED_PYTHON_STAGING_DIR}/${module}"
+done
+cp -R "${STORE_FACADE_SOURCE_DIR}" "${STORE_FACADE_STAGING_DIR}"
 cp -R "${RESHARD_SOURCE_DIR}" "${RESHARD_STAGING_DIR}"
 
 # Build the wheel package
@@ -204,7 +253,7 @@ WHEEL_DIR="$(pwd)"
 cleanup_wheel_metadata_state() {
     [[ -f "${WHEEL_DIR}/pyproject.toml.backup" ]] && mv "${WHEEL_DIR}/pyproject.toml.backup" "${WHEEL_DIR}/pyproject.toml"
     rm -f "${WHEEL_DIR}/README.md"
-    cleanup_reshard_staging
+    cleanup_migrated_python_staging
 }
 trap cleanup_wheel_metadata_state EXIT
 
@@ -422,6 +471,10 @@ else
     AUDITWHEEL_CMD="auditwheel"
 fi
 
+# Bundle OpenSSL when required: the OSS adapter links libcrypto directly, and
+# target systems may not provide the OpenSSL ABI used by the wheel builder.
+# Keep libssl eligible too, so auditwheel can repair its libcrypto dependency.
+#
 # `--exclude libmpcomm.so*` below is deliberate, not an oversight. MPComm ships
 # its own wheel / CMake install and is upgraded independently of Mooncake, so
 # engine.so keeps its DT_NEEDED on libmpcomm.so.<N> and the dynamic linker
@@ -435,6 +488,7 @@ ${AUDITWHEEL_CMD} repair ${OUTPUT_DIR}/*.whl \
     --exclude libcurl.so* \
     --exclude libfabric.so* \
     --exclude libefa.so* \
+    --exclude libhwloc.so* \
     --exclude libibverbs.so* \
     --exclude libmlx5.so* \
     --exclude libnuma.so* \
@@ -446,8 +500,6 @@ ${AUDITWHEEL_CMD} repair ${OUTPUT_DIR}/*.whl \
     --exclude librtmp.so* \
     --exclude libssh.so* \
     --exclude libpsl.so* \
-    --exclude libssl.so* \
-    --exclude libcrypto.so* \
     --exclude libgssapi_krb5.so* \
     --exclude libldap.so* \
     --exclude liblber.so* \
@@ -477,9 +529,11 @@ ${AUDITWHEEL_CMD} repair ${OUTPUT_DIR}/*.whl \
     --exclude libcudart.so* \
     --exclude libmooncake_ep_device.so* \
     --exclude libmooncake_pg_device.so* \
+    --exclude libnccl.so* \
     --exclude libmusa.so* \
     --exclude libmusart.so* \
     --exclude libamdhip64.so* \
+    --exclude libgalaxyhip.so* \
     --exclude libhsa-runtime64.so* \
     --exclude librocprofiler-register.so* \
     --exclude libc10.so* \

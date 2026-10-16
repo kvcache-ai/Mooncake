@@ -84,6 +84,11 @@ struct SelectionContext {
         policy_name;  // Optional: bind to specific policy by name
     IntentType intent_type{
         IntentType::INTENT_UNSPEC};  // Business intent for policy matching
+    // A peer on the same machine still has a different address space.
+    bool local_segment{false};
+    // Match policy against the original memory types, but select a network
+    // transport for the host-to-host leg of a staged request.
+    bool host_staging{false};
 };
 
 /**
@@ -156,6 +161,8 @@ struct SelectionResult {
     std::optional<int> traffic_class;
     // Consumed: names the QP pool the transfer is routed to.
     std::optional<std::string> qp_pool;
+    // Filled by the engine for XPU orchestration, never by select() itself.
+    std::vector<std::string> staging_params;
 };
 
 /**
@@ -200,6 +207,8 @@ class TransportSelector {
      */
     bool isLegacyMode() const { return legacy_mode_; }
 
+    bool isForceTcp() const { return force_tcp_; }
+
     static std::optional<std::vector<TransportType>> reorderWithHint(
         const std::vector<TransportType>& raw, TransportType hint);
 
@@ -223,6 +232,7 @@ class TransportSelector {
     std::shared_ptr<Config> config_;
     std::shared_ptr<Topology> topology_;
     std::vector<SelectionPolicy> policies_;
+    bool force_tcp_{false};
     bool legacy_mode_{false};  // If true, skip selector and return empty result
 };
 

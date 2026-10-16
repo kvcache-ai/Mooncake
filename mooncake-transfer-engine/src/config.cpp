@@ -14,6 +14,11 @@
 
 #include "config.h"
 
+#include "bool_parser.h"
+#include "integer_parser.h"
+
+#include "glog_compat.h"
+
 #include <charconv>
 #include <cstring>
 #include <cstdio>
@@ -222,6 +227,16 @@ void loadGlobalConfig(GlobalConfig& config) {
         }
     }
 
+    const char* signal_interval_env = std::getenv("MC_RDMA_SIGNAL_INTERVAL");
+    if (signal_interval_env) {
+        int val = atoi(signal_interval_env);
+        if (val > 0 && val <= UINT16_MAX)
+            config.rdma_signal_interval = val;
+        else
+            LOG(WARNING) << "Ignore value from environment variable "
+                            "MC_RDMA_SIGNAL_INTERVAL";
+    }
+
     const char* max_inline_env = std::getenv("MC_MAX_INLINE");
     if (max_inline_env) {
         size_t val = atoi(max_inline_env);
@@ -396,6 +411,26 @@ void loadGlobalConfig(GlobalConfig& config) {
         }
     }
 
+    const char* rdma_worker_idle_spin_us =
+        std::getenv("MC_RDMA_WORKER_IDLE_SPIN_US");
+    if (rdma_worker_idle_spin_us) {
+        // Strict parse (not atoi): a typo keeps the default instead of
+        // silently parking or spinning every worker. 0 is a valid value.
+        uint64_t val = 0;
+        const char* end =
+            rdma_worker_idle_spin_us + strlen(rdma_worker_idle_spin_us);
+        auto [ptr, ec] = std::from_chars(rdma_worker_idle_spin_us, end, val);
+        if (ec == std::errc() && ptr == end && val <= 10000000) {
+            config.rdma_worker_idle_spin_us = val;
+            LOG(INFO) << "Set MC_RDMA_WORKER_IDLE_SPIN_US=" << val;
+        } else {
+            LOG(WARNING) << "Ignore value from environment variable "
+                            "MC_RDMA_WORKER_IDLE_SPIN_US: "
+                         << rdma_worker_idle_spin_us
+                         << ". Expected an integer in range 0-10000000";
+        }
+    }
+
     const char* log_level = std::getenv("MC_LOG_LEVEL");
     config.trace = false;
     if (log_level) {
@@ -447,9 +482,36 @@ void loadGlobalConfig(GlobalConfig& config) {
         }
     }
 
+    const char* context_pause_ttl_env = std::getenv("MC_CONTEXT_PAUSE_TTL_MS");
+    if (context_pause_ttl_env) {
+        // Robust parse (not atoi): a non-numeric typo must keep the default
+        // rather than silently resolve to 0 and re-enable the legacy latch.
+        // Non-positive, out-of-range and garbage values are rejected.
+        int val = 0;
+        const char* end = context_pause_ttl_env + strlen(context_pause_ttl_env);
+        auto [ptr, ec] = std::from_chars(context_pause_ttl_env, end, val);
+        if (ec == std::errc() && ptr == end) {
+            if (val >= 1 && val <= 600000) {
+                config.context_pause_ttl_ms = val;
+            } else {
+                LOG(WARNING) << "Ignore value from environment variable "
+                                "MC_CONTEXT_PAUSE_TTL_MS, value "
+                             << context_pause_ttl_env
+                             << " out of range (should be 1-600000)";
+            }
+        } else {
+            LOG(WARNING)
+                << "Invalid MC_CONTEXT_PAUSE_TTL_MS environment value: "
+                << context_pause_ttl_env
+                << ". Expected an integer in range 1-600000";
+        }
+    }
+
     const char* log_dir_path = std::getenv("MC_LOG_DIR");
     if (log_dir_path) {
-        google::InitGoogleLogging("mooncake-transfer-engine");
+        // Skip initialization when the caller (host program) has already
+        // initialized glog — see glog_compat.h.
+        mooncake::InitGoogleLoggingOnce("mooncake-transfer-engine");
         std::error_code ec;
         if (!std::filesystem::is_directory(log_dir_path, ec)) {
             LOG(WARNING)
@@ -653,6 +715,37 @@ void loadGlobalConfig(GlobalConfig& config) {
         }
     }
 
+    if (const char* value = std::getenv("MC_EFA_CQ_THREADS")) {
+        const auto parsed = TryParseInteger<int>(
+            value, {.trim_ascii_whitespace = true, .allow_leading_plus = true});
+        if (parsed.has_value()) {
+            config.efa_cq_threads = *parsed;
+        } else {
+            LOG(WARNING) << "Invalid MC_EFA_CQ_THREADS environment value: "
+                         << value << ", keeping default "
+                         << config.efa_cq_threads;
+        }
+    }
+
+    for (const auto& [env_name, field] :
+         {std::pair{"WITH_NVIDIA_PEERMEM", &config.with_nvidia_peermem},
+          std::pair{"MC_RDMA_DATA_DIRECT", &config.rdma_data_direct},
+          std::pair{"MC_RDMA_DATA_DIRECT_PAIRING",
+                    &config.rdma_data_direct_pairing}}) {
+        const char* value = std::getenv(env_name);
+        if (value == nullptr) {
+            continue;
+        }
+        const auto parsed = TryParseBool(value);
+        if (parsed.has_value()) {
+            *field = *parsed;
+        } else {
+            LOG(WARNING) << "Invalid " << env_name
+                         << " environment value: " << value
+                         << ", keeping default " << *field;
+        }
+    }
+
     const char* endpoint_store_type_env = std::getenv("MC_ENDPOINT_STORE_TYPE");
     if (endpoint_store_type_env) {
         if (strcmp(endpoint_store_type_env, "FIFO") == 0) {
@@ -814,6 +907,7 @@ void dumpGlobalConfig() {
     LOG(INFO) << "num_qp_per_ep = " << config.num_qp_per_ep;
     LOG(INFO) << "max_sge = " << config.max_sge;
     LOG(INFO) << "max_wr = " << config.max_wr;
+    LOG(INFO) << "rdma_signal_interval = " << config.rdma_signal_interval;
     LOG(INFO) << "max_inline = " << config.max_inline;
     LOG(INFO) << "mtu_length = " << mtuLengthToString(config.mtu_length);
     LOG(INFO) << "parallel_reg_mr = " << config.parallel_reg_mr;
@@ -827,6 +921,8 @@ void dumpGlobalConfig() {
     LOG(INFO) << "te_metadata_refresh_interval_seconds = "
               << config.te_metadata_refresh_interval_seconds;
     LOG(INFO) << "rdma_rail_pause_seconds = " << config.rdma_rail_pause_seconds;
+    LOG(INFO) << "rdma_worker_idle_spin_us = "
+              << config.rdma_worker_idle_spin_us;
     {
         std::ostringstream oss;
         for (size_t i = 0; i < config.mlx5_qp_udp_sports.size(); ++i) {

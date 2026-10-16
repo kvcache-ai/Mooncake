@@ -16,6 +16,8 @@
 #include <glog/logging.h>
 #include <async_simple/executors/SimpleExecutor.h>
 
+#include <stdexcept>
+
 #include "transfer_engine_rpc_client_io_context.h"
 #include "tent/common/utils/ip.h"
 #include "tent/common/utils/random.h"
@@ -43,29 +45,52 @@ struct RpcHandlerScope {
 
 class ClientPool {
    public:
-    std::unique_ptr<coro_rpc_client> acquire() {
+    struct Lease {
+        std::unique_ptr<coro_rpc_client> client;
+        // Which generation the client was drawn from. Flushing is keyed on
+        // this: see clearIfCurrent().
+        uint64_t generation = 0;
+    };
+
+    Lease acquire() {
         std::lock_guard<std::mutex> guard(lock_);
         if (!idle_clients_.empty()) {
             auto client = std::move(idle_clients_.back());
             idle_clients_.pop_back();
-            return client;
+            return Lease{std::move(client), generation_};
         }
-        return nullptr;
+        return Lease{nullptr, generation_};
     }
 
+    // A client is only released after a call succeeded on it, which proves it
+    // is alive, so it goes back regardless of which generation it came from.
     void release(std::unique_ptr<coro_rpc_client> client) {
         if (!client) return;
         std::lock_guard<std::mutex> guard(lock_);
         idle_clients_.push_back(std::move(client));
     }
 
+    // Drop every idle client, but only on behalf of a caller that is still
+    // looking at the generation it drew from. Several callers notice a peer
+    // restart at once; without this, the second one to fail would throw away
+    // the connections the first one has already re-established, and the pool
+    // would churn for as long as stale clients keep surfacing.
+    void clearIfCurrent(uint64_t generation) {
+        std::lock_guard<std::mutex> guard(lock_);
+        if (generation != generation_) return;
+        ++generation_;
+        idle_clients_.clear();
+    }
+
     void clear() {
         std::lock_guard<std::mutex> guard(lock_);
+        ++generation_;
         idle_clients_.clear();
     }
 
    private:
     std::mutex lock_;
+    uint64_t generation_ = 0;
     std::vector<std::unique_ptr<coro_rpc_client>> idle_clients_;
 };
 
@@ -89,9 +114,8 @@ CoroRpcAgent::~CoroRpcAgent() { stop(); }
 
 Status CoroRpcAgent::registerFunction(int func_id, const Function& func,
                                       bool offload) {
-    func_map_mutex_.lock();
+    std::lock_guard<std::mutex> guard(func_map_mutex_);
     func_map_[func_id] = Handler{func, offload};
-    func_map_mutex_.unlock();
     return Status::OK();
 }
 
@@ -150,9 +174,19 @@ Status CoroRpcAgent::stop() {
 
 Lazy<void> CoroRpcAgent::process(int func_id) {
     auto* ctx = co_await coro_rpc::get_context_in_coro();
-    auto it = func_map_.find(func_id);
-    if (it == func_map_.end()) co_return;
-    const auto handler = it->second;
+    // registerFunction() may run while the server is serving, and a rehash
+    // under a bare find() is a data race. The handler is copied out and the
+    // lock released before the coroutine can suspend below.
+    Handler handler;
+    {
+        std::lock_guard<std::mutex> guard(func_map_mutex_);
+        auto it = func_map_.find(func_id);
+        if (it == func_map_.end()) {
+            throw std::runtime_error("Unknown TENT RPC function: " +
+                                     std::to_string(func_id));
+        }
+        handler = it->second;
+    }
 
     auto request = ctx->get_request_attachment();
     std::string response;
@@ -187,8 +221,29 @@ std::shared_ptr<ClientPool> CoroRpcAgent::getOrCreatePool(
     return it->second;
 }
 
+namespace {
+
+// True when the failure came back from the peer as a reply, which means the
+// connection carried a full round trip and is still usable. Every other
+// failure leaves the connection in an unknown state.
+bool peerAnswered(coro_rpc::errc ec) {
+    switch (ec) {
+        case coro_rpc::errc::rpc_throw_exception:
+        case coro_rpc::errc::function_not_registered:
+        case coro_rpc::errc::invalid_rpc_arguments:
+        case coro_rpc::errc::invalid_rpc_result:
+        case coro_rpc::errc::message_too_large:
+            return true;
+        default:
+            return false;
+    }
+}
+
+}  // namespace
+
 Lazy<std::pair<Status, std::string>> CoroRpcAgent::callCoroutine(
-    std::string server_addr, int func_id, std::string request) {
+    std::string server_addr, int func_id, std::string request,
+    bool retry_rpc_error_once) {
     if (tl_inside_rpc_handler) {
         co_return std::make_pair(
             Status::InvalidArgument(
@@ -196,42 +251,62 @@ Lazy<std::pair<Status, std::string>> CoroRpcAgent::callCoroutine(
             "");
     }
 
-    auto pool = getOrCreatePool(server_addr);
-    ClientLease lease{pool->acquire(), pool, false};
+    const int max_attempts = retry_rpc_error_once ? 2 : 1;
+    for (int attempt = 0; attempt < max_attempts; ++attempt) {
+        auto pool = getOrCreatePool(server_addr);
+        auto acquired = pool->acquire();
+        const uint64_t generation = acquired.generation;
+        ClientLease lease{std::move(acquired.client), pool, false};
+        const bool from_pool = lease.client != nullptr;
 
-    if (!lease.client) {
-        lease.client = std::make_unique<coro_rpc_client>(
-            GetTransferEngineRpcClientIoContextPool().get_executor());
-        auto conn_result = co_await lease.client->connect(server_addr);
-        if (conn_result.val() != 0) {
+        if (!lease.client) {
+            lease.client = std::make_unique<coro_rpc_client>(
+                GetTransferEngineRpcClientIoContextPool().get_executor());
+            auto conn_result = co_await lease.client->connect(server_addr);
+            if (conn_result.val() != 0) {
+                lease.broken = true;
+                auto msg =
+                    "Failed to connect RPC server. server: " + server_addr +
+                    ", func_id: " + std::to_string(func_id) +
+                    ", message: " + std::string{conn_result.message()};
+                if (attempt + 1 < max_attempts) continue;
+                co_return std::make_pair(
+                    Status::RpcConnectionError(msg + LOC_MARK), "");
+            }
+        }
+
+        lease->set_req_attachment(request);
+
+        auto call_result =
+            co_await lease->call<&CoroRpcAgent::process>(func_id);
+
+        if (!call_result.has_value()) {
             lease.broken = true;
-            auto msg = "Failed to connect RPC server. server: " + server_addr +
+            // An idle pooled connection only learns that its peer restarted
+            // when it is next used. Drop the whole pool so a retry starts
+            // from a fresh connection.
+            if (from_pool && !peerAnswered(call_result.error().code)) {
+                pool->clearIfCurrent(generation);
+            }
+            auto msg = "Failed to call RPC function. server: " + server_addr +
                        ", func_id: " + std::to_string(func_id) +
-                       ", message: " + std::string{conn_result.message()};
+                       ", message: " + std::string{call_result.error().msg};
+            if (attempt + 1 < max_attempts) continue;
             co_return std::make_pair(Status::RpcServiceError(msg + LOC_MARK),
                                      "");
         }
+
+        // The internal buffer is padded for small attachments; trim the moved
+        // string to the real attachment length from the view.
+        const size_t len = lease->get_resp_attachment().size();
+        std::string response = lease->release_resp_attachment();
+        response.resize(len);
+
+        co_return std::make_pair(Status::OK(), std::move(response));
     }
 
-    lease->set_req_attachment(request);
-
-    auto call_result = co_await lease->call<&CoroRpcAgent::process>(func_id);
-
-    if (!call_result.has_value()) {
-        lease.broken = true;
-        auto msg = "Failed to call RPC function. server: " + server_addr +
-                   ", func_id: " + std::to_string(func_id) +
-                   ", message: " + std::string{call_result.error().msg};
-        co_return std::make_pair(Status::RpcServiceError(msg + LOC_MARK), "");
-    }
-
-    // The internal buffer is padded for small attachments; trim the moved
-    // string to the real attachment length from the view.
-    const size_t len = lease->get_resp_attachment().size();
-    std::string response = lease->release_resp_attachment();
-    response.resize(len);
-
-    co_return std::make_pair(Status::OK(), std::move(response));
+    co_return std::make_pair(
+        Status::InternalError("RPC retry loop exhausted" LOC_MARK), "");
 }
 
 Status CoroRpcAgent::call(const std::string& server_addr, int func_id,
@@ -261,6 +336,20 @@ void CoroRpcAgent::callAsync(const std::string& server_addr, int func_id,
                              const std::string& request,
                              AsyncCallback callback) {
     callCoroutine(server_addr, func_id, request)
+        .start([cb = std::move(callback)](auto&& try_result) {
+            if (try_result.hasError()) {
+                cb(Status::RpcServiceError("Async RPC exception" LOC_MARK), "");
+            } else {
+                auto& val = try_result.value();
+                cb(val.first, std::move(val.second));
+            }
+        });
+}
+
+void CoroRpcAgent::callAsyncRetryOnce(const std::string& server_addr,
+                                      int func_id, const std::string& request,
+                                      AsyncCallback callback) {
+    callCoroutine(server_addr, func_id, request, true)
         .start([cb = std::move(callback)](auto&& try_result) {
             if (try_result.hasError()) {
                 cb(Status::RpcServiceError("Async RPC exception" LOC_MARK), "");

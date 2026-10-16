@@ -2,6 +2,18 @@ file(GLOB ENGINE_SOURCES "*.cpp" "shared_segment/*.cpp")
 set(TRANSFER_METADATA_PLUGIN_SOURCES config.cpp transfer_metadata_plugin.cpp)
 list(REMOVE_ITEM ENGINE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/config.cpp"
      "${CMAKE_CURRENT_SOURCE_DIR}/transfer_metadata_plugin.cpp")
+# ibv_port_attr::active_speed is a uint8_t and reads 0 for XDR (encoding 256);
+# newer rdma-core adds active_speed_ex to carry it. TENT probes the same cache
+# variable in tent/src; this definition covers the classic RdmaContext under
+# transport/ so both decode the port speed the same way.
+include(CheckStructHasMember)
+check_struct_has_member(
+  "struct ibv_port_attr" active_speed_ex infiniband/verbs.h
+  HAVE_IBV_ACTIVE_SPEED_EX LANGUAGE CXX)
+if(HAVE_IBV_ACTIVE_SPEED_EX)
+  add_compile_definitions(HAVE_IBV_ACTIVE_SPEED_EX)
+endif()
+
 add_subdirectory(common)
 add_subdirectory(transport)
 
@@ -55,6 +67,7 @@ if(USE_HTTP)
 endif()
 
 add_library(transfer_engine ${ENGINE_SOURCES} $<TARGET_OBJECTS:transport>)
+set_target_properties(transfer_engine PROPERTIES INSTALL_RPATH "$ORIGIN")
 target_include_directories(
   transfer_engine
   PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>
@@ -77,6 +90,11 @@ target_link_libraries(
          asio_shared
          yalantinglibs::yalantinglibs
   PRIVATE transport transfer_metadata_plugin)
+if(UNIX AND NOT APPLE)
+  # shm_open/shm_unlink live in librt on glibc; OBJECT-library PRIVATE deps do
+  # not propagate through $<TARGET_OBJECTS:shm_transport>.
+  target_link_libraries(transfer_engine PRIVATE rt)
+endif()
 if(BUILD_SHARED_LIBS)
   install(TARGETS transfer_engine DESTINATION lib)
 endif()
@@ -105,7 +123,7 @@ if(USE_NCCL_DEVICE OR USE_NCCL_HOST)
 endif()
 
 if(USE_SUPA)
-  target_link_libraries(transfer_engine PUBLIC supa supart)
+  target_link_libraries(transfer_engine PUBLIC ${SUPA_LIBRARIES})
 endif()
 
 if(USE_MACA)
@@ -204,7 +222,7 @@ endif()
 
 if(USE_EFA)
   message(STATUS "Enabled USE_EFA (AWS Elastic Fabric Adapter) support")
-  target_link_libraries(transfer_engine PUBLIC fabric efa_transport)
+  target_link_libraries(transfer_engine PUBLIC efa_transport)
 endif()
 if(USE_CXI)
   message(STATUS "Enabled USE_CXI (HPE Cray Slingshot) support")

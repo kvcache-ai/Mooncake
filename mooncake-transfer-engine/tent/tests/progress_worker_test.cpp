@@ -30,6 +30,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <functional>
+#include <future>
 #include <memory>
 #include <string>
 #include <thread>
@@ -1498,6 +1499,303 @@ TEST(BatchLifecycle, PermanentlyStuckBatchIsQuarantinedNotRetriedForever) {
     EXPECT_EQ(fake_rdma->free_sub_batch_calls.load(std::memory_order_acquire),
               2)
         << "teardown must reclaim the quarantined batch";
+}
+
+void installFakeRdmaAndTcp(TransferEngineImpl& engine,
+                           const std::shared_ptr<FakeTransport>& fake_rdma,
+                           const std::shared_ptr<FakeTransport>& fake_tcp) {
+    std::string seg = engine.getSegmentName();
+    ASSERT_TRUE(fake_rdma->install(seg, nullptr, nullptr).ok());
+    ASSERT_TRUE(fake_tcp->install(seg, nullptr, nullptr).ok());
+    engine.swapTransportForTest(RDMA, fake_rdma);
+    engine.swapTransportForTest(TCP, fake_tcp);
+}
+
+Request makeLocalWriteReq(uint8_t* ptr, size_t length) {
+    Request req;
+    req.opcode = Request::WRITE;
+    req.source = ptr;
+    req.target_id = LOCAL_SEGMENT_ID;
+    req.target_offset = reinterpret_cast<uint64_t>(ptr);
+    req.length = length;
+    return req;
+}
+
+template <typename Fn>
+void runOrAbortOnTimeout(Fn&& fn, std::chrono::milliseconds timeout,
+                         const char* what) {
+    std::promise<void> done;
+    auto fut = done.get_future();
+    std::thread worker([&] {
+        fn();
+        done.set_value();
+    });
+    if (fut.wait_for(timeout) != std::future_status::ready) {
+        worker.detach();
+        ADD_FAILURE() << what << " timed out (likely deadlock)";
+        std::_Exit(1);
+    }
+    worker.join();
+}
+
+// ---------------------------------------------------------------------------
+// Lock-sharding: independent batches poll concurrently; poll vs free of the
+// same batch is well-defined; runtime-queue path must not invert lock order.
+// ---------------------------------------------------------------------------
+
+TEST(ProgressLockShard, ConcurrentIndependentBatchPolls) {
+    auto cfg = makeMinimalP2PConfig();
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake_rdma = std::make_shared<FakeTransport>(RDMA);
+    auto fake_tcp = std::make_shared<FakeTransport>(TCP);
+    installFakeRdmaAndTcp(engine, fake_rdma, fake_tcp);
+
+    constexpr size_t kBufLen = 4096;
+    constexpr int kThreads = 8;
+    constexpr int kIters = 50;
+    std::vector<uint8_t> buf(kBufLen * kThreads, 0x5A);
+    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), buf.size()).ok());
+
+    std::atomic<int> failures{0};
+    runOrAbortOnTimeout(
+        [&] {
+            std::vector<std::thread> threads;
+            threads.reserve(kThreads);
+            for (int t = 0; t < kThreads; ++t) {
+                threads.emplace_back([&, t] {
+                    uint8_t* ptr = buf.data() + t * kBufLen;
+                    for (int i = 0; i < kIters; ++i) {
+                        BatchID batch_id = engine.allocateBatch(1);
+                        if (!batch_id) {
+                            ++failures;
+                            return;
+                        }
+                        if (!engine
+                                 .submitTransfer(batch_id, {makeLocalWriteReq(
+                                                               ptr, kBufLen)})
+                                 .ok()) {
+                            ++failures;
+                            (void)engine.freeBatch(batch_id);
+                            return;
+                        }
+                        TransferStatus status{};
+                        if (!engine.getTransferStatus(batch_id, status).ok() ||
+                            status.s != TransferStatusEnum::COMPLETED) {
+                            ++failures;
+                            (void)engine.freeBatch(batch_id);
+                            return;
+                        }
+                        if (!engine.freeBatch(batch_id).ok()) ++failures;
+                    }
+                });
+            }
+            for (auto& th : threads) th.join();
+        },
+        std::chrono::seconds(10), "ConcurrentIndependentBatchPolls");
+
+    EXPECT_EQ(failures.load(), 0);
+    EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), buf.size()).ok());
+}
+
+TEST(ProgressLockShard, PollRacesWithFreeSameBatch) {
+    auto cfg = makeMinimalP2PConfig();
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake_rdma = std::make_shared<FakeTransport>(RDMA);
+    auto fake_tcp = std::make_shared<FakeTransport>(TCP);
+    installFakeRdmaAndTcp(engine, fake_rdma, fake_tcp);
+
+    constexpr size_t kBufLen = 4096;
+    std::vector<uint8_t> buf(kBufLen, 0x11);
+    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), kBufLen).ok());
+
+    BatchID batch_id = engine.allocateBatch(1);
+    ASSERT_NE(batch_id, (BatchID)0);
+    ASSERT_TRUE(
+        engine
+            .submitTransfer(batch_id, {makeLocalWriteReq(buf.data(), kBufLen)})
+            .ok());
+
+    std::atomic<bool> stop{false};
+    std::atomic<int> invalid_after_free{0};
+    std::atomic<int> unexpected{0};
+    runOrAbortOnTimeout(
+        [&] {
+            std::thread poller([&] {
+                TransferStatus status{};
+                while (!stop.load(std::memory_order_acquire)) {
+                    auto st = engine.getTransferStatus(batch_id, status);
+                    if (st.ok()) continue;
+                    if (st.IsInvalidArgument()) {
+                        ++invalid_after_free;
+                        return;
+                    }
+                    ++unexpected;
+                    return;
+                }
+            });
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            EXPECT_TRUE(engine.freeBatch(batch_id).ok());
+            stop.store(true, std::memory_order_release);
+            poller.join();
+        },
+        std::chrono::seconds(10), "PollRacesWithFreeSameBatch");
+
+    EXPECT_EQ(unexpected.load(), 0);
+    TransferStatus status{};
+    EXPECT_TRUE(engine.getTransferStatus(batch_id, status).IsInvalidArgument());
+    EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), kBufLen).ok());
+}
+
+TEST(ProgressLockShard, DeferredFreeRegistryReadRacesWithAllocation) {
+    auto cfg = makeMinimalP2PConfig();
+    cfg->set("enable_runtime_queue", false);
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    std::atomic<bool> complete{false};
+    auto pending_poll = [&complete](const Request& request, int) {
+        if (complete.load(std::memory_order_acquire)) {
+            return TransferStatus{TransferStatusEnum::COMPLETED,
+                                  request.length};
+        }
+        return TransferStatus{TransferStatusEnum::PENDING, 0};
+    };
+    auto fake_rdma = std::make_shared<FakeTransport>(
+        RDMA, FakeTransport::StatusFactory{}, pending_poll);
+    auto fake_tcp = std::make_shared<FakeTransport>(
+        TCP, FakeTransport::StatusFactory{}, pending_poll);
+    installFakeRdmaAndTcp(engine, fake_rdma, fake_tcp);
+
+    constexpr size_t kBufLen = 4096;
+    constexpr int kPendingBatches = 8;
+    constexpr int kRounds = 512;
+    constexpr int kAllocatorThreads = 4;
+    std::vector<uint8_t> buf(kBufLen, 0x33);
+    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), buf.size()).ok());
+
+    std::vector<BatchID> pending_batches;
+    pending_batches.reserve(kPendingBatches);
+    for (int i = 0; i < kPendingBatches; ++i) {
+        BatchID batch_id = engine.allocateBatch(1);
+        ASSERT_NE(batch_id, (BatchID)0);
+        ASSERT_TRUE(engine
+                        .submitTransfer(
+                            batch_id, {makeLocalWriteReq(buf.data(), kBufLen)})
+                        .ok());
+        pending_batches.push_back(batch_id);
+    }
+
+    std::atomic<bool> start{false};
+    std::atomic<bool> stop{false};
+    std::atomic<int> allocator_failures{0};
+    std::vector<std::thread> allocators;
+    allocators.reserve(kAllocatorThreads);
+    for (int i = 0; i < kAllocatorThreads; ++i) {
+        allocators.emplace_back([&] {
+            while (!start.load(std::memory_order_acquire))
+                std::this_thread::yield();
+            while (!stop.load(std::memory_order_acquire)) {
+                // Empty batches complete immediately, so this thread mutates
+                // the shard registry without growing the deferred freelist.
+                BatchID batch_id = engine.allocateBatch(0);
+                if (!batch_id) {
+                    ++allocator_failures;
+                    return;
+                }
+                if (!engine.freeBatch(batch_id).ok()) ++allocator_failures;
+            }
+        });
+    }
+    start.store(true, std::memory_order_release);
+
+    int free_failures = 0;
+    for (int round = 0; round < kRounds; ++round) {
+        for (BatchID batch_id : pending_batches) {
+            if (!engine.freeBatch(batch_id).ok()) ++free_failures;
+        }
+    }
+
+    stop.store(true, std::memory_order_release);
+    for (auto& allocator : allocators) allocator.join();
+
+    EXPECT_EQ(free_failures, 0);
+    EXPECT_EQ(allocator_failures.load(std::memory_order_acquire), 0);
+    EXPECT_EQ(engine.aliveBatchCountForTest(), kPendingBatches);
+
+    // Let the deferred batches drain before the engine and registered memory
+    // are torn down.
+    complete.store(true, std::memory_order_release);
+    EXPECT_TRUE(engine.freeBatch(pending_batches.front()).ok());
+    EXPECT_EQ(engine.aliveBatchCountForTest(), 0);
+    EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), buf.size()).ok());
+}
+
+TEST(ProgressLockShard, RuntimeQueuePollAndFreeDoesNotDeadlock) {
+    auto cfg = makeMinimalP2PConfig();
+    cfg->set("enable_runtime_queue", true);
+    cfg->set("runtime_queue/max_outstanding_owners", 16UL);
+    cfg->set("runtime_queue/max_outstanding_bytes", 1UL << 20);
+    cfg->set("runtime_queue/max_dispatch_owners", 4UL);
+    cfg->set("runtime_queue/max_dispatch_bytes", 1UL << 20);
+    cfg->set("runtime_queue/staging_owner_reserve", 0UL);
+    cfg->set("runtime_queue/staging_byte_reserve", 0UL);
+    cfg->set("runtime_queue/progress_fallback_interval_us", 50000UL);
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto pending_poll = [](const Request&, int) {
+        return TransferStatus{TransferStatusEnum::PENDING, 0};
+    };
+    auto fake_rdma = std::make_shared<FakeTransport>(
+        RDMA, FakeTransport::StatusFactory{}, pending_poll);
+    auto fake_tcp = std::make_shared<FakeTransport>(TCP);
+    installFakeRdmaAndTcp(engine, fake_rdma, fake_tcp);
+
+    constexpr size_t kBufLen = 4096;
+    constexpr int kBatches = 8;
+    std::vector<uint8_t> buf(kBufLen * kBatches, 0x22);
+    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), buf.size()).ok());
+
+    std::vector<BatchID> batches;
+    batches.reserve(kBatches);
+    for (int i = 0; i < kBatches; ++i) {
+        BatchID batch_id = engine.allocateBatch(1);
+        ASSERT_NE(batch_id, (BatchID)0);
+        ASSERT_TRUE(engine
+                        .submitTransfer(batch_id,
+                                        {makeLocalWriteReq(
+                                            buf.data() + i * kBufLen, kBufLen)})
+                        .ok());
+        batches.push_back(batch_id);
+    }
+
+    runOrAbortOnTimeout(
+        [&] {
+            std::atomic<bool> stop{false};
+            std::vector<std::thread> pollers;
+            pollers.reserve(kBatches);
+            for (int i = 0; i < kBatches; ++i) {
+                pollers.emplace_back([&, i] {
+                    TransferStatus status{};
+                    while (!stop.load(std::memory_order_acquire)) {
+                        (void)engine.getTransferStatus(batches[i], status);
+                    }
+                });
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            for (auto batch_id : batches) {
+                EXPECT_TRUE(engine.freeBatch(batch_id).ok());
+            }
+            stop.store(true, std::memory_order_release);
+            for (auto& th : pollers) th.join();
+        },
+        std::chrono::seconds(10), "RuntimeQueuePollAndFreeDoesNotDeadlock");
+
+    EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), buf.size()).ok());
 }
 
 }  // namespace

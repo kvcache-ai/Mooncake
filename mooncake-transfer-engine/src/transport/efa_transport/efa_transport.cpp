@@ -20,15 +20,11 @@
 #include <unistd.h>
 
 #include <algorithm>
-#include <atomic>
 #include <cassert>
 #include <chrono>
 #include <cstddef>
 #include <cstdlib>
-#include <fstream>
-#include <functional>
 #include <future>
-#include <limits>
 #include <set>
 #include <thread>
 
@@ -36,9 +32,9 @@
 
 #include "common.h"
 #include "config.h"
-#include "environ.h"
 #include "memory_location.h"
 #include "topology.h"
+#include "transport/batch_registration.h"
 #include "transport/efa_transport/efa_context.h"
 #include "transport/efa_transport/efa_endpoint.h"
 
@@ -49,39 +45,6 @@ namespace mooncake {
 // With 4KB pages: 22M × 4KB ≈ 88GB per NIC.
 // With 2MB hugepages: 22M × 2MB ≈ 44TB per NIC (effectively unlimited).
 static constexpr size_t kDefaultMaxPteEntries = 22ULL * 1024 * 1024;  // 22M
-
-// Detect the kernel page size backing the memory at `addr` by reading
-// /proc/self/smaps.  Falls back to sysconf(_SC_PAGESIZE) on any failure.
-static size_t detectBufferPageSize(void* addr) {
-    size_t fallback = static_cast<size_t>(sysconf(_SC_PAGESIZE));
-    std::ifstream smaps("/proc/self/smaps");
-    if (!smaps.is_open()) return fallback;
-
-    uintptr_t target = reinterpret_cast<uintptr_t>(addr);
-    std::string line;
-    bool in_range = false;
-
-    while (std::getline(smaps, line)) {
-        // VMA header: "start-end perms offset dev inode [pathname]".
-        // Cast to unsigned char before std::isxdigit: passing a (possibly
-        // signed) char whose value is > 0x7F is UB, since the argument must be
-        // representable as unsigned char or equal EOF.
-        if (!line.empty() &&
-            std::isxdigit(static_cast<unsigned char>(line[0]))) {
-            unsigned long start = 0, end = 0;
-            if (sscanf(line.c_str(), "%lx-%lx", &start, &end) == 2) {
-                in_range = (target >= start && target < end);
-            }
-        } else if (in_range && line.compare(0, 15, "KernelPageSize:") == 0) {
-            unsigned long kb = 0;
-            if (sscanf(line.c_str(), "KernelPageSize: %lu kB", &kb) == 1 &&
-                kb > 0) {
-                return kb * 1024;
-            }
-        }
-    }
-    return fallback;
-}
 
 static size_t getMaxPteEntries() { return kDefaultMaxPteEntries; }
 
@@ -102,7 +65,7 @@ void EfaTransport::startWorkerThreads() {
     worker_running_ = true;
     // MC_EFA_CQ_THREADS caps CQ poller count (default 1). Set 0 to disable cap.
     size_t num_threads = context_list_.size();
-    int cq_cap = Environ::Get().GetEfaCqThreads();
+    const int cq_cap = globalConfig().efa_cq_threads;
     if (cq_cap > 0 && static_cast<size_t>(cq_cap) < num_threads) {
         num_threads = static_cast<size_t>(cq_cap);
     }
@@ -169,6 +132,12 @@ int EfaTransport::install(std::string& local_server_name,
     metadata_ = meta;
     local_server_name_ = local_server_name;
     local_topology_ = topo;
+
+    std::string fabric_error;
+    if (!loadLibfabric(&fabric_error)) {
+        LOG(ERROR) << "EfaTransport: " << fabric_error;
+        return ERR_CONTEXT;
+    }
 
     auto ret = initializeEfaResources();
     if (ret) {
@@ -682,56 +651,6 @@ int EfaTransport::allocateLocalSegmentID() {
 // (99-128 s) since nothing queues. Largest-first being worst is backwards from
 // longest-processing-time scheduling and is unexplained, so no sort is applied
 // here yet -- another reason the cap stays opt-in rather than a default.
-static size_t maxConcurrentRegMr() {
-    size_t configured = globalConfig().max_concurrent_reg_mr;
-    // 0 (unset) means unbounded, i.e. one thread per buffer as before.
-    return configured > 0 ? configured : std::numeric_limits<size_t>::max();
-}
-
-// Run `fn(i)` for i in [0, count) on at most maxConcurrentRegMr() threads,
-// returning the first non-zero result (all items are still attempted).
-//
-// With no cap set this spawns count-1 threads and runs the caller as a worker,
-// which reproduces what both batch entry points did before: one
-// std::async(std::launch::async) per buffer, which libstdc++ honours literally
-// as one fresh thread each. Kimi-K3 registers ~1450 KV buffers at once, so a
-// 192-core node peaks at ~1400 runnable threads inside fi_mr_regattr, and the
-// per-buffer duration this logs inflates with the queueing delay of the ones
-// ahead of it -- on 2x p6-b300 the median reached 106 s while the whole batch
-// took 138 s. That inflation is not by itself a reason to cap: a badly chosen
-// cap is slower still, see maxConcurrentRegMr().
-//
-// A plain thread pool rather than a semaphore over std::async, because if a cap
-// is set the point is to avoid the thread *creation*, not just to gate entry
-// into the provider -- admission control after the thread already exists would
-// leave that cost in place.
-static int runBoundedParallel(size_t count,
-                              const std::function<int(size_t)>& fn) {
-    if (count == 0) return 0;
-
-    size_t workers = std::min(count, maxConcurrentRegMr());
-    std::atomic<size_t> next{0};
-    std::atomic<int> first_error{0};
-
-    auto worker = [&]() {
-        for (size_t i = next.fetch_add(1); i < count; i = next.fetch_add(1)) {
-            int ret = fn(i);
-            if (ret) {
-                int expected = 0;
-                first_error.compare_exchange_strong(expected, ret);
-            }
-        }
-    };
-
-    std::vector<std::thread> threads;
-    threads.reserve(workers - 1);
-    for (size_t w = 1; w < workers; ++w) threads.emplace_back(worker);
-    worker();  // the caller is a worker too
-    for (auto& t : threads) t.join();
-
-    return first_error.load();
-}
-
 // Invert the topology's per-location preferred_hca lists into indices into the
 // NIC set the transport actually opened. `Topology::discover()` already
 // computes what matters here: for a "cuda:N" entry, preferred_hca holds the
@@ -772,7 +691,7 @@ int EfaTransport::registerLocalMemoryBatch(
     const std::string& location) {
     auto start = std::chrono::steady_clock::now();
 
-    int first_error = runBoundedParallel(buffer_list.size(), [&](size_t i) {
+    int first_error = runBoundedRegMrBatch(buffer_list.size(), [&](size_t i) {
         int ret = registerLocalMemoryInternal(buffer_list[i].addr,
                                               buffer_list[i].length, location,
                                               true, false, true);
@@ -799,7 +718,7 @@ int EfaTransport::registerLocalMemoryBatch(
 
 int EfaTransport::unregisterLocalMemoryBatch(
     const std::vector<void*>& addr_list) {
-    int first_error = runBoundedParallel(addr_list.size(), [&](size_t i) {
+    int first_error = runBoundedRegMrBatch(addr_list.size(), [&](size_t i) {
         int ret = unregisterLocalMemoryInternal(addr_list[i], false, true);
         if (ret) {
             LOG(WARNING) << "EfaTransport: Failed to unregister memory: addr "
@@ -1168,9 +1087,13 @@ Status EfaTransport::getTransferStatus(BatchID batch_id,
     status.resize(task_count);
     for (size_t task_id = 0; task_id < task_count; task_id++) {
         auto& task = batch_desc.task_list[task_id];
-        status[task_id].transferred_bytes = task.transferred_bytes;
-        uint64_t success_slice_count = task.success_slice_count;
-        uint64_t failed_slice_count = task.failed_slice_count;
+        uint64_t success_slice_count =
+            __atomic_load_n(&task.success_slice_count, __ATOMIC_ACQUIRE);
+        uint64_t failed_slice_count =
+            __atomic_load_n(&task.failed_slice_count, __ATOMIC_ACQUIRE);
+        // Completion counters publish the preceding byte updates.
+        status[task_id].transferred_bytes =
+            __atomic_load_n(&task.transferred_bytes, __ATOMIC_RELAXED);
         if (success_slice_count + failed_slice_count == task.slice_count) {
             if (failed_slice_count)
                 status[task_id].s = TransferStatusEnum::FAILED;
@@ -1194,9 +1117,13 @@ Status EfaTransport::getTransferStatus(BatchID batch_id, size_t task_id,
             std::to_string(batch_id));
     }
     auto& task = batch_desc.task_list[task_id];
-    status.transferred_bytes = task.transferred_bytes;
-    uint64_t success_slice_count = task.success_slice_count;
-    uint64_t failed_slice_count = task.failed_slice_count;
+    uint64_t success_slice_count =
+        __atomic_load_n(&task.success_slice_count, __ATOMIC_ACQUIRE);
+    uint64_t failed_slice_count =
+        __atomic_load_n(&task.failed_slice_count, __ATOMIC_ACQUIRE);
+    // Completion counters publish the preceding byte updates.
+    status.transferred_bytes =
+        __atomic_load_n(&task.transferred_bytes, __ATOMIC_RELAXED);
     if (success_slice_count + failed_slice_count == task.slice_count) {
         if (failed_slice_count)
             status.s = TransferStatusEnum::FAILED;
@@ -1370,8 +1297,12 @@ int EfaTransport::selectDevice(SegmentDesc* desc, uint64_t offset,
         // Try multiple attempts to find a device with valid MR registration.
         // With per-NIC partition, not all devices have all buffers registered,
         // so rkey[device_id] may be 0 for unassigned NICs.
+        // Topology::selectDevice() draws a random preferred HCA for try 0 and
+        // returns entry (try - 1) of preferred + available for try > 0, so
+        // num_devices + 1 attempts are needed for the deterministic part of the
+        // walk to visit every entry, whatever retry_count it starts from.
         int num_devices = static_cast<int>(desc->devices.size());
-        for (int attempt = 0; attempt < num_devices; ++attempt) {
+        for (int attempt = 0; attempt <= num_devices; ++attempt) {
             int try_count = retry_count + attempt;
             device_id =
                 hint.empty()
@@ -1389,6 +1320,28 @@ int EfaTransport::selectDevice(SegmentDesc* desc, uint64_t offset,
             if (device_id >= 0 &&
                 static_cast<size_t>(device_id) < buffer.rkey.size() &&
                 buffer.rkey[device_id] != 0) {
+                return 0;
+            }
+        }
+
+        // The walk can still miss a keyed NIC: a hint that resolves to an HCA
+        // pins every attempt to that HCA, and a topology that lists fewer HCAs
+        // than the buffer has keys (or none for this location) never reaches
+        // the rest. Under the disjoint per-NIC partition a chunk is registered
+        // on a single NIC, so a miss fails a transfer that a registered NIC
+        // could serve. Fall back to any NIC that holds a key for this buffer.
+        const size_t num_keys = buffer.rkey.size();
+        for (size_t i = 0; i < num_keys; ++i) {
+            const size_t candidate =
+                (static_cast<size_t>(retry_count) + i) % num_keys;
+            if (buffer.rkey[candidate] != 0) {
+                device_id = static_cast<int>(candidate);
+                LOG_EVERY_N(WARNING, 1000)
+                    << "selectDevice: topology walk found no keyed NIC for "
+                       "buffer "
+                    << buffer.name << " (hint '" << hint << "', retry_count "
+                    << retry_count << "), falling back to device_id "
+                    << device_id;
                 return 0;
             }
         }

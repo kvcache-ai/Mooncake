@@ -49,8 +49,12 @@ endif()
 # Add BatchEvict benchmark executable
 add_executable(batch_evict_bench batch_evict_bench.cpp)
 target_link_libraries(
-  batch_evict_bench PRIVATE mooncake_store cachelib_memory_allocator
+  batch_evict_bench PRIVATE master_service_test_peer cachelib_memory_allocator
                             gflags::gflags glog::glog pthread)
+
+add_executable(batch_oplog_promotion_bench batch_oplog_promotion_bench.cpp)
+target_link_libraries(batch_oplog_promotion_bench PRIVATE mooncake_store
+                                                          gflags::gflags)
 
 if(STORE_USE_ETCD)
   add_executable(oplog_batch_bench oplog_batch_bench.cpp)
@@ -61,3 +65,7 @@ endif()
 
 add_executable(uring_batch_read_bench uring_batch_read_bench.cpp)
 target_link_libraries(uring_batch_read_bench PRIVATE mooncake_store)
+
+# Add group index write path benchmark executable
+add_executable(group_index_contention_bench group_index_contention_bench.cpp)
+target_link_libraries(group_index_contention_bench PRIVATE mooncake_store)

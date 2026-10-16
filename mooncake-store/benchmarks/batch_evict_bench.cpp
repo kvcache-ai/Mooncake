@@ -1,4 +1,5 @@
 #include "master_service.h"
+#include "master_service/master_service_test_peer.h"
 
 #include <algorithm>
 #include <chrono>
@@ -25,6 +26,8 @@ DEFINE_double(evict_ratio_lowerbound, 0.25,
 
 namespace mooncake::benchmarks {
 
+using mooncake::test::MasterServiceTestPeer;
+
 class BatchEvictBench {
    public:
     static bool RunRealBatchEvictScales() {
@@ -48,7 +51,7 @@ class BatchEvictBench {
         return true;
     }
 
-    static bool RunSingleWaiterSnapshotMutexProbe() {
+    static bool RunSingleWaiterMasterStateMutexProbe() {
         if (std::getenv("MOONCAKE_EVICT_BENCH_LOCK_PROBE") == nullptr) {
             return true;
         }
@@ -169,19 +172,21 @@ class BatchEvictBench {
         const auto base_expiration = now - std::chrono::hours(1);
         size_t ordinal = 0;
 
-        for (size_t shard_idx = 0; shard_idx < MasterService::kNumShards;
-             ++shard_idx) {
-            MasterService::MetadataShardAccessorRW shard(&service, shard_idx);
+        for (size_t shard_idx = 0;
+             shard_idx < MasterServiceTestPeer::kNumShards; ++shard_idx) {
+            MasterServiceTestPeer::MetadataShardAccessorRW shard(&service,
+                                                                 shard_idx);
             for (auto& [tenant_id, tenant_state] : shard->tenants) {
                 if (tenant_id != TenantId::Default()) {
                     continue;
                 }
-                for (auto& [key, metadata] : tenant_state.metadata) {
+                for (auto& [key, record] : tenant_state.metadata) {
+                    auto& metadata = record.metadata;
                     {
                         SpinLocker locker(&metadata.lock);
-                        metadata.lease_timeout =
+                        metadata.lease_->SetDeadline(
                             base_expiration +
-                            std::chrono::nanoseconds(ordinal++);
+                            std::chrono::nanoseconds(ordinal++));
                     }
 
                     ++stats.object_count;
@@ -271,7 +276,8 @@ class BatchEvictBench {
         const auto wait_start = std::chrono::steady_clock::now();
         uint64_t wait_us = 0;
         {
-            std::unique_lock<std::shared_mutex> lock(service.snapshot_mutex_);
+            std::unique_lock<std::shared_mutex> lock(
+                MasterServiceTestPeer::MasterStateMutex(service));
             const auto wait_end = std::chrono::steady_clock::now();
             wait_us = std::chrono::duration_cast<std::chrono::microseconds>(
                           wait_end - wait_start)
@@ -345,8 +351,8 @@ class BatchEvictBench {
         }
 
         const auto evict_start = std::chrono::steady_clock::now();
-        service.BatchEvict(FLAGS_evict_ratio_target,
-                           FLAGS_evict_ratio_lowerbound);
+        MasterServiceTestPeer(service).RunBatchEvictForTesting(
+            FLAGS_evict_ratio_target, FLAGS_evict_ratio_lowerbound);
         const auto total_us =
             std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - evict_start)
@@ -401,8 +407,8 @@ class BatchEvictBench {
         });
 
         const auto evict_start = std::chrono::steady_clock::now();
-        service.BatchEvict(FLAGS_evict_ratio_target,
-                           FLAGS_evict_ratio_lowerbound);
+        MasterServiceTestPeer(service).RunBatchEvictForTesting(
+            FLAGS_evict_ratio_target, FLAGS_evict_ratio_lowerbound);
         const auto batch_evict_total_us =
             std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - evict_start)
@@ -455,7 +461,7 @@ int main(int argc, char** argv) {
 
     using mooncake::benchmarks::BatchEvictBench;
     const bool ok = BatchEvictBench::RunRealBatchEvictScales() &&
-                    BatchEvictBench::RunSingleWaiterSnapshotMutexProbe();
+                    BatchEvictBench::RunSingleWaiterMasterStateMutexProbe();
 
     google::ShutdownGoogleLogging();
     return ok ? 0 : 1;

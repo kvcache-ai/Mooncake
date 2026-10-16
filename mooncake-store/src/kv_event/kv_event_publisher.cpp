@@ -6,9 +6,11 @@
 #include <msgpack.hpp>
 #include <zmq.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <endian.h>
+#include <unordered_set>
 #include <vector>
 
 namespace mooncake {
@@ -32,17 +34,14 @@ void PackOptionalString(msgpack::packer<msgpack::sbuffer>& packer,
     }
 }
 
-void PackOptionalU32(msgpack::packer<msgpack::sbuffer>& packer, uint32_t value,
-                     bool has_value) {
-    if (!has_value) {
-        packer.pack_nil();
-    } else {
-        packer.pack(value);
-    }
-}
-
-size_t ComputeEventMapSize(bool is_stored, bool emit_legacy,
+size_t ComputeEventMapSize(bool is_stored, bool is_cleared, bool emit_legacy,
                            bool emit_object_key) {
+    if (is_cleared) {
+        // Envelope only: event_id, timestamp, event_type, model_name,
+        // block_size, additional_salt, lora_name, tenant_id, backend_id,
+        // medium, dp_rank.
+        return 11 + (emit_legacy ? 1 : 0);
+    }
     // Base envelope: event_id, timestamp, event_type, model_name, block_size,
     // additional_salt, lora_name, tenant_id, backend_id, medium, dp_rank,
     // seq_hashes, group_id.
@@ -65,6 +64,30 @@ size_t ComputeEventMapSize(bool is_stored, bool emit_legacy,
     return map_size;
 }
 
+std::unordered_set<std::string> NormalizeMedia(
+    const std::vector<std::string>& media) {
+    std::unordered_set<std::string> result;
+    for (const auto& value : media) {
+        if (!value.empty()) {
+            result.insert(value);
+        }
+    }
+    return result;
+}
+
+std::vector<std::string> SortedMedia(
+    const std::unordered_set<std::string>& media) {
+    std::vector<std::string> result(media.begin(), media.end());
+    std::sort(result.begin(), result.end());
+    return result;
+}
+
+// Events always carry a concrete tenant so subscribers can key on it without
+// having to model an unset value.
+std::string NormalizeTenant(const std::string& tenant_id) {
+    return tenant_id.empty() ? "default" : tenant_id;
+}
+
 }  // namespace
 
 KvEventPublisher::KvEventPublisher(KvEventConfig config)
@@ -81,6 +104,16 @@ KvEventPublisher::KvEventPublisher(KvEventConfig config)
         LOG(ERROR) << "kv_events enabled but backend_id is empty";
         config_.enabled = false;
         return;
+    }
+    if (!config_.emit_object_key) {
+        // object_key is the only key-identifying field on the wire, so without
+        // it a stored/removed event carries nothing a subscriber can act on and
+        // is dropped. Say so at startup: the flag name reads like a formatting
+        // switch, but it silences the whole per-object stream.
+        LOG(WARNING)
+            << "kv_events: emit_object_key=false suppresses all stored "
+               "and removed events; only cleared will be published. "
+               "Suppressed events are counted as skipped_keyless_events";
     }
 
     zmq_context_ = zmq_ctx_new();
@@ -140,24 +173,112 @@ KvEventPublisher::~KvEventPublisher() {
 
 void KvEventPublisher::PublishStored(const std::string& object_key,
                                      const std::string& medium,
-                                     const TenantId& tenant_id,
+                                     const std::string& tenant_id,
                                      const std::string& group_id) {
     if (!config_.enabled) {
         return;
     }
-    Enqueue(PendingEvent{EventKind::kStored, object_key, medium, tenant_id,
-                         group_id});
+    // medium is the only availability field on a stored event, so an empty one
+    // would announce a replica the subscriber cannot place on any tier.
+    if (medium.empty()) {
+        return;
+    }
+    std::vector<PendingEvent> events;
+    events.push_back(PendingEvent{EventKind::kStored, object_key, medium,
+                                  NormalizeTenant(tenant_id), group_id});
+    EnqueueBatch(std::move(events));
 }
 
 void KvEventPublisher::PublishRemoved(const std::string& object_key,
                                       const std::string& medium,
-                                      const TenantId& tenant_id,
+                                      const std::string& tenant_id,
                                       const std::string& group_id) {
     if (!config_.enabled) {
         return;
     }
-    Enqueue(PendingEvent{EventKind::kRemoved, object_key, medium, tenant_id,
-                         group_id});
+    // A retraction has to name the tier it retracts; medium=nil would ask the
+    // subscriber to drop availability it cannot identify.
+    if (medium.empty()) {
+        return;
+    }
+    std::vector<PendingEvent> events;
+    events.push_back(PendingEvent{EventKind::kRemoved, object_key, medium,
+                                  NormalizeTenant(tenant_id), group_id});
+    EnqueueBatch(std::move(events));
+}
+
+void KvEventPublisher::PublishCleared(const std::string& tenant_id) {
+    if (!config_.enabled) {
+        return;
+    }
+    std::vector<PendingEvent> events;
+    events.push_back(PendingEvent{EventKind::kCleared, "", "",
+                                  NormalizeTenant(tenant_id), ""});
+    EnqueueBatch(std::move(events));
+}
+
+void KvEventPublisher::PublishCommitted(
+    const std::string& object_key,
+    const std::vector<std::string>& current_media, const std::string& tenant_id,
+    const std::string& group_id) {
+    if (!config_.enabled) {
+        return;
+    }
+    const std::string normalized_tenant = NormalizeTenant(tenant_id);
+    std::vector<PendingEvent> events;
+    // A commit announces every medium unconditionally. Unlike SyncObjectState
+    // this is not a delta: the medium set can be unchanged while the object
+    // contents are new, and a subscriber that saw no event would keep serving
+    // the previous contents.
+    for (const auto& medium : SortedMedia(NormalizeMedia(current_media))) {
+        events.push_back(PendingEvent{EventKind::kStored, object_key, medium,
+                                      normalized_tenant, group_id});
+    }
+    EnqueueBatch(std::move(events));
+}
+
+void KvEventPublisher::PublishObjectRemoved(
+    const std::string& object_key, const std::string& tenant_id,
+    const std::string& group_id,
+    const std::vector<std::string>& previous_media) {
+    if (!config_.enabled) {
+        return;
+    }
+    const std::string normalized_tenant = NormalizeTenant(tenant_id);
+    std::vector<PendingEvent> events;
+    for (const auto& medium : SortedMedia(NormalizeMedia(previous_media))) {
+        events.push_back(PendingEvent{EventKind::kRemoved, object_key, medium,
+                                      normalized_tenant, group_id});
+    }
+    EnqueueBatch(std::move(events));
+}
+
+void KvEventPublisher::SyncObjectState(
+    const std::string& object_key,
+    const std::vector<std::string>& current_media, const std::string& tenant_id,
+    const std::string& group_id,
+    const std::vector<std::string>& previous_media) {
+    if (!config_.enabled) {
+        return;
+    }
+    const std::string normalized_tenant = NormalizeTenant(tenant_id);
+    const auto new_set = NormalizeMedia(current_media);
+    const auto previous_set = NormalizeMedia(previous_media);
+
+    std::vector<PendingEvent> events;
+    for (const auto& medium : SortedMedia(previous_set)) {
+        if (!new_set.contains(medium)) {
+            events.push_back(PendingEvent{EventKind::kRemoved, object_key,
+                                          medium, normalized_tenant, group_id});
+        }
+    }
+    for (const auto& medium : SortedMedia(new_set)) {
+        if (!previous_set.contains(medium)) {
+            events.push_back(PendingEvent{EventKind::kStored, object_key,
+                                          medium, normalized_tenant, group_id});
+        }
+    }
+    EnqueueBatch(std::move(events));
 }
 
 KvEventPublisher::Stats KvEventPublisher::GetStats() const {
@@ -165,21 +286,26 @@ KvEventPublisher::Stats KvEventPublisher::GetStats() const {
     stats.published_batches = published_batches_.load();
     stats.published_events = published_events_.load();
     stats.dropped_events = dropped_events_.load();
-    stats.skipped_unparsed_keys = skipped_unparsed_keys_.load();
+    stats.skipped_keyless_events = skipped_keyless_events_.load();
     return stats;
 }
 
-void KvEventPublisher::Enqueue(PendingEvent event) {
+void KvEventPublisher::EnqueueBatch(std::vector<PendingEvent> events) {
+    if (events.empty()) {
+        return;
+    }
     {
         std::lock_guard<std::mutex> lock(queue_mutex_);
-        if (config_.queue_capacity > 0 &&
-            queue_.size() >= config_.queue_capacity) {
-            queue_.pop_front();
-            dropped_events_.fetch_add(1, std::memory_order_relaxed);
-            // Reserve a ZMQ sequence gap so consumers can detect loss.
-            next_zmq_sequence_.fetch_add(1, std::memory_order_relaxed);
+        for (auto& event : events) {
+            if (config_.queue_capacity > 0 &&
+                queue_.size() >= config_.queue_capacity) {
+                queue_.pop_front();
+                dropped_events_.fetch_add(1, std::memory_order_relaxed);
+                // Reserve a ZMQ sequence gap so consumers can detect loss.
+                next_zmq_sequence_.fetch_add(1, std::memory_order_relaxed);
+            }
+            queue_.push_back(std::move(event));
         }
-        queue_.push_back(std::move(event));
     }
     queue_cv_.notify_one();
 }
@@ -225,23 +351,18 @@ void KvEventPublisher::WorkerLoop() {
 void KvEventPublisher::PublishBatch(const std::vector<PendingEvent>& batch) {
     struct EncodedEvent {
         PendingEvent pending;
-        std::optional<uint64_t> seq_hash;
         uint64_t event_id{0};
     };
     std::vector<EncodedEvent> encoded;
     encoded.reserve(batch.size());
     for (const auto& pending : batch) {
-        const auto seq_hash = ParseSeqHashFromObjectKey(pending.object_key);
-        if (!seq_hash.has_value()) {
-            if (!config_.emit_object_key || pending.object_key.empty()) {
-                skipped_unparsed_keys_.fetch_add(1, std::memory_order_relaxed);
-                continue;
-            }
-            skipped_unparsed_keys_.fetch_add(1, std::memory_order_relaxed);
+        if (pending.kind != EventKind::kCleared &&
+            (!config_.emit_object_key || pending.object_key.empty())) {
+            skipped_keyless_events_.fetch_add(1, std::memory_order_relaxed);
+            continue;
         }
         encoded.push_back(EncodedEvent{
-            pending, seq_hash,
-            next_event_id_.fetch_add(1, std::memory_order_relaxed)});
+            pending, next_event_id_.fetch_add(1, std::memory_order_relaxed)});
     }
     if (encoded.empty()) {
         return;
@@ -258,13 +379,19 @@ void KvEventPublisher::PublishBatch(const std::vector<PendingEvent>& batch) {
     packer.pack_array(encoded.size());
     for (const auto& item : encoded) {
         const bool is_stored = item.pending.kind == EventKind::kStored;
-        const char* rfc_type = is_stored ? "stored" : "removed";
-        const char* legacy_type = is_stored ? "BlockStored" : "BlockRemoved";
-        const std::string& tenant_id = item.pending.tenant_id.value();
+        const bool is_cleared = item.pending.kind == EventKind::kCleared;
+        const char* rfc_type =
+            is_stored ? "stored" : (is_cleared ? "cleared" : "removed");
+        const char* legacy_type =
+            is_stored ? "BlockStored"
+                      : (is_cleared ? "AllBlocksCleared" : "BlockRemoved");
+        // Every enqueue path normalizes an empty tenant to "default" before
+        // building the PendingEvent, so no re-check is needed here.
+        const std::string& tenant_id = item.pending.tenant_id;
 
-        const size_t map_size =
-            ComputeEventMapSize(is_stored, config_.emit_legacy_compat_fields,
-                                config_.emit_object_key);
+        const size_t map_size = ComputeEventMapSize(
+            is_stored, is_cleared, config_.emit_legacy_compat_fields,
+            config_.emit_object_key);
 
         packer.pack_map(map_size);
         packer.pack("event_id");
@@ -277,26 +404,33 @@ void KvEventPublisher::PublishBatch(const std::vector<PendingEvent>& batch) {
             packer.pack("type");
             packer.pack(legacy_type);
         }
-        // Per-block envelope fields unknown to the storage pool are omitted
-        // (nil). Indexer registration supplies model/block_size/dp_rank.
         packer.pack("model_name");
-        packer.pack_nil();
+        PackOptionalString(packer, config_.model_name);
         packer.pack("block_size");
-        packer.pack_nil();
+        if (config_.block_size == 0) {
+            packer.pack_nil();
+        } else {
+            packer.pack(config_.block_size);
+        }
         packer.pack("additional_salt");
-        packer.pack_nil();
+        PackOptionalString(packer, config_.additional_salt);
         packer.pack("lora_name");
-        packer.pack_nil();
+        PackOptionalString(packer, config_.lora_name);
         packer.pack("tenant_id");
         packer.pack(tenant_id);
         packer.pack("backend_id");
         packer.pack(config_.backend_id);
-        packer.pack("group_id");
-        PackOptionalString(packer, item.pending.group_id);
         packer.pack("medium");
         PackOptionalString(packer, item.pending.medium);
         packer.pack("dp_rank");
-        packer.pack_nil();
+        packer.pack(config_.dp_rank);
+
+        if (is_cleared) {
+            continue;
+        }
+
+        packer.pack("group_id");
+        PackOptionalString(packer, item.pending.group_id);
 
         if (config_.emit_object_key) {
             packer.pack("object_key");
@@ -304,27 +438,16 @@ void KvEventPublisher::PublishBatch(const std::vector<PendingEvent>& batch) {
         }
 
         packer.pack("seq_hashes");
-        if (item.seq_hash.has_value()) {
-            packer.pack_array(1);
-            packer.pack(item.seq_hash.value());
-        } else {
-            packer.pack_array(0);
-        }
+        packer.pack_array(0);
 
-        if (config_.emit_legacy_compat_fields && item.seq_hash.has_value()) {
-            packer.pack("block_hashes");
-            packer.pack_array(1);
-            packer.pack(static_cast<int64_t>(item.seq_hash.value()));
-        } else if (config_.emit_legacy_compat_fields) {
+        if (config_.emit_legacy_compat_fields) {
             packer.pack("block_hashes");
             packer.pack_array(0);
         }
 
         if (is_stored) {
-            // Master keys are standalone pool blocks; depth 0 satisfies RFC
-            // #1527 requirement that base_block_idx or parent_hash be present.
             packer.pack("base_block_idx");
-            packer.pack(static_cast<uint32_t>(0));
+            packer.pack_nil();
             packer.pack("parent_hash");
             packer.pack_nil();
             packer.pack("token_ids");
@@ -339,8 +462,7 @@ void KvEventPublisher::PublishBatch(const std::vector<PendingEvent>& batch) {
         }
     }
 
-    // Batch-level dp_rank; storage pool has no DP context (0).
-    packer.pack(static_cast<uint32_t>(0));
+    packer.pack(config_.dp_rank);
 
     const uint64_t seq = next_zmq_sequence_.fetch_add(1);
     const uint64_t seq_be = htobe64(seq);

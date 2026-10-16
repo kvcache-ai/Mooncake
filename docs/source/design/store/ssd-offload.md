@@ -146,6 +146,10 @@ Bucket IDs are monotonically increasing timestamps with a sequence suffix, so `b
 
 **In-flight read tracking**: A `BucketReadGuard` RAII object increments `BucketMetadata::inflight_reads_` on construction and decrements it on destruction. This allows safe deletion of bucket files even when concurrent reads are in progress.
 
+**Ownership contract (`storage_path`)**: LOCAL_DISK allows **one live client per `storage_path`**. `BucketStorageBackend::Init()` opens `.mooncake_local_disk.lock` under that directory and takes a non-blocking exclusive `flock`; a second live client fails Init immediately with an actionable error (`storage_path already held by another live client … use standalone store or per-client directories`). Do not delete the lock file while a client is running — that would release the flock for other processes. `flock` is only meaningful on local filesystems (NFS and similar may not honor exclusive locks the same way).
+
+**Bucket-id pid salt (defense in depth)**: `BucketIdGenerator` mixes `getpid() & SEQUENCE_MASK` (`SEQUENCE_BITS = 12`, so pids alias mod 4096) into the starting id so two clients that somehow race in the same second are less likely to emit the same sequence. The salt only **narrows** the restart/collision window; it is not a substitute for exclusive ownership. The load-bearing guards remain the path `flock` and `O_EXCL` when creating a new bucket data file.
+
 ### StorageBackendAdaptor (FilePerKey)
 
 Each object is stored as an individual file. The file path is derived from the key via a two-level hash-sharded directory structure to avoid large flat directories. This backend is simple and easy to inspect but does not scale well to millions of objects.
@@ -166,13 +170,13 @@ When `MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE` is set, the backend evicts existin
 
 `MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE` bounds `total_size_`, a *logical* byte counter kept in memory: incremented on write, decremented per object as buckets are evicted. Two properties limit what it can guarantee:
 
-- It is **per backend instance**. At runtime each instance's `total_size_` counts only the bytes *it* wrote. So when several instances share one offload directory (e.g. one per tensor-parallel rank, all on the same `ssd_offload_path`), each caps only its own `~1/N` share and the directory as a whole is never bounded. (One exception: on restart, `Init()` rebuilds `total_size_` by scanning `storage_path_`, so in a shared directory a restarted instance folds *all* ranks' files into its own counter — a recovery-time double-count.)
+- It is **per backend instance**. At runtime each instance's `total_size_` counts only the bytes *it* wrote. Because LOCAL_DISK enforces one live client per `storage_path`, deploy **per-rank / per-client directories** (or separate disks) rather than pointing several ranks at the same `ssd_offload_path` — a second live client now fails at Init. On restart, `Init()` rebuilds `total_size_` by scanning that exclusive `storage_path_`.
 - It is **logical, not physical**. It ignores filesystem block rounding and can lag the real on-disk footprint — a 256 MB bucket file stays on disk until every object packed into it has been evicted.
 
 `MOONCAKE_OFFLOAD_BUCKET_MAX_PHYSICAL_BYTES` (default `0` = disabled) adds a hard cap on the *real* on-disk usage of the offload directory, measured by `ActualDiskBytesUsedLocked()`:
 
 - It scans `storage_path_` with `std::filesystem::recursive_directory_iterator` and sums `stat.st_blocks * 512` over the entries. `st_blocks` is the number of 512-byte blocks actually allocated to a file — a fixed POSIX unit, independent of the filesystem block size — so the total equals what `du` reports and what a Kubernetes `emptyDir` `sizeLimit` is accounted against (it includes block rounding and excludes sparse holes).
-- The scan is scoped to `storage_path_`, so the cap's meaning follows the layout: when instances **share** one directory, each scans the whole directory and the cap bounds their **combined** usage; with **per-rank** directories (or separate disks), each scans only its own files and the cap bounds **each rank individually**. (A cap on the global sum across ranks under any layout would require master-side aggregation and is out of scope here.)
+- The scan is scoped to `storage_path_`. With the one-client-per-path contract, each rank should use its **own** directory (or disk); the physical cap then bounds that rank's footprint only. A shared offload directory across live clients is no longer a supported deployment shape — Init fails fast instead. (A cap on the global sum across ranks would require master-side aggregation and is out of scope here.)
 - The scan is cached for `MOONCAKE_OFFLOAD_BUCKET_DISK_SCAN_CACHE_MS` (default 500 ms; `<= 0` re-scans on every check) to bound its cost, and is snapshotted once per `PrepareEviction` call under the metadata lock. `FinalizeEviction` invalidates the cache after deleting files so the next check re-measures.
 - If the directory cannot be scanned — an open error, or an iteration error partway through — the function **fails closed**: it reports the cap as reached and does not cache the partial total, so a transient scan failure drives eviction/rejection instead of silently disabling the cap.
 

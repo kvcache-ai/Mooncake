@@ -1,13 +1,11 @@
 #pragma once
 
+#include <cstddef>
 #include <string>
 #include <unordered_map>
 #include <mutex>
 #include <thread>
 #include <hf3fs_usrbio.h>
-
-#include "file_interface.h"
-#include "types.h"
 
 namespace mooncake {
 
@@ -80,27 +78,6 @@ struct ThreadUSRBIOResource {
     void Cleanup();
 
     ~ThreadUSRBIOResource() { Cleanup(); }
-};
-
-class ThreeFSFile : public StorageFile {
-   public:
-    ThreeFSFile(const std::string &filename, int fd,
-                USRBIOResourceManager *resource_manager);
-    ~ThreeFSFile() override;
-
-    tl::expected<size_t, ErrorCode> write(const std::string &buffer,
-                                          size_t length) override;
-    tl::expected<size_t, ErrorCode> write(std::span<const char> data,
-                                          size_t length) override;
-    tl::expected<size_t, ErrorCode> read(std::string &buffer,
-                                         size_t length) override;
-    tl::expected<size_t, ErrorCode> vector_write(const iovec *iov, int iovcnt,
-                                                 off_t offset) override;
-    tl::expected<size_t, ErrorCode> vector_read(const iovec *iov, int iovcnt,
-                                                off_t offset) override;
-
-   private:
-    USRBIOResourceManager *resource_manager_;
 };
 
 }  // namespace mooncake

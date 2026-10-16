@@ -1,4 +1,4 @@
-#include "file_interface.h"
+#include "hf3fs/hf3fs.h"
 
 namespace mooncake {
 // ============================================================================

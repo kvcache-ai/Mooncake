@@ -1,41 +1,31 @@
-// Reproduction/regression test for the MetadataAccessorRW double-erase
-// use-after-free (prod incident 2026-08-03: mooncake_master segfaulted every
-// ~5 minutes after a snapshot restore, always at the same instruction inside
+// Regression test for a MetadataAccessorRW double-erase use-after-free (prod
+// incident 2026-08-03: mooncake_master segfaulted every ~5 minutes after a
+// snapshot restore, always at the same instruction inside
 // std::unordered_set<std::string>::erase(const_iterator) — the bucket-chain
 // walk dereferencing the chain-end nullptr).
 //
-// The bug — MasterService::MetadataAccessorRW constructor
-// (mooncake-store/include/master_service.h):
+// The MetadataAccessorRW constructor erases an object whose replicas have all
+// turned invalid. While the processing marker was a key in a per-tenant
+// processing set, the constructor erased the object (EraseMetadata also
+// dropped the key from the set) and then erased the key again through an
+// iterator taken before, which by then pointed at a freed node. libstdc++
+// re-read the cached hash from the freed node, ran off the end of the bucket
+// chain and dereferenced nullptr -> SIGSEGV (fault address 0x0, exactly as
+// observed in the prod kernel logs).
 //
-//     if (!it_->second.IsValid()) {
-//         const bool had_processing =
-//             processing_it_ != tenant_state_->processing_keys.end();
-//         this->Erase();  // -> EraseMetadata(), which already does
-//                         //    processing_keys.erase(key)
-//                         //    (master_service.cpp), freeing the
-//                         //    node processing_it_ points to
-//         if (tenant_state_ != nullptr && had_processing) {
-//             this->EraseFromProcessing();  // -> processing_keys.erase(
-//         }                                 //    processing_it_)
-//     }                                     //    STALE ITERATOR!
+// The marker now lives on the object's own record and goes with it, so there
+// is nothing left to erase twice. The scenario stays as a regression test for
+// the accessor's cleanup path.
 //
-// Erase() already removes the key from processing_keys (by key); the follow-up
-// EraseFromProcessing() erases the SAME node again via the now-dangling
-// iterator. libstdc++ re-reads the cached hash from the freed node, walks the
-// bucket chain looking for it by address, runs off the end of the chain and
-// dereferences nullptr -> SIGSEGV (fault address 0x0, exactly as observed in
-// the prod kernel logs).
-//
-// Production trigger chain reproduced here (public API + one friend hook):
+// Production trigger chain reproduced here (public API + test peer):
 //   1. MountSegment                     (a "ghost" client mounts a segment)
-//   2. PutStart without PutEnd          (key stays in processing_keys with an
+//   2. PutStart without PutEnd          (the object stays processing with an
 //                                        incomplete replica on that segment)
 //   3. PrepareUnmountSegment            (ghost client expires; the replica's
 //                                        allocator weak_ptr expires, so
 //                                        has_invalid_mem_handle() == true)
 //   4. PutEnd (or any op constructing   (ctor cleanup: erases invalid replicas
-//      MetadataAccessorRW for the key)   -> !IsValid() -> Erase() +
-//                                        EraseFromProcessing() double-erase)
+//      MetadataAccessorRW for the key)   -> !IsValid() -> Erase())
 //
 // Two scenario details matter for a deterministic repro:
 //   * Step 3 must NOT use MasterService::UnmountSegment: it internally runs
@@ -55,6 +45,7 @@
 // simply reports OBJECT_NOT_FOUND) and the test passes.
 
 #include "master_service.h"
+#include "master_service/master_service_test_peer.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -86,17 +77,17 @@ class MasterServiceProcessingKeyDoubleEraseTest : public ::testing::Test {
     static constexpr int kExitUnmountFailed = 4;   // scenario setup broken
 
     // Friend access: find a key that routes to the SAME metadata shard as
-    // `key` (getMetadataShardIndex hashes tenant+key, so a naive second key
+    // `key` (getShardIndex hashes tenant+key, so a naive second key
     // lands in a different shard's TenantState and cannot keep THIS shard's
     // tenant non-empty).
     std::string FindKeyOnSameShard(MasterService& service,
                                    const std::string& key) {
-        const size_t target =
-            service.getMetadataShardIndex(TenantId::Default(), key);
+        const size_t target = MasterServiceTestPeer(service).getShardIndex(
+            TenantId::Default(), key);
         for (int i = 0; i < 100000; ++i) {
             std::string candidate = key + "_keepalive_" + std::to_string(i);
-            if (service.getMetadataShardIndex(TenantId::Default(), candidate) ==
-                target) {
+            if (MasterServiceTestPeer(service).getShardIndex(
+                    TenantId::Default(), candidate) == target) {
                 return candidate;
             }
         }
@@ -122,7 +113,7 @@ class MasterServiceProcessingKeyDoubleEraseTest : public ::testing::Test {
         }
 
         // 2. PutStart a key onto the segment and never complete it — the key
-        //    stays in TenantState::processing_keys (client "died" mid-put).
+        //    object stays processing (client "died" mid-put).
         ReplicateConfig config;
         config.replica_num = 1;
         config.preferred_segment = segment.name;
@@ -151,7 +142,8 @@ class MasterServiceProcessingKeyDoubleEraseTest : public ::testing::Test {
         //    No ClearInvalidHandles sweep here (see file header).
         size_t metrics_dec_capacity = 0;
         {
-            auto segment_access = service.segment_manager_.getSegmentAccess();
+            auto segment_access = MasterServiceTestPeer::SegmentManager(service)
+                                      .getSegmentAccess();
             if (segment_access.PrepareUnmountSegment(
                     segment.id, metrics_dec_capacity) != ErrorCode::OK) {
                 ::_exit(kExitUnmountFailed);
@@ -159,9 +151,8 @@ class MasterServiceProcessingKeyDoubleEraseTest : public ::testing::Test {
         }
 
         // 4. Trigger: PutEnd constructs MetadataAccessorRW(service, key).
-        //    The ctor erases the invalid replica, finds !IsValid(), calls
-        //    Erase() (frees the processing_keys node) and then
-        //    EraseFromProcessing() with the stale processing_it_ iterator.
+        //    The ctor erases the invalid replica, finds !IsValid() and
+        //    erases the object, processing marker included.
         (void)service.PutEnd(client_id, key, TenantId::Default(),
                              ReplicaType::MEMORY);
         ::_exit(kExitOk);  // only reachable on fixed code
@@ -185,13 +176,11 @@ TEST_F(MasterServiceProcessingKeyDoubleEraseTest,
     ASSERT_EQ(::waitpid(pid, &status, 0), pid);
 
     if (WIFSIGNALED(status)) {
-        FAIL() << "MetadataAccessorRW double-erase reproduced: child died "
-                  "with signal "
+        FAIL() << "MetadataAccessorRW cleanup crashed: child died with signal "
                << WTERMSIG(status)
                << (WTERMSIG(status) == SIGSEGV ? " (SIGSEGV)" : "")
-               << ". Erase() -> EraseMetadata() already erases the key from "
-                  "processing_keys; the subsequent EraseFromProcessing() "
-                  "re-erases it via the stale processing_it_ iterator.";
+               << " while erasing a processing object left with only invalid "
+                  "replicas.";
     }
     ASSERT_TRUE(WIFEXITED(status)) << "child did not exit normally";
     EXPECT_EQ(WEXITSTATUS(status), kExitOk)

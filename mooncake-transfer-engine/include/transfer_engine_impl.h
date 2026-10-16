@@ -49,6 +49,24 @@
 namespace mooncake {
 class TransferEngineImplTestPeer;
 
+// Whether an Ascend build installs the Ascend transport for a protocol hint.
+// Hints that name no protocol or name Ascend install it; a hint naming a host
+// transport (e.g. "rdma") leaves the classic host-transport selection in
+// charge. HCCL builds (USE_ASCEND without USE_ASCEND_DIRECT) return true here
+// whatever the hint says, so they install Ascend and never reach that block.
+static inline bool shouldInstallAscendTransport(const std::string& protocol) {
+#if defined(USE_ASCEND) && !defined(USE_ASCEND_DIRECT)
+    (void)protocol;
+    return true;
+#elif defined(USE_ASCEND_DIRECT)
+    return protocol.empty() || protocol == "ascend" ||
+           protocol == "ascend_direct";
+#else
+    (void)protocol;
+    return false;
+#endif
+}
+
 using TransferRequest = Transport::TransferRequest;
 using TransferStatus = Transport::TransferStatus;
 using TransferStatusEnum = Transport::TransferStatusEnum;
@@ -263,7 +281,12 @@ class TransferEngineImpl {
     }
 
     Status freeBatchID(BatchID batch_id) {
-        return multi_transports_->freeBatchID(batch_id);
+        return multi_transports_->freeBatchID(batch_id, [this, batch_id] {
+            // BatchID is pointer-derived. Remove side-table state before the
+            // descriptor is deleted and its address can be reused.
+            RWSpinlock::WriteGuard guard(send_notifies_lock_);
+            notifies_to_send_.erase(batch_id);
+        });
     }
 
     int getNotifies(std::vector<TransferMetadata::NotifyDesc>& notifies);
@@ -359,16 +382,19 @@ class TransferEngineImpl {
         }
 #endif
         if (result.ok() && status.s == TransferStatusEnum::COMPLETED) {
-            // send notify
-            RWSpinlock::WriteGuard guard(send_notifies_lock_);
-            if (!notifies_to_send_.count(batch_id)) return result;
-            auto value = notifies_to_send_[batch_id];
-            auto rc = sendNotifyByID(value.first, value.second);
+            std::pair<SegmentID, TransferMetadata::NotifyDesc> value;
+            {
+                RWSpinlock::WriteGuard guard(send_notifies_lock_);
+                auto notify = notifies_to_send_.find(batch_id);
+                if (notify == notifies_to_send_.end()) return result;
+                value = std::move(notify->second);
+                notifies_to_send_.erase(notify);
+            }
+            auto rc = sendNotifyByID(value.first, std::move(value.second));
             if (rc) {
                 LOG(ERROR) << "Failed to send notify message, error code: "
                            << rc;
             }
-            notifies_to_send_.erase(batch_id);
         }
         return result;
     }
@@ -418,7 +444,25 @@ class TransferEngineImpl {
         auto_discover_config_ = config;
     }
 
+    // Optional transport hint carried by the protocol argument of init(). An
+    // empty value keeps the config written by setAutoDiscover(), which Store
+    // uses to pass the protocol of the client before calling init(). A hint
+    // for a transport this build does not provide is dropped, so discovery
+    // still falls back to the host transports rather than failing the install.
+    void applyProtocolHint(const std::string& protocol) {
+        if (protocol.empty()) return;
+#ifndef USE_EFA
+        if (protocol == "efa") return;
+#endif
+        auto_discover_config_.protocol = protocol;
+    }
+
     void* getBaseAddr() { return multi_transports_->getBaseAddr(); }
+
+    void* allocateSharedMemory(size_t length);
+    void* allocateSharedMemory(size_t length, const SharedMemoryOptions& opt);
+
+    int freeSharedMemory(void* addr);
 
     void setWhitelistFilters(std::vector<std::string>&& filters) {
         filter_ = std::move(filters);
@@ -481,6 +525,17 @@ class TransferEngineImpl {
             return "rdma_twosided";
         }
         return "rdma";
+    }
+
+    // True when auto-discovery should set up the EFA transport. Only USE_EFA
+    // builds can construct it; elsewhere protocol=efa keeps the RDMA-style
+    // discovery that excludes EFA NICs.
+    bool autoDiscoverUsesEfa() const {
+#ifdef USE_EFA
+        return autoDiscoverTransport() == "efa";
+#else
+        return false;
+#endif
     }
 
     // Discover topology and install transports automatically when enabled.

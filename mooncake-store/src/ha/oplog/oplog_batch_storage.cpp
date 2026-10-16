@@ -1,12 +1,15 @@
 #include "ha/oplog/oplog_batch_storage.h"
 
 #include <algorithm>
+#include <array>
 #include <charconv>
+#include <string_view>
 
 #include <glog/logging.h>
 
 #include "ha/oplog/oplog_batch_codec.h"
 #include "ha/oplog/oplog_types.h"
+#include "ha/snapshot/batch_oplog/metadata.h"
 #ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
 #include "ha_metric_manager.h"
 #endif
@@ -167,6 +170,21 @@ ErrorCode OpLogBatchStorage::ReadProducerView(
         LOG(ERROR) << "Invalid producer view value: cluster=" << cluster_id_;
         return ErrorCode::INTERNAL_ERROR;
     }
+    return ErrorCode::OK;
+}
+
+ErrorCode OpLogBatchStorage::ReadCompactionFloor(uint64_t& floor) const {
+    if (!IsValidClusterId()) return ErrorCode::INVALID_PARAMS;
+    std::string value;
+    const auto err = backend_.Get(
+        ha::BuildBatchOpLogSnapshotCompactionFloorKey(cluster_id_), value);
+    if (err != ErrorCode::OK) return err;
+    uint64_t parsed = 0;
+    const auto result =
+        std::from_chars(value.data(), value.data() + value.size(), parsed);
+    if (result.ec != std::errc() || result.ptr != value.data() + value.size())
+        return ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
+    floor = parsed;
     return ErrorCode::OK;
 }
 
@@ -485,6 +503,17 @@ ErrorCode OpLogBatchStorage::ReadBatchesAfter(
     return ErrorCode::OK;
 }
 
+ErrorCode OpLogBatchStorage::DeleteBatchesThrough(uint64_t batch_id) {
+    if (!IsValidClusterId()) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    // The suffix range starts immediately after the inclusive cutoff, and
+    // already handles UINT64_MAX without overflowing the batch ID.
+    const auto suffix = BuildBatchRecordRange(cluster_id_, batch_id);
+    return backend_.DeleteRange(BuildBatchRecordKey(cluster_id_, 0),
+                                suffix.begin_key);
+}
+
 bool OpLogBatchStorage::IsValidClusterId() const { return cluster_id_valid_; }
 
 ErrorCode OpLogBatchStorage::RejectLegacyLayout() const {
@@ -517,17 +546,26 @@ ErrorCode OpLogBatchStorage::RejectLegacyLayout() const {
     }
 
     entries.clear();
-    err = backend_.Range(root + "snapshot/", root + "snapshot0",
-                         /*limit=*/1, entries);
+    const std::string snapshot_prefix = root + "snapshot/";
+    constexpr std::array<std::string_view, 4> kBatchSnapshotControlKeys{
+        "latest", "fallback", "maintenance", "compaction_floor"};
+    err = backend_.Range(snapshot_prefix, root + "snapshot0",
+                         kBatchSnapshotControlKeys.size() + 1, entries);
     if (err != ErrorCode::OK) {
         return err;
     }
-    if (!entries.empty()) {
-        LOG(ERROR) << "Legacy OpLog snapshot sidecar exists for cluster="
-                   << cluster_id_
-                   << "; clear the legacy OpLog namespace before enabling "
-                      "batch-record OpLog";
-        return ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
+    for (const auto& entry : entries) {
+        const std::string_view key(entry.key);
+        const std::string_view suffix = key.substr(snapshot_prefix.size());
+        if (std::find(kBatchSnapshotControlKeys.begin(),
+                      kBatchSnapshotControlKeys.end(),
+                      suffix) == kBatchSnapshotControlKeys.end()) {
+            LOG(ERROR) << "Legacy OpLog snapshot sidecar exists for cluster="
+                       << cluster_id_
+                       << "; clear the legacy OpLog namespace before enabling "
+                          "batch-record OpLog";
+            return ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
+        }
     }
     return ErrorCode::OK;
 }

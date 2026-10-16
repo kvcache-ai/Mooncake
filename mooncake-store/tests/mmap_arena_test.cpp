@@ -5,7 +5,6 @@
 #include <gtest/gtest.h>
 #include <glog/logging.h>
 #include "mmap_arena.h"
-#include "utils.h"
 #include <thread>
 #include <vector>
 #include <atomic>

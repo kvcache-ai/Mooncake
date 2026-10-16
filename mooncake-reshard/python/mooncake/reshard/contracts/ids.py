@@ -20,7 +20,7 @@ PlacementSetId = NewType("PlacementSetId", str)
 RevisionId = NewType("RevisionId", str)
 RuntimeInstanceId = NewType("RuntimeInstanceId", str)
 LeaseId = NewType("LeaseId", str)
-StoredFragmentId = NewType("StoredFragmentId", str)
+StoredFragmentSnapshotId = NewType("StoredFragmentSnapshotId", str)
 
 
 __all__ = [
@@ -33,7 +33,7 @@ __all__ = [
     "RevisionId",
     "RuntimeFragmentId",
     "RuntimeInstanceId",
-    "StoredFragmentId",
+    "StoredFragmentSnapshotId",
     "TensorId",
     "TopologyId",
 ]

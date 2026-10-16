@@ -19,6 +19,15 @@
 
 namespace mooncake {
 
+struct LocalHotCacheConfig {
+    size_t total_size_bytes = 0;
+    size_t block_size_bytes = 16 * 1024 * 1024;
+    bool use_shm = false;
+    uint8_t admission_threshold = 2;
+
+    static LocalHotCacheConfig FromEnvironment();
+};
+
 /**
  * @brief Token captured at async hot cache fill submission time.
  * Invalidated when RemoveHotKey, BumpKeyGeneration, or Clear bumps

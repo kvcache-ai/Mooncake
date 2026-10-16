@@ -42,21 +42,28 @@
     } while (0)
 
 #ifdef USE_CUDA
+#include <glog/logging.h>
+
 #define CHECK_CUDA(call)                                                      \
     do {                                                                      \
         auto err = call;                                                      \
-        if (err != cudaSuccess)                                               \
-            return Status::InternalError(std::string(#call) + ": " +          \
-                                         cudaGetErrorString(err) + LOC_MARK); \
+        if (err != cudaSuccess) {                                             \
+            auto _msg = std::string(#call) + ": " + cudaGetErrorString(err) + \
+                        LOC_MARK;                                             \
+            LOG(ERROR) << "CUDA error: " << _msg;                             \
+            return Status::InternalError(std::move(_msg));                    \
+        }                                                                     \
     } while (0)
 
-#define CHECK_CU(call)                                                        \
-    do {                                                                      \
-        auto err = call;                                                      \
-        if (err != CUDA_SUCCESS) {                                            \
-            return Status::InternalError(std::string(#call) + ": cuResult " + \
-                                         std::to_string(err) + LOC_MARK);     \
-        }                                                                     \
+#define CHECK_CU(call)                                       \
+    do {                                                     \
+        auto err = call;                                     \
+        if (err != CUDA_SUCCESS) {                           \
+            auto _msg = std::string(#call) + ": cuResult " + \
+                        std::to_string(err) + LOC_MARK;      \
+            LOG(ERROR) << "CUDA driver error: " << _msg;     \
+            return Status::InternalError(std::move(_msg));   \
+        }                                                    \
     } while (0)
 #endif
 
@@ -101,6 +108,7 @@ class Status final {
         kMetadataError = 131,
         kRpcServiceError = 132,
         kMalformedJson = 133,
+        kRpcConnectionError = 134,  // Failed before dispatching the request.
         kInternalError = 199,
 
         kNotImplemented = 200,
@@ -154,7 +162,13 @@ class Status final {
     TYPE_CHECK(RdmaError);
     TYPE_CHECK(CudaError);
     TYPE_CHECK(MetadataError);
-    TYPE_CHECK(RpcServiceError);
+    TYPE_CHECK(RpcConnectionError);
+    [[nodiscard]] bool IsRpcServiceError() const {
+        return code_ == Code::kRpcServiceError || IsRpcConnectionError();
+    }
+    static Status RpcServiceError(std::string_view msg) {
+        return Status(Code::kRpcServiceError, msg);
+    }
     TYPE_CHECK(MalformedJson);
     TYPE_CHECK(InternalError);
 

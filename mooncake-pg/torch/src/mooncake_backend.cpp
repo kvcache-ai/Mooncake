@@ -127,8 +127,6 @@ void validateSingleBufferTensors(const at::Tensor& output,
                 "Input and output tensors must be on the same device");
     TORCH_CHECK(output.scalar_type() == input.scalar_type(),
                 "Input and output tensors must have the same dtype");
-    TORCH_CHECK(input.is_contiguous(), "Input tensor must be contiguous");
-    TORCH_CHECK(output.is_contiguous(), "Output tensor must be contiguous");
 }
 
 at::Tensor packPeerTensors(const std::vector<at::Tensor>& tensors,
@@ -161,6 +159,21 @@ std::function<void()> makeCopyBackToPeerTensors(
                     .view(outputs[index].sizes()));
         }
     };
+}
+
+at::Tensor makeContiguous(const at::Tensor& tensor) {
+    return tensor.is_contiguous() ? tensor : tensor.contiguous();
+}
+
+at::Tensor makeContiguousOutput(const at::Tensor& tensor) {
+    return tensor.is_contiguous() ? tensor
+                                  : at::empty(tensor.sizes(), tensor.options());
+}
+
+std::function<void()> makeCopyBackToTensor(const at::Tensor& output,
+                                           const at::Tensor& packed) {
+    if (output.is_contiguous()) return {};
+    return [output, packed]() mutable { output.copy_(packed); };
 }
 
 std::vector<int32_t> convertRanks(const std::vector<int>& ranks) {
@@ -358,6 +371,19 @@ MooncakeBackend::MooncakeBackend(
     config.globalRankCount = global_ranks.size();
     config.deviceIndex = isCpu_ ? -1 : at::cuda::current_device();
     config.deviceType = isCpu_ ? mooncakePgDeviceCpu : mooncakePgDeviceGpu;
+    if (!isCpu_) {
+        const auto preferred_backend =
+            c10::utils::get_env("MOONCAKE_PG_PREFERRED_GPU_COLLECTIVE_BACKEND")
+                .value_or("legacy");
+        TORCH_CHECK(
+            preferred_backend == "legacy" || preferred_backend == "new",
+            "MOONCAKE_PG_PREFERRED_GPU_COLLECTIVE_BACKEND must be unset, "
+            "'legacy', or 'new'; got '",
+            preferred_backend, "'");
+        config.preferredGpuCollectiveBackend =
+            preferred_backend == "new" ? mooncakePgGpuCollectiveBackendNew
+                                       : mooncakePgGpuCollectiveBackendLegacy;
+    }
     config.idResolvePolicy = options_ && options_->isExtension_
                                  ? mooncakePgIdResolveAttachOrExtend
                                  : mooncakePgIdResolveCreateOrAttach;
@@ -435,16 +461,25 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::launchCollective(
     checkResult(GpuFn(args..., comm_, convertStream(stream),
                       failed_ranks_hint.data(), failed_ranks_hint_count),
                 operation);
+    // Clear a sticky error before recording the completion event and checking
+    // capture state on the collective's stream.
+    cudaGetLastError();
     if (postCompletion) postCompletion();
     auto event = std::make_shared<c10::Event>(kGpuDeviceType);
     event->record(stream);
-    if (at::cuda::currentStreamCaptureStatus() ==
-        c10::cuda::CaptureStatus::None) {
+    cudaStreamCaptureStatus captureStatus = cudaStreamCaptureStatusNone;
+    cudaStreamIsCapturing(stream.stream(), &captureStatus);
+    const bool is_captured = captureStatus != cudaStreamCaptureStatusNone ||
+                             at::cuda::currentStreamCaptureStatus() !=
+                                 c10::cuda::CaptureStatus::None;
+    if (is_captured) {
+        work_tracker_->notifyCapture(true);
+    } else {
         work_tracker_->evictCompleted();
     }
     return c10::make_intrusive<MooncakeWorkCuda>(
         opType, std::move(event), std::move(failed_ranks_hint), work_tracker_,
-        std::move(keepAlive));
+        std::move(keepAlive), is_captured);
 }
 
 template <auto CpuFn, auto GpuFn, typename... Args>
@@ -510,11 +545,13 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::broadcast(
     std::vector<at::Tensor>& tensors, const c10d::BroadcastOptions& opts) {
     TORCH_CHECK(tensors.size() == 1, kSingleTensorError);
     auto tensor = tensors.back();
+    auto packed = makeContiguous(tensor);
     const int root = opts.rootRank + opts.rootTensor;
+    auto post_completion = makeCopyBackToTensor(tensor, packed);
     return launchCollective<mooncakePgBroadcastCpu, mooncakePgBroadcastGpu>(
-        c10d::OpType::BROADCAST, "mooncakePgBroadcast", tensor, {tensor}, {},
-        tensor.data_ptr(), tensor.data_ptr(), tensorCount(tensor),
-        tensorType(tensor), root);
+        c10d::OpType::BROADCAST, "mooncakePgBroadcast", packed,
+        {tensor, packed}, std::move(post_completion), packed.data_ptr(),
+        packed.data_ptr(), tensorCount(packed), tensorType(packed), root);
 }
 
 c10::intrusive_ptr<c10d::Work> MooncakeBackend::allreduce(
@@ -522,10 +559,13 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::allreduce(
     TORCH_CHECK(tensors.size() == 1, kSingleTensorError);
     TORCH_CHECK(opts.sparseIndices == std::nullopt, kSparseError);
     auto tensor = tensors.back();
+    auto packed = makeContiguous(tensor);
+    auto post_completion = makeCopyBackToTensor(tensor, packed);
     return launchCollective<mooncakePgAllReduceCpu, mooncakePgAllReduceGpu>(
-        c10d::OpType::ALLREDUCE, "mooncakePgAllReduce", tensor, {tensor}, {},
-        tensor.data_ptr(), tensor.data_ptr(), tensorCount(tensor),
-        tensorType(tensor), convertReduceOp(opts.reduceOp));
+        c10d::OpType::ALLREDUCE, "mooncakePgAllReduce", packed,
+        {tensor, packed}, std::move(post_completion), packed.data_ptr(),
+        packed.data_ptr(), tensorCount(packed), tensorType(packed),
+        convertReduceOp(opts.reduceOp));
 }
 
 c10::intrusive_ptr<c10d::Work> MooncakeBackend::allgather(
@@ -534,21 +574,23 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::allgather(
     TORCH_CHECK(inputTensors.size() == 1, kSingleTensorError);
     TORCH_CHECK(outputTensors.size() == 1, kSingleTensorError);
     auto input = inputTensors.back();
+    auto packed_input = makeContiguous(input);
     auto outputs = outputTensors.back();
     const int active_size = getSize();
-    validateEqualPeerTensors(outputs, input, active_size);
+    validateEqualPeerTensors(outputs, packed_input, active_size);
     auto packed_output =
-        at::empty({input.numel() * static_cast<int64_t>(outputs.size())},
-                  input.options());
+        at::empty({packed_input.numel() * static_cast<int64_t>(outputs.size())},
+                  packed_input.options());
 
-    std::vector<at::Tensor> keep_alive{input, packed_output};
+    std::vector<at::Tensor> keep_alive{input, packed_input, packed_output};
     keep_alive.insert(keep_alive.end(), outputs.begin(), outputs.end());
     auto post_completion =
         makeCopyBackToPeerTensors(packed_output, std::move(outputs));
     return launchCollective<mooncakePgAllGatherCpu, mooncakePgAllGatherGpu>(
-        c10d::OpType::ALLGATHER, "mooncakePgAllGather", input,
-        std::move(keep_alive), std::move(post_completion), input.data_ptr(),
-        packed_output.data_ptr(), tensorCount(input), tensorType(input));
+        c10d::OpType::ALLGATHER, "mooncakePgAllGather", packed_input,
+        std::move(keep_alive), std::move(post_completion),
+        packed_input.data_ptr(), packed_output.data_ptr(),
+        tensorCount(packed_input), tensorType(packed_input));
 }
 
 c10::intrusive_ptr<c10d::Work> MooncakeBackend::_allgather_base(
@@ -556,12 +598,16 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_allgather_base(
     const c10d::AllgatherOptions&) {
     validateSingleBufferTensors(outputBuffer, inputBuffer,
                                 isCpu_ ? c10::DeviceType::CPU : kGpuDeviceType);
+    auto packed_input = makeContiguous(inputBuffer);
+    auto packed_output = makeContiguousOutput(outputBuffer);
+    auto post_completion = makeCopyBackToTensor(outputBuffer, packed_output);
 
     return launchCollective<mooncakePgAllGatherCpu, mooncakePgAllGatherGpu>(
-        c10d::OpType::_ALLGATHER_BASE, "mooncakePgAllGather", inputBuffer,
-        {inputBuffer, outputBuffer}, {}, inputBuffer.data_ptr(),
-        outputBuffer.data_ptr(), tensorCount(inputBuffer),
-        tensorType(inputBuffer));
+        c10d::OpType::_ALLGATHER_BASE, "mooncakePgAllGather", packed_input,
+        {inputBuffer, outputBuffer, packed_input, packed_output},
+        std::move(post_completion), packed_input.data_ptr(),
+        packed_output.data_ptr(), tensorCount(packed_input),
+        tensorType(packed_input));
 }
 
 c10::intrusive_ptr<c10d::Work> MooncakeBackend::_reduce_scatter_base(
@@ -569,13 +615,17 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_reduce_scatter_base(
     const c10d::ReduceScatterOptions& opts) {
     validateSingleBufferTensors(outputBuffer, inputBuffer,
                                 isCpu_ ? c10::DeviceType::CPU : kGpuDeviceType);
+    auto packed_input = makeContiguous(inputBuffer);
+    auto packed_output = makeContiguousOutput(outputBuffer);
+    auto post_completion = makeCopyBackToTensor(outputBuffer, packed_output);
 
     return launchCollective<mooncakePgReduceScatterCpu,
                             mooncakePgReduceScatterGpu>(
         c10d::OpType::_REDUCE_SCATTER_BASE, "mooncakePgReduceScatter",
-        outputBuffer, {inputBuffer, outputBuffer}, {}, inputBuffer.data_ptr(),
-        outputBuffer.data_ptr(), tensorCount(outputBuffer),
-        tensorType(outputBuffer), convertReduceOp(opts.reduceOp));
+        packed_input, {inputBuffer, outputBuffer, packed_input, packed_output},
+        std::move(post_completion), packed_input.data_ptr(),
+        packed_output.data_ptr(), tensorCount(packed_output),
+        tensorType(packed_output), convertReduceOp(opts.reduceOp));
 }
 
 c10::intrusive_ptr<c10d::Work> MooncakeBackend::alltoall(
@@ -640,11 +690,15 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::reduce(
     std::vector<at::Tensor>& tensors, const c10d::ReduceOptions& opts) {
     TORCH_CHECK(tensors.size() == 1, kSingleTensorError);
     auto tensor = tensors.back();
+    auto packed = makeContiguous(tensor);
     const int root = opts.rootRank + opts.rootTensor;
+    auto post_completion = root == rank_ ? makeCopyBackToTensor(tensor, packed)
+                                         : std::function<void()>{};
     return launchCollective<mooncakePgReduceCpu, mooncakePgReduceGpu>(
-        c10d::OpType::REDUCE, "mooncakePgReduce", tensor, {tensor}, {},
-        tensor.data_ptr(), tensor.data_ptr(), tensorCount(tensor),
-        tensorType(tensor), convertReduceOp(opts.reduceOp), root);
+        c10d::OpType::REDUCE, "mooncakePgReduce", packed, {tensor, packed},
+        std::move(post_completion), packed.data_ptr(), packed.data_ptr(),
+        tensorCount(packed), tensorType(packed), convertReduceOp(opts.reduceOp),
+        root);
 }
 
 c10::intrusive_ptr<c10d::Work> MooncakeBackend::gather(
@@ -657,27 +711,29 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::gather(
         TORCH_CHECK(outputTensors.size() == 1, kSingleTensorError);
     }
     auto input = inputTensors.back();
+    auto packed_input = makeContiguous(input);
     std::vector<at::Tensor> outputs;
     at::Tensor packed_output;
     if (is_root) {
         outputs = outputTensors.back();
         const int active_size = getSize();
-        validateEqualPeerTensors(outputs, input, active_size);
-        packed_output =
-            at::empty({input.numel() * static_cast<int64_t>(outputs.size())},
-                      input.options());
+        validateEqualPeerTensors(outputs, packed_input, active_size);
+        packed_output = at::empty(
+            {packed_input.numel() * static_cast<int64_t>(outputs.size())},
+            packed_input.options());
     }
 
-    std::vector<at::Tensor> keep_alive{input, packed_output};
+    std::vector<at::Tensor> keep_alive{input, packed_input, packed_output};
     keep_alive.insert(keep_alive.end(), outputs.begin(), outputs.end());
     auto post_completion = packed_output.defined() ? makeCopyBackToPeerTensors(
                                                          packed_output, outputs)
                                                    : std::function<void()>{};
     return launchCollective<mooncakePgGatherCpu, mooncakePgGatherGpu>(
-        c10d::OpType::GATHER, "mooncakePgGather", input, std::move(keep_alive),
-        std::move(post_completion), input.data_ptr(),
+        c10d::OpType::GATHER, "mooncakePgGather", packed_input,
+        std::move(keep_alive), std::move(post_completion),
+        packed_input.data_ptr(),
         packed_output.defined() ? packed_output.data_ptr() : nullptr,
-        tensorCount(input), tensorType(input), root);
+        tensorCount(packed_input), tensorType(packed_input), root);
 }
 
 c10::intrusive_ptr<c10d::Work> MooncakeBackend::scatter(
@@ -691,29 +747,36 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::scatter(
         TORCH_CHECK(inputTensors.size() == 1, kSingleTensorError);
     }
     auto output = outputTensors.back();
+    auto packed_output = makeContiguous(output);
     at::Tensor packed_input;
     std::vector<at::Tensor> inputs;
     if (is_root) {
         inputs = inputTensors.back();
-        packed_input = packPeerTensors(inputs, output, getSize());
+        packed_input = packPeerTensors(inputs, packed_output, getSize());
     }
 
-    std::vector<at::Tensor> keep_alive{output, packed_input};
+    std::vector<at::Tensor> keep_alive{output, packed_output, packed_input};
     keep_alive.insert(keep_alive.end(), inputs.begin(), inputs.end());
+    auto post_completion = makeCopyBackToTensor(output, packed_output);
     return launchCollective<mooncakePgScatterCpu, mooncakePgScatterGpu>(
-        c10d::OpType::SCATTER, "mooncakePgScatter", output,
-        std::move(keep_alive), {},
+        c10d::OpType::SCATTER, "mooncakePgScatter", packed_output,
+        std::move(keep_alive), std::move(post_completion),
         packed_input.defined() ? packed_input.data_ptr() : nullptr,
-        output.data_ptr(), tensorCount(output), tensorType(output), root);
+        packed_output.data_ptr(), tensorCount(packed_output),
+        tensorType(packed_output), root);
 }
 
 void MooncakeBackend::shutdown() {
     if (isShutdown_) return;
-    isShutdown_ = true;
-    auto comm = std::exchange(comm_, nullptr);
-    const auto result = comm ? mooncakePgCommDestroy(comm) : mooncakePgSuccess;
+    if (comm_) {
+        // A captured CUDA Graph may still reference the communicator. The C
+        // API leaves the handle valid on ResourceBusy, so do not discard it
+        // until destruction has actually succeeded.
+        checkResult(mooncakePgCommDestroy(comm_), "mooncakePgCommDestroy");
+        comm_ = nullptr;
+    }
     work_tracker_->shutdown();
-    checkResult(result, "mooncakePgCommDestroy");
+    isShutdown_ = true;
 }
 
 void MooncakeBackend::extendGroupSizeTo(int) {

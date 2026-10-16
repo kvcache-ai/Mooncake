@@ -109,6 +109,80 @@ TEST(TopologyPriorityMatrixTest, RejectsMalformedMatrixEntries) {
         topology.parsePriorityMatrix(R"({"cpu:0": [[1], ["mlx5_1"]]})").ok());
 }
 
+TEST(TopologyPriorityMatrixTest, AmdGpuLocationUsesHipPrefixAndRocmAlias) {
+    EXPECT_EQ(memTypeFromLocation("hip:0"), Topology::MEM_ROCM);
+    EXPECT_EQ(memTypeFromLocation("rocm:3"), Topology::MEM_ROCM);
+    EXPECT_EQ(makeAmdGpuLocation(2), "hip:2");
+    EXPECT_TRUE(isAmdGpuLocationType("hip"));
+    EXPECT_TRUE(isAmdGpuLocationType("rocm"));
+    EXPECT_FALSE(isAmdGpuLocationType("cuda"));
+    EXPECT_EQ(canonicalizeLocation("rocm:1"), "hip:1");
+    EXPECT_EQ(canonicalizeLocation("hip:1"), "hip:1");
+    EXPECT_EQ(canonicalizeLocation("cpu:0"), "cpu:0");
+
+    Topology topology;
+    ASSERT_TRUE(topology
+                    .parsePriorityMatrix(R"json({
+          "hip:0": [["mlx5_0"], ["mlx5_1"]],
+          "rocm:1": [["mlx5_1"], ["mlx5_0"]]
+        })json")
+                    .ok());
+
+    const auto* hip0 = topology.getMemEntry("hip:0");
+    ASSERT_NE(hip0, nullptr);
+    EXPECT_EQ(hip0->type, Topology::MEM_ROCM);
+
+    // The legacy "rocm:1" key is stored under its canonical name, and both
+    // the canonical and the legacy name resolve to the same entry.
+    const auto* rocm1 = topology.getMemEntry("rocm:1");
+    ASSERT_NE(rocm1, nullptr);
+    EXPECT_EQ(rocm1->name, "hip:1");
+    EXPECT_EQ(rocm1->type, Topology::MEM_ROCM);
+    EXPECT_EQ(topology.getMemEntry("hip:1"), rocm1);
+}
+
+// Regression test: a matrix configured with only the legacy "rocm:N" key
+// must be reachable via the canonical runtime name, so the configured NIC
+// priorities are not silently ignored by exact-name lookups.
+TEST(TopologyPriorityMatrixTest,
+     LegacyRocmMatrixKeyResolvesViaCanonicalHipName) {
+    Topology topology;
+    ASSERT_TRUE(topology
+                    .parsePriorityMatrix(R"json({
+          "rocm:0": [["mlx5_0"], ["mlx5_1"]]
+        })json")
+                    .ok());
+
+    // Stored under the canonical name only.
+    const auto* hip0 = topology.getMemEntry("hip:0");
+    ASSERT_NE(hip0, nullptr);
+    EXPECT_EQ(hip0->name, "hip:0");
+    EXPECT_EQ(hip0->type, Topology::MEM_ROCM);
+
+    // Exact-id lookups with the canonical name resolve to the entry and
+    // carry the configured per-GPU NIC priorities.
+    const auto mem_id = topology.getMemId("hip:0");
+    EXPECT_GE(mem_id, 0);
+    const auto* by_id = topology.getMemEntry(mem_id);
+    ASSERT_NE(by_id, nullptr);
+    ASSERT_EQ(by_id->device_list[0].size(), 1u);
+    EXPECT_EQ(topology.getNicName(by_id->device_list[0][0]), "mlx5_0");
+    ASSERT_EQ(by_id->device_list[1].size(), 1u);
+    EXPECT_EQ(topology.getNicName(by_id->device_list[1][0]), "mlx5_1");
+}
+
+TEST(TopologyPriorityMatrixTest, RejectsConflictingHipAndRocmKeys) {
+    Topology topology;
+    // "rocm:0" and "hip:0" refer to the same device; specifying both is a
+    // config error rather than a silent last-wins.
+    EXPECT_FALSE(topology
+                     .parsePriorityMatrix(R"json({
+          "hip:0": [["mlx5_0"], ["mlx5_1"]],
+          "rocm:0": [["mlx5_1"], ["mlx5_0"]]
+        })json")
+                     .ok());
+}
+
 TEST(TopologyPriorityMatrixTest, ParseCustomRoutesNativeFormat) {
     constexpr const char* kNative = R"json(
         {
