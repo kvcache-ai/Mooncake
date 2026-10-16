@@ -510,25 +510,36 @@ Status TransferEngineImpl::construct() {
 
     if (runtime_queue_config_.limits.deadline_aware &&
         runtime_queue_config_.limits.mlu_local_threshold > 0.0) {
-        auto rdma_xport =
-            transport_list_[static_cast<int>(TransportType::RDMA)];
-        if (rdma_xport) {
-            std::weak_ptr<Transport> weak_rdma = rdma_xport;
-            runtime_queue_->setDegradationPolicy(
-                [weak_rdma]() -> double {
-                    if (auto rdma = weak_rdma.lock()) {
-                        return rdma->getEstimatedBandwidth();
+        std::array<std::weak_ptr<Transport>, kSupportedTransportTypes>
+            bandwidth_providers;
+        bool has_bandwidth_provider = false;
+        for (auto type : {TransportType::RDMA, TransportType::UB}) {
+            auto& transport = transport_list_[static_cast<int>(type)];
+            if (transport) {
+                bandwidth_providers[static_cast<int>(type)] = transport;
+                has_bandwidth_provider = true;
+            }
+        }
+        if (has_bandwidth_provider) {
+            runtime_queue_->setTransportDegradationPolicy(
+                [bandwidth_providers](TransportType type) -> double {
+                    if (type < 0 || type >= kSupportedTransportTypes)
+                        return -1.0;
+                    if (auto transport =
+                            bandwidth_providers[static_cast<int>(type)]
+                                .lock()) {
+                        return transport->getEstimatedBandwidth();
                     }
                     return -1.0;
                 },
                 DegradationHooks{}, nullptr);
-            LOG(INFO) << "Admission queue degradation: live RDMA bw"
+            LOG(INFO) << "Admission queue degradation: live network bw"
                       << ", theta_local="
                       << runtime_queue_config_.limits.mlu_local_threshold;
         } else {
-            LOG(WARNING) << "Admission queue degradation requested but RDMA "
-                            "transport is "
-                            "unavailable";
+            LOG(WARNING)
+                << "Admission queue degradation requested but RDMA and UB "
+                   "transports are unavailable";
         }
     }
 
@@ -792,6 +803,8 @@ Status TransferEngineImpl::allocateLocalMemory(void** addr, size_t size,
             options.type = SHM;
         else if (transport_list_[RDMA])
             options.type = RDMA;
+        else if (transport_list_[UB])
+            options.type = UB;
         else if (transport_list_[FABRIC])
             options.type = FABRIC;
         else if (transport_list_[TCP])
@@ -803,6 +816,8 @@ Status TransferEngineImpl::allocateLocalMemory(void** addr, size_t size,
             options.type = MNNVL;
         else if (transport_list_[RDMA])
             options.type = RDMA;
+        else if (transport_list_[UB])
+            options.type = UB;
         else if (transport_list_[FABRIC])
             options.type = FABRIC;
         else if (transport_list_[TCP])
@@ -824,6 +839,8 @@ Status TransferEngineImpl::allocateLocalMemory(void** addr, size_t size,
             options.type = MNNVL;  // EGM: host memory NVLink peers can address
         else if (transport_list_[RDMA])
             options.type = RDMA;
+        else if (transport_list_[UB])
+            options.type = UB;
         else if (transport_list_[FABRIC])
             options.type = FABRIC;
         else if (transport_list_[TCP])
@@ -910,6 +927,7 @@ std::vector<TransportType> TransferEngineImpl::getSupportedTransports(
     // not advertise host-to-host capability, so host network order is intact.
     if (transport_list_[XPU]) result.push_back(XPU);
     if (transport_list_[RDMA]) result.push_back(RDMA);
+    if (transport_list_[UB]) result.push_back(UB);
     if (transport_list_[FABRIC]) result.push_back(FABRIC);
     if (transport_list_[SUNRISE_LINK]) result.push_back(SUNRISE_LINK);
     if (transport_list_[AscendDirect]) result.push_back(AscendDirect);
@@ -1009,12 +1027,34 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
                 options.type == HP_TCP ||
                 (options.type == UNSPEC && transports.size() == 1 &&
                  transports.front() == HP_TCP);
+            std::vector<TransportType> registered_transports;
+            Status first_error = Status::OK();
             for (auto type : transports) {
                 auto s = transport_list_[type]->addMemoryBuffer(descs, options);
                 if (!s.ok()) {
+                    // addMemoryBuffer implementations are required to be
+                    // transactional, but invoke remove on the failing
+                    // transport as defensive cleanup for a partially
+                    // constructed backend.
+                    for (auto& desc : descs) {
+                        auto cleanup =
+                            transport_list_[type]->removeMemoryBuffer(desc);
+                        if (!cleanup.ok()) LOG(WARNING) << cleanup.ToString();
+                    }
+                    if (first_error.ok()) first_error = s;
                     if (type == HP_TCP && hp_tcp_required) return s;
                     LOG(WARNING) << s.ToString();
+                    // Explicit transport registration is strict. UNSPEC keeps
+                    // the long-standing best-effort behavior across several
+                    // installed transports, but may not publish a buffer for
+                    // which every backend failed.
+                    if (options.type != UNSPEC) return s;
+                    continue;
                 }
+                registered_transports.push_back(type);
+            }
+            if (registered_transports.empty() && !first_error.ok()) {
+                return first_error;
             }
             // desc.transports lists the transports that actually registered
             // the buffer (each transport appends itself on success).
@@ -1972,8 +2012,9 @@ void TransferEngineImpl::findStagingPolicy(const Request& request,
     // local HBM<->host executor), mirroring how the CUDA cases gate on NVLINK.
     // An empty stage location means "no staging needed on that side".
     if (transport_list_[TPU] &&
-        (transport_list_[RDMA] || transport_list_[FABRIC] ||
-         transport_list_[TCP] || transport_list_[HP_TCP])) {
+        (transport_list_[RDMA] || transport_list_[UB] ||
+         transport_list_[FABRIC] || transport_list_[TCP] ||
+         transport_list_[HP_TCP])) {
         if (local_mtype == MTYPE_TPU && remote_mtype == MTYPE_TPU) {
             policy.clear();
             policy.push_back(server_addr);
@@ -2276,11 +2317,11 @@ Status TransferEngineImpl::commitPreparedSubmit(
 
         // SubBatch carries one policy per submit call. Requests using the
         // same transport may still resolve to different device masks or QP
-        // pools, so RDMA owners must be submitted in homogeneous groups.
-        // RdmaTransport copies these scalar fields into each RdmaTask before
-        // returning, so groups can safely share one SubBatch.
+        // pools, so RDMA and UB owners must be submitted in homogeneous
+        // groups. RdmaTransport copies these scalar fields into each RdmaTask
+        // before returning, so groups can safely share one SubBatch.
         std::vector<std::vector<size_t>> submit_groups;
-        if (type == RDMA) {
+        if (type == RDMA || type == UB) {
             std::map<std::pair<uint64_t, std::string>, size_t> group_by_policy;
             for (const auto task_id : physical_task_id_list[type]) {
                 const auto& task = batch->task_list[task_id];
@@ -2313,10 +2354,10 @@ Status TransferEngineImpl::commitPreparedSubmit(
                 ++next_sub_task_id;
             }
 
-            if (type == RDMA) {
+            if (type == RDMA || type == UB) {
                 const auto& first_task = batch->task_list[group.front()];
                 sub_batch->device_mask = first_task.device_mask;
-                sub_batch->qp_pool = first_task.qp_pool;
+                if (type == RDMA) sub_batch->qp_pool = first_task.qp_pool;
             }
 
             std::vector<Request> requests;
@@ -2402,8 +2443,15 @@ Status TransferEngineImpl::enqueuePreparedSubmit(Batch* batch,
         input.derived_task_ids = owner.derived_task_ids;
         input.request = owner.request;
         input.kind = owner_kind;
+        // The transport is snapshotted with the admission decision, so the
+        // degradation prediction reads the bandwidth of the transport selected
+        // here. A later transport failover does not revisit this owner: the
+        // prediction is a pre-dispatch heuristic, and re-scoring an admitted
+        // owner would let the drop decision change underneath it.
+        input.transport = owner.route.transport;
         input.degradation_eligible =
-            owner.route.transport == RDMA && !owner.staging;
+            (owner.route.transport == RDMA || owner.route.transport == UB) &&
+            !owner.staging;
         submit.owners.push_back(std::move(input));
     }
 
@@ -2602,9 +2650,9 @@ Status TransferEngineImpl::dispatchQueuedOwner(QueueOwnerId owner_id) {
     auto& transport = transport_list_[task.type];
     if (!transport) return finishQueuedOwner(owner_id, FAILED);
     auto& sub_batch = batch->sub_batch[task.type];
-    if (task.type == RDMA) {
+    if (task.type == RDMA || task.type == UB) {
         sub_batch->device_mask = task.device_mask;
-        sub_batch->qp_pool = task.qp_pool;
+        if (task.type == RDMA) sub_batch->qp_pool = task.qp_pool;
     }
     task.sub_task_id = sub_batch->size();
     startTransportAttempt(task, task.type, std::chrono::steady_clock::now());
