@@ -6,7 +6,7 @@ get_filename_component(MOONCAKE_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/../.."
                        ABSOLUTE)
 set(MOONCAKE_SOURCE
     "${MOONCAKE_SOURCE}"
-    CACHE PATH "W02 source checkout")
+    CACHE PATH "Mooncake source checkout")
 set(YLT_INCLUDE_DIR
     ""
     CACHE PATH "Repository-pinned yalantinglibs include directory")
@@ -27,9 +27,9 @@ find_library(
 set(STORE "${MOONCAKE_SOURCE}/mooncake-store")
 execute_process(
   COMMAND git -C "${MOONCAKE_SOURCE}" rev-parse HEAD
-  OUTPUT_VARIABLE W02_COMMIT
+  OUTPUT_VARIABLE SOURCE_COMMIT
   OUTPUT_STRIP_TRAILING_WHITESPACE COMMAND_ERROR_IS_FATAL ANY)
-file(SHA256 "${STORE}/src/ha/oplog/ordered_oplog_writer.cpp" W02_WRITER_SHA256)
+file(SHA256 "${STORE}/src/ha/oplog/ordered_oplog_writer.cpp" WRITER_SHA256)
 file(SHA256 "${NLOHMANN_JSON_INCLUDE_DIR}/nlohmann/json.hpp" JSON_HEADER_SHA256)
 configure_file(build_metadata.json.in build_metadata.json @ONLY)
 add_library(
@@ -63,7 +63,7 @@ add_library(
   replay_runtime STATIC
   ${STORE}/src/ha/oplog/oplog_applier.cpp
   ${STORE}/src/ha/standby_metadata_store.cpp ${STORE}/src/metadata_store.cpp
-  ${STORE}/src/ha_metric_manager.cpp)
+  ${STORE}/src/weight_metadata_store.cpp ${STORE}/src/ha_metric_manager.cpp)
 target_link_libraries(replay_runtime PUBLIC batch_codec_runtime)
 target_link_libraries(w02_runtime PUBLIC replay_runtime ${ETCD_WRAPPER_LIBRARY})
 add_library(candidate_codecs STATIC candidate_codecs.cpp payload_workloads.cpp)

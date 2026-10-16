@@ -1,6 +1,6 @@
 {
-  "w02_commit": "@W02_COMMIT@",
-  "w02_writer_sha256": "@W02_WRITER_SHA256@",
+  "source_commit": "@SOURCE_COMMIT@",
+  "writer_sha256": "@WRITER_SHA256@",
   "source_directory": "@MOONCAKE_SOURCE@",
   "build_type": "@CMAKE_BUILD_TYPE@",
   "compiler": "@CMAKE_CXX_COMPILER_ID@ @CMAKE_CXX_COMPILER_VERSION@",

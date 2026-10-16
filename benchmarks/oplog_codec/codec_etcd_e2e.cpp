@@ -167,7 +167,7 @@ void Run(Format format, const std::string& phase) {
         } release{gate};
         uint64_t last = 0;
         for (const auto& entry : expected.entries) last = Commit(writer, entry);
-        // Latest W02 API registers on the calling thread and returns pending;
+        // AwaitDurable registers on the calling thread and returns pending;
         // no std::async/thread-pool wrapper around AwaitDurable is used.
         auto pending = writer.AwaitDurable(last);
         Require(!pending.hasResult(), "future completed before storage");

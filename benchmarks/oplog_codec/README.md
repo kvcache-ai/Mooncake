@@ -1,10 +1,10 @@
-# P01 codec evidence on W02
+# P01 codec evidence on the asynchronous durable awaiter
 
-This standalone benchmark extends W02 PR #4141 at
-`e92af584fa106668c3e311b66e1592bd8922b42b` (asynchronous
-`async_simple::Future<ErrorCode>`), not its earlier blocking implementation.
-It implements the P01 experiment in roadmap #3808. No production source,
-writer selection, or persisted production format is changed.
+This standalone benchmark builds on `main`'s `OrderedOpLogWriter`: the
+asynchronous `async_simple::Future<ErrorCode>` durable awaiter from W02 (#4141)
+and the commit-group sealing added by #3806. It implements the P01 experiment
+in roadmap #3808. No production source, writer selection, or persisted
+production format is changed.
 
 ## Build
 
@@ -76,7 +76,7 @@ the temporary data directory is retained and recorded for inspection.
 
 ## Real-etcd E2E boundary
 
-The fixture uses the actual W02 writer, `OpLogBatchStorage`,
+The fixture uses the actual `OrderedOpLogWriter`, `OpLogBatchStorage`,
 `EtcdHaKvBackend`, and Go wrapper. A test-only backend bridge transcodes only
 the isolated `/oplog/p01-w02-{format}/batches/` values; durable prefixes and
 producer-view transactions remain production JSON/etcd operations.
@@ -84,8 +84,10 @@ producer-view transactions remain production JSON/etcd operations.
 For each format it gates the real transaction, registers a pending Future on
 the calling thread without spawning a blocking waiter, proves the prefix is
 not yet visible, then checks durable completion and a reentrant continuation.
-It reads the candidate bytes directly from etcd. After restarting etcd on the
-same data directory, fresh processes verify every persisted batch, a ready
+It commits entries individually (`Reserve`/`Commit`), so every batch boundary
+comes from the writer's ordinary sealing; `CommitBatch` group sealing is
+covered by the writer unit tests, not by this fixture. It reads the candidate
+bytes directly from etcd. After restarting etcd on the same data directory, fresh processes verify every persisted batch, a ready
 restored-prefix Future, stale-producer fencing without prefix/batch visibility,
 and corrupted-record rejection. Only the fixture's own bytes are fault-injected.
 Before and after restart, the complete decoded trace is replayed through the
@@ -104,5 +106,8 @@ E2E. A size/CPU gain here does not establish an end-to-end service improvement.
 
 ## Recorded evidence
 
-See the 2026-09-16 report (record retained locally) for both repeated
+See the 2026-10-16 report (record retained locally) for both repeated
 raw sample passes, summaries, build metadata, and the eight-case E2E report.
+It was measured on this branch rebased onto `main` at `5d77d344`; the build
+metadata records the exact source commit. The earlier 2026-09-16 report used
+the pre-merge W02 branch and is superseded.

@@ -1,4 +1,4 @@
-"""Isolated real-etcd correctness checks on the latest W02 asynchronous API."""
+"""Isolated real-etcd correctness checks on the asynchronous durable awaiter."""
 
 import argparse
 import json
