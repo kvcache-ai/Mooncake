@@ -64,10 +64,16 @@ namespace mooncake {
 // through 2.3, with HOMOGENEOUS_PEERS added eighth in 2.2.  A libfabric
 // predating it hits efa_rdm_ep_setopt()'s default case and returns
 // -FI_ENOPROTOOPT, which is exactly the "keep the handshake" path.
-#ifdef MC_HAVE_FI_EXT_H
-constexpr int kEfaOptHomogeneousPeers = FI_OPT_EFA_HOMOGENEOUS_PEERS;
-#else
+//
+// Having fi_ext.h is not enough: headers older than 2.2 ship it without the
+// enum value (the wheel CI builds against 1.18.3), so gate on the header
+// version too, and check the vendored value wherever the real one exists.
 constexpr int kEfaOptHomogeneousPeers = -(0xefa << 16) + 7;
+#if defined(MC_HAVE_FI_EXT_H) &&                                  \
+    FI_VERSION_GE(FI_VERSION(FI_MAJOR_VERSION, FI_MINOR_VERSION), \
+                  FI_VERSION(2, 2))
+static_assert(kEfaOptHomogeneousPeers == FI_OPT_EFA_HOMOGENEOUS_PEERS,
+              "vendored FI_OPT_EFA_HOMOGENEOUS_PEERS drifted from libfabric");
 #endif
 
 class EfaEndPoint;
