@@ -129,6 +129,70 @@ TEST(RailMonitorConfigTest, CustomJsonOverridesAutomaticPeerMapping) {
     EXPECT_FALSE(rail.isAvailable(/*local_nic=*/0, /*remote_nic=*/0));
 }
 
+TEST(RailMonitorConfigTest, AllocationMaskUsesConfiguredPairsAndTargetMemory) {
+    auto local = makeTwoNicTopology("local0", "local1");
+    auto remote = makeTwoNicTopology("remote0", "remote1");
+    RailMonitor rail;
+    ASSERT_TRUE(rail.load(local, remote, R"({"all":[
+        {"local":"local0","remote":"remote1"},
+        {"local":"local1","remote":"remote0"}]})")
+                    .ok());
+    Topology::MemEntry target;
+    target.device_list[1] = {1};
+    EXPECT_EQ(rail.localDeviceMask(target), 1ULL);
+    target.device_list[1] = {0};
+    EXPECT_EQ(rail.localDeviceMask(target), 2ULL);
+    target.device_list[0] = {1};
+    EXPECT_EQ(rail.localDeviceMask(target), 3ULL);
+    target.device_list[0] = {-1, 99};
+    target.device_list[1].clear();
+    EXPECT_EQ(rail.localDeviceMask(target), 0ULL);
+}
+
+TEST(RailMonitorConfigTest, AllocationMaskIsPeerSpecific) {
+    auto local = makeTwoNicTopology("local0", "local1");
+    const std::string config = R"({"all":[
+        {"local":"local0","remote":"peerA"},
+        {"local":"local1","remote":"peerB"}]})";
+    RailMonitor a, b;
+    auto peer_a = makeSingleNicTopology("peerA");
+    auto peer_b = makeSingleNicTopology("peerB");
+    ASSERT_TRUE(a.load(local, peer_a, config).ok());
+    ASSERT_TRUE(b.load(local, peer_b, config).ok());
+    EXPECT_EQ(a.localDeviceMask(*peer_a->getMemEntry(0)), 1ULL);
+    EXPECT_EQ(b.localDeviceMask(*peer_b->getMemEntry(0)), 2ULL);
+}
+
+TEST(RailMonitorConfigTest, AllocationMaskPreservesDefaultAndEmptyRails) {
+    auto local = makeTwoNicTopology("local0", "local1");
+    auto remote = makeSingleNicTopology("remote");
+    for (const auto& config : {std::string{}, std::string{"invalid-json"},
+                               std::string{R"({"all":[],"direct":[]})"}}) {
+        SCOPED_TRACE(config);
+        RailMonitor rail;
+        ASSERT_TRUE(rail.load(local, remote, config).ok());
+        EXPECT_EQ(rail.localDeviceMask(*remote->getMemEntry(0)),
+                  config.find("all") == std::string::npos ? 3ULL : 0ULL);
+    }
+}
+
+TEST(RailMonitorConfigTest, AllocationMaskDoesNotConsumeRecoveryProbe) {
+    auto local = makeSingleNicTopology("local");
+    auto remote = makeSingleNicTopology("remote");
+    Config config;
+    config.set(RailMonitor::kCfgErrorThreshold, 1);
+    config.set(RailMonitor::kCfgProbeIntervalSecs, 0);
+    RailMonitor rail;
+    ASSERT_TRUE(rail.load(local, remote, "", &config).ok());
+    rail.markFailed(0, 0);
+    ASSERT_FALSE(rail.isAvailable(0, 0));
+    for (int i = 0; i < 3; ++i)
+        EXPECT_EQ(rail.localDeviceMask(*remote->getMemEntry(0)), 1ULL);
+    EXPECT_TRUE(rail.admit(0, 0));
+    EXPECT_EQ(rail.localDeviceMask(*remote->getMemEntry(0)), 1ULL);
+    EXPECT_FALSE(rail.admit(0, 0));
+}
+
 // Build a 2-NIC topology (mlx5_a, mlx5_b) with per-NIC NUMA nodes, so the two
 // sides can disagree on which NUMA a same-named NIC sits in — the asymmetric
 // (overlay) situation from #2467.

@@ -40,7 +40,6 @@
 
 #include "config.h"
 #include "cuda_alike.h"
-#include "environ.h"
 #include "hip_device_guard.h"
 #if defined(USE_HIP_DMABUF)
 #include <sys/utsname.h>
@@ -50,6 +49,7 @@
 #include <hsa/hsa.h>
 #include <hsa/hsa_ext_amd.h>
 #endif
+#include "transport/rdma_transport/data_direct_topology.h"
 #include "transport/rdma_transport/endpoint_store.h"
 #include "transport/rdma_transport/rdma_gid_probe.h"
 #include "transport/rdma_transport/rdma_endpoint.h"
@@ -101,7 +101,7 @@ static Mlx5RegDmabufMr dataDirectRegMr() {
 
 bool containsAddress(const MemoryRegionMeta &region, uintptr_t addr) {
     const auto region_start = reinterpret_cast<uintptr_t>(region.addr);
-    const auto region_length = static_cast<uintptr_t>(region.mr->length);
+    const auto region_length = static_cast<uintptr_t>(region.length);
     return region_start <= addr && addr - region_start < region_length;
 }
 
@@ -452,6 +452,7 @@ int RdmaContext::deconstruct() {
     notify_endpoints_.clear();
 
     for (auto &[_, entry] : memory_region_map_) {
+        if (!entry.mr) continue;  // skipped on a non-paired Data Direct NIC
         int ret = ibv_dereg_mr(entry.mr);
         if (ret) {
             LOG(ERROR) << "Failed to unregister memory region: "
@@ -510,7 +511,7 @@ int RdmaContext::exportDmabuf(void *addr, size_t length, DmabufExport &out) {
     out = DmabufExport{};
     (void)addr;  // unused on the host-only (#else) build
     (void)length;
-    const bool data_direct = Environ::Get().GetRdmaDataDirect();
+    const bool data_direct = globalConfig().rdma_data_direct;
     if (data_direct) {
 #ifdef USE_CUDA
         if (!dataDirectRegMr()) return ERR_CONTEXT;
@@ -533,7 +534,7 @@ int RdmaContext::exportDmabuf(void *addr, size_t length, DmabufExport &out) {
         out.method = DmabufExport::Method::kHostReg;
 #if defined(USE_CUDA) || defined(USE_SUPA)
     } else if (memType == CU_MEMORYTYPE_DEVICE &&
-               Environ::Get().GetWithNvidiaPeermem() && !data_direct) {
+               globalConfig().with_nvidia_peermem && !data_direct) {
         // WITH_NVIDIA_PEERMEM env var is set: use ibv_reg_mr() directly for
         // GPU memory (requires the nvidia-peermem kernel module to be loaded).
         out.method = DmabufExport::Method::kHostReg;
@@ -550,6 +551,14 @@ int RdmaContext::exportDmabuf(void *addr, size_t length, DmabufExport &out) {
         cuDeviceGet(&cuDev, devOrd);
         cuDevicePrimaryCtxRetain(&cuCtx, cuDev);
         cuCtxSetCurrent(cuCtx);
+        // Remember which PCI root the GPU hangs off: Data Direct registration
+        // only works on NICs whose Data Direct function shares that root.
+        {
+            char pci_bus_id[32] = {0};
+            if (cuDeviceGetPCIBusId(pci_bus_id, sizeof(pci_bus_id), cuDev) ==
+                CUDA_SUCCESS)
+                out.pci_root = pciSysfsRoot(pci_bus_id);
+        }
 
         // Use cuMemGetAddressRange to get the true allocation base and
         // size — addr may sit at an offset within a larger cudaMalloc
@@ -763,6 +772,7 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
         return ERR_INVALID_ARGUMENT;
     }
     mrMeta.addr = addr;
+    mrMeta.length = length;
 #if defined(USE_MLU) || defined(USE_MACA) || defined(USE_CUDA) || \
     defined(USE_HIP_DMABUF) || defined(USE_SUPA)
     if (exp.method == DmabufExport::Method::kDmabufReg) {
@@ -771,11 +781,35 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
         // reference, so all NICs share one dma_buf object (and one BAR1
         // window).
 #ifdef USE_CUDA
-        if (Environ::Get().GetRdmaDataDirect()) {
+        // Under MC_RDMA_DATA_DIRECT_PAIRING a NIC that is not Data
+        // Direct-paired with the buffer's GPU cannot register this memory at
+        // all: the Data Direct call fails with ENOTSUPP, and so does a plain
+        // dma-buf registration of the shared export (it was made with the
+        // PCIe mapping flag). Record a region without an MR (keys read as 0,
+        // like a placeholder context); the paired topology never routes a
+        // transfer to such a NIC, and discovery already rejected any layout
+        // where the pairing cannot hold. Without the pairing flag the
+        // registration proceeds and fails loudly, as before this change.
+        if (globalConfig().rdma_data_direct &&
+            globalConfig().rdma_data_direct_pairing &&
+            !dataDirectPairedWith(exp)) {
+            mrMeta.mr = nullptr;
+            return 0;
+        }
+        if (globalConfig().rdma_data_direct) {
             auto reg_mr = dataDirectRegMr();
             if (!reg_mr) return ERR_CONTEXT;
-            mrMeta.mr = reg_mr(pd_, exp.offset, length, (uintptr_t)addr, exp.fd,
-                               access, MLX5DV_REG_DMABUF_ACCESS_DATA_DIRECT);
+            const size_t prefix = (uintptr_t)addr % getpagesize();
+            if (exp.offset < prefix ||
+                prefix > (size_t)globalConfig().max_mr_size - length) {
+                LOG(ERROR) << "Cannot align Data Direct memory region at "
+                           << addr << " length " << length << " dmabuf_offset "
+                           << exp.offset;
+                return ERR_INVALID_ARGUMENT;
+            }
+            mrMeta.mr = reg_mr(pd_, exp.offset - prefix, length + prefix,
+                               (uintptr_t)addr - prefix, exp.fd, access,
+                               MLX5DV_REG_DMABUF_ACCESS_DATA_DIRECT);
         } else
 #endif
         {
@@ -793,10 +827,35 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
         PLOG(ERROR) << "Failed to register memory " << addr << " length "
                     << length << " dmabuf_offset " << exp.offset << " on "
                     << device_name_ << " MC_RDMA_DATA_DIRECT="
-                    << Environ::Get().GetRdmaDataDirect();
+                    << globalConfig().rdma_data_direct;
         return ERR_CONTEXT;
     }
     return 0;
+}
+
+bool RdmaContext::dataDirectPairedWith(const DmabufExport &exp) {
+    std::call_once(data_direct_root_once_, [this]() {
+        data_direct_root_ = dataDirectSysfsRoot(context_);
+        if (data_direct_root_.empty()) {
+            LOG(INFO) << device_name_
+                      << ": no Data Direct function reported by libmlx5; "
+                         "assuming every GPU is reachable through Data Direct";
+        } else {
+            VLOG(1) << device_name_ << ": Data Direct function under "
+                    << data_direct_root_;
+        }
+    });
+    if (exp.pci_root.empty() || data_direct_root_.empty()) return true;
+    if (exp.pci_root == data_direct_root_) return true;
+    if (!data_direct_mismatch_logged_.exchange(true)) {
+        LOG(WARNING) << device_name_ << ": Data Direct function is under "
+                     << data_direct_root_ << " but the GPU memory is under "
+                     << exp.pci_root
+                     << "; not registering it on this NIC (its keys read as "
+                        "0). The topology keeps this NIC out of that GPU's "
+                        "HCA list.";
+    }
+    return false;
 }
 
 int RdmaContext::registerMemoryRegion(void *addr, size_t length, int access,
@@ -834,12 +893,17 @@ int RdmaContext::unregisterMemoryRegion(void *addr) {
     if (iter == memory_region_map_.end()) {
         return 0;
     }
+    if (!iter->second.mr) {  // skipped on a non-paired Data Direct NIC
+        memory_region_map_.erase(iter);
+        return 0;
+    }
     // Cache addr/length before ibv_dereg_mr: the MR is freed by dereg_mr, so
     // reading mr->length (or the cached region length) afterwards is a use-
     // after-free. We restore fork state on the same range to undo the
     // MADV_DONTFORK applied at register time (see issue #3639).
-    void *region_addr = iter->second.addr;
     size_t region_length = iter->second.mr->length;
+    void *region_addr = static_cast<char *>(iter->second.addr) -
+                        (region_length - iter->second.length);
     if (ibv_dereg_mr(iter->second.mr)) {
         LOG(ERROR) << "Failed to unregister memory " << addr;
         return ERR_CONTEXT;
@@ -869,6 +933,7 @@ int RdmaContext::preTouchMemory(void *addr, size_t length) {
     if (ret != 0) {
         return ret;
     }
+    if (!mrMeta.mr) return 0;  // skipped on a non-paired Data Direct NIC
     return ibv_dereg_mr(mrMeta.mr);
 }
 
@@ -877,7 +942,8 @@ uint32_t RdmaContext::rkey(void *addr) {
     if (!pd_) return 0;
     RWSpinlock::ReadGuard guard(memory_regions_lock_);
     auto iter = findMemoryRegionContaining(reinterpret_cast<uintptr_t>(addr));
-    if (iter != memory_region_map_.end()) return iter->second.mr->rkey;
+    if (iter != memory_region_map_.end())
+        return iter->second.mr ? iter->second.mr->rkey : 0;
 
     LOG(ERROR) << "Address " << addr << " rkey not found for " << deviceName();
     return 0;
@@ -887,7 +953,8 @@ uint32_t RdmaContext::lkey(void *addr) {
     if (!pd_) return 0;  // see rkey()
     RWSpinlock::ReadGuard guard(memory_regions_lock_);
     auto iter = findMemoryRegionContaining(reinterpret_cast<uintptr_t>(addr));
-    if (iter != memory_region_map_.end()) return iter->second.mr->lkey;
+    if (iter != memory_region_map_.end())
+        return iter->second.mr ? iter->second.mr->lkey : 0;
 
     LOG(ERROR) << "Address " << addr << " lkey not found for " << deviceName();
     return 0;
@@ -1525,7 +1592,7 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
         // not just GPUs listing it as preferred.  Runtime selection falls
         // back to avail_hca when a preferred NIC is disabled, so we must
         // validate both lists.
-        if (!Environ::Get().GetWithNvidiaPeermem()) {
+        if (!globalConfig().with_nvidia_peermem) {
             std::vector<int> mapped_gpu_devices;
             if (engine_.local_topology_) {
                 const auto topology_matrix =
@@ -1602,7 +1669,7 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
                     }
                 }
             }
-        }  // !Environ::Get().GetWithNvidiaPeermem()
+        }  // !globalConfig().with_nvidia_peermem
 #endif
 
         ibv_port_attr port_attr;
@@ -1621,6 +1688,19 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
         }
 
         updateGlobalConfig(device_attr);
+        max_qp_rd_atom_ = clampRdAtomicDepth(device_attr.max_qp_rd_atom);
+        max_qp_init_rd_atom_ =
+            clampRdAtomicDepth(device_attr.max_qp_init_rd_atom);
+        if (max_qp_rd_atom_ < kIdealRdAtomicDepth ||
+            max_qp_init_rd_atom_ < kIdealRdAtomicDepth) {
+            LOG(WARNING)
+                << "Device " << device_name
+                << " advertises a reduced RD-atomic depth: max_qp_rd_atom="
+                << max_qp_rd_atom_
+                << ", max_qp_init_rd_atom=" << max_qp_init_rd_atom_
+                << "; QPs on this NIC will use those "
+                << "values instead of the default " << kIdealRdAtomicDepth;
+        }
         GidNetworkState gid_state;
         auto_gid_selection_enabled_ = gid_index < 0;
         if (gid_index < 0) {

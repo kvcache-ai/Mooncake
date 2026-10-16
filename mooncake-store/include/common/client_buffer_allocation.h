@@ -65,4 +65,9 @@ void* allocate_buffer_numa_segments(size_t total_size,
                                     const std::vector<int>& numa_nodes,
                                     size_t page_size = 0);
 
+// Anonymous 2MB-aligned mapping advised for THP and interleaved across the
+// allowed NUMA nodes. total_size must be a multiple of 2MB. Free with
+// free_buffer_mmap_memory(ptr, total_size).
+void* allocate_buffer_thp_interleaved(size_t total_size);
+
 }  // namespace mooncake

@@ -368,8 +368,7 @@ TEST_F(MasterMetricsTest, SnapshotReaderTeardownKeepsCapacityIntact) {
     ASSERT_TRUE(snapshot.has_value());
 
     {
-        // Deserialize into a temporary reader (as
-        // CatalogBackedSnapshotProvider does). The reader's records never
+        // Deserialize into a temporary reader. The reader's records never
         // contributed to the capacity metrics, so destroying it must leave
         // the gauges untouched.
         SegmentManager reader(BufferAllocatorType::OFFSET);
@@ -628,6 +627,33 @@ TEST_F(MasterMetricsTest, ProjectStorageUsageRemovesAbsentSegmentLabels) {
     EXPECT_EQ(metrics.get_total_mem_capacity(), 0);
     EXPECT_EQ(metrics.get_allocated_nof_size(), 0);
     EXPECT_EQ(metrics.get_total_nof_capacity(), 0);
+}
+
+TEST_F(MasterMetricsTest, ProjectStorageUsageExposesDfsAllocatorGauges) {
+    auto& metrics = MasterMetricManager::instance();
+
+    TieredStorageUsageSnapshot snapshot;
+    snapshot.dfs.enabled = true;
+    snapshot.dfs.used_bytes = 12288;
+    snapshot.dfs.capacity_bytes = 65536;
+    snapshot.dfs.file_count = 4;
+    metrics.project_storage_usage(snapshot);
+
+    EXPECT_EQ(metrics.get_dfs_allocated_bytes(), 12288);
+    EXPECT_EQ(metrics.get_dfs_total_capacity(), 65536);
+    EXPECT_EQ(metrics.get_dfs_file_count(), 4);
+
+    const std::string serialized = metrics.serialize_metrics();
+    EXPECT_NE(serialized.find("master_dfs_allocated_bytes"), std::string::npos);
+    EXPECT_NE(serialized.find("master_dfs_total_capacity_bytes"),
+              std::string::npos);
+    EXPECT_NE(serialized.find("master_dfs_file_count"), std::string::npos);
+
+    // An empty snapshot (DFS disabled) resets the gauges to zero.
+    metrics.project_storage_usage({});
+    EXPECT_EQ(metrics.get_dfs_allocated_bytes(), 0);
+    EXPECT_EQ(metrics.get_dfs_total_capacity(), 0);
+    EXPECT_EQ(metrics.get_dfs_file_count(), 0);
 }
 
 TEST_F(MasterMetricsTest, AdminServerRoutesServiceEndpointsWhenAvailable) {

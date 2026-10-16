@@ -130,6 +130,18 @@ class TransferMetadata {
         // Copying a SegmentDesc copies this snapshot; a subsequent
         // push_back/erase must call rebuildBufferRangeIndex() again.
         BufferRangeIndex buffer_range_index;
+        // Derived from `name`/`rdma_server_name` + `devices`. Rebuild after
+        // every mutation of those fields, before the descriptor is published
+        // (addLocalSegment / decodeSegmentDesc). Not tied to
+        // rebuildBufferRangeIndex(); that snapshot depends only on `buffers`.
+        // Entries point into a process-lifetime intern pool (never erased;
+        // cardinality is historical peer endpoints × NICs). After publish,
+        // devices / name / rdma_server_name are frozen. internedNicPath()
+        // falls back to the intern pool without mutating this snapshot if
+        // interned_nic_paths.size() != devices.size().
+        std::vector<const std::string *> interned_nic_paths;
+        void rebuildInternedNicPaths();
+        const std::string &internedNicPath(size_t device_id) const;
         void rebuildBufferRangeIndex() { buffer_range_index.rebuild(buffers); }
         // this is for nvmeof.
         std::vector<NVMeoFBufferDesc> nvmeof_buffers;
@@ -266,6 +278,9 @@ class TransferMetadata {
     // ERR_ADDRESS_NOT_REGISTERED means no matching local entry was present.
     int removeLocalMemoryBuffer(void *addr, bool update_metadata);
 
+    // Rebuilds interned NIC paths on `desc` before insert. The caller must
+    // exclusively own `desc`; do not pass a live descriptor from the metadata
+    // map (copy first, as refreshLocalDeviceDesc does).
     int addLocalSegment(SegmentID segment_id, const std::string &segment_name,
                         std::shared_ptr<SegmentDesc> &&desc);
 
@@ -298,8 +313,14 @@ class TransferMetadata {
                    const NotifyDesc &local_desc, NotifyDesc &peer_desc);
     int sendProbe(const std::string &peer_server_name);
 
-    void dumpMetadataContent(const std::string &segment_name = "",
-                             uint64_t offset = 0, uint64_t length = 0);
+    // Record a failed peer buffer/device selection.  Runs on the transfer
+    // worker (CQ polling) thread, so the record is fixed-size and capped
+    // process-wide: one line per throttle window plus a suppressed-event
+    // count.  Uses the descriptor the caller already holds — the exact
+    // version the failed selection matched against — instead of
+    // re-looking-up the cache, and takes no metadata locks.
+    void dumpMetadataContent(const std::shared_ptr<const SegmentDesc> &desc,
+                             uint64_t offset, uint64_t length);
 
     void dumpMetadataContentUnlocked();
 

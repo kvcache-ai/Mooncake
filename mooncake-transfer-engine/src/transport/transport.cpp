@@ -49,6 +49,13 @@ Status Transport::freeBatchID(BatchID batch_id) {
                 "BatchID cannot be freed until all tasks are done");
         }
     }
+    // Terminal tasks may still have completion callbacks unwinding while
+    // holding a pin on this BatchDesc; wait for the pin count to drain.
+    if (batch_desc.active_completion_callbacks.load(
+            std::memory_order_acquire) != 0) {
+        return Status::BatchBusy(
+            "BatchID cannot be freed until completion callbacks are quiescent");
+    }
     delete &batch_desc;
 #ifdef CONFIG_USE_BATCH_DESC_SET
     RWSpinlock::WriteGuard guard(batch_desc_lock_);
