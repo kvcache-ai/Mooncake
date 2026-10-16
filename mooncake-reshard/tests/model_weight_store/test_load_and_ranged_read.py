@@ -148,6 +148,11 @@ class _ManifestOnlyReader:
         return self._store.get_into_ranges(*args)
 
     def __getattr__(self, name: str):
+        if name in {
+            "prepare_get_into_ranges_snapshot",
+            "get_into_ranges_from_snapshot",
+        }:
+            raise AttributeError(name)
         raise AssertionError(f"manifest restore accessed legacy Store API: {name}")
 
 
@@ -619,7 +624,7 @@ def test_load_rejects_worker_and_generation_rollover_instead_of_succeeding_noop(
 
 def test_load_chunks_large_ranges_to_bound_host_staging() -> None:
     """GPU range GET uses a host temporary per range, so each range is capped."""
-    store, weight_store = make_weight_store(max_range_bytes=2)
+    store, weight_store = make_weight_store(max_range_bytes=2, max_ranges_per_request=2)
     sources = source_manifests(dp=1, tp=1)
     upload_plan = weight_store.plan_upload(sources.placement, sources.bindings)
     manifest = weight_store.commit_upload(
@@ -632,6 +637,9 @@ def test_load_chunks_large_ranges_to_bound_host_staging() -> None:
 
     assert store.range_sizes == [2, 2, 2, 2]
     assert bytes(bound_fragments(targets)[0].owner) == bytes(range(8))
+    assert store.range_get_calls == 2
+    assert store.snapshot_prepare_calls == 1
+    assert store.snapshot_get_calls == 2
 
 
 def test_load_expands_strided_ranges_in_bounded_requests() -> None:

@@ -39,6 +39,16 @@ static_assert(static_cast<int>(TransportType::MPCOMM) == TRANSPORT_MPCOMM,
               "MPCOMM wire value must match the C API macro");
 static_assert(static_cast<int>(TransportType::HP_TCP) == TRANSPORT_HP_TCP,
               "HP_TCP wire value must match the C API macro");
+static_assert(static_cast<int>(TransportType::MLU) == TRANSPORT_MLU,
+              "MLU wire value must match the C API macro");
+static_assert(static_cast<int>(TransportType::XPU) == TRANSPORT_XPU,
+              "XPU wire value must match the C API macro");
+static_assert(static_cast<int>(TransportType::HYLINK) == TRANSPORT_HYLINK,
+              "HYLINK wire value must match the C API macro");
+static_assert(static_cast<int>(TransportType::FABRIC) == TRANSPORT_FABRIC,
+              "FABRIC wire value must match the C API macro");
+static_assert(static_cast<int>(TransportType::MEMFABRIC) == TRANSPORT_MEMFABRIC,
+              "MEMFABRIC wire value must match the C API macro");
 
 // =============================================================================
 // Custom Exception Hierarchy
@@ -97,6 +107,7 @@ static void ThrowStatus(const Status& s, const char* where) {
         case Status::Code::kMetadataError:
             throw MetadataError(full_msg);
         case Status::Code::kRpcServiceError:
+        case Status::Code::kRpcConnectionError:
             throw RpcServiceError(full_msg);
         case Status::Code::kNotImplemented:
             throw NotImplementedError(full_msg);
@@ -315,6 +326,11 @@ PYBIND11_MODULE(tent, m) {
         .value("UB", TransportType::UB)
         .value("MPCOMM", TransportType::MPCOMM)
         .value("HP_TCP", TransportType::HP_TCP)
+        .value("XPU", TransportType::XPU)
+        .value("MLU", TransportType::MLU)
+        .value("HYLINK", TransportType::HYLINK)
+        .value("FABRIC", TransportType::FABRIC)
+        .value("MEMFABRIC", TransportType::MEMFABRIC)
         .export_values();
 
     py::enum_<IntentType>(m, "IntentType")
@@ -421,7 +437,6 @@ PYBIND11_MODULE(tent, m) {
         .def("__exit__", [](MemoryGuard& self, py::args) {
             py::gil_scoped_release release;
             self.release();
-            return py::none();
         });
 
     py::class_<BatchGuard>(m, "BatchGuard")
@@ -433,7 +448,6 @@ PYBIND11_MODULE(tent, m) {
         .def("__exit__", [](BatchGuard& self, py::args) {
             py::gil_scoped_release release;
             self.release();
-            return py::none();
         });
 
     // -------------------------------------------------------------------------
@@ -562,7 +576,8 @@ PYBIND11_MODULE(tent, m) {
                 ThrowStatus(s, "allocate_memory_guard");
                 return std::make_unique<MemoryGuard>(&self, addr, size);
             },
-            py::arg("size"), py::arg("location") = kWildcardLocation)
+            py::arg("size"), py::arg("location") = kWildcardLocation,
+            py::keep_alive<0, 1>())
 
         .def(
             "allocate_memory_guard_ex",
@@ -574,7 +589,7 @@ PYBIND11_MODULE(tent, m) {
                 ThrowStatus(s, "allocate_memory_guard_ex");
                 return std::make_unique<MemoryGuard>(&self, addr, size);
             },
-            py::arg("size"), py::arg("options"))
+            py::arg("size"), py::arg("options"), py::keep_alive<0, 1>())
 
         // ---------------------------------------------------------------------
         // register/unregister single
@@ -679,7 +694,7 @@ PYBIND11_MODULE(tent, m) {
                 }
                 return std::make_unique<BatchGuard>(&self, batch_id);
             },
-            py::arg("batch_size"))
+            py::arg("batch_size"), py::keep_alive<0, 1>())
 
         // ---------------------------------------------------------------------
         // submitTransfer overloads

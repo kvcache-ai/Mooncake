@@ -2,6 +2,7 @@
 #include "storage_backend.h"
 
 #include <fcntl.h>
+#include <sys/file.h>
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/uio.h>
@@ -24,11 +25,10 @@
 #include <ylt/struct_pb.hpp>
 
 #include "mutex.h"
-#include "nvme_kv_backend.h"
+#include "nvme_kv/backend.h"
 #include "common/timestamp.h"
 #include "common/file_util.h"
 #include "crc32c.h"
-#include "environ.h"
 
 #include <ylt/util/tl/expected.hpp>
 
@@ -52,59 +52,17 @@ struct FdGuard {
 
 #include "storage/distributed/distributed_storage_backend.h"
 #include "storage/distributed/posix_fs_adapter.h"
+#ifdef HAVE_OSS_ADAPTER
+#include "storage/distributed/oss_adapter.h"
+#endif
+#ifdef HAVE_S3_ADAPTER
+#include "storage/distributed/s3_adapter.h"
+#endif
 #ifdef USE_3FS
 #include "storage/distributed/hf3fs_adapter.h"
 #endif
 
 namespace mooncake {
-
-bool BucketBackendConfig::Validate() const {
-    if (bucket_keys_limit <= 0) {
-        LOG(ERROR) << "BucketBackendConfig: bucket_keys_limit must > 0";
-        return false;
-    }
-    if (bucket_size_limit <= 0) {
-        LOG(ERROR) << "BucketBackendConfig: bucket_size_limit must > 0";
-        return false;
-    }
-    return true;
-}
-
-BucketBackendConfig BucketBackendConfig::FromEnvironment() {
-    BucketBackendConfig config;
-
-    config.bucket_keys_limit = Environ::GetInt64(
-        "MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", config.bucket_keys_limit);
-
-    config.bucket_size_limit = Environ::GetInt64(
-        "MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES", config.bucket_size_limit);
-
-    config.max_total_size =
-        Environ::GetInt64("MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE",
-                          Environ::GetInt64("MOONCAKE_BUCKET_MAX_TOTAL_SIZE",
-                                            config.max_total_size));
-
-    config.max_physical_bytes =
-        Environ::GetInt64("MOONCAKE_OFFLOAD_BUCKET_MAX_PHYSICAL_BYTES",
-                          config.max_physical_bytes);
-
-    config.disk_scan_cache_ms =
-        Environ::GetInt64("MOONCAKE_OFFLOAD_BUCKET_DISK_SCAN_CACHE_MS",
-                          config.disk_scan_cache_ms);
-
-    const auto policy_str = Environ::GetString(
-        "MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY",
-        Environ::GetString("MOONCAKE_BUCKET_EVICTION_POLICY", "fifo"));
-    if (policy_str == "fifo") {
-        config.eviction_policy = BucketEvictionPolicy::FIFO;
-    } else if (policy_str == "lru") {
-        config.eviction_policy = BucketEvictionPolicy::LRU;
-    } else {
-        config.eviction_policy = BucketEvictionPolicy::NONE;
-    }
-
-    return config;
-}
 
 std::string StorageBackend::GetActualFsdir() const {
     std::string actual_fsdir = fsdir_;
@@ -1518,7 +1476,10 @@ void StorageBackendAdaptor::RemoveAll() {
 BucketIdGenerator::BucketIdGenerator(int64_t start) {
     if (start <= 0) {
         auto cur_time_stamp = time_gen();
-        current_id_ = (cur_time_stamp << TIMESTAMP_SHIFT) | SEQUENCE_ID_SHIFT;
+        // Salt with pid so two clients starting in the same second do not
+        // share an identical id sequence (Mooncake #3528).
+        const int64_t salt = static_cast<int64_t>(::getpid()) & SEQUENCE_MASK;
+        current_id_ = (cur_time_stamp << TIMESTAMP_SHIFT) | salt;
     } else {
         current_id_ = start;
     }
@@ -1559,6 +1520,11 @@ BucketStorageBackend::~BucketStorageBackend() {
     // Clear file cache to release UringFile instances before destruction
     // This ensures orderly cleanup of io_uring resources
     ClearFileCache();
+    if (owner_lock_fd_ >= 0) {
+        ::flock(owner_lock_fd_, LOCK_UN);
+        ::close(owner_lock_fd_);
+        owner_lock_fd_ = -1;
+    }
 }
 
 tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
@@ -1634,6 +1600,10 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
     // Save a copy of bucket->keys before std::move(bucket) into buckets_
     // consumes the shared_ptr. Needed for complete_handler and rollback.
     const auto bucket_keys = bucket->keys;
+    // Keys/metadatas actually committed below (duplicates skipped). The
+    // complete handler and the rollback path must only see these.
+    std::vector<std::string> committed_keys;
+    std::vector<StorageObjectMetadata> committed_metadatas;
 
     // Commit to metadata maps under exclusive lock FIRST.
     // This ensures any concurrent BatchLoad arriving after Master redirects
@@ -1645,44 +1615,63 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
 
         ReleasePreparedWriteLocked(pending);
 
-        // Pre-check for duplicates before modifying any state
-        bool duplicate_found = false;
-        for (const auto& key : bucket_keys) {
-            if (object_bucket_map_.find(key) != object_bucket_map_.end()) {
-                duplicate_found = true;
-                break;
+        // Duplicate safety net under mutex_: skip keys that PrepareEviction
+        // flagged as already persisted or in flight, plus anything that got
+        // committed since (defense in depth). GroupOffloadingKeysByBucket
+        // filters persisted keys under offloading_mutex_, but a key can
+        // still be committed by a concurrent BatchOffload between that
+        // check and this one. Re-offloading an already persisted key is an
+        // idempotent no-op (same as Put), not an error.
+        const std::unordered_set<std::string> skipped_keys(
+            pending.skipped_keys.begin(), pending.skipped_keys.end());
+        std::vector<size_t> committed_indices;
+        for (size_t i = 0; i < bucket_keys.size(); ++i) {
+            if (skipped_keys.find(bucket_keys[i]) != skipped_keys.end() &&
+                object_bucket_map_.find(bucket_keys[i]) !=
+                    object_bucket_map_.end()) {
+                continue;  // Still persisted elsewhere: idempotent skip.
+            }
+            if (object_bucket_map_.find(bucket_keys[i]) ==
+                object_bucket_map_.end()) {
+                committed_indices.push_back(i);
+            } else {
+                VLOG(1) << "Key already committed by a concurrent offload, "
+                           "skipping: "
+                        << bucket_keys[i];
             }
         }
 
-        if (!duplicate_found) {
-            total_size_ += bucket->data_size + bucket->meta_size;
-            object_bucket_map_.reserve(object_bucket_map_.size() +
-                                       bucket_keys.size());
-            for (size_t i = 0; i < bucket_keys.size(); ++i) {
-                auto [it, inserted] =
-                    object_bucket_map_.insert({bucket_keys[i], metadatas[i]});
-                CHECK(inserted)
-                    << "Reserved key became duplicated: " << bucket_keys[i];
-            }
-            auto ts = 0LL;
-            // Update LRU timestamp for in case of eviction.
-            if (bucket_backend_config_.eviction_policy ==
-                BucketEvictionPolicy::LRU) {
-                ts =
-                    std::chrono::steady_clock::now().time_since_epoch().count();
-                bucket->last_access_ns_.store(ts, std::memory_order_relaxed);
-            }
-            buckets_.emplace(bucket_id, std::move(bucket));
-            lru_index_.emplace(ts, bucket_id);
-        }
-        if (duplicate_found) {
-            LOG(ERROR) << "Reserved key became duplicated before commit, "
-                          "bucket_id="
-                       << bucket_id;
+        if (committed_indices.empty()) {
+            // Every key was already persisted: nothing new to commit or
+            // notify, the written bucket file is redundant.
             lock.unlock();
             CleanupOrphanedBucket(bucket_id);
-            return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
+            return bucket_id;
         }
+
+        int64_t committed_data_size = bucket->meta_size;
+        object_bucket_map_.reserve(object_bucket_map_.size() +
+                                   committed_indices.size());
+        for (size_t i : committed_indices) {
+            auto [it, inserted] =
+                object_bucket_map_.insert({bucket_keys[i], metadatas[i]});
+            CHECK(inserted)
+                << "Reserved key became duplicated: " << bucket_keys[i];
+            committed_data_size +=
+                metadatas[i].data_size + metadatas[i].key_size;
+            committed_keys.push_back(bucket_keys[i]);
+            committed_metadatas.push_back(metadatas[i]);
+        }
+        total_size_ += committed_data_size;
+        auto ts = 0LL;
+        // Update LRU timestamp for in case of eviction.
+        if (bucket_backend_config_.eviction_policy ==
+            BucketEvictionPolicy::LRU) {
+            ts = std::chrono::steady_clock::now().time_since_epoch().count();
+            bucket->last_access_ns_.store(ts, std::memory_order_relaxed);
+        }
+        buckets_.emplace(bucket_id, std::move(bucket));
+        lru_index_.emplace(ts, bucket_id);
     }
     // Lock released. From this point forward, concurrent BatchLoad
     // can find the keys and read from the committed bucket files.
@@ -1692,17 +1681,17 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
     // complete_handler before the RPC); int64_t fields carry the metadata
     // from BuildBucket unchanged.
     if (complete_handler != nullptr) {
-        auto error_code = complete_handler(bucket_keys, metadatas);
+        auto error_code = complete_handler(committed_keys, committed_metadatas);
         if (error_code != ErrorCode::OK) {
             LOG(ERROR) << "Complete handler failed: " << error_code
-                       << ", Key count: " << bucket_keys.size()
+                       << ", Key count: " << committed_keys.size()
                        << ", Bucket id: " << bucket_id;
             // Master was NOT notified. The local index has entries that
             // Master doesn't know about — a "client can read but Master
             // doesn't know" ghost replica. Rollback the local commit
             // (removes index entries + waits for inflight reads + deletes
             // on-disk files).
-            RollbackCommittedBucket(bucket_id, bucket_keys);
+            RollbackCommittedBucket(bucket_id, committed_keys);
             return tl::make_unexpected(error_code);
         }
     }
@@ -1937,6 +1926,33 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
             LOG(ERROR) << "Storage backend already initialized";
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         }
+
+        // One live client per storage_path (standalone contract). Fail fast
+        // instead of silently colliding on bucket ids (#3528).
+        if (owner_lock_fd_ < 0) {
+            fs::create_directories(storage_path_);
+            const auto lock_path =
+                (fs::path(storage_path_) / ".mooncake_local_disk.lock")
+                    .string();
+            owner_lock_fd_ =
+                ::open(lock_path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0644);
+            if (owner_lock_fd_ < 0) {
+                LOG(ERROR) << "Failed to open storage_path lock: " << lock_path
+                           << ", errno=" << errno;
+                return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+            }
+            if (::flock(owner_lock_fd_, LOCK_EX | LOCK_NB) != 0) {
+                LOG(ERROR)
+                    << "storage_path already held by another live client: "
+                    << storage_path_
+                    << ". LOCAL_DISK requires one client per storage_path "
+                       "(use standalone store or per-client directories).";
+                ::close(owner_lock_fd_);
+                owner_lock_fd_ = -1;
+                return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+            }
+        }
+
         SharedMutexLocker lock(&mutex_);
         object_bucket_map_.clear();
         buckets_.clear();
@@ -2171,7 +2187,24 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
 tl::expected<bool, ErrorCode> BucketStorageBackend::IsExist(
     const std::string& key) {
     SharedMutexLocker lock(&mutex_, shared_lock);
-    return object_bucket_map_.find(key) != object_bucket_map_.end();
+    auto it = object_bucket_map_.find(key);
+    if (it == object_bucket_map_.end()) {
+        return false;
+    }
+    // The index alone cannot see an externally wiped bucket file: writes
+    // commit file-then-index, so an index hit with no file behind it means
+    // the backing data is gone and the answer must be false, not "present".
+    auto path = GetBucketDataPath(it->second.bucket_id);
+    if (!path) {
+        return tl::make_unexpected(path.error());
+    }
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const bool on_disk = fs::exists(*path, ec);
+    if (ec) {
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    return on_disk;
 }
 
 tl::expected<bool, ErrorCode> BucketStorageBackend::IsEnableOffloading() {
@@ -2793,16 +2826,27 @@ BucketStorageBackend::PrepareEviction(
     if (!write_keys.empty()) {
         for (const auto& key : write_keys) {
             if (object_bucket_map_.find(key) != object_bucket_map_.end() ||
-                pending_eviction_keys_.find(key) !=
-                    pending_eviction_keys_.end() ||
                 pending_write_keys_.find(key) != pending_write_keys_.end()) {
+                // Already persisted, or being persisted by a concurrent
+                // offload: re-offloading is an idempotent no-op (Put
+                // semantics), skip it instead of failing the whole batch.
+                result.skipped_keys.push_back(key);
+                continue;
+            }
+            if (pending_eviction_keys_.find(key) !=
+                pending_eviction_keys_.end()) {
+                // About to be evicted: the old copy is on its way out, so a
+                // skip could lose the only replica. Fail loudly here.
                 return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
             }
+            result.write_keys.push_back(key);
         }
-        result.write_keys = write_keys;
-        result.write_size = required_size;
-        pending_write_size_ += required_size;
-        pending_write_keys_.insert(write_keys.begin(), write_keys.end());
+        if (!result.write_keys.empty()) {
+            result.write_size = required_size;
+            pending_write_size_ += required_size;
+            pending_write_keys_.insert(result.write_keys.begin(),
+                                       result.write_keys.end());
+        }
     }
 
     if (bucket_backend_config_.eviction_policy == BucketEvictionPolicy::NONE) {
@@ -2830,7 +2874,7 @@ BucketStorageBackend::PrepareEviction(
             // Watermark eviction passes a synthetic required_size to drive
             // quota-based cleanup. It is not a real incoming write, so it
             // should not be counted as physical disk free-space demand.
-            uint64_t req_sz = (!write_keys.empty() && required_size > 0)
+            uint64_t req_sz = (!result.write_keys.empty() && required_size > 0)
                                   ? static_cast<uint64_t>(required_size)
                                   : 0;
             initial_disk_full = actual_available < req_sz + kMinFreeSpace;
@@ -2913,7 +2957,10 @@ BucketStorageBackend::PrepareEviction(
         buckets_.erase(evict_it);
 
         int64_t evicted_size = evict_meta->meta_size;
-        // Remove all keys belonging to this bucket from the object map.
+        // Remove all keys belonging to this bucket from the object map, and
+        // report ONLY those to the master: a key skipped as a duplicate at
+        // commit time keeps pointing at its authoritative bucket, so
+        // reporting it here would make the master drop a live replica.
         for (const auto& key : evict_meta->keys) {
             auto obj_it = object_bucket_map_.find(key);
             if (obj_it != object_bucket_map_.end() &&
@@ -2923,16 +2970,13 @@ BucketStorageBackend::PrepareEviction(
                 total_size_ -= object_size;
                 evicted_size += object_size;
                 object_bucket_map_.erase(obj_it);
+                pending_eviction_keys_.insert(key);
+                result.keys.push_back(key);
             }
         }
         total_size_ -= evict_meta->meta_size;
         result.evicted_size += evicted_size;
 
-        // Collect for notification and file deletion.
-        for (const auto& key : evict_meta->keys) {
-            pending_eviction_keys_.insert(key);
-            result.keys.push_back(key);
-        }
         accumulated_freed_space +=
             static_cast<uint64_t>(evict_meta->data_size) +
             static_cast<uint64_t>(evict_meta->meta_size);
@@ -2949,7 +2993,7 @@ BucketStorageBackend::PrepareEviction(
     // rather than overrun the disk quota and get OOM-evicted.
     const bool phys_exceeded = phys_over_cap(accumulated_freed_space);
     pending_eviction_size_ += result.evicted_size;
-    if (!write_keys.empty() && (quota_exceeded || phys_exceeded)) {
+    if (!result.write_keys.empty() && (quota_exceeded || phys_exceeded)) {
         RestorePreparedEvictionLocked(std::move(result));
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
@@ -2977,6 +3021,8 @@ void BucketStorageBackend::RestorePreparedEvictionLocked(
     for (const auto& key : pending.keys) {
         pending_eviction_keys_.erase(key);
     }
+    const std::unordered_set<std::string> restore_keys(pending.keys.begin(),
+                                                       pending.keys.end());
     for (auto& [bucket_id, bucket_meta] : pending.buckets) {
         if (!bucket_meta || buckets_.find(bucket_id) != buckets_.end()) {
             continue;
@@ -2984,6 +3030,11 @@ void BucketStorageBackend::RestorePreparedEvictionLocked(
 
         for (size_t i = 0; i < bucket_meta->keys.size(); ++i) {
             const auto& key = bucket_meta->keys[i];
+            if (restore_keys.find(key) == restore_keys.end()) {
+                // matched-only mirror of the prepare phase: skipped duplicates
+                // stay pointed at their authoritative bucket, never re-pointed
+                continue;
+            }
             const auto& object_meta = bucket_meta->metadatas[i];
             object_bucket_map_[key] = StorageObjectMetadata{
                 bucket_id, object_meta.offset, object_meta.key_size,
@@ -3407,7 +3458,14 @@ BucketStorageBackend::OpenFile(const std::string& path, FileMode mode) const {
             access_mode = O_RDONLY;
             break;
         case FileMode::Write:
-            access_mode = O_WRONLY | O_CREAT | O_TRUNC;
+            // New path: exclusive create so a colliding bucket id cannot
+            // silently O_TRUNC another client's file (#3528). Existing path:
+            // in-place rewrite (same client).
+            if (::access(path.c_str(), F_OK) == 0) {
+                access_mode = O_WRONLY | O_TRUNC;
+            } else {
+                access_mode = O_WRONLY | O_CREAT | O_EXCL;
+            }
             break;
     }
 
@@ -3507,6 +3565,8 @@ BucketStorageBackend::GetFileInstance() const {
 
     std::string temp_path =
         (fs::path(storage_path_) / "temp_for_registration").string();
+    std::error_code temp_ec;
+    fs::remove(temp_path, temp_ec);
 
     auto open_result = OpenFile(temp_path, FileMode::Write);
     if (!open_result) {
@@ -3601,6 +3661,22 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::Init() {
                        << capacity_ << ". Capacity must be > 0";
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
+
+#ifdef USE_URING
+        // O_DIRECT vector I/O rounds writes up to 4 KiB. An unaligned capacity
+        // can let an end-of-file write grow the data file past capacity_, after
+        // which recovery's exact size check rejects the file.
+        constexpr uint64_t kDirectIoAlignment = 4096;
+        if (file_storage_config_.use_uring &&
+            (capacity_ % kDirectIoAlignment) != 0) {
+            LOG(ERROR)
+                << "Invalid capacity for OffsetAllocatorStorageBackend with "
+                   "uring/O_DIRECT: "
+                << capacity_ << ". Capacity must be a multiple of "
+                << kDirectIoAlignment;
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+#endif
 
         // Ensure storage path exists
         {
@@ -3743,6 +3819,11 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::Init() {
 
         // Open/truncate data file in read-write mode
         int flags = O_CLOEXEC | O_RDWR | O_CREAT | O_TRUNC;
+#ifdef USE_URING
+        if (file_storage_config_.use_uring) {
+            flags |= O_DIRECT;
+        }
+#endif
         int raw_fd = open(data_file_path_.c_str(), flags, 0644);
         if (raw_fd < 0) {
             LOG(ERROR) << "Failed to open data file: " << data_file_path_;
@@ -4518,6 +4599,11 @@ OffsetAllocatorStorageBackend::TryRecoverFromMetadata() {
         // Open data file without truncation
         data_file_path_ = GetDataFilePath();
         int flags = O_CLOEXEC | O_RDWR;
+#ifdef USE_URING
+        if (file_storage_config_.use_uring) {
+            flags |= O_DIRECT;
+        }
+#endif
         int raw_fd = open(data_file_path_.c_str(), flags, 0644);
         if (raw_fd < 0) {
             const int open_errno = errno;
@@ -5466,8 +5552,13 @@ void OffsetAllocatorStorageBackend::RemoveAll() {
     // BatchLoad/BatchStore that pinned the old data_file_ keeps it alive until
     // its I/O completes — no use-after-free.
     if (!data_file_path_.empty()) {
-        int fd = open(data_file_path_.c_str(),
-                      O_CLOEXEC | O_RDWR | O_CREAT | O_TRUNC, 0644);
+        int flags = O_CLOEXEC | O_RDWR | O_CREAT | O_TRUNC;
+#ifdef USE_URING
+        if (file_storage_config_.use_uring) {
+            flags |= O_DIRECT;
+        }
+#endif
+        int fd = open(data_file_path_.c_str(), flags, 0644);
         if (fd >= 0) {
 #ifdef USE_URING
             if (file_storage_config_.use_uring) {
@@ -5534,20 +5625,40 @@ CreateStorageBackend(const FileStorageConfig& config) {
                 throw std::invalid_argument(
                     "Invalid DistributedStorage configuration");
             }
-            std::unique_ptr<FileSystemAdapter> adapter;
+            std::unique_ptr<FileSystemAdapter> fs_adapter;
+            std::unique_ptr<ObjectStorageAdapter> object_storage_adapter;
             if (distributed_config.fs_adapter_type == "posix") {
-                adapter = std::make_unique<PosixFsAdapter>();
+                fs_adapter = std::make_unique<PosixFsAdapter>();
             } else if (distributed_config.fs_adapter_type == "hf3fs") {
 #ifdef USE_3FS
-                adapter = std::make_unique<Hf3fsAdapter>();
+                fs_adapter = std::make_unique<Hf3fsAdapter>();
 #else
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+#endif
+            } else if (distributed_config.fs_adapter_type == "oss") {
+#ifdef HAVE_OSS_ADAPTER
+                object_storage_adapter =
+                    std::make_unique<OssObjectStorageAdapter>(
+                        distributed_config.fsdir);
+#else
+                LOG(ERROR) << "OSS adapter requires libcurl and OpenSSL";
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+#endif
+            } else if (distributed_config.fs_adapter_type == "s3") {
+#ifdef HAVE_S3_ADAPTER
+                object_storage_adapter =
+                    std::make_unique<S3ObjectStorageAdapter>(
+                        distributed_config.fsdir);
+#else
+                LOG(ERROR) << "S3 adapter requires libcurl and OpenSSL";
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
 #endif
             } else {
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             }
             return std::make_shared<DistributedStorageBackend>(
-                config, distributed_config, std::move(adapter));
+                config, distributed_config, std::move(fs_adapter),
+                std::move(object_storage_adapter));
         }
         default: {
             LOG(ERROR) << "Unsupported backend type: "

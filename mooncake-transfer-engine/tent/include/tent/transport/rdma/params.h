@@ -147,6 +147,45 @@ inline int selectQpInPool(const std::vector<QpPoolSegment>& segments,
     return candidate % total_qp;
 }
 
+// Attributes the notification QP takes on its INIT->RTR and RTR->RTS
+// transitions. The data QPs of the same endpoint read these from
+// EndPointParams (RdmaEndPoint::setupOneQP); the notify QP used to hard-code
+// the verbs tutorial values instead, so its retry budget could not be tuned
+// and a dead peer path nominally took 4.096us * 2^18 * 8 ~= 8.6 s to report
+// (about 15 s measured on ConnectX-7) while the data QPs nominally give up in
+// ~0.5 s (about 3.7 s measured). Kept free-standing (no verbs handles) so the
+// mapping can be unit-tested without a device.
+struct NotifyQpRtrAttrs {
+    ibv_mtu path_mtu;
+    uint8_t min_rnr_timer;
+    uint8_t max_dest_rd_atomic;
+};
+
+struct NotifyQpRtsAttrs {
+    uint8_t timeout;
+    uint8_t retry_cnt;
+    uint8_t rnr_retry;
+    uint8_t max_rd_atomic;
+};
+
+// The notify QP only carries SEND/RECV, so one outstanding RDMA read/atomic
+// is all it ever needs; that part stays at 1 regardless of the data-QP value.
+inline NotifyQpRtrAttrs buildNotifyQpRtrAttrs(const EndPointParams& params) {
+    return {params.path_mtu, params.min_rnr_timer, /*max_dest_rd_atomic=*/1};
+}
+
+// The notify QP is the endpoint's only SEND/RECV QP, so it is the only QP
+// that can see RNR NAKs: a burst larger than the receiver's posted RECV slots
+// (kNotifyMaxPendingSends) is ordinary flow control there, not a fault, and
+// must never exhaust a retry budget and retire the endpoint together with its
+// data QPs. rnr_retry therefore stays at 7 (infinite) regardless of
+// send_rnr_count; the RNR *timer* still follows params so a stalled receiver
+// is re-polled as quickly as the data QPs would be.
+inline NotifyQpRtsAttrs buildNotifyQpRtsAttrs(const EndPointParams& params) {
+    return {params.send_timeout, params.send_retry_count,
+            /*rnr_retry=*/7, /*max_rd_atomic=*/1};
+}
+
 struct WorkerParams {
     int num_workers = 6;  // Derived from RdmaParams::num_lanes.
     int max_retry_count = 8;

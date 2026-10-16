@@ -1192,6 +1192,11 @@ struct DfsEvictAction {};
 
 DfsEvictAction EvictDfs();
 
+// Drives one pass of the per-tenant quota watermark evictor.
+struct TenantEvictAction {};
+
+TenantEvictAction EvictTenants();
+
 struct WaitAction {
     std::chrono::milliseconds duration;
 };
@@ -1985,6 +1990,26 @@ struct BatchExistenceSpec {
 
 BatchExistenceSpec BatchExistence(std::initializer_list<std::string> keys);
 
+// Lease-free twin of BatchExistence: BatchProbeKey reports the same hits
+// without granting or extending read leases.
+struct BatchProbeSpec {
+    std::vector<std::string> keys;
+    std::string tenant{TenantId::Default().value()};
+    std::vector<bool> expected;
+
+    BatchProbeSpec& ForTenant(std::string value) {
+        tenant = std::move(value);
+        return *this;
+    }
+
+    BatchProbeSpec& Returns(std::initializer_list<bool> values) {
+        expected.assign(values.begin(), values.end());
+        return *this;
+    }
+};
+
+BatchProbeSpec BatchProbe(std::initializer_list<std::string> keys);
+
 struct BatchReplicaListsSpec {
     std::vector<std::string> keys;
     std::string tenant{TenantId::Default().value()};
@@ -2170,6 +2195,7 @@ class MasterScenario {
     MasterScenario& When(ExpireAtAction action);
     MasterScenario& When(MemoryEvictAction action);
     MasterScenario& When(DfsEvictAction action);
+    MasterScenario& When(TenantEvictAction action);
     MasterScenario& When(WaitAction action);
     MasterScenario& When(WaitForOpLogFailureAction action);
     MasterScenario& When(PingAction action);
@@ -2200,6 +2226,7 @@ class MasterScenario {
     MasterScenario& Then(ReadableObjectCountSpec objects);
     MasterScenario& Then(KeyExistsSpec key_exists);
     MasterScenario& Then(BatchExistenceSpec batch_existence);
+    MasterScenario& Then(BatchProbeSpec batch_probe);
     MasterScenario& Then(BatchReplicaListsSpec batch_replica_lists);
     MasterScenario& Then(NamedTaskSpec task);
     MasterScenario& Then(UnknownTaskSpec task);

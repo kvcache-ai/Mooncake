@@ -14,6 +14,7 @@ TEST(HpTcpTransportConfigTest, DefaultsToDisabled) {
     HpTcpTransportConfig parsed;
     ASSERT_TRUE(ParseHpTcpTransportConfig(config, &parsed).ok());
     EXPECT_FALSE(parsed.enabled);
+    EXPECT_EQ(parsed.params.idle_connection_timeout_ms, 60000U);
 }
 
 TEST(HpTcpTransportConfigTest, RejectsWrongLeafTypes) {
@@ -59,6 +60,30 @@ TEST(HpTcpTransportConfigTest, ParsesRailAddresses) {
     ASSERT_TRUE(ParseHpTcpTransportConfig(config, &parsed).ok());
     ASSERT_EQ(parsed.params.rail_addresses.size(), 2U);
     EXPECT_EQ(parsed.params.rail_addresses[1], "10.1.0.1");
+}
+
+TEST(HpTcpTransportConfigTest, ParsesIndependentIdleConnectionTimeout) {
+    Config config;
+    ASSERT_TRUE(
+        config
+            .load(
+                R"({"transports":{"tcp":{"enable":false},"hp_tcp":{"enable":true,"idle_connection_timeout_ms":1234}}})")
+            .ok());
+    HpTcpTransportConfig parsed;
+    ASSERT_TRUE(ParseHpTcpTransportConfig(config, &parsed).ok());
+    EXPECT_EQ(parsed.params.idle_connection_timeout_ms, 1234U);
+    EXPECT_EQ(parsed.params.progress_timeout_ms, 30000U);
+    for (const char* value : {"0", "-1", "1.5", "\"100\""}) {
+        ASSERT_TRUE(
+            config
+                .load(
+                    std::string(
+                        R"({"transports":{"tcp":{"enable":false},"hp_tcp":{"enable":true,"idle_connection_timeout_ms":)") +
+                    value + "}}}")
+                .ok());
+        EXPECT_TRUE(
+            ParseHpTcpTransportConfig(config, &parsed).IsInvalidArgument());
+    }
 }
 
 TEST(HpTcpTransportConfigTest, AcceptsFullWidthUnsignedLimit) {

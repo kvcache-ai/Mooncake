@@ -17,6 +17,7 @@
 
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include "tent/common/cuda_fabric_compat.h"
 
 #include <functional>
 #include <iostream>
@@ -58,6 +59,8 @@ struct MnnvlSubBatch : public Transport::SubBatch {
 };
 
 class MnnvlTransport : public Transport {
+    friend class MnnvlTransportTestPeer;
+
    public:
     MnnvlTransport();
 

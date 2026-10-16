@@ -30,6 +30,7 @@
 #include <thread>
 #include <unordered_map>
 #include <variant>
+#include <limits>
 
 #include "tent/runtime/metastore.h"
 #include "tent/runtime/segment.h"
@@ -47,7 +48,7 @@ struct BootstrapDesc {
     std::string peer_nic_path;
     std::vector<uint32_t> qp_num;
     // RDMA address of local_nic_path.
-    uint16_t local_lid = 0;
+    uint32_t local_lid = 0;
     std::string local_gid;
     std::string reply_msg;       // on error
     uint32_t notify_qp_num = 0;  // Notification QP number (0 = not supported)
@@ -121,6 +122,16 @@ struct XferDataDesc {
     uint64_t peer_mem_addr;
     size_t length;
 };
+
+// Standard TCP RPC payload boundaries. READ retains the server's 1 GiB cap;
+// WRITE uses a 32-bit RPC attachment that includes XferDataDesc.
+inline constexpr size_t kTcpMaxReadBytes = size_t{1} << 30;
+inline constexpr size_t kTcpMaxWriteBytes =
+    std::numeric_limits<uint32_t>::max() - sizeof(XferDataDesc);
+
+inline constexpr size_t tcpMaxTransferBytes(Request::OpCode opcode) {
+    return opcode == Request::READ ? kTcpMaxReadBytes : kTcpMaxWriteBytes;
+}
 
 using OnReceiveBootstrap =
     std::function<int(const BootstrapDesc& request, BootstrapDesc& response)>;

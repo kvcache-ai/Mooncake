@@ -379,6 +379,7 @@ static int g_transfer_count = 0;
 static int g_transfer_async_count = 0;
 static int g_register_mem_count = 0;
 static int g_deregister_mem_count = 0;
+static bool g_last_local_only = false;
 static std::string g_last_connect_target;
 static std::vector<std::string> g_connect_targets;
 static adxl::Status g_get_capability_result = adxl::SUCCESS;
@@ -408,6 +409,7 @@ void reset() {
     g_transfer_async_count = 0;
     g_register_mem_count = 0;
     g_deregister_mem_count = 0;
+    g_last_local_only = false;
     g_last_connect_target.clear();
     g_connect_targets.clear();
     g_get_capability_result = adxl::SUCCESS;
@@ -496,6 +498,11 @@ int get_disconnect_count() {
 int get_register_mem_count() {
     std::lock_guard<std::mutex> lock(g_mutex);
     return g_register_mem_count;
+}
+
+bool get_last_local_only() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    return g_last_local_only;
 }
 
 int get_deregister_mem_count() {
@@ -644,10 +651,10 @@ Status AdxlEngine::GetTransferStatus(const TransferReq& req,
 
 Status AdxlEngine::RegisterMem(const MemDesc& mem, MemType type,
                                MemHandle& mem_handle) {
-    (void)mem;
     (void)type;
     std::lock_guard<std::mutex> lock(g_mutex);
     g_register_mem_count++;
+    g_last_local_only = mem.local_only;
     if (g_register_mem_result != adxl::SUCCESS) {
         return g_register_mem_result;
     }
@@ -1287,6 +1294,22 @@ TEST_F(AscendDirectTransportTest, Memory_RegisterAndUnregister) {
                                              "cpu:0", true, true),
               0);
     EXPECT_EQ(transport->unregisterLocalMemory(test_buffer_src_, true), 0);
+}
+
+TEST_F(AscendDirectTransportTest, Memory_RegisterPassesLocalOnly) {
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+
+    // remote_accessible=false is local_only=true on the HIXL MemDesc.
+    ASSERT_EQ(transport->registerLocalMemory(test_buffer_src_, kRegisterMemSize,
+                                             "cpu:0", false, true),
+              0);
+    EXPECT_TRUE(adxl_mock::get_last_local_only());
+
+    ASSERT_EQ(transport->registerLocalMemory(test_buffer_dst_, kRegisterMemSize,
+                                             "cpu:0", true, true),
+              0);
+    EXPECT_FALSE(adxl_mock::get_last_local_only());
 }
 
 TEST_F(AscendDirectTransportTest, Memory_RegisterStampsBufferDeviceId) {
@@ -2292,9 +2315,23 @@ int32_t CurrentAclDevice() {
     return device_id;
 }
 
+int g_host_alloc_calls = 0;
+
+void* CountingHostAlloc(size_t size, size_t alignment, bool defer) {
+    (void)alignment;
+    (void)defer;
+    ++g_host_alloc_calls;
+    void* ptr = nullptr;
+    EXPECT_EQ(aclrtMallocHost(&ptr, size), ACL_ERROR_NONE);
+    return ptr;
+}
+
+void* NullHostAlloc(size_t, size_t, bool) { return nullptr; }
+
 struct AgentAllocEnv {
     explicit AgentAllocEnv(int device_count) {
         mock_acl::reset();
+        g_host_alloc_calls = 0;
         globalConfig().ascend_agent_mode = true;
         globalConfig().ascend_use_fabric_mem = false;
         mock_acl::set_device_count(device_count);
@@ -2338,6 +2375,73 @@ TEST(AgentModeAllocTest, ConsecutiveStoreAllocsRotateDevices) {
     ASSERT_NE(wrap, nullptr);
     EXPECT_EQ(CurrentAclDevice(), first);
     ascend_free_memory("ascend", wrap);
+}
+
+TEST(AgentModeAllocTest, HostAllocRotatesDevices) {
+    constexpr int kDeviceCount = 4;
+    constexpr size_t kAllocSize = 4096;
+    AgentAllocEnv env(kDeviceCount);
+
+    int first = -1;
+    for (int i = 0; i < kDeviceCount; ++i) {
+        size_t actual = 0;
+        void* ptr = ascend_allocate_memory_best_effort(
+            kAllocSize, "ascend", &actual, CountingHostAlloc, kAllocSize,
+            false);
+        ASSERT_NE(ptr, nullptr);
+        EXPECT_EQ(actual, kAllocSize);
+        if (i == 0) {
+            first = CurrentAclDevice();
+            ASSERT_GE(first, 0);
+            ASSERT_LT(first, kDeviceCount);
+        } else {
+            EXPECT_EQ(CurrentAclDevice(), (first + i) % kDeviceCount);
+        }
+        ascend_free_memory("ascend", ptr);
+    }
+    EXPECT_EQ(g_host_alloc_calls, kDeviceCount);
+}
+
+TEST(AgentModeAllocTest, FabricMemIgnoresHostAlloc) {
+    constexpr int kDeviceCount = 4;
+    constexpr size_t kGiB = 1024ULL * 1024 * 1024;
+    AgentAllocEnv env(kDeviceCount);
+    globalConfig().ascend_use_fabric_mem = true;
+    mock_acl::set_malloc_physical_max_success(0);
+
+    size_t actual = 0;
+    void* ptr = ascend_allocate_memory_best_effort(
+        kGiB, "ascend", &actual, CountingHostAlloc, kGiB, false);
+    ASSERT_NE(ptr, nullptr);
+    EXPECT_EQ(g_host_alloc_calls, 0) << "fabric_mem must not call host_alloc";
+    EXPECT_GT(actual, 0);
+    ascend_free_memory("ascend", ptr);
+}
+
+TEST(AgentModeAllocTest, FailedHostAllocDoesNotConsumeSlot) {
+    constexpr int kDeviceCount = 4;
+    constexpr size_t kAllocSize = 4096;
+    AgentAllocEnv env(kDeviceCount);
+
+    size_t actual = 0;
+    void* marker =
+        ascend_allocate_memory_best_effort(kAllocSize, "ascend", &actual);
+    ASSERT_NE(marker, nullptr);
+    const int d0 = CurrentAclDevice();
+    ascend_free_memory("ascend", marker);
+
+    actual = 0;
+    void* failed = ascend_allocate_memory_best_effort(
+        kAllocSize, "ascend", &actual, NullHostAlloc, kAllocSize, false);
+    EXPECT_EQ(failed, nullptr);
+    EXPECT_EQ(actual, 0);
+
+    actual = 0;
+    void* ok =
+        ascend_allocate_memory_best_effort(kAllocSize, "ascend", &actual);
+    ASSERT_NE(ok, nullptr);
+    EXPECT_EQ(CurrentAclDevice(), (d0 + 1) % kDeviceCount);
+    ascend_free_memory("ascend", ok);
 }
 
 TEST(AgentModeAllocTest, DirectVmmDoesNotRotateSequencer) {

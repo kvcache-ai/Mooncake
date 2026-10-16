@@ -22,6 +22,8 @@ namespace mooncake {
 class RpcServer;
 class RpcClient;
 class MooncakeCommunicator;
+class DeviceTransferService;
+class DeviceCollectiveWorkspace;
 
 // =========================================================================
 // Control Plane Architecture (Agent side)
@@ -50,7 +52,7 @@ class MooncakeCommunicator;
 //                              | runEffects()                   |
 //                              |  EnablePeerProbe -> LinkManager|
 //                              |  SendLinkEventReport -> RPC    |
-//                              | ApplyViewToCommunicator -> comm|
+//                              | Apply*ToCommunicator -> comm   |
 //                              |              ...               |
 //                              +--------------------------------+
 
@@ -75,6 +77,7 @@ class AgentInterface {
     virtual PGResult<GroupId> registerGroup(
         GroupBootstrapId group_bootstrap_id, int32_t max_group_size,
         std::vector<GlobalRank> rank_order,
+        std::optional<GpuCollectiveBackend> preferred_gpu_collective_backend,
         GroupBootstrapIdResolvePolicy resolve_policy, bool auto_deactivate,
         MooncakeCommunicator* communicator) = 0;
 
@@ -124,7 +127,10 @@ class AgentHost : public AgentInterface {
     static constexpr auto kHeartbeatInterval = std::chrono::seconds(1);
 
     AgentHost(std::string coordinator_addr, const std::string& host_ip,
-              GlobalRank rank, int max_world_size, LinkManager& link_manager,
+              GlobalRank rank, int max_world_size,
+              DeviceTransferService* device_transfer_service,
+              DeviceCollectiveWorkspace* device_collective_workspace,
+              LinkManager& link_manager,
               int64_t fault_reconciliation_window_us);
 
     ~AgentHost() override;
@@ -144,6 +150,7 @@ class AgentHost : public AgentInterface {
     PGResult<GroupId> registerGroup(
         GroupBootstrapId group_bootstrap_id, int32_t max_group_size,
         std::vector<GlobalRank> rank_order,
+        std::optional<GpuCollectiveBackend> preferred_gpu_collective_backend,
         GroupBootstrapIdResolvePolicy resolve_policy, bool auto_deactivate,
         MooncakeCommunicator* communicator) override;
     void detachCommunicator(GroupId group_id) override;
@@ -172,6 +179,8 @@ class AgentHost : public AgentInterface {
     AgentStateMachine agent_;
     SerializedExecutor executor_;
 
+    DeviceTransferService* device_transfer_service_ = nullptr;
+    DeviceCollectiveWorkspace* device_collective_workspace_ = nullptr;
     LinkManager& link_manager_;
 
     std::string host_ip_;

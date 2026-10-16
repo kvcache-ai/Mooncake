@@ -81,6 +81,15 @@ class FileStorage {
         return pinned_restore_arena_allocator_ != nullptr;
     }
 
+    // Allocate request-scoped staging from the fixed-capacity accelerator-
+    // pinned restore arena. The returned handle releases its sub-allocation
+    // back to the arena; FileStorage retains ownership of the backing memory.
+    [[nodiscard]] std::optional<BufferHandle> AllocatePinnedStagingBuffer(
+        size_t size) {
+        if (!pinned_restore_arena_allocator_) return std::nullopt;
+        return pinned_restore_arena_allocator_->allocate(size);
+    }
+
     /**
      * @brief Reports whether the backend still holds an entry for the key.
      *

@@ -20,6 +20,15 @@
 
 namespace mooncake {
 
+enum class ProbeLeaseMode : uint8_t { None = 0, LastHitOnly = 1 };
+
+// Candidates are consecutive groups of candidate_size keys in caller order.
+// None preserves the lease-free existence probe and ignores candidate_size.
+struct GrantLeasePolicy {
+    ProbeLeaseMode lease_mode{ProbeLeaseMode::None};
+    uint64_t candidate_size{1};
+};
+
 // Constants
 static constexpr uint64_t WRONG_VERSION = 0;
 static constexpr uint64_t DEFAULT_VALUE = UINT64_MAX;
@@ -90,6 +99,12 @@ static constexpr uint64_t DEFAULT_MAX_KV_SOFT_PIN_TTL_MS =
 static constexpr bool DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS = true;
 static constexpr double DEFAULT_EVICTION_RATIO = 0.05;
 static constexpr double DEFAULT_EVICTION_HIGH_WATERMARK_RATIO = 0.90;
+// Per-tenant eviction watermark, as a fraction of a tenant's own effective
+// quota. Mirrors the pool-wide default above so that a tenant gets the same
+// evict-to-make-room contract the pool has; 0.0 disables the pass and restores
+// the pre-existing behaviour, where only the pool-wide watermark can trigger
+// background eviction. Inert unless enable_multi_tenants is set.
+static constexpr double DEFAULT_TENANT_EVICTION_HIGH_WATERMARK_RATIO = 0.90;
 static constexpr double DEFAULT_NOF_EVICTION_RATIO = 0.05;
 static constexpr double DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO = 0.90;
 static constexpr int64_t DEFAULT_MASTER_VIEW_LEASE_TTL_SEC = 5;  // in seconds
@@ -118,6 +133,9 @@ constexpr const char* PUT_NO_SPACE_HELPER_STR =  // A helpful string
     " due to insufficient space. Consider lowering "
     "eviction_high_watermark_ratio or mounting more segments.";
 static constexpr uint64_t DEFAULT_PUT_START_DISCARD_TIMEOUT = 30;  // 30 seconds
+// How long RestoreFromStandbySnapshot waits for conflict-repair records to
+// become durable. 0 waits on the writer's durability future with no cap.
+static constexpr uint64_t DEFAULT_RESTORE_REPAIR_DURABLE_TIMEOUT_MS = 10000;
 static constexpr uint64_t DEFAULT_PUT_START_RELEASE_TIMEOUT =
     600;  // 10 minutes
 
@@ -212,10 +230,15 @@ constexpr const char* CONFIG_KEY_PROTOCOL = "protocol";
 constexpr const char* CONFIG_KEY_RDMA_DEVICES = "rdma_devices";
 constexpr const char* CONFIG_KEY_MASTER_SERVER_ADDR = "master_server_addr";
 constexpr const char* CONFIG_KEY_IPC_SOCKET_PATH = "ipc_socket_path";
+constexpr const char* CONFIG_KEY_ENABLE_EGM_STORE_POOL =
+    "enable_egm_store_pool";
+constexpr const char* CONFIG_KEY_EGM_NUMA_NODES = "egm_numa_nodes";
 constexpr const char* CONFIG_KEY_TENANT_ID = "tenant_id";
 constexpr const char* CONFIG_KEY_ENABLE_CLIENT_HTTP_SERVER =
     "enable_client_http_server";
 constexpr const char* CONFIG_KEY_CLIENT_HTTP_PORT = "client_http_port";
+constexpr const char* CONFIG_KEY_ENABLE_EMBEDDED_MASTER =
+    "enable_embedded_master";
 
 // Store client configuration defaults
 static constexpr size_t DEFAULT_GLOBAL_SEGMENT_SIZE = 1024 * 1024 * 16;  // 16MB

@@ -16,8 +16,12 @@
 
 #include "te_backend.h"
 #include "utils.h"
+#include "split_output.h"
 #include "common.h"
 #include "char_util.h"
+
+#include <linux/mman.h>
+#include <sys/mman.h>
 
 #if defined(USE_CUDA)
 #include <bits/stdint-uintn.h>
@@ -77,6 +81,16 @@ static inline int getSunriseDeviceNumaID(int dev_id) {
 #else
 static inline int getCudaDeviceNumaID(int cuda_id) { return 0; }
 #endif
+
+// freeBatchID() returns BatchCleanupDeferred when a completion callback is
+// still unwinding (#4569). The handle is already released and the engine
+// finishes the cleanup, so for a finished batch this is success.
+static mooncake::Status releaseFinishedBatch(mooncake::TransferEngine& engine,
+                                             BatchID batch_id) {
+    mooncake::Status status = engine.freeBatchID(batch_id);
+    if (status.IsBatchCleanupDeferred()) return mooncake::Status::OK();
+    return status;
+}
 
 volatile bool g_te_running = true;
 volatile bool g_te_triggered_sig = false;
@@ -173,6 +187,57 @@ static std::string cpuLocationFromPages(void* addr, int expected_node) {
     return entries[0].location;
 }
 
+#ifndef MAP_HUGE_2MB
+#define MAP_HUGE_2MB (21 << 26)
+#endif
+#ifndef MAP_HUGE_1GB
+#define MAP_HUGE_1GB (30 << 26)
+#endif
+#ifndef MAP_HUGE_512MB
+#define MAP_HUGE_512MB (29 << 26)
+#endif
+
+static size_t hugepageBytes() {
+    return XferBenchConfig::hugepage_size == 0
+               ? mooncake::SharedMemoryOptions::kHugepage2MB
+               : XferBenchConfig::hugepage_size;
+}
+
+static int hugepageMmapFlags(size_t hp) {
+    int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_POPULATE;
+    if (hp == mooncake::SharedMemoryOptions::kHugepage2MB)
+        flags |= MAP_HUGE_2MB;
+    else if (hp == mooncake::SharedMemoryOptions::kHugepage512MB)
+        flags |= MAP_HUGE_512MB;
+    else if (hp == mooncake::SharedMemoryOptions::kHugepage1GB)
+        flags |= MAP_HUGE_1GB;
+    return flags;
+}
+
+static void* allocateHugepageOnNode(size_t size, int node) {
+    const size_t hp = hugepageBytes();
+    if (hp == 0 || size % hp != 0) {
+        LOG(ERROR) << "RDMA hugepage buffer " << size
+                   << " is not a multiple of hugepage size " << hp;
+        return nullptr;
+    }
+    void* buf = mmap(nullptr, size, PROT_READ | PROT_WRITE,
+                     hugepageMmapFlags(hp), -1, 0);
+    if (buf == MAP_FAILED) {
+        PLOG(ERROR) << "MAP_HUGETLB mmap failed for " << size
+                    << " bytes (hp=" << hp
+                    << "); refusing 4K fallback to avoid blowing NIC PTEs";
+        return nullptr;
+    }
+    if (numa_available() >= 0 && node >= 0) {
+        numa_tonode_memory(buf, size, node);
+    }
+    auto* p = static_cast<char*>(buf);
+    for (size_t off = 0; off < size; off += hp) p[off] = 0;
+    if (size > 0) p[size - 1] = 0;
+    return buf;
+}
+
 static void freeMemoryPool(void* addr, size_t size) {
 #if defined(USE_CUDA) && defined(USE_MNNVL)
     CUmemGenericAllocationHandle handle;
@@ -206,15 +271,29 @@ int TEBenchRunner::allocateBuffers() {
         int num_buffers = numa_num_configured_nodes();
         pinned_buffer_list_.resize(num_buffers, nullptr);
         shm_backed_.assign(num_buffers, 0);
+        hugepage_backed_.assign(num_buffers, 0);
         for (int i = 0; i < num_buffers; ++i) {
             std::string location = "cpu:" + std::to_string(i);
             if (use_shm) {
+                mooncake::SharedMemoryOptions opt;
+                if (XferBenchConfig::use_hugepage) {
+                    opt.use_hugepage = true;
+                    opt.hugepage_size = XferBenchConfig::hugepage_size;
+                    opt.hugetlbfs_path = XferBenchConfig::hugetlbfs_path;
+                }
                 pinned_buffer_list_[i] =
-                    engine_->allocateSharedMemory(total_buffer_size);
+                    engine_->allocateSharedMemory(total_buffer_size, opt);
                 shm_backed_[i] = 1;
                 if (pinned_buffer_list_[i]) {
                     bindShmBufferToNode(pinned_buffer_list_[i],
                                         total_buffer_size, i);
+                    location = cpuLocationFromPages(pinned_buffer_list_[i], i);
+                }
+            } else if (XferBenchConfig::use_hugepage) {
+                pinned_buffer_list_[i] =
+                    allocateHugepageOnNode(total_buffer_size, i);
+                hugepage_backed_[i] = 1;
+                if (pinned_buffer_list_[i]) {
                     location = cpuLocationFromPages(pinned_buffer_list_[i], i);
                 }
             } else {
@@ -229,8 +308,14 @@ int TEBenchRunner::allocateBuffers() {
             }
         }
         if (use_shm) {
-            LOG(INFO) << "tebench: DRAM buffers allocated from POSIX shm "
-                         "and bound to NUMA nodes";
+            LOG(INFO) << "tebench: DRAM buffers allocated from "
+                      << (XferBenchConfig::use_hugepage ? "hugetlbfs"
+                                                        : "POSIX shm")
+                      << " and bound to NUMA nodes";
+        } else if (XferBenchConfig::use_hugepage) {
+            LOG(INFO) << "tebench: DRAM buffers allocated with MAP_HUGETLB "
+                         "hugepages (hp="
+                      << hugepageBytes() << ") for RDMA MR registration";
         }
 #if defined(USE_CUDA) || defined(USE_SUNRISE)
     } else if (XferBenchConfig::seg_type == "VRAM") {
@@ -262,6 +347,18 @@ int TEBenchRunner::allocateBuffers() {
 }
 
 int TEBenchRunner::freeBuffers() {
+    const uint64_t abandoned = abandoned_batches_.load();
+    if (abandoned != 0) {
+        // A transport may still copy into these buffers; the process is
+        // exiting, so leaving them allocated costs nothing.
+        LOG(WARNING) << abandoned
+                     << " transfer batch(es) were still in flight when the "
+                        "run stopped; leaving the local buffers allocated";
+        pinned_buffer_list_.clear();
+        shm_backed_.clear();
+        hugepage_backed_.clear();
+        return 0;
+    }
     auto total_buffer_size = XferBenchConfig::total_buffer_size;
     for (size_t i = 0; i < pinned_buffer_list_.size(); ++i) {
         if (!pinned_buffer_list_[i]) continue;
@@ -269,11 +366,18 @@ int TEBenchRunner::freeBuffers() {
             engine_->freeSharedMemory(pinned_buffer_list_[i]);
         } else {
             engine_->unregisterLocalMemory(pinned_buffer_list_[i]);
-            freeMemoryPool(pinned_buffer_list_[i], total_buffer_size);
+            if (i < hugepage_backed_.size() && hugepage_backed_[i]) {
+                if (munmap(pinned_buffer_list_[i], total_buffer_size) != 0) {
+                    PLOG(WARNING) << "munmap hugepage buffer failed";
+                }
+            } else {
+                freeMemoryPool(pinned_buffer_list_[i], total_buffer_size);
+            }
         }
     }
     pinned_buffer_list_.clear();
     shm_backed_.clear();
+    hugepage_backed_.clear();
     return 0;
 }
 
@@ -283,7 +387,8 @@ TEBenchRunner::TEBenchRunner() {
     // Disable auto-discovery when an explicit non-RDMA xport is requested
     // (e.g. flagcx, shm) so we can installTransport() ourselves below.
     bool auto_disc = XferBenchConfig::xport_type != "flagcx" &&
-                     XferBenchConfig::xport_type != "shm";
+                     XferBenchConfig::xport_type != "shm" &&
+                     XferBenchConfig::xport_type != "efa";
     engine_ = std::make_unique<mooncake::TransferEngine>(auto_disc);
     auto conn_str = XferBenchConfig::metadata_type == "p2p"
                         ? "P2PHANDSHAKE"
@@ -313,6 +418,13 @@ TEBenchRunner::TEBenchRunner() {
             LOG_ASSERT(shm) << "installTransport(shm) failed";
         }
         LOG(INFO) << "tebench: SHM transport installed";
+    }
+    if (XferBenchConfig::xport_type == "efa") {
+        // Discover manually: auto-discovery would install RDMA instead.
+        engine_->getLocalTopology()->discover({});
+        auto* xp = engine_->installTransport("efa", nullptr);
+        LOG_ASSERT(xp) << "installTransport(efa) failed";
+        LOG(INFO) << "tebench: EFA transport installed";
     }
     init_ok_ = (allocateBuffers() == 0);
     if (!init_ok_) {
@@ -458,6 +570,46 @@ int TEBenchRunner::runInitiatorTasks(
     return g_te_running ? 0 : -1;
 }
 
+void TEBenchRunner::noteTransferFailed() {
+    std::lock_guard<std::mutex> lk(mtx_);
+    g_te_running = false;
+    cv_task_.notify_all();
+    cv_done_.notify_all();
+}
+
+// How long a stopped run keeps waiting for a batch already handed to the
+// transports before abandoning it. A second SIGINT still exits immediately.
+static constexpr uint64_t kStopDrainTimeoutUs = 5ull * 1000 * 1000;
+
+mooncake::Status TEBenchRunner::waitForBatch(BatchID batch_id,
+                                             mooncake::TransferStatus& status,
+                                             uint64_t& polls) {
+    bool stop_seen = false;
+    XferBenchTimer since_stop;
+    while (true) {
+        auto polled = engine_->getBatchTransferStatus(batch_id, status);
+        ++polls;
+        if (!polled.ok()) {
+            // The batch state is unknown, so treat it as still in flight.
+            abandoned_batches_.fetch_add(1);
+            return polled;
+        }
+        if (status.s != TransferStatusEnum::WAITING &&
+            status.s != TransferStatusEnum::PENDING) {
+            return mooncake::Status::OK();
+        }
+        if (g_te_running) continue;
+        if (!stop_seen) {
+            stop_seen = true;
+            since_stop.reset();
+        } else if (since_stop.lap_us(false) > kStopDrainTimeoutUs) {
+            abandoned_batches_.fetch_add(1);
+            status.s = TransferStatusEnum::PENDING;
+            return mooncake::Status::OK();
+        }
+    }
+}
+
 double TEBenchRunner::runSingleTransfer(uint64_t local_addr, uint64_t target_id,
                                         uint64_t target_addr,
                                         uint64_t block_size,
@@ -466,6 +618,7 @@ double TEBenchRunner::runSingleTransfer(uint64_t local_addr, uint64_t target_id,
                                         IntentType intent_type) {
     (void)deadline_ns;
     (void)intent_type;
+    if (!g_te_running) return -1.0;
     auto batch_id = engine_->allocateBatchID(batch_size);
     std::vector<TransferRequest> requests;
     for (uint64_t i = 0; i < batch_size; ++i) {
@@ -478,25 +631,49 @@ double TEBenchRunner::runSingleTransfer(uint64_t local_addr, uint64_t target_id,
         entry.target_offset = target_addr + block_size * i;
         requests.emplace_back(entry);
     }
-    XferBenchTimer timer;
-    CHECK_FAIL(engine_->submitTransfer(batch_id, requests));
-    while (true) {
-        uint64_t success_count = 0;
-        for (uint64_t i = 0; i < batch_size; ++i) {
-            mooncake::TransferStatus overall_status;
-            CHECK_FAIL(engine_->getTransferStatus(batch_id, i, overall_status));
-            if (overall_status.s == TransferStatusEnum::COMPLETED) {
-                success_count++;
-            } else if (overall_status.s == TransferStatusEnum::FAILED) {
-                LOG(ERROR) << "Failed transfer detected";
-                exit(EXIT_FAILURE);
-            }
+    // A deferred free means transport work may still own the buffers (see
+    // TransferEngine::freeBatchID), e.g. a TIMEOUT task whose slices are
+    // still waiting. Keep freeBuffers() from releasing them at exit.
+    auto releaseUnfinishedBatch = [&] {
+        if (engine_->freeBatchID(batch_id).IsBatchCleanupDeferred()) {
+            abandoned_batches_.fetch_add(1);
         }
-        if (success_count == batch_size) break;
+    };
+    auto fail = [&](const char* what, const mooncake::Status& status) {
+        LOG(ERROR) << what << ": " << status.ToString();
+        noteTransferFailed();
+        return -1.0;
+    };
+
+    XferBenchTimer timer;
+    auto submitted = engine_->submitTransfer(batch_id, requests);
+    if (!submitted.ok()) {
+        releaseUnfinishedBatch();
+        return fail("Failed to submit transfer", submitted);
     }
-    auto duration = timer.lap_us();
-    CHECK_FAIL(engine_->freeBatchID(batch_id));
-    return duration;
+    const uint64_t submit_us = timer.lap_us(false);
+    uint64_t polls = 0;
+    mooncake::TransferStatus overall_status;
+    auto polled = waitForBatch(batch_id, overall_status, polls);
+    if (!polled.ok()) return fail("Failed to poll transfer", polled);
+    if (overall_status.s == TransferStatusEnum::COMPLETED) {
+        const uint64_t total_us = timer.lap_us(false);
+        if (splitOutputEnabled()) {
+            logSplitXfer({batch_size, submit_us, total_us - submit_us, polls});
+        }
+        auto released = releaseFinishedBatch(*engine_, batch_id);
+        if (!released.ok()) return fail("Failed to free batch", released);
+        return static_cast<double>(total_us);
+    }
+    if (overall_status.s == TransferStatusEnum::PENDING) {
+        // Abandoned after a stop; waitForBatch() already counted it.
+        (void)engine_->freeBatchID(batch_id);
+        return -1.0;
+    }
+    releaseUnfinishedBatch();
+    LOG(ERROR) << "Failed transfer detected";
+    noteTransferFailed();
+    return -1.0;
 }
 
 }  // namespace tent

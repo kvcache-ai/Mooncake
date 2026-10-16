@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "tent/platform/cuda.h"
+#include "tent/platform/cuda_utils.h"
 #include "tent/common/status.h"
 
 #include <bits/stdint-uintn.h>
@@ -22,19 +23,11 @@
 #include <mutex>
 #include <numa.h>
 #include <vector>
+#include <cstring>
 
 namespace mooncake {
 namespace tent {
 namespace {
-
-// cuInit is process-global and idempotent; still call it once so the driver
-// probe is not re-entered on every topology device.
-bool ensureCudaDriverInit() {
-    static std::once_flag flag;
-    static CUresult result = CUDA_ERROR_NOT_INITIALIZED;
-    std::call_once(flag, []() { result = cuInit(0); });
-    return result == CUDA_SUCCESS;
-}
 
 // Driver-API probe: true iff this process already has a primary context on
 // `device`. Does not create one. Topology lists every visible GPU for NIC
@@ -82,15 +75,10 @@ Status CudaPlatform::allocate(void** pptr, size_t size,
 }
 
 Status CudaPlatform::free(void* ptr, size_t size) {
-    cudaPointerAttributes attributes;
-    CHECK_CUDA(cudaPointerGetAttributes(&attributes, ptr));
-    if (attributes.type == cudaMemoryTypeDevice) {
+    if (getCudaDeviceForPtr(ptr) >= 0) {
         CHECK_CUDA(cudaFree(ptr));
-    } else if (attributes.type == cudaMemoryTypeHost ||
-               attributes.type == cudaMemoryTypeUnregistered) {
-        numa_free(ptr, size);
     } else {
-        LOG(ERROR) << "Unknown memory type, " << ptr << " " << attributes.type;
+        numa_free(ptr, size);
     }
     return Status::OK();
 }
@@ -111,12 +99,30 @@ Status CudaPlatform::copy(void* dst, void* src, size_t length) {
     if (device_id == CUDAStreamPool::kCurrentDevice) {
         device_id = getPointerDeviceId(src);
     }
+    if (device_id == CUDAStreamPool::kCurrentDevice) {
+        // Host-to-host: plain memcpy. The stream pool would create a primary
+        // context on the thread's default device (GPU 0).
+        ::memcpy(dst, src, length);
+        return Status::OK();
+    }
 
+    // cudaMemcpyAsync() validates the stream against the current device's
+    // context; pin the buffer's device for the copy and restore the caller's
+    // binding only when the thread already had a context.
+    int saved_device = 0;
+    const bool have_saved =
+        cudaHasCurrentContext() && cudaGetDevice(&saved_device) == cudaSuccess;
+    if (!have_saved) (void)cudaGetLastError();
+
+    CHECK_CUDA(cudaSetDevice(device_id));
     CUDAStreamHandle stream;
     CHECK_STATUS(getStreamFromPool(stream, device_id));
     CHECK_CUDA(
         cudaMemcpyAsync(dst, src, length, cudaMemcpyDefault, stream.get()));
     CHECK_CUDA(cudaStreamSynchronize(stream.get()));
+    if (have_saved) {
+        CHECK_CUDA(cudaSetDevice(saved_device));
+    }
     return Status::OK();
 }
 

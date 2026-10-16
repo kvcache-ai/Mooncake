@@ -3,7 +3,7 @@
 set -euo pipefail
 source "$(dirname -- "${BASH_SOURCE[0]}")/run_oplog_batch_cluster.sh"
 parse_up_options "$@"
-[[ ! -e "$RUN_DIR" ]] || die "snapshot smoke requires a fresh run directory"
+if [[ -e "$RUN_DIR" ]]; then die "snapshot smoke requires a fresh run directory"; fi
 MASTER_COUNT=2
 CLIENT_COUNT=0
 ENABLE_OPLOG_SNAPSHOT=true
@@ -13,7 +13,7 @@ HA_CLIENT="$BUILD_DIR/mooncake-store/tests/e2e/oplog_ha_client"
 require_executable "$HA_CLIENT"
 mkdir -p "$RUN_DIR/configs"
 MASTER_CONFIG="$RUN_DIR/configs/snapshot.yaml"
-printf 'snapshot_interval_seconds: 2\nenable_snapshot: true\nenable_snapshot_restore: true\nsnapshot_catalog_store_type: invalid\n' >"$MASTER_CONFIG"
+printf 'snapshot_interval_seconds: 2\n' >"$MASTER_CONFIG"
 trap 'down_cluster >/dev/null 2>&1 || true' EXIT
 # Static dependency failures must terminate before any leadership work.
 python3 - "$BUILD_DIR/mooncake-store/src/mooncake_master" "$RUN_DIR" <<'PYTEST'
@@ -36,7 +36,7 @@ up_cluster
 export MC_STORE_CLUSTER_ID="$CLUSTER_ID"
 GTEST_FILTER=StandbyControllerTest.BatchSnapshotRepeatedStartStopAndPromotion \
 MOONCAKE_TEST_ETCD_ENDPOINTS="$ETCD_ENDPOINTS" \
-  "$BUILD_DIR/mooncake-store/tests/hot_standby_snapshot_bootstrap_test" \
+  "$BUILD_DIR/mooncake-store/tests/standby_controller_test" \
   >"$RUN_DIR/audit/controller-lifecycle.log" 2>&1
 for index in 0 1; do
   python3 - "$(cat "$RUN_DIR/pids/master-$index.pid")" "$RUN_DIR/snapshots" "$FAILPOINT_DIR" <<'PYENV'
@@ -47,6 +47,8 @@ if sys.argv[3]:
     assert ('MOONCAKE_TEST_FAILPOINT_DIR=' + sys.argv[3]).encode() in entries
 PYENV
 done
+summary=$("$INSPECTOR_BIN" summary --endpoints="$ETCD_ENDPOINTS" --cluster_id="$CLUSTER_ID" --json)
+python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["ok"]; assert not d["errors"]' "$summary"
 client_args=(--master_server_entry="etcd://$ETCD_ENDPOINTS"
   --engine_meta_url="http://127.0.0.1:$METADATA_PORT/metadata" --protocol=tcp
   --payload_size=4096 --key_prefix="snapshot-$CLUSTER_ID")
@@ -118,6 +120,14 @@ wait "$(cat "$RUN_DIR/pids/master-$leader.pid")" 2>/dev/null || true
 wait_for_single_leader "$START_TIMEOUT_SEC"
 [[ "$(ready_leader_index)" == "$standby" ]] || die "restarted standby did not promote"
 wait_master_metric_at_least "$standby" master_active_clients 1 "$START_TIMEOUT_SEC"
+# Bring the former leader back as standby after promotion and verify that its
+# coordinator can publish a new snapshot.
+start_master "$leader"
+wait_file_text "$RUN_DIR/logs/master-$leader.err" \
+  "Batch snapshot bootstrap complete" "$START_TIMEOUT_SEC"
+run_client seed "$RUN_DIR/workload/post-promotion.ack" --count=4 --start_index=300
+post_promotion=$(wait_snapshot "$second" "$(read_durable_sequence)")
+[[ -n "$post_promotion" ]] || die "post-promotion snapshot was not published"
 for manifest in survivors second suffix; do
   run_client verify "$RUN_DIR/workload/$manifest.ack"
 done

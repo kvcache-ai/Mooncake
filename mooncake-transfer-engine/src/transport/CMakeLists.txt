@@ -61,6 +61,11 @@ if(USE_HIP)
   target_sources(transport PUBLIC $<TARGET_OBJECTS:hip_transport>)
 endif()
 
+if(USE_HYLINK)
+  add_subdirectory(hylink_transport)
+  target_sources(transport PUBLIC $<TARGET_OBJECTS:hylink_transport>)
+endif()
+
 if(USE_MACA)
   add_subdirectory(maca_transport)
   target_sources(transport PUBLIC $<TARGET_OBJECTS:maca_transport>)
@@ -94,7 +99,7 @@ endif()
 if(USE_EFA)
   add_subdirectory(efa_transport)
   target_sources(transport PUBLIC $<TARGET_OBJECTS:efa_transport>)
-  target_link_libraries(transport PRIVATE fabric)
+  target_link_libraries(transport PRIVATE ${CMAKE_DL_LIBS})
 endif()
 
 if(USE_CXI)
@@ -110,7 +115,7 @@ if(USE_CUDA
   target_sources(transport PUBLIC $<TARGET_OBJECTS:device_transport>)
   # device_transport (ibgda_device_transport.cpp / mlx5gda.cpp) calls libmlx5
   # DevX symbols (mlx5dv_devx_*, mlx5dv_init_obj) directly.
-  if((USE_CUDA OR USE_MUSA) AND NOT USE_CXI)
+  if((USE_CUDA OR USE_MUSA OR USE_MACA) AND NOT USE_CXI)
     target_link_libraries(transport PUBLIC mlx5)
   endif()
   if(USE_CUDA AND MOONCAKE_HAVE_MLX5_DMABUF_UMEM)

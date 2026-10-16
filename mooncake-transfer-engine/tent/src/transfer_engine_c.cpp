@@ -277,32 +277,39 @@ int tent_send_notifs(tent_engine_t engine, tent_segment_id_t handle,
 int tent_recv_notifs(tent_engine_t engine, tent_notifi_info* info) {
     CHECK_POINTER(engine);
     CHECK_POINTER(info);
+    info->records = nullptr;
+    info->num_records = 0;
     std::vector<mooncake::tent::Notification> notify_list;
     auto status = CAST(engine)->receiveNotification(notify_list);
     if (!status.ok()) {
         LOG(ERROR) << "tent_recv_notifs: " << status.ToString();
         return -1;
     }
-    info->num_records = (int)notify_list.size();
-    if (info->num_records) {
+    if (!notify_list.empty()) {
         info->records = (tent_notifi_record*)malloc(sizeof(tent_notifi_record) *
-                                                    info->num_records);
+                                                    notify_list.size());
         if (!info->records) {
             LOG(ERROR) << "tent_recv_notifs: out of memory";
             return -1;
         }
 
+        info->num_records = (int)notify_list.size();
         for (int i = 0; i < info->num_records; ++i) {
             info->records[i].handle = 0;
             strncpy(info->records[i].name, notify_list[i].name.c_str(), 255);
+            info->records[i].name[255] = '\0';
             strncpy(info->records[i].msg, notify_list[i].msg.c_str(), 4095);
+            info->records[i].msg[4095] = '\0';
         }
     }
     return 0;
 }
 
 void tent_free_notifs(tent_notifi_info* info) {
-    if (info && info->records) free(info->records);
+    if (!info) return;
+    free(info->records);
+    info->records = nullptr;
+    info->num_records = 0;
 }
 
 int tent_task_status(tent_engine_t engine, tent_batch_id_t batch_id,

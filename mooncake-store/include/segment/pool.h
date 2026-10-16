@@ -8,6 +8,7 @@
 #include "placement/replica_allocator.h"
 #include "segment/catalog.h"
 #include "segment/region_driver.h"
+#include "segment/snapshot.h"
 #include "segment/usage.h"
 #include "storage_usage.h"
 
@@ -28,6 +29,18 @@ class SegmentPool final {
 
     WriteAccess AcquireWriteAccess();
     ReadAccess AcquireReadAccess() const;
+
+    // Capture detached data without acquiring pool/allocator locks. Only call
+    // in a forked snapshot child or with all relevant state externally
+    // quiesced. After capture, the result is independent of this pool's
+    // lifetime/mutations.
+    tl::expected<SegmentPoolSnapshot, ErrorCode> CaptureSnapshot() const;
+
+    // Consumes the snapshot, staging all resources before replacing the pool.
+    // Preparation failure leaves published state unchanged. Temporary readers
+    // may omit capacity accounting.
+    tl::expected<void, ErrorCode> RestoreSnapshot(
+        SegmentPoolSnapshot snapshot, bool account_capacity_metrics);
 
     // Holds the Pool read lock through candidate selection and allocation.
     template <ReplicaPlacementPolicy Policy = RandomPlacementPolicy>

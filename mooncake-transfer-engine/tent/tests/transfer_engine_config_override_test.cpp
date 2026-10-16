@@ -28,6 +28,7 @@
 
 #include "tent/common/config.h"
 #include "tent/runtime/transfer_engine_impl.h"
+#include "tent/transfer_engine.h"
 
 #ifndef _WIN32
 #include <asio.hpp>
@@ -261,6 +262,57 @@ class TestHttpMetadataServer {
 #endif
 
 TEST(TransferEngineConfigOverrideTest,
+     InvalidInlineConfigPreventsDefaultConstruction) {
+    EnvVarGuard conf_guard("MC_TENT_CONF", "{");
+    EnvVarGuard tcp_guard("MC_FORCE_TCP", "1");
+    EnvVarGuard hostname_guard("MOONCAKE_LOCAL_HOSTNAME", kLoopbackHostname);
+
+    // Valid fallback settings must not start discovery or an RPC server when
+    // the requested configuration cannot be loaded.
+    TransferEngineImpl engine;
+
+    EXPECT_FALSE(engine.available());
+    EXPECT_EQ(engine.getRpcServerPort(), 0);
+    EXPECT_EQ(engine.getLocalTopology(), nullptr);
+}
+
+TEST(TransferEngineConfigOverrideTest,
+     InvalidConfigFilePreventsExplicitConstruction) {
+    TempConfigFile conf_file("{");
+    EnvVarGuard conf_guard("MC_TENT_CONF", conf_file.path());
+    EnvVarGuard tcp_guard("MC_FORCE_TCP", "1");
+    EnvVarGuard hostname_guard("MOONCAKE_LOCAL_HOSTNAME", kLoopbackHostname);
+    auto config = std::make_shared<Config>();
+    config->set("rpc_server_hostname", kLoopbackHostname);
+    configureTcpOnlyTransports(*config);
+
+    TransferEngineImpl engine(config);
+
+    EXPECT_FALSE(engine.available());
+    EXPECT_EQ(engine.getRpcServerPort(), 0);
+    EXPECT_EQ(engine.getLocalTopology(), nullptr);
+}
+
+TEST(TransferEngineConfigOverrideTest,
+     MissingConfigFilePreventsDefaultConstruction) {
+    std::string missing_path;
+    {
+        TempConfigFile conf_file("{}");
+        missing_path = conf_file.path();
+    }
+    ASSERT_FALSE(std::filesystem::exists(missing_path));
+    EnvVarGuard conf_guard("MC_TENT_CONF", missing_path);
+    EnvVarGuard tcp_guard("MC_FORCE_TCP", "1");
+    EnvVarGuard hostname_guard("MOONCAKE_LOCAL_HOSTNAME", kLoopbackHostname);
+
+    TransferEngineImpl engine;
+
+    EXPECT_FALSE(engine.available());
+    EXPECT_EQ(engine.getRpcServerPort(), 0);
+    EXPECT_EQ(engine.getLocalTopology(), nullptr);
+}
+
+TEST(TransferEngineConfigOverrideTest,
      LegacyRdmaBindAddressEnvLoadsIntoTentConfig) {
     EnvVarGuard guard("MC_RDMA_BIND_ADDRESS", "10.0.0.2");
 
@@ -281,6 +333,44 @@ TEST(TransferEngineConfigOverrideTest,
     ASSERT_TRUE(ConfigHelper().loadFromEnv(config).ok());
 
     EXPECT_EQ(config.get("transports/rdma/bind_address", ""), "10.0.0.2");
+}
+
+TEST(TransferEngineConfigOverrideTest, LegacyForceTcpEnvOverridesTentConfig) {
+    EnvVarGuard conf_guard(
+        "MC_TENT_CONF",
+        R"({"transports":{"tcp":{"enable":false},"rdma":{"enable":true},"hp_tcp":{"enable":true}}})");
+    EnvVarGuard force_tcp_guard("MC_FORCE_TCP", "1");
+
+    Config config;
+    ASSERT_TRUE(ConfigHelper().loadFromEnv(config).ok());
+
+    EXPECT_TRUE(config.get("transports/force_tcp", false));
+    EXPECT_TRUE(config.get("transports/tcp/enable", false));
+    EXPECT_FALSE(config.get("transports/rdma/enable", true));
+    EXPECT_FALSE(config.get("transports/hp_tcp/enable", true));
+}
+
+TEST(TransferEngineConfigOverrideTest,
+     ExplicitForceTcpSurvivesMcTentConfThroughConstructor) {
+    EnvVarGuard conf_guard(
+        "MC_TENT_CONF",
+        R"({"transports":{"tcp":{"enable":false},"rdma":{"enable":false},"hp_tcp":{"enable":true},"mpcomm":{"enable":false},"io_uring":{"enable":false}},"metrics":{"enabled":false}})");
+
+    auto config = std::make_shared<Config>();
+    config->set("metadata_type", "p2p");
+    config->set("local_segment_name", "force-tcp-explicit");
+    config->set("rpc_server_hostname", kLoopbackHostname);
+    config->set("rpc_server_port", 0);
+    ConfigHelper::forceTcp(*config);
+
+    {
+        TransferEngineImpl engine(config);
+        ASSERT_TRUE(engine.available());
+        EXPECT_TRUE(config->get("transports/force_tcp", false));
+        EXPECT_TRUE(config->get("transports/tcp/enable", false));
+        EXPECT_FALSE(config->get("transports/rdma/enable", true));
+        EXPECT_FALSE(config->get("transports/hp_tcp/enable", true));
+    }
 }
 
 // MOONCAKE_LOCAL_HOSTNAME is the classic Transfer Engine + store env var that
@@ -319,6 +409,28 @@ TEST(TransferEngineConfigOverrideTest,
     ASSERT_TRUE(ConfigHelper().loadFromEnv(config).ok());
 
     EXPECT_TRUE(config.get("transports/rdma/log_slice_affinity", false));
+}
+
+TEST(TransferEngineConfigOverrideTest, InvalidConstructorFilePreventsStartup) {
+    TempConfigFile file("{invalid-json");
+    EnvVarGuard conf_guard("MC_TENT_CONF", "");
+    EnvVarGuard tcp_guard("MC_FORCE_TCP", "1");
+    EnvVarGuard hostname_guard("MOONCAKE_LOCAL_HOSTNAME", kLoopbackHostname);
+    TransferEngine engine(file.path());
+    EXPECT_FALSE(engine.available());
+    EXPECT_EQ(engine.getRpcServerPort(), 0);
+    EXPECT_EQ(engine.getLocalTopology(), nullptr);
+}
+
+TEST(TransferEngineConfigOverrideTest, MissingConstructorFilePreventsStartup) {
+    TempConfigFile file("{}");
+    EnvVarGuard conf_guard("MC_TENT_CONF", "");
+    EnvVarGuard tcp_guard("MC_FORCE_TCP", "1");
+    EnvVarGuard hostname_guard("MOONCAKE_LOCAL_HOSTNAME", kLoopbackHostname);
+    TransferEngine engine(file.path() + ".missing");
+    EXPECT_FALSE(engine.available());
+    EXPECT_EQ(engine.getRpcServerPort(), 0);
+    EXPECT_EQ(engine.getLocalTopology(), nullptr);
 }
 
 TEST(TransferEngineConfigOverrideTest, FilterNicEnvLoadsRdmaWhitelist) {
@@ -373,6 +485,45 @@ TEST(TransferEngineConfigOverrideTest, CustomTopoJsonEnvLoadsPath) {
 
     EXPECT_EQ(config.get("topology/custom_json_path", ""),
               "/tmp/mooncake-nic-priority-matrix.json");
+}
+
+TEST(TransferEngineConfigOverrideTest,
+     ExplicitRdmaWhitelistOverridesLegacyFilterEnv) {
+    EnvVarGuard guard("MC_TE_FILTERS", "mlx5_from_env_0,mlx5_from_env_1");
+
+    auto config = std::make_shared<Config>();
+    const std::vector<std::string> explicit_filter{"mlx5_requested"};
+    config->set("topology/rdma_whitelist", explicit_filter);
+    config->set("rpc_server_hostname", kInvalidHostname);
+
+    TransferEngineImpl engine(config);
+
+    EXPECT_FALSE(engine.available());
+    EXPECT_EQ(config->getArray<std::string>("topology/rdma_whitelist"),
+              explicit_filter);
+}
+
+TEST(TransferEngineConfigOverrideTest,
+     ExplicitRdmaWhitelistOverridesMcTentConf) {
+    TempConfigFile conf_file(R"({
+        "topology": {
+            "rdma_whitelist": ["mlx5_from_env_0", "mlx5_from_env_1"]
+        }
+    })");
+    EnvVarGuard guard("MC_TENT_CONF", conf_file.path());
+
+    auto config = std::make_shared<Config>();
+    const std::vector<std::string> explicit_filter{"mlx5_requested"};
+    config->set("topology/rdma_whitelist", explicit_filter);
+    // Stop construction before platform probing; this test only needs the
+    // constructor's config merge and remains hardware-independent.
+    config->set("rpc_server_hostname", kInvalidHostname);
+
+    TransferEngineImpl engine(config);
+
+    EXPECT_FALSE(engine.available());
+    EXPECT_EQ(config->getArray<std::string>("topology/rdma_whitelist"),
+              explicit_filter);
 }
 
 TEST(TransferEngineConfigOverrideTest,
@@ -442,6 +593,39 @@ TEST(TransferEngineConfigOverrideTest,
 
     EXPECT_FALSE(metadata_server.getStoredValue(metadata_key).has_value());
 #endif
+}
+
+TEST(TransferEngineConfigOverrideTest,
+     NestedCallerTransportLeafSurvivesMcTentConf) {
+    TempConfigFile conf_file(R"({
+        "metadata_type": "p2p",
+        "metadata_servers": "127.0.0.1:2379",
+        "rpc_server_hostname": "256.256.256.256",
+        "rpc_server_port": 15014,
+        "transports": {
+            "ascend_direct": {
+                "agent_mode": false,
+                "fabric_mem": false,
+                "transfer_timeout_ms": 1234
+            }
+        }
+    })");
+    EnvVarGuard guard("MC_TENT_CONF", conf_file.path());
+
+    auto config = std::make_shared<Config>();
+    config->set("local_segment_name", "store-segment-C");
+    config->set("transports/ascend_direct/agent_mode", true);
+    config->set("transports/ascend_direct/store_te_init", true);
+
+    TransferEngineImpl engine(config);
+
+    EXPECT_TRUE(config->get("transports/ascend_direct/agent_mode", false));
+    EXPECT_TRUE(config->get("transports/ascend_direct/store_te_init", false));
+    EXPECT_FALSE(config->get("transports/ascend_direct/fabric_mem", true));
+    EXPECT_EQ(config->get("transports/ascend_direct/transfer_timeout_ms", 0),
+              1234);
+    EXPECT_EQ(config->get("local_segment_name", ""), "store-segment-C");
+    EXPECT_EQ(config->get("metadata_type", ""), "p2p");
 }
 
 TEST(TransferEngineConfigOverrideTest,

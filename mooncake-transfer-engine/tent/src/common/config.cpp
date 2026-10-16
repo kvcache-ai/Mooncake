@@ -51,9 +51,16 @@ Status Config::load(const std::string& content) {
     try {
         config_data_ = json::parse(content);
         return Status::OK();
-    } catch (const std::exception& e) {
-        return Status::InvalidArgument(std::string("Invalid JSON: ") +
-                                       e.what() + LOC_MARK);
+    } catch (const json::parse_error& e) {
+        // what() includes the last input token, which may contain credentials.
+        return Status::InvalidArgument("Invalid JSON: parse error " +
+                                       std::to_string(e.id) + " at byte " +
+                                       std::to_string(e.byte) + LOC_MARK);
+    } catch (const json::exception& e) {
+        return Status::InvalidArgument("Invalid JSON: parse error " +
+                                       std::to_string(e.id) + LOC_MARK);
+    } catch (const std::exception&) {
+        return Status::InvalidArgument("Invalid JSON: parsing failed" LOC_MARK);
     }
 }
 
@@ -155,6 +162,14 @@ static inline void setArrayConfig(Config& config, const std::string& env_key,
     if (!items.empty()) config.set(config_key, items);
 }
 
+void ConfigHelper::forceTcp(Config& config) {
+    config.set("transports/force_tcp", true);
+    config.set("transports/tcp/enable", true);
+    config.set("transports/rdma/enable", false);
+    config.set("transports/hp_tcp/enable", false);
+    config.set("transports/fabric/enable", false);
+}
+
 Status ConfigHelper::loadFromEnv(Config& config) {
     const char* conf_str = std::getenv("MC_TENT_CONF");
     Status status = Status::OK();
@@ -164,9 +179,8 @@ Status ConfigHelper::loadFromEnv(Config& config) {
         try {
             is_file = std::filesystem::exists(conf);
         } catch (const std::filesystem::filesystem_error& e) {
-            LOG(WARNING) << "Failed to check file existence for MC_TENT_CONF="
-                         << conf << ": " << e.what()
-                         << ", treating as JSON string";
+            LOG(WARNING) << "Failed to check MC_TENT_CONF as a file: "
+                         << e.code().message() << ", treating as JSON string";
         }
         if (is_file) {
             status = config.loadFile(conf);
@@ -188,6 +202,11 @@ Status ConfigHelper::loadFromEnv(Config& config) {
 
     // Legacy keys for backward compatibility (MC_* env vars)
     setConfig(config, "MOONCAKE_LOCAL_HOSTNAME", "rpc_server_hostname");
+    if (std::getenv("MC_FORCE_TCP")) {
+        forceTcp(config);
+        LOG(INFO)
+            << "MC_FORCE_TCP is set, forcing TENT memory transfers to use TCP";
+    }
     setBoolConfig(config, "MC_MNNVL_EGM", "transports/mnnvl/egm");
     setConfig(config, "MC_RDMA_BIND_ADDRESS", "transports/rdma/bind_address");
     setConfig(config, "MC_NUM_CQ_PER_CTX",

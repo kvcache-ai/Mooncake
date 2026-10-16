@@ -3,6 +3,7 @@
 #ifdef USE_CUDA
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include "cuda_fabric_compat.h"
 #elif defined(USE_HIP)
 #include "gpu_vendor/hip.h"
 #elif defined(USE_MUSA)
@@ -20,9 +21,11 @@
 #elif defined(USE_HYGON)
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include "cuda_fabric_compat.h"
 #elif defined(USE_COREX)
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include "cuda_fabric_compat.h"
 #endif
 
 #if !defined(USE_HIP) && !defined(USE_MUSA) && !defined(USE_MLU) &&         \

@@ -6,11 +6,14 @@
 #include <cstddef>
 #include <cstring>
 #include <chrono>
+#include <functional>
+#include <limits>
 #include <memory>
 #include <thread>
 #include <vector>
 
 #include "allocator.h"
+#include "master_metric_manager.h"
 #include "types.h"
 
 namespace mooncake {
@@ -279,6 +282,124 @@ TEST_F(BufferAllocatorTest, CachelibCreateRejectsInvalidMemoryLayout) {
             kSlabSize;
         expect_invalid(kBase, too_many_slabs);
     }
+}
+
+TEST_F(BufferAllocatorTest, OffsetRestoreFactoryRejectsInvalidState) {
+    auto& metrics = MasterMetricManager::instance();
+    const auto baseline = metrics.get_allocated_mem_size();
+    const std::string segment_name = "restore-factory";
+    constexpr size_t kBase = 0x100000000ULL;
+    constexpr size_t kCapacity = 16U * 1024 * 1024;
+    auto state = offset_allocator::OffsetAllocator::create(kBase, kCapacity);
+    ASSERT_NE(state, nullptr);
+
+    auto snapshot = [&] {
+        return OffsetBufferAllocatorSnapshot{segment_name,
+                                             kBase,
+                                             kCapacity,
+                                             0,
+                                             segment_name + "-endpoint",
+                                             state->CaptureSnapshot()};
+    };
+    const auto expect_rejected = [](OffsetBufferAllocatorSnapshot candidate) {
+        auto restored = OffsetBufferAllocator::Restore(std::move(candidate));
+        ASSERT_FALSE(restored.has_value());
+        EXPECT_EQ(restored.error(), ErrorCode::INVALID_PARAMS);
+    };
+    auto missing_layout = snapshot();
+    missing_layout.allocation_state.layout.reset();
+    expect_rejected(std::move(missing_layout));
+    auto invalid_usage = snapshot();
+    invalid_usage.used_bytes = kCapacity + 1;
+    expect_rejected(std::move(invalid_usage));
+    auto mismatched_base = snapshot();
+    ++mismatched_base.allocation_state.base;
+    expect_rejected(std::move(mismatched_base));
+    auto overflow = snapshot();
+    overflow.used_bytes = std::numeric_limits<size_t>::max();
+    expect_rejected(std::move(overflow));
+    // The persisted counters must describe the persisted layout.
+    auto wrong_alloc_num = snapshot();
+    ++wrong_alloc_num.allocation_state.allocated_num;
+    expect_rejected(std::move(wrong_alloc_num));
+    auto wrong_alloc_size = snapshot();
+    wrong_alloc_size.allocation_state.allocated_size = kCapacity;
+    expect_rejected(std::move(wrong_alloc_size));
+    EXPECT_EQ(metrics.get_allocated_mem_size(), baseline);
+
+    {
+        auto restored = OffsetBufferAllocator::Restore(snapshot());
+        ASSERT_TRUE(restored.has_value());
+        EXPECT_EQ((*restored)->size(), 0U);
+        EXPECT_EQ((*restored)->capacity(), kCapacity);
+
+        auto buffer = (*restored)->allocate(4096);
+        ASSERT_NE(buffer, nullptr);
+        EXPECT_EQ((*restored)->size(), 4096U);
+        EXPECT_EQ(metrics.get_allocated_mem_size(), baseline + 4096);
+    }
+    EXPECT_EQ(metrics.get_allocated_mem_size(), baseline);
+}
+
+TEST_F(BufferAllocatorTest,
+       SnapshotValidationReportsErrorsWithoutPublishingUsage) {
+    auto& metrics = MasterMetricManager::instance();
+    const auto baseline = metrics.get_allocated_mem_size();
+    constexpr size_t kBase = 0x100000000ULL;
+    constexpr size_t kCapacity = 16U << 20;
+    auto state =
+        offset_allocator::OffsetAllocator::create(kBase, kCapacity, 16, 32);
+    auto allocation = state->allocate(4097);
+    ASSERT_TRUE(allocation.has_value());
+    auto snapshot = [&] {
+        return OffsetBufferAllocatorSnapshot{
+            .segment_name = "validate-snapshot",
+            .base = kBase,
+            .capacity = kCapacity,
+            .used_bytes = 4097,
+            .transport_endpoint = "endpoint",
+            .allocation_state = state->CaptureSnapshot(),
+        };
+    };
+    struct Fault {
+        const char* diagnostic;
+        std::function<void(OffsetBufferAllocatorSnapshot&)> apply;
+    };
+    const std::vector<Fault> faults{
+        {"bounds", [](auto& s) { ++s.base; }},
+        {"bounds", [](auto& s) { ++s.capacity; }},
+        {"usage", [](auto& s) { s.used_bytes = s.capacity + 1; }},
+        {"used_bytes", [](auto& s) { s.used_bytes = 0; }},
+        {"layout", [](auto& s) { s.allocation_state.layout.reset(); }},
+        {"multiplier_bits",
+         [](auto& s) { s.allocation_state.multiplier_bits = 64; }},
+        {"allocated_num", [](auto& s) { ++s.allocation_state.allocated_num; }},
+        {"allocated_size",
+         [](auto& s) { s.used_bytes = s.allocation_state.allocated_size = 0; }},
+    };
+    for (const auto& fault : faults) {
+        SCOPED_TRACE(fault.diagnostic);
+        auto candidate = snapshot();
+        fault.apply(candidate);
+        const auto valid = candidate.Validate();
+        ASSERT_FALSE(valid.has_value());
+        EXPECT_NE(valid.error().find(fault.diagnostic), std::string::npos);
+        EXPECT_EQ(metrics.get_allocated_mem_size(), baseline);
+        auto restored = OffsetBufferAllocator::Restore(std::move(candidate));
+        ASSERT_FALSE(restored.has_value());
+        EXPECT_EQ(restored.error(), ErrorCode::INVALID_PARAMS);
+        EXPECT_EQ(metrics.get_allocated_mem_size(), baseline);
+    }
+    auto clean = snapshot();
+    ASSERT_TRUE(clean.Validate().has_value());
+    EXPECT_EQ(metrics.get_allocated_mem_size(), baseline);
+    {
+        auto restored = OffsetBufferAllocator::Restore(std::move(clean));
+        ASSERT_TRUE(restored.has_value());
+        EXPECT_EQ((*restored)->size(), 4097U);
+        EXPECT_EQ(metrics.get_allocated_mem_size(), baseline + 4097);
+    }
+    EXPECT_EQ(metrics.get_allocated_mem_size(), baseline);
 }
 
 TEST_F(BufferAllocatorTest, ImportCachelibAllocationsAtOriginalAddresses) {
