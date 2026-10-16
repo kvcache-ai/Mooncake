@@ -371,6 +371,33 @@ class FileStorageTest : public ::testing::Test {
         return total;
     }
 
+    std::shared_ptr<FileStorage::AllocatedBatch> ClientBufferBatch(
+        FileStorage& fileStorage, uint64_t batch_id) {
+        auto& shard = fileStorage.ShardFor(batch_id);
+        MutexLocker locker(&shard.mutex);
+        auto it = shard.batches.find(batch_id);
+        return it == shard.batches.end() ? nullptr : it->second.batch;
+    }
+
+    bool ExpireClientBufferBatch(FileStorage& fileStorage, uint64_t batch_id) {
+        auto& shard = fileStorage.ShardFor(batch_id);
+        MutexLocker locker(&shard.mutex);
+        auto it = shard.batches.find(batch_id);
+        if (it == shard.batches.end()) return false;
+        it->second.lease_timeout = std::chrono::steady_clock::now();
+        return true;
+    }
+
+    size_t ClientBufferShardIndex(uint64_t batch_id) {
+        return batch_id % FileStorage::kClientBufferShards;
+    }
+
+    FileStorage::BatchGetResult FileStorageShareStagingBuffer(
+        FileStorage& fileStorage,
+        const std::shared_ptr<FileStorage::AllocatedBatch>& staging) {
+        return fileStorage.ShareStagingBuffer(staging);
+    }
+
     void SetPinnedRestoreArena(FileStorage& fileStorage, void* address,
                                size_t size) {
         fileStorage.pinned_restore_arena_allocator_ =
@@ -2065,6 +2092,49 @@ TEST_F(FileStorageTest, BatchGetSingleflight_LastReleaseFreesSharedStaging) {
         << "The survivor's reader already released that id";
     EXPECT_EQ(ClientBufferBatchCount(fileStorage), 0u)
         << "The last release should return the staging buffer to the pool";
+}
+
+TEST_F(FileStorageTest, BatchGetSingleflight_AliasLeasesAreIndependent) {
+    std::vector<std::string> keys;
+    std::vector<int64_t> sizes;
+    std::unordered_map<std::string, std::string> batch_data;
+
+    constexpr int64_t kBufferSize = 1024 * 1024;
+    auto file_storage_config = FileStorageConfig::FromEnvironment();
+    file_storage_config.storage_filepath = data_path;
+    file_storage_config.local_buffer_size = kBufferSize;
+    file_storage_config.total_keys_limit = 1000;
+    FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
+    ASSERT_TRUE(FileStorageBatchOffload(fileStorage, keys, sizes, batch_data));
+    ASSERT_FALSE(keys.empty());
+
+    auto leader = fileStorage.BatchGet({keys.front()}, {sizes.front()});
+    ASSERT_TRUE(leader);
+    auto staging = ClientBufferBatch(fileStorage, leader->batch_id);
+    ASSERT_NE(staging, nullptr);
+
+    auto alias = FileStorageShareStagingBuffer(fileStorage, staging);
+    ASSERT_NE(ClientBufferShardIndex(leader->batch_id),
+              ClientBufferShardIndex(alias.batch_id));
+    ASSERT_EQ(ClientBufferBatchCount(fileStorage), 2u);
+    staging.reset();
+
+    // Expiring the leader must not expire an alias in another shard. The
+    // alias started its own lease window when it joined the shared staging
+    // buffer, and its shard mutex cannot protect a deadline stored on the
+    // shared AllocatedBatch.
+    ASSERT_TRUE(ExpireClientBufferBatch(fileStorage, leader->batch_id));
+    const std::vector<std::string> probe_key = {keys.front()};
+    const std::vector<int64_t> probe_size = {kBufferSize};
+    auto probe = FileStorageAllocateBatch(fileStorage, probe_key, probe_size);
+    ASSERT_FALSE(probe);
+    EXPECT_EQ(probe.error(), ErrorCode::BUFFER_OVERFLOW);
+
+    EXPECT_FALSE(fileStorage.ReleaseBuffer(leader->batch_id))
+        << "The expired leader entry should have been collected";
+    EXPECT_TRUE(fileStorage.ReleaseBuffer(alias.batch_id))
+        << "The alias has an independent, unexpired lease";
+    EXPECT_EQ(ClientBufferBatchCount(fileStorage), 0u);
 }
 
 TEST_F(FileStorageTest,

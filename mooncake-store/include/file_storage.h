@@ -142,11 +142,10 @@ class FileStorage {
      * strong reference to it, so the waiter can register its id even if the
      * leader has already released its own. Every reader releases its own id
      * and the staging memory goes back to the pool when the last id is gone.
-     * The lease is refreshed because the waiter starts its own read window
-     * now; without that it could outlive the leader's lease and read freed
-     * memory. The refreshed lease still expires once every reader is done or
-     * dead, which is what keeps an abandoned batch reclaimable by GC instead
-     * of pinned forever.
+     * The alias gets its own lease because the waiter starts its own read
+     * window now; without that it could outlive the leader's lease and read
+     * freed memory. Keeping the deadline in the alias's table entry also lets
+     * different shards update and collect their leases independently.
      */
     BatchGetResult ShareStagingBuffer(
         const std::shared_ptr<AllocatedBatch>& staging);
@@ -155,7 +154,6 @@ class FileStorage {
         uint64_t batch_id;
         std::vector<BufferHandle> handles;
         std::unordered_map<std::string, Slice> slices;
-        std::chrono::steady_clock::time_point lease_timeout;
         std::vector<uint64_t> pointers;
         uint64_t total_size;
 
@@ -278,10 +276,14 @@ class FileStorage {
     // here. Striping the table by id keeps the resulting convoy off a single
     // mutex; ids are handed out sequentially, so this spreads them evenly.
     static constexpr size_t kClientBufferShards = 16;
+    struct ClientBufferEntry {
+        std::shared_ptr<AllocatedBatch> batch;
+        std::chrono::steady_clock::time_point lease_timeout;
+    };
     struct ClientBufferShard {
         Mutex mutex;
-        std::unordered_map<uint64_t, std::shared_ptr<AllocatedBatch>>
-            GUARDED_BY(mutex) batches;
+        std::unordered_map<uint64_t, ClientBufferEntry> GUARDED_BY(
+            mutex) batches;
     };
     std::array<ClientBufferShard, kClientBufferShards> client_buffer_shards_;
 
