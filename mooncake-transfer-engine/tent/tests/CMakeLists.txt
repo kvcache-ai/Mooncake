@@ -429,9 +429,13 @@ if(TARGET tent_xport_gds)
   target_link_libraries(tent_gds_transport_status_test PRIVATE gtest gtest_main
                                                                tent_link_group)
   target_link_options(
-    tent_gds_transport_status_test PRIVATE "-Wl,--wrap=cuFileDriverOpen"
-    "-Wl,--wrap=cuFileBatchIOGetStatus" "-Wl,--wrap=cuFileBatchIOCancel"
-    "-Wl,--wrap=cuFileBatchIOSubmit" "-Wl,--wrap=cuFileHandleRegister"
+    tent_gds_transport_status_test
+    PRIVATE
+    "-Wl,--wrap=cuFileDriverOpen"
+    "-Wl,--wrap=cuFileBatchIOGetStatus"
+    "-Wl,--wrap=cuFileBatchIOCancel"
+    "-Wl,--wrap=cuFileBatchIOSubmit"
+    "-Wl,--wrap=cuFileHandleRegister"
     "-Wl,--wrap=cuFileHandleDeregister")
   target_include_directories(tent_gds_transport_status_test
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
@@ -849,5 +853,17 @@ if(TARGET tent_xport_fabric)
              COMMAND tent_fabric_transport_test
                      --gtest_filter=FabricTransportTest.${case})
     set_tests_properties(tent_fabric_transport_${case} PROPERTIES TIMEOUT 120)
+  endforeach()
+endif()
+
+if(USE_MLU)
+  foreach(suite platform transport engine process)
+    add_executable(tent_mlu_${suite}_test mlu/mlu_${suite}_test.cpp)
+    target_link_libraries(tent_mlu_${suite}_test PRIVATE gtest gtest_main
+                                                         tent_link_group)
+    target_include_directories(tent_mlu_${suite}_test
+                               PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+    add_test(NAME tent_mlu_${suite}_test COMMAND tent_mlu_${suite}_test)
+    set_tests_properties(tent_mlu_${suite}_test PROPERTIES TIMEOUT 300)
   endforeach()
 endif()

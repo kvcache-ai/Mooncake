@@ -161,7 +161,7 @@ struct SelectionResult {
     std::optional<int> traffic_class;
     // Consumed: names the QP pool the transfer is routed to.
     std::optional<std::string> qp_pool;
-    // Filled by the engine for XPU orchestration, never by select() itself.
+    // Filled by the engine for device staging, never by select() itself.
     std::vector<std::string> staging_params;
 };
 
