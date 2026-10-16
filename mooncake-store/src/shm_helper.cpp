@@ -82,21 +82,28 @@ ShmHelper::ShmHelper() {
             LOG(WARNING) << "MC_STORE_REGISTER_SPDK=1 but NoF is unavailable "
                             "(e.g. MC_NOF_BACKEND=none); shared memory will "
                             "NOT be registered for NoF zero-copy transfers";
+        } else {
+            // SPDK's spdk_mem_register() requires hugepage-backed memory: its
+            // vtophys notify checks each 2MB segment's PHYSICAL address for
+            // 2MB alignment, which only hugepage pages satisfy (4KB-backed
+            // memory always fails with -EINVAL, on v23.01.1 and every later
+            // version in iova=pa mode). Virtual-address alignment alone is
+            // not sufficient, so force hugepages here; if not enough are
+            // configured the allocation below fails with a clear error
+            // instead of silently losing NoF zero-copy. This is an override
+            // on top of HugepageConfig::IsEnabledFromEnvironment() above,
+            // and applies only when an initiator actually exists (allocate()
+            // registers under the same register_spdk_ && nof_initiator_
+            // condition).
+            use_hugepage_ = true;
+            LOG(INFO) << "MC_STORE_REGISTER_SPDK=1: shared memory will be "
+                         "registered with the NoF initiator for zero-copy "
+                         "transfers";
         }
-        // SPDK's spdk_mem_register() requires hugepage-backed memory: its
-        // vtophys notify checks each 2MB segment's PHYSICAL address for 2MB
-        // alignment, which only hugepage pages satisfy (4KB-backed memory
-        // always fails with -EINVAL, on v23.01.1 and every later version in
-        // iova=pa mode). Virtual-address alignment alone is not sufficient, so
-        // force hugepages here; if not enough are configured the allocation
-        // below fails with a clear error instead of silently losing NoF
-        // zero-copy. This is an override on top of
-        // HugepageConfig::IsEnabledFromEnvironment() above.
-        use_hugepage_ = true;
+#else
+        LOG(WARNING) << "MC_STORE_REGISTER_SPDK=1 but this build has no NoF "
+                        "support (compiled without USE_NOF); ignoring";
 #endif
-        LOG(INFO) << "MC_STORE_REGISTER_SPDK=1: shared memory will be "
-                     "registered with the NoF initiator for zero-copy "
-                     "transfers";
     }
 }
 

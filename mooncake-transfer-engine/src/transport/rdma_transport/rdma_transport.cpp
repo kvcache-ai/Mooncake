@@ -822,6 +822,16 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
     // Confirmed cleanup: report success so the engine erases its region
     // record and the same range can be registered again.
     if (metadata_missing) {
+        if (update_metadata) {
+            // The earlier attempt removed the local metadata entry but may
+            // have failed to publish it (that failure is what seeded the
+            // pending record). Republish now so the remote metadata server
+            // drops the stale buffer advertisement. On publish failure the
+            // pending record is kept: a later retry re-runs this path (the
+            // MR cleanup above is then a no-op) and publishes again.
+            int pub_rc = metadata_->updateLocalSegmentDesc();
+            if (pub_rc) return pub_rc;
+        }
         std::lock_guard<std::mutex> lock(pending_dereg_mutex_);
         pending_dereg_.erase((uint64_t)addr);
     }
@@ -937,6 +947,13 @@ int RdmaTransport::unregisterLocalMemoryBatch(
     const std::vector<void *> &addr_list) {
     int first_error = runBoundedRegMrBatch(addr_list.size(), [&](size_t i) {
         int ret = unregisterLocalMemoryInternal(addr_list[i], false, true);
+        // NOT_REGISTERED means nothing remains for this member: its metadata
+        // entry is gone and no pending MR cleanup is recorded. A batch retry
+        // after a partial failure always hits this for the members that
+        // already succeeded — reporting it as an error would keep the
+        // engine's region records stuck forever (un-re-registerable), while
+        // the single-address path treats confirmed cleanup as success.
+        if (ret == ERR_ADDRESS_NOT_REGISTERED) ret = 0;
         if (ret) {
             LOG(WARNING) << "RdmaTransport: Failed to unregister memory: addr "
                          << addr_list[i];

@@ -151,11 +151,15 @@ class SpdkEnvGuard {
         }
     }
 
-    // Runs when the last initiator/allocator reference dies — with the
-    // process-wide pin in place, that can only happen during static
-    // destruction at process exit. spdk_env_fini is serialized with Acquire
-    // via RegistryMutex: a concurrent Acquire holds the same mutex while
-    // running spdk_env_init, so DPDK teardown and re-init can never race.
+    // Runs when the last reference dies. With the process-wide pin in place,
+    // that is static destruction at process exit at the earliest — and in
+    // HAVE_SPDK_MEM_REGISTER builds it never happens at all: the deliberately
+    // leaked NofRegistryBundle (below) holds a strong reference for the whole
+    // process lifetime, so spdk_env_fini intentionally stays unreachable
+    // there (SPDK v23.01.1 cannot be re-initialized after fini). spdk_env_fini
+    // is serialized with Acquire via RegistryMutex: a concurrent Acquire
+    // holds the same mutex while running spdk_env_init, so DPDK teardown and
+    // re-init can never race.
     struct Deleter {
         void operator()(SpdkEnvGuard* p) const {
             std::lock_guard<std::mutex> lock(RegistryMutex());
@@ -303,8 +307,10 @@ class SpdkInitiator::Impl {
                           "exit";
         }
 #endif
-        // env_guard_ released after all qpair/ctrlr teardown above;
-        // spdk_env_fini runs inside ~SpdkEnvGuard.
+        // env_guard_ is released after all qpair/ctrlr teardown above. That
+        // only drops this instance's reference: in HAVE_SPDK_MEM_REGISTER
+        // builds the leaked NofRegistryBundle keeps the env pinned for the
+        // whole process, so spdk_env_fini (in ~SpdkEnvGuard) never runs here.
     }
 
     NofSegmentHandle* OpenSegment(const std::string& tr_str) {
@@ -633,7 +639,10 @@ class SpdkInitiator::Impl {
                 return -1;
             }
         } else {
-            LOG(ERROR) << "No ns field found in transport string";
+            // ns: is optional (both forms are accepted, e.g. from Python);
+            // info->ns keeps its default of 1.
+            LOG(WARNING) << "No ns field found in transport string, "
+                            "defaulting to ns=1";
         }
 
         info->ctrlr_key = std::string(info->trid.traddr) + "|" +
