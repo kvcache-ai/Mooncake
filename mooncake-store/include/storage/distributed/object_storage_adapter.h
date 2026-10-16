@@ -27,6 +27,7 @@ struct ObjectGetRequest {
     std::string logical_key;
     void* buffer = nullptr;
     size_t size = 0;
+    uint64_t offset = 0;
 };
 
 /**
@@ -53,6 +54,12 @@ class ObjectStorageAdapter {
     virtual tl::expected<size_t, ErrorCode> Get(const std::string& logical_key,
                                                 void* buf, size_t len) = 0;
 
+    virtual tl::expected<size_t, ErrorCode> GetRange(
+        const std::string& logical_key, void* buf, size_t len, off_t offset) {
+        if (offset != 0) return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+        return Get(logical_key, buf, len);
+    }
+
     // Batch methods may be overridden by concurrent adapters. The default
     // implementation preserves compatibility by executing requests serially.
     // Return exactly one result per request, in the same order. Referenced
@@ -74,8 +81,8 @@ class ObjectStorageAdapter {
         std::vector<tl::expected<size_t, ErrorCode>> results;
         results.reserve(requests.size());
         for (const auto& request : requests) {
-            results.emplace_back(
-                Get(request.logical_key, request.buffer, request.size));
+            results.emplace_back(GetRange(request.logical_key, request.buffer,
+                                          request.size, request.offset));
         }
         return results;
     }

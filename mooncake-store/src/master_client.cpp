@@ -23,6 +23,36 @@ template <auto Method>
 struct RpcNameTraits;
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::GetObjectStorageConfig> {
+    static constexpr const char* value = "GetObjectStorageConfig";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::RegisterObjectStorageClient> {
+    static constexpr const char* value = "RegisterObjectStorageClient";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::PollObjectStorageTasks> {
+    static constexpr const char* value = "PollObjectStorageTasks";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::BeginObjectStorageUpload> {
+    static constexpr const char* value = "BeginObjectStorageUpload";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::FinishObjectStorageUpload> {
+    static constexpr const char* value = "FinishObjectStorageUpload";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::RevokeObjectStorageWrite> {
+    static constexpr const char* value = "RevokeObjectStorageWrite";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::ExistKey> {
     static constexpr const char* value = "ExistKey";
 };
@@ -1446,6 +1476,36 @@ std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchEvictDiskReplica(
             keys.size(), client_id_, keys, tenant_id, replica_type);
     timer.LogResponse("result=", result.size(), " operations");
     return result;
+}
+
+tl::expected<ObjectStorageConfig, ErrorCode>
+MasterClient::GetObjectStorageConfig() {
+    return invoke_rpc<&WrappedMasterService::GetObjectStorageConfig,
+                      ObjectStorageConfig>();
+}
+tl::expected<void, ErrorCode> MasterClient::RegisterObjectStorageClient() {
+    return invoke_rpc<&WrappedMasterService::RegisterObjectStorageClient, void>(
+        client_id_);
+}
+tl::expected<std::vector<ObjectStorageRecord>, ErrorCode>
+MasterClient::PollObjectStorageTasks() {
+    return invoke_rpc<&WrappedMasterService::PollObjectStorageTasks,
+                      std::vector<ObjectStorageRecord>>(client_id_);
+}
+tl::expected<void, ErrorCode> MasterClient::BeginObjectStorageUpload(
+    const std::string& object_key) {
+    return invoke_rpc<&WrappedMasterService::BeginObjectStorageUpload, void>(
+        client_id_, object_key);
+}
+tl::expected<void, ErrorCode> MasterClient::FinishObjectStorageUpload(
+    const std::string& object_key, ObjectUploadOutcome outcome) {
+    return invoke_rpc<&WrappedMasterService::FinishObjectStorageUpload, void>(
+        client_id_, object_key, outcome);
+}
+tl::expected<void, ErrorCode> MasterClient::RevokeObjectStorageWrite(
+    const std::string& key, ReplicaID target_id) {
+    return invoke_rpc<&WrappedMasterService::RevokeObjectStorageWrite, void>(
+        client_id_, key, tenant_id_.value(), target_id);
 }
 
 }  // namespace mooncake

@@ -177,12 +177,14 @@ DeserializeStandbyObjectMetadata(
 
         const auto lease_timeout = std::chrono::system_clock::time_point(
             std::chrono::milliseconds(lease_timestamp_ms));
-        if (size == 0 || lease_timeout <= now) {
+        if (size == 0) {
             return std::optional<StandbyObjectMetadata>();
         }
 
         std::vector<Replica::Descriptor> replicas;
         replicas.reserve(replica_count);
+        bool pending_background_upload = false;
+        bool has_memory_source = false;
         for (uint32_t i = 0; i < replica_count; ++i) {
             // Defensive bound: a corrupt entry whose first post-count field
             // looks like a data_type could otherwise read past the array.
@@ -201,16 +203,25 @@ DeserializeStandbyObjectMetadata(
             }
 
             const Replica& replica = *replica_result.value();
-            if (replica.status() != ReplicaStatus::COMPLETE ||
+            if ((!replica.is_completed() &&
+                 !replica.is_pending_background_object_storage_replica()) ||
                 (replica.is_memory_replica() &&
                  replica.has_invalid_mem_handle())) {
                 return std::optional<StandbyObjectMetadata>();
             }
 
+            pending_background_upload |=
+                replica.is_pending_background_object_storage_replica();
+            has_memory_source |= replica.is_memory_replica();
             replicas.emplace_back(replica.get_descriptor());
         }
 
-        if (replicas.empty()) {
+        // Pending object intents need their MEMORY source even without an
+        // outstanding read lease. Promotion reconciles them with the catalog.
+        if (replicas.empty() ||
+            (pending_background_upload && !has_memory_source) ||
+            (lease_timeout <= now &&
+             !(pending_background_upload && has_memory_source))) {
             return std::optional<StandbyObjectMetadata>();
         }
 

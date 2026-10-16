@@ -1,5 +1,7 @@
 #pragma once
 
+#include "storage/distributed/object_storage_catalog.h"
+
 #include <csignal>
 
 #include <string>
@@ -36,6 +38,20 @@ class WrappedMasterService {
                          const std::string& http_metadata_remote_url = "");
 
     ~WrappedMasterService();
+
+    tl::expected<ObjectStorageConfig, ErrorCode> GetObjectStorageConfig();
+    tl::expected<void, ErrorCode> RegisterObjectStorageClient(
+        const UUID& client_id);
+    tl::expected<std::vector<ObjectStorageRecord>, ErrorCode>
+    PollObjectStorageTasks(const UUID& client_id);
+    tl::expected<void, ErrorCode> BeginObjectStorageUpload(
+        const UUID& client_id, const std::string& object_key);
+    tl::expected<void, ErrorCode> FinishObjectStorageUpload(
+        const UUID& client_id, const std::string& object_key,
+        ObjectUploadOutcome outcome);
+    tl::expected<void, ErrorCode> RevokeObjectStorageWrite(
+        const UUID& client_id, const std::string& key,
+        const std::string& tenant_id, ReplicaID target_id);
 
     tl::expected<bool, ErrorCode> ExistKey(
         const std::string& key, const std::string& tenant_id = "default");

@@ -491,7 +491,7 @@ inline const Replica::Descriptor *SelectSessionReplica(
 
     for (const auto &replica : replicas) {
         if (replica.status == ReplicaStatus::COMPLETE &&
-            replica.is_dfs_replica()) {
+            (replica.is_dfs_replica() || replica.is_object_storage_replica())) {
             return &replica;
         }
     }
@@ -3410,7 +3410,8 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
     // the replica we selected, preventing accidental LOCAL_DISK picks.
     auto runtime_accelerator =
         device::GetAcceleratorRegistry().RuntimeAccelerators();
-    if ((replica.is_disk_replica() || replica.is_dfs_replica()) &&
+    if ((replica.is_disk_replica() || replica.is_dfs_replica() ||
+         replica.is_object_storage_replica()) &&
         runtime_accelerator.FindDeviceForPointer(buffer_handle->ptr())) {
         LOG(WARNING) << (replica.is_dfs_replica() ? "DFS" : "DISK")
                      << " replica for key '" << key
@@ -3771,7 +3772,8 @@ RealClient::batch_get_buffer_internal(
         // the read will fail.
         auto runtime_accelerator =
             device::GetAcceleratorRegistry().RuntimeAccelerators();
-        if ((replica.is_disk_replica() || replica.is_dfs_replica()) &&
+        if ((replica.is_disk_replica() || replica.is_dfs_replica() ||
+             replica.is_object_storage_replica()) &&
             runtime_accelerator.FindDeviceForPointer(buffer_handle->ptr())) {
             LOG(WARNING)
                 << (replica.is_dfs_replica() ? "DFS" : "DISK")
@@ -4142,7 +4144,8 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
             return static_cast<int64_t>(total_size);
         }
 
-        if (replica.is_disk_replica() || replica.is_dfs_replica()) {
+        if (replica.is_disk_replica() || replica.is_dfs_replica() ||
+            replica.is_object_storage_replica()) {
             // File-backed full read: use a contiguous temp buffer, then
             // scatter to the requested destination.
             const char *replica_type =
@@ -4288,6 +4291,15 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
                                                               objects);
             },
             src_offset + size);
+    }
+
+    if (replica.is_object_storage_replica()) {
+        std::vector<Slice> ranges{
+            {static_cast<char *>(buffer) + dst_offset, size}};
+        auto filtered = FilterQueryResult(query_result, replica, false);
+        auto result = client_->Get(key, filtered, ranges, src_offset);
+        if (!result) return tl::unexpected(result.error());
+        return static_cast<int64_t>(size);
     }
 
     if (replica.is_disk_replica() || replica.is_dfs_replica()) {
@@ -5931,7 +5943,8 @@ RealClient::batch_get_into_internal(
             results[i] = static_cast<int64_t>(total_size);
             continue;
         }
-        if (replica.is_disk_replica() || replica.is_dfs_replica()) {
+        if (replica.is_disk_replica() || replica.is_dfs_replica() ||
+            replica.is_object_storage_replica()) {
             // File-backed replicas cannot safely read directly into arbitrary
             // user buffers. Use a contiguous temp buffer, then scatter.
             disk_operations.emplace_back(
@@ -6466,7 +6479,8 @@ RealClient::classify_session_range_read_requests(
     for (auto &request : requests) {
         if (request.selected_replica.is_memory_replica()) {
             read_plan.memory_requests.push_back(std::move(request));
-        } else if (request.selected_replica.is_dfs_replica()) {
+        } else if (request.selected_replica.is_dfs_replica() ||
+                   request.selected_replica.is_object_storage_replica()) {
             read_plan.dfs_requests.push_back(std::move(request));
         } else {
             results[request.result_index] =
@@ -6764,9 +6778,11 @@ std::vector<int> RealClient::batch_put_session_start(
     // Session put only writes MEMORY replicas. Reliable configs that require
     // NoF completion cannot be finalized correctly on this path.
     const auto write_mode = DetermineReplicaWriteMode(config);
-    if (config.nof_replica_num > 0 &&
-        write_mode != ReplicaWriteMode::FLEXIBLE_DUAL_REPLICA) {
-        LOG(ERROR) << "batch_put_session_start rejects reliable NoF configs: "
+    if (config.os_replica_num > 0 ||
+        (config.nof_replica_num > 0 &&
+         write_mode != ReplicaWriteMode::FLEXIBLE_DUAL_REPLICA)) {
+        LOG(ERROR) << "batch_put_session_start requires memory-only or "
+                      "flexible NoF configs: "
                    << "session path never writes NoF "
                    << "(nof_replica_num=" << config.nof_replica_num
                    << ", replica_num=" << config.replica_num << ")";
@@ -7365,7 +7381,8 @@ RealClient::batch_get_into_multi_buffers_internal(
                 key_slices.emplace_back(Slice{buffers[j], sizes[j]});
             }
         } else if (replica.is_local_disk_replica() ||
-                   replica.is_disk_replica() || replica.is_dfs_replica()) {
+                   replica.is_disk_replica() || replica.is_dfs_replica() ||
+                   replica.is_object_storage_replica()) {
             // LOCAL_DISK: GPU buffers passed directly as scatter-gather slices
             // (zero-copy). DISK/DFS use a contiguous temp buffer at read time.
             if (valid_local_disk_ops.count(key)) {

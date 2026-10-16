@@ -149,6 +149,8 @@ uint64_t calculate_total_size(const Replica::Descriptor& replica) {
         total_length = disk_descriptor.object_size;
     } else if (replica.is_local_disk_replica()) {
         total_length = replica.get_local_disk_descriptor().object_size;
+    } else if (replica.is_object_storage_replica()) {
+        total_length = replica.get_object_storage_descriptor().object_size;
     } else if (replica.is_dfs_replica()) {
         total_length = replica.get_dfs_descriptor().object_size;
     } else if (replica.is_nof_replica()) {
@@ -174,6 +176,9 @@ int allocateSlices(std::vector<Slice>& slices,
     } else if (replica.is_local_disk_replica()) {
         slices.emplace_back(
             Slice{buffer_ptr, replica.get_local_disk_descriptor().object_size});
+    } else if (replica.is_object_storage_replica()) {
+        slices.emplace_back(Slice{
+            buffer_ptr, replica.get_object_storage_descriptor().object_size});
     } else if (replica.is_dfs_replica()) {
         slices.emplace_back(
             Slice{buffer_ptr, replica.get_dfs_descriptor().object_size});

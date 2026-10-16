@@ -2143,6 +2143,7 @@ PYBIND11_MODULE(store, m) {
         .def_readwrite("replica_num", &ReplicateConfig::replica_num)
         .def_readwrite("nof_replica_num", &ReplicateConfig::nof_replica_num)
         .def_readwrite("dfs_replica_num", &ReplicateConfig::dfs_replica_num)
+        .def_readwrite("os_replica_num", &ReplicateConfig::os_replica_num)
         .def_readwrite("soft_pin_action", &ReplicateConfig::soft_pin_action)
         .def_readwrite("soft_pin_ttl_ms", &ReplicateConfig::soft_pin_ttl_ms)
         .def_readwrite("with_hard_pin", &ReplicateConfig::with_hard_pin)
@@ -2178,8 +2179,19 @@ PYBIND11_MODULE(store, m) {
         .def_readwrite("file_path", &DiskDescriptor::file_path)
         .def_readwrite("object_size", &DiskDescriptor::object_size);
 
+    py::class_<ObjectStorageDescriptor>(m, "ObjectStorageDescriptor")
+        .def_readonly("object_key", &ObjectStorageDescriptor::object_key)
+        .def_readonly("object_size", &ObjectStorageDescriptor::object_size);
+
     py::class_<Replica::Descriptor>(m, "ReplicaDescriptor")
         .def_readonly("status", &Replica::Descriptor::status)
+        .def("is_object_storage_replica",
+             &Replica::Descriptor::is_object_storage_replica)
+        .def("get_object_storage_descriptor",
+             static_cast<const ObjectStorageDescriptor &(
+                 Replica::Descriptor::*)() const>(
+                 &Replica::Descriptor::get_object_storage_descriptor),
+             py::return_value_policy::reference_internal)
         .def("is_memory_replica",
              static_cast<bool (Replica::Descriptor::*)() const noexcept>(
                  &Replica::Descriptor::is_memory_replica))

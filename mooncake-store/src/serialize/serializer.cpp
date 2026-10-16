@@ -764,6 +764,15 @@ tl::expected<void, SerializationError> Serializer<Replica>::serialize(
             packer.pack(local_data->transport_endpoint);
             break;
         }
+        case ReplicaType::OBJECT_STORAGE: {
+            const auto &descriptor = replica.get_object_storage_descriptor();
+            packer.pack_array(4);
+            packer.pack(descriptor.object_key);
+            packer.pack(descriptor.object_size);
+            packer.pack(static_cast<uint8_t>(descriptor.write_mode));
+            packer.pack(descriptor.namespace_id);
+            break;
+        }
         case ReplicaType::DFS: {
             const auto *dfs_data = std::get_if<DfsReplicaData>(&replica.data_);
             if (!dfs_data) {
@@ -880,6 +889,31 @@ auto Serializer<Replica>::deserialize(const msgpack::object &obj,
 
             replica = std::make_shared<Replica>(
                 client_id, object_size, std::move(transport_endpoint), status);
+            break;
+        }
+        case static_cast<int8_t>(ReplicaType::OBJECT_STORAGE): {
+            const auto &payload = array_items[3];
+            if (payload.type != msgpack::type::ARRAY ||
+                payload.via.array.size != 4) {
+                return tl::unexpected(
+                    SerializationError(ErrorCode::DESERIALIZE_FAIL,
+                                       "Invalid object storage descriptor"));
+            }
+            const auto *fields = payload.via.array.ptr;
+            ObjectStorageDescriptor descriptor;
+            descriptor.object_key = fields[0].as<std::string>();
+            descriptor.object_size = fields[1].as<uint64_t>();
+            const auto mode = fields[2].as<uint8_t>();
+            descriptor.namespace_id = fields[3].as<std::string>();
+            if (descriptor.object_key.empty() || descriptor.object_size == 0 ||
+                mode > static_cast<uint8_t>(
+                           ObjectStorageWriteMode::OFFLOAD_ON_EVICT)) {
+                return tl::unexpected(SerializationError(
+                    ErrorCode::DESERIALIZE_FAIL,
+                    "Invalid object storage descriptor fields"));
+            }
+            descriptor.write_mode = static_cast<ObjectStorageWriteMode>(mode);
+            replica = std::make_shared<Replica>(std::move(descriptor), status);
             break;
         }
         case static_cast<int8_t>(ReplicaType::DFS): {

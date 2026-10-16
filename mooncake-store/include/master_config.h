@@ -1,5 +1,7 @@
 #pragma once
 
+#include "config/object_storage_config.h"
+
 #include <optional>
 #include <stdexcept>
 #include <string_view>
@@ -118,6 +120,7 @@ struct MasterConfig {
     uint32_t nof_heartbeat_failures_threshold;
 
     bool enable_ha;
+    ObjectStorageConfig object_storage;
     bool enable_offload;
     std::string ha_backend_type;
     std::string ha_backend_connstring;
@@ -254,6 +257,7 @@ class MasterServiceSupervisorConfig {
         "nof_heartbeat_probe_timeout_ms"};
     RequiredParam<uint32_t> nof_heartbeat_failures_threshold{
         "nof_heartbeat_failures_threshold"};
+    ObjectStorageConfig object_storage;
     RequiredParam<bool> enable_offload{"enable_offload"};
     RequiredParam<int> rpc_port{"rpc_port"};
     RequiredParam<size_t> rpc_thread_num{"rpc_thread_num"};
@@ -376,6 +380,7 @@ class MasterServiceSupervisorConfig {
         nof_heartbeat_probe_timeout_ms = config.nof_heartbeat_probe_timeout_ms;
         nof_heartbeat_failures_threshold =
             config.nof_heartbeat_failures_threshold;
+        object_storage = config.object_storage;
         enable_offload = config.enable_offload;
         offload_on_evict = config.offload_on_evict;
         offload_force_evict = config.offload_force_evict;
@@ -580,6 +585,7 @@ class WrappedMasterServiceConfig {
     uint32_t nof_heartbeat_failures_threshold =
         DEFAULT_NOF_HEARTBEAT_FAILURES_THRESHOLD;
     bool enable_ha = false;
+    ObjectStorageConfig object_storage;
     bool enable_offload = false;
     bool offload_on_evict = false;
     bool offload_force_evict = false;
@@ -679,6 +685,7 @@ class WrappedMasterServiceConfig {
         nof_heartbeat_failures_threshold =
             config.nof_heartbeat_failures_threshold;
         enable_ha = config.enable_ha;
+        object_storage = config.object_storage;
         enable_offload = config.enable_offload;
         offload_on_evict = config.offload_on_evict;
         offload_force_evict = config.offload_force_evict;
@@ -808,6 +815,7 @@ class WrappedMasterServiceConfig {
             config.nof_heartbeat_failures_threshold;
         enable_ha =
             true;  // This is used in HA mode, so enable_ha should be true
+        object_storage = config.object_storage;
         enable_offload = config.enable_offload;
         offload_on_evict = config.offload_on_evict;
         offload_force_evict = config.offload_force_evict;
@@ -910,6 +918,7 @@ class MasterServiceConfigBuilder {
     uint32_t nof_heartbeat_failures_threshold_ =
         DEFAULT_NOF_HEARTBEAT_FAILURES_THRESHOLD;
     bool enable_ha_ = false;
+    ObjectStorageConfig object_storage_;
     bool enable_offload_ = false;
     std::string ha_backend_type_ = "etcd";
     std::string ha_backend_connstring_;
@@ -1046,6 +1055,11 @@ class MasterServiceConfigBuilder {
 
     MasterServiceConfigBuilder& set_enable_ha(bool enable) {
         enable_ha_ = enable;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_object_storage(ObjectStorageConfig config) {
+        object_storage_ = std::move(config);
         return *this;
     }
 
@@ -1309,6 +1323,7 @@ class MasterServiceConfig {
     uint32_t nof_heartbeat_failures_threshold =
         DEFAULT_NOF_HEARTBEAT_FAILURES_THRESHOLD;
     bool enable_ha = false;
+    ObjectStorageConfig object_storage;
     bool enable_offload = false;
     bool offload_on_evict = false;
     bool offload_force_evict = false;
@@ -1404,6 +1419,7 @@ class MasterServiceConfig {
         nof_heartbeat_failures_threshold =
             config.nof_heartbeat_failures_threshold;
         enable_ha = config.enable_ha;
+        object_storage = config.object_storage;
         enable_offload = config.enable_offload;
         offload_on_evict = config.offload_on_evict;
         offload_force_evict = config.offload_force_evict;
@@ -1512,6 +1528,7 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.nof_heartbeat_probe_timeout_ms = nof_heartbeat_probe_timeout_ms_;
     config.nof_heartbeat_failures_threshold = nof_heartbeat_failures_threshold_;
     config.enable_ha = enable_ha_;
+    config.object_storage = object_storage_;
     config.enable_offload = enable_offload_;
     config.ha_backend_type = ha_backend_type_;
     config.ha_backend_connstring = ha_backend_connstring_;

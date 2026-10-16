@@ -17,6 +17,7 @@
 #include <ostream>
 
 #include "types.h"
+#include "config/object_storage_config.h"
 #include "allocator.h"
 #include "master_metric_manager.h"
 
@@ -38,7 +39,8 @@ inline std::ostream& operator<<(std::ostream& os,
                              {ReplicaType::LOCAL_DISK, "LOCAL_DISK"},
                              {ReplicaType::NOF_SSD, "NOF_SSD"},
                              {ReplicaType::ALL, "ALL"},
-                             {ReplicaType::DFS, "DFS"}};
+                             {ReplicaType::DFS, "DFS"},
+                             {ReplicaType::OBJECT_STORAGE, "OBJECT_STORAGE"}};
 
     os << (replica_type_strings.count(replicaType)
                ? replica_type_strings.at(replicaType)
@@ -105,6 +107,7 @@ struct ReplicateConfig {
     size_t replica_num{1};
     size_t nof_replica_num{0};
     size_t dfs_replica_num{0};
+    size_t os_replica_num{0};
     SoftPinAction soft_pin_action{SoftPinAction::PRESERVE};
     // Optional request-level override. When omitted, ENABLE uses the
     // master's default soft-pin TTL.
@@ -139,6 +142,7 @@ struct ReplicateConfig {
         os << "ReplicateConfig: { replica_num: " << config.replica_num
            << ", nof_replica_num: " << config.nof_replica_num
            << ", dfs_replica_num: " << config.dfs_replica_num
+           << ", os_replica_num: " << config.os_replica_num
            << ", soft_pin_action: " << config.soft_pin_action
            << ", soft_pin_ttl_ms: ";
         if (config.soft_pin_ttl_ms.has_value()) {
@@ -190,12 +194,12 @@ enum class ReplicaWriteMode {
 
 inline ReplicaWriteMode DetermineReplicaWriteMode(
     const ReplicateConfig& config) {
-    if (config.dfs_replica_num == 0 && config.replica_num == 1 &&
-        config.nof_replica_num == 1) {
+    if (config.os_replica_num == 0 && config.dfs_replica_num == 0 &&
+        config.replica_num == 1 && config.nof_replica_num == 1) {
         return ReplicaWriteMode::FLEXIBLE_DUAL_REPLICA;
     }
     if (config.replica_num > 1 || config.nof_replica_num > 1 ||
-        config.dfs_replica_num > 0) {
+        config.dfs_replica_num > 0 || config.os_replica_num > 0) {
         return ReplicaWriteMode::RELIABLE_MULTI_REPLICA;
     }
     return ReplicaWriteMode::SINGLE_REPLICA;
@@ -231,6 +235,20 @@ struct DistributedFSDescriptor {
     int shard_idx = 0;
     YLT_REFL(DistributedFSDescriptor, file_path, offset, object_size,
              aligned_size, shard_idx);
+};
+
+// An object name is never reused by a replacement write or reassigned task.
+struct ObjectStorageDescriptor {
+    std::string object_key;
+    uint64_t object_size{0};
+    ObjectStorageWriteMode write_mode{ObjectStorageWriteMode::SYNC};
+    std::string namespace_id;
+    YLT_REFL(ObjectStorageDescriptor, object_key, object_size, write_mode,
+             namespace_id);
+};
+
+struct ObjectStorageReplicaData {
+    ObjectStorageDescriptor descriptor;
 };
 
 struct DfsReplicaData {
@@ -289,6 +307,9 @@ class Replica {
 
     // dfs replica constructor
     Replica(DistributedFSDescriptor descriptor, ReplicaStatus status)
+        : Replica(next_id_.fetch_add(1), std::move(descriptor), status) {}
+
+    Replica(ObjectStorageDescriptor descriptor, ReplicaStatus status)
         : Replica(next_id_.fetch_add(1), std::move(descriptor), status) {}
 
     ~Replica() {
@@ -399,6 +420,23 @@ class Replica {
 
     [[nodiscard]] static bool fn_is_processing(const Replica& replica) {
         return replica.is_processing();
+    }
+
+    [[nodiscard]] bool is_object_storage_replica() const {
+        return std::holds_alternative<ObjectStorageReplicaData>(data_);
+    }
+    // Snapshot recovery retains this intent alongside its completed MEMORY
+    // source; the durable catalog still decides whether it was committed.
+    [[nodiscard]] bool is_pending_background_object_storage_replica() const {
+        return is_object_storage_replica() && is_processing() &&
+               get_object_storage_descriptor().write_mode !=
+                   ObjectStorageWriteMode::SYNC;
+    }
+    static bool fn_is_object_storage_replica(const Replica& replica) {
+        return replica.is_object_storage_replica();
+    }
+    const ObjectStorageDescriptor& get_object_storage_descriptor() const {
+        return std::get<ObjectStorageReplicaData>(data_).descriptor;
     }
 
     [[nodiscard]] bool is_busy() const { return refcnt_.load() > 0; }
@@ -637,6 +675,9 @@ class Replica {
         ReplicaType operator()(const LocalDiskReplicaData&) const {
             return ReplicaType::LOCAL_DISK;
         }
+        ReplicaType operator()(const ObjectStorageReplicaData&) const {
+            return ReplicaType::OBJECT_STORAGE;
+        }
         ReplicaType operator()(const DfsReplicaData&) const {
             return ReplicaType::DFS;
         }
@@ -645,10 +686,22 @@ class Replica {
     struct Descriptor {
         ReplicaID id{0};
         std::variant<MemoryDescriptor, NoFDescriptor, DiskDescriptor,
-                     LocalDiskDescriptor, DistributedFSDescriptor>
+                     LocalDiskDescriptor, DistributedFSDescriptor,
+                     ObjectStorageDescriptor>
             descriptor_variant;
         ReplicaStatus status;
         YLT_REFL(Descriptor, id, descriptor_variant, status);
+
+        bool is_object_storage_replica() const noexcept {
+            return std::holds_alternative<ObjectStorageDescriptor>(
+                descriptor_variant);
+        }
+        const ObjectStorageDescriptor& get_object_storage_descriptor() const {
+            return std::get<ObjectStorageDescriptor>(descriptor_variant);
+        }
+        ObjectStorageDescriptor& get_object_storage_descriptor() {
+            return std::get<ObjectStorageDescriptor>(descriptor_variant);
+        }
 
         // Helper functions
         bool is_memory_replica() noexcept {
@@ -821,11 +874,18 @@ class Replica {
           status_(status),
           refcnt_(0) {}
 
+    Replica(ReplicaID id, ObjectStorageDescriptor descriptor,
+            ReplicaStatus status)
+        : id_(id),
+          data_(ObjectStorageReplicaData{std::move(descriptor)}),
+          status_(status),
+          refcnt_(0) {}
+
     inline static std::atomic<ReplicaID> next_id_{1};
 
     ReplicaID id_;
     std::variant<MemoryReplicaData, NoFReplicaData, DiskReplicaData,
-                 LocalDiskReplicaData, DfsReplicaData>
+                 LocalDiskReplicaData, DfsReplicaData, ObjectStorageReplicaData>
         data_;
     ReplicaStatus status_{ReplicaStatus::UNDEFINED};
 
@@ -876,6 +936,8 @@ inline Replica::Descriptor Replica::get_descriptor() const {
         local_disk_desc.object_size = disk_data.object_size;
         local_disk_desc.transport_endpoint = disk_data.transport_endpoint;
         desc.descriptor_variant = std::move(local_disk_desc);
+    } else if (is_object_storage_replica()) {
+        desc.descriptor_variant = get_object_storage_descriptor();
     } else if (is_dfs_replica()) {
         desc.descriptor_variant = std::get<DfsReplicaData>(data_).descriptor;
     }

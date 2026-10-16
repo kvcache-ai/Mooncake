@@ -264,6 +264,7 @@ struct OssObjectStorageAdapter::BatchRequest {
     int upload_iovcnt = 0;
     void* download_buffer = nullptr;
     size_t size = 0;
+    uint64_t offset = 0;
 };
 
 struct OssObjectStorageAdapter::RequestContext {
@@ -305,8 +306,14 @@ OssObjectStorageAdapter::OssObjectStorageAdapter(std::string key_prefix)
         key_prefix_.pop_back();
 }
 
+OssObjectStorageAdapter::OssObjectStorageAdapter(ObjectStorageConfig config)
+    : OssObjectStorageAdapter(config.prefix) {
+    cluster_config_ = std::move(config);
+}
+
 tl::expected<void, ErrorCode> OssObjectStorageAdapter::Init() {
-    auto config = OssAdapterConfig::FromEnvironment();
+    auto config = OssAdapterConfig::FromEnvironment(
+        cluster_config_ ? &*cluster_config_ : nullptr);
     if (!config.has_value()) {
         return tl::make_unexpected(config.error());
     }
@@ -494,7 +501,10 @@ tl::expected<void, ErrorCode> OssObjectStorageAdapter::PrepareRequest(
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &context.download_context);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 5000L);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 120000L);
+    curl_easy_setopt(
+        curl, CURLOPT_TIMEOUT_MS,
+        cluster_config_ ? static_cast<long>(cluster_config_->request_timeout_ms)
+                        : 120000L);
     if (method == "HEAD") curl_easy_setopt(curl, CURLOPT_NOBODY, 1L);
     if (method == "PUT") {
         if (upload_iov) {
@@ -625,7 +635,8 @@ OssObjectStorageAdapter::RequestBatch(
         const std::string range =
             request.upload || request.size == 0
                 ? ""
-                : "bytes=0-" + std::to_string(request.size - 1);
+                : "bytes=" + std::to_string(request.offset) + "-" +
+                      std::to_string(request.offset + request.size - 1);
         auto prepared = PrepareRequest(
             context, request.upload ? "PUT" : "GET",
             LogicalToPhysicalKey(request.logical_key), {}, nullptr,
@@ -770,9 +781,14 @@ std::vector<tl::expected<size_t, ErrorCode>> OssObjectStorageAdapter::GetBatch(
             results[i] = size_t{0};
             continue;
         }
-        if (!request.buffer) continue;
+        if (!request.buffer ||
+            request.offset >
+                static_cast<uint64_t>(std::numeric_limits<off_t>::max()) ||
+            request.size - 1 >
+                std::numeric_limits<uint64_t>::max() - request.offset)
+            continue;
         batch.push_back({false, request.logical_key, nullptr, 0, request.buffer,
-                         request.size});
+                         request.size, request.offset});
         mapping.push_back(i);
     }
     auto batch_results = RequestBatch(batch);

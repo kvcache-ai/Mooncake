@@ -18,7 +18,8 @@ std::string ReadPrimaryOrAlias(const EnvironmentVariable<std::string>& primary,
 
 }  // namespace
 
-tl::expected<OssAdapterConfig, ErrorCode> OssAdapterConfig::FromEnvironment() {
+tl::expected<OssAdapterConfig, ErrorCode> OssAdapterConfig::FromEnvironment(
+    const ObjectStorageConfig* cluster) {
     using Variables = OssAdapterEnvironmentVariables;
     OssAdapterConfig config;
 
@@ -52,6 +53,13 @@ tl::expected<OssAdapterConfig, ErrorCode> OssAdapterConfig::FromEnvironment() {
                                    config.upload_buffer_size),
                    16 * 1024, 2 * 1024 * 1024);
 
+    if (cluster) {
+        config.endpoint = cluster->endpoint;
+        config.bucket = cluster->bucket;
+        config.region = cluster->region;
+        config.path_style = cluster->path_style;
+        config.anonymous = cluster->anonymous;
+    }
     while (!config.endpoint.empty() && config.endpoint.back() == '/') {
         config.endpoint.pop_back();
     }

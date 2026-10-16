@@ -1,6 +1,8 @@
 #pragma once
 
 #include <map>
+#include <optional>
+#include "config/object_storage_config.h"
 #include <span>
 #include <string>
 #include <vector>
@@ -18,6 +20,7 @@ namespace mooncake {
 class OssObjectStorageAdapter : public ObjectStorageAdapter {
    public:
     explicit OssObjectStorageAdapter(std::string key_prefix);
+    explicit OssObjectStorageAdapter(ObjectStorageConfig config);
     ~OssObjectStorageAdapter() override = default;
 
     tl::expected<void, ErrorCode> Put(const std::string& logical_key,
@@ -42,7 +45,7 @@ class OssObjectStorageAdapter : public ObjectStorageAdapter {
     // ObjectStorageAdapter contract.
     tl::expected<size_t, ErrorCode> GetRange(const std::string& logical_key,
                                              void* buf, size_t len,
-                                             off_t offset);
+                                             off_t offset) override;
     tl::expected<size_t, ErrorCode> GetV(const std::string& logical_key,
                                          const iovec* iov, int iovcnt,
                                          off_t offset);
@@ -90,6 +93,7 @@ class OssObjectStorageAdapter : public ObjectStorageAdapter {
         const std::string& timestamp,
         const std::map<std::string, std::string>& oss_headers) const;
 
+    std::optional<ObjectStorageConfig> cluster_config_;
     std::string endpoint_;
     std::string bucket_;
     std::string region_;

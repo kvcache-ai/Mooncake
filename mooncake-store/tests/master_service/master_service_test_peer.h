@@ -41,6 +41,27 @@ class MasterServiceTestPeer {
     static constexpr auto kPromotionCandidateMaxRetries =
         MasterService::kPromotionCandidateMaxRetries;
 
+    void SetObjectStorageForTesting(
+        std::unique_ptr<ObjectStorageCatalog> catalog,
+        std::shared_ptr<ObjectStorageAdapter> adapter,
+        bool recovery_complete = true) {
+        service_.object_storage_recovery_complete_ = recovery_complete;
+        service_.object_storage_catalog_ = std::move(catalog);
+        service_.object_storage_adapter_ = std::move(adapter);
+    }
+    ObjectStorageCatalog& ObjectStorageCatalogForTesting() {
+        return *service_.object_storage_catalog_;
+    }
+    void RunObjectStorageMaintenance() { service_.ReclaimObjectStorage(); }
+    void StopJobDispatchForTesting() {
+        service_.job_dispatch_running_ = false;
+        service_.job_dispatch_thread_.join();
+    }
+    void ProcessDrainJobsForTesting() { service_.ProcessDrainJobs(); }
+    ErrorCode RecoverObjectStorage() { return service_.RecoverObjectStorage(); }
+    auto ApplySnapshotState() {
+        return service_.ApplySnapshotState(std::chrono::system_clock::now());
+    }
     ErrorCode SetBatchOpLogBackendForTesting(
         std::shared_ptr<HaKvBackend> backend);
 
@@ -123,6 +144,10 @@ class MasterServiceTestPeer {
     }
     static const auto& DynamicReplicationWindows(const MasterService& service) {
         return service.dynamic_replication_windows_;
+    }
+
+    DfsAllocatorInterface& DfsAllocatorForTesting() {
+        return *service_.dfs_allocator_;
     }
 
     static auto& EnableDfs(MasterService& service) {

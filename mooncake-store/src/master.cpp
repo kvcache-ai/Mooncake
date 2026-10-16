@@ -209,6 +209,25 @@ DEFINE_validator(nof_eviction_ratio, [](const char* flagname, double value) {
 });
 DEFINE_bool(enable_ha, false,
             "Enable high availability using the configured HA backend");
+DEFINE_bool(object_storage_enabled, false, "Object storage enabled");
+DEFINE_string(object_storage_provider, "oss", "Object storage provider");
+DEFINE_string(object_storage_endpoint, "", "Object storage endpoint");
+DEFINE_string(object_storage_bucket, "", "Object storage bucket");
+DEFINE_string(object_storage_region, "", "Object storage region");
+DEFINE_string(object_storage_prefix, "mooncake/", "Object storage prefix");
+DEFINE_bool(object_storage_path_style, false, "Object storage path_style");
+DEFINE_bool(object_storage_anonymous, false, "Object storage anonymous");
+DEFINE_string(object_storage_write_mode, "sync", "Object storage write_mode");
+DEFINE_uint64(object_storage_max_object_bytes, 268435456,
+              "Object storage max_object_bytes");
+DEFINE_uint64(object_storage_max_pending_bytes, 1073741824,
+              "Object storage max_pending_bytes");
+DEFINE_uint64(object_storage_max_pending_objects, 10000,
+              "Object storage max_pending_objects");
+DEFINE_uint64(object_storage_maintenance_batch_size, 32,
+              "Object storage maintenance_batch_size");
+DEFINE_uint64(object_storage_request_timeout_ms, 30000,
+              "Object storage request_timeout_ms");
 DEFINE_bool(enable_offload, false, "Enable offload availability");
 DEFINE_bool(offload_on_evict, false,
             "Defer LOCAL_DISK offload to eviction time instead of PutEnd");
@@ -552,6 +571,49 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
 
     default_config.GetBool("enable_ha", &master_config.enable_ha,
                            FLAGS_enable_ha);
+    default_config.GetBool("object_storage_enabled",
+                           &master_config.object_storage.enabled,
+                           FLAGS_object_storage_enabled);
+    default_config.GetString("object_storage_provider",
+                             &master_config.object_storage.provider,
+                             FLAGS_object_storage_provider);
+    default_config.GetString("object_storage_endpoint",
+                             &master_config.object_storage.endpoint,
+                             FLAGS_object_storage_endpoint);
+    default_config.GetString("object_storage_bucket",
+                             &master_config.object_storage.bucket,
+                             FLAGS_object_storage_bucket);
+    default_config.GetString("object_storage_region",
+                             &master_config.object_storage.region,
+                             FLAGS_object_storage_region);
+    default_config.GetString("object_storage_prefix",
+                             &master_config.object_storage.prefix,
+                             FLAGS_object_storage_prefix);
+    default_config.GetBool("object_storage_path_style",
+                           &master_config.object_storage.path_style,
+                           FLAGS_object_storage_path_style);
+    default_config.GetBool("object_storage_anonymous",
+                           &master_config.object_storage.anonymous,
+                           FLAGS_object_storage_anonymous);
+    default_config.GetString("object_storage_write_mode",
+                             &master_config.object_storage.write_mode,
+                             FLAGS_object_storage_write_mode);
+    default_config.GetUInt64("object_storage_max_object_bytes",
+                             &master_config.object_storage.max_object_bytes,
+                             FLAGS_object_storage_max_object_bytes);
+    default_config.GetUInt64("object_storage_max_pending_bytes",
+                             &master_config.object_storage.max_pending_bytes,
+                             FLAGS_object_storage_max_pending_bytes);
+    default_config.GetUInt64("object_storage_max_pending_objects",
+                             &master_config.object_storage.max_pending_objects,
+                             FLAGS_object_storage_max_pending_objects);
+    default_config.GetUInt64(
+        "object_storage_maintenance_batch_size",
+        &master_config.object_storage.maintenance_batch_size,
+        FLAGS_object_storage_maintenance_batch_size);
+    default_config.GetUInt64("object_storage_request_timeout_ms",
+                             &master_config.object_storage.request_timeout_ms,
+                             FLAGS_object_storage_request_timeout_ms);
     default_config.GetBool("enable_offload", &master_config.enable_offload,
                            FLAGS_enable_offload);
     default_config.GetBool("offload_on_evict", &master_config.offload_on_evict,
@@ -934,6 +996,88 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
          !info.is_default) ||
         !conf_set) {
         master_config.enable_ha = FLAGS_enable_ha;
+    }
+    if ((google::GetCommandLineFlagInfo("object_storage_enabled", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.object_storage.enabled = FLAGS_object_storage_enabled;
+    }
+    if ((google::GetCommandLineFlagInfo("object_storage_provider", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.object_storage.provider = FLAGS_object_storage_provider;
+    }
+    if ((google::GetCommandLineFlagInfo("object_storage_endpoint", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.object_storage.endpoint = FLAGS_object_storage_endpoint;
+    }
+    if ((google::GetCommandLineFlagInfo("object_storage_bucket", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.object_storage.bucket = FLAGS_object_storage_bucket;
+    }
+    if ((google::GetCommandLineFlagInfo("object_storage_region", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.object_storage.region = FLAGS_object_storage_region;
+    }
+    if ((google::GetCommandLineFlagInfo("object_storage_prefix", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.object_storage.prefix = FLAGS_object_storage_prefix;
+    }
+    if ((google::GetCommandLineFlagInfo("object_storage_path_style", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.object_storage.path_style =
+            FLAGS_object_storage_path_style;
+    }
+    if ((google::GetCommandLineFlagInfo("object_storage_anonymous", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.object_storage.anonymous = FLAGS_object_storage_anonymous;
+    }
+    if ((google::GetCommandLineFlagInfo("object_storage_write_mode", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.object_storage.write_mode =
+            FLAGS_object_storage_write_mode;
+    }
+    if ((google::GetCommandLineFlagInfo("object_storage_max_object_bytes",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.object_storage.max_object_bytes =
+            FLAGS_object_storage_max_object_bytes;
+    }
+    if ((google::GetCommandLineFlagInfo("object_storage_max_pending_bytes",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.object_storage.max_pending_bytes =
+            FLAGS_object_storage_max_pending_bytes;
+    }
+    if ((google::GetCommandLineFlagInfo("object_storage_max_pending_objects",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.object_storage.max_pending_objects =
+            FLAGS_object_storage_max_pending_objects;
+    }
+    if ((google::GetCommandLineFlagInfo("object_storage_maintenance_batch_size",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.object_storage.maintenance_batch_size =
+            FLAGS_object_storage_maintenance_batch_size;
+    }
+    if ((google::GetCommandLineFlagInfo("object_storage_request_timeout_ms",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.object_storage.request_timeout_ms =
+            FLAGS_object_storage_request_timeout_ms;
     }
     if ((google::GetCommandLineFlagInfo("enable_offload", &info) &&
          !info.is_default) ||
@@ -1584,8 +1728,9 @@ int main(int argc, char* argv[]) {
         LOG(FATAL) << *error;
         return 1;
     }
-    if (!master_config.enable_ha && (!ha_backend_connstring.empty() ||
-                                     !master_config.etcd_endpoints.empty())) {
+    if (!master_config.enable_ha && !master_config.object_storage.enabled &&
+        (!ha_backend_connstring.empty() ||
+         !master_config.etcd_endpoints.empty())) {
         LOG(WARNING)
             << "HA backend connection string is set but will not be used in "
             << "non-HA mode";

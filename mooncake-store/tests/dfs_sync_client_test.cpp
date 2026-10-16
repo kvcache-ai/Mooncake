@@ -8,6 +8,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -305,6 +306,46 @@ TEST_F(DfsSyncClientTest, MissingDfsBackendRevokesObject) {
     auto query = client_without_backend->Query("sync_no_backend");
     ASSERT_FALSE(query.has_value());
     EXPECT_EQ(query.error(), ErrorCode::OBJECT_NOT_FOUND);
+}
+
+TEST_F(DfsSyncClientTest, BatchUpsertDfsFailuresUseOneBatchRevoke) {
+    SetEnv("MC_STORE_CLIENT_METRIC", "1");
+    auto client_without_backend = CreateClient("127.0.0.1:18105");
+    ASSERT_NE(client_without_backend, nullptr);
+    std::vector<std::string> keys{"upsert_no_backend_0", "upsert_no_backend_1",
+                                  "upsert_no_backend_2"};
+    std::vector<std::string> values(keys.size(), std::string(4096, 'B'));
+    auto slices = MakeSlices(values);
+
+    auto results =
+        client_without_backend->BatchUpsert(keys, slices, DfsConfig());
+    ASSERT_EQ(results.size(), keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        SCOPED_TRACE(keys[i]);
+        ASSERT_FALSE(results[i].has_value());
+        EXPECT_EQ(results[i].error(), ErrorCode::DFS_SERVICE_UNAVAILABLE);
+        auto query = client_without_backend->Query(keys[i]);
+        ASSERT_FALSE(query.has_value());
+        EXPECT_EQ(query.error(), ErrorCode::OBJECT_NOT_FOUND);
+    }
+
+    auto serialized = client_without_backend->SerializeMetrics();
+    ASSERT_TRUE(serialized.has_value());
+    const auto rpc_count = [&](const std::string& name) {
+        std::istringstream metrics(*serialized);
+        std::string line;
+        uint64_t count = 0;
+        while (std::getline(metrics, line)) {
+            if (line.rfind("mooncake_client_rpc_count{", 0) == 0 &&
+                line.find("rpc_name=\"" + name + "\"") != std::string::npos) {
+                count += std::stoull(line.substr(line.find('}') + 1));
+            }
+        }
+        return count;
+    };
+    EXPECT_EQ(rpc_count("BatchUpsertStart"), 1);
+    EXPECT_EQ(rpc_count("BatchUpsertRevoke"), 1);
+    EXPECT_EQ(rpc_count("UpsertRevoke"), 0);
 }
 
 TEST_F(DfsSyncClientTest, ExistingClientUsesOnlineExpandedDfsCapacity) {

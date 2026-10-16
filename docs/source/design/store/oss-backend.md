@@ -6,7 +6,7 @@ The object-storage backend extends Mooncake Store's client-owned offload path
 to key-based storage services, such as OSS and S3, through service-specific
 adapters. It uses the same `LOCAL_DISK` replica model as local-file and NVMe KV
 backends: the master records an owner and the requesting client reads through
-that owner. Object storage is not a separate first-class replica type here.
+that owner. This client-owned path remains available. The separate `OBJECT_STORAGE` tier described below supports direct reads without that owner.
 
 This document describes the OSS adapter implementation. Its signing protocol
 is OSS-specific; S3 requires a compatible adapter, not just a different endpoint.
@@ -181,3 +181,120 @@ the returned result vector preserves input order and cardinality.
   metadata usage can therefore differ from actual bucket usage.
 - Multipart uploads, automatic parallel range splitting, and automatic
   credential refresh are not implemented.
+
+
+## First-class object replicas
+
+Set `ReplicateConfig.os_replica_num = 1` to request one shared object replica
+alongside at least one MEMORY replica. The default is zero. Enable the tier on
+all participating processes with a build containing the OSS adapter and
+`STORE_USE_ETCD`. Mixed-version clusters are not supported for this protocol.
+A local SSD mount is not required.
+
+The Master publishes the non-secret target configuration. Every Client uses its
+own OSS credential environment variables from the deployment guide; the Master
+needs DELETE access. Credentials are not included in descriptors or RPC config.
+For example:
+
+```bash
+mooncake_master --port=50051 \
+  --object_storage_enabled=true \
+  --object_storage_endpoint=https://oss-cn-hangzhou.aliyuncs.com \
+  --object_storage_bucket=my-bucket \
+  --object_storage_region=cn-hangzhou \
+  --object_storage_prefix=my-cluster/ \
+  --object_storage_write_mode=sync \
+  --ha_backend_connstring=http://127.0.0.1:2379 \
+  --cluster_id=my-cluster
+```
+
+The same `object_storage_*` names are accepted in the Master config file.
+`object_storage_provider` currently accepts `oss`. Endpoint path style is
+controlled by `object_storage_path_style`; `object_storage_anonymous` is intended
+for services which explicitly allow unauthenticated access, including isolated
+HTTP tests. Normal OSS deployments supply credentials.
+
+| Mode | Foreground success | Background behavior |
+| --- | --- | --- |
+| `sync` | Every requested foreground replica, including the object PUT, has completed and the Master commits the write. | MEMORY can subsequently be evicted. |
+| `async` | Foreground transfers complete, the durable upload intent is recorded, and the source MEMORY replica is protected. | Its owner uploads and reports completion. |
+| `offload_on_evict` | Foreground transfers complete and the deferred policy is recorded. | Eviction schedules upload; no MEMORY replica is evicted until the object completes. |
+
+An owner must register object-upload capability before a background-mode write
+is admitted. Uploads run on the Client's existing task executor. Only COMPLETE
+objects are readable; MEMORY remains preferred. Ordinary reads, batch reads,
+Python buffers and get-session ranges can use the shared object directly after
+the memory owner exits. Range-only put sessions remain memory-only and reject
+`os_replica_num > 0`; ordinary and batch Put/Upsert support the tier.
+
+### Durability and reclamation
+
+Enabling this tier requires the existing transactional etcd backend even when
+Master HA is disabled. The namespace-fenced catalog lives under
+`/mooncake/object-storage/<cluster_id>/`. It durably records foreground commits,
+upload claims, source identities and pending deletions. Its binary payloads are
+Base64 encoded for the existing JSON-based range interface. A restart restores
+completed objects without requiring their former owner; HA reconciliation runs
+after standby metadata restoration. Losing every MEMORY replica before a
+background upload completes can still lose that object. The catalog keeps one
+logical head per key after physical GC, so a lagging HA snapshot cannot revive
+an older generation. These heads are not currently compacted; metadata usage
+grows with the number of distinct logical keys ever written to this tier.
+
+Endpoint, bucket, region and prefix must remain fixed for a catalog. Reusing a
+cluster ID with a different target fails startup. Use a distinct cluster ID and
+prefix for a rebuilt independent cluster.
+
+Each write generation and retry after a failed upload gets a new object name.
+An upload claim permits one PUT. This deliberately avoids retrying an ambiguous
+PUT into a name whose DELETE may already have run. Completion notifications
+are idempotent and release only their own source protection. Deletion retires
+all attempts of the logical object durably before removing metadata. An active
+background uploader prevents Remove/Upsert from freeing its source until its
+completion notification arrives (`OBJECT_HAS_REPLICATION_TASK`); Move and
+segment clearing also honor source references. If retirement cannot be
+confirmed because the durable KV is unavailable, the operation returns an
+error and stops granting new read leases; retry the deletion after KV recovery.
+Reclamation waits until the
+outstanding read lease has ended. Existing background maintenance issues
+bounded DELETE requests without listing the bucket.
+
+A timed-out PUT can materialize after a DELETE. Such an uncertain attempt keeps
+a durable tombstone and is deleted again on later maintenance rounds. The
+record is retained until the uploader confirms it has finished; an uploader
+which permanently disappears can therefore leave a persistent tombstone.
+Admission applies backpressure rather than discarding that uncertainty.
+When the uploader confirms that no PUT was started, the catalog atomically
+transfers the old attempt's reservation to a fresh name. This permits retries
+with a single pending slot without dropping the durable retry intent.
+
+Defaults: `object_storage_max_object_bytes=268435456` (256 MiB),
+`object_storage_max_pending_bytes=1073741824` (1 GiB),
+`object_storage_max_pending_objects=10000`,
+`object_storage_maintenance_batch_size=32`, and
+`object_storage_request_timeout_ms=30000`. Deferred policies do not consume the
+pending upload budget until scheduled. Retired names also count against the
+backlog budget. Client staging is bounded by the byte budget; reads use chunks
+of at most 4 MiB. The first implementation processes object entries in batch
+Put/Upsert sequentially; it does not claim HTTP batch throughput improvements.
+Existing checksum metadata is used, never provider ETags.
+A read which outlasts its lease returns `LEASE_EXPIRED`.
+
+### Verification
+
+`object_storage_test` exercises catalog fencing, lost transaction replies,
+retirement/late PUT, admission limits, range validation, Master commit and
+restart behavior, and eviction ordering. `object_storage_integration.py` starts
+isolated etcd and Master processes plus an HTTP object fixture, then drives the
+compiled Python SDK. Its HTTP fixture exercises the protocol and lifecycle; it
+does not replace a live OSS signing/credential acceptance test. The existing
+`oss_adapter_test` contains adapter fault-injection and opt-in live OSS tests.
+
+With a CUDA build, add `--gpu` to the integration test to exercise device-memory
+Put/Upsert, direct Get and get-session ranges. For example (set the build's
+shared-library directories in `LD_LIBRARY_PATH` when not installed):
+
+```bash
+python mooncake-store/tests/object_storage_integration.py \
+  --build build --etcd /path/to/etcd --gpu
+```

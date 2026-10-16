@@ -1,5 +1,7 @@
 #pragma once
 
+#include "storage/distributed/object_storage_backend.h"
+
 #include <atomic>
 #include <boost/functional/hash.hpp>
 #include <condition_variable>
@@ -921,6 +923,20 @@ class Client {
                                             const WriteBufferStager& stager);
     void SubmitTransfers(std::vector<PutOperation>& ops);
     void WaitForTransfers(std::vector<PutOperation>& ops);
+    void SubmitObjectStorageWrites(std::vector<PutOperation>& ops);
+    ErrorCode InitObjectStorage();
+    ErrorCode WriteObjectStorageReplica(const Replica::Descriptor& replica,
+                                        const std::vector<Slice>& slices);
+    ErrorCode ReadObjectStorageReplica(const Replica::Descriptor& replica,
+                                       const std::vector<Slice>& slices,
+                                       uint64_t offset);
+    void PollObjectStorage();
+    std::shared_ptr<ObjectStorageBackend> object_storage_backend_;
+    std::atomic<bool> object_storage_running_{false};
+    std::mutex object_storage_completions_mutex_;
+    std::unordered_map<std::string, ObjectUploadOutcome>
+        object_storage_completions_;
+
     void SubmitDfsWrites(std::vector<PutOperation>& ops);
     void FinalizeBatchPut(std::vector<PutOperation>& ops);
     void StartBatchUpsert(std::vector<PutOperation>& ops,

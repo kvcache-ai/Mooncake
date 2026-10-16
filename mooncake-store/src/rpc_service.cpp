@@ -10,6 +10,7 @@
 
 #include "master_metric_manager.h"
 #include "master_service.h"
+#include "ha/oplog/oplog_test_failpoint.h"
 #include "rpc_helper.h"
 #include "types.h"
 #include "common/scoped_vlog_timer.h"
@@ -89,6 +90,39 @@ WrappedMasterService::WrappedMasterService(
     } else if (!http_metadata_remote_url.empty()) {
         master_service_.setHttpMetadataRemoteUrl(http_metadata_remote_url);
     }
+}
+
+tl::expected<ObjectStorageConfig, ErrorCode>
+WrappedMasterService::GetObjectStorageConfig() {
+    return master_service_.GetObjectStorageConfig();
+}
+tl::expected<void, ErrorCode> WrappedMasterService::RegisterObjectStorageClient(
+    const UUID& client_id) {
+    return master_service_.RegisterObjectStorageClient(client_id);
+}
+tl::expected<std::vector<ObjectStorageRecord>, ErrorCode>
+WrappedMasterService::PollObjectStorageTasks(const UUID& client_id) {
+    return master_service_.PollObjectStorageTasks(client_id);
+}
+tl::expected<void, ErrorCode> WrappedMasterService::BeginObjectStorageUpload(
+    const UUID& client_id, const std::string& object_key) {
+    return master_service_.BeginObjectStorageUpload(client_id, object_key);
+}
+tl::expected<void, ErrorCode> WrappedMasterService::FinishObjectStorageUpload(
+    const UUID& client_id, const std::string& object_key,
+    ObjectUploadOutcome outcome) {
+    if (TestFailPoint::Wait("object_storage_finish_rpc_failure"))
+        return tl::make_unexpected(ErrorCode::RPC_FAIL);
+    return master_service_.FinishObjectStorageUpload(client_id, object_key,
+                                                     outcome);
+}
+tl::expected<void, ErrorCode> WrappedMasterService::RevokeObjectStorageWrite(
+    const UUID& client_id, const std::string& key, const std::string& tenant_id,
+    ReplicaID target_id) {
+    return WithRequestTenant(tenant_id, [&](const TenantId& tenant) {
+        return master_service_.RevokeObjectStorageWrite(client_id, key, tenant,
+                                                        target_id);
+    });
 }
 
 WrappedMasterService::~WrappedMasterService() = default;
@@ -1802,6 +1836,24 @@ void RegisterRpcService(
     server
         .register_handler<&mooncake::WrappedMasterService::BatchGetReplicaList>(
             &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::GetObjectStorageConfig>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::RegisterObjectStorageClient>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::PollObjectStorageTasks>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::BeginObjectStorageUpload>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::FinishObjectStorageUpload>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::RevokeObjectStorageWrite>(
+        &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::PutStart>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::PutEnd>(

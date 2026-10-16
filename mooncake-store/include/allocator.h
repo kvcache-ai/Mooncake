@@ -25,12 +25,13 @@ namespace mooncake {
  * @brief Type of buffer allocator used in the system
  */
 enum class ReplicaType {
-    MEMORY = 0,      // Memory replica
-    DISK = 1,        // Disk replica
-    LOCAL_DISK = 2,  // Local disk replica
-    NOF_SSD = 3,     // Nvme-oF SSD replica
-    ALL = 4,         // All synchronous replicas in put finalize path
-    DFS = 100,       // Distributed filesystem page-offset replica
+    MEMORY = 0,            // Memory replica
+    DISK = 1,              // Disk replica
+    LOCAL_DISK = 2,        // Local disk replica
+    NOF_SSD = 3,           // Nvme-oF SSD replica
+    ALL = 4,               // All synchronous replicas in put finalize path
+    OBJECT_STORAGE = 101,  // Shared, immutable object replica
+    DFS = 100,             // Distributed filesystem page-offset replica
 };
 
 struct LiveAllocation {

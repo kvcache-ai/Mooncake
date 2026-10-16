@@ -11,6 +11,8 @@ set(MOONCAKE_STORE_SHARED_SOURCES
     etcd_helper.cpp
     uds_transport.cpp
     config/distributed_storage_config.cpp
+    config/object_storage_config.cpp
+    storage/distributed/object_storage_backend.cpp
     config/rpc_protocol_config.cpp
     storage/distributed/distributed_storage_backend.cpp
     storage/distributed/posix_fs_adapter.cpp
@@ -26,6 +28,8 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     segment_allocator_registration.cpp
     client_offboarding.cpp
     master_service.cpp
+    master_object_storage.cpp
+    storage/distributed/object_storage_catalog.cpp
     master_snapshot_manager.cpp
     master_snapshot_repository.cpp
     master_metric_manager.cpp
@@ -98,6 +102,7 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     config/mmap_arena_config.cpp
     common/mmap_buffer.cpp
     client_service.cpp
+    client_object_storage.cpp
     client_metric.cpp
     master_client.cpp
     storage_backend.cpp
@@ -205,7 +210,7 @@ if(CURL_FOUND AND OpenSSL_FOUND)
   set(MOONCAKE_OSS_ADAPTER_ENABLED
       TRUE
       CACHE INTERNAL "Whether the Alibaba Cloud OSS adapter is built")
-  list(APPEND MOONCAKE_STORE_CLIENT_SOURCES config/oss_adapter_config.cpp
+  list(APPEND MOONCAKE_STORE_SHARED_SOURCES config/oss_adapter_config.cpp
        storage/distributed/oss_adapter.cpp)
   list(APPEND EXTRA_LIBS CURL::libcurl OpenSSL::Crypto)
   add_definitions(-DHAVE_OSS_ADAPTER)
@@ -449,6 +454,8 @@ add_library(mooncake_store_shared_objects OBJECT
             ${MOONCAKE_STORE_SHARED_SOURCES})
 set_target_properties(mooncake_store_shared_objects
                       PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(mooncake_store_shared_objects
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(mooncake_store_shared_objects
                            PRIVATE ${MOONCAKE_STORE_INCLUDE_DIRS})
 target_link_libraries(

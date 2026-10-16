@@ -1,5 +1,7 @@
 #pragma once
 
+#include "storage/distributed/object_storage_catalog.h"
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -144,6 +146,20 @@ class MasterService {
     MasterService();
     MasterService(const MasterServiceConfig& config);
     ~MasterService();
+
+    tl::expected<ObjectStorageConfig, ErrorCode> GetObjectStorageConfig();
+    tl::expected<void, ErrorCode> RegisterObjectStorageClient(
+        const UUID& client_id);
+    tl::expected<std::vector<ObjectStorageRecord>, ErrorCode>
+    PollObjectStorageTasks(const UUID& client_id);
+    tl::expected<void, ErrorCode> BeginObjectStorageUpload(
+        const UUID& client_id, const std::string& object_key);
+    tl::expected<void, ErrorCode> FinishObjectStorageUpload(
+        const UUID& client_id, const std::string& object_key,
+        ObjectUploadOutcome outcome);
+    tl::expected<void, ErrorCode> RevokeObjectStorageWrite(
+        const UUID& client_id, const std::string& key,
+        const TenantId& tenant_id, ReplicaID target_id);
 
     [[nodiscard]] TieredStorageUsageSnapshot GetStorageUsageSnapshot() const;
     bool IsTenantQuotaEnabled() const;
@@ -1361,20 +1377,22 @@ class MasterService {
             const std::string&, ObjectMetadata&, TenantState&,
             MetadataShardAccessorRW&)>& evict_one_member);
 
-    std::unordered_map<std::string, ObjectMetadata>::iterator EraseMetadata(
-        TenantState& tenant_state,
-        std::unordered_map<std::string, ObjectMetadata>::iterator it,
-        const TenantId& tenant_id);
+    tl::expected<std::unordered_map<std::string, ObjectMetadata>::iterator,
+                 ErrorCode>
+    EraseMetadata(TenantState& tenant_state,
+                  std::unordered_map<std::string, ObjectMetadata>::iterator it,
+                  const TenantId& tenant_id);
     void ReleaseLocalDiskUsage(const std::vector<Replica>& replicas);
     enum class QuotaEraseMode {
         kFull,
         kPreserveOld,
         kAbortOnly,
     };
-    std::unordered_map<std::string, ObjectMetadata>::iterator EraseMetadata(
-        TenantState& tenant_state,
-        std::unordered_map<std::string, ObjectMetadata>::iterator it,
-        const TenantId& tenant_id, QuotaEraseMode quota_mode);
+    tl::expected<std::unordered_map<std::string, ObjectMetadata>::iterator,
+                 ErrorCode>
+    EraseMetadata(TenantState& tenant_state,
+                  std::unordered_map<std::string, ObjectMetadata>::iterator it,
+                  const TenantId& tenant_id, QuotaEraseMode quota_mode);
     tl::expected<void, ErrorCode> SettlePrimaryWriteQuotaIfReady(
         TenantState& tenant_state, ObjectMetadata& metadata);
     uint64_t CompletedMemoryQuotaCharge(const ObjectMetadata& metadata) const;
@@ -1392,12 +1410,13 @@ class MasterService {
     void LoadTenantQuotaPoliciesFromStoreOrThrow();
     void ApplyTenantQuotaPolicies(const TenantQuotaPolicySnapshot& snapshot);
     TenantQuotaPolicySnapshot BuildTenantQuotaPolicySnapshot() const;
-    std::unordered_map<std::string, ObjectMetadata>::iterator EraseMetadata(
-        TenantState& tenant_state,
-        std::unordered_map<std::string, ObjectMetadata>::iterator it,
-        const TenantId& tenant_id, QuotaEraseMode quota_mode,
-        MetadataShardAccessorRW* shard,
-        const std::vector<std::string>& previous_media_hint = {});
+    tl::expected<std::unordered_map<std::string, ObjectMetadata>::iterator,
+                 ErrorCode>
+    EraseMetadata(TenantState& tenant_state,
+                  std::unordered_map<std::string, ObjectMetadata>::iterator it,
+                  const TenantId& tenant_id, QuotaEraseMode quota_mode,
+                  MetadataShardAccessorRW* shard,
+                  const std::vector<std::string>& previous_media_hint = {});
     void FinalizeRemovedReplicasAfterDurable(
         const OpLogEntry& durable_entry,
         const std::vector<ReplicaID>& replica_ids, QuotaEraseMode quota_mode,
@@ -1791,13 +1810,16 @@ class MasterService {
         }
 
         // Delete current metadata (for PutRevoke or Remove operations)
-        void Erase(const std::vector<std::string>& previous_media_hint = {})
+        tl::expected<void, ErrorCode> Erase(
+            const std::vector<std::string>& previous_media_hint = {})
             NO_THREAD_SAFETY_ANALYSIS {
-            service_->EraseMetadata(*tenant_state_, it_, object_id_.tenant_id,
-                                    QuotaEraseMode::kFull, &shard_guard_,
-                                    previous_media_hint);
+            auto result = service_->EraseMetadata(
+                *tenant_state_, it_, object_id_.tenant_id,
+                QuotaEraseMode::kFull, &shard_guard_, previous_media_hint);
+            if (!result) return tl::make_unexpected(result.error());
             it_ = tenant_state_->metadata.end();
             MaybeEraseEmptyTenant();
+            return {};
         }
 
         void EraseFromProcessing() NO_THREAD_SAFETY_ANALYSIS {
@@ -2206,6 +2228,30 @@ class MasterService {
     void cleanupHttpMetadata(const std::string& segment_name);
 
     bool use_disk_replica_{false};
+    void InitObjectStorage(const MasterServiceConfig& config);
+    ErrorCode RecoverObjectStorage();
+    ErrorCode PrepareObjectStorage(ObjectMetadata& metadata);
+    ErrorCode CommitObjectStorageForeground(ObjectMetadata& metadata,
+                                            const ObjectMeta& meta);
+    void ReconcileObjectStorageTarget(ObjectMetadata& metadata);
+    bool ScheduleObjectStorage(ObjectMetadata& metadata);
+    void ReclaimObjectStorage();
+    ErrorCode RetireObjectStorage(ObjectMetadata& metadata);
+    void UpdateObjectStorageSourceReference(ObjectMetadata& metadata,
+                                            const ObjectStorageRecord& record,
+                                            bool acquire);
+    std::mutex object_storage_refs_mutex_;
+    std::unordered_set<ReplicaID> object_storage_refs_;
+    bool HasPendingObjectStorage(const ObjectMetadata& metadata) const;
+    // HA construction opens the catalog before standby metadata is restored.
+    // Maintenance may interpret missing metadata only after reconciliation.
+    std::atomic<bool> object_storage_recovery_complete_{false};
+    std::unique_ptr<ObjectStorageCatalog> object_storage_catalog_;
+    std::shared_ptr<ObjectStorageAdapter> object_storage_adapter_;
+    std::mutex object_storage_clients_mutex_;
+    std::unordered_set<UUID, boost::hash<UUID>> object_storage_clients_;
+    std::mutex object_storage_maintenance_mutex_;
+    std::string object_storage_maintenance_cursor_;
     bool enable_dfs_{false};
     std::unique_ptr<DfsAllocatorInterface> dfs_allocator_;
     DfsGlobalAllocator* shard_allocator_{nullptr};

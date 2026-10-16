@@ -1,5 +1,7 @@
 #pragma once
 
+#include "storage/distributed/object_storage_catalog.h"
+
 #include <atomic>
 #include <csignal>
 #include <memory>
@@ -110,6 +112,17 @@ class MasterClient {
           metrics_(metrics) {}
     // Drains in-flight RPCs before the pool member is released (#3909).
     ~MasterClient();
+
+    tl::expected<ObjectStorageConfig, ErrorCode> GetObjectStorageConfig();
+    tl::expected<void, ErrorCode> RegisterObjectStorageClient();
+    tl::expected<std::vector<ObjectStorageRecord>, ErrorCode>
+    PollObjectStorageTasks();
+    tl::expected<void, ErrorCode> BeginObjectStorageUpload(
+        const std::string& object_key);
+    tl::expected<void, ErrorCode> FinishObjectStorageUpload(
+        const std::string& object_key, ObjectUploadOutcome outcome);
+    tl::expected<void, ErrorCode> RevokeObjectStorageWrite(
+        const std::string& key, ReplicaID target_id);
 
     void EnableHaConnectionPolicy();
 
