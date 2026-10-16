@@ -1,0 +1,413 @@
+from __future__ import annotations
+
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - Python 3.10
+    import tomli as tomllib
+
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
+CLI_MODULES = (
+    "cli.py",
+    "cli_client.py",
+    "cli_bench.py",
+    "transfer_engine_topology_dump.py",
+)
+CLI_ENTRY_POINTS = {
+    "mooncake_master": "mooncake.cli:main",
+    "mooncake_client": "mooncake.cli_client:main",
+    "transfer_engine_bench": "mooncake.cli_bench:main",
+    "transfer_engine_topology_dump": "mooncake.transfer_engine_topology_dump:main",
+}
+STORE_RS_CLI_ENTRY_POINTS = {
+    "mooncake-store-rs-client": "mooncake._launcher:store_rs_client",
+    "mooncake-store-rs-admin": "mooncake._launcher:store_rs_admin",
+    "mooncake-store-rs-bench": "mooncake._launcher:store_rs_bench",
+}
+
+
+def test_scikit_build_core_is_the_only_build_backend() -> None:
+    project = tomllib.loads((REPOSITORY_ROOT / "pyproject.toml").read_text())
+
+    assert project["build-system"]["build-backend"] == "scikit_build_core.build"
+    assert project["tool"]["scikit-build"]["wheel"]["packages"] == ["python/mooncake"]
+    assert project["tool"]["scikit-build"]["install"]["components"] == ["python"]
+    assert project["tool"]["scikit-build"]["sdist"]["include"] == [
+        "extern/yalantinglibs/**",
+        "!extern/yalantinglibs/.git",
+    ]
+    assert project["tool"]["scikit-build"]["sdist"]["exclude"] == [
+        "extern/yalantinglibs/.git"
+    ]
+    assert "setuptools>=61" in project["build-system"]["requires"]
+    assert "pip>=23" in project["build-system"]["requires"]
+    assert project["tool"]["scikit-build"]["cmake"]["define"]["USE_CUDA"] is False
+    assert project["tool"]["scikit-build"]["cmake"]["define"]["WITH_EP"] is False
+    assert project["tool"]["scikit-build"]["cmake"]["define"]["WITH_STORE_RS"] is False
+
+
+def test_dependency_boundaries_are_declared() -> None:
+    project = tomllib.loads((REPOSITORY_ROOT / "pyproject.toml").read_text())
+    metadata = project["project"]
+
+    assert set(metadata["dependencies"]) == {"aiohttp", "msgpack", "requests"}
+    assert set(metadata["optional-dependencies"]["structured"]) == {
+        "numpy",
+        "pillow",
+    }
+    assert set(metadata["optional-dependencies"]) == {
+        "administration",
+        "dev",
+        "hardware",
+        "structured",
+        "vllm",
+    }
+    assert metadata["optional-dependencies"]["administration"] == ["paramiko"]
+
+
+def test_legacy_wheel_administration_extra_matches_root_project() -> None:
+    project = tomllib.loads((REPOSITORY_ROOT / "pyproject.toml").read_text())
+    legacy = tomllib.loads(
+        (REPOSITORY_ROOT / "mooncake-wheel" / "pyproject.toml").read_text()
+    )
+
+    assert (
+        legacy["project"]["optional-dependencies"]["administration"]
+        == project["project"]["optional-dependencies"]["administration"]
+    )
+    assert not any("paramiko" in dep for dep in legacy["project"]["dependencies"])
+
+
+def test_tracked_source_roots_contain_no_generated_native_artifacts() -> None:
+    package_root = REPOSITORY_ROOT / "python" / "mooncake"
+
+    assert (package_root / "__init__.py").is_file()
+    assert not list(package_root.rglob("*.so"))
+    assert not list((REPOSITORY_ROOT / "mooncake-pg" / "torch").rglob("*.so"))
+
+
+def test_structured_object_storage_has_one_authoritative_source() -> None:
+    package_root = REPOSITORY_ROOT / "python" / "mooncake"
+    test_root = REPOSITORY_ROOT / "python" / "tests" / "store"
+    legacy_package_root = REPOSITORY_ROOT / "mooncake-wheel" / "mooncake"
+    legacy_test_root = REPOSITORY_ROOT / "mooncake-wheel" / "tests"
+
+    for module in ("structured_object_store.py", "_fast_copy.c"):
+        assert (package_root / module).is_file()
+        assert not (legacy_package_root / module).exists()
+
+    for test in ("test_structured_object_store.py", "test_fast_copy.py"):
+        assert (test_root / test).is_file()
+        assert not (legacy_test_root / test).exists()
+
+    cmake = (REPOSITORY_ROOT / "python" / "CMakeLists.txt").read_text()
+    assert '"${CMAKE_CURRENT_SOURCE_DIR}/mooncake/_fast_copy.c"' in cmake
+
+    legacy_build_script = (REPOSITORY_ROOT / "scripts" / "build_wheel.sh").read_text()
+    migrated_modules = (
+        legacy_build_script.split("MIGRATED_PYTHON_MODULES=(", 1)[1]
+        .split(")", 1)[0]
+        .split()
+    )
+    assert {"structured_object_store.py", "_fast_copy.c"} <= set(migrated_modules)
+
+
+def test_http_metadata_service_has_one_authoritative_source(
+    tmp_path: Path,
+) -> None:
+    package_root = REPOSITORY_ROOT / "python" / "mooncake"
+    legacy_package_root = REPOSITORY_ROOT / "mooncake-wheel" / "mooncake"
+    test_root = REPOSITORY_ROOT / "python" / "tests" / "services"
+    legacy_test_root = REPOSITORY_ROOT / "mooncake-wheel" / "tests"
+
+    module = package_root / "http_metadata_server.py"
+    assert module.is_file()
+    assert not (legacy_package_root / module.name).exists()
+    assert (test_root / "test_http_metadata_server.py").is_file()
+    assert not (legacy_test_root / "test_http_metadata_server.py").exists()
+
+    project = tomllib.loads((REPOSITORY_ROOT / "pyproject.toml").read_text())
+    legacy_project = tomllib.loads(
+        (REPOSITORY_ROOT / "mooncake-wheel" / "pyproject.toml").read_text()
+    )
+    entry_point = "mooncake.http_metadata_server:main"
+    assert project["project"]["scripts"]["mooncake_http_metadata_server"] == entry_point
+    assert (
+        legacy_project["project"]["scripts"]["mooncake_http_metadata_server"]
+        == entry_point
+    )
+
+    integration_cmake = (
+        REPOSITORY_ROOT / "mooncake-integration" / "CMakeLists.txt"
+    ).read_text()
+    assert "../python/mooncake/http_metadata_server.py" in integration_cmake
+    assert "../mooncake-wheel/mooncake/http_metadata_server.py" not in integration_cmake
+
+    legacy_build_script = (REPOSITORY_ROOT / "scripts" / "build_wheel.sh").read_text()
+    migrated_modules = (
+        legacy_build_script.split("MIGRATED_PYTHON_MODULES=(", 1)[1]
+        .split(")", 1)[0]
+        .split()
+    )
+    assert "http_metadata_server.py" in migrated_modules
+
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = os.pathsep.join(
+        [
+            str(REPOSITORY_ROOT / "python"),
+            str(REPOSITORY_ROOT / "mooncake-wheel"),
+        ]
+    )
+    environment["PYTHONNOUSERSITE"] = "1"
+    import_check = f"""
+from pathlib import Path
+import mooncake.http_metadata_server as service
+
+assert Path(service.__file__).resolve() == Path({str(module)!r}).resolve()
+assert service.KVBootstrapServer is not None
+"""
+    subprocess.run(
+        [sys.executable, "-c", import_check],
+        cwd=tmp_path,
+        env=environment,
+        check=True,
+    )
+
+
+def test_async_store_has_one_authoritative_source() -> None:
+    canonical_module = REPOSITORY_ROOT / "python" / "mooncake" / "async_store.py"
+    legacy_module = (
+        REPOSITORY_ROOT / "mooncake-integration" / "store" / "async_store.py"
+    )
+
+    assert canonical_module.is_file()
+    assert not legacy_module.exists()
+    assert (
+        REPOSITORY_ROOT / "python" / "tests" / "store" / "test_async_store.py"
+    ).is_file()
+    assert (
+        REPOSITORY_ROOT / "python" / "tests" / "store" / "async_store_integration.py"
+    ).is_file()
+    assert not (REPOSITORY_ROOT / "scripts" / "test_async_store.py").exists()
+
+    cmake = (REPOSITORY_ROOT / "mooncake-integration" / "CMakeLists.txt").read_text()
+    legacy_builder = (REPOSITORY_ROOT / "scripts" / "build_wheel.sh").read_text()
+    assert '../python/mooncake/async_store.py"' in cmake
+    assert 'CMAKE_CURRENT_SOURCE_DIR}/store/async_store.py"' not in cmake
+    assert "cp python/mooncake/async_store.py " in legacy_builder
+    assert "cp mooncake-integration/store/async_store.py " not in legacy_builder
+
+
+def test_ep_modules_have_one_authoritative_source() -> None:
+    package_root = REPOSITORY_ROOT / "python" / "mooncake"
+    legacy_package_root = REPOSITORY_ROOT / "mooncake-wheel" / "mooncake"
+
+    for module in (
+        "ep.py",
+        "mooncake_ep_buffer.py",
+        "mooncake_elastic_buffer.py",
+    ):
+        assert (package_root / module).is_file()
+        assert not (legacy_package_root / module).exists()
+
+    test_root = REPOSITORY_ROOT / "python" / "tests" / "ep"
+    for test_file in (
+        "ep_test_utils.py",
+        "test_elastic_buffer.py",
+        "test_ep_grid.py",
+        "test_mooncake_ep.py",
+        "test_regmr_overhead.py",
+    ):
+        assert (test_root / test_file).is_file()
+
+    for legacy_test in (
+        REPOSITORY_ROOT / "mooncake-ep" / "tests" / "test_elastic_buffer.py",
+        REPOSITORY_ROOT / "mooncake-ep" / "tests" / "test_ep_grid.py",
+        REPOSITORY_ROOT / "mooncake-wheel" / "tests" / "ep_test_utils.py",
+        REPOSITORY_ROOT / "mooncake-wheel" / "tests" / "test_mooncake_ep.py",
+        REPOSITORY_ROOT / "mooncake-wheel" / "tests" / "test_regmr_overhead.py",
+    ):
+        assert not legacy_test.exists()
+
+
+def test_cli_has_one_authoritative_source_and_test_location() -> None:
+    package_root = REPOSITORY_ROOT / "python" / "mooncake"
+    legacy_package_root = REPOSITORY_ROOT / "mooncake-wheel" / "mooncake"
+
+    for module in CLI_MODULES:
+        assert (package_root / module).is_file()
+        assert not (legacy_package_root / module).exists()
+
+    assert (
+        REPOSITORY_ROOT / "python" / "tests" / "integration" / "test_cli.py"
+    ).is_file()
+    assert (
+        REPOSITORY_ROOT / "python" / "tests" / "unit" / "test_cli_modules.py"
+    ).is_file()
+    assert not (REPOSITORY_ROOT / "mooncake-wheel" / "tests" / "test_cli.py").exists()
+
+
+def test_scikit_build_consumes_unified_python_sources() -> None:
+    """Lock the Phase-2 cut-over invariants for the scikit-build wheel path.
+
+    These are read-only source checks. The scikit-build backend uses the
+    repository-root CMakeLists.txt, which must pull in python/CMakeLists.txt
+    (the \"unified\" Python sources) while mooncake-integration installs the
+    CLI binaries next to the package so the console scripts resolve them.
+
+    The root facade and Store-RS implementation are installed from the
+    canonical python/mooncake tree. Other integrations keep their current
+    source ownership until their separate migration.
+    """
+    root_cmake = (REPOSITORY_ROOT / "CMakeLists.txt").read_text()
+    # SKBUILD must route through the unified python/CMakeLists.txt.
+    assert "if(SKBUILD)" in root_cmake
+    assert "add_subdirectory(python)" in root_cmake
+
+    python_cmake = (REPOSITORY_ROOT / "python" / "CMakeLists.txt").read_text()
+    assert "../mooncake-wheel/mooncake/" in python_cmake
+    assert 'PATTERN "__init__.py" EXCLUDE' in python_cmake
+    # Modules still supplied from the legacy tree at build time. Phase 2 should
+    # migrate these into python/mooncake and drop the DIRECTORY rule above.
+    for module in (
+        "mooncake_store_service.py",
+        "mooncake_connector_v1.py",
+        "vllm_v1_proxy_server.py",
+        "pg.py",
+        "dataproto_catalog.py",
+    ):
+        assert (REPOSITORY_ROOT / "mooncake-wheel" / "mooncake" / module).is_file()
+
+    integration_cmake = (
+        REPOSITORY_ROOT / "mooncake-integration" / "CMakeLists.txt"
+    ).read_text()
+    # The C++ Store extension is private; Python imports it through the facade.
+    assert "install(TARGETS mooncake_master mooncake_client" in integration_cmake
+    assert "RUNTIME DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR}" in integration_cmake
+    assert "if(WITH_TE AND BUILD_EXAMPLES)" in integration_cmake
+    assert 'OUTPUT_NAME "_store"' in integration_cmake
+    assert "../python/mooncake/store/" in integration_cmake
+    binding = (REPOSITORY_ROOT / "mooncake-integration/store/store_py.cpp").read_text()
+    assert "PYBIND11_MODULE(_store, m)" in binding
+
+    store_rs = REPOSITORY_ROOT / "mooncake-store-rs"
+    assert not (store_rs / "pyproject.toml").exists()
+    assert not (store_rs / "python/mooncake_store_rs.pth").exists()
+    assert not (store_rs / "python/mooncake_store_rs/_shim.py").exists()
+    assert (REPOSITORY_ROOT / "python/mooncake/store/rs/store.py").is_file()
+    assert (
+        REPOSITORY_ROOT / "python/tests/store/rs/test_structured_object_store.py"
+    ).is_file()
+
+
+def test_python_package_init_keeps_store_import_lazy() -> None:
+    """Importing Mooncake must leave backend selection to mooncake.store."""
+    init = (REPOSITORY_ROOT / "python" / "mooncake" / "__init__.py").read_text()
+    assert "from mooncake.buffer_pool import" not in init
+    assert "def __getattr__" in init
+    assert "from .store import BufferPool" in init
+
+    facade = (REPOSITORY_ROOT / "python/mooncake/store/__init__.py").read_text()
+    assert 'os.environ.get("MOONCAKE_STORE_BACKEND", "cpp")' in facade
+    assert "sys.meta_path" not in facade
+
+
+def test_cli_entry_points_remain_stable_across_build_interfaces() -> None:
+    for project_file in (
+        REPOSITORY_ROOT / "pyproject.toml",
+        REPOSITORY_ROOT / "mooncake-wheel" / "pyproject.toml",
+    ):
+        project = tomllib.loads(project_file.read_text())
+        scripts = project["project"]["scripts"]
+        assert {name: scripts[name] for name in CLI_ENTRY_POINTS} == CLI_ENTRY_POINTS
+
+    root_project = tomllib.loads((REPOSITORY_ROOT / "pyproject.toml").read_text())
+    scripts = root_project["project"]["scripts"]
+    assert {
+        name: scripts[name] for name in STORE_RS_CLI_ENTRY_POINTS
+    } == STORE_RS_CLI_ENTRY_POINTS
+    old_store_rs_commands = {
+        "mooncake-store-client",
+        "mooncake-store-admin",
+        "mooncake-store-bench",
+    }
+    assert old_store_rs_commands.isdisjoint(scripts)
+
+
+def test_cli_build_inputs_use_the_canonical_sources() -> None:
+    legacy_build = (REPOSITORY_ROOT / "scripts" / "build_wheel.sh").read_text()
+    assert 'MIGRATED_PYTHON_SOURCE_DIR="python/mooncake"' in legacy_build
+    for module in CLI_MODULES:
+        assert module in legacy_build
+    # The shared launcher must also be staged so the setuptools wheel has it.
+    assert "_launcher.py" in legacy_build
+    assert 'STORE_FACADE_SOURCE_DIR="python/mooncake/store"' in legacy_build
+    assert 'cp -R "${STORE_FACADE_SOURCE_DIR}"' in legacy_build
+
+    integration_cmake = (
+        REPOSITORY_ROOT / "mooncake-integration" / "CMakeLists.txt"
+    ).read_text()
+    for module in (
+        "cli.py",
+        "cli_client.py",
+        "cli_bench.py",
+        "transfer_engine_topology_dump.py",
+    ):
+        assert f"../python/mooncake/{module}" in integration_cmake
+        assert f"../mooncake-wheel/mooncake/{module}" not in integration_cmake
+
+
+def test_lightweight_modules_have_one_authoritative_source() -> None:
+    package_root = REPOSITORY_ROOT / "python" / "mooncake"
+    legacy_package_root = REPOSITORY_ROOT / "mooncake-wheel" / "mooncake"
+
+    for module in ("buffer_pool.py", "mooncake_config.py"):
+        assert (package_root / module).is_file()
+        assert not (legacy_package_root / module).exists()
+
+    assert (
+        REPOSITORY_ROOT / "python" / "tests" / "unit" / "test_mooncake_config.py"
+    ).is_file()
+    assert (
+        REPOSITORY_ROOT / "python" / "tests" / "store" / "test_buffer_pool_native.py"
+    ).is_file()
+    assert not (
+        REPOSITORY_ROOT / "mooncake-wheel" / "tests" / "test_mooncake_config.py"
+    ).exists()
+    assert not (
+        REPOSITORY_ROOT / "mooncake-wheel" / "tests" / "test_buffer_pool_native.py"
+    ).exists()
+
+
+def test_ssd_administration_modules_have_one_authoritative_source() -> None:
+    package_root = REPOSITORY_ROOT / "python" / "mooncake"
+    legacy_package_root = REPOSITORY_ROOT / "mooncake-wheel" / "mooncake"
+    direct_install = (
+        REPOSITORY_ROOT / "mooncake-integration" / "CMakeLists.txt"
+    ).read_text()
+    legacy_builder = (REPOSITORY_ROOT / "scripts" / "build_wheel.sh").read_text()
+    modules = (
+        "_administration.py",
+        "mooncake_ssd_register.py",
+        "mooncake_ssd_unregister.py",
+        "spdk_tgt_create.py",
+    )
+
+    for module in modules:
+        assert (package_root / module).is_file()
+        assert not (legacy_package_root / module).exists()
+        assert f"../python/mooncake/{module}" in direct_install
+        assert f"../mooncake-wheel/mooncake/{module}" not in direct_install
+        assert module in legacy_builder
+
+    assert (
+        REPOSITORY_ROOT / "python" / "tests" / "ssd" / "test_spdk_tgt_create.py"
+    ).is_file()
+    assert not (
+        REPOSITORY_ROOT / "mooncake-wheel" / "tests" / "test_spdk_tgt_create.py"
+    ).exists()

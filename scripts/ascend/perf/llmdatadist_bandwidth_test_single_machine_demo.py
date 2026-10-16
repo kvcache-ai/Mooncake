@@ -29,9 +29,13 @@ import logging
 import time
 from llm_datadist import LLMDataDist, LLMRole, LLMConfig, CacheDesc, Cache, DataType, RegisterMemStatus, BlocksCacheKey, \
     Placement
+import importlib
+
 import torch
-import torch_npu
-import torchair
+
+# Side-effect imports: register Ascend NPU backends used by tensor.npu().
+importlib.import_module("torch_npu")
+importlib.import_module("torchair")
 
 NPU_IP_LIST = ['192.168.1.1', '192.168.1.2', '192.168.1.3', '192.168.1.4',
                   '192.168.1.5', '192.168.1.6', '192.168.1.7', '192.168.1.8']
@@ -160,7 +164,7 @@ def run_prompt_sample(datadist, device_id: int):
                            placement=Placement.DEVICE)
     tensor = torch.ones(BLOCK_NUM, BLOCK_SIZE // 4, dtype=torch.float).npu()
     addr = int(tensor.data_ptr())
-    cache = cache_manager.register_blocks_cache(cache_desc, [addr], BlocksCacheKey(1, 0))
+    cache_manager.register_blocks_cache(cache_desc, [addr], BlocksCacheKey(1, 0))
     logging.info('[register_blocks_cache] success')
 
     comm_id = link(datadist, device_id, TARGRT_DEVICE_ID)

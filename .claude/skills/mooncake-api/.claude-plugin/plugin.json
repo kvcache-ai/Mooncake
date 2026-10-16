@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "mooncake-api",
+  "description": "Work with the Mooncake Store, Transfer Engine, and EP/Backend Python APIs.",
+  "author": {
+    "name": "Mooncake Team"
+  },
+  "homepage": "https://kvcache-ai.github.io/Mooncake/skills/mooncake-api.html",
+  "repository": "https://github.com/kvcache-ai/Mooncake",
+  "license": "Apache-2.0",
+  "keywords": ["mooncake", "python", "api", "transfer-engine", "store"]
+}

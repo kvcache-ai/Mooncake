@@ -139,8 +139,10 @@ TransferExecutorBase::ExecuteResult AsyncTransferExecutor::execute(
         }
         async_task_cv_.notify_one();
     }
-    disconnect(local_engine_idx, target_adxl_engine_name,
-               kDefaultDisconnectTime);
+    if (!params_.auto_connect) {
+        disconnect(local_engine_idx, target_adxl_engine_name,
+                   kDefaultDisconnectTime);
+    }
     return {.ret = -1, .status = status, .retryable = true};
 }
 
@@ -172,7 +174,8 @@ void AsyncTransferExecutor::queryThreadLoop() {
                         : poll_result.fail_reason;
                 failAllPendingOnRoute(batch.engine_idx,
                                       batch.target_adxl_engine_name,
-                                      pending_batches, reason);
+                                      pending_batches, reason,
+                                      poll_result.adxl_already_disconnected);
                 // failAllPendingOnRoute swap-pops may move unvisited batches to
                 // indices < i; restart the scan so none are skipped this cycle.
                 i = 0;
@@ -220,9 +223,10 @@ void AsyncTransferExecutor::markBatchFailed(QueryBatch& batch,
 
 void AsyncTransferExecutor::failAllPendingOnRoute(
     size_t engine_idx, const std::string& target,
-    std::vector<QueryBatch>& pending, const std::string& reason) {
+    std::vector<QueryBatch>& pending, const std::string& reason,
+    bool adxl_already_disconnected) {
     LOG(ERROR) << reason;
-    bool disconnected = false;
+    bool cleaned_up = false;
     for (size_t j = 0; j < pending.size();) {
         auto& batch = pending[j];
         if (batch.engine_idx != engine_idx ||
@@ -232,10 +236,14 @@ void AsyncTransferExecutor::failAllPendingOnRoute(
         }
 
         markBatchFailed(batch, reason, false);
-        if (!disconnected && engine_idx < adxl_engines_.size() &&
+        if (!cleaned_up && engine_idx < adxl_engines_.size() &&
             !target.empty()) {
-            disconnect(engine_idx, target, params_.connect_timeout);
-            disconnected = true;
+            if (params_.auto_connect && adxl_already_disconnected) {
+                forgetConnectedSegment(engine_idx, target);
+            } else {
+                disconnect(engine_idx, target, params_.connect_timeout);
+            }
+            cleaned_up = true;
         }
 
         std::swap(pending[j], pending.back());
@@ -284,6 +292,7 @@ void AsyncTransferExecutor::processOneBatch(QueryBatch& batch,
     if (ret != adxl::SUCCESS || task_status == adxl::TransferStatus::FAILED) {
         result.done = true;
         result.fail_entire_route = true;
+        result.adxl_already_disconnected = true;
         result.fail_reason = "Get transfer status failed, ret: " +
                              std::to_string(static_cast<int>(ret)) +
                              ", errmsg: " + aclGetRecentErrMsg();

@@ -15,6 +15,7 @@
 #include "tent/platform/rocm.h"
 #include "tent/common/status.h"
 #include "tent/common/utils/prefault.h"
+#include "char_util.h"
 
 #include <glog/logging.h>
 #include <fstream>
@@ -24,7 +25,6 @@
 #include <utility>
 #include <vector>
 #include <hip/hip_runtime.h>
-#include <ctype.h>
 #include <dirent.h>
 #include <infiniband/verbs.h>
 #include <limits.h>
@@ -65,7 +65,7 @@ static std::vector<Topology::NicEntry> listInfiniBandDevices() {
         std::ifstream(path) >> numa_node;
 
         devices.push_back(
-            Topology::NicEntry{.name = std::move(device_name),
+            Topology::NicEntry{.name = device_name,
                                .pci_bus_id = std::move(pci_bus_id),
                                .type = Topology::NIC_RDMA,
                                .numa_node = numa_node});
@@ -182,7 +182,7 @@ static void discoverRocmTopology(std::vector<Topology::NicEntry>& nic_list,
         char pci_bus_id[20];
         snprintf(pci_bus_id, sizeof(pci_bus_id), "%04x:%02x:%02x.%x",
                  prop.pciDomainID, prop.pciBusID, prop.pciDeviceID, 0);
-        for (char* ch = pci_bus_id; *ch; ch++) *ch = tolower(*ch);
+        for (char* ch = pci_bus_id; *ch; ch++) *ch = to_lower(*ch);
 
         int numa_node = getNumaNodeFromPciDevice(pci_bus_id);
         int min_distance = INT_MAX;
@@ -194,7 +194,7 @@ static void discoverRocmTopology(std::vector<Topology::NicEntry>& nic_list,
         }
 
         Topology::MemEntry entry;
-        entry.name = "rocm:" + std::to_string(i);
+        entry.name = makeAmdGpuLocation(i);
         entry.numa_node = numa_node;
         entry.pci_bus_id = pci_bus_id;
         entry.type = Topology::MEM_ROCM;
@@ -263,6 +263,20 @@ MemoryType RocmPlatform::getMemoryType(void* addr) {
     return MTYPE_CPU;
 }
 
+int RocmPlatform::getPointerDeviceId(void* addr) {
+    hipPointerAttribute_t attributes{};
+    if (hipPointerGetAttributes(&attributes, addr) != hipSuccess) {
+        // Clear the latched error so it cannot surface at an unrelated
+        // hipGetLastError() call site.
+        hipGetLastError();
+        return HIPStreamPool::kCurrentDevice;
+    }
+    if (attributes.type != hipMemoryTypeDevice) {
+        return HIPStreamPool::kCurrentDevice;
+    }
+    return attributes.device;
+}
+
 static inline uintptr_t alignPage(uintptr_t address) {
     const static size_t kPageSize = 4096;
     return address & ~(kPageSize - 1);
@@ -274,7 +288,7 @@ static inline std::string genCpuNodeName(int node) {
 }
 
 static inline std::string genRocmNodeName(int node) {
-    if (node >= 0) return "rocm:" + std::to_string(node);
+    if (node >= 0) return makeAmdGpuLocation(node);
     return kWildcardLocation;
 }
 

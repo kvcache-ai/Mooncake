@@ -57,8 +57,10 @@ class TransferExecutorBase {
         bool auto_connect = false;
         bool use_short_connection = false;
         bool use_buffer_pool = false;
-        bool dummy_real_mode = false;
+        bool agent_mode = false;
         bool roce_mode = false;
+        bool use_fabric_mem = false;
+        bool client_server_mode = false;
     };
 
     explicit TransferExecutorBase(const InitParams& params);
@@ -77,7 +79,7 @@ class TransferExecutorBase {
     void processSliceList(const std::vector<Transport::Slice*>& slice_list);
 
     int registerMem(void* addr, size_t length, adxl::MemType mem_type,
-                    bool use_buffer_pool, bool roce_mode, bool dummy_real_mode);
+                    bool use_buffer_pool, bool remote_accessible);
     int deregisterMem(void* addr);
 
     const size_t getNumEngines() const { return adxl_engines_.size(); }
@@ -94,6 +96,7 @@ class TransferExecutorBase {
     void finalizeEngines();
     void disconnectAllForEngine(size_t engine_idx);
     void recordConnectedSegment(size_t engine_idx, const std::string& remote);
+    void forgetConnectedSegment(size_t engine_idx, const std::string& remote);
 
     int checkAndConnect(size_t engine_idx,
                         const std::string& target_adxl_engine_name);
@@ -102,7 +105,9 @@ class TransferExecutorBase {
                    int32_t timeout_in_millis);
     std::string resolveTargetAdxlEngineName(
         const std::shared_ptr<TransferMetadata::SegmentDesc>& segment_desc,
-        size_t engine_idx) const;
+        uint64_t dest_addr) const;
+    void processHomogeneousSliceList(
+        const std::vector<Transport::Slice*>& slice_list);
 
     InitParams params_;
     std::unique_ptr<LocalCopyEngine> local_copy_engine_;

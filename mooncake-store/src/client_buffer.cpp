@@ -1,4 +1,4 @@
-#include "client_buffer.hpp"
+#include "client_buffer.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -8,7 +8,11 @@
 #include <fcntl.h>     // For O_CREAT, O_RDWR
 #include <unistd.h>    // For ftruncate, close, shm_unlink
 
-#include "utils.h"
+#include "common/client_buffer_allocation.h"
+
+#if defined(USE_SUNRISE)
+#include "sunrise_allocator.h"
+#endif
 
 namespace mooncake {
 
@@ -43,8 +47,15 @@ ClientBufferAllocator::ClientBufferAllocator(size_t size,
     if (use_hugepage_) {
         buffer_ = allocate_buffer_mmap_memory(size, alignment);
     } else {
-        buffer_ = allocate_buffer_allocator_memory(size, protocol, alignment,
-                                                   use_spdk_dma_);
+#if defined(USE_SUNRISE)
+        if (protocol == "sunrise_link") {
+            buffer_ = sunrise_allocate_memory(size, alignment, false);
+        } else
+#endif
+        {
+            buffer_ = allocate_buffer_allocator_memory(
+                size, protocol, alignment, use_spdk_dma_);
+        }
     }
     if (!buffer_) {
         throw std::bad_alloc();
@@ -69,7 +80,7 @@ ClientBufferAllocator::~ClientBufferAllocator() {
         if (use_hugepage_) {
             free_buffer_mmap_memory(buffer_, buffer_size_);
         } else {
-            free_memory(protocol, buffer_);
+            free_memory(protocol, buffer_, use_spdk_dma_);
         }
     }
 }
@@ -138,6 +149,8 @@ uint64_t calculate_total_size(const Replica::Descriptor& replica) {
         total_length = disk_descriptor.object_size;
     } else if (replica.is_local_disk_replica()) {
         total_length = replica.get_local_disk_descriptor().object_size;
+    } else if (replica.is_dfs_replica()) {
+        total_length = replica.get_dfs_descriptor().object_size;
     } else if (replica.is_nof_replica()) {
         total_length = replica.get_nof_descriptor().buffer_descriptor.size_;
     } else {
@@ -161,6 +174,9 @@ int allocateSlices(std::vector<Slice>& slices,
     } else if (replica.is_local_disk_replica()) {
         slices.emplace_back(
             Slice{buffer_ptr, replica.get_local_disk_descriptor().object_size});
+    } else if (replica.is_dfs_replica()) {
+        slices.emplace_back(
+            Slice{buffer_ptr, replica.get_dfs_descriptor().object_size});
     } else if (replica.is_nof_replica()) {
         auto& handle = replica.get_nof_descriptor().buffer_descriptor;
         void* chunk_ptr = buffer_ptr;

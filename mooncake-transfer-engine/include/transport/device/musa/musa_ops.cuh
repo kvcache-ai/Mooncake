@@ -9,8 +9,8 @@
 //   - atomicAdd_system / atomicCAS_system → infinite SelectionDAG loop.
 //     Use block-scope atomicAdd + __threadfence_system() instead.
 //   - Named barriers (bar.sync) → not available; use __syncthreads().
-//   - cooperative_groups::this_grid().sync() → not available; host uses
-//     separate kernel launches (return_recv_hook=true) so grid sync is a no-op.
+//   - cooperative_groups::this_grid().sync() → not available; host MUSA paths
+//     split SEND/RECV into separate kernel launches, so grid sync is a no-op.
 #pragma once
 
 #include <musa_runtime.h>
@@ -33,24 +33,31 @@ __device__ __forceinline__ uint64_t mc_ld_acquire_u64(const uint64_t* ptr) {
     return ret;
 }
 
+__device__ __forceinline__ uint64_t mc_ld_volatile_u64(const uint64_t* ptr) {
+    return *const_cast<volatile const uint64_t*>(ptr);
+}
+
 // ---------------------------------------------------------------------------
 // Release stores
 // ---------------------------------------------------------------------------
 __device__ __forceinline__ void mc_st_release(const int* ptr, int val) {
     __threadfence_system();
     *const_cast<volatile int*>(ptr) = val;
+    __threadfence_system();
 }
 
 __device__ __forceinline__ void mc_st_release_u32(const uint32_t* ptr,
                                                   uint32_t val) {
     __threadfence_system();
     *const_cast<volatile uint32_t*>(ptr) = val;
+    __threadfence_system();
 }
 
 __device__ __forceinline__ void mc_st_release_u64(const uint64_t* ptr,
                                                   uint64_t val) {
     __threadfence_system();
     *const_cast<volatile uint64_t*>(ptr) = val;
+    __threadfence_system();
 }
 
 // ---------------------------------------------------------------------------
@@ -58,22 +65,22 @@ __device__ __forceinline__ void mc_st_release_u64(const uint64_t* ptr,
 // ---------------------------------------------------------------------------
 __device__ __forceinline__ int mc_atomic_add_release(const int* ptr, int val) {
     __threadfence_system();
+    int ret = atomicAdd(const_cast<int*>(ptr), val);
+    __threadfence_system();
+    return ret;
+}
+
+// Finish counters are consumed by local CTA/count workers. Cross-GPU
+// publication is fenced once before the final per-expert signal.
+__device__ __forceinline__ int mc_atomic_add_relaxed(const int* ptr, int val) {
     return atomicAdd(const_cast<int*>(ptr), val);
 }
 
 // ---------------------------------------------------------------------------
-// Non-coherent loads — MUSA has no nc/no_allocate cache hints; use volatile.
-// int4 volatile copy not supported by MUSA compiler; copy field-by-field.
+// Non-coherent loads — use MUSA's vector cache-hinted intrinsic for int4.
+// Scalar metadata loads remain volatile so reused signal slots are observed.
 // ---------------------------------------------------------------------------
-__device__ __forceinline__ int4 mc_ld_nc(const int4* ptr) {
-    const volatile int* vp = reinterpret_cast<const volatile int*>(ptr);
-    int4 ret;
-    ret.x = vp[0];
-    ret.y = vp[1];
-    ret.z = vp[2];
-    ret.w = vp[3];
-    return ret;
-}
+__device__ __forceinline__ int4 mc_ld_nc(const int4* ptr) { return __ldg(ptr); }
 
 __device__ __forceinline__ int mc_ld_nc_s32(const int* ptr) {
     return *const_cast<volatile const int*>(ptr);
@@ -116,6 +123,30 @@ __device__ __forceinline__ void mc_bar_sync(int /*bar_id*/,
 // launches, so SEND and RECV never share a kernel invocation.  No-op.
 // ---------------------------------------------------------------------------
 __device__ __forceinline__ void mc_grid_sync() {}
+
+// ---------------------------------------------------------------------------
+// System-level memory fence: MUSA requires explicit __threadfence_system()
+// for cross-GPU (MTLink) visibility.  CUDA hardware guarantees this without
+// explicit fences, so mc_fence() is a no-op there.
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ void mc_fence() { __threadfence_system(); }
+
+// System-scope ordering without forcing a cache flush. This is sufficient
+// before publishing a local completion counter after P2P payload stores.
+__device__ __forceinline__ void mc_fence_noflush() {
+    __threadfence_system_noflush();
+}
+
+// ---------------------------------------------------------------------------
+// Fence/barrier/fence: ensures all threads' writes are globally visible
+// before any thread proceeds.  On MUSA, __syncthreads() does NOT imply a
+// memory fence, so explicit fences are needed on both sides.
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ void mc_fence_barrier_fence() {
+    mc_fence();
+    mc_bar_sync(0, 0);
+    mc_fence();
+}
 
 // ---------------------------------------------------------------------------
 // Byte-swap helpers — MUSA has no __byte_perm; implement manually.

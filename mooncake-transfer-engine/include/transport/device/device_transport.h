@@ -30,6 +30,7 @@
 // The header intentionally avoids including cuda_alike.h so it can be included
 // from pure C++ translation units.  Implementations include cuda_alike.h.
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -55,16 +56,18 @@ class P2pTransport {
     // Free a buffer previously returned by allocateBuffer.
     virtual void freeBuffer(void* ptr) = 0;
 
-    // Export an IPC handle for the buffer allocated by this rank.
-    // Returns a byte blob (serialised as int32_t array for Python compat).
-    // Returns empty vector if IPC is not needed (e.g. fabric memory).
+    // Export the metadata peers need to access this rank's buffer.
+    // Returns an opaque byte blob (serialised as int32_t array for Python
+    // compat). For classic IPC this is a cudaIpcMemHandle-like payload; for
+    // fabric-backed paths this carries a CUmemFabricHandle plus mapping size.
     virtual std::vector<int32_t> exportIpcHandle(void* ptr) = 0;
 
-    // Import peer IPC handles and populate the device-visible tables.
-    // remote_handles[i] is the handle exported by rank i (may be empty for
-    // ranks that use fabric memory or are on a different node).
+    // Import peer access metadata and populate the device-visible tables.
+    // remote_handles[i] is the blob exported by rank i.
     // active_ranks_mask[i] == 1 means rank i is participating.
     // After this call, availableTablePtr() and peerPtrsTablePtr() are valid.
+    // The tables are transport-scoped: a later call replaces the previously
+    // imported peer mapping context.
     virtual void importPeerHandles(
         void* local_ptr, int rank, int num_ranks,
         const std::vector<std::vector<int32_t>>& remote_handles,
@@ -97,11 +100,23 @@ struct RdmaLocalMetadata {
     std::vector<int32_t> lids;
 };
 
+// One memory registration owned by RdmaTransport.  The keys are exposed so a
+// device-side submitter can select the correct local key when a transport has
+// more than one registered source region.
+struct RdmaMemoryRegion {
+    void* addr = nullptr;
+    size_t size = 0;
+    uint32_t lkey = 0;
+    uint32_t rkey = 0;
+
+    bool operator==(const RdmaMemoryRegion&) const = default;
+};
+
 // ---------------------------------------------------------------------------
 // RdmaTransport
 //
 // Manages IBGDA QP lifecycle, MR registration, and the device-visible RDMA
-// context tables (raddrs, rkeys, qp_devctxs) used by the EP kernel.
+// context tables (raddrs, rkeys, qp_devctxs) used by device submitters.
 // ---------------------------------------------------------------------------
 class RdmaTransport {
    public:
@@ -114,7 +129,9 @@ class RdmaTransport {
                            int num_qps) = 0;
 
     // Register the GDR buffer for RDMA access.
-    virtual int registerMemory(void* ptr, size_t bytes) = 0;
+    virtual int registerMemory(void* ptr, size_t bytes,
+                               RdmaMemoryRegion& region) = 0;
+    virtual int unregisterMemory(const RdmaMemoryRegion& region) = 0;
 
     // Allocate the GPU-side control buffer (QP/CQ structures).
     virtual int allocateControlBuffer() = 0;
@@ -126,9 +143,20 @@ class RdmaTransport {
     // Destroy and recreate QPs (used when active_ranks changes).
     virtual int recreateQueuePairs(void* stream) = 0;
 
+    // After device submitters stop, wait for outstanding sends to complete.
+    // A non-zero result does not cancel work; reset or destroy QPs before
+    // releasing their registered memory. timeout_ms is shared across all QPs.
+    virtual int drainQueuePairs(void* stream, uint64_t timeout_ms) = 0;
+
+    // Reset [qp_offset, qp_offset + num_qps) to INIT in place, preserving QPNs
+    // and device pointers. Clears CQ/doorbell state and device-side counters.
+    // The caller must stop using these QPs before reset and until reconnect.
+    // On success, the supplied stream's reset work is complete on return.
+    virtual int resetQueuePairs(int qp_offset, int num_qps, void* stream) = 0;
+
     // Connect QPs to peers using exchanged metadata.
     // is_roce: true for RoCE, false for IB.
-    virtual int connectPeers(int local_rank, bool is_roce,
+    virtual int connectPeers(int local_rank, bool is_roce, uint32_t local_lkey,
                              const std::vector<int64_t>& remote_addrs,
                              const std::vector<int32_t>& remote_keys,
                              const std::vector<int32_t>& remote_qpns,
@@ -138,7 +166,8 @@ class RdmaTransport {
                              const std::vector<int>& active_ranks_mask) = 0;
 
     // Metadata for this rank, to be exchanged with peers.
-    virtual RdmaLocalMetadata localMetadata() const = 0;
+    virtual RdmaLocalMetadata localMetadata(
+        const RdmaMemoryRegion& region_to_publish) const = 0;
 
     // Device pointers to the tables consumed by the EP kernel.
     virtual void* raddrsPtr() = 0;     // uint64_t[num_ranks]
@@ -157,7 +186,7 @@ class RdmaTransport {
 // Create the platform-native P2P transport (NVLink on CUDA, MTLink on MUSA).
 std::unique_ptr<P2pTransport> createP2pDeviceTransport(int num_ranks);
 
-// Create the IBGDA RDMA transport backed by TE's RdmaContext.
+// Create an IBGDA RDMA transport with its own verbs/DevX resources.
 // device_filter: optional whitelist of NIC names (e.g. {"mlx5_1", "mlx5_2"}).
 //   Empty vector = auto-detect via TE's Topology::discover() with no filter.
 //   Non-empty = restrict discovery to these NICs, then pick the closest one.

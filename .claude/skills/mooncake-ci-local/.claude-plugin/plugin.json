@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "mooncake-ci-local",
+  "description": "Run Mooncake pre-PR local validation via scripts/run_ci_test.sh, reproducing the reproducible parts of GitHub Actions.",
+  "author": {
+    "name": "Mooncake Team"
+  },
+  "homepage": "https://kvcache-ai.github.io/Mooncake/skills/mooncake-ci-local.html",
+  "repository": "https://github.com/kvcache-ai/Mooncake",
+  "license": "Apache-2.0",
+  "keywords": ["mooncake", "ci", "validation", "pre-pr"]
+}

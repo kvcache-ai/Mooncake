@@ -5,7 +5,7 @@
 #include <string>
 #include <vector>
 
-#include "utils/zstd_util.h"
+#include "common/zstd_util.h"
 
 namespace mooncake::test {
 

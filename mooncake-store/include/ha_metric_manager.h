@@ -1,9 +1,12 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <mutex>
+#include <optional>
 #include <string>
+#include <utility>
 
 #include "ylt/metric/counter.hpp"
 #include "ylt/metric/gauge.hpp"
@@ -24,6 +27,123 @@ namespace mooncake {
  */
 class HAMetricManager {
    public:
+    enum class SnapshotOperation {
+        Schedule,
+        Upload,
+        Bootstrap,
+        Replay,
+        Publish,
+        Gc,
+        Prune,
+        Rebootstrap,
+        Count
+    };
+    enum class SnapshotSkipReason {
+        None,
+        Disabled,
+        Interval,
+        InFlight,
+        Stopped,
+        Promotion,
+        NoNewBatch,
+        CatchUp,
+        LeaseBusy,
+        CaptureUnavailable,
+        NoFallback,
+        InvalidPair,
+        FloorAhead,
+        Count
+    };
+    // Records failed/throwing operations too. Set error to zero only after
+    // successful completion; the default denotes an exception/incomplete call.
+    class SnapshotOperationTimer {
+       public:
+        explicit SnapshotOperationTimer(SnapshotOperation operation)
+            : operation_(operation) {}
+        ~SnapshotOperationTimer() {
+            HAMetricManager::instance().record_snapshot_operation(
+                operation_, error, start_);
+        }
+        SnapshotOperationTimer(const SnapshotOperationTimer&) = delete;
+        SnapshotOperationTimer& operator=(const SnapshotOperationTimer&) =
+            delete;
+        template <typename Result>
+        Result Success(Result result) {
+            error = 0;
+            return result;
+        }
+        int64_t error{-1};
+
+       private:
+        SnapshotOperation operation_;
+        std::chrono::steady_clock::time_point start_{
+            std::chrono::steady_clock::now()};
+    };
+    struct SnapshotRuntime {
+        bool enabled{false};
+        // Absent means unknown/missing. Timestamps are Unix milliseconds.
+        std::optional<int64_t> latest_created_at_ms;
+        std::optional<int64_t> fallback_created_at_ms;
+        uint64_t snapshot_bytes{0};
+        uint64_t chunk_bytes{0};
+        uint64_t chunk_count{0};
+        uint64_t capture_pause_us{0};
+        uint64_t suffix_batches{0};
+        uint64_t catch_up_target_batch{0};
+        uint64_t catch_up_target_sequence{0};
+        uint64_t durable_batch{0};
+        uint64_t applied_batch{0};
+        uint64_t latest_batch{0};
+        uint64_t fallback_batch{0};
+        uint64_t compaction_floor{0};
+        uint64_t candidate_floor{0};
+        uint64_t floor_advances_total{0};
+        uint64_t gc_orphan_prefixes{0};
+        uint64_t gc_deleted_prefixes{0};
+        uint64_t lease_lost_total{0};
+        SnapshotSkipReason skip_reason{SnapshotSkipReason::Disabled};
+    };
+    struct SnapshotOperationStats {
+        uint64_t total{0};
+        uint64_t errors{0};
+        uint64_t elapsed_us{0};
+    };
+    void reset_snapshot_runtime(bool enabled);
+    SnapshotRuntime get_snapshot_runtime() const;
+    SnapshotOperationStats get_snapshot_operation(
+        SnapshotOperation operation) const;
+    // Updates are restricted to observed state transitions; never perform I/O
+    // or call back into a service while holding this lock.
+    template <typename Update>
+    void update_snapshot_runtime(Update&& update) {
+        std::lock_guard<std::mutex> lock(snapshot_runtime_mutex_);
+        if (snapshot_runtime_.enabled) update(snapshot_runtime_);
+    }
+    void record_snapshot_skip(SnapshotSkipReason reason);
+    void record_snapshot_operation(SnapshotOperation operation, int64_t error,
+                                   std::chrono::steady_clock::time_point start);
+
+    struct WriterRuntimeSnapshot {
+        bool accepting{false};
+        uint64_t retry_count{0};
+        uint64_t retry_delay_ms{0};
+        uint64_t waiting_slots{0};
+        uint64_t committed_queue_depth{0};
+        uint64_t callback_queue_depth{0};
+        uint64_t durable_batch_id{0};
+        uint64_t durable_sequence{0};
+        int64_t last_error{0};
+        std::string terminal_reason;
+        std::optional<std::pair<uint64_t, uint64_t>> stuck_range;
+    };
+
+    // Activation replaces the observed writer and invalidates earlier owners.
+    // Snapshot retry_count is per writer on input, process cumulative on
+    // output.
+    uint64_t activate_writer_runtime(const WriterRuntimeSnapshot& snapshot);
+    void update_writer_runtime(uint64_t owner,
+                               const WriterRuntimeSnapshot& snapshot);
+    WriterRuntimeSnapshot get_writer_runtime() const;
     // --- Singleton Access ---
     static HAMetricManager& instance();
 
@@ -146,6 +266,30 @@ class HAMetricManager {
      */
     void observe_oplog_apply_latency_us(int64_t latency_us);
 
+    // ========== Batch-record OpLog Metrics ==========
+
+    void inc_batch_record_durable_batches(int64_t val = 1);
+    int64_t get_batch_record_durable_batches_total();
+    void inc_batch_record_durable_entries(int64_t val = 1);
+    int64_t get_batch_record_durable_entries_total();
+    void inc_batch_record_retries(int64_t val = 1);
+    int64_t get_batch_record_retries_total();
+
+    void set_batch_record_committed_queue_depth(int64_t depth);
+    int64_t get_batch_record_committed_queue_depth();
+    void set_batch_record_callback_queue_depth(int64_t depth);
+    int64_t get_batch_record_callback_queue_depth();
+    void set_batch_record_last_batch_id(int64_t batch_id);
+    int64_t get_batch_record_last_batch_id();
+    void set_batch_record_durable_sequence(int64_t sequence_id);
+    int64_t get_batch_record_durable_sequence();
+
+    void observe_batch_record_batch_entries(int64_t entries);
+    void observe_batch_record_batch_bytes(int64_t bytes);
+    void observe_batch_record_txn_latency_us(int64_t latency_us);
+    void observe_batch_record_commit_to_durable_us(int64_t latency_us);
+    void observe_batch_record_callback_latency_us(int64_t latency_us);
+
     // ========== State Machine Metrics ==========
 
     /**
@@ -207,9 +351,35 @@ class HAMetricManager {
     ylt::metric::histogram_t oplog_etcd_write_latency_us_;
     ylt::metric::histogram_t oplog_apply_latency_us_;
 
+    ylt::metric::counter_t batch_record_durable_batches_total_;
+    ylt::metric::counter_t batch_record_durable_entries_total_;
+    ylt::metric::counter_t batch_record_retry_total_;
+    ylt::metric::gauge_t batch_record_committed_queue_depth_;
+    ylt::metric::gauge_t batch_record_callback_queue_depth_;
+    ylt::metric::gauge_t batch_record_last_batch_id_;
+    ylt::metric::gauge_t batch_record_durable_sequence_;
+    ylt::metric::histogram_t batch_record_batch_entries_;
+    ylt::metric::histogram_t batch_record_batch_bytes_;
+    ylt::metric::histogram_t batch_record_txn_latency_us_;
+    ylt::metric::histogram_t batch_record_commit_to_durable_us_;
+    ylt::metric::histogram_t batch_record_callback_latency_us_;
+
     // State Machine
     ylt::metric::gauge_t standby_state_;
     ylt::metric::counter_t state_transitions_total_;
+
+    mutable std::mutex snapshot_runtime_mutex_;
+    SnapshotRuntime snapshot_runtime_;
+    std::array<SnapshotOperationStats,
+               static_cast<size_t>(SnapshotOperation::Count)>
+        snapshot_operations_{};
+    std::array<uint64_t, static_cast<size_t>(SnapshotSkipReason::Count)>
+        snapshot_skips_{};
+
+    mutable std::mutex writer_runtime_mutex_;
+    WriterRuntimeSnapshot writer_runtime_;
+    uint64_t writer_runtime_owner_{0};
+    uint64_t writer_retry_base_{0};
 };
 
 }  // namespace mooncake

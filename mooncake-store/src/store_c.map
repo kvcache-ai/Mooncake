@@ -1,0 +1,9 @@
+# Linker version script for libmooncake_store.so (WITH_STORE_C_SHARED).
+# Export only the store_c.h C ABI; localize every symbol pulled in from the
+# statically-archived C++ dependency graph (asio, glog, transfer_engine, ...).
+{
+  global:
+    mooncake_store_*;
+  local:
+    *;
+};

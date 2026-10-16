@@ -13,9 +13,11 @@
 // limitations under the License.
 
 #include "tent/platform/cuda.h"
+#include "tent/platform/cuda_utils.h"
 #include "tent/common/status.h"
 #include "tent/common/utils/prefault.h"
 #include "tent/common/utils/random.h"
+#include "char_util.h"
 
 #include <glog/logging.h>
 #include <fstream>
@@ -26,7 +28,6 @@
 #include <utility>
 #include <vector>
 #include <cuda_runtime.h>
-#include <ctype.h>
 #include <dirent.h>
 #include <infiniband/verbs.h>
 #include <limits.h>
@@ -69,7 +70,7 @@ static std::vector<Topology::NicEntry> listInfiniBandDevices() {
         std::ifstream(path) >> numa_node;
 
         devices.push_back(
-            Topology::NicEntry{.name = std::move(device_name),
+            Topology::NicEntry{.name = device_name,
                                .pci_bus_id = std::move(pci_bus_id),
                                .type = Topology::NIC_RDMA,
                                .numa_node = numa_node});
@@ -191,7 +192,7 @@ static void discoverCudaTopology(std::vector<Topology::NicEntry>& nic_list,
                          << cudaGetErrorString(err);
             continue;
         }
-        for (char* ch = pci_bus_id; (*ch = tolower(*ch)); ch++);
+        for (char* ch = pci_bus_id; (*ch = to_lower(*ch)); ch++);
         int numa_node = getNumaNodeFromPciDevice(pci_bus_id);
         int min_distance = INT_MAX;
         std::unordered_map<int, std::vector<int>> distance_map;
@@ -262,17 +263,54 @@ Status CudaPlatform::probe(std::vector<Topology::NicEntry>& nic_list,
     return Status::OK();
 }
 
+namespace {
+bool cudaDevicePresent() {
+    static const bool present = [] {
+        int device_count = 0;
+        if (cudaGetDeviceCount(&device_count) != cudaSuccess ||
+            device_count == 0) {
+            LOG(WARNING) << "No CUDA device detected; treating buffers as "
+                            "host memory";
+            return false;
+        }
+        return true;
+    }();
+    return present;
+}
+
+bool cudaAbiMatches() {
+    static const bool matches = [] {
+        int runtime_version = 0;
+        // Major version only: struct layout changes across CUDA majors.
+        if (cudaRuntimeGetVersion(&runtime_version) == cudaSuccess &&
+            runtime_version / 1000 != CUDART_VERSION / 1000) {
+            LOG(ERROR) << "CUDA ABI mismatch: built against CUDART "
+                       << CUDART_VERSION << ", loaded libcudart is "
+                       << runtime_version
+                       << "; skipping pointer probe, rebuild against a "
+                          "matching CUDA toolkit.";
+            return false;
+        }
+        return true;
+    }();
+    return matches;
+}
+}  // namespace
+
 MemoryType CudaPlatform::getMemoryType(void* addr) {
-    cudaPointerAttributes attributes;
-    cudaError_t result;
-    result = cudaPointerGetAttributes(&attributes, addr);
-    if (result != cudaSuccess) {
-        LOG(WARNING) << "cudaPointerGetAttributes: "
-                     << cudaGetErrorString(result);
-        return MTYPE_UNKNOWN;
+    if (!cudaDevicePresent()) return MTYPE_CPU;
+    if (!cudaAbiMatches()) return MTYPE_UNKNOWN;
+    return getCudaDeviceForPtr(addr) >= 0 ? MTYPE_CUDA : MTYPE_CPU;
+}
+
+int CudaPlatform::getPointerDeviceId(void* addr) {
+    // Same guards as getMemoryType().
+    if (!cudaDevicePresent() || !cudaAbiMatches()) {
+        return CUDAStreamPool::kCurrentDevice;
     }
-    if (attributes.type == cudaMemoryTypeDevice) return MTYPE_CUDA;
-    return MTYPE_CPU;
+    int device = getCudaDeviceForPtr(addr);
+    if (device < 0) return CUDAStreamPool::kCurrentDevice;
+    return device;
 }
 
 static inline uintptr_t alignPage(uintptr_t address) {
@@ -296,21 +334,18 @@ const std::vector<RangeLocation> CudaPlatform::getLocation(void* start,
     const static size_t kPageSize = 4096;
     std::vector<RangeLocation> entries;
 
-    cudaPointerAttributes attributes;
-    cudaError_t result;
-
-    result = cudaPointerGetAttributes(&attributes, start);
-    if (result != cudaSuccess) {
-        LOG(WARNING) << "cudaPointerGetAttributes: "
-                     << cudaGetErrorString(result);
+    if (cudaDevicePresent() && !cudaAbiMatches()) {
         entries.push_back({(uint64_t)start, len, kWildcardLocation});
         return entries;
     }
-
-    if (attributes.type == cudaMemoryTypeDevice) {
-        entries.push_back(
-            {(uint64_t)start, len, genCudaNodeName(attributes.device)});
-        return entries;
+    if (cudaDevicePresent()) {
+        // Unregistered pointers fall through to the NUMA probe below.
+        int cuda_dev = getCudaDeviceForPtr(start);
+        if (cuda_dev >= 0) {
+            entries.push_back(
+                {(uint64_t)start, len, genCudaNodeName(cuda_dev)});
+            return entries;
+        }
     }
 
     // start and end address may not be page aligned.

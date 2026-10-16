@@ -50,7 +50,7 @@
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
-    defined(USE_COREX)
+    defined(USE_COREX) || defined(USE_SUPA)
 
 #include <cassert>
 
@@ -100,8 +100,9 @@ std::string pickBackend() {
     }
 #if defined(USE_MLU)
     return "mlu";
-#elif defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
-    defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX)
+#elif defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
+    defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX) || \
+    defined(USE_SUPA)
     return FLAGS_use_vram ? "gpu" : "cpu";
 #else
     return "cpu";
@@ -112,8 +113,9 @@ int pickDevId(const std::string &backend) {
     if (FLAGS_device_id >= 0) {
         return FLAGS_device_id;
     }
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
-    defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||    \
+    defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX) || \
+    defined(USE_SUPA)
     if (backend == "gpu") {
         return FLAGS_gpu_id;
     }
@@ -127,8 +129,9 @@ void validateBackend(const std::string &backend) {
     if (backend == "cpu") {
         return;
     }
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
-    defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||    \
+    defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX) || \
+    defined(USE_SUPA)
     if (backend == "gpu") {
         return;
     }
@@ -177,7 +180,7 @@ bool validateTransferSizes() {
     }
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
-    defined(USE_COREX)
+    defined(USE_COREX) || defined(USE_SUPA)
     checkCudaError(cudaSetDevice(pickDevId(backend)), "Failed to set device");
 #else
     LOG(FATAL) << "Device memory backend is not available in this build";
@@ -189,7 +192,7 @@ void *allocateMemoryPool(size_t size, int socket_id,
     if (usesDeviceMemory(backend)) {
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
-    defined(USE_COREX)
+    defined(USE_COREX) || defined(USE_SUPA)
         setBackendDevice(backend);
         void *d_buf = nullptr;
         checkCudaError(cudaMalloc(&d_buf, size),
@@ -207,7 +210,7 @@ void freeMemoryPool(void *addr, size_t size, const std::string &backend) {
     if (usesDeviceMemory(backend)) {
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
-    defined(USE_COREX)
+    defined(USE_COREX) || defined(USE_SUPA)
         cudaFree(addr);
         return;
 #else
@@ -222,7 +225,7 @@ void copyFromHost(void *dst, const void *src, size_t size,
     if (usesDeviceMemory(backend)) {
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
-    defined(USE_COREX)
+    defined(USE_COREX) || defined(USE_SUPA)
         checkCudaError(cudaMemcpy(dst, src, size, cudaMemcpyHostToDevice),
                        "Failed to copy host data to device");
         return;
@@ -238,7 +241,7 @@ void copyToHost(void *dst, const void *src, size_t size,
     if (usesDeviceMemory(backend)) {
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
-    defined(USE_COREX)
+    defined(USE_COREX) || defined(USE_SUPA)
         checkCudaError(cudaMemcpy(dst, src, size, cudaMemcpyDeviceToHost),
                        "Failed to copy device data to host");
         return;

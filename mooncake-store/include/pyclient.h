@@ -1,16 +1,21 @@
 #pragma once
 
-#include <csignal>
+#include <algorithm>
 #include <atomic>
-#include <thread>
-#include <string>
+#include <chrono>
+#include <csignal>
+#include <map>
 #include <memory>
+#include <optional>
+#include <string>
+#include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "client_service.h"
-#include "client_buffer.hpp"
+#include "client_buffer.h"
 #include "mutex.h"
-#include "utils.h"
+#include "common/result.h"
 #include "file_storage.h"
 
 namespace mooncake {
@@ -56,8 +61,8 @@ build_ranged_read_results_like(
                     ? all_dst_offsets[i][j].size()
                     : 1;
             std::vector<ResultValue> fragments;
-            fragments.reserve(std::max<size_t>(fragment_count, 1));
-            for (size_t k = 0; k < std::max<size_t>(fragment_count, 1); ++k) {
+            fragments.reserve(fragment_count);
+            for (size_t k = 0; k < fragment_count; ++k) {
                 fragments.push_back(make_error());
             }
             key_rows.emplace_back(std::move(fragments));
@@ -139,6 +144,10 @@ class ClientRequester {
    public:
     ClientRequester();
 
+    // Drains in-flight offload RPCs before the pools member is released
+    // (#3909).
+    ~ClientRequester();
+
     /**
      * @brief Retrieves multiple objects from a remote Transfer Engine (TE)
      * @param client_addr Network address (e.g., "ip:port") of the remote
@@ -159,6 +168,20 @@ class ClientRequester {
      */
     void release_offload_buffer(const std::string &client_addr,
                                 uint64_t batch_id);
+
+    /**
+     * @brief Asks a replica owner to verify the backing file of each key and
+     * evict its own replica when the file is proven gone.
+     * @param client_addr Network address of the replica owner's offload RPC
+     * service.
+     * @param request The caller's tenant (offload files are scoped by the
+     * object's recorded tenant) and the object keys to verify.
+     * @return Per-key tri-state in request order (present, evicted,
+     * undetermined), or an error when the owner could not answer at all.
+     */
+    tl::expected<VerifyDiskReplicaResponse, ErrorCode> verify_disk_replica(
+        const std::string &client_addr,
+        const VerifyDiskReplicaRequest &request);
 
    private:
     /**
@@ -190,6 +213,7 @@ class ClientRequester {
     mutable std::shared_mutex client_pool_mutex_;
     std::shared_ptr<coro_io::client_pools<coro_rpc::coro_rpc_client>>
         client_pools_;
+    RpcDrainGuard rpc_drain_;
 
     /**
      * @brief Generic RPC invocation helper for single-result operations
@@ -207,6 +231,84 @@ class ClientRequester {
 // Python-specific wrapper class for client interface
 class PyClient {
    public:
+    // Request-scoped cache of fresh batch_query() results that can be reused by
+    // subsequent ranged reads in the same operation. Callers should not retain
+    // entries across independent requests.
+    using QueryResultCache =
+        std::unordered_map<std::string, tl::expected<QueryResult, ErrorCode>>;
+
+    // A caller-owned metadata snapshot for repeated ranged reads against the
+    // same key set. It is reusable until refresh_at; after that, callers should
+    // refresh it before submitting more transfers.
+    struct RangedReadSnapshot {
+        QueryResultCache query_result_cache;
+        std::chrono::steady_clock::time_point refresh_at{};
+
+        bool reset(QueryResultCache cache,
+                   std::chrono::steady_clock::time_point now =
+                       std::chrono::steady_clock::now()) {
+            query_result_cache = std::move(cache);
+            refresh_at = now;
+            if (query_result_cache.empty()) return false;
+
+            auto earliest_lease = std::chrono::steady_clock::time_point::max();
+            bool all_fresh = true;
+            for (const auto &[key, query_result] : query_result_cache) {
+                (void)key;
+                if (query_result && !query_result->IsLeaseExpired(now)) {
+                    earliest_lease =
+                        std::min(earliest_lease, query_result->lease_timeout);
+                } else {
+                    all_fresh = false;
+                }
+            }
+            if (all_fresh && earliest_lease > now) {
+                refresh_at = now + (earliest_lease - now) / 2;
+            }
+            return all_fresh;
+        }
+
+        bool reset(
+            const std::vector<std::string> &keys,
+            std::vector<tl::expected<QueryResult, ErrorCode>> query_results,
+            std::chrono::steady_clock::time_point now =
+                std::chrono::steady_clock::now()) {
+            query_result_cache.clear();
+            refresh_at = now;
+            if (query_results.size() != keys.size()) return false;
+
+            query_result_cache.reserve(keys.size());
+            auto earliest_lease = std::chrono::steady_clock::time_point::max();
+            bool all_fresh = true;
+            for (size_t i = 0; i < keys.size(); ++i) {
+                if (query_results[i] &&
+                    !query_results[i]->IsLeaseExpired(now)) {
+                    earliest_lease = std::min(earliest_lease,
+                                              query_results[i]->lease_timeout);
+                } else {
+                    all_fresh = false;
+                }
+                query_result_cache.emplace(keys[i],
+                                           std::move(query_results[i]));
+            }
+
+            if (all_fresh && earliest_lease > now) {
+                refresh_at = now + (earliest_lease - now) / 2;
+            }
+            return all_fresh;
+        }
+
+        bool reusable(std::chrono::steady_clock::time_point now =
+                          std::chrono::steady_clock::now()) const {
+            return !query_result_cache.empty() && now < refresh_at;
+        }
+
+        bool should_refresh(std::chrono::steady_clock::time_point now =
+                                std::chrono::steady_clock::now()) const {
+            return !reusable(now);
+        }
+    };
+
     virtual ~PyClient() = 0;
     virtual int setup_real(
         const std::string &local_hostname, const std::string &metadata_server,
@@ -216,7 +318,9 @@ class PyClient {
         const std::shared_ptr<TransferEngine> &transfer_engine,
         const std::string &ipc_socket_path, bool enable_ssd_offload = false,
         const std::string &ssd_offload_path = "",
-        const std::string &tenant_id = "default") = 0;
+        const std::string &tenant_id = "default",
+        bool enable_client_http_server = false,
+        int client_http_port = DEFAULT_CLIENT_HTTP_PORT) = 0;
 
     virtual int setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
                             const std::string &server_address,
@@ -238,12 +342,56 @@ class PyClient {
     virtual int64_t get_into(const std::string &key, void *buffer,
                              size_t size) = 0;
 
+    // query_result_cache is optional and is only used to reuse fresh
+    // batch_query() results for this read; callers still do not provide any
+    // replica-selection or ranged-read metadata directly.
     virtual std::vector<std::vector<std::vector<int64_t>>> get_into_ranges(
         const std::vector<void *> &buffers,
         const std::vector<std::vector<std::string>> &all_keys,
         const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
         const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
-        const std::vector<std::vector<std::vector<size_t>>> &all_sizes) = 0;
+        const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
+        const QueryResultCache *query_result_cache = nullptr) = 0;
+
+    // Read only from the supplied query-result snapshot. Implementations must
+    // not re-query keys or renew leases; an expired snapshot fails.
+    virtual std::vector<std::vector<std::vector<int64_t>>>
+    get_into_ranges_from_snapshot(
+        const std::vector<void *> &buffers,
+        const std::vector<std::vector<std::string>> &all_keys,
+        const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
+        const QueryResultCache &query_result_cache) = 0;
+
+    std::vector<std::vector<std::vector<int64_t>>>
+    get_into_ranges_from_snapshot(
+        const std::vector<void *> &buffers,
+        const std::vector<std::vector<std::string>> &all_keys,
+        const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
+        const RangedReadSnapshot &snapshot) {
+        return get_into_ranges_from_snapshot(buffers, all_keys, all_dst_offsets,
+                                             all_src_offsets, all_sizes,
+                                             snapshot.query_result_cache);
+    }
+
+    virtual std::vector<tl::expected<QueryResult, ErrorCode>> batch_query(
+        const std::vector<std::string> &keys) = 0;
+
+    RangedReadSnapshot prepare_get_into_ranges_snapshot(
+        const std::vector<std::string> &keys) {
+        RangedReadSnapshot snapshot;
+        refresh_get_into_ranges_snapshot(snapshot, keys);
+        return snapshot;
+    }
+
+    bool refresh_get_into_ranges_snapshot(
+        RangedReadSnapshot &snapshot, const std::vector<std::string> &keys) {
+        auto query_results = batch_query(keys);
+        return snapshot.reset(keys, std::move(query_results));
+    }
 
     virtual std::vector<int64_t> batch_get_into(
         const std::vector<std::string> &keys,
@@ -275,6 +423,57 @@ class PyClient {
         const std::vector<std::vector<size_t>> &all_sizes,
         const ReplicateConfig &config = ReplicateConfig{}) = 0;
 
+    // Put/get sessions. Default stubs keep DummyClient unchanged; RealClient
+    // overrides with the real implementations.
+    virtual std::vector<int> batch_get_session_start(
+        const std::vector<std::string> &keys) {
+        return std::vector<int>(
+            keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
+    }
+
+    virtual std::vector<int> batch_get_into_multi_buffer_ranges(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> & /*all_buffers*/,
+        const std::vector<std::vector<size_t>> & /*all_sizes*/,
+        const std::vector<std::vector<size_t>> & /*all_src_offsets*/) {
+        return std::vector<int>(
+            keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
+    }
+
+    virtual int batch_get_session_end(
+        const std::vector<std::string> & /*keys*/) {
+        return static_cast<int>(toInt(ErrorCode::INVALID_PARAMS));
+    }
+
+    virtual std::vector<int> batch_put_session_start(
+        const std::vector<std::string> &keys,
+        const std::vector<size_t> & /*sizes*/,
+        const ReplicateConfig & /*config*/ = ReplicateConfig{}) {
+        return std::vector<int>(
+            keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
+    }
+
+    virtual std::vector<int> batch_put_from_multi_buffer_ranges(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> & /*all_buffers*/,
+        const std::vector<std::vector<size_t>> & /*all_sizes*/,
+        const std::vector<std::vector<size_t>> & /*all_dst_offsets*/) {
+        return std::vector<int>(
+            keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
+    }
+
+    virtual std::vector<int> batch_put_session_end(
+        const std::vector<std::string> &keys) {
+        return std::vector<int>(
+            keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
+    }
+
+    virtual std::vector<int> batch_put_session_revoke(
+        const std::vector<std::string> &keys) {
+        return std::vector<int>(
+            keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
+    }
+
     virtual std::shared_ptr<BufferHandle> get_buffer(
         const std::string &key) = 0;
 
@@ -302,6 +501,12 @@ class PyClient {
         const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
         const ReplicateConfig &config = ReplicateConfig{}) = 0;
 
+    virtual std::vector<int> batch_upsert_from_multi_buffers(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> &all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
+        const ReplicateConfig &config = ReplicateConfig{}) = 0;
+
     virtual int upsert_parts(
         const std::string &key, std::vector<std::span<const char>> values,
         const ReplicateConfig &config = ReplicateConfig{}) = 0;
@@ -326,6 +531,15 @@ class PyClient {
 
     virtual std::vector<int> batchIsExist(
         const std::vector<std::string> &keys) = 0;
+
+    // Point-in-time existence check that grants no read lease: 1 if the
+    // object existed at the time of the call, 0 if not, negative on error.
+    // The object may still be evicted before a subsequent get.
+    virtual int probeKey(const std::string &key) = 0;
+
+    virtual std::vector<int> batchProbeKey(
+        const std::vector<std::string> &keys,
+        const GrantLeasePolicy &policy = {}) = 0;
 
     virtual int64_t getSize(const std::string &key) = 0;
 
@@ -352,10 +566,100 @@ class PyClient {
     virtual tl::expected<QueryTaskResponse, ErrorCode> query_task(
         const UUID &task_id) = 0;
 
+    virtual std::optional<BufferHandle> allocate_client_buffer(size_t size) {
+        if (!client_buffer_allocator_) {
+            return std::nullopt;
+        }
+        return client_buffer_allocator_->allocate(size);
+    }
+
     std::shared_ptr<mooncake::Client> client_ = nullptr;
     std::shared_ptr<mooncake::ClientRequester> client_requester_ = nullptr;
     std::shared_ptr<mooncake::FileStorage> file_storage_ = nullptr;
     std::shared_ptr<ClientBufferAllocator> client_buffer_allocator_ = nullptr;
 };
+
+inline uint64_t remaining_lease_ttl_ms(
+    const QueryResult &query_result,
+    std::chrono::steady_clock::time_point now) {
+    if (query_result.IsLeaseExpired(now)) {
+        return 0;
+    }
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            query_result.lease_timeout - now)
+            .count());
+}
+
+inline CachedQueryResultResponse to_cached_query_result_response(
+    const tl::expected<QueryResult, ErrorCode> &query_result,
+    std::chrono::steady_clock::time_point now) {
+    if (!query_result) {
+        return CachedQueryResultResponse(query_result.error());
+    }
+    if (query_result->IsLeaseExpired(now)) {
+        return CachedQueryResultResponse(ErrorCode::OBJECT_NOT_FOUND);
+    }
+    GetReplicaListResponse value(
+        std::vector<Replica::Descriptor>(query_result->replicas.begin(),
+                                         query_result->replicas.end()),
+        remaining_lease_ttl_ms(*query_result, now),
+        query_result->object_checksum);
+    if (query_result->resolved_tenant_id) {
+        value.resolved_tenant_id = *query_result->resolved_tenant_id;
+    }
+    return CachedQueryResultResponse(std::move(value));
+}
+
+inline tl::expected<QueryResult, ErrorCode> from_cached_query_result_response(
+    const CachedQueryResultResponse &cached_result,
+    std::chrono::steady_clock::time_point now) {
+    if (!cached_result.success) {
+        return tl::make_unexpected(cached_result.error);
+    }
+    return tl::expected<QueryResult, ErrorCode>(
+        tl::in_place,
+        std::vector<Replica::Descriptor>(cached_result.value.replicas.begin(),
+                                         cached_result.value.replicas.end()),
+        now + std::chrono::milliseconds(cached_result.value.lease_ttl_ms),
+        cached_result.value.object_checksum,
+        cached_result.value.resolved_tenant_id);
+}
+
+inline PyClient::QueryResultCache build_query_result_cache_from_cached_results(
+    const std::map<std::string, CachedQueryResultResponse>
+        &cached_query_results) {
+    PyClient::QueryResultCache query_result_cache;
+    query_result_cache.reserve(cached_query_results.size());
+    auto now = std::chrono::steady_clock::now();
+    for (const auto &[key, cached_result] : cached_query_results) {
+        auto query_result =
+            from_cached_query_result_response(cached_result, now);
+        if (!query_result || query_result->IsLeaseExpired(now)) {
+            continue;
+        }
+        query_result_cache.emplace(key, std::move(query_result));
+    }
+    return query_result_cache;
+}
+
+inline std::map<std::string, CachedQueryResultResponse>
+build_cached_query_results_from_query_result_cache(
+    const PyClient::QueryResultCache *query_result_cache) {
+    std::map<std::string, CachedQueryResultResponse> cached_query_results;
+    if (query_result_cache == nullptr) {
+        return cached_query_results;
+    }
+
+    auto now = std::chrono::steady_clock::now();
+    for (const auto &[key, query_result] : *query_result_cache) {
+        if (query_result && query_result->IsLeaseExpired(now)) {
+            continue;
+        }
+        cached_query_results.emplace(
+            key, to_cached_query_result_response(query_result, now));
+    }
+    return cached_query_results;
+}
 
 }  // namespace mooncake

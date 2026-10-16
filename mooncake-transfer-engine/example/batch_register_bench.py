@@ -25,11 +25,8 @@ import argparse
 import ctypes
 import ctypes.util
 import json
-import os
-import random
 import signal
 import statistics
-import sys
 import time
 
 
@@ -224,7 +221,6 @@ def run_initiator(args):
     """Run as initiator: pull data from random blocks."""
     from mooncake.engine import TransferEngine
 
-    block_bytes = int(args.block_size_gb * 1024 * 1024 * 1024)
     transfer_bytes = int(args.transfer_size_mb * 1024 * 1024)
 
     print(f"=== Initiator Node ===")

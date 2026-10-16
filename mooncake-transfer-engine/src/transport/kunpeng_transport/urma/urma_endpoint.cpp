@@ -38,7 +38,9 @@ UrmaContext::~UrmaContext() {
     auto thisString = toString();
     worker_pool_.reset();
     LOG(INFO) << "destroy worker pool done.";
-    endpoint_store_->destroy();
+    if (endpoint_store_) {
+        endpoint_store_->destroy();
+    }
     LOG(INFO) << "destroy endpoint store done.";
     if (urma_context_) deconstruct();
     LOG(WARNING) << "finished destroy context : " << thisString;
@@ -516,8 +518,11 @@ bool UrmaContext::transEidFromString(const std::string& eid_str,
     return index == URMA_EID_SIZE;
 }
 
-int UrmaContext::poll(int num_entries, Transport::Slice** slices,
+int UrmaContext::poll(int num_entries, Transport::Slice** failed_slices,
+                      int& num_failed,
+                      std::unordered_map<volatile int*, int>& jetty_depth_set,
                       int jfc_index) {
+    num_failed = 0;
     urma_cr_t cr[num_entries];
     int nr_poll = urma_poll_jfc(jfc_list_[jfc_index].native, num_entries, cr);
     if (nr_poll < 0) {
@@ -525,17 +530,29 @@ int UrmaContext::poll(int num_entries, Transport::Slice** slices,
                    << device_name_;
         return ERR_CONTEXT;
     }
-    Transport::Slice s[nr_poll];
     for (int i = 0; i < nr_poll; ++i) {
         auto slice = (Transport::Slice*)cr[i].user_ctx;
         if (!slice) {
             continue;
         }
-        slices[i] = slice;
+
+        // All deref of `slice` (including the jetty_depth aggregation below)
+        // MUST happen before markSuccess(): once that publishes completion,
+        // the submitting thread may recycle the slice immediately.
+        auto* depth = slice->ub.jetty_depth;
+        auto it = jetty_depth_set.find(depth);
+        if (it != jetty_depth_set.end())
+            it->second++;
+        else
+            jetty_depth_set[depth] = 1;
+
         if (cr[i].status == URMA_CR_SUCCESS) {
+            // Safe to publish here — we are done with this slice and do not
+            // return it to the caller, so no one else will deref it.
             slice->markSuccess();
             continue;
         }
+
         if (cr[i].status != URMA_CR_WR_FLUSH_ERR ||
             show_work_request_flushed_error_)
             LOG(ERROR) << "Worker: Process failed for slice (opcode: "
@@ -553,6 +570,11 @@ int UrmaContext::poll(int num_entries, Transport::Slice** slices,
                        << ", comp_events_acked: "
                        << jfc_list_[jfc_index].native->comp_events_acked << " "
                        << jfc_list_[jfc_index].native->async_events_acked;
+
+        // Failed: hand the slice back so the caller can decide retry vs
+        // final markFailed(). Slice is NOT published, so the caller may
+        // safely deref it.
+        failed_slices[num_failed++] = slice;
     }
     return nr_poll;
 }

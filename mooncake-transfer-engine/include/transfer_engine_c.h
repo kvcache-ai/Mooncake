@@ -27,6 +27,7 @@ extern "C" {
 #define batch_id_t uint64_t
 #define LOCAL_SEGMENT (0)
 #define INVALID_BATCH UINT64_MAX
+#define BATCH_CLEANUP_DEFERRED (5)
 
 #define OPCODE_READ (0)
 #define OPCODE_WRITE (1)
@@ -161,9 +162,29 @@ int genNotifyInEngine(transfer_engine_t engine, uint64_t target_id,
 int getTransferStatus(transfer_engine_t engine, batch_id_t batch_id,
                       size_t task_id, struct transfer_status *status);
 
+/*
+ * Returns 0 when cleanup completes immediately, or BATCH_CLEANUP_DEFERRED when
+ * cleanup ownership is accepted but physical cleanup must wait. Both results
+ * invalidate batch_id; the caller must not use it again.
+ */
 int freeBatchID(transfer_engine_t engine, batch_id_t batch_id);
 
 int syncSegmentCache(transfer_engine_t engine);
+
+struct nic_load_stat {
+    char device_name[64];
+    uint64_t inflight_bytes;
+    double ewma_bandwidth_bps;
+};
+
+typedef struct nic_load_stat nic_load_stat_t;
+
+int getNicLoadStats(transfer_engine_t engine, nic_load_stat_t *stats,
+                    size_t *count);
+
+void enableGracefulShutdown(transfer_engine_t engine);
+int showLinks(transfer_engine_t engine, char *buf_out, size_t buf_len,
+              int json);
 
 #ifdef __cplusplus
 }

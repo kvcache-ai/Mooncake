@@ -8,7 +8,7 @@
 #include <ylt/coro_http/coro_http_client.hpp>
 
 #include "http_metadata_server.h"
-#include "utils.h"
+#include "common/network.h"
 
 namespace mooncake::testing {
 
@@ -94,6 +94,21 @@ TEST_F(HttpMetadataServerTest, RejectsChangedRpcMetaRepublish) {
     EXPECT_EQ(stored.body, original);
 
     server.stop();
+}
+
+TEST_F(HttpMetadataServerTest, StartReportsBindFailure) {
+    int port = getFreeTcpPort();
+    HttpMetadataServer first(static_cast<uint16_t>(port), "127.0.0.1");
+    ASSERT_TRUE(first.start());
+    WaitUntilReady(port);
+
+    // A second server cannot bind the already-taken port; start() must report
+    // the failure instead of claiming a healthy server that never came up.
+    HttpMetadataServer second(static_cast<uint16_t>(port), "127.0.0.1");
+    EXPECT_FALSE(second.start());
+    EXPECT_FALSE(second.is_running());
+
+    first.stop();
 }
 
 }  // namespace mooncake::testing

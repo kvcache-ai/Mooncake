@@ -12,7 +12,7 @@ namespace mooncake {
 HttpMetadataServer::HttpMetadataServer(uint16_t port, const std::string& host)
     : port_(port),
       host_(host),
-      server_(std::make_unique<coro_http::coro_http_server>(4, port)),
+      server_(std::make_unique<coro_http::coro_http_server>(4, port, host_)),
       running_(false) {
     init_server();
 }
@@ -112,7 +112,17 @@ bool HttpMetadataServer::start() {
         return true;
     }
 
-    server_->async_start();
+    // async_start() binds synchronously and hands back a future that is already
+    // resolved (hasResult()) when the bind failed; otherwise the server keeps
+    // running. Mirror MasterAdminServer::Start() so a failed bind is surfaced
+    // instead of reporting a healthy server that never came up.
+    auto ec = server_->async_start();
+    if (ec.hasResult()) {
+        LOG(ERROR) << "Failed to start HTTP metadata server on " << host_ << ":"
+                   << port_;
+        return false;
+    }
+    port_ = server_->port();
     running_ = true;
     LOG(INFO) << "HTTP metadata server started on " << host_ << ":" << port_;
     return true;
@@ -133,6 +143,27 @@ KVPoll HttpMetadataServer::poll() const {
         return KVPoll::Failed;
     }
     return KVPoll::Success;
+}
+
+bool HttpMetadataServer::removeKey(const std::string& key) {
+    std::lock_guard<std::mutex> lock(store_mutex_);
+    if (store_.erase(key) > 0) {
+        LOG(INFO) << "HttpMetadataServer: removed key=" << key;
+        return true;
+    }
+    return false;
+}
+
+size_t HttpMetadataServer::removeKeys(const std::vector<std::string>& keys) {
+    std::lock_guard<std::mutex> lock(store_mutex_);
+    size_t removed = 0;
+    for (const auto& key : keys) {
+        if (store_.erase(key) > 0) {
+            LOG(INFO) << "HttpMetadataServer: removed key=" << key;
+            ++removed;
+        }
+    }
+    return removed;
 }
 
 }  // namespace mooncake

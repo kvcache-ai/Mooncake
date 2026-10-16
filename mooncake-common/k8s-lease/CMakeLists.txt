@@ -1,5 +1,6 @@
 add_custom_command(
     OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/libk8s_lease_wrapper.so
+           ${CMAKE_CURRENT_BINARY_DIR}/libk8s_lease_wrapper.h
     COMMAND bash -c "go mod tidy" && bash -c "go build -buildmode=c-shared -o ${CMAKE_CURRENT_BINARY_DIR}/libk8s_lease_wrapper.so k8s_lease_wrapper.go" && cp ${CMAKE_CURRENT_BINARY_DIR}/libk8s_lease_wrapper.h ${CMAKE_CURRENT_SOURCE_DIR}
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     COMMENT "Building K8s Lease Go shared library"

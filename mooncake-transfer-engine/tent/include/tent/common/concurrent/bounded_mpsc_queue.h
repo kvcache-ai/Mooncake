@@ -18,6 +18,7 @@
 #include <atomic>
 #include <thread>
 #include <unordered_set>
+#include <vector>
 
 namespace mooncake {
 namespace tent {
@@ -43,27 +44,29 @@ struct BoundedMPSCQueue {
     ~BoundedMPSCQueue() = default;
 
     void push(T &slice_list) {
-        if (slice_list.num_slices == 0) return;
-        uint64_t pos;
-        while (true) {
-            pos = tail.load(std::memory_order_relaxed);
-            Cell *cell = &buffer[pos % Capacity];
-
-            uint64_t seq = cell->sequence.load(std::memory_order_acquire);
-            intptr_t dif =
-                static_cast<intptr_t>(seq) - static_cast<intptr_t>(pos);
-            if (dif == 0) {
-                if (tail.compare_exchange_weak(pos, pos + 1,
-                                               std::memory_order_acq_rel,
-                                               std::memory_order_relaxed)) {
-                    cell->data = slice_list;
-                    cell->sequence.store(pos + 1, std::memory_order_release);
-                    return;
-                }
-            } else if (dif < 0) {
-                std::this_thread::yield();
-            }
+        while (!try_push(slice_list)) {
+            std::this_thread::yield();
         }
+    }
+
+    // Non-blocking push: returns false when the queue is full. The worker
+    // thread re-enqueues through this so a full queue parks the entry in a
+    // local overflow instead of wedging the only consumer (issue #3637).
+    bool try_push(T &slice_list) {
+        if (slice_list.num_slices == 0) return true;
+        uint64_t pos = tail.load(std::memory_order_relaxed);
+        Cell *cell = &buffer[pos % Capacity];
+
+        uint64_t seq = cell->sequence.load(std::memory_order_acquire);
+        intptr_t dif = static_cast<intptr_t>(seq) - static_cast<intptr_t>(pos);
+        if (dif != 0) return false;
+        if (!tail.compare_exchange_weak(pos, pos + 1, std::memory_order_acq_rel,
+                                        std::memory_order_relaxed)) {
+            return false;
+        }
+        cell->data = slice_list;
+        cell->sequence.store(pos + 1, std::memory_order_release);
+        return true;
     }
 
     T pop() {

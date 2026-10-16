@@ -3,10 +3,21 @@ add_executable(allocator_bench allocator_bench.cpp)
 target_link_libraries(allocator_bench PRIVATE cachelib_memory_allocator
                                               mooncake_store)
 
+# Add focused OffsetAllocator concurrency benchmark
+add_executable(offset_allocator_concurrency_bench
+               offset_allocator_concurrency_bench.cpp)
+target_link_libraries(offset_allocator_concurrency_bench
+                      PRIVATE mooncake_store gflags::gflags pthread)
+
 # Add master benchmark executable
 add_executable(master_bench master_bench.cpp)
 target_link_libraries(master_bench PRIVATE cachelib_memory_allocator
                                            mooncake_store)
+
+# Add BatchGetReplicaList latency benchmark executable
+add_executable(batch_get_replica_bench batch_get_replica_bench.cpp)
+target_link_libraries(batch_get_replica_bench PRIVATE cachelib_memory_allocator
+                                                       mooncake_store)
 
 # Add file interface benchmark executable
 add_executable(file_interface_bench file_interface_bench.cpp)
@@ -34,3 +45,27 @@ if(USE_NOF)
   target_link_libraries(nof_worker_pool_bench PRIVATE mooncake_store glog::glog
                                                        gflags::gflags)
 endif()
+
+# Add BatchEvict benchmark executable
+add_executable(batch_evict_bench batch_evict_bench.cpp)
+target_link_libraries(
+  batch_evict_bench PRIVATE master_service_test_peer cachelib_memory_allocator
+                            gflags::gflags glog::glog pthread)
+
+add_executable(batch_oplog_promotion_bench batch_oplog_promotion_bench.cpp)
+target_link_libraries(batch_oplog_promotion_bench PRIVATE mooncake_store
+                                                          gflags::gflags)
+
+if(STORE_USE_ETCD)
+  add_executable(oplog_batch_bench oplog_batch_bench.cpp)
+  target_link_libraries(
+    oplog_batch_bench PRIVATE mooncake_store glog::glog gflags::gflags
+                              JsonCpp::JsonCpp)
+endif()
+
+add_executable(uring_batch_read_bench uring_batch_read_bench.cpp)
+target_link_libraries(uring_batch_read_bench PRIVATE mooncake_store)
+
+# Add group index write path benchmark executable
+add_executable(group_index_contention_bench group_index_contention_bench.cpp)
+target_link_libraries(group_index_contention_bench PRIVATE mooncake_store)

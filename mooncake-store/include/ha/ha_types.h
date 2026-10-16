@@ -16,7 +16,6 @@ namespace ha {
 using ClusterNamespace = std::string;
 using OwnerToken = std::string;
 using OpLogSequenceId = uint64_t;
-using SnapshotId = std::string;
 
 enum class HABackendType {
     UNKNOWN = 0,
@@ -39,6 +38,18 @@ inline std::string HABackendTypeToString(HABackendType type) {
     return "unknown";
 }
 
+inline bool HaBackendSupportsOpLog(HABackendType type) {
+    switch (type) {
+        case HABackendType::ETCD:
+        case HABackendType::REDIS:
+            return true;
+        case HABackendType::UNKNOWN:
+        case HABackendType::K8S:
+            return false;
+    }
+    return false;
+}
+
 inline std::optional<HABackendType> ParseHABackendType(std::string_view type) {
     if (type == "etcd") {
         return HABackendType::ETCD;
@@ -50,6 +61,11 @@ inline std::optional<HABackendType> ParseHABackendType(std::string_view type) {
         return HABackendType::K8S;
     }
     return std::nullopt;
+}
+
+inline bool HaBackendSupportsOpLog(std::string_view type) {
+    const auto parsed = ParseHABackendType(type);
+    return parsed.has_value() && HaBackendSupportsOpLog(parsed.value());
 }
 
 inline ErrorCode ValidateHABackendAvailability(HABackendType type) {
@@ -69,7 +85,11 @@ inline ErrorCode ValidateHABackendAvailability(HABackendType type) {
             return ErrorCode::UNAVAILABLE_IN_CURRENT_MODE;
 #endif
         case HABackendType::K8S:
+#ifdef STORE_USE_K8S_LEASE
+            return ErrorCode::OK;
+#else
             return ErrorCode::UNAVAILABLE_IN_CURRENT_MODE;
+#endif
     }
 
     return ErrorCode::INVALID_PARAMS;
@@ -189,15 +209,6 @@ struct OpLogPollResult {
     std::vector<OpLogRecord> records;
     OpLogSequenceId next_seq = 0;
     bool timed_out = false;
-};
-
-struct SnapshotDescriptor {
-    SnapshotId snapshot_id;
-    OpLogSequenceId last_included_seq = 0;
-    ViewVersionId producer_view_version = 0;
-    std::string manifest_key;
-    std::string object_prefix;
-    int64_t created_at_ms = 0;
 };
 
 }  // namespace ha

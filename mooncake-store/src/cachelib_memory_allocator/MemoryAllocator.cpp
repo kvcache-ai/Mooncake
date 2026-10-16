@@ -16,6 +16,9 @@
 
 #include "MemoryAllocator.h"
 
+#include <algorithm>
+#include <map>
+
 using namespace facebook::cachelib;
 
 namespace {
@@ -82,6 +85,86 @@ PoolId MemoryAllocator::getPoolId(const std::string& name) const noexcept {
 void MemoryAllocator::free(void* memory) {
   auto& mp = getMemoryPool(memory);
   mp.free(memory);
+}
+
+bool MemoryAllocator::importAllocations(
+    PoolId id, const std::vector<ImportedAllocation>& allocations) {
+  auto& pool = memoryPoolManager_.getPoolById(id);
+  if (pool.getCurrentUsedSize() != 0 || pool.getCurrentAllocSize() != 0) {
+    return false;
+  }
+  if (allocations.empty()) {
+    return true;
+  }
+
+  struct SlabImport {
+    ClassId classId{Slab::kInvalidClassId};
+    std::vector<uint32_t> occupied;
+  };
+  std::map<size_t, SlabImport> imports;
+  const uintptr_t base =
+      reinterpret_cast<uintptr_t>(slabAllocator_.getSlabForIdx(0));
+  const size_t slabCount = slabAllocator_.getNumUsableSlabs();
+  if (slabCount > std::numeric_limits<size_t>::max() / Slab::kSize ||
+      base > std::numeric_limits<uintptr_t>::max() - slabCount * Slab::kSize) {
+    return false;
+  }
+  const uintptr_t end = base + slabCount * Slab::kSize;
+
+  for (const auto& allocation : allocations) {
+    const uintptr_t address = reinterpret_cast<uintptr_t>(allocation.address);
+    if (allocation.size == 0 || address < base || address >= end) {
+      return false;
+    }
+    ClassId classId;
+    uint32_t allocSize;
+    try {
+      classId = pool.getAllocationClassId(allocation.size);
+      allocSize = getAllocSize(id, classId);
+    } catch (...) {
+      return false;
+    }
+    const size_t slabIndex = (address - base) / Slab::kSize;
+    const size_t slabOffset = (address - base) % Slab::kSize;
+    const size_t chunkIndex = slabOffset / allocSize;
+    if (slabOffset % allocSize != 0 ||
+        chunkIndex >= Slab::kSize / allocSize ||
+        allocSize > Slab::kSize - slabOffset) {
+      return false;
+    }
+    auto& import = imports[slabIndex];
+    if (import.classId != Slab::kInvalidClassId && import.classId != classId) {
+      return false;
+    }
+    import.classId = classId;
+    import.occupied.push_back(static_cast<uint32_t>(chunkIndex));
+  }
+
+  for (auto& [slabIndex, import] : imports) {
+    std::sort(import.occupied.begin(), import.occupied.end());
+    if (std::adjacent_find(import.occupied.begin(), import.occupied.end()) !=
+        import.occupied.end()) {
+      return false;
+    }
+  }
+
+  const size_t highest = imports.rbegin()->first;
+  for (size_t slabIndex = 0; slabIndex <= highest; ++slabIndex) {
+    Slab* slab = slabAllocator_.makeNewSlab(id);
+    if (slab == nullptr ||
+        reinterpret_cast<uintptr_t>(slab) != base + slabIndex * Slab::kSize) {
+      return false;
+    }
+    auto it = imports.find(slabIndex);
+    if (it == imports.end()) {
+      pool.importFreeSlab(slab);
+    } else {
+      if (!pool.importSlab(slab, it->second.classId, it->second.occupied)) {
+        return false;
+      }
+    }
+  }
+  return true;
 }
 
 MemoryPool& MemoryAllocator::getMemoryPool(const void* memory) const {

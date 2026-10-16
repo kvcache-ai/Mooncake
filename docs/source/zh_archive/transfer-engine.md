@@ -394,7 +394,7 @@ int init(const std::string &metadata_conn_string,
 - `MC_NUM_COMP_CHANNELS_PER_CTX` 每个设备实例创建的 Completion Channel 数量，默认值 1
 - `MC_IB_PORT` 每个设备实例使用的 IB 端口号，默认值 1
 - `MC_IB_TC` 当使用`RDMA`通信协议时，在交换机和网卡默认配置不一致场景/需要流量规划场景下，可能需要修改 RDMA 网卡的 Traffic Class 配置，默认值 -1
-- `MC_IB_PCI_RELAXED_ORDERING` 将网络适配器的PCIe顺序设置为放宽有时会带来更好的性能。可设置 1 以启用RO功能，默认值 0
+- `MC_IB_PCI_RELAXED_ORDERING` 控制 RDMA 内存区域的 PCIe Relaxed Ordering（RO）功能。`0`：禁用，`1`：硬件支持时启用（默认），`2`：自动。需要 `ibv_reg_mr_iova2`（libibverbs ≥ 1.8），不支持时自动回退到严格顺序模式。
 - `MC_GID_INDEX` 每个设备实例使用的 GID 序号，默认值 3（或平台支持的最大值）
 - `MC_PKEY_INDEX` QP 转换到 INIT 状态时使用的 `pkey_index`（partition key 表索引）。有效范围：0 到 65535，默认值 0。当 fabric 所需的 partition key 不在 HCA pkey 表的 0 号位置时需要设置该值
 - `MC_MAX_CQE_PER_CTX` 每个设备实例中 CQ 缓冲区大小，默认值 4096
@@ -423,5 +423,6 @@ int init(const std::string &metadata_conn_string,
 - `MC_MIN_RPC_PORT` 指定 RPC 服务使用的最小端口号。默认值为 15000。
 - `MC_MAX_RPC_PORT` 指定 RPC 服务使用的最大端口号。默认值为 17000。
 - `MC_PATH_ROUNDROBIN` 指定 RDMA 路径选择使用 Round Robin 模式，这对于传输大块数据可能有利。
+- `MC_TE_FILTERS` 可选，逗号分隔的 IB 设备名白名单（如 `mlx5_0,mlx5_2`），用于 Legacy Transfer Engine 拓扑自动发现时限制可见 RDMA 网卡；未设置时不限制。
 - `WITH_NVIDIA_PEERMEM` 设置为 `1`、`ON` 或 `TRUE` 时，Mooncake 使用 `ibv_reg_mr()` 直接注册 GPU 内存（需要 `nvidia-peermem` 内核模块）。默认情况下（未设置或为 `0`），Mooncake 使用不需要 `nvidia-peermem` 的 DMA-BUF 路径。
 - `MC_ENDPOINT_STORE_TYPE` 选择 FIFO Endpoint Store (`FIFO`) 或者 Sieve Endpoint Store (`SIEVE`)，模式是 `SIEVE`。

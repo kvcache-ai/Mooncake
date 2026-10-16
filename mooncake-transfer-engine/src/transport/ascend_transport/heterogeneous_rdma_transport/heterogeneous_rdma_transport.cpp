@@ -208,16 +208,18 @@ int HeterogeneousRdmaTransport::registerLocalMemoryBatch(
 
 int HeterogeneousRdmaTransport::unregisterLocalMemoryBatch(
     const std::vector<void *> &addr_list) {
+    int first_error = 0;
     for (auto &addr : addr_list) {
         int ret = unregisterLocalMemory(addr, false);
         if (ret) {
             LOG(ERROR) << "HeterogeneousRdmaTransport "
                           "unregisterLocalMemoryBatch error, ret: "
                        << ret;
-            return ret;
+            if (!first_error) first_error = ret;
         }
     }
-    return metadata_->updateLocalSegmentDesc();
+    int metadata_ret = metadata_->updateLocalSegmentDesc();
+    return first_error ? first_error : metadata_ret;
 }
 
 int HeterogeneousRdmaTransport::checkAndCreateStreamCopy() {

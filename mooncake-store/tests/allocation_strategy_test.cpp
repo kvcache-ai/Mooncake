@@ -16,6 +16,8 @@
 #include <vector>
 
 #include "allocator.h"
+#include "local_ssd/manager.h"
+#include "segment.h"
 #include "types.h"
 
 namespace mooncake {
@@ -47,7 +49,7 @@ class AllocationStrategyParameterizedTest
    protected:
     void SetUp() override {
         auto [strategy_type, allocator_type] = GetParam();
-        strategy_ = CreateAllocationStrategy(strategy_type);
+        strategy_ = CreateAllocationStrategy(strategy_type, local_ssd_);
         allocator_type_ = allocator_type;
     }
 
@@ -57,19 +59,16 @@ class AllocationStrategyParameterizedTest
         const std::string& segment_name, size_t base_offset,
         size_t size = 64 * MiB) {
         const size_t base = 0x100000000ULL + base_offset;  // 4GB + offset
-        switch (allocator_type_) {
-            case BufferAllocatorType::CACHELIB:
-                return std::make_shared<CachelibBufferAllocator>(
-                    segment_name, base, size, segment_name);
-            case BufferAllocatorType::OFFSET:
-                return std::make_shared<OffsetBufferAllocator>(
-                    segment_name, base, size, segment_name);
-            default:
-                throw std::invalid_argument("Invalid allocator type");
+        auto allocator = CreateBufferAllocator(allocator_type_, segment_name,
+                                               base, size, segment_name);
+        if (!allocator) {
+            throw std::invalid_argument("Invalid allocator test parameters");
         }
+        return std::move(*allocator);
     }
 
     BufferAllocatorType allocator_type_;
+    LocalSsdManager local_ssd_;
     std::shared_ptr<AllocationStrategy> strategy_;
 };
 
@@ -88,6 +87,9 @@ INSTANTIATE_TEST_SUITE_P(
                 break;
             case AllocationStrategyType::FREE_RATIO_FIRST:
                 strategy_str = "FreeRatioFirst";
+                break;
+            case AllocationStrategyType::SSD_FREE_RATIO_FIRST:
+                strategy_str = "SsdFreeRatioFirst";
                 break;
             default:
                 strategy_str = "Unknown";
@@ -119,6 +121,46 @@ TEST_F(AllocationStrategyTest, PreferredSegmentWithEmptyAllocators) {
                                       preferred_segments, {});
     EXPECT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+}
+
+TEST_F(AllocationStrategyTest, SuspectedRegistrationIsSkipped) {
+    const auto initial = ClientLivenessRecord::TimePoint{};
+    auto suspected = std::make_shared<ClientLivenessRecord>(initial);
+    ASSERT_EQ(
+        suspected->Evaluate(initial + std::chrono::seconds(1),
+                            std::chrono::seconds(1), std::chrono::seconds(10)),
+        ClientLivenessTransition::BECAME_SUSPECTED);
+    auto active = std::make_shared<ClientLivenessRecord>(initial);
+
+    auto suspected_allocator = std::make_shared<OffsetBufferAllocator>(
+        "shared", DEFAULT_CXL_BASE, 64 * MiB, "suspected");
+    auto active_allocator = std::make_shared<OffsetBufferAllocator>(
+        "shared", DEFAULT_CXL_BASE + 64 * MiB, 64 * MiB, "active");
+    AllocatorManager allocator_manager;
+    allocator_manager.addAllocator("shared", suspected_allocator, suspected);
+    allocator_manager.addAllocator("shared", active_allocator, active);
+
+    // No SSD usage is registered: the SSD strategy still picks the serving
+    // registration.
+    LocalSsdManager local_ssd;
+    for (const auto strategy_type :
+         {AllocationStrategyType::RANDOM,
+          AllocationStrategyType::FREE_RATIO_FIRST,
+          AllocationStrategyType::SSD_FREE_RATIO_FIRST,
+          AllocationStrategyType::CXL}) {
+        auto strategy = CreateAllocationStrategy(strategy_type, local_ssd);
+        auto result =
+            strategy->Allocate(allocator_manager, 1024, 1, {"shared"}, {});
+        ASSERT_TRUE(result.has_value());
+        ASSERT_EQ(result->size(), 1);
+        const auto expected_endpoint =
+            strategy_type == AllocationStrategyType::CXL ? "shared" : "active";
+        EXPECT_EQ((*result)[0]
+                      .get_descriptor()
+                      .get_memory_descriptor()
+                      .buffer_descriptor.transport_endpoint_,
+                  expected_endpoint);
+    }
 }
 
 // Test preferred segment allocation when available
@@ -751,5 +793,233 @@ TEST_F(AllocationStrategyTest, PerformanceTest) {
 // allocateSlice, resetRetryCount, getRetryCount) are no longer part of the
 // public API. The functionality is now encapsulated within the Allocate()
 // method.
+
+class SsdPlacementTestState {
+   public:
+    void AddSegment(const std::string& name, size_t index, size_t segment_size,
+                    int64_t total_capacity, int64_t used_bytes) {
+        allocators.addAllocator(
+            name, std::make_shared<OffsetBufferAllocator>(
+                      name, 0x100000000ULL + index * segment_size, segment_size,
+                      name));
+        const UUID client_id{index + 1, index + 100};
+        client_by_name.emplace(name, client_id);
+        ASSERT_EQ(local_ssd.RegisterClient(client_id, true), ErrorCode::OK);
+        ASSERT_TRUE(
+            local_ssd.ReportCapacity(client_id, total_capacity).has_value());
+        ASSERT_TRUE(local_ssd.AdjustUsedBytes(client_id, used_bytes));
+    }
+
+    void AddSegmentWithoutSsd(const std::string& name, size_t segment_size) {
+        allocators.addAllocator(
+            name, std::make_shared<OffsetBufferAllocator>(name, 0x100000000ULL,
+                                                          segment_size, name));
+        client_by_name.emplace(name, UUID{1, 100});
+    }
+
+    ScopedAllocatorAccess GetPlacement() {
+        return ScopedAllocatorAccess(allocators, segments_by_host,
+                                     client_by_name, mutex);
+    }
+
+    AllocatorManager allocators;
+    LocalSsdManager local_ssd;
+
+   private:
+    HostSegmentIndex segments_by_host;
+    std::unordered_map<std::string, UUID> client_by_name;
+    std::shared_mutex mutex;
+};
+
+TEST_F(AllocationStrategyTest, SsdFreeRatioFirstChoosesHighestFreeRatio) {
+    const int kNumSegments = 3;
+    const size_t kSegmentSize = 64 * MiB;
+
+    SsdPlacementTestState state;
+    for (int i = 0; i < kNumSegments; i++) {
+        const auto name = std::to_string(i) + "-segment";
+        const int64_t used[] = {800 * MiB, 400 * MiB, 100 * MiB};
+        state.AddSegment(name, i, kSegmentSize, 1000 * MiB, used[i]);
+    }
+
+    SsdFreeRatioFirstAllocationStrategy ssd_strategy(state.local_ssd);
+    auto placement = state.GetPlacement();
+    auto result = ssd_strategy.Allocate(placement, 64 * 1024);
+    ASSERT_TRUE(result.has_value());
+    ASSERT_EQ(result.value().size(), 1u);
+
+    const auto& replica = result.value()[0];
+    auto descriptor = replica.get_descriptor();
+    ASSERT_TRUE(descriptor.is_memory_replica());
+    const auto& mem_desc = descriptor.get_memory_descriptor();
+    EXPECT_EQ(mem_desc.buffer_descriptor.transport_endpoint_, "2-segment");
+}
+
+TEST_F(AllocationStrategyTest, SsdFreeRatioFirstSnapshotPreservesOwnerRanking) {
+    const size_t kSegmentSize = 64 * MiB;
+    SsdPlacementTestState state;
+    state.AddSegment("busy", 0, kSegmentSize, 1000 * MiB, 900 * MiB);
+    state.AddSegment("free", 1, kSegmentSize, 1000 * MiB, 100 * MiB);
+
+    AllocatorManager snapshot;
+    {
+        auto placement = state.GetPlacement();
+        snapshot = placement.SnapshotAllocatorManager();
+    }
+
+    SsdFreeRatioFirstAllocationStrategy strategy(state.local_ssd);
+    auto result = strategy.Allocate(snapshot, 64 * 1024);
+    ASSERT_TRUE(result.has_value());
+    ASSERT_EQ(result->size(), 1u);
+    EXPECT_EQ(result->front()
+                  .get_descriptor()
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              "free");
+}
+
+TEST_F(AllocationStrategyTest, SsdFreeRatioFirstWithoutUsageAllocates) {
+    SsdPlacementTestState state;
+    state.AddSegmentWithoutSsd("segment1", 64 * MiB);
+    SsdFreeRatioFirstAllocationStrategy ssd_strategy(state.local_ssd);
+    auto placement = state.GetPlacement();
+
+    auto result = ssd_strategy.Allocate(placement, 1024);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result.value().size(), 1u);
+}
+
+// Test that SsdFreeRatioFirstAllocationStrategy skips excluded segments even
+// when they have the highest SSD free ratio.
+TEST_F(AllocationStrategyTest, SsdFreeRatioFirstExcludedSegmentsSkipped) {
+    const int kNumSegments = 3;
+    const size_t kSegmentSize = 64 * MiB;
+
+    SsdPlacementTestState state;
+    const int64_t used[] = {50 * MiB, 500 * MiB, 700 * MiB};
+    for (int i = 0; i < kNumSegments; i++) {
+        const auto name = std::to_string(i) + "-segment";
+        state.AddSegment(name, i, kSegmentSize, 1000 * MiB, used[i]);
+    }
+
+    // Exclude 0-segment which has the highest SSD free ratio
+    std::set<std::string> excluded = {"0-segment"};
+
+    SsdFreeRatioFirstAllocationStrategy ssd_strategy(state.local_ssd);
+    auto placement = state.GetPlacement();
+    auto result = ssd_strategy.Allocate(placement, 64 * 1024, 1, {}, excluded);
+    ASSERT_TRUE(result.has_value());
+    ASSERT_EQ(result.value().size(), 1u);
+
+    const auto& replica = result.value()[0];
+    auto descriptor = replica.get_descriptor();
+    ASSERT_TRUE(descriptor.is_memory_replica());
+    const auto& mem_desc = descriptor.get_memory_descriptor();
+    // Must NOT be allocated to the excluded segment despite its high free ratio
+    EXPECT_NE(mem_desc.buffer_descriptor.transport_endpoint_, "0-segment");
+}
+
+// Test that ssd_used_bytes > ssd_total_capacity is clamped to 0% free,
+// so the other segment (with normal usage) is preferred.
+TEST_F(AllocationStrategyTest, SsdFreeRatioFirstUsedExceedsTotalIsClamped) {
+    const size_t kSegmentSize = 64 * MiB;
+
+    SsdPlacementTestState state;
+    state.AddSegment("0-segment", 0, kSegmentSize, 1000 * MiB, 1500 * MiB);
+    state.AddSegment("1-segment", 1, kSegmentSize, 1000 * MiB, 100 * MiB);
+
+    SsdFreeRatioFirstAllocationStrategy ssd_strategy(state.local_ssd);
+    auto placement = state.GetPlacement();
+    auto result = ssd_strategy.Allocate(placement, 64 * 1024);
+    ASSERT_TRUE(result.has_value());
+    ASSERT_EQ(result.value().size(), 1u);
+
+    const auto& replica = result.value()[0];
+    auto descriptor = replica.get_descriptor();
+    ASSERT_TRUE(descriptor.is_memory_replica());
+    const auto& mem_desc = descriptor.get_memory_descriptor();
+    // 0-segment is clamped to 0% free; 1-segment is 90% free → pick 1-segment
+    EXPECT_EQ(mem_desc.buffer_descriptor.transport_endpoint_, "1-segment");
+}
+
+// Strategy-level performance comparison: Random vs SsdFreeRatioFirst.
+TEST_F(AllocationStrategyTest, SsdFreeRatioFirstVsRandomStrategyPerformance) {
+    constexpr size_t kNumSegments = 64;
+    constexpr size_t kSegmentSize = 8 * MiB;   // 64 * 8MB = 512MB physical
+    constexpr size_t kAllocSize = 128 * 1024;  // 128KB per allocation
+    constexpr int kWarmupRounds = 200;
+    constexpr int kBenchmarkRounds = 2000;
+
+    SsdPlacementTestState state;
+    for (size_t i = 0; i < kNumSegments; i++) {
+        const auto name = "perf_seg_" + std::to_string(i);
+        const auto used =
+            static_cast<int64_t>((100 + i * 800 / kNumSegments)) * MiB;
+        state.AddSegment(name, i, kSegmentSize, 1000 * MiB, used);
+    }
+    auto placement = state.GetPlacement();
+
+    // -------- Random strategy --------
+    auto random_strategy = std::make_unique<RandomAllocationStrategy>();
+    {
+        // Warmup (results discarded)
+        for (int i = 0; i < kWarmupRounds; i++) {
+            (void)random_strategy->Allocate(state.allocators, kAllocSize);
+        }
+    }
+    std::vector<std::vector<Replica>> random_replicas;
+    random_replicas.reserve(kBenchmarkRounds);
+
+    auto t_rand_start = std::chrono::steady_clock::now();
+    for (int i = 0; i < kBenchmarkRounds; i++) {
+        auto r = random_strategy->Allocate(state.allocators, kAllocSize);
+        ASSERT_TRUE(r.has_value());
+        random_replicas.emplace_back(std::move(r.value()));
+    }
+    auto rand_us = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - t_rand_start);
+    random_replicas.clear();  // deallocate so SSD strategy starts fresh
+
+    // -------- SsdFreeRatioFirst strategy --------
+    SsdFreeRatioFirstAllocationStrategy ssd_strategy(state.local_ssd);
+    {
+        // Warmup
+        for (int i = 0; i < kWarmupRounds; i++) {
+            (void)ssd_strategy.Allocate(placement, kAllocSize);
+        }
+    }
+    std::vector<std::vector<Replica>> ssd_replicas;
+    ssd_replicas.reserve(kBenchmarkRounds);
+
+    auto t_ssd_start = std::chrono::steady_clock::now();
+    for (int i = 0; i < kBenchmarkRounds; i++) {
+        auto r = ssd_strategy.Allocate(placement, kAllocSize);
+        ASSERT_TRUE(r.has_value());
+        ssd_replicas.emplace_back(std::move(r.value()));
+    }
+    auto ssd_us = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - t_ssd_start);
+    ssd_replicas.clear();
+
+    double rand_us_per_op =
+        static_cast<double>(rand_us.count()) / kBenchmarkRounds;
+    double ssd_us_per_op =
+        static_cast<double>(ssd_us.count()) / kBenchmarkRounds;
+    double overhead_ratio =
+        static_cast<double>(ssd_us.count()) / rand_us.count();
+
+    std::cout
+        << "\n=== Strategy-Level Performance: Random vs SsdFreeRatioFirst ===\n"
+        << "Segments: " << kNumSegments
+        << " | Alloc size: " << (kAllocSize / 1024) << " KB"
+        << " | Rounds: " << kBenchmarkRounds << "\n"
+        << "Random:              " << rand_us.count() << " us total  |  "
+        << std::fixed << std::setprecision(3) << rand_us_per_op << " us/op\n"
+        << "SsdFreeRatioFirst:   " << ssd_us.count() << " us total  |  "
+        << ssd_us_per_op << " us/op\n"
+        << "Overhead ratio:      " << std::setprecision(2) << overhead_ratio
+        << "x  (" << std::setprecision(1) << (overhead_ratio - 1.0) * 100.0
+        << "% slower)\n\n";
+}
 
 }  // namespace mooncake

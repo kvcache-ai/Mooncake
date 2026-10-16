@@ -35,8 +35,8 @@
 namespace mooncake {
 namespace {
 
-int32_t ResolveCurrentEngineId(bool dummy_real_mode) {
-    if (!dummy_real_mode) {
+int32_t ResolveCurrentEngineId(bool agent_mode) {
+    if (!agent_mode) {
         return 0;
     }
     int32_t current_device_id = 0;
@@ -45,6 +45,41 @@ int32_t ResolveCurrentEngineId(bool dummy_real_mode) {
         return -1;
     }
     return current_device_id;
+}
+
+int ResolveAscendMemType(const std::string &location, void *addr,
+                         adxl::MemType &mem_type) {
+    if (location.starts_with("cpu")) {
+        mem_type = adxl::MEM_HOST;
+        return 0;
+    }
+    if (location.starts_with("npu")) {
+        mem_type = adxl::MEM_DEVICE;
+        return 0;
+    }
+    if (location != kWildcardLocation) {
+        LOG(ERROR) << "location:" << location << " is not supported.";
+        return ERR_INVALID_ARGUMENT;
+    }
+    aclrtPtrAttributes attributes;
+    CHECK_ACL(aclrtPointerGetAttributes(addr, &attributes));
+    if (attributes.location.type == ACL_MEM_LOCATION_TYPE_HOST) {
+        mem_type = adxl::MEM_HOST;
+    } else if (attributes.location.type == ACL_MEM_LOCATION_TYPE_DEVICE) {
+        mem_type = adxl::MEM_DEVICE;
+    } else {
+        LOG(INFO) << "mem addr:" << addr
+                  << " can not be recognized, try set to host mem.";
+        mem_type = adxl::MEM_HOST;
+    }
+    return 0;
+}
+
+int StampBufferDeviceId(TransferMetadata::BufferDesc &buffer_desc) {
+    int32_t device_id = -1;
+    CHECK_ACL(aclrtGetDevice(&device_id));
+    buffer_desc.device_id = device_id;
+    return 0;
 }
 
 void InitializeSlice(const Transport::TransferRequest &request,
@@ -105,8 +140,9 @@ int AscendDirectTransport::install(std::string &local_server_name,
     TransferExecutorBase::InitParams exec_params;
     exec_params.metadata = metadata_;
     exec_params.local_engine_contexts = local_engine_contexts_;
-    exec_params.dummy_real_mode = dummy_real_mode_;
+    exec_params.agent_mode = agent_mode_;
     exec_params.roce_mode = roce_mode_;
+    exec_params.use_fabric_mem = use_fabric_mem_;
 
     transfer_executor_ = TransferExecutorBase::Create(exec_params);
     ret = transfer_executor_->initialize();
@@ -117,7 +153,7 @@ int AscendDirectTransport::install(std::string &local_server_name,
         return ret;
     }
 
-    if (dummy_real_mode_ && roce_mode_) {
+    if (agent_mode_ && roce_mode_) {
         dispatcher_ = std::make_unique<RoceDummyRealSliceDispatcher>(
             transfer_executor_.get(), local_engine_contexts_);
     } else {
@@ -148,19 +184,21 @@ int AscendDirectTransport::allocateLocalSegmentID() {
     desc->name = local_server_name_;
     desc->protocol = "ascend";
 
-    dummy_real_mode_ = globalConfig().ascend_agent_mode;
-    char *roce_enable_str = std::getenv("HCCL_INTRA_ROCE_ENABLE");
-    if (roce_enable_str) {
-        std::optional<int32_t> roce_enable =
-            parseFromString<int32_t>(roce_enable_str);
-        if (roce_enable.has_value() && roce_enable.value() == 1) {
-            roce_mode_ = true;
-            LOG(INFO) << "Roce mode is enabled.";
-        } else {
-            LOG(WARNING) << "HCCL_INTRA_ROCE_ENABLE is not valid, value:"
-                         << roce_enable_str;
-        }
-    }
+    agent_mode_ = globalConfig().ascend_agent_mode;
+    roce_mode_ = IsRoceModeEnabled();
+    // Only a Store-init TE may use fabric mem; gate on ascend_store_te_init so
+    // a P2P/HCCS TE does not inherit a Store TE's fabric flag left in the
+    // process-global config.
+    use_fabric_mem_ = globalConfig().ascend_use_fabric_mem &&
+                      globalConfig().ascend_store_te_init;
+    LOG(INFO) << "[AscendTE] init local segment, te is created for store="
+              << (globalConfig().ascend_store_te_init ? "true" : "false")
+              << ", roce_mode=" << (roce_mode_ ? "true" : "false")
+              << ", use_fabric_mem=" << (use_fabric_mem_ ? "true" : "false")
+              << (agent_mode_
+                      ? ", launched as standalone real client (manages all "
+                        "local NPU devices)"
+                      : "");
     char *adxl_base_port = std::getenv("ASCEND_BASE_PORT");
     if (adxl_base_port) {
         std::optional<int32_t> base_port =
@@ -175,9 +213,10 @@ int AscendDirectTransport::allocateLocalSegmentID() {
     }
     const auto [host_ip, port] = parseHostNameWithPort(local_server_name_);
     (void)port;
+    desc->rank_info.hostIp = host_ip;
     uint32_t device_count = 0;
     CHECK_ACL(aclrtGetDeviceCount(&device_count));
-    if (dummy_real_mode_) {
+    if (agent_mode_) {
         auto &ctx_mgr = ContextManager::getInstance();
         if (!ctx_mgr.isInitialized()) {
             LOG(ERROR) << "ContextManager is not initialized.";
@@ -224,7 +263,7 @@ Status AscendDirectTransport::submitTransfer(
             std::to_string(batch_id));
     }
 
-    const int32_t current_engine_id = ResolveCurrentEngineId(dummy_real_mode_);
+    const int32_t current_engine_id = ResolveCurrentEngineId(agent_mode_);
     if (current_engine_id < 0) {
         return Status::Context("aclrtGetDevice failed");
     }
@@ -252,7 +291,7 @@ Status AscendDirectTransport::submitTransfer(
 
 Status AscendDirectTransport::submitTransferTask(
     const std::vector<TransferTask *> &task_list) {
-    const int32_t current_engine_id = ResolveCurrentEngineId(dummy_real_mode_);
+    const int32_t current_engine_id = ResolveCurrentEngineId(agent_mode_);
     if (current_engine_id < 0) {
         return Status::Context("aclrtGetDevice failed");
     }
@@ -291,9 +330,13 @@ Status AscendDirectTransport::getTransferStatus(BatchID batch_id,
             std::to_string(batch_id));
     }
     auto &task = batch_desc.task_list[task_id];
-    status.transferred_bytes = task.transferred_bytes;
-    uint64_t success_slice_count = task.success_slice_count;
-    uint64_t failed_slice_count = task.failed_slice_count;
+    uint64_t success_slice_count =
+        __atomic_load_n(&task.success_slice_count, __ATOMIC_ACQUIRE);
+    uint64_t failed_slice_count =
+        __atomic_load_n(&task.failed_slice_count, __ATOMIC_ACQUIRE);
+    // Completion counters publish the preceding byte updates.
+    status.transferred_bytes =
+        __atomic_load_n(&task.transferred_bytes, __ATOMIC_RELAXED);
     if (success_slice_count + failed_slice_count == task.slice_count) {
         if (failed_slice_count) {
             status.s = TransferStatusEnum::FAILED;
@@ -311,7 +354,6 @@ int AscendDirectTransport::registerLocalMemory(void *addr, size_t length,
                                                const std::string &location,
                                                bool remote_accessible,
                                                bool update_metadata) {
-    (void)remote_accessible;
     aclrtContext saved_ctx = nullptr;
     if (aclrtGetCurrentContext(&saved_ctx) != ACL_ERROR_NONE) {
         LOG(ERROR) << "aclrtGetCurrentContext failed, errmsg: "
@@ -325,27 +367,25 @@ int AscendDirectTransport::registerLocalMemory(void *addr, size_t length,
     buffer_desc.name = location;
     buffer_desc.addr = (uint64_t)addr;
     buffer_desc.length = (uint64_t)length;
+    int stamp_ret = StampBufferDeviceId(buffer_desc);
+    if (stamp_ret != 0) {
+        return stamp_ret;
+    }
 
     adxl::MemType mem_type;
-    if (location.starts_with("cpu")) {
-        mem_type = adxl::MEM_HOST;
-    } else if (location.starts_with("npu")) {
+    int type_ret = ResolveAscendMemType(location, addr, mem_type);
+    if (type_ret != 0) {
+        return type_ret;
+    }
+    if (use_fabric_mem_ && ascend_is_direct_vmm_memory(addr, length)) {
+        // Direct ACL VMM allocations bypass adxl::MallocMem and are not known
+        // to ADXL's allocation bookkeeping, so they must be registered as
+        // device memory. adxl::MallocMem allocations keep MEM_HOST: ADXL
+        // exports them through its own host-memory path. The gate is this TE's
+        // own fabric flag, not the process-wide allocation table: a co-located
+        // non-fabric TE has no fabric-enabled ADXL engine, so it must keep
+        // treating that memory as host.
         mem_type = adxl::MEM_DEVICE;
-    } else if (location == kWildcardLocation) {
-        aclrtPtrAttributes attributes;
-        CHECK_ACL(aclrtPointerGetAttributes(addr, &attributes));
-        if (attributes.location.type == ACL_MEM_LOCATION_TYPE_HOST) {
-            mem_type = adxl::MEM_HOST;
-        } else if (attributes.location.type == ACL_MEM_LOCATION_TYPE_DEVICE) {
-            mem_type = adxl::MEM_DEVICE;
-        } else {
-            LOG(ERROR) << "mem addr:" << addr
-                       << " can not be recognized, try set to host mem.";
-            mem_type = adxl::MEM_HOST;
-        }
-    } else {
-        LOG(ERROR) << "location:" << location << " is not supported.";
-        return ERR_INVALID_ARGUMENT;
     }
 
     int ret = metadata_->addLocalMemoryBuffer(buffer_desc, update_metadata);
@@ -356,7 +396,7 @@ int AscendDirectTransport::registerLocalMemory(void *addr, size_t length,
 
     const int register_ret = transfer_executor_->registerMem(
         addr, length, mem_type, transfer_executor_->getUseBufferPool(),
-        roce_mode_, dummy_real_mode_);
+        remote_accessible);
     if (register_ret == 0) {
         return 0;
     }
@@ -416,16 +456,18 @@ int AscendDirectTransport::unregisterLocalMemoryBatch(
                  "with addr count: "
               << addr_list.size();
 
+    int first_error = 0;
     for (void *addr : addr_list) {
         int ret = unregisterLocalMemory(addr, false);
         if (ret != 0) {
             LOG(ERROR) << "Failed to unregister memory in batch, addr: "
                        << addr;
-            return ret;
+            if (!first_error) first_error = ret;
         }
     }
 
     // Update metadata once for the entire batch
-    return metadata_->updateLocalSegmentDesc();
+    int metadata_ret = metadata_->updateLocalSegmentDesc();
+    return first_error ? first_error : metadata_ret;
 }
 }  // namespace mooncake

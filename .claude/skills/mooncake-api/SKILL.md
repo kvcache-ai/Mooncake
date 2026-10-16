@@ -1,4 +1,7 @@
-<!-- Let's perfect this skill together. -->
+---
+name: mooncake-api
+description: Help users work with the Mooncake Python APIs for distributed storage and high-performance data transfer. Use when working with Mooncake Store (distributed KV cache), Transfer Engine (RDMA/TCP transfers), service setup (master, metadata server), PyTorch tensors in the Store, zero-copy/buffer management, batch operations and replication, or Mooncake EP / Backend (Expert Parallelism). Trigger on questions about MooncakeDistributedStore, TransferEngine, put/get, put_tensor, register_buffer, ReplicateConfig, or the mooncake.store / mooncake.engine / mooncake.pg Python modules.
+---
 
 # Mooncake Python API Skill
 
@@ -15,6 +18,14 @@ Use this skill when users ask about:
 - Batch operations and replication configuration
 - Mooncake EP (Expert Parallelism) and Mooncake Backend
 - Troubleshooting Mooncake Python API issues
+
+## Routing Guidance
+
+- For most vLLM and SGLang users, start from `docs/source/getting_started/quick-start.md`.
+- For PD disaggregation, direct users to the SGLang/vLLM integration guides listed in Quick Start. Those guides own the serving-framework configuration.
+- For Mooncake Store integrations, direct users to the SGLang/vLLM Store setup guides listed in Quick Start. Do not duplicate `mooncake_master` startup commands in general API answers unless the user is working outside those frameworks.
+- For direct low-level Transfer Engine usage, use `docs/source/design/transfer-engine/index.md#using-transfer-engine-in-your-projects`.
+- For API signatures and method details, use the Python API references under `docs/source/python-api-reference/`.
 
 ## Core Components
 
@@ -304,6 +315,7 @@ mooncake_master --default_kv_lease_ttl=5000
 - `MC_STORE_MEMCPY`: Enable local memcpy optimization (set to "1")
 - `MC_STORE_CLIENT_METRIC`: Enable client metrics (enabled by default)
 - `MC_YLT_LOG_LEVEL`: Log level (trace/debug/info/warn/error/critical)
+- `MOONCAKE_STORE_CHECKSUM`: Enable diagnostic object-level CRC-64 checks (set to "1" before creating any writer or reader client)
 
 ## Common Patterns
 
@@ -462,6 +474,17 @@ if result != 0:
     raise RuntimeError(f"Failed to register buffer: {result}")
 ```
 
+### Corrupted Data or Garbled Output
+```python
+# Set this before importing Mooncake or creating any Store client.
+import os
+os.environ["MOONCAKE_STORE_CHECKSUM"] = "1"
+
+from mooncake.store import MooncakeDistributedStore
+```
+
+Enable the switch on every writer and reader client process, then reproduce with full-object `put`/`upsert` and `get` operations. Treat `CHECKSUM_MISMATCH` (-801) as a failed read and do not use the destination buffer. Objects without checksum metadata and range reads are not verified. This mode scans object data, stages GPU buffers to host memory, and disables the local hot cache, so use it only for diagnosis.
+
 ### Service Connectivity
 ```bash
 # Check master is running
@@ -507,6 +530,8 @@ curl http://localhost:8080/metadata
 ## Documentation Links
 
 - Full API Reference: https://kvcache-ai.github.io/Mooncake/
+- Quick Start: docs/source/getting_started/quick-start.md
 - Mooncake Store: docs/source/python-api-reference/mooncake-store.md
 - Transfer Engine: docs/source/python-api-reference/transfer-engine.md
+- Transfer Engine direct usage: docs/source/design/transfer-engine/index.md#using-transfer-engine-in-your-projects
 - EP Backend: docs/source/python-api-reference/ep-backend.md

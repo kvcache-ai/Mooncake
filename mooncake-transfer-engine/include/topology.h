@@ -30,6 +30,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <vector>
 
 #include "common.h"
 
@@ -38,6 +39,8 @@ struct TopologyEntry {
     std::string name;
     std::vector<std::string> preferred_hca;
     std::vector<std::string> avail_hca;
+
+    bool operator==(const TopologyEntry &other) const = default;
 
     Json::Value toJson() const {
         Json::Value matrix(Json::arrayValue);
@@ -73,7 +76,11 @@ class Topology {
         return discover(filter);
     }
 
-    int discover(const std::vector<std::string> &filter);
+    // exclude_efa drops AWS EFA NICs. They are verbs devices too, but only
+    // expose SRD, so the RDMA transport (RC QPs) cannot use them. RDMA
+    // auto-discovery sets it; callers setting up the EFA transport must not.
+    int discover(const std::vector<std::string> &filter,
+                 bool exclude_efa = false);
 
     int parse(const std::string &topology_json);
 
@@ -83,9 +90,20 @@ class Topology {
 
     Json::Value toJson() const;
 
+    bool operator==(const Topology &other) const;
+    bool operator!=(const Topology &other) const { return !(*this == other); }
+
     int selectDevice(const std::string storage_type, int retry_count = 0);
     int selectDevice(const std::string storage_type, std::string_view hint,
                      int retry_count = 0);
+    int selectDeviceByLocalHca(const std::string storage_type,
+                               std::string_view local_hca, int retry_count = 0);
+
+    // Resolve a named HCA in one topology entry without applying fallback
+    // selection. Returns ERR_DEVICE_NOT_FOUND when either the entry or HCA is
+    // absent. This lets callers explicitly try a location and then wildcard.
+    int getDeviceIndex(const std::string &storage_type,
+                       std::string_view device_name) const;
 
     TopologyMatrix getMatrix() const { return matrix_; }
 
@@ -121,6 +139,10 @@ class Topology {
     };
     std::unordered_map<std::string /* storage type */, ResolvedTopologyEntry>
         resolved_matrix_;
+    std::unordered_map<std::string /* local HCA */,
+                       std::unordered_map<std::string /* storage type */,
+                                          std::vector<int> /* peer HCA ids */>>
+        resolved_hca_peer_affinity_by_local_;
 };
 
 }  // namespace mooncake

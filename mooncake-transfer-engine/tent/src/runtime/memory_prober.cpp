@@ -15,6 +15,7 @@
 #include "tent/runtime/memory_prober.h"
 #include "tent/device_plugin.h"
 #include "tent/common/utils/prefault.h"
+#include "char_util.h"
 
 #include <filesystem>
 #include <dlfcn.h>
@@ -92,6 +93,13 @@ Status MemoryProber::loadPlugins(const std::string& path) {
     return Status::OK();
 }
 
+static bool pluginHandlesLocationType(const char* class_name,
+                                      const std::string& type) {
+    if (!class_name) return false;
+    if (class_name == type) return true;
+    return isAmdGpuLocationType(class_name) && isAmdGpuLocationType(type);
+}
+
 void MemoryProber::unloadPlugins() {
     for (auto& p : plugins_) {
         if (p.iface.destroy_plugin && p.ctx) {
@@ -131,7 +139,9 @@ Status MemoryProber::alloc(void** pptr, size_t size, const std::string& loc) {
     }
 
     for (auto& p : plugins_) {
-        if (!(p.iface.class_name == type) || !p.iface.alloc) continue;
+        if (!pluginHandlesLocationType(p.iface.class_name, type) ||
+            !p.iface.alloc)
+            continue;
         int rc = p.iface.alloc(p.ctx, pptr, size, loc.c_str());
         if (rc == 0) {
             std::lock_guard<std::mutex> lock(mu_);
@@ -156,7 +166,9 @@ Status MemoryProber::free(void* ptr, size_t size) {
     }
 
     for (auto& p : plugins_) {
-        if (!(p.iface.class_name == type) || !p.iface.free) continue;
+        if (!pluginHandlesLocationType(p.iface.class_name, type) ||
+            !p.iface.free)
+            continue;
         int rc = p.iface.free(p.ctx, ptr, size);
         if (rc == 0) {
             memory_type_map_.erase(ptr);
@@ -363,7 +375,8 @@ void MemoryProber::probeDeviceMemory(
     MemoryProber::LoadedPlugin& plugin,
     const std::vector<Topology::NicEntry>& nic_list,
     std::vector<Topology::MemEntry>& mem_list) {
-    if (!plugin.iface.get_device_count || !plugin.iface.get_device_pci_bus_id) {
+    if (!plugin.iface.class_name || !plugin.iface.get_device_count ||
+        !plugin.iface.get_device_pci_bus_id) {
         return;
     }
     int device_count = plugin.iface.get_device_count(plugin.ctx);
@@ -374,7 +387,7 @@ void MemoryProber::probeDeviceMemory(
                                                      sizeof(pci_bus_id));
         if (err) continue;
 
-        for (char* ch = pci_bus_id; (*ch = tolower(*ch)); ch++);
+        for (char* ch = pci_bus_id; (*ch = to_lower(*ch)); ch++);
         int numa_node = getNumaNodeFromPciDevice(pci_bus_id);
         int min_distance = INT_MAX;
         std::unordered_map<int, std::vector<int>> distance_map;
@@ -385,11 +398,20 @@ void MemoryProber::probeDeviceMemory(
         }
 
         Topology::MemEntry entry;
-        entry.name =
-            std::string(plugin.iface.class_name) + ":" + std::to_string(i);
+        // Canonicalize the AMD alias so legacy plugins registering
+        // class_name "rocm" still emit the canonical "hip:N" names.
+        const bool is_amd = isAmdGpuLocationType(plugin.iface.class_name);
+        entry.name = (is_amd ? std::string(kAmdGpuLocationType)
+                             : std::string(plugin.iface.class_name)) +
+                     ":" + std::to_string(i);
         entry.numa_node = numa_node;
         entry.pci_bus_id = pci_bus_id;
-        entry.type = Topology::MEM_CUDA;
+        entry.type = memTypeFromLocation(entry.name);
+        if (entry.type == Topology::MEM_UNKNOWN) {
+            // Non-AMD device plugins historically defaulted to CUDA-class
+            // memory (e.g. npu). Keep that fallback.
+            entry.type = Topology::MEM_CUDA;
+        }
         if (distance_map.count(0)) {
             // Prefer NICs with distance 0 (e.g. same PCIe switch/RC)
             entry.device_list[0] = std::move(distance_map[0]);

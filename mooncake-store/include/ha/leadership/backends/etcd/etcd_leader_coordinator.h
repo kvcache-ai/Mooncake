@@ -26,6 +26,8 @@ class EtcdLeaderCoordinator final : public LeaderCoordinator {
     tl::expected<AcquireLeadershipResult, ErrorCode> TryAcquireLeadership(
         const std::string& leader_address) override;
 
+    ErrorCode PublishServiceReady(const LeadershipSession& session) override;
+
     tl::expected<bool, ErrorCode> RenewLeadership(
         const LeadershipSession& session) override;
 
@@ -50,6 +52,7 @@ class EtcdLeaderCoordinator final : public LeaderCoordinator {
     static LeadershipLossReason ClassifyLeadershipLossReason(ErrorCode err);
 
     ErrorCode EnsureConnected();
+    ErrorCode ResetConnection();
     ErrorCode ShutdownKeepAliveThread();
     void ClearLeadershipMonitorStateLocked();
     bool IsSameViewVersion(const std::optional<MasterView>& current_view,

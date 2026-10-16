@@ -78,9 +78,6 @@ int main(int argc, char* argv[]) {
     std::cout << "\nConfiguration:" << std::endl;
     std::cout << "  - HTTP Server: " << config.http_host << ":"
               << config.http_port << std::endl;
-    std::cout << "  - Prometheus: "
-              << (config.enable_prometheus ? "enabled" : "disabled")
-              << std::endl;
     std::cout << "  - Runtime metrics: "
               << (config.enabled ? "enabled" : "disabled") << std::endl;
 
@@ -112,19 +109,19 @@ int main(int argc, char* argv[]) {
         // Simulate successful reads with manual latency
         size_t read_bytes = 1024 * 1024 * (i + 1);   // 1-10 MB
         double read_latency = 0.001 + (i * 0.0005);  // 1-5ms
-        TENT_RECORD_READ_COMPLETED(read_bytes, read_latency);
+        TENT_RECORD_READ_COMPLETED(RDMA, read_bytes, read_latency);
 
         // Simulate successful writes with manual latency
         size_t write_bytes = 512 * 1024 * (i + 1);    // 512KB - 5MB
         double write_latency = 0.002 + (i * 0.0003);  // 2-4.7ms
-        TENT_RECORD_WRITE_COMPLETED(write_bytes, write_latency);
+        TENT_RECORD_WRITE_COMPLETED(RDMA, write_bytes, write_latency);
 
         // Simulate some failures
         if (i % 3 == 0) {
-            TENT_RECORD_READ_FAILED(1024);
+            TENT_RECORD_READ_FAILED(RDMA);
         }
         if (i % 4 == 0) {
-            TENT_RECORD_WRITE_FAILED(512);
+            TENT_RECORD_WRITE_FAILED(RDMA);
         }
 
         std::cout << "  Iteration " << (i + 1) << ": Read "
@@ -145,7 +142,7 @@ int main(int argc, char* argv[]) {
 
     // Example 1: Using TENT_SCOPED_READ_LATENCY macro
     {
-        TENT_SCOPED_READ_LATENCY(2 * 1024 * 1024);  // 2 MB read
+        TENT_SCOPED_READ_LATENCY(RDMA, 2 * 1024 * 1024);  // 2 MB read
         // Simulate work (the latency is automatically measured)
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
         std::cout << "  Scoped read: 2 MB with ~5ms simulated work"
@@ -154,7 +151,7 @@ int main(int argc, char* argv[]) {
 
     // Example 2: Using TENT_SCOPED_WRITE_LATENCY macro
     {
-        TENT_SCOPED_WRITE_LATENCY(1 * 1024 * 1024);  // 1 MB write
+        TENT_SCOPED_WRITE_LATENCY(RDMA, 1 * 1024 * 1024);  // 1 MB write
         // Simulate work
         std::this_thread::sleep_for(std::chrono::milliseconds(3));
         std::cout << "  Scoped write: 1 MB with ~3ms simulated work"
@@ -164,7 +161,7 @@ int main(int argc, char* argv[]) {
     // Example 3: Using ScopedLatencyRecorder directly with failure handling
     {
         ScopedLatencyRecorder recorder(
-            ScopedLatencyRecorder::OperationType::Read, 512 * 1024);
+            ScopedLatencyRecorder::OperationType::Read, RDMA, 512 * 1024);
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
         // Simulate a failure condition
         bool operation_failed = true;  // Simulated failure
@@ -178,7 +175,7 @@ int main(int argc, char* argv[]) {
     // Example 4: Multiple scoped operations in a loop
     std::cout << "\n  Running 5 scoped read operations..." << std::endl;
     for (int i = 0; i < 5; ++i) {
-        TENT_SCOPED_READ_LATENCY(256 * 1024 * (i + 1));  // 256KB - 1.25MB
+        TENT_SCOPED_READ_LATENCY(RDMA, 256 * 1024 * (i + 1));  // 256KB - 1.25MB
         std::this_thread::sleep_for(std::chrono::milliseconds(1 + i));
         std::cout << "    Scoped read " << (i + 1) << ": " << 256 * (i + 1)
                   << " KB with ~" << (1 + i) << "ms work" << std::endl;
@@ -199,7 +196,7 @@ int main(int argc, char* argv[]) {
         // These calls will return immediately with minimal overhead
         for (int i = 0; i < 1000; ++i) {
             TENT_RECORD_READ_COMPLETED(
-                1024, 0.001);  // These are no-ops when disabled
+                RDMA, 1024, 0.001);  // These are no-ops when disabled
         }
         std::cout << "  1000 record calls completed (no-op, metrics disabled)"
                   << std::endl;
@@ -209,7 +206,7 @@ int main(int argc, char* argv[]) {
         TentMetrics::setEnabled(true);
 
         // Now these will be recorded
-        TENT_RECORD_READ_COMPLETED(1024 * 1024, 0.005);
+        TENT_RECORD_READ_COMPLETED(RDMA, 1024 * 1024, 0.005);
         std::cout << "  Recorded 1 MB read after re-enabling" << std::endl;
     } else {
         std::cout << "  Skipping enable/disable demo (started with --disabled)"
@@ -247,8 +244,8 @@ int main(int argc, char* argv[]) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
 
             // Simulate ongoing traffic
-            TENT_RECORD_READ_COMPLETED(1024 * 1024, 0.001);
-            TENT_RECORD_WRITE_COMPLETED(512 * 1024, 0.002);
+            TENT_RECORD_READ_COMPLETED(RDMA, 1024 * 1024, 0.001);
+            TENT_RECORD_WRITE_COMPLETED(RDMA, 512 * 1024, 0.002);
         }
     }
 

@@ -16,10 +16,12 @@
 
 #include <arpa/inet.h>
 #include <bits/stdint-uintn.h>
+#include <fcntl.h>
 #include <ifaddrs.h>
 #include <json/value.h>
 #include <net/if.h>
 #include <netdb.h>
+#include <poll.h>
 #include <sys/socket.h>
 
 #include <random>
@@ -148,6 +150,13 @@ struct RedisStoragePlugin : public MetadataStoragePlugin {
                        << " from " << metadata_uri_;
             return false;
         }
+        if (resp->type == REDIS_REPLY_ERROR) {
+            LOG(ERROR) << "RedisStoragePlugin: get " << key << " rejected by "
+                       << metadata_uri_ << ": "
+                       << (resp->str ? resp->str : "unknown error");
+            freeReplyObject(resp);
+            return false;
+        }
         if (!resp->str) {
             LOG(ERROR) << "RedisStoragePlugin: unable to get " << key
                        << " from " << metadata_uri_;
@@ -166,6 +175,44 @@ struct RedisStoragePlugin : public MetadataStoragePlugin {
         return true;
     }
 
+    // Distinguishes a nil reply (key absent — kNotFound) from a connection
+    // or command error (kUnavailable) so syncSegmentCache does not purge the
+    // cache during a Redis outage.
+    GetResult getWithStatus(const std::string &key,
+                            Json::Value &value) override {
+        std::lock_guard<std::mutex> lock(access_client_mutex_);
+        if (!client_) return GetResult::kUnavailable;
+
+        redisReply *resp =
+            (redisReply *)redisCommand(client_, "GET %s", key.c_str());
+        if (!resp) {
+            LOG(ERROR) << "RedisStoragePlugin: unable to get " << key
+                       << " from " << metadata_uri_;
+            return GetResult::kUnavailable;
+        }
+        if (resp->type == REDIS_REPLY_ERROR) {
+            LOG(ERROR) << "RedisStoragePlugin: get " << key << " rejected by "
+                       << metadata_uri_ << ": "
+                       << (resp->str ? resp->str : "unknown error");
+            freeReplyObject(resp);
+            return GetResult::kUnavailable;
+        }
+        if (!resp->str) {
+            freeReplyObject(resp);
+            return GetResult::kNotFound;
+        }
+
+        auto json_file = std::string(resp->str);
+        freeReplyObject(resp);
+
+        std::string errs;
+        if (!parseJsonString(json_file, value, &errs)) {
+            LOG(ERROR) << "RedisStoragePlugin: JSON parse error: " << errs;
+            return GetResult::kUnavailable;
+        }
+        return GetResult::kFound;
+    }
+
     virtual bool set(const std::string &key, const Json::Value &value) {
         std::lock_guard<std::mutex> lock(access_client_mutex_);
         if (!client_) return false;
@@ -177,6 +224,17 @@ struct RedisStoragePlugin : public MetadataStoragePlugin {
         if (!resp) {
             LOG(ERROR) << "RedisStoragePlugin: unable to put " << key
                        << " from " << metadata_uri_;
+            return false;
+        }
+        if (resp->type == REDIS_REPLY_ERROR) {
+            // The server received and rejected the write (READONLY after a
+            // failover, OOM at maxmemory, MISCONF, NOAUTH). Reporting success
+            // loses the write silently; the constructor already treats the
+            // same reply type as failure for AUTH/SELECT.
+            LOG(ERROR) << "RedisStoragePlugin: put " << key << " rejected by "
+                       << metadata_uri_ << ": "
+                       << (resp->str ? resp->str : "unknown error");
+            freeReplyObject(resp);
             return false;
         }
         freeReplyObject(resp);
@@ -192,6 +250,13 @@ struct RedisStoragePlugin : public MetadataStoragePlugin {
         if (!resp) {
             LOG(ERROR) << "RedisStoragePlugin: unable to remove " << key
                        << " from " << metadata_uri_;
+            return false;
+        }
+        if (resp->type == REDIS_REPLY_ERROR) {
+            LOG(ERROR) << "RedisStoragePlugin: remove " << key
+                       << " rejected by " << metadata_uri_ << ": "
+                       << (resp->str ? resp->str : "unknown error");
+            freeReplyObject(resp);
             return false;
         }
         freeReplyObject(resp);
@@ -301,6 +366,54 @@ struct HTTPStoragePlugin : public MetadataStoragePlugin {
             return false;
         }
         return true;
+    }
+
+    // Distinguishes HTTP 404 (key absent — kNotFound) from curl/network
+    // errors and server-side 5xx (kUnavailable) so syncSegmentCache does not
+    // purge the cache during an etcd/master outage.
+    GetResult getWithStatus(const std::string &key,
+                            Json::Value &value) override {
+        CURL *h = tl_easy();
+        curl_easy_reset(h);
+
+        std::string readBody;
+        char errbuf[CURL_ERROR_SIZE] = {0};
+
+        curl_easy_setopt(h, CURLOPT_TIMEOUT_MS, 3000L);
+        curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT_MS, 1500L);
+
+        const std::string url = encodeUrl(key);
+        curl_easy_setopt(h, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(h, CURLOPT_HTTPGET, 1L);
+        curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, writeCallback);
+        curl_easy_setopt(h, CURLOPT_WRITEDATA, &readBody);
+        curl_easy_setopt(h, CURLOPT_ERRORBUFFER, errbuf);
+
+        CURLcode rc = curl_easy_perform(h);
+        if (rc != CURLE_OK) {
+            LOG(ERROR) << "GET " << url << " curl: " << curl_easy_strerror(rc)
+                       << " err: " << errbuf;
+            return GetResult::kUnavailable;
+        }
+
+        long code = 0;
+        curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &code);
+        if (code == 404) return GetResult::kNotFound;
+        if (!is_200(code)) {
+            LOG(ERROR) << "GET " << url << " http=" << code
+                       << " body: " << readBody;
+            return GetResult::kUnavailable;
+        }
+
+        Json::CharReaderBuilder b;
+        std::string errs;
+        std::unique_ptr<Json::CharReader> r(b.newCharReader());
+        if (!r->parse(readBody.data(), readBody.data() + readBody.size(),
+                      &value, &errs)) {
+            LOG(ERROR) << "GET " << url << " json parse error: " << errs;
+            return GetResult::kUnavailable;
+        }
+        return GetResult::kFound;
     }
 
     bool set(const std::string &key, const Json::Value &value) override {
@@ -417,6 +530,29 @@ struct EtcdStoragePlugin : public MetadataStoragePlugin {
         return true;
     }
 
+    // etcd v3 answers a range request for a missing key with an OK response
+    // carrying no value, so an empty payload is an authoritative absence;
+    // everything else that fails (RPC error, timeout, malformed payload) is
+    // reported as unavailability, never as absence.
+    GetResult getWithStatus(const std::string &key,
+                            Json::Value &value) override {
+        auto resp = client_.get(key);
+        if (!resp.is_ok()) {
+            LOG(ERROR) << "EtcdStoragePlugin: unable to get " << key << " from "
+                       << metadata_uri_ << ": " << resp.error_message();
+            return GetResult::kUnavailable;
+        }
+        auto json_file = resp.value().as_string();
+        if (json_file.empty()) return GetResult::kNotFound;
+
+        std::string errs;
+        if (!parseJsonString(json_file, value, &errs)) {
+            LOG(ERROR) << "EtcdStoragePlugin: JSON parse error: " << errs;
+            return GetResult::kUnavailable;
+        }
+        return GetResult::kFound;
+    }
+
     virtual bool set(const std::string &key, const Json::Value &value) {
         Json::FastWriter writer;
         const std::string json_file = writer.write(value);
@@ -483,6 +619,36 @@ struct EtcdStoragePlugin : public MetadataStoragePlugin {
             return false;
         }
         return true;
+    }
+
+    // EtcdGetWrapper reports a missing key as ret == 0 with no payload, so
+    // that combination is an authoritative absence; a non-zero return (RPC
+    // error, timeout) is unavailability, never absence.
+    GetResult getWithStatus(const std::string &key,
+                            Json::Value &value) override {
+        char *json_data = nullptr;
+        auto ret = EtcdGetWrapper((char *)key.c_str(), &json_data, &err_msg_);
+        if (ret) {
+            LOG(ERROR) << "EtcdStoragePlugin: unable to get " << key << " in "
+                       << metadata_uri_ << ": " << err_msg_;
+            // free the memory for storing error message
+            free(err_msg_);
+            err_msg_ = nullptr;
+            return GetResult::kUnavailable;
+        }
+        if (!json_data) {
+            return GetResult::kNotFound;
+        }
+        auto json_file = std::string(json_data);
+        // free the memory allocated by EtcdGetWrapper
+        free(json_data);
+
+        std::string errs;
+        if (!parseJsonString(json_file, value, &errs)) {
+            LOG(ERROR) << "EtcdStoragePlugin: JSON parse error: " << errs;
+            return GetResult::kUnavailable;
+        }
+        return GetResult::kFound;
     }
 
     virtual bool set(const std::string &key, const Json::Value &value) {
@@ -744,12 +910,19 @@ struct SocketHandShakePlugin : public HandShakePlugin {
                 }
 
                 struct timeval timeout;
-                timeout.tv_sec = 60;
+                timeout.tv_sec = 5;
                 timeout.tv_usec = 0;
                 if (setsockopt(conn_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout,
                                sizeof(timeout))) {
                     PLOG(ERROR)
                         << "SocketHandShakePlugin: setsockopt(SO_RCVTIMEO)";
+                    close(conn_fd);
+                    continue;
+                }
+                if (setsockopt(conn_fd, SOL_SOCKET, SO_SNDTIMEO, &timeout,
+                               sizeof(timeout))) {
+                    PLOG(ERROR)
+                        << "SocketHandShakePlugin: setsockopt(SO_SNDTIMEO)";
                     close(conn_fd);
                     continue;
                 }
@@ -760,6 +933,11 @@ struct SocketHandShakePlugin : public HandShakePlugin {
                 Json::Value local, peer;
 
                 auto [type, json_str] = readString(conn_fd);
+                if (type == HandShakeRequestType::Invalid) {
+                    close(conn_fd);
+                    continue;
+                }
+
                 std::string errs;
                 if (!parseJsonString(json_str, peer, &errs)) {
                     LOG(ERROR)
@@ -960,9 +1138,77 @@ struct SocketHandShakePlugin : public HandShakePlugin {
             return ERR_SOCKET;
         }
 
+        // SO_RCVTIMEO does not apply to connect(). A blocking connect() to
+        // an unroutable address (e.g. a torn-down pod IP) stalls for the
+        // kernel's full SYN-retry cycle -- minutes -- and this runs on RDMA
+        // worker threads, where the stall also blocks CQ polling. Connect in
+        // non-blocking mode and bound the wait with poll().
+        int flags = fcntl(conn_fd, F_GETFL, 0);
+        if (flags == -1 || fcntl(conn_fd, F_SETFL, flags | O_NONBLOCK) == -1) {
+            PLOG(ERROR) << "SocketHandShakePlugin: fcntl(O_NONBLOCK)";
+            close(conn_fd);
+            return ERR_SOCKET;
+        }
+
         if (connect(conn_fd, addr->ai_addr, addr->ai_addrlen)) {
-            PLOG(ERROR) << "SocketHandShakePlugin: connect()"
-                        << getNetworkAddress(addr->ai_addr);
+            if (errno != EINPROGRESS) {
+                PLOG(ERROR) << "SocketHandShakePlugin: connect()"
+                            << getNetworkAddress(addr->ai_addr);
+                close(conn_fd);
+                return ERR_SOCKET;
+            }
+
+            const int64_t deadline_ms =
+                getCurrentTimeInMilli() +
+                globalConfig().handshake_connect_timeout * 1000;
+            struct pollfd pfd;
+            pfd.fd = conn_fd;
+            pfd.events = POLLOUT;
+            while (true) {
+                const int64_t remaining_ms =
+                    deadline_ms - getCurrentTimeInMilli();
+                // poll() returning 0 already means the timeout expired; an
+                // exhausted deadline (only reachable after EINTR) is the
+                // same condition.
+                int ret =
+                    remaining_ms <= 0 ? 0 : poll(&pfd, 1, (int)remaining_ms);
+                if (ret > 0) break;
+                if (ret == 0) {
+                    errno = ETIMEDOUT;
+                    PLOG(ERROR) << "SocketHandShakePlugin: connect() "
+                                << getNetworkAddress(addr->ai_addr);
+                    close(conn_fd);
+                    return ERR_SOCKET;
+                }
+                if (errno != EINTR) {
+                    PLOG(ERROR) << "SocketHandShakePlugin: poll()";
+                    close(conn_fd);
+                    return ERR_SOCKET;
+                }
+                // EINTR: retry with the remaining time.
+            }
+
+            int conn_err = 0;
+            socklen_t err_len = sizeof(conn_err);
+            if (getsockopt(conn_fd, SOL_SOCKET, SO_ERROR, &conn_err,
+                           &err_len)) {
+                PLOG(ERROR) << "SocketHandShakePlugin: getsockopt(SO_ERROR)";
+                close(conn_fd);
+                return ERR_SOCKET;
+            }
+            if (conn_err) {
+                errno = conn_err;
+                PLOG(ERROR) << "SocketHandShakePlugin: connect()"
+                            << getNetworkAddress(addr->ai_addr);
+                close(conn_fd);
+                return ERR_SOCKET;
+            }
+        }
+
+        // Restore blocking mode; the request/response exchange relies on
+        // blocking reads bounded by SO_RCVTIMEO.
+        if (fcntl(conn_fd, F_SETFL, flags) == -1) {
+            PLOG(ERROR) << "SocketHandShakePlugin: fcntl(restore flags)";
             close(conn_fd);
             return ERR_SOCKET;
         }

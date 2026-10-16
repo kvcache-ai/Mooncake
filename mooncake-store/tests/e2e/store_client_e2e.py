@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
 import argparse
-import os
-import sys
 import time
 
 
@@ -31,7 +29,7 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
-        import store  # type: ignore
+        import mooncake.store as store
     except Exception as exc:
         print(f"import_fail {exc}", flush=True)
         return 10

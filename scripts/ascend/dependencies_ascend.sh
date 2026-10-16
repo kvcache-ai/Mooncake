@@ -15,7 +15,7 @@
 
 # If git clone fails, you can place dependencies and Mooncake source code in a directory for compilation and installation.
 
-# ASCEND TRANSPORT is scheduled for deprecation, please use ASCEND DIRECT TRANSPORT on ASCEND platform. 
+# ASCEND TRANSPORT is scheduled for deprecation, please use ASCEND DIRECT TRANSPORT on ASCEND platform.
 # Use dependencies_ascend_installation.sh to install dependencies instead.
 
 #!/bin/bash
@@ -55,7 +55,6 @@ if command -v apt-get &> /dev/null; then
             wget \
             libibverbs-dev \
             libgoogle-glog-dev \
-            libgtest-dev \
             libjsoncpp-dev \
             libunwind-dev \
             libnuma-dev \
@@ -83,8 +82,6 @@ elif command -v yum &> /dev/null; then
             glog-devel \
             libibverbs-devel \
             numactl-devel \
-            gtest \
-            gtest-devel \
             boost-devel \
             openssl-devel \
             hiredis-devel \
@@ -116,19 +113,6 @@ export CPLUS_INCLUDE_PATH=$(echo $CPLUS_INCLUDE_PATH | tr ':' '\n' | grep -v "/u
 cd "$TARGET_DIR"
 pwd
 
-# Install yalantinglibs
-clone_repo_if_not_exists "yalantinglibs" "https://github.com/alibaba/yalantinglibs.git"
-cd yalantinglibs || exit
-git checkout 0.5.5
-rm -rf build
-mkdir -p build && cd build
-cmake .. -DBUILD_EXAMPLES=OFF -DBUILD_BENCHMARK=OFF -DBUILD_UNIT_TESTS=OFF
-make -j$(nproc)
-make install
-cd ../..
-
-echo -e "yalantinglibs installed successfully."
-
 # Install Mooncake
 cd Mooncake || exit
 if ! git submodule update --init --recursive; then
@@ -148,7 +132,7 @@ rm -rf build
 mkdir -p build
 cd build
 cmake -DCMAKE_POLICY_VERSION_MINIMUM=3.5 ..
-make -j 
+make -j
 make install -j
 cd ..
 

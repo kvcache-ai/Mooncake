@@ -3,23 +3,24 @@
 ###############################################################################
 # Stage 1: build Mooncake from source and produce a Python wheel
 ###############################################################################
-ARG CUDA_VERSION=12.8.1
+ARG CUDA_VERSION=13.0.3
 ARG UBUNTU_VERSION=22.04
 
 FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION} AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
 
 ARG PYTHON_VERSION=3.10
 ARG PYPA_INDEX_URL=https://bootstrap.pypa.io
 ARG CMAKE_BUILD_TYPE=Release
-ARG EP_TORCH_VERSIONS="2.9.1"
-ARG TORCH_CUDA_ARCH_LIST="8.0;9.0"
+ARG TORCH_VERSION=2.14.1
+ARG TORCH_CUDA_ARCH_LIST="8.0;9.0;10.3"
+# CI can opt in to removing /workspace/build from the builder layer.
+ARG CLEAN_BUILD_ARTIFACTS=0
 
 ENV PYTHON_VERSION=${PYTHON_VERSION} \
-    BUILD_WITH_EP=1 \
-    EP_TORCH_VERSIONS=${EP_TORCH_VERSIONS} \
     TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST} \
     PATH="/usr/local/go/bin:${PATH}"
 
@@ -39,6 +40,7 @@ RUN apt-get update && \
         python${PYTHON_VERSION}-dev \
         python${PYTHON_VERSION}-venv && \
     curl -sS ${PYPA_INDEX_URL}/get-pip.py | python${PYTHON_VERSION} && \
+    python${PYTHON_VERSION} -m pip install --no-cache-dir "torch==${TORCH_VERSION}" && \
     update-alternatives --install /usr/bin/python  python  /usr/bin/python${PYTHON_VERSION} 1 && \
     update-alternatives --install /usr/bin/python3 python3 /usr/bin/python${PYTHON_VERSION} 1 && \
     apt-get purge -y --auto-remove software-properties-common && \
@@ -47,10 +49,12 @@ RUN apt-get update && \
 WORKDIR /workspace
 COPY . /workspace
 
-# Install Mooncake dependencies (yalantinglibs, Go, etc.)
+# Install Mooncake dependencies (submodules, Go, etc.)
 RUN bash dependencies.sh -y
 
-# Configure & build Mooncake
+# Configure and build the wheel in one layer, then remove build/ only after
+# auditwheel has resolved libraries from it. The large intermediate tree is
+# therefore not retained in the builder image or BuildKit cache.
 RUN mkdir -p build && \
     cd build && \
     cmake -G Ninja .. \
@@ -63,18 +67,22 @@ RUN mkdir -p build && \
         -DPython3_EXECUTABLE=/usr/bin/python${PYTHON_VERSION} \
         -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE} && \
     export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH && \
-    cmake --build .
-
-# Build nvlink allocator to make wheel self-contained for CUDA paths
-RUN export PATH=/usr/local/nvidia/bin:/usr/local/nvidia/lib64:$PATH && \
+    cmake --build . && \
+    cd /workspace && \
+    export PATH=/usr/local/nvidia/bin:/usr/local/nvidia/lib64:$PATH && \
     export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH && \
     export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH && \
     mkdir -p build/mooncake-transfer-engine/nvlink-allocator && \
     cd mooncake-transfer-engine/nvlink-allocator && \
-    bash build.sh ../../build/mooncake-transfer-engine/nvlink-allocator/
-
-# Build the Python wheel from local sources
-RUN OUTPUT_DIR=dist ./scripts/build_wheel.sh
+    bash build.sh ../../build/mooncake-transfer-engine/nvlink-allocator/ && \
+    cd /workspace && \
+    OUTPUT_DIR=dist ./scripts/build_wheel.sh && \
+    python${PYTHON_VERSION} -m pip install --no-cache-dir mooncake-wheel/dist/*.whl && \
+    ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1 && \
+    python${PYTHON_VERSION} -m mooncake.pg --prebuild && \
+    if [ "${CLEAN_BUILD_ARTIFACTS}" = "1" ]; then \
+        rm -rf build; \
+    fi
 
 ###############################################################################
 # Stage 2: install the freshly built wheel into a runtime image
@@ -87,6 +95,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 # Inherit build-args so the runtime stage installs the matching interpreter
 ARG PYTHON_VERSION=3.10
+ARG TORCH_VERSION=2.14.1
 ARG PYPA_INDEX_URL=https://bootstrap.pypa.io
 ENV PYTHON_VERSION=${PYTHON_VERSION}
 
@@ -109,6 +118,7 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         python${PYTHON_VERSION} && \
     curl -sS ${PYPA_INDEX_URL}/get-pip.py | python${PYTHON_VERSION} && \
+    python${PYTHON_VERSION} -m pip install --no-cache-dir "torch==${TORCH_VERSION}" && \
     update-alternatives --install /usr/bin/python  python  /usr/bin/python${PYTHON_VERSION} 1 && \
     update-alternatives --install /usr/bin/python3 python3 /usr/bin/python${PYTHON_VERSION} 1 && \
     apt-get purge -y --auto-remove software-properties-common curl && \
@@ -116,6 +126,7 @@ RUN apt-get update && \
 
 # Copy wheels produced in builder stage and install them via pip
 COPY --from=builder /workspace/mooncake-wheel/dist /tmp/mooncake-wheel
+COPY --from=builder /root/.cache/mooncake/pg_jit /root/.cache/mooncake/pg_jit
 COPY --chmod=755 scripts/check_hicache_hugepage_requirements.py /usr/local/bin/mooncake-hicache-sizing
 RUN python${PYTHON_VERSION} -m pip install --no-cache-dir /tmp/mooncake-wheel/*.whl && rm -rf /tmp/mooncake-wheel /root/.cache/pip
 

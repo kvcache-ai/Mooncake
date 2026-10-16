@@ -117,14 +117,16 @@ Status IOUringTransport::allocateSubBatch(SubBatchRef& batch, size_t max_size) {
     auto io_uring_batch = Slab<IOUringSubBatch>::Get().allocate();
     if (!io_uring_batch)
         return Status::InternalError("Unable to allocate IO Uring sub-batch");
-    batch = io_uring_batch;
     io_uring_batch->max_size = max_size;
     io_uring_batch->task_list.reserve(max_size);
     int rc = io_uring_queue_init(max_size, &io_uring_batch->ring, 0);
-    if (rc)
+    if (rc) {
+        Slab<IOUringSubBatch>::Get().deallocate(io_uring_batch);
         return Status::InternalError(
             std::string("io_uring_queue_init failed: ") + strerror(-rc) +
             LOC_MARK);
+    }
+    batch = io_uring_batch;
     return Status::OK();
 }
 
@@ -156,7 +158,7 @@ std::string IOUringTransport::getIOUringFilePath(SegmentID target_id) {
 }
 
 IOUringFileContext* IOUringTransport::findFileContext(SegmentID target_id) {
-    thread_local FileContextMap tl_file_context_map;
+    auto& tl_file_context_map = tl_file_context_map_.get();
     if (tl_file_context_map.count(target_id))
         return tl_file_context_map[target_id].get();
 
@@ -180,52 +182,106 @@ Status IOUringTransport::submitTransferTasks(
     if (request_list.size() + (int)io_uring_batch->task_list.size() >
         io_uring_batch->max_size)
         return Status::TooManyRequests("Exceed batch capacity" LOC_MARK);
+
+    const size_t kPageSize = 4096;
+
+    // Phase 1: validate every request and stage alignment-fixing buffers
+    // before touching the sub-batch or the SQ ring (all-or-nothing
+    // submission contract, see Transport::submitTransferTasks). Any failure
+    // here returns with the sub-batch, the SQ ring and the file untouched;
+    // staging buffers allocated for earlier requests are freed.
+    std::vector<IOUringFileContext*> contexts;
+    contexts.reserve(request_list.size());
+    std::vector<void*> staging_buffers;
+    staging_buffers.reserve(request_list.size());
     for (auto& request : request_list) {
+        if (request.opcode != Request::READ &&
+            request.opcode != Request::WRITE) {
+            for (void* buffer : staging_buffers) free(buffer);
+            return Status::InvalidArgument("Unsupported opcode" LOC_MARK);
+        }
+
+        IOUringFileContext* context = findFileContext(request.target_id);
+        if (!context || !context->ready()) {
+            for (void* buffer : staging_buffers) free(buffer);
+            return Status::InvalidArgument("Invalid remote segment" LOC_MARK);
+        }
+        contexts.push_back(context);
+
+        if (Platform::getLoader().getMemoryType(request.source) == MTYPE_CUDA ||
+            (uint64_t)request.source % kPageSize) {
+            void* buffer = nullptr;
+            int rc = posix_memalign(&buffer, kPageSize, request.length);
+            if (rc) {
+                for (void* staged : staging_buffers) free(staged);
+                return Status::InternalError("posix_memalign failed" LOC_MARK);
+            }
+            staging_buffers.push_back(buffer);
+        } else {
+            staging_buffers.push_back(nullptr);
+        }
+    }
+
+    // The capacity check above bounds the task count, but SQEs left queued
+    // by a deferred submission (see below) may still occupy the ring.
+    if (io_uring_sq_space_left(&io_uring_batch->ring) <
+        (int)request_list.size()) {
+        for (void* buffer : staging_buffers) free(buffer);
+        return Status::TooManyRequests("Insufficient SQE space" LOC_MARK);
+    }
+
+    // Phase 2: commit. Tasks are appended and SQEs prepared; from here on
+    // this call must not return an error. A positive short io_uring_submit()
+    // means part of the batch is already in flight, and an error return
+    // would make the engine's failover re-execute it. Keep flushing the
+    // remainder instead; a persistent failure defers the flush of the
+    // queued SQEs to the next submit attempt from getTransferStatus()'s
+    // PENDING path while the tasks stay PENDING.
+    for (size_t i = 0; i < request_list.size(); ++i) {
+        const auto& request = request_list[i];
         io_uring_batch->task_list.push_back(IOUringTask{});
         auto& task =
             io_uring_batch->task_list[io_uring_batch->task_list.size() - 1];
         task.request = request;
         task.status_word = TransferStatusEnum::PENDING;
-
-        IOUringFileContext* context = findFileContext(request.target_id);
-        if (!context || !context->ready())
-            return Status::InvalidArgument("Invalid remote segment" LOC_MARK);
+        task.buffer = staging_buffers[i];
+        // Vectored ops with a single iovec: IORING_OP_READV/WRITEV have
+        // existed since kernel 5.1, while the non-vectored READ/WRITE
+        // opcodes used by io_uring_prep_read()/io_uring_prep_write() require
+        // kernel 5.6+.
+        task.iov = {task.buffer ? task.buffer : request.source, request.length};
 
         struct io_uring_sqe* sqe = io_uring_get_sqe(&io_uring_batch->ring);
-        if (!sqe)
-            return Status::InternalError("io_uring_get_sqe failed" LOC_MARK);
+        CHECK(sqe) << "SQE space was verified before preparation";
 
-        const size_t kPageSize = 4096;
-        if (Platform::getLoader().getMemoryType(request.source) == MTYPE_CUDA ||
-            (uint64_t)request.source % kPageSize) {
-            int rc = posix_memalign(&task.buffer, kPageSize, request.length);
-            if (rc)
-                return Status::InternalError("posix_memalign failed" LOC_MARK);
-
-            if (request.opcode == Request::READ)
-                io_uring_prep_read(sqe, context->getHandle(), task.buffer,
-                                   request.length, request.target_offset);
-            else if (request.opcode == Request::WRITE) {
+        if (request.opcode == Request::READ) {
+            io_uring_prep_readv(sqe, contexts[i]->getHandle(), &task.iov, 1,
+                                request.target_offset);
+        } else {
+            if (task.buffer)
                 Platform::getLoader().copy(task.buffer, request.source,
                                            request.length);
-                io_uring_prep_write(sqe, context->getHandle(), task.buffer,
-                                    request.length, request.target_offset);
-            }
-        } else {
-            if (request.opcode == Request::READ)
-                io_uring_prep_read(sqe, context->getHandle(), request.source,
-                                   request.length, request.target_offset);
-            else if (request.opcode == Request::WRITE)
-                io_uring_prep_write(sqe, context->getHandle(), request.source,
-                                    request.length, request.target_offset);
+            io_uring_prep_writev(sqe, contexts[i]->getHandle(), &task.iov, 1,
+                                 request.target_offset);
         }
         sqe->user_data = (uintptr_t)&task;
     }
 
-    int rc = io_uring_submit(&io_uring_batch->ring);
-    if (rc != (int32_t)request_list.size())
-        return Status::InternalError(std::string("io_uring_submit failed: ") +
-                                     strerror(-rc) + LOC_MARK);
+    int submitted = 0;
+    int transient_retries = 0;
+    while (submitted < (int)request_list.size()) {
+        int rc = submitSqes(&io_uring_batch->ring);
+        if ((rc == -EINTR || rc == -EAGAIN) && transient_retries++ < 3)
+            continue;
+        if (rc <= 0) {
+            LOG(ERROR) << "IOUringTransport: io_uring_submit "
+                       << (rc < 0 ? strerror(-rc) : "made no progress")
+                       << "; deferring " << request_list.size() - submitted
+                       << " SQE(s) to the poll path";
+            break;
+        }
+        submitted += rc;
+    }
 
     return Status::OK();
 }
@@ -238,6 +294,9 @@ Status IOUringTransport::getTransferStatus(SubBatchRef batch, int task_id,
     auto& task = io_uring_batch->task_list[task_id];
     status = TransferStatus{task.status_word, task.transferred_bytes};
     if (task.status_word == TransferStatusEnum::PENDING) {
+        // Flush SQEs left queued by a deferred submission failure: calling
+        // io_uring_submit() on an empty SQ ring is a no-op.
+        submitSqes(&io_uring_batch->ring);
         struct io_uring_cqe* cqe = nullptr;
         int err = io_uring_peek_cqe(&io_uring_batch->ring, &cqe);
         if (err == -EAGAIN) return Status::OK();
@@ -245,26 +304,36 @@ Status IOUringTransport::getTransferStatus(SubBatchRef batch, int task_id,
             return Status::InternalError(
                 std::string("io_uring_peek_cqe failed: ") + strerror(-err));
         }
-        auto task = (IOUringTask*)cqe->user_data;
-        if (task) {
+        auto cqe_task = (IOUringTask*)cqe->user_data;
+        if (cqe_task) {
             if (cqe->res < 0) {
                 LOG(INFO) << "Received an event with error code " << cqe->res;
-                task->status_word = TransferStatusEnum::FAILED;
+                cqe_task->status_word = TransferStatusEnum::FAILED;
+                cqe_task->transferred_bytes = 0;
             } else {
-                if (task->buffer) {
-                    if (task->request.opcode == Request::READ)
-                        Platform::getLoader().copy(task->request.source,
-                                                   task->buffer,
-                                                   task->request.length);
-
-                    free(task->buffer);
-                    task->buffer = nullptr;
+                const size_t completed_bytes = static_cast<size_t>(cqe->res);
+                // A nonnegative CQE may still be short, including EOF. Only
+                // copy the prefix actually read from the file.
+                if (cqe_task->buffer && completed_bytes != 0 &&
+                    cqe_task->request.opcode == Request::READ) {
+                    Platform::getLoader().copy(cqe_task->request.source,
+                                               cqe_task->buffer,
+                                               completed_bytes);
                 }
-                task->status_word = TransferStatusEnum::COMPLETED;
-                task->transferred_bytes = task->request.length;
+                cqe_task->transferred_bytes = completed_bytes;
+                cqe_task->status_word =
+                    completed_bytes == cqe_task->request.length
+                        ? TransferStatusEnum::COMPLETED
+                        : TransferStatusEnum::FAILED;
+            }
+            if (cqe_task->buffer) {
+                free(cqe_task->buffer);
+                cqe_task->buffer = nullptr;
             }
         }
         io_uring_cqe_seen(&io_uring_batch->ring, cqe);
+        batch->notifyProgress();
+        status = TransferStatus{task.status_word, task.transferred_bytes};
     }
     return Status::OK();
 }
