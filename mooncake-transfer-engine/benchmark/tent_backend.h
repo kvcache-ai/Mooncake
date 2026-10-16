@@ -30,6 +30,7 @@
 #include <signal.h>
 #include <sys/time.h>
 #include <memory>
+#include <atomic>
 
 #include "tent/transfer_engine.h"
 #include "tent/common/utils/random.h"
@@ -187,6 +188,14 @@ class TENTBenchRunner : public BenchRunner {
 
     void noteTransferFailed();
 
+    // Polls batch_id until it is terminal. A stop (failed worker, SIGINT,
+    // SIGTERM) does not end the wait early: the transports may still be
+    // writing into the local buffers. Returns with status PENDING only if the
+    // batch did not finish within the drain timeout after the stop; the batch
+    // is then counted in abandoned_batches_.
+    Status waitForBatch(BatchID batch_id, TransferStatus& status,
+                        uint64_t& polls);
+
     size_t targetIndex(int thread_id) const;
 
     int localTargetThreadId(int thread_id) const;
@@ -212,6 +221,9 @@ class TENTBenchRunner : public BenchRunner {
     std::condition_variable cv_task_;
     std::condition_variable cv_done_;
     int pending_ = 0;
+    // Batches that may still be in flight (see waitForBatch); while non-zero
+    // freeBuffers() leaves the local buffers allocated.
+    std::atomic<uint64_t> abandoned_batches_{0};
 };
 
 }  // namespace tent

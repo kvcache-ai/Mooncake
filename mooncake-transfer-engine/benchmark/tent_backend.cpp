@@ -289,6 +289,17 @@ int TENTBenchRunner::allocateBuffers() {
 }
 
 int TENTBenchRunner::freeBuffers() {
+    const uint64_t abandoned = abandoned_batches_.load();
+    if (abandoned != 0) {
+        // A transport may still copy into these buffers; releasing them
+        // would turn a stopped run into a use-after-free. The process is
+        // exiting, so leaving them allocated costs nothing.
+        LOG(WARNING) << abandoned
+                     << " transfer batch(es) were still in flight when the "
+                        "run stopped; leaving the local buffers allocated";
+        pinned_buffer_list_.clear();
+        return 0;
+    }
     auto total_buffer_size = XferBenchConfig::total_buffer_size;
     for (size_t i = 0; i < pinned_buffer_list_.size(); ++i) {
         CHECK_FAIL(engine_->unregisterLocalMemory(pinned_buffer_list_[i],
@@ -480,6 +491,37 @@ void TENTBenchRunner::noteTransferFailed() {
     cv_done_.notify_all();
 }
 
+// How long a stopped run keeps waiting for a batch already handed to the
+// transports before abandoning it. A second SIGINT still exits immediately.
+static constexpr uint64_t kStopDrainTimeoutNs = 5ull * 1000 * 1000 * 1000;
+
+Status TENTBenchRunner::waitForBatch(BatchID batch_id, TransferStatus& status,
+                                     uint64_t& polls) {
+    uint64_t stop_seen_ns = 0;
+    while (true) {
+        auto polled = engine_->getTransferStatus(batch_id, status);
+        ++polls;
+        if (!polled.ok()) {
+            // The batch state is unknown, so treat it as still in flight.
+            abandoned_batches_.fetch_add(1);
+            return polled;
+        }
+        if (status.s != TransferStatusEnum::PENDING &&
+            status.s != TransferStatusEnum::INITIAL) {
+            return Status::OK();
+        }
+        if (g_tent_running.load()) continue;
+        const uint64_t now_ns = getCurrentTimeInNano();
+        if (stop_seen_ns == 0) {
+            stop_seen_ns = now_ns;
+        } else if (now_ns - stop_seen_ns > kStopDrainTimeoutNs) {
+            abandoned_batches_.fetch_add(1);
+            status.s = TransferStatusEnum::PENDING;
+            return Status::OK();
+        }
+    }
+}
+
 double TENTBenchRunner::runSingleTransfer(
     uint64_t local_addr, uint64_t target_id, uint64_t target_addr,
     uint64_t block_size, uint64_t batch_size, OpCode opcode,
@@ -529,26 +571,22 @@ double TENTBenchRunner::runSingleTransfer(
             noteTransferFailed();
             return finish(-1.0);
         }
-        while (g_tent_running.load()) {
-            TransferStatus overall_status;
-            auto polled = engine_->getTransferStatus(batch_id, overall_status);
-            if (!polled.ok()) {
-                LOG(ERROR) << "Failed to poll transfer: " << polled.ToString();
-                noteTransferFailed();
-                return finish(-1.0);
-            }
-            if (overall_status.s == TransferStatusEnum::COMPLETED) {
-                return finish(timer.lap_us());
-            }
-            if (overall_status.s == TransferStatusEnum::FAILED ||
-                overall_status.s == TransferStatusEnum::TIMEOUT ||
-                overall_status.s == TransferStatusEnum::CANCELED ||
-                overall_status.s == TransferStatusEnum::INVALID) {
-                LOG(ERROR) << "Failed transfer detected";
-                noteTransferFailed();
-                return finish(-1.0);
-            }
+        TransferStatus overall_status;
+        uint64_t polls = 0;
+        auto polled = waitForBatch(batch_id, overall_status, polls);
+        if (!polled.ok()) {
+            LOG(ERROR) << "Failed to poll transfer: " << polled.ToString();
+            noteTransferFailed();
+            return finish(-1.0);
         }
+        if (overall_status.s == TransferStatusEnum::COMPLETED) {
+            return finish(timer.lap_us());
+        }
+        if (overall_status.s == TransferStatusEnum::PENDING) {
+            return finish(-1.0);  // stopped and abandoned
+        }
+        LOG(ERROR) << "Failed transfer detected";
+        noteTransferFailed();
         return finish(-1.0);
     }
 
@@ -568,29 +606,23 @@ double TENTBenchRunner::runSingleTransfer(
     const uint64_t submit_us = submit_timer.lap_us();
     XferBenchTimer wait_timer;
     uint64_t polls = 0;
-    while (g_tent_running.load()) {
-        TransferStatus overall_status;
-        auto polled = engine_->getTransferStatus(batch_id, overall_status);
-        polls++;
-        if (!polled.ok()) {
-            LOG(ERROR) << "Failed to poll transfer: " << polled.ToString();
-            noteTransferFailed();
-            return finish(-1.0);
-        }
-        if (overall_status.s == TransferStatusEnum::COMPLETED) {
-            const uint64_t wait_us = wait_timer.lap_us();
-            logSplitXfer({batch_size, submit_us, wait_us, polls});
-            return finish(static_cast<double>(submit_us + wait_us));
-        }
-        if (overall_status.s == TransferStatusEnum::FAILED ||
-            overall_status.s == TransferStatusEnum::TIMEOUT ||
-            overall_status.s == TransferStatusEnum::CANCELED ||
-            overall_status.s == TransferStatusEnum::INVALID) {
-            LOG(ERROR) << "Failed transfer detected";
-            noteTransferFailed();
-            return finish(-1.0);
-        }
+    TransferStatus overall_status;
+    auto polled = waitForBatch(batch_id, overall_status, polls);
+    if (!polled.ok()) {
+        LOG(ERROR) << "Failed to poll transfer: " << polled.ToString();
+        noteTransferFailed();
+        return finish(-1.0);
     }
+    if (overall_status.s == TransferStatusEnum::COMPLETED) {
+        const uint64_t wait_us = wait_timer.lap_us();
+        logSplitXfer({batch_size, submit_us, wait_us, polls});
+        return finish(static_cast<double>(submit_us + wait_us));
+    }
+    if (overall_status.s == TransferStatusEnum::PENDING) {
+        return finish(-1.0);  // stopped and abandoned
+    }
+    LOG(ERROR) << "Failed transfer detected";
+    noteTransferFailed();
     return finish(-1.0);
 }
 
