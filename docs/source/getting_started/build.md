@@ -80,42 +80,57 @@ sudo make install
 
 Store-RS is an optional Rust-native Mooncake Store. The default CMake build
 leaves it disabled, and the Python Store facade uses the C++ backend. Enable
-it when a root wheel should include the Rust backend and the standalone
-`mooncake-store-rs-client`, `mooncake-store-rs-admin`, and
-`mooncake-store-rs-bench` commands.
+it when building a root wheel that should include the Rust backend and its standalone commands.
 
 The build needs a root checkout with submodules, CMake, a C++ toolchain, Rust
 (`cargo` on `PATH`), and Python 3.10 or newer. A multi-client runtime also
 needs Redis or etcd.
 
 ```bash
-mkdir build
-cd build
-cmake .. \
+export MOONCAKE_ROOT_DIR="$PWD"
+export MOONCAKE_STORE_RS_DIR="$MOONCAKE_ROOT_DIR/mooncake-store-rs"
+export MOONCAKE_BUILD_DIR="$MOONCAKE_ROOT_DIR/build/store-rs"
+export MOONCAKE_PYTHON_BIN="$(command -v python3)"
+
+cmake -S "$MOONCAKE_ROOT_DIR" -B "$MOONCAKE_BUILD_DIR" \
+  -DPython3_EXECUTABLE="$MOONCAKE_PYTHON_BIN" \
   -DWITH_STORE=ON \
   -DWITH_STORE_RUST=OFF \
   -DWITH_STORE_RS=ON \
   -DWITH_TE=ON \
   -DUSE_TENT=ON \
-  -DBUILD_SHARED_LIBS=ON
-cmake --build . --target build_store_rs --parallel
+  -DBUILD_SHARED_LIBS=ON \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build "$MOONCAKE_BUILD_DIR" --target build_store_rs --parallel
 ```
 
-`WITH_STORE_RS=ON` requires `WITH_TE=ON` and `USE_TENT=ON`. This build produces
-the native artifacts and standalone binaries. For a Python wheel, skip that
-CMake build and let the wheel builder configure its own tree:
+This out-of-tree build provides the native artifacts and standalone binaries. For a Python wheel only, skip the separate CMake build command; the wheel builder configures and builds its own CMake tree.
+
+The root wheel owns the mooncake Python package. Build and install one wheel,
+then select its Store backend before importing mooncake.store:
+
+| Setting | Backend |
+|---------|---------|
+| Unset or cpp | C++ Store |
+| rs | Store-RS, included by WITH_STORE_RS=ON |
+
+The facade reads MOONCAKE_STORE_BACKEND when mooncake.store is first imported.
+Use exactly cpp or rs. The setting does not change the standalone command
+names.
 
 ```bash
-SKBUILD_CMAKE_ARGS="-DWITH_STORE=ON -DWITH_STORE_RUST=OFF \
-  -DWITH_STORE_RS=ON -DWITH_TE=ON -DUSE_TENT=ON \
-  -DBUILD_SHARED_LIBS=ON" \
-  python3 -m pip wheel . --no-deps --wheel-dir dist
+MOONCAKE_STORE_BACKEND=rs .venv-store-rs/bin/python -c \
+  "from mooncake.store import MooncakeDistributedStore; print(MooncakeDistributedStore)"
+
+.venv-store-rs/bin/mooncake-store-rs-client --help
+.venv-store-rs/bin/mooncake-store-rs-admin --help
+.venv-store-rs/bin/mooncake-store-rs-bench --help
 ```
 
-Install that wheel into one environment. Set `MOONCAKE_STORE_BACKEND` before
-the first import of `mooncake.store`: leave it unset or set it to `cpp` for
-the C++ Store, or set it to `rs` for Store-RS. The setting does not change the
-standalone command names.
+For workspace unit tests and installed-package smoke coverage, run
+`scripts/ci/run_store_rs_smoke.sh` after installing the CMake `python`
+component. The [Store-RS validation guide](../deployment/store-rs/testing.md#local-validation)
+lists the required CMake paths and the direct commands for heavier scenarios.
 
 Configuration, validation, and API details are in the
 [Store-RS deployment guides](../deployment/store-rs/index.md), the
