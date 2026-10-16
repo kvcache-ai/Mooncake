@@ -450,6 +450,10 @@ class ObjectRoute {
     const bool report_reads_;
     std::atomic<Generation> next_generation_{1};
     std::atomic<size_t> object_count_{0};
+    // How many cursors are open on the route, counted in debug builds only
+    // so that the destructor can catch one. It exists in every build, so the
+    // route's layout does not depend on NDEBUG.
+    mutable std::atomic<uint32_t> live_cursors_{0};
     mutable std::array<Stripe, kStripeCount> stripes_;
     // Group membership and the one shared Lease per group.
     GroupIndex groups_;
@@ -553,6 +557,11 @@ class ObjectRoute::Cursor {
         AssertInFlightUnchanged();
         UnlockSlot();
         UnlockStripe();
+        // Done with the route before the count says so.
+        deferred_.clear();
+#ifndef NDEBUG
+        route_.live_cursors_.fetch_sub(1, std::memory_order_relaxed);
+#endif
     }
 
     Iterator begin() { return Iterator(this); }
@@ -561,7 +570,12 @@ class ObjectRoute::Cursor {
    private:
     friend class ObjectRoute;
 
-    explicit Cursor(const ObjectRoute& route) : route_(route) { Settle(); }
+    explicit Cursor(const ObjectRoute& route) : route_(route) {
+#ifndef NDEBUG
+        route_.live_cursors_.fetch_add(1, std::memory_order_relaxed);
+#endif
+        Settle();
+    }
 
     void Advance() {
         AssertInFlightUnchanged();
@@ -657,17 +671,15 @@ class ObjectRoute::Cursor {
 inline ObjectRoute::~ObjectRoute() {
 #ifndef NDEBUG
     // A route goes only with its owner, once nothing reaches it any more, so a
-    // holder left here is a caller bug, which debug builds catch. A cursor
-    // standing on an object in its stripe pass holds that stripe and no
-    // handle, so a stripe still locked is a cursor still in use. A slot with
-    // no holder and no object is already gone, so the walk covers the objects
-    // plus the slots someone still holds. A holder lets go before its owner
-    // lets go of the route, so a relaxed load sees every release.
-    for (Stripe& stripe : stripes_) {
-        if (!stripe.lock.try_lock()) {
-            LOG(FATAL) << "ObjectRoute destroyed under a locked stripe";
-        }
-        stripe.lock.unlock();
+    // holder left here is a caller bug, which debug builds catch: an open
+    // cursor by the count, and a guard by its slot. A slot with no holder and
+    // no object is already gone, so the walk covers the objects plus the slots
+    // someone still holds. A holder lets go before its owner lets go of the
+    // route, so relaxed loads see every release.
+    if (live_cursors_.load(std::memory_order_relaxed) != 0) {
+        LOG(FATAL) << "ObjectRoute destroyed under an open cursor";
+    }
+    for (const Stripe& stripe : stripes_) {
         for (const auto& [key, slot] : stripe.slots) {
             if ((slot.state_.load(std::memory_order_relaxed) &
                  ~KeySlot::kOccupied) != 0) {

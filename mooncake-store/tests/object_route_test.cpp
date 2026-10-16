@@ -563,8 +563,10 @@ TEST(ObjectRouteTest, ReadCursorVisitsEveryObjectOnce) {
     }
     EXPECT_EQ(Sorted(keys), Sorted(expected));
 
+    // Named, since a temporary route would go before the loop body runs.
+    const ObjectRoute empty;
     size_t count = 0;
-    for (auto object : ObjectRoute().ReadCursor()) {
+    for (auto object : empty.ReadCursor()) {
         (void)object;
         ++count;
     }
@@ -774,7 +776,7 @@ TEST(ObjectRouteDeathTest, DestroyingARouteUnderACursorAborts) {
                 route.reset();
             }
         },
-        "under a locked stripe");
+        "under an open cursor");
 }
 
 TEST(ObjectRouteDeathTest, RouteAccessFromACursorAsserts) {
