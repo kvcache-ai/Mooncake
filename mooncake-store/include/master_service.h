@@ -406,6 +406,17 @@ class MasterService {
         -> tl::expected<GetReplicaListResponse, ErrorCode>;
 
     /**
+     * @brief Get the replica list of one part of an object
+     * @param part_index Part to read, in [0, part_count)
+     * @return ErrorCode::OK on success, ErrorCode::REPLICA_IS_NOT_READY if the
+     * part is not written or not readable, ErrorCode::INVALID_PARAMS if the
+     * object has no such part
+     */
+    auto GetReplicaListForPart(const std::string& key,
+                               const TenantId& tenant_id, uint32_t part_index)
+        -> tl::expected<GetReplicaListResponse, ErrorCode>;
+
+    /**
      * @brief Read-only single-key replica list query for admin use.
      * Unlike GetReplicaList, this does not grant leases, trigger
      * promotion, or update cache-hit metrics.
@@ -444,6 +455,18 @@ class MasterService {
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
 
     /**
+     * @brief Start a put operation for one part of an object
+     * @param request Which part this writer fills, out of how many, with the
+     * replication config to allocate it with
+     * @return ErrorCode::OK on success, ErrorCode::INVALID_PARAMS if the scope
+     * is not valid or this master cannot serve parts
+     */
+    auto PutStart(const UUID& client_id, const std::string& key,
+                  const TenantId& tenant_id, const uint64_t slice_length,
+                  const PartWriteRequest& request)
+        -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
+
+    /**
      * @brief Complete a put operation, replica_type indicates the type of
      * replica to complete (memory or disk)
      * @return ErrorCode::OK on success, ErrorCode::OBJECT_NOT_FOUND if not
@@ -454,6 +477,23 @@ class MasterService {
         -> tl::expected<void, ErrorCode>;
 
     auto PutEnd(const UUID& client_id, const std::string& key,
+                const TenantId& tenant_id, ReplicaType replica_type)
+        -> tl::expected<void, ErrorCode>;
+
+    /**
+     * @brief Complete one part's put operation
+     * @param request The part this request completes, the replicas that
+     * attempt allocated, and the checksum it wrote. The replicas it names must
+     * cover every replica the part still holds, and adding replicas the attempt
+     * already gave up is allowed
+     * @param replica_type The replicas of the attempt to complete: a part can
+     * hold a memory and a disk replica, and finishing one leaves the other in
+     * flight
+     * @return ErrorCode::OK on success, ErrorCode::INVALID_PARAMS if the part
+     * has no such write, ErrorCode::INVALID_WRITE if the request names another
+     * attempt's replicas
+     */
+    auto PutEnd(const UUID& client_id, const PartEndRequest& request,
                 const TenantId& tenant_id, ReplicaType replica_type)
         -> tl::expected<void, ErrorCode>;
 
@@ -472,6 +512,23 @@ class MasterService {
      */
     auto PutRevoke(const UUID& client_id, const std::string& key,
                    const TenantId& tenant_id, ReplicaType replica_type)
+        -> tl::expected<void, ErrorCode>;
+
+    /**
+     * @brief Revoke one part's write attempt
+     * @param replica_ids The replicas the attempt allocated. Every object must
+     * name the replicas the part still holds, and an empty list is refused
+     * @param replica_type The replicas to give up. The others stay in flight,
+     * and the attempt ends only when none of them is still PROCESSING
+     * @return ErrorCode::OK on success, ErrorCode::OBJECT_NOT_FOUND if not
+     * found, ErrorCode::INVALID_WRITE if the part has no write in progress, the
+     * request names another attempt, or it names no replica of the type it asks
+     * for
+     */
+    auto PutRevokeForPart(const UUID& client_id, const std::string& key,
+                          const TenantId& tenant_id, uint32_t part_index,
+                          const std::vector<ReplicaID>& replica_ids,
+                          ReplicaType replica_type)
         -> tl::expected<void, ErrorCode>;
 
     /**
@@ -1193,17 +1250,19 @@ class MasterService {
 
     mutable SoftPinDeadlineIndex soft_pin_deadline_index_;
 
-    static bool HasCompletedMemoryCacheReplica(const ObjectMetadata& metadata);
-    static bool HasCompletedDiskCacheReplica(const ObjectMetadata& metadata);
     static void SyncCacheTotalAccounting(ObjectMetadata& metadata);
     void RebuildCacheTotalAccounting();
     static void AccountCacheTotalRemoval(ObjectMetadata& metadata);
-    std::vector<Replica> PopReplicasWithCacheTotalAccounting(
+    // The part form asks the part it names, the All form asks every part.
+    std::vector<Replica> PopPartReplicasWithCacheTotalAccounting(
+        ObjectMetadata& metadata, size_t part_index,
+        const std::function<bool(const Replica&)>& pred_fn);
+    std::vector<Replica> PopAllReplicasWithCacheTotalAccounting(
         ObjectMetadata& metadata,
         const std::function<bool(const Replica&)>& pred_fn);
-    std::vector<Replica> PopReplicasWithCacheTotalAccounting(
+    std::vector<Replica> PopAllReplicasWithCacheTotalAccounting(
         ObjectMetadata& metadata);
-    size_t EraseReplicasWithCacheTotalAccounting(
+    size_t EraseAllReplicasWithCacheTotalAccounting(
         ObjectMetadata& metadata,
         const std::function<bool(const Replica&)>& pred_fn,
         std::vector<ReplicaID>* erased_replica_ids = nullptr);
@@ -1528,7 +1587,8 @@ class MasterService {
                         const std::chrono::system_clock::time_point& now,
                         const ResolvedSoftPinRequest& soft_pin_request,
                         std::vector<Replica>&& replicas,
-                        uint64_t pending_quota_charge,
+                        uint64_t pending_quota_charge, uint32_t part_index = 0,
+                        uint32_t part_count = 1,
                         std::optional<std::chrono::system_clock::time_point>
                             committed_soft_pin_timeout = std::nullopt)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
@@ -1541,10 +1601,33 @@ class MasterService {
         const ReplicateConfig& config, const std::string& writer_host_id,
         const std::string& group_id, const TenantId& tenant_id,
         const std::chrono::system_clock::time_point& now,
-        const ResolvedSoftPinRequest& soft_pin_request,
+        const ResolvedSoftPinRequest& soft_pin_request, uint32_t part_index = 0,
+        uint32_t part_count = 1,
         std::optional<std::chrono::system_clock::time_point>
             committed_soft_pin_timeout = std::nullopt,
         bool* dfs_allocation_failed = nullptr)
+        -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
+
+    // The bodies of the write entries above: an ordinary write names part 0 of
+    // a one-part object, a part-scoped one names the part it fills.
+    auto PutStartImpl(const UUID& client_id, const std::string& key,
+                      const TenantId& tenant_id, const uint64_t slice_length,
+                      uint32_t part_index, uint32_t part_count,
+                      const ReplicateConfig& config)
+        -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
+    auto PutEndImpl(const UUID& client_id, const std::string& key,
+                    const TenantId& tenant_id, uint32_t part_index,
+                    std::optional<std::vector<ReplicaID>> replica_ids,
+                    std::optional<uint64_t> object_checksum,
+                    ReplicaType replica_type) -> tl::expected<void, ErrorCode>;
+
+    // Allocates one part's replicas on an object that already exists.
+    auto AllocateAndInsertPart(ObjectRecord& record, const UUID& client_id,
+                               const std::string& key, uint32_t part_index,
+                               uint64_t value_length,
+                               const ReplicateConfig& config,
+                               const std::string& writer_host_id,
+                               const std::chrono::system_clock::time_point& now)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
 
     /**
@@ -1553,6 +1636,14 @@ class MasterService {
     void DiscardExpiredProcessingReplicas(
         MetadataShardAccessorRW& shard,
         const std::chrono::system_clock::time_point& now);
+    // Reclaims parts whose write attempt passed put_start_release_timeout, and
+    // objects that never became readable or whose repair window closed.
+    void SweepMultiPartObjects(
+        MetadataShardAccessorRW& shard,
+        const std::chrono::system_clock::time_point& now);
+    bool CanReclaimIncompleteObject(
+        const ObjectMetadata& metadata,
+        const std::chrono::system_clock::time_point& now) const;
     void FreeDfsReplicas(const std::string& key,
                          std::span<const Replica> replicas);
     void RunDfsEviction();
@@ -1719,9 +1810,9 @@ class MasterService {
                 tenant_state_ != nullptr &&
                 it_ != tenant_state_->metadata.end()) {
                 // Gate the snapshot on the publisher being live: this runs on
-                // every read-write metadata access, and the VisitReplicas walk
-                // plus vector allocation is pure overhead when KV events are
-                // off (the default).
+                // every read-write metadata access, and the walk over every
+                // part's replicas plus vector allocation is pure overhead when
+                // KV events are off (the default).
                 ObjectMetadata& metadata = it_->second.metadata;
                 const auto previous_kv_media =
                     service_->KvMediaSnapshot(metadata);
@@ -1731,7 +1822,7 @@ class MasterService {
                 const uint64_t before_charge =
                     service_->CompletedMemoryQuotaCharge(metadata);
                 std::vector<ReplicaID> removed_replica_ids;
-                service_->EraseReplicasWithCacheTotalAccounting(
+                service_->EraseAllReplicasWithCacheTotalAccounting(
                     metadata,
                     [](const Replica& replica) {
                         return replica.has_invalid_mem_handle();
@@ -2065,6 +2156,8 @@ class MasterService {
     const bool enable_disk_eviction_;
     const uint64_t quota_bytes_;
     const bool enable_multi_tenants_;
+    // Serve objects whose content is written by several writers, one part each.
+    const bool enable_multi_part_objects_;
     TenantQuotaManager tenant_quota_manager_{
         [this] { return GetTenantQuotaAllocatableCapacityBytes(); }};
 
@@ -2282,8 +2375,8 @@ class MasterService {
                                           uint64_t expected_epoch);
 
     // Gated snapshots for the call sites that capture a pre-mutation medium
-    // set. They run on hot metadata paths, so skip the VisitReplicas walk
-    // entirely when no publisher is listening.
+    // set. They run on hot metadata paths, so skip the walk over every part's
+    // replicas entirely when no publisher is listening.
     std::vector<std::string> KvMediaSnapshot(const ObjectMetadata& metadata) {
         return KvEventsEnabled() ? KvMediaForMetadata(metadata)
                                  : std::vector<std::string>{};
@@ -2374,11 +2467,25 @@ class MasterService {
     bool IsAwaitingRemount(const Replica& replica) const;
     bool TryGetReadableReplicaDescriptor(const Replica& replica,
                                          Replica::Descriptor& descriptor) const;
+    // Whether a replica can be read is the service's rule, so the calls below
+    // hand it to the part and to the metadata rather than owning it.
     std::vector<Replica::Descriptor> GetReadableReplicaDescriptors(
-        const ObjectMetadata& metadata) const;
+        const ObjectPart& part) const;
     bool IsReplicaReadable(const Replica& replica) const;
-    bool HasReadableReplica(const ObjectMetadata& metadata) const;
+    // Every part the object has written holds a replica a reader can use.
+    bool IsReadable(const ObjectMetadata& metadata) const;
+    // Part 0 of a one-part object; nullptr when a read that names no part has
+    // no single slice to answer with.
+    const ObjectPart* LegacyReadPart(const ObjectMetadata& metadata) const;
+    // Shared body of the read paths; an unset `part_index` is a legacy read.
+    auto GetReplicaListImpl(const std::string& key, const TenantId& tenant_id,
+                            std::optional<uint32_t> part_index)
+        -> tl::expected<GetReplicaListResponse, ErrorCode>;
     bool IsEvictableMemoryReplica(const Replica& replica) const;
+    // Whether an eviction pass could free this object's memory replicas: every
+    // part has arrived and one memory replica is readable and unreferenced. The
+    // lease and pin checks stay with the caller.
+    bool HasEvictableReplicas(const ObjectMetadata& metadata) const;
 
     /**
      * Segment lifecycle persist helper. Tries to durably persist the

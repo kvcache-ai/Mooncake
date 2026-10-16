@@ -850,8 +850,11 @@ class MasterServiceHATest : public ::testing::Test {
             return {};
         }
         std::vector<Replica::Descriptor> descriptors;
-        for (const auto& replica : accessor.Get().GetAllReplicas()) {
-            descriptors.push_back(replica.get_descriptor());
+        const ObjectPart* part = accessor.Get().GetPart(0);
+        if (part != nullptr) {
+            for (const auto& replica : part->replicas()) {
+                descriptors.push_back(replica.get_descriptor());
+            }
         }
         return descriptors;
     }
@@ -876,9 +879,12 @@ class MasterServiceHATest : public ::testing::Test {
         if (!accessor.Exists()) {
             return true;
         }
-        for (const auto& replica : accessor.Get().GetAllReplicas()) {
-            if (replica.has_invalid_mem_handle()) {
-                return true;
+        const ObjectPart* part = accessor.Get().GetPart(0);
+        if (part != nullptr) {
+            for (const auto& replica : part->replicas()) {
+                if (replica.has_invalid_mem_handle()) {
+                    return true;
+                }
             }
         }
         return false;
@@ -1107,11 +1113,16 @@ class MasterServiceHATest : public ::testing::Test {
             return {};
         }
         std::vector<ReplicaID> ids;
-        accessor.Get().VisitReplicas(&Replica::fn_is_completed,
-                                     [&ids](Replica& replica) {
-                                         ids.push_back(replica.id());
-                                         replica.mark_removed();
-                                     });
+        ObjectPart* part = accessor.Get().MutablePart(0);
+        if (part != nullptr) {
+            for (auto& replica : part->replicas()) {
+                if (!Replica::fn_is_completed(replica)) {
+                    continue;
+                }
+                ids.push_back(replica.id());
+                replica.mark_removed();
+            }
+        }
         return ids;
     }
 

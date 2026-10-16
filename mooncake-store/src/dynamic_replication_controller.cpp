@@ -307,11 +307,12 @@ DynamicReplicationController::SelectPlan(
         segments_by_name.emplace(segment.name, segment);
     }
 
-    metadata.VisitReplicas(
-        [&is_readable](const Replica& replica) {
-            return is_readable(replica) && replica.is_memory_replica();
-        },
-        [&](const Replica& replica) {
+    const ObjectPart* part = metadata.GetPart(0);
+    if (part != nullptr) {
+        for (const auto& replica : part->replicas()) {
+            if (!(is_readable(replica) && replica.is_memory_replica())) {
+                continue;
+            }
             memory_replicas++;
             const auto liveness = replica.getClientLiveness();
             for (const auto& segment_name : replica.get_segment_names()) {
@@ -327,7 +328,8 @@ DynamicReplicationController::SelectPlan(
                     existing_hosts.insert(segment_it->second.host_id);
                 }
             }
-        });
+        }
+    }
 
     if (source_segments.empty() || memory_replicas == 0 ||
         memory_replicas >= max_memory_replicas_) {
@@ -674,9 +676,20 @@ size_t DynamicReplicationController::RecordReplicaRemoval(
 
 uint64_t DynamicReplicationController::VersionEpoch(
     const ObjectMetadata& metadata) {
+    // The epoch is the start time of the object's one write. An object written
+    // in several parts has no single writer, and the controller leaves those
+    // to the memory replicas they have.
+    if (metadata.PartCount() != 1) {
+        return 0;
+    }
+    const ObjectMetadata::PartWriteRecord* write =
+        metadata.GetPartWriteRecord(0);
+    if (write == nullptr) {
+        return 0;
+    }
     return static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(
-            metadata.put_start_time.time_since_epoch())
+            write->put_start_time.time_since_epoch())
             .count());
 }
 
