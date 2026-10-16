@@ -203,6 +203,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
       root_fs_dir_(config.root_fs_dir),
       enable_disk_eviction_(config.enable_disk_eviction),
       quota_bytes_(config.quota_bytes),
+      te_metadata_server_(config.te_metadata_server),
       enable_multi_tenants_(config.enable_multi_tenants),
       segment_manager_(config.memory_allocator, config.enable_cxl),
       nof_segment_manager_(config.memory_allocator),
@@ -8860,15 +8861,20 @@ tl::expected<std::string, ErrorCode> MasterService::GetFsdir() const {
 
 tl::expected<GetStorageConfigResponse, ErrorCode>
 MasterService::GetStorageConfig() const {
+    GetStorageConfigResponse response;
     if (root_fs_dir_.empty() || cluster_id_.empty()) {
         LOG(INFO)
             << "Storage root directory or cluster ID is not set. persisting "
                "data is disabled.";
-        return GetStorageConfigResponse("", enable_disk_eviction_,
-                                        quota_bytes_);
+        response =
+            GetStorageConfigResponse("", enable_disk_eviction_, quota_bytes_);
+    } else {
+        response =
+            GetStorageConfigResponse(root_fs_dir_ + "/" + cluster_id_,
+                                     enable_disk_eviction_, quota_bytes_);
     }
-    std::string fsdir = root_fs_dir_ + "/" + cluster_id_;
-    return GetStorageConfigResponse(fsdir, enable_disk_eviction_, quota_bytes_);
+    response.te_metadata_server = te_metadata_server_;
+    return response;
 }
 
 auto MasterService::MountLocalDiskSegment(const UUID& client_id,

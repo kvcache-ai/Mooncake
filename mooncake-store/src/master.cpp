@@ -52,6 +52,14 @@ constexpr char kDefaultKvLeaseTtlFlagValue[] = "10000";
 constexpr char kDefaultKvSoftPinTtlFlagValue[] = "1800000";
 constexpr char kDefaultMaxKvSoftPinTtlFlagValue[] = "86400000";
 
+DEFINE_string(
+    te_metadata_server, "",
+    "TE metadata backend clients should use, advertised via "
+    "GetStorageConfig: \"P2PHANDSHAKE\" or a shared-backend URL (e.g. "
+    "http://mooncake-master.mooncake:8080/metadata). In K8s the value is "
+    "a Service name. Default unset: clients keep their own configuration "
+    "and no class check is enforced (issue #4536)");
+
 namespace {
 
 bool ValidateDurationFlag(const char* flagname, const std::string& value) {
@@ -77,10 +85,18 @@ uint64_t ParseDurationFlagOrDie(const char* flag_name,
 }
 
 // Derive the metadata server address for cleanup when it is deployed
-// separately. Priority: MOONCAKE_TE_META_DATA_SERVER, then the
-// "metadata_server" field of MOONCAKE_CONFIG_PATH. Returns "" if none found;
-// the caller validates the scheme (only http(s) is supported).
+// separately. Priority: --te_metadata_server flag, then
+// MOONCAKE_TE_META_DATA_SERVER, then the "metadata_server" field of
+// MOONCAKE_CONFIG_PATH. Returns "" if none found; the caller validates the
+// scheme (only http(s) is supported).
 std::string ResolveMetadataServerForCleanup() {
+    // The flag is the master-owned source of truth (issue #4536). When set
+    // to P2PHANDSHAKE there is no central metadata server to clean up.
+    if (!FLAGS_te_metadata_server.empty() &&
+        FLAGS_te_metadata_server != "P2PHANDSHAKE") {
+        return FLAGS_te_metadata_server;
+    }
+
     if (const char* env = std::getenv("MOONCAKE_TE_META_DATA_SERVER")) {
         std::string value(env);
         // P2PHANDSHAKE has no central metadata server, nothing to clean up.
@@ -566,6 +582,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
 
     default_config.GetBool("enable_ha", &master_config.enable_ha,
                            FLAGS_enable_ha);
+    default_config.GetString("te_metadata_server",
+                             &master_config.te_metadata_server,
+                             FLAGS_te_metadata_server);
     default_config.GetBool("enable_offload", &master_config.enable_offload,
                            FLAGS_enable_offload);
     default_config.GetBool("offload_on_evict", &master_config.offload_on_evict,
@@ -1488,6 +1507,15 @@ int main(int argc, char* argv[]) {
         LOG(FATAL) << "Invalid memory allocator: "
                    << master_config.memory_allocator
                    << ", must be 'cachelib' or 'offset'";
+        return 1;
+    }
+    if (!master_config.te_metadata_server.empty() &&
+        master_config.te_metadata_server != "P2PHANDSHAKE" &&
+        master_config.te_metadata_server.rfind("http://", 0) != 0 &&
+        master_config.te_metadata_server.rfind("https://", 0) != 0) {
+        LOG(FATAL) << "Invalid te_metadata_server: '"
+                   << master_config.te_metadata_server
+                   << "', must be 'P2PHANDSHAKE' or an http(s) URL";
         return 1;
     }
 
