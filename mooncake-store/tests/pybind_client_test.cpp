@@ -3304,6 +3304,94 @@ TEST_F(RealClientTest, BatchGetApisHealDanglingLocalDiskReplica) {
     EXPECT_TRUE(py_client_->get_replica_desc(key).empty());
 }
 
+TEST_F(RealClientTest, BatchGetIntoRejectsChangedRetrySizeForDuplicates) {
+    ScopedEnvVar local_memcpy("MC_STORE_MEMCPY", "1");
+    ScopedEnvVar heartbeat("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "1");
+    ScopedEnvVar storage_backend("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+                                 "bucket_storage_backend");
+    ScopedEnvVar bucket_keys("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "1");
+    char path[] = "/tmp/mooncake_ssd_retry_size_XXXXXX";
+    ASSERT_NE(mkdtemp(path), nullptr);
+    ssd_path_ = path;
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
+                                  .set_enable_offload(true)
+                                  .set_default_kv_lease_ttl(10)
+                                  .build()));
+    master_address_ = master_.master_address();
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17816", "P2PHANDSHAKE",
+                               16 * 1024 * 1024, 16 * 1024 * 1024, "tcp", "",
+                               master_address_, nullptr, "", true, ssd_path_),
+        0);
+
+    constexpr size_t original_size = 4096;
+    for (const size_t replacement_size :
+         {original_size / 2, original_size, original_size * 2}) {
+        SCOPED_TRACE(replacement_size);
+        const auto key = "retry-size-" + std::to_string(replacement_size);
+        ASSERT_EQ(py_client_->put(key, std::vector<char>(original_size, 'a')),
+                  0);
+        std::optional<Replica::Descriptor> disk_replica;
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (!disk_replica && std::chrono::steady_clock::now() < deadline) {
+            for (const auto& replica : py_client_->get_replica_desc(key)) {
+                if (replica.is_local_disk_replica()) {
+                    disk_replica = replica;
+                    break;
+                }
+            }
+            if (!disk_replica) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            }
+        }
+        ASSERT_TRUE(disk_replica.has_value());
+        const QueryResult stale_query(
+            {*disk_replica},
+            std::chrono::steady_clock::now() + std::chrono::minutes(1));
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        ASSERT_EQ(py_client_->remove(key), 0);
+        const std::vector<char> replacement(replacement_size, 'b');
+        ASSERT_EQ(py_client_->put(key, replacement), 0);
+
+        std::vector<char> primary(original_size * 2, 'p');
+        std::vector<char> duplicate(original_size * 2, 'd');
+        size_t disk_reads = 0;
+        auto reader = [&disk_reads](const std::string&,
+                                    RealClient::LocalDiskOffloadObjects&)
+            -> tl::expected<void, ErrorCode> {
+            ++disk_reads;
+            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+        };
+        const auto results = py_client_->batch_get_into_internal(
+            {key, key}, {primary.data(), duplicate.data()},
+            {primary.size(), duplicate.size()}, {stale_query, stale_query},
+            reader);
+        ASSERT_EQ(results.size(), 2);
+        EXPECT_EQ(disk_reads, 1);
+        EXPECT_TRUE(std::equal(replacement.begin(), replacement.end(),
+                               primary.begin()));
+        if (replacement_size == original_size) {
+            ASSERT_TRUE(results[0].has_value());
+            ASSERT_TRUE(results[1].has_value());
+            EXPECT_EQ(*results[0], original_size);
+            EXPECT_EQ(*results[1], original_size);
+            EXPECT_TRUE(std::equal(replacement.begin(), replacement.end(),
+                                   duplicate.begin()));
+        } else {
+            EXPECT_FALSE(results[0].has_value());
+            EXPECT_FALSE(results[1].has_value());
+            if (!results[0]) {
+                EXPECT_EQ(results[0].error(), ErrorCode::FILE_READ_FAIL);
+            }
+            if (!results[1]) {
+                EXPECT_EQ(results[1].error(), ErrorCode::FILE_READ_FAIL);
+            }
+            EXPECT_EQ(duplicate, std::vector<char>(duplicate.size(), 'd'));
+        }
+    }
+}
+
 TEST_F(RealClientTest, BatchGetIntoFallsBackToDiskAfterLocalDiskHeal) {
     ScopedEnvVar local_memcpy("MC_STORE_MEMCPY", "1");
     ScopedEnvVar heartbeat("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "1");

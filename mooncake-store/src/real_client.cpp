@@ -6454,7 +6454,9 @@ RealClient::batch_get_into_internal(
                     {op.key}, {buffers[op.original_index]},
                     {sizes[op.original_index]}, retry_query, local_disk_reader,
                     /*heal_dangling_disk_replica=*/false);
-                if (retry.size() == 1 && retry.front()) {
+                if (retry.size() == 1 && retry.front() &&
+                    retry.front().value() ==
+                        static_cast<int64_t>(op.total_size)) {
                     result = retry.front();
                 }
             }
