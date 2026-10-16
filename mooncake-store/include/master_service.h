@@ -941,6 +941,9 @@ class MasterService {
      */
     tl::expected<QueryTaskResponse, ErrorCode> QueryTask(const UUID& task_id);
 
+    tl::expected<ListTasksResponse, ErrorCode> ListTasks(
+        const TaskListRequest& request);
+
     /**
      * @brief fetch tasks assigned to a client
      * @return list of tasks

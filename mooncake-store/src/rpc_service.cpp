@@ -1498,6 +1498,15 @@ tl::expected<QueryTaskResponse, ErrorCode> WrappedMasterService::QueryTask(
         [] { MasterMetricManager::instance().inc_query_task_failures(); });
 }
 
+tl::expected<ListTasksResponse, ErrorCode> WrappedMasterService::ListTasks(
+    const TaskListRequest& request) {
+    auto scoped_request = request;
+    if (!master_service_.IsTenantQuotaEnabled()) {
+        scoped_request.tenant_id = TenantId::kDefaultValue;
+    }
+    return master_service_.ListTasks(scoped_request);
+}
+
 tl::expected<std::vector<TaskAssignment>, ErrorCode>
 WrappedMasterService::FetchTasks(const UUID& client_id, size_t batch_size) {
     return execute_rpc(
@@ -1936,7 +1945,7 @@ void RegisterRpcService(coro_rpc::coro_rpc_server& server,
         &WrappedMasterService::PollRemoveAll,
         &WrappedMasterService::CreateCopyTask,
         &WrappedMasterService::CreateMoveTask, &WrappedMasterService::QueryTask,
-        &WrappedMasterService::FetchTasks,
+        &WrappedMasterService::ListTasks, &WrappedMasterService::FetchTasks,
         &WrappedMasterService::MarkTaskToComplete>(
         server, wrapped_master_service, worker_pool);
 }
