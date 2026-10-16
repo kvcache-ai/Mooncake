@@ -479,7 +479,7 @@ int TEBenchRunner::stopInitiator() {
         cv_done_.notify_all();
     }
     for (auto& thread : threads_) {
-        thread.join();
+        if (thread.joinable()) thread.join();
     }
     return 0;
 }
