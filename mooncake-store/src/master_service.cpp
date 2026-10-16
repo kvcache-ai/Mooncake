@@ -92,6 +92,12 @@ uint64_t SaturatingMultiply(uint64_t lhs, uint64_t rhs) {
     return lhs * rhs;
 }
 
+bool IsForegroundWrite(ReplicaType type) {
+    return type == ReplicaType::MEMORY || type == ReplicaType::NOF_SSD ||
+           type == ReplicaType::DFS || type == ReplicaType::SHARED_NVME_KV ||
+           type == ReplicaType::ALL;
+}
+
 // Decides whether PutStart may proceed with the replicas that were
 // actually allocated. Three deliberately different policies apply:
 //
@@ -113,12 +119,14 @@ uint64_t SaturatingMultiply(uint64_t lhs, uint64_t rhs) {
 bool HasExpectedReplicaAllocation(const ReplicateConfig& config,
                                   size_t allocated_memory_replicas,
                                   size_t allocated_nof_replicas) {
-    if (config.nof_replica_num == 0 && config.dfs_replica_num == 0) {
+    if (config.nof_replica_num == 0 && config.dfs_replica_num == 0 &&
+        config.shared_nvme_kv_replica_num == 0) {
         return allocated_memory_replicas > 0;
     }
     if (DetermineReplicaWriteMode(config) ==
         ReplicaWriteMode::FLEXIBLE_DUAL_REPLICA) {
-        return allocated_memory_replicas + allocated_nof_replicas > 0;
+        return allocated_memory_replicas + allocated_nof_replicas > 0 ||
+               config.shared_nvme_kv_replica_num > 0;
     }
     return allocated_memory_replicas == config.replica_num &&
            allocated_nof_replicas == config.nof_replica_num;
@@ -2367,6 +2375,13 @@ auto MasterService::BatchUpdateSoftPin(const std::vector<std::string>& keys,
             continue;
         }
         auto& metadata = accessor.Get();
+        if (metadata.shared_kv_allocation_id != 0 ||
+            metadata.HasReplica([](const Replica& replica) {
+                return replica.is_shared_kv_replica();
+            })) {
+            results.emplace_back(tl::make_unexpected(ErrorCode::NOT_SUPPORTED));
+            continue;
+        }
         if (accessor.InProcessing() || metadata.pending_soft_pin_action ||
             !metadata.HasReplica(&Replica::fn_is_completed)) {
             results.emplace_back(
@@ -5095,6 +5110,20 @@ auto MasterService::AllocateReplicas(const std::string& key,
         }
     }
 
+    // Publish only after the client confirms the complete physical Store.
+    if (config.shared_nvme_kv_replica_num > 0) {
+        auto allocation_id = shared_kv_id_allocator_.Allocate();
+        if (!allocation_id) {
+            FreeDfsReplicas(key, replicas);
+            LOG(ERROR) << "Shared KV ID allocation failed: "
+                       << toString(allocation_id.error());
+            return tl::make_unexpected(allocation_id.error());
+        }
+
+        replicas.emplace_back(SharedKvDescriptor{value_length, *allocation_id},
+                              ReplicaStatus::PROCESSING);
+    }
+
     return replicas;
 }
 
@@ -5113,6 +5142,7 @@ auto MasterService::InsertMetadata(
     const TenantId& tenant_id = accessor.GetTenantId();
     const auto deadline_to_index = committed_soft_pin_timeout;
 
+    uint64_t shared_allocation_id = 0;
     std::vector<Replica::Descriptor> replica_list;
     std::unordered_set<ReplicaID> eligible_replica_ids;
     replica_list.reserve(replicas.size());
@@ -5124,6 +5154,10 @@ auto MasterService::InsertMetadata(
         const auto desc = replica.get_descriptor();
         replica_list.emplace_back(desc);
         eligible_replica_ids.insert(replica.id());
+        if (replica.is_shared_kv_replica()) {
+            shared_allocation_id =
+                desc.get_shared_kv_descriptor().allocation_id;
+        }
 
         if (replica.is_memory_replica()) {
             const auto& mem_desc = desc.get_memory_descriptor();
@@ -5150,6 +5184,7 @@ auto MasterService::InsertMetadata(
                      config.with_hard_pin, config.data_type, group_id,
                      tenant_id, key, residency_affinity_id);
     auto& metadata = accessor.Get();
+    metadata.shared_kv_allocation_id = shared_allocation_id;
     metadata.BeginSessionTag(config.SessionId(), eligible_replica_ids);
     metadata.BeginSoftPinAction(soft_pin_request,
                                 std::move(eligible_replica_ids));
@@ -5198,7 +5233,8 @@ auto MasterService::PrepareWriteStart(
     uint64_t slice_length, const ReplicateConfig& config,
     std::string_view action) -> tl::expected<WriteStartPlan, ErrorCode> {
     if ((config.replica_num == 0 && config.nof_replica_num == 0 &&
-         config.dfs_replica_num == 0) ||
+         config.dfs_replica_num == 0 &&
+         config.shared_nvme_kv_replica_num == 0) ||
         key.empty() || slice_length == 0) {
         LOG(ERROR) << "key=" << key << ", replica_num=" << config.replica_num
                    << ", nof_replica_num=" << config.nof_replica_num
@@ -5207,6 +5243,21 @@ auto MasterService::PrepareWriteStart(
                    << ", key_size=" << key.size() << ", error=invalid_params";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
+    if (config.shared_nvme_kv_replica_num > 0 &&
+        (config.shared_nvme_kv_replica_num > kMaxSharedKvReplicaCount ||
+         !tenant_id.IsDefault())) {
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+
+    // TODO: Support pin guarantees for mixed replicas with shared KV.
+    // Retention and required-success policies need Master-driven reclamation.
+    if (config.shared_nvme_kv_replica_num > 0 &&
+        (config.with_hard_pin ||
+         config.soft_pin_action == SoftPinAction::ENABLE ||
+         config.soft_pin_ttl_ms.has_value())) {
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+
     if (config.dfs_replica_num > 1) {
         LOG(ERROR) << "key=" << key
                    << ", dfs_replica_num=" << config.dfs_replica_num
@@ -5452,13 +5503,20 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
         return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
     }
 
+    // Fence delayed completions before changing any replica or checksum.
+    if (IsForegroundWrite(replica_type) &&
+        metadata.shared_kv_allocation_id !=
+            object_meta.shared_kv_allocation_id) {
+        return tl::make_unexpected(ErrorCode::INVALID_WRITE);
+    }
+
     auto is_target_replica = [replica_type](const Replica& replica) {
         if (replica_type == ReplicaType::ALL) {
             return (replica.is_memory_replica() &&
                     !replica.has_invalid_mem_handle()) ||
                    (replica.is_nof_replica() &&
                     !replica.has_invalid_nof_handle()) ||
-                   replica.is_dfs_replica();
+                   replica.is_dfs_replica() || replica.is_shared_kv_replica();
         }
         if (replica_type == ReplicaType::MEMORY) {
             return replica.is_memory_replica() &&
@@ -5744,7 +5802,8 @@ auto MasterService::AddReplicaForRetainedClient(const UUID& client_id,
 
 auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
                               const TenantId& tenant_id,
-                              ReplicaType replica_type)
+                              ReplicaType replica_type,
+                              uint64_t expected_shared_allocation_id)
     -> tl::expected<void, ErrorCode> {
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
@@ -5761,6 +5820,13 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
         return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
     }
 
+    // Reject stale revocations whose allocation ID does not match
+    // the current write.
+    if (IsForegroundWrite(replica_type) &&
+        metadata.shared_kv_allocation_id != expected_shared_allocation_id) {
+        return tl::make_unexpected(ErrorCode::INVALID_WRITE);
+    }
+
     if (!accessor.InProcessing()) {
         LOG(ERROR) << "key=" << key << ", error=no_primary_write_in_progress";
         return tl::make_unexpected(ErrorCode::INVALID_WRITE);
@@ -5770,7 +5836,8 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
         metadata.GetFirstReplica([replica_type](const Replica& replica) {
             if (replica_type == ReplicaType::ALL) {
                 return (replica.is_memory_replica() ||
-                        replica.is_nof_replica() || replica.is_dfs_replica()) &&
+                        replica.is_nof_replica() || replica.is_dfs_replica() ||
+                        replica.is_shared_kv_replica()) &&
                        !replica.is_processing();
             }
             return replica.type() == replica_type && !replica.is_processing();
@@ -5787,7 +5854,7 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
         }
         if (replica_type == ReplicaType::ALL) {
             return r.is_memory_replica() || r.is_nof_replica() ||
-                   r.is_dfs_replica();
+                   r.is_dfs_replica() || r.is_shared_kv_replica();
         }
         return r.type() == replica_type;
     };
@@ -5905,6 +5972,10 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                                 const uint64_t slice_length,
                                 const ReplicateConfig& config)
     -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
+    if (config.shared_nvme_kv_replica_num > 0) {
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
     auto placement = AllocationStrategy::ResolvePlacement(config);
     if (!placement) return tl::make_unexpected(placement.error());
@@ -5964,6 +6035,15 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
             if (accessor.IsPublished() && config.residency_affinity_ids &&
                 accessor.Get().residency_affinity_id != residency_affinity_id) {
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
+
+            // Reject existing shared objects even if this request omits them.
+            if (accessor.IsPublished() &&
+                (accessor.Get().shared_kv_allocation_id != 0 ||
+                 accessor.Get().HasReplica([](const Replica& replica) {
+                     return replica.is_shared_kv_replica();
+                 }))) {
+                return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
             }
 
             // Managed writes must acquire the group lock before the shard
@@ -6396,6 +6476,34 @@ std::vector<tl::expected<void, ErrorCode>> MasterService::BatchUpsertRevoke(
     const UUID& client_id, const std::vector<std::string>& keys,
     const TenantId& tenant_id) {
     return BatchPutRevoke(client_id, keys, tenant_id);
+}
+
+tl::expected<void, ErrorCode> MasterService::InvalidateSharedKv(
+    const std::string& key, const TenantId& tenant_id,
+    uint64_t expected_allocation_id) {
+    if (!expected_allocation_id) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    MetadataAccessorRW accessor(this,
+                                MakeObjectIdentityForRequest(key, tenant_id));
+    if (!accessor.Exists()) {
+        return {};
+    }
+
+    auto& metadata = accessor.Get();
+    EraseReplicasWithCacheTotalAccounting(
+        metadata, [expected_allocation_id](const Replica& r) {
+            return r.is_shared_kv_replica() && r.is_completed() &&
+                   r.get_shared_kv_descriptor().allocation_id ==
+                       expected_allocation_id;
+        });
+
+    if (!metadata.IsValid()) {
+        accessor.Erase();
+    }
+
+    return {};
 }
 
 auto MasterService::EvictDiskReplicaImpl(const UUID& client_id,
@@ -11569,7 +11677,8 @@ MasterService::KvMediaMasks MasterService::KvMediaMasksForMetadata(
             if (complete && !replica.has_stale_local_disk_client()) {
                 masks.live |= KvEventPublisher::kMediumDisk;
             }
-        } else if (replica.is_disk_replica() || replica.is_dfs_replica()) {
+        } else if (replica.is_disk_replica() || replica.is_dfs_replica() ||
+                   replica.is_shared_kv_replica()) {
             masks.retained |= KvEventPublisher::kMediumDisk;
             if (complete) {
                 masks.live |= KvEventPublisher::kMediumDisk;

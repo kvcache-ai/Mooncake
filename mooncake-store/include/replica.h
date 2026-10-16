@@ -42,7 +42,8 @@ inline std::ostream& operator<<(std::ostream& os,
                              {ReplicaType::LOCAL_DISK, "LOCAL_DISK"},
                              {ReplicaType::NOF_SSD, "NOF_SSD"},
                              {ReplicaType::ALL, "ALL"},
-                             {ReplicaType::DFS, "DFS"}};
+                             {ReplicaType::DFS, "DFS"},
+                             {ReplicaType::SHARED_NVME_KV, "SHARED_NVME_KV"}};
 
     os << (replica_type_strings.count(replicaType)
                ? replica_type_strings.at(replicaType)
@@ -105,10 +106,13 @@ inline std::ostream& operator<<(std::ostream& os,
 /**
  * @brief Configuration for replica management
  */
+inline constexpr size_t kMaxSharedKvReplicaCount = 1;
+
 struct ReplicateConfig {
     size_t replica_num{1};
     size_t nof_replica_num{0};
     size_t dfs_replica_num{0};
+    size_t shared_nvme_kv_replica_num{0};
     SoftPinAction soft_pin_action{SoftPinAction::PRESERVE};
     // Optional request-level override. When omitted, ENABLE uses the
     // master's default soft-pin TTL.
@@ -240,6 +244,8 @@ struct ReplicateConfig {
         os << "ReplicateConfig: { replica_num: " << config.replica_num
            << ", nof_replica_num: " << config.nof_replica_num
            << ", dfs_replica_num: " << config.dfs_replica_num
+           << ", shared_nvme_kv_replica_num: "
+           << config.shared_nvme_kv_replica_num
            << ", soft_pin_action: " << config.soft_pin_action
            << ", soft_pin_ttl_ms: ";
         if (config.soft_pin_ttl_ms.has_value()) {
@@ -325,14 +331,25 @@ struct ExistOptions {
 
 inline ReplicaWriteMode DetermineReplicaWriteMode(
     const ReplicateConfig& config) {
-    if (config.dfs_replica_num == 0 && config.replica_num == 1 &&
-        config.nof_replica_num == 1) {
+    // One memory replica plus one NoF or shared-KV replica.
+    const bool one_secondary =
+        (config.nof_replica_num == 1 &&
+         config.shared_nvme_kv_replica_num == 0) ||
+        (config.nof_replica_num == 0 && config.shared_nvme_kv_replica_num == 1);
+
+    if (config.replica_num == 1 && config.dfs_replica_num == 0 &&
+        one_secondary) {
         return ReplicaWriteMode::FLEXIBLE_DUAL_REPLICA;
     }
-    if (config.replica_num > 1 || config.nof_replica_num > 1 ||
-        config.dfs_replica_num > 0) {
+
+    const size_t total = config.replica_num + config.nof_replica_num +
+                         config.dfs_replica_num +
+                         config.shared_nvme_kv_replica_num;
+
+    if (total > 1 || config.dfs_replica_num > 0) {
         return ReplicaWriteMode::RELIABLE_MULTI_REPLICA;
     }
+
     return ReplicaWriteMode::SINGLE_REPLICA;
 }
 
@@ -368,6 +385,21 @@ struct DistributedFSDescriptor {
     int shard_idx = 0;
     YLT_REFL(DistributedFSDescriptor, file_path, offset, object_size,
              aligned_size, shard_idx);
+};
+
+// Shared replicas are independent of the writer client lifetime.
+struct SharedKvDescriptor {
+    // Payload bytes, excluding the inline metadata.
+    uint64_t object_size = 0;
+
+    // Assigned by Master in PutStart to construct the physical key.
+    // Reused for retries of the same write; recreated objects get a new ID.
+    uint64_t allocation_id = 0;
+    YLT_REFL(SharedKvDescriptor, object_size, allocation_id);
+};
+
+struct SharedKvReplicaData {
+    SharedKvDescriptor descriptor;
 };
 
 struct DfsReplicaData {
@@ -424,6 +456,14 @@ class Replica {
         : Replica(next_id_.fetch_add(1), client_id, object_size,
                   std::move(transport_endpoint), status,
                   std::move(owner_session)) {}
+
+    // shared KV replica constructor
+    Replica(SharedKvDescriptor descriptor, ReplicaStatus status)
+        : id_(next_id_.fetch_add(1)),
+          data_(std::make_unique<SharedKvReplicaData>(
+              SharedKvReplicaData{std::move(descriptor)})),
+          status_(status),
+          refcnt_(0) {}
 
     // dfs replica constructor
     Replica(DistributedFSDescriptor descriptor, ReplicaStatus status)
@@ -577,6 +617,16 @@ class Replica {
 
     [[nodiscard]] static bool fn_is_local_disk_replica(const Replica& replica) {
         return replica.is_local_disk_replica();
+    }
+
+    [[nodiscard]] bool is_shared_kv_replica() const {
+        return std::holds_alternative<std::unique_ptr<SharedKvReplicaData>>(
+            data_);
+    }
+
+    [[nodiscard]] const SharedKvDescriptor& get_shared_kv_descriptor() const {
+        return std::get<std::unique_ptr<SharedKvReplicaData>>(data_)
+            ->descriptor;
     }
 
     [[nodiscard]] bool is_dfs_replica() const {
@@ -749,6 +799,10 @@ class Replica {
             const std::unique_ptr<LocalDiskReplicaData>&) const {
             return ReplicaType::LOCAL_DISK;
         }
+        ReplicaType operator()(
+            const std::unique_ptr<SharedKvReplicaData>&) const {
+            return ReplicaType::SHARED_NVME_KV;
+        }
         ReplicaType operator()(const std::unique_ptr<DfsReplicaData>&) const {
             return ReplicaType::DFS;
         }
@@ -757,7 +811,8 @@ class Replica {
     struct Descriptor {
         ReplicaID id{0};
         std::variant<MemoryDescriptor, NoFDescriptor, DiskDescriptor,
-                     LocalDiskDescriptor, DistributedFSDescriptor>
+                     LocalDiskDescriptor, DistributedFSDescriptor,
+                     SharedKvDescriptor>
             descriptor_variant;
         ReplicaStatus status;
         YLT_REFL(Descriptor, id, descriptor_variant, status);
@@ -807,6 +862,11 @@ class Replica {
                 descriptor_variant);
         }
 
+        bool is_shared_kv_replica() const noexcept {
+            return std::holds_alternative<SharedKvDescriptor>(
+                descriptor_variant);
+        }
+
         MemoryDescriptor& get_memory_descriptor() {
             if (auto* desc =
                     std::get_if<MemoryDescriptor>(&descriptor_variant)) {
@@ -843,6 +903,10 @@ class Replica {
                 return *desc;
             }
             throw std::runtime_error("Expected DistributedFSDescriptor");
+        }
+
+        SharedKvDescriptor& get_shared_kv_descriptor() {
+            return std::get<SharedKvDescriptor>(descriptor_variant);
         }
 
         const MemoryDescriptor& get_memory_descriptor() const {
@@ -882,6 +946,10 @@ class Replica {
             }
             throw std::runtime_error("Expected DistributedFSDescriptor");
         }
+
+        const SharedKvDescriptor& get_shared_kv_descriptor() const {
+            return std::get<SharedKvDescriptor>(descriptor_variant);
+        }
     };
 
    private:
@@ -891,7 +959,8 @@ class Replica {
     // DFS 64 B) for the replicas that never use them.
     using Data = std::variant<
         MemoryReplicaData, NoFReplicaData, std::unique_ptr<DiskReplicaData>,
-        std::unique_ptr<LocalDiskReplicaData>, std::unique_ptr<DfsReplicaData>>;
+        std::unique_ptr<LocalDiskReplicaData>, std::unique_ptr<DfsReplicaData>,
+        std::unique_ptr<SharedKvReplicaData>>;
 
     static Data MakeBufferedData(std::unique_ptr<AllocatedBuffer> buffer,
                                  ReplicaType replica_type) {
@@ -1028,6 +1097,8 @@ inline Replica::Descriptor Replica::get_descriptor() const {
         desc.descriptor_variant = std::move(local_disk_desc);
     } else if (is_dfs_replica()) {
         desc.descriptor_variant = DfsData(data_).descriptor;
+    } else if (is_shared_kv_replica()) {
+        desc.descriptor_variant = get_shared_kv_descriptor();
     }
 
     return desc;
