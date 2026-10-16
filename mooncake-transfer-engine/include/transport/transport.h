@@ -268,7 +268,15 @@ class Transport {
         static constexpr uint64_t kCompletionSealBit = 1ull << 63;
         static constexpr uint64_t kCompletionDoneMask = kCompletionSealBit - 1;
 
+        // Every slice must be marked exactly once; the pin protocol below
+        // assumes a single terminal publish per slice.
         void markSuccess() {
+            // Pin the BatchDesc before publishing the terminal slice count:
+            // a waiter that observes the task complete may freeBatchID()
+            // while this callback still dereferences task/batch state.
+            // slice->status is transport-internal, not a terminal channel,
+            // so its store may stay outside the pin.
+            CompletionCallbackPin pin(task);
             status = Slice::SUCCESS;
             TransferTask *t = task.load(std::memory_order_acquire);
             __atomic_fetch_add(&t->transferred_bytes, length, __ATOMIC_RELAXED);
@@ -281,6 +289,7 @@ class Transport {
         }
 
         void markFailed() {
+            CompletionCallbackPin pin(task);
             status = Slice::FAILED;
             TransferTask *t = task.load(std::memory_order_acquire);
             __atomic_fetch_add(&t->failed_slice_count, 1, __ATOMIC_ACQ_REL);
@@ -294,6 +303,7 @@ class Transport {
         }
 
         static void sealTaskSubmission(TransferTask *task) {
+            CompletionCallbackPin pin(task);
             const uint64_t state = __atomic_or_fetch(
                 &task->completion_state, kCompletionSealBit, __ATOMIC_ACQ_REL);
             finishIfComplete(task, state, false);
@@ -306,11 +316,9 @@ class Transport {
                                             bool is_failed) {
             // Handshake / dummy slices are not attached to a BatchDesc.
             if (!task->batch_id) return;
+            // Callers hold a pin on this BatchDesc across the publish and
+            // this callback; see CompletionCallbackPin.
             auto &batch_desc = toBatchDesc(task->batch_id);
-#ifdef USE_EVENT_DRIVEN_COMPLETION
-            batch_desc.active_completion_callbacks.fetch_add(
-                1, std::memory_order_acq_rel);
-#endif
             if (is_failed) {
                 batch_desc.has_failure.store(true, std::memory_order_relaxed);
             }
@@ -319,18 +327,10 @@ class Transport {
             const uint64_t slice_count =
                 __atomic_load_n(&task->slice_count, __ATOMIC_ACQUIRE);
             if ((state & kCompletionSealBit) == 0 || done != slice_count) {
-#ifdef USE_EVENT_DRIVEN_COMPLETION
-                batch_desc.active_completion_callbacks.fetch_sub(
-                    1, std::memory_order_acq_rel);
-#endif
                 return;
             }
             if (__atomic_exchange_n(&task->completion_published, true,
                                     __ATOMIC_ACQ_REL)) {
-#ifdef USE_EVENT_DRIVEN_COMPLETION
-                batch_desc.active_completion_callbacks.fetch_sub(
-                    1, std::memory_order_acq_rel);
-#endif
                 return;
             }
 
@@ -367,10 +367,39 @@ class Transport {
                 // only to block again on the mutex.
                 batch_desc.completion_cv.notify_all();
             }
-            batch_desc.active_completion_callbacks.fetch_sub(
-                1, std::memory_order_acq_rel);
 #endif
         }
+
+        // The terminal slice counters are visible to waiters before this
+        // callback finishes unwinding, so a racing freeBatchID() could
+        // otherwise delete the BatchDesc (and the TransferTask objects it
+        // owns) out from under finishIfComplete(). Pin the BatchDesc across
+        // the publish and the callback; freeBatchID() defers deletion until
+        // the pin count drains. Handshake/dummy slices have no BatchDesc.
+        struct CompletionCallbackPin {
+            explicit CompletionCallbackPin(TransferTask *task) : task_(task) {
+                if (task_ && task_->batch_id) {
+                    toBatchDesc(task_->batch_id)
+                        .active_completion_callbacks.fetch_add(
+                            1, std::memory_order_acq_rel);
+                } else {
+                    task_ = nullptr;
+                }
+            }
+            ~CompletionCallbackPin() {
+                if (task_) {
+                    toBatchDesc(task_->batch_id)
+                        .active_completion_callbacks.fetch_sub(
+                            1, std::memory_order_acq_rel);
+                }
+            }
+            CompletionCallbackPin(const CompletionCallbackPin &) = delete;
+            CompletionCallbackPin &operator=(const CompletionCallbackPin &) =
+                delete;
+
+           private:
+            TransferTask *task_;
+        };
     };
 
     struct ThreadLocalSliceCache {
@@ -487,11 +516,13 @@ class Transport {
         // As with task_list, submission and polling must be serialized.
         bool counter_eligible = false;
 
-#ifdef USE_EVENT_DRIVEN_COMPLETION
-        // Number of completion callbacks currently inside finishIfComplete
-        // and therefore still allowed to read or update this BatchDesc.
+        // Number of completion callbacks currently holding a pin on this
+        // BatchDesc and therefore still allowed to read or update it and the
+        // TransferTask objects in task_list. freeBatchID() must not delete
+        // this object while a pin is held.
         std::atomic<uint64_t> active_completion_callbacks{0};
 
+#ifdef USE_EVENT_DRIVEN_COMPLETION
         // Synchronization primitives for direct notification
         std::mutex completion_mutex;
         std::condition_variable completion_cv;
@@ -505,6 +536,9 @@ class Transport {
     virtual BatchID allocateBatchID(size_t batch_size);
 
     /// @brief Free an allocated batch.
+    /// May return BatchBusy while completion callbacks are still unwinding;
+    /// the caller must retry then. MultiTransport wraps this with a deferred
+    /// cleanup thread so engine callers see BatchCleanupDeferred instead.
     virtual Status freeBatchID(BatchID batch_id);
 
     /// @brief Submit a batch of transfer requests to the batch.

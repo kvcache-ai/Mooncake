@@ -17,11 +17,12 @@
 #include "master_client.h"
 #include "master_config.h"
 #include "rpc_service.h"
+#include "rpc_worker_pool.h"
 
 namespace mooncake {
 namespace {
 
-class DrainJobRpcTest : public ::testing::Test {
+class DrainJobRpcTest : public ::testing::TestWithParam<bool> {
    protected:
     void SetUp() override {
         WrappedMasterServiceConfig config;
@@ -30,7 +31,10 @@ class DrainJobRpcTest : public ::testing::Test {
         service_ = std::make_unique<WrappedMasterService>(config);
         server_ = std::make_unique<coro_rpc::coro_rpc_server>(
             2, 0, "127.0.0.1", std::chrono::seconds(0), true);
-        RegisterRpcService(*server_, *service_);
+        if (GetParam()) {
+            worker_pool_ = std::make_unique<RpcWorkerPool>(2);
+        }
+        RegisterRpcService(*server_, *service_, worker_pool_.get());
         auto started = server_->async_start();
         ASSERT_FALSE(started.hasResult());
         auto connected = async_simple::coro::syncAwait(
@@ -46,6 +50,7 @@ class DrainJobRpcTest : public ::testing::Test {
     void TearDown() override {
         client_.reset();
         if (server_) server_->stop();
+        worker_pool_.reset();
     }
 
     static bool WaitUntil(const std::function<bool()>& ready) {
@@ -82,12 +87,13 @@ class DrainJobRpcTest : public ::testing::Test {
     std::string address_;
     UUID client_id_ = generate_uuid();
     std::unique_ptr<WrappedMasterService> service_;
+    std::unique_ptr<RpcWorkerPool> worker_pool_;
     std::unique_ptr<coro_rpc::coro_rpc_server> server_;
     coro_rpc::coro_rpc_client raw_client_;
     std::unique_ptr<MasterClient> client_;
 };
 
-TEST_F(DrainJobRpcTest, CreateHandlerPreservesValidationError) {
+TEST_P(DrainJobRpcTest, CreateHandlerPreservesValidationError) {
     auto result = async_simple::coro::syncAwait(
         raw_client_.call<&WrappedMasterService::CreateDrainJob>(
             CreateDrainJobRequest{}));
@@ -96,7 +102,7 @@ TEST_F(DrainJobRpcTest, CreateHandlerPreservesValidationError) {
     EXPECT_EQ(result->error(), ErrorCode::INVALID_PARAMS);
 }
 
-TEST_F(DrainJobRpcTest, QueryHandlerPreservesMissingJobError) {
+TEST_P(DrainJobRpcTest, QueryHandlerPreservesMissingJobError) {
     auto result = async_simple::coro::syncAwait(
         raw_client_.call<&WrappedMasterService::QueryDrainJob>(
             generate_uuid()));
@@ -105,7 +111,7 @@ TEST_F(DrainJobRpcTest, QueryHandlerPreservesMissingJobError) {
     EXPECT_EQ(result->error(), ErrorCode::JOB_NOT_FOUND);
 }
 
-TEST_F(DrainJobRpcTest, CancelHandlerPreservesMissingJobError) {
+TEST_P(DrainJobRpcTest, CancelHandlerPreservesMissingJobError) {
     auto result = async_simple::coro::syncAwait(
         raw_client_.call<&WrappedMasterService::CancelDrainJob>(
             generate_uuid()));
@@ -114,7 +120,7 @@ TEST_F(DrainJobRpcTest, CancelHandlerPreservesMissingJobError) {
     EXPECT_EQ(result->error(), ErrorCode::JOB_NOT_FOUND);
 }
 
-TEST_F(DrainJobRpcTest, ClientPreservesJobAndSegmentErrors) {
+TEST_P(DrainJobRpcTest, ClientPreservesJobAndSegmentErrors) {
     auto created = client_->CreateDrainJob({});
     ASSERT_FALSE(created.has_value());
     EXPECT_EQ(created.error(), ErrorCode::INVALID_PARAMS);
@@ -130,7 +136,7 @@ TEST_F(DrainJobRpcTest, ClientPreservesJobAndSegmentErrors) {
     EXPECT_EQ(status.error(), ErrorCode::SEGMENT_NOT_FOUND);
 }
 
-TEST_F(DrainJobRpcTest, ClientCancelsBlockedJobAndRestoresSegment) {
+TEST_P(DrainJobRpcTest, ClientCancelsBlockedJobAndRestoresSegment) {
     ASSERT_NO_FATAL_FAILURE(MountSourceAndPut(/*hard_pin=*/true));
     CreateDrainJobRequest request;
     request.segments = {"source"};
@@ -180,7 +186,7 @@ TEST_F(DrainJobRpcTest, ClientCancelsBlockedJobAndRestoresSegment) {
               "source");
 }
 
-TEST_F(DrainJobRpcTest, ClientRejectsInvalidDrainRequests) {
+TEST_P(DrainJobRpcTest, ClientRejectsInvalidDrainRequests) {
     ASSERT_NO_FATAL_FAILURE(MountSourceAndPut(/*hard_pin=*/true));
     for (const auto& request :
          std::vector<CreateDrainJobRequest>{{{"source"}, {}, 0},
@@ -201,7 +207,7 @@ TEST_F(DrainJobRpcTest, ClientRejectsInvalidDrainRequests) {
     EXPECT_EQ(*status, SegmentStatus::OK);
 }
 
-TEST_F(DrainJobRpcTest, ClientCannotCancelAnActiveMove) {
+TEST_P(DrainJobRpcTest, ClientCannotCancelAnActiveMove) {
     ASSERT_NO_FATAL_FAILURE(MountSourceAndPut(/*hard_pin=*/false));
     Segment target;
     target.id = generate_uuid();
@@ -225,7 +231,7 @@ TEST_F(DrainJobRpcTest, ClientCannotCancelAnActiveMove) {
     EXPECT_EQ(job->active_units, 1u);
 }
 
-TEST_F(DrainJobRpcTest, ClientDrainMigratesDataBeforeSourceUnmount) {
+TEST_P(DrainJobRpcTest, ClientDrainMigratesDataBeforeSourceUnmount) {
     constexpr size_t kSegmentSize = 16 * 1024 * 1024;
     const auto release = [](void* p) { free_memory("tcp", p); };
     std::unique_ptr<void, decltype(release)> source_buffer(
@@ -315,6 +321,11 @@ TEST_F(DrainJobRpcTest, ClientDrainMigratesDataBeforeSourceUnmount) {
     ASSERT_TRUE(
         target->UnmountSegment(target_buffer.get(), kSegmentSize).has_value());
 }
+
+INSTANTIATE_TEST_SUITE_P(ExecutionModes, DrainJobRpcTest, ::testing::Bool(),
+                         [](const ::testing::TestParamInfo<bool>& info) {
+                             return info.param ? "Pooled" : "Inline";
+                         });
 
 }  // namespace
 }  // namespace mooncake

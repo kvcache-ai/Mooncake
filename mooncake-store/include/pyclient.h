@@ -169,6 +169,20 @@ class ClientRequester {
     void release_offload_buffer(const std::string &client_addr,
                                 uint64_t batch_id);
 
+    /**
+     * @brief Asks a replica owner to verify the backing file of each key and
+     * evict its own replica when the file is proven gone.
+     * @param client_addr Network address of the replica owner's offload RPC
+     * service.
+     * @param request The caller's tenant (offload files are scoped by the
+     * object's recorded tenant) and the object keys to verify.
+     * @return Per-key tri-state in request order (present, evicted,
+     * undetermined), or an error when the owner could not answer at all.
+     */
+    tl::expected<VerifyDiskReplicaResponse, ErrorCode> verify_disk_replica(
+        const std::string &client_addr,
+        const VerifyDiskReplicaRequest &request);
+
    private:
     /**
      * @brief A batch of allocated memory buffers, tracking both handles and
@@ -585,11 +599,15 @@ inline CachedQueryResultResponse to_cached_query_result_response(
     if (query_result->IsLeaseExpired(now)) {
         return CachedQueryResultResponse(ErrorCode::OBJECT_NOT_FOUND);
     }
-    return CachedQueryResultResponse(GetReplicaListResponse(
+    GetReplicaListResponse value(
         std::vector<Replica::Descriptor>(query_result->replicas.begin(),
                                          query_result->replicas.end()),
         remaining_lease_ttl_ms(*query_result, now),
-        query_result->object_checksum));
+        query_result->object_checksum);
+    if (query_result->resolved_tenant_id) {
+        value.resolved_tenant_id = *query_result->resolved_tenant_id;
+    }
+    return CachedQueryResultResponse(std::move(value));
 }
 
 inline tl::expected<QueryResult, ErrorCode> from_cached_query_result_response(
@@ -603,7 +621,8 @@ inline tl::expected<QueryResult, ErrorCode> from_cached_query_result_response(
         std::vector<Replica::Descriptor>(cached_result.value.replicas.begin(),
                                          cached_result.value.replicas.end()),
         now + std::chrono::milliseconds(cached_result.value.lease_ttl_ms),
-        cached_result.value.object_checksum);
+        cached_result.value.object_checksum,
+        cached_result.value.resolved_tenant_id);
 }
 
 inline PyClient::QueryResultCache build_query_result_cache_from_cached_results(
