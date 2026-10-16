@@ -26,6 +26,9 @@ class OssObjectStorageAdapter : public ObjectStorageAdapter {
                                        const iovec* iov, int iovcnt) override;
     tl::expected<size_t, ErrorCode> Get(const std::string& logical_key,
                                         void* buf, size_t len) override;
+    tl::expected<size_t, ErrorCode> GetRange(const std::string& logical_key,
+                                             void* buf, size_t len,
+                                             off_t offset) override;
     std::vector<tl::expected<void, ErrorCode>> PutBatch(
         const std::vector<ObjectPutRequest>& requests) override;
     std::vector<tl::expected<size_t, ErrorCode>> GetBatch(
@@ -37,12 +40,10 @@ class OssObjectStorageAdapter : public ObjectStorageAdapter {
     tl::expected<void, ErrorCode> Init() override;
     tl::expected<void, ErrorCode> CheckHealth() override;
     const char* GetName() const override { return "oss"; }
+    bool SupportsSinglePutAttempt() const override { return true; }
 
     // OSS-specific operations that are intentionally not part of the common
     // ObjectStorageAdapter contract.
-    tl::expected<size_t, ErrorCode> GetRange(const std::string& logical_key,
-                                             void* buf, size_t len,
-                                             off_t offset);
     tl::expected<size_t, ErrorCode> GetV(const std::string& logical_key,
                                          const iovec* iov, int iovcnt,
                                          off_t offset);

@@ -173,6 +173,119 @@ the returned result vector preserves input order and cardinality.
 | Request setup or multi-handle failure | Return errors for requests that could not complete; do not roll back successful cloud writes. |
 | One object fails in a batch | Preserve per-object results; successful uploads are not automatically deleted. |
 
+## Bounded Object I/O Component
+
+`ObjectStorageBackend` provides synchronous I/O for caller-selected object names,
+independently of the client-owned offload path above. Construct it with an
+initialized `ObjectStorageAdapter` and `ObjectStorageBackendConfig`:
+
+- `max_object_bytes` defaults to 256 MiB and limits the declared object size.
+- `max_staging_bytes` defaults to 1 GiB and bounds concurrent host staging
+  allocations within one backend instance. It does not include caller buffers
+  or the adapter's own HTTP buffers.
+
+`Write` validates and gathers all slices into a full-object host buffer, then
+invokes the adapter's `Put` once. It requires enough staging budget for the
+entire object. The adapter must advertise `SupportsSinglePutAttempt()`; otherwise
+writes return `NOT_SUPPORTED` before staging or issuing PUT. OSS supports this
+contract. The REST/S3 adapter automatically retries ambiguous uploads and is
+rejected for these immutable-attempt writes; its legacy offload API is unchanged.
+The optional `upload_started` output becomes true immediately
+before the adapter call; an error with this flag set can have an ambiguous
+remote outcome. The backend does not retry PUT.
+
+`Read` validates the requested range against the caller-supplied object size,
+then scatters exact range GETs into destination slices. Each staging allocation
+is at most 4 MiB, or the configured staging limit if smaller. Reads fail on a
+short response. OSS and the REST adapter used by S3 also validate `Content-Range`
+against the requested offset and length, for both individual and batch reads.
+Adapters that do not implement
+the optional generic `GetRange` method return `NOT_SUPPORTED`.
+
+Copy callbacks allow callers to stage device buffers. They must finish copying
+before returning, and report failure with `false`. Invalid arguments return
+`INVALID_PARAMS`; staging exhaustion returns `NO_AVAILABLE_HANDLE`; copy
+failure returns `TRANSFER_FAIL`. Reservations are released on return or stack
+unwinding. A failed read can leave destination buffers partially written.
+
+This component does not allocate immutable names, manage read leases, publish
+replicas, or decide when deletion is safe. Those responsibilities remain with
+the caller, which can use the adapter's existing `Delete` operation. Sharing an
+adapter across concurrent operations requires a thread-safe adapter.
+
+## Durable Object Lifecycle Component
+
+`ObjectStorageCatalog` pairs with the I/O component above. Production persistence
+currently requires an initialized `EtcdHaKvBackend` and transactional etcd, even
+without Master HA. The injected `HaKvBackend` interface also permits component
+testing. Transaction support alone is insufficient: the backend must support
+the catalog's keyspace and finite range operations. The existing Redis HA
+backend accepts only oplog keys and is unsupported; catalog startup with it
+returns `INVALID_PARAMS`.
+
+The catalog stores Base64-encoded records under
+`/mooncake/object-storage/<cluster_id>/`; cluster IDs must be nonempty and contain
+neither `/` nor NUL. `ObjectStorageCatalogConfig.storage_namespace` binds the
+catalog to the full provider, endpoint, bucket, region, prefix and path style.
+Provider, endpoint, bucket and prefix must be nonempty. Credentials stay local
+to the adapter. A changed target fails catalog startup.
+If the durable catalog is lost or independently rebuilt, use a distinct cluster
+ID and object prefix; generations must not restart against an old namespace.
+
+The lifecycle is explicit:
+
+1. `Open` acquires a strictly increasing epoch with a fresh owner identity and
+   restores records and heads.
+   Zero selects the next epoch automatically. Every mutation compares this
+   durable fence, so an older catalog cannot authorize another upload.
+2. `Prepare` durably allocates a bounded name from a SHA-256 digest of the
+   cluster, tenant and logical key, followed by the generation. A logical key
+   can be prepared again after its current attempt
+   is retired. Names are never reused, including after physical reclamation.
+3. `Claim` authorizes one physical PUT. Repeating the claim fails. The caller
+   then calls the I/O backend and reports `COMPLETE`, `NOT_STARTED` or `UNKNOWN`
+   through `Finish`. Completion notifications may be repeated; contradictory
+   terminal outcomes are rejected. A new physical upload requires a new name.
+4. `Commit` records foreground success and an optional checksum independently
+   of upload completion. The integration must require both for a readable
+   synchronous object replica. The catalog itself does not grant read leases
+   or publish replicas.
+5. `Retire` makes the attempt permanently ineligible for commit. The caller
+   must first stop issuing new read leases and supply the latest outstanding
+   lease deadline as absolute Unix time in milliseconds. Deadlines can be
+   extended until reclamation is admitted;
+   extending one after that point fails explicitly.
+6. `Reclaim` waits for that deadline, performs provider DELETE outside the
+   catalog mutex, and retains uncertain upload attempts for repeated deletion.
+   An upload may materialize after a successful DELETE. Its tombstone remains
+   until the uploader supplies a terminal outcome, followed by another cleanup
+   round. A missing uploader can leave a tombstone indefinitely.
+
+The defaults are 256 MiB per new object, 1 GiB of pending bytes, 10,000 pending
+objects, and 32 inspected reclamation records per call. Each call rotates
+through retired records so a persistent tombstone or future deadline cannot
+starve later cleanup. DELETE requests are sequential and use the adapter's request
+timeout; there is no separate wall-clock deadline for a reclamation call.
+Upload intents, uncommitted uploads and retirement obligations consume pending
+capacity. Retirement can increase backlog beyond admission limits; subsequent
+admission applies backpressure. A known-not-started attempt can be replaced
+atomically with the next generation, even with one pending slot.
+
+Lost transaction replies are checked against all intended records and the
+durable fence. If the outcome cannot be confirmed, operations fail closed until
+`Open` succeeds again. Recovery retains pending obligations even when configured
+admission limits are lower than the restored backlog. Logical heads remain
+after physical GC to prevent older generations being reused or revived; heads
+are not currently compacted.
+
+`Find`, `Head` and `Records` read this catalog instance's recovered cache.
+Master integration must enforce current leadership before using cached state
+to grant leases or serve metadata.
+
+This PR delivers independently tested I/O and catalog components. Wiring them
+into Master/Client RPCs, replica selection, source ownership and snapshot/HA
+reconciliation belongs to the subsequent synchronous-replica integration.
+
 ## Current Limitations
 
 - Readers depend on a reachable owner and valid Master metadata, not just the

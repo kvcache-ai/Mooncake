@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "storage/distributed/s3_adapter.h"
+#include "storage/distributed/object_storage_backend.h"
 
 namespace mooncake {
 namespace {
@@ -436,6 +437,61 @@ TEST(S3ObjectStorageAdapterTest, BatchGetRetriesTransientFailure) {
     EXPECT_TRUE(results[0].has_value());
     EXPECT_EQ(buffer, "abc");
     EXPECT_EQ(server.requests().size(), 2u);
+}
+
+TEST(S3ObjectStorageAdapterTest, GenericAndBatchReadsValidateContentRange) {
+    const auto wrong = RawResponse("206 Partial Content",
+                                   "Content-Range: bytes 2-4/5\r\n", "abc");
+    const auto missing = RawResponse("206 Partial Content", "", "abc");
+    OneShotHttpServer server(
+        {wrong, wrong, missing, missing,
+         RawResponse("206 Partial Content", "Content-Range: bytes 1-3/5\r\n",
+                     "abc"),
+         RawResponse("206 Partial Content", "Content-Range: bytes 0-2/3\r\n",
+                     "abc")});
+    ScopedEnvironment env;
+    ConfigureLocalEndpoint(env, server.port());
+    S3ObjectStorageAdapter adapter("p");
+    ASSERT_TRUE(adapter.Init());
+    ObjectStorageAdapter& generic = adapter;
+    std::array<char, 5> output;
+    for (int i = 0; i < 2; ++i) {
+        output.fill('!');
+        const auto single = generic.GetRange("k", output.data() + 1, 3, 1);
+        EXPECT_FALSE(single);
+        if (!single) {
+            EXPECT_EQ(single.error(), ErrorCode::FILE_READ_FAIL);
+        }
+        const auto batch = adapter.GetBatch({{"k", output.data() + 1, 3}});
+        ASSERT_EQ(batch.size(), 1U);
+        EXPECT_FALSE(batch[0]);
+        if (!batch[0]) {
+            EXPECT_EQ(batch[0].error(), ErrorCode::FILE_READ_FAIL);
+        }
+        EXPECT_EQ(output.front(), '!');
+        EXPECT_EQ(output.back(), '!');
+    }
+    EXPECT_TRUE(generic.GetRange("k", output.data() + 1, 3, 1));
+    EXPECT_EQ(std::string(output.data(), output.size()), "!abc!");
+    const auto batch = adapter.GetBatch({{"k", output.data() + 1, 3}});
+    ASSERT_EQ(batch.size(), 1U);
+    EXPECT_TRUE(batch[0]);
+    EXPECT_EQ(server.requests().size(), 6U);
+}
+
+TEST(S3ObjectStorageAdapterTest, ImmutableBackendRejectsAutomaticPutRetries) {
+    auto adapter = std::make_shared<S3ObjectStorageAdapter>("p");
+    EXPECT_FALSE(adapter->SupportsSinglePutAttempt());
+    ObjectStorageBackend backend({}, adapter);
+    char value = 'x';
+    bool started = true;
+    const auto copy = [](void* dst, const void* src, size_t bytes) {
+        std::memcpy(dst, src, bytes);
+        return true;
+    };
+    EXPECT_EQ(backend.Write("key", 1, {{&value, 1}}, copy, &started),
+              ErrorCode::NOT_SUPPORTED);
+    EXPECT_FALSE(started);
 }
 
 // A connection dropped before any response (for example a reset after a
