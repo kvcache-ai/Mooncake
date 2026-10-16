@@ -5,7 +5,9 @@ from __future__ import annotations
 
 from pathlib import Path
 import sys
+import tempfile
 import unittest
+from unittest import mock
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -68,6 +70,20 @@ class EvaluateBudgetTest(unittest.TestCase):
         self.assertEqual(summary.status, "planning_only")
         self.assertEqual(summary.exit_code, 0)
 
+
+class ReadAvailableHugeTLBTest(unittest.TestCase):
+    def test_reads_free_instead_of_configured_hugepages(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            page_dir = root / "hugepages-2048kB"
+            page_dir.mkdir()
+            (page_dir / "nr_hugepages").write_text("11", encoding="utf-8")
+            (page_dir / "free_hugepages").write_text("7", encoding="utf-8")
+
+            with mock.patch.object(helper, "_HUGEPAGE_SYSFS_ROOT", root):
+                available = helper.read_available_hugetlb(2 * 1024**2)
+
+            self.assertEqual(available, 14 * 1024**2)
 
 if __name__ == "__main__":
     unittest.main()
