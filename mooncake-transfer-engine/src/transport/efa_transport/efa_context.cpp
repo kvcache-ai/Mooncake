@@ -425,8 +425,9 @@ int EfaContext::buildSharedEndpoint(size_t max_wr, size_t max_inline) {
     // holds for a Mooncake cluster by construction: peers run the same build
     // against the same EFA fabric.  What the provider then assumes on our word
     // is p2p / RDMA-read / RDMA-write support (efa_rdm_ep.h), i.e. it uses OUR
-    // capabilities for the peer -- safe between identical instance types, so
-    // MC_EFA_HOMOGENEOUS_PEERS=0 exists for a genuinely mixed fleet.
+    // capabilities for the peer -- safe between identical instance types only,
+    // and see the AV constraint below for why it is opt-in
+    // (MC_EFA_HOMOGENEOUS_PEERS=1).
     //
     // Must precede fi_enable(): the flag changes protocol selection at enable
     // time.  It is a local endpoint property, so it needs no coordination with
@@ -434,11 +435,14 @@ int EfaContext::buildSharedEndpoint(size_t max_wr, size_t max_inline) {
     //
     // One documented constraint (fi_efa.7): the target of an RMA must have
     // inserted the initiator's address into its AV before the op starts, else
-    // completions fail with prov_errno=14.  EfaEndPoint satisfies this --
-    // setupConnectionsByPassive() calls insertPeerAddr() before it replies, and
-    // the active side only marks CONNECTED after that reply arrives.  Should it
-    // ever be violated, 14 is already in isStalePeerCqError() and drops the
-    // peer handle for a fresh handshake.
+    // completions fail with prov_errno=14.  EfaEndPoint only half satisfies
+    // it.  The active side is safe: it marks CONNECTED after the reply, and
+    // setupConnectionsByPassive() inserted our address before replying.  The
+    // passive side is not: it marks CONNECTED as soon as it has inserted the
+    // peer, before the peer has read the reply and inserted us.  A passive
+    // side that writes first (both peers dialing at once) fails with 14, and
+    // since 14 is in isStalePeerCqError() the dropped handle then fails the
+    // peer's writes too.  That is why this defaults off.
     //
     // Support is decided at RUNTIME, not compile time: the option's value is
     // resolved from headers if we have them and vendored if we do not (see
@@ -2038,14 +2042,12 @@ int EfaContext::pollCq(int max_entries, int cq_index) {
         std::vector<std::pair<AvSlotState*, fi_addr_t>> touched_slots;
 
         for (;;) {
-            // MUST be re-zeroed every iteration.  libfabric only copies
-            // provider error details into err_data when the caller supplies
-            // a buffer AND err_data_size; otherwise it hands back an internal
-            // pointer that is documented as valid only "until the next time
-            // the CQ is read".  Leaving the struct uninitialized made
-            // fi_cq_strerror() below format whatever stack garbage sat in
-            // err_data, producing unreadable log lines for every error after
-            // the first in a drain loop.
+            // MUST be re-zeroed every iteration.  fi_cq_readerr() reads
+            // err_data/err_data_size as INPUTS.  Reusing the struct passes
+            // back the previous call's provider buffer, which libfabric
+            // frees and then writes into (heap write-after-free), and
+            // garbles every error line after the first.  Always hand
+            // libfabric a caller-owned buffer.
             struct fi_cq_err_entry err_entry = {};
             char err_data_buf[64] = {};
             err_entry.err_data = err_data_buf;

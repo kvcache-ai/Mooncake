@@ -105,10 +105,12 @@ struct GlobalConfig {
     // capabilities, which lets it skip the per-peer RDM handshake. That
     // handshake is what limits the first transfers to a new peer to 16 queued
     // ops before returning FI_EAGAIN, endpoint-wide rather than per-peer.
-    // Defaults on: a Mooncake cluster is homogeneous by construction. Set
-    // MC_EFA_HOMOGENEOUS_PEERS=0 for a fleet mixing EFA generations or
-    // Mooncake builds. See buildSharedEndpoint() for the full rationale.
-    bool efa_homogeneous_peers = true;
+    // Defaults OFF: without the handshake, a passively connected endpoint can
+    // write before the peer has inserted our address, which fails the write
+    // with prov_errno=14 under bilateral first contact. Opt in with
+    // MC_EFA_HOMOGENEOUS_PEERS=1 only for one-directional traffic between
+    // identical hosts. See buildSharedEndpoint() for the full rationale.
+    bool efa_homogeneous_peers = false;
     // Wall-clock safety net for the WR/CQ credit wait in
     // EfaContext::submitSlicesOnPeer, in milliseconds.  A credit wait is
     // ordinary backpressure and resolves on its own; only a wait this long
