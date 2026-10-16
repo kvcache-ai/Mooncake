@@ -134,7 +134,6 @@ void HcclTransport::initiatorLoop(int deviceLogicId, int selfIdx) {
                         << ", dest_addr: " << slice->hccl.dest_addr
                         << ", ret: " << ret;
                     slice->markFailed();
-                    slice->status = Slice::SliceStatus::FAILED;
                 }
             }
 

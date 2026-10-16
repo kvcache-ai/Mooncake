@@ -363,7 +363,7 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
     std::unique_lock<std::shared_mutex> LockSnapshotForTest(
         MasterService& service) {
         return std::unique_lock<std::shared_mutex>(
-            MasterServiceTestPeer::SnapshotMutex(service));
+            MasterServiceTestPeer::MasterStateMutex(service));
     }
 
     std::unique_lock<std::mutex> LockTenantQuotaRecomputeForTest(
