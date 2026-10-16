@@ -573,7 +573,7 @@ HF3FS USRBIO Adapter (Experimental)<../getting_started/plugin-usage/3FS-USRBIO-P
 |------|---------|-------------|
 | `--rpc_port` | `0` → effective `50051` | RPC listen port. The literal default is `0`, which falls back to the deprecated `--port` (default `50051`) |
 | `--rpc_thread_num` | `0` → effective `min(4, CPU cores)` | RPC io threads, which read and write the connections. The literal default is `0`, which falls back to the deprecated `--max_threads` → `min(4, CPU cores)` |
-| `--handler_worker_thread_num` | `0` → effective `--rpc_thread_num` | RPC worker threads. Every handler except `Ping` and `ServiceReady` runs on these threads instead of the io threads, so a slow request cannot delay the heartbeats sharing its io thread. The literal default is `0`, which starts as many worker threads as io threads. Non-HA mode only |
+| `--handler_worker_thread_num` | `0` → effective `--rpc_thread_num` | RPC worker threads. Every handler except `Ping` and `ServiceReady` runs on these threads instead of the io threads, so a slow request cannot delay the heartbeats sharing its io thread. The literal default is `0`, which starts as many worker threads as io threads |
 | `--rpc_address` | `0.0.0.0` | RPC bind address |
 | `--rpc_interface` | empty | Network interface to resolve RPC address at startup (overrides `--rpc_address`) |
 | `--rpc_conn_timeout_seconds` | `0` | Idle connection timeout; `0` disables |

@@ -183,7 +183,7 @@ DEFINE_int32(rpc_thread_num, 0,
 DEFINE_int32(handler_worker_thread_num, 0,
              "Number of worker threads that run RPC handlers apart from the "
              "io threads, so a slow handler cannot delay a Ping (0 = as "
-             "many as rpc_thread_num; non-HA only)");
+             "many as rpc_thread_num)");
 DEFINE_validator(handler_worker_thread_num,
                  [](const char* flagname, int32_t value) {
                      // The config stores it unsigned, so a negative value
