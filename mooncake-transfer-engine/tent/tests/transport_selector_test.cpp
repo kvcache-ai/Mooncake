@@ -587,11 +587,13 @@ TEST(TransportSelectorTest, TransportCapabilityGpuToDram) {
         << "RDMA should be available for CUDA-to-CPU";
 }
 
-// The XPU staging transport advertises only gpu_to_dram / dram_to_gpu, and XPU
-// VRAM (MTYPE_XPU) must be treated as a device type by the selector's is_gpu
-// predicate. The local VRAM->host stage is therefore routed to XpuTransport via
-// gpu_to_dram, and because XpuTransport never advertises gpu_to_gpu a VRAM<->
-// VRAM hop is not directly available (the engine stages it through host DRAM).
+// XpuTransport advertises gpu_to_dram / dram_to_gpu for the staging hop and
+// gpu_to_gpu for the intra-node device copy, and XPU VRAM (MTYPE_XPU) must be
+// treated as a device type by the selector's is_gpu predicate. The local
+// VRAM->host stage is therefore routed to XpuTransport via gpu_to_dram, and a
+// process-local VRAM<->VRAM request via gpu_to_gpu (PCIe P2P). Every XPU route
+// is gated on local_segment, so a remote VRAM<->VRAM hop stays unavailable and
+// the engine stages it through host DRAM.
 TEST(TransportSelectorTest, XpuStagingRoutesDeviceToHostViaGpuToDram) {
     auto conf = std::make_shared<Config>();
     TransportSelector selector(conf);
@@ -602,6 +604,7 @@ TEST(TransportSelectorTest, XpuStagingRoutesDeviceToHostViaGpuToDram) {
     auto* xpu = static_cast<FakeTransport*>(transports[XPU].get());
     xpu->setGpuToDram(true);
     xpu->setDramToGpu(true);
+    xpu->setGpuToGpu(true);
 
     std::vector<TransportType> buffer_transports = {XPU};
 
@@ -626,16 +629,24 @@ TEST(TransportSelectorTest, XpuStagingRoutesDeviceToHostViaGpuToDram) {
     EXPECT_EQ(result.transport, XPU)
         << "host->XPU VRAM stage should route to XpuTransport (dram_to_gpu)";
 
-    // VRAM<->VRAM needs gpu_to_gpu, which XpuTransport never advertises, so it
-    // is not directly available and the engine must stage through host DRAM.
+    // Process-local VRAM<->VRAM (same XPU or PCIe P2P between two XPUs) uses
+    // gpu_to_gpu.
     ctx.local_memory_type = MTYPE_XPU;
     ctx.remote_memory_type = MTYPE_XPU;
     result = selector.select(ctx, transports);
+    EXPECT_EQ(result.transport, XPU)
+        << "local XPU VRAM<->VRAM should route to XpuTransport (gpu_to_gpu)";
+
+    // The same VRAM<->VRAM pair on another segment is not process-local, so
+    // XPU must not be offered and the engine stages through host DRAM.
+    ctx.local_segment = false;
+    result = selector.select(ctx, transports);
     EXPECT_EQ(result.transport, UNSPEC)
-        << "XPU VRAM<->VRAM must not be directly routable (forces staging)";
+        << "remote XPU VRAM<->VRAM must not be directly routable (forces "
+           "staging)";
 }
 
-// Regression: XPU is a local-stage-only executor, so it must never be selected
+// Regression: XPU is a process-local executor, so it must never be selected
 // for a remote (cross-machine) hop -- the same invariant TPU has. Without XPU
 // in the selector's same-machine guard, an XPU-tagged buffer on a remote
 // segment would be picked via gpu_to_dram and only fail later at execution
@@ -661,10 +672,61 @@ TEST(TransportSelectorTest, XpuIsNotRoutableAcrossMachines) {
     ctx.buffer_transports = &buffer_transports;
 
     EXPECT_EQ(selector.select(ctx, transports).transport, UNSPEC)
-        << "XPU must never carry a remote hop; it is local-stage-only";
+        << "XPU must never carry a remote hop; it is process-local only";
     ctx.same_machine = true;
     EXPECT_EQ(selector.select(ctx, transports).transport, UNSPEC)
         << "a different segment on the same host is not process-local";
+}
+
+// A same-host peer's XPU buffer that the engine has mapped in over Level Zero
+// IPC (xpu_ipc) is reachable by XpuTransport like a local address, so the
+// gpu_to_gpu / gpu_to_dram routes open up for that segment. The mapping is
+// only ever established for same-machine peers; a stray xpu_ipc flag on a
+// cross-machine hop must still not select XPU.
+TEST(TransportSelectorTest, XpuIpcMappedPeerIsRoutable) {
+    auto conf = std::make_shared<Config>();
+    TransportSelector selector(conf);
+
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
+    transports[XPU] = std::make_shared<FakeTransport>(XPU);
+    transports[TCP] = std::make_shared<FakeTransport>(TCP);
+    auto* xpu = static_cast<FakeTransport*>(transports[XPU].get());
+    xpu->setGpuToDram(true);
+    xpu->setDramToGpu(true);
+    xpu->setGpuToGpu(true);
+    auto* tcp = static_cast<FakeTransport*>(transports[TCP].get());
+    tcp->setGpuToDram(true);
+    tcp->setDramToGpu(true);
+    tcp->setGpuToGpu(true);
+
+    // Registration order puts XPU ahead of the network transports.
+    std::vector<TransportType> buffer_transports = {XPU, TCP};
+
+    SelectionContext ctx;
+    ctx.segment_type = SegmentType::Memory;
+    ctx.same_machine = true;
+    ctx.local_segment = false;
+    ctx.xpu_ipc = true;
+    ctx.local_memory_type = MTYPE_XPU;
+    ctx.remote_memory_type = MTYPE_XPU;
+    ctx.buffer_transports = &buffer_transports;
+
+    EXPECT_EQ(selector.select(ctx, transports).transport, XPU)
+        << "mapped peer VRAM<->VRAM should take the XPU IPC route";
+    ctx.local_memory_type = MTYPE_CPU;
+    EXPECT_EQ(selector.select(ctx, transports).transport, XPU)
+        << "host -> mapped peer VRAM should take the XPU IPC route";
+
+    // Without the mapping the same request falls to the network transport.
+    ctx.xpu_ipc = false;
+    EXPECT_EQ(selector.select(ctx, transports).transport, TCP);
+
+    // The flag never overrides machine locality.
+    ctx.xpu_ipc = true;
+    ctx.same_machine = false;
+    EXPECT_EQ(selector.select(ctx, transports).transport, TCP)
+        << "xpu_ipc must not make XPU routable across machines";
 }
 
 // Regression: a SelectionPolicy memory pattern of "xpu" must match XPU VRAM

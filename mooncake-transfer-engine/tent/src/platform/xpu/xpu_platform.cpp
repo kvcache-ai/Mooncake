@@ -109,9 +109,13 @@ Status XpuPlatform::copy(void* dst, void* src, size_t length) {
     bool src_is_device = be.isDevicePtr(src);
     bool dst_is_device = be.isDevicePtr(dst);
     if (src_is_device && dst_is_device) {
-        return Status::NotImplemented(
-            "XpuPlatform: device-to-device copy is not supported in the MVP; "
-            "transfers are staged through host DRAM" LOC_MARK);
+        // Same device, or two devices with peer access: one direct copy over
+        // PCIe / Xe Link. The backend bounces through host memory for pairs
+        // without peer access, so this never fails on topology alone.
+        if (be.copyD2D(dst, src, length) != 0)
+            return Status::InternalError(
+                "XPU device->device copy failed" LOC_MARK);
+        return Status::OK();
     }
     if (src_is_device) {
         if (be.copyD2H(dst, src, length) != 0)
@@ -150,6 +154,80 @@ const std::vector<RangeLocation> XpuPlatform::getLocation(void* start,
     }
     return CpuPlatform::getLocation(start, len, skip_prefault);
 }
+
+Status XpuPlatform::exportDmabuf(void* addr, size_t length, DmabufExport& out) {
+    out = DmabufExport{};
+    auto& be = backend();
+    if (!be.isDevicePtr(addr))
+        return Status::InvalidArgument("not an XPU device allocation" LOC_MARK);
+    int fd = -1;
+    uint64_t offset = 0;
+    uint64_t alloc_size = 0;
+    const int rc = be.exportDmabuf(addr, &fd, &offset, &alloc_size);
+    if (rc == XpuSyclBackend::kExportPooled) {
+        LOG(WARNING) << "XpuPlatform: " << addr << " (" << length
+                     << " bytes) lives in a pooled USM allocation whose "
+                        "dma-buf is shared with other allocations; "
+                        "transfers will be staged through host. Set "
+                        "NEOReadDebugKeys=1 EnableDeviceUsmAllocationPool=0 "
+                        "to disable pooling in the Intel compute runtime";
+        return Status::InternalError(
+            "pooled USM allocation cannot be exported as dma-buf" LOC_MARK);
+    }
+    if (rc != XpuSyclBackend::kExportOk) {
+        LOG(WARNING) << "XpuPlatform: dma-buf export failed for " << addr
+                     << " (" << length
+                     << " bytes); transfers will be staged through host";
+        return Status::InternalError(
+            "Level Zero dma-buf export failed" LOC_MARK);
+    }
+    // The MR is registered as [offset, offset + length) of this dma-buf; a
+    // range running past the allocation would describe memory it does not
+    // cover.
+    if (length > alloc_size - offset)
+        return Status::InvalidArgument(
+            "range spans more than one XPU allocation" LOC_MARK);
+    out.fd = fd;
+    out.offset = offset;
+    return Status::OK();
+}
+
+Status XpuPlatform::exportIpc(void* addr, size_t length, IpcExport& out) {
+    out = IpcExport{};
+    auto& be = backend();
+    if (!be.isDevicePtr(addr))
+        return Status::InvalidArgument("not an XPU device allocation" LOC_MARK);
+    uint64_t base = 0, size = 0;
+    static_assert(sizeof(IpcHandle) == sizeof(XpuSyclBackend::IpcHandleBytes));
+    if (be.exportIpc(addr, &base, &size, &out.handle) != 0)
+        return Status::InternalError(
+            "Level Zero IPC handle export failed" LOC_MARK);
+    const uint64_t start = reinterpret_cast<uint64_t>(addr);
+    if (start < base || start - base + length > size)
+        return Status::InvalidArgument(
+            "range spans more than one XPU allocation" LOC_MARK);
+    out.base = base;
+    out.size = size;
+    return Status::OK();
+}
+
+Status XpuPlatform::importIpc(const IpcHandle& handle, pid_t exporter_pid,
+                              size_t size, int device_index, void** pptr) {
+    if (backend().importIpc(handle, exporter_pid, size, device_index, pptr) !=
+        0)
+        return Status::InternalError(
+            "Level Zero IPC import of peer XPU allocation failed" LOC_MARK);
+    return Status::OK();
+}
+
+Status XpuPlatform::closeImport(void* ptr) {
+    if (backend().closeImport(ptr) != 0)
+        return Status::InternalError(
+            "Level Zero IPC close of imported XPU allocation failed" LOC_MARK);
+    return Status::OK();
+}
+
+int XpuPlatform::deviceIndex(void* addr) { return backend().deviceIndex(addr); }
 
 }  // namespace tent
 }  // namespace mooncake
