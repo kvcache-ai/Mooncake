@@ -49,6 +49,8 @@ struct BucketBackendEnvironment {
         "MOONCAKE_OFFLOAD_BUCKET_DISK_SCAN_CACHE_MS"};
     ScopedEnvVar eviction_policy{"MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY"};
     ScopedEnvVar legacy_eviction_policy{"MOONCAKE_BUCKET_EVICTION_POLICY"};
+    ScopedEnvVar flush_partial_buckets{
+        "MOONCAKE_OFFLOAD_FLUSH_PARTIAL_BUCKETS"};
 };
 
 class BucketBackendConfigTest : public ::testing::Test {
@@ -65,6 +67,33 @@ TEST_F(BucketBackendConfigTest, UsesExistingDefaultsWhenEnvironmentIsUnset) {
     EXPECT_EQ(config.max_physical_bytes, 0);
     EXPECT_EQ(config.disk_scan_cache_ms, 500);
     EXPECT_EQ(config.eviction_policy, BucketEvictionPolicy::FIFO);
+    EXPECT_FALSE(config.flush_partial_buckets);
+}
+
+TEST_F(BucketBackendConfigTest, ReadsPartialFlushBooleanValues) {
+    struct Case {
+        const char* value;
+        bool enabled;
+    };
+    for (const auto& entry :
+         {Case{"1", true}, Case{"true", true}, Case{"0", false},
+          Case{"FALSE", false}, Case{"invalid", false}}) {
+        SCOPED_TRACE(entry.value);
+        env.flush_partial_buckets.Set(entry.value);
+        EXPECT_EQ(BucketBackendConfig::FromEnvironment().flush_partial_buckets,
+                  entry.enabled);
+    }
+}
+
+TEST_F(BucketBackendConfigTest, PartialFlushIsReadPerConfiguration) {
+    env.flush_partial_buckets.Set("1");
+    const auto enabled = BucketBackendConfig::FromEnvironment();
+    EXPECT_TRUE(enabled.flush_partial_buckets);
+    env.flush_partial_buckets.Set("0");
+    EXPECT_FALSE(BucketBackendConfig::FromEnvironment().flush_partial_buckets);
+    env.flush_partial_buckets.Unset();
+    EXPECT_FALSE(BucketBackendConfig::FromEnvironment().flush_partial_buckets);
+    EXPECT_TRUE(enabled.flush_partial_buckets);
 }
 
 TEST_F(BucketBackendConfigTest, ReadsIndependentValidValues) {
