@@ -211,6 +211,24 @@ Pre-allocates a single large file and manages offset-based allocation within it.
 
 Best for: high-concurrency scenarios with many small objects where restart durability is not required.
 
+#### Device-DAX / CXL memory arena
+
+Set `MOONCAKE_OFFSET_DAX_DEVICE_PATH` to place the arena on byte-addressable memory instead of a file: a device-DAX character device (`/dev/dax0.0`, backed by PMEM or CXL-attached memory), an fsdax file, or any regular file. The backend maps the first `MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES` bytes with `mmap(MAP_SHARED)` and copies records with `memcpy`. Device-DAX nodes do not support `read`/`write` syscalls, so this mode is the only way to use them. `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` is still required: it holds the metadata checkpoint when persistence is enabled.
+
+| Variable | Default | Description |
+|---|---|---|
+| `MOONCAKE_OFFSET_DAX_DEVICE_PATH` | unset | Path to map as the data arena. Unset keeps the file-based arena under `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH`. |
+| `MOONCAKE_OFFSET_DAX_ALIGNMENT_BYTES` | `2097152` | Capacity is rounded down to a multiple of this. Device-DAX rejects mapping lengths that are not a multiple of the device alignment (2 MiB, or 1 GiB for some namespaces). |
+| `MOONCAKE_OFFSET_DAX_FLUSH_CPU_CACHE` | `false` | x86-64 only. Write each record's CPU cache lines back to the device (CLWB, else CLFLUSHOPT, else CLFLUSH, then SFENCE) before the write returns. Enable on persistent memory without eADR (for example Intel Optane PMem) when the arena must survive power loss. Leave it off for volatile CXL memory, where it only costs write throughput. |
+
+Notes:
+
+- The process needs read/write permission on the device node, and the device must already exist; no `ndctl`/`daxctl` provisioning is performed.
+- Each DAX arena belongs to one live client. The backend takes an exclusive `flock` on the device, so a second client pointed at the same device fails to start instead of overwriting the first one's records.
+- `MOONCAKE_OFFLOAD_USE_URING` is ignored for the DAX arena.
+- Device memory outlives the process, so `MOONCAKE_OFFSET_PERSIST_MODE=strict` or `relaxed` restores the arena after a restart. Without `MOONCAKE_OFFSET_DAX_FLUSH_CPU_CACHE`, sync uses `msync`, which does not flush CPU caches to persistent media; treat the arena as volatile across power loss unless the platform has eADR. CXL memory expanders are volatile regardless, so their contents are lost on a host reboot or power loss.
+- The DAX arena is independent of the transfer engine's `cxl` protocol (`MC_CXL_DEV_PATH`). The backend refuses to start if both name the same device.
+
 ---
 
 ## Eviction
