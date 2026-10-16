@@ -130,8 +130,13 @@ class FabricTransport : public Transport {
     Status publishPeerAttr();
     Status unpublishPeerAttr();
 
-    Status registerBuffer(uint64_t addr, uint64_t length,
+    Status registerBuffer(uint64_t addr, uint64_t length, int cuda_device,
                           std::shared_ptr<FabricLocalBuffer>& buffer);
+    // The NICs of `nics` closest to local memory: under the GPU's PCIe
+    // switch for device memory, otherwise on its NUMA node.
+    std::vector<int> nearNics(const std::vector<int>& nics, uint64_t addr,
+                              const std::string& location,
+                              int cuda_device) const;
     std::shared_ptr<FabricLocalBuffer> findLocalBuffer(uint64_t addr,
                                                        uint64_t length);
     Status resolveTarget(const Request& request, Target& target);
@@ -149,6 +154,7 @@ class FabricTransport : public Transport {
     const FabricProfile* profile_ = nullptr;
     std::vector<std::unique_ptr<FabricContext>> contexts_;
     bool virt_addr_ = true;
+    bool hmem_ = false;  // every context registers CUDA memory
     uint64_t chunk_limit_ = 0;
     size_t slice_size_ = 0;
 

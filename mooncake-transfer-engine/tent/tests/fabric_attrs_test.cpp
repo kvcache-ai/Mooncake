@@ -69,11 +69,14 @@ TEST(FabricAttrsTest, BufferAttrRoundTripAndValidation) {
     FabricBufferAttr attr;
     attr.chunks.push_back({0, 100, {0, 1}, {11, 12}});
     attr.chunks.push_back({100, 50, {1}, {0xffffffffffffull}});
+    attr.chunks[0].near = {1};
     const std::string text = encodeFabricBufferAttr(attr);
 
     FabricBufferAttr decoded;
     ASSERT_TRUE(decodeFabricBufferAttr(text, 150, decoded).ok());
     ASSERT_EQ(decoded.chunks.size(), 2u);
+    EXPECT_EQ(decoded.chunks[0].near, std::vector<int>{1});
+    EXPECT_TRUE(decoded.chunks[1].near.empty());
     uint64_t key = 0;
     EXPECT_TRUE(decoded.chunks[1].keyFor(1, key));
     EXPECT_EQ(key, 0xffffffffffffull);
@@ -94,6 +97,12 @@ TEST(FabricAttrsTest, BufferAttrRoundTripAndValidation) {
                      R"({"chunks":[{"off":0,"len":5,"nics":[0],"keys":[]}]})",
                      5, decoded)
                      .ok());
+    // A preferred NIC must be one the chunk is registered on.
+    EXPECT_FALSE(
+        decodeFabricBufferAttr(
+            R"({"chunks":[{"off":0,"len":5,"nics":[0],"keys":[1],"near":[1]}]})",
+            5, decoded)
+            .ok());
 }
 
 TEST(FabricAttrsTest, PlanChunks) {
