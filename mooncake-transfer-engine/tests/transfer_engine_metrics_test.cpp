@@ -65,11 +65,13 @@ class TransferEngineImplTestPeer {
 
 namespace {
 
-// Reports successful completion for every task.
+// Reports `status` for every task; COMPLETED unless a test changes it.
 class FakeTransport : public Transport {
    public:
     explicit FakeTransport(size_t transferred_bytes)
         : transferred_bytes_(transferred_bytes) {}
+
+    TransferStatusEnum status = TransferStatusEnum::COMPLETED;
 
     Status submitTransfer(BatchID,
                           const std::vector<TransferRequest>&) override {
@@ -84,7 +86,7 @@ class FakeTransport : public Transport {
 
     Status getTransferStatus(BatchID batch_id, size_t task_id,
                              TransferStatus& status) override {
-        status.s = TransferStatusEnum::COMPLETED;
+        status.s = this->status;
         status.transferred_bytes = transferred_bytes_;
         __atomic_store_n(&toBatchDesc(batch_id).task_list[task_id].is_finished,
                          true, __ATOMIC_RELEASE);
@@ -348,6 +350,58 @@ TEST_F(EngineMetricsTest, ConcurrentPollsRecordOnce) {
     EXPECT_EQ(bytesTotal(Direction::Read), kTasks * 4096);
     EXPECT_EQ(latencyCount(Direction::Read), kTasks);
 }
+
+class EngineMetricsOutcomeTest
+    : public EngineMetricsTest,
+      public ::testing::WithParamInterface<TransferStatusEnum> {};
+
+// The first terminal status decides the outcome; later COMPLETED polls of
+// the same tasks must not record again.
+TEST_P(EngineMetricsOutcomeTest, FirstTerminalStatusIsRecordedOnce) {
+    auto transport = std::make_shared<FakeTransport>(4096);
+    buildBatch("127.0.0.1:0", transport, Transport::TransferRequest::WRITE, 2);
+
+    TransferStatus status;
+    transport->status = GetParam();
+    for (size_t task = 0; task < 2; ++task)
+        engine_->getTransferStatus(batch_, task, status);
+    transport->status = TransferStatusEnum::COMPLETED;
+    engine_->getBatchTransferStatus(batch_, status);
+    for (size_t task = 0; task < 2; ++task)
+        engine_->getTransferStatus(batch_, task, status);
+
+    const bool timed_out = GetParam() == TransferStatusEnum::TIMEOUT;
+    EXPECT_EQ(requestsTotal(Direction::Write), 2);
+    EXPECT_EQ(failuresTotal(Direction::Write), timed_out ? 0 : 2);
+    EXPECT_EQ(timeoutsTotal(Direction::Write), timed_out ? 2 : 0);
+    EXPECT_EQ(bytesTotal(Direction::Write), 0);
+    EXPECT_EQ(latencyCount(Direction::Write), 0);
+}
+
+// The reverse order: tasks recorded as COMPLETED must keep that outcome
+// when a later poll reports a terminal failure status.
+TEST_P(EngineMetricsOutcomeTest, CompletionBlocksLaterTerminalStatuses) {
+    auto transport = std::make_shared<FakeTransport>(4096);
+    buildBatch("127.0.0.1:0", transport, Transport::TransferRequest::WRITE, 2);
+
+    TransferStatus status;
+    for (size_t task = 0; task < 2; ++task)
+        engine_->getTransferStatus(batch_, task, status);
+    transport->status = GetParam();
+    for (size_t task = 0; task < 2; ++task)
+        engine_->getTransferStatus(batch_, task, status);
+
+    EXPECT_EQ(requestsTotal(Direction::Write), 2);
+    EXPECT_EQ(failuresTotal(Direction::Write), 0);
+    EXPECT_EQ(timeoutsTotal(Direction::Write), 0);
+    EXPECT_EQ(bytesTotal(Direction::Write), 2 * 4096);
+    EXPECT_EQ(latencyCount(Direction::Write), 2);
+}
+
+INSTANTIATE_TEST_SUITE_P(TerminalStatuses, EngineMetricsOutcomeTest,
+                         ::testing::Values(TransferStatusEnum::FAILED,
+                                           TransferStatusEnum::CANCELED,
+                                           TransferStatusEnum::TIMEOUT));
 
 }  // namespace
 }  // namespace mooncake
