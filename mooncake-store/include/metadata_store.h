@@ -196,6 +196,10 @@ class MetadataStore {
     virtual size_t GetKeyCount() const = 0;
 
     virtual bool PutWeightMetadata(const WeightRevisionMetadata& metadata) = 0;
+    // Publish both records as one observable state for snapshot readers.
+    virtual bool PutWeightMetadataAndOperation(
+        const WeightRevisionMetadata& metadata,
+        const std::optional<WeightResidencyOperation>& operation) = 0;
     virtual std::optional<WeightRevisionMetadata> GetWeightMetadata(
         const WeightRevisionIdentity& identity) const = 0;
     virtual std::optional<uint64_t> GetWeightMetadataTombstoneGeneration(
@@ -211,6 +215,10 @@ class MetadataStore {
     virtual bool RemoveWeightLease(uint64_t lease_id,
                                    const WeightRevisionIdentity& identity,
                                    uint64_t fenced_metadata_generation) = 0;
+    virtual bool PutWeightOperation(
+        const WeightResidencyOperation& operation) = 0;
+    virtual std::optional<WeightResidencyOperation> GetWeightOperation(
+        uint64_t operation_id) const = 0;
 };
 
 }  // namespace mooncake

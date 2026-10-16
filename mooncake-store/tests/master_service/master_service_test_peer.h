@@ -15,6 +15,19 @@ class MasterServiceTestPeer {
     explicit MasterServiceTestPeer(MasterService& service)
         : service_(service) {}
 
+    size_t RunWeightReconciliationForTesting(uint64_t now_ms,
+                                             size_t limit = 32) {
+        return service_.weight_manager_.ReconcileWeightMetadataStoreOnce(now_ms,
+                                                                         limit);
+    }
+
+    bool DropWeightGroupMemberForTesting(const WeightRevisionIdentity& identity,
+                                         const std::string& key) {
+        return service_
+            .RemoveObject(key, TenantId(identity.tenant_id), true, true)
+            .has_value();
+    }
+
     using GroupDomainAccessorRO = MasterService::GroupDomainAccessorRO;
     using GroupDomainAccessorRW = MasterService::GroupDomainAccessorRW;
     using MetadataAccessorRO = MasterService::MetadataAccessorRO;
@@ -309,6 +322,9 @@ class MasterServiceTestPeer {
 
     static auto& WeightMetadata(MasterService& service) {
         return service.weight_manager_.weight_metadata_;
+    }
+    static auto& WeightManager(MasterService& service) {
+        return service.weight_manager_;
     }
     static const auto& WeightMetadata(const MasterService& service) {
         return service.weight_manager_.weight_metadata_;

@@ -75,6 +75,31 @@ auto WithWriteTenant(std::string_view raw, bool enable_multi_tenants, Fn&& fn) {
     return std::invoke(std::forward<Fn>(fn), tenant_id.value());
 }
 
+template <typename Request>
+void BindWeightRequestTenant(Request& request, const TenantId& tenant_id) {
+    if constexpr (requires { request.identity.tenant_id; }) {
+        request.identity.tenant_id = tenant_id.value();
+    } else {
+        request.tenant_id = tenant_id.value();
+    }
+}
+
+template <typename Request, typename Fn>
+auto WithWeightRequestTenant(Request request, std::string_view raw,
+                             bool enable_multi_tenants, bool write, Fn&& fn) {
+    using Result = std::invoke_result_t<Fn, const Request&>;
+    auto tenant_id =
+        write ? ResolveTenantIdForWrite(raw, enable_multi_tenants)
+              : ResolveRequestTenantId(
+                    enable_multi_tenants ? raw : TenantId::kDefaultValue);
+    if (!tenant_id) {
+        return Result(
+            tl::make_unexpected(WeightManagementError::INVALID_ARGUMENT));
+    }
+    BindWeightRequestTenant(request, *tenant_id);
+    return std::invoke(std::forward<Fn>(fn), request);
+}
+
 }  // namespace
 
 WrappedMasterService::WrappedMasterService(
@@ -1826,6 +1851,120 @@ tl::expected<void, ErrorCode> WrappedMasterService::SetSegmentStatus(
     return master_service_.SetSegmentStatus(segment_name, status);
 }
 
+WeightMetadataStore::Result<WeightRevisionMetadata>
+WrappedMasterService::BeginWeightImport(const BeginWeightImportRequest& request,
+                                        const std::string& tenant_id) {
+    return WithWeightRequestTenant(
+        request, tenant_id, master_service_.IsTenantQuotaEnabled(), true,
+        [this](const auto& bound) {
+            return master_service_.BeginWeightImport(bound);
+        });
+}
+
+WeightMetadataStore::Result<WeightRevisionMetadata>
+WrappedMasterService::CommitWeightImport(
+    const CommitWeightImportRequest& request, const std::string& tenant_id) {
+    return WithWeightRequestTenant(
+        request, tenant_id, master_service_.IsTenantQuotaEnabled(), true,
+        [this](const auto& bound) {
+            return master_service_.CommitWeightImport(bound);
+        });
+}
+
+WeightMetadataStore::Result<WeightRevisionMetadata>
+WrappedMasterService::AbortWeightImport(const AbortWeightImportRequest& request,
+                                        const std::string& tenant_id) {
+    return WithWeightRequestTenant(
+        request, tenant_id, master_service_.IsTenantQuotaEnabled(), true,
+        [this](const auto& bound) {
+            return master_service_.AbortWeightImport(bound);
+        });
+}
+
+WeightMetadataStore::Result<WeightRevisionView>
+WrappedMasterService::GetWeightRevision(const GetWeightRevisionRequest& request,
+                                        const std::string& tenant_id) {
+    return WithWeightRequestTenant(
+        request, tenant_id, master_service_.IsTenantQuotaEnabled(), false,
+        [this](const auto& bound) {
+            return master_service_.GetWeightRevision(bound);
+        });
+}
+
+WeightMetadataStore::Result<ListWeightRevisionsResponse>
+WrappedMasterService::ListWeightRevisions(
+    const ListWeightRevisionsRequest& request, const std::string& tenant_id) {
+    return WithWeightRequestTenant(
+        request, tenant_id, master_service_.IsTenantQuotaEnabled(), false,
+        [this](const auto& bound) {
+            return master_service_.ListWeightRevisions(bound);
+        });
+}
+
+WeightMetadataStore::Result<WeightRevisionLease>
+WrappedMasterService::AcquireWeightRevisionLease(
+    const AcquireWeightRevisionLeaseRequest& request,
+    const std::string& tenant_id) {
+    return WithWeightRequestTenant(
+        request, tenant_id, master_service_.IsTenantQuotaEnabled(), true,
+        [this](const auto& bound) {
+            return master_service_.AcquireWeightRevisionLease(bound);
+        });
+}
+
+WeightMetadataStore::Result<WeightRevisionLease>
+WrappedMasterService::RenewWeightRevisionLease(
+    const RenewWeightRevisionLeaseRequest& request,
+    const std::string& tenant_id) {
+    return WithWeightRequestTenant(
+        request, tenant_id, master_service_.IsTenantQuotaEnabled(), true,
+        [this](const auto& bound) {
+            return master_service_.RenewWeightRevisionLease(bound);
+        });
+}
+
+WeightMetadataStore::Result<void>
+WrappedMasterService::ReleaseWeightRevisionLease(
+    const ReleaseWeightRevisionLeaseRequest& request,
+    const std::string& tenant_id) {
+    return WithWeightRequestTenant(
+        request, tenant_id, master_service_.IsTenantQuotaEnabled(), true,
+        [this](const auto& bound) {
+            return master_service_.ReleaseWeightRevisionLease(bound);
+        });
+}
+
+WeightMetadataStore::Result<WeightResidencyOperation>
+WrappedMasterService::StartWeightResidencyOperation(
+    const StartWeightResidencyOperationRequest& request,
+    const std::string& tenant_id) {
+    return WithWeightRequestTenant(
+        request, tenant_id, master_service_.IsTenantQuotaEnabled(), true,
+        [this](const auto& bound) {
+            return master_service_.StartWeightResidencyOperation(bound);
+        });
+}
+
+WeightMetadataStore::Result<WeightResidencyOperation>
+WrappedMasterService::QueryWeightOperation(
+    const QueryWeightOperationRequest& request, const std::string& tenant_id) {
+    return WithWeightRequestTenant(
+        request, tenant_id, master_service_.IsTenantQuotaEnabled(), false,
+        [this](const auto& bound) {
+            return master_service_.QueryWeightOperation(bound);
+        });
+}
+
+WeightMetadataStore::Result<WeightRevisionMetadata>
+WrappedMasterService::DeleteWeightRevision(
+    const DeleteWeightRevisionRequest& request, const std::string& tenant_id) {
+    return WithWeightRequestTenant(
+        request, tenant_id, master_service_.IsTenantQuotaEnabled(), true,
+        [this](const auto& bound) {
+            return master_service_.DeleteWeightRevision(bound);
+        });
+}
+
 bool WrappedMasterService::KvEventsEnabled() const {
     return master_service_.KvEventsEnabled();
 }
@@ -1937,7 +2076,18 @@ void RegisterRpcService(coro_rpc::coro_rpc_server& server,
         &WrappedMasterService::CreateCopyTask,
         &WrappedMasterService::CreateMoveTask, &WrappedMasterService::QueryTask,
         &WrappedMasterService::FetchTasks,
-        &WrappedMasterService::MarkTaskToComplete>(
+        &WrappedMasterService::MarkTaskToComplete,
+        &WrappedMasterService::BeginWeightImport,
+        &WrappedMasterService::CommitWeightImport,
+        &WrappedMasterService::AbortWeightImport,
+        &WrappedMasterService::GetWeightRevision,
+        &WrappedMasterService::ListWeightRevisions,
+        &WrappedMasterService::AcquireWeightRevisionLease,
+        &WrappedMasterService::RenewWeightRevisionLease,
+        &WrappedMasterService::ReleaseWeightRevisionLease,
+        &WrappedMasterService::StartWeightResidencyOperation,
+        &WrappedMasterService::QueryWeightOperation,
+        &WrappedMasterService::DeleteWeightRevision>(
         server, wrapped_master_service, worker_pool);
 }
 

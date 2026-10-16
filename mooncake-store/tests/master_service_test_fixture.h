@@ -149,6 +149,13 @@ class MasterServiceTest : public ::testing::Test {
         MasterServiceTestPeer(service).CleanupExpiredSoftPins(now);
     }
 
+    std::unique_lock<std::mutex> AcquireWeightGroupOperationLockForTest(
+        MasterService& service, const TenantId& tenant_id,
+        const std::string& group_id) {
+        return MasterServiceTestPeer::WeightManager(service).LockGroup(
+            tenant_id, group_id);
+    }
+
     size_t MetadataShardIndex(MasterService& service, const std::string& key,
                               const TenantId& tenant_id = TenantId::Default()) {
         return MasterServiceTestPeer(service).getShardIndex(tenant_id, key);
