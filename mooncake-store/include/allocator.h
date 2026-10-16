@@ -29,8 +29,10 @@ enum class ReplicaType {
     DISK = 1,        // Disk replica
     LOCAL_DISK = 2,  // Local disk replica
     NOF_SSD = 3,     // Nvme-oF SSD replica
-    ALL = 4,         // All synchronous replicas in put finalize path
-    DFS = 100,       // Distributed filesystem page-offset replica
+    // Foreground Put finalization: MEMORY, NOF_SSD, DFS and SHARED_NVME_KV.
+    ALL = 4,
+    DFS = 100,             // Distributed filesystem page-offset replica
+    SHARED_NVME_KV = 101,  // Shared NVMe KV replica
 };
 
 struct LiveAllocation {
