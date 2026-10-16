@@ -13,6 +13,13 @@
 namespace mooncake {
 namespace {
 
+uint64_t WeightNowMs() {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count());
+}
+
 template <typename T, typename Publish>
 WeightMetadataStore::Result<T> PersistAndPublish(
     WeightStoreBackend& backend, OpType type, const std::string& tenant_id,
@@ -59,6 +66,90 @@ WeightMetadataStore::Result<T> PersistAndPublish(
 
 }  // namespace
 
+WeightStoreManager::ImportWriteGuard::~ImportWriteGuard() {
+    if (activity_) {
+        std::lock_guard lock(activity_->mutex);
+        --activity_->in_flight;
+        if (accepted_) {
+            activity_->last_write_ms =
+                std::max(activity_->last_write_ms, WeightNowMs());
+        }
+    }
+}
+
+std::shared_ptr<WeightStoreManager::ImportActivity>
+WeightStoreManager::FindImportActivity(const TenantId& tenant,
+                                       const std::string& group) {
+    if (group.empty()) {
+        return {};
+    }
+    std::lock_guard lock(import_activity_mutex_);
+    const auto entry = import_activity_.find(tenant.MakeScopedKey(group));
+    return entry == import_activity_.end() ? nullptr : entry->second;
+}
+
+tl::expected<WeightStoreManager::ImportWriteGuard, ErrorCode>
+WeightStoreManager::TrackImportWrite(const TenantId& tenant,
+                                     const std::string& group) {
+    auto activity = FindImportActivity(tenant, group);
+    if (!activity) {
+        return ImportWriteGuard{};
+    }
+    std::lock_guard lock(activity->mutex);
+    if (activity->closing) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+    ++activity->in_flight;
+    return ImportWriteGuard(std::move(activity));
+}
+
+void WeightStoreManager::RecordImportWrite(const TenantId& tenant,
+                                           const std::string& group) {
+    auto write = TrackImportWrite(tenant, group);
+    if (write) {
+        write->Accept();
+    }
+}
+
+void WeightStoreManager::RegisterImportActivity(
+    const WeightRevisionMetadata& metadata) {
+    auto activity = std::make_shared<ImportActivity>();
+    activity->last_write_ms = WeightNowMs();
+    activity->closing =
+        metadata.availability == WeightAvailabilityState::DELETING;
+    std::lock_guard lock(import_activity_mutex_);
+    import_activity_[TenantId(metadata.identity.tenant_id)
+                         .MakeScopedKey(metadata.manifest.payload_group_id)] =
+        std::move(activity);
+}
+
+WeightMetadataStore::Result<void> WeightStoreManager::RestoreSnapshot(
+    const WeightMetadataSnapshot& snapshot) {
+    auto restored = weight_metadata_.RestoreSnapshot(snapshot);
+    if (!restored) {
+        return restored;
+    }
+    {
+        std::lock_guard lock(import_activity_mutex_);
+        import_activity_.clear();
+    }
+    // Restore runs behind the master-state barrier. Give the new leader a full
+    // observation window; local write activity is intentionally not durable.
+    for (const auto& metadata : snapshot.metadata) {
+        if (metadata.availability == WeightAvailabilityState::IMPORTING ||
+            metadata.availability == WeightAvailabilityState::DELETING) {
+            RegisterImportActivity(metadata);
+        }
+    }
+    return {};
+}
+
+void WeightStoreManager::Clear() {
+    weight_metadata_.Clear();
+    std::lock_guard lock(import_activity_mutex_);
+    import_activity_.clear();
+}
+
 std::unique_lock<std::mutex> WeightStoreManager::LockGroup(
     const WeightRevisionIdentity& identity) {
     const auto key = TenantId(identity.tenant_id)
@@ -87,7 +178,11 @@ WeightStoreManager::BeginWeightImport(const BeginWeightImportRequest& request) {
     if (!mutation) {
         return tl::make_unexpected(mutation.error());
     }
-    return PersistAndPublishWeightMutation(*mutation);
+    auto importing = PersistAndPublishWeightMutation(*mutation);
+    if (importing && !mutation->no_op) {
+        RegisterImportActivity(*importing);
+    }
+    return importing;
 }
 
 WeightMetadataStore::Result<WeightRevisionMetadata>
@@ -116,7 +211,14 @@ WeightStoreManager::CommitWeightImport(
         return tl::make_unexpected(validation.error());
     }
 
-    return PersistAndPublishWeightMutation(*mutation);
+    auto committed = PersistAndPublishWeightMutation(*mutation);
+    if (committed) {
+        std::lock_guard lock(import_activity_mutex_);
+        import_activity_.erase(
+            TenantId(request.identity.tenant_id)
+                .MakeScopedKey(committed->manifest.payload_group_id));
+    }
+    return committed;
 }
 
 WeightMetadataStore::Result<WeightRevisionMetadata>
@@ -130,7 +232,16 @@ WeightStoreManager::AbortWeightImport(const AbortWeightImportRequest& request) {
     if (!mutation) {
         return tl::make_unexpected(mutation.error());
     }
-    return PersistAndPublishWeightMutation(*mutation);
+    auto aborted = PersistAndPublishWeightMutation(*mutation);
+    if (aborted) {
+        auto activity = FindImportActivity(TenantId(request.identity.tenant_id),
+                                           aborted->manifest.payload_group_id);
+        if (activity) {
+            std::lock_guard lock(activity->mutex);
+            activity->closing = true;
+        }
+    }
+    return aborted;
 }
 
 WeightMetadataStore::Result<WeightRevisionView>
@@ -408,6 +519,13 @@ WeightStoreManager::StartWeightResidencyOperation(
                 mutation->metadata.next->manifest.payload_count + 1) {
             return tl::make_unexpected(WeightManagementError::NOT_READY);
         }
+        if (request.target_residency == WeightResidencyState::COLD &&
+            std::any_of(members->begin(), members->end(),
+                        [](const auto& member) {
+                            return !member.readable || !member.has_cold;
+                        })) {
+            return tl::make_unexpected(WeightManagementError::NOT_READY);
+        }
         mutation->next->total_members = members->size();
     }
     return PersistAndPublishWeightOperationMutation(*mutation);
@@ -546,6 +664,10 @@ WeightStoreManager::ReconcileWeightRevisionBounded(
         auto deleted = PersistAndPublishWeightMutation(*mutation);
         if (deleted) {
             ForgetReconciliationCursor(current.identity);
+            std::lock_guard lock(import_activity_mutex_);
+            import_activity_.erase(
+                TenantId(current.identity.tenant_id)
+                    .MakeScopedKey(current.manifest.payload_group_id));
         }
         return deleted;
     }
@@ -562,8 +684,10 @@ WeightStoreManager::ReconcileWeightRevisionBounded(
         for (const auto& member : *members) {
             complete = complete && member.readable;
             any_readable = any_readable || member.readable;
-            all_memory = all_memory && member.has_memory;
-            all_cold = all_cold && member.has_cold && !member.has_memory;
+            if (member.readable) {
+                all_memory = all_memory && member.has_memory;
+                all_cold = all_cold && member.has_cold && !member.has_memory;
+            }
             if (member.key == current.manifest.manifest_key &&
                 member.data_type == ObjectDataType::METADATA) {
                 manifest_found = true;
@@ -671,7 +795,16 @@ WeightStoreManager::DeleteWeightRevision(
             std::chrono::system_clock::now().time_since_epoch())
             .count());
     auto mutation = weight_metadata_.PrepareDelete(request, now_ms);
-    if (!mutation) {
+    std::optional<WeightOperationMutation> cancellation;
+    if (!mutation && mutation.error() == WeightManagementError::BUSY) {
+        auto cancelled =
+            weight_metadata_.PrepareCancelOperationForDelete(request, now_ms);
+        if (!cancelled) {
+            return tl::make_unexpected(cancelled.error());
+        }
+        cancellation = std::move(*cancelled);
+        mutation = cancellation->metadata;
+    } else if (!mutation) {
         return tl::make_unexpected(mutation.error());
     }
     // Retire leases durably before publishing a state that cannot own leases.
@@ -682,7 +815,18 @@ WeightStoreManager::DeleteWeightRevision(
             return tl::make_unexpected(retired.error());
         }
     }
-    auto deleting = PersistAndPublishWeightMutation(*mutation);
+    WeightMetadataStore::Result<WeightRevisionMetadata> deleting =
+        tl::make_unexpected(WeightManagementError::DURABILITY_FAILED);
+    if (cancellation) {
+        auto cancelled =
+            PersistAndPublishWeightOperationMutation(*cancellation);
+        if (!cancelled) {
+            return tl::make_unexpected(cancelled.error());
+        }
+        deleting = *cancellation->metadata.next;
+    } else {
+        deleting = PersistAndPublishWeightMutation(*mutation);
+    }
     if (!deleting) {
         return tl::make_unexpected(deleting.error());
     }
@@ -742,7 +886,6 @@ size_t WeightStoreManager::ReconcileWeightMetadataStoreOnce(uint64_t now_ms,
         return 0;
     }
     std::lock_guard reconciliation_lock(reconciliation_mutex_);
-    constexpr uint64_t kImportAbandonTimeoutMs = 5 * 60 * 1000;
     size_t actions = 0;
 
     const auto expired_leases = weight_metadata_.PrepareExpireLeases(now_ms);
@@ -813,13 +956,27 @@ size_t WeightStoreManager::ReconcileWeightMetadataStoreOnce(uint64_t now_ms,
         if (metadata.availability == WeightAvailabilityState::IMPORTING) {
             auto group_lock = LockGroup(metadata.identity);
             auto current = weight_metadata_.Get(metadata.identity, now_ms);
-            if (!current ||
-                current->metadata.availability !=
-                    WeightAvailabilityState::IMPORTING ||
-                now_ms < current->metadata.updated_at_ms ||
-                now_ms - current->metadata.updated_at_ms <
-                    kImportAbandonTimeoutMs) {
+            if (!current || current->metadata.availability !=
+                                WeightAvailabilityState::IMPORTING) {
                 continue;
+            }
+            auto activity =
+                FindImportActivity(TenantId(metadata.identity.tenant_id),
+                                   metadata.manifest.payload_group_id);
+            if (!activity) {
+                continue;
+            }
+            {
+                std::lock_guard activity_lock(activity->mutex);
+                if (activity->closing || activity->in_flight != 0 ||
+                    now_ms < activity->last_write_ms ||
+                    now_ms - activity->last_write_ms <
+                        import_idle_timeout_ms_) {
+                    continue;
+                }
+                // Claim abandonment before releasing the activity lock. An End
+                // either holds a write guard or observes this closed admission.
+                activity->closing = true;
             }
             auto mutation = weight_metadata_.PrepareAbortImport(
                 AbortWeightImportRequest{
@@ -830,6 +987,8 @@ size_t WeightStoreManager::ReconcileWeightMetadataStoreOnce(uint64_t now_ms,
                 now_ms);
             ++actions;
             if (!mutation || !PersistAndPublishWeightMutation(*mutation)) {
+                std::lock_guard activity_lock(activity->mutex);
+                activity->closing = false;
                 MasterMetricManager::instance()
                     .inc_weight_reconciliation_failures();
                 continue;

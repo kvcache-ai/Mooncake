@@ -164,7 +164,6 @@ class MasterService {
 
     WeightMetadataStore::Result<WeightRevisionMetadata> BeginWeightImport(
         const BeginWeightImportRequest& request);
-    WeightStoreManager& GetWeightStoreManager() { return weight_manager_; }
     WeightMetadataStore::Result<WeightRevisionMetadata> CommitWeightImport(
         const CommitWeightImportRequest& request);
     WeightMetadataStore::Result<WeightRevisionMetadata> AbortWeightImport(

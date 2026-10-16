@@ -73,7 +73,7 @@ written after the request was issued.
 The group is a logical lifecycle boundary, not a distributed transaction.
 Physical work may be partial while an operation is running. The metadata store keeps
 the operation non-terminal until reconciliation observes the required state
-for every member.
+for every member, or an explicit delete cancels the operation.
 
 ## Revision Identity and Manifest Location
 
@@ -129,7 +129,7 @@ replica. DRAM eviction changes residency but does not by itself make a revision
 unavailable. Missing required members produce `DEGRADED`; complete physical
 removal produces the retained `DELETED`/`ABSENT` tombstone.
 
-For an incomplete revision, residency describes the members still present;
+For an incomplete revision, residency describes the readable members still present;
 `DEGRADED` reports the missing required members. Missing members alone do not
 mean the remaining objects span multiple storage tiers.
 
@@ -153,7 +153,15 @@ The managed upload sequence is:
 5. `GetWeightRevision` or bounded `ListWeightRevisions` can discover it.
 
 `READY` is never inferred from key prefixes. An abandoned import is handled by
-the explicit abort/reconciliation policy.
+the explicit abort/reconciliation policy. `weight_import_idle_timeout_ms`
+(default `300000`, must be positive) bounds inactivity since the last accepted
+member `PutStart`/`UpsertStart` or write-progressing `PutEnd`/`UpsertEnd`.
+Failed requests, repeated Begin, and already-completed End retries do not extend
+the window. Activity remains local to the leader; recovery grants importing
+revisions a fresh full window. The timeout claim excludes admitted End calls and
+rejects new End calls once abandonment starts. Data-plane transfers between
+master requests are not observable activity: set this timeout above the longest
+expected interval between those requests, including a large single-object upload.
 
 ## Load and Revision Leases
 
@@ -186,6 +194,14 @@ per-object primitives:
 - deletion blocks new leases, waits for live leases, removes payload objects,
   removes the manifest last, verifies absence, and retains a tombstone.
 
+An explicit COLD request requires a readable cold copy of every member at
+admission; otherwise it returns `NOT_READY`. An explicit delete may cancel a
+pending residency operation, including one stalled by missing replicas or
+promotion capacity. After the ordinary generation and lease checks, cancellation
+and `DELETING` publish together in one durable record, before physical removal.
+Operation queries retain the original target and progress with message
+`cancelled`; they never report cancellation as successful convergence.
+
 Generic `BatchEvict`, quota eviction, explicit remove, and cleanup paths skip
 managed groups. Only the weight lifecycle path may change their aggregate
 residency or availability.
@@ -213,6 +229,8 @@ envelope with invalid metadata or operation fields is rejected rather than
 retried as a legacy payload. Deploy new readers before enabling writers that
 publish operation envelopes; compatibility decoding does not make an old reader
 understand a new writer's format.
+The `cancelled` terminal message also requires upgraded readers before writers
+enable cancellation, even though the serialized envelope shape is unchanged.
 
 Batch-OpLog snapshots containing weight state use a version-2 manifest with a
 checksummed weight-state artifact captured at the same replay cursor as object
@@ -235,7 +253,8 @@ Clusters using HA plus the etcd batch OpLog fail closed for weight-management
 mutations unless the operator sets
 `weight_management_oplog_capability_confirmed=true`. Set it only after every
 configured standby runs a version that understands all weight metadata and
-lease OpLog entries. This is an explicit rolling-upgrade capability assertion,
+lease OpLog entries, including the `cancelled` operation terminal. This is an
+explicit rolling-upgrade capability assertion,
 not automatic standby discovery. Reads and ordinary KV operations are not
 gated by it.
 

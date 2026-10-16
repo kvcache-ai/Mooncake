@@ -107,6 +107,8 @@ class WeightMetadataStore {
 
     Result<WeightMetadataMutation> PrepareDelete(
         const DeleteWeightRevisionRequest& request, uint64_t now_ms) const;
+    Result<WeightOperationMutation> PrepareCancelOperationForDelete(
+        const DeleteWeightRevisionRequest& request, uint64_t now_ms) const;
     Result<WeightMetadataMutation> PrepareFinishDelete(
         const WeightRevisionIdentity& identity,
         uint64_t expected_metadata_generation, uint64_t now_ms) const;
@@ -123,6 +125,9 @@ class WeightMetadataStore {
     void Clear();
 
    private:
+    Result<WeightMetadataMutation> PrepareDeleteLocked(
+        const DeleteWeightRevisionRequest& request, uint64_t now_ms,
+        bool cancel_operation) const;
     static std::string MakePageToken(const WeightRevisionIdentity& identity);
     static Result<std::pair<std::string, uint64_t>> ParsePageToken(
         const std::string& page_token);

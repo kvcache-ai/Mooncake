@@ -323,6 +323,9 @@ class MasterServiceTestPeer {
     static auto& WeightMetadata(MasterService& service) {
         return service.weight_manager_.weight_metadata_;
     }
+    static auto& WeightManager(MasterService& service) {
+        return service.weight_manager_;
+    }
     static const auto& WeightMetadata(const MasterService& service) {
         return service.weight_manager_.weight_metadata_;
     }

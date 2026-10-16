@@ -1857,8 +1857,7 @@ WrappedMasterService::BeginWeightImport(const BeginWeightImportRequest& request,
     return WithWeightRequestTenant(
         request, tenant_id, master_service_.IsTenantQuotaEnabled(), true,
         [this](const auto& bound) {
-            return master_service_.GetWeightStoreManager().BeginWeightImport(
-                bound);
+            return master_service_.BeginWeightImport(bound);
         });
 }
 
@@ -1868,8 +1867,7 @@ WrappedMasterService::CommitWeightImport(
     return WithWeightRequestTenant(
         request, tenant_id, master_service_.IsTenantQuotaEnabled(), true,
         [this](const auto& bound) {
-            return master_service_.GetWeightStoreManager().CommitWeightImport(
-                bound);
+            return master_service_.CommitWeightImport(bound);
         });
 }
 
@@ -1879,8 +1877,7 @@ WrappedMasterService::AbortWeightImport(const AbortWeightImportRequest& request,
     return WithWeightRequestTenant(
         request, tenant_id, master_service_.IsTenantQuotaEnabled(), true,
         [this](const auto& bound) {
-            return master_service_.GetWeightStoreManager().AbortWeightImport(
-                bound);
+            return master_service_.AbortWeightImport(bound);
         });
 }
 
@@ -1890,8 +1887,7 @@ WrappedMasterService::GetWeightRevision(const GetWeightRevisionRequest& request,
     return WithWeightRequestTenant(
         request, tenant_id, master_service_.IsTenantQuotaEnabled(), false,
         [this](const auto& bound) {
-            return master_service_.GetWeightStoreManager().GetWeightRevision(
-                bound);
+            return master_service_.GetWeightRevision(bound);
         });
 }
 
@@ -1901,8 +1897,7 @@ WrappedMasterService::ListWeightRevisions(
     return WithWeightRequestTenant(
         request, tenant_id, master_service_.IsTenantQuotaEnabled(), false,
         [this](const auto& bound) {
-            return master_service_.GetWeightStoreManager().ListWeightRevisions(
-                bound);
+            return master_service_.ListWeightRevisions(bound);
         });
 }
 
@@ -1913,8 +1908,7 @@ WrappedMasterService::AcquireWeightRevisionLease(
     return WithWeightRequestTenant(
         request, tenant_id, master_service_.IsTenantQuotaEnabled(), true,
         [this](const auto& bound) {
-            return master_service_.GetWeightStoreManager()
-                .AcquireWeightRevisionLease(bound);
+            return master_service_.AcquireWeightRevisionLease(bound);
         });
 }
 
@@ -1925,8 +1919,7 @@ WrappedMasterService::RenewWeightRevisionLease(
     return WithWeightRequestTenant(
         request, tenant_id, master_service_.IsTenantQuotaEnabled(), true,
         [this](const auto& bound) {
-            return master_service_.GetWeightStoreManager()
-                .RenewWeightRevisionLease(bound);
+            return master_service_.RenewWeightRevisionLease(bound);
         });
 }
 
@@ -1937,8 +1930,7 @@ WrappedMasterService::ReleaseWeightRevisionLease(
     return WithWeightRequestTenant(
         request, tenant_id, master_service_.IsTenantQuotaEnabled(), true,
         [this](const auto& bound) {
-            return master_service_.GetWeightStoreManager()
-                .ReleaseWeightRevisionLease(bound);
+            return master_service_.ReleaseWeightRevisionLease(bound);
         });
 }
 
@@ -1949,8 +1941,7 @@ WrappedMasterService::StartWeightResidencyOperation(
     return WithWeightRequestTenant(
         request, tenant_id, master_service_.IsTenantQuotaEnabled(), true,
         [this](const auto& bound) {
-            return master_service_.GetWeightStoreManager()
-                .StartWeightResidencyOperation(bound);
+            return master_service_.StartWeightResidencyOperation(bound);
         });
 }
 
@@ -1960,8 +1951,7 @@ WrappedMasterService::QueryWeightOperation(
     return WithWeightRequestTenant(
         request, tenant_id, master_service_.IsTenantQuotaEnabled(), false,
         [this](const auto& bound) {
-            return master_service_.GetWeightStoreManager().QueryWeightOperation(
-                bound);
+            return master_service_.QueryWeightOperation(bound);
         });
 }
 
@@ -1971,8 +1961,7 @@ WrappedMasterService::DeleteWeightRevision(
     return WithWeightRequestTenant(
         request, tenant_id, master_service_.IsTenantQuotaEnabled(), true,
         [this](const auto& bound) {
-            return master_service_.GetWeightStoreManager().DeleteWeightRevision(
-                bound);
+            return master_service_.DeleteWeightRevision(bound);
         });
 }
 
