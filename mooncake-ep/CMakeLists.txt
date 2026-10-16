@@ -13,3 +13,8 @@ endif()
 
 include_directories(include)
 add_subdirectory(src)
+
+# The JIT engine is only built for CUDA, and its tests need it.
+if(BUILD_UNIT_TESTS AND USE_CUDA)
+  add_subdirectory(tests)
+endif()
