@@ -267,7 +267,7 @@ jobs:
           mkdir build && cd build
           cmake -G Ninja .. \
             -DUSE_HTTP=ON -DUSE_CXL=ON -DUSE_UB=ON -DUSE_ETCD=ON -DUSE_CUDA=ON \
-            -DWITH_P2P_STORE=ON \
+            -DWITH_P2P_STORE=ON -DWITH_CONDUCTOR=ON \
             -DSTORE_USE_ETCD=ON -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_UNIT_TESTS=ON -DENABLE_SCCACHE=ON
 
