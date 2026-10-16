@@ -264,7 +264,7 @@ The lifecycle is explicit:
 The defaults are 256 MiB per new object, 1 GiB of pending bytes, 10,000 pending
 objects, and 32 inspected reclamation records per call. Each call rotates
 through retired records so a persistent tombstone or future deadline cannot
-starve later cleanup. DELETEs are sequential and use the adapter's request
+starve later cleanup. DELETE requests are sequential and use the adapter's request
 timeout; there is no separate wall-clock deadline for a reclamation call.
 Upload intents, uncommitted uploads and retirement obligations consume pending
 capacity. Retirement can increase backlog beyond admission limits; subsequent

@@ -101,10 +101,11 @@ class ObjectStorageCatalog {
         const std::string& tenant, const std::string& key) const;
     tl::expected<std::vector<ObjectStorageRecord>, ErrorCode> Records() const;
     bool CanReserve(uint64_t bytes) const;
-    // Bounds inspected records as well as DELETEs, rotates for fairness, and
-    // performs provider DELETE outside the catalog mutex. An uncertain PUT
-    // retains its tombstone even after DELETE succeeds. Once reclamation is
-    // admitted, extending that attempt's lease deadline is rejected.
+    // Bounds inspected records as well as DELETE requests, rotates for
+    // fairness, and performs provider DELETE outside the catalog mutex. An
+    // uncertain PUT retains its tombstone even after DELETE succeeds. Once
+    // reclamation is admitted, extending that attempt's lease deadline is
+    // rejected.
     ErrorCode Reclaim(ObjectStorageAdapter& adapter, uint64_t now_ms);
 
    private:
