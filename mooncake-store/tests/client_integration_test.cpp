@@ -71,6 +71,7 @@ struct LegacyReplicateConfig {
     size_t replica_num{1};
     size_t nof_replica_num{0};
     size_t dfs_replica_num{0};
+    size_t shared_nvme_kv_replica_num{0};
     SoftPinAction soft_pin_action{SoftPinAction::PRESERVE};
     std::optional<uint64_t> soft_pin_ttl_ms;
     bool with_hard_pin{false};
@@ -88,6 +89,7 @@ struct SessionReplicateConfig {
     size_t replica_num{1};
     size_t nof_replica_num{0};
     size_t dfs_replica_num{0};
+    size_t shared_nvme_kv_replica_num{0};
     SoftPinAction soft_pin_action{SoftPinAction::PRESERVE};
     std::optional<uint64_t> soft_pin_ttl_ms;
     bool with_hard_pin{false};
@@ -162,7 +164,8 @@ YLT_REFL(LegacyMemoryDescriptor, buffer_descriptor);
 struct LegacyReplicaDescriptor {
     ReplicaID id{0};
     std::variant<LegacyMemoryDescriptor, NoFDescriptor, DiskDescriptor,
-                 LocalDiskDescriptor, DistributedFSDescriptor>
+                 LocalDiskDescriptor, DistributedFSDescriptor,
+                 SharedKvDescriptor>
         descriptor_variant;
     ReplicaStatus status;
 };

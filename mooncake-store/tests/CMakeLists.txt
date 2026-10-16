@@ -54,6 +54,9 @@ add_store_test(allocation_strategy_test allocation_strategy_test.cpp)
 add_store_test(client_liveness_test client_liveness_test.cpp)
 add_store_test(master_config_test master_config_test.cpp)
 add_store_test(replica_selection_test replica_selection_test.cpp)
+add_store_test(shared_nvme_kv_master_test shared_nvme_kv_master_test.cpp)
+add_store_test(shared_nvme_kv_id_allocator_test
+               shared_nvme_kv_id_allocator_test.cpp)
 add_store_test(replica_selection_config_test replica_selection_config_test.cpp)
 set_tests_properties(replica_selection_test
                      PROPERTIES ENVIRONMENT "MC_STORE_REPLICA_SCORING=0")

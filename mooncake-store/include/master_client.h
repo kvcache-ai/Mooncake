@@ -306,7 +306,8 @@ class MasterClient {
      * @return tl::expected<void, ErrorCode> indicating success/failure
      */
     [[nodiscard]] tl::expected<void, ErrorCode> PutRevoke(
-        const std::string& key, ReplicaType replica_type);
+        const std::string& key, ReplicaType replica_type,
+        uint64_t shared_allocation_id = 0);
 
     /**
      * @brief Revokes a put operation for a batch of objects
@@ -315,7 +316,8 @@ class MasterClient {
      */
     [[nodiscard]] std::vector<tl::expected<void, ErrorCode>> BatchPutRevoke(
         const std::vector<std::string>& keys,
-        ReplicaType replica_type = ReplicaType::ALL);
+        ReplicaType replica_type = ReplicaType::ALL,
+        const std::vector<uint64_t>& shared_allocation_ids = {});
 
     /**
      * @brief Starts an upsert operation (insert or update)
@@ -746,6 +748,17 @@ class MasterClient {
      */
     [[nodiscard]] tl::expected<void, ErrorCode> MarkTaskToComplete(
         const TaskCompleteRequest& task_complete);
+
+    /**
+     * @brief Report a definite shared NVMe KV miss to Master.
+     * @param key Logical object key.
+     * @param expected_allocation_id Allocation ID from the queried replica.
+     * @return Success for invalidated, absent, or superseded shared replicas;
+     *         otherwise an RPC or service error.
+     * @note Only matching metadata is removed; physical data and peers remain.
+     */
+    tl::expected<void, ErrorCode> InvalidateSharedKv(
+        const std::string& key, uint64_t expected_allocation_id);
 
     /**
      * @brief Notify master that a disk replica was evicted locally
