@@ -43,6 +43,8 @@ Master service started on port 50051, max_threads=4, ...
 
 The master's default RPC port is `50051`. (To embed an HTTP metadata server instead of using P2P, add `--enable_http_metadata_server=true --http_metadata_server_port=8080`.)
 
+When the metadata backend is the Python HTTP server (`python -m mooncake.http_metadata_server`, the `http://host:8080/metadata` conn strings in this guide), it answers unauthenticated GET/PUT/DELETE on the bind address. Anywhere beyond a single trusted host, set `MC_METADATA_HTTP_TOKEN` on the server and on every engine: the server then requires `Authorization: Bearer <token>` on each metadata request, and the Transfer Engine's HTTP storage plugin attaches the same token automatically. A server asked to bind a non-loopback address with no token refuses to start; on a trusted network you can export `MC_METADATA_HTTP_ALLOW_INSECURE=1` to keep the legacy open behavior (it still logs a loud startup warning). Its in-memory store is also capped by `MC_METADATA_MAX_KEYS` and `MC_METADATA_MAX_TOTAL_BYTES` (64K entries and 1 GiB by default) so a flood of writes cannot exhaust the server's memory.
+
 (start-a-store-client)=
 ### 3. Start a Store Client
 
