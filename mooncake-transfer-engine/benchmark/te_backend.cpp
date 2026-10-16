@@ -82,6 +82,16 @@ static inline int getSunriseDeviceNumaID(int dev_id) {
 static inline int getCudaDeviceNumaID(int cuda_id) { return 0; }
 #endif
 
+// freeBatchID() returns BatchCleanupDeferred when a completion callback is
+// still unwinding (#4569). The handle is already released and the engine
+// finishes the cleanup, so for a finished batch this is success.
+static mooncake::Status releaseFinishedBatch(mooncake::TransferEngine& engine,
+                                             BatchID batch_id) {
+    mooncake::Status status = engine.freeBatchID(batch_id);
+    if (status.IsBatchCleanupDeferred()) return mooncake::Status::OK();
+    return status;
+}
+
 volatile bool g_te_running = true;
 volatile bool g_te_triggered_sig = false;
 
@@ -337,6 +347,18 @@ int TEBenchRunner::allocateBuffers() {
 }
 
 int TEBenchRunner::freeBuffers() {
+    const uint64_t abandoned = abandoned_batches_.load();
+    if (abandoned != 0) {
+        // A transport may still copy into these buffers; the process is
+        // exiting, so leaving them allocated costs nothing.
+        LOG(WARNING) << abandoned
+                     << " transfer batch(es) were still in flight when the "
+                        "run stopped; leaving the local buffers allocated";
+        pinned_buffer_list_.clear();
+        shm_backed_.clear();
+        hugepage_backed_.clear();
+        return 0;
+    }
     auto total_buffer_size = XferBenchConfig::total_buffer_size;
     for (size_t i = 0; i < pinned_buffer_list_.size(); ++i) {
         if (!pinned_buffer_list_[i]) continue;
@@ -548,6 +570,46 @@ int TEBenchRunner::runInitiatorTasks(
     return g_te_running ? 0 : -1;
 }
 
+void TEBenchRunner::noteTransferFailed() {
+    std::lock_guard<std::mutex> lk(mtx_);
+    g_te_running = false;
+    cv_task_.notify_all();
+    cv_done_.notify_all();
+}
+
+// How long a stopped run keeps waiting for a batch already handed to the
+// transports before abandoning it. A second SIGINT still exits immediately.
+static constexpr uint64_t kStopDrainTimeoutUs = 5ull * 1000 * 1000;
+
+mooncake::Status TEBenchRunner::waitForBatch(BatchID batch_id,
+                                             mooncake::TransferStatus& status,
+                                             uint64_t& polls) {
+    bool stop_seen = false;
+    XferBenchTimer since_stop;
+    while (true) {
+        auto polled = engine_->getBatchTransferStatus(batch_id, status);
+        ++polls;
+        if (!polled.ok()) {
+            // The batch state is unknown, so treat it as still in flight.
+            abandoned_batches_.fetch_add(1);
+            return polled;
+        }
+        if (status.s != TransferStatusEnum::WAITING &&
+            status.s != TransferStatusEnum::PENDING) {
+            return mooncake::Status::OK();
+        }
+        if (g_te_running) continue;
+        if (!stop_seen) {
+            stop_seen = true;
+            since_stop.reset();
+        } else if (since_stop.lap_us(false) > kStopDrainTimeoutUs) {
+            abandoned_batches_.fetch_add(1);
+            status.s = TransferStatusEnum::PENDING;
+            return mooncake::Status::OK();
+        }
+    }
+}
+
 double TEBenchRunner::runSingleTransfer(uint64_t local_addr, uint64_t target_id,
                                         uint64_t target_addr,
                                         uint64_t block_size,
@@ -556,6 +618,7 @@ double TEBenchRunner::runSingleTransfer(uint64_t local_addr, uint64_t target_id,
                                         IntentType intent_type) {
     (void)deadline_ns;
     (void)intent_type;
+    if (!g_te_running) return -1.0;
     auto batch_id = engine_->allocateBatchID(batch_size);
     std::vector<TransferRequest> requests;
     for (uint64_t i = 0; i < batch_size; ++i) {
@@ -568,56 +631,48 @@ double TEBenchRunner::runSingleTransfer(uint64_t local_addr, uint64_t target_id,
         entry.target_offset = target_addr + block_size * i;
         requests.emplace_back(entry);
     }
-    if (!splitOutputEnabled()) {
-        XferBenchTimer timer;
-        CHECK_FAIL(engine_->submitTransfer(batch_id, requests));
-        while (g_te_running) {
-            mooncake::TransferStatus overall_status;
-            CHECK_FAIL(
-                engine_->getBatchTransferStatus(batch_id, overall_status));
-            if (overall_status.s == TransferStatusEnum::COMPLETED) {
-                auto duration = timer.lap_us();
-                CHECK_FAIL(engine_->freeBatchID(batch_id));
-                return duration;
-            }
-            if (overall_status.s == TransferStatusEnum::FAILED ||
-                overall_status.s == TransferStatusEnum::TIMEOUT ||
-                overall_status.s == TransferStatusEnum::CANCELED ||
-                overall_status.s == TransferStatusEnum::INVALID) {
-                LOG(ERROR) << "Failed transfer detected";
-                exit(EXIT_FAILURE);
-            }
+    // A deferred free means transport work may still own the buffers (see
+    // TransferEngine::freeBatchID), e.g. a TIMEOUT task whose slices are
+    // still waiting. Keep freeBuffers() from releasing them at exit.
+    auto releaseUnfinishedBatch = [&] {
+        if (engine_->freeBatchID(batch_id).IsBatchCleanupDeferred()) {
+            abandoned_batches_.fetch_add(1);
         }
+    };
+    auto fail = [&](const char* what, const mooncake::Status& status) {
+        LOG(ERROR) << what << ": " << status.ToString();
+        noteTransferFailed();
+        return -1.0;
+    };
+
+    XferBenchTimer timer;
+    auto submitted = engine_->submitTransfer(batch_id, requests);
+    if (!submitted.ok()) {
+        releaseUnfinishedBatch();
+        return fail("Failed to submit transfer", submitted);
+    }
+    const uint64_t submit_us = timer.lap_us(false);
+    uint64_t polls = 0;
+    mooncake::TransferStatus overall_status;
+    auto polled = waitForBatch(batch_id, overall_status, polls);
+    if (!polled.ok()) return fail("Failed to poll transfer", polled);
+    if (overall_status.s == TransferStatusEnum::COMPLETED) {
+        const uint64_t total_us = timer.lap_us(false);
+        if (splitOutputEnabled()) {
+            logSplitXfer({batch_size, submit_us, total_us - submit_us, polls});
+        }
+        auto released = releaseFinishedBatch(*engine_, batch_id);
+        if (!released.ok()) return fail("Failed to free batch", released);
+        return static_cast<double>(total_us);
+    }
+    if (overall_status.s == TransferStatusEnum::PENDING) {
+        // Abandoned after a stop; waitForBatch() already counted it.
         (void)engine_->freeBatchID(batch_id);
         return -1.0;
     }
-
-    XferBenchTimer submit_timer;
-    CHECK_FAIL(engine_->submitTransfer(batch_id, requests));
-    const uint64_t submit_us = submit_timer.lap_us();
-    XferBenchTimer wait_timer;
-    uint64_t polls = 0;
-    while (g_te_running) {
-        mooncake::TransferStatus overall_status;
-        CHECK_FAIL(engine_->getBatchTransferStatus(batch_id, overall_status));
-        polls++;
-        if (overall_status.s == TransferStatusEnum::COMPLETED) {
-            const uint64_t wait_us = wait_timer.lap_us();
-            logSplitXfer({batch_size, submit_us, wait_us, polls});
-            CHECK_FAIL(engine_->freeBatchID(batch_id));
-            return static_cast<double>(submit_us + wait_us);
-        }
-        if (overall_status.s == TransferStatusEnum::FAILED ||
-            overall_status.s == TransferStatusEnum::TIMEOUT ||
-            overall_status.s == TransferStatusEnum::CANCELED ||
-            overall_status.s == TransferStatusEnum::INVALID) {
-            LOG(ERROR) << "Failed transfer detected";
-            exit(EXIT_FAILURE);
-        }
-    }
-    // Stopped while the batch is still in flight. freeBatchID refuses
-    // unfinished batches, so this release is best-effort on the abort path.
-    (void)engine_->freeBatchID(batch_id);
+    releaseUnfinishedBatch();
+    LOG(ERROR) << "Failed transfer detected";
+    noteTransferFailed();
     return -1.0;
 }
 
