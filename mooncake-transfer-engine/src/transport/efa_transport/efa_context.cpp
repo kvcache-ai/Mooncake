@@ -1688,17 +1688,11 @@ int EfaContext::submitSlicesOnPeer(
             return 0;
         }
         if (!retry_slices.empty()) {
-            // Splice retry slices back in at the head of the un-consumed
-            // region so the next pass picks them up.  Drop the consumed prefix
-            // at the same time and rewind the cursor: re-inserting without
-            // trimming grew slice_list by one entry per retried slice per wave
-            // and was observed at 188 million entries in a hung process.
-            // Trimming keeps it bounded by the original batch size, at the same
-            // O(remaining) cost the insert already paid.
-            slice_list.erase(slice_list.begin(), slice_list.begin() + cursor);
-            cursor = 0;
-            slice_list.insert(slice_list.begin(), retry_slices.begin(),
-                              retry_slices.end());
+            // Rewind into the slots the last pass consumed, so the list keeps
+            // its size across EAGAIN waves.
+            cursor -= retry_slices.size();
+            std::copy(retry_slices.begin(), retry_slices.end(),
+                      slice_list.begin() + cursor);
             retry_slices.clear();
             std::this_thread::yield();
         }
