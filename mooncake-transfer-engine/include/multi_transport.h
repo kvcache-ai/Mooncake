@@ -15,6 +15,7 @@
 #ifndef MULTI_TRANSPORT_H_
 #define MULTI_TRANSPORT_H_
 
+#include <chrono>
 #include <condition_variable>
 #include <functional>
 #include <map>
@@ -139,10 +140,23 @@ class MultiTransport {
     RWSpinlock batch_desc_lock_;
     std::unordered_map<BatchID, std::shared_ptr<BatchDesc>> batch_desc_set_;
 
+    struct DeferredCleanup {
+        std::function<void()> before_delete;
+        std::chrono::steady_clock::time_point deferred_at;
+        bool stuck_reported = false;
+    };
+
     std::mutex deferred_cleanup_mutex_;
     std::condition_variable deferred_cleanup_cv_;
-    std::unordered_map<BatchID, std::function<void()>>
-        deferred_cleanup_batches_;
+    std::unordered_map<BatchID, DeferredCleanup> deferred_cleanup_batches_;
+    // A deferred batch still busy after this long is counted once, in a
+    // per-pass summary warning: a completion callback that never unwinds or
+    // a task that never finishes would otherwise stay invisible until
+    // shutdown.
+    std::chrono::milliseconds deferred_cleanup_stuck_after_{
+        std::chrono::seconds(10)};
+    size_t deferred_cleanup_stuck_reports_ = 0;    // batches counted
+    size_t deferred_cleanup_stuck_summaries_ = 0;  // warning lines logged
     bool stop_deferred_cleanup_ = false;
     std::thread deferred_cleanup_thread_;
 };

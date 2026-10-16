@@ -201,6 +201,22 @@ class TransferEngineImplTestPeer {
         return transport.deferred_cleanup_batches_.count(batch_id) != 0;
     }
 
+    static void setDeferredCleanupStuckAfter(MultiTransport& transport,
+                                             std::chrono::milliseconds after) {
+        std::lock_guard<std::mutex> guard(transport.deferred_cleanup_mutex_);
+        transport.deferred_cleanup_stuck_after_ = after;
+    }
+
+    static size_t deferredCleanupStuckReports(MultiTransport& transport) {
+        std::lock_guard<std::mutex> guard(transport.deferred_cleanup_mutex_);
+        return transport.deferred_cleanup_stuck_reports_;
+    }
+
+    static size_t deferredCleanupStuckSummaries(MultiTransport& transport) {
+        std::lock_guard<std::mutex> guard(transport.deferred_cleanup_mutex_);
+        return transport.deferred_cleanup_stuck_summaries_;
+    }
+
     // Why freeBatchID() would defer this batch: true if a task is still
     // running, false if only completion callbacks are unwinding. The batch
     // must be busy; a free batch would be deleted here.
@@ -1245,6 +1261,104 @@ TEST_F(TransportTest, FinishedBatchWaitsForCompletionCallbackQuiescence) {
     }
     EXPECT_FALSE(TransferEngineImplTestPeer::isCleanupDeferred(multi_transport,
                                                                batch_id));
+}
+
+// A deferred batch that stays busy past the threshold is reported once, and
+// is still reclaimed once it quiesces.
+TEST_F(TransportTest, StuckDeferredCleanupIsReportedOnce) {
+    std::string server_name = "unit-test-server:1234";
+    MultiTransport multi_transport(nullptr, server_name);
+    TransferEngineImplTestPeer::setDeferredCleanupStuckAfter(
+        multi_transport, std::chrono::milliseconds(50));
+    auto batch_id = multi_transport.allocateBatchID(1);
+    TransferEngineImplTestPeer::prepareFinishedBatchWithActiveCallback(
+        multi_transport, batch_id);
+    ASSERT_TRUE(multi_transport.freeBatchID(batch_id).IsBatchCleanupDeferred());
+
+    constexpr auto kDeadline = std::chrono::seconds(2);
+    auto deadline = std::chrono::steady_clock::now() + kDeadline;
+    while (TransferEngineImplTestPeer::deferredCleanupStuckReports(
+               multi_transport) == 0 &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_EQ(TransferEngineImplTestPeer::deferredCleanupStuckReports(
+                  multi_transport),
+              1u);
+    EXPECT_EQ(TransferEngineImplTestPeer::deferredCleanupStuckSummaries(
+                  multi_transport),
+              1u);
+    // Several more 100 ms cleanup passes must not report it again.
+    std::this_thread::sleep_for(std::chrono::milliseconds(350));
+    EXPECT_EQ(TransferEngineImplTestPeer::deferredCleanupStuckReports(
+                  multi_transport),
+              1u);
+    EXPECT_TRUE(TransferEngineImplTestPeer::isCleanupDeferred(multi_transport,
+                                                              batch_id));
+
+    TransferEngineImplTestPeer::finishActiveCompletionCallback(multi_transport,
+                                                               batch_id);
+    deadline = std::chrono::steady_clock::now() + kDeadline;
+    while (TransferEngineImplTestPeer::isCleanupDeferred(multi_transport,
+                                                         batch_id) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_FALSE(TransferEngineImplTestPeer::isCleanupDeferred(multi_transport,
+                                                               batch_id));
+}
+
+// Batches that become stuck in the same pass share one summary warning, and
+// each is still counted.
+TEST_F(TransportTest, StuckDeferredCleanupsShareOneSummary) {
+    std::string server_name = "unit-test-server:1234";
+    MultiTransport multi_transport(nullptr, server_name);
+    // Defer both batches first, then lower the threshold, so both cross it
+    // in the same cleanup pass.
+    TransferEngineImplTestPeer::setDeferredCleanupStuckAfter(
+        multi_transport, std::chrono::hours(1));
+    auto first = multi_transport.allocateBatchID(1);
+    auto second = multi_transport.allocateBatchID(1);
+    TransferEngineImplTestPeer::prepareFinishedBatchWithActiveCallback(
+        multi_transport, first);
+    TransferEngineImplTestPeer::prepareFinishedBatchWithActiveCallback(
+        multi_transport, second);
+    ASSERT_TRUE(multi_transport.freeBatchID(first).IsBatchCleanupDeferred());
+    ASSERT_TRUE(multi_transport.freeBatchID(second).IsBatchCleanupDeferred());
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    TransferEngineImplTestPeer::setDeferredCleanupStuckAfter(
+        multi_transport, std::chrono::milliseconds(1));
+
+    constexpr auto kDeadline = std::chrono::seconds(2);
+    auto deadline = std::chrono::steady_clock::now() + kDeadline;
+    while (TransferEngineImplTestPeer::deferredCleanupStuckReports(
+               multi_transport) < 2 &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_EQ(TransferEngineImplTestPeer::deferredCleanupStuckReports(
+                  multi_transport),
+              2u);
+    EXPECT_EQ(TransferEngineImplTestPeer::deferredCleanupStuckSummaries(
+                  multi_transport),
+              1u);
+
+    for (auto batch_id : {first, second}) {
+        TransferEngineImplTestPeer::finishActiveCompletionCallback(
+            multi_transport, batch_id);
+    }
+    deadline = std::chrono::steady_clock::now() + kDeadline;
+    while ((TransferEngineImplTestPeer::isCleanupDeferred(multi_transport,
+                                                          first) ||
+            TransferEngineImplTestPeer::isCleanupDeferred(multi_transport,
+                                                          second)) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_FALSE(
+        TransferEngineImplTestPeer::isCleanupDeferred(multi_transport, first));
+    EXPECT_FALSE(
+        TransferEngineImplTestPeer::isCleanupDeferred(multi_transport, second));
 }
 
 TEST_F(TransportTest, TransferTaskDestructorRunsSliceCleanup) {
