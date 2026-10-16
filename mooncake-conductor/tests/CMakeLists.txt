@@ -33,3 +33,19 @@ target_compile_definitions(
   PRIVATE CONDUCTOR_TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
 
 add_test(NAME conductor_test COMMAND conductor_test)
+
+if(TARGET mooncake_conductor_client)
+  enable_language(C)
+  add_executable(conductor_c_header_test conductor_c_header_test.c)
+  target_include_directories(conductor_c_header_test PRIVATE ../include)
+  target_link_libraries(conductor_c_header_test
+                        PRIVATE mooncake_conductor_client)
+  add_test(NAME conductor_c_header_test COMMAND conductor_c_header_test)
+  add_test(
+    NAME conductor_c_lifecycle_test
+    COMMAND ${CMAKE_COMMAND} -DPROGRAM=$<TARGET_FILE:conductor_c_header_test>
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/repeat_client_lifecycle.cmake)
+  set_tests_properties(conductor_c_lifecycle_test PROPERTIES TIMEOUT 30)
+  target_sources(conductor_test PRIVATE conductor_c_test.cpp)
+  target_link_libraries(conductor_test PRIVATE mooncake_conductor_client)
+endif()

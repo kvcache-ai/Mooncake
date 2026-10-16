@@ -14,6 +14,9 @@ endif()
 
 find_package(Threads REQUIRED)
 find_package(OpenSSL REQUIRED COMPONENTS Crypto)
+option(WITH_CONDUCTOR_GO "build Go bindings for mooncake conductor" OFF)
+option(WITH_CONDUCTOR_C_SHARED
+       "build the conductor client C ABI shared library" OFF)
 
 # Standalone builds own their dependencies; the top-level build provides this
 # target before adding Conductor and Store.
@@ -130,6 +133,47 @@ else()
   message(
     STATUS
       "conductor: SHA-256 backend = EVP (low-level API unavailable or forced)")
+endif()
+
+if(WITH_CONDUCTOR_C_SHARED OR WITH_CONDUCTOR_GO)
+  if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    message(FATAL_ERROR "Conductor C shared library currently supports Linux")
+  endif()
+  include(GNUInstallDirs)
+  add_library(mooncake_conductor_client SHARED src/client/conductor_c.cpp)
+  target_link_libraries(mooncake_conductor_client PRIVATE conductor_cpp_core)
+  set_target_properties(
+    mooncake_conductor_client
+    PROPERTIES VERSION 1.0.0
+               SOVERSION 1
+               INSTALL_RPATH "$ORIGIN"
+               LINK_DEPENDS
+               "${CMAKE_CURRENT_SOURCE_DIR}/src/client/conductor_c.map")
+  target_link_options(
+    mooncake_conductor_client
+    PRIVATE
+    "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/src/client/conductor_c.map"
+  )
+  install(TARGETS mooncake_conductor_client
+          LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
+  install(FILES include/conductor/client/conductor_c.h
+          DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/conductor/client)
+endif()
+
+if(WITH_CONDUCTOR_GO)
+  find_program(CONDUCTOR_GO_EXECUTABLE go)
+  if(NOT CONDUCTOR_GO_EXECUTABLE)
+    message(FATAL_ERROR "WITH_CONDUCTOR_GO=ON requires the Go compiler")
+  endif()
+  add_custom_target(
+    build_conductor_go ALL
+    COMMAND
+      ${CMAKE_COMMAND} -E env "GO=${CONDUCTOR_GO_EXECUTABLE}" bash
+      ${CMAKE_CURRENT_SOURCE_DIR}/go/build.sh ${CMAKE_CURRENT_BINARY_DIR}
+      ${CMAKE_CURRENT_BINARY_DIR}/mooncake-conductor-go-example
+    DEPENDS mooncake_conductor_client
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/go
+    VERBATIM)
 endif()
 
 if(BUILD_UNIT_TESTS)
