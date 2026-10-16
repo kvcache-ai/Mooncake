@@ -193,18 +193,21 @@ class BatchEvictBench {
                     if (!metadata.IsLeaseExpired(now)) {
                         ++stats.unexpired_leases;
                     }
-                    for (const auto& replica : metadata.GetAllReplicas()) {
-                        if (replica.is_memory_replica()) {
-                            if (replica.is_completed()) {
-                                ++stats.completed_memory_replicas;
+                    const ObjectPart* part = metadata.GetPart(0);
+                    if (part != nullptr) {
+                        for (const auto& replica : part->replicas()) {
+                            if (replica.is_memory_replica()) {
+                                if (replica.is_completed()) {
+                                    ++stats.completed_memory_replicas;
+                                } else {
+                                    ++stats.incomplete_replicas;
+                                }
+                                if (replica.get_refcnt() != 0) {
+                                    ++stats.busy_memory_replicas;
+                                }
                             } else {
-                                ++stats.incomplete_replicas;
+                                ++stats.non_memory_replicas;
                             }
-                            if (replica.get_refcnt() != 0) {
-                                ++stats.busy_memory_replicas;
-                            }
-                        } else {
-                            ++stats.non_memory_replicas;
                         }
                     }
                 }

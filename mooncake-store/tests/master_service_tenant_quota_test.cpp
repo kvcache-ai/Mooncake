@@ -323,12 +323,15 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
                 &service,
                 MasterServiceTestPeer::ObjectIdentity{tenant_id, key});
             ASSERT_TRUE(accessor.Exists());
-            accessor.Get().VisitReplicas(
-                &Replica::fn_is_memory_replica,
-                [&removed_ids](Replica& replica) {
-                    removed_ids.push_back(replica.id());
-                    replica.mark_removed();
-                });
+            ObjectPart* part = accessor.Get().MutablePart(0);
+            ASSERT_NE(part, nullptr);
+            for (auto& replica : part->replicas()) {
+                if (!Replica::fn_is_memory_replica(replica)) {
+                    continue;
+                }
+                removed_ids.push_back(replica.id());
+                replica.mark_removed();
+            }
         }
         ASSERT_FALSE(removed_ids.empty());
 

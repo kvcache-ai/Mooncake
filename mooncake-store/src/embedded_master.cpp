@@ -109,6 +109,10 @@ bool EmbeddedMaster::Start(InProcMasterConfig config) {
         if (config.enable_multi_tenants.has_value()) {
             wms_cfg.enable_multi_tenants = config.enable_multi_tenants.value();
         }
+        if (config.enable_multi_part_objects.has_value()) {
+            wms_cfg.enable_multi_part_objects =
+                config.enable_multi_part_objects.value();
+        }
         if (config.tenant_quota_connector_uri.has_value()) {
             wms_cfg.tenant_quota_connector_uri =
                 config.tenant_quota_connector_uri.value();

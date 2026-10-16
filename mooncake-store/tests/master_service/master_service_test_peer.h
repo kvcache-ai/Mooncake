@@ -378,6 +378,12 @@ class MasterServiceTestPeer {
         service_.DiscardExpiredProcessingReplicas(shard, now);
     }
 
+    void SweepMultiPartObjects(
+        MetadataShardAccessorRW& shard,
+        const std::chrono::system_clock::time_point& now) {
+        service_.SweepMultiPartObjects(shard, now);
+    }
+
     uint32_t DynamicReplicationAdmissionMinHits() const {
         return service_.dynamic_replication_.AdmissionMinHits();
     }
@@ -391,12 +397,31 @@ class MasterServiceTestPeer {
         return DynamicReplicationController::VersionEpoch(metadata);
     }
 
-    size_t EraseReplicasWithCacheTotalAccounting(
+    size_t EraseAllReplicasWithCacheTotalAccounting(
         ObjectMetadata& metadata,
         const std::function<bool(const Replica&)>& pred_fn,
         std::vector<ReplicaID>* erased_replica_ids = nullptr) {
-        return service_.EraseReplicasWithCacheTotalAccounting(
+        return service_.EraseAllReplicasWithCacheTotalAccounting(
             metadata, pred_fn, erased_replica_ids);
+    }
+
+    std::vector<Replica> PopPartReplicasWithCacheTotalAccounting(
+        ObjectMetadata& metadata, size_t part_index,
+        const std::function<bool(const Replica&)>& pred_fn) {
+        return service_.PopPartReplicasWithCacheTotalAccounting(
+            metadata, part_index, pred_fn);
+    }
+
+    std::vector<Replica> PopAllReplicasWithCacheTotalAccounting(
+        ObjectMetadata& metadata,
+        const std::function<bool(const Replica&)>& pred_fn) {
+        return service_.PopAllReplicasWithCacheTotalAccounting(metadata,
+                                                               pred_fn);
+    }
+
+    std::vector<Replica> PopAllReplicasWithCacheTotalAccounting(
+        ObjectMetadata& metadata) {
+        return service_.PopAllReplicasWithCacheTotalAccounting(metadata);
     }
 
     TenantQuotaEvictionResult EvictTenantMemoryForQuota(
@@ -436,6 +461,12 @@ class MasterServiceTestPeer {
 
     bool IsReplicaReadable(const Replica& replica) const {
         return service_.IsReplicaReadable(replica);
+    }
+
+    // Marks an endpoint as awaiting a remount, the state a restored replica
+    // sits in until its segment is mounted again.
+    void MarkEndpointAwaitingRemount(const std::string& endpoint) {
+        service_.invalid_replica_endpoints_.insert(endpoint);
     }
 
     static std::vector<std::string> KvMediaForMetadata(
