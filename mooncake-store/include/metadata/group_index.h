@@ -33,8 +33,9 @@ namespace mooncake {
 // a constant.
 //
 // Membership is a set of member keys. Which publication a member belongs to is
-// settled by the caller (see Tenant::RemoveObject) before a membership is
-// dropped, so this table keeps no identity of its own.
+// settled by the caller, which holds the key's lock while it adds or drops a
+// membership (see route::ObjectRoute), so this table keeps no identity of its
+// own.
 template <size_t StripeCount>
 class StripedGroupIndex {
    public:
