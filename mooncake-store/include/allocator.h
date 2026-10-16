@@ -192,6 +192,22 @@ class BufferAllocatorBase {
     virtual std::string getSegmentName() const = 0;
     virtual std::string getTransportEndpoint() const = 0;
 
+    // Publish an immutable value; legacy remounts may enrich unknown locality.
+    void SetLocality(std::optional<SegmentLocality> locality) {
+        std::atomic_store_explicit(
+            &locality_,
+            locality
+                ? std::make_shared<const SegmentLocality>(std::move(*locality))
+                : nullptr,
+            std::memory_order_release);
+    }
+    std::optional<SegmentLocality> GetLocality() const {
+        auto locality =
+            std::atomic_load_explicit(&locality_, std::memory_order_acquire);
+        return locality ? std::optional<SegmentLocality>(*locality)
+                        : std::nullopt;
+    }
+
     /**
      * Returns the largest free region available in this allocator.
      * For CacheLib allocators, this returns kAllocatorUnknownFreeSpace as an
@@ -224,6 +240,7 @@ class BufferAllocatorBase {
    private:
     std::atomic_size_t cur_size_{0};
     std::unique_ptr<StorageUsageRegistration> usage_registration_;
+    std::shared_ptr<const SegmentLocality> locality_;
 };
 
 /**

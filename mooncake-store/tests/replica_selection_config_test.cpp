@@ -15,7 +15,11 @@ class ReplicaSelectionConfigTest : public ::testing::Test {
         if (const char* value = std::getenv("MC_STORE_REPLICA_SCORING")) {
             original_ = value;
         }
+        if (const char* value = std::getenv("MC_STORE_HCA_AFFINITY")) {
+            original_affinity_ = value;
+        }
         ASSERT_EQ(unsetenv("MC_STORE_REPLICA_SCORING"), 0);
+        ASSERT_EQ(unsetenv("MC_STORE_HCA_AFFINITY"), 0);
     }
 
     void TearDown() override {
@@ -25,10 +29,18 @@ class ReplicaSelectionConfigTest : public ::testing::Test {
         } else {
             EXPECT_EQ(unsetenv("MC_STORE_REPLICA_SCORING"), 0);
         }
+        if (original_affinity_) {
+            EXPECT_EQ(
+                setenv("MC_STORE_HCA_AFFINITY", original_affinity_->c_str(), 1),
+                0);
+        } else {
+            EXPECT_EQ(unsetenv("MC_STORE_HCA_AFFINITY"), 0);
+        }
     }
 
    private:
     std::optional<std::string> original_;
+    std::optional<std::string> original_affinity_;
 };
 
 TEST_F(ReplicaSelectionConfigTest, UnsetDisablesScoring) {
@@ -66,6 +78,23 @@ TEST_F(ReplicaSelectionConfigTest, NewConfigsReadTheCurrentEnvironment) {
     EXPECT_FALSE(
         ReplicaSelectionConfig::FromEnvironment().remote_scoring_enabled);
     EXPECT_TRUE(enabled_config.remote_scoring_enabled);
+}
+
+TEST_F(ReplicaSelectionConfigTest,
+       StoreAffinityDefaultsOffAndParsesBooleanValues) {
+    EXPECT_FALSE(
+        ReplicaSelectionConfig::FromEnvironment().hca_affinity_enabled);
+    for (const auto& [text, enabled] : {std::pair{"0", false},
+                                        {"false", false},
+                                        {"1", true},
+                                        {"true", true},
+                                        {"invalid", false},
+                                        {"", false}}) {
+        ASSERT_EQ(setenv("MC_STORE_HCA_AFFINITY", text, 1), 0);
+        EXPECT_EQ(
+            ReplicaSelectionConfig::FromEnvironment().hca_affinity_enabled,
+            enabled);
+    }
 }
 
 }  // namespace

@@ -30,8 +30,9 @@ tl::expected<void, SerializationError> EncodeMountedRegion(
     const MountedRegion& mounted,
     const OffsetBufferAllocatorSnapshot& allocator, MsgpackPacker& packer) {
     // Preserved wire shape: [segment_id, segment_name, segment_base,
-    // segment_size, te_endpoint, status, has_allocator, allocator, host_id].
-    packer.pack_array(9);
+    // segment_size, te_endpoint, status, has_allocator, allocator, host_id,
+    // optional [numa_node, hca_names]].
+    packer.pack_array(mounted.segment.locality ? 10 : 9);
     packer.pack(UuidToString(mounted.segment.id));
     packer.pack(mounted.segment.name);
     packer.pack(static_cast<uint64_t>(mounted.segment.base));
@@ -44,6 +45,9 @@ tl::expected<void, SerializationError> EncodeMountedRegion(
         return tl::make_unexpected(encoded.error());
     }
     packer.pack(mounted.segment.host_id);
+    if (const auto& locality = mounted.segment.locality) {
+        packer.pack(std::make_pair(locality->numa_node, locality->hca_names));
+    }
     return {};
 }
 
@@ -90,6 +94,13 @@ tl::expected<DecodedMountedRegion, SerializationError> DecodeMountedRegion(
         }
         if (object.via.array.size >= 9) {
             decoded.mounted.segment.host_id = array[8].as<std::string>();
+        }
+        if (object.via.array.size >= 10) {
+            auto [numa, hcas] =
+                array[9].as<std::pair<int32_t, std::vector<std::string>>>();
+            if (numa < 0) throw msgpack::type_error();
+            decoded.mounted.segment.locality =
+                SegmentLocality{numa, std::move(hcas)};
         }
         return decoded;
     } catch (const std::exception& error) {

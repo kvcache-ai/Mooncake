@@ -1,4 +1,5 @@
 #include "master_service.h"
+#include "config/replica_selection_config.h"
 #include "master_service/master_service_test_peer.h"
 #include "rpc_service.h"
 
@@ -27,6 +28,7 @@
 #include <unistd.h>
 
 #include "tenant/quota_policy_store.h"
+#include "random.h"
 #include "types.h"
 #include "master_service_test_fixture.h"
 
@@ -132,6 +134,137 @@ std::string GenerateKeyForSegment(const UUID& client_id,
             // Ignore cleanup failure
         }
     }
+}
+
+TEST_F(MasterServiceTest, MixedGpuBatchUsesEachKeysHcaHint) {
+    if (!StoreHcaAffinityEnabled()) GTEST_SKIP();
+    MasterService service(MasterServiceConfig::builder()
+                              .set_memory_allocator(BufferAllocatorType::OFFSET)
+                              .build());
+    const auto owner = generate_uuid();
+    auto first = MakeSegment("receiver");
+    first.protocol = "rdma";
+    first.locality = SegmentLocality{7, {"mlx5_0"}};
+    auto second = first;
+    second.id = generate_uuid();
+    second.base += first.size;
+    second.locality = SegmentLocality{0, {"mlx5_1"}};
+    ASSERT_TRUE(service.MountSegment(first, owner));
+    ASSERT_TRUE(service.MountSegment(second, owner));
+    ReplicateConfig config;
+    config.per_key_preferred_hca_names =
+        std::vector<std::vector<std::string>>{{"mlx5_0"}, {"mlx5_1"}};
+    auto results = service.BatchUpsertStart(
+        owner, {"gpu0", "gpu1"}, TenantId::Default(), {1024, 1024}, config);
+    ASSERT_EQ(results.size(), 2);
+    for (size_t i = 0; i < results.size(); ++i) {
+        ASSERT_TRUE(results[i]);
+        const auto& memory = (*results[i])[0].get_memory_descriptor();
+        ASSERT_TRUE(memory.locality);
+        EXPECT_EQ(memory.locality->numa_node, i == 0 ? 7 : 0);
+    }
+    config.per_key_preferred_hca_names->pop_back();
+    results =
+        service.BatchUpsertStart(owner, {"invalid0", "invalid1"},
+                                 TenantId::Default(), {1024, 1024}, config);
+    for (const auto& result : results) {
+        ASSERT_FALSE(result);
+        EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+    }
+}
+
+TEST_F(MasterServiceTest, PutAndBatchUpsertHonorReceiverHcaLocality) {
+    if (!StoreHcaAffinityEnabled()) GTEST_SKIP();
+    auto config = MasterServiceConfig::builder()
+                      .set_memory_allocator(BufferAllocatorType::OFFSET)
+                      .build();
+    MasterService service(config);
+    const auto owner = generate_uuid();
+    auto other = MakeSegment("receiver");
+    other.protocol = "rdma";
+    other.locality = SegmentLocality{0, {"mlx5_1"}};
+    auto matching = other;
+    matching.id = generate_uuid();
+    matching.base += matching.size;
+    matching.locality = SegmentLocality{7, {"mlx5_0"}};
+    ASSERT_TRUE(service.MountSegment(other, owner));
+    ASSERT_TRUE(service.MountSegment(matching, owner));
+    ReplicateConfig request;
+    request.preferred_hca_names = std::vector<std::string>{"mlx5_0"};
+    auto result = service.PutStart(owner, "hca-put", TenantId::Default(),
+                                   {1024}, request);
+    ASSERT_TRUE(result);
+    const auto address =
+        (*result)[0].get_memory_descriptor().buffer_descriptor.buffer_address_;
+    EXPECT_GE(address, matching.base);
+    EXPECT_LT(address, matching.base + matching.size);
+    auto conflicting = matching;
+    conflicting.locality = SegmentLocality{0, {"mlx5_1"}};
+    auto remounted = service.ReMountSegment({conflicting}, owner);
+    ASSERT_FALSE(remounted);
+    EXPECT_EQ(remounted.error(), ErrorCode::INVALID_PARAMS);
+    auto batch =
+        service.BatchUpsertStart(owner, {"hca-upsert-a", "hca-upsert-b"},
+                                 TenantId::Default(), {1024, 1024}, request);
+    ASSERT_EQ(batch.size(), 2);
+    for (const auto& entry : batch) {
+        ASSERT_TRUE(entry);
+        const auto target = (*entry)[0]
+                                .get_memory_descriptor()
+                                .buffer_descriptor.buffer_address_;
+        EXPECT_GE(target, matching.base);
+        EXPECT_LT(target, matching.base + matching.size);
+    }
+}
+
+TEST_F(MasterServiceTest, DisabledAffinityIgnoresExplicitHints) {
+    if (StoreHcaAffinityEnabled()) GTEST_SKIP();
+    MasterService service(
+        MasterServiceConfig::builder()
+            .set_memory_allocator(BufferAllocatorType::OFFSET)
+            .set_allocation_strategy_type(AllocationStrategyType::RANDOM)
+            .build());
+    const auto owner = generate_uuid();
+    auto first = MakeSegment("receiver");
+    first.locality = SegmentLocality{0, {"mlx5_0"}};
+    auto second = first;
+    second.id = generate_uuid();
+    second.base += first.size;
+    second.locality = SegmentLocality{1, {"mlx5_1"}};
+    ASSERT_TRUE(service.MountSegment(first, owner));
+    ASSERT_TRUE(service.MountSegment(second, owner));
+    const auto engine = threadLocalRandomEngine();
+    auto baseline =
+        service.PutStart(owner, "without-hint", TenantId::Default(), 1024, {});
+    ASSERT_TRUE(baseline);
+    const auto locality = baseline->front().get_memory_descriptor().locality;
+    ASSERT_TRUE(locality);
+    ReplicateConfig request;
+    request.preferred_hca_names = std::vector<std::string>{
+        locality->numa_node == 0 ? "mlx5_1" : "mlx5_0"};
+    threadLocalRandomEngine() = engine;
+    auto hinted = service.PutStart(owner, "with-hint", TenantId::Default(),
+                                   1024, request);
+    ASSERT_TRUE(hinted);
+    EXPECT_EQ(hinted->front().get_memory_descriptor().locality, locality);
+}
+
+TEST_F(MasterServiceTest, DuplicateMountEnrichesOnlyUnknownLocality) {
+    MasterService service(MasterServiceConfig::builder()
+                              .set_memory_allocator(BufferAllocatorType::OFFSET)
+                              .build());
+    const auto owner = generate_uuid();
+    auto legacy = MakeSegment("legacy-locality");
+    ASSERT_TRUE(service.MountSegment(legacy, owner));
+    auto known = legacy;
+    known.locality = SegmentLocality{7, {"mlx5_0"}};
+    ASSERT_TRUE(service.MountSegment(known, owner));
+    ASSERT_TRUE(service.MountSegment(legacy, owner));
+    auto replicas = service.PutStart(owner, "enriched-locality",
+                                     TenantId::Default(), 1024, {});
+    ASSERT_TRUE(replicas);
+    EXPECT_EQ(replicas->front().get_memory_descriptor().locality,
+              known.locality);
 }
 
 TEST_F(MasterServiceTest, MountUnmountSegmentWithCachelibAllocator) {
@@ -1188,6 +1321,33 @@ StandbySegmentInfo MakeStandbySegment(const std::string& name,
 }
 
 }  // namespace
+
+TEST_F(MasterServiceTest, StandbyRemountFindsSameEndpointRangeByAddress) {
+    MasterService service(MasterServiceConfig::builder()
+                              .set_memory_allocator(BufferAllocatorType::OFFSET)
+                              .build());
+    auto first = MakeSegment("shared-range");
+    auto second = first;
+    second.id = generate_uuid();
+    second.base += first.size;
+    first.locality = SegmentLocality{0, {"mlx5_0"}};
+    second.locality = SegmentLocality{1, {"mlx5_1"}};
+    auto a = MakeStandbyEntry("range-a", 1024, first.base, first.te_endpoint);
+    auto b = MakeStandbyEntry("range-b", 1024, second.base, second.te_endpoint);
+    ASSERT_TRUE(service.RestoreFromStandbySnapshot(
+        {a, b}, 1,
+        {MakeStandbySegment(first.name, first.te_endpoint, first.size)}));
+    ASSERT_TRUE(service.ReMountSegment({first, second}, generate_uuid()));
+    for (const auto& [key, address] :
+         {std::pair{"range-a", first.base}, {"range-b", second.base}}) {
+        auto result = service.GetReplicaList(key, TenantId::Default());
+        ASSERT_TRUE(result);
+        EXPECT_EQ(result->replicas.front()
+                      .get_memory_descriptor()
+                      .buffer_descriptor.buffer_address_,
+                  address);
+    }
+}
 
 TEST_F(MasterServiceTest, StandbyRestoreSkipsInvalidObjectAndRestoresTheRest) {
     // #3760: one bad descriptor must not cost the whole index.

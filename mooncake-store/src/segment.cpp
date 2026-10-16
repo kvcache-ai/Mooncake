@@ -169,6 +169,9 @@ std::optional<UUID> ScopedAllocatorAccess::GetOwnerClientId(
 ErrorCode ScopedSegmentAccess::MountSegment(
     const Segment& segment, const UUID& client_id,
     std::shared_ptr<ClientLivenessRecord> client_liveness) {
+    if (segment.locality && segment.locality->numa_node < 0) {
+        return ErrorCode::INVALID_PARAMS;
+    }
     const auto indexed_name =
         segment_manager_->segment_id_by_name_.find(segment.name);
     if (indexed_name != segment_manager_->segment_id_by_name_.end()) {
@@ -195,12 +198,20 @@ ErrorCode ScopedSegmentAccess::MountSegment(
         const bool owned = owner != segment_manager_->client_segments_.end() &&
                            std::find(owner->second.begin(), owner->second.end(),
                                      segment.id) != owner->second.end();
-        const auto& mounted = existing->second.segment;
+        auto& mounted = existing->second.segment;
         if (!owned || mounted.name != segment.name ||
             mounted.base != segment.base || mounted.size != segment.size ||
             mounted.te_endpoint != segment.te_endpoint ||
-            mounted.protocol != segment.protocol) {
+            mounted.protocol != segment.protocol ||
+            (mounted.locality && segment.locality &&
+             *mounted.locality != *segment.locality)) {
             return ErrorCode::INVALID_PARAMS;
+        }
+        if (!mounted.locality && segment.locality) {
+            mounted.locality = segment.locality;
+            if (existing->second.buf_allocator) {
+                existing->second.buf_allocator->SetLocality(segment.locality);
+            }
         }
         return ErrorCode::SEGMENT_ALREADY_EXISTS;
     }
@@ -258,6 +269,7 @@ ErrorCode ScopedSegmentAccess::MountSegment(
         return created.error();
     }
     auto allocator = std::move(*created);
+    allocator->SetLocality(segment.locality);
 
     allocator->AttachUsageTracker(segment_manager_->usage_tracker_);
     auto registration = segment_manager_->allocator_manager_.addAllocator(
@@ -360,7 +372,9 @@ ErrorCode ScopedSegmentAccess::ValidateRemountSegment(
         authoritative.size != segment.size ||
         authoritative.te_endpoint != segment.te_endpoint ||
         authoritative.protocol != segment.protocol ||
-        authoritative.host_id != segment.host_id) {
+        authoritative.host_id != segment.host_id ||
+        (authoritative.locality && segment.locality &&
+         *authoritative.locality != *segment.locality)) {
         return ErrorCode::INVALID_PARAMS;
     }
     return ErrorCode::OK;
@@ -393,6 +407,10 @@ bool ScopedSegmentAccess::ReplaceAllocators(
         manager_replacements.push_back({mounted->second.segment.name,
                                         replacement.expected,
                                         replacement.replacement});
+        if (replacement.expected != replacement.replacement) {
+            replacement.replacement->SetLocality(
+                mounted->second.segment.locality);
+        }
     }
     if (!segment_manager_->allocator_manager_.replaceAllocators(
             manager_replacements)) {

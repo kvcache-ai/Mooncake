@@ -487,14 +487,15 @@ inline tl::expected<void, ErrorCode> gather_maybe_device_to_host(
 // replica_selection.h (included above) so they can be unit-tested directly.
 using mooncake::SelectBestReplica;
 
-// Build a QueryResult containing only the chosen replica so that
-// Client::Get / Client::BatchGet (which internally call
-// FindFirstCompleteReplica) cannot pick a different replica type.
+// Preserve the selected medium and lease. Affinity-enabled memory reads retain
+// their candidates until the actual destination of each read is known.
 inline QueryResult FilterQueryResult(const QueryResult &qr,
                                      const Replica::Descriptor &replica,
                                      bool include_object_checksum = true) {
     return QueryResult(
-        {replica}, qr.lease_timeout,
+        RetainMemoryReadCandidates(qr.replicas, replica,
+                                   StoreHcaAffinityEnabled()),
+        qr.lease_timeout,
         include_object_checksum ? qr.object_checksum : std::nullopt,
         qr.resolved_tenant_id);
 }
@@ -1247,12 +1248,14 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         }
 #endif
 
-        // For RDMA, auto-discover NUMA nodes with NICs and distribute
-        // global_segment across them for full NIC utilization.
+        // Each Master allocation target must have homogeneous NUMA locality.
+        // Keep the logical segment name and transport endpoint shared.
+        const bool hca_affinity = StoreHcaAffinityEnabled();
         std::vector<int> seg_numa_nodes;
         if (protocol == "rdma") {
             seg_numa_nodes = client_->GetNicNumaNodes();
-            if (seg_numa_nodes.size() > 1) {
+            if (seg_numa_nodes.size() > 1 ||
+                (hca_affinity && !seg_numa_nodes.empty())) {
                 std::string nodes_str;
                 for (size_t i = 0; i < seg_numa_nodes.size(); ++i) {
                     if (i) nodes_str += ",";
@@ -1264,6 +1267,16 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                 seg_numa_nodes.clear();
             }
         }
+
+        if (hca_affinity && !seg_numa_nodes.empty()) {
+            const auto numa_limit = align_up(
+                DivideRoundUp(global_segment_size, seg_numa_nodes.size()),
+                alignment);
+            if (!split_limit || numa_limit < *split_limit) {
+                split_limit = numa_limit;
+            }
+        }
+        size_t next_numa_node = 0;
 
         const bool parallel_hugetlb_population =
             protocol == "rdma" && use_hugepage_;
@@ -1285,6 +1298,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             std::unique_ptr<NvlinkHostNumaAllocation> egm_owner;
             std::string seg_location = kWildcardLocation;
             bool use_mmap_segment = !seg_numa_nodes.empty() || use_hugepage_;
+            std::vector<int> segment_numa_nodes;
 
             if (egm_config.enabled) {
                 auto status = NvlinkHostNumaAllocation::Create(
@@ -1307,14 +1321,23 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                 mapped_size = egm_owner->length();
             } else if (!seg_numa_nodes.empty()) {
                 // NUMA-segmented allocation: contiguous VMA, per-region binding
+                segment_numa_nodes =
+                    hca_affinity
+                        ? std::vector<
+                              int>{seg_numa_nodes[next_numa_node++ %
+                                                  seg_numa_nodes.size()]}
+                        : seg_numa_nodes;
                 size_t page_sz = use_hugepage_
                                      ? get_hugepage_size_from_env()
                                      : static_cast<size_t>(getpagesize());
                 mapped_size =
-                    align_up(segment_size, page_sz * seg_numa_nodes.size());
-                ptr = allocate_buffer_numa_segments(mapped_size, seg_numa_nodes,
-                                                    page_sz);
-                seg_location = buildSegmentsLocation(page_sz, seg_numa_nodes);
+                    align_up(segment_size, page_sz * segment_numa_nodes.size());
+                ptr = allocate_buffer_numa_segments(
+                    mapped_size, segment_numa_nodes, page_sz);
+                seg_location =
+                    hca_affinity
+                        ? "cpu:" + std::to_string(segment_numa_nodes[0])
+                        : buildSegmentsLocation(page_sz, segment_numa_nodes);
 #ifdef USE_ASCEND_DIRECT
             } else if (protocol == "ascend" || protocol == "ubshmem") {
                 ptr = AllocateAscendStoreSegment(
@@ -1408,7 +1431,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             if (parallel_hugetlb_population) {
                 if (!seg_numa_nodes.empty()) {
                     populate_hugetlb_numa_mapping(ptr, mapped_size,
-                                                  seg_numa_nodes);
+                                                  segment_numa_nodes);
                 } else if (!is_mmap_arena_allocation(ptr)) {
                     populate_hugetlb_mapping(ptr, mapped_size);
                 }
@@ -3825,9 +3848,8 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
         return buffer_handle;
     }
 
-    // MEMORY / DISK / DFS: use client_->Get. FilterQueryResult ensures
-    // Client::Get internal FindFirstCompleteReplica can only see
-    // the replica we selected, preventing accidental LOCAL_DISK picks.
+    // MEMORY / DISK / DFS: use client_->Get. FilterQueryResult preserves the
+    // selected medium while allowing memory affinity to follow the destination.
     auto runtime_accelerator =
         device::GetAcceleratorRegistry().RuntimeAccelerators();
     if ((replica.is_disk_replica() || replica.is_dfs_replica()) &&
@@ -4930,6 +4952,7 @@ RealClient::get_into_ranges_internal(
         return results;
     }
 
+    auto select_replica = client_->MakeReadReplicaSelector();
     const size_t buffer_count = buffers.size();
     if (buffer_count != all_keys.size() ||
         buffer_count != all_dst_offsets.size() ||
@@ -5086,7 +5109,7 @@ RealClient::get_into_ranges_internal(
                 if (inserted)
                     lease_it->second.expires_at =
                         metadata.query_result.lease_timeout;
-                memory_transfers.push_back(TransferEngine::ScatterTransferRange{
+                auto transfer = TransferEngine::ScatterTransferRange{
                     .opcode = TransferRequest::READ,
                     .remote_segment = handle.transport_endpoint_,
                     .remote_base_offset = handle.buffer_address_,
@@ -5112,7 +5135,49 @@ RealClient::get_into_ranges_internal(
                                             : scatter_transfer_error(status));
                             (*results)[k] = tl::unexpected(error);
                         },
-                });
+                };
+                auto candidates = FilterQueryResult(metadata.query_result,
+                                                    metadata.replica, false);
+                if (candidates.replicas.size() == 1) {
+                    memory_transfers.push_back(std::move(transfer));
+                    continue;
+                }
+                Replica::Descriptor selected;
+                for (size_t k = 0; k < sizes.size(); ++k) {
+                    if (dst_offsets[k] > capacities[i] ||
+                        sizes[k] > capacities[i] - dst_offsets[k])
+                        continue;
+                    const Slice destination{
+                        static_cast<char *>(buffers[i]) + dst_offsets[k],
+                        sizes[k]};
+                    if (select_replica(candidates.replicas,
+                                       std::span<const Slice>(&destination, 1),
+                                       selected) != ErrorCode::OK ||
+                        !selected.is_memory_replica()) {
+                        range_results[k] =
+                            tl::unexpected(ErrorCode::INVALID_REPLICA);
+                        continue;
+                    }
+                    const auto &selected_handle =
+                        selected.get_memory_descriptor().buffer_descriptor;
+                    auto fragment = transfer;
+                    fragment.remote_segment =
+                        selected_handle.transport_endpoint_;
+                    fragment.remote_base_offset =
+                        selected_handle.buffer_address_;
+                    fragment.remote_size = selected_handle.size_;
+                    fragment.local_offsets =
+                        transfer.local_offsets.subspan(k, 1);
+                    fragment.remote_offsets =
+                        transfer.remote_offsets.subspan(k, 1);
+                    fragment.lengths = transfer.lengths.subspan(k, 1);
+                    fragment.on_fragment_complete =
+                        [complete = transfer.on_fragment_complete, k](
+                            size_t, const Status &status) {
+                            complete(k, status);
+                        };
+                    memory_transfers.push_back(std::move(fragment));
+                }
                 continue;
             }
 
@@ -6924,7 +6989,9 @@ RealClient::prepare_session_range_read_requests(
                 static_cast<int>(toInt(ErrorCode::LEASE_EXPIRED));
             continue;
         }
-        if (session->second.replicas.size() != 1) {
+        if (session->second.replicas.empty() ||
+            (!StoreHcaAffinityEnabled() &&
+             session->second.replicas.size() != 1)) {
             results[request_index] =
                 static_cast<int>(toInt(ErrorCode::INVALID_REPLICA));
             continue;
@@ -7007,9 +7074,11 @@ void RealClient::execute_session_memory_range_reads(
     std::vector<Replica::Descriptor> replicas;
     std::vector<std::vector<Slice>> destination_slices;
     std::vector<std::vector<uint64_t>> source_offsets;
+    std::vector<const QueryResult *> query_results;
     replicas.reserve(requests.size());
     destination_slices.reserve(requests.size());
     source_offsets.reserve(requests.size());
+    query_results.reserve(requests.size());
     for (const auto &request : requests) {
         std::vector<Slice> request_slices;
         std::vector<uint64_t> request_offsets;
@@ -7024,12 +7093,14 @@ void RealClient::execute_session_memory_range_reads(
                 static_cast<uint64_t>(request.source_offsets[range_index]));
         }
         replicas.push_back(request.selected_replica);
+        query_results.push_back(&request.cached_query_result);
         destination_slices.push_back(std::move(request_slices));
         source_offsets.push_back(std::move(request_offsets));
     }
 
     auto transfer_results = client_->BatchTransferReadRanges(
-        replicas, destination_slices, source_offsets);
+        replicas, destination_slices, source_offsets,
+        TransferIntent::kUnspecified, query_results);
     if (!SessionBackendResultCountMatches(
             "Session memory range", requests.size(), transfer_results.size())) {
         for (const auto &request : requests) {
@@ -7490,12 +7561,8 @@ std::vector<int> RealClient::batch_put_session_start(
         return std::vector<int>(
             keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
     }
-    if (config.group_ids.has_value() &&
-        config.group_ids->size() != keys.size()) {
-        LOG(ERROR) << "batch_put_session_start: group_ids.size()="
-                   << config.group_ids->size()
-                   << ", keys.size()=" << keys.size()
-                   << ", error=invalid_group_ids";
+    if (!config.HasValidKeyHints(keys.size())) {
+        LOG(ERROR) << "batch_put_session_start: invalid per-key hint count";
         return std::vector<int>(
             keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
     }
@@ -7531,15 +7598,7 @@ std::vector<int> RealClient::batch_put_session_start(
         return results;
     }
 
-    ReplicateConfig start_config = config;
-    if (start_config.group_ids.has_value()) {
-        std::vector<std::string> filtered_group_ids;
-        filtered_group_ids.reserve(start_indices.size());
-        for (size_t idx : start_indices) {
-            filtered_group_ids.push_back(start_config.group_ids->at(idx));
-        }
-        start_config.group_ids = std::move(filtered_group_ids);
-    }
+    ReplicateConfig start_config = config.ForKeySubset(start_indices);
 
     auto start_responses =
         client_->StartBatchPutForSizes(start_keys, start_sizes, start_config);

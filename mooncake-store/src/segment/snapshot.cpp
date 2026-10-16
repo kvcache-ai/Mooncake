@@ -90,6 +90,7 @@ tl::expected<void, ErrorCode> SegmentPool::RestoreSnapshot(
         auto allocator =
             OffsetBufferAllocator::Restore(std::move(region.allocator));
         if (!allocator) return tl::make_unexpected(allocator.error());
+        (*allocator)->SetLocality(region.mounted.segment.locality);
         auto txn = access.PrepareAdopt(region.mounted, std::move(*allocator),
                                        account_capacity_metrics,
                                        WriteAccess::AdoptMode::ReplacePool);

@@ -1029,7 +1029,14 @@ TEST_F(RealClientTest, RangedSnapshotPreservesPayloadAcrossSameSizeUpsert) {
     ASSERT_EQ(queries.size(), 1);
     ASSERT_TRUE(queries[0].has_value());
     PyClient::QueryResultCache snapshot;
-    snapshot.emplace(key, std::move(queries[0]));
+    // Two candidates exercise fragment splitting when affinity is enabled.
+    auto replicas = queries[0]->replicas;
+    auto alias = replicas.front();
+    ++alias.id;
+    replicas.push_back(std::move(alias));
+    snapshot.emplace(key,
+                     QueryResult(std::move(replicas), queries[0]->lease_timeout,
+                                 queries[0]->object_checksum));
     auto destination = py_client_->allocate_client_buffer(original.size());
     ASSERT_TRUE(destination.has_value());
     auto read = [&](size_t offset, size_t size) {
@@ -1042,8 +1049,10 @@ TEST_F(RealClientTest, RangedSnapshotPreservesPayloadAcrossSameSizeUpsert) {
     EXPECT_EQ(read(0, 4),
               (std::vector<std::vector<std::vector<int64_t>>>{{{4}}}));
     ASSERT_EQ(py_client_->upsert(key, std::span<const char>(replacement)), 0);
-    EXPECT_EQ(read(4, 28),
-              (std::vector<std::vector<std::vector<int64_t>>>{{{28}}}));
+    EXPECT_EQ(py_client_->get_into_ranges_from_snapshot(
+                  {destination->ptr()}, {{key}}, {{{4, 12}}}, {{{4, 12}}},
+                  {{{8, 20}}}, snapshot),
+              (std::vector<std::vector<std::vector<int64_t>>>{{{8, 20}}}));
     EXPECT_EQ(std::string(static_cast<char*>(destination->ptr()), 32),
               original);
     auto current = py_client_->get_buffer(key);

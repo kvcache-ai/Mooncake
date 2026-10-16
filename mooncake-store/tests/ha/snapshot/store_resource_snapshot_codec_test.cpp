@@ -139,6 +139,28 @@ std::vector<uint8_t> ReplaceSnapshotAllocatorType(
 
 }  // namespace
 
+TEST(StoreResourceSnapshotCodecTest, PreservesHcaLocalityAfterRestore) {
+    SegmentPool source(Drivers());
+    auto segment = MakeSegment(0, "hca-local", "rdma");
+    segment.locality = SegmentLocality{7, {"mlx5_0", "mlx5_2"}};
+    const auto client = generate_uuid();
+    ASSERT_EQ(source.AcquireWriteAccess().MountSegment(segment, client),
+              ErrorCode::OK);
+    auto encoded = CaptureAndEncode(source, {});
+    ASSERT_TRUE(encoded);
+    auto decoded = StoreResourceSnapshotCodec::Decode(*encoded);
+    ASSERT_TRUE(decoded);
+    ASSERT_EQ(decoded->segment_pool.regions.size(), 1);
+    EXPECT_EQ(decoded->segment_pool.regions[0].mounted.segment.locality,
+              segment.locality);
+    SegmentPool restored(Drivers());
+    ASSERT_TRUE(
+        restored.RestoreSnapshot(std::move(decoded->segment_pool), false));
+    auto allocator = restored.AcquireReadAccess().GetAllocator(segment.id);
+    ASSERT_TRUE(allocator);
+    EXPECT_EQ(allocator->GetLocality(), segment.locality);
+}
+
 TEST(StoreResourceSnapshotCodecTest,
      CapturedSnapshotOutlivesPoolAndPreservesOriginalLayout) {
     auto& metrics = MasterMetricManager::instance();

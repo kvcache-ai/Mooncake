@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -451,6 +452,32 @@ const static uint64_t kMinSliceSize = facebook::cachelib::Slab::kMinAllocSize;
 const static uint64_t kMaxSliceSize =
     facebook::cachelib::Slab::kSize - 16;  // should be lower than limit
 
+// The entire allocation range belongs to this NUMA node. hca_names contains
+// only RDMA devices local to that node, as discovered on the storage host.
+struct SegmentLocality {
+    int32_t numa_node{-1};
+    std::vector<std::string> hca_names;
+
+    bool operator==(const SegmentLocality&) const = default;
+};
+YLT_REFL(SegmentLocality, numa_node, hca_names);
+
+// Match HCA names on the receiver; unknown locality precedes a known mismatch.
+inline int HcaAffinityTier(const std::optional<SegmentLocality>& locality,
+                           const std::vector<std::string>& hcas) {
+    if (hcas.empty()) return 0;
+    if (!locality || locality->numa_node < 0 || locality->hca_names.empty())
+        return 1;
+    return std::all_of(hcas.begin(), hcas.end(),
+                       [&](const auto& hca) {
+                           return std::find(locality->hca_names.begin(),
+                                            locality->hca_names.end(),
+                                            hca) != locality->hca_names.end();
+                       })
+               ? 0
+               : 2;
+}
+
 /**
  * @brief Represents a contiguous memory region
  */
@@ -463,10 +490,12 @@ struct Segment {
     std::string te_endpoint{};
     std::string protocol;
     std::string host_id{};
+    struct_pack::compatible<SegmentLocality, 1> locality;
     Segment() = default;
     bool operator==(const Segment&) const = default;
 };
-YLT_REFL(Segment, id, name, base, size, te_endpoint, protocol, host_id);
+YLT_REFL(Segment, id, name, base, size, te_endpoint, protocol, host_id,
+         locality);
 
 /**
  * @brief Allocation strategy type for segment allocation
