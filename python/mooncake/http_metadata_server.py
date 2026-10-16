@@ -8,6 +8,7 @@ used by Mooncake. It can be used as an alternative to etcd for metadata storage.
 
 import argparse
 import asyncio
+import json
 import logging
 import signal
 import sys
@@ -16,6 +17,18 @@ from enum import Enum
 from time import sleep
 
 from aiohttp import web
+
+
+def _same_rpc_endpoint(old: bytes, new: bytes) -> bool:
+    """True if two rpc_meta payloads name the same host and port."""
+    try:
+        a, b = json.loads(old), json.loads(new)
+    except ValueError:
+        return False
+    if not isinstance(a, dict) or not isinstance(b, dict):
+        return False
+    keys = ("ip_or_host_name", "rpc_port")
+    return all(k in a and k in b and a[k] == b[k] for k in keys)
 
 
 class KVPoll(Enum):
@@ -100,6 +113,15 @@ class KVBootstrapServer:
                 if self.store[key] == data:
                     return web.Response(
                         text="metadata unchanged",
+                        status=200,
+                        content_type="application/json",
+                    )
+                # A republish carries a fresh metadata_version, so accept it
+                # when the endpoint (host and port) is unchanged.
+                if _same_rpc_endpoint(self.store[key], data):
+                    self.store[key] = data
+                    return web.Response(
+                        text="metadata updated",
                         status=200,
                         content_type="application/json",
                     )
