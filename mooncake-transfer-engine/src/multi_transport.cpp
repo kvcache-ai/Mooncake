@@ -131,12 +131,15 @@ Status MultiTransport::freeBatchID(BatchID batch_id,
             "BatchID is invalid because cleanup has already been deferred");
     }
 
-    Status status = tryFreeBatchID(batch_id, before_delete);
+    bool tasks_in_flight = false;
+    Status status = tryFreeBatchID(batch_id, before_delete, &tasks_in_flight);
     if (!status.IsBatchBusy()) {
         return status;
     }
 
-    deferred_cleanup_batches_.emplace(batch_id, before_delete);
+    deferred_cleanup_batches_.emplace(
+        batch_id, DeferredCleanup{before_delete,
+                                  std::chrono::steady_clock::now(), false});
     if (!deferred_cleanup_thread_.joinable()) {
         // Start the cleanup worker lazily after taking ownership of a busy
         // batch. BatchCleanupDeferred tells callers that in-flight transport
@@ -145,14 +148,27 @@ Status MultiTransport::freeBatchID(BatchID batch_id,
             std::thread(&MultiTransport::deferredCleanupLoop, this);
     }
     deferred_cleanup_cv_.notify_one();
-    LOG(WARNING) << "Batch " << batch_id
-                 << " is still busy; cleanup has been deferred";
+    if (tasks_in_flight) {
+        // The caller released a batch whose transfers have not finished
+        // (e.g. after a timeout): worth surfacing.
+        LOG(WARNING) << "Batch " << batch_id
+                     << " is still busy; cleanup has been deferred";
+    } else {
+        // Every task is terminal and a completion callback is still
+        // unwinding (#4569). This is a routine race on fast completions and
+        // clears on the next cleanup pass.
+        VLOG(1) << "Batch " << batch_id
+                << " finished but its completion callback is still running; "
+                   "cleanup has been deferred";
+    }
     return Status::BatchCleanupDeferred(
         "BatchID is invalid because cleanup has been deferred");
 }
 
 Status MultiTransport::tryFreeBatchID(
-    BatchID batch_id, const std::function<void()>& before_delete) {
+    BatchID batch_id, const std::function<void()>& before_delete,
+    bool* tasks_in_flight) {
+    if (tasks_in_flight) *tasks_in_flight = false;
     auto& batch_desc = *((BatchDesc*)(batch_id));
     const size_t task_count = batch_desc.task_list.size();
     for (size_t task_id = 0; task_id < task_count; task_id++) {
@@ -176,6 +192,7 @@ Status MultiTransport::tryFreeBatchID(
         // counter reaches zero below.
         if (status.s != Transport::TransferStatusEnum::COMPLETED &&
             status.s != Transport::TransferStatusEnum::FAILED) {
+            if (tasks_in_flight) *tasks_in_flight = true;
             return Status::BatchBusy(
                 "BatchID cannot be freed until all tasks are done");
         }
@@ -215,9 +232,20 @@ void MultiTransport::deferredCleanupLoop() {
             continue;
         }
 
+        const auto now = std::chrono::steady_clock::now();
+        // Batches that crossed the stuck threshold in this pass. Reported as
+        // one summary line, so a dead peer that strands thousands of batches
+        // at once does not log one warning per batch.
+        size_t newly_stuck_in_flight = 0;
+        size_t newly_stuck_callbacks = 0;
+        BatchID longest_id = 0;
+        auto longest_wait = std::chrono::steady_clock::duration::zero();
         for (auto it = deferred_cleanup_batches_.begin();
              it != deferred_cleanup_batches_.end();) {
-            Status status = tryFreeBatchID(it->first, it->second);
+            auto& entry = it->second;
+            bool tasks_in_flight = false;
+            Status status = tryFreeBatchID(it->first, entry.before_delete,
+                                           &tasks_in_flight);
             if (status.ok()) {
                 it = deferred_cleanup_batches_.erase(it);
             } else if (!status.IsBatchBusy()) {
@@ -227,8 +255,36 @@ void MultiTransport::deferredCleanupLoop() {
                            << it->first << ": " << status.ToString();
                 it = deferred_cleanup_batches_.erase(it);
             } else {
+                const auto waited = now - entry.deferred_at;
+                if (!entry.stuck_reported &&
+                    waited >= deferred_cleanup_stuck_after_) {
+                    entry.stuck_reported = true;
+                    ++deferred_cleanup_stuck_reports_;
+                    ++(tasks_in_flight ? newly_stuck_in_flight
+                                       : newly_stuck_callbacks);
+                    if (waited > longest_wait) {
+                        longest_wait = waited;
+                        longest_id = it->first;
+                    }
+                }
                 ++it;
             }
+        }
+        if (newly_stuck_in_flight + newly_stuck_callbacks != 0) {
+            ++deferred_cleanup_stuck_summaries_;
+            LOG(WARNING)
+                << newly_stuck_in_flight + newly_stuck_callbacks
+                << " deferred batch(es) still busy after "
+                << deferred_cleanup_stuck_after_.count() << " ms ("
+                << newly_stuck_in_flight << " with a task that has not "
+                << "finished, " << newly_stuck_callbacks
+                << " with a completion callback that has not returned); "
+                   "longest of these is batch "
+                << longest_id << " at "
+                << std::chrono::duration_cast<std::chrono::milliseconds>(
+                       longest_wait)
+                       .count()
+                << " ms. Their memory stays allocated until they are freed";
         }
 
         if (stop_deferred_cleanup_) {
