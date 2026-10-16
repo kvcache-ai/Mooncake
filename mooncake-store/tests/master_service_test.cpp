@@ -26,7 +26,7 @@
 
 #include <unistd.h>
 
-#include "tenant_quota_policy_store.h"
+#include "tenant/quota_policy_store.h"
 #include "types.h"
 #include "master_service_test_fixture.h"
 
@@ -2675,7 +2675,7 @@ TEST_F(MasterServiceTest, BatchProbeKeyReportsPointInTimeExistence) {
 
     const std::string missing_key = "probe_batch_missing_key";
     auto results = service_->BatchProbeKey(
-        {existing_key, missing_key, existing_key}, TenantId::Default());
+        {}, {existing_key, missing_key, existing_key}, TenantId::Default());
     ASSERT_EQ(3u, results.size());
     ASSERT_TRUE(results[0].has_value());
     EXPECT_TRUE(*results[0]);

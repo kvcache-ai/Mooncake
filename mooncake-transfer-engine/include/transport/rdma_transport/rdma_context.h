@@ -114,6 +114,10 @@ struct DmabufExport {
     Method method = Method::kHostReg;
     int fd = -1;          // live dma_buf fd; -1 when not applicable
     uint64_t offset = 0;  // offset of addr within the exported allocation
+    // sysfs PCI root of the GPU owning the memory ("pci0009:00"); empty when
+    // unknown. Data Direct registration is only possible on NICs whose Data
+    // Direct function sits under the same root.
+    std::string pci_root;
 };
 
 // RdmaContext represents the set of resources controlled by each local NIC,
@@ -176,6 +180,12 @@ class RdmaContext {
     int registerMemoryRegionInternal(void *addr, size_t length, int access,
                                      const DmabufExport &exp,
                                      MemoryRegionMeta &mrMeta);
+
+    // True when this NIC can register the exported GPU memory through Data
+    // Direct: its Data Direct function and the GPU share a PCI root, or the
+    // pairing is unknown (no sysfs path from libmlx5, no GPU root recorded).
+    // Logs the first mismatch per NIC.
+    bool dataDirectPairedWith(const DmabufExport &exp);
 
     using MemoryRegionMap = std::map<uintptr_t, MemoryRegionMeta>;
 
@@ -337,6 +347,11 @@ class RdmaContext {
 
     ibv_context *context_ = nullptr;
     ibv_pd *pd_ = nullptr;
+    // PCI root of this NIC's Data Direct function, resolved once on first
+    // Data Direct registration; empty when the NIC has none.
+    std::once_flag data_direct_root_once_;
+    std::string data_direct_root_;
+    std::atomic<bool> data_direct_mismatch_logged_{false};
     uint64_t max_mr_size;
     int event_fd_ = -1;
 
