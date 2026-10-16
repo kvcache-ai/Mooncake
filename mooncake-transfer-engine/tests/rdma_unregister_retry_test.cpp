@@ -29,6 +29,7 @@
 
 #include "error.h"
 #include "rdma_test_peers.h"
+#include "transfer_engine_impl.h"
 #include "transfer_metadata.h"
 #include "transport/rdma_transport/rdma_context.h"
 #include "transport/rdma_transport/rdma_transport.h"
@@ -42,7 +43,7 @@ using namespace mooncake;
 int g_fake_dereg_failures_remaining = 0;
 int g_fake_dereg_calls = 0;
 
-extern "C" int ibv_dereg_mr(ibv_mr *) {
+extern "C" int ibv_dereg_mr(ibv_mr*) {
     ++g_fake_dereg_calls;
     if (g_fake_dereg_failures_remaining > 0) {
         --g_fake_dereg_failures_remaining;
@@ -50,6 +51,28 @@ extern "C" int ibv_dereg_mr(ibv_mr *) {
     }
     return 0;
 }
+
+// The friend declarations name mooncake::TransferEngineImplTestPeer, so this
+// peer must be defined in namespace mooncake BEFORE its first use below
+// (mirrors the peer in transport_uint_test.cpp).
+namespace mooncake {
+class TransferEngineImplTestPeer {
+   public:
+    static void replaceTransports(TransferEngineImpl& engine,
+                                  std::shared_ptr<Transport> transport) {
+        engine.multi_transports_->transport_map_.clear();
+        engine.multi_transports_->transport_map_.emplace("rdma",
+                                                         std::move(transport));
+    }
+
+    static void seedLocalMemoryRegion(TransferEngineImpl& engine, void* addr,
+                                      uint64_t length) {
+        std::unique_lock<std::shared_mutex> lock(engine.mutex_);
+        engine.insertMemoryRegionLocked(
+            TransferEngineImpl::MemoryRegion{addr, length, "cpu", true});
+    }
+};
+}  // namespace mooncake
 
 namespace {
 
@@ -108,7 +131,7 @@ class RdmaUnregisterRetryTest : public ::testing::Test {
     }
 
     static constexpr size_t kLength = 64 * 1024;
-    void *buffer_ = MAP_FAILED;
+    void* buffer_ = MAP_FAILED;
     std::shared_ptr<TransferMetadata> metadata_;
     std::unique_ptr<RdmaTransport> transport_;
     std::shared_ptr<RdmaContext> context_;
@@ -128,10 +151,10 @@ TEST_F(RdmaUnregisterRetryTest, RetryReachesLiveMrBehindMissingMetadata) {
         << "failed deregistration must keep the MR so a retry can find it";
     EXPECT_EQ(g_fake_dereg_calls, 1);
 
-    // Retry: the metadata entry is already gone, but the cleanup must still
-    // reach the live MR. NOT_REGISTERED is now truthful: nothing remains.
-    EXPECT_EQ(transport_->unregisterLocalMemory(buffer_, false),
-              ERR_ADDRESS_NOT_REGISTERED);
+    // Retry: the metadata entry is already gone, but the pending record lets
+    // the cleanup reach the live MR. Confirmed cleanup reports success so the
+    // engine erases its region record and the range can be registered again.
+    EXPECT_EQ(transport_->unregisterLocalMemory(buffer_, false), 0);
     EXPECT_FALSE(RdmaContextTestPeer::hasMemoryRegion(*context_, buffer_));
     EXPECT_EQ(g_fake_dereg_calls, 2);
 
@@ -141,8 +164,8 @@ TEST_F(RdmaUnregisterRetryTest, RetryReachesLiveMrBehindMissingMetadata) {
     EXPECT_EQ(g_fake_dereg_calls, 2);
 }
 
-// While an MR survives, the retry must keep failing: NOT_REGISTERED may only
-// be reported once the per-context deregistration has actually succeeded.
+// While an MR survives, the retry must keep failing: success may only be
+// reported once the per-context deregistration has actually succeeded.
 TEST_F(RdmaUnregisterRetryTest, RetryKeepsFailingWhileMrSurvives) {
     addMetadataEntry();
 
@@ -153,10 +176,60 @@ TEST_F(RdmaUnregisterRetryTest, RetryKeepsFailingWhileMrSurvives) {
     EXPECT_EQ(transport_->unregisterLocalMemory(buffer_, false), ERR_CONTEXT);
     EXPECT_TRUE(RdmaContextTestPeer::hasMemoryRegion(*context_, buffer_));
 
-    EXPECT_EQ(transport_->unregisterLocalMemory(buffer_, false),
-              ERR_ADDRESS_NOT_REGISTERED);
+    EXPECT_EQ(transport_->unregisterLocalMemory(buffer_, false), 0);
     EXPECT_FALSE(RdmaContextTestPeer::hasMemoryRegion(*context_, buffer_));
     EXPECT_EQ(g_fake_dereg_calls, 3);
+}
+
+// An address that was never a registration base (e.g. an interior pointer)
+// has no metadata entry either, but the fall-through must not touch MRs: a
+// containing-range lookup would deregister the live base registration while
+// its metadata keeps advertising the range.
+TEST_F(RdmaUnregisterRetryTest,
+       InteriorAddressUnregisterLeavesRegistrationIntact) {
+    addMetadataEntry();
+
+    EXPECT_EQ(transport_->unregisterLocalMemory(
+                  static_cast<char*>(buffer_) + 4096, false),
+              ERR_ADDRESS_NOT_REGISTERED);
+    EXPECT_EQ(g_fake_dereg_calls, 0)
+        << "an interior address must not reach the MR deregistration";
+    EXPECT_TRUE(RdmaContextTestPeer::hasMemoryRegion(*context_, buffer_));
+
+    // The original registration is fully intact: unregistering the base still
+    // deregisters exactly once and succeeds.
+    EXPECT_EQ(transport_->unregisterLocalMemory(buffer_, false), 0);
+    EXPECT_EQ(g_fake_dereg_calls, 1);
+    EXPECT_FALSE(RdmaContextTestPeer::hasMemoryRegion(*context_, buffer_));
+}
+
+// End to end through the TransferEngine API: a failed deregistration keeps
+// the engine's region record (re-registration reports OVERLAPPED), and the
+// confirmed-cleanup retry must reconcile that record so the same range can
+// be registered again.
+TEST_F(RdmaUnregisterRetryTest, RetryThenReregisterThroughEngineApi) {
+    addMetadataEntry();
+    TransferEngineImpl engine;
+    // init() creates multi_transports_; replaceTransports below derefs it.
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:17945"), 0);
+    TransferEngineImplTestPeer::replaceTransports(engine,
+                                                  std::move(transport_));
+    TransferEngineImplTestPeer::seedLocalMemoryRegion(engine, buffer_, kLength);
+
+    // First attempt fails at ibv_dereg_mr: the engine keeps its record, so
+    // re-registering the same range is rejected as overlapped.
+    g_fake_dereg_failures_remaining = 1;
+    EXPECT_EQ(engine.unregisterLocalMemory(buffer_, false), ERR_CONTEXT);
+    EXPECT_EQ(engine.registerLocalMemory(buffer_, kLength, "cpu", true, false),
+              ERR_ADDRESS_OVERLAPPED);
+
+    // Retry: the pending cleanup finishes, the transport reports success, and
+    // the engine erases its record — registration is no longer blocked. (The
+    // register itself may still fail without RDMA hardware; only the absence
+    // of OVERLAPPED is asserted.)
+    EXPECT_EQ(engine.unregisterLocalMemory(buffer_, false), 0);
+    EXPECT_NE(engine.registerLocalMemory(buffer_, kLength, "cpu", true, false),
+              ERR_ADDRESS_OVERLAPPED);
 }
 
 }  // namespace

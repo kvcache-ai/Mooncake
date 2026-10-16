@@ -115,11 +115,11 @@ The formula is shared; every input to it is chosen per layer.
 |---|---|---|
 | Evaluated | once per queued owner, in `pickForDispatch`, before the request reaches any worker | once per slice per slot, in `orderByDeadline`, just before `submitSlices` |
 | `length` | the whole request | one slice |
-| `bandwidth` | sum of the transmit estimates of all available RNICs (`getEstimatedBandwidth`) | the transmit estimate of the NIC these slices will post on |
+| `bandwidth` | the transmit estimate of the transport that will carry the owner: RDMA's `getEstimatedBandwidth()` (sum over its RNICs) or UB's own estimate | the transmit estimate of the NIC these slices will post on |
 | `bytes_ahead` on entry | `dispatching_bytes_`: every eligible owner dispatched and not yet completed, on any NIC, including slices still in worker queues | `getPostedBytes(dev)`: bytes on this NIC's hardware, not yet completed; nothing from worker queues |
 | `bytes_ahead` during the pass | grows by each owner **dispatched** in this call; a dropped owner adds nothing | grows by each slice **placed** in an earlier slot; every slice is placed eventually |
 | `now` | read once per `pickForDispatch` | read once per `orderByDeadline` |
-| Who is scored | eligible owners only (RDMA route, not staged); others are dispatched without a prediction | every slice in the group; a slice without a deadline scores 0 |
+| Who is scored | eligible owners only (RDMA or UB route, not staged); others are dispatched without a prediction | every slice in the group; a slice without a deadline scores 0 |
 | Threshold | `mlu >= mlu_local_threshold` → cancel | none; scores are only compared with each other |
 | Effect of a high value | the request never runs | the slice posts earlier |
 | Past deadline | infinite → cancelled | infinite → first slot |
@@ -204,8 +204,9 @@ link speed; everything else differs.
    usable interval the estimate keeps its last value, or the link-speed seed
    from `openDevice()`: the optimistic direction, which cannot cause a false
    drop.
-5. **Readers**: the admission drop, as the sum over available devices
-   (`getEstimatedBandwidth()`), and the arbitration, as this NIC's value.
+5. **Readers**: the admission drop, as the estimate of the owner's own transport
+   (RDMA sums its RNICs, UB reports its own), and the arbitration, as this NIC's
+   value.
    Both add the queueing term themselves through `bytes_ahead`, so the rate
    must not contain it, or the wait would be counted twice.
 
@@ -222,7 +223,7 @@ The two series, input by input:
 | Sampled | every successful completion | at most every 10 ms, last completion of a pass |
 | α | 0.01 (follows the latest sample) | 0.9 (~100 ms to converge) |
 | Fed by | `release()` | `maybeSampleTransmit()` |
-| Read by | `DeviceSelector::allocate()` | `getEstimatedBandwidth()` (sum), `orderByDeadline()` (per NIC) |
+| Read by | `DeviceSelector::allocate()` | `getEstimatedBandwidth()` (sum, RDMA) or the UB transport's estimate, `orderByDeadline()` (per NIC) |
 | Question answered | which NIC is the better choice right now | how fast does this NIC move bytes once posted |
 
 Why per-completion timing cannot serve the predictors: up to `max_qp_wr` work
@@ -246,9 +247,9 @@ A submit is queued as a whole or not at all. A submit that contains any
 **staged** owner (one that must be copied through a staging buffer, see the
 proxy path) bypasses the queue entirely; staging-internal submits always
 queue. Each owner records whether it is **degradation eligible**: routed to
-RDMA and not staged. Only eligible owners can be dropped and only their bytes
-count toward `bytes_ahead`, because the bandwidth provider is the RDMA
-transport's and says nothing about a TCP, NVLink or staging transfer.
+RDMA or UB and not staged. Only eligible owners can be dropped and only their
+bytes count toward `bytes_ahead`, because the bandwidth provider belongs to the
+owner's own transport and says nothing about a TCP, NVLink or staging transfer.
 
 `tryAdmit` enforces the capacity limits: `max_outstanding_owners` and
 `max_outstanding_bytes` bound everything admitted and not yet terminal, with
@@ -290,11 +291,15 @@ so nothing beyond the status is delivered (see [Known Limits](#known-limits)).
 
 ### Bandwidth Provider
 
-The provider installed by `TransferEngineImpl` is
-`RdmaTransport::getEstimatedBandwidth()`: the sum over the local RNICs of each
-device's transmit estimate. It is installed only when the RDMA transport is
-present; without it the drop is inactive even if θ_local is set, and a warning
-is logged at startup.
+`TransferEngineImpl` installs a transport-aware provider, so an owner is
+predicted with the rate of the transport that will carry it: for RDMA that is
+`RdmaTransport::getEstimatedBandwidth()`, the sum over the local RNICs of each
+device's transmit estimate; for UB it is the UB transport's own estimate. It is
+installed only when at least one of those transports is present; without either
+the drop is inactive even if θ_local is set, and a warning is logged at startup.
+The provider is resolved at most once per transport in a dispatch pass, and the
+transport is snapshotted with the admission decision, so a later transport
+failover does not re-score an owner that is already queued.
 
 ### Choosing θ_local
 
@@ -434,7 +439,7 @@ where it runs, and what it can and cannot do.
 |---|---|---|---|
 | Question | which NIC | whether and when to dispatch | in what order to post on a NIC |
 | Runs | per slice, in the worker | per submit and per poll, in the engine | per post batch, in the worker |
-| Reads | selection EWMA, NUMA tier, inflight charge | transmit estimate (sum), `dispatching_bytes_` | transmit estimate (this NIC), posted bytes |
+| Reads | selection EWMA, NUMA tier, inflight charge | transmit estimate (owner's transport), `dispatching_bytes_` | transmit estimate (this NIC), posted bytes |
 | Can | choose, split across NICs | reorder, promote, cancel | reorder within a tier |
 | Cannot | see deadlines | choose a NIC | drop or move a slice |
 | Switch | `enable_smart_scheduling` | `enable_runtime_queue` + `deadline_aware` (+ `mlu_local_threshold`) | `deadline_bw_arbitration` |
@@ -559,9 +564,9 @@ because it never ran. See [Metrics](metrics.md) for labels and export.
 ## Where Each Effect Is Observable
 
 Ordering and promotion are engine-level and apply on any transport. The drop
-and the arbitration only ever act on RDMA: the drop requires an RDMA-routed,
-non-staged owner and an installed RDMA bandwidth provider, and the arbitration
-runs in the RDMA workers. On a host with TCP only, `deadline_aware` and
+acts on RDMA- or UB-routed, non-staged owners whenever a bandwidth provider is
+installed for their transport; the arbitration runs only in the RDMA workers, so
+it stays RDMA-only. On a host with TCP only, `deadline_aware` and
 `promotion_slack_ns` change dispatch order, while `mlu_local_threshold` and
 `deadline_bw_arbitration` do nothing. That is by design, not a
 misconfiguration.

@@ -755,12 +755,23 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
     int rc = metadata_->removeLocalMemoryBuffer(addr, update_metadata);
     // A missing metadata entry does NOT prove the MRs are gone: a partial
     // ibv_dereg_mr failure on an earlier attempt leaves live MRs behind it.
-    // Fall through and retry the per-context deregistration (a clean address
-    // no-ops), so ERR_ADDRESS_NOT_REGISTERED means "nothing remains locally".
-    // Local state only: a failed publishSegmentDesc may leave remote metadata
-    // stale (pre-existing gap, tracked separately).
+    // But a missing entry also occurs for an address that was never a
+    // registration base (e.g. an interior pointer): fall through only for a
+    // known pending cleanup, so the containing-range MR lookup cannot
+    // deregister another registration's live MR.
     const bool metadata_missing = (rc == ERR_ADDRESS_NOT_REGISTERED);
-    if (rc && !metadata_missing) return rc;
+    if (metadata_missing) {
+        std::lock_guard<std::mutex> lock(pending_dereg_mutex_);
+        if (!pending_dereg_.contains((uint64_t)addr)) {
+            return ERR_ADDRESS_NOT_REGISTERED;
+        }
+    } else if (rc) {
+        // Local metadata was removed but the publish failed; the MRs stay
+        // live. Record the pending cleanup so a retry can still finish it.
+        std::lock_guard<std::mutex> lock(pending_dereg_mutex_);
+        pending_dereg_.insert((uint64_t)addr);
+        return rc;
+    }
 
     // force_sequential is used by batch operations to avoid nested parallelism
     int use_parallel_unreg = 0;
@@ -771,6 +782,7 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
         }
     }
 
+    int dereg_err = 0;
     if (use_parallel_unreg) {
         std::vector<std::thread> unreg_threads;
         unreg_threads.reserve(context_list_.size());
@@ -786,27 +798,34 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
             thread.join();
         }
 
-        for (size_t i = 0; i < ret_codes.size(); ++i) {
-            if (ret_codes[i] != 0) {
-                LOG(ERROR) << "Failed to unregister memory region with context "
-                           << i;
-                return ret_codes[i];
-            }
+        for (int ret : ret_codes) {
+            if (ret && !dereg_err) dereg_err = ret;
         }
     } else {
         for (size_t i = 0; i < context_list_.size(); ++i) {
             int ret = context_list_[i]->unregisterMemoryRegion(addr);
-            if (ret) {
-                LOG(ERROR) << "Failed to unregister memory region with context "
-                           << i;
-                return ret;
-            }
+            if (ret && !dereg_err) dereg_err = ret;
         }
     }
 
-    // Preserve the "nothing was registered" signal once the MR cleanup above
-    // has confirmed (or completed) that nothing remains.
-    return metadata_missing ? ERR_ADDRESS_NOT_REGISTERED : 0;
+    if (dereg_err) {
+        LOG(ERROR) << "Failed to unregister memory region at " << addr;
+        // The metadata entry is already gone; only the pending record keeps
+        // the MR cleanup reachable from a later retry.
+        if (!metadata_missing) {
+            std::lock_guard<std::mutex> lock(pending_dereg_mutex_);
+            pending_dereg_.insert((uint64_t)addr);
+        }
+        return dereg_err;
+    }
+
+    // Confirmed cleanup: report success so the engine erases its region
+    // record and the same range can be registered again.
+    if (metadata_missing) {
+        std::lock_guard<std::mutex> lock(pending_dereg_mutex_);
+        pending_dereg_.erase((uint64_t)addr);
+    }
+    return 0;
 }
 
 int RdmaTransport::allocateLocalSegmentID() {
