@@ -827,6 +827,13 @@ jobs:
       with:
         components: rustfmt, clippy
 
+    - name: Show Rust toolchain versions
+      run: |
+        rustc --version --verbose
+        cargo --version
+        cargo clippy --version
+        rustfmt --version
+
     - name: Check Store-RS Rust formatting
       run: cargo fmt --all --manifest-path mooncake-store-rs/Cargo.toml -- --check
 
