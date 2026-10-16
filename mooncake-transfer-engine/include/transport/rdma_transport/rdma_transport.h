@@ -32,6 +32,9 @@
 #include "topology.h"
 #include "transfer_metadata.h"
 #include "transport/transport.h"
+#ifdef USE_ASCEND_RDMA
+#include "transport/rdma_transport/ub_segment.h"
+#endif
 
 namespace mooncake {
 
@@ -159,6 +162,9 @@ class RdmaTransport : public Transport {
 
    private:
     std::vector<std::shared_ptr<RdmaContext>> context_list_;
+#ifdef USE_ASCEND_RDMA
+    UbSegment ub_segment_;
+#endif
     std::atomic<bool> notify_running_{false};
     std::thread notify_worker_;
     std::shared_ptr<Topology> local_topology_;
