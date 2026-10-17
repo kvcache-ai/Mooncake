@@ -1156,12 +1156,14 @@ int TransferEnginePy::batchUnregisterMemory(
 int TransferEnginePy::registerMemory(uintptr_t buffer_addr, size_t capacity,
                                      const std::string& location,
                                      bool remote_accessible) {
+    pybind11::gil_scoped_release release;
     char* buffer = reinterpret_cast<char*>(buffer_addr);
     return engine_->registerLocalMemory(buffer, capacity, location,
                                         remote_accessible);
 }
 
 int TransferEnginePy::unregisterMemory(uintptr_t buffer_addr) {
+    pybind11::gil_scoped_release release;
     char* buffer = reinterpret_cast<char*>(buffer_addr);
     return engine_->unregisterLocalMemory(buffer);
 }
