@@ -845,6 +845,29 @@ If the wheel console scripts are installed, the equivalent command is:
 mc_store_rest_server --config /path/to/mooncake_config.json --port 8080
 ```
 
+### Authentication
+
+The service binds `0.0.0.0` and historically shipped without any access control,
+so every endpoint below was open to any host that can reach the port. To require
+a bearer token on every request, pass `--auth-token` or set the
+`MOONCAKE_STORE_REST_AUTH_TOKEN` environment variable:
+
+```bash
+mc_store_rest_server --config /path/to/mooncake_config.json --port 8080 \
+  --auth-token "$(openssl rand -hex 32)"
+```
+
+Requests must then carry the header:
+
+```bash
+curl -H "Authorization: Bearer <token>" http://localhost:8080/api/get/my_key
+```
+
+A request with a missing or invalid token is rejected with `401` and a
+`WWW-Authenticate: Bearer` challenge. When no token is configured the service
+keeps the old open behavior for compatibility and logs a startup warning. Do
+not rely on that on any network you do not fully trust.
+
 ### `/api/mount_shm`
 Mount a named shared memory object as one or more Mooncake store segments.
 Protocols with a registration-size limit split oversized regions and return
