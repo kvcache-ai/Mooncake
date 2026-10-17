@@ -276,10 +276,10 @@ To prevent `io_uring`'s `FOLL_LONGTERM` page pinning from failing on systems wit
 
 | Method | Description |
 |--------|-------------|
-| `read` / `write` | Contiguous read or write, chunked into up to `QUEUE_DEPTH` SQEs per submission |
+| `read` / `write` | Contiguous read or write, chunked into up to `QUEUE_DEPTH` SQEs per submission; an `O_DIRECT` write of up to twice the device's `max_sectors_kb`, at most 2 MiB (`detail::single_sqe_write_max`), is one SQE |
 | `read_aligned` / `write_aligned` | Same as above but with alignment preconditions for O_DIRECT |
 | `batch_read` | Submits multiple independent reads (different offsets) in batches of up to `QUEUE_DEPTH`, maximizing NVMe queue utilization |
-| `vector_read` / `vector_write` | Scatter/gather I/O: one SQE per `iovec`, submitted in batches |
+| `vector_read` / `vector_write` | Scatter/gather I/O: one SQE per `iovec`, submitted in batches; an unaligned `O_DIRECT` `vector_write` is copied into one buffer and written as in `write` |
 | `datasync` | Issues `IORING_FSYNC_DATASYNC` and waits for completion |
 
 ### Integration with storage backends
