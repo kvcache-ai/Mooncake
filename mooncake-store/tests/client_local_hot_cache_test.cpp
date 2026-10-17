@@ -482,6 +482,74 @@ TEST_F(LocalHotCacheTest, GetHotKeyProtectsBlockFromReuse) {
     EXPECT_FALSE(cache.HasHotKey("key1"));
 }
 
+// Metadata reclamation must not resurrect generation-zero tokens or evict
+// published data. Exercise each invalidation API that can see uncached keys.
+TEST_F(LocalHotCacheTest, GenerationReclamationRejectsOldFillsAndKeepsEntries) {
+    for (int mode = 0; mode != 4; ++mode) {
+        SCOPED_TRACE(mode);
+        LocalHotCache cache(8192, 4096);
+        Slice data = CreateSlice(64, 'A');
+        ASSERT_TRUE(PutHotKeyHelper(cache, "published", data));
+        auto* pinned = cache.GetHotKey("published");
+        ASSERT_NE(pinned, nullptr);
+
+        const auto stale = cache.AcquirePutToken("fill");
+        cache.BumpKeyGeneration("fill");
+        EXPECT_FALSE(cache.IsPutTokenValid("fill", stale));
+        for (size_t i = 0; i < 64; ++i) {
+            const auto key = "uncached-" + std::to_string(i);
+            switch (mode) {
+                case 0:
+                    EXPECT_FALSE(cache.RemoveHotKey(key));
+                    break;
+                case 1:
+                    EXPECT_EQ(cache.RemoveHotKeys({key}), 0);
+                    break;
+                case 2:
+                    cache.BumpKeyGeneration(key);
+                    break;
+                case 3:
+                    cache.BumpKeyGenerations({key});
+                    break;
+            }
+        }
+        const auto fresh = cache.AcquirePutToken("fill");
+        EXPECT_GT(fresh.cache_epoch, stale.cache_epoch);
+        EXPECT_EQ(fresh.key_generation, 0);
+        EXPECT_EQ(cache.AcquirePutToken("uncached-0").key_generation, 0);
+        EXPECT_FALSE(cache.IsPutTokenValid("fill", stale));
+        EXPECT_TRUE(cache.IsPutTokenValid("fill", fresh));
+        ASSERT_TRUE(cache.HasHotKey("published"));
+        VerifySliceData(pinned, 64, 'A');
+        cache.ReleaseHotKey("published");
+
+        auto* block = cache.GetFreeBlock();
+        ASSERT_NE(block, nullptr);
+        std::memcpy(block->addr, data.ptr, data.size);
+        block->size = data.size;
+        block->key_ = "fill";
+        EXPECT_FALSE(cache.PutHotKey(block, stale));
+        EXPECT_FALSE(cache.HasHotKey("fill"));
+        block = cache.GetFreeBlock();
+        ASSERT_NE(block, nullptr);
+        std::memcpy(block->addr, data.ptr, data.size);
+        block->size = data.size;
+        block->key_ = "fill";
+        EXPECT_TRUE(cache.PutHotKey(block, fresh));
+    }
+}
+
+TEST_F(LocalHotCacheTest,
+       ZeroBlockCacheInvalidatesTokensWithoutKeepingVersions) {
+    LocalHotCache cache(0, 4096);
+    const auto stale = cache.AcquirePutToken("key");
+    cache.BumpKeyGeneration("key");
+    const auto fresh = cache.AcquirePutToken("key");
+    EXPECT_EQ(fresh.key_generation, 0);
+    EXPECT_FALSE(cache.IsPutTokenValid("key", stale));
+    EXPECT_TRUE(cache.IsPutTokenValid("key", fresh));
+}
+
 // Token check and publish must be atomic: a generation bump that races after
 // the token was captured must cancel the fill instead of resurrecting it.
 TEST_F(LocalHotCacheTest, PutHotKeyWithTokenRejectsStaleFill) {
