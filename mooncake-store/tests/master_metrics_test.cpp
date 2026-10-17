@@ -107,6 +107,18 @@ TEST_F(MasterMetricsTest, InitialStatusTest) {
     ASSERT_EQ(metrics.get_eviction_attempts(), 0);
     ASSERT_EQ(metrics.get_evicted_key_count(), 0);
     ASSERT_EQ(metrics.get_evicted_size(), 0);
+    ASSERT_EQ(metrics.get_eviction_census_runs(), 0);
+    ASSERT_EQ(metrics.get_eviction_continuation_created(), 0);
+    ASSERT_EQ(metrics.get_eviction_continuation_resumes(), 0);
+    ASSERT_EQ(metrics.get_eviction_backpressure_pauses(), 0);
+    ASSERT_EQ(metrics.get_eviction_continuation_drops(), 0);
+    ASSERT_EQ(metrics.get_eviction_continuation_stale_skips(), 0);
+    const std::string serialized_metrics = metrics.serialize_metrics();
+    EXPECT_NE(serialized_metrics.find("master_eviction_census_runs_total 0\n"),
+              std::string::npos);
+    EXPECT_NE(serialized_metrics.find(
+                  "master_eviction_continuation_stale_skips_total 0\n"),
+              std::string::npos);
 
     // Batch RPC Metrics
     ASSERT_EQ(metrics.get_batch_exist_key_requests(), 0);

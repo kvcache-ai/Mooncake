@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bitset>
 #include <boost/functional/hash.hpp>
 #include <chrono>
 #include <condition_variable>
@@ -1025,6 +1026,9 @@ class MasterService {
         const std::vector<std::string>& keys, const TenantId& tenant_id,
         bool grant_lease);
 
+    struct EvictionContinuation;
+    enum class EvictionContinuationDropReason;
+
     // BatchEvict evicts objects in a near-LRU way, i.e., prioritizes to evict
     // object with smaller lease timeout. It has two passes. The first pass only
     // evicts objects without soft pin. The second pass prioritizes objects
@@ -1034,6 +1038,15 @@ class MasterService {
     // evict_ratio_lowerbound, the second pass will be triggered and try to
     // fulfill evict ratio lowerbound.
     void BatchEvict(double evict_ratio_target, double evict_ratio_lowerbound);
+    void StartEvictionEpisode(double evict_ratio_target,
+                              double evict_ratio_lowerbound);
+    bool ResumeEvictionContinuation();
+    void ClearEvictionContinuation(EvictionContinuationDropReason reason,
+                                   bool record_episode_result = false);
+    void RecordEvictionContinuationOutcome(
+        const EvictionContinuation& continuation);
+    void FinishEvictionContinuation();
+    EvictionContinuationDropReason ClassifyWriterError(ErrorCode error) const;
     void NoFBatchEvict(double evict_ratio_target,
                        double evict_ratio_lowerbound);
     struct TenantQuotaEvictionResult {
@@ -1111,6 +1124,95 @@ class MasterService {
         route::ObjectState state;
     };
     using ObjectMap = std::unordered_map<std::string, ObjectRecord>;
+
+    // Value-only eviction identity retained between 10 ms eviction ticks.
+    // No lock, iterator, reservation, or callback-owned object may be stored
+    // in this type.
+    struct EvictionCandidate {
+        TenantId tenant_id;
+        std::string key;
+        std::string group_id;
+        size_t shard_idx{0};
+        std::chrono::system_clock::time_point deadline{};
+        route::Generation generation{0};
+    };
+
+    struct GroupMemberIdentity {
+        std::string key;
+        size_t shard_idx{0};
+        route::Generation generation{0};
+    };
+
+    struct GroupEvictionProgress {
+        TenantId tenant_id;
+        std::string group_id;
+        std::string trigger_key;
+        route::Generation trigger_generation{0};
+        std::vector<GroupMemberIdentity> members;
+        size_t next_member{0};
+        // `members` can legitimately be empty when the group-domain entry
+        // has already been removed.  Keep initialization separate from the
+        // vector size so a resumed scan never re-snapshots live membership.
+        bool initialized{false};
+    };
+
+    enum class EvictionContinuationPhase {
+        kPrimary,
+        kSecondPassNoSoftPin,
+        kSecondPassSoftPin,
+    };
+
+    struct SecondPassScan {
+        size_t next_shard{0};
+        std::vector<EvictionCandidate> pending_candidates;
+        size_t next_pending{0};
+        size_t scanned_shards{0};
+        std::chrono::system_clock::time_point cutoff{};
+        long remaining_target{0};
+        bool allow_soft_pinned{false};
+    };
+
+    struct EvictionContinuation {
+        EvictionContinuationPhase phase{EvictionContinuationPhase::kPrimary};
+        double target{0.0};
+        double lowerbound{0.0};
+        long eviction_base{0};
+        long primary_target{0};
+        long evicted_count{0};
+        uint64_t freed_bytes{0};
+        uint64_t released_discarded_replica_count{0};
+        std::bitset<kNumShards> evicted_shards;
+
+        // Deadline-only census vectors are retained until the second-pass
+        // cutoff is selected, then released. The vectors contain no metadata
+        // references and are safe to keep across ticks.
+        std::vector<std::chrono::system_clock::time_point>
+            no_soft_pin_deadlines;
+        std::vector<std::chrono::system_clock::time_point>
+            soft_pin_deadlines;
+
+        std::vector<EvictionCandidate> primary_candidates;
+        size_t next_primary_candidate{0};
+        std::optional<GroupEvictionProgress> group_progress;
+        SecondPassScan second_pass;
+        size_t start_shard_idx{0};
+    };
+
+    enum class EvictionStepResult {
+        kAdvanced,
+        kPaused,
+        kCompleted,
+        kDropped,
+    };
+
+    enum class EvictionContinuationDropReason {
+        kWriterTerminal,
+        kWriterStopped,
+        kCommitRejected,
+        kLeadershipLost,
+        kShutdown,
+        kInternalError,
+    };
 
     struct TenantState {
         TenantQuotaHandle quota_account{nullptr};
@@ -1376,6 +1478,7 @@ class MasterService {
     struct GroupEvictionResult {
         uint64_t freed_bytes{0};
         long evicted_objects{0};
+        std::bitset<kNumShards> evicted_shards;
         bool stop_scan{false};
         ErrorCode error{ErrorCode::OK};
     };
@@ -1398,7 +1501,10 @@ class MasterService {
         const std::string& group_id, bool allow_soft_pinned,
         std::chrono::system_clock::time_point now,
         const std::function<EvictMemberOutcome(MetadataAccessorRW& member)>&
-            evict_one_member);
+            evict_one_member,
+        GroupEvictionProgress* progress = nullptr,
+        std::optional<std::chrono::system_clock::time_point> cutoff =
+            std::nullopt);
 
     ObjectMap::iterator EraseMetadata(TenantState& tenant_state,
                                       ObjectMap::iterator it,
@@ -1698,6 +1804,20 @@ class MasterService {
     // Eviction related members
     std::atomic<bool> need_mem_eviction_{
         false};  // Set to trigger memory eviction when allocation fails
+    // BatchEvict normally runs on the eviction thread, while restore and
+    // writer replacement can invalidate an in-progress episode from another
+    // control path.  Serialize those transitions with the scan itself.  A
+    // recursive mutex is intentional: the scan calls the lifecycle helpers
+    // below when it classifies a terminal writer error.
+    mutable std::recursive_mutex eviction_continuation_mutex_;
+    // A continuation belongs to the eviction thread. It is intentionally
+    // memory-only and is cleared on terminal writer/lifecycle transitions.
+    std::optional<EvictionContinuation> eviction_continuation_;
+    uint64_t eviction_census_runs_{0};
+    uint64_t eviction_continuation_stale_skips_{0};
+    std::atomic<bool> eviction_abort_requested_{false};
+    std::atomic<bool> eviction_writer_replacement_required_{false};
+    std::function<void()> eviction_census_hook_for_testing_;
     std::atomic<bool> need_nof_eviction_{
         false};  // Set to trigger NoF eviction when allocation fails
     const double eviction_ratio_;                 // in range [0.0, 1.0]
@@ -2380,6 +2500,7 @@ class MasterService {
     std::shared_ptr<HaKvBackend> batch_oplog_kv_backend_;
     std::unique_ptr<OpLogBatchStorage> batch_oplog_storage_;
     std::unique_ptr<OrderedOpLogWriter> ordered_oplog_writer_;
+    OrderedOpLogWriter::TerminalCallback batch_oplog_terminal_callback_;
     BatchOpLogWriterFactory batch_oplog_writer_factory_;
 
     // OpLog publishing helpers

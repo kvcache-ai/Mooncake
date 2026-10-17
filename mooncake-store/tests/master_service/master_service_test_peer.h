@@ -53,6 +53,34 @@ class MasterServiceTestPeer {
     void RunBatchEvictForTesting(double evict_ratio_target,
                                  double evict_ratio_lowerbound);
 
+    void SetEvictionCensusHookForTesting(std::function<void()> hook);
+
+    void PrepareSoftPinSecondPassForTesting(
+        size_t shard_idx,
+        std::chrono::system_clock::time_point cutoff);
+
+    void DisableSoftPinForTesting(const TenantId& tenant_id,
+                                  const std::string& key);
+
+    uint64_t GetEvictionCensusRunsForTesting() const;
+
+    bool HasEvictionContinuationForTesting() const;
+
+    uint64_t GetObjectGenerationForTesting(const TenantId& tenant_id,
+                                           const std::string& key) const;
+
+    size_t GetMetadataShardIndexForTesting(const TenantId& tenant_id,
+                                           const std::string& key) const;
+
+    std::string GetEvictionContinuationPhaseForTesting() const;
+
+    std::pair<size_t, size_t>
+    GetEvictionSecondPassPendingCursorForTesting() const;
+
+    std::pair<size_t, size_t> GetEvictionGroupMemberCursorForTesting() const;
+
+    uint64_t GetEvictionContinuationStaleSkipsForTesting() const;
+
     void RunNoFBatchEvictForTesting(double evict_ratio_target,
                                     double evict_ratio_lowerbound);
 

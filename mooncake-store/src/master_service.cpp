@@ -550,6 +550,7 @@ void MasterService::InitDfsAllocatorFromEnvironment(
 MasterService::~MasterService() {
     // Stop and join the threads
     eviction_running_ = false;
+    eviction_abort_requested_.store(true, std::memory_order_relaxed);
     client_monitor_running_ = false;
 
     task_cleanup_running_ = false;
@@ -568,6 +569,7 @@ MasterService::~MasterService() {
     if (eviction_thread_.joinable()) {
         eviction_thread_.join();
     }
+    ClearEvictionContinuation(EvictionContinuationDropReason::kShutdown);
     if (client_monitor_thread_.joinable()) {
         client_monitor_thread_.join();
     }
@@ -589,6 +591,8 @@ MasterService::~MasterService() {
 
     client_offboarding_worker_.Stop();
     if (ordered_oplog_writer_) {
+        ClearEvictionContinuation(
+            EvictionContinuationDropReason::kWriterStopped);
         ordered_oplog_writer_->Stop();
     }
     for (const auto& [segment, bytes] : standby_accounted_memory_bytes_) {
@@ -614,11 +618,24 @@ MasterService::~MasterService() {
 void MasterService::SetBatchOpLogTerminalCallback(
     OrderedOpLogWriter::TerminalCallback callback) {
     if (ordered_oplog_writer_) {
-        ordered_oplog_writer_->SetTerminalCallback(std::move(callback));
+        ordered_oplog_writer_->SetTerminalCallback(
+            [this, callback = std::move(callback)](
+                const OrderedOpLogWriterTerminalState& state) mutable {
+                eviction_abort_requested_.store(true,
+                                                 std::memory_order_relaxed);
+                eviction_writer_replacement_required_.store(
+                    true, std::memory_order_relaxed);
+                if (callback) {
+                    callback(state);
+                }
+            });
     }
 }
 
 void MasterService::StopBatchOpLogWriter() {
+    eviction_abort_requested_.store(true, std::memory_order_relaxed);
+    eviction_writer_replacement_required_.store(true,
+                                               std::memory_order_relaxed);
     if (ordered_oplog_writer_) ordered_oplog_writer_->Stop();
 }
 
@@ -1481,48 +1498,124 @@ MasterService::GroupEvictionResult MasterService::EvictGroupOrObject(
     const std::string& group_id, bool allow_soft_pinned,
     std::chrono::system_clock::time_point now,
     const std::function<EvictMemberOutcome(MetadataAccessorRW& member)>&
-        evict_one_member) {
+        evict_one_member,
+    GroupEvictionProgress* progress,
+    std::optional<std::chrono::system_clock::time_point> cutoff) {
     GroupEvictionResult result;
 
     // Group membership lives in group_domain_, keyed by scoped(tenant,
-    // group_id) and read WITHOUT holding any key.
-    std::vector<std::string> member_keys =
-        GetGroupMemberKeys(tenant_id, group_id);
-    if (member_keys.empty()) {
-        member_keys.push_back(key);
+    // group_id) and read WITHOUT a metadata shard lock.  A continuation takes
+    // a value-only snapshot once.  In particular, keep identities for members
+    // that are already missing from metadata (generation 0): they still have
+    // to advance the cursor, and a newly-created replacement must not become
+    // part of the paused episode.
+    if (progress != nullptr && !progress->initialized) {
+        progress->tenant_id = tenant_id;
+        progress->group_id = group_id;
+        progress->trigger_key = key;
+        progress->members.clear();
+        progress->next_member = 0;
+
+        const auto live_member_keys = GetGroupMemberKeys(tenant_id, group_id);
+        for (const auto& member_key : live_member_keys) {
+            const size_t member_shard = getShardIndex(tenant_id, member_key);
+            MetadataAccessorRW member(this, ObjectIdentity{tenant_id, member_key});
+            const route::Generation generation =
+                member.IsPublished() ? member.GetRef().generation : 0;
+            progress->members.push_back(
+                GroupMemberIdentity{member_key, member_shard, generation});
+        }
+        auto trigger_member =
+            std::find_if(progress->members.begin(), progress->members.end(),
+                         [&](const GroupMemberIdentity& member) {
+                             return member.key == progress->trigger_key;
+                         });
+        if (trigger_member == progress->members.end()) {
+            progress->members.push_back(GroupMemberIdentity{
+                progress->trigger_key, getShardIndex(tenant_id, key),
+                progress->trigger_generation});
+        } else {
+            // The trigger identity comes from the episode's candidate census.
+            // If the key was replaced between census and this membership
+            // snapshot, do not let the replacement inherit the old candidate.
+            trigger_member->generation = progress->trigger_generation;
+        }
+        std::sort(
+            progress->members.begin(), progress->members.end(),
+            [](const GroupMemberIdentity& lhs, const GroupMemberIdentity& rhs) {
+                if (lhs.shard_idx != rhs.shard_idx) {
+                    return lhs.shard_idx < rhs.shard_idx;
+                }
+                return lhs.key < rhs.key;
+            });
+        progress->initialized = true;
     }
 
-    // Each member is held on its own, one at a time, and re-looked-up and
-    // re-validated under its own lock, so no two evictions wait on each
-    // other's keys.
-    auto is_evictable_memory_replica = [this](const Replica& replica) {
-        return IsEvictableMemoryReplica(replica);
-    };
-    for (const auto& member_key : member_keys) {
-        MetadataAccessorRW member(this, ObjectIdentity{tenant_id, member_key});
+    // Like every write path, hold just one key through its accessor. Only
+    // copied identities and the next-member index survive a paused call.
+    auto eligible = [&](MetadataAccessorRW& member) {
         if (!member.IsPublished()) {
-            continue;
+            return false;
         }
-        auto& member_metadata = member.Get();
-        // Re-validate under the member's own lock: the group/member lease
-        // and pin state may have changed since the caller's snapshot. A
-        // surviving shared group lease makes every member's lease not
-        // expired, so the whole group is skipped here.
-        if (member_metadata.IsHardPinned() ||
-            !member_metadata.IsLeaseExpired(now) ||
-            (!allow_soft_pinned && IsSoftPinActive(member_metadata, now)) ||
-            !member_metadata.HasReplica(is_evictable_memory_replica)) {
-            continue;
+        const auto& metadata = member.Get();
+        return !metadata.IsHardPinned() && metadata.IsLeaseExpired(now) &&
+               (!cutoff ||
+                (allow_soft_pinned && !IsSoftPinActive(metadata, now)) ||
+                metadata.EvictionDeadline() <= *cutoff) &&
+               (allow_soft_pinned || !IsSoftPinActive(metadata, now)) &&
+               metadata.HasReplica([this](const Replica& replica) {
+                   return IsEvictableMemoryReplica(replica);
+               });
+    };
+    auto evict_member = [&](MetadataAccessorRW& member) {
+        // The callback may erase the publication it holds, so copy the shard
+        // identity before calling it and never access its metadata afterwards.
+        const auto shard_idx = getShardIndex(tenant_id, member.GetKey());
+        const auto outcome = evict_one_member(member);
+        result.freed_bytes += outcome.freed_bytes;
+        result.evicted_objects += outcome.evicted_objects;
+        if (outcome.evicted_objects > 0) {
+            result.evicted_shards.set(shard_idx);
         }
-        // The callback performs only the path-specific eviction (oplog
-        // persist, offload, publish) and may erase the member it holds.
-        EvictMemberOutcome member_outcome = evict_one_member(member);
-        result.freed_bytes += member_outcome.freed_bytes;
-        result.evicted_objects += member_outcome.evicted_objects;
-        if (member_outcome.stop_scan) {
-            result.stop_scan = true;
-            result.error = member_outcome.error;
-            break;
+        result.stop_scan = outcome.stop_scan;
+        result.error = outcome.error;
+    };
+
+    if (progress != nullptr) {
+        while (progress->next_member < progress->members.size()) {
+            const auto& identity = progress->members[progress->next_member];
+            MetadataAccessorRW member(
+                this, tenant_id,
+                route::ObjectRef{identity.key, identity.generation});
+            if (!eligible(member)) {
+                ++eviction_continuation_stale_skips_;
+                MasterMetricManager::instance()
+                    .inc_eviction_continuation_stale_skips();
+                ++progress->next_member;
+                continue;
+            }
+            evict_member(member);
+            if (result.stop_scan) {
+                // A rejected reservation has not submitted this member. The
+                // next tick retries it after this accessor releases the key.
+                break;
+            }
+            ++progress->next_member;
+        }
+    } else {
+        auto member_keys = GetGroupMemberKeys(tenant_id, group_id);
+        if (member_keys.empty()) {
+            member_keys.push_back(key);
+        }
+        for (const auto& member_key : member_keys) {
+            MetadataAccessorRW member(this, ObjectIdentity{tenant_id, member_key});
+            if (!eligible(member)) {
+                continue;
+            }
+            evict_member(member);
+            if (result.stop_scan) {
+                break;
+            }
         }
     }
     return result;
@@ -3760,6 +3853,10 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
     const std::vector<StandbySegmentInfo>& segments, size_t chunk_object_count,
     std::optional<ReplicaID> expected_max_replica_id,
     const WeightMetadataSnapshot* legacy_weight_metadata) {
+    std::lock_guard<std::recursive_mutex> eviction_lock(
+        eviction_continuation_mutex_);
+    eviction_abort_requested_.store(true, std::memory_order_relaxed);
+    ClearEvictionContinuation(EvictionContinuationDropReason::kLeadershipLost);
     if (enable_dfs_) {
         LOG(ERROR) << "RestoreFromStandbySnapshot: DFS allocator state "
                       "restoration is not supported";
@@ -10225,7 +10322,14 @@ void MasterService::EvictionThreadFunc() {
     while (eviction_running_) {
         const auto now = std::chrono::system_clock::now();
         double used_ratio = segment_manager_.GetMemoryUsage().used_ratio();
-        if (used_ratio > eviction_high_watermark_ratio_ ||
+        bool has_eviction_continuation = false;
+        {
+            std::lock_guard<std::recursive_mutex> lock(
+                eviction_continuation_mutex_);
+            has_eviction_continuation = eviction_continuation_.has_value();
+        }
+        if (has_eviction_continuation ||
+            used_ratio > eviction_high_watermark_ratio_ ||
             (need_mem_eviction_ && eviction_ratio_ > 0.0)) {
             LOG(INFO) << "[EVICT-TRIGGER] memory_ratio=" << used_ratio
                       << " high_watermark=" << eviction_high_watermark_ratio_
@@ -10913,8 +11017,548 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
     return total;
 }
 
+void MasterService::StartEvictionEpisode(double evict_ratio_target,
+                                         double evict_ratio_lowerbound) {
+    std::lock_guard<std::recursive_mutex> lock(eviction_continuation_mutex_);
+    EvictionContinuation continuation;
+    continuation.target = evict_ratio_target;
+    continuation.lowerbound = evict_ratio_lowerbound;
+    eviction_continuation_ = std::move(continuation);
+    ++eviction_census_runs_;
+    MasterMetricManager::instance().inc_eviction_census_runs();
+    MasterMetricManager::instance().inc_eviction_continuation_created();
+}
+
+MasterService::EvictionContinuationDropReason
+MasterService::ClassifyWriterError(ErrorCode error) const {
+    switch (error) {
+        case ErrorCode::TASK_PENDING_LIMIT_EXCEEDED:
+            return EvictionContinuationDropReason::kInternalError;
+        case ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS:
+            return EvictionContinuationDropReason::kWriterStopped;
+        case ErrorCode::ETCD_TRANSACTION_FAIL:
+        case ErrorCode::PERSISTENT_FAIL:
+            return EvictionContinuationDropReason::kWriterTerminal;
+        case ErrorCode::INVALID_PARAMS:
+        case ErrorCode::INTERNAL_ERROR:
+            return EvictionContinuationDropReason::kInternalError;
+        default:
+            return EvictionContinuationDropReason::kCommitRejected;
+    }
+}
+
+void MasterService::ClearEvictionContinuation(
+    EvictionContinuationDropReason reason, bool record_episode_result) {
+    std::lock_guard<std::recursive_mutex> lock(eviction_continuation_mutex_);
+    if (eviction_continuation_) {
+        if (record_episode_result) {
+            RecordEvictionContinuationOutcome(*eviction_continuation_);
+        }
+        std::string reason_name;
+        switch (reason) {
+            case EvictionContinuationDropReason::kWriterTerminal:
+                reason_name = "writer_terminal";
+                break;
+            case EvictionContinuationDropReason::kWriterStopped:
+                reason_name = "writer_stopped";
+                break;
+            case EvictionContinuationDropReason::kCommitRejected:
+                reason_name = "commit_rejected";
+                break;
+            case EvictionContinuationDropReason::kLeadershipLost:
+                reason_name = "leadership_lost";
+                break;
+            case EvictionContinuationDropReason::kShutdown:
+                reason_name = "shutdown";
+                break;
+            case EvictionContinuationDropReason::kInternalError:
+                reason_name = "internal_error";
+                break;
+        }
+        MasterMetricManager::instance().inc_eviction_continuation_dropped(
+            reason_name);
+    }
+    eviction_continuation_.reset();
+}
+
+void MasterService::RecordEvictionContinuationOutcome(
+    const EvictionContinuation& continuation) {
+    const bool success = continuation.evicted_count > 0 ||
+                         continuation.released_discarded_replica_count > 0;
+    if (success) {
+        MasterMetricManager::instance().inc_eviction_success(
+            continuation.evicted_count, continuation.freed_bytes);
+        MasterMetricManager::instance().inc_mem_eviction_success(
+            continuation.evicted_count, continuation.freed_bytes);
+    } else {
+        MasterMetricManager::instance().inc_eviction_fail();
+        MasterMetricManager::instance().inc_mem_eviction_fail();
+    }
+}
+
+void MasterService::FinishEvictionContinuation() {
+    std::lock_guard<std::recursive_mutex> lock(eviction_continuation_mutex_);
+    eviction_continuation_.reset();
+}
+
+bool MasterService::ResumeEvictionContinuation() {
+    // Callers normally hold this lock through BatchEvict.  Keep the helper
+    // independently safe for the synchronous test seam and future callers.
+    std::lock_guard<std::recursive_mutex> lock(eviction_continuation_mutex_);
+    if (!eviction_continuation_ || !enable_oplog_) {
+        return false;
+    }
+
+    auto& continuation = *eviction_continuation_;
+    MasterMetricManager::instance().inc_eviction_continuation_resumes();
+    std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
+
+    struct ResumeResult {
+        uint64_t freed_bytes{0};
+        long evicted_objects{0};
+        std::bitset<kNumShards> evicted_shards;
+        bool stale{false};
+        bool paused{false};
+        ErrorCode error{ErrorCode::OK};
+    };
+
+    auto is_evictable_memory_replica = [this](const Replica& replica) {
+        return IsEvictableMemoryReplica(replica);
+    };
+
+    auto persist_one = [&](const TenantId& tenant_id, const std::string& key,
+                           ObjectMetadata& metadata) -> ResumeResult {
+        ResumeResult result;
+        auto remaining = BuildRemainingReplicaDescriptors(
+            metadata, is_evictable_memory_replica);
+        auto reservation = ReserveBatchOpLogSlot();
+        if (!reservation) {
+            result.error = reservation.error();
+            result.paused = result.error ==
+                            ErrorCode::TASK_PENDING_LIMIT_EXCEEDED;
+            return result;
+        }
+
+        std::vector<ReplicaID> removed_ids;
+        metadata.VisitReplicas(
+            is_evictable_memory_replica,
+            [&removed_ids](Replica& replica) {
+                removed_ids.push_back(replica.id());
+                replica.mark_removed();
+            });
+        tl::expected<OpLogEntry, ErrorCode> persist_result;
+        auto finalize = [this, removed_ids](const OpLogEntry& entry) {
+            FinalizeRemovedReplicasAfterDurable(entry, removed_ids,
+                                                QuotaEraseMode::kFull);
+        };
+        if (remaining.empty()) {
+            persist_result = AppendReservedOpLogWithDurableFinalize(
+                std::move(reservation.value()), OpType::REMOVE,
+                tenant_id.value(), key, {}, finalize);
+        } else {
+            persist_result = AppendReservedOpLogWithDurableFinalize(
+                std::move(reservation.value()), OpType::PUT_END,
+                tenant_id.value(), key,
+                SerializeMetadataForOpLogFromReplicaDescriptors(metadata,
+                                                                remaining),
+                finalize);
+        }
+        if (!persist_result) {
+            result.error = persist_result.error();
+            for (const auto& id : removed_ids) {
+                if (auto* replica = metadata.GetReplicaByID(id);
+                    replica != nullptr) {
+                    replica->cancel_remove();
+                }
+            }
+            result.paused = result.error ==
+                            ErrorCode::TASK_PENDING_LIMIT_EXCEEDED;
+            return result;
+        }
+        result.freed_bytes = metadata.TotalLength() * removed_ids.size();
+        result.evicted_objects = removed_ids.empty() ? 0 : 1;
+        return result;
+    };
+
+    auto process_candidate = [&](const EvictionCandidate& candidate,
+                                 bool candidate_allows_soft_pin) -> ResumeResult {
+        ResumeResult result;
+        auto now = std::chrono::system_clock::now();
+        const auto cutoff =
+            continuation.phase == EvictionContinuationPhase::kPrimary
+                ? std::nullopt
+                : std::optional(continuation.second_pass.cutoff);
+
+        // Revalidate the trigger with a short-lived lock, then release it
+        // before EvictGroupOrObject acquires each member independently.
+        std::string group_id;
+        const bool resuming_group =
+            continuation.group_progress.has_value() &&
+            continuation.group_progress->tenant_id == candidate.tenant_id &&
+            continuation.group_progress->trigger_key == candidate.key &&
+            continuation.group_progress->group_id == candidate.group_id;
+        if (resuming_group) {
+            // The trigger may already have been submitted by a previous
+            // member step and may have no evictable replica anymore.  The
+            // member snapshot is the authoritative cursor for this resume.
+            group_id = candidate.group_id;
+        } else {
+            MetadataAccessorRW trigger(
+                this, candidate.tenant_id,
+                route::ObjectRef{candidate.key, candidate.generation});
+            if (!trigger.IsPublished()) {
+                result.stale = true;
+                return result;
+            }
+            const auto& metadata = trigger.Get();
+            if (metadata.IsHardPinned() ||
+                !metadata.IsLeaseExpired(now) ||
+                (cutoff &&
+                 (!candidate_allows_soft_pin ||
+                  IsSoftPinActive(metadata, now)) &&
+                 metadata.EvictionDeadline() > *cutoff) ||
+                (!candidate_allows_soft_pin &&
+                 IsSoftPinActive(metadata, now)) ||
+                !metadata.HasReplica(is_evictable_memory_replica)) {
+                result.stale = true;
+                return result;
+            }
+            group_id = metadata.group_id;
+        }
+
+        if (!group_id.empty()) {
+            if (!continuation.group_progress ||
+                continuation.group_progress->group_id != group_id ||
+                continuation.group_progress->trigger_key != candidate.key) {
+                GroupEvictionProgress progress;
+                progress.tenant_id = candidate.tenant_id;
+                progress.group_id = group_id;
+                progress.trigger_key = candidate.key;
+                progress.trigger_generation = candidate.generation;
+                continuation.group_progress = std::move(progress);
+            }
+
+            auto evict_one_member =
+                [&](MetadataAccessorRW& member) -> EvictMemberOutcome {
+                auto member_result =
+                    persist_one(candidate.tenant_id, member.GetKey(), member.Get());
+                if (member_result.paused || member_result.error != ErrorCode::OK) {
+                    return {.stop_scan = true, .error = member_result.error};
+                }
+                return {.freed_bytes = member_result.freed_bytes,
+                        .evicted_objects = member_result.evicted_objects};
+            };
+
+            auto group_result = EvictGroupOrObject(
+                candidate.tenant_id, candidate.key, group_id,
+                candidate_allows_soft_pin, now, evict_one_member,
+                &*continuation.group_progress, cutoff);
+            result.freed_bytes = group_result.freed_bytes;
+            result.evicted_objects = group_result.evicted_objects;
+            result.evicted_shards = group_result.evicted_shards;
+            if (group_result.stop_scan) {
+                result.error = group_result.error;
+                result.paused = result.error ==
+                                ErrorCode::TASK_PENDING_LIMIT_EXCEEDED;
+                return result;
+            }
+            return result;
+        }
+
+        MetadataAccessorRW object(
+            this, candidate.tenant_id,
+            route::ObjectRef{candidate.key, candidate.generation});
+        if (!object.IsPublished()) {
+            result.stale = true;
+            return result;
+        }
+        auto& metadata = object.Get();
+        if (metadata.IsHardPinned() ||
+            !metadata.IsLeaseExpired(now) ||
+            (cutoff &&
+             (!candidate_allows_soft_pin ||
+              IsSoftPinActive(metadata, now)) &&
+             metadata.EvictionDeadline() > *cutoff) ||
+            (!candidate_allows_soft_pin &&
+             IsSoftPinActive(metadata, now)) ||
+            !metadata.HasReplica(is_evictable_memory_replica)) {
+            result.stale = true;
+            return result;
+        }
+        result = persist_one(candidate.tenant_id, candidate.key,
+                             metadata);
+        if (result.evicted_objects > 0) {
+            result.evicted_shards.set(candidate.shard_idx);
+        }
+        return result;
+    };
+
+    auto collect_second_pass_candidates =
+        [&](size_t shard_idx, bool allow_soft_pin,
+            std::chrono::system_clock::time_point cutoff) {
+            std::vector<EvictionCandidate> candidates;
+            auto now = std::chrono::system_clock::now();
+            MetadataShardAccessorRO shard(this, shard_idx);
+            for (const auto& [tenant_id, tenant_state] : shard->tenants) {
+                for (const auto& [key, record] : tenant_state.metadata) {
+                    const auto& metadata = record.metadata;
+                    if (metadata.IsHardPinned() ||
+                        !metadata.IsLeaseExpired(now) ||
+                        !metadata.HasReplica(is_evictable_memory_replica)) {
+                        continue;
+                    }
+                    const auto deadline = metadata.EvictionDeadline();
+                    const bool soft_pin_active = IsSoftPinActive(metadata, now);
+                    // The soft-pin cutoff only selects which still-pinned
+                    // objects may enter this pass. Non-soft-pinned objects
+                    // remain eligible regardless of their deadline; they
+                    // were already counted separately when the cutoff was
+                    // chosen.
+                    if ((!allow_soft_pin &&
+                         (soft_pin_active || deadline > cutoff)) ||
+                        (allow_soft_pin && soft_pin_active &&
+                         deadline > cutoff)) {
+                        continue;
+                    }
+                    candidates.push_back(EvictionCandidate{
+                        tenant_id, key, metadata.group_id, shard_idx, deadline,
+                        record.generation});
+                }
+            }
+            return candidates;
+        };
+
+    auto complete_episode = [&]() {
+        for (size_t i = 0; i < kNumShards; ++i) {
+            if (!continuation.evicted_shards.test(i)) {
+                continue;
+            }
+            MetadataShardAccessorRW shard(this, i);
+            for (auto& tenant : shard->tenants) {
+                ShrinkBucketsIfSparse(tenant.second.metadata);
+            }
+        }
+        RecordEvictionContinuationOutcome(continuation);
+        FinishEvictionContinuation();
+    };
+
+    auto record_eviction_result = [&](const EvictionCandidate& candidate,
+                                      const ResumeResult& result,
+                                      bool second_pass) {
+        continuation.evicted_count += result.evicted_objects;
+        continuation.freed_bytes += result.freed_bytes;
+        continuation.evicted_shards |= result.evicted_shards;
+        if (second_pass) {
+            continuation.second_pass.remaining_target = std::max<long>(
+                0, continuation.second_pass.remaining_target -
+                       result.evicted_objects);
+        }
+        if (result.evicted_objects <= 0) {
+            return;
+        }
+
+        // Deadline vectors are a multiset of census entries.  Remove one
+        // entry per object that was actually submitted, including a partial
+        // grouped result that paused at -1401.
+        for (long i = 0; i < result.evicted_objects; ++i) {
+            auto deadline_it = std::find(
+                continuation.no_soft_pin_deadlines.begin(),
+                continuation.no_soft_pin_deadlines.end(), candidate.deadline);
+            if (deadline_it == continuation.no_soft_pin_deadlines.end()) {
+                break;
+            }
+            continuation.no_soft_pin_deadlines.erase(deadline_it);
+        }
+    };
+
+    auto drop_for_writer_error = [&](ErrorCode error) {
+        const auto reason = ClassifyWriterError(error);
+        if (reason == EvictionContinuationDropReason::kWriterStopped ||
+            reason == EvictionContinuationDropReason::kWriterTerminal) {
+            eviction_writer_replacement_required_.store(
+                true, std::memory_order_relaxed);
+        }
+        ClearEvictionContinuation(reason, /*record_episode_result=*/true);
+    };
+
+    auto advance_primary = [&]() -> bool {
+        while (continuation.next_primary_candidate <
+                   continuation.primary_candidates.size() &&
+               (continuation.evicted_count < continuation.primary_target ||
+                continuation.group_progress.has_value())) {
+            const auto candidate = continuation.primary_candidates
+                [continuation.next_primary_candidate];
+            auto result = process_candidate(candidate, false);
+            record_eviction_result(candidate, result, false);
+            if (result.paused) {
+                MasterMetricManager::instance()
+                    .inc_eviction_backpressure_pauses();
+                return false;
+            }
+            if (result.error != ErrorCode::OK) {
+                drop_for_writer_error(result.error);
+                return false;
+            }
+            // The result has been accounted for (including all member
+            // shards) before the completed group cursor is discarded.
+            continuation.group_progress.reset();
+            ++continuation.next_primary_candidate;
+            if (result.stale) {
+                ++eviction_continuation_stale_skips_;
+                MasterMetricManager::instance()
+                    .inc_eviction_continuation_stale_skips();
+                continue;
+            }
+        }
+        return true;
+    };
+
+    if (continuation.phase == EvictionContinuationPhase::kPrimary) {
+        if (!advance_primary()) {
+            return true;
+        }
+        continuation.released_discarded_replica_count +=
+            ReleaseExpiredDiscardedReplicas(std::chrono::system_clock::now());
+        long target = static_cast<long>(std::ceil(
+            continuation.eviction_base * continuation.lowerbound));
+        target -= continuation.evicted_count;
+        target -= static_cast<long>(
+            continuation.released_discarded_replica_count);
+        target = std::max<long>(0, target);
+        target = std::min<long>(
+            target, static_cast<long>(continuation.no_soft_pin_deadlines.size() +
+                                      continuation.soft_pin_deadlines.size()));
+        if (target == 0) {
+            complete_episode();
+            return true;
+        }
+
+        continuation.phase =
+            target <= static_cast<long>(continuation.no_soft_pin_deadlines.size())
+                ? EvictionContinuationPhase::kSecondPassNoSoftPin
+                : EvictionContinuationPhase::kSecondPassSoftPin;
+        continuation.second_pass = SecondPassScan{};
+        continuation.second_pass.next_shard = continuation.start_shard_idx;
+        continuation.second_pass.remaining_target = target;
+        continuation.second_pass.allow_soft_pinned =
+            continuation.phase == EvictionContinuationPhase::kSecondPassSoftPin;
+        auto& deadlines = continuation.second_pass.allow_soft_pinned
+                              ? continuation.soft_pin_deadlines
+                              : continuation.no_soft_pin_deadlines;
+        const long cutoff_index = continuation.second_pass.allow_soft_pinned
+                                      ? target -
+                                            static_cast<long>(
+                                                continuation.no_soft_pin_deadlines
+                                                    .size()) -
+                                            1
+                                      : target - 1;
+        if (cutoff_index >= 0 &&
+            static_cast<size_t>(cutoff_index) < deadlines.size()) {
+            std::nth_element(deadlines.begin(), deadlines.begin() + cutoff_index,
+                             deadlines.end());
+            continuation.second_pass.cutoff = deadlines[cutoff_index];
+        }
+        continuation.no_soft_pin_deadlines.clear();
+        continuation.soft_pin_deadlines.clear();
+    }
+
+    auto& second_pass = continuation.second_pass;
+    while (second_pass.remaining_target > 0 ||
+           continuation.group_progress.has_value()) {
+        while (second_pass.next_pending <
+                   second_pass.pending_candidates.size() &&
+               (second_pass.remaining_target > 0 ||
+                continuation.group_progress.has_value())) {
+            const auto candidate =
+                second_pass.pending_candidates[second_pass.next_pending];
+            auto result =
+                process_candidate(candidate, second_pass.allow_soft_pinned);
+            record_eviction_result(candidate, result, true);
+            if (result.paused) {
+                MasterMetricManager::instance()
+                    .inc_eviction_backpressure_pauses();
+                return true;
+            }
+            ++second_pass.next_pending;
+            if (result.stale) {
+                ++eviction_continuation_stale_skips_;
+                MasterMetricManager::instance()
+                    .inc_eviction_continuation_stale_skips();
+                continue;
+            }
+            if (result.error != ErrorCode::OK) {
+                drop_for_writer_error(result.error);
+                return false;
+            }
+            continuation.group_progress.reset();
+            if (second_pass.remaining_target <= 0 &&
+                !continuation.group_progress.has_value()) {
+                complete_episode();
+                return true;
+            }
+        }
+        second_pass.pending_candidates.clear();
+        second_pass.next_pending = 0;
+        if (second_pass.scanned_shards >= kNumShards) {
+            break;
+        }
+        const size_t shard_idx = second_pass.next_shard;
+        second_pass.next_shard = (shard_idx + 1) % kNumShards;
+        ++second_pass.scanned_shards;
+        second_pass.pending_candidates = collect_second_pass_candidates(
+            shard_idx, second_pass.allow_soft_pinned, second_pass.cutoff);
+    }
+
+    complete_episode();
+    return true;
+}
 void MasterService::BatchEvict(double evict_ratio_target,
                                double evict_ratio_lowerbound) {
+    std::lock_guard<std::recursive_mutex> continuation_lock(
+        eviction_continuation_mutex_);
+    const bool abort_requested =
+        eviction_abort_requested_.exchange(false, std::memory_order_relaxed);
+    if (abort_requested) {
+        auto reason = EvictionContinuationDropReason::kLeadershipLost;
+        bool record_episode_result = false;
+        if (eviction_writer_replacement_required_.load(
+                std::memory_order_relaxed)) {
+            const auto terminal_state = ordered_oplog_writer_
+                                            ? ordered_oplog_writer_
+                                                  ->GetTerminalState()
+                                            : std::nullopt;
+            reason = terminal_state
+                         ? EvictionContinuationDropReason::kWriterTerminal
+                         : EvictionContinuationDropReason::kWriterStopped;
+            record_episode_result = true;
+        }
+        ClearEvictionContinuation(reason, record_episode_result);
+        need_mem_eviction_.store(false, std::memory_order_relaxed);
+        return;
+    }
+    if (enable_oplog_) {
+        const auto terminal_state = ordered_oplog_writer_
+                                        ? ordered_oplog_writer_->GetTerminalState()
+                                        : std::nullopt;
+        if (eviction_writer_replacement_required_.load(
+                std::memory_order_relaxed) ||
+            !ordered_oplog_writer_ || !ordered_oplog_writer_->IsAccepting() ||
+            terminal_state.has_value()) {
+            eviction_writer_replacement_required_.store(
+                true, std::memory_order_relaxed);
+            const auto reason =
+                terminal_state
+                    ? EvictionContinuationDropReason::kWriterTerminal
+                    : EvictionContinuationDropReason::kWriterStopped;
+            ClearEvictionContinuation(reason, /*record_episode_result=*/true);
+            need_mem_eviction_.store(false, std::memory_order_relaxed);
+            return;
+        }
+    }
+    if (eviction_continuation_ && enable_oplog_) {
+        ResumeEvictionContinuation();
+        return;
+    }
     // Consume the allocation-pressure signal before this pass. A new failure
     // during the pass remains visible to the next iteration.
     const bool allocation_pressure =
@@ -11124,7 +11768,9 @@ void MasterService::BatchEvict(double evict_ratio_target,
     struct EvictionResult {
         uint64_t freed_bytes{0};
         long evicted_objects{0};
+        std::bitset<kNumShards> evicted_shards;
         bool stop_scan{false};
+        ErrorCode error{ErrorCode::OK};
         // Set when the candidate was present but its re-validation failed
         // (lease still live, soft-pinned, or no evictable replica), so the
         // first pass can keep its lease timeout for the second-pass census.
@@ -11137,37 +11783,50 @@ void MasterService::BatchEvict(double evict_ratio_target,
     // evictions wait on each other's keys.
     auto try_evict_group_or_object =
         [&, this](const TenantId& tenant_id, const std::string& key,
+                  size_t shard_idx, route::Generation expected_generation,
                   bool allow_soft_pinned,
+                  std::optional<std::chrono::system_clock::time_point> cutoff,
                   std::vector<std::vector<Replica>>& deferred_replicas)
         -> EvictionResult {
         // Snapshot grouped-ness/membership under the trigger's lock; it is let
         // go of before any member is held.
         std::string group_id;
         {
-            MetadataAccessorRW trigger(this, ObjectIdentity{tenant_id, key});
+            MetadataAccessorRW trigger(
+                this, tenant_id, route::ObjectRef{key, expected_generation});
             if (!trigger.IsPublished()) {
-                return {};
+                return {.evicted_shards = {}, .revalidation_skipped = true};
             }
             auto& metadata = trigger.Get();
+            const auto deadline = metadata.EvictionDeadline();
             // Re-validate: state may have changed since the census. Soft pins
             // are only a blocker when this pass is not allowed to evict them.
-            if (now < metadata.EvictionDeadline() ||
+            if (metadata.IsHardPinned() || now < deadline ||
+                (cutoff &&
+                 (!allow_soft_pinned || IsSoftPinActive(metadata, now)) &&
+                 deadline > *cutoff) ||
                 (!allow_soft_pinned && IsSoftPinActive(metadata, now)) ||
                 !can_evict_replicas(metadata)) {
-                return {.revalidation_skipped = true};
+                return {.evicted_shards = {}, .revalidation_skipped = true};
             }
 
             if (!metadata.IsGrouped()) {
                 auto submission =
                     persist_evict_oplog_or_skip(tenant_id, key, metadata);
                 if (!submission) {
-                    return {.stop_scan = true};
+                    return {.evicted_shards = {},
+                            .stop_scan = true,
+                            .error = submission.error()};
                 }
                 uint64_t freed = try_evict_or_offload(
                     tenant_id, key, metadata, trigger.QuotaAccount(),
                     trigger.GetState(), deferred_replicas);
                 EvictionResult result{.freed_bytes = freed,
-                                      .evicted_objects = freed > 0 ? 1 : 0};
+                                      .evicted_objects = freed > 0 ? 1 : 0,
+                                      .evicted_shards = {}};
+                if (result.evicted_objects > 0) {
+                    result.evicted_shards.set(shard_idx);
+                }
                 if (!enable_oplog_ && freed > 0) {
                     PublishKvRemovedAfterEvict(key, 1, "cpu", metadata,
                                                tenant_id);
@@ -11196,7 +11855,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
             auto submission = persist_evict_oplog_or_skip(tenant_id, member_key,
                                                           member_metadata);
             if (!submission) {
-                return {.stop_scan = true};
+                return {.stop_scan = true, .error = submission.error()};
             }
             const uint64_t freed = try_evict_or_offload(
                 tenant_id, member_key, member_metadata, member.QuotaAccount(),
@@ -11214,16 +11873,39 @@ void MasterService::BatchEvict(double evict_ratio_target,
             return outcome;
         };
 
+        GroupEvictionProgress* progress = nullptr;
+        if (enable_oplog_ && eviction_continuation_) {
+            auto& progress_slot = eviction_continuation_->group_progress;
+            if (!progress_slot || progress_slot->tenant_id != tenant_id ||
+                progress_slot->group_id != group_id ||
+                progress_slot->trigger_key != key) {
+                progress_slot.emplace();
+                progress_slot->tenant_id = tenant_id;
+                progress_slot->group_id = group_id;
+                progress_slot->trigger_key = key;
+                progress_slot->trigger_generation = expected_generation;
+            }
+            progress = &*progress_slot;
+        }
         GroupEvictionResult group_result = EvictGroupOrObject(
-            tenant_id, key, group_id, allow_soft_pinned, now, evict_one_member);
+            tenant_id, key, group_id, allow_soft_pinned, now, evict_one_member,
+            progress, cutoff);
         EvictionResult result{.freed_bytes = group_result.freed_bytes,
                               .evicted_objects = group_result.evicted_objects,
-                              .stop_scan = group_result.stop_scan};
+                              .evicted_shards = group_result.evicted_shards,
+                              .stop_scan = group_result.stop_scan,
+                              .error = group_result.error};
+
+        if (!group_result.stop_scan && progress != nullptr &&
+            eviction_continuation_) {
+            eviction_continuation_->group_progress.reset();
+        }
 
         // The callback erased every member except the trigger; re-look-up the
         // trigger to erase it if it is now invalid.
         if (!enable_oplog_) {
-            MetadataAccessorRW trigger(this, ObjectIdentity{tenant_id, key});
+            MetadataAccessorRW trigger(
+                this, tenant_id, route::ObjectRef{key, expected_generation});
             if (trigger.IsPublished() && !trigger.Get().IsValid()) {
                 trigger.Erase();
             }
@@ -11237,7 +11919,9 @@ void MasterService::BatchEvict(double evict_ratio_target,
         size_t shard_idx;
         TenantId tenant_id;
         std::string key;
+        std::string group_id;
         std::chrono::system_clock::time_point lease_timeout;
+        route::Generation generation{0};
     };
 
     // Randomly select a starting shard to avoid imbalance eviction between
@@ -11305,7 +11989,9 @@ void MasterService::BatchEvict(double evict_ratio_target,
                         if (!IsSoftPinActive(it->second.metadata, now)) {
                             if (compact_frontier_prebypass) {
                                 local_candidates[t].push_back(
-                                    {s, tenant_id, it->first, deadline});
+                                    {s, tenant_id, it->first,
+                                     it->second.metadata.group_id, deadline,
+                                     it->second.generation});
                             } else {
                                 local_no_pin[t].push_back(deadline);
                             }
@@ -11416,7 +12102,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
                                 if (!in_range) continue;
                             }
                             local_frontier[t].push_back(
-                                {s, tenant_id, key, deadline});
+                                {s, tenant_id, key, record.metadata.group_id,
+                                 deadline, record.generation});
                         }
                     }
                 }
@@ -11476,10 +12163,44 @@ void MasterService::BatchEvict(double evict_ratio_target,
                                             /*collect_older_or_equal=*/true);
         }
     }
+
+    if (eviction_census_hook_for_testing_) {
+        auto hook = std::move(eviction_census_hook_for_testing_);
+        eviction_census_hook_for_testing_ = {};
+        hook();
+    }
+
+    // The continuation is created for every HA episode, including an episode
+    // whose primary frontier is empty but whose lower-bound second pass still
+    // has work.  The candidate vector and deadline populations are copied
+    // below; no map iterator or lock crosses the tick boundary.
+    if (enable_oplog_ && !eviction_continuation_) {
+        StartEvictionEpisode(evict_ratio_target, evict_ratio_lowerbound);
+        eviction_continuation_->eviction_base = total_eviction_base;
+        eviction_continuation_->primary_target =
+            std::min(ideal_evict_num, static_cast<long>(candidates.size()));
+        eviction_continuation_->start_shard_idx = start_idx;
+        // Keep the complete no-soft-pin deadline population for the second
+        // pass cutoff.  In compact-frontier mode the census stores identities
+        // directly, so `no_pin_timeouts` is empty and the candidate frontier
+        // is the equivalent full population.
+        if (!no_pin_timeouts.empty()) {
+            eviction_continuation_->no_soft_pin_deadlines = no_pin_timeouts;
+        } else {
+            eviction_continuation_->no_soft_pin_deadlines.reserve(
+                candidates.size());
+            for (const auto& candidate : candidates) {
+                eviction_continuation_->no_soft_pin_deadlines.push_back(
+                    candidate.lease_timeout);
+            }
+        }
+        eviction_continuation_->soft_pin_deadlines = soft_pin_objects;
+    }
     // ===== Phase 2: Serial eviction via key lookup =====
     long evicted_count = 0;
     uint64_t total_freed_size = 0;
     bool stop_eviction_scan = false;
+    ErrorCode stop_error = ErrorCode::OK;
     std::vector<std::chrono::system_clock::time_point> no_pin_objects;
     std::vector<std::vector<Replica>> deferred_replicas;
     // Shards that actually evicted this cycle; their metadata maps are
@@ -11496,12 +12217,29 @@ void MasterService::BatchEvict(double evict_ratio_target,
                              return a.lease_timeout < b.lease_timeout;
                          });
 
+        if (enable_oplog_ && eviction_continuation_) {
+            eviction_continuation_->primary_target = evict_num;
+            if (eviction_continuation_->primary_candidates.empty()) {
+                eviction_continuation_->primary_candidates.reserve(
+                    candidates.size());
+                for (const auto& candidate : candidates) {
+                    eviction_continuation_->primary_candidates.push_back(
+                        EvictionCandidate{
+                            candidate.tenant_id, candidate.key,
+                            candidate.group_id, candidate.shard_idx,
+                            candidate.lease_timeout, candidate.generation});
+                }
+            }
+        }
+
         // Treat evict_num as a minimum: if re-validation skips a candidate,
         // continue trying the next one so actual evicted count reaches
         // evict_num. This matches the old per-shard over-eviction behavior.
         long evicted_this_pass = 0;
         auto evict_candidate_batch = [&](std::vector<Candidate>& batch) {
-            for (auto& c : batch) {
+            for (size_t candidate_index = 0; candidate_index < batch.size();
+                 ++candidate_index) {
+                auto& c = batch[candidate_index];
                 if (stop_eviction_scan) break;
                 // Stop once the target object count is reached. Grouped
                 // eviction is all-or-none, so evicting a group can overshoot
@@ -11513,22 +12251,85 @@ void MasterService::BatchEvict(double evict_ratio_target,
                     continue;
                 }
                 auto evict_result = try_evict_group_or_object(
-                    c.tenant_id, c.key,
-                    /*allow_soft_pinned=*/false, deferred_replicas);
+                    c.tenant_id, c.key, c.shard_idx, c.generation,
+                    /*allow_soft_pinned=*/false, std::nullopt,
+                    deferred_replicas);
 
                 total_freed_size += evict_result.freed_bytes;
 
                 if (evict_result.revalidation_skipped) {
                     no_pin_objects.push_back(c.lease_timeout);
+                    if (eviction_continuation_) {
+                        ++eviction_continuation_stale_skips_;
+                        MasterMetricManager::instance()
+                            .inc_eviction_continuation_stale_skips();
+                    }
                 }
 
                 evicted_count += evict_result.evicted_objects;
                 evicted_this_pass += evict_result.evicted_objects;
                 if (evict_result.evicted_objects > 0) {
-                    evicted_shards.set(c.shard_idx);
+                    evicted_shards |= evict_result.evicted_shards;
                 }
                 if (evict_result.stop_scan) {
                     stop_eviction_scan = true;
+                    stop_error = evict_result.error;
+                    if (eviction_continuation_) {
+                        eviction_continuation_->evicted_count = evicted_count;
+                        eviction_continuation_->freed_bytes = total_freed_size;
+                        eviction_continuation_->evicted_shards |=
+                            evicted_shards;
+                        auto& deadlines =
+                            eviction_continuation_->no_soft_pin_deadlines;
+                        for (long i = 0; i < evict_result.evicted_objects;
+                             ++i) {
+                            auto deadline_it = std::find(
+                                deadlines.begin(), deadlines.end(),
+                                c.lease_timeout);
+                            if (deadline_it == deadlines.end()) {
+                                break;
+                            }
+                            deadlines.erase(deadline_it);
+                        }
+                    }
+                } else if (eviction_continuation_) {
+                    if (&batch == &candidates) {
+                        eviction_continuation_->next_primary_candidate =
+                            candidate_index + 1;
+                    } else {
+                        auto& pending =
+                            eviction_continuation_->primary_candidates;
+                        auto pending_it = std::find_if(
+                            pending.begin(), pending.end(), [&](const auto& p) {
+                                return p.tenant_id == c.tenant_id &&
+                                       p.key == c.key &&
+                                       p.shard_idx == c.shard_idx &&
+                                       p.generation == c.generation;
+                            });
+                        if (pending_it == pending.end()) {
+                            pending.push_back(EvictionCandidate{
+                                c.tenant_id, c.key, c.group_id, c.shard_idx,
+                                c.lease_timeout, c.generation});
+                            pending_it = std::prev(pending.end());
+                        }
+                        eviction_continuation_->next_primary_candidate =
+                            static_cast<size_t>(pending_it - pending.begin()) +
+                            1;
+                    }
+                    eviction_continuation_->evicted_count = evicted_count;
+                    eviction_continuation_->freed_bytes = total_freed_size;
+                    eviction_continuation_->evicted_shards |= evicted_shards;
+                    auto& deadlines =
+                        eviction_continuation_->no_soft_pin_deadlines;
+                    for (long i = 0; i < evict_result.evicted_objects; ++i) {
+                        auto deadline_it =
+                            std::find(deadlines.begin(), deadlines.end(),
+                                      c.lease_timeout);
+                        if (deadline_it == deadlines.end()) {
+                            break;
+                        }
+                        deadlines.erase(deadline_it);
+                    }
                 }
                 deferred_replicas.clear();
             }
@@ -11546,6 +12347,14 @@ void MasterService::BatchEvict(double evict_ratio_target,
             auto refill_candidates = collect_candidates(
                 /*use_cutoff=*/true, reserve_cutoff,
                 /*collect_older_or_equal=*/false);
+            if (eviction_continuation_) {
+                for (const auto& c : refill_candidates) {
+                    eviction_continuation_->primary_candidates.push_back(
+                        EvictionCandidate{c.tenant_id, c.key, c.group_id,
+                                          c.shard_idx, c.lease_timeout,
+                                          c.generation});
+                }
+            }
             evict_candidate_batch(refill_candidates);
         }
     }
@@ -11553,6 +12362,10 @@ void MasterService::BatchEvict(double evict_ratio_target,
     // Try releasing discarded replicas before we decide whether to do the
     // second pass.
     uint64_t released_discarded_cnt = ReleaseExpiredDiscardedReplicas(now);
+    if (eviction_continuation_) {
+        eviction_continuation_->released_discarded_replica_count +=
+            released_discarded_cnt;
+    }
 
     // The ideal number of objects to evict in the second pass
     long target_evict_num =
@@ -11573,6 +12386,18 @@ void MasterService::BatchEvict(double evict_ratio_target,
                              no_pin_objects.begin() + (target_evict_num - 1),
                              no_pin_objects.end());
             auto target_timeout = no_pin_objects[target_evict_num - 1];
+            if (eviction_continuation_) {
+                auto& second_pass = eviction_continuation_->second_pass;
+                second_pass = SecondPassScan{};
+                eviction_continuation_->phase =
+                    EvictionContinuationPhase::kSecondPassNoSoftPin;
+                second_pass.next_shard = start_idx;
+                second_pass.cutoff = target_timeout;
+                second_pass.remaining_target = target_evict_num;
+                second_pass.allow_soft_pinned = false;
+                eviction_continuation_->no_soft_pin_deadlines.clear();
+                eviction_continuation_->soft_pin_deadlines.clear();
+            }
 
             // Evict via key lookup — avoid full metadata traversal
             for (size_t i = 0;
@@ -11580,41 +12405,89 @@ void MasterService::BatchEvict(double evict_ratio_target,
                  i++) {
                 const size_t shard_idx = (start_idx + i) % kNumShards;
                 {
-                    std::vector<std::pair<TenantId, std::string>> to_evict;
+                    std::vector<EvictionCandidate> batch_candidates;
                     {
                         MetadataShardAccessorRW shard(this, shard_idx);
-                        for (auto tenant_it = shard->tenants.begin();
-                             tenant_it != shard->tenants.end(); ++tenant_it) {
-                            auto& tenant_state = tenant_it->second;
-                            for (auto it = tenant_state.metadata.begin();
-                                 it != tenant_state.metadata.end(); ++it) {
-                                if (!it->second.metadata.IsHardPinned() &&
-                                    now >= it->second.metadata
-                                               .EvictionDeadline() &&
-                                    it->second.metadata.EvictionDeadline() <=
-                                        target_timeout &&
-                                    !IsSoftPinActive(it->second.metadata,
-                                                     now) &&
-                                    can_evict_replicas(it->second.metadata)) {
-                                    to_evict.emplace_back(tenant_it->first,
-                                                          it->first);
+                        for (const auto& [tenant_id, tenant_state] :
+                             shard->tenants) {
+                            for (const auto& [key, record] :
+                                 tenant_state.metadata) {
+                                const auto& metadata = record.metadata;
+                                const auto deadline =
+                                    metadata.EvictionDeadline();
+                                if (metadata.IsHardPinned() || now < deadline ||
+                                    deadline > target_timeout ||
+                                    IsSoftPinActive(metadata, now) ||
+                                    !can_evict_replicas(metadata)) {
+                                    continue;
                                 }
+                                batch_candidates.push_back(EvictionCandidate{
+                                    tenant_id, key, metadata.group_id, shard_idx,
+                                    deadline, record.generation});
                             }
                         }
                     }
-                    for (auto& c : to_evict) {
+                    if (eviction_continuation_) {
+                        eviction_continuation_->second_pass.next_shard =
+                            (shard_idx + 1) % kNumShards;
+                        eviction_continuation_->second_pass.scanned_shards =
+                            i + 1;
+                        eviction_continuation_->second_pass.cutoff =
+                            target_timeout;
+                        eviction_continuation_->second_pass.remaining_target =
+                            target_evict_num;
+                        eviction_continuation_->second_pass.allow_soft_pinned =
+                            false;
+                        eviction_continuation_->second_pass.pending_candidates
+                            .clear();
+                        eviction_continuation_->second_pass.next_pending = 0;
+                        eviction_continuation_->second_pass.pending_candidates =
+                            batch_candidates;
+                    }
+                    for (size_t pending_index = 0;
+                         pending_index < batch_candidates.size();
+                         ++pending_index) {
+                        const auto& c = batch_candidates[pending_index];
                         if (target_evict_num <= 0 || stop_eviction_scan) break;
                         auto evict_result = try_evict_group_or_object(
-                            c.first, c.second,
-                            /*allow_soft_pinned=*/false, deferred_replicas);
+                            c.tenant_id, c.key, c.shard_idx, c.generation,
+                            /*allow_soft_pinned=*/false, target_timeout,
+                            deferred_replicas);
                         total_freed_size += evict_result.freed_bytes;
                         evicted_count += evict_result.evicted_objects;
-                        target_evict_num -= evict_result.evicted_objects;
+                        target_evict_num = std::max<long>(
+                            0, target_evict_num - evict_result.evicted_objects);
+                        if (evict_result.revalidation_skipped &&
+                            eviction_continuation_) {
+                            ++eviction_continuation_stale_skips_;
+                            MasterMetricManager::instance()
+                                .inc_eviction_continuation_stale_skips();
+                        }
                         if (evict_result.evicted_objects > 0) {
-                            evicted_shards.set(shard_idx);
+                            evicted_shards |= evict_result.evicted_shards;
                         }
                         if (evict_result.stop_scan) {
                             stop_eviction_scan = true;
+                            stop_error = evict_result.error;
+                            if (eviction_continuation_) {
+                                eviction_continuation_->evicted_count =
+                                    evicted_count;
+                                eviction_continuation_->freed_bytes =
+                                    total_freed_size;
+                                eviction_continuation_->evicted_shards |=
+                                    evicted_shards;
+                                eviction_continuation_->second_pass
+                                    .remaining_target = target_evict_num;
+                            }
+                        } else if (eviction_continuation_) {
+                            eviction_continuation_->second_pass.next_pending =
+                                pending_index + 1;
+                            eviction_continuation_->evicted_count =
+                                evicted_count;
+                            eviction_continuation_->freed_bytes =
+                                total_freed_size;
+                            eviction_continuation_->second_pass
+                                .remaining_target = target_evict_num;
                         }
                     }
                 }
@@ -11630,49 +12503,110 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 soft_pin_objects.begin() + (soft_pin_evict_num - 1),
                 soft_pin_objects.end());
             auto soft_target_timeout = soft_pin_objects[soft_pin_evict_num - 1];
+            if (eviction_continuation_) {
+                auto& second_pass = eviction_continuation_->second_pass;
+                second_pass = SecondPassScan{};
+                eviction_continuation_->phase =
+                    EvictionContinuationPhase::kSecondPassSoftPin;
+                second_pass.next_shard = start_idx;
+                second_pass.cutoff = soft_target_timeout;
+                second_pass.remaining_target = target_evict_num;
+                second_pass.allow_soft_pinned = true;
+                eviction_continuation_->no_soft_pin_deadlines.clear();
+                eviction_continuation_->soft_pin_deadlines.clear();
+            }
 
             for (size_t i = 0;
                  i < kNumShards && target_evict_num > 0 && !stop_eviction_scan;
                  i++) {
                 const size_t shard_idx = (start_idx + i) % kNumShards;
                 {
-                    std::vector<std::pair<TenantId, std::string>> to_evict;
+                    std::vector<EvictionCandidate> batch_candidates;
                     {
                         MetadataShardAccessorRW shard(this, shard_idx);
-                        for (auto tenant_it = shard->tenants.begin();
-                             tenant_it != shard->tenants.end(); ++tenant_it) {
-                            auto& tenant_state = tenant_it->second;
-                            for (auto it = tenant_state.metadata.begin();
-                                 it != tenant_state.metadata.end(); ++it) {
-                                if (it->second.metadata.IsHardPinned() ||
-                                    now < it->second.metadata
-                                              .EvictionDeadline() ||
-                                    !can_evict_replicas(it->second.metadata)) {
+                        for (const auto& [tenant_id, tenant_state] :
+                             shard->tenants) {
+                            for (const auto& [key, record] :
+                                 tenant_state.metadata) {
+                                const auto& metadata = record.metadata;
+                                const auto deadline =
+                                    metadata.EvictionDeadline();
+                                if (metadata.IsHardPinned() || now < deadline ||
+                                    !can_evict_replicas(metadata)) {
                                     continue;
                                 }
-                                if (!IsSoftPinActive(it->second.metadata,
-                                                     now) ||
-                                    it->second.metadata.EvictionDeadline() <=
-                                        soft_target_timeout) {
-                                    to_evict.emplace_back(tenant_it->first,
-                                                          it->first);
+                                if (!IsSoftPinActive(metadata, now) ||
+                                    deadline <= soft_target_timeout) {
+                                    batch_candidates.push_back(
+                                        EvictionCandidate{
+                                            tenant_id, key, metadata.group_id,
+                                            shard_idx, deadline,
+                                            record.generation});
                                 }
                             }
                         }
                     }
-                    for (auto& c : to_evict) {
+                    if (eviction_continuation_) {
+                        eviction_continuation_->second_pass.next_shard =
+                            (shard_idx + 1) % kNumShards;
+                        eviction_continuation_->second_pass.scanned_shards =
+                            i + 1;
+                        eviction_continuation_->second_pass.cutoff =
+                            soft_target_timeout;
+                        eviction_continuation_->second_pass.remaining_target =
+                            target_evict_num;
+                        eviction_continuation_->second_pass.allow_soft_pinned =
+                            true;
+                        eviction_continuation_->second_pass.pending_candidates
+                            .clear();
+                        eviction_continuation_->second_pass.next_pending = 0;
+                        eviction_continuation_->second_pass.pending_candidates =
+                            batch_candidates;
+                    }
+                    for (size_t pending_index = 0;
+                         pending_index < batch_candidates.size();
+                         ++pending_index) {
+                        const auto& c = batch_candidates[pending_index];
                         if (target_evict_num <= 0 || stop_eviction_scan) break;
                         auto evict_result = try_evict_group_or_object(
-                            c.first, c.second,
-                            /*allow_soft_pinned=*/true, deferred_replicas);
+                            c.tenant_id, c.key, c.shard_idx, c.generation,
+                            /*allow_soft_pinned=*/true, soft_target_timeout,
+                            deferred_replicas);
                         total_freed_size += evict_result.freed_bytes;
                         evicted_count += evict_result.evicted_objects;
-                        target_evict_num -= evict_result.evicted_objects;
+                        target_evict_num = std::max<long>(
+                            0, target_evict_num - evict_result.evicted_objects);
+                        if (evict_result.revalidation_skipped &&
+                            eviction_continuation_) {
+                            ++eviction_continuation_stale_skips_;
+                            MasterMetricManager::instance()
+                                .inc_eviction_continuation_stale_skips();
+                        }
                         if (evict_result.evicted_objects > 0) {
-                            evicted_shards.set(shard_idx);
+                            evicted_shards |= evict_result.evicted_shards;
                         }
                         if (evict_result.stop_scan) {
                             stop_eviction_scan = true;
+                            stop_error = evict_result.error;
+                            if (eviction_continuation_) {
+                                eviction_continuation_->evicted_count =
+                                    evicted_count;
+                                eviction_continuation_->freed_bytes =
+                                    total_freed_size;
+                                eviction_continuation_->evicted_shards |=
+                                    evicted_shards;
+                                eviction_continuation_->second_pass
+                                    .remaining_target = target_evict_num;
+                            }
+                        } else if (eviction_continuation_) {
+                            eviction_continuation_->second_pass.next_pending =
+                                pending_index + 1;
+                            eviction_continuation_->evicted_count =
+                                evicted_count;
+                            eviction_continuation_->freed_bytes =
+                                total_freed_size;
+                            eviction_continuation_->second_pass
+                                .remaining_target = target_evict_num;
                         }
                     }
                 }
@@ -11688,6 +12622,16 @@ void MasterService::BatchEvict(double evict_ratio_target,
                        << ", eviction_base=" << total_eviction_base
                        << ", evict_ratio_target=" << evict_ratio_target
                        << ", evict_ratio_lowerbound=" << evict_ratio_lowerbound;
+        }
+    }
+
+    if (stop_eviction_scan) {
+        if (stop_error == ErrorCode::TASK_PENDING_LIMIT_EXCEEDED) {
+            MasterMetricManager::instance().inc_eviction_backpressure_pauses();
+            return;
+        }
+        if (eviction_continuation_) {
+            ClearEvictionContinuation(ClassifyWriterError(stop_error));
         }
     }
 
@@ -11766,6 +12710,9 @@ void MasterService::BatchEvict(double evict_ratio_target,
                      << offload_push_failed_forced
                      << " object(s); force-evicted without disk offload "
                         "(offload_force_evict=true).";
+    }
+    if (eviction_continuation_) {
+        FinishEvictionContinuation();
     }
 }
 
@@ -13581,13 +14528,28 @@ ErrorCode MasterService::InitializeBatchOpLogWriter(
     }
     writer->Start();
 
+    std::lock_guard<std::recursive_mutex> eviction_lock(
+        eviction_continuation_mutex_);
     if (ordered_oplog_writer_) {
+        ClearEvictionContinuation(
+            EvictionContinuationDropReason::kWriterStopped,
+            /*record_episode_result=*/true);
+        eviction_writer_replacement_required_.store(
+            true, std::memory_order_relaxed);
+        eviction_abort_requested_.store(true, std::memory_order_relaxed);
         ordered_oplog_writer_->Stop();
     }
     batch_oplog_kv_backend_ = std::move(backend);
     batch_oplog_storage_ = std::move(storage);
     ordered_oplog_writer_ = std::move(writer);
     ordered_oplog_writer_->ActivateRuntimeMetrics();
+    // A terminal callback from the old writer is synchronous with Stop() in
+    // the normal implementation.  Clear the lifecycle signal only after the
+    // replacement is installed so a stale callback cannot revive the old
+    // continuation while the new writer is being published.
+    eviction_abort_requested_.store(false, std::memory_order_relaxed);
+    eviction_writer_replacement_required_.store(false,
+                                               std::memory_order_relaxed);
     return ErrorCode::OK;
 }
 

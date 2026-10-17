@@ -36,6 +36,133 @@ void MasterServiceTestPeer::RunBatchEvictForTesting(
     service_.BatchEvict(evict_ratio_target, evict_ratio_lowerbound);
 }
 
+void MasterServiceTestPeer::SetEvictionCensusHookForTesting(
+    std::function<void()> hook) {
+    std::lock_guard<std::recursive_mutex> lock(
+        service_.eviction_continuation_mutex_);
+    service_.eviction_census_hook_for_testing_ = std::move(hook);
+}
+
+void MasterServiceTestPeer::PrepareSoftPinSecondPassForTesting(
+    size_t shard_idx, std::chrono::system_clock::time_point cutoff) {
+    std::lock_guard<std::recursive_mutex> lock(
+        service_.eviction_continuation_mutex_);
+    MasterService::EvictionContinuation continuation;
+    continuation.eviction_base = 1;
+    continuation.phase =
+        MasterService::EvictionContinuationPhase::kSecondPassSoftPin;
+    continuation.second_pass.next_shard = shard_idx;
+    continuation.second_pass.scanned_shards = kNumShards - 1;
+    continuation.second_pass.cutoff = cutoff;
+    continuation.second_pass.remaining_target = 1;
+    continuation.second_pass.allow_soft_pinned = true;
+    service_.eviction_continuation_ = std::move(continuation);
+}
+
+void MasterServiceTestPeer::DisableSoftPinForTesting(
+    const TenantId& tenant_id, const std::string& key) {
+    MetadataAccessorRW accessor(&service_, ObjectIdentity{tenant_id, key});
+    if (!accessor.Exists()) {
+        return;
+    }
+
+    auto& metadata = accessor.Get();
+    const auto soft_pin_deadline = metadata.GetCommittedSoftPinTimeout();
+    if (!soft_pin_deadline) {
+        return;
+    }
+    const auto shard_idx = service_.GetMetadataShardIndex(metadata);
+    {
+        SpinLocker locker(&metadata.lock);
+        metadata.soft_pin_timeout.reset();
+    }
+    service_.soft_pin_deadline_index_.RemoveIfMatches(
+        tenant_id.MakeScopedKey(key), shard_idx, *soft_pin_deadline);
+    MasterService::ApplySoftPinMetricDelta(-1);
+}
+
+uint64_t MasterServiceTestPeer::GetEvictionCensusRunsForTesting() const {
+    std::lock_guard<std::recursive_mutex> lock(
+        service_.eviction_continuation_mutex_);
+    return service_.eviction_census_runs_;
+}
+
+bool MasterServiceTestPeer::HasEvictionContinuationForTesting() const {
+    std::lock_guard<std::recursive_mutex> lock(
+        service_.eviction_continuation_mutex_);
+    return service_.eviction_continuation_.has_value();
+}
+
+uint64_t MasterServiceTestPeer::GetObjectGenerationForTesting(
+    const TenantId& tenant_id, const std::string& key) const {
+    const size_t shard_idx = service_.getShardIndex(tenant_id, key);
+    MasterService::MetadataShardAccessorRO shard(&service_, shard_idx);
+    auto tenant_it = shard->tenants.find(tenant_id);
+    if (tenant_it == shard->tenants.end()) {
+        return 0;
+    }
+    auto object_it = tenant_it->second.metadata.find(key);
+    if (object_it == tenant_it->second.metadata.end()) {
+        return 0;
+    }
+    return object_it->second.generation;
+}
+
+size_t MasterServiceTestPeer::GetMetadataShardIndexForTesting(
+    const TenantId& tenant_id, const std::string& key) const {
+    return service_.getShardIndex(tenant_id, key);
+}
+
+std::string MasterServiceTestPeer::GetEvictionContinuationPhaseForTesting()
+    const {
+    std::lock_guard<std::recursive_mutex> lock(
+        service_.eviction_continuation_mutex_);
+    if (!service_.eviction_continuation_) {
+        return "none";
+    }
+    switch (service_.eviction_continuation_->phase) {
+        case MasterService::EvictionContinuationPhase::kPrimary:
+            return "primary";
+        case MasterService::EvictionContinuationPhase::kSecondPassNoSoftPin:
+            return "second_pass_no_soft_pin";
+        case MasterService::EvictionContinuationPhase::kSecondPassSoftPin:
+            return "second_pass_soft_pin";
+    }
+    return "unknown";
+}
+
+std::pair<size_t, size_t>
+MasterServiceTestPeer::GetEvictionSecondPassPendingCursorForTesting() const {
+    std::lock_guard<std::recursive_mutex> lock(
+        service_.eviction_continuation_mutex_);
+    if (!service_.eviction_continuation_) {
+        return {0, 0};
+    }
+    const auto& second_pass =
+        service_.eviction_continuation_->second_pass;
+    return {second_pass.pending_candidates.size(), second_pass.next_pending};
+}
+
+std::pair<size_t, size_t>
+MasterServiceTestPeer::GetEvictionGroupMemberCursorForTesting() const {
+    std::lock_guard<std::recursive_mutex> lock(
+        service_.eviction_continuation_mutex_);
+    if (!service_.eviction_continuation_ ||
+        !service_.eviction_continuation_->group_progress) {
+        return {0, 0};
+    }
+    const auto& progress =
+        *service_.eviction_continuation_->group_progress;
+    return {progress.members.size(), progress.next_member};
+}
+
+uint64_t MasterServiceTestPeer::GetEvictionContinuationStaleSkipsForTesting()
+    const {
+    std::lock_guard<std::recursive_mutex> lock(
+        service_.eviction_continuation_mutex_);
+    return service_.eviction_continuation_stale_skips_;
+}
+
 void MasterServiceTestPeer::RunNoFBatchEvictForTesting(
     double evict_ratio_target, double evict_ratio_lowerbound) {
     service_.NoFBatchEvict(evict_ratio_target, evict_ratio_lowerbound);
