@@ -152,6 +152,9 @@ void ShmTransport::startTransfer(ShmTask *task, ShmSubBatch *batch) {
 Status ShmTransport::getTransferStatus(SubBatchRef batch, int task_id,
                                        TransferStatus &status) {
     auto shm_batch = dynamic_cast<ShmSubBatch *>(batch);
+    if (!shm_batch) {
+        return Status::InvalidArgument("Invalid SHM sub-batch" LOC_MARK);
+    }
     if (task_id < 0 || task_id >= (int)shm_batch->task_list.size()) {
         return Status::InvalidArgument("Invalid task id" LOC_MARK);
     }
