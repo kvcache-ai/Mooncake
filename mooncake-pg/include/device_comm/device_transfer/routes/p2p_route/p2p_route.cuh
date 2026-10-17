@@ -6,7 +6,7 @@
 #include <cooperative_groups.h>
 #include <transport/device/device_ops.cuh>
 
-#include "device_comm/device_utils/device_assert.cuh"
+#include "pg_assert.h"
 #include "device_comm/device_primitives/value_primitives.cuh"
 #include "device_comm/device_transfer/transfer_types.cuh"
 
@@ -33,8 +33,8 @@ __device__ __forceinline__ void applyP2pSignalAction(
     // applying the peer-visible action.
     device::mc_fence_barrier_fence();
     if (signal.kind == SignalAction::Kind::None) return;
-    PG_DEVICE_ASSERT(signal.kind == SignalAction::Kind::Add ||
-                     signal.kind == SignalAction::Kind::Set);
+    PG_ASSERT(signal.kind == SignalAction::Kind::Add ||
+              signal.kind == SignalAction::Kind::Set);
 
     if (block.thread_rank() == 0) {
         auto* const target =
@@ -53,7 +53,7 @@ __device__ __forceinline__ P2pTransferTicket
 p2pPut(const DeviceP2pRoute& route, const void* source,
        uint64_t remote_payload_offset, uint64_t size,
        const SignalAction& signal, cooperative_groups::thread_block block) {
-    PG_DEVICE_ASSERT(route.mapped_region_address != 0);
+    PG_ASSERT(route.mapped_region_address != 0);
     auto* const remote_region = reinterpret_cast<char*>(
         static_cast<uintptr_t>(route.mapped_region_address));
     if (size != 0) {
@@ -68,7 +68,7 @@ p2pPut(const DeviceP2pRoute& route, const void* source,
 __device__ __forceinline__ P2pTransferTicket
 p2pSignal(const DeviceP2pRoute& route, const SignalAction& signal,
           cooperative_groups::thread_block block) {
-    PG_DEVICE_ASSERT(route.mapped_region_address != 0);
+    PG_ASSERT(route.mapped_region_address != 0);
     auto* const remote_region = reinterpret_cast<char*>(
         static_cast<uintptr_t>(route.mapped_region_address));
     applyP2pSignalAction(remote_region, signal, block);

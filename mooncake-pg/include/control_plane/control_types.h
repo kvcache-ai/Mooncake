@@ -1,6 +1,7 @@
 #ifndef MOONCAKE_PG_CONTROL_PLANE_CONTROL_TYPES_H
 #define MOONCAKE_PG_CONTROL_PLANE_CONTROL_TYPES_H
 
+#include <array>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -14,6 +15,7 @@ namespace mooncake {
 using GroupBootstrapId = std::string;
 // Coordinator-assigned unique group id
 using GroupId = std::string;
+using DeviceUUID = std::array<uint8_t, 16>;
 
 // Resolves a registration only against runtime groups stored under the same
 // GroupBootstrapId, i.e. the same device kind and PyTorch group id.
@@ -75,34 +77,53 @@ struct DeviceTransferEndpoint {
     bool operator==(const DeviceTransferEndpoint&) const = default;
 };
 
-// Group-level endpoint of one Ring AllReduce algorithm instance. Signals are
-// communicator-local even though their backing memory comes from the
-// process-wide peer-accessible region.
-struct RingAllReduceEndpoint {
+// Communicator-local signals interpreted by Simple primitives. Payload uses
+// the process-level collective workspace.
+struct SimpleEndpoint {
     uint64_t signal_offset = 0;
     uint32_t signal_count = 0;
 
-    bool operator==(const RingAllReduceEndpoint&) const = default;
+    bool operator==(const SimpleEndpoint&) const = default;
 };
 
-// Group-level endpoints published by the device collective runtime and the
-// algorithms owned by one communicator.
+// Communicator-local control signals interpreted by LL primitives.
+struct LLEndpoint {
+    uint64_t signal_offset = 0;
+    uint32_t signal_count = 0;
+    DeviceUUID device_uuid{};
+    // Hardware peers supporting native atomics from this device.
+    std::vector<DeviceUUID> native_atomic_peer_uuids;
+
+    bool operator==(const LLEndpoint&) const = default;
+};
+
+// Private one-shot packet storage.
+struct OneShotEndpoint {
+    uint64_t buffer_offset = 0;
+    uint64_t buffer_size = 0;
+
+    bool operator==(const OneShotEndpoint&) const = default;
+};
+
+// Runtime, protocol and algorithm endpoints owned by one communicator.
 struct DeviceGroupEndpoint {
     // Runtime-owned signal slice for synchronizing one GroupView incarnation.
     // Each slot is written only by the peer with the matching InGroupRank.
     uint64_t view_epoch_signal = 0;
     uint32_t view_epoch_signal_count = 0;
 
-    std::optional<RingAllReduceEndpoint> ring_all_reduce;
+    std::optional<SimpleEndpoint> simple;
+    std::optional<LLEndpoint> ll;
+    std::optional<OneShotEndpoint> one_shot;
 
     [[nodiscard]] bool empty() const noexcept {
-        return view_epoch_signal_count == 0 && !ring_all_reduce.has_value();
+        return view_epoch_signal_count == 0 && !simple.has_value() &&
+               !ll.has_value() && !one_shot.has_value();
     }
 
-    // True when the runtime and every algorithm required by the New backend
-    // have published their group-level endpoints.
+    // Ring is the baseline; LL and one-shot resources are optional.
     [[nodiscard]] bool hasAllRequiredEndpoints() const noexcept {
-        return view_epoch_signal_count != 0 && ring_all_reduce.has_value();
+        return view_epoch_signal_count != 0 && simple.has_value();
     }
 
     [[nodiscard]] bool supportsBackend(
@@ -208,6 +229,19 @@ enum class GroupStatus : uint8_t {
     Ready = 2,
 };
 
+enum class DeviceAllReduceAlgorithm : uint8_t {
+    Ring = 1,
+    OneShot = 2,
+};
+
+// Coordinator-provided upper bounds, in increasing byte order.
+struct DeviceAllReduceAlgorithmChoice {
+    uint64_t max_bytes = 0;
+    DeviceAllReduceAlgorithm algorithm = DeviceAllReduceAlgorithm::Ring;
+
+    bool operator==(const DeviceAllReduceAlgorithmChoice&) const = default;
+};
+
 // Runtime state for a group.
 struct GroupView {
     GroupId group_id;
@@ -217,6 +251,7 @@ struct GroupView {
     // Coordinator-selected implementation for active GPU group members. It is
     // empty for CPU groups and until a GPU group leaves Bootstrapping.
     std::optional<GpuCollectiveBackend> gpu_collective_backend;
+    std::vector<DeviceAllReduceAlgorithmChoice> all_reduce_algorithm_choices;
     int32_t max_group_size = 0;          // fixed in-group slot capacity
     std::vector<GlobalRank> rank_order;  // InGroupRank -> GlobalRank
     std::vector<GroupMember> members;    // indexed by GlobalRank
