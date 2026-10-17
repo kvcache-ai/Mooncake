@@ -98,7 +98,8 @@ Status DeviceSelector::allocate(uint64_t total_length, uint32_t num_slices,
                                 uint64_t slice_bytes,
                                 const std::string& location,
                                 std::vector<int>& slice_dev_ids, int priority,
-                                uint64_t device_mask) {
+                                uint64_t device_mask, int* unavailable_device) {
+    if (unavailable_device) *unavailable_device = -1;
     slice_dev_ids.clear();
     slice_dev_ids.reserve(num_slices);
     auto entry = local_topology_->getMemEntry(location);
@@ -129,7 +130,11 @@ Status DeviceSelector::allocate(uint64_t total_length, uint32_t num_slices,
             thread_local std::vector<int> tl_eligible;
             tl_eligible.clear();
             for (int dev_id : entry->device_list[rank]) {
-                if (!usable(dev_id)) continue;
+                if (!usable(dev_id)) {
+                    recordUnavailableDevice(entry, dev_id, device_mask,
+                                            unavailable_device);
+                    continue;
+                }
                 if ((device_mask & (1ULL << dev_id)) == 0) continue;
                 if (!isNumaEligible(entry, dev_id)) continue;
                 tl_eligible.push_back(dev_id);
@@ -153,15 +158,18 @@ Status DeviceSelector::allocate(uint64_t total_length, uint32_t num_slices,
                 devices_[dev_id].total_bytes.fetch_add(
                     this_slice_bytes, std::memory_order_relaxed);
             }
+            if (unavailable_device) *unavailable_device = -1;
             return Status::OK();
         }
         return Status::DeviceNotFound(noEligibleDeviceReason());
     }
 
     std::vector<DeviceSelector::Candidate> tl_candidates;
-    Status status = buildCandidates(entry, slice_bytes, device_mask,
-                                    tl_candidates, priority);
+    Status status =
+        buildCandidates(entry, slice_bytes, device_mask, tl_candidates,
+                        priority, unavailable_device);
     if (!status.ok()) return status;
+    if (unavailable_device) *unavailable_device = -1;
     if (num_slices == 1) {
         selectSinglePath(tl_candidates, num_slices, total_length,
                          slice_dev_ids);
@@ -225,7 +233,8 @@ Status DeviceSelector::buildCandidates(const Topology::MemEntry* entry,
                                        uint64_t slice_bytes,
                                        uint64_t device_mask,
                                        std::vector<Candidate>& candidates,
-                                       int request_priority) {
+                                       int request_priority,
+                                       int* unavailable_device) {
     // Helper lambda to add candidate device
     // Score formula: predicted_time × numa_penalty + random_jitter
     // Lower score = better candidate
@@ -250,7 +259,11 @@ Status DeviceSelector::buildCandidates(const Topology::MemEntry* entry,
     // First pass: filter by device priority (QoS filtering)
     for (size_t rank = 0; rank < Topology::DevicePriorityRanks; ++rank) {
         for (int dev_id : entry->device_list[rank]) {
-            if (!usable(dev_id)) continue;
+            if (!usable(dev_id)) {
+                recordUnavailableDevice(entry, dev_id, device_mask,
+                                        unavailable_device);
+                continue;
+            }
             if ((device_mask & (1ULL << dev_id)) == 0) continue;
             if (!isNumaEligible(entry, dev_id)) continue;
             // QoS: Get device's current priority slot (local, per-process)
@@ -268,7 +281,11 @@ Status DeviceSelector::buildCandidates(const Topology::MemEntry* entry,
     if (candidates.empty()) {
         for (size_t rank = 0; rank < Topology::DevicePriorityRanks; ++rank) {
             for (int dev_id : entry->device_list[rank]) {
-                if (!usable(dev_id)) continue;
+                if (!usable(dev_id)) {
+                    recordUnavailableDevice(entry, dev_id, device_mask,
+                                            unavailable_device);
+                    continue;
+                }
                 if ((device_mask & (1ULL << dev_id)) == 0) continue;
                 if (!isNumaEligible(entry, dev_id)) continue;
                 add_candidate(dev_id, rank);
@@ -387,10 +404,10 @@ Status DeviceSelector::allocate(uint64_t length, const std::string& location,
 
 Status DeviceSelector::allocate(uint64_t length, const std::string& location,
                                 int& chosen_dev_id, int priority,
-                                uint64_t device_mask) {
+                                uint64_t device_mask, int* unavailable_device) {
     std::vector<int> slice_dev_ids;
     Status status = allocate(length, 1, length, location, slice_dev_ids,
-                             priority, device_mask);
+                             priority, device_mask, unavailable_device);
     if (!status.ok()) return status;
     if (slice_dev_ids.empty()) {
         return Status::DeviceNotFound("allocation failed");

@@ -53,6 +53,7 @@ constexpr ConfigFieldSpec kConfigFields[] = {
     {"transports/rdma/rail_error_threshold", ConfigFieldMatch::kExact},
     {"transports/rdma/rail_error_window_secs", ConfigFieldMatch::kExact},
     {"transports/rdma/rail_cooldown_secs", ConfigFieldMatch::kExact},
+    {"transports/rdma/rail_recovery_probe_enabled", ConfigFieldMatch::kExact},
     {"transports/rdma/gdr_error_threshold", ConfigFieldMatch::kExact},
     {"transports/rdma/gdr_error_window_secs", ConfigFieldMatch::kExact},
     {"transports/rdma/gdr_cooldown_secs", ConfigFieldMatch::kExact},

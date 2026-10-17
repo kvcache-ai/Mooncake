@@ -15,6 +15,8 @@
 #ifndef TENT_RAIL_MONITOR_H
 #define TENT_RAIL_MONITOR_H
 
+#include <cstdint>
+
 #include "tent/common/config.h"
 #include "tent/common/status.h"
 #include "tent/runtime/topology.h"
@@ -31,6 +33,7 @@ class RailMonitor {
     // Upper bound on the exponential-backoff cooldown; prevents the
     // per-rail pause from growing without bound under repeated failure.
     static constexpr std::chrono::seconds kMaxCooldown{300};
+    static constexpr size_t kSnapshotCleanupInterval = 64;
 
    public:
     // Config keys. Exposed as constants so callers (and docs) reference
@@ -43,6 +46,8 @@ class RailMonitor {
         "transports/rdma/rail_cooldown_secs";
     static constexpr const char *kCfgProbeIntervalSecs =
         "transports/rdma/rail_probe_interval_secs";
+    static constexpr const char *kCfgRecoveryProbeEnabled =
+        "transports/rdma/rail_recovery_probe_enabled";
 
    public:
     RailMonitor() = default;
@@ -65,7 +70,7 @@ class RailMonitor {
     Status load(std::shared_ptr<const Topology> local,
                 std::shared_ptr<const Topology> remote,
                 const std::string &rail_topo_json = "",
-                const Config *conf = nullptr);
+                const Config *conf = nullptr, uint64_t remote_snapshot_key = 0);
 
     bool ready() { return ready_; }
 
@@ -77,6 +82,15 @@ class RailMonitor {
     // Same-host same-NIC loopback remains legal, as in worker fallback.
     uint64_t localDeviceMask(const Topology::MemEntry &remote_memory,
                              bool same_machine = false) const;
+
+    struct HealthSnapshot {
+        bool paused = false;
+        bool probe_in_progress = false;
+        uint64_t retry_after_ns = 0;
+    };
+
+    // Read-only evidence from the existing recovery policy.
+    HealthSnapshot healthSnapshot(int local_nic, int remote_nic) const;
 
     // Mutating admit: the ONLY path that arms a probe/trial. Returns true when
     // a transfer may use this rail -- Closed (no-op), or an exploratory probe /
@@ -91,7 +105,19 @@ class RailMonitor {
     // two workers arm a probe on the same rail.
     bool admit(int local_nic, int remote_nic);
 
-    void markFailed(int local_nic, int remote_nic);
+    // A paused rail may admit one slice after a newer remote metadata
+    // snapshot arrives. A zero token requests ownership; a non-zero token
+    // lets the owning slice retain that ownership across endpoint retries.
+    // probe_in_progress distinguishes a sibling's active probe from a rail
+    // that has no recovery evidence left.
+    bool tryRecoveryProbe(int local_nic, int remote_nic, uint64_t &token,
+                          bool *probe_in_progress = nullptr);
+
+    // Return ownership when the admitted slice is cancelled or rejected
+    // before post, allowing another slice to use the same fresh snapshot.
+    void abandonRecoveryProbe(uint64_t token);
+
+    void markFailed(int local_nic, int remote_nic, uint64_t probe_token = 0);
 
     void markRecovered(int local_nic, int remote_nic);
 
@@ -130,6 +156,8 @@ class RailMonitor {
         std::chrono::steady_clock::time_point last_probe_time{};
         bool half_open = false;
         bool probe_in_flight = false;
+        uint64_t last_probe_generation = 0;
+        uint64_t active_probe_token = 0;
 
         bool paused() const {
             return resume_time != std::chrono::steady_clock::time_point{};
@@ -139,6 +167,13 @@ class RailMonitor {
     std::unordered_map<std::pair<int, int>, RailState, PairHash> rail_states_;
     std::unordered_map<int, int> direct_rails_;  // keep static after loaded
     std::unordered_map<int, int> best_mapping_[kMaxNuma];
+    std::unordered_map<uint64_t, std::weak_ptr<const Topology>>
+        remote_snapshots_;
+    size_t snapshot_inserts_since_cleanup_ = 0;
+
+    uint64_t metadata_generation_ = 0;
+    uint64_t next_probe_token_ = 0;
+    bool recovery_probe_enabled_ = true;
 
     int error_threshold_ = 3;
     std::chrono::seconds error_window_{10};

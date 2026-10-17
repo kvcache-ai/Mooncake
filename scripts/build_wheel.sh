@@ -59,6 +59,19 @@ cp mooncake-integration/shared_segment.py mooncake-wheel/mooncake/shared_segment
 # Copy libasio.so to mooncake directory (runtime dependency of engine.so)
 cp ${BUILD_DIR}/mooncake-common/libasio.so mooncake-wheel/mooncake/libasio.so
 
+# The TENT Python extension is built only with USE_TENT. Keep its original
+# extension suffix and co-locate its shared metrics dependency with libasio.
+TENT_SO=$(compgen -G "${BUILD_DIR}/mooncake-transfer-engine/tent/src/python/tent.*.so" | head -1 || true)
+if [ -n "$TENT_SO" ]; then
+    TENT_METRICS_SO="${BUILD_DIR}/mooncake-transfer-engine/tent/src/metrics/libtent_metrics.so"
+    if [ ! -f "$TENT_METRICS_SO" ]; then
+        echo "Error: TENT Python extension exists without libtent_metrics.so"
+        exit 1
+    fi
+    cp "$TENT_SO" mooncake-wheel/mooncake/
+    cp "$TENT_METRICS_SO" mooncake-wheel/mooncake/
+fi
+
 # Copy the private C++ Store extension to the mooncake package.
 if compgen -G "${BUILD_DIR}/mooncake-integration/_store.*.so" >/dev/null; then
     echo "Copying _store extension..."
@@ -214,6 +227,8 @@ MIGRATED_PYTHON_MODULES=(
 )
 RESHARD_SOURCE_DIR="mooncake-reshard/python/mooncake/reshard"
 RESHARD_STAGING_DIR="$(pwd)/mooncake-wheel/mooncake/reshard"
+TENT_COMPAT_SOURCE="mooncake-transfer-engine/tent/src/python/tent.py"
+TENT_COMPAT_STAGING_DIR="$(pwd)/mooncake-wheel/tent"
 cleanup_migrated_python_staging() {
     for module in "${MIGRATED_PYTHON_MODULES[@]}"; do
         if [ "${module}" = "__init__.py" ]; then
@@ -228,6 +243,7 @@ cleanup_migrated_python_staging() {
     fi
     rm -rf "${STORE_FACADE_STAGING_DIR}"
     rm -rf "${RESHARD_STAGING_DIR}"
+    rm -rf "${TENT_COMPAT_STAGING_DIR}"
 }
 trap cleanup_migrated_python_staging EXIT
 cleanup_migrated_python_staging
@@ -239,6 +255,10 @@ for module in "${MIGRATED_PYTHON_MODULES[@]}"; do
 done
 cp -R "${STORE_FACADE_SOURCE_DIR}" "${STORE_FACADE_STAGING_DIR}"
 cp -R "${RESHARD_SOURCE_DIR}" "${RESHARD_STAGING_DIR}"
+if [ -n "$TENT_SO" ]; then
+    mkdir -p "${TENT_COMPAT_STAGING_DIR}"
+    cp "${TENT_COMPAT_SOURCE}" "${TENT_COMPAT_STAGING_DIR}/__init__.py"
+fi
 
 # Build the wheel package
 cd mooncake-wheel
@@ -655,6 +675,24 @@ fi
 # Replace original wheel with repaired wheel
 rm -f ${OUTPUT_DIR}/*.whl
 mv ${REPAIRED_DIR}/*.whl ${OUTPUT_DIR}/
+
+if [ -n "$TENT_SO" ]; then
+    REPAIRED_WHEEL=$(ls ${OUTPUT_DIR}/*.whl | head -1)
+    python${PYTHON_VERSION} - "$REPAIRED_WHEEL" <<'PY'
+import sys
+import zipfile
+
+with zipfile.ZipFile(sys.argv[1]) as wheel:
+    names = set(wheel.namelist())
+
+required = {"mooncake/libtent_metrics.so", "tent/__init__.py"}
+missing = sorted(required - names)
+if not any(name.startswith("mooncake/tent.") and name.endswith(".so") for name in names):
+    missing.append("mooncake/tent.<extension>.so")
+if missing:
+    raise SystemExit(f"TENT wheel artifacts are missing: {', '.join(missing)}")
+PY
+fi
 
 cd ..
 

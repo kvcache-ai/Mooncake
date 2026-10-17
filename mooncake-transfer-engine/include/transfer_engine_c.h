@@ -18,6 +18,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "task_congestion_status_c.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif  // __cplusplus
@@ -161,6 +163,18 @@ int genNotifyInEngine(transfer_engine_t engine, uint64_t target_id,
 
 int getTransferStatus(transfer_engine_t engine, batch_id_t batch_id,
                       size_t task_id, struct transfer_status *status);
+
+int getTaskCongestionState(transfer_engine_t engine, batch_id_t batch_id,
+                           size_t task_id, int *state);
+
+// The required path length includes the NUL byte when a path was observed;
+// otherwise it is zero. Call with path_buf=NULL and path_capacity=0 to size
+// the buffer, then retry with at least the reported capacity. A short buffer
+// returns an argument error without truncating the path.
+int getTaskCongestionDetail(transfer_engine_t engine, batch_id_t batch_id,
+                            size_t task_id, task_congestion_detail_t *detail,
+                            char *path_buf, size_t path_capacity,
+                            size_t *required_path_length);
 
 /*
  * Returns 0 when cleanup completes immediately, or BATCH_CLEANUP_DEFERRED when

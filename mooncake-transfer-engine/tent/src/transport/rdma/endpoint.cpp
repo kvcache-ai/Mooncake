@@ -84,7 +84,14 @@ RdmaEndPoint::RdmaEndPoint()
       queue_lock_list_(nullptr),
       wr_depth_list_(nullptr),
       inflight_slices_(0),
-      destroy_start_time_(0) {}
+      destroy_start_time_(0) {
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+    static std::atomic<uint32_t> next_generation{1};
+    generation_ = next_generation.fetch_add(1, std::memory_order_relaxed);
+    if (generation_ == 0)
+        generation_ = next_generation.fetch_add(1, std::memory_order_relaxed);
+#endif
+}
 
 RdmaEndPoint::~RdmaEndPoint() { deconstruct(); }
 
@@ -771,9 +778,22 @@ static ibv_wr_opcode getOpCode(RdmaSlice* slice) {
     }
 }
 
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
 int RdmaEndPoint::submitSlices(std::vector<RdmaSlice*>& slice_list,
                                int qp_index,
                                const std::function<void(RdmaSlice*)>& on_post) {
+    return submitSlicesLimited(slice_list, qp_index, on_post,
+                               slice_list.size());
+}
+
+int RdmaEndPoint::submitSlicesLimited(
+    std::vector<RdmaSlice*>& slice_list, int qp_index,
+    const std::function<void(RdmaSlice*)>& on_post, size_t max_count) {
+#else
+int RdmaEndPoint::submitSlices(std::vector<RdmaSlice*>& slice_list,
+                               int qp_index,
+                               const std::function<void(RdmaSlice*)>& on_post) {
+#endif
     const static int kSgeEntries = 1;
     RWSpinlock::ReadGuard guard(lock_);
     if (qp_list_.empty()) return 0;
@@ -796,7 +816,11 @@ int RdmaEndPoint::submitSlices(std::vector<RdmaSlice*>& slice_list,
         cq->maxCqe() - cq->getQuota(),
         std::min(params_->max_qp_wr - wr_depth_list_[qp_index].value.load(
                                           std::memory_order_relaxed),
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+                 static_cast<int>(std::min(slice_list.size(), max_count))));
+#else
                  (int)slice_list.size()));
+#endif
     int sge_count = wr_count * kSgeEntries;
 
     if (wr_count <= 0 || !reserveQuota(qp_index, wr_count)) return 0;
@@ -892,6 +916,13 @@ void RdmaEndPoint::resetInflightSlices() {
         auto& queue = slice_queue_[qp_index];
         while (!queue.empty()) {
             auto current = queue.pop();
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+            adaptive_congestion_control::complete(
+                current->congestion_control_permit,
+                adaptive_congestion_control::OutcomeClass::kDerivedFlush,
+                adaptive_congestion_control::FailureScope::kOperation);
+            current->congestion_control_route = nullptr;
+#endif
             updateSliceStatus(current, TransferStatusEnum::CANCELED);
         }
     }

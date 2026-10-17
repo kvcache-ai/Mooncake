@@ -189,6 +189,23 @@ RdmaTransport::RdmaTransport() {
     }
 }
 
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+void RdmaTransport::recordClassicCongestionControlMode(
+    adaptive_congestion_control::Mode mode) {
+    const int next_mode = static_cast<int>(mode);
+    int current =
+        classic_congestion_control_mode_.load(std::memory_order_acquire);
+    while (current == -1) {
+        if (classic_congestion_control_mode_.compare_exchange_weak(
+                current, next_mode, std::memory_order_acq_rel,
+                std::memory_order_acquire))
+            return;
+    }
+    if (current != next_mode)
+        classic_congestion_control_mode_.store(3, std::memory_order_release);
+}
+#endif
+
 RdmaTransport::~RdmaTransport() {
     notify_running_.store(false, std::memory_order_release);
     if (notify_worker_.joinable()) notify_worker_.join();
@@ -941,6 +958,17 @@ Status RdmaTransport::submitTransfer(
 
 Status RdmaTransport::submitTransferTask(
     const std::vector<TransferTask *> &task_list) {
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+    const int congestion_control_mode =
+        classic_congestion_control_mode_.load(std::memory_order_acquire);
+    if (congestion_control_mode >= 0 && congestion_control_mode <= 2) {
+        for (auto *task : task_list) {
+            task->rdma_congestion_control_mode = {
+                true, static_cast<TaskCongestionControllerMode>(
+                          congestion_control_mode)};
+        }
+    }
+#endif
     std::unordered_map<std::shared_ptr<RdmaContext>, std::vector<Slice *>>
         slices_to_post;
     std::unordered_map<SegmentID, std::shared_ptr<SegmentDesc>>
@@ -979,6 +1007,10 @@ Status RdmaTransport::submitTransferTask(
             slice->length = 0;
             slice->task = &task;
             slice->status = Slice::PENDING;
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+            slice->rdma_congestion_control_slice_ordinal =
+                task.slice_list.size();
+#endif
             task.slice_list.push_back(slice);
             __sync_fetch_and_add(&task.slice_count, 1);
             slice->markFailed();
@@ -1081,6 +1113,10 @@ Status RdmaTransport::submitTransferTask(
             slice->target_id = request.target_id;
             slice->status = Slice::PENDING;
             slice->ts = 0;
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+            slice->rdma_congestion_control_slice_ordinal =
+                task.slice_list.size();
+#endif
             task.slice_list.push_back(slice);
 
             int buffer_id = -1, device_id = -1,
@@ -1159,6 +1195,14 @@ Status RdmaTransport::submitTransferTask(
             }
 
             if (nr_slices >= kSubmitWatermark) {
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+                auto observation = std::atomic_load_explicit(
+                    &task.congestion_observation, std::memory_order_acquire);
+                if (observation)
+                    observation->extendAttempt(
+                        1,
+                        __atomic_load_n(&task.slice_count, __ATOMIC_ACQUIRE));
+#endif
                 for (auto &entry : slices_to_post)
                     entry.first->submitPostSend(entry.second);
                 slices_to_post.clear();
@@ -1169,6 +1213,15 @@ Status RdmaTransport::submitTransferTask(
         }
     }
 
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+    for (auto *task : task_list) {
+        auto observation = std::atomic_load_explicit(
+            &task->congestion_observation, std::memory_order_acquire);
+        if (observation)
+            observation->extendAttempt(
+                1, __atomic_load_n(&task->slice_count, __ATOMIC_ACQUIRE));
+    }
+#endif
     for (auto &entry : slices_to_post)
         if (!entry.second.empty()) entry.first->submitPostSend(entry.second);
     return Status::OK();

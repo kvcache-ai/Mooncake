@@ -28,6 +28,13 @@
 
 namespace py = pybind11;
 using namespace mooncake::tent;
+using mooncake::TaskCongestionAttemptKind;
+using mooncake::TaskCongestionControllerMode;
+using mooncake::TaskCongestionDetail;
+using mooncake::TaskCongestionFailureScope;
+using mooncake::TaskCongestionObserved;
+using mooncake::TaskCongestionReason;
+using mooncake::TaskCongestionState;
 
 // The enumerators below are exposed to Python as plain integers, so their
 // values are a compatibility contract shared with the C API macros. Pin them
@@ -114,6 +121,12 @@ static void ThrowStatus(const Status& s, const char* where) {
         default:
             throw InternalError(full_msg);
     }
+}
+
+template <typename T>
+static py::object ObservedTaskCongestionValue(
+    const TaskCongestionObserved<T>& field) {
+    return field.observed ? py::cast(field.value) : py::none();
 }
 
 // =============================================================================
@@ -304,6 +317,44 @@ PYBIND11_MODULE(tent, m) {
         .value("TIMEOUT", TransferStatusEnum::TIMEOUT)
         .value("FAILED", TransferStatusEnum::FAILED)
         .export_values();
+
+    py::enum_<TaskCongestionState>(m, "TaskCongestionState")
+        .value("NORMAL", TaskCongestionState::kNormal)
+        .value("CONGESTED", TaskCongestionState::kCongested)
+        .value("LONG_UNAVAILABLE", TaskCongestionState::kLongUnavailable)
+        .value("UNKNOWN", TaskCongestionState::kUnknown);
+
+    py::enum_<TaskCongestionAttemptKind>(m, "TaskCongestionAttemptKind")
+        .value("UNKNOWN", TaskCongestionAttemptKind::kUnknown)
+        .value("RDMA", TaskCongestionAttemptKind::kRdma)
+        .value("OTHER", TaskCongestionAttemptKind::kOther);
+
+    py::enum_<TaskCongestionReason>(m, "TaskCongestionReason")
+        .value("UNKNOWN", TaskCongestionReason::kUnknown)
+        .value("BYTE_WINDOW", TaskCongestionReason::kByteWindow)
+        .value("RECEIVER_PRESSURE", TaskCongestionReason::kReceiverPressure)
+        .value("PATH_QUARANTINED", TaskCongestionReason::kPathQuarantined)
+        .value("PROBE_FAILED", TaskCongestionReason::kProbeFailed)
+        .value("NO_USABLE_PATH", TaskCongestionReason::kNoUsablePath)
+        .value("CONGESTION_FEEDBACK", TaskCongestionReason::kCongestionFeedback)
+        .value("ROUTE_TIMEOUT", TaskCongestionReason::kRouteTimeout)
+        .value("LOCAL_CONFIGURATION", TaskCongestionReason::kLocalConfiguration)
+        .value("REMOTE_METADATA", TaskCongestionReason::kRemoteMetadata)
+        .value("DERIVED_FLUSH", TaskCongestionReason::kDerivedFlush)
+        .value("FATAL", TaskCongestionReason::kFatal);
+
+    py::enum_<TaskCongestionFailureScope>(m, "TaskCongestionFailureScope")
+        .value("OPERATION", TaskCongestionFailureScope::kOperation)
+        .value("QP", TaskCongestionFailureScope::kQp)
+        .value("CQ", TaskCongestionFailureScope::kCq)
+        .value("ROUTE", TaskCongestionFailureScope::kRoute)
+        .value("PORT", TaskCongestionFailureScope::kPort)
+        .value("DEVICE", TaskCongestionFailureScope::kDevice);
+
+    py::enum_<TaskCongestionControllerMode>(m, "TaskCongestionControllerMode")
+        .value("OFF", TaskCongestionControllerMode::kOff)
+        .value("OBSERVE", TaskCongestionControllerMode::kObserve)
+        .value("ENFORCE", TaskCongestionControllerMode::kEnforce);
 
     py::enum_<Permission>(m, "Permission")
         .value("LocalReadWrite", Permission::kLocalReadWrite)
@@ -803,5 +854,60 @@ PYBIND11_MODULE(tent, m) {
                 ThrowStatus(s, "get_transfer_status_overall");
                 return overall;
             },
-            py::arg("batch_id"));
+            py::arg("batch_id"))
+
+        .def(
+            "get_task_congestion_state",
+            [](TransferEngine& self, uint64_t batch_id,
+               size_t task_id) -> TaskCongestionState {
+                TaskCongestionState state = TaskCongestionState::kUnknown;
+                {
+                    py::gil_scoped_release release;
+                    auto s = self.getTaskCongestionState((BatchID)batch_id,
+                                                         task_id, state);
+                    ThrowStatus(s, "get_task_congestion_state");
+                }
+                return state;
+            },
+            py::arg("batch_id"), py::arg("task_id"))
+
+        .def(
+            "get_task_congestion_detail",
+            [](TransferEngine& self, uint64_t batch_id,
+               size_t task_id) -> py::dict {
+                TaskCongestionDetail detail;
+                {
+                    py::gil_scoped_release release;
+                    auto s = self.getTaskCongestionDetail((BatchID)batch_id,
+                                                          task_id, detail);
+                    ThrowStatus(s, "get_task_congestion_detail");
+                }
+                py::dict result;
+                result["state"] = detail.state;
+                result["attempt_kind"] = detail.attempt_kind;
+                result["attempt_id"] =
+                    ObservedTaskCongestionValue(detail.attempt_id);
+                result["reason"] = ObservedTaskCongestionValue(detail.reason);
+                result["failure_scope"] =
+                    ObservedTaskCongestionValue(detail.failure_scope);
+                result["slice_id"] =
+                    ObservedTaskCongestionValue(detail.slice_id);
+                result["affected_path"] =
+                    ObservedTaskCongestionValue(detail.affected_path);
+                result["observed_at_ns"] =
+                    ObservedTaskCongestionValue(detail.observed_at_ns);
+                result["resolved"] = detail.resolved;
+                result["controller_mode"] =
+                    ObservedTaskCongestionValue(detail.controller_mode);
+                result["controller_generation"] =
+                    ObservedTaskCongestionValue(detail.controller_generation);
+                result["window_bytes"] =
+                    ObservedTaskCongestionValue(detail.window_bytes);
+                result["inflight_bytes"] =
+                    ObservedTaskCongestionValue(detail.inflight_bytes);
+                result["retry_after_ns"] =
+                    ObservedTaskCongestionValue(detail.retry_after_ns);
+                return result;
+            },
+            py::arg("batch_id"), py::arg("task_id"));
 }

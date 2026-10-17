@@ -38,6 +38,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <set>
 #include <string>
@@ -49,10 +50,17 @@
 #include "tent/common/config.h"
 #include "tent/common/config_lifecycle.h"
 #include "tent/common/types.h"
+#include "tent/transfer_engine.h"
 #include "tent/runtime/segment.h"
 #include "tent/runtime/transfer_engine_impl.h"
 #include "tent/runtime/transport.h"
 #include "tent/transport/fault_proxy/fault_proxy_transport.h"
+#include "task_congestion_status.h"
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+#include "adaptive_congestion_control.h"
+#include "tent/transport/rdma/slice.h"
+#include "tent/transport/rdma/workers.h"
+#endif
 
 namespace mooncake {
 
@@ -235,6 +243,119 @@ class FakeTransport : public Transport {
     bool force_submit_fail_;
     bool cancellation_supported_;
 };
+
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+adaptive_congestion_control::Config taskQueryCongestionControlConfig() {
+    adaptive_congestion_control::Config config;
+    config.mode = adaptive_congestion_control::Mode::kEnforce;
+    config.min_window_bytes = 1024;
+    config.max_window_bytes = 1024;
+    return config;
+}
+
+// The engine handles real logical-task mapping; admission uses the same TENT
+// RDMA adapter as worker posting, with hardware posting held by this test.
+class ObservedRdmaTransport : public FakeTransport {
+   public:
+    ObservedRdmaTransport(uint64_t first_length = 1024,
+                          uint64_t second_length = 128)
+        : FakeTransport(
+              RDMA, [](const Request&) { return TransferStatus{PENDING, 0}; }),
+          device_(taskQueryCongestionControlConfig(), 3),
+          route_(taskQueryCongestionControlConfig()),
+          first_length_(first_length),
+          second_length_(second_length) {}
+
+    bool taskCongestionEnabled() const override { return true; }
+
+    void setTaskCongestionObservation(
+        SubBatchRef, size_t,
+        std::shared_ptr<adaptive_congestion_control::TaskCongestionObservation>
+            observation,
+        uint64_t attempt_id) override {
+        observation_ = std::move(observation);
+        attempt_id_ = attempt_id;
+    }
+
+    Status submitTransferTasks(SubBatchRef batch,
+                               const std::vector<Request>& requests) override {
+        if (!observation_ || requests.size() != 1) {
+            return Status::InvalidArgument(
+                "observation was not attached" LOC_MARK);
+        }
+        CHECK_STATUS(FakeTransport::submitTransferTasks(batch, requests));
+        submitted_batch_ = static_cast<FakeSubBatch*>(batch);
+        if (!observation_->beginAttempt(attempt_id_, 2)) {
+            return Status::InvalidArgument("attempt was not started" LOC_MARK);
+        }
+        task_.congestion_observation = observation_;
+        task_.congestion_attempt_id = attempt_id_;
+        first_.task = second_.task = &task_;
+        first_.slice_idx = 0;
+        second_.slice_idx = 1;
+        second_.source_nic_name = "local-nic";
+        second_.target_nic_name = "remote-nic";
+        second_.target_machine_id = target_machine_id_;
+        first_.length = first_length_;
+        second_.length = second_length_;
+        adaptive_congestion_control::PathHandle path{&device_, &route_.domain,
+                                                     3, 1};
+        if (acquireTentCongestionControlAttempt(first_, &route_, path,
+                                                first_.length, 7) !=
+                adaptive_congestion_control::Decision::kAllow ||
+            acquireTentCongestionControlAttempt(second_, &route_, path,
+                                                second_.length, 7) !=
+                adaptive_congestion_control::Decision::kDefer) {
+            return Status::InvalidArgument(
+                "window did not defer slice" LOC_MARK);
+        }
+        return Status::OK();
+    }
+
+    bool readmitBlockedSlice() {
+        if (!completeTentCongestionControlAttempt(
+                first_, adaptive_congestion_control::OutcomeClass::kSuccess,
+                adaptive_congestion_control::FailureScope::kOperation)) {
+            return false;
+        }
+        adaptive_congestion_control::PathHandle path{&device_, &route_.domain,
+                                                     3, 1};
+        const bool allowed = acquireTentCongestionControlAttempt(
+                                 second_, &route_, path, second_.length, 7) ==
+                             adaptive_congestion_control::Decision::kAllow;
+        if (allowed) {
+            completeTentCongestionControlAttempt(
+                second_, adaptive_congestion_control::OutcomeClass::kSuccess,
+                adaptive_congestion_control::FailureScope::kOperation);
+            submitted_batch_->statuses[0] = {COMPLETED, 4096};
+        }
+        return allowed;
+    }
+
+    void failCurrentAttempt() { submitted_batch_->statuses[0] = {FAILED, 0}; }
+
+   private:
+    adaptive_congestion_control::DomainState device_;
+    TentRdmaCongestionControlRoute route_;
+    std::shared_ptr<adaptive_congestion_control::TaskCongestionObservation>
+        observation_;
+    uint64_t attempt_id_ = 0;
+    RdmaTask task_{};
+    RdmaSlice first_{}, second_{};
+    FakeSubBatch* submitted_batch_ = nullptr;
+    uint64_t first_length_;
+    uint64_t second_length_;
+    std::string target_machine_id_ = "remote-machine";
+};
+
+class RejectingCongestionControlRdmaTransport : public FakeTransport {
+   public:
+    RejectingCongestionControlRdmaTransport()
+        : FakeTransport(RDMA, {}, {}, true) {}
+
+    bool taskCongestionEnabled() const override { return true; }
+};
+#endif
 
 class HpTcpRecoveryTransport : public FakeTransport {
    public:
@@ -490,6 +611,379 @@ TEST(EngineFailoverE2E, HpTcpStaleMetadataRetriesSameTransportOnce) {
 
     releaseHpTcpRecoveryBatch(engine, batch);
 }
+
+TEST(EngineFailoverE2E, TaskCongestionQueryDoesNotPollUnsupportedTask) {
+    auto config = makeMinimalP2PConfig();
+    TransferEngineImpl engine(config);
+    ASSERT_TRUE(engine.available());
+
+    HpTcpRecoveryBatch batch;
+    submitHpTcpRecoveryBatch(engine, batch);
+    const int polls_before = batch.hp_tcp->status_calls.load();
+
+    TaskCongestionState state = TaskCongestionState::kNormal;
+    TaskCongestionDetail detail;
+    ASSERT_TRUE(engine.getTaskCongestionState(batch.batch_id, 0, state).ok());
+    ASSERT_TRUE(engine.getTaskCongestionDetail(batch.batch_id, 0, detail).ok());
+    EXPECT_EQ(state, TaskCongestionState::kUnknown);
+    EXPECT_EQ(detail.state, state);
+    EXPECT_EQ(detail.attempt_kind, TaskCongestionAttemptKind::kOther);
+    EXPECT_FALSE(detail.reason.observed);
+    int c_state = TASK_CONGESTION_NORMAL;
+    EXPECT_EQ(tent_task_congestion_state(static_cast<tent_engine_t>(&engine),
+                                         batch.batch_id, 0, &c_state),
+              0);
+    EXPECT_EQ(c_state, TASK_CONGESTION_UNKNOWN);
+    task_congestion_detail_t c_detail{};
+    size_t required_path_length = 1;
+    EXPECT_EQ(tent_task_congestion_detail(static_cast<tent_engine_t>(&engine),
+                                          batch.batch_id, 0, &c_detail, nullptr,
+                                          0, &required_path_length),
+              0);
+    EXPECT_EQ(c_detail.state, c_state);
+    EXPECT_EQ(c_detail.attempt_kind, TASK_CONGESTION_ATTEMPT_OTHER);
+    EXPECT_EQ(required_path_length, 0u);
+    EXPECT_EQ(batch.hp_tcp->status_calls.load(), polls_before);
+    EXPECT_FALSE(engine.getTaskCongestionState(batch.batch_id, 1, state).ok());
+
+    releaseHpTcpRecoveryBatch(engine, batch);
+    EXPECT_FALSE(engine.getTaskCongestionState(batch.batch_id, 0, state).ok());
+}
+
+TEST(EngineFailoverE2E, PublicFacadeRejectsUnsubmittedAndFreedTask) {
+    TransferEngine engine(makeMinimalP2PConfig());
+    ASSERT_TRUE(engine.available());
+    const BatchID batch_id = engine.allocateBatch(1);
+    ASSERT_NE(batch_id, static_cast<BatchID>(0));
+
+    TaskCongestionState state;
+    TaskCongestionDetail detail;
+    EXPECT_FALSE(engine.getTaskCongestionState(0, 0, state).ok());
+    EXPECT_FALSE(engine.getTaskCongestionDetail(0, 0, detail).ok());
+    const BatchID invalid_batch = std::numeric_limits<BatchID>::max();
+    EXPECT_FALSE(engine.getTaskCongestionState(invalid_batch, 0, state).ok());
+    EXPECT_FALSE(engine.getTaskCongestionDetail(invalid_batch, 0, detail).ok());
+    EXPECT_FALSE(engine.getTaskCongestionState(batch_id, 0, state).ok());
+    EXPECT_FALSE(engine.getTaskCongestionDetail(batch_id, 0, detail).ok());
+    ASSERT_TRUE(engine.freeBatch(batch_id).ok());
+    EXPECT_FALSE(engine.getTaskCongestionState(batch_id, 0, state).ok());
+    EXPECT_FALSE(engine.getTaskCongestionDetail(batch_id, 0, detail).ok());
+}
+
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+TEST(EngineFailoverE2E, LogicalRdmaTaskProjectsWorkerAdmissionWithoutPolling) {
+    auto config = makeMinimalP2PConfig();
+    TransferEngineImpl engine(config);
+    ASSERT_TRUE(engine.available());
+    auto rdma = std::make_shared<ObservedRdmaTransport>();
+    std::string segment_name = engine.getSegmentName();
+    ASSERT_TRUE(rdma->install(segment_name, nullptr, nullptr).ok());
+    engine.swapTransportForTest(RDMA, rdma);
+
+    std::vector<uint8_t> buffer(4096, 0x5A);
+    ASSERT_TRUE(engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+    const BatchID batch_id = engine.allocateBatch(1);
+    ASSERT_NE(batch_id, static_cast<BatchID>(0));
+    Request request{};
+    request.opcode = Request::WRITE;
+    request.source = buffer.data();
+    request.target_id = LOCAL_SEGMENT_ID;
+    request.target_offset = reinterpret_cast<uint64_t>(buffer.data());
+    request.length = buffer.size();
+    request.transport_hint = RDMA;
+    ASSERT_TRUE(engine.submitTransfer(batch_id, {request}).ok());
+
+    TaskCongestionState state;
+    TaskCongestionDetail detail;
+    ASSERT_TRUE(engine.getTaskCongestionState(batch_id, 0, state).ok());
+    ASSERT_TRUE(engine.getTaskCongestionDetail(batch_id, 0, detail).ok());
+    EXPECT_EQ(state, TaskCongestionState::kCongested);
+    EXPECT_EQ(detail.state, state);
+    EXPECT_EQ(detail.attempt_kind, TaskCongestionAttemptKind::kRdma);
+    EXPECT_EQ(detail.reason.value, TaskCongestionReason::kByteWindow);
+    EXPECT_EQ(detail.slice_id.value, 1);
+    ASSERT_TRUE(detail.affected_path.observed);
+    int c_state = TASK_CONGESTION_UNKNOWN;
+    EXPECT_EQ(tent_task_congestion_state(static_cast<tent_engine_t>(&engine),
+                                         batch_id, 0, &c_state),
+              0);
+    EXPECT_EQ(c_state, TASK_CONGESTION_CONGESTED);
+    task_congestion_detail_t c_detail{};
+    size_t required_path_length = 0;
+    EXPECT_EQ(tent_task_congestion_detail(static_cast<tent_engine_t>(&engine),
+                                          batch_id, 0, &c_detail, nullptr, 0,
+                                          &required_path_length),
+              0);
+    EXPECT_EQ(c_detail.state, c_state);
+    EXPECT_NE(c_detail.observed_fields & TASK_CONGESTION_HAS_AFFECTED_PATH, 0u);
+    EXPECT_NE(c_detail.observed_fields & TASK_CONGESTION_HAS_REASON, 0u);
+    EXPECT_EQ(c_detail.reason, TASK_CONGESTION_REASON_BYTE_WINDOW);
+    EXPECT_EQ(c_detail.controller_mode, TASK_CONGESTION_MODE_ENFORCE);
+    EXPECT_EQ(required_path_length, detail.affected_path.value.size() + 1);
+    std::vector<char> short_path(required_path_length - 1, '#');
+    EXPECT_EQ(tent_task_congestion_detail(
+                  static_cast<tent_engine_t>(&engine), batch_id, 0, &c_detail,
+                  short_path.data(), short_path.size(), &required_path_length),
+              -1);
+    EXPECT_EQ(short_path, std::vector<char>(short_path.size(), '#'));
+    std::vector<char> path(required_path_length);
+    EXPECT_EQ(tent_task_congestion_detail(static_cast<tent_engine_t>(&engine),
+                                          batch_id, 0, &c_detail, path.data(),
+                                          path.size(), &required_path_length),
+              0);
+    EXPECT_EQ(std::string(path.data()), detail.affected_path.value);
+    EXPECT_EQ(rdma->status_calls.load(), 0);
+
+    ASSERT_TRUE(rdma->readmitBlockedSlice());
+    ASSERT_TRUE(engine.getTaskCongestionState(batch_id, 0, state).ok());
+    EXPECT_EQ(state, TaskCongestionState::kNormal);
+    ASSERT_TRUE(engine.getTaskCongestionDetail(batch_id, 0, detail).ok());
+    EXPECT_TRUE(detail.resolved);
+    EXPECT_EQ(rdma->status_calls.load(), 0);
+
+    EXPECT_TRUE(engine.freeBatch(batch_id).ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
+}
+
+TEST(EngineFailoverE2E, PartialWindowDeferAppearsOnPublicTaskQuery) {
+    auto config = makeMinimalP2PConfig();
+    TransferEngineImpl engine(config);
+    ASSERT_TRUE(engine.available());
+    auto rdma = std::make_shared<ObservedRdmaTransport>(512, 600);
+    std::string segment_name = engine.getSegmentName();
+    ASSERT_TRUE(rdma->install(segment_name, nullptr, nullptr).ok());
+    engine.swapTransportForTest(RDMA, rdma);
+
+    std::vector<uint8_t> buffer(4096, 0x5A);
+    ASSERT_TRUE(engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+    const BatchID batch_id = engine.allocateBatch(1);
+    ASSERT_NE(batch_id, static_cast<BatchID>(0));
+    Request request{};
+    request.opcode = Request::WRITE;
+    request.source = buffer.data();
+    request.target_id = LOCAL_SEGMENT_ID;
+    request.target_offset = reinterpret_cast<uint64_t>(buffer.data());
+    request.length = buffer.size();
+    request.transport_hint = RDMA;
+    ASSERT_TRUE(engine.submitTransfer(batch_id, {request}).ok());
+
+    TaskCongestionState state;
+    TaskCongestionDetail detail;
+    ASSERT_TRUE(engine.getTaskCongestionState(batch_id, 0, state).ok());
+    ASSERT_TRUE(engine.getTaskCongestionDetail(batch_id, 0, detail).ok());
+    EXPECT_EQ(state, TaskCongestionState::kCongested);
+    EXPECT_EQ(detail.state, state);
+    ASSERT_TRUE(detail.reason.observed);
+    EXPECT_EQ(detail.reason.value, TaskCongestionReason::kByteWindow);
+    EXPECT_EQ(rdma->status_calls.load(), 0);
+
+    ASSERT_TRUE(rdma->readmitBlockedSlice());
+    ASSERT_TRUE(engine.getTaskCongestionState(batch_id, 0, state).ok());
+    EXPECT_EQ(state, TaskCongestionState::kNormal);
+    EXPECT_TRUE(engine.freeBatch(batch_id).ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
+}
+
+TEST(EngineFailoverE2E,
+     FailedRdmaSubmitWithoutCongestionControlEvidenceIsUnknown) {
+    auto config = makeMinimalP2PConfig();
+    TransferEngineImpl engine(config);
+    ASSERT_TRUE(engine.available());
+    auto rdma = std::make_shared<RejectingCongestionControlRdmaTransport>();
+    std::string segment_name = engine.getSegmentName();
+    ASSERT_TRUE(rdma->install(segment_name, nullptr, nullptr).ok());
+    engine.swapTransportForTest(RDMA, rdma);
+
+    std::vector<uint8_t> buffer(4096, 0x5A);
+    ASSERT_TRUE(engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+    const BatchID batch_id = engine.allocateBatch(1);
+    ASSERT_NE(batch_id, static_cast<BatchID>(0));
+    Request request{};
+    request.opcode = Request::WRITE;
+    request.source = buffer.data();
+    request.target_id = LOCAL_SEGMENT_ID;
+    request.target_offset = reinterpret_cast<uint64_t>(buffer.data());
+    request.length = buffer.size();
+    request.transport_hint = RDMA;
+    ASSERT_TRUE(engine.submitTransfer(batch_id, {request}).ok());
+
+    TaskCongestionState state;
+    TaskCongestionDetail detail;
+    ASSERT_TRUE(engine.getTaskCongestionState(batch_id, 0, state).ok());
+    ASSERT_TRUE(engine.getTaskCongestionDetail(batch_id, 0, detail).ok());
+    EXPECT_EQ(state, TaskCongestionState::kUnknown);
+    EXPECT_EQ(detail.state, state);
+    EXPECT_FALSE(detail.reason.observed);
+
+    EXPECT_TRUE(engine.freeBatch(batch_id).ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
+}
+
+TEST(EngineFailoverE2E,
+     FailedLogicalTaskRetainsCongestionControlEvidenceUntilBatchFree) {
+    auto config = makeMinimalP2PConfig();
+    config->set("max_failover_attempts", 0);
+    TransferEngineImpl engine(config);
+    ASSERT_TRUE(engine.available());
+    auto rdma = std::make_shared<ObservedRdmaTransport>();
+    std::string segment_name = engine.getSegmentName();
+    ASSERT_TRUE(rdma->install(segment_name, nullptr, nullptr).ok());
+    engine.swapTransportForTest(RDMA, rdma);
+
+    std::vector<uint8_t> buffer(4096, 0x5A);
+    ASSERT_TRUE(engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+    const BatchID batch_id = engine.allocateBatch(1);
+    ASSERT_NE(batch_id, static_cast<BatchID>(0));
+    Request request{};
+    request.opcode = Request::WRITE;
+    request.source = buffer.data();
+    request.target_id = LOCAL_SEGMENT_ID;
+    request.target_offset = reinterpret_cast<uint64_t>(buffer.data());
+    request.length = buffer.size();
+    request.transport_hint = RDMA;
+    ASSERT_TRUE(engine.submitTransfer(batch_id, {request}).ok());
+
+    rdma->failCurrentAttempt();
+    TransferStatus transfer_status;
+    ASSERT_TRUE(engine.getTransferStatus(batch_id, 0, transfer_status).ok());
+    EXPECT_EQ(transfer_status.s, FAILED);
+    TaskCongestionState state;
+    TaskCongestionDetail detail;
+    ASSERT_TRUE(engine.getTaskCongestionState(batch_id, 0, state).ok());
+    ASSERT_TRUE(engine.getTaskCongestionDetail(batch_id, 0, detail).ok());
+    EXPECT_EQ(state, TaskCongestionState::kCongested);
+    EXPECT_EQ(detail.state, state);
+    EXPECT_EQ(detail.reason.value, TaskCongestionReason::kByteWindow);
+    EXPECT_FALSE(detail.resolved);
+
+    ASSERT_TRUE(engine.freeBatch(batch_id).ok());
+    EXPECT_FALSE(engine.getTaskCongestionState(batch_id, 0, state).ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
+}
+
+TEST(EngineFailoverE2E, MergedAliasUsesCurrentFailoverAttempt) {
+    auto config = makeMinimalP2PConfig();
+    config->set("merge_requests", true);
+    TransferEngineImpl engine(config);
+    ASSERT_TRUE(engine.available());
+    auto rdma = std::make_shared<ObservedRdmaTransport>();
+    auto tcp = std::make_shared<FakeTransport>(TCP);
+    std::string segment_name = engine.getSegmentName();
+    ASSERT_TRUE(rdma->install(segment_name, nullptr, nullptr).ok());
+    ASSERT_TRUE(tcp->install(segment_name, nullptr, nullptr).ok());
+    engine.swapTransportForTest(RDMA, rdma);
+    engine.swapTransportForTest(TCP, tcp);
+
+    std::vector<uint8_t> buffer(4096, 0x5A);
+    ASSERT_TRUE(engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+    const BatchID batch_id = engine.allocateBatch(2);
+    ASSERT_NE(batch_id, static_cast<BatchID>(0));
+    Request first{};
+    first.opcode = Request::WRITE;
+    first.source = buffer.data();
+    first.target_id = LOCAL_SEGMENT_ID;
+    first.target_offset = reinterpret_cast<uint64_t>(buffer.data());
+    first.length = 2048;
+    Request second = first;
+    second.source = buffer.data() + 2048;
+    second.target_offset += 2048;
+    ASSERT_TRUE(engine.submitTransfer(batch_id, {first, second}).ok());
+
+    TaskCongestionState owner_state, alias_state;
+    ASSERT_TRUE(engine.getTaskCongestionState(batch_id, 0, owner_state).ok());
+    ASSERT_TRUE(engine.getTaskCongestionState(batch_id, 1, alias_state).ok());
+    EXPECT_EQ(owner_state, TaskCongestionState::kCongested);
+    EXPECT_EQ(alias_state, owner_state);
+
+    rdma->failCurrentAttempt();
+    TransferStatus transfer_status;
+    ASSERT_TRUE(engine.getTransferStatus(batch_id, 0, transfer_status).ok());
+    EXPECT_EQ(transfer_status.s, PENDING);
+    ASSERT_TRUE(engine.getTaskCongestionState(batch_id, 0, owner_state).ok());
+    ASSERT_TRUE(engine.getTaskCongestionState(batch_id, 1, alias_state).ok());
+    EXPECT_EQ(owner_state, TaskCongestionState::kUnknown);
+    EXPECT_EQ(alias_state, owner_state);
+    EXPECT_EQ(tcp->submit_calls.load(), 1);
+
+    ASSERT_TRUE(engine.getTransferStatus(batch_id, 0, transfer_status).ok());
+    EXPECT_EQ(transfer_status.s, COMPLETED);
+    ASSERT_TRUE(engine.getTaskCongestionState(batch_id, 0, owner_state).ok());
+    ASSERT_TRUE(engine.getTaskCongestionState(batch_id, 1, alias_state).ok());
+    EXPECT_EQ(owner_state, TaskCongestionState::kUnknown);
+    EXPECT_EQ(alias_state, owner_state);
+
+    EXPECT_TRUE(engine.freeBatch(batch_id).ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
+}
+
+TEST(EngineFailoverE2E, QueuedMergedAliasSharesCurrentAttempt) {
+    auto config = makeMinimalP2PConfig();
+    config->set("merge_requests", true);
+    config->set("enable_runtime_queue", true);
+    config->set("runtime_queue/max_outstanding_owners", 16UL);
+    config->set("runtime_queue/max_outstanding_bytes", 1UL << 20);
+    config->set("runtime_queue/max_dispatch_owners", 16UL);
+    config->set("runtime_queue/max_dispatch_bytes", 1UL << 20);
+    config->set("runtime_queue/staging_owner_reserve", 0UL);
+    config->set("runtime_queue/staging_byte_reserve", 0UL);
+    TransferEngineImpl engine(config);
+    ASSERT_TRUE(engine.available());
+    auto rdma = std::make_shared<ObservedRdmaTransport>();
+    auto tcp = std::make_shared<FakeTransport>(TCP);
+    std::string segment_name = engine.getSegmentName();
+    ASSERT_TRUE(rdma->install(segment_name, nullptr, nullptr).ok());
+    ASSERT_TRUE(tcp->install(segment_name, nullptr, nullptr).ok());
+    engine.swapTransportForTest(RDMA, rdma);
+    engine.swapTransportForTest(TCP, tcp);
+
+    std::vector<uint8_t> buffer(4096, 0x5A);
+    ASSERT_TRUE(engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+    const BatchID batch_id = engine.allocateBatch(2);
+    ASSERT_NE(batch_id, static_cast<BatchID>(0));
+    Request first{};
+    first.opcode = Request::WRITE;
+    first.source = buffer.data();
+    first.target_id = LOCAL_SEGMENT_ID;
+    first.target_offset = reinterpret_cast<uint64_t>(buffer.data());
+    first.length = 2048;
+    Request second = first;
+    second.source = buffer.data() + 2048;
+    second.target_offset += 2048;
+    ASSERT_TRUE(engine.submitTransfer(batch_id, {first, second}).ok());
+
+    TransferStatus status;
+    for (int step = 0; step < 10 && rdma->submit_calls.load() == 0; ++step) {
+        ASSERT_TRUE(engine.progressBatch(batch_id, status).ok());
+    }
+    ASSERT_EQ(rdma->submit_calls.load(), 1);
+    const int polls_before = rdma->status_calls.load();
+    TaskCongestionState owner_state, alias_state;
+    ASSERT_TRUE(engine.getTaskCongestionState(batch_id, 0, owner_state).ok());
+    ASSERT_TRUE(engine.getTaskCongestionState(batch_id, 1, alias_state).ok());
+    EXPECT_EQ(owner_state, TaskCongestionState::kCongested);
+    EXPECT_EQ(alias_state, owner_state);
+    EXPECT_EQ(rdma->status_calls.load(), polls_before);
+
+    rdma->failCurrentAttempt();
+    for (int step = 0; step < 10 && tcp->submit_calls.load() == 0; ++step) {
+        ASSERT_TRUE(engine.progressBatch(batch_id, status).ok());
+    }
+    ASSERT_EQ(tcp->submit_calls.load(), 1);
+    ASSERT_TRUE(engine.getTaskCongestionState(batch_id, 0, owner_state).ok());
+    ASSERT_TRUE(engine.getTaskCongestionState(batch_id, 1, alias_state).ok());
+    EXPECT_EQ(owner_state, TaskCongestionState::kUnknown);
+    EXPECT_EQ(alias_state, owner_state);
+
+    EXPECT_TRUE(engine.freeBatch(batch_id).ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
+}
+#endif
 
 TEST(EngineFailoverE2E,
      PostSubmitCancellationRequirementRejectsUnsupportedTransport) {
