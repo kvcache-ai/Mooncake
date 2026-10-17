@@ -948,6 +948,10 @@ int RdmaTransport::unregisterLocalMemoryBatch(
     const std::vector<void *> &addr_list) {
     std::atomic<bool> any_cleaned{false};
     std::atomic<bool> any_not_registered{false};
+    // Members whose cleanup completed in this call; their pending records
+    // must be restored if the deferred publish below fails.
+    std::mutex cleaned_mutex;
+    std::vector<void *> cleaned_addrs;
     int first_error = runBoundedRegMrBatch(addr_list.size(), [&](size_t i) {
         int ret = unregisterLocalMemoryInternal(addr_list[i], false, true);
         // NOT_REGISTERED means nothing remains for this member: its metadata
@@ -965,6 +969,8 @@ int RdmaTransport::unregisterLocalMemoryBatch(
                          << addr_list[i];
         } else {
             any_cleaned.store(true, std::memory_order_relaxed);
+            std::lock_guard<std::mutex> lock(cleaned_mutex);
+            cleaned_addrs.push_back(addr_list[i]);
         }
         return ret;
     });
@@ -973,6 +979,18 @@ int RdmaTransport::unregisterLocalMemoryBatch(
     // entries removed locally, and this best-effort republish keeps the
     // remote advertisement from going stale.
     int metadata_ret = metadata_->updateLocalSegmentDesc();
+    if (metadata_ret) {
+        // The deferred publish failed, but the members cleaned above already
+        // dropped their metadata entries and pending records: a retry would
+        // report NOT_REGISTERED (fatal to the engine) and could never
+        // republish. Re-seed their pending records so the retry re-runs the
+        // MR cleanup as a no-op (the MRs are already gone) and re-attempts
+        // this publish.
+        std::lock_guard<std::mutex> lock(pending_dereg_mutex_);
+        for (void *addr : cleaned_addrs) {
+            pending_dereg_.insert((uint64_t)addr);
+        }
+    }
     if (first_error) return first_error;
     if (metadata_ret) return metadata_ret;
     // Preserve the never-registered contract for the engine's multi-transport
