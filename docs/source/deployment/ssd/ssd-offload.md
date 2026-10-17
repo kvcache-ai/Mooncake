@@ -157,10 +157,39 @@ Applies when `MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=bucket_storage_backend
 |---|---|---|
 | `MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES` | `268435456` (256 MB) | Max size per bucket |
 | `MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT` | `500` | Max keys per bucket |
+| `MOONCAKE_OFFLOAD_BUCKET_DIRECT_WRITE` | `false` | Opt in with `true` or `1` to O_DIRECT/io_uring writes for `.bucket` data files. Requires a build with io_uring support and `MOONCAKE_OFFLOAD_USE_URING=true`. `.meta` writes stay buffered with their exact protobuf length. |
+| `MOONCAKE_OFFLOAD_BUCKET_COPY_THREADS` | `1` | Threads used to pack direct-write buckets, clamped to 1–8; invalid values use 1. Buckets smaller than 16 MiB always use one thread. |
 | `MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE` | `0` | Eviction threshold in bytes. When set to `0`, the backend uses **90% of the physical disk capacity** as the quota — it does not mean unlimited. Set an explicit value to control disk usage precisely. |
 | `MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY` | `fifo` | Eviction policy: `none` / `fifo` / `lru` |
 | `MOONCAKE_OFFLOAD_BUCKET_MAX_PHYSICAL_BYTES` | `0` (disabled) | Hard cap on **real on-disk** bytes (`du`-equivalent) under this backend's `ssd_offload_path`. `0` disables it. With per-rank directories (required), the cap is per-rank — see below. |
 | `MOONCAKE_OFFLOAD_BUCKET_DISK_SCAN_CACHE_MS` | `500` | How long the directory-scan result is cached before re-scanning, to bound the cost of the physical-usage check. `<= 0` scans on every check. |
+
+For direct bucket writes, each writing thread retains a 4096-byte-aligned buffer
+that grows to fit its largest bucket and is released when the thread exits.
+Only the end of the data file is zero-padded to a 4096-byte boundary; key order,
+metadata offsets, and logical lengths keep the existing format. Data writes and
+`datasync` finish before metadata is written and the local index is committed.
+
+To enable direct writes with parallel packing, set these variables before
+starting the offload owner:
+
+```bash
+export MOONCAKE_OFFLOAD_USE_URING=true
+export MOONCAKE_OFFLOAD_BUCKET_DIRECT_WRITE=true
+export MOONCAKE_OFFLOAD_BUCKET_COPY_THREADS=8
+```
+
+Unset `MOONCAKE_OFFLOAD_BUCKET_DIRECT_WRITE` or set it to `false` and restart the
+owner to return to buffered writes. Set `MOONCAKE_OFFLOAD_BUCKET_COPY_THREADS=1`
+to retain direct writes with serial packing. Previously written buckets remain
+readable with either configuration.
+
+Parallel packing competes for CPU and memory bandwidth and creates up to seven
+helper threads per bucket. All copies finish before I/O submission. If a helper
+thread cannot be created, existing copies finish before the whole bucket is
+copied serially. The retained buffer increases resident memory per writer.
+Filesystems that do not support O_DIRECT have no automatic buffered fallback;
+disable the direct-write option on those filesystems.
 
 ### File-per-key backend settings
 
