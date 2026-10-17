@@ -15,6 +15,8 @@
 #endif
 #if defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
 #include "ascend_allocator.h"
+#elif defined(USE_MEMFABRIC)
+#include "memfabric_allocator.h"
 #endif
 #if defined(USE_SUNRISE)
 #include "sunrise_allocator.h"
@@ -105,6 +107,10 @@ void *allocate_buffer_allocator_memory(size_t total_size,
     if (protocol == "ascend" || protocol == "ubshmem") {
         return ascend_allocate_memory(total_size, protocol);
     }
+#elif defined(USE_MEMFABRIC)
+    if (protocol == "ascend") {
+        return memfabric_allocate_memory(total_size, protocol);
+    }
 #endif
 #if defined(USE_SUNRISE)
     if (protocol == "sunrise_link") {
@@ -140,6 +146,10 @@ void free_memory(const std::string &protocol, void *ptr, bool use_spdk_dma) {
 #if defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
     if (protocol == "ascend" || protocol == "ubshmem") {
         return ascend_free_memory(protocol, ptr);
+    }
+#elif defined(USE_MEMFABRIC)
+    if (protocol == "ascend") {
+        return memfabric_free_memory(protocol, ptr);
     }
 #endif
 #if defined(USE_SUNRISE)

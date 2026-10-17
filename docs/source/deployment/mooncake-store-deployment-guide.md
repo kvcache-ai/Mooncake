@@ -547,7 +547,7 @@ Multi-Tenant Deployment <multi-tenancy>
 - Start with default eviction settings; adjust `--eviction_high_watermark_ratio` and `--eviction_ratio` based on memory pressure and object churn.
 - Use `/metrics/summary` during bring-up; integrate `/metrics` with Prometheus/Grafana for production.
 - For detailed SSD offload configuration (storage backends, eviction policies, io_uring), see the [SSD Offload guide](ssd/ssd-offload).
-- For OSS offload configuration, see the [OSS Offload guide](oss-offload).
+- For object storage offload configuration (OSS and S3-compatible services), see the [Object Storage Offload guide](object-storage-offload).
 - For NVMe-oF SSD pool configuration see the [NVMe-oF SSD Pool Deployment Guide](ssd/nvmf-ssd-deployment-guide)
 - For the experimental HF3FS USRBIO adapter used by descriptor-based DFS replicas, see the [HF3FS USRBIO adapter guide](../getting_started/plugin-usage/3FS-USRBIO-Plugin).
 - For detailed monitoring and observation see [Observability](../getting_started/observability)
@@ -558,7 +558,7 @@ Multi-Tenant Deployment <multi-tenancy>
 
 KV Cache Sharing and Isolation<kv-cache-sharing-and-isolation>
 SSD Storage<ssd/index>
-OSS Offload<oss-offload>
+Object Storage Offload<object-storage-offload>
 HF3FS USRBIO Adapter (Experimental)<../getting_started/plugin-usage/3FS-USRBIO-Plugin>
 ../getting_started/observability
 :::
@@ -572,7 +572,8 @@ HF3FS USRBIO Adapter (Experimental)<../getting_started/plugin-usage/3FS-USRBIO-P
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--rpc_port` | `0` → effective `50051` | RPC listen port. The literal default is `0`, which falls back to the deprecated `--port` (default `50051`) |
-| `--rpc_thread_num` | `0` → effective `min(4, CPU cores)` | RPC worker threads. The literal default is `0`, which falls back to the deprecated `--max_threads` → `min(4, CPU cores)` |
+| `--rpc_thread_num` | `0` → effective `min(4, CPU cores)` | RPC io threads, which read and write the connections. The literal default is `0`, which falls back to the deprecated `--max_threads` → `min(4, CPU cores)` |
+| `--handler_worker_thread_num` | `0` → effective `--rpc_thread_num` | RPC worker threads. Every handler except `Ping` and `ServiceReady` runs on these threads instead of the io threads, so a slow request cannot delay the heartbeats sharing its io thread. The literal default is `0`, which starts as many worker threads as io threads |
 | `--rpc_address` | `0.0.0.0` | RPC bind address |
 | `--rpc_interface` | empty | Network interface to resolve RPC address at startup (overrides `--rpc_address`) |
 | `--rpc_conn_timeout_seconds` | `0` | Idle connection timeout; `0` disables |
@@ -1303,7 +1304,7 @@ The following `MC_*` variables are read directly by the engine/client at runtime
 | `MC_RPC_CLIENT_IO_THREADS` | `min(16, online CPU count)`, minimum `1` | Fallback number of threads and `io_context` instances for each component's RPC client I/O pool. A positive integer overrides the default; invalid values and `0` use the default |
 | `MC_STORE_RPC_CLIENT_IO_THREADS` | `MC_RPC_CLIENT_IO_THREADS` | Store/Master client RPC I/O pool size. This pool is isolated from Transfer Engine traffic. Invalid values and `0` use the fallback |
 | `MC_TE_RPC_CLIENT_IO_THREADS` | `MC_RPC_CLIENT_IO_THREADS` | Transfer Engine and TENT client RPC I/O pool size. This pool is isolated from Store/Master traffic. Invalid values and `0` use the fallback |
-| `MC_USE_TENT` / `MC_USE_TEV1` | unset | Set to any value to enable the TENT (next-gen) transfer engine |
+| `MC_USE_TENT` / `MC_USE_TEV1` | unset | Set to any value to enable the TENT (next-gen) transfer engine. Required for Intel XPU deployments (`USE_XPU=ON`): the classic engine has no XPU support |
 | `MC_STORE_CLUSTER_ID` | unset | Cluster ID label attached to client metrics |
 
 RPC client I/O pool settings are read and resolved once when the process-wide
