@@ -1030,6 +1030,31 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         LOG(ERROR) << "Client is already initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
+    // A previous teardown that could not release NoF registrations leaves
+    // caller-owned buffers (or quarantined shms) whose DMA translation may
+    // still be live under the OLD initiator's owner token. Re-init installs a
+    // fresh initiator (fresh owner token) whose UnregisterMemory no-ops on
+    // them, so a later teardown would erase the records and falsely report
+    // success — or worse, munmap a quarantined VA while the translation is
+    // live. Refuse to re-init this object; create a new client instead.
+    {
+        std::shared_lock<std::shared_mutex> lock(registered_buffer_mutex_);
+        if (!registered_buffer_sizes_.empty()) {
+            LOG(ERROR) << "Cannot re-initialize: a previous teardown left "
+                          "un-released NoF registrations; create a new client "
+                          "instead";
+            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+    }
+    {
+        std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
+        if (!quarantine_shms_.empty()) {
+            LOG(ERROR) << "Cannot re-initialize: a previous teardown left "
+                          "quarantined shared mappings that must stay pinned; "
+                          "create a new client instead";
+            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+    }
     // Reset the teardown latch so this instance can be torn down again.
     closed_.store(false, std::memory_order_release);
 

@@ -151,15 +151,14 @@ class SpdkEnvGuard {
         }
     }
 
-    // Runs when the last reference dies. With the process-wide pin in place,
-    // that is static destruction at process exit at the earliest — and in
-    // HAVE_SPDK_MEM_REGISTER builds it never happens at all: the deliberately
-    // leaked NofRegistryBundle (below) holds a strong reference for the whole
-    // process lifetime, so spdk_env_fini intentionally stays unreachable
-    // there (SPDK v23.01.1 cannot be re-initialized after fini). spdk_env_fini
-    // is serialized with Acquire via RegistryMutex: a concurrent Acquire
-    // holds the same mutex while running spdk_env_init, so DPDK teardown and
-    // re-init can never race.
+    // Runs when the last reference dies. In practice that never happens:
+    // ProcessPin is deliberately leaked (see below), so one reference is
+    // always alive and spdk_env_fini never runs — the OS reclaims DPDK
+    // resources at process exit, and SPDK v23.01.1 could not be
+    // re-initialized after fini anyway. spdk_env_fini is serialized with
+    // Acquire via RegistryMutex: a concurrent Acquire holds the same mutex
+    // while running spdk_env_init, so DPDK teardown and re-init can never
+    // race.
     struct Deleter {
         void operator()(SpdkEnvGuard* p) const {
             std::lock_guard<std::mutex> lock(RegistryMutex());
@@ -178,15 +177,26 @@ class SpdkEnvGuard {
         return *m;
     }
     static std::weak_ptr<SpdkEnvGuard>& Registry() {
-        static std::weak_ptr<SpdkEnvGuard> w;
-        return w;
+        // Deliberately leaked (like RegistryMutex): a probe-only initiator
+        // never registers memory, so the NofRegistryBundle below is first
+        // constructed by its ~Impl backstop during static destruction —
+        // after function-local statics like this one have already been
+        // destroyed. The bundle's constructor calls Acquire(), which must
+        // not touch a destroyed static. Leaking also means the pin below
+        // never releases, so spdk_env_fini never runs at all; the OS
+        // reclaims DPDK resources at exit.
+        static std::weak_ptr<SpdkEnvGuard>* w =
+            new std::weak_ptr<SpdkEnvGuard>();
+        return *w;
     }
     // Process-lifetime pin: keeps one reference from the first successful
-    // Acquire until static destruction, so the env is never finalized
-    // mid-process (SPDK v23.01.1 cannot be re-initialized after fini).
+    // Acquire until process exit, so the env is never finalized mid-process
+    // (SPDK v23.01.1 cannot be re-initialized after fini). Leaked like
+    // Registry() for the same static-destruction-order reason.
     static std::shared_ptr<SpdkEnvGuard>& ProcessPin() {
-        static std::shared_ptr<SpdkEnvGuard> pin;
-        return pin;
+        static std::shared_ptr<SpdkEnvGuard>* pin =
+            new std::shared_ptr<SpdkEnvGuard>();
+        return *pin;
     }
 
     bool ok_{false};
@@ -217,7 +227,10 @@ struct NofRegistryBundle {
 NofRegistryBundle& GetNofRegistryBundle() {
     // Deliberately leaked (like RegistryMutex and the ShmHelper singleton):
     // avoids static-destruction-order issues with probe initiators' backstop
-    // UnregisterAll.
+    // UnregisterAll. A probe-only process first constructs the bundle inside
+    // that backstop during static destruction, so its constructor's Acquire()
+    // runs late too — safe because Registry()/ProcessPin() are likewise
+    // leaked and never destroyed.
     static NofRegistryBundle* bundle = new NofRegistryBundle();
     return *bundle;
 }

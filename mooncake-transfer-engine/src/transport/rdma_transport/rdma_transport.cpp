@@ -20,6 +20,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <chrono>
 #include <cstddef>
@@ -945,6 +946,8 @@ int RdmaTransport::registerLocalMemoryBatch(
 
 int RdmaTransport::unregisterLocalMemoryBatch(
     const std::vector<void *> &addr_list) {
+    std::atomic<bool> any_cleaned{false};
+    std::atomic<bool> any_not_registered{false};
     int first_error = runBoundedRegMrBatch(addr_list.size(), [&](size_t i) {
         int ret = unregisterLocalMemoryInternal(addr_list[i], false, true);
         // NOT_REGISTERED means nothing remains for this member: its metadata
@@ -953,16 +956,33 @@ int RdmaTransport::unregisterLocalMemoryBatch(
         // already succeeded — reporting it as an error would keep the
         // engine's region records stuck forever (un-re-registerable), while
         // the single-address path treats confirmed cleanup as success.
-        if (ret == ERR_ADDRESS_NOT_REGISTERED) ret = 0;
+        if (ret == ERR_ADDRESS_NOT_REGISTERED) {
+            any_not_registered.store(true, std::memory_order_relaxed);
+            return 0;
+        }
         if (ret) {
             LOG(WARNING) << "RdmaTransport: Failed to unregister memory: addr "
                          << addr_list[i];
+        } else {
+            any_cleaned.store(true, std::memory_order_relaxed);
         }
         return ret;
     });
 
+    // Publish even on failure: members that were cleaned have their metadata
+    // entries removed locally, and this best-effort republish keeps the
+    // remote advertisement from going stale.
     int metadata_ret = metadata_->updateLocalSegmentDesc();
-    return first_error ? first_error : metadata_ret;
+    if (first_error) return first_error;
+    if (metadata_ret) return metadata_ret;
+    // Preserve the never-registered contract for the engine's multi-transport
+    // aggregation: only report NOT_REGISTERED when every member was unknown
+    // and nothing was actually cleaned.
+    if (any_not_registered.load(std::memory_order_relaxed) &&
+        !any_cleaned.load(std::memory_order_relaxed)) {
+        return ERR_ADDRESS_NOT_REGISTERED;
+    }
+    return 0;
 }
 
 Status RdmaTransport::submitTransfer(
