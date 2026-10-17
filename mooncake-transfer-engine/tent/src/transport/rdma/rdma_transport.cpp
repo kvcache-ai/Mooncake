@@ -184,6 +184,7 @@ static Status convertConfToRdmaParams(std::shared_ptr<Config> conf,
     SET_ENDPOINT(endpoint_store_cap, params->endpoint.endpoint_store_cap);
     SET_ENDPOINT(max_sge, params->endpoint.max_sge);
     SET_ENDPOINT(max_qp_wr, params->endpoint.max_qp_wr);
+    SET_ENDPOINT(signal_interval, params->endpoint.signal_interval);
     SET_ENDPOINT(max_inline_bytes, params->endpoint.max_inline_bytes);
     SET_ENDPOINT(pkey_index, params->endpoint.pkey_index);
     SET_ENDPOINT(hop_limit, params->endpoint.hop_limit);
@@ -200,6 +201,14 @@ static Status convertConfToRdmaParams(std::shared_ptr<Config> conf,
     SET_ENDPOINT(send_retry_count, params->endpoint.send_retry_count);
     SET_ENDPOINT(send_rnr_count, params->endpoint.send_rnr_count);
     SET_ENDPOINT(max_rd_atomic, params->endpoint.max_rd_atomic);
+
+    if (params->endpoint.signal_interval <= 0) {
+        std::stringstream ss;
+        ss << "Invalid RDMA endpoint.signal_interval: "
+           << params->endpoint.signal_interval
+           << ", expected a positive integer";
+        return Status::InvalidArgument(ss.str() + LOC_MARK);
+    }
 
     size_t mtu_val = conf->get("transports/rdma/endpoint/path_mtu", 4096);
     if (mtu_val == 4096)

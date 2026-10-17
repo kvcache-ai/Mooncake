@@ -153,9 +153,13 @@ struct RdmaSlice {
     std::string target_machine_id;
 
     std::weak_ptr<RdmaEndPoint> ep_weak_ptr;
+    // Whether this slice's posted WR generates a CQE. Unsignaled WRs are
+    // retired by the next signaled completion and do not hold the slice
+    // storage alive after the batch is released.
+    bool completion_signaled = false;
     // Posted work requests whose completion has not been polled and fully
-    // handled yet; every work request is signalled, so each accepted post
-    // owes one. The status cannot stand in for this -- a timeout or a
+    // handled yet; only signaled work requests owe one. The status cannot
+    // stand in for this -- a timeout or a
     // teardown resolves a slice while its work request is live. Above zero,
     // the completion queue can still hand this address back, or a handler
     // can still be reading the slice, so the storage must outlive the
