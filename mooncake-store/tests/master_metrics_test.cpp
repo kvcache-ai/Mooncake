@@ -1436,6 +1436,40 @@ TEST_F(MasterMetricsTest, DuplicatePutResponsesCountItemsWithoutPerKeyLogs) {
     EXPECT_NE(response.body.find(batch_sample), std::string::npos);
 }
 
+TEST_F(MasterMetricsTest, EvictionAgeAndDurationHistogramsAreExported) {
+    auto& metrics = MasterMetricManager::instance();
+
+    // Histograms with zero sum are omitted from serialization, so observe
+    // representative values first. This test assumes no prior observations
+    // of these two histograms in the process (no reset exists; it is
+    // registered last in this file) — if an eviction-triggering test is
+    // added above it, switch to delta assertions.
+    metrics.observe_evicted_key_age_seconds(5.0);
+    metrics.observe_eviction_duration_ms(42);
+
+    const auto serialized = metrics.serialize_metrics();
+
+    EXPECT_NE(serialized.find("master_evicted_key_age_seconds_bucket{"),
+              std::string::npos);
+    // Constructor's update_metrics_for_zero_output() observed 0 once into
+    // each histogram (bucket counters include it), so after the observe
+    // calls above each serialized count is 2, not 1. ylt renders the count
+    // series with std::to_string(value_type): the double-specialized age
+    // histogram gets 6 decimals, the int64 duration histogram gets none.
+    EXPECT_NE(
+        serialized.find("master_evicted_key_age_seconds_count 2.000000\n"),
+        std::string::npos);
+    EXPECT_NE(serialized.find("master_evicted_key_age_seconds_sum 5\n"),
+              std::string::npos);
+
+    EXPECT_NE(serialized.find("master_eviction_duration_ms_bucket{"),
+              std::string::npos);
+    EXPECT_NE(serialized.find("master_eviction_duration_ms_count 2\n"),
+              std::string::npos);
+    EXPECT_NE(serialized.find("master_eviction_duration_ms_sum 42\n"),
+              std::string::npos);
+}
+
 }  // namespace mooncake::test
 
 int main(int argc, char** argv) {
