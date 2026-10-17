@@ -667,9 +667,10 @@ config.nof_replica_num = 1
 **Default:** `0`
 **Status:** **Work in progress; development and evaluation only.**
 **Description:** Requests an additional replica in the configured shared
-distributed filesystem. The supported values are currently `0` and `1`. When
-set to `1`, `replica_num` must be at least `1`, so DFS-only placement is not
-supported. DFS replicas currently support only the `default` tenant.
+distributed filesystem. The supported values are currently `0` and `1`.
+DFS-only placement (`replica_num = 0` with `dfs_replica_num = 1`) is supported;
+the DFS replica is then the object's only copy, so DFS eviction or removal
+deletes the object. DFS replicas currently support only the `default` tenant.
 
 ```python
 config = ReplicateConfig()

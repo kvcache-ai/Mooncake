@@ -998,9 +998,9 @@ config.dfs_replica_num = 1
 store.put("key", b"value", config)
 ```
 
-`dfs_replica_num` may currently be `0` or `1`. A DFS replica must be requested
-with at least one memory replica (`replica_num >= 1`), so DFS-only placement is
-not supported.
+`dfs_replica_num` may currently be `0` or `1`. DFS-only placement is supported
+by setting `replica_num = 0` and `nof_replica_num = 0`; the object then has no
+memory replica, and DFS eviction or removal deletes it.
 
 Allocation first tries the key's hash-selected DFS shard, then tries other
 ready shards if that shard has no suitable extent. This lets new shards accept
@@ -1022,7 +1022,9 @@ failed key is revoked without downgrading successful keys.
 For a same-size `Upsert`, if either the existing object or the new request has
 a DFS replica, the requested memory, NoF, and DFS replica counts must match the
 existing topology. A different-size update releases the old placement and
-allocates a new topology.
+allocates a new topology. For example, after the memory replica of a
+memory-plus-DFS object is evicted, a same-size `Upsert` must request the
+DFS-only topology.
 
 On reads, the master returns the readable replica list through the normal query
 path, and the client selects the first complete replica. If it selects DFS, any
@@ -1032,8 +1034,7 @@ reads for that descriptor.
 #### Current limitations
 
 - Only the `default` tenant is supported.
-- `dfs_replica_num` must be `0` or `1`, and `replica_num >= 1` is required when
-  it is enabled.
+- `dfs_replica_num` must be `0` or `1`.
 - C and Rust clients cannot currently request or access descriptor-based DFS:
   their replication configuration does not expose `dfs_replica_num`, and their
   setup API cannot initialize the distributed `FileStorage` backend. Use the
