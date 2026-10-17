@@ -278,6 +278,7 @@ std::shared_ptr<Config> makeMinimalP2PConfig() {
     cfg->set("transports/rdma/enable", false);
     cfg->set("transports/io_uring/enable", false);
     cfg->set("transports/nvlink/enable", false);
+    cfg->set("transports/mlu/enable", false);
     cfg->set("transports/mnnvl/enable", false);
     cfg->set("transports/gds/enable", false);
     cfg->set("transports/ascend_direct/enable", false);

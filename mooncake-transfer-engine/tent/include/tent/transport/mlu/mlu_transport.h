@@ -16,8 +16,12 @@
 #define TENT_MLU_TRANSPORT_H_
 
 #include <atomic>
+#include <array>
+#include <map>
+#include <mutex>
 #include <string>
 #include <vector>
+#include <cn_api.h>
 
 #include "tent/platform/mlu.h"
 #include "tent/runtime/control_plane.h"
@@ -26,17 +30,25 @@
 namespace mooncake {
 namespace tent {
 
+struct MluCopyQueue {
+    CNcontext context = nullptr;
+    CNqueue handle = nullptr;
+    std::mutex mutex;
+    ~MluCopyQueue();
+    Status synchronize();
+};
+
 struct MluTask {
     Request request;
     std::atomic<TransferStatusEnum> status_word{TransferStatusEnum::PENDING};
     std::atomic<size_t> transferred_bytes{0};
+    std::shared_ptr<MluCopyQueue> queue;
+    CNnotifier completion = nullptr;
+    bool drain_on_error = false;
 
     MluTask() = default;
-    // vector::reserve needs a copy or move constructor despite the atomics.
-    MluTask(const MluTask &other)
-        : request(other.request),
-          status_word(other.status_word.load()),
-          transferred_bytes(other.transferred_bytes.load()) {}
+    MluTask(MluTask &&other) noexcept;
+    ~MluTask();
 };
 
 struct MluSubBatch : public Transport::SubBatch {
@@ -45,16 +57,18 @@ struct MluSubBatch : public Transport::SubBatch {
     size_t size() const override { return task_list.size(); }
 };
 
-// Executes synchronous copies with exactly one MLU endpoint, within the local
+// Executes copies with exactly one MLU endpoint, within the local
 // segment. Peer transfers use the engine's host-staging pipeline.
 class MluTransport : public Transport {
    public:
+    ~MluTransport() override;
     Status install(std::string &local_segment_name,
                    std::shared_ptr<ControlService> metadata,
                    std::shared_ptr<Topology> local_topology,
                    std::shared_ptr<Config> conf = nullptr) override;
 
     Status uninstall() override;
+    Status quiesce() override;
 
     Status allocateSubBatch(SubBatchRef &batch, size_t max_size) override;
 
@@ -66,6 +80,10 @@ class MluTransport : public Transport {
     Status getTransferStatus(SubBatchRef batch, int task_id,
                              TransferStatus &status) override;
 
+    Status allocateLocalMemory(void **addr, size_t size,
+                               MemoryOptions &options) override;
+    Status freeLocalMemory(void *addr, size_t size) override;
+
     Status addMemoryBuffer(BufferDesc &desc,
                            const MemoryOptions &options) override;
 
@@ -74,8 +92,11 @@ class MluTransport : public Transport {
     const char *getName() const override { return "mlu"; }
 
    private:
+    Status submitCopy(MluTask &task, bool to_device);
     void startTransfer(MluTask *task, MluSubBatch *batch);
 
+    std::mutex mutex_;
+    std::map<CNcontext, std::array<std::shared_ptr<MluCopyQueue>, 2>> queues_;
     bool installed_ = false;
     MluPlatform *platform_ = nullptr;
 };

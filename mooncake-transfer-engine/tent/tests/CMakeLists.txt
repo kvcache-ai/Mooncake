@@ -878,4 +878,6 @@ if(USE_MLU)
     add_test(NAME tent_mlu_${suite}_test COMMAND tent_mlu_${suite}_test)
     set_tests_properties(tent_mlu_${suite}_test PROPERTIES TIMEOUT 300)
   endforeach()
+  target_link_options(tent_mlu_transport_test PRIVATE
+                      "-Wl,--wrap=cnPlaceNotifier")
 endif()

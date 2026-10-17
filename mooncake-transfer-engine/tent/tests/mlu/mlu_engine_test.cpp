@@ -412,6 +412,21 @@ TEST_P(MluEngineTest, StagesDeviceToDeviceReadAndWrite) {
     ASSERT_NO_FATAL_FAILURE(transfer("mlu:0", "mlu:0", Request::READ, true));
 }
 
+TEST_P(MluEngineTest, InternalStagingUsesPinnedHostMemory) {
+    const auto location = a_->getLocalTopology()->findNearMem("mlu:0");
+    const auto pin = a_->lockStageBuffer(location);
+    ASSERT_NE(pin, 0u);
+    held_pins_.push_back({a_.get(), pin});
+    cnrtPointerAttributes_t attributes{};
+    ASSERT_EQ(
+        cnrtPointerGetAttributes(&attributes, reinterpret_cast<void*>(pin)),
+        cnrtSuccess);
+    EXPECT_EQ(attributes.type, cnrtMemTypeHost);
+    ASSERT_TRUE(a_->unlockStageBuffer(pin).ok());
+    held_pins_.pop_back();
+    checkIdleResources();
+}
+
 TEST_P(MluEngineTest, StagesOneDeviceSideReadAndWrite) {
     ASSERT_NO_FATAL_FAILURE(transfer("cpu:0", "mlu:0", Request::WRITE, true));
     ASSERT_NO_FATAL_FAILURE(transfer("cpu:0", "mlu:0", Request::READ, true));
