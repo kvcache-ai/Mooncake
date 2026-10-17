@@ -86,6 +86,25 @@ void MasterServiceTestPeer::SetNoFProbeFnForTesting(
 #endif
 }
 
+void MasterServiceTestPeer::SetNoFNamespaceQueryFnForTesting(
+    MasterService::NoFNamespaceQueryFn fn) {
+#ifdef USE_NOF
+    std::lock_guard<std::mutex> lock(service_.nof_namespace_query_fn_mutex_);
+    if (fn) {
+        service_.nof_namespace_query_fn_ = std::move(fn);
+        return;
+    }
+    service_.nof_namespace_query_fn_ = [](const std::string& endpoint,
+                                          NoFNamespaceInfo& info,
+                                          std::string* error_reason) {
+        return SpdkWrapper::GetInstance().QueryNamespaceInfo(endpoint, info,
+                                                             error_reason);
+    };
+#else
+    (void)fn;
+#endif
+}
+
 size_t MasterServiceTestPeer::GetMountedNoFSegmentCountForTesting() {
     std::vector<MountedNoFSegmentSnapshot> mounted_segments;
     service_.nof_segment_manager_.GetMountedSegmentsSnapshot(mounted_segments);
