@@ -38,7 +38,7 @@ jobs:
     # Fork code always runs on a disposable hosted VM. A repository-owned PR
     # can use the optional dedicated Linux runner label after A/A calibration.
     runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork && 'ubuntu-22.04' || vars.PERF_RUNNER || 'ubuntu-22.04' }}
-    timeout-minutes: 60
+    timeout-minutes: 75
     env:
       PERF_ROOT: ${{ github.workspace }}/performance-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
@@ -86,16 +86,21 @@ jobs:
           cp -R "$harness_source/scripts/ci/performance/." "$PERF_ROOT/harness/"
           cp baseline/mooncake-store/benchmarks/offset_allocator_concurrency_bench.cpp \
             candidate/mooncake-store/benchmarks/offset_allocator_concurrency_bench.cpp
+          python3 "$PERF_ROOT/harness/freeze_build.py" \
+            --baseline baseline --candidate candidate \
+            --manifest "$PERF_ROOT/results/build-config.json"
           echo "BASELINE_SHA=$baseline_sha" >> "$GITHUB_ENV"
           echo "CANDIDATE_SHA=$candidate_sha" >> "$GITHUB_ENV"
           echo "PERF_HARNESS_SHA=$(git -C "$harness_source" rev-parse HEAD)" >> "$GITHUB_ENV"
 
       - name: Install hosted runner dependencies
         if: runner.environment == 'github-hosted'
+        timeout-minutes: 10
         working-directory: baseline
         run: sudo bash dependencies.sh -y
 
       - name: Build both revisions with the same Release configuration
+        timeout-minutes: 35
         run: |
           set -euo pipefail
           for revision in baseline candidate; do
@@ -111,11 +116,13 @@ jobs:
           done
 
       - name: Collect alternating baseline and candidate samples
+        timeout-minutes: 16
         run: |
           python3 "$PERF_ROOT/harness/perf_gate.py" collect \
             --baseline baseline/build-perf/mooncake-store/benchmarks/offset_allocator_concurrency_bench \
             --candidate candidate/build-perf/mooncake-store/benchmarks/offset_allocator_concurrency_bench \
             --baseline-sha "$BASELINE_SHA" --candidate-sha "$CANDIDATE_SHA" \
+            --collection-timeout-seconds 900 \
             --output "$PERF_ROOT/results"
 
       - name: Publish comparison and enforce thresholds

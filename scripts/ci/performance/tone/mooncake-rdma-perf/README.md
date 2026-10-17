@@ -60,11 +60,16 @@ exact harness revision. `RDMA_HOSTS_FILE` belongs to the template configuration.
 
 Each host acquires `~/.mooncake-rdma-perf.lock` for the entire run. A busy host
 fails immediately; all suites sharing the pair must honor this lock/account.
-The two hosts build both revisions using the **same harness benchmark source**
-and Release flags, with CUDA/Store disabled and TENT enabled. Building on the
+The two hosts build both revisions using the **same harness benchmark source**,
+baseline tracked CMake recipes and Release flags, with CUDA/Store disabled and
+TENT enabled. Candidate-only CMake recipes are removed from disposable checkouts;
+target definitions and parent flags therefore cannot change the paired workload.
+This compares implementation changes under a fixed build configuration, not
+candidate build-system changes, and is not a sandbox for candidate C++ code.
+Building on the
 pair keeps the eRDMA provider and runtime libraries consistent; it does not
 depend on `tebench` being present in a wheel. Builds finish before measurements.
-Binary and linked-library hashes, compiler, device/port/GID, kernel, boot IDs,
+Build-configuration, binary and linked-library hashes, compiler, device/port/GID, kernel, boot IDs,
 NUMA CPU set, policy digest, harness identity and both revisions are recorded.
 
 `tebench` is forced to TENT + RDMA with an explicit RDMA transport hint and NIC

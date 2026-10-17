@@ -128,7 +128,7 @@ class Remote:
             )
             files = [
                 str(Path(__file__).with_name(name))
-                for name in ("rdma_worker.py", "perf_gate.py")
+                for name in ("rdma_worker.py", "perf_gate.py", "freeze_build.py")
             ]
             subprocess.run(
                 [

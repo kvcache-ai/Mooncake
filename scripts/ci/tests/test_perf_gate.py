@@ -1,4 +1,5 @@
 import argparse
+import copy
 import importlib.util
 import io
 import json
@@ -7,6 +8,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stdout
 from unittest.mock import patch
@@ -130,7 +132,7 @@ class PerformanceGateTest(unittest.TestCase):
         self.assertEqual(self.run_gate().returncode, 1)
 
     def test_negative_or_nonfinite_threshold_is_rejected(self):
-        for value in (-0.1, float("nan"), True):
+        for value in (-0.1, float("nan"), True, 10**400):
             with self.subTest(value=value):
                 self.policy["metrics"]["qps"]["max_regression_percent"] = value
                 self.assertEqual(self.run_gate().returncode, 2)
@@ -235,6 +237,39 @@ class PerformanceGateTest(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     gate.load_policy(self.policy_path)
 
+    def test_malformed_policy_containers_preserve_error_reports(self):
+        valid = copy.deepcopy(self.policy)
+        paths = (
+            (),
+            ("arguments",),
+            ("cases",),
+            ("metrics",),
+            ("cases", "offset-success-1t"),
+            ("cases", "offset-success-1t", "max_regression_percent"),
+            ("metrics", "qps"),
+        )
+        for path in paths:
+            for invalid in (None, [], ["not-an-object"], "not-an-object", 1):
+                with self.subTest(path=path, invalid=invalid):
+                    self.policy = copy.deepcopy(valid)
+                    if path:
+                        parent = self.policy
+                        for key in path[:-1]:
+                            parent = parent[key]
+                        parent[path[-1]] = invalid
+                    else:
+                        self.policy = invalid
+                    process = self.run_gate()
+                    self.assertEqual(process.returncode, 2, process.stderr)
+                    comparison = json.loads(
+                        (self.root / "report/comparison.json").read_text()
+                    )
+                    self.assertEqual(comparison["status"], "ERROR")
+                    self.assertIn(
+                        "Performance Gate: ERROR",
+                        (self.root / "report/summary.md").read_text(),
+                    )
+
     def fixture_binary(self, side, behavior="ok"):
         path = self.root / side
         path.write_text(f"""#!{sys.executable}
@@ -268,13 +303,13 @@ else:
         path.chmod(0o755)
         return path
 
-    def collect_fixture(self, behavior="ok"):
+    def collect_fixture(self, behavior="ok", budget=900):
         self.policy["cases"] = {
             "offset-success-1t": self.policy["cases"]["offset-success-1t"]
         }
         self.policy["arguments"]["iterations"] = 1000
         if behavior == "timeout":
-            self.policy["timeout_seconds"] = 0.1
+            self.policy["timeout_seconds"] = 1
         self.policy_path.write_text(json.dumps(self.policy))
         args = argparse.Namespace(
             policy=self.policy_path,
@@ -283,6 +318,7 @@ else:
             baseline_sha=BASE_SHA,
             candidate_sha=CANDIDATE_SHA,
             output=self.root / "samples",
+            collection_timeout_seconds=budget,
         )
         with patch.object(
             gate, "environment", return_value={"hostname": "fixture"}
@@ -328,8 +364,37 @@ else:
                     code, args = self.collect_fixture(behavior)
                     self.assertEqual(code, 2)
                     candidate = json.loads((args.output / "candidate.json").read_text())
-                    self.assertEqual(len(candidate["errors"]), 5)
+                    self.assertEqual(len(candidate["errors"]), 1)
                     self.assertEqual(candidate["cases"], {})
+                    self.assertEqual(
+                        (self.root / "order").read_text().splitlines(),
+                        ["baseline", "candidate"],
+                    )
+                    self.assertEqual(len(list(args.output.glob("*.csv"))), 2)
+                    args.baseline, args.candidate = (
+                        args.output / "baseline.json",
+                        args.output / "candidate.json",
+                    )
+                    args.summary = None
+                    with redirect_stdout(io.StringIO()):
+                        self.assertEqual(gate.report(args), 2)
+                    self.assertEqual(
+                        json.loads((args.output / "comparison.json").read_text())[
+                            "status"
+                        ],
+                        "ERROR",
+                    )
+
+    def test_collection_budget_bounds_total_runtime(self):
+        start = time.monotonic()
+        # The first baseline consumes the budget; no subsequent sample may start.
+        with patch.object(gate.time, "monotonic", side_effect=[0, 0, 2]):
+            code, args = self.collect_fixture(budget=1)
+        self.assertEqual(code, 2)
+        self.assertLess(time.monotonic() - start, 5)
+        self.assertEqual((self.root / "order").read_text().splitlines(), ["baseline"])
+        candidate = json.loads((args.output / "candidate.json").read_text())
+        self.assertIn("collection time budget exhausted", candidate["errors"][0])
 
 
 if __name__ == "__main__":

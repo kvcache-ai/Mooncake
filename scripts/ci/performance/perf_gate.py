@@ -11,9 +11,11 @@ import os
 from pathlib import Path
 import platform
 import re
+import signal
 import statistics
 import subprocess
 import sys
+import time
 
 
 def require(condition, message):
@@ -22,12 +24,21 @@ def require(condition, message):
 
 
 def number(value, minimum=0):
-    return type(value) in (int, float) and math.isfinite(value) and value > minimum
+    try:
+        return type(value) in (int, float) and math.isfinite(value) and value > minimum
+    except OverflowError:
+        return False
 
 
 def load_policy(path):
     policy = json.loads(Path(path).read_text())
+    require(isinstance(policy, dict), "policy must be an object")
     require(policy["schema_version"] == 1, "unsupported policy version")
+    for field in ("arguments", "cases", "metrics"):
+        require(
+            isinstance(policy[field], dict) and policy[field],
+            f"{field} must be a nonempty object",
+        )
     require(
         type(policy["repetitions"]) is int and policy["repetitions"] >= 5,
         "at least five repetitions are required",
@@ -55,10 +66,25 @@ def load_policy(path):
             policy["arguments"]["duration"] + 1 < policy["timeout_seconds"] <= 60,
             "RDMA timeout must include warmup/setup and fit the 60-second sample watchdog",
         )
-    require(policy["cases"] and policy["metrics"], "empty policy")
     for name, case in policy["cases"].items():
         require(re.fullmatch(r"[a-z0-9_-]+", name), "invalid case name")
+        require(isinstance(case, dict), f"{name}: case must be an object")
+        require(
+            isinstance(case.get("max_regression_percent", {}), dict),
+            f"{name}: threshold overrides must be an object",
+        )
+        require(
+            type(case["threads"]) is int and 0 < case["threads"] <= policy["cpu_count"],
+            "invalid thread count",
+        )
         if rdma:
+            require(
+                isinstance(case.get("metrics"), list)
+                and case["metrics"]
+                and all(isinstance(key, str) for key in case["metrics"])
+                and len(set(case["metrics"])) == len(case["metrics"]),
+                f"{name}: metrics must be a nonempty list of distinct names",
+            )
             require(case["op_type"] in ("read", "write"), "invalid RDMA operation")
             for key in ("block_size", "batch_size"):
                 require(type(case[key]) is int and case[key] > 0, f"invalid {key}")
@@ -81,20 +107,19 @@ def load_policy(path):
             and set(case.get("metrics", policy["metrics"])) <= set(policy["metrics"]),
             "invalid case metrics",
         )
-        require(
-            type(case["threads"]) is int and 0 < case["threads"] <= policy["cpu_count"],
-            "invalid thread count",
-        )
         for key, limit in case.get("max_regression_percent", {}).items():
             require(
                 key in policy["metrics"] and number(limit, -1) and limit >= 0,
                 "invalid case threshold override",
             )
     for name, metric in policy["metrics"].items():
+        require(isinstance(metric, dict), f"{name}: metric must be an object")
         allowed = ("bandwidth_gbs", "p99_us") if rdma else ("qps", "p50_ns", "p99_ns")
         require(name in allowed, "unsupported benchmark metric")
         require(
-            metric["direction"] in ("higher", "lower") and metric["unit"],
+            metric["direction"] in ("higher", "lower")
+            and isinstance(metric["unit"], str)
+            and metric["unit"],
             "invalid metric direction or unit",
         )
         require(
@@ -117,6 +142,28 @@ def write_json(path, value):
 def annotation(message):
     escaped = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
     print(f"::error title=Performance Gate::{escaped}")
+
+
+def stop_process(process):
+    """Stop only the process group started for this invocation, including descendants."""
+    if process is None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass  # The group already exited; its direct child still needs to be reaped.
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass  # It exited between the wait and the signal.
+        process.wait(timeout=5)
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass  # No descendants remain after the parent was reaped.
 
 
 def environment(cpu_count):
@@ -181,6 +228,9 @@ def collect(args):
     # Never reuse files from an earlier invocation as evidence for this run.
     require(not any(out.glob("*.json")), "output directory already contains results")
     env = environment(policy["cpu_count"])
+    budget = getattr(args, "collection_timeout_seconds", 900)
+    require(number(budget), "invalid collection time budget")
+    deadline = time.monotonic() + budget
     results = {}
     for side in ("baseline", "candidate"):
         binary = Path(getattr(args, side)).resolve()
@@ -211,16 +261,25 @@ def collect(args):
                 command += [f"--{key}={value}" for key, value in flags.items()]
                 print(f"{name} round {repeat + 1}: {side}", flush=True)
                 try:
+                    remaining = deadline - time.monotonic()
+                    require(remaining > 0, "collection time budget exhausted")
                     with log.with_suffix(".csv").open("w") as stdout, log.with_suffix(
                         ".log"
                     ).open("w") as stderr:
-                        subprocess.run(
+                        process = subprocess.Popen(
                             command,
                             stdout=stdout,
                             stderr=stderr,
-                            timeout=policy["timeout_seconds"],
-                            check=True,
+                            start_new_session=True,
                         )
+                        try:
+                            code = process.wait(
+                                timeout=min(policy["timeout_seconds"], remaining)
+                            )
+                            if code:
+                                raise subprocess.CalledProcessError(code, command)
+                        finally:
+                            stop_process(process)
                     sample = parse_sample(
                         log.with_suffix(".csv").read_text(), case, policy
                     )
@@ -238,13 +297,17 @@ def collect(args):
                     ValueError,
                     KeyError,
                     TypeError,
+                    RuntimeError,
                     subprocess.SubprocessError,
                 ) as exc:
                     results[side]["errors"].append(f"{name} round {repeat + 1}: {exc}")
+                    # A failed invocation invalidates the run. Save diagnostics below,
+                    # then leave time for comparison/upload instead of retrying it.
+                    return 2
                 finally:
                     for result_side, result in results.items():
                         write_json(out / f"{result_side}.json", result)
-    return 2 if any(result["errors"] for result in results.values()) else 0
+    return 0
 
 
 def compare(policy, baseline, candidate, baseline_sha, candidate_sha):
@@ -398,10 +461,17 @@ def main():
     parser.add_argument("--baseline-sha", required=True)
     parser.add_argument("--candidate-sha", required=True)
     parser.add_argument("--output", required=True)
+    parser.add_argument("--collection-timeout-seconds", type=float, default=900)
     parser.add_argument("--summary", default=os.environ.get("GITHUB_STEP_SUMMARY"))
     args = parser.parse_args()
     return collect(args) if args.mode == "collect" else report(args)
 
 
 if __name__ == "__main__":
+
+    def interrupted(signum, frame):
+        raise RuntimeError(f"interrupted by signal {signum}")
+
+    signal.signal(signal.SIGTERM, interrupted)
+    signal.signal(signal.SIGINT, interrupted)
     sys.exit(main())

@@ -85,6 +85,7 @@ class FixtureRemote:
                     side: {
                         "revision": args[side + "_sha"],
                         "binary_sha256": "d" * 64,
+                        "build_config_sha256": "f" * 64,
                         "libraries": {"/lib/provider.so": "e" * 64},
                     }
                     for side in ("baseline", "candidate")
@@ -106,6 +107,7 @@ class FixtureRemote:
                 )
                 + "\n"
             )
+        return None
 
     def close(self):
         self.calls.append((self.index, "close", {}))
@@ -279,6 +281,10 @@ class RDMAPerformanceTest(unittest.TestCase):
             lambda x: x["candidate"].update(revision=BASE),
             lambda x: x["candidate"]["environment"].update(harness_sha=HEAD),
             lambda x: x["candidate"].update(builds=[]),
+            lambda x: x["candidate"]["builds"][0].update(build_config_sha256="0" * 64),
+            lambda x: x["candidate"]["builds"][0].pop("build_config_sha256"),
+            lambda x: x["baseline"].update(errors="malformed errors"),
+            lambda x: x["baseline"].update(errors=[{}]),
             lambda x: x["candidate"].update(policy_sha256="wrong"),
             lambda x: x["candidate"]["environment"].update(
                 hosts=[{"boot_id": "same"}] * 2
@@ -291,6 +297,10 @@ class RDMAPerformanceTest(unittest.TestCase):
             code, args, _ = self.run_client(bad, output=self.root / f"bad-{index}")
             self.assertEqual(code, 2)
             self.assertIn("ERROR", (args.output / "summary.md").read_text())
+            self.assertEqual(
+                json.loads((args.output / "comparison.json").read_text())["status"],
+                "ERROR",
+            )
 
     def test_infrastructure_failure_cannot_be_masked_by_passing_measurements(self):
         code, args, _ = self.run_client(self.bundle(), state="fail")
@@ -376,6 +386,37 @@ class RDMAPerformanceTest(unittest.TestCase):
         self.addCleanup(worker.stop, process)
         worker.stop(process)
         self.assertIsNotNone(process.returncode)
+
+    def test_process_group_cleanup_reaches_descendants(self):
+        marker = self.root / "stopped"
+        ready = self.root / "ready"
+        child = f"""import signal, time
+from pathlib import Path
+def terminate(signum, frame):
+    Path({str(marker)!r}).write_text("stopped")
+    raise SystemExit(0)
+signal.signal(signal.SIGTERM, terminate)
+Path({str(ready)!r}).write_text("ready")
+while True:
+    time.sleep(1)
+"""
+        parent = f"""import signal, subprocess, sys
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+child = subprocess.Popen([sys.executable, "-c", {child!r}])
+child.wait()
+"""
+        process = subprocess.Popen(
+            [sys.executable, "-c", parent], start_new_session=True
+        )
+        self.addCleanup(worker.stop, process)
+        for _ in range(100):
+            if ready.exists():
+                break
+            time.sleep(0.01)
+        self.assertTrue(ready.exists(), "child did not become ready")
+        worker.stop(process)
+        self.assertEqual(process.returncode, 0)
+        self.assertEqual(marker.read_text(), "stopped")
 
     def test_worker_launch_pins_rdma_and_numa_and_manages_target_lifetime(self):
         remote = self.root / "remote"

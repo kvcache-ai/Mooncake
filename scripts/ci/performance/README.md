@@ -2,11 +2,17 @@
 
 The `Performance regression` workflow builds the PR base and test merge commit
 in Release mode on the same Linux runner. It runs the existing
-`offset_allocator_concurrency_bench` with the **base revision's benchmark source**
-in both builds. The baseline's policy and Python harness are also used, so a PR
-cannot quietly change its own workload or thresholds. The first PR introducing
+`offset_allocator_concurrency_bench` with the **base revision's benchmark source
+and tracked CMake recipes** in both builds. Target definitions, parent compile
+flags and included `.cmake` files are frozen; candidate-only recipes are removed
+from the disposable checkout. The baseline's policy and Python harness are also
+used. The first PR introducing
 this directory necessarily bootstraps the harness from the candidate and emits
-a warning. Benchmark / policy changes take effect for subsequent PRs after merge.
+a warning. Benchmark, build-recipe and policy changes take effect for subsequent
+PRs after merge. Candidate implementation sources still change. A candidate
+requiring an incompatible build layout fails explicitly; this gate compares
+source changes under the baseline build configuration, not build-system changes.
+This workload control is not a sandbox for arbitrary candidate C++ code.
 
 The initial suite covers successful allocate/free, capacity rejection, and
 fragmentation rejection with one and two threads. It measures allocator CPU
@@ -23,7 +29,8 @@ T-One template before enabling `RDMA_PERF_ENABLED`.
 Open **Performance Gate → Details → Summary** to see each case's baseline and
 candidate medians, regression percentage, threshold, and measurement spread.
 The `performance-results` artifact contains raw CSV/stderr for every invocation,
-the exact policy, build logs, binary hashes, commit SHAs, CPU affinity, compiler,
+the exact policy, frozen CMake file hashes (`build-config.json`), build logs,
+binary hashes, commit SHAs, CPU affinity, compiler,
 environment, normalized samples, `comparison.json`, and `summary.md`.
 
 `policy.json` specifies five measured runs per revision. Each invocation performs
@@ -54,7 +61,12 @@ not match, non-finite or non-positive values, benchmark errors, and incomplete
 sample counts fail closed. Expected allocation rejection is part of the capacity
 and fragmentation workloads; any *unexpected* result fails correctness checks.
 Setup/build failures also produce an ERROR summary. Reports are uploaded even on
-failure. Re-running creates a new artifact; there is no retry-until-green logic.
+failure. Collection stops at the first process, timeout or parsing failure after
+saving partial samples. A 15-minute total collection budget also bounds sequences
+of slow successful samples. Dependency installation and building have separate
+10/35-minute step limits within the 75-minute job, leaving time for reports and
+uploads. Owned benchmark process groups are stopped on failure or cancellation.
+Re-running creates a new artifact; there is no retry-until-green logic.
 
 ## Runner calibration and branch protection
 
@@ -86,7 +98,16 @@ separate fixed release anchor is needed to detect cumulative small regressions.
 
 ## Local reproduction
 
-Build the benchmark target for both revisions with the workflow's CMake flags.
+Use disposable checkouts. Freeze the baseline benchmark source and build recipes,
+then build both revisions with the workflow's CMake flags:
+
+```bash
+cp /path/to/base/mooncake-store/benchmarks/offset_allocator_concurrency_bench.cpp \
+  /path/to/candidate/mooncake-store/benchmarks/offset_allocator_concurrency_bench.cpp
+python3 scripts/ci/performance/freeze_build.py \
+  --baseline /path/to/base --candidate /path/to/candidate --manifest build-config.json
+```
+
 On Linux, collect results into a fresh directory:
 
 ```bash
@@ -97,7 +118,7 @@ python3 scripts/ci/performance/perf_gate.py collect \
 python3 scripts/ci/performance/perf_gate.py compare \
   --baseline results/baseline.json --candidate results/candidate.json \
   --baseline-sha FULL_BASE_SHA --candidate-sha FULL_CANDIDATE_SHA --output results
-python3 -m unittest discover -s scripts/ci/tests -p test_perf_gate.py -v
+python3 -m unittest discover -s scripts/ci/tests -p 'test_*perf*.py' -v
 ```
 
 Use the same policy and benchmark source for both revisions. The comparison

@@ -82,8 +82,14 @@ class Tone:
 
 def import_results(bundle, args, policy):
     require(bundle["run_id"] == args.run_id, "stale T-One result")
+    build_configs = set()
     for side in ("baseline", "candidate"):
         result = bundle[side]
+        require(
+            isinstance(result["errors"], list)
+            and all(isinstance(error, str) for error in result["errors"]),
+            "invalid collection errors",
+        )
         env = result["environment"]
         require(
             env["run_id"] == args.run_id and env["harness_sha"] == args.harness_sha,
@@ -103,6 +109,7 @@ def import_results(bundle, args, policy):
             for build in result["builds"]:
                 require(
                     build["revision"] == getattr(args, side + "_sha")
+                    and re.fullmatch(r"[0-9a-f]{64}", build["build_config_sha256"])
                     and re.fullmatch(r"[0-9a-f]{64}", build["binary_sha256"])
                     and build["libraries"]
                     and all(
@@ -111,7 +118,11 @@ def import_results(bundle, args, policy):
                     ),
                     "invalid build provenance",
                 )
+                build_configs.add(build["build_config_sha256"])
         write_json(Path(args.output) / (side + ".json"), result)
+    require(
+        len(build_configs) <= 1, "baseline and candidate build configurations differ"
+    )
     return compare(
         policy,
         bundle["baseline"],

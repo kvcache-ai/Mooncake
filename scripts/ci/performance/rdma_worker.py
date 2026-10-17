@@ -14,32 +14,12 @@ import subprocess
 import sys
 import time
 
-from perf_gate import require
+from freeze_build import freeze
+from perf_gate import require, stop_process as stop, write_json
 
 
 def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
-
-
-def stop(process):
-    if process is not None:
-        try:
-            os.killpg(process.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-        try:
-            process.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            process.wait(timeout=5)
-        # Reap descendants even if their parent exited before handling SIGTERM.
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
 
 
 class Worker:
@@ -169,6 +149,11 @@ class Worker:
             benchmark = source / "mooncake-transfer-engine/benchmark"
             shutil.rmtree(benchmark)
             shutil.copytree(self.root / "benchmark", benchmark)
+        manifest = freeze(self.root / "baseline", self.root / "candidate")
+        write_json(self.logs / "build-config.json", manifest)
+        for side in ("baseline", "candidate"):
+            source = self.root / side
+            log = side + "-build.log"
             self.command(
                 [
                     "cmake",
@@ -211,7 +196,8 @@ class Worker:
                 for path in re.findall(r"(?:=>\s+|^\s*)(/\S+)", linked, re.M)
             }
             builds[side] = {
-                "revision": sha,
+                "revision": request[side + "_sha"],
+                "build_config_sha256": manifest["sha256"],
                 "binary_sha256": digest(binary),
                 "libraries": libraries,
             }
