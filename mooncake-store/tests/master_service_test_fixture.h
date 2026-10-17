@@ -101,11 +101,12 @@ class MasterServiceTest : public ::testing::Test {
         MasterServiceTestPeer(service).ClearInvalidHandles();
     }
 
-    void ExpectKeyHiddenFromReadApis(MasterService& service,
-                                     const std::string& key) {
+    void ExpectKeyHiddenFromReadApis(
+        MasterService& service, const std::string& key,
+        ErrorCode expected_get_error = ErrorCode::REPLICA_IS_NOT_READY) {
         auto get = service.GetReplicaList(key, TenantId::Default());
         ASSERT_FALSE(get.has_value());
-        EXPECT_EQ(ErrorCode::REPLICA_IS_NOT_READY, get.error());
+        EXPECT_EQ(expected_get_error, get.error());
 
         auto exists = service.ExistKey(key, TenantId::Default());
         ASSERT_TRUE(exists.has_value());

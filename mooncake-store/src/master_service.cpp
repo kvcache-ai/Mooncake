@@ -2538,6 +2538,45 @@ tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
                 }
                 const auto cleanup_plan =
                     BuildStaleHandleCleanupPlan(it->second.metadata, is_stale);
+                if ((cleanup_plan.would_invalidate ||
+                     !it->second.metadata.IsValid()) &&
+                    !it->second.metadata.IsLeaseExpired()) {
+                    // This round would end the record: every replica is stale
+                    // or the metadata is already invalid. A live read lease
+                    // means ExistKey just reported the key as a hit, so
+                    // sweeping now flips the follow-up load to
+                    // OBJECT_NOT_FOUND mid-flight and drops bytes a remount
+                    // could still revive (#4508). Leave replicas and metadata
+                    // in place; the next sweep after lease expiry takes both.
+                    //
+                    // A promotion task anchored to the key is just as dead as
+                    // the record (its source replica is stale), so cancel it
+                    // now: keeping it would let a dead holder pin the
+                    // cluster-wide in-flight cap until the lease lapses.
+                    auto& task = it->second.state.promotion_task;
+                    if (task) {
+                        if (auto* source = it->second.metadata.GetReplicaByID(
+                                task->source_id);
+                            source != nullptr) {
+                            source->dec_refcnt();
+                        }
+                        const ReplicaID alloc_id = task->alloc_id;
+                        const UUID holder_id = task->holder_id;
+                        ErasePromotionTaskIfPresent(tenant_state,
+                                                    it->second.state);
+                        if (alloc_id != 0) {
+                            EraseReplicasWithCacheTotalAccounting(
+                                it->second.metadata,
+                                [alloc_id](const Replica& replica) {
+                                    return replica.id() == alloc_id;
+                                });
+                        }
+                        local_ssd_manager_.RemovePromotion(
+                            holder_id, it->second.metadata.tenant_id,
+                            it->second.metadata.user_key);
+                    }
+                    continue;
+                }
                 if (!cleanup_plan.removed_ids.empty()) {
                     if (enable_ha_) {
                         if (enable_oplog_) {
