@@ -936,6 +936,49 @@ class MasterService {
         size_t chunk_object_count = kDefaultBatchOpLogPromotionChunkObjects);
 
     /**
+     * @brief Restore lifecycle state machine (RFC #4700, slice 1).
+     *
+     * The machine below is the one proposed by the RFC:
+     *
+     *   Constructed -> Recovering -> Ready -> Serving
+     *        |              |           (non-HA: Constructed -> Ready)
+     *        +----------> Failed
+     *
+     * The absence of a Serving -> Recovering edge is a proposed constraint,
+     * not an established API guarantee. Slice 1 wires the transitions that
+     * exist today and uses the state to pause business workers while a
+     * promotion restore is in flight; the master_state_mutex_ stays in
+     * place, so this slice changes no locking behavior. The Stopping state
+     * and the RPC-level admission gate land with the follow-up slices that
+     * actually remove the global lock from ordinary paths.
+     */
+    enum class RestoreLifecycleState {
+        kConstructed,  // components built; workers admitted (see below)
+        kRecovering,   // HA promotion restore in flight; workers paused
+        kReady,        // restore + durable repair done; serving not activated
+        kServing,      // service registered and exposed
+        kFailed,       // restore failed; the candidate must be destroyed
+    };
+
+    /// Current lifecycle state; safe to call from any thread.
+    RestoreLifecycleState GetRestoreLifecycleState() const;
+
+    /**
+     * @brief Non-HA initialization step: Constructed -> Ready.
+     * The non-HA path has no restore, so it opens the lifecycle directly.
+     * Refuses (logs) any other source state.
+     */
+    void MarkReadyForServing();
+
+    /**
+     * @brief Activate serving: Ready -> Serving.
+     * Called once the RPC service is registered and exposed. Refuses
+     * (logs) any other source state: serving must never be activated on a
+     * service whose restore did not succeed.
+     */
+    void ActivateServing();
+
+    /**
      * @brief Query the status of a task
      * @return Task basic info
      */
@@ -976,7 +1019,25 @@ class MasterService {
     void setHttpMetadataRemoteUrl(const std::string& metadata_connstring);
 
    private:
+    // Lifecycle wrapper around the restore implementation: performs the
+    // {Constructed, Ready, Failed} -> Recovering -> {Ready, Failed}
+    // transitions so a promotion restore has an explicit lifecycle
+    // bookkeeping point (RFC #4700, slice 1). Entry from Serving is
+    // refused per the RFC's proposed no-cycles constraint; the existing
+    // restore retry semantics (replacement restore from Ready or Failed)
+    // are unchanged and remain covered by the HA tests.
     tl::expected<void, ErrorCode> RestoreFromStandbyState(
+        const std::vector<StandbyObjectEntry>* legacy_objects,
+        const StandbyMetadataStore* metadata_store,
+        uint64_t initial_oplog_sequence_id,
+        const std::vector<StandbySegmentInfo>& segments,
+        size_t chunk_object_count,
+        std::optional<ReplicaID> expected_max_replica_id,
+        const WeightMetadataSnapshot* legacy_weight_metadata);
+
+    // The restore implementation itself; entered only through
+    // RestoreFromStandbyState above.
+    tl::expected<void, ErrorCode> RestoreFromStandbyStateCore(
         const std::vector<StandbyObjectEntry>* legacy_objects,
         const StandbyMetadataStore* metadata_store,
         uint64_t initial_oplog_sequence_id,
@@ -2117,6 +2178,23 @@ class MasterService {
     std::shared_ptr<AllocationStrategy> allocation_strategy_;
 
     mutable std::shared_mutex master_state_mutex_;
+
+    // Restore lifecycle state (RFC #4700, slice 1). Declared next to
+    // master_state_mutex_ because the follow-up slices replace that lock's
+    // restore-window protection with this state machine. kConstructed keeps
+    // business workers admitted so tests and embedded users keep the
+    // constructor-starts-workers behavior; tightening that to "paused until
+    // activation" is part of the later slices once callers carry explicit
+    // activation.
+    std::atomic<RestoreLifecycleState> lifecycle_state_{
+        RestoreLifecycleState::kConstructed};
+
+    // True in every lifecycle state except the restore windows
+    // (kRecovering / kFailed). Background workers that mutate business
+    // metadata consult this at the top of each loop iteration so a
+    // promotion restore never races them, independent of
+    // master_state_mutex_.
+    bool AdmitsBusinessWorkers() const;
 
     // Discarded replicas management
     const std::chrono::seconds put_start_discard_timeout_sec_;

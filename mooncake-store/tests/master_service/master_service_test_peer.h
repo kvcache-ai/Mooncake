@@ -265,6 +265,23 @@ class MasterServiceTestPeer {
         return service.master_state_mutex_;
     }
 
+    // Restore lifecycle (RFC #4700, slice 1).
+    static MasterService::RestoreLifecycleState GetRestoreLifecycleState(
+        MasterService& service) {
+        return service.lifecycle_state_.load(std::memory_order_acquire);
+    }
+
+    // Force a lifecycle state so worker-admission can be tested without
+    // running a real promotion restore.
+    static void SetRestoreLifecycleStateForTesting(
+        MasterService& service, MasterService::RestoreLifecycleState state) {
+        service.lifecycle_state_.store(state, std::memory_order_release);
+    }
+
+    bool AdmitsBusinessWorkersForTesting() const {
+        return service_.AdmitsBusinessWorkers();
+    }
+
     static auto& SoftPinDeadlineIndex(MasterService& service) {
         return service.soft_pin_deadline_index_;
     }
