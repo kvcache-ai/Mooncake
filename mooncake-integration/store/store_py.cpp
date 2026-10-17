@@ -2495,8 +2495,6 @@ PYBIND11_MODULE(store, m) {
             "in seconds (default 5, 0 disables).\n"
             "  ssd_prefetch_dedup_ttl_sec: Prefetch per-key dedup/rate-limit "
             "TTL in seconds (default 30, 0 disables).\n"
-            "  ssd_get_wait_ms: get-side prefetch wait budget in "
-            "milliseconds (default 0 = no waiting).\n"
             "  enable_embedded_master: Start an in-process master so no "
             "external mooncake_master is required (default false). This is "
             "test/eval plumbing, not a documented deployment mode.")

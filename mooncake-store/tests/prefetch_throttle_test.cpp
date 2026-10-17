@@ -2,7 +2,6 @@
 // backoff, memory-pressure cooldown, and concurrent reserve uniqueness.
 
 #include "prefetch_throttle.h"
-#include "ssd_prefetcher.h"
 
 #include <gtest/gtest.h>
 
@@ -133,46 +132,16 @@ TEST(PrefetchThrottleTest, AlreadyResidentClearsPromoteAttempted) {
     EXPECT_FALSE(throttle.promoteAttempted("a"));
 }
 
-TEST(PrefetchThrottleTest, WaitForCompletionReturnsOnComplete) {
-    PrefetchThrottle throttle;
-    throttle.configure(1, 60);
-    ASSERT_EQ(throttle.reserve({"a"}).size(), 1u);
-
-    std::thread finisher([&] {
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
-        throttle.markCompleted("a");
-    });
-    EXPECT_TRUE(throttle.waitForCompletion("a", /*max_wait_ms=*/2000));
-    finisher.join();
-}
-
-TEST(PrefetchThrottleTest, WaitForCompletionTimesOutOrFailsFast) {
-    PrefetchThrottle throttle;
-    throttle.configure(1, 60);
-
-    // Never triggered: treated as failed, returns immediately.
-    EXPECT_FALSE(throttle.waitForCompletion("never", 100));
-
-    ASSERT_EQ(throttle.reserve({"b"}).size(), 1u);
-    throttle.markFailed("b");
-    EXPECT_FALSE(throttle.waitForCompletion("b", 1000));
-
-    ASSERT_EQ(throttle.reserve({"c"}).size(), 1u);
-    EXPECT_FALSE(throttle.waitForCompletion("c", /*max_wait_ms=*/20));
-}
-
-TEST(PrefetchThrottleTest, DelegatedKeysBlockRetriggerAndNeverWait) {
+TEST(PrefetchThrottleTest, DelegatedKeysBlockRetrigger) {
     PrefetchThrottle throttle;
     throttle.configure(/*cooldown_sec=*/1, /*dedup_ttl_sec=*/60);
 
     ASSERT_EQ(throttle.reserve({"a"}).size(), 1u);
     throttle.markDelegated("a");
     EXPECT_EQ(throttle.stateOf("a"), PrefetchThrottle::State::kDelegated);
-    // Delegated keys block re-triggering for the full TTL (the remote holder
-    // is executing; re-delegating would spam the holder RPC)...
+    // Delegated keys block re-triggering for the full TTL: the remote holder
+    // is executing, and re-delegating would spam the holder RPC.
     EXPECT_TRUE(throttle.reserve({"a"}).empty());
-    // ...and are never waited on locally: immediate false, no budget burn.
-    EXPECT_FALSE(throttle.waitForCompletion("a", /*max_wait_ms=*/1000));
 }
 
 TEST(PrefetchThrottleTest, ConcurrentReserveGrantsEachKeyOnce) {
@@ -192,73 +161,6 @@ TEST(PrefetchThrottleTest, ConcurrentReserveGrantsEachKeyOnce) {
         thread.join();
     }
     EXPECT_EQ(total_reserved.load(), keys.size());
-}
-
-TEST(PrefetchThrottleTest, WaitOutcomeReflectsPromotionState) {
-    SsdPrefetcher prefetcher;
-    prefetcher.Init(std::weak_ptr<Client>(), std::weak_ptr<FileStorage>(),
-                    std::weak_ptr<ClientRequester>(), "", 1000);
-    auto throttle = prefetcher.throttle();
-    throttle->configure(1, 30);
-
-    // No record at all: skipped.
-    EXPECT_EQ(prefetcher.WaitIfPromotionInFlight("none", 100),
-              SsdPrefetcher::WaitOutcome::kSkipped);
-    // kTriggered (pool job still queued): never waited on.
-    throttle->reserve({"queued"});
-    EXPECT_EQ(prefetcher.WaitIfPromotionInFlight("queued", 100),
-              SsdPrefetcher::WaitOutcome::kSkipped);
-    // kFailed / kDelegated: terminal, skipped.
-    throttle->reserve({"failed"});
-    throttle->markFailed("failed");
-    EXPECT_EQ(prefetcher.WaitIfPromotionInFlight("failed", 100),
-              SsdPrefetcher::WaitOutcome::kSkipped);
-    // Already completed: immediate, no wait.
-    throttle->reserve({"done"});
-    throttle->markCompleted("done");
-    EXPECT_EQ(prefetcher.WaitIfPromotionInFlight("done", 100),
-              SsdPrefetcher::WaitOutcome::kCompleted);
-    // In-flight, completes during the wait.
-    throttle->reserve({"live"});
-    throttle->markInFlight("live");
-    std::thread finisher([&] {
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
-        throttle->markCompleted("live");
-    });
-    EXPECT_EQ(prefetcher.WaitIfPromotionInFlight("live", 2000),
-              SsdPrefetcher::WaitOutcome::kCompleted);
-    finisher.join();
-    // Still in flight when the budget runs out.
-    throttle->reserve({"slow"});
-    throttle->markInFlight("slow");
-    EXPECT_EQ(prefetcher.WaitIfPromotionInFlight("slow", 30),
-              SsdPrefetcher::WaitOutcome::kTimedOut);
-    // Fails during the wait.
-    throttle->reserve({"bad"});
-    throttle->markInFlight("bad");
-    std::thread breaker([&] {
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
-        throttle->markFailed("bad");
-    });
-    EXPECT_EQ(prefetcher.WaitIfPromotionInFlight("bad", 2000),
-              SsdPrefetcher::WaitOutcome::kFailed);
-    breaker.join();
-}
-
-TEST(PrefetchThrottleTest, GetWaitDeadlineCappedByBatchLeaseFloor) {
-    constexpr int64_t now = 100000;
-    // A 2s wait budget with a lease floor 500ms out: the deadline must land
-    // inside the lease window (floor minus margin), not at now + 2000ms —
-    // otherwise co-batch keys' transfers expire their leases while waiting.
-    const int64_t capped =
-        PrefetchThrottle::CapWaitDeadlineByLeaseMs(now, 2000, now + 500);
-    EXPECT_LT(capped, now + 500);
-    EXPECT_GT(capped, now);
-    // Budget smaller than the lease window: uncapped.
-    EXPECT_EQ(PrefetchThrottle::CapWaitDeadlineByLeaseMs(now, 100, now + 5000),
-              now + 100);
-    // Lease already spent: deadline in the past, i.e. no wait at all.
-    EXPECT_LT(PrefetchThrottle::CapWaitDeadlineByLeaseMs(now, 2000, now), now);
 }
 
 }  // namespace mooncake::test

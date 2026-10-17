@@ -82,52 +82,25 @@ Per-client `PrefetchThrottle` (sharded, lock-free fast path per shard):
   state eagerly (`NotifyPromotionFailure`, RAII guard) instead of waiting for
   the reaper TTL.
 
-## get() wait (opt-in)
+## get() demand-side kick
 
-`ssd_get_wait_ms` (default 0 = off) is a **single deadline for the whole
-batch-get**, not a fresh timeout per key. A long prefix spans tens of keys;
-applying a per-key wait serially multiplied the batch budget by the key
-count and produced tens-of-seconds TTFT p99 spikes when prefetch was on.
-
-The deadline is also **capped by the batch's earliest lease expiry** (minus a
-margin for the fallback transfer itself): the batch query grants every key's
-lease up front, so a wait outliving a lease would turn the waited keys'
-fallback transfers into `LEASE_EXPIRED`. Memory-headed keys are not exposed
-to the wait at all: their transfers are submitted in a **first transfer
-phase** before the wait loop, on the fresh leases from the batch query, so a
-slow promotion or a slow refresh RPC can neither delay them nor expire their
-leases. The wait helper itself returns only an outcome (skipped / completed /
-failed / timed out) and never issues an RPC. Only keys that actually waited
-or completed are refreshed, with **one batch lease-granting query** after the
-wait, and their transfer operations are built from the fresh descriptors and
-leases. Replicas promoted during the wait are then transferred in a **second,
-smaller transfer phase** — the price of never delaying co-batch memory reads
-behind the wait.
-
-Wait only when this process has a live local promotion (`kInFlight` /
-`kCompleted`). Do **not** wait on `kTriggered` (pool job still queued),
-`kFailed`, `kAlreadyResident`, or keys delegated to another holder. A process
-with no local SSD object (EngineCore `global_segment_size=0`) must not call
-`RegisterPrefetchTask`: that left a `PROCESSING` MEMORY replica the get path
-then waited on for the full per-key budget.
-
-**Demand-side kick.** A batch whose best replica is `LOCAL_DISK` gets one
-`TriggerPrefetch(disk_keys, ignore_cooldown=true)` before the wait. The
+A batch get whose best replica is `LOCAL_DISK` fires one
+`TriggerPrefetch(disk_keys, ignore_cooldown=true)` before the transfer. The
 bypass covers only the client-side throttle backoff — never a master-side
 gate (the shared in-flight cap, holder check, and dedup TTL all still
 apply). Rationale: an in-flight get is the strongest hotness signal there
 is, and a request whose exist-triggered promotion was dropped by a
-saturated backoff window should not pay an SSD read with no retry.
-Measured on a saturated store this kick is what turns a no-gain regime
-positive; without it, p99 TTFT regresses slightly as gets wait on
-promotions that then fail under pressure.
+saturated backoff window should not pay SSD reads with no retry. The kick
+is cheap (one dedup lookup + one pool enqueue, no RPC on the caller's
+thread) and never blocks the get: the batch proceeds to the SSD read
+immediately, and a promoted replica benefits the *next* get.
 
-If nothing is in flight, fall through to SSD immediately.
-
-Between the refresh observing a COMPLETE MEMORY replica and the actual
-transfer, the replica could in principle be evicted. That race is accepted
-(best-effort): the transfer simply fails and the caller retries/falls back
-per the existing error path.
+An earlier revision of this design also waited on in-flight promotions from
+the get path (`ssd_get_wait_ms`). Decomposition measurements (store-level
+get latency and engine TTFT, pure and mixed batches, DRAM-constrained)
+showed the wait never turned the pending get into a DRAM read in the tested
+regimes and added latency instead, so the wait was removed and the kick
+kept, decoupled from any wait knob. The data is in the PR description.
 
 Measured TTFT results and the A/B methodology (fill → overflow → settle →
 measure) are in PR #4272's description.
@@ -145,14 +118,12 @@ classDiagram
     class SsdPrefetcher {
         +TriggerPrefetch(keys)
         +RunLocalPrefetch(keys, sizes)
-        +WaitIfPromotionInFlight(key, budget_ms)
         -ThreadPool prefetch_pool_
     }
     class PrefetchThrottle {
         +reserve(keys) keys
         +enterCooldown()
         +inCooldown() bool
-        +waitForCompletion(key, budget) bool
         -Shard shards_
     }
     class FileStorage {
@@ -233,8 +204,7 @@ only for `ssd_prefetch_cooldown_sec` (default 5 s) so transient failures
 retry quickly. The memory-pressure cooldown is opened when
 `PromotionAllocStart` returns `NO_AVAILABLE_HANDLE`: while active,
 TriggerPrefetch is a no-op — prefetch (which adds DRAM) yields to
-eviction/offload (which frees DRAM). `waitForCompletion` exits immediately
-on the three terminal non-success states instead of burning budget.
+eviction/offload (which frees DRAM).
 
 ### Master: RegisterPrefetchTask
 
@@ -295,15 +265,10 @@ completion callback that drives the throttle states above.
 
 - **exist**: `ExistOptions.prefetch_to_memory` + `enable_ssd_prefetch` →
   TriggerPrefetch. Synchronous cost: one dedup lookup + one pool enqueue.
-- **get** (`ssd_get_wait_ms > 0`, default 0 = off): one deadline shared by
-  the whole batch; a key is waited on only while a local promotion is
-  `kInFlight`/`kCompleted`. Memory-headed keys transfer before the wait
-  (first phase); only waited keys are re-queried, in one batch lease-granting
-  query, and promoted replicas transfer after it (second phase). A batch
-  headed for SSD also gets one demand-side kick (see "get() wait" above)
-  that bypasses only the client-side throttle backoff. On a COMPLETE MEMORY
-  replica the transfer plan is rebuilt from the refreshed replica list
-  (`FilterQueryResult`); otherwise the SSD read proceeds immediately.
+- **get**: a batch headed for SSD gets one demand-side kick (see "get()
+  demand-side kick" above) that bypasses only the client-side throttle
+  backoff, then proceeds to the transfer immediately — the get path never
+  waits on promotions.
 
 ## Rolling-upgrade compatibility
 
@@ -319,7 +284,6 @@ completion callback that drives the throttle states above.
 | `enable_ssd_prefetch` | false | master switch (client config) |
 | `ssd_prefetch_cooldown_sec` | 5 | DRAM-pressure backoff; 0 disables |
 | `ssd_prefetch_dedup_ttl_sec` | 30 | per-key trigger dedup TTL; 0 disables |
-| `ssd_get_wait_ms` | 0 | get-side wait budget; 0 disables |
 
 Requires `enable_ssd_offload` + `ssd_offload_path` (prefetch promotes from the
 local SSD tier; without offload there are no LOCAL_DISK replicas).
@@ -334,6 +298,6 @@ local SSD tier; without offload there are no LOCAL_DISK replicas).
   promotion-on-hit), `LookupLocalObjectSize`.
 - `storage_backend.*` — `GetObjectDataSize`.
 - `ssd_prefetcher.*` — trigger/dedup/classify/delegate and the prefetch pool.
-- `real_client.*` — exist-path trigger, get-path wait.
+- `real_client.*` — exist-path trigger, get-side kick.
 - `replica.h` (`ExistOptions`), `store_c`, `store_py`, `dummy_client` — API
   plumbing.

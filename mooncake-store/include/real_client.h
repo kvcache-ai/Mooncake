@@ -1092,7 +1092,6 @@ class RealClient : public PyClient {
     bool enable_ssd_prefetch_ = false;
     int64_t ssd_prefetch_cooldown_sec_ = DEFAULT_SSD_PREFETCH_COOLDOWN_SEC;
     int64_t ssd_prefetch_dedup_ttl_sec_ = DEFAULT_SSD_PREFETCH_DEDUP_TTL_SEC;
-    int64_t ssd_get_wait_ms_ = DEFAULT_SSD_GET_WAIT_MS;
     bool use_hugepage_ = false;
 
     struct MappedShm {

@@ -139,16 +139,14 @@ void RegisterAndPromote(Client& client, FileStorage& file_storage,
 void SsdPrefetcher::Init(std::weak_ptr<Client> client,
                          std::weak_ptr<FileStorage> file_storage,
                          std::weak_ptr<ClientRequester> client_requester,
-                         std::string local_rpc_addr, int64_t get_wait_ms) {
+                         std::string local_rpc_addr) {
     client_ = std::move(client);
     file_storage_ = std::move(file_storage);
     client_requester_ = std::move(client_requester);
     local_rpc_addr_ = std::move(local_rpc_addr);
-    get_wait_ms_ = get_wait_ms;
     prefetch_pool_ = std::make_unique<ThreadPool>(kPrefetchThreadPoolSize);
     initialized_.store(true);
-    LOG(INFO) << "SSD prefetch runtime: pool_size=" << kPrefetchThreadPoolSize
-              << ", ssd_get_wait_ms=" << get_wait_ms_;
+    LOG(INFO) << "SSD prefetch runtime: pool_size=" << kPrefetchThreadPoolSize;
 }
 
 void SsdPrefetcher::SubmitJob(std::function<void()> job) {
@@ -350,31 +348,5 @@ void SsdPrefetcher::RunLocalPrefetch(const std::vector<std::string>& keys,
         RegisterAndPromote(*client, *file_storage, throttle, local_keys,
                            local_sizes, tenant_id);
     });
-}
-
-SsdPrefetcher::WaitOutcome SsdPrefetcher::WaitIfPromotionInFlight(
-    const std::string& key, int64_t budget_ms) {
-    if (budget_ms <= 0 || !initialized_.load()) {
-        return WaitOutcome::kSkipped;
-    }
-    auto throttle = throttle_;
-    if (throttle->triggeredAt(key) < 0) {
-        return WaitOutcome::kSkipped;
-    }
-    const auto st = throttle->stateOf(key);
-    if (st == PrefetchThrottle::State::kCompleted) {
-        return WaitOutcome::kCompleted;
-    }
-    if (st != PrefetchThrottle::State::kInFlight) {
-        // kTriggered (job still queued) / kFailed / kAlreadyResident /
-        // kDelegated: nothing live to wait on.
-        return WaitOutcome::kSkipped;
-    }
-    if (throttle->waitForCompletion(key, budget_ms, /*poll_ms=*/1)) {
-        return WaitOutcome::kCompleted;
-    }
-    return throttle->stateOf(key) == PrefetchThrottle::State::kFailed
-               ? WaitOutcome::kFailed
-               : WaitOutcome::kTimedOut;
 }
 }  // namespace mooncake

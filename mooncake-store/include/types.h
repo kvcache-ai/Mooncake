@@ -239,9 +239,6 @@ constexpr const char* CONFIG_KEY_SSD_PREFETCH_COOLDOWN_SEC =
 // probes. 0 disables dedup.
 constexpr const char* CONFIG_KEY_SSD_PREFETCH_DEDUP_TTL_SEC =
     "ssd_prefetch_dedup_ttl_sec";
-// Max wait budget (milliseconds) on get when an SSD-only key has a prefetch
-// in flight. 0 (the default) disables the wait entirely.
-constexpr const char* CONFIG_KEY_SSD_GET_WAIT_MS = "ssd_get_wait_ms";
 constexpr const char* CONFIG_KEY_ENABLE_EMBEDDED_MASTER =
     "enable_embedded_master";
 
@@ -253,8 +250,6 @@ constexpr const char* DEFAULT_MASTER_SERVER_ADDR = "127.0.0.1:50051";
 static constexpr int DEFAULT_CLIENT_HTTP_PORT = 9300;
 static constexpr size_t DEFAULT_SSD_PREFETCH_COOLDOWN_SEC = 5;
 static constexpr size_t DEFAULT_SSD_PREFETCH_DEDUP_TTL_SEC = 30;
-// Disabled by default: no get-path latency change unless explicitly opted in.
-static constexpr size_t DEFAULT_SSD_GET_WAIT_MS = 0;
 
 struct OffloadTaskItem {
     std::string tenant_id;

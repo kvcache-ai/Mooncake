@@ -34,7 +34,6 @@ Prerequisites:
     ``MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES=10485760`` on the client.
 """
 
-import ctypes
 import os
 import time
 import unittest
@@ -72,7 +71,6 @@ def setup_store(store):
         "master_server_addr": os.getenv("MASTER_SERVER", "127.0.0.1:50051"),
         "enable_ssd_offload": "true",
         "enable_ssd_prefetch": "true",
-        "ssd_get_wait_ms": os.getenv("SSD_GET_WAIT_MS", "0"),
     }
     ssd_offload_path = os.getenv("MOONCAKE_OFFLOAD_FILE_STORAGE_PATH", "")
     if ssd_offload_path:
@@ -218,155 +216,30 @@ class TestPrefetchOnExist(unittest.TestCase):
         got = self.store.get(cold_key)
         self.assertEqual(bytes(got), expected, "get after prefetch must be bit-exact")
 
-    def test_get_wait_success_carries_live_lease(self):
-        """ssd_get_wait_ms > 0: a get that arrives while the promotion is
-        still in flight waits for it, and the post-wait transfer must carry
-        a live lease. A QueryReadOnly result (lease_ttl_ms forced to 0)
-        would turn every successful wait into LEASE_EXPIRED at BatchGet's
-        post-transfer lease check."""
-        # The class shares one store across test methods; earlier tests
-        # already filled the 32MB segment, so reset it first.
-        # remove_all returns the number of removed objects (>= 0 on success).
-        self.assertGreaterEqual(self.store.remove_all(True), 0)
-        # Put the big key FIRST (empty segment has room for it), then
-        # overflow with small keys to evict it. After _make_cold_keys the
-        # segment is full and this put would fail with NO_AVAILABLE_HANDLE.
-        # 8MB stays under the offload bucket size limit (10MB in CI).
-        timestamp = int(time.time() * 1000)
-        big_key = f"prefetch_waitlease_big_{timestamp}"
-        big_value = os.urandom(8 * 1024 * 1024)
-        self.assertEqual(self.store.put(big_key, big_value), 0)
-        # The put lease (default_kv_lease_ttl=500ms) blocks eviction, and
-        # the overflow burst fits inside it; wait the lease out first, or
-        # nothing ever forces this object out of DRAM.
-        time.sleep(1.5)
-        self._make_cold_keys("waitlease")
-        # _find_cold_key polls every 1s and each poll grants a fresh lease,
-        # pinning the object in DRAM until the probe times out. Probe more
-        # rarely and keep applying overflow pressure only while unleased.
-        types = []
-        for round_i in range(6):
-            time.sleep(2.0)
-            descs = self.store.batch_get_replica_desc([big_key])
-            types = _replica_types(descs, big_key)
-            print(f"waitlease probe {round_i}: {types}")
-            if (
-                types
-                and all("MEMORY" not in t for t in types)
-                and any("LOCAL_DISK" in t for t in types)
-            ):
-                break
-            self._make_cold_keys(f"waitlease_more{round_i}", num_keys=40)
-        else:
-            self.fail(f"big key stayed resident, last={types}")
-        print(f"replica-type histogram: {types}")
+    def test_get_kick_promotes_ssd_only_key(self):
+        """A plain get() on a LOCAL_DISK-only key fires the demand-side kick:
+        one promotion attempt with no exist probe and no waiting. The get
+        itself returns from SSD (bit-exact), and the key must gain a MEMORY
+        replica shortly after."""
+        reference = self._make_cold_keys("kick")
+        cold_key, type_hist = self._find_cold_key(list(reference.keys()))
+        print(f"replica-type histogram: {type_hist}")
+        expected = reference[cold_key]
 
-        self.assertEqual(self.store.is_exist(big_key, _prefetch_options(True)), 1)
-        # No sleep: the get path's own replica query takes longer than the
-        # pool job's task registration, so firing immediately lands the
-        # wait inside the promotion's in-flight window. Even a 25ms sleep
-        # lands after kCompleted on a fast SSD and skips the wait path.
+        # No is_exist probe at all: the get alone must trigger the promotion.
+        got = self.store.get(cold_key)
+        self.assertEqual(bytes(got), expected, "cold get must be bit-exact")
 
-        capacity = len(big_value)
-        destination = (ctypes.c_ubyte * capacity)()
-        destination_ptr = ctypes.addressof(destination)
-        self.assertEqual(self.store.register_buffer(destination_ptr, capacity), 0)
-        try:
-            results = self.store.batch_get_into_multi_buffers(
-                [big_key], [[destination_ptr]], [[capacity]], False
+        def _promoted():
+            return self._has_memory_replica(cold_key), _replica_types(
+                self.store.batch_get_replica_desc([cold_key]), cold_key
             )
-            print("batch_get results", list(results))
-            self.assertEqual(
-                list(results),
-                [capacity],
-                "post-wait get must succeed; a forced-expired lease turns "
-                "it into LEASE_EXPIRED",
-            )
-            self.assertEqual(bytes(destination), big_value)
-        finally:
-            self.store.unregister_buffer(destination_ptr)
 
-    def test_get_wait_mixed_batch_serves_memory_and_ssd_keys(self):
-        """Mixed batch with ssd_get_wait_ms > 0: a MEMORY-resident key and a
-        LOCAL_DISK-only key with an in-flight promotion are read in one
-        batch. Both must succeed: the memory key's transfer is submitted
-        before the wait (round 1), the promoted key after the batch refresh
-        (round 2), so neither the wait nor the refresh RPC can consume the
-        memory key's lease."""
-        self.assertGreaterEqual(self.store.remove_all(True), 0)
-        timestamp = int(time.time() * 1000)
-        mem_key = f"prefetch_waitmix_mem_{timestamp}"
-        mem_value = os.urandom(1024 * 1024)
-        big_key = f"prefetch_waitmix_big_{timestamp}"
-        big_value = os.urandom(8 * 1024 * 1024)
-        self.assertEqual(self.store.put(big_key, big_value), 0)
-        # Evict ONLY the big key: wait out its put lease
-        # (default_kv_lease_ttl=500ms), then put the small key and flood
-        # within the small key's own lease window. The overflow burst fits
-        # inside that window (see test_get_wait_success_carries_live_lease),
-        # so the small key stays lease-pinned in DRAM while the unleased big
-        # key is forced out.
-        time.sleep(1.5)
-        self.assertEqual(self.store.put(mem_key, mem_value), 0)
-        self._make_cold_keys("waitmix")
-        # Same probing pattern as test_get_wait_success_carries_live_lease:
-        # rare probes (2s) and pressure only while the big key is unleased.
-        types = []
-        for round_i in range(6):
-            time.sleep(2.0)
-            descs = self.store.batch_get_replica_desc([big_key])
-            types = _replica_types(descs, big_key)
-            print(f"waitmix probe {round_i}: {types}")
-            if (
-                types
-                and all("MEMORY" not in t for t in types)
-                and any("LOCAL_DISK" in t for t in types)
-            ):
-                break
-            self._make_cold_keys(f"waitmix_more{round_i}", num_keys=40)
-        else:
-            self.fail(f"big key stayed resident, last={types}")
-        # The mixed batch needs the small key memory-resident. Overflow
-        # pressure may have evicted it too; skip rather than fail then.
-        mem_types = _replica_types(
-            self.store.batch_get_replica_desc([mem_key]), mem_key
+        wait_until(
+            _promoted,
+            PREFETCH_WAIT_SECONDS,
+            desc=f"kick promotion of {cold_key} to a MEMORY replica",
         )
-        print(f"mem key replica types: {mem_types}")
-        if not any("MEMORY" in t for t in mem_types):
-            self.skipTest(
-                "small key evicted under overflow pressure; mixed-batch "
-                "precondition not met"
-            )
-
-        self.assertEqual(self.store.is_exist(big_key, _prefetch_options(True)), 1)
-        # No sleep: land the batch get inside the promotion's in-flight
-        # window so the SSD key actually waits.
-        cap_mem, cap_big = len(mem_value), len(big_value)
-        dest_mem = (ctypes.c_ubyte * cap_mem)()
-        dest_big = (ctypes.c_ubyte * cap_big)()
-        ptr_mem = ctypes.addressof(dest_mem)
-        ptr_big = ctypes.addressof(dest_big)
-        self.assertEqual(self.store.register_buffer(ptr_mem, cap_mem), 0)
-        self.assertEqual(self.store.register_buffer(ptr_big, cap_big), 0)
-        try:
-            results = self.store.batch_get_into_multi_buffers(
-                [mem_key, big_key],
-                [[ptr_mem], [ptr_big]],
-                [[cap_mem], [cap_big]],
-                False,
-            )
-            print("mixed batch_get results", list(results))
-            self.assertEqual(
-                list(results),
-                [cap_mem, cap_big],
-                "mixed batch must serve the memory key (round 1) and the "
-                "waited/promoted key (round 2) in one call",
-            )
-            self.assertEqual(bytes(dest_mem), mem_value)
-            self.assertEqual(bytes(dest_big), big_value)
-        finally:
-            self.store.unregister_buffer(ptr_mem)
-            self.store.unregister_buffer(ptr_big)
 
     def test_exist_without_prefetch_does_not_promote(self):
         """Negative control: plain is_exist must not promote. Only
