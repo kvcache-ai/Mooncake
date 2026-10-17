@@ -115,4 +115,10 @@ if(BUILD_UNIT_TESTS)
   target_include_directories(tebench_split_output_test
                              PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
   add_test(NAME tebench_split_output_test COMMAND tebench_split_output_test)
+
+  add_test(
+    NAME tebench_multinode_script_test
+    COMMAND
+      bash "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_tebench_multinode_test.sh"
+      "${CMAKE_CURRENT_SOURCE_DIR}/scripts/run_tebench_multinode.sh")
 endif()

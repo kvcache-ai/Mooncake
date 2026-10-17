@@ -374,6 +374,73 @@ the local buffer without modifying the remote data. Do not combine these modes
 with `--check_consistency`; `--check_consistency` remains the existing
 WRITE→READ self-check mode.
 
+#### Multi-node orchestration
+
+`benchmark/scripts/run_tebench_multinode.sh` launches targets and initiators
+over SSH, discovers the target segment names, releases all initiators from a
+start barrier, and collects each process's log and result JSONL.
+
+The script is an orchestration layer over the existing endpoint-level
+multi-target interface. It does not add a new `peer` mode to `tebench`; an
+all-to-all node runs separate target and initiator processes. Weighted targets,
+hotspot routing, and arbitrary custom target plans remain outside this
+launcher's scope.
+
+Every host must provide Bash and `setsid`, and the same absolute `tebench` path
+must exist on each host. The launcher host also needs Python 3 to combine
+results. SSH public-key authentication and host-key verification
+must already be configured. Use the literal host name `local` for a role that
+should run without SSH.
+
+`--env` entries are passed unchanged to every host. For per-host settings such
+as `rpc_server_hostname` or `topology/rdma_whitelist`, place a host-local TENT
+config file at the same path on each host and pass `--env=MC_TENT_CONF=<path>`.
+
+```bash
+./mooncake-transfer-engine/benchmark/scripts/run_tebench_multinode.sh \
+  --topology=m2n \
+  --targets=target-a,target-b \
+  --initiators=initiator-a,initiator-b \
+  --tebench=/opt/mooncake/bin/tebench \
+  --backend=tent \
+  --xport-type=rdma \
+  --num-threads=4 \
+  --duration=30 \
+  --range-policy=per_initiator
+```
+
+Supported topologies are:
+
+| Topology | Target plan |
+| -------- | ----------- |
+| `fanout` | One initiator accesses every target. |
+| `incast` | Every initiator accesses one target. |
+| `m2n` | Every initiator accesses every target. |
+| `all_to_all` | Every node publishes a segment and accesses every other node. |
+
+Use `--range-policy=per_initiator` when multiple writers share a target. The
+script divides `--total-buffer-size` into non-overlapping ranges and passes the
+corresponding `--target_offset` and `--target_range_size` to each initiator.
+`--range-policy=shared` leaves every initiator on the same range and is useful
+for read-only fan-out or incast measurements.
+
+`--verify-data` runs two synchronized phases while the targets stay alive:
+`write_seed` followed by `read_verify`. This validates the same deterministic
+target ranges used by the performance run without relying on application data.
+
+Use `--dry-run` to validate topology expansion, target lists, thread counts,
+and range assignments without connecting to any host. Each run stores logs and
+per-target JSONL files under a new local `tebench-multinode-*` directory.
+The directory also contains `results.json`, a single JSON object with
+`schema_version`, `run_id`, `topology`, `backend`, and a `results` array.
+Each entry identifies the `host`, `phase`, `initiator_index`, and `exit_code`,
+and includes the original JSONL objects in `records`, preserving all per-target
+metrics. Failed runs include available records; an unavailable exit code is
+`null`. Invalid JSON causes collection to fail instead of publishing a partial
+summary. Original logs and JSONL files are retained.
+An existing run directory is rejected; use a new `--run-id` when rerunning with
+`--keep-remote`.
+
 ---
 
 ### 5.5 GPU Affinity
