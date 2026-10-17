@@ -9,6 +9,7 @@ from .helpers import (
     FakeReplicateConfig,
     InMemoryStore,
     allocation_guards_for_bindings,
+    coalesce_runtime_inputs,
     make_weight_store,
     source_manifests,
     target_manifests,
@@ -117,6 +118,88 @@ def test_store_load_holds_target_pin_through_sync_ranged_read() -> None:
 
     token = next(iter(guards.values())).tokens[0]
     assert token.released_states == [TerminalTransferState.COMPLETED]
+    assert store.registered == set()
+
+
+@pytest.mark.parametrize("operation", ("upload", "lease"))
+def test_pending_cleanup_retries_pin_release_without_unregistering_again(
+    operation: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = InMemoryStore()
+    weight_store = _raw_store(store)
+    sources = coalesce_runtime_inputs(
+        source_manifests(dp=1, tp=2), instance_id="combined-source"
+    )
+    plan = weight_store.plan_upload(sources.placement, sources.bindings)
+    guards = allocation_guards_for_bindings((sources.binding,))
+    address = sources.binding.fragments[0].address
+    store.unregister_results[address] = -9
+    terminal_state = (
+        TerminalTransferState.COMPLETED
+        if operation == "upload"
+        else TerminalTransferState.FAILED_DRAINED
+    )
+
+    with pytest.raises(WeightStoreError, match="allocation lifetime is quarantined"):
+        if operation == "upload":
+            weight_store.upload(
+                plan,
+                sources.placement,
+                sources.binding,
+                source_allocation_guards=guards,
+            )
+        else:
+            lease = weight_store.register_weight_buffers(
+                sources.binding,
+                fragment_ids=tuple(f.fragment_id for f in sources.binding.fragments),
+                allocation_guards=guards,
+                side="source",
+            )
+            lease.close(terminal_state)
+
+    assert store.unregister_calls == 2
+    assert store.registered == {address}
+    (pending_id,) = weight_store.pending_registration_ids()
+    token = next(iter(guards.values())).tokens[0]
+    release = token.release_after_terminal
+    release_attempts = []
+
+    def fail_once(state):
+        release_attempts.append(state)
+        if len(release_attempts) == 1:
+            raise RuntimeError("temporary pin release failure")
+        release(state)
+
+    monkeypatch.setattr(token, "release_after_terminal", fail_once)
+    store.unregister_results.pop(address)
+    with pytest.raises(WeightStoreError, match="allocation lifetime release failed"):
+        weight_store.drain_pending_registration(pending_id)
+
+    assert store.registered == set()
+    assert store.unregister_calls == 3
+    assert token.released_states == []
+    assert weight_store.pending_registration_ids() == (pending_id,)
+    with pytest.raises(WeightStoreError, match="blocked by pending registration"):
+        weight_store.upload(
+            plan,
+            sources.placement,
+            sources.binding,
+            source_allocation_guards=allocation_guards_for_bindings((sources.binding,)),
+        )
+
+    weight_store.drain_pending_registration(pending_id)
+
+    assert store.unregister_calls == 3
+    assert release_attempts == [terminal_state, terminal_state]
+    assert token.released_states == [terminal_state]
+    assert weight_store.pending_registration_ids() == ()
+    # Successful cleanup removes the fence on subsequent public submissions.
+    weight_store.upload(
+        plan,
+        sources.placement,
+        sources.binding,
+        source_allocation_guards=allocation_guards_for_bindings((sources.binding,)),
+    )
     assert store.registered == set()
 
 
