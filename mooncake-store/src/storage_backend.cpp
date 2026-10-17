@@ -9,6 +9,7 @@
 #include <errno.h>
 #include <cstdint>
 #include <cstring>
+#include <climits>
 #include <limits>
 
 #include <array>
@@ -2526,18 +2527,76 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
     } else
 #endif
     {
-        // Fallback to vector_write for non-UringFile
-        auto write_result = file->vector_write(iovs.data(), iovs.size(), 0);
-        if (!write_result) {
-            LOG(ERROR) << "vector_write failed for: " << bucket_id
-                       << ", error: " << write_result.error();
-            return tl::make_unexpected(write_result.error());
+        // Buffered write in chunks that end at multiples of
+        // kBucketWriteChunkBytes in the file (objects are split across
+        // them) and carry at most IOV_MAX iovecs. When the write reaches a
+        // chunk boundary, writeback of the data before it starts, so
+        // copying the next chunk overlaps the device write of this one and
+        // the datasync below has less left to wait for. Only whole chunks
+        // are handed over: a page under writeback that the next chunk still
+        // writes into would make that write wait on filesystems that keep
+        // pages stable during writeback.
+        const size_t chunk_size = kBucketWriteChunkBytes;
+        std::vector<iovec> chunk;
+        size_t offset = 0;  // file offset of the next byte to write
+        size_t kicked = 0;  // writeback started for [0, kicked)
+        size_t index = 0;   // next iovec, and how much of it is written
+        size_t index_done = 0;
+        while (index < iovs.size()) {
+            const size_t chunk_end = (offset / chunk_size + 1) * chunk_size;
+            size_t chunk_bytes = 0;
+            chunk.clear();
+            while (index < iovs.size() &&
+                   chunk.size() < static_cast<size_t>(IOV_MAX) &&
+                   offset + chunk_bytes < chunk_end) {
+                const size_t take = std::min(iovs[index].iov_len - index_done,
+                                             chunk_end - offset - chunk_bytes);
+                chunk.push_back(
+                    {static_cast<char*>(iovs[index].iov_base) + index_done,
+                     take});
+                chunk_bytes += take;
+                index_done += take;
+                if (index_done == iovs[index].iov_len) {
+                    ++index;
+                    index_done = 0;
+                }
+            }
+            auto write_result = file->vector_write(
+                chunk.data(), static_cast<int>(chunk.size()), offset);
+            if (!write_result) {
+                LOG(ERROR) << "vector_write failed for: " << bucket_id
+                           << ", error: " << write_result.error();
+                return tl::make_unexpected(write_result.error());
+            }
+            if (write_result.value() != chunk_bytes) {
+                LOG(ERROR) << "Write size mismatch for: " << bucket_data_path
+                           << ", expected: " << chunk_bytes
+                           << ", got: " << write_result.value();
+                return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+            }
+            offset += chunk_bytes;
+            if (offset % chunk_size == 0 && offset > kicked) {
+                auto kick = file->start_writeback(static_cast<off_t>(kicked),
+                                                  offset - kicked);
+                if (test_writeback_failure_.load(std::memory_order_relaxed)) {
+                    kick = tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+                }
+                if (!kick) {
+                    // The error may be reported only here: ext4 drops the
+                    // pages of a failed delayed allocation, and a later
+                    // datasync then succeeds. Fail like datasync does.
+                    LOG(ERROR)
+                        << "start_writeback failed for bucket: " << bucket_id;
+                    CleanupOrphanedBucket(bucket_id);
+                    return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+                }
+                kicked = offset;
+            }
         }
-        if (static_cast<int64_t>(write_result.value()) !=
-            bucket_metadata->data_size) {
+        if (static_cast<int64_t>(offset) != bucket_metadata->data_size) {
             LOG(ERROR) << "Write size mismatch for: " << bucket_data_path
                        << ", expected: " << bucket_metadata->data_size
-                       << ", got: " << write_result.value();
+                       << ", got: " << offset;
             return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
         }
     }

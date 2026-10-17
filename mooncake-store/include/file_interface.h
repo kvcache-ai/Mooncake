@@ -67,6 +67,19 @@ class StorageFile {
      */
     virtual tl::expected<void, ErrorCode> datasync() { return {}; }
 
+    // Starts writing back the dirty pages of [offset, offset + length)
+    // without waiting for them (length 0 means to the end of the file);
+    // datasync() is still needed for durability. The default does nothing
+    // (no page cache to push). Like a datasync() failure, a failure means
+    // data in the range may be lost: it is reported to the caller and does
+    // not mark the file.
+    virtual tl::expected<void, ErrorCode> start_writeback(off_t offset,
+                                                          size_t length) {
+        (void)offset;
+        (void)length;
+        return {};
+    }
+
     // Prevent destructor from unlinking the arena file on write failure.
     void SetDeleteOnWriteFail(bool v) { delete_on_write_fail_ = v; }
 
@@ -167,6 +180,8 @@ class PosixFile : public StorageFile {
     PosixFile(const std::string &filename, int fd);
 
     tl::expected<void, ErrorCode> datasync() override;
+    tl::expected<void, ErrorCode> start_writeback(off_t offset,
+                                                  size_t length) override;
     ~PosixFile() override;
 
     tl::expected<size_t, ErrorCode> write(const std::string &buffer,
