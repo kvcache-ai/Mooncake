@@ -320,6 +320,8 @@ else:
             output=self.root / "samples",
             collection_timeout_seconds=budget,
         )
+        args.output.mkdir()
+        gate.write_json(args.output / "build-config.json", {"sha256": "d" * 64})
         with patch.object(
             gate, "environment", return_value={"hostname": "fixture"}
         ), patch.dict(
@@ -350,6 +352,10 @@ else:
         candidate = json.loads((args.output / "candidate.json").read_text())
         self.assertEqual(len(list(args.output.glob("*.csv"))), 10)
         self.assertEqual(len(list(args.output.glob("*.log"))), 10)
+        self.assertEqual(
+            json.loads((args.output / "build-config.json").read_text()),
+            {"sha256": "d" * 64},
+        )
         rows = gate.compare(self.policy, baseline, candidate, BASE_SHA, CANDIDATE_SHA)
         self.assertTrue(all(row["status"] == "PASS" for row in rows))
         with self.assertRaisesRegex(ValueError, "already contains results"):

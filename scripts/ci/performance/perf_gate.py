@@ -225,8 +225,11 @@ def collect(args):
     policy = load_policy(args.policy)
     out = Path(args.output)
     out.mkdir(parents=True, exist_ok=True)
-    # Never reuse files from an earlier invocation as evidence for this run.
-    require(not any(out.glob("*.json")), "output directory already contains results")
+    # Build metadata is prepared before collection; prior measurements are not reusable.
+    require(
+        not any(path.name != "build-config.json" for path in out.glob("*.json")),
+        "output directory already contains results",
+    )
     env = environment(policy["cpu_count"])
     budget = getattr(args, "collection_timeout_seconds", 900)
     require(number(budget), "invalid collection time budget")
