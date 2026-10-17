@@ -1,0 +1,4 @@
+[
+  {"ssh": "benchmark@192.0.2.10", "address": "192.0.2.10", "device": "erdma_0", "port": 1, "gid_index": 0, "numa": 0},
+  {"ssh": "benchmark@192.0.2.11", "address": "192.0.2.11", "device": "erdma_0", "port": 1, "gid_index": 0, "numa": 0}
+]
