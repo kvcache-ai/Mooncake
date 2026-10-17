@@ -288,3 +288,15 @@ ib_write_bw -d [rdma_device] -R -x gdr [server_ip]
 Expected Output:
 Successful bidirectional transfer with "BW peak" reported
 Errors with -x gdr indicate GDR setup failures
+
+
+## Ascend FabricMem initialization after HCCL
+
+If initialization fails in `aclrtReserveMemAddressNoUCMemory` after HCCL starts,
+compare initialization orders in separate processes using the
+[manual FabricMem/HCCL probe](https://github.com/kvcache-ai/Mooncake/blob/main/mooncake-store/tests/e2e/README_ascend_fabric_mem_hccl.md).
+The probe performs no KV transfers. It records the effective layout and setup/close
+results; it does not change the production initialization path or establish safe
+transfer cancellation. A virtual-address reservation failure does not by itself
+prove physical DRAM exhaustion. The documented VA adjustment is experimental,
+not a general fix.
