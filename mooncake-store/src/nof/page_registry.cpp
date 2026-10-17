@@ -18,6 +18,9 @@ NofPageRegistry::NofPageRegistry(MemRegisterFn register_fn,
     : register_fn_(register_fn), unregister_fn_(unregister_fn) {}
 
 ErrorCode NofPageRegistry::Register(uint64_t owner, void* ptr, size_t size) {
+    if (ptr == nullptr || size == 0) {
+        return ErrorCode::INVALID_PARAMS;
+    }
     const uintptr_t begin = reinterpret_cast<uintptr_t>(ptr);
     const uintptr_t first_page = begin & ~kPageMask;
     const uintptr_t end_page = AlignUpToPage(begin + size);

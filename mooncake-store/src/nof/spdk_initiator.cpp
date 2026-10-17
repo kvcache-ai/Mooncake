@@ -68,6 +68,20 @@ void ApplyCtrlrOptsFromEnv(struct spdk_nvme_ctrlr_opts* opts) {
               << ", data_digest=" << opts->data_digest;
 }
 
+// spdk_nvme_probe/spdk_nvme_detach mutate the NVMe driver's process-global
+// controller state and are not thread-safe against each other. The
+// pre-refactor SpdkWrapper was a process singleton whose ctrlrs_mutex
+// serialized them; with per-instance initiators a process-wide lock is
+// needed instead. Held only around the SPDK calls; the lock order is
+// ctrlrs_mutex_ < NvmeCtrlrStateMutex (the destructor takes this lock while
+// holding ctrlrs_mutex_, and no path takes ctrlrs_mutex_ while holding this
+// one), so a slow probe still cannot stall cache lookups. Leaked to avoid
+// any static destruction-order hazard.
+std::mutex& NvmeCtrlrStateMutex() {
+    static std::mutex* m = new std::mutex();
+    return *m;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -284,6 +298,7 @@ class SpdkInitiator::Impl {
         DrainQuarantinedProbes();
         {
             std::lock_guard<std::mutex> lock(ctrlrs_mutex_);
+            std::lock_guard<std::mutex> nvme_lock(NvmeCtrlrStateMutex());
             for (auto& [_, info] : connected_ctrlrs_) {
                 if (info) {
                     for (auto& [_, seg] : info->ns_seg) {
@@ -365,6 +380,7 @@ class SpdkInitiator::Impl {
                 }
             }
             if (detach_duplicate) {
+                std::lock_guard<std::mutex> nvme_lock(NvmeCtrlrStateMutex());
                 spdk_nvme_detach(new_info->ctrlr);
             }
         }
@@ -690,6 +706,10 @@ class SpdkInitiator::Impl {
             info->ctrlr = ctrlr;
         };
 
+        // Serialize probes process-wide (see NvmeCtrlrStateMutex): the
+        // callbacks only set info->ctrlr and log, so nothing here can
+        // re-enter a lock.
+        std::lock_guard<std::mutex> nvme_lock(NvmeCtrlrStateMutex());
         return spdk_nvme_probe(trid, (void*)info, probe_cb, attach_cb, NULL);
     }
 

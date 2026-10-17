@@ -145,8 +145,12 @@ class NVMeoFInitiator {
 // three-outcome contract for the cleanup/NOF_REGISTRATION_STUCK semantics).
 inline bool NofRangeIsRegistrable(const void* ptr, size_t size) {
     constexpr uintptr_t kNofRegistrationPageSize = 2ULL << 20;  // 2MB
-    return ptr != nullptr && size != 0 &&
-           (reinterpret_cast<uintptr_t>(ptr) % kNofRegistrationPageSize) == 0 &&
+    // spdk_mem_register() also rejects addresses outside the 256TB window it
+    // can represent (MASK_256TB) before marking anything (memory.c:339-348).
+    constexpr uintptr_t kNofAddressMask = (1ULL << 48) - 1;  // MASK_256TB
+    const uintptr_t vaddr = reinterpret_cast<uintptr_t>(ptr);
+    return ptr != nullptr && size != 0 && (vaddr & ~kNofAddressMask) == 0 &&
+           (vaddr % kNofRegistrationPageSize) == 0 &&
            (size % kNofRegistrationPageSize) == 0;
 }
 
