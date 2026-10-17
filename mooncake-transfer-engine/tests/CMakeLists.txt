@@ -591,3 +591,16 @@ add_executable(batch_counter_wait_test ${WORKSPACE}/batch_counter_wait_test.cpp)
 target_link_libraries(batch_counter_wait_test PUBLIC transfer_engine gtest
                                                      gtest_main)
 add_test(NAME batch_counter_wait_test COMMAND batch_counter_wait_test)
+
+# Hardware-independent routing regression for the classic MACA backend.
+# Neither GPU resources nor a network connection are used by this fixture.
+if(USE_MACA AND ENABLE_MULTI_PROTOCOL)
+  add_executable(maca_ipc_locality_test maca_ipc_locality_test.cpp)
+  target_include_directories(maca_ipc_locality_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  target_link_libraries(maca_ipc_locality_test PRIVATE transfer_engine)
+  add_test(NAME maca_ipc_locality COMMAND maca_ipc_locality_test)
+  set_tests_properties(maca_ipc_locality PROPERTIES
+    TIMEOUT 30
+    LABELS "transfer-engine;maca;unit")
+endif()
