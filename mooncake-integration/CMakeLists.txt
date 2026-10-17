@@ -21,7 +21,6 @@ endif()
 if(WITH_STORE)
   include_directories("../mooncake-store/include")
   include_directories("../mooncake-store/include/cachelib_memory_allocator")
-  include_directories("../mooncake-store/include/engram")
 
   include_directories(
     "../mooncake-store/include/cachelib_memory_allocator/include")
@@ -147,15 +146,8 @@ endif()
 
 if(WITH_STORE)
   if(USE_CUDA)
-    find_package(CUDAToolkit REQUIRED)
-    enable_language(CUDA)
-    pybind11_add_module(_engram_cuda store/engram_local_cuda.cpp
-                        store/engram_local_cuda.cu)
-    set_target_properties(_engram_cuda PROPERTIES CUDA_STANDARD 17 INSTALL_RPATH
-                                                                   "$ORIGIN")
-    target_link_libraries(_engram_cuda PRIVATE CUDA::cudart)
-    install(TARGETS _engram_cuda
-            LIBRARY DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR} COMPONENT python)
+    add_subdirectory(../mooncake-store/engram
+                     ${CMAKE_BINARY_DIR}/mooncake-store/engram)
   endif()
   pybind11_add_module(
     store ${SOURCES} ${CACHE_ALLOCATOR_SOURCES} store/store_py.cpp
