@@ -24,6 +24,12 @@ class WrappedMasterService {
     void SetBatchOpLogTerminalCallback(
         OrderedOpLogWriter::TerminalCallback callback);
     void StopBatchOpLogWriter();
+    // Restore lifecycle hooks (RFC #4700, slice 1). The non-HA path opens
+    // the lifecycle with MarkReadyForServing + ActivateServing before the
+    // RPC service is registered; the HA supervisor's ActivateServingState
+    // calls ActivateServing after a successful promotion restore.
+    void MarkReadyForServing();
+    void ActivateServing();
     // Constructor with optional metadata-cleanup-on-timeout configuration.
     // - http_metadata_server: in-process pointer used when the HTTP metadata
     //   server is co-located in the master process (nullptr = not co-located).
