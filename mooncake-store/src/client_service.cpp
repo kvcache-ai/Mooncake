@@ -6,6 +6,7 @@
 #include "ascii_string.h"
 #include "allocator.h"
 #include "segment.h"
+#include "nof/nof_runtime.h"
 
 #include <csignal>
 #include <algorithm>
@@ -17,7 +18,7 @@
 #include <cstdlib>
 #include <iomanip>
 #include <limits>
-#ifdef USE_NOF
+#if defined(__linux__)
 #include <numa.h>
 #endif
 #include <optional>
@@ -84,8 +85,8 @@ class ScopedObjectChecksumBuffer {
     PinnedBufferPool::Buffer buffer_;
 };
 
-#ifdef USE_NOF
 int GetCurrentNumaSocketId() {
+#if defined(__linux__)
     if (numa_available() < 0) {
         return 0;
     }
@@ -95,8 +96,18 @@ int GetCurrentNumaSocketId() {
     }
     int node = numa_node_of_cpu(cpu);
     return node < 0 ? 0 : node;
-}
+#else
+    // libnuma is Linux-only; default to socket 0 elsewhere.
+    return 0;
 #endif
+}
+
+// Backing slot for Client::SetDefaultNofInitiatorFactoryForTesting.
+std::function<std::shared_ptr<NVMeoFInitiator>()>&
+DefaultNofInitiatorFactoryForTestingSlot() {
+    static std::function<std::shared_ptr<NVMeoFInitiator>()> factory;
+    return factory;
+}
 
 struct ContiguousSliceRange {
     void* ptr = nullptr;
@@ -1028,19 +1039,28 @@ void Client::InitTransferSubmitter() {
     // Initialize TransferSubmitter after transfer engine is ready
     // Keep using logical local_hostname for name-based behaviors; endpoint is
     // used separately where needed.
-#ifdef USE_NOF
+    // Unconditional; no NofWorkerPool is created when nof_initiator_ is null.
     const int numa_socket_id =
         ClientNumaConfig::FromEnvironment().socket_id.value_or(
             GetCurrentNumaSocketId());
+    // ClientMetric::nof_metric exists only in USE_NOF builds.
+    NofMetric* nof_metric = nullptr;
+#ifdef USE_NOF
+    nof_metric = metrics_ ? &metrics_->nof_metric : nullptr;
+#endif
     transfer_submitter_ = std::make_unique<TransferSubmitter>(
         *transfer_engine_, storage_backend_, local_hostname_,
         metrics_ ? &metrics_->transfer_metric : nullptr, numa_socket_id,
-        metrics_ ? &metrics_->nof_metric : nullptr);
-#else
-    transfer_submitter_ = std::make_unique<TransferSubmitter>(
-        *transfer_engine_, storage_backend_, local_hostname_,
-        metrics_ ? &metrics_->transfer_metric : nullptr);
-#endif
+        nof_initiator_, nof_metric);
+}
+
+void Client::SetDefaultNofInitiatorFactoryForTesting(
+    std::function<std::shared_ptr<NVMeoFInitiator>()> factory) {
+    DefaultNofInitiatorFactoryForTestingSlot() = std::move(factory);
+}
+
+std::shared_ptr<NVMeoFInitiator> Client::GetNofInitiatorForTesting() const {
+    return nof_initiator_;
 }
 
 std::optional<std::shared_ptr<Client>> Client::Create(
@@ -1048,7 +1068,8 @@ std::optional<std::shared_ptr<Client>> Client::Create(
     const std::string& protocol, const std::optional<std::string>& device_names,
     const std::string& master_server_entry,
     const std::shared_ptr<TransferEngine>& transfer_engine,
-    std::map<std::string, std::string> labels, const std::string& tenant_id) {
+    std::map<std::string, std::string> labels, const std::string& tenant_id,
+    std::shared_ptr<NVMeoFInitiator> nof_initiator) {
     // Reused engines retain their metadata mode. In particular, P2PHANDSHAKE
     // must publish the engine's actual endpoint rather than the Store hostname.
     const auto& resolved_metadata =
@@ -1057,6 +1078,14 @@ std::optional<std::shared_ptr<Client>> Client::Create(
             : metadata_connstring;
     auto client = std::shared_ptr<Client>(new Client(
         local_hostname, resolved_metadata, protocol, labels, tenant_id));
+    if (!nof_initiator) {
+        // nullptr means "use the process default", not "disable NoF" —
+        // existing callers keep the pre-parameter behavior. Explicit disable
+        // is MC_NOF_BACKEND=none; explicit injection is a non-null initiator.
+        auto& factory = DefaultNofInitiatorFactoryForTestingSlot();
+        nof_initiator = factory ? factory() : CreateNofRuntime().initiator;
+    }
+    client->nof_initiator_ = std::move(nof_initiator);
 
     ErrorCode err = client->ConnectToMaster(master_server_entry);
     if (err != ErrorCode::OK) {
@@ -4085,9 +4114,15 @@ tl::expected<void, ErrorCode> Client::RegisterLocalMemory(
 
 tl::expected<void, ErrorCode> Client::unregisterLocalMemory(
     void* addr, bool update_metadata) {
-    if (this->transfer_engine_->unregisterLocalMemory(addr, update_metadata) !=
-        0) {
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    const int rc =
+        transfer_engine_->unregisterLocalMemory(addr, update_metadata);
+    if (rc != 0) {
+        // Distinguish "not registered" from real failures so callers can
+        // tell an already-cleaned buffer apart from a live registration
+        // whose deregistration failed.
+        return tl::unexpected(rc == ERR_ADDRESS_NOT_REGISTERED
+                                  ? ErrorCode::NOT_REGISTERED
+                                  : ErrorCode::INVALID_PARAMS);
     }
     return {};
 }

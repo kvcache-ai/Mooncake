@@ -2981,7 +2981,10 @@ PYBIND11_MODULE(_store, m) {
             },
             py::arg("buffer_ptr"),
             "Unregister a previously registered memory "
-            "buffer for direct access operations")
+            "buffer for direct access operations. The caller must ensure no "
+            "transfer on this buffer is in flight: deregistration does not "
+            "wait for in-flight RDMA/NoF operations, and freeing or remapping "
+            "the buffer while a transfer is active is unsafe")
         .def(
             "get_into",
             [](MooncakeStorePyWrapper &self, const std::string &key,

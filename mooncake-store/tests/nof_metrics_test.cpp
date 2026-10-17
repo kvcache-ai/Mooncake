@@ -12,7 +12,6 @@
 #include <vector>
 
 #include "client_metric.h"
-#include "spdk/spdk_wrapper.h"
 #include "transfer_task.h"
 
 namespace mooncake {
@@ -105,59 +104,62 @@ TEST(NofMetrics, ConcurrentRecordingAndScrapesPreserveTotals) {
 namespace {
 constexpr uint32_t kBlockSize = 4096;
 
-struct PendingIo {
-    spdk_nvme_cmd_cb callback;
-    void* context;
-    bool fail;
-};
-}  // namespace
+// Stub initiator replacing the SPDK layer: SubmitIO queues the adaptor,
+// PollCompletion fires pending completions (in reverse order, to exercise
+// successful completions after a failure). The worker and completion
+// callback stay real.
+class StubInitiator : public NVMeoFInitiator {
+   public:
+    NofSegmentHandle* OpenSegment(const std::string&) override {
+        return reinterpret_cast<NofSegmentHandle*>(&sentinel_);
+    }
+    bool ProbeSegment(const std::string&, uint32_t, std::string*) override {
+        return true;
+    }
+    uint32_t GetBlockSize(const NofSegmentHandle*) override {
+        return kBlockSize;
+    }
+    int SubmitIO(NofSegmentHandle*, void*, uint64_t, uint64_t, NofIOOp,
+                 NofIOAdaptor* adaptor) override {
+        const int call = ++submit_calls;
+        if (call == reject_call) return -ENOMEM;
+        pending_io.push_back({adaptor, call == fail_call});
+        return 0;
+    }
+    int64_t PollCompletion(NofSegmentHandle*, uint32_t) override {
+        int64_t completed = 0;
+        while (!pending_io.empty()) {
+            const auto io = pending_io.back();
+            pending_io.pop_back();
+            NofIOCompletion completion{};
+            completion.success = !io.fail;
+            if (io.fail) {
+                completion.sc = 128;
+                completion.sct = 2;
+                completion.error_string = "stub_io_error";
+            }
+            io.adaptor->cb(io.adaptor->ctx, completion);
+            ++completed;
+        }
+        return completed;
+    }
+    ErrorCode RegisterMemory(void*, size_t) override { return ErrorCode::OK; }
+    ErrorCode UnregisterMemory(void*) override { return ErrorCode::OK; }
+    NofCapabilities GetCapabilities() const override { return {}; }
 
-// Replace SPDK at link time; the worker and completion callback stay real.
-struct ctrlr_info {};
-struct nof_seg_handle {
     int reject_call = 0;
     int fail_call = 0;
-    mutable int submit_calls = 0;
-    mutable std::deque<PendingIo> pending_io;
-};
+    int submit_calls = 0;
 
-SpdkWrapper::SpdkWrapper() = default;
-SpdkWrapper::~SpdkWrapper() = default;
-SpdkWrapper& SpdkWrapper::GetInstance() {
-    static SpdkWrapper wrapper;
-    return wrapper;
-}
-nof_seg_handle* SpdkWrapper::OpenNofSegment(const std::string&) {
-    ADD_FAILURE() << "Worker tests supply the segment directly";
-    return nullptr;
-}
-uint32_t SpdkWrapper::GetBlockSize(const nof_seg_handle*) { return kBlockSize; }
-int SpdkWrapper::SubmitRequest(const nof_seg_handle* segment, void*, uint64_t,
-                               uint32_t, int, spdk_nvme_cmd_cb callback,
-                               void* context) {
-    const int call = ++segment->submit_calls;
-    if (call == segment->reject_call) return -ENOMEM;
-    segment->pending_io.push_back(
-        {callback, context, call == segment->fail_call});
-    return 0;
-}
-int64_t SpdkWrapper::NvmePollProcessCompletion(nof_seg_handle* segment,
-                                               uint32_t) {
-    int64_t completed = 0;
-    while (!segment->pending_io.empty()) {
-        // Reverse order also exercises successful completions after a failure.
-        const auto io = segment->pending_io.back();
-        segment->pending_io.pop_back();
-        spdk_nvme_cpl completion{};
-        if (io.fail) {
-            completion.status.sct = 2;
-            completion.status.sc = 128;
-        }
-        io.callback(io.context, &completion);
-        ++completed;
-    }
-    return completed;
-}
+   private:
+    struct PendingIo {
+        NofIOAdaptor* adaptor;
+        bool fail;
+    };
+    std::deque<PendingIo> pending_io;
+    uint64_t sentinel_ = 0;
+};
+}  // namespace
 
 namespace test {
 class NofWorkerMetricsTest : public ::testing::TestWithParam<int> {
@@ -172,6 +174,8 @@ class NofWorkerMetricsTest : public ::testing::TestWithParam<int> {
         SetEnv("MC_NOF_WORKERS", "1");
         SetEnv("MC_NOF_SUBMIT_CHUNK_BYTES", "4096");
         SetEnv("MC_NOF_INFLIGHT_BYTES_LIMIT", "16384");
+        initiator_ = std::make_shared<StubInitiator>();
+        seg_ = initiator_->OpenSegment("stub");
     }
 
     void TearDown() override {
@@ -183,19 +187,18 @@ class NofWorkerMetricsTest : public ::testing::TestWithParam<int> {
         }
     }
 
-    std::shared_ptr<SpdkNofOperationState> Submit(SpdkNofWorkerPool& pool,
-                                                  uint32_t blocks = 3) {
-        auto state = std::make_shared<SpdkNofOperationState>();
-        SpdkNofTask task(&segment_, buffer_.data(), 0, blocks, GetParam(),
-                         state);
+    std::shared_ptr<NofOperationState> Submit(NofWorkerPool& pool,
+                                              uint32_t blocks = 3) {
+        auto state = std::make_shared<NofOperationState>();
+        NofTask task(seg_, buffer_.data(), 0, blocks * kBlockSize,
+                     GetParam() == 0 ? NofIOOp::kRead : NofIOOp::kWrite, state);
         task.metric = &metric_;
-        task.block_size = kBlockSize;
         pool.submitTask(std::move(task));
         return state;
     }
 
     void ExpectMetrics(int64_t bytes, int64_t ops, int64_t errors) {
-        const bool read = GetParam() == kSpdkNofOpRead;
+        const bool read = GetParam() == 0;
         EXPECT_EQ(metric_.nof_read_bytes.value(), read ? bytes : 0);
         EXPECT_EQ(metric_.nof_read_ops.value(), read ? ops : 0);
         EXPECT_EQ(metric_.nof_read_errors.value(), read ? errors : 0);
@@ -204,46 +207,46 @@ class NofWorkerMetricsTest : public ::testing::TestWithParam<int> {
         EXPECT_EQ(metric_.nof_write_errors.value(), read ? 0 : errors);
     }
 
-    nof_seg_handle segment_;
+    std::shared_ptr<StubInitiator> initiator_;
+    NofSegmentHandle* seg_ = nullptr;
     std::array<char, 5 * kBlockSize> buffer_{};
     NofMetric metric_;
     std::map<std::string, std::optional<std::string>> old_env_;
 };
 
 TEST_P(NofWorkerMetricsTest, SuccessfulCompletionsCountEachChunk) {
-    SpdkNofWorkerPool pool;
+    NofWorkerPool pool(initiator_, 0);
     auto state = Submit(pool);
     state->wait_for_completion();
     EXPECT_EQ(state->get_result(), ErrorCode::OK);
-    EXPECT_EQ(segment_.submit_calls, 3);
+    EXPECT_EQ(initiator_->submit_calls, 3);
     ExpectMetrics(3 * kBlockSize, 3, 0);
 }
 
 TEST_P(NofWorkerMetricsTest, SubmissionFailureKeepsCompletedChunks) {
-    segment_.reject_call = 2;
-    SpdkNofWorkerPool pool;
+    initiator_->reject_call = 2;
+    NofWorkerPool pool(initiator_, 0);
     auto state = Submit(pool);
     state->wait_for_completion();
     EXPECT_EQ(state->get_result(), ErrorCode::TRANSFER_FAIL);
-    EXPECT_EQ(segment_.submit_calls, 2);
+    EXPECT_EQ(initiator_->submit_calls, 2);
     ExpectMetrics(kBlockSize, 1, 1);
 }
 
 TEST_P(NofWorkerMetricsTest, CompletionFailureKeepsSuccessfulSiblings) {
-    segment_.fail_call = 2;
-    SpdkNofWorkerPool pool;
+    initiator_->fail_call = 2;
+    NofWorkerPool pool(initiator_, 0);
     auto state = Submit(pool);
     state->wait_for_completion();
     EXPECT_EQ(state->get_result(), ErrorCode::TRANSFER_FAIL);
-    EXPECT_EQ(segment_.submit_calls, 3);
+    EXPECT_EQ(initiator_->submit_calls, 3);
     ExpectMetrics(2 * kBlockSize, 2, 1);
 }
 
 INSTANTIATE_TEST_SUITE_P(ReadAndWrite, NofWorkerMetricsTest,
-                         ::testing::Values(kSpdkNofOpRead, kSpdkNofOpWrite),
+                         ::testing::Values(0, 1),
                          [](const ::testing::TestParamInfo<int>& info) {
-                             return info.param == kSpdkNofOpRead ? "Read"
-                                                                 : "Write";
+                             return info.param == 0 ? "Read" : "Write";
                          });
 }  // namespace test
 }  // namespace mooncake
