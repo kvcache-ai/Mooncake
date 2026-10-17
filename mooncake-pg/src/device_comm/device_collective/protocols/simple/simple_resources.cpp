@@ -6,7 +6,6 @@
 
 #include "device_comm/device_collective/device_control_update.h"
 #include "device_comm/device_collective/device_collective_workspace.h"
-#include "device_comm/device_primitives/payload_writer.h"
 #include "device_comm/device_transfer/transfer_service.h"
 #include "gpu_runtime.h"
 #include "pg_utils.h"
@@ -132,10 +131,9 @@ PGResult<SimpleWorkspace> SimpleResources::bindWorkspace(
                       "Simple workspace capacity is invalid");
     SimpleWorkspace result{static_cast<char*>(workspace.buffer().addr()), bytes,
                            nullptr};
-    PG_TRY(
-        auto staging_required,
-        payloadWriterRequiresStaging(transfer_service_, send_peer.global_rank));
-    if (staging_required) {
+    PG_TRY(auto direct,
+           transfer_service_.isDirectlyAddressable(send_peer.global_rank));
+    if (!direct) {
         PG_TRY(auto staging, workspace.staging());
         result.staging = static_cast<char*>(staging->addr());
     }

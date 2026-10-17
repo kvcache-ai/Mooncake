@@ -656,6 +656,20 @@ class NcclDeviceTransportImpl final : public NcclTransport {
         return status;
     }
 
+    void* peerPointer(const NcclBufferRegistration& registration,
+                      int peer) const override {
+        if (!initialized_ || peer < 0 || peer >= properties_.num_ranks)
+            return nullptr;
+        const auto it = registrations_.find(registration.id_);
+        if (it == registrations_.end()) return nullptr;
+        void* ptr = nullptr;
+        if (reportNcclError(
+                ncclGetPeerDevicePointer(it->second.window, 0, peer, &ptr),
+                "ncclGetPeerDevicePointer") != 0)
+            return nullptr;
+        return ptr;
+    }
+
    private:
     struct WindowRecord {
         ncclWindow_t window;

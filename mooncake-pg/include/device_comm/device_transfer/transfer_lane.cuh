@@ -8,11 +8,14 @@
 
 #include "common_types.h"
 #include "pg_assert.h"
+#include "device_comm/device_utils/d2h_request_slot.cuh"
+#include "device_comm/device_utils/h2d_request_slot.cuh"
 #include "device_comm/device_utils/device_timeout.cuh"
 #include "device_comm/device_transfer/transfer_types.cuh"
-#include "device_comm/device_transfer/routes/host_proxy_route/host_proxy_route.cuh"
 #include "device_comm/device_transfer/routes/p2p_route/p2p_route.cuh"
 #include "device_comm/device_transfer/routes/rdma_route/rdma_route.cuh"
+#include "device_comm/device_transfer/routes/nccl_device_route/nccl_device_route.cuh"
+#include "device_comm/device_transfer/routes/host_proxy_route/host_proxy_route.cuh"
 
 namespace mooncake {
 
@@ -39,14 +42,23 @@ __device__ __forceinline__ void validateRemoteSignal(
     }
 }
 
-static __device__ __noinline__ void drainTransfers(
-    const DeviceTransferHandle& handle, const GlobalRank* peers,
-    uint32_t peer_count) {
+inline __device__ __noinline__ void DeviceTransferHandle::drain(
+    const GlobalRank* peers, uint32_t peer_count) const {
     // One thread drains after all producers stop submitting. P2P has no
     // outstanding asynchronous transport work to drain.
-    drainRdmaTransfers(handle, peers, peer_count);
-    drainHostProxyTransfers(handle.route_context.host_proxy,
-                            handle.drain_timeout_ticks);
+    drainRdmaTransfers(*this, peers, peer_count);
+    drainNcclDeviceTransfers(*this, peers, peer_count);
+    drainHostProxyTransfers(*this);
+}
+
+__device__ __forceinline__ void DeviceTransferHandle::pauseIfRequested() const {
+    PauseMailbox::PauseSlot::ReceivedRequest received;
+    while (pause_mailbox->pause.tryReceive(received)) {
+        PG_ASSERT(received.pinned);
+        received.handle.reply({});
+        auto resume_request = pause_mailbox->resume.submit({});
+        resume_request.wait();
+    }
 }
 
 class TransferTicket {
@@ -61,6 +73,8 @@ class TransferTicket {
                 return p2p_.wait(block);
             case DeviceRouteType::Rdma:
                 return rdma_.wait(block);
+            case DeviceRouteType::NcclDevice:
+                return nccl_.wait(block);
             case DeviceRouteType::HostProxy:
                 return host_proxy_.wait(block);
             case DeviceRouteType::Unreachable:
@@ -83,6 +97,10 @@ class TransferTicket {
         : route_(DeviceRouteType::Rdma), rdma_(ticket) {}
 
     __device__ __forceinline__ explicit TransferTicket(
+        NcclDeviceTransferTicket ticket)
+        : route_(DeviceRouteType::NcclDevice), nccl_(ticket) {}
+
+    __device__ __forceinline__ explicit TransferTicket(
         HostProxyTransferTicket ticket)
         : route_(DeviceRouteType::HostProxy), host_proxy_(ticket) {}
 
@@ -90,6 +108,7 @@ class TransferTicket {
     union {
         P2pTransferTicket p2p_;
         RdmaTransferTicket rdma_;
+        NcclDeviceTransferTicket nccl_;
         HostProxyTransferTicket host_proxy_;
     };
 };
@@ -125,6 +144,12 @@ class TransferLane {
                     request.remote_offset, request.size, request.signal,
                     request.timeout_ticks, lane_index_, block));
 
+            case DeviceRouteType::NcclDevice:
+                return TransferTicket(ncclDevicePut(
+                    route.nccl, service_->route_context.nccl, request.local_ptr,
+                    request.remote_offset, request.size, request.signal,
+                    request.timeout_ticks, lane_index_, block));
+
             case DeviceRouteType::HostProxy:
                 return TransferTicket(hostProxyPut(
                     route.host_proxy, service_->route_context.host_proxy, rank,
@@ -155,6 +180,11 @@ class TransferLane {
             case DeviceRouteType::Rdma:
                 return TransferTicket(rdmaSignal(
                     route.rdma, service_->route_context.rdma, request.signal,
+                    request.timeout_ticks, lane_index_, block));
+
+            case DeviceRouteType::NcclDevice:
+                return TransferTicket(ncclDeviceSignal(
+                    route.nccl, service_->route_context.nccl, request.signal,
                     request.timeout_ticks, lane_index_, block));
 
             case DeviceRouteType::HostProxy:

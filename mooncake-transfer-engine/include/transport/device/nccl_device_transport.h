@@ -211,6 +211,11 @@ class NcclTransport {
     // participation. The default preserves source compatibility for external
     // transports that do not need a distinct local-abort path.
     virtual int abort() { return shutdown(); }
+
+    // Registered peer's LSA mapping, or nullptr when not LSA reachable.
+    virtual void* peerPointer(const NcclBufferRegistration&, int) const {
+        return nullptr;
+    }
 };
 
 // Create the CUDA-only NCCL LSA/GIN device transport.

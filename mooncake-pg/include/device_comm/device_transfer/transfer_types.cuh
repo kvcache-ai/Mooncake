@@ -6,6 +6,8 @@
 #include <cuda_alike.h>
 
 #include "common_types.h"
+#include "device_comm/device_utils/d2h_request_slot_types.h"
+#include "device_comm/device_utils/h2d_request_slot_types.h"
 
 namespace mooncake {
 
@@ -23,6 +25,7 @@ enum class DeviceRouteType : uint32_t {
     P2p = 1,
     HostProxy = 2,
     Rdma = 3,
+    NcclDevice = 4,
 };
 
 // Terminal outcomes visible to a transfer-service caller.
@@ -44,6 +47,13 @@ struct DeviceRdmaRoute {
     uint32_t qp_offset;
 };
 
+struct DeviceNcclRoute {
+    // Rank within the NCCL communicator, not GlobalRank or InGroupRank.
+    int32_t nccl_rank;
+    // LSA mapping owned by the nccl communicator, or zero for a GIN peer.
+    uint64_t mapped_region_address;
+};
+
 struct DeviceHostProxyRoute {
     // Address published by the peer and consumed by the host proxy through TE.
     uint64_t remote_region_address;
@@ -56,12 +66,24 @@ struct DeviceTransferRoute {
     union {
         DeviceP2pRoute p2p = {};
         DeviceRdmaRoute rdma;
+        DeviceNcclRoute nccl;
         DeviceHostProxyRoute host_proxy;
     };
+
+    // Local GPU address of the peer region, or zero without a direct mapping.
+    [[nodiscard]] __host__ __device__ __forceinline__ uint64_t
+    mappedRegionAddress() const {
+        switch (type) {
+            case DeviceRouteType::P2p:
+                return p2p.mapped_region_address;
+            case DeviceRouteType::NcclDevice:
+                return nccl.mapped_region_address;
+            default:
+                return 0;
+        }
+    }
 };
 
-template <typename Request, typename Reply>
-class D2HRequestSlot;
 struct HostProxyCommand;
 enum class HostProxyCommandResult : uint32_t;
 // Each lane owns one command/reply slot serviced by the host proxy.
@@ -96,6 +118,16 @@ struct DeviceRdmaContext {
     uint32_t atomic_sink_lkey = 0;
 };
 
+namespace device {
+class NcclDeviceContext;
+}
+
+struct DeviceNcclContext {
+    const device::NcclDeviceContext* peer_accessible_ctx = nullptr;
+    const device::NcclDeviceContext* local_staging_ctx = nullptr;
+    DeviceLocalRegion peer_accessible_region;
+};
+
 struct DeviceHostProxyContext {
     HostProxyCommandSlot* command_slots = nullptr;
 };
@@ -103,6 +135,7 @@ struct DeviceHostProxyContext {
 // Non-owning route-specific device state shared by all peer routes.
 struct DeviceRouteContext {
     DeviceRdmaContext rdma;
+    DeviceNcclContext nccl;
     DeviceHostProxyContext host_proxy;
 };
 
@@ -110,6 +143,16 @@ struct DeviceRouteContext {
 // only device-wide resources; a caller supplies its own peer selection,
 // buffers, signals, and algorithm state.
 struct DeviceTransferHandle {
+    // Host pins a pause request. The device replies at a safe point, then
+    // requests resumption and waits for the host's reply.
+    struct alignas(64) PauseMailbox {
+        using PauseSlot = H2DRequestSlot<>;
+        using ResumeSlot = D2HRequestSlot<>;
+
+        PauseSlot pause;
+        ResumeSlot resume;
+    };
+
     DeviceLocalRegion peer_accessible_region;
     DeviceLocalRegion local_staging_region;
     DeviceRouteContext route_context;             // Per device.
@@ -117,27 +160,29 @@ struct DeviceTransferHandle {
     uint64_t drain_timeout_ticks = 0;
 
     uint32_t max_world_size = 0;
+    PauseMailbox* pause_mailbox = nullptr;
 
     // Return a directly addressable pointer into a peer's registered region.
     // A null result means the selected route is not directly addressable. This
     // capability query never allocates or falls back to staging.
     [[nodiscard]] __device__ __forceinline__ void* remotePtr(
         GlobalRank rank, uint64_t remote_offset) const {
-        const auto& route = routes[rank];
-        if (route.type != DeviceRouteType::P2p) return nullptr;
-        return reinterpret_cast<char*>(
-                   static_cast<uintptr_t>(route.p2p.mapped_region_address)) +
+        const auto address = routes[rank].mappedRegionAddress();
+        if (address == 0) return nullptr;
+        return reinterpret_cast<char*>(static_cast<uintptr_t>(address)) +
                remote_offset;
-    }
-
-    // Return the route currently selected for a peer.
-    [[nodiscard]] __device__ __forceinline__ DeviceRouteType
-    routeType(GlobalRank rank) const {
-        return routes[rank].type;
     }
 
     // Return a lightweight view of one fixed service lane.
     __device__ __forceinline__ TransferLane lane(uint32_t lane_index) const;
+
+    // Drain outstanding transfers on a best-effort basis after all producers
+    // stop submitting. Called by one thread.
+    __device__ void drain(const GlobalRank* peers, uint32_t peer_count) const;
+
+    // Acknowledge a pause request and wait for the host to resume execution.
+    // Called by one thread.
+    __device__ __forceinline__ void pauseIfRequested() const;
 };
 
 // A single-publisher update to one 64-bit notification counter in the peer's
