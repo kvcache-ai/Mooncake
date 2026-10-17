@@ -1,5 +1,7 @@
 #pragma once
 
+#include <atomic>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <utility>
@@ -25,6 +27,7 @@ namespace mooncake {
 class PinnedBufferPool {
    public:
     static constexpr size_t kDefaultMaxPoolSize = 32;
+    using FallbackCallback = std::function<void(size_t)>;
 
     struct Buffer {
         PinnedHostBuffer pinned_host;
@@ -74,6 +77,15 @@ class PinnedBufferPool {
 
     ~PinnedBufferPool() { Clear(); }
 
+    void SetFallbackCallback(FallbackCallback cb) {
+        std::lock_guard<std::mutex> lk(mutex_);
+        fallback_cb_ = std::move(cb);
+    }
+
+    uint64_t GetFallbackCount() const {
+        return fallback_count_.load(std::memory_order_relaxed);
+    }
+
     Buffer Acquire(size_t size) {
         {
             std::lock_guard<std::mutex> lk(mutex_);
@@ -121,9 +133,18 @@ class PinnedBufferPool {
     }
 
    private:
-    static Buffer AllocNew(size_t size) {
+    Buffer AllocNew(size_t size) {
         auto pinned = AllocatePinned(size);
         if (pinned.data) return pinned;
+        fallback_count_.fetch_add(1, std::memory_order_relaxed);
+        FallbackCallback cb;
+        {
+            std::lock_guard<std::mutex> lk(mutex_);
+            cb = fallback_cb_;
+        }
+        if (cb) {
+            cb(size);
+        }
         return Buffer::Pageable(size);
     }
 
@@ -136,6 +157,8 @@ class PinnedBufferPool {
     const size_t max_pool_size_;
     std::mutex mutex_;
     std::vector<Buffer> pool_;
+    FallbackCallback fallback_cb_;
+    std::atomic<uint64_t> fallback_count_{0};
 };
 
 }  // namespace mooncake
