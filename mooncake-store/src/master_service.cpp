@@ -401,7 +401,13 @@ MasterService::MasterService(const MasterServiceConfig& config)
                       << ", error=" << toString(result.error());
               }
           }),
-      replica_cleanup_worker_([this] { ClearInvalidHandles(); }),
+      replica_cleanup_worker_([this] {
+          // RFC #4700 slice 1: no metadata sweep while a promotion restore
+          // is in flight; the restore itself owns the metadata transition.
+          if (AdmitsBusinessWorkers()) {
+              ClearInvalidHandles();
+          }
+      }),
       enable_async_segment_cleanup_(!config.enable_ha && !config.enable_cxl),
       default_kv_lease_ttl_(config.default_kv_lease_ttl),
       default_kv_soft_pin_ttl_(config.default_kv_soft_pin_ttl),
@@ -712,6 +718,11 @@ MasterService::MasterService(const MasterServiceConfig& config)
 
     dynamic_replication_.Start([this](const TenantId& tenant_id,
                                       const std::string& key) {
+        // RFC #4700 slice 1: dynamic replica proposals mutate business
+        // metadata, so they stay out of the restore window.
+        if (!AdmitsBusinessWorkers()) {
+            return;
+        }
         std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
         TrySubmitDynamicReplicaProposal(ObjectIdentity{tenant_id, key});
     });
@@ -2628,6 +2639,12 @@ void MasterService::TaskCleanupThreadFunc() {
             break;
         }
 
+        // RFC #4700 slice 1: task pruning, soft-pin expiry and dynamic
+        // replication cleanup all mutate business metadata.
+        if (!AdmitsBusinessWorkers()) {
+            continue;
+        }
+
         std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
         {
             auto write_access = task_manager_.get_write_access();
@@ -3526,7 +3543,107 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromBatchOpLogPromotion(
                                    chunk_object_count, max_replica_id, nullptr);
 }
 
+// Restore lifecycle (RFC #4700, slice 1). Defined next to the restore
+// implementation it guards.
+namespace {
+
+const char* RestoreLifecycleStateToString(
+    MasterService::RestoreLifecycleState state) {
+    switch (state) {
+        case MasterService::RestoreLifecycleState::kConstructed:
+            return "Constructed";
+        case MasterService::RestoreLifecycleState::kRecovering:
+            return "Recovering";
+        case MasterService::RestoreLifecycleState::kReady:
+            return "Ready";
+        case MasterService::RestoreLifecycleState::kServing:
+            return "Serving";
+        case MasterService::RestoreLifecycleState::kFailed:
+            return "Failed";
+    }
+    return "Unknown";
+}
+
+}  // namespace
+
 tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
+    const std::vector<StandbyObjectEntry>* legacy_objects,
+    const StandbyMetadataStore* metadata_store,
+    uint64_t initial_oplog_sequence_id,
+    const std::vector<StandbySegmentInfo>& segments, size_t chunk_object_count,
+    std::optional<ReplicaID> expected_max_replica_id,
+    const WeightMetadataSnapshot* legacy_weight_metadata) {
+    // Lifecycle bookkeeping around the restore (RFC #4700, slice 1). The
+    // restore itself keeps its existing retry semantics: a replacement
+    // restore from Ready or Failed is still allowed and is exercised by
+    // the HA tests (allocator rebind, discard-repair retry). The one
+    // refused entry is Serving: the RFC's proposed no-cycles-out-of-
+    // Serving constraint. master_state_mutex_ stays in place, so this
+    // slice adds no locking behavior.
+    const RestoreLifecycleState entry_state =
+        lifecycle_state_.load(std::memory_order_acquire);
+    if (entry_state == RestoreLifecycleState::kServing) {
+        LOG(ERROR) << "RestoreFromStandbyState: refusing restore of a "
+                      "serving service (lifecycle state="
+                   << RestoreLifecycleStateToString(entry_state) << ")";
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+    lifecycle_state_.store(RestoreLifecycleState::kRecovering,
+                           std::memory_order_release);
+
+    auto result = RestoreFromStandbyStateCore(
+        legacy_objects, metadata_store, initial_oplog_sequence_id, segments,
+        chunk_object_count, expected_max_replica_id, legacy_weight_metadata);
+
+    lifecycle_state_.store(result.has_value() ? RestoreLifecycleState::kReady
+                                              : RestoreLifecycleState::kFailed,
+                           std::memory_order_release);
+    LOG(INFO) << "Restore lifecycle -> "
+              << RestoreLifecycleStateToString(lifecycle_state_.load());
+    return result;
+}
+
+MasterService::RestoreLifecycleState MasterService::GetRestoreLifecycleState()
+    const {
+    return lifecycle_state_.load(std::memory_order_acquire);
+}
+
+void MasterService::MarkReadyForServing() {
+    RestoreLifecycleState expected = RestoreLifecycleState::kConstructed;
+    if (!lifecycle_state_.compare_exchange_strong(
+            expected, RestoreLifecycleState::kReady)) {
+        LOG(ERROR) << "MarkReadyForServing: refusing transition from "
+                   << RestoreLifecycleStateToString(lifecycle_state_.load());
+        return;
+    }
+    LOG(INFO) << "Restore lifecycle -> Ready (non-HA initialization)";
+}
+
+void MasterService::ActivateServing() {
+    RestoreLifecycleState expected = RestoreLifecycleState::kReady;
+    if (!lifecycle_state_.compare_exchange_strong(
+            expected, RestoreLifecycleState::kServing)) {
+        LOG(ERROR) << "ActivateServing: refusing transition from "
+                   << RestoreLifecycleStateToString(lifecycle_state_.load());
+        return;
+    }
+    LOG(INFO) << "Restore lifecycle -> Serving";
+}
+
+bool MasterService::AdmitsBusinessWorkers() const {
+    switch (lifecycle_state_.load(std::memory_order_acquire)) {
+        case RestoreLifecycleState::kRecovering:
+        case RestoreLifecycleState::kFailed:
+            return false;
+        case RestoreLifecycleState::kConstructed:
+        case RestoreLifecycleState::kReady:
+        case RestoreLifecycleState::kServing:
+            return true;
+    }
+    return false;
+}
+
+tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
     const std::vector<StandbyObjectEntry>* legacy_objects,
     const StandbyMetadataStore* metadata_store,
     uint64_t initial_oplog_sequence_id,
@@ -9278,6 +9395,16 @@ void MasterService::EvictionThreadFunc() {
     auto last_discard_time = std::chrono::system_clock::now();
     auto next_dfs_eviction_time = std::chrono::steady_clock::now();
     while (eviction_running_) {
+        // RFC #4700 slice 1: eviction, tenant watermark eviction, DFS/NoF
+        // eviction, expired-processing discard and promotion retry all
+        // mutate business metadata, so none of them runs while a promotion
+        // restore is in flight.
+        if (!AdmitsBusinessWorkers()) {
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(kEvictionThreadSleepMs));
+            continue;
+        }
+
         const auto now = std::chrono::system_clock::now();
         double used_ratio = segment_manager_.GetMemoryUsage().used_ratio();
         if (used_ratio > eviction_high_watermark_ratio_ ||
@@ -9814,6 +9941,14 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
 
 void MasterService::ClientMonitorFunc() {
     while (client_monitor_running_) {
+        // RFC #4700 slice 1: liveness transitions retire clients and drive
+        // offboarding, so the monitor stays out of the restore window too.
+        if (!AdmitsBusinessWorkers()) {
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(kClientMonitorSleepMs));
+            continue;
+        }
+
         const auto now = ClientLivenessRecord::Clock::now();
         std::vector<std::pair<UUID, std::shared_ptr<ClientLivenessRecord>>>
             clients;
@@ -10024,6 +10159,14 @@ bool MasterService::TryUnmountNoFSegmentByHeartbeat(
 void MasterService::NofHeartbeatThreadFunc() {
     size_t next_probe_index = 0;
     while (nof_heartbeat_running_) {
+        // RFC #4700 slice 1: heartbeat-driven NoF unmounts mutate segment
+        // and replica state.
+        if (!AdmitsBusinessWorkers()) {
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(kNoFHeartbeatThreadSleepMs));
+            continue;
+        }
+
         auto now = std::chrono::steady_clock::now();
         std::vector<MountedNoFSegmentSnapshot> mounted_segments;
         nof_segment_manager_.GetMountedSegmentsSnapshot(mounted_segments);
@@ -11007,6 +11150,13 @@ void MasterService::ProcessDrainJobs() {
 
 void MasterService::JobDispatchThreadFunc() {
     while (job_dispatch_running_) {
+        // RFC #4700 slice 1: drain jobs mutate business metadata.
+        if (!AdmitsBusinessWorkers()) {
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(kJobDispatchThreadSleepMs));
+            continue;
+        }
+
         ProcessDrainJobs();
         std::this_thread::sleep_for(
             std::chrono::milliseconds(kJobDispatchThreadSleepMs));

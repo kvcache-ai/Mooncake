@@ -133,6 +133,14 @@ void WrappedMasterService::StopHttpMetadataCleanup() {
     master_service_.StopHttpMetadataCleanup();
 }
 
+void WrappedMasterService::MarkReadyForServing() {
+    master_service_.MarkReadyForServing();
+}
+
+void WrappedMasterService::ActivateServing() {
+    master_service_.ActivateServing();
+}
+
 tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>
 WrappedMasterService::CalcCacheStats() {
     return MasterMetricManager::instance().calculate_cache_stats();
