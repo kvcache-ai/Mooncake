@@ -139,6 +139,10 @@ static constexpr uint64_t DEFAULT_RESTORE_REPAIR_DURABLE_TIMEOUT_MS = 10000;
 static constexpr uint64_t DEFAULT_PUT_START_RELEASE_TIMEOUT =
     600;  // 10 minutes
 
+// Upper bound on the parts one object may be written in. A request above it is
+// refused rather than turned into a slot vector of unbounded size.
+static constexpr uint32_t MAX_PART_COUNT = 1024;
+
 // Task manager constants
 static constexpr uint32_t DEFAULT_MAX_TOTAL_FINISHED_TASKS = 10000;
 static constexpr uint32_t DEFAULT_MAX_TOTAL_PENDING_TASKS = 10000;

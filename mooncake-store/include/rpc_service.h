@@ -76,6 +76,12 @@ class WrappedMasterService {
     tl::expected<GetReplicaListResponse, ErrorCode> GetReplicaList(
         const std::string& key, const std::string& tenant_id = "default");
 
+    // The part-scoped read: which slice of an object written in several parts
+    // this caller means. A read without it only answers an ordinary object.
+    tl::expected<GetReplicaListResponse, ErrorCode> GetReplicaListForPart(
+        const std::string& key, uint32_t part_index,
+        const std::string& tenant_id = "default");
+
     std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
     BatchGetReplicaList(const std::vector<std::string>& keys,
                         const std::string& tenant_id = "default");
@@ -94,13 +100,38 @@ class WrappedMasterService {
         const uint64_t slice_length, const ReplicateConfig& config,
         const std::string& tenant_id = "default");
 
+    // The part-scoped write start: which part this writer fills, out of how
+    // many. It travels as an RPC of its own, so a master that predates
+    // multi-part objects answers that it does not know the method instead of
+    // writing the part as a whole object.
+    tl::expected<std::vector<Replica::Descriptor>, ErrorCode> PutStartForPart(
+        const UUID& client_id, const std::string& key,
+        const uint64_t slice_length, const PartWriteRequest& request,
+        const std::string& tenant_id = "default");
+
     tl::expected<void, ErrorCode> PutEnd(
         const UUID& client_id, const ObjectMeta& object_meta,
         ReplicaType replica_type = ReplicaType::ALL,
         const std::string& tenant_id = "default");
 
+    // The part-scoped write end: the part this request completes, the replicas
+    // that attempt allocated, the checksum it wrote and the replica type it
+    // completes.
+    tl::expected<void, ErrorCode> PutEndForPart(
+        const UUID& client_id, const PartEndRequest& request,
+        ReplicaType replica_type = ReplicaType::ALL,
+        const std::string& tenant_id = "default");
+
     tl::expected<void, ErrorCode> PutRevoke(
         const UUID& client_id, const std::string& key,
+        ReplicaType replica_type = ReplicaType::ALL,
+        const std::string& tenant_id = "default");
+
+    // The part-scoped revoke: the part whose attempt is abandoned, the replicas
+    // that attempt allocated, and the replica type it gives up.
+    tl::expected<void, ErrorCode> PutRevokeForPart(
+        const UUID& client_id, const std::string& key, uint32_t part_index,
+        const std::vector<ReplicaID>& replica_ids,
         ReplicaType replica_type = ReplicaType::ALL,
         const std::string& tenant_id = "default");
 

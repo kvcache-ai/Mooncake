@@ -393,6 +393,35 @@ WrappedMasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
     return results;
 }
 
+tl::expected<GetReplicaListResponse, ErrorCode>
+WrappedMasterService::GetReplicaListForPart(const std::string& key,
+                                            uint32_t part_index,
+                                            const std::string& tenant_id) {
+    return execute_rpc(
+        "GetReplicaListForPart",
+        [&] {
+            return WithRequestTenant(
+                master_service_.IsTenantQuotaEnabled()
+                    ? std::string_view(tenant_id)
+                    : TenantId::kDefaultValue,
+                [&](const TenantId& resolved_tenant_id) {
+                    auto result = master_service_.GetReplicaListForPart(
+                        key, resolved_tenant_id, part_index);
+                    if (result) {
+                        result->resolved_tenant_id = resolved_tenant_id.value();
+                    }
+                    return result;
+                });
+        },
+        [&](auto& timer) {
+            timer.LogRequest("key=", key, ", part_index=", part_index);
+        },
+        [] { MasterMetricManager::instance().inc_get_replica_list_requests(); },
+        [] {
+            MasterMetricManager::instance().inc_get_replica_list_failures();
+        });
+}
+
 std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
 WrappedMasterService::BatchGetReplicaListForAdmin(
     const std::vector<std::string>& keys, const std::string& tenant_id) {
@@ -474,6 +503,61 @@ tl::expected<void, ErrorCode> WrappedMasterService::PutEnd(
         [] { MasterMetricManager::instance().inc_put_end_failures(); });
 }
 
+tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
+WrappedMasterService::PutStartForPart(const UUID& client_id,
+                                      const std::string& key,
+                                      const uint64_t slice_length,
+                                      const PartWriteRequest& request,
+                                      const std::string& tenant_id) {
+    auto result = execute_rpc(
+        "PutStartForPart",
+        [&] {
+            return WithWriteTenant(tenant_id,
+                                   master_service_.IsTenantQuotaEnabled(),
+                                   [&](const TenantId& resolved_tenant_id) {
+                                       return master_service_.PutStart(
+                                           client_id, key, resolved_tenant_id,
+                                           slice_length, request);
+                                   });
+        },
+        [&](auto& timer) {
+            timer.LogRequest("client_id=", client_id, ", key=", key,
+                             ", part_index=", request.part_index,
+                             ", part_count=", request.part_count,
+                             ", slice_length=", slice_length);
+        },
+        [&] { MasterMetricManager::instance().inc_put_start_requests(); },
+        [] { MasterMetricManager::instance().inc_put_start_failures(); });
+    if (!result && result.error() == ErrorCode::OBJECT_ALREADY_EXISTS) {
+        MasterMetricManager::instance().inc_put_start_object_already_exists();
+    }
+    return result;
+}
+
+tl::expected<void, ErrorCode> WrappedMasterService::PutEndForPart(
+    const UUID& client_id, const PartEndRequest& request,
+    ReplicaType replica_type, const std::string& tenant_id) {
+    return execute_rpc(
+        "PutEndForPart",
+        [&] {
+            return WithRequestTenant(master_service_.IsTenantQuotaEnabled()
+                                         ? std::string_view(tenant_id)
+                                         : TenantId::kDefaultValue,
+                                     [&](const TenantId& resolved_tenant_id) {
+                                         return master_service_.PutEnd(
+                                             client_id, request,
+                                             resolved_tenant_id, replica_type);
+                                     });
+        },
+        [&](auto& timer) {
+            timer.LogRequest("client_id=", client_id, ", key=", request.key,
+                             ", part_index=", request.part_index,
+                             ", replica_type=", replica_type);
+        },
+        [] { MasterMetricManager::instance().inc_put_end_requests(); },
+        [] { MasterMetricManager::instance().inc_put_end_failures(); });
+}
+
 tl::expected<void, ErrorCode> WrappedMasterService::PutRevoke(
     const UUID& client_id, const std::string& key, ReplicaType replica_type,
     const std::string& tenant_id) {
@@ -491,6 +575,32 @@ tl::expected<void, ErrorCode> WrappedMasterService::PutRevoke(
         },
         [&](auto& timer) {
             timer.LogRequest("client_id=", client_id, ", key=", key,
+                             ", replica_type=", replica_type);
+        },
+        [] { MasterMetricManager::instance().inc_put_revoke_requests(); },
+        [] { MasterMetricManager::instance().inc_put_revoke_failures(); });
+}
+
+tl::expected<void, ErrorCode> WrappedMasterService::PutRevokeForPart(
+    const UUID& client_id, const std::string& key, uint32_t part_index,
+    const std::vector<ReplicaID>& replica_ids, ReplicaType replica_type,
+    const std::string& tenant_id) {
+    return execute_rpc(
+        "PutRevokeForPart",
+        [&] {
+            return WithRequestTenant(
+                master_service_.IsTenantQuotaEnabled()
+                    ? std::string_view(tenant_id)
+                    : TenantId::kDefaultValue,
+                [&](const TenantId& resolved_tenant_id) {
+                    return master_service_.PutRevokeForPart(
+                        client_id, key, resolved_tenant_id, part_index,
+                        replica_ids, replica_type);
+                });
+        },
+        [&](auto& timer) {
+            timer.LogRequest("client_id=", client_id, ", key=", key,
+                             ", part_index=", part_index,
                              ", replica_type=", replica_type);
         },
         [] { MasterMetricManager::instance().inc_put_revoke_requests(); },
@@ -1887,9 +1997,13 @@ void RegisterRpcService(coro_rpc::coro_rpc_server& server,
         &WrappedMasterService::BatchReplicaClear,
         &WrappedMasterService::GetReplicaListByRegex,
         &WrappedMasterService::GetReplicaList,
+        &WrappedMasterService::GetReplicaListForPart,
         &WrappedMasterService::BatchGetReplicaList,
         &WrappedMasterService::PutStart, &WrappedMasterService::PutEnd,
-        &WrappedMasterService::PutRevoke, &WrappedMasterService::BatchPutStart,
+        &WrappedMasterService::PutStartForPart,
+        &WrappedMasterService::PutEndForPart, &WrappedMasterService::PutRevoke,
+        &WrappedMasterService::PutRevokeForPart,
+        &WrappedMasterService::BatchPutStart,
         &WrappedMasterService::BatchPutEnd,
         &WrappedMasterService::BatchPutRevoke,
         &WrappedMasterService::UpsertStart, &WrappedMasterService::UpsertEnd,

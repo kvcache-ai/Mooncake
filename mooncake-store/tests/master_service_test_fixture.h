@@ -211,10 +211,13 @@ class MasterServiceTest : public ::testing::Test {
             return std::nullopt;
         }
 
-        for (const auto& replica : accessor.Get().GetAllReplicas()) {
-            for (const auto& name : replica.get_segment_names()) {
-                if (name.has_value() && *name == segment_name) {
-                    return replica.get_refcnt();
+        const ObjectPart* part = accessor.Get().GetPart(0);
+        if (part != nullptr) {
+            for (const auto& replica : part->replicas()) {
+                for (const auto& name : replica.get_segment_names()) {
+                    if (name.has_value() && *name == segment_name) {
+                        return replica.get_refcnt();
+                    }
                 }
             }
         }

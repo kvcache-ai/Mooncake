@@ -14,6 +14,28 @@ struct ObjectMeta {
 };
 YLT_REFL(ObjectMeta, key, object_checksum);
 
+// The payload of a part-scoped PutStart. The part scope travels in the request
+// of the part-scoped RPC rather than as a compatible field of the ordinary one:
+// a master that predates multi-part objects would decode such a field, ignore
+// it, and publish the part as a whole object.
+struct PartWriteRequest {
+    uint32_t part_index{0};
+    uint32_t part_count{1};
+    ReplicateConfig config{};
+};
+YLT_REFL(PartWriteRequest, part_index, part_count, config);
+
+// The payload of a part-scoped PutEnd. `replica_ids` names the replicas that
+// the attempt holding the part allocated: it has to cover every replica the
+// part still holds, and replicas the attempt already gave up may be named too.
+struct PartEndRequest {
+    std::string key;
+    uint32_t part_index{0};
+    std::vector<ReplicaID> replica_ids{};
+    std::optional<uint64_t> object_checksum{};
+};
+YLT_REFL(PartEndRequest, key, part_index, replica_ids, object_checksum);
+
 enum class ReplicaActionType {
     ADD = 0,
 };
@@ -84,6 +106,10 @@ struct GetReplicaListResponse {
     // the exact scope the write path used. Empty when the master predates
     // this field.
     struct_pack::compatible<std::string, 1> resolved_tenant_id;
+    // How many parts the object has. 1 for every object written before
+    // multi-part objects existed, which is also the value an older master
+    // leaves here.
+    struct_pack::compatible<uint32_t, 2> part_count{1};
 
     GetReplicaListResponse() : lease_ttl_ms(0) {}
     GetReplicaListResponse(
@@ -95,7 +121,7 @@ struct GetReplicaListResponse {
           object_checksum(object_checksum_param) {}
 };
 YLT_REFL(GetReplicaListResponse, replicas, lease_ttl_ms, object_checksum,
-         resolved_tenant_id);
+         resolved_tenant_id, part_count);
 
 struct CachedQueryResultResponse {
     bool success;

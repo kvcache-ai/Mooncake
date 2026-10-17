@@ -584,14 +584,15 @@ TEST(ObjectRouteTest, WriteCursorChangesMetadataAndState) {
     // A write cursor may change a task, but not whether the object has work
     // in flight: it does not run the observer.
     for (auto object : route.WriteCursor()) {
-        object.metadata().MutablePart(0).SetChecksum(42);
+        object.metadata().MutablePart(0)->SetChecksum(42);
         object.state().offloading_task->mirror_clients.push_back(UUID{3, 4});
     }
     for (const char* key : {"k1", "k2"}) {
         auto guard = route.Read(key);
         ASSERT_TRUE(guard.has_value());
-        ASSERT_TRUE(guard->metadata().GetPart(0).checksum().has_value());
-        EXPECT_EQ(*guard->metadata().GetPart(0).checksum(), 42u);
+        ASSERT_NE(guard->metadata().GetPart(0), nullptr);
+        ASSERT_TRUE(guard->metadata().GetPart(0)->checksum().has_value());
+        EXPECT_EQ(*guard->metadata().GetPart(0)->checksum(), 42u);
         ASSERT_TRUE(guard->state().offloading_task.has_value());
         EXPECT_EQ(guard->state().offloading_task->mirror_clients.size(), 1u);
     }
@@ -891,7 +892,7 @@ TEST(ObjectRouteTest, ObserverIsNotCalledForReadsOrCursors) {
     // A write cursor does not run the observer, which is why it must not
     // start or finish in-flight work.
     for (auto object : route.WriteCursor()) {
-        object.metadata().MutablePart(0).SetChecksum(7);
+        object.metadata().MutablePart(0)->SetChecksum(7);
     }
     EXPECT_TRUE(observer.releases.empty());
 }

@@ -91,6 +91,8 @@ target_link_libraries(master_service_evict_scenario_test
 add_store_test(master_service_scenario_test master_service_scenario_test.cpp)
 target_link_libraries(master_service_scenario_test
                       PRIVATE master_service_test_dsl)
+add_store_test(master_service_part_scenario_test
+               master_service_part_scenario_test.cpp)
 add_store_test(master_service_group_scenario_test
                master_service_group_scenario_test.cpp)
 target_link_libraries(master_service_group_scenario_test

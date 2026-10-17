@@ -3520,6 +3520,35 @@ TEST_F(MasterServiceTest,
     EXPECT_FALSE(FindClientLivenessForTest(service, client_id));
 }
 
+TEST_F(MasterServiceTest, PutStartRefusesAPartScopeThisBuildCannotServe) {
+    MasterService service;
+    const auto context = PrepareSimpleSegment(service);
+    const UUID client_id = generate_uuid();
+
+    PartWriteRequest multi_part;
+    multi_part.part_count = 2;
+    EXPECT_EQ(service
+                  .PutStart(client_id, "multi_part_key", TenantId::Default(),
+                            1024, multi_part)
+                  .error(),
+              ErrorCode::INVALID_PARAMS);
+
+    PartWriteRequest other_part;
+    other_part.part_index = 1;
+    EXPECT_EQ(service
+                  .PutStart(client_id, "other_part_key", TenantId::Default(),
+                            1024, other_part)
+                  .error(),
+              ErrorCode::INVALID_PARAMS);
+
+    // The ordinary scope still goes through, so the refusal is about the part
+    // scope and not about PutStart itself.
+    EXPECT_TRUE(service
+                    .PutStart(client_id, "ordinary_key", TenantId::Default(),
+                              1024, ReplicateConfig{})
+                    .has_value());
+}
+
 }  // namespace mooncake::test
 
 int main(int argc, char** argv) {

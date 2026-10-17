@@ -424,6 +424,9 @@ DEFINE_string(tenant_quota_connector_type, "file",
               "Tenant quota policy connector type");
 DEFINE_string(tenant_quota_connector_uri, "",
               "Tenant quota policy connector URI");
+DEFINE_bool(enable_multi_part_objects, false,
+            "Serve objects whose content is written by several writers, one "
+            "part each");
 
 // Task manager configuration
 DEFINE_uint32(max_total_finished_tasks, 10000,
@@ -725,6 +728,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetBool("enable_multi_tenants",
                            &master_config.enable_multi_tenants,
                            FLAGS_enable_multi_tenants);
+    default_config.GetBool("enable_multi_part_objects",
+                           &master_config.enable_multi_part_objects,
+                           FLAGS_enable_multi_part_objects);
     default_config.GetString("tenant_quota_connector_type",
                              &master_config.tenant_quota_connector_type,
                              FLAGS_tenant_quota_connector_type);
@@ -1250,6 +1256,12 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
          !info.is_default) ||
         !conf_set) {
         master_config.enable_multi_tenants = FLAGS_enable_multi_tenants;
+    }
+    if ((google::GetCommandLineFlagInfo("enable_multi_part_objects", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.enable_multi_part_objects =
+            FLAGS_enable_multi_part_objects;
     }
     if ((google::GetCommandLineFlagInfo("tenant_quota_connector_type", &info) &&
          !info.is_default) ||

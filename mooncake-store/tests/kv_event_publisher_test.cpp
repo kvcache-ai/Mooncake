@@ -457,6 +457,38 @@ TEST(KvEventPublisherTest, SurvivingMediumIsNotRemoved) {
               "disk");
 }
 
+TEST(KvEventPublisherTest, EventsCarryTheObjectsPartCount) {
+    const std::string endpoint = MakeIpcEndpoint();
+    KvEventPublisher publisher(MakeEnabledConfig(endpoint));
+    ASSERT_TRUE(publisher.enabled());
+    ScopedSubscriber subscriber;
+    ASSERT_TRUE(subscriber.Connect(endpoint));
+
+    // A stored event tells a subscriber the object is readable; the part count
+    // tells it how many parts to ask for.
+    msgpack::object_handle payload;
+    publisher.PublishCommitted("object-a", {"cpu"}, "tenant-a", "group-a", 4);
+    ASSERT_TRUE(ReceivePayload(subscriber.sub, &payload));
+    const auto* stored_count = FindMapValue(EventAt(payload, 0), "part_count");
+    ASSERT_NE(stored_count, nullptr);
+    EXPECT_EQ(stored_count->via.u64, 4u);
+
+    // A removal names the same count, so a subscriber can retract every part.
+    publisher.PublishObjectRemoved("object-a", "tenant-a", "group-a", {"cpu"},
+                                   4);
+    ASSERT_TRUE(ReceivePayload(subscriber.sub, &payload));
+    const auto* removed_count = FindMapValue(EventAt(payload, 0), "part_count");
+    ASSERT_NE(removed_count, nullptr);
+    EXPECT_EQ(removed_count->via.u64, 4u);
+
+    // An ordinary object reports one part.
+    publisher.PublishCommitted("object-b", {"cpu"}, "tenant-a", "group-a");
+    ASSERT_TRUE(ReceivePayload(subscriber.sub, &payload));
+    const auto* default_count = FindMapValue(EventAt(payload, 0), "part_count");
+    ASSERT_NE(default_count, nullptr);
+    EXPECT_EQ(default_count->via.u64, 1u);
+}
+
 TEST(KvEventPublisherTest, RemovesBothMediaAfterStoredOnCpuAndDisk) {
     const std::string endpoint = MakeIpcEndpoint();
     KvEventPublisher publisher(MakeEnabledConfig(endpoint));
