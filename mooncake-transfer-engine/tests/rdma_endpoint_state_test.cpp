@@ -87,9 +87,11 @@ class RdmaContextTestPeer {
         context.lid_ = 0;
     }
 
-    static void bindFakeEndpointStore(RdmaContext &context, ibv_cq *cq) {
+    static void bindFakeEndpointStore(RdmaContext &context, ibv_cq *cq,
+                                      size_t max_endpoints = 8) {
         bindCompletionQueue(context, cq);
-        context.endpoint_store_ = std::make_shared<SIEVEEndpointStore>(8);
+        context.endpoint_store_ =
+            std::make_shared<SIEVEEndpointStore>(max_endpoints);
         context.transfer_worker_count_ = 1;
         context.endpoint_lifecycle_locks_.clear();
         context.endpoint_lifecycle_locks_.push_back(
@@ -149,6 +151,10 @@ class WorkerPoolTestPeer {
         pool.performPostSend(thread_id);
     }
 
+    static int performPollCq(WorkerPool &pool, int thread_id) {
+        return pool.performPollCq(thread_id);
+    }
+
     static void clearQueuedSlices(WorkerPool &pool) {
         for (auto &queue : pool.collective_slice_queue_) queue.clear();
         for (auto &queue : pool.worker_slice_queue_) queue.clear();
@@ -156,6 +162,23 @@ class WorkerPoolTestPeer {
 
     static uint64_t lastPollTs(const WorkerPool &pool) {
         return pool.last_poll_ts_ns_.load(std::memory_order_acquire);
+    }
+
+    static size_t pendingHandshakeCount(const WorkerPool &pool, int thread_id) {
+        return pool.pending_handshakes_[thread_id].size();
+    }
+
+    static bool pendingHandshakeReady(const WorkerPool &pool, int thread_id,
+                                      const std::string &peer_nic_path) {
+        const auto &pending = pool.pending_handshakes_[thread_id];
+        auto it = pending.find(peer_nic_path);
+        return it != pending.end() &&
+               it->second.result.wait_for(std::chrono::seconds(0)) ==
+                   std::future_status::ready;
+    }
+
+    static void reapCompletedHandshakes(WorkerPool &pool, int thread_id) {
+        pool.reapCompletedHandshakes(thread_id);
     }
 
     static bool waitForPollTs(WorkerPool &pool,
@@ -283,7 +306,8 @@ struct FakeRdmaPeer {
 
 void initFakePeer(FakeRdmaPeer &peer, const std::string &server_name,
                   const std::string &device_name,
-                  std::shared_ptr<InProcessRdmaTransport::Barrier> barrier) {
+                  std::shared_ptr<InProcessRdmaTransport::Barrier> barrier,
+                  size_t max_endpoints = 8) {
     peer.server_name = server_name;
     peer.device_name = device_name;
     peer.metadata = std::make_shared<TransferMetadata>(P2PHANDSHAKE);
@@ -299,7 +323,8 @@ void initFakePeer(FakeRdmaPeer &peer, const std::string &server_name,
 
     peer.context =
         std::make_shared<RdmaContext>(*peer.transport, peer.device_name);
-    RdmaContextTestPeer::bindFakeEndpointStore(*peer.context, &peer.cq);
+    RdmaContextTestPeer::bindFakeEndpointStore(*peer.context, &peer.cq,
+                                               max_endpoints);
     RdmaTransportTestPeer::addContext(*peer.transport, peer.context);
 
     peer.transport->local_context_ = peer.context.get();
@@ -548,6 +573,16 @@ TEST(RdmaEndpointLifecycleGateTest,
     active_a.get();
     active_b.get();
 
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while ((!peer_a.context->findEndpoint(a_to_b)->readyToSend() ||
+            !peer_b.context->findEndpoint(b_to_a)->readyToSend()) &&
+           std::chrono::steady_clock::now() < deadline) {
+        WorkerPoolTestPeer::performPostSend(*peer_a.worker_pool, 0);
+        WorkerPoolTestPeer::performPostSend(*peer_b.worker_pool, 0);
+        std::this_thread::yield();
+    }
+
     EXPECT_TRUE(peer_a.transport->lifecycleGateWasFree());
     EXPECT_TRUE(peer_b.transport->lifecycleGateWasFree());
 
@@ -560,9 +595,71 @@ TEST(RdmaEndpointLifecycleGateTest,
 
     WorkerPoolTestPeer::clearQueuedSlices(*peer_a.worker_pool);
     WorkerPoolTestPeer::clearQueuedSlices(*peer_b.worker_pool);
+    // Both in-process transports point directly at each other. Join both
+    // pools' outbound handshakes before either fake transport is destroyed.
+    peer_a.worker_pool.reset();
+    peer_b.worker_pool.reset();
 }
 
-TEST(RdmaEndpointLifecycleGateTest, ActiveHandshakeWaitDrainsOwnerCq) {
+TEST(RdmaEndpointLifecycleGateTest,
+     CompletedHandshakeForEvictedEndpointIsConsumedBeforeReplacementLookup) {
+    auto barrier = std::make_shared<InProcessRdmaTransport::Barrier>();
+    barrier->required_arrivals = 1;
+    FakeRdmaPeer sender;
+    FakeRdmaPeer target;
+
+    ASSERT_NO_FATAL_FAILURE(initFakePeer(sender, "rdma-capacity-a:10000",
+                                         "mlx5_capacity_a", barrier, 1));
+    ASSERT_NO_FATAL_FAILURE(initFakePeer(target, "rdma-capacity-b:10000",
+                                         "mlx5_capacity_b", barrier));
+    sender.transport->peer_ = target.transport.get();
+    target.transport->peer_ = sender.transport.get();
+
+    const std::string sender_to_target =
+        MakeNicPath(target.server_name, target.device_name);
+    const std::string target_to_sender =
+        MakeNicPath(sender.server_name, sender.device_name);
+    const std::string replacement_path =
+        MakeNicPath("rdma-capacity-c:10000", "mlx5_capacity_c");
+
+    ASSERT_NO_FATAL_FAILURE(installZeroQpEndpoint(sender, sender_to_target));
+    ASSERT_NO_FATAL_FAILURE(installZeroQpEndpoint(target, target_to_sender));
+
+    Transport::Slice slice;
+    Transport::TransferTask task;
+    queueHandshakeSlice(sender, sender_to_target, slice, task);
+    slice.rdma.max_retry_cnt = 0;
+    WorkerPoolTestPeer::performPostSend(*sender.worker_pool, 0);
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!WorkerPoolTestPeer::pendingHandshakeReady(*sender.worker_pool, 0,
+                                                      sender_to_target) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::yield();
+    }
+    ASSERT_TRUE(WorkerPoolTestPeer::pendingHandshakeReady(*sender.worker_pool,
+                                                          0, sender_to_target));
+
+    // The sender store has capacity one, so inserting this endpoint retires
+    // the endpoint whose handshake just completed.
+    ASSERT_NO_FATAL_FAILURE(installZeroQpEndpoint(sender, replacement_path));
+    auto replacement = sender.context->findEndpoint(replacement_path);
+    ASSERT_NE(replacement, nullptr);
+    ASSERT_EQ(sender.context->findEndpoint(sender_to_target), nullptr);
+
+    WorkerPoolTestPeer::performPostSend(*sender.worker_pool, 0);
+    EXPECT_EQ(WorkerPoolTestPeer::pendingHandshakeCount(*sender.worker_pool, 0),
+              0);
+    EXPECT_EQ(sender.context->findEndpoint(replacement_path), replacement);
+
+    WorkerPoolTestPeer::clearQueuedSlices(*sender.worker_pool);
+    sender.worker_pool.reset();
+    target.worker_pool.reset();
+}
+
+TEST(RdmaEndpointLifecycleGateTest,
+     ActiveHandshakePendingDoesNotBlockOwnerPostOrPoll) {
     auto barrier = std::make_shared<InProcessRdmaTransport::Barrier>();
     FakeRdmaPeer peer;
 
@@ -575,8 +672,8 @@ TEST(RdmaEndpointLifecycleGateTest, ActiveHandshakeWaitDrainsOwnerCq) {
     ASSERT_NO_FATAL_FAILURE(installZeroQpEndpoint(peer, peer_nic_path));
 
     // The fake CQ is not a real verbs object. Clearing the native pointer keeps
-    // the regression hardware-free while still proving the owner worker enters
-    // its CQ poll path during the blocked active handshake.
+    // the regression hardware-free while still proving the owner can enter its
+    // CQ poll path after scheduling a blocked active handshake.
     RdmaContextTestPeer::clearNativeCompletionQueue(*peer.context, 0);
     peer.context->cqOutstandingCount(0)->store(1, std::memory_order_relaxed);
 
@@ -596,20 +693,33 @@ TEST(RdmaEndpointLifecycleGateTest, ActiveHandshakeWaitDrainsOwnerCq) {
         }));
     }
 
-    EXPECT_TRUE(WorkerPoolTestPeer::waitForPollTs(*peer.worker_pool,
-                                                  std::chrono::seconds(5)));
+    const bool post_returned =
+        active.wait_for(std::chrono::seconds(1)) == std::future_status::ready;
+    EXPECT_TRUE(post_returned);
+    if (post_returned) active.get();
+    EXPECT_EQ(WorkerPoolTestPeer::performPollCq(*peer.worker_pool, 0), 0);
+    EXPECT_NE(WorkerPoolTestPeer::lastPollTs(*peer.worker_pool), 0);
 
     {
         std::lock_guard<std::mutex> lock(barrier->mutex);
         barrier->released = true;
     }
     barrier->cv.notify_all();
+    if (!post_returned) active.get();
 
-    ASSERT_EQ(active.wait_for(std::chrono::seconds(5)),
-              std::future_status::ready);
-    active.get();
-
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!WorkerPoolTestPeer::pendingHandshakeReady(*peer.worker_pool, 0,
+                                                      peer_nic_path) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::yield();
+    }
+    ASSERT_TRUE(WorkerPoolTestPeer::pendingHandshakeReady(*peer.worker_pool, 0,
+                                                          peer_nic_path));
     WorkerPoolTestPeer::clearQueuedSlices(*peer.worker_pool);
+    WorkerPoolTestPeer::reapCompletedHandshakes(*peer.worker_pool, 0);
+    EXPECT_EQ(WorkerPoolTestPeer::pendingHandshakeCount(*peer.worker_pool, 0),
+              0);
 }
 
 }  // namespace

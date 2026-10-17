@@ -125,58 +125,6 @@ static ActiveEndpointSetupExecutor &activeEndpointSetupExecutor() {
     return executor;
 }
 
-static ActiveEndpointSetupResult setupEndpointByActiveOutsideLifecycleGate(
-    RdmaContext &context, const std::string &peer_nic_path,
-    const std::shared_ptr<RdmaEndPoint> &endpoint,
-    std::unique_lock<std::mutex> &endpoint_lifecycle_lock,
-    const std::function<int()> &drain_cq_while_waiting) {
-    const bool had_lifecycle_gate = endpoint_lifecycle_lock.owns_lock();
-    if (had_lifecycle_gate) endpoint_lifecycle_lock.unlock();
-
-    // The owner worker also polls this peer's CQ. Keep it draining while the
-    // active handshake can block on TCP connect/read timeouts.
-    int ret = ERR_ENDPOINT;
-    try {
-        auto setup_future = activeEndpointSetupExecutor().submit(endpoint);
-        auto wait_period = std::chrono::milliseconds(1);
-        constexpr auto kMaxWaitPeriod = std::chrono::milliseconds(25);
-        while (setup_future.wait_for(std::chrono::milliseconds(0)) !=
-               std::future_status::ready) {
-            bool made_progress = false;
-            while (setup_future.wait_for(std::chrono::milliseconds(0)) !=
-                   std::future_status::ready) {
-                const int drained = drain_cq_while_waiting();
-                if (drained <= 0) break;
-                made_progress = true;
-            }
-            if (setup_future.wait_for(std::chrono::milliseconds(0)) ==
-                std::future_status::ready) {
-                break;
-            }
-            if (made_progress) {
-                wait_period = std::chrono::milliseconds(1);
-            } else {
-                if (setup_future.wait_for(wait_period) ==
-                    std::future_status::ready) {
-                    break;
-                }
-                wait_period = std::min(wait_period * 2, kMaxWaitPeriod);
-            }
-        }
-        ret = setup_future.get();
-    } catch (const std::exception &ex) {
-        LOG(ERROR) << "Worker: Active endpoint setup threw: " << ex.what();
-    } catch (...) {
-        LOG(ERROR)
-            << "Worker: Active endpoint setup threw an unknown exception";
-    }
-
-    if (had_lifecycle_gate) endpoint_lifecycle_lock.lock();
-    auto current_endpoint = context.findEndpoint(peer_nic_path);
-    return {ret, current_endpoint.get() == endpoint.get() &&
-                     endpoint->active() && !endpoint->retired()};
-}
-
 static int selectPeerDevice(RdmaTransport::SegmentDesc *peer_segment_desc,
                             uint64_t offset, size_t length,
                             const std::string &local_hca, int &buffer_id,
@@ -228,6 +176,7 @@ WorkerPool::WorkerPool(RdmaContext &context, int numa_socket_id)
     : context_(context),
       numa_socket_id_(numa_socket_id),
       worker_count_(context.transferWorkerCount()),
+      pending_handshakes_(worker_count_),
       workers_running_(true),
       parked_worker_count_(0),
       redispatch_counter_(0),
@@ -290,6 +239,79 @@ WorkerPool::~WorkerPool() {
         cond_var_.notify_all();
         workers_running_.store(false);
         for (auto &entry : worker_thread_) entry.join();
+    }
+
+    // The executor is process-global, so make sure tasks submitted by this
+    // pool finish before their endpoints and context are destroyed.
+    for (auto &pending : pending_handshakes_)
+        for (auto &entry : pending) entry.second.result.wait();
+}
+
+std::optional<int> WorkerPool::progressHandshake(
+    int thread_id, const std::string &peer_nic_path,
+    const std::shared_ptr<RdmaEndPoint> &endpoint) {
+    auto &pending = pending_handshakes_[thread_id];
+    auto it = pending.find(peer_nic_path);
+    if (it != pending.end() && it->second.endpoint != endpoint) {
+        // The executor keeps the old task and its captured endpoint alive
+        // until the task completes.
+        pending.erase(it);
+        it = pending.end();
+    }
+
+    if (it == pending.end()) {
+        auto result = activeEndpointSetupExecutor().submit(endpoint);
+        pending.emplace(peer_nic_path,
+                        PendingHandshake{endpoint, std::move(result)});
+        return std::nullopt;
+    }
+
+    if (it->second.result.wait_for(std::chrono::seconds(0)) !=
+        std::future_status::ready)
+        return std::nullopt;
+
+    int ret = ERR_ENDPOINT;
+    try {
+        ret = it->second.result.get();
+    } catch (const std::exception &ex) {
+        LOG(ERROR) << "Worker: Active endpoint setup threw: " << ex.what();
+    } catch (...) {
+        LOG(ERROR)
+            << "Worker: Active endpoint setup threw an unknown exception";
+    }
+    pending.erase(it);
+    return ret;
+}
+
+void WorkerPool::reapCompletedHandshakes(int thread_id) {
+    auto &pending = pending_handshakes_[thread_id];
+    if (pending.empty()) return;
+    auto &local_queue = collective_slice_queue_[thread_id];
+    std::lock_guard<std::mutex> lock(worker_slice_queue_lock_[thread_id]);
+    auto &shared_queue = worker_slice_queue_[thread_id];
+    for (auto it = pending.begin(); it != pending.end();) {
+        auto local_it = local_queue.find(it->first);
+        auto shared_it = shared_queue.find(it->first);
+        const bool has_queued_slices =
+            (local_it != local_queue.end() && !local_it->second.empty()) ||
+            (shared_it != shared_queue.end() && !shared_it->second.empty());
+        if (has_queued_slices ||
+            it->second.result.wait_for(std::chrono::seconds(0)) !=
+                std::future_status::ready) {
+            ++it;
+            continue;
+        }
+
+        try {
+            it->second.result.get();
+        } catch (const std::exception &ex) {
+            LOG(ERROR) << "Worker: Abandoned active endpoint setup threw: "
+                       << ex.what();
+        } catch (...) {
+            LOG(ERROR) << "Worker: Abandoned active endpoint setup threw an "
+                          "unknown exception";
+        }
+        it = pending.erase(it);
     }
 }
 
@@ -590,6 +612,8 @@ void WorkerPool::performPostSend(int thread_id) {
         worker_slice_queue_[thread_id].clear();
     }
 
+    auto &pending = pending_handshakes_[thread_id];
+
     // If this local RNIC is inactive/unhealthy, the remote rail is not the
     // problem. Move queued work to another local RNIC while preserving the
     // already selected peer rail.
@@ -647,36 +671,62 @@ void WorkerPool::performPostSend(int thread_id) {
             entry.second.clear();
             continue;
         }
+        auto pending_it = pending.find(entry.first);
+        if (pending_it != pending.end() &&
+            pending_it->second.result.wait_for(std::chrono::seconds(0)) !=
+                std::future_status::ready) {
+            // Do not repeatedly take the lifecycle gate while the RPC is in
+            // flight. Besides avoiding needless contention, this keeps the
+            // gate continuously available to simultaneous passive setup.
+            continue;
+        }
         auto endpoint_lifecycle_lock =
             context_.lockEndpointLifecycle(entry.first);
+        std::shared_ptr<RdmaEndPoint> endpoint;
+        std::optional<int> handshake_result;
+        if (pending_it != pending.end()) {
+            // Consume the result for the endpoint that actually performed the
+            // handshake before endpoint() can insert a replacement and evict
+            // another completed setup from the bounded endpoint store.
+            endpoint = pending_it->second.endpoint;
+            handshake_result =
+                progressHandshake(thread_id, entry.first, endpoint);
+        } else {
 #ifdef CONFIG_CACHE_ENDPOINT
-        auto &endpoint = endpoint_map[entry.first];
-        if (endpoint == nullptr || !endpoint->active())
+            auto &cached_endpoint = endpoint_map[entry.first];
+            if (cached_endpoint == nullptr || !cached_endpoint->active())
+                cached_endpoint = context_.endpoint(
+                    entry.first, cqIndexForPostingThread(thread_id));
+            endpoint = cached_endpoint;
+#else
             endpoint = context_.endpoint(entry.first,
                                          cqIndexForPostingThread(thread_id));
-#else
-        auto endpoint =
-            context_.endpoint(entry.first, cqIndexForPostingThread(thread_id));
 #endif
+        }
         if (!endpoint) {
             for (auto &slice : entry.second) failed_slice_list.push_back(slice);
             entry.second.clear();
             continue;
         }
-        if (!endpoint->connected()) {
-            auto setup_result = setupEndpointByActiveOutsideLifecycleGate(
-                context_, entry.first, endpoint, endpoint_lifecycle_lock,
-                [this, thread_id] {
-                    if (!hasOutstandingCq(thread_id)) return 0;
-                    return performPollCq(thread_id, true);
-                });
+        if (!handshake_result && !endpoint->connected()) {
+            // Neither the active RPC nor its wait may hold this gate: passive
+            // setup needs it to make simultaneous-open progress.
+            endpoint_lifecycle_lock.unlock();
+            progressHandshake(thread_id, entry.first, endpoint);
+            continue;
+        }
+        if (handshake_result) {
+            auto setup_result = ActiveEndpointSetupResult{
+                *handshake_result,
+                context_.findEndpoint(entry.first) == endpoint &&
+                    endpoint->active() && !endpoint->retired()};
             if (!setup_result.endpoint_current) {
                 LOG(WARNING)
                     << "Worker: Endpoint changed while active handshake was "
                        "outstanding: "
                     << entry.first << ", retrying queued slices";
 #ifdef CONFIG_CACHE_ENDPOINT
-                endpoint.reset();
+                endpoint_map[entry.first].reset();
 #endif
                 for (auto &slice : entry.second)
                     failed_slice_list.push_back(slice);
@@ -1217,6 +1267,7 @@ void WorkerPool::transferWorker(int thread_id) {
         globalConfig().rdma_worker_idle_spin_us * 1000;
     uint64_t last_wait_ts = getCurrentTimeInNano();
     while (workers_running_.load(std::memory_order_relaxed)) {
+        reapCompletedHandshakes(thread_id);
         auto processed_slice_count =
             processed_slice_count_.load(std::memory_order_relaxed);
         auto submitted_slice_count =
