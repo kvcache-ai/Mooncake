@@ -19,8 +19,10 @@
 #include <cuda_runtime.h>
 #include "tent/common/cuda_fabric_compat.h"
 
+#include <atomic>
 #include <functional>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <queue>
 #include <string>
@@ -34,12 +36,31 @@
 namespace mooncake {
 namespace tent {
 
+// A peer buffer imported into this process. Identified by the peer's base
+// address AND the mnnvl_handle it was imported from: the peer may publish a
+// new allocation at the same address (free + allocate, or a restart), and a
+// mapping of the old allocation must then not be served again.
+struct MnnvlMappingEntry {
+    void *mnnvl_addr = nullptr;  // local VA the import is mapped at
+    uint64_t length = 0;         // mapped extent (the peer's BufferDesc length)
+    std::string mnnvl_handle;    // handle the mapping was imported from
+    // Tasks using this mapping. A retired entry is unmapped only when this
+    // drops to zero, so an in-flight copy never races with the teardown.
+    std::atomic<int> pins{0};
+    // Set (under relocate_lock_) once the entry left relocate_map_.
+    bool stale = false;
+};
+
 struct MnnvlTask {
     Request request;
     volatile TransferStatusEnum status_word;
     volatile size_t transferred_bytes;
     uint64_t target_addr = 0;
     cudaEvent_t completion_event = nullptr;
+    // Mapping that target_addr points into (remote targets only). Pinned at
+    // submit, released when the task reaches a terminal state or the batch
+    // is freed.
+    std::shared_ptr<MnnvlMappingEntry> mapping;
 };
 
 struct MnnvlSubBatch : public Transport::SubBatch {
@@ -100,8 +121,62 @@ class MnnvlTransport : public Transport {
 
     void *createSharedMemory(const std::string &path, size_t size);
 
+    using OpenedMnnvlEntry = MnnvlMappingEntry;
+    using EntryRef = std::shared_ptr<OpenedMnnvlEntry>;
+    using HashMap =
+        std::unordered_map<SegmentID, std::unordered_map<uint64_t, EntryRef>>;
+
+    // Translates a peer address into this process. The cached mapping is
+    // used only if its mnnvl_handle matches the peer's current descriptor;
+    // otherwise the old mapping is retired and the new allocation imported.
+    // With `pinned` set, the resolved entry is pinned and handed back; the
+    // caller must unpin() it once the transfer is done. Without it the
+    // returned address is only safe while no other thread can retire the
+    // mapping (single-threaded tests); real callers always pin.
     Status relocateSharedMemoryAddress(uint64_t &dest_addr, uint64_t length,
-                                       uint64_t target_id);
+                                       uint64_t target_id,
+                                       EntryRef *pinned = nullptr);
+
+    // One resolution pass; `lost_race` is set when another thread published
+    // a different generation of the buffer while this one was importing.
+    Status relocateOnce(uint64_t &dest_addr, uint64_t length,
+                        uint64_t target_id, EntryRef *pinned, bool &lost_race);
+
+    // True if `entry` was imported from the allocation `mnnvl_handle` names.
+    static bool sameGeneration(const OpenedMnnvlEntry &entry,
+                               const std::string &mnnvl_handle);
+
+    // Drops one pin; a retired entry whose last pin is released is unmapped.
+    void unpin(EntryRef &entry);
+
+    // Imports `mnnvl_handle` and maps it (reserve, map, set access). Nothing
+    // is left behind on failure.
+    Status importMapping(uint64_t peer_addr, uint64_t length,
+                         const std::string &mnnvl_handle, EntryRef &entry);
+
+    // Marks the entry at `slot` stale and removes it from relocate_map_
+    // (caller holds the write lock; both iterators are invalidated); retired
+    // entries with no pins are appended to `to_release`.
+    void retireLocked(HashMap::iterator target,
+                      HashMap::mapped_type::iterator slot,
+                      std::vector<EntryRef> &to_release);
+
+    // Retires every mapping of `target_id` that `segment` no longer
+    // publishes: the address is gone, or carries a different handle. Run
+    // only when `segment` is authoritative (the local snapshot, or a
+    // descriptor that was just refetched), so a peer that restarted onto a
+    // different address does not leave its old mappings behind until
+    // uninstall(). Caller holds the write lock.
+    void retireUnpublishedLocked(SegmentID target_id,
+                                 const SegmentDesc &segment,
+                                 std::vector<EntryRef> &to_release);
+
+    // Moves retired entries whose pins dropped to zero into `to_release`
+    // (caller holds the write lock).
+    void collectReleasableLocked(std::vector<EntryRef> &to_release);
+
+    // cuMemUnmap + cuMemAddressFree. Never called under relocate_lock_.
+    static void releaseMappings(std::vector<EntryRef> &entries);
 
     Status setPeerAccess();
 
@@ -112,18 +187,11 @@ class MnnvlTransport : public Transport {
     std::shared_ptr<ControlService> metadata_;
     CudaPlatform *platform_;
 
-    struct OpenedMnnvlEntry {
-        void *mnnvl_addr;
-        uint64_t length;
-        int cuda_id;
-    };
-
-    using HashMap =
-        std::unordered_map<SegmentID,
-                           std::unordered_map<uint64_t, OpenedMnnvlEntry>>;
-
     RWSpinlock relocate_lock_;
-    HashMap relocate_map_;
+    HashMap relocate_map_;  // live mappings: target -> peer base addr -> entry
+    // Mappings replaced or uninstalled while tasks still pin them; unmapped
+    // as soon as the last pin drops.
+    std::vector<EntryRef> retired_;
     std::shared_ptr<Config> conf_;
 
     std::string machine_id_;

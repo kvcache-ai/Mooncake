@@ -353,9 +353,9 @@ endif()
 # connected NVLink domains; on a box whose GPUs lack P2P to each other, pin
 # CUDA_VISIBLE_DEVICES to one card.
 if(USE_CUDA)
+  # Own main(): the binary doubles as the peer process (see kPeerEnv).
   add_executable(tent_mnnvl_transport_test mnnvl_transport_test.cpp)
-  target_link_libraries(tent_mnnvl_transport_test PRIVATE gtest gtest_main
-                                                          tent_link_group)
+  target_link_libraries(tent_mnnvl_transport_test PRIVATE gtest tent_link_group)
   target_include_directories(tent_mnnvl_transport_test
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 endif()
