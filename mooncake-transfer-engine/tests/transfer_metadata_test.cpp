@@ -28,6 +28,7 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <cstdint>
 #include <cstdlib>
 #include <mutex>
 #include <sstream>
@@ -122,6 +123,294 @@ TEST_F(TransferMetadataTest, LocalMemoryBufferTest) {
     re = metadata_client->removeLocalSegment("test_local_segment");
     ASSERT_EQ(re, 0);
 }
+
+#ifdef ENABLE_MULTI_PROTOCOL
+// Regression for issue #4709: an address-only removal must not guess which
+// transport owns a descriptor when more than one protocol shares the address.
+TEST(TransferMetadataRemovalTest, LegacyRemovalRejectsAmbiguousAddress) {
+    TransferMetadata metadata(P2PHANDSHAKE);
+    auto segment = std::make_shared<TransferMetadata::SegmentDesc>();
+    segment->name = "shared-address-test";
+    segment->protocol = "tcp,rdma";
+    segment->cxl_base_addr = 0;
+    ASSERT_EQ(metadata.addLocalSegment(LOCAL_SEGMENT_ID, segment->name,
+                                       std::move(segment)),
+              0);
+
+    constexpr uintptr_t kAddr = 0x500000;
+    TransferMetadata::BufferDesc tcp{};
+    tcp.name = "cpu:0";
+    tcp.addr = kAddr;
+    tcp.length = 4096;
+    tcp.protocol = "tcp";
+    auto rdma = tcp;
+    rdma.protocol = "rdma";
+
+    ASSERT_EQ(metadata.addLocalMemoryBuffer(tcp, false), 0);
+    ASSERT_EQ(metadata.addLocalMemoryBuffer(rdma, false), 0);
+    auto original = metadata.getSegmentDescByID(LOCAL_SEGMENT_ID);
+    ASSERT_NE(original, nullptr);
+    ASSERT_EQ(original->buffers.size(), 2U);
+
+    EXPECT_EQ(metadata.removeLocalMemoryBuffer(reinterpret_cast<void *>(kAddr),
+                                               false),
+              ERR_INVALID_ARGUMENT);
+    auto after = metadata.getSegmentDescByID(LOCAL_SEGMENT_ID);
+    ASSERT_NE(after, nullptr);
+    ASSERT_EQ(after->buffers.size(), 2U);
+    EXPECT_EQ(after->buffers[0].protocol, "tcp");
+    EXPECT_EQ(after->buffers[1].protocol, "rdma");
+}
+
+TEST(TransferMetadataRemovalTest, ExplicitProtocolRemovesOnlyRequestedEntry) {
+    TransferMetadata metadata(P2PHANDSHAKE);
+    auto segment = std::make_shared<TransferMetadata::SegmentDesc>();
+    segment->name = "specific-protocol-test";
+    segment->protocol = "tcp,rdma";
+    segment->cxl_base_addr = 0;
+    ASSERT_EQ(metadata.addLocalSegment(LOCAL_SEGMENT_ID, segment->name,
+                                       std::move(segment)),
+              0);
+
+    constexpr uintptr_t kAddr = 0x600000;
+    TransferMetadata::BufferDesc tcp{};
+    tcp.name = "cpu:0";
+    tcp.addr = kAddr;
+    tcp.length = 4096;
+    tcp.protocol = "tcp";
+    auto rdma = tcp;
+    rdma.protocol = "rdma";
+
+    // TCP precedes RDMA; removing RDMA must not accidentally erase TCP.
+    ASSERT_EQ(metadata.addLocalMemoryBuffer(tcp, false), 0);
+    ASSERT_EQ(metadata.addLocalMemoryBuffer(rdma, false), 0);
+    auto *address = reinterpret_cast<void *>(kAddr);
+    EXPECT_EQ(metadata.removeLocalMemoryBuffer(address, false, "rdma"), 0);
+    auto current = metadata.getSegmentDescByID(LOCAL_SEGMENT_ID);
+    ASSERT_NE(current, nullptr);
+    ASSERT_EQ(current->buffers.size(), 1U);
+    EXPECT_EQ(current->buffers[0].protocol, "tcp");
+
+    EXPECT_EQ(metadata.removeLocalMemoryBuffer(address, false, "tcp"), 0);
+    EXPECT_TRUE(metadata.getSegmentDescByID(LOCAL_SEGMENT_ID)->buffers.empty());
+
+    // Also verify the opposite ordering so selection is not position-based.
+    ASSERT_EQ(metadata.addLocalMemoryBuffer(rdma, false), 0);
+    ASSERT_EQ(metadata.addLocalMemoryBuffer(tcp, false), 0);
+    EXPECT_EQ(metadata.removeLocalMemoryBuffer(address, false, "tcp"), 0);
+    current = metadata.getSegmentDescByID(LOCAL_SEGMENT_ID);
+    ASSERT_EQ(current->buffers.size(), 1U);
+    EXPECT_EQ(current->buffers[0].protocol, "rdma");
+}
+
+TEST(TransferMetadataRemovalTest, MissingProtocolNeverDeletesOtherProtocol) {
+    TransferMetadata metadata(P2PHANDSHAKE);
+    auto segment = std::make_shared<TransferMetadata::SegmentDesc>();
+    segment->name = "missing-protocol-test";
+    segment->protocol = "tcp,rdma";
+    segment->cxl_base_addr = 0;
+    ASSERT_EQ(metadata.addLocalSegment(LOCAL_SEGMENT_ID, segment->name,
+                                       std::move(segment)),
+              0);
+
+    constexpr uintptr_t kAddr = 0x700000;
+    TransferMetadata::BufferDesc tcp{};
+    tcp.name = "cpu:0";
+    tcp.addr = kAddr;
+    tcp.length = 4096;
+    tcp.protocol = "tcp";
+    ASSERT_EQ(metadata.addLocalMemoryBuffer(tcp, false), 0);
+
+    EXPECT_EQ(metadata.removeLocalMemoryBuffer(reinterpret_cast<void *>(kAddr),
+                                               false, "rdma"),
+              ERR_ADDRESS_NOT_REGISTERED);
+    auto current = metadata.getSegmentDescByID(LOCAL_SEGMENT_ID);
+    ASSERT_NE(current, nullptr);
+    ASSERT_EQ(current->buffers.size(), 1U);
+    EXPECT_EQ(current->buffers[0].protocol, "tcp");
+
+    // An unambiguous address-only call remains backwards compatible.
+    EXPECT_EQ(metadata.removeLocalMemoryBuffer(reinterpret_cast<void *>(kAddr),
+                                               false),
+              0);
+    EXPECT_TRUE(metadata.getSegmentDescByID(LOCAL_SEGMENT_ID)->buffers.empty());
+}
+
+TEST(TransferMetadataRemovalTest, LegacyRemovalSupportsUniqueUntaggedBuffer) {
+    // Ascend/Barex and older callers may not populate BufferDesc.protocol.
+    TransferMetadata metadata(P2PHANDSHAKE);
+    auto segment = std::make_shared<TransferMetadata::SegmentDesc>();
+    segment->name = "untagged-buffer-test";
+    segment->protocol = "ascend";
+    segment->cxl_base_addr = 0;
+    ASSERT_EQ(metadata.addLocalSegment(LOCAL_SEGMENT_ID, segment->name,
+                                       std::move(segment)),
+              0);
+
+    constexpr uintptr_t kAddr = 0xa00000;
+    TransferMetadata::BufferDesc untagged{};
+    untagged.name = "npu:0";
+    untagged.addr = kAddr;
+    untagged.length = 4096;
+    ASSERT_TRUE(untagged.protocol.empty());
+    ASSERT_EQ(metadata.addLocalMemoryBuffer(untagged, false), 0);
+
+    auto *address = reinterpret_cast<void *>(kAddr);
+    EXPECT_EQ(metadata.removeLocalMemoryBuffer(address, false), 0);
+    EXPECT_TRUE(metadata.getSegmentDescByID(LOCAL_SEGMENT_ID)->buffers.empty());
+}
+
+TEST(TransferMetadataRemovalTest, DifferentAddressRemainsUntouched) {
+    TransferMetadata metadata(P2PHANDSHAKE);
+    auto segment = std::make_shared<TransferMetadata::SegmentDesc>();
+    segment->name = "other-address-test";
+    segment->protocol = "tcp,rdma";
+    segment->cxl_base_addr = 0;
+    ASSERT_EQ(metadata.addLocalSegment(LOCAL_SEGMENT_ID, segment->name,
+                                       std::move(segment)),
+              0);
+
+    constexpr uintptr_t kFirst = 0xb00000;
+    constexpr uintptr_t kSecond = 0xb01000;
+    TransferMetadata::BufferDesc first{};
+    first.name = "cpu:0";
+    first.addr = kFirst;
+    first.length = 4096;
+    first.protocol = "tcp";
+    auto second = first;
+    second.addr = kSecond;
+    second.protocol = "rdma";
+
+    ASSERT_EQ(metadata.addLocalMemoryBuffer(first, false), 0);
+    ASSERT_EQ(metadata.addLocalMemoryBuffer(second, false), 0);
+    EXPECT_EQ(metadata.removeLocalMemoryBuffer(reinterpret_cast<void *>(kFirst),
+                                               false, "tcp"),
+              0);
+    auto current = metadata.getSegmentDescByID(LOCAL_SEGMENT_ID);
+    ASSERT_NE(current, nullptr);
+    ASSERT_EQ(current->buffers.size(), 1U);
+    EXPECT_EQ(current->buffers[0].addr, kSecond);
+    EXPECT_EQ(current->buffers[0].protocol, "rdma");
+}
+
+TEST(TransferMetadataRemovalTest, DuplicateProtocolRejectsAmbiguousRemoval) {
+    TransferMetadata metadata(P2PHANDSHAKE);
+    auto segment = std::make_shared<TransferMetadata::SegmentDesc>();
+    segment->name = "duplicate-protocol-test";
+    segment->protocol = "tcp";
+    segment->cxl_base_addr = 0;
+    ASSERT_EQ(metadata.addLocalSegment(LOCAL_SEGMENT_ID, segment->name,
+                                       std::move(segment)),
+              0);
+
+    constexpr uintptr_t kAddr = 0x800000;
+    TransferMetadata::BufferDesc tcp{};
+    tcp.name = "cpu:0";
+    tcp.addr = kAddr;
+    tcp.length = 4096;
+    tcp.protocol = "tcp";
+    ASSERT_EQ(metadata.addLocalMemoryBuffer(tcp, false), 0);
+    ASSERT_EQ(metadata.addLocalMemoryBuffer(tcp, false), 0);
+
+    EXPECT_EQ(metadata.removeLocalMemoryBuffer(reinterpret_cast<void *>(kAddr),
+                                               false, "tcp"),
+              ERR_INVALID_ARGUMENT);
+    EXPECT_EQ(metadata.getSegmentDescByID(LOCAL_SEGMENT_ID)->buffers.size(),
+              2U);
+}
+
+#ifdef USE_CXL
+TEST(TransferMetadataRemovalTest, CxlOffsetRemovalPreservesTcpAddress) {
+    TransferMetadata metadata(P2PHANDSHAKE);
+    auto segment = std::make_shared<TransferMetadata::SegmentDesc>();
+    segment->name = "cxl-tcp-test";
+    segment->protocol = "cxl,tcp";
+    constexpr uintptr_t kBase = 0x900000;
+    constexpr uintptr_t kOffset = 0x1000;
+    segment->cxl_base_addr = kBase;
+    ASSERT_EQ(metadata.addLocalSegment(LOCAL_SEGMENT_ID, segment->name,
+                                       std::move(segment)),
+              0);
+
+    TransferMetadata::BufferDesc cxl{};
+    cxl.name = "cxl:0";
+    cxl.protocol = "cxl";
+    cxl.offset = kOffset;
+    cxl.length = 4096;
+    TransferMetadata::BufferDesc tcp{};
+    tcp.name = "cpu:0";
+    tcp.protocol = "tcp";
+    tcp.addr = kBase + kOffset;
+    tcp.length = 4096;
+    ASSERT_EQ(metadata.addLocalMemoryBuffer(tcp, false), 0);
+    ASSERT_EQ(metadata.addLocalMemoryBuffer(cxl, false), 0);
+
+    auto *address = reinterpret_cast<void *>(kBase + kOffset);
+    EXPECT_EQ(metadata.removeLocalMemoryBuffer(address, false, "cxl"), 0);
+    auto current = metadata.getSegmentDescByID(LOCAL_SEGMENT_ID);
+    ASSERT_NE(current, nullptr);
+    ASSERT_EQ(current->buffers.size(), 1U);
+    EXPECT_EQ(current->buffers[0].protocol, "tcp");
+}
+
+TEST(TransferMetadataRemovalTest, NonCxlOffsetCannotAliasRealAddress) {
+    // A TCP descriptor's uninitialized/irrelevant offset must never act as
+    // a second address merely because the build enables CXL support.
+    TransferMetadata metadata(P2PHANDSHAKE);
+    auto segment = std::make_shared<TransferMetadata::SegmentDesc>();
+    segment->name = "non-cxl-offset-test";
+    segment->protocol = "tcp";
+    constexpr uintptr_t kBase = 0xc00000;
+    segment->cxl_base_addr = kBase;
+    ASSERT_EQ(metadata.addLocalSegment(LOCAL_SEGMENT_ID, segment->name,
+                                       std::move(segment)),
+              0);
+
+    TransferMetadata::BufferDesc tcp{};
+    tcp.name = "cpu:0";
+    tcp.protocol = "tcp";
+    tcp.addr = 0xd00000;
+    tcp.offset = 0x1000;
+    tcp.length = 4096;
+    ASSERT_EQ(metadata.addLocalMemoryBuffer(tcp, false), 0);
+    EXPECT_EQ(metadata.removeLocalMemoryBuffer(
+                  reinterpret_cast<void *>(kBase + 0x1000), false, "tcp"),
+              ERR_ADDRESS_NOT_REGISTERED);
+    EXPECT_EQ(metadata.getSegmentDescByID(LOCAL_SEGMENT_ID)->buffers.size(),
+              1U);
+}
+#endif  // USE_CXL
+
+TEST(TransferMetadataRemovalTest, MacaRdmaSharedAddressRemoval) {
+    TransferMetadata metadata(P2PHANDSHAKE);
+    auto segment = std::make_shared<TransferMetadata::SegmentDesc>();
+    segment->name = "maca-rdma-test";
+    segment->protocol = "maca,rdma";
+    segment->cxl_base_addr = 0;
+    ASSERT_EQ(metadata.addLocalSegment(LOCAL_SEGMENT_ID, segment->name,
+                                       std::move(segment)),
+              0);
+
+    constexpr uintptr_t kAddr = 0xe00000;
+    TransferMetadata::BufferDesc maca{};
+    maca.name = "maca:0";
+    maca.addr = kAddr;
+    maca.length = 4096;
+    maca.protocol = "maca";
+    auto rdma = maca;
+    rdma.protocol = "rdma";
+
+    ASSERT_EQ(metadata.addLocalMemoryBuffer(maca, false), 0);
+    ASSERT_EQ(metadata.addLocalMemoryBuffer(rdma, false), 0);
+    EXPECT_EQ(metadata.removeLocalMemoryBuffer(reinterpret_cast<void *>(kAddr),
+                                               false, "rdma"),
+              0);
+    auto current = metadata.getSegmentDescByID(LOCAL_SEGMENT_ID);
+    ASSERT_NE(current, nullptr);
+    ASSERT_EQ(current->buffers.size(), 1U);
+    EXPECT_EQ(current->buffers[0].protocol, "maca");
+}
+#endif  // ENABLE_MULTI_PROTOCOL
 
 TEST_F(TransferMetadataTest, NcclMetadataAndHandshakePayloadRoundTrip) {
     TransferMetadata server(P2PHANDSHAKE);
