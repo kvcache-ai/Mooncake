@@ -3817,7 +3817,7 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
         chunk_object_count, expected_max_replica_id, legacy_weight_metadata);
 
     lifecycle_state_.store(result.has_value() ? RestoreLifecycleState::kReady
-                                             : RestoreLifecycleState::kFailed,
+                                              : RestoreLifecycleState::kFailed,
                            std::memory_order_release);
     LOG(INFO) << "Restore lifecycle -> "
               << RestoreLifecycleStateToString(lifecycle_state_.load());
