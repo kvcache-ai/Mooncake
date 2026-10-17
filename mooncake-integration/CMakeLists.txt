@@ -146,8 +146,8 @@ endif()
 
 if(WITH_STORE)
   if(USE_CUDA)
-    add_subdirectory(../mooncake-store/engram
-                     ${CMAKE_BINARY_DIR}/mooncake-store/engram)
+    add_subdirectory(../mooncake-store/src/engram
+                     ${CMAKE_BINARY_DIR}/mooncake-store/src/engram)
   endif()
   pybind11_add_module(
     store ${SOURCES} ${CACHE_ALLOCATOR_SOURCES} store/store_py.cpp
