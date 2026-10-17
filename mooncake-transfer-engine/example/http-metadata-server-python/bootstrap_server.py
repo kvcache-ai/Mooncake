@@ -2,6 +2,73 @@ from enum import Enum
 from aiohttp import web
 import threading
 import asyncio
+import json
+
+# Path-segment marker shared with the production http_metadata_server.py and
+# the C++ client (transfer_metadata.cpp). We require the literal path segment
+# "rpc_meta" to avoid misclassifying any other key that just happens to
+# contain the substring "rpc_meta".
+_RPC_META_SEGMENT = "rpc_meta"
+
+
+def _is_rpc_meta_key(key: str) -> bool:
+    parts = [p for p in key.split("/") if p]
+    return _RPC_META_SEGMENT in parts
+
+
+def _field_value(obj, *names):
+    if isinstance(obj, dict):
+        for name in names:
+            if name in obj and obj[name] is not None:
+                return obj[name]
+    return None
+
+
+def _put_rpc_meta_is_valid(new_payload: bytes, existing_payload: bytes):
+    """(ok, reason) for an rpc_meta PUT against an existing entry.
+
+    Accepts identical bytes (idempotent), rejects a rollback of
+    metadata_version or a conflicting identity change, and otherwise allows
+    a legitimate version bump matching TransferMetadata::rePublishRpcMetaEntry.
+    """
+    if new_payload == existing_payload:
+        return True, "unchanged"
+    try:
+        new_obj = json.loads(new_payload)
+        old_obj = json.loads(existing_payload)
+    except (ValueError, TypeError):
+        return False, "payload-not-json"
+    new_version = _field_value(new_obj, "metadata_version")
+    old_version = _field_value(old_obj, "metadata_version")
+    if (
+        isinstance(new_version, int)
+        and isinstance(old_version, int)
+        and new_version < old_version
+    ):
+        return False, "metadata_version-rollback"
+    if (
+        isinstance(new_version, int)
+        and isinstance(old_version, int)
+        and new_version == old_version
+        and new_obj != old_obj
+    ):
+        return False, "metadata_version-conflict"
+    new_host = _field_value(new_obj, "ip_or_host_name")
+    old_host = _field_value(old_obj, "ip_or_host_name")
+    new_port = _field_value(new_obj, "rpc_port")
+    old_port = _field_value(old_obj, "rpc_port")
+    if (
+        new_host is not None
+        and old_host is not None
+        and new_host != old_host
+    ) or (
+        new_port is not None
+        and old_port is not None
+        and int(new_port) != int(old_port)
+    ):
+        return False, "identity-conflict"
+    return True, "version-bumped"
+
 
 class KVPoll(Enum):
     Failed = 0
@@ -10,6 +77,7 @@ class KVPoll(Enum):
     Transferring = 3
     Success = 4
 
+
 class KVBootstrapServer:
     def __init__(self, port: int):
         self.port = port
@@ -17,7 +85,7 @@ class KVBootstrapServer:
         self.store = dict()
         self.lock = asyncio.Lock()
         self._setup_routes()
-    
+
     def run(self):
         self.thread = threading.Thread(target=self._run_server, daemon=True)
         self.thread.start()
@@ -49,9 +117,26 @@ class KVBootstrapServer:
     async def _handle_put(self, key, request):
         data = await request.read()
         async with self.lock:
-            if key.find("rpc_meta") != -1 and key in self.store:
-                return web.Response(text='Duplicate rpc_meta key not allowed', status=400,
-                                  content_type='application/json')
+            if _is_rpc_meta_key(key) and key in self.store:
+                ok, reason = _put_rpc_meta_is_valid(data, self.store[key])
+                if not ok:
+                    return web.Response(
+                        text=f'rpc_meta conflict: {reason}',
+                        status=400,
+                        content_type='application/json',
+                    )
+                if reason == 'unchanged':
+                    return web.Response(
+                        text='metadata unchanged',
+                        status=200,
+                        content_type='application/json',
+                    )
+                self.store[key] = data
+                return web.Response(
+                    text='metadata republished',
+                    status=200,
+                    content_type='application/json',
+                )
             self.store[key] = data
         return web.Response(text='metadata updated', status=200,
                           content_type='application/json')
@@ -70,7 +155,7 @@ class KVBootstrapServer:
             self._loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self._loop)
             
-            self._runner = web.AppRunner(self.app)
+            self._runner = web.AppRunner(self._loop)
             self._loop.run_until_complete(self._runner.setup())
             
             site = web.TCPSite(self._runner, port=self.port)
