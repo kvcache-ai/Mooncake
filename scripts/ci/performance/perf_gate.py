@@ -37,20 +37,49 @@ def load_policy(path):
         "invalid CPU count",
     )
     require(number(policy["timeout_seconds"]), "invalid timeout")
-    require(
-        type(policy["arguments"]["iterations"]) is int
-        and policy["arguments"]["iterations"] > 0,
-        "invalid operation count",
-    )
+    rdma = policy.get("suite", "cpu") == "rdma"
+    require(policy.get("suite", "cpu") in ("cpu", "rdma"), "unknown suite")
+    if not rdma:
+        require(
+            type(policy["arguments"]["iterations"]) is int
+            and policy["arguments"]["iterations"] > 0,
+            "invalid operation count",
+        )
+    else:
+        for key in ("duration", "total_buffer_size"):
+            require(
+                type(policy["arguments"][key]) is int and policy["arguments"][key] > 0,
+                f"invalid {key}",
+            )
+        require(
+            policy["arguments"]["duration"] + 1 < policy["timeout_seconds"] <= 60,
+            "RDMA timeout must include warmup/setup and fit the 60-second sample watchdog",
+        )
     require(policy["cases"] and policy["metrics"], "empty policy")
     for name, case in policy["cases"].items():
         require(re.fullmatch(r"[a-z0-9_-]+", name), "invalid case name")
+        if rdma:
+            require(case["op_type"] in ("read", "write"), "invalid RDMA operation")
+            for key in ("block_size", "batch_size"):
+                require(type(case[key]) is int and case[key] > 0, f"invalid {key}")
+            require(
+                case["block_size"] * case["batch_size"] * case["threads"]
+                <= policy["arguments"]["total_buffer_size"],
+                "RDMA buffer too small",
+            )
+        else:
+            require("metrics" not in case, "CPU collector uses all policy metrics")
+            require(
+                case["layer"] in ("offset_allocator", "put_allocation"), "invalid layer"
+            )
+            require(
+                case["scenario"] in ("success", "capacity", "fragmentation", "mixed"),
+                "invalid scenario",
+            )
         require(
-            case["layer"] in ("offset_allocator", "put_allocation"), "invalid layer"
-        )
-        require(
-            case["scenario"] in ("success", "capacity", "fragmentation", "mixed"),
-            "invalid scenario",
+            case.get("metrics", list(policy["metrics"]))
+            and set(case.get("metrics", policy["metrics"])) <= set(policy["metrics"]),
+            "invalid case metrics",
         )
         require(
             type(case["threads"]) is int and 0 < case["threads"] <= policy["cpu_count"],
@@ -62,7 +91,8 @@ def load_policy(path):
                 "invalid case threshold override",
             )
     for name, metric in policy["metrics"].items():
-        require(name in ("qps", "p50_ns", "p99_ns"), "unsupported benchmark metric")
+        allowed = ("bandwidth_gbs", "p99_us") if rdma else ("qps", "p50_ns", "p99_ns")
+        require(name in allowed, "unsupported benchmark metric")
         require(
             metric["direction"] in ("higher", "lower") and metric["unit"],
             "invalid metric direction or unit",
@@ -243,10 +273,11 @@ def compare(policy, baseline, candidate, baseline_sha, candidate_sha):
         require(
             set(baseline["cases"][name])
             == set(candidate["cases"][name])
-            == set(policy["metrics"]),
+            == set(policy["cases"][name].get("metrics", policy["metrics"])),
             f"{name}: missing or unexpected metrics",
         )
-        for key, metric in policy["metrics"].items():
+        for key in policy["cases"][name].get("metrics", policy["metrics"]):
+            metric = policy["metrics"][key]
             medians, noise = [], []
             for result in (baseline, candidate):
                 data = result["cases"][name][key]
@@ -341,7 +372,8 @@ def report(args):
         annotation(error)
     lines += [
         "",
-        "Raw samples, environment, benchmark logs and comparison.json are in the performance-results artifact.",
+        f"Normalized samples, environment and comparison.json are in the {getattr(args, 'artifact_name', 'performance-results')} artifact. "
+        "Consult the job logs for raw benchmark diagnostics.",
     ]
     markdown = "\n".join(lines) + "\n"
     (out / "summary.md").write_text(markdown)

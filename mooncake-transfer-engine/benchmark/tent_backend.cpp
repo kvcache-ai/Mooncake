@@ -133,6 +133,13 @@ static int resolveSegTypeParams(const std::string& seg_type,
     if (seg_type == "DRAM" || seg_type == "dram") {
         device_prefix = "cpu";
         num_buffers = numa_num_configured_nodes();
+        if (XferBenchConfig::dram_numa_node != -1) {
+            start_idx = XferBenchConfig::dram_numa_node;
+            LOG_ASSERT(start_idx >= 0 && start_idx <= numa_max_node() &&
+                       numa_bitmask_isbitset(numa_all_nodes_ptr, start_idx))
+                << "dram_numa_node is not an available NUMA node";
+            num_buffers = 1;
+        }
 #if defined(USE_CUDA) || defined(USE_SUNRISE)
     } else if (seg_type == "VRAM" || seg_type == "vram") {
         device_prefix = "cuda";

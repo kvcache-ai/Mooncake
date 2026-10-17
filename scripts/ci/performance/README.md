@@ -13,6 +13,11 @@ fragmentation rejection with one and two threads. It measures allocator CPU
 performance; it does not validate master RPC, Store end-to-end, RDMA, or GPUs.
 Those need their own workload adapters and, for RDMA, a fixed pair of machines.
 
+The opt-in [T-One RDMA gate](tone/mooncake-rdma-perf/README.md) adds that fixed-pair
+adapter for TENT DRAM read/write. It has a separate workflow and policy; the CPU
+suite does not require RDMA credentials or hardware. Deploy and calibrate the
+T-One template before enabling `RDMA_PERF_ENABLED`.
+
 ## Results and failure behavior
 
 Open **Performance Gate → Details → Summary** to see each case's baseline and

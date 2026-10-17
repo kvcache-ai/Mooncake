@@ -98,6 +98,8 @@ DEFINE_int32(deadline_tight_threads, 0,
 DEFINE_bool(deadline_bw_arbitration, false,
             "tent only: enable deadline-aware RDMA bandwidth arbitration.");
 DEFINE_int32(local_gpu_id, 0, "Local GPU ID to be used, -1 for all GPUs");
+DEFINE_int32(dram_numa_node, -1,
+             "TENT DRAM NUMA node, -1 allocates on all configured nodes");
 DEFINE_int32(target_gpu_id, 0, "Target GPU ID to be used, -1 for all GPUs");
 DEFINE_string(metadata_type, "p2p",
               "Type of metadata service: p2p|etcd|redis|http");
@@ -179,6 +181,7 @@ std::string XferBenchConfig::tent_transport_hint;
 std::string XferBenchConfig::tent_intent_type;
 
 int XferBenchConfig::local_gpu_id = 0;
+int XferBenchConfig::dram_numa_node = -1;
 int XferBenchConfig::target_gpu_id = 0;
 
 namespace {
@@ -271,6 +274,7 @@ void XferBenchConfig::loadFromFlags() {
     tent_intent_type = FLAGS_tent_intent_type;
 
     local_gpu_id = FLAGS_local_gpu_id;
+    dram_numa_node = FLAGS_dram_numa_node;
     target_gpu_id = FLAGS_target_gpu_id;
 }
 

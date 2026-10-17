@@ -100,6 +100,7 @@ struct XferBenchConfig {
     static std::string tent_intent_type;
 
     static int local_gpu_id;
+    static int dram_numa_node;
     static int target_gpu_id;
 };
 

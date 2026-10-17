@@ -1,0 +1,88 @@
+name: RDMA performance regression
+
+on:
+  pull_request:
+    branches: [main, 'release/**']
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      baseline_sha:
+        description: Full baseline commit SHA (same as candidate for A/A calibration)
+        required: true
+      candidate_sha:
+        description: Full candidate commit SHA
+        required: true
+  workflow_call:
+    inputs:
+      baseline_sha:
+        required: true
+        type: string
+      candidate_sha:
+        required: true
+        type: string
+    secrets:
+      TONE_USER_NAME:
+        required: true
+      TONE_USER_TOKEN:
+        required: true
+
+permissions:
+  contents: read
+
+# One fixed hardware pair; do not interrupt an older measurement to start a new one.
+concurrency:
+  group: rdma-performance-pair
+  cancel-in-progress: false
+
+jobs:
+  rdma:
+    name: RDMA Performance Gate
+    if: ${{ github.event_name != 'pull_request' || vars.RDMA_PERF_ENABLED == 'true' }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout the reviewed harness
+        uses: actions/checkout@v4
+        with:
+          # Never execute candidate code in the credential-bearing controller.
+          # Manual bootstrap uses the selected workflow revision, reviewed by its dispatcher.
+          ref: ${{ github.event.pull_request.base.sha || github.workflow_sha }}
+          persist-credentials: false
+
+      - name: Submit, collect, and enforce RDMA thresholds
+        env:
+          BASELINE_SHA: ${{ inputs.baseline_sha || github.event.pull_request.base.sha }}
+          CANDIDATE_SHA: ${{ inputs.candidate_sha || github.sha }}
+          TONE_USER_NAME: ${{ secrets.TONE_USER_NAME }}
+          TONE_USER_TOKEN: ${{ secrets.TONE_USER_TOKEN }}
+          TONE_WORKSPACE: ${{ vars.TONE_WORKSPACE }}
+          TONE_PROJECT: ${{ vars.TONE_PROJECT }}
+          TONE_RDMA_TEMPLATE: ${{ vars.TONE_RDMA_TEMPLATE }}
+          TONE_RESULT_ORIGIN: ${{ vars.TONE_RESULT_ORIGIN }}
+          RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          python3 scripts/ci/performance/tone_rdma.py \
+            --baseline-sha "$BASELINE_SHA" --candidate-sha "$CANDIDATE_SHA" \
+            --harness-sha "$(git rev-parse HEAD)" --run-id "$RUN_ID" \
+            --output rdma-performance-results
+
+      - name: Publish setup errors
+        if: ${{ always() }}
+        run: |
+          if [ ! -f rdma-performance-results/summary.md ]; then
+            mkdir -p rdma-performance-results
+            echo '## RDMA Performance Gate: ERROR — no complete report was returned' \
+              > rdma-performance-results/summary.md
+            cat rdma-performance-results/summary.md >> "$GITHUB_STEP_SUMMARY"
+            echo '::error::RDMA setup failed or the run was interrupted.'
+            exit 2
+          fi
+
+      - name: Preserve results even on failure
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: rdma-performance-results
+          path: rdma-performance-results/
+          if-no-files-found: error
+          retention-days: 14

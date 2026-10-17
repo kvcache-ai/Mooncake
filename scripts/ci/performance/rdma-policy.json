@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "suite": "rdma",
+  "repetitions": 5,
+  "cpu_count": 4,
+  "timeout_seconds": 60,
+  "arguments": {"duration": 10, "total_buffer_size": 268435456},
+  "cases": {
+    "read-4k": {"op_type": "read", "block_size": 4096, "batch_size": 1, "threads": 1, "metrics": ["p99_us"]},
+    "write-4k": {"op_type": "write", "block_size": 4096, "batch_size": 1, "threads": 1, "metrics": ["p99_us"]},
+    "read-1m": {"op_type": "read", "block_size": 1048576, "batch_size": 16, "threads": 4, "metrics": ["bandwidth_gbs"]},
+    "write-1m": {"op_type": "write", "block_size": 1048576, "batch_size": 16, "threads": 4, "metrics": ["bandwidth_gbs"]}
+  },
+  "metrics": {
+    "bandwidth_gbs": {"unit": "GB/s", "direction": "higher", "max_regression_percent": 5, "max_mad_percent": 5},
+    "p99_us": {"unit": "us", "direction": "lower", "max_regression_percent": 10, "max_mad_percent": 10}
+  }
+}
