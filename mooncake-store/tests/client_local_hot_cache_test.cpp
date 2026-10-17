@@ -1421,6 +1421,90 @@ TEST_F(LocalHotCacheTest, AdmissionSketchNotIncrementedOnCacheHit) {
     EXPECT_EQ(client->GetAdmissionCount(key), count_before);
 }
 
+TEST_F(LocalHotCacheTest, MultiSliceGetPublishesCompleteHotCacheEntry) {
+    class EnvGuard {
+       public:
+        EnvGuard(const char* name, const char* value) : name_(name) {
+            if (const char* previous = std::getenv(name)) {
+                previous_ = previous;
+            }
+            setenv(name, value, 1);
+        }
+        ~EnvGuard() {
+            if (previous_) {
+                setenv(name_, previous_->c_str(), 1);
+            } else {
+                unsetenv(name_);
+            }
+        }
+
+       private:
+        const char* name_;
+        std::optional<std::string> previous_;
+    };
+    EnvGuard size("MC_STORE_LOCAL_HOT_CACHE_SIZE", "4096");
+    EnvGuard block_size("MC_STORE_LOCAL_HOT_BLOCK_SIZE", "4096");
+    EnvGuard shm("MC_STORE_LOCAL_HOT_CACHE_USE_SHM", "1");
+    EnvGuard threshold("MC_STORE_LOCAL_HOT_ADMISSION_THRESHOLD", "1");
+    EnvGuard memcpy_enabled("MC_STORE_MEMCPY", "1");
+
+    auto client_opt = CreateTestClient("localhost");
+    ASSERT_TRUE(client_opt.has_value());
+    auto client = *client_opt;
+    ASSERT_TRUE(client->IsHotCacheEnabled());
+    auto cache = client->GetHotCache();
+    ASSERT_TRUE(cache->IsShm());
+
+    // SHM mode also admits same-process reads. A real local-memory transfer
+    // exercises Get -> ProcessSlicesAsync without a second network client.
+    std::string source = "abcdefgh";
+    const std::string expected = source;
+    const std::string key = "multi_slice_hot_cache_entry";
+    Replica::Descriptor replica;
+    replica.id = 1;
+    replica.status = ReplicaStatus::COMPLETE;
+    MemoryDescriptor descriptor;
+    descriptor.buffer_descriptor.transport_endpoint_ =
+        client->GetTransportEndpoint();
+    descriptor.buffer_descriptor.buffer_address_ =
+        reinterpret_cast<uintptr_t>(source.data());
+    descriptor.buffer_descriptor.size_ = source.size();
+    replica.descriptor_variant = descriptor;
+    std::vector<Replica::Descriptor> replicas{replica};
+    QueryResult query_result(
+        std::move(replicas),
+        std::chrono::steady_clock::now() + std::chrono::seconds(60));
+    std::vector<char> first(3), second(5);
+    std::vector<Slice> slices{{first.data(), first.size()},
+                              {second.data(), second.size()}};
+    ASSERT_TRUE(client->Get(key, query_result, slices).has_value());
+    EXPECT_EQ(std::string(first.begin(), first.end()) +
+                  std::string(second.begin(), second.end()),
+              expected);
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!cache->HasHotKey(key) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    auto* cached = cache->GetHotKey(key);
+    ASSERT_NE(cached, nullptr);
+    const std::string cached_bytes(static_cast<char*>(cached->addr),
+                                   cached->size);
+    cache->ReleaseHotKey(key);
+    ASSERT_EQ(cached_bytes, expected);
+
+    // If the second Get misses the hot cache, it reads these changed bytes.
+    // Keeping the original bytes demonstrates actual cache redirection.
+    std::memset(source.data(), 'x', source.size());
+    ASSERT_TRUE(client->Get(key, query_result, slices).has_value());
+    EXPECT_EQ(std::string(first.begin(), first.end()) +
+                  std::string(second.begin(), second.end()),
+              expected);
+    EXPECT_EQ(cached->ref_count.load(), 0);
+}
+
 // ---------------------------------------------------------------------------
 // CountMinSketch basic tests
 // ---------------------------------------------------------------------------

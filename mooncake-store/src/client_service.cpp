@@ -5596,13 +5596,9 @@ void Client::ProcessSlicesAsync(const std::string& key,
         return;
     }
 
-    // Identify TE transfer slices (non-local) and submit async put tasks
-    for (size_t i = 0; i < slices.size(); ++i) {
-        if (!hot_cache_handler_->SubmitPutTask(key, slices[i])) {
-            LOG(ERROR) << "Failed to submit hot cache put task for key=" << key
-                       << " slice_idx=" << i;
-            return;
-        }
+    // The slices belong to one object; publish them as one cache entry.
+    if (!hot_cache_handler_->SubmitPutTask(key, slices)) {
+        LOG(ERROR) << "Failed to submit hot cache put task for key=" << key;
     }
 }
 
