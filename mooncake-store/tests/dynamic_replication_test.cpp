@@ -258,8 +258,11 @@ class DynamicReplicationTest : public ::testing::Test {
             return 0;
         }
         std::vector<ReplicaID> erased_replica_ids;
+        // Clearing the replicas an object holds on a segment takes the object
+        // as a whole, which is the erasure the batch clear and eviction paths
+        // run.
         return MasterServiceTestPeer(service)
-            .EraseReplicasWithCacheTotalAccounting(
+            .EraseAllReplicasWithCacheTotalAccounting(
                 accessor.Get(),
                 [&target_segment](const Replica& replica) {
                     if (!replica.is_memory_replica()) {

@@ -44,6 +44,33 @@ class ObjectPart {
     std::span<Replica> replicas() { return replicas_; }
     std::span<const Replica> replicas() const { return replicas_; }
 
+    // Whether one of the part's replicas can be read. The part does not own the
+    // rule: whether a replica is readable depends on the service (its status,
+    // its availability, and whether its endpoint is still registered), and it
+    // can change while the part's content does not.
+    template <typename IsReadable>
+    bool HasReadableReplica(IsReadable&& is_readable) const {
+        return std::ranges::any_of(replicas_,
+                                   std::forward<IsReadable>(is_readable));
+    }
+
+    // The descriptors of the part's readable replicas. `try_descriptor` answers
+    // whether the replica is readable and fills its descriptor in one step,
+    // which is how the caller already decides that question.
+    template <typename TryDescriptor>
+    std::vector<Replica::Descriptor> ReadableDescriptors(
+        TryDescriptor&& try_descriptor) const {
+        std::vector<Replica::Descriptor> descriptors;
+        descriptors.reserve(replicas_.size());
+        for (const auto& replica : replicas_) {
+            Replica::Descriptor descriptor;
+            if (try_descriptor(replica, descriptor)) {
+                descriptors.push_back(std::move(descriptor));
+            }
+        }
+        return descriptors;
+    }
+
     void AddReplicas(std::vector<Replica>&& replicas) {
         replicas_.insert(replicas_.end(), std::move_iterator(replicas.begin()),
                          std::move_iterator(replicas.end()));

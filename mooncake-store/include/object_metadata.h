@@ -5,8 +5,7 @@
 // Moved out of MasterService so the service and the per-object metadata
 // module share one definition. The envelope owns the object identity, the
 // authoritative read lease, the soft-pin state and the tenant quota ledger.
-// The object's content and the replicas holding it live in the envelope's
-// single ObjectPart.
+// The object's content and the replicas holding it live in the object's part.
 //
 // It has no ownership lock: whoever owns the envelope decides how the
 // envelope as a whole is guarded. The `lock` member below is internal and
@@ -17,10 +16,10 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <ranges>
-#include <span>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -37,6 +36,10 @@
 #include "types.h"
 
 namespace mooncake {
+
+namespace test {
+class MasterServiceTestPeer;
+}  // namespace test
 
 struct ResolvedSoftPinRequest {
     SoftPinAction action{SoftPinAction::PRESERVE};
@@ -169,12 +172,16 @@ struct ObjectMetadata {
             std::max(dynamic_replication_recreate_after, deadline);
     }
 
+    size_t PartCount() const { return parts_.size(); }
+
     // Read under the owner's shared lock, change under its exclusive lock. A
     // replica pointer taken from a part is invalidated by any add or pop on it.
     const ObjectPart& GetPart(size_t index) const { return parts_.at(index); }
 
     ObjectPart& MutablePart(size_t index) { return parts_.at(index); }
 
+    // The length of the object's content: the sum of the lengths the object's
+    // parts hold.
     size_t TotalLength() const {
         size_t total = 0;
         for (const auto& part : parts_) {
@@ -183,54 +190,37 @@ struct ObjectMetadata {
         return total;
     }
 
-    // Temporary: these operate on part 0. The multi-part work replaces them
-    // with `parts()` and a flattened `replicas()` view, so each call site says
-    // which it means.
-    void AddReplicas(std::vector<Replica>&& replicas) {
-        MutablePart(0).AddReplicas(std::move(replicas));
-    }
-
-    std::vector<Replica> PopReplicas(
+    // Takes the object's replicas that match the predicate out of it, or all of
+    // the object's replicas when none is given. Every part is asked, which is
+    // what an operation that disposes of the object as a whole wants; a caller
+    // that means one part pops from that part directly.
+    std::vector<Replica> PopAllReplicas(
         const std::function<bool(const Replica&)>& pred_fn) {
-        return MutablePart(0).PopReplicas(pred_fn);
-    }
-
-    std::vector<Replica> PopReplicas() { return MutablePart(0).PopReplicas(); }
-
-    size_t EraseReplicas(const std::function<bool(const Replica&)>& pred_fn) {
-        return MutablePart(0).PopReplicas(pred_fn).size();
-    }
-
-    // visit_fn may modify the replica but must not add or pop replicas.
-    size_t VisitReplicas(const std::function<bool(const Replica&)>& pred_fn,
-                         const std::function<void(Replica&)>& visit_fn) {
-        size_t num_visited = 0;
-
-        for (auto& replica : MutablePart(0).replicas()) {
-            if (pred_fn(replica)) {
-                visit_fn(replica);
-                num_visited++;
-            }
+        std::vector<Replica> popped;
+        for (auto& part : parts_) {
+            auto replicas = part.PopReplicas(pred_fn);
+            popped.insert(popped.end(),
+                          std::make_move_iterator(replicas.begin()),
+                          std::make_move_iterator(replicas.end()));
         }
-
-        return num_visited;
+        return popped;
     }
 
-    size_t VisitReplicas(
-        const std::function<bool(const Replica&)>& pred_fn,
-        const std::function<void(const Replica&)>& visit_fn) const {
-        size_t num_visited = 0;
-
-        for (const auto& replica : GetPart(0).replicas()) {
-            if (pred_fn(replica)) {
-                visit_fn(replica);
-                num_visited++;
-            }
+    std::vector<Replica> PopAllReplicas() {
+        std::vector<Replica> popped;
+        for (auto& part : parts_) {
+            auto replicas = part.PopReplicas();
+            popped.insert(popped.end(),
+                          std::make_move_iterator(replicas.begin()),
+                          std::make_move_iterator(replicas.end()));
         }
-
-        return num_visited;
+        return popped;
     }
 
+    // The queries below answer about the object. The object holds one part, so
+    // the object's replicas are the replicas of that part, and these read it. A
+    // caller that works on a named part reads that part through GetPart /
+    // MutablePart.
     bool HasReplica(const std::function<bool(const Replica&)>& pred_fn) const {
         return std::ranges::any_of(GetPart(0).replicas(), pred_fn);
     }
@@ -246,10 +236,6 @@ struct ObjectMetadata {
     }
 
     size_t CountReplicas() const { return GetPart(0).replicas().size(); }
-
-    std::span<const Replica> GetAllReplicas() const {
-        return GetPart(0).replicas();
-    }
 
     Replica* GetFirstReplica(
         const std::function<bool(const Replica&)>& pred_fn) {
@@ -439,31 +425,27 @@ struct ObjectMetadata {
 
     bool IsGrouped() const { return !group_id.empty(); }
 
+    // Whether the object can be read, by the caller's rule for one replica. A
+    // reader is handed the replicas of the object's part, so the object is
+    // readable when that part holds one the caller can use.
+    template <typename IsReplicaReadable>
+    bool IsReadable(IsReplicaReadable&& is_readable) const {
+        return GetPart(0).HasReadableReplica(is_readable);
+    }
+
     // Check if the metadata is valid
     // Valid means it has at least one valid replica and size is greater
     // than 0
     bool IsValid() const {
-        return GetPart(0).length() > 0 &&
-               HasReplica([](const Replica& replica) {
+        return TotalLength() > 0 && HasReplica([](const Replica& replica) {
                    return !replica.is_memory_replica() ||
                           !replica.has_invalid_mem_handle();
                });
     }
 
-    std::vector<std::string> GetReplicaSegmentNames() const {
-        std::vector<std::string> segment_names;
-        for (const auto& replica : GetPart(0).replicas()) {
-            const auto& segment_name_options = replica.get_segment_names();
-            for (const auto& segment_name_opt : segment_name_options) {
-                if (segment_name_opt.has_value()) {
-                    segment_names.push_back(segment_name_opt.value());
-                }
-            }
-        }
-        return segment_names;
-    }
-
    private:
+    friend class test::MasterServiceTestPeer;
+
     std::vector<ObjectPart> parts_;
 };
 

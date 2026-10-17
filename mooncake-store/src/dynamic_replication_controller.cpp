@@ -307,27 +307,26 @@ DynamicReplicationController::SelectPlan(
         segments_by_name.emplace(segment.name, segment);
     }
 
-    metadata.VisitReplicas(
-        [&is_readable](const Replica& replica) {
-            return is_readable(replica) && replica.is_memory_replica();
-        },
-        [&](const Replica& replica) {
-            memory_replicas++;
-            const auto liveness = replica.getClientLiveness();
-            for (const auto& segment_name : replica.get_segment_names()) {
-                if (!segment_name.has_value()) {
-                    continue;
-                }
-                existing_segments.insert(*segment_name);
-                source_segments.push_back(*segment_name);
-                source_liveness_by_segment[*segment_name] = liveness;
-                auto segment_it = segments_by_name.find(*segment_name);
-                if (segment_it != segments_by_name.end() &&
-                    !segment_it->second.host_id.empty()) {
-                    existing_hosts.insert(segment_it->second.host_id);
-                }
+    for (const auto& replica : metadata.GetPart(0).replicas()) {
+        if (!(is_readable(replica) && replica.is_memory_replica())) {
+            continue;
+        }
+        memory_replicas++;
+        const auto liveness = replica.getClientLiveness();
+        for (const auto& segment_name : replica.get_segment_names()) {
+            if (!segment_name.has_value()) {
+                continue;
             }
-        });
+            existing_segments.insert(*segment_name);
+            source_segments.push_back(*segment_name);
+            source_liveness_by_segment[*segment_name] = liveness;
+            auto segment_it = segments_by_name.find(*segment_name);
+            if (segment_it != segments_by_name.end() &&
+                !segment_it->second.host_id.empty()) {
+                existing_hosts.insert(segment_it->second.host_id);
+            }
+        }
+    }
 
     if (source_segments.empty() || memory_replicas == 0 ||
         memory_replicas >= max_memory_replicas_) {

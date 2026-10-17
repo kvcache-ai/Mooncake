@@ -1198,12 +1198,26 @@ class MasterService {
     static void SyncCacheTotalAccounting(ObjectMetadata& metadata);
     void RebuildCacheTotalAccounting();
     static void AccountCacheTotalRemoval(ObjectMetadata& metadata);
-    std::vector<Replica> PopReplicasWithCacheTotalAccounting(
+    // The replicas an operation takes out of an object come out through one of
+    // these two, so the call site says which replicas it means: the part one
+    // takes the object's part, the All one takes every replica the object
+    // holds.
+    std::vector<Replica> PopPartReplicasWithCacheTotalAccounting(
         ObjectMetadata& metadata,
         const std::function<bool(const Replica&)>& pred_fn);
-    std::vector<Replica> PopReplicasWithCacheTotalAccounting(
+    std::vector<Replica> PopAllReplicasWithCacheTotalAccounting(
+        ObjectMetadata& metadata,
+        const std::function<bool(const Replica&)>& pred_fn);
+    std::vector<Replica> PopAllReplicasWithCacheTotalAccounting(
         ObjectMetadata& metadata);
+    size_t AccountErasedReplicas(ObjectMetadata& metadata,
+                                 std::vector<Replica> erased_replicas,
+                                 std::vector<ReplicaID>* erased_replica_ids);
     size_t EraseReplicasWithCacheTotalAccounting(
+        ObjectMetadata& metadata,
+        const std::function<bool(const Replica&)>& pred_fn,
+        std::vector<ReplicaID>* erased_replica_ids = nullptr);
+    size_t EraseAllReplicasWithCacheTotalAccounting(
         ObjectMetadata& metadata,
         const std::function<bool(const Replica&)>& pred_fn,
         std::vector<ReplicaID>* erased_replica_ids = nullptr);
@@ -1719,9 +1733,9 @@ class MasterService {
                 tenant_state_ != nullptr &&
                 it_ != tenant_state_->metadata.end()) {
                 // Gate the snapshot on the publisher being live: this runs on
-                // every read-write metadata access, and the VisitReplicas walk
-                // plus vector allocation is pure overhead when KV events are
-                // off (the default).
+                // every read-write metadata access, and the walk over every
+                // part's replicas plus vector allocation is pure overhead when
+                // KV events are off (the default).
                 ObjectMetadata& metadata = it_->second.metadata;
                 const auto previous_kv_media =
                     service_->KvMediaSnapshot(metadata);
@@ -2282,8 +2296,8 @@ class MasterService {
                                           uint64_t expected_epoch);
 
     // Gated snapshots for the call sites that capture a pre-mutation medium
-    // set. They run on hot metadata paths, so skip the VisitReplicas walk
-    // entirely when no publisher is listening.
+    // set. They run on hot metadata paths, so skip the walk over every part's
+    // replicas entirely when no publisher is listening.
     std::vector<std::string> KvMediaSnapshot(const ObjectMetadata& metadata) {
         return KvEventsEnabled() ? KvMediaForMetadata(metadata)
                                  : std::vector<std::string>{};
@@ -2374,10 +2388,14 @@ class MasterService {
     bool IsAwaitingRemount(const Replica& replica) const;
     bool TryGetReadableReplicaDescriptor(const Replica& replica,
                                          Replica::Descriptor& descriptor) const;
+    // The readability rule stays with the service: a replica is readable by its
+    // status, its availability and its endpoint still being registered, and
+    // none of that is owned by the part or by the metadata. The adapters below
+    // hand the rule to the part and metadata operations that ask the question.
     std::vector<Replica::Descriptor> GetReadableReplicaDescriptors(
-        const ObjectMetadata& metadata) const;
+        const ObjectPart& part) const;
     bool IsReplicaReadable(const Replica& replica) const;
-    bool HasReadableReplica(const ObjectMetadata& metadata) const;
+    bool IsReadable(const ObjectMetadata& metadata) const;
     bool IsEvictableMemoryReplica(const Replica& replica) const;
 
     /**

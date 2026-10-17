@@ -399,6 +399,40 @@ class MasterServiceTestPeer {
             metadata, pred_fn, erased_replica_ids);
     }
 
+    size_t EraseAllReplicasWithCacheTotalAccounting(
+        ObjectMetadata& metadata,
+        const std::function<bool(const Replica&)>& pred_fn,
+        std::vector<ReplicaID>* erased_replica_ids = nullptr) {
+        return service_.EraseAllReplicasWithCacheTotalAccounting(
+            metadata, pred_fn, erased_replica_ids);
+    }
+
+    std::vector<Replica> PopPartReplicasWithCacheTotalAccounting(
+        ObjectMetadata& metadata,
+        const std::function<bool(const Replica&)>& pred_fn) {
+        return service_.PopPartReplicasWithCacheTotalAccounting(metadata,
+                                                                pred_fn);
+    }
+
+    std::vector<Replica> PopAllReplicasWithCacheTotalAccounting(
+        ObjectMetadata& metadata,
+        const std::function<bool(const Replica&)>& pred_fn) {
+        return service_.PopAllReplicasWithCacheTotalAccounting(metadata,
+                                                               pred_fn);
+    }
+
+    std::vector<Replica> PopAllReplicasWithCacheTotalAccounting(
+        ObjectMetadata& metadata) {
+        return service_.PopAllReplicasWithCacheTotalAccounting(metadata);
+    }
+
+    // Appends another part to the envelope. An object holds one part, so this
+    // is how a case sees what an operation does with more than one.
+    static void AppendPart(ObjectMetadata& metadata, size_t length,
+                           std::vector<Replica>&& replicas) {
+        metadata.parts_.emplace_back(length, std::move(replicas));
+    }
+
     TenantQuotaEvictionResult EvictTenantMemoryForQuota(
         const TenantId& tenant_id, uint64_t target_bytes) {
         return service_.EvictTenantMemoryForQuota(tenant_id, target_bytes);
@@ -436,6 +470,17 @@ class MasterServiceTestPeer {
 
     bool IsReplicaReadable(const Replica& replica) const {
         return service_.IsReplicaReadable(replica);
+    }
+
+    std::vector<Replica::Descriptor> GetReadableReplicaDescriptors(
+        const ObjectPart& part) const {
+        return service_.GetReadableReplicaDescriptors(part);
+    }
+
+    // Marks an endpoint as awaiting a remount, the state a restored replica
+    // sits in until its segment is mounted again.
+    void MarkEndpointAwaitingRemount(const std::string& endpoint) {
+        service_.invalid_replica_endpoints_.insert(endpoint);
     }
 
     static std::vector<std::string> KvMediaForMetadata(
