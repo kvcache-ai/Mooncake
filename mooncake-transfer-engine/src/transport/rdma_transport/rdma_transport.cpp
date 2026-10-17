@@ -485,7 +485,7 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
         size_t n = std::min(committed, chunks.size());
         for (size_t ri = 0; ri < n; ++ri) {
             int rc = metadata_->removeLocalMemoryBuffer(
-                chunks[ri].first, /*update_metadata=*/false);
+                chunks[ri].first, /*update_metadata=*/false, "rdma");
             if (rc)
                 LOG(WARNING) << "Rollback: failed to remove metadata for chunk "
                                 "at "
@@ -692,7 +692,8 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
         // chunk); publish once after all removals, below.
         for (uint64_t ca : chunk_addrs) {
             int rc = metadata_->removeLocalMemoryBuffer(
-                reinterpret_cast<void *>(ca), /*update_metadata=*/false);
+                reinterpret_cast<void *>(ca), /*update_metadata=*/false,
+                "rdma");
             if (rc && !first_err) first_err = rc;
         }
 
@@ -743,7 +744,7 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
         return first_err;
     }
 
-    int rc = metadata_->removeLocalMemoryBuffer(addr, update_metadata);
+    int rc = metadata_->removeLocalMemoryBuffer(addr, update_metadata, "rdma");
     if (rc) return rc;
 
     // force_sequential is used by batch operations to avoid nested parallelism

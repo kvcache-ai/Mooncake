@@ -486,7 +486,7 @@ int TcpTransport::registerLocalMemory(void* addr, size_t length,
 }
 
 int TcpTransport::unregisterLocalMemory(void* addr, bool update_metadata) {
-    return metadata_->removeLocalMemoryBuffer(addr, update_metadata);
+    return metadata_->removeLocalMemoryBuffer(addr, update_metadata, "tcp");
 }
 
 int TcpTransport::registerLocalMemoryBatch(
