@@ -16,9 +16,11 @@
 
 #include <set>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include "transport/rdma_transport/rdma_gid_probe.h"
+#include "transport/transport.h"
 
 using namespace mooncake;
 
@@ -399,6 +401,398 @@ TEST(RdmaGidProbeTest, RetryActionRequiresObservedOrReprobedChange) {
                   /*previous_gid=*/"00:11:22", /*current_gid_index=*/1,
                   /*current_gid=*/"00:11:23"),
               AutoGidRetryAction::kRetryWithObservedChange);
+}
+
+TEST(RdmaGidProbeTest, DataPathRetryCountsEndpointInstanceOnlyOnce) {
+    PeerAutoGidStateTable peers(/*capacity=*/4, /*max_advances=*/2,
+                                /*enabled=*/true);
+    const AutoGidSelection initial{5, "gid-5"};
+    auto selected = peers.prepare("peer-a", initial);
+    AutoGidDataPathAttempt first{101, selected.selection_epoch};
+    AutoGidDataPathAttempt same_endpoint{101, selected.selection_epoch};
+    AutoGidDataPathAttempt fresh_endpoint{102, selected.selection_epoch};
+
+    EXPECT_EQ(peers.recordCompletion("peer-a", first, /*success=*/false),
+              AutoGidDataPathAction::kRetrySameGid);
+    auto rebuilt = peers.prepare("peer-a", initial);
+    EXPECT_EQ(rebuilt.selection.gid, initial.gid);
+    EXPECT_EQ(rebuilt.selection_epoch, selected.selection_epoch);
+    EXPECT_EQ(
+        peers.recordCompletion("peer-a", same_endpoint, /*success=*/false),
+        AutoGidDataPathAction::kIgnoreDuplicate);
+    EXPECT_EQ(
+        peers.recordCompletion("peer-a", fresh_endpoint, /*success=*/false),
+        AutoGidDataPathAction::kAdvanceGid);
+}
+
+TEST(RdmaGidProbeTest, StaleOlderEndpointCannotConfirmFailure) {
+    PeerAutoGidStateTable peers(/*capacity=*/4, /*max_advances=*/2,
+                                /*enabled=*/true);
+    auto selected = peers.prepare("peer-a", {5, "gid-5"});
+
+    EXPECT_EQ(peers.recordCompletion("peer-a", {102, selected.selection_epoch},
+                                     false),
+              AutoGidDataPathAction::kRetrySameGid);
+    EXPECT_EQ(peers.recordCompletion("peer-a", {101, selected.selection_epoch},
+                                     false),
+              AutoGidDataPathAction::kIgnoreDuplicate);
+    EXPECT_EQ(peers.recordCompletion("peer-a", {103, selected.selection_epoch},
+                                     false),
+              AutoGidDataPathAction::kAdvanceGid);
+}
+
+TEST(RdmaGidProbeTest, PeerSelectionsUseIndependentLocalCandidateOrders) {
+    PeerAutoGidStateTable left(/*capacity=*/4, /*max_advances=*/2,
+                               /*enabled=*/true);
+    PeerAutoGidStateTable right(/*capacity=*/4, /*max_advances=*/2,
+                                /*enabled=*/true);
+    const AutoGidSelection left_initial{5, "gid-shared"};
+    const AutoGidSelection right_initial{3, "gid-shared"};
+    auto left_selected = left.prepare("right", left_initial);
+    auto right_selected = right.prepare("left", right_initial);
+    ASSERT_EQ(left.recordCompletion("right", {1, left_selected.selection_epoch},
+                                    false),
+              AutoGidDataPathAction::kRetrySameGid);
+    ASSERT_EQ(left.recordCompletion("right", {2, left_selected.selection_epoch},
+                                    false),
+              AutoGidDataPathAction::kAdvanceGid);
+    ASSERT_EQ(right.recordCompletion(
+                  "left", {11, right_selected.selection_epoch}, false),
+              AutoGidDataPathAction::kRetrySameGid);
+    ASSERT_EQ(right.recordCompletion(
+                  "left", {12, right_selected.selection_epoch}, false),
+              AutoGidDataPathAction::kAdvanceGid);
+
+    auto left_next = left.prepare("right", left_initial,
+                                  {{9, "gid-left-next"}, {5, "gid-shared"}});
+    auto right_next = right.prepare(
+        "left", right_initial,
+        {{1, "gid-right-next"}, {7, "gid-extra"}, {3, "gid-shared"}});
+    EXPECT_EQ(left_next.selection.gid, "gid-left-next");
+    EXPECT_EQ(right_next.selection.gid, "gid-right-next");
+}
+
+TEST(RdmaGidProbeTest, PeerAdvanceDoesNotChangeOtherPeerOrDefault) {
+    PeerAutoGidStateTable peers(/*capacity=*/4, /*max_advances=*/2,
+                                /*enabled=*/true);
+    const AutoGidSelection context_default{5, "gid-default"};
+    auto peer_a = peers.prepare("peer-a", context_default);
+    auto peer_b = peers.prepare("peer-b", context_default);
+    ASSERT_EQ(
+        peers.recordCompletion("peer-a", {1, peer_a.selection_epoch}, false),
+        AutoGidDataPathAction::kRetrySameGid);
+    ASSERT_EQ(
+        peers.recordCompletion("peer-a", {2, peer_a.selection_epoch}, false),
+        AutoGidDataPathAction::kAdvanceGid);
+
+    auto advanced = peers.prepare("peer-a", context_default,
+                                  {{7, "gid-next"}, {5, "gid-default"}});
+    auto unchanged = peers.prepare("peer-b", context_default);
+    EXPECT_EQ(advanced.selection.gid, "gid-next");
+    EXPECT_TRUE(advanced.observe_success);
+    EXPECT_EQ(unchanged.selection.gid, "gid-default");
+    EXPECT_FALSE(unchanged.observe_success);
+    EXPECT_EQ(context_default.gid, "gid-default");
+}
+
+TEST(RdmaGidProbeTest, CompletionTokenIsScalarAndEndpointIndependent) {
+    static_assert(
+        std::is_trivially_copyable_v<Transport::Slice::RdmaCompletionToken>);
+    PeerAutoGidStateTable peers(/*capacity=*/1, /*max_advances=*/1,
+                                /*enabled=*/true);
+    auto selected = peers.prepare("peer", {5, "gid"});
+    Transport::Slice::RdmaCompletionToken token{42, selected.selection_epoch,
+                                                true, false};
+    AutoGidDataPathAttempt attempt{token.endpoint_id, token.selection_epoch};
+    EXPECT_EQ(peers.recordCompletion("peer", attempt, false),
+              AutoGidDataPathAction::kRetrySameGid);
+    EXPECT_EQ(peers.recordCompletion("peer", attempt, true),
+              AutoGidDataPathAction::kIgnoreDuplicate);
+}
+
+TEST(RdmaGidProbeTest, ExhaustedRecoveryRearmsAfterDataSuccess) {
+    PeerAutoGidStateTable peers(/*capacity=*/1, /*max_advances=*/0,
+                                /*enabled=*/true);
+    const AutoGidSelection initial{5, "gid-5"};
+    auto selected = peers.prepare("peer", initial);
+    ASSERT_EQ(
+        peers.recordCompletion("peer", {10, selected.selection_epoch}, false),
+        AutoGidDataPathAction::kRetrySameGid);
+    ASSERT_EQ(
+        peers.recordCompletion("peer", {11, selected.selection_epoch}, false),
+        AutoGidDataPathAction::kAdvanceGid);
+
+    auto exhausted = peers.prepare("peer", initial, {initial});
+    EXPECT_TRUE(exhausted.observe_success);
+    EXPECT_EQ(
+        peers.recordCompletion("peer", {12, exhausted.selection_epoch}, false),
+        AutoGidDataPathAction::kExhausted);
+    EXPECT_EQ(
+        peers.recordCompletion("peer", {12, exhausted.selection_epoch}, true),
+        AutoGidDataPathAction::kIgnoreDuplicate);
+    EXPECT_EQ(
+        peers.recordCompletion("peer", {13, exhausted.selection_epoch}, false),
+        AutoGidDataPathAction::kRetrySameGid);
+}
+
+TEST(RdmaGidProbeTest, SuccessfulRecoveryRenewsBudgetAndKeepsLiveToken) {
+    PeerAutoGidStateTable peers(4, 2, true);
+    const AutoGidSelection initial{5, "gid-5"};
+    const std::vector<AutoGidSelection> candidates = {
+        initial, {7, "gid-7"}, {3, "gid-3"}};
+    auto selected = peers.prepare("peer", initial);
+    uint64_t endpoint = 1;
+    for (const auto* expected : {"gid-7", "gid-3"}) {
+        EXPECT_EQ(peers.recordCompletion(
+                      "peer", {endpoint++, selected.selection_epoch}, false),
+                  AutoGidDataPathAction::kRetrySameGid);
+        EXPECT_EQ(peers.recordCompletion(
+                      "peer", {endpoint++, selected.selection_epoch}, false),
+                  AutoGidDataPathAction::kAdvanceGid);
+        selected = peers.prepare("peer", initial, candidates);
+        ASSERT_EQ(selected.selection.gid, expected);
+    }
+    const AutoGidDataPathAttempt live{endpoint++, selected.selection_epoch};
+    peers.recordCompletion("peer", live, true);
+    auto recovered = peers.prepare("peer", initial);
+    EXPECT_EQ(recovered.selection.gid, "gid-3");
+    EXPECT_EQ(recovered.selection_epoch, live.selection_epoch);
+    EXPECT_FALSE(recovered.observe_success);
+    EXPECT_EQ(peers.recordCompletion("peer", live, false),
+              AutoGidDataPathAction::kRetrySameGid);
+    EXPECT_EQ(peers.recordCompletion("peer", {endpoint++, live.selection_epoch},
+                                     false),
+              AutoGidDataPathAction::kAdvanceGid);
+    auto next = peers.prepare("peer", initial, candidates);
+    EXPECT_EQ(next.selection.gid, "gid-5");
+    EXPECT_NE(next.selection_epoch, live.selection_epoch);
+    EXPECT_EQ(peers.recordCompletion("peer", live, true),
+              AutoGidDataPathAction::kIgnoreDuplicate);
+    EXPECT_TRUE(peers.prepare("peer", initial).observe_success);
+}
+
+TEST(RdmaGidProbeTest, CandidateRefreshRenewsExhaustedBudget) {
+    for (const bool keep_current : {false, true}) {
+        SCOPED_TRACE(keep_current);
+        PeerAutoGidStateTable peers(4, 1, true);
+        const AutoGidSelection initial{5, "gid-5"};
+        const std::vector<AutoGidSelection> candidates = {initial,
+                                                          {7, "gid-7"}};
+        auto selected = peers.prepare("peer", initial);
+        peers.recordCompletion("peer", {1, selected.selection_epoch}, false);
+        peers.recordCompletion("peer", {2, selected.selection_epoch}, false);
+        selected = peers.prepare("peer", initial, candidates);
+        ASSERT_EQ(selected.selection.gid, "gid-7");
+        peers.recordCompletion("peer", {3, selected.selection_epoch}, false);
+        peers.recordCompletion("peer", {4, selected.selection_epoch}, false);
+        selected = peers.prepare("peer", initial, candidates);
+        const AutoGidDataPathAttempt old{5, selected.selection_epoch};
+        ASSERT_EQ(peers.recordCompletion("peer", old, false),
+                  AutoGidDataPathAction::kExhausted);
+        EXPECT_EQ(peers.prepare("peer", initial, candidates).selection_epoch,
+                  old.selection_epoch);
+
+        peers.markCandidatesDirty();
+        auto refreshed = peers.prepare(
+            "peer", initial,
+            keep_current ? candidates : std::vector<AutoGidSelection>{initial});
+        EXPECT_NE(refreshed.selection_epoch, old.selection_epoch);
+        EXPECT_EQ(peers.recordCompletion("peer", old, false),
+                  AutoGidDataPathAction::kIgnoreDuplicate);
+        EXPECT_EQ(peers.recordCompletion("peer", old, true),
+                  AutoGidDataPathAction::kIgnoreDuplicate);
+        if (keep_current) {
+            EXPECT_EQ(refreshed.selection.gid, "gid-7");
+            EXPECT_EQ(peers.recordCompletion(
+                          "peer", {6, refreshed.selection_epoch}, false),
+                      AutoGidDataPathAction::kRetrySameGid);
+            EXPECT_EQ(peers.recordCompletion(
+                          "peer", {7, refreshed.selection_epoch}, false),
+                      AutoGidDataPathAction::kAdvanceGid);
+            refreshed = peers.prepare("peer", initial, candidates);
+        }
+        EXPECT_EQ(refreshed.selection.gid, "gid-5");
+        // Without success or another refresh, the renewed budget is bounded.
+        peers.recordCompletion("peer", {8, refreshed.selection_epoch}, false);
+        peers.recordCompletion("peer", {9, refreshed.selection_epoch}, false);
+        auto exhausted_again = peers.prepare("peer", initial, candidates);
+        EXPECT_EQ(exhausted_again.selection.gid, "gid-5");
+        EXPECT_EQ(peers.recordCompletion(
+                      "peer", {10, exhausted_again.selection_epoch}, false),
+                  AutoGidDataPathAction::kExhausted);
+    }
+}
+
+TEST(RdmaGidProbeTest, RefreshPreservesPendingAdvisoryAndBoundsEmptySearch) {
+    for (const bool empty : {false, true}) {
+        SCOPED_TRACE(empty);
+        PeerAutoGidStateTable peers(4, 1, true);
+        const AutoGidSelection initial{5, "gid-5"};
+        auto selected = peers.prepare("peer", initial);
+        peers.rememberPeerAdvertisedGid("peer", "remote-gid");
+        peers.recordCompletion("peer", {1, selected.selection_epoch}, false);
+        peers.recordCompletion("peer", {2, selected.selection_epoch}, false);
+        peers.markCandidatesDirty();
+        const std::vector<AutoGidSelection> candidates =
+            empty ? std::vector<AutoGidSelection>{}
+                  : std::vector<AutoGidSelection>{{7, "gid-7"}, initial};
+        auto next = peers.prepare("peer", initial, candidates);
+        EXPECT_NE(next.selection_epoch, selected.selection_epoch);
+        EXPECT_EQ(next.selection.gid, empty ? "gid-5" : "gid-7");
+        EXPECT_EQ(next.auto_gid_reprobe_from, empty ? "" : "remote-gid");
+        EXPECT_FALSE(peers.needsCandidateScan("peer", initial));
+        EXPECT_EQ(peers.prepare("peer", initial).selection_epoch,
+                  next.selection_epoch);
+        if (empty) {
+            EXPECT_EQ(peers.recordCompletion("peer", {3, next.selection_epoch},
+                                             false),
+                      AutoGidDataPathAction::kExhausted);
+        }
+    }
+}
+
+TEST(RdmaGidProbeTest, AdvisoryAppliesOnceAndBudgetZeroKeepsSelection) {
+    const AutoGidSelection initial{5, "gid-old"};
+    const std::vector<AutoGidSelection> candidates = {{7, "gid-new"},
+                                                      {5, "gid-old"}};
+    PeerAutoGidStateTable enabled(/*capacity=*/2, /*max_advances=*/1,
+                                  /*enabled=*/true);
+    auto advanced = enabled.prepare("peer", initial, candidates, "gid-old");
+    EXPECT_EQ(advanced.selection.gid, "gid-new");
+    auto repeated = enabled.prepare("peer", initial, candidates, "gid-old");
+    EXPECT_EQ(repeated.selection.gid, "gid-new");
+    EXPECT_EQ(repeated.selection_epoch, advanced.selection_epoch);
+
+    PeerAutoGidStateTable no_budget(/*capacity=*/2, /*max_advances=*/0,
+                                    /*enabled=*/true);
+    auto unchanged = no_budget.prepare("peer", initial, candidates, "gid-old");
+    EXPECT_EQ(unchanged.selection.gid, "gid-old");
+
+    PeerAutoGidStateTable no_candidates(/*capacity=*/2, /*max_advances=*/1,
+                                        /*enabled=*/true);
+    auto still_current = no_candidates.prepare(
+        "peer", initial, std::vector<AutoGidSelection>{}, "gid-old");
+    EXPECT_EQ(still_current.selection.gid, "gid-old");
+}
+
+TEST(RdmaGidProbeTest, LocalAdvanceAdvisesLastPeerAdvertisedGid) {
+    PeerAutoGidStateTable peers(/*capacity=*/2, /*max_advances=*/1,
+                                /*enabled=*/true);
+    const AutoGidSelection initial{5, "local-old"};
+    auto selected = peers.prepare("peer", initial);
+    peers.rememberPeerAdvertisedGid("peer", "peer-old");
+    ASSERT_EQ(
+        peers.recordCompletion("peer", {1, selected.selection_epoch}, false),
+        AutoGidDataPathAction::kRetrySameGid);
+    ASSERT_EQ(
+        peers.recordCompletion("peer", {2, selected.selection_epoch}, false),
+        AutoGidDataPathAction::kAdvanceGid);
+
+    auto advanced = peers.prepare("peer", initial, {{7, "local-new"}, initial});
+    EXPECT_EQ(advanced.selection.gid, "local-new");
+    EXPECT_EQ(advanced.auto_gid_reprobe_from, "peer-old");
+}
+
+TEST(RdmaGidProbeTest, RefreshRebindsSameGidAndOnlyAdvancesWhenMissing) {
+    PeerAutoGidStateTable peers(/*capacity=*/2, /*max_advances=*/2,
+                                /*enabled=*/true);
+    const AutoGidSelection initial{5, "gid-stable"};
+    auto first = peers.prepare("peer", initial);
+    peers.markCandidatesDirty();
+    auto rebound = peers.prepare("peer", initial,
+                                 {{9, "gid-stable"}, {7, "gid-fallback"}});
+    EXPECT_EQ(rebound.selection.gid, "gid-stable");
+    EXPECT_EQ(rebound.selection.gid_index, 9);
+    EXPECT_GT(rebound.selection_epoch, first.selection_epoch);
+
+    peers.markCandidatesDirty();
+    auto missing = peers.prepare("peer", initial, {{7, "gid-fallback"}});
+    EXPECT_EQ(missing.selection.gid, "gid-fallback");
+}
+
+TEST(RdmaGidProbeTest, PeerStateIsBoundedAndExplicitGidBypassesRecovery) {
+    PeerAutoGidStateTable bounded(/*capacity=*/2, /*max_advances=*/1,
+                                  /*enabled=*/true);
+    bounded.prepare("peer-a", {1, "gid-a"});
+    auto peer_b = bounded.prepare("peer-b", {2, "gid-b"});
+    ASSERT_EQ(
+        bounded.recordCompletion("peer-b", {1, peer_b.selection_epoch}, false),
+        AutoGidDataPathAction::kRetrySameGid);
+    bounded.prepare("peer-a", {1, "gid-a"});
+    bounded.prepare("peer-c", {3, "gid-c"});
+    EXPECT_EQ(bounded.size(), 2u);
+    EXPECT_TRUE(bounded.contains("peer-b"));
+    EXPECT_FALSE(bounded.contains("peer-a"));
+
+    PeerAutoGidStateTable explicit_gid(/*capacity=*/2, /*max_advances=*/2,
+                                       /*enabled=*/false);
+    auto selected = explicit_gid.prepare("peer", {4, "explicit"},
+                                         {{8, "other"}}, "explicit");
+    EXPECT_FALSE(selected.recovery_enabled);
+    EXPECT_EQ(selected.selection.gid, "explicit");
+    EXPECT_EQ(explicit_gid.recordCompletion(
+                  "peer", {1, selected.selection_epoch}, false),
+              AutoGidDataPathAction::kUnavailable);
+}
+
+TEST(RdmaGidProbeTest, RecoveryStateSurvivesCapacityChurn) {
+    PeerAutoGidStateTable peers(/*capacity=*/1, /*max_advances=*/1,
+                                /*enabled=*/true);
+    auto peer_a = peers.prepare("peer-a", {5, "gid-a"});
+    ASSERT_EQ(
+        peers.recordCompletion("peer-a", {10, peer_a.selection_epoch}, false),
+        AutoGidDataPathAction::kRetrySameGid);
+
+    auto peer_b = peers.prepare("peer-b", {3, "gid-b"});
+    EXPECT_EQ(peers.size(), 2u);
+    EXPECT_TRUE(peers.contains("peer-a"));
+    EXPECT_TRUE(peers.contains("peer-b"));
+    EXPECT_TRUE(peer_b.recovery_enabled);
+    EXPECT_EQ(
+        peers.recordCompletion("peer-b", {20, peer_b.selection_epoch}, false),
+        AutoGidDataPathAction::kRetrySameGid);
+    EXPECT_EQ(
+        peers.recordCompletion("peer-a", {11, peer_a.selection_epoch}, false),
+        AutoGidDataPathAction::kAdvanceGid);
+
+    auto peer_c = peers.prepare("peer-c", {7, "gid-c"});
+    EXPECT_TRUE(peer_c.recovery_enabled);
+    EXPECT_LE(peers.size(), 2u);
+    EXPECT_TRUE(peers.contains("peer-a"));
+    EXPECT_TRUE(peers.contains("peer-c"));
+    EXPECT_FALSE(peers.contains("peer-b"));
+}
+
+TEST(RdmaGidProbeTest, RecoveryStateRemainsHardBoundedUnderFailureStorm) {
+    PeerAutoGidStateTable peers(/*capacity=*/1, /*max_advances=*/1,
+                                /*enabled=*/true);
+    for (uint64_t endpoint_id = 1; endpoint_id <= 1024; ++endpoint_id) {
+        const std::string peer = "peer-" + std::to_string(endpoint_id);
+        auto selected = peers.prepare(peer, {5, "gid"});
+        if (!selected.recovery_enabled) continue;
+        EXPECT_EQ(peers.recordCompletion(
+                      peer, {endpoint_id, selected.selection_epoch}, false),
+                  AutoGidDataPathAction::kRetrySameGid);
+        EXPECT_LE(peers.size(), 2u);
+    }
+    EXPECT_EQ(peers.size(), 2u);
+}
+
+TEST(RdmaGidProbeTest, EvictedPeerRejectsStaleCompletionAfterRecreation) {
+    PeerAutoGidStateTable peers(/*capacity=*/1, /*max_advances=*/1,
+                                /*enabled=*/true);
+    const AutoGidSelection peer_a_gid{5, "gid-a"};
+    auto old_peer_a = peers.prepare("peer-a", peer_a_gid);
+
+    peers.prepare("peer-b", {3, "gid-b"});
+    peers.prepare("peer-c", {7, "gid-c"});
+    ASSERT_FALSE(peers.contains("peer-a"));
+
+    auto new_peer_a = peers.prepare("peer-a", peer_a_gid);
+    ASSERT_NE(new_peer_a.selection_epoch, old_peer_a.selection_epoch);
+    EXPECT_EQ(peers.recordCompletion("peer-a", {10, old_peer_a.selection_epoch},
+                                     false),
+              AutoGidDataPathAction::kIgnoreDuplicate);
 }
 
 // Regression tests for #2729: a routable-fabric private-range IPv4 GID must
