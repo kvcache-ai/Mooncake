@@ -71,13 +71,6 @@ class TransferEngineImplTestPeer {
                                                          std::move(transport));
     }
 
-    static void addTransport(TransferEngineImpl& engine,
-                             const std::string& name,
-                             std::shared_ptr<Transport> transport) {
-        engine.multi_transports_->transport_map_.emplace(name,
-                                                         std::move(transport));
-    }
-
     static void seedLocalMemoryRegion(TransferEngineImpl& engine, void* addr,
                                       uint64_t length) {
         std::unique_lock<std::shared_mutex> lock(engine.mutex_);
@@ -298,73 +291,6 @@ TEST_F(RdmaUnregisterRetryTest, BatchRetryIgnoresAlreadyCleanedSibling) {
               ERR_ADDRESS_OVERLAPPED);
 
     munmap(sibling, kLength);
-}
-
-// Multi-transport retry: the transports share one metadata instance with one
-// BufferDesc per transport (registration adds one each). After a partial
-// failure, the transport that failed finishes through its pending record
-// while an already-cleaned sibling transport reports NOT_REGISTERED — the
-// engine must treat that as "nothing remains", erase the record, and report
-// success instead of leaving the region stuck.
-TEST_F(RdmaUnregisterRetryTest,
-       MultiTransportRetryErasesWithCleanedSiblingTransport) {
-    // Two entries mirror a real two-transport registration.
-    addMetadataEntry();
-    addMetadataEntry();
-    auto sibling_transport = std::make_shared<RdmaTransport>();
-    RdmaTransportTestPeer::bindMetadata(*sibling_transport, metadata_,
-                                        "local-rdma-segment");
-
-    TransferEngineImpl engine;
-    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:17948"), 0);
-    TransferEngineImplTestPeer::replaceTransports(engine,
-                                                  std::move(transport_));
-    TransferEngineImplTestPeer::addTransport(engine, "tcp",
-                                             std::move(sibling_transport));
-    TransferEngineImplTestPeer::seedLocalMemoryRegion(engine, buffer_, kLength);
-
-    // First attempt: one transport removes an entry and fails its MR
-    // deregistration (pending recorded); the other removes the remaining
-    // entry and succeeds. The engine keeps its record.
-    g_fake_dereg_failures_remaining = 1;
-    EXPECT_EQ(engine.unregisterLocalMemory(buffer_, false), ERR_CONTEXT);
-    EXPECT_EQ(engine.registerLocalMemory(buffer_, kLength, "cpu", true, false),
-              ERR_ADDRESS_OVERLAPPED);
-
-    // Retry: the failed transport finishes through its pending record; the
-    // sibling reports NOT_REGISTERED (it has no per-transport pending state).
-    EXPECT_EQ(engine.unregisterLocalMemory(buffer_, false), 0);
-    EXPECT_EQ(g_fake_dereg_calls.load(), 2);
-    EXPECT_NE(engine.registerLocalMemory(buffer_, kLength, "cpu", true, false),
-              ERR_ADDRESS_OVERLAPPED);
-}
-
-// The batch aggregation must behave the same way across transports.
-TEST_F(RdmaUnregisterRetryTest,
-       MultiTransportBatchRetryErasesWithCleanedSiblingTransport) {
-    addMetadataEntry();
-    addMetadataEntry();
-    auto sibling_transport = std::make_shared<RdmaTransport>();
-    RdmaTransportTestPeer::bindMetadata(*sibling_transport, metadata_,
-                                        "local-rdma-segment");
-
-    TransferEngineImpl engine;
-    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:17949"), 0);
-    TransferEngineImplTestPeer::replaceTransports(engine,
-                                                  std::move(transport_));
-    TransferEngineImplTestPeer::addTransport(engine, "tcp",
-                                             std::move(sibling_transport));
-    TransferEngineImplTestPeer::seedLocalMemoryRegion(engine, buffer_, kLength);
-
-    g_fake_dereg_failures_remaining = 1;
-    EXPECT_EQ(engine.unregisterLocalMemoryBatch({buffer_}), ERR_CONTEXT);
-    EXPECT_EQ(engine.registerLocalMemory(buffer_, kLength, "cpu", true, false),
-              ERR_ADDRESS_OVERLAPPED);
-
-    EXPECT_EQ(engine.unregisterLocalMemoryBatch({buffer_}), 0);
-    EXPECT_EQ(g_fake_dereg_calls.load(), 2);
-    EXPECT_NE(engine.registerLocalMemory(buffer_, kLength, "cpu", true, false),
-              ERR_ADDRESS_OVERLAPPED);
 }
 
 // When every transport reports NOT_REGISTERED the address was never

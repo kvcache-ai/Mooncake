@@ -1031,21 +1031,24 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     // A previous teardown that could not release NoF registrations leaves
-    // caller-owned buffers (or quarantined shms) whose DMA translation may
-    // still be live under the OLD initiator's owner token. Re-init installs a
-    // fresh initiator (fresh owner token) whose UnregisterMemory no-ops on
-    // them, so a later teardown would erase the records and falsely report
-    // success — or worse, munmap a quarantined VA while the translation is
-    // live. Refuse to re-init this object; create a new client instead.
-    {
-        std::shared_lock<std::shared_mutex> lock(registered_buffer_mutex_);
-        if (!registered_buffer_sizes_.empty()) {
-            LOG(ERROR) << "Cannot re-initialize: a previous teardown left "
-                          "un-released NoF registrations; create a new client "
-                          "instead";
-            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
-        }
+    // caller-owned buffers whose DMA translation may still be live under the
+    // OLD initiator's owner token. Re-init installs a fresh initiator whose
+    // UnregisterMemory no-ops on them, so a later teardown would erase the
+    // records and falsely report success. nof_buffer_cleanup_failed_ is the
+    // precise signal: it is set only when CleanupNofRegisteredBuffers fails
+    // to release a record, and stays false when NoF is unavailable — a clean
+    // non-NoF teardown that leaves register_buffer() records behind is NOT
+    // refused. Refuse to re-init this object; create a new client instead.
+    if (nof_buffer_cleanup_failed_.load(std::memory_order_acquire)) {
+        LOG(ERROR) << "Cannot re-initialize: a previous teardown left "
+                      "un-released NoF registrations; create a new client "
+                      "instead";
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
     }
+    // Likewise refuse when a previous teardown quarantined a mapping (a
+    // failed TE or NoF unregister): it stays pinned because its registration
+    // state is uncertain, and a re-initialized client's teardown could
+    // munmap it while an old registration is still live.
     {
         std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
         if (!quarantine_shms_.empty()) {

@@ -828,28 +828,16 @@ int TransferEngineImpl::unregisterLocalMemory(void* addr,
                                               bool update_metadata) {
     // Best-effort: try every transport so one failure can't leave the region
     // registered on the others; mirrors unregisterLocalMemoryBatch (#2869).
-    // ERR_ADDRESS_NOT_REGISTERED is not a failure: the transports share one
-    // metadata instance with one BufferDesc per transport, so after a partial
-    // failure a retry always finds some transports already cleaned. Treat it
-    // as "nothing remains for this transport" — but preserve the
-    // never-registered contract: when NO transport did anything, report
-    // NOT_REGISTERED instead of success.
     int first_error = 0;
-    bool any_success = false;
     for (auto& transport : multi_transports_->listTransports()) {
         int ret = transport->unregisterLocalMemory(addr, update_metadata);
-        if (ret == ERR_ADDRESS_NOT_REGISTERED) continue;
-        if (ret) {
-            if (!first_error) first_error = ret;
-        } else {
-            any_success = true;
-        }
+        if (ret && !first_error) first_error = ret;
     }
     if (first_error) return first_error;
 
     std::unique_lock<std::shared_mutex> lock(mutex_);
     eraseMemoryRegionLocked(addr);
-    return any_success ? 0 : ERR_ADDRESS_NOT_REGISTERED;
+    return 0;
 }
 
 #ifdef ENABLE_MULTI_PROTOCOL
@@ -1041,19 +1029,10 @@ int TransferEngineImpl::registerLocalMemoryBatch(
 
 int TransferEngineImpl::unregisterLocalMemoryBatch(
     const std::vector<void*>& addr_list) {
-    // Same aggregation as the single-address path: an already-cleaned
-    // transport reports ERR_ADDRESS_NOT_REGISTERED and must not block the
-    // erase, while a fully unknown batch keeps the NOT_REGISTERED contract.
     int first_error = 0;
-    bool any_success = false;
     for (auto transport : multi_transports_->listTransports()) {
         int ret = transport->unregisterLocalMemoryBatch(addr_list);
-        if (ret == ERR_ADDRESS_NOT_REGISTERED) continue;
-        if (ret) {
-            if (!first_error) first_error = ret;
-        } else {
-            any_success = true;
-        }
+        if (ret && !first_error) first_error = ret;
     }
     if (first_error) return first_error;
 
@@ -1061,7 +1040,7 @@ int TransferEngineImpl::unregisterLocalMemoryBatch(
     for (auto& addr : addr_list) {
         eraseMemoryRegionLocked(addr);
     }
-    return any_success ? 0 : ERR_ADDRESS_NOT_REGISTERED;
+    return 0;
 }
 
 bool TransferEngineImpl::hasOverlapLocked(uintptr_t addr,
