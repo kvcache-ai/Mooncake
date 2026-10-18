@@ -345,6 +345,44 @@ TEST(NvlinkHostNumaRegistrationTest, FailedUnregisterKeepsHandleOwned) {
     EXPECT_TRUE(owner->Release().ok());
 }
 
+#ifdef ENABLE_MULTI_PROTOCOL
+TEST(NvlinkHostNumaRegistrationTest, AmbiguousRemovalRetainsMetadataAndHandle) {
+    constexpr size_t kLength = 64 * 1024;
+    void* const base = reinterpret_cast<void*>(0x210000000ULL);
+    FakeRegistrationDriver driver;
+    auto owner =
+        NvlinkTransportTestPeer::MakeOwnedRange(base, kLength, driver.api());
+    ASSERT_NE(owner, nullptr);
+    NvlinkTransport transport;
+    auto metadata = NvlinkTransportTestPeer::Configure(transport);
+    ASSERT_EQ(NvlinkTransportTestPeer::Register(transport, base, kLength), 0);
+    auto segment = metadata->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    ASSERT_EQ(segment->buffers.size(), 1U);
+    ASSERT_EQ(metadata->addLocalMemoryBuffer(segment->buffers[0], false), 0);
+    auto ambiguous = metadata->getSegmentDescByID(LOCAL_SEGMENT_ID);
+
+    EXPECT_EQ(NvlinkTransportTestPeer::Unregister(transport, base),
+              ERR_INVALID_ARGUMENT);
+    EXPECT_EQ(metadata->getSegmentDescByID(LOCAL_SEGMENT_ID), ambiguous);
+    EXPECT_EQ(driver.release_calls, 0);
+    EXPECT_EQ(NvlinkTransportTestPeer::RegistrationCount(transport), 1U);
+
+    // Repair the injected duplicate and retry. Releasing the handle must not
+    // skip the metadata removal that was previously rejected.
+    auto repaired = std::make_shared<TransferMetadata::SegmentDesc>(*ambiguous);
+    repaired->buffers.pop_back();
+    repaired->rebuildBufferRangeIndex();
+    ASSERT_EQ(metadata->addLocalSegment(LOCAL_SEGMENT_ID, "local",
+                                        std::move(repaired)),
+              0);
+    ASSERT_EQ(NvlinkTransportTestPeer::Unregister(transport, base), 0);
+    EXPECT_TRUE(
+        metadata->getSegmentDescByID(LOCAL_SEGMENT_ID)->buffers.empty());
+    EXPECT_EQ(driver.release_calls, 1);
+    EXPECT_TRUE(owner->Release().ok());
+}
+#endif
+
 TEST(NvlinkHostNumaRegistrationTest, RejectsNonExactOwnedRange) {
     constexpr size_t kLength = 64 * 1024;
     void* const base = reinterpret_cast<void*>(0x400000000ULL);

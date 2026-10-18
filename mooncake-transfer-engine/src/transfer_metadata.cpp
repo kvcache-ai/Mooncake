@@ -1871,10 +1871,10 @@ int TransferMetadata::removeLocalMemoryBuffer(void *addr, bool update_metadata,
 #endif
             if (!address_matches) continue;
 #ifdef ENABLE_MULTI_PROTOCOL
-            if (!protocol.empty() && iter->protocol != protocol) continue;
+            if (iter->protocol != protocol) continue;
 #endif
-            // Reject ambiguous address-only calls and duplicate descriptors
-            // within one protocol; never erase an arbitrary first match.
+            // Reject duplicate descriptors within the selected protocol,
+            // including the empty tag used by legacy callers.
 #ifdef ENABLE_MULTI_PROTOCOL
             if (match != new_segment_desc->buffers.end()) {
                 LOG(ERROR) << "Ambiguous local buffer metadata removal at "

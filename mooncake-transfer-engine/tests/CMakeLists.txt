@@ -449,6 +449,22 @@ target_link_libraries(transfer_metadata_test PUBLIC transfer_engine gtest
                                                     gtest_main)
 add_test(NAME transfer_metadata_test COMMAND transfer_metadata_test)
 
+# These tests use local metadata, POSIX SHM and optionally a file-backed CXL
+# mapping. They require no GPU or RDMA device and no metadata server.
+add_test(NAME transfer_metadata_removal_test
+         COMMAND transfer_metadata_test
+                 --gtest_filter=TransferMetadataRemovalTest.*)
+set_tests_properties(transfer_metadata_removal_test PROPERTIES TIMEOUT 60)
+if(ENABLE_MULTI_PROTOCOL)
+  add_executable(transport_metadata_removal_test
+                 ${WORKSPACE}/transport_metadata_removal_test.cpp)
+  target_link_libraries(transport_metadata_removal_test
+                       PUBLIC transfer_engine gtest gtest_main)
+  add_test(NAME transport_metadata_removal_test
+           COMMAND transport_metadata_removal_test)
+  set_tests_properties(transport_metadata_removal_test PROPERTIES TIMEOUT 60)
+endif()
+
 add_executable(config_test ${WORKSPACE}/config_test.cpp)
 target_link_libraries(config_test PUBLIC transfer_engine gtest gtest_main)
 add_test(NAME config_test COMMAND config_test)

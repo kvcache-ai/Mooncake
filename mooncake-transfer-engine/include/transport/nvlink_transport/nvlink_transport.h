@@ -157,6 +157,7 @@ class NvlinkTransport : public Transport {
     std::shared_ptr<GpuIpcTransportPolicy> policy_;
 
     std::mutex register_mutex_;
+    int removeLocalMemoryBuffer(void* addr, bool update_metadata);
 #if MOONCAKE_NVLINK_HOST_NUMA_ENABLED
     using AddLocalMemoryBufferOp = std::function<int(const BufferDesc&, bool)>;
     using RemoveLocalMemoryBufferOp = std::function<int(void*, bool)>;

@@ -55,7 +55,7 @@ CxlTransport::~CxlTransport() {
         cxl_dev_size != 0) {
         munmap(cxl_base_addr, cxl_dev_size);
     }
-    metadata_->removeSegmentDesc(local_server_name_);
+    if (metadata_) metadata_->removeSegmentDesc(local_server_name_);
 }
 
 size_t CxlTransport::cxlGetDeviceSize() {
@@ -218,8 +218,9 @@ int CxlTransport::install(std::string &local_server_name,
 }
 
 int CxlTransport::allocateLocalSegmentID() {
-    auto desc = metadata_->getSegmentDesc(local_server_name_);
-    if (!desc) desc = std::make_shared<SegmentDesc>();
+    auto existing = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    auto desc = existing ? std::make_shared<SegmentDesc>(*existing)
+                         : std::make_shared<SegmentDesc>();
     desc->name = local_server_name_;
 #ifdef ENABLE_MULTI_PROTOCOL
     if (!desc->protocol.empty()) desc->protocol += ",";
@@ -239,7 +240,7 @@ int CxlTransport::registerLocalMemory(void *addr, size_t length,
                                       bool remote_accessible,
                                       bool update_metadata) {
     (void)remote_accessible;
-    BufferDesc cxl_buffer_desc;
+    BufferDesc cxl_buffer_desc{};
     cxl_buffer_desc.name = local_server_name_;
 
     uintptr_t base = reinterpret_cast<uintptr_t>(cxl_base_addr);
@@ -266,7 +267,7 @@ int CxlTransport::registerLocalMemory(void *addr, size_t length,
 }
 
 int CxlTransport::unregisterLocalMemory(void *addr, bool update_metadata) {
-    return metadata_->removeLocalMemoryBuffer(addr, update_metadata);
+    return metadata_->removeLocalMemoryBuffer(addr, update_metadata, "cxl");
 }
 
 int CxlTransport::registerLocalMemoryBatch(

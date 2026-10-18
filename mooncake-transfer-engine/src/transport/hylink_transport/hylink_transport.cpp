@@ -657,7 +657,7 @@ int HylinkTransport::unregisterLocalMemory(void* addr, bool update_metadata) {
         registered_exports_.erase(key);
     }
     return metadata_->removeLocalMemoryBuffer(reinterpret_cast<void*>(key),
-                                              update_metadata);
+                                              update_metadata, "hylink");
 }
 
 int HylinkTransport::relocateSharedMemoryAddress(uint64_t& dest_addr,

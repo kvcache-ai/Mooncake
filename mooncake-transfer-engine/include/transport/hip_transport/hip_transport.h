@@ -9,6 +9,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 #include <utility>
 
@@ -90,6 +91,14 @@ class HipTransport : public Transport {
     bool use_fabric_mem_;
 
     std::mutex register_mutex_;
+    // Only published registrations belong to HIP. Host/local-only buffers
+    // skipped during registration must also be skipped during unregistration.
+    // Fabric descriptors use the allocation base rather than the input pointer.
+    struct LocalRegistration {
+        void* base;
+        bool metadata_removed = false;
+    };
+    std::unordered_map<void*, LocalRegistration> registered_addresses_;
 
     // Stream and event pools for async operations
     StreamPool stream_pool_;
