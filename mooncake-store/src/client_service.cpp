@@ -600,42 +600,45 @@ Client::HcaAffinity Client::MakeHcaAffinity(
         std::sort(hcas.begin(), hcas.end());
         hcas.erase(std::unique(hcas.begin(), hcas.end()), hcas.end());
     }
-    return [matrix = std::move(matrix),
-            buffers = std::move(buffers)](std::span<const Slice> slices) {
-        std::vector<std::string> common;
-        for (const auto& slice : slices) {
-            if (slice.size == 0) continue;
-            if (!slice.ptr) return std::vector<std::string>{};
-            const auto address = reinterpret_cast<uintptr_t>(slice.ptr);
-            std::string location;
-            for (const auto& buffer : buffers) {
-                if (address < buffer.addr) continue;
-                const auto offset = address - buffer.addr;
-                if (offset >= buffer.length ||
-                    slice.size > buffer.length - offset)
-                    continue;
-                location = buffer.location;
-                SegmentsLocationInfo segments;
-                if (parseSegmentsLocation(location, segments)) {
-                    location = resolveSegmentsLocation(segments, buffer.length,
-                                                       offset);
-                    if (location !=
-                        resolveSegmentsLocation(segments, buffer.length,
-                                                offset + slice.size - 1))
-                        return std::vector<std::string>{};
+    return
+        [matrix = std::move(matrix), buffers = std::move(buffers)](
+            std::span<const Slice> slices) -> const std::vector<std::string>& {
+            static const std::vector<std::string> empty;
+            const std::vector<std::string>* common = nullptr;
+            for (const auto& slice : slices) {
+                if (slice.size == 0) continue;
+                if (!slice.ptr) return empty;
+                const auto address = reinterpret_cast<uintptr_t>(slice.ptr);
+                std::string location;
+                for (const auto& buffer : buffers) {
+                    if (address < buffer.addr) continue;
+                    const auto offset = address - buffer.addr;
+                    if (offset >= buffer.length ||
+                        slice.size > buffer.length - offset)
+                        continue;
+                    location = buffer.location;
+                    SegmentsLocationInfo segments;
+                    if (parseSegmentsLocation(location, segments)) {
+                        location = resolveSegmentsLocation(
+                            segments, buffer.length, offset);
+                        if (location !=
+                            resolveSegmentsLocation(segments, buffer.length,
+                                                    offset + slice.size - 1))
+                            return empty;
+                    }
+                    break;
                 }
-                break;
+                const auto entry = matrix.find(location);
+                if (entry == matrix.end() ||
+                    entry->second.preferred_hca.empty())
+                    return empty;
+                if (!common)
+                    common = &entry->second.preferred_hca;
+                else if (*common != entry->second.preferred_hca)
+                    return empty;
             }
-            const auto entry = matrix.find(location);
-            if (entry == matrix.end() || entry->second.preferred_hca.empty())
-                return std::vector<std::string>{};
-            if (common.empty())
-                common = entry->second.preferred_hca;
-            else if (common != entry->second.preferred_hca)
-                return std::vector<std::string>{};
-        }
-        return common;
-    };
+            return common ? *common : empty;
+        };
 }
 
 Client::HcaAffinity Client::MakeHcaAffinity() const {
@@ -674,8 +677,8 @@ ErrorCode Client::ReadReplicaSelector::operator()(
                                                  client_->GetLocalEndpoints());
         }
     }
-    const auto hcas =
-        context_ ? context_->infer(destinations) : std::vector<std::string>{};
+    if (!context_) return client_->FindFirstCompleteReplica(replicas, result);
+    const auto& hcas = context_->infer(destinations);
     if (hcas.empty())
         return client_->FindFirstCompleteReplica(replicas, result);
     const auto* selected =

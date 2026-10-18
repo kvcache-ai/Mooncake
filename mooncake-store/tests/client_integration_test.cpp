@@ -155,6 +155,11 @@ TEST(HcaAffinityTest, InfersOnlyHomogeneousRegisteredSources) {
     const std::vector<Slice> mixed{homogeneous[0],
                                    {reinterpret_cast<void*>(0x101000), 4096}};
     EXPECT_TRUE(infer(mixed).empty());
+    const auto& names = infer(homogeneous);
+    topology.clear();
+    EXPECT_TRUE(infer(mixed).empty());
+    EXPECT_EQ(names, (std::vector<std::string>{"mlx5_0", "mlx5_2"}));
+    EXPECT_EQ(infer(homogeneous), names);
 }
 
 TEST(HcaAffinityTest, BatchHintsFollowKeysAndRetrySubsets) {

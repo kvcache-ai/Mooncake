@@ -80,9 +80,9 @@ class Client {
     virtual ~Client();
 
     // One topology/registration snapshot serves every key or fragment in a
-    // batch.
+    // batch. Returned names remain owned by that snapshot.
     using HcaAffinity =
-        std::function<std::vector<std::string>(std::span<const Slice>)>;
+        std::function<const std::vector<std::string>&(std::span<const Slice>)>;
     static HcaAffinity MakeHcaAffinity(const Topology& topology,
                                        std::vector<SegmentBufferInfo> buffers);
     static std::optional<SegmentLocality> DiscoverSegmentLocality(
