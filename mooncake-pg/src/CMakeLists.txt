@@ -15,6 +15,7 @@ if(USE_CUDA)
       "${_pg_device_source}"
       "${CMAKE_CURRENT_SOURCE_DIR}/device_comm/device_collective/algorithms/ring/ring_all_reduce.cu"
       "${CMAKE_CURRENT_SOURCE_DIR}/device_comm/device_collective/algorithms/oneshot/one_shot_all_reduce.cu"
+      "${CMAKE_CURRENT_SOURCE_DIR}/device_comm/device_collective/algorithms/tree/tree_all_reduce.cu"
   )
 elseif(USE_MUSA OR USE_MACA)
   set(_pg_device_object "${CMAKE_CURRENT_BINARY_DIR}/mooncake_worker_device.o")
@@ -171,6 +172,8 @@ if(USE_CUDA)
       device_comm/device_collective/protocols/ll/ll_resources.cpp
       device_comm/device_collective/algorithms/ring/ring_all_reduce.cpp
       device_comm/device_collective/algorithms/oneshot/one_shot_all_reduce.cpp
+      device_comm/device_collective/algorithms/tree/tree_topology.cpp
+      device_comm/device_collective/algorithms/tree/tree_all_reduce.cpp
       device_comm/device_collective/strong_stream.cpp)
 endif()
 
@@ -179,9 +182,9 @@ target_include_directories(
   mooncake_pg PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>
                      $<INSTALL_INTERFACE:include>)
 if(USE_MACA)
-  target_include_directories(mooncake_pg PRIVATE
-                             "${MACA_ROOT}/tools/cu-bridge/include"
-                             "${MACA_ROOT}/include/mcr")
+  target_include_directories(
+    mooncake_pg PRIVATE "${MACA_ROOT}/tools/cu-bridge/include"
+                        "${MACA_ROOT}/include/mcr")
 endif()
 target_link_libraries(mooncake_pg PRIVATE transfer_engine mooncake_pg_device)
 

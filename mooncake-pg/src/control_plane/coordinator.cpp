@@ -22,6 +22,41 @@ bool validDeviceCollectiveWorkspaceEndpoint(
                transfer_endpoint.region_size - endpoint.buffer_offset;
 }
 
+bool validTreeEndpoint(const DeviceGroupEndpoint& endpoint,
+                       const DeviceCollectiveWorkspaceEndpoint& workspace,
+                       const DeviceTransferEndpoint& transfer,
+                       uint32_t capacity) {
+    if (!endpoint.supportsTree()) return false;
+    const auto signal_words = kMaxDeviceCollectiveChannels * capacity *
+                              (1 + 2 * kSimplePipelineDepth);
+    const auto range_valid = [&](uint64_t offset, uint64_t bytes) {
+        return offset % alignof(uint64_t) == 0 &&
+               offset <= transfer.region_size &&
+               bytes <= transfer.region_size - offset;
+    };
+    const auto disjoint = [](uint64_t a, uint64_t as, uint64_t b, uint64_t bs) {
+        return a + as <= b || b + bs <= a;
+    };
+    const auto simple_bytes =
+        uint64_t{endpoint.simple->signal_count} * sizeof(uint64_t);
+    const auto epoch_bytes =
+        uint64_t{endpoint.view_epoch_signal_count} * sizeof(uint64_t);
+    // Tree v1 uses two child receive roles and one parent role, each pipelined.
+    return workspace.buffer_offset % kSimplePayloadAlignment == 0 &&
+           workspace.buffer_size >=
+               3 * kSimplePipelineDepth * kSimplePayloadAlignment &&
+           endpoint.simple->signal_count >= signal_words &&
+           endpoint.view_epoch_signal_count >= capacity &&
+           range_valid(endpoint.simple->signal_offset, simple_bytes) &&
+           range_valid(endpoint.view_epoch_signal, epoch_bytes) &&
+           disjoint(endpoint.simple->signal_offset, simple_bytes,
+                    workspace.buffer_offset, workspace.buffer_size) &&
+           disjoint(endpoint.view_epoch_signal, epoch_bytes,
+                    workspace.buffer_offset, workspace.buffer_size) &&
+           disjoint(endpoint.view_epoch_signal, epoch_bytes,
+                    endpoint.simple->signal_offset, simple_bytes);
+}
+
 bool memberSupportsGpuCollectiveBackend(const GroupMember& member,
                                         GpuCollectiveBackend backend) {
     if (backend == GpuCollectiveBackend::Legacy) return true;
@@ -346,6 +381,14 @@ CentralizedCoordinatorStateMachine::handleConfirmReadyForActivation(
         return result;
     }
 
+    if (all_reduce_algorithm_ == DeviceAllReduceAlgorithm::Tree &&
+        member.preferred_gpu_collective_backend &&
+        (!member.endpoint ||
+         !member.endpoint->device_collective.supportsTree())) {
+        result.response.reject_reason =
+            "joining member does not support Tree v1";
+        return result;
+    }
     member.status = GroupMemberState::AwaitingActivation;
     view.epoch++;
     result.effects.push_back(PushViewUpdate{view});
@@ -410,6 +453,40 @@ CentralizedCoordinatorStateMachine::handlePublishEndpoint(
         return result;
     }
 
+    if (all_reduce_algorithm_ == DeviceAllReduceAlgorithm::Tree) {
+        for (const auto& ep : req.endpoints) {
+            const auto found = group_views_.find(ep.group_id);
+            if (found == group_views_.end()) {
+                result.response.reject_reason = "group not found";
+                return result;
+            }
+            const auto& view = found->second;
+            const auto& member = view.members[req.rank];
+            const bool gpu_group = std::any_of(
+                view.members.begin(), view.members.end(),
+                [](const auto& participant) {
+                    return participant.isMember() &&
+                           participant.preferred_gpu_collective_backend
+                               .has_value();
+                });
+            if (gpu_group &&
+                (member.preferred_gpu_collective_backend !=
+                     GpuCollectiveBackend::New ||
+                 !ranks_[req.rank].transfer_service_endpoint ||
+                 !ranks_[req.rank].collective_workspace_endpoint ||
+                 !validTreeEndpoint(
+                     ep.endpoint_info.device_collective,
+                     *ranks_[req.rank].collective_workspace_endpoint,
+                     *ranks_[req.rank].transfer_service_endpoint,
+                     view.max_group_size))) {
+                result.response.reject_reason =
+                    "explicit tree requires new backend, Simple and Tree v1 "
+                    "endpoints";
+                return result;
+            }
+        }
+    }
+
     for (const auto& ep : req.endpoints) {
         auto it = group_views_.find(ep.group_id);
         if (it == group_views_.end()) {
@@ -436,6 +513,16 @@ CentralizedCoordinatorStateMachine::handlePublishEndpoint(
             result.response.reject_reason =
                 "active member does not support the group's GPU collective "
                 "backend";
+            return result;
+        }
+        if (all_reduce_algorithm_ == DeviceAllReduceAlgorithm::Tree &&
+            member.preferred_gpu_collective_backend &&
+            (member.preferred_gpu_collective_backend !=
+                 GpuCollectiveBackend::New ||
+             !device_group_endpoint.supportsTree())) {
+            result.response.reject_reason =
+                "explicit tree requires new backend, Simple and Tree v1 "
+                "endpoints";
             return result;
         }
         member.endpoint = ep.endpoint_info;
@@ -1100,6 +1187,23 @@ void CentralizedCoordinatorStateMachine::tryAdmitPendingProposals(
         }
 
         if (req.is_activation &&
+            all_reduce_algorithm_ == DeviceAllReduceAlgorithm::Tree &&
+            view.gpu_collective_backend == GpuCollectiveBackend::New &&
+            std::any_of(
+                requested_global_ranks.begin(), requested_global_ranks.end(),
+                [&](GlobalRank rank) {
+                    const auto& member = view.members[rank];
+                    return member.preferred_gpu_collective_backend !=
+                               GpuCollectiveBackend::New ||
+                           (member.endpoint &&
+                            !member.endpoint->device_collective.supportsTree());
+                })) {
+            reply_and_pop(ProposalStatus::Rejected,
+                          "joining member is incompatible with explicit Tree");
+            continue;
+        }
+
+        if (req.is_activation &&
             !isActivatableSet(group_id, requested_global_ranks, view)) {
             // Keep the FIFO head pending until it times out.
             return;
@@ -1118,7 +1222,13 @@ void CentralizedCoordinatorStateMachine::tryAdmitPendingProposals(
             }
         }
 
-        resolveGpuCollectiveBackend(view);
+        if (!resolveGpuCollectiveBackend(view)) {
+            view = std::move(old_view);
+            reply_and_pop(
+                ProposalStatus::Rejected,
+                "explicit Tree requires compatible new-backend members");
+            continue;
+        }
 
         const auto propose_id = pending.propose_id;
         queue.pop_front();
@@ -1262,7 +1372,7 @@ bool CentralizedCoordinatorStateMachine::isRankActivatable(
            member.hasEndpoint();
 }
 
-void CentralizedCoordinatorStateMachine::resolveGpuCollectiveBackend(
+bool CentralizedCoordinatorStateMachine::resolveGpuCollectiveBackend(
     GroupView& view) {
     std::optional<GpuCollectiveBackend> consensus;
     bool has_active_rank = false;
@@ -1282,7 +1392,7 @@ void CentralizedCoordinatorStateMachine::resolveGpuCollectiveBackend(
         preferences_conflict |= consensus != preferred;
     }
 
-    if (!has_active_rank) return;
+    if (!has_active_rank) return true;
 
     if (preferences_conflict) {
         LOG(WARNING) << "[PG] Conflicting GPU collective backend preferences; "
@@ -1293,7 +1403,7 @@ void CentralizedCoordinatorStateMachine::resolveGpuCollectiveBackend(
     }
 
     // CPU groups consistently have no GPU backend preference.
-    if (!consensus.has_value()) return;
+    if (!consensus.has_value()) return true;
 
     auto selected = *consensus;
     const bool all_support_selected = std::all_of(
@@ -1302,6 +1412,19 @@ void CentralizedCoordinatorStateMachine::resolveGpuCollectiveBackend(
             return !member.isActive() ||
                    memberSupportsGpuCollectiveBackend(member, selected);
         });
+    if (all_reduce_algorithm_ == DeviceAllReduceAlgorithm::Tree &&
+        (preferences_conflict || selected != GpuCollectiveBackend::New ||
+         !all_support_selected ||
+         std::any_of(
+             view.members.begin(), view.members.end(), [](const auto& member) {
+                 return member.isActive() &&
+                        (!member.endpoint ||
+                         !member.endpoint->device_collective.supportsTree());
+             }))) {
+        LOG(ERROR) << "[PG] Explicit Tree rejects an incompatible GPU group"
+                   << " group=" << view.group_id;
+        return false;
+    }
     if (!all_support_selected) {
         LOG(WARNING) << "[PG] Preferred GPU collective backend is not "
                         "available on every active rank; falling back to legacy"
@@ -1320,7 +1443,16 @@ void CentralizedCoordinatorStateMachine::resolveGpuCollectiveBackend(
     }
 
     view.all_reduce_algorithm_choices.clear();
-    if (selected != GpuCollectiveBackend::New) return;
+    if (selected != GpuCollectiveBackend::New) return true;
+
+    if (all_reduce_algorithm_ == DeviceAllReduceAlgorithm::Tree) {
+        view.all_reduce_algorithm_choices.push_back(
+            {std::numeric_limits<uint64_t>::max(),
+             DeviceAllReduceAlgorithm::Tree});
+        LOG(INFO) << "[PG] Coordinator selected AllReduce algorithm=tree"
+                  << " group=" << view.group_id;
+        return true;
+    }
 
     const bool use_one_shot =
         all_reduce_algorithm_ != DeviceAllReduceAlgorithm::Ring &&
@@ -1344,6 +1476,7 @@ void CentralizedCoordinatorStateMachine::resolveGpuCollectiveBackend(
                          << " group=" << view.group_id;
         }
     }
+    return true;
 }
 
 void CentralizedCoordinatorStateMachine::checkGroupTransitions(
@@ -1371,7 +1504,7 @@ void CentralizedCoordinatorStateMachine::checkGroupTransitions(
                 // All active ranks have endpoints and are Healthy.
                 // Resolve preferences before starting the bootstrap barrier.
                 // Every active rank installs this decision before Ready.
-                resolveGpuCollectiveBackend(view);
+                if (!resolveGpuCollectiveBackend(view)) continue;
 
                 // Transition to BootstrapSyncing and initiate a barrier.
                 view.status = GroupStatus::BootstrapSyncing;
@@ -1404,6 +1537,15 @@ bool CentralizedCoordinatorStateMachine::validateGroupRegistration(
         response.success = false;
         response.reject_reason =
             "preferred GPU collective backend is not recognized";
+        return false;
+    }
+
+    if (all_reduce_algorithm_ == DeviceAllReduceAlgorithm::Tree && preferred &&
+        preferred != GpuCollectiveBackend::New) {
+        response.success = false;
+        response.reject_reason =
+            "explicit tree requires the new GPU collective backend";
+        response.allow_local_fallback.emplace(false);
         return false;
     }
 

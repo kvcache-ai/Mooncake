@@ -14,6 +14,7 @@
 
 #include "common.h"
 #include "error_types.h"
+#include "control_plane/collective_algorithm_policy.h"
 #include "gpu_runtime.h"
 #include "memory_location.h"
 #if MOONCAKE_PG_HAS_COLLECTIVE_V2
@@ -68,19 +69,8 @@ PGResult<DeviceRouteConfig> loadDeviceRouteConfigFromEnvironment() {
 PGResult<std::optional<DeviceAllReduceAlgorithm>>
 loadCollectiveAlgorithmFromEnvironment() {
     const char* raw_value = std::getenv("MOONCAKE_PG_COLLECTIVE_ALGORITHM");
-    if (!raw_value || std::string_view(raw_value) == "auto") {
-        return std::optional<DeviceAllReduceAlgorithm>{};
-    }
-    const std::string_view value(raw_value);
-    if (value == "ring") {
-        return std::optional{DeviceAllReduceAlgorithm::Ring};
-    }
-    if (value == "oneshot") {
-        return std::optional{DeviceAllReduceAlgorithm::OneShot};
-    }
-    return makePGError(PGErrorCode::InvalidArgument,
-                       "MOONCAKE_PG_COLLECTIVE_ALGORITHM must be 'auto', "
-                       "'ring', or 'oneshot'");
+    return parseCollectiveAlgorithm(raw_value ? std::string_view(raw_value)
+                                              : std::string_view("auto"));
 }
 
 void copyDeviceToDevice(void* dst, const void* src, size_t bytes,
@@ -1890,7 +1880,7 @@ void MooncakeCommunicator::applyGroupState(
         switch (next_mode) {
             case CollectiveExtensionState::Isolated:
             case CollectiveExtensionState::Quiescing:
-                PG_ASSERT_OK(device_collective_->useLocalOnly(view.epoch));
+                PG_ASSERT_OK(device_collective_->useLocalOnly(view));
                 break;
             case CollectiveExtensionState::Normal:
                 PG_ASSERT_OK(device_collective_->applyGroupView(view));

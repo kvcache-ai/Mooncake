@@ -84,7 +84,6 @@ struct CollectiveChunk {
     uint64_t count = 0;
 };
 
-inline constexpr uint32_t kMaxDeviceCollectiveChannels = 32;
 static_assert(kMaxDeviceCollectiveChannels <= kTransferLaneCount);
 inline constexpr uint32_t kMaxDeviceControlUpdateOperations = 8;
 inline constexpr uint32_t kDeviceControlUpdatePayloadBytes = 8192;

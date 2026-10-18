@@ -22,9 +22,36 @@ class SimplePrimitives {
         PG_ASSERT(state.transfer_handle && channel_count > 0 &&
                   channel_count <= kMaxDeviceCollectiveChannels &&
                   channel < channel_count);
+        const auto buffers = SimpleBufferLayout::make(
+            workspace.bytes / channel_count, max_chunk_bytes);
+        const uint64_t offset = uint64_t{channel} * buffers.bufferBytes();
+        return bindConnection(state, workspace, recv_peer, send_peer, channel,
+                              {buffers, offset, offset, offset}, timeout_ticks);
+    }
+
+    [[nodiscard]] __device__ __forceinline__ static SimplePrimitives
+    bindConnection(const SimpleBindings& state,
+                   const SimpleWorkspace& workspace,
+                   const CollectivePeer& recv_peer,
+                   const CollectivePeer& send_peer, uint32_t channel,
+                   const SimpleConnectionLayout& layout,
+                   uint64_t timeout_ticks) {
+        PG_ASSERT(state.transfer_handle &&
+                  channel < kMaxDeviceCollectiveChannels);
         const auto& handle = *state.transfer_handle;
         PG_ASSERT(handle.peer_accessible_region.contains(workspace.buffer,
                                                          workspace.bytes));
+        const auto bytes = layout.buffers.bufferBytes();
+        PG_ASSERT(layout.buffers.chunk_bytes >= sizeof(T) &&
+                  layout.buffers.chunk_bytes % kSimplePayloadAlignment == 0);
+        PG_ASSERT(layout.receive_offset <= workspace.bytes &&
+                  bytes <= workspace.bytes - layout.receive_offset);
+        PG_ASSERT(layout.remote_offset <= workspace.bytes &&
+                  bytes <= workspace.bytes - layout.remote_offset);
+        PG_ASSERT(layout.staging_offset <= workspace.bytes &&
+                  bytes <= workspace.bytes - layout.staging_offset);
+        PG_ASSERT(send_peer.workspace_offset <=
+                  UINT64_MAX - layout.remote_offset);
         if (workspace.staging) {
             PG_ASSERT(handle.local_staging_region.contains(workspace.staging,
                                                            workspace.bytes));
@@ -33,39 +60,44 @@ class SimplePrimitives {
                   recv_peer.global_rank);
         PG_ASSERT(peerAt(state, send_peer.in_group_rank).global_rank ==
                   send_peer.global_rank);
-        const auto buffers = SimpleBufferLayout::make(
-            workspace.bytes / channel_count, max_chunk_bytes);
-        PG_ASSERT(buffers.chunk_bytes >= sizeof(T));
-        const uint64_t channel_bytes = buffers.bufferBytes();
-        const uint64_t offset = uint64_t{channel} * channel_bytes;
         const auto staging =
             workspace.staging
-                ? StagingRegion{workspace.staging + offset, channel_bytes}
+                ? StagingRegion{workspace.staging + layout.staging_offset,
+                                bytes}
                 : StagingRegion{};
-        return SimplePrimitives(state, buffers, workspace.buffer + offset,
-                                recv_peer.in_group_rank,
-                                send_peer.in_group_rank, channel, timeout_ticks,
-                                staging, send_peer.workspace_offset + offset);
+        return SimplePrimitives(
+            state, layout.buffers, workspace.buffer + layout.receive_offset,
+            recv_peer.in_group_rank, send_peer.in_group_rank, channel,
+            timeout_ticks, staging,
+            send_peer.workspace_offset + layout.remote_offset);
     }
 
     [[nodiscard]] __device__ __forceinline__ uint64_t chunkElements() const {
         return buffers_.chunk_bytes / sizeof(T);
     }
 
-    // StrongStream ordering makes our shared workspace available at this point.
-    // Notify the sender, then wait for the receiver to make its workspace
-    // available.
-    [[nodiscard]] __device__ __forceinline__ CollectiveStepResult
-    begin(cooperative_groups::thread_block block) const {
+    // Tree publishes every neighbor's readiness before waiting on any of
+    // them. Ring retains the same combined begin() ordering as before.
+    __device__ __forceinline__ void publishRecvBufferReady(
+        cooperative_groups::thread_block block) const {
         const uint64_t ready_offset =
             state_.signal_layout.recvBufferReadyOffset(
                 recv_peer_.signal_offset, channel_, state_.self_rank);
         signalPeer(recv_peer_, ready_offset, block);
+    }
 
+    [[nodiscard]] __device__ __forceinline__ CollectiveStepResult
+    waitSendBufferReady(cooperative_groups::thread_block block) const {
         const auto* ready_signal = state_.signal_layout.recvBufferReadyPtr(
             state_.signals, channel_, send_rank_);
         return waitForSignal(ready_signal, buffer_ready_sequence_ + 1,
                              send_rank_, block);
+    }
+
+    [[nodiscard]] __device__ __forceinline__ CollectiveStepResult
+    begin(cooperative_groups::thread_block block) const {
+        publishRecvBufferReady(block);
+        return waitSendBufferReady(block);
     }
 
     // Send source[0:count] to the bound outgoing connection.
