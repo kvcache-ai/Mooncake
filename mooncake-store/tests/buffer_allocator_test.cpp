@@ -14,6 +14,7 @@
 
 #include "allocator.h"
 #include "master_metric_manager.h"
+#include "replica.h"
 #include "types.h"
 
 namespace mooncake {
@@ -68,6 +69,25 @@ class BufferAllocatorTest : public ::testing::Test {
     std::vector<BufferAllocatorType> allocator_types_ = {
         BufferAllocatorType::CACHELIB, BufferAllocatorType::OFFSET};
 };
+
+TEST_F(BufferAllocatorTest, DescriptorFollowsPublishedAndClearedLocality) {
+    auto allocator = CreateTestAllocator("receiver", 0, 16 * 1024 * 1024,
+                                         BufferAllocatorType::OFFSET);
+    Replica replica(allocator->allocate(1024), ReplicaStatus::COMPLETE);
+    EXPECT_FALSE(replica.get_descriptor().get_memory_descriptor().locality);
+    const SegmentLocality locality{7, {"mlx5_0"}};
+    allocator->SetLocality(locality);
+    auto descriptor = replica.get_descriptor();
+    EXPECT_EQ(descriptor.get_memory_descriptor().locality, locality);
+    EXPECT_EQ(descriptor.get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              "receiver");
+    allocator->SetLocality(std::nullopt);
+    EXPECT_FALSE(replica.get_descriptor().get_memory_descriptor().locality);
+    allocator->SetLocality(locality);
+    EXPECT_EQ(replica.get_descriptor().get_memory_descriptor().locality,
+              locality);
+}
 
 // Test basic allocation and deallocation functionality
 TEST_F(BufferAllocatorTest, AllocateAndDeallocate) {

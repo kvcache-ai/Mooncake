@@ -83,14 +83,30 @@ class Client {
     // batch.
     using HcaAffinity =
         std::function<std::vector<std::string>(std::span<const Slice>)>;
-    static HcaAffinity MakeHcaAffinity(
-        const Topology& topology, std::span<const SegmentBufferInfo> buffers);
+    static HcaAffinity MakeHcaAffinity(const Topology& topology,
+                                       std::vector<SegmentBufferInfo> buffers);
     static std::optional<SegmentLocality> DiscoverSegmentLocality(
         const Topology& topology, const std::string& location);
-    using ReadReplicaSelector =
-        std::function<ErrorCode(const std::vector<Replica::Descriptor>&,
-                                std::span<const Slice>, Replica::Descriptor&)>;
-    ReadReplicaSelector MakeReadReplicaSelector() const;
+    class ReadReplicaSelector {
+       public:
+        ErrorCode operator()(const std::vector<Replica::Descriptor>& replicas,
+                             std::span<const Slice> destinations,
+                             Replica::Descriptor& result);
+
+       private:
+        friend class Client;
+        explicit ReadReplicaSelector(const Client* client) : client_(client) {}
+        struct Context {
+            HcaAffinity infer;
+            std::unordered_set<std::string> endpoints;
+        };
+        const Client* client_;
+        std::unique_ptr<Context> context_;
+        bool initialized_{false};
+    };
+    ReadReplicaSelector MakeReadReplicaSelector() const {
+        return ReadReplicaSelector(this);
+    }
 
     using WriteBufferStager =
         std::function<tl::expected<std::vector<Slice>, ErrorCode>(

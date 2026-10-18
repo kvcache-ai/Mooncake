@@ -136,6 +136,33 @@ std::string GenerateKeyForSegment(const UUID& client_id,
     }
 }
 
+TEST_F(MasterServiceTest, HcaHintFallsBackForLargeOffsetObject) {
+    MasterService service(MasterServiceConfig::builder()
+                              .set_memory_allocator(BufferAllocatorType::OFFSET)
+                              .build());
+    const auto owner = generate_uuid();
+    constexpr size_t mib = 1024 * 1024;
+    auto matching = MakeSegment("receiver");
+    matching.size = 8 * mib;
+    matching.locality = SegmentLocality{7, {"mlx5_0"}};
+    auto original = matching;
+    original.id = generate_uuid();
+    original.base += matching.size;
+    original.size = 16 * mib;
+    original.locality.reset();
+    ASSERT_TRUE(service.MountSegment(matching, owner));
+    ASSERT_TRUE(service.MountSegment(original, owner));
+    ReplicateConfig request;
+    request.preferred_hca_names = std::vector<std::string>{"mlx5_0"};
+    const auto result = service.PutStart(
+        owner, "large-hca-object", TenantId::Default(), 12 * mib, request);
+    ASSERT_TRUE(result) << toString(result.error());
+    const auto& buffer = (*result)[0].get_memory_descriptor().buffer_descriptor;
+    EXPECT_EQ(buffer.size_, 12 * mib);
+    EXPECT_GE(buffer.buffer_address_, original.base);
+    EXPECT_LT(buffer.buffer_address_, original.base + original.size);
+}
+
 TEST_F(MasterServiceTest, MixedGpuBatchUsesEachKeysHcaHint) {
     if (!StoreHcaAffinityEnabled()) GTEST_SKIP();
     MasterService service(MasterServiceConfig::builder()

@@ -62,7 +62,8 @@ UUID ParseClientId(const std::string& client_id_str) {
 
 class ObjectChecksumClient : public Client {
    public:
-    ObjectChecksumClient() : Client("localhost", "", "tcp") {}
+    explicit ObjectChecksumClient(const std::string& protocol = "tcp")
+        : Client("localhost", "", protocol) {}
 };
 
 struct LegacyReplicateConfig {
@@ -179,6 +180,23 @@ TEST(HcaAffinityTest, BatchHintsFollowKeysAndRetrySubsets) {
         struct_pack::serialize(config));
     ASSERT_TRUE(legacy);
     EXPECT_EQ(legacy->group_ids, config.group_ids);
+}
+
+TEST(ReadAffinityTest,
+     SingleCopyKeepsStatusChecksWithoutRegisteredDestinations) {
+    ObjectChecksumClient client("rdma");
+    auto select = client.MakeReadReplicaSelector();
+    Replica::Descriptor copy;
+    copy.descriptor_variant = MemoryDescriptor{};
+    copy.status = ReplicaStatus::COMPLETE;
+    copy.id = 123;
+    copy.get_memory_descriptor().locality = SegmentLocality{7, {"mlx5_0"}};
+    Replica::Descriptor selected;
+    EXPECT_EQ(select({copy}, {}, selected), ErrorCode::OK);
+    EXPECT_EQ(selected.id, copy.id);
+    copy.status = ReplicaStatus::PROCESSING;
+    EXPECT_EQ(select({copy}, {}, selected), ErrorCode::INVALID_REPLICA);
+    EXPECT_EQ(select({}, {}, selected), ErrorCode::INVALID_REPLICA);
 }
 
 TEST(ReadAffinityTest, MissingCompleteSessionCandidateIsAnError) {

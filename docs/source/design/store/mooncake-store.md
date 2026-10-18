@@ -346,8 +346,7 @@ clients and RL workers before startup; unset, `0`, `false` or invalid values
 keep the existing allocation, memory layout and read-selection behavior.
 Transfer Engine's existing affinity setting alone does not enable this feature.
 
-When enabled, RDMA Store ranges are bound to one NUMA node and mounted under the same
-logical segment name. They report receiver-local NUMA/HCA metadata to the
+RDMA Store ranges bound to one NUMA node report receiver-local NUMA/HCA metadata to the
 master. Within a selected segment, allocation tries matching HCA-local ranges,
 unknown locality, then known mismatches. Existing host/segment preferences,
 capacity policies and replica separation remain in effect. NUMA IDs are never
@@ -360,6 +359,15 @@ same-name peer-device selection before starting the client:
 export MC_ENABLE_DEST_DEVICE_AFFINITY=1
 export MC_STORE_HCA_AFFINITY=1
 ```
+
+Affinity alone preserves the existing Store memory layout and maximum contiguous
+object capacity. To create separate NUMA-bound ranges automatically, also set
+`MC_STORE_HCA_NUMA_SEGMENTS=1` on storage clients before startup. The ranges share
+the existing logical segment name and endpoint. This separate option partitions
+the pool across NIC-local NUMA nodes: each object must fit entirely within one
+range. Leave it unset for workloads that need the original large-object capacity,
+or mount explicitly bound ranges using the existing mount APIs. Compound
+`segments:...` ranges retain their original layout and advertise unknown locality.
 
 Put/Upsert infer preferred HCA names from the current registered source;
 batches infer per key, supporting different GPUs or NUMA nodes in one batch.

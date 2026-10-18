@@ -128,12 +128,14 @@ class AllocatedBuffer {
     }
 
     // Serialize the buffer into a descriptor for transfer
-    [[nodiscard]] Descriptor get_descriptor() const;
+    [[nodiscard]] Descriptor get_descriptor(
+        std::optional<SegmentLocality>* locality = nullptr) const;
 
     [[nodiscard]] std::string getSegmentName() const noexcept;
 
     // The endpoint a reader transfers from, as get_descriptor() reports it.
-    [[nodiscard]] std::string getTransportEndpoint() const;
+    [[nodiscard]] std::string getTransportEndpoint(
+        std::optional<SegmentLocality>* locality = nullptr) const;
 
     // Friend declaration for operator<<
     friend std::ostream& operator<<(std::ostream& os,
@@ -200,8 +202,11 @@ class BufferAllocatorBase {
                 ? std::make_shared<const SegmentLocality>(std::move(*locality))
                 : nullptr,
             std::memory_order_release);
+        // Monotonic: a concurrent clear must not hide a later publication.
+        if (locality) has_locality_.store(true, std::memory_order_release);
     }
     std::optional<SegmentLocality> GetLocality() const {
+        if (!has_locality_.load(std::memory_order_acquire)) return std::nullopt;
         auto locality =
             std::atomic_load_explicit(&locality_, std::memory_order_acquire);
         return locality ? std::optional<SegmentLocality>(*locality)
@@ -241,6 +246,7 @@ class BufferAllocatorBase {
     std::atomic_size_t cur_size_{0};
     std::unique_ptr<StorageUsageRegistration> usage_registration_;
     std::shared_ptr<const SegmentLocality> locality_;
+    std::atomic<bool> has_locality_{false};
 };
 
 /**

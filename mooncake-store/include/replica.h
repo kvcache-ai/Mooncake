@@ -876,10 +876,8 @@ inline Replica::Descriptor Replica::get_descriptor() const {
         const auto& mem_data = std::get<MemoryReplicaData>(data_);
         MemoryDescriptor mem_desc;
         if (mem_data.buffer) {
-            mem_desc.buffer_descriptor = mem_data.buffer->get_descriptor();
-            if (auto allocator = mem_data.buffer->getAllocator()) {
-                mem_desc.locality = allocator->GetLocality();
-            }
+            mem_desc.buffer_descriptor =
+                mem_data.buffer->get_descriptor(&mem_desc.locality);
         } else {
             mem_desc.buffer_descriptor.size_ = 0;
             mem_desc.buffer_descriptor.buffer_address_ = 0;

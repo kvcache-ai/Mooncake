@@ -593,7 +593,7 @@ std::optional<SegmentLocality> Client::DiscoverSegmentLocality(
 }
 
 Client::HcaAffinity Client::MakeHcaAffinity(
-    const Topology& topology, std::span<const SegmentBufferInfo> buffers) {
+    const Topology& topology, std::vector<SegmentBufferInfo> buffers) {
     auto matrix = topology.getMatrix();
     for (auto& [location, entry] : matrix) {
         auto& hcas = entry.preferred_hca;
@@ -601,9 +601,7 @@ Client::HcaAffinity Client::MakeHcaAffinity(
         hcas.erase(std::unique(hcas.begin(), hcas.end()), hcas.end());
     }
     return [matrix = std::move(matrix),
-            buffers =
-                std::vector<SegmentBufferInfo>(buffers.begin(), buffers.end())](
-               std::span<const Slice> slices) {
+            buffers = std::move(buffers)](std::span<const Slice> slices) {
         std::vector<std::string> common;
         for (const auto& slice : slices) {
             if (slice.size == 0) continue;
@@ -648,7 +646,7 @@ Client::HcaAffinity Client::MakeHcaAffinity() const {
     if (!topology ||
         transfer_engine_->getSegmentBuffers(LOCAL_SEGMENT_ID, buffers) != 0)
         return {};
-    return MakeHcaAffinity(*topology, buffers);
+    return MakeHcaAffinity(*topology, std::move(buffers));
 }
 
 void Client::AttachHcaAffinity(ReplicateConfig& config,
@@ -660,22 +658,31 @@ void Client::AttachHcaAffinity(ReplicateConfig& config,
     }
 }
 
-Client::ReadReplicaSelector Client::MakeReadReplicaSelector() const {
-    auto infer = MakeHcaAffinity();
-    auto endpoints =
-        infer ? GetLocalEndpoints() : std::unordered_set<std::string>{};
-    return
-        [this, infer = std::move(infer), endpoints = std::move(endpoints)](
-            const std::vector<Replica::Descriptor>& replicas,
-            std::span<const Slice> destinations, Replica::Descriptor& result) {
-            const auto hcas =
-                infer ? infer(destinations) : std::vector<std::string>{};
-            if (hcas.empty()) return FindFirstCompleteReplica(replicas, result);
-            const auto* selected = SelectBestReplica(replicas, endpoints, hcas);
-            if (!selected) return ErrorCode::INVALID_REPLICA;
-            result = *selected;
-            return ErrorCode::OK;
-        };
+ErrorCode Client::ReadReplicaSelector::operator()(
+    const std::vector<Replica::Descriptor>& replicas,
+    std::span<const Slice> destinations, Replica::Descriptor& result) {
+    // No topology copies, registration lookups or callback allocations for
+    // disabled affinity, non-RDMA clients or single-copy reads.
+    if (!StoreHcaAffinityEnabled() || client_->protocol_ != "rdma" ||
+        replicas.size() <= 1) {
+        return client_->FindFirstCompleteReplica(replicas, result);
+    }
+    if (!initialized_) {
+        initialized_ = true;
+        if (auto infer = client_->MakeHcaAffinity()) {
+            context_ = std::make_unique<Context>(std::move(infer),
+                                                 client_->GetLocalEndpoints());
+        }
+    }
+    const auto hcas =
+        context_ ? context_->infer(destinations) : std::vector<std::string>{};
+    if (hcas.empty())
+        return client_->FindFirstCompleteReplica(replicas, result);
+    const auto* selected =
+        SelectBestReplica(replicas, context_->endpoints, hcas);
+    if (!selected) return ErrorCode::INVALID_REPLICA;
+    result = *selected;
+    return ErrorCode::OK;
 }
 
 static std::vector<std::string> ParseDeviceNames(std::string_view value) {
@@ -4921,7 +4928,7 @@ std::vector<tl::expected<int64_t, ErrorCode>> Client::BatchTransferReadRanges(
                                 selected) != ErrorCode::OK) ||
                 !selected.is_memory_replica()) {
                 entry_errors[i] = ErrorCode::INVALID_REPLICA;
-                continue;
+                break;
             }
             const auto& handle =
                 selected.get_memory_descriptor().buffer_descriptor;

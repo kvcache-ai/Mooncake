@@ -14,6 +14,11 @@ ReplicaSelectionConfig ReplicaSelectionConfig::FromEnvironment() {
         Environ::Read(
             ReplicaSelectionEnvironmentVariables::MC_STORE_HCA_AFFINITY)
             .value_or(false);
+    config.hca_numa_segments_enabled =
+        config.hca_affinity_enabled &&
+        Environ::Read(
+            ReplicaSelectionEnvironmentVariables::MC_STORE_HCA_NUMA_SEGMENTS)
+            .value_or(false);
     return config;
 }
 

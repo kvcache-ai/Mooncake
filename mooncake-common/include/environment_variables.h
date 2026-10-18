@@ -181,6 +181,7 @@ struct OffsetAllocatorBackendEnvironmentVariables {
 
 struct ReplicaSelectionEnvironmentVariables {
     MC_DEFINE_ENV_VAR(bool, MC_STORE_HCA_AFFINITY);
+    MC_DEFINE_ENV_VAR(bool, MC_STORE_HCA_NUMA_SEGMENTS);
     // Only the exact string "1" enables scoring, unlike canonical bool parsing.
     MC_DEFINE_ENV_VAR(std::string, MC_STORE_REPLICA_SCORING);
 };

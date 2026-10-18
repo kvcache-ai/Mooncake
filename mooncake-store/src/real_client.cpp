@@ -1218,14 +1218,16 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         }
 #endif
 
-        // Each Master allocation target must have homogeneous NUMA locality.
-        // Keep the logical segment name and transport endpoint shared.
-        const bool hca_affinity = StoreHcaAffinityEnabled();
+        // NUMA partitioning changes the largest contiguous allocation domain.
+        // Keep the original layout unless explicitly requested on storage
+        // hosts.
+        const bool partition_numa =
+            ReplicaSelectionConfig::FromEnvironment().hca_numa_segments_enabled;
         std::vector<int> seg_numa_nodes;
         if (protocol == "rdma") {
             seg_numa_nodes = client_->GetNicNumaNodes();
             if (seg_numa_nodes.size() > 1 ||
-                (hca_affinity && !seg_numa_nodes.empty())) {
+                (partition_numa && !seg_numa_nodes.empty())) {
                 std::string nodes_str;
                 for (size_t i = 0; i < seg_numa_nodes.size(); ++i) {
                     if (i) nodes_str += ",";
@@ -1238,7 +1240,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             }
         }
 
-        if (hca_affinity && !seg_numa_nodes.empty()) {
+        if (partition_numa && !seg_numa_nodes.empty()) {
             const auto numa_limit = align_up(
                 DivideRoundUp(global_segment_size, seg_numa_nodes.size()),
                 alignment);
@@ -1292,7 +1294,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             } else if (!seg_numa_nodes.empty()) {
                 // NUMA-segmented allocation: contiguous VMA, per-region binding
                 segment_numa_nodes =
-                    hca_affinity
+                    partition_numa
                         ? std::vector<
                               int>{seg_numa_nodes[next_numa_node++ %
                                                   seg_numa_nodes.size()]}
@@ -1305,7 +1307,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                 ptr = allocate_buffer_numa_segments(
                     mapped_size, segment_numa_nodes, page_sz);
                 seg_location =
-                    hca_affinity
+                    partition_numa
                         ? "cpu:" + std::to_string(segment_numa_nodes[0])
                         : buildSegmentsLocation(page_sz, segment_numa_nodes);
 #ifdef USE_ASCEND_DIRECT
@@ -5065,6 +5067,11 @@ RealClient::get_into_ranges_internal(
                             (*results)[k] = tl::unexpected(error);
                         },
                 };
+                if (!StoreHcaAffinityEnabled() ||
+                    metadata.query_result.replicas.size() == 1) {
+                    memory_transfers.push_back(std::move(transfer));
+                    continue;
+                }
                 auto candidates = FilterQueryResult(metadata.query_result,
                                                     metadata.replica, false);
                 if (candidates.replicas.size() == 1) {
