@@ -3,6 +3,7 @@
 #include <glog/logging.h>
 
 #include <boost/functional/hash.hpp>
+#include <boost/locale/utf.hpp>
 
 #include <algorithm>
 #include <ylt/struct_pack/compatible.hpp>
@@ -137,7 +138,19 @@ struct ReplicateConfig {
         return !session_ids ||
                (session_ids->size() == key_count &&
                 std::all_of(session_ids->begin(), session_ids->end(),
-                            [](const auto& id) { return id.size() <= 256; }));
+                            [](const auto& id) {
+                                if (id.size() > 256) return false;
+                                auto it = id.begin();
+                                while (it != id.end()) {
+                                    namespace utf = boost::locale::utf;
+                                    if (!utf::is_valid_codepoint(
+                                            utf::utf_traits<char>::decode(
+                                                it, id.end()))) {
+                                        return false;
+                                    }
+                                }
+                                return true;
+                            }));
     }
 
     std::string SessionId() const {

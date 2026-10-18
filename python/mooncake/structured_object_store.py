@@ -6737,6 +6737,7 @@ def _call_write_with_optional_config(fn: Any, *args: Any, config: Any = None) ->
 
 _WRITE_CONFIG_COPY_FIELDS = (
     "data_type",
+    "dfs_replica_num",
     "group_ids",
     "session_ids",
     "nof_replica_num",
@@ -6746,7 +6747,8 @@ _WRITE_CONFIG_COPY_FIELDS = (
     "preferred_segments",
     "replica_num",
     "with_hard_pin",
-    "with_soft_pin",
+    "soft_pin_action",
+    "soft_pin_ttl_ms",
 )
 
 

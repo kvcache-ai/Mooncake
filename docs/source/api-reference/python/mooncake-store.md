@@ -749,8 +749,8 @@ config.prefer_alloc_in_same_node = True
 **Default:** `None`
 
 Optional per-key write attribution. Supply one entry for each input key (one
-entry for a single-key write). Each ID is at most 256 UTF-8 bytes. An empty
-string means no new attribution. The field does not change object identity,
+entry for a single-key write). Each ID must be valid UTF-8 and at most 256 bytes.
+An empty string means no new attribution. The field does not change object identity,
 replication, group membership, leases, or eviction policy.
 
 ```python

@@ -158,13 +158,23 @@ def test_session_tags_over_rpc_and_zmq(session_store):
         "two": "z",
     }
 
-    for invalid in (tagged("x"), tagged("x", "x" * 257)):
+    for invalid in (tagged("x"), tagged("x", "x" * 257), tagged("x", b"\xff")):
         assert store.put_batch(["bad1", "bad2"], [b"1", b"2"], invalid) != 0
         assert store.is_exist("bad1") == 0
+    for write in (store.put, store.upsert):
+        assert write("invalid-utf8", b"x", tagged(b"\xff")) != 0
+        assert store.is_exist("invalid-utf8") == 0
+    assert (
+        store.upsert_batch(["bad1", "bad2"], [b"1", b"2"], tagged("valid", b"\xff"))
+        != 0
+    )
+    assert store.is_exist("bad1") == 0
     assert store.put("too-long", b"x", tagged("会" * 86)) != 0
     assert not subscriber.poll(300)
     assert store.put("boundary", b"x", tagged("x" * 256)) == 0
     expect_stored("boundary", "x" * 256)
+    assert store.put("unicode-boundary", b"x", tagged("会" * 85 + "x")) == 0
+    expect_stored("unicode-boundary", "会" * 85 + "x")
     assert store.remove("shared", force=True) == 0
     assert "session_id" not in receive(1)[0]
     assert store.put("shared", b"fresh") == 0
@@ -212,3 +222,21 @@ def test_tensor_filtering_and_tp_session_mapping(session_store):
     assert results == [0, 0]
     assert sorted(e["session_id"] for e in receive(4)) == ["a", "a", "b", "b"]
     assert not subscriber.poll(300)
+
+
+def test_structured_session_expansion_preserves_native_write_options():
+    from mooncake.store import ReplicateConfig, SoftPinAction
+    from mooncake.structured_object_store import _config_for_grouped_keys
+
+    config = ReplicateConfig()
+    config.dfs_replica_num = 1
+    config.soft_pin_action = SoftPinAction.ENABLE
+    config.soft_pin_ttl_ms = 60000
+    config.session_ids = ["session"]
+    expanded = _config_for_grouped_keys(config, 2)
+    assert expanded.session_ids == ["session", "session"]
+    assert expanded.dfs_replica_num == 1
+    assert expanded.soft_pin_action == SoftPinAction.ENABLE
+    assert expanded.soft_pin_ttl_ms == 60000
+    assert config.session_ids == ["session"]
+    assert expanded.group_ids is None

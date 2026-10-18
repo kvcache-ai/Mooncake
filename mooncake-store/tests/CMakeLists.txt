@@ -153,7 +153,7 @@ add_test(
   NAME object_checksum_client_test
   COMMAND
     client_integration_test
-    "--gtest_filter=ObjectChecksumTest.*:ClientIntegrationTest.ObjectChecksumRejectsCorruptedObject:ClientIntegrationTest.BatchPutPreservesObjectChecksumPairing"
+    "--gtest_filter=ObjectChecksumTest.*:ClientIntegrationTest.ObjectChecksumRejectsCorruptedObject:ClientIntegrationTest.BatchPutPreservesObjectChecksumPairing:ClientIntegrationTest.TaggedBatchWritesSkipChecksumFailures"
 )
 set_tests_properties(object_checksum_client_test
                      PROPERTIES ENVIRONMENT "MOONCAKE_STORE_CHECKSUM=1")

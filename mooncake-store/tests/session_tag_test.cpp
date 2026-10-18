@@ -76,6 +76,18 @@ TEST(SessionTagTest, RpcCompatibilityAndBatchValidation) {
     EXPECT_FALSE(Tagged(std::string(257, 'x')).ValidSessionIds(1));
 }
 
+TEST(SessionTagTest, SessionIdsRequireValidUtf8) {
+    for (const std::string id : {"", "ascii", "\xc2\x80", "会",
+                                 "\xf0\x9f\x98\x80", "\xf4\x8f\xbf\xbf"}) {
+        EXPECT_TRUE(Tagged(id).ValidSessionIds(1));
+    }
+    for (const std::string id : {"\xff", "\x80", "\xc2", "\xe4\xb8", "\xc2x",
+                                 "\xc0\x80", "\xe0\x80\x80", "\xed\xa0\x80",
+                                 "\xf0\x80\x80\x80", "\xf4\x90\x80\x80"}) {
+        EXPECT_FALSE(Tagged(id).ValidSessionIds(1));
+    }
+}
+
 TEST(SessionTagTest, MetadataPayloadCompatibility) {
     LegacyMetadataPayload legacy;
     legacy.group_id = "group";
