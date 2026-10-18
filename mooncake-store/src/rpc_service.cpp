@@ -10,6 +10,7 @@
 
 #include "master_metric_manager.h"
 #include "master_service.h"
+#include "ha/oplog/oplog_test_failpoint.h"
 #include "rpc_worker_pool.h"
 #include "rpc_helper.h"
 #include "types.h"
@@ -993,6 +994,7 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchRemove(
 
 tl::expected<void, ErrorCode> WrappedMasterService::MountSegment(
     const Segment& segment, const UUID& client_id) {
+    TestFailPoint::Wait("rpc_mount_segment_before_service");
     return execute_rpc(
         "MountSegment",
         [&] { return master_service_.MountSegment(segment, client_id); },

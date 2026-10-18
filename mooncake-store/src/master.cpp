@@ -27,6 +27,7 @@
 #include "master_admin_service.h"
 #include "rpc_worker_pool.h"
 #include "rpc_service.h"
+#include "shutdown_request.h"
 #include "types.h"
 #include "common/network.h"
 #include "glog_compat.h"
@@ -1639,12 +1640,32 @@ int main(int argc, char* argv[]) {
     }
 
     if (master_config.enable_ha) {
+        // Arm the shutdown bound and the handlers before any lease can be
+        // acquired; without them a SIGTERM kills a leader mid-term.
+        if (!mooncake::StartShutdownWatchdog(
+                mooncake::ha::kHaShutdownDeadline)) {
+            LOG(ERROR) << "Failed to start the shutdown watchdog, "
+                          "refusing to start";
+            return 1;
+        }
+        if (!mooncake::InstallShutdownSignalHandlers()) {
+            PLOG(ERROR) << "Failed to install SIGINT/SIGTERM handlers, "
+                           "refusing to start";
+            return 1;
+        }
         mooncake::MasterServiceSupervisorConfig supervisor_config{
             master_config};
         supervisor_config.http_metadata_server = metadata_server_ptr;
         supervisor_config.http_metadata_remote_url = http_metadata_remote_url;
         mooncake::ha::MasterServiceSupervisor supervisor(supervisor_config);
-        return supervisor.Start();
+        const int result = supervisor.Start();
+        // Finish a requested process exit without further main/static
+        // teardown; supervisor-owned cleanup may already have run on this
+        // error path.
+        if (mooncake::ShutdownRequested() || mooncake::ShutdownLatched()) {
+            mooncake::ExitAfterShutdown(result);
+        }
+        return result;
     } else {
         // version is not used in non-HA mode, just pass a dummy value
         mooncake::ViewVersionId version = 0;
