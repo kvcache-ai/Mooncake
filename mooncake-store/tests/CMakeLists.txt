@@ -76,14 +76,6 @@ endif()
 add_subdirectory(master_service)
 
 add_store_test(master_service_test master_service_test.cpp)
-add_test(
-  NAME master_service_hca_affinity_test
-  COMMAND
-    master_service_test
-    --gtest_filter=MasterServiceTest.MixedGpuBatchUsesEachKeysHcaHint:MasterServiceTest.PutAndBatchUpsertHonorReceiverHcaLocality:MasterServiceTest.HcaHintFallsBackForLargeOffsetObject
-)
-set_tests_properties(master_service_hca_affinity_test
-                     PROPERTIES ENVIRONMENT "MC_STORE_HCA_AFFINITY=1")
 add_store_test(master_metadata_config_test master_metadata_config_test.cpp)
 add_store_test(dfs_enablement_config_test dfs_enablement_config_test.cpp)
 add_store_test(master_service_weight_management_test
@@ -158,6 +150,14 @@ add_test(NAME client_hca_affinity_test
          COMMAND client_integration_test
                  --gtest_filter=HcaAffinityTest.*:ReadAffinityTest.*)
 set_tests_properties(client_hca_affinity_test
+                     PROPERTIES ENVIRONMENT "MC_STORE_HCA_AFFINITY=1")
+add_test(
+  NAME master_service_hca_affinity_test
+  COMMAND
+    master_service_test
+    --gtest_filter=MasterServiceTest.MixedGpuBatchUsesEachKeysHcaHint:MasterServiceTest.PutAndBatchUpsertHonorReceiverHcaLocality:MasterServiceTest.HcaHintFallsBackForLargeOffsetObject
+)
+set_tests_properties(master_service_hca_affinity_test
                      PROPERTIES ENVIRONMENT "MC_STORE_HCA_AFFINITY=1")
 add_store_test(batch_replica_clear_tenant_rpc_test
                batch_replica_clear_tenant_rpc_test.cpp)
