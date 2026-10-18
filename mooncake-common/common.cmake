@@ -109,6 +109,12 @@ option(USE_ASCEND_DIRECT "option for using ascend npu with adxl engine" OFF)
 option(USE_UBSHMEM "option for using ascend npu with shmem" OFF)
 option(USE_ASCEND_HETEROGENEOUS
        "option for transferring between ascend npu and gpu" OFF)
+option(USE_ASCEND_RDMA
+       "enable Ascend UB segment registration for plain RDMA memory regions"
+       OFF)
+if(USE_ASCEND_RDMA)
+  add_compile_definitions(USE_ASCEND_RDMA)
+endif()
 option(USE_MNNVL "option for using Multi-Node NVLink transport" OFF)
 option(USE_CXL "option for using CXL protocol" OFF)
 option(USE_EFA "option for using AWS EFA transport" OFF)

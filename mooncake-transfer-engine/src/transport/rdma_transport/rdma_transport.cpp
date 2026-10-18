@@ -25,6 +25,7 @@
 #include <cstddef>
 #include <cstdlib>
 #include <memory>
+#include <numeric>
 #include <set>
 #include <thread>
 #include <unordered_map>
@@ -350,6 +351,61 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
 
     std::string resolved_name = name;
 
+#ifdef USE_ASCEND_RDMA
+    const bool explicit_location = name != kWildcardLocation;
+    // Keep MR registration aligned with the route selected for an explicit
+    // NPU location. The context index is intentionally the index in
+    // getHcaList(), which is also the index used by SegmentDesc devices.
+    std::vector<size_t> target_indices;
+    const bool npu_location =
+        explicit_location && resolved_name.rfind(UbSegment::kNpuPrefix, 0) == 0;
+    if (npu_location) {
+        const auto matrix = local_topology_->getMatrix();
+        auto entry_it = matrix.find(resolved_name);
+        if (entry_it != matrix.end() &&
+            (!entry_it->second.preferred_hca.empty() ||
+             !entry_it->second.avail_hca.empty())) {
+            std::set<std::string> target_hcas(
+                entry_it->second.preferred_hca.begin(),
+                entry_it->second.preferred_hca.end());
+            target_hcas.insert(entry_it->second.avail_hca.begin(),
+                               entry_it->second.avail_hca.end());
+            const auto &hca_list = local_topology_->getHcaList();
+            for (const auto &hca : target_hcas) {
+                auto hca_it = std::find(hca_list.begin(), hca_list.end(), hca);
+                if (hca_it != hca_list.end()) {
+                    size_t index =
+                        static_cast<size_t>(hca_it - hca_list.begin());
+                    if (index < context_list_.size())
+                        target_indices.push_back(index);
+                }
+            }
+        }
+    }
+    if (target_indices.empty()) {
+        target_indices.resize(context_list_.size());
+        std::iota(target_indices.begin(), target_indices.end(), 0);
+        if (npu_location) {
+            LOG(WARNING) << "Ascend RDMA: no HCA route found for location "
+                         << resolved_name << ", falling back to all "
+                         << context_list_.size() << " contexts";
+        }
+    } else {
+        std::string routed_contexts;
+        for (size_t i = 0; i < target_indices.size(); ++i) {
+            if (i) routed_contexts += ",";
+            routed_contexts += std::to_string(target_indices[i]);
+        }
+        LOG(INFO) << "Ascend RDMA: location " << resolved_name
+                  << " routes MR registration to HCA contexts ["
+                  << routed_contexts << "] (" << target_indices.size() << "/"
+                  << context_list_.size() << ")";
+    }
+#else
+    std::vector<size_t> target_indices(context_list_.size());
+    std::iota(target_indices.begin(), target_indices.end(), 0);
+#endif
+
     // Export a single dma_buf fd for the whole buffer and import it into every
     // NIC's PD during each chunk's registration below (one dma_buf object
     // shared across NICs keeps a single BAR1 window for the buffer instead of
@@ -467,8 +523,16 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
     // not a "committed" chunk, so rollbackChunks() below must not touch its
     // (never-added) metadata, but its partial MRs still need releasing.
     auto unregisterChunkMRs = [&](void *chunk_addr) {
-        for (auto &context : context_list_) {
-            int ret = context->unregisterMemoryRegion(chunk_addr);
+#ifdef USE_ASCEND_RDMA
+        int ub_ret = ub_segment_.UnRegUbSegment(
+            resolved_name, reinterpret_cast<uint64_t>(chunk_addr));
+        if (ub_ret != 0) {
+            LOG(WARNING) << "Rollback: failed to unregister UB segment at "
+                         << chunk_addr << " (ret=" << ub_ret << ")";
+        }
+#endif
+        for (size_t index : target_indices) {
+            int ret = context_list_[index]->unregisterMemoryRegion(chunk_addr);
             if (ret)
                 LOG(WARNING) << "Rollback: failed to unregister chunk MR at "
                              << chunk_addr << " (ret=" << ret << ")";
@@ -495,17 +559,22 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
         if (n > 0 && update_metadata) metadata_->updateLocalSegmentDesc();
     };
 
-    // Pre-touch decision is loop-invariant: it depends only on context_list_,
-    // hardware_concurrency(), and the ORIGINAL buffer length (never chunk_len,
-    // which is capped at max_mr_size and would silently disable pre-touch for a
-    // >=4GiB buffer). Compute once above the loop to avoid repeated
+    // Pre-touch decision is loop-invariant: it depends on memory kind/location,
+    // context_list_, hardware_concurrency(), and the ORIGINAL buffer length.
+    // Using chunk_len, which is capped at max_mr_size, could silently disable
+    // pre-touch for a >=4GiB buffer. Compute once above the loop to avoid repeated
     // hardware_concurrency() OS queries per chunk.
     //
     // Pre-touch faults host pages in before the real registration. It gains
     // nothing for device memory registered through DMA-BUF, where each
     // pre-touch thread only adds a DMA-BUF import (and a BAR1 mapping) of its
     // block, so skip it there.
+    // Explicit Ascend NPU buffers must also skip host pre-touch, which uses
+    // context 0 instead of the NPU's routed HCA contexts.
     const bool do_pre_touch =
+#ifdef USE_ASCEND_RDMA
+        !npu_location &&
+#endif
         dmabuf_exp.method != DmabufExport::Method::kDmabufReg &&
         context_list_.size() > 0 && std::thread::hardware_concurrency() >= 4 &&
         length >= (size_t)4 * 1024 * 1024 * 1024;
@@ -519,12 +588,27 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
         if (chunk_dmabuf_exp.method == DmabufExport::Method::kDmabufReg)
             chunk_dmabuf_exp.offset += chunk_offset;
 
+#ifdef USE_ASCEND_RDMA
+        int ub_ret = ub_segment_.RegUbSegment(
+            resolved_name, reinterpret_cast<uint64_t>(chunk_addr), chunk_len);
+        if (ub_ret != 0) {
+            LOG(ERROR) << "Failed to register UB segment (chunk " << ci << "/"
+                       << chunks.size() << ") at " << chunk_addr
+                       << " (location=" << resolved_name
+                       << ", length=" << chunk_len << ", ret=" << ub_ret
+                       << "), rolling back";
+            rollbackChunks(ci);
+            return ub_ret;
+        }
+#endif
+
         if (do_pre_touch) {
             // Parallel pre-touch the memory to speed up registration.
             int ret = preTouchMemory(chunk_addr, chunk_len);
             if (ret != 0) {
                 // pre-touch is before MR registration for chunk ci, so ci has
                 // no MR/metadata yet: roll back only committed chunks [0, ci).
+                unregisterChunkMRs(chunk_addr);
                 rollbackChunks(ci);
                 return ret;
             }
@@ -540,7 +624,7 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
         if (!force_sequential) {
             use_parallel_reg = globalConfig().parallel_reg_mr;
             if (use_parallel_reg == -1) {
-                use_parallel_reg = context_list_.size() > 1 && do_pre_touch;
+                use_parallel_reg = target_indices.size() > 1 && do_pre_touch;
             }
         }
 
@@ -548,15 +632,16 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
 
         if (use_parallel_reg) {
             std::vector<std::thread> reg_threads;
-            reg_threads.reserve(context_list_.size());
+            reg_threads.reserve(target_indices.size());
             std::vector<int> ret_codes(context_list_.size(), 0);
             const int ar = access_rights;  // Local copy for lambda capture
 
-            for (size_t i = 0; i < context_list_.size(); ++i) {
-                reg_threads.emplace_back([this, &ret_codes, chunk_dmabuf_exp, i,
-                                          chunk_addr, chunk_len, ar]() {
-                    ret_codes[i] = context_list_[i]->registerMemoryRegion(
-                        chunk_addr, chunk_len, ar, chunk_dmabuf_exp);
+            for (size_t index : target_indices) {
+                reg_threads.emplace_back([this, &ret_codes, chunk_dmabuf_exp,
+                                          index, chunk_addr, chunk_len, ar]() {
+                    ret_codes[index] =
+                        context_list_[index]->registerMemoryRegion(
+                            chunk_addr, chunk_len, ar, chunk_dmabuf_exp);
                 });
             }
 
@@ -575,12 +660,12 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
                 }
             }
         } else {
-            for (size_t i = 0; i < context_list_.size(); ++i) {
-                int ret = context_list_[i]->registerMemoryRegion(
+            for (size_t index : target_indices) {
+                int ret = context_list_[index]->registerMemoryRegion(
                     chunk_addr, chunk_len, access_rights, chunk_dmabuf_exp);
                 if (ret) {
                     LOG(ERROR) << "Failed to register memory region (chunk "
-                               << ci << ") with context " << i;
+                               << ci << ") with context " << index;
                     // chunk ci's MRs are partially registered but its metadata
                     // was never added; release ci's MRs, then roll back [0,
                     // ci).
@@ -615,10 +700,17 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
 
         // Collect per-context keys for THIS chunk (address-range lookup).
         BufferDesc buffer_desc;
-        for (auto &context : context_list_) {
-            buffer_desc.lkey.push_back(context->lkey(chunk_addr));
-            if (remote_accessible)
-                buffer_desc.rkey.push_back(context->rkey(chunk_addr));
+        for (size_t i = 0; i < context_list_.size(); ++i) {
+            if (std::find(target_indices.begin(), target_indices.end(), i) !=
+                target_indices.end()) {
+                buffer_desc.lkey.push_back(context_list_[i]->lkey(chunk_addr));
+                if (remote_accessible)
+                    buffer_desc.rkey.push_back(
+                        context_list_[i]->rkey(chunk_addr));
+            } else {
+                buffer_desc.lkey.push_back(0);
+                if (remote_accessible) buffer_desc.rkey.push_back(0);
+            }
         }
         buffer_desc.name = resolved_name;
         buffer_desc.addr = (uint64_t)chunk_addr;
@@ -669,6 +761,15 @@ int RdmaTransport::unregisterLocalMemory(void *addr, bool update_metadata) {
 int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
                                                  bool update_metadata,
                                                  bool force_sequential) {
+    auto findLocalBufferLocation = [this](uint64_t buffer_addr) {
+        auto desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
+        if (!desc) return std::string();
+        for (const auto &buffer : desc->buffers) {
+            if (buffer.addr == buffer_addr) return buffer.name;
+        }
+        return std::string();
+    };
+
     // Mooncake#2017: if this base buffer was split into chunks at registration,
     // unregister each chunk's MR + metadata entry (unregisterLocalMemory only
     // receives the base addr).
@@ -690,11 +791,30 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
         // Metadata: remove each chunk from the local desc WITHOUT publishing (a
         // chunked buffer otherwise publishes to the metadata server once per
         // chunk); publish once after all removals, below.
+        std::vector<std::string> chunk_locations;
+        chunk_locations.reserve(chunk_addrs.size());
         for (uint64_t ca : chunk_addrs) {
+            chunk_locations.push_back(findLocalBufferLocation(ca));
             int rc = metadata_->removeLocalMemoryBuffer(
                 reinterpret_cast<void *>(ca), /*update_metadata=*/false);
             if (rc && !first_err) first_err = rc;
         }
+
+#ifdef USE_ASCEND_RDMA
+        for (size_t i = 0; i < chunk_addrs.size(); ++i) {
+            if (chunk_locations[i].empty()) continue;
+            int ret =
+                ub_segment_.UnRegUbSegment(chunk_locations[i], chunk_addrs[i]);
+            if (ret) {
+                LOG(WARNING) << "Failed to unregister UB segment (chunk " << i
+                             << "/" << chunk_addrs.size() << ") at "
+                             << reinterpret_cast<void *>(chunk_addrs[i])
+                             << " (location=" << chunk_locations[i]
+                             << ", ret=" << ret << ")";
+                if (!first_err) first_err = ret;
+            }
+        }
+#endif
 
         // MRs: unregister across contexts in PARALLEL (one thread per context,
         // each releasing all chunks) — the previous code did chunks × contexts
@@ -743,8 +863,24 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
         return first_err;
     }
 
-    int rc = metadata_->removeLocalMemoryBuffer(addr, update_metadata);
+    const std::string location = findLocalBufferLocation((uint64_t)addr);
+    int rc =
+        metadata_->removeLocalMemoryBuffer(addr, /*update_metadata=*/false);
     if (rc) return rc;
+
+    // Once the local entry is removed, a publish failure must not prevent
+    // resource cleanup: a retry can no longer find the buffer in metadata.
+    int first_err = 0;
+    if (update_metadata) first_err = metadata_->updateLocalSegmentDesc();
+
+#ifdef USE_ASCEND_RDMA
+    int ub_ret = ub_segment_.UnRegUbSegment(location, (uint64_t)addr);
+    if (ub_ret != 0) {
+        LOG(ERROR) << "Failed to unregister UB segment at " << addr
+                   << " (location=" << location << ", ret=" << ub_ret << ")";
+        if (!first_err) first_err = ub_ret;
+    }
+#endif
 
     // force_sequential is used by batch operations to avoid nested parallelism
     int use_parallel_unreg = 0;
@@ -774,7 +910,7 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
             if (ret_codes[i] != 0) {
                 LOG(ERROR) << "Failed to unregister memory region with context "
                            << i;
-                return ret_codes[i];
+                if (!first_err) first_err = ret_codes[i];
             }
         }
     } else {
@@ -783,12 +919,12 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
             if (ret) {
                 LOG(ERROR) << "Failed to unregister memory region with context "
                            << i;
-                return ret;
+                if (!first_err) first_err = ret;
             }
         }
     }
 
-    return 0;
+    return first_err;
 }
 
 int RdmaTransport::allocateLocalSegmentID() {
