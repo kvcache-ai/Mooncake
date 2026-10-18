@@ -8,10 +8,11 @@
 #include <functional>
 #include <memory>
 #include <mutex>
-#include <vector>
+#include <optional>
 
 #include "common_types.h"
 #include "control_plane/control_types.h"
+#include "device_comm/device_collective/device_collective_dispatcher.h"
 #include "device_comm/device_collective/device_collective_recovery.h"
 #include "device_comm/device_collective/resolved_group_view.h"
 #include "device_comm/device_collective/device_collective_types.cuh"
@@ -22,15 +23,9 @@
 namespace mooncake {
 
 class DeviceCollectiveWorkspace;
-class RingAllReduceAlgorithm;
-class OneShotAllReduceAlgorithm;
-class SimpleResources;
-class LLResources;
 class StrongStream;
 
-// Collective lifecycle facade. Owns communicator protocol resources,
-// view-epoch synchronization, invocation/recovery state, control-update
-// publication, and graph references.
+// Runs device collectives for one communicator.
 class DeviceCollectiveRuntime {
    public:
     using FailureRecoveryCallback = std::function<PGResult<void>(InGroupRank)>;
@@ -48,22 +43,26 @@ class DeviceCollectiveRuntime {
 
     [[nodiscard]] DeviceGroupEndpoint localEndpoint() const;
 
-    PGResult<void> useLocalOnly(uint64_t view_epoch);
+    PGResult<void> useLocalOnly(const GroupView& view);
     PGResult<void> applyGroupView(const GroupView& view);
 
     PGResult<void> enableRecovery(DeviceCollectiveRecoveryWorker& worker,
                                   FailureRecoveryCallback callback);
 
-    PGResult<void> enqueueAllReduce(const void* send_buffer, void* recv_buffer,
-                                    size_t count, DataType datatype,
-                                    ReduceOp op,
-                                    cudaStream_t user_stream_handle,
-                                    int32_t* failed_ranks_hint);
+    PGResult<void> enqueue(const DeviceCollectiveRequest& request,
+                           cudaStream_t user_stream_handle);
 
     PGResult<void> shutdown();
 
    private:
     friend class MooncakeCommunicator;
+
+    using RecoveryRequest = ControlMailbox::RecoverySlot::ReceivedRequest;
+
+    struct PublishedViewUpdate {
+        ControlUpdate update;
+        ControlMailbox::ControlUpdateSlot::RequestHandle handle;
+    };
 
     DeviceCollectiveRuntime(DeviceTransferService& transfer_service,
                             DeviceCollectiveWorkspace& workspace,
@@ -74,17 +73,10 @@ class DeviceCollectiveRuntime {
                             StrongStream& strong_stream,
                             GpuEvent handoff_event);
 
-    struct Configuration;
     PGResult<ResolvedGroupView> resolveGroupView(const GroupView& view) const;
-    PGResult<void> installGroupView(const ResolvedGroupView& view,
-                                    bool require_one_shot_plan);
-    PGResult<void> publishControlState(const Configuration& configuration,
-                                       bool pinned,
-                                       bool include_active_ranks_mirror);
+    PGResult<void> installGroupView(const ResolvedGroupView& view);
     [[nodiscard]] bool hasPendingRecovery() const noexcept;
-    PGResult<void> prepareFailureResume(const CollectiveFailureReport& failure);
-    [[nodiscard]] DeviceAllReduceAlgorithm allReduceAlgorithm(
-        size_t bytes, DataType datatype, ReduceOp op) const noexcept;
+    PGResult<void> handleFailure(const RecoveryRequest& request);
     PGResult<void> attachGraphUse(const GpuCaptureInfo& capture);
     void releaseState() noexcept;
 
@@ -93,17 +85,20 @@ class DeviceCollectiveRuntime {
     int device_index_ = -1;
     InGroupRank self_rank_ = kInvalidInGroupRank;
     RegionSlice view_epoch_signals_;
-    InvocationState* invocation_state_ = nullptr;
-    // Protocol resources outlive all algorithms borrowing them.
-    std::unique_ptr<SimpleResources> simple_;
-    std::unique_ptr<LLResources> ll_;
-    std::unique_ptr<RingAllReduceAlgorithm> ring_all_reduce_;
-    std::unique_ptr<OneShotAllReduceAlgorithm> one_shot_all_reduce_;
-    // One committed host image; candidate construction never mutates it.
-    std::unique_ptr<Configuration> configuration_;
-    std::vector<DeviceAllReduceAlgorithmChoice> all_reduce_algorithm_choices_;
+    GpuBuffer<DeviceGroupView> device_group_view_;
+    GpuBuffer<InvocationState> invocation_state_;
+    std::unique_ptr<DeviceCollectiveDispatcher> dispatcher_;
     StrongStream& strong_stream_;
-    ControlMailbox* control_mailbox_ = nullptr;
+    MappedHostBuffer<ControlMailbox> control_mailbox_;
+    // Last ordinary publication; recovery reuses it only if still unconsumed.
+    std::optional<PublishedViewUpdate> published_view_update_;
+    // Skip repeated GroupView updates when both the epoch and local-only mode
+    // match.
+    std::optional<uint64_t> installed_view_epoch_;
+    bool installed_local_only_ = false;
+    // 0/1 mask indexed by stable group rank, updated when a group view is
+    // installed. Copied to the caller-owned mirror in recovery control updates.
+    std::array<int32_t, kMaxNumRanks> active_ranks_source_{};
     int32_t* active_ranks_mirror_ = nullptr;
     size_t active_ranks_count_ = 0;
     FailureRecoveryCallback failure_recovery_callback_;

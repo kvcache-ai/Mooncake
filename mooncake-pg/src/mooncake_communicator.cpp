@@ -1,13 +1,16 @@
 #include <mooncake_communicator.h>
 
 #include <algorithm>
+#include <charconv>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <future>
 #include <limits>
+#include <optional>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 
 #include <glog/logging.h>
@@ -67,22 +70,139 @@ PGResult<DeviceRouteConfig> loadDeviceRouteConfigFromEnvironment() {
 }
 #endif
 
-PGResult<std::optional<DeviceAllReduceAlgorithm>>
-loadCollectiveAlgorithmFromEnvironment() {
+// Parses the coordinator's collective algorithm policy from
+// MOONCAKE_PG_COLLECTIVE_ALGORITHM.
+//
+// Syntax:
+//   <op>:<rule>[,<rule>...][;<op>:<rule>...]
+//   where each <rule> is <algorithm>[@<max_bytes>]
+//
+// Format & Semantics:
+//   - Operations are separated by ';', and per-operation rules by ','.
+//   - '@max_bytes' is an inclusive upper bound; omit it for no upper bound.
+//   - Sizes are unsigned decimal bytes, with optional KiB, MiB or GiB suffixes.
+//   - Rules for an operation are sorted by bound, smallest first.
+//   - Textual order only matters when bounds are equal.
+//
+// Behavior & Fallback:
+//   - Unset, empty, whitespace-only, or "auto": use the automatic policy.
+//   - For each configured op, explicit rules cover [0, largest max_bytes].
+//   - Explicit rules take precedence within that range.
+//   - Other operations and sizes above that range retain the automatic policy.
+//   - No fallback if the selected algorithm is unsupported or unavailable.
+//
+// Examples:
+//   unset, "", or "auto":
+//     Let the coordinator automatically choose algorithms based on
+//     capabilities.
+//   "allreduce:ring":
+//     Use Ring for AllReduce across all sizes. AllGather keeps its automatic
+//     policy.
+//   "allreduce:oneshot@512KiB":
+//     Use OneShot for AllReduce inputs <= 512 KiB. Larger inputs and AllGather
+//     keep their automatic policy.
+//   "allreduce:ring;allgather:ring":
+//     Use Ring for both AllReduce and AllGather across all sizes.
+//   "allreduce:oneshot@512KiB,ring;allgather:ring":
+//     AllReduce uses OneShot for inputs <= 512 KiB (524,288 bytes) and Ring for
+//     larger inputs. AllGather uses Ring across all sizes.
+//   "allreduce:ring@1048576":
+//     Force Ring for AllReduce inputs <= 1 MiB, including sizes that would
+//     otherwise use OneShot. Larger inputs and AllGather keep their automatic
+//     policy.
+PGResult<std::optional<std::vector<DeviceCollectiveAlgorithmChoice>>>
+loadCollectiveAlgorithmChoicesFromEnvironment() {
+    const auto trim = [](std::string_view value) {
+        const auto first = value.find_first_not_of(" \t\r\n");
+        if (first == std::string_view::npos) return value.substr(value.size());
+        return value.substr(first,
+                            value.find_last_not_of(" \t\r\n") - first + 1);
+    };
     const char* raw_value = std::getenv("MOONCAKE_PG_COLLECTIVE_ALGORITHM");
-    if (!raw_value || std::string_view(raw_value) == "auto") {
-        return std::optional<DeviceAllReduceAlgorithm>{};
+    auto remaining = trim(raw_value ? raw_value : "");
+    if (remaining.empty() || remaining == "auto") {
+        return std::nullopt;
     }
-    const std::string_view value(raw_value);
-    if (value == "ring") {
-        return std::optional{DeviceAllReduceAlgorithm::Ring};
+
+    static const std::unordered_map<std::string_view, OpType> kOperationByName{
+        {"allreduce", OpType::AllReduce},
+        {"allgather", OpType::AllGather},
+    };
+    static const std::unordered_map<std::string_view, DeviceCollectiveAlgorithm>
+        kAlgorithmByName{
+            {"ring", DeviceCollectiveAlgorithm::Ring},
+            {"oneshot", DeviceCollectiveAlgorithm::OneShot},
+        };
+
+    std::vector<DeviceCollectiveAlgorithmChoice> choices;
+    while (true) {
+        const auto semicolon = remaining.find(';');
+        const auto group = trim(remaining.substr(0, semicolon));
+        const auto colon = group.find(':');
+        const std::string error_prefix =
+            "invalid MOONCAKE_PG_COLLECTIVE_ALGORITHM group '" +
+            std::string(group) + "': ";
+        PG_VALIDATE_ARG(colon != std::string_view::npos,
+                        error_prefix + "expected op:algorithm[@max_bytes],...");
+        const auto operation_name = trim(group.substr(0, colon));
+        const auto operation = kOperationByName.find(operation_name);
+        PG_VALIDATE_ARG(
+            operation != kOperationByName.end(),
+            error_prefix + "unknown op '" + std::string(operation_name) + "'");
+
+        auto rules = group.substr(colon + 1);
+        while (true) {
+            const auto comma = rules.find(',');
+            const auto rule = trim(rules.substr(0, comma));
+            const auto at = rule.find('@');
+            const auto algorithm_name = trim(rule.substr(0, at));
+            const auto algorithm = kAlgorithmByName.find(algorithm_name);
+            PG_VALIDATE_ARG(algorithm != kAlgorithmByName.end(),
+                            error_prefix + "unknown algorithm '" +
+                                std::string(algorithm_name) + "'");
+            DeviceCollectiveAlgorithmChoice choice{
+                .operation = operation->second,
+                .max_bytes = std::numeric_limits<uint64_t>::max(),
+                .algorithm = algorithm->second,
+            };
+            if (at != std::string_view::npos) {
+                const auto bound = trim(rule.substr(at + 1));
+                const auto [end, error] =
+                    std::from_chars(bound.data(), bound.data() + bound.size(),
+                                    choice.max_bytes);
+                PG_VALIDATE_ARG(error == std::errc{},
+                                error_prefix +
+                                    "max_bytes must be an unsigned byte count "
+                                    "with an optional KiB, MiB, or GiB suffix");
+                const std::string_view suffix(
+                    end,
+                    static_cast<size_t>(bound.data() + bound.size() - end));
+                uint64_t scale = 1;
+                if (suffix == "KiB") {
+                    scale = 1024;
+                } else if (suffix == "MiB") {
+                    scale = 1024ull * 1024;
+                } else if (suffix == "GiB") {
+                    scale = 1024ull * 1024 * 1024;
+                } else {
+                    PG_VALIDATE_ARG(
+                        suffix.empty(),
+                        error_prefix + "size suffix must be KiB, MiB, or GiB");
+                }
+                PG_VALIDATE_ARG(
+                    choice.max_bytes <=
+                        std::numeric_limits<uint64_t>::max() / scale,
+                    error_prefix + "max_bytes overflows uint64_t");
+                choice.max_bytes *= scale;
+            }
+            choices.push_back(choice);
+            if (comma == std::string_view::npos) break;
+            rules.remove_prefix(comma + 1);
+        }
+        if (semicolon == std::string_view::npos) break;
+        remaining.remove_prefix(semicolon + 1);
     }
-    if (value == "oneshot") {
-        return std::optional{DeviceAllReduceAlgorithm::OneShot};
-    }
-    return makePGError(PGErrorCode::InvalidArgument,
-                       "MOONCAKE_PG_COLLECTIVE_ALGORITHM must be 'auto', "
-                       "'ring', or 'oneshot'");
+    return std::optional{std::move(choices)};
 }
 
 void copyDeviceToDevice(void* dst, const void* src, size_t bytes,
@@ -291,12 +411,11 @@ PGResult<std::string> MooncakePGContext::launchCoordinator() {
     PG_VALIDATE_STATE(global_rank == 0,
                       "only global rank 0 may start the coordinator");
     if (!coordinator_host) {
-        // The coordinator publishes one algorithm policy for every rank.
-        PG_TRY(auto all_reduce_algorithm,
-               loadCollectiveAlgorithmFromEnvironment());
+        PG_TRY(auto collective_algorithm_choices_override,
+               loadCollectiveAlgorithmChoicesFromEnvironment());
         auto candidate = std::make_unique<CoordinatorHost>(
             host_ip, max_world_size, fault_reconciliation_window_us,
-            all_reduce_algorithm);
+            std::move(collective_algorithm_choices_override));
         PG_TRY(candidate->start());
         coordinator_host = std::move(candidate);
     }
@@ -1026,15 +1145,10 @@ PGResult<void> MooncakeCommunicator::allReduceGpu(
         PG_ASSERT(device_collective_,
                   "new GPU collective backend is selected without a local "
                   "runtime");
-        if (!isDeviceAllReduceCombinationSupported(datatype, op)) {
-            return makePGError(
-                PGErrorCode::NotSupported,
-                "datatype/reduction combination is not supported by device "
-                "AllReduce");
-        }
-        return device_collective_->enqueueAllReduce(send_buffer, recv_buffer,
-                                                    count, datatype, op, stream,
-                                                    failed_ranks_hint);
+        return device_collective_->enqueue(
+            AllReduceRequest{send_buffer, recv_buffer, count, datatype, op,
+                             failed_ranks_hint},
+            stream);
     }
 #else
     PG_ASSERT(gpu_collective_backend_ != GpuCollectiveBackend::New,
@@ -1099,6 +1213,20 @@ PGResult<void> MooncakeCommunicator::allGatherGpu(
     PG_TRY(checkBuffer(recv_buffer, send_bytes, "receive buffer"));
     PG_TRY(
         initializeFailedRanksHint(failed_ranks_hint, failed_ranks_hint_count));
+#if MOONCAKE_PG_HAS_COLLECTIVE_V2
+    if (gpu_collective_backend_ == GpuCollectiveBackend::New) {
+        PG_ASSERT(device_collective_,
+                  "new GPU collective backend is selected without a local "
+                  "runtime");
+        return device_collective_->enqueue(
+            AllGatherRequest{send_buffer, recv_buffer, count, datatype,
+                             failed_ranks_hint},
+            stream);
+    }
+#else
+    PG_ASSERT(gpu_collective_backend_ != GpuCollectiveBackend::New,
+              "new GPU collective backend is unavailable in this build");
+#endif
     const int active_size = getSize();
     worker_->putTaskCuda(
         OpType::AllGather, send_bytes, 0, meta_, stream, failed_ranks_hint,
@@ -1891,7 +2019,7 @@ void MooncakeCommunicator::applyGroupState(
         switch (next_mode) {
             case CollectiveExtensionState::Isolated:
             case CollectiveExtensionState::Quiescing:
-                PG_ASSERT_OK(device_collective_->useLocalOnly(view.epoch));
+                PG_ASSERT_OK(device_collective_->useLocalOnly(view));
                 break;
             case CollectiveExtensionState::Normal:
                 PG_ASSERT_OK(device_collective_->applyGroupView(view));
@@ -1907,7 +2035,7 @@ void MooncakeCommunicator::applyGroupState(
     if (active_ranks_mirror_ && active_ranks_mirror_is_device_ &&
         active_ranks_mirror_device_index_ == device_index_) {
 #if MOONCAKE_PG_HAS_COLLECTIVE_V2
-        if (effective_gpu_collective_backend == GpuCollectiveBackend::New) {
+        if (device_collective_) {
             mirror_update_in_kernel = device_collective_->hasPendingRecovery();
         }
 #endif

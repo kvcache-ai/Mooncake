@@ -36,10 +36,10 @@ class RdmaRoute : public RouteProvider {
     PGResult<void> unregisterRegion(DeviceRegionKind kind, void* addr,
                                     size_t size) override;
     [[nodiscard]] std::optional<RouteEndpoint> localEndpoint() override;
-    PGResult<void> installEndpoints(const DeviceTransferSnapshot& snapshot,
-                                    uint64_t reclaim_before_version) override;
-    [[nodiscard]] PGResult<std::vector<DeviceTransferRoute>> updateRoutes()
-        override;
+    [[nodiscard]] PGResult<std::vector<DeviceTransferRoute>> installEndpoints(
+        const DeviceTransferSnapshot& snapshot,
+        uint64_t reclaim_before_version) override;
+    PGResult<void> updateRoutes() override;
     void fillDeviceContext(DeviceRouteContext& context) const noexcept override;
 
     PGResult<void> shutdown() override;

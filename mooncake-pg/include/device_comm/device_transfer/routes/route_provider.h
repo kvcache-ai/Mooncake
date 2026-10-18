@@ -4,11 +4,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
-
-#include <ylt/struct_pack.hpp>
 
 #include "control_plane/control_types.h"
 #include "device_comm/device_transfer/transfer_types.cuh"
@@ -30,13 +29,9 @@ class RouteProvider {
    public:
     virtual ~RouteProvider() = default;
 
-    [[nodiscard]] DeviceRouteType routeType() const noexcept {
-        return route_type_;
-    }
-    [[nodiscard]] std::string_view routeKey() const noexcept {
-        return route_key_;
-    }
-    [[nodiscard]] uint32_t routeVersion() const noexcept {
+    [[nodiscard]] DeviceRouteType type() const noexcept { return route_type_; }
+    [[nodiscard]] std::string_view key() const noexcept { return route_key_; }
+    [[nodiscard]] uint32_t endpointVersion() const noexcept {
         return endpoint_version_;
     }
 
@@ -61,17 +56,14 @@ class RouteProvider {
 
     // Prepare resources for the snapshot while current routes remain usable.
     // Reclaim generations with versions below reclaim_before_version.
-    virtual PGResult<void> installEndpoints(
-        const DeviceTransferSnapshot& snapshot,
-        uint64_t reclaim_before_version) = 0;
+    // Return routes indexed by GlobalRank, with Unreachable entries for missing
+    // peers or missing matching routes.
+    [[nodiscard]] virtual PGResult<std::vector<DeviceTransferRoute>>
+    installEndpoints(const DeviceTransferSnapshot& snapshot,
+                     uint64_t reclaim_before_version) = 0;
 
     // Switch resources after local DTS users stop.
-    // Resolve the service-owned endpoint snapshot as one batch.
-    // A missing peer or a missing matching route means that the provider
-    // must clear any state previously associated with that slot and return
-    // an Unreachable entry for it.
-    [[nodiscard]] virtual PGResult<std::vector<DeviceTransferRoute>>
-    updateRoutes() = 0;
+    virtual PGResult<void> updateRoutes() = 0;
 
     // Fill this provider's fields, preserving other providers' fields.
     virtual void fillDeviceContext(DeviceRouteContext&) const noexcept {}
@@ -85,44 +77,20 @@ class RouteProvider {
           route_key_(route_key),
           endpoint_version_(endpoint_version) {}
 
-    [[nodiscard]] PGResult<const RouteEndpoint*> findEndpoint(
-        const std::optional<DeviceTransferEndpoint>& endpoint) const {
-        if (!endpoint) return nullptr;
+    template <typename T>
+    [[nodiscard]] RouteEndpoint encodeEndpoint(const T& metadata) const {
+        return RouteEndpoint::encode(key(), endpointVersion(), metadata);
+    }
 
-        const RouteEndpoint* match = nullptr;
-        for (const auto& route_endpoint : endpoint->routes) {
-            if (route_endpoint.route_key != routeKey() ||
-                route_endpoint.version != routeVersion()) {
-                continue;
-            }
-            PG_ASSERT(
-                !match,
-                "peer endpoint contains a duplicate route key and version");
-            match = &route_endpoint;
-        }
-        return match;
+    [[nodiscard]] const RouteEndpoint* findEndpoint(
+        std::span<const RouteEndpoint> endpoints) const {
+        return findProviderEndpoint(endpoints, key(), endpointVersion());
     }
 
     template <typename T>
-    [[nodiscard]] static std::vector<uint8_t> encodeEndpointMetadata(
-        const T& metadata) {
-        return struct_pack::serialize<std::vector<uint8_t>>(metadata);
-    }
-
-    template <typename T>
-    [[nodiscard]] static PGResult<T> decodeEndpointMetadata(
-        const RouteEndpoint& endpoint) {
-        PG_VALIDATE_ARG(!endpoint.metadata.empty(), "serialized data is empty");
-        T metadata;
-        size_t consumed = 0;
-        const auto error = struct_pack::deserialize_to(
-            metadata, reinterpret_cast<const char*>(endpoint.metadata.data()),
-            endpoint.metadata.size(), consumed);
-        PG_VALIDATE_ARG(
-            !error, "deserialization failed: " + std::string(error.message()));
-        PG_VALIDATE_ARG(consumed == endpoint.metadata.size(),
-                        "serialized data contains trailing bytes");
-        return metadata;
+    [[nodiscard]] PGResult<T> decodeEndpoint(
+        const RouteEndpoint& endpoint) const {
+        return endpoint.decode<T>(key(), endpointVersion());
     }
 
    private:

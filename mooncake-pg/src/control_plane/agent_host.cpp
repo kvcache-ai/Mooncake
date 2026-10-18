@@ -41,7 +41,7 @@ PGResult<void> callAndCheck(RpcClient& client, const std::string& addr,
 }
 
 // Runs on the installation executor with no access to AgentHost state.
-PGResult<DeviceTransferEndpoint> installTransferEndpoints(
+PGResult<DeviceTransferInstallResult> installTransferEndpoints(
     DeviceTransferService* service, const InstallTransferEndpoints& effect) {
 #if MOONCAKE_PG_HAS_COLLECTIVE_V2
     PG_VALIDATE_STATE(service, "device endpoint service is missing");
@@ -537,9 +537,9 @@ void AgentHost::enqueueTransferEndpointInstallation(
             auto result = installTransferEndpoints(service, effect);
             if (result.has_value()) {
                 ack.applied = true;
-                auto endpoint = std::move(result).value();
-                if (endpoint != *effect.snapshot.endpoints[ack.rank])
-                    ack.updated_endpoint = std::move(endpoint);
+                auto installed = std::move(result).value();
+                ack.updated_endpoint = std::move(installed.updated_endpoint);
+                ack.routes = std::move(installed.routes);
             } else {
                 LOG(ERROR) << "Device endpoint installation failed: "
                            << result.error().message;

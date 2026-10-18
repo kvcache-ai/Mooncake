@@ -34,15 +34,15 @@ HostProxyRoute::~HostProxyRoute() noexcept = default;
 
 std::optional<RouteEndpoint> HostProxyRoute::localEndpoint() {
     return RouteEndpoint{
-        .route_key = std::string(kRouteKey),
-        .version = routeVersion(),
+        .key = std::string(key()),
+        .version = endpointVersion(),
         // HostProxy currently resolves TE peers through LinkManager, so its
         // endpoint carries no route-specific metadata.
         .metadata = {},
     };
 }
 
-PGResult<void> HostProxyRoute::installEndpoints(
+PGResult<std::vector<DeviceTransferRoute>> HostProxyRoute::installEndpoints(
     const DeviceTransferSnapshot& snapshot, uint64_t) {
     const auto& endpoints = snapshot.endpoints;
     PG_VALIDATE_STATE(!shutdown_requested_, "HostProxyRoute is shutting down");
@@ -54,8 +54,8 @@ PGResult<void> HostProxyRoute::installEndpoints(
     std::vector<DeviceTransferRoute> routes(max_world_size_);
     for (GlobalRank rank = 0; rank < static_cast<GlobalRank>(max_world_size_);
          ++rank) {
-        PG_TRY(auto endpoint, findEndpoint(endpoints[rank]));
-        if (!endpoint) continue;
+        if (!endpoints[rank] || !findEndpoint(endpoints[rank]->routes))
+            continue;
 
         routes[rank] = DeviceTransferRoute{
             .type = DeviceRouteType::HostProxy,
@@ -66,13 +66,10 @@ PGResult<void> HostProxyRoute::installEndpoints(
                 },
         };
     }
-    pending_routes_ = std::move(routes);
-    return {};
+    return routes;
 }
 
-PGResult<std::vector<DeviceTransferRoute>> HostProxyRoute::updateRoutes() {
-    return std::move(pending_routes_);
-}
+PGResult<void> HostProxyRoute::updateRoutes() { return {}; }
 
 void HostProxyRoute::fillDeviceContext(
     DeviceRouteContext& context) const noexcept {
