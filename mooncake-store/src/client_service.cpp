@@ -2741,8 +2741,11 @@ void Client::StartBatchPut(std::vector<PutOperation>& ops,
         return;
     }
 
-    const auto config =
-        AttachBatchHcaAffinity(base_config, ops, active_indices);
+    const auto affinity_config =
+        StoreHcaAffinityEnabled() ? std::make_optional(AttachBatchHcaAffinity(
+                                        base_config, ops, active_indices))
+                                  : std::nullopt;
+    const auto& config = affinity_config ? *affinity_config : base_config;
     auto start_responses =
         master_client_.BatchPutStart(keys, slice_lengths, config);
 
@@ -2842,8 +2845,11 @@ void Client::StartBatchUpsert(std::vector<PutOperation>& ops,
         return;
     }
 
-    const auto config =
-        AttachBatchHcaAffinity(base_config, ops, active_indices);
+    const auto affinity_config =
+        StoreHcaAffinityEnabled() ? std::make_optional(AttachBatchHcaAffinity(
+                                        base_config, ops, active_indices))
+                                  : std::nullopt;
+    const auto& config = affinity_config ? *affinity_config : base_config;
     auto start_responses =
         master_client_.BatchUpsertStart(keys, slice_lengths, config);
 
@@ -4919,19 +4925,22 @@ std::vector<tl::expected<int64_t, ErrorCode>> Client::BatchTransferReadRanges(
             continue;
         }
 
-        Replica::Descriptor selected = replicas[i];
+        Replica::Descriptor selected;
+        const auto* selected_replica = &replicas[i];
         int64_t transferred = 0;
         for (size_t j = 0; j < slices[i].size(); ++j) {
-            if ((!query_results.empty() && query_results[i] &&
-                 select_replica(query_results[i]->replicas,
-                                std::span<const Slice>(&slices[i][j], 1),
-                                selected) != ErrorCode::OK) ||
-                !selected.is_memory_replica()) {
-                entry_errors[i] = ErrorCode::INVALID_REPLICA;
-                break;
+            if (!query_results.empty() && query_results[i]) {
+                if (select_replica(query_results[i]->replicas,
+                                   std::span<const Slice>(&slices[i][j], 1),
+                                   selected) != ErrorCode::OK ||
+                    !selected.is_memory_replica()) {
+                    entry_errors[i] = ErrorCode::INVALID_REPLICA;
+                    break;
+                }
+                selected_replica = &selected;
             }
             const auto& handle =
-                selected.get_memory_descriptor().buffer_descriptor;
+                selected_replica->get_memory_descriptor().buffer_descriptor;
             builder.Add(TransferRequest::READ, handle, slices[i][j],
                         src_offsets[i][j], &entry_errors[i]);
             transferred += static_cast<int64_t>(slices[i][j].size);

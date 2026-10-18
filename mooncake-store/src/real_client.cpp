@@ -7007,6 +7007,11 @@ void RealClient::execute_session_memory_range_reads(
     std::vector<int> &results) {
     if (requests.empty()) return;
 
+    const bool select_by_destination =
+        StoreHcaAffinityEnabled() && client_->GetProtocol() == "rdma" &&
+        std::any_of(requests.begin(), requests.end(), [](const auto &request) {
+            return request.cached_query_result.replicas.size() > 1;
+        });
     std::vector<Replica::Descriptor> replicas;
     std::vector<std::vector<Slice>> destination_slices;
     std::vector<std::vector<uint64_t>> source_offsets;
@@ -7014,7 +7019,7 @@ void RealClient::execute_session_memory_range_reads(
     replicas.reserve(requests.size());
     destination_slices.reserve(requests.size());
     source_offsets.reserve(requests.size());
-    query_results.reserve(requests.size());
+    if (select_by_destination) query_results.reserve(requests.size());
     for (const auto &request : requests) {
         std::vector<Slice> request_slices;
         std::vector<uint64_t> request_offsets;
@@ -7029,7 +7034,8 @@ void RealClient::execute_session_memory_range_reads(
                 static_cast<uint64_t>(request.source_offsets[range_index]));
         }
         replicas.push_back(request.selected_replica);
-        query_results.push_back(&request.cached_query_result);
+        if (select_by_destination)
+            query_results.push_back(&request.cached_query_result);
         destination_slices.push_back(std::move(request_slices));
         source_offsets.push_back(std::move(request_offsets));
     }
