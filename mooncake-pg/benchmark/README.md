@@ -16,6 +16,38 @@ python mooncake-pg/benchmark/pgbench.py \
   --collective all_reduce --backend mooncake --device cuda -g 8 -b 8 -e 128M -f 2
 ```
 
+### Explicit Tree + Simple
+
+The Coordinator reads `MOONCAKE_PG_COLLECTIVE_ALGORITHM` at startup. Set it on
+all launched benchmark workers so the Coordinator receives the selection:
+
+```bash
+MOONCAKE_PG_PREFERRED_GPU_COLLECTIVE_BACKEND=new \
+MOONCAKE_PG_COLLECTIVE_ALGORITHM=tree \
+PYTHONPATH=mooncake-pg \
+python mooncake-pg/benchmark/pgbench.py \
+  --collective all_reduce --backend mooncake --device cuda -g 4 -b 8 -e 128M -f 2
+```
+
+`tree` requires the group to select the new backend and every active GPU rank
+to advertise compatible Tree/Simple endpoints. Initialization or activation is
+rejected when that requirement fails. CPU groups are unaffected. `auto`, `ring`
+and `oneshot` keep their existing selection and fallback behavior; auto does
+not select Tree. Changing the environment of an existing Coordinator does not
+change its selection.
+
+Tree uses a single NCCL-style binary tree and the shared Simple resources. Its
+CUDA Graph keeps a fixed kernel and reads the latest plan on compatible
+membership changes within the communicator capacity. Captured input addresses,
+count, dtype/op and algorithm remain fixed; changing them requires recapture.
+A failed AllReduce can partially overwrite output and is not retried or rolled
+back automatically. Restore input before replaying after failure.
+
+For C API users, set `preferredGpuCollectiveBackend` to
+`mooncakePgGpuCollectiveBackendNew` in the existing comm config; its initializer
+continues to default to legacy. No public C API signatures or config fields
+were added for Tree.
+
 Set `MOONCAKE_PGTEST_DEVICE_FILTERS=mlx5_1,mlx5_2,...` to explicitly set HCA whitelist.
 
 ## Notes

@@ -262,17 +262,21 @@ bool MooncakeWorkCuda::wait(std::chrono::milliseconds) {
 
 at::Tensor MooncakeWorkCuda::getFailedRanksHint() const {
     // Ensure the worker thread has completed the task and written
-    // the failed-ranks bitmap before returning the tensor.
-    if (event_ && at::cuda::currentStreamCaptureStatus() ==
-                      c10::cuda::CaptureStatus::None) {
+    // the failed-ranks bitmap before returning the tensor. Captured events
+    // express Graph dependencies and cannot be synchronized here; the caller
+    // must synchronize the replay stream before querying captured Work.
+    if (!is_captured_ && event_ &&
+        at::cuda::currentStreamCaptureStatus() ==
+            c10::cuda::CaptureStatus::None) {
         event_->synchronize();
     }
     return failed_ranks_hint_.tensor;
 }
 
 bool MooncakeWorkCuda::getLocalSuccess() const {
-    if (event_ && at::cuda::currentStreamCaptureStatus() ==
-                      c10::cuda::CaptureStatus::None) {
+    if (!is_captured_ && event_ &&
+        at::cuda::currentStreamCaptureStatus() ==
+            c10::cuda::CaptureStatus::None) {
         event_->synchronize();
     }
     return failed_ranks_hint_.isLocalSuccess();

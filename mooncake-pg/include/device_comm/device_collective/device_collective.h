@@ -24,6 +24,7 @@ namespace mooncake {
 class DeviceCollectiveWorkspace;
 class RingAllReduceAlgorithm;
 class OneShotAllReduceAlgorithm;
+class TreeAllReduceAlgorithm;
 class SimpleResources;
 class LLResources;
 class StrongStream;
@@ -48,7 +49,7 @@ class DeviceCollectiveRuntime {
 
     [[nodiscard]] DeviceGroupEndpoint localEndpoint() const;
 
-    PGResult<void> useLocalOnly(uint64_t view_epoch);
+    PGResult<void> useLocalOnly(const GroupView& group_view);
     PGResult<void> applyGroupView(const GroupView& view);
 
     PGResult<void> enableRecovery(DeviceCollectiveRecoveryWorker& worker,
@@ -77,7 +78,8 @@ class DeviceCollectiveRuntime {
     struct Configuration;
     PGResult<ResolvedGroupView> resolveGroupView(const GroupView& view) const;
     PGResult<void> installGroupView(const ResolvedGroupView& view,
-                                    bool require_one_shot_plan);
+                                    bool require_one_shot_plan,
+                                    bool require_tree_plan = false);
     PGResult<void> publishControlState(const Configuration& configuration,
                                        bool pinned,
                                        bool include_active_ranks_mirror);
@@ -99,6 +101,7 @@ class DeviceCollectiveRuntime {
     std::unique_ptr<LLResources> ll_;
     std::unique_ptr<RingAllReduceAlgorithm> ring_all_reduce_;
     std::unique_ptr<OneShotAllReduceAlgorithm> one_shot_all_reduce_;
+    std::unique_ptr<TreeAllReduceAlgorithm> tree_all_reduce_;
     // One committed host image; candidate construction never mutates it.
     std::unique_ptr<Configuration> configuration_;
     std::vector<DeviceAllReduceAlgorithmChoice> all_reduce_algorithm_choices_;
