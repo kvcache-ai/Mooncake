@@ -1538,7 +1538,7 @@ SelectionResult TransferEngineImpl::getTransportType(const Request& request,
 
     const TransportType hint = request.transport_hint;
 
-    // Plan XPU/MLU staging before selecting a host-only network transport.
+    // Plan TPU/XPU/MLU staging before selecting a host-only network transport.
     // Keep the original memory types for policy matching.
     std::vector<std::string> host_staging_params;
     std::vector<TransportType> staging_transports;
@@ -1547,7 +1547,9 @@ SelectionResult TransferEngineImpl::getTransportType(const Request& request,
         auto* entry = desc->findBuffer(request.target_offset, request.length);
         if (!entry) return SelectionResult{};
         auto remote_mtype = getTypeEnum(LocationParser(entry->location).type());
-        if ((transport_list_[XPU] &&
+        if ((transport_list_[TPU] &&
+             (local_mtype == MTYPE_TPU || remote_mtype == MTYPE_TPU)) ||
+            (transport_list_[XPU] &&
              (local_mtype == MTYPE_XPU || remote_mtype == MTYPE_XPU)) ||
             local_mtype == MTYPE_MLU || remote_mtype == MTYPE_MLU) {
             findStagingPolicy(request, host_staging_params);
@@ -2011,41 +2013,16 @@ void TransferEngineImpl::findStagingPolicy(const Request& request,
                 remote, Topology::MEM_CUDA));
         }
     }
-    // case 3: TPU. HBM is not NIC-addressable, so any hop touching TPU memory
-    // is staged through host DRAM: TpuTransport performs the local HBM<->host
-    // copy (via the PJRT adapter) and the host<->host hop is carried by
-    // whatever host-DRAM network transport is present. TPU deployments (e.g.
-    // cloud TPU VMs) are typically TCP/multi-NIC rather than RDMA, so we gate
-    // on either; the cross stage itself is routed by capability (dram_to_dram),
-    // so TCP is selected when RDMA is absent. We also require TpuTransport (the
-    // local HBM<->host executor), mirroring how the CUDA cases gate on NVLINK.
-    // An empty stage location means "no staging needed on that side".
-    if (transport_list_[TPU] &&
-        (transport_list_[RDMA] || transport_list_[UB] ||
-         transport_list_[FABRIC] || transport_list_[TCP] ||
-         transport_list_[HP_TCP])) {
-        if (local_mtype == MTYPE_TPU && remote_mtype == MTYPE_TPU) {
-            policy.clear();
-            policy.push_back(server_addr);
-            policy.push_back(topology_->findNearMem(local));
-            policy.push_back(desc->getMemory().topology.findNearMem(remote));
-        } else if (local_mtype == MTYPE_TPU && remote_mtype == MTYPE_CPU) {
-            policy.clear();
-            policy.push_back(server_addr);
-            policy.push_back(topology_->findNearMem(local));
-            policy.push_back("");  // remote already host DRAM
-        } else if (local_mtype == MTYPE_CPU && remote_mtype == MTYPE_TPU) {
-            policy.clear();
-            policy.push_back(server_addr);
-            policy.push_back("");  // local already host DRAM
-            policy.push_back(desc->getMemory().topology.findNearMem(remote));
-        }
-    }
-    // XPU and MLU stage device memory through host DRAM. The local device
-    // needs its copy transport; a host-only caller can delegate a peer's MLU
-    // copy to that peer. Each device side needs a resolvable host stage. Fail
-    // closed when topology or the local copy transport is unavailable.
-    if (((transport_list_[XPU] &&
+    // TPU, XPU and MLU device memory is not NIC-addressable, so it is staged
+    // through host DRAM: the device's copy transport (TpuTransport,
+    // XpuTransport, MluTransport) runs the local device<->host hop and a host
+    // network transport carries the host<->host hop. The local device needs its
+    // copy transport; a host-only caller can delegate a peer's MLU copy to that
+    // peer. Each device side needs a resolvable host stage. Fail closed when
+    // topology or the local copy transport is unavailable.
+    if (((transport_list_[TPU] &&
+          (local_mtype == MTYPE_TPU || remote_mtype == MTYPE_TPU)) ||
+         (transport_list_[XPU] &&
           (local_mtype == MTYPE_XPU || remote_mtype == MTYPE_XPU)) ||
          ((local_mtype == MTYPE_MLU || remote_mtype == MTYPE_MLU) &&
           (local_mtype != MTYPE_MLU || transport_list_[MLU]))) &&

@@ -736,6 +736,21 @@ if(USE_TPU)
     tent_tpu_transport_test
     PRIVATE MOCK_TPU_PJRT_LIB="$<TARGET_FILE:mock_tpu_pjrt>")
   add_test(NAME tent_tpu_transport_test COMMAND tent_tpu_transport_test)
+
+  # Two engines over loopback: TPU requests must be planned as host-staged
+  # transfers whichever host network transport is installed.
+  add_executable(tent_tpu_engine_test tpu/tpu_engine_test.cpp)
+  add_dependencies(tent_tpu_engine_test mock_tpu_pjrt)
+  target_link_libraries(
+    tent_tpu_engine_test PRIVATE gtest gtest_main tent_link_group
+                                 ${CMAKE_DL_LIBS})
+  target_include_directories(tent_tpu_engine_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  target_compile_definitions(
+    tent_tpu_engine_test
+    PRIVATE MOCK_TPU_PJRT_LIB="$<TARGET_FILE:mock_tpu_pjrt>")
+  add_test(NAME tent_tpu_engine_test COMMAND tent_tpu_engine_test)
+  set_tests_properties(tent_tpu_engine_test PROPERTIES TIMEOUT 300)
 endif()
 
 # XPU SYCL platform test: exercises XpuPlatform (device allocation, pointer
