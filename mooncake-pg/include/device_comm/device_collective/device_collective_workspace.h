@@ -39,7 +39,7 @@ class DeviceCollectiveWorkspace {
     [[nodiscard]] const RegionSlice& buffer() const noexcept;
     PGResult<const RegionSlice*> staging();
 
-    [[nodiscard]] const DeviceCollectiveWorkspaceEndpoint& localEndpoint()
+    [[nodiscard]] DeviceCollectiveWorkspaceEndpoint localEndpoint()
         const noexcept;
 
     PGResult<void> installPeerEndpoint(
@@ -49,14 +49,12 @@ class DeviceCollectiveWorkspace {
    private:
     DeviceCollectiveWorkspace(DeviceTransferService& transfer_service,
                               RegionSlice buffer, GlobalRank self_rank,
-                              uint32_t max_world_size,
-                              DeviceCollectiveWorkspaceEndpoint local_endpoint);
+                              uint32_t max_world_size);
 
     DeviceTransferService& transfer_service_;
     RegionSlice buffer_;
     std::optional<RegionSlice> staging_;
     GlobalRank self_rank_ = kInvalidGlobalRank;
-    DeviceCollectiveWorkspaceEndpoint local_endpoint_;
     std::vector<std::optional<DeviceCollectiveWorkspaceEndpoint>> endpoints_;
     mutable std::mutex mutex_;
 };

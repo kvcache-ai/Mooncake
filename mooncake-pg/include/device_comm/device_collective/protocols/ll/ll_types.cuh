@@ -2,6 +2,7 @@
 #define MOONCAKE_PG_DEVICE_COMM_DEVICE_COLLECTIVE_PROTOCOLS_LL_TYPES_CUH
 
 #include "device_comm/device_collective/device_collective_types.cuh"
+#include "device_comm/device_utils/device_utils.cuh"
 
 namespace mooncake {
 
@@ -24,8 +25,7 @@ struct LLPacket {
 
     [[nodiscard]] __host__ __device__ static constexpr uint64_t packetCount(
         uint64_t payload_bytes) {
-        return payload_bytes / kPayloadBytes +
-               (payload_bytes % kPayloadBytes != 0);
+        return ceilDiv(payload_bytes, kPayloadBytes);
     }
 
     [[nodiscard]] __host__ __device__ static constexpr uint64_t payloadCapacity(
@@ -35,44 +35,31 @@ struct LLPacket {
 };
 static_assert(sizeof(LLPacket) == sizeof(uint64_t));
 
-// Separate entry and exit signals bracket each reset operation.
+// Separate entry and exit signals bracket packet-tag recycling.
 enum class LLBarrierType : uint32_t {
-    ViewResetEnter,
-    ViewResetExit,
     TagRecycleEnter,
     TagRecycleExit,
 };
 
-inline constexpr uint32_t kLLBarrierCount = 4;
-
-// Protocol-owned bindings, indexed by stable InGroupRank.
-struct LLPeer {
-    GlobalRank global_rank = kInvalidGlobalRank;
-    // Remote offsets are relative to the peer's DTS region base.
-    uint64_t signal_offset = 0;
-};
-
-// Host-published bindings contain no mutable device progress.
-struct LLBindings {
-    const DeviceTransferHandle* transfer_handle = nullptr;
-    InGroupRank self_rank = kInvalidInGroupRank;
-    uint32_t max_group_size = 0;
-    uint64_t* signals = nullptr;
-    // Indexed by InGroupRank.
-    LLPeer peer_bindings[kMaxNumRanks] = {};
-};
+inline constexpr uint32_t kLLBarrierCount = 2;
 
 // Each channel advances independently across launches and graph replays.
-struct alignas(64) LLProgress {
-    uint64_t view_epoch = kInvalidViewEpoch;
+struct alignas(64) LLChannelProgress {
     uint64_t next_sequence = LLPacket::kFirstSequence;
     // A failed exchange requires a new View before its storage can be reused.
     InGroupRank failed_rank = kInvalidInGroupRank;
 };
 
+// Host-installed LL addresses and layout for one communicator.
 struct LLState {
-    LLBindings bindings;
-    LLProgress progress[kMaxDeviceCollectiveChannels];
+    const DeviceTransferHandle* transfer_handle = nullptr;
+    uint32_t max_group_size = 0;
+    uint64_t* tag_recycle_signals = nullptr;
+    // Remote tag-recycle signal offsets, indexed by DeviceGroupView active
+    // index.
+    uint64_t tag_recycle_signal_offsets[kMaxNumRanks] = {};
+    // Local progress, indexed by channel.
+    LLChannelProgress* progress = nullptr;
 };
 
 }  // namespace mooncake

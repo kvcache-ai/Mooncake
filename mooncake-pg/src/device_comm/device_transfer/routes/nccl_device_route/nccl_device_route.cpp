@@ -26,6 +26,7 @@ namespace {
 struct NcclDeviceEndpointMetadata {
     uint32_t context_count;
     std::vector<int32_t> next_unique_id;
+    GpuUuid device_uuid{};
 };
 
 PGResult<std::vector<int32_t>> createUniqueId() {
@@ -58,19 +59,14 @@ struct NcclDeviceRoute::State {
                 PG_TRY_TE(transport->abort());
                 transport.reset();
             }
-            if (device_contexts) {
-                PG_TRY_CUDA(cudaFree(device_contexts));
-                device_contexts = nullptr;
-            }
-            return {};
+            return device_contexts.release();
         }
 
         int device_index = -1;
         // Installation this generation belongs to.
         uint64_t installation_version = 0;
+        GpuBuffer<DeviceContexts> device_contexts;
         std::unique_ptr<device::NcclTransport> transport;
-        DeviceContexts* device_contexts = nullptr;
-        std::vector<DeviceTransferRoute> routes;
     };
 
     int device_index = -1;
@@ -78,6 +74,7 @@ struct NcclDeviceRoute::State {
     // When this rank provides the ID, installEndpoints() consumes it and
     // generates a replacement for a future installation.
     std::vector<int32_t> next_unique_id;
+    GpuUuid device_uuid{};
     DeviceLocalRegion peer_accessible_region;
     DeviceLocalRegion staging_region;
     std::optional<GpuStream> stream;
@@ -113,6 +110,7 @@ PGResult<std::unique_ptr<NcclDeviceRoute>> NcclDeviceRoute::create(
     PG_TRY_CUDA(preloadNcclDeviceDrainKernel());
     auto state = std::make_unique<State>();
     state->device_index = device_index;
+    PG_TRY(state->device_uuid, queryGpuUuid(device_index));
     PG_TRY(state->stream, GpuStream::createNonBlocking(device_index));
     PG_TRY(state->drain_timeout_ticks,
            gpuTimeoutTicks(device_index, kTransferDrainTimeoutMs * 1000));
@@ -167,15 +165,11 @@ PGResult<void> NcclDeviceRoute::unregisterRegion(DeviceRegionKind kind,
 
 std::optional<RouteEndpoint> NcclDeviceRoute::localEndpoint() {
     if (!state_ || state_->next_unique_id.empty()) return std::nullopt;
-    return RouteEndpoint{
-        .route_key = std::string(kRouteKey),
-        .version = kEndpointVersion,
-        .metadata = encodeEndpointMetadata(
-            NcclDeviceEndpointMetadata{context_count_, state_->next_unique_id}),
-    };
+    return encodeEndpoint(NcclDeviceEndpointMetadata{
+        context_count_, state_->next_unique_id, state_->device_uuid});
 }
 
-PGResult<void> NcclDeviceRoute::installEndpoints(
+PGResult<std::vector<DeviceTransferRoute>> NcclDeviceRoute::installEndpoints(
     const DeviceTransferSnapshot& snapshot, uint64_t) {
     PG_VALIDATE_STATE(state_, "NCCL device route is unavailable");
     PG_VALIDATE_STATE(!state_->pending,
@@ -186,16 +180,19 @@ PGResult<void> NcclDeviceRoute::installEndpoints(
     next->installation_version = snapshot.version;
     next->transport = device::createNcclDeviceTransport();
     PG_VALIDATE_STATE(next->transport, "NCCL device transport is unavailable");
-    next->routes.resize(max_world_size_);
+    std::vector<DeviceTransferRoute> routes(max_world_size_);
     std::vector<GlobalRank> nccl_rank_order;
+    std::vector<GpuUuid> peer_uuids(max_world_size_);
     std::vector<int32_t> unique_id;
     for (const auto rank : snapshot.participants) {
-        PG_TRY(auto endpoint, findEndpoint(snapshot.endpoints[rank]));
+        if (!snapshot.endpoints[rank]) continue;
+        const auto* endpoint = findEndpoint(snapshot.endpoints[rank]->routes);
         if (!endpoint) continue;
         PG_TRY(auto metadata,
-               decodeEndpointMetadata<NcclDeviceEndpointMetadata>(*endpoint));
+               decodeEndpoint<NcclDeviceEndpointMetadata>(*endpoint));
         PG_VALIDATE_ARG(metadata.context_count == context_count_,
                         "NCCL device context counts differ");
+        peer_uuids[rank] = metadata.device_uuid;
         // The first participant with an NCCL endpoint provides the unique ID.
         if (nccl_rank_order.empty())
             unique_id = std::move(metadata.next_unique_id);
@@ -236,8 +233,15 @@ PGResult<void> NcclDeviceRoute::installEndpoints(
         const auto global_rank = nccl_rank_order[nccl_rank];
         auto* const mapped_region =
             transport.peerPointer(peer_registration, nccl_rank);
-        next->routes[global_rank] = DeviceTransferRoute{
+        bool native_atomics = false;
+        if (mapped_region) {
+            PG_TRY(native_atomics,
+                   gpuPeerSupportsNativeAtomics(state_->device_uuid,
+                                                peer_uuids[global_rank]));
+        }
+        routes[global_rank] = DeviceTransferRoute{
             .type = DeviceRouteType::NcclDevice,
+            .native_atomics = native_atomics,
             .region_size = snapshot.endpoints[global_rank]->region_size,
             .nccl = {.nccl_rank = nccl_rank,
                      .mapped_region_address =
@@ -248,16 +252,15 @@ PGResult<void> NcclDeviceRoute::installEndpoints(
         .peer_accessible = transport.deviceContext(peer_registration),
         .local_staging = transport.deviceContext(staging_registration),
     };
-    PG_TRY_CUDA(cudaMalloc(reinterpret_cast<void**>(&next->device_contexts),
-                           sizeof(device_contexts)));
-    PG_TRY_CUDA(cudaMemcpy(next->device_contexts, &device_contexts,
-                           sizeof(device_contexts), cudaMemcpyHostToDevice));
+    PG_TRY(next->device_contexts,
+           GpuBuffer<State::Generation::DeviceContexts>::fromHost(
+               state_->device_index, device_contexts));
     if (this_rank_provides_unique_id) {
         // The completion ACK carries the next unique ID in the local endpoint.
         PG_TRY(state_->next_unique_id, createUniqueId());
     }
     state_->pending = std::move(next);
-    return {};
+    return routes;
 }
 
 PGResult<void> NcclDeviceRoute::drainCurrent() {
@@ -266,14 +269,14 @@ PGResult<void> NcclDeviceRoute::drainCurrent() {
     PG_TRY(auto guard, GpuDeviceGuard::create(state_->device_index));
     const auto properties = current.transport->properties();
     PG_TRY_CUDA(launchNcclDeviceDrainKernel(
-        &current.device_contexts->peer_accessible, properties.num_ranks,
+        &current.device_contexts.get()->peer_accessible, properties.num_ranks,
         properties.gin_context_count, state_->drain_timeout_ticks,
         state_->stream->get()));
     PG_TRY(state_->stream->synchronize());
     return {};
 }
 
-PGResult<std::vector<DeviceTransferRoute>> NcclDeviceRoute::updateRoutes() {
+PGResult<void> NcclDeviceRoute::updateRoutes() {
     PG_ASSERT(state_ && state_->pending,
               "updateRoutes() requires a pending generation from "
               "installEndpoints()");
@@ -294,14 +297,14 @@ PGResult<std::vector<DeviceTransferRoute>> NcclDeviceRoute::updateRoutes() {
                   << " retired_count=" << state_->retired_generations.size();
     }
     state_->current = std::move(state_->pending);
-    return state_->current->routes;
+    return {};
 }
 
 void NcclDeviceRoute::fillDeviceContext(
     DeviceRouteContext& context) const noexcept {
     context.nccl = {};
     if (!state_ || !state_->current) return;
-    const auto* device_contexts = state_->current->device_contexts;
+    const auto* device_contexts = state_->current->device_contexts.get();
     context.nccl = {
         .peer_accessible_ctx = &device_contexts->peer_accessible,
         .local_staging_ctx = &device_contexts->local_staging,
@@ -363,16 +366,14 @@ std::optional<RouteEndpoint> NcclDeviceRoute::localEndpoint() {
     return std::nullopt;
 }
 
-PGResult<void> NcclDeviceRoute::installEndpoints(const DeviceTransferSnapshot&,
-                                                 uint64_t) {
-    return {};
+PGResult<std::vector<DeviceTransferRoute>> NcclDeviceRoute::installEndpoints(
+    const DeviceTransferSnapshot&, uint64_t) {
+    return std::vector<DeviceTransferRoute>(max_world_size_);
 }
 
 PGResult<void> NcclDeviceRoute::drainCurrent() { return {}; }
 
-PGResult<std::vector<DeviceTransferRoute>> NcclDeviceRoute::updateRoutes() {
-    return {};
-}
+PGResult<void> NcclDeviceRoute::updateRoutes() { return {}; }
 
 void NcclDeviceRoute::fillDeviceContext(DeviceRouteContext&) const noexcept {}
 

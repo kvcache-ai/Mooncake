@@ -67,10 +67,11 @@ void CoordinatorRpcServiceImpl::syncAfterFailure(
 CoordinatorHost::CoordinatorHost(
     const std::string& host_ip, int max_world_size,
     int64_t fault_reconciliation_window_us,
-    std::optional<DeviceAllReduceAlgorithm> all_reduce_algorithm)
+    std::optional<std::vector<DeviceCollectiveAlgorithmChoice>>
+        collective_algorithm_choices_override)
     : state_machine_(max_world_size,
                      std::chrono::microseconds(fault_reconciliation_window_us),
-                     all_reduce_algorithm),
+                     std::move(collective_algorithm_choices_override)),
       executor_("CoordinatorHost"),
       host_ip_(host_ip),
       max_world_size_(max_world_size),

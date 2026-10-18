@@ -10,7 +10,7 @@
 #include "pg_assert.h"
 #include "device_comm/device_utils/d2h_request_slot.cuh"
 #include "device_comm/device_utils/h2d_request_slot.cuh"
-#include "device_comm/device_utils/device_timeout.cuh"
+#include "device_comm/device_utils/device_utils.cuh"
 #include "device_comm/device_transfer/transfer_types.cuh"
 #include "device_comm/device_transfer/routes/p2p_route/p2p_route.cuh"
 #include "device_comm/device_transfer/routes/rdma_route/rdma_route.cuh"

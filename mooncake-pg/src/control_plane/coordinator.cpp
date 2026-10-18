@@ -4,9 +4,11 @@
 #include <iterator>
 #include <limits>
 #include <set>
+#include <span>
 
 #include <glog/logging.h>
 
+#include "control_plane/collective_selection.h"
 #include "error_types.h"
 #include "pg_utils.h"
 
@@ -22,44 +24,16 @@ bool validDeviceCollectiveWorkspaceEndpoint(
                transfer_endpoint.region_size - endpoint.buffer_offset;
 }
 
-bool memberSupportsGpuCollectiveBackend(const GroupMember& member,
-                                        GpuCollectiveBackend backend) {
-    if (backend == GpuCollectiveBackend::Legacy) return true;
-    return member.endpoint.has_value() &&
-           member.endpoint->device_collective.supportsBackend(backend);
-}
-
-bool groupSupportsOneShot(const GroupView& view) {
-    std::vector<const LLEndpoint*> endpoints;
-    for (const auto& member : view.members) {
-        if (!member.isActive()) continue;
-        if (!member.endpoint) return false;
-        const auto& endpoint = member.endpoint->device_collective;
-        if (!endpoint.ll || !endpoint.one_shot) return false;
-        endpoints.push_back(&*endpoint.ll);
-    }
-    // One-shot needs every directed edge, not just a connected topology.
-    for (const auto* source : endpoints) {
-        for (const auto* destination : endpoints) {
-            if (source == destination) continue;
-            const auto& peers = source->native_atomic_peer_uuids;
-            if (std::find(peers.begin(), peers.end(),
-                          destination->device_uuid) == peers.end()) {
-                return false;
-            }
-        }
-    }
-    return true;
-}
-
 }  // namespace
 
 CentralizedCoordinatorStateMachine::CentralizedCoordinatorStateMachine(
     int max_world_size, std::chrono::microseconds fault_reconciliation_window,
-    std::optional<DeviceAllReduceAlgorithm> all_reduce_algorithm)
+    std::optional<std::vector<DeviceCollectiveAlgorithmChoice>>
+        collective_algorithm_choices_override)
     : max_world_size_(max_world_size),
       fault_reconciliation_window_(fault_reconciliation_window),
-      all_reduce_algorithm_(all_reduce_algorithm) {
+      collective_algorithm_choices_override_(
+          std::move(collective_algorithm_choices_override)) {
     PG_ASSERT(max_world_size_ > 0 && max_world_size_ <= kMaxNumRanks,
               "invalid max_world_size: ", max_world_size_);
     ranks_.resize(max_world_size_);
@@ -439,8 +413,8 @@ CentralizedCoordinatorStateMachine::handlePublishEndpoint(
             return result;
         }
         if (view.gpu_collective_backend && member.isActive() &&
-            !device_group_endpoint.supportsBackend(
-                *view.gpu_collective_backend)) {
+            !supportsGpuCollectiveBackend(device_group_endpoint,
+                                          *view.gpu_collective_backend)) {
             result.response.success = false;
             result.response.reject_reason =
                 "active member does not support the group's GPU collective "
@@ -664,6 +638,11 @@ CentralizedCoordinatorStateMachine::handleTransferEndpointUpdateAck(
         ranks_[ack.rank].state == RankState::Offline ||
         ranks_[ack.rank].rank_epoch != ack.rank_epoch)
         return result;
+    if (ack.routes.size() != static_cast<size_t>(max_world_size_)) {
+        LOG(WARNING) << "[COORD] Invalid installed route table, rank="
+                     << ack.rank;
+        return result;
+    }
     if (ack.updated_endpoint) {
         const auto& old = installation.snapshot.endpoints[ack.rank];
         if (ack.updated_endpoint->version <= old->version) {
@@ -677,6 +656,7 @@ CentralizedCoordinatorStateMachine::handleTransferEndpointUpdateAck(
         if (ack.updated_endpoint->version > latest->version)
             latest = ack.updated_endpoint;
     }
+    installation.routes[ack.rank] = ack.routes;
     installation.waiting_acks.erase(ack.rank);
     tryCompleteTransferEndpointInstallation(result.effects);
     return result;
@@ -834,7 +814,7 @@ void CentralizedCoordinatorStateMachine::handleTimedOutAgent(
 
         if (view_changed) {
             if (membership_changed) {
-                resolveGpuCollectiveBackend(view);
+                updateCollectiveSelection(view);
             }
             view.epoch++;
             effects.push_back(PushViewUpdate{view});
@@ -937,6 +917,7 @@ void CentralizedCoordinatorStateMachine::
     if (!installation.waiting_acks.empty()) return;
 
     installed_transfer_endpoints_ = std::move(installation.snapshot);
+    installed_transfer_routes_ = std::move(installation.routes);
     pending_transfer_endpoint_installation_.reset();
     // As with positive link reports, defer health updates while a fault
     // reconciliation window is open.
@@ -963,6 +944,7 @@ void CentralizedCoordinatorStateMachine::updateTransferEndpoints(
     snapshot.version = next_transfer_snapshot_version_++;
     PendingTransferEndpointInstallation installation;
     installation.snapshot = std::move(snapshot);
+    installation.routes.resize(max_world_size_);
     installation.waiting_acks.insert(installation.snapshot.participants.begin(),
                                      installation.snapshot.participants.end());
     installation.deadline =
@@ -1127,7 +1109,7 @@ void CentralizedCoordinatorStateMachine::applyAutoDeactivate(
             }
         }
         if (!deactivated_ranks.empty()) {
-            resolveGpuCollectiveBackend(view);
+            updateCollectiveSelection(view);
             view.epoch++;
             effects.push_back(PushViewUpdate{view});
             LOG(INFO) << "[COORD] auto_deactivate view update group="
@@ -1257,7 +1239,7 @@ void CentralizedCoordinatorStateMachine::tryAdmitPendingProposals(
             }
         }
 
-        resolveGpuCollectiveBackend(view);
+        updateCollectiveSelection(view);
 
         const auto propose_id = pending.propose_id;
         queue.pop_front();
@@ -1401,87 +1383,23 @@ bool CentralizedCoordinatorStateMachine::isRankActivatable(
            member.hasEndpoint();
 }
 
-void CentralizedCoordinatorStateMachine::resolveGpuCollectiveBackend(
+void CentralizedCoordinatorStateMachine::updateCollectiveSelection(
     GroupView& view) {
-    std::optional<GpuCollectiveBackend> consensus;
-    bool has_active_rank = false;
-    bool preferences_conflict = false;
-    size_t active_rank_count = 0;
-
-    for (const auto& member : view.members) {
-        if (!member.isActive()) continue;
-        ++active_rank_count;
-
-        const auto& preferred = member.preferred_gpu_collective_backend;
-        if (!has_active_rank) {
-            consensus = preferred;
-            has_active_rank = true;
-            continue;
+    std::span<const std::vector<DeviceTransferRouteInfo>> routes =
+        installed_transfer_routes_;
+    // Ensure the installed routes match the current rank epoch of every active
+    // group member before using their capabilities for algorithm selection.
+    for (const auto rank : view.rank_order) {
+        if (view.members[rank].isActive() && !isDeviceLinkUp(rank)) {
+            routes = {};
+            break;
         }
-        preferences_conflict |= consensus != preferred;
     }
-
-    if (!has_active_rank) return;
-
-    if (preferences_conflict) {
-        LOG(WARNING) << "[PG] Conflicting GPU collective backend preferences; "
-                        "falling back to legacy"
-                     << " group=" << view.group_id
-                     << " active_rank_count=" << active_rank_count;
-        consensus = GpuCollectiveBackend::Legacy;
-    }
-
-    // CPU groups consistently have no GPU backend preference.
-    if (!consensus.has_value()) return;
-
-    auto selected = *consensus;
-    const bool all_support_selected = std::all_of(
-        view.members.begin(), view.members.end(),
-        [&](const GroupMember& member) {
-            return !member.isActive() ||
-                   memberSupportsGpuCollectiveBackend(member, selected);
-        });
-    if (!all_support_selected) {
-        LOG(WARNING) << "[PG] Preferred GPU collective backend is not "
-                        "available on every active rank; falling back to legacy"
-                     << " group=" << view.group_id
-                     << " preferred=" << gpuCollectiveBackendName(selected)
-                     << " active_rank_count=" << active_rank_count;
-        selected = GpuCollectiveBackend::Legacy;
-    }
-
-    if (view.gpu_collective_backend != selected) {
-        view.gpu_collective_backend = selected;
-        LOG(INFO) << "[PG] Coordinator selected GPU collective backend"
-                  << " group=" << view.group_id
-                  << " backend=" << gpuCollectiveBackendName(selected)
-                  << " active_rank_count=" << active_rank_count;
-    }
-
-    view.all_reduce_algorithm_choices.clear();
-    if (selected != GpuCollectiveBackend::New) return;
-
-    const bool use_one_shot =
-        all_reduce_algorithm_ != DeviceAllReduceAlgorithm::Ring &&
-        groupSupportsOneShot(view);
-    if (use_one_shot) {
-        const uint64_t max_bytes =
-            all_reduce_algorithm_ == DeviceAllReduceAlgorithm::OneShot
-                ? std::numeric_limits<uint64_t>::max()
-                : 512 * 1024;
-        view.all_reduce_algorithm_choices.push_back(
-            {max_bytes, DeviceAllReduceAlgorithm::OneShot});
-    }
-    if (all_reduce_algorithm_.has_value()) {
-        LOG(INFO) << "[PG] Coordinator selected AllReduce algorithm="
-                  << (use_one_shot ? "oneshot" : "ring")
-                  << " group=" << view.group_id;
-        if (all_reduce_algorithm_ == DeviceAllReduceAlgorithm::OneShot &&
-            !use_one_shot) {
-            LOG(WARNING) << "[PG] OneShot is unavailable on this group; "
-                            "falling back to Ring"
-                         << " group=" << view.group_id;
-        }
+    if (auto selection = selectGpuCollective(
+            view, routes, collective_algorithm_choices_override_)) {
+        view.gpu_collective_backend = selection->backend;
+        view.collective_algorithm_choices =
+            std::move(selection->algorithm_choices);
     }
 }
 
@@ -1510,7 +1428,7 @@ void CentralizedCoordinatorStateMachine::checkGroupTransitions(
                 // All active ranks have endpoints and are Healthy.
                 // Resolve preferences before starting the bootstrap barrier.
                 // Every active rank installs this decision before Ready.
-                resolveGpuCollectiveBackend(view);
+                updateCollectiveSelection(view);
 
                 // Transition to BootstrapSyncing and initiate a barrier.
                 view.status = GroupStatus::BootstrapSyncing;
