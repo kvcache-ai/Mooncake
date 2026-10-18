@@ -1641,7 +1641,9 @@ int main(int argc, char* argv[]) {
 
     if (master_config.enable_ha) {
         // Arm the shutdown bound and the handlers before any lease can be
-        // acquired; without them a SIGTERM kills a leader mid-term.
+        // acquired; without them a SIGTERM kills a leader mid-term. This
+        // call is serial and one-shot from main(): the check-then-store in
+        // StartShutdownWatchdog assumes no concurrent caller.
         if (!mooncake::StartShutdownWatchdog(
                 mooncake::ha::kHaShutdownDeadline)) {
             LOG(ERROR) << "Failed to start the shutdown watchdog, "

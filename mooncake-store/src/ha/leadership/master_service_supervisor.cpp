@@ -233,6 +233,11 @@ class ServingShutdownTrigger {
         std::unique_lock<std::mutex> lock(mutex_);
         while (!stop_.load(std::memory_order_acquire)) {
             if (ShutdownObserved(shutdown_requested_)) {
+                // on_shutdown_ runs with the mutex unlocked on purpose:
+                // Stop() must be able to signal and join while the callback
+                // is inside server.stop(). If that callback blocks, the
+                // join in Stop() waits, and the watchdog is what bounds the
+                // whole process, not this interlock.
                 lock.unlock();
                 on_shutdown_();
                 return;
