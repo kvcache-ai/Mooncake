@@ -454,8 +454,9 @@ class RandomAllocationStrategy : public AllocationStrategy {
                 const auto& registration =
                     (*allocators)[(i + seg_offset) % num_segs];
                 if (!preferred_hca_names.empty() &&
-                    HcaAffinityTier(registration->GetAllocator()->GetLocality(),
-                                    preferred_hca_names) != tier) {
+                    HcaAffinityTier(
+                        registration->GetAllocator()->GetLocalityHandle().get(),
+                        preferred_hca_names) != tier) {
                     continue;
                 }
                 if (auto buffer = registration->Allocate(slice_length)) {

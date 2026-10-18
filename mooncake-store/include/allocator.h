@@ -205,10 +205,12 @@ class BufferAllocatorBase {
         // Monotonic: a concurrent clear must not hide a later publication.
         if (locality) has_locality_.store(true, std::memory_order_release);
     }
+    std::shared_ptr<const SegmentLocality> GetLocalityHandle() const {
+        if (!has_locality_.load(std::memory_order_acquire)) return nullptr;
+        return std::atomic_load_explicit(&locality_, std::memory_order_acquire);
+    }
     std::optional<SegmentLocality> GetLocality() const {
-        if (!has_locality_.load(std::memory_order_acquire)) return std::nullopt;
-        auto locality =
-            std::atomic_load_explicit(&locality_, std::memory_order_acquire);
+        const auto locality = GetLocalityHandle();
         return locality ? std::optional<SegmentLocality>(*locality)
                         : std::nullopt;
     }

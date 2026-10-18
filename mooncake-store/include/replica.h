@@ -874,7 +874,7 @@ inline Replica::Descriptor Replica::get_descriptor() const {
 
     if (is_memory_replica()) {
         const auto& mem_data = std::get<MemoryReplicaData>(data_);
-        MemoryDescriptor mem_desc;
+        auto& mem_desc = desc.get_memory_descriptor();
         if (mem_data.buffer) {
             mem_desc.buffer_descriptor =
                 mem_data.buffer->get_descriptor(&mem_desc.locality);
@@ -884,7 +884,6 @@ inline Replica::Descriptor Replica::get_descriptor() const {
             mem_desc.buffer_descriptor.transport_endpoint_ = "";
             LOG(ERROR) << "Trying to get invalid memory replica descriptor";
         }
-        desc.descriptor_variant = std::move(mem_desc);
     } else if (is_nof_replica()) {
         const auto& nof_data = std::get<NoFReplicaData>(data_);
         NoFDescriptor nof_desc;

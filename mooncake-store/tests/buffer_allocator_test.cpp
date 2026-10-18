@@ -78,11 +78,14 @@ TEST_F(BufferAllocatorTest, DescriptorFollowsPublishedAndClearedLocality) {
     const SegmentLocality locality{7, {"mlx5_0"}};
     allocator->SetLocality(locality);
     auto descriptor = replica.get_descriptor();
+    auto retained_locality = allocator->GetLocalityHandle();
     EXPECT_EQ(descriptor.get_memory_descriptor().locality, locality);
     EXPECT_EQ(descriptor.get_memory_descriptor()
                   .buffer_descriptor.transport_endpoint_,
               "receiver");
     allocator->SetLocality(std::nullopt);
+    ASSERT_TRUE(retained_locality);
+    EXPECT_EQ(*retained_locality, locality);
     EXPECT_FALSE(replica.get_descriptor().get_memory_descriptor().locality);
     allocator->SetLocality(locality);
     EXPECT_EQ(replica.get_descriptor().get_memory_descriptor().locality,
