@@ -284,6 +284,10 @@ PGResult<GroupId> AgentHost::registerGroup(
                        coordinator_addr_, std::move(req)));
 
             if (!resp.success) {
+                if (resp.allow_local_fallback && !*resp.allow_local_fallback) {
+                    return makePGError(PGErrorCode::NotSupported,
+                                       resp.reject_reason);
+                }
                 // A rejected group must not affect the process-scoped Agent.
                 // Return an empty id so this communicator can remain
                 // group-scoped and execute local-only collectives.

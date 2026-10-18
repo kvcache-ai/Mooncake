@@ -5,9 +5,6 @@
 
 namespace mooncake {
 
-inline constexpr uint32_t kSimplePipelineDepth = 2;
-inline constexpr uint64_t kSimplePayloadAlignment = 16;
-
 // Host-bound workspace shared by the channels of one invocation.
 struct SimpleWorkspace {
     char* buffer = nullptr;
@@ -29,6 +26,15 @@ struct SimpleBufferLayout {
     [[nodiscard]] __device__ __forceinline__ uint64_t bufferBytes() const {
         return chunk_bytes * kSimplePipelineDepth;
     }
+};
+
+// Algorithm-selected subviews for one connection. recv/send may address
+// different logical receive roles; staging is isolated per neighbor.
+struct SimpleConnectionLayout {
+    SimpleBufferLayout buffers;
+    uint64_t receive_offset = 0;
+    uint64_t remote_offset = 0;
+    uint64_t staging_offset = 0;
 };
 
 // Persistent progress for one (channel, peer) within a communicator.
