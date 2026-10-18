@@ -553,6 +553,103 @@ class MasterServiceHATest : public ::testing::Test {
             MasterServiceTestPeer::OrderedOplogWriter(service).get());
     }
 
+    void CheckEvictionRetryRecovery(bool pause_first, bool fail_after_census,
+                                    bool grouped = false) {
+        const std::string cluster_id = "eviction_retry_recovery";
+        auto backend = std::make_shared<FailingBatchHaKvBackend>();
+        auto config = MasterServiceConfig::builder()
+                          .set_default_kv_lease_ttl(50)
+                          .set_enable_ha(true)
+                          .set_enable_oplog(true)
+                          .set_cluster_id(cluster_id)
+                          .set_oplog_batch_max_entries(1)
+                          .set_eviction_ratio(0.0)
+                          .build();
+        MasterService service(config);
+        MasterServiceTestPeer(service).StopEvictionWorkerForTesting();
+        auto* writer = InstallGatedWriter(service, backend);
+        auto mounted = PrepareSimpleSegment(service, "retry_segment");
+        OpLogBatchStorage storage(cluster_id, *backend);
+        OpLogBatchRecord batch;
+        ReadBatchEventually(storage, 1, batch);
+        ASSERT_TRUE(writer->RunCallbacksThrough(batch.last_seq));
+        const std::string key = "retry_eviction_key";
+        ReplicateConfig put_config;
+        put_config.replica_num = 1;
+        put_config.preferred_segments = {"retry_segment"};
+        if (grouped)
+            put_config.group_ids = std::vector<std::string>{"retry_group"};
+        ASSERT_TRUE(service
+                        .PutStart(mounted.client_id, key, kDefaultTenant, 1024,
+                                  put_config)
+                        .has_value());
+        ASSERT_TRUE(service
+                        .PutEnd(mounted.client_id, key, kDefaultTenant,
+                                ReplicaType::MEMORY)
+                        .has_value());
+        ReadBatchEventually(storage, 2, batch);
+        ASSERT_TRUE(writer->RunCallbacksThrough(batch.last_seq));
+        SetLeaseDeadlineForTesting(
+            service, kDefaultTenant, key,
+            std::chrono::system_clock::now() - std::chrono::seconds(1));
+        MasterServiceTestPeer peer(service);
+        const auto census_before = peer.GetEvictionCensusRunsForTesting();
+        if (pause_first) {
+            auto held = ReserveBatchSlotForTesting(service);
+            ASSERT_TRUE(held.has_value());
+            peer.RunBatchEvictForTesting(1.0, 1.0);
+            ASSERT_TRUE(peer.HasEvictionContinuationForTesting());
+        }
+        auto enter_retry = [&] {
+            backend->SetTxnError(ErrorCode::PERSISTENT_FAIL);
+            ASSERT_TRUE(AppendVisibleForTesting(service, OpType::PUT_END,
+                                                kDefaultTenant, "retry_probe",
+                                                {})
+                            .has_value());
+            const auto deadline =
+                std::chrono::steady_clock::now() + std::chrono::seconds(2);
+            while (writer->IsAccepting() &&
+                   std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            ASSERT_FALSE(writer->IsAccepting());
+            ASSERT_FALSE(writer->GetTerminalState().has_value());
+        };
+        if (fail_after_census) {
+            peer.SetEvictionCensusHookForTesting(enter_retry);
+        } else {
+            ASSERT_NO_FATAL_FAILURE(enter_retry());
+        }
+        SetNeedMemEvictionForTesting(service, true);
+        for (int tick = 0; tick < 3; ++tick) {
+            peer.RunBatchEvictForTesting(1.0, 1.0);
+            EXPECT_EQ(pause_first || fail_after_census,
+                      peer.HasEvictionContinuationForTesting());
+            EXPECT_EQ(
+                census_before + (pause_first || fail_after_census ? 1 : 0),
+                peer.GetEvictionCensusRunsForTesting());
+        }
+        if (!pause_first && !fail_after_census) {
+            EXPECT_TRUE(NeedMemEvictionForTesting(service));
+        }
+        backend->SetTxnError(ErrorCode::OK);
+        ReadBatchEventually(storage, 3, batch);
+        ASSERT_TRUE(writer->RunCallbacksThrough(batch.last_seq));
+        ASSERT_TRUE(writer->IsAccepting());
+        ASSERT_FALSE(writer->GetTerminalState().has_value());
+        peer.RunBatchEvictForTesting(1.0, 1.0);
+        EXPECT_EQ(census_before + 1, peer.GetEvictionCensusRunsForTesting());
+        EXPECT_FALSE(peer.HasEvictionContinuationForTesting());
+        ReadBatchEventually(storage, 4, batch);
+        ASSERT_EQ(1u, batch.entries.size());
+        EXPECT_EQ(OpType::REMOVE, batch.entries.front().op_type);
+        EXPECT_EQ(key, batch.entries.front().object_key);
+        ASSERT_TRUE(writer->RunCallbacksThrough(batch.last_seq));
+        EXPECT_EQ(0u, ReplicaCountForTesting(service, kDefaultTenant, key));
+        EXPECT_EQ(writer,
+                  MasterServiceTestPeer::OrderedOplogWriter(service).get());
+    }
+
     static RejectingOrderedOpLogWriter* InstallRejectingWriter(
         MasterService& service, std::shared_ptr<HaKvBackend> backend) {
         MasterServiceTestPeer(service).SetBatchOpLogWriterFactoryForTesting(
@@ -6811,6 +6908,153 @@ TEST_F(MasterServiceHATest,
     (void)writer;
 }
 
+TEST(EvictionDeadlineTest, CompactsPartialGroupSubmissionsWithMultiplicity) {
+    using Deadline = std::chrono::system_clock::time_point;
+    const auto first = Deadline(std::chrono::nanoseconds(100));
+    const auto next = Deadline(std::chrono::nanoseconds(101));
+    const auto last = Deadline(std::chrono::nanoseconds(102));
+    MasterServiceTestPeer::EvictionContinuation continuation;
+    continuation.eviction_base = 6;
+    continuation.lowerbound = 1.0;
+    continuation.evicted_count = 4;
+    continuation.no_soft_pin_deadlines = {first, first, first,
+                                          first, next,  last};
+    // One group submitted two members initially and two on a later tick.
+    continuation.primary_submissions = {{first, 2}, {first, 2}};
+    ASSERT_TRUE(MasterServiceTestPeer::PrepareEvictionSecondPassForTesting(
+        continuation));
+    EXPECT_EQ(2, continuation.second_pass.remaining_target);
+    EXPECT_EQ(last, continuation.second_pass.cutoff);
+    EXPECT_FALSE(continuation.second_pass.allow_soft_pinned);
+    EXPECT_EQ(0u, continuation.no_soft_pin_deadlines.capacity());
+    EXPECT_EQ(0u, continuation.soft_pin_deadlines.capacity());
+    EXPECT_EQ(0u, continuation.primary_submissions.capacity());
+}
+
+TEST(EvictionDeadlineTest, KeepsDistinctSubmillisecondDeadlines) {
+    using Deadline = std::chrono::system_clock::time_point;
+    const auto first = Deadline(std::chrono::nanoseconds(100));
+    const auto next = Deadline(std::chrono::nanoseconds(101));
+    const auto soft = Deadline(std::chrono::nanoseconds(102));
+    MasterServiceTestPeer::EvictionContinuation continuation;
+    continuation.eviction_base = 4;
+    continuation.lowerbound = 1.0;
+    continuation.evicted_count = 2;
+    // A group grew after census: its count must not consume the neighboring
+    // deadline or an unrelated soft-pin entry when only one match exists.
+    continuation.no_soft_pin_deadlines = {next, first};
+    continuation.soft_pin_deadlines = {soft};
+    continuation.primary_submissions = {{first, 2}};
+    ASSERT_TRUE(MasterServiceTestPeer::PrepareEvictionSecondPassForTesting(
+        continuation));
+    EXPECT_EQ(2, continuation.second_pass.remaining_target);
+    EXPECT_TRUE(continuation.second_pass.allow_soft_pinned);
+    EXPECT_EQ(soft, continuation.second_pass.cutoff);
+}
+
+TEST(EvictionDeadlineTest, BoundsTargetWhenSubmittedDeadlineIsAbsent) {
+    using Deadline = std::chrono::system_clock::time_point;
+    const auto first = Deadline(std::chrono::nanoseconds(100));
+    const auto absent = Deadline(std::chrono::nanoseconds(200));
+    MasterServiceTestPeer::EvictionContinuation continuation;
+    continuation.eviction_base = 10;
+    continuation.lowerbound = 1.0;
+    continuation.evicted_count = 2;
+    continuation.no_soft_pin_deadlines = {first};
+    continuation.primary_submissions = {{absent, 2}};
+    ASSERT_TRUE(MasterServiceTestPeer::PrepareEvictionSecondPassForTesting(
+        continuation));
+    EXPECT_EQ(1, continuation.second_pass.remaining_target);
+    EXPECT_FALSE(continuation.second_pass.allow_soft_pinned);
+    EXPECT_EQ(first, continuation.second_pass.cutoff);
+}
+
+TEST(EvictionDeadlineTest, FinishesWithoutSecondPassWhenLowerboundIsMet) {
+    MasterServiceTestPeer::EvictionContinuation continuation;
+    continuation.eviction_base = 10;
+    continuation.lowerbound = 0.5;
+    continuation.evicted_count = 3;
+    continuation.released_discarded_replica_count = 2;
+    EXPECT_FALSE(MasterServiceTestPeer::PrepareEvictionSecondPassForTesting(
+        continuation));
+    continuation.released_discarded_replica_count = 0;
+    // No census survivors: avoid selecting an out-of-range nth element.
+    EXPECT_FALSE(MasterServiceTestPeer::PrepareEvictionSecondPassForTesting(
+        continuation));
+}
+
+TEST_F(MasterServiceHATest,
+       BatchEvictCommitRejectionDoesNotLatchWriterReplacement) {
+    for (const bool resume : {false, true}) {
+        for (const auto error : {ErrorCode::PERSISTENT_FAIL,
+                                 ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS}) {
+            SCOPED_TRACE(toString(error));
+            SCOPED_TRACE(resume);
+            const std::string cluster_id = "eviction_commit_rejection";
+            auto backend = std::make_shared<FailingBatchHaKvBackend>();
+            auto config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_batch_max_entries(1)
+                              .set_eviction_ratio(0.0)
+                              .build();
+            MasterService service(config);
+            MasterServiceTestPeer peer(service);
+            peer.StopEvictionWorkerForTesting();
+            auto* writer = InstallRejectingWriter(service, backend);
+            auto mounted =
+                PrepareSimpleSegment(service, "commit_reject_segment");
+            OpLogBatchStorage storage(cluster_id, *backend);
+            OpLogBatchRecord batch;
+            ReadBatchEventually(storage, 1, batch);
+            const std::string key = "commit_reject_key";
+            PutObjectOnSegment(service, mounted.client_id, key,
+                               "commit_reject_segment");
+            ReadBatchEventually(storage, 2, batch);
+            SetLeaseDeadlineForTesting(
+                service, kDefaultTenant, key,
+                std::chrono::system_clock::now() - std::chrono::seconds(1));
+            if (resume) {
+                auto held = ReserveBatchSlotForTesting(service);
+                ASSERT_TRUE(held.has_value());
+                peer.RunBatchEvictForTesting(1.0, 1.0);
+                ASSERT_TRUE(peer.HasEvictionContinuationForTesting());
+            }
+            writer->RejectCommitsWith(error);
+            peer.RunBatchEvictForTesting(1.0, 1.0);
+            EXPECT_FALSE(peer.HasEvictionContinuationForTesting());
+            EXPECT_TRUE(writer->IsAccepting());
+            EXPECT_FALSE(writer->GetTerminalState().has_value());
+            EXPECT_EQ(1u, ReplicaCountForTesting(service, kDefaultTenant, key));
+
+            writer->RejectCommitsWith(ErrorCode::OK);
+            peer.RunBatchEvictForTesting(1.0, 1.0);
+            ReadBatchEventually(storage, 3, batch);
+            ASSERT_EQ(1u, batch.entries.size());
+            EXPECT_EQ(OpType::REMOVE, batch.entries.front().op_type);
+            EXPECT_EQ(key, batch.entries.front().object_key);
+        }
+    }
+}
+
+TEST_F(MasterServiceHATest, BatchEvictRecoversAfterRetryBeforeCensus) {
+    CheckEvictionRetryRecovery(false, false);
+}
+
+TEST_F(MasterServiceHATest, BatchEvictPreservesEpisodeDuringWriterRetry) {
+    CheckEvictionRetryRecovery(true, false);
+}
+
+TEST_F(MasterServiceHATest, BatchEvictPausesWhenWriterRetriesAfterCensus) {
+    CheckEvictionRetryRecovery(false, true);
+}
+
+TEST_F(MasterServiceHATest, BatchEvictGroupPausesWhenWriterRetriesAfterCensus) {
+    CheckEvictionRetryRecovery(false, true, true);
+}
+
 TEST_F(MasterServiceHATest,
        BatchEvictTerminalWriterSettlesPausedEpisodeOnce) {
     const std::string cluster_id = "test_batch_evict_terminal_episode";
@@ -6824,6 +7068,7 @@ TEST_F(MasterServiceHATest,
                               .set_eviction_ratio(0.0)
                               .build();
     MasterService service(service_config);
+    MasterServiceTestPeer(service).StopEvictionWorkerForTesting();
     auto* writer = InstallGatedWriter(service, backend);
     auto mounted = PrepareSimpleSegment(service, "terminal_episode_segment");
     OpLogBatchStorage storage(cluster_id, *backend);
@@ -6943,6 +7188,7 @@ TEST_F(MasterServiceHATest,
                               .set_eviction_ratio(0.0)
                               .build();
     MasterService service(service_config);
+    MasterServiceTestPeer(service).StopEvictionWorkerForTesting();
     auto* writer = InstallGatedWriter(service, backend);
     auto mounted = PrepareSimpleSegment(service, "initial_soft_cutoff_segment");
     OpLogBatchStorage storage(cluster_id, *backend);
@@ -6956,6 +7202,7 @@ TEST_F(MasterServiceHATest,
     soft_pinned_config.preferred_segments = {"initial_soft_cutoff_segment"};
     soft_pinned_config.soft_pin_action = SoftPinAction::ENABLE;
     soft_pinned_config.soft_pin_ttl_ms = 60'000;
+    uint64_t next_batch = 2;
     for (const auto& key : {cutoff_key, candidate_key}) {
         ASSERT_TRUE(service
                         .PutStart(mounted.client_id, key, kDefaultTenant, 1024,
@@ -6965,6 +7212,7 @@ TEST_F(MasterServiceHATest,
                         .PutEnd(mounted.client_id, key, kDefaultTenant,
                                 ReplicaType::MEMORY)
                         .has_value());
+        ReadBatchEventually(storage, next_batch++, batch);
     }
     ReadBatchEventually(storage, 3, batch);
 
@@ -7014,6 +7262,7 @@ TEST_F(MasterServiceHATest,
                               .set_eviction_ratio(0.0)
                               .build();
     MasterService service(service_config);
+    MasterServiceTestPeer(service).StopEvictionWorkerForTesting();
     auto* writer = InstallGatedWriter(service, backend);
     auto mounted = PrepareSimpleSegment(service, "second_pass_cursor_segment");
     OpLogBatchStorage storage(cluster_id, *backend);
@@ -7049,6 +7298,7 @@ TEST_F(MasterServiceHATest,
                         .has_value());
         keys.push_back(key);
         shard_indices.push_back(shard_idx);
+        ReadBatchEventually(storage, keys.size() + 1, batch);
     }
     ASSERT_EQ(2u, keys.size());
     ASSERT_NE(shard_indices[0], shard_indices[1]);
@@ -7071,6 +7321,9 @@ TEST_F(MasterServiceHATest,
         ASSERT_TRUE(peer.HasEvictionContinuationForTesting());
         EXPECT_EQ("second_pass_soft_pin",
                   peer.GetEvictionContinuationPhaseForTesting());
+        // Once the cutoff is selected, a stalled scan must not retain the
+        // potentially million-entry census allocation.
+        EXPECT_EQ(0u, peer.GetEvictionDeadlineCapacityForTesting());
         EXPECT_EQ((std::pair<size_t, size_t>{1, 0}),
                   peer.GetEvictionSecondPassPendingCursorForTesting());
         EXPECT_EQ(census_before + 1, peer.GetEvictionCensusRunsForTesting());
@@ -7110,6 +7363,7 @@ TEST_F(MasterServiceHATest,
                               .set_eviction_ratio(0.0)
                               .build();
     MasterService service(service_config);
+    MasterServiceTestPeer(service).StopEvictionWorkerForTesting();
     InstallGatedWriter(service, backend);
     auto mounted = PrepareSimpleSegment(service, "group_member_cursor_segment");
     OpLogBatchStorage storage(cluster_id, *backend);
@@ -7145,6 +7399,7 @@ TEST_F(MasterServiceHATest,
                         .has_value());
         keys.push_back(key);
         shard_indices.push_back(shard_idx);
+        ReadBatchEventually(storage, keys.size() + 1, batch);
     }
     ASSERT_EQ(3u, keys.size());
     ReadBatchEventually(storage, 4, batch);
@@ -7498,6 +7753,7 @@ TEST_F(MasterServiceHATest, PutStartExpiredOverwriteWritesBatchRecordOpLog) {
                               .set_put_start_release_timeout_sec(2)
                               .build();
     MasterService service(service_config);
+    MasterServiceTestPeer(service).StopEvictionWorkerForTesting();
     ASSERT_EQ(
         ErrorCode::OK,
         MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
@@ -7515,7 +7771,15 @@ TEST_F(MasterServiceHATest, PutStartExpiredOverwriteWritesBatchRecordOpLog) {
     ASSERT_TRUE(service.PutStart(client_id, key, kDefaultTenant, 1024, config)
                     .has_value());
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    // Exercise PutStart's cleanup itself. A wall-clock sleep lets the
+    // background reaper remove this unpublished object before the overwrite.
+    {
+        MasterServiceTestPeer::MetadataAccessorRW accessor(
+            &service, {kDefaultTenant, key});
+        ASSERT_TRUE(accessor.Exists());
+        accessor.Get().put_start_time =
+            std::chrono::system_clock::now() - std::chrono::seconds(2);
+    }
     const UUID next_client_id = generate_uuid();
     ASSERT_TRUE(
         service.PutStart(next_client_id, key, kDefaultTenant, 1024, config)

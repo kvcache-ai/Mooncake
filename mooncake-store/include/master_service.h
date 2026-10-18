@@ -1041,12 +1041,14 @@ class MasterService {
     void StartEvictionEpisode(double evict_ratio_target,
                               double evict_ratio_lowerbound);
     bool ResumeEvictionContinuation();
+    static bool PrepareEvictionSecondPass(EvictionContinuation& continuation);
     void ClearEvictionContinuation(EvictionContinuationDropReason reason,
                                    bool record_episode_result = false);
     void RecordEvictionContinuationOutcome(
         const EvictionContinuation& continuation);
     void FinishEvictionContinuation();
     EvictionContinuationDropReason ClassifyWriterError(ErrorCode error) const;
+    bool IsEvictionReservationRetryable(ErrorCode error) const;
     void NoFBatchEvict(double evict_ratio_target,
                        double evict_ratio_lowerbound);
     struct TenantQuotaEvictionResult {
@@ -1190,6 +1192,11 @@ class MasterService {
             no_soft_pin_deadlines;
         std::vector<std::chrono::system_clock::time_point>
             soft_pin_deadlines;
+
+        // Append once per primary result, including partially submitted groups.
+        // Compact the census only if the lower-bound second pass is needed.
+        std::vector<std::pair<std::chrono::system_clock::time_point, long>>
+            primary_submissions;
 
         std::vector<EvictionCandidate> primary_candidates;
         size_t next_primary_candidate{0};

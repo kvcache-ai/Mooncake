@@ -38,6 +38,13 @@ struct OrderedOpLogWriterTerminalState {
 
 class OrderedOpLogWriter {
    public:
+    enum class AdmissionState {
+        kAccepting,
+        kRetrying,
+        kStopped,
+        kTerminal,
+        kInvalid,
+    };
     using DurableCallback = std::function<void(const OpLogEntry&)>;
     using TerminalCallback =
         std::function<void(const OrderedOpLogWriterTerminalState&)>;
@@ -108,6 +115,8 @@ class OrderedOpLogWriter {
     async_simple::Future<ErrorCode> AwaitDurable(uint64_t sequence);
 
     bool IsAccepting() const;
+    // One mutex-protected snapshot; !IsAccepting() alone does not imply Stop.
+    AdmissionState GetAdmissionState() const;
     ErrorCode LastError() const;
     std::optional<OrderedOpLogWriterTerminalState> GetTerminalState() const;
     void SetTerminalCallback(TerminalCallback callback);

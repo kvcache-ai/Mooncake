@@ -29,6 +29,12 @@ class MasterServiceTestPeer {
     using QuotaEraseMode = MasterService::QuotaEraseMode;
     using TenantQuotaEvictionResult = MasterService::TenantQuotaEvictionResult;
     using TenantState = MasterService::TenantState;
+    using EvictionContinuation = MasterService::EvictionContinuation;
+
+    static bool PrepareEvictionSecondPassForTesting(
+        EvictionContinuation& continuation) {
+        return MasterService::PrepareEvictionSecondPass(continuation);
+    }
 
     static constexpr auto kDynamicReplicationWindowEntryLimit =
         DynamicReplicationController::kWindowEntryLimit;
@@ -52,6 +58,7 @@ class MasterServiceTestPeer {
     // Drive one eviction cycle synchronously, without the periodic worker.
     void RunBatchEvictForTesting(double evict_ratio_target,
                                  double evict_ratio_lowerbound);
+    void StopEvictionWorkerForTesting();
 
     void SetEvictionCensusHookForTesting(std::function<void()> hook);
 
@@ -65,6 +72,7 @@ class MasterServiceTestPeer {
     uint64_t GetEvictionCensusRunsForTesting() const;
 
     bool HasEvictionContinuationForTesting() const;
+    size_t GetEvictionDeadlineCapacityForTesting() const;
 
     uint64_t GetObjectGenerationForTesting(const TenantId& tenant_id,
                                            const std::string& key) const;

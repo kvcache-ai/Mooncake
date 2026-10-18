@@ -36,6 +36,13 @@ void MasterServiceTestPeer::RunBatchEvictForTesting(
     service_.BatchEvict(evict_ratio_target, evict_ratio_lowerbound);
 }
 
+void MasterServiceTestPeer::StopEvictionWorkerForTesting() {
+    service_.eviction_running_ = false;
+    if (service_.eviction_thread_.joinable()) {
+        service_.eviction_thread_.join();
+    }
+}
+
 void MasterServiceTestPeer::SetEvictionCensusHookForTesting(
     std::function<void()> hook) {
     std::lock_guard<std::recursive_mutex> lock(
@@ -91,6 +98,14 @@ bool MasterServiceTestPeer::HasEvictionContinuationForTesting() const {
     std::lock_guard<std::recursive_mutex> lock(
         service_.eviction_continuation_mutex_);
     return service_.eviction_continuation_.has_value();
+}
+
+size_t MasterServiceTestPeer::GetEvictionDeadlineCapacityForTesting() const {
+    std::lock_guard<std::recursive_mutex> lock(
+        service_.eviction_continuation_mutex_);
+    if (!service_.eviction_continuation_) return 0;
+    return service_.eviction_continuation_->no_soft_pin_deadlines.capacity() +
+           service_.eviction_continuation_->soft_pin_deadlines.capacity();
 }
 
 uint64_t MasterServiceTestPeer::GetObjectGenerationForTesting(
