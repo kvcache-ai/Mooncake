@@ -56,6 +56,8 @@ std::shared_ptr<Config> loadConfig() {
     config->set("rpc_server_port", XferBenchConfig::rpc_server_port);
     config->set("transports/rdma/deadline_bw_arbitration",
                 XferBenchConfig::deadline_bw_arbitration);
+    config->set("transports/rdma/workers/rail_topo_path",
+                XferBenchConfig::tent_rail_topo_path);
 
     // Configure transport types based on xport_type parameter
     if (!XferBenchConfig::xport_type.empty()) {
@@ -333,6 +335,10 @@ size_t TENTBenchRunner::getTargetCount() const {
     return std::max<size_t>(target_handles_.size(), 1);
 }
 
+Status TENTBenchRunner::getSelectionStats(SelectionStats& stats) const {
+    return engine_->getSelectionStats(stats);
+}
+
 int TENTBenchRunner::startInitiator(int num_threads) {
     auto names = splitCommaSeparated(XferBenchConfig::target_seg_name);
     if (names.empty()) {
@@ -373,7 +379,7 @@ int TENTBenchRunner::stopInitiator() {
         cv_done_.notify_all();
     }
     for (auto& thread : threads_) {
-        thread.join();
+        if (thread.joinable()) thread.join();
     }
     return 0;
 }

@@ -86,6 +86,7 @@ struct XferBenchConfig {
     static uint64_t deadline_us;
     static int deadline_tight_threads;
     static bool deadline_bw_arbitration;
+    static std::string tent_rail_topo_path;
 
     static std::string metadata_type;
     static std::string metadata_url_list;
