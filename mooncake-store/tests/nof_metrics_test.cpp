@@ -48,7 +48,7 @@ TEST(NofMetrics, ClientExportAndSummary) {
 }
 
 TEST(NofMetrics, ClientTotalsKeepReadWriteAndErrorsSeparate) {
-    NofMetric metric({{"client", "test"}});
+    NofMetric metric(std::map<std::string, std::string>{{"client", "test"}});
     EXPECT_EQ(metric.nof_read_bytes.value(), 0);
     metric.ObserveRead(4096);
     metric.RecordReadErrors();
