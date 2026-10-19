@@ -139,8 +139,6 @@ June 26, 2026
 
 getting_started/quick-start
 getting_started/build
-getting_started/store-rs
-getting_started/store-rs-features
 
 :::
 
