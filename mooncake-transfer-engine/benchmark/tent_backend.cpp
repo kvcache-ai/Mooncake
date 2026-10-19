@@ -48,6 +48,24 @@ void signalHandlerV1(int signum) {
     g_tent_triggered_sig.store(true);
 }
 
+// Parse a comma-separated list (e.g. "dram,vram") into a vector of lowercased
+// seg_type names. Empty input returns an empty vector.
+static std::vector<std::string> parseSegTypeMix(const std::string& mix) {
+    std::vector<std::string> result;
+    if (mix.empty()) return result;
+    std::stringstream ss(mix);
+    std::string token;
+    while (std::getline(ss, token, ',')) {
+        size_t b = token.find_first_not_of(" \t");
+        size_t e = token.find_last_not_of(" \t");
+        if (b == std::string::npos) continue;
+        std::string name = token.substr(b, e - b + 1);
+        for (auto& c : name) c = to_lower(c);
+        result.push_back(name);
+    }
+    return result;
+}
+
 std::shared_ptr<Config> loadConfig() {
     auto config = std::make_shared<Config>();
     config->set("local_segment_name", XferBenchConfig::seg_name);
@@ -74,16 +92,28 @@ std::shared_ptr<Config> loadConfig() {
             {"mpcomm", "mpcomm"},
             {"fabric", "fabric"}};
 
-        // Disable all transports by default
+        // Disable the selectable benchmark transports.
         for (const auto& entry : transport_map) {
             config->set("transports/" + entry.second + "/enable", false);
         }
 
-        // Enable only the specified transport
+        // Enable the selected benchmark transport.
         auto it = transport_map.find(XferBenchConfig::xport_type);
         if (it != transport_map.end()) {
             config->set("transports/" + it->second + "/enable", true);
         }
+
+#ifdef USE_MLU
+        auto seg_types = parseSegTypeMix(XferBenchConfig::seg_type_mix);
+        if (seg_types.empty()) {
+            seg_types = parseSegTypeMix(XferBenchConfig::seg_type);
+        }
+        if (std::find(seg_types.begin(), seg_types.end(), "vram") !=
+            seg_types.end()) {
+            // Network transfers of MLU memory also need local host copies.
+            config->set("transports/mlu/enable", true);
+        }
+#endif
     }
 
     return config;
@@ -187,24 +217,6 @@ static int resolveSegTypeParams(const std::string& seg_type,
         return -1;
     }
     return 0;
-}
-
-// Parse a comma-separated list (e.g. "dram,vram") into a vector of lowercased
-// seg_type names. Empty input returns an empty vector.
-static std::vector<std::string> parseSegTypeMix(const std::string& mix) {
-    std::vector<std::string> result;
-    if (mix.empty()) return result;
-    std::stringstream ss(mix);
-    std::string token;
-    while (std::getline(ss, token, ',')) {
-        size_t b = token.find_first_not_of(" \t");
-        size_t e = token.find_last_not_of(" \t");
-        if (b == std::string::npos) continue;
-        std::string name = token.substr(b, e - b + 1);
-        for (auto& c : name) c = to_lower(c);
-        result.push_back(name);
-    }
-    return result;
 }
 
 int TENTBenchRunner::allocateBuffers() {
@@ -455,6 +467,7 @@ void TENTBenchRunner::pinThread(int thread_id) {
 #endif
     uint64_t addr = getLocalBufferBase(thread_id, 0, 0);
     auto result = Platform::getLoader().getLocation((void*)addr, 1);
+    if (result.empty()) return;
     LocationParser location(result[0].location);
     if (location.type() == "cpu") {
         auto socket_id = location.index();

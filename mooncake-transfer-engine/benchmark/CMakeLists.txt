@@ -70,6 +70,18 @@ set_target_properties(
              "$ORIGIN/../lib:$ORIGIN/../../mooncake-common${TANGRT_RPATH}")
 
 if(BUILD_UNIT_TESTS)
+  if(USE_TENT)
+    add_executable(
+      tebench_tent_config_test tests/tent_config_test.cpp tent_backend.cpp
+                               split_output.cpp utils.cpp)
+    target_link_libraries(
+      tebench_tent_config_test PRIVATE transfer_engine tent_link_group gtest
+                                       gtest_main)
+    target_include_directories(tebench_tent_config_test
+                               PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME tebench_tent_config_test COMMAND tebench_tent_config_test)
+  endif()
+
   if(USE_MLU)
     add_executable(tebench_mlu_data_test tests/mlu_data_test.cpp utils.cpp)
     target_link_libraries(tebench_mlu_data_test PRIVATE transfer_engine gtest

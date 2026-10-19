@@ -30,8 +30,8 @@ DEFINE_string(
     "\"dram,vram\". When set, target registers buffers of each listed type "
     "in one segment, and initiator threads round-robin across them so a "
     "single tebench process drives traffic over multiple memory types "
-    "concurrently. Empty falls back to --seg_type. Requires transports "
-    "to be enabled via MC_TENT_CONF.");
+    "concurrently. Empty falls back to --seg_type. Select transports "
+    "with --xport_type or MC_TENT_CONF.");
 DEFINE_string(target_seg_name, "",
               "Target segment name for the initiator side. A comma-separated "
               "list enables multi-target initiator mode.");

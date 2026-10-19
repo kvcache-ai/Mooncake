@@ -20,6 +20,9 @@
 namespace mooncake::tent {
 namespace {
 
+constexpr size_t kSize = 65539;
+constexpr size_t kOffset = 17;
+
 class MluDataTest : public testing::Test {
    protected:
     void SetUp() override {
@@ -39,8 +42,6 @@ class MluDataTest : public testing::Test {
         XferBenchConfig::check_consistency = saved_check_;
     }
 
-    static constexpr size_t kSize = 65539;
-    static constexpr size_t kOffset = 17;
     void* device_ = nullptr;
     std::string saved_transport_;
     bool saved_check_ = false;
@@ -48,37 +49,52 @@ class MluDataTest : public testing::Test {
 
 TEST_F(MluDataTest, InteriorDeviceDataMatchesHostPatternOnFreshWorker) {
     auto* ptr = static_cast<uint8_t*>(device_) + kOffset;
-    std::thread worker([&] {
-        std::vector<uint8_t> expected(kSize), actual(kSize);
-        EXPECT_FALSE(isMluMemory(expected.data()));
-        ASSERT_TRUE(isMluMemory(ptr));
-        for (const auto* transport : {"tcp", "hp_tcp"}) {
-            XferBenchConfig::xport_type = transport;
-            for (bool check : {false, true}) {
-                XferBenchConfig::check_consistency = check;
+    for (const auto* transport : {"tcp", "hp_tcp"}) {
+        XferBenchConfig::xport_type = transport;
+        for (bool check : {false, true}) {
+            XferBenchConfig::check_consistency = check;
+            std::vector<uint8_t> expected(kSize), actual(kSize);
+            bool host_is_device = false, device_is_device = false;
+            auto copy_status = cnrtSuccess;
+            std::thread worker([&] {
+                host_is_device = isMluMemory(expected.data());
+                device_is_device = isMluMemory(ptr);
+                if (!device_is_device) return;
                 fillData(expected.data(), kSize, 37);
                 fillData(ptr, kSize, 37);
-                ASSERT_EQ(
-                    cnrtMemcpy(actual.data(), ptr, kSize, cnrtMemcpyDevToHost),
-                    cnrtSuccess);
-                EXPECT_EQ(actual, expected);
+                copy_status =
+                    cnrtMemcpy(actual.data(), ptr, kSize, cnrtMemcpyDevToHost);
+                if (copy_status != cnrtSuccess) return;
                 verifyData(ptr, kSize, 37);
-            }
+            });
+            worker.join();
+            EXPECT_FALSE(host_is_device);
+            ASSERT_TRUE(device_is_device);
+            ASSERT_EQ(copy_status, cnrtSuccess);
+            EXPECT_EQ(actual, expected);
         }
-    });
-    worker.join();
+    }
 }
 
-using MluDataDeathTest = MluDataTest;
-
-TEST_F(MluDataDeathTest, RejectsCorruptedDeviceData) {
+TEST(MluDataDeathTest, RejectsCorruptedDeviceData) {
+    unsigned int count = 0;
+    if (cnrtGetDeviceCount(&count) != cnrtSuccess || count == 0)
+        GTEST_SKIP() << "No MLU device visible";
     testing::FLAGS_gtest_death_test_style = "threadsafe";
-    XferBenchConfig::xport_type = "tcp";
-    XferBenchConfig::check_consistency = true;
-    fillData(device_, kSize, 37);
-    ASSERT_EQ(cnrtMemset(static_cast<uint8_t*>(device_) + kOffset, 38, 1),
-              cnrtSuccess);
-    EXPECT_DEATH(verifyData(device_, kSize, 37), "Inconsistent data detected");
+    EXPECT_DEATH(
+        ([] {
+            // Create the device context and allocation in the child process.
+            LOG_ASSERT(cnrtSetDevice(0) == cnrtSuccess);
+            void* device = nullptr;
+            LOG_ASSERT(cnrtMalloc(&device, kSize + kOffset) == cnrtSuccess);
+            XferBenchConfig::xport_type = "tcp";
+            XferBenchConfig::check_consistency = true;
+            fillData(device, kSize, 37);
+            LOG_ASSERT(cnrtMemset(static_cast<uint8_t*>(device) + kOffset, 38,
+                                  1) == cnrtSuccess);
+            verifyData(device, kSize, 37);
+        }()),
+        "Inconsistent data detected");
 }
 
 }  // namespace
