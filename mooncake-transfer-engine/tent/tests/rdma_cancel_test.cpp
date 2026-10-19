@@ -14,6 +14,7 @@
 
 #include "tent/transport/rdma/slice.h"
 
+#include <atomic>
 #include <gtest/gtest.h>
 
 namespace mooncake {
@@ -70,6 +71,68 @@ TEST(RdmaCancelTest, FullyPostedTaskMayStillComplete) {
 
     EXPECT_EQ(task.status_word, COMPLETED);
     EXPECT_EQ(task.transferred_bytes, 4096u);
+}
+
+TEST(RdmaCancelTest, LastSlicePublishesFinishedTaskCount) {
+    std::atomic<uint64_t> finished{0};
+    std::atomic<bool> has_failure{false};
+    RdmaTask task{};
+    task.num_slices = 2;
+    task.status_word = PENDING;
+    task.transferred_bytes = 0;
+    task.success_slices.store(0);
+    task.resolved_slices.store(0);
+    task.first_error = PENDING;
+    task.finished_counter = &finished;
+    task.has_failure_flag = &has_failure;
+    task.ref_count.store(3);
+
+    RdmaSlice first{};
+    first.task = &task;
+    first.word = PENDING;
+    first.length = 64;
+    RdmaSlice second{};
+    second.task = &task;
+    second.word = PENDING;
+    second.length = 64;
+
+    updateSliceStatus(&first, COMPLETED);
+    EXPECT_EQ(task.status_word, PENDING);
+    EXPECT_EQ(finished.load(), 0u);
+    EXPECT_FALSE(has_failure.load());
+
+    updateSliceStatus(&second, COMPLETED);
+    EXPECT_EQ(task.status_word, COMPLETED);
+    EXPECT_EQ(finished.load(), 1u);
+    EXPECT_FALSE(has_failure.load());
+
+    updateSliceStatus(&second, COMPLETED);
+    EXPECT_EQ(finished.load(), 1u);
+}
+
+TEST(RdmaCancelTest, FailedLastSliceSetsHasFailure) {
+    std::atomic<uint64_t> finished{0};
+    std::atomic<bool> has_failure{false};
+    RdmaTask task{};
+    task.num_slices = 1;
+    task.status_word = PENDING;
+    task.transferred_bytes = 0;
+    task.success_slices.store(0);
+    task.resolved_slices.store(0);
+    task.first_error = PENDING;
+    task.finished_counter = &finished;
+    task.has_failure_flag = &has_failure;
+    task.ref_count.store(2);
+
+    RdmaSlice slice{};
+    slice.task = &task;
+    slice.word = PENDING;
+    slice.length = 64;
+    updateSliceStatus(&slice, FAILED);
+
+    EXPECT_EQ(task.status_word, FAILED);
+    EXPECT_EQ(finished.load(), 0u);
+    EXPECT_TRUE(has_failure.load());
 }
 
 }  // namespace

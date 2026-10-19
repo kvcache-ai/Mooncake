@@ -528,6 +528,11 @@ class TransferEngineImpl {
     Status getBatchStatus(BatchID batch_id, TransferStatus& overall_status,
                           bool force_failover);
 
+    void noteBatchPollRequirement(Batch* batch, TransportType type,
+                                  bool staging);
+
+    bool trySkipInFlightOwnerWalk(Batch* batch, TransferStatus& overall_status);
+
     SelectionResult resolveTransport(const Request& req, int transport_index,
                                      bool invalidate_on_fail = true);
 

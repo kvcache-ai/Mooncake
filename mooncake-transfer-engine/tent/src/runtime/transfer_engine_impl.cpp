@@ -89,6 +89,9 @@ struct Batch {
         std::unordered_set<SegmentID> targets;
     };
     std::vector<SubmitHook> submit_hooks;
+    // False once any owner needs a foreground poll (TCP/NVLink/staging/queue/
+    // cancel). RDMA-only batches keep the PR #4199 in-flight shortcut.
+    bool counter_eligible{true};
 };
 
 struct PreservedTentConfigOverrides {
@@ -2431,6 +2434,7 @@ Status TransferEngineImpl::commitPreparedSubmit(
         if (task.type == UNSPEC) {
             LOG(WARNING) << "Unable to find registered buffer for request: "
                          << printRequest(merged_request);
+            noteBatchPollRequirement(batch, UNSPEC, false);
             merged_task_id_map[merged_task_id] = task;
             continue;
         }
@@ -2450,9 +2454,11 @@ Status TransferEngineImpl::commitPreparedSubmit(
             } else {
                 task.post_time = std::chrono::steady_clock::now();
             }
+            noteBatchPollRequirement(batch, task.type, true);
             continue;
         }
 
+        noteBatchPollRequirement(batch, task.type, false);
         if (!batch->sub_batch[task.type]) {
             auto& transport = transport_list_[task.type];
             auto status = transport->allocateSubBatch(
@@ -2460,6 +2466,7 @@ Status TransferEngineImpl::commitPreparedSubmit(
             if (!status.ok()) {
                 LOG(WARNING) << "Failed to allocate SubBatch " << task.type
                              << ":" << status.ToString();
+                noteBatchPollRequirement(batch, UNSPEC, false);
                 merged_task_id_map[merged_task_id] = task;
                 continue;
             }
@@ -2536,6 +2543,7 @@ Status TransferEngineImpl::commitPreparedSubmit(
             }
             auto status = transport->submitTransferTasks(sub_batch, requests);
             if (!status.ok()) {
+                noteBatchPollRequirement(batch, UNSPEC, false);
                 auto attempt_end = std::chrono::steady_clock::now();
                 // failure_stage must be marked in this first segment, before
                 // any recovery/failover attempt on the failure: a task that
@@ -2585,6 +2593,7 @@ Status TransferEngineImpl::enqueuePreparedSubmit(Batch* batch,
                                                  QueueOwnerKind owner_kind) {
     std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
     if (prepared.tasks.empty()) return Status::OK();
+    batch->counter_eligible = false;
     if (prepared.tasks.size() > batch->max_size - batch->task_list.size()) {
         return Status::TooManyRequests(
             "batch public task capacity exceeded" LOC_MARK);
@@ -3062,6 +3071,7 @@ Status TransferEngineImpl::cancelTransfer(BatchID batch_id, size_t task_id) {
     if (task_id >= batch->task_list.size()) {
         return Status::InvalidArgument("Invalid task ID" LOC_MARK);
     }
+    batch->counter_eligible = false;
 
     size_t owner_task_id = task_id;
     bool queued_owner_resolved = false;
@@ -3197,6 +3207,7 @@ Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {
     }
     task.sub_task_id = sub_batch->size();
     task.type = type;
+    noteBatchPollRequirement(batch, type, false);
     startTransportAttempt(task, type, std::chrono::steady_clock::now());
     auto status = transport->submitTransferTasks(sub_batch, {task.request});
     if (!status.ok()) {
@@ -3604,6 +3615,53 @@ Status TransferEngineImpl::getTransferStatus(
     return Status::OK();
 }
 
+void TransferEngineImpl::noteBatchPollRequirement(Batch* batch,
+                                                  TransportType type,
+                                                  bool staging) {
+    if (!batch || !batch->counter_eligible) return;
+    if (staging || type == UNSPEC) {
+        batch->counter_eligible = false;
+        return;
+    }
+    auto& transport = transport_list_[type];
+    if (!transport || !transport->publishesBatchCompletionCounter()) {
+        batch->counter_eligible = false;
+    }
+}
+
+bool TransferEngineImpl::trySkipInFlightOwnerWalk(
+    Batch* batch, TransferStatus& overall_status) {
+    if (!batch->counter_eligible || batch->queue_token != 0) return false;
+    // Notify hooks fire on the completion walk. NIXL posts with
+    // submitTransferWithNotify; skipping in-flight polls is required for
+    // CP-1. Multi-submit hooks on the same batch wait until every owner
+    // finishes, same as TE #4199 bytes aggregation.
+
+    Transport::SubBatchRef publisher = nullptr;
+    for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
+        auto* sub_batch = batch->sub_batch[type];
+        if (!sub_batch) continue;
+        auto& transport = transport_list_[type];
+        if (!transport || !transport->publishesBatchCompletionCounter()) {
+            return false;
+        }
+        if (publisher) return false;
+        publisher = sub_batch;
+    }
+    if (!publisher) return false;
+    if (publisher->has_failure.load(std::memory_order_acquire)) return false;
+
+    const uint64_t owners = publisher->size();
+    if (owners == 0) return false;
+    const uint64_t finished =
+        publisher->finished_task_count.load(std::memory_order_acquire);
+    if (finished >= owners) return false;
+
+    overall_status.s = PENDING;
+    overall_status.transferred_bytes = 0;
+    return true;
+}
+
 Status TransferEngineImpl::getBatchStatus(BatchID batch_id,
                                           TransferStatus& overall_status,
                                           bool force_failover) {
@@ -3615,6 +3673,9 @@ Status TransferEngineImpl::getBatchStatus(BatchID batch_id,
     Batch* batch = (Batch*)(batch_id);
     overall_status.s = PENDING;
     overall_status.transferred_bytes = 0;
+    if (trySkipInFlightOwnerWalk(batch, overall_status)) {
+        return Status::OK();
+    }
     size_t success_tasks = 0;
     size_t failed_tasks = 0;
     size_t total_tasks = 0;

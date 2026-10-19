@@ -123,6 +123,18 @@ target_include_directories(rdma_cancel_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME rdma_cancel_test COMMAND rdma_cancel_test)
 
+# PR #4199 analogue: RDMA-only getBatchStatus skips the owner walk while the
+# worker-published finished_task_count says the batch is still in flight.
+add_executable(tent_batch_counter_wait_test batch_counter_wait_test.cpp)
+target_link_libraries(tent_batch_counter_wait_test PRIVATE gtest gtest_main
+                                                           tent_link_group)
+if(TARGET asio_shared)
+  target_link_libraries(tent_batch_counter_wait_test PRIVATE asio_shared)
+endif()
+target_include_directories(tent_batch_counter_wait_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_batch_counter_wait_test COMMAND tent_batch_counter_wait_test)
+
 add_executable(thread_local_storage_test thread_local_storage_test.cpp)
 target_link_libraries(thread_local_storage_test PRIVATE gtest gtest_main)
 target_include_directories(thread_local_storage_test

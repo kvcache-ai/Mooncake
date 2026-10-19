@@ -112,6 +112,10 @@ struct RdmaTask {
     std::atomic<int> success_slices{0};
     std::atomic<int> resolved_slices{0};
     volatile TransferStatusEnum first_error = PENDING;
+    // Set at submit to the owning SubBatch counters. Null on stack tasks in
+    // unit tests that never go through RdmaTransport::submitTransferTasks.
+    std::atomic<uint64_t>* finished_counter = nullptr;
+    std::atomic<bool>* has_failure_flag = nullptr;
 
     // Set by the control thread. Workers observe this flag before posting or
     // retrying a slice. Already-posted WRs are allowed to drain normally.
@@ -230,7 +234,20 @@ static inline void updateSliceStatus(RdmaSlice* slice,
                 ? COMPLETED
                 : task->first_error;
         if (final_st == PENDING) final_st = FAILED;
-        __sync_bool_compare_and_swap(&task->status_word, PENDING, final_st);
+        if (__sync_bool_compare_and_swap(&task->status_word, PENDING,
+                                         final_st)) {
+            // Same idea as classic TE Slice::markSuccess (PR #4199): the CQ
+            // thread publishes batch progress so getBatchStatus does not have
+            // to walk owners while the batch is still in flight.
+            if (final_st == COMPLETED) {
+                if (task->finished_counter) {
+                    task->finished_counter->fetch_add(
+                        1, std::memory_order_release);
+                }
+            } else if (task->has_failure_flag) {
+                task->has_failure_flag->store(true, std::memory_order_release);
+            }
+        }
     }
     task->deref();
 }
