@@ -295,7 +295,8 @@ TEST(HighPerformanceTcpTransportTest, ReceiverCreditFenceTracksPinnedMetadata) {
         ASSERT_TRUE(metadata->segmentManager()
                         .updateLocal([&](SegmentDesc& segment) -> Status {
                             auto& published =
-                                segment.getMemory().receiver_credit;
+                                std::get<MemorySegmentDesc>(segment.detail)
+                                    .receiver_credit;
                             if (scenario == 0)
                                 published.reset();
                             else
