@@ -132,11 +132,12 @@ class PrefetchTaskMasterTest : public ::testing::Test {
         if (tenant_state == nullptr) {
             return std::nullopt;
         }
-        auto it = tenant_state->promotion_candidates.find(key);
-        if (it == tenant_state->promotion_candidates.end()) {
+        auto it = tenant_state->metadata.find(key);
+        if (it == tenant_state->metadata.end() ||
+            !it->second.state.promotion_candidate) {
             return std::nullopt;
         }
-        return it->second.execution_failures;
+        return it->second.state.promotion_candidate->execution_failures;
     }
 
     // The in-flight task's execution-failure count if a task exists.
@@ -170,8 +171,8 @@ class PrefetchTaskMasterTest : public ::testing::Test {
         if (!accessor.Exists()) {
             return;
         }
-        service->RecordOrUpdateCandidate(
-            accessor.GetTenantState(), key, /*sketch_score=*/0,
+        service->promotion_candidates_.RecordLocked(
+            tenant_id, key, accessor.GetState(), /*sketch_score=*/0,
             PromotionCandidateReason::kExecutionFailed, ErrorCode::OK,
             failures);
     }
