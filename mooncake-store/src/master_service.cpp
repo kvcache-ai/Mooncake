@@ -9924,7 +9924,6 @@ auto MasterService::RegisterPrefetchTask(const UUID& client_id,
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
     auto& metadata = accessor.Get();
-    auto& tenant_state = accessor.GetTenantState();
 
     // A primary Put/Upsert owns all PROCESSING replicas while the object is
     // processing. Prefetch promotion must not establish a second owner.
@@ -9982,12 +9981,8 @@ auto MasterService::RegisterPrefetchTask(const UUID& client_id,
     source->inc_refcnt();
     const uint64_t object_size =
         source->get_descriptor().get_local_disk_descriptor().object_size;
-    uint32_t execution_failures = 0;
-    if (auto cit = tenant_state.promotion_candidates.find(object_id.user_key);
-        cit != tenant_state.promotion_candidates.end()) {
-        execution_failures = cit->second.execution_failures;
-    }
-    EraseCandidate(tenant_state, object_id.user_key);
+    const uint32_t execution_failures = promotion_candidates_.ConsumeLocked(
+        object_id.tenant_id, object_id.user_key, accessor.GetState());
     promotion_task =
         PromotionTask{.source_id = source->id(),
                       .alloc_id = 0,
