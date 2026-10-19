@@ -369,9 +369,14 @@ int EfaTransport::registerLocalMemoryInternal(
                 nic_assignments[ci].push_back(n);
             }
         }
-        LOG(WARNING) << "Disjoint NIC partition: PTE/NIC="
-                     << total_pages_per_nic
-                     << " exceeds budget=" << getMaxPteEntries();
+        if (thp_plan == ThpPlan::kThpPartitioned) {
+            LOG(WARNING) << "Disjoint NIC partition: full-coverage "
+                            "registration failed";
+        } else {
+            LOG(WARNING) << "Disjoint NIC partition: PTE/NIC="
+                         << total_pages_per_nic
+                         << " exceeds budget=" << getMaxPteEntries();
+        }
         for (size_t ci = 0; ci < num_chunks; ++ci) {
             std::string nic_list;
             for (size_t j = 0; j < nic_assignments[ci].size(); ++j) {
