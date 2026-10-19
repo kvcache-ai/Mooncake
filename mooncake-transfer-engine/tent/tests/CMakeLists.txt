@@ -625,6 +625,19 @@ target_include_directories(tent_transport_hint_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_transport_hint_test COMMAND tent_transport_hint_test)
 
+# CP-3: homogeneous RDMA batches reuse SelectionResult per covering MR pair
+# instead of calling getTransportType once per descriptor.
+add_executable(tent_transport_route_cache_test transport_route_cache_test.cpp)
+target_link_libraries(tent_transport_route_cache_test PRIVATE gtest gtest_main
+                                                              tent_link_group)
+if(TARGET asio_shared)
+  target_link_libraries(tent_transport_route_cache_test PRIVATE asio_shared)
+endif()
+target_include_directories(tent_transport_route_cache_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_transport_route_cache_test
+         COMMAND tent_transport_route_cache_test)
+
 # ProgressWorker skeleton test: covers default-off behavior, event-driven
 # progress without poll-failover, and freeBatch races (issue #2116).
 add_executable(tent_progress_worker_test progress_worker_test.cpp)
