@@ -53,6 +53,16 @@ class SpdkWrapper {
     bool ProbeNofSegment(const std::string &tr_str, uint32_t timeout_ms,
                          std::string *error_reason = nullptr);
 
+    /**
+     * @brief Release the probe resources cached for a transport endpoint.
+     *        Called once the last NoF segment behind @p tr_str is unmounted,
+     *        so that the DMA buffer does not outlive the segment. The call is
+     *        idempotent. A buffer with a probe read still outstanding is
+     *        freed when that read's completion is reaped instead, because
+     *        the device may still write into it until then.
+     */
+    void ReleaseProbeResources(const std::string &tr_str);
+
     /** @brief Register external memory with SPDK for NoF zero-copy transfers.
      *
      * Memory returned by Alloc() is already registered with SPDK; use this to
@@ -103,6 +113,14 @@ class SpdkWrapper {
     struct ProbeBuffer {
         void *ptr{nullptr};
         uint32_t size{0};
+        // Probe reads submitted against this buffer whose completion has not
+        // been reaped yet. A timed out read stays counted until a later poll
+        // of the qpair reaps it, so the buffer is never freed while the
+        // device may still DMA into it.
+        uint32_t outstanding{0};
+        // The endpoint was released while reads were outstanding. The last
+        // completion frees the buffer instead.
+        bool release_requested{false};
 
         ProbeBuffer() = default;
         ProbeBuffer(const ProbeBuffer &) = delete;
@@ -117,10 +135,13 @@ class SpdkWrapper {
         std::mutex error_mutex;
         std::string error_reason;
         SpdkWrapper *owner{nullptr};
+        // Buffer the read targets; its reference is dropped on completion.
+        ProbeBuffer *buffer{nullptr};
 
         void Reset(SpdkWrapper *wrapper) {
             std::lock_guard<std::mutex> lock(error_mutex);
             owner = wrapper;
+            buffer = nullptr;
             done.store(false, std::memory_order_release);
             success.store(false, std::memory_order_release);
             error_reason.clear();
@@ -136,6 +157,7 @@ class SpdkWrapper {
     ProbeBuffer *GetOrCreateProbeBuffer(const std::string &tr_str,
                                         uint32_t block_size,
                                         std::string *error_reason);
+    void ReleaseProbeBufferRef(ProbeBuffer *buffer);
     ProbeRequestContext *AcquireProbeRequestContext();
     void RecycleProbeRequestContext(ProbeRequestContext *ctx);
     void ReplenishProbeRequestContextPoolLocked(size_t count);
