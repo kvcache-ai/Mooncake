@@ -724,6 +724,17 @@ class RealClient : public PyClient {
         const std::vector<std::vector<size_t>> &all_sizes,
         bool prefer_same_node);
 
+    // Demand-side kick, shared by all get paths: a get headed for LOCAL_DISK
+    // fires one promotion attempt for those keys (best-effort, non-blocking,
+    // one dedup lookup + one pool enqueue; no RPC on the caller's thread).
+    // ignore_cooldown bypasses only this client's throttle backoff — never a
+    // master-side gate (the in-flight cap, holder check, and dedup TTL still
+    // apply). No-op unless enable_ssd_prefetch_ and the prefetcher is set up.
+    void KickPrefetchForDiskHeadedKeys(
+        const std::vector<std::string> &keys,
+        const std::vector<tl::expected<QueryResult, ErrorCode>> &query_results,
+        const std::unordered_set<std::string> &local_endpoints);
+
     tl::expected<void, ErrorCode> put_from_internal(
         const std::string &key, void *buffer, size_t size,
         const ReplicateConfig &config = ReplicateConfig{});

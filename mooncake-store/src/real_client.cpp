@@ -3618,6 +3618,9 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
         LOG(ERROR) << "No usable replica for key: " << key;
         return nullptr;
     }
+    // Same demand-side kick as the batch path: a plain get headed for SSD is
+    // the strongest hotness signal there is.
+    KickPrefetchForDiskHeadedKeys({key}, {query_result}, local_endpoints);
 
     const auto &replica = *best_replica;
     uint64_t total_length = calculate_total_size(replica);
@@ -7767,6 +7770,35 @@ std::vector<int> RealClient::batch_get_into_multi_buffers(
     return results;
 }
 
+void RealClient::KickPrefetchForDiskHeadedKeys(
+    const std::vector<std::string> &keys,
+    const std::vector<tl::expected<QueryResult, ErrorCode>> &query_results,
+    const std::unordered_set<std::string> &local_endpoints) {
+    if (!enable_ssd_prefetch_ || !prefetcher_) {
+        return;
+    }
+    std::vector<std::string> disk_keys;
+    disk_keys.reserve(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (!query_results[i] || query_results[i].value().replicas.empty()) {
+            continue;
+        }
+        const auto *best = SelectBestReplica(query_results[i].value().replicas,
+                                             local_endpoints);
+        if (best != nullptr && best->is_local_disk_replica()) {
+            disk_keys.push_back(keys[i]);
+        }
+    }
+    if (disk_keys.empty()) {
+        return;
+    }
+    // Without this kick, a request whose exist-triggered promotion was
+    // dropped by a saturated backoff window pays the SSD read with no retry.
+    VLOG(1) << "SSD prefetch: get-side kick, disk_keys=" << disk_keys.size()
+            << ", in_cooldown=" << prefetcher_->throttle()->inCooldown();
+    prefetcher_->TriggerPrefetch(disk_keys, /*ignore_cooldown=*/true);
+}
+
 std::vector<tl::expected<int64_t, ErrorCode>>
 RealClient::batch_get_into_multi_buffers_internal(
     const std::vector<std::string> &keys,
@@ -7832,35 +7864,7 @@ RealClient::batch_get_into_multi_buffers_internal(
     std::vector<DuplicateDiskOp> duplicate_disk_ops;
     valid_operations.reserve(num_keys);
     auto local_endpoints = client_->GetLocalEndpoints();
-    if (enable_ssd_prefetch_ && prefetcher_) {
-        // Demand-side kick: a batch headed for SSD gets one promotion
-        // attempt for its disk keys. ignore_cooldown bypasses only the
-        // client-side throttle's backoff, never a master-side gate (the
-        // in-flight cap and holder check still apply on the master); an
-        // in-flight get is the strongest hotness signal there is, and the
-        // dedup TTL still bounds the rate. Without this kick, a request
-        // whose exist-triggered promotion was dropped by a saturated
-        // backoff window pays the SSD read with no retry.
-        std::vector<std::string> disk_keys;
-        disk_keys.reserve(num_keys);
-        for (size_t i = 0; i < num_keys; ++i) {
-            if (!query_results[i] ||
-                query_results[i].value().replicas.empty()) {
-                continue;
-            }
-            const auto *best = SelectBestReplica(
-                query_results[i].value().replicas, local_endpoints);
-            if (best != nullptr && best->is_local_disk_replica()) {
-                disk_keys.push_back(keys[i]);
-            }
-        }
-        if (!disk_keys.empty()) {
-            VLOG(1) << "SSD prefetch: get-side kick, disk_keys="
-                    << disk_keys.size() << ", in_cooldown="
-                    << prefetcher_->throttle()->inCooldown();
-            prefetcher_->TriggerPrefetch(disk_keys, /*ignore_cooldown=*/true);
-        }
-    }
+    KickPrefetchForDiskHeadedKeys(keys, query_results, local_endpoints);
     for (size_t i = 0; i < num_keys; ++i) {
         const auto &key = keys[i];
         // Handle query failures

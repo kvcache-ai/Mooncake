@@ -84,8 +84,8 @@ Per-client `PrefetchThrottle` (sharded, lock-free fast path per shard):
 
 ## get() demand-side kick
 
-A batch get whose best replica is `LOCAL_DISK` fires one
-`TriggerPrefetch(disk_keys, ignore_cooldown=true)` before the transfer. The
+Any get whose best replica is `LOCAL_DISK` — single-key or batched — fires
+one `TriggerPrefetch(disk_keys, ignore_cooldown=true)` before the transfer. The
 bypass covers only the client-side throttle backoff — never a master-side
 gate (the shared in-flight cap, holder check, and dedup TTL all still
 apply). Rationale: an in-flight get is the strongest hotness signal there
