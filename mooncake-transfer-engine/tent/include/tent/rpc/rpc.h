@@ -55,8 +55,8 @@ enum RpcFuncID {
 class ClientPool;
 
 // timeout bounds both the connect and the request; non-positive keeps the
-// coro_rpc defaults. peer_unreachable is set only when the peer did not
-// answer, not for an error reply or a stale idle pooled connection.
+// coro_rpc defaults. peer_unreachable is set only on a timeout of the last
+// attempt, not for a refused or closed connection or an error reply.
 struct RpcCallOptions {
     std::chrono::milliseconds timeout{-1};
     bool *peer_unreachable = nullptr;

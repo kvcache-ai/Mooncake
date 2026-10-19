@@ -312,7 +312,7 @@ TEST(RpcTimeoutPoolTest, RetryOnceAfterAConnectTimeoutDoesNotFlagThePeer) {
     EXPECT_FALSE(unreachable);
 }
 
-TEST(RpcTimeoutPoolTest, AFreshConnectionClosedWithoutAnswerIsUnreachable) {
+TEST(RpcTimeoutPoolTest, AFreshConnectionClosedWithoutAnswerIsNotUnreachable) {
     uint16_t port = 0;
     const int listener = listenLoopback(&port, 8);
     ASSERT_GE(listener, 0);
@@ -329,11 +329,12 @@ TEST(RpcTimeoutPoolTest, AFreshConnectionClosedWithoutAnswerIsUnreachable) {
     closer.join();
     close(listener);
     EXPECT_FALSE(status.ok());
-    EXPECT_TRUE(unreachable) << status.ToString();
+    EXPECT_FALSE(status.IsRpcConnectionError()) << status.ToString();
+    EXPECT_FALSE(unreachable) << status.ToString();
 }
 
-// Nothing listens on port 1: a refused connect is unreachable.
-TEST_F(RpcTimeoutTest, AConnectFailureIsUnreachable) {
+// Nothing listens on port 1: a refused connect is not unreachable.
+TEST_F(RpcTimeoutTest, AConnectRefusalIsNotUnreachable) {
     bool unreachable = false;
     const auto options = flagging(&unreachable);
 
@@ -341,8 +342,8 @@ TEST_F(RpcTimeoutTest, AConnectFailureIsUnreachable) {
     const auto started = Clock::now();
     const Status status =
         client_.call("127.0.0.1:1", kSlowFunc, "x", response, options);
-    EXPECT_FALSE(status.ok());
-    EXPECT_TRUE(unreachable);
+    EXPECT_TRUE(status.IsRpcConnectionError()) << status.ToString();
+    EXPECT_FALSE(unreachable);
     EXPECT_LT(Clock::now() - started, 5s);
 }
 
