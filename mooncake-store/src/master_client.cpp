@@ -335,6 +335,16 @@ struct RpcNameTraits<&WrappedMasterService::MarkTaskToComplete> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::BatchRevokeSharedKv> {
+    static constexpr const char* value = "BatchRevokeSharedKv";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::InvalidateSharedKv> {
+    static constexpr const char* value = "InvalidateSharedKv";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::EvictDiskReplica> {
     static constexpr const char* value = "EvictDiskReplica";
 };
@@ -732,7 +742,14 @@ std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchPutEnd(
 }
 
 tl::expected<void, ErrorCode> MasterClient::PutRevoke(
-    const std::string& key, ReplicaType replica_type) {
+    const std::string& key, ReplicaType replica_type,
+    uint64_t shared_allocation_id) {
+    if (shared_allocation_id != 0) {
+        auto results =
+            BatchPutRevoke({key}, replica_type, {shared_allocation_id});
+        if (results.size() != 1) return tl::unexpected(ErrorCode::RPC_FAIL);
+        return results[0];
+    }
     ScopedVLogTimer timer(1, "MasterClient::PutRevoke");
     timer.LogRequest("key=", key);
 
@@ -743,9 +760,26 @@ tl::expected<void, ErrorCode> MasterClient::PutRevoke(
 }
 
 std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchPutRevoke(
-    const std::vector<std::string>& keys, ReplicaType replica_type) {
+    const std::vector<std::string>& keys, ReplicaType replica_type,
+    const std::vector<uint64_t>& shared_allocation_ids) {
     ScopedVLogTimer timer(1, "MasterClient::BatchPutRevoke");
     timer.LogRequest("keys_count=", keys.size());
+
+    if (!shared_allocation_ids.empty()) {
+        if (shared_allocation_ids.size() != keys.size())
+            return std::vector<tl::expected<void, ErrorCode>>(
+                keys.size(), tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+        std::vector<SharedKvObjectRef> objects;
+        objects.reserve(keys.size());
+        for (size_t i = 0; i < keys.size(); ++i)
+            objects.push_back({keys[i], shared_allocation_ids[i]});
+        auto result =
+            invoke_batch_rpc<&WrappedMasterService::BatchRevokeSharedKv, void>(
+                keys.size(), client_id_, objects, replica_type,
+                tenant_id_.value());
+        timer.LogResponse("result=", result.size(), " operations");
+        return result;
+    }
 
     auto result = invoke_batch_rpc<&WrappedMasterService::BatchPutRevoke, void>(
         keys.size(), client_id_, keys, replica_type, tenant_id_.value());
@@ -1413,6 +1447,18 @@ tl::expected<void, ErrorCode> MasterClient::MarkTaskToComplete(
     timer.LogRequest("client_id=", client_id_, ", task_id=", task_update.id);
     auto result = invoke_rpc<&WrappedMasterService::MarkTaskToComplete, void>(
         client_id_, task_update);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<void, ErrorCode> MasterClient::InvalidateSharedKv(
+    const std::string& key, uint64_t expected_allocation_id) {
+    ScopedVLogTimer timer(1, "MasterClient::InvalidateSharedKv");
+    timer.LogRequest("key=", key, ", tenant_id=", tenant_id_.value(),
+                     ", allocation_id=", expected_allocation_id);
+
+    auto result = invoke_rpc<&WrappedMasterService::InvalidateSharedKv, void>(
+        key, tenant_id_.value(), expected_allocation_id);
     timer.LogResponseExpected(result);
     return result;
 }
