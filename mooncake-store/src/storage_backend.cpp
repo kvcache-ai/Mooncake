@@ -2347,14 +2347,10 @@ tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
         while (static_cast<int64_t>(bucket_keys.size()) <
                bucket_backend_config_.bucket_keys_limit) {
             if (it == offloading_objects.cend()) {
-                for (const auto& bucket_object : bucket_objects) {
-                    ungrouped_offloading_objects.emplace(bucket_object.first,
-                                                         bucket_object.second);
-                }
-                VLOG(1) << "Add offloading objects to ungrouped pool. "
-                        << "Total ungrouped count: "
-                        << ungrouped_offloading_objects.size();
-                return {};
+                // Offload tasks belong to this heartbeat batch. Flush its
+                // partial bucket before those tasks are acknowledged or
+                // released; retaining only keys loses their task metadata.
+                break;
             }
 
             if (carryover_objects.find(it->first) != carryover_objects.end()) {
@@ -2401,7 +2397,9 @@ tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
 
         auto bucket_keys_count = static_cast<int64_t>(bucket_keys.size());
         residue_count -= bucket_keys_count;
-        buckets_keys.push_back(std::move(bucket_keys));
+        if (!bucket_keys.empty()) {
+            buckets_keys.push_back(std::move(bucket_keys));
+        }
         VLOG(1) << "Group objects with total object count: " << total_count
                 << ", current bucket object count: " << bucket_keys_count
                 << ", current bucket data size: " << bucket_data_size
