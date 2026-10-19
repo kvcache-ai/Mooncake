@@ -3793,7 +3793,7 @@ TEST_F(MasterServiceTest, DISABLED_Repro3936RemountKeepsHealthyPings) {
     // A real remount holds only its per-incarnation registration lock here.
     // Holding snapshot_mutex_ models a slow restore/snapshot critical section.
     std::unique_lock snapshot_lock(
-        MasterServiceTestPeer::SnapshotMutex(service));
+        MasterServiceTestPeer::MasterStateMutex(service));
     bool remount_ok = false;
     std::thread remounter([&] {
         remount_ok =
