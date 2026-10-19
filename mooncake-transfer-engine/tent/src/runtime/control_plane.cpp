@@ -343,10 +343,16 @@ Status ControlClient::recvData(const std::string& server_addr,
     }
     auto status = tl_rpc_agent.call(server_addr, RecvData, request, response);
     if (!status.ok()) return status;
+    // A short reply is an error, not payload: surface the server's message so
+    // callers keep the rejection reason (e.g. "permission denied") instead of
+    // a generic string, matching the pre-v2 client behavior. An empty or
+    // unpadded reply still gets a descriptive fallback.
     if (!has_complete_fence) {
         if (response.size() != length) {
             return Status::RpcServiceError(
-                "RecvData failed: invalid or rejected legacy response");
+                response.empty()
+                    ? "RecvData failed: invalid or rejected legacy response"
+                    : response);
         }
         return Platform::getLoader().copy(local_mem_addr, response.data(),
                                           length);
@@ -355,7 +361,8 @@ Status ControlClient::recvData(const std::string& server_addr,
             std::numeric_limits<size_t>::max() - sizeof(XferDataReplyHeader) ||
         response.size() != sizeof(XferDataReplyHeader) + length) {
         return Status::RpcServiceError(
-            "RecvData failed: invalid or rejected response");
+            response.empty() ? "RecvData failed: invalid or rejected response"
+                             : response);
     }
     XferDataReplyHeader header;
     memcpy(&header, response.data(), sizeof(header));
