@@ -4485,6 +4485,7 @@ RealClient::batch_get_buffer_internal(
                 << "file I/O cannot write to GPU memory — read will fail. "
                 << "Ensure client_buffer_allocator_ returns host memory.";
         }
+
         valid_ops.emplace_back(KeyOp{
             .original_index = i,
             .key = key,
@@ -5085,7 +5086,8 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
         auto runtime_accelerator =
             device::GetAcceleratorRegistry().RuntimeAccelerators();
         void *dst = static_cast<char *>(buffer) + dst_offset;
-        if (runtime_accelerator.FindDeviceForPointer(dst) &&
+        if (!replica.is_shared_kv_replica() &&
+            runtime_accelerator.FindDeviceForPointer(dst) &&
             ((!client_->CanUseLocalMemcpy(replica) &&
               !can_use_direct_memory_read(replica, dst, total_size)) ||
              client_->IsHotCacheEnabled())) {
@@ -8264,6 +8266,12 @@ std::vector<int> RealClient::batch_put_session_start(
             keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
     }
 
+    // Session writes do not yet assemble and store shared KV values.
+    if (config.shared_nvme_kv_replica_num > 0) {
+        return std::vector<int>(
+            keys.size(), static_cast<int>(toInt(ErrorCode::NOT_SUPPORTED)));
+    }
+
     const auto write_mode = DetermineReplicaWriteMode(config);
     if (config.nof_replica_num > 0 &&
         write_mode != ReplicaWriteMode::FLEXIBLE_DUAL_REPLICA) {
@@ -8839,10 +8847,10 @@ RealClient::batch_get_into_multi_buffers_internal(
         std::vector<Slice> key_slices;
         key_slices.reserve(buffers.size());
         if (replica.is_memory_replica() || replica.is_nof_replica() ||
+            replica.is_shared_kv_replica() ||
             (replica.is_dfs_replica() &&
              can_use_direct_dfs_read(replica, buffers))) {
-            // MEMORY / NOF: RDMA directly to the user buffers. DFS into host
-            // memory: the fs adapter reads directly to the user buffers.
+            // Pass caller buffers directly to Client::BatchGet.
             for (size_t j = 0; j < buffers.size(); ++j) {
                 key_slices.emplace_back(Slice{buffers[j], sizes[j]});
             }
