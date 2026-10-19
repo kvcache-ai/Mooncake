@@ -1341,6 +1341,9 @@ int RdmaEndPoint::submitPostSend(
         wr_count = std::min(wr_count, cq_remaining);
         if (wr_count <= 0) continue;
 
+        // All WRs of this chain go out in one ibv_post_send below, so stamp
+        // them with one clock read rather than one per WR under lock_.
+        const int64_t post_ts = getCurrentTimeInNano();
         for (int i = 0; i < wr_count; ++i) {
             auto *slice = slice_list[start + i];
             auto &sge = sge_list[i];
@@ -1362,7 +1365,7 @@ int RdmaEndPoint::submitPostSend(
             wr.next = (i + 1 == wr_count) ? nullptr : &wr_list[i + 1];
             wr.wr.rdma.remote_addr = slice->rdma.dest_addr;
             wr.wr.rdma.rkey = slice->rdma.dest_rkey;
-            slice->ts = getCurrentTimeInNano();
+            slice->ts = post_ts;
             slice->status = Transport::Slice::POSTED;
             slice->rdma.qp_depth = &wr_depth_list_[qp_index];
             slice->rdma.qp_index = static_cast<int>(qp_index);
