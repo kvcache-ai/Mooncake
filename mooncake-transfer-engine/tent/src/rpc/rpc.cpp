@@ -281,7 +281,13 @@ Lazy<std::pair<Status, std::string>> CoroRpcAgent::callCoroutine(
                     ", func_id: " + std::to_string(func_id) +
                     ", message: " + std::string{conn_result.message()};
                 if (attempt + 1 < max_attempts) continue;
-                if (options.peer_unreachable) *options.peer_unreachable = true;
+                // coro_rpc reports every failed dial but its own timeout as
+                // not_connected, and a refusal may be a peer restarting on
+                // the same address, so only a timeout marks the peer.
+                if (options.peer_unreachable &&
+                    conn_result == coro_rpc::errc::timed_out) {
+                    *options.peer_unreachable = true;
+                }
                 co_return std::make_pair(
                     Status::RpcConnectionError(msg + LOC_MARK), "");
             }
@@ -305,12 +311,10 @@ Lazy<std::pair<Status, std::string>> CoroRpcAgent::callCoroutine(
                        ", func_id: " + std::to_string(func_id) +
                        ", message: " + std::string{call_result.error().msg};
             if (attempt + 1 < max_attempts) continue;
-            // A local error on an idle pooled connection only says it is
-            // stale; a timeout, or no answer on a connection made for this
-            // call, does not.
-            if (options.peer_unreachable && !answered &&
-                (call_result.error().code == coro_rpc::errc::timed_out ||
-                 !from_pool)) {
+            // A connection closed without an answer, fresh or pooled, is a
+            // stale socket or a peer restarting; only a timeout is silence.
+            if (options.peer_unreachable &&
+                call_result.error().code == coro_rpc::errc::timed_out) {
                 *options.peer_unreachable = true;
             }
             co_return std::make_pair(Status::RpcServiceError(msg + LOC_MARK),

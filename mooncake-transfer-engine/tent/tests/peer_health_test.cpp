@@ -235,8 +235,8 @@ TEST(PeerHealthTest, DisabledNeverFailsFast) {
     EXPECT_TRUE(health.unreachablePeers().empty());
 }
 
-// A refused connect marks the peer; a probe of it still dials.
-TEST(PeerHealthTest, RefusedConnectMarksThePeer) {
+// A refused connect does not mark the peer: it may be restarting in place.
+TEST(PeerHealthTest, RefusedConnectDoesNotMarkThePeer) {
     auto& health = PeerHealth::instance();
     health.clear();
     health.configure(config());
@@ -244,11 +244,50 @@ TEST(PeerHealthTest, RefusedConnectMarksThePeer) {
 
     const Status first = ControlClient::probe(addr);
     EXPECT_TRUE(first.IsRpcServiceError()) << first.ToString();
-    EXPECT_TRUE(health.shouldFailFast(addr));
-    const Status again = ControlClient::probe(addr);
-    EXPECT_EQ(again.message().find("marked unreachable"),
-              std::string_view::npos)
-        << again.ToString();
+    EXPECT_FALSE(health.shouldFailFast(addr));
+    EXPECT_TRUE(health.unreachablePeers().empty());
+    health.clear();
+}
+
+// A call refused while the peer is down must not turn away the first call
+// once it is back on the same address.
+TEST(PeerHealthTest, ARestartedPeerIsUsableAtOnce) {
+    auto& health = PeerHealth::instance();
+    health.clear();
+    health.configure(config());
+    std::atomic<int> notified{0};
+    const auto count = [&](const std::string_view&, std::string&) {
+        ++notified;
+    };
+    Notification notifi;
+    notifi.name = "n";
+    notifi.msg = "m";
+    uint16_t port = 0;
+    std::string addr;
+    {
+        CoroRpcAgent peer;
+        ASSERT_TRUE(peer.registerFunction(Notify, count).ok());
+        ASSERT_TRUE(peer.start(port).ok());
+        addr = "127.0.0.1:" + std::to_string(port);
+        onFreshThread(
+            [&] { EXPECT_TRUE(ControlClient::notify(addr, notifi).ok()); });
+    }
+    onFreshThread([&] {
+        const Status refused = ControlClient::notify(addr, notifi);
+        EXPECT_TRUE(refused.IsRpcConnectionError()) << refused.ToString();
+    });
+
+    CoroRpcAgent peer;  // a new object: stop() leaves running_ set
+    ASSERT_TRUE(peer.registerFunction(Notify, count).ok());
+    uint16_t same_port = port;
+    ASSERT_TRUE(peer.start(same_port).ok());
+    ASSERT_EQ(same_port, port) << "port drifted";
+    onFreshThread([&] {
+        const Status status = ControlClient::notify(addr, notifi);
+        EXPECT_TRUE(status.ok()) << status.ToString();
+    });
+    EXPECT_EQ(notified.load(), 2);
+    EXPECT_FALSE(health.shouldFailFast(addr));
     health.clear();
 }
 
