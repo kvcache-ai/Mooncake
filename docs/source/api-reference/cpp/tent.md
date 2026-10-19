@@ -289,7 +289,7 @@ struct TransferStatus {
 ```
 
 - `s`: Current status of the transfer.
-- `transferred_bytes`: Number of bytes successfully transferred (lower bound).
+- `transferred_bytes`: Number of bytes successfully transferred (lower bound). In-flight `PENDING` polls that skip the owner walk leave this at 0; the completion walk fills the total.
 
 ### Data Transfer
 
