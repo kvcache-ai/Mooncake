@@ -589,6 +589,29 @@ TEST_F(WorkerPoolRailStateTest,
     EXPECT_EQ(WorkerPoolTestPeer::recoveryActivateAfter(*worker_pool_), 0u);
 }
 
+TEST_F(WorkerPoolRailStateTest, PortPollLeavesNonPortErrFatalEventsInactive) {
+    port_state_probe = [](ibv_port_state *state) {
+        *state = IBV_PORT_ACTIVE;
+        return 0;
+    };
+    const ibv_event_type events[] = {
+        IBV_EVENT_DEVICE_FATAL,
+        IBV_EVENT_CQ_ERR,
+        IBV_EVENT_WQ_FATAL,
+        IBV_EVENT_LID_CHANGE,
+    };
+    for (ibv_event_type event : events) {
+        WorkerPoolTestPeer::contextEvent(*worker_pool_, event);
+        EXPECT_FALSE(WorkerPoolTestPeer::contextActive(*worker_pool_));
+        EXPECT_EQ(WorkerPoolTestPeer::recoveryActivateAfter(*worker_pool_), 0u);
+        WorkerPoolTestPeer::resumePausedContext(*worker_pool_);
+        EXPECT_EQ(WorkerPoolTestPeer::recoveryActivateAfter(*worker_pool_), 0u)
+            << ibv_event_type_str(event);
+        EXPECT_FALSE(WorkerPoolTestPeer::contextActive(*worker_pool_))
+            << ibv_event_type_str(event);
+    }
+}
+
 TEST_F(WorkerPoolRailStateTest, PortPollDoesNotStealBreakerOwnedPause) {
     WorkerPoolTestPeer::setContextActive(*worker_pool_, true);
     for (int i = 0; i < WorkerPoolTestPeer::contextFailureThreshold(); ++i)
