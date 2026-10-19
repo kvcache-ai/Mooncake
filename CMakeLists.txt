@@ -166,6 +166,8 @@ if(WITH_CONDUCTOR_RUST)
   endif()
   message(STATUS "Mooncake Conductor Rust bindings will be built")
   add_subdirectory(mooncake-conductor/rust)
+endif()
+
 if (WITH_STORE_RS)
   message(STATUS "Mooncake Store Rust-native implementation (store-rs) will be built")
   add_subdirectory(mooncake-store-rs)
