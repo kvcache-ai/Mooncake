@@ -11341,16 +11341,18 @@ bool MasterService::BatchEvict(double evict_ratio_target,
                 size_t shard_pending_offloads = 0;
                 for (const auto& [tenant_id, tenant_state] : shard->tenants) {
                     shard_metadata_count += tenant_state.metadata.size();
-                    shard_pending_offloads +=
-                        tenant_state.offloading_tasks.size();
-                    for (const auto& [task_key, task] :
-                         tenant_state.offloading_tasks) {
-                        if (task.start_time < local_oldest_offload[t]) {
-                            local_oldest_offload[t] = task.start_time;
-                        }
-                    }
                     for (auto it = tenant_state.metadata.begin();
                          it != tenant_state.metadata.end(); ++it) {
+                        // The in-flight offload lives on the object's record;
+                        // count it before any skip below so hard-pinned or
+                        // leased objects still take room.
+                        const auto& task = it->second.state.offloading_task;
+                        if (task) {
+                            shard_pending_offloads++;
+                            if (task->start_time < local_oldest_offload[t]) {
+                                local_oldest_offload[t] = task->start_time;
+                            }
+                        }
                         if (it->second.metadata.IsHardPinned()) continue;
                         bool has_evictable =
                             can_evict_replicas(it->second.metadata);
