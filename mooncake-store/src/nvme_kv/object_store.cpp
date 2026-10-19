@@ -393,7 +393,8 @@ NvmeKvObjectStore::FindCachedManifest(const NvmeKvObjectKey &key,
     std::shared_lock<std::shared_mutex> lock(manifest_cache_mutex_);
     const auto it = manifest_cache_.find(key.logical_key);
     if (it == manifest_cache_.end() ||
-        it->second->payload_size != payload_size) {
+        it->second->payload_size != payload_size ||
+        it->second->allocation_id != key.allocation_id) {
         return nullptr;
     }
     return it->second;
@@ -412,6 +413,7 @@ NvmeKvObjectStore::CacheManifest(
         return nullptr;
     }
     auto manifest = std::make_shared<const CachedManifest>(CachedManifest{
+        .allocation_id = key.allocation_id,
         .resolved_slot = resolved_slot,
         .payload_size = static_cast<uint32_t>(payload_size),
         .chunk_records = chunk_records,
@@ -423,7 +425,8 @@ NvmeKvObjectStore::CacheManifest(
     if (inserted) {
         return manifest;
     }
-    if (it->second->payload_size == payload_size &&
+    if (it->second->allocation_id == key.allocation_id &&
+        it->second->payload_size == payload_size &&
         it->second->resolved_slot == resolved_slot &&
         ManifestChunkRecordsEqual(it->second->chunk_records, chunk_records)) {
         return it->second;

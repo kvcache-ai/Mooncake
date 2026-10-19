@@ -18,6 +18,7 @@ namespace mooncake {
 
 struct NvmeKvObjectKey {
     std::string logical_key;
+    std::optional<uint64_t> allocation_id;
 };
 
 struct NvmeKvReadRoot {
@@ -76,7 +77,7 @@ class NvmeKvObjectPolicy {
 
     /**
      * @brief Computes a physical address without submitting I/O.
-     * @param key Logical identity used by this backend.
+     * @param key Logical identity and optional allocation ID.
      * @param slot Local collision slot; ignored by allocation-based addressing.
      * @param part_index Zero for the root, or chunk index plus one.
      * @note Callers must first validate backend-specific key requirements.
@@ -165,6 +166,7 @@ class NvmeKvObjectStore final {
     using PhysicalKey = NvmeKvPhysicalKey;
 
     struct CachedManifest {
+        std::optional<uint64_t> allocation_id;
         uint32_t resolved_slot = 0;
         uint32_t payload_size = 0;
         std::vector<NvmeKvManifestChunkRecord> chunk_records;
