@@ -254,7 +254,7 @@ TEST_F(TcpRegression, ServerChecksEveryRegistrationPermission) {
             // Direct RPC bypasses client-side registration/routing policy.
             auto status = call(engine->getSegmentName(),
                                reinterpret_cast<uint64_t>(data.data()),
-                               local.data(), local.size());
+                               local.data(), local.size(), 0, 0, 0);
             EXPECT_EQ(status.ok(), allowed) << status.ToString();
             if (!allowed) {
                 EXPECT_NE(status.ToString().find("permission denied"),
@@ -298,7 +298,7 @@ TEST_F(TcpRegression, PayloadCapsRejectBeforeAllocationOrDataRpc) {
             EXPECT_NO_THROW({
                 EXPECT_TRUE(call(address,
                                  reinterpret_cast<uint64_t>(data.data()),
-                                 data.data(), length)
+                                 data.data(), length, 0, 0, 0)
                                 .IsInvalidArgument());
             });
         }
@@ -316,14 +316,20 @@ TEST_F(TcpRegression, MalformedWriteLengthCannotOverflowOrModifyTarget) {
     CoroRpcAgent rpc;
     for (size_t length : {size_t{1}, kTcpMaxWriteBytes + 1,
                           std::numeric_limits<size_t>::max()}) {
-        XferDataDesc header{htole64(reinterpret_cast<uint64_t>(data.data())),
-                            htole64(length)};
+        LegacyXferDataDesc header{
+            htole64(reinterpret_cast<uint64_t>(data.data())), htole64(length)};
         std::string request(reinterpret_cast<char*>(&header), sizeof(header));
         std::string response;
         ASSERT_TRUE(
             rpc.call(engine->getSegmentName(), SendData, request, response)
                 .ok());
-        EXPECT_EQ(response, "SendData failed: invalid request size");
+        // The v2 parser rejects the legacy header before any copy: the
+        // declared length can never match a request that carries no payload.
+        EXPECT_EQ(response.rfind("SendData failed: InvalidArgument: invalid "
+                                 "transfer request size",
+                                 0),
+                  0u)
+            << response;
         EXPECT_EQ(data, original);
     }
 }
