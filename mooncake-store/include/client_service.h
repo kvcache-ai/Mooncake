@@ -31,6 +31,10 @@
 
 namespace mooncake {
 
+class NvmeKvObjectStore;
+class SharedNvmeKvBackend;
+struct SharedKvIORequest;
+
 class PutOperation;
 class DistributedStorageBackend;
 
@@ -111,6 +115,11 @@ class Client {
     using WriteBufferStager =
         std::function<tl::expected<std::vector<Slice>, ErrorCode>(
             const std::vector<Slice>&)>;
+
+    // Configure once before IO; every host must use the same ordered NS list.
+    // Each object resides entirely in one namespace, selected by its key hash.
+    void SetSharedKvBackends(
+        std::vector<std::shared_ptr<NvmeKvObjectStore>> backends);
 
     const UUID& getClientId() const { return client_id_; }
     const std::string& tenant_id() const { return master_client_.tenant_id(); }
@@ -1123,6 +1132,17 @@ class Client {
         const ReplicateConfig& config, const std::vector<PutOperation>& ops,
         const std::vector<size_t>& indices) const;
 
+    // Shared NVMe KV IO helpers.
+    tl::expected<void, ErrorCode> InitSharedNvmeKv();
+
+    void SubmitSharedKvWrites(std::vector<PutOperation>& ops);
+
+    std::vector<tl::expected<void, ErrorCode>> ReadSharedKvReplicas(
+        const std::vector<SharedKvIORequest>& requests);
+
+    std::vector<tl::expected<void, ErrorCode>> WriteSharedKvReplicas(
+        const std::vector<SharedKvIORequest>& requests);
+
     // Client identification
     const UUID client_id_;
 
@@ -1177,6 +1197,7 @@ class Client {
     ThreadPool write_thread_pool_;
     std::shared_ptr<StorageBackend> storage_backend_;
     std::shared_ptr<DistributedStorageBackend> dfs_storage_backend_;
+    std::shared_ptr<SharedNvmeKvBackend> shared_kv_backend_;
 
     // Probe used by healDanglingLocalDiskReplica to prove a completed
     // LOCAL_DISK replica's backing file is gone. Installed by the owner of
