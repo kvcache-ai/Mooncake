@@ -84,8 +84,7 @@ def test_ep_profiles_cover_current_torch_abi(tmp_path, architecture, variant):
         text=True,
     )
     environment = environment_file.read_text()
-    assert "EP_TORCH_VERSIONS" not in environment
-    assert "ep_versions" not in profile["run"]
+    assert ("2.14.0" in environment) == (variant != "non-cuda")
     if variant == "non-cuda":
         assert "-DUSE_CUDA=OFF" in environment
         assert "-DWITH_EP=OFF" in environment
