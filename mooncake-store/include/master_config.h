@@ -121,6 +121,7 @@ struct MasterConfig {
     bool enable_offload;
     std::string ha_backend_type;
     std::string ha_backend_connstring;
+    int64_t ha_leader_lease_ttl_sec = DEFAULT_MASTER_VIEW_LEASE_TTL_SEC;
     std::string etcd_endpoints;
 
     // OpLog store configuration
@@ -257,6 +258,7 @@ class MasterServiceSupervisorConfig {
     uint32_t handler_worker_thread_num = 0;
     std::string ha_backend_type = "etcd";
     std::string ha_backend_connstring;
+    int64_t ha_leader_lease_ttl_sec = DEFAULT_MASTER_VIEW_LEASE_TTL_SEC;
     std::string etcd_endpoints = "0.0.0.0:2379";
     // OpLog store configuration
     bool enable_oplog = false;
@@ -393,6 +395,7 @@ class MasterServiceSupervisorConfig {
         rpc_enable_tcp_no_delay = config.rpc_enable_tcp_no_delay;
         handler_worker_thread_num = config.handler_worker_thread_num;
         ha_backend_type = config.ha_backend_type;
+        ha_leader_lease_ttl_sec = config.ha_leader_lease_ttl_sec;
         etcd_endpoints = config.etcd_endpoints;
         ha_backend_connstring = ResolveConfiguredHABackendConnstring(
             ha_backend_type, config.ha_backend_connstring, etcd_endpoints);
