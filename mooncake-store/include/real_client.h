@@ -1377,6 +1377,7 @@ class RealClient : public PyClient {
         bool enable_embedded_master);
 
     friend class DirectGpuReadTest;
+    friend class test::PrefetchTeardownTest;
 
     bool can_use_direct_memory_read(const Replica::Descriptor &replica,
                                     void *buffer, size_t size) const;

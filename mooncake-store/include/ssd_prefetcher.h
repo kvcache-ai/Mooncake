@@ -13,7 +13,9 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <latch>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -66,6 +68,20 @@ class SsdPrefetcher {
                           const std::vector<int64_t>& sizes,
                           const std::string& tenant_id);
 
+    // Stop accepting new work, then drain and join the pool. Must run before
+    // client teardown releases resources the jobs reference: jobs capture
+    // shared_ptrs locked at submission, so a job blocked on its metadata RPC
+    // keeps Client alive past client_.reset(), and segment memory must not be
+    // released while such a job is still running. Idempotent; after Shutdown,
+    // TriggerPrefetch no-ops and SubmitJob drops.
+    void Shutdown();
+
+    // Test-only hook (prefetch_teardown_test): when set, every pool job waits
+    // on this latch before running. Never set in production.
+    void SetJobGateForTest(std::shared_ptr<std::latch> gate) {
+        job_gate_for_test_ = std::move(gate);
+    }
+
    private:
     // Submit to the bounded pool; drop the job when the pool is unavailable
     // (shutting down). Never falls back to a detached thread: an unbounded
@@ -79,6 +95,10 @@ class SsdPrefetcher {
     std::weak_ptr<FileStorage> file_storage_;
     std::weak_ptr<ClientRequester> client_requester_;
     std::string local_rpc_addr_;
+
+    // Serializes the pool check+enqueue against Shutdown's pool handoff.
+    std::mutex submit_mutex_;
+    std::shared_ptr<std::latch> job_gate_for_test_;
 
     // Fixed-size worker pool; bounds concurrent SSD reads / DRAM allocations.
     static constexpr size_t kPrefetchThreadPoolSize = 4;

@@ -1792,6 +1792,15 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
         return {};
     }
 
+    // Drain the prefetch pool before any resource release below. Pool jobs
+    // capture shared_ptrs locked at submission, so a job blocked on its
+    // metadata RPC keeps Client alive past client_.reset(); segment memory
+    // must not be released (and must not stay registered with TE / published
+    // on the master) while such a job is still running.
+    if (prefetcher_) {
+        prefetcher_->Shutdown();
+    }
+
     stop_ipc_server();
     stop_dummy_client_monitor();
     stop_http_server();

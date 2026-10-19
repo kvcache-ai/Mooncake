@@ -149,13 +149,41 @@ void SsdPrefetcher::Init(std::weak_ptr<Client> client,
     LOG(INFO) << "SSD prefetch runtime: pool_size=" << kPrefetchThreadPoolSize;
 }
 
+void SsdPrefetcher::Shutdown() {
+    // Stop accepting new work first; TriggerPrefetch checks initialized_.
+    if (!initialized_.exchange(false)) {
+        return;  // never initialized, or already shut down
+    }
+    // Hand the pool out under the submit lock so a racing SubmitJob sees
+    // prefetch_pool_ == nullptr and drops instead of touching a draining
+    // pool. stop() runs queued and in-flight jobs to completion and joins
+    // the workers; a job blocked on an RPC finishes when the RPC returns
+    // (client RPCs carry timeouts), while the master connection is still up
+    // because teardown calls this before resetting the client.
+    std::unique_ptr<ThreadPool> pool;
+    {
+        std::lock_guard<std::mutex> lock(submit_mutex_);
+        pool = std::move(prefetch_pool_);
+    }
+    if (pool) {
+        pool->stop();
+    }
+}
+
 void SsdPrefetcher::SubmitJob(std::function<void()> job) {
+    std::lock_guard<std::mutex> lock(submit_mutex_);
     if (!prefetch_pool_) {
         VLOG(1) << "SSD prefetch: pool unavailable, dropping job";
         return;
     }
+    auto gate = job_gate_for_test_;
     try {
-        prefetch_pool_->enqueue(std::move(job));
+        prefetch_pool_->enqueue([gate, job = std::move(job)]() mutable {
+            if (gate) {
+                gate->wait();
+            }
+            job();
+        });
     } catch (const std::exception& e) {
         // Pool stopped (shutdown in progress): drop the best-effort job.
         VLOG(1) << "SSD prefetch: pool enqueue failed (" << e.what()

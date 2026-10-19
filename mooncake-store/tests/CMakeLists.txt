@@ -287,6 +287,7 @@ add_store_test(client_host_identity_config_test
 add_store_test(client_readonly_query_test client_readonly_query_test.cpp)
 add_store_test(prefetch_throttle_test prefetch_throttle_test.cpp)
 add_store_test(prefetch_task_master_test prefetch_task_master_test.cpp)
+add_store_test(prefetch_teardown_test prefetch_teardown_test.cpp)
 add_store_test(client_metric_config_test client_metric_config_test.cpp)
 add_test(
   NAME client_metric_cluster_id_test

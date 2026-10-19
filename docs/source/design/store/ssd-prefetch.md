@@ -77,7 +77,11 @@ Per-client `PrefetchThrottle` (sharded, lock-free fast path per shard):
   disables the backoff.
 - All prefetch work runs on a fixed-size thread pool (4 workers). If the pool
   is down (shutdown), the job is dropped — prefetch never spawns a thread per
-  probe and never falls back to unbounded detached threads.
+  probe and never falls back to unbounded detached threads. Client teardown
+  drains the pool before releasing resources: `Shutdown()` refuses new work,
+  then runs queued and in-flight jobs to completion and joins the workers,
+  because jobs capture `shared_ptr`s locked at submission and must not
+  outlive the client/segment teardown beneath them.
 - Every failure past `PromotionAllocStart` releases the master-side staged
   state eagerly (`NotifyPromotionFailure`, RAII guard) instead of waiting for
   the reaper TTL.
