@@ -20,6 +20,15 @@
 
 namespace mooncake {
 
+enum class ProbeLeaseMode : uint8_t { None = 0, LastHitOnly = 1 };
+
+// Candidates are consecutive groups of candidate_size keys in caller order.
+// None preserves the lease-free existence probe and ignores candidate_size.
+struct GrantLeasePolicy {
+    ProbeLeaseMode lease_mode{ProbeLeaseMode::None};
+    uint64_t candidate_size{1};
+};
+
 // Constants
 static constexpr uint64_t WRONG_VERSION = 0;
 static constexpr uint64_t DEFAULT_VALUE = UINT64_MAX;
