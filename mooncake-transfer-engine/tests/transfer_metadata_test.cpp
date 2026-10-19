@@ -240,7 +240,7 @@ TEST(TransferMetadataRemovalTest, MissingProtocolNeverDeletesOtherProtocol) {
 }
 
 TEST(TransferMetadataRemovalTest, LegacyRemovalSupportsUniqueUntaggedBuffer) {
-    // Ascend/Barex and older callers may not populate BufferDesc.protocol.
+    // External legacy callers may not populate BufferDesc.protocol.
     TransferMetadata metadata(P2PHANDSHAKE);
     auto segment = std::make_shared<TransferMetadata::SegmentDesc>();
     segment->name = "untagged-buffer-test";
@@ -317,8 +317,11 @@ TEST(TransferMetadataRemovalTest,
 }
 
 TEST(TransferMetadataRemovalTest, ExplicitProtocolNeverFallsBackToLegacy) {
-    for (const char *protocol : {"tcp", "rdma", "maca", "hip", "cxl", "shm",
-                                 "flagcx", "musa", "hylink"}) {
+    for (const char *protocol :
+         {"tcp",     "rdma",          "maca",   "hip",    "cxl",          "shm",
+          "flagcx",  "musa",          "hylink", "nvlink", "nvlink_intra", "ub",
+          "ubshmem", "ascend_direct", "hccl",   "nccl",   "barex",        "efa",
+          "cxi",     "sunrise_link"}) {
         SCOPED_TRACE(protocol);
         TransferMetadata metadata(P2PHANDSHAKE);
         auto segment = std::make_shared<TransferMetadata::SegmentDesc>();

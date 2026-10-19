@@ -672,6 +672,9 @@ int IntraNodeNvlinkTransport::registerLocalMemory(void *addr, size_t length,
 
     (void)remote_accessible;
     BufferDesc desc;
+#ifdef ENABLE_MULTI_PROTOCOL
+    desc.protocol = "nvlink_intra";
+#endif
     desc.addr = (uint64_t)base_ptr;
     desc.length = alloc_size;
     desc.name = location;
@@ -704,7 +707,8 @@ int IntraNodeNvlinkTransport::unregisterLocalMemory(void *addr,
         std::lock_guard<std::mutex> lock(register_mutex_);
         registered_base_addrs_.erase((uint64_t)key_ptr);
     }
-    return metadata_->removeLocalMemoryBuffer(key_ptr, update_metadata);
+    return metadata_->removeLocalMemoryBuffer(key_ptr, update_metadata,
+                                              "nvlink_intra");
 }
 
 int IntraNodeNvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,

@@ -9,7 +9,10 @@
 #include <vector>
 
 #include "common.h"
+#include "multi_transport.h"
+#include "transfer_engine_impl.h"
 #include "transfer_metadata.h"
+#include "transport/local_buffer_registrations.h"
 #include "transport/shm_transport/shm_transport.h"
 #include "transport/transport.h"
 #ifdef USE_CXL
@@ -20,6 +23,21 @@
 #endif
 
 namespace mooncake {
+
+class TransferEngineImplTestPeer {
+   public:
+    static void configure(
+        TransferEngineImpl &engine, std::shared_ptr<TransferMetadata> metadata,
+        const std::vector<std::pair<std::string, std::shared_ptr<Transport>>>
+            &transports) {
+        engine.metadata_ = metadata;
+        engine.local_server_name_ = "127.0.0.1:0";
+        engine.multi_transports_ = std::make_shared<MultiTransport>(
+            metadata, engine.local_server_name_);
+        for (const auto &entry : transports)
+            engine.multi_transports_->transport_map_.emplace(entry);
+    }
+};
 
 // Exercise the actual transport implementations through their virtual methods.
 // The peer only exposes the lifecycle operations normally called by the engine.
@@ -44,6 +62,74 @@ class TransportMetadataRemovalTestPeer {
 
 namespace {
 using Peer = TransportMetadataRemovalTestPeer;
+
+// CPU stand-in for driver-dependent registration. The bookkeeping helper,
+// metadata mutation, and engine overlap registry are the production code.
+class TrackedMetadataTransport : public Transport {
+   public:
+    TrackedMetadataTransport(std::shared_ptr<TransferMetadata> metadata,
+                             std::string protocol, bool skip = false)
+        : protocol_(std::move(protocol)), skip_(skip) {
+        meta() = std::move(metadata);
+    }
+    Status submitTransfer(BatchID,
+                          const std::vector<TransferRequest> &) override {
+        return Status::OK();
+    }
+    Status submitTransferTask(const std::vector<TransferTask *> &) override {
+        return Status::OK();
+    }
+    Status getTransferStatus(BatchID, size_t, TransferStatus &) override {
+        return Status::OK();
+    }
+
+   private:
+    int registerLocalMemory(void *addr, size_t length,
+                            const std::string &location, bool,
+                            bool update) override {
+        if (skip_) return 0;
+        BufferDesc buffer{};
+        buffer.addr = reinterpret_cast<uint64_t>(addr);
+        buffer.length = length;
+        buffer.name = location;
+        buffer.protocol = protocol_;
+        return registrations_.add(
+            addr, addr, length,
+            [&] { return meta()->addLocalMemoryBuffer(buffer, false); }, update,
+            [&] { return meta()->updateLocalSegmentDesc(); });
+    }
+    int unregisterLocalMemory(void *addr, bool update) override {
+        return registrations_.remove(
+            addr,
+            [&](void *base) {
+                return meta()->removeLocalMemoryBuffer(base, false, protocol_);
+            },
+            update, [&] { return meta()->updateLocalSegmentDesc(); });
+    }
+    int registerLocalMemoryBatch(const std::vector<BufferEntry> &buffers,
+                                 const std::string &location) override {
+        for (const auto &buffer : buffers) {
+            int rc = registerLocalMemory(buffer.addr, buffer.length, location,
+                                         true, false);
+            if (rc) return rc;
+        }
+        return meta()->updateLocalSegmentDesc();
+    }
+    int unregisterLocalMemoryBatch(
+        const std::vector<void *> &addresses) override {
+        int first_error = 0;
+        for (void *addr : addresses) {
+            int rc = unregisterLocalMemory(addr, false);
+            if (rc && !first_error) first_error = rc;
+        }
+        int rc = meta()->updateLocalSegmentDesc();
+        return first_error ? first_error : rc;
+    }
+    const char *getName() const override { return protocol_.c_str(); }
+    std::string protocol_;
+    bool skip_;
+    LocalBufferRegistrations registrations_;
+};
 
 class MetadataRemovalTest : public ::testing::Test {
    protected:
@@ -79,6 +165,74 @@ class MetadataRemovalTest : public ::testing::Test {
     std::string name = "127.0.0.1:0";
     std::shared_ptr<TransferMetadata> metadata;
 };
+
+TEST_F(MetadataRemovalTest, EngineSkippedTransportAllowsReregistration) {
+    for (const char *skipped : {"hylink", "nvlink", "musa"}) {
+        TransferEngineImpl engine;
+        TransferEngineImplTestPeer::configure(
+            engine, metadata,
+            {{"tcp",
+              std::make_shared<TrackedMetadataTransport>(metadata, "tcp")},
+             {skipped, std::make_shared<TrackedMetadataTransport>(
+                           metadata, skipped, true)}});
+        std::vector<char> buffer(4096);
+        for (int repeat = 0; repeat < 2; ++repeat) {
+            ASSERT_EQ(engine.registerLocalMemory(buffer.data(), buffer.size(),
+                                                 "cpu:0", true, false),
+                      0);
+            ASSERT_EQ(engine.unregisterLocalMemory(buffer.data(), false), 0);
+            EXPECT_TRUE(metadata->getSegmentDescByID(LOCAL_SEGMENT_ID)
+                            ->buffers.empty());
+        }
+    }
+}
+
+TEST_F(MetadataRemovalTest, EngineBatchSkipDoesNotLeaveOverlap) {
+    TransferEngineImpl engine;
+    TransferEngineImplTestPeer::configure(
+        engine, metadata,
+        {{"tcp", std::make_shared<TrackedMetadataTransport>(metadata, "tcp")},
+         {"hylink", std::make_shared<TrackedMetadataTransport>(
+                        metadata, "hylink", true)}});
+    std::vector<char> first(4096), second(4096);
+    for (int repeat = 0; repeat < 2; ++repeat) {
+        ASSERT_EQ(engine.registerLocalMemory(first.data(), first.size(),
+                                             "cpu:0", true, false),
+                  0);
+        ASSERT_EQ(engine.registerLocalMemory(second.data(), second.size(),
+                                             "cpu:0", true, false),
+                  0);
+        ASSERT_EQ(
+            engine.unregisterLocalMemoryBatch({first.data(), second.data()}),
+            0);
+        EXPECT_TRUE(
+            metadata->getSegmentDescByID(LOCAL_SEGMENT_ID)->buffers.empty());
+    }
+}
+
+TEST_F(MetadataRemovalTest, FormerlyUntaggedOwnersAreIndependentlyRemovable) {
+    for (bool reverse : {false, true}) {
+        const std::vector<std::string> tags =
+            reverse
+                ? std::vector<std::string>{"ascend_direct", "ub", "ubshmem"}
+                : std::vector<std::string>{"ubshmem", "ub", "ascend_direct"};
+        std::vector<char> buffer(4096);
+        std::vector<std::unique_ptr<TrackedMetadataTransport>> transports;
+        for (const auto &tag : tags) {
+            transports.push_back(
+                std::make_unique<TrackedMetadataTransport>(metadata, tag));
+            ASSERT_EQ(Peer::registerMemory(*transports.back(), buffer.data()),
+                      0);
+        }
+        for (size_t i = 0; i < transports.size(); ++i) {
+            ASSERT_EQ(Peer::unregisterMemory(*transports[i], buffer.data()), 0);
+            const auto segment = metadata->getSegmentDescByID(LOCAL_SEGMENT_ID);
+            ASSERT_EQ(segment->buffers.size(), transports.size() - i - 1);
+            for (size_t j = 0; j < segment->buffers.size(); ++j)
+                EXPECT_EQ(segment->buffers[j].protocol, tags[i + j + 1]);
+        }
+    }
+}
 
 TEST_F(MetadataRemovalTest, ShmSkippedRegistrationPreservesRdma) {
     ShmTransport transport;

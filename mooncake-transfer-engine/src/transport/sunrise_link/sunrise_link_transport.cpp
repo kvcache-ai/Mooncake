@@ -399,6 +399,9 @@ int SunriseLinkTransport::registerLocalMemory(void* addr, size_t length,
     }
 
     BufferDesc desc;
+#ifdef ENABLE_MULTI_PROTOCOL
+    desc.protocol = "sunrise_link";
+#endif
     desc.addr = reinterpret_cast<uint64_t>(addr);
     desc.length = length;
     desc.name = location;
@@ -412,7 +415,8 @@ int SunriseLinkTransport::unregisterLocalMemory(void* addr,
         std::lock_guard<std::mutex> guard(register_mutex_);
         registered_regions_.erase(addr);
     }
-    return metadata_->removeLocalMemoryBuffer(addr, update_metadata);
+    return metadata_->removeLocalMemoryBuffer(addr, update_metadata,
+                                              "sunrise_link");
 }
 
 int SunriseLinkTransport::registerLocalMemoryBatch(

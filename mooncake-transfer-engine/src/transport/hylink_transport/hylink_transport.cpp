@@ -638,10 +638,31 @@ int HylinkTransport::registerLocalMemory(void* addr, size_t length,
     }
     desc.shm_name = cached->second;
     (void)hipSetDevice(saved);
+#ifdef ENABLE_MULTI_PROTOCOL
+    return published_buffers_.add(
+        addr, reinterpret_cast<void*>(desc.addr), desc.length,
+        [&] { return metadata_->addLocalMemoryBuffer(desc, false); },
+        update_metadata, [&] { return metadata_->updateLocalSegmentDesc(); });
+#else
     return metadata_->addLocalMemoryBuffer(desc, update_metadata);
+#endif
 }
 
 int HylinkTransport::unregisterLocalMemory(void* addr, bool update_metadata) {
+#ifdef ENABLE_MULTI_PROTOCOL
+    std::lock_guard<std::mutex> lock(register_mutex_);
+    void* base = published_buffers_.baseFor(addr);
+    const int rc = published_buffers_.remove(
+        addr,
+        [&](void* published_base) {
+            return metadata_->removeLocalMemoryBuffer(published_base, false,
+                                                      "hylink");
+        },
+        update_metadata, [&] { return metadata_->updateLocalSegmentDesc(); });
+    if (rc == 0 && base && !published_buffers_.containsBase(base))
+        registered_exports_.erase(reinterpret_cast<uint64_t>(base));
+    return rc;
+#else
     hipDeviceptr_t base = nullptr;
     size_t alloc_size = 0;
     uint64_t key = reinterpret_cast<uint64_t>(addr);
@@ -658,6 +679,7 @@ int HylinkTransport::unregisterLocalMemory(void* addr, bool update_metadata) {
     }
     return metadata_->removeLocalMemoryBuffer(reinterpret_cast<void*>(key),
                                               update_metadata, "hylink");
+#endif
 }
 
 int HylinkTransport::relocateSharedMemoryAddress(uint64_t& dest_addr,

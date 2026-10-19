@@ -17,6 +17,9 @@
 #include "topology.h"
 #include "transfer_metadata.h"
 #include "transport/transport.h"
+#ifdef ENABLE_MULTI_PROTOCOL
+#include "transport/local_buffer_registrations.h"
+#endif
 #include "transport/hip_transport/event_pool.h"
 #include "transport/hip_transport/stream_pool.h"
 
@@ -91,6 +94,9 @@ class HipTransport : public Transport {
     bool use_fabric_mem_;
 
     std::mutex register_mutex_;
+#ifdef ENABLE_MULTI_PROTOCOL
+    LocalBufferRegistrations published_buffers_;
+#else
     // Only published registrations belong to HIP. Host/local-only buffers
     // skipped during registration must also be skipped during unregistration.
     // Fabric descriptors use the allocation base rather than the input pointer.
@@ -99,6 +105,7 @@ class HipTransport : public Transport {
         bool metadata_removed = false;
     };
     std::unordered_map<void*, LocalRegistration> registered_addresses_;
+#endif
 
     // Stream and event pools for async operations
     StreamPool stream_pool_;

@@ -21,6 +21,9 @@
 #include "transfer_metadata.h"
 #include "transport/nvlink_transport/nvlink_host_numa_allocation.h"
 #include "transport/transport.h"
+#ifdef ENABLE_MULTI_PROTOCOL
+#include "transport/local_buffer_registrations.h"
+#endif
 
 namespace mooncake {
 
@@ -157,6 +160,10 @@ class NvlinkTransport : public Transport {
     std::shared_ptr<GpuIpcTransportPolicy> policy_;
 
     std::mutex register_mutex_;
+#ifdef ENABLE_MULTI_PROTOCOL
+    LocalBufferRegistrations published_buffers_;
+    int unregisterPublishedMemoryLocked(void* addr, bool update_metadata);
+#endif
     int removeLocalMemoryBuffer(void* addr, bool update_metadata);
 #if MOONCAKE_NVLINK_HOST_NUMA_ENABLED
     using AddLocalMemoryBufferOp = std::function<int(const BufferDesc&, bool)>;

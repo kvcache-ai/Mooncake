@@ -313,7 +313,7 @@ if(USE_EFA)
 
   add_executable(efa_select_device_test ${WORKSPACE}/efa_select_device_test.cpp)
   target_link_libraries(efa_select_device_test PUBLIC transfer_engine gtest
-                                                       gtest_main)
+                                                      gtest_main)
   add_test(NAME efa_select_device_test COMMAND efa_select_device_test)
 
   add_executable(efa_c_api_test ${WORKSPACE}/efa_c_api_test.cpp)
@@ -455,11 +455,18 @@ add_test(NAME transfer_metadata_removal_test
          COMMAND transfer_metadata_test
                  --gtest_filter=TransferMetadataRemovalTest.*)
 set_tests_properties(transfer_metadata_removal_test PROPERTIES TIMEOUT 60)
+add_executable(local_buffer_registrations_test
+               ${WORKSPACE}/local_buffer_registrations_test.cpp)
+target_include_directories(local_buffer_registrations_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+target_link_libraries(local_buffer_registrations_test PUBLIC gtest gtest_main)
+add_test(NAME local_buffer_registrations_test
+         COMMAND local_buffer_registrations_test)
 if(ENABLE_MULTI_PROTOCOL)
   add_executable(transport_metadata_removal_test
                  ${WORKSPACE}/transport_metadata_removal_test.cpp)
-  target_link_libraries(transport_metadata_removal_test
-                       PUBLIC transfer_engine gtest gtest_main)
+  target_link_libraries(transport_metadata_removal_test PUBLIC transfer_engine
+                                                               gtest gtest_main)
   add_test(NAME transport_metadata_removal_test
            COMMAND transport_metadata_removal_test)
   set_tests_properties(transport_metadata_removal_test PROPERTIES TIMEOUT 60)

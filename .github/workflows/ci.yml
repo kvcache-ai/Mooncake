@@ -309,14 +309,14 @@ jobs:
         MP: ${{ matrix.mp }}
         MC_METADATA_SERVER: P2PHANDSHAKE
       run: |
-        cmake --build build-metadata --target transfer_metadata_test --parallel 2
+        cmake --build build-metadata --target transfer_metadata_test local_buffer_registrations_test --parallel 2
         if [ "$MP" = ON ]; then
           cmake --build build-metadata --target transport_metadata_removal_test --parallel 2
         fi
         mkdir -p "$PWD/build-metadata/results"
         export GTEST_OUTPUT="xml:$PWD/build-metadata/results/"
         ctest --test-dir build-metadata --verbose --no-tests=error \
-          -R '^(transfer_metadata_removal_test|transport_metadata_removal_test)$'
+          -R '^(transfer_metadata_removal_test|transport_metadata_removal_test|local_buffer_registrations_test)$'
     - name: Check executed test counts
       env:
         MP: ${{ matrix.mp }}
@@ -327,12 +327,14 @@ jobs:
         import pathlib
         import xml.etree.ElementTree as ET
         directory = pathlib.Path('build-metadata/results')
-        expected = {'transfer_metadata_test.xml': 1}
+        expected = {'transfer_metadata_test.xml': 1,
+                    'local_buffer_registrations_test.xml': 8}
         if os.environ['MP'] == 'ON':
             cxl = os.environ['CXL'] == 'ON'
             expected = {
                 'transfer_metadata_test.xml': 12 if cxl else 10,
-                'transport_metadata_removal_test.xml': 5 if cxl else 2,
+                'transport_metadata_removal_test.xml': 8 if cxl else 5,
+                'local_buffer_registrations_test.xml': 8,
             }
         for filename, minimum in expected.items():
             cases = ET.parse(directory / filename).getroot().findall('.//testcase')

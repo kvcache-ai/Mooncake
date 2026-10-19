@@ -335,9 +335,16 @@ TEST(NvlinkHostNumaRegistrationTest, FailedUnregisterKeepsHandleOwned) {
     NvlinkTransport transport;
     NvlinkTransportTestPeer::Configure(transport);
     ASSERT_EQ(NvlinkTransportTestPeer::Register(transport, base, kLength), 0);
+#ifdef ENABLE_MULTI_PROTOCOL
+    // This address was never published by this transport.
+    EXPECT_EQ(NvlinkTransportTestPeer::Unregister(
+                  transport, reinterpret_cast<void*>(0x300000000ULL)),
+              0);
+#else
     EXPECT_NE(NvlinkTransportTestPeer::Unregister(
                   transport, reinterpret_cast<void*>(0x300000000ULL)),
               0);
+#endif
     EXPECT_EQ(driver.release_calls, 0);
     EXPECT_EQ(NvlinkTransportTestPeer::RegistrationCount(transport), 1U);
     EXPECT_EQ(NvlinkTransportTestPeer::Unregister(transport, base), 0);
