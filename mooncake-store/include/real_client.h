@@ -37,6 +37,10 @@
 namespace mooncake {
 
 class RealClient;
+
+namespace test {
+class PrefetchTeardownTest;
+}  // namespace test
 class NvlinkHostNumaAllocation;
 struct EgmStorePoolConfig;
 class RegisteredPinnedRegion;

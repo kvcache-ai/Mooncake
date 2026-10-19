@@ -180,7 +180,8 @@ void SsdPrefetcher::SubmitJob(std::function<void()> job) {
     try {
         prefetch_pool_->enqueue([gate, job = std::move(job)]() mutable {
             if (gate) {
-                gate->wait();
+                gate->arrived.count_down();
+                gate->release.wait();
             }
             job();
         });

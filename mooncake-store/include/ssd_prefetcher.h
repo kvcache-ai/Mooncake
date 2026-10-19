@@ -76,9 +76,14 @@ class SsdPrefetcher {
     // TriggerPrefetch no-ops and SubmitJob drops.
     void Shutdown();
 
-    // Test-only hook (prefetch_teardown_test): when set, every pool job waits
-    // on this latch before running. Never set in production.
-    void SetJobGateForTest(std::shared_ptr<std::latch> gate) {
+    // Test-only hook (prefetch_teardown_test): pool jobs count down
+    // `arrived` as they start, then wait on `release`. Never set in
+    // production.
+    struct JobGateForTest {
+        std::latch arrived{1};
+        std::latch release{1};
+    };
+    void SetJobGateForTest(std::shared_ptr<JobGateForTest> gate) {
         job_gate_for_test_ = std::move(gate);
     }
 
@@ -98,7 +103,7 @@ class SsdPrefetcher {
 
     // Serializes the pool check+enqueue against Shutdown's pool handoff.
     std::mutex submit_mutex_;
-    std::shared_ptr<std::latch> job_gate_for_test_;
+    std::shared_ptr<JobGateForTest> job_gate_for_test_;
 
     // Fixed-size worker pool; bounds concurrent SSD reads / DRAM allocations.
     static constexpr size_t kPrefetchThreadPoolSize = 4;
