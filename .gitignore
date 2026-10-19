@@ -209,3 +209,4 @@ core_*
 # MacOS
 .DS_Store
 .envrc
+.clangd
