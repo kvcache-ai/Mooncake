@@ -772,12 +772,6 @@ int RdmaEndPoint::setupConnectionsByActive() {
         int rc = context_.engine().sendHandshake(peer_server_name, local_desc,
                                                  peer_desc);
 
-        auto response_gid_selection = local_gid_selection;
-        if (!rc && !peer_desc.auto_gid_reprobe_from.empty()) {
-            response_gid_selection = context_.preparePeerGidSelection(
-                peer_nic_path_, peer_desc.auto_gid_reprobe_from);
-        }
-
         bool retry_with_new_gid = false;
         bool should_send_ready_ack = false;
         HandShakeDesc ready_ack_desc;
@@ -847,21 +841,11 @@ int RdmaEndPoint::setupConnectionsByActive() {
                 return rc;
             }
 
-            if (!connected() && response_gid_selection.selection_epoch !=
-                                    local_gid_selection.selection_epoch) {
-                int reset_ret =
-                    resetConnection("apply peer auto GID reprobe advisory");
-                if (reset_ret) return reset_ret;
-                qp_generation = qp_generation_;
-                status_.store(CONNECTING, std::memory_order_relaxed);
-                retry_with_new_gid = true;
-            }
-
             // Handle simultaneous open: if the peer initiates a connection
             // during our RPC and it is passively established in
             // setupConnectionsByPassive, send an explicit ready ACK after this
             // active RPC confirms that the peer's passive QPs are ready.
-            if (!retry_with_new_gid && connected()) {
+            if (connected()) {
                 if ((peer_qp_num_list_ == peer_desc.qp_num &&
                      (!notify_.enabled ||
                       peer_notify_qp_num_ == peer_desc.notify_qp_num))) {
@@ -894,7 +878,7 @@ int RdmaEndPoint::setupConnectionsByActive() {
                 }
             }
 
-            if (!retry_with_new_gid && !should_send_ready_ack) {
+            if (!should_send_ready_ack) {
                 if (!peer_desc.reply_msg.empty()) {
                     LOG(ERROR) << "Rejected handshake request by peer "
                                << local_desc.peer_nic_path;
@@ -913,6 +897,21 @@ int RdmaEndPoint::setupConnectionsByActive() {
                         << ", peer.peer_nic_path: " << peer_desc.peer_nic_path;
                     disconnectUnlocked();
                     return ERR_REJECT_HANDSHAKE;
+                }
+
+                if (!peer_desc.auto_gid_reprobe_from.empty()) {
+                    auto response_gid_selection =
+                        context_.preparePeerGidSelection(
+                            peer_nic_path_, peer_desc.auto_gid_reprobe_from);
+                    if (response_gid_selection.selection_epoch !=
+                        local_gid_selection.selection_epoch) {
+                        int reset_ret = resetConnection(
+                            "apply peer auto GID reprobe advisory");
+                        if (reset_ret) return reset_ret;
+                        qp_generation = qp_generation_;
+                        status_.store(CONNECTING, std::memory_order_relaxed);
+                        continue;
+                    }
                 }
 
                 int ret = ERR_DEVICE_NOT_FOUND;
