@@ -22,6 +22,7 @@
 #include "k8s_lease_helper.h"
 #include "master_admin_service.h"
 #include "rpc_service.h"
+#include "rpc_worker_pool.h"
 
 namespace mooncake {
 namespace ha {
@@ -538,6 +539,13 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         auto wrapped_master_service = std::make_shared<WrappedMasterService>(
             wrapped_config, config.http_metadata_server,
             config.http_metadata_remote_url);
+        // Runs the term's handlers once they are registered. It drains before
+        // the service goes, so release the service through release_service.
+        std::unique_ptr<RpcWorkerPool> worker_pool;
+        auto release_service = [&]() {
+            worker_pool.reset();
+            wrapped_master_service.reset();
+        };
         wrapped_master_service->SetBatchOpLogTerminalCallback(
             [&](const OrderedOpLogWriterTerminalState& state) {
                 serving_state.RequestShutdown([&]() {
@@ -567,7 +575,7 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         if (!restore_result) {
             LOG(ERROR) << "Standby restore failed: "
                        << toString(restore_result.error());
-            wrapped_master_service.reset();
+            release_service();
             DeactivateServingState(admin_server, label_reconciler);
             return_to_standby(leadership_session->view);
             SetRuntimeState(admin_server, MasterRuntimeState::kRecovering);
@@ -586,7 +594,7 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         if (renewal.Lost()) {
             LOG(WARNING) << "Leadership expired during restore, applied_seq="
                          << promotion_ctx->applied_cursor.last_seq;
-            wrapped_master_service.reset();
+            release_service();
             DeactivateServingState(admin_server, label_reconciler);
             return_to_standby(std::nullopt);
             LogLeadershipReleaseWarning(
@@ -601,7 +609,7 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         auto serve_preflight =
             leader_coordinator.RenewLeadership(*leadership_session);
         if (!serve_preflight) {
-            wrapped_master_service.reset();
+            release_service();
             DeactivateServingState(admin_server, label_reconciler);
             return_to_standby(leadership_session->view);
             if (HandleLeadershipPhaseError(
@@ -613,7 +621,7 @@ int RunSupervisorLoop(const HABackendSpec& spec,
             continue;
         }
         if (!serve_preflight.value()) {
-            wrapped_master_service.reset();
+            release_service();
             DeactivateServingState(admin_server, label_reconciler);
             return_to_standby(std::nullopt);
             LogLeadershipReleaseWarning(
@@ -624,7 +632,12 @@ int RunSupervisorLoop(const HABackendSpec& spec,
             continue;
         }
 
-        mooncake::RegisterRpcService(server, *wrapped_master_service);
+        worker_pool = std::make_unique<RpcWorkerPool>(
+            config.handler_worker_thread_num != 0
+                ? config.handler_worker_thread_num
+                : config.rpc_thread_num);
+        mooncake::RegisterRpcService(server, *wrapped_master_service,
+                                     worker_pool.get());
 
         auto leadership_monitor = leader_coordinator.StartLeadershipMonitor(
             *leadership_session, [&server, &admin_server, &serving_state,
@@ -639,7 +652,7 @@ int RunSupervisorLoop(const HABackendSpec& spec,
                 });
             });
         if (!leadership_monitor) {
-            wrapped_master_service.reset();
+            release_service();
             DeactivateServingState(admin_server, label_reconciler);
             return_to_standby(leadership_session->view);
             if (HandleLeadershipPhaseError(
@@ -656,7 +669,7 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         serving_state.RunIfActive([&]() { ec.emplace(server.async_start()); });
         if (!ec.has_value()) {
             StopLeadershipMonitor(leadership_monitor_handle);
-            wrapped_master_service.reset();
+            release_service();
             DeactivateServingState(admin_server, label_reconciler);
             return_to_standby(std::nullopt);
             LogLeadershipReleaseWarning(
@@ -668,7 +681,7 @@ int RunSupervisorLoop(const HABackendSpec& spec,
             LOG(ERROR) << "Failed to start master service: "
                        << ec->result().value();
             StopLeadershipMonitor(leadership_monitor_handle);
-            wrapped_master_service.reset();
+            release_service();
             DeactivateServingState(admin_server, label_reconciler);
             return_to_standby(leadership_session->view);
             auto err =
@@ -711,7 +724,7 @@ int RunSupervisorLoop(const HABackendSpec& spec,
             auto server_err = std::move(ec.value()).get();
             LOG(ERROR) << "Master service stopped after readiness failure: "
                        << server_err;
-            wrapped_master_service.reset();
+            release_service();
             return_to_standby(leadership_session->view);
             if (HandleLeadershipPhaseError(
                     "service readiness publication failure",
@@ -723,6 +736,9 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         }
 
         auto server_err = std::move(ec.value()).get();
+        // Finish the calls the workers still hold before the term's OpLog
+        // writer and leadership go, as inline handlers would have.
+        worker_pool.reset();
         LOG(ERROR) << "Master service stopped: " << server_err;
 
         StopLeadershipMonitor(leadership_monitor_handle);
@@ -731,7 +747,7 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         auto err = leader_coordinator.ReleaseLeadership(*leadership_session);
         LOG(INFO) << "Release leadership: " << toString(err);
         auto current_view = leader_coordinator.ReadCurrentView();
-        wrapped_master_service.reset();
+        release_service();
         // Serving drops the handoff in ActivateServingState. If the listener
         // stopped before that, preserve the still-populated catch-up cursor.
         if (promotion_ctx->metadata_store) {

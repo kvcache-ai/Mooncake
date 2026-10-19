@@ -473,6 +473,42 @@ TEST_F(ClientIntegrationTest, BatchPutPreservesObjectChecksumPairing) {
     }
 }
 
+TEST_F(ClientIntegrationTest, TaggedBatchWritesSkipChecksumFailures) {
+    if (!ClientObjectChecksumConfig::IsEnabledAtFirstUse()) {
+        GTEST_SKIP() << "MOONCAKE_STORE_CHECKSUM is not enabled";
+    }
+    void* buffer = client_buffer_allocator_->allocate(4);
+    ASSERT_NE(buffer, nullptr);
+    std::memcpy(buffer, "data", 4);
+    for (bool upsert : {false, true}) {
+        const std::vector<ObjectKey> keys = {
+            "invalid-slice", upsert ? "tagged-upsert" : "tagged-put"};
+        std::vector<std::vector<Slice>> slices{{Slice{nullptr, 1}},
+                                               {Slice{buffer, 4}}};
+        ReplicateConfig config;
+        config.session_ids = std::vector<std::string>{"invalid", "valid"};
+        auto results = upsert ? test_client_->BatchUpsert(keys, slices, config)
+                              : test_client_->BatchPut(keys, slices, config);
+        ASSERT_EQ(results.size(), 2);
+        ASSERT_FALSE(results[0]);
+        EXPECT_EQ(results[0].error(), ErrorCode::INVALID_PARAMS);
+        ASSERT_TRUE(results[1]) << toString(results[1].error());
+        auto query = test_client_->Query(keys[1]);
+        ASSERT_TRUE(query);
+        EXPECT_EQ(query->object_checksum, ComputeCrcChecksum("data", 4));
+
+        // A short tag vector must not become valid after filtering a key.
+        config.session_ids = std::vector<std::string>{"wrong"};
+        results = upsert ? test_client_->BatchUpsert(keys, slices, config)
+                         : test_client_->BatchPut(keys, slices, config);
+        for (const auto& result : results) {
+            ASSERT_FALSE(result);
+            EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+        }
+    }
+    client_buffer_allocator_->deallocate(buffer, 4);
+}
+
 // Test Remove operation
 TEST_F(ClientIntegrationTest, RemoveOperation) {
     const std::string test_data = "Test data for removal";

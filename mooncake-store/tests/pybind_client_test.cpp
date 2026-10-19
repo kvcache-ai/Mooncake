@@ -51,9 +51,13 @@ class GLogMuter {
 
 class ScopedEnvVar {
    public:
-    ScopedEnvVar(const char* name, const char* value) : name_(name) {
+    ScopedEnvVar(const char* name, const char* value = nullptr) : name_(name) {
         if (const char* previous = getenv(name)) previous_ = previous;
-        setenv(name, value, 1);
+        if (value) {
+            setenv(name, value, 1);
+        } else {
+            unsetenv(name);
+        }
     }
 
     ~ScopedEnvVar() {
@@ -336,6 +340,90 @@ TEST_F(RealClientTest, SessionRangesReadDfsAndPropagateShortRead) {
 }
 
 #ifdef MOONCAKE_TEST_CUDA_H2D
+TEST_F(RealClientTest, LastHitOnlyGpuCheckpointRoundTrip) {
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
+        GTEST_SKIP() << "CUDA device is unavailable";
+    }
+
+    ScopedEnvVar local_memcpy("MC_STORE_MEMCPY", "1");
+    StartMasterAndSetupClient();
+    ASSERT_FALSE(HasFatalFailure());
+
+    // Three synthetic TP8 checkpoints, each with two state components per
+    // rank. The last checkpoint is missing one component.
+    constexpr size_t kCandidateSize = 16;
+    constexpr size_t kKeyCount = 3 * kCandidateSize;
+    constexpr size_t kPartSize = 4096;
+    constexpr size_t kPayloadSize = kKeyCount * kPartSize;
+    std::vector<char> source(kPayloadSize);
+    for (size_t i = 0; i < source.size(); ++i) {
+        source[i] = static_cast<char>(i % 251);
+    }
+    void* allocation = nullptr;
+    ASSERT_EQ(cudaMalloc(&allocation, 2 * kPayloadSize), cudaSuccess);
+    bool registered = false;
+    auto cleanup = [this, &registered](void* ptr) {
+        if (registered) EXPECT_EQ(py_client_->unregister_buffer(ptr), 0);
+        EXPECT_EQ(cudaFree(ptr), cudaSuccess);
+    };
+    std::unique_ptr<void, decltype(cleanup)> gpu_owner(allocation, cleanup);
+    ASSERT_EQ(cudaMemcpy(allocation, source.data(), kPayloadSize,
+                         cudaMemcpyHostToDevice),
+              cudaSuccess);
+    ASSERT_EQ(py_client_->register_buffer(allocation, 2 * kPayloadSize), 0);
+    registered = true;
+
+    std::vector<std::string> keys;
+    std::vector<void*> buffers;
+    for (size_t i = 0; i < kKeyCount; ++i) {
+        keys.push_back("gpu-probe-" + std::to_string(i));
+        if (i + 1 < kKeyCount) {
+            buffers.push_back(static_cast<char*>(allocation) + i * kPartSize);
+        }
+    }
+    const std::vector<std::string> present(keys.begin(), keys.end() - 1);
+    ASSERT_EQ(
+        py_client_->batch_put_from(
+            present, buffers, std::vector<size_t>(present.size(), kPartSize),
+            {.replica_num = 1}),
+        std::vector<int>(present.size(), 0));
+
+    auto expected = std::vector<int>(kKeyCount, 1);
+    expected.back() = 0;
+    EXPECT_EQ(py_client_->batchProbeKey(keys), expected);
+    ASSERT_EQ(py_client_->batchProbeKey(
+                  keys, {ProbeLeaseMode::LastHitOnly, kCandidateSize}),
+              expected);
+
+    const std::vector<std::string> selected(keys.begin() + kCandidateSize,
+                                            keys.begin() + 2 * kCandidateSize);
+    for (const auto& key : selected) {
+        EXPECT_EQ(py_client_->remove(key), toInt(ErrorCode::OBJECT_HAS_LEASE));
+    }
+    // Existence results remain true for unselected keys without leasing them.
+    EXPECT_EQ(py_client_->remove(keys.front()), 0);
+    EXPECT_EQ(py_client_->remove(keys[kKeyCount - 2]), 0);
+
+    auto* destination = static_cast<char*>(allocation) + kPayloadSize;
+    ASSERT_EQ(cudaMemset(destination, 0, kCandidateSize * kPartSize),
+              cudaSuccess);
+    buffers.clear();
+    for (size_t i = 0; i < kCandidateSize; ++i) {
+        buffers.push_back(destination + i * kPartSize);
+    }
+    ASSERT_EQ(
+        py_client_->batch_get_into(
+            selected, buffers, std::vector<size_t>(kCandidateSize, kPartSize)),
+        std::vector<int64_t>(kCandidateSize, kPartSize));
+    std::vector<char> actual(kCandidateSize * kPartSize);
+    ASSERT_EQ(cudaMemcpy(actual.data(), destination, actual.size(),
+                         cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    EXPECT_TRUE(std::equal(actual.begin(), actual.end(),
+                           source.begin() + kCandidateSize * kPartSize));
+}
+
 TEST_F(RealClientTest, SessionRangesReadDfsIntoGpuUsesPinnedArena) {
     int device_count = 0;
     if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
@@ -2331,6 +2419,148 @@ TEST_F(RealClientTest, SetupWithConfigDictAllowsZeroSizes) {
     ASSERT_TRUE(result.has_value())
         << "Setup should preserve zero-size pure client/server semantics";
 }
+
+TEST_F(RealClientTest, NvlinkConfigHonorsDiscoveryOverride) {
+    ScopedEnvVar auto_discover("MC_MS_AUTO_DISC", "1");
+    ScopedEnvVar force_tcp("MC_FORCE_TCP", "1");
+    // TENT selection tests variable presence, not its value.
+    ScopedEnvVar use_tent("MC_USE_TENT");
+    ScopedEnvVar use_tev1("MC_USE_TEV1");
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
+    master_address_ = master_.master_address();
+
+    for (const auto& hostname :
+         {"localhost:" + std::to_string(getFreeTcpPort()),
+          std::string("localhost")}) {
+        SCOPED_TRACE(hostname);
+        auto client = RealClient::create();
+        ConfigDict config = MakeConfigDict(hostname, "0", "0");
+        config[CONFIG_KEY_PROTOCOL] = "nvlink";
+        config[CONFIG_KEY_RDMA_DEVICES] = "";
+        config[CONFIG_KEY_ENABLE_EGM_STORE_POOL] = "false";
+        config[CONFIG_KEY_EGM_NUMA_NODES] = "invalid";
+
+        // Disabled EGM ignores its node selection, and the explicit discovery
+        // override still permits TCP for the requested nvlink protocol.
+        ASSERT_TRUE(client->setup_internal(config).has_value());
+        ASSERT_NE(client->client_, nullptr);
+        EXPECT_TRUE(hasExplicitPort(client->get_hostname()));
+        auto details = master_.service()->GetSegmentsDetailForAdmin();
+        ASSERT_TRUE(details.has_value());
+        EXPECT_TRUE(details->empty());
+        EXPECT_EQ(client->tearDownAll(), 0);
+    }
+}
+
+TEST_F(RealClientTest, EgmConfigRejectsDiscoveredTcpBeforeAllocating) {
+    ScopedEnvVar auto_discover("MC_MS_AUTO_DISC", "1");
+    ScopedEnvVar force_tcp("MC_FORCE_TCP", "1");
+    ScopedEnvVar use_tent("MC_USE_TENT");
+    ScopedEnvVar use_tev1("MC_USE_TEV1");
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
+    master_address_ = master_.master_address();
+
+    const char* node_options[] = {nullptr, "auto", "0,1"};
+    for (const auto* nodes : node_options) {
+        SCOPED_TRACE(nodes ? nodes : "<unset>");
+        for (const auto& hostname :
+             {"localhost:" + std::to_string(getFreeTcpPort()),
+              std::string("localhost")}) {
+            SCOPED_TRACE(hostname);
+            auto client = RealClient::create();
+            ConfigDict config = MakeConfigDict(hostname, "16MB", "0");
+            config[CONFIG_KEY_PROTOCOL] = "nvlink";
+            config[CONFIG_KEY_RDMA_DEVICES] = "";
+            config[CONFIG_KEY_ENABLE_EGM_STORE_POOL] = "true";
+            if (nodes) config[CONFIG_KEY_EGM_NUMA_NODES] = nodes;
+
+            ::testing::internal::CaptureStderr();
+            auto result = client->setup_internal(config);
+            const std::string logs = ::testing::internal::GetCapturedStderr();
+
+            ASSERT_FALSE(result.has_value());
+            EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+            EXPECT_NE(
+                logs.find("EGM Store requires the classic NVLink transport"),
+                std::string::npos)
+                << logs;
+            // Failed EGM setup must leave neither a live client nor host-backed
+            // capacity behind.
+            EXPECT_EQ(client->client_, nullptr);
+            EXPECT_EQ(client->client_buffer_allocator_, nullptr);
+            EXPECT_TRUE(client->segment_ptrs_.empty());
+            EXPECT_TRUE(client->hugepage_segment_ptrs_.empty());
+            auto details = master_.service()->GetSegmentsDetailForAdmin();
+            ASSERT_TRUE(details.has_value());
+            EXPECT_TRUE(details->empty());
+            EXPECT_EQ(client->tearDownAll(), 0);
+        }
+    }
+}
+
+TEST_F(RealClientTest, EgmConfigWithEmbeddedMasterRejectsDiscoveredTcp) {
+    ScopedEnvVar auto_discover("MC_MS_AUTO_DISC", "1");
+    ScopedEnvVar force_tcp("MC_FORCE_TCP", "1");
+    ScopedEnvVar use_tent("MC_USE_TENT");
+    ScopedEnvVar use_tev1("MC_USE_TEV1");
+    ScopedEnvVar embedded_master("MOONCAKE_ENABLE_EMBEDDED_MASTER");
+
+    for (const auto& hostname :
+         {"localhost:" + std::to_string(getFreeTcpPort()),
+          std::string("localhost")}) {
+        SCOPED_TRACE(hostname);
+        auto client = RealClient::create();
+        ConfigDict config = MakeConfigDict(hostname, "16MB", "0");
+        config.erase(CONFIG_KEY_METADATA_SERVER);
+        config.erase(CONFIG_KEY_MASTER_SERVER_ADDR);
+        config[CONFIG_KEY_ENABLE_EMBEDDED_MASTER] = "true";
+        config[CONFIG_KEY_PROTOCOL] = "nvlink";
+        config[CONFIG_KEY_RDMA_DEVICES] = "";
+        config[CONFIG_KEY_ENABLE_EGM_STORE_POOL] = "true";
+
+        // The embedded-master flag must reach the EGM setup overload. The
+        // resulting real Client must then be rejected before EGM allocation.
+        ::testing::internal::CaptureStderr();
+        auto result = client->setup_internal(config);
+        const std::string logs = ::testing::internal::GetCapturedStderr();
+
+        ASSERT_FALSE(result.has_value());
+        EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+        EXPECT_NE(logs.find("EGM Store requires the classic NVLink transport"),
+                  std::string::npos)
+            << logs;
+        EXPECT_EQ(client->client_, nullptr);
+        EXPECT_EQ(client->client_buffer_allocator_, nullptr);
+        EXPECT_EQ(client->tearDownAll(), 0);
+    }
+}
+
+#ifndef USE_MNNVL
+TEST_F(RealClientTest, EgmConfigCannotFallbackWithoutMnnvl) {
+    ScopedEnvVar auto_discover("MC_MS_AUTO_DISC", "0");
+    ScopedEnvVar use_tent("MC_USE_TENT");
+    ScopedEnvVar use_tev1("MC_USE_TEV1");
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
+    master_address_ = master_.master_address();
+
+    ConfigDict config = MakeConfigDict(
+        "localhost:" + std::to_string(getFreeTcpPort()), "16MB", "0");
+    config[CONFIG_KEY_PROTOCOL] = "nvlink";
+    config[CONFIG_KEY_RDMA_DEVICES] = "";
+    config[CONFIG_KEY_ENABLE_EGM_STORE_POOL] = "true";
+    config[CONFIG_KEY_EGM_NUMA_NODES] = "auto";
+
+    auto result = py_client_->setup_internal(config);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(py_client_->client_buffer_allocator_, nullptr);
+    EXPECT_TRUE(py_client_->segment_ptrs_.empty());
+    EXPECT_TRUE(py_client_->hugepage_segment_ptrs_.empty());
+    auto details = master_.service()->GetSegmentsDetailForAdmin();
+    ASSERT_TRUE(details.has_value());
+    EXPECT_TRUE(details->empty());
+}
+#endif
 
 TEST_F(RealClientTest,
        ConfigDictGlobalSegmentSizeAboveMaxPassesSizeValidation) {

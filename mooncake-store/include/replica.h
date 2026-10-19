@@ -3,6 +3,10 @@
 #include <glog/logging.h>
 
 #include <boost/functional/hash.hpp>
+#include <boost/locale/utf.hpp>
+
+#include <algorithm>
+#include <ylt/struct_pack/compatible.hpp>
 
 #include <atomic>
 #include <cstdint>
@@ -125,13 +129,44 @@ struct ReplicateConfig {
     // always hash(tenant, key) and is decoupled from groups.
     std::optional<std::vector<std::string>> group_ids{};
 
-    ReplicateConfig ForSingleKey(size_t key_index) const {
-        ReplicateConfig key_config = *this;
-        if (group_ids.has_value()) {
-            key_config.group_ids =
-                std::vector<std::string>{group_ids->at(key_index)};
+    // Per-key write attribution, independent of key identity and eviction
+    // groups. Compatible field keeps pre-session RPC payloads readable in both
+    // directions.
+    struct_pack::compatible<std::vector<std::string>, 1> session_ids;
+
+    bool ValidSessionIds(size_t key_count) const {
+        return !session_ids ||
+               (session_ids->size() == key_count &&
+                std::all_of(session_ids->begin(), session_ids->end(),
+                            [](const auto& id) {
+                                if (id.size() > 256) return false;
+                                auto it = id.begin();
+                                while (it != id.end()) {
+                                    namespace utf = boost::locale::utf;
+                                    if (!utf::is_valid_codepoint(
+                                            utf::utf_traits<char>::decode(
+                                                it, id.end()))) {
+                                        return false;
+                                    }
+                                }
+                                return true;
+                            }));
+    }
+
+    std::string SessionId() const {
+        return session_ids && !session_ids->empty() ? session_ids->front() : "";
+    }
+
+    // Reuse a copy of the batch config; select IDs from the original batch.
+    void SetKeyIds(const ReplicateConfig& batch_config, size_t key_index) {
+        if (batch_config.group_ids.has_value()) {
+            group_ids =
+                std::vector<std::string>{batch_config.group_ids->at(key_index)};
         }
-        return key_config;
+        if (batch_config.session_ids) {
+            session_ids = std::vector<std::string>{
+                batch_config.session_ids->at(key_index)};
+        }
     }
 
     friend std::ostream& operator<<(std::ostream& os,

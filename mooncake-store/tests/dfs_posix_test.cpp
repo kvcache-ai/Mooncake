@@ -1425,6 +1425,42 @@ TEST_F(DfsBackendTest, LazyOpenRejectsMissingAndMalformedShardFiles) {
     EXPECT_EQ(write[0].error(), ErrorCode::INVALID_PARAMS);
 }
 
+// Once a shard is open, only the exact path validated at open time skips
+// normalization. Aliases and changed descriptors must still be validated
+// against the cached shard without reopening it.
+TEST_F(DfsBackendTest, CachedShardRevalidatesChangedDescriptors) {
+    ControlledPosixFsAdapter* controlled = nullptr;
+    auto backend = MakeControlledBackend(tmp_->path(), &controlled);
+    ASSERT_TRUE(backend->Init().has_value());
+
+    AlignedBuffer buf(4096);
+    ASSERT_NE(buf.data(), nullptr);
+    const auto read = [&](const std::string& path, int shard_idx) {
+        auto results = backend->BatchRead({{"cached",
+                                            {path, 0, 4096, 4096, shard_idx},
+                                            {{buf.data(), buf.size()}}}});
+        return results.at(0);
+    };
+    const std::filesystem::path root(tmp_->path());
+    const auto name = std::filesystem::path(ShardPath(0)).filename();
+
+    ASSERT_TRUE(read(ShardPath(0), 0));
+    ASSERT_TRUE(read(ShardPath(0), 0));
+    EXPECT_TRUE(read((root / "." / name).string(), 0));
+
+    for (const auto& [path, shard_idx] :
+         std::vector<std::pair<std::string, int>>{
+             {ShardPath(1), 0},
+             {ShardPath(0), 1},
+             {(root / ".." / name).string(), 0}}) {
+        SCOPED_TRACE(path + " shard_idx=" + std::to_string(shard_idx));
+        auto result = read(path, shard_idx);
+        ASSERT_FALSE(result);
+        EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+    }
+    EXPECT_EQ(controlled->OpenCallCount(), 1);
+}
+
 TEST_F(DfsBackendTest, ConcurrentLazyOpenPreservesIndependentWrites) {
     PosixFsAdapter adapter;
     ASSERT_TRUE(adapter.Init(tmp_->path()));

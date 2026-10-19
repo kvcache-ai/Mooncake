@@ -1244,7 +1244,8 @@ uint64_t MasterService::CompletedMemoryQuotaCharge(
             return replica.is_memory_replica() && replica.is_completed();
         });
     const unsigned __int128 charge =
-        static_cast<unsigned __int128>(metadata.size) * completed_replicas;
+        static_cast<unsigned __int128>(metadata.TotalLength()) *
+        completed_replicas;
     return charge > std::numeric_limits<uint64_t>::max()
                ? std::numeric_limits<uint64_t>::max()
                : static_cast<uint64_t>(charge);
@@ -1747,17 +1748,18 @@ void MasterService::FinalizeRemovedReplicasAfterDurable(
         has_processing_memory) {
         const uint64_t committed_charge =
             metadata.quota_ledger.CommittedBytes();
-        if (metadata.size > committed_charge / erased_memory_replicas) {
+        if (metadata.TotalLength() >
+            committed_charge / erased_memory_replicas) {
             LOG(ERROR) << "tenant quota removed-replica release exceeds "
                           "committed bytes, tenant="
                        << tenant_id.value()
                        << ", key=" << durable_entry.object_key
-                       << ", object_size=" << metadata.size
+                       << ", object_size=" << metadata.TotalLength()
                        << ", erased_memory_replicas=" << erased_memory_replicas
                        << ", committed_bytes=" << committed_charge;
         } else {
             const uint64_t release_bytes =
-                metadata.size * erased_memory_replicas;
+                metadata.TotalLength() * erased_memory_replicas;
             auto release_result = metadata.quota_ledger.ReleaseCommitted(
                 GetBoundTenantQuotaHandle(tenant_state), release_bytes);
             LogTenantQuotaLedgerError(release_result, "release_committed",
@@ -1954,7 +1956,8 @@ MasterService::BuildStaleHandleCleanupPlan(
             has_valid_after_cleanup = true;
         }
     }
-    plan.would_invalidate = metadata.size == 0 || !has_valid_after_cleanup;
+    plan.would_invalidate =
+        metadata.TotalLength() == 0 || !has_valid_after_cleanup;
     return plan;
 }
 
@@ -2074,6 +2077,9 @@ MasterService::ObjectMap::iterator MasterService::EraseMetadata(
     }
     ErasePromotionTaskIfPresent(tenant_state, state);
     dynamic_replication_.ClearPendingLocked(tenant_id, key, state);
+    // The candidate leaves the retry index with the object, or the index would
+    // hold its slot toward the candidate limit until the retry loop reached it.
+    promotion_candidates_.EraseLocked(tenant_id, key, state);
 
     ReleaseLocalDiskUsage(metadata.GetAllReplicas());
     FreeDfsReplicas(key, metadata.GetAllReplicas());
@@ -2118,8 +2124,7 @@ MasterService::ObjectMap::iterator MasterService::EraseMetadata(
     return next;
 }
 
-void MasterService::ReleaseLocalDiskUsage(
-    const std::vector<Replica>& replicas) {
+void MasterService::ReleaseLocalDiskUsage(std::span<const Replica> replicas) {
     std::unordered_map<UUID, int64_t, boost::hash<UUID>> bytes_by_client;
     for (const auto& replica : replicas) {
         if (!replica.is_local_disk_replica()) {
@@ -3018,8 +3023,55 @@ std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchExistKey(
 }
 
 std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchProbeKey(
-    const std::vector<std::string>& keys, const TenantId& tenant_id) {
-    return BatchExistKeyImpl(keys, tenant_id, /*grant_lease=*/false);
+    const GrantLeasePolicy& policy, const std::vector<std::string>& keys,
+    const TenantId& tenant_id) {
+    if (keys.empty()) return {};
+    std::string_view invalid_reason;
+    if (policy.lease_mode != ProbeLeaseMode::None &&
+        policy.lease_mode != ProbeLeaseMode::LastHitOnly) {
+        invalid_reason = "unknown lease mode";
+    } else if (policy.lease_mode == ProbeLeaseMode::LastHitOnly) {
+        if (policy.candidate_size == 0) {
+            invalid_reason = "candidate_size is zero";
+        } else if (keys.size() % policy.candidate_size != 0) {
+            invalid_reason = "key count is not divisible by candidate_size";
+        }
+    }
+    if (!invalid_reason.empty()) {
+        LOG(WARNING) << "BatchProbeKey: " << invalid_reason
+                     << ", lease_mode=" << static_cast<int>(policy.lease_mode)
+                     << ", candidate_size=" << policy.candidate_size
+                     << ", key_count=" << keys.size();
+        return std::vector<tl::expected<bool, ErrorCode>>(
+            keys.size(), tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+    }
+
+    auto results = BatchExistKeyImpl(keys, tenant_id, /*grant_lease=*/false);
+    if (policy.lease_mode == ProbeLeaseMode::None) return results;
+
+    const auto is_readable = [](const auto& result) {
+        return result.has_value() && result.value();
+    };
+    for (size_t end = keys.size(); end > 0; end -= policy.candidate_size) {
+        const size_t begin = end - policy.candidate_size;
+        if (!std::all_of(results.begin() + begin, results.begin() + end,
+                         is_readable)) {
+            continue;
+        }
+
+        const std::vector<std::string> candidate(keys.begin() + begin,
+                                                 keys.begin() + end);
+        auto leased =
+            BatchExistKeyImpl(candidate, tenant_id, /*grant_lease=*/true);
+        // Recheck under the existing per-shard locks. Publish the fresh
+        // results so a candidate lost since probing cannot remain all-true.
+        // Failed candidates may retain partial leases until their TTL expires.
+        std::copy(leased.begin(), leased.end(), results.begin() + begin);
+        if (std::all_of(leased.begin(), leased.end(), is_readable)) {
+            break;
+        }
+    }
+    return results;
 }
 
 std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchExistKeyImpl(
@@ -3612,6 +3664,8 @@ tl::expected<size_t, ErrorCode> MasterService::InstallLegacyStandbyObjects(
                     standby_meta.data_type, standby_meta.group_id,
                     object.tenant_id, object.user_key));
             (void)inserted;
+            it->second.metadata.session_id =
+                standby_meta.session_id.value_or("");
             if (!standby_meta.group_id.empty()) {
                 it->second.metadata.lease_ = RegisterGroupMember(
                     object.tenant_id, object.user_key, standby_meta.group_id);
@@ -4081,6 +4135,8 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
                         standby_meta.data_type, standby_meta.group_id,
                         object.tenant_id, object.user_key));
                 (void)inserted;
+                it->second.metadata.session_id =
+                    standby_meta.session_id.value_or("");
                 if (!standby_meta.group_id.empty()) {
                     it->second.metadata.lease_ =
                         RegisterGroupMember(object.tenant_id, object.user_key,
@@ -4759,12 +4815,12 @@ auto MasterService::GetReplicaList(const std::string& key,
         if (replica_list[0].is_memory_replica()) {
             MasterMetricManager::instance().inc_mem_cache_hit_nums();
             MasterMetricManager::instance().inc_mem_cache_hit_bytes(
-                static_cast<int64_t>(metadata.size));
+                static_cast<int64_t>(metadata.TotalLength()));
         } else if (replica_list[0].is_local_disk_replica() ||
                    replica_list[0].is_disk_replica()) {
             MasterMetricManager::instance().inc_file_cache_hit_nums();
             MasterMetricManager::instance().inc_file_cache_hit_bytes(
-                static_cast<int64_t>(metadata.size));
+                static_cast<int64_t>(metadata.TotalLength()));
         }
         MasterMetricManager::instance().inc_valid_get_nums();
         // Grant a lease to the object so it will not be removed
@@ -4802,7 +4858,7 @@ auto MasterService::GetReplicaList(const std::string& key,
 
         resp = GetReplicaListResponse(std::move(replica_list),
                                       default_kv_lease_ttl_,
-                                      metadata.object_checksum);
+                                      metadata.GetPart(0).checksum());
     }
     // RO accessor released. Safe to take a fresh RW accessor now.
     if (promotion_eligible) {
@@ -4839,7 +4895,7 @@ auto MasterService::GetReplicaListForAdmin(const std::string& key,
 
     return GetReplicaListResponse(std::move(replica_list),
                                   default_kv_lease_ttl_,
-                                  metadata.object_checksum);
+                                  metadata.GetPart(0).checksum());
 }
 
 std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
@@ -4936,12 +4992,12 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
                 if (replica_list[0].is_memory_replica()) {
                     MasterMetricManager::instance().inc_mem_cache_hit_nums();
                     MasterMetricManager::instance().inc_mem_cache_hit_bytes(
-                        static_cast<int64_t>(metadata.size));
+                        static_cast<int64_t>(metadata.TotalLength()));
                 } else if (replica_list[0].is_local_disk_replica() ||
                            replica_list[0].is_disk_replica()) {
                     MasterMetricManager::instance().inc_file_cache_hit_nums();
                     MasterMetricManager::instance().inc_file_cache_hit_bytes(
-                        static_cast<int64_t>(metadata.size));
+                        static_cast<int64_t>(metadata.TotalLength()));
                 }
                 MasterMetricManager::instance().inc_valid_get_nums();
                 metadata.GrantReadLease(
@@ -4985,7 +5041,7 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
 
                 results[original_idx] = GetReplicaListResponse(
                     std::move(replica_list), default_kv_lease_ttl_,
-                    metadata.object_checksum);
+                    metadata.GetPart(0).checksum());
             }
         }
 
@@ -5070,7 +5126,7 @@ MasterService::BatchGetReplicaListForAdmin(const std::vector<std::string>& keys,
 
                 results[original_idx] = GetReplicaListResponse(
                     std::move(replica_list), default_kv_lease_ttl_,
-                    metadata.object_checksum);
+                    metadata.GetPart(0).checksum());
             }
         }
     }
@@ -5331,6 +5387,8 @@ auto MasterService::InsertMetadata(
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         }
     }
+    it->second.metadata.BeginSessionTag(config.SessionId(),
+                                        eligible_replica_ids);
     it->second.metadata.BeginSoftPinAction(soft_pin_request,
                                            std::move(eligible_replica_ids));
     if (deadline_to_index) {
@@ -5467,6 +5525,9 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
     VLOG(1) << "key=" << key << ", value_length=" << slice_length
             << ", config=" << config << ", action=put_start_begin";
 
+    if (!config.ValidSessionIds(1)) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
     auto group_id_result = GetGroupIdForKey(config, 1, 0);
     if (!group_id_result) {
         return tl::make_unexpected(group_id_result.error());
@@ -5687,6 +5748,7 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
                 metadata.PendingSoftPinOwnsReplica(replica.id())) {
                 completed_pending_replica = true;
             }
+            metadata.CommitSessionTag(replica.id());
             replica.mark_complete();
             if (replica.is_dfs_replica() && dfs_allocator_) {
                 const auto& desc = replica.get_dfs_descriptor();
@@ -5705,7 +5767,7 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
         replica_type == ReplicaType::ALL ||
         replica_type == ReplicaType::MEMORY ||
         replica_type == ReplicaType::NOF_SSD) {
-        metadata.object_checksum = object_meta.object_checksum;
+        metadata.MutablePart(0).SetChecksum(object_meta.object_checksum);
     }
 
     auto settle_result =
@@ -5961,6 +6023,7 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
             r.mark_removed();
         });
         metadata.ClearPendingSoftPinIfNoViableReplica();
+        metadata.ClearSessionTagIfNoViableReplica();
 
         tl::expected<OpLogEntry, ErrorCode> persist_result;
         if (remaining.empty()) {
@@ -5993,6 +6056,7 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
     const uint64_t before_charge = CompletedMemoryQuotaCharge(metadata);
     EraseReplicasWithCacheTotalAccounting(metadata, target_pred);
     metadata.ClearPendingSoftPinIfNoViableReplica();
+    metadata.ClearSessionTagIfNoViableReplica();
     const uint64_t after_charge = CompletedMemoryQuotaCharge(metadata);
     if (enable_multi_tenants_ && before_charge > after_charge) {
         auto release_result = metadata.quota_ledger.ReleaseCommitted(
@@ -6153,6 +6217,9 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
     VLOG(1) << "key=" << key << ", value_length=" << slice_length
             << ", config=" << config << ", action=upsert_start_begin";
 
+    if (!config.ValidSessionIds(1)) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
     auto group_id_result = GetGroupIdForKey(config, 1, 0);
     if (!group_id_result) {
         return tl::make_unexpected(group_id_result.error());
@@ -6164,6 +6231,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
     bool dfs_allocation_failed = false;
     ReplicateConfig allocation_config = config;
     std::string allocation_group_id = group_id;
+    std::string allocation_session_id;
     std::optional<std::chrono::system_clock::time_point>
         allocation_committed_soft_pin_timeout;
     auto admit =
@@ -6253,7 +6321,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 // An in-place Upsert returns and overwrites the existing
                 // buffers, so every completed Client-owned target must still
                 // be serving before any queue or metadata state is changed.
-                if (metadata.size == slice_length &&
+                if (metadata.TotalLength() == slice_length &&
                     metadata.HasReplica([](const Replica& replica) {
                         if (!replica.is_completed() ||
                             (!replica.is_memory_replica() &&
@@ -6288,6 +6356,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     auto processing_replicas =
                         metadata.PopReplicas(&Replica::fn_is_processing);
                     metadata.ClearPendingSoftPinAction();
+                    metadata.pending_session_tag.reset();
                     if (!processing_replicas.empty()) {
                         FreeDfsReplicas(key, processing_replicas);
                         std::lock_guard lock(discarded_replicas_mutex_);
@@ -6300,6 +6369,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     // If no COMPLETE replicas survive the preemption, this key
                     // effectively does not exist — fall through to Case A.
                     if (!metadata.HasReplica(&Replica::fn_is_completed)) {
+                        allocation_session_id = metadata.session_id;
                         allocation_committed_soft_pin_timeout =
                             metadata.GetCommittedSoftPinTimeout();
                         if (allocation_committed_soft_pin_timeout &&
@@ -6324,12 +6394,17 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
             // routed by hash(tenant, key); group_id does not affect routing.
             if (it == tenant_state.metadata.end()) {
                 VLOG(1) << "key=" << key << ", action=upsert_start_case_a";
-                return AllocateAndInsertMetadata(
+                auto result = AllocateAndInsertMetadata(
                     shard, client_id, key, slice_length, allocation_config,
                     writer_host_id, allocation_group_id, object_id.tenant_id,
                     now, *soft_pin_request,
                     allocation_committed_soft_pin_timeout,
                     &dfs_allocation_failed);
+                if (result) {
+                    tenant_state.metadata.at(key).metadata.session_id =
+                        allocation_session_id;
+                }
+                return result;
             } else {
                 // --- Step 2: key exists with COMPLETE replicas → Case B or C
                 // ---
@@ -6345,7 +6420,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 }
 
                 bool restore_missing_bucket_dfs = false;
-                if (metadata.size == slice_length) {
+                if (metadata.TotalLength() == slice_length) {
                     // Validate same-size DFS topology before changing storage.
                     const size_t existing_dfs_replicas =
                         metadata.CountReplicas(&Replica::fn_is_dfs_replica);
@@ -6395,7 +6470,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 const bool has_bucket_dfs_replica =
                     bucket_allocator_ != nullptr &&
                     metadata.HasReplica(&Replica::fn_is_dfs_replica);
-                if (metadata.size == slice_length && !has_read_lease &&
+                if (metadata.TotalLength() == slice_length && !has_read_lease &&
                     !has_bucket_dfs_replica && !restore_missing_bucket_dfs) {
                     metadata.client_id = client_id;
                     metadata.put_start_time = now;
@@ -6412,6 +6487,8 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                             eligible_replica_ids.insert(replica.id());
                             replica.mark_processing();
                         });
+                    metadata.BeginSessionTag(config.SessionId(),
+                                             eligible_replica_ids);
                     metadata.BeginSoftPinAction(
                         *soft_pin_request, std::move(eligible_replica_ids));
                     SyncCacheTotalAccounting(metadata);
@@ -6455,6 +6532,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 }
 
                 allocation_group_id = metadata.group_id;
+                allocation_session_id = metadata.session_id;
                 const auto previous_kv_media = KvMediaSnapshot(metadata);
                 TenantQuotaLedger replacement_charge;
                 auto* quota_account = GetBoundTenantQuotaHandle(tenant_state);
@@ -6562,6 +6640,9 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     return allocate_result;
                 }
                 auto new_it = tenant_state.metadata.find(key);
+                if (new_it != tenant_state.metadata.end()) {
+                    new_it->second.metadata.session_id = allocation_session_id;
+                }
                 if (has_replacement_charge) {
                     if (new_it == tenant_state.metadata.end()) {
                         auto rollback_result =
@@ -6664,6 +6745,9 @@ MasterService::BatchUpsertStart(const UUID& client_id,
             tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>(
             keys.size(), tl::make_unexpected(ErrorCode::INVALID_PARAMS));
     }
+    if (!config.ValidSessionIds(keys.size())) {
+        return {keys.size(), tl::make_unexpected(ErrorCode::INVALID_PARAMS)};
+    }
     if (config.group_ids.has_value() &&
         config.group_ids->size() != keys.size()) {
         LOG(ERROR) << "BatchUpsertStart: group_ids.size()="
@@ -6676,8 +6760,9 @@ MasterService::BatchUpsertStart(const UUID& client_id,
     std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
         results;
     results.reserve(keys.size());
+    ReplicateConfig key_config = config;
     for (size_t i = 0; i < keys.size(); ++i) {
-        auto key_config = config.ForSingleKey(i);
+        key_config.SetKeyIds(config, i);
         results.emplace_back(UpsertStart(client_id, keys[i], tenant_id,
                                          slice_lengths[i], key_config));
     }
@@ -6965,7 +7050,7 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
     }
 
     const uint64_t pending_quota_charge =
-        SaturatingMultiply(static_cast<uint64_t>(metadata.size),
+        SaturatingMultiply(static_cast<uint64_t>(metadata.TotalLength()),
                            static_cast<uint64_t>(new_replica_count));
     auto quota_result = ChargeTenantQuota(
         GetBoundTenantQuotaHandle(tenant_state), pending_quota_charge);
@@ -7007,7 +7092,7 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
         }
 
         auto replica = allocation_strategy_->AllocateFrom(
-            allocator_snapshot, metadata.size, tgt_segment);
+            allocator_snapshot, metadata.TotalLength(), tgt_segment);
         if (!replica.has_value()) {
             LOG(ERROR) << "key=" << key << ", tgt_segment=" << tgt_segment
                        << ", failed to allocate replica";
@@ -7178,8 +7263,9 @@ tl::expected<void, ErrorCode> MasterService::CopyEnd(
         auto replica = metadata.GetReplicaByID(replica_id);
         if (replica != nullptr) {
             replica->mark_complete();
-            completed_quota_charge = SaturatingAdd(
-                completed_quota_charge, static_cast<uint64_t>(metadata.size));
+            completed_quota_charge =
+                SaturatingAdd(completed_quota_charge,
+                              static_cast<uint64_t>(metadata.TotalLength()));
         }
     }
 
@@ -7390,8 +7476,8 @@ tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
     // terminal cleanup ordered after this already-admitted MoveStart.
     serving_guard.reset();
     if (metadata.GetReplicaBySegmentName(tgt_segment) == nullptr) {
-        const uint64_t pending_quota_charge =
-            SaturatingMultiply(static_cast<uint64_t>(metadata.size), 1);
+        const uint64_t pending_quota_charge = SaturatingMultiply(
+            static_cast<uint64_t>(metadata.TotalLength()), 1);
         auto quota_result = ChargeTenantQuota(
             GetBoundTenantQuotaHandle(tenant_state), pending_quota_charge);
         if (!quota_result) {
@@ -7413,7 +7499,7 @@ tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
             allocator_snapshot = allocator_access.SnapshotAllocatorManager();
         }
         auto replica = allocation_strategy_->AllocateFrom(
-            allocator_snapshot, metadata.size, tgt_segment);
+            allocator_snapshot, metadata.TotalLength(), tgt_segment);
         if (!replica.has_value()) {
             LOG(ERROR) << "key=" << key << ", tgt_segment=" << tgt_segment
                        << ", failed to allocate replica";
@@ -7432,7 +7518,8 @@ tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
     const uint64_t pending_quota_charge =
         replicas.empty()
             ? 0
-            : SaturatingMultiply(static_cast<uint64_t>(metadata.size), 1);
+            : SaturatingMultiply(static_cast<uint64_t>(metadata.TotalLength()),
+                                 1);
 
     MoveStartResponse response;
     std::vector<ReplicaID> replica_ids;
@@ -7627,7 +7714,7 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(
         auto settle_result = metadata.quota_ledger.SettleAdditional(
             GetBoundTenantQuotaHandle(accessor.GetTenantState()),
             task.pending_quota_charge_bytes,
-            has_target ? static_cast<uint64_t>(metadata.size) : 0);
+            has_target ? static_cast<uint64_t>(metadata.TotalLength()) : 0);
         if (!settle_result) {
             LogTenantQuotaLedgerError(settle_result, "settle_additional",
                                       metadata.tenant_id, key);
@@ -7646,7 +7733,7 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(
             if (enable_multi_tenants_) {
                 auto release_result = metadata.quota_ledger.ReleaseCommitted(
                     GetBoundTenantQuotaHandle(accessor.GetTenantState()),
-                    static_cast<uint64_t>(metadata.size));
+                    static_cast<uint64_t>(metadata.TotalLength()));
                 if (!release_result) {
                     LogTenantQuotaLedgerError(release_result,
                                               "release_committed",
@@ -7994,7 +8081,8 @@ long MasterService::RemoveAll(bool force) {
                                     continue;
                                 }
                                 total_freed_size +=
-                                    it->second.metadata.size * mem_rep_count;
+                                    it->second.metadata.TotalLength() *
+                                    mem_rep_count;
                                 ++it;
                                 removed_count++;
                                 continue;
@@ -8002,7 +8090,7 @@ long MasterService::RemoveAll(bool force) {
                         }
 
                         total_freed_size +=
-                            it->second.metadata.size * mem_rep_count;
+                            it->second.metadata.TotalLength() * mem_rep_count;
                         ErasePromotionTaskIfPresent(tenant_state,
                                                     it->second.state);
                         it = EraseMetadata(tenant_state, it, tenant_it->first,
@@ -8134,14 +8222,15 @@ long MasterService::RemoveAll(const TenantId& tenant_id, bool force) {
                                 continue;
                             }
                             total_freed_size +=
-                                it->second.metadata.size * mem_rep_count;
+                                it->second.metadata.TotalLength() *
+                                mem_rep_count;
                             ++it;
                             removed_count++;
                             continue;
                         }
                     }
                     total_freed_size +=
-                        it->second.metadata.size * mem_rep_count;
+                        it->second.metadata.TotalLength() * mem_rep_count;
                     ErasePromotionTaskIfPresent(tenant_state, it->second.state);
                     it = EraseMetadata(tenant_state, it, normalized_tenant,
                                        QuotaEraseMode::kFull, &shard);
@@ -8418,7 +8507,7 @@ bool MasterService::CleanupStaleHandles(
 }
 
 void MasterService::FreeDfsReplicas(const std::string& key,
-                                    const std::vector<Replica>& replicas) {
+                                    std::span<const Replica> replicas) {
     if (!dfs_allocator_) return;
     for (const auto& replica : replicas) {
         if (!replica.is_dfs_replica()) continue;
@@ -9347,169 +9436,54 @@ tl::expected<void, ErrorCode> MasterService::PushPromotionQueue(
 
 // --- Promotion retry candidate helpers ---
 
-void MasterService::DecrementCandidateCount() {
-    uint64_t count = promotion_candidate_count_.load(std::memory_order_relaxed);
-    while (count > 0) {
-        if (promotion_candidate_count_.compare_exchange_weak(
-                count, count - 1, std::memory_order_relaxed)) {
-            return;
-        }
-    }
-}
-
-void MasterService::EraseCandidate(TenantState& tenant_state,
-                                   const std::string& key) {
-    if (tenant_state.promotion_candidates.erase(key) > 0) {
-        DecrementCandidateCount();
-    }
-}
-
 void MasterService::EraseCandidate(const ObjectIdentity& object_id) {
     MetadataShardAccessorRW shard(
         this, getShardIndex(object_id.tenant_id, object_id.user_key));
     auto tenant_it = shard->tenants.find(object_id.tenant_id);
     if (tenant_it == shard->tenants.end()) return;
-    EraseCandidate(tenant_it->second, object_id.user_key);
-    if (tenant_it->second.Empty()) {
-        shard->tenants.erase(tenant_it);
-    }
-}
-
-void MasterService::RecordOrUpdateCandidate(TenantState& tenant_state,
-                                            const std::string& key,
-                                            uint8_t sketch_score,
-                                            PromotionCandidateReason reason,
-                                            ErrorCode last_error,
-                                            uint32_t execution_failures) {
-    const auto now = std::chrono::steady_clock::now();
-    auto it = tenant_state.promotion_candidates.find(key);
-    if (it != tenant_state.promotion_candidates.end()) {
-        // Update existing entry: refresh last_seen, reset
-        // retry_after/retry_count. execution_failures is intentionally NOT
-        // updated here: a read refresh is new demand signal and may extend
-        // the budget, but it must not erase the failure history of this
-        // admission chain.
-        it->second.last_seen = now;
-        it->second.last_reason = reason;
-        it->second.last_error = last_error;
-        if (sketch_score > it->second.sketch_score) {
-            it->second.sketch_score = sketch_score;
-        }
-        it->second.retry_after = now;
-        it->second.retry_count = 0;
+    auto& tenant_state = tenant_it->second;
+    auto it = tenant_state.metadata.find(object_id.user_key);
+    if (it == tenant_state.metadata.end()) {
+        promotion_candidates_.ForgetLocked(object_id.tenant_id,
+                                           object_id.user_key);
         return;
     }
-
-    // Reserve a slot in the global candidate limit.
-    uint64_t count = promotion_candidate_count_.load(std::memory_order_relaxed);
-    while (count < kPromotionCandidateLimit) {
-        if (promotion_candidate_count_.compare_exchange_weak(
-                count, count + 1, std::memory_order_relaxed)) {
-            break;
-        }
-    }
-    if (count >= kPromotionCandidateLimit) {
-        VLOG(1) << "promotion_candidate_dropped key=" << key
-                << " reason=global_limit";
-        MasterMetricManager::instance().inc_promotion_candidate_dropped_limit();
-        return;
-    }
-
-    auto [emplace_it, inserted] = tenant_state.promotion_candidates.emplace(
-        key, PromotionCandidate{.sketch_score = sketch_score,
-                                .first_seen = now,
-                                .last_seen = now,
-                                .retry_after = now,
-                                .last_reason = reason,
-                                .last_error = last_error,
-                                .retry_count = 0,
-                                .execution_failures = execution_failures});
-    if (inserted) {
-        MasterMetricManager::instance().inc_promotion_candidate_recorded();
-        VLOG(1) << "promotion_candidate_recorded key=" << key;
-    } else {
-        DecrementCandidateCount();
-    }
-}
-
-std::chrono::milliseconds MasterService::CandidateBackoff(
-    uint32_t retry_count) const {
-    uint64_t backoff_ms =
-        static_cast<uint64_t>(kPromotionCandidateInitialBackoff.count());
-    for (uint32_t i = 1; i < retry_count; ++i) {
-        backoff_ms = std::min<uint64_t>(
-            backoff_ms * 2,
-            static_cast<uint64_t>(kPromotionCandidateMaxBackoff.count()));
-    }
-    return std::chrono::milliseconds(backoff_ms);
-}
-
-bool MasterService::IsTransientResult(PromotionQueueResult result) const {
-    return result == PromotionQueueResult::kWatermarkRejected ||
-           result == PromotionQueueResult::kQueueCapRejected ||
-           result == PromotionQueueResult::kPushFailed;
+    promotion_candidates_.EraseLocked(object_id.tenant_id, object_id.user_key,
+                                      it->second.state);
 }
 
 void MasterService::BackoffCandidate(const ObjectIdentity& object_id,
                                      PromotionQueueResult result) {
-    const auto now = std::chrono::steady_clock::now();
     MetadataShardAccessorRW shard(
         this, getShardIndex(object_id.tenant_id, object_id.user_key));
     auto tenant_it = shard->tenants.find(object_id.tenant_id);
     if (tenant_it == shard->tenants.end()) return;
     auto& tenant_state = tenant_it->second;
-    auto candidate_it =
-        tenant_state.promotion_candidates.find(object_id.user_key);
-    if (candidate_it == tenant_state.promotion_candidates.end()) return;
-
-    auto& c = candidate_it->second;
-    c.retry_count++;
-    if (result == PromotionQueueResult::kWatermarkRejected) {
-        c.last_reason = PromotionCandidateReason::kWatermark;
-        c.last_error = ErrorCode::OK;
-    } else if (result == PromotionQueueResult::kQueueCapRejected) {
-        c.last_reason = PromotionCandidateReason::kQueueCap;
-        c.last_error = ErrorCode::OK;
-    } else {
-        c.last_reason = PromotionCandidateReason::kPushFailed;
+    auto it = tenant_state.metadata.find(object_id.user_key);
+    if (it == tenant_state.metadata.end()) {
+        promotion_candidates_.ForgetLocked(object_id.tenant_id,
+                                           object_id.user_key);
+        return;
     }
-
-    const bool ttl_expired = now - c.last_seen >= kPromotionCandidateTtl;
-    if (ttl_expired || c.retry_count >= kPromotionCandidateMaxRetries) {
-        VLOG(1) << "promotion_candidate_gave_up key=" << object_id.user_key
-                << " retries=" << c.retry_count;
-        EraseCandidate(tenant_state, object_id.user_key);
-        MasterMetricManager::instance()
-            .inc_promotion_candidate_expired_evaluated();
-    } else {
-        c.retry_after = now + CandidateBackoff(c.retry_count);
-    }
-
-    if (tenant_state.Empty()) {
-        shard->tenants.erase(tenant_it);
-    }
+    promotion_candidates_.BackoffLocked(object_id.tenant_id, object_id.user_key,
+                                        it->second.state, result);
 }
 
 void MasterService::ClearCandidatesForReload() {
     for (size_t i = 0; i < kNumShards; ++i) {
         MetadataShardAccessorRW shard(this, i);
         for (auto& [tenant_id, tenant_state] : shard->tenants) {
-            (void)tenant_id;
-            tenant_state.promotion_candidates.clear();
+            for (auto& [key, record] : tenant_state.metadata) {
+                promotion_candidates_.EraseLocked(tenant_id, key, record.state);
+            }
         }
     }
-    promotion_candidate_count_.store(0, std::memory_order_relaxed);
-    promotion_retry_cursor_.store(0, std::memory_order_relaxed);
+    promotion_candidates_.Reset();
     promotion_in_flight_.store(0, std::memory_order_relaxed);
 }
 
 size_t MasterService::RunPromotionCandidateRetry() {
-    return RunPromotionCandidateRetry(kPromotionRetryShardBatch);
-}
-
-size_t MasterService::RunPromotionCandidateRetry(size_t max_shards_to_scan) {
-    if (!promotion_on_hit_ ||
-        promotion_candidate_count_.load(std::memory_order_relaxed) == 0) {
+    if (!promotion_on_hit_ || promotion_candidates_.Empty()) {
         return 0;
     }
 
@@ -9517,84 +9491,45 @@ size_t MasterService::RunPromotionCandidateRetry(size_t max_shards_to_scan) {
     std::vector<ObjectIdentity> due_candidates;
     due_candidates.reserve(kPromotionRetryBatchSize);
 
-    const size_t shards_to_scan = std::min(max_shards_to_scan, kNumShards);
-    if (shards_to_scan == 0) return 0;
-    const size_t start_shard = promotion_retry_cursor_.fetch_add(
-                                   shards_to_scan, std::memory_order_relaxed) %
-                               kNumShards;
-
+    // The tracker files every candidate at its retry time, so a round reads
+    // only the due ones, the longest overdue first, and the batch size bounds
+    // how much one round touches.
     {
         std::shared_lock<std::shared_mutex> snap_lock(master_state_mutex_);
-        for (size_t scanned = 0;
-             scanned < shards_to_scan &&
-             due_candidates.size() < kPromotionRetryBatchSize;
-             ++scanned) {
-            const size_t i = (start_shard + scanned) % kNumShards;
-            MetadataShardAccessorRW shard(this, i);
-            for (auto tenant_it = shard->tenants.begin();
-                 tenant_it != shard->tenants.end() &&
-                 due_candidates.size() < kPromotionRetryBatchSize;) {
-                auto& tenant_state = tenant_it->second;
-                for (auto cit = tenant_state.promotion_candidates.begin();
-                     cit != tenant_state.promotion_candidates.end() &&
-                     due_candidates.size() < kPromotionRetryBatchSize;) {
-                    const auto& key = cit->first;
-                    auto& c = cit->second;
-
-                    const bool ttl_expired =
-                        now - c.last_seen >= kPromotionCandidateTtl;
-                    if (ttl_expired ||
-                        c.retry_count >= kPromotionCandidateMaxRetries) {
-                        VLOG(1) << "promotion_candidate_expired key=" << key
-                                << " retry_count=" << c.retry_count;
-                        const uint32_t saved_retry_count = c.retry_count;
-                        cit = tenant_state.promotion_candidates.erase(cit);
-                        DecrementCandidateCount();
-                        // retry_count == 0: scheduler never reached this
-                        // candidate before TTL elapsed — scan budget was
-                        // too small. retry_count > 0: scheduler evaluated
-                        // it but gave up after retries or TTL.
-                        if (saved_retry_count == 0) {
-                            MasterMetricManager::instance()
-                                .inc_promotion_candidate_expired_unevaluated();
-                        } else {
-                            MasterMetricManager::instance()
-                                .inc_promotion_candidate_expired_evaluated();
-                        }
-                        continue;
-                    }
-                    if (c.retry_after > now) {
-                        ++cit;
-                        continue;
-                    }
-
-                    // Quick pre-filter under shard lock to avoid adding
-                    // candidates that are obviously ineligible.
-                    auto meta_it = tenant_state.metadata.find(key);
-                    if (meta_it == tenant_state.metadata.end() ||
-                        !meta_it->second.metadata.IsValid() ||
-                        meta_it->second.state.is_processing ||
-                        meta_it->second.state.promotion_task ||
-                        meta_it->second.metadata.HasReplica(
-                            &Replica::fn_is_memory_replica) ||
-                        !meta_it->second.metadata.HasReplica(
-                            &Replica::fn_is_local_disk_replica)) {
-                        cit = tenant_state.promotion_candidates.erase(cit);
-                        DecrementCandidateCount();
-                        continue;
-                    }
-
-                    due_candidates.push_back(ObjectIdentity{
-                        .tenant_id = tenant_it->first, .user_key = key});
-                    ++cit;
-                }
-
-                if (tenant_state.Empty()) {
-                    tenant_it = shard->tenants.erase(tenant_it);
-                } else {
-                    ++tenant_it;
-                }
+        for (auto& [tenant_id, key] :
+             promotion_candidates_.Due(now, kPromotionRetryBatchSize)) {
+            ObjectIdentity object_id{.tenant_id = std::move(tenant_id),
+                                     .user_key = std::move(key)};
+            MetadataShardAccessorRW shard(
+                this, getShardIndex(object_id.tenant_id, object_id.user_key));
+            auto tenant_it = shard->tenants.find(object_id.tenant_id);
+            auto it = tenant_it == shard->tenants.end()
+                          ? ObjectMap::iterator{}
+                          : tenant_it->second.metadata.find(object_id.user_key);
+            if (tenant_it == shard->tenants.end() ||
+                it == tenant_it->second.metadata.end()) {
+                promotion_candidates_.ForgetLocked(object_id.tenant_id,
+                                                   object_id.user_key);
+                continue;
             }
+            auto& [metadata, state] = it->second;
+            if (!promotion_candidates_.DueLocked(
+                    object_id.tenant_id, object_id.user_key, state, now)) {
+                continue;
+            }
+
+            // Quick pre-filter under shard lock to avoid adding
+            // candidates that are obviously ineligible.
+            if (!metadata.IsValid() || state.is_processing ||
+                state.promotion_task ||
+                metadata.HasReplica(&Replica::fn_is_memory_replica) ||
+                !metadata.HasReplica(&Replica::fn_is_local_disk_replica)) {
+                promotion_candidates_.EraseLocked(object_id.tenant_id,
+                                                  object_id.user_key, state);
+                continue;
+            }
+
+            due_candidates.push_back(std::move(object_id));
         }
     }
 
@@ -9608,7 +9543,7 @@ size_t MasterService::RunPromotionCandidateRetry(size_t max_shards_to_scan) {
                 queued++;
                 MasterMetricManager::instance()
                     .inc_promotion_candidate_admitted();
-            } else if (IsTransientResult(result)) {
+            } else if (PromotionCandidateTracker::IsTransient(result)) {
                 MasterMetricManager::instance()
                     .inc_promotion_candidate_admission_rejected();
                 BackoffCandidate(object_id, result);
@@ -9734,7 +9669,7 @@ MasterService::SubmitReplicaActionProposalLocked(
         return tl::make_unexpected(ErrorCode::INVALID_VERSION);
     }
     if (proposal.object_size_bytes != 0 &&
-        proposal.object_size_bytes != metadata.size) {
+        proposal.object_size_bytes != metadata.TotalLength()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     if (metadata.DynamicReplicationRecreateBlocked(
@@ -9846,9 +9781,9 @@ PromotionQueueResult MasterService::TryPushPromotionQueue(
         if (record_candidate) {
             MetadataAccessorRW accessor(this, object_id);
             if (accessor.Exists()) {
-                RecordOrUpdateCandidate(accessor.GetTenantState(), key, freq,
-                                        PromotionCandidateReason::kWatermark,
-                                        ErrorCode::OK);
+                promotion_candidates_.RecordLocked(
+                    object_id.tenant_id, key, accessor.GetState(), freq,
+                    PromotionCandidateReason::kWatermark, ErrorCode::OK);
             }
         }
         return PromotionQueueResult::kWatermarkRejected;
@@ -9862,18 +9797,18 @@ PromotionQueueResult MasterService::TryPushPromotionQueue(
         return PromotionQueueResult::kNotFound;
     }
     auto& metadata = accessor.Get();
-    auto& tenant_state = accessor.GetTenantState();
+    auto& state = accessor.GetState();
 
     // A primary Put/Upsert owns all PROCESSING replicas while the object is
     // processing. Promotion must not establish a second owner.
     if (accessor.InProcessing()) {
-        EraseCandidate(tenant_state, key);
+        promotion_candidates_.EraseLocked(object_id.tenant_id, key, state);
         return PromotionQueueResult::kAlreadyInFlight;
     }
 
     // Dedup: don't queue twice if a promotion is already in flight or if a
     // MEMORY replica has appeared since GetReplicaList observed only-disk.
-    auto& promotion_task = accessor.GetState().promotion_task;
+    auto& promotion_task = state.promotion_task;
     if (promotion_task) {
         // A read hit an already in-flight promotion: re-mark the queued
         // entry's recency so the next heartbeat delivers it ahead of stale
@@ -9881,11 +9816,11 @@ PromotionQueueResult MasterService::TryPushPromotionQueue(
         // promotion is executing) or the holder's mailbox is gone.
         local_ssd_manager_.TouchPromotion(promotion_task->holder_id,
                                           object_id.tenant_id, key);
-        EraseCandidate(tenant_state, key);
+        promotion_candidates_.EraseLocked(object_id.tenant_id, key, state);
         return PromotionQueueResult::kAlreadyInFlight;
     }
     if (metadata.HasReplica(&Replica::fn_is_memory_replica)) {
-        EraseCandidate(tenant_state, key);
+        promotion_candidates_.EraseLocked(object_id.tenant_id, key, state);
         return PromotionQueueResult::kMemoryReplicaPresent;
     }
 
@@ -9896,7 +9831,7 @@ PromotionQueueResult MasterService::TryPushPromotionQueue(
                                if (source == nullptr) source = &r;
                            });
     if (source == nullptr) {
-        EraseCandidate(tenant_state, key);
+        promotion_candidates_.EraseLocked(object_id.tenant_id, key, state);
         return PromotionQueueResult::kNoLocalDiskSource;
     }
 
@@ -9911,9 +9846,9 @@ PromotionQueueResult MasterService::TryPushPromotionQueue(
         promotion_queue_limit_) {
         MasterMetricManager::instance().inc_promotion_rejected_cap();
         if (record_candidate) {
-            RecordOrUpdateCandidate(tenant_state, key, freq,
-                                    PromotionCandidateReason::kQueueCap,
-                                    ErrorCode::OK);
+            promotion_candidates_.RecordLocked(
+                object_id.tenant_id, key, state, freq,
+                PromotionCandidateReason::kQueueCap, ErrorCode::OK);
         }
         return PromotionQueueResult::kQueueCapRejected;
     }
@@ -9930,18 +9865,18 @@ PromotionQueueResult MasterService::TryPushPromotionQueue(
         VLOG(1) << "promotion_push_failed key=" << key
                 << " error=" << push_result.error();
         if (push_result.error() == ErrorCode::OBJECT_ALREADY_EXISTS) {
-            EraseCandidate(tenant_state, key);
+            promotion_candidates_.EraseLocked(object_id.tenant_id, key, state);
             return PromotionQueueResult::kAlreadyInFlight;
         }
         if (push_result.error() == ErrorCode::SEGMENT_NOT_FOUND ||
             push_result.error() == ErrorCode::INVALID_PARAMS) {
-            EraseCandidate(tenant_state, key);
+            promotion_candidates_.EraseLocked(object_id.tenant_id, key, state);
             return PromotionQueueResult::kNoLocalDiskSource;
         }
         if (record_candidate) {
-            RecordOrUpdateCandidate(tenant_state, key, freq,
-                                    PromotionCandidateReason::kPushFailed,
-                                    push_result.error());
+            promotion_candidates_.RecordLocked(
+                object_id.tenant_id, key, state, freq,
+                PromotionCandidateReason::kPushFailed, push_result.error());
         }
         return PromotionQueueResult::kPushFailed;
     }
@@ -9956,12 +9891,8 @@ PromotionQueueResult MasterService::TryPushPromotionQueue(
     // Propagate the execution-failure count across the candidate's
     // consumption so NotifyPromotionFailure can bound self-sustaining
     // execution-failure cycles; an absent candidate means a fresh chain (0).
-    uint32_t execution_failures = 0;
-    if (auto cit = tenant_state.promotion_candidates.find(key);
-        cit != tenant_state.promotion_candidates.end()) {
-        execution_failures = cit->second.execution_failures;
-    }
-    EraseCandidate(tenant_state, key);
+    const uint32_t execution_failures =
+        promotion_candidates_.ConsumeLocked(object_id.tenant_id, key, state);
     promotion_task =
         PromotionTask{.source_id = source->id(),
                       .alloc_id = 0,
@@ -10218,10 +10149,10 @@ auto MasterService::PromotionAllocStart(
     // measured from when a master-allocated buffer becomes vulnerable,
     // rather than being consumed by queue-waiting. Without the reset,
     // a backlogged task could enter active transfer with little TTL
-    // remaining and the reaper could free the staged replica via
-    // EraseReplicaByID mid-RDMA-write. The queue-waiting phase
+    // remaining and the reaper could erase the staged replica by its
+    // allocation id mid-RDMA-write. The queue-waiting phase
     // (alloc_id == 0) is bounded by its own original start_time window
-    // during which the reaper's EraseReplicaByID branch is a no-op.
+    // during which the reaper's erase-by-allocation branch is a no-op.
     promotion_task->alloc_id = new_id;
     promotion_task->pending_quota_charge_bytes = pending_quota_charge;
     promotion_task->start_time = std::chrono::system_clock::now();
@@ -10424,8 +10355,8 @@ auto MasterService::NotifyPromotionFailure(const UUID& client_id,
     // A transient execution failure (DRAM pressure at AllocStart, a TE write
     // flake, SSD throttling) must not silently kill the promotion: re-record
     // a retry candidate so the eviction-thread retry loop re-queues it with
-    // backoff. Bounded by kPromotionCandidateMaxRetries /
-    // kPromotionCandidateTtl, and the retry path erases the candidate on
+    // backoff. Bounded by PromotionCandidateTracker::kMaxRetries /
+    // kTtl, and the retry path erases the candidate on
     // permanent conditions (not-found, memory-present, no-local-disk-source),
     // so this cannot spin. Record the current estimate via count()
     // (read-only), NOT increment(): an executor-side failure is not demand
@@ -10456,9 +10387,10 @@ auto MasterService::NotifyPromotionFailure(const UUID& client_id,
                 object_id.tenant_id.MakeScopedKey(object_id.user_key);
             const uint8_t freq =
                 promotion_sketch_ ? promotion_sketch_->count(admission_key) : 0;
-            RecordOrUpdateCandidate(tenant_state, object_id.user_key, freq,
-                                    PromotionCandidateReason::kExecutionFailed,
-                                    ErrorCode::OK, prior_failures + 1);
+            promotion_candidates_.RecordLocked(
+                object_id.tenant_id, object_id.user_key, accessor.GetState(),
+                freq, PromotionCandidateReason::kExecutionFailed, ErrorCode::OK,
+                prior_failures + 1);
         }
     }
 
@@ -10598,7 +10530,7 @@ void MasterService::EvictionThreadFunc() {
             }
         }
 
-        if (promotion_candidate_count_.load(std::memory_order_relaxed) > 0) {
+        if (!promotion_candidates_.Empty()) {
             RunPromotionCandidateRetry();
         }
 
@@ -10638,6 +10570,7 @@ void MasterService::DiscardExpiredProcessingReplicas(
             if (!metadata.IsValid() ||
                 metadata.AllReplicas(&Replica::fn_is_completed)) {
                 metadata.ClearPendingSoftPinIfNoViableReplica();
+                metadata.ClearSessionTagIfNoViableReplica();
                 if (!metadata.IsValid()) {
                     EraseMetadata(tenant_state, it, tenant_it->first,
                                   QuotaEraseMode::kFull, &shard);
@@ -10705,6 +10638,7 @@ void MasterService::DiscardExpiredProcessingReplicas(
                 auto replicas =
                     metadata.PopReplicas(&Replica::fn_is_processing);
                 metadata.ClearPendingSoftPinIfNoViableReplica();
+                metadata.ClearSessionTagIfNoViableReplica();
                 if (!replicas.empty()) {
                     FreeDfsReplicas(it->first, replicas);
                     discarded_replicas.emplace_back(std::move(replicas), ttl);
@@ -10980,7 +10914,7 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
                                           metadata.tenant_id,
                                           metadata.user_key);
             }
-            return metadata.size * replica_count;
+            return metadata.TotalLength() * replica_count;
         };
     long offload_queued_this_call = 0;
     long offload_deferred_count = 0;
@@ -11260,7 +11194,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
         [&, this](TenantState& tenant_state, ObjectMetadata& metadata,
                   std::vector<std::vector<Replica>>& deferred_replicas) {
             if (enable_oplog_) {
-                return metadata.size *
+                return metadata.TotalLength() *
                        metadata.CountReplicas([](const Replica& replica) {
                            return replica.is_memory_replica() &&
                                   replica.status() == ReplicaStatus::REMOVED;
@@ -11288,7 +11222,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                                           metadata.tenant_id,
                                           metadata.user_key);
             }
-            return metadata.size * replica_count;
+            return metadata.TotalLength() * replica_count;
         };
 
     // --- Offload-on-evict support ---
@@ -12236,7 +12170,8 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
                             ++it;
                             continue;
                         }
-                        total_freed_size += metadata.size * removed_count;
+                        total_freed_size +=
+                            metadata.TotalLength() * removed_count;
                         shard_evicted_count++;
                         ++it;
                         continue;
@@ -12273,7 +12208,7 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
                     continue;
                 }
 
-                total_freed_size += metadata.size * erased;
+                total_freed_size += metadata.TotalLength() * erased;
                 shard_evicted_count++;
                 PublishKvRemovedAfterEvict(it->first, erased, "disk", metadata,
                                            tenant_it->first);
@@ -13336,7 +13271,8 @@ void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
 
                         if (plans.size() < slots) {
                             plans.push_back({tenant_id, key, source_segment,
-                                             *target, metadata.size, unit_key});
+                                             *target, metadata.TotalLength(),
+                                             unit_key});
                         }
                     }
                 }
@@ -13589,7 +13525,8 @@ void MasterService::PublishKvStored(const std::string& key,
         return;
     }
     kv_event_publisher_->PublishCommitted(key, KvMediaForMetadata(metadata),
-                                          tenant_id.value(), metadata.group_id);
+                                          tenant_id.value(), metadata.group_id,
+                                          metadata.session_id);
 }
 
 void MasterService::SyncKvObjectState(
@@ -13612,8 +13549,8 @@ void MasterService::SyncKvObjectState(
         return;
     }
     kv_event_publisher_->SyncObjectState(key, current_media, tenant_id.value(),
-                                         metadata.group_id,
-                                         previous_media_hint);
+                                         metadata.group_id, previous_media_hint,
+                                         metadata.session_id);
 }
 
 void MasterService::PublishKvRemoved(
@@ -13812,8 +13749,9 @@ std::string MasterService::SerializeMetadataForOpLog(
     const ObjectMetadata& metadata) const {
     MetadataPayload payload;
     payload.client_id = metadata.client_id;
-    payload.size = metadata.size;
+    payload.size = metadata.TotalLength();
     payload.group_id = metadata.group_id;
+    payload.session_id = metadata.session_id;
     payload.data_type = metadata.data_type;
     payload.hard_pinned = metadata.IsHardPinned();
 
@@ -13838,8 +13776,9 @@ std::string MasterService::SerializeMetadataForOpLogWithoutMemReplicas(
     const ObjectMetadata& metadata) const {
     MetadataPayload payload;
     payload.client_id = metadata.client_id;
-    payload.size = metadata.size;
+    payload.size = metadata.TotalLength();
     payload.group_id = metadata.group_id;
+    payload.session_id = metadata.session_id;
     payload.data_type = metadata.data_type;
     payload.hard_pinned = metadata.IsHardPinned();
 
@@ -13861,9 +13800,10 @@ std::string MasterService::SerializeMetadataForOpLogFromReplicaDescriptors(
     const std::vector<Replica::Descriptor>& replicas) const {
     MetadataPayload payload;
     payload.client_id = metadata.client_id;
-    payload.size = metadata.size;
+    payload.size = metadata.TotalLength();
     payload.replicas = replicas;
     payload.group_id = metadata.group_id;
+    payload.session_id = metadata.session_id;
     payload.data_type = metadata.data_type;
     payload.hard_pinned = metadata.IsHardPinned();
     auto result = struct_pack::serialize(payload);

@@ -354,11 +354,12 @@ DynamicReplicationController::SelectPlan(
         if (segment_access.QuerySegments(segment.name, used, capacity) !=
                 ErrorCode::OK ||
             capacity == 0 || used >= capacity ||
-            capacity - used < metadata.size) {
+            capacity - used < metadata.TotalLength()) {
             return false;
         }
-        const double util_after = static_cast<double>(used + metadata.size) /
-                                  static_cast<double>(capacity);
+        const double util_after =
+            static_cast<double>(used + metadata.TotalLength()) /
+            static_cast<double>(capacity);
         return util_after < kTargetHighWatermark;
     };
 

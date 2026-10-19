@@ -939,8 +939,8 @@ ErrorCode Client::InitTransferEngine(
                 LOG(ERROR) << "Failed to install TCP transport";
                 return ErrorCode::INTERNAL_ERROR;
             }
-        } else if (protocol == "ascend" || protocol == "ubshmem" ||
-                   protocol == "sunrise_link") {
+        } else if (protocol == "nvlink" || protocol == "ascend" ||
+                   protocol == "ubshmem" || protocol == "sunrise_link") {
             if (device_names.has_value()) {
                 LOG(WARNING) << protocol
                              << " protocol does not use device names, ignoring";
@@ -2570,6 +2570,8 @@ void Client::healDanglingLocalDiskBatchStarts(
     std::vector<std::string> retry_keys;
     std::vector<std::vector<uint64_t>> retry_slices;
     std::vector<size_t> retry_positions;
+    ReplicateConfig retry_config = config;
+    if (retry_config.session_ids) retry_config.session_ids->clear();
     for (size_t j = 0; j < evict_keys.size(); ++j) {
         if (!evicted[j]) {
             LOG(WARNING) << "Failed to evict dangling LOCAL_DISK replica for "
@@ -2583,12 +2585,16 @@ void Client::healDanglingLocalDiskBatchStarts(
         retry_keys.emplace_back(keys[already_exists[evict_positions[j]]]);
         retry_slices.emplace_back(
             slice_lengths[already_exists[evict_positions[j]]]);
+        if (config.session_ids) {
+            retry_config.session_ids->push_back(
+                config.session_ids->at(already_exists[evict_positions[j]]));
+        }
     }
     if (retry_keys.empty()) {
         return;
     }
     auto retry_responses =
-        master_client_.BatchPutStart(retry_keys, retry_slices, config);
+        master_client_.BatchPutStart(retry_keys, retry_slices, retry_config);
     if (retry_responses.size() != retry_keys.size()) {
         return;
     }
@@ -2621,6 +2627,8 @@ void Client::StartBatchPut(std::vector<PutOperation>& ops,
     std::vector<std::string> keys;
     std::vector<std::vector<uint64_t>> slice_lengths;
     std::vector<size_t> active_indices;
+    ReplicateConfig active_config = config;
+    if (active_config.session_ids) active_config.session_ids->clear();
 
     keys.reserve(ops.size());
     slice_lengths.reserve(ops.size());
@@ -2640,6 +2648,9 @@ void Client::StartBatchPut(std::vector<PutOperation>& ops,
         }
         active_indices.emplace_back(i);
         keys.emplace_back(op.key);
+        if (config.session_ids) {
+            active_config.session_ids->push_back(config.session_ids->at(i));
+        }
 
         std::vector<uint64_t> slice_sizes;
         slice_sizes.reserve(op.slices.size());
@@ -2654,7 +2665,7 @@ void Client::StartBatchPut(std::vector<PutOperation>& ops,
     }
 
     auto start_responses =
-        master_client_.BatchPutStart(keys, slice_lengths, config);
+        master_client_.BatchPutStart(keys, slice_lengths, active_config);
 
     // Ensure response size matches request size
     if (start_responses.size() != active_indices.size()) {
@@ -2704,7 +2715,7 @@ void Client::StartBatchPut(std::vector<PutOperation>& ops,
     }
 
     healDanglingLocalDiskBatchStarts(ops, active_indices, already_exists, keys,
-                                     slice_lengths, config);
+                                     slice_lengths, active_config);
     for (size_t i : already_exists) {
         auto& op = ops[active_indices[i]];
         if (!op.IsResolved() && op.replicas.empty()) {
@@ -2720,6 +2731,8 @@ void Client::StartBatchUpsert(std::vector<PutOperation>& ops,
     std::vector<std::string> keys;
     std::vector<std::vector<uint64_t>> slice_lengths;
     std::vector<size_t> active_indices;
+    ReplicateConfig active_config = config;
+    if (active_config.session_ids) active_config.session_ids->clear();
 
     keys.reserve(ops.size());
     slice_lengths.reserve(ops.size());
@@ -2739,6 +2752,9 @@ void Client::StartBatchUpsert(std::vector<PutOperation>& ops,
         }
         active_indices.emplace_back(i);
         keys.emplace_back(op.key);
+        if (config.session_ids) {
+            active_config.session_ids->push_back(config.session_ids->at(i));
+        }
 
         std::vector<uint64_t> slice_sizes;
         slice_sizes.reserve(op.slices.size());
@@ -2753,7 +2769,7 @@ void Client::StartBatchUpsert(std::vector<PutOperation>& ops,
     }
 
     auto start_responses =
-        master_client_.BatchUpsertStart(keys, slice_lengths, config);
+        master_client_.BatchUpsertStart(keys, slice_lengths, active_config);
 
     // Ensure response size matches request size
     if (start_responses.size() != active_indices.size()) {
@@ -3634,6 +3650,10 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const ReplicateConfig& config, const WriteBufferStager& stager) {
+    if (!config.ValidSessionIds(keys.size())) {
+        return std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
     ReplicateConfig client_cfg = AttachHostId(config);
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
@@ -3680,6 +3700,10 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const ReplicateConfig& config, const WriteBufferStager& stager) {
+    if (!config.ValidSessionIds(keys.size())) {
+        return std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
     ReplicateConfig client_cfg = AttachHostId(config);
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
@@ -3719,6 +3743,9 @@ Client::StartBatchPutForSizes(const std::vector<std::string>& keys,
                               const ReplicateConfig& config) {
     std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
         results(keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    if (!config.ValidSessionIds(keys.size())) {
+        return results;
+    }
     if (keys.size() != object_sizes.size()) {
         LOG(ERROR) << "StartBatchPutForSizes size mismatch: keys="
                    << keys.size() << ", sizes=" << object_sizes.size();
@@ -4178,8 +4205,8 @@ std::vector<tl::expected<bool, ErrorCode>> Client::BatchIsExist(
 }
 
 std::vector<tl::expected<bool, ErrorCode>> Client::BatchProbeKey(
-    const std::vector<std::string>& keys) {
-    auto response = master_client_.BatchProbeKey(keys);
+    const std::vector<std::string>& keys, const GrantLeasePolicy& policy) {
+    auto response = master_client_.BatchProbeKey(keys, policy);
 
     // Check if we got the expected number of responses
     if (response.size() != keys.size()) {
