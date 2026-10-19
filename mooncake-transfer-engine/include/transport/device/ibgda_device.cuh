@@ -3,41 +3,14 @@
 // Wraps mlx5gda_qp_devctx and issues RDMA writes/atomics via
 // device-side WQE construction.
 //
-// On MUSA: BF (Blue Flame) doorbell is not available (musaHostRegisterIoMemory
-// doesn't support MMIO), so qp->bf is NULL and the kernel uses DBR-only mode.
-// All other IBGDA logic (WQE construction, CQ polling, DBR write) is shared.
+// WQE construction and CQ polling are shared across CUDA, MUSA and MACA.
+// Platform memory operations publish the DBR and mapped BF doorbell.
 #pragma once
 
 #include <cstdint>
 #include "transport/device/device_ops.cuh"
 
-#ifdef MOONCAKE_EP_USE_MACA
-
-namespace mooncake {
-namespace device {
-
-struct IbgdaContext {
-    void* qp_devctxs;
-    const uint64_t* raddrs;
-    const uint32_t* rkeys;
-    const void* local_atomic_base;
-    const void* remote_atomic_base;
-};
-
-__device__ __forceinline__ void mc_ibgda_put(const IbgdaContext&, int, int, int,
-                                             int, const void*, uint64_t,
-                                             uint32_t) {}
-
-__device__ __forceinline__ void mc_ibgda_red_add(const IbgdaContext&, int, int,
-                                                 int, int, uint64_t, uint64_t,
-                                                 int32_t) {}
-
-}  // namespace device
-}  // namespace mooncake
-
-#else  // !MOONCAKE_EP_USE_MACA
-
-#ifndef MOONCAKE_EP_USE_MUSA
+#if !defined(MOONCAKE_EP_USE_MUSA) && !defined(MOONCAKE_EP_USE_MACA)
 #include <cuda/atomic>
 #endif
 #include <transport/device/ibgda/mlx5gda.h>
@@ -52,6 +25,12 @@ struct mlx5_wqe_atomic_add_32_seg {
 
 namespace mooncake {
 namespace device {
+
+enum class IbgdaPollResult {
+    Completed,
+    TimedOut,
+    Failed,
+};
 
 // ---------------------------------------------------------------------------
 // IbgdaContext
@@ -76,7 +55,12 @@ __device__ __forceinline__ mlx5gda_qp_devctx* mc_ibgda_channel(
 }
 
 __device__ __forceinline__ void mc_ibgda_lock(mlx5gda_qp_devctx* qp) {
-#ifdef MOONCAKE_EP_USE_MUSA
+#if defined(MOONCAKE_EP_USE_MACA)
+    uint32_t old;
+    do {
+        old = atomicCAS(&qp->mutex, 0u, 1u);
+    } while (old != 0);
+#elif defined(MOONCAKE_EP_USE_MUSA)
     uint32_t old;
     do {
         old = atomicCAS(&qp->mutex, 0u, 1u);
@@ -88,7 +72,11 @@ __device__ __forceinline__ void mc_ibgda_lock(mlx5gda_qp_devctx* qp) {
 }
 
 __device__ __forceinline__ void mc_ibgda_unlock(mlx5gda_qp_devctx* qp) {
-#ifdef MOONCAKE_EP_USE_MUSA
+#if defined(MOONCAKE_EP_USE_MACA)
+    __threadfence_system();
+    atomicExch(&qp->mutex, 0u);
+    __threadfence_system();
+#elif defined(MOONCAKE_EP_USE_MUSA)
     mc_st_release_u32(&qp->mutex, 0u);
 #else
     cuda::atomic_ref<uint32_t, cuda::thread_scope_system> lock(qp->mutex);
@@ -96,38 +84,75 @@ __device__ __forceinline__ void mc_ibgda_unlock(mlx5gda_qp_devctx* qp) {
 #endif
 }
 
-__device__ __forceinline__ void mc_ibgda_poll_cq(mlx5gda_qp_devctx* qp,
-                                                 uint16_t expect) {
+__device__ __forceinline__ IbgdaPollResult mc_ibgda_poll_cq(
+    mlx5gda_qp_devctx* qp, uint16_t expect, uint64_t deadline_ticks = 0) {
     uint16_t wq_tail = qp->wq_tail;
     while (static_cast<int16_t>(wq_tail - expect) <= 0) {
         uint16_t cq_be =
             *reinterpret_cast<volatile uint16_t*>(&qp->cq->wqe_counter);
         uint8_t opcode = qp->cq->op_own >> 4;
-        if (opcode == 0xD)
-            printf("[EP IBGDA] Requester error: syndrome=0x%lx\n",
-                   qp->cq->timestamp >> 56);
+        if (opcode == 0xD) {
+#ifndef NDEBUG
+            printf("[EP IBGDA] Requester error: syndrome=0x%llx\n",
+                   static_cast<unsigned long long>(qp->cq->timestamp >> 56));
+#endif
+            return IbgdaPollResult::Failed;
+        }
         if (!(opcode == 0x0 || opcode == 0xF)) {
-            printf("[EP IBGDA] Unexpected CQE opcode=0x%x, trapping\n", opcode);
-            __trap();
+#ifndef NDEBUG
+            printf("[EP IBGDA] Unexpected CQE opcode=0x%x\n", opcode);
+#endif
+            return IbgdaPollResult::Failed;
         }
         wq_tail = mc_bswap16(cq_be) + 1;
+        if (static_cast<int16_t>(wq_tail - expect) <= 0 &&
+            deadline_ticks != 0 && clock64() >= deadline_ticks) {
+            if (wq_tail != qp->wq_tail) qp->wq_tail = wq_tail;
+            return IbgdaPollResult::TimedOut;
+        }
     }
     if (wq_tail != qp->wq_tail) qp->wq_tail = wq_tail;
+    return IbgdaPollResult::Completed;
 }
 
 __device__ __forceinline__ void mc_ibgda_post_send_db(mlx5gda_qp_devctx* qp) {
     uint32_t num_posted = static_cast<uint32_t>(qp->wq_head);
     // DBR write — always done (NIC polls doorbell record in GPU memory)
+#if defined(MOONCAKE_EP_USE_MUSA) && __MUSA_ARCH__ == 310
+    // Match mtshmem's IBGDA publish sequence. The bypass atomic exchange makes
+    // the GPU-memory doorbell record visible to the NIC rather than retaining
+    // the write in the GPU cache hierarchy.
+    const uint32_t dbr_value = mc_bswap32(num_posted);
+    __threadfence_system_noflush();
+    asm volatile("LSU.ATOM_32.XCHG %0, %1, slc=byp;"
+                 :
+                 : "R"(reinterpret_cast<uint32_t*>(&qp->dbr->send_counter)),
+                   "R"(dbr_value));
+#else
     mc_st_release_u32(reinterpret_cast<uint32_t*>(&qp->dbr->send_counter),
                       mc_bswap32(num_posted));
+#endif
     // BF (Blue Flame) doorbell — only if BF register is mapped into GPU VA.
-    // On MUSA, musaHostRegisterIoMemory fails for MMIO addresses, so bf is
-    // NULL and we rely on DBR-only mode (slightly higher latency).
     if (qp->bf != nullptr) {
+#if defined(MOONCAKE_EP_USE_MUSA) && __MUSA_ARCH__ == 310
+        struct {
+            __be32 opmod_idx_opcode;
+            __be32 qpn_ds;
+        } doorbell{
+            mc_bswap32(num_posted << 8),
+            mc_bswap32(qp->qpn << 8),
+        };
+        __threadfence_system_noflush();
+        asm volatile("LSU.ATOM_64.XCHG %0, %1, slc=byp;"
+                     :
+                     : "R"(reinterpret_cast<uint64_t*>(qp->bf)),
+                       "R"(*reinterpret_cast<uint64_t*>(&doorbell)));
+#else
         auto* last_wqe = qp->wq + ((num_posted - 1) & qp->wqeid_mask);
         mc_st_release_u64(reinterpret_cast<uint64_t*>(qp->bf + qp->bf_offset),
                           *reinterpret_cast<uint64_t*>(last_wqe));
         qp->bf_offset ^= MLX5GDA_BF_SIZE;
+#endif
     }
 }
 
@@ -190,6 +215,60 @@ __device__ __forceinline__ void mc_ibgda_write_rdma_atomic_add_wqe(
     ++qp->wq_head;
 }
 
+// Issue a regular 64-bit FETCH-AND-ADD WQE.
+__device__ __forceinline__ void mc_ibgda_write_rdma_atomic_add_64_wqe(
+    mlx5gda_qp_devctx* qp, uint64_t value, uint64_t laddr, __be32 lkey,
+    uint64_t raddr, __be32 rkey) {
+    auto* wqe = reinterpret_cast<mlx5gda_rdma_atomic_wqe*>(
+        qp->wq + (qp->wq_head & qp->wqeid_mask));
+
+    wqe->ctrl = {};
+    wqe->ctrl.qpn_ds = mc_bswap32((qp->qpn << 8) | 4);
+    wqe->ctrl.fm_ce_se = MLX5_WQE_CTRL_CQ_UPDATE;
+    wqe->ctrl.opmod_idx_opcode = mc_bswap32(
+        (static_cast<uint32_t>(qp->wq_head) << 8) | MLX5_OPCODE_ATOMIC_FA);
+
+    wqe->raddr.raddr = mc_bswap64(raddr);
+    wqe->raddr.rkey = rkey;
+    wqe->raddr.reserved = 0;
+
+    wqe->atomic.swap_add = mc_bswap64(value);
+    wqe->atomic.compare = 0;
+
+    wqe->data.byte_count = mc_bswap32(static_cast<uint32_t>(sizeof(uint64_t)));
+    wqe->data.lkey = lkey;
+    wqe->data.addr = mc_bswap64(laddr);
+
+    ++qp->wq_head;
+}
+
+// Issue an 8-byte inline RDMA WRITE. Inline data lives in the WQE, so the
+// scalar need not be staged in a separately registered source buffer.
+__device__ __forceinline__ void mc_ibgda_write_rdma_write_inline_u64_wqe(
+    mlx5gda_qp_devctx* qp, uint64_t value, uint64_t raddr, __be32 rkey) {
+    auto* wqe = reinterpret_cast<mlx5gda_rdma_write_wqe*>(
+        qp->wq + (qp->wq_head & qp->wqeid_mask));
+
+    wqe->ctrl = {};
+    wqe->ctrl.qpn_ds = mc_bswap32((qp->qpn << 8) | 3);
+    wqe->ctrl.fm_ce_se = MLX5_WQE_CTRL_CQ_UPDATE;
+    wqe->ctrl.opmod_idx_opcode = mc_bswap32(
+        (static_cast<uint32_t>(qp->wq_head) << 8) | MLX5_OPCODE_RDMA_WRITE);
+
+    wqe->raddr.raddr = mc_bswap64(raddr);
+    wqe->raddr.rkey = rkey;
+    wqe->raddr.reserved = 0;
+
+    auto* inline_segment = reinterpret_cast<uint32_t*>(&wqe->data);
+    inline_segment[0] =
+        mc_bswap32(MLX5_INLINE_SEG | static_cast<uint32_t>(sizeof(uint64_t)));
+    inline_segment[1] = static_cast<uint32_t>(value);
+    inline_segment[2] = static_cast<uint32_t>(value >> 32);
+    inline_segment[3] = 0;
+
+    ++qp->wq_head;
+}
+
 // ---------------------------------------------------------------------------
 // High-level IBGDA operations
 // ---------------------------------------------------------------------------
@@ -230,5 +309,3 @@ __device__ __forceinline__ void mc_ibgda_red_add(
 
 }  // namespace device
 }  // namespace mooncake
-
-#endif  // MOONCAKE_EP_USE_MACA

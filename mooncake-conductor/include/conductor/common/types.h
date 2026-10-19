@@ -1,0 +1,80 @@
+#pragma once
+
+#include <cstdint>
+#include <optional>
+#include <string>
+#include <string_view>
+
+namespace mooncake::conductor::common {
+
+enum class PublisherKind { kVllm, kMooncake, kSglang };
+
+inline constexpr std::string_view PublisherKindName(PublisherKind kind) {
+    switch (kind) {
+        case PublisherKind::kVllm:
+            return "vLLM";
+        case PublisherKind::kMooncake:
+            return "Mooncake";
+        case PublisherKind::kSglang:
+            return "SGLang";
+    }
+    return "unknown";
+}
+
+inline std::optional<PublisherKind> ParsePublisherKind(std::string_view value) {
+    if (value == "vLLM") {
+        return PublisherKind::kVllm;
+    }
+    if (value == "Mooncake") {
+        return PublisherKind::kMooncake;
+    }
+    if (value == "SGLang") {
+        return PublisherKind::kSglang;
+    }
+    return std::nullopt;
+}
+
+struct HashProfileConfig {
+    std::string strategy;
+    std::string algorithm;
+    std::string python_hash_seed;
+    std::string index_projection;
+
+    bool operator==(const HashProfileConfig&) const = default;
+};
+
+struct ResolvedHashProfile {
+    std::string strategy;
+    std::string algorithm;
+    std::string python_hash_seed;
+    std::string root_digest;
+    std::string index_projection;
+
+    bool operator==(const ResolvedHashProfile& other) const {
+        // SGLang has no process-level seed. Ignore it even for resolved
+        // profiles constructed directly rather than through configuration.
+        const bool sglang = strategy == "sglang" || strategy == "sglang_bigram";
+        return strategy == other.strategy && algorithm == other.algorithm &&
+               root_digest == other.root_digest &&
+               index_projection == other.index_projection &&
+               (sglang || python_hash_seed == other.python_hash_seed);
+    }
+};
+
+struct ServiceConfig {
+    std::string endpoint;         // kv publisher endpoint
+    std::string replay_endpoint;  // replay publisher endpoint
+    PublisherKind publisher_kind = PublisherKind::kVllm;
+    std::string model_name;  // Model name hosted by the service
+    std::string lora_name;
+    std::string tenant_id;    // (optional), default use 'default'
+    std::string instance_id;  // required
+    int64_t block_size = 0;
+    int dp_rank = 0;
+    std::optional<int64_t> cache_group;
+    ResolvedHashProfile hash_profile;
+
+    bool operator==(const ServiceConfig&) const = default;
+};
+
+}  // namespace mooncake::conductor::common

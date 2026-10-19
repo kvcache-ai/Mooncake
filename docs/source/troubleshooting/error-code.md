@@ -64,3 +64,6 @@ Mooncake Store may generate various types of errors during execution. For most A
 |                          | FILE_INVALID_BUFFER (-1104)    | File buffer is wrong                                                                                      |
 |                          | FILE_LOCK_FAIL (-1105)         | File lock operation failed                                                                                |
 |                          | FILE_INVALID_HANDLE (-1106)    | Invalid file handle                                                                                       |
+| Task / Job               | TASK_NOT_FOUND (-1400)         | Task ID not found, or a completed task has already been pruned from the master's in-memory history       |
+|                          | TASK_PENDING_LIMIT_EXCEEDED (-1401) | The master-side pending task queue is full and cannot accept another task                           |
+|                          | JOB_NOT_FOUND (-1402)          | Job ID not found                                                                                          |

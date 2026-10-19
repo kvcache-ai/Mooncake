@@ -4,6 +4,7 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 #include <numa.h>
+#include <numaif.h>
 #include <sys/mman.h>
 
 #include <cstdint>
@@ -13,7 +14,22 @@
 #include <string>
 #include <vector>
 
-#include "utils.h"
+#include "common/client_buffer_allocation.h"
+
+#if defined(__has_feature)
+#define MC_HAS_FEATURE(x) __has_feature(x)
+#else
+#define MC_HAS_FEATURE(x) 0
+#endif
+#if defined(__SANITIZE_ADDRESS__) || MC_HAS_FEATURE(address_sanitizer) || \
+    MC_HAS_FEATURE(leak_sanitizer)
+// Suppress false positives from libnuma.so process-wide caches that are
+// intentionally retained until process exit.
+extern "C" __attribute__((weak, visibility("default"))) const char*
+__lsan_default_suppressions() {
+    return "leak:libnuma.so\n";
+}
+#endif
 
 namespace mooncake {
 
@@ -77,7 +93,6 @@ TEST_F(MmapArenaFallbackTest, PopulateNumaHugetlbMappingTouchesEveryRegion) {
     if (numa_available() < 0) {
         GTEST_SKIP() << "NUMA is unavailable";
     }
-
     setenv("MC_STORE_USE_HUGEPAGE", "1", 1);
     setenv("MC_STORE_HUGEPAGE_SIZE", "2MB", 1);
 
@@ -205,6 +220,55 @@ TEST_F(MmapArenaFallbackTest, AllocateFreeCycle) {
         memset(ptr, static_cast<uint8_t>(i), alloc_size);
         free_buffer_mmap_memory(ptr, alloc_size);
     }
+}
+
+TEST_F(MmapArenaFallbackTest, ThpInterleavedRejectsUnalignedSize) {
+    EXPECT_EQ(allocate_buffer_thp_interleaved(0), nullptr);
+    EXPECT_EQ(allocate_buffer_thp_interleaved(SZ_2MB + 4096), nullptr);
+}
+
+TEST_F(MmapArenaFallbackTest, ThpInterleavedAlignedAndInterleaved) {
+    const size_t alloc_size = 4 * SZ_2MB;
+    void* ptr = allocate_buffer_thp_interleaved(alloc_size);
+    ASSERT_NE(ptr, nullptr);
+    EXPECT_EQ(reinterpret_cast<uintptr_t>(ptr) % SZ_2MB, 0u);
+
+    memset(ptr, 0x5A, alloc_size);
+    EXPECT_EQ(static_cast<uint8_t*>(ptr)[alloc_size - 1], 0x5A);
+
+    if (numa_available() >= 0 && numa_bitmask_weight(numa_all_nodes_ptr) > 1) {
+        int mode = -1;
+        ASSERT_EQ(get_mempolicy(&mode, nullptr, 0, ptr, MPOL_F_ADDR), 0);
+        EXPECT_EQ(mode, MPOL_INTERLEAVE);
+    }
+
+    free_buffer_mmap_memory(ptr, alloc_size);
+}
+
+TEST_F(MmapArenaFallbackTest, ThpInterleavedKeepsExplicitTaskPolicy) {
+    if (numa_available() < 0) {
+        GTEST_SKIP() << "NUMA is unavailable";
+    }
+    struct bitmask* node0 = numa_allocate_nodemask();
+    numa_bitmask_setbit(node0, 0);
+    ASSERT_EQ(set_mempolicy(MPOL_BIND, node0->maskp, node0->size + 1), 0);
+
+    const size_t alloc_size = 2 * SZ_2MB;
+    void* ptr = allocate_buffer_thp_interleaved(alloc_size);
+    int mode = -1;
+    const int rc =
+        ptr ? get_mempolicy(&mode, nullptr, 0, ptr, MPOL_F_ADDR) : -1;
+
+    set_mempolicy(MPOL_DEFAULT, nullptr, 0);
+    numa_bitmask_free(node0);
+
+    ASSERT_NE(ptr, nullptr);
+    ASSERT_EQ(rc, 0);
+    // No VMA policy was installed (MPOL_F_ADDR reports MPOL_DEFAULT), so the
+    // task's MPOL_BIND still governs the segment.
+    EXPECT_EQ(mode, MPOL_DEFAULT);
+
+    free_buffer_mmap_memory(ptr, alloc_size);
 }
 
 }  // namespace mooncake

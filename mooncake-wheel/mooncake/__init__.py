@@ -1,6 +1,9 @@
-"""Mooncake public Python package."""
+"""Package staging directory for the root Mooncake Python distribution.
 
-from mooncake.buffer_pool import BufferPool, RegisteredBufferPool
+``scripts/build_wheel.sh`` stages ``python/mooncake/__init__.py`` here before
+building. The root package owns its import behavior and Store backend facade.
+"""
 
-__all__ = ["BufferPool", "RegisteredBufferPool"]
+from pkgutil import extend_path
 
+__path__ = extend_path(__path__, __name__)

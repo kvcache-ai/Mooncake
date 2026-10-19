@@ -6,7 +6,6 @@
 #include <gtest/gtest.h>
 
 #include <sstream>
-#include <vector>
 
 namespace mooncake::test {
 
@@ -79,13 +78,6 @@ TEST_F(ObjectDataTypeTest, ReplicateConfigDefaultDataType) {
     EXPECT_EQ(config.data_type, ObjectDataType::UNKNOWN);
 }
 
-// ReplicateConfig can be set to other types
-TEST_F(ObjectDataTypeTest, ReplicateConfigSetDataType) {
-    ReplicateConfig config;
-    config.data_type = ObjectDataType::WEIGHT;
-    EXPECT_EQ(config.data_type, ObjectDataType::WEIGHT);
-}
-
 // ReplicateConfig stream output includes data_type
 TEST_F(ObjectDataTypeTest, ReplicateConfigStreamIncludesDataType) {
     ReplicateConfig config;
@@ -95,32 +87,7 @@ TEST_F(ObjectDataTypeTest, ReplicateConfigStreamIncludesDataType) {
     EXPECT_NE(oss.str().find("data_type: TENSOR"), std::string::npos);
 }
 
-// PutStart with data_type propagates to ObjectMetadata
-TEST_F(ObjectDataTypeTest, PutStartWithDataType) {
-    std::unique_ptr<MasterService> service(new MasterService());
-    Segment segment = MakeSegment();
-    UUID client_id = generate_uuid();
-    auto mount_result = service->MountSegment(segment, client_id);
-    ASSERT_TRUE(mount_result.has_value());
-
-    UUID put_client = generate_uuid();
-
-    // Put with WEIGHT type
-    ReplicateConfig config;
-    config.replica_num = 1;
-    config.data_type = ObjectDataType::WEIGHT;
-
-    auto result = service->PutStart(put_client, "key_weight",
-                                    TenantId::Default(), 1024, config);
-    ASSERT_TRUE(result.has_value());
-    EXPECT_FALSE(result.value().empty());
-
-    auto end_result = service->PutEnd(put_client, "key_weight",
-                                      TenantId::Default(), ReplicaType::MEMORY);
-    EXPECT_TRUE(end_result.has_value());
-}
-
-// PutStart with default UNKNOWN data_type still works (backward compat)
+// PutStart accepts the default UNKNOWN data type.
 TEST_F(ObjectDataTypeTest, PutStartDefaultDataType) {
     std::unique_ptr<MasterService> service(new MasterService());
     Segment segment = MakeSegment();
@@ -137,23 +104,6 @@ TEST_F(ObjectDataTypeTest, PutStartDefaultDataType) {
                                     TenantId::Default(), 1024, config);
     ASSERT_TRUE(result.has_value());
     EXPECT_FALSE(result.value().empty());
-}
-
-// Verify all enum values can roundtrip through uint8_t cast
-TEST_F(ObjectDataTypeTest, EnumRoundtrip) {
-    std::vector<ObjectDataType> all_types = {
-        ObjectDataType::UNKNOWN,  ObjectDataType::KVCACHE,
-        ObjectDataType::TENSOR,   ObjectDataType::WEIGHT,
-        ObjectDataType::SAMPLE,   ObjectDataType::ACTIVATION,
-        ObjectDataType::GRADIENT, ObjectDataType::OPTIMIZER_STATE,
-        ObjectDataType::METADATA, ObjectDataType::GENERAL,
-    };
-
-    for (auto type : all_types) {
-        uint8_t raw = static_cast<uint8_t>(type);
-        auto recovered = static_cast<ObjectDataType>(raw);
-        EXPECT_EQ(type, recovered);
-    }
 }
 
 }  // namespace mooncake::test

@@ -97,6 +97,22 @@ gathered = transfer.get_dataproto(
 
 Row selection supports `axis=0`. Tensor and ndarray batch fields, including native Mooncake tensor fields, are read by byte ranges from the stored payload. Structured object `non_tensor_batch` fields read only the selected row metadata and payload ranges. `destinations` may be combined with `rows` for fields that support caller-provided output buffers. Use `raw_destination(ptr, size, owner, pre_registered=True)` for BufferPool or otherwise pre-registered destination memory.
 
+Use `batch_slices` to select columns independently for dense two-dimensional `batch` fields. The mapping is keyed by selected batch field name; fields omitted from the mapping keep their full width. Column slices must have a step of `None` or `1`, and the same `rows` selection is applied to every selected field:
+
+```python
+subset = transfer.get_dataproto(
+    ref,
+    batch_fields=["input_ids", "hidden_states"],
+    rows=slice(128, 256),
+    batch_slices={
+        "input_ids": slice(0, 128),
+        "hidden_states": slice(32, 96),
+    },
+)
+```
+
+When supported by the backend, the selected rows and columns are assembled with one batched ranged read. If the request exceeds the ranged-read limits or that path is unavailable, Mooncake falls back to regular materialization without changing the result.
+
 The result is a plain dictionary when `data_cls` is omitted:
 
 ```python

@@ -25,8 +25,6 @@
 #include "spdk/spdk_wrapper.h"
 #include "transfer_task.h"
 
-namespace {
-
 constexpr uint64_t KiB = 1024;
 constexpr uint64_t MiB = 1024 * KiB;
 constexpr uint64_t GiB = 1024 * MiB;
@@ -95,6 +93,8 @@ DEFINE_int32(socket_id, -1,
              "NUMA socket for benchmark buffers. -1 lets SPDK choose.");
 DEFINE_bool(fill_on_write, true,
             "Fill buffers with a deterministic pattern for write/mixed ops.");
+
+namespace {
 
 using Clock = std::chrono::steady_clock;
 using TimePoint = Clock::time_point;

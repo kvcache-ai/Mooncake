@@ -15,6 +15,7 @@
 #include "tent/transfer_engine.h"
 #include "tent/common/config.h"
 #include "tent/runtime/transfer_engine_impl.h"
+#include "tent/runtime/topology.h"
 #include <glog/logging.h>
 
 namespace mooncake {
@@ -27,9 +28,10 @@ TransferEngine::TransferEngine(const std::string config_path) {
     auto conf = std::make_shared<Config>();
     auto status = conf->loadFile(config_path);
     if (!status.ok()) {
-        LOG(WARNING) << "Failed to read config file " << config_path;
+        LOG(ERROR) << "Failed to read config file " << config_path << ": "
+                   << status.ToString();
     }
-    impl_ = std::make_unique<TransferEngineImpl>(conf);
+    impl_ = std::make_unique<TransferEngineImpl>(conf, status.ok());
 }
 
 TransferEngine::TransferEngine(std::shared_ptr<Config> conf)
@@ -49,6 +51,15 @@ const std::string TransferEngine::getRpcServerAddress() const {
 
 uint16_t TransferEngine::getRpcServerPort() const {
     return impl_->getRpcServerPort();
+}
+
+std::shared_ptr<Topology> TransferEngine::getLocalTopology() const {
+    return impl_->getLocalTopology();
+}
+
+std::string TransferEngine::getLocalTopologyString() const {
+    auto topo = impl_->getLocalTopology();
+    return topo ? topo->toString() : "{}";
 }
 
 Status TransferEngine::exportLocalSegment(std::string& shared_handle) {
@@ -132,6 +143,12 @@ Status TransferEngine::freeBatch(BatchID batch_id) {
 Status TransferEngine::submitTransfer(
     BatchID batch_id, const std::vector<Request>& request_list) {
     return impl_->submitTransfer(batch_id, request_list);
+}
+
+Status TransferEngine::submitTransferRequiringPostSubmitCancellation(
+    BatchID batch_id, const std::vector<Request>& request_list) {
+    return impl_->submitTransferRequiringPostSubmitCancellation(batch_id,
+                                                                request_list);
 }
 
 Status TransferEngine::submitTransfer(BatchID batch_id,

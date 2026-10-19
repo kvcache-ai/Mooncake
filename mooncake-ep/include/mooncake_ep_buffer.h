@@ -1,16 +1,17 @@
 #ifndef MOONCAKE_EP_BUFFER_H
 #define MOONCAKE_EP_BUFFER_H
 
-#include <ATen/cuda/CUDAContext.h>
-#include <cuda_bf16.h>
-#include <cuda.h>
-#include <cuda_runtime.h>
+#include <cuda_alike.h>
+#include <functional>
 #include <memory>
+#include <mutex>
+#include <optional>
+#include <unordered_map>
 #include <mooncake_ep_api.cuh>
 #include <mooncake_ep_configs.cuh>
 #include <mooncake_ep_event.h>
 #include <mooncake_ep_exception.cuh>
-#include <torch/torch.h>
+#include <glog/logging.h>
 #include <transport/device/device_transport.h>
 
 namespace mooncake {
@@ -72,9 +73,14 @@ struct MooncakeEpBuffer {
     int rank, num_ranks;
     int clock_rate_khz;
 
-    // GDR buffer — owned by p2p_transport_
+    // GDR buffer — allocated by p2p_transport_; peer mappings are optional.
     int buffer_idx{};
-    int phase_epochs[2]{};
+    // TBO owns multiple logical dispatchers but shares one native Buffer.
+    // Keep a private top-k snapshot slot per dispatch metadata tensor so
+    // interleaved subbatches cannot overwrite one another.
+    std::mutex buffer_mutex;
+    std::unordered_map<uint64_t, int> dispatch_shadow_slots;
+    int next_shadow_slot = 0;
     int64_t num_ep_buffer_bytes;
     void* gdr_buffer = nullptr;
 
@@ -83,6 +89,7 @@ struct MooncakeEpBuffer {
     // rdma_transport_: IBGDA inter-node RDMA.  nullptr when IBGDA unavailable.
     device::P2pTransport* p2p_transport_ = nullptr;
     device::RdmaTransport* rdma_transport_ = nullptr;
+    device::RdmaMemoryRegion rdma_memory_region_;
     // When EP creates transports itself (no engine provided), ownership lives
     // in these unique_ptrs.  When an engine is provided, the engine owns them
     // and these remain null.
@@ -90,16 +97,15 @@ struct MooncakeEpBuffer {
     std::unique_ptr<device::RdmaTransport> owned_rdma_transport_;
 
     bool ibgda_disabled_ = false;
+    bool p2p_enabled_ = true;
 
     int USE_QP_COUNT = MAX_QP_COUNT;
-    // Cap on active RoCE QPs per peer: spreading small EP messages across too
-    // many QP/doorbell/progress streams hurts when GPUs share an HCA. Default
-    // 8; override at runtime with MOONCAKE_EP_ACTIVE_QPS_PER_RANK (>= per-rank
-    // QP count disables).
-    int active_qps_cap_ = 8;
+    // Active RoCE QPs per peer. MUSA uses one until its independent per-QP
+    // staging protocol is implemented; CUDA/MACA retain their runtime cap.
+    int active_qps_cap_ = 0;
 
     // Stream for communication
-    at::cuda::CUDAStream comm_stream;
+    cudaStream_t comm_stream = nullptr;
 
     // Workspace
     void* workspace = nullptr;
@@ -109,31 +115,32 @@ struct MooncakeEpBuffer {
     // (engine owns the transports).  Otherwise EP creates its own via the
     // factory functions (EP owns them via owned_p2p_transport_ etc.).
     MooncakeEpBuffer(int rank, int num_ranks, int64_t num_ep_buffer_bytes,
+                     bool disable_p2p = false,
                      TransferEngine* engine = nullptr);
 
     ~MooncakeEpBuffer() noexcept(false);
 
-    std::tuple<torch::Tensor, std::optional<torch::Tensor>, torch::Tensor,
-               torch::Tensor, torch::Tensor, std::optional<EventHandle>,
-               std::optional<std::function<void()>>>
-    dispatch(const torch::Tensor& x, const torch::Tensor& topk_idx,
-             torch::Tensor& active_ranks, int num_max_dispatch_tokens_per_rank,
-             int num_experts, int timeout_us, bool use_fp8, bool async,
-             bool return_recv_hook);
+    std::tuple<std::optional<EventHandle>, std::optional<std::function<void()>>>
+    dispatch(uint64_t x_ptr, uint64_t topk_idx_ptr, uint64_t active_ranks_ptr,
+             int num_tokens, int hidden, int num_topk,
+             int num_max_dispatch_tokens_per_rank, int num_experts,
+             int timeout_us, bool use_fp8, uint64_t packed_recv_x_ptr,
+             uint64_t packed_recv_x_scales_ptr, uint64_t packed_recv_count_ptr,
+             uint64_t packed_recv_src_info_ptr,
+             uint64_t packed_recv_layout_range_ptr, bool async,
+             bool return_recv_hook, uint64_t compute_stream_ptr);
 
-    std::tuple<torch::Tensor, std::optional<EventHandle>,
-               std::optional<std::function<void()>>>
-    combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
-            const torch::Tensor& topk_weights, const torch::Tensor& src_info,
-            const torch::Tensor& layout_range, torch::Tensor& active_ranks,
+    std::tuple<std::optional<EventHandle>, std::optional<std::function<void()>>>
+    combine(uint64_t x_ptr, uint64_t topk_idx_ptr, uint64_t topk_weights_ptr,
+            uint64_t src_info_ptr, uint64_t layout_range_ptr,
+            uint64_t active_ranks_ptr, int num_local_experts,
+            int num_combined_tokens, int hidden, int num_topk,
             int num_max_dispatch_tokens_per_rank, int num_experts,
-            int timeout_us, bool zero_copy, bool async, bool return_recv_hook,
-            const std::optional<torch::Tensor>& out);
-
-    torch::Tensor get_next_combine_buffer(int num_max_dispatch_tokens_per_rank,
-                                          int hidden, int num_experts);
+            int timeout_us, bool zero_copy, uint64_t combined_x_ptr, bool async,
+            bool return_recv_hook, uint64_t compute_stream_ptr);
 
     bool ibgda_disabled() const { return ibgda_disabled_; }
+    bool p2p_enabled() const { return p2p_enabled_; }
 
     bool is_roce() const {
         return rdma_transport_ && rdma_transport_->isRoce();
@@ -166,24 +173,24 @@ struct MooncakeEpBuffer {
     // Metadata accessors for Python-level bootstrap exchange.
     std::tuple<int64_t, int32_t> get_mr_info() {
         if (!rdma_transport_) return {0, 0};
-        auto m = rdma_transport_->localMetadata();
+        auto m = rdma_transport_->localMetadata(rdma_memory_region_);
         return {m.raddr, m.rkey};
     }
 
     std::tuple<int64_t, int64_t> get_gid() {
         if (!rdma_transport_) return {0, 0};
-        auto m = rdma_transport_->localMetadata();
+        auto m = rdma_transport_->localMetadata(rdma_memory_region_);
         return {m.subnet_prefix, m.interface_id};
     }
 
     std::vector<int32_t> get_local_qpns() {
         if (!rdma_transport_) return {};
-        return rdma_transport_->localMetadata().qpns;
+        return rdma_transport_->localMetadata(rdma_memory_region_).qpns;
     }
 
     std::vector<int32_t> get_local_lids() {
         if (!rdma_transport_) return {};
-        return rdma_transport_->localMetadata().lids;
+        return rdma_transport_->localMetadata(rdma_memory_region_).lids;
     }
 
     // IPC handle for P2P (NVLink).

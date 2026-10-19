@@ -1,22 +1,39 @@
 # Mooncake PG/EP Troubleshooting
 
 This page covers common setup, import, runtime, and recovery issues for
-Mooncake Backend (PG) and Mooncake EP.
+Mooncake PG and Mooncake EP.
 
-## Import fails with a PyTorch version error
+## PG JIT import fails
+
+The Torch-facing PG adapter is compiled for the installed PyTorch at first
+import. To check the local toolchain without compiling, run:
+
+```bash
+python -m mooncake.pg --report
+```
+
+To compile it before starting an application (for example, in a Docker build),
+run:
+
+```bash
+python -m mooncake.pg --prebuild
+```
+
+The prebuild command uses the same cache and compiler path as a normal import.
+It validates the image at build time; the runtime image must still provide the
+compiler unless the resulting JIT cache is deliberately carried into it.
 
 Symptoms:
 
 ```text
-Mooncake PG was not built against torch==...
-Mooncake EP was not built against torch==...
+Mooncake PG JIT requires Ninja to compile the Torch adapter.
+Mooncake PG Torch adapter JIT requires a CUDA toolkit with nvcc.
 ```
 
 Cause:
 
-`mooncake.pg` and `mooncake.ep` load native extension modules whose names include
-the current PyTorch version. If the wheel or source build does not contain an
-extension for the active `torch.__version__`, import fails.
+`mooncake.pg` builds its Torch-facing adapter for the installed PyTorch at
+first import. That build requires Ninja and a CUDA toolkit with `nvcc`.
 
 Fixes:
 
@@ -30,91 +47,39 @@ Fixes:
    PY
    ```
 
-2. Install a Mooncake wheel built for that PyTorch/CUDA combination, or rebuild
-   from source with EP/PG enabled:
+2. Install Ninja and a CUDA toolkit compatible with the installed PyTorch:
 
    ```bash
-   cmake .. -DWITH_EP=ON
-   make -j
+   python -m pip install ninja
    ```
 
-3. Make sure the Python environment used at runtime is the same one used for the
-   build.
+   On a headless CUDA host, set `TORCH_CUDA_ARCH_LIST` to an architecture
+   supported by the target GPUs before running the prebuild or importing PG.
+   MUSA PyTorch builds are detected automatically from `torch.version.musa`;
+   `MOONCAKE_EP_USE_MUSA=1` remains available when an explicit override is
+   needed.
 
-## `activeRanks must be int` or device mismatch
+3. Re-import `mooncake.pg`; it will rebuild into the local JIT cache.
 
-Symptoms:
+## `dist.get_world_size()` differs from the number of active ranks
 
-```text
-activeRanks must be int.
-activeRanks must be on CPU.
-activeRanks must be on GPU.
-activeRanks must be sized to max_world_size when max_world_size is set
-```
+Mooncake PG preserves stable in-group rank slots. Consequently:
 
-Causes and fixes:
-
-- Use `torch.int32`, not `bool`, `int64`, or floating-point types.
-- For `backend="mooncake"`, put `active_ranks` on the accelerator device.
-- For `backend="mooncake-cpu"`, put `active_ranks` on CPU.
-- If `max_world_size` is set, allocate `active_ranks` with length
-  `max_world_size`, even if the initial visible `world_size` is smaller.
-
-Examples:
-
-```python
-# CUDA / accelerator backend
-active_ranks = torch.ones(max_world_size, dtype=torch.int32, device="cuda")
-
-# CPU backend
-active_ranks = torch.ones(max_world_size, dtype=torch.int32)
-```
-
-## `dist.get_world_size()` is smaller than `max_world_size`
-
-This is expected. Mooncake PG distinguishes reserved capacity from visible active
-membership:
-
-- `max_world_size` reserves future rank slots.
-- `dist.get_world_size()` returns the visible active size.
-- Reserved ranks are inactive until `recover_ranks()` activates them.
+- `max_group_size` is the fixed slot capacity;
+- `dist.get_world_size()` is the highest active in-group rank plus one;
+- holes below that extent remain visible in the rank space but are skipped by
+  the active mask.
 
 Use `pg.get_active_ranks(backend)` to inspect the current backend mask.
 
-## `get_peer_state()` or `join_group()` hangs
+## `join_group()` hangs or activation times out
 
 Common causes:
 
-- Healthy ranks are not all calling `get_peer_state()` in the same order.
-- The joining rank did not initialize with `is_extension=True`.
-- `max_world_size` / rank numbering differs between healthy and joining ranks.
-- Subgroups were created in different orders on healthy and joining processes.
-- The joining process has not published peer metadata yet.
-- Network device filters differ across ranks.
-
-Debug checklist:
-
-1. Confirm all ranks use the same rendezvous address and store.
-2. Print rank, visible `world_size`, and `max_world_size` at initialization.
-3. Confirm `active_ranks` length and values on every rank.
-4. Verify healthy ranks poll the same `join_ranks` list.
-5. For subgroup recovery, confirm every rank calls `dist.new_group()` in the same
-   order.
-6. If using RDMA, set the same HCA whitelist on every rank.
-
-## Newly extended ranks participate too early
-
-After `pg.extend_group_size_to(backend, new_size)`, new ranks are reserved but
-inactive. They should not participate in collectives until healthy ranks call
-`pg.recover_ranks(backend, ranks)`.
-
-If a new rank appears to participate early, check whether:
-
-- `active_ranks` was initialized with `1` for future ranks without masking them
-  through the backend protocol;
-- the application called collectives on the joining process before
-  `pg.join_group()` returned;
-- different ranks used inconsistent `max_world_size` or rank IDs.
+- No existing rank submitted `activate_ranks()` / `recover_ranks()` after the
+  joining process entered `join_group()`.
+- The future active set is not mutually connected, so the activation proposal
+  remains pending until timeout.
 
 ## EP dispatch/combine timeout marks a rank inactive
 
@@ -240,7 +205,7 @@ python mooncake-pg/benchmark/pgbench.py \
   --collective all_reduce --backend mooncake --device cuda -g 2 -b 8 -e 1M -f 2
 
 # EP grid test
-python mooncake-ep/tests/test_ep_grid.py
+python python/tests/ep/test_ep_grid.py
 ```
 
 Adapt process counts, device filters, and launchers to the target cluster.

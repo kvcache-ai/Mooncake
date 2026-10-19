@@ -15,6 +15,9 @@
 #include <unordered_set>
 #include <vector>
 
+#include "config/bucket_backend_config.h"
+#include "config/file_per_key_config.h"
+#include "config/offset_allocator_backend_config.h"
 #include "file_interface.h"
 #include "mutex.h"
 #include "offset_allocator/offset_allocator.h"
@@ -163,104 +166,13 @@ enum class StorageBackendType {
     kFilePerKey,
     kBucket,
     kOffsetAllocator,
-    kDistributed
+    kDistributed,
+    kNvmeKv
 };
 
 static constexpr size_t kKB = 1024;
 static constexpr size_t kMB = kKB * 1024;
 static constexpr size_t kGB = kMB * 1024;
-
-struct FilePerKeyConfig {
-    std::string fsdir = "file_per_key_dir";  // Subdirectory name
-
-    bool enable_eviction = true;  // Enable eviction for storage
-
-    bool Validate() const;
-
-    static FilePerKeyConfig FromEnvironment();
-};
-
-enum class BucketEvictionPolicy {
-    NONE,  // No eviction (default)
-    FIFO,  // Evict oldest bucket first (by creation order)
-    LRU,   // Evict least recently read bucket first
-};
-
-struct BucketBackendConfig {
-    int64_t bucket_size_limit =
-        256 * kMB;  // Max total size of a single bucket (256 MB)
-
-    int64_t bucket_keys_limit = 500;  // Max number of keys allowed in a single
-                                      // bucket, required by bucket backend only
-
-    BucketEvictionPolicy eviction_policy =
-        BucketEvictionPolicy::NONE;  // Eviction strategy
-
-    int64_t max_total_size = 0;  // 0 = unlimited; evict when total_size_
-                                 // exceeds this threshold (bytes)
-
-    bool Validate() const;
-
-    static BucketBackendConfig FromEnvironment();
-};
-
-enum class OffsetEvictionPolicy {
-    NONE,  // No eviction
-    FIFO,  // Evict oldest key first (by insertion order)
-    LRU,   // Approximate LRU via cross-shard sampling (phase 2)
-};
-
-enum class OffsetPersistMode {
-    kDisabled,  // No persistence (default)
-    kRelaxed,   // Periodic checkpoint
-    kStrict,    // Every BatchOffload is durable
-};
-
-struct OffsetAllocatorBackendConfig {
-    OffsetEvictionPolicy eviction_policy = OffsetEvictionPolicy::NONE;
-
-    // Watermark thresholds: eviction triggers when total_size_ exceeds high,
-    // drives down to low. 0 = auto-resolved in Init() from ratios.
-    int64_t high_watermark_bytes = 0;
-    int64_t low_watermark_bytes = 0;
-    double high_ratio = 0.90;
-    double low_ratio = 0.80;
-
-    // Key-count watermarks (symmetric with byte watermarks).
-    // high triggers eviction, drives down to low.
-    int64_t high_watermark_keys = 0;
-    int64_t low_watermark_keys = 0;
-    double keys_high_ratio = 0.95;
-    double keys_low_ratio = 0.90;
-
-    // Eviction caps
-    size_t max_evict_per_offload = 4096;
-    size_t fallback_evict_batch = 16;
-
-    // Allocator node capacity override.
-    // 0 = auto-derived from capacity_ / kMinObjectSize (capped at RAM budget).
-    // Must be <= UINT32_MAX (OffsetAllocator::create takes uint32
-    // max_capacity).
-    int64_t max_capacity_nodes = 0;
-
-    bool Validate() const;
-
-    static OffsetAllocatorBackendConfig FromEnvironment();
-
-    // ---- Persistence settings ----
-    OffsetPersistMode persist_mode = OffsetPersistMode::kDisabled;
-    int64_t persist_interval_seconds = 60;
-
-    // ---- Record integrity ----
-    // When true (default), every written record carries a CRC-32C over
-    // header-prefix + key + value (RecordHeader::kFlagHasCrc), verified
-    // once on recovery.  Disable only when torn writes are otherwise
-    // impossible (kStrict mode on storage that honors fsync ordering,
-    // e.g. power-loss-protected NVMe) or when values never pass through
-    // the CPU (future DMA/GDS writers): unchecksummed records are then
-    // validated by checkpoint ordering (seq guard) alone.
-    bool enable_record_crc = true;
-};
 
 // ===== Persistence metadata structures =====
 
@@ -300,6 +212,8 @@ struct FileStorageConfig {
     // Size of the local client-side buffer (used for caching or batching)
     int64_t local_buffer_size = 1280 * kMB;  // ~1.2 GB
 
+    int64_t pinned_restore_arena_size = 0;
+
     // Limits for scanning and iteration operations
     int64_t scanmeta_iterator_keys_limit =
         20000;  // Max number of keys returned per Scan call, required by bucket
@@ -319,6 +233,9 @@ struct FileStorageConfig {
     // Use io_uring for file I/O instead of POSIX pread/pwrite
     bool use_uring = false;
 
+    // DFS page-offset mode. Enabled for filesystem-mode distributed storage;
+    // object storage uses the regular offload control plane.
+    bool enable_dfs = false;
     // Proactively evict local disk objects from the heartbeat thread once
     // backend usage crosses the high watermark.
     bool enable_disk_watermark_eviction = true;
@@ -344,7 +261,9 @@ struct FileStorageConfig {
 
 class StorageBackendInterface {
    public:
-    StorageBackendInterface(const FileStorageConfig& file_storage_config);
+    explicit StorageBackendInterface(const FileStorageConfig& config)
+        : file_storage_config_(config) {}
+    virtual ~StorageBackendInterface() = default;
 
     using EvictionHandler = std::function<tl::expected<void, ErrorCode>(
         const std::vector<std::string>& evicted_keys)>;
@@ -1064,10 +983,16 @@ class BucketStorageBackend : public StorageBackendInterface {
     // FinalizeEviction removes persisted metadata, waits for in-flight reads,
     // and then deletes the data files.
     struct PendingEviction {
-        std::vector<std::string> keys;  // All keys in evicted buckets
+        std::vector<std::string> keys;  // Keys the eviction removed from the
+                                        // index (matched set; skipped
+                                        // duplicates are never re-pointed)
         std::vector<std::pair<int64_t, std::shared_ptr<BucketMetadata>>>
             buckets;  // (bucket_id, metadata) for file deletion
         std::vector<std::string> write_keys;
+        // Duplicates bypassed instead of failing the batch: already
+        // persisted, or being persisted by a concurrent offload. The
+        // commit phase must skip these (idempotent Put semantics).
+        std::vector<std::string> skipped_keys;
         int64_t evicted_size = 0;
         int64_t write_size = 0;
     };
@@ -1103,6 +1028,24 @@ class BucketStorageBackend : public StorageBackendInterface {
     SelectEvictionCandidate();
 
     /**
+     * @brief Actual on-disk bytes of the offload directory, measured by
+     *        summing real file allocation (stat st_blocks * 512) over every
+     *        file under storage_path_.
+     *
+     * This is ground truth — the same block-based accounting kubelet uses for
+     * emptyDir sizeLimit — so it captures bucket files that linger after their
+     * objects are logically evicted (which the in-memory total_size_ misses).
+     * Result is cached for bucket_backend_config_.disk_scan_cache_ms to bound
+     * the scan cost regardless of offload rate. Caller must hold mutex_.
+     */
+    int64_t ActualDiskBytesUsedLocked() const;
+
+    // Cached result of ActualDiskBytesUsedLocked() and when it was taken.
+    mutable int64_t cached_disk_bytes_ GUARDED_BY(mutex_) = -1;
+    mutable std::chrono::steady_clock::time_point cached_disk_bytes_at_
+        GUARDED_BY(mutex_);
+
+    /**
      * @brief Phase 2 of eviction: delete persisted metadata for each evicted
      * bucket, wait for in-flight reads to drain, then delete the data file.
      * When metadata removal succeeds, doing it first prevents a later read
@@ -1123,7 +1066,21 @@ class BucketStorageBackend : public StorageBackendInterface {
     tl::expected<std::shared_ptr<StorageFile>, ErrorCode> GetFileInstance()
         const;
 
+    // Test-only: number of entries in the LRU eviction index.
+    size_t GetLruIndexSizeForTest() const {
+        SharedMutexLocker lock(&mutex_, shared_lock);
+        return lru_index_.size();
+    }
+
+    // Test-only: inject datasync failure in WriteBucket to verify orphan
+    // cleanup. SetDatasyncFailureForTest(true) makes WriteBucket fail its
+    // datasync call and immediately call CleanupOrphanedBucket.
+    void SetDatasyncFailureForTest(bool enabled) {
+        test_datasync_failure_.store(enabled, std::memory_order_relaxed);
+    }
+
    private:
+    std::atomic<bool> test_datasync_failure_{false};
     // Alignment helper functions for O_DIRECT I/O
     static constexpr size_t kDirectIOAlignment = 4096;
 
@@ -1137,6 +1094,8 @@ class BucketStorageBackend : public StorageBackendInterface {
 
     std::atomic<bool> initialized_{false};
     std::optional<BucketIdGenerator> bucket_id_generator_;
+    // Held for process lifetime after Init(); enforces one client / path.
+    int owner_lock_fd_{-1};
     static constexpr const char* BUCKET_DATA_FILE_SUFFIX = ".bucket";
     static constexpr const char* BUCKET_METADATA_FILE_SUFFIX = ".meta";
 

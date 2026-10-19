@@ -4,20 +4,24 @@
 #include <chrono>
 #include <condition_variable>
 #include <deque>
+#include <map>
 #include <mutex>
 #include <thread>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 
+#include <async_simple/Promise.h>
+
 #include "ha/oplog/oplog_test_failpoint.h"
-#ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
 #include "ha_metric_manager.h"
-#endif
 
 namespace mooncake {
 
 struct OrderedOpLogWriter::Impl {
+    using DurableWaiters =
+        std::multimap<uint64_t, async_simple::Promise<ErrorCode>>;
+
 #ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
     using Clock = std::chrono::steady_clock;
 #endif
@@ -25,14 +29,20 @@ struct OrderedOpLogWriter::Impl {
     struct PendingEntry {
         OpLogEntry entry;
         DurableCallback callback;
+        // Entries committed together via CommitBatch share a non-zero group
+        // id and must be sealed into the same batch record.
+        uint64_t group{0};
 #ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
         Clock::time_point committed_at{};
         Clock::time_point durable_at{};
 #endif
     };
 
-    explicit Impl(OrderedOpLogWriterConfig config, WriteBatchFn write_batch)
-        : config(std::move(config)), write_batch(std::move(write_batch)) {
+    explicit Impl(OrderedOpLogWriterConfig config, WriteBatchFn write_batch,
+                  TerminalCallback terminal_callback)
+        : config(std::move(config)),
+          write_batch(std::move(write_batch)),
+          terminal_callback(std::move(terminal_callback)) {
         if (this->config.max_entries_per_batch == 0) {
             this->config.max_entries_per_batch = 1;
         }
@@ -45,12 +55,45 @@ struct OrderedOpLogWriter::Impl {
         next_sequence_id = this->config.initial_durable_prefix.last_seq + 1;
     }
 
+    void PublishRuntime(bool activate = false) {
+        if (!activate && runtime_owner == 0) return;
+        HAMetricManager::WriterRuntimeSnapshot snapshot;
+        snapshot.accepting = accepting;
+        snapshot.retry_count = retry_count;
+        snapshot.retry_delay_ms = retry_delay_ms;
+        snapshot.waiting_slots = open_waiting_slots;
+        snapshot.committed_queue_depth =
+            committed_entries.size() + ready_entries.size();
+        snapshot.callback_queue_depth = callback_entries.size();
+        snapshot.durable_batch_id = durable_prefix.batch_id;
+        snapshot.durable_sequence = durable_prefix.last_seq;
+        snapshot.last_error = static_cast<int64_t>(last_error);
+        snapshot.terminal_reason = terminal_reason;
+        snapshot.stuck_range = stuck_range;
+        if (activate) {
+            runtime_owner =
+                HAMetricManager::instance().activate_writer_runtime(snapshot);
+        } else {
+            HAMetricManager::instance().update_writer_runtime(runtime_owner,
+                                                              snapshot);
+        }
+    }
+
     void SealCommittedEntriesIfIdle() {
         if (batch_busy || committed_entries.empty()) {
             return;
         }
-        const size_t count =
+        size_t count =
             std::min(committed_entries.size(), config.max_entries_per_batch);
+        // Never split a commit group across records: if the cap lands in the
+        // middle of a group, extend the seal to the end of that group. The
+        // cap is a batching efficiency knob; a group's atomicity is not.
+        while (count < committed_entries.size() &&
+               committed_entries[count].group != 0 &&
+               committed_entries[count].group ==
+                   committed_entries[count - 1].group) {
+            ++count;
+        }
         ready_entries.reserve(count);
         for (size_t i = 0; i < count; ++i) {
             ready_entries.push_back(std::move(committed_entries.front()));
@@ -64,8 +107,69 @@ struct OrderedOpLogWriter::Impl {
         batch_busy = true;
     }
 
+    // Called with mutex held. Extracting nodes avoids allocating while
+    // advancing the prefix and leaves later waiters untouched.
+    DurableWaiters TakeCoveredWaiters() {
+        DurableWaiters covered;
+        auto end = durable_waiters.upper_bound(durable_prefix.last_seq);
+        for (auto it = durable_waiters.begin(); it != end;) {
+            auto current = it++;
+            covered.insert(durable_waiters.extract(current));
+        }
+        return covered;
+    }
+
+    // A continuation may run inline and reenter the writer, so never call
+    // this while holding mutex.
+    static void CompleteWaiters(DurableWaiters waiters, ErrorCode error) {
+        for (auto& waiter : waiters) {
+            waiter.second.setValue(ErrorCode{error});
+        }
+    }
+
+    void EnterTerminalState(ErrorCode error,
+                            OrderedOpLogWriterTerminalReason reason) {
+        TerminalCallback callback;
+        std::optional<OrderedOpLogWriterTerminalState> state;
+        DurableWaiters waiters;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (stop_requested || terminal_state.has_value()) {
+                return;
+            }
+            terminal_state = {
+                .error = error,
+                .reason = reason,
+                .durable_prefix = durable_prefix,
+                .occurred_at_ms = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::system_clock::now().time_since_epoch())
+                        .count())};
+            accepting = false;
+            last_error = error;
+            retry_delay_ms = 0;
+            terminal_reason =
+                reason == OrderedOpLogWriterTerminalReason::kRetryTimeout
+                    ? "retry_timeout"
+                : reason == OrderedOpLogWriterTerminalReason::kFenced
+                    ? "fenced"
+                    : "non_retryable_write_error";
+            PublishRuntime();
+            callback = terminal_callback;
+            state = terminal_state;
+            waiters.swap(durable_waiters);
+        }
+        cv.notify_all();
+        CompleteWaiters(std::move(waiters), error);
+        if (callback) {
+            callback(*state);
+        }
+    }
+
     OrderedOpLogWriterConfig config;
     WriteBatchFn write_batch;
+    TerminalCallback terminal_callback;
+    std::optional<OrderedOpLogWriterTerminalState> terminal_state;
     mutable std::mutex mutex;
     std::condition_variable cv;
     bool accepting{true};
@@ -73,9 +177,16 @@ struct OrderedOpLogWriter::Impl {
     bool stop_requested{false};
     bool callback_stop_requested{false};
     ErrorCode last_error{ErrorCode::OK};
+    uint64_t retry_count{0};
+    uint64_t runtime_owner{0};
+    uint64_t retry_delay_ms{0};
+    std::string terminal_reason;
+    std::optional<std::pair<uint64_t, uint64_t>> stuck_range;
     uint64_t next_reservation_id{1};
     uint64_t next_sequence_id{1};
+    uint64_t next_group_id{1};
     DurablePrefix durable_prefix{config.initial_durable_prefix};
+    DurableWaiters durable_waiters;
     size_t open_waiting_slots{0};
     std::unordered_set<uint64_t> active_reservations;
     std::deque<PendingEntry> committed_entries;
@@ -86,16 +197,27 @@ struct OrderedOpLogWriter::Impl {
     std::thread callback_thread;
 };
 
+namespace {
+
+bool IsRetryableWriteError(ErrorCode error) {
+    return error == ErrorCode::ETCD_OPERATION_ERROR ||
+           error == ErrorCode::ETCD_CTX_CANCELLED ||
+           error == ErrorCode::PERSISTENT_FAIL;
+}
+
+}  // namespace
+
 OrderedOpLogWriter::Reservation::Reservation() = default;
 
 OrderedOpLogWriter::Reservation::Reservation(OrderedOpLogWriter* writer,
-                                             uint64_t id)
-    : writer_(writer), id_(id) {}
+                                             uint64_t id, uint64_t slots)
+    : writer_(writer), id_(id), slots_(slots) {}
 
 OrderedOpLogWriter::Reservation::Reservation(Reservation&& other) noexcept
-    : writer_(other.writer_), id_(other.id_) {
+    : writer_(other.writer_), id_(other.id_), slots_(other.slots_) {
     other.writer_ = nullptr;
     other.id_ = 0;
+    other.slots_ = 0;
 }
 
 OrderedOpLogWriter::Reservation& OrderedOpLogWriter::Reservation::operator=(
@@ -106,8 +228,10 @@ OrderedOpLogWriter::Reservation& OrderedOpLogWriter::Reservation::operator=(
         }
         writer_ = other.writer_;
         id_ = other.id_;
+        slots_ = other.slots_;
         other.writer_ = nullptr;
         other.id_ = 0;
+        other.slots_ = 0;
     }
     return *this;
 }
@@ -128,25 +252,45 @@ uint64_t OrderedOpLogWriter::PendingHandle::sequence_id() const {
 }
 
 OrderedOpLogWriter::OrderedOpLogWriter(OrderedOpLogWriterConfig config,
-                                       WriteBatchFn write_batch)
-    : impl_(std::make_unique<Impl>(std::move(config), std::move(write_batch))) {
+                                       WriteBatchFn write_batch,
+                                       TerminalCallback terminal_callback)
+    : impl_(std::make_unique<Impl>(std::move(config), std::move(write_batch),
+                                   std::move(terminal_callback))) {}
+
+void OrderedOpLogWriter::ActivateRuntimeMetrics() {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->runtime_owner == 0) impl_->PublishRuntime(true);
 }
 
 OrderedOpLogWriter::~OrderedOpLogWriter() { Stop(); }
 
 tl::expected<OrderedOpLogWriter::Reservation, ErrorCode>
 OrderedOpLogWriter::Reserve() {
+    return ReserveBatch(1);
+}
+
+tl::expected<OrderedOpLogWriter::Reservation, ErrorCode>
+OrderedOpLogWriter::ReserveBatch(size_t entry_count) {
     std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->terminal_state.has_value()) {
+        return tl::make_unexpected(impl_->terminal_state->error);
+    }
     if (!impl_->accepting) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
-    if (impl_->open_waiting_slots >= impl_->config.max_entries_per_batch) {
+    if (entry_count == 0) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (entry_count > impl_->config.max_entries_per_batch ||
+        impl_->open_waiting_slots >
+            impl_->config.max_entries_per_batch - entry_count) {
         return tl::make_unexpected(ErrorCode::TASK_PENDING_LIMIT_EXCEEDED);
     }
     const uint64_t id = impl_->next_reservation_id++;
     impl_->active_reservations.insert(id);
-    ++impl_->open_waiting_slots;
-    return Reservation(this, id);
+    impl_->open_waiting_slots += entry_count;
+    impl_->PublishRuntime();
+    return Reservation(this, id, entry_count);
 }
 
 tl::expected<OrderedOpLogWriter::PendingHandle, ErrorCode>
@@ -157,21 +301,28 @@ OrderedOpLogWriter::Commit(Reservation&& reservation, OpLogEntry entry,
         impl_->active_reservations.erase(reservation.id_) == 0) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    if (impl_->stop_requested) {
-        --impl_->open_waiting_slots;
+    auto reject_reservation =
+        [&](ErrorCode error) -> tl::expected<PendingHandle, ErrorCode> {
+        impl_->open_waiting_slots -= reservation.slots_;
         reservation.writer_ = nullptr;
         reservation.id_ = 0;
-        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        reservation.slots_ = 0;
+        impl_->PublishRuntime();
+        return tl::make_unexpected(error);
+    };
+    if (impl_->terminal_state.has_value()) {
+        return reject_reservation(impl_->terminal_state->error);
+    }
+    if (impl_->stop_requested) {
+        return reject_reservation(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
     std::string reason;
     if (!ValidateOpLogBatchEntry(entry, &reason)) {
-        --impl_->open_waiting_slots;
-        reservation.writer_ = nullptr;
-        reservation.id_ = 0;
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        return reject_reservation(ErrorCode::INVALID_PARAMS);
     }
     reservation.writer_ = nullptr;
     reservation.id_ = 0;
+    reservation.slots_ = 0;
     entry.timestamp_ms = 0;
     entry.checksum = ComputeOpLogChecksum(entry.payload);
     entry.prefix_hash = 0;
@@ -188,18 +339,104 @@ OrderedOpLogWriter::Commit(Reservation&& reservation, OpLogEntry entry,
         impl_->committed_entries.size() + impl_->ready_entries.size());
 #endif
     impl_->SealCommittedEntriesIfIdle();
+    impl_->PublishRuntime();
     impl_->cv.notify_all();
     return PendingHandle(sequence_id);
+}
+
+tl::expected<std::vector<OrderedOpLogWriter::PendingHandle>, ErrorCode>
+OrderedOpLogWriter::CommitBatch(Reservation&& reservation,
+                                std::vector<OpLogEntry> entries,
+                                DurableCallback callback) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (reservation.writer_ != this ||
+        impl_->active_reservations.erase(reservation.id_) == 0) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto reject_reservation = [&](ErrorCode error)
+        -> tl::expected<std::vector<PendingHandle>, ErrorCode> {
+        impl_->open_waiting_slots -= reservation.slots_;
+        reservation.writer_ = nullptr;
+        reservation.id_ = 0;
+        reservation.slots_ = 0;
+        impl_->PublishRuntime();
+        return tl::make_unexpected(error);
+    };
+    if (entries.empty() || entries.size() != reservation.slots_) {
+        return reject_reservation(ErrorCode::INVALID_PARAMS);
+    }
+    if (impl_->terminal_state.has_value()) {
+        return reject_reservation(impl_->terminal_state->error);
+    }
+    if (impl_->stop_requested) {
+        return reject_reservation(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+    for (const auto& entry : entries) {
+        std::string reason;
+        if (!ValidateOpLogBatchEntry(entry, &reason)) {
+            return reject_reservation(ErrorCode::INVALID_PARAMS);
+        }
+    }
+    reservation.writer_ = nullptr;
+    reservation.id_ = 0;
+    reservation.slots_ = 0;
+    const uint64_t group = impl_->next_group_id++;
+    std::vector<PendingHandle> handles;
+    handles.reserve(entries.size());
+    for (auto& entry : entries) {
+        entry.timestamp_ms = 0;
+        entry.checksum = ComputeOpLogChecksum(entry.payload);
+        entry.prefix_hash = 0;
+        entry.sequence_id = impl_->next_sequence_id++;
+        handles.push_back(PendingHandle(entry.sequence_id));
+        Impl::PendingEntry pending{.entry = std::move(entry),
+                                   .callback = callback};
+        pending.group = group;
+#ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
+        pending.committed_at = Impl::Clock::now();
+#endif
+        impl_->committed_entries.push_back(std::move(pending));
+    }
+#ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
+    HAMetricManager::instance().set_batch_record_committed_queue_depth(
+        impl_->committed_entries.size() + impl_->ready_entries.size());
+#endif
+    impl_->SealCommittedEntriesIfIdle();
+    impl_->PublishRuntime();
+    impl_->cv.notify_all();
+    return handles;
 }
 
 void OrderedOpLogWriter::Abort(Reservation&& reservation) {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     if (reservation.writer_ == this &&
         impl_->active_reservations.erase(reservation.id_) != 0) {
-        --impl_->open_waiting_slots;
+        impl_->open_waiting_slots -= reservation.slots_;
     }
     reservation.writer_ = nullptr;
     reservation.id_ = 0;
+    reservation.slots_ = 0;
+    impl_->PublishRuntime();
+}
+
+async_simple::Future<ErrorCode> OrderedOpLogWriter::AwaitDurable(
+    uint64_t sequence) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->durable_prefix.last_seq >= sequence) {
+        return async_simple::makeReadyFuture<ErrorCode>(ErrorCode::OK);
+    }
+    if (impl_->terminal_state.has_value()) {
+        return async_simple::makeReadyFuture<ErrorCode>(
+            ErrorCode{impl_->terminal_state->error});
+    }
+    if (impl_->stop_requested) {
+        return async_simple::makeReadyFuture<ErrorCode>(
+            ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+    async_simple::Promise<ErrorCode> promise;
+    auto future = promise.getFuture();
+    impl_->durable_waiters.emplace(sequence, std::move(promise));
+    return future;
 }
 
 bool OrderedOpLogWriter::IsAccepting() const {
@@ -210,6 +447,26 @@ bool OrderedOpLogWriter::IsAccepting() const {
 ErrorCode OrderedOpLogWriter::LastError() const {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     return impl_->last_error;
+}
+
+std::optional<OrderedOpLogWriterTerminalState>
+OrderedOpLogWriter::GetTerminalState() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->terminal_state;
+}
+
+void OrderedOpLogWriter::SetTerminalCallback(TerminalCallback callback) {
+    std::optional<OrderedOpLogWriterTerminalState> terminal;
+    TerminalCallback notify;
+    {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        impl_->terminal_callback = std::move(callback);
+        notify = impl_->terminal_callback;
+        terminal = impl_->terminal_state;
+    }
+    if (terminal && notify) {
+        notify(*terminal);
+    }
 }
 
 void OrderedOpLogWriter::Start() {
@@ -239,6 +496,7 @@ void OrderedOpLogWriter::Start() {
                     .set_batch_record_callback_queue_depth(
                         impl_->callback_entries.size());
 #endif
+                impl_->PublishRuntime();
             }
             if (callback_entry.callback) {
 #ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
@@ -275,6 +533,10 @@ void OrderedOpLogWriter::Start() {
                         impl_->committed_entries.size());
 #endif
                 expected_prefix = impl_->durable_prefix;
+                impl_->stuck_range =
+                    std::make_pair(expected_prefix.last_seq + 1,
+                                   expected_prefix.last_seq + entries.size());
+                impl_->PublishRuntime();
             }
 
             OpLogBatchRecord batch;
@@ -289,9 +551,31 @@ void OrderedOpLogWriter::Start() {
             constexpr auto kInitialRetryDelay = std::chrono::milliseconds(1);
             constexpr auto kMaxRetryDelay = std::chrono::milliseconds(1000);
             auto retry_delay = kInitialRetryDelay;
+            std::optional<std::chrono::steady_clock::time_point> retry_deadline;
+            bool retry_attempt = false;
 
             while (true) {
                 TestFailPoint::Wait("batch_before_txn");
+                if (retry_attempt) {
+                    std::optional<ErrorCode> timeout_error;
+                    {
+                        std::lock_guard<std::mutex> lock(impl_->mutex);
+                        if (impl_->stop_requested) {
+                            return;
+                        }
+                        if (retry_deadline.has_value() &&
+                            std::chrono::steady_clock::now() >=
+                                *retry_deadline) {
+                            timeout_error = impl_->last_error;
+                        }
+                    }
+                    if (timeout_error.has_value()) {
+                        impl_->EnterTerminalState(
+                            *timeout_error,
+                            OrderedOpLogWriterTerminalReason::kRetryTimeout);
+                        return;
+                    }
+                }
 #ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
                 const auto txn_started_at = Impl::Clock::now();
 #endif
@@ -305,6 +589,7 @@ void OrderedOpLogWriter::Start() {
                     txn_latency_us);
 #endif
                 if (err == ErrorCode::OK) {
+                    Impl::DurableWaiters waiters;
                     TestFailPoint::Wait("batch_txn_succeeded_before_callback");
 #ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
                     const auto durable_at = Impl::Clock::now();
@@ -321,8 +606,11 @@ void OrderedOpLogWriter::Start() {
                         std::lock_guard<std::mutex> lock(impl_->mutex);
                         impl_->durable_prefix = {.batch_id = batch.batch_id,
                                                  .last_seq = batch.last_seq};
+                        waiters = impl_->TakeCoveredWaiters();
                         impl_->last_error = ErrorCode::OK;
                         impl_->accepting = !impl_->stop_requested;
+                        impl_->retry_delay_ms = 0;
+                        impl_->stuck_range.reset();
                         for (size_t i = 0; i < entries.size(); ++i) {
 #ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
                             entries[i].durable_at = durable_at;
@@ -346,18 +634,40 @@ void OrderedOpLogWriter::Start() {
 #endif
                         impl_->batch_busy = false;
                         impl_->SealCommittedEntriesIfIdle();
+                        impl_->PublishRuntime();
                     }
                     impl_->cv.notify_all();
+                    Impl::CompleteWaiters(std::move(waiters), ErrorCode::OK);
                     break;
                 }
 
+                if (!IsRetryableWriteError(err)) {
+                    const auto reason =
+                        err == ErrorCode::ETCD_TRANSACTION_FAIL
+                            ? OrderedOpLogWriterTerminalReason::kFenced
+                            : OrderedOpLogWriterTerminalReason::
+                                  kNonRetryableWriteError;
+                    impl_->EnterTerminalState(err, reason);
+                    return;
+                }
                 {
                     std::unique_lock<std::mutex> lock(impl_->mutex);
+                    if (impl_->stop_requested) {
+                        return;
+                    }
 #ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
                     HAMetricManager::instance().inc_batch_record_retries();
 #endif
+                    ++impl_->retry_count;
                     impl_->last_error = err;
                     impl_->accepting = false;
+                    impl_->retry_delay_ms = retry_delay.count();
+                    impl_->PublishRuntime();
+                    if (!retry_deadline.has_value() &&
+                        impl_->config.retry_timeout.count() > 0) {
+                        retry_deadline = std::chrono::steady_clock::now() +
+                                         impl_->config.retry_timeout;
+                    }
                     if (impl_->stop_requested ||
                         impl_->cv.wait_for(lock, retry_delay, [this] {
                             return impl_->stop_requested;
@@ -366,21 +676,33 @@ void OrderedOpLogWriter::Start() {
                     }
                 }
                 retry_delay = std::min(retry_delay * 2, kMaxRetryDelay);
+                retry_attempt = true;
             }
         }
     });
 }
 
 void OrderedOpLogWriter::Stop() {
+    bool running;
+    Impl::DurableWaiters waiters;
+    ErrorCode waiter_error;
     {
         std::lock_guard<std::mutex> lock(impl_->mutex);
         impl_->accepting = false;
         impl_->stop_requested = true;
-        if (!impl_->running) {
-            return;
-        }
+        impl_->retry_delay_ms = 0;
+        impl_->PublishRuntime();
+        running = impl_->running;
+        waiters.swap(impl_->durable_waiters);
+        waiter_error = impl_->terminal_state.has_value()
+                           ? impl_->terminal_state->error
+                           : ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
     }
     impl_->cv.notify_all();
+    Impl::CompleteWaiters(std::move(waiters), waiter_error);
+    if (!running) {
+        return;
+    }
     if (impl_->writer_thread.joinable()) {
         impl_->writer_thread.join();
     }

@@ -163,6 +163,7 @@ OpLogAuditReport AuditOpLogNamespace(const std::string& cluster_id,
             } else if (suffix.size() == kOpLogBatchIdWidth) {
                 AddError(&report, "malformed legacy key: " + kv.key);
             } else if (suffix != "latest" && !suffix.starts_with("snapshot/") &&
+                       !suffix.starts_with("producer_view") &&
                        !suffix.starts_with("cleanup/")) {
                 report.warnings.push_back("unknown OpLog key: " + kv.key);
             }

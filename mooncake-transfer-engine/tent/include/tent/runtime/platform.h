@@ -20,10 +20,23 @@
 namespace mooncake {
 namespace tent {
 
-// MTYPE_TPU is appended last so the numeric values of the existing entries are
-// preserved. TPU HBM is not NIC-addressable, so transfers touching it are
-// staged through host DRAM by ProxyManager (see findStagingPolicy).
-enum MemoryType { MTYPE_UNKNOWN, MTYPE_CPU, MTYPE_CUDA, MTYPE_ROCM, MTYPE_TPU };
+// Append new memory types to preserve existing numeric values. Add device
+// types to isGpuMemoryType() as well so routing and staging agree.
+enum MemoryType {
+    MTYPE_UNKNOWN,
+    MTYPE_CPU,
+    MTYPE_CUDA,
+    MTYPE_ROCM,
+    MTYPE_TPU,
+    MTYPE_XPU,
+    MTYPE_MLU
+};
+
+// Shared by routing and staging. Copy capabilities depend on the transport.
+inline bool isGpuMemoryType(MemoryType t) {
+    return t == MTYPE_CUDA || t == MTYPE_ROCM || t == MTYPE_TPU ||
+           t == MTYPE_XPU || t == MTYPE_MLU;
+}
 
 class Platform {
    public:
@@ -49,6 +62,15 @@ class Platform {
         void *start, size_t len, bool skip_prefault = false) = 0;
 
     virtual const std::string type() const = 0;
+
+    // Make GPUDirect / device DMA visible on devices named in `topology`.
+    // GPU platforms flush those devices; CPU and others no-op. Failures are
+    // logged and still return OK so teardown can continue.
+    virtual Status synchronizeDevices(const Topology *topology);
+
+   protected:
+    static std::vector<int> topologyDeviceIndices(const Topology *topology,
+                                                  Topology::MemType mem_type);
 };
 
 }  // namespace tent

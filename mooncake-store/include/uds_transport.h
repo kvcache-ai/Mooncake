@@ -77,7 +77,7 @@ class UdsAcceptor {
     int listen_fd_ = -1;
     std::atomic<int> active_client_fd_{-1};
     std::atomic<bool> running_{false};
-    std::jthread thread_;
+    std::thread thread_;
 };
 
 }  // namespace mooncake

@@ -117,8 +117,14 @@ tl::expected<size_t, ErrorCode> PosixFile::vector_write(const iovec *iov,
         return make_error<size_t>(ErrorCode::FILE_NOT_FOUND);
     }
 
+    size_t expected_bytes = 0;
+    for (int i = 0; i < iovcnt; ++i) expected_bytes += iov[i].iov_len;
+
     ssize_t ret = ::pwritev(fd_, iov, iovcnt, offset);
     if (ret < 0) {
+        return make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
+    }
+    if (static_cast<size_t>(ret) != expected_bytes) {
         return make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
     }
 

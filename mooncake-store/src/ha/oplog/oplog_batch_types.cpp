@@ -130,6 +130,14 @@ std::string BuildDurablePrefixKey(const std::string& cluster_id) {
     return "/oplog/" + normalized + "/durable_prefix";
 }
 
+std::string BuildProducerViewKey(const std::string& cluster_id) {
+    std::string normalized = cluster_id;
+    if (!NormalizeAndValidateClusterId(normalized) || normalized.empty()) {
+        return {};
+    }
+    return "/oplog/" + normalized + "/producer_view";
+}
+
 BatchRecordRange BuildBatchRecordRange(const std::string& cluster_id,
                                        uint64_t after_batch_id) {
     std::string normalized = cluster_id;

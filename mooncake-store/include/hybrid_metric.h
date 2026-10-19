@@ -17,13 +17,9 @@ class basic_hybrid_counter
     basic_hybrid_counter(std::string name, std::string help,
                          std::map<std::string, std::string> static_labels,
                          std::array<std::string, N> labels_name)
-        : Base(MetricType::Counter, std::move(name), std::move(help),
-               std::move(labels_name)),
-          static_labels_(static_labels) {
-        for (auto& [k, v] : static_labels) {
-            static_labels_str_.append(k).append("=\"").append(v).append("\",");
-        }
-    }
+        : basic_hybrid_counter(MetricType::Counter, std::move(name),
+                               std::move(help), std::move(static_labels),
+                               std::move(labels_name)) {}
     using label_key_type = const std::array<std::string, N>&;
     void inc(label_key_type labels_value, value_type value = 1) {
         detail::inc_impl(Base::try_emplace(labels_value).first->value, value);
@@ -167,6 +163,18 @@ class basic_hybrid_counter
 #endif
 
    protected:
+    // Lets a derived metric reuse this implementation while announcing its own
+    // MetricType, which is what the "# TYPE" line is rendered from.
+    basic_hybrid_counter(MetricType type, std::string name, std::string help,
+                         std::map<std::string, std::string> static_labels,
+                         std::array<std::string, N> labels_name)
+        : Base(type, std::move(name), std::move(help), std::move(labels_name)),
+          static_labels_(static_labels) {
+        for (auto& [k, v] : static_labels) {
+            static_labels_str_.append(k).append("=\"").append(v).append("\",");
+        }
+    }
+
     template <typename T>
     void serialize_map(T& value_map, std::string& str) {
         for (auto& e : value_map) {
@@ -209,6 +217,23 @@ class basic_hybrid_counter
     std::string static_labels_str_;  // preformatted static labels string
     std::map<std::string, std::string> static_labels_;
 };
+
+// A gauge shares the hybrid counter's storage and serialization; only the
+// declared MetricType differs, so that Prometheus is not told a value that can
+// fall is monotonic.
+template <typename value_type, uint8_t N>
+class basic_hybrid_gauge : public basic_hybrid_counter<value_type, N> {
+    using Base = basic_hybrid_counter<value_type, N>;
+
+   public:
+    basic_hybrid_gauge(std::string name, std::string help,
+                       std::map<std::string, std::string> static_labels,
+                       std::array<std::string, N> labels_name)
+        : Base(MetricType::Gauge, std::move(name), std::move(help),
+               std::move(static_labels), std::move(labels_name)) {}
+};
+
+using hybrid_gauge_1t = basic_hybrid_gauge<int64_t, 1>;
 
 using hybrid_counter_1t = basic_hybrid_counter<int64_t, 1>;
 using hybrid_counter_1d = basic_hybrid_counter<double, 1>;
@@ -289,8 +314,10 @@ class basic_hybrid_histogram : public dynamic_metric {
             return;
         }
 
+        const auto initial_size = str.size();
         serialize_head(str);
 
+        bool emitted_any = false;
         std::string value_str;
         auto bucket_counts = get_bucket_counts();
         for (auto& e : value_map) {
@@ -300,6 +327,7 @@ class basic_hybrid_histogram : public dynamic_metric {
                 continue;
             }
 
+            value_str.clear();
             value_type count = 0;
             for (size_t i = 0; i < bucket_counts.size(); i++) {
                 auto counter = bucket_counts[i];
@@ -324,6 +352,7 @@ class basic_hybrid_histogram : public dynamic_metric {
             }
 
             str.append(value_str);
+            emitted_any = true;
 
             std::string labels_str;
             build_label_string_with_static(labels_str, sum_->labels_name(),
@@ -341,8 +370,8 @@ class basic_hybrid_histogram : public dynamic_metric {
             str.append(std::to_string(count));
             str.append("\n");
         }
-        if (value_str.empty()) {
-            str.clear();
+        if (!emitted_any) {
+            str.resize(initial_size);
         }
     }
 

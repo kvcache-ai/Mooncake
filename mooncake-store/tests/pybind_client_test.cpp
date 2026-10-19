@@ -2,19 +2,32 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <barrier>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fcntl.h>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <random>
 #include <string>
 #include <thread>
 #include <unistd.h>
 
+#ifdef MOONCAKE_TEST_CUDA_H2D
+#include <cuda_runtime_api.h>
+#endif
+
+#ifdef MOONCAKE_TEST_XPU_H2D
+#include <sycl/sycl.hpp>
+#endif
+
+#include "config.h"
 #include "real_client.h"
+#include "tenant_id.h"
 #include "test_server_helpers.h"
 
 DEFINE_string(protocol, "tcp", "Transfer protocol: rdma|tcp");
@@ -35,6 +48,54 @@ class GLogMuter {
    private:
     int original_log_level_;
 };
+
+class ScopedEnvVar {
+   public:
+    ScopedEnvVar(const char* name, const char* value = nullptr) : name_(name) {
+        if (const char* previous = getenv(name)) previous_ = previous;
+        if (value) {
+            setenv(name, value, 1);
+        } else {
+            unsetenv(name);
+        }
+    }
+
+    ~ScopedEnvVar() {
+        if (previous_) {
+            setenv(name_.c_str(), previous_->c_str(), 1);
+        } else {
+            unsetenv(name_.c_str());
+        }
+    }
+
+   private:
+    std::string name_;
+    std::optional<std::string> previous_;
+};
+
+class ScopedMaxMrSize {
+   public:
+    explicit ScopedMaxMrSize(size_t max_mr_size)
+        : old_max_mr_size_(globalConfig().max_mr_size) {
+        globalConfig().max_mr_size = max_mr_size;
+    }
+
+    ~ScopedMaxMrSize() { globalConfig().max_mr_size = old_max_mr_size_; }
+
+   private:
+    size_t old_max_mr_size_;
+};
+
+TEST(TransportRegistrationLimitTest, ClassifiesProtocols) {
+    constexpr size_t kMaxMrSize = 64 * 1024 * 1024;
+    ScopedMaxMrSize limit(kMaxMrSize);
+
+    EXPECT_EQ(GetTransportRegistrationLimit("rdma"), std::nullopt);
+    EXPECT_EQ(GetTransportRegistrationLimit("tcp"), std::nullopt);
+    EXPECT_EQ(GetTransportRegistrationLimit("efa"), kMaxMrSize);
+    EXPECT_EQ(GetTransportRegistrationLimit("cxi"), kMaxMrSize);
+    EXPECT_TRUE(GetTransportRegistrationLimit("ub").has_value());
+}
 
 class RealClientTest : public ::testing::Test {
    protected:
@@ -60,9 +121,11 @@ class RealClientTest : public ::testing::Test {
     void TearDown() override {
         if (py_client_) {
             py_client_->tearDownAll();
+            if (!ssd_path_.empty()) py_client_.reset();
         }
 
         master_.Stop();
+        if (!ssd_path_.empty()) std::filesystem::remove_all(ssd_path_);
     }
 
     std::shared_ptr<RealClient> py_client_;
@@ -70,6 +133,7 @@ class RealClientTest : public ::testing::Test {
     // In-proc master for tests
     mooncake::testing::InProcMaster master_;
     std::string master_address_;
+    std::string ssd_path_;
 
     void StartMasterAndSetupClient() {
         ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))
@@ -117,6 +181,564 @@ class RealClientTest : public ::testing::Test {
     }
 };
 
+TEST_F(RealClientTest, BatchGetIntoUsesSelectedLocalDiskEndpoint) {
+    StartMasterAndSetupClient();
+
+    constexpr size_t object_size = 16;
+    auto make_local_disk = [object_size](const std::string& endpoint,
+                                         ReplicaStatus status) {
+        Replica::Descriptor replica;
+        LocalDiskDescriptor descriptor;
+        descriptor.client_id = generate_uuid();
+        descriptor.object_size = object_size;
+        descriptor.transport_endpoint = endpoint;
+        replica.descriptor_variant = std::move(descriptor);
+        replica.status = status;
+        return replica;
+    };
+
+    struct TestCase {
+        std::string name;
+        std::vector<Replica::Descriptor> replicas;
+        std::string expected_endpoint;
+    };
+    std::vector<TestCase> test_cases;
+    // SelectBestReplica currently chooses the last COMPLETE LOCAL_DISK
+    // descriptor. Both list orders make a first-vs-last mismatch observable.
+    test_cases.push_back(
+        {.name = "a_then_b",
+         .replicas = {make_local_disk("endpoint-a", ReplicaStatus::COMPLETE),
+                      make_local_disk("endpoint-b", ReplicaStatus::COMPLETE)},
+         .expected_endpoint = "endpoint-b"});
+    test_cases.push_back(
+        {.name = "b_then_a",
+         .replicas = {make_local_disk("endpoint-b", ReplicaStatus::COMPLETE),
+                      make_local_disk("endpoint-a", ReplicaStatus::COMPLETE)},
+         .expected_endpoint = "endpoint-a"});
+    test_cases.push_back(
+        {.name = "not_ready_then_complete",
+         .replicas = {make_local_disk("endpoint-not-ready",
+                                      ReplicaStatus::PROCESSING),
+                      make_local_disk("endpoint-complete",
+                                      ReplicaStatus::COMPLETE)},
+         .expected_endpoint = "endpoint-complete"});
+
+    for (auto& test_case : test_cases) {
+        SCOPED_TRACE(test_case.name);
+        std::vector<tl::expected<QueryResult, ErrorCode>> query_results;
+        query_results.emplace_back(QueryResult(
+            std::move(test_case.replicas),
+            std::chrono::steady_clock::now() + std::chrono::minutes(1)));
+
+        std::vector<char> destination(object_size);
+        std::string visited_endpoint;
+        // Stop at the offload RPC boundary after recording its destination.
+        // The injected error also prevents checksum verification of the
+        // intentionally untouched destination buffer.
+        auto local_disk_reader = [&visited_endpoint](
+                                     const std::string& endpoint,
+                                     RealClient::LocalDiskOffloadObjects&)
+            -> tl::expected<void, ErrorCode> {
+            visited_endpoint = endpoint;
+            return tl::make_unexpected(ErrorCode::RPC_FAIL);
+        };
+
+        std::vector<tl::expected<int64_t, ErrorCode>> results;
+        {
+            GLogMuter muter;
+            results = py_client_->batch_get_into_internal(
+                {"endpoint-selection-key"}, {destination.data()},
+                {destination.size()}, query_results, local_disk_reader);
+        }
+
+        EXPECT_EQ(visited_endpoint, test_case.expected_endpoint);
+        ASSERT_EQ(results.size(), 1);
+        ASSERT_FALSE(results[0].has_value());
+        EXPECT_EQ(results[0].error(), ErrorCode::RPC_FAIL);
+    }
+}
+
+TEST_F(RealClientTest, SessionRangesReadDfsAndPropagateShortRead) {
+    ScopedEnvVar enable_dfs("MOONCAKE_ENABLE_DFS", "1");
+    ScopedEnvVar storage_backend("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+                                 "distributed_storage_backend");
+    ScopedEnvVar local_buffer("MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES",
+                              "16777216");
+    ScopedEnvVar dfs_adapter("MOONCAKE_DFS_FS_ADAPTER", "posix");
+    ScopedEnvVar dfs_shards("MOONCAKE_DFS_SHARD_COUNT", "1");
+    ScopedEnvVar dfs_capacity("MOONCAKE_DFS_SHARD_CAPACITY", "16777216");
+    ScopedEnvVar dfs_alignment("MOONCAKE_DFS_ALIGNMENT", "4096");
+    ScopedEnvVar dfs_eviction("MOONCAKE_DFS_EVICTION_ENABLED", "0");
+    ScopedEnvVar dfs_deferred_free("MOONCAKE_DFS_DEFERRED_FREE_SECONDS", "0");
+    ScopedEnvVar dfs_single_tenant("MOONCAKE_DFS_SINGLE_TENANT", "true");
+
+    char path[] = "/tmp/mooncake_session_dfs_XXXXXX";
+    const char* created = mkdtemp(path);
+    ASSERT_NE(created, nullptr);
+    ssd_path_ = created;
+    ScopedEnvVar dfs_root("MOONCAKE_DFS_ROOT_DIR", ssd_path_.c_str());
+
+    ASSERT_TRUE(master_.Start(
+        InProcMasterConfigBuilder().set_default_kv_lease_ttl(1000).build()));
+    master_address_ = master_.master_address();
+    constexpr char kClientAddress[] = "localhost:17824";
+    ASSERT_EQ(
+        py_client_->setup_real(kClientAddress, "P2PHANDSHAKE", 16 * 1024 * 1024,
+                               16 * 1024 * 1024, "tcp", "", master_address_,
+                               nullptr, "", true, ssd_path_),
+        0);
+
+    constexpr size_t kObjectSize = 4096;
+    const std::string key = "session_dfs";
+    std::string source(kObjectSize, '\0');
+    for (size_t i = 0; i < source.size(); ++i) {
+        source[i] = static_cast<char>((i * 7) % 251);
+    }
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.dfs_replica_num = 1;
+    ASSERT_EQ(py_client_->put(key, source, config), 0);
+    ASSERT_EQ(py_client_->batch_replica_clear({key}, kClientAddress).size(), 1);
+
+    const auto replicas = py_client_->get_replica_desc(key);
+    ASSERT_EQ(replicas.size(), 1);
+    ASSERT_TRUE(replicas.front().is_dfs_replica());
+    const auto dfs_descriptor = replicas.front().get_dfs_descriptor();
+
+    std::string first(512, '\0');
+    std::string second(777, '\0');
+    ASSERT_EQ(py_client_->register_buffer(first.data(), first.size()), 0);
+    ASSERT_EQ(py_client_->register_buffer(second.data(), second.size()), 0);
+    ASSERT_EQ(py_client_->batch_get_session_start({key}), std::vector<int>{0});
+
+    auto client_buffer_allocator =
+        std::move(py_client_->client_buffer_allocator_);
+    auto results = py_client_->batch_get_into_multi_buffer_ranges(
+        {key}, {{first.data()}}, {{first.size()}}, {{127}});
+    ASSERT_EQ(results, std::vector<int>{static_cast<int>(
+                           toInt(ErrorCode::NO_AVAILABLE_HANDLE))});
+    py_client_->client_buffer_allocator_ = std::move(client_buffer_allocator);
+
+    results = py_client_->batch_get_into_multi_buffer_ranges(
+        {key}, {{first.data(), second.data()}}, {{first.size(), second.size()}},
+        {{127, 2048}});
+    ASSERT_EQ(results,
+              std::vector<int>{static_cast<int>(first.size() + second.size())});
+    EXPECT_EQ(first, source.substr(127, first.size()));
+    EXPECT_EQ(second, source.substr(2048, second.size()));
+
+    std::filesystem::resize_file(dfs_descriptor.file_path,
+                                 dfs_descriptor.offset + kObjectSize / 2);
+    results = py_client_->batch_get_into_multi_buffer_ranges(
+        {key}, {{first.data()}}, {{first.size()}}, {{0}});
+    ASSERT_EQ(results.size(), 1);
+    EXPECT_EQ(results[0], static_cast<int>(toInt(ErrorCode::FILE_READ_FAIL)));
+
+    EXPECT_EQ(py_client_->batch_get_session_end({key}), 0);
+    EXPECT_EQ(py_client_->unregister_buffer(first.data()), 0);
+    EXPECT_EQ(py_client_->unregister_buffer(second.data()), 0);
+}
+
+#ifdef MOONCAKE_TEST_CUDA_H2D
+TEST_F(RealClientTest, LastHitOnlyGpuCheckpointRoundTrip) {
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
+        GTEST_SKIP() << "CUDA device is unavailable";
+    }
+
+    ScopedEnvVar local_memcpy("MC_STORE_MEMCPY", "1");
+    StartMasterAndSetupClient();
+    ASSERT_FALSE(HasFatalFailure());
+
+    // Three synthetic TP8 checkpoints, each with two state components per
+    // rank. The last checkpoint is missing one component.
+    constexpr size_t kCandidateSize = 16;
+    constexpr size_t kKeyCount = 3 * kCandidateSize;
+    constexpr size_t kPartSize = 4096;
+    constexpr size_t kPayloadSize = kKeyCount * kPartSize;
+    std::vector<char> source(kPayloadSize);
+    for (size_t i = 0; i < source.size(); ++i) {
+        source[i] = static_cast<char>(i % 251);
+    }
+    void* allocation = nullptr;
+    ASSERT_EQ(cudaMalloc(&allocation, 2 * kPayloadSize), cudaSuccess);
+    bool registered = false;
+    auto cleanup = [this, &registered](void* ptr) {
+        if (registered) EXPECT_EQ(py_client_->unregister_buffer(ptr), 0);
+        EXPECT_EQ(cudaFree(ptr), cudaSuccess);
+    };
+    std::unique_ptr<void, decltype(cleanup)> gpu_owner(allocation, cleanup);
+    ASSERT_EQ(cudaMemcpy(allocation, source.data(), kPayloadSize,
+                         cudaMemcpyHostToDevice),
+              cudaSuccess);
+    ASSERT_EQ(py_client_->register_buffer(allocation, 2 * kPayloadSize), 0);
+    registered = true;
+
+    std::vector<std::string> keys;
+    std::vector<void*> buffers;
+    for (size_t i = 0; i < kKeyCount; ++i) {
+        keys.push_back("gpu-probe-" + std::to_string(i));
+        if (i + 1 < kKeyCount) {
+            buffers.push_back(static_cast<char*>(allocation) + i * kPartSize);
+        }
+    }
+    const std::vector<std::string> present(keys.begin(), keys.end() - 1);
+    ASSERT_EQ(
+        py_client_->batch_put_from(
+            present, buffers, std::vector<size_t>(present.size(), kPartSize),
+            {.replica_num = 1}),
+        std::vector<int>(present.size(), 0));
+
+    auto expected = std::vector<int>(kKeyCount, 1);
+    expected.back() = 0;
+    EXPECT_EQ(py_client_->batchProbeKey(keys), expected);
+    ASSERT_EQ(py_client_->batchProbeKey(
+                  keys, {ProbeLeaseMode::LastHitOnly, kCandidateSize}),
+              expected);
+
+    const std::vector<std::string> selected(keys.begin() + kCandidateSize,
+                                            keys.begin() + 2 * kCandidateSize);
+    for (const auto& key : selected) {
+        EXPECT_EQ(py_client_->remove(key), toInt(ErrorCode::OBJECT_HAS_LEASE));
+    }
+    // Existence results remain true for unselected keys without leasing them.
+    EXPECT_EQ(py_client_->remove(keys.front()), 0);
+    EXPECT_EQ(py_client_->remove(keys[kKeyCount - 2]), 0);
+
+    auto* destination = static_cast<char*>(allocation) + kPayloadSize;
+    ASSERT_EQ(cudaMemset(destination, 0, kCandidateSize * kPartSize),
+              cudaSuccess);
+    buffers.clear();
+    for (size_t i = 0; i < kCandidateSize; ++i) {
+        buffers.push_back(destination + i * kPartSize);
+    }
+    ASSERT_EQ(
+        py_client_->batch_get_into(
+            selected, buffers, std::vector<size_t>(kCandidateSize, kPartSize)),
+        std::vector<int64_t>(kCandidateSize, kPartSize));
+    std::vector<char> actual(kCandidateSize * kPartSize);
+    ASSERT_EQ(cudaMemcpy(actual.data(), destination, actual.size(),
+                         cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    EXPECT_TRUE(std::equal(actual.begin(), actual.end(),
+                           source.begin() + kCandidateSize * kPartSize));
+}
+
+TEST_F(RealClientTest, SessionRangesReadDfsIntoGpuUsesPinnedArena) {
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
+        GTEST_SKIP() << "CUDA device is unavailable";
+    }
+
+    ScopedEnvVar local_memcpy("MC_STORE_MEMCPY", "1");
+    ScopedEnvVar pinned_restore_arena(
+        "MC_STORE_PINNED_RESTORE_ARENA_SIZE_BYTES", "1048576");
+    ScopedEnvVar enable_dfs("MOONCAKE_ENABLE_DFS", "1");
+    ScopedEnvVar storage_backend("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+                                 "distributed_storage_backend");
+    ScopedEnvVar local_buffer("MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES",
+                              "16777216");
+    ScopedEnvVar dfs_adapter("MOONCAKE_DFS_FS_ADAPTER", "posix");
+    ScopedEnvVar dfs_shards("MOONCAKE_DFS_SHARD_COUNT", "1");
+    ScopedEnvVar dfs_capacity("MOONCAKE_DFS_SHARD_CAPACITY", "16777216");
+    ScopedEnvVar dfs_alignment("MOONCAKE_DFS_ALIGNMENT", "4096");
+    ScopedEnvVar dfs_eviction("MOONCAKE_DFS_EVICTION_ENABLED", "0");
+    ScopedEnvVar dfs_deferred_free("MOONCAKE_DFS_DEFERRED_FREE_SECONDS", "0");
+    ScopedEnvVar dfs_single_tenant("MOONCAKE_DFS_SINGLE_TENANT", "true");
+
+    char path[] = "/tmp/mooncake_session_dfs_gpu_XXXXXX";
+    const char* created = mkdtemp(path);
+    ASSERT_NE(created, nullptr);
+    ssd_path_ = created;
+    ScopedEnvVar dfs_root("MOONCAKE_DFS_ROOT_DIR", ssd_path_.c_str());
+
+    ASSERT_TRUE(master_.Start(
+        InProcMasterConfigBuilder().set_default_kv_lease_ttl(1000).build()));
+    master_address_ = master_.master_address();
+    constexpr char kClientAddress[] = "localhost:17825";
+    ASSERT_EQ(
+        py_client_->setup_real(kClientAddress, "P2PHANDSHAKE", 16 * 1024 * 1024,
+                               16 * 1024 * 1024, "tcp", "", master_address_,
+                               nullptr, "", true, ssd_path_),
+        0);
+
+    constexpr size_t kObjectSize = 4096;
+    constexpr size_t kSourceOffset = 257;
+    constexpr size_t kRangeSize = 1024;
+    const std::string key = "session_dfs_gpu";
+    std::vector<char> source(kObjectSize);
+    for (size_t i = 0; i < source.size(); ++i) {
+        source[i] = static_cast<char>(i % 251);
+    }
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.dfs_replica_num = 1;
+    ASSERT_EQ(py_client_->put(key, source, config), 0);
+    ASSERT_EQ(py_client_->batch_replica_clear({key}, kClientAddress).size(), 1);
+    const auto replicas = py_client_->get_replica_desc(key);
+    ASSERT_EQ(replicas.size(), 1);
+    ASSERT_TRUE(replicas.front().is_dfs_replica());
+    ASSERT_EQ(py_client_->batch_get_session_start({key}), std::vector<int>{0});
+
+    void* gpu_destination = nullptr;
+    ASSERT_EQ(cudaMalloc(&gpu_destination, kRangeSize), cudaSuccess);
+    bool registered = false;
+    auto cleanup = [this, &registered](void* ptr) {
+        if (registered) EXPECT_EQ(py_client_->unregister_buffer(ptr), 0);
+        EXPECT_EQ(cudaFree(ptr), cudaSuccess);
+    };
+    std::unique_ptr<void, decltype(cleanup)> gpu_owner(gpu_destination,
+                                                       cleanup);
+    ASSERT_EQ(py_client_->register_buffer(gpu_destination, kRangeSize), 0);
+    registered = true;
+
+    // Remove the fallback allocator so success proves that device-targeted DFS
+    // staging came from the pinned restore arena.
+    auto fallback_allocator = std::move(py_client_->client_buffer_allocator_);
+    auto results = py_client_->batch_get_into_multi_buffer_ranges(
+        {key}, {{gpu_destination}}, {{kRangeSize}}, {{kSourceOffset}});
+    py_client_->client_buffer_allocator_ = std::move(fallback_allocator);
+
+    ASSERT_EQ(results, std::vector<int>{static_cast<int>(kRangeSize)});
+    std::vector<char> actual(kRangeSize);
+    ASSERT_EQ(cudaMemcpy(actual.data(), gpu_destination, kRangeSize,
+                         cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    EXPECT_TRUE(std::equal(actual.begin(), actual.end(),
+                           source.begin() + kSourceOffset));
+    EXPECT_EQ(py_client_->batch_get_session_end({key}), 0);
+}
+
+TEST_F(RealClientTest, RangedSnapshotGpuReadBypassesNewerHotCacheValue) {
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
+        GTEST_SKIP() << "CUDA device is unavailable";
+    }
+
+    ScopedEnvVar local_memcpy("MC_STORE_MEMCPY", "1");
+    ScopedEnvVar cache_size("MC_STORE_LOCAL_HOT_CACHE_SIZE", "1048576");
+    ScopedEnvVar block_size("MC_STORE_LOCAL_HOT_BLOCK_SIZE", "4096");
+    ScopedEnvVar shared_cache("MC_STORE_LOCAL_HOT_CACHE_USE_SHM", "1");
+    ScopedEnvVar admission("MC_STORE_LOCAL_HOT_ADMISSION_THRESHOLD", "1");
+    StartMasterAndSetupClient();
+    const std::string key = "snapshot_gpu_hot_cache";
+    const std::string original(32, 'A');
+    const std::string replacement(32, 'B');
+    ASSERT_EQ(py_client_->put(key, std::span<const char>(original)), 0);
+    auto queries = py_client_->batch_query({key});
+    ASSERT_EQ(queries.size(), 1);
+    ASSERT_TRUE(queries[0].has_value());
+    PyClient::QueryResultCache snapshot;
+    snapshot.emplace(key, std::move(queries[0]));
+    ASSERT_EQ(py_client_->upsert(key, std::span<const char>(replacement)), 0);
+
+    // Populate the key-based cache with the new value after taking the old
+    // snapshot. Keep the read buffer alive until the async cache fill
+    // completes.
+    auto current = py_client_->get_buffer(key);
+    ASSERT_NE(current, nullptr);
+    ASSERT_EQ(std::string(static_cast<char*>(current->ptr()), current->size()),
+              replacement);
+    bool cache_ready = false;
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (py_client_->acquire_hot_cache(key).has_value()) {
+            ASSERT_TRUE(py_client_->release_hot_cache(key).has_value());
+            cache_ready = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    ASSERT_TRUE(cache_ready);
+
+    void* destination = nullptr;
+    ASSERT_EQ(cudaMalloc(&destination, original.size()), cudaSuccess);
+    bool registered = false;
+    auto cleanup = [this, &registered](void* ptr) {
+        if (registered) EXPECT_EQ(py_client_->unregister_buffer(ptr), 0);
+        EXPECT_EQ(cudaFree(ptr), cudaSuccess);
+    };
+    std::unique_ptr<void, decltype(cleanup)> owner(destination, cleanup);
+    ASSERT_EQ(py_client_->register_buffer(destination, original.size()), 0);
+    registered = true;
+    EXPECT_EQ(py_client_->get_into_ranges_from_snapshot(
+                  {destination}, {{key}}, {{{0}}}, {{{0}}},
+                  {{{original.size()}}}, snapshot),
+              (std::vector<std::vector<std::vector<int64_t>>>{{{32}}}));
+    std::string actual(original.size(), '\0');
+    ASSERT_EQ(cudaMemcpy(actual.data(), destination, actual.size(),
+                         cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    EXPECT_EQ(actual, original);
+}
+
+TEST_F(RealClientTest, PinnedSsdRestoreReadsNonTailRangeIntoGpu) {
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
+        GTEST_SKIP() << "CUDA device is unavailable";
+    }
+
+    ScopedEnvVar local_memcpy("MC_STORE_MEMCPY", "1");
+    ScopedEnvVar heartbeat("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "1");
+    ScopedEnvVar pinned_restore_arena(
+        "MC_STORE_PINNED_RESTORE_ARENA_SIZE_BYTES", "1048576");
+    ScopedEnvVar storage_backend("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+                                 "bucket_storage_backend");
+    ScopedEnvVar bucket_keys("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "1");
+
+    char path[] = "/tmp/mooncake_ssd_pinned_restore_XXXXXX";
+    const char* created = mkdtemp(path);
+    ASSERT_NE(created, nullptr);
+    ssd_path_ = created;
+
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
+                                  .set_enable_offload(true)
+                                  .set_default_kv_lease_ttl(10)
+                                  .build()));
+    master_address_ = master_.master_address();
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                               16 * 1024 * 1024, 16 * 1024 * 1024, "tcp", "",
+                               master_address_, nullptr, "", true, ssd_path_),
+        0);
+
+    constexpr size_t kObjectSize = 64 * 1024;
+    constexpr size_t kSourceOffset = 8 * 1024;
+    constexpr size_t kRangeSize = 16 * 1024;
+    static_assert(kSourceOffset + kRangeSize < kObjectSize);
+    std::vector<char> source(kObjectSize);
+    for (size_t i = 0; i < source.size(); ++i) {
+        source[i] = static_cast<char>(i % 251);
+    }
+    const std::string key = "pinned_ssd_non_tail_range";
+    ASSERT_EQ(py_client_->put(key, source), 0);
+
+    bool disk_ready = false;
+    const auto offload_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (std::chrono::steady_clock::now() < offload_deadline && !disk_ready) {
+        for (const auto& replica : py_client_->get_replica_desc(key)) {
+            if (replica.is_local_disk_replica()) {
+                disk_ready = true;
+            }
+        }
+        if (!disk_ready)
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    ASSERT_TRUE(disk_ready);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    const auto clear_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    bool memory_cleared = false;
+    while (std::chrono::steady_clock::now() < clear_deadline) {
+        if (py_client_->batch_replica_clear({key}, "localhost:17813").size() ==
+            1) {
+            memory_cleared = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    ASSERT_TRUE(memory_cleared);
+
+    auto replicas = py_client_->get_replica_desc(key);
+    ASSERT_EQ(replicas.size(), 1);
+    ASSERT_TRUE(replicas.front().is_local_disk_replica());
+
+    void* gpu_destination = nullptr;
+    ASSERT_EQ(cudaMalloc(&gpu_destination, kRangeSize), cudaSuccess);
+    bool registered = false;
+    auto cleanup = [this, &registered](void* ptr) {
+        if (registered) {
+            EXPECT_EQ(py_client_->unregister_buffer(ptr), 0);
+        }
+        EXPECT_EQ(cudaFree(ptr), cudaSuccess);
+    };
+    std::unique_ptr<void, decltype(cleanup)> gpu_owner(gpu_destination,
+                                                       cleanup);
+    ASSERT_EQ(py_client_->register_buffer(gpu_destination, kRangeSize), 0);
+    registered = true;
+
+    const auto reads_before = py_client_->get_offload_rpc_read_count();
+    auto results =
+        py_client_->get_into_ranges({gpu_destination}, {{key}}, {{{0}}},
+                                    {{{kSourceOffset}}}, {{{kRangeSize}}});
+    ASSERT_EQ(results.size(), 1);
+    ASSERT_EQ(results[0].size(), 1);
+    ASSERT_EQ(results[0][0].size(), 1);
+    EXPECT_EQ(results[0][0][0], static_cast<int64_t>(kRangeSize));
+    EXPECT_EQ(py_client_->get_offload_rpc_read_count(), reads_before + 1);
+
+    std::vector<char> actual(kRangeSize);
+    ASSERT_EQ(cudaMemcpy(actual.data(), gpu_destination, kRangeSize,
+                         cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    EXPECT_TRUE(std::equal(actual.begin(), actual.end(),
+                           source.begin() + kSourceOffset));
+}
+#endif
+
+#ifdef MOONCAKE_TEST_XPU_H2D
+// Acceptance for XPU store staging: an object written straight from Intel GPU
+// USM (allocated the way PyTorch does, outside the Store) round-trips
+// byte-equal through the Store back into a second GPU buffer, with the VRAM
+// <-> host staging handled by the XPU accelerator device and TENT.
+TEST_F(RealClientTest, XpuDeviceBufferPutGetRoundTrips) {
+    std::optional<sycl::device> gpu;
+    for (const auto& d : sycl::device::get_devices()) {
+        if (d.is_gpu() && d.has(sycl::aspect::usm_device_allocations)) {
+            gpu = d;
+            break;
+        }
+    }
+    if (!gpu) GTEST_SKIP() << "XPU device is unavailable";
+    sycl::context ctx = gpu->get_platform().ext_oneapi_get_default_context();
+    sycl::queue queue(ctx, *gpu);
+
+    StartMasterAndSetupClient();
+
+    constexpr size_t kSize = 1 << 20;
+    std::vector<char> source(kSize);
+    std::mt19937 rng(7);
+    for (auto& byte : source) byte = static_cast<char>(rng());
+
+    auto* gpu_source =
+        static_cast<char*>(sycl::malloc_device(kSize, *gpu, ctx));
+    auto* gpu_destination =
+        static_cast<char*>(sycl::malloc_device(kSize, *gpu, ctx));
+    ASSERT_NE(gpu_source, nullptr);
+    ASSERT_NE(gpu_destination, nullptr);
+    queue.memcpy(gpu_source, source.data(), kSize).wait();
+    queue.memset(gpu_destination, 0, kSize).wait();
+
+    ASSERT_EQ(py_client_->register_buffer(gpu_source, kSize), 0);
+    ASSERT_EQ(py_client_->register_buffer(gpu_destination, kSize), 0);
+
+    const std::string key = "xpu_roundtrip";
+    ReplicateConfig config;
+    config.replica_num = 1;
+    EXPECT_EQ(py_client_->put_from(key, gpu_source, kSize, config), 0);
+
+    // Host-side view of the stored object must equal the GPU source.
+    auto handle = py_client_->get_buffer(key);
+    ASSERT_NE(handle, nullptr);
+    ASSERT_EQ(handle->size(), kSize);
+    EXPECT_EQ(std::memcmp(handle->ptr(), source.data(), kSize), 0);
+
+    EXPECT_EQ(py_client_->get_into(key, gpu_destination, kSize),
+              static_cast<int64_t>(kSize));
+    std::vector<char> actual(kSize);
+    queue.memcpy(actual.data(), gpu_destination, kSize).wait();
+    EXPECT_EQ(actual, source);
+
+    EXPECT_EQ(py_client_->unregister_buffer(gpu_source), 0);
+    EXPECT_EQ(py_client_->unregister_buffer(gpu_destination), 0);
+    sycl::free(gpu_source, ctx);
+    sycl::free(gpu_destination, ctx);
+}
+#endif
+
 TEST_F(RealClientTest, AllocateAndMountSegmentAlignsAndUnmounts) {
     StartMasterAndSetupClient();
 
@@ -140,6 +762,95 @@ TEST_F(RealClientTest, AllocateAndMountSegmentAlignsAndUnmounts) {
     EXPECT_EQ(allocated_size, slab_size * 2);
     ASSERT_FALSE(segment_ids.empty());
     EXPECT_EQ(py_client_->unmountAndFreeSegment(segment_ids), 0);
+}
+
+TEST_F(RealClientTest, TcpSetupDoesNotSplitAtMaxMrSize) {
+    const size_t slab_size = facebook::cachelib::Slab::kSize;
+    ScopedMaxMrSize limit(2 * slab_size);
+
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
+    master_address_ = master_.master_address();
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17814", "P2PHANDSHAKE", 6 * slab_size,
+                               0, "tcp", "", master_address_),
+        0);
+
+    auto details = master_.service()->GetSegmentsDetailForAdmin();
+    ASSERT_TRUE(details.has_value());
+    ASSERT_EQ(details->size(), 1u);
+    EXPECT_EQ(details->front().size_bytes, 6 * slab_size);
+}
+
+TEST_F(RealClientTest, DynamicMountApisBalanceLimitedSegments) {
+    const size_t slab_size = facebook::cachelib::Slab::kSize;
+    ScopedMaxMrSize limit(4 * slab_size);
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
+    master_address_ = master_.master_address();
+    ASSERT_EQ(py_client_->setup_real("localhost:17815", "P2PHANDSHAKE", 0, 0,
+                                     "tcp", "", master_address_),
+              0);
+
+    std::vector<std::string> allocated_ids;
+    size_t allocated_size = 0;
+    ASSERT_EQ(py_client_->allocateAndMountSegment(
+                  6 * slab_size, "efa", "", allocated_ids, &allocated_size),
+              0);
+    ASSERT_EQ(allocated_ids.size(), 2u);
+
+    const std::string path = CreateTempSegmentFile(6 * slab_size);
+    ASSERT_FALSE(path.empty());
+    std::vector<std::string> mounted_ids;
+    ASSERT_EQ(py_client_->mountSegment(path, 0, 6 * slab_size, "efa", "",
+                                       mounted_ids),
+              0);
+    ASSERT_EQ(mounted_ids.size(), 2u);
+
+    auto details = master_.service()->GetSegmentsDetailForAdmin();
+    ASSERT_TRUE(details.has_value());
+    ASSERT_EQ(details->size(), 4u);
+    for (const auto& detail : *details) {
+        EXPECT_EQ(detail.size_bytes, 3 * slab_size);
+    }
+
+    EXPECT_EQ(py_client_->unmountAndFreeSegment(allocated_ids), 0);
+    EXPECT_EQ(py_client_->unmountSegment(mounted_ids), 0);
+    EXPECT_EQ(std::remove(path.c_str()), 0);
+}
+
+TEST_F(RealClientTest, DynamicMountApisDoNotSplitRdma) {
+    const size_t slab_size = facebook::cachelib::Slab::kSize;
+    ScopedMaxMrSize limit(4 * slab_size);
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
+    master_address_ = master_.master_address();
+    ASSERT_EQ(py_client_->setup_real("localhost:17816", "P2PHANDSHAKE", 0, 0,
+                                     "tcp", "", master_address_),
+              0);
+
+    std::vector<std::string> allocated_ids;
+    size_t allocated_size = 0;
+    ASSERT_EQ(py_client_->allocateAndMountSegment(
+                  6 * slab_size, "rdma", "", allocated_ids, &allocated_size),
+              0);
+    ASSERT_EQ(allocated_ids.size(), 1u);
+
+    const std::string path = CreateTempSegmentFile(6 * slab_size);
+    ASSERT_FALSE(path.empty());
+    std::vector<std::string> mounted_ids;
+    ASSERT_EQ(py_client_->mountSegment(path, 0, 6 * slab_size, "rdma", "",
+                                       mounted_ids),
+              0);
+    ASSERT_EQ(mounted_ids.size(), 1u);
+
+    auto details = master_.service()->GetSegmentsDetailForAdmin();
+    ASSERT_TRUE(details.has_value());
+    ASSERT_EQ(details->size(), 2u);
+    for (const auto& detail : *details) {
+        EXPECT_EQ(detail.size_bytes, 6 * slab_size);
+    }
+
+    EXPECT_EQ(py_client_->unmountAndFreeSegment(allocated_ids), 0);
+    EXPECT_EQ(py_client_->unmountSegment(mounted_ids), 0);
+    EXPECT_EQ(std::remove(path.c_str()), 0);
 }
 
 TEST_F(RealClientTest, AllocateAndMountSegmentRejectsOverflowSize) {
@@ -306,6 +1017,72 @@ TEST_F(RealClientTest, GetIntoAcceptsSubrangeOfLocalRegisteredBuffer) {
     auto bytes_read = py_client_->get_into(key, dst, test_data.size());
     ASSERT_EQ(bytes_read, static_cast<int64_t>(test_data.size()));
     EXPECT_EQ(std::string(dst, test_data.size()), test_data);
+}
+
+TEST_F(RealClientTest, RangedSnapshotPreservesPayloadAcrossSameSizeUpsert) {
+    StartMasterAndSetupClient();
+    const std::string key = "ranged_snapshot_upsert";
+    const std::string original(32, 'A');
+    const std::string replacement(32, 'B');
+    ASSERT_EQ(py_client_->put(key, std::span<const char>(original)), 0);
+    auto queries = py_client_->batch_query({key});
+    ASSERT_EQ(queries.size(), 1);
+    ASSERT_TRUE(queries[0].has_value());
+    PyClient::QueryResultCache snapshot;
+    snapshot.emplace(key, std::move(queries[0]));
+    auto destination = py_client_->allocate_client_buffer(original.size());
+    ASSERT_TRUE(destination.has_value());
+    auto read = [&](size_t offset, size_t size) {
+        return py_client_->get_into_ranges_from_snapshot(
+            {destination->ptr()}, {{key}}, {{{offset}}}, {{{offset}}},
+            {{{size}}}, snapshot);
+    };
+
+    // Pause between prefix and payload, then replace the same-size object.
+    EXPECT_EQ(read(0, 4),
+              (std::vector<std::vector<std::vector<int64_t>>>{{{4}}}));
+    ASSERT_EQ(py_client_->upsert(key, std::span<const char>(replacement)), 0);
+    EXPECT_EQ(read(4, 28),
+              (std::vector<std::vector<std::vector<int64_t>>>{{{28}}}));
+    EXPECT_EQ(std::string(static_cast<char*>(destination->ptr()), 32),
+              original);
+    auto current = py_client_->get_buffer(key);
+    ASSERT_NE(current, nullptr);
+    EXPECT_EQ(std::string(static_cast<char*>(current->ptr()), current->size()),
+              replacement);
+}
+
+TEST_F(RealClientTest, RangedSnapshotDoesNotRefreshExpiredOrMissingEntries) {
+    StartMasterAndSetupClient();
+    const std::string key = "ranged_snapshot_expired";
+    const std::string data(32, 'A');
+    ASSERT_EQ(py_client_->put(key, std::span<const char>(data)), 0);
+    auto queries = py_client_->batch_query({key});
+    ASSERT_EQ(queries.size(), 1);
+    ASSERT_TRUE(queries[0].has_value());
+    PyClient::QueryResultCache snapshot;
+    snapshot.emplace(
+        key, QueryResult(
+                 std::vector<Replica::Descriptor>(queries[0]->replicas),
+                 std::chrono::steady_clock::now() - std::chrono::seconds(1)));
+    auto destination = py_client_->allocate_client_buffer(data.size());
+    ASSERT_TRUE(destination.has_value());
+    auto read = [&]() {
+        return py_client_->get_into_ranges_from_snapshot(
+            {destination->ptr()}, {{key}}, {{{0}}}, {{{4}}}, {{{4}}}, snapshot);
+    };
+    EXPECT_EQ(read(), (std::vector<std::vector<std::vector<int64_t>>>{
+                          {{toInt(ErrorCode::LEASE_EXPIRED)}}}));
+    // The existing cache API still allows refresh for independent reads.
+    EXPECT_EQ(py_client_->get_into_ranges({destination->ptr()}, {{key}},
+                                          {{{0}}}, {{{4}}}, {{{4}}}, &snapshot),
+              (std::vector<std::vector<std::vector<int64_t>>>{{{4}}}));
+    snapshot.clear();
+    EXPECT_EQ(read(), (std::vector<std::vector<std::vector<int64_t>>>{
+                          {{toInt(ErrorCode::INVALID_PARAMS)}}}));
+    snapshot.emplace(key, tl::unexpected(ErrorCode::OBJECT_NOT_FOUND));
+    EXPECT_EQ(read(), (std::vector<std::vector<std::vector<int64_t>>>{
+                          {{toInt(ErrorCode::OBJECT_NOT_FOUND)}}}));
 }
 
 // Test Get Operation will fail if the lease has expired.
@@ -747,6 +1524,7 @@ TEST_F(RealClientTest, TestBatchPutAndGetMultiBuffers) {
         0);
 
     std::string test_data(1000, '1');
+    std::string upsert_data(1000, '2');
     std::string dst_data(1000, '0');
 
     // Register buffers for zero-copy operations
@@ -758,26 +1536,36 @@ TEST_F(RealClientTest, TestBatchPutAndGetMultiBuffers) {
         py_client_->register_buffer(dst_data.data(), dst_data.size());
     ASSERT_EQ(reg_result_dst, 0)
         << "Dst data buffer registration should succeed";
+    int reg_result_upsert =
+        py_client_->register_buffer(upsert_data.data(), upsert_data.size());
+    ASSERT_EQ(reg_result_upsert, 0)
+        << "Upsert data buffer registration should succeed";
 
     std::vector<std::string> keys;
     std::vector<std::vector<void*>> all_ptrs;
+    std::vector<std::vector<void*>> all_upsert_ptrs;
     std::vector<std::vector<void*>> all_dst_ptrs;
     std::vector<std::vector<size_t>> all_sizes;
     auto ptr = test_data.data();
+    auto upsert_ptr = upsert_data.data();
     auto dst_ptr = dst_data.data();
     for (size_t i = 0; i < 10; i++) {
         keys.emplace_back("test_key_" + std::to_string(i));
         std::vector<void*> ptrs;
+        std::vector<void*> upsert_ptrs;
         std::vector<void*> dst_ptrs;
         std::vector<size_t> sizes;
         for (size_t j = 0; j < 10; j++) {
             ptrs.emplace_back(ptr);
+            upsert_ptrs.emplace_back(upsert_ptr);
             dst_ptrs.emplace_back(dst_ptr);
             sizes.emplace_back(10);
             ptr += 10;
+            upsert_ptr += 10;
             dst_ptr += 10;
         }
         all_ptrs.emplace_back(ptrs);
+        all_upsert_ptrs.emplace_back(upsert_ptrs);
         all_dst_ptrs.emplace_back(dst_ptrs);
         all_sizes.emplace_back(sizes);
     }
@@ -796,6 +1584,21 @@ TEST_F(RealClientTest, TestBatchPutAndGetMultiBuffers) {
     }
     EXPECT_EQ(dst_data, test_data) << "Retrieved data should match original";
 
+    std::vector<int> upsert_results =
+        py_client_->batch_upsert_from_multi_buffers(keys, all_upsert_ptrs,
+                                                    all_sizes, config);
+    for (auto result : upsert_results) {
+        EXPECT_EQ(result, 0) << "Upsert operation should succeed";
+    }
+    std::fill(dst_data.begin(), dst_data.end(), '0');
+    get_results = py_client_->batch_get_into_multi_buffers(keys, all_dst_ptrs,
+                                                           all_sizes, true);
+    for (auto result : get_results) {
+        EXPECT_EQ(result, 100) << "Get after upsert should succeed";
+    }
+    EXPECT_EQ(dst_data, upsert_data)
+        << "Retrieved data should match upserted data";
+
     // Unregister buffers
     int unreg_result_test = py_client_->unregister_buffer(test_data.data());
     ASSERT_EQ(unreg_result_test, 0)
@@ -803,6 +1606,631 @@ TEST_F(RealClientTest, TestBatchPutAndGetMultiBuffers) {
     int unreg_result_dst = py_client_->unregister_buffer(dst_data.data());
     ASSERT_EQ(unreg_result_dst, 0)
         << "Dst data buffer unregistration should succeed";
+    int unreg_result_upsert = py_client_->unregister_buffer(upsert_data.data());
+    ASSERT_EQ(unreg_result_upsert, 0)
+        << "Upsert data buffer unregistration should succeed";
+}
+
+TEST_F(RealClientTest, TestPutGetSessionRanges) {
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))
+        << "Failed to start in-proc master";
+    master_address_ = master_.master_address();
+
+    const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
+                                         ? FLAGS_device_name
+                                         : std::string("");
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17814", "P2PHANDSHAKE",
+                               16 * 1024 * 1024, 16 * 1024 * 1024,
+                               FLAGS_protocol, rdma_devices, master_address_),
+        0);
+
+    constexpr size_t kNumLayers = 4;
+    constexpr size_t kPageSize = 64;
+    constexpr size_t kObjectSize = kPageSize * kNumLayers;
+    constexpr size_t kNumKeys = 3;
+
+    std::string src_data(kObjectSize * kNumKeys, 'A');
+    std::string dst_data(kObjectSize * kNumKeys, 'B');
+    for (size_t i = 0; i < src_data.size(); ++i) {
+        src_data[i] = static_cast<char>('a' + (i % 26));
+    }
+
+    ASSERT_EQ(py_client_->register_buffer(src_data.data(), src_data.size()), 0);
+    ASSERT_EQ(py_client_->register_buffer(dst_data.data(), dst_data.size()), 0);
+
+    std::vector<std::string> keys;
+    std::vector<size_t> object_sizes;
+    keys.reserve(kNumKeys);
+    object_sizes.reserve(kNumKeys);
+    for (size_t i = 0; i < kNumKeys; ++i) {
+        keys.push_back("session_key_" + std::to_string(i));
+        object_sizes.push_back(kObjectSize);
+    }
+
+    auto put_start_rcs =
+        py_client_->batch_put_session_start(keys, object_sizes);
+    ASSERT_EQ(put_start_rcs.size(), kNumKeys);
+    for (auto rc : put_start_rcs) {
+        EXPECT_EQ(rc, 0) << "batch_put_session_start should succeed";
+    }
+
+    for (size_t layer = 0; layer < kNumLayers; ++layer) {
+        std::vector<std::vector<void*>> all_buffers(kNumKeys);
+        std::vector<std::vector<size_t>> all_sizes(kNumKeys);
+        std::vector<std::vector<size_t>> all_dst_offsets(kNumKeys);
+        for (size_t i = 0; i < kNumKeys; ++i) {
+            char* layer_ptr =
+                src_data.data() + i * kObjectSize + layer * kPageSize;
+            all_buffers[i] = {layer_ptr};
+            all_sizes[i] = {kPageSize};
+            all_dst_offsets[i] = {layer * kPageSize};
+        }
+        auto put_rcs = py_client_->batch_put_from_multi_buffer_ranges(
+            keys, all_buffers, all_sizes, all_dst_offsets);
+        ASSERT_EQ(put_rcs.size(), kNumKeys);
+        for (auto rc : put_rcs) {
+            EXPECT_EQ(rc, static_cast<int>(kPageSize));
+        }
+    }
+
+    auto put_end_rcs = py_client_->batch_put_session_end(keys);
+    ASSERT_EQ(put_end_rcs.size(), kNumKeys);
+    for (auto rc : put_end_rcs) {
+        EXPECT_EQ(rc, 0) << "batch_put_session_end should succeed";
+    }
+
+    auto get_start_rcs = py_client_->batch_get_session_start(keys);
+    ASSERT_EQ(get_start_rcs.size(), kNumKeys);
+    for (auto rc : get_start_rcs) {
+        EXPECT_EQ(rc, 0) << "batch_get_session_start should succeed";
+    }
+
+    for (size_t layer = 0; layer < kNumLayers; ++layer) {
+        std::vector<std::vector<void*>> all_buffers(kNumKeys);
+        std::vector<std::vector<size_t>> all_sizes(kNumKeys);
+        std::vector<std::vector<size_t>> all_src_offsets(kNumKeys);
+        for (size_t i = 0; i < kNumKeys; ++i) {
+            char* layer_ptr =
+                dst_data.data() + i * kObjectSize + layer * kPageSize;
+            all_buffers[i] = {layer_ptr};
+            all_sizes[i] = {kPageSize};
+            all_src_offsets[i] = {layer * kPageSize};
+        }
+        auto get_rcs = py_client_->batch_get_into_multi_buffer_ranges(
+            keys, all_buffers, all_sizes, all_src_offsets);
+        ASSERT_EQ(get_rcs.size(), kNumKeys);
+        for (auto rc : get_rcs) {
+            EXPECT_EQ(rc, static_cast<int>(kPageSize));
+        }
+    }
+
+    EXPECT_EQ(py_client_->batch_get_session_end(keys), 0);
+    EXPECT_EQ(dst_data, src_data);
+
+    // Revoke path: start then revoke without end.
+    std::vector<std::string> revoke_keys = {"session_revoke_0"};
+    std::vector<size_t> revoke_sizes = {kObjectSize};
+    auto revoke_start =
+        py_client_->batch_put_session_start(revoke_keys, revoke_sizes);
+    ASSERT_EQ(revoke_start.size(), 1);
+    EXPECT_EQ(revoke_start[0], 0);
+    auto revoke_rcs = py_client_->batch_put_session_revoke(revoke_keys);
+    ASSERT_EQ(revoke_rcs.size(), 1);
+    EXPECT_EQ(revoke_rcs[0], 0);
+    auto missing = py_client_->batch_get_session_start(revoke_keys);
+    ASSERT_EQ(missing.size(), 1);
+    EXPECT_LT(missing[0], 0);
+
+    ASSERT_EQ(py_client_->unregister_buffer(src_data.data()), 0);
+    ASSERT_EQ(py_client_->unregister_buffer(dst_data.data()), 0);
+}
+
+// Issue #3658: read SSD-only keys through a separate TCP client.
+TEST_F(RealClientTest, TestGetSessionRangesFromSsdOffload) {
+    ScopedEnvVar heartbeat("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "1");
+    ScopedEnvVar storage_backend("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+                                 "bucket_storage_backend");
+    ScopedEnvVar bucket_keys("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "1");
+    char path[] = "/tmp/mooncake_ssd_session_XXXXXX";
+    ASSERT_NE(mkdtemp(path), nullptr);
+    ssd_path_ = path;
+    constexpr int kLeaseMs = 1000;
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
+                                  .set_enable_offload(true)
+                                  .set_default_kv_lease_ttl(kLeaseMs)
+                                  .build()));
+    master_address_ = master_.master_address();
+    const std::string owner = "localhost:17822";
+    ASSERT_EQ(py_client_->setup_real(
+                  owner, "P2PHANDSHAKE", 16 * 1024 * 1024, 16 * 1024 * 1024,
+                  "tcp", "", master_address_, nullptr, "", true, ssd_path_),
+              0);
+    auto reader = RealClient::create();
+    ASSERT_EQ(reader->setup_real("localhost:17823", "P2PHANDSHAKE", 0, 0, "tcp",
+                                 "", master_address_),
+              0);
+
+    constexpr size_t kPageSize = 64;
+    constexpr size_t kObjectSize = 4 * kPageSize;
+    const std::vector<std::string> keys = {"session_ssd_0", "session_ssd_1",
+                                           "session_memory"};
+    std::string src(kObjectSize * keys.size(), '\0');
+    std::string dst(src.size(), 'Z');
+    for (size_t i = 0; i < src.size(); ++i) {
+        src[i] = static_cast<char>(i % 251);
+    }
+    ASSERT_EQ(reader->register_buffer(dst.data(), dst.size()), 0);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        ASSERT_EQ(py_client_->put(
+                      keys[i], std::span<const char>(
+                                   src.data() + i * kObjectSize, kObjectSize)),
+                  0);
+    }
+
+    const std::vector<std::string> ssd_keys(keys.begin(), keys.begin() + 2);
+    for (const auto& key : ssd_keys) {
+        bool ready = false;
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (!ready && std::chrono::steady_clock::now() < deadline) {
+            for (const auto& replica : py_client_->get_replica_desc(key)) {
+                ready |= replica.is_local_disk_replica() &&
+                         replica.status == ReplicaStatus::COMPLETE;
+            }
+            if (!ready)
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        ASSERT_TRUE(ready) << key;
+    }
+    // Querying above granted a lease; wait for it before clearing MEMORY.
+    std::this_thread::sleep_for(std::chrono::milliseconds(kLeaseMs + 50));
+    ASSERT_EQ(py_client_->batch_replica_clear(ssd_keys, owner).size(),
+              ssd_keys.size());
+    for (const auto& key : ssd_keys) {
+        const auto replicas = py_client_->get_replica_desc(key);
+        ASSERT_EQ(replicas.size(), 1u);
+        ASSERT_TRUE(replicas.front().is_local_disk_replica());
+    }
+    ASSERT_EQ(reader->batch_get_session_start(keys), std::vector<int>(3, 0));
+
+    auto read_ranges = [&](const std::vector<size_t>& offsets,
+                           const std::vector<size_t>& sizes) {
+        std::fill(dst.begin(), dst.end(), 'Z');
+        std::string expected(dst);
+        std::vector<std::vector<void*>> buffers(keys.size());
+        size_t total = 0;
+        for (size_t j = 0; j < sizes.size(); ++j) {
+            for (size_t i = 0; i < keys.size(); ++i) {
+                buffers[i].push_back(dst.data() + i * kObjectSize + total);
+                expected.replace(i * kObjectSize + total, sizes[j], src,
+                                 i * kObjectSize + offsets[j], sizes[j]);
+            }
+            total += sizes[j];
+        }
+        const auto before = reader->get_offload_rpc_read_count();
+        EXPECT_EQ(reader->batch_get_into_multi_buffer_ranges(
+                      keys, buffers,
+                      std::vector<std::vector<size_t>>(keys.size(), sizes),
+                      std::vector<std::vector<size_t>>(keys.size(), offsets)),
+                  std::vector<int>(keys.size(), total));
+        EXPECT_EQ(reader->get_offload_rpc_read_count(), before + 1);
+        EXPECT_EQ(dst, expected);
+    };
+    read_ranges({0, kPageSize, 2 * kPageSize, 3 * kPageSize},
+                {kPageSize, kPageSize, kPageSize, kPageSize});
+    read_ranges({kPageSize}, {kPageSize});            // Non-tail partial read.
+    read_ranges({2 * kPageSize, 7, 9}, {16, 16, 8});  // Unordered, overlapping.
+
+    // Repeated SSD keys must fill each destination without duplicate reads.
+    const auto before_duplicate = reader->get_offload_rpc_read_count();
+    EXPECT_EQ(reader->batch_get_into_multi_buffer_ranges(
+                  {keys[0], keys[0]}, {{dst.data()}, {dst.data() + kPageSize}},
+                  {{kPageSize}, {kPageSize}}, {{0}, {2 * kPageSize}}),
+              std::vector<int>(2, kPageSize));
+    EXPECT_EQ(reader->get_offload_rpc_read_count(), before_duplicate + 1);
+    EXPECT_EQ(dst.substr(0, kPageSize), src.substr(0, kPageSize));
+    EXPECT_EQ(dst.substr(kPageSize, kPageSize),
+              src.substr(2 * kPageSize, kPageSize));
+
+    // Invalid entries must not prevent valid entries in the batch from reading.
+    const int invalid = static_cast<int>(toInt(ErrorCode::INVALID_PARAMS));
+    EXPECT_EQ(
+        reader->batch_get_into_multi_buffer_ranges(
+            keys, {{dst.data()}, {dst.data()}, {dst.data() + kObjectSize}},
+            {{kPageSize}, {kPageSize}, {kPageSize}},
+            {{std::numeric_limits<size_t>::max()}, {0}, {kObjectSize}}),
+        (std::vector<int>{invalid, kPageSize, invalid}));
+    const auto before_empty = reader->get_offload_rpc_read_count();
+    EXPECT_EQ(reader->batch_get_into_multi_buffer_ranges(
+                  {keys[0], keys[1]}, {{}, {nullptr}}, {{}, {1}}, {{}, {0}}),
+              (std::vector<int>{0, invalid}));
+    EXPECT_EQ(reader->get_offload_rpc_read_count(), before_empty);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(kLeaseMs + 50));
+    EXPECT_EQ(
+        reader->batch_get_into_multi_buffer_ranges({keys[0]}, {{dst.data()}},
+                                                   {{1}}, {{0}}),
+        (std::vector<int>{static_cast<int>(toInt(ErrorCode::LEASE_EXPIRED))}));
+    EXPECT_EQ(reader->batch_get_session_end(keys), 0);
+    EXPECT_EQ(reader->batch_get_into_multi_buffer_ranges(
+                  {keys[1]}, {{dst.data()}}, {{1}}, {{0}}),
+              (std::vector<int>{invalid}));
+    ASSERT_EQ(reader->unregister_buffer(dst.data()), 0);
+    EXPECT_EQ(reader->tearDownAll(), 0);
+}
+
+// Abnormal put/get session cases. See check table in PR / review notes.
+TEST_F(RealClientTest, TestPutGetSessionAbnormal) {
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))
+        << "Failed to start in-proc master";
+    master_address_ = master_.master_address();
+
+    const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
+                                         ? FLAGS_device_name
+                                         : std::string("");
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17815", "P2PHANDSHAKE",
+                               16 * 1024 * 1024, 16 * 1024 * 1024,
+                               FLAGS_protocol, rdma_devices, master_address_),
+        0);
+
+    constexpr size_t kPage = 64;
+    constexpr size_t kObjectSize = kPage * 2;
+    const int kInvalidParams =
+        static_cast<int>(toInt(ErrorCode::INVALID_PARAMS));
+
+    std::string buf(kObjectSize, 'x');
+    ASSERT_EQ(py_client_->register_buffer(buf.data(), buf.size()), 0);
+
+    EXPECT_TRUE(py_client_->batch_get_session_start({}).empty());
+    EXPECT_TRUE(
+        py_client_->batch_get_into_multi_buffer_ranges({}, {}, {}, {}).empty());
+    EXPECT_EQ(py_client_->batch_get_session_end({}), 0);
+    EXPECT_EQ(py_client_->batch_get_into_multi_buffer_ranges(
+                  {"outer_arity_get"}, {}, {}, {}),
+              std::vector<int>{kInvalidParams});
+
+    // --- Put: ranges/end/revoke without start ---
+    {
+        std::vector<std::string> keys = {"no_put_session"};
+        auto ranges = py_client_->batch_put_from_multi_buffer_ranges(
+            keys, {{buf.data()}}, {{kPage}}, {{0}});
+        ASSERT_EQ(ranges.size(), 1);
+        EXPECT_EQ(ranges[0], kInvalidParams);
+
+        auto end_rcs = py_client_->batch_put_session_end(keys);
+        ASSERT_EQ(end_rcs.size(), 1);
+        EXPECT_EQ(end_rcs[0], kInvalidParams);
+
+        auto revoke_rcs = py_client_->batch_put_session_revoke(keys);
+        ASSERT_EQ(revoke_rcs.size(), 1);
+        EXPECT_EQ(revoke_rcs[0], kInvalidParams);
+    }
+
+    // --- Put: keys/sizes mismatch ---
+    {
+        auto rcs =
+            py_client_->batch_put_session_start({"a", "b"}, {kObjectSize});
+        ASSERT_EQ(rcs.size(), 2);
+        EXPECT_EQ(rcs[0], kInvalidParams);
+        EXPECT_EQ(rcs[1], kInvalidParams);
+    }
+
+    // --- Put: duplicate start ---
+    {
+        std::vector<std::string> keys = {"dup_put"};
+        auto first = py_client_->batch_put_session_start(keys, {kObjectSize});
+        ASSERT_EQ(first.size(), 1);
+        EXPECT_EQ(first[0], 0);
+        auto second = py_client_->batch_put_session_start(keys, {kObjectSize});
+        ASSERT_EQ(second.size(), 1);
+        EXPECT_EQ(second[0], kInvalidParams);
+        EXPECT_EQ(py_client_->batch_put_session_revoke(keys)[0], 0);
+    }
+
+    // --- Put: range overflow past object_size ---
+    {
+        std::vector<std::string> keys = {"overflow_put"};
+        ASSERT_EQ(py_client_->batch_put_session_start(keys, {kObjectSize})[0],
+                  0);
+        auto overflow = py_client_->batch_put_from_multi_buffer_ranges(
+            keys, {{buf.data()}}, {{kPage}},
+            {{kObjectSize}});  // offset == size
+        ASSERT_EQ(overflow.size(), 1);
+        EXPECT_EQ(overflow[0], kInvalidParams);
+        EXPECT_EQ(py_client_->batch_put_session_revoke(keys)[0], 0);
+    }
+
+    // --- Put: buffer/size/offset arity mismatch ---
+    {
+        std::vector<std::string> keys = {"arity_put"};
+        ASSERT_EQ(py_client_->batch_put_session_start(keys, {kObjectSize})[0],
+                  0);
+        auto bad = py_client_->batch_put_from_multi_buffer_ranges(
+            keys, {{buf.data(), buf.data() + kPage}}, {{kPage}}, {{0}});
+        ASSERT_EQ(bad.size(), 1);
+        EXPECT_EQ(bad[0], kInvalidParams);
+        EXPECT_EQ(py_client_->batch_put_session_revoke(keys)[0], 0);
+    }
+
+    // --- Put: end clears session; second end fails ---
+    {
+        std::vector<std::string> keys = {"put_end_once"};
+        ASSERT_EQ(py_client_->batch_put_session_start(keys, {kObjectSize})[0],
+                  0);
+        ASSERT_EQ(py_client_->batch_put_from_multi_buffer_ranges(
+                      keys, {{buf.data()}}, {{kObjectSize}}, {{0}})[0],
+                  static_cast<int>(kObjectSize));
+        EXPECT_EQ(py_client_->batch_put_session_end(keys)[0], 0);
+        EXPECT_EQ(py_client_->batch_put_session_end(keys)[0], kInvalidParams);
+        // ranges after end also fail
+        EXPECT_EQ(py_client_->batch_put_from_multi_buffer_ranges(
+                      keys, {{buf.data()}}, {{kPage}}, {{0}})[0],
+                  kInvalidParams);
+    }
+
+    // --- Get: ranges without start ---
+    {
+        std::vector<std::string> keys = {"no_get_session"};
+        auto ranges = py_client_->batch_get_into_multi_buffer_ranges(
+            keys, {{buf.data()}}, {{kPage}}, {{0}});
+        ASSERT_EQ(ranges.size(), 1);
+        EXPECT_EQ(ranges[0], kInvalidParams);
+    }
+
+    // --- Get: start on missing object ---
+    {
+        auto rcs = py_client_->batch_get_session_start({"missing_obj"});
+        ASSERT_EQ(rcs.size(), 1);
+        EXPECT_LT(rcs[0], 0);
+    }
+
+    // --- Get: end clears session; ranges after end fail ---
+    {
+        std::vector<std::string> keys = {"put_end_once"};  // exists from above
+        auto start = py_client_->batch_get_session_start(keys);
+        ASSERT_EQ(start.size(), 1);
+        EXPECT_EQ(start[0], 0);
+        EXPECT_EQ(py_client_->batch_get_session_end(keys), 0);
+        auto after_end = py_client_->batch_get_into_multi_buffer_ranges(
+            keys, {{buf.data()}}, {{kPage}}, {{0}});
+        ASSERT_EQ(after_end.size(), 1);
+        EXPECT_EQ(after_end[0], kInvalidParams);
+    }
+
+    // --- Get: arity mismatch while session exists ---
+    {
+        std::vector<std::string> keys = {"put_end_once"};
+        ASSERT_EQ(py_client_->batch_get_session_start(keys)[0], 0);
+        auto bad = py_client_->batch_get_into_multi_buffer_ranges(
+            keys, {{buf.data()}}, {{kPage, kPage}}, {{0}});
+        ASSERT_EQ(bad.size(), 1);
+        EXPECT_EQ(bad[0], kInvalidParams);
+        EXPECT_EQ(py_client_->batch_get_session_end(keys), 0);
+    }
+
+    ASSERT_EQ(py_client_->unregister_buffer(buf.data()), 0);
+}
+
+// Put session must survive BatchPutEnd failure so caller can retry end/revoke.
+TEST_F(RealClientTest, TestPutSessionKeptAfterEndFailure) {
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))
+        << "Failed to start in-proc master";
+    master_address_ = master_.master_address();
+
+    const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
+                                         ? FLAGS_device_name
+                                         : std::string("");
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17817", "P2PHANDSHAKE",
+                               16 * 1024 * 1024, 16 * 1024 * 1024,
+                               FLAGS_protocol, rdma_devices, master_address_),
+        0);
+
+    constexpr size_t kSize = 128;
+    const int kObjectNotFound =
+        static_cast<int>(toInt(ErrorCode::OBJECT_NOT_FOUND));
+    const int kInvalidParams =
+        static_cast<int>(toInt(ErrorCode::INVALID_PARAMS));
+
+    std::vector<std::string> keys = {"session_end_fail_keep"};
+    ASSERT_EQ(py_client_->batch_put_session_start(keys, {kSize})[0], 0);
+
+    // Drop Master reservation while keeping the local put session.
+    ASSERT_NE(py_client_->client_, nullptr);
+    auto revoked = py_client_->client_->BatchPutRevoke(keys, ReplicaType::ALL);
+    ASSERT_EQ(revoked.size(), 1u);
+    ASSERT_TRUE(revoked[0].has_value());
+
+    auto end1 = py_client_->batch_put_session_end(keys);
+    ASSERT_EQ(end1.size(), 1u);
+    EXPECT_EQ(end1[0], kObjectNotFound)
+        << "end should surface Master OBJECT_NOT_FOUND";
+
+    // Session must still exist: second end is not INVALID_PARAMS.
+    auto end2 = py_client_->batch_put_session_end(keys);
+    ASSERT_EQ(end2.size(), 1u);
+    EXPECT_EQ(end2[0], kObjectNotFound)
+        << "put session should be kept after end failure";
+
+    // Revoke clears the local session even when Master object is already gone.
+    auto revoke_rcs = py_client_->batch_put_session_revoke(keys);
+    ASSERT_EQ(revoke_rcs.size(), 1u);
+    EXPECT_EQ(revoke_rcs[0], 0);
+    EXPECT_EQ(py_client_->batch_put_session_end(keys)[0], kInvalidParams);
+    EXPECT_EQ(py_client_->batch_put_session_revoke(keys)[0], kInvalidParams);
+}
+
+// Reliable NoF configs cannot be finalized by the session put path.
+TEST_F(RealClientTest, TestPutSessionStartRejectsReliableNofConfig) {
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))
+        << "Failed to start in-proc master";
+    master_address_ = master_.master_address();
+
+    const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
+                                         ? FLAGS_device_name
+                                         : std::string("");
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17819", "P2PHANDSHAKE",
+                               16 * 1024 * 1024, 16 * 1024 * 1024,
+                               FLAGS_protocol, rdma_devices, master_address_),
+        0);
+
+    const int kInvalidParams =
+        static_cast<int>(toInt(ErrorCode::INVALID_PARAMS));
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.nof_replica_num = 2;  // RELIABLE_MULTI_REPLICA
+
+    auto rcs =
+        py_client_->batch_put_session_start({"reliable_nof"}, {128}, config);
+    ASSERT_EQ(rcs.size(), 1u);
+    EXPECT_EQ(rcs[0], kInvalidParams);
+}
+
+// Filtered start_keys must keep group_ids aligned (skip existing sessions).
+TEST_F(RealClientTest, TestPutSessionStartFiltersGroupIds) {
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))
+        << "Failed to start in-proc master";
+    master_address_ = master_.master_address();
+
+    const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
+                                         ? FLAGS_device_name
+                                         : std::string("");
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17820", "P2PHANDSHAKE",
+                               16 * 1024 * 1024, 16 * 1024 * 1024,
+                               FLAGS_protocol, rdma_devices, master_address_),
+        0);
+
+    constexpr size_t kSize = 128;
+    const int kInvalidParams =
+        static_cast<int>(toInt(ErrorCode::INVALID_PARAMS));
+
+    ReplicateConfig first_config;
+    first_config.group_ids = std::vector<std::string>{"group_a"};
+    ASSERT_EQ(py_client_->batch_put_session_start({"group_key_a"}, {kSize},
+                                                  first_config)[0],
+              0);
+
+    ReplicateConfig batch_config;
+    batch_config.group_ids = std::vector<std::string>{"group_a", "group_b"};
+    auto rcs = py_client_->batch_put_session_start(
+        {"group_key_a", "group_key_b"}, {kSize, kSize}, batch_config);
+    ASSERT_EQ(rcs.size(), 2u);
+    EXPECT_EQ(rcs[0], kInvalidParams) << "existing session should be skipped";
+    EXPECT_EQ(rcs[1], 0) << "filtered group_ids must match remaining keys";
+
+    auto revoke_rcs =
+        py_client_->batch_put_session_revoke({"group_key_a", "group_key_b"});
+    ASSERT_EQ(revoke_rcs.size(), 2u);
+    EXPECT_EQ(revoke_rcs[0], 0);
+    EXPECT_EQ(revoke_rcs[1], 0);
+}
+
+// Session put finalizes MEMORY only; complete object must be readable.
+TEST_F(RealClientTest, TestPutSessionEndCompletesMemoryReplica) {
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))
+        << "Failed to start in-proc master";
+    master_address_ = master_.master_address();
+
+    const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
+                                         ? FLAGS_device_name
+                                         : std::string("");
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17818", "P2PHANDSHAKE",
+                               16 * 1024 * 1024, 16 * 1024 * 1024,
+                               FLAGS_protocol, rdma_devices, master_address_),
+        0);
+
+    constexpr size_t kSize = 256;
+    std::string src(kSize, 'P');
+    std::string dst(kSize, 'Q');
+    ASSERT_EQ(py_client_->register_buffer(src.data(), src.size()), 0);
+    ASSERT_EQ(py_client_->register_buffer(dst.data(), dst.size()), 0);
+
+    std::vector<std::string> keys = {"session_memory_end"};
+    ASSERT_EQ(py_client_->batch_put_session_start(keys, {kSize})[0], 0);
+    ASSERT_EQ(py_client_->batch_put_from_multi_buffer_ranges(
+                  keys, {{src.data()}}, {{kSize}}, {{0}})[0],
+              static_cast<int>(kSize));
+    ASSERT_EQ(py_client_->batch_put_session_end(keys)[0], 0);
+
+    auto descs = py_client_->get_replica_desc(keys[0]);
+    ASSERT_EQ(descs.size(), 1u);
+    EXPECT_TRUE(descs[0].is_memory_replica());
+    EXPECT_EQ(descs[0].status, ReplicaStatus::COMPLETE);
+
+    ASSERT_EQ(py_client_->batch_get_session_start(keys)[0], 0);
+    ASSERT_EQ(py_client_->batch_get_into_multi_buffer_ranges(
+                  keys, {{dst.data()}}, {{kSize}}, {{0}})[0],
+              static_cast<int>(kSize));
+    EXPECT_EQ(py_client_->batch_get_session_end(keys), 0);
+    EXPECT_EQ(dst, src);
+
+    ASSERT_EQ(py_client_->unregister_buffer(src.data()), 0);
+    ASSERT_EQ(py_client_->unregister_buffer(dst.data()), 0);
+}
+
+// Lease expire on get ranges must drop the cached get session.
+TEST_F(RealClientTest, TestGetSessionLeaseExpiredDropsSession) {
+    constexpr uint64_t kLeaseTtlMs = 50;
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
+                                  .set_default_kv_lease_ttl(kLeaseTtlMs)
+                                  .build()))
+        << "Failed to start in-proc master";
+    master_address_ = master_.master_address();
+
+    const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
+                                         ? FLAGS_device_name
+                                         : std::string("");
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17816", "P2PHANDSHAKE",
+                               16 * 1024 * 1024, 16 * 1024 * 1024,
+                               FLAGS_protocol, rdma_devices, master_address_),
+        0);
+
+    constexpr size_t kSize = 128;
+    const int kLeaseExpired = static_cast<int>(toInt(ErrorCode::LEASE_EXPIRED));
+    const int kInvalidParams =
+        static_cast<int>(toInt(ErrorCode::INVALID_PARAMS));
+
+    std::string src(kSize, 'S');
+    std::string dst(kSize, 'D');
+    ASSERT_EQ(py_client_->register_buffer(src.data(), src.size()), 0);
+    ASSERT_EQ(py_client_->register_buffer(dst.data(), dst.size()), 0);
+
+    std::vector<std::string> keys = {"lease_session_key"};
+    ASSERT_EQ(py_client_->batch_put_session_start(keys, {kSize})[0], 0);
+    ASSERT_EQ(py_client_->batch_put_from_multi_buffer_ranges(
+                  keys, {{src.data()}}, {{kSize}}, {{0}})[0],
+              static_cast<int>(kSize));
+    ASSERT_EQ(py_client_->batch_put_session_end(keys)[0], 0);
+
+    ASSERT_EQ(py_client_->batch_get_session_start(keys)[0], 0);
+
+    // Wait past cached lease_deadline (client-local check; no Master query).
+    std::this_thread::sleep_for(std::chrono::milliseconds(kLeaseTtlMs + 50));
+
+    auto expired = py_client_->batch_get_into_multi_buffer_ranges(
+        keys, {{dst.data()}}, {{kSize}}, {{0}});
+    ASSERT_EQ(expired.size(), 1);
+    EXPECT_EQ(expired[0], kLeaseExpired)
+        << "get ranges after lease ttl should return LEASE_EXPIRED";
+
+    // Session must have been erased: next ranges sees no session.
+    auto again = py_client_->batch_get_into_multi_buffer_ranges(
+        keys, {{dst.data()}}, {{kSize}}, {{0}});
+    ASSERT_EQ(again.size(), 1);
+    EXPECT_EQ(again[0], kInvalidParams)
+        << "get session should be dropped after LEASE_EXPIRED";
+
+    // get_end is still safe (idempotent erase).
+    EXPECT_EQ(py_client_->batch_get_session_end(keys), 0);
+
+    ASSERT_EQ(py_client_->unregister_buffer(src.data()), 0);
+    ASSERT_EQ(py_client_->unregister_buffer(dst.data()), 0);
 }
 
 TEST_F(RealClientTest, TestBatchAndNormalGetReplicaDesc) {
@@ -991,6 +2419,148 @@ TEST_F(RealClientTest, SetupWithConfigDictAllowsZeroSizes) {
     ASSERT_TRUE(result.has_value())
         << "Setup should preserve zero-size pure client/server semantics";
 }
+
+TEST_F(RealClientTest, NvlinkConfigHonorsDiscoveryOverride) {
+    ScopedEnvVar auto_discover("MC_MS_AUTO_DISC", "1");
+    ScopedEnvVar force_tcp("MC_FORCE_TCP", "1");
+    // TENT selection tests variable presence, not its value.
+    ScopedEnvVar use_tent("MC_USE_TENT");
+    ScopedEnvVar use_tev1("MC_USE_TEV1");
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
+    master_address_ = master_.master_address();
+
+    for (const auto& hostname :
+         {"localhost:" + std::to_string(getFreeTcpPort()),
+          std::string("localhost")}) {
+        SCOPED_TRACE(hostname);
+        auto client = RealClient::create();
+        ConfigDict config = MakeConfigDict(hostname, "0", "0");
+        config[CONFIG_KEY_PROTOCOL] = "nvlink";
+        config[CONFIG_KEY_RDMA_DEVICES] = "";
+        config[CONFIG_KEY_ENABLE_EGM_STORE_POOL] = "false";
+        config[CONFIG_KEY_EGM_NUMA_NODES] = "invalid";
+
+        // Disabled EGM ignores its node selection, and the explicit discovery
+        // override still permits TCP for the requested nvlink protocol.
+        ASSERT_TRUE(client->setup_internal(config).has_value());
+        ASSERT_NE(client->client_, nullptr);
+        EXPECT_TRUE(hasExplicitPort(client->get_hostname()));
+        auto details = master_.service()->GetSegmentsDetailForAdmin();
+        ASSERT_TRUE(details.has_value());
+        EXPECT_TRUE(details->empty());
+        EXPECT_EQ(client->tearDownAll(), 0);
+    }
+}
+
+TEST_F(RealClientTest, EgmConfigRejectsDiscoveredTcpBeforeAllocating) {
+    ScopedEnvVar auto_discover("MC_MS_AUTO_DISC", "1");
+    ScopedEnvVar force_tcp("MC_FORCE_TCP", "1");
+    ScopedEnvVar use_tent("MC_USE_TENT");
+    ScopedEnvVar use_tev1("MC_USE_TEV1");
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
+    master_address_ = master_.master_address();
+
+    const char* node_options[] = {nullptr, "auto", "0,1"};
+    for (const auto* nodes : node_options) {
+        SCOPED_TRACE(nodes ? nodes : "<unset>");
+        for (const auto& hostname :
+             {"localhost:" + std::to_string(getFreeTcpPort()),
+              std::string("localhost")}) {
+            SCOPED_TRACE(hostname);
+            auto client = RealClient::create();
+            ConfigDict config = MakeConfigDict(hostname, "16MB", "0");
+            config[CONFIG_KEY_PROTOCOL] = "nvlink";
+            config[CONFIG_KEY_RDMA_DEVICES] = "";
+            config[CONFIG_KEY_ENABLE_EGM_STORE_POOL] = "true";
+            if (nodes) config[CONFIG_KEY_EGM_NUMA_NODES] = nodes;
+
+            ::testing::internal::CaptureStderr();
+            auto result = client->setup_internal(config);
+            const std::string logs = ::testing::internal::GetCapturedStderr();
+
+            ASSERT_FALSE(result.has_value());
+            EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+            EXPECT_NE(
+                logs.find("EGM Store requires the classic NVLink transport"),
+                std::string::npos)
+                << logs;
+            // Failed EGM setup must leave neither a live client nor host-backed
+            // capacity behind.
+            EXPECT_EQ(client->client_, nullptr);
+            EXPECT_EQ(client->client_buffer_allocator_, nullptr);
+            EXPECT_TRUE(client->segment_ptrs_.empty());
+            EXPECT_TRUE(client->hugepage_segment_ptrs_.empty());
+            auto details = master_.service()->GetSegmentsDetailForAdmin();
+            ASSERT_TRUE(details.has_value());
+            EXPECT_TRUE(details->empty());
+            EXPECT_EQ(client->tearDownAll(), 0);
+        }
+    }
+}
+
+TEST_F(RealClientTest, EgmConfigWithEmbeddedMasterRejectsDiscoveredTcp) {
+    ScopedEnvVar auto_discover("MC_MS_AUTO_DISC", "1");
+    ScopedEnvVar force_tcp("MC_FORCE_TCP", "1");
+    ScopedEnvVar use_tent("MC_USE_TENT");
+    ScopedEnvVar use_tev1("MC_USE_TEV1");
+    ScopedEnvVar embedded_master("MOONCAKE_ENABLE_EMBEDDED_MASTER");
+
+    for (const auto& hostname :
+         {"localhost:" + std::to_string(getFreeTcpPort()),
+          std::string("localhost")}) {
+        SCOPED_TRACE(hostname);
+        auto client = RealClient::create();
+        ConfigDict config = MakeConfigDict(hostname, "16MB", "0");
+        config.erase(CONFIG_KEY_METADATA_SERVER);
+        config.erase(CONFIG_KEY_MASTER_SERVER_ADDR);
+        config[CONFIG_KEY_ENABLE_EMBEDDED_MASTER] = "true";
+        config[CONFIG_KEY_PROTOCOL] = "nvlink";
+        config[CONFIG_KEY_RDMA_DEVICES] = "";
+        config[CONFIG_KEY_ENABLE_EGM_STORE_POOL] = "true";
+
+        // The embedded-master flag must reach the EGM setup overload. The
+        // resulting real Client must then be rejected before EGM allocation.
+        ::testing::internal::CaptureStderr();
+        auto result = client->setup_internal(config);
+        const std::string logs = ::testing::internal::GetCapturedStderr();
+
+        ASSERT_FALSE(result.has_value());
+        EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+        EXPECT_NE(logs.find("EGM Store requires the classic NVLink transport"),
+                  std::string::npos)
+            << logs;
+        EXPECT_EQ(client->client_, nullptr);
+        EXPECT_EQ(client->client_buffer_allocator_, nullptr);
+        EXPECT_EQ(client->tearDownAll(), 0);
+    }
+}
+
+#ifndef USE_MNNVL
+TEST_F(RealClientTest, EgmConfigCannotFallbackWithoutMnnvl) {
+    ScopedEnvVar auto_discover("MC_MS_AUTO_DISC", "0");
+    ScopedEnvVar use_tent("MC_USE_TENT");
+    ScopedEnvVar use_tev1("MC_USE_TEV1");
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
+    master_address_ = master_.master_address();
+
+    ConfigDict config = MakeConfigDict(
+        "localhost:" + std::to_string(getFreeTcpPort()), "16MB", "0");
+    config[CONFIG_KEY_PROTOCOL] = "nvlink";
+    config[CONFIG_KEY_RDMA_DEVICES] = "";
+    config[CONFIG_KEY_ENABLE_EGM_STORE_POOL] = "true";
+    config[CONFIG_KEY_EGM_NUMA_NODES] = "auto";
+
+    auto result = py_client_->setup_internal(config);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(py_client_->client_buffer_allocator_, nullptr);
+    EXPECT_TRUE(py_client_->segment_ptrs_.empty());
+    EXPECT_TRUE(py_client_->hugepage_segment_ptrs_.empty());
+    auto details = master_.service()->GetSegmentsDetailForAdmin();
+    ASSERT_TRUE(details.has_value());
+    EXPECT_TRUE(details->empty());
+}
+#endif
 
 TEST_F(RealClientTest,
        ConfigDictGlobalSegmentSizeAboveMaxPassesSizeValidation) {
@@ -1870,6 +3440,1002 @@ TEST_F(RealClientTest, SunriseLinkHostPutGetRemove) {
     EXPECT_EQ(py_client_->isExist(key), 0);
 }
 #endif
+
+// Regression for the read-side half of the dangling-replica problem: a
+// COMPLETE LOCAL_DISK replica whose backing file physically disappeared used
+// to make every read return empty bytes forever while the master kept
+// advertising the key. The batch get path must now heal it like the Put path
+// does: prove the file gone, evict the replica, and stop advertising the key
+// instead of returning a silent empty value.
+TEST_F(RealClientTest, BatchGetBufferHealsDanglingLocalDiskReplica) {
+    ScopedEnvVar local_memcpy("MC_STORE_MEMCPY", "1");
+    ScopedEnvVar heartbeat("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "1");
+    ScopedEnvVar storage_backend("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+                                 "bucket_storage_backend");
+    ScopedEnvVar bucket_keys("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "1");
+
+    char path[] = "/tmp/mooncake_ssd_dangling_heal_XXXXXX";
+    const char* created = mkdtemp(path);
+    ASSERT_NE(created, nullptr);
+    ssd_path_ = created;
+
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
+                                  .set_enable_offload(true)
+                                  .set_default_kv_lease_ttl(10)
+                                  .build()));
+    master_address_ = master_.master_address();
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                               16 * 1024 * 1024, 16 * 1024 * 1024, "tcp", "",
+                               master_address_, nullptr, "", true, ssd_path_),
+        0);
+
+    constexpr size_t kSize = 64 * 1024;
+    std::vector<char> source(kSize);
+    for (size_t i = 0; i < source.size(); ++i) {
+        source[i] = static_cast<char>((i * 31 + 7) & 0xFF);
+    }
+    const std::string key = "dangling_local_disk_heal";
+    ASSERT_EQ(py_client_->put(key, source), 0);
+
+    bool disk_ready = false;
+    const auto offload_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (std::chrono::steady_clock::now() < offload_deadline && !disk_ready) {
+        for (const auto& replica : py_client_->get_replica_desc(key)) {
+            if (replica.is_local_disk_replica()) {
+                disk_ready = true;
+            }
+        }
+        if (!disk_ready) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    }
+    ASSERT_TRUE(disk_ready);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    const auto clear_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    bool memory_cleared = false;
+    while (std::chrono::steady_clock::now() < clear_deadline) {
+        if (py_client_->batch_replica_clear({key}, "localhost:17813").size() ==
+            1) {
+            memory_cleared = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    ASSERT_TRUE(memory_cleared);
+    ASSERT_EQ(py_client_->get_replica_desc(key).size(), 1u);
+    ASSERT_TRUE(
+        py_client_->get_replica_desc(key).front().is_local_disk_replica());
+
+    // The disk-only read works before the wipe, so the later failure comes
+    // from the missing file, not from a setup mistake.
+    auto before = py_client_->batch_get_buffer({key});
+    ASSERT_EQ(before.size(), 1u);
+    ASSERT_NE(before[0], nullptr);
+
+    // The #3709 shape: the backing files are wiped while the master keeps the
+    // completed replica in metadata.
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(ssd_path_)) {
+        std::filesystem::remove_all(entry.path(), ec);
+        ASSERT_FALSE(ec) << ec.message();
+    }
+
+    auto after = py_client_->batch_get_buffer({key});
+    ASSERT_EQ(after.size(), 1u);
+    EXPECT_EQ(after[0], nullptr);
+    // The dead replica must be evicted: the master stops advertising the key
+    // instead of letting every later read come back empty.
+    EXPECT_TRUE(py_client_->get_replica_desc(key).empty());
+}
+
+// fcczzz's race on #3889: a reader fails on replica R1, and before its verify
+// reaches the owner a remove + re-put replaces R1 with a fresh record on the
+// same owner. The conditional eviction must compare the reader's replica id
+// against the master's current record atomically under the shard write lock
+// and refuse when they differ, leaving the replacement untouched.
+TEST_F(RealClientTest, ConditionalEvictLeavesReplacedReplicaUntouched) {
+    ScopedEnvVar local_memcpy("MC_STORE_MEMCPY", "1");
+    ScopedEnvVar heartbeat("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "1");
+    ScopedEnvVar storage_backend("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+                                 "bucket_storage_backend");
+    ScopedEnvVar bucket_keys("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "1");
+
+    char path[] = "/tmp/mooncake_ssd_conditional_evict_XXXXXX";
+    const char* created = mkdtemp(path);
+    ASSERT_NE(created, nullptr);
+    ssd_path_ = created;
+
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
+                                  .set_enable_offload(true)
+                                  .set_default_kv_lease_ttl(10)
+                                  .build()));
+    master_address_ = master_.master_address();
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17814", "P2PHANDSHAKE",
+                               16 * 1024 * 1024, 16 * 1024 * 1024, "tcp", "",
+                               master_address_, nullptr, "", true, ssd_path_),
+        0);
+
+    constexpr size_t kSize = 64 * 1024;
+    std::vector<char> source(kSize);
+    for (size_t i = 0; i < source.size(); ++i) {
+        source[i] = static_cast<char>((i * 31 + 7) & 0xFF);
+    }
+    const std::string key = "conditional_evict_replace_race";
+    ASSERT_EQ(py_client_->put(key, source), 0);
+
+    Replica::Descriptor r1;
+    {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (std::chrono::steady_clock::now() < deadline) {
+            for (const auto& replica : py_client_->get_replica_desc(key)) {
+                if (replica.is_local_disk_replica()) {
+                    r1 = replica;
+                    break;
+                }
+            }
+            if (r1.is_local_disk_replica()) {
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        ASSERT_TRUE(r1.is_local_disk_replica())
+            << "no local disk replica advertised";
+    }
+    const UUID owner_id = r1.get_local_disk_descriptor().client_id;
+
+    // The id the reader carries no longer matches the current record: the
+    // eviction is refused and R1 stays.
+    auto stale = master_.service()->EvictDiskReplicaIfCurrent(
+        owner_id, key, std::string(TenantId::kDefaultValue),
+        ReplicaType::LOCAL_DISK, r1.id + 1000);
+    ASSERT_TRUE(stale.has_value());
+    EXPECT_FALSE(*stale) << "an id that is not current must not evict";
+    bool r1_survives = false;
+    for (const auto& replica : py_client_->get_replica_desc(key)) {
+        if (replica.is_local_disk_replica() && replica.id == r1.id) {
+            r1_survives = true;
+        }
+    }
+    EXPECT_TRUE(r1_survives);
+
+    // The same call with the current id is the positive control: it evicts.
+    auto current = master_.service()->EvictDiskReplicaIfCurrent(
+        owner_id, key, std::string(TenantId::kDefaultValue),
+        ReplicaType::LOCAL_DISK, r1.id);
+    ASSERT_TRUE(current.has_value());
+    EXPECT_TRUE(*current);
+    for (const auto& replica : py_client_->get_replica_desc(key)) {
+        EXPECT_FALSE(replica.is_local_disk_replica());
+    }
+
+    // Now the remove + re-put half of the race. The fresh object comes back
+    // memory-only here: the bucket backend dedupes the re-offload against its
+    // persisted entry (a separate quirk, not what this test pins down). The
+    // stale verify carrying R1's id must still be refused and must not
+    // disturb the replacement.
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    const auto remove_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (py_client_->remove(key) != 0) {
+        ASSERT_LT(std::chrono::steady_clock::now(), remove_deadline)
+            << "remove never succeeded";
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    ASSERT_EQ(py_client_->put(key, source), 0);
+
+    Replica::Descriptor fresh;
+    {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (std::chrono::steady_clock::now() < deadline) {
+            for (const auto& replica : py_client_->get_replica_desc(key)) {
+                if (replica.is_memory_replica() && replica.id != r1.id) {
+                    fresh = replica;
+                    break;
+                }
+            }
+            if (fresh.is_memory_replica()) {
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        ASSERT_TRUE(fresh.is_memory_replica())
+            << "re-put did not advertise a fresh memory replica";
+    }
+
+    auto after_reput = master_.service()->EvictDiskReplicaIfCurrent(
+        owner_id, key, std::string(TenantId::kDefaultValue),
+        ReplicaType::LOCAL_DISK, r1.id);
+    ASSERT_TRUE(after_reput.has_value());
+    EXPECT_FALSE(*after_reput)
+        << "the replaced record must not answer a stale eviction";
+    bool fresh_survives = false;
+    for (const auto& replica : py_client_->get_replica_desc(key)) {
+        if (replica.id == fresh.id) {
+            fresh_survives = true;
+        }
+    }
+    EXPECT_TRUE(fresh_survives);
+}
+
+// fcczzz's counterexample on #3889: two disk-only keys in separate bucket
+// files on one owner, only A's file wiped. A failed batch must heal A while
+// leaving the healthy B alone — the probe used to answer "gone" for B too,
+// because it asked the raw object key against tenant-scoped storage keys and
+// never checked the physical file.
+TEST_F(RealClientTest, BatchGetBufferWipedSiblingPreservesHealthyReplica) {
+    ScopedEnvVar local_memcpy("MC_STORE_MEMCPY", "1");
+    ScopedEnvVar heartbeat("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "1");
+    ScopedEnvVar storage_backend("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+                                 "bucket_storage_backend");
+    ScopedEnvVar bucket_keys("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "1");
+
+    char path[] = "/tmp/mooncake_ssd_mixed_heal_XXXXXX";
+    const char* created = mkdtemp(path);
+    ASSERT_NE(created, nullptr);
+    ssd_path_ = created;
+
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
+                                  .set_enable_offload(true)
+                                  .set_default_kv_lease_ttl(10)
+                                  .build()));
+    master_address_ = master_.master_address();
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                               16 * 1024 * 1024, 16 * 1024 * 1024, "tcp", "",
+                               master_address_, nullptr, "", true, ssd_path_),
+        0);
+
+    constexpr size_t kSize = 64 * 1024;
+    std::vector<char> source(kSize);
+    for (size_t i = 0; i < source.size(); ++i) {
+        source[i] = static_cast<char>((i * 31 + 7) & 0xFF);
+    }
+    const std::string key_a = "mixed_heal_missing";
+    const std::string key_b = "mixed_heal_healthy";
+    ASSERT_EQ(py_client_->put(key_a, source), 0);
+
+    auto wait_disk_replica = [&](const std::string& k) {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (std::chrono::steady_clock::now() < deadline) {
+            for (const auto& replica : py_client_->get_replica_desc(k)) {
+                if (replica.is_local_disk_replica()) {
+                    return true;
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        return false;
+    };
+    auto clear_memory_replica = [&](const std::string& k) {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (py_client_->batch_replica_clear({k}, "localhost:17813")
+                    .size() == 1) {
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        return false;
+    };
+    ASSERT_TRUE(wait_disk_replica(key_a));
+    ASSERT_TRUE(clear_memory_replica(key_a));
+
+    // Everything in the offload dir right now belongs to A's bucket. B gets
+    // its own bucket file later, so this snapshot is how we wipe only A.
+    std::vector<std::filesystem::path> files_a;
+    for (const auto& entry : std::filesystem::directory_iterator(ssd_path_)) {
+        files_a.push_back(entry.path());
+    }
+    ASSERT_FALSE(files_a.empty());
+
+    ASSERT_EQ(py_client_->put(key_b, source), 0);
+    ASSERT_TRUE(wait_disk_replica(key_b));
+    ASSERT_TRUE(clear_memory_replica(key_b));
+
+    // Both disk-only reads work before the wipe, so the later failure comes
+    // from the missing file, not from a setup mistake.
+    auto before = py_client_->batch_get_buffer({key_a, key_b});
+    ASSERT_EQ(before.size(), 2u);
+    ASSERT_NE(before[0], nullptr);
+    ASSERT_NE(before[1], nullptr);
+
+    std::error_code ec;
+    for (const auto& file : files_a) {
+        std::filesystem::remove_all(file, ec);
+        ASSERT_FALSE(ec) << ec.message();
+    }
+
+    auto after = py_client_->batch_get_buffer({key_a, key_b});
+    ASSERT_EQ(after.size(), 2u);
+    // A's backing file is proven gone: its replica is evicted and the read
+    // surfaces a real miss.
+    EXPECT_EQ(after[0], nullptr);
+    EXPECT_TRUE(py_client_->get_replica_desc(key_a).empty());
+    // B's file is byte-for-byte intact: no eviction, and the read must still
+    // return its data.
+    ASSERT_NE(after[1], nullptr);
+    EXPECT_EQ(py_client_->get_replica_desc(key_b).size(), 1u);
+}
+
+// fcczzz's second counterexample on #3889: request {A, B, B} with A's bucket
+// file wiped and B healthy on the same owner. The batch dies wholesale, B's
+// standalone retry succeeds, but the healed status used to stay an error, so
+// the duplicate fan-out skipped the copy and the second B came back null.
+TEST_F(RealClientTest, BatchGetBufferHealedKeyFeedsDuplicateFanOut) {
+    ScopedEnvVar local_memcpy("MC_STORE_MEMCPY", "1");
+    ScopedEnvVar heartbeat("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "1");
+    ScopedEnvVar storage_backend("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+                                 "bucket_storage_backend");
+    ScopedEnvVar bucket_keys("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "1");
+
+    char path[] = "/tmp/mooncake_ssd_dup_heal_XXXXXX";
+    const char* created = mkdtemp(path);
+    ASSERT_NE(created, nullptr);
+    ssd_path_ = created;
+
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
+                                  .set_enable_offload(true)
+                                  .set_default_kv_lease_ttl(10)
+                                  .build()));
+    master_address_ = master_.master_address();
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                               16 * 1024 * 1024, 16 * 1024 * 1024, "tcp", "",
+                               master_address_, nullptr, "", true, ssd_path_),
+        0);
+
+    constexpr size_t kSize = 64 * 1024;
+    std::vector<char> source(kSize);
+    for (size_t i = 0; i < source.size(); ++i) {
+        source[i] = static_cast<char>((i * 31 + 7) & 0xFF);
+    }
+    const std::string key_a = "dup_heal_missing";
+    const std::string key_b = "dup_heal_healthy";
+    ASSERT_EQ(py_client_->put(key_a, source), 0);
+
+    auto wait_disk_replica = [&](const std::string& k) {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (std::chrono::steady_clock::now() < deadline) {
+            for (const auto& replica : py_client_->get_replica_desc(k)) {
+                if (replica.is_local_disk_replica()) {
+                    return true;
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        return false;
+    };
+    auto clear_memory_replica = [&](const std::string& k) {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (py_client_->batch_replica_clear({k}, "localhost:17813")
+                    .size() == 1) {
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        return false;
+    };
+    ASSERT_TRUE(wait_disk_replica(key_a));
+    ASSERT_TRUE(clear_memory_replica(key_a));
+
+    // Everything in the offload dir right now belongs to A's bucket.
+    std::vector<std::filesystem::path> files_a;
+    for (const auto& entry : std::filesystem::directory_iterator(ssd_path_)) {
+        files_a.push_back(entry.path());
+    }
+    ASSERT_FALSE(files_a.empty());
+
+    ASSERT_EQ(py_client_->put(key_b, source), 0);
+    ASSERT_TRUE(wait_disk_replica(key_b));
+    ASSERT_TRUE(clear_memory_replica(key_b));
+
+    std::error_code ec;
+    for (const auto& file : files_a) {
+        std::filesystem::remove_all(file, ec);
+        ASSERT_FALSE(ec) << ec.message();
+    }
+
+    auto after = py_client_->batch_get_buffer({key_a, key_b, key_b});
+    ASSERT_EQ(after.size(), 3u);
+    EXPECT_EQ(after[0], nullptr);
+    EXPECT_TRUE(py_client_->get_replica_desc(key_a).empty());
+    // Both B entries must carry the healed data: the primary is repopulated
+    // by the bounded retry, the duplicate is served by the fan-out copy.
+    ASSERT_NE(after[1], nullptr);
+    ASSERT_NE(after[2], nullptr);
+    EXPECT_EQ(std::memcmp(after[1]->ptr(), source.data(), kSize), 0);
+    EXPECT_EQ(std::memcmp(after[2]->ptr(), source.data(), kSize), 0);
+    EXPECT_EQ(py_client_->get_replica_desc(key_b).size(), 1u);
+}
+
+// fcczzz's first counterexample on #3889: a truncated bucket file keeps the
+// existence probe at kPresent while every read fails. The retry used to
+// recurse with healing enabled, burning one arena buffer per level until
+// allocation or the stack gave out; now it runs exactly once with healing
+// off and surfaces the error. The file exists, so the replica must stay.
+TEST_F(RealClientTest, BatchGetBufferTruncatedBucketFileSurfacesMiss) {
+    ScopedEnvVar local_memcpy("MC_STORE_MEMCPY", "1");
+    ScopedEnvVar heartbeat("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "1");
+    ScopedEnvVar storage_backend("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+                                 "bucket_storage_backend");
+    ScopedEnvVar bucket_keys("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "1");
+
+    char path[] = "/tmp/mooncake_ssd_trunc_heal_XXXXXX";
+    const char* created = mkdtemp(path);
+    ASSERT_NE(created, nullptr);
+    ssd_path_ = created;
+
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
+                                  .set_enable_offload(true)
+                                  .set_default_kv_lease_ttl(10)
+                                  .build()));
+    master_address_ = master_.master_address();
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                               16 * 1024 * 1024, 16 * 1024 * 1024, "tcp", "",
+                               master_address_, nullptr, "", true, ssd_path_),
+        0);
+
+    constexpr size_t kSize = 64 * 1024;
+    std::vector<char> source(kSize);
+    for (size_t i = 0; i < source.size(); ++i) {
+        source[i] = static_cast<char>((i * 31 + 7) & 0xFF);
+    }
+    const std::string key = "trunc_heal_missing";
+    ASSERT_EQ(py_client_->put(key, source), 0);
+
+    auto wait_disk_replica = [&]() {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (std::chrono::steady_clock::now() < deadline) {
+            for (const auto& replica : py_client_->get_replica_desc(key)) {
+                if (replica.is_local_disk_replica()) {
+                    return true;
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        return false;
+    };
+    ASSERT_TRUE(wait_disk_replica());
+    const auto clear_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    bool memory_cleared = false;
+    while (std::chrono::steady_clock::now() < clear_deadline) {
+        if (py_client_->batch_replica_clear({key}, "localhost:17813").size() ==
+            1) {
+            memory_cleared = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    ASSERT_TRUE(memory_cleared);
+
+    auto before = py_client_->batch_get_buffer({key});
+    ASSERT_EQ(before.size(), 1u);
+    ASSERT_NE(before[0], nullptr);
+
+    // Truncate every bucket file: the physical file still exists, so the
+    // heal probe keeps answering kPresent, but no read can succeed.
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(ssd_path_)) {
+        if (std::filesystem::is_regular_file(entry.path(), ec)) {
+            std::filesystem::resize_file(entry.path(), 1024, ec);
+            ASSERT_FALSE(ec) << ec.message();
+        }
+    }
+
+    auto after = py_client_->batch_get_buffer({key});
+    ASSERT_EQ(after.size(), 1u);
+    EXPECT_EQ(after[0], nullptr);
+    // kPresent means no eviction: the key stays advertised even though this
+    // read could not be served.
+    EXPECT_EQ(py_client_->get_replica_desc(key).size(), 1u);
+}
+
+// fcczzz's review on #3889: the heal used to live only in the batch path and
+// refused to act unless every COMPLETE replica was the caller's own
+// LOCAL_DISK, so a remote reader could never evict the owner's dangling
+// replica. A second client with no SSD of its own reads the owner's wiped
+// replica through the single-key get path: the read misses, and the probe to
+// the owner must still evict the dead replica.
+TEST_F(RealClientTest,
+       GetBufferRemoteReaderHealsOwnersDanglingLocalDiskReplica) {
+    ScopedEnvVar local_memcpy("MC_STORE_MEMCPY", "1");
+    ScopedEnvVar heartbeat("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "1");
+    ScopedEnvVar storage_backend("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+                                 "bucket_storage_backend");
+    ScopedEnvVar bucket_keys("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "1");
+
+    char path[] = "/tmp/mooncake_ssd_remote_get_heal_XXXXXX";
+    const char* created = mkdtemp(path);
+    ASSERT_NE(created, nullptr);
+    ssd_path_ = created;
+
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
+                                  .set_enable_offload(true)
+                                  .set_default_kv_lease_ttl(10)
+                                  .build()));
+    master_address_ = master_.master_address();
+    // The owner holds the SSD offload; the reader has no disk of its own and
+    // can only reach the replica over the owner's offload RPC. The reader
+    // joins after the offload completes, the way a second node would.
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                               16 * 1024 * 1024, 16 * 1024 * 1024, "tcp", "",
+                               master_address_, nullptr, "", true, ssd_path_),
+        0);
+
+    constexpr size_t kSize = 64 * 1024;
+    std::vector<char> source(kSize);
+    for (size_t i = 0; i < source.size(); ++i) {
+        source[i] = static_cast<char>((i * 31 + 7) & 0xFF);
+    }
+    const std::string key = "remote_reader_get_heal";
+    ASSERT_EQ(py_client_->put(key, source), 0);
+
+    const auto disk_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    bool disk_ready = false;
+    while (std::chrono::steady_clock::now() < disk_deadline && !disk_ready) {
+        for (const auto& replica : py_client_->get_replica_desc(key)) {
+            if (replica.is_local_disk_replica()) disk_ready = true;
+        }
+        if (!disk_ready) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    }
+    ASSERT_TRUE(disk_ready);
+    const auto clear_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    bool memory_cleared = false;
+    while (std::chrono::steady_clock::now() < clear_deadline) {
+        if (py_client_->batch_replica_clear({key}, "localhost:17813").size() ==
+            1) {
+            memory_cleared = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    ASSERT_TRUE(memory_cleared);
+
+    auto reader = RealClient::create();
+    ASSERT_EQ(
+        reader->setup_real("localhost:17814", "P2PHANDSHAKE", 16 * 1024 * 1024,
+                           16 * 1024 * 1024, "tcp", "", master_address_),
+        0);
+
+    // Sanity: the remote single-key read works while the file is there.
+    ASSERT_NE(reader->get_buffer(key), nullptr);
+
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(ssd_path_)) {
+        std::filesystem::remove_all(entry.path(), ec);
+        ASSERT_FALSE(ec) << ec.message();
+    }
+
+    // Nothing about the wiped replica belongs to the reader, yet its miss
+    // must still get the dead replica evicted.
+    EXPECT_EQ(reader->get_buffer(key), nullptr);
+    EXPECT_TRUE(py_client_->get_replica_desc(key).empty());
+
+    reader->tearDownAll();
+}
+
+// Same remote-reader shape through the batch path: the reader's failed batch
+// read must find the failed replica by the endpoint it actually read from and
+// have the owner evict it.
+TEST_F(RealClientTest,
+       BatchGetBufferRemoteReaderHealsOwnersDanglingLocalDiskReplica) {
+    ScopedEnvVar local_memcpy("MC_STORE_MEMCPY", "1");
+    ScopedEnvVar heartbeat("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "1");
+    ScopedEnvVar storage_backend("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+                                 "bucket_storage_backend");
+    ScopedEnvVar bucket_keys("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "1");
+
+    char path[] = "/tmp/mooncake_ssd_remote_batch_heal_XXXXXX";
+    const char* created = mkdtemp(path);
+    ASSERT_NE(created, nullptr);
+    ssd_path_ = created;
+
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
+                                  .set_enable_offload(true)
+                                  .set_default_kv_lease_ttl(10)
+                                  .build()));
+    master_address_ = master_.master_address();
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                               16 * 1024 * 1024, 16 * 1024 * 1024, "tcp", "",
+                               master_address_, nullptr, "", true, ssd_path_),
+        0);
+
+    constexpr size_t kSize = 64 * 1024;
+    std::vector<char> source(kSize);
+    for (size_t i = 0; i < source.size(); ++i) {
+        source[i] = static_cast<char>((i * 31 + 7) & 0xFF);
+    }
+    const std::string key = "remote_reader_batch_heal";
+    ASSERT_EQ(py_client_->put(key, source), 0);
+
+    const auto disk_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    bool disk_ready = false;
+    while (std::chrono::steady_clock::now() < disk_deadline && !disk_ready) {
+        for (const auto& replica : py_client_->get_replica_desc(key)) {
+            if (replica.is_local_disk_replica()) disk_ready = true;
+        }
+        if (!disk_ready) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    }
+    ASSERT_TRUE(disk_ready);
+    const auto clear_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    bool memory_cleared = false;
+    while (std::chrono::steady_clock::now() < clear_deadline) {
+        if (py_client_->batch_replica_clear({key}, "localhost:17813").size() ==
+            1) {
+            memory_cleared = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    ASSERT_TRUE(memory_cleared);
+
+    // The reader joins after the offload completed, like a second node would.
+    auto reader = RealClient::create();
+    ASSERT_EQ(
+        reader->setup_real("localhost:17814", "P2PHANDSHAKE", 16 * 1024 * 1024,
+                           16 * 1024 * 1024, "tcp", "", master_address_),
+        0);
+
+    auto before = reader->batch_get_buffer({key});
+    ASSERT_EQ(before.size(), 1u);
+    ASSERT_NE(before[0], nullptr);
+
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(ssd_path_)) {
+        std::filesystem::remove_all(entry.path(), ec);
+        ASSERT_FALSE(ec) << ec.message();
+    }
+
+    auto after = reader->batch_get_buffer({key});
+    ASSERT_EQ(after.size(), 1u);
+    EXPECT_EQ(after[0], nullptr);
+    EXPECT_TRUE(py_client_->get_replica_desc(key).empty());
+
+    reader->tearDownAll();
+}
+
+// fcczzz's review on #3889: an SSD owner can hold objects recorded under a
+// different tenant than its own. The verify handler used to probe the scoped
+// file and emit the eviction under the owner's own tenant, so the probe
+// missed the tenant-scoped file and the eviction went to a master record
+// that does not exist (OBJECT_NOT_FOUND, swallowed as success), leaving the
+// dangling replica advertised. The verify request now carries the reader's
+// tenant, which always matches the tenant the write path scoped the file
+// with, and both the probe and the eviction go through it.
+//
+// The owner is the cross-tenant side here: it runs on tenant-a while the
+// object and its callers stay on default, which also keeps the memory
+// replica clearable through the default-scoped batch_replica_clear RPC.
+TEST_F(RealClientTest, GetBufferHealUsesReaderTenantForCrossTenantReplica) {
+    ScopedEnvVar local_memcpy("MC_STORE_MEMCPY", "1");
+    ScopedEnvVar heartbeat("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "1");
+    ScopedEnvVar storage_backend("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+                                 "bucket_storage_backend");
+    ScopedEnvVar bucket_keys("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "1");
+
+    char path[] = "/tmp/mooncake_ssd_cross_tenant_heal_XXXXXX";
+    const char* created = mkdtemp(path);
+    ASSERT_NE(created, nullptr);
+    ssd_path_ = created;
+
+    // Tenant isolation has to be on for the mismatch to exist: with it off
+    // the master resolves every tenant to default and the owner's tenant can
+    // never differ from the object's.
+    char quota_path[] = "/tmp/mooncake_tenant_quota_heal_XXXXXX.yaml";
+    const int quota_fd = mkstemps(quota_path, 5);
+    ASSERT_NE(quota_fd, -1);
+    const char quota_yaml[] =
+        "version: 1\n\ntenants:\n"
+        "  - name: \"default\"\n    quota: 1073741824\n"
+        "  - name: \"tenant-a\"\n    quota: 1073741824\n";
+    ASSERT_EQ(::write(quota_fd, quota_yaml, sizeof(quota_yaml) - 1),
+              (ssize_t)(sizeof(quota_yaml) - 1));
+    ::close(quota_fd);
+
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
+                                  .set_enable_offload(true)
+                                  .set_default_kv_lease_ttl(10)
+                                  .set_enable_multi_tenants(true)
+                                  .set_tenant_quota_connector_uri(quota_path)
+                                  .build()));
+    master_address_ = master_.master_address();
+    // The SSD owner runs on tenant-a. The object and its caller stay on the
+    // default tenant, so the offload file is written under the default scope
+    // while the owner's own tenant is wrong for both the probe and the
+    // eviction.
+    ASSERT_EQ(py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                                     16 * 1024 * 1024, 16 * 1024 * 1024, "tcp",
+                                     "", master_address_, nullptr, "", true,
+                                     ssd_path_, "tenant-a"),
+              0);
+
+    // The caller mounts no segment of its own, so the put allocates on the
+    // owner's segment and the offload task lands on the owner.
+    auto caller = RealClient::create();
+    ASSERT_EQ(caller->setup_real("localhost:17815", "P2PHANDSHAKE", 0,
+                                 16 * 1024 * 1024, "tcp", "", master_address_),
+              0);
+
+    constexpr size_t kSize = 64 * 1024;
+    std::vector<char> source(kSize);
+    for (size_t i = 0; i < source.size(); ++i) {
+        source[i] = static_cast<char>((i * 31 + 7) & 0xFF);
+    }
+    const std::string key = "cross_tenant_heal";
+    ASSERT_EQ(caller->put(key, source), 0);
+
+    const auto disk_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    bool disk_ready = false;
+    while (std::chrono::steady_clock::now() < disk_deadline && !disk_ready) {
+        for (const auto& replica : caller->get_replica_desc(key)) {
+            if (replica.is_local_disk_replica()) disk_ready = true;
+        }
+        if (!disk_ready) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    }
+    ASSERT_TRUE(disk_ready);
+    const auto clear_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    bool memory_cleared = false;
+    while (std::chrono::steady_clock::now() < clear_deadline) {
+        if (caller->batch_replica_clear({key}, "localhost:17813").size() == 1) {
+            memory_cleared = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    ASSERT_TRUE(memory_cleared);
+
+    // Sanity: the cross-tenant remote read works while the file is there.
+    ASSERT_NE(caller->get_buffer(key), nullptr);
+
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(ssd_path_)) {
+        std::filesystem::remove_all(entry.path(), ec);
+        ASSERT_FALSE(ec) << ec.message();
+    }
+
+    // The probe must look under the caller's (default) tenant and the
+    // eviction must hit the default master record; going out with the
+    // owner's tenant-a leaves the dangling replica advertised here.
+    EXPECT_EQ(caller->get_buffer(key), nullptr);
+    EXPECT_TRUE(caller->get_replica_desc(key).empty());
+
+    caller->tearDownAll();
+    std::remove(quota_path);
+}
+
+// fcczzz's review on #3889 (isolation-off follow-up): with tenant isolation
+// disabled the master resolves every request to "default", so the offload
+// file is written under the default scope no matter what tenant a reader is
+// configured with. A tenant-a reader's verify then probed the tenant-a scope,
+// reported the healthy default-scoped file missing, and the master normalized
+// the follow-up eviction to "default" and deleted that healthy replica. On a
+// scoped miss the handler now also probes the default scope and answers
+// undetermined instead of evicting on the ambiguity.
+TEST_F(RealClientTest,
+       GetBufferHealDoesNotEvictHealthyReplicaWhenTenancyIsOff) {
+    ScopedEnvVar local_memcpy("MC_STORE_MEMCPY", "1");
+    ScopedEnvVar heartbeat("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "1");
+    ScopedEnvVar storage_backend("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+                                 "bucket_storage_backend");
+    ScopedEnvVar bucket_keys("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "1");
+
+    char path[] = "/tmp/mooncake_ssd_tenancy_off_heal_XXXXXX";
+    const char* created = mkdtemp(path);
+    ASSERT_NE(created, nullptr);
+    ssd_path_ = created;
+
+    // No enable_multi_tenants: the master resolves everything to "default".
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
+                                  .set_enable_offload(true)
+                                  .set_default_kv_lease_ttl(10)
+                                  .build()));
+    master_address_ = master_.master_address();
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                               16 * 1024 * 1024, 16 * 1024 * 1024, "tcp", "",
+                               master_address_, nullptr, "", true, ssd_path_),
+        0);
+
+    constexpr size_t kSize = 64 * 1024;
+    std::vector<char> source(kSize);
+    for (size_t i = 0; i < source.size(); ++i) {
+        source[i] = static_cast<char>((i * 31 + 7) & 0xFF);
+    }
+    const std::string key = "tenancy_off_heal";
+    ASSERT_EQ(py_client_->put(key, source), 0);
+
+    const auto disk_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    bool disk_ready = false;
+    while (std::chrono::steady_clock::now() < disk_deadline && !disk_ready) {
+        for (const auto& replica : py_client_->get_replica_desc(key)) {
+            if (replica.is_local_disk_replica()) disk_ready = true;
+        }
+        if (!disk_ready) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    }
+    ASSERT_TRUE(disk_ready);
+    const auto clear_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    bool memory_cleared = false;
+    while (std::chrono::steady_clock::now() < clear_deadline) {
+        if (py_client_->batch_replica_clear({key}, "localhost:17813").size() ==
+            1) {
+            memory_cleared = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    ASSERT_TRUE(memory_cleared);
+
+    // A reader configured for tenant-a still sees the replica (the master
+    // resolves its query to "default"), but its storage read is scoped with
+    // its own tenant and misses. Its verify must NOT evict the healthy
+    // default replica.
+    auto reader = RealClient::create();
+    ASSERT_EQ(
+        reader->setup_real("localhost:17814", "P2PHANDSHAKE", 16 * 1024 * 1024,
+                           16 * 1024 * 1024, "tcp", "", master_address_,
+                           nullptr, "", false, "", "tenant-a"),
+        0);
+
+    EXPECT_EQ(reader->get_buffer(key), nullptr);
+    bool disk_replica_survives = false;
+    for (const auto& replica : py_client_->get_replica_desc(key)) {
+        if (replica.is_local_disk_replica()) disk_replica_survives = true;
+    }
+    EXPECT_TRUE(disk_replica_survives);
+
+    reader->tearDownAll();
+}
+
+// fcczzz's review on #3889 (second round): with tenant isolation on, a
+// tenant-scoped object whose backing file is gone must still be evicted even
+// when a healthy same-named object sits under the default scope on the same
+// owner. Probing the default scope on a tenant-scoped miss made the healthy
+// default object shield the dangling tenant one: the verify answered
+// undetermined forever and the dangling replica kept being advertised. The
+// master now stamps the query's resolved tenant on GetReplicaListResponse,
+// the reader forwards it in the verify request, and the owner probes and
+// evicts under that exact scope instead of guessing.
+TEST_F(RealClientTest,
+       GetBufferHealEvictsTenantReplicaDespiteHealthyDefaultScope) {
+    ScopedEnvVar local_memcpy("MC_STORE_MEMCPY", "1");
+    ScopedEnvVar heartbeat("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "1");
+    ScopedEnvVar storage_backend("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+                                 "bucket_storage_backend");
+    ScopedEnvVar bucket_keys("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "1");
+
+    char path[] = "/tmp/mooncake_ssd_tenant_scope_heal_XXXXXX";
+    const char* created = mkdtemp(path);
+    ASSERT_NE(created, nullptr);
+    ssd_path_ = created;
+
+    char quota_path[] = "/tmp/mooncake_tenant_quota_scope_heal_XXXXXX.yaml";
+    const int quota_fd = mkstemps(quota_path, 5);
+    ASSERT_NE(quota_fd, -1);
+    const char quota_yaml[] =
+        "version: 1\n\ntenants:\n"
+        "  - name: \"default\"\n    quota: 1073741824\n"
+        "  - name: \"tenant-a\"\n    quota: 1073741824\n";
+    ASSERT_EQ(::write(quota_fd, quota_yaml, sizeof(quota_yaml) - 1),
+              (ssize_t)(sizeof(quota_yaml) - 1));
+    ::close(quota_fd);
+
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
+                                  .set_enable_offload(true)
+                                  .set_default_kv_lease_ttl(10)
+                                  .set_enable_multi_tenants(true)
+                                  .set_tenant_quota_connector_uri(quota_path)
+                                  .build()));
+    master_address_ = master_.master_address();
+    // One SSD owner holds both scopes: it runs on tenant-a, and both the
+    // tenant-a object and the default object offload onto its disk.
+    ASSERT_EQ(py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                                     16 * 1024 * 1024, 16 * 1024 * 1024, "tcp",
+                                     "", master_address_, nullptr, "", true,
+                                     ssd_path_, "tenant-a"),
+              0);
+
+    auto tenant_caller = RealClient::create();
+    ASSERT_EQ(tenant_caller->setup_real(
+                  "localhost:17814", "P2PHANDSHAKE", 0, 16 * 1024 * 1024, "tcp",
+                  "", master_address_, nullptr, "", false, "", "tenant-a"),
+              0);
+    auto default_caller = RealClient::create();
+    ASSERT_EQ(default_caller->setup_real("localhost:17815", "P2PHANDSHAKE", 0,
+                                         16 * 1024 * 1024, "tcp", "",
+                                         master_address_),
+              0);
+
+    constexpr size_t kSize = 64 * 1024;
+    std::vector<char> source(kSize);
+    for (size_t i = 0; i < source.size(); ++i) {
+        source[i] = static_cast<char>((i * 31 + 7) & 0xFF);
+    }
+    const std::string key = "tenant_scope_heal";
+
+    auto wait_disk_ready = [&](RealClient* c) {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (std::chrono::steady_clock::now() < deadline) {
+            for (const auto& replica : c->get_replica_desc(key)) {
+                if (replica.is_local_disk_replica()) return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        return false;
+    };
+    auto clear_memory = [&](RealClient* c) {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (c->batch_replica_clear({key}, "localhost:17813").size() == 1) {
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        return false;
+    };
+
+    // tenant-a's object first, then wipe the disk so its backing file is
+    // gone while the master still advertises the replica.
+    ASSERT_EQ(tenant_caller->put(key, source), 0);
+    ASSERT_TRUE(wait_disk_ready(tenant_caller.get()));
+    ASSERT_TRUE(clear_memory(tenant_caller.get()));
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(ssd_path_)) {
+        std::filesystem::remove_all(entry.path(), ec);
+        ASSERT_FALSE(ec) << ec.message();
+    }
+
+    // A healthy same-named object under the default scope on the same owner.
+    ASSERT_EQ(default_caller->put(key, source), 0);
+    ASSERT_TRUE(wait_disk_ready(default_caller.get()));
+    ASSERT_TRUE(clear_memory(default_caller.get()));
+
+    // The tenant-a read misses on disk, the verify must probe the tenant-a
+    // scope alone (the master resolved the query to tenant-a), prove the file
+    // gone, and evict the dangling replica. The healthy default-scoped object
+    // must not shield it and must not be touched.
+    EXPECT_EQ(tenant_caller->get_buffer(key), nullptr);
+    EXPECT_TRUE(tenant_caller->get_replica_desc(key).empty());
+    EXPECT_NE(default_caller->get_buffer(key), nullptr);
+
+    tenant_caller->tearDownAll();
+    default_caller->tearDownAll();
+    std::remove(quota_path);
+}
 
 }  // namespace testing
 

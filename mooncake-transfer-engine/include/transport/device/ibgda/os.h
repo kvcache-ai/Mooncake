@@ -20,7 +20,7 @@ static inline int close_ret(int fd) {
 static inline ssize_t read_all(int fd, void *buf, size_t len) {
     size_t total = 0;
     while (total < len) {
-        ssize_t n = read(fd, buf + total, len - total);
+        ssize_t n = read(fd, static_cast<char *>(buf) + total, len - total);
         if (n == -1) {
             return -1;
         }
@@ -35,7 +35,8 @@ static inline ssize_t read_all(int fd, void *buf, size_t len) {
 static inline ssize_t write_all(int fd, const void *buf, size_t len) {
     size_t total = 0;
     while (total < len) {
-        ssize_t n = write(fd, buf + total, len - total);
+        ssize_t n =
+            write(fd, static_cast<const char *>(buf) + total, len - total);
         if (n == -1) {
             return -1;
         }

@@ -21,6 +21,9 @@ namespace mooncake {
 class HttpMetadataServer;
 class WrappedMasterService {
    public:
+    void SetBatchOpLogTerminalCallback(
+        OrderedOpLogWriter::TerminalCallback callback);
+    void StopBatchOpLogWriter();
     // Constructor with optional metadata-cleanup-on-timeout configuration.
     // - http_metadata_server: in-process pointer used when the HTTP metadata
     //   server is co-located in the master process (nullptr = not co-located).
@@ -37,11 +40,21 @@ class WrappedMasterService {
     tl::expected<bool, ErrorCode> ExistKey(
         const std::string& key, const std::string& tenant_id = "default");
 
+    // Point-in-time existence check: shares the ExistKey lookup path but
+    // grants no read lease, so a `true` result does not protect the object
+    // from eviction.
+    tl::expected<bool, ErrorCode> ProbeKey(
+        const std::string& key, const std::string& tenant_id = "default");
+
     tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>
     CalcCacheStats();
 
     std::vector<tl::expected<bool, ErrorCode>> BatchExistKey(
         const std::vector<std::string>& keys,
+        const std::string& tenant_id = "default");
+
+    std::vector<tl::expected<bool, ErrorCode>> BatchProbeKey(
+        const GrantLeasePolicy& policy, const std::vector<std::string>& keys,
         const std::string& tenant_id = "default");
 
     tl::expected<
@@ -51,7 +64,8 @@ class WrappedMasterService {
 
     tl::expected<std::vector<std::string>, ErrorCode> BatchReplicaClear(
         const std::vector<std::string>& object_keys, const UUID& client_id,
-        const std::string& segment_name);
+        const std::string& segment_name,
+        const std::string& tenant_id = "default");
 
     tl::expected<
         std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
@@ -187,6 +201,8 @@ class WrappedMasterService {
 
     tl::expected<std::string, ErrorCode> ServiceReady();
 
+    [[nodiscard]] TieredStorageUsageSnapshot GetStorageUsageSnapshot() const;
+
     tl::expected<std::vector<TenantQuotaSnapshot>, ErrorCode>
     ListTenantQuotaSnapshots();
     tl::expected<TenantQuotaSnapshot, ErrorCode> GetTenantQuotaSnapshot(
@@ -209,6 +225,9 @@ class WrappedMasterService {
 
     tl::expected<void, ErrorCode> MountLocalDiskSegment(const UUID& client_id,
                                                         bool enable_offloading);
+
+    tl::expected<void, ErrorCode> UnmountLocalDiskSegment(
+        const UUID& client_id);
 
     tl::expected<std::vector<OffloadTaskItem>, ErrorCode>
     OffloadObjectHeartbeat(const UUID& client_id, bool enable_offloading);
@@ -239,6 +258,11 @@ class WrappedMasterService {
         const UUID& client_id, const std::string& key,
         const std::string& tenant_id);
 
+    // Admin-only, grow-only DFS capacity management. Existing placements remain
+    // valid.
+    tl::expected<int, ErrorCode> GetDfsShardCount() const;
+    tl::expected<int, ErrorCode> ExpandDfsShards(int shard_count);
+
     tl::expected<UUID, ErrorCode> CreateDrainJob(
         const CreateDrainJobRequest& request);
 
@@ -250,12 +274,26 @@ class WrappedMasterService {
         const std::string& segment_name);
     tl::expected<SegmentStatus, ErrorCode> QuerySegmentStatusById(
         const UUID& segment_id);
+    tl::expected<void, ErrorCode> SetSegmentStatus(
+        const std::string& segment_name, SegmentStatus status);
 
     // Internal method called by supervisor during promotion; NOT an RPC
     // endpoint.
-    void RestoreFromStandby(const std::vector<StandbyObjectEntry>& objects,
-                            uint64_t initial_oplog_sequence_id,
-                            const std::vector<StandbySegmentInfo>& segments);
+    tl::expected<void, ErrorCode> RestoreFromStandby(
+        const std::vector<StandbyObjectEntry>& objects,
+        uint64_t initial_oplog_sequence_id,
+        const std::vector<StandbySegmentInfo>& segments,
+        const WeightMetadataSnapshot& weight_metadata = {});
+    // Copies objects out of the handoff; the caller keeps ownership.
+    tl::expected<void, ErrorCode> RestoreFromBatchOpLogPromotion(
+        const BatchOpLogPromotionHandoff& handoff,
+        size_t chunk_object_count = kDefaultBatchOpLogPromotionChunkObjects);
+    tl::expected<void, ErrorCode> RestoreFromBatchOpLogPromotion(
+        const StandbyMetadataStore& metadata_store,
+        DurablePrefix applied_cursor,
+        const std::vector<StandbySegmentInfo>& segments,
+        ReplicaID max_replica_id,
+        size_t chunk_object_count = kDefaultBatchOpLogPromotionChunkObjects);
 
     tl::expected<UUID, ErrorCode> CreateCopyTask(
         const std::string& key, const std::string& tenant_id,
@@ -279,13 +317,28 @@ class WrappedMasterService {
         const std::string& tenant_id, const std::string& src_segment,
         const std::vector<std::string>& tgt_segments);
 
+    tl::expected<CopyStartResponse, ErrorCode> DynamicReplicaCopyStart(
+        const UUID& client_id, const std::string& key,
+        const std::string& tenant_id, const std::string& src_segment,
+        const std::vector<std::string>& tgt_segments,
+        const UUID& dynamic_replication_lease_id,
+        uint64_t dynamic_replication_version_epoch);
+
     tl::expected<void, ErrorCode> CopyEnd(const UUID& client_id,
                                           const std::string& key,
                                           const std::string& tenant_id);
+    tl::expected<void, ErrorCode> DynamicReplicaCopyEnd(
+        const UUID& client_id, const std::string& key,
+        const std::string& tenant_id, const UUID& dynamic_replication_lease_id,
+        uint64_t dynamic_replication_version_epoch);
 
     tl::expected<void, ErrorCode> CopyRevoke(const UUID& client_id,
                                              const std::string& key,
                                              const std::string& tenant_id);
+    tl::expected<void, ErrorCode> DynamicReplicaCopyRevoke(
+        const UUID& client_id, const std::string& key,
+        const std::string& tenant_id, const UUID& dynamic_replication_lease_id,
+        uint64_t dynamic_replication_version_epoch);
 
     tl::expected<MoveStartResponse, ErrorCode> MoveStart(
         const UUID& client_id, const std::string& key,
@@ -305,6 +358,14 @@ class WrappedMasterService {
                                                    const std::string& tenant_id,
                                                    ReplicaType replica_type);
 
+    // Conditional variant: evicts only when the current record still carries
+    // the replica id the caller failed on. Returns false when the replica was
+    // replaced in the meantime; the replacement is left untouched.
+    tl::expected<bool, ErrorCode> EvictDiskReplicaIfCurrent(
+        const UUID& client_id, const std::string& key,
+        const std::string& tenant_id, ReplicaType replica_type,
+        ReplicaID expected_replica_id);
+
     std::vector<tl::expected<void, ErrorCode>> BatchEvictDiskReplica(
         const UUID& client_id, const std::vector<std::string>& keys,
         const std::string& tenant_id, ReplicaType replica_type);
@@ -316,7 +377,13 @@ class WrappedMasterService {
     MasterService master_service_;
 };
 
+class RpcWorkerPool;
+
+// With a worker pool, every handler except Ping and ServiceReady runs on its
+// worker threads; those two stay on the io threads, which the pool keeps
+// free. Without one, every handler runs inline on the io threads.
 void RegisterRpcService(coro_rpc::coro_rpc_server& server,
-                        mooncake::WrappedMasterService& wrapped_master_service);
+                        mooncake::WrappedMasterService& wrapped_master_service,
+                        RpcWorkerPool* worker_pool = nullptr);
 
 }  // namespace mooncake

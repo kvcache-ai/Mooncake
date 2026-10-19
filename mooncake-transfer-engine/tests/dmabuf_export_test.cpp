@@ -32,6 +32,10 @@
 #include <cstring>
 #include <vector>
 
+#if defined(USE_CUDA)
+#include <cuda_runtime.h>
+#endif
+
 using mooncake::DmabufExport;
 using mooncake::RdmaContext;
 
@@ -110,7 +114,7 @@ TEST(CloseDmabufExport, Idempotent) {
 TEST(ExportDmabuf, HostMemoryYieldsHostReg) {
     std::vector<char> buf(4096);
     DmabufExport exp;
-    int ret = RdmaContext::exportDmabuf(buf.data(), exp);
+    int ret = RdmaContext::exportDmabuf(buf.data(), buf.size(), exp);
     EXPECT_EQ(ret, 0);
     EXPECT_EQ(exp.method, DmabufExport::Method::kHostReg);
     EXPECT_EQ(exp.fd, -1);
@@ -122,7 +126,7 @@ TEST(ExportDmabuf, LargeHostBufferYieldsHostReg) {
     constexpr size_t kSize = 8ULL * 1024 * 1024;  // 8 MiB
     std::vector<char> buf(kSize);
     DmabufExport exp;
-    int ret = RdmaContext::exportDmabuf(buf.data(), exp);
+    int ret = RdmaContext::exportDmabuf(buf.data(), kSize, exp);
     EXPECT_EQ(ret, 0);
     EXPECT_EQ(exp.method, DmabufExport::Method::kHostReg);
     EXPECT_EQ(exp.fd, -1);
@@ -134,7 +138,7 @@ TEST(ExportDmabuf, MmapAnonymousYieldsHostReg) {
     ASSERT_NE(p, MAP_FAILED);
 
     DmabufExport exp;
-    int ret = RdmaContext::exportDmabuf(p, exp);
+    int ret = RdmaContext::exportDmabuf(p, 4096, exp);
     EXPECT_EQ(ret, 0);
     EXPECT_EQ(exp.method, DmabufExport::Method::kHostReg);
     EXPECT_EQ(exp.fd, -1);
@@ -145,10 +149,45 @@ TEST(ExportDmabuf, MmapAnonymousYieldsHostReg) {
 TEST(ExportDmabuf, StackAddressYieldsHostReg) {
     char stack_buf[128];
     DmabufExport exp;
-    int ret = RdmaContext::exportDmabuf(stack_buf, exp);
+    int ret = RdmaContext::exportDmabuf(stack_buf, sizeof(stack_buf), exp);
     EXPECT_EQ(ret, 0);
     EXPECT_EQ(exp.method, DmabufExport::Method::kHostReg);
     EXPECT_EQ(exp.fd, -1);
 }
+
+#if defined(USE_CUDA)
+// Needs a CUDA device and DMA-BUF support; skipped otherwise. Registering a
+// sub-range of a larger cudaMalloc allocation must export only that range:
+// exporting the whole allocation makes every import map all of it through
+// BAR1, and N concurrent imports of an N-way split (preTouchMemory) run out
+// of BAR1 (ibv_reg_dmabuf_mr ENOMEM), e.g. on MIG instances.
+TEST(ExportDmabuf, GpuSubRangeExportsOnlyTheRequestedRange) {
+    int devices = 0;
+    if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0)
+        GTEST_SKIP() << "no CUDA device";
+    constexpr size_t kAlloc = 64ULL << 20;  // one 64 MiB allocation
+    constexpr size_t kOffset = 16ULL << 20;
+    constexpr size_t kLength = 16ULL << 20;  // register [16 MiB, 32 MiB)
+    void *base = nullptr;
+    ASSERT_EQ(cudaMalloc(&base, kAlloc), cudaSuccess);
+    DmabufExport exp;
+    int ret = RdmaContext::exportDmabuf(static_cast<char *>(base) + kOffset,
+                                        kLength, exp);
+    if (ret != 0 || exp.method != DmabufExport::Method::kDmabufReg) {
+        RdmaContext::closeDmabufExport(exp);
+        cudaFree(base);
+        GTEST_SKIP() << "DMA-BUF path not taken (no DMA-BUF support, or "
+                        "WITH_NVIDIA_PEERMEM selects ibv_reg_mr)";
+    }
+    off_t exported = lseek(exp.fd, 0, SEEK_END);
+    ASSERT_GT(exported, 0);
+    EXPECT_GE(static_cast<size_t>(exported), exp.offset + kLength);
+    EXPECT_LT(static_cast<size_t>(exported), kAlloc)
+        << "exported the whole allocation instead of the requested range";
+    EXPECT_LT(exp.offset, static_cast<uint64_t>(sysconf(_SC_PAGESIZE)));
+    RdmaContext::closeDmabufExport(exp);
+    cudaFree(base);
+}
+#endif
 
 }  // namespace

@@ -23,6 +23,18 @@ __device__ __forceinline__ uint64_t mc_ld_acquire_u64(const uint64_t* ptr) {
     return ret;
 }
 
+// Volatile polling load. This deliberately carries no acquire semantics; a
+// waiter must perform one acquire load after observing the awaited value
+// before consuming data published by the matching release operation.
+__device__ __forceinline__ uint64_t mc_ld_volatile_u64(const uint64_t* ptr) {
+    uint64_t ret;
+    asm volatile("ld.volatile.global.u64 %0, [%1];"
+                 : "=l"(ret)
+                 : "l"(ptr)
+                 : "memory");
+    return ret;
+}
+
 // ---------------------------------------------------------------------------
 // Release stores — cross-GPU visibility (sys scope), non-temporal (no alloc)
 // ---------------------------------------------------------------------------

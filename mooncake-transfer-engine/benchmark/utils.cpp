@@ -15,7 +15,11 @@
 #include "utils.h"
 
 #include <gflags/gflags.h>
+#include <cctype>
+#include <charconv>
 #include <iostream>
+#include <optional>
+#include <string_view>
 
 DEFINE_string(seg_name, "", "Memory segment name for the local side");
 DEFINE_string(seg_type, "DRAM",
@@ -29,10 +33,15 @@ DEFINE_string(
     "thus multiple transports — SHM for DRAM, NVLink for VRAM) "
     "concurrently. Empty falls back to --seg_type (single type, existing "
     "behavior). Requires transports to be enabled via MC_TENT_CONF.");
-DEFINE_string(target_seg_name, "", "Memory segment name for the target side");
-DEFINE_string(op_type, "read", "Operation type to benchmark: read|write|mix");
+DEFINE_string(target_seg_name, "",
+              "Target segment name for the initiator side. A comma-separated "
+              "list enables multi-target initiator mode.");
+DEFINE_string(
+    op_type, "read",
+    "Operation type to benchmark: read|write|mix|write_seed|read_verify");
 DEFINE_bool(check_consistency, false,
-            "Enable data consistency check after transfer.");
+            "Validate data with alternating WRITE/READ transfers; reports "
+            "op_type=mix regardless of --op_type=read|write|mix.");
 DEFINE_uint64(total_buffer_size, 1UL << 30,
               "Total buffer size for testing (in bytes).");
 DEFINE_uint64(start_block_size, 4096, "Start block size (in bytes).");
@@ -44,6 +53,13 @@ DEFINE_int32(start_num_threads, 1,
              "Start number of concurrent worker threads.");
 DEFINE_int32(max_num_threads, 1,
              "Maximum number of concurrent worker threads.");
+DEFINE_uint64(target_offset, 0,
+              "Base offset added to every target buffer address. Useful when "
+              "multiple initiator processes share one target segment.");
+DEFINE_uint64(
+    target_range_size, 0,
+    "Per-initiator target range size. 0 disables range validation; "
+    "non-zero requires every target address to stay inside the range.");
 DEFINE_string(
     qos_classes, "",
     "QoS classes as name:threads:slo_us:weight[:isolated_gbps],...; "
@@ -60,6 +76,17 @@ DEFINE_double(qos_link_capacity_gbps, 0.0,
               "Link capacity in GB/s for total utilization (0 reports N/A).");
 DEFINE_string(qos_output_jsonl, "",
               "Append versioned QoS metric records to this JSONL file.");
+DEFINE_string(result_output_jsonl, "",
+              "Append versioned benchmark result records, including "
+              "per-target metrics, to this JSONL file.");
+DEFINE_string(
+    split_output_jsonl, "",
+    "Initiator only: append one JSONL line per transfer with submit_us, "
+    "wait_us, and polls. Empty (default) disables the log: no extra timers "
+    "and no I/O. Enable to split Avg Tx into submit vs completion wait.");
+DEFINE_uint64(request_interval_us, 0,
+              "Per-thread delay before issuing each transfer batch, in "
+              "microseconds. 0 disables pacing.");
 DEFINE_uint64(deadline_us, 0,
               "tent only: relative per-transfer deadline in microseconds for "
               "tight worker threads (0 disables deadline tagging); cannot be "
@@ -80,14 +107,29 @@ DEFINE_int32(
     rpc_server_port, 0,
     "RPC server port used for p2p metadata service (0 = auto-select).");
 DEFINE_string(xport_type, "",
-              "Transport type: rdma|shm|mnnvl|gds|iouring|sunrise_link");
+              "Transport type: "
+              "rdma|tcp|hp_tcp|shm|mnnvl|nvlink|gds|iouring|ub|sunrise_link|"
+              "mpcomm|flagcx|efa|fabric");
 DEFINE_string(backend, "tent", "Transport backend: classic|tent");
+DEFINE_bool(use_hugepage, false,
+            "classic DRAM: SHM allocates on hugetlbfs; RDMA allocates with "
+            "MAP_HUGETLB so ibv_reg_mr does not explode NIC PTEs on 4K pages. "
+            "Length must be a multiple of hugepage_size. No 4K fallback.");
+DEFINE_string(hugepage_size, "0",
+              "Hugepage size: 2MB, 512MB, or 1GB (same as "
+              "MC_STORE_HUGEPAGE_SIZE), or the size in bytes "
+              "(2097152, 536870912, 1073741824). "
+              "0 defaults to 2MB when --use_hugepage is set.");
+DEFINE_string(
+    hugetlbfs_path, "",
+    "classic shm hugepage mount. Empty uses the size-specific "
+    "default (/dev/hugepages, /dev/hugepages-512M, /dev/hugepages-1G).");
 DEFINE_bool(notifi, false,
             "Enable RDMA notification for performance measurement.");
-DEFINE_string(
-    tent_transport_hint, "unspec",
-    "tent only: per-request transport_hint. "
-    "unspec|rdma|tcp|shm|nvlink|gds|io_uring|mnnvl|ascend|sunrise_link");
+DEFINE_string(tent_transport_hint, "unspec",
+              "tent only: per-request transport_hint. "
+              "unspec|rdma|tcp|hp_tcp|shm|nvlink|gds|io_uring|mnnvl|ascend|"
+              "ub|sunrise_link|mpcomm|fabric");
 DEFINE_string(tent_intent_type, "unspec",
               "tent only: intent_type attached to every benchmark request. "
               "unspec|foreground_get|background_prefetch|migration|checkpoint|"
@@ -110,11 +152,16 @@ size_t XferBenchConfig::max_batch_size = 0;
 int XferBenchConfig::duration = 0;
 int XferBenchConfig::max_num_threads = 0;
 int XferBenchConfig::start_num_threads = 0;
+size_t XferBenchConfig::target_offset = 0;
+size_t XferBenchConfig::target_range_size = 0;
 std::string XferBenchConfig::qos_classes;
 std::string XferBenchConfig::qos_classes_json;
 std::string XferBenchConfig::workload_classes_json;
 double XferBenchConfig::qos_link_capacity_gbps = 0.0;
 std::string XferBenchConfig::qos_output_jsonl;
+std::string XferBenchConfig::result_output_jsonl;
+std::string XferBenchConfig::split_output_jsonl;
+uint64_t XferBenchConfig::request_interval_us = 0;
 uint64_t XferBenchConfig::deadline_us = 0;
 int XferBenchConfig::deadline_tight_threads = 0;
 bool XferBenchConfig::deadline_bw_arbitration = false;
@@ -124,12 +171,60 @@ std::string XferBenchConfig::metadata_url_list;
 int XferBenchConfig::rpc_server_port = 0;
 std::string XferBenchConfig::xport_type;
 std::string XferBenchConfig::backend;
+bool XferBenchConfig::use_hugepage = false;
+size_t XferBenchConfig::hugepage_size = 0;
+std::string XferBenchConfig::hugetlbfs_path;
 bool XferBenchConfig::notifi = false;
 std::string XferBenchConfig::tent_transport_hint;
 std::string XferBenchConfig::tent_intent_type;
 
 int XferBenchConfig::local_gpu_id = 0;
 int XferBenchConfig::target_gpu_id = 0;
+
+namespace {
+
+std::string_view trimFlag(std::string_view text) {
+    while (!text.empty() &&
+           std::isspace(static_cast<unsigned char>(text.front()))) {
+        text.remove_prefix(1);
+    }
+    while (!text.empty() &&
+           std::isspace(static_cast<unsigned char>(text.back()))) {
+        text.remove_suffix(1);
+    }
+    return text;
+}
+
+bool equalsIgnoreCase(std::string_view a, std::string_view b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+        unsigned char ca = static_cast<unsigned char>(a[i]);
+        unsigned char cb = static_cast<unsigned char>(b[i]);
+        if (ca >= 'A' && ca <= 'Z')
+            ca = static_cast<unsigned char>(ca - 'A' + 'a');
+        if (cb >= 'A' && cb <= 'Z')
+            cb = static_cast<unsigned char>(cb - 'A' + 'a');
+        if (ca != cb) return false;
+    }
+    return true;
+}
+
+// Store labels 2MB/512MB/1GB, or a raw byte count. Empty/"0" → 0.
+std::optional<size_t> parseHugepageSizeFlag(std::string_view raw) {
+    raw = trimFlag(raw);
+    if (raw.empty() || raw == "0") return 0;
+    if (equalsIgnoreCase(raw, "2MB")) return 2ULL << 20;
+    if (equalsIgnoreCase(raw, "512MB")) return 512ULL << 20;
+    if (equalsIgnoreCase(raw, "1GB")) return 1ULL << 30;
+    size_t bytes = 0;
+    const auto* first = raw.data();
+    const auto* last = raw.data() + raw.size();
+    const auto [ptr, ec] = std::from_chars(first, last, bytes);
+    if (ec == std::errc{} && ptr == last) return bytes;
+    return std::nullopt;
+}
+
+}  // namespace
 
 void XferBenchConfig::loadFromFlags() {
     seg_type = FLAGS_seg_type;
@@ -146,11 +241,16 @@ void XferBenchConfig::loadFromFlags() {
     max_batch_size = FLAGS_max_batch_size;
     start_num_threads = FLAGS_start_num_threads;
     max_num_threads = FLAGS_max_num_threads;
+    target_offset = FLAGS_target_offset;
+    target_range_size = FLAGS_target_range_size;
     qos_classes = FLAGS_qos_classes;
     qos_classes_json = FLAGS_qos_classes_json;
     workload_classes_json = FLAGS_workload_classes_json;
     qos_link_capacity_gbps = FLAGS_qos_link_capacity_gbps;
     qos_output_jsonl = FLAGS_qos_output_jsonl;
+    result_output_jsonl = FLAGS_result_output_jsonl;
+    split_output_jsonl = FLAGS_split_output_jsonl;
+    request_interval_us = FLAGS_request_interval_us;
     deadline_us = FLAGS_deadline_us;
     deadline_tight_threads = FLAGS_deadline_tight_threads;
     deadline_bw_arbitration = FLAGS_deadline_bw_arbitration;
@@ -162,6 +262,10 @@ void XferBenchConfig::loadFromFlags() {
 
     xport_type = FLAGS_xport_type;
     backend = FLAGS_backend;
+    use_hugepage = FLAGS_use_hugepage;
+    const auto parsed_hp = parseHugepageSizeFlag(FLAGS_hugepage_size);
+    hugepage_size = parsed_hp.value_or(static_cast<size_t>(-1));
+    hugetlbfs_path = FLAGS_hugetlbfs_path;
     notifi = FLAGS_notifi;
     tent_transport_hint = FLAGS_tent_transport_hint;
     tent_intent_type = FLAGS_tent_intent_type;
@@ -191,7 +295,8 @@ void printStatsHeader() {
     std::cout << std::left
               << std::setw(14) << "BlkSize (B)"
               << std::setw(8) << "Batch"
-              << std::setw(14) << "BW (GB/S)"
+              << std::setw(14) << "BW (GB/s)"
+              << std::setw(18) << "Avg Inst GB/s"
               << std::setw(14) << "Avg Lat (us)"
               << std::setw(14) << "Avg Tx (us)"
               << std::setw(14) << "P99 Tx (us)"
@@ -211,6 +316,7 @@ void printStats(size_t block_size, size_t batch_size, XferBenchStats& stats,
     avg_latency = (total_duration * num_threads / num_ops);
     throughput_gb = (((double)total_data_transferred / (1000 * 1000 * 1000)) /
                      (total_duration / 1e6));  // In GB/Sec
+    const double avg_instant_gbps = stats.instant_bandwidth.avg();
 
     // Tabulate print with fixed width for each string
     // clang-format off
@@ -218,6 +324,7 @@ void printStats(size_t block_size, size_t batch_size, XferBenchStats& stats,
               << std::setw(14) << block_size
               << std::setw(8)  << batch_size
               << std::setw(14) << throughput_gb
+              << std::setw(18) << avg_instant_gbps
               << std::setprecision(1)
               << std::setw(14) << avg_latency
               << std::setw(14) << stats.transfer_duration.avg()
@@ -240,6 +347,28 @@ void printDeadlineGroupStats(const char* group, size_t block_size,
     std::cout << " operations=" << stats.transfer_duration.count()
               << " throughput=" << std::fixed << std::setprecision(6)
               << throughput_gbs << " GB/s" << std::endl;
+}
+
+std::vector<std::string> splitCommaSeparated(const std::string& value) {
+    std::vector<std::string> result;
+    std::stringstream ss(value);
+    std::string token;
+    while (std::getline(ss, token, ',')) {
+        const size_t begin = token.find_first_not_of(" \t\r\n");
+        if (begin == std::string::npos) continue;
+        const size_t end = token.find_last_not_of(" \t\r\n");
+        result.push_back(token.substr(begin, end - begin + 1));
+    }
+    return result;
+}
+
+uint8_t stableDataSeed(uint64_t target_addr) {
+    uint64_t value = target_addr;
+    value ^= value >> 33;
+    value *= 0xff51afd7ed558ccdULL;
+    value ^= value >> 33;
+    uint8_t seed = static_cast<uint8_t>(value);
+    return seed == 0 ? 1 : seed;
 }
 
 }  // namespace tent

@@ -17,6 +17,7 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+#include "p2p_progress_timeout.h"
 
 namespace mooncake {
 
@@ -274,7 +275,7 @@ class P2PProxy {
    public:
     friend class P2PDeviceWorker;
 
-    enum class IssueResult : uint8_t { kIssued, kNoCredit, kTimeout };
+    enum class IssueResult : uint8_t { kIssued, kNoCredit, kFailed };
 
     struct Options {
         bool is_cpu = false;
@@ -335,15 +336,6 @@ class P2PProxy {
      */
     void abandonResources();
 
-    // Epoch for fault recovery.  All control slots carry this
-    // value so that stale messages from before a Reset can be detected.
-    uint32_t getEpoch(int peer_rank) const {
-        return peer_epoch_[peer_rank].load(std::memory_order_acquire);
-    }
-    void setEpoch(int peer_rank, uint32_t epoch) {
-        peer_epoch_[peer_rank].store(epoch, std::memory_order_release);
-    }
-
    private:
     // Sender-side per-chunk state machine.
     enum class SendTaskState {
@@ -375,7 +367,7 @@ class P2PProxy {
         SendTransferTask() = default;
         SendTransferTask(uint64_t buffer_offset_in, uint32_t chunk_len_in,
                          void* staging_addr_in, uint64_t remote_addr_in,
-                         uint32_t sequence_in, uint32_t epoch_in);
+                         uint32_t sequence_in);
 
         SendTaskState state_ = SendTaskState::kCopyIn;
         uint64_t buffer_offset_ = 0;  // Offset inside the user buffer.
@@ -383,7 +375,6 @@ class P2PProxy {
         void* staging_addr_ = nullptr;  // Address inside SendPool.
         uint64_t remote_addr_ = 0;      // Address inside REMOTE RecvPool.
         uint32_t sequence_ = 0;         // Sequence number in the control ring.
-        uint32_t epoch_ = 0;            // Epoch for Reset detection.
         std::optional<BatchID> transfer_batch_id_;  // RDMA Write batch id.
         std::optional<BatchID> ack_batch_id_;       // AckSlot write batch id.
         cudaEvent_t copy_ready_event_ = nullptr;  // Signals Copy-In done (GPU).
@@ -408,9 +399,11 @@ class P2PProxy {
         // staging buffers.  When bytes_staged_ == total_bytes_ every chunk
         // has at least entered the Copy-In stage.
         uint64_t bytes_staged_ = 0;
+        // Epoch of the first accepted credit, used for all ACKs.
+        std::optional<uint32_t> credit_epoch_;
         int32_t* failed_ranks_hint_ = nullptr;
 
-        std::chrono::steady_clock::time_point last_update_time_;
+        P2PProgressTimeout progress_timeout_;
     };
 
     // One chunk of a RecvOp.  The receiver allocates a RecvPool chunk,
@@ -420,15 +413,13 @@ class P2PProxy {
     struct RecvTransferTask {
         RecvTransferTask() = default;
         RecvTransferTask(uint64_t buffer_offset_in, uint32_t chunk_len_in,
-                         void* local_addr_in, uint32_t sequence_in,
-                         uint32_t epoch_in);
+                         void* local_addr_in, uint32_t sequence_in);
 
         RecvTaskState state_ = RecvTaskState::kIssueCredit;
         uint64_t buffer_offset_ = 0;  // Offset inside the user buffer.
         uint32_t chunk_len_ = 0;      // Bytes in this chunk.
         void* local_addr_ = nullptr;  // Address inside local RecvPool.
         uint32_t sequence_ = 0;       // Sequence number in the control ring.
-        uint32_t epoch_ = 0;          // Epoch for Reset detection.
         std::optional<BatchID>
             credit_batch_id_;  // CreditSlot RDMA Write batch id.
         cudaEvent_t copy_ready_event_ =
@@ -441,7 +432,7 @@ class P2PProxy {
     // kWaitAck -> kCopyOut -> kFinished).
     struct RecvOpContext {
         RecvOpContext() = default;
-        RecvOpContext(RecvOp&& op_in);
+        RecvOpContext(RecvOp&& op_in, uint32_t credit_epoch);
 
         std::deque<RecvTransferTask> tasks_;
         std::shared_ptr<std::promise<void>> completion_;
@@ -455,6 +446,8 @@ class P2PProxy {
         // CreditSlot has been sent to the peer.  When bytes_credited_ ==
         // total_bytes_ the entire buffer has been offered to the sender.
         uint64_t bytes_credited_ = 0;
+        // Epoch captured at enqueue, used for credits and ACK matching.
+        uint32_t credit_epoch_ = 0;
     };
 
     // Per-peer sender state.  The sender consumes CreditSlots that the
@@ -463,8 +456,11 @@ class P2PProxy {
         std::deque<SendOpContext> pending_send_ops_;
         std::optional<SendOpContext> active_send_op_;
         // Sequence number of the next CreditSlot to consume from this peer.
-        // Monotonically increases; wraps around the ring via modulo.
+        // Increases between resets; indexes the ring modulo its size.
         uint64_t credit_consume_seq_ = 0;
+        // Group epoch observed at the last reset; older credits are rejected.
+        // This cannot distinguish credits across resets within the same epoch.
+        uint32_t minimum_credit_epoch_ = 0;
         std::array<cudaEvent_t, kP2PControlRingSize> copy_ready_events_;
     };
 
@@ -522,7 +518,7 @@ class P2PProxy {
     // Clean up the active op on a lane
     void cleanupFailedSendOp(SendOpContext& op_ctx);
     void cleanupFailedRecvOp(RecvOpContext& op_ctx);
-    // Reset P2P session and push link event to Agent.
+    // Request a lane reset and report the link failure to the Agent.
     void reportPeerFailure(int peer_rank);
     // Clean up, mark kFailed, and report the failure.
     void handleFailedSendOp(SendOpContext& op_ctx);
@@ -551,6 +547,10 @@ class P2PProxy {
     bool isTimeout(const T& obj) const {
         return std::chrono::steady_clock::now() - obj.last_update_time_ >
                std::chrono::microseconds(*p2p_timeout_us_);
+    }
+
+    bool isTimeout(const P2PProgressTimeout& timeout) const {
+        return timeout.expired(std::chrono::microseconds(*p2p_timeout_us_));
     }
 
    private:
@@ -590,11 +590,6 @@ class P2PProxy {
 
     std::atomic<int> active_send_tasks_{0};
     std::atomic<int> active_recv_tasks_{0};
-
-    // Per-peer epoch for fault recovery.  Incremented in resetPeerState
-    // and performSend/RecvReset so that stale messages from a previous epoch
-    // can be detected on a per-peer basis.
-    std::array<std::atomic<uint32_t>, kMaxNumRanks> peer_epoch_;
 
     std::array<SendPeerLane, kMaxNumRanks> send_peer_lanes_;
     std::array<RecvPeerLane, kMaxNumRanks> recv_peer_lanes_;

@@ -16,19 +16,16 @@
 #define EFA_ENDPOINT_H
 
 #include <glog/logging.h>
-#include <rdma/fabric.h>
-#include <rdma/fi_domain.h>
-#include <rdma/fi_endpoint.h>
-#include <rdma/fi_cm.h>
-#include <rdma/fi_rma.h>
+#include "transport/efa_transport/efa_fabric.h"
 
 #include <atomic>
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <vector>
 
 #include "common.h"
-#include "efa_context.h"
+#include "transport/efa_transport/efa_context.h"
 #include "transfer_metadata.h"
 #include "transport/transport.h"
 
@@ -121,7 +118,12 @@ class EfaEndPoint {
     EfaContext& context_;
     std::atomic<Status> status_;
 
+    // Only active callers take this mutex. Passive RPC handlers must not.
+    std::mutex active_setup_mutex_;
     RWSpinlock lock_;  // protects peer_nic_path_ and status_
+    // Bumped (under lock_) on every disconnect, nic-path change and teardown,
+    // so a handshake reply that crosses one of them can be rejected.
+    uint64_t generation_ = 0;
     std::string peer_nic_path_;
     fi_addr_t peer_fi_addr_;  // slot in context_.av()
     // Last peer EFA address successfully inserted into the AV.  Used to

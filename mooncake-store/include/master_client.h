@@ -1,18 +1,22 @@
 #pragma once
 
+#include <atomic>
 #include <csignal>
 #include <memory>
 #include <string>
 #include <type_traits>
 #include <vector>
 #include <variant>
-#include <cstdlib>
 #include <boost/functional/hash.hpp>
 #include <ylt/coro_rpc/coro_rpc_client.hpp>
 #include <ylt/coro_io/client_pool.hpp>
+#ifdef YLT_ENABLE_IBV
 #include <ylt/coro_io/ibverbs/ib_socket.hpp>
+#endif
 
 #include "client_metric.h"
+#include "config/rpc_protocol_config.h"
+#include "config/rpc_timeout_config.h"
 #include "replica.h"
 #include "segment.h"
 #include "types.h"
@@ -40,29 +44,47 @@ inline constexpr bool variant_contains_v =
 
 template <typename SocketConfigVariant>
 inline void MaybeEnableRdmaSocketConfig(SocketConfigVariant& socket_config) {
+#ifdef YLT_ENABLE_IBV
     if constexpr (variant_contains_v<SocketConfigVariant,
                                      coro_io::ib_socket_t::config_t>) {
         socket_config = coro_io::ib_socket_t::config_t{};
     }
+#endif
 }
 
-inline RpcClientPool::PoolConfig MakeMasterRpcClientPoolConfig() {
+// Applies the RPC timeout overrides to any mooncake-store RPC client config.
+// Shared by the client->master pool and the store->store offload pool so the
+// two cannot drift. Absent overrides leave the caller's defaults in place.
+// A negative request timeout disables the per-request timer.
+template <typename ClientConfig>
+inline void ApplyRpcTimeoutOverrides(ClientConfig& client_config,
+                                     const RpcTimeoutConfig& config) {
+    if (config.request_timeout.has_value()) {
+        client_config.request_timeout_duration = *config.request_timeout;
+    }
+    if (config.connect_timeout.has_value()) {
+        client_config.connect_timeout_duration = *config.connect_timeout;
+    }
+}
+
+inline RpcClientPool::PoolConfig MakeMasterRpcClientPoolConfig(
+    bool ha_enabled = false) {
     RpcClientPool::PoolConfig config;
-    const char* value = std::getenv("MC_RPC_PROTOCOL");
-    if (value && std::string_view(value) == "rdma") {
+    if (ha_enabled) {
+        // HA monitor and heartbeat loops own the retry schedule. Keep each
+        // attempt bounded so a deleted pod IP that silently drops SYNs cannot
+        // block failover on YLT's default 4 x 30-second retry budget.
+        config.connect_retry_count = 0;
+        config.reconnect_wait_time = std::chrono::milliseconds{0};
+        config.client_config.connect_timeout_duration = std::chrono::seconds{1};
+    }
+
+    if (RpcProtocolConfig::FromEnvironment().use_rdma) {
         MaybeEnableRdmaSocketConfig(config.client_config.socket_config);
     }
 
-    // Default request and connect timeouts remain coro_rpc's built-in 30s.
-    // A negative request timeout disables the per-request timer.
-    if (const char* timeout_ms = std::getenv("MC_RPC_TIMEOUT_MS")) {
-        config.client_config.request_timeout_duration =
-            std::chrono::milliseconds(std::atoll(timeout_ms));
-    }
-    if (const char* connect_ms = std::getenv("MC_RPC_CONNECT_TIMEOUT_MS")) {
-        config.client_config.connect_timeout_duration =
-            std::chrono::milliseconds(std::atoll(connect_ms));
-    }
+    ApplyRpcTimeoutOverrides(config.client_config,
+                             RpcTimeoutConfig::FromEnvironment());
     return config;
 }
 
@@ -77,10 +99,19 @@ class MasterClient {
                  std::string tenant_id = "default")
         : client_accessor_(GetStoreRpcClientIoContextPool(),
                            detail::MakeMasterRpcClientPoolConfig()),
+          ha_control_client_accessor_(
+              GetStoreRpcClientIoContextPool(),
+              detail::MakeMasterRpcClientPoolConfig(/*ha_enabled=*/true)),
+          ha_probe_client_accessor_(
+              GetStoreRpcClientIoContextPool(),
+              detail::MakeMasterRpcClientPoolConfig(/*ha_enabled=*/true)),
           client_id_(client_id),
           tenant_id_(std::move(tenant_id)),
           metrics_(metrics) {}
+    // Drains in-flight RPCs before the pool member is released (#3909).
     ~MasterClient();
+
+    void EnableHaConnectionPolicy();
 
     const std::string& tenant_id() const { return tenant_id_.value(); }
 
@@ -104,12 +135,31 @@ class MasterClient {
         const std::string& object_key);
 
     /**
+     * @brief Point-in-time existence check that grants no read lease
+     * @param object_key Key to query
+     * @return tl::expected<bool, ErrorCode> indicating exist or not at the
+     * time of the call; the object may still be evicted afterwards
+     */
+    [[nodiscard]] tl::expected<bool, ErrorCode> ProbeKey(
+        const std::string& object_key);
+
+    /**
      * @brief Checks if multiple objects exist
      * @param object_keys Vector of keys to query
      * @return Vector containing existence status for each key
      */
     [[nodiscard]] std::vector<tl::expected<bool, ErrorCode>> BatchExistKey(
         const std::vector<std::string>& object_keys);
+
+    /**
+     * @brief Probe multiple objects, optionally leasing the last complete
+     * candidate. LastHitOnly leases the last all-true candidate in the results.
+     * @param object_keys Vector of keys to query
+     * @return Per-key existence results in input order
+     */
+    [[nodiscard]] std::vector<tl::expected<bool, ErrorCode>> BatchProbeKey(
+        const std::vector<std::string>& object_keys,
+        const GrantLeasePolicy& policy = {});
 
     /**
      * @brief Calculate Store-observed cache reuse metrics
@@ -414,6 +464,13 @@ class MasterClient {
         const UUID& client_id, bool enable_offloading);
 
     /**
+     * @brief Deregisters this client's local disk segment from the master,
+     * dropping the LOCAL_DISK replicas it owns. Idempotent.
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> UnmountLocalDiskSegment(
+        const UUID& client_id);
+
+    /**
      * @brief Heartbeat call to collect object-level statistics and retrieve the
      * set of non-persisted objects.
      * @param enable_offloading Indicates whether persistence is enabled for
@@ -504,6 +561,13 @@ class MasterClient {
         const std::string& key, const std::string& tenant_id,
         const std::string& src_segment,
         const std::vector<std::string>& tgt_segments);
+    [[nodiscard]] tl::expected<CopyStartResponse, ErrorCode>
+    DynamicReplicaCopyStart(const std::string& key,
+                            const std::string& tenant_id,
+                            const std::string& src_segment,
+                            const std::vector<std::string>& tgt_segments,
+                            const UUID& dynamic_replication_lease_id,
+                            uint64_t dynamic_replication_version_epoch);
 
     /**
      * @brief End a copy operation
@@ -513,6 +577,10 @@ class MasterClient {
     [[nodiscard]] tl::expected<void, ErrorCode> CopyEnd(const std::string& key);
     [[nodiscard]] tl::expected<void, ErrorCode> CopyEnd(
         const std::string& key, const std::string& tenant_id);
+    [[nodiscard]] tl::expected<void, ErrorCode> DynamicReplicaCopyEnd(
+        const std::string& key, const std::string& tenant_id,
+        const UUID& dynamic_replication_lease_id,
+        uint64_t dynamic_replication_version_epoch);
 
     /**
      * @brief Revoke a copy operation
@@ -523,6 +591,10 @@ class MasterClient {
         const std::string& key);
     [[nodiscard]] tl::expected<void, ErrorCode> CopyRevoke(
         const std::string& key, const std::string& tenant_id);
+    [[nodiscard]] tl::expected<void, ErrorCode> DynamicReplicaCopyRevoke(
+        const std::string& key, const std::string& tenant_id,
+        const UUID& dynamic_replication_lease_id,
+        uint64_t dynamic_replication_version_epoch);
 
     /**
      * @brief Start a move operation
@@ -626,6 +698,22 @@ class MasterClient {
         ReplicaType replica_type);
 
     /**
+     * @brief Evict a disk replica only if the master still records the
+     * replica the caller failed on. A master that predates this RPC answers
+     * with an unknown-handler error, so the caller can tell the precondition
+     * was never enforced.
+     * @param key The object key whose disk replica was evicted
+     * @param tenant_id The tenant scope of the object
+     * @param replica_type DISK or LOCAL_DISK
+     * @param expected_replica_id The replica id the caller failed on
+     * @return true if evicted, false if the current record is a different
+     * replica (left untouched)
+     */
+    [[nodiscard]] tl::expected<bool, ErrorCode> EvictDiskReplicaIfCurrent(
+        const std::string& key, const std::string& tenant_id,
+        ReplicaType replica_type, ReplicaID expected_replica_id);
+
+    /**
      * @brief Batch notify master that disk replicas were evicted locally.
      * @param keys The evicted object keys
      * @param replica_type DISK or LOCAL_DISK
@@ -653,6 +741,16 @@ class MasterClient {
     [[nodiscard]] tl::expected<ReturnType, ErrorCode> invoke_rpc(
         Args&&... args);
 
+    template <auto ServiceMethod, typename ReturnType, typename... Args>
+    [[nodiscard]] tl::expected<ReturnType, ErrorCode> invoke_rpc_with_pool(
+        RpcClientPool& client_accessor, Args&&... args);
+
+    template <auto ServiceMethod, typename ReturnType, typename... Args>
+    [[nodiscard]] tl::expected<ReturnType, ErrorCode>
+    invoke_rpc_with_client_pool(
+        const std::shared_ptr<RpcClientPool::ClientPool>& client_pool,
+        Args&&... args);
+
     /**
      * @brief Generic RPC invocation helper for batch operations
      * @tparam ServiceMethod Pointer to WrappedMasterService member function
@@ -667,6 +765,9 @@ class MasterClient {
     invoke_batch_rpc(size_t input_size, Args&&... args);
 
     RpcClientPool client_accessor_;
+    RpcClientPool ha_control_client_accessor_;
+    RpcClientPool ha_probe_client_accessor_;
+    RpcDrainGuard rpc_drain_;
 
     // The client identification.
     const UUID client_id_;
@@ -680,6 +781,7 @@ class MasterClient {
     mutable Mutex connect_mutex_;
     // The address which is passed to the coro_rpc_client
     std::string client_addr_param_ GUARDED_BY(connect_mutex_);
+    std::atomic<bool> ha_connection_policy_enabled_{false};
 };
 
 }  // namespace mooncake

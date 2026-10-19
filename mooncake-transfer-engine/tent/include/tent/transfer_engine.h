@@ -109,6 +109,15 @@ typedef struct tent_notifi_info tent_notifi_info;
 #define TRANSPORT_TCP (7)
 #define TRANSPORT_ASCEND_DIRECT (8)
 #define TRANSPORT_SUNRISE_LINK (9)
+#define TRANSPORT_TPU (10)
+#define TRANSPORT_UB (11)
+#define TRANSPORT_MPCOMM (12)
+#define TRANSPORT_HP_TCP (13)
+#define TRANSPORT_XPU (14)
+#define TRANSPORT_HYLINK (15)
+#define TRANSPORT_FABRIC (16)
+#define TRANSPORT_MLU (17)
+#define TRANSPORT_MEMFABRIC (18)
 
 struct tent_memory_options {
     char location[64];
@@ -167,8 +176,11 @@ int tent_submit_notif(tent_engine_t engine, tent_batch_id_t batch_id,
 int tent_send_notifs(tent_engine_t engine, tent_segment_id_t handle,
                      const char* name, const char* message);
 
+/* Free the previous result before reusing info. Successful empty polls return
+ * zero records and a null pointer. */
 int tent_recv_notifs(tent_engine_t engine, tent_notifi_info* info);
 
+/* Release records and reset info so it can be reused or freed again. */
 void tent_free_notifs(tent_notifi_info* info);
 
 int tent_task_status(tent_engine_t engine, tent_batch_id_t batch_id,
@@ -204,6 +216,7 @@ int tent_register_memory_batch_ex(tent_engine_t engine, void** addrs,
 int tent_task_status_list(tent_engine_t engine, tent_batch_id_t batch_id,
                           tent_status_t* statuses, size_t* count);
 
+// Only NICs currently able to carry traffic are reported (see NicLoadStats).
 struct tent_nic_load_stat {
     char device_name[64];
     uint64_t inflight_bytes;
@@ -234,9 +247,12 @@ int tent_get_nic_load_stats(tent_engine_t engine, tent_nic_load_stat_t* stats,
 #include "tent/common/types.h"
 
 namespace mooncake {
+class TransferEngine;
+class TransferEngineImplTestPeer;
 namespace tent {
 class TransferEngineImpl;
 class Config;
+class Topology;
 class TransferEngine {
    public:
     TransferEngine();
@@ -259,6 +275,12 @@ class TransferEngine {
     const std::string getRpcServerAddress() const;
 
     uint16_t getRpcServerPort() const;
+
+    // Returns the live local topology (nics/mems). Empty if engine unavailable.
+    std::shared_ptr<Topology> getLocalTopology() const;
+
+    // Native {"nics","mems"} JSON dump (includes rank0/1/2). "{}" if empty.
+    std::string getLocalTopologyString() const;
 
    public:
     Status exportLocalSegment(std::string& shared_handle);
@@ -343,7 +365,12 @@ class TransferEngine {
     Status getNicLoadStats(std::vector<NicLoadStats>& stats) const;
 
    private:
+    Status submitTransferRequiringPostSubmitCancellation(
+        BatchID batch_id, const std::vector<Request>& request_list);
+
     std::unique_ptr<TransferEngineImpl> impl_;
+    friend class ::mooncake::TransferEngine;
+    friend class ::mooncake::TransferEngineImplTestPeer;
 };
 }  // namespace tent
 }  // namespace mooncake

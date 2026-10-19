@@ -24,17 +24,6 @@ _store_module = importlib.import_module(
 MooncakeDistributedStore = _store_module.MooncakeDistributedStore
 ReplicateConfig = _store_module.ReplicateConfig
 
-try:
-    get_alloc_func_addr = _store_module.get_alloc_func_addr
-    get_free_func_addr = _store_module.get_free_func_addr
-except AttributeError:
-
-    def get_alloc_func_addr():
-        return None
-
-    def get_free_func_addr():
-        return None
-
 
 LOG = logging.getLogger("store_kv_bench")
 
@@ -68,6 +57,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device-name", default="")
     parser.add_argument("--global-segment-size", type=int, default=64 * 1024 * 1024)
     parser.add_argument("--local-buffer-size", type=int, default=32 * 1024 * 1024)
+    parser.add_argument("--enable-ssd-offload", action="store_true")
     parser.add_argument(
         "--io-api",
         choices=["plain", "zcopy"],
@@ -109,6 +99,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--memory-replica-num", type=int, default=1)
     parser.add_argument("--nof-replica-num", type=int, default=0)
+    parser.add_argument("--dfs-replica-num", type=int, default=0)
 
     parser.add_argument("--verify", action="store_true")
     parser.add_argument("--pattern", default="")
@@ -412,6 +403,7 @@ class StoreSession:
         self.config = ReplicateConfig()
         self.config.replica_num = args.memory_replica_num
         self.config.nof_replica_num = args.nof_replica_num
+        self.config.dfs_replica_num = args.dfs_replica_num
         self._zcopy = zcopy
 
     def close(self) -> None:
@@ -478,7 +470,7 @@ class StoreSession:
             lengths = self._get_lengths_zcopy(keys, len(object_ids))
             for slot, (object_id, length) in enumerate(zip(object_ids, lengths)):
                 if length < 0:
-                    if self.store.isExist(keys[slot]) == 0:
+                    if self.store.is_exist(keys[slot]) == 0:
                         misses += 1
                         errors["MISS"] += 1
                     else:
@@ -520,7 +512,7 @@ class StoreSession:
         if operation == "put":
             payload = self.payload_factory.build(object_id)
             result_code = self.store.put(key, payload, self.config)
-            actual_present = result_code == 0 or self.store.isExist(key) == 1
+            actual_present = result_code == 0 or self.store.is_exist(key) == 1
             success = result_code == 0 or (expected_present and actual_present)
             bytes_processed = len(payload) if success else 0
         elif operation == "get":
@@ -537,13 +529,18 @@ class StoreSession:
                 result_code = "PRESENCE_MISMATCH"
             bytes_processed = len(payload) if actual_present else 0
         elif operation == "exist":
-            result_code = self.store.isExist(key)
+            result_code = self.store.is_exist(key)
             actual_present = result_code == 1
             success = result_code >= 0 and actual_present == expected_present
         elif operation == "remove":
             result_code = self.store.remove(key)
-            actual_present = self.store.isExist(key) == 1
-            success = not actual_present and (result_code == 0 or not expected_present)
+            existence_result = self.store.is_exist(key)
+            actual_present = existence_result == 1
+            success = existence_result == 0 and (
+                result_code == 0 or not expected_present
+            )
+            if existence_result < 0:
+                result_code = existence_result
         else:
             raise ValueError(f"unsupported metadata operation: {operation}")
 
@@ -592,61 +589,41 @@ class StoreSession:
 
 
 class ZcopyBufferPool:
-    def __init__(self, store_obj, value_size: int, slots: int):
+    def __init__(self, store_obj, value_size: int, slots: int, local_buffer_size: int):
         self.store = store_obj
         self.value_size = value_size
         self.slots = slots
         self.total_size = self.value_size * self.slots
-        self._alloc_fn = None
-        self._free_fn = None
-        self._registered = False
+        self._pool = None
+        self._lease = None
         self.base_ptr = 0
 
-        alloc_addr = get_alloc_func_addr()
-        free_addr = get_free_func_addr()
-        if alloc_addr is None or free_addr is None:
-            raise RuntimeError(
-                "store module does not expose hugepage alloc/free helpers"
+        if self.total_size > local_buffer_size:
+            raise ValueError(
+                "zcopy pool requires "
+                f"{self.total_size} bytes, but --local-buffer-size is "
+                f"{local_buffer_size}; increase --local-buffer-size"
             )
 
-        self._alloc_fn = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_size_t)(
-            get_alloc_func_addr()
+        self._pool = _store_module.BufferPool(
+            self.store, max_bytes=local_buffer_size, max_regions=1
         )
-        self._free_fn = ctypes.CFUNCTYPE(None, ctypes.c_void_p)(get_free_func_addr())
-
-        raw_ptr = self._alloc_fn(self.total_size)
-        self.base_ptr = ctypes.cast(raw_ptr, ctypes.c_void_p).value or 0
-        if self.base_ptr == 0:
-            raise RuntimeError(
-                f"direct hugepage alloc failed for zcopy pool: size={self.total_size}"
-            )
-        ret = self.store.register_buffer(self.base_ptr, self.total_size)
-        if ret != 0:
-            failed_ptr = self.base_ptr
-            self._free_fn(ctypes.c_void_p(self.base_ptr))
-            self.base_ptr = 0
-            raise RuntimeError(
-                f"register_buffer failed for direct zcopy pool ptr={failed_ptr}: {ret}"
-            )
-        self._registered = True
-        self._buffer = (ctypes.c_ubyte * self.total_size).from_address(self.base_ptr)
+        try:
+            self._lease = self._pool.acquire(self.total_size, block=False)
+        except Exception:
+            self._pool.close()
+            self._pool = None
+            raise
+        self.base_ptr = self._lease.ptr
 
     def close(self) -> None:
-        self._buffer = None
-        if self.base_ptr:
-            if self._registered:
-                try:
-                    self.store.unregister_buffer(self.base_ptr)
-                except Exception:
-                    LOG.debug(
-                        "unregister_buffer failed for direct zcopy pool ptr=%s",
-                        self.base_ptr,
-                        exc_info=True,
-                    )
-                self._registered = False
-            if self._free_fn is not None:
-                self._free_fn(ctypes.c_void_p(self.base_ptr))
-            self.base_ptr = 0
+        self.base_ptr = 0
+        if self._lease is not None:
+            self._lease.release()
+            self._lease = None
+        if self._pool is not None:
+            self._pool.close()
+            self._pool = None
 
     def slot_ptr(self, slot: int) -> int:
         if slot < 0 or slot >= self.slots:
@@ -707,6 +684,7 @@ class StoreRuntime:
             args.protocol,
             args.device_name,
             args.master_server,
+            enable_ssd_offload=args.enable_ssd_offload,
         )
         if setup_ret != 0:
             raise RuntimeError(f"setup failed: {setup_ret}")
@@ -714,7 +692,9 @@ class StoreRuntime:
         self.zcopy_pool: Optional[ZcopyBufferPool] = None
         if args.io_api == "zcopy":
             slots = max(1, args.batch_size) * lane_count
-            self.zcopy_pool = ZcopyBufferPool(self.store, args.value_size, slots)
+            self.zcopy_pool = ZcopyBufferPool(
+                self.store, args.value_size, slots, args.local_buffer_size
+            )
 
     def make_session(
         self,
@@ -994,11 +974,16 @@ class BenchmarkRunner:
         sessions = self._make_sessions()
         per_lane_stats: List[Optional[PhaseStats]] = [None] * self.lane_count
         threads: List[threading.Thread] = []
+        errors: List[Optional[BaseException]] = [None] * self.lane_count
 
         def runner(index: int, session: StoreSession) -> None:
             stats = PhaseStats(name=f"{phase_name}/lane{index}")
             stats.start_time = time.perf_counter()
-            worker_builder(session, index)(stats)
+            try:
+                worker_builder(session, index)(stats)
+            except BaseException as exc:
+                errors[index] = exc
+                return
             stats.end_time = time.perf_counter()
             per_lane_stats[index] = stats
 
@@ -1013,6 +998,11 @@ class BenchmarkRunner:
 
         for thread in threads:
             thread.join()
+
+        # Join every lane before allowing the caller to release shared buffers.
+        for lane_id, error in enumerate(errors):
+            if error is not None:
+                raise RuntimeError(f"{phase_name} lane {lane_id} failed") from error
 
         merged = merge_stats(phase_name, [s for s in per_lane_stats if s is not None])
         log_phase_stats(merged)
@@ -1388,7 +1378,7 @@ class BenchmarkRunner:
 
     def run(self) -> List[PhaseStats]:
         LOG.info(
-            "scenario=%s io_api=%s numjobs=%d iodepth=%d lanes=%d batch_size=%d value_size=%d nr_objects=%d prepare_objects=%d write_objects=%d memory_replica_num=%d nof_replica_num=%d verify=%s",
+            "scenario=%s io_api=%s numjobs=%d iodepth=%d lanes=%d batch_size=%d value_size=%d nr_objects=%d prepare_objects=%d write_objects=%d memory_replica_num=%d nof_replica_num=%d dfs_replica_num=%d verify=%s",
             self.args.scenario,
             self.args.io_api,
             self.args.numjobs,
@@ -1401,6 +1391,7 @@ class BenchmarkRunner:
             self.args.write_objects,
             self.args.memory_replica_num,
             self.args.nof_replica_num,
+            self.args.dfs_replica_num,
             self.args.verify,
         )
 

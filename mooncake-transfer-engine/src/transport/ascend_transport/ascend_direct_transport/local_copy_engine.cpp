@@ -33,28 +33,94 @@ constexpr uint32_t kStreamFlags = ACL_STREAM_FAST_LAUNCH | ACL_STREAM_FAST_SYNC;
 }  // namespace
 
 LocalCopyEngine::LocalCopyEngine()
-    : stream_(nullptr), transfer_timeout_(10000), initialized_(false) {}
+    : transfer_timeout_(10000), initialized_(false) {}
 
 LocalCopyEngine::~LocalCopyEngine() { Finalize(); }
 
 int LocalCopyEngine::Initialize(int32_t transfer_timeout) {
     transfer_timeout_ = transfer_timeout;
-    auto ret = aclrtCreateStreamWithConfig(&stream_, 0, kStreamFlags);
-    if (ret != ACL_ERROR_NONE) {
-        LOG(ERROR) << "aclrtCreateStreamWithConfig failed, ret:" << ret
-                   << ", errmsg:" << aclGetRecentErrMsg();
-        return -1;
-    }
+    // Do not create a stream here: initEngines() may still be under a
+    // different device context than the worker threads that later call Copy.
+    // Streams are created lazily in GetOrCreateStreamForCurrentDevice().
     initialized_ = true;
     return 0;
 }
 
 void LocalCopyEngine::Finalize() {
-    if (initialized_ && stream_ != nullptr) {
-        (void)aclrtDestroyStream(stream_);
-        stream_ = nullptr;
+    std::lock_guard<std::mutex> lock(streams_mu_);
+    aclrtContext saved_ctx = nullptr;
+    if (aclrtGetCurrentContext(&saved_ctx) != ACL_ERROR_NONE) {
+        saved_ctx = nullptr;
     }
+    // Capture only saved_ctx: MAKE_GUARD is a 2-arg macro, so a
+    // multi-capture lambda would be split on the comma in [].
+    MAKE_GUARD(ctx_restore, [saved_ctx]() {
+        if (saved_ctx != nullptr) {
+            (void)aclrtSetCurrentContext(saved_ctx);
+        }
+    });
+
+    for (auto &kv : streams_) {
+        auto &info = kv.second;
+        if (info.stream == nullptr) {
+            continue;
+        }
+        aclError ret = ACL_ERROR_NONE;
+        if (info.context != nullptr) {
+            ret = aclrtSetCurrentContext(info.context);
+        } else {
+            ret = aclrtSetDevice(kv.first);
+        }
+        if (ret != ACL_ERROR_NONE) {
+            LOG(ERROR)
+                << "Failed to switch to device " << kv.first
+                << " context before destroying LocalCopyEngine stream, ret:"
+                << ret << ", errmsg:" << aclGetRecentErrMsg();
+        }
+        (void)aclrtDestroyStream(info.stream);
+        info.stream = nullptr;
+        info.context = nullptr;
+    }
+    streams_.clear();
     initialized_ = false;
+}
+
+aclrtStream LocalCopyEngine::GetOrCreateStreamForCurrentDevice() {
+    int32_t device_id = 0;
+    auto ret = aclrtGetDevice(&device_id);
+    if (ret != ACL_ERROR_NONE) {
+        LOG(ERROR) << "aclrtGetDevice failed, ret:" << ret
+                   << ", errmsg:" << aclGetRecentErrMsg();
+        return nullptr;
+    }
+
+    std::lock_guard<std::mutex> lock(streams_mu_);
+    auto it = streams_.find(device_id);
+    if (it != streams_.end() && it->second.stream != nullptr) {
+        return it->second.stream;
+    }
+
+    aclrtStream stream = nullptr;
+    ret = aclrtCreateStreamWithConfig(&stream, 0, kStreamFlags);
+    if (ret != ACL_ERROR_NONE) {
+        LOG(ERROR) << "aclrtCreateStreamWithConfig failed for device "
+                   << device_id << ", ret:" << ret
+                   << ", errmsg:" << aclGetRecentErrMsg();
+        return nullptr;
+    }
+
+    aclrtContext ctx = nullptr;
+    ret = aclrtGetCurrentContext(&ctx);
+    if (ret != ACL_ERROR_NONE || ctx == nullptr) {
+        LOG(ERROR) << "aclrtGetCurrentContext failed after creating stream for "
+                      "device "
+                   << device_id << ", ret:" << ret
+                   << ", errmsg:" << aclGetRecentErrMsg();
+        ctx = nullptr;
+    }
+    streams_[device_id] = DeviceStream{stream, ctx};
+    VLOG(1) << "Created LocalCopyEngine stream for device " << device_id;
+    return stream;
 }
 
 void LocalCopyEngine::Copy(TransferRequest::OpCode opcode,
@@ -118,6 +184,8 @@ void LocalCopyEngine::Copy(TransferRequest::OpCode opcode,
         ret = CopyWithBatch(opcode, slice_list, kind, batch_num, slice_index);
         if (ret == ACL_ERROR_RT_FEATURE_NOT_SUPPORT) {
             // Fallback to async copy if batch copy is not supported
+            VLOG(1) << "aclrtMemcpyBatch FEATURE_NOT_SUPPORT (207000); "
+                       "falling back to CopyWithAsync";
             CopyWithAsync(opcode, slice_list, kind);
             return;
         }
@@ -243,6 +311,14 @@ void LocalCopyEngine::CopyWithSync(TransferRequest::OpCode opcode,
 void LocalCopyEngine::CopyWithAsync(TransferRequest::OpCode opcode,
                                     const std::vector<Slice *> &slice_list,
                                     aclrtMemcpyKind kind) {
+    aclrtStream stream = GetOrCreateStreamForCurrentDevice();
+    if (stream == nullptr) {
+        for (auto &slice : slice_list) {
+            slice->markFailed();
+        }
+        return;
+    }
+
     std::vector<Slice *> async_list;
     async_list.reserve(slice_list.size());
 
@@ -254,11 +330,11 @@ void LocalCopyEngine::CopyWithAsync(TransferRequest::OpCode opcode,
 
         aclError ret;
         if (opcode == TransferRequest::WRITE) {
-            ret = aclrtMemcpyAsync(remote_ptr, len, local_ptr, len, kind,
-                                   stream_);
+            ret =
+                aclrtMemcpyAsync(remote_ptr, len, local_ptr, len, kind, stream);
         } else {
-            ret = aclrtMemcpyAsync(local_ptr, len, remote_ptr, len, kind,
-                                   stream_);
+            ret =
+                aclrtMemcpyAsync(local_ptr, len, remote_ptr, len, kind, stream);
         }
 
         if (ret != ACL_ERROR_NONE) {
@@ -273,8 +349,7 @@ void LocalCopyEngine::CopyWithAsync(TransferRequest::OpCode opcode,
         return;
     }
 
-    aclError ret =
-        aclrtSynchronizeStreamWithTimeout(stream_, transfer_timeout_);
+    aclError ret = aclrtSynchronizeStreamWithTimeout(stream, transfer_timeout_);
     if (ret == ACL_ERROR_NONE) {
         VLOG(1) << "Copy with aclrtMemcpyAsync suc.";
         for (auto &slice : async_list) {
@@ -282,7 +357,7 @@ void LocalCopyEngine::CopyWithAsync(TransferRequest::OpCode opcode,
         }
     } else {
         LOG(ERROR) << "Memory copy failed, ret:" << ret;
-        (void)aclrtStreamAbort(stream_);
+        (void)aclrtStreamAbort(stream);
         for (auto &slice : async_list) {
             slice->markFailed();
         }

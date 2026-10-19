@@ -41,7 +41,7 @@ class EndpointStore {
     virtual std::shared_ptr<RdmaEndPoint> getEndpointByPtr(
         const RdmaEndPoint *endpoint_ptr) = 0;
     virtual std::shared_ptr<RdmaEndPoint> insertEndpoint(
-        const std::string &peer_nic_path, RdmaContext *context) = 0;
+        const std::string &peer_nic_path, RdmaContext *context, ibv_cq *cq) = 0;
     virtual int deleteEndpoint(const std::string &peer_nic_path) = 0;
     // Deletes the endpoint matching endpoint_ptr (by pointer identity, under
     // the store lock -- the pointer is never dereferenced, so a stale/freed
@@ -83,7 +83,8 @@ class FIFOEndpointStore : public EndpointStore {
     std::shared_ptr<RdmaEndPoint> getEndpointByPtr(
         const RdmaEndPoint *endpoint_ptr) override;
     std::shared_ptr<RdmaEndPoint> insertEndpoint(
-        const std::string &peer_nic_path, RdmaContext *context) override;
+        const std::string &peer_nic_path, RdmaContext *context,
+        ibv_cq *cq) override;
     int deleteEndpoint(const std::string &peer_nic_path) override;
     int deleteEndpointByPtr(
         const RdmaEndPoint *endpoint_ptr,
@@ -125,7 +126,8 @@ class SIEVEEndpointStore : public EndpointStore {
     std::shared_ptr<RdmaEndPoint> getEndpointByPtr(
         const RdmaEndPoint *endpoint_ptr) override;
     std::shared_ptr<RdmaEndPoint> insertEndpoint(
-        const std::string &peer_nic_path, RdmaContext *context) override;
+        const std::string &peer_nic_path, RdmaContext *context,
+        ibv_cq *cq) override;
     int deleteEndpoint(const std::string &peer_nic_path) override;
     int deleteEndpointByPtr(
         const RdmaEndPoint *endpoint_ptr,
@@ -143,6 +145,11 @@ class SIEVEEndpointStore : public EndpointStore {
     }
 
     void testOnlyInsertWaiting(std::shared_ptr<RdmaEndPoint> ep) override;
+    // Test-only: push a pre-constructed endpoint into the active map so
+    // pointer-identity lookup/delete paths can be exercised without standing up
+    // an RDMA device.
+    void testOnlyInsertEndpoint(const std::string &peer_nic_path,
+                                std::shared_ptr<RdmaEndPoint> ep);
 
    private:
     RWSpinlock endpoint_map_lock_;

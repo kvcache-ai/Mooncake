@@ -3,17 +3,21 @@
 #include <gtest/gtest.h>
 #include <xxhash.h>
 
+#include <async_simple/coro/FutureAwaiter.h>
+#include <async_simple/coro/Lazy.h>
+#include <async_simple/executors/SimpleExecutor.h>
+
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <deque>
+#include <future>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
 
-#ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
 #include "ha_metric_manager.h"
-#endif
 
 namespace mooncake::test {
 namespace {
@@ -43,6 +47,7 @@ class FakeBatchWriter {
             return repeated_error_;
         }
         writes_.push_back({.batch = batch, .expected_prefix = expected_prefix});
+        if (writes_.size() == block_after_writes_) blocked_ = true;
         cv_.notify_all();
         return ErrorCode::OK;
     }
@@ -55,6 +60,16 @@ class FakeBatchWriter {
             batches.push_back(write.batch);
         }
         return batches;
+    }
+
+    std::vector<DurablePrefix> ExpectedPrefixes() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::vector<DurablePrefix> prefixes;
+        prefixes.reserve(writes_.size());
+        for (const auto& write : writes_) {
+            prefixes.push_back(write.expected_prefix);
+        }
+        return prefixes;
     }
 
     bool WaitForWrites(size_t count, std::chrono::milliseconds timeout =
@@ -90,6 +105,10 @@ class FakeBatchWriter {
         next_error_ = ErrorCode::OK;
         failures_remaining_ = 0;
     }
+    void BlockAfterWrites(size_t count) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        block_after_writes_ = count;
+    }
     void BlockWrites() {
         std::lock_guard<std::mutex> lock(mutex_);
         blocked_ = true;
@@ -123,6 +142,7 @@ class FakeBatchWriter {
     ErrorCode next_error_{ErrorCode::OK};
     ErrorCode repeated_error_{ErrorCode::OK};
     size_t failures_remaining_{0};
+    size_t block_after_writes_{0};
     bool blocked_{false};
     bool blocked_write_active_{false};
 };
@@ -154,6 +174,434 @@ bool WaitForMetric(const std::function<bool()>& predicate) {
 #endif
 
 }  // namespace
+
+namespace {
+
+async_simple::coro::Lazy<ErrorCode> AwaitOnExecutor(
+    OrderedOpLogWriter& writer, uint64_t sequence,
+    std::promise<std::thread::id>& registered,
+    std::promise<std::thread::id>& resumed) {
+    auto future = writer.AwaitDurable(sequence);
+    registered.set_value(std::this_thread::get_id());
+    auto error = co_await std::move(future);
+    resumed.set_value(std::this_thread::get_id());
+    co_return error;
+}
+
+class OrderedOpLogWriterAwaitTest : public ::testing::Test {
+   protected:
+    void CreateWriter(OrderedOpLogWriterConfig config = {},
+                      OrderedOpLogWriter::TerminalCallback callback = {}) {
+        writer_ = std::make_unique<OrderedOpLogWriter>(
+            config,
+            [this](const OpLogBatchRecord& batch, const DurablePrefix& prefix) {
+                return storage_.Write(batch, prefix);
+            },
+            std::move(callback));
+    }
+
+    async_simple::Future<ErrorCode>& Await(uint64_t sequence) {
+        waiters_.push_back(writer_->AwaitDurable(sequence));
+        return waiters_.back();
+    }
+
+    void ExpectPending(async_simple::Future<ErrorCode>& waiter) {
+        // Storage is gated, so readiness can be checked without a timeout.
+        EXPECT_FALSE(waiter.hasResult());
+    }
+
+    void ExpectResult(async_simple::Future<ErrorCode>& waiter,
+                      ErrorCode expected) {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!waiter.hasResult() &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        ASSERT_TRUE(waiter.hasResult());
+        EXPECT_EQ(std::move(waiter).get(), expected);
+    }
+
+    void ExpectReadyResult(async_simple::Future<ErrorCode>& waiter,
+                           ErrorCode expected) {
+        ASSERT_TRUE(waiter.hasResult());
+        EXPECT_EQ(std::move(waiter).get(), expected);
+    }
+
+    void ReenterFromContinuation(async_simple::Future<ErrorCode>& waiter) {
+        waiter = std::move(waiter).thenValue([this](ErrorCode error) {
+            // These methods all acquire the writer mutex. Inline completion
+            // must not hold it, including terminal failure and Stop().
+            writer_->IsAccepting();
+            writer_->LastError();
+            writer_->GetTerminalState();
+            EXPECT_TRUE(writer_->AwaitDurable(0).hasResult());
+            return error;
+        });
+    }
+
+    void BlockCallback() {
+        std::unique_lock<std::mutex> lock(callback_mutex_);
+        callback_entered_ = true;
+        callback_cv_.notify_all();
+        callback_cv_.wait(lock, [this] { return callback_released_; });
+    }
+
+    bool WaitForCallback() {
+        std::unique_lock<std::mutex> lock(callback_mutex_);
+        return callback_cv_.wait_for(lock, std::chrono::seconds(5),
+                                     [this] { return callback_entered_; });
+    }
+
+    void ReleaseCallback() {
+        {
+            std::lock_guard<std::mutex> lock(callback_mutex_);
+            callback_released_ = true;
+        }
+        callback_cv_.notify_all();
+    }
+
+    void CheckTerminal(ErrorCode error, OrderedOpLogWriterTerminalReason reason,
+                       std::chrono::milliseconds retry_timeout = {}) {
+        storage_.BlockWrites();
+        storage_.FailNextWrites(100000, error);
+        CreateWriter({.initial_durable_prefix = {.batch_id = 1, .last_seq = 10},
+                      .retry_timeout = retry_timeout},
+                     [this](const OrderedOpLogWriterTerminalState&) {
+                         ++terminal_callbacks_;
+                         BlockCallback();
+                     });
+        auto reservation = writer_->Reserve();
+        ASSERT_TRUE(reservation.has_value());
+        auto pending =
+            writer_->Commit(std::move(*reservation), MakeEntry(), {});
+        ASSERT_TRUE(pending.has_value());
+        auto& first = Await(pending->sequence_id());
+        auto& later = Await(pending->sequence_id() + 1);
+        ReenterFromContinuation(first);
+        writer_->Start();
+        ASSERT_TRUE(storage_.WaitForBlockedWrite());
+        ExpectPending(first);
+        ExpectPending(later);
+        storage_.UnblockWrites();
+        ASSERT_TRUE(WaitForCallback());
+
+        // Awaiters must wake before the terminal callback is allowed to finish.
+        ExpectResult(first, error);
+        ExpectResult(later, error);
+        auto state = writer_->GetTerminalState();
+        ASSERT_TRUE(state.has_value());
+        EXPECT_EQ(state->reason, reason);
+        EXPECT_EQ(state->error, error);
+        EXPECT_EQ(state->durable_prefix.last_seq, 10);
+        EXPECT_EQ(terminal_callbacks_.load(), 1);
+        ExpectReadyResult(Await(pending->sequence_id()), error);
+        ExpectReadyResult(Await(10), ErrorCode::OK);
+        ReleaseCallback();
+        writer_->Stop();
+        ExpectReadyResult(Await(pending->sequence_id()), error);
+    }
+
+    void TearDown() override {
+        storage_.UnblockWrites();
+        ReleaseCallback();
+        if (writer_) writer_->Stop();
+    }
+
+    FakeBatchWriter storage_;
+    std::unique_ptr<OrderedOpLogWriter> writer_;
+    std::deque<async_simple::Future<ErrorCode>> waiters_;
+    std::atomic<int> terminal_callbacks_{0};
+    std::atomic<bool> callback_finished_{false};
+    std::mutex callback_mutex_;
+    std::condition_variable callback_cv_;
+    bool callback_entered_{false};
+    bool callback_released_{false};
+};
+
+}  // namespace
+
+TEST_F(OrderedOpLogWriterAwaitTest,
+       RestoredPrefixSucceedsBeforeStartAndAfterStop) {
+    CreateWriter({.initial_durable_prefix = {.batch_id = 2, .last_seq = 10}});
+    ExpectReadyResult(Await(0), ErrorCode::OK);
+    ExpectReadyResult(Await(1), ErrorCode::OK);
+    ExpectReadyResult(Await(10), ErrorCode::OK);
+    writer_->Stop();
+    ExpectReadyResult(Await(10), ErrorCode::OK);
+    ExpectReadyResult(Await(11), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+}
+
+TEST_F(OrderedOpLogWriterAwaitTest, CommittedSequenceWaitsForStorageSuccess) {
+    storage_.BlockWrites();
+    CreateWriter();
+    writer_->Start();
+    auto reservation = writer_->Reserve();
+    ASSERT_TRUE(reservation.has_value());
+    auto pending = writer_->Commit(std::move(*reservation), MakeEntry(), {});
+    ASSERT_TRUE(pending.has_value());
+    ASSERT_TRUE(storage_.WaitForBlockedWrite());
+    auto& waiter = Await(pending->sequence_id());
+    ExpectPending(waiter);
+    storage_.UnblockWrites();
+    ExpectResult(waiter, ErrorCode::OK);
+    // Registration after advancement cannot miss an earlier notification.
+    ExpectReadyResult(Await(pending->sequence_id()), ErrorCode::OK);
+}
+
+TEST_F(OrderedOpLogWriterAwaitTest, PrefixAdvancesInStages) {
+    storage_.BlockWrites();
+    storage_.BlockAfterWrites(1);
+    CreateWriter({.max_entries_per_batch = 3});
+    for (int i = 0; i < 3; ++i) {
+        auto reservation = writer_->Reserve();
+        ASSERT_TRUE(reservation.has_value());
+        ASSERT_TRUE(writer_->Commit(std::move(*reservation), MakeEntry(), {})
+                        .has_value());
+    }
+    auto& third = Await(3);
+    auto& second = Await(2);
+    auto& first = Await(1);
+    writer_->Start();
+    ASSERT_TRUE(storage_.WaitForBlockedWrite());
+    ExpectPending(first);
+    storage_.UnblockWrites();
+    ExpectResult(first, ErrorCode::OK);
+    ASSERT_TRUE(storage_.WaitForBlockedWrite());
+    ExpectPending(second);
+    ExpectPending(third);
+    storage_.UnblockWrites();
+    ExpectResult(second, ErrorCode::OK);
+    ExpectResult(third, ErrorCode::OK);
+}
+
+TEST_F(OrderedOpLogWriterAwaitTest,
+       NonRetryableFailureWakesBeforeTerminalCallback) {
+    CheckTerminal(ErrorCode::INVALID_PARAMS,
+                  OrderedOpLogWriterTerminalReason::kNonRetryableWriteError);
+}
+
+TEST_F(OrderedOpLogWriterAwaitTest, FencingFailurePreservesTerminalError) {
+    CheckTerminal(ErrorCode::ETCD_TRANSACTION_FAIL,
+                  OrderedOpLogWriterTerminalReason::kFenced);
+}
+
+TEST_F(OrderedOpLogWriterAwaitTest, RetryTimeoutWakesAllOutstandingWaiters) {
+    CheckTerminal(ErrorCode::PERSISTENT_FAIL,
+                  OrderedOpLogWriterTerminalReason::kRetryTimeout,
+                  std::chrono::milliseconds(5));
+}
+
+TEST_F(OrderedOpLogWriterAwaitTest, StopWakesUncoveredWaitersBeforeStart) {
+    CreateWriter();
+    auto& waiter = Await(1);
+    ReenterFromContinuation(waiter);
+    ExpectPending(waiter);
+    writer_->Stop();
+    ExpectResult(waiter, ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+}
+
+TEST_F(OrderedOpLogWriterAwaitTest, StopWakesUncoveredWaitersAfterStart) {
+    CreateWriter();
+    writer_->Start();
+    auto& waiter = Await(1);
+    ReenterFromContinuation(waiter);
+    ExpectPending(waiter);
+    writer_->Stop();
+    ExpectResult(waiter, ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+}
+
+TEST_F(OrderedOpLogWriterAwaitTest, DurableCallbackCompletionIsNotRequired) {
+    CreateWriter();
+    auto reservation = writer_->Reserve();
+    ASSERT_TRUE(reservation.has_value());
+    auto pending = writer_->Commit(std::move(*reservation), MakeEntry(),
+                                   [this](const OpLogEntry&) {
+                                       BlockCallback();
+                                       callback_finished_ = true;
+                                   });
+    ASSERT_TRUE(pending.has_value());
+    auto& waiter = Await(pending->sequence_id());
+    writer_->Start();
+    ASSERT_TRUE(WaitForCallback());
+    ExpectResult(waiter, ErrorCode::OK);
+    EXPECT_FALSE(callback_finished_.load());
+    ReleaseCallback();
+    writer_->Stop();
+    EXPECT_TRUE(callback_finished_.load());
+    ExpectResult(Await(pending->sequence_id()), ErrorCode::OK);
+}
+
+TEST_F(OrderedOpLogWriterAwaitTest, AllWaitersForSameSequenceWake) {
+    storage_.BlockWrites();
+    CreateWriter();
+    auto reservation = writer_->Reserve();
+    ASSERT_TRUE(reservation.has_value());
+    auto pending = writer_->Commit(std::move(*reservation), MakeEntry(), {});
+    ASSERT_TRUE(pending.has_value());
+    for (int i = 0; i < 8; ++i) Await(pending->sequence_id());
+    writer_->Start();
+    ASSERT_TRUE(storage_.WaitForBlockedWrite());
+    for (auto& waiter : waiters_) ExpectPending(waiter);
+    storage_.UnblockWrites();
+    for (auto& waiter : waiters_) ExpectResult(waiter, ErrorCode::OK);
+}
+
+TEST_F(OrderedOpLogWriterAwaitTest, DurableContinuationCanReenterWriter) {
+    storage_.BlockWrites();
+    CreateWriter();
+    auto reservation = writer_->Reserve();
+    ASSERT_TRUE(reservation.has_value());
+    ASSERT_TRUE(
+        writer_->Commit(std::move(*reservation), MakeEntry(), {}).has_value());
+    auto& waiter = Await(1);
+    ReenterFromContinuation(waiter);
+    writer_->Start();
+    ASSERT_TRUE(storage_.WaitForBlockedWrite());
+    ExpectPending(waiter);
+    storage_.UnblockWrites();
+    ExpectResult(waiter, ErrorCode::OK);
+}
+
+TEST_F(OrderedOpLogWriterAwaitTest, CompletesWaitersInSequenceOrder) {
+    storage_.BlockWrites();
+    CreateWriter({.max_entries_per_batch = 3});
+    for (int i = 0; i < 3; ++i) {
+        auto reservation = writer_->Reserve();
+        ASSERT_TRUE(reservation.has_value());
+        ASSERT_TRUE(writer_->Commit(std::move(*reservation), MakeEntry(), {})
+                        .has_value());
+    }
+    std::mutex mutex;
+    std::vector<uint64_t> completed;
+    for (uint64_t sequence : {3, 1, 2}) {
+        auto& waiter = Await(sequence);
+        waiter = std::move(waiter).thenValue([&, sequence](ErrorCode error) {
+            std::lock_guard<std::mutex> lock(mutex);
+            completed.push_back(sequence);
+            return error;
+        });
+    }
+    writer_->Start();
+    EXPECT_TRUE(storage_.WaitForBlockedWrite());
+    storage_.UnblockWrites();
+    for (auto& waiter : waiters_) ExpectResult(waiter, ErrorCode::OK);
+    writer_->Stop();
+    std::lock_guard<std::mutex> lock(mutex);
+    EXPECT_EQ(completed, (std::vector<uint64_t>{1, 2, 3}));
+}
+
+TEST_F(OrderedOpLogWriterAwaitTest,
+       OutstandingWaitAllowsOtherWorkOnSameExecutorThread) {
+    storage_.BlockWrites();
+    CreateWriter();
+    auto reservation = writer_->Reserve();
+    ASSERT_TRUE(reservation.has_value());
+    ASSERT_TRUE(
+        writer_->Commit(std::move(*reservation), MakeEntry(), {}).has_value());
+    writer_->Start();
+    ASSERT_TRUE(storage_.WaitForBlockedWrite());
+
+    std::promise<std::thread::id> registered;
+    std::promise<std::thread::id> resumed;
+    std::promise<std::thread::id> other_work;
+    std::promise<ErrorCode> completed;
+    auto registered_future = registered.get_future();
+    auto resumed_future = resumed.get_future();
+    auto work_future = other_work.get_future();
+    auto completed_future = completed.get_future();
+    async_simple::executors::SimpleExecutor executor(1);
+    AwaitOnExecutor(*writer_, 1, registered, resumed)
+        .via(&executor)
+        .start([&](async_simple::Try<ErrorCode>&& result) {
+            if (result.hasError()) {
+                completed.set_exception(result.getException());
+            } else {
+                completed.set_value(result.value());
+            }
+        });
+    const auto registered_status =
+        registered_future.wait_for(std::chrono::seconds(5));
+    EXPECT_EQ(registered_status, std::future_status::ready);
+    EXPECT_TRUE(executor.schedule(
+        [&] { other_work.set_value(std::this_thread::get_id()); }));
+    const auto work_status = work_future.wait_for(std::chrono::seconds(5));
+    EXPECT_EQ(work_status, std::future_status::ready);
+    EXPECT_EQ(completed_future.wait_for(std::chrono::milliseconds(0)),
+              std::future_status::timeout);
+
+    // Always release storage and drain the writer before destroying executor,
+    // even if a non-blocking/scheduling assertion above failed.
+    storage_.UnblockWrites();
+    const auto completed_status =
+        completed_future.wait_for(std::chrono::seconds(5));
+    writer_->Stop();
+    EXPECT_EQ(completed_status, std::future_status::ready);
+    if (completed_status == std::future_status::ready) {
+        EXPECT_EQ(completed_future.get(), ErrorCode::OK);
+    }
+    if (registered_status == std::future_status::ready &&
+        work_status == std::future_status::ready) {
+        const auto executor_thread = registered_future.get();
+        EXPECT_EQ(work_future.get(), executor_thread);
+        if (resumed_future.wait_for(std::chrono::milliseconds(0)) ==
+            std::future_status::ready) {
+            EXPECT_EQ(resumed_future.get(), executor_thread);
+        } else {
+            ADD_FAILURE() << "durability coroutine did not resume";
+        }
+    }
+}
+
+TEST(OrderedOpLogWriterMetricsTest, RuntimeSnapshotTracksAdmission) {
+    OrderedOpLogWriter writer(
+        OrderedOpLogWriterConfig{.max_entries_per_batch = 2},
+        [](const OpLogBatchRecord&, const DurablePrefix&) {
+            return ErrorCode::OK;
+        });
+    writer.ActivateRuntimeMetrics();
+    auto snapshot = HAMetricManager::instance().get_writer_runtime();
+    EXPECT_TRUE(snapshot.accepting);
+    EXPECT_EQ(snapshot.waiting_slots, 0);
+
+    auto reservation = writer.Reserve();
+    ASSERT_TRUE(reservation.has_value());
+    snapshot = HAMetricManager::instance().get_writer_runtime();
+    EXPECT_EQ(snapshot.waiting_slots, 1);
+    writer.Abort(std::move(*reservation));
+    snapshot = HAMetricManager::instance().get_writer_runtime();
+    EXPECT_EQ(snapshot.waiting_slots, 0);
+}
+
+TEST(OrderedOpLogWriterMetricsTest,
+     CandidateAndOldDestructorCannotOverwriteOwner) {
+    auto write = [](const OpLogBatchRecord&, const DurablePrefix&) {
+        return ErrorCode::OK;
+    };
+    auto old = std::make_unique<OrderedOpLogWriter>(
+        OrderedOpLogWriterConfig{
+            .initial_durable_prefix = {.batch_id = 1, .last_seq = 10}},
+        write);
+    old->ActivateRuntimeMetrics();
+    auto& metrics = HAMetricManager::instance();
+    {
+        OrderedOpLogWriter rejected({}, write);
+        EXPECT_EQ(metrics.get_writer_runtime().durable_sequence, 10);
+    }
+    EXPECT_TRUE(metrics.get_writer_runtime().accepting);
+    OrderedOpLogWriter replacement(
+        OrderedOpLogWriterConfig{
+            .initial_durable_prefix = {.batch_id = 2, .last_seq = 20}},
+        write);
+    EXPECT_EQ(metrics.get_writer_runtime().durable_sequence, 10);
+    replacement.ActivateRuntimeMetrics();
+    old->Stop();
+    old.reset();
+    EXPECT_TRUE(metrics.get_writer_runtime().accepting);
+    EXPECT_EQ(metrics.get_writer_runtime().durable_sequence, 20);
+    replacement.Stop();
+    EXPECT_FALSE(metrics.get_writer_runtime().accepting);
+}
 
 TEST(OrderedOpLogWriterAdmissionTest, AbortLeavesNoSequenceGap) {
     FakeBatchWriter storage;
@@ -211,7 +659,7 @@ TEST(OrderedOpLogWriterAdmissionTest, CommitAssignsContiguousSequences) {
 #ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
 TEST(OrderedOpLogWriterMetricTest, RecordsDurabilityQueuesAndRetry) {
     FakeBatchWriter storage;
-    storage.FailNextWrites(1, ErrorCode::ETCD_TRANSACTION_FAIL);
+    storage.FailNextWrites(1, ErrorCode::PERSISTENT_FAIL);
     auto& metrics = HAMetricManager::instance();
     const auto batches_before =
         metrics.get_batch_record_durable_batches_total();
@@ -713,6 +1161,107 @@ TEST(OrderedOpLogWriterFailureTest, FirstStorageFailureStopsNewReservations) {
     writer.Stop();
 }
 
+TEST(OrderedOpLogWriterFailureTest, NonRetryableFailureLatchesTerminalState) {
+    FakeBatchWriter storage;
+    std::mutex mutex;
+    std::condition_variable cv;
+    int terminal_callbacks = 0;
+    std::optional<OrderedOpLogWriterTerminalState> callback_state;
+    OrderedOpLogWriter writer(
+        OrderedOpLogWriterConfig{.max_entries_per_batch = 2},
+        [&](const OpLogBatchRecord& batch,
+            const DurablePrefix& expected_prefix) {
+            return storage.Write(batch, expected_prefix);
+        },
+        [&](const OrderedOpLogWriterTerminalState& state) {
+            std::lock_guard<std::mutex> lock(mutex);
+            ++terminal_callbacks;
+            callback_state = state;
+            cv.notify_all();
+        });
+    writer.Start();
+
+    auto held = writer.Reserve();
+    auto failing = writer.Reserve();
+    ASSERT_TRUE(held.has_value());
+    ASSERT_TRUE(failing.has_value());
+    storage.FailNextWrite(ErrorCode::INVALID_PARAMS);
+    ASSERT_TRUE(
+        writer
+            .Commit(std::move(*failing), MakeEntry("fail"), [](const auto&) {})
+            .has_value());
+
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(1),
+                                [&] { return terminal_callbacks == 1; }));
+    }
+    const auto state = writer.GetTerminalState();
+    ASSERT_TRUE(state.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, state->error);
+    EXPECT_EQ(OrderedOpLogWriterTerminalReason::kNonRetryableWriteError,
+              state->reason);
+    EXPECT_EQ(0u, state->durable_prefix.batch_id);
+    EXPECT_EQ(0u, state->durable_prefix.last_seq);
+    EXPECT_NE(0u, state->occurred_at_ms);
+    ASSERT_TRUE(callback_state.has_value());
+    EXPECT_EQ(state->error, callback_state->error);
+    EXPECT_FALSE(writer.IsAccepting());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, writer.LastError());
+    auto reserve_after_terminal = writer.Reserve();
+    ASSERT_FALSE(reserve_after_terminal.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, reserve_after_terminal.error());
+
+    auto committed =
+        writer.Commit(std::move(*held), MakeEntry(), [](const auto&) {});
+    ASSERT_FALSE(committed.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, committed.error());
+    auto reused =
+        writer.Commit(std::move(*held), MakeEntry(), [](const auto&) {});
+    ASSERT_FALSE(reused.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, reused.error());
+    writer.Stop();
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, writer.LastError());
+    const auto state_after_stop = writer.GetTerminalState();
+    ASSERT_TRUE(state_after_stop.has_value());
+    EXPECT_EQ(state->error, state_after_stop->error);
+    EXPECT_EQ(state->reason, state_after_stop->reason);
+    EXPECT_EQ(state->durable_prefix.batch_id,
+              state_after_stop->durable_prefix.batch_id);
+    EXPECT_EQ(state->durable_prefix.last_seq,
+              state_after_stop->durable_prefix.last_seq);
+    EXPECT_EQ(state->occurred_at_ms, state_after_stop->occurred_at_ms);
+    EXPECT_EQ(1, terminal_callbacks);
+}
+
+TEST(OrderedOpLogWriterFailureTest, TransactionConflictBecomesFencedTerminal) {
+    FakeBatchWriter storage;
+    OrderedOpLogWriter writer(
+        OrderedOpLogWriterConfig{.max_entries_per_batch = 1},
+        [&](const OpLogBatchRecord& batch,
+            const DurablePrefix& expected_prefix) {
+            return storage.Write(batch, expected_prefix);
+        });
+    writer.Start();
+
+    storage.FailNextWrite(ErrorCode::ETCD_TRANSACTION_FAIL);
+    auto reservation = writer.Reserve();
+    ASSERT_TRUE(reservation.has_value());
+    ASSERT_TRUE(
+        writer.Commit(std::move(*reservation), MakeEntry(), [](const auto&) {})
+            .has_value());
+    ASSERT_TRUE(storage.WaitForAttempts(1));
+    for (int i = 0; i < 100 && !writer.GetTerminalState().has_value(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    const auto state = writer.GetTerminalState();
+    ASSERT_TRUE(state.has_value());
+    EXPECT_EQ(ErrorCode::ETCD_TRANSACTION_FAIL, state->error);
+    EXPECT_EQ(OrderedOpLogWriterTerminalReason::kFenced, state->reason);
+    EXPECT_EQ(1u, storage.AttemptTimes().size());
+    writer.Stop();
+}
+
 TEST(OrderedOpLogWriterFailureTest,
      DoesNotInvokeCallbacksWhileBatchIsUndurable) {
     FakeBatchWriter storage;
@@ -735,6 +1284,86 @@ TEST(OrderedOpLogWriterFailureTest,
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
     EXPECT_EQ(0, callbacks.load());
+    writer.Stop();
+}
+
+TEST(OrderedOpLogWriterFailureTest, RetryTimeoutStopsFurtherAttempts) {
+    using namespace std::chrono_literals;
+
+    FakeBatchWriter storage;
+    std::atomic<int> terminal_callbacks{0};
+    OrderedOpLogWriter writer(
+        OrderedOpLogWriterConfig{.max_entries_per_batch = 1,
+                                 .retry_timeout = 50ms},
+        [&](const OpLogBatchRecord& batch,
+            const DurablePrefix& expected_prefix) {
+            return storage.Write(batch, expected_prefix);
+        },
+        [&](const OrderedOpLogWriterTerminalState&) { ++terminal_callbacks; });
+    writer.Start();
+
+    storage.FailNextWrites(100000, ErrorCode::PERSISTENT_FAIL);
+    auto reservation = writer.Reserve();
+    ASSERT_TRUE(reservation.has_value());
+    ASSERT_TRUE(writer
+                    .Commit(std::move(*reservation), MakeEntry("k1"),
+                            [](const auto&) {})
+                    .has_value());
+
+    for (int i = 0; i < 200 && !writer.GetTerminalState().has_value(); ++i) {
+        std::this_thread::sleep_for(10ms);
+    }
+    const auto state = writer.GetTerminalState();
+    ASSERT_TRUE(state.has_value());
+    EXPECT_EQ(ErrorCode::PERSISTENT_FAIL, state->error);
+    EXPECT_EQ(OrderedOpLogWriterTerminalReason::kRetryTimeout, state->reason);
+    EXPECT_NE(0u, state->occurred_at_ms);
+    EXPECT_EQ(ErrorCode::PERSISTENT_FAIL, writer.LastError());
+    EXPECT_EQ(0u,
+              HAMetricManager::instance().get_writer_runtime().retry_delay_ms);
+    for (int i = 0; i < 100 && terminal_callbacks.load() != 1; ++i) {
+        std::this_thread::sleep_for(10ms);
+    }
+    EXPECT_EQ(1, terminal_callbacks.load());
+
+    const size_t attempts_after_terminal = storage.AttemptTimes().size();
+    std::this_thread::sleep_for(100ms);
+    EXPECT_EQ(attempts_after_terminal, storage.AttemptTimes().size());
+    writer.Stop();
+}
+
+TEST(OrderedOpLogWriterFailureTest,
+     SuccessBeforeRetryTimeoutDoesNotBecomeTerminal) {
+    using namespace std::chrono_literals;
+
+    FakeBatchWriter storage;
+    std::atomic<int> terminal_callbacks{0};
+    OrderedOpLogWriter writer(
+        OrderedOpLogWriterConfig{.max_entries_per_batch = 1,
+                                 .retry_timeout = 2s},
+        [&](const OpLogBatchRecord& batch,
+            const DurablePrefix& expected_prefix) {
+            return storage.Write(batch, expected_prefix);
+        },
+        [&](const OrderedOpLogWriterTerminalState&) { ++terminal_callbacks; });
+    writer.Start();
+
+    storage.FailNextWrites(1, ErrorCode::PERSISTENT_FAIL);
+    auto reservation = writer.Reserve();
+    ASSERT_TRUE(reservation.has_value());
+    ASSERT_TRUE(writer
+                    .Commit(std::move(*reservation), MakeEntry("k1"),
+                            [](const auto&) {})
+                    .has_value());
+
+    ASSERT_TRUE(storage.WaitForWrites(1));
+    for (int i = 0; i < 100 && !writer.IsAccepting(); ++i) {
+        std::this_thread::sleep_for(10ms);
+    }
+    EXPECT_FALSE(writer.GetTerminalState().has_value());
+    EXPECT_EQ(0, terminal_callbacks.load());
+    EXPECT_TRUE(writer.IsAccepting());
+    EXPECT_EQ(ErrorCode::OK, writer.LastError());
     writer.Stop();
 }
 
@@ -859,6 +1488,9 @@ TEST(OrderedOpLogWriterFailureTest, StopInterruptsRetryBackoff) {
     const auto started_at = FakeBatchWriter::Clock::now();
     writer.Stop();
     EXPECT_LT(FakeBatchWriter::Clock::now() - started_at, 250ms);
+    EXPECT_FALSE(writer.GetTerminalState().has_value());
+    EXPECT_EQ(0u,
+              HAMetricManager::instance().get_writer_runtime().retry_delay_ms);
 }
 
 TEST(OrderedOpLogWriterFailureTest, SuccessAfterRetryRestoresAccepting) {
@@ -1085,6 +1717,140 @@ TEST(OrderedOpLogWriterCallbackTest, SlowCallbackDoesNotPreventNextBatchWrite) {
     }
     release_callback_cv.notify_all();
     writer.Stop();
+}
+
+TEST(OrderedOpLogWriterAdmissionTest, CommitBatchSealsWholeGroupIntoOneRecord) {
+    FakeBatchWriter storage;
+    OrderedOpLogWriter writer(
+        OrderedOpLogWriterConfig{.max_entries_per_batch = 2},
+        [&](const OpLogBatchRecord& batch,
+            const DurablePrefix& expected_prefix) {
+            return storage.Write(batch, expected_prefix);
+        });
+    writer.Start();
+
+    auto reservation = writer.ReserveBatch(2);
+    ASSERT_TRUE(reservation.has_value());
+    std::atomic<size_t> callbacks{0};
+    std::vector<OpLogEntry> entries;
+    entries.push_back(MakeEntry("g1"));
+    entries.push_back(MakeEntry("g2"));
+    auto pending =
+        writer.CommitBatch(std::move(*reservation), std::move(entries),
+                           [&](const OpLogEntry&) { ++callbacks; });
+    ASSERT_TRUE(pending.has_value());
+    ASSERT_EQ(2u, pending->size());
+    EXPECT_EQ(1u, (*pending)[0].sequence_id());
+    EXPECT_EQ(2u, (*pending)[1].sequence_id());
+
+    ASSERT_TRUE(storage.WaitForWrites(1));
+    writer.Stop();
+
+    auto batches = storage.Batches();
+    ASSERT_EQ(1u, batches.size());
+    ASSERT_EQ(2u, batches[0].entries.size());
+    EXPECT_EQ("g1", batches[0].entries[0].object_key);
+    EXPECT_EQ("g2", batches[0].entries[1].object_key);
+    EXPECT_EQ(1u, batches[0].first_seq);
+    EXPECT_EQ(2u, batches[0].last_seq);
+    EXPECT_EQ(2u, callbacks.load());
+}
+
+TEST(OrderedOpLogWriterAdmissionTest, CommitBatchKeepsNeighborEntriesOutside) {
+    FakeBatchWriter storage;
+    OrderedOpLogWriter writer(
+        OrderedOpLogWriterConfig{.max_entries_per_batch = 3},
+        [&](const OpLogBatchRecord& batch,
+            const DurablePrefix& expected_prefix) {
+            return storage.Write(batch, expected_prefix);
+        });
+    writer.Start();
+
+    // The plain commit seals first and keeps the writer busy, so the group
+    // queues behind it and must come out as its own record.
+    auto first = writer.Reserve();
+    ASSERT_TRUE(first.has_value());
+    ASSERT_TRUE(
+        writer.Commit(std::move(*first), MakeEntry("plain"), [](const auto&) {})
+            .has_value());
+    ASSERT_TRUE(storage.WaitForWrites(1));
+
+    auto reservation = writer.ReserveBatch(2);
+    ASSERT_TRUE(reservation.has_value());
+    std::vector<OpLogEntry> entries;
+    entries.push_back(MakeEntry("g1"));
+    entries.push_back(MakeEntry("g2"));
+    ASSERT_TRUE(writer
+                    .CommitBatch(std::move(*reservation), std::move(entries),
+                                 [](const auto&) {})
+                    .has_value());
+    ASSERT_TRUE(storage.WaitForWrites(2));
+    writer.Stop();
+
+    auto batches = storage.Batches();
+    ASSERT_EQ(2u, batches.size());
+    ASSERT_EQ(1u, batches[0].entries.size());
+    EXPECT_EQ("plain", batches[0].entries[0].object_key);
+    ASSERT_EQ(2u, batches[1].entries.size());
+    EXPECT_EQ("g1", batches[1].entries[0].object_key);
+    EXPECT_EQ("g2", batches[1].entries[1].object_key);
+    EXPECT_EQ(2u, batches[1].first_seq);
+    EXPECT_EQ(3u, batches[1].last_seq);
+}
+
+TEST(OrderedOpLogWriterAdmissionTest, ReserveBatchEnforcesAdmissionCap) {
+    FakeBatchWriter storage;
+    OrderedOpLogWriter writer(
+        OrderedOpLogWriterConfig{.max_entries_per_batch = 2},
+        [&](const OpLogBatchRecord& batch,
+            const DurablePrefix& expected_prefix) {
+            return storage.Write(batch, expected_prefix);
+        });
+
+    // A group larger than the batch cap is rejected up front rather than
+    // producing an oversized record the backend might refuse.
+    auto oversized = writer.ReserveBatch(3);
+    ASSERT_FALSE(oversized.has_value());
+    EXPECT_EQ(ErrorCode::TASK_PENDING_LIMIT_EXCEEDED, oversized.error());
+
+    auto first = writer.Reserve();
+    ASSERT_TRUE(first.has_value());
+    auto no_room = writer.ReserveBatch(2);
+    ASSERT_FALSE(no_room.has_value());
+    EXPECT_EQ(ErrorCode::TASK_PENDING_LIMIT_EXCEEDED, no_room.error());
+
+    writer.Abort(std::move(*first));
+    auto reservation = writer.ReserveBatch(2);
+    ASSERT_TRUE(reservation.has_value());
+    writer.Abort(std::move(*reservation));
+
+    auto zero = writer.ReserveBatch(0);
+    ASSERT_FALSE(zero.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, zero.error());
+}
+
+TEST(OrderedOpLogWriterAdmissionTest, CommitBatchRejectsSlotMismatch) {
+    FakeBatchWriter storage;
+    OrderedOpLogWriter writer(
+        OrderedOpLogWriterConfig{.max_entries_per_batch = 2},
+        [&](const OpLogBatchRecord& batch,
+            const DurablePrefix& expected_prefix) {
+            return storage.Write(batch, expected_prefix);
+        });
+
+    auto reservation = writer.ReserveBatch(2);
+    ASSERT_TRUE(reservation.has_value());
+    std::vector<OpLogEntry> entries;
+    entries.push_back(MakeEntry("only_one"));
+    auto pending = writer.CommitBatch(std::move(*reservation),
+                                      std::move(entries), [](const auto&) {});
+    ASSERT_FALSE(pending.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, pending.error());
+
+    // The rejected reservation released its slots, so admission still works.
+    auto next = writer.ReserveBatch(2);
+    ASSERT_TRUE(next.has_value());
+    writer.Abort(std::move(*next));
 }
 
 }  // namespace mooncake::test

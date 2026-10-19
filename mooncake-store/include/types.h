@@ -18,10 +18,16 @@
 #include "ylt/struct_json/json_writer.h"
 #include "ylt/struct_pack.hpp"
 
-#ifdef STORE_USE_ETCD
-#include "libetcd_wrapper.h"
-#endif
 namespace mooncake {
+
+enum class ProbeLeaseMode : uint8_t { None = 0, LastHitOnly = 1 };
+
+// Candidates are consecutive groups of candidate_size keys in caller order.
+// None preserves the lease-free existence probe and ignores candidate_size.
+struct GrantLeasePolicy {
+    ProbeLeaseMode lease_mode{ProbeLeaseMode::None};
+    uint64_t candidate_size{1};
+};
 
 // Constants
 static constexpr uint64_t WRONG_VERSION = 0;
@@ -88,13 +94,22 @@ static constexpr uint64_t DEFAULT_DEFAULT_KV_LEASE_TTL =
     10000;  // in milliseconds
 static constexpr uint64_t DEFAULT_KV_SOFT_PIN_TTL_MS =
     30 * 60 * 1000;  // 30 minutes
+static constexpr uint64_t DEFAULT_MAX_KV_SOFT_PIN_TTL_MS =
+    24 * 60 * 60 * 1000;  // 24 hours
 static constexpr bool DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS = true;
 static constexpr double DEFAULT_EVICTION_RATIO = 0.05;
 static constexpr double DEFAULT_EVICTION_HIGH_WATERMARK_RATIO = 0.90;
+// Per-tenant eviction watermark, as a fraction of a tenant's own effective
+// quota. Mirrors the pool-wide default above so that a tenant gets the same
+// evict-to-make-room contract the pool has; 0.0 disables the pass and restores
+// the pre-existing behaviour, where only the pool-wide watermark can trigger
+// background eviction. Inert unless enable_multi_tenants is set.
+static constexpr double DEFAULT_TENANT_EVICTION_HIGH_WATERMARK_RATIO = 0.90;
 static constexpr double DEFAULT_NOF_EVICTION_RATIO = 0.05;
 static constexpr double DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO = 0.90;
 static constexpr int64_t DEFAULT_MASTER_VIEW_LEASE_TTL_SEC = 5;  // in seconds
 static constexpr int64_t DEFAULT_CLIENT_LIVE_TTL_SEC = 10;       // in seconds
+static constexpr int64_t DEFAULT_CLIENT_SUSPICION_TTL_SEC = 20;  // in seconds
 static constexpr int64_t DEFAULT_NOF_HEARTBEAT_INTERVAL_SEC = 10;
 static constexpr uint32_t DEFAULT_NOF_HEARTBEAT_PROBE_TIMEOUT_MS = 1000;
 static constexpr uint32_t DEFAULT_NOF_HEARTBEAT_FAILURES_THRESHOLD = 3;
@@ -118,6 +133,9 @@ constexpr const char* PUT_NO_SPACE_HELPER_STR =  // A helpful string
     " due to insufficient space. Consider lowering "
     "eviction_high_watermark_ratio or mounting more segments.";
 static constexpr uint64_t DEFAULT_PUT_START_DISCARD_TIMEOUT = 30;  // 30 seconds
+// How long RestoreFromStandbySnapshot waits for conflict-repair records to
+// become durable. 0 waits on the writer's durability future with no cap.
+static constexpr uint64_t DEFAULT_RESTORE_REPAIR_DURABLE_TIMEOUT_MS = 10000;
 static constexpr uint64_t DEFAULT_PUT_START_RELEASE_TIMEOUT =
     600;  // 10 minutes
 
@@ -188,16 +206,11 @@ using BufHandleList = std::vector<std::shared_ptr<AllocatedBuffer>>;
 using ReplicaList = std::unordered_map<uint32_t, Replica>;
 using BufferResources =
     std::map<SegmentId, std::vector<std::shared_ptr<BufferAllocatorBase>>>;
-// Mapping between c++ and go types
-#ifdef STORE_USE_ETCD
-using EtcdRevisionId = GoInt64;
-using ViewVersionId = EtcdRevisionId;
-using EtcdLeaseId = GoInt64;
-#else
+// Keep store-facing IDs independent from the generated Go C ABI header.
+// EtcdHelper performs the conversion to GoInt64 at the wrapper boundary.
 using EtcdRevisionId = int64_t;
-using ViewVersionId = int64_t;
+using ViewVersionId = EtcdRevisionId;
 using EtcdLeaseId = int64_t;
-#endif
 
 using UUID = std::pair<uint64_t, uint64_t>;
 
@@ -217,10 +230,15 @@ constexpr const char* CONFIG_KEY_PROTOCOL = "protocol";
 constexpr const char* CONFIG_KEY_RDMA_DEVICES = "rdma_devices";
 constexpr const char* CONFIG_KEY_MASTER_SERVER_ADDR = "master_server_addr";
 constexpr const char* CONFIG_KEY_IPC_SOCKET_PATH = "ipc_socket_path";
+constexpr const char* CONFIG_KEY_ENABLE_EGM_STORE_POOL =
+    "enable_egm_store_pool";
+constexpr const char* CONFIG_KEY_EGM_NUMA_NODES = "egm_numa_nodes";
 constexpr const char* CONFIG_KEY_TENANT_ID = "tenant_id";
 constexpr const char* CONFIG_KEY_ENABLE_CLIENT_HTTP_SERVER =
     "enable_client_http_server";
 constexpr const char* CONFIG_KEY_CLIENT_HTTP_PORT = "client_http_port";
+constexpr const char* CONFIG_KEY_ENABLE_EMBEDDED_MASTER =
+    "enable_embedded_master";
 
 // Store client configuration defaults
 static constexpr size_t DEFAULT_GLOBAL_SEGMENT_SIZE = 1024 * 1024 * 16;  // 16MB
@@ -359,7 +377,8 @@ enum class ErrorCode : int32_t {
     UNAVAILABLE_IN_CURRENT_STATUS =
         -1010,  ///< Request cannot be done in current status.
     UNAVAILABLE_IN_CURRENT_MODE =
-        -1011,  ///< Request cannot be done in current mode.
+        -1011,              ///< Request cannot be done in current mode.
+    NOT_SUPPORTED = -1012,  ///< Operation is not supported in current mode.
 
     // FILE errors (Range: -1100 to -1199)
     FILE_NOT_FOUND = -1100,       ///< File not found.
@@ -445,6 +464,7 @@ struct Segment {
     std::string protocol;
     std::string host_id{};
     Segment() = default;
+    bool operator==(const Segment&) const = default;
 };
 YLT_REFL(Segment, id, name, base, size, te_endpoint, protocol, host_id);
 

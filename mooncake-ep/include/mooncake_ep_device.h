@@ -13,14 +13,14 @@
 #include <musa_fp8.h>
 using ep_fp8_storage_t = __mt_fp8_storage_t;
 using ep_fp8x2_storage_t = __mt_fp8x2_storage_t;
-#if defined(__CUDACC__) || defined(__MCC__)
+#if defined(__CUDACC__) || defined(__MCC__) || defined(__MUSACC__)
 __device__ __forceinline__ ep_fp8x2_storage_t ep_cvt_float2_to_fp8x2(float2 x) {
     return __musa_cvt_float2_to_fp8x2(x, __MT_SATFINITE, __MT_E4M3);
 }
 #endif
 
 // -- Device intrinsics (MUSA doesn't have __ldg / __activemask) --------------
-#if (defined(__CUDACC__) || defined(__MCC__)) && \
+#if (defined(__CUDACC__) || defined(__MCC__) || defined(__MUSACC__)) && \
     !defined(MOONCAKE_EP_MUSA_LDG_DEFINED)
 #define MOONCAKE_EP_MUSA_LDG_DEFINED
 template <typename dtype_t>
@@ -32,7 +32,7 @@ __device__ __forceinline__ dtype_t __ldg(const dtype_t* ptr) {
 #define __activemask() (0xffffffff)
 #endif
 
-#if defined(__CUDACC__) || defined(__MCC__)
+#if defined(__CUDACC__) || defined(__MCC__) || defined(__MUSACC__)
 __forceinline__ __device__ int get_lane_id() { return threadIdx.x % 32; }
 #endif
 
@@ -44,28 +44,24 @@ __forceinline__ __device__ int get_lane_id() { return threadIdx.x % 32; }
     dim3 _block(num_threads);                             \
     cudaStream_t _stream = stream
 
-#define LAUNCH_KERNEL(config, kernel, ...)                     \
-    kernel<<<_grid, _block, 0, _stream>>>(__VA_ARGS__);        \
-    {                                                          \
-        auto _err = cudaGetLastError();                        \
-        if (_err != cudaSuccess) {                             \
-            fprintf(stderr, "[EP] kernel launch failed: %s\n", \
-                    cudaGetErrorString(_err));                 \
-        }                                                      \
-    }
+#define LAUNCH_KERNEL(config, kernel, ...)                  \
+    do {                                                    \
+        kernel<<<_grid, _block, 0, _stream>>>(__VA_ARGS__); \
+        CUDA_CHECK(cudaGetLastError());                     \
+    } while (false)
 
 #elif defined(MOONCAKE_EP_USE_MACA)
 
 // -- FP8 types ---------------------------------------------------------------
-// MetaX C500 does not support the FP8 EP path.  The dispatch<true> template is
-// still compiled because the host selects the kernel through a runtime bool, so
-// provide storage stubs and reject actual FP8 use in the host/Python wrappers.
 #include <cstdint>
-using ep_fp8_storage_t = uint8_t;
+#include <maca_fp8.h>
+using ep_fp8_storage_t = __maca_fp8_e4m3;
 using ep_fp8x2_storage_t = uint16_t;
-#if defined(__CUDACC__) || defined(__MCC__)
-__device__ __forceinline__ ep_fp8x2_storage_t ep_cvt_float2_to_fp8x2(float2) {
-    return 0;
+#if defined(__CUDACC__) || defined(__MCC__) || defined(__MUSACC__)
+__device__ __forceinline__ ep_fp8x2_storage_t ep_cvt_float2_to_fp8x2(float2 x) {
+    const auto x0 = __maca_fp8_e4m3(x.x);
+    const auto x1 = __maca_fp8_e4m3(x.y);
+    return static_cast<uint16_t>(x0.__x) | (static_cast<uint16_t>(x1.__x) << 8);
 }
 #endif
 
@@ -74,7 +70,7 @@ __device__ __forceinline__ ep_fp8x2_storage_t ep_cvt_float2_to_fp8x2(float2) {
 #define __activemask() (0xffffffff)
 #endif
 
-#if defined(__CUDACC__) || defined(__MCC__)
+#if defined(__CUDACC__) || defined(__MCC__) || defined(__MUSACC__)
 __forceinline__ __device__ int get_lane_id() { return threadIdx.x % 32; }
 #endif
 
@@ -86,15 +82,11 @@ __forceinline__ __device__ int get_lane_id() { return threadIdx.x % 32; }
     dim3 _block(num_threads);                             \
     cudaStream_t _stream = stream
 
-#define LAUNCH_KERNEL(config, kernel, ...)                     \
-    kernel<<<_grid, _block, 0, _stream>>>(__VA_ARGS__);        \
-    {                                                          \
-        auto _err = cudaGetLastError();                        \
-        if (_err != cudaSuccess) {                             \
-            fprintf(stderr, "[EP] kernel launch failed: %s\n", \
-                    cudaGetErrorString(_err));                 \
-        }                                                      \
-    }
+#define LAUNCH_KERNEL(config, kernel, ...)                  \
+    do {                                                    \
+        kernel<<<_grid, _block, 0, _stream>>>(__VA_ARGS__); \
+        CUDA_CHECK(cudaGetLastError());                     \
+    } while (false)
 
 #else  // !MOONCAKE_EP_USE_MUSA && !MOONCAKE_EP_USE_MACA
 

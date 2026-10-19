@@ -29,6 +29,7 @@
 #include <glog/logging.h>
 #include <signal.h>
 #include <sys/time.h>
+#include <atomic>
 
 #include "transfer_engine.h"
 
@@ -61,16 +62,46 @@ class TEBenchRunner : public BenchRunner {
                block_size * batch_size * (thread_id / num_buffers);
     }
 
-    uint64_t getTargetBufferBase(int thread_id, uint64_t block_size,
-                                 uint64_t batch_size) const {
-        return info_->buffers[thread_id % info_->buffers.size()].addr +
-               block_size * batch_size * (thread_id / info_->buffers.size());
+    size_t getTargetCount() const;
+
+    size_t getTargetIndex(int thread_id) const {
+        return targetIndex(thread_id);
     }
 
-    double runSingleTransfer(uint64_t local_addr, uint64_t target_addr,
-                             uint64_t block_size, uint64_t batch_size,
-                             OpCode opcode, uint64_t deadline_ns,
-                             IntentType intent_type);
+    uint64_t getTargetSegmentId(int thread_id) const;
+
+    uint64_t getTargetBufferBase(int thread_id, uint64_t block_size,
+                                 uint64_t batch_size) const {
+        const size_t target_idx = targetIndex(thread_id);
+        const int local_thread_id = localTargetThreadId(thread_id);
+        const auto& info = target_infos_[target_idx];
+        const size_t buffer_idx = local_thread_id % info->buffers.size();
+        const uint64_t bytes =
+            checkedMul(block_size, batch_size, "target operation size");
+        const uint64_t relative_offset =
+            checkedMul(bytes, local_thread_id / info->buffers.size(),
+                       "target relative offset");
+        const auto& buffer = info->buffers[buffer_idx];
+        if (XferBenchConfig::target_range_size != 0 &&
+            !rangeContains(relative_offset, bytes,
+                           XferBenchConfig::target_range_size)) {
+            LOG(FATAL) << "Target range too small for thread " << thread_id;
+        }
+        if (XferBenchConfig::target_offset > buffer.length ||
+            !rangeContains(relative_offset, bytes,
+                           buffer.length - XferBenchConfig::target_offset)) {
+            LOG(FATAL) << "Target buffer too small for thread " << thread_id;
+        }
+        return checkedAdd(buffer.addr,
+                          checkedAdd(XferBenchConfig::target_offset,
+                                     relative_offset, "target address offset"),
+                          "target address");
+    }
+
+    double runSingleTransfer(uint64_t local_addr, uint64_t target_id,
+                             uint64_t target_addr, uint64_t block_size,
+                             uint64_t batch_size, OpCode opcode,
+                             uint64_t deadline_ns, IntentType intent_type);
 
    private:
     int allocateBuffers();
@@ -79,11 +110,30 @@ class TEBenchRunner : public BenchRunner {
 
     int runner(int thread_id);
 
+    // Stops the run from a worker thread; main then joins the workers and
+    // tears down normally. Workers must not call exit() (see BenchRunner).
+    void noteTransferFailed();
+
+    // Polls batch_id until it is terminal. A stop does not end the wait
+    // early: the transports may still be writing into the local buffers.
+    // Returns with status PENDING only if the batch did not finish within the
+    // drain timeout after the stop; the batch is then counted in
+    // abandoned_batches_.
+    mooncake::Status waitForBatch(BatchID batch_id,
+                                  mooncake::TransferStatus& status,
+                                  uint64_t& polls);
+
+    size_t targetIndex(int thread_id) const;
+
+    int localTargetThreadId(int thread_id) const;
+
    private:
     std::unique_ptr<mooncake::TransferEngine> engine_;
     std::vector<void*> pinned_buffer_list_;
-    SegmentID handle_;
-    std::shared_ptr<TransferMetadata::SegmentDesc> info_;
+    std::vector<char> shm_backed_;
+    std::vector<char> hugepage_backed_;
+    std::vector<SegmentID> target_handles_;
+    std::vector<std::shared_ptr<TransferMetadata::SegmentDesc>> target_infos_;
 
     std::vector<std::function<int(int)>> current_task_;
     std::vector<std::thread> threads_;
@@ -92,6 +142,9 @@ class TEBenchRunner : public BenchRunner {
     std::condition_variable cv_done_;
     int pending_ = 0;
     bool init_ok_ = true;
+    // Batches that may still be in flight (see waitForBatch); while non-zero
+    // freeBuffers() leaves the local buffers allocated.
+    std::atomic<uint64_t> abandoned_batches_{0};
 };
 
 }  // namespace tent

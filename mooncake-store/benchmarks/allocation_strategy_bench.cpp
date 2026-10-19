@@ -18,6 +18,7 @@
 #include "offset_allocator/offset_allocator.h"
 #include "allocator.h"
 #include "allocation_strategy.h"
+#include "local_ssd/manager.h"
 
 // --- gflags definitions ---
 DEFINE_int64(segment_capacity, 1024,
@@ -381,7 +382,8 @@ static double computeAverageUtilAll(const AllocatorManager& manager) {
     for (const auto& name : names) {
         const auto* allocators = manager.getAllocators(name);
         if (!allocators || allocators->empty()) continue;
-        for (const auto& alloc : *allocators) {
+        for (const auto& registration : *allocators) {
+            const auto alloc = registration->GetAllocator();
             double cap = static_cast<double>(alloc->capacity());
             if (cap == 0) continue;
             sum += static_cast<double>(alloc->size()) / cap;
@@ -396,8 +398,8 @@ static size_t computeTotalCapacity(const AllocatorManager& manager) {
     for (const auto& name : manager.getNames()) {
         const auto* allocs = manager.getAllocators(name);
         if (!allocs) continue;
-        for (const auto& alloc : *allocs) {
-            total += alloc->capacity();
+        for (const auto& registration : *allocs) {
+            total += registration->GetAllocator()->capacity();
         }
     }
     return total;
@@ -416,7 +418,8 @@ static double computeUtilizationStdDev(const AllocatorManager& manager) {
     for (const auto& name : names) {
         const auto* allocators = manager.getAllocators(name);
         if (!allocators || allocators->empty()) continue;
-        for (const auto& alloc : *allocators) {
+        for (const auto& registration : *allocators) {
+            const auto alloc = registration->GetAllocator();
             double cap = static_cast<double>(alloc->capacity());
             if (cap == 0) continue;
             double used = static_cast<double>(alloc->size());
@@ -507,9 +510,10 @@ static FragmentationSnapshot computeFragmentationSnapshot(
         const auto* allocs = manager.getAllocators(name);
         if (!allocs) continue;
 
-        for (const auto& alloc : *allocs) {
+        for (const auto& registration : *allocs) {
             auto offset_alloc =
-                std::dynamic_pointer_cast<OffsetBufferAllocator>(alloc);
+                std::dynamic_pointer_cast<OffsetBufferAllocator>(
+                    registration->GetAllocator());
             if (!offset_alloc) continue;
 
             auto allocator = offset_alloc->getOffsetAllocator();
@@ -669,7 +673,8 @@ static void computeLatencyStats(std::vector<double>& latencies, double total_us,
 static FillUpResult runFillUpBenchmark(const BenchConfig& cfg) {
     AllocatorManager manager =
         createCluster(cfg.num_segments, cfg.segment_capacity, cfg.skewed);
-    auto strategy = CreateAllocationStrategy(cfg.strategy_type);
+    LocalSsdManager local_ssd;
+    auto strategy = CreateAllocationStrategy(cfg.strategy_type, local_ssd);
 
     std::vector<double> latencies;
     latencies.reserve(cfg.num_allocations);
@@ -788,7 +793,8 @@ static FillUpResult runFillUpBenchmark(const BenchConfig& cfg) {
 static ScaleOutResult runScaleOutBenchmark(const BenchConfig& cfg) {
     AllocatorManager manager =
         createCluster(cfg.num_segments, cfg.segment_capacity, cfg.skewed);
-    auto strategy = CreateAllocationStrategy(cfg.strategy_type);
+    LocalSsdManager local_ssd;
+    auto strategy = CreateAllocationStrategy(cfg.strategy_type, local_ssd);
 
     const double convergence_threshold = FLAGS_convergence_threshold;
 
@@ -1113,7 +1119,8 @@ static SizeClassPrefillStats prefillSizeClassChurn(
 static FillUpResult runDsaBenchmark(const BenchConfig& cfg) {
     AllocatorManager manager =
         createCluster(cfg.num_segments, cfg.segment_capacity, cfg.skewed);
-    auto strategy = CreateAllocationStrategy(cfg.strategy_type);
+    LocalSsdManager local_ssd;
+    auto strategy = CreateAllocationStrategy(cfg.strategy_type, local_ssd);
 
     const size_t total_capacity = computeTotalCapacity(manager);
     const size_t avg_obj_size =
@@ -1236,7 +1243,8 @@ static FillUpResult runDsaBenchmark(const BenchConfig& cfg) {
 static SizeClassChurnResult runSizeClassChurnBenchmark(const BenchConfig& cfg) {
     AllocatorManager manager =
         createCluster(cfg.num_segments, cfg.segment_capacity, cfg.skewed);
-    auto strategy = CreateAllocationStrategy(cfg.strategy_type);
+    LocalSsdManager local_ssd;
+    auto strategy = CreateAllocationStrategy(cfg.strategy_type, local_ssd);
     auto specs = getSizeClassSpecs(cfg.size_class_pattern);
 
     std::vector<SizeClassStat> per_class_stats;
