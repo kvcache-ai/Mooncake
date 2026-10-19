@@ -1251,8 +1251,7 @@ TEST_F(MasterServiceHATest, InPlaceUpsertKeepsObjectGeneration) {
     const std::string key = "generation_key";
     PutObjectOnSegment(service, mounted.client_id, key, "generation_segment");
     MasterServiceTestPeer peer(service);
-    const auto before =
-        peer.GetObjectGenerationForTesting(kDefaultTenant, key);
+    const auto before = peer.GetObjectGenerationForTesting(kDefaultTenant, key);
 
     std::this_thread::sleep_for(std::chrono::milliseconds(60));
     ReplicateConfig config;
@@ -1267,18 +1266,16 @@ TEST_F(MasterServiceHATest, NewInsertionGetsFreshObjectGeneration) {
     MasterService service(service_config);
     auto backend = std::make_shared<FakeBatchHaKvBackend>();
     InstallGatedWriter(service, backend);
-    auto mounted =
-        PrepareSimpleSegment(service, "generation_replace_segment");
+    auto mounted = PrepareSimpleSegment(service, "generation_replace_segment");
     const std::string key = "generation_replace_key";
     PutObjectOnSegment(service, mounted.client_id, key,
                        "generation_replace_segment");
     MasterServiceTestPeer peer(service);
-    const auto first =
-        peer.GetObjectGenerationForTesting(kDefaultTenant, key);
-    ASSERT_TRUE(service.Remove(key, kDefaultTenant, /*force=*/true).has_value());
-    for (int i = 0; i < 50 &&
-                    peer.GetObjectGenerationForTesting(kDefaultTenant, key) !=
-                        0;
+    const auto first = peer.GetObjectGenerationForTesting(kDefaultTenant, key);
+    ASSERT_TRUE(
+        service.Remove(key, kDefaultTenant, /*force=*/true).has_value());
+    for (int i = 0;
+         i < 50 && peer.GetObjectGenerationForTesting(kDefaultTenant, key) != 0;
          ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
@@ -6869,8 +6866,8 @@ TEST_F(MasterServiceHATest,
     MasterServiceTestPeer peer(service);
     const auto old_generation =
         peer.GetObjectGenerationForTesting(kDefaultTenant, key);
-    const auto old_deadline = LeaseDeadlineForTesting(
-        service, kDefaultTenant, key);
+    const auto old_deadline =
+        LeaseDeadlineForTesting(service, kDefaultTenant, key);
     ASSERT_GT(old_generation, 0u);
 
     peer.SetEvictionCensusHookForTesting([&] {
@@ -6883,14 +6880,12 @@ TEST_F(MasterServiceHATest,
                 return started.error();
             }
             auto ended = service.UpsertEnd(mounted.client_id, key,
-                                           kDefaultTenant,
-                                           ReplicaType::MEMORY);
+                                           kDefaultTenant, ReplicaType::MEMORY);
             return ended ? ErrorCode::OK : ended.error();
         });
         EXPECT_EQ(ErrorCode::OK, upsert.get());
-        SetLeaseDeadlineForTesting(
-            service, kDefaultTenant, key,
-            old_deadline + std::chrono::milliseconds(1));
+        SetLeaseDeadlineForTesting(service, kDefaultTenant, key,
+                                   old_deadline + std::chrono::milliseconds(1));
     });
 
     peer.RunBatchEvictForTesting(/*evict_ratio_target=*/1.0,
@@ -7055,8 +7050,7 @@ TEST_F(MasterServiceHATest, BatchEvictGroupPausesWhenWriterRetriesAfterCensus) {
     CheckEvictionRetryRecovery(false, true, true);
 }
 
-TEST_F(MasterServiceHATest,
-       BatchEvictTerminalWriterSettlesPausedEpisodeOnce) {
+TEST_F(MasterServiceHATest, BatchEvictTerminalWriterSettlesPausedEpisodeOnce) {
     const std::string cluster_id = "test_batch_evict_terminal_episode";
     auto backend = std::make_shared<FailingBatchHaKvBackend>();
     auto service_config = MasterServiceConfig::builder()
@@ -7154,13 +7148,13 @@ TEST_F(MasterServiceHATest,
     SetLeaseDeadlineForTesting(service, kDefaultTenant, key,
                                now - std::chrono::seconds(1));
     MasterServiceTestPeer peer(service);
-    const auto shard_idx = peer.GetMetadataShardIndexForTesting(
-        kDefaultTenant, key);
+    const auto shard_idx =
+        peer.GetMetadataShardIndexForTesting(kDefaultTenant, key);
     // A non-soft-pinned object remains eligible in the soft-pin pass even
     // when its deadline is newer than the cutoff selected from soft-pinned
     // objects.
-    peer.PrepareSoftPinSecondPassForTesting(
-        shard_idx, now - std::chrono::seconds(2));
+    peer.PrepareSoftPinSecondPassForTesting(shard_idx,
+                                            now - std::chrono::seconds(2));
 
     peer.RunBatchEvictForTesting(/*evict_ratio_target=*/0.0,
                                  /*evict_ratio_lowerbound=*/0.0);
@@ -7241,8 +7235,7 @@ TEST_F(MasterServiceHATest,
     EXPECT_EQ(OpType::REMOVE, batch.entries.front().op_type);
     EXPECT_EQ(candidate_key, batch.entries.front().object_key);
     ASSERT_TRUE(writer->RunCallbacksThrough(batch.last_seq));
-    EXPECT_EQ(1u,
-              ReplicaCountForTesting(service, kDefaultTenant, cutoff_key));
+    EXPECT_EQ(1u, ReplicaCountForTesting(service, kDefaultTenant, cutoff_key));
     EXPECT_EQ(0u,
               ReplicaCountForTesting(service, kDefaultTenant, candidate_key));
 }
@@ -7288,10 +7281,10 @@ TEST_F(MasterServiceHATest,
             shard_indices.end()) {
             continue;
         }
-        ASSERT_TRUE(service
-                        .PutStart(mounted.client_id, key, kDefaultTenant, 1024,
-                                  config)
-                        .has_value());
+        ASSERT_TRUE(
+            service
+                .PutStart(mounted.client_id, key, kDefaultTenant, 1024, config)
+                .has_value());
         ASSERT_TRUE(service
                         .PutEnd(mounted.client_id, key, kDefaultTenant,
                                 ReplicaType::MEMORY)
@@ -7340,9 +7333,9 @@ TEST_F(MasterServiceHATest,
                                  /*evict_ratio_lowerbound=*/0.5);
     EXPECT_FALSE(peer.HasEvictionContinuationForTesting());
     EXPECT_EQ(census_before + 1, peer.GetEvictionCensusRunsForTesting());
-    EXPECT_EQ(pauses_before + 2,
-              MasterMetricManager::instance()
-                  .get_eviction_backpressure_pauses());
+    EXPECT_EQ(
+        pauses_before + 2,
+        MasterMetricManager::instance().get_eviction_backpressure_pauses());
     ReadBatchEventually(storage, 4, batch);
     ASSERT_EQ(1u, batch.entries.size());
     EXPECT_EQ(OpType::REMOVE, batch.entries.front().op_type);
@@ -7350,8 +7343,7 @@ TEST_F(MasterServiceHATest,
     ASSERT_TRUE(writer->RunCallbacksThrough(batch.last_seq));
 }
 
-TEST_F(MasterServiceHATest,
-       BatchEvictGroupResumesAtFirstUnsubmittedMember) {
+TEST_F(MasterServiceHATest, BatchEvictGroupResumesAtFirstUnsubmittedMember) {
     const std::string cluster_id = "test_batch_evict_group_member_cursor";
     auto backend = std::make_shared<BlockingBatchHaKvBackend>();
     auto service_config = MasterServiceConfig::builder()
@@ -7389,10 +7381,10 @@ TEST_F(MasterServiceHATest,
         config.replica_num = 1;
         config.preferred_segments = {"group_member_cursor_segment"};
         config.group_ids = std::vector<std::string>{group_id};
-        ASSERT_TRUE(service
-                        .PutStart(mounted.client_id, key, kDefaultTenant, 1024,
-                                  config)
-                        .has_value());
+        ASSERT_TRUE(
+            service
+                .PutStart(mounted.client_id, key, kDefaultTenant, 1024, config)
+                .has_value());
         ASSERT_TRUE(service
                         .PutEnd(mounted.client_id, key, kDefaultTenant,
                                 ReplicaType::MEMORY)
@@ -7442,8 +7434,7 @@ TEST_F(MasterServiceHATest,
     }
 }
 
-TEST_F(MasterServiceHATest,
-       BatchEvictResumeRevalidatesConcurrentUpsert) {
+TEST_F(MasterServiceHATest, BatchEvictResumeRevalidatesConcurrentUpsert) {
     const std::string cluster_id = "test_batch_evict_resume_upsert";
     auto backend = std::make_shared<FakeBatchHaKvBackend>();
     auto service_config = MasterServiceConfig::builder()
@@ -7495,8 +7486,7 @@ TEST_F(MasterServiceHATest,
             upsert_started.set_value(ErrorCode::OK);
             finish_upsert_end_signal.wait();
             auto ended = service.UpsertEnd(mounted.client_id, key,
-                                           kDefaultTenant,
-                                           ReplicaType::MEMORY);
+                                           kDefaultTenant, ReplicaType::MEMORY);
             return ended ? ErrorCode::OK : ended.error();
         });
         EXPECT_EQ(std::future_status::ready,
@@ -7538,7 +7528,8 @@ TEST_F(MasterServiceHATest, BatchEvictRestoreClearsContinuation) {
                               .build();
     MasterService service(service_config);
     auto* writer = InstallGatedWriter(service, backend);
-    auto mounted = PrepareSimpleSegment(service, "restore_continuation_segment");
+    auto mounted =
+        PrepareSimpleSegment(service, "restore_continuation_segment");
     OpLogBatchStorage storage(cluster_id, *backend);
     OpLogBatchRecord batch;
     ReadBatchEventually(storage, 1, batch);
@@ -7575,11 +7566,13 @@ TEST_F(MasterServiceHATest, BatchEvictShutdownJoinsWithPausedContinuation) {
     {
         MasterService service(service_config);
         auto* writer = InstallGatedWriter(service, backend);
-        auto mounted = PrepareSimpleSegment(service, "shutdown_continuation_segment");
+        auto mounted =
+            PrepareSimpleSegment(service, "shutdown_continuation_segment");
         OpLogBatchStorage storage(cluster_id, *backend);
         OpLogBatchRecord batch;
         ReadBatchEventually(storage, 1, batch);
-        PutObjectOnSegment(service, mounted.client_id, "shutdown_continuation_key",
+        PutObjectOnSegment(service, mounted.client_id,
+                           "shutdown_continuation_key",
                            "shutdown_continuation_segment");
         ReadBatchEventually(storage, 2, batch);
         std::this_thread::sleep_for(std::chrono::milliseconds(60));

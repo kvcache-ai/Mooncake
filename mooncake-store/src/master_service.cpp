@@ -622,7 +622,7 @@ void MasterService::SetBatchOpLogTerminalCallback(
             [this, callback = std::move(callback)](
                 const OrderedOpLogWriterTerminalState& state) mutable {
                 eviction_abort_requested_.store(true,
-                                                 std::memory_order_relaxed);
+                                                std::memory_order_relaxed);
                 eviction_writer_replacement_required_.store(
                     true, std::memory_order_relaxed);
                 if (callback) {
@@ -635,7 +635,7 @@ void MasterService::SetBatchOpLogTerminalCallback(
 void MasterService::StopBatchOpLogWriter() {
     eviction_abort_requested_.store(true, std::memory_order_relaxed);
     eviction_writer_replacement_required_.store(true,
-                                               std::memory_order_relaxed);
+                                                std::memory_order_relaxed);
     if (ordered_oplog_writer_) ordered_oplog_writer_->Stop();
 }
 
@@ -11211,12 +11211,11 @@ bool MasterService::ResumeEvictionContinuation() {
         }
 
         std::vector<ReplicaID> removed_ids;
-        metadata.VisitReplicas(
-            is_evictable_memory_replica,
-            [&removed_ids](Replica& replica) {
-                removed_ids.push_back(replica.id());
-                replica.mark_removed();
-            });
+        metadata.VisitReplicas(is_evictable_memory_replica,
+                               [&removed_ids](Replica& replica) {
+                                   removed_ids.push_back(replica.id());
+                                   replica.mark_removed();
+                               });
         tl::expected<OpLogEntry, ErrorCode> persist_result;
         auto finalize = [this, removed_ids](const OpLogEntry& entry) {
             FinalizeRemovedReplicasAfterDurable(entry, removed_ids,
@@ -11242,8 +11241,8 @@ bool MasterService::ResumeEvictionContinuation() {
                     replica->cancel_remove();
                 }
             }
-            result.paused = result.error ==
-                            ErrorCode::TASK_PENDING_LIMIT_EXCEEDED;
+            result.paused =
+                result.error == ErrorCode::TASK_PENDING_LIMIT_EXCEEDED;
             return result;
         }
         result.freed_bytes = metadata.TotalLength() * removed_ids.size();
@@ -11251,8 +11250,9 @@ bool MasterService::ResumeEvictionContinuation() {
         return result;
     };
 
-    auto process_candidate = [&](const EvictionCandidate& candidate,
-                                 bool candidate_allows_soft_pin) -> ResumeResult {
+    auto process_candidate =
+        [&](const EvictionCandidate& candidate,
+            bool candidate_allows_soft_pin) -> ResumeResult {
         ResumeResult result;
         auto now = std::chrono::system_clock::now();
         const auto cutoff =
@@ -11314,7 +11314,8 @@ bool MasterService::ResumeEvictionContinuation() {
                 auto member_result =
                     persist_one(candidate.tenant_id, member.GetKey(), member.Get());
                 result.paused = member_result.paused;
-                if (member_result.paused || member_result.error != ErrorCode::OK) {
+                if (member_result.paused ||
+                    member_result.error != ErrorCode::OK) {
                     return {.stop_scan = true, .error = member_result.error};
                 }
                 return {.freed_bytes = member_result.freed_bytes,
@@ -11419,9 +11420,9 @@ bool MasterService::ResumeEvictionContinuation() {
         continuation.freed_bytes += result.freed_bytes;
         continuation.evicted_shards |= result.evicted_shards;
         if (second_pass) {
-            continuation.second_pass.remaining_target = std::max<long>(
-                0, continuation.second_pass.remaining_target -
-                       result.evicted_objects);
+            continuation.second_pass.remaining_target =
+                std::max<long>(0, continuation.second_pass.remaining_target -
+                                      result.evicted_objects);
         }
         if (!second_pass && result.evicted_objects > 0) {
             continuation.primary_submissions.emplace_back(
@@ -11444,8 +11445,9 @@ bool MasterService::ResumeEvictionContinuation() {
                    continuation.primary_candidates.size() &&
                (continuation.evicted_count < continuation.primary_target ||
                 continuation.group_progress.has_value())) {
-            const auto candidate = continuation.primary_candidates
-                [continuation.next_primary_candidate];
+            const auto candidate =
+                continuation
+                    .primary_candidates[continuation.next_primary_candidate];
             auto result = process_candidate(candidate, false);
             record_eviction_result(candidate, result, false);
             if (result.paused) {
@@ -11544,10 +11546,10 @@ void MasterService::BatchEvict(double evict_ratio_target,
         bool record_episode_result = false;
         if (eviction_writer_replacement_required_.load(
                 std::memory_order_relaxed)) {
-            const auto terminal_state = ordered_oplog_writer_
-                                            ? ordered_oplog_writer_
-                                                  ->GetTerminalState()
-                                            : std::nullopt;
+            const auto terminal_state =
+                ordered_oplog_writer_
+                    ? ordered_oplog_writer_->GetTerminalState()
+                    : std::nullopt;
             reason = terminal_state
                          ? EvictionContinuationDropReason::kWriterTerminal
                          : EvictionContinuationDropReason::kWriterStopped;
@@ -11916,9 +11918,9 @@ void MasterService::BatchEvict(double evict_ratio_target,
             }
             progress = &*progress_slot;
         }
-        GroupEvictionResult group_result = EvictGroupOrObject(
-            tenant_id, key, group_id, allow_soft_pinned, now, evict_one_member,
-            progress, cutoff);
+        GroupEvictionResult group_result =
+            EvictGroupOrObject(tenant_id, key, group_id, allow_soft_pinned, now,
+                               evict_one_member, progress, cutoff);
         EvictionResult result{.freed_bytes = group_result.freed_bytes,
                               .evicted_objects = group_result.evicted_objects,
                               .evicted_shards = group_result.evicted_shards,
@@ -12415,8 +12417,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
                                     continue;
                                 }
                                 batch_candidates.push_back(EvictionCandidate{
-                                    tenant_id, key, metadata.group_id, shard_idx,
-                                    deadline, record.generation});
+                                    tenant_id, key, metadata.group_id,
+                                    shard_idx, deadline, record.generation});
                             }
                         }
                     }
@@ -12525,10 +12527,10 @@ void MasterService::BatchEvict(double evict_ratio_target,
                                 if (!IsSoftPinActive(metadata, now) ||
                                     deadline <= soft_target_timeout) {
                                     batch_candidates.push_back(
-                                        EvictionCandidate{
-                                            tenant_id, key, metadata.group_id,
-                                            shard_idx, deadline,
-                                            record.generation});
+                                        EvictionCandidate{tenant_id, key,
+                                                          metadata.group_id,
+                                                          shard_idx, deadline,
+                                                          record.generation});
                                 }
                             }
                         }
@@ -14528,8 +14530,8 @@ ErrorCode MasterService::InitializeBatchOpLogWriter(
         ClearEvictionContinuation(
             EvictionContinuationDropReason::kWriterStopped,
             /*record_episode_result=*/true);
-        eviction_writer_replacement_required_.store(
-            true, std::memory_order_relaxed);
+        eviction_writer_replacement_required_.store(true,
+                                                    std::memory_order_relaxed);
         eviction_abort_requested_.store(true, std::memory_order_relaxed);
         ordered_oplog_writer_->Stop();
     }
@@ -14543,7 +14545,7 @@ ErrorCode MasterService::InitializeBatchOpLogWriter(
     // continuation while the new writer is being published.
     eviction_abort_requested_.store(false, std::memory_order_relaxed);
     eviction_writer_replacement_required_.store(false,
-                                               std::memory_order_relaxed);
+                                                std::memory_order_relaxed);
     return ErrorCode::OK;
 }
 

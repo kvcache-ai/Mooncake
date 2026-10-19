@@ -66,8 +66,8 @@ void MasterServiceTestPeer::PrepareSoftPinSecondPassForTesting(
     service_.eviction_continuation_ = std::move(continuation);
 }
 
-void MasterServiceTestPeer::DisableSoftPinForTesting(
-    const TenantId& tenant_id, const std::string& key) {
+void MasterServiceTestPeer::DisableSoftPinForTesting(const TenantId& tenant_id,
+                                                     const std::string& key) {
     MetadataAccessorRW accessor(&service_, ObjectIdentity{tenant_id, key});
     if (!accessor.Exists()) {
         return;
@@ -153,8 +153,7 @@ MasterServiceTestPeer::GetEvictionSecondPassPendingCursorForTesting() const {
     if (!service_.eviction_continuation_) {
         return {0, 0};
     }
-    const auto& second_pass =
-        service_.eviction_continuation_->second_pass;
+    const auto& second_pass = service_.eviction_continuation_->second_pass;
     return {second_pass.pending_candidates.size(), second_pass.next_pending};
 }
 
@@ -166,8 +165,7 @@ MasterServiceTestPeer::GetEvictionGroupMemberCursorForTesting() const {
         !service_.eviction_continuation_->group_progress) {
         return {0, 0};
     }
-    const auto& progress =
-        *service_.eviction_continuation_->group_progress;
+    const auto& progress = *service_.eviction_continuation_->group_progress;
     return {progress.members.size(), progress.next_member};
 }
 

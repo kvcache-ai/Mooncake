@@ -63,8 +63,7 @@ class MasterServiceTestPeer {
     void SetEvictionCensusHookForTesting(std::function<void()> hook);
 
     void PrepareSoftPinSecondPassForTesting(
-        size_t shard_idx,
-        std::chrono::system_clock::time_point cutoff);
+        size_t shard_idx, std::chrono::system_clock::time_point cutoff);
 
     void DisableSoftPinForTesting(const TenantId& tenant_id,
                                   const std::string& key);
@@ -82,8 +81,8 @@ class MasterServiceTestPeer {
 
     std::string GetEvictionContinuationPhaseForTesting() const;
 
-    std::pair<size_t, size_t>
-    GetEvictionSecondPassPendingCursorForTesting() const;
+    std::pair<size_t, size_t> GetEvictionSecondPassPendingCursorForTesting()
+        const;
 
     std::pair<size_t, size_t> GetEvictionGroupMemberCursorForTesting() const;
 

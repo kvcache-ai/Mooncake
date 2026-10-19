@@ -1190,8 +1190,7 @@ class MasterService {
         // references and are safe to keep across ticks.
         std::vector<std::chrono::system_clock::time_point>
             no_soft_pin_deadlines;
-        std::vector<std::chrono::system_clock::time_point>
-            soft_pin_deadlines;
+        std::vector<std::chrono::system_clock::time_point> soft_pin_deadlines;
 
         // Append once per primary result, including partially submitted groups.
         // Compact the census only if the lower-bound second pass is needed.
