@@ -21,6 +21,9 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <async_simple/coro/SyncAwait.h>
+
+#include <atomic>
 #include <chrono>
 #include <memory>
 #include <stdexcept>
@@ -185,6 +188,44 @@ TEST(RpcTimeoutPoolTest, AStalePooledConnectionIsNotUnreachable) {
     EXPECT_EQ(response, "fresh");
 }
 
+// The first attempt times out and the retry is answered: only the last attempt
+// may mark the peer. ylt deals connections to its two io threads in turn, so
+// the retry's fresh one is not stuck behind the sleeping handler.
+TEST(RpcTimeoutPoolTest, RetryOnceWithOptionsDoesNotFlagAnAnsweringPeer) {
+    std::atomic<int> calls{0};
+    CoroRpcAgent server;
+    ASSERT_TRUE(server
+                    .registerFunction(kSlowFunc,
+                                      [&calls](const std::string_view& request,
+                                               std::string& response) {
+                                          if (calls++ == 0)
+                                              std::this_thread::sleep_for(
+                                                  kHandlerDelay);
+                                          response = std::string(request);
+                                      })
+                    .ok());
+    registerEcho(server);
+    uint16_t port = 0;
+    ASSERT_TRUE(server.start(port, false, 2).ok());
+    const std::string addr = "127.0.0.1:" + std::to_string(port);
+
+    CoroRpcAgent client;
+    std::string response;
+    ASSERT_TRUE(client.call(addr, kEchoFunc, "warm", response).ok());
+
+    bool unreachable = false;
+    const auto started = Clock::now();
+    auto [status, echoed] = async_simple::coro::syncAwait(client.callCoroutine(
+        addr, kSlowFunc, "retry", /*retry_rpc_error_once=*/true,
+        flagging(&unreachable, 300ms)));
+    const auto took = Clock::now() - started;
+    EXPECT_TRUE(status.ok()) << status.ToString();
+    EXPECT_EQ(echoed, "retry");
+    EXPECT_EQ(calls.load(), 2);
+    EXPECT_LT(took, 1200ms);
+    EXPECT_FALSE(unreachable);
+}
+
 // A full accept queue drops SYNs; the connect timeout bounds the dial.
 TEST(RpcTimeoutPoolTest, PerCallConnectTimeoutBoundsAnUnansweredDial) {
     uint16_t port = 0;
@@ -220,6 +261,55 @@ TEST(RpcTimeoutPoolTest, PerCallConnectTimeoutBoundsAnUnansweredDial) {
 
     for (int fd : fillers) close(fd);
     close(listener);
+}
+
+// The first dial times out on a full accept queue while a real server takes
+// over the port, so the retry is answered: a dial that timed out on an earlier
+// attempt must not leave the peer marked.
+TEST(RpcTimeoutPoolTest, RetryOnceAfterAConnectTimeoutDoesNotFlagThePeer) {
+    uint16_t port = 0;
+    const int listener = listenLoopback(&port, 0);
+    ASSERT_GE(listener, 0);
+    sockaddr_in bind_addr{};
+    bind_addr.sin_family = AF_INET;
+    bind_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    bind_addr.sin_port = htons(port);
+
+    std::vector<int> fillers;
+    for (int i = 0; i < 8; ++i) {
+        const int fd = socket(AF_INET, SOCK_STREAM, 0);
+        ASSERT_GE(fd, 0);
+        fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+        (void)connect(fd, reinterpret_cast<sockaddr*>(&bind_addr),
+                      sizeof(bind_addr));
+        fillers.push_back(fd);
+    }
+    std::this_thread::sleep_for(100ms);
+
+    CoroRpcAgent server;
+    registerEcho(server);
+    uint16_t same_port = port;
+    bool started = false;
+    std::thread swapper([&] {
+        std::this_thread::sleep_for(100ms);
+        for (int fd : fillers) close(fd);
+        close(listener);
+        started = server.start(same_port).ok();
+    });
+    CoroRpcAgent client;
+    bool unreachable = false;
+    const auto begin = Clock::now();
+    auto [status, echoed] = async_simple::coro::syncAwait(client.callCoroutine(
+        "127.0.0.1:" + std::to_string(port), kEchoFunc, "late",
+        /*retry_rpc_error_once=*/true, flagging(&unreachable, 500ms)));
+    const auto took = Clock::now() - begin;
+    swapper.join();
+    ASSERT_TRUE(started);
+    ASSERT_EQ(same_port, port) << "port drifted";
+    EXPECT_GE(took, 450ms) << "the first dial did not time out";
+    EXPECT_TRUE(status.ok()) << status.ToString();
+    EXPECT_EQ(echoed, "late");
+    EXPECT_FALSE(unreachable);
 }
 
 TEST(RpcTimeoutPoolTest, AFreshConnectionClosedWithoutAnswerIsUnreachable) {
