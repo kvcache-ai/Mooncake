@@ -202,6 +202,6 @@ What this feature is not:
 ## 9. Related Docs
 
 - [Python Guide](../../api-reference/python/store-rs.md)
-- [Features](../../getting_started/store-rs-features.md)
+- [Features](../../design/store/store-rs/features.md)
 - [Configuration Reference](configuration.md)
 - [Architecture](../../design/store/store-rs/architecture.md)

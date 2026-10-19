@@ -81,6 +81,69 @@ with older SPDK versions, but then logs a CMake warning, and pure-NoF writes
 over RDMA from unregistered user buffers fail at runtime with
 "No translation" errors.
 
+(build-with-store-rs)=
+### Build with Store-RS
+
+Store-RS is an optional Rust-native Mooncake Store. The default CMake build
+leaves it disabled, and the Python Store facade uses the C++ backend. Enable
+it when building a root wheel that should include the Rust backend and its standalone commands.
+
+The build needs a root checkout with submodules, CMake, a C++ toolchain, Rust
+(`cargo` on `PATH`), and Python 3.10 or newer. A multi-client runtime also
+needs Redis or etcd.
+
+```bash
+export MOONCAKE_ROOT_DIR="$PWD"
+export MOONCAKE_STORE_RS_DIR="$MOONCAKE_ROOT_DIR/mooncake-store-rs"
+export MOONCAKE_BUILD_DIR="$MOONCAKE_ROOT_DIR/build/store-rs"
+export MOONCAKE_PYTHON_BIN="$(command -v python3)"
+
+cmake -S "$MOONCAKE_ROOT_DIR" -B "$MOONCAKE_BUILD_DIR" \
+  -DPython3_EXECUTABLE="$MOONCAKE_PYTHON_BIN" \
+  -DWITH_STORE=ON \
+  -DWITH_STORE_RUST=OFF \
+  -DWITH_STORE_RS=ON \
+  -DWITH_TE=ON \
+  -DUSE_TENT=ON \
+  -DBUILD_SHARED_LIBS=ON \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build "$MOONCAKE_BUILD_DIR" --target build_store_rs --parallel
+```
+
+This out-of-tree build provides the native artifacts and standalone binaries. For a Python wheel only, skip the separate CMake build command; the wheel builder configures and builds its own CMake tree.
+
+The root wheel owns the mooncake Python package. Build and install one wheel,
+then select its Store backend before importing mooncake.store:
+
+| Setting | Backend |
+|---------|---------|
+| Unset or cpp | C++ Store |
+| rs | Store-RS, included by WITH_STORE_RS=ON |
+
+The facade reads MOONCAKE_STORE_BACKEND when mooncake.store is first imported.
+Use exactly cpp or rs. The setting does not change the standalone command
+names.
+
+```bash
+MOONCAKE_STORE_BACKEND=rs .venv-store-rs/bin/python -c \
+  "from mooncake.store import MooncakeDistributedStore; print(MooncakeDistributedStore)"
+
+.venv-store-rs/bin/mooncake-store-rs-client --help
+.venv-store-rs/bin/mooncake-store-rs-admin --help
+.venv-store-rs/bin/mooncake-store-rs-bench --help
+```
+
+For workspace unit tests and installed-package smoke coverage, run
+`scripts/ci/run_store_rs_smoke.sh` after installing the CMake `python`
+component. The [Store-RS validation guide](../deployment/store-rs/testing.md#local-validation)
+lists the required CMake paths and the direct commands for heavier scenarios.
+
+Configuration, validation, and API details are in the
+[Store-RS deployment guides](../deployment/store-rs/index.md), the
+[Rust API](../api-reference/rust/store-rs.md), the
+[Python API](../api-reference/python/store-rs.md), and the
+[Admin HTTP API](../api-reference/http/store-rs-admin.md).
+
 ### RISC-V Build
 
 Mooncake supports native 64-bit RISC-V Linux builds with `USE_RISCV` enabled.
@@ -307,6 +370,7 @@ The following options can be passed to `cmake ..`.
 | `-DWITH_P2P_STORE=ON/OFF` | `OFF` | Enable Golang support and build the P2P Store component. Requires Go 1.23+. |
 | `-DWITH_RUST_EXAMPLE=ON/OFF` | `OFF` | Build the Transfer Engine Rust library (`transfer_engine_rust`), tests, and sample benchmark. |
 | `-DWITH_STORE_RUST=ON/OFF` | `ON` | Build Mooncake Store Rust bindings and CMake Rust targets. |
+| `-DWITH_STORE_RS=ON/OFF` | `OFF` | Build the Rust-native Mooncake Store (Store-RS), its Python extension, and the standalone commands. Requires `-DWITH_TE=ON`, `-DUSE_TENT=ON`, and `cargo`. See {ref}`Build with Store-RS <build-with-store-rs>`. |
 | `-DWITH_EP=ON/OFF` | `OFF` | Build Mooncake EP and the native Mooncake PG core/device libraries. The Torch-facing PG adapter is compiled by the installed package at first `import mooncake.pg`. |
 
 ### Build Behavior Options

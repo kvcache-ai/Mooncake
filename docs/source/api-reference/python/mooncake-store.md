@@ -30,7 +30,7 @@ imported and accepts cpp or rs.
 This page describes the shared facade and the default C++ backend. See the
 [Store-RS Python API](store-rs.md) for backend-specific runtime behavior, API
 coverage, and compatibility notes. The
-[source-checkout quickstart](../../getting_started/store-rs.md) shows how to
+{ref}`Build with Store-RS <build-with-store-rs>` section shows how to
 build the root wheel with Store-RS enabled.
 
 ## Quick Start
