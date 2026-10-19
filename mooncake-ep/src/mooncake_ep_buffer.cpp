@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <sstream>
+#include <stdexcept>
 #include <transfer_engine.h>
 
 namespace mooncake {
@@ -65,6 +66,21 @@ constexpr int kTopkShadowSlots = 8;
 constexpr size_t kTopkShadowBytes = static_cast<size_t>(kTopkShadowMaxTokens) *
                                     kTopkShadowMaxTopk * sizeof(int64_t);
 
+int validate_rank(int rank, int num_ranks) {
+    if (num_ranks <= 0 || num_ranks > MAX_QP_COUNT || rank < 0 ||
+        rank >= num_ranks) {
+        throw std::invalid_argument("invalid EP rank or world size");
+    }
+    return rank;
+}
+
+int64_t validate_buffer_size(int64_t num_ep_buffer_bytes) {
+    if (num_ep_buffer_bytes <= 0) {
+        throw std::invalid_argument("EP buffer size must be positive");
+    }
+    return num_ep_buffer_bytes;
+}
+
 int64_t* topk_shadow(void* workspace, int shadow_slot, int num_experts) {
     auto* base = reinterpret_cast<uint8_t*>(workspace) +
                  2 * static_cast<size_t>(num_experts) * sizeof(int);
@@ -77,16 +93,21 @@ int64_t* topk_shadow(void* workspace, int shadow_slot, int num_experts) {
 // create QPs.  Returns true on success, false if IBGDA is unavailable.
 static bool initRdmaTransport(device::RdmaTransport* t, void* gdr_buffer,
                               int64_t num_ep_buffer_bytes, int num_ranks,
-                              int use_qp_count, void* stream) {
+                              int use_qp_count, void* stream,
+                              device::RdmaMemoryRegion& memory_region) {
     int ret = t->initialize("", num_ranks, use_qp_count);
     if (ret == 0) {
-        ret = t->registerMemory(gdr_buffer, num_ep_buffer_bytes);
+        ret = t->registerMemory(gdr_buffer, num_ep_buffer_bytes, memory_region);
     }
     if (ret == 0) {
         ret = t->allocateControlBuffer();
     }
     if (ret == 0) {
         ret = t->createQueuePairs(stream);
+    }
+    if (ret != 0 && memory_region.addr) {
+        t->unregisterMemory(memory_region);
+        memory_region = {};
     }
     return ret == 0;
 }
@@ -102,9 +123,9 @@ static bool macaHostPhaseFenceCoversPeers() {
 MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
                                    int64_t num_ep_buffer_bytes,
                                    bool disable_p2p, TransferEngine* engine)
-    : rank(rank),
+    : rank(validate_rank(rank, num_ranks)),
       num_ranks(num_ranks),
-      num_ep_buffer_bytes(num_ep_buffer_bytes),
+      num_ep_buffer_bytes(validate_buffer_size(num_ep_buffer_bytes)),
       p2p_enabled_(!disable_p2p),
       comm_stream(create_comm_stream()) {
     USE_QP_COUNT = MAX_QP_COUNT / num_ranks * num_ranks;
@@ -156,7 +177,7 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
         if (rdma_transport_) {
             if (!initRdmaTransport(rdma_transport_, gdr_buffer,
                                    num_ep_buffer_bytes, num_ranks, USE_QP_COUNT,
-                                   comm_stream)) {
+                                   comm_stream, rdma_memory_region_)) {
                 rdma_transport_ = nullptr;
                 ibgda_disabled_ = true;
                 LOG(INFO) << "[EP] IBGDA unavailable, using P2P-only path";
@@ -178,7 +199,8 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
         }
         auto t = device::createIbgdaDeviceTransport(device_filter);
         if (initRdmaTransport(t.get(), gdr_buffer, num_ep_buffer_bytes,
-                              num_ranks, USE_QP_COUNT, comm_stream)) {
+                              num_ranks, USE_QP_COUNT, comm_stream,
+                              rdma_memory_region_)) {
             owned_rdma_transport_ = std::move(t);
             rdma_transport_ = owned_rdma_transport_.get();
         } else {
@@ -193,8 +215,14 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
 }
 
 MooncakeEpBuffer::~MooncakeEpBuffer() noexcept(false) {
-    // When EP owns the rdma transport, destructor handles QP/MR/ctrl_buf
-    // teardown. When engine owns it, just clear the pointer.
+    // When EP owns the rdma transport, its destructor handles QP/MR/control
+    // teardown. When the engine owns it, unregister this buffer's MR.
+    if (!owned_rdma_transport_ && rdma_transport_ && rdma_memory_region_.addr) {
+        const int ret = rdma_transport_->unregisterMemory(rdma_memory_region_);
+        if (ret != 0) {
+            LOG(ERROR) << "[EP] Failed to unregister the IBGDA memory region";
+        }
+    }
     owned_rdma_transport_.reset();
     rdma_transport_ = nullptr;
 
@@ -524,8 +552,9 @@ void MooncakeEpBuffer::sync_ibgda_peers(
     }
 
     int ret = rdma_transport_->connectPeers(
-        rank, rdma_transport_->isRoce(), remote_addrs, remote_keys, flat_qpns,
-        flat_lids, subnet_prefixes, interface_ids, active_ranks_mask);
+        rank, rdma_transport_->isRoce(), rdma_memory_region_.lkey, remote_addrs,
+        remote_keys, flat_qpns, flat_lids, subnet_prefixes, interface_ids,
+        active_ranks_mask);
     if (ret != 0) {
         ibgda_disabled_ = true;
         LOG(WARNING)
