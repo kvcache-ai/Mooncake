@@ -16,7 +16,9 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -219,6 +221,54 @@ TEST_F(MasterServiceTest, RestoreLifecycleWorkersPausedOnlyInRestoreWindows) {
         EXPECT_EQ(test_case.admitted, peer.AdmitsBusinessWorkersForTesting())
             << "state=" << static_cast<int>(test_case.state);
     }
+}
+
+TEST_F(MasterServiceTest, RestoreLifecycleOverlappingRestoreIsRefused) {
+    MasterService service(MakeStrictTenantConfig({"default"}));
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(service, "ep1");
+    const auto seg = MakeStandbySegment("seg", "ep1", 1ULL << 32);
+
+    // Large enough that the first restore is still inside its core when the
+    // second call arrives; the test does not depend on its exact duration,
+    // it waits for the Recovering state, which is published before the core
+    // starts.
+    std::vector<StandbyObjectEntry> entries;
+    entries.reserve(20000);
+    for (int i = 0; i < 20000; ++i) {
+        entries.push_back(
+            MakeStandbyEntry("key_" + std::to_string(i), 64,
+                             0x1000 + static_cast<uintptr_t>(i) * 64, "ep1"));
+    }
+
+    tl::expected<void, ErrorCode> first_result;
+    std::thread first([&] {
+        first_result = service.RestoreFromStandbySnapshot(entries, 0, {seg});
+    });
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (MasterServiceTestPeer::GetRestoreLifecycleState(service) !=
+               RestoreLifecycleState::kRecovering &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::yield();
+    }
+    ASSERT_EQ(RestoreLifecycleState::kRecovering,
+              MasterServiceTestPeer::GetRestoreLifecycleState(service))
+        << "the first restore finished before the test could overlap it";
+
+    // A second restore that overlaps the in-flight one is refused instead of
+    // running: it would otherwise be able to publish Ready while the first
+    // one is still rewriting metadata.
+    auto second = service.RestoreFromStandbySnapshot(entries, 0, {seg});
+    ASSERT_FALSE(second.has_value());
+    EXPECT_EQ(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS, second.error());
+
+    first.join();
+    ASSERT_TRUE(first_result.has_value());
+    EXPECT_EQ(RestoreLifecycleState::kReady,
+              MasterServiceTestPeer::GetRestoreLifecycleState(service));
+    EXPECT_TRUE(
+        MasterServiceTestPeer(service).AdmitsBusinessWorkersForTesting());
 }
 
 }  // namespace mooncake::test

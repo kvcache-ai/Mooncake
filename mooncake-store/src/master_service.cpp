@@ -3833,16 +3833,35 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
     // refused entry is Serving: the RFC's proposed no-cycles-out-of-
     // Serving constraint. master_state_mutex_ stays in place, so this
     // slice adds no locking behavior.
-    const RestoreLifecycleState entry_state =
+    //
+    // Admission is single-flight: the state transition into Recovering is
+    // the admission token, so a second restore that overlaps an in-flight
+    // one is refused instead of running. Without that, two overlapping
+    // callers could each publish their own outcome and the first one to
+    // finish would return the lifecycle to Ready while the other is still
+    // rewriting metadata. Overlapping restores are not a supported way to
+    // retry -- a retry starts after the previous attempt returned.
+    RestoreLifecycleState expected =
         lifecycle_state_.load(std::memory_order_acquire);
-    if (entry_state == RestoreLifecycleState::kServing) {
+    if (expected == RestoreLifecycleState::kServing) {
         LOG(ERROR) << "RestoreFromStandbyState: refusing restore of a "
                       "serving service (lifecycle state="
-                   << RestoreLifecycleStateToString(entry_state) << ")";
+                   << RestoreLifecycleStateToString(expected) << ")";
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
-    lifecycle_state_.store(RestoreLifecycleState::kRecovering,
-                           std::memory_order_release);
+    if (expected == RestoreLifecycleState::kRecovering) {
+        LOG(ERROR) << "RestoreFromStandbyState: refusing a second restore "
+                      "while one is already in flight";
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+    if (!lifecycle_state_.compare_exchange_strong(
+            expected, RestoreLifecycleState::kRecovering,
+            std::memory_order_acq_rel)) {
+        LOG(ERROR) << "RestoreFromStandbyState: lost the admission race "
+                      "(lifecycle state="
+                   << RestoreLifecycleStateToString(expected) << ")";
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
 
     auto result = RestoreFromStandbyStateCore(
         legacy_objects, metadata_store, initial_oplog_sequence_id, segments,
@@ -3884,6 +3903,14 @@ void MasterService::ActivateServing() {
 }
 
 bool MasterService::AdmitsBusinessWorkers() const {
+    // Admission is evaluated once per worker iteration, so it gates the
+    // start of business work, not work already in progress: a worker that
+    // passed this check before the restore window opened runs its current
+    // iteration to completion. In this slice that is safe because the
+    // restore core still holds master_state_mutex_ exclusively, which is
+    // what actually excludes in-flight business work. A slice that removes
+    // that lock from these paths must add an explicit quiesce step
+    // (drain or epoch) instead of relying on this predicate.
     switch (lifecycle_state_.load(std::memory_order_acquire)) {
         case RestoreLifecycleState::kRecovering:
         case RestoreLifecycleState::kFailed:
