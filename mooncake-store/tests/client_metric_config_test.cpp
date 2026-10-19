@@ -158,5 +158,16 @@ TEST_F(ClientMetricConfigTest, ZeroIntervalRemainsEnabled) {
               std::string::npos);
 }
 
+TEST(ClientMetricClusterIdTest, MergeLabelsUsesConfiguredClusterId) {
+    const char* cluster_id = std::getenv("MC_STORE_CLUSTER_ID");
+    if (cluster_id == nullptr || cluster_id[0] == '\0') {
+        GTEST_SKIP() << "MC_STORE_CLUSTER_ID is not configured";
+    }
+
+    const auto labels = merge_labels({{"operation", "test"}});
+    EXPECT_EQ(labels.at("cluster_id"), cluster_id);
+    EXPECT_EQ(labels.at("operation"), "test");
+}
+
 }  // namespace
 }  // namespace mooncake

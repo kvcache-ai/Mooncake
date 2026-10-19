@@ -354,7 +354,6 @@ int AscendDirectTransport::registerLocalMemory(void *addr, size_t length,
                                                const std::string &location,
                                                bool remote_accessible,
                                                bool update_metadata) {
-    (void)remote_accessible;
     aclrtContext saved_ctx = nullptr;
     if (aclrtGetCurrentContext(&saved_ctx) != ACL_ERROR_NONE) {
         LOG(ERROR) << "aclrtGetCurrentContext failed, errmsg: "
@@ -378,6 +377,16 @@ int AscendDirectTransport::registerLocalMemory(void *addr, size_t length,
     if (type_ret != 0) {
         return type_ret;
     }
+    if (use_fabric_mem_ && ascend_is_direct_vmm_memory(addr, length)) {
+        // Direct ACL VMM allocations bypass adxl::MallocMem and are not known
+        // to ADXL's allocation bookkeeping, so they must be registered as
+        // device memory. adxl::MallocMem allocations keep MEM_HOST: ADXL
+        // exports them through its own host-memory path. The gate is this TE's
+        // own fabric flag, not the process-wide allocation table: a co-located
+        // non-fabric TE has no fabric-enabled ADXL engine, so it must keep
+        // treating that memory as host.
+        mem_type = adxl::MEM_DEVICE;
+    }
 
     int ret = metadata_->addLocalMemoryBuffer(buffer_desc, update_metadata);
     if (ret) {
@@ -386,7 +395,8 @@ int AscendDirectTransport::registerLocalMemory(void *addr, size_t length,
     }
 
     const int register_ret = transfer_executor_->registerMem(
-        addr, length, mem_type, transfer_executor_->getUseBufferPool());
+        addr, length, mem_type, transfer_executor_->getUseBufferPool(),
+        remote_accessible);
     if (register_ret == 0) {
         return 0;
     }

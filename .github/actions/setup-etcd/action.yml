@@ -1,0 +1,8 @@
+name: Install and start the CI etcd service
+description: Install and start the CI etcd service
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: bash "$GITHUB_ACTION_PATH/run.sh"

@@ -66,6 +66,9 @@ IbvLoader::IbvLoader() {
     ok &= LoadSymbol(handle_, "ibv_close_device", symbols_.ibv_close_device);
     ok &= LoadSymbol(handle_, "ibv_query_device", symbols_.ibv_query_device);
     ok &= LoadSymbol(handle_, "ibv_query_gid", symbols_.ibv_query_gid);
+    // ibv_query_gid_ex() is a header inline over this entry point, which the
+    // binary already links, so requiring it here loses no host.
+    ok &= LoadSymbol(handle_, "_ibv_query_gid_ex", symbols_.ibv_query_gid_ex);
     ok &=
         LoadSymbol(handle_, "ibv_query_port", symbols_.ibv_query_port_default);
     LoadOptionalSymbol(handle_, "ibv_query_port_speed",

@@ -44,8 +44,16 @@ class MultiTransportTestPeer {
    public:
     static Status selectTransport(MultiTransport& multi,
                                   const Transport::TransferRequest& entry,
-                                  Transport*& transport) {
-        return multi.selectTransport(entry, transport);
+                                  Transport*& transport,
+                                  bool* allows_reuse = nullptr) {
+        return multi.selectTransport(entry, transport, allows_reuse);
+    }
+
+    static Status selectTransports(
+        MultiTransport& multi,
+        const std::vector<Transport::TransferRequest>& entries,
+        std::vector<Transport*>& transports) {
+        return multi.selectTransports(entries, transports);
     }
 };
 
@@ -970,11 +978,12 @@ class ShmRoutingTest : public ::testing::Test {
 
     void AddBuffer(TransferMetadata::SegmentDesc& desc,
                    const std::string& shm_name,
-                   const std::string& buffer_protocol) {
+                   const std::string& buffer_protocol,
+                   uint64_t addr = kRemoteAddr, uint64_t length = 4096) {
         TransferMetadata::BufferDesc buffer;
         buffer.name = "cpu:0";
-        buffer.addr = kRemoteAddr;
-        buffer.length = 4096;
+        buffer.addr = addr;
+        buffer.length = length;
         buffer.shm_name = shm_name;
 #ifdef ENABLE_MULTI_PROTOCOL
         buffer.protocol = buffer_protocol;
@@ -998,12 +1007,13 @@ class ShmRoutingTest : public ::testing::Test {
         return id;
     }
 
-    Transport::TransferRequest MakeWrite(Transport::SegmentID id) const {
+    Transport::TransferRequest MakeWrite(
+        Transport::SegmentID id, uint64_t target_offset = kRemoteAddr) const {
         Transport::TransferRequest request;
         request.opcode = Transport::TransferRequest::WRITE;
         request.source = nullptr;
         request.target_id = id;
-        request.target_offset = kRemoteAddr;
+        request.target_offset = target_offset;
         request.length = 64;
         return request;
     }
@@ -1097,6 +1107,107 @@ TEST_F(ShmRoutingTest, HipBufferDoesNotSelectShm) {
         MultiTransportTestPeer::selectTransport(*multi_, request, transport);
     EXPECT_TRUE(status.IsNotSupportedTransport()) << status.ToString();
     EXPECT_NE(transport, shm_);
+}
+#endif
+
+TEST_F(ShmRoutingTest, HomogeneousProtocolAllowsReuse) {
+    auto id = AddPeer("127.0.0.1:19001", "mooncake_1_abcdefgh");
+    auto request = MakeWrite(id);
+    Transport* transport = nullptr;
+    bool allows_reuse = false;
+    auto status = MultiTransportTestPeer::selectTransport(
+        *multi_, request, transport, &allows_reuse);
+    EXPECT_TRUE(status.ok()) << status.ToString();
+    EXPECT_EQ(transport, shm_);
+    EXPECT_TRUE(allows_reuse);
+}
+
+#ifdef ENABLE_MULTI_PROTOCOL
+TEST_F(ShmRoutingTest, CommaProtocolDisablesReuse) {
+    auto desc = std::make_shared<TransferMetadata::SegmentDesc>();
+    desc->name = "127.0.0.1:19001";
+    desc->protocol = "tcp,shm";
+    AddBuffer(*desc, "", "tcp");
+    AddBuffer(*desc, "mooncake_1_abcdefgh", "shm");
+    const auto id = next_segment_id_++;
+    metadata_->addLocalSegment(id, desc->name, std::move(desc));
+
+    auto request = MakeWrite(id);
+    Transport* transport = nullptr;
+    bool allows_reuse = true;
+    auto status = MultiTransportTestPeer::selectTransport(
+        *multi_, request, transport, &allows_reuse);
+    EXPECT_TRUE(status.ok()) << status.ToString();
+    EXPECT_EQ(transport, shm_);
+    EXPECT_FALSE(allows_reuse);
+}
+#endif
+
+TEST_F(ShmRoutingTest, InvalidSegmentClearsReuse) {
+    auto request = MakeWrite(9999);
+    Transport* transport = nullptr;
+    bool allows_reuse = true;
+    auto status = MultiTransportTestPeer::selectTransport(
+        *multi_, request, transport, &allows_reuse);
+    EXPECT_FALSE(status.ok());
+    EXPECT_FALSE(allows_reuse);
+}
+
+TEST_F(ShmRoutingTest, ReuseLoopMatchesPerRequestSelect) {
+    auto first = AddPeer("127.0.0.1:19001", "mooncake_1_abcdefgh");
+    auto second = AddPeer("127.0.0.1:19002", "mooncake_2_abcdefgh");
+    const std::vector<Transport::TransferRequest> entries = {
+        MakeWrite(first), MakeWrite(first), MakeWrite(second),
+        MakeWrite(first)};
+
+    std::vector<Transport*> got;
+    auto status =
+        MultiTransportTestPeer::selectTransports(*multi_, entries, got);
+    ASSERT_TRUE(status.ok()) << status.ToString();
+    ASSERT_EQ(got.size(), entries.size());
+    for (size_t i = 0; i < entries.size(); ++i) {
+        Transport* expected = nullptr;
+        auto per_request = MultiTransportTestPeer::selectTransport(
+            *multi_, entries[i], expected);
+        ASSERT_TRUE(per_request.ok()) << per_request.ToString();
+        EXPECT_EQ(got[i], expected) << "index " << i;
+        EXPECT_EQ(got[i], shm_);
+    }
+}
+
+TEST_F(ShmRoutingTest, ReuseLoopDoesNotReuseUnsupportedTarget) {
+    auto first = AddPeer("127.0.0.1:19001", "mooncake_1_abcdefgh");
+    auto second = AddPeer("127.0.0.1:19002", "mooncake_2_abcdefgh", "rdma");
+    const std::vector<Transport::TransferRequest> entries = {
+        MakeWrite(first), MakeWrite(first), MakeWrite(second)};
+
+    std::vector<Transport*> got;
+    auto status =
+        MultiTransportTestPeer::selectTransports(*multi_, entries, got);
+    EXPECT_TRUE(status.IsNotSupportedTransport()) << status.ToString();
+    EXPECT_EQ(got.size(), 2u);
+    EXPECT_EQ(got[0], shm_);
+    EXPECT_EQ(got[1], shm_);
+}
+
+#ifdef ENABLE_MULTI_PROTOCOL
+TEST_F(ShmRoutingTest, ReuseLoopDoesNotSkipMixedProtocolOffsets) {
+    auto desc = std::make_shared<TransferMetadata::SegmentDesc>();
+    desc->name = "127.0.0.1:19001";
+    desc->protocol = "tcp,shm";
+    AddBuffer(*desc, "", "tcp", kRemoteAddr);
+    AddBuffer(*desc, "mooncake_1_abcdefgh", "shm", kRemoteAddr + 4096);
+    const auto id = next_segment_id_++;
+    metadata_->addLocalSegment(id, desc->name, std::move(desc));
+
+    const std::vector<Transport::TransferRequest> entries = {
+        MakeWrite(id, kRemoteAddr + 4096), MakeWrite(id, kRemoteAddr)};
+    std::vector<Transport*> got;
+    auto status =
+        MultiTransportTestPeer::selectTransports(*multi_, entries, got);
+    EXPECT_TRUE(status.IsNotSupportedTransport()) << status.ToString();
+    EXPECT_EQ(got.size(), 1u);
+    EXPECT_EQ(got[0], shm_);
 }
 #endif
 

@@ -16,14 +16,23 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
+#include <memory>
+#include <string>
+#include <unistd.h>
 #include <vector>
 
+#include "tent/common/config.h"
 #include "tent/transport/gds/gds_transport.h"
 
 namespace {
 
 std::vector<CUfileIOEvents_t> reported_events;
 size_t cancel_call_count = 0;
+size_t handle_register_call_count = 0;
+size_t handle_deregister_call_count = 0;
+size_t failed_handle_register_count = 0;
+size_t batch_submit_call_count = 0;
 
 }  // namespace
 
@@ -54,11 +63,52 @@ extern "C" CUfileError_t __wrap_cuFileBatchIOCancel(CUfileBatchHandle_t) {
     return result;
 }
 
+extern "C" CUfileError_t __wrap_cuFileBatchIOSubmit(CUfileBatchHandle_t,
+                                                    unsigned, CUfileIOParams_t*,
+                                                    unsigned) {
+    ++batch_submit_call_count;
+    CUfileError_t result{};
+    result.err = CU_FILE_SUCCESS;
+    return result;
+}
+
+extern "C" CUfileError_t __wrap_cuFileHandleRegister(CUfileHandle_t* handle,
+                                                     CUfileDescr_t*) {
+    ++handle_register_call_count;
+    CUfileError_t result{};
+    if (failed_handle_register_count > 0) {
+        --failed_handle_register_count;
+        *handle = reinterpret_cast<CUfileHandle_t>(1);
+        result.err = CU_FILE_INVALID_VALUE;
+        return result;
+    }
+    *handle = reinterpret_cast<CUfileHandle_t>(1);
+    result.err = CU_FILE_SUCCESS;
+    return result;
+}
+
+extern "C" CUfileError_t __wrap_cuFileHandleDeregister(CUfileHandle_t) {
+    ++handle_deregister_call_count;
+    CUfileError_t result{};
+    result.err = CU_FILE_SUCCESS;
+    return result;
+}
+
 namespace mooncake {
 namespace tent {
 
 class GdsTransportTestPeer {
    public:
+    static std::shared_ptr<GdsFileContext> getOrCreate(
+        GdsTransport& transport, SegmentID target_id, const std::string& path) {
+        return transport.getOrCreateFileContext(target_id, path);
+    }
+
+    static std::shared_ptr<GdsFileContext> find(GdsTransport& transport,
+                                                SegmentID target_id) {
+        return transport.findFileContext(target_id);
+    }
+
     static TransferStatus aggregate(const std::vector<CUfileIOEvents_t>& events,
                                     bool& all_terminal) {
         return GdsTransport::aggregateTransferStatus(events, 0, events.size(),
@@ -213,6 +263,110 @@ TEST(GdsTransportStatusTest, AggregatesCompletedBytes) {
     EXPECT_EQ(status.s, COMPLETED);
     EXPECT_EQ(status.transferred_bytes, 3072);
     EXPECT_TRUE(all_terminal);
+}
+
+TEST(GdsTransportStatusTest, FailedFileOpenReturnsNoContext) {
+    char path[] = "/tmp/tent-gds-open-failure-XXXXXX";
+    int fd = mkstemp(path);
+    ASSERT_GE(fd, 0);
+    ASSERT_EQ(close(fd), 0);
+    ASSERT_EQ(unlink(path), 0);
+
+    GdsTransport transport;
+    EXPECT_EQ(GdsTransportTestPeer::getOrCreate(transport, 100, path), nullptr);
+}
+
+TEST(GdsTransportStatusTest, FailedHandleRegistrationCanBeRetried) {
+    char path[] = "/tmp/tent-gds-registration-retry-XXXXXX";
+    int fd = mkstemp(path);
+    ASSERT_GE(fd, 0);
+    ASSERT_EQ(close(fd), 0);
+
+    handle_register_call_count = 0;
+    handle_deregister_call_count = 0;
+    failed_handle_register_count = 1;
+    {
+        GdsTransport transport;
+        auto failed = GdsTransportTestPeer::getOrCreate(transport, 101, path);
+        EXPECT_EQ(failed, nullptr);
+        EXPECT_EQ(handle_register_call_count, 1);
+        EXPECT_EQ(handle_deregister_call_count, 0);
+
+        auto recovered =
+            GdsTransportTestPeer::getOrCreate(transport, 101, path);
+        ASSERT_NE(recovered, nullptr);
+        EXPECT_EQ(handle_register_call_count, 2);
+        EXPECT_EQ(GdsTransportTestPeer::getOrCreate(transport, 101, path),
+                  recovered);
+        EXPECT_EQ(handle_register_call_count, 2);
+    }
+    EXPECT_EQ(handle_deregister_call_count, 1);
+    EXPECT_EQ(unlink(path), 0);
+}
+
+TEST(GdsTransportStatusTest, KeepsFileContextAliveDuringUninstall) {
+    char path[] = "/tmp/tent-gds-context-lifetime-XXXXXX";
+    int fd = mkstemp(path);
+    ASSERT_GE(fd, 0);
+    ASSERT_EQ(close(fd), 0);
+
+    handle_deregister_call_count = 0;
+    GdsTransport transport;
+    std::string local_segment_name = "gds-context-lifetime";
+    ASSERT_TRUE(transport
+                    .install(local_segment_name, nullptr, nullptr,
+                             std::make_shared<Config>())
+                    .ok());
+    auto created = GdsTransportTestPeer::getOrCreate(transport, 102, path);
+    ASSERT_NE(created, nullptr);
+    auto found = GdsTransportTestPeer::find(transport, 102);
+    ASSERT_NE(found, nullptr);
+
+    ASSERT_TRUE(transport.uninstall().ok());
+    EXPECT_EQ(handle_deregister_call_count, 0);
+
+    found.reset();
+    EXPECT_EQ(handle_deregister_call_count, 0);
+    created.reset();
+    EXPECT_EQ(handle_deregister_call_count, 1);
+    EXPECT_EQ(unlink(path), 0);
+}
+
+TEST(GdsTransportStatusTest, SubmittedBatchKeepsFileContextDuringUninstall) {
+    char path[] = "/tmp/tent-gds-submitted-context-XXXXXX";
+    int fd = mkstemp(path);
+    ASSERT_GE(fd, 0);
+    ASSERT_EQ(close(fd), 0);
+
+    handle_deregister_call_count = 0;
+    batch_submit_call_count = 0;
+    GdsTransport transport;
+    std::string local_segment_name = "gds-submitted-context";
+    ASSERT_TRUE(transport
+                    .install(local_segment_name, nullptr, nullptr,
+                             std::make_shared<Config>())
+                    .ok());
+    auto context = GdsTransportTestPeer::getOrCreate(transport, 103, path);
+    ASSERT_NE(context, nullptr);
+    context.reset();
+
+    {
+        GdsSubBatch batch;
+        BatchHandle batch_handle{};
+        batch.batch_handle = &batch_handle;
+        Request request{};
+        request.opcode = Request::WRITE;
+        request.target_id = 103;
+        request.length = 1;
+        ASSERT_TRUE(transport.submitTransferTasks(&batch, {request}).ok());
+        EXPECT_EQ(batch_submit_call_count, 1);
+
+        ASSERT_TRUE(transport.uninstall().ok());
+        EXPECT_EQ(handle_deregister_call_count, 0);
+    }
+
+    EXPECT_EQ(handle_deregister_call_count, 1);
+    EXPECT_EQ(unlink(path), 0);
 }
 
 TEST(GdsTransportStatusTest, FailurePrecedenceIsCompletionOrderIndependent) {

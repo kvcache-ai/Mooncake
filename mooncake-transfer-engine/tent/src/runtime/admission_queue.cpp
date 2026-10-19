@@ -16,6 +16,7 @@
 #include "tent/runtime/deadline_mlu.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <limits>
 #include <set>
@@ -178,6 +179,7 @@ Status LocalTransferAdmissionQueue::tryAdmit(
         owner.batch_token = submit.batch_token;
         owner.request = owner_input.request;
         owner.kind = owner_input.kind;
+        owner.transport = owner_input.transport;
         owner.degradation_eligible = owner_input.degradation_eligible;
         owners_.emplace(owner_id, owner);
 
@@ -221,6 +223,16 @@ void LocalTransferAdmissionQueue::setDegradationPolicy(
     BandwidthProvider bandwidth_provider, DegradationHooks hooks,
     NowProvider now_provider) {
     bandwidth_provider_ = std::move(bandwidth_provider);
+    transport_bandwidth_provider_ = nullptr;
+    degradation_hooks_ = std::move(hooks);
+    now_provider_ = std::move(now_provider);
+}
+
+void LocalTransferAdmissionQueue::setTransportDegradationPolicy(
+    TransportBandwidthProvider bandwidth_provider, DegradationHooks hooks,
+    NowProvider now_provider) {
+    transport_bandwidth_provider_ = std::move(bandwidth_provider);
+    bandwidth_provider_ = nullptr;
     degradation_hooks_ = std::move(hooks);
     now_provider_ = std::move(now_provider);
 }
@@ -241,13 +253,13 @@ std::vector<QueueOwnerId> LocalTransferAdmissionQueue::pickForDispatch(
     //
     // RFC #2519 step 3 (opt-in): drop is active only when a positive threshold,
     // deadline awareness, and a bandwidth provider are all present.
-    const bool drop_enabled = limits_.deadline_aware &&
-                              limits_.mlu_local_threshold > 0.0 &&
-                              static_cast<bool>(bandwidth_provider_);
+    const bool drop_enabled =
+        limits_.deadline_aware && limits_.mlu_local_threshold > 0.0 &&
+        (static_cast<bool>(bandwidth_provider_) ||
+         static_cast<bool>(transport_bandwidth_provider_));
     const bool promotion_enabled =
         limits_.deadline_aware && limits_.promotion_slack_ns > 0;
     const bool need_now = drop_enabled || promotion_enabled;
-    const double bw_bps = drop_enabled ? bandwidth_provider_() : 0.0;
     const uint64_t now_ns =
         need_now
             ? (now_provider_
@@ -282,8 +294,34 @@ std::vector<QueueOwnerId> LocalTransferAdmissionQueue::pickForDispatch(
     // (<= 0) means nothing to predict from, so never a drop -- not even
     // past the deadline; DeadlineMlu yields 0 there too, the explicit
     // checks just keep the rule readable here.
+    //
+    // The rate stays per transport so transports that report their own
+    // bandwidth are not averaged into a process-wide aggregate, but the
+    // provider is resolved at most once per transport per scan: it reads live
+    // link state behind the transport lifecycle lock, and only RDMA and UB can
+    // carry degradation-eligible owners.
+    std::array<double, kSupportedTransportTypes> bandwidth_by_transport{};
+    std::array<bool, kSupportedTransportTypes> bandwidth_resolved{};
+    bandwidth_resolved.fill(false);
+    auto bandwidthFor = [&](TransportType type) -> double {
+        const int index = static_cast<int>(type);
+        if (index < 0 || index >= kSupportedTransportTypes) {
+            return transport_bandwidth_provider_
+                       ? transport_bandwidth_provider_(type)
+                       : bandwidth_provider_();
+        }
+        if (!bandwidth_resolved[index]) {
+            bandwidth_resolved[index] = true;
+            bandwidth_by_transport[index] =
+                transport_bandwidth_provider_
+                    ? transport_bandwidth_provider_(type)
+                    : bandwidth_provider_();
+        }
+        return bandwidth_by_transport[index];
+    };
     auto shouldDrop = [&](const QueueOwner& owner, size_t bytes_ahead) {
         if (!drop_enabled || !owner.degradation_eligible) return false;
+        const double bw_bps = bandwidthFor(owner.transport);
         if (owner.request.deadline_ns == 0 || bw_bps <= 0.0) return false;
         const double mlu =
             DeadlineMlu(bytes_ahead, owner.request.length,

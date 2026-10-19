@@ -75,7 +75,6 @@ struct MooncakeEpBuffer {
 
     // GDR buffer — allocated by p2p_transport_; peer mappings are optional.
     int buffer_idx{};
-    int phase_epochs[2]{};
     // TBO owns multiple logical dispatchers but shares one native Buffer.
     // Keep a private top-k snapshot slot per dispatch metadata tensor so
     // interleaved subbatches cannot overwrite one another.
@@ -90,6 +89,7 @@ struct MooncakeEpBuffer {
     // rdma_transport_: IBGDA inter-node RDMA.  nullptr when IBGDA unavailable.
     device::P2pTransport* p2p_transport_ = nullptr;
     device::RdmaTransport* rdma_transport_ = nullptr;
+    device::RdmaMemoryRegion rdma_memory_region_;
     // When EP creates transports itself (no engine provided), ownership lives
     // in these unique_ptrs.  When an engine is provided, the engine owns them
     // and these remain null.
@@ -100,9 +100,8 @@ struct MooncakeEpBuffer {
     bool p2p_enabled_ = true;
 
     int USE_QP_COUNT = MAX_QP_COUNT;
-    // Active RoCE QPs per peer. The platform-specific default is selected in
-    // active_qps_per_rank_for_ep(); a positive
-    // MOONCAKE_EP_ACTIVE_QPS_PER_RANK value forces an explicit count.
+    // Active RoCE QPs per peer. MUSA uses one until its independent per-QP
+    // staging protocol is implemented; CUDA/MACA retain their runtime cap.
     int active_qps_cap_ = 0;
 
     // Stream for communication
@@ -174,24 +173,24 @@ struct MooncakeEpBuffer {
     // Metadata accessors for Python-level bootstrap exchange.
     std::tuple<int64_t, int32_t> get_mr_info() {
         if (!rdma_transport_) return {0, 0};
-        auto m = rdma_transport_->localMetadata();
+        auto m = rdma_transport_->localMetadata(rdma_memory_region_);
         return {m.raddr, m.rkey};
     }
 
     std::tuple<int64_t, int64_t> get_gid() {
         if (!rdma_transport_) return {0, 0};
-        auto m = rdma_transport_->localMetadata();
+        auto m = rdma_transport_->localMetadata(rdma_memory_region_);
         return {m.subnet_prefix, m.interface_id};
     }
 
     std::vector<int32_t> get_local_qpns() {
         if (!rdma_transport_) return {};
-        return rdma_transport_->localMetadata().qpns;
+        return rdma_transport_->localMetadata(rdma_memory_region_).qpns;
     }
 
     std::vector<int32_t> get_local_lids() {
         if (!rdma_transport_) return {};
-        return rdma_transport_->localMetadata().lids;
+        return rdma_transport_->localMetadata(rdma_memory_region_).lids;
     }
 
     // IPC handle for P2P (NVLink).

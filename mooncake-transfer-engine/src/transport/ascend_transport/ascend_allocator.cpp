@@ -14,6 +14,7 @@
 namespace mooncake {
 namespace {
 constexpr size_t kFabricMemPageSize = 1024ULL * 1024 * 1024;  // 1G
+constexpr size_t kMemAccessDescCount = 1;
 constexpr int kBestEffortStartPercent = 100;
 constexpr int kBestEffortMinPercent = 50;
 constexpr int kBestEffortPercentStep = 10;
@@ -74,6 +75,7 @@ void remove_store_memory_range(void *ptr) {
 struct AllocRecord {
     aclrtDrvMemHandle handle;
     bool is_direct_alloc;
+    size_t size;
 };
 std::mutex g_vmm_alloc_mutex;
 std::unordered_map<void *, AllocRecord> g_vmm_alloc_records;
@@ -135,6 +137,44 @@ int allocate_physical_memory(size_t total_size, aclrtDrvMemHandle &handle,
     return 0;
 }
 
+// Host physical pages mapped behind a VA are only bound to the host by
+// aclrtMapMem; the NPU needs an explicit grant before SDMA/HCCS can touch them.
+// adxl::MallocMem grants it internally for its own allocations, so the direct
+// ACL VMM path has to do the same. location.id is a driver logical id while
+// aclrtGetDevice returns a user id (ASCEND_RT_VISIBLE_DEVICES), so convert.
+int grant_current_device_access(void *va, size_t total_size, bool quiet) {
+    int32_t user_dev_id = -1;
+    auto ret = aclrtGetDevice(&user_dev_id);
+    if (ret != ACL_ERROR_NONE) {
+        if (!quiet) {
+            LOG(ERROR) << "Failed to get device for MemSetAccess: " << ret;
+        }
+        return -1;
+    }
+    int32_t driver_dev_id = -1;
+    ret = aclrtGetLogicDevIdByUserDevId(user_dev_id, &driver_dev_id);
+    if (ret != ACL_ERROR_NONE) {
+        if (!quiet) {
+            LOG(ERROR) << "Failed to get logical device id for MemSetAccess: "
+                       << ret;
+        }
+        return -1;
+    }
+
+    aclrtMemAccessDesc desc = {};
+    desc.flags = ACL_RT_MEM_ACCESS_FLAGS_READWRITE;
+    desc.location.type = ACL_MEM_LOCATION_TYPE_DEVICE;
+    desc.location.id = static_cast<uint32_t>(driver_dev_id);
+    ret = aclrtMemSetAccess(va, total_size, &desc, kMemAccessDescCount);
+    if (ret != ACL_ERROR_NONE) {
+        if (!quiet) {
+            LOG(ERROR) << "Failed to set memory access: " << ret;
+        }
+        return -1;
+    }
+    return 0;
+}
+
 // Direct ACL VMM allocation (always bypasses adxl MallocMem).
 // Used by shm_helper when ascend_agent_mode && ascend_use_fabric_mem.
 void *allocate_vmm_memory_direct_impl(size_t total_size, bool quiet = false) {
@@ -160,8 +200,14 @@ void *allocate_vmm_memory_direct_impl(size_t total_size, bool quiet = false) {
         (void)aclrtFreePhysical(handle);
         return nullptr;
     }
+    if (grant_current_device_access(va, total_size, quiet) != 0) {
+        (void)aclrtUnmapMem(va);
+        (void)aclrtReleaseMemAddress(va);
+        (void)aclrtFreePhysical(handle);
+        return nullptr;
+    }
     std::lock_guard<std::mutex> lock(g_vmm_alloc_mutex);
-    g_vmm_alloc_records.emplace(va, AllocRecord{handle, true});
+    g_vmm_alloc_records.emplace(va, AllocRecord{handle, true, total_size});
     return va;
 }
 
@@ -184,7 +230,8 @@ void *allocate_fabric_exact(size_t total_size, bool quiet = false) {
         LOG(INFO) << "Call adxl MallocMem suc, va:" << va
                   << ", size:" << total_size;
         std::lock_guard<std::mutex> lock(g_vmm_alloc_mutex);
-        g_vmm_alloc_records.emplace(va, AllocRecord{nullptr, false});
+        g_vmm_alloc_records.emplace(va,
+                                    AllocRecord{nullptr, false, total_size});
         return va;
     }
     va = allocate_vmm_memory_direct_impl(total_size, quiet);
@@ -359,6 +406,31 @@ bool ascend_is_store_memory(void *addr, size_t length) {
             return true;
         }
     }
+    return false;
+}
+
+bool ascend_is_direct_vmm_memory(void *addr, size_t length) {
+    if (!addr || length == 0) return false;
+    const auto addr_start = reinterpret_cast<uintptr_t>(addr);
+#ifdef ASCEND_SUPPORT_FABRIC_MEM
+    std::lock_guard<std::mutex> lock(g_vmm_alloc_mutex);
+    for (const auto &[base, record] : g_vmm_alloc_records) {
+        if (!record.is_direct_alloc) {
+            continue;
+        }
+        // Only the start address identifies the allocation. A caller may hand
+        // over a longer range than was allocated - a store segment is mounted
+        // at its requested size while best-effort fabric allocation can return
+        // less - and demanding full containment would silently keep that
+        // buffer as MEM_HOST.
+        const auto base_start = reinterpret_cast<uintptr_t>(base);
+        if (addr_start >= base_start && addr_start < base_start + record.size) {
+            return true;
+        }
+    }
+#else
+    (void)addr_start;
+#endif
     return false;
 }
 

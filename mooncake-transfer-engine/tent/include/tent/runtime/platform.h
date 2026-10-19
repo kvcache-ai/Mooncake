@@ -20,20 +20,23 @@
 namespace mooncake {
 namespace tent {
 
-// New device memory types are appended last so the numeric values of the
-// existing entries are preserved. TPU HBM and Intel XPU VRAM are not
-// NIC-addressable in the MVP, so transfers touching them are staged through
-// host DRAM. TPU staging is routed by ProxyManager (see findStagingPolicy);
-// XPU currently only exposes the device-local alloc/copy primitives and is
-// classified by getTypeEnum, but its transport-layer staging is not yet wired.
+// Append new memory types to preserve existing numeric values. Add device
+// types to isGpuMemoryType() as well so routing and staging agree.
 enum MemoryType {
     MTYPE_UNKNOWN,
     MTYPE_CPU,
     MTYPE_CUDA,
     MTYPE_ROCM,
     MTYPE_TPU,
-    MTYPE_XPU
+    MTYPE_XPU,
+    MTYPE_MLU
 };
+
+// Shared by routing and staging. Copy capabilities depend on the transport.
+inline bool isGpuMemoryType(MemoryType t) {
+    return t == MTYPE_CUDA || t == MTYPE_ROCM || t == MTYPE_TPU ||
+           t == MTYPE_XPU || t == MTYPE_MLU;
+}
 
 class Platform {
    public:

@@ -64,6 +64,7 @@ TEST(BatchOpLogSnapshotCodecTest, ObjectChunkRoundTripsAndChecksEnvelope) {
     metadata.size = 8192;
     metadata.group_id = "group";
     metadata.hard_pinned = true;
+    metadata.session_id = "session-snapshot";
     std::vector<StandbyObjectEntry> objects{
         {.tenant_id = "tenant", .key = "key", .metadata = metadata}};
     auto encoded = EncodeBatchOpLogSnapshotObjectChunk(7, std::move(objects));
@@ -79,6 +80,8 @@ TEST(BatchOpLogSnapshotCodecTest, ObjectChunkRoundTripsAndChecksEnvelope) {
     EXPECT_EQ(8192u, decoded->objects[0].metadata.size);
     EXPECT_EQ("group", decoded->objects[0].metadata.group_id);
     EXPECT_TRUE(decoded->objects[0].metadata.hard_pinned.value_or(false));
+    EXPECT_EQ(decoded->objects[0].metadata.session_id.value_or(""),
+              "session-snapshot");
 
     EXPECT_FALSE(DecodeBatchOpLogSnapshotObjectChunk(encoded, 8, 1));
     EXPECT_FALSE(DecodeBatchOpLogSnapshotObjectChunk(encoded, 7, 300000000));
@@ -94,6 +97,7 @@ TEST(BatchOpLogSnapshotCodecTest, OldObjectChunkDefaultsHardPinnedToFalse) {
 
     ASSERT_TRUE(decoded) << decoded.error();
     EXPECT_FALSE(decoded->objects[0].metadata.hard_pinned.value_or(false));
+    EXPECT_FALSE(decoded->objects[0].metadata.session_id.has_value());
 }
 
 TEST(BatchOpLogSnapshotCodecTest, RejectsTruncatedArtifacts) {

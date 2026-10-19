@@ -37,9 +37,9 @@ struct VllmClearedEvent {};
 using VllmEvent =
     std::variant<VllmStoredEvent, VllmRemovedEvent, VllmClearedEvent>;
 
-// SGLang's native KV-event protocol is msgspec array-like/tagged data.  Keep
-// its signed wire hashes as uint64 bit patterns internally so all index paths
-// use one unsigned representation.
+// SGLang's native KV-event protocol wraps tagged msgpack map events in an
+// array-like envelope.  Keep its signed wire hashes as uint64 bit patterns
+// internally so all index paths use one unsigned representation.
 struct SglangStoredEvent {
     std::vector<uint64_t> block_hashes;
     std::optional<uint64_t> parent_block_hash;

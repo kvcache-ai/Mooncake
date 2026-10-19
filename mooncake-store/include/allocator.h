@@ -134,6 +134,9 @@ class AllocatedBuffer {
 
     [[nodiscard]] std::string getSegmentName() const noexcept;
 
+    // The endpoint a reader transfers from, as get_descriptor() reports it.
+    [[nodiscard]] std::string getTransportEndpoint() const;
+
     // Friend declaration for operator<<
     friend std::ostream& operator<<(std::ostream& os,
                                     const AllocatedBuffer& buffer);
@@ -155,6 +158,11 @@ class AllocatedBuffer {
     bool copyTransferProtocolFrom(const AllocatedBuffer& source);
 
     std::weak_ptr<BufferAllocatorBase> allocator_;
+    // Both bindings are set before the buffer is published to readers and not
+    // changed while readers can see it, so neither needs atomic access. The
+    // one rebind of a published buffer is the snapshot restore pass
+    // (RebuildClientLivenessAfterSnapshotRestore), which runs inside the
+    // MasterService constructor, before any reader.
     SegmentLifetime segment_lifetime_;
     std::string segment_name_;
     void* buffer_ptr_{nullptr};

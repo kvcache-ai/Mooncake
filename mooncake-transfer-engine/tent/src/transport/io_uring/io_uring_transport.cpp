@@ -158,7 +158,7 @@ std::string IOUringTransport::getIOUringFilePath(SegmentID target_id) {
 }
 
 IOUringFileContext* IOUringTransport::findFileContext(SegmentID target_id) {
-    thread_local FileContextMap tl_file_context_map;
+    auto& tl_file_context_map = tl_file_context_map_.get();
     if (tl_file_context_map.count(target_id))
         return tl_file_context_map[target_id].get();
 
@@ -309,18 +309,26 @@ Status IOUringTransport::getTransferStatus(SubBatchRef batch, int task_id,
             if (cqe->res < 0) {
                 LOG(INFO) << "Received an event with error code " << cqe->res;
                 cqe_task->status_word = TransferStatusEnum::FAILED;
+                cqe_task->transferred_bytes = 0;
             } else {
-                if (cqe_task->buffer) {
-                    if (cqe_task->request.opcode == Request::READ)
-                        Platform::getLoader().copy(cqe_task->request.source,
-                                                   cqe_task->buffer,
-                                                   cqe_task->request.length);
-
-                    free(cqe_task->buffer);
-                    cqe_task->buffer = nullptr;
+                const size_t completed_bytes = static_cast<size_t>(cqe->res);
+                // A nonnegative CQE may still be short, including EOF. Only
+                // copy the prefix actually read from the file.
+                if (cqe_task->buffer && completed_bytes != 0 &&
+                    cqe_task->request.opcode == Request::READ) {
+                    Platform::getLoader().copy(cqe_task->request.source,
+                                               cqe_task->buffer,
+                                               completed_bytes);
                 }
-                cqe_task->status_word = TransferStatusEnum::COMPLETED;
-                cqe_task->transferred_bytes = cqe_task->request.length;
+                cqe_task->transferred_bytes = completed_bytes;
+                cqe_task->status_word =
+                    completed_bytes == cqe_task->request.length
+                        ? TransferStatusEnum::COMPLETED
+                        : TransferStatusEnum::FAILED;
+            }
+            if (cqe_task->buffer) {
+                free(cqe_task->buffer);
+                cqe_task->buffer = nullptr;
             }
         }
         io_uring_cqe_seen(&io_uring_batch->ring, cqe);

@@ -2,6 +2,7 @@
 #include "storage_backend.h"
 
 #include <fcntl.h>
+#include <sys/file.h>
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/uio.h>
@@ -53,6 +54,9 @@ struct FdGuard {
 #include "storage/distributed/posix_fs_adapter.h"
 #ifdef HAVE_OSS_ADAPTER
 #include "storage/distributed/oss_adapter.h"
+#endif
+#ifdef HAVE_S3_ADAPTER
+#include "storage/distributed/s3_adapter.h"
 #endif
 #ifdef USE_3FS
 #include "storage/distributed/hf3fs_adapter.h"
@@ -132,23 +136,7 @@ tl::expected<void, ErrorCode> StorageBackend::Init(uint64_t quota_bytes = 0) {
                    << e.what();
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
-    std::sort(existing_files.begin(), existing_files.end(),
-              [](const auto& a, const auto& b) {
-                  struct statx stx_a, stx_b;
-                  bool success_a = (statx(AT_FDCWD, a.path().c_str(), 0,
-                                          STATX_BTIME, &stx_a) == 0);
-                  bool success_b = (statx(AT_FDCWD, b.path().c_str(), 0,
-                                          STATX_BTIME, &stx_b) == 0);
-
-                  if (!success_a || !success_b) {
-                      return false;
-                  }
-
-                  if (stx_a.stx_btime.tv_sec == stx_b.stx_btime.tv_sec) {
-                      return stx_a.stx_btime.tv_nsec < stx_b.stx_btime.tv_nsec;
-                  }
-                  return stx_a.stx_btime.tv_sec < stx_b.stx_btime.tv_sec;
-              });
+    FileUtil::SortByCreationTime(existing_files);
     bool eviction_needed = false;
     {
         std::unique_lock<std::shared_mutex> space_lock(space_mutex_);
@@ -1472,7 +1460,10 @@ void StorageBackendAdaptor::RemoveAll() {
 BucketIdGenerator::BucketIdGenerator(int64_t start) {
     if (start <= 0) {
         auto cur_time_stamp = time_gen();
-        current_id_ = (cur_time_stamp << TIMESTAMP_SHIFT) | SEQUENCE_ID_SHIFT;
+        // Salt with pid so two clients starting in the same second do not
+        // share an identical id sequence (Mooncake #3528).
+        const int64_t salt = static_cast<int64_t>(::getpid()) & SEQUENCE_MASK;
+        current_id_ = (cur_time_stamp << TIMESTAMP_SHIFT) | salt;
     } else {
         current_id_ = start;
     }
@@ -1513,6 +1504,11 @@ BucketStorageBackend::~BucketStorageBackend() {
     // Clear file cache to release UringFile instances before destruction
     // This ensures orderly cleanup of io_uring resources
     ClearFileCache();
+    if (owner_lock_fd_ >= 0) {
+        ::flock(owner_lock_fd_, LOCK_UN);
+        ::close(owner_lock_fd_);
+        owner_lock_fd_ = -1;
+    }
 }
 
 tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
@@ -1914,6 +1910,33 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
             LOG(ERROR) << "Storage backend already initialized";
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         }
+
+        // One live client per storage_path (standalone contract). Fail fast
+        // instead of silently colliding on bucket ids (#3528).
+        if (owner_lock_fd_ < 0) {
+            fs::create_directories(storage_path_);
+            const auto lock_path =
+                (fs::path(storage_path_) / ".mooncake_local_disk.lock")
+                    .string();
+            owner_lock_fd_ =
+                ::open(lock_path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0644);
+            if (owner_lock_fd_ < 0) {
+                LOG(ERROR) << "Failed to open storage_path lock: " << lock_path
+                           << ", errno=" << errno;
+                return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+            }
+            if (::flock(owner_lock_fd_, LOCK_EX | LOCK_NB) != 0) {
+                LOG(ERROR)
+                    << "storage_path already held by another live client: "
+                    << storage_path_
+                    << ". LOCAL_DISK requires one client per storage_path "
+                       "(use standalone store or per-client directories).";
+                ::close(owner_lock_fd_);
+                owner_lock_fd_ = -1;
+                return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+            }
+        }
+
         SharedMutexLocker lock(&mutex_);
         object_bucket_map_.clear();
         buckets_.clear();
@@ -2148,7 +2171,24 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
 tl::expected<bool, ErrorCode> BucketStorageBackend::IsExist(
     const std::string& key) {
     SharedMutexLocker lock(&mutex_, shared_lock);
-    return object_bucket_map_.find(key) != object_bucket_map_.end();
+    auto it = object_bucket_map_.find(key);
+    if (it == object_bucket_map_.end()) {
+        return false;
+    }
+    // The index alone cannot see an externally wiped bucket file: writes
+    // commit file-then-index, so an index hit with no file behind it means
+    // the backing data is gone and the answer must be false, not "present".
+    auto path = GetBucketDataPath(it->second.bucket_id);
+    if (!path) {
+        return tl::make_unexpected(path.error());
+    }
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const bool on_disk = fs::exists(*path, ec);
+    if (ec) {
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    return on_disk;
 }
 
 tl::expected<bool, ErrorCode> BucketStorageBackend::IsEnableOffloading() {
@@ -2291,6 +2331,14 @@ tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
         while (static_cast<int64_t>(bucket_keys.size()) <
                bucket_backend_config_.bucket_keys_limit) {
             if (it == offloading_objects.cend()) {
+                if (bucket_backend_config_.flush_partial_buckets) {
+                    // Keep these keys in the current cycle, while FileStorage
+                    // still has their tasks and source replicas are pinned.
+                    if (!bucket_keys.empty()) {
+                        buckets_keys.push_back(std::move(bucket_keys));
+                    }
+                    return {};
+                }
                 for (const auto& bucket_object : bucket_objects) {
                     ungrouped_offloading_objects.emplace(bucket_object.first,
                                                          bucket_object.second);
@@ -3402,7 +3450,14 @@ BucketStorageBackend::OpenFile(const std::string& path, FileMode mode) const {
             access_mode = O_RDONLY;
             break;
         case FileMode::Write:
-            access_mode = O_WRONLY | O_CREAT | O_TRUNC;
+            // New path: exclusive create so a colliding bucket id cannot
+            // silently O_TRUNC another client's file (#3528). Existing path:
+            // in-place rewrite (same client).
+            if (::access(path.c_str(), F_OK) == 0) {
+                access_mode = O_WRONLY | O_TRUNC;
+            } else {
+                access_mode = O_WRONLY | O_CREAT | O_EXCL;
+            }
             break;
     }
 
@@ -3502,6 +3557,8 @@ BucketStorageBackend::GetFileInstance() const {
 
     std::string temp_path =
         (fs::path(storage_path_) / "temp_for_registration").string();
+    std::error_code temp_ec;
+    fs::remove(temp_path, temp_ec);
 
     auto open_result = OpenFile(temp_path, FileMode::Write);
     if (!open_result) {
@@ -5577,6 +5634,15 @@ CreateStorageBackend(const FileStorageConfig& config) {
                         distributed_config.fsdir);
 #else
                 LOG(ERROR) << "OSS adapter requires libcurl and OpenSSL";
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+#endif
+            } else if (distributed_config.fs_adapter_type == "s3") {
+#ifdef HAVE_S3_ADAPTER
+                object_storage_adapter =
+                    std::make_unique<S3ObjectStorageAdapter>(
+                        distributed_config.fsdir);
+#else
+                LOG(ERROR) << "S3 adapter requires libcurl and OpenSSL";
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
 #endif
             } else {

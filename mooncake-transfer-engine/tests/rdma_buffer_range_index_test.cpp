@@ -14,6 +14,8 @@
 
 #include <gtest/gtest.h>
 
+#include <memory>
+
 #include <algorithm>
 #include <cstdint>
 #include <random>
@@ -240,6 +242,74 @@ TEST(BufferRangeIndex, AdjacentRegionsAreNotOverlapping) {
               0);
     EXPECT_EQ(linear_buffer, 1);
     EXPECT_EQ(index.findCovering(0x3000, 0), -1);
+}
+
+TEST(BufferRangeIndex, LastHitReusesHintDevice) {
+    auto desc = MakeSegment({MakeBuffer(0x1000, 0x1000, 0)});
+    int buffer_id = -1, device_id = -1;
+    ASSERT_EQ(
+        RdmaTransport::selectDevice(&desc, 0x1080, 16, buffer_id, device_id),
+        0);
+    EXPECT_EQ(buffer_id, 0);
+    const int first_device = device_id;
+
+    int hinted_buffer = -1, hinted_device = -1;
+    ASSERT_EQ(
+        RdmaTransport::selectDevice(&desc, 0x1100, 32, hinted_buffer,
+                                    hinted_device, 0, buffer_id, first_device),
+        0);
+    EXPECT_EQ(hinted_buffer, 0);
+    EXPECT_EQ(hinted_device, first_device);
+}
+
+TEST(BufferRangeIndex, DeviceHintDoesNotFollowBufferJump) {
+    auto desc = MakeSegment(
+        {MakeBuffer(0x1000, 0x1000, 0), MakeBuffer(0x2000, 0x1000, 1)});
+    int buffer_id = -1, device_id = -1;
+    ASSERT_EQ(
+        RdmaTransport::selectDevice(&desc, 0x1080, 16, buffer_id, device_id),
+        0);
+    EXPECT_EQ(buffer_id, 0);
+
+    int jumped_buffer = -1, jumped_device = -1;
+    ASSERT_EQ(
+        RdmaTransport::selectDevice(&desc, 0x2080, 16, jumped_buffer,
+                                    jumped_device, 0, buffer_id, device_id),
+        0);
+    EXPECT_EQ(jumped_buffer, 1);
+}
+
+TEST(BufferRangeIndex, InternedNicPathIsStable) {
+    auto desc = MakeSegment({MakeBuffer(0x1000, 0x1000, 0)});
+    desc.devices.push_back({"mlx5_unit_test", 1, "", ""});
+    desc.rebuildInternedNicPaths();
+    const auto &first = desc.internedNicPath(0);
+    const auto &second = desc.internedNicPath(0);
+    EXPECT_EQ(&first, &second);
+    EXPECT_EQ(first, MakeNicPath(desc.nicPathServerName(), "mlx5_unit_test"));
+}
+
+TEST(BufferRangeIndex, InternedNicPathOutlivesSegmentDesc) {
+    auto desc = std::make_unique<SegmentDesc>(
+        MakeSegment({MakeBuffer(0x1000, 0x1000, 0)}));
+    desc->devices.push_back({"mlx5_unit_test", 1, "", ""});
+    desc->rebuildInternedNicPaths();
+    const std::string *interned = &desc->internedNicPath(0);
+    const std::string expected = *interned;
+    desc.reset();
+    EXPECT_EQ(*interned, expected);
+    EXPECT_EQ(expected, MakeNicPath("unit-test-server:1234", "mlx5_unit_test"));
+}
+
+TEST(BufferRangeIndex, InternedNicPathWorksWithoutRebuild) {
+    auto desc = MakeSegment({MakeBuffer(0x1000, 0x1000, 0)});
+    desc.devices.push_back({"mlx5_unit_test", 1, "", ""});
+    EXPECT_TRUE(desc.interned_nic_paths.empty());
+    const auto &first = desc.internedNicPath(0);
+    const auto &second = desc.internedNicPath(0);
+    EXPECT_TRUE(desc.interned_nic_paths.empty());
+    EXPECT_EQ(&first, &second);
+    EXPECT_EQ(first, MakeNicPath(desc.nicPathServerName(), "mlx5_unit_test"));
 }
 
 TEST(BufferRangeIndex, SelectDeviceMatchesLinearFirstMatch) {

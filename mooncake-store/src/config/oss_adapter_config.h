@@ -17,6 +17,9 @@ struct OssAdapterConfig {
     std::string security_token;
     bool path_style = false;
     bool anonymous = false;
+    int max_connections = 64;
+    int receive_buffer_size = 1024 * 1024;
+    int upload_buffer_size = 1024 * 1024;
 
     static tl::expected<OssAdapterConfig, ErrorCode> FromEnvironment();
 };

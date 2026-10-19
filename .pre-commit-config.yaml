@@ -12,9 +12,8 @@ minimum_pre_commit_version: '3.6.0'
 ci:
   autofix_prs: true
   autoupdate_commit_msg: 'chore: pre-commit autoupdate'
-  # Needs Cargo + libclang, which the hosted pre-commit.ci image lacks;
-  # GitHub Actions is the authoritative check for this hook.
-  skip: [store-rust-dlopen-bindings]
+  # These system hooks need the native CMake build and its Cargo toolchain.
+  skip: [store-rust-dlopen-bindings, store-rs-rustfmt, store-rs-clippy]
 
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
@@ -47,6 +46,20 @@ repos:
         pass_filenames: false
         require_serial: true
         files: '^(mooncake-store/include/store_c\.h|mooncake-store/rust/(Cargo\.(toml|lock)|examples/generate_dlopen_bindings\.rs|src/generated/ffi_dlopen_bindings\.rs))$'
+      - id: store-rs-rustfmt
+        name: Check Store-RS Rust formatting
+        entry: cargo fmt --all --manifest-path mooncake-store-rs/Cargo.toml -- --check
+        language: system
+        pass_filenames: false
+        require_serial: true
+        files: '^mooncake-store-rs/.*\.(rs|toml|lock)$'
+      - id: store-rs-clippy
+        name: Lint Store-RS Rust crates
+        entry: cargo clippy --manifest-path mooncake-store-rs/Cargo.toml --workspace --lib --bins -- -D warnings
+        language: system
+        pass_filenames: false
+        require_serial: true
+        files: '^mooncake-store-rs/.*\.(rs|toml|lock)$'
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.6.9

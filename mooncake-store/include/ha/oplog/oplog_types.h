@@ -6,6 +6,7 @@
 #include <string_view>
 
 #include "types.h"
+#include "weight_management.h"
 
 namespace mooncake {
 
@@ -17,8 +18,31 @@ enum class OpType : uint8_t {
     SEGMENT_MOUNT = 5,
     SEGMENT_UNMOUNT = 6,
     SEGMENT_UPDATE = 7,
+    WEIGHT_METADATA_UPSERT = 8,
+    WEIGHT_METADATA_DELETE = 9,
+    WEIGHT_LEASE_UPSERT = 10,
+    WEIGHT_LEASE_DELETE = 11,
     OP_TYPE_MAX,
 };
+
+struct WeightMetadataDeleteOp {
+    WeightRevisionIdentity identity;
+    uint64_t metadata_generation{0};
+
+    friend bool operator==(const WeightMetadataDeleteOp&,
+                           const WeightMetadataDeleteOp&) = default;
+};
+YLT_REFL(WeightMetadataDeleteOp, identity, metadata_generation);
+
+struct WeightLeaseDeleteOp {
+    uint64_t lease_id{0};
+    WeightRevisionIdentity identity;
+    uint64_t fenced_metadata_generation{0};
+
+    friend bool operator==(const WeightLeaseDeleteOp&,
+                           const WeightLeaseDeleteOp&) = default;
+};
+YLT_REFL(WeightLeaseDeleteOp, lease_id, identity, fenced_metadata_generation);
 
 struct SegmentMountOp {
     std::string segment_name;

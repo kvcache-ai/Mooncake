@@ -16,6 +16,10 @@ elseif(USE_MACA)
        ${CMAKE_CURRENT_SOURCE_DIR}/../include/gpu_vendor/maca.h)
 endif()
 
+if(USE_HYLINK)
+  list(APPEND _extra_build_opts --with-hylink)
+endif()
+
 set(_enable_nvlink_allocator_build FALSE)
 if(USE_CUDA
    OR USE_HIP

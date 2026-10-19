@@ -2,7 +2,9 @@
 set -euo pipefail
 
 TEST_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-COMMON_SH="${TEST_DIR}/../scripts/common.sh"
+COMMON_SH="${TEST_DIR}/../../rocm_tests/scripts/common.sh"
+TONE_COMMON_SH="${TEST_DIR}/../scripts/common.sh"
+export E2E_DIR="$(cd "$TEST_DIR/../../e2e" && pwd)"
 
 fail() {
     echo "FAIL: $*" >&2
@@ -222,7 +224,7 @@ test_cuda_cleanup_aggregates_both_nodes() (
     export REMOTE_IP=192.0.2.2
     test_case_name=cleanup_unit
     # shellcheck disable=SC1090
-    source "$COMMON_SH"
+    source "$TONE_COMMON_SH"
 
     call_log=$(mktemp)
     trap 'rm -f "$call_log"' EXIT
@@ -246,7 +248,7 @@ test_cuda_process_launch_keeps_legacy_pid_tracking() (
     export CONTAINER_NAME=mooncake-cleanup-test
     test_case_name=cleanup_unit
     # shellcheck disable=SC1090
-    source "$COMMON_SH"
+    source "$TONE_COMMON_SH"
 
     temp_dir=$(mktemp -d)
     trap 'rm -rf "$temp_dir"' EXIT
@@ -285,16 +287,17 @@ test_run_all_propagates_cleanup_failure() (
 
     temp_dir=$(mktemp -d)
     trap 'rm -rf "$temp_dir"' EXIT
-    TONE_TESTS_DIR=$temp_dir
+    SUITE_DIR=$temp_dir
+    E2E_DIR=$temp_dir
     RUN_DIR="$temp_dir/run"
-    mkdir -p "$RUN_DIR" "$TONE_TESTS_DIR/scripts"
+    mkdir -p "$RUN_DIR" "$SUITE_DIR/scripts"
     printf 'test_case_name="cleanup_caller"\nTEST_TYPE="double"\nrun_test() { return 0; }\nparse() { return 0; }\n' \
-        > "$TONE_TESTS_DIR/scripts/fake_test.sh"
+        > "$SUITE_DIR/scripts/fake_test.sh"
     UNIT_TESTS=(fake_test.sh)
 
     setup_env_for_test() {
         printf 'export BASE_DIR=%s\nexport TEST_RUN_DIR=%s\n' \
-            "$TONE_TESTS_DIR" "$RUN_DIR" > "$RUN_DIR/.shrc"
+            "$SUITE_DIR" "$RUN_DIR" > "$RUN_DIR/.shrc"
         return 0
     }
     cleanup_test_env() { return 1; }

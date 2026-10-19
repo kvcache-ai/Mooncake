@@ -248,6 +248,27 @@ AttemptResult RestorePointer(
         return Invalid();
     }
 
+    if (manifest.weight_metadata) {
+        const auto& weights = *manifest.weight_metadata;
+        if (weights.key != ha::BuildBatchOpLogSnapshotWeightMetadataKey(
+                               snapshot_root, descriptor.snapshot_id)) {
+            return Invalid();
+        }
+        std::vector<uint8_t> weight_bytes;
+        auto read_weights =
+            ReadVerifiedObject(object_store, weights.key, weights.stored_size,
+                               weights.crc32c, weight_bytes);
+        if (read_weights.disposition != AttemptDisposition::kSuccess) {
+            return read_weights;
+        }
+        auto decoded_weights =
+            DecodeBatchOpLogSnapshotWeightMetadata(weight_bytes);
+        if (!decoded_weights ||
+            !metadata.RestoreWeightMetadata(*decoded_weights)) {
+            return Invalid(ErrorCode::DESERIALIZE_FAIL);
+        }
+    }
+
     std::unique_ptr<OpLogApplier> owned_applier;
     OpLogApplier* applier = supplied_applier;
     if (applier == nullptr) {
@@ -320,6 +341,8 @@ AttemptResult RestorePointer(
         metrics.chunk_bytes = chunk_bytes;
         metrics.snapshot_bytes =
             metrics.chunk_bytes + manifest.segments.stored_size +
+            (manifest.weight_metadata ? manifest.weight_metadata->stored_size
+                                      : 0) +
             descriptor.manifest_size + pointer_bytes.size();
     });
     return {AttemptDisposition::kSuccess,

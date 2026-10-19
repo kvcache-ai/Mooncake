@@ -72,7 +72,8 @@ TEST(DynamicReplicationLeaseTableTest,
     const UUID second{3, 4};
     const UUID other_key{5, 6};
     table.Put(first, MakeLease(first, "k1", 0));
-    table.Put(second, MakeLease(second, "k1", 0));  // several may be in flight
+    // Several proposals may be in flight for one key.
+    table.Put(second, MakeLease(second, "k1", 0));
     table.Put(other_key, MakeLease(other_key, "k2", 0));
 
     table.EraseForObject("k1");
@@ -81,8 +82,40 @@ TEST(DynamicReplicationLeaseTableTest,
     EXPECT_FALSE(table.Find(second).has_value());
     EXPECT_TRUE(table.Find(other_key).has_value());
 
-    table.EraseForObject("k1");  // nothing left to retract
+    // Nothing left to retract.
+    table.EraseForObject("k1");
     EXPECT_TRUE(table.Find(other_key).has_value());
+}
+
+TEST(DynamicReplicationLeaseTableTest,
+     ErasingForAnObjectRetractsEveryProposalOfThatKey) {
+    DynamicReplicationLeaseTable table;
+    const UUID first{1, 2};
+    const UUID second{3, 4};
+    const UUID other_key{5, 6};
+    const UUID third_key{7, 8};
+    // Several proposals may be in flight for one key at once, so a retraction
+    // for that key takes all of them rather than one.
+    table.Put(first, MakeLease(first, "k1", 0));
+    table.Put(second, MakeLease(second, "k1", 0));
+    table.Put(other_key, MakeLease(other_key, "k2", 0));
+    table.Put(third_key, MakeLease(third_key, "k3", 0));
+
+    table.EraseForObject("k1");
+
+    EXPECT_FALSE(table.Find(first).has_value());
+    EXPECT_FALSE(table.Find(second).has_value());
+    EXPECT_TRUE(table.Find(other_key).has_value());
+    EXPECT_TRUE(table.Find(third_key).has_value());
+
+    // The retracted key indexes its proposals again, and a key the retraction
+    // never named keeps both its lease and its index entry.
+    table.Put(first, MakeLease(first, "k1", 0));
+    EXPECT_TRUE(table.Find(first).has_value());
+    table.EraseForObject("k1");
+    EXPECT_FALSE(table.Find(first).has_value());
+    EXPECT_TRUE(table.Find(other_key).has_value());
+    EXPECT_TRUE(table.Find(third_key).has_value());
 }
 
 TEST(DynamicReplicationLeaseTableTest, ErasingExpiredKeepsTheLiveOnes) {

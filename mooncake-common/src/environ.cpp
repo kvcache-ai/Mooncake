@@ -1,207 +1,56 @@
 #include "environ.h"
 
-#include <algorithm>
+#include <cstdlib>
 #include <iostream>
-#include <thread>
 
 namespace mooncake {
 
-namespace {
-
-constexpr char kRpcClientIoThreadsEnv[] = "MC_RPC_CLIENT_IO_THREADS";
-constexpr char kStoreRpcClientIoThreadsEnv[] = "MC_STORE_RPC_CLIENT_IO_THREADS";
-constexpr char kTransferEngineRpcClientIoThreadsEnv[] =
-    "MC_TE_RPC_CLIENT_IO_THREADS";
-constexpr uint32_t kDefaultRpcClientIoThreads = 16;
-
-class OsEnvironSource final : public EnvironSource {
-   public:
-    const char* Get(const char* name) const override {
-        return std::getenv(name);
-    }
-};
-
-const EnvironSource& GetOsEnvironSource() {
-    static const OsEnvironSource source;
-    return source;
-}
-
-template <typename Integer>
-Integer ReadInteger(const EnvironSource& source, const char* name,
-                    Integer default_value) {
-    const char* value = source.Get(name);
+std::optional<std::string> ProcessEnvironSource::Get(
+    std::string_view name) const {
+    const char* value = std::getenv(std::string(name).c_str());
     if (value == nullptr) {
-        return default_value;
+        return std::nullopt;
     }
+    return std::string(value);
+}
 
-    const auto parsed = TryParseEnvironmentValue<Integer>(value);
-    if (parsed.has_value()) {
-        return *parsed;
+std::optional<std::string> MapEnvironSource::Get(std::string_view name) const {
+    const auto it = values_.find(name);
+    if (it == values_.end()) {
+        return std::nullopt;
     }
-
-    std::cerr << "[Mooncake] Warning: invalid value '" << value << "' for env "
-              << name << ", using default " << default_value << std::endl;
-    return default_value;
+    return it->second;
 }
 
-int ReadInt(const EnvironSource& source, const char* name, int default_value) {
-    return ReadInteger(source, name, default_value);
+void MapEnvironSource::Set(std::string name, std::string value) {
+    values_.insert_or_assign(std::move(name), std::move(value));
 }
 
-int64_t ReadInt64(const EnvironSource& source, const char* name,
-                  int64_t default_value) {
-    return ReadInteger(source, name, default_value);
-}
-
-size_t ReadSizeT(const EnvironSource& source, const char* name,
-                 size_t default_value) {
-    return ReadInteger(source, name, default_value);
-}
-
-double ReadDouble(const EnvironSource& source, const char* name,
-                  double default_value) {
-    const char* value = source.Get(name);
-    if (value == nullptr || value[0] == '\0') {
-        return default_value;
+void MapEnvironSource::Unset(std::string_view name) {
+    const auto it = values_.find(name);
+    if (it != values_.end()) {
+        values_.erase(it);
     }
-
-    const auto parsed = TryParseEnvironmentValue<double>(value);
-    if (parsed.has_value()) {
-        return *parsed;
-    }
-
-    std::cerr << "[Mooncake] Warning: invalid value '" << value << "' for env "
-              << name << ", using default " << default_value << std::endl;
-    return default_value;
-}
-
-bool ReadBool(const EnvironSource& source, const char* name,
-              bool default_value) {
-    const char* value = source.Get(name);
-    if (value == nullptr) {
-        return default_value;
-    }
-
-    const auto parsed = TryParseEnvironmentValue<bool>(value);
-    if (parsed.has_value()) {
-        return *parsed;
-    }
-
-    std::cerr << "[Mooncake] Warning: invalid value '" << value << "' for env "
-              << name << ", using default " << default_value << std::endl;
-    return default_value;
-}
-
-std::string ReadString(const EnvironSource& source, const char* name,
-                       const std::string& default_value) {
-    const char* val = source.Get(name);
-    return val ? std::string(val) : default_value;
-}
-
-uint32_t ResolveRpcClientIoThreads(const EnvironSource& source,
-                                   const char* env_name, uint32_t fallback) {
-    const int configured =
-        ReadInt(source, env_name, static_cast<int>(fallback));
-    return configured > 0 ? static_cast<uint32_t>(configured) : fallback;
-}
-
-}  // namespace
-
-Environ& Environ::Get() {
-    static Environ instance(GetOsEnvironSource());
-    return instance;
-}
-
-int Environ::GetInt(const char* name, int default_value) {
-    return ReadInt(GetOsEnvironSource(), name, default_value);
-}
-
-int64_t Environ::GetInt64(const char* name, int64_t default_value) {
-    return ReadInt64(GetOsEnvironSource(), name, default_value);
-}
-
-uint32_t Environ::GetUInt32(const char* name, uint32_t default_value) {
-    return ReadInteger(GetOsEnvironSource(), name, default_value);
-}
-
-uint64_t Environ::GetUInt64(const char* name, uint64_t default_value) {
-    return ReadInteger(GetOsEnvironSource(), name, default_value);
 }
 
 double Environ::GetDouble(const char* name, double default_value) {
-    return ReadDouble(GetOsEnvironSource(), name, default_value);
+    const auto value = Process().Get(name);
+    if (!value.has_value() || value->empty()) {
+        return default_value;
+    }
+    const auto parsed = TryParseEnvironmentValue<double>(*value);
+    if (parsed.has_value()) {
+        return *parsed;
+    }
+    std::cerr << "[Mooncake] Warning: invalid value '" << *value << "' for env "
+              << name << ", using default " << default_value << std::endl;
+    return default_value;
 }
 
-size_t Environ::GetSizeT(const char* name, size_t default_value) {
-    return ReadSizeT(GetOsEnvironSource(), name, default_value);
-}
-
-bool Environ::GetBool(const char* name, bool default_value) {
-    return ReadBool(GetOsEnvironSource(), name, default_value);
-}
-
-std::string Environ::GetString(const char* name,
-                               const std::string& default_value) {
-    return ReadString(GetOsEnvironSource(), name, default_value);
-}
-
-Environ::Environ(const EnvironSource& source) {
-    const uint32_t hardware_threads =
-        static_cast<uint32_t>(std::thread::hardware_concurrency());
-    const uint32_t default_rpc_client_io_threads = std::min(
-        kDefaultRpcClientIoThreads, std::max(uint32_t{1}, hardware_threads));
-    rpc_client_io_threads_ = ResolveRpcClientIoThreads(
-        source, kRpcClientIoThreadsEnv, default_rpc_client_io_threads);
-    store_rpc_client_io_threads_ = ResolveRpcClientIoThreads(
-        source, kStoreRpcClientIoThreadsEnv, rpc_client_io_threads_);
-    transfer_engine_rpc_client_io_threads_ = ResolveRpcClientIoThreads(
-        source, kTransferEngineRpcClientIoThreadsEnv, rpc_client_io_threads_);
-
-    num_cq_per_ctx_ = ReadInt(source, "MC_NUM_CQ_PER_CTX", 1);
-    num_comp_channels_per_ctx_ =
-        ReadInt(source, "MC_NUM_COMP_CHANNELS_PER_CTX", 1);
-    ib_port_ = ReadInt(source, "MC_IB_PORT", 1);
-    ib_tc_ = ReadInt(source, "MC_IB_TC", -1);
-    ib_pci_relaxed_ordering_ = ReadInt(source, "MC_IB_PCI_RELAXED_ORDERING", 0);
-    gid_index_ = ReadInt(source, "MC_GID_INDEX", 3);
-    max_cqe_per_ctx_ = ReadInt(source, "MC_MAX_CQE_PER_CTX", 4096);
-    max_ep_per_ctx_ = ReadInt(source, "MC_MAX_EP_PER_CTX", 65536);
-    num_qp_per_ep_ = ReadInt(source, "MC_NUM_QP_PER_EP", 2);
-    max_sge_ = ReadInt(source, "MC_MAX_SGE", 4);
-    max_wr_ = ReadInt(source, "MC_MAX_WR", 256);
-    max_inline_ = ReadInt(source, "MC_MAX_INLINE", 64);
-    mtu_ = ReadInt(source, "MC_MTU", 4096);
-    workers_per_ctx_ = ReadInt(source, "MC_WORKERS_PER_CTX", 2);
-    slice_size_ = ReadSizeT(source, "MC_SLICE_SIZE", 65536);
-    retry_cnt_ = ReadInt(source, "MC_RETRY_CNT", 9);
-    log_level_ = ReadString(source, "MC_LOG_LEVEL", "INFO");
-    disable_metacache_ = ReadBool(source, "MC_DISABLE_METACACHE", false);
-    handshake_listen_backlog_ =
-        ReadInt(source, "MC_HANDSHAKE_LISTEN_BACKLOG", 128);
-    handshake_max_length_ = ReadInt(source, "MC_HANDSHAKE_MAX_LENGTH", 1048576);
-    log_dir_ = ReadString(source, "MC_LOG_DIR", "");
-    redis_password_ = ReadString(source, "MC_REDIS_PASSWORD", "");
-    redis_db_index_ = ReadInt(source, "MC_REDIS_DB_INDEX", 0);
-    fragment_ratio_ = ReadInt(source, "MC_FRAGMENT_RATIO", 4);
-    enable_dest_device_affinity_ =
-        ReadBool(source, "MC_ENABLE_DEST_DEVICE_AFFINITY", false);
-    use_ipv6_ = ReadBool(source, "MC_USE_IPV6", false);
-    min_rpc_port_ = ReadInt(source, "MC_MIN_RPC_PORT",
-                            ReadInt(source, "MC_MIN_PRC_PORT", 15000));
-    max_rpc_port_ = ReadInt(source, "MC_MAX_RPC_PORT",
-                            ReadInt(source, "MC_MAX_PRC_PORT", 17000));
-    enable_parallel_reg_mr_ = ReadInt(source, "MC_ENABLE_PARALLEL_REG_MR", -1);
-    endpoint_store_type_ =
-        ReadString(source, "MC_ENDPOINT_STORE_TYPE", "SIEVE");
-    force_tcp_ = ReadBool(source, "MC_FORCE_TCP", false);
-    force_hca_ = ReadBool(source, "MC_FORCE_HCA", false);
-    force_mnnvl_ = ReadBool(source, "MC_FORCE_MNNVL", false);
-    intra_nvlink_ = ReadBool(source, "MC_INTRA_NVLINK", false);
-    path_roundrobin_ = ReadBool(source, "MC_PATH_ROUNDROBIN", false);
-    with_nvidia_peermem_ = ReadBool(source, "WITH_NVIDIA_PEERMEM", true);
-    efa_cq_threads_ = ReadInt(source, "MC_EFA_CQ_THREADS", 1);
-    store_checksum_enabled_ =
-        ReadBool(source, "MOONCAKE_STORE_CHECKSUM", false);
+const Environ& Environ::Process() {
+    static const ProcessEnvironSource source;
+    static const Environ process_environ(source);
+    return process_environ;
 }
 
 }  // namespace mooncake

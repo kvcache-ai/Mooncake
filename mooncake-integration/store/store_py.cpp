@@ -4,6 +4,7 @@
 
 #include <functional>
 #include <limits>
+#include <mutex>
 #include <numeric>
 #include <optional>
 #include <unordered_map>
@@ -493,6 +494,41 @@ inline int to_py_ret(ErrorCode error_code) {
 #include "store_py_internal.h"
 
 }  // namespace
+
+class RangedReadSnapshotPy {
+   public:
+    RangedReadSnapshotPy(std::shared_ptr<PyClient> store,
+                         std::vector<std::string> keys)
+        : store_(std::move(store)), keys_(std::move(keys)) {
+        snapshot_ = store_->prepare_get_into_ranges_snapshot(keys_);
+    }
+
+    bool belongs_to(const std::shared_ptr<PyClient> &store) const {
+        return store_.get() == store.get();
+    }
+
+    std::vector<std::vector<std::vector<int64_t>>> get_into_ranges(
+        const std::vector<void *> &buffers,
+        const std::vector<std::vector<std::string>> &all_keys,
+        const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_sizes) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (snapshot_.should_refresh()) {
+            store_->refresh_get_into_ranges_snapshot(snapshot_, keys_);
+        }
+        return store_->get_into_ranges_from_snapshot(
+            buffers, all_keys, all_dst_offsets, all_src_offsets, all_sizes,
+            snapshot_);
+    }
+
+   private:
+    std::shared_ptr<PyClient> store_;
+    std::vector<std::string> keys_;
+    PyClient::RangedReadSnapshot snapshot_;
+    std::mutex mutex_;
+};
+
 // Python-specific wrapper functions that handle GIL and return pybind11 types
 class MooncakeStorePyWrapper {
    public:
@@ -1135,11 +1171,18 @@ class MooncakeStorePyWrapper {
     ReplicateConfig MakeIndexedConfig(
         const ReplicateConfig &config,
         const std::vector<size_t> &original_indices) const {
+        ReplicateConfig indexed_config = config;
+        if (config.session_ids) {
+            indexed_config.session_ids->clear();
+            for (size_t index : original_indices) {
+                indexed_config.session_ids->push_back(
+                    config.session_ids->at(index));
+            }
+        }
         if (!config.group_ids.has_value()) {
-            return config;
+            return indexed_config;
         }
 
-        ReplicateConfig indexed_config = config;
         std::vector<std::string> group_ids;
         group_ids.reserve(original_indices.size());
         for (size_t index : original_indices) {
@@ -1152,11 +1195,20 @@ class MooncakeStorePyWrapper {
     ReplicateConfig MakeRepeatedIndexedConfig(
         const ReplicateConfig &config,
         const std::vector<size_t> &original_indices, int repeat_count) const {
+        ReplicateConfig indexed_config = config;
+        if (config.session_ids) {
+            indexed_config.session_ids->clear();
+            for (size_t index : original_indices) {
+                for (int i = 0; i < repeat_count; ++i) {
+                    indexed_config.session_ids->push_back(
+                        config.session_ids->at(index));
+                }
+            }
+        }
         if (!config.group_ids.has_value()) {
-            return config;
+            return indexed_config;
         }
 
-        ReplicateConfig indexed_config = config;
         std::vector<std::string> group_ids;
         group_ids.reserve(original_indices.size() *
                           static_cast<size_t>(repeat_count));
@@ -1172,6 +1224,11 @@ class MooncakeStorePyWrapper {
     std::vector<int> ValidateGroupIdsForBatchConfig(
         const ReplicateConfig &config, size_t key_count,
         const char *operation_name) const {
+        if (!config.ValidSessionIds(key_count)) {
+            LOG(ERROR) << operation_name << ": invalid per-key session IDs";
+            return std::vector<int>(key_count,
+                                    to_py_ret(ErrorCode::INVALID_PARAMS));
+        }
         if (config.group_ids.has_value() &&
             config.group_ids->size() != key_count) {
             LOG(ERROR) << operation_name
@@ -1186,6 +1243,8 @@ class MooncakeStorePyWrapper {
         const std::string &key, pybind11::object tensor,
         const ReplicateConfig &config = ReplicateConfig{}, int tp_rank = 0,
         int tp_size = 1, int split_dim = 0) {
+        if (!config.ValidSessionIds(1))
+            return to_py_ret(ErrorCode::INVALID_PARAMS);
         try {
             std::vector<std::string> tp_keys;
             tp_keys.reserve(tp_size);
@@ -1198,7 +1257,13 @@ class MooncakeStorePyWrapper {
             if (!infos.has_value()) {
                 return to_py_ret(ErrorCode::INVALID_PARAMS);
             }
-            auto results = batch_put_tensor_infos_impl(tp_keys, *infos, config);
+            ReplicateConfig tp_config = config;
+            if (config.session_ids) {
+                tp_config.session_ids =
+                    std::vector<std::string>(tp_size, config.SessionId());
+            }
+            auto results =
+                batch_put_tensor_infos_impl(tp_keys, *infos, tp_config);
             for (int ret : results) {
                 if (ret != 0) return ret;
             }
@@ -2069,7 +2134,7 @@ class MooncakeDistributedNoFRegisterPyWrapper {
     MooncakeDistributedNoFRegisterPyWrapper() = default;
 };
 
-PYBIND11_MODULE(store, m) {
+PYBIND11_MODULE(_store, m) {
     m.def("_serialize_tensor", &serialize_tensor_metadata,
           "Inspect a torch tensor as Mooncake tensor metadata, data pointer, "
           "size, and owner.");
@@ -2077,6 +2142,10 @@ PYBIND11_MODULE(store, m) {
           "Return the serialized Mooncake tensor metadata size.");
     m.def("_deserialize_tensor", &deserialize_tensor_from_bytes,
           "Deserialize Mooncake tensor metadata plus payload bytes.");
+
+    py::class_<RangedReadSnapshotPy, std::shared_ptr<RangedReadSnapshotPy>>(
+        m, "RangedReadSnapshot",
+        "Reusable metadata snapshot for repeated ranged reads");
 
     // Object data type classification
     py::enum_<ObjectDataType>(m, "ObjectDataType")
@@ -2115,6 +2184,18 @@ PYBIND11_MODULE(store, m) {
                        &ReplicateConfig::prefer_alloc_in_same_node)
         .def_readwrite("data_type", &ReplicateConfig::data_type)
         .def_readwrite("group_ids", &ReplicateConfig::group_ids)
+        .def_property(
+            "session_ids",
+            [](const ReplicateConfig &config)
+                -> std::optional<std::vector<std::string>> {
+                if (!config.session_ids) return std::nullopt;
+                return *config.session_ids;
+            },
+            [](ReplicateConfig &config,
+               std::optional<std::vector<std::string>> ids) {
+                config.session_ids.reset();
+                if (ids) config.session_ids = std::move(*ids);
+            })
         .def("__str__", [](const ReplicateConfig &config) {
             std::ostringstream oss;
             oss << config;
@@ -2367,7 +2448,8 @@ PYBIND11_MODULE(store, m) {
                const std::string &ssd_offload_path = "",
                const std::string &tenant_id = "default",
                bool enable_client_http_server = false,
-               int client_http_port = DEFAULT_CLIENT_HTTP_PORT) {
+               int client_http_port = DEFAULT_CLIENT_HTTP_PORT,
+               bool enable_embedded_master = false) {
                 auto real_client = self.init_real_client();
                 std::shared_ptr<mooncake::TransferEngine> transfer_engine =
                     nullptr;
@@ -2378,12 +2460,15 @@ PYBIND11_MODULE(store, m) {
                 int ret;
                 {
                     py::gil_scoped_release release;
-                    ret = real_client->setup_real(
+                    auto result = real_client->setup_internal(
                         local_hostname, metadata_server, global_segment_size,
                         local_buffer_size, protocol, rdma_devices,
-                        master_server_addr, transfer_engine, "",
-                        enable_ssd_offload, ssd_offload_path, tenant_id,
-                        enable_client_http_server, client_http_port);
+                        master_server_addr, transfer_engine, "", 50052,
+                        enable_ssd_offload, true, ssd_offload_path, tenant_id,
+                        enable_client_http_server, client_http_port,
+                        enable_embedded_master);
+                    ret = result.has_value() ? 0
+                                             : static_cast<int>(result.error());
                 }
                 return ret;
             },
@@ -2394,7 +2479,8 @@ PYBIND11_MODULE(store, m) {
             py::arg("enable_ssd_offload") = false,
             py::arg("ssd_offload_path") = "", py::arg("tenant_id") = "default",
             py::arg("enable_client_http_server") = false,
-            py::arg("client_http_port") = DEFAULT_CLIENT_HTTP_PORT)
+            py::arg("client_http_port") = DEFAULT_CLIENT_HTTP_PORT,
+            py::arg("enable_embedded_master") = false)
         .def(
             "setup",
             [](MooncakeStorePyWrapper &self, const py::dict &config_dict) {
@@ -2426,6 +2512,11 @@ PYBIND11_MODULE(store, m) {
             "  local_buffer_size: Local buffer size (default 16MB).\n"
             "  protocol: Transfer protocol (default 'tcp').\n"
             "  rdma_devices: RDMA device list.\n"
+            "  enable_egm_store_pool: Use EGM DRAM for the global Store pool "
+            "(default false; requires protocol 'nvlink', "
+            "global_segment_size>0, and local_buffer_size=0).\n"
+            "  egm_numa_nodes: Provider NUMA nodes ('auto' or comma-separated "
+            "IDs; default 'auto').\n"
             "  master_server_addr: Master server address.\n"
             "  ipc_socket_path: IPC socket path.\n"
             "  enable_ssd_offload: Enable SSD offload (default false).\n"
@@ -2434,7 +2525,10 @@ PYBIND11_MODULE(store, m) {
             "  tenant_id: Tenant identifier (default 'default').\n"
             "  enable_client_http_server: Enable client HTTP endpoints "
             "(default false).\n"
-            "  client_http_port: Client HTTP metrics port (default 9300).")
+            "  client_http_port: Client HTTP metrics port (default 9300).\n"
+            "  enable_embedded_master: Start an in-process master so no "
+            "external mooncake_master is required (default false). This is "
+            "test/eval plumbing, not a documented deployment mode.")
         .def(
             "setup_dummy",
             [](MooncakeStorePyWrapper &self, size_t mem_pool_size,
@@ -2558,13 +2652,56 @@ PYBIND11_MODULE(store, m) {
             py::arg("keys"),
             "Check if multiple objects exist. Returns list of results: 1 if "
             "exists, 0 if not exists, -1 if error")
-        .def("close",
-             [](MooncakeStorePyWrapper &self) {
-                 if (!self.store_) return 0;
-                 int rc = self.store_->tearDownAll();
-                 self.store_.reset();
-                 return rc;
-             })
+        .def(
+            "probe_key",
+            [](MooncakeStorePyWrapper &self, const std::string &key) {
+                py::gil_scoped_release release;
+                return self.store_->probeKey(key);
+            },
+            py::arg("key"),
+            "Point-in-time existence check that grants no read lease. "
+            "Returns 1 if the object existed at the time of the call, 0 if "
+            "not exists, -1 if error. The object may still be evicted "
+            "before a subsequent get.")
+        .def(
+            "batch_probe_key",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::string> &keys, const std::string &policy,
+               uint64_t candidate_size) {
+                GrantLeasePolicy lease_policy;
+                if (policy == "none") {
+                    lease_policy.lease_mode = ProbeLeaseMode::None;
+                } else if (policy == "LastHitOnly") {
+                    lease_policy.lease_mode = ProbeLeaseMode::LastHitOnly;
+                } else {
+                    throw py::value_error("Unknown batch_probe_key policy: " +
+                                          policy);
+                }
+                lease_policy.candidate_size = candidate_size;
+                if (!self.is_client_initialized()) {
+                    return std::vector<int>(
+                        keys.size(), to_py_ret(ErrorCode::INVALID_PARAMS));
+                }
+                py::gil_scoped_release release;
+                return self.store_->batchProbeKey(keys, lease_policy);
+            },
+            py::arg("keys"), py::arg("policy") = "none",
+            py::arg("candidate_size") = 1,
+            "Per-key existence results: 1 if readable, 0 if missing, and "
+            "negative values on error. none grants no leases. LastHitOnly "
+            "leases the last all-1 group of candidate_size results; failed "
+            "candidates may retain partial leases after a concurrent eviction.")
+        .def(
+            "close",
+            [](MooncakeStorePyWrapper &self) {
+                int rc = self.store_ ? self.store_->tearDownAll() : 0;
+                self.store_.reset();
+                self.real_client_.reset();
+                self.use_dummy_client_ = false;
+                return rc;
+            },
+            "Close the store and clear the native client, including on "
+            "cleanup failure. A nonzero result is terminal, not retryable.")
         .def("health_check", &MooncakeStorePyWrapper::health_check,
              "Health check for store connectivity. "
              "Returns 0 if healthy, 1 if not initialized/closed, "
@@ -2922,6 +3059,60 @@ PYBIND11_MODULE(store, m) {
             py::arg("all_sizes"),
             "Get multiple byte ranges from multiple objects into multiple "
             "pre-allocated buffers")
+        .def(
+            "prepare_get_into_ranges_snapshot",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::string> &keys) {
+                if (!self.is_client_initialized()) {
+                    throw std::runtime_error("Client is not initialized");
+                }
+                std::vector<std::string> unique_keys;
+                unique_keys.reserve(keys.size());
+                std::unordered_set<std::string> seen;
+                seen.reserve(keys.size());
+                for (const auto &key : keys) {
+                    if (seen.insert(key).second) unique_keys.push_back(key);
+                }
+                py::gil_scoped_release release;
+                return std::make_shared<RangedReadSnapshotPy>(
+                    self.store_, std::move(unique_keys));
+            },
+            py::arg("keys"),
+            "Prepare a reusable metadata snapshot for ranged reads")
+        .def(
+            "get_into_ranges_from_snapshot",
+            [](MooncakeStorePyWrapper &self,
+               const std::shared_ptr<RangedReadSnapshotPy> &snapshot,
+               const std::vector<uintptr_t> &buffer_ptrs,
+               const std::vector<std::vector<std::string>> &all_keys,
+               const std::vector<std::vector<std::vector<size_t>>>
+                   &all_dst_offsets,
+               const std::vector<std::vector<std::vector<size_t>>>
+                   &all_src_offsets,
+               const std::vector<std::vector<std::vector<size_t>>> &all_sizes) {
+                if (!self.is_client_initialized()) {
+                    throw std::runtime_error("Client is not initialized");
+                }
+                if (!snapshot || !snapshot->belongs_to(self.store_)) {
+                    throw std::invalid_argument(
+                        "Ranged-read snapshot belongs to another Store");
+                }
+                std::vector<void *> buffers;
+                buffers.reserve(buffer_ptrs.size());
+                for (uintptr_t ptr : buffer_ptrs) {
+                    buffers.push_back(reinterpret_cast<void *>(ptr));
+                }
+                py::gil_scoped_release release;
+                return snapshot->get_into_ranges(buffers, all_keys,
+                                                 all_dst_offsets,
+                                                 all_src_offsets, all_sizes);
+            },
+            py::arg("snapshot"), py::arg("buffer_ptrs"), py::arg("all_keys"),
+            py::arg("all_dst_offsets"), py::arg("all_src_offsets"),
+            py::arg("all_sizes"),
+            "Get byte ranges using a reusable metadata snapshot. The "
+            "snapshot is refreshed at the read-lease midpoint before a new "
+            "transfer is submitted.")
         .def(
             "batch_get_into",
             [](MooncakeStorePyWrapper &self,

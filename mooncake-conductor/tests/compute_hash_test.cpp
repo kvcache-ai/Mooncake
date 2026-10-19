@@ -783,6 +783,62 @@ TEST(HashChain, RejectsInvalidInputsAtSetup) {
         nullptr);
 }
 
+TEST(SglangHashChain, SeedDoesNotChangeResolvedIdentityOrHashes) {
+    for (const auto* recipe : {"sglang", "sglang_bigram"}) {
+        SCOPED_TRACE(recipe);
+        HashProfile canonical;
+        ASSERT_TRUE(ResolveHashProfile({.strategy = recipe,
+                                        .algorithm = "sha256_raw",
+                                        .python_hash_seed = "0",
+                                        .index_projection = "first64_be"},
+                                       &canonical)
+                        .empty());
+        const ContextKey context{.tenant_id = "default",
+                                 .model_name = "model",
+                                 .lora_name = "",
+                                 .block_size = 4};
+        const std::vector<int32_t> tokens{1, 2, 3, 4, 5};
+        std::string error;
+        auto expected_strategy = CreateHashStrategy(canonical, &error);
+        ASSERT_NE(expected_strategy, nullptr) << error;
+        std::vector<HashBlock> expected;
+        ASSERT_TRUE(
+            expected_strategy->Compute(context, tokens, std::nullopt, &expected)
+                .empty());
+        for (const auto* seed : {"", "0", "1", "random", "unused"}) {
+            HashProfile resolved;
+            ASSERT_TRUE(ResolveHashProfile({.strategy = recipe,
+                                            .algorithm = "sha256_raw",
+                                            .python_hash_seed = seed,
+                                            .index_projection = "first64_be"},
+                                           &resolved)
+                            .empty());
+            EXPECT_EQ(resolved.python_hash_seed, "0");
+            EXPECT_EQ(resolved, canonical);
+            // Direct resolved-profile callers get the same semantic identity.
+            resolved.python_hash_seed = seed;
+            EXPECT_EQ(resolved, canonical);
+            EXPECT_EQ(canonical, resolved);
+            ASSERT_TRUE(ValidateHashProfile(resolved).empty());
+            auto strategy = CreateHashStrategy(resolved, &error);
+            ASSERT_NE(strategy, nullptr) << error;
+            std::vector<HashBlock> actual;
+            ASSERT_TRUE(
+                strategy->Compute(context, tokens, std::nullopt, &actual)
+                    .empty());
+            EXPECT_EQ(actual, expected);
+        }
+        auto different = canonical;
+        different.index_projection = "low64_be";
+        EXPECT_NE(different, canonical);
+        different = canonical;
+        different.strategy =
+            recipe == std::string("sglang") ? "sglang_bigram" : "sglang";
+        EXPECT_NE(different, canonical);
+    }
+    EXPECT_NE(ResolvedProfile("0"), ResolvedProfile("1"));
+}
+
 TEST(SglangHashChain, MatchesNativeSha256TokenChain) {
     HashProfile profile;
     const HashProfileConfig source{

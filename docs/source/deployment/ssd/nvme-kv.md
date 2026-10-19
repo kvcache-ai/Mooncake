@@ -4,7 +4,7 @@
 
 Mooncake Store can use a node-local NVMe Key-Value namespace as an SSD offload backend. The backend implements `StorageBackendInterface`, so the master tracks offloaded objects as `LOCAL_DISK` replicas and applications continue to use the normal Mooncake Store APIs.
 
-For implementation details, see [NVMe KV Backend Design](../../design/nvme-kv-backend.md).
+For implementation details, see [NVMe KV Backend Design](../../design/store/nvme-kv-backend.md).
 
 ## Prerequisites
 

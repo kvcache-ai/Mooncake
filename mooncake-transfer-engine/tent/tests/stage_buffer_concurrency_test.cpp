@@ -157,6 +157,22 @@ class StageBufferConcurrencyTest : public ::testing::Test {
     std::unique_ptr<ProxyManager> proxy_;
 };
 
+TEST_F(StageBufferConcurrencyTest, StageBuffersAreNotPublicSegmentBuffers) {
+    std::vector<uint8_t> data(kChunkSize);
+    ASSERT_TRUE(engine_->registerLocalMemory(data.data(), data.size()).ok());
+
+    uint64_t addr = 0;
+    ASSERT_TRUE(proxy_->pinStageBuffer("cpu:0", addr).ok());
+    SegmentInfo info;
+    ASSERT_TRUE(engine_->getSegmentInfo(LOCAL_SEGMENT_ID, info).ok());
+    ASSERT_EQ(info.buffers.size(), 1u);
+    EXPECT_EQ(info.buffers[0].base, reinterpret_cast<uint64_t>(data.data()));
+    EXPECT_EQ(info.buffers[0].length, data.size());
+
+    EXPECT_TRUE(proxy_->unpinStageBuffer(addr).ok());
+    EXPECT_TRUE(engine_->unregisterLocalMemory(data.data()).ok());
+}
+
 // The dangerous shape: every thread inserts a different entry at the same
 // time, so inserts and lookups overlap.
 TEST_F(StageBufferConcurrencyTest, ConcurrentFirstPinOfDistinctLocations) {

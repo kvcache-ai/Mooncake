@@ -23,6 +23,10 @@ TEST(KvEventPublisherTest, DisabledPublisherIsNoop) {
     KvEventPublisher publisher(config);
     EXPECT_FALSE(publisher.enabled());
     publisher.PublishStored("42", "cpu");
+    publisher.PublishStored("42", "cpu", TenantId::Default(), "", "session");
+    publisher.PublishCommitted("42", {"cpu"}, "default", "", "session");
+    publisher.SyncObjectState("42", {"disk"}, "default", "", {"cpu"},
+                              "session");
     publisher.PublishRemoved("42", "cpu");
     publisher.PublishCleared("tenant-a");
     const auto stats = publisher.GetStats();
@@ -181,6 +185,50 @@ struct ScopedSubscriber {
 };
 
 }  // namespace
+
+TEST(KvEventPublisherTest, SessionTagIsStoredAttributionOnly) {
+    for (bool legacy : {false, true}) {
+        auto endpoint = MakeIpcEndpoint();
+        auto config = MakeEnabledConfig(endpoint);
+        config.emit_legacy_compat_fields = legacy;
+        KvEventPublisher publisher(config);
+        ScopedSubscriber subscriber;
+        ASSERT_TRUE(subscriber.Connect(endpoint));
+        std::string session = "session-a";
+        publisher.PublishStored("a", "cpu", "default", "group", session);
+        session = "changed-after-enqueue";
+        publisher.PublishCommitted("b", {"cpu", "disk"}, "default", "",
+                                   "session-b");
+        publisher.SyncObjectState("c", {"disk"}, "default", "", {"cpu"},
+                                  "session-c");
+        publisher.PublishStored("untagged", "cpu");
+        publisher.PublishCleared();
+        size_t received = 0;
+        while (received < 7) {
+            msgpack::object_handle payload;
+            ASSERT_TRUE(ReceivePayload(subscriber.sub, &payload));
+            for (uint32_t i = 0; i < EventCount(payload); ++i) {
+                const auto& event = EventAt(payload, i);
+                const auto* tag = FindMapValue(event, "session_id");
+                const auto kind =
+                    MsgpackString(*FindMapValue(event, "event_type"));
+                if (kind == "stored") {
+                    ASSERT_NE(tag, nullptr);
+                    const auto key =
+                        MsgpackString(*FindMapValue(event, "object_key"));
+                    if (key == "untagged")
+                        EXPECT_EQ(tag->type, msgpack::type::NIL);
+                    else
+                        EXPECT_EQ(MsgpackString(*tag), "session-" + key);
+                } else {
+                    EXPECT_EQ(tag, nullptr);
+                }
+                ++received;
+            }
+        }
+        EXPECT_EQ(received, 7u);
+    }
+}
 
 TEST(KvEventPublisherTest, PublishesSglangObjectKeyOverZmq) {
     const std::string endpoint = MakeIpcEndpoint();

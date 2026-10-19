@@ -601,6 +601,11 @@ TEST_F(MetricsRecordingTest, FailoverResubmitSyncFailureRecordsBothAttempts) {
     ASSERT_TRUE(
         engine.submitTransfer(batch, {makeLocalWrite(buf.data(), kLen)}).ok());
     ASSERT_EQ(pollUntilTerminal(engine, batch, 0), TransferStatusEnum::FAILED);
+    for (int poll = 0; poll < 3; ++poll) {
+        TransferStatus status{TransferStatusEnum::PENDING, 0};
+        EXPECT_TRUE(engine.getTransferStatus(batch, 0, status).ok());
+        EXPECT_EQ(status.s, TransferStatusEnum::FAILED);
+    }
     auto after = MetricsSnapshot(TentMetrics::instance());
 
     EXPECT_EQ(fake_rdma->submit_calls.load(), 1);
@@ -622,6 +627,13 @@ TEST_F(MetricsRecordingTest, FailoverResubmitSyncFailureRecordsBothAttempts) {
         "\"write\"}";
     EXPECT_EQ(after.series(rdma_failures) - before.series(rdma_failures), 1);
     EXPECT_EQ(after.series(tcp_failures) - before.series(tcp_failures), 1);
+
+    EXPECT_EQ(after.counter("tent_write_failures_total") -
+                  before.counter("tent_write_failures_total"),
+              1);
+    const std::string poll_failures =
+        "tent_task_failures_total{transport=\"tcp\",reason=\"poll\"}";
+    EXPECT_EQ(after.series(poll_failures) - before.series(poll_failures), 1);
 
     EXPECT_TRUE(engine.freeBatch(batch).ok());
     EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), buf.size()).ok());
@@ -988,6 +1000,10 @@ TEST_F(MetricsRecordingTest, InfeasibleDeadlineRecordedOnFailedTransfer) {
     // Infeasible counter must increment even though the transfer failed.
     EXPECT_EQ(after.counter("tent_deadline_infeasible_total") -
                   before.counter("tent_deadline_infeasible_total"),
+              1);
+    const std::string rdma_infeasible =
+        "tent_deadline_infeasible_total{transport=\"rdma\"}";
+    EXPECT_EQ(after.series(rdma_infeasible) - before.series(rdma_infeasible),
               1);
     // MLU histogram must not receive a sample (no completion, no latency).
     EXPECT_EQ(after.histogramCount("tent_deadline_mlu_permille") -

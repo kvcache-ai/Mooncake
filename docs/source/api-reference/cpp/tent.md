@@ -108,6 +108,12 @@ When this variable is set, the `mooncake::TransferEngine` class internally deleg
 
 Passing a NIC priority matrix through `installTransport(..., args)` is **not** supported under TENT. Configure custom topology via `MC_TENT_CONF` or `MC_CUSTOM_TOPO_JSON` instead (see below).
 
+### TCP Worker Configuration
+
+For standard TCP, `transports/tcp/max_concurrent_tasks` controls the worker
+thread count and must be greater than zero. A zero value makes TCP installation
+return `InvalidArgument`; it does not select an automatic worker count.
+
 (custom-nic-priority-matrix)=
 ### Custom NIC Priority Matrix
 

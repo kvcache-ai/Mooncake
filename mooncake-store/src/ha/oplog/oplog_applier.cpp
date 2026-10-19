@@ -7,6 +7,29 @@
 #include "ha/oplog/oplog_types.h"
 
 namespace mooncake {
+namespace {
+
+bool SameImmutableWeightReference(const WeightRevisionMetadata& lhs,
+                                  const WeightRevisionMetadata& rhs) {
+    if (lhs.identity != rhs.identity ||
+        lhs.created_at_ms != rhs.created_at_ms) {
+        return false;
+    }
+    if (lhs.availability == WeightAvailabilityState::IMPORTING) {
+        return lhs.manifest.payload_group_id == rhs.manifest.payload_group_id &&
+               lhs.manifest.payload_count == rhs.manifest.payload_count &&
+               lhs.manifest.logical_bytes == rhs.manifest.logical_bytes;
+    }
+    return lhs.manifest == rhs.manifest;
+}
+
+bool MatchesWeightTenantAndKey(const OpLogEntry& entry,
+                               const WeightRevisionIdentity& identity) {
+    return NormalizeTenantId(entry.tenant_id) == identity.tenant_id &&
+           entry.object_key == MakeWeightRevisionMetadataKey(identity);
+}
+
+}  // namespace
 
 OpLogApplier::OpLogApplier(MetadataStore* metadata_store,
                            const std::string& cluster_id)
@@ -59,7 +82,7 @@ bool OpLogApplier::ApplyOpLogEntry(const OpLogEntry& entry) {
         return false;
     }
 
-    // Apply the operation based on type
+    bool applied = true;
     switch (entry.op_type) {
         case OpType::PUT_END:
             ApplyPutEnd(entry);
@@ -79,12 +102,27 @@ bool OpLogApplier::ApplyOpLogEntry(const OpLogEntry& entry) {
         case OpType::SEGMENT_UPDATE:
             ApplySegmentUpdate(entry);
             break;
+        case OpType::WEIGHT_METADATA_UPSERT:
+            applied = ApplyWeightMetadataUpsert(entry);
+            break;
+        case OpType::WEIGHT_METADATA_DELETE:
+            applied = ApplyWeightMetadataDelete(entry);
+            break;
+        case OpType::WEIGHT_LEASE_UPSERT:
+            applied = ApplyWeightLeaseUpsert(entry);
+            break;
+        case OpType::WEIGHT_LEASE_DELETE:
+            applied = ApplyWeightLeaseDelete(entry);
+            break;
         default:
             LOG(ERROR) << "OpLogApplier: unsupported op_type="
                        << static_cast<int>(entry.op_type)
                        << ", sequence_id=" << entry.sequence_id
                        << ", key=" << entry.object_key;
             return false;
+    }
+    if (!applied) {
+        return false;
     }
 
     // Update expected sequence ID
@@ -196,6 +234,175 @@ void OpLogApplier::ApplyRemove(const OpLogEntry& entry) {
         VLOG(1) << "OpLogApplier: applied REMOVE, key=" << entry.object_key
                 << ", sequence_id=" << entry.sequence_id;
     }
+}
+
+bool OpLogApplier::ApplyWeightMetadataUpsert(const OpLogEntry& entry) {
+    WeightRevisionMetadata next;
+    if (struct_pack::deserialize_to(next, entry.payload) !=
+            struct_pack::errc::ok ||
+        !ValidateWeightRevisionMetadata(next).ok() ||
+        next.operation != WeightOperationState::NONE ||
+        !MatchesWeightTenantAndKey(entry, next.identity)) {
+        LOG(ERROR) << "OpLogApplier: invalid weight metadata upsert, key="
+                   << entry.object_key << ", sequence_id=" << entry.sequence_id;
+        return false;
+    }
+
+    const auto tombstone =
+        metadata_store_->GetWeightMetadataTombstoneGeneration(next.identity);
+    if (tombstone.has_value()) {
+        LOG(ERROR) << "OpLogApplier: weight metadata is fenced by tombstone, "
+                   << "key=" << entry.object_key
+                   << ", sequence_id=" << entry.sequence_id;
+        return false;
+    }
+
+    const auto current = metadata_store_->GetWeightMetadata(next.identity);
+    if (!current.has_value()) {
+        if (next.metadata_generation != 1) {
+            LOG(ERROR) << "OpLogApplier: initial weight metadata generation "
+                          "must be one, key="
+                       << entry.object_key
+                       << ", generation=" << next.metadata_generation;
+            return false;
+        }
+        return metadata_store_->PutWeightMetadata(next);
+    }
+    if (*current == next) {
+        return true;
+    }
+    if (!CanAdvanceWeightMetadataGeneration(current->metadata_generation) ||
+        next.metadata_generation != current->metadata_generation + 1 ||
+        next.updated_at_ms < current->updated_at_ms ||
+        !SameImmutableWeightReference(*current, next) ||
+        (current->availability != next.availability &&
+         !IsValidWeightAvailabilityTransition(current->availability,
+                                              next.availability))) {
+        LOG(ERROR) << "OpLogApplier: stale or conflicting weight metadata, "
+                   << "key=" << entry.object_key
+                   << ", current_generation=" << current->metadata_generation
+                   << ", incoming_generation=" << next.metadata_generation;
+        return false;
+    }
+    return metadata_store_->PutWeightMetadata(next);
+}
+
+bool OpLogApplier::ApplyWeightMetadataDelete(const OpLogEntry& entry) {
+    WeightMetadataDeleteOp deletion;
+    if (struct_pack::deserialize_to(deletion, entry.payload) !=
+            struct_pack::errc::ok ||
+        !ValidateWeightRevisionIdentity(deletion.identity).ok() ||
+        deletion.metadata_generation == 0 ||
+        !MatchesWeightTenantAndKey(entry, deletion.identity)) {
+        LOG(ERROR) << "OpLogApplier: invalid weight metadata delete, key="
+                   << entry.object_key << ", sequence_id=" << entry.sequence_id;
+        return false;
+    }
+
+    const auto current = metadata_store_->GetWeightMetadata(deletion.identity);
+    if (!current.has_value()) {
+        const auto tombstone =
+            metadata_store_->GetWeightMetadataTombstoneGeneration(
+                deletion.identity);
+        return tombstone.has_value() &&
+               *tombstone == deletion.metadata_generation;
+    }
+    if (current->metadata_generation != deletion.metadata_generation) {
+        LOG(ERROR) << "OpLogApplier: stale weight metadata delete, key="
+                   << entry.object_key
+                   << ", current_generation=" << current->metadata_generation
+                   << ", delete_generation=" << deletion.metadata_generation;
+        return false;
+    }
+    return metadata_store_->RemoveWeightMetadata(deletion.identity,
+                                                 deletion.metadata_generation);
+}
+
+bool OpLogApplier::ApplyWeightLeaseUpsert(const OpLogEntry& entry) {
+    WeightRevisionLease next;
+    if (struct_pack::deserialize_to(next, entry.payload) !=
+            struct_pack::errc::ok ||
+        next.lease_id == 0 ||
+        !ValidateWeightRevisionIdentity(next.identity).ok() ||
+        !IsValidWeightComponent(next.holder) || next.expires_at_ms == 0 ||
+        next.fenced_metadata_generation == 0 ||
+        NormalizeTenantId(entry.tenant_id) != next.identity.tenant_id ||
+        entry.object_key != MakeWeightLeaseMetadataKey(next.lease_id)) {
+        LOG(ERROR) << "OpLogApplier: invalid weight lease upsert, key="
+                   << entry.object_key << ", sequence_id=" << entry.sequence_id;
+        return false;
+    }
+    if (metadata_store_->GetWeightLeaseTombstone(next.lease_id).has_value()) {
+        LOG(ERROR) << "OpLogApplier: weight lease is fenced by tombstone, id="
+                   << next.lease_id;
+        return false;
+    }
+    const auto current = metadata_store_->GetWeightLease(next.lease_id);
+    if (!current.has_value()) {
+        const auto revision = metadata_store_->GetWeightMetadata(next.identity);
+        if (!revision.has_value() ||
+            revision->metadata_generation != next.fenced_metadata_generation) {
+            LOG(ERROR)
+                << "OpLogApplier: new weight lease references stale revision, "
+                << "id=" << next.lease_id;
+            return false;
+        }
+        return metadata_store_->PutWeightLease(next);
+    }
+    if (*current == next) {
+        return true;
+    }
+    if (current->identity != next.identity || current->holder != next.holder ||
+        current->fenced_metadata_generation !=
+            next.fenced_metadata_generation ||
+        next.expires_at_ms < current->expires_at_ms) {
+        LOG(ERROR) << "OpLogApplier: conflicting weight lease upsert, id="
+                   << next.lease_id;
+        return false;
+    }
+    const auto revision = metadata_store_->GetWeightMetadata(next.identity);
+    if (!revision.has_value() ||
+        revision->metadata_generation < next.fenced_metadata_generation) {
+        LOG(ERROR) << "OpLogApplier: renewed weight lease references missing "
+                      "revision, id="
+                   << next.lease_id;
+        return false;
+    }
+    return metadata_store_->PutWeightLease(next);
+}
+
+bool OpLogApplier::ApplyWeightLeaseDelete(const OpLogEntry& entry) {
+    WeightLeaseDeleteOp deletion;
+    if (struct_pack::deserialize_to(deletion, entry.payload) !=
+            struct_pack::errc::ok ||
+        deletion.lease_id == 0 ||
+        !ValidateWeightRevisionIdentity(deletion.identity).ok() ||
+        deletion.fenced_metadata_generation == 0 ||
+        NormalizeTenantId(entry.tenant_id) != deletion.identity.tenant_id ||
+        entry.object_key != MakeWeightLeaseMetadataKey(deletion.lease_id)) {
+        LOG(ERROR) << "OpLogApplier: invalid weight lease delete, key="
+                   << entry.object_key << ", sequence_id=" << entry.sequence_id;
+        return false;
+    }
+    const auto current = metadata_store_->GetWeightLease(deletion.lease_id);
+    if (!current.has_value()) {
+        const auto tombstone =
+            metadata_store_->GetWeightLeaseTombstone(deletion.lease_id);
+        return tombstone.has_value() &&
+               tombstone->identity == deletion.identity &&
+               tombstone->fenced_metadata_generation ==
+                   deletion.fenced_metadata_generation;
+    }
+    if (current->identity != deletion.identity ||
+        current->fenced_metadata_generation !=
+            deletion.fenced_metadata_generation) {
+        LOG(ERROR) << "OpLogApplier: stale weight lease delete, id="
+                   << deletion.lease_id;
+        return false;
+    }
+    return metadata_store_->RemoveWeightLease(
+        deletion.lease_id, deletion.identity,
+        deletion.fenced_metadata_generation);
 }
 
 const StandbySegmentRegistry& OpLogApplier::GetSegmentRegistry() const {

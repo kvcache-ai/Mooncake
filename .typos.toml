@@ -12,6 +12,10 @@ hsa = "hsa"
 Optin = "Optin"
 HPE = "HPE"
 
+[default.extend-identifiers]
+# CPython buffer protocol flag from the Python C API.
+PyBUF_ND = "PyBUF_ND"
+
 [files]
 extend-exclude = [
   "mooncake-transfer-engine/tent/include/tent/thirdparty/nlohmann/json.h",
