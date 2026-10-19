@@ -10,9 +10,11 @@ namespace mooncake {
 
 RingAlgorithm::RingAlgorithm(DeviceCollectiveWorkspace& workspace,
                              const SimpleProtocol& simple)
-    : AlgorithmProvider(DeviceCollectiveAlgorithm::Ring, kAlgorithmKey,
-                        kEndpointVersion, simple,
-                        {OpType::AllReduce, OpType::AllGather}),
+    : AlgorithmProvider(
+          DeviceCollectiveAlgorithm::Ring, kAlgorithmKey, kEndpointVersion,
+          simple,
+          {OpType::AllReduce, OpType::AllGather, OpType::ReduceScatter,
+           OpType::Broadcast, OpType::Reduce, OpType::Barrier}),
       workspace_(workspace),
       simple_(simple) {}
 
@@ -106,6 +108,30 @@ PGResult<void> RingAlgorithm::enqueueImpl(const AllReduceRequest& request,
 PGResult<void> RingAlgorithm::enqueueImpl(const AllGatherRequest& request,
                                           cudaStream_t stream) const {
     PG_TRY(launchRingAllGatherKernel(request, state_.get(), stream));
+    return {};
+}
+
+PGResult<void> RingAlgorithm::enqueueImpl(const ReduceScatterRequest& request,
+                                          cudaStream_t stream) const {
+    PG_TRY(launchRingReduceScatterKernel(request, state_.get(), stream));
+    return {};
+}
+
+PGResult<void> RingAlgorithm::enqueueImpl(const BroadcastRequest& request,
+                                          cudaStream_t stream) const {
+    PG_TRY(launchRingBroadcastKernel(request, state_.get(), stream));
+    return {};
+}
+
+PGResult<void> RingAlgorithm::enqueueImpl(const ReduceRequest& request,
+                                          cudaStream_t stream) const {
+    PG_TRY(launchRingReduceKernel(request, state_.get(), stream));
+    return {};
+}
+
+PGResult<void> RingAlgorithm::enqueueImpl(const BarrierRequest& request,
+                                          cudaStream_t stream) const {
+    PG_TRY(launchRingBarrierKernel(request, state_.get(), stream));
     return {};
 }
 

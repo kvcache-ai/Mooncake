@@ -43,6 +43,14 @@ class RingAlgorithm final : public AlgorithmProvider {
                                cudaStream_t stream) const override;
     PGResult<void> enqueueImpl(const AllGatherRequest& request,
                                cudaStream_t stream) const override;
+    PGResult<void> enqueueImpl(const ReduceScatterRequest& request,
+                               cudaStream_t stream) const override;
+    PGResult<void> enqueueImpl(const BroadcastRequest& request,
+                               cudaStream_t stream) const override;
+    PGResult<void> enqueueImpl(const ReduceRequest& request,
+                               cudaStream_t stream) const override;
+    PGResult<void> enqueueImpl(const BarrierRequest& request,
+                               cudaStream_t stream) const override;
 
    private:
     RingAlgorithm(DeviceCollectiveWorkspace& workspace,
