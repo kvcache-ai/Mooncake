@@ -1,0 +1,104 @@
+name: Build NPU Test Wheel
+on:
+  push:
+    branches: [feat/bypass-local-copy]
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - arch: aarch64
+            runner: ubuntu-22.04-arm
+            cann_arch: aarch64
+            python-version: '3.12'
+
+    runs-on: ${{ matrix.runner }}
+    env:
+      NPU_BUILD: "1"
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install CANN Toolkit
+        shell: bash
+        run: |
+          set -euo pipefail
+          CANN_BASE_URL="https://ascend.devcloud.huaweicloud.com/cann/run/software"
+          CANN_VERSION=$(curl -s "${CANN_BASE_URL}/" | grep -oP '[0-9]+\.[0-9]+\.[0-9]+(?=/)' | sort -V | tail -1)
+          echo "Latest CANN version: ${CANN_VERSION}"
+          CANN_URL="${CANN_BASE_URL}/${CANN_VERSION}/${{ matrix.cann_arch }}/Ascend-cann-toolkit_${CANN_VERSION}_linux-${{ matrix.cann_arch }}.run"
+          echo "Downloading CANN ${CANN_VERSION}"
+          wget -q --show-progress -O /tmp/cann_toolkit.run "${CANN_URL}"
+          chmod +x /tmp/cann_toolkit.run
+          sudo /tmp/cann_toolkit.run --install --install-for-all --install-path=/usr/local/Ascend --quiet
+          rm -f /tmp/cann_toolkit.run
+
+      - name: Build and install HIXL
+        shell: bash
+        run: |
+          set -eo pipefail
+          source /usr/local/Ascend/cann/set_env.sh
+          sudo $(command -v python3.12) -m pip install setuptools
+          cd /tmp
+          git clone https://gitcode.com/cann/hixl.git
+          cd hixl
+          bash build.sh -j$(nproc)
+          sudo ./build_out/cann-hixl_*.run --full --quiet --pylocal --install-path=/usr/local/Ascend
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -eo pipefail
+          source /usr/local/Ascend/cann/set_env.sh
+          sudo bash dependencies.sh -y
+          sudo bash scripts/ascend/dependencies_ascend_installation.sh
+
+      - name: Configure project
+        shell: bash
+        run: |
+          set -eo pipefail
+          source /usr/local/Ascend/cann/set_env.sh
+          rm -rf build
+          mkdir build
+          cd build
+          cmake .. \
+            -DUSE_ASCEND_DIRECT=ON \
+            -DUSE_ETCD=ON \
+            -DSTORE_USE_ETCD=ON \
+            -DBUILD_UNIT_TESTS=OFF \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DPython3_EXECUTABLE="$(command -v python3.12)" \
+            -DCMAKE_INSTALL_RPATH_USE_LINK_PATH=OFF \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=OFF \
+            -DCMAKE_SKIP_INSTALL_RPATH=ON
+
+      - name: Build project
+        shell: bash
+        run: |
+          set -eo pipefail
+          source /usr/local/Ascend/cann/set_env.sh
+          cd build
+          cmake --build . -j"$(nproc)"
+          sudo cmake --install .
+
+      - name: Build Python wheel
+        shell: bash
+        run: |
+          set -eo pipefail
+          source /usr/local/Ascend/cann/set_env.sh
+          export LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:/usr/local/lib"
+          NPU_BUILD=1 PYTHON_VERSION=3.12 OUTPUT_DIR=dist-npu ./scripts/build_wheel.sh
+
+      - name: Upload Python wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mooncake-wheel-npu-test
+          path: mooncake-wheel/dist-npu/*.whl
