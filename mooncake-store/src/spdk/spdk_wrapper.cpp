@@ -20,9 +20,12 @@
 namespace mooncake {
 namespace {
 
-void ApplyCtrlrOptsFromEnv(struct spdk_nvme_ctrlr_opts *opts) {
-    opts->keep_alive_timeout_ms = 0;
+void ApplyCtrlrOptsFromEnv(struct spdk_nvme_ctrlr_opts *opts,
+                           bool recovery_enabled) {
     const auto config = SpdkControllerConfig::FromEnvironment();
+    // Only recoverable client controllers have continuous admin polling.
+    opts->keep_alive_timeout_ms =
+        recovery_enabled ? config.keep_alive_timeout_ms.value_or(10000) : 0;
     if (config.num_io_queues.has_value()) {
         opts->num_io_queues = *config.num_io_queues;
     }
@@ -162,6 +165,8 @@ bool SpdkWrapper::InitializeEnv() {
 }
 
 void SpdkWrapper::Cleanup() {
+    // Finish any initial connection before stopping polling and the SPDK env.
+    std::lock_guard<std::mutex> connect_lock(connect_mutex_);
     {
         std::lock_guard<std::mutex> lock(controller_mutex_);
         controller_stop_ = true;
@@ -381,7 +386,8 @@ int SpdkWrapper::ConnectController(const struct spdk_nvme_transport_id *trid,
                                    ctrlr_info *info) {
     auto probe_cb = [](void *cb_ctx, const struct spdk_nvme_transport_id *trid,
                        struct spdk_nvme_ctrlr_opts *opts) -> bool {
-        ApplyCtrlrOptsFromEnv(opts);
+        auto *info = static_cast<ctrlr_info *>(cb_ctx);
+        ApplyCtrlrOptsFromEnv(opts, info->recovery_enabled);
         LOG(INFO) << "Attaching to " << trid->traddr << " " << trid->subnqn;
         return true;
     };
@@ -389,7 +395,8 @@ int SpdkWrapper::ConnectController(const struct spdk_nvme_transport_id *trid,
     auto attach_cb = [](void *cb_ctx, const struct spdk_nvme_transport_id *trid,
                         struct spdk_nvme_ctrlr *ctrlr,
                         const struct spdk_nvme_ctrlr_opts *opts) {
-        LOG(INFO) << "Attached to " << trid->traddr << " " << trid->subnqn;
+        LOG(INFO) << "Attached to " << trid->traddr << " " << trid->subnqn
+                  << " keep_alive_timeout_ms=" << opts->keep_alive_timeout_ms;
         ctrlr_info *info = (ctrlr_info *)cb_ctx;
         info->ctrlr = ctrlr;
     };
@@ -421,19 +428,28 @@ nof_seg_handle *SpdkWrapper::OpenNofSegment(const std::string &tr_str,
     {
         std::lock_guard<std::mutex> lock(ctrlrs_mutex);
         auto it = connected_ctrlrs.find(tr.ctrlr_key);
-        if (it == connected_ctrlrs.end()) {
+        if (it != connected_ctrlrs.end()) info = it->second.get();
+    }
+    if (!info) {
+        std::lock_guard<std::mutex> connect_lock(connect_mutex_);
+        {
+            std::lock_guard<std::mutex> lock(ctrlrs_mutex);
+            auto it = connected_ctrlrs.find(tr.ctrlr_key);
+            if (it != connected_ctrlrs.end()) info = it->second.get();
+        }
+        if (!info) {
             auto new_info = std::make_unique<ctrlr_info>();
             info = new_info.get();
             info->recovery_enabled = recovery_enabled;
 
+            // Keep slow connection work outside the controller table lock.
             ret = ConnectController(&tr.trid, info);
-            if (ret != 0) {
+            if (ret != 0 || !info->ctrlr) {
                 return nullptr;
             }
 
+            std::lock_guard<std::mutex> lock(ctrlrs_mutex);
             connected_ctrlrs[tr.ctrlr_key] = std::move(new_info);
-        } else {
-            info = it->second.get();
         }
     }
 
@@ -795,9 +811,8 @@ void SpdkWrapper::ControllerLoop() {
             lock.unlock();
             if (state == State::Ready) {
                 // In SPDK 23.01, admin polling fetches RDMA connection events
-                // and dispatches them to the affected qpairs. Keep polling even
-                // with keep-alive disabled so workers can detect remote
-                // disconnects.
+                // and dispatches them to the affected qpairs. It also sends
+                // Keep Alive commands when enabled, including while idle.
                 if (spdk_nvme_ctrlr_process_admin_completions(info->ctrlr) < 0)
                     RequestRecovery(info);
                 // RequestRecovery() may have changed info->state to Draining,
@@ -821,8 +836,13 @@ void SpdkWrapper::ControllerLoop() {
             }
 
             int rc = 0;
-            if (state == State::Reconnecting)
+            if (state == State::Reconnecting) {
+                // Admin may connect before controller initialization finishes.
+                // Poll it so SPDK can send Keep Alive once enabled.
+                spdk_nvme_ctrlr_process_admin_completions(info->ctrlr);
+
                 rc = spdk_nvme_ctrlr_reconnect_poll_async(info->ctrlr);
+            }
 
             lock.lock();
             info->state = state;
@@ -858,9 +878,11 @@ void SpdkWrapper::ControllerLoop() {
                 post_recovery_task_(owner, info, true);
             info->state = State::Ready;
             const auto *trid = spdk_nvme_ctrlr_get_transport_id(info->ctrlr);
-            LOG(INFO) << "nof_recovery ready traddr=" << trid->traddr
-                      << " trsvcid=" << trid->trsvcid
-                      << " subnqn=" << trid->subnqn;
+            LOG(INFO)
+                << "nof_recovery ready traddr=" << trid->traddr
+                << " trsvcid=" << trid->trsvcid << " subnqn=" << trid->subnqn
+                << " keep_alive_timeout_ms="
+                << spdk_nvme_ctrlr_get_opts(info->ctrlr)->keep_alive_timeout_ms;
         }
 
         if (stopping && !reconnect_in_progress) return;

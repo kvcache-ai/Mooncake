@@ -43,11 +43,12 @@ class SpdkControllerConfigTest : public ::testing::Test {
         FLAGS_logtostderr = original_logtostderr_;
     }
 
-    inline static constexpr std::array<const char*, 8> kVariables = {
-        "MC_NVME_NUM_IO_QUEUES",     "MC_NVME_IO_QUEUE_SIZE",
-        "MC_NVME_IO_QUEUE_REQUESTS", "MC_NVME_TRANSPORT_ACK_TIMEOUT",
-        "MC_NVME_ADMIN_QUEUE_SIZE",  "MC_NVME_FABRICS_CONNECT_TIMEOUT_US",
-        "MC_NVME_HEADER_DIGEST",     "MC_NVME_DATA_DIGEST",
+    inline static constexpr std::array<const char*, 9> kVariables = {
+        "MC_NVME_NUM_IO_QUEUES",         "MC_NVME_IO_QUEUE_SIZE",
+        "MC_NVME_IO_QUEUE_REQUESTS",     "MC_NVME_TRANSPORT_ACK_TIMEOUT",
+        "MC_NVME_ADMIN_QUEUE_SIZE",      "MC_NVME_FABRICS_CONNECT_TIMEOUT_US",
+        "MC_NVME_HEADER_DIGEST",         "MC_NVME_DATA_DIGEST",
+        "MC_NVME_KEEP_ALIVE_TIMEOUT_MS",
     };
     std::array<std::optional<std::string>, kVariables.size()> original_;
     bool original_logtostderr_ = false;
@@ -69,6 +70,7 @@ TEST_F(SpdkControllerConfigTest, UnsetAndEmptyValuesLeaveOverridesAbsent) {
     EXPECT_FALSE(config.fabrics_connect_timeout_us.has_value());
     EXPECT_FALSE(config.header_digest.has_value());
     EXPECT_FALSE(config.data_digest.has_value());
+    EXPECT_FALSE(config.keep_alive_timeout_ms.has_value());
     EXPECT_TRUE(diagnostics.empty()) << diagnostics;
 }
 
@@ -81,6 +83,7 @@ TEST_F(SpdkControllerConfigTest, ReadsIndependentValidOverrides) {
     ASSERT_EQ(setenv("MC_NVME_FABRICS_CONNECT_TIMEOUT_US", "66", 1), 0);
     ASSERT_EQ(setenv("MC_NVME_HEADER_DIGEST", "false", 1), 0);
     ASSERT_EQ(setenv("MC_NVME_DATA_DIGEST", "TRUE", 1), 0);
+    ASSERT_EQ(setenv("MC_NVME_KEEP_ALIVE_TIMEOUT_MS", "20000", 1), 0);
 
     const auto config = SpdkControllerConfig::FromEnvironment();
 
@@ -92,6 +95,7 @@ TEST_F(SpdkControllerConfigTest, ReadsIndependentValidOverrides) {
     EXPECT_EQ(config.fabrics_connect_timeout_us, 66u);
     EXPECT_EQ(config.header_digest, false);
     EXPECT_EQ(config.data_digest, true);
+    EXPECT_EQ(config.keep_alive_timeout_ms, 20000u);
 }
 
 TEST_F(SpdkControllerConfigTest, UsesTypedIntegerAndBooleanSyntax) {
@@ -160,6 +164,20 @@ TEST_F(SpdkControllerConfigTest, EachConstructionReadsCurrentEnvironment) {
     EXPECT_EQ(first.num_io_queues, 1u);
     EXPECT_EQ(second.num_io_queues, 2u);
     EXPECT_FALSE(third.num_io_queues.has_value());
+}
+
+TEST_F(SpdkControllerConfigTest, KeepAliveAllowsDisableAndBoundsTimeout) {
+    ASSERT_EQ(setenv("MC_NVME_KEEP_ALIVE_TIMEOUT_MS", "0", 1), 0);
+    EXPECT_EQ(SpdkControllerConfig::FromEnvironment().keep_alive_timeout_ms,
+              0u);
+
+    ASSERT_EQ(setenv("MC_NVME_KEEP_ALIVE_TIMEOUT_MS", "3600000", 1), 0);
+    EXPECT_EQ(SpdkControllerConfig::FromEnvironment().keep_alive_timeout_ms,
+              3600000u);
+
+    ASSERT_EQ(setenv("MC_NVME_KEEP_ALIVE_TIMEOUT_MS", "3600001", 1), 0);
+    EXPECT_FALSE(SpdkControllerConfig::FromEnvironment()
+                     .keep_alive_timeout_ms.has_value());
 }
 
 }  // namespace

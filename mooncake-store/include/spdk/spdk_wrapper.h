@@ -178,6 +178,8 @@ class SpdkWrapper {
     std::mutex init_mutex;
     std::map<std::string, std::unique_ptr<ctrlr_info>> connected_ctrlrs;
     std::mutex ctrlrs_mutex;
+    // Serializes initial connections without blocking controller polling.
+    std::mutex connect_mutex_;
 
     std::mutex controller_mutex_;
     std::condition_variable controller_cv_;

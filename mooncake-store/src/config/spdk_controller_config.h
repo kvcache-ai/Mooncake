@@ -14,6 +14,7 @@ struct SpdkControllerConfig {
     std::optional<uint64_t> fabrics_connect_timeout_us;
     std::optional<bool> header_digest;
     std::optional<bool> data_digest;
+    std::optional<uint32_t> keep_alive_timeout_ms;
 
     static SpdkControllerConfig FromEnvironment();
 };
