@@ -630,6 +630,9 @@ TEST_F(DfsSyncClientTest, DfsOnlyBatchFailureOnlyRevokesFailedKey) {
     ExpectDfsOnlyValue(keys[0], values[0]);
     ExpectNotFound(keys[1]);
 
+    // Restore writes after the persistent failure before retrying the key.
+    adapter_->FailWriteCall(-1);
+
     // The revoked key and its extent can be reused.
     std::vector<Slice> retry{{values[1].data(), values[1].size()}};
     ASSERT_TRUE(writer_->Put(keys[1], retry, DfsOnlyConfig()).has_value());
