@@ -6713,8 +6713,9 @@ MasterService::BatchUpsertStart(const UUID& client_id,
     std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
         results;
     results.reserve(keys.size());
+    ReplicateConfig key_config = config;
     for (size_t i = 0; i < keys.size(); ++i) {
-        auto key_config = config.ForSingleKey(i);
+        key_config.SetKeyIds(config, i);
         results.emplace_back(UpsertStart(client_id, keys[i], tenant_id,
                                          slice_lengths[i], key_config));
     }

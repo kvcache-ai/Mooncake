@@ -157,17 +157,16 @@ struct ReplicateConfig {
         return session_ids && !session_ids->empty() ? session_ids->front() : "";
     }
 
-    ReplicateConfig ForSingleKey(size_t key_index) const {
-        ReplicateConfig key_config = *this;
-        if (group_ids.has_value()) {
-            key_config.group_ids =
-                std::vector<std::string>{group_ids->at(key_index)};
+    // Reuse a copy of the batch config; select IDs from the original batch.
+    void SetKeyIds(const ReplicateConfig& batch_config, size_t key_index) {
+        if (batch_config.group_ids.has_value()) {
+            group_ids =
+                std::vector<std::string>{batch_config.group_ids->at(key_index)};
         }
-        if (session_ids) {
-            key_config.session_ids =
-                std::vector<std::string>{session_ids->at(key_index)};
+        if (batch_config.session_ids) {
+            session_ids = std::vector<std::string>{
+                batch_config.session_ids->at(key_index)};
         }
-        return key_config;
     }
 
     friend std::ostream& operator<<(std::ostream& os,

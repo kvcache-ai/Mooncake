@@ -21,7 +21,7 @@ def session_store(request, tmp_path):
     # Reserve distinct local ports while selecting the endpoints.
     reservations = [socket.socket() for _ in range(4)]
     for reservation in reservations:
-        reservation.bind(("127.0.0.1", 0))
+        reservation.bind(("0.0.0.0", 0))
     rpc, metadata, events, admin = [s.getsockname()[1] for s in reservations]
     for reservation in reservations:
         reservation.close()
@@ -156,6 +156,23 @@ def test_session_tags_over_rpc_and_zmq(session_store):
     } == {
         "one": "y",
         "two": "z",
+    }
+
+    config = tagged("same-node-a", "same-node-b")
+    config.prefer_alloc_in_same_node = True
+    buffer = ctypes.create_string_buffer(b"ab")
+    pointer = ctypes.addressof(buffer)
+    assert store.register_buffer(pointer, 2) == 0
+    try:
+        assert store.batch_put_from_multi_buffers(
+            ["local-a", "local-b"], [[pointer], [pointer + 1]], [[1], [1]], config
+        ) == [0, 0]
+    finally:
+        store.unregister_buffer(pointer)
+    assert (store.get("local-a"), store.get("local-b")) == (b"a", b"b")
+    assert {e["object_key"]: e["session_id"] for e in receive(2)} == {
+        "local-a": "same-node-a",
+        "local-b": "same-node-b",
     }
 
     for invalid in (tagged("x"), tagged("x", "x" * 257), tagged("x", b"\xff")):

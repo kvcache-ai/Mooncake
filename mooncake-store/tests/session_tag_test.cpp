@@ -1,6 +1,26 @@
+#include <cstdlib>
+#include <new>
+
 #include "master_service_test_fixture.h"
 #include "metadata_store.h"
 #include "rpc_service.h"
+
+namespace {
+// Count only allocations made by the config-splitting test on its own thread.
+thread_local bool track_allocations = false;
+thread_local size_t tracked_allocation_bytes = 0;
+}  // namespace
+
+void* operator new(size_t size) {
+    if (void* ptr = std::malloc(size ? size : 1)) {
+        if (track_allocations) tracked_allocation_bytes += size;
+        return ptr;
+    }
+    throw std::bad_alloc();
+}
+
+void operator delete(void* ptr) noexcept { std::free(ptr); }
+void operator delete(void* ptr, size_t) noexcept { std::free(ptr); }
 
 namespace mooncake::test {
 namespace {
@@ -70,10 +90,56 @@ TEST(SessionTagTest, RpcCompatibilityAndBatchValidation) {
     config.group_ids = std::vector<std::string>{"g1", "g2", "g3"};
     EXPECT_TRUE(config.ValidSessionIds(3));
     EXPECT_FALSE(config.ValidSessionIds(2));
-    EXPECT_EQ(config.ForSingleKey(2).SessionId(), "b");
-    EXPECT_EQ(config.ForSingleKey(2).group_ids->at(0), "g3");
+    config.dfs_replica_num = 2;
+    config.soft_pin_action = SoftPinAction::ENABLE;
+    config.soft_pin_ttl_ms = 60000;
+    auto key_config = config;
+    key_config.preferred_segment = "selected-segment";
+    for (size_t i = 0; i < 3; ++i) {
+        key_config.SetKeyIds(config, i);
+        ASSERT_EQ(key_config.session_ids->size(), 1);
+        EXPECT_EQ(key_config.SessionId(), config.session_ids->at(i));
+        ASSERT_EQ(key_config.group_ids->size(), 1);
+        EXPECT_EQ(key_config.group_ids->front(), config.group_ids->at(i));
+        EXPECT_EQ(key_config.preferred_segment, "selected-segment");
+        EXPECT_EQ(key_config.dfs_replica_num, 2);
+        EXPECT_EQ(key_config.soft_pin_action, SoftPinAction::ENABLE);
+        EXPECT_EQ(key_config.soft_pin_ttl_ms, 60000);
+    }
+    EXPECT_EQ(config.session_ids->size(), 3);
+    EXPECT_EQ(config.group_ids->size(), 3);
+    EXPECT_TRUE(config.preferred_segment.empty());
     EXPECT_TRUE(Tagged(std::string(256, 'x')).ValidSessionIds(1));
     EXPECT_FALSE(Tagged(std::string(257, 'x')).ValidSessionIds(1));
+}
+
+TEST(SessionTagTest, BatchSessionIdSelectionAllocatesLinearly) {
+    size_t previous_bytes = 0;
+    for (size_t count : {1024, 4096}) {
+        ReplicateConfig config;
+        config.session_ids =
+            std::vector<std::string>(count, std::string(64, 's'));
+        size_t selected_bytes = 0;
+        tracked_allocation_bytes = 0;
+        track_allocations = true;
+        {
+            auto key_config = config;
+            for (size_t i = 0; i < count; ++i) {
+                key_config.SetKeyIds(config, i);
+                selected_bytes += key_config.session_ids->front().size();
+            }
+        }
+        track_allocations = false;
+        const size_t allocated_bytes = tracked_allocation_bytes;
+        EXPECT_EQ(selected_bytes, count * 64);
+        EXPECT_LT(allocated_bytes, count * 512);
+        if (previous_bytes) {
+            EXPECT_LE(allocated_bytes, previous_bytes * 5);
+        }
+        previous_bytes = allocated_bytes;
+        RecordProperty("allocated_bytes_" + std::to_string(count),
+                       std::to_string(allocated_bytes));
+    }
 }
 
 TEST(SessionTagTest, SessionIdsRequireValidUtf8) {
