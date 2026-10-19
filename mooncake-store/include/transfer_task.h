@@ -4,6 +4,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -406,6 +407,7 @@ class MemcpyWorkerPool {
 #ifdef USE_NOF
 // struct SpdkNofSubTask;
 struct SpdkNofQos;
+struct SpdkNofControllerState;
 
 /**
  * @brief Spdk nvmf operation descriptor
@@ -455,6 +457,8 @@ struct SpdkNofSubTask {
 constexpr int kDefaultSpdkNofSubmitChunkBytes = (1 << 17);    // 128k
 constexpr int kDefaultSpdkNofInflightBytesLimit = (1 << 25);  // 32M
 struct SpdkNofQos {
+    SpdkNofControllerState* controller_state{nullptr};
+
     int inflight_blocks[kSpdkNofOpNum];
     int blocks_per_chunk;
     int inflight_blocks_limit;
@@ -486,6 +490,13 @@ struct SpdkNofQos {
     }
 };
 
+struct SpdkNofControllerState {
+    enum class Phase { Running, Cleaning, Paused };
+
+    Phase phase{Phase::Running};
+    std::vector<nof_seg_handle*> draining_segments;
+};
+
 /**
  * @brief Thread pool for asynchronous spdk nvmf operations
  *
@@ -495,6 +506,13 @@ struct SpdkNofQos {
 constexpr int kDefaultSpdkNofWorkers = 4;
 class SpdkNofWorkerPool {
    public:
+    struct WorkerContext;
+    using ControlTask = std::function<void(WorkerContext&)>;
+
+    // Callbacks run on the target worker and must not wait for other tasks on
+    // that worker. Callers must stop posting before destroying the pool.
+    void PostControlTask(int worker_idx, ControlTask task);
+
     explicit SpdkNofWorkerPool(int numa_socket_id = 0);
     ~SpdkNofWorkerPool();
 
@@ -504,6 +522,10 @@ class SpdkNofWorkerPool {
     SpdkNofWorkerPool(SpdkNofWorkerPool&&) = delete;
     SpdkNofWorkerPool& operator=(SpdkNofWorkerPool&&) = delete;
 
+    // Bind the segment to a worker before returning. That worker creates the
+    // qpair and starts the asynchronous connection.
+    nof_seg_handle* OpenNofSegment(const std::string& tr_str);
+
     /**
      * @brief Submit a spdk nvmf task for async execution
      * @param task The spdk nvmf task to execute
@@ -512,11 +534,13 @@ class SpdkNofWorkerPool {
 
    private:
     void workerThread(int work_idx);
+    void PostRecoveryTask(int worker_idx, ctrlr_info* ctrlr, bool resume);
 
     int worker_count_;
     int numa_socket_id_;
     std::vector<std::thread> workers_;
     std::unique_ptr<std::queue<SpdkNofTask>[]> task_queue_;
+    std::unique_ptr<std::queue<ControlTask>[]> control_queue_;
     std::unique_ptr<std::mutex[]> queue_mutex_;
     std::unique_ptr<std::condition_variable[]> queue_cv_;
     std::atomic<bool> shutdown_;
