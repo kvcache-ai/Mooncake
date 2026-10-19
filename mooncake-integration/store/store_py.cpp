@@ -2271,6 +2271,8 @@ NB_MODULE(_store, m) {
         .def_rw("replica_num", &ReplicateConfig::replica_num)
         .def_rw("nof_replica_num", &ReplicateConfig::nof_replica_num)
         .def_rw("dfs_replica_num", &ReplicateConfig::dfs_replica_num)
+        .def_rw("shared_nvme_kv_replica_num",
+                &ReplicateConfig::shared_nvme_kv_replica_num)
         .def_rw("soft_pin_action", &ReplicateConfig::soft_pin_action)
         .def_rw("soft_pin_ttl_ms", &ReplicateConfig::soft_pin_ttl_ms)
         .def_rw("with_hard_pin", &ReplicateConfig::with_hard_pin)

@@ -97,6 +97,7 @@ add_store_test(shared_nvme_kv_master_test shared_nvme_kv_master_test.cpp)
 add_store_test(shared_nvme_kv_id_allocator_test
                shared_nvme_kv_id_allocator_test.cpp)
 add_store_test(shared_nvme_kv_config_test shared_nvme_kv_config_test.cpp)
+add_store_test(shared_nvme_kv_client_test shared_nvme_kv_client_test.cpp)
 add_store_test(shared_nvme_kv_object_store_test
                shared_nvme_kv_object_store_test.cpp)
 set_tests_properties(replica_selection_test
