@@ -32,7 +32,6 @@ namespace mooncake {
 
 class PutOperation;
 class DistributedStorageBackend;
-class RealClient;
 
 std::optional<size_t> GetTransportRegistrationLimit(
     const std::string& protocol);
@@ -469,13 +468,14 @@ class Client {
         const std::vector<std::string>& keys);
 
     /**
-     * @brief Point-in-time existence check for multiple objects, granting no
-     *        read leases
+     * @brief Probe multiple objects, optionally leasing the last complete
+     *        candidate. LastHitOnly leases the last all-true candidate.
      * @param keys Vector of keys to check
-     * @return Vector of existence results for each key
+     * @return Per-key existence results in input order
      */
     std::vector<tl::expected<bool, ErrorCode>> BatchProbeKey(
-        const std::vector<std::string>& keys);
+        const std::vector<std::string>& keys,
+        const GrantLeasePolicy& policy = {});
 
     /**
      * @brief Create a copy task to copy an object's replicas to target segments
@@ -712,6 +712,11 @@ class Client {
     }
 
     [[nodiscard]] const std::string& GetProtocol() const { return protocol_; }
+
+    [[nodiscard]] bool HasClassicTransport(const std::string& protocol) const {
+        return transfer_engine_ && !transfer_engine_->isUsingTent() &&
+               transfer_engine_->getTransport(protocol) != nullptr;
+    }
 
     [[nodiscard]] bool CanUseLocalMemcpy(const std::string& endpoint) const {
         return transfer_submitter_ != nullptr &&

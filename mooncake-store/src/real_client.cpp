@@ -22,6 +22,7 @@
 #include <span>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "real_client.h"
@@ -41,6 +42,7 @@
 #include "bool_parser.h"
 #include "client_auto_port_config.h"
 #include "config/cxl_segment_config.h"
+#include "config/egm_store_pool_config.h"
 #include "config/hugepage_config.h"
 #include "integer_parser.h"
 #include "mutex.h"
@@ -56,11 +58,14 @@
 #include "shm_helper.h"
 #include "memory_location.h"
 #include "version.h"
+#include "transport/nvlink_transport/nvlink_host_numa_allocation.h"
 #ifdef USE_NOF
 #include "spdk/spdk_wrapper.h"
 #endif
-#ifdef USE_ASCEND_DIRECT
+#if defined(USE_ASCEND_DIRECT) || defined(USE_MEMFABRIC)
 #include "acl/acl_rt.h"
+#endif
+#ifdef USE_ASCEND_DIRECT
 #include "transport/ascend_transport/ascend_direct_transport/context_manager.h"
 #endif
 #ifdef USE_CUDA
@@ -71,6 +76,9 @@
 #endif
 #if defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
 #include "ascend_allocator.h"
+#endif
+#ifdef USE_MEMFABRIC
+#include "memfabric_allocator.h"
 #endif
 
 DEFINE_bool(enable_http_server, false,
@@ -335,6 +343,31 @@ tl::expected<void, ErrorCode> set_context_from_dummy_shms(
         }
     }
     return set_context_if_needed(protocol, device_id, action);
+}
+#endif
+
+#ifdef USE_MEMFABRIC
+void *AllocateMemFabricStoreSegment(size_t segment_size,
+                                    const std::string &protocol,
+                                    bool use_hugepage, bool defer_hugetlb,
+                                    size_t *mapped_size) {
+    size_t actual_size = 0;
+    MemFabricHostAllocFn host_alloc = nullptr;
+    size_t host_align = 0;
+    size_t alloc_size = segment_size;
+    if (use_hugepage) {
+        host_align = get_hugepage_size_from_env();
+        alloc_size = align_up(segment_size, host_align);
+        host_alloc =
+            static_cast<MemFabricHostAllocFn>(allocate_buffer_mmap_memory);
+    }
+    void *ptr = memfabric_allocate_memory_best_effort(
+        alloc_size, protocol, &actual_size, host_alloc, host_align,
+        defer_hugetlb);
+    if (ptr != nullptr) {
+        *mapped_size = actual_size;
+    }
+    return ptr;
 }
 #endif
 
@@ -945,6 +978,26 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     const std::string &ssd_offload_path, const std::string &tenant_id,
     bool enable_client_http_server, int client_http_port,
     bool enable_embedded_master) {
+    return setup_internal(EgmStorePoolConfig{}, local_hostname, metadata_server,
+                          global_segment_size, local_buffer_size, protocol,
+                          rdma_devices, master_server_addr, transfer_engine,
+                          ipc_socket_path, local_rpc_port, enable_ssd_offload,
+                          start_offload_rpc_server, ssd_offload_path, tenant_id,
+                          enable_client_http_server, client_http_port,
+                          enable_embedded_master);
+}
+
+tl::expected<void, ErrorCode> RealClient::setup_internal(
+    const EgmStorePoolConfig &egm_config, const std::string &local_hostname,
+    const std::string &metadata_server, size_t global_segment_size,
+    size_t local_buffer_size, const std::string &protocol,
+    const std::string &rdma_devices, const std::string &master_server_addr,
+    const std::shared_ptr<TransferEngine> &transfer_engine,
+    const std::string &ipc_socket_path, int local_rpc_port,
+    bool enable_ssd_offload, bool start_offload_rpc_server,
+    const std::string &ssd_offload_path, const std::string &tenant_id,
+    bool enable_client_http_server, int client_http_port,
+    bool enable_embedded_master) {
     this->protocol = protocol;
     this->ipc_socket_path_ = ipc_socket_path;
     if (!enable_embedded_master &&
@@ -1070,6 +1123,12 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         }
     }
 
+    if (egm_config.enabled && !client_->HasClassicTransport("nvlink")) {
+        LOG(ERROR) << "EGM Store requires the classic NVLink transport; "
+                      "check MC_MS_AUTO_DISC and MC_FORCE_MNNVL";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
     // Local_buffer_size is allowed to be 0, but we only register memory when
     // local_buffer_size > 0. Invoke ibv_reg_mr() with size=0 is UB, and may
     // fail in some rdma implementations.
@@ -1132,7 +1191,47 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         uint64_t current_glbseg_size = 0;                  // For logging
 
         auto split_limit = GetTransportRegistrationLimit(protocol);
-        const size_t alignment = facebook::cachelib::Slab::kSize;
+        size_t alignment = facebook::cachelib::Slab::kSize;
+        std::vector<int> egm_numa_nodes;
+        std::vector<size_t> egm_node_sizes;
+        size_t egm_node_index = 0;
+        if (egm_config.enabled) {
+            if (egm_config.auto_numa_nodes) {
+                auto status = NvlinkHostNumaAllocation::DiscoverHostNumaNodes(
+                    egm_numa_nodes);
+                if (!status.ok()) {
+                    LOG(ERROR) << "EGM NUMA discovery failed: " << status;
+                    return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+                }
+            } else {
+                egm_numa_nodes = egm_config.numa_nodes;
+            }
+            std::vector<size_t> granularities;
+            for (int node : egm_numa_nodes) {
+                size_t granularity = 0;
+                auto status =
+                    NvlinkHostNumaAllocation::GetAllocationGranularity(
+                        node, granularity);
+                if (!status.ok()) {
+                    LOG(ERROR) << "EGM granularity query failed for NUMA node "
+                               << node << ": " << status;
+                    return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+                }
+                granularities.push_back(granularity);
+            }
+            auto capacity = CalculateEgmStorePoolCapacity(
+                global_segment_size, granularities, alignment,
+                static_cast<size_t>(globalConfig().max_mr_size));
+            if (!capacity) return tl::unexpected(capacity.error());
+            alignment = capacity->alignment;
+            split_limit = capacity->max_chunk_size;
+            egm_node_sizes = std::move(capacity->node_sizes);
+            global_segment_size = (global_segment_size / alignment) * alignment;
+            LOG(INFO) << "EGM Store capacity: requested=" << total_glbseg_size
+                      << " effective=" << global_segment_size
+                      << " alignment=" << alignment;
+            total_glbseg_size = global_segment_size;
+        }
 #ifdef USE_ASCEND_DIRECT
         if (protocol == "ascend" && globalConfig().ascend_agent_mode) {
             const size_t cap = AgentModeStoreChunkCap(global_segment_size);
@@ -1170,8 +1269,10 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             protocol == "rdma" && use_hugepage_;
 
         while (global_segment_size > 0) {
-            size_t segment_size =
-                GetNextSegmentSize(global_segment_size, split_limit, alignment);
+            size_t segment_size = GetNextSegmentSize(
+                egm_config.enabled ? egm_node_sizes[egm_node_index]
+                                   : global_segment_size,
+                split_limit, alignment);
             if (segment_size == 0) {
                 LOG(ERROR) << "Registration limit is smaller than segment "
                               "alignment";
@@ -1181,10 +1282,30 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
 
             size_t mapped_size = segment_size;
             void *ptr = nullptr;
+            std::unique_ptr<NvlinkHostNumaAllocation> egm_owner;
             std::string seg_location = kWildcardLocation;
             bool use_mmap_segment = !seg_numa_nodes.empty() || use_hugepage_;
 
-            if (!seg_numa_nodes.empty()) {
+            if (egm_config.enabled) {
+                auto status = NvlinkHostNumaAllocation::Create(
+                    egm_numa_nodes[egm_node_index], segment_size, alignment,
+                    egm_owner);
+                if (!status.ok()) {
+                    LOG(ERROR) << "EGM allocation failed: " << status;
+                    if (egm_owner) {
+                        auto cleanup = egm_owner->Release();
+                        if (!cleanup.ok()) {
+                            LOG(ERROR)
+                                << "EGM partial allocation cleanup failed: "
+                                << cleanup << "; retaining until process exit";
+                            (void)egm_owner.release();
+                        }
+                    }
+                    return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+                }
+                ptr = egm_owner->base();
+                mapped_size = egm_owner->length();
+            } else if (!seg_numa_nodes.empty()) {
                 // NUMA-segmented allocation: contiguous VMA, per-region binding
                 size_t page_sz = use_hugepage_
                                      ? get_hugepage_size_from_env()
@@ -1197,6 +1318,11 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
 #ifdef USE_ASCEND_DIRECT
             } else if (protocol == "ascend" || protocol == "ubshmem") {
                 ptr = AllocateAscendStoreSegment(
+                    segment_size, this->protocol, use_hugepage_,
+                    parallel_hugetlb_population, &mapped_size);
+#elif defined(USE_MEMFABRIC)
+            } else if (protocol == "ascend") {
+                ptr = AllocateMemFabricStoreSegment(
                     segment_size, this->protocol, use_hugepage_,
                     parallel_hugetlb_population, &mapped_size);
 #endif
@@ -1224,12 +1350,25 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                 return tl::unexpected(ErrorCode::INVALID_PARAMS);
             }
             const size_t mount_size =
-                split_limit.has_value() ? segment_size : mapped_size;
+                egm_config.enabled || !split_limit.has_value() ? mapped_size
+                                                               : segment_size;
             current_glbseg_size += mount_size;
             LOG(INFO) << "Mounting segment: " << mount_size << " bytes, "
                       << current_glbseg_size << " of " << total_glbseg_size;
 
-            if (this->protocol == "ascend" || this->protocol == "ubshmem") {
+            if (egm_config.enabled) {
+                egm_segment_ptrs_.emplace_back(std::move(egm_owner));
+            } else if (this->protocol == "ascend" ||
+                       this->protocol == "ubshmem") {
+#ifdef USE_MEMFABRIC
+                if (use_hugepage_) {
+                    hugepage_segment_ptrs_.emplace_back(
+                        ptr, HugepageSegmentDeleter{mapped_size});
+                } else {
+                    memfabric_segment_ptrs_.emplace_back(
+                        ptr, MemFabricSegmentDeleter{this->protocol});
+                }
+#else
                 if (use_hugepage_ && !globalConfig().ascend_use_fabric_mem) {
                     hugepage_segment_ptrs_.emplace_back(
                         ptr, HugepageSegmentDeleter{mapped_size});
@@ -1237,6 +1376,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                     ascend_segment_ptrs_.emplace_back(
                         ptr, AscendSegmentDeleter{this->protocol});
                 }
+#endif
             } else if (this->protocol == "sunrise_link") {
 #if defined(USE_SUNRISE)
                 sunrise_segment_ptrs_.emplace_back(ptr,
@@ -1290,6 +1430,10 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             if (pinned_region) {
                 setup_segment_pinned_regions_.push_back(
                     std::move(pinned_region));
+            }
+            if (egm_config.enabled) {
+                egm_node_sizes[egm_node_index] -= segment_size;
+                if (egm_node_sizes[egm_node_index] == 0) ++egm_node_index;
             }
         }
         if (total_glbseg_size == 0) {
@@ -1563,11 +1707,25 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     }
     int client_http_port = client_http_port_opt.value();
 
-    return setup_internal(
-        local_hostname, metadata_server, global_segment_size, local_buffer_size,
-        protocol, rdma_devices, master_server_addr, nullptr, ipc_socket_path,
-        50052, enable_ssd_offload, true, ssd_offload_path, tenant_id,
-        enable_client_http_server, client_http_port, enable_embedded_master);
+    auto egm_config = ParseEgmStorePoolConfig(
+        config, protocol, global_segment_size, local_buffer_size);
+    if (!egm_config) return tl::unexpected(egm_config.error());
+    try {
+        auto result = setup_internal(
+            *egm_config, local_hostname, metadata_server, global_segment_size,
+            local_buffer_size, protocol, rdma_devices, master_server_addr,
+            nullptr, ipc_socket_path, 50052, enable_ssd_offload, true,
+            ssd_offload_path, tenant_id, enable_client_http_server,
+            client_http_port, enable_embedded_master);
+        if (!result && egm_config->enabled) {
+            (void)tearDownAll_internal();
+        }
+        return result;
+    } catch (...) {
+        // The Python wrapper still owns this client when setup throws.
+        if (egm_config->enabled) (void)tearDownAll_internal();
+        throw;
+    }
 }
 
 tl::expected<void, ErrorCode> RealClient::initAll_internal(
@@ -1602,7 +1760,35 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     stop_dummy_client_monitor();
     stop_http_server();
 
+    ErrorCode cleanup_error = ErrorCode::OK;
     if (client_) {
+        if (!egm_segment_ptrs_.empty()) {
+            // Callers must quiesce in-flight requests before close. FileStorage
+            // owns a Client reference and workers that access segments.
+            if (offload_rpc_server_) {
+                offload_rpc_server_->stop();
+                offload_rpc_server_.reset();
+            }
+            file_storage_.reset();
+            for (auto it = egm_segment_ptrs_.rbegin();
+                 it != egm_segment_ptrs_.rend(); ++it) {
+                auto &owner = *it;
+                if (!owner) continue;
+                auto result =
+                    client_->UnmountSegment(owner->base(), owner->length());
+                if (!result) {
+                    // Failed mounts may have no Client record even if
+                    // publication is uncertain. Retain memory unless unmount
+                    // confirms cleanup.
+                    LOG(ERROR)
+                        << "EGM unmount failed: " << toString(result.error())
+                        << "; retaining allocation until process exit";
+                    if (cleanup_error == ErrorCode::OK)
+                        cleanup_error = result.error();
+                    (void)owner.release();
+                }
+            }
+        }
         if (client_buffer_allocator_ && client_buffer_allocator_->size() > 0 &&
             protocol != "cxl") {
             auto unregister_result = client_->unregisterLocalMemory(
@@ -1615,12 +1801,32 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
             std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
             local_buffer_region_.reset();
         }
+        // Keep EGM Release separate from UnmountSegment above. Unmount only
+        // removes Master metadata and TE registration; replica copy/move
+        // workers may still hold local source slices. If reset drops the last
+        // Client reference, its destructor stops and joins those workers before
+        // we release backing memory. This is not a GPU completion barrier:
+        // transfers that timed out may still require deferred cleanup.
         client_.reset();
     }
     if (embedded_master_) {
         embedded_master_->Stop();
         embedded_master_.reset();
     }
+    for (auto it = egm_segment_ptrs_.rbegin(); it != egm_segment_ptrs_.rend();
+         ++it) {
+        auto &owner = *it;
+        if (!owner) continue;
+        auto status = owner->Release();
+        if (!status.ok()) {
+            LOG(ERROR) << "EGM release failed: " << status
+                       << "; retaining allocation until process exit";
+            if (cleanup_error == ErrorCode::OK)
+                cleanup_error = ErrorCode::INTERNAL_ERROR;
+            (void)owner.release();
+        }
+    }
+    egm_segment_ptrs_.clear();
     ReleaseAllMountedSegmentRecords();
     ReleaseAllAllocatedSegmentRecords();
     client_buffer_allocator_.reset();
@@ -1630,10 +1836,16 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     if (!setup_segments_safe_to_free || setup_segment_memory_must_leak_) {
         for (auto &ptr : hugepage_segment_ptrs_) ptr.release();
         for (auto &ptr : segment_ptrs_) ptr.release();
+#ifdef USE_MEMFABRIC
+        for (auto &ptr : memfabric_segment_ptrs_) ptr.release();
+#endif
         setup_segment_memory_must_leak_ = false;
     }
     hugepage_segment_ptrs_.clear();
     segment_ptrs_.clear();
+#ifdef USE_MEMFABRIC
+    memfabric_segment_ptrs_.clear();
+#endif
     ub_segment_ptrs_.clear();
 #ifdef USE_VRAM_SEGMENT
     vram_segment_ptrs_.clear();
@@ -1692,6 +1904,7 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     // which is safe: they are never munmapped, so SPDK's translations never
     // point at freed/reused virtual addresses.
     RetryQuarantinedShmsLocked();
+    if (cleanup_error != ErrorCode::OK) return tl::unexpected(cleanup_error);
     return {};
 }
 
@@ -2671,9 +2884,9 @@ int RealClient::probeKey(const std::string &key) {
     }
 }
 
-std::vector<int> RealClient::batchProbeKey(
-    const std::vector<std::string> &keys) {
-    auto internal_results = batchProbeKey_internal(keys);
+std::vector<int> RealClient::batchProbeKey(const std::vector<std::string> &keys,
+                                           const GrantLeasePolicy &policy) {
+    auto internal_results = batchProbeKey_internal(keys, policy);
     std::vector<int> results;
     results.reserve(internal_results.size());
 
@@ -4354,6 +4567,24 @@ RealClient::resolve_writable_buffer_region(void *buffer) const {
     return std::nullopt;
 }
 
+bool RealClient::can_use_direct_memory_read(const Replica::Descriptor &replica,
+                                            void *buffer, size_t size) const {
+    if (!replica.is_memory_replica()) return false;
+    // The selected replica's descriptor controls Transfer Engine routing.
+    // NVLink accepts ordinary CUDA allocations as local endpoints, while RDMA
+    // requires the destination range to have a local memory registration.
+    const std::string &replica_protocol =
+        replica.get_memory_descriptor().buffer_descriptor.protocol_;
+    if (replica_protocol == "nvlink") {
+        return true;
+    }
+    if (replica_protocol != "rdma") {
+        return false;
+    }
+    auto region = resolve_writable_buffer_region(buffer);
+    return region.has_value() && size <= region->size - region->offset;
+}
+
 tl::expected<RealClient::RangedReadMetadata, ErrorCode>
 RealClient::resolve_ranged_read_metadata(
     const std::string &key, const QueryResultCache *query_result_cache,
@@ -4468,7 +4699,8 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
             device::GetAcceleratorRegistry().RuntimeAccelerators();
         void *dst = static_cast<char *>(buffer) + dst_offset;
         if (runtime_accelerator.FindDeviceForPointer(dst) &&
-            (!client_->CanUseLocalMemcpy(replica) ||
+            ((!client_->CanUseLocalMemcpy(replica) &&
+              !can_use_direct_memory_read(replica, dst, total_size)) ||
              client_->IsHotCacheEnabled())) {
             if (!client_buffer_allocator_) {
                 LOG(ERROR) << "Client buffer allocator is not provided";
@@ -4610,7 +4842,8 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
     void *dst = static_cast<char *>(buffer) + dst_offset;
     auto filtered_qr = FilterQueryResult(query_result, replica, false);
     if (runtime_accelerator.FindDeviceForPointer(dst) &&
-        !client_->CanUseLocalMemcpy(replica)) {
+        !client_->CanUseLocalMemcpy(replica) &&
+        !can_use_direct_memory_read(replica, dst, size)) {
         if (!client_buffer_allocator_) {
             LOG(ERROR) << "Client buffer allocator is not provided";
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -6492,7 +6725,7 @@ tl::expected<bool, ErrorCode> RealClient::probeKey_internal(
 }
 
 std::vector<tl::expected<bool, ErrorCode>> RealClient::batchProbeKey_internal(
-    const std::vector<std::string> &keys) {
+    const std::vector<std::string> &keys, const GrantLeasePolicy &policy) {
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
         return std::vector<tl::expected<bool, ErrorCode>>(
@@ -6505,7 +6738,7 @@ std::vector<tl::expected<bool, ErrorCode>> RealClient::batchProbeKey_internal(
     }
 
     // Call client BatchProbeKey and return the vector<expected> directly
-    return client_->BatchProbeKey(keys);
+    return client_->BatchProbeKey(keys, policy);
 }
 
 int RealClient::put_from_with_metadata(const std::string &key, void *buffer,

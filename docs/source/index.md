@@ -39,15 +39,16 @@ At the center of Mooncake is a KVCache-centric scheduler that balances effective
 
 <h2 id="updates">🔄 Updates</h2>
 
+- **Aug 24, 2026**: [AgentX / InferenceX v3](https://newsletter.semianalysis.com/p/agentx-inferencexv3-does-cuda-moat) highlights Mooncake's contributions to agentic inference workloads, including ROCm wheels, CI, and packaging improvements. [Mooncake optimization details](https://inferencex.semianalysis.com/agentx/optimizations/mooncake).
 - **Aug 20, 2026**: Mooncake is integrated into [Miles](https://github.com/radixark/miles) as a rollout data-transfer backend for the fragmented, heterogeneous data moving between rollout and training in disaggregated RL. Blogs: [KVCache.AI](https://kvcache.ai/blog/mooncake-rl-rollout-data-transfer/), [lmsys](https://www.lmsys.org/blog/2026-08-20-miles-mooncake-rollout-data-transfer).
 - **Aug 17, 2026**: Mooncake is integrated into [Speculators](https://github.com/vllm-project/speculators) as a distributed backend for multi-node online training, efficiently moves hidden-state between vLLM inference workers and Speculators trainers through RDMA, eliminating the need for massive hidden-state storage in offline training. [Benchmark on GB300 NVL72](https://x.com/mgoin_/status/2072785822231728363).
 - **May 7, 2026**: 🚀 [vLLM officially features Mooncake Store](https://vllm.ai/blog/mooncake-store) — a deep dive into how Mooncake's distributed KVCache engine supercharges vLLM inference with high-throughput, memory-efficient, cross-instance KV cache sharing!
 - **Apr 29, 2026**: SGLang introduces [RDMA-based P2P weight transfer for large-scale distributed RL](https://lmsys.org/blog/2026-04-29-p2p-update/) using Mooncake TransferEngine, achieving 7x faster weight updates for the 1T-parameter Kimi-K2 model (53s → 7.2s) with zero-copy RDMA transfer across thousands of GPUs.
-- **Mar 19, 2026**: [TorchSpec: Speculative Decoding Training at Scale](https://pytorch.org/blog/torchspec-speculative-decoding-training-at-scale) is [open sourced](https://github.com/torchspec-project/TorchSpec), using Mooncake to decouple inference and training via efficient hidden states management.
 
 :::{dropdown} More
 :animate: fade-in
 
+- **Mar 19, 2026**: [TorchSpec: Speculative Decoding Training at Scale](https://pytorch.org/blog/torchspec-speculative-decoding-training-at-scale) is [open sourced](https://github.com/torchspec-project/TorchSpec), using Mooncake to decouple inference and training via efficient hidden states management.
 - **Mar 5, 2026**: [LightX2V](https://github.com/ModelTC/LightX2V/pull/893) now supports disaggregated deployment based on Mooncake, enabling encoder/transformer service decoupling with Mooncake Transfer Engine for high-performance cross-device and cross-machine data transfer. Details in [blog](https://light-ai.top/LightX2V-BLOG/posts/Disaggregation/).
 - **Feb 25, 2026**: [SGLang](https://github.com/sgl-project/sglang) merged [Encoder Global Cache Manager](https://github.com/sgl-project/sglang/pull/16137), introducing a Mooncake-powered global multimodal embedding cache that enables cross-instance sharing of ViT embeddings to avoid redundant GPU computation.
 - **Feb 24, 2026**: [vLLM-Omni](https://docs.vllm.ai/projects/vllm-omni/en/latest/design/feature/disaggregated_inference/) introduces disaggregated inference connectors with support for both `MooncakeStoreConnector` and `MooncakeTransferEngineConnector` for multi-node omni-modality pipelines.
@@ -81,13 +82,60 @@ At the center of Mooncake is a KVCache-centric scheduler that balances effective
 
 :::
 
-## Documentation
+<h2 id="blogs">📰 Blogs</h2>
+
+::::{grid} 1 2 2 2
+:gutter: 2
+:class-container: latest-blogs
+
+:::{grid-item-card} Over One Trillion Tokens per Day: How Mooncake Powers Approaching.AI’s Token Factory
+:img-top: https://kvcache.ai/blog/mooncake-in-approaching-ai/featured_hue86b549ecdd836b0c6b3aa760df33338_1244829_2a2b63e1a97ff4921bf0e665a65e1403.webp
+:img-alt: The HiCache + Mooncake Store Architecture within a PD Group
+:link: https://kvcache.ai/blog/mooncake-in-approaching-ai/
+:link-alt: Over One Trillion Tokens per Day: How Mooncake Powers Approaching.AI’s Token Factory
+:class-body: blog-card-date
+
+September 15, 2026
+:::
+
+:::{grid-item-card} Mooncake for Miles: From Fragmented Rollout Data to Efficient Bulk I/O
+:img-top: https://kvcache.ai/blog/mooncake-rl-rollout-data-transfer/featured_hue655d0112fa862027ab204efc8ff95c7_58042_8bb94c00d58ac807a3ff4bc8f8df21e2.webp
+:img-alt: Miles rollout data transfer with Mooncake
+:link: https://kvcache.ai/blog/mooncake-rl-rollout-data-transfer/
+:link-alt: Mooncake for Miles: From Fragmented Rollout Data to Efficient Bulk I/O
+:class-body: blog-card-date
+
+August 20, 2026
+:::
+
+:::{grid-item-card} Scaling KV Cache Beyond Memory with Mooncake SSD Offloading
+:img-top: https://kvcache.ai/blog/scaling-kv-cache-beyond-memory/featured_huc52d82bb227581a966940933903d5e2c_479035_349926621d7fc55e030b6d364f46602b.webp
+:img-alt: Mooncake SSD Offloading Architecture
+:link: https://kvcache.ai/blog/scaling-kv-cache-beyond-memory/
+:link-alt: Scaling KV Cache Beyond Memory with Mooncake SSD Offloading
+:class-body: blog-card-date
+
+July 15, 2026
+:::
+
+:::{grid-item-card} How Much KV Cache Budget Do We Need for LLM Serving?
+:img-top: https://kvcache.ai/blog/calculate-kvcache-cache-budge/featured_hu137d5fd64784a367d2cae0088c081616_54073_4242cb61033db09c45fd8739c71f32e2.webp
+:img-alt: KV Cache Hit Rate Figure
+:link: https://kvcache.ai/blog/calculate-kvcache-cache-budge/
+:link-alt: How Much KV Cache Budget Do We Need for LLM Serving?
+:class-body: blog-card-date
+
+June 26, 2026
+:::
+
+::::
 
 % How to start using Mooncake?
 
 :::{toctree}
 :caption: Getting Started
 :maxdepth: 1
+:hidden:
 
 getting_started/quick-start
 getting_started/build
@@ -99,8 +147,10 @@ getting_started/build
 :::{toctree}
 :caption: Deployment
 :maxdepth: 1
+:hidden:
 
 deployment/mooncake-store-deployment-guide
+deployment/store-rs/index
 deployment/kubernetes-deployment-guide/index
 deployment/integrations/sglang/index
 deployment/integrations/vllm/index
@@ -114,6 +164,7 @@ Mooncake x LMDeploy Integration<deployment/integrations/lmdeploy>
 :::{toctree}
 :caption: Performance
 :maxdepth: 1
+:hidden:
 performance/mooncake/index
 performance/sglang/index
 performance/vllm/index
@@ -124,11 +175,13 @@ performance/vllm/index
 :::{toctree}
 :caption: Design Documents
 :maxdepth: 1
+:hidden:
 
 design/architecture
 design/transfer-engine/index
 design/tent/overview
 design/store/mooncake-store
+design/store/store-rs/index
 design/mooncake-backend-pg
 design/mooncake-ep
 design/conductor/index
@@ -142,6 +195,7 @@ design/hicache-design
 :::{toctree}
 :caption: API Reference
 :maxdepth: 1
+:hidden:
 
 api-reference/python/index
 api-reference/cpp/index
@@ -154,10 +208,12 @@ api-reference/rust/index
 :::{toctree}
 :caption: Troubleshooting
 :maxdepth: 1
+:hidden:
 
 troubleshooting/error-code
 troubleshooting/troubleshooting
 troubleshooting/pg-ep-troubleshooting
+troubleshooting/store-rs-key-access
 :::
 
 
@@ -166,15 +222,7 @@ troubleshooting/pg-ep-troubleshooting
 :::{toctree}
 :caption: Community
 :maxdepth: 1
+:hidden:
 
 community/governance
 :::
-
-% Archived content
-
-### Archived
-
-- [Guide: vLLM MooncakeStoreConnector](deployment/integrations/vllm/vllm-mooncakestoreconnector)
-- [vLLM V0 Disaggregated Serving Demo](deployment/integrations/vllm/vllm-integration-v0.2)
-- [vLLM V0 Disaggregated Serving with MooncakeStore](deployment/integrations/vllm/vllm-integration-v0.3)
-- [vLLM v1 backend Disaggregated Serving with MooncakeConnector](deployment/integrations/vllm/vllm-integration-v1.0)

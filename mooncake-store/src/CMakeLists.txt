@@ -31,6 +31,7 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     client_offboarding.cpp
     dynamic_replication_controller.cpp
     master_service.cpp
+    promotion_candidate_tracker.cpp
     master_store_backend.cpp
     weight_store_manager.cpp
     master_metric_manager.cpp
@@ -149,6 +150,7 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     config/rpc_timeout_config.cpp
     config/spdk_controller_config.cpp
     config/transfer_submitter_config.cpp
+    config/egm_store_pool_config.cpp
     device/accelerator_device.cpp
     device/accelerator_registry.cpp
     device/runtime_accelerator.cpp
@@ -226,6 +228,29 @@ else()
   set(MOONCAKE_OSS_ADAPTER_ENABLED
       FALSE
       CACHE INTERNAL "Whether the Alibaba Cloud OSS adapter is built")
+endif()
+
+# S3-compatible adapter (REST API with AWS Signature V4). Independent of the OSS
+# adapter; it needs the same CURL and OpenSSL packages found above.
+if(CURL_FOUND AND OpenSSL_FOUND)
+  message(STATUS "S3-compatible adapter: Enabled")
+  set(MOONCAKE_S3_ADAPTER_ENABLED
+      TRUE
+      CACHE INTERNAL "Whether the S3-compatible adapter is built")
+  list(
+    APPEND
+    MOONCAKE_STORE_CLIENT_SOURCES
+    storage/distributed/rest_object_storage_adapter.cpp
+    storage/distributed/object_storage_xml.cpp
+    config/s3_adapter_config.cpp
+    storage/distributed/s3_adapter.cpp)
+  list(APPEND EXTRA_LIBS CURL::libcurl OpenSSL::Crypto)
+  add_definitions(-DHAVE_S3_ADAPTER)
+else()
+  message(STATUS "S3-compatible adapter: Disabled (requires CURL and OpenSSL)")
+  set(MOONCAKE_S3_ADAPTER_ENABLED
+      FALSE
+      CACHE INTERNAL "Whether the S3-compatible adapter is built")
 endif()
 
 # Find AWS SDK
@@ -674,6 +699,7 @@ if(USE_SUNRISE)
 endif()
 
 if(BUILD_SHARED_LIBS)
+  set_target_properties(mooncake_store PROPERTIES INSTALL_RPATH "$ORIGIN")
   install(TARGETS mooncake_store DESTINATION lib)
 endif()
 

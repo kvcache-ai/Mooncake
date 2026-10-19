@@ -939,8 +939,8 @@ ErrorCode Client::InitTransferEngine(
                 LOG(ERROR) << "Failed to install TCP transport";
                 return ErrorCode::INTERNAL_ERROR;
             }
-        } else if (protocol == "ascend" || protocol == "ubshmem" ||
-                   protocol == "sunrise_link") {
+        } else if (protocol == "nvlink" || protocol == "ascend" ||
+                   protocol == "ubshmem" || protocol == "sunrise_link") {
             if (device_names.has_value()) {
                 LOG(WARNING) << protocol
                              << " protocol does not use device names, ignoring";
@@ -4125,8 +4125,8 @@ std::vector<tl::expected<bool, ErrorCode>> Client::BatchIsExist(
 }
 
 std::vector<tl::expected<bool, ErrorCode>> Client::BatchProbeKey(
-    const std::vector<std::string>& keys) {
-    auto response = master_client_.BatchProbeKey(keys);
+    const std::vector<std::string>& keys, const GrantLeasePolicy& policy) {
+    auto response = master_client_.BatchProbeKey(keys, policy);
 
     // Check if we got the expected number of responses
     if (response.size() != keys.size()) {

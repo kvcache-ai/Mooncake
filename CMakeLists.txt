@@ -27,6 +27,10 @@ option(WITH_STORE_RUST "build the Rust bindings for the Mooncake Store" ON)
 option(WITH_CONDUCTOR_RUST
        "build the Rust bindings for the Mooncake Conductor client" OFF)
 option(
+  WITH_STORE_RS
+  "build the Rust-native Mooncake Store implementation (mooncake-store-rs)"
+  OFF)
+option(
   WITH_STORE_C_SHARED
   "build a self-contained libmooncake_store.so exposing only the store_c.h C ABI (for dlopen consumers)"
   OFF)
@@ -162,6 +166,9 @@ if(WITH_CONDUCTOR_RUST)
   endif()
   message(STATUS "Mooncake Conductor Rust bindings will be built")
   add_subdirectory(mooncake-conductor/rust)
+if (WITH_STORE_RS)
+  message(STATUS "Mooncake Store Rust-native implementation (store-rs) will be built")
+  add_subdirectory(mooncake-store-rs)
 endif()
 
 option(EP_USE_IDE "Enable intelligent indexing for IDEs" OFF)
