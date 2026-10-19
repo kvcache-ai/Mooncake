@@ -45,6 +45,8 @@ class OneShotAlgorithm final : public AlgorithmProvider {
                                cudaStream_t stream) const override;
     PGResult<void> enqueueImpl(const AllGatherRequest& request,
                                cudaStream_t stream) const override;
+    PGResult<void> enqueueImpl(const ReduceScatterRequest& request,
+                               cudaStream_t stream) const override;
 
    private:
     OneShotAlgorithm(RegionSlice packets, OneShotBufferLayout layout,

@@ -61,7 +61,7 @@ namespace {
         };
         // Publish the local contribution before writing any output, including
         // its own slot when the request is in-place.
-        exchange.sendAll(chunk, block);
+        exchange.sendAll(chunk.source, chunk.count, 0, block);
         const auto failed = gatherPeers(chunk, output + offset, rank_bytes,
                                         view, exchange, block);
         PG_COLL_TRY(exchange.finish(failed, block));

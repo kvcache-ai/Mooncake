@@ -23,7 +23,14 @@ std::vector<DeviceCollectiveAlgorithmChoice>
 defaultDeviceCollectiveAlgorithmChoices() {
     constexpr auto max_bytes = std::numeric_limits<uint64_t>::max();
     return {{OpType::AllReduce, max_bytes, DeviceCollectiveAlgorithm::Ring},
-            {OpType::AllGather, max_bytes, DeviceCollectiveAlgorithm::Ring}};
+            {OpType::AllGather, max_bytes, DeviceCollectiveAlgorithm::Ring},
+            {OpType::ReduceScatter, max_bytes, DeviceCollectiveAlgorithm::Ring},
+            {OpType::Broadcast, max_bytes, DeviceCollectiveAlgorithm::Ring},
+            {OpType::Reduce, max_bytes, DeviceCollectiveAlgorithm::Ring},
+            {OpType::AllToAll, max_bytes, DeviceCollectiveAlgorithm::Pairwise},
+            {OpType::Gather, max_bytes, DeviceCollectiveAlgorithm::Star},
+            {OpType::Scatter, max_bytes, DeviceCollectiveAlgorithm::Star},
+            {OpType::Barrier, max_bytes, DeviceCollectiveAlgorithm::Ring}};
 }
 
 // Returns whether OneShot can be selected for the group's active members.
@@ -166,9 +173,13 @@ bool supportsGpuCollectiveBackend(const DeviceGroupEndpoint& endpoint,
             return true;
         case GpuCollectiveBackend::New:
             // The new backend needs signals to synchronize view epochs.
-            // Its current default algorithm choices require Ring.
+            // Its default policy uses Ring, Pairwise and Star.
             return endpoint.view_epoch_signal_count != 0 &&
-                   endpoint.supportsAlgorithm(DeviceCollectiveAlgorithm::Ring);
+                   endpoint.supportsAlgorithm(
+                       DeviceCollectiveAlgorithm::Ring) &&
+                   endpoint.supportsAlgorithm(
+                       DeviceCollectiveAlgorithm::Pairwise) &&
+                   endpoint.supportsAlgorithm(DeviceCollectiveAlgorithm::Star);
     }
     return false;
 }

@@ -44,6 +44,75 @@ __device__ __forceinline__ void executeLocalOnlyCollective(
                                      block);
 }
 
+__device__ __forceinline__ void executeLocalOnlyCollective(
+    const ReduceScatterRequest& request, InGroupRank self_rank,
+    cooperative_groups::thread_block block) {
+    const uint64_t bytes = request.count * elementSize(request.datatype);
+    const auto* source = static_cast<const uint8_t*>(request.send_buffer) +
+                         static_cast<uint64_t>(self_rank) * bytes;
+    detail::copyLocalCollectiveInput(source, request.recv_buffer, bytes, block);
+}
+
+__device__ __forceinline__ void executeLocalOnlyCollective(
+    const BroadcastRequest& request, InGroupRank self_rank,
+    cooperative_groups::thread_block block) {
+    // Non-root callers need not supply a send buffer.
+    if (self_rank == request.root) {
+        const uint64_t bytes = request.count * elementSize(request.datatype);
+        detail::copyLocalCollectiveInput(request.send_buffer,
+                                         request.recv_buffer, bytes, block);
+    }
+}
+
+__device__ __forceinline__ void executeLocalOnlyCollective(
+    const ReduceRequest& request, InGroupRank self_rank,
+    cooperative_groups::thread_block block) {
+    // Non-root callers need not supply a receive buffer.
+    if (self_rank == request.root) {
+        const uint64_t bytes = request.count * elementSize(request.datatype);
+        detail::copyLocalCollectiveInput(request.send_buffer,
+                                         request.recv_buffer, bytes, block);
+    }
+}
+
+__device__ __forceinline__ void executeLocalOnlyCollective(
+    const AllToAllRequest& request, InGroupRank self_rank,
+    cooperative_groups::thread_block block) {
+    const uint64_t bytes = request.count * elementSize(request.datatype);
+    const uint64_t offset = static_cast<uint64_t>(self_rank) * bytes;
+    const auto* source =
+        static_cast<const uint8_t*>(request.send_buffer) + offset;
+    auto* destination = static_cast<uint8_t*>(request.recv_buffer) + offset;
+    detail::copyLocalCollectiveInput(source, destination, bytes, block);
+}
+
+__device__ __forceinline__ void executeLocalOnlyCollective(
+    const GatherRequest& request, InGroupRank self_rank,
+    cooperative_groups::thread_block block) {
+    if (self_rank == request.root) {
+        const uint64_t bytes = request.count * elementSize(request.datatype);
+        auto* destination = static_cast<uint8_t*>(request.recv_buffer) +
+                            static_cast<uint64_t>(self_rank) * bytes;
+        detail::copyLocalCollectiveInput(request.send_buffer, destination,
+                                         bytes, block);
+    }
+}
+
+__device__ __forceinline__ void executeLocalOnlyCollective(
+    const ScatterRequest& request, InGroupRank self_rank,
+    cooperative_groups::thread_block block) {
+    if (self_rank == request.root) {
+        const uint64_t bytes = request.count * elementSize(request.datatype);
+        const auto* source = static_cast<const uint8_t*>(request.send_buffer) +
+                             static_cast<uint64_t>(self_rank) * bytes;
+        detail::copyLocalCollectiveInput(source, request.recv_buffer, bytes,
+                                         block);
+    }
+}
+
+__device__ __forceinline__ void executeLocalOnlyCollective(
+    const BarrierRequest&, InGroupRank, cooperative_groups::thread_block) {}
+
 }  // namespace mooncake
 
 #endif  // MOONCAKE_PG_DEVICE_COMM_DEVICE_COLLECTIVE_DEVICE_COLLECTIVE_LOCAL_CUH
