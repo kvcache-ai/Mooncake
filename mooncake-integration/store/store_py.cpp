@@ -1171,11 +1171,18 @@ class MooncakeStorePyWrapper {
     ReplicateConfig MakeIndexedConfig(
         const ReplicateConfig &config,
         const std::vector<size_t> &original_indices) const {
+        ReplicateConfig indexed_config = config;
+        if (config.session_ids) {
+            indexed_config.session_ids->clear();
+            for (size_t index : original_indices) {
+                indexed_config.session_ids->push_back(
+                    config.session_ids->at(index));
+            }
+        }
         if (!config.group_ids.has_value()) {
-            return config;
+            return indexed_config;
         }
 
-        ReplicateConfig indexed_config = config;
         std::vector<std::string> group_ids;
         group_ids.reserve(original_indices.size());
         for (size_t index : original_indices) {
@@ -1188,11 +1195,20 @@ class MooncakeStorePyWrapper {
     ReplicateConfig MakeRepeatedIndexedConfig(
         const ReplicateConfig &config,
         const std::vector<size_t> &original_indices, int repeat_count) const {
+        ReplicateConfig indexed_config = config;
+        if (config.session_ids) {
+            indexed_config.session_ids->clear();
+            for (size_t index : original_indices) {
+                for (int i = 0; i < repeat_count; ++i) {
+                    indexed_config.session_ids->push_back(
+                        config.session_ids->at(index));
+                }
+            }
+        }
         if (!config.group_ids.has_value()) {
-            return config;
+            return indexed_config;
         }
 
-        ReplicateConfig indexed_config = config;
         std::vector<std::string> group_ids;
         group_ids.reserve(original_indices.size() *
                           static_cast<size_t>(repeat_count));
@@ -1208,6 +1224,11 @@ class MooncakeStorePyWrapper {
     std::vector<int> ValidateGroupIdsForBatchConfig(
         const ReplicateConfig &config, size_t key_count,
         const char *operation_name) const {
+        if (!config.ValidSessionIds(key_count)) {
+            LOG(ERROR) << operation_name << ": invalid per-key session IDs";
+            return std::vector<int>(key_count,
+                                    to_py_ret(ErrorCode::INVALID_PARAMS));
+        }
         if (config.group_ids.has_value() &&
             config.group_ids->size() != key_count) {
             LOG(ERROR) << operation_name
@@ -1222,6 +1243,8 @@ class MooncakeStorePyWrapper {
         const std::string &key, pybind11::object tensor,
         const ReplicateConfig &config = ReplicateConfig{}, int tp_rank = 0,
         int tp_size = 1, int split_dim = 0) {
+        if (!config.ValidSessionIds(1))
+            return to_py_ret(ErrorCode::INVALID_PARAMS);
         try {
             std::vector<std::string> tp_keys;
             tp_keys.reserve(tp_size);
@@ -1234,7 +1257,13 @@ class MooncakeStorePyWrapper {
             if (!infos.has_value()) {
                 return to_py_ret(ErrorCode::INVALID_PARAMS);
             }
-            auto results = batch_put_tensor_infos_impl(tp_keys, *infos, config);
+            ReplicateConfig tp_config = config;
+            if (config.session_ids) {
+                tp_config.session_ids =
+                    std::vector<std::string>(tp_size, config.SessionId());
+            }
+            auto results =
+                batch_put_tensor_infos_impl(tp_keys, *infos, tp_config);
             for (int ret : results) {
                 if (ret != 0) return ret;
             }
@@ -2155,6 +2184,18 @@ PYBIND11_MODULE(_store, m) {
                        &ReplicateConfig::prefer_alloc_in_same_node)
         .def_readwrite("data_type", &ReplicateConfig::data_type)
         .def_readwrite("group_ids", &ReplicateConfig::group_ids)
+        .def_property(
+            "session_ids",
+            [](const ReplicateConfig &config)
+                -> std::optional<std::vector<std::string>> {
+                if (!config.session_ids) return std::nullopt;
+                return *config.session_ids;
+            },
+            [](ReplicateConfig &config,
+               std::optional<std::vector<std::string>> ids) {
+                config.session_ids.reset();
+                if (ids) config.session_ids = std::move(*ids);
+            })
         .def("__str__", [](const ReplicateConfig &config) {
             std::ostringstream oss;
             oss << config;

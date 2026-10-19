@@ -744,6 +744,40 @@ config = ReplicateConfig()
 config.prefer_alloc_in_same_node = True
 ```
 
+#### session_ids
+**Type:** `Optional[List[str]]`
+**Default:** `None`
+
+Optional per-key write attribution. Supply one entry for each input key (one
+entry for a single-key write). Each ID must be valid UTF-8 and at most 256 bytes.
+An empty string means no new attribution. The field does not change object identity,
+replication, group membership, leases, or eviction policy.
+
+```python
+config = ReplicateConfig()
+config.session_ids = ["session-a", "session-a", "session-b"]
+store.batch_put_from(keys, buffer_ptrs, buffer_sizes, config)
+```
+
+The tag becomes committed when the first replica of the write becomes readable.
+A skipped duplicate Put leaves the original tag unchanged. Upsert with a
+non-empty ID replaces attribution at commit; an omitted or empty ID preserves
+the previous tag, including when storage is reallocated. Failed/preempted
+writes do not commit their pending tags. Committed tags survive metadata
+OpLog/snapshot recovery and standby promotion; old metadata defaults to no tag.
+
+With KV events enabled, each `stored` / `BlockStored` map carries a single
+`session_id` string, or MessagePack `nil` when untagged. Replica availability
+changes reuse the committed object tag. `removed` and `cleared` keep their
+existing schemas: they retract availability, not a particular session's
+association. This matches SGLang's single-session stored-event attribution;
+it does not enumerate every session that has reused a shared object.
+
+Old RPC readers can ignore the compatible extension, but do not persist or
+publish session tags. Upgrade the Store client and Master to enable attribution.
+A storage node's disk scan alone cannot reconstruct metadata tags after all
+Master metadata is lost; preserve the metadata recovery artifacts as well.
+
 #### group_ids
 **Type:** `List[str] | None`
 **Default:** `None`
