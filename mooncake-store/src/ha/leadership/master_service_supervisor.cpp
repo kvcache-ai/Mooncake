@@ -174,29 +174,57 @@ bool ShutdownObserved(const std::function<bool()>& shutdown_requested) {
     return true;
 }
 
-// What the supervisor holds when a shutdown ends the process.
+// What the supervisor holds when a shutdown ends the process. session and
+// coordinator are set together, only where the term's lease is acquired.
 struct ShutdownLease {
-    // Set while this process holds the lease; it is left to expire by TTL.
+    // Set while this process holds the lease; shutdown releases it once.
     const LeadershipSession* session = nullptr;
+    LeaderCoordinator* coordinator = nullptr;
+    // The term's renewal polling guard, once it exists. It stops before the
+    // release so that a poll cannot race the revoke.
+    LeadershipRenewalGuard* renewal = nullptr;
     // Result of an ordinary release that already ran for the session.
     std::optional<ErrorCode> prior_release{};
 };
 
-// Last step before the terminal exit. Returns the exit status.
+// Last step before the terminal exit, after the admin drain. Releases a
+// held lease once and returns the exit status: 0 when no lease is left to
+// TTL expiry, kHaShutdownReleaseFailedStatus when a release was not
+// confirmed.
 int FinishShutdown(const ShutdownLease& lease) {
+    // An ordinary release already ran for this term. Never repeat it; a
+    // second revoke is not a no-op (it costs a round trip of up to 5 s).
     if (lease.prior_release.has_value()) {
-        LOG_IF(INFO, *lease.prior_release == ErrorCode::OK)
-            << "Shutdown complete after leadership release, result=OK";
-        LOG_IF(WARNING, *lease.prior_release != ErrorCode::OK)
-            << "Shutdown complete after leadership release, result="
-            << toString(*lease.prior_release);
-        return 0;
+        if (*lease.prior_release == ErrorCode::OK) {
+            LOG(INFO)
+                << "Shutdown complete after leadership release, result=OK";
+            return 0;
+        }
+        LOG(WARNING) << "Shutdown complete after leadership release, result="
+                     << toString(*lease.prior_release);
+        return kHaShutdownReleaseFailedStatus;
     }
     if (lease.session != nullptr) {
-        LOG(INFO) << "Shutdown complete, no release attempted; the lease is "
-                     "left to TTL expiry, view_version="
-                  << lease.session->view.view_version;
-        return 0;
+        if (lease.renewal != nullptr) {
+            lease.renewal->Stop();
+        }
+        LOG(INFO) << "Shutdown releasing leadership, view_version="
+                  << lease.session->view.view_version << ", renewal_lost="
+                  << (lease.renewal != nullptr && lease.renewal->Lost());
+        TestFailPoint::Wait("supervisor_before_shutdown_release");
+        const ErrorCode err =
+            lease.coordinator->ReleaseLeadership(*lease.session);
+        if (err == ErrorCode::OK) {
+            LOG(INFO) << "Shutdown complete, leadership released, view_version="
+                      << lease.session->view.view_version;
+            return 0;
+        }
+        LOG(WARNING) << "Shutdown complete, leadership release failed, result="
+                     << toString(err)
+                     << "; release not confirmed, any remaining lease expires "
+                        "by TTL, view_version="
+                     << lease.session->view.view_version;
+        return kHaShutdownReleaseFailedStatus;
     }
     LOG(INFO) << "Shutdown complete, no lease held";
     return 0;
@@ -567,7 +595,8 @@ int RunSupervisorLoop(const HABackendSpec& spec,
             continue;
         }
 
-        ShutdownLease term_lease{.session = &*leadership_session};
+        ShutdownLease term_lease{.session = &*leadership_session,
+                                 .coordinator = &leader_coordinator};
         if (ShutdownObserved(shutdown_requested)) {
             return shutdown_exit("acquired", term_lease);
         }
@@ -593,6 +622,7 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         // TryAcquireLeadership, but etcd KeepAlive previously started only in
         // the warmup phase, so a large Oplog replay expired the lease first.
         LeadershipRenewalGuard renewal(leader_coordinator, *leadership_session);
+        term_lease.renewal = &renewal;
 
         auto claim_error = ClaimProducerViewForServing(
             spec, config, leadership_session->view.view_version);
