@@ -7,6 +7,7 @@
 #include <string>
 #include <unordered_map>
 
+#include "allocator_metric.h"
 #include "ylt/metric/counter.hpp"
 #include "ylt/metric/gauge.hpp"
 #include "ylt/metric/histogram.hpp"
@@ -127,6 +128,13 @@ class MasterMetricManager {
     void set_dfs_capacity_unlimited(bool unlimited);
     bool is_dfs_capacity_unlimited() const;
 
+    // DFS Allocator Metrics (projected from the DFS allocator snapshot). These
+    // reflect the shard/bucket DFS allocator, distinct from the 3fs/nfs file
+    // storage gauges above.
+    int64_t get_dfs_allocated_bytes();
+    int64_t get_dfs_total_capacity();
+    int64_t get_dfs_file_count();
+
     // Key/Value Metrics
     void inc_key_count(int64_t val = 1);
     void dec_key_count(int64_t val = 1);
@@ -152,14 +160,10 @@ class MasterMetricManager {
     void inc_client_offboarding_alert();
     void observe_client_offboarding_duration_ms(int64_t duration_ms);
 
-    // Snapshot Metrics
-    void set_snapshot_duration_ms(int64_t size);
-    void inc_snapshot_success();
-    void inc_snapshot_fail();
-
     // Operation Statistics (Counters)
     void inc_put_start_requests(int64_t val = 1);
     void inc_put_start_failures(int64_t val = 1);
+    void inc_put_start_object_already_exists(int64_t val = 1);
     void inc_put_start_alloc_failures(int64_t val = 1);
     void inc_put_start_partial_allocations(int64_t val = 1);
     void inc_put_end_requests(int64_t val = 1);
@@ -213,6 +217,7 @@ class MasterMetricManager {
     void inc_batch_get_replica_list_partial_success(int64_t failed_items);
     void inc_batch_put_start_requests(int64_t items);
     void inc_batch_put_start_failures(int64_t failed_items);
+    void inc_batch_put_start_object_already_exists(int64_t items);
     void inc_batch_put_start_partial_success(int64_t failed_items);
     void inc_batch_put_end_requests(int64_t items);
     void inc_batch_put_end_failures(int64_t failed_items);
@@ -224,6 +229,7 @@ class MasterMetricManager {
     // Operation Statistics Getters
     int64_t get_put_start_requests();
     int64_t get_put_start_failures();
+    int64_t get_put_start_object_already_exists();
     int64_t get_put_start_alloc_failures();
     int64_t get_put_start_partial_allocations();
     int64_t get_put_end_requests();
@@ -274,6 +280,7 @@ class MasterMetricManager {
     int64_t get_batch_get_replica_list_failed_items();
     int64_t get_batch_put_start_requests();
     int64_t get_batch_put_start_failures();
+    int64_t get_batch_put_start_object_already_exists();
     int64_t get_batch_put_start_partial_successes();
     int64_t get_batch_put_start_items();
     int64_t get_batch_put_start_failed_items();
@@ -342,6 +349,8 @@ class MasterMetricManager {
     // Tenant quota metrics
     void inc_tenant_quota_reject(const std::string& tenant_id,
                                  const std::string& reason, int64_t val = 1);
+    void inc_standby_restore_rejected_objects(const std::string& reason,
+                                              int64_t val = 1);
     void inc_tenant_evict_bytes(const std::string& tenant_id, int64_t bytes);
 
     // Promotion retry candidate metrics
@@ -565,6 +574,8 @@ class MasterMetricManager {
     std::set<std::string> projected_mem_segments_;
     std::set<std::string> projected_nof_segments_;
 
+    AllocatorMetric allocator_metric_;
+
     // Memory Storage Metrics
     ylt::metric::gauge_t
         mem_allocated_size_;  // Overall memory usage update for gauge
@@ -594,6 +605,11 @@ class MasterMetricManager {
     ylt::metric::gauge_t file_total_capacity_;
     std::atomic<bool> dfs_capacity_unlimited_{false};
 
+    // DFS Allocator Metrics
+    ylt::metric::gauge_t dfs_allocated_size_;
+    ylt::metric::gauge_t dfs_total_capacity_;
+    ylt::metric::gauge_t dfs_file_count_;
+
     // Key/Value Metrics
     ylt::metric::gauge_t key_count_;
     ylt::metric::gauge_t soft_pin_key_count_;
@@ -615,6 +631,7 @@ class MasterMetricManager {
     // Operation Statistics
     ylt::metric::counter_t put_start_requests_;
     ylt::metric::counter_t put_start_failures_;
+    ylt::metric::counter_t put_start_object_already_exists_;
     ylt::metric::counter_t put_start_alloc_failures_;
     ylt::metric::counter_t put_start_partial_allocations_;
     ylt::metric::counter_t put_end_requests_;
@@ -676,6 +693,7 @@ class MasterMetricManager {
     ylt::metric::counter_t batch_get_replica_list_failed_items_;
     ylt::metric::counter_t batch_put_start_requests_;
     ylt::metric::counter_t batch_put_start_failures_;
+    ylt::metric::counter_t batch_put_start_object_already_exists_;
     ylt::metric::counter_t batch_put_start_partial_successes_;
     ylt::metric::counter_t batch_put_start_items_;
     ylt::metric::counter_t batch_put_start_failed_items_;
@@ -756,6 +774,7 @@ class MasterMetricManager {
 
     ylt::metric::dynamic_counter_2t tenant_quota_reject_total_;
     ylt::metric::dynamic_counter_1t tenant_evict_bytes_total_;
+    ylt::metric::dynamic_counter_1t standby_restore_rejected_objects_total_;
 
     // SSD Offload Task Metrics
     ylt::metric::dynamic_counter_1t offload_enqueued_total_;
@@ -764,10 +783,6 @@ class MasterMetricManager {
     ylt::metric::dynamic_counter_1t offload_cancelled_total_;
     ylt::metric::dynamic_counter_1t offload_enqueue_rejected_total_;
 
-    // Snapshot Metrics
-    ylt::metric::histogram_t snapshot_duration_ms_;
-    ylt::metric::counter_t snapshot_success_;
-    ylt::metric::counter_t snapshot_fail_;
     // CopyStart, CopyEnd, CopyRevoke, MoveStart, MoveEnd, MoveRevoke Metrics
     ylt::metric::counter_t copy_start_requests_;
     ylt::metric::counter_t copy_start_failures_;

@@ -385,6 +385,131 @@ TEST(HighPerformanceTcpSocketTest, ClientProgressTimeoutCompletesTask) {
     peer.join();
 }
 
+TEST(HighPerformanceTcpSocketTest, FragmentedReadBodyCompletesAcrossChunkTail) {
+    constexpr size_t kChunk = 1 << 20;
+    constexpr size_t kLength = kChunk + 17;
+    std::array<uint8_t, kLength> payload{};
+    std::array<uint8_t, kLength> local{};
+    for (size_t i = 0; i < payload.size(); ++i) payload[i] = i % 251;
+    Completion completion;
+    asio::io_context peer_io;
+    asio::ip::tcp::acceptor acceptor(peer_io, {asio::ip::tcp::v4(), 0});
+    HighPerformanceTcpWorkers workers({.worker_count = 1});
+    ASSERT_TRUE(workers.start().ok());
+    HighPerformanceTcpClient client({2 * kChunk, kChunk, 1000, 1000, 1},
+                                    &workers);
+    auto operation = Operation(local.data(), local.size(), 0x1000, 1, 41,
+                               HighPerformanceTcpOpcode::kRead, &completion,
+                               acceptor.local_endpoint().port());
+    asio::post(workers.ioContext(0),
+               [&client, operation = std::move(operation)]() mutable {
+                   client.enqueueOnOwner(0, std::move(operation));
+               });
+
+    asio::ip::tcp::socket socket(peer_io);
+    acceptor.accept(socket);
+    std::array<uint8_t, kHighPerformanceTcpRequestSize> request{};
+    asio::read(socket, asio::buffer(request));
+    const auto response = EncodeHighPerformanceTcpResponse(
+        {HighPerformanceTcpStatus::kOk, 41, kLength});
+    asio::write(socket, asio::buffer(response));
+    asio::write(socket, asio::buffer(payload.data(), 65533));
+    std::this_thread::sleep_for(1ms);
+    EXPECT_FALSE(completion.done.load(std::memory_order_acquire));
+    asio::write(socket, asio::buffer(payload.data() + 65533, 29));
+    std::this_thread::sleep_for(1ms);
+    asio::write(socket, asio::buffer(payload.data() + 65562, kLength - 65562));
+    const bool completed = completion.wait();
+    EXPECT_TRUE(client.cancelAll().ok());
+    EXPECT_TRUE(workers.stop().ok());
+    ASSERT_TRUE(completed);
+    EXPECT_EQ(completion.status, COMPLETED);
+    EXPECT_EQ(completion.bytes, kLength);
+    EXPECT_FALSE(completion.protocol_status.has_value());
+    EXPECT_TRUE(SocketOrderedEqual(local, payload));
+}
+
+TEST(HighPerformanceTcpSocketTest,
+     TruncatedReadBodyTailFailsAfterValidResponse) {
+    constexpr size_t kChunk = 1 << 20;
+    constexpr size_t kLength = kChunk + 17;
+    std::array<uint8_t, kLength> payload{};
+    std::array<uint8_t, kLength> local{};
+    payload.fill(0x5a);
+    Completion completion;
+    asio::io_context peer_io;
+    asio::ip::tcp::acceptor acceptor(peer_io, {asio::ip::tcp::v4(), 0});
+    HighPerformanceTcpWorkers workers({.worker_count = 1});
+    ASSERT_TRUE(workers.start().ok());
+    HighPerformanceTcpClient client({2 * kChunk, kChunk, 1000, 1000, 1},
+                                    &workers);
+    auto operation = Operation(local.data(), local.size(), 0x1000, 1, 42,
+                               HighPerformanceTcpOpcode::kRead, &completion,
+                               acceptor.local_endpoint().port());
+    asio::post(workers.ioContext(0),
+               [&client, operation = std::move(operation)]() mutable {
+                   client.enqueueOnOwner(0, std::move(operation));
+               });
+
+    asio::ip::tcp::socket socket(peer_io);
+    acceptor.accept(socket);
+    std::array<uint8_t, kHighPerformanceTcpRequestSize> request{};
+    asio::read(socket, asio::buffer(request));
+    const auto response = EncodeHighPerformanceTcpResponse(
+        {HighPerformanceTcpStatus::kOk, 42, kLength});
+    asio::write(socket, asio::buffer(response));
+    asio::write(socket, asio::buffer(payload.data(), kLength - 1));
+    socket.shutdown(asio::ip::tcp::socket::shutdown_send);
+    const bool completed = completion.wait();
+    EXPECT_TRUE(client.cancelAll().ok());
+    EXPECT_TRUE(workers.stop().ok());
+    ASSERT_TRUE(completed);
+    EXPECT_EQ(completion.status, FAILED);
+    EXPECT_EQ(completion.bytes, 0u);
+    EXPECT_FALSE(completion.protocol_status.has_value());
+}
+
+TEST(HighPerformanceTcpSocketTest,
+     StalledReadBodyTailTimesOutAfterValidResponse) {
+    constexpr size_t kChunk = 1 << 20;
+    constexpr size_t kLength = kChunk + 17;
+    std::array<uint8_t, kLength> payload{};
+    std::array<uint8_t, kLength> local{};
+    payload.fill(0x5a);
+    Completion completion;
+    asio::io_context peer_io;
+    asio::ip::tcp::acceptor acceptor(peer_io, {asio::ip::tcp::v4(), 0});
+    HighPerformanceTcpWorkers workers({.worker_count = 1});
+    ASSERT_TRUE(workers.start().ok());
+    HighPerformanceTcpClient client({2 * kChunk, kChunk, 1000, 100, 1},
+                                    &workers);
+    auto operation = Operation(local.data(), local.size(), 0x1000, 1, 43,
+                               HighPerformanceTcpOpcode::kRead, &completion,
+                               acceptor.local_endpoint().port());
+    asio::post(workers.ioContext(0),
+               [&client, operation = std::move(operation)]() mutable {
+                   client.enqueueOnOwner(0, std::move(operation));
+               });
+
+    asio::ip::tcp::socket socket(peer_io);
+    acceptor.accept(socket);
+    std::array<uint8_t, kHighPerformanceTcpRequestSize> request{};
+    asio::read(socket, asio::buffer(request));
+    const auto response = EncodeHighPerformanceTcpResponse(
+        {HighPerformanceTcpStatus::kOk, 43, kLength});
+    asio::write(socket, asio::buffer(response));
+    asio::write(socket, asio::buffer(payload.data(), kChunk + 7));
+    // Leave the peer open without the last ten bytes: this must time out,
+    // rather than treating the successful response or first chunk as done.
+    const bool completed = completion.wait();
+    EXPECT_TRUE(client.cancelAll().ok());
+    EXPECT_TRUE(workers.stop().ok());
+    ASSERT_TRUE(completed);
+    EXPECT_EQ(completion.status, TIMEOUT);
+    EXPECT_EQ(completion.bytes, 0u);
+    EXPECT_FALSE(completion.protocol_status.has_value());
+}
+
 TEST(HighPerformanceTcpSocketTest, ClientBindsConfiguredSourceAddress) {
     asio::io_context peer_io;
     asio::ip::tcp::acceptor acceptor(peer_io,

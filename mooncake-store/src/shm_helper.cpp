@@ -13,6 +13,7 @@
 #include "common/client_buffer_allocation.h"
 #include "config.h"
 #include "config/hugepage_config.h"
+#include "config/shm_spdk_registration_config.h"
 #ifdef USE_NOF
 #include "spdk/spdk_wrapper.h"
 #endif
@@ -104,8 +105,7 @@ ShmHelper::ShmHelper() {
 }
 
 bool ShmHelper::is_register_spdk_enabled() {
-    const char* rs = std::getenv("MC_STORE_REGISTER_SPDK");
-    return rs != nullptr && std::strcmp(rs, "1") == 0;
+    return ShmSpdkRegistrationConfig::FromEnvironment().enabled;
 }
 
 ShmHelper::~ShmHelper() { cleanup(); }

@@ -1,0 +1,21 @@
+name: Run Mooncake CTest suite
+description: Run the source-build CTest suite with shared runtime settings
+inputs:
+  reserve-rpc-port:
+    description: Reserve the Mooncake client RPC port from ephemeral allocation
+    default: 'true'
+  junit-report:
+    description: Optional repository-relative JUnit output path
+    default: ''
+  label-exclude:
+    description: Optional CTest label regex to exclude
+    default: ''
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        RESERVE_RPC_PORT: ${{ inputs.reserve-rpc-port }}
+        JUNIT_REPORT: ${{ inputs.junit-report }}
+        CTEST_LABEL_EXCLUDE: ${{ inputs.label-exclude }}
+      run: bash "$GITHUB_ACTION_PATH/run.sh"

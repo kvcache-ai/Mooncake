@@ -75,6 +75,24 @@ TEST(TcpTransportConfigTest, InstallReadsConfigKeys) {
     EXPECT_TRUE(transport.uninstall().ok());
 }
 
+TEST(TcpTransportConfigTest, RejectsZeroWorkersAndAllowsRetry) {
+    auto conf = std::make_shared<Config>();
+    conf->set("transports/tcp/max_concurrent_tasks", 0);
+
+    TcpTransport transport;
+    auto metadata = makeP2PMetadata();
+    std::string name = "tcp-config-zero-workers";
+    auto status = transport.install(name, metadata, nullptr, conf);
+    ASSERT_TRUE(status.IsInvalidArgument()) << status.ToString();
+    EXPECT_NE(status.ToString().find("transports/tcp/max_concurrent_tasks"),
+              std::string::npos);
+
+    conf->set("transports/tcp/max_concurrent_tasks", 1);
+    ASSERT_TRUE(transport.install(name, metadata, nullptr, conf).ok());
+    EXPECT_EQ(TcpTransportTestPeer::params(transport).max_concurrent_tasks, 1u);
+    EXPECT_TRUE(transport.uninstall().ok());
+}
+
 TEST(TcpSubBatchTest, PointerStabilityAfterReserve) {
     // allocateSubBatch reserves task_list to max_size so submitTransferTasks
     // can take stable TcpTask* after emplace.

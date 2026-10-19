@@ -114,6 +114,9 @@ class AllocatedBuffer {
 
     [[nodiscard]] std::string getSegmentName() const noexcept;
 
+    // The endpoint a reader transfers from, as get_descriptor() reports it.
+    [[nodiscard]] std::string getTransportEndpoint() const;
+
     // Friend declaration for operator<<
     friend std::ostream& operator<<(std::ostream& os,
                                     const AllocatedBuffer& buffer);

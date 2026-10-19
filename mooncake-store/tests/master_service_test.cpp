@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <barrier>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
@@ -25,7 +26,7 @@
 
 #include <unistd.h>
 
-#include "tenant_quota_policy_store.h"
+#include "tenant/quota_policy_store.h"
 #include "types.h"
 #include "master_service_test_fixture.h"
 
@@ -577,6 +578,441 @@ TEST_F(MasterServiceTest, DfsPutEndAllAndUpsertTopologyAreAtomic) {
     std::filesystem::remove_all(dfs_root, ec);
 }
 
+// A one-object shard allocator: any DFS extent leaked by a lifecycle path makes
+// the next DFS-only allocation fail.
+class OneSlotDfsShardEnv {
+   public:
+    explicit OneSlotDfsShardEnv(const std::string& root)
+        : enable_dfs_("MOONCAKE_ENABLE_DFS", "1"),
+          fs_adapter_("MOONCAKE_DFS_FS_ADAPTER", "posix"),
+          root_dir_("MOONCAKE_DFS_ROOT_DIR", root.c_str()),
+          shard_count_("MOONCAKE_DFS_SHARD_COUNT", "1"),
+          shard_capacity_("MOONCAKE_DFS_SHARD_CAPACITY", "32768"),
+          alignment_("MOONCAKE_DFS_ALIGNMENT", "4096"),
+          eviction_("MOONCAKE_DFS_EVICTION_ENABLED", "0"),
+          deferred_free_("MOONCAKE_DFS_DEFERRED_FREE_SECONDS", "0"),
+          single_tenant_("MOONCAKE_DFS_SINGLE_TENANT", "true") {}
+
+    static constexpr uint64_t kObjectSize = 20480;
+
+   private:
+    ScopedEnvVar enable_dfs_, fs_adapter_, root_dir_, shard_count_,
+        shard_capacity_, alignment_, eviction_, deferred_free_, single_tenant_;
+};
+
+ReplicateConfig DfsOnlyConfig() {
+    ReplicateConfig config;
+    config.replica_num = 0;
+    config.dfs_replica_num = 1;
+    return config;
+}
+
+TEST_F(MasterServiceTest, DfsOnlyLifecyclePathsReleaseTheExtent) {
+    const auto dfs_root = (std::filesystem::temp_directory_path() /
+                           ("master_dfs_only_" + std::to_string(::getpid())))
+                              .string();
+    std::filesystem::create_directories(dfs_root);
+    OneSlotDfsShardEnv env(dfs_root);
+    constexpr uint64_t kSize = OneSlotDfsShardEnv::kObjectSize;
+
+    MasterServiceConfig master_config;
+    master_config.put_start_discard_timeout_sec = 1;
+    master_config.put_start_release_timeout_sec = 2;
+    MasterService service(master_config);
+    const UUID writer = generate_uuid();
+    const UUID other = generate_uuid();
+
+    auto start = service.PutStart(writer, "a", TenantId::Default(), kSize,
+                                  DfsOnlyConfig());
+    ASSERT_TRUE(start.has_value()) << toString(start.error());
+    ASSERT_EQ(start->size(), 1u);
+    EXPECT_TRUE(start->front().is_dfs_replica());
+    auto not_ready = service.GetReplicaList("a", TenantId::Default());
+    ASSERT_FALSE(not_ready.has_value());
+    EXPECT_EQ(not_ready.error(), ErrorCode::REPLICA_IS_NOT_READY);
+    auto full = service.PutStart(writer, "b", TenantId::Default(), kSize,
+                                 DfsOnlyConfig());
+    ASSERT_FALSE(full.has_value());
+    EXPECT_EQ(full.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+
+    // Revoke releases the extent.
+    ASSERT_TRUE(
+        service.PutRevoke(writer, "a", TenantId::Default(), ReplicaType::ALL));
+    auto revoked = service.GetReplicaList("a", TenantId::Default());
+    ASSERT_FALSE(revoked.has_value());
+    EXPECT_EQ(revoked.error(), ErrorCode::OBJECT_NOT_FOUND);
+
+    // Upsert preemption releases the in-flight writer's extent.
+    ASSERT_TRUE(service.PutStart(writer, "b", TenantId::Default(), kSize,
+                                 DfsOnlyConfig()));
+    ASSERT_TRUE(service.UpsertStart(other, "b", TenantId::Default(), kSize,
+                                    DfsOnlyConfig()));
+    auto stale_end =
+        service.PutEnd(writer, "b", TenantId::Default(), ReplicaType::ALL);
+    ASSERT_FALSE(stale_end.has_value());
+    EXPECT_EQ(stale_end.error(), ErrorCode::ILLEGAL_CLIENT);
+    ASSERT_TRUE(
+        service.UpsertEnd(other, "b", TenantId::Default(), ReplicaType::ALL));
+    auto complete = service.GetReplicaList("b", TenantId::Default());
+    ASSERT_TRUE(complete.has_value());
+    ASSERT_EQ(complete->replicas.size(), 1u);
+    EXPECT_EQ(complete->replicas[0].status, ReplicaStatus::COMPLETE);
+
+    // Remove honours the read lease, then releases the extent.
+    auto leased = service.Remove("b", TenantId::Default());
+    ASSERT_FALSE(leased.has_value());
+    EXPECT_EQ(leased.error(), ErrorCode::OBJECT_HAS_LEASE);
+    ASSERT_TRUE(service.Remove("b", TenantId::Default(), /*force=*/true));
+
+    // An abandoned write is reaped after the release timeout.
+    ASSERT_TRUE(service.PutStart(writer, "c", TenantId::Default(), kSize,
+                                 DfsOnlyConfig()));
+    std::this_thread::sleep_for(std::chrono::seconds(4));
+    auto reaped = service.GetReplicaList("c", TenantId::Default());
+    ASSERT_FALSE(reaped.has_value());
+    EXPECT_EQ(reaped.error(), ErrorCode::OBJECT_NOT_FOUND);
+    auto reuse = service.PutStart(other, "d", TenantId::Default(), kSize,
+                                  DfsOnlyConfig());
+    ASSERT_TRUE(reuse.has_value()) << toString(reuse.error());
+
+    std::error_code ec;
+    std::filesystem::remove_all(dfs_root, ec);
+}
+
+TEST_F(MasterServiceTest, DfsOnlyObjectsIgnoreMemoryEvictionAndSegmentLoss) {
+    const auto dfs_root =
+        (std::filesystem::temp_directory_path() /
+         ("master_dfs_only_eviction_" + std::to_string(::getpid())))
+            .string();
+    std::filesystem::create_directories(dfs_root);
+    OneSlotDfsShardEnv env(dfs_root);
+
+    MasterServiceConfig master_config;
+    master_config.default_kv_lease_ttl = 1;
+    MasterService service(master_config);
+    const auto context = PrepareSimpleSegment(service);
+    const UUID writer = generate_uuid();
+
+    ASSERT_TRUE(service.PutStart(writer, "dfs_only", TenantId::Default(),
+                                 OneSlotDfsShardEnv::kObjectSize,
+                                 DfsOnlyConfig()));
+    ASSERT_TRUE(service.PutEnd(writer, "dfs_only", TenantId::Default(),
+                               ReplicaType::ALL));
+    ReplicateConfig memory_config;
+    memory_config.replica_num = 1;
+    for (int i = 0; i < 8; ++i) {
+        const auto key = "memory_" + std::to_string(i);
+        ASSERT_TRUE(service.PutStart(writer, key, TenantId::Default(), 1 << 20,
+                                     memory_config));
+        ASSERT_TRUE(service.PutEnd(writer, key, TenantId::Default(),
+                                   ReplicaType::MEMORY));
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    MasterServiceTestPeer(service).RunBatchEvictForTesting(1.0, 1.0);
+
+    auto query = service.GetReplicaList("dfs_only", TenantId::Default());
+    ASSERT_TRUE(query.has_value()) << toString(query.error());
+    ASSERT_EQ(query->replicas.size(), 1u);
+    EXPECT_TRUE(query->replicas[0].is_dfs_replica());
+    ASSERT_TRUE(service.UnmountSegment(context.segment_id, context.client_id));
+    EXPECT_TRUE(
+        service.GetReplicaList("dfs_only", TenantId::Default()).has_value());
+
+    std::error_code ec;
+    std::filesystem::remove_all(dfs_root, ec);
+}
+
+TEST_F(MasterServiceTest, DfsBucketMemoryAllocationFailurePreservesBuckets) {
+    const auto dfs_root =
+        (std::filesystem::temp_directory_path() /
+         ("master_dfs_bucket_memory_failure_" + std::to_string(::getpid())))
+            .string();
+    std::filesystem::create_directories(dfs_root);
+    ScopedEnvVar enable_dfs("MOONCAKE_ENABLE_DFS", "1");
+    ScopedEnvVar fs_adapter("MOONCAKE_DFS_FS_ADAPTER", "posix");
+    ScopedEnvVar root_dir("MOONCAKE_DFS_ROOT_DIR", dfs_root.c_str());
+    ScopedEnvVar allocator("MOONCAKE_DFS_ALLOCATOR", "bucket");
+    ScopedEnvVar bucket_capacity("MOONCAKE_DFS_BUCKET_CAPACITY", "8192");
+    ScopedEnvVar max_bucket_count("MOONCAKE_DFS_MAX_BUCKET_COUNT", "4");
+    ScopedEnvVar alignment("MOONCAKE_DFS_ALIGNMENT", "4096");
+    ScopedEnvVar eviction("MOONCAKE_DFS_EVICTION_ENABLED", "1");
+    ScopedEnvVar high_watermark("MOONCAKE_DFS_EVICTION_HIGH_WATERMARK", "1.0");
+    ScopedEnvVar low_watermark("MOONCAKE_DFS_EVICTION_LOW_WATERMARK", "0.9");
+    ScopedEnvVar deferred_free("MOONCAKE_DFS_DEFERRED_FREE_SECONDS", "0");
+    ScopedEnvVar single_tenant("MOONCAKE_DFS_SINGLE_TENANT", "true");
+
+    {
+        MasterService service;
+        const auto context = PrepareSimpleSegment(service, "small_memory",
+                                                  kDefaultSegmentBase, 8192);
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.dfs_replica_num = 1;
+
+        for (const char* key : {"memory_full_a", "memory_full_b"}) {
+            auto start = service.PutStart(context.client_id, key,
+                                          TenantId::Default(), 4096, config);
+            ASSERT_TRUE(start.has_value()) << key << ": " << start.error();
+            ASSERT_TRUE(service
+                            .PutEnd(context.client_id, key, TenantId::Default(),
+                                    ReplicaType::ALL)
+                            .has_value());
+        }
+
+        ASSERT_TRUE(
+            service.UnmountSegment(context.segment_id, context.client_id)
+                .has_value());
+
+        auto failed = service.PutStart(context.client_id, "memory_full_c",
+                                       TenantId::Default(), 4096, config);
+        ASSERT_FALSE(failed.has_value());
+        EXPECT_EQ(failed.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+
+        for (const char* key : {"memory_full_a", "memory_full_b"}) {
+            auto query = service.GetReplicaList(key, TenantId::Default());
+            ASSERT_TRUE(query.has_value()) << key;
+            ASSERT_EQ(query->replicas.size(), 1u);
+            EXPECT_TRUE(query->replicas.front().is_dfs_replica());
+        }
+    }
+
+    std::error_code ec;
+    std::filesystem::remove_all(dfs_root, ec);
+}
+
+TEST_F(MasterServiceTest, DfsBucketUpsertRestoresEvictedReplica) {
+    const auto dfs_root =
+        (std::filesystem::temp_directory_path() /
+         ("master_dfs_bucket_upsert_restore_" + std::to_string(::getpid())))
+            .string();
+    std::filesystem::create_directories(dfs_root);
+    ScopedEnvVar enable_dfs("MOONCAKE_ENABLE_DFS", "1");
+    ScopedEnvVar fs_adapter("MOONCAKE_DFS_FS_ADAPTER", "posix");
+    ScopedEnvVar root_dir("MOONCAKE_DFS_ROOT_DIR", dfs_root.c_str());
+    ScopedEnvVar allocator("MOONCAKE_DFS_ALLOCATOR", "bucket");
+    ScopedEnvVar bucket_capacity("MOONCAKE_DFS_BUCKET_CAPACITY", "8192");
+    ScopedEnvVar max_bucket_count("MOONCAKE_DFS_MAX_BUCKET_COUNT", "2");
+    ScopedEnvVar alignment("MOONCAKE_DFS_ALIGNMENT", "4096");
+    ScopedEnvVar eviction("MOONCAKE_DFS_EVICTION_ENABLED", "1");
+    ScopedEnvVar high_watermark("MOONCAKE_DFS_EVICTION_HIGH_WATERMARK", "0.7");
+    ScopedEnvVar low_watermark("MOONCAKE_DFS_EVICTION_LOW_WATERMARK", "0.5");
+    ScopedEnvVar eviction_interval("MOONCAKE_DFS_EVICTION_CHECK_INTERVAL",
+                                   "60");
+    ScopedEnvVar deferred_free("MOONCAKE_DFS_DEFERRED_FREE_SECONDS", "0");
+    ScopedEnvVar single_tenant("MOONCAKE_DFS_SINGLE_TENANT", "true");
+
+    {
+        MasterService service;
+        const auto context = PrepareSimpleSegment(service);
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.dfs_replica_num = 1;
+
+        std::optional<uint64_t> old_memory_address;
+        std::optional<int> old_bucket_id;
+        for (const std::string key :
+             {"upsert_restore", "bucket_0_peer", "bucket_1_peer"}) {
+            auto start = service.PutStart(context.client_id, key,
+                                          TenantId::Default(), 4096, config);
+            ASSERT_TRUE(start.has_value()) << key << ": " << start.error();
+            if (key == "upsert_restore") {
+                for (const auto& descriptor : *start) {
+                    if (descriptor.is_memory_replica()) {
+                        old_memory_address =
+                            descriptor.get_memory_descriptor()
+                                .buffer_descriptor.buffer_address_;
+                    } else if (descriptor.is_dfs_replica()) {
+                        old_bucket_id =
+                            descriptor.get_dfs_descriptor().shard_idx;
+                    }
+                }
+            }
+            ASSERT_TRUE(service
+                            .PutEnd(context.client_id, key, TenantId::Default(),
+                                    ReplicaType::ALL)
+                            .has_value());
+        }
+        ASSERT_TRUE(old_memory_address.has_value());
+        ASSERT_TRUE(old_bucket_id.has_value());
+
+        MasterServiceTestPeer(service).RunDfsEvictionForTesting();
+        auto after_eviction =
+            service.GetReplicaList("upsert_restore", TenantId::Default());
+        ASSERT_TRUE(after_eviction.has_value());
+        ASSERT_EQ(after_eviction->replicas.size(), 1u);
+        EXPECT_TRUE(after_eviction->replicas.front().is_memory_replica());
+
+        auto mismatched_config = config;
+        mismatched_config.replica_num = 2;
+        auto mismatched =
+            service.UpsertStart(context.client_id, "upsert_restore",
+                                TenantId::Default(), 4096, mismatched_config);
+        ASSERT_FALSE(mismatched.has_value());
+        EXPECT_EQ(mismatched.error(), ErrorCode::INVALID_PARAMS);
+
+        auto restored = service.UpsertStart(context.client_id, "upsert_restore",
+                                            TenantId::Default(), 4096, config);
+        ASSERT_TRUE(restored.has_value()) << restored.error();
+        ASSERT_EQ(restored->size(), 2u);
+        bool restored_memory = false;
+        bool restored_dfs = false;
+        for (const auto& descriptor : *restored) {
+            if (descriptor.is_memory_replica()) {
+                restored_memory = true;
+                EXPECT_NE(descriptor.get_memory_descriptor()
+                              .buffer_descriptor.buffer_address_,
+                          *old_memory_address);
+            } else if (descriptor.is_dfs_replica()) {
+                restored_dfs = true;
+                EXPECT_NE(descriptor.get_dfs_descriptor().shard_idx,
+                          *old_bucket_id);
+            }
+        }
+        EXPECT_TRUE(restored_memory);
+        EXPECT_TRUE(restored_dfs);
+        ASSERT_TRUE(service
+                        .UpsertEnd(context.client_id, "upsert_restore",
+                                   TenantId::Default(), ReplicaType::ALL)
+                        .has_value());
+
+        auto complete =
+            service.GetReplicaList("upsert_restore", TenantId::Default());
+        ASSERT_TRUE(complete.has_value());
+        EXPECT_EQ(complete->replicas.size(), 2u);
+        EXPECT_EQ(
+            std::count_if(complete->replicas.begin(), complete->replicas.end(),
+                          [](const Replica::Descriptor& descriptor) {
+                              return descriptor.is_dfs_replica();
+                          }),
+            1);
+    }
+
+    std::error_code ec;
+    std::filesystem::remove_all(dfs_root, ec);
+}
+
+TEST_F(MasterServiceTest,
+       DfsBucketConcurrentPutAndUpsertShareSingleRecoveryBucket) {
+    const auto dfs_root =
+        (std::filesystem::temp_directory_path() /
+         ("master_dfs_bucket_single_flight_" + std::to_string(::getpid())))
+            .string();
+    std::filesystem::create_directories(dfs_root);
+    ScopedEnvVar enable_dfs("MOONCAKE_ENABLE_DFS", "1");
+    ScopedEnvVar fs_adapter("MOONCAKE_DFS_FS_ADAPTER", "posix");
+    ScopedEnvVar root_dir("MOONCAKE_DFS_ROOT_DIR", dfs_root.c_str());
+    ScopedEnvVar allocator("MOONCAKE_DFS_ALLOCATOR", "bucket");
+    ScopedEnvVar bucket_capacity("MOONCAKE_DFS_BUCKET_CAPACITY", "32768");
+    ScopedEnvVar max_bucket_count("MOONCAKE_DFS_MAX_BUCKET_COUNT", "4");
+    ScopedEnvVar alignment("MOONCAKE_DFS_ALIGNMENT", "4096");
+    ScopedEnvVar eviction("MOONCAKE_DFS_EVICTION_ENABLED", "1");
+    ScopedEnvVar high_watermark("MOONCAKE_DFS_EVICTION_HIGH_WATERMARK", "1.0");
+    ScopedEnvVar low_watermark("MOONCAKE_DFS_EVICTION_LOW_WATERMARK", "0.9");
+    ScopedEnvVar eviction_interval("MOONCAKE_DFS_EVICTION_CHECK_INTERVAL",
+                                   "60");
+    ScopedEnvVar deferred_free("MOONCAKE_DFS_DEFERRED_FREE_SECONDS", "0");
+    ScopedEnvVar single_tenant("MOONCAKE_DFS_SINGLE_TENANT", "true");
+
+    {
+        MasterService service;
+        const auto context = PrepareSimpleSegment(service);
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.dfs_replica_num = 1;
+
+        constexpr size_t kObjectSize = 4096;
+        constexpr size_t kConcurrentWrites = 8;
+        constexpr size_t kOldKeyCount = 32;
+        const size_t old_shard =
+            MetadataShardIndex(service, "single_flight_old_seed");
+        std::vector<std::string> old_keys;
+        std::vector<std::string> new_keys;
+        for (size_t i = 0; old_keys.size() < kOldKeyCount ||
+                           new_keys.size() < kConcurrentWrites;
+             ++i) {
+            const std::string key = "single_flight_key_" + std::to_string(i);
+            if (MetadataShardIndex(service, key) == old_shard) {
+                if (old_keys.size() < kOldKeyCount) old_keys.push_back(key);
+            } else if (new_keys.size() < kConcurrentWrites) {
+                new_keys.push_back(key);
+            }
+        }
+
+        for (const auto& key : old_keys) {
+            auto start =
+                service.PutStart(context.client_id, key, TenantId::Default(),
+                                 kObjectSize, config);
+            ASSERT_TRUE(start.has_value()) << key << ": " << start.error();
+            ASSERT_TRUE(service
+                            .PutEnd(context.client_id, key, TenantId::Default(),
+                                    ReplicaType::ALL)
+                            .has_value());
+        }
+
+        auto old_shard_lock = LockMetadataShardForTest(service, old_shard);
+        std::barrier start_barrier(kConcurrentWrites + 1);
+        std::vector<int> errors(kConcurrentWrites,
+                                static_cast<int>(ErrorCode::INTERNAL_ERROR));
+        std::vector<int> bucket_ids(kConcurrentWrites, -1);
+        std::vector<std::thread> writers;
+        writers.reserve(kConcurrentWrites);
+        for (size_t i = 0; i < kConcurrentWrites; ++i) {
+            writers.emplace_back([&, i] {
+                start_barrier.arrive_and_wait();
+                auto result =
+                    i % 2 == 0
+                        ? service.PutStart(context.client_id, new_keys[i],
+                                           TenantId::Default(), kObjectSize,
+                                           config)
+                        : service.UpsertStart(context.client_id, new_keys[i],
+                                              TenantId::Default(), kObjectSize,
+                                              config);
+                if (!result) {
+                    errors[i] = static_cast<int>(result.error());
+                    return;
+                }
+                errors[i] = static_cast<int>(ErrorCode::OK);
+                for (const auto& descriptor : *result) {
+                    if (descriptor.is_dfs_replica()) {
+                        bucket_ids[i] =
+                            descriptor.get_dfs_descriptor().shard_idx;
+                    }
+                }
+            });
+        }
+
+        start_barrier.arrive_and_wait();
+        // Keep eviction validation blocked long enough for all writers to
+        // encounter the full allocator. Without single-flight recovery they
+        // freeze different LRU buckets while waiting on this shard.
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        old_shard_lock.reset();
+        for (auto& writer : writers) writer.join();
+
+        for (size_t i = 0; i < kConcurrentWrites; ++i) {
+            EXPECT_EQ(errors[i], static_cast<int>(ErrorCode::OK))
+                << new_keys[i];
+            EXPECT_GE(bucket_ids[i], 0) << new_keys[i];
+            EXPECT_EQ(bucket_ids[i], bucket_ids.front()) << new_keys[i];
+        }
+
+        size_t old_dfs_replicas = 0;
+        for (const auto& key : old_keys) {
+            auto query = service.GetReplicaList(key, TenantId::Default());
+            ASSERT_TRUE(query.has_value()) << key;
+            old_dfs_replicas +=
+                std::count_if(query->replicas.begin(), query->replicas.end(),
+                              [](const Replica::Descriptor& descriptor) {
+                                  return descriptor.is_dfs_replica();
+                              });
+        }
+        EXPECT_EQ(old_dfs_replicas, kOldKeyCount - kConcurrentWrites);
+    }
+
+    std::error_code ec;
+    std::filesystem::remove_all(dfs_root, ec);
+}
+
 TEST_F(MasterServiceTest, LeasedUpsertAllocationFailurePreservesObject) {
     MasterServiceConfig service_config;
     service_config.memory_allocator = BufferAllocatorType::OFFSET;
@@ -860,6 +1296,85 @@ TEST_F(MasterServiceTest, TenantScopedRemoveAllSuppressesClearOnRace) {
               MasterServiceTestPeer(service).GetKvClearedPublishedForTesting());
     EXPECT_EQ(
         1u, MasterServiceTestPeer(service).GetKvClearedSuppressedForTesting());
+}
+
+namespace {
+
+StandbyObjectEntry MakeStandbyEntry(const std::string& key, uint64_t obj_size,
+                                    uintptr_t addr,
+                                    const std::string& endpoint) {
+    StandbyObjectEntry entry;
+    entry.tenant_id = TenantId::Default().value();
+    entry.key = key;
+    entry.metadata.client_id = generate_uuid();
+    entry.metadata.size = obj_size;
+    AllocatedBuffer::Descriptor buf;
+    buf.size_ = obj_size;
+    buf.buffer_address_ = addr;
+    buf.transport_endpoint_ = endpoint;
+    Replica::Descriptor desc;
+    desc.id = addr;
+    desc.descriptor_variant = MemoryDescriptor{buf};
+    desc.status = ReplicaStatus::COMPLETE;
+    entry.metadata.replicas.push_back(desc);
+    return entry;
+}
+
+StandbySegmentInfo MakeStandbySegment(const std::string& name,
+                                      const std::string& endpoint,
+                                      uint64_t capacity) {
+    StandbySegmentInfo seg;
+    seg.segment_name = name;
+    seg.transport_endpoint = endpoint;
+    seg.capacity = capacity;
+    seg.is_memory_segment = true;
+    return seg;
+}
+
+}  // namespace
+
+TEST_F(MasterServiceTest, StandbyRestoreSkipsInvalidObjectAndRestoresTheRest) {
+    // #3760: one bad descriptor must not cost the whole index.
+    MasterService service(MakeStrictTenantConfig({"default"}));
+    // Mount the endpoint live: replicas restored onto an unmounted endpoint
+    // stay unreadable until the segment comes back, which is not what this
+    // test checks.
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(service, "ep1");
+    const auto seg = MakeStandbySegment("seg", "ep1", 4096);
+    auto good = MakeStandbyEntry("good_key", 128, 0x1000, "ep1");
+    auto bad = MakeStandbyEntry("bad_key", 128, 0x2000, "ep1");
+    bad.metadata.size = 256;  // descriptor size no longer matches metadata
+
+    auto result = service.RestoreFromStandbySnapshot(
+        {good, bad},
+        /*initial_oplog_sequence_id=*/0, {seg});
+    ASSERT_TRUE(result.has_value());
+    EXPECT_TRUE(
+        service.ExistKey("good_key", TenantId::Default()).value_or(false));
+    EXPECT_FALSE(
+        service.ExistKey("bad_key", TenantId::Default()).value_or(true));
+}
+
+TEST_F(MasterServiceTest, StandbyRestoreDiscardsAmbiguousOverlap) {
+    // #3760: eviction frees and reallocates a buffer; a standby that missed
+    // the removal replays both replicas at the same address. No replay order
+    // reaches the promotion context, so neither side can prove it is newer:
+    // both are discarded, and with nothing restored the restore fails closed.
+    MasterService service(MakeStrictTenantConfig({"default"}));
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(service, "ep1");
+    const auto seg = MakeStandbySegment("seg", "ep1", 4096);
+    auto stale = MakeStandbyEntry("stale_key", 128, 0x1000, "ep1");
+    auto fresh = MakeStandbyEntry("fresh_key", 128, 0x1040, "ep1");
+
+    auto result = service.RestoreFromStandbySnapshot(
+        {stale, fresh},
+        /*initial_oplog_sequence_id=*/0, {seg});
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+    EXPECT_FALSE(
+        service.ExistKey("stale_key", TenantId::Default()).value_or(true));
+    EXPECT_FALSE(
+        service.ExistKey("fresh_key", TenantId::Default()).value_or(false));
 }
 
 TEST_F(MasterServiceTest, StandbySnapshotRestorePreservesTenantScopedKeys) {
@@ -2208,6 +2723,112 @@ TEST_F(MasterServiceTest, SoftPinExpiresAndGetDoesNotReactivate) {
     service_->RemoveAll();
 }
 
+TEST_F(MasterServiceTest, ExistKeyLeasesPinSegmentButProbeKeyDoesNot) {
+    // Set a long lease TTL so leases granted by ExistKey will not expire
+    // during the test.
+    const uint64_t kv_lease_ttl = 2000;
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(kv_lease_ttl)
+                              .build();
+    constexpr size_t kSegmentSize = 4 * 1024 * 1024;
+    constexpr size_t kObjectSize = 2 * 1024 * 1024;
+
+    // ExistKey grants a read lease on every hit, so a scan-heavy client can
+    // pin the entire segment: eviction cannot reclaim the probed objects and
+    // new allocations fail.
+    {
+        std::unique_ptr<MasterService> service_(
+            new MasterService(service_config));
+        [[maybe_unused]] const auto context =
+            PrepareSimpleSegment(*service_, "exist_lease_segment",
+                                 kDefaultSegmentBase, kSegmentSize);
+        const UUID client_id = generate_uuid();
+
+        ReplicateConfig config;
+        config.replica_num = 1;
+        for (const auto& key : {"exist_key_a", "exist_key_b"}) {
+            PutCompletedObject(*service_, client_id, key, config, kObjectSize);
+            auto exists = service_->ExistKey(key, TenantId::Default());
+            ASSERT_TRUE(exists.has_value());
+            ASSERT_TRUE(exists.value());
+        }
+
+        ReplicateConfig trigger_config;
+        trigger_config.replica_num = 1;
+        auto trigger_result = service_->PutStart(
+            client_id, "trigger_exist_eviction", TenantId::Default(),
+            kObjectSize, trigger_config);
+        ASSERT_FALSE(trigger_result.has_value());
+        EXPECT_EQ(ErrorCode::NO_AVAILABLE_HANDLE, trigger_result.error());
+    }
+
+    // ProbeKey shares the lookup path but grants no lease, so the probed
+    // objects stay evictable and the allocation eventually succeeds by
+    // evicting them.
+    {
+        std::unique_ptr<MasterService> service_(
+            new MasterService(service_config));
+        [[maybe_unused]] const auto context = PrepareSimpleSegment(
+            *service_, "probe_segment", kDefaultSegmentBase, kSegmentSize);
+        const UUID client_id = generate_uuid();
+
+        ReplicateConfig config;
+        config.replica_num = 1;
+        for (const auto& key : {"probe_key_a", "probe_key_b"}) {
+            PutCompletedObject(*service_, client_id, key, config, kObjectSize);
+            auto probed = service_->ProbeKey(key, TenantId::Default());
+            ASSERT_TRUE(probed.has_value());
+            ASSERT_TRUE(probed.value());
+        }
+
+        // A missing key reports false.
+        auto missing =
+            service_->ProbeKey("probe_missing_key", TenantId::Default());
+        ASSERT_TRUE(missing.has_value());
+        EXPECT_FALSE(missing.value());
+
+        ReplicateConfig trigger_config;
+        trigger_config.replica_num = 1;
+        bool allocated = false;
+        for (int i = 0; i < 40 && !allocated; ++i) {
+            auto trigger_result = service_->PutStart(
+                client_id, "trigger_probe_eviction_" + std::to_string(i),
+                TenantId::Default(), kObjectSize, trigger_config);
+            allocated = trigger_result.has_value();
+            if (!allocated) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+        }
+        EXPECT_TRUE(allocated);
+    }
+}
+
+TEST_F(MasterServiceTest, BatchProbeKeyReportsPointInTimeExistence) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+
+    constexpr size_t buffer = 0x300000000;
+    constexpr size_t size = 1024 * 1024 * 16;
+    auto segment = MakeSegment("probe_batch_segment", buffer, size);
+    UUID client_id = generate_uuid();
+    ASSERT_TRUE(service_->MountSegment(segment, client_id).has_value());
+
+    const std::string existing_key = "probe_batch_existing_key";
+    ReplicateConfig config;
+    config.replica_num = 1;
+    PutCompletedObject(*service_, client_id, existing_key, config);
+
+    const std::string missing_key = "probe_batch_missing_key";
+    auto results = service_->BatchProbeKey(
+        {}, {existing_key, missing_key, existing_key}, TenantId::Default());
+    ASSERT_EQ(3u, results.size());
+    ASSERT_TRUE(results[0].has_value());
+    EXPECT_TRUE(*results[0]);
+    ASSERT_TRUE(results[1].has_value());
+    EXPECT_FALSE(*results[1]);
+    ASSERT_TRUE(results[2].has_value());
+    EXPECT_TRUE(*results[2]);
+}
+
 TEST_F(MasterServiceTest, WrappedBatchExistKeyUsesTenantAwareBatchPath) {
     const TenantId tenant_id("wrapped_batch_exist_tenant");
     auto service_config = MakeStrictWrappedConfig(
@@ -2778,6 +3399,117 @@ TEST_F(MasterServiceTest, DrainJobFailsAfterRetryBudgetExhausted) {
     auto segment_status = service_->QuerySegmentStatus("segment_0");
     ASSERT_TRUE(segment_status.has_value());
     EXPECT_EQ(segment_status.value(), SegmentStatus::OK);
+}
+
+TEST_F(MasterServiceTest, SetSegmentStatusStopsAndRestoresAllocation) {
+    auto service_config =
+        MasterServiceConfig::builder().set_default_kv_lease_ttl(0).build();
+    auto service_ = std::make_unique<MasterService>(service_config);
+
+    const auto ctx0 = PrepareSimpleSegment(*service_, "segment_0", 0x300000000,
+                                           kDefaultSegmentSize);
+    [[maybe_unused]] const auto ctx1 = PrepareSimpleSegment(
+        *service_, "segment_1", 0x400000000, kDefaultSegmentSize);
+
+    auto replica_endpoints = [&](const std::string& key) {
+        std::unordered_set<std::string> endpoints;
+        auto replicas = service_->GetReplicaList(key, TenantId::Default());
+        EXPECT_TRUE(replicas.has_value());
+        if (replicas.has_value()) {
+            for (const auto& replica : replicas->replicas) {
+                endpoints.insert(replica.get_memory_descriptor()
+                                     .buffer_descriptor.transport_endpoint_);
+            }
+        }
+        return endpoints;
+    };
+    auto put_preferring_segment_0 = [&] {
+        return replica_endpoints(
+            PutObjectOnSegment(*service_, ctx0.client_id, "segment_0"));
+    };
+
+    const std::string existing_key =
+        PutObjectOnSegment(*service_, ctx0.client_id, "segment_0");
+
+    ASSERT_TRUE(service_->SetSegmentStatus("segment_0", SegmentStatus::DRAINING)
+                    .has_value());
+    ASSERT_TRUE(service_->SetSegmentStatus("segment_0", SegmentStatus::DRAINING)
+                    .has_value());
+    auto status = service_->QuerySegmentStatus("segment_0");
+    ASSERT_TRUE(status.has_value());
+    EXPECT_EQ(status.value(), SegmentStatus::DRAINING);
+
+    EXPECT_EQ(put_preferring_segment_0(),
+              std::unordered_set<std::string>{"segment_1"});
+    EXPECT_EQ(replica_endpoints(existing_key),
+              std::unordered_set<std::string>{"segment_0"});
+
+    ASSERT_TRUE(
+        service_->SetSegmentStatus("segment_0", SegmentStatus::OK).has_value());
+    status = service_->QuerySegmentStatus("segment_0");
+    ASSERT_TRUE(status.has_value());
+    EXPECT_EQ(status.value(), SegmentStatus::OK);
+
+    EXPECT_EQ(put_preferring_segment_0(),
+              std::unordered_set<std::string>{"segment_0"});
+}
+
+TEST_F(MasterServiceTest, SetSegmentStatusRejectsOtherTargetStatuses) {
+    auto service_ = std::make_unique<MasterService>();
+    [[maybe_unused]] const auto ctx0 = PrepareSimpleSegment(
+        *service_, "segment_0", 0x300000000, kDefaultSegmentSize);
+
+    for (auto target :
+         {SegmentStatus::UNDEFINED, SegmentStatus::DRAINED,
+          SegmentStatus::GRACEFULLY_UNMOUNTING, SegmentStatus::UNMOUNTING}) {
+        auto result = service_->SetSegmentStatus("segment_0", target);
+        ASSERT_FALSE(result.has_value());
+        EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+    }
+
+    auto status = service_->QuerySegmentStatus("segment_0");
+    ASSERT_TRUE(status.has_value());
+    EXPECT_EQ(status.value(), SegmentStatus::OK);
+}
+
+TEST_F(MasterServiceTest, SetSegmentStatusRejectsUnknownSegment) {
+    auto service_ = std::make_unique<MasterService>();
+
+    auto result =
+        service_->SetSegmentStatus("no_such_segment", SegmentStatus::DRAINING);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::SEGMENT_NOT_FOUND);
+}
+
+TEST_F(MasterServiceTest, SetSegmentStatusRejectsSegmentUnderDrainJob) {
+    auto service_config =
+        MasterServiceConfig::builder().set_default_kv_lease_ttl(0).build();
+    auto service_ = std::make_unique<MasterService>(service_config);
+
+    const auto ctx0 = PrepareSimpleSegment(*service_, "segment_0", 0x300000000,
+                                           kDefaultSegmentSize);
+    [[maybe_unused]] const auto ctx1 = PrepareSimpleSegment(
+        *service_, "segment_1", 0x400000000, kDefaultSegmentSize);
+
+    // The object keeps the job unfinished because no one runs its move task.
+    PutObjectOnSegment(*service_, ctx0.client_id, "segment_0");
+
+    CreateDrainJobRequest request;
+    request.segments = {"segment_0"};
+    request.target_segments = {"segment_1"};
+    request.max_concurrency = 1;
+    auto job_id = service_->CreateDrainJob(request);
+    ASSERT_TRUE(job_id.has_value());
+
+    for (auto target : {SegmentStatus::OK, SegmentStatus::DRAINING}) {
+        auto result = service_->SetSegmentStatus("segment_0", target);
+        ASSERT_FALSE(result.has_value());
+        EXPECT_EQ(result.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+
+    auto status = service_->QuerySegmentStatus("segment_0");
+    ASSERT_TRUE(status.has_value());
+    EXPECT_EQ(status.value(), SegmentStatus::DRAINING);
 }
 
 // ===================== Client Offboarding Tests =====================

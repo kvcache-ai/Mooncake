@@ -1,5 +1,6 @@
 #include "oss_adapter_config.h"
 
+#include <algorithm>
 #include <boost/algorithm/string.hpp>
 #include <glog/logging.h>
 
@@ -39,6 +40,17 @@ tl::expected<OssAdapterConfig, ErrorCode> OssAdapterConfig::FromEnvironment() {
         Environ::ReadOr(Variables::MOONCAKE_OSS_PATH_STYLE, false);
     config.anonymous =
         Environ::ReadOr(Variables::MOONCAKE_OSS_ANONYMOUS, false);
+    config.max_connections =
+        std::max(1, Environ::ReadOr(Variables::MOONCAKE_OSS_MAX_CONNECTIONS,
+                                    config.max_connections));
+    config.receive_buffer_size =
+        std::clamp(Environ::ReadOr(Variables::MOONCAKE_OSS_RECEIVE_BUFFER_SIZE,
+                                   config.receive_buffer_size),
+                   16 * 1024, 10 * 1024 * 1024);
+    config.upload_buffer_size =
+        std::clamp(Environ::ReadOr(Variables::MOONCAKE_OSS_UPLOAD_BUFFER_SIZE,
+                                   config.upload_buffer_size),
+                   16 * 1024, 2 * 1024 * 1024);
 
     while (!config.endpoint.empty() && config.endpoint.back() == '/') {
         config.endpoint.pop_back();

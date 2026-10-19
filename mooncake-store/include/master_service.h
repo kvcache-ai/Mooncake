@@ -16,6 +16,7 @@
 #include <optional>
 #include <queue>
 #include <shared_mutex>
+#include <span>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -31,6 +32,7 @@
 #include "client_offboarding.h"
 #include "count_min_sketch.h"
 #include "deadline_scheduler.h"
+#include "dynamic_replication_controller.h"
 #include "lease.h"
 #include "master_metric_manager.h"
 #include "mutex.h"
@@ -41,16 +43,17 @@
 #include "serialize/serializer.h"
 #include "local_ssd/manager.h"
 #include "tenant_quota_ledger.h"
-#include "tenant_quota_sharded.h"
-#include "tenant_quota_policy_store.h"
+#include "tenant/quota_manager.h"
 #include "types.h"
+#include "weight_store_manager.h"
 #include "master_config.h"
 #include "object_metadata.h"
 #include "object_runtime_state.h"
+#include "metadata/object_state.h"
+#include "promotion_candidate_tracker.h"
 #include "rpc_types.h"
 #include "replica.h"
 #include "ha/ha_types.h"
-#include "ha/snapshot/object/snapshot_object_store.h"
 #include "ha/snapshot/batch_oplog/promotion.h"
 #include "task_manager.h"
 #include "kv_event/kv_event_publisher.h"
@@ -61,18 +64,10 @@
 
 namespace mooncake {
 
-// Forward declaration for MasterSnapshotManager
-class MasterSnapshotManager;
-class MasterSnapshotRepository;
-
-namespace ha {
-class SnapshotCatalogStore;
-class MasterSnapshotCodec;
-struct MasterSnapshotPayloads;
-}  // namespace ha
-
 class EtcdOpLogStore;
-class DfsGlobalAllocator;
+class ShardAllocator;
+class DfsAllocatorInterface;
+class ImmutableBucketAllocator;
 
 // Forward declarations
 class EvictionStrategy;
@@ -80,7 +75,6 @@ class HaKvBackend;
 class HttpMetadataServer;
 class OpLogBatchStorage;
 class OrderedOpLogWriter;
-struct MetadataStoragePlugin;
 
 namespace test {
 class MasterServiceTestPeer;
@@ -109,28 +103,25 @@ void ShrinkBucketsIfSparse(UnorderedContainer& container) {
  * @brief MasterService is the main class for the master server.
  * Lock order: To avoid deadlocks, the following lock order should be followed:
  * 1. client_mutex_
- * 2. tenant_quota_policy_mutex_
- * 3. snapshot_mutex_
+ * 2. tenant_quota_manager_'s policy mutex
+ * 3. master_state_mutex_
  * 4. metadata_shards_[shard_idx_].mutex
- * 5. tenant_quota_recompute_mutex_
+ * 5. tenant_quota_manager_'s recompute mutex
  * 6. ShardedTenantQuotaTable internal mutex or pool_mutex_
  * 7. soft_pin_deadline_index_ mutex
  *
- * Strict tenant admission and policy mutation paths that need both
- * tenant_quota_policy_mutex_ and snapshot_mutex_ must acquire the tenant
- * policy mutex first, then snapshot_mutex_.
- * tenant_quota_recompute_mutex_ serializes the capacity snapshot and the
- * corresponding quota-table update. The segment mutex is released before
- * entering ShardedTenantQuotaTable, so these two locks are never nested.
+ * Strict tenant admission and policy mutation paths that need both the tenant
+ * policy mutex and master_state_mutex_ must acquire the tenant policy mutex
+ * first, then master_state_mutex_.
+ * The recompute mutex serializes the capacity snapshot and the corresponding
+ * quota-table update. The segment mutex is released before entering
+ * ShardedTenantQuotaTable, so these two locks are never nested.
  */
 
 class MasterService {
+    friend class MasterStoreBackend;
     friend class test::MasterServiceTestPeer;
-    friend class MasterSnapshotManager;    // Allow access to internal state for
-                                           // snapshot
     friend class ClientOffboardingWorker;
-    friend class ha::MasterSnapshotCodec;  // Allow codec to access private
-                                           // members
 
    public:
     using NoFProbeFn =
@@ -155,6 +146,24 @@ class MasterService {
     tl::expected<std::optional<TenantQuotaSnapshot>, ErrorCode>
     DeleteTenantQuotaPolicy(const TenantId& tenant_id);
     uint64_t GetTenantQuotaAllocatableCapacityBytes();
+
+    WeightMetadataStore::Result<WeightRevisionLease> AcquireWeightRevisionLease(
+        const AcquireWeightRevisionLeaseRequest& request);
+    WeightMetadataStore::Result<WeightRevisionLease> RenewWeightRevisionLease(
+        const RenewWeightRevisionLeaseRequest& request);
+    WeightMetadataStore::Result<void> ReleaseWeightRevisionLease(
+        const ReleaseWeightRevisionLeaseRequest& request);
+
+    WeightMetadataStore::Result<WeightRevisionMetadata> BeginWeightImport(
+        const BeginWeightImportRequest& request);
+    WeightMetadataStore::Result<WeightRevisionMetadata> CommitWeightImport(
+        const CommitWeightImportRequest& request);
+    WeightMetadataStore::Result<WeightRevisionMetadata> AbortWeightImport(
+        const AbortWeightImportRequest& request);
+    WeightMetadataStore::Result<WeightRevisionView> GetWeightRevision(
+        const GetWeightRevisionRequest& request) const;
+    WeightMetadataStore::Result<ListWeightRevisionsResponse>
+    ListWeightRevisions(const ListWeightRevisionsRequest& request) const;
 
     void SetBatchOpLogTerminalCallback(
         OrderedOpLogWriter::TerminalCallback callback);
@@ -244,6 +253,19 @@ class MasterService {
 
     std::vector<tl::expected<bool, ErrorCode>> BatchExistKey(
         const std::vector<std::string>& keys, const TenantId& tenant_id);
+
+    /**
+     * @brief Point-in-time existence check that grants no read lease.
+     *        A `true` result only means the object existed at the time of
+     *        the call; it may be evicted before a subsequent Get.
+     * @return ErrorCode::OK if exists, otherwise return other ErrorCode
+     */
+    auto ProbeKey(const std::string& key, const TenantId& tenant_id)
+        -> tl::expected<bool, ErrorCode>;
+
+    std::vector<tl::expected<bool, ErrorCode>> BatchProbeKey(
+        const GrantLeasePolicy& policy, const std::vector<std::string>& keys,
+        const TenantId& tenant_id);
 
     /**
      * @brief Fetch all keys for a single tenant.
@@ -541,6 +563,27 @@ class MasterService {
         -> tl::expected<void, ErrorCode>;
 
     /**
+     * @brief Evict a disk replica only if the current record is still the
+     * replica the caller failed on.
+     *
+     * The precondition is checked against the replica id inside the same
+     * shard write lock as the eviction, so a replica replaced between the
+     * caller's query and this call is left untouched.
+     * @param client_id The client performing the eviction
+     * @param key The object key whose disk replica was evicted
+     * @param replica_type DISK or LOCAL_DISK
+     * @param expected_replica_id The replica id the caller failed on
+     * @return true if the replica was evicted, false if the precondition did
+     * not hold (the replica was replaced or is already gone), or an error
+     */
+    auto EvictDiskReplicaIfCurrent(const UUID& client_id,
+                                   const std::string& key,
+                                   const TenantId& tenant_id,
+                                   ReplicaType replica_type,
+                                   ReplicaID expected_replica_id)
+        -> tl::expected<bool, ErrorCode>;
+
+    /**
      * @brief Batch evict disk replicas for multiple keys.
      * @param client_id The client performing the eviction
      * @param keys The object keys whose disk replicas were evicted
@@ -705,7 +748,7 @@ class MasterService {
      *
      * The replica sweep targets exactly this owner (see
      * ClearLocalDiskHandlesOwnedBy), and the deregistration runs under the
-     * exclusive snapshot_mutex_ so no registration admitted against the old
+     * exclusive master_state_mutex_ so no registration admitted against the old
      * one can land after the sweep: NotifyOffloadSuccess checks the
      * registration and writes the replica inside one shared-lock section,
      * which therefore falls entirely before the deregistration (registered,
@@ -751,9 +794,9 @@ class MasterService {
     /**
      * @brief Heartbeat-driven pull of pending promotion work for a client.
      * Returns tenant-scoped promotion tasks for the holder client and clears
-     * its per-client promotion_objects queue. The per-shard promotion_tasks
-     * map remains populated as the source of truth until NotifyPromotionSuccess
-     * commits the new MEMORY replica.
+     * its per-client promotion_objects queue. The object's promotion task
+     * remains the source of truth until NotifyPromotionSuccess commits the new
+     * MEMORY replica.
      */
     auto PromotionObjectHeartbeat(const UUID& client_id)
         -> tl::expected<std::vector<PromotionTaskItem>, ErrorCode>;
@@ -865,15 +908,33 @@ class MasterService {
         const UUID& segment_id);
 
     /**
+     * @brief Switch a segment between OK and DRAINING without a drain job.
+     * DRAINING stops new allocations on the segment while its existing
+     * replicas stay readable. Rejected while an unfinished drain job lists
+     * the segment as a source.
+     */
+    tl::expected<void, ErrorCode> SetSegmentStatus(
+        const std::string& segment_name, SegmentStatus status);
+
+    /**
      * @brief Restore primary state from standby promotion context.
      * Called once at promotion time before serving requests.
      */
     tl::expected<void, ErrorCode> RestoreFromStandbySnapshot(
         const std::vector<StandbyObjectEntry>& objects,
         uint64_t initial_oplog_sequence_id,
-        const std::vector<StandbySegmentInfo>& segments);
+        const std::vector<StandbySegmentInfo>& segments,
+        const WeightMetadataSnapshot& weight_metadata = {});
+    // Copies objects out of the handoff. The caller keeps ownership so a
+    // failed restore or a later lease loss can still PreservePromotionBaseline.
     tl::expected<void, ErrorCode> RestoreFromBatchOpLogPromotion(
-        BatchOpLogPromotionHandoff handoff,
+        const BatchOpLogPromotionHandoff& handoff,
+        size_t chunk_object_count = kDefaultBatchOpLogPromotionChunkObjects);
+    tl::expected<void, ErrorCode> RestoreFromBatchOpLogPromotion(
+        const StandbyMetadataStore& metadata_store,
+        DurablePrefix applied_cursor,
+        const std::vector<StandbySegmentInfo>& segments,
+        ReplicaID max_replica_id,
         size_t chunk_object_count = kDefaultBatchOpLogPromotionChunkObjects);
 
     /**
@@ -919,29 +980,51 @@ class MasterService {
    private:
     tl::expected<void, ErrorCode> RestoreFromStandbyState(
         const std::vector<StandbyObjectEntry>* legacy_objects,
-        std::unique_ptr<StandbyMetadataStore> metadata_store,
+        const StandbyMetadataStore* metadata_store,
         uint64_t initial_oplog_sequence_id,
         const std::vector<StandbySegmentInfo>& segments,
         size_t chunk_object_count,
-        std::optional<ReplicaID> expected_max_replica_id);
+        std::optional<ReplicaID> expected_max_replica_id,
+        const WeightMetadataSnapshot* legacy_weight_metadata);
 
-    std::unique_ptr<ha::SnapshotCatalogStore> CreateSnapshotCatalogStore(
-        const MasterServiceConfig& config);
+    // Tolerant legacy snapshot restore (#3760), one phase per method so each
+    // stays single-purpose.
+    struct LegacyRestoreContext;
+    void NoteLegacyStandbyRejection(LegacyRestoreContext& ctx,
+                                    const StandbyObjectEntry& entry,
+                                    const char* reason);
+    tl::expected<void, ErrorCode> ValidateLegacyStandbyEntries(
+        LegacyRestoreContext& ctx);
+    tl::expected<void, ErrorCode> ConstructLegacyStandbyReplicas(
+        LegacyRestoreContext& ctx);
+    tl::expected<size_t, ErrorCode> InstallLegacyStandbyObjects(
+        LegacyRestoreContext& ctx);
 
-    // Restore master state
-    void RestoreState();
-    void ResetStateAfterFailedRestoreAttempt();
-    tl::expected<void, SerializationError>
-    RebuildClientLivenessAfterSnapshotRestore();
+    // A restored local-disk replica reads only while its owner has a liveness
+    // record; share the existing one or stage a fresh record for install.
+    std::shared_ptr<ClientLivenessRecord> RecordRestoreKnownOwner(
+        std::unordered_map<UUID, std::shared_ptr<ClientLivenessRecord>,
+                           boost::hash<UUID>>& new_known_owner_records,
+        const UUID& owner);
 
-    /**
-     * @brief Apply decoded snapshot state to running master service
-     * @param payloads Decoded snapshot payloads
-     * @param now Current time for cleanup logic
-     * @return void on success, SerializationError on failure
-     */
-    tl::expected<void, SerializationError> ApplySnapshotState(
-        const std::chrono::system_clock::time_point& now);
+    // Shared lookup path for ExistKey/ProbeKey (and their batch variants).
+    // When grant_lease is false, the check acquires no read lease and is a
+    // point-in-time existence probe only.
+    auto ExistKeyImpl(const std::string& key, const TenantId& tenant_id,
+                      bool grant_lease) -> tl::expected<bool, ErrorCode>;
+
+    // Shared body for EvictDiskReplica and EvictDiskReplicaIfCurrent. When
+    // expected_replica_id is set, the eviction runs only if a matching
+    // replica with that id is still present under the shard write lock;
+    // otherwise the record is left untouched and false is returned.
+    auto EvictDiskReplicaImpl(const UUID& client_id, const std::string& key,
+                              const TenantId& tenant_id,
+                              ReplicaType replica_type,
+                              const ReplicaID* expected_replica_id)
+        -> tl::expected<bool, ErrorCode>;
+    std::vector<tl::expected<bool, ErrorCode>> BatchExistKeyImpl(
+        const std::vector<std::string>& keys, const TenantId& tenant_id,
+        bool grant_lease);
 
     // BatchEvict evicts objects in a near-LRU way, i.e., prioritizes to evict
     // object with smaller lease timeout. It has two passes. The first pass only
@@ -984,7 +1067,7 @@ class MasterService {
                                     const ReplicateConfig& config);
 
     void ClearInvalidHandles();
-    // Caller owns snapshot_mutex_ (shared) while metadata is swept.
+    // Caller owns master_state_mutex_ (shared) while metadata is swept.
     void ClearInvalidHandles(
         const std::unordered_set<UUID, boost::hash<UUID>>& retaining_clients);
     // Clear completed LOCAL_DISK replicas owned by exactly this client, in
@@ -1004,17 +1087,10 @@ class MasterService {
     tl::expected<void, ErrorCode> ClearStaleHandles(
         const std::function<bool(const Replica&)>& is_stale);
     bool ProcessClientOffboardingJob(ClientOffboardingJob& job);
-    bool ShouldSkipSnapshotForClientOffboarding() const {
-        return client_offboarding_worker_.HasPending();
-    }
-
-    std::string FormatTimestamp(
-        const std::chrono::system_clock::time_point& tp);
     // We need to clean up finished tasks periodically to avoid memory leak
     // And also we can add some task ttl mechanism in the future
     void TaskCleanupThreadFunc();
     void JobDispatchThreadFunc();
-    void DynamicReplicationAdmissionThreadFunc();
 
     // Internal data structures
     struct ObjectIdentity {
@@ -1024,31 +1100,23 @@ class MasterService {
 
     static constexpr size_t kNumShards = 1024;  // Number of metadata shards
 
+    // One object: its metadata and the tasks in flight for it, which live and
+    // die with it.
+    struct ObjectRecord {
+        template <typename... Args>
+        explicit ObjectRecord(Args&&... metadata_args)
+            : metadata(std::forward<Args>(metadata_args)...) {}
+
+        ObjectMetadata metadata;
+        route::ObjectState state;
+    };
+    using ObjectMap = std::unordered_map<std::string, ObjectRecord>;
+
     struct TenantState {
         TenantQuotaHandle quota_account{nullptr};
-        std::unordered_map<std::string, ObjectMetadata> metadata;
-        std::unordered_set<std::string> processing_keys;
-        std::unordered_map<std::string, ReplicationTask> replication_tasks;
-        std::unordered_map<std::string, const OffloadingTask> offloading_tasks;
-        std::unordered_map<std::string, PromotionTask> promotion_tasks;
-        std::unordered_map<std::string, PromotionCandidate>
-            promotion_candidates;
+        ObjectMap metadata;
 
-        std::unordered_map<std::string, DynamicReplicaPending>
-            dynamic_replication_pending;
-        std::unordered_map<UUID, ReplicaActionLease, boost::hash<UUID>>
-            dynamic_replication_leases;
-        std::unordered_map<std::string, std::chrono::steady_clock::time_point>
-            dynamic_replication_cooldowns;
-
-        bool Empty() const {
-            return metadata.empty() && processing_keys.empty() &&
-                   replication_tasks.empty() && offloading_tasks.empty() &&
-                   promotion_tasks.empty() && promotion_candidates.empty() &&
-                   dynamic_replication_pending.empty() &&
-                   dynamic_replication_leases.empty() &&
-                   dynamic_replication_cooldowns.empty();
-        }
+        bool Empty() const { return metadata.empty(); }
     };
 
     // Sharded metadata maps and their mutexes
@@ -1080,6 +1148,8 @@ class MasterService {
         std::unordered_map<std::string, GroupState> groups GUARDED_BY(mutex);
     };
     GroupDomain group_domain_;
+    MasterStoreBackend weight_backend_{*this};
+    WeightStoreManager weight_manager_{weight_backend_};
 
     class SoftPinDeadlineIndex {
         friend class test::MasterServiceTestPeer;
@@ -1137,8 +1207,6 @@ class MasterService {
         const std::function<bool(const Replica&)>& pred_fn);
     std::vector<Replica> PopReplicasWithCacheTotalAccounting(
         ObjectMetadata& metadata);
-    size_t RecordDynamicReplicaRemoval(
-        ObjectMetadata& metadata, const std::vector<ReplicaID>& replica_ids);
     size_t EraseReplicasWithCacheTotalAccounting(
         ObjectMetadata& metadata,
         const std::function<bool(const Replica&)>& pred_fn,
@@ -1342,20 +1410,19 @@ class MasterService {
             const std::string&, ObjectMetadata&, TenantState&,
             MetadataShardAccessorRW&)>& evict_one_member);
 
-    std::unordered_map<std::string, ObjectMetadata>::iterator EraseMetadata(
-        TenantState& tenant_state,
-        std::unordered_map<std::string, ObjectMetadata>::iterator it,
-        const TenantId& tenant_id);
-    void ReleaseLocalDiskUsage(const std::vector<Replica>& replicas);
+    ObjectMap::iterator EraseMetadata(TenantState& tenant_state,
+                                      ObjectMap::iterator it,
+                                      const TenantId& tenant_id);
+    void ReleaseLocalDiskUsage(std::span<const Replica> replicas);
     enum class QuotaEraseMode {
         kFull,
         kPreserveOld,
         kAbortOnly,
     };
-    std::unordered_map<std::string, ObjectMetadata>::iterator EraseMetadata(
-        TenantState& tenant_state,
-        std::unordered_map<std::string, ObjectMetadata>::iterator it,
-        const TenantId& tenant_id, QuotaEraseMode quota_mode);
+    ObjectMap::iterator EraseMetadata(TenantState& tenant_state,
+                                      ObjectMap::iterator it,
+                                      const TenantId& tenant_id,
+                                      QuotaEraseMode quota_mode);
     tl::expected<void, ErrorCode> SettlePrimaryWriteQuotaIfReady(
         TenantState& tenant_state, ObjectMetadata& metadata);
     uint64_t CompletedMemoryQuotaCharge(const ObjectMetadata& metadata) const;
@@ -1370,12 +1437,8 @@ class MasterService {
     void ReleaseTenantQuota(TenantQuotaHandle account, uint64_t bytes);
     void RecomputeTenantEffectiveQuotas();
     void RebuildTenantQuotaUsageFromMetadata();
-    void LoadTenantQuotaPoliciesFromStoreOrThrow();
-    void ApplyTenantQuotaPolicies(const TenantQuotaPolicySnapshot& snapshot);
-    TenantQuotaPolicySnapshot BuildTenantQuotaPolicySnapshot() const;
-    std::unordered_map<std::string, ObjectMetadata>::iterator EraseMetadata(
-        TenantState& tenant_state,
-        std::unordered_map<std::string, ObjectMetadata>::iterator it,
+    ObjectMap::iterator EraseMetadata(
+        TenantState& tenant_state, ObjectMap::iterator it,
         const TenantId& tenant_id, QuotaEraseMode quota_mode,
         MetadataShardAccessorRW* shard,
         const std::vector<std::string>& previous_media_hint = {});
@@ -1432,7 +1495,7 @@ class MasterService {
     // or local_disk replicas whose owner client no longer retains resources.
     bool CleanupStaleHandles(
         const std::string& key, const TenantId& tenant_id,
-        TenantState& tenant_state, ObjectMetadata& metadata,
+        TenantState& tenant_state, ObjectRecord& record,
         const std::unordered_set<UUID, boost::hash<UUID>>& retaining_clients,
         MetadataShardAccessorRW* shard = nullptr);
     // Predicate form, so the owner-targeted LOCAL_DISK sweep can reuse the
@@ -1440,7 +1503,7 @@ class MasterService {
     // shard bookkeeping) instead of duplicating it.
     bool CleanupStaleHandles(
         const std::string& key, const TenantId& tenant_id,
-        TenantState& tenant_state, ObjectMetadata& metadata,
+        TenantState& tenant_state, ObjectRecord& record,
         const std::function<bool(const Replica&)>& is_stale,
         MetadataShardAccessorRW* shard = nullptr);
 
@@ -1448,7 +1511,7 @@ class MasterService {
     // Momentarily takes the LocalSsdManager registry lock, so callers must not
     // hold it; call before taking a metadata shard lock. Callers that need the
     // answer to stay true across a later metadata write must hold
-    // snapshot_mutex_ (shared) across both -- UnmountLocalDiskSegment
+    // master_state_mutex_ (shared) across both -- UnmountLocalDiskSegment
     // deregisters the client under the exclusive lock, so the check and the
     // write cannot straddle a deregistration.
     bool HasMountedLocalDiskSegment(const UUID& client_id);
@@ -1458,7 +1521,8 @@ class MasterService {
     // before the old metadata is removed.
     auto AllocateReplicas(const std::string& key, uint64_t value_length,
                           const ReplicateConfig& config,
-                          const std::string& writer_host_id)
+                          const std::string& writer_host_id,
+                          bool* dfs_allocation_failed = nullptr)
         -> tl::expected<std::vector<Replica>, ErrorCode>;
 
     auto InsertMetadata(MetadataShardAccessorRW& shard, const UUID& client_id,
@@ -1483,7 +1547,8 @@ class MasterService {
         const std::chrono::system_clock::time_point& now,
         const ResolvedSoftPinRequest& soft_pin_request,
         std::optional<std::chrono::system_clock::time_point>
-            committed_soft_pin_timeout = std::nullopt)
+            committed_soft_pin_timeout = std::nullopt,
+        bool* dfs_allocation_failed = nullptr)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
 
     /**
@@ -1493,8 +1558,12 @@ class MasterService {
         MetadataShardAccessorRW& shard,
         const std::chrono::system_clock::time_point& now);
     void FreeDfsReplicas(const std::string& key,
-                         const std::vector<Replica>& replicas);
+                         std::span<const Replica> replicas);
     void RunDfsEviction();
+    void RunShardDfsEviction();
+    void RunBucketDfsEviction();
+    bool RunBucketDfsEvictionInternal(bool force_one);
+    bool TryRecoverDfsSpaceAfterAllocationFailure();
     void InitDfsAllocatorFromEnvironment(const MasterServiceConfig& config);
     /**
      * @brief Helper to release space of expired discarded replicas.
@@ -1523,8 +1592,7 @@ class MasterService {
     // and dropping the task marker along with its mirrors. Returns false
     // without touching the task if any mirror has already been drained by a
     // store worker.
-    bool CancelQueuedOffloadTask(TenantState& tenant_state,
-                                 ObjectMetadata& metadata,
+    bool CancelQueuedOffloadTask(ObjectRecord& record,
                                  const ObjectIdentity& object_id);
 
     struct GracefulUnmountDeadlineRecord {
@@ -1541,7 +1609,7 @@ class MasterService {
      * @brief Mirror of PushOffloadingQueue for promotion-on-hit. Inserts an
      * task into the holder client's LocalSSD mailbox.
      * Caller is responsible for refcnt-pinning the source replica and
-     * recording the task in the shard's promotion_tasks map.
+     * recording the task on the object.
      */
     tl::expected<void, ErrorCode> PushPromotionQueue(
         const ObjectIdentity& object_id, Replica& source_replica);
@@ -1556,41 +1624,31 @@ class MasterService {
      */
     PromotionQueueResult TryPushPromotionQueue(const ObjectIdentity& object_id,
                                                bool record_candidate = true);
-    void RecordOrUpdateCandidate(TenantState& tenant_state,
-                                 const std::string& key, uint8_t sketch_score,
-                                 PromotionCandidateReason reason,
-                                 ErrorCode last_error,
-                                 uint32_t execution_failures = 0);
-    void EraseCandidate(TenantState& tenant_state, const std::string& key);
     void EraseCandidate(const ObjectIdentity& object_id);
-    void DecrementCandidateCount();
     void BackoffCandidate(const ObjectIdentity& object_id,
                           PromotionQueueResult result);
     void ClearCandidatesForReload();
-    std::chrono::milliseconds CandidateBackoff(uint32_t retry_count) const;
-    bool IsTransientResult(PromotionQueueResult result) const;
-    size_t RunPromotionCandidateRetry(size_t max_shards_to_scan);
     size_t RunPromotionCandidateRetry();
 
-    // Erase any in-flight PromotionTask for `key`, refund its pending charge,
+    // Erase the object's in-flight PromotionTask, refund its pending charge,
     // and decrement the cluster-wide in-flight counter. Safe no-op if no task
     // exists.
     void ErasePromotionTaskIfPresent(TenantState& tenant_state,
-                                     const std::string& key)
+                                     route::ObjectState& state)
         NO_THREAD_SAFETY_ANALYSIS {
-        auto task_it = tenant_state.promotion_tasks.find(key);
-        if (task_it != tenant_state.promotion_tasks.end()) {
+        if (state.promotion_task) {
             ReleaseTenantQuota(
                 GetBoundTenantQuotaHandle(tenant_state),
-                std::exchange(task_it->second.pending_quota_charge_bytes, 0));
-            tenant_state.promotion_tasks.erase(task_it);
+                std::exchange(state.promotion_task->pending_quota_charge_bytes,
+                              0));
+            state.promotion_task.reset();
             promotion_in_flight_.fetch_sub(1, std::memory_order_relaxed);
             MasterMetricManager::instance().dec_promotion_in_flight();
             MasterMetricManager::instance().inc_promotion_cancelled();
         }
     }
     void CancelPromotionTaskForRemovedReplicas(
-        TenantState& tenant_state, ObjectMetadata& metadata,
+        TenantState& tenant_state, ObjectRecord& record,
         const std::vector<ReplicaID>& removed_replica_ids)
         NO_THREAD_SAFETY_ANALYSIS;
 
@@ -1605,15 +1663,15 @@ class MasterService {
         false};  // Set to trigger memory eviction when allocation fails
     std::atomic<bool> need_nof_eviction_{
         false};  // Set to trigger NoF eviction when allocation fails
-    const double eviction_ratio_;                     // in range [0.0, 1.0]
-    const double eviction_high_watermark_ratio_;      // in range [0.0, 1.0]
+    const double eviction_ratio_;                 // in range [0.0, 1.0]
+    const double eviction_high_watermark_ratio_;  // in range [0.0, 1.0]
     // Per-tenant watermark as a fraction of each tenant's OWN effective quota.
     // Defaults to the same 0.90 as the pool-wide ratio above; 0.0 disables the
     // pass. See EvictTenantsOverWatermark for why the pool-wide ratio is not
     // sufficient once quotas partition the pool.
     const double tenant_eviction_high_watermark_ratio_;  // in range [0.0, 1.0]
-    const double nof_eviction_ratio_;                 // in range [0.0, 1.0]
-    const double nof_eviction_high_watermark_ratio_;  // in range [0.0, 1.0]
+    const double nof_eviction_ratio_;                    // in range [0.0, 1.0]
+    const double nof_eviction_high_watermark_ratio_;     // in range [0.0, 1.0]
 
     // Eviction thread related members
     std::thread eviction_thread_;
@@ -1626,9 +1684,6 @@ class MasterService {
     // milliseconds, and admission still has its own synchronous fallback in
     // between.
     static constexpr uint64_t kTenantEvictionCheckIntervalMs = 1000;
-
-    // Snapshot manager handles snapshot lifecycle orchestration
-    std::unique_ptr<MasterSnapshotManager> snapshot_manager_;
 
     // Task cleanup thread related members
     std::thread task_cleanup_thread_;
@@ -1655,15 +1710,7 @@ class MasterService {
                                 : &tenant_it_->second),
               it_(tenant_state_ == nullptr
                       ? ObjectMetadataIterator{}
-                      : tenant_state_->metadata.find(object_id_.user_key)),
-              processing_it_(tenant_state_ == nullptr
-                                 ? ProcessingIterator{}
-                                 : tenant_state_->processing_keys.find(
-                                       object_id_.user_key)),
-              replication_task_it_(tenant_state_ == nullptr
-                                       ? ReplicationTaskIterator{}
-                                       : tenant_state_->replication_tasks.find(
-                                             object_id_.user_key)) {
+                      : tenant_state_->metadata.find(object_id_.user_key)) {
             if (tenant_state_ != nullptr) {
                 service_->GetBoundTenantQuotaHandle(*tenant_state_);
             }
@@ -1679,16 +1726,17 @@ class MasterService {
                 // every read-write metadata access, and the VisitReplicas walk
                 // plus vector allocation is pure overhead when KV events are
                 // off (the default).
+                ObjectMetadata& metadata = it_->second.metadata;
                 const auto previous_kv_media =
-                    service_->KvMediaSnapshot(it_->second);
+                    service_->KvMediaSnapshot(metadata);
                 // Erase invalid memory replicas (those with unmounted
                 // segments). No client_mutex_ needed since we only check memory
                 // replicas.
                 const uint64_t before_charge =
-                    service_->CompletedMemoryQuotaCharge(it_->second);
+                    service_->CompletedMemoryQuotaCharge(metadata);
                 std::vector<ReplicaID> removed_replica_ids;
                 service_->EraseReplicasWithCacheTotalAccounting(
-                    it_->second,
+                    metadata,
                     [](const Replica& replica) {
                         return replica.has_invalid_mem_handle();
                     },
@@ -1696,11 +1744,11 @@ class MasterService {
                 service_->CancelPromotionTaskForRemovedReplicas(
                     *tenant_state_, it_->second, removed_replica_ids);
                 const uint64_t after_charge =
-                    service_->CompletedMemoryQuotaCharge(it_->second);
+                    service_->CompletedMemoryQuotaCharge(metadata);
                 if (service_->enable_multi_tenants_ &&
                     before_charge > after_charge) {
                     auto release_result =
-                        it_->second.quota_ledger.ReleaseCommitted(
+                        metadata.quota_ledger.ReleaseCommitted(
                             service_->GetBoundTenantQuotaHandle(*tenant_state_),
                             before_charge - after_charge);
                     if (!release_result) {
@@ -1711,22 +1759,13 @@ class MasterService {
                             << ", bytes=" << before_charge - after_charge;
                     }
                 }
-                service_->SyncKvObjectState(object_id_.user_key, it_->second,
+                service_->SyncKvObjectState(object_id_.user_key, metadata,
                                             object_id_.tenant_id,
                                             previous_kv_media);
-                // If no valid replicas remain, delete the whole object.
-                if (!it_->second.IsValid()) {
-                    // NOTE: Erase() -> EraseMetadata() already removes the key
-                    // from processing_keys (by key), so calling
-                    // EraseFromProcessing() here would re-erase the same node
-                    // via the now-dangling processing_it_ iterator
-                    // (use-after-free, prod segfault 2026-08-03).
+                // If no valid replicas remain, delete the whole object, and
+                // with it every task in flight for it.
+                if (!metadata.IsValid()) {
                     this->Erase();
-                    if (tenant_state_ != nullptr) {
-                        service_->ErasePromotionTaskIfPresent(
-                            *tenant_state_, object_id_.user_key);
-                        MaybeEraseEmptyTenant();
-                    }
                 }
             }
         }
@@ -1735,18 +1774,15 @@ class MasterService {
         bool Exists() const NO_THREAD_SAFETY_ANALYSIS {
             return tenant_state_ != nullptr &&
                    it_ != tenant_state_->metadata.end() &&
-                   it_->second.IsValid();
+                   it_->second.metadata.IsValid();
         }
 
         bool InProcessing() const NO_THREAD_SAFETY_ANALYSIS {
-            return tenant_state_ != nullptr &&
-                   processing_it_ != tenant_state_->processing_keys.end();
+            return HasRecord() && it_->second.state.is_processing;
         }
 
         bool HasReplicationTask() const NO_THREAD_SAFETY_ANALYSIS {
-            return tenant_state_ != nullptr &&
-                   replication_task_it_ !=
-                       tenant_state_->replication_tasks.end();
+            return HasRecord() && it_->second.state.replication_task;
         }
 
         MetadataShardAccessorRW& GetShard() NO_THREAD_SAFETY_ANALYSIS {
@@ -1759,10 +1795,20 @@ class MasterService {
         }
 
         // Get metadata (only call when Exists() is true)
-        ObjectMetadata& Get() NO_THREAD_SAFETY_ANALYSIS { return it_->second; }
+        ObjectMetadata& Get() NO_THREAD_SAFETY_ANALYSIS {
+            return it_->second.metadata;
+        }
+
+        // The tasks in flight for the object (only call when Exists() is true)
+        route::ObjectState& GetState() NO_THREAD_SAFETY_ANALYSIS {
+            return it_->second.state;
+        }
+
+        // The tenant the object was resolved under.
+        const TenantId& GetTenantId() const { return object_id_.tenant_id; }
 
         ReplicationTask& GetReplicationTask() NO_THREAD_SAFETY_ANALYSIS {
-            return replication_task_it_->second;
+            return *it_->second.state.replication_task;
         }
 
         // Delete current metadata (for PutRevoke or Remove operations)
@@ -1776,15 +1822,15 @@ class MasterService {
         }
 
         void EraseFromProcessing() NO_THREAD_SAFETY_ANALYSIS {
-            tenant_state_->processing_keys.erase(processing_it_);
-            processing_it_ = tenant_state_->processing_keys.end();
-            MaybeEraseEmptyTenant();
+            if (HasRecord()) {
+                it_->second.state.is_processing = false;
+            }
         }
 
         void EraseReplicationTask() NO_THREAD_SAFETY_ANALYSIS {
-            tenant_state_->replication_tasks.erase(replication_task_it_);
-            replication_task_it_ = tenant_state_->replication_tasks.end();
-            MaybeEraseEmptyTenant();
+            if (HasRecord()) {
+                it_->second.state.replication_task.reset();
+            }
         }
 
         void Create(const UUID& client_id, uint64_t total_length,
@@ -1807,11 +1853,13 @@ class MasterService {
         }
 
        private:
-        using ObjectMetadataIterator =
-            std::unordered_map<std::string, ObjectMetadata>::iterator;
-        using ProcessingIterator = std::unordered_set<std::string>::iterator;
-        using ReplicationTaskIterator =
-            std::unordered_map<std::string, ReplicationTask>::iterator;
+        using ObjectMetadataIterator = ObjectMap::iterator;
+
+        // Whether the key holds an object, valid or not.
+        bool HasRecord() const NO_THREAD_SAFETY_ANALYSIS {
+            return tenant_state_ != nullptr &&
+                   it_ != tenant_state_->metadata.end();
+        }
 
         void EnsureTenantState() NO_THREAD_SAFETY_ANALYSIS {
             if (tenant_state_ != nullptr) {
@@ -1821,8 +1869,6 @@ class MasterService {
                 shard_guard_.get(), object_id_.tenant_id);
             tenant_it_ = shard_guard_->tenants.find(object_id_.tenant_id);
             it_ = tenant_state_->metadata.end();
-            processing_it_ = tenant_state_->processing_keys.end();
-            replication_task_it_ = tenant_state_->replication_tasks.end();
         }
 
         void MaybeEraseEmptyTenant() NO_THREAD_SAFETY_ANALYSIS {
@@ -1841,49 +1887,6 @@ class MasterService {
             tenant_it_;
         TenantState* tenant_state_;
         ObjectMetadataIterator it_;
-        ProcessingIterator processing_it_;
-        ReplicationTaskIterator replication_task_it_;
-    };
-
-    class MetadataSerializer {
-       public:
-        MetadataSerializer(MasterService* service) : service_(service) {}
-
-        // Serialize metadata of all shards
-        tl::expected<std::vector<uint8_t>, SerializationError> Serialize();
-
-        tl::expected<void, SerializationError> Deserialize(
-            const std::vector<uint8_t>& data);
-
-        void Reset();
-
-       private:
-        MasterService* service_;
-
-        // Serialize a single ObjectMetadata
-        tl::expected<void, SerializationError> SerializeMetadata(
-            const ObjectMetadata& metadata, MsgpackPacker& packer) const;
-
-        // Deserialize a single ObjectMetadata
-        [[nodiscard]] tl::expected<std::unique_ptr<ObjectMetadata>,
-                                   SerializationError>
-        DeserializeMetadata(const msgpack::object& obj) const;
-
-        // Serialize a single MetadataShard
-        tl::expected<void, SerializationError> SerializeShard(
-            const MetadataShard& shard, MsgpackPacker& packer) const;
-
-        // Deserialize a single MetadataShard
-        tl::expected<void, SerializationError> DeserializeShard(
-            const msgpack::object& obj, MetadataShard& shard);
-
-        // Serialize discarded replicas
-        tl::expected<void, SerializationError> SerializeDiscardedReplicas(
-            MsgpackPacker& packer) const;
-
-        // Deserialize discarded replicas
-        tl::expected<void, SerializationError> DeserializeDiscardedReplicas(
-            const msgpack::object& obj);
     };
 
     friend class MetadataAccessor;
@@ -1902,27 +1905,24 @@ class MasterService {
                                 : &tenant_it_->second),
               it_(tenant_state_ == nullptr
                       ? ObjectMetadataConstIterator{}
-                      : tenant_state_->metadata.find(object_id_.user_key)),
-              processing_it_(tenant_state_ == nullptr
-                                 ? ProcessingConstIterator{}
-                                 : tenant_state_->processing_keys.find(
-                                       object_id_.user_key)) {}
+                      : tenant_state_->metadata.find(object_id_.user_key)) {}
 
         // Check if metadata exists
         bool Exists() const NO_THREAD_SAFETY_ANALYSIS {
             return tenant_state_ != nullptr &&
                    it_ != tenant_state_->metadata.end() &&
-                   it_->second.IsValid();
+                   it_->second.metadata.IsValid();
         }
 
         bool InProcessing() const NO_THREAD_SAFETY_ANALYSIS {
             return tenant_state_ != nullptr &&
-                   processing_it_ != tenant_state_->processing_keys.end();
+                   it_ != tenant_state_->metadata.end() &&
+                   it_->second.state.is_processing;
         }
 
         // Get metadata (only call when Exists() is true)
         const ObjectMetadata& Get() NO_THREAD_SAFETY_ANALYSIS {
-            return it_->second;
+            return it_->second.metadata;
         }
 
         MetadataShardAccessorRO& GetShard() NO_THREAD_SAFETY_ANALYSIS {
@@ -1934,10 +1934,7 @@ class MasterService {
         }
 
        private:
-        using ObjectMetadataConstIterator =
-            std::unordered_map<std::string, ObjectMetadata>::const_iterator;
-        using ProcessingConstIterator =
-            std::unordered_set<std::string>::const_iterator;
+        using ObjectMetadataConstIterator = ObjectMap::const_iterator;
 
         const MasterService* service_;
         const ObjectIdentity object_id_;
@@ -1947,7 +1944,6 @@ class MasterService {
             tenant_it_;
         const TenantState* tenant_state_;
         ObjectMetadataConstIterator it_;
-        ProcessingConstIterator processing_it_;
     };
 
     friend class MetadataAccessorRW;
@@ -2020,25 +2016,10 @@ class MasterService {
     // promotion task reaper after the task entry is erased. Relaxed memory
     // order is safe — the value is an advisory soft cap, not a barrier.
     std::atomic<uint64_t> promotion_in_flight_{0};
-    // Promotion retry candidate state.
-    std::atomic<uint64_t> promotion_candidate_count_{0};
-    std::atomic<size_t> promotion_retry_cursor_{0};
-    static constexpr size_t kPromotionCandidateLimit = 50000;
-    // Retry budget is sized to the condition it waits on: the watermark /
-    // queue-cap / push-failure gates clear on the client's offload heartbeat
-    // (10s-scale), not in milliseconds. The old budget (8 retries ≈ 2.3s)
-    // expired candidates long before their condition could clear, silently
-    // killing promotions whose only trigger was a one-off read. 64 retries
-    // with a 5s backoff cap spans ~5 minutes (≈ 30 heartbeat ticks); the TTL
-    // bounds how long an unread key can keep a slot.
-    static constexpr uint32_t kPromotionCandidateMaxRetries = 64;
+    // Promotion retry candidates: the index of due keys and the retry rules.
+    PromotionCandidateTracker promotion_candidates_;
+    // At most this many due candidates are tried per retry round.
     static constexpr size_t kPromotionRetryBatchSize = 128;
-    static constexpr size_t kPromotionRetryShardBatch = 64;
-    static constexpr std::chrono::milliseconds kPromotionCandidateTtl{300000};
-    static constexpr std::chrono::milliseconds
-        kPromotionCandidateInitialBackoff{10};
-    static constexpr std::chrono::milliseconds kPromotionCandidateMaxBackoff{
-        5000};
     // Bound on self-sustaining execution-failure cycles: a key whose
     // promotion keeps failing at execution time (AllocStart under DRAM
     // pressure, TE-write flake, SSD error) is re-recorded at most this many
@@ -2053,93 +2034,32 @@ class MasterService {
     // from any GetReplicaList caller without additional locking.
     std::unique_ptr<CountMinSketch> promotion_sketch_;
 
-    enum class DynamicReplicationMode { kOff, kObserve, kEnforce };
-    struct DynamicReplicationWindow {
-        std::chrono::steady_clock::time_point window_start{};
-        uint32_t hits{0};
-    };
-    struct DynamicReplicaPlan {
-        std::string source_segment;
-        std::string target_segment;
-        std::string target_domain;
-        std::shared_ptr<ClientLivenessRecord> source_liveness;
-    };
+    // Hot-object MEMORY replication: heat admission, placement and the leases
+    // a client copies inside. The pending task of a key stays on its record.
+    DynamicReplicationController dynamic_replication_;
 
-    DynamicReplicationMode dynamic_replication_mode_{
-        DynamicReplicationMode::kOff};
-    uint32_t dynamic_replication_heat_window_seconds_{10};
-    double dynamic_replication_admission_qps_threshold_{0.8};
-    size_t dynamic_replication_max_memory_replicas_{2};
-    std::mutex dynamic_replication_mutex_;
-    std::unordered_map<std::string, DynamicReplicationWindow>
-        dynamic_replication_windows_;
-    std::deque<std::string> dynamic_replication_window_order_;
-    std::chrono::steady_clock::time_point
-        dynamic_replication_next_window_cleanup_{};
-    std::mutex dynamic_replication_admission_mutex_;
-    std::condition_variable dynamic_replication_admission_cv_;
-    std::queue<ObjectIdentity> dynamic_replication_admission_queue_;
-    std::unordered_set<std::string> dynamic_replication_admission_queued_;
-    std::thread dynamic_replication_admission_thread_;
-    std::atomic<bool> dynamic_replication_admission_running_{false};
-    static constexpr std::chrono::milliseconds
-        kDynamicReplicationActionCooldown{30000};
-    static constexpr std::chrono::milliseconds kDynamicReplicationLeaseTtl{
-        30000};
-    static constexpr std::chrono::milliseconds
-        kDynamicReplicationRecreateCooldown{60000};
-    static constexpr std::chrono::milliseconds
-        kDynamicReplicationWindowCleanupInterval{1000};
-    static constexpr uint64_t kDynamicReplicationAdmissionThreadSleepMs = 100;
-    static constexpr size_t kDynamicReplicationWindowEntryLimit = 50000;
-    static constexpr size_t kDynamicReplicationWindowCleanupBudget = 256;
-    static constexpr size_t kDynamicReplicationAdmissionQueueLimit = 50000;
-    static constexpr size_t kDynamicReplicationAdmissionBatchSize = 64;
-    static constexpr double kDynamicReplicationTargetHighWatermark = 0.85;
-
-    bool DynamicReplicationEnabled() const;
-    static uint64_t DynamicReplicationStableScore(const std::string& key,
-                                                  const std::string& segment);
-    bool DynamicReplicationEnforce() const;
-    uint32_t DynamicReplicationAdmissionMinHits() const;
-    void CleanupDynamicReplicationWindowsLocked(
-        std::chrono::steady_clock::time_point now, std::chrono::seconds window);
-    bool ObserveDynamicReplicationAccess(const ObjectIdentity& object_id);
-    bool DynamicReplicationHeatAdmitted(const ObjectIdentity& object_id);
-    void MaybeQueueDynamicReplicaProposal(const ObjectIdentity& object_id);
-    void EnqueueDynamicReplicaProposal(const ObjectIdentity& object_id);
     void TrySubmitDynamicReplicaProposal(const ObjectIdentity& object_id);
     tl::expected<ReplicaActionLease, ErrorCode>
     SubmitReplicaActionProposalLocked(const ReplicaActionProposal& proposal);
-    uint64_t DynamicReplicationVersionEpoch(
-        const ObjectMetadata& metadata) const;
-    void ClearDynamicReplicationStateForKey(TenantState& tenant_state,
-                                            const std::string& key);
     void CleanupExpiredDynamicReplicationState();
-    bool HasDynamicReplicationPending(TenantState& tenant_state,
-                                      const std::string& key);
-    std::optional<DynamicReplicaPlan> SelectDynamicReplicaPlan(
-        const ObjectMetadata& metadata,
-        const std::optional<std::string>& preferred_target_segment,
-        std::string target_domain);
     tl::expected<UUID, ErrorCode> SubmitDynamicReplicaCopyTask(
-        const ObjectIdentity& object_id, const DynamicReplicaPlan& plan,
-        const UUID& lease_id, uint64_t version_epoch);
+        const ObjectIdentity& object_id,
+        const DynamicReplicationController::Plan& plan, const UUID& lease_id,
+        uint64_t version_epoch);
+    // Runs under the shard lock CopyStart holds for the whole operation, so
+    // the pending state it reads is the one that copy was admitted for.
     tl::expected<void, ErrorCode> ValidateDynamicReplicaPendingForCopyStart(
-        TenantState& tenant_state, const std::string& key,
-        const UUID& dynamic_replication_lease_id, const UUID& client_id,
-        const std::string& source_segment, uint64_t current_version_epoch,
+        route::ObjectState& state, const TenantId& tenant_id,
+        const std::string& key, const UUID& dynamic_replication_lease_id,
+        const UUID& client_id, const std::string& source_segment,
+        uint64_t current_version_epoch,
         uint64_t dynamic_replication_version_epoch,
         const std::vector<std::string>& target_segments);
-    void RegisterDynamicReplicaStart(
-        TenantState& tenant_state, ObjectMetadata& metadata,
-        const std::string& key, const std::string& source_segment,
-        uint64_t version_epoch, const std::vector<std::string>& target_segments,
-        const std::vector<ReplicaID>& replica_ids);
-    static int64_t DynamicReplicationNowMs();
 
     const bool enable_oplog_;
+    const bool weight_management_mutations_enabled_;
     const uint32_t oplog_batch_max_entries_;
+    const uint64_t restore_repair_durable_timeout_ms_;
 
     // cluster id for persistent sub directory
     const std::string cluster_id_;
@@ -2149,18 +2069,17 @@ class MasterService {
     const bool enable_disk_eviction_;
     const uint64_t quota_bytes_;
     const bool enable_multi_tenants_;
-    std::unique_ptr<TenantQuotaPolicyStore> tenant_quota_policy_store_;
-    mutable std::mutex tenant_quota_policy_mutex_;
-    mutable std::mutex tenant_quota_recompute_mutex_;
-    ShardedTenantQuotaTable<1024> tenant_quota_table_;
+    TenantQuotaManager tenant_quota_manager_{
+        [this] { return GetTenantQuotaAllocatableCapacityBytes(); }};
 
     // HTTP metadata server pointer for cleanup on client timeout
     // nullptr means cleanup is disabled
     HttpMetadataServer* http_metadata_server_{nullptr};
 
-    // Remote HTTP metadata client, used when the metadata server is deployed
-    // separately. nullptr = no remote cleanup (co-located prefers the pointer).
-    std::shared_ptr<MetadataStoragePlugin> http_metadata_remote_;
+    // Remote HTTP metadata server URL, used when the metadata server is
+    // deployed separately. Empty = no remote cleanup (co-located prefers the
+    // pointer).
+    std::string http_metadata_remote_url_;
 
     // Cached HTTP metadata key prefix (initialized once at startup)
     std::string http_metadata_prefix_;
@@ -2174,6 +2093,9 @@ class MasterService {
     std::vector<std::string> http_metadata_cleanup_queue_;
 
     void HttpMetadataCleanupThreadFunc();
+    // Sends an HTTP DELETE for one key to the remote metadata server; true on
+    // success.
+    bool removeRemoteHttpMetadataKey(const std::string& key) const;
 
     // Clean up HTTP metadata (mooncake/ram/*, mooncake/rpc_meta/*) for a
     // segment. For the co-located case this is synchronous (no network I/O);
@@ -2182,7 +2104,13 @@ class MasterService {
 
     bool use_disk_replica_{false};
     bool enable_dfs_{false};
-    std::unique_ptr<DfsGlobalAllocator> dfs_allocator_;
+    std::unique_ptr<DfsAllocatorInterface> dfs_allocator_;
+    ShardAllocator* shard_allocator_{nullptr};
+    ImmutableBucketAllocator* bucket_allocator_{nullptr};
+    // Serializes allocation-failure recovery so concurrent writers can reuse
+    // capacity made available by the first recovery instead of each evicting
+    // a different frozen bucket.
+    std::mutex dfs_bucket_recovery_mutex_;
 
     // Segment management
     SegmentPool segment_pool_;
@@ -2212,11 +2140,7 @@ class MasterService {
     tl::expected<std::vector<Replica>, ErrorCode> AllocateNoFReplicas(
         const ReplicaAllocationRequest& request);
 
-    std::unique_ptr<SnapshotObjectStore> snapshot_object_store_;
-    std::unique_ptr<ha::SnapshotCatalogStore> snapshot_catalog_store_;
-    std::unique_ptr<MasterSnapshotRepository> snapshot_repository_;
-    std::unique_ptr<ha::MasterSnapshotCodec> snapshot_codec_;
-    mutable std::shared_mutex snapshot_mutex_;
+    mutable std::shared_mutex master_state_mutex_;
 
     // Discarded replicas management
     const std::chrono::seconds put_start_discard_timeout_sec_;
@@ -2249,7 +2173,6 @@ class MasterService {
         }
 
        private:
-        friend class MetadataSerializer;
         std::vector<Replica> replicas_;
         std::chrono::system_clock::time_point ttl_;
         uint64_t mem_size_;
@@ -2447,6 +2370,11 @@ class MasterService {
     tl::expected<OpLogEntry, ErrorCode> AppendOpLogWithDurableFinalize(
         OpType type, const std::string& tenant_id, const std::string& key,
         const std::string& payload, DurableFinalizeCallback callback);
+    // Commit a set of entries as one indivisible batch record, so a durable
+    // prefix either covers the whole set or none of it. Returns the last
+    // assigned sequence id on success.
+    tl::expected<uint64_t, ErrorCode> AppendOpLogBatchWithDurableFinalize(
+        std::vector<OpLogEntry> entries, DurableFinalizeCallback callback);
     tl::expected<OrderedOpLogWriter::Reservation, ErrorCode>
     ReserveBatchOpLogSlot();
     tl::expected<OpLogEntry, ErrorCode> AppendReservedOpLogWithDurableFinalize(
@@ -2467,6 +2395,9 @@ class MasterService {
 
     ErrorCode ValidateStandbyRemountSegment(const Segment& segment) const;
 
+    // True while the replica sits on an endpoint in
+    // invalid_replica_endpoints_. The read path asks only this, never the set.
+    bool IsAwaitingRemount(const Replica& replica) const;
     bool TryGetReadableReplicaDescriptor(const Replica& replica,
                                          Replica::Descriptor& descriptor) const;
     std::vector<Replica::Descriptor> GetReadableReplicaDescriptors(

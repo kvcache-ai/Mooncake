@@ -42,22 +42,32 @@ namespace tent {
 
 // Minimal USM-device backend with an interior-pointer registry.
 //
-// SYCL's sycl::get_pointer_type only classifies base addresses reliably across
-// backends, but the platform requires classifying addresses interior to an
-// allocation (staging hands the backend base + chunk_offset). We therefore keep
-// our own [base, base + size) interval registry and resolve interior addresses
-// against it, backed by real SYCL allocations.
+// Two classification paths are combined:
+//  1. Allocations made through this backend are tracked in a [base, base+size)
+//    interval registry, so interior addresses (staging hands the backend
+//    base + chunk_offset) resolve without touching the SYCL runtime.
+//  2. Anything else is classified with sycl::get_pointer_type against the
+//    platform default context. That is the context PyTorch's XPU allocator
+//    uses (device.get_platform().ext_oneapi_get_default_context()), so a
+//    PyTorch XPU tensor handed to registerLocalMemory is recognised as device
+//    memory and can be copied. Queues are created on that same default
+//    context so queue::memcpy on foreign USM is legal. Only usm::alloc::device
+//    is reported as device memory; host/shared USM is host-accessible and is
+//    treated as ordinary host memory.
 //
 // Every method returns 0 on success and non-zero on failure (classification
 // helpers return bool / an ordinal); XpuPlatform maps these to Status.
 class XpuSyclBackend {
    public:
     static XpuSyclBackend &instance() {
-        static XpuSyclBackend g;
-        return g;
+        // Intentionally leaked: SYCL queues/contexts must not be destroyed
+        // during static teardown, after the SYCL runtime may already be gone.
+        static XpuSyclBackend *g = new XpuSyclBackend();
+        return *g;
     }
 
-    // Enumerate devices and build one in-order queue per device. Idempotent.
+    // Enumerate devices and build one in-order queue per device on the
+    // platform default context. Idempotent.
     int init() {
         std::lock_guard<std::mutex> lock(mu_);
         if (initialized_) return 0;
@@ -83,7 +93,17 @@ class XpuSyclBackend {
             }
             if (devices.empty()) return 1;
             for (auto &d : devices) {
-                queues_.emplace_back(d, sycl::property::queue::in_order());
+                sycl::context ctx =
+                    d.get_platform().ext_oneapi_get_default_context();
+                bool known = false;
+                for (const auto &c : contexts_) {
+                    if (c == ctx) {
+                        known = true;
+                        break;
+                    }
+                }
+                if (!known) contexts_.push_back(ctx);
+                queues_.emplace_back(ctx, d, sycl::property::queue::in_order());
             }
             initialized_ = true;
             return 0;
@@ -91,6 +111,7 @@ class XpuSyclBackend {
             // Leave no partially-built state: a later init() retry must start
             // from an empty queue list, not resume with duplicate ordinals.
             queues_.clear();
+            contexts_.clear();
             return 1;
         }
     }
@@ -132,13 +153,12 @@ class XpuSyclBackend {
 
     bool isDevicePtr(const void *addr) {
         std::lock_guard<std::mutex> lock(mu_);
-        return findLocked(addr) != nullptr;
+        return classifyLocked(addr) >= 0;
     }
 
     int deviceIndex(const void *addr) {
         std::lock_guard<std::mutex> lock(mu_);
-        const Alloc *a = findLocked(addr);
-        return a ? a->device : -1;
+        return classifyLocked(addr);
     }
 
     int copyD2H(void *host_dst, const void *device_src, size_t len) {
@@ -178,6 +198,31 @@ class XpuSyclBackend {
         return nullptr;
     }
 
+    // Device ordinal owning `addr`, or -1 when it is not USM device memory.
+    // Own allocations resolve through the registry; anything else is asked of
+    // the SYCL runtime against every default context we hold.
+    int classifyLocked(const void *addr) const {
+        if (const Alloc *a = findLocked(addr)) return a->device;
+        for (const auto &ctx : contexts_) {
+            try {
+                if (sycl::get_pointer_type(addr, ctx) !=
+                    sycl::usm::alloc::device)
+                    continue;
+                sycl::device owner = sycl::get_pointer_device(addr, ctx);
+                for (size_t i = 0; i < queues_.size(); ++i) {
+                    if (queues_[i].get_device() == owner)
+                        return static_cast<int>(i);
+                }
+                // Device memory on a GPU we did not enumerate: still device
+                // memory; the context is shared, so device 0's queue can copy.
+                return 0;
+            } catch (const sycl::exception &) {
+                // Not a pointer this context knows about.
+            }
+        }
+        return -1;
+    }
+
     int copy(void *dst, const void *src, size_t len, bool to_host) {
         // Validate and resolve the target queue under the lock, but run the
         // blocking memcpy().wait() outside it so copies on different devices
@@ -189,10 +234,16 @@ class XpuSyclBackend {
             std::lock_guard<std::mutex> lock(mu_);
             const void *dev = to_host ? src : dst;
             const Alloc *a = findLocked(dev);
-            if (!a) return 1;  // device side must be a known allocation
-            const uintptr_t start = reinterpret_cast<uintptr_t>(dev);
-            if (start + len > a->base + a->size) return 1;  // runs past end
-            q = queues_[a->device];
+            int device_index;
+            if (a) {
+                const uintptr_t start = reinterpret_cast<uintptr_t>(dev);
+                if (start + len > a->base + a->size) return 1;  // runs past end
+                device_index = a->device;
+            } else {
+                device_index = classifyLocked(dev);
+                if (device_index < 0) return 1;  // not device memory
+            }
+            q = queues_[device_index];
         }
         try {
             q->memcpy(dst, src, len).wait();
@@ -204,6 +255,7 @@ class XpuSyclBackend {
 
     std::mutex mu_;
     bool initialized_ = false;
+    std::vector<sycl::context> contexts_;
     std::vector<sycl::queue> queues_;
     std::vector<Alloc> allocs_;
 };
