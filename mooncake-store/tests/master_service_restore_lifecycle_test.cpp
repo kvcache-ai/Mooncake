@@ -16,7 +16,10 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <chrono>
+#include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <utility>
@@ -226,44 +229,64 @@ TEST_F(MasterServiceTest, RestoreLifecycleWorkersPausedOnlyInRestoreWindows) {
 TEST_F(MasterServiceTest, RestoreLifecycleOverlappingRestoreIsRefused) {
     MasterService service(MakeStrictTenantConfig({"default"}));
     [[maybe_unused]] const auto context = PrepareSimpleSegment(service, "ep1");
-    const auto seg = MakeStandbySegment("seg", "ep1", 1ULL << 32);
+    const auto seg = MakeStandbySegment("seg", "ep1", 4096);
+    auto entry = MakeStandbyEntry("restored_key", 128, 0x1000, "ep1");
 
-    // Large enough that the first restore is still inside its core when the
-    // second call arrives; the test does not depend on its exact duration,
-    // it waits for the Recovering state, which is published before the core
-    // starts.
-    std::vector<StandbyObjectEntry> entries;
-    entries.reserve(20000);
-    for (int i = 0; i < 20000; ++i) {
-        entries.push_back(
-            MakeStandbyEntry("key_" + std::to_string(i), 64,
-                             0x1000 + static_cast<uintptr_t>(i) * 64, "ep1"));
-    }
+    // Hold the restore core's exclusive lock, so the first restore cannot
+    // finish once it has published Recovering. Admission is a compare_exchange
+    // that runs before the core takes this lock, so the wrapper still reaches
+    // Recovering deterministically -- the test does not depend on how long a
+    // restore takes or on the scheduler running the second caller in time.
+    auto& state_mutex = MasterServiceTestPeer::MasterStateMutex(service);
+    std::unique_lock<std::shared_mutex> core_hold(state_mutex);
 
     tl::expected<void, ErrorCode> first_result;
     std::thread first([&] {
-        first_result = service.RestoreFromStandbySnapshot(entries, 0, {seg});
+        first_result = service.RestoreFromStandbySnapshot({entry}, 0, {seg});
     });
 
-    const auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(10);
-    while (MasterServiceTestPeer::GetRestoreLifecycleState(service) !=
-               RestoreLifecycleState::kRecovering &&
-           std::chrono::steady_clock::now() < deadline) {
+    bool saw_recovering = false;
+    const auto recovering_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (std::chrono::steady_clock::now() < recovering_deadline) {
+        if (MasterServiceTestPeer::GetRestoreLifecycleState(service) ==
+            RestoreLifecycleState::kRecovering) {
+            saw_recovering = true;
+            break;
+        }
         std::this_thread::yield();
     }
-    ASSERT_EQ(RestoreLifecycleState::kRecovering,
-              MasterServiceTestPeer::GetRestoreLifecycleState(service))
-        << "the first restore finished before the test could overlap it";
 
-    // A second restore that overlaps the in-flight one is refused instead of
-    // running: it would otherwise be able to publish Ready while the first
-    // one is still rewriting metadata.
-    auto second = service.RestoreFromStandbySnapshot(entries, 0, {seg});
-    ASSERT_FALSE(second.has_value());
-    EXPECT_EQ(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS, second.error());
+    // The overlapping call must be refused at admission. It runs on its own
+    // thread with a bounded wait: if admission ever regressed into blocking on
+    // the core lock this test holds, the suite would hang instead of failing.
+    tl::expected<void, ErrorCode> second_result;
+    std::atomic<bool> second_done{false};
+    std::thread second([&] {
+        second_result = service.RestoreFromStandbySnapshot({entry}, 0, {seg});
+        second_done.store(true);
+    });
+    const auto second_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!second_done.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < second_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const bool second_returned = second_done.load(std::memory_order_acquire);
 
+    // Release the core and join before any fatal assertion: a fatal check
+    // would otherwise return from the test with a joinable std::thread and
+    // call std::terminate instead of reporting an ordinary failure.
+    core_hold.unlock();
     first.join();
+    second.join();
+
+    ASSERT_TRUE(saw_recovering);
+    ASSERT_TRUE(second_returned)
+        << "the overlapping restore blocked on the core lock instead of being "
+           "refused at admission";
+    ASSERT_FALSE(second_result.has_value());
+    EXPECT_EQ(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS, second_result.error());
     ASSERT_TRUE(first_result.has_value());
     EXPECT_EQ(RestoreLifecycleState::kReady,
               MasterServiceTestPeer::GetRestoreLifecycleState(service));
