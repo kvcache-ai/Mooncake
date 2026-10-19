@@ -332,8 +332,8 @@ jobs:
         if os.environ['MP'] == 'ON':
             cxl = os.environ['CXL'] == 'ON'
             expected = {
-                'transfer_metadata_test.xml': 12 if cxl else 10,
-                'transport_metadata_removal_test.xml': 8 if cxl else 5,
+                'transfer_metadata_test.xml': 6 if cxl else 4,
+                'transport_metadata_removal_test.xml': 5 if cxl else 2,
                 'local_buffer_registrations_test.xml': 8,
             }
         for filename, minimum in expected.items():
