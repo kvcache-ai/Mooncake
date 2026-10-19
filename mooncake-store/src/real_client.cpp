@@ -1049,11 +1049,12 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             // P2P handshake mode only works when every peer in the cluster
             // also uses P2PHANDSHAKE: segment descriptors are exchanged
             // directly between peers and are never published to a shared
-            // metadata backend. Warn explicitly because silently mixing
-            // this default with peers that use HTTP/etcd/Redis metadata
-            // makes their lookups fail with "metadata not found"
-            // (issue #4536).
-            LOG(WARNING)
+            // metadata backend. Reported at INFO because a pure-P2PHANDSHAKE
+            // cluster is a valid, common configuration and this branch fires on
+            // every startup of one. The actual mixed-mode detector is the
+            // master-side MountSegment check, which only fires when both modes
+            // are combined (issue #4536).
+            LOG(INFO)
                 << "metadata_server is empty; falling back to P2PHANDSHAKE. "
                    "This mode requires ALL peers in the cluster to use "
                    "P2PHANDSHAKE and does not publish segment descriptors "
