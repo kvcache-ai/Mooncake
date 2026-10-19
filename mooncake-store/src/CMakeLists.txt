@@ -41,9 +41,6 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     segment/catalog.cpp
     segment/pool.cpp
     segment/pool_mount.cpp
-    segment/snapshot.cpp
-    ha/snapshot/allocator_snapshot_codec.cpp
-    ha/snapshot/store_resource_snapshot_codec.cpp
     segment/pool_write_access.cpp
     segment/pool_read_access.cpp
     segment.cpp
@@ -57,7 +54,6 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     offset_allocator.cpp
     http_metadata_server.cpp
     embedded_master.cpp
-    serialize/serializer.cpp
     storage/distributed/shard_allocator.cpp
     storage/distributed/immutable_bucket_allocator.cpp
     ha/leadership/leader_coordinator_factory.cpp
@@ -80,7 +76,6 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     ha/snapshot/batch_oplog/batch_oplog_snapshot_gc.cpp
     ha/snapshot/batch_oplog/batch_oplog_pruning_coordinator.cpp
     ha/snapshot/snapshot_maintenance_lease.cpp
-    ha/snapshot/local_ssd_codec.cpp
     ha/snapshot/object/snapshot_object_store.cpp
     ha/snapshot/object/backends/local/local_file_snapshot_object_store.cpp
     ha/snapshot/object/backends/s3/s3_snapshot_object_store.cpp

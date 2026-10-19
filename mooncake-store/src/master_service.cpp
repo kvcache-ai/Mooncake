@@ -46,7 +46,6 @@
 #include "ha/oplog/oplog_batch_storage.h"
 #include "ha/oplog/ordered_oplog_writer.h"
 #include "types.h"
-#include "serialize/serializer.h"
 #include "common/zstd_util.h"
 #include "common/file_util.h"
 #include "storage/distributed/shard_allocator.h"

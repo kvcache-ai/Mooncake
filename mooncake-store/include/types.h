@@ -428,17 +428,6 @@ inline std::ostream& operator<<(std::ostream& os,
     return os << toString(errorCode);
 }
 
-struct SerializationError {
-    ErrorCode code;
-    std::string message;
-
-    SerializationError(ErrorCode c, const std::string& msg)
-        : code(c), message(msg) {}
-
-    // Construct from ErrorCode
-    explicit SerializationError(ErrorCode c) : code(c), message(toString(c)) {}
-};
-
 /**
  * @brief Represents a contiguous memory region
  */
