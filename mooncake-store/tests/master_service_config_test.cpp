@@ -274,6 +274,16 @@ TEST(MasterServiceConfigTest, MetricsBootstrapConfigPropagatesToSupervisor) {
     EXPECT_EQ(metrics.host, "127.0.0.7");
 }
 
+TEST(MasterServiceConfigTest, HandlerWorkerThreadNumPropagatesToSupervisor) {
+    EXPECT_EQ(0u, MasterServiceSupervisorConfig{}.handler_worker_thread_num);
+
+    MasterConfig master_config{};
+    master_config.handler_worker_thread_num = 7;
+    const MasterServiceSupervisorConfig supervisor_config(master_config);
+
+    EXPECT_EQ(7u, supervisor_config.handler_worker_thread_num);
+}
+
 TEST(MasterServiceConfigTest,
      MetricsBootstrapConfigPreservesWrappedCompatibility) {
     MasterConfig master_config{};

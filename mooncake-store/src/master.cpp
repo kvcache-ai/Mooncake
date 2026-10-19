@@ -25,6 +25,7 @@
 
 #include "http_metadata_server.h"
 #include "master_admin_service.h"
+#include "rpc_worker_pool.h"
 #include "rpc_service.h"
 #include "types.h"
 #include "common/network.h"
@@ -177,8 +178,22 @@ DEFINE_double(nof_eviction_high_watermark_ratio,
 // RPC server configuration parameters (new, preferred)
 // TODO: deprecate port and max_threads in the future
 DEFINE_int32(rpc_thread_num, 0,
-             "Number of threads for RPC server (0 = use max_threads, preferred "
-             "over max_threads)");
+             "Number of io threads for RPC server (0 = use max_threads, "
+             "preferred over max_threads)");
+DEFINE_int32(handler_worker_thread_num, 0,
+             "Number of worker threads that run RPC handlers apart from the "
+             "io threads, so a slow handler cannot delay a Ping (0 = as "
+             "many as rpc_thread_num)");
+DEFINE_validator(handler_worker_thread_num,
+                 [](const char* flagname, int32_t value) {
+                     // The config stores it unsigned, so a negative value
+                     // would become a thread count asio refuses to start.
+                     if (value < 0) {
+                         LOG(ERROR) << flagname << " must not be negative";
+                         return false;
+                     }
+                     return true;
+                 });
 DEFINE_int32(
     rpc_port, 0,
     "Port for RPC server to listen on (0 = use port, preferred over port)");
@@ -499,6 +514,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
                              FLAGS_rpc_port);
     default_config.GetUInt32("rpc_thread_num", &master_config.rpc_thread_num,
                              FLAGS_rpc_thread_num);
+    default_config.GetUInt32("handler_worker_thread_num",
+                             &master_config.handler_worker_thread_num,
+                             FLAGS_handler_worker_thread_num);
     default_config.GetString("rpc_address", &master_config.rpc_address,
                              FLAGS_rpc_address);
     default_config.GetString("rpc_interface", &master_config.rpc_interface,
@@ -815,6 +833,15 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
          !info.is_default) ||
         !conf_set) {
         master_config.rpc_enable_tcp_no_delay = FLAGS_rpc_enable_tcp_no_delay;
+    }
+    if ((google::GetCommandLineFlagInfo("handler_worker_thread_num", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.handler_worker_thread_num =
+            FLAGS_handler_worker_thread_num;
+    }
+    if (master_config.handler_worker_thread_num == 0) {
+        master_config.handler_worker_thread_num = master_config.rpc_thread_num;
     }
     if ((google::GetCommandLineFlagInfo("default_kv_lease_ttl", &info) &&
          !info.is_default) ||
@@ -1547,6 +1574,8 @@ int main(int argc, char* argv[]) {
         << ", client_suspicion_ttl_sec="
         << master_config.client_suspicion_ttl_sec
         << ", rpc_thread_num=" << master_config.rpc_thread_num
+        << ", handler_worker_thread_num="
+        << master_config.handler_worker_thread_num
         << ", rpc_port=" << master_config.rpc_port
         << ", rpc_address=" << master_config.rpc_address
         << ", rpc_interface=" << master_config.rpc_interface
@@ -1648,7 +1677,12 @@ int main(int argc, char* argv[]) {
         admin_server.SetServiceDelegate(wrapped_master_service);
         admin_server.SetServiceAvailable(true);
 
-        mooncake::RegisterRpcService(server, *wrapped_master_service);
+        // Declared after the service so that it drains before the service
+        // is destroyed.
+        mooncake::RpcWorkerPool worker_pool(
+            master_config.handler_worker_thread_num);
+        mooncake::RegisterRpcService(server, *wrapped_master_service,
+                                     &worker_pool);
 
         static std::atomic<bool> shutdown_requested{false};
         auto signal_handler = [](int /* signum */) {

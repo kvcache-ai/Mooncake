@@ -5143,3 +5143,19 @@ def test_dataproto_helper_recursive_manifest_export_append_and_overwrite() -> No
     assert ref.encoded_non_tensor["samples"]["codec"] == "utf8_ragged"
     assert overwritten["non_tensor_batch"]["samples"].tolist() == ["a", "b", "c", "d"]
     assert old_manifest_key not in store.objects
+
+
+def test_session_config_expands_with_physical_keys_without_mutating_input():
+    from types import SimpleNamespace
+    from mooncake.structured_object_store import _config_for_grouped_keys
+
+    config = SimpleNamespace(group_ids=["group"], session_ids=["session"])
+    expanded = _config_for_grouped_keys(config, 3)
+    assert expanded.group_ids == ["group"] * 3
+    assert expanded.session_ids == ["session"] * 3
+    assert config.group_ids == ["group"]
+    assert config.session_ids == ["session"]
+    session_only = SimpleNamespace(session_ids=["session"])
+    assert _config_for_grouped_keys(session_only, 2).session_ids == ["session"] * 2
+    with pytest.raises(ValueError, match="session_ids"):
+        _config_for_grouped_keys(SimpleNamespace(session_ids=["a", "b"]), 2)
