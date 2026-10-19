@@ -19,12 +19,14 @@
 #include <chrono>
 #include <cstdlib>
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <map>
 #include <optional>
 #include <random>
 #include <stdexcept>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 
 #include "tent/common/config.h"
@@ -1525,6 +1527,7 @@ Status TransferEngineImpl::validateTransportHint(const Request& req,
 
 SelectionResult TransferEngineImpl::getTransportType(const Request& request,
                                                      int transport_index) {
+    transport_resolve_calls_.fetch_add(1, std::memory_order_relaxed);
     // Owning reference: keeps the snapshot alive while we read through it.
     SegmentDescRef desc;
     if (request.target_id == LOCAL_SEGMENT_ID) {
@@ -1626,6 +1629,7 @@ SelectionResult TransferEngineImpl::getTransportType(const Request& request,
 
         auto candidates = TransportSelector::reorderWithHint(raw, hint);
         if (!candidates) {
+            result.local_memory_type = local_mtype;
             return result;  // UNSPEC: hint not authorized for this req
         }
         if (transport_index >= 0 &&
@@ -1633,6 +1637,7 @@ SelectionResult TransferEngineImpl::getTransportType(const Request& request,
             result.transport = (*candidates)[transport_index];
             result.staging_params = std::move(host_staging_params);
         }
+        result.local_memory_type = local_mtype;
         return result;
     }
 
@@ -1673,6 +1678,7 @@ SelectionResult TransferEngineImpl::getTransportType(const Request& request,
 
     auto result = transport_selector_->select(ctx, transport_list_,
                                               transport_index, hint);
+    result.local_memory_type = local_mtype;
     if (result.transport != UNSPEC)
         result.staging_params = std::move(host_staging_params);
     return result;
@@ -1752,6 +1758,59 @@ MergeResult makePassThroughMergeResult(const std::vector<Request>& requests) {
 
 uint64_t requestSourceAddr(const Request& request) {
     return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(request.source));
+}
+
+// prepareSubmit reuses SelectionResult when two owners share the inputs
+// getTransportType actually reads: peer, covering local/remote MR, hint,
+// intent, priority, length, and optional policy name (CP-3).
+struct RouteCacheKey {
+    SegmentID target_id{0};
+    TransportType hint{UNSPEC};
+    IntentType intent{IntentType::INTENT_UNSPEC};
+    int priority{0};
+    size_t length{0};
+    BufferKey source{};
+    BufferKey target{};
+    std::string policy_name;
+
+    bool operator==(const RouteCacheKey&) const = default;
+};
+
+struct RouteCacheKeyHash {
+    size_t operator()(const RouteCacheKey& k) const {
+        size_t h = std::hash<uint64_t>{}(k.target_id);
+        auto mix = [&](size_t v) { h ^= v + 0x9e3779b9 + (h << 6) + (h >> 2); };
+        mix(std::hash<int>{}(static_cast<int>(k.hint)));
+        mix(std::hash<int>{}(static_cast<int>(k.intent)));
+        mix(std::hash<int>{}(k.priority));
+        mix(std::hash<size_t>{}(k.length));
+        mix(std::hash<uint64_t>{}(k.source.addr));
+        mix(std::hash<uint64_t>{}(k.source.length));
+        mix(std::hash<uint64_t>{}(k.target.addr));
+        mix(std::hash<uint64_t>{}(k.target.length));
+        mix(std::hash<std::string>{}(k.policy_name));
+        return h;
+    }
+};
+
+bool bufferCovers(const BufferKey& key, uint64_t addr, uint64_t len) {
+    if (len != 0 && addr + len < addr) return false;
+    if (key.length != 0 && key.addr + key.length < key.addr) return false;
+    return key.addr <= addr && addr + len <= key.addr + key.length;
+}
+
+RouteCacheKey makeRouteCacheKey(const Request& req, const BufferKey& source,
+                                const BufferKey& target) {
+    RouteCacheKey key;
+    key.target_id = req.target_id;
+    key.hint = req.transport_hint;
+    key.intent = req.intent_type;
+    key.priority = req.priority;
+    key.length = req.length;
+    key.source = source;
+    key.target = target;
+    key.policy_name = req.policy_name.value_or("");
+    return key;
 }
 
 }  // namespace
@@ -2156,10 +2215,90 @@ Status TransferEngineImpl::prepareSubmit(
     }
 
     prepared.owners.reserve(merged.request_list.size());
-    for (const auto& request : merged.request_list) {
+    std::vector<size_t> first_public(merged.request_list.size(),
+                                     std::numeric_limits<size_t>::max());
+    for (size_t pub = 0; pub < merged.task_lookup.size(); ++pub) {
+        const size_t owner_id = merged.task_lookup[pub];
+        if (first_public[owner_id] == std::numeric_limits<size_t>::max())
+            first_public[owner_id] = pub;
+    }
+    const bool have_boundaries = merge_boundaries.size() == request_list.size();
+
+    std::unordered_map<RouteCacheKey, SelectionResult, RouteCacheKeyHash>
+        route_cache;
+    RouteCacheKey last_key{};
+    SelectionResult last_route{};
+    bool last_valid = false;
+
+    auto lookupSourceKey = [&](const Request& req) -> std::optional<BufferKey> {
+        auto local_desc = metadata_->segmentManager().getLocal();
+        if (!local_desc) return std::nullopt;
+        return toBufferKey(
+            local_desc->findBuffer(requestSourceAddr(req), req.length));
+    };
+    auto lookupTargetKey = [&](const Request& req) -> std::optional<BufferKey> {
+        std::optional<BufferKey> key;
+        metadata_->segmentManager().withCachedSegment(
+            req.target_id, [&](SegmentDesc* desc) {
+                key = toBufferKey(
+                    desc->findBuffer(req.target_offset, req.length));
+                return Status::OK();
+            });
+        return key;
+    };
+
+    for (size_t owner_id = 0; owner_id < merged.request_list.size();
+         ++owner_id) {
         PreparedSubmit::Owner owner;
-        owner.request = request;
-        owner.route = resolveTransport(owner.request, 0);
+        owner.request = merged.request_list[owner_id];
+        const size_t pub = first_public[owner_id];
+        std::optional<BufferKey> source_key;
+        std::optional<BufferKey> target_key;
+        if (have_boundaries && pub < merge_boundaries.size()) {
+            source_key = merge_boundaries[pub].source_key;
+            target_key = merge_boundaries[pub].target_key;
+        }
+
+        const uint64_t src = requestSourceAddr(owner.request);
+        const uint64_t dst = owner.request.target_offset;
+        const uint64_t len = owner.request.length;
+        if (last_valid && last_key.target_id == owner.request.target_id &&
+            last_key.hint == owner.request.transport_hint &&
+            last_key.intent == owner.request.intent_type &&
+            last_key.priority == owner.request.priority &&
+            last_key.length == len &&
+            last_key.policy_name == owner.request.policy_name.value_or("") &&
+            bufferCovers(last_key.source, src, len) &&
+            bufferCovers(last_key.target, dst, len)) {
+            owner.route = last_route;
+        } else {
+            if (!source_key) source_key = lookupSourceKey(owner.request);
+            if (!target_key) target_key = lookupTargetKey(owner.request);
+            if (source_key && target_key) {
+                auto key =
+                    makeRouteCacheKey(owner.request, *source_key, *target_key);
+                if (auto it = route_cache.find(key); it != route_cache.end()) {
+                    owner.route = it->second;
+                } else {
+                    owner.route = resolveTransport(owner.request, 0);
+                    if (owner.route.transport != UNSPEC) {
+                        route_cache.emplace(key, owner.route);
+                    }
+                }
+                if (owner.route.transport != UNSPEC) {
+                    last_key = std::move(key);
+                    last_route = owner.route;
+                    last_valid = true;
+                } else {
+                    last_valid = false;
+                }
+            } else {
+                owner.route = resolveTransport(owner.request, 0);
+                last_valid = false;
+            }
+        }
+        owner.request.source_memory_type =
+            static_cast<int>(owner.route.local_memory_type);
         if (require_post_submit_cancellation) {
             const auto type = owner.route.transport;
             if (type == UNSPEC || type < 0 ||

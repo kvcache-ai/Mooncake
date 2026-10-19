@@ -163,6 +163,9 @@ struct SelectionResult {
     std::optional<std::string> qp_pool;
     // Filled by the engine for device staging, never by select() itself.
     std::vector<std::string> staging_params;
+    // Local memory type observed while building the selection context. Copied
+    // onto Request so RDMA submit does not call getMemoryType() again.
+    MemoryType local_memory_type = MTYPE_UNKNOWN;
 };
 
 /**
