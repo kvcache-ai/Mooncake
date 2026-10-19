@@ -630,6 +630,11 @@ TEST_F(DfsSyncClientTest, DfsOnlyBatchFailureOnlyRevokesFailedKey) {
     ExpectDfsOnlyValue(keys[0], values[0]);
     ExpectNotFound(keys[1]);
 
+    // The injector fails every write once armed (a persistent fault, which
+    // is what defeats the backend's reopen-retry above). Disarm it before
+    // the retry: the transient fault is modeled as cleared once the failed
+    // key has been revoked, otherwise the reuse Put can never succeed.
+    adapter_->FailWriteCall(-1);
     // The revoked key and its extent can be reused.
     std::vector<Slice> retry{{values[1].data(), values[1].size()}};
     ASSERT_TRUE(writer_->Put(keys[1], retry, DfsOnlyConfig()).has_value());
