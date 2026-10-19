@@ -313,13 +313,13 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
     bool use_flagcx = (proto == "flagcx");
 
 #ifdef USE_EFA
-    // When using EFA protocol, we still need topology discovery but won't
-    // auto-install RDMA
+    // Only protocol=efa is set up by hand. Every other protocol goes through
+    // the same auto-discovery as non-EFA builds, which keeps EFA NICs out of
+    // the RDMA transport, so the EFA wheel behaves like the default wheel on
+    // IB/RoCE hosts.
     bool use_efa = (proto == "efa");
-    // Disable auto_discover to prevent RDMA transport installation, we'll
-    // install EFA manually
-    engine_ = std::make_unique<TransferEngine>(false, device_filter);
-    // Manually discover topology for EFA to populate device list
+    engine_ = std::make_unique<TransferEngine>(!use_efa && !use_flagcx,
+                                               device_filter);
     if (use_efa) {
         engine_->getLocalTopology()->discover(device_filter);
         LOG(INFO) << "Topology discovery complete for EFA. Found "
@@ -372,18 +372,6 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
             return -1;
         }
         LOG(INFO) << "FlagCX transport installed successfully";
-    } else {
-        // For non-EFA protocols (e.g. TCP), manually install TCP transport
-        // since auto_discover is disabled to prevent RDMA installation
-        // (RDMA QP creation fails on EFA devices).
-        LOG(INFO)
-            << "Installing TCP transport (auto_discover disabled in EFA build)";
-        auto transport = engine_->installTransport("tcp", nullptr);
-        if (!transport) {
-            LOG(ERROR) << "Failed to install TCP transport";
-            return -1;
-        }
-        LOG(INFO) << "TCP transport installed successfully";
     }
 #elif defined(USE_CXI)
     if (use_cxi) {
@@ -1166,9 +1154,11 @@ int TransferEnginePy::batchUnregisterMemory(
 }
 
 int TransferEnginePy::registerMemory(uintptr_t buffer_addr, size_t capacity,
-                                     const std::string& location) {
+                                     const std::string& location,
+                                     bool remote_accessible) {
     char* buffer = reinterpret_cast<char*>(buffer_addr);
-    return engine_->registerLocalMemory(buffer, capacity, location);
+    return engine_->registerLocalMemory(buffer, capacity, location,
+                                        remote_accessible);
 }
 
 int TransferEnginePy::unregisterMemory(uintptr_t buffer_addr) {
@@ -1676,7 +1666,8 @@ PYBIND11_MODULE(engine, m) {
                  &TransferEnginePy::readBytesFromBuffer)
             .def("register_memory", &TransferEnginePy::registerMemory,
                  py::arg("buffer_addr"), py::arg("capacity"),
-                 py::arg("location") = kWildcardLocation)
+                 py::arg("location") = kWildcardLocation,
+                 py::arg("remote_accessible") = true)
             .def("unregister_memory", &TransferEnginePy::unregisterMemory)
             .def("batch_register_memory",
                  &TransferEnginePy::batchRegisterMemory,

@@ -216,6 +216,24 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::Init() {
 tl::expected<DistributedStorageBackend::ShardFile*, ErrorCode>
 DistributedStorageBackend::GetOrOpenShard(
     const DistributedFSDescriptor& descriptor) {
+    if (descriptor.shard_idx < 0) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    ShardFile* shard = nullptr;
+    {
+        std::lock_guard cache_lock(shard_files_mutex_);
+        auto existing = shard_files_.find(descriptor.shard_idx);
+        if (existing != shard_files_.end()) shard = existing->second.get();
+    }
+    if (shard) {
+        std::lock_guard shard_lock(shard->mutex);
+        // Only the exact path validated when this fd was opened can bypass
+        // normalization. Aliases and changed descriptors take the full
+        // validation path below. Cache entries live until backend teardown.
+        if (shard->fd >= 0 && shard->path == descriptor.file_path) return shard;
+    }
+
     const auto path =
         std::filesystem::path(descriptor.file_path).lexically_normal();
     auto root = std::filesystem::path(root_dir_).lexically_normal();
@@ -223,13 +241,11 @@ DistributedStorageBackend::GetOrOpenShard(
     auto parent = path.parent_path();
     if (parent.empty()) parent = ".";
     const auto index = ParseShardFileName(path.filename().string());
-    if (descriptor.shard_idx < 0 || !index || *index != descriptor.shard_idx ||
-        parent != root) {
+    if (!index || *index != descriptor.shard_idx || parent != root) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    ShardFile* shard;
-    {
+    if (!shard) {
         std::lock_guard cache_lock(shard_files_mutex_);
         auto existing = shard_files_.find(descriptor.shard_idx);
         if (existing == shard_files_.end()) {
@@ -253,6 +269,18 @@ DistributedStorageBackend::GetOrOpenShard(
         return shard;
     }
 
+    auto fd = ValidateAndOpenShardFile(file_path);
+    if (!fd) return tl::make_unexpected(fd.error());
+    // Failed attempts keep fd == -1 so a later request can retry
+    // initialization.
+    shard->path = std::move(file_path);
+    shard->fd = *fd;
+    return shard;
+}
+
+tl::expected<int, ErrorCode>
+DistributedStorageBackend::ValidateAndOpenShardFile(
+    const std::string& file_path) {
     // The master prepares new shards before publishing their descriptors.
     // OpenFile may create a file, so reject missing/unprepared shards first.
     auto file_size = fs_adapter_->GetFileSize(file_path);
@@ -260,6 +288,9 @@ DistributedStorageBackend::GetOrOpenShard(
     if (*file_size != distributed_config_.shard_capacity) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
+    auto root = std::filesystem::path(root_dir_).lexically_normal();
+    if (root.filename().empty()) root = root.parent_path();
+    const auto path = std::filesystem::path(file_path);
     std::error_code ec;
     const auto canonical_root = std::filesystem::canonical(root, ec);
     if (ec) return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
@@ -269,13 +300,25 @@ DistributedStorageBackend::GetOrOpenShard(
         canonical_path.filename() != path.filename()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    auto fd = fs_adapter_->OpenFile(file_path);
+    return fs_adapter_->OpenFile(file_path);
+}
+
+tl::expected<void, ErrorCode> DistributedStorageBackend::ReopenShardLocked(
+    ShardFile& shard) {
+    if (shard.path.empty()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    // Drop the stale descriptor first. The caller holds shard.mutex, which
+    // serializes all I/O on this shard, so no other thread can be reading or
+    // writing through the old fd while we close it.
+    if (shard.fd >= 0) {
+        (void)fs_adapter_->CloseFile(shard.fd);
+        shard.fd = -1;
+    }
+    auto fd = ValidateAndOpenShardFile(shard.path);
     if (!fd) return tl::make_unexpected(fd.error());
-    // Failed attempts keep fd == -1 so a later request can retry
-    // initialization.
-    shard->path = std::move(file_path);
-    shard->fd = *fd;
-    return shard;
+    shard.fd = *fd;
+    return {};
 }
 
 bool DistributedStorageBackend::UsesBucketAllocator() const {
@@ -435,6 +478,28 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::ExecuteSingleIo(
             ? fs_adapter_->WriteAt((*shard)->fd, op.iovs.data(), count, offset)
             : fs_adapter_->ReadAt((*shard)->fd, op.iovs.data(), count, offset);
     const char* op_name = write ? "write" : "read";
+    if (!result && fs_adapter_->SupportsFdReopen()) {
+        // A cached descriptor can go stale (fd invalidated, shard file
+        // rotated). Reopen once under the shard lock and retry before
+        // surfacing the failure. A short transfer below is treated as genuine
+        // corruption and not retried. The lock already serializes shard I/O, so
+        // the reopen adds no cost to the success path. Only adapters whose I/O
+        // faults are fd-recoverable (POSIX) opt in via SupportsFdReopen.
+        LOG(WARNING) << "DFS " << op_name << " failed for key " << op.key
+                     << ", error=" << result.error() << ", reopening shard "
+                     << op.descriptor.shard_idx;
+        auto reopen = ReopenShardLocked(**shard);
+        if (reopen) {
+            result = write ? fs_adapter_->WriteAt((*shard)->fd, op.iovs.data(),
+                                                  count, offset)
+                           : fs_adapter_->ReadAt((*shard)->fd, op.iovs.data(),
+                                                 count, offset);
+        } else {
+            LOG(ERROR) << "DFS shard " << op.descriptor.shard_idx
+                       << " reopen failed for key " << op.key
+                       << ", error=" << reopen.error();
+        }
+    }
     if (!result) {
         LOG(WARNING) << "DFS " << op_name << " failed for key " << op.key
                      << ", error=" << result.error();

@@ -74,7 +74,7 @@ For CUDA, VRAM segments, NVMe-oF, and other backend flags, see the
 
 :::{tab-item} Docker
 Published images are available on Docker Hub at
-[kvcacheai/mooncake](https://hub.docker.com/r/kvcacheai/mooncake).
+[kvcacheai/mooncake](https://hub.docker.com/r/kvcacheai/mooncake):
 
 ```bash
 docker run --net=host \
@@ -83,6 +83,17 @@ docker run --net=host \
     kvcacheai/mooncake:latest \
     mooncake_master
 ```
+
+The multi-architecture image publishes these CUDA flavor tags:
+
+| Tag | CUDA | Notes |
+| --- | --- | --- |
+| `latest` | 13 | Default flavor |
+| `0.3.14` | 13 | Default flavor for this version |
+| `0.3.14-cuda12` | 12 | Fixed release, recommended for production |
+| `0.3.14-cuda13` | 13 | Fixed release, recommended for production |
+| `cuda12` | 12 | Floating alias for the newest CUDA 12 image |
+| `cuda13` | 13 | Floating alias for the newest CUDA 13 image |
 
 For details, see
 [Use Mooncake in Docker Containers](build.md#use-mooncake-in-docker-containers).
