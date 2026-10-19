@@ -8,6 +8,7 @@
 #include <future>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -26,6 +27,32 @@
 using mooncake::test::MockMetadataStore;
 
 namespace mooncake::test {
+
+class ReplayDiagnosticSink : public google::LogSink {
+   public:
+    ReplayDiagnosticSink() { google::AddLogSink(this); }
+    ~ReplayDiagnosticSink() override { google::RemoveLogSink(this); }
+
+    void send(google::LogSeverity severity, const char*, const char*, int,
+              const struct ::tm*, const char* message,
+              size_t message_len) override {
+        if (severity != google::GLOG_ERROR) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        diagnostic_.append(message, message_len);
+        diagnostic_.push_back('\n');
+    }
+
+    std::string diagnostic() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return diagnostic_;
+    }
+
+   private:
+    std::mutex mutex_;
+    std::string diagnostic_;
+};
 
 // Helper function to create a valid OpLogEntry with checksum
 // Uses the production checksum algorithm (XXH32).
@@ -293,6 +320,21 @@ TEST_F(OpLogApplierTest, CancelledOperationRejectsLateProgressReplay) {
     const auto cancelled = standby.SnapshotWeightMetadata();
     EXPECT_TRUE(ValidateWeightMetadataSnapshot(cancelled));
     EXPECT_NE(metadata.residency, operation.target_residency);
+    {
+        auto conflicting = operation;
+        ++conflicting.processed_members;
+        ReplayDiagnosticSink sink;
+        EXPECT_FALSE(applier.ApplyOpLogEntry(
+            MakeEntry(4, OpType::WEIGHT_METADATA_UPSERT, key,
+                      SerializeWeightUpsert(metadata, conflicting))));
+        const auto diagnostic = sink.diagnostic();
+        EXPECT_NE(diagnostic.find("cancellation duplicate operation mismatch"),
+                  std::string::npos);
+        EXPECT_NE(diagnostic.find("key=" + key), std::string::npos);
+        EXPECT_NE(diagnostic.find("sequence_id=4"), std::string::npos);
+        EXPECT_NE(diagnostic.find("operation_id=9"), std::string::npos);
+        EXPECT_EQ(cancelled, standby.SnapshotWeightMetadata());
+    }
     EXPECT_FALSE(applier.ApplyOpLogEntry(
         MakeEntry(4, OpType::WEIGHT_METADATA_UPSERT, key, active_payload)));
     EXPECT_EQ(4u, applier.GetExpectedSequenceId());
@@ -358,9 +400,21 @@ TEST_F(OpLogApplierTest, RejectsCancellationThatChangesPendingOperation) {
         } else {
             operation.processed_members = 1;
         }
+        ReplayDiagnosticSink sink;
         EXPECT_FALSE(applier.ApplyOpLogEntry(
             MakeEntry(3, OpType::WEIGHT_METADATA_UPSERT, key,
                       SerializeWeightUpsert(metadata, operation))));
+        const auto diagnostic = sink.diagnostic();
+        EXPECT_NE(
+            diagnostic.find(changed == "operation_id"
+                                ? "cancellation prior lineage mismatch"
+                                : "cancellation changes operation fields"),
+            std::string::npos);
+        EXPECT_NE(diagnostic.find("key=" + key), std::string::npos);
+        EXPECT_NE(diagnostic.find("sequence_id=3"), std::string::npos);
+        EXPECT_NE(diagnostic.find("operation_id=" +
+                                  std::to_string(operation.operation_id)),
+                  std::string::npos);
         EXPECT_EQ(3u, applier.GetExpectedSequenceId());
         EXPECT_EQ(before, standby.SnapshotWeightMetadata());
     }
@@ -386,10 +440,19 @@ TEST_F(OpLogApplierTest, RejectsCancellationWithoutPriorOperation) {
         .cursor = {},
         .message = kWeightOperationCancelledMessage,
     };
+    ReplayDiagnosticSink sink;
     EXPECT_FALSE(applier.ApplyOpLogEntry(
         MakeEntry(1, OpType::WEIGHT_METADATA_UPSERT,
                   MakeWeightRevisionMetadataKey(metadata.identity),
                   SerializeWeightUpsert(metadata, operation))));
+    const auto diagnostic = sink.diagnostic();
+    EXPECT_NE(diagnostic.find("cancellation has no current metadata"),
+              std::string::npos);
+    EXPECT_NE(diagnostic.find("key=" +
+                              MakeWeightRevisionMetadataKey(metadata.identity)),
+              std::string::npos);
+    EXPECT_NE(diagnostic.find("sequence_id=1"), std::string::npos);
+    EXPECT_NE(diagnostic.find("operation_id=9"), std::string::npos);
     EXPECT_EQ(1u, applier.GetExpectedSequenceId());
     EXPECT_EQ(before, standby.SnapshotWeightMetadata());
 }

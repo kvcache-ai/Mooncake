@@ -14,8 +14,8 @@ namespace mooncake::test {
 
 TEST_F(MasterServiceTest, RemoveAllPreservesManagedGroupImportedDuringScan) {
     MasterService service;
-    [[maybe_unused]] const auto context = PrepareSimpleSegment(service);
-    const UUID client_id = generate_uuid();
+    const auto context = PrepareSimpleSegment(service);
+    const UUID client_id = context.client_id;
     WeightRevisionIdentity identity{
         .tenant_id = "default",
         .name_space = "production",
@@ -23,13 +23,8 @@ TEST_F(MasterServiceTest, RemoveAllPreservesManagedGroupImportedDuringScan) {
         .revision = "step-1",
         .weight_generation = 1,
     };
-    std::string manifest_key = MakeWeightManifestKey(identity);
-    while (MetadataShardIndex(service, manifest_key) == 0) {
-        identity.revision += "x";
-        manifest_key = MakeWeightManifestKey(identity);
-    }
-    std::string payload_key = "concurrent-scan-payload";
-    while (MetadataShardIndex(service, payload_key) == 0) payload_key += "x";
+    const std::string manifest_key = MakeWeightManifestKey(identity);
+    const std::string payload_key = "concurrent-scan-payload";
     const std::string ordinary_key = "concurrent-scan-ordinary";
     ReplicateConfig ordinary;
     ordinary.replica_num = 1;
@@ -40,9 +35,9 @@ TEST_F(MasterServiceTest, RemoveAllPreservesManagedGroupImportedDuringScan) {
     auto paused_future = paused.get_future();
     const auto resume_future = resume.get_future().share();
     std::atomic<bool> gate_timed_out{false};
-    MasterServiceTestPeer(service).SetRemoveAllShardHookForTesting(
-        [&](size_t shard) {
-            if (shard != 0) return;
+    MasterServiceTestPeer(service).SetRemoveAllTenantHookForTesting(
+        [&](const TenantId& tenant_id) {
+            if (!tenant_id.IsDefault()) return;
             paused.set_value();
             gate_timed_out = resume_future.wait_for(std::chrono::seconds(10)) !=
                              std::future_status::ready;
@@ -89,7 +84,7 @@ TEST_F(MasterServiceTest, RemoveAllPreservesManagedGroupImportedDuringScan) {
     }
     resume.set_value();
     const auto removed = sweep.get();
-    MasterServiceTestPeer(service).SetRemoveAllShardHookForTesting(nullptr);
+    MasterServiceTestPeer(service).SetRemoveAllTenantHookForTesting(nullptr);
     ASSERT_TRUE(reached);
     ASSERT_TRUE(published);
     ASSERT_FALSE(gate_timed_out);
@@ -267,6 +262,28 @@ TEST_F(MasterServiceTest,
     for (const auto& result : batch_remove) {
         ASSERT_FALSE(result.has_value());
         EXPECT_EQ(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS, result.error());
+    }
+
+    const std::string ordinary_key = "managed-weight-ordinary";
+    for (int mode = 0; mode < 3; ++mode) {
+        PutCompletedObject(service, client_id, ordinary_key, trigger_config,
+                           1024);
+        if (mode == 0) {
+            auto removed =
+                service.RemoveByRegex(".*", TenantId::Default(), true);
+            ASSERT_TRUE(removed.has_value());
+            EXPECT_EQ(1, *removed);
+        } else if (mode == 1) {
+            EXPECT_EQ(1, service.RemoveAll(TenantId::Default(), true));
+        } else {
+            EXPECT_EQ(1, service.RemoveAll(true));
+        }
+        EXPECT_FALSE(
+            service.ExistKey(ordinary_key, TenantId::Default()).value_or(true));
+        EXPECT_TRUE(
+            service.ExistKey(payload_key, TenantId::Default()).value_or(false));
+        EXPECT_TRUE(service.ExistKey(manifest_key, TenantId::Default())
+                        .value_or(false));
     }
 }
 

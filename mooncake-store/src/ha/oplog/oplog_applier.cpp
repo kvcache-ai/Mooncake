@@ -304,6 +304,10 @@ bool OpLogApplier::ApplyWeightMetadataUpsert(const OpLogEntry& entry) {
     if (!current.has_value()) {
         if (upsert.operation.has_value() &&
             upsert.operation->message == kWeightOperationCancelledMessage) {
+            LOG(ERROR) << "OpLogApplier: cancellation has no current metadata, "
+                       << "key=" << entry.object_key
+                       << ", sequence_id=" << entry.sequence_id
+                       << ", operation_id=" << upsert.operation->operation_id;
             return false;
         }
         if (next.metadata_generation != 1) {
@@ -318,8 +322,17 @@ bool OpLogApplier::ApplyWeightMetadataUpsert(const OpLogEntry& entry) {
     if (*current == next) {
         if (upsert.operation.has_value() &&
             upsert.operation->message == kWeightOperationCancelledMessage) {
-            return metadata_store_->GetWeightOperation(
-                       upsert.operation->operation_id) == upsert.operation;
+            if (metadata_store_->GetWeightOperation(
+                    upsert.operation->operation_id) != upsert.operation) {
+                LOG(ERROR) << "OpLogApplier: cancellation duplicate operation "
+                              "mismatch, "
+                           << "key=" << entry.object_key
+                           << ", sequence_id=" << entry.sequence_id
+                           << ", operation_id="
+                           << upsert.operation->operation_id;
+                return false;
+            }
+            return true;
         }
         return !upsert.operation.has_value() ||
                metadata_store_->GetWeightOperation(
@@ -337,6 +350,10 @@ bool OpLogApplier::ApplyWeightMetadataUpsert(const OpLogEntry& entry) {
                 previous->fenced_metadata_generation ||
             IsWeightOperationTerminal(previous->message) ||
             upsert.operation->updated_at_ms < previous->updated_at_ms) {
+            LOG(ERROR) << "OpLogApplier: cancellation prior lineage mismatch, "
+                       << "key=" << entry.object_key
+                       << ", sequence_id=" << entry.sequence_id
+                       << ", operation_id=" << upsert.operation->operation_id;
             return false;
         }
         // Cancellation changes only the terminal message and update time.
@@ -345,6 +362,11 @@ bool OpLogApplier::ApplyWeightMetadataUpsert(const OpLogEntry& entry) {
         unchanged.message = previous->message;
         unchanged.updated_at_ms = previous->updated_at_ms;
         if (unchanged != *previous) {
+            LOG(ERROR)
+                << "OpLogApplier: cancellation changes operation fields, "
+                << "key=" << entry.object_key
+                << ", sequence_id=" << entry.sequence_id
+                << ", operation_id=" << upsert.operation->operation_id;
             return false;
         }
     }

@@ -4022,6 +4022,7 @@ TEST_F(MasterServiceHATest, WeightDurabilityWaitDoesNotBlockTaskCleanup) {
                       .set_cluster_id("weight_cleanup_isolation")
                       .set_weight_import_idle_timeout_ms(1)
                       .set_pending_task_timeout_sec(1)
+                      .set_max_retry_attempts(0)
                       .build();
     MasterService service(config);
     ASSERT_EQ(
@@ -4046,23 +4047,19 @@ TEST_F(MasterServiceHATest, WeightDurabilityWaitDoesNotBlockTaskCleanup) {
     } release{*backend};
     // Let the real background worker enter the abandoned-import durable wait.
     ASSERT_TRUE(backend->WaitForBlockedTxn(std::chrono::seconds(35)));
-    const auto task_id = generate_uuid();
-    const auto expired =
-        std::chrono::system_clock::now() - std::chrono::seconds(5);
+    UUID task_id;
     {
         auto tasks =
             MasterServiceTestPeer::TaskManager(service).get_write_access();
-        tasks.restore_task(Task{
-            .id = task_id,
-            .type = TaskType::REPLICA_COPY,
-            .status = TaskStatus::PENDING,
-            .payload = "{}",
-            .created_at = expired,
-            .last_updated_at = expired,
-            .assigned_client = generate_uuid(),
-            .max_retry_attempts = 0,
-        });
+        auto submitted = tasks.submit_task_typed<TaskType::REPLICA_COPY>(
+            generate_uuid(), ReplicaCopyPayload{});
+        ASSERT_TRUE(submitted.has_value());
+        task_id = *submitted;
     }
+    const auto pending = service.QueryTask(task_id);
+    ASSERT_TRUE(pending.has_value());
+    ASSERT_EQ(TaskStatus::PENDING, pending->status);
+    // Let the real pending timeout expire while weight reconciliation blocks.
     bool cleaned = false;
     const auto deadline =
         std::chrono::steady_clock::now() + std::chrono::seconds(35);

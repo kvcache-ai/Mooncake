@@ -1529,13 +1529,12 @@ class MasterService {
         bool skipped_object{false};
     };
     // Removes each of the tenant's objects whose key `matches_key` accepts
-    // (every key, if unset) and that CheckRemovable lets go. `on_remove`, if
-    // set, sees each one just before it goes.
+    // (every key, if unset), excluding managed weights and objects that
+    // CheckRemovable refuses.
     RemoveResult RemoveTenantObjects(
         const TenantId& tenant_id, bool force,
         std::chrono::system_clock::time_point now,
-        const std::function<bool(const std::string& key)>& matches_key,
-        const std::function<void(const ObjectMetadata&)>& on_remove);
+        const std::function<bool(const std::string& key)>& matches_key);
     static void ApplySoftPinMetricDelta(int metric_delta);
     void ApplySoftPinEvaluation(
         const ObjectMetadata& metadata,
@@ -1824,20 +1823,24 @@ class MasterService {
         }
 
         // Holds the key only while it holds an object.
-        MetadataAccessorRW(MasterService* service, ObjectIdentity object_id)
+        MetadataAccessorRW(MasterService* service, ObjectIdentity object_id,
+                           bool cleanup_invalid = true)
             : MetadataAccessorRW(service, std::move(object_id), AsIs{}) {
             // Invalid memory replicas go first, which may tear the object down.
-            if (IsPublished()) {
+            if (cleanup_invalid && IsPublished()) {
                 service_->CleanupInvalidMemoryReplicas(*this);
             }
         }
 
-        struct CreateKey {};
+        struct CreateKey {
+            bool cleanup_invalid = true;
+        };
         // Holds the key whether or not it holds an object, creating the
         // tenant if needed, so the caller can publish one under it.
         MetadataAccessorRW(MasterService* service, ObjectIdentity object_id,
-                           CreateKey)
-            : MetadataAccessorRW(service, std::move(object_id)) {
+                           CreateKey options)
+            : MetadataAccessorRW(service, std::move(object_id),
+                                 options.cleanup_invalid) {
             EnsureTenantState();
         }
 

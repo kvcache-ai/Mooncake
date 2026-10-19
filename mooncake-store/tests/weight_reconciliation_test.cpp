@@ -70,6 +70,27 @@ class WeightReconciliationTest : public MasterServiceTest {
         return *ready;
     }
 
+    void AssertStaleGroupMember(MasterService& service, const std::string& key,
+                                const std::string& group_id) {
+        const auto tenant = TenantId::Default();
+        MasterServiceTestPeer::MetadataShardAccessorRO shard(
+            &service,
+            MasterServiceTestPeer(service).getShardIndex(tenant, key));
+        const auto tenant_it = shard->tenants.find(tenant);
+        ASSERT_NE(tenant_it, shard->tenants.end());
+        const auto member = tenant_it->second.metadata.find(key);
+        ASSERT_NE(member, tenant_it->second.metadata.end());
+        const auto& metadata = member->second.metadata;
+        ASSERT_EQ(group_id, metadata.group_id);
+        ASSERT_TRUE(metadata.HasReplica([](const Replica& replica) {
+            return replica.is_memory_replica();
+        }));
+        ASSERT_TRUE(metadata.AllReplicas([](const Replica& replica) {
+            return replica.is_memory_replica() &&
+                   replica.has_invalid_mem_handle();
+        }));
+    }
+
     void CheckContinuousLeaseTraffic(size_t limit) {
         MasterService service;
         const auto context = PrepareSimpleSegment(service);
@@ -198,7 +219,7 @@ TEST_F(WeightReconciliationTest, AcceptedPutEndRefreshesImportInactivity) {
 }
 
 TEST_F(WeightReconciliationTest,
-       UpsertWithInheritedGroupRefreshesImportInactivity) {
+       UpsertWithExplicitGroupRefreshesImportInactivity) {
     MasterService service;
     const auto context = PrepareSimpleSegment(service);
     const auto importing = service.BeginWeightImport({
@@ -219,7 +240,6 @@ TEST_F(WeightReconciliationTest,
             std::chrono::system_clock::now().time_since_epoch())
             .count());
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
-    config.group_ids.reset();
     ASSERT_TRUE(service.UpsertStart(context.client_id, "active-upsert-payload",
                                     TenantId::Default(), 1024, config));
     MasterServiceTestPeer(service).RunWeightReconciliationForTesting(
@@ -229,6 +249,204 @@ TEST_F(WeightReconciliationTest,
     ASSERT_TRUE(observed);
     EXPECT_EQ(WeightAvailabilityState::IMPORTING,
               observed->metadata.availability);
+}
+
+TEST_F(WeightReconciliationTest, UpsertWithInheritedManagedGroupRejectsReady) {
+    for (const bool manifest : {false, true}) {
+        for (const bool resize : {false, true}) {
+            SCOPED_TRACE(::testing::Message()
+                         << "manifest=" << manifest << ", resize=" << resize);
+            MasterService service;
+            const auto context = PrepareSimpleSegment(service);
+            const auto ready =
+                PublishReady(service, context.client_id, "upsert-ready");
+            const auto key =
+                manifest ? ManifestKey(ready.identity) : "upsert-ready-payload";
+            ReplicateConfig config;
+            config.replica_num = 1;
+            config.data_type =
+                manifest ? ObjectDataType::METADATA : ObjectDataType::WEIGHT;
+            const size_t length = manifest ? 128 : 1024;
+            const auto result =
+                service.UpsertStart(context.client_id, key, TenantId::Default(),
+                                    resize ? length * 2 : length, config);
+            EXPECT_FALSE(result);
+            if (!result) {
+                EXPECT_EQ(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS,
+                          result.error());
+            }
+            EXPECT_TRUE(service.GetReplicaList(key, TenantId::Default()));
+            const auto observed =
+                service.GetWeightRevision({.identity = ready.identity});
+            ASSERT_TRUE(observed);
+            EXPECT_EQ(WeightAvailabilityState::READY,
+                      observed->metadata.availability);
+        }
+    }
+}
+
+TEST_F(WeightReconciliationTest,
+       UpsertWithInheritedManagedGroupRejectsDeleting) {
+    MasterService service;
+    const auto context = PrepareSimpleSegment(service);
+    const auto importing = service.BeginWeightImport({
+        .identity = Identity("upsert-deleting"),
+        .expected_payload_count = 1,
+        .expected_logical_bytes = 1024,
+    });
+    ASSERT_TRUE(importing);
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.data_type = ObjectDataType::WEIGHT;
+    config.group_ids =
+        std::vector<std::string>{importing->manifest.payload_group_id};
+    PutCompletedObject(service, context.client_id, "upsert-deleting-payload",
+                       config, 1024);
+    const auto deleting = service.AbortWeightImport({
+        .identity = importing->identity,
+        .expected_metadata_generation = importing->metadata_generation,
+    });
+    ASSERT_TRUE(deleting);
+    ASSERT_EQ(WeightAvailabilityState::DELETING, deleting->availability);
+    ASSERT_TRUE(
+        service.GetReplicaList("upsert-deleting-payload", TenantId::Default()));
+    config.group_ids.reset();
+    const auto result =
+        service.UpsertStart(context.client_id, "upsert-deleting-payload",
+                            TenantId::Default(), 1024, config);
+    ASSERT_FALSE(result);
+    EXPECT_EQ(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS, result.error());
+}
+
+TEST_F(WeightReconciliationTest,
+       UpsertWithInheritedManagedGroupRejectsStaleReplicas) {
+    MasterService service;
+    const auto context = PrepareSimpleSegment(service);
+    const auto ready = PublishReady(service, context.client_id, "upsert-stale");
+    PauseReplicaCleanup(service);
+    ASSERT_TRUE(service.UnmountSegment(context.segment_id, context.client_id));
+    const auto replacement = PrepareSimpleSegment(service, "replacement");
+    ASSERT_NO_FATAL_FAILURE(AssertStaleGroupMember(
+        service, "upsert-stale-payload", ready.manifest.payload_group_id));
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.data_type = ObjectDataType::WEIGHT;
+    const auto result =
+        service.UpsertStart(replacement.client_id, "upsert-stale-payload",
+                            TenantId::Default(), 1024, config);
+    ASSERT_FALSE(result);
+    EXPECT_EQ(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS, result.error());
+    const auto members =
+        GetGroupMemberKeysForTest(service, ready.manifest.payload_group_id);
+    EXPECT_EQ(2, members.size());
+    EXPECT_NE(members.end(), std::find(members.begin(), members.end(),
+                                       "upsert-stale-payload"));
+}
+
+TEST_F(WeightReconciliationTest,
+       UpsertWithInheritedManagedGroupRejectsImporting) {
+    MasterService service;
+    const auto context = PrepareSimpleSegment(service);
+    const auto importing = service.BeginWeightImport({
+        .identity = Identity("upsert-importing"),
+        .expected_payload_count = 1,
+        .expected_logical_bytes = 1024,
+    });
+    ASSERT_TRUE(importing);
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.data_type = ObjectDataType::WEIGHT;
+    config.group_ids =
+        std::vector<std::string>{importing->manifest.payload_group_id};
+    PutCompletedObject(service, context.client_id, "upsert-importing-payload",
+                       config, 1024);
+    config.group_ids.reset();
+    const auto result =
+        service.UpsertStart(context.client_id, "upsert-importing-payload",
+                            TenantId::Default(), 1024, config);
+    ASSERT_FALSE(result);
+    EXPECT_EQ(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS, result.error());
+    config.group_ids =
+        std::vector<std::string>{importing->manifest.payload_group_id};
+    ASSERT_TRUE(service.UpsertStart(context.client_id,
+                                    "upsert-importing-payload",
+                                    TenantId::Default(), 1024, config));
+    EXPECT_TRUE(service.UpsertEnd(context.client_id, "upsert-importing-payload",
+                                  TenantId::Default(), ReplicaType::ALL));
+}
+
+TEST_F(WeightReconciliationTest,
+       UpsertWithDifferentManagedGroupRejectsLiveAndStaleMembers) {
+    for (const bool manifest : {false, true}) {
+        SCOPED_TRACE(::testing::Message() << "manifest=" << manifest);
+        MasterService service;
+        const auto context = PrepareSimpleSegment(service);
+        const auto ready =
+            PublishReady(service, context.client_id, "upsert-original");
+        const auto importing = service.BeginWeightImport({
+            .identity = Identity("upsert-other"),
+            .expected_payload_count = 1,
+            .expected_logical_bytes = 1024,
+        });
+        ASSERT_TRUE(importing);
+        const auto key =
+            manifest ? ManifestKey(ready.identity) : "upsert-original-payload";
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.data_type =
+            manifest ? ObjectDataType::METADATA : ObjectDataType::WEIGHT;
+        config.group_ids =
+            std::vector<std::string>{importing->manifest.payload_group_id};
+        const size_t length = manifest ? 128 : 1024;
+        const auto live = service.UpsertStart(
+            context.client_id, key, TenantId::Default(), length, config);
+        ASSERT_FALSE(live);
+        ASSERT_EQ(ErrorCode::INVALID_PARAMS, live.error());
+
+        PauseReplicaCleanup(service);
+        ASSERT_TRUE(
+            service.UnmountSegment(context.segment_id, context.client_id));
+        const auto replacement = PrepareSimpleSegment(service, "replacement");
+        ASSERT_NO_FATAL_FAILURE(AssertStaleGroupMember(
+            service, key, ready.manifest.payload_group_id));
+        const auto stale = service.UpsertStart(
+            replacement.client_id, key, TenantId::Default(), length, config);
+        EXPECT_FALSE(stale);
+        if (!stale) {
+            EXPECT_EQ(ErrorCode::INVALID_PARAMS, stale.error());
+        }
+        const auto original_members =
+            GetGroupMemberKeysForTest(service, ready.manifest.payload_group_id);
+        EXPECT_EQ(2, original_members.size());
+        EXPECT_NE(
+            original_members.end(),
+            std::find(original_members.begin(), original_members.end(), key));
+        const auto other_members = GetGroupMemberKeysForTest(
+            service, importing->manifest.payload_group_id);
+        EXPECT_TRUE(other_members.empty());
+    }
+}
+
+TEST_F(WeightReconciliationTest,
+       UpsertWithInheritedUnmanagedGroupStillSucceeds) {
+    for (const size_t length : {1024, 2048}) {
+        MasterService service;
+        const auto context = PrepareSimpleSegment(service);
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.group_ids = std::vector<std::string>{"ordinary-group"};
+        PutCompletedObject(service, context.client_id, "ordinary-payload",
+                           config, 1024);
+        config.group_ids.reset();
+        ASSERT_TRUE(service.UpsertStart(context.client_id, "ordinary-payload",
+                                        TenantId::Default(), length, config));
+        ASSERT_TRUE(service.UpsertEnd(context.client_id, "ordinary-payload",
+                                      TenantId::Default(), ReplicaType::ALL));
+        EXPECT_TRUE(
+            service.GetReplicaList("ordinary-payload", TenantId::Default()));
+        EXPECT_EQ(std::vector<std::string>{"ordinary-payload"},
+                  GetGroupMemberKeysForTest(service, "ordinary-group"));
+    }
 }
 
 TEST_F(WeightReconciliationTest,
