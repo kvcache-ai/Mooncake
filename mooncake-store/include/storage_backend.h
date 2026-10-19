@@ -1076,6 +1076,8 @@ class BucketStorageBackend : public StorageBackendInterface {
 
     std::atomic<bool> initialized_{false};
     std::optional<BucketIdGenerator> bucket_id_generator_;
+    // Held for process lifetime after Init(); enforces one client / path.
+    int owner_lock_fd_{-1};
     static constexpr const char* BUCKET_DATA_FILE_SUFFIX = ".bucket";
     static constexpr const char* BUCKET_METADATA_FILE_SUFFIX = ".meta";
 

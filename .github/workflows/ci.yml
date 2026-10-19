@@ -19,9 +19,17 @@ on:
 permissions:
   contents: read
 
+# A branch push lets the running build finish: a full run outlasts the gap
+# between merges, so cancelling on every push left main with no completed
+# result. Newer pushes still replace the one pending run.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name != 'push' }}
+
+env:
+  # Only push/schedule builds write: PR-scoped entries are invisible to
+  # other PRs and would evict the main entries every PR reads.
+  SCCACHE_GHA_RW_MODE: ${{ (github.event_name == 'push' || github.event_name == 'schedule') && 'READ_WRITE' || 'READ_ONLY' }}
 
 jobs:
   # Build the artifact tested below through the exact release wheel path. The
@@ -87,6 +95,13 @@ jobs:
         bash scripts/test_installation.sh
       shell: bash
 
+    - name: Run in-process master e2e tests (no mooncake_master)
+      run: |
+        source test_env/bin/activate
+        bash scripts/run_standalone_store_e2e.sh
+        deactivate
+      shell: bash
+
     - name: Run tensor snapshot regressions
       env:
         MASTER_SERVER: "127.0.0.1:50061"
@@ -116,12 +131,15 @@ jobs:
         python mooncake-wheel/tests/test_cuda_fabric_compat.py -v
       shell: bash
 
-    - name: Run all PG CPU tests with latest PyTorch
+    - name: Run all PG CPU tests with supported PyTorch
       if: matrix.ubuntu-version == 'ubuntu-22.04' && matrix.python-version == '3.12'
       env:
         MC_FORCE_TCP: "true"
+        # The runner has CUDA headers/nvcc but no usable GPU for arch detection.
+        TORCH_CUDA_ARCH_LIST: "8.0"
       run: |
         source test_env/bin/activate
+        python -m pip install torch==2.14.0
         export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}:/usr/local/lib
         python -m unittest discover -s mooncake-pg/tests -k CPU -v
       shell: bash
@@ -207,6 +225,7 @@ jobs:
           -DUSE_UB=ON \
           -DUSE_ETCD=ON \
           -DUSE_CUDA=ON \
+          -DUSE_MNNVL=ON \
           -DWITH_P2P_STORE=ON \
           -DWITH_CONDUCTOR=ON \
           -DSTORE_USE_ETCD=ON \
@@ -242,6 +261,7 @@ jobs:
       uses: ./.github/actions/run-ctest
       with:
         junit-report: build/test-results/ctest.xml
+        label-exclude: '^nvlink_gpu$'
 
     - name: Preserve CTest diagnostics
       if: ${{ always() && steps.ctest.outcome == 'failure' }}
@@ -373,7 +393,7 @@ jobs:
     - name: Run focused release gate tests
       run: |
         python -m pip install --disable-pip-version-check \
-          packaging pytest==8.3.5
+          packaging pytest==8.3.5 pyyaml
         python -m pytest -q mooncake-wheel/tests/test_testpypi_wheel_gate.py
       shell: bash
 
@@ -391,7 +411,7 @@ jobs:
     - name: Run focused shell regression tests
       run: |
         bash scripts/tone_tests/tests/test_common_cleanup.sh
-        python3 scripts/tone_tests/tests/test_hicache_model_selection.py
+        python3 -m unittest discover -s scripts/tone_tests/tests -p 'test_*.py'
       shell: bash
 
   clang-format:
@@ -423,6 +443,9 @@ jobs:
         if [ "${{ github.event_name }}" == "pull_request" ]; then
           # For PRs: compare against the target branch
           BASE_REF="origin/${{ github.base_ref }}"
+        elif [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+          # Manual runs have no previous push SHA.
+          BASE_REF="origin/${{ github.event.repository.default_branch }}"
         else
           # For push events: use github.event.before to handle multi-commit pushes
           BEFORE_SHA="${{ github.event.before }}"
@@ -480,7 +503,8 @@ jobs:
         fi
 
         ruff check "${python_files[@]}"
-        ruff format --check "${python_files[@]}"
+        python scripts/ci/check_changed_python_format.py \
+          "$base_ref" "${python_files[@]}"
       shell: bash
 
 
@@ -567,6 +591,19 @@ jobs:
       artifact-prefix: mooncake-wheel-cu130
       version-override: 0.0.0.dev0
 
+  # arm64 default wheels use a different transport set (USE_MNNVL) than
+  # x86_64 (USE_INTRA_NVLINK), so build one here instead of only at release.
+  build-wheel-cu13-arm64:
+    needs: [spell-check, clang-format, check-paths]
+    if: *run-ci-for-source-changes
+    uses: ./.github/workflows/_build-wheel.yaml
+    with:
+      variant: cuda13
+      architecture: arm64
+      python-versions: '["3.12"]'
+      artifact-prefix: mooncake-wheel-cu130-arm64
+      version-override: 0.0.0.dev0
+
   build-wheel-efa:
     needs: [spell-check, clang-format, check-paths]
     if: *run-ci-for-source-changes
@@ -603,6 +640,15 @@ jobs:
           # Debug build also catches ODR/link errors hidden by optimization.
           - name: ub-mock
             cmake_flags: '-DUSE_CUDA=OFF -DUSE_UB=ON -DCMAKE_BUILD_TYPE=Debug'
+            need_cuda: false
+            metrics_flags: ''
+          # Compile against stub ACL headers and embed host-only ACL stubs in
+          # transfer_engine for Rust checks; no CANN, NPU, or libmf_smem is required.
+          - name: memfabric-mock
+            cmake_flags: >-
+              -DUSE_CUDA=OFF -DUSE_MEMFABRIC=ON
+              -DWITH_STORE=OFF -DWITH_STORE_RUST=OFF
+              -DCMAKE_BUILD_TYPE=Debug
             need_cuda: false
             metrics_flags: ''
     name: tent-ci (${{ matrix.name }})
@@ -656,8 +702,12 @@ jobs:
           export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
         fi
         cd build-tent
-        cmake --build .
-        sudo cmake --install .
+        if [ "${{ matrix.name }}" = "memfabric-mock" ]; then
+          cmake --build . --target tent_memfabric_transport_test transfer_engine
+        else
+          cmake --build .
+          sudo cmake --install .
+        fi
       shell: bash
 
     # Check the Transfer Engine Rust crate against the freshly built C++
@@ -682,11 +732,18 @@ jobs:
         cargo clean
       shell: bash
 
-    - name: Test Store completion with TENT
+    - name: Test Store completion and engine reuse with TENT
       if: matrix.name == 'cuda-off'
       run: |
         ctest --test-dir build-tent --output-on-failure --no-tests=error \
-          -R '^transfer_task_tent_completion_test$'
+          -R '^(transfer_task_tent_completion_test|standalone_client_tent_test)$'
+      shell: bash
+
+    - name: Test TENT notification handle ownership
+      if: matrix.name == 'cuda-off'
+      run: |
+        ctest --test-dir build-tent --output-on-failure --no-tests=error \
+          -R '^tent_compat_notify_test$'
       shell: bash
 
     # Only run tests on the cuda-off leg. GitHub runners have no real GPU;
@@ -698,11 +755,17 @@ jobs:
       id: ctest
       if: '!matrix.need_cuda'
       run: |
+        ctest_args=()
+        if [ "${{ matrix.name }}" = "memfabric-mock" ]; then
+          # Only the MemFabric test executable is built in this test directory.
+          ctest_args=(-R '^tent_memfabric_transport_test$' --no-tests=error --timeout 120)
+        fi
         cd build-tent
         mkdir -p test-results
         ctest --test-dir mooncake-transfer-engine/tent/tests -j \
           --output-on-failure \
-          --output-junit "$GITHUB_WORKSPACE/build-tent/test-results/ctest.xml"
+          --output-junit "$GITHUB_WORKSPACE/build-tent/test-results/ctest.xml" \
+          "${ctest_args[@]}"
       shell: bash
 
     - name: Preserve TENT CTest diagnostics
@@ -739,7 +802,10 @@ jobs:
 
   ci-gate:
     name: CI Gate
-    if: always()
+    # A cancelled branch push run reports no result rather than a failed gate.
+    # Everywhere else the gate must fail: a skipped gate would satisfy the
+    # required check for a PR head whose run was cancelled.
+    if: ${{ (github.event_name != 'push' && always()) || !cancelled() }}
     needs:
       - check-paths
       - spell-check
@@ -754,6 +820,7 @@ jobs:
       - build-flags
       - test-wheel-ubuntu
       - build-wheel-cu13
+      - build-wheel-cu13-arm64
       - build-wheel-efa
       - build-wheel-rocm
       - tent-ci
@@ -785,6 +852,7 @@ jobs:
             ${{ needs.build-flags.result }}
             ${{ needs.test-wheel-ubuntu.result }}
             ${{ needs.build-wheel-cu13.result }}
+            ${{ needs.build-wheel-cu13-arm64.result }}
             ${{ needs.build-wheel-efa.result }}
             ${{ needs.build-wheel-rocm.result }}
         run: |

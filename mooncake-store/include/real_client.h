@@ -8,6 +8,8 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <string>
 #include <thread>
@@ -34,6 +36,8 @@
 namespace mooncake {
 
 class RealClient;
+class NvlinkHostNumaAllocation;
+struct EgmStorePoolConfig;
 class RegisteredPinnedRegion;
 class UdsAcceptor;
 class UdsConnection;
@@ -130,12 +134,11 @@ class RealClient : public PyClient {
     /**
      * @brief Get object data directly into a pre-allocated buffer
      * @param key Key of the object to get
-     * @param buffer Pointer to a writable Store buffer, either explicitly
-     * registered with register_buffer() or inside the setup-time local buffer
+     * @param buffer Pointer to a writable Store buffer
      * @param size Size of the buffer
      * @return Number of bytes read on success, negative value on error
-     * @note The buffer address must resolve to Store-managed registered memory
-     * for zero-copy operations
+     * @note Direct RDMA reads require register_buffer() or the setup-time local
+     * buffer. NVLink can read directly into an ordinary device allocation.
      */
     int64_t get_into(const std::string &key, void *buffer, size_t size);
 
@@ -376,6 +379,24 @@ class RealClient : public PyClient {
     std::vector<int> batchIsExist(const std::vector<std::string> &keys);
 
     /**
+     * @brief Point-in-time existence check that grants no read lease
+     * @param key Key to check
+     * @return 1 if exists, 0 if not exists, -1 if error. The object may
+     * still be evicted before a subsequent get.
+     */
+    int probeKey(const std::string &key);
+
+    /**
+     * @brief Probe multiple objects, optionally leasing the last complete
+     * candidate.
+     * @param keys Vector of keys to check
+     * @return Per-key existence results. LastHitOnly leases the last all-1
+     * candidate. Negative values indicate errors.
+     */
+    std::vector<int> batchProbeKey(const std::vector<std::string> &keys,
+                                   const GrantLeasePolicy &policy = {});
+
+    /**
      * @brief Get the size of an object
      * @param key Key of the object
      * @return Size of the object in bytes, or -1 if error or object doesn't
@@ -612,7 +633,8 @@ class RealClient : public PyClient {
         const std::string &ssd_offload_path = "",
         const std::string &tenant_id = "default",
         bool enable_client_http_server = false,
-        int client_http_port = DEFAULT_CLIENT_HTTP_PORT);
+        int client_http_port = DEFAULT_CLIENT_HTTP_PORT,
+        bool enable_embedded_master = false);
 
     // Overload that accepts a configuration dictionary
     tl::expected<void, ErrorCode> setup_internal(const ConfigDict &config);
@@ -777,17 +799,44 @@ class RealClient : public PyClient {
     std::vector<tl::expected<bool, ErrorCode>> batchIsExist_internal(
         const std::vector<std::string> &keys);
 
+    tl::expected<bool, ErrorCode> probeKey_internal(const std::string &key);
+
+    std::vector<tl::expected<bool, ErrorCode>> batchProbeKey_internal(
+        const std::vector<std::string> &keys, const GrantLeasePolicy &policy);
+
     tl::expected<int64_t, ErrorCode> getSize_internal(const std::string &key);
+
+    // Whether a failed LOCAL_DISK read was healed: the owner proved the
+    // backing file gone and the replica was evicted (kEvicted), the file is
+    // actually present so the failure was transient (kPresent), or nothing
+    // could be determined (kUnknown).
+    enum class DiskReadHealResult { kEvicted, kPresent, kUnknown };
+
+    // Read-side counterpart of the Put-path heal: ask the (possibly remote)
+    // replica owner over the offload RPC to verify the backing file; the
+    // owner evicts its own replica when the file is proven gone (the master
+    // scopes LOCAL_DISK eviction to the owning client). A present or
+    // undetermined answer never evicts. resolved_tenant_id is the tenant scope
+    // the master resolved for the query that produced this replica, forwarded
+    // to the owner so it probes and evicts under the exact write scope.
+    DiskReadHealResult heal_disk_replica_for_read(
+        const std::string &key, const Replica::Descriptor &local_disk_replica,
+        const std::optional<std::string> &resolved_tenant_id = std::nullopt);
 
     std::shared_ptr<BufferHandle> get_buffer_internal(
         const std::string &key,
         const std::shared_ptr<ClientBufferAllocator> &client_buffer_allocator =
-            nullptr);
+            nullptr,
+        bool heal_dangling_disk_replica = true);
 
     std::vector<std::shared_ptr<BufferHandle>> batch_get_buffer_internal(
         const std::vector<std::string> &keys,
         const std::shared_ptr<ClientBufferAllocator> &client_buffer_allocator =
-            nullptr);
+            nullptr,
+        // The dangling-replica heal retry calls back into this function;
+        // it passes false here so a replica whose file exists but keeps
+        // failing to read surfaces its error instead of recursing forever.
+        bool heal_dangling_disk_replica = true);
 
     std::map<std::string, std::vector<Replica::Descriptor>>
     batch_get_replica_desc(const std::vector<std::string> &keys);
@@ -815,6 +864,22 @@ class RealClient : public PyClient {
     bool release_offload_buffer(uint64_t batch_id);
 
     /**
+     * @brief Verifies each key's backing offload file on this (the replica
+     * owner's) disk and evicts this client's own replica when the file is
+     * proven gone. Called by a reader over the offload RPC when a read failed
+     * against one of this client's LOCAL_DISK replicas; the eviction has to
+     * happen here because the master scopes replica eviction to the owning
+     * client.
+     * @param request The reader's tenant (the write path scopes offload
+     * files by the object's recorded tenant, which the reader necessarily
+     * shares) and the object keys to verify
+     * @return Per-key tri-state in request order (present, evicted,
+     * undetermined)
+     */
+    async_simple::coro::Lazy<tl::expected<VerifyDiskReplicaResponse, ErrorCode>>
+    verify_disk_replica(const VerifyDiskReplicaRequest &request);
+
+    /**
      * @brief Retrieves multiple stored objects from a remote service.
      * @param target_rpc_service_addr Address of the remote RPC service (e.g.,
      "ip:port").
@@ -829,6 +894,22 @@ class RealClient : public PyClient {
         const std::string &target_rpc_service_addr,
         std::unordered_map<std::string, std::vector<Slice>> &objects,
         const OffloadReadRange *read_range = nullptr);
+
+    // Owner restore for LOCAL_DISK: RPC batch_get_offload_object or
+    // BatchGetLocal. Callers copy out of the restored arena (sequential
+    // BatchGetOffloadObject or session BatchTransferReadOffloadRanges) while
+    // the returned lease is alive; the destructor releases the owner buffer.
+    // allow_pinned: sequential memcpy may restore into the unregistered pinned
+    // arena. Session scatter is TE-only, so it must pass false and land in the
+    // owner's registered client buffer.
+    class OffloadRestoreLease;
+    tl::expected<std::unique_ptr<OffloadRestoreLease>, ErrorCode>
+    restore_offload_objects(
+        const std::string &target_rpc_service_addr,
+        const std::vector<std::string> &keys,
+        const std::vector<int64_t> &restore_sizes,
+        const std::unordered_map<std::string, std::vector<Slice>> &objects,
+        bool allow_pinned = true);
 
     bool can_use_pinned_restore_arena(
         const std::string &target_rpc_service_addr,
@@ -961,11 +1042,26 @@ class RealClient : public PyClient {
     };
 #endif
 
+#ifdef USE_MEMFABRIC
+    struct MemFabricSegmentDeleter {
+        std::string protocol = "ascend";
+        void operator()(void *ptr) {
+            if (ptr) {
+                free_memory(protocol.c_str(), ptr);
+            }
+        }
+    };
+#endif
+
     std::vector<std::unique_ptr<void, HugepageSegmentDeleter>>
         hugepage_segment_ptrs_;
     std::vector<std::unique_ptr<void, SegmentDeleter>> segment_ptrs_;
     std::vector<std::unique_ptr<void, AscendSegmentDeleter>>
         ascend_segment_ptrs_;
+#ifdef USE_MEMFABRIC
+    std::vector<std::unique_ptr<void, MemFabricSegmentDeleter>>
+        memfabric_segment_ptrs_;
+#endif
     std::vector<std::unique_ptr<void, UbSegmentDeleter>> ub_segment_ptrs_;
 #ifdef USE_VRAM_SEGMENT
     std::vector<std::unique_ptr<void, VRAMSegmentDeleter>> vram_segment_ptrs_;
@@ -1030,7 +1126,10 @@ class RealClient : public PyClient {
     // KV transfer sessions (process-local; not shared with DummyClient).
     // get_sessions_ stores a FilterQueryResult'd QueryResult (single complete
     // supported replica + lease); ranges only compare lease locally (no
-    // Master).
+    // Master). MEMORY uses BatchTransferReadRanges; DFS reads through
+    // request-scoped staging; LOCAL_DISK restores on the owner then
+    // BatchTransferReadOffloadRanges; DISK BatchGets into a temp buffer then
+    // scatters by src_offset.
     // Put sessions track writable + inflight so end/revoke can seal the
     // session and wait for outstanding range writes before finalize/free.
     struct PutSessionEntry {
@@ -1044,6 +1143,9 @@ class RealClient : public PyClient {
     std::condition_variable session_cv_;
     std::unordered_map<std::string, QueryResult> get_sessions_;
     std::unordered_map<std::string, PutSessionEntry> put_sessions_;
+
+    void wait_session_put_idle(std::unique_lock<std::mutex> &lock,
+                               const std::vector<std::string> &keys);
 
     // Dummy VA -> real VA using mapped_shms; last_hit_shm caches locality.
     bool map_dummy_range_in_shm(const MappedShm &shm, uint64_t dummy_addr,
@@ -1129,6 +1231,11 @@ class RealClient : public PyClient {
         size_t local_buffer_size);
 
    private:
+    tl::expected<std::string, ErrorCode> StartEmbeddedMaster(
+        bool enable_ssd_offload);
+
+    std::unique_ptr<class EmbeddedMaster> embedded_master_;
+
     struct SessionRangeReadRequest {
         std::string object_key;
         size_t result_index;
@@ -1144,6 +1251,8 @@ class RealClient : public PyClient {
     struct SessionRangeReadPlan {
         std::vector<SessionRangeReadRequest> memory_requests;
         std::vector<SessionRangeReadRequest> dfs_requests;
+        std::vector<SessionRangeReadRequest> local_disk_requests;
+        std::vector<SessionRangeReadRequest> disk_requests;
     };
 
     struct DfsSessionStagingArena {
@@ -1186,6 +1295,14 @@ class RealClient : public PyClient {
         const std::vector<SessionRangeReadRequest> &requests,
         std::vector<int> &results);
 
+    void execute_session_local_disk_range_reads(
+        const std::vector<SessionRangeReadRequest> &requests,
+        std::vector<int> &results);
+
+    void execute_session_disk_range_reads(
+        const std::vector<SessionRangeReadRequest> &requests,
+        std::vector<int> &results);
+
     tl::expected<void, ErrorCode> scatter_session_range_read(
         const SessionRangeReadRequest &request,
         const void *staging_buffer) const;
@@ -1205,6 +1322,23 @@ class RealClient : public PyClient {
         const std::string &object_key, ErrorCode error,
         std::vector<int> &results);
 
+    tl::expected<void, ErrorCode> setup_internal(
+        const EgmStorePoolConfig &egm_config, const std::string &local_hostname,
+        const std::string &metadata_server, size_t global_segment_size,
+        size_t local_buffer_size, const std::string &protocol,
+        const std::string &rdma_devices, const std::string &master_server_addr,
+        const std::shared_ptr<TransferEngine> &transfer_engine,
+        const std::string &ipc_socket_path, int local_rpc_port,
+        bool enable_ssd_offload, bool start_offload_rpc_server,
+        const std::string &ssd_offload_path, const std::string &tenant_id,
+        bool enable_client_http_server, int client_http_port,
+        bool enable_embedded_master);
+
+    friend class DirectGpuReadTest;
+
+    bool can_use_direct_memory_read(const Replica::Descriptor &replica,
+                                    void *buffer, size_t size) const;
+
     std::unordered_map<std::string, MountedSegmentRecord>
         mounted_segment_records_;
     std::mutex mounted_segment_records_mutex_;
@@ -1212,6 +1346,9 @@ class RealClient : public PyClient {
     std::unordered_map<std::string, AllocatedSegmentRecord>
         allocated_segment_records_;
     std::mutex allocated_segment_records_mutex_;
+
+    // Owners awaiting teardown, including mounts without a Client record.
+    std::vector<std::unique_ptr<NvlinkHostNumaAllocation>> egm_segment_ptrs_;
 
     void ReleaseMountedSegmentRecord(const std::string &segment_id);
     void ReleaseAllMountedSegmentRecords();

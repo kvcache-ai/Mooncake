@@ -19,7 +19,6 @@
 #include <asio/ip/v6_only.hpp>
 #include <asio/post.hpp>
 #include <asio/steady_timer.hpp>
-
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -75,7 +74,7 @@ std::atomic<size_t> staging_device_query_count{0};
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
-    defined(USE_COREX)
+    defined(USE_COREX) || defined(USE_SUPA)
 void recordStagingBufferAllocationForTest() noexcept {
     staging_buffer_allocation_count.fetch_add(1, std::memory_order_relaxed);
 }
@@ -360,6 +359,13 @@ TcpTransport::TcpTransport()
         "MC_TCP_MAX_PENDING_ADMISSIONS_PER_PEER",
         getenv("MC_TCP_MAX_PENDING_ADMISSIONS_PER_PEER"),
         kDefaultPendingAdmissionsPerPeer, 1, kMaxPendingAdmissionsPerPeer);
+    if (const char* queued_bytes_env =
+            getenv("MC_TCP_MAX_QUEUED_BYTES_PER_PEER")) {
+        lane_state_->max_queued_bytes_per_peer = parseBoundedTcpSetting(
+            "MC_TCP_MAX_QUEUED_BYTES_PER_PEER", queued_bytes_env,
+            /*default_value=*/0, /*minimum=*/0,
+            std::numeric_limits<size_t>::max());
+    }
     lane_state_->admission_timeout =
         std::chrono::milliseconds(parseBoundedTcpSetting(
             "MC_TCP_ADMISSION_TIMEOUT_MS",
@@ -552,6 +558,9 @@ Status TcpTransport::submitTransfer(
     for (auto& request : entries) {
         TransferTask& task = batch_desc.task_list[task_id];
         ++task_id;
+        // Match every sibling transport: attach the batch so completion
+        // callbacks pin the BatchDesc and publish into finishIfComplete.
+        task.batch_id = batch_id;
         startTransfer(prepareTransfer(&task, request));
     }
 

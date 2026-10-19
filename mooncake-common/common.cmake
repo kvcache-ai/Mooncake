@@ -125,6 +125,12 @@ option(
   OFF)
 option(USE_VRAM_SEGMENT "option for vram segment" OFF)
 option(USE_MPCOMM "option for using MPComm transport in TENT" OFF)
+option(USE_FABRIC
+       "option for the libfabric transport in TENT (implied by USE_EFA/USE_CXI)"
+       OFF)
+option(USE_SHCA "option for using ScaleFabric SHCA InfiniBand" OFF)
+option(USE_HYLINK "option for enabling hylink transport for Hygon DCU/DTK" OFF)
+option(USE_MEMFABRIC "option for using memfabric transport" OFF)
 
 if(USE_UB)
   add_compile_definitions(USE_UB)
@@ -133,30 +139,25 @@ if(USE_UB)
 endif()
 
 if(USE_EFA)
-  # Find libfabric headers and library; default to AWS EFA installer path
+  # The EFA transport dlopens libfabric at runtime, so only the headers are
+  # needed here; default to the AWS EFA installer path.
   find_path(
     LIBFABRIC_INCLUDE_DIR rdma/fabric.h
     HINTS /opt/amazon/efa/include
     PATH_SUFFIXES include)
-  find_library(
-    LIBFABRIC_LIBRARY fabric
-    HINTS /opt/amazon/efa/lib
-    PATH_SUFFIXES lib lib64)
 
-  if(NOT LIBFABRIC_INCLUDE_DIR OR NOT LIBFABRIC_LIBRARY)
+  if(NOT LIBFABRIC_INCLUDE_DIR)
     message(
       FATAL_ERROR
-        "libfabric not found. Install AWS EFA or set LIBFABRIC_INCLUDE_DIR/LIBFABRIC_LIBRARY."
+        "libfabric headers not found. Install libfabric-dev or AWS EFA, or set LIBFABRIC_INCLUDE_DIR."
     )
   endif()
 
-  get_filename_component(LIBFABRIC_LIB_DIR ${LIBFABRIC_LIBRARY} DIRECTORY)
   include_directories(${LIBFABRIC_INCLUDE_DIR})
-  link_directories(${LIBFABRIC_LIB_DIR})
   add_compile_definitions(USE_EFA)
   message(STATUS "AWS EFA (libfabric) transport is enabled")
   message(STATUS "  libfabric include: ${LIBFABRIC_INCLUDE_DIR}")
-  message(STATUS "  libfabric library: ${LIBFABRIC_LIBRARY}")
+  message(STATUS "  libfabric is loaded at runtime (dlopen)")
 endif()
 if(USE_CXI)
   # Find libfabric headers and library; default to AWS EFA installer path
@@ -285,8 +286,30 @@ if(USE_SUPA)
     endif()
   endif()
   message(STATUS "  BIREN_HOME: ${BIREN_HOME}")
-  include_directories(${BIREN_HOME}/supa/include)
+  # The SUPA SDK ships generic header names (e.g. version.h) that must not
+  # shadow Mooncake's own headers, so expose it as a system include directory.
+  include_directories(SYSTEM ${BIREN_HOME}/supa/include)
   link_directories(${BIREN_HOME}/supa/lib ${BIREN_HOME}/brumd/lib)
+  # Resolve the runtime library by name: older SUPA SDKs ship libsupa.so with a
+  # separate libsupart.so, while newer SDKs ship a single libsupa-runtime.so.
+  find_library(
+    SUPA_RUNTIME_LIBRARY
+    NAMES supa supa-runtime
+    PATHS ${BIREN_HOME}/supa/lib)
+  find_library(
+    SUPA_PART_LIBRARY
+    NAMES supart
+    PATHS ${BIREN_HOME}/supa/lib)
+  if(NOT SUPA_RUNTIME_LIBRARY)
+    message(
+      FATAL_ERROR
+        "SUPA runtime library not found under ${BIREN_HOME}/supa/lib (expected libsupa.so, libsupa-runtime.so, or libsupart.so)"
+    )
+  endif()
+  set(SUPA_LIBRARIES ${SUPA_RUNTIME_LIBRARY})
+  if(SUPA_PART_LIBRARY)
+    list(APPEND SUPA_LIBRARIES ${SUPA_PART_LIBRARY})
+  endif()
 endif()
 
 if(USE_TPU)
@@ -476,6 +499,11 @@ if(USE_COREX)
   endif()
 endif()
 
+# Hylink builds on the HIP runtime; enable it automatically.
+if(USE_HYLINK AND NOT USE_HIP)
+  set(USE_HIP ON)
+endif()
+
 if(USE_HIP)
   list(APPEND CMAKE_PREFIX_PATH "/opt/rocm/lib/cmake")
   find_package(HIP REQUIRED)
@@ -607,13 +635,19 @@ if(USE_TCP)
   add_compile_definitions(USE_TCP)
 endif()
 
+if(USE_MEMFABRIC)
+  add_compile_definitions(USE_MEMFABRIC)
+  message(STATUS "memfabric transport is enabled")
+endif()
+
 if(USE_BAREX)
   add_compile_definitions(USE_BAREX)
 endif()
 
 if(USE_ASCEND
    OR USE_ASCEND_DIRECT
-   OR USE_UBSHMEM)
+   OR USE_UBSHMEM
+   OR USE_MEMFABRIC)
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DOPEN_BUILD_PROJECT ")
   set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -DOPEN_BUILD_PROJECT ")
   string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" CURRENT_CPU)
@@ -759,9 +793,22 @@ if(USE_FLAGCX)
       PROPERTIES IMPORTED_LOCATION "${FLAGCX_LIBRARY}"
                  INTERFACE_INCLUDE_DIRECTORIES "${FLAGCX_INCLUDE_DIR}")
   endif()
+  include_directories(${FLAGCX_INCLUDE_DIR})
   add_compile_definitions(USE_FLAGCX)
   message(
     STATUS
       "FlagCX transport enabled, include=${FLAGCX_INCLUDE_DIR}, library=${FLAGCX_LIBRARY}"
   )
+endif()
+
+if(USE_SHCA)
+  add_compile_definitions(USE_SHCA)
+elseif(YLT_ENABLE_IBV)
+  # YLT_ENABLE_IBV is set in FindYLT.cmake (OFF on macOS).
+  add_compile_definitions(YLT_ENABLE_IBV)
+endif()
+
+if(USE_HYLINK)
+  add_compile_definitions(USE_HYLINK)
+  message(STATUS "Hylink transport is enabled")
 endif()

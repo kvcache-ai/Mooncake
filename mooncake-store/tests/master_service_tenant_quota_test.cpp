@@ -19,7 +19,7 @@
 #include <unistd.h>
 
 #include "allocation_strategy.h"
-#include "tenant_quota_policy_store.h"
+#include "tenant/quota_policy_store.h"
 #include "types.h"
 
 namespace mooncake::test {
@@ -363,7 +363,7 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
     std::unique_lock<std::shared_mutex> LockSnapshotForTest(
         MasterService& service) {
         return std::unique_lock<std::shared_mutex>(
-            MasterServiceTestPeer::SnapshotMutex(service));
+            MasterServiceTestPeer::MasterStateMutex(service));
     }
 
     std::unique_lock<std::mutex> LockTenantQuotaRecomputeForTest(

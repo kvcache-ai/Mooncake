@@ -50,7 +50,15 @@ struct ResolvedHashProfile {
     std::string root_digest;
     std::string index_projection;
 
-    bool operator==(const ResolvedHashProfile&) const = default;
+    bool operator==(const ResolvedHashProfile& other) const {
+        // SGLang has no process-level seed. Ignore it even for resolved
+        // profiles constructed directly rather than through configuration.
+        const bool sglang = strategy == "sglang" || strategy == "sglang_bigram";
+        return strategy == other.strategy && algorithm == other.algorithm &&
+               root_digest == other.root_digest &&
+               index_projection == other.index_projection &&
+               (sglang || python_hash_seed == other.python_hash_seed);
+    }
 };
 
 struct ServiceConfig {
