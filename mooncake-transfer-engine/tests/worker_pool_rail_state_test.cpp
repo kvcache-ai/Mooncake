@@ -76,8 +76,8 @@ extern "C" GidRefreshResult wrapRefreshCurrentGid(RdmaContext *, std::string *,
     return gid_probe ? gid_probe() : GidRefreshResult::FAILED;
 }
 
-extern "C" int wrapQueryPortState(const RdmaContext *,
-                                  ibv_port_state *state) asm(
+extern "C" int
+wrapQueryPortState(const RdmaContext *, ibv_port_state *state) asm(
     "__wrap__ZNK8mooncake11RdmaContext14queryPortStateEP14ibv_port_state");
 extern "C" int wrapQueryPortState(const RdmaContext *, ibv_port_state *state) {
     return port_state_probe ? port_state_probe(state) : -1;
