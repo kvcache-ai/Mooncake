@@ -504,6 +504,13 @@ target_compile_definitions(oplog_test_failpoint_test
 target_link_libraries(oplog_test_failpoint_test PRIVATE glog::glog gtest
                                                         gtest_main pthread)
 add_test(NAME oplog_test_failpoint_test COMMAND oplog_test_failpoint_test)
+add_executable(shutdown_request_test shutdown_request_test.cpp
+                                     ../src/shutdown_request.cpp)
+target_include_directories(shutdown_request_test
+                           PRIVATE ${MOONCAKE_STORE_INCLUDE_ROOT})
+target_link_libraries(shutdown_request_test PRIVATE glog::glog gtest gtest_main
+                                                    pthread)
+add_test(NAME shutdown_request_test COMMAND shutdown_request_test)
 add_ha_test(master_service_ha_test ha/master_service_ha_test.cpp)
 
 foreach(
