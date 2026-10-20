@@ -359,6 +359,34 @@ class FileStorageTest : public ::testing::Test {
                                          *fileStorage.client_buffer_allocator_);
     }
 
+    // Registers the batch the way BatchGet does: ownership moves into the
+    // allocated-batches map, so ReleaseBuffer (or the lease GC) is the only
+    // thing that frees its arena memory.
+    static void RegisterHolderBatch(
+        FileStorage& fileStorage,
+        std::shared_ptr<FileStorage::AllocatedBatch> batch) {
+        MutexLocker locker(&fileStorage.client_buffer_mutex_);
+        fileStorage.client_buffer_allocated_batches_.emplace(batch->batch_id,
+                                                             std::move(batch));
+    }
+
+    // Plain-data result of one AllocateBatch call, so TEST_F bodies (not
+    // friended) never have to name the private AllocatedBatch type.
+    struct AllocOutcome {
+        ErrorCode error;
+        uint64_t total_size;
+    };
+
+    AllocOutcome TryAllocate(FileStorage& fileStorage,
+                             const std::vector<std::string>& keys,
+                             const std::vector<int64_t>& sizes) {
+        auto result = FileStorageAllocateBatch(fileStorage, keys, sizes);
+        if (!result) {
+            return AllocOutcome{result.error(), 0};
+        }
+        return AllocOutcome{ErrorCode::OK, result.value()->total_size};
+    }
+
     void SetPinnedRestoreArena(FileStorage& fileStorage, void* address,
                                size_t size) {
         fileStorage.pinned_restore_arena_allocator_ =
@@ -964,6 +992,66 @@ TEST_F(FileStorageTest, AllocateBatchAvoidsDirectIoPaddingForPosixReads) {
     for (const auto& handle : allocate_result.value()->handles) {
         EXPECT_EQ(handle.size(), 4 * 1024);
     }
+}
+
+TEST_F(FileStorageTest, StagingAllocWaitsForReleaseInsteadOfFailing) {
+    auto file_storage_config = FileStorageConfig::FromEnvironment();
+    file_storage_config.storage_filepath = data_path;
+    // The arena fits one 2 MiB batch, not two.
+    file_storage_config.local_buffer_size = 3 * 1024 * 1024;
+    file_storage_config.client_buffer_alloc_wait_ms = 5000;
+    // Keep the lease GC out of the way: this test exercises ReleaseBuffer.
+    file_storage_config.client_buffer_gc_ttl_ms = 60 * 1000;
+    FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
+
+    auto holder =
+        FileStorageAllocateBatch(fileStorage, {"holder"}, {2 * 1024 * 1024});
+    ASSERT_TRUE(holder);
+    const uint64_t holder_id = holder.value()->batch_id;
+    RegisterHolderBatch(fileStorage, std::move(holder.value()));
+
+    AllocOutcome waiter_result{ErrorCode::INTERNAL_ERROR, 0};
+    auto start = std::chrono::steady_clock::now();
+    std::thread waiter([&] {
+        waiter_result = TryAllocate(fileStorage, {"waiter"}, {2 * 1024 * 1024});
+    });
+    // Give the waiter time to fail its first allocation and enter the wait.
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    ASSERT_TRUE(fileStorage.ReleaseBuffer(holder_id))
+        << "the holder batch must be releasable";
+    waiter.join();
+
+    ASSERT_EQ(waiter_result.error, ErrorCode::OK)
+        << "waiting reader should succeed once the holder releases";
+    auto waited = std::chrono::steady_clock::now() - start;
+    EXPECT_GE(waited, std::chrono::milliseconds(250))
+        << "the waiter should actually have waited, not failed fast";
+    EXPECT_EQ(waiter_result.total_size, 2 * 1024 * 1024);
+}
+
+TEST_F(FileStorageTest, StagingAllocWaitExpiresToBufferOverflow) {
+    auto file_storage_config = FileStorageConfig::FromEnvironment();
+    file_storage_config.storage_filepath = data_path;
+    file_storage_config.local_buffer_size = 3 * 1024 * 1024;
+    file_storage_config.client_buffer_alloc_wait_ms = 400;
+    file_storage_config.client_buffer_gc_ttl_ms = 60 * 1000;
+    FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
+
+    auto holder =
+        FileStorageAllocateBatch(fileStorage, {"holder"}, {2 * 1024 * 1024});
+    ASSERT_TRUE(holder);
+    RegisterHolderBatch(fileStorage, std::move(holder.value()));
+
+    auto start = std::chrono::steady_clock::now();
+    auto waiter_result =
+        TryAllocate(fileStorage, {"waiter"}, {2 * 1024 * 1024});
+    auto elapsed = std::chrono::steady_clock::now() - start;
+
+    EXPECT_EQ(waiter_result.error, ErrorCode::BUFFER_OVERFLOW);
+    EXPECT_GE(elapsed, std::chrono::milliseconds(350))
+        << "the bounded wait must run its budget before failing";
+    EXPECT_LT(elapsed, std::chrono::milliseconds(3000))
+        << "the wait must stay bounded";
 }
 
 TEST_F(FileStorageTest, GroupOffloadingKeysByBucket_bucket_keys_limit) {
