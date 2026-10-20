@@ -107,6 +107,10 @@ add_test(NAME bounded_mpsc_queue_test COMMAND bounded_mpsc_queue_test)
 
 add_executable(rdma_cancel_test rdma_cancel_test.cpp ../src/runtime/slab.cpp)
 target_link_libraries(rdma_cancel_test PRIVATE tent_common gtest gtest_main)
+if(MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL)
+  target_link_libraries(rdma_cancel_test
+                        PRIVATE adaptive_congestion_control_core)
+endif()
 target_include_directories(rdma_cancel_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME rdma_cancel_test COMMAND rdma_cancel_test)
@@ -502,6 +506,18 @@ target_link_libraries(tent_quota_accounting_test PRIVATE gtest gtest_main
 target_include_directories(tent_quota_accounting_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_quota_accounting_test COMMAND tent_quota_accounting_test)
+
+if(MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL AND TARGET tent_xport_rdma)
+  add_executable(tent_adaptive_congestion_control_test
+                 adaptive_congestion_control_test.cpp)
+  target_link_libraries(
+    tent_adaptive_congestion_control_test
+    PRIVATE gtest gtest_main tent_link_group adaptive_congestion_control_core)
+  target_include_directories(tent_adaptive_congestion_control_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_adaptive_congestion_control_test
+           COMMAND tent_adaptive_congestion_control_test)
+endif()
 
 # QoS Contract Schema Unit Test
 add_executable(tent_qos_contract_test qos_contract_test.cpp

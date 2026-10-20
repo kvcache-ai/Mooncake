@@ -18,6 +18,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "task_congestion_status_c.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif  // __cplusplus
@@ -186,6 +188,18 @@ void tent_free_notifs(tent_notifi_info* info);
 int tent_task_status(tent_engine_t engine, tent_batch_id_t batch_id,
                      size_t task_id, tent_status_t* status);
 
+int tent_task_congestion_state(tent_engine_t engine, tent_batch_id_t batch_id,
+                               size_t task_id, int* state);
+
+// The required path length includes its NUL byte when observed, otherwise
+// zero. A zero-capacity call sizes the buffer; a short buffer returns -1
+// without truncating the path.
+int tent_task_congestion_detail(tent_engine_t engine, tent_batch_id_t batch_id,
+                                size_t task_id,
+                                task_congestion_detail_t* detail,
+                                char* path_buf, size_t path_capacity,
+                                size_t* required_path_length);
+
 int tent_cancel_task(tent_engine_t engine, tent_batch_id_t batch_id,
                      size_t task_id);
 
@@ -245,6 +259,7 @@ int tent_get_nic_load_stats(tent_engine_t engine, tent_nic_load_stat_t* stats,
 
 #include "tent/common/status.h"
 #include "tent/common/types.h"
+#include "task_congestion_status.h"
 
 namespace mooncake {
 class TransferEngine;
@@ -353,6 +368,11 @@ class TransferEngine {
                              std::vector<TransferStatus>& status_list);
 
     Status getTransferStatus(BatchID batch_id, TransferStatus& overall_status);
+
+    Status getTaskCongestionState(BatchID batch_id, size_t task_id,
+                                  TaskCongestionState& state) const;
+    Status getTaskCongestionDetail(BatchID batch_id, size_t task_id,
+                                   TaskCongestionDetail& detail) const;
 
     // Drive one progress step on a batch and return its aggregated status.
     // Unlike getTransferStatus, this always allows internal failover/resubmit

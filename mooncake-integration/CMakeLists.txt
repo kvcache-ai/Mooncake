@@ -296,6 +296,19 @@ if(WITH_TE)
     install(TARGETS tent_metrics
             LIBRARY DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR} COMPONENT python)
   endif()
+  if(TARGET tentpy)
+    install(TARGETS tentpy LIBRARY DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR}
+                                   COMPONENT python)
+    if(SKBUILD)
+      set(TENT_PYTHON_TOP_LEVEL_DIR ".")
+    else()
+      set(TENT_PYTHON_TOP_LEVEL_DIR "${PYTHON_SYS_PATH}")
+    endif()
+    install(
+      FILES ${CMAKE_SOURCE_DIR}/mooncake-transfer-engine/tent/src/python/tent.py
+      DESTINATION ${TENT_PYTHON_TOP_LEVEL_DIR}
+      COMPONENT python)
+  endif()
 endif()
 
 if(WITH_EP)

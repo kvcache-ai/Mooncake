@@ -480,6 +480,10 @@ Status RdmaTransport::freeSubBatch(SubBatchRef& batch) {
         task->deref();  // Release batch's reference to the task
     }
     rdma_batch->task_list.clear();
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+    rdma_batch->congestion_observations.clear();
+    rdma_batch->congestion_attempt_ids.clear();
+#endif
     // A slice still owed a completion cannot go back to the slab: its
     // address is a live work-request id, and the next transfer would get
     // that storage, so the stale completion would resolve somebody else's
@@ -537,6 +541,17 @@ Status RdmaTransport::submitTransferTasks(
             max_slice_count = 32;
         auto* task = RdmaTaskStorage::Get().allocate();
         rdma_batch->task_list.push_back(task);
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+        const size_t task_id = rdma_batch->task_list.size() - 1;
+        task->congestion_observation =
+            task_id < rdma_batch->congestion_observations.size()
+                ? rdma_batch->congestion_observations[task_id]
+                : nullptr;
+        task->congestion_attempt_id =
+            task_id < rdma_batch->congestion_attempt_ids.size()
+                ? rdma_batch->congestion_attempt_ids[task_id]
+                : 0;
+#endif
         task->request = request;
         task->device_mask = rdma_batch->device_mask;
         task->qp_pool = rdma_batch->qp_pool;  // RFC #2568 step 3
@@ -553,6 +568,12 @@ Status RdmaTransport::submitTransferTasks(
             planRdmaSlices(request.length, default_block_size, max_slice_count);
         const uint64_t block_size = plan.block_size;
         const uint64_t num_slices = plan.count;
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+        if (task->congestion_observation) {
+            task->congestion_observation->beginAttempt(
+                task->congestion_attempt_id, num_slices);
+        }
+#endif
 
         std::vector<int> slice_dev_ids;
         // Only if a single request is enough, we perform aggregated allocation
@@ -579,6 +600,9 @@ Status RdmaTransport::submitTransferTasks(
             slice->target_addr = request.target_offset + offset;
             slice->length = length;
             slice->task = task;
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+            slice->slice_idx = slice_idx;
+#endif
             slice->retry_count = 0;
             slice->last_fallback_idx = -1;
             slice->charged_dev = -1;
@@ -672,6 +696,27 @@ void RdmaTransport::reapOrphanSlices(bool on_tick) {
     orphan_slices_.swap(taken);
     orphans_pending_.store(!orphan_slices_.empty(), std::memory_order_release);
 }
+
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+bool RdmaTransport::taskCongestionEnabled() const {
+    return workers_ && workers_->taskCongestionEnabled();
+}
+
+void RdmaTransport::setTaskCongestionObservation(
+    SubBatchRef batch, size_t task_id,
+    std::shared_ptr<adaptive_congestion_control::TaskCongestionObservation>
+        observation,
+    uint64_t attempt_id) {
+    auto* rdma_batch = dynamic_cast<RdmaSubBatch*>(batch);
+    if (!rdma_batch) return;
+    if (rdma_batch->congestion_observations.size() <= task_id) {
+        rdma_batch->congestion_observations.resize(task_id + 1);
+        rdma_batch->congestion_attempt_ids.resize(task_id + 1);
+    }
+    rdma_batch->congestion_observations[task_id] = std::move(observation);
+    rdma_batch->congestion_attempt_ids[task_id] = attempt_id;
+}
+#endif
 
 Status RdmaTransport::getTransferStatus(SubBatchRef batch, int task_id,
                                         TransferStatus& status) {

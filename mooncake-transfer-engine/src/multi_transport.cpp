@@ -463,6 +463,69 @@ Status MultiTransport::getTransferStatus(BatchID batch_id, size_t task_id,
     return Status::OK();
 }
 
+Status MultiTransport::getTaskCongestionState(
+    BatchID batch_id, size_t task_id, TaskCongestionState& state) const {
+    if (batch_id == 0 || batch_id == static_cast<BatchID>(-1))
+        return Status::InvalidArgument("Invalid Batch ID");
+    const auto& batch_desc = Transport::toBatchDesc(batch_id);
+    if (task_id >= batch_desc.task_list.size())
+        return Status::InvalidArgument("Task ID out of range");
+    state = TaskCongestionState::kUnknown;
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+    const auto& task = batch_desc.task_list[task_id];
+    auto observation = std::atomic_load_explicit(&task.congestion_observation,
+                                                 std::memory_order_acquire);
+    if (observation) {
+        state = observation->state();
+        if (state == TaskCongestionState::kNormal &&
+            __atomic_load_n(&task.failed_slice_count, __ATOMIC_ACQUIRE) != 0)
+            state = TaskCongestionState::kUnknown;
+    } else if (task.rdma_congestion_control_mode.observed &&
+               task.rdma_congestion_control_mode.value !=
+                   TaskCongestionControllerMode::kOff &&
+               __atomic_load_n(&task.failed_slice_count, __ATOMIC_ACQUIRE) ==
+                   0) {
+        state = TaskCongestionState::kNormal;
+    }
+#endif
+    return Status::OK();
+}
+
+Status MultiTransport::getTaskCongestionDetail(
+    BatchID batch_id, size_t task_id, TaskCongestionDetail& detail) const {
+    if (batch_id == 0 || batch_id == static_cast<BatchID>(-1))
+        return Status::InvalidArgument("Invalid Batch ID");
+    const auto& batch_desc = Transport::toBatchDesc(batch_id);
+    if (task_id >= batch_desc.task_list.size())
+        return Status::InvalidArgument("Task ID out of range");
+    const auto& task = batch_desc.task_list[task_id];
+    detail = TaskCongestionDetail{};
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+    auto observation = std::atomic_load_explicit(&task.congestion_observation,
+                                                 std::memory_order_acquire);
+    if (observation) {
+        detail = observation->detail();
+        if (detail.state == TaskCongestionState::kNormal &&
+            __atomic_load_n(&task.failed_slice_count, __ATOMIC_ACQUIRE) != 0)
+            detail.state = TaskCongestionState::kUnknown;
+    } else if (task.rdma_congestion_control_mode.observed) {
+        detail.attempt_kind = TaskCongestionAttemptKind::kRdma;
+        detail.controller_mode = task.rdma_congestion_control_mode;
+        if (__atomic_load_n(&task.failed_slice_count, __ATOMIC_ACQUIRE) == 0)
+            detail.state = task.rdma_congestion_control_mode.value ==
+                                   TaskCongestionControllerMode::kOff
+                               ? TaskCongestionState::kUnknown
+                               : TaskCongestionState::kNormal;
+    } else if (task.transport_) {
+        detail.attempt_kind = TaskCongestionAttemptKind::kOther;
+    }
+#else
+    if (task.transport_)
+        detail.attempt_kind = TaskCongestionAttemptKind::kOther;
+#endif
+    return Status::OK();
+}
+
 Status MultiTransport::getScatterRequestStatuses(
     BatchID batch_id, size_t task_id,
     std::vector<TransferStatusEnum>& request_statuses) {

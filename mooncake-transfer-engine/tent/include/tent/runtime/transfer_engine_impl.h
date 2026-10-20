@@ -36,6 +36,7 @@
 #include "tent/runtime/transport.h"
 #include "tent/runtime/transport_selector.h"
 #include "tent/runtime/hp_tcp_transport_config.h"
+#include "task_congestion_status.h"
 
 namespace mooncake {
 class TransferEngineImplTestPeer;
@@ -107,6 +108,12 @@ struct TaskInfo {
     // attempt, so a task that recovers and later fails at poll still
     // attributes its root cause to submit.
     int8_t failure_stage{-1};
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+    std::shared_ptr<adaptive_congestion_control::TaskCongestionObservation>
+        congestion_observation;
+    std::shared_ptr<std::atomic<TransportType>> congestion_current_type;
+    uint64_t congestion_attempt_id{0};
+#endif
 
     TaskInfo() = default;
 
@@ -134,7 +141,13 @@ struct TaskInfo {
           attempt_post_time(other.attempt_post_time),
           attempt_type(other.attempt_type),
           attempt_active(other.attempt_active),
-          failure_stage(other.failure_stage) {}
+          failure_stage(other.failure_stage) {
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+        congestion_observation = other.congestion_observation;
+        congestion_current_type = other.congestion_current_type;
+        congestion_attempt_id = other.congestion_attempt_id;
+#endif
+    }
 
     TaskInfo(TaskInfo&& other) noexcept
         : type(other.type),
@@ -160,7 +173,13 @@ struct TaskInfo {
           attempt_post_time(other.attempt_post_time),
           attempt_type(other.attempt_type),
           attempt_active(other.attempt_active),
-          failure_stage(other.failure_stage) {}
+          failure_stage(other.failure_stage) {
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+        congestion_observation = std::move(other.congestion_observation);
+        congestion_current_type = std::move(other.congestion_current_type);
+        congestion_attempt_id = other.congestion_attempt_id;
+#endif
+    }
 
     TaskInfo& operator=(const TaskInfo& other) {
         if (this != &other) {
@@ -190,6 +209,11 @@ struct TaskInfo {
             attempt_type = other.attempt_type;
             attempt_active = other.attempt_active;
             failure_stage = other.failure_stage;
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+            congestion_observation = other.congestion_observation;
+            congestion_current_type = other.congestion_current_type;
+            congestion_attempt_id = other.congestion_attempt_id;
+#endif
         }
         return *this;
     }
@@ -222,6 +246,11 @@ struct TaskInfo {
             attempt_type = other.attempt_type;
             attempt_active = other.attempt_active;
             failure_stage = other.failure_stage;
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+            congestion_observation = std::move(other.congestion_observation);
+            congestion_current_type = std::move(other.congestion_current_type);
+            congestion_attempt_id = other.congestion_attempt_id;
+#endif
         }
         return *this;
     }
@@ -335,6 +364,11 @@ class TransferEngineImpl {
                              std::vector<TransferStatus>& status_list);
 
     Status getTransferStatus(BatchID batch_id, TransferStatus& overall_status);
+
+    Status getTaskCongestionState(BatchID batch_id, size_t task_id,
+                                  TaskCongestionState& state) const;
+    Status getTaskCongestionDetail(BatchID batch_id, size_t task_id,
+                                   TaskCongestionDetail& detail) const;
 
     Status progressBatch(BatchID batch_id, TransferStatus& overall_status);
 

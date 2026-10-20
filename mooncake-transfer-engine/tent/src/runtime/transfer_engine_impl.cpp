@@ -57,6 +57,15 @@ constexpr uint8_t kRedisDefaultDbIndex = 0;
 // the counter), so only a permanently failing poll or queue retire gets here.
 constexpr size_t kMaxReclaimAttempts = 4096;
 constexpr int kMaxHpTcpMetadataRefreshRetries = 1;
+
+TransportType currentTaskCongestionType(const TaskInfo& task) {
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+    if (task.congestion_current_type) {
+        return task.congestion_current_type->load(std::memory_order_acquire);
+    }
+#endif
+    return task.type != UNSPEC ? task.type : task.attempt_type;
+}
 }  // namespace
 
 struct Batch {
@@ -2341,6 +2350,33 @@ Status TransferEngineImpl::commitPreparedSubmit(
         for (const auto& group : submit_groups) {
             if (group.empty()) continue;
 
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+            if (type == RDMA && transport->taskCongestionEnabled()) {
+                for (const auto physical_task_id : group) {
+                    auto& owner_task = batch->task_list[physical_task_id];
+                    if (!owner_task.congestion_observation) {
+                        owner_task.congestion_observation =
+                            std::make_shared<adaptive_congestion_control::
+                                                 TaskCongestionObservation>(0,
+                                                                            0);
+                    }
+                    if (!owner_task.congestion_current_type) {
+                        owner_task.congestion_current_type =
+                            std::make_shared<std::atomic<TransportType>>(RDMA);
+                    }
+                    for (const auto public_task_id :
+                         public_tasks_by_physical_owner.at(physical_task_id)) {
+                        batch->task_list[public_task_id]
+                            .congestion_observation =
+                            owner_task.congestion_observation;
+                        batch->task_list[public_task_id]
+                            .congestion_current_type =
+                            owner_task.congestion_current_type;
+                    }
+                }
+            }
+#endif
+
             // A synchronous failure is allowed to return without appending
             // anything to the SubBatch. Resolve IDs from the actual current
             // size for each group so a failed earlier group cannot leave a gap
@@ -2373,6 +2409,15 @@ Status TransferEngineImpl::commitPreparedSubmit(
                 startTransportAttempt(batch->task_list[task_id],
                                       static_cast<TransportType>(type),
                                       attempt_start);
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+                const auto& task = batch->task_list[task_id];
+                if (type == RDMA && task.congestion_observation) {
+                    transport->setTaskCongestionObservation(
+                        sub_batch, task.sub_task_id,
+                        task.congestion_observation,
+                        task.congestion_attempt_id);
+                }
+#endif
             }
             auto status = transport->submitTransferTasks(sub_batch, requests);
             if (!status.ok()) {
@@ -2658,7 +2703,32 @@ Status TransferEngineImpl::dispatchQueuedOwner(QueueOwnerId owner_id) {
         if (task.type == RDMA) sub_batch->qp_pool = task.qp_pool;
     }
     task.sub_task_id = sub_batch->size();
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+    if (task.type == RDMA && transport->taskCongestionEnabled()) {
+        if (!task.congestion_observation) {
+            task.congestion_observation = std::make_shared<
+                adaptive_congestion_control::TaskCongestionObservation>(0, 0);
+        }
+        if (!task.congestion_current_type) {
+            task.congestion_current_type =
+                std::make_shared<std::atomic<TransportType>>(RDMA);
+        }
+        for (const auto public_task_id : queued.public_task_ids) {
+            batch->task_list[public_task_id].congestion_observation =
+                task.congestion_observation;
+            batch->task_list[public_task_id].congestion_current_type =
+                task.congestion_current_type;
+        }
+    }
+#endif
     startTransportAttempt(task, task.type, std::chrono::steady_clock::now());
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+    if (task.type == RDMA && task.congestion_observation) {
+        transport->setTaskCongestionObservation(sub_batch, task.sub_task_id,
+                                                task.congestion_observation,
+                                                task.congestion_attempt_id);
+    }
+#endif
     auto status = transport->submitTransferTasks(sub_batch, {task.request});
     if (!status.ok()) {
         if (task.failure_stage < 0) task.failure_stage = 0;
@@ -2966,6 +3036,9 @@ Status TransferEngineImpl::cancelTransfer(BatchID batch_id, size_t task_id) {
 Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {
     auto& task = batch->task_list[task_id];
     auto prev_type = task.type;
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+    const int prev_sub_task_id = task.sub_task_id;
+#endif
 
     if (++task.failover_count > task.runtime_policy.max_failover_attempts) {
         LOG(WARNING) << "Task failover limit reached ("
@@ -3027,7 +3100,46 @@ Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {
     }
     task.sub_task_id = sub_batch->size();
     task.type = type;
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+    if (type == RDMA && transport->taskCongestionEnabled() &&
+        !task.congestion_observation) {
+        task.congestion_observation = std::make_shared<
+            adaptive_congestion_control::TaskCongestionObservation>(0, 0);
+        task.congestion_current_type =
+            std::make_shared<std::atomic<TransportType>>(RDMA);
+        if (prev_type != UNSPEC) {
+            for (auto& alias : batch->task_list) {
+                if (alias.derived && alias.type == prev_type &&
+                    alias.sub_task_id == prev_sub_task_id) {
+                    alias.congestion_observation = task.congestion_observation;
+                    alias.congestion_current_type =
+                        task.congestion_current_type;
+                }
+            }
+        }
+        if (runtime_queue_config_.enabled) {
+            for (const auto& [_, queued] : queued_owners_) {
+                if (queued.batch != batch || queued.owner_task_id != task_id) {
+                    continue;
+                }
+                for (const auto public_task_id : queued.public_task_ids) {
+                    batch->task_list[public_task_id].congestion_observation =
+                        task.congestion_observation;
+                    batch->task_list[public_task_id].congestion_current_type =
+                        task.congestion_current_type;
+                }
+            }
+        }
+    }
+#endif
     startTransportAttempt(task, type, std::chrono::steady_clock::now());
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+    if (type == RDMA && task.congestion_observation) {
+        transport->setTaskCongestionObservation(sub_batch, task.sub_task_id,
+                                                task.congestion_observation,
+                                                task.congestion_attempt_id);
+    }
+#endif
     auto status = transport->submitTransferTasks(sub_batch, {task.request});
     if (!status.ok()) {
         if (task.failure_stage < 0) task.failure_stage = 0;
@@ -3418,6 +3530,76 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id, size_t task_id,
     return Status::OK();
 }
 
+Status TransferEngineImpl::getTaskCongestionState(
+    BatchID batch_id, size_t task_id, TaskCongestionState& state) const {
+    if (!batch_id) return Status::InvalidArgument("Invalid batch ID" LOC_MARK);
+    auto* self = const_cast<TransferEngineImpl*>(this);
+    std::lock_guard<std::recursive_mutex> lk(self->progressLockFor(batch_id));
+    if (!self->isBatchAlive(batch_id)) {
+        return Status::InvalidArgument("Batch is not alive" LOC_MARK);
+    }
+    const auto* batch = reinterpret_cast<const Batch*>(batch_id);
+    if (task_id >= batch->task_list.size()) {
+        return Status::InvalidArgument("Invalid task ID" LOC_MARK);
+    }
+    state = TaskCongestionState::kUnknown;
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+    const auto& task = batch->task_list[task_id];
+    const TransportType current_type = currentTaskCongestionType(task);
+    if (task.congestion_observation) {
+        const auto observed = task.congestion_observation->state();
+        if (current_type == RDMA && task.status == COMPLETED) {
+            state = TaskCongestionState::kNormal;
+        } else if (task.status != CANCELED && current_type == RDMA &&
+                   !(task.status != PENDING &&
+                     observed == TaskCongestionState::kNormal)) {
+            state = observed;
+        }
+    }
+#endif
+    return Status::OK();
+}
+
+Status TransferEngineImpl::getTaskCongestionDetail(
+    BatchID batch_id, size_t task_id, TaskCongestionDetail& detail) const {
+    if (!batch_id) return Status::InvalidArgument("Invalid batch ID" LOC_MARK);
+    auto* self = const_cast<TransferEngineImpl*>(this);
+    std::lock_guard<std::recursive_mutex> lk(self->progressLockFor(batch_id));
+    if (!self->isBatchAlive(batch_id)) {
+        return Status::InvalidArgument("Batch is not alive" LOC_MARK);
+    }
+    const auto* batch = reinterpret_cast<const Batch*>(batch_id);
+    if (task_id >= batch->task_list.size()) {
+        return Status::InvalidArgument("Invalid task ID" LOC_MARK);
+    }
+
+    const auto& task = batch->task_list[task_id];
+    detail = {};
+    const TransportType current_type = currentTaskCongestionType(task);
+    detail.attempt_kind =
+        current_type == RDMA     ? TaskCongestionAttemptKind::kRdma
+        : current_type == UNSPEC ? TaskCongestionAttemptKind::kUnknown
+                                 : TaskCongestionAttemptKind::kOther;
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+    if (task.congestion_observation) {
+        detail = task.congestion_observation->detail();
+        detail.attempt_kind =
+            current_type == RDMA     ? TaskCongestionAttemptKind::kRdma
+            : current_type == UNSPEC ? TaskCongestionAttemptKind::kUnknown
+                                     : TaskCongestionAttemptKind::kOther;
+        if (current_type == RDMA && task.status == COMPLETED) {
+            detail.state = TaskCongestionState::kNormal;
+            detail.resolved = true;
+        } else if (task.status == CANCELED || current_type != RDMA ||
+                   (task.status != PENDING &&
+                    detail.state == TaskCongestionState::kNormal)) {
+            detail.state = TaskCongestionState::kUnknown;
+        }
+    }
+#endif
+    return Status::OK();
+}
+
 Status TransferEngineImpl::getTransferStatus(
     BatchID batch_id, std::vector<TransferStatus>& status_list) {
     if (!batch_id) return Status::InvalidArgument("Invalid batch ID" LOC_MARK);
@@ -3802,6 +3984,20 @@ void TransferEngineImpl::startTransportAttempt(
     // task.type is overwritten by failover before finishTransportAttempt().
     task.attempt_type = type;
     task.attempt_active = true;
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+    if (task.congestion_observation) {
+        if (!task.congestion_current_type) {
+            task.congestion_current_type =
+                std::make_shared<std::atomic<TransportType>>(type);
+        }
+        task.congestion_current_type->store(type, std::memory_order_release);
+        ++task.congestion_attempt_id;
+        if (type != RDMA) {
+            task.congestion_observation->beginAttempt(
+                task.congestion_attempt_id, 0);
+        }
+    }
+#endif
 #if TENT_METRICS_ENABLED
     TentMetrics::instance().recordTransportAttemptStarted(type,
                                                           task.request.opcode);

@@ -1,5 +1,66 @@
 set(WORKSPACE "${CMAKE_CURRENT_SOURCE_DIR}")
 
+if(MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL)
+  add_executable(task_congestion_observation_test
+                 ${WORKSPACE}/task_congestion_observation_test.cpp)
+  target_include_directories(
+    task_congestion_observation_test
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/../src/common/adaptive_congestion_control
+      ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  target_link_libraries(
+    task_congestion_observation_test PRIVATE adaptive_congestion_control_core
+                                             gtest gtest_main)
+  add_test(NAME task_congestion_observation_test
+           COMMAND task_congestion_observation_test)
+
+  add_executable(adaptive_congestion_control_test
+                 ${WORKSPACE}/adaptive_congestion_control_test.cpp)
+  target_link_libraries(
+    adaptive_congestion_control_test PRIVATE adaptive_congestion_control_core
+                                             gtest gtest_main)
+  add_test(NAME adaptive_congestion_control_test
+           COMMAND adaptive_congestion_control_test)
+
+  add_executable(rdma_error_classifier_test
+                 ${WORKSPACE}/rdma_error_classifier_test.cpp)
+  target_link_libraries(
+    rdma_error_classifier_test PRIVATE adaptive_congestion_control_core gtest
+                                       gtest_main)
+  add_test(NAME rdma_error_classifier_test COMMAND rdma_error_classifier_test)
+
+  add_executable(adaptive_congestion_control_config_test
+                 ${WORKSPACE}/adaptive_congestion_control_config_test.cpp)
+  target_link_libraries(
+    adaptive_congestion_control_config_test
+    PRIVATE adaptive_congestion_control_core gtest gtest_main)
+  add_test(NAME adaptive_congestion_control_config_test
+           COMMAND adaptive_congestion_control_config_test)
+
+  add_executable(adaptive_congestion_control_benchmark
+                 ${WORKSPACE}/adaptive_congestion_control_benchmark.cpp)
+  target_link_libraries(adaptive_congestion_control_benchmark
+                        PRIVATE adaptive_congestion_control_core)
+
+  add_executable(classic_rdma_congestion_control_test
+                 ${WORKSPACE}/classic_rdma_congestion_control_test.cpp)
+  target_link_libraries(classic_rdma_congestion_control_test
+                        PRIVATE transfer_engine gtest gtest_main)
+  add_test(NAME classic_rdma_congestion_control_test
+           COMMAND classic_rdma_congestion_control_test)
+
+  configure_file(installed_congestion_control_header_test.cmake.in
+                 installed_congestion_control_header_test.cmake @ONLY)
+  add_test(
+    NAME installed_congestion_control_header_test
+    COMMAND
+      ${CMAKE_COMMAND} -P
+      ${CMAKE_CURRENT_BINARY_DIR}/installed_congestion_control_header_test.cmake
+  )
+  set_tests_properties(installed_congestion_control_header_test
+                       PROPERTIES RUN_SERIAL TRUE)
+endif()
+
 if(USE_HIP)
   file(GLOB TEST_SOURCES "*.cpp")
   hipify_files(TEST_SOURCES)
@@ -36,6 +97,19 @@ add_executable(rdma_atomic_cap_test ${WORKSPACE}/rdma_atomic_cap_test.cpp)
 target_link_libraries(rdma_atomic_cap_test PUBLIC transfer_engine gtest
                                                   gtest_main)
 add_test(NAME rdma_atomic_cap_test COMMAND rdma_atomic_cap_test)
+
+add_executable(task_congestion_c_abi_test
+               ${CMAKE_CURRENT_SOURCE_DIR}/task_congestion_c_abi_test.c)
+target_include_directories(
+  task_congestion_c_abi_test
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include
+          ${CMAKE_CURRENT_SOURCE_DIR}/../tent/include)
+target_link_libraries(task_congestion_c_abi_test PRIVATE transfer_engine)
+set_target_properties(task_congestion_c_abi_test PROPERTIES LINKER_LANGUAGE CXX)
+if(USE_TENT)
+  target_compile_definitions(task_congestion_c_abi_test PRIVATE USE_TENT)
+endif()
+add_test(NAME task_congestion_c_abi_test COMMAND task_congestion_c_abi_test)
 
 # Hardware-free tests for FlagCX transport range and descriptor validation.
 add_executable(flagcx_transport_internal_test

@@ -11,6 +11,10 @@ if(USE_CUDA)
   target_link_libraries(rdma_transport PUBLIC ${CMAKE_DL_LIBS})
 endif()
 
+if(MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL)
+  target_link_libraries(rdma_transport PUBLIC adaptive_congestion_control_core)
+endif()
+
 if(USE_MLX5DV)
   target_compile_definitions(rdma_transport PRIVATE USE_MLX5DV)
 endif()

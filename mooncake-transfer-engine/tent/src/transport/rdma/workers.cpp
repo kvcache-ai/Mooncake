@@ -23,6 +23,8 @@
 #include <cerrno>
 #include <chrono>
 #include <fstream>
+#include <limits>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -35,10 +37,227 @@
 #include "tent/common/utils/string_builder.h"
 #include "tent/common/utils/os.h"
 #include "tent/common/utils/random.h"
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+#include "adaptive_congestion_control_config.h"
+#include "rdma_error_classifier.h"
+#endif
 
 namespace mooncake {
 namespace tent {
 thread_local int tl_wid = -1;
+
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+namespace {
+TaskCongestionControllerMode taskControllerMode(
+    adaptive_congestion_control::Mode mode) {
+    switch (mode) {
+        case adaptive_congestion_control::Mode::kObserve:
+            return TaskCongestionControllerMode::kObserve;
+        case adaptive_congestion_control::Mode::kEnforce:
+            return TaskCongestionControllerMode::kEnforce;
+        default:
+            return TaskCongestionControllerMode::kOff;
+    }
+}
+
+TaskCongestionFailureScope taskFailureScope(
+    adaptive_congestion_control::FailureScope scope) {
+    switch (scope) {
+        case adaptive_congestion_control::FailureScope::kQp:
+            return TaskCongestionFailureScope::kQp;
+        case adaptive_congestion_control::FailureScope::kCq:
+            return TaskCongestionFailureScope::kCq;
+        case adaptive_congestion_control::FailureScope::kRoute:
+            return TaskCongestionFailureScope::kRoute;
+        case adaptive_congestion_control::FailureScope::kPort:
+            return TaskCongestionFailureScope::kPort;
+        case adaptive_congestion_control::FailureScope::kDevice:
+            return TaskCongestionFailureScope::kDevice;
+        default:
+            return TaskCongestionFailureScope::kOperation;
+    }
+}
+
+adaptive_congestion_control::TaskCongestionEvidence taskEvidence(
+    const RdmaSlice& slice, TaskCongestionReason reason,
+    const adaptive_congestion_control::Snapshot& domain,
+    std::optional<TaskCongestionFailureScope> scope = std::nullopt) {
+    adaptive_congestion_control::TaskCongestionEvidence evidence;
+    evidence.reason = reason;
+    evidence.failure_scope = scope;
+    evidence.observed_at_ns = getCurrentTimeInNano();
+    evidence.controller_mode = taskControllerMode(domain.mode);
+    evidence.controller_generation = domain.generation;
+    evidence.window_bytes = domain.window_bytes;
+    evidence.inflight_bytes = domain.inflight_bytes;
+    if (!slice.source_nic_name.empty() && !slice.target_nic_name.empty() &&
+        !slice.target_machine_id.empty()) {
+        evidence.path = slice.source_nic_name + " -> " +
+                        slice.target_machine_id + "/" + slice.target_nic_name;
+    }
+    return evidence;
+}
+
+void recordDeviceBlocked(RdmaSlice& slice, const std::string& device,
+                         adaptive_congestion_control::Mode mode) {
+    if (mode == adaptive_congestion_control::Mode::kOff || !slice.task ||
+        !slice.task->congestion_observation)
+        return;
+    adaptive_congestion_control::TaskCongestionEvidence evidence;
+    evidence.reason = TaskCongestionReason::kPathQuarantined;
+    evidence.failure_scope = TaskCongestionFailureScope::kDevice;
+    evidence.observed_at_ns = getCurrentTimeInNano();
+    evidence.controller_mode = taskControllerMode(mode);
+    if (!device.empty()) evidence.path = device;
+    slice.congestion_control_observed_blocked =
+        slice.task->congestion_observation->avoid(
+            slice.slice_idx, slice.task->congestion_attempt_id, evidence);
+}
+
+void recordRailBlocked(RdmaSlice& slice, const RailMonitor& rail, int local_nic,
+                       int remote_nic, const std::string& machine_id,
+                       adaptive_congestion_control::Mode mode) {
+    if (mode == adaptive_congestion_control::Mode::kOff || !slice.task ||
+        !slice.task->congestion_observation)
+        return;
+    const auto health = rail.healthSnapshot(local_nic, remote_nic);
+    if (!health.paused) return;
+    adaptive_congestion_control::TaskCongestionEvidence evidence;
+    evidence.reason = TaskCongestionReason::kPathQuarantined;
+    evidence.failure_scope = TaskCongestionFailureScope::kRoute;
+    evidence.observed_at_ns = getCurrentTimeInNano();
+    evidence.controller_mode = taskControllerMode(mode);
+    if (!health.probe_in_progress)
+        evidence.retry_after_ns = health.retry_after_ns;
+    const auto* local = rail.local()->getNicEntry(local_nic);
+    const auto* remote = rail.remote()->getNicEntry(remote_nic);
+    if (local && remote) {
+        evidence.path = local->name + " -> " + machine_id + "/" + remote->name;
+    }
+    slice.congestion_control_observed_blocked =
+        slice.task->congestion_observation->avoid(
+            slice.slice_idx, slice.task->congestion_attempt_id, evidence);
+}
+
+void recordTaskFeedback(RdmaSlice& slice,
+                        adaptive_congestion_control::OutcomeClass outcome,
+                        adaptive_congestion_control::FailureScope scope) {
+    if (slice.word != PENDING) return;
+    auto observation =
+        slice.task ? slice.task->congestion_observation : nullptr;
+    if (!observation) return;
+    TaskCongestionReason reason;
+    switch (outcome) {
+        case adaptive_congestion_control::OutcomeClass::kCongestion:
+            reason = TaskCongestionReason::kCongestionFeedback;
+            break;
+        case adaptive_congestion_control::OutcomeClass::kReceiverPressure:
+            reason = TaskCongestionReason::kReceiverPressure;
+            break;
+        case adaptive_congestion_control::OutcomeClass::kRouteTimeout:
+            reason = TaskCongestionReason::kRouteTimeout;
+            break;
+        default:
+            return;
+    }
+    if (!slice.congestion_control_route) return;
+    auto evidence = taskEvidence(slice, reason,
+                                 adaptive_congestion_control::snapshot(
+                                     slice.congestion_control_route->domain),
+                                 taskFailureScope(scope));
+    if (observation->defer(slice.slice_idx, slice.task->congestion_attempt_id,
+                           evidence)) {
+        slice.congestion_control_observed_blocked = true;
+    }
+}
+}  // namespace
+
+adaptive_congestion_control::Decision acquireTentCongestionControlAttempt(
+    RdmaSlice& slice, TentRdmaCongestionControlRoute* route,
+    const adaptive_congestion_control::PathHandle& path, uint64_t bytes,
+    uint32_t endpoint_generation) {
+    adaptive_congestion_control::AdmissionEvidence admission;
+    const auto decision = adaptive_congestion_control::tryAcquire(
+        path, bytes, slice.congestion_control_permit, &admission);
+    if (decision == adaptive_congestion_control::Decision::kAllow) {
+        slice.congestion_control_route = route;
+        slice.congestion_control_endpoint_generation = endpoint_generation;
+        route->endpoint_generation.store(endpoint_generation,
+                                         std::memory_order_release);
+        if (slice.congestion_control_observed_blocked && slice.task &&
+            slice.task->congestion_observation) {
+            slice.task->congestion_observation->resolve(
+                slice.slice_idx, slice.task->congestion_attempt_id);
+            slice.congestion_control_observed_blocked = false;
+        }
+    } else if (!slice.congestion_control_permit.active() && slice.task &&
+               slice.task->congestion_observation &&
+               admission.reason ==
+                   adaptive_congestion_control::AdmissionReason::kWindow) {
+        const auto evidence = taskEvidence(
+            slice, TaskCongestionReason::kByteWindow, admission.snapshot,
+            admission.domain ==
+                    adaptive_congestion_control::AdmissionDomain::kDevice
+                ? TaskCongestionFailureScope::kDevice
+                : TaskCongestionFailureScope::kRoute);
+        slice.congestion_control_observed_blocked =
+            slice.task->congestion_observation->defer(
+                slice.slice_idx, slice.task->congestion_attempt_id, evidence);
+    }
+    return decision;
+}
+
+bool completeTentCongestionControlAttempt(
+    RdmaSlice& slice, adaptive_congestion_control::OutcomeClass outcome,
+    adaptive_congestion_control::FailureScope scope) {
+    auto* route = slice.congestion_control_route;
+    const bool current_endpoint =
+        route && route->endpoint_generation.load(std::memory_order_acquire) ==
+                     slice.congestion_control_endpoint_generation;
+    const bool successful_attempt =
+        current_endpoint &&
+        outcome == adaptive_congestion_control::OutcomeClass::kSuccess;
+    const bool current_generation =
+        outcome != adaptive_congestion_control::OutcomeClass::kSuccess &&
+        outcome != adaptive_congestion_control::OutcomeClass::kDerivedFlush &&
+        adaptive_congestion_control::isCurrentGeneration(
+            slice.congestion_control_permit);
+    if (!current_endpoint) {
+        outcome = adaptive_congestion_control::OutcomeClass::kDerivedFlush;
+        scope = adaptive_congestion_control::FailureScope::kOperation;
+    }
+    const bool completed = adaptive_congestion_control::complete(
+        slice.congestion_control_permit, outcome, scope);
+    if (completed && current_endpoint && current_generation) {
+        recordTaskFeedback(slice, outcome, scope);
+    }
+    if (completed && successful_attempt) {
+        route->completed_bytes.fetch_add(slice.length,
+                                         std::memory_order_relaxed);
+    }
+    if (completed) slice.congestion_control_route = nullptr;
+    return completed;
+}
+
+void tickTentCongestionControlRoute(TentRdmaCongestionControlRoute& route,
+                                    uint64_t now_ns, uint64_t elapsed_ns) {
+    if (elapsed_ns != 0) {
+        const auto state = adaptive_congestion_control::snapshot(route.domain);
+        adaptive_congestion_control::Signals signals;
+        signals.backlog_bytes = state.inflight_bytes;
+        const auto completed =
+            route.completed_bytes.exchange(0, std::memory_order_relaxed);
+        const __uint128_t scaled =
+            static_cast<__uint128_t>(completed) * 1'000'000'000ULL;
+        signals.delivery_rate_bytes_per_sec =
+            static_cast<uint64_t>(std::min<__uint128_t>(
+                scaled / elapsed_ns, std::numeric_limits<uint64_t>::max()));
+        adaptive_congestion_control::recordSignals(route.domain,
+                                                   state.generation, signals);
+    }
+    adaptive_congestion_control::controlTick(route.domain, now_ns);
+}
+#endif
 
 namespace {
 // Look up (or create) the RailMonitor for `machine_id` on this worker's
@@ -64,6 +283,30 @@ Workers::Workers(RdmaTransport* transport)
     device_selector_->loadTopology(transport_->local_topology_);
     auto& conf = transport_->conf_;
     GdrReachability::instance().configure(conf.get());
+
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+    auto loaded_congestion_control =
+        adaptive_congestion_control::loadConfigFromEnvironment();
+    if (loaded_congestion_control.valid) {
+        congestion_control_config_ = loaded_congestion_control.config;
+    } else {
+        static std::once_flag warning_once;
+        std::call_once(warning_once, [&] {
+            LOG(ERROR) << "Invalid adaptive congestion-control setting: "
+                       << loaded_congestion_control.error
+                       << "; TENT RDMA enforcement disabled";
+        });
+    }
+    if (congestion_control_config_.mode !=
+        adaptive_congestion_control::Mode::kOff) {
+        congestion_control_devices_.reserve(transport_->context_set_.size());
+        for (size_t i = 0; i < transport_->context_set_.size(); ++i) {
+            congestion_control_devices_.push_back(
+                std::make_unique<adaptive_congestion_control::DomainState>(
+                    congestion_control_config_, 1));
+        }
+    }
+#endif
 
     // RailMonitor consumes JSON text, while the public configuration is a file
     // path. Load it once here instead of reopening the file for every worker
@@ -483,6 +726,17 @@ void Workers::rechargeSlice(RdmaSlice* slice, int dev_id) {
     if (prev >= 0) device_selector_->release(prev, slice->length, 0.0);
 }
 
+void Workers::abandonRecoveryProbe(RdmaSlice* slice) {
+    if (!slice) return;
+    if (auto* rail = slice->rail_monitor) {
+        if (slice->rail_probe_token != 0) {
+            rail->abandonRecoveryProbe(slice->rail_probe_token);
+        }
+        rail->cancelProbe(slice->source_dev_id, slice->target_dev_id);
+    }
+    slice->rail_probe_token = 0;
+}
+
 bool Workers::dropUnpostableSlice(WorkerContext& worker, RdmaSlice* slice) {
     if (!slice || !slice->task) return false;
     // Two reasons not to post. The caller cancelled the transfer; or another
@@ -497,6 +751,7 @@ bool Workers::dropUnpostableSlice(WorkerContext& worker, RdmaSlice* slice) {
     // back where they came from, each idempotently, since whichever path
     // resolved the slice may already have run them -- and updateSliceStatus
     // is a no-op once the slice is terminal.
+    abandonRecoveryProbe(slice);
     retireSweptSlice(worker, slice, getCurrentTimeInNano(), nullptr);
     updateSliceStatus(slice, CANCELED);
     return true;
@@ -516,6 +771,95 @@ void Workers::releaseSliceQuota(RdmaSlice* slice, uint64_t now_ns,
     if (charged >= 0)
         device_selector_->release(charged, slice->length, latency);
 }
+
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+TentRdmaCongestionControlRoute* Workers::getCongestionRoute(
+    const PostPath& path) {
+    auto& local_routes = worker_context_[tl_wid].congestion_control_routes;
+    auto local = local_routes.find(path);
+    if (local != local_routes.end()) return local->second;
+    std::lock_guard<std::mutex> lock(congestion_control_routes_mutex_);
+    auto [it, inserted] = congestion_control_routes_.try_emplace(path, nullptr);
+    if (inserted)
+        it->second = std::make_shared<TentRdmaCongestionControlRoute>(
+            congestion_control_config_);
+    local_routes[path] = it->second.get();
+    return it->second.get();
+}
+
+adaptive_congestion_control::Decision Workers::acquireCongestionPermit(
+    RdmaSlice* slice, const PostPath& path,
+    const std::shared_ptr<RdmaEndPoint>& endpoint) {
+    if (congestion_control_config_.mode ==
+            adaptive_congestion_control::Mode::kOff ||
+        !slice || !endpoint)
+        return adaptive_congestion_control::Decision::kAllow;
+    const int dev_id = slice->source_dev_id;
+    if (dev_id < 0 ||
+        static_cast<size_t>(dev_id) >= congestion_control_devices_.size())
+        return adaptive_congestion_control::Decision::kAllow;
+    auto* route = slice->congestion_control_route;
+    if (!route) route = getCongestionRoute(path);
+    route = endpoint->bindCongestionRoute(route);
+    slice->congestion_control_route = route;
+    const uint32_t device_generation = adaptive_congestion_control::generation(
+        *congestion_control_devices_[dev_id]);
+    const uint32_t route_generation =
+        adaptive_congestion_control::generation(route->domain);
+    adaptive_congestion_control::PathHandle handle{
+        congestion_control_devices_[dev_id].get(), &route->domain,
+        device_generation, route_generation};
+    return acquireTentCongestionControlAttempt(
+        *slice, route, handle, slice->length, endpoint->generation());
+}
+
+void Workers::completeCongestionPermit(
+    RdmaSlice* slice, adaptive_congestion_control::OutcomeClass outcome,
+    adaptive_congestion_control::FailureScope scope) {
+    if (congestion_control_config_.mode ==
+            adaptive_congestion_control::Mode::kOff ||
+        !slice)
+        return;
+    completeTentCongestionControlAttempt(*slice, outcome, scope);
+}
+
+void Workers::updateCongestionSignals(uint64_t now_ns) {
+    if (congestion_control_config_.mode ==
+            adaptive_congestion_control::Mode::kOff ||
+        !device_selector_)
+        return;
+    const uint64_t elapsed_ns = congestion_control_last_tick_ns_ == 0
+                                    ? 0
+                                    : now_ns - congestion_control_last_tick_ns_;
+    congestion_control_last_tick_ns_ = now_ns;
+    for (size_t dev_id = 0; dev_id < congestion_control_devices_.size();
+         ++dev_id) {
+        adaptive_congestion_control::Signals signals;
+        signals.backlog_bytes =
+            device_selector_->getPostedBytes(static_cast<int>(dev_id));
+        const double rate =
+            device_selector_->getTransmitBandwidth(static_cast<int>(dev_id));
+        if (rate > 0.0) {
+            signals.delivery_rate_bytes_per_sec = static_cast<uint64_t>(rate);
+        }
+        const uint32_t generation = adaptive_congestion_control::generation(
+            *congestion_control_devices_[dev_id]);
+        adaptive_congestion_control::recordSignals(
+            *congestion_control_devices_[dev_id], generation, signals);
+        adaptive_congestion_control::controlTick(
+            *congestion_control_devices_[dev_id], now_ns);
+    }
+    std::vector<std::shared_ptr<TentRdmaCongestionControlRoute>> routes;
+    {
+        std::lock_guard<std::mutex> lock(congestion_control_routes_mutex_);
+        routes.reserve(congestion_control_routes_.size());
+        for (const auto& [_, route] : congestion_control_routes_)
+            routes.push_back(route);
+    }
+    for (const auto& route : routes)
+        tickTentCongestionControlRoute(*route, now_ns, elapsed_ns);
+}
+#endif
 
 Workers::WorkerContext* Workers::ownerContext(const RdmaSlice* slice) {
     if (!worker_context_ || !slice) return nullptr;
@@ -549,6 +893,13 @@ void Workers::retireSweptSlice(WorkerContext& self, RdmaSlice* slice,
                                std::vector<RdmaSlice*>* deferred,
                                bool bytes_moved) {
     if (!slice) return;
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+    completeCongestionPermit(
+        slice,
+        bytes_moved ? adaptive_congestion_control::OutcomeClass::kSuccess
+                    : adaptive_congestion_control::OutcomeClass::kDerivedFlush,
+        adaptive_congestion_control::FailureScope::kOperation);
+#endif
     const int posted_dev = slice->posted_dev.load(std::memory_order_relaxed);
     releaseSliceQuota(slice, now_ns);
     // A slice swept off with FAILED or TIMEOUT leaves the hardware without
@@ -604,7 +955,9 @@ void Workers::markPosted(WorkerContext& worker, RdmaSlice* slice,
     worker.inflight_slice_set.insert(slice);
 }
 
-std::shared_ptr<RdmaEndPoint> Workers::getEndpoint(Workers::PostPath path) {
+std::shared_ptr<RdmaEndPoint> Workers::getEndpoint(Workers::PostPath path,
+                                                   bool* context_unavailable) {
+    if (context_unavailable) *context_unavailable = false;
     std::string rpc_server_addr, target_seg_name, target_dev_name,
         target_nic_path_name;
     RouteHint hint;
@@ -640,6 +993,7 @@ std::shared_ptr<RdmaEndPoint> Workers::getEndpoint(Workers::PostPath path) {
 
     auto context = transport_->context_set_[path.local_device_id].get();
     if (context->status() != RdmaContext::DEVICE_ENABLED) {
+        if (context_unavailable) *context_unavailable = true;
         // LOG(WARNING) << "Context " << context->name() << " is not serving";
         return nullptr;  // experimental: force to fail this slice and mark this
                          // connection unavailable
@@ -670,7 +1024,9 @@ std::shared_ptr<RdmaEndPoint> Workers::getEndpoint(Workers::PostPath path) {
 
 void Workers::disableEndpoint(RdmaSlice* slice) {
     if (auto* rail = slice->rail_monitor) {
-        rail->markFailed(slice->source_dev_id, slice->target_dev_id);
+        rail->markFailed(slice->source_dev_id, slice->target_dev_id,
+                         slice->rail_probe_token);
+        slice->rail_probe_token = 0;
     }
     if (auto ep = slice->ep_weak_ptr.lock()) {
         ep->acknowledge(slice, FAILED);
@@ -715,20 +1071,23 @@ void Workers::asyncPostSend() {
                 slice = slice->next;
                 continue;
             }
-            auto status = generatePostPath(slice);
+            bool recovery_probe_in_progress = false;
+            auto status = generatePostPath(slice, &recovery_probe_in_progress);
             if (!status.ok()) {
+                if (recovery_probe_in_progress) {
+                    // One sibling is proving this rail. Keep the remaining
+                    // slices pending until its WC either recovers the rail or
+                    // consumes this metadata generation on failure.
+                    submitFromTick(worker, slice);
+                    slice = slice->next;
+                    continue;
+                }
+                abandonRecoveryProbe(slice);
                 VLOG(1) << "Failed to generate post path for slice " << slice
                         << ": " << status.ToString();
                 LOG_EVERY_N(ERROR, 10000)
                     << "Failed to generate post path for slice " << slice
                     << ": " << status.ToString();
-                // generatePostPath may have armed a probe/trial via admit()
-                // before a later validation failed (e.g. rkey out of bounds).
-                // The slice never reaches the wire, so roll back the admission
-                // or the rail is permanently blocked (Half-Open).
-                if (auto* rail = slice->rail_monitor)
-                    rail->cancelProbe(slice->source_dev_id,
-                                      slice->target_dev_id);
                 releaseSliceQuota(slice, getCurrentTimeInNano());
                 // Count first: resolving the slice lets the batch be freed.
                 discountFromOwner(worker, slice);
@@ -775,7 +1134,14 @@ void Workers::asyncPostSend() {
                                     }),
                      slices.end());
         if (slices.empty()) continue;
-        auto endpoint = getEndpoint(path);
+        bool* health_rejection = nullptr;
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+        bool context_unavailable = false;
+        if (congestion_control_config_.mode !=
+            adaptive_congestion_control::Mode::kOff)
+            health_rejection = &context_unavailable;
+#endif
+        auto endpoint = getEndpoint(path, health_rejection);
         if (!endpoint) {
             std::vector<RdmaSlice*> clone;
             slices.swap(clone);
@@ -787,6 +1153,11 @@ void Workers::asyncPostSend() {
                                           slice->target_dev_id);
                     continue;
                 }
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+                if (context_unavailable)
+                    recordDeviceBlocked(*slice, slice->source_nic_name,
+                                        congestion_control_config_.mode);
+#endif
                 slice->retry_count++;
                 releaseSliceQuota(slice, getCurrentTimeInNano());
                 if (slice->retry_count >=
@@ -824,22 +1195,70 @@ void Workers::asyncPostSend() {
                             getCurrentTimeInNano());
         }
 
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+        size_t max_post_count = slices.size();
+        size_t allowed = 0;
+        while (allowed < slices.size()) {
+            const auto decision =
+                acquireCongestionPermit(slices[allowed], path, endpoint);
+            if (decision == adaptive_congestion_control::Decision::kAllow) {
+                ++allowed;
+                continue;
+            }
+            if (decision == adaptive_congestion_control::Decision::kAvoid &&
+                allowed == 0) {
+                auto* avoided = slices.front();
+                slices.erase(slices.begin());
+                abandonRecoveryProbe(avoided);
+                releaseSliceQuota(avoided, getCurrentTimeInNano());
+                ++avoided->retry_count;
+                // Admission avoidance is not a new transport failure. No WR
+                // was posted, so do not penalize the rail or reset its QP.
+                if (avoided->retry_count >=
+                    transport_->params_->workers.max_retry_count) {
+                    updateSliceStatus(avoided, FAILED);
+                    discountFromOwner(worker, avoided);
+                } else {
+                    submitFromTick(worker, avoided);
+                }
+                continue;
+            }
+            break;
+        }
+        if (allowed == 0) continue;
+        max_post_count = allowed;
+#endif
+
         // Everything a completion's poller must find is written before the
         // work request can reach the wire: with a shared queue pair another
         // lane may poll the completion before submitSlices returns, and a
         // poller that finds no posted device on the slice would leave the
         // device's backlog holding these bytes for good.
         const uint64_t post_ts = getCurrentTimeInNano();
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+        int num_submitted = endpoint->submitSlicesLimited(
+            slices, tl_wid,
+            [&](RdmaSlice* posted) { markPosted(worker, posted, post_ts); },
+            max_post_count);
+#else
         int num_submitted = endpoint->submitSlices(
             slices, tl_wid,
             [&](RdmaSlice* posted) { markPosted(worker, posted, post_ts); });
+#endif
         for (int id = 0; id < num_submitted; ++id) {
             auto slice = slices[id];
             if (!slice->failed) continue;
             // Rejected by the hardware: it never went on the wire, so take
             // back what the hook put in place.
             worker.inflight_slice_set.erase(slice);
+            abandonRecoveryProbe(slice);
             releaseSliceQuota(slice, post_ts);
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+            completeCongestionPermit(
+                slice,
+                adaptive_congestion_control::OutcomeClass::kLocalConfiguration,
+                adaptive_congestion_control::FailureScope::kOperation);
+#endif
             if (slice->task->cancel_requested.load(std::memory_order_acquire)) {
                 // Canceled after admit() armed a probe/trial and HW rejected
                 // the post: roll back the admission.
@@ -867,6 +1286,16 @@ void Workers::asyncPostSend() {
                 submitFromTick(worker, slice);
             }
         }
+
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+        for (size_t id = static_cast<size_t>(num_submitted); id < allowed;
+             ++id) {
+            completeCongestionPermit(
+                slices[id],
+                adaptive_congestion_control::OutcomeClass::kDerivedFlush,
+                adaptive_congestion_control::FailureScope::kOperation);
+        }
+#endif
 
         if (num_submitted) {
             slices.erase(slices.begin(), slices.begin() + num_submitted);
@@ -969,6 +1398,14 @@ void Workers::expireTimedOutSlices(WorkerContext& worker, uint64_t now_ns) {
             auto ep = slice->ep_weak_ptr.lock();
             LOG(WARNING) << "Slice " << slice
                          << " failed: transfer timeout (software)";
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+            completeCongestionPermit(
+                slice,
+                worker.congestion_control_poller_stalled
+                    ? adaptive_congestion_control::OutcomeClass::kDerivedFlush
+                    : adaptive_congestion_control::OutcomeClass::kRouteTimeout,
+                adaptive_congestion_control::FailureScope::kRoute);
+#endif
             // The slice turns terminal here, not on the CQ. Its flush
             // completion may never be polled (acknowledge() zeroes wr_depth,
             // so the endpoint destroys the QP and its unpolled CQEs), so
@@ -1012,6 +1449,12 @@ void Workers::handleCompletion(WorkerContext& worker, RdmaContext& context,
             slice->completions_owed.fetch_sub(1, std::memory_order_acq_rel);
         }
     } completion_paid{slice};
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+    const auto classification = adaptive_congestion_control::classifyCompletion(
+        wc.status, wc.vendor_err);
+    completeCongestionPermit(slice, classification.outcome,
+                             classification.scope);
+#endif
     // What the acknowledge callbacks below need, behind one reference so
     // the std::function stays in its small-buffer storage (no allocation
     // per completion).
@@ -1132,10 +1575,6 @@ void Workers::handleCompletion(WorkerContext& worker, RdmaContext& context,
             }
         }
     } else {
-        ep->acknowledge(slice, COMPLETED, [&sweep](RdmaSlice* swept) {
-            sweep.self->retireSweptSlice(*sweep.worker, swept, sweep.now_ns,
-                                         nullptr, /*bytes_moved=*/true);
-        });
         // A successful GPU transfer re-admits any learned GDR
         // unreachability for the (GPU, NIC) pair(s) it used, so a
         // transient exclusion (or a recovered path) heals. Skipped
@@ -1159,6 +1598,13 @@ void Workers::handleCompletion(WorkerContext& worker, RdmaContext& context,
         // in generatePostPath, so no map lookup is needed here.
         if (auto* rail = slice->rail_monitor; rail && rail->ready())
             rail->markRecovered(slice->source_dev_id, slice->target_dev_id);
+        // Publish COMPLETED only after every path state proved by this WC is
+        // visible. The caller may submit its next request immediately after
+        // observing completion, including while a recovery probe is active.
+        ep->acknowledge(slice, COMPLETED, [&sweep](RdmaSlice* swept) {
+            sweep.self->retireSweptSlice(*sweep.worker, swept, sweep.now_ns,
+                                         nullptr, /*bytes_moved=*/true);
+        });
         if (transport_->params_->workers.show_latency_info) {
             worker.perf.inflight_lat.add(inflight_lat);
             worker.perf.enqueue_lat.add(enqueue_lat);
@@ -1172,7 +1618,16 @@ void Workers::asyncPollCq() {
     int num_contexts = (int)transport_->context_set_.size();
     int num_cq_list = transport_->params_->device.num_cq_list;
 
-    expireTimedOutSlices(worker, getCurrentTimeInNano());
+    const uint64_t now_ns = getCurrentTimeInNano();
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+    constexpr uint64_t kPollerStallNs = 5ULL * 1000 * 1000 * 1000;
+    worker.congestion_control_poller_stalled =
+        worker.congestion_control_last_poll_ns != 0 &&
+        now_ns > worker.congestion_control_last_poll_ns &&
+        now_ns - worker.congestion_control_last_poll_ns >= kPollerStallNs;
+    worker.congestion_control_last_poll_ns = now_ns;
+#endif
+    expireTimedOutSlices(worker, now_ns);
 
     for (int index = 0; index < num_contexts; index++) {
         auto& context = transport_->context_set_[index];
@@ -1391,6 +1846,17 @@ bool Workers::activateContext(int dev_id, RdmaContext& context) {
     // The link may have renegotiated while down: re-seed before the device
     // becomes selectable so no worker scores it on the old rate.
     refreshLinkSpeed(dev_id, context);
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+    if (congestion_control_config_.mode !=
+            adaptive_congestion_control::Mode::kOff &&
+        dev_id >= 0 &&
+        static_cast<size_t>(dev_id) < congestion_control_devices_.size()) {
+        const uint32_t generation = adaptive_congestion_control::generation(
+            *congestion_control_devices_[dev_id]);
+        adaptive_congestion_control::resetGeneration(
+            *congestion_control_devices_[dev_id], generation + 1);
+    }
+#endif
     if (device_selector_) device_selector_->setDeviceAvailable(dev_id, true);
     return true;
 }
@@ -1461,6 +1927,9 @@ void Workers::monitorThread() {
             transport_->reapOrphanSlices(/*on_tick=*/true);
             // Safety net for a recovery event that never reached us.
             resumePausedContexts();
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+            updateCongestionSignals(getCurrentTimeInNano());
+#endif
             last_reclaim_time = current_time;
         }
 
@@ -1595,23 +2064,41 @@ int Workers::getDeviceRank(const RouteHint& hint, int device_id) {
 }
 
 Status Workers::selectOptimalDevice(RouteHint& source, RouteHint& target,
-                                    RdmaSlice* slice) {
+                                    RdmaSlice* slice,
+                                    bool* recovery_probe_in_progress) {
     auto& worker = worker_context_[tl_wid];
     auto& rail = getOrCreateRail(worker.rails, target.segment->machine_id);
     if (!rail.ready() || target.topo != rail.remote())
         CHECK_STATUS(
             rail.load(std::shared_ptr<const Topology>(source.pin, source.topo),
                       std::shared_ptr<const Topology>(target.pin, target.topo),
-                      rail_topo_json_, transport_->conf_.get()));
+                      rail_topo_json_, transport_->conf_.get(),
+                      static_cast<uint64_t>(slice->task->request.target_id)));
     if (slice->source_dev_id < 0) {
         const uint64_t device_mask =
             slice->task->device_mask &
             rail.localDeviceMask(
                 *target.topo_entry,
                 source.segment->machine_id == target.segment->machine_id);
-        CHECK_STATUS(device_selector_->allocate(
+        int* health_rejection = nullptr;
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+        int unavailable_device = -1;
+        if (congestion_control_config_.mode !=
+            adaptive_congestion_control::Mode::kOff)
+            health_rejection = &unavailable_device;
+#endif
+        auto status = device_selector_->allocate(
             slice->length, source.topo_entry->name, slice->source_dev_id,
-            slice->priority, device_mask));
+            slice->priority, device_mask, health_rejection);
+        if (!status.ok()) {
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+            if (unavailable_device >= 0)
+                recordDeviceBlocked(*slice,
+                                    source.topo->getNicName(unavailable_device),
+                                    congestion_control_config_.mode);
+#endif
+            return status;
+        }
         slice->charged_dev = slice->source_dev_id;
     }
 
@@ -1690,8 +2177,20 @@ Status Workers::selectOptimalDevice(RouteHint& source, RouteHint& target,
                                        slice->target_dev_id, src_gpu, dst_gpu);
     }
 
-    if (gdr_excluded ||
-        !rail.admit(slice->source_dev_id, slice->target_dev_id)) {
+    bool rail_available =
+        !gdr_excluded && rail.admit(slice->source_dev_id, slice->target_dev_id);
+    if (!gdr_excluded && !rail_available) {
+        rail_available = rail.tryRecoveryProbe(
+            slice->source_dev_id, slice->target_dev_id, slice->rail_probe_token,
+            recovery_probe_in_progress);
+    }
+    if (gdr_excluded || !rail_available) {
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+        if (!gdr_excluded)
+            recordRailBlocked(*slice, rail, slice->source_dev_id,
+                              slice->target_dev_id, target.segment->machine_id,
+                              congestion_control_config_.mode);
+#endif
         VLOG(1) << "Optimal device pair not available: source_dev_id "
                 << slice->source_dev_id << ", target_dev_id "
                 << slice->target_dev_id;
@@ -1699,7 +2198,8 @@ Status Workers::selectOptimalDevice(RouteHint& source, RouteHint& target,
             << "Optimal device pair not available: source_dev_id "
             << slice->source_dev_id << ", target_dev_id "
             << slice->target_dev_id;
-        return selectFallbackDevice(source, target, slice);
+        return selectFallbackDevice(source, target, slice,
+                                    recovery_probe_in_progress);
     }
 
     return Status::OK();
@@ -1740,7 +2240,8 @@ bool Workers::gdrPairExcluded(const RouteHint& source, const RouteHint& target,
 }
 
 Status Workers::selectFallbackDevice(RouteHint& source, RouteHint& target,
-                                     RdmaSlice* slice) {
+                                     RdmaSlice* slice,
+                                     bool* recovery_probe_in_progress) {
     // Mirrors selectOptimalDevice: a rare WARNING sample so a sustained
     // fallback storm is visible without flooding; VLOG(1) for debugging.
     VLOG(1) << "fallback device selection for slice " << slice;
@@ -1785,6 +2286,12 @@ Status Workers::selectFallbackDevice(RouteHint& source, RouteHint& target,
         same_machine
             ? nullptr
             : &getOrCreateRail(worker.rails, target.segment->machine_id);
+    if (rail_mon && (!rail_mon->ready() || target.topo != rail_mon->remote())) {
+        rail_mon->load(std::shared_ptr<const Topology>(source.pin, source.topo),
+                       std::shared_ptr<const Topology>(target.pin, target.topo),
+                       rail_topo_json_, transport_->conf_.get(),
+                       static_cast<uint64_t>(slice->task->request.target_id));
+    }
     size_t start =
         static_cast<size_t>(slice->last_fallback_idx + 1) % total_combos;
     const uint64_t device_mask = slice->task->device_mask;
@@ -1806,10 +2313,24 @@ Status Workers::selectFallbackDevice(RouteHint& source, RouteHint& target,
         if (!same_machine && gdr_learned &&
             gdrPairExcluded(source, target, sdev, tdev, src_gpu, dst_gpu))
             continue;
+        const uint64_t probe_token_before = slice->rail_probe_token;
         bool reachable = same_machine ? (sdev == tdev)  // loopback is safe
                                       : rail_mon->admit(sdev, tdev);
+        if (!same_machine && !reachable) {
+            bool pair_probe_in_progress = false;
+            reachable = rail_mon->tryRecoveryProbe(
+                sdev, tdev, slice->rail_probe_token, &pair_probe_in_progress);
+            if (pair_probe_in_progress && recovery_probe_in_progress)
+                *recovery_probe_in_progress = true;
+        }
 
         if (reachable) {
+            if (probe_token_before != 0 && (slice->source_dev_id != sdev ||
+                                            slice->target_dev_id != tdev)) {
+                // This attempt found another usable rail before returning to
+                // the probe pair. Return that pair's ownership before moving.
+                abandonRecoveryProbe(slice);
+            }
             // A retry gets here after the failure path returned the slice's
             // charge, so charge the device this attempt will actually use:
             // otherwise the NIC's inflight bytes miss it and its completion
@@ -1822,12 +2343,19 @@ Status Workers::selectFallbackDevice(RouteHint& source, RouteHint& target,
             slice->last_fallback_idx = static_cast<int>(idx);
             return Status::OK();
         }
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+        if (rail_mon)
+            recordRailBlocked(*slice, *rail_mon, sdev, tdev,
+                              target.segment->machine_id,
+                              congestion_control_config_.mode);
+#endif
     }
 
     return Status::DeviceNotFound("No available path" LOC_MARK);
 }
 
-Status Workers::generatePostPath(RdmaSlice* slice) {
+Status Workers::generatePostPath(RdmaSlice* slice,
+                                 bool* recovery_probe_in_progress) {
     RouteHint source, target;
     CHECK_STATUS(getRouteHint(source, LOCAL_SEGMENT_ID,
                               (uint64_t)slice->source_addr, slice->length));
@@ -1837,9 +2365,11 @@ Status Workers::generatePostPath(RdmaSlice* slice) {
                               slice->length));
 
     if (slice->retry_count == 0)
-        CHECK_STATUS(selectOptimalDevice(source, target, slice));
+        CHECK_STATUS(selectOptimalDevice(source, target, slice,
+                                         recovery_probe_in_progress));
     else
-        CHECK_STATUS(selectFallbackDevice(source, target, slice));
+        CHECK_STATUS(selectFallbackDevice(source, target, slice,
+                                          recovery_probe_in_progress));
     // Cache the RailMonitor pointer as soon as select* succeeds, BEFORE the
     // rkey bounds check below: select* may have armed a probe/trial via
     // admit(), and any later failure (rkey out of bounds, a pre-wire cancel)
@@ -1861,6 +2391,14 @@ Status Workers::generatePostPath(RdmaSlice* slice) {
             "Selected device has no registered memory key" LOC_MARK);
     slice->source_lkey = lkeys[slice->source_dev_id];
     slice->target_rkey = rkeys[slice->target_dev_id];
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+    if (congestion_control_config_.mode !=
+        adaptive_congestion_control::Mode::kOff) {
+        PostPath path{slice->source_dev_id, slice->task->request.target_id,
+                      slice->target_dev_id};
+        slice->congestion_control_route = getCongestionRoute(path);
+    }
+#endif
     // Copy identifiers for GPUDirect reachability learning in asyncPollCq.
     // RouteHint pins the metadata snapshot only through this call; completion
     // handling may happen after the segment publishes a replacement snapshot.

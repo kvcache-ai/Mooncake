@@ -197,10 +197,13 @@ class DeviceSelector {
     // actually carry, so release(), which returns a slice's real length,
     // balances. Charging every slice slice_bytes would leave the folded tail
     // released but never charged, and inflight_bytes is unsigned.
+    // Optional rejection evidence identifies an otherwise eligible unavailable
+    // device on allocation failure; success or a policy-only rejection sets -1.
     Status allocate(uint64_t total_length, uint32_t num_slices,
                     uint64_t slice_bytes, const std::string &location,
                     std::vector<int> &slice_dev_ids, int priority = PRIO_HIGH,
-                    uint64_t device_mask = ~0ULL);
+                    uint64_t device_mask = ~0ULL,
+                    int *unavailable_device = nullptr);
 
     Status allocate(uint64_t length, const std::string &location,
                     int &chosen_dev_id);
@@ -210,7 +213,8 @@ class DeviceSelector {
     // priority and transport policy's device mask. Keep the three-argument
     // overload above for source and binary compatibility.
     Status allocate(uint64_t length, const std::string &location,
-                    int &chosen_dev_id, int priority, uint64_t device_mask);
+                    int &chosen_dev_id, int priority, uint64_t device_mask,
+                    int *unavailable_device = nullptr);
 
     // The NIC's own backlog: `notePosted` when a WR reaches the hardware,
     // `notePostEnded` when it leaves the queue pair (completion, sweep or
@@ -403,6 +407,19 @@ class DeviceSelector {
                    : "no eligible devices";
     }
 
+    // Called only at an actual availability rejection. Policy exclusions
+    // cannot become device-health evidence.
+    void recordUnavailableDevice(const Topology::MemEntry *entry, int dev_id,
+                                 uint64_t device_mask,
+                                 int *unavailable_device) const {
+        if (unavailable_device && dev_id >= 0 && dev_id < 64 &&
+            devices_.find(dev_id) != devices_.end() &&
+            (device_mask & (1ULL << dev_id)) != 0 &&
+            isNumaEligible(entry, dev_id)) {
+            *unavailable_device = dev_id;
+        }
+    }
+
     bool isNumaEligible(const Topology::MemEntry *entry, int dev_id) const {
         if (!sched_params_.strict_local_numa) return true;
         if (!entry || !local_topology_) return true;
@@ -412,7 +429,8 @@ class DeviceSelector {
     Status buildCandidates(const Topology::MemEntry *entry,
                            uint64_t slice_bytes, uint64_t device_mask,
                            std::vector<Candidate> &candidates,
-                           int request_priority = PRIO_HIGH);
+                           int request_priority = PRIO_HIGH,
+                           int *unavailable_device = nullptr);
 
     void selectSinglePath(const std::vector<Candidate> &candidates,
                           uint32_t num_slices, uint64_t total_length,

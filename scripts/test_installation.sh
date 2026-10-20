@@ -53,6 +53,13 @@ python tests/test_import_structure.py
 echo "Running HTTP metadata server test..."
 python -m unittest service_tests/test_http_metadata_server.py
 
+if python -c "import importlib.util; raise SystemExit(importlib.util.find_spec('mooncake.tent') is None)" 2>/dev/null; then
+    echo "Running installed TENT task-state API test..."
+    python tests/test_tent_installed_api.py
+else
+    echo "Skipping TENT task-state API test (TENT is not included in this wheel)"
+fi
+
 echo "Running mooncake config test..."
 python unit_tests/test_mooncake_config.py
 
