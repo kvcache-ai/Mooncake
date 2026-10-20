@@ -1958,6 +1958,32 @@ tl::expected<void, ErrorCode> MasterService::PersistStaleHandleCleanupForHA(
     return {};
 }
 
+auto MasterService::ReadCursor(const TenantId& tenant_id) const
+    -> TenantCursor<LockMode::kRead> {
+    return TenantCursor<LockMode::kRead>(*this, tenant_id);
+}
+
+auto MasterService::WriteCursor(const TenantId& tenant_id)
+    -> TenantCursor<LockMode::kWrite> {
+    return TenantCursor<LockMode::kWrite>(*this, tenant_id);
+}
+
+void MasterService::VisitTenants(
+    const std::function<void(const TenantId&)>& visit) const {
+    std::unordered_set<TenantId, TenantIdHash> tenants;
+    for (size_t i = 0; i < kNumShards; ++i) {
+        MetadataShardAccessorRO shard(this, i);
+        for (const auto& [tenant_id, tenant_state] : shard->tenants) {
+            if (!tenant_state.Empty()) {
+                tenants.insert(tenant_id);
+            }
+        }
+    }
+    for (const TenantId& tenant_id : tenants) {
+        visit(tenant_id);
+    }
+}
+
 void MasterService::CleanupInvalidMemoryReplicas(MetadataAccessorRW& accessor) {
     // Only memory replicas are checked here, to avoid a lock order violation
     // (client_mutex_ must be acquired before a metadata shard). local_disk

@@ -20,6 +20,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -1997,6 +1998,138 @@ class MasterService {
 
     friend class MetadataAccessorRW;
     friend class MetadataAccessorRO;
+
+    template <LockMode kMode>
+    class TenantCursor;
+
+    // A cursor over one tenant's objects, each visited under its shard's read
+    // or write lock:
+    //
+    //     for (auto object : ReadCursor(tenant)) { ... object.metadata() ... }
+    //
+    // Each object is visited at most once, and the cursor moves one shard at a
+    // time rather than reading one point in time: an object published or torn
+    // down meanwhile may or may not be seen. A write cursor may change an
+    // object's metadata and state but not publish or tear down.
+    //
+    // The cursor holds a shard lock across the loop body, so the body must
+    // not reach any key through an accessor or another cursor, nor block on a
+    // lock whose holder may be waiting on a shard. One that acts after the
+    // cursor keeps `ref()` and comes back through MetadataAccessorRW(service,
+    // tenant_id, ref).
+    [[nodiscard]] TenantCursor<LockMode::kRead> ReadCursor(
+        const TenantId& tenant_id) const;
+    [[nodiscard]] TenantCursor<LockMode::kWrite> WriteCursor(
+        const TenantId& tenant_id);
+
+    // Calls `visit` with each tenant that holds an object when the walk
+    // starts, holding no lock, so `visit` may reach any key. A tenant that
+    // gains its first object meanwhile may or may not be visited.
+    void VisitTenants(const std::function<void(const TenantId&)>& visit) const;
+
+    // The single-pass cursor behind ReadCursor() and WriteCursor(). It owns
+    // the lock of the shard it stands in, so it neither copies nor moves, and
+    // leaving the loop early releases it.
+    template <LockMode kMode>
+    class TenantCursor {
+        static constexpr bool kWrite = kMode == LockMode::kWrite;
+        template <typename T>
+        using Access = std::conditional_t<kWrite, T, const T>;
+        using RecordIterator = std::conditional_t<kWrite, ObjectMap::iterator,
+                                                  ObjectMap::const_iterator>;
+
+       public:
+        // The object a position stands on, valid until the cursor advances.
+        class Object {
+           public:
+            using Metadata = Access<ObjectMetadata>;
+            using State = Access<route::ObjectState>;
+
+            const std::string& key() const { return it_->first; }
+            route::Generation generation() const {
+                return it_->second.generation;
+            }
+            route::ObjectRef ref() const { return {key(), generation()}; }
+            Metadata& metadata() const { return it_->second.metadata; }
+            State& state() const { return it_->second.state; }
+
+           private:
+            friend class TenantCursor;
+            explicit Object(RecordIterator it) : it_(it) {}
+            RecordIterator it_;
+        };
+
+        struct Sentinel {};
+
+        class Iterator {
+           public:
+            Object operator*() const { return Object(cursor_->it_); }
+            Iterator& operator++() {
+                cursor_->Advance();
+                return *this;
+            }
+            bool operator!=(Sentinel) const {
+                return cursor_->lock_.has_value();
+            }
+
+           private:
+            friend class TenantCursor;
+            explicit Iterator(TenantCursor* cursor) : cursor_(cursor) {}
+            TenantCursor* cursor_;
+        };
+
+        TenantCursor(const TenantCursor&) = delete;
+        TenantCursor& operator=(const TenantCursor&) = delete;
+
+        Iterator begin() { return Iterator(this); }
+        Sentinel end() const { return {}; }
+
+       private:
+        friend class MasterService;
+
+        TenantCursor(Access<MasterService>& service, TenantId tenant_id)
+            : service_(service), tenant_id_(std::move(tenant_id)) {
+            Settle();
+        }
+
+        void Advance() {
+            ++it_;
+            Settle();
+        }
+
+        // Stays on the current object if the shard has one left, or else
+        // moves to the next shard that holds an object of the tenant, or to
+        // the end, where it holds no lock.
+        void Settle() NO_THREAD_SAFETY_ANALYSIS {
+            while (it_ == end_) {
+                // Value-initialized iterators compare equal, unlike ones into
+                // a map whose lock is gone.
+                it_ = end_ = RecordIterator{};
+                lock_.reset();
+                if (next_shard_ == kNumShards) {
+                    return;
+                }
+                auto& shard = service_.metadata_shards_[next_shard_++];
+                if constexpr (kWrite) {
+                    lock_.emplace(&shard.mutex);
+                } else {
+                    lock_.emplace(&shard.mutex, shared_lock);
+                }
+                auto tenant_it = shard.tenants.find(tenant_id_);
+                if (tenant_it != shard.tenants.end()) {
+                    it_ = tenant_it->second.metadata.begin();
+                    end_ = tenant_it->second.metadata.end();
+                }
+            }
+        }
+
+        Access<MasterService>& service_;
+        const TenantId tenant_id_;
+        size_t next_shard_{0};
+        std::optional<SharedMutexLocker> lock_;
+        RecordIterator it_{};
+        RecordIterator end_{};
+    };
 
     ViewVersionId view_version_;
 

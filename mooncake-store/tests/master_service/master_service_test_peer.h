@@ -61,6 +61,17 @@ class MasterServiceTestPeer {
     // Drive one tenant watermark eviction pass without the periodic worker.
     void RunTenantEvictForTesting();
 
+    // The service's walks over tenants and over one tenant's objects.
+    auto ReadCursor(const TenantId& tenant_id) const {
+        return service_.ReadCursor(tenant_id);
+    }
+    auto WriteCursor(const TenantId& tenant_id) {
+        return service_.WriteCursor(tenant_id);
+    }
+    void VisitTenants(const std::function<void(const TenantId&)>& visit) const {
+        service_.VisitTenants(visit);
+    }
+
     // Enable epoch bookkeeping without starting a live KV event publisher.
     void SetKvTenantEpochTrackingForTesting(bool enabled);
 
