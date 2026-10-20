@@ -16,6 +16,7 @@ add_subdirectory(ub)
 add_subdirectory(mpcomm)
 add_subdirectory(hylink)
 add_subdirectory(fabric)
+add_subdirectory(memfabric)
 
 add_library(tent_transport_all INTERFACE)
 foreach(
@@ -37,7 +38,8 @@ foreach(
   tent_xport_mlu
   tent_xport_mpcomm
   tent_xport_hylink
-  tent_xport_fabric)
+  tent_xport_fabric
+  tent_xport_memfabric)
   if(TARGET ${tgt})
     target_link_libraries(tent_transport_all INTERFACE ${tgt})
   endif()

@@ -1333,10 +1333,10 @@ int DummyClient::probeKey(const std::string& key) {
 }
 
 std::vector<int> DummyClient::batchProbeKey(
-    const std::vector<std::string>& keys) {
+    const std::vector<std::string>& keys, const GrantLeasePolicy& policy) {
     auto internal_results =
-        invoke_batch_rpc<&RealClient::batchProbeKey_internal, bool>(keys.size(),
-                                                                    keys);
+        invoke_batch_rpc<&RealClient::batchProbeKey_internal, bool>(
+            keys.size(), keys, policy);
     std::vector<int> results;
     results.reserve(internal_results.size());
 

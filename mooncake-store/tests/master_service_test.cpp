@@ -578,6 +578,150 @@ TEST_F(MasterServiceTest, DfsPutEndAllAndUpsertTopologyAreAtomic) {
     std::filesystem::remove_all(dfs_root, ec);
 }
 
+// A one-object shard allocator: any DFS extent leaked by a lifecycle path makes
+// the next DFS-only allocation fail.
+class OneSlotDfsShardEnv {
+   public:
+    explicit OneSlotDfsShardEnv(const std::string& root)
+        : enable_dfs_("MOONCAKE_ENABLE_DFS", "1"),
+          fs_adapter_("MOONCAKE_DFS_FS_ADAPTER", "posix"),
+          root_dir_("MOONCAKE_DFS_ROOT_DIR", root.c_str()),
+          shard_count_("MOONCAKE_DFS_SHARD_COUNT", "1"),
+          shard_capacity_("MOONCAKE_DFS_SHARD_CAPACITY", "32768"),
+          alignment_("MOONCAKE_DFS_ALIGNMENT", "4096"),
+          eviction_("MOONCAKE_DFS_EVICTION_ENABLED", "0"),
+          deferred_free_("MOONCAKE_DFS_DEFERRED_FREE_SECONDS", "0"),
+          single_tenant_("MOONCAKE_DFS_SINGLE_TENANT", "true") {}
+
+    static constexpr uint64_t kObjectSize = 20480;
+
+   private:
+    ScopedEnvVar enable_dfs_, fs_adapter_, root_dir_, shard_count_,
+        shard_capacity_, alignment_, eviction_, deferred_free_, single_tenant_;
+};
+
+ReplicateConfig DfsOnlyConfig() {
+    ReplicateConfig config;
+    config.replica_num = 0;
+    config.dfs_replica_num = 1;
+    return config;
+}
+
+TEST_F(MasterServiceTest, DfsOnlyLifecyclePathsReleaseTheExtent) {
+    const auto dfs_root = (std::filesystem::temp_directory_path() /
+                           ("master_dfs_only_" + std::to_string(::getpid())))
+                              .string();
+    std::filesystem::create_directories(dfs_root);
+    OneSlotDfsShardEnv env(dfs_root);
+    constexpr uint64_t kSize = OneSlotDfsShardEnv::kObjectSize;
+
+    MasterServiceConfig master_config;
+    master_config.put_start_discard_timeout_sec = 1;
+    master_config.put_start_release_timeout_sec = 2;
+    MasterService service(master_config);
+    const UUID writer = generate_uuid();
+    const UUID other = generate_uuid();
+
+    auto start = service.PutStart(writer, "a", TenantId::Default(), kSize,
+                                  DfsOnlyConfig());
+    ASSERT_TRUE(start.has_value()) << toString(start.error());
+    ASSERT_EQ(start->size(), 1u);
+    EXPECT_TRUE(start->front().is_dfs_replica());
+    auto not_ready = service.GetReplicaList("a", TenantId::Default());
+    ASSERT_FALSE(not_ready.has_value());
+    EXPECT_EQ(not_ready.error(), ErrorCode::REPLICA_IS_NOT_READY);
+    auto full = service.PutStart(writer, "b", TenantId::Default(), kSize,
+                                 DfsOnlyConfig());
+    ASSERT_FALSE(full.has_value());
+    EXPECT_EQ(full.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+
+    // Revoke releases the extent.
+    ASSERT_TRUE(
+        service.PutRevoke(writer, "a", TenantId::Default(), ReplicaType::ALL));
+    auto revoked = service.GetReplicaList("a", TenantId::Default());
+    ASSERT_FALSE(revoked.has_value());
+    EXPECT_EQ(revoked.error(), ErrorCode::OBJECT_NOT_FOUND);
+
+    // Upsert preemption releases the in-flight writer's extent.
+    ASSERT_TRUE(service.PutStart(writer, "b", TenantId::Default(), kSize,
+                                 DfsOnlyConfig()));
+    ASSERT_TRUE(service.UpsertStart(other, "b", TenantId::Default(), kSize,
+                                    DfsOnlyConfig()));
+    auto stale_end =
+        service.PutEnd(writer, "b", TenantId::Default(), ReplicaType::ALL);
+    ASSERT_FALSE(stale_end.has_value());
+    EXPECT_EQ(stale_end.error(), ErrorCode::ILLEGAL_CLIENT);
+    ASSERT_TRUE(
+        service.UpsertEnd(other, "b", TenantId::Default(), ReplicaType::ALL));
+    auto complete = service.GetReplicaList("b", TenantId::Default());
+    ASSERT_TRUE(complete.has_value());
+    ASSERT_EQ(complete->replicas.size(), 1u);
+    EXPECT_EQ(complete->replicas[0].status, ReplicaStatus::COMPLETE);
+
+    // Remove honours the read lease, then releases the extent.
+    auto leased = service.Remove("b", TenantId::Default());
+    ASSERT_FALSE(leased.has_value());
+    EXPECT_EQ(leased.error(), ErrorCode::OBJECT_HAS_LEASE);
+    ASSERT_TRUE(service.Remove("b", TenantId::Default(), /*force=*/true));
+
+    // An abandoned write is reaped after the release timeout.
+    ASSERT_TRUE(service.PutStart(writer, "c", TenantId::Default(), kSize,
+                                 DfsOnlyConfig()));
+    std::this_thread::sleep_for(std::chrono::seconds(4));
+    auto reaped = service.GetReplicaList("c", TenantId::Default());
+    ASSERT_FALSE(reaped.has_value());
+    EXPECT_EQ(reaped.error(), ErrorCode::OBJECT_NOT_FOUND);
+    auto reuse = service.PutStart(other, "d", TenantId::Default(), kSize,
+                                  DfsOnlyConfig());
+    ASSERT_TRUE(reuse.has_value()) << toString(reuse.error());
+
+    std::error_code ec;
+    std::filesystem::remove_all(dfs_root, ec);
+}
+
+TEST_F(MasterServiceTest, DfsOnlyObjectsIgnoreMemoryEvictionAndSegmentLoss) {
+    const auto dfs_root =
+        (std::filesystem::temp_directory_path() /
+         ("master_dfs_only_eviction_" + std::to_string(::getpid())))
+            .string();
+    std::filesystem::create_directories(dfs_root);
+    OneSlotDfsShardEnv env(dfs_root);
+
+    MasterServiceConfig master_config;
+    master_config.default_kv_lease_ttl = 1;
+    MasterService service(master_config);
+    const auto context = PrepareSimpleSegment(service);
+    const UUID writer = generate_uuid();
+
+    ASSERT_TRUE(service.PutStart(writer, "dfs_only", TenantId::Default(),
+                                 OneSlotDfsShardEnv::kObjectSize,
+                                 DfsOnlyConfig()));
+    ASSERT_TRUE(service.PutEnd(writer, "dfs_only", TenantId::Default(),
+                               ReplicaType::ALL));
+    ReplicateConfig memory_config;
+    memory_config.replica_num = 1;
+    for (int i = 0; i < 8; ++i) {
+        const auto key = "memory_" + std::to_string(i);
+        ASSERT_TRUE(service.PutStart(writer, key, TenantId::Default(), 1 << 20,
+                                     memory_config));
+        ASSERT_TRUE(service.PutEnd(writer, key, TenantId::Default(),
+                                   ReplicaType::MEMORY));
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    MasterServiceTestPeer(service).RunBatchEvictForTesting(1.0, 1.0);
+
+    auto query = service.GetReplicaList("dfs_only", TenantId::Default());
+    ASSERT_TRUE(query.has_value()) << toString(query.error());
+    ASSERT_EQ(query->replicas.size(), 1u);
+    EXPECT_TRUE(query->replicas[0].is_dfs_replica());
+    ASSERT_TRUE(service.UnmountSegment(context.segment_id, context.client_id));
+    EXPECT_TRUE(
+        service.GetReplicaList("dfs_only", TenantId::Default()).has_value());
+
+    std::error_code ec;
+    std::filesystem::remove_all(dfs_root, ec);
+}
+
 TEST_F(MasterServiceTest, DfsBucketMemoryAllocationFailurePreservesBuckets) {
     const auto dfs_root =
         (std::filesystem::temp_directory_path() /
@@ -2675,7 +2819,7 @@ TEST_F(MasterServiceTest, BatchProbeKeyReportsPointInTimeExistence) {
 
     const std::string missing_key = "probe_batch_missing_key";
     auto results = service_->BatchProbeKey(
-        {existing_key, missing_key, existing_key}, TenantId::Default());
+        {}, {existing_key, missing_key, existing_key}, TenantId::Default());
     ASSERT_EQ(3u, results.size());
     ASSERT_TRUE(results[0].has_value());
     EXPECT_TRUE(*results[0]);
