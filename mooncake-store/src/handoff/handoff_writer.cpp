@@ -64,6 +64,16 @@ bool WriteAll(int fd, const void* data, size_t size) {
     return true;
 }
 
+// fdatasync() where the platform declares it. macOS does not, and fsync()
+// covers everything fdatasync() guarantees.
+int SyncFileData(int fd) {
+#ifdef __linux__
+    return ::fdatasync(fd);
+#else
+    return ::fsync(fd);
+#endif
+}
+
 // Starts writeback of a freshly written file without waiting.
 void StartWriteback(int fd) {
 #ifdef __linux__
@@ -82,7 +92,7 @@ bool FinishDurable(int fd) {
                                 SYNC_FILE_RANGE_WRITE |
                                 SYNC_FILE_RANGE_WAIT_AFTER);
 #endif
-    if (::fdatasync(fd) != 0) return false;
+    if (SyncFileData(fd) != 0) return false;
 #ifdef __linux__
     (void)::posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
 #endif
@@ -109,7 +119,7 @@ tl::expected<handoff::BlobInfo, std::string> WriteBlob(const fs::path& root,
     const int fd =
         ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
     if (fd < 0) return tl::make_unexpected(Errno("open", path.string()));
-    if (!WriteAll(fd, data, size) || (durable && ::fdatasync(fd) != 0)) {
+    if (!WriteAll(fd, data, size) || (durable && SyncFileData(fd) != 0)) {
         const std::string err = Errno("write", path.string());
         ::close(fd);
         return tl::make_unexpected(err);
