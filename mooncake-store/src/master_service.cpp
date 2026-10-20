@@ -11054,6 +11054,9 @@ MasterService::EvictionBackoff MasterService::BatchEvict(
     long offload_deferred_count = 0;
     long offload_cap_forced_count = 0;    // #keys force-evicted due to cap
     long offload_push_failed_forced = 0;  // #keys force-evicted on push fail
+    // Objects skipped because an owner with room refused the push (its queue
+    // is full, offloading is disabled, or it is not serving).
+    long offload_push_refused = 0;
     // Objects whose memory this cycle freed. The cycle's target also counts
     // the objects it queued for disk offload; the eviction metrics and the
     // result log count an object once, when its memory is freed.
@@ -11147,6 +11150,7 @@ MasterService::EvictionBackoff MasterService::BatchEvict(
             offload_push_failed_forced++;
             return evict_replicas(quota_account, metadata, deferred_replicas);
         }
+        offload_push_refused++;
         return 0;
     };
 
@@ -11556,7 +11560,12 @@ MasterService::EvictionBackoff MasterService::BatchEvict(
                                 std::make_move_iterator(v.end()));
     }
 
-    if (total_eviction_base == 0) {
+    // Nothing evictable. When the owners hold offloads in flight, the memory
+    // is theirs to release: the cycle runs on to its accounting, counts as a
+    // failed attempt and backs off instead of returning to re-scan on the next
+    // tick.
+    if (total_eviction_base == 0 &&
+        !(offload_on_evict_ && pending_offloads > 0)) {
         VLOG(1) << "[EVICT-DIAG] object_count=" << object_count
                 << " eviction_base=0 (no evictable memory objects)";
         return EvictionBackoff::kNone;
@@ -12010,20 +12019,29 @@ MasterService::EvictionBackoff MasterService::BatchEvict(
                      << " object(s); force-evicted without disk offload "
                         "(offload_force_evict=true).";
     }
-    // The caller backs off while the owners are the bottleneck: the in-flight
-    // room ran out this cycle, or nothing was freed and they still hold work
-    // (queued this cycle, or earlier cycles' objects in flight).
+    if (offload_push_refused > 0 && !freed_now) {
+        LOG(INFO) << "[EVICT] " << offload_push_refused
+                  << " object(s) refused for disk offload (the owner's queue "
+                     "is full, offloading is disabled, or it is not serving) "
+                     "and kept in memory; waiting for the owners";
+    }
+    // The caller backs off while the owners are the bottleneck: an owner's
+    // in-flight room ran out this cycle, or nothing was freed and they still
+    // hold work (queued this cycle, earlier cycles' objects in flight) or
+    // refused it.
     const bool waiting_on_offloads =
         offload_on_evict_ &&
         (offload_room_exhausted ||
-         (!freed_now && (offload_deferred_count > 0 || pending_offloads > 0)));
+         (!freed_now && (offload_deferred_count > 0 || pending_offloads > 0 ||
+                         offload_push_refused > 0)));
     if (!waiting_on_offloads) {
         return EvictionBackoff::kNone;
     }
-    // A failed allocation found no room in flight and nothing it may drop:
-    // the re-armed pressure must not cancel the wait, or the thread would
-    // re-scan every kEvictionThreadSleepMs until the owners drain.
-    return pressure_held && offload_room_exhausted
+    // A failed allocation found no room in flight, or only owners that refused
+    // the push, and nothing it may drop: the re-armed pressure must not cancel
+    // the wait, or the thread would re-scan every kEvictionThreadSleepMs until
+    // the owners drain.
+    return pressure_held && (offload_room_exhausted || offload_push_refused > 0)
                ? EvictionBackoff::kWaitForOwnersHoldingPressure
                : EvictionBackoff::kWaitForOwners;
 }

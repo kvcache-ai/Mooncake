@@ -1241,4 +1241,159 @@ TEST(MasterServiceOffloadScenarioTest,
     EXPECT_EQ(metrics.get_evicted_key_count() - all_before, 2);
 }
 
+namespace {
+
+// BatchEvict cycles the eviction thread runs over `window`: every cycle past
+// the census moves the memory eviction attempts counter once.
+int64_t CyclesOver(MasterScenario& scenario, std::chrono::milliseconds window) {
+    auto& metrics = MasterMetricManager::instance();
+    const int64_t before = metrics.get_mem_eviction_attempts();
+    scenario.When(WaitFor(window));
+    return metrics.get_mem_eviction_attempts() - before;
+}
+
+// A cycle the watermark starts finds every push refused: the owner mounted
+// its disk with offloading disabled. Nothing is dropped, with or without
+// offload_force_evict (no allocation failed), and the thread backs off
+// instead of re-scanning every tick.
+void ExpectRefusedPushesBackOff(bool force_evict) {
+    constexpr uint64_t kLargeObject = 1024 * 1024;
+    constexpr size_t kObjectCount = 4;
+    const auto key = [](size_t index) {
+        return "refused_backoff_" + std::to_string(index);
+    };
+    MasterServiceConfig config = OffloadOnEvictConfig();
+    config.offload_force_evict = force_evict;
+    config.default_kv_lease_ttl = 0;  // no leases in the way
+    // Four one-megabyte objects in 16 MB keep the watermark over.
+    config.eviction_high_watermark_ratio = 0.1;
+    config.eviction_ratio = 0.10;
+    MasterScenario scenario("refused pushes back off", config);
+    scenario.Given(MemoryNode("node").Capacity(16 * 1024 * 1024))
+        .When(MountLocalDisk("node").OffloadingDisabled())
+        .Given(Objects(0, kObjectCount)
+                   .NamedBy(key)
+                   .Size(kLargeObject)
+                   .By("node")
+                   .CompleteOn("node")
+                   .ExpiredFrom(std::chrono::system_clock::now() -
+                                std::chrono::hours(1)))
+        .When(WaitFor(std::chrono::milliseconds(100)));
+    const int64_t cycles =
+        CyclesOver(scenario, std::chrono::milliseconds(1500));
+    // One cycle per kEvictionDeferredBackoffMs (500 ms): three or four in
+    // 1.5 s. Re-scanning on every 10 ms tick runs well over a hundred.
+    EXPECT_GE(cycles, 1);
+    EXPECT_LE(cycles, 8);
+    scenario.Then(Objects(0, kObjectCount).NamedBy(key).AreReadable());
+}
+
+}  // namespace
+
+TEST(MasterServiceOffloadScenarioTest, RefusedPushesBackOff) {
+    ExpectRefusedPushesBackOff(/*force_evict=*/false);
+}
+
+// Since offload_force_evict drops a refused offload only after a failed
+// allocation, a watermark cycle with it on refuses and keeps everything too,
+// and backs off the same way.
+TEST(MasterServiceOffloadScenarioTest, RefusedPushesBackOffWithForceEvict) {
+    ExpectRefusedPushesBackOff(/*force_evict=*/true);
+}
+
+// Every evictable object is in flight to its owner while the watermark stays
+// over: the cycle finds nothing to evict. It counts as a failed attempt and
+// backs off; before, it returned without counting and the thread re-ran it on
+// every tick.
+TEST(MasterServiceOffloadScenarioTest, EverythingInFlightBacksOff) {
+    constexpr uint64_t kLargeObject = 1024 * 1024;
+    constexpr size_t kObjectCount = 4;
+    const auto key = [](size_t index) {
+        return "all_in_flight_" + std::to_string(index);
+    };
+    MasterServiceConfig config = OffloadOnEvictConfig();
+    config.default_kv_lease_ttl = 0;  // no leases in the way
+    config.eviction_high_watermark_ratio = 0.1;
+    config.eviction_ratio = 1.0;  // each cycle takes all it can
+    config.offloading_queue_limit = kObjectCount;
+    config.offload_cap_ratio = 1.0;  // room for every object
+    MasterScenario scenario("everything in flight backs off", config);
+    scenario.Given(MemoryNode("node").Capacity(16 * 1024 * 1024))
+        .When(MountLocalDisk("node"))
+        .Given(Objects(0, kObjectCount)
+                   .NamedBy(key)
+                   .Size(kLargeObject)
+                   .By("node")
+                   .CompleteOn("node")
+                   .ExpiredFrom(std::chrono::system_clock::now() -
+                                std::chrono::hours(1)))
+        // The watermark is over, so the thread queues all four (in one cycle,
+        // or two a back-off apart if it started while they were written).
+        .When(WaitFor(std::chrono::milliseconds(1000)))
+        .When(OffloadHeartbeat("node").ExpectTasks(
+            {key(0), key(1), key(2), key(3)}, kLargeObject));
+    const int64_t cycles =
+        CyclesOver(scenario, std::chrono::milliseconds(1500));
+    EXPECT_GE(cycles, 1);
+    EXPECT_LE(cycles, 8);
+    scenario.Then(Objects(0, kObjectCount).NamedBy(key).AreReadable());
+}
+
+// A failed allocation finds one owner refusing every push and the other
+// owner's objects all in flight. Without offload_force_evict nothing can be
+// dropped, so the cycle re-arms the pressure; the thread still backs off
+// instead of letting that re-armed pressure start a cycle on every tick.
+TEST(MasterServiceOffloadScenarioTest,
+     RefusedPushUnderPressureBacksOffWhileAnotherOwnerHasWorkInFlight) {
+    constexpr uint64_t kLargeObject = 1024 * 1024;
+    const auto a_key = [](size_t index) { return OwnerKey("a", index); };
+    const auto b_key = [](size_t index) { return OwnerKey("b", index); };
+    const auto base = std::chrono::system_clock::now() - std::chrono::hours(1);
+    MasterServiceConfig config = OffloadOnEvictConfig();
+    config.default_kv_lease_ttl = 0;  // no leases in the way
+    // Only a failed allocation arms the eviction thread.
+    config.eviction_high_watermark_ratio = 1.0;
+    config.eviction_ratio = 0.10;
+    // A cap of three: b's two objects in flight leave room, so a's objects
+    // are refused by a, not skipped for the cap.
+    config.offloading_queue_limit = 3;
+    config.offload_cap_ratio = 1.0;
+    MasterScenario scenario(
+        "a refused push under pressure backs off while another owner has "
+        "work in flight",
+        config);
+    scenario.Given(MemoryNode("a").Capacity(16 * 1024 * 1024))
+        .Given(MemoryNode("b").Capacity(4 * 1024 * 1024))
+        // a refuses every offload task; b writes them.
+        .When(MountLocalDisk("a").OffloadingDisabled())
+        .When(MountLocalDisk("b"))
+        .Given(Objects(0, 14)
+                   .NamedBy(a_key)
+                   .Size(kLargeObject)
+                   .By("a")
+                   .CompleteOn("a")
+                   .ExpiredFrom(base))
+        .Given(Objects(0, 2)
+                   .NamedBy(b_key)
+                   .Size(kLargeObject)
+                   .By("b")
+                   .CompleteOn("b")
+                   .ExpiredFrom(base + std::chrono::minutes(1)))
+        // Target 2 of 16: a refuses its objects, b's two go in flight.
+        .When(EvictMemory(0.10))
+        .When(OffloadHeartbeat("b").ExpectTasks({b_key(0), b_key(1)},
+                                                kLargeObject))
+        // Neither node has 3 MB free: the allocation fails and arms the
+        // pressure.
+        .When(PutStart("large", 3 * kLargeObject)
+                  .By("a")
+                  .ExpectError(ErrorCode::NO_AVAILABLE_HANDLE));
+    const int64_t cycles =
+        CyclesOver(scenario, std::chrono::milliseconds(1500));
+    EXPECT_GE(cycles, 1);
+    EXPECT_LE(cycles, 8);
+    scenario.Then(Objects(0, 14).NamedBy(a_key).AreReadable())
+        .Then(Objects(0, 2).NamedBy(b_key).AreReadable());
+}
+
 }  // namespace mooncake::test

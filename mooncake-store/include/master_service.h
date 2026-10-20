@@ -1031,13 +1031,13 @@ class MasterService {
         kNone,
         // The owners hold the work (offload_on_evict): the cycle found an
         // owner's in-flight room full, or freed nothing while offloads are in
-        // flight. An allocation that fails meanwhile cancels the wait.
+        // flight or while owners refused the pushes (nothing evictable
+        // included). An allocation that fails meanwhile cancels the wait.
         kWaitForOwners,
         // As above, but the cycle answered a failed allocation, found an
-        // owner's in-flight room full and could drop nothing
-        // (offload_force_evict off), so it re-armed the pressure. Wait anyway:
-        // only the owners can make room, and the cycle after the wait acts on
-        // the pressure.
+        // owner's in-flight room full or the pushes refused, and could drop
+        // nothing, so it re-armed the pressure. Wait anyway: only the owners
+        // can make room, and the cycle after the wait acts on the pressure.
         kWaitForOwnersHoldingPressure,
     };
 
