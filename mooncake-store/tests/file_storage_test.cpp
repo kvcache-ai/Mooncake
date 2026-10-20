@@ -1,6 +1,7 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 #include <sys/stat.h>
+#include <ylt/coro_rpc/coro_rpc_server.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -11,6 +12,7 @@
 #include <functional>
 #include <utility>
 #include <memory>
+#include <optional>
 #include <unordered_set>
 #include <string>
 #include <thread>
@@ -19,6 +21,8 @@
 #include "client_metric.h"
 #include "common/network.h"
 #include "file_storage.h"
+#include "master_client.h"
+#include "rpc_service.h"
 #include "storage_backend.h"
 #include "tenant_id.h"
 #include "test_server_helpers.h"
@@ -2615,6 +2619,57 @@ TEST_F(FileStorageTest, CompletionRpcErrorRollsTheBucketBack) {
     EXPECT_FALSE(StorageKeyExists(file_storage, "rollback_key"));
     EXPECT_EQ(rig.DiskReplicas("rollback_key"), 0u);
     EXPECT_FALSE(rig.HasOffloadTask("rollback_key"));  // NACKed
+    rig.Stop();
+}
+
+// The same over RPC. A master that predates task ids serves
+// NotifyOffloadSuccess but has no NotifyOffloadTaskSuccess handler; this test
+// serves the master's handlers that way and sends the store's completion
+// there. The RPC server refuses the call, and the store rolls the bucket back
+// and NACKs.
+TEST_F(FileStorageTest, CompletionToAMasterWithoutTheTaskRpcIsRolledBack) {
+    OffloadRig rig;
+    rig.Start();
+    rig.Put("old_master_key", std::string(128, 'o'));
+    auto items = rig.Drain();
+    ASSERT_EQ(items.size(), 1u);
+
+    coro_rpc::coro_rpc_server old_master(
+        /*thread_num=*/1, /*port=*/0, /*address=*/"127.0.0.1",
+        std::chrono::seconds(0), /*tcp_no_delay=*/true);
+    old_master.register_handler<&WrappedMasterService::ServiceReady,
+                                &WrappedMasterService::NotifyOffloadSuccess>(
+        rig.master.service().get());
+    ASSERT_FALSE(old_master.async_start().hasResult());
+    const UUID client_id = rig.client->getClientId();
+    MasterClient old_master_client(client_id);
+    ASSERT_EQ(old_master_client.Connect("127.0.0.1:" +
+                                        std::to_string(old_master.port())),
+              ErrorCode::OK);
+
+    SetEnv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "1");
+    auto config = FileStorageConfig::FromEnvironment();
+    config.storage_filepath = data_path + "/old_master_ssd";
+    config.local_buffer_size = 1024 * 1024;
+    fs::create_directories(config.storage_filepath);
+    FileStorage file_storage(config, rig.client, rig.endpoint);
+    ASSERT_TRUE(InitStorageBackend(file_storage));
+    std::optional<tl::expected<void, ErrorCode>> completion;
+    SetOffloadCompletionRpc(
+        file_storage, [&](const auto& tasks, const auto& metadatas) {
+            completion = old_master_client.NotifyOffloadTaskSuccess(
+                client_id, tasks, metadatas);
+            return *completion;
+        });
+    (void)FileStorageProcessDrainedOffloads(file_storage, items);
+
+    ASSERT_TRUE(completion.has_value());
+    ASSERT_FALSE(completion->has_value());
+    EXPECT_EQ(completion->error(), ErrorCode::RPC_FAIL);
+    EXPECT_FALSE(StorageKeyExists(file_storage, "old_master_key"));
+    EXPECT_EQ(rig.DiskReplicas("old_master_key"), 0u);
+    EXPECT_FALSE(rig.HasOffloadTask("old_master_key"));  // NACKed
+    old_master.stop();
     rig.Stop();
 }
 
