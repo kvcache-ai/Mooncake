@@ -18,8 +18,11 @@
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
+#include <memory>
 #include "transport/transport.h"
 #include "transport/ascend_transport/ascend_direct_transport/utils.h"
 
@@ -27,6 +30,36 @@ namespace mooncake {
 
 namespace {
 constexpr size_t kMemcpyBatchLimit = 4096U;
+// Slices per aclrtMemcpyBatch call when a copy is split across threads
+// (upstream PR #4799; active only under MC_LOCAL_COPY_PARALLEL_BATCH=1).
+constexpr size_t kParallelMemcpyBatchSize = 122U;
+
+struct ParallelCopyState {
+    std::function<void(size_t)> copy_chunk;
+    size_t chunk_count = 0;
+    std::atomic<size_t> next_chunk{0};
+    std::mutex mutex;
+    std::condition_variable cv;
+    size_t finished_chunks = 0;
+};
+
+// copy_chunk references the caller's slices, so only a thread that claimed a
+// chunk may call it: the caller does not return until every claimed chunk has
+// finished, and a helper that starts later finds nothing left to claim.
+void RunChunks(ParallelCopyState &state) {
+    while (true) {
+        const size_t chunk = state.next_chunk.fetch_add(1);
+        if (chunk >= state.chunk_count) {
+            return;
+        }
+        state.copy_chunk(chunk);
+        std::lock_guard<std::mutex> lock(state.mutex);
+        if (++state.finished_chunks == state.chunk_count) {
+            state.cv.notify_all();
+        }
+    }
+}
+
 constexpr size_t kMaxLocalCopyStreams = 32U;
 constexpr size_t kDefaultLocalCopyStreams = 1U;
 
@@ -44,6 +77,14 @@ size_t ResolveNumLocalCopyStreams() {
     }
     return static_cast<size_t>(std::min<long>(parsed, kMaxLocalCopyStreams));
 }
+
+bool ResolveParallelBatchEnabled() {
+    const char *env = std::getenv("MC_LOCAL_COPY_PARALLEL_BATCH");
+    if (env == nullptr || *env == '\0') {
+        return false;
+    }
+    return *env != '0';
+}
 }  // namespace
 
 namespace {
@@ -60,9 +101,19 @@ LocalCopyEngine::~LocalCopyEngine() { Finalize(); }
 int LocalCopyEngine::Initialize(int32_t transfer_timeout) {
     transfer_timeout_ = transfer_timeout;
     num_streams_ = ResolveNumLocalCopyStreams();
+    parallel_batch_enabled_ = ResolveParallelBatchEnabled();
     if (num_streams_ > 1) {
         LOG(INFO) << "LocalCopyEngine striping local copies across "
                   << num_streams_ << " streams per device (MC_LOCAL_COPY_STREAMS)";
+    }
+    if (parallel_batch_enabled_) {
+        if (num_streams_ > 1) {
+            LOG(WARNING) << "Both MC_LOCAL_COPY_STREAMS=" << num_streams_
+                         << " and MC_LOCAL_COPY_PARALLEL_BATCH=1 are set;"
+                            " the striped-streams path takes precedence";
+        }
+        LOG(INFO) << "LocalCopyEngine parallel chunked aclrtMemcpyBatch enabled"
+                     " (MC_LOCAL_COPY_PARALLEL_BATCH)";
     }
     // Do not create streams here: initEngines() may still run under a
     // different device context than the worker threads that later call Copy.
@@ -110,6 +161,11 @@ void LocalCopyEngine::Finalize() {
     }
     streams_.clear();
     initialized_ = false;
+}
+
+void LocalCopyEngine::SetTaskRunner(TaskRunner runner, size_t max_parallelism) {
+    task_runner_ = std::move(runner);
+    max_parallelism_ = std::max<size_t>(max_parallelism, 1);
 }
 
 const std::vector<aclrtStream> *LocalCopyEngine::GetOrCreateStreamsForCurrentDevice() {
@@ -219,9 +275,17 @@ void LocalCopyEngine::Copy(TransferRequest::OpCode opcode,
     // striped async path for device-side parallelism. aclrtMemcpyBatch is
     // synchronous and stream-less, so it cannot be striped; the per-slice
     // async copies trade higher host submission cost for N-way copy-engine
-    // parallelism.
+    // parallelism. Takes precedence over MC_LOCAL_COPY_PARALLEL_BATCH.
     if (num_streams_ > 1) {
         CopyWithAsync(opcode, slice_list, kind);
+        return;
+    }
+
+    // Parallel chunked aclrtMemcpyBatch across the dispatcher thread pool
+    // (upstream PR #4799), enabled via MC_LOCAL_COPY_PARALLEL_BATCH=1.
+    if (parallel_batch_enabled_ && task_runner_ && max_parallelism_ > 1 &&
+        slice_list.size() > kParallelMemcpyBatchSize) {
+        CopyWithParallelBatch(opcode, slice_list, kind);
         return;
     }
 
@@ -241,6 +305,71 @@ void LocalCopyEngine::Copy(TransferRequest::OpCode opcode,
         left_num -= batch_num;
         slice_index += batch_num;
     }
+}
+
+void LocalCopyEngine::CopyBatchChunk(TransferRequest::OpCode opcode,
+                                     const std::vector<Slice *> &slice_list,
+                                     aclrtMemcpyKind kind, size_t slice_index,
+                                     size_t batch_num) {
+    auto ret = CopyWithBatch(opcode, slice_list, kind, batch_num, slice_index);
+    if (ret != ACL_ERROR_RT_FEATURE_NOT_SUPPORT) {
+        return;
+    }
+    VLOG(1) << "aclrtMemcpyBatch FEATURE_NOT_SUPPORT (207000); "
+               "falling back to CopyWithAsync";
+    const auto begin = slice_list.begin() + slice_index;
+    std::vector<Slice *> chunk_slices(begin, begin + batch_num);
+    CopyWithAsync(opcode, chunk_slices, kind);
+}
+
+void LocalCopyEngine::CopyWithParallelBatch(
+    TransferRequest::OpCode opcode, const std::vector<Slice *> &slice_list,
+    aclrtMemcpyKind kind) {
+    auto state = std::make_shared<ParallelCopyState>();
+    state->chunk_count = (slice_list.size() + kParallelMemcpyBatchSize - 1) /
+                         kParallelMemcpyBatchSize;
+    state->copy_chunk = [this, opcode, &slice_list, kind](size_t chunk) {
+        const size_t slice_index = chunk * kParallelMemcpyBatchSize;
+        const size_t batch_num =
+            std::min(kParallelMemcpyBatchSize, slice_list.size() - slice_index);
+        CopyBatchChunk(opcode, slice_list, kind, slice_index, batch_num);
+    };
+
+    // Helpers copy under the caller's context so aclrtMemcpyBatch sees the
+    // same device.
+    aclrtContext context = nullptr;
+    size_t helper_count = 0;
+    if (aclrtGetCurrentContext(&context) == ACL_ERROR_NONE) {
+        helper_count = std::min(state->chunk_count, max_parallelism_) - 1;
+    } else {
+        LOG(WARNING) << "aclrtGetCurrentContext failed, copying "
+                     << slice_list.size() << " slices on one thread, errmsg:"
+                     << aclGetRecentErrMsg();
+    }
+    for (size_t i = 0; i < helper_count; ++i) {
+        task_runner_([state, context] {
+            if (state->next_chunk.load() >= state->chunk_count) {
+                return;
+            }
+            if (aclrtSetCurrentContext(context) != ACL_ERROR_NONE) {
+                LOG(ERROR) << "aclrtSetCurrentContext failed for parallel "
+                              "local copy, errmsg:"
+                           << aclGetRecentErrMsg();
+                return;
+            }
+            RunChunks(*state);
+        });
+    }
+
+    // The caller also claims chunks, so the copy finishes even when every
+    // pool thread is busy and no helper ever starts.
+    RunChunks(*state);
+    std::unique_lock<std::mutex> lock(state->mutex);
+    state->cv.wait(lock, [&state] {
+        return state->finished_chunks == state->chunk_count;
+    });
+    VLOG(1) << "Copied " << slice_list.size() << " slices with "
+            << state->chunk_count << " parallel aclrtMemcpyBatch calls";
 }
 
 aclrtMemcpyKind LocalCopyEngine::GetMemcpyKind(TransferRequest::OpCode opcode,

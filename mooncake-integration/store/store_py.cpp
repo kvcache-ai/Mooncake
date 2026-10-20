@@ -3287,14 +3287,14 @@ PYBIND11_MODULE(_store, m) {
                const std::vector<std::string> &keys,
                const std::vector<std::vector<uintptr_t>> &all_buffer_ptrs,
                const std::vector<std::vector<size_t>> &all_sizes,
-               bool prefer_alloc_in_same_node = false) {
+               bool group_by_target = false) {
                 py::gil_scoped_release release;
                 return self.store_->batch_get_into_multi_buffers(
                     keys, CastAddrs2Ptrs(all_buffer_ptrs), all_sizes,
-                    prefer_alloc_in_same_node);
+                    group_by_target);
             },
             py::arg("keys"), py::arg("all_buffer_ptrs"), py::arg("all_sizes"),
-            py::arg("prefer_alloc_in_same_node") = false,
+            py::arg("group_by_target") = false,
             "Get object data directly into multiple pre-allocated buffers for "
             "multiple "
             "keys")

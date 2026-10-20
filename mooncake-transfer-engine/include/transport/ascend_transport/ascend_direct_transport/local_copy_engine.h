@@ -16,6 +16,7 @@
 #ifndef LOCAL_COPY_ENGINE_H
 #define LOCAL_COPY_ENGINE_H
 
+#include <functional>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -33,6 +34,9 @@ using Slice = Transport::Slice;
 // patterns including sync, async, and batch copy operations.
 class LocalCopyEngine {
    public:
+    // Runs a task on another thread of the pool that calls Copy().
+    using TaskRunner = std::function<void(std::function<void()>)>;
+
     LocalCopyEngine();
 
     ~LocalCopyEngine();
@@ -45,6 +49,12 @@ class LocalCopyEngine {
 
     // Finalize and cleanup resources
     void Finalize();
+
+    // Lets a large host-device copy split its aclrtMemcpyBatch calls across
+    // `runner`, using at most `max_parallelism` threads including the caller.
+    // Pass an empty runner to keep every copy on the calling thread. Must not
+    // be called while a Copy() is in flight.
+    void SetTaskRunner(TaskRunner runner, size_t max_parallelism);
 
     // Perform local memory copy for a list of slices.
     // This is the main entry point that determines the optimal copy method
@@ -71,6 +81,20 @@ class LocalCopyEngine {
                            const std::vector<Slice *> &slice_list,
                            aclrtMemcpyKind kind, size_t batch_num,
                            size_t slice_index) const;
+
+    // Copies slices [slice_index, slice_index + batch_num) with one
+    // aclrtMemcpyBatch call, falling back to async copy for just these slices
+    // when batch copy is not supported.
+    void CopyBatchChunk(TransferRequest::OpCode opcode,
+                        const std::vector<Slice *> &slice_list,
+                        aclrtMemcpyKind kind, size_t slice_index,
+                        size_t batch_num);
+
+    // Splits the slices into fixed-size aclrtMemcpyBatch calls and runs them
+    // on the calling thread and on task_runner_ in parallel.
+    void CopyWithParallelBatch(TransferRequest::OpCode opcode,
+                               const std::vector<Slice *> &slice_list,
+                               aclrtMemcpyKind kind);
 
     // Determine the appropriate memcpy kind based on source and dest memory
     // types
@@ -105,6 +129,14 @@ class LocalCopyEngine {
     // historical single-stream behavior.
     size_t num_streams_;
     bool initialized_;
+    // Parallel-chunked aclrtMemcpyBatch support (from upstream PR #4799).
+    // Enabled via MC_LOCAL_COPY_PARALLEL_BATCH=1; requires a task runner
+    // supplied by the slice dispatcher's thread pool. Independent of
+    // MC_LOCAL_COPY_STREAMS: when both are set the striped-streams path
+    // takes precedence.
+    TaskRunner task_runner_;
+    size_t max_parallelism_ = 1;
+    bool parallel_batch_enabled_ = false;
 };
 
 }  // namespace mooncake

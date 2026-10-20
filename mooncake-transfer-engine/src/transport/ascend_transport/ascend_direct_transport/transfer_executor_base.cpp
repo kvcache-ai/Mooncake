@@ -646,6 +646,13 @@ std::string TransferExecutorBase::resolveTargetAdxlEngineName(
     return EngineNameForDestAddr(segment_desc->buffers, endpoints, dest_addr);
 }
 
+void TransferExecutorBase::setLocalCopyTaskRunner(
+    std::function<void(std::function<void()>)> runner, size_t max_parallelism) {
+    if (local_copy_engine_) {
+        local_copy_engine_->SetTaskRunner(std::move(runner), max_parallelism);
+    }
+}
+
 void TransferExecutorBase::processSliceList(
     const std::vector<Transport::Slice*>& slice_list) {
     if (slice_list.empty()) {

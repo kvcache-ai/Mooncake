@@ -60,7 +60,16 @@ DefaultSliceDispatcher::DefaultSliceDispatcher(
     const std::vector<aclrtContext> &local_engine_contexts)
     : transfer_executor_(transfer_executor),
       thread_pool_(std::make_unique<AscendThreadPool>(resolveThreadPoolSize())),
-      local_engine_contexts_(local_engine_contexts) {}
+      local_engine_contexts_(local_engine_contexts) {
+    if (thread_pool_->size() > 1) {
+        auto *pool = thread_pool_.get();
+        transfer_executor_->setLocalCopyTaskRunner(
+            [pool](std::function<void()> task) {
+                pool->enqueue(std::move(task));
+            },
+            thread_pool_->size());
+    }
+}
 
 void DefaultSliceDispatcher::enqueue(
     std::vector<Transport::Slice *> slice_list) {
@@ -103,6 +112,7 @@ void DefaultSliceDispatcher::enqueue(
 void DefaultSliceDispatcher::stop() {
     if (thread_pool_) {
         thread_pool_->stop();
+        transfer_executor_->setLocalCopyTaskRunner(nullptr, 1);
     }
 }
 

@@ -133,6 +133,11 @@ class AscendThreadPool {
     bool isRunning() const;
 
     /**
+     * @brief Returns the number of worker threads.
+     */
+    size_t size() const { return workers_.size(); }
+
+    /**
      * @brief Enqueues a task to be executed by the thread pool.
      * @tparam F The callable type.
      * @tparam Args The argument types for the callable.
