@@ -296,6 +296,8 @@ To prevent `io_uring`'s `FOLL_LONGTERM` page pinning from failing on systems wit
 
 Offloaded files are not re-registered with the master. A file the store already has can predate the current object of its key (`Remove` does not delete it), so the master registers a `LOCAL_DISK` replica only as the completion of an offload task. When the store's LOCAL_DISK registration is new (`FileStorage::Init`, and the re-mount after the master answers `SEGMENT_NOT_FOUND`), the store drops its offloaded files before it takes any offload task. A shared backend (object storage) is left untouched. L4 contents therefore do not survive a store restart or a master restart; later offloads repopulate them.
 
+Offload tasks that the store carries across heartbeats while the bucket backend waits for a full bucket keep the item they were drained with, task id included, so their completions are registered like any other. When the LOCAL_DISK registration is new, the store NACKs the tasks it carries: they were taken under the earlier registration. When the store drains items whose task id epoch differs from that of a carried task (another master, while the store kept its registration), it drops that task and its pooled key without writing them, because the current master would refuse the completion.
+
 `OffsetAllocatorStorageBackend` is the exception. It truncates its pre-allocated data file during initialization and clears its in-memory metadata, so previously offloaded objects are not recoverable after a real client restart.
 
 ## Mixed Master and Store Versions
