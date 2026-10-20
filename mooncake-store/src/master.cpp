@@ -2085,32 +2085,15 @@ int main(int argc, char* argv[]) {
         }
 
         if (shutdown_requested.load() && handoff_on_shutdown) {
-            // Does not return. coro_rpc_server::stop() closes the acceptor
-            // and connections and joins the io threads, so no new call
-            // reaches a handler; destroying the worker pool then waits for
-            // the handlers already queued on it. MasterAdminServer::Stop()
-            // does the same for the admin HTTP server.
+            // Does not return. No RPC handler, queued or running, outlives
+            // the stop step, so none can change the index while the snapshot
+            // is written. MasterAdminServer::Stop() does the same for the
+            // admin HTTP server.
             RunHandoffShutdownAndExit(
                 handoff,
                 [&]() {
-                    server.stop();
-                    LOG(INFO) << "handoff: RPC server stopped";
-                    // If stop() raced with the start-up of the accept loop,
-                    // start() may never return although no io thread is
-                    // left to run a handler. Do not wait for it forever.
-                    for (int i = 0; i < 200 && !server_done.load(); ++i) {
-                        std::this_thread::sleep_for(
-                            std::chrono::milliseconds(10));
-                    }
-                    if (server_done.load()) {
-                        server_thread.join();
-                    } else {
-                        LOG(WARNING) << "handoff: RPC server start() did not "
-                                        "return after stop(); detaching it";
-                        server_thread.detach();
-                    }
-                    worker_pool.reset();
-                    LOG(INFO) << "handoff: RPC handlers drained";
+                    mooncake::StopRpcServerAndDrainHandlers(
+                        server, server_thread, server_done, worker_pool);
                     admin_server.Stop();
                 },
                 *wrapped_master_service);
