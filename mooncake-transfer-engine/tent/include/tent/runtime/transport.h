@@ -63,6 +63,10 @@ class Transport {
         // PR #4199). Default transports leave both at 0 / false so
         // getBatchStatus keeps walking.
         std::atomic<uint64_t> finished_task_count{0};
+        // When set, the last-slice CAS publishes here instead of
+        // finished_task_count. TENT submit intervals use this so a completed
+        // interval can notify without a second CQ atomic on the batch counter.
+        std::atomic<uint64_t>* publish_finished_counter{nullptr};
         std::atomic<bool> has_failure{false};
         // Named QP pool for this batch's transfers (RFC #2568 step 3). Empty =
         // no pool (default spray). Carried like device_mask, from the matched

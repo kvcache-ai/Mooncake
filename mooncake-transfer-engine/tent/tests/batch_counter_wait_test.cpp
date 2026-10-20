@@ -13,12 +13,12 @@
 // limitations under the License.
 //
 // TENT analogue of classic TE PR #4199: RDMA-only batches skip the owner
-// walk in getBatchStatus while the CQ/worker counter says the batch is
-// still in flight. Notify uses the same batch-complete timing: an earlier
-// interval's hook waits until the publisher is fully done. Mixed RDMA+TCP,
-// append of a non-publisher, rejected submit (UNSPEC / submitTransferTasks
-// failure), and failover onto TCP keep the walk — those paths cannot use
-// the CQ counter.
+// walk in getBatchStatus while any submit interval is still unfinished.
+// Notify stays on TENT #4001 interval timing: a completed interval fires
+// even while a later interval is pending. Mixed RDMA+TCP, append of a
+// non-publisher, rejected submit (UNSPEC / submitTransferTasks failure),
+// and failover onto TCP keep the walk — those paths cannot use the CQ
+// counter.
 
 #include <gtest/gtest.h>
 
@@ -58,6 +58,7 @@ class FakeTransport : public Transport {
     std::atomic<int> status_calls{0};
     std::atomic<bool> fail_next_submit{false};
     FakeSubBatch* last_batch{nullptr};
+    std::vector<std::atomic<uint64_t>*> task_finished_counters;
 
     TransportType type() const { return self_type_; }
 
@@ -71,6 +72,7 @@ class FakeTransport : public Transport {
     Status allocateSubBatch(SubBatchRef& batch, size_t /*max_size*/) override {
         batch = new FakeSubBatch();
         last_batch = static_cast<FakeSubBatch*>(batch);
+        task_finished_counters.clear();
         return Status::OK();
     }
 
@@ -90,10 +92,14 @@ class FakeTransport : public Transport {
         }
         auto* fb = static_cast<FakeSubBatch*>(batch);
         last_batch = fb;
+        auto* counter = fb->publish_finished_counter
+                            ? fb->publish_finished_counter
+                            : &fb->finished_task_count;
         for (const auto& req : request_list) {
             fb->statuses.push_back({TransferStatusEnum::PENDING, 0});
             fb->requests.push_back(req);
             fb->task_count++;
+            task_finished_counters.push_back(counter);
         }
         return Status::OK();
     }
@@ -151,8 +157,16 @@ class FakeTransport : public Transport {
     void completeAllSuccess() {
         ASSERT_NE(last_batch, nullptr);
         for (size_t i = 0; i < last_batch->statuses.size(); ++i) {
+            if (last_batch->statuses[i].s == TransferStatusEnum::COMPLETED) {
+                continue;
+            }
             last_batch->statuses[i] = {TransferStatusEnum::COMPLETED,
                                        last_batch->requests[i].length};
+            if (i < task_finished_counters.size() &&
+                task_finished_counters[i]) {
+                task_finished_counters[i]->fetch_add(1,
+                                                     std::memory_order_release);
+            }
         }
         last_batch->finished_task_count.store(last_batch->size(),
                                               std::memory_order_release);
@@ -164,6 +178,11 @@ class FakeTransport : public Transport {
         last_batch->statuses[index] = {TransferStatusEnum::COMPLETED,
                                        last_batch->requests[index].length};
         last_batch->finished_task_count.fetch_add(1, std::memory_order_release);
+        if (index < task_finished_counters.size() &&
+            task_finished_counters[index]) {
+            task_finished_counters[index]->fetch_add(1,
+                                                     std::memory_order_release);
+        }
     }
 
     void publishFailure(size_t index) {
@@ -372,10 +391,10 @@ TEST(BatchCounterWait, NotifyBatchSkipsInFlightAndFiresOnCompletion) {
     EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), kBufLen).ok());
 }
 
-TEST(BatchCounterWait, NotifyWaitsForFullPublisherAfterAppend) {
-    // TE #4199: notify is batch-complete, not interval-complete. Submit A
-    // with notify, append B, finish only A — still PENDING, bytes 0, A's
-    // hook must not fire. Finish B — hook fires on the completion walk.
+TEST(BatchCounterWait, NotifyFiresForCompletedIntervalWhileAppendPending) {
+    // TENT #4001: notify is interval-complete. Submit A with notify, append
+    // B, finish only A — still PENDING, bytes 0, no owner walk, but A's hook
+    // must fire. Finish B — batch becomes COMPLETED.
     auto cfg = makeMinimalP2PConfig();
     TransferEngineImpl engine(cfg);
     ASSERT_TRUE(engine.available());
@@ -411,13 +430,10 @@ TEST(BatchCounterWait, NotifyWaitsForFullPublisherAfterAppend) {
     EXPECT_EQ(status.transferred_bytes, 0u);
     EXPECT_EQ(fake_rdma->status_calls.load(), 0);
 
-    // FakeTransport does not implement receiveNotification. An empty poll
-    // therefore reports "Notification not supported" unless sendNotification
-    // already queued a local payload. The pin is that A's hook has not
-    // delivered anything yet.
     std::vector<Notification> received;
-    (void)engine.receiveNotification(received);
-    EXPECT_TRUE(received.empty());
+    ASSERT_TRUE(engine.receiveNotification(received).ok());
+    ASSERT_EQ(received.size(), 1u);
+    EXPECT_EQ(received[0].msg, "interval-a");
 
     fake_rdma->completeOneSuccess(1);
     status = {};
@@ -426,9 +442,59 @@ TEST(BatchCounterWait, NotifyWaitsForFullPublisherAfterAppend) {
     EXPECT_EQ(fake_rdma->status_calls.load(), 2);
 
     received.clear();
+    (void)engine.receiveNotification(received);
+    EXPECT_TRUE(received.empty());
+
+    EXPECT_TRUE(engine.freeBatch(batch_id).ok());
+    EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), kBufLen).ok());
+}
+
+TEST(BatchCounterWait, NotifySecondIntervalStaysSilentUntilComplete) {
+    auto cfg = makeMinimalP2PConfig();
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake_rdma = std::make_shared<FakeTransport>(RDMA, true);
+    std::string seg = engine.getSegmentName();
+    ASSERT_TRUE(fake_rdma->install(seg, nullptr, nullptr).ok());
+    engine.swapTransportForTest(RDMA, fake_rdma);
+
+    constexpr size_t kBufLen = 4096;
+    std::vector<uint8_t> buf(kBufLen, 0x47);
+    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), kBufLen).ok());
+
+    Notification first;
+    first.name = "local";
+    first.msg = "first";
+    Notification second;
+    second.name = "local";
+    second.msg = "second";
+
+    BatchID batch_id = engine.allocateBatch(2);
+    auto req = makeLocalWrite(buf.data(), kBufLen);
+    ASSERT_TRUE(engine.submitTransfer(batch_id, {req}, first).ok());
+    ASSERT_TRUE(engine.submitTransfer(batch_id, {req}, second).ok());
+
+    fake_rdma->completeOneSuccess(0);
+    TransferStatus status{};
+    ASSERT_TRUE(engine.getTransferStatus(batch_id, status).ok());
+    EXPECT_EQ(status.s, TransferStatusEnum::PENDING);
+    EXPECT_EQ(fake_rdma->status_calls.load(), 0);
+
+    std::vector<Notification> received;
     ASSERT_TRUE(engine.receiveNotification(received).ok());
     ASSERT_EQ(received.size(), 1u);
-    EXPECT_EQ(received[0].msg, "interval-a");
+    EXPECT_EQ(received[0].msg, "first");
+
+    fake_rdma->completeOneSuccess(1);
+    status = {};
+    ASSERT_TRUE(engine.getTransferStatus(batch_id, status).ok());
+    EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
+
+    received.clear();
+    ASSERT_TRUE(engine.receiveNotification(received).ok());
+    ASSERT_EQ(received.size(), 1u);
+    EXPECT_EQ(received[0].msg, "second");
 
     EXPECT_TRUE(engine.freeBatch(batch_id).ok());
     EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), kBufLen).ok());
