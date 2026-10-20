@@ -286,6 +286,6 @@ extra_config:
 | `MC_NOF_WORKERS` | Number of worker threads used to process SPDK NoF I/O operations. | 4 |
 | `MC_NOF_SUBMIT_CHUNK_BYTES` | Size of each I/O operation submitted to SPDK. | 128KB |
 | `MC_NOF_INFLIGHT_BYTES_LIMIT` | Maximum number of in-flight I/O bytes allowed in the system. | 32MB |
-| `MC_NVME_KEEP_ALIVE_TIMEOUT_MS` | Requested NVMe Keep Alive Timeout (KATO) for client controllers, in milliseconds. Accepts 0–3600000; 0 disables keep-alive. | 10000 |
+| `MC_NVME_KEEP_ALIVE_TIMEOUT_MS` | Requested NVMe Keep Alive Timeout (KATO) for client controllers and Master heartbeat probes, in milliseconds. 0 disables keep-alive. | 10000 |
 
 The first three parameters together provide QoS control for SPDK NoF I/O.

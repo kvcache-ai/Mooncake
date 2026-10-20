@@ -20,13 +20,9 @@
 namespace mooncake {
 namespace {
 
-void ApplyCtrlrOptsFromEnv(struct spdk_nvme_ctrlr_opts *opts,
-                           bool enable_keep_alive) {
+void ApplyCtrlrOptsFromEnv(struct spdk_nvme_ctrlr_opts *opts) {
     const auto config = SpdkControllerConfig::FromEnvironment();
-    // Enable Keep Alive only when the owner continuously polls the admin queue.
-    // A configured timeout of zero still disables it.
-    opts->keep_alive_timeout_ms =
-        enable_keep_alive ? config.keep_alive_timeout_ms.value_or(10000) : 0;
+    opts->keep_alive_timeout_ms = config.keep_alive_timeout_ms.value_or(10000);
     if (config.num_io_queues.has_value()) {
         opts->num_io_queues = *config.num_io_queues;
     }
@@ -397,8 +393,7 @@ int SpdkWrapper::ConnectController(const struct spdk_nvme_transport_id *trid,
                                    ctrlr_info *info) {
     auto probe_cb = [](void *cb_ctx, const struct spdk_nvme_transport_id *trid,
                        struct spdk_nvme_ctrlr_opts *opts) -> bool {
-        auto *info = static_cast<ctrlr_info *>(cb_ctx);
-        ApplyCtrlrOptsFromEnv(opts, info->client_managed);
+        ApplyCtrlrOptsFromEnv(opts);
         LOG(INFO) << "Attaching to " << trid->traddr << " " << trid->subnqn;
         return true;
     };
@@ -412,6 +407,8 @@ int SpdkWrapper::ConnectController(const struct spdk_nvme_transport_id *trid,
         info->ctrlr = ctrlr;
     };
 
+    // Initial attach is synchronous. On Master, a slow attach delays heartbeat
+    // probes and Keep Alive polling for existing controllers.
     return spdk_nvme_probe(trid, (void *)info, probe_cb, attach_cb, NULL);
 }
 
@@ -784,6 +781,8 @@ void SpdkWrapper::PollProbeControllers() {
                 // the next heartbeat probe decides whether to reconnect.
                 break;
             case State::Reconnecting: {
+                // Keep Alive must also progress after reconnect re-enables it.
+                spdk_nvme_ctrlr_process_admin_completions(info->ctrlr);
                 int rc = spdk_nvme_ctrlr_reconnect_poll_async(info->ctrlr);
                 if (rc == -EAGAIN) break;
                 std::lock_guard<std::mutex> lock(info->ns_mutex);
@@ -795,7 +794,10 @@ void SpdkWrapper::PollProbeControllers() {
                                  << " rc=" << rc;
                 } else {
                     info->state = State::Ready;
-                    LOG(INFO) << "nof_probe_recovery ready ctrlr=" << info;
+                    LOG(INFO) << "nof_probe_recovery ready ctrlr=" << info
+                              << " keep_alive_timeout_ms="
+                              << spdk_nvme_ctrlr_get_opts(info->ctrlr)
+                                     ->keep_alive_timeout_ms;
                 }
                 break;
             }
