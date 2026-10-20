@@ -467,6 +467,82 @@ TEST_F(RdmaContextReprobeTest, RefreshRetiresOnlyInvalidPeerBindings) {
 #endif
 }
 
+TEST_F(RdmaContextReprobeTest, PeerRecoveryPreservesTransientState) {
+#ifdef __linux__
+    FakeVerbsDeviceScope device(1);
+    const auto initial = makeGid(kCurrentGid);
+    auto fallback = initial;
+    fallback.raw[15] = 0x22;
+    auto third = initial;
+    third.raw[15] = 0x33;
+    fake_verbs.gids = {initial, fallback};
+    RdmaContextTestPeer::seedAutoGidState(*context_, &fake_verbs.context, 1, 23,
+                                          initial, 0);
+    RdmaContextTestPeer::enablePeerGidRecovery(*context_);
+
+    for (const std::string mode : {"refresh", "advisory", "advisory-pending",
+                                   "advisory-budget", "empty"}) {
+        SCOPED_TRACE(mode);
+        fake_verbs.gids = {initial, fallback};
+        if (mode == "advisory-budget") fake_verbs.gids.push_back(third);
+        const std::string peer = mode + ":15365@nic";
+        auto selected = context_->preparePeerGidSelection(peer);
+        uint64_t endpoint = 1;
+        auto fail_twice = [&] {
+            context_->recordAutoGidCompletion(
+                peer, {endpoint++, selected.selection_epoch}, false);
+            context_->recordAutoGidCompletion(
+                peer, {endpoint++, selected.selection_epoch}, false);
+        };
+        fail_twice();
+        if (mode == "empty") {
+            fake_verbs.gids.clear();
+            for (int i = 0; i < 2; ++i) {
+                EXPECT_EQ(
+                    context_->preparePeerGidSelection(peer).selection_epoch,
+                    selected.selection_epoch);
+            }
+            fake_verbs.gids = {initial, fallback};
+            EXPECT_EQ(
+                context_->preparePeerGidSelection(peer).selection.gid_index, 1);
+            continue;
+        }
+        selected = context_->preparePeerGidSelection(peer);
+        ASSERT_EQ(selected.selection.gid_index, 1);
+        fail_twice();
+        if (mode != "advisory-pending" && mode != "advisory-budget") {
+            selected = context_->preparePeerGidSelection(peer);
+            ASSERT_EQ(context_->recordAutoGidCompletion(
+                          peer, {endpoint++, selected.selection_epoch}, false),
+                      AutoGidDataPathAction::kExhausted);
+        }
+        if (mode == "refresh") {
+            EXPECT_EQ(context_->refreshCurrentGid(),
+                      GidRefreshResult::UNCHANGED);
+            fail_twice();
+            EXPECT_EQ(context_->preparePeerGidSelection(peer).selection_epoch,
+                      selected.selection_epoch);
+        } else {
+            context_->rememberPeerAdvertisedGid(peer, "remote-gid");
+            auto next =
+                context_->preparePeerGidSelection(peer, selected.selection.gid);
+            EXPECT_EQ(next.selection.gid_index,
+                      mode == "advisory-budget" ? 2 : 0);
+            EXPECT_NE(next.selection_epoch, selected.selection_epoch);
+            EXPECT_EQ(next.auto_gid_reprobe_from,
+                      mode == "advisory-budget" ? "remote-gid" : "");
+            EXPECT_EQ(
+                context_->preparePeerGidSelection(peer, selected.selection.gid)
+                    .selection_epoch,
+                next.selection_epoch);
+        }
+    }
+    RdmaContextTestPeer::disableContextForTeardown(*context_);
+#else
+    GTEST_SKIP() << "Requires Linux libibverbs symbol interposition";
+#endif
+}
+
 // Regression tests for the HCA-index / context_list_ alignment invariant.
 // An HCA's id is its position in getHcaList(), and disableDevice() keeps the
 // surviving ids there. initializeRdmaResources() used to append a context only

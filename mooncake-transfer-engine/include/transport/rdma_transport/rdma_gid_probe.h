@@ -138,9 +138,8 @@ class PeerAutoGidStateTable {
                    advisory_from == default_selection.gid;
         }
         const State& state = iter->second;
-        return !state.exhausted &&
-               (state.advance_pending ||
-                (!advisory_from.empty() && advisory_from == state.current.gid));
+        return (!state.exhausted && state.advance_pending) ||
+               (!advisory_from.empty() && advisory_from == state.current.gid);
     }
 
     AutoGidDataPathAction recordCompletion(
@@ -212,14 +211,13 @@ class PeerAutoGidStateTable {
         std::lock_guard<std::mutex> guard(mutex_);
         std::vector<std::string> invalidated;
         for (auto& [peer, state] : states_) {
-            // A successful fresh scan renews the budget. Keep pending local
-            // requests and their advisory until prepare consumes them.
-            state.remaining_advances = max_advances_;
-            state.exhausted = false;
-            state.first_failed_endpoint_id = 0;
-            state.recovery_active = state.advance_pending;
             const auto* rebound = findByGid(candidates, state.current.gid);
             if (!rebound || rebound->gid_index != state.current.gid_index) {
+                // Only a changed binding starts a new recovery cycle.
+                state.remaining_advances = max_advances_;
+                state.exhausted = false;
+                state.first_failed_endpoint_id = 0;
+                state.recovery_active = state.advance_pending;
                 state.selection_epoch = nextSelectionEpoch();
                 invalidated.push_back(peer);
             }
@@ -309,11 +307,19 @@ class PeerAutoGidStateTable {
         bool should_advance = state.advance_pending;
         bool locally_requested = state.advance_requested_locally;
 
-        if (!advisory_from.empty() && advisory_from == state.current.gid) {
+        const bool matching_advisory =
+            !advisory_from.empty() && advisory_from == state.current.gid;
+        if (matching_advisory) {
             should_advance = true;
         }
 
-        if (should_advance && candidates && !state.exhausted) {
+        if (should_advance && candidates && !candidates->empty() &&
+            (!state.exhausted || matching_advisory)) {
+            // A peer may need us to follow its move after local recovery ended.
+            if (matching_advisory && state.remaining_advances == 0) {
+                state.remaining_advances = 1;
+                locally_requested = false;
+            }
             state.recovery_active = true;
             const AutoGidSelection* next = nullptr;
             // Visit each alternative at most once per recovery cycle. A
