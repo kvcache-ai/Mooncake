@@ -51,15 +51,16 @@ class AllocatorManager {
     std::shared_ptr<SegmentAllocatorRegistration> addAllocator(
         const std::string& name,
         const std::shared_ptr<BufferAllocatorBase>& allocator) {
-        return addAllocator(name, allocator, nullptr);
+        return addAllocator(name, allocator, std::string(), nullptr);
     }
 
     std::shared_ptr<SegmentAllocatorRegistration> addAllocator(
         const std::string& name,
         const std::shared_ptr<BufferAllocatorBase>& allocator,
+        const std::string& host,
         std::shared_ptr<ClientLivenessRecord> client_liveness) {
         auto registration = std::shared_ptr<SegmentAllocatorRegistration>(
-            new SegmentAllocatorRegistration(allocator,
+            new SegmentAllocatorRegistration(allocator, host,
                                              std::move(client_liveness)));
         addRegistration(name, registration);
         return registration;
@@ -132,15 +133,36 @@ class AllocatorManager {
     }
 
     AllocatorManager Snapshot(
-        const std::unordered_map<std::string, UUID>* owners = nullptr) const {
+        const std::unordered_map<std::string, UUID>* owners = nullptr,
+        bool avoid_same_host = false) const {
         AllocatorManager snapshot;
         snapshot.names_ = names_;
         snapshot.allocators_ = allocators_;
         if (owners) {
             snapshot.owner_by_name_ = *owners;
         }
+        snapshot.avoid_same_host_ = avoid_same_host;
         return snapshot;
     }
+
+    // Returns the host id that owns segment `name`, or an empty string when the
+    // host is unknown. Allocation strategies use it, together with
+    // AvoidSameHost(), to keep two replicas of the same object off one host; an
+    // empty result skips that check for the segment. The host rides on the
+    // segment's registration, so it costs nothing extra to snapshot -- the
+    // snapshot copies shared_ptrs, not the registration objects themselves.
+    [[nodiscard]] const std::string& GetHost(const std::string& name) const {
+        static const std::string kEmpty;
+        auto it = allocators_.find(name);
+        if (it == allocators_.end() || it->second.empty()) {
+            return kEmpty;
+        }
+        return it->second.front()->Host();
+    }
+
+    // Whether allocation should keep an object's replicas on different hosts.
+    // Set per-request when a snapshot is taken; false on the live manager.
+    [[nodiscard]] bool AvoidSameHost() const { return avoid_same_host_; }
 
     [[nodiscard]] std::optional<UUID> GetOwnerClientId(
         const std::string& name) const {
@@ -203,6 +225,11 @@ class AllocatorManager {
         std::string, std::vector<std::shared_ptr<SegmentAllocatorRegistration>>>
         allocators_;
     std::unordered_map<std::string, UUID> owner_by_name_;
+    // Whether allocation should avoid placing an object's replicas on the same
+    // host. Set per-request on snapshots (from ReplicateConfig's
+    // avoid_replicas_on_same_host); false on the live manager, so non-snapshot
+    // paths skip the check.
+    bool avoid_same_host_{false};
     friend class ScopedSegmentAccess;
     friend class SegmentSerializer;
 };
@@ -319,83 +346,52 @@ class RandomAllocationStrategy : public AllocationStrategy {
             return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
         }
 
-        std::vector<Replica> replicas;
-        replicas.reserve(replica_num);
+        PlacementState state;
+        state.replicas.reserve(replica_num);
 
-        // Fast path: single segment case
-        if (names.size() == 1) {
-            if (excluded_segments.contains(names[0])) {
-                return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
-            }
-
-            auto buffer =
-                allocateSingle(allocator_manager, names[0], slice_length);
-            if (buffer) {
-                replicas.emplace_back(std::move(buffer),
-                                      ReplicaStatus::PROCESSING, replica_type);
-                return replicas;
-            }
-            return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
-        }
-
-        std::set<std::string> used_segments;
-
-        // Try preferred segments first if specified
-        for (auto& preferred_segment : preferred_segments) {
-            if (excluded_segments.contains(preferred_segment) ||
-                used_segments.contains(preferred_segment)) {
-                // Skip excluded and used segments
-                continue;
-            }
-
-            auto buffer = allocateSingle(allocator_manager, preferred_segment,
-                                         slice_length);
-            if (buffer) {
-                replicas.emplace_back(std::move(buffer),
-                                      ReplicaStatus::PROCESSING, replica_type);
-                if (replicas.size() == replica_num) {
-                    return replicas;
+        // One pass tries preferred segments first, then a random sweep over all
+        // serving segments (random start so allocations spread across the
+        // cluster). avoid_used_host controls whether a host that already holds
+        // a replica of this object is skipped.
+        auto run_pass = [&](bool avoid_used_host) {
+            for (const auto& preferred_segment : preferred_segments) {
+                if (TryPlaceReplica(allocator_manager, preferred_segment,
+                                    slice_length, replica_num, replica_type,
+                                    avoid_used_host, excluded_segments,
+                                    state)) {
+                    return;
                 }
-
-                // Add preferred segment to used_segments on allocation success
-                used_segments.insert(preferred_segment);
             }
+            const size_t start_idx = randomIndex(names.size());
+            const size_t max_retry = std::min(kMaxRetryLimit, names.size());
+            for (size_t i = 0; i < max_retry; ++i) {
+                if (TryPlaceReplica(allocator_manager,
+                                    names[(start_idx + i) % names.size()],
+                                    slice_length, replica_num, replica_type,
+                                    avoid_used_host, excluded_segments,
+                                    state)) {
+                    return;
+                }
+            }
+        };
+
+        // Pass 1 keeps the replicas on different hosts when the caller opted in
+        // (AvoidSameHost()). Pass 2 runs only if pass 1 fell short, and drops
+        // the check so the number of replicas placed is never lower than
+        // before. When the caller did not opt in (the live manager, or
+        // avoid_replicas_on_same_host=false), only pass 1 runs with the check
+        // off -- behaviour identical to the previous single-pass version.
+        const bool avoid_same_host = allocator_manager.AvoidSameHost();
+        run_pass(/*avoid_used_host=*/avoid_same_host);
+        if (state.replicas.size() < replica_num && avoid_same_host) {
+            run_pass(/*avoid_used_host=*/false);
         }
 
-        // If replica_num is not satisfied, allocate the remaining replicas
-        // randomly.
-        size_t start_idx = randomIndex(names.size());
-
-        const size_t max_retry = std::min(kMaxRetryLimit, names.size());
-        size_t try_count = 0;
-
-        while (replicas.size() < replica_num && try_count < max_retry) {
-            auto index = start_idx % names.size();
-            start_idx++;
-            try_count++;
-
-            // Skip excluded and used segments
-            if (excluded_segments.contains(names[index]) ||
-                used_segments.contains(names[index])) {
-                continue;
-            }
-
-            auto buffer =
-                allocateSingle(allocator_manager, names[index], slice_length);
-            if (buffer) {
-                replicas.emplace_back(std::move(buffer),
-                                      ReplicaStatus::PROCESSING, replica_type);
-                // Nit: no need to insert names[index] into used_segments here
-                // because we only traverse all names once, thus there is no
-                // chance to try allocating from a segment for the second time.
-            }
-        }
-
-        // Return allocated replicas (may be fewer than requested)
-        if (replicas.empty()) {
+        // Return allocated replicas (may be fewer than requested).
+        if (state.replicas.empty()) {
             return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
         }
-        return replicas;
+        return std::move(state.replicas);
     }
 
     tl::expected<Replica, ErrorCode> AllocateFrom(
@@ -449,6 +445,54 @@ class RandomAllocationStrategy : public AllocationStrategy {
         return nullptr;
     }
 
+   protected:
+    // Mutable placement state threaded through a single Allocate call: the
+    // replicas built so far and the segments/hosts already used by this object
+    // (for distinct-segment and distinct-host dedup).
+    struct PlacementState {
+        std::vector<Replica> replicas;
+        std::set<std::string> used_segments;
+        std::set<std::string> used_hosts;
+    };
+
+    // Try to place one replica of `slice_length` on segment `name`. The segment
+    // is skipped if it is excluded, already used by this object, or -- when
+    // avoid_used_host is true -- sits on a host that already holds one of this
+    // object's replicas (so replicas spread across hosts). Distinct segments
+    // are always guaranteed. On success the replica is appended and its segment
+    // and host recorded. Returns true once `replica_num` replicas are placed.
+    bool TryPlaceReplica(const AllocatorManager& allocator_manager,
+                         const std::string& name, const size_t slice_length,
+                         const size_t replica_num,
+                         const ReplicaType replica_type,
+                         const bool avoid_used_host,
+                         const std::set<std::string>& excluded_segments,
+                         PlacementState& state) {
+        if (state.replicas.size() >= replica_num) {
+            return true;
+        }
+        if (excluded_segments.contains(name) ||
+            state.used_segments.contains(name)) {
+            return false;
+        }
+        const std::string& host = allocator_manager.GetHost(name);
+        if (avoid_used_host && !host.empty() &&
+            state.used_hosts.contains(host)) {
+            return false;
+        }
+        auto buffer = allocateSingle(allocator_manager, name, slice_length);
+        if (!buffer) {
+            return false;
+        }
+        state.replicas.emplace_back(std::move(buffer),
+                                    ReplicaStatus::PROCESSING, replica_type);
+        state.used_segments.insert(name);
+        if (!host.empty()) {
+            state.used_hosts.insert(host);
+        }
+        return state.replicas.size() >= replica_num;
+    }
+
    private:
     static constexpr size_t kMaxRetryLimit = 100;
 };
@@ -476,93 +520,84 @@ class RankedAllocationStrategy : public RandomAllocationStrategy {
             return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
         }
 
-        std::vector<Replica> replicas;
-        replicas.reserve(replica_num);
-        std::set<std::string> used_segments;
+        PlacementState state;
+        state.replicas.reserve(replica_num);
 
-        for (const auto& preferred_segment : preferred_segments) {
-            if (excluded_segments.contains(preferred_segment) ||
-                used_segments.contains(preferred_segment)) {
-                continue;
-            }
-            auto buffer = allocateSingle(allocator_manager, preferred_segment,
-                                         slice_length);
-            if (buffer) {
-                replicas.emplace_back(std::move(buffer),
-                                      ReplicaStatus::PROCESSING, replica_type);
-                used_segments.insert(preferred_segment);
-                if (replicas.size() == replica_num) {
-                    return replicas;
+        // One pass: preferred segments first, then the highest-scored sampled
+        // candidates, then a random fallback sweep. avoid_used_host controls
+        // whether a host that already holds a replica of this object is
+        // skipped.
+        auto run_pass = [&](bool avoid_used_host) {
+            for (const auto& preferred_segment : preferred_segments) {
+                if (TryPlaceReplica(allocator_manager, preferred_segment,
+                                    slice_length, replica_num, replica_type,
+                                    avoid_used_host, excluded_segments,
+                                    state)) {
+                    return;
                 }
             }
-        }
 
-        const size_t remaining = replica_num - replicas.size();
-        const size_t sample_count =
-            std::min(kCandidateMultiplier * remaining, names.size());
-        const size_t start_idx = randomIndex(names.size());
+            const size_t remaining = replica_num - state.replicas.size();
+            const size_t sample_count =
+                std::min(kCandidateMultiplier * remaining, names.size());
+            const size_t start_idx = randomIndex(names.size());
 
-        struct Candidate {
-            size_t name_idx;
-            double score;
+            struct Candidate {
+                size_t name_idx;
+                double score;
+            };
+            std::vector<Candidate> candidates;
+            candidates.reserve(sample_count);
+            for (size_t i = 0; i < sample_count; ++i) {
+                const size_t idx = (start_idx + i) % names.size();
+                const auto& name = names[idx];
+                if (excluded_segments.contains(name) ||
+                    state.used_segments.contains(name)) {
+                    continue;
+                }
+                candidates.push_back({idx, score(name)});
+            }
+
+            std::sort(candidates.begin(), candidates.end(),
+                      [](const Candidate& lhs, const Candidate& rhs) {
+                          return lhs.score > rhs.score;
+                      });
+            for (const auto& candidate : candidates) {
+                if (TryPlaceReplica(allocator_manager,
+                                    names[candidate.name_idx], slice_length,
+                                    replica_num, replica_type, avoid_used_host,
+                                    excluded_segments, state)) {
+                    return;
+                }
+            }
+
+            const size_t fallback_start = randomIndex(names.size());
+            const size_t max_retry = std::min(kMaxRetryLimit, names.size());
+            for (size_t i = 0; i < max_retry; ++i) {
+                if (TryPlaceReplica(allocator_manager,
+                                    names[(fallback_start + i) % names.size()],
+                                    slice_length, replica_num, replica_type,
+                                    avoid_used_host, excluded_segments,
+                                    state)) {
+                    return;
+                }
+            }
         };
-        std::vector<Candidate> candidates;
-        candidates.reserve(sample_count);
-        for (size_t i = 0; i < sample_count; ++i) {
-            const size_t idx = (start_idx + i) % names.size();
-            const auto& name = names[idx];
-            if (excluded_segments.contains(name) ||
-                used_segments.contains(name)) {
-                continue;
-            }
-            candidates.push_back({idx, score(name)});
+
+        // Pass 1 keeps the replicas on different hosts when the caller opted in
+        // (AvoidSameHost()). Pass 2 runs only if pass 1 fell short and drops
+        // the check, so the number of replicas placed is never lower than
+        // before.
+        const bool avoid_same_host = allocator_manager.AvoidSameHost();
+        run_pass(avoid_same_host);
+        if (state.replicas.size() < replica_num && avoid_same_host) {
+            run_pass(/*avoid_used_host=*/false);
         }
 
-        std::sort(candidates.begin(), candidates.end(),
-                  [](const Candidate& lhs, const Candidate& rhs) {
-                      return lhs.score > rhs.score;
-                  });
-        for (const auto& candidate : candidates) {
-            if (replicas.size() >= replica_num) {
-                break;
-            }
-            const auto& name = names[candidate.name_idx];
-            auto buffer = allocateSingle(allocator_manager, name, slice_length);
-            if (buffer) {
-                replicas.emplace_back(std::move(buffer),
-                                      ReplicaStatus::PROCESSING, replica_type);
-                used_segments.insert(name);
-            }
-        }
-
-        if (replicas.size() >= replica_num) {
-            return replicas;
-        }
-
-        size_t fallback_idx = randomIndex(names.size());
-        const size_t max_retry = std::min(kMaxRetryLimit, names.size());
-        size_t try_count = 0;
-        while (replicas.size() < replica_num && try_count < max_retry) {
-            const size_t index = fallback_idx % names.size();
-            ++fallback_idx;
-            ++try_count;
-            const auto& name = names[index];
-            if (excluded_segments.contains(name) ||
-                used_segments.contains(name)) {
-                continue;
-            }
-            auto buffer = allocateSingle(allocator_manager, name, slice_length);
-            if (buffer) {
-                replicas.emplace_back(std::move(buffer),
-                                      ReplicaStatus::PROCESSING, replica_type);
-                used_segments.insert(name);
-            }
-        }
-
-        if (replicas.empty()) {
+        if (state.replicas.empty()) {
             return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
         }
-        return replicas;
+        return std::move(state.replicas);
     }
 
    private:

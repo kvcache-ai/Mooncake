@@ -320,8 +320,13 @@ class ScopedAllocatorAccess {
         return allocator_manager_;
     }
 
-    AllocatorManager SnapshotAllocatorManager() const {
-        return allocator_manager_.Snapshot(client_by_name_);
+    AllocatorManager SnapshotAllocatorManager(
+        bool avoid_same_host = false) const {
+        // Per-segment host info rides on each registration (copied as a
+        // shared_ptr by Snapshot), so there is nothing to rebuild here per
+        // request. avoid_same_host gates whether allocation enforces host
+        // anti-affinity for this request.
+        return allocator_manager_.Snapshot(client_by_name_, avoid_same_host);
     }
 
     std::vector<std::string> GetHostOrderedSegments(

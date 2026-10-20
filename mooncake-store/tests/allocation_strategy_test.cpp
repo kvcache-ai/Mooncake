@@ -39,6 +39,39 @@ class AllocationStrategyTest : public ::testing::Test {
         strategy_ = std::make_unique<RandomAllocationStrategy>();
     }
 
+    // Builds a manager with two segments on hostA (segA1, segA2) and one on
+    // hostB (segB1), with the host carried on each registration. This is the
+    // layout that used to defeat host-blind placement: two replicas could both
+    // land on hostA's two segments.
+    static AllocatorManager MakeTwoHostManager() {
+        constexpr size_t kSize = 64 * MiB;
+        auto seg_a1 =
+            CreateBufferAllocator(BufferAllocatorType::CACHELIB, "segA1",
+                                  0x100000000ULL, kSize, "segA1");
+        auto seg_a2 =
+            CreateBufferAllocator(BufferAllocatorType::CACHELIB, "segA2",
+                                  0x200000000ULL, kSize, "segA2");
+        auto seg_b1 =
+            CreateBufferAllocator(BufferAllocatorType::CACHELIB, "segB1",
+                                  0x300000000ULL, kSize, "segB1");
+        EXPECT_TRUE(seg_a1.has_value());
+        EXPECT_TRUE(seg_a2.has_value());
+        EXPECT_TRUE(seg_b1.has_value());
+
+        AllocatorManager mgr;
+        mgr.addAllocator("segA1", *seg_a1, "hostA", nullptr);
+        mgr.addAllocator("segA2", *seg_a2, "hostA", nullptr);
+        mgr.addAllocator("segB1", *seg_b1, "hostB", nullptr);
+        return mgr;
+    }
+
+    // Host of each segment created by MakeTwoHostManager(), for assertions.
+    static std::string HostOfSegment(const std::string& name) {
+        if (name == "segA1" || name == "segA2") return "hostA";
+        if (name == "segB1") return "hostB";
+        return "";
+    }
+
     std::unique_ptr<RandomAllocationStrategy> strategy_;
 };
 
@@ -123,6 +156,121 @@ TEST_F(AllocationStrategyTest, PreferredSegmentWithEmptyAllocators) {
     EXPECT_EQ(result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
 }
 
+// With two segments on one host (segA1, segA2) and one on another (segB1), a
+// 2-replica allocation opted in to host anti-affinity must land on two
+// different hosts, so losing a single host cannot take down both copies.
+// Before host-aware placement the two replicas could both land on the first
+// host's two segments, because placement only guaranteed distinct segments.
+TEST_F(AllocationStrategyTest, SpreadsReplicasAcrossHosts) {
+    AllocatorManager mgr = MakeTwoHostManager();
+    const AllocatorManager snapshot =
+        mgr.Snapshot(/*owners=*/nullptr, /*avoid_same_host=*/true);
+
+    // Repeat so the random start point cannot accidentally pass: the two
+    // replicas must always span both hosts, never both land on hostA.
+    for (int iter = 0; iter < 50; ++iter) {
+        auto result = strategy_->Allocate(snapshot, /*slice_length=*/1024,
+                                          /*replica_num=*/2, {}, {});
+        ASSERT_TRUE(result.has_value());
+        ASSERT_EQ(result.value().size(), 2u);
+
+        std::set<std::string> hosts;
+        for (const auto& replica : result.value()) {
+            for (const auto& name_ptr : replica.get_segment_names()) {
+                if (!name_ptr) continue;
+                const std::string host = HostOfSegment(*name_ptr);
+                ASSERT_FALSE(host.empty());
+                hosts.insert(host);
+            }
+        }
+        EXPECT_EQ(hosts.size(), 2u)
+            << "replicas must span two distinct hosts (iter " << iter << ")";
+    }
+}
+
+// Opting out (avoid_same_host=false) keeps only the distinct-segment
+// guarantee, so over many iterations a 2-replica allocation is allowed to land
+// on hostA's two segments at least once.
+TEST_F(AllocationStrategyTest, AllowsSameHostWhenOptedOut) {
+    AllocatorManager mgr = MakeTwoHostManager();
+    const AllocatorManager snapshot =
+        mgr.Snapshot(/*owners=*/nullptr, /*avoid_same_host=*/false);
+
+    bool saw_single_host = false;
+    for (int iter = 0; iter < 200 && !saw_single_host; ++iter) {
+        auto result = strategy_->Allocate(snapshot, /*slice_length=*/1024,
+                                          /*replica_num=*/2, {}, {});
+        ASSERT_TRUE(result.has_value());
+        ASSERT_EQ(result.value().size(), 2u);
+
+        std::set<std::string> hosts;
+        for (const auto& replica : result.value()) {
+            for (const auto& name_ptr : replica.get_segment_names()) {
+                if (!name_ptr) continue;
+                hosts.insert(HostOfSegment(*name_ptr));
+            }
+        }
+        if (hosts.size() == 1u) saw_single_host = true;
+    }
+    EXPECT_TRUE(saw_single_host)
+        << "opt-out should allow both replicas on one host's two segments";
+}
+
+// Even with host anti-affinity on, a single-host cluster must still get the
+// requested replica count: pass 2 drops the check so the count is never
+// reduced below the host-blind behaviour.
+TEST_F(AllocationStrategyTest, FallsBackToSameHostWhenSingleHost) {
+    constexpr size_t kSize = 64 * MiB;
+    auto seg_a1 = CreateBufferAllocator(BufferAllocatorType::CACHELIB, "segA1",
+                                        0x100000000ULL, kSize, "segA1");
+    auto seg_a2 = CreateBufferAllocator(BufferAllocatorType::CACHELIB, "segA2",
+                                        0x200000000ULL, kSize, "segA2");
+    ASSERT_TRUE(seg_a1.has_value());
+    ASSERT_TRUE(seg_a2.has_value());
+
+    AllocatorManager mgr;
+    mgr.addAllocator("segA1", *seg_a1, "hostA", nullptr);
+    mgr.addAllocator("segA2", *seg_a2, "hostA", nullptr);
+    const AllocatorManager snapshot =
+        mgr.Snapshot(/*owners=*/nullptr, /*avoid_same_host=*/true);
+
+    auto result = strategy_->Allocate(snapshot, /*slice_length=*/1024,
+                                      /*replica_num=*/2, {}, {});
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result.value().size(), 2u)
+        << "replica count must not drop just because only one host exists";
+}
+
+// The FreeRatioFirst strategy goes through RankedAllocationStrategy::
+// AllocateRanked, a different code path than Random. It must also keep an
+// object's replicas on different hosts when host anti-affinity is opted in.
+TEST_F(AllocationStrategyTest, FreeRatioFirstSpreadsReplicasAcrossHosts) {
+    AllocatorManager mgr = MakeTwoHostManager();
+    const AllocatorManager snapshot =
+        mgr.Snapshot(/*owners=*/nullptr, /*avoid_same_host=*/true);
+
+    FreeRatioFirstAllocationStrategy strategy;
+    for (int iter = 0; iter < 50; ++iter) {
+        auto result = strategy.Allocate(snapshot, /*slice_length=*/1024,
+                                        /*replica_num=*/2, {}, {});
+        ASSERT_TRUE(result.has_value());
+        ASSERT_EQ(result.value().size(), 2u);
+
+        std::set<std::string> hosts;
+        for (const auto& replica : result.value()) {
+            for (const auto& name_ptr : replica.get_segment_names()) {
+                if (!name_ptr) continue;
+                const std::string host = HostOfSegment(*name_ptr);
+                ASSERT_FALSE(host.empty());
+                hosts.insert(host);
+            }
+        }
+        EXPECT_EQ(hosts.size(), 2u)
+            << "FreeRatioFirst replicas must span two distinct hosts (iter "
+            << iter << ")";
+    }
+}
+
 TEST_F(AllocationStrategyTest, SuspectedRegistrationIsSkipped) {
     const auto initial = ClientLivenessRecord::TimePoint{};
     auto suspected = std::make_shared<ClientLivenessRecord>(initial);
@@ -137,8 +285,9 @@ TEST_F(AllocationStrategyTest, SuspectedRegistrationIsSkipped) {
     auto active_allocator = std::make_shared<OffsetBufferAllocator>(
         "shared", DEFAULT_CXL_BASE + 64 * MiB, 64 * MiB, "active");
     AllocatorManager allocator_manager;
-    allocator_manager.addAllocator("shared", suspected_allocator, suspected);
-    allocator_manager.addAllocator("shared", active_allocator, active);
+    allocator_manager.addAllocator("shared", suspected_allocator, "",
+                                   suspected);
+    allocator_manager.addAllocator("shared", active_allocator, "", active);
 
     // No SSD usage is registered: the SSD strategy still picks the serving
     // registration.
