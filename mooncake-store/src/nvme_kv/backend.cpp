@@ -17,6 +17,8 @@
 #include <utility>
 #include <vector>
 
+#include <glog/logging.h>
+
 #include "config/executor_config.h"
 #include "config/io_concurrency_config.h"
 #include "nvme_kv/executor_util.h"
@@ -27,8 +29,6 @@
 namespace mooncake {
 
 namespace {
-
-constexpr uint32_t kMinMaxValueSize = sizeof(NvmeKvObjectHeader) + 1;
 
 class IndexQueue {
    public:
@@ -75,7 +75,7 @@ bool CanRetrieveDirectlyInto(const char *data, uint32_t size) {
            reinterpret_cast<uintptr_t>(data) % alignment == 0;
 }
 
-std::string_view BuildPayloadView(const std::vector<Slice> &slices,
+std::string_view BuildPayloadView(std::span<const Slice> slices,
                                   size_t payload_size, std::string &storage) {
     if (slices.size() == 1) {
         const auto &slice = slices.front();
@@ -96,7 +96,7 @@ size_t ReadPlanBatchSize() {
 }
 
 std::optional<std::vector<size_t>> ValidateChunkRecords(
-    const NvmeKvObjectIdentity &identity, uint32_t slot,
+    const NvmeKvObjectPolicy &policy, const NvmeKvObjectKey &key, uint32_t slot,
     size_t expected_payload_size,
     const std::vector<NvmeKvManifestChunkRecord> &records) {
     if (records.empty()) {
@@ -110,8 +110,8 @@ std::optional<std::vector<size_t>> ValidateChunkRecords(
         if (record.payload_size == 0 || offset > expected_payload_size ||
             record.payload_size > expected_payload_size - offset ||
             record.physical_key !=
-                EncodeNvmeKvChunkPhysicalKey(
-                    identity, static_cast<uint32_t>(index), slot)) {
+                policy.EncodePhysicalKey(key, slot,
+                                         static_cast<uint32_t>(index) + 1)) {
             return std::nullopt;
         }
         offsets.push_back(offset);
@@ -138,13 +138,17 @@ bool ManifestChunkRecordsEqual(
     return true;
 }
 
-struct ResolvedRoot {
-    NvmeKvPhysicalKey physical_key{};
-    uint32_t slot = 0;
-    std::string object_blob;
-};
+tl::expected<size_t, ErrorCode> SliceBytes(std::span<const Slice> slices) {
+    size_t total = 0;
+    for (const auto &slice : slices) {
+        if ((slice.size && !slice.ptr) || slice.size > SIZE_MAX - total)
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        total += slice.size;
+    }
+    return total;
+}
 
-tl::expected<std::optional<ResolvedRoot>, ErrorCode> ResolveRoot(
+tl::expected<NvmeKvResolvedRoot, ErrorCode> ResolveRoot(
     NvmeKvConnector &connector, const std::string &logical_key) {
     const NvmeKvObjectIdentity identity{.logical_key = logical_key};
     for (uint32_t slot = 0; slot < kNvmeKvMaxPhysicalKeySlots; ++slot) {
@@ -157,39 +161,196 @@ tl::expected<std::optional<ResolvedRoot>, ErrorCode> ResolveRoot(
             return tl::make_unexpected(object_res.error());
         }
 
-        NvmeKvObjectHeader header{};
-        std::string_view identity_metadata;
-        std::string_view payload;
-        if (!ParseNvmeKvObjectBlob(object_res.value(), header,
-                                   identity_metadata, payload)) {
+        auto root = DecodeNvmeKvReadRoot(std::move(*object_res));
+        if (!root) {
             return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
         }
-
-        NvmeKvStoredIdentityView stored_identity{};
-        if (!ParseNvmeKvStoredIdentity(identity_metadata, stored_identity)) {
-            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
-        }
-        if (stored_identity.logical_key != logical_key) {
+        if (root->identity.logical_key != logical_key) {
             continue;
         }
-        if (stored_identity.resolved_slot != slot ||
-            !NvmeKvKeyConflictPolicy::ValidateResolvedRootPlacement(
-                identity, stored_identity, physical_key)) {
-            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
-        }
-        return std::optional<ResolvedRoot>(
-            ResolvedRoot{physical_key, slot, std::move(object_res.value())});
+
+        return NvmeKvResolvedRoot{physical_key, slot, std::move(*root)};
     }
-    return std::nullopt;
+    return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+}
+
+class LocalNvmeKvPolicy final : public NvmeKvObjectPolicy {
+   public:
+    NvmeKvPhysicalKey EncodePhysicalKey(const NvmeKvObjectKey &key,
+                                        uint32_t slot,
+                                        uint32_t part_index) const override {
+        const NvmeKvObjectIdentity identity{key.logical_key};
+        if (part_index == 0) {
+            return EncodeNvmeKvPhysicalKey(identity, slot);
+        }
+        return EncodeNvmeKvChunkPhysicalKey(identity, part_index - 1, slot);
+    }
+
+    tl::expected<NvmeKvWritePlan, ErrorCode> PrepareWrite(
+        const NvmeKvObjectKey &key, std::string_view payload,
+        uint32_t value_limit) const override {
+        return PrepareWriteAtSlot(key, payload, value_limit, 0);
+    }
+
+    tl::expected<NvmeKvReadRoot, ErrorCode> ReadRoot(
+        NvmeKvConnector &connector, const NvmeKvObjectKey &key,
+        std::optional<uint64_t> expected_payload_size) const override;
+
+    tl::expected<NvmeKvPutResult, ErrorCode> HandleWriteFailure(
+        NvmeKvConnector &connector, const NvmeKvObjectKey &key,
+        std::string_view payload, NvmeKvWriteAttempt &attempt) const override;
+
+    void AbortWrite(NvmeKvConnector &connector,
+                    NvmeKvWriteAttempt &attempt) const noexcept override {
+        if (!attempt.write_plan) {
+            return;
+        }
+
+        const auto delete_key = [&](const NvmeKvPhysicalKey &key) {
+            try {
+                auto result = connector.Delete(key);
+                if (!result && result.error() != ErrorCode::OBJECT_NOT_FOUND) {
+                    LOG(WARNING) << "NVMe KV failed to clean local value for "
+                                 << attempt.write_plan->identity.logical_key
+                                 << " error=" << toString(result.error());
+                }
+            } catch (const std::exception &error) {
+                LOG(WARNING)
+                    << "NVMe KV abort cleanup failed: " << error.what();
+            } catch (...) {
+                LOG(WARNING) << "NVMe KV abort cleanup failed";
+            }
+        };
+        if (attempt.root_written) {
+            delete_key(attempt.write_plan->root_key);
+        }
+        for (const auto &key : attempt.written_chunk_keys) {
+            delete_key(key);
+        }
+        attempt.root_written = false;
+        attempt.written_chunk_keys.clear();
+    }
+
+   private:
+    tl::expected<NvmeKvWritePlan, ErrorCode> PrepareWriteAtSlot(
+        const NvmeKvObjectKey &key, std::string_view payload,
+        uint32_t value_limit, uint32_t slot) const {
+        const NvmeKvObjectIdentity identity{key.logical_key};
+        return BuildNvmeKvWritePlan(
+            identity, payload, value_limit,
+            {EncodePhysicalKey(key, slot, 0), slot, [&](uint32_t index) {
+                 return EncodePhysicalKey(key, slot, index + 1);
+             }});
+    }
+};
+
+tl::expected<NvmeKvReadRoot, ErrorCode> LocalNvmeKvPolicy::ReadRoot(
+    NvmeKvConnector &connector, const NvmeKvObjectKey &key,
+    std::optional<uint64_t> expected_payload_size) const {
+    auto resolved = ResolveRoot(connector, key.logical_key);
+    if (!resolved) {
+        return tl::make_unexpected(resolved.error());
+    }
+
+    auto validation_res = ValidateNvmeKvReadRoot(
+        {key.logical_key}, resolved->physical_key, resolved->slot,
+        expected_payload_size, resolved->root);
+    if (!validation_res) {
+        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    }
+
+    return std::move(resolved->root);
 }
 
 }  // namespace
+
+tl::expected<NvmeKvReadRoot, ErrorCode> DecodeNvmeKvReadRoot(std::string blob) {
+    NvmeKvReadRoot root;
+    root.blob = std::move(blob);
+    std::string_view identity_blob;
+    std::string_view payload;
+    if (!ParseNvmeKvObjectBlob(root.blob, root.header, identity_blob,
+                               payload) ||
+        !ParseNvmeKvStoredIdentity(identity_blob, root.identity)) {
+        return tl::make_unexpected(ErrorCode::CHECKSUM_MISMATCH);
+    }
+    return root;
+}
+
+tl::expected<void, ErrorCode> ValidateNvmeKvReadRoot(
+    const NvmeKvObjectIdentity &identity, const NvmeKvPhysicalKey &expected_key,
+    uint32_t expected_slot, std::optional<uint64_t> expected_payload_size,
+    NvmeKvReadRoot &root, std::optional<NvmeKvObjectType> expected_type) {
+    const auto &header = root.header;
+    const auto &stored_identity_view = root.identity;
+    if (stored_identity_view.logical_key != identity.logical_key ||
+        stored_identity_view.resolved_physical_key != expected_key ||
+        stored_identity_view.resolved_slot != expected_slot) {
+        return tl::make_unexpected(ErrorCode::INVALID_KEY);
+    }
+
+    const auto object_type = static_cast<NvmeKvObjectType>(header.object_type);
+    if (expected_type && object_type != *expected_type) {
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+    if (!expected_payload_size) {
+        return {};
+    }
+
+    const std::string_view payload_view = root.Payload();
+    const uint32_t expected_identity_size =
+        ComputeNvmeKvStoredIdentityMetadataSize(identity);
+    if (object_type == NvmeKvObjectType::kInline) {
+        if (!ValidateNvmeKvHeader(header, identity, expected_identity_size,
+                                  static_cast<uint32_t>(*expected_payload_size),
+                                  NvmeKvObjectType::kInline) ||
+            header.payload_checksum !=
+                ComputeNvmeKvPayloadChecksum(payload_view) ||
+            payload_view.size() != *expected_payload_size) {
+            return tl::make_unexpected(ErrorCode::CHECKSUM_MISMATCH);
+        }
+        return {};
+    }
+
+    if (object_type != NvmeKvObjectType::kManifest ||
+        !ValidateNvmeKvHeader(header, identity, expected_identity_size,
+                              static_cast<uint32_t>(payload_view.size()),
+                              NvmeKvObjectType::kManifest) ||
+        header.payload_checksum != ComputeNvmeKvPayloadChecksum(payload_view)) {
+        return tl::make_unexpected(ErrorCode::CHECKSUM_MISMATCH);
+    }
+
+    NvmeKvManifestMetadata metadata{};
+    auto &chunk_records = root.chunks;
+    if (!ParseNvmeKvManifest(payload_view, metadata, chunk_records) ||
+        metadata.logical_payload_size != *expected_payload_size ||
+        metadata.chunk_count != chunk_records.size()) {
+        return tl::make_unexpected(ErrorCode::CHECKSUM_MISMATCH);
+    }
+    return {};
+}
+
+std::unique_ptr<NvmeKvObjectStore> NvmeKvStorageBackend::CreateObjectStore(
+    std::unique_ptr<NvmeKvConnector> connector) {
+    return std::make_unique<NvmeKvObjectStore>(
+        std::move(connector), std::make_unique<LocalNvmeKvPolicy>());
+}
 
 NvmeKvStorageBackend::NvmeKvStorageBackend(
     const FileStorageConfig &file_storage_config_)
     : StorageBackendInterface(file_storage_config_) {}
 
-void NvmeKvStorageBackend::InitIoWorkers() {
+NvmeKvObjectStore::NvmeKvObjectStore(std::unique_ptr<NvmeKvConnector> connector,
+                                     std::unique_ptr<NvmeKvObjectPolicy> policy)
+    : connector_(std::move(connector)), policy_(std::move(policy)) {
+    if (!connector_ || !policy_) {
+        throw std::invalid_argument(
+            "NVMe KV connector and policy are required");
+    }
+    InitIoWorkers();
+}
+
+void NvmeKvObjectStore::InitIoWorkers() {
     const auto config = NvmeKvIoConcurrencyConfig::FromEnvironment(
         connector_->GetCapabilities().queue_depth);
     const size_t max_io_concurrency = config.max_io_concurrency;
@@ -213,9 +374,9 @@ void NvmeKvStorageBackend::InitIoWorkers() {
               << ", prepare concurrency: " << prepare_concurrency_;
 }
 
-void NvmeKvStorageBackend::RunParallelIo(
-    size_t item_count, const std::function<void(size_t)> &task,
-    size_t max_inflight) {
+void NvmeKvObjectStore::RunParallelIo(size_t item_count,
+                                      const std::function<void(size_t)> &task,
+                                      size_t max_inflight) {
     if (item_count == 0) {
         return;
     }
@@ -273,7 +434,7 @@ void NvmeKvStorageBackend::RunParallelIo(
     }
 }
 
-void NvmeKvStorageBackend::RunPipelinedIo(
+void NvmeKvObjectStore::RunPipelinedIo(
     size_t item_count, const std::function<void(size_t)> &io_task,
     const std::function<void(size_t)> &completion_task) {
     if (item_count == 0) {
@@ -351,11 +512,11 @@ void NvmeKvStorageBackend::RunPipelinedIo(
     }
 }
 
-std::shared_ptr<const NvmeKvStorageBackend::CachedManifest>
-NvmeKvStorageBackend::FindCachedManifest(const std::string &key,
-                                         size_t payload_size) const {
+std::shared_ptr<const NvmeKvObjectStore::CachedManifest>
+NvmeKvObjectStore::FindCachedManifest(const NvmeKvObjectKey &key,
+                                      size_t payload_size) const {
     std::shared_lock<std::shared_mutex> lock(manifest_cache_mutex_);
-    const auto it = manifest_cache_.find(key);
+    const auto it = manifest_cache_.find(key.logical_key);
     if (it == manifest_cache_.end() ||
         it->second->payload_size != payload_size) {
         return nullptr;
@@ -363,15 +524,14 @@ NvmeKvStorageBackend::FindCachedManifest(const std::string &key,
     return it->second;
 }
 
-std::shared_ptr<const NvmeKvStorageBackend::CachedManifest>
-NvmeKvStorageBackend::CacheManifest(
-    const std::string &key, size_t payload_size, uint32_t resolved_slot,
+std::shared_ptr<const NvmeKvObjectStore::CachedManifest>
+NvmeKvObjectStore::CacheManifest(
+    const NvmeKvObjectKey &key, size_t payload_size, uint32_t resolved_slot,
     const std::vector<NvmeKvManifestChunkRecord> &chunk_records) {
     if (payload_size > std::numeric_limits<uint32_t>::max()) {
         return nullptr;
     }
-    const NvmeKvObjectIdentity identity{.logical_key = key};
-    auto chunk_offsets = ValidateChunkRecords(identity, resolved_slot,
+    auto chunk_offsets = ValidateChunkRecords(*policy_, key, resolved_slot,
                                               payload_size, chunk_records);
     if (!chunk_offsets) {
         return nullptr;
@@ -383,7 +543,8 @@ NvmeKvStorageBackend::CacheManifest(
         .chunk_offsets = std::move(*chunk_offsets),
     });
     std::unique_lock<std::shared_mutex> lock(manifest_cache_mutex_);
-    auto [it, inserted] = manifest_cache_.try_emplace(key, manifest);
+    auto [it, inserted] =
+        manifest_cache_.try_emplace(key.logical_key, manifest);
     if (inserted) {
         return manifest;
     }
@@ -396,22 +557,23 @@ NvmeKvStorageBackend::CacheManifest(
     return manifest;
 }
 
-void NvmeKvStorageBackend::CacheManifestAfterWrite(
-    const std::string &key, size_t payload_size, uint32_t resolved_slot,
+void NvmeKvObjectStore::CacheManifestAfterWrite(
+    const NvmeKvObjectKey &key, size_t payload_size, uint32_t resolved_slot,
     const std::vector<NvmeKvManifestChunkRecord> &chunk_records) noexcept {
     try {
         (void)CacheManifest(key, payload_size, resolved_slot, chunk_records);
     } catch (...) {
-        LOG(WARNING) << "NVMe KV could not cache manifest for " << key;
+        LOG(WARNING) << "NVMe KV could not cache manifest for "
+                     << key.logical_key;
     }
 }
 
-void NvmeKvStorageBackend::StoreBatchParallel(
+void NvmeKvObjectStore::StoreBatchParallel(
     std::vector<NvmeKvCommandExecutor::StoreRequest> &requests) {
     if (requests.empty()) {
         return;
     }
-    auto connector = connector_;
+    auto *connector = connector_.get();
     if (connector == nullptr) {
         for (auto &request : requests) {
             request.result = tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
@@ -447,14 +609,14 @@ void NvmeKvStorageBackend::StoreBatchParallel(
 }
 
 tl::expected<void, ErrorCode> NvmeKvStorageBackend::InitDevice() {
-    auto connector = std::make_shared<NvmeKvConnector>(file_storage_config_);
+    auto connector = std::make_unique<NvmeKvConnector>(file_storage_config_);
     auto init_res = connector->Init();
     if (!init_res) {
         LOG(ERROR) << "Failed to initialize NVMe KV device: "
                    << toString(init_res.error());
         return init_res;
     }
-    connector_ = std::move(connector);
+    object_store_ = CreateObjectStore(std::move(connector));
     return {};
 }
 
@@ -472,98 +634,39 @@ tl::expected<void, ErrorCode> NvmeKvStorageBackend::Init() {
     }
     total_size_.store(0, std::memory_order_relaxed);
     total_keys_.store(0, std::memory_order_relaxed);
-    InitIoWorkers();
     return {};
 }
 
-tl::expected<int64_t, ErrorCode> NvmeKvStorageBackend::BatchOffload(
-    const std::unordered_map<std::string, std::vector<Slice>> &batch_object,
-    std::function<ErrorCode(const std::vector<std::string> &keys,
-                            std::vector<StorageObjectMetadata> &metadatas)>
-        complete_handler,
-    NvmeKvStorageBackend::EvictionHandler eviction_handler) {
-    (void)eviction_handler;
-    if (!initialized_.load(std::memory_order_acquire)) {
-        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-    }
-    if (batch_object.empty()) {
-        return tl::make_unexpected(ErrorCode::INVALID_KEY);
-    }
-
-    struct OffloadPlan {
-        std::string key;
-        const std::vector<Slice> *slices = nullptr;
-        size_t payload_size = 0;
-    };
+tl::expected<void, ErrorCode> NvmeKvObjectStore::PutBatch(
+    std::span<PutRequest> requests) {
     std::vector<OffloadPlan> plans;
-    plans.reserve(batch_object.size());
-    int64_t batch_total_size = 0;
-    for (const auto &[key, slices] : batch_object) {
-        if (slices.empty()) {
+    plans.reserve(requests.size());
+    for (size_t i = 0; i < requests.size(); ++i) {
+        auto &request = requests[i];
+        request.result = tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        auto bytes = SliceBytes(request.slices);
+        if (!bytes || *bytes > UINT32_MAX || request.key.logical_key.empty()) {
             continue;
         }
-        size_t payload_size = 0;
-        for (const auto &slice : slices) {
-            if (slice.size >
-                std::numeric_limits<size_t>::max() - payload_size) {
-                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-            }
-            payload_size += slice.size;
-        }
-        if (payload_size >
-                static_cast<size_t>(std::numeric_limits<int64_t>::max()) ||
-            batch_total_size > std::numeric_limits<int64_t>::max() -
-                                   static_cast<int64_t>(payload_size)) {
-            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-        }
-        batch_total_size += static_cast<int64_t>(payload_size);
-        plans.push_back(OffloadPlan{key, &slices, payload_size});
+        plans.push_back({request.key, request.slices, *bytes, i});
     }
 
-    if (plans.empty()) {
-        return 0;
-    }
-
-    if (total_keys_.load(std::memory_order_relaxed) +
-            static_cast<int64_t>(plans.size()) >
-        file_storage_config_.total_keys_limit) {
-        return tl::make_unexpected(ErrorCode::KEYS_ULTRA_LIMIT);
-    }
-    if (total_size_.load(std::memory_order_relaxed) + batch_total_size >
-        file_storage_config_.total_size_limit) {
-        return tl::make_unexpected(ErrorCode::KEYS_ULTRA_LIMIT);
-    }
-    auto enable_offloading_res = IsEnableOffloading();
-    if (!enable_offloading_res) {
-        return tl::make_unexpected(enable_offloading_res.error());
-    }
-    if (!enable_offloading_res.value()) {
-        return tl::make_unexpected(ErrorCode::KEYS_ULTRA_LIMIT);
-    }
-
-    std::vector<tl::expected<OffloadResult, ErrorCode>> results;
+    std::vector<tl::expected<PutResult, ErrorCode>> results;
     results.reserve(plans.size());
     for (size_t i = 0; i < plans.size(); ++i) {
-        results.emplace_back(OffloadResult{});
+        results.emplace_back(PutResult{});
     }
 
-    struct PreparedOffload {
-        std::string payload_storage;
-        std::string_view payload;
-        std::optional<NvmeKvKeyConflictPolicy::WritePlan> write_plan;
-        std::vector<PhysicalKey> written_chunk_keys;
-        bool root_written = false;
-        bool needs_fallback = false;
-    };
+    using PreparedOffload = NvmeKvWriteAttempt;
     std::vector<PreparedOffload> prepared(plans.size());
 
     const auto prepare_one = [&](size_t index) {
         const auto &plan = plans[index];
         auto &item = prepared[index];
-        item.payload = BuildPayloadView(*plan.slices, plan.payload_size,
+        item.payload = BuildPayloadView(plan.slices, plan.payload_size,
                                         item.payload_storage);
-        auto write_plan = NvmeKvKeyConflictPolicy::BuildWritePlan(
-            NvmeKvObjectIdentity{.logical_key = plan.key}, item.payload, 0,
+        auto write_plan = policy_->PrepareWrite(
+            plan.key, item.payload,
             std::max(connector_->GetCapabilities().effective_max_value_size,
                      kMinMaxValueSize));
         if (!write_plan) {
@@ -589,7 +692,7 @@ tl::expected<int64_t, ErrorCode> NvmeKvStorageBackend::BatchOffload(
                         item.write_plan->chunk_values[context.chunk_index]
                             .first);
                 } else {
-                    item.needs_fallback = true;
+                    item.error = requests[request_index].result.error();
                 }
             }
         };
@@ -662,7 +765,7 @@ tl::expected<int64_t, ErrorCode> NvmeKvStorageBackend::BatchOffload(
                  ++enqueued_root_consumers) {
                 root_submit_workers_->enqueue([&]() {
                     try {
-                        auto connector = connector_;
+                        auto *connector = connector_.get();
                         if (connector == nullptr) {
                             throw std::runtime_error(
                                 "NVMe KV connector is unavailable");
@@ -685,7 +788,7 @@ tl::expected<int64_t, ErrorCode> NvmeKvStorageBackend::BatchOffload(
                                 if (requests[index].result) {
                                     item.root_written = true;
                                 } else {
-                                    item.needs_fallback = true;
+                                    item.error = requests[index].result.error();
                                 }
                             }
                             requests.clear();
@@ -725,7 +828,7 @@ tl::expected<int64_t, ErrorCode> NvmeKvStorageBackend::BatchOffload(
             for (; enqueued_consumers < lane_count; ++enqueued_consumers) {
                 submit_workers_->enqueue([&, lane = enqueued_consumers]() {
                     try {
-                        auto connector = connector_;
+                        auto *connector = connector_.get();
                         if (connector == nullptr) {
                             throw std::runtime_error(
                                 "NVMe KV connector is unavailable");
@@ -747,9 +850,9 @@ tl::expected<int64_t, ErrorCode> NvmeKvStorageBackend::BatchOffload(
                                 auto &item = prepared[context.plan_index];
                                 if (context.chunk_index + 1 ==
                                         item.write_plan->chunk_values.size() &&
-                                    !item.needs_fallback) {
+                                    item.error == ErrorCode::OK) {
                                     if (!root_queue.Push(context.plan_index)) {
-                                        item.needs_fallback = true;
+                                        item.error = ErrorCode::INTERNAL_ERROR;
                                     }
                                 }
                             }
@@ -829,47 +932,16 @@ tl::expected<int64_t, ErrorCode> NvmeKvStorageBackend::BatchOffload(
         }
     };
 
-    const auto cleanup_new_writes = [&](size_t plan_index, bool delete_root) {
-        auto connector = connector_;
-        auto &item = prepared[plan_index];
-        if (connector == nullptr || !item.write_plan) {
-            return;
-        }
-        if (delete_root) {
-            auto result = connector->Delete(item.write_plan->root_key);
-            if (!result && result.error() != ErrorCode::OBJECT_NOT_FOUND) {
-                LOG(WARNING) << "NVMe KV failed to clean batched root for "
-                             << plans[plan_index].key
-                             << " error=" << toString(result.error());
-            }
-            item.root_written = false;
-        }
-        for (const auto &chunk_key : item.written_chunk_keys) {
-            auto result = connector->Delete(chunk_key);
-            if (!result && result.error() != ErrorCode::OBJECT_NOT_FOUND) {
-                LOG(WARNING) << "NVMe KV failed to clean batched chunk for "
-                             << plans[plan_index].key
-                             << " error=" << toString(result.error());
-            }
-        }
-        item.written_chunk_keys.clear();
-    };
-
     ErrorCode worker_error = ErrorCode::OK;
     try {
         store_chunks();
-
-        for (size_t plan_index = 0; plan_index < plans.size(); ++plan_index) {
-            if (prepared[plan_index].needs_fallback) {
-                cleanup_new_writes(plan_index, false);
-            }
-        }
 
         std::vector<NvmeKvCommandExecutor::StoreRequest> root_requests;
         std::vector<size_t> root_contexts;
         for (size_t plan_index = 0; plan_index < plans.size(); ++plan_index) {
             auto &item = prepared[plan_index];
-            if (!item.write_plan || item.needs_fallback || roots_pipelined) {
+            if (!item.write_plan || item.error != ErrorCode::OK ||
+                roots_pipelined) {
                 continue;
             }
             NvmeKvCommandExecutor::StoreRequest request;
@@ -884,8 +956,7 @@ tl::expected<int64_t, ErrorCode> NvmeKvStorageBackend::BatchOffload(
             const size_t plan_index = root_contexts[request_index];
             auto &item = prepared[plan_index];
             if (!root_requests[request_index].result) {
-                item.needs_fallback = true;
-                cleanup_new_writes(plan_index, false);
+                item.error = root_requests[request_index].result.error();
                 continue;
             }
             item.root_written = true;
@@ -893,26 +964,37 @@ tl::expected<int64_t, ErrorCode> NvmeKvStorageBackend::BatchOffload(
 
         for (size_t plan_index = 0; plan_index < plans.size(); ++plan_index) {
             auto &item = prepared[plan_index];
-            if (!item.write_plan || item.needs_fallback || !item.root_written) {
+            if (!item.write_plan || item.error != ErrorCode::OK ||
+                !item.root_written) {
                 continue;
             }
             item.root_written = false;
             item.written_chunk_keys.clear();
-            results[plan_index] =
-                OffloadResult{.stored = true, .inserted = true};
+            results[plan_index] = PutResult{.stored = true, .inserted = true};
             if (!item.write_plan->store_inline) {
-                CacheManifestAfterWrite(plans[plan_index].key,
-                                        plans[plan_index].payload_size, 0,
-                                        item.write_plan->manifest_records);
+                CacheManifestAfterWrite(
+                    plans[plan_index].key, plans[plan_index].payload_size,
+                    item.write_plan->slot, item.write_plan->manifest_records);
             }
         }
 
         RunParallelIo(plans.size(), [&](size_t index) {
-            if (!prepared[index].needs_fallback) {
+            auto &item = prepared[index];
+            if (item.error == ErrorCode::OK) {
                 return;
             }
-            results[index] = OffloadOne(plans[index].key, *plans[index].slices,
-                                        plans[index].payload_size);
+            results[index] = policy_->HandleWriteFailure(
+                *connector_, plans[index].key, item.payload, item);
+            if (results[index] && results[index]->stored) {
+                item.root_written = false;
+                item.written_chunk_keys.clear();
+                if (!item.write_plan->store_inline) {
+                    CacheManifestAfterWrite(plans[index].key,
+                                            plans[index].payload_size,
+                                            item.write_plan->slot,
+                                            item.write_plan->manifest_records);
+                }
+            }
         });
     } catch (const std::exception &error) {
         LOG(ERROR) << "NVMe KV batch offload worker failed: " << error.what();
@@ -923,9 +1005,96 @@ tl::expected<int64_t, ErrorCode> NvmeKvStorageBackend::BatchOffload(
     }
     if (worker_error != ErrorCode::OK) {
         for (size_t index = 0; index < prepared.size(); ++index) {
-            cleanup_new_writes(index, prepared[index].root_written);
+            if (!results[index] || !results[index]->stored) {
+                policy_->AbortWrite(*connector_, prepared[index]);
+            }
         }
     }
+
+    for (size_t i = 0; i < plans.size(); ++i) {
+        if (worker_error != ErrorCode::OK && results[i] &&
+            !results[i]->stored) {
+            results[i] = tl::make_unexpected(worker_error);
+        }
+        requests[plans[i].request_index].result = std::move(results[i]);
+    }
+    if (worker_error != ErrorCode::OK) {
+        return tl::make_unexpected(worker_error);
+    }
+    return {};
+}
+
+tl::expected<int64_t, ErrorCode> NvmeKvStorageBackend::BatchOffload(
+    const std::unordered_map<std::string, std::vector<Slice>> &batch_object,
+    std::function<ErrorCode(const std::vector<std::string> &keys,
+                            std::vector<StorageObjectMetadata> &metadatas)>
+        complete_handler,
+    NvmeKvStorageBackend::EvictionHandler eviction_handler) {
+    (void)eviction_handler;
+    if (!initialized_.load(std::memory_order_acquire)) {
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    if (batch_object.empty()) {
+        return tl::make_unexpected(ErrorCode::INVALID_KEY);
+    }
+
+    struct OffloadPlan {
+        std::string key;
+        const std::vector<Slice> *slices = nullptr;
+        size_t payload_size = 0;
+    };
+    std::vector<OffloadPlan> plans;
+    plans.reserve(batch_object.size());
+    int64_t batch_total_size = 0;
+    for (const auto &[key, slices] : batch_object) {
+        if (slices.empty()) {
+            continue;
+        }
+        size_t payload_size = 0;
+        for (const auto &slice : slices) {
+            if (slice.size >
+                std::numeric_limits<size_t>::max() - payload_size) {
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
+            payload_size += slice.size;
+        }
+        if (payload_size >
+                static_cast<size_t>(std::numeric_limits<int64_t>::max()) ||
+            batch_total_size > std::numeric_limits<int64_t>::max() -
+                                   static_cast<int64_t>(payload_size)) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        batch_total_size += static_cast<int64_t>(payload_size);
+        plans.push_back(OffloadPlan{key, &slices, payload_size});
+    }
+
+    if (plans.empty()) {
+        return 0;
+    }
+
+    if (total_keys_.load(std::memory_order_relaxed) +
+            static_cast<int64_t>(plans.size()) >
+        file_storage_config_.total_keys_limit) {
+        return tl::make_unexpected(ErrorCode::KEYS_ULTRA_LIMIT);
+    }
+    if (total_size_.load(std::memory_order_relaxed) + batch_total_size >
+        file_storage_config_.total_size_limit) {
+        return tl::make_unexpected(ErrorCode::KEYS_ULTRA_LIMIT);
+    }
+    auto enable_offloading_res = IsEnableOffloading();
+    if (!enable_offloading_res) {
+        return tl::make_unexpected(enable_offloading_res.error());
+    }
+    if (!enable_offloading_res.value()) {
+        return tl::make_unexpected(ErrorCode::KEYS_ULTRA_LIMIT);
+    }
+
+    std::vector<NvmeKvObjectStore::PutRequest> requests;
+    requests.reserve(plans.size());
+    for (const auto &plan : plans) {
+        requests.push_back({{plan.key}, *plan.slices});
+    }
+    const auto worker_result = object_store_->PutBatch(requests);
 
     std::vector<std::string> keys;
     std::vector<StorageObjectMetadata> metadatas;
@@ -933,18 +1102,19 @@ tl::expected<int64_t, ErrorCode> NvmeKvStorageBackend::BatchOffload(
     metadatas.reserve(plans.size());
     int64_t inserted_keys = 0;
     int64_t inserted_size = 0;
-    ErrorCode first_error = worker_error;
+    ErrorCode first_error =
+        worker_result ? ErrorCode::OK : worker_result.error();
     for (size_t i = 0; i < plans.size(); ++i) {
-        if (!results[i]) {
+        if (!requests[i].result) {
             if (first_error == ErrorCode::OK) {
-                first_error = results[i].error();
+                first_error = requests[i].result.error();
             }
             continue;
         }
-        if (!results[i].value().stored) {
+        if (!requests[i].result.value().stored) {
             continue;
         }
-        if (results[i].value().inserted) {
+        if (requests[i].result.value().inserted) {
             ++inserted_keys;
             inserted_size += static_cast<int64_t>(plans[i].payload_size);
         }
@@ -972,48 +1142,45 @@ tl::expected<int64_t, ErrorCode> NvmeKvStorageBackend::BatchOffload(
     return static_cast<int64_t>(keys.size());
 }
 
-tl::expected<NvmeKvStorageBackend::OffloadResult, ErrorCode>
-NvmeKvStorageBackend::OffloadOne(const std::string &key,
-                                 const std::vector<Slice> &slices,
-                                 size_t payload_size) {
+namespace {
+
+tl::expected<NvmeKvPutResult, ErrorCode> LocalNvmeKvPolicy::HandleWriteFailure(
+    NvmeKvConnector &connector_ref, const NvmeKvObjectKey &key,
+    std::string_view payload, NvmeKvWriteAttempt &attempt) const {
+    const size_t payload_size = payload.size();
     if (payload_size >
         static_cast<size_t>(std::numeric_limits<uint32_t>::max())) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    std::string payload_storage;
-    const std::string_view payload =
-        BuildPayloadView(slices, payload_size, payload_storage);
-
-    auto connector = connector_;
-    if (connector == nullptr) {
-        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
-    }
+    auto *connector = &connector_ref;
+    AbortWrite(connector_ref, attempt);
     const uint32_t effective_max_value_size =
         std::max(connector->GetCapabilities().effective_max_value_size,
                  kMinMaxValueSize);
 
     for (uint32_t slot = 0; slot < kNvmeKvMaxPhysicalKeySlots; ++slot) {
-        auto write_plan_res = NvmeKvKeyConflictPolicy::BuildWritePlan(
-            NvmeKvObjectIdentity{.logical_key = key}, payload, slot,
-            effective_max_value_size);
+        auto write_plan_res =
+            PrepareWriteAtSlot(key, payload, effective_max_value_size, slot);
         if (!write_plan_res) {
             return tl::make_unexpected(write_plan_res.error());
         }
-        auto &write_plan = write_plan_res.value();
+        attempt.write_plan.emplace(std::move(write_plan_res.value()));
+        auto &write_plan = *attempt.write_plan;
         const bool store_inline = write_plan.store_inline;
         const auto &physical_key = write_plan.root_key;
         const auto &root_blob = write_plan.root_blob;
         const auto &chunk_store_values = write_plan.chunk_values;
 
-        std::vector<PhysicalKey> written_chunk_keys;
-        bool root_written = false;
+        auto &written_chunk_keys = attempt.written_chunk_keys;
+        auto &root_written = attempt.root_written;
         const auto cleanup_new_writes = [&]() {
             if (root_written) {
                 auto delete_res = connector->Delete(physical_key);
                 if (!delete_res &&
                     delete_res.error() != ErrorCode::OBJECT_NOT_FOUND) {
                     LOG(WARNING)
-                        << "NVMe KV failed to clean orphan root for " << key
+                        << "NVMe KV failed to clean orphan root for "
+                        << key.logical_key
                         << " key=" << NvmeKvPhysicalKeyToHex(physical_key)
                         << " error=" << toString(delete_res.error());
                 }
@@ -1026,16 +1193,16 @@ NvmeKvStorageBackend::OffloadOne(const std::string &key,
                 auto delete_res = connector->Delete(chunk_key);
                 if (!delete_res &&
                     delete_res.error() != ErrorCode::OBJECT_NOT_FOUND) {
-                    LOG(WARNING)
-                        << "NVMe KV failed to clean orphan chunk for " << key
-                        << " key=" << NvmeKvPhysicalKeyToHex(chunk_key)
-                        << " error=" << toString(delete_res.error());
+                    LOG(WARNING) << "NVMe KV failed to clean orphan chunk for "
+                                 << key.logical_key
+                                 << " key=" << NvmeKvPhysicalKeyToHex(chunk_key)
+                                 << " error=" << toString(delete_res.error());
                 }
             }
             written_chunk_keys.clear();
         };
         const auto resolve_existing_root =
-            [&]() -> tl::expected<OffloadResult, ErrorCode> {
+            [&]() -> tl::expected<NvmeKvPutResult, ErrorCode> {
             auto decision_res = NvmeKvKeyConflictPolicy::ResolveExistingObject(
                 *connector, physical_key, root_blob);
             if (!decision_res) {
@@ -1043,19 +1210,20 @@ NvmeKvStorageBackend::OffloadOne(const std::string &key,
             }
             if (decision_res.value() ==
                 NvmeKvKeyConflictPolicy::ExistingObjectDecision::kNotFound) {
-                return OffloadResult{};
+                return NvmeKvPutResult{};
             }
             if (decision_res.value() ==
                 NvmeKvKeyConflictPolicy::ExistingObjectDecision::
                     kDifferentObject) {
-                return OffloadResult{};
+                return NvmeKvPutResult{};
             }
-            return OffloadResult{.stored = true, .inserted = false};
+            return NvmeKvPutResult{.stored = true, .inserted = false};
         };
 
         bool write_success = true;
         bool slot_collision = false;
-        ErrorCode write_error = ErrorCode::OK;
+        ErrorCode &write_error = attempt.error;
+        write_error = ErrorCode::OK;
         if (store_inline) {
             auto store_res = connector->Store(physical_key, root_blob);
             if (!store_res) {
@@ -1066,8 +1234,8 @@ NvmeKvStorageBackend::OffloadOne(const std::string &key,
             }
         } else {
             const auto handle_chunk_store_error =
-                [&](const PhysicalKey &chunk_key, std::string_view chunk_blob,
-                    ErrorCode error) -> bool {
+                [&](const NvmeKvPhysicalKey &chunk_key,
+                    std::string_view chunk_blob, ErrorCode error) -> bool {
                 if (error == ErrorCode::OBJECT_ALREADY_EXISTS) {
                     auto existing_chunk_res =
                         NvmeKvKeyConflictPolicy::ResolveExistingObject(
@@ -1101,6 +1269,14 @@ NvmeKvStorageBackend::OffloadOne(const std::string &key,
             }
             connector->StoreBatch(chunk_requests);
 
+            for (size_t chunk_index = 0; chunk_index < chunk_requests.size();
+                 ++chunk_index) {
+                if (chunk_requests[chunk_index].result) {
+                    written_chunk_keys.push_back(
+                        chunk_store_values[chunk_index].first);
+                }
+            }
+
             for (size_t chunk_index = 0;
                  chunk_index < chunk_store_values.size(); ++chunk_index) {
                 const auto &[chunk_key, chunk_blob] =
@@ -1113,7 +1289,6 @@ NvmeKvStorageBackend::OffloadOne(const std::string &key,
                     }
                     continue;
                 }
-                written_chunk_keys.push_back(chunk_key);
             }
             if (write_success) {
                 auto store_res = connector->Store(physical_key, root_blob);
@@ -1130,10 +1305,6 @@ NvmeKvStorageBackend::OffloadOne(const std::string &key,
         if (!write_success && write_error == ErrorCode::OBJECT_ALREADY_EXISTS) {
             auto existing_res = resolve_existing_root();
             if (existing_res && existing_res.value().stored) {
-                if (!store_inline) {
-                    CacheManifestAfterWrite(key, payload_size, slot,
-                                            write_plan.manifest_records);
-                }
                 return existing_res;
             }
             if (!existing_res) {
@@ -1155,40 +1326,30 @@ NvmeKvStorageBackend::OffloadOne(const std::string &key,
             return tl::make_unexpected(write_error);
         }
 
-        if (!store_inline) {
-            CacheManifestAfterWrite(key, payload_size, slot,
-                                    write_plan.manifest_records);
-        }
-        return OffloadResult{.stored = true, .inserted = true};
+        return NvmeKvPutResult{.stored = true, .inserted = true};
     }
-    return OffloadResult{};
+    return NvmeKvPutResult{};
 }
 
-tl::expected<void, ErrorCode> NvmeKvStorageBackend::BatchLoad(
-    std::unordered_map<std::string, Slice> &batched_slices) {
-    if (!initialized_.load(std::memory_order_acquire)) {
-        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-    }
+}  // namespace
 
-    const auto connector = connector_;
-    if (connector == nullptr) {
-        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
-    }
-
-    struct ReadPlan {
-        std::string key;
-        Slice dest_slice;
-        std::shared_ptr<const CachedManifest> cached_manifest;
-    };
+void NvmeKvObjectStore::GetBatch(std::span<GetRequest> requests) {
+    auto *connector = connector_.get();
     std::vector<ReadPlan> plans;
-    plans.reserve(batched_slices.size());
-
-    for (const auto &[key, dest_slice] : batched_slices) {
-        if (dest_slice.size > std::numeric_limits<uint32_t>::max()) {
-            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    plans.reserve(requests.size());
+    for (size_t request_index = 0; request_index < requests.size();
+         ++request_index) {
+        auto &request = requests[request_index];
+        request.result = tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        const auto &dest_slice = request.dest_slice;
+        if ((dest_slice.size != 0 && dest_slice.ptr == nullptr) ||
+            dest_slice.size != request.expected_payload_size ||
+            dest_slice.size > UINT32_MAX || request.key.logical_key.empty()) {
+            continue;
         }
-        plans.push_back(ReadPlan{key, dest_slice,
-                                 FindCachedManifest(key, dest_slice.size)});
+        auto cached = FindCachedManifest(request.key, dest_slice.size);
+        plans.push_back(
+            {request.key, dest_slice, std::move(cached), request_index});
     }
 
     struct PreparedRead {
@@ -1198,77 +1359,22 @@ tl::expected<void, ErrorCode> NvmeKvStorageBackend::BatchLoad(
     const auto prepare_one =
         [&](size_t plan_index) -> tl::expected<void, ErrorCode> {
         const auto &plan = plans[plan_index];
-        auto resolved_res = ResolveRoot(*connector, plan.key);
-        if (!resolved_res) {
-            return tl::make_unexpected(resolved_res.error());
-        }
-        if (!resolved_res.value()) {
-            return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
-        }
-        const auto &resolved = *resolved_res.value();
-        const std::string &object_blob = resolved.object_blob;
-        NvmeKvObjectHeader header{};
-        std::string_view identity_metadata_view;
-        std::string_view payload_view;
-        if (!ParseNvmeKvObjectBlob(object_blob, header, identity_metadata_view,
-                                   payload_view)) {
-            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+        auto root =
+            policy_->ReadRoot(*connector, plan.key, plan.dest_slice.size);
+        if (!root) {
+            return tl::make_unexpected(root.error());
         }
 
-        NvmeKvStoredIdentityView stored_identity_view{};
-        if (!ParseNvmeKvStoredIdentity(identity_metadata_view,
-                                       stored_identity_view) ||
-            stored_identity_view.logical_key.empty() ||
-            stored_identity_view.logical_key != plan.key) {
-            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
-        }
-        NvmeKvObjectIdentity identity{.logical_key =
-                                          stored_identity_view.logical_key};
-        if (!NvmeKvKeyConflictPolicy::ValidateResolvedRootPlacement(
-                identity, stored_identity_view, resolved.physical_key) ||
-            stored_identity_view.resolved_slot != resolved.slot) {
-            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
-        }
-
-        const auto object_type =
-            static_cast<NvmeKvObjectType>(header.object_type);
-        const uint32_t expected_identity_size =
-            ComputeNvmeKvStoredIdentityMetadataSize(identity);
-        if (object_type == NvmeKvObjectType::kInline) {
-            if (!ValidateNvmeKvHeader(
-                    header, identity, expected_identity_size,
-                    static_cast<uint32_t>(plan.dest_slice.size),
-                    NvmeKvObjectType::kInline) ||
-                header.payload_checksum !=
-                    ComputeNvmeKvPayloadChecksum(payload_view) ||
-                payload_view.size() != plan.dest_slice.size) {
-                return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
-            }
-            std::memcpy(plan.dest_slice.ptr, payload_view.data(),
-                        payload_view.size());
+        if (root->header.object_type ==
+            static_cast<uint32_t>(NvmeKvObjectType::kInline)) {
+            const auto payload = root->Payload();
+            std::memcpy(plan.dest_slice.ptr, payload.data(), payload.size());
             return {};
-        }
-
-        if (object_type != NvmeKvObjectType::kManifest ||
-            !ValidateNvmeKvHeader(header, identity, expected_identity_size,
-                                  static_cast<uint32_t>(payload_view.size()),
-                                  NvmeKvObjectType::kManifest) ||
-            header.payload_checksum !=
-                ComputeNvmeKvPayloadChecksum(payload_view)) {
-            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
-        }
-
-        NvmeKvManifestMetadata metadata{};
-        std::vector<NvmeKvManifestChunkRecord> chunk_records;
-        if (!ParseNvmeKvManifest(payload_view, metadata, chunk_records) ||
-            metadata.logical_payload_size != plan.dest_slice.size ||
-            metadata.chunk_count != chunk_records.size()) {
-            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
         }
 
         auto cached_manifest =
             CacheManifest(plan.key, plan.dest_slice.size,
-                          stored_identity_view.resolved_slot, chunk_records);
+                          root->identity.resolved_slot, root->chunks);
         if (cached_manifest == nullptr) {
             return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
         }
@@ -1310,12 +1416,6 @@ tl::expected<void, ErrorCode> NvmeKvStorageBackend::BatchLoad(
             const size_t plan_index = prepare_misses[index];
             prepare_results[plan_index] = prepare_one(plan_index);
         });
-        for (const auto &result : prepare_results) {
-            if (!result) {
-                return tl::make_unexpected(result.error());
-            }
-        }
-
         std::vector<tl::expected<void, ErrorCode>> chunk_results(plans.size());
         const size_t read_plan_batch_size = ReadPlanBatchSize();
         const size_t read_group_count =
@@ -1341,6 +1441,9 @@ tl::expected<void, ErrorCode> NvmeKvStorageBackend::BatchLoad(
 
             for (size_t plan_index = plan_begin; plan_index < plan_end;
                  ++plan_index) {
+                if (!prepare_results[plan_index]) {
+                    continue;
+                }
                 const auto &prepared = prepared_reads[plan_index];
                 const auto chunk_count =
                     !prepared.manifest
@@ -1468,20 +1571,59 @@ tl::expected<void, ErrorCode> NvmeKvStorageBackend::BatchLoad(
 
         RunPipelinedIo(read_group_count, read_group, verify_read_group);
         for (size_t plan_index = 0; plan_index < plans.size(); ++plan_index) {
-            if (!chunk_results[plan_index]) {
-                const auto error = chunk_results[plan_index].error();
-                return tl::make_unexpected(error);
+            const auto request_index = plans[plan_index].request_index;
+            auto &request = requests[request_index];
+            if (!prepare_results[plan_index]) {
+                request.result =
+                    tl::make_unexpected(prepare_results[plan_index].error());
+                continue;
             }
+            if (!chunk_results[plan_index]) {
+                request.result =
+                    tl::make_unexpected(chunk_results[plan_index].error());
+                continue;
+            }
+            request.result = plans[plan_index].dest_slice.size;
         }
     } catch (const std::exception &error) {
         LOG(ERROR) << "NVMe KV batch load worker failed: " << error.what();
-        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        for (const auto &plan : plans)
+            requests[plan.request_index].result =
+                tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     } catch (...) {
-        LOG(ERROR) << "NVMe KV batch load worker failed";
+        for (const auto &plan : plans)
+            requests[plan.request_index].result =
+                tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+}
+
+tl::expected<void, ErrorCode> NvmeKvStorageBackend::BatchLoad(
+    std::unordered_map<std::string, Slice> &batched_slices) {
+    if (!initialized_.load(std::memory_order_acquire)) {
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
-
+    std::vector<NvmeKvObjectStore::GetRequest> requests;
+    requests.reserve(batched_slices.size());
+    for (const auto &[key, slice] : batched_slices) {
+        requests.push_back({{key}, slice.size, slice});
+    }
+    object_store_->GetBatch(requests);
+    for (const auto &request : requests) {
+        if (!request.result) {
+            return tl::make_unexpected(request.result.error());
+        }
+    }
     return {};
+}
+
+tl::expected<bool, ErrorCode> NvmeKvObjectStore::IsExist(
+    const NvmeKvObjectKey &key) {
+    auto root = policy_->ReadRoot(*connector_, key, std::nullopt);
+    if (!root) {
+        if (root.error() == ErrorCode::OBJECT_NOT_FOUND) return false;
+        return tl::make_unexpected(root.error());
+    }
+    return true;
 }
 
 tl::expected<bool, ErrorCode> NvmeKvStorageBackend::IsExist(
@@ -1489,22 +1631,17 @@ tl::expected<bool, ErrorCode> NvmeKvStorageBackend::IsExist(
     if (!initialized_.load(std::memory_order_acquire)) {
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
-    const auto connector = connector_;
-    if (connector == nullptr) {
+    if (object_store_ == nullptr) {
         return false;
     }
-    auto resolved = ResolveRoot(*connector, key);
-    if (!resolved) {
-        return tl::make_unexpected(resolved.error());
-    }
-    return resolved.value().has_value();
+    return object_store_->IsExist({key});
 }
 
 tl::expected<bool, ErrorCode> NvmeKvStorageBackend::IsEnableOffloading() {
     if (!initialized_.load(std::memory_order_acquire)) {
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
-    if (connector_ == nullptr) {
+    if (object_store_ == nullptr) {
         return false;
     }
     return total_keys_.load(std::memory_order_relaxed) <

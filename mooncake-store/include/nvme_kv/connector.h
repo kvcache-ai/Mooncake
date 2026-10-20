@@ -14,6 +14,10 @@ namespace mooncake {
 
 struct FileStorageConfig;
 
+namespace test {
+class NvmeKvConnectorTestPeer;
+}  // namespace test
+
 class NvmeKvConnector {
    public:
     using PhysicalKey = NvmeKvCommandExecutor::PhysicalKey;
@@ -39,6 +43,8 @@ class NvmeKvConnector {
     const Capabilities &GetCapabilities() const;
 
    private:
+    friend class test::NvmeKvConnectorTestPeer;
+
     std::string storage_path_;
     std::unique_ptr<NvmeKvCommandExecutor> executor_;
 };
