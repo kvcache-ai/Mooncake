@@ -950,4 +950,68 @@ TEST(MasterServiceOffloadScenarioTest,
         .Then(Objects(2, kObjectCount).NamedBy(key).AreReadable());
 }
 
+// A full in-flight room skips every object its owner has not written yet, but
+// an object already on disk can give back its memory replica at once. With
+// more expired objects than the compact frontier holds, the frontier can be
+// all older memory-only objects; the refill past it must still reach the newer
+// disk-backed ones instead of leaving them until the owners drain the queue.
+TEST(MasterServiceOffloadScenarioTest,
+     FullInFlightRoomStillFreesDiskBackedObjectsPastTheFrontier) {
+    // The frontier holds the target plus at least 1024 objects, so the
+    // memory-only objects fill it and the disk-backed ones sit past it.
+    constexpr size_t kMemoryOnly = 1196;
+    constexpr size_t kDiskBacked = 4;
+    const auto key = [](size_t index) {
+        return "past_frontier_" + std::to_string(index);
+    };
+    const auto disk_key = [](size_t index) {
+        return "past_frontier_disk_" + std::to_string(index);
+    };
+    const auto base = std::chrono::system_clock::now() - std::chrono::hours(1);
+    MasterServiceConfig config = OffloadOnEvictConfig();
+    config.default_kv_lease_ttl = 0;  // no leases in the way
+    // Only the cycles the test runs evict.
+    config.eviction_high_watermark_ratio = 1.0;
+    config.offloading_queue_limit = 4;  // the mailbox is not the bound
+    config.offload_cap_ratio = 0.5;     // cap = 2 objects in flight
+    MasterScenario scenario(
+        "a full in-flight room still frees disk-backed objects past the "
+        "frontier",
+        config);
+    scenario.Given(MemoryNode("node").Capacity(64 * 1024 * 1024))
+        .When(MountLocalDisk("node"))
+        .Given(Objects(0, kMemoryOnly)
+                   .NamedBy(key)
+                   .Size(1_KB)
+                   .By("node")
+                   .CompleteOn("node")
+                   .ExpiredFrom(base))
+        .Given(Objects(0, kDiskBacked)
+                   .NamedBy(disk_key)
+                   .Size(1_KB)
+                   .By("node")
+                   .CompleteOn("node")
+                   .ExpiredFrom(base + std::chrono::minutes(1)))
+        // The owner has written the newest objects to its disk already; they
+        // keep their memory replicas until a cycle frees them.
+        .When(CompleteOffload(
+                  {disk_key(0), disk_key(1), disk_key(2), disk_key(3)})
+                  .By("node")
+                  .OnNode("node")
+                  .OfSize(1024))
+        // Target 2 of 1200: the two oldest objects fill the in-flight room.
+        .When(EvictMemory(0.0015))
+        .When(OffloadHeartbeat("node").ExpectTasks({key(0), key(1)}, 1024))
+        // Target 6 of 1198 with no room left: the frontier (the 1030 oldest)
+        // is all memory-only and skipped, so only the refill past it reaches
+        // the disk-backed objects.
+        .When(EvictMemory(0.005))
+        .When(OffloadHeartbeat("node").ExpectNoTasks())
+        .Then(Object(disk_key(0)).HasMemoryReplicas(0).HasLocalDiskReplicas(1))
+        .Then(Object(disk_key(1)).HasMemoryReplicas(0).HasLocalDiskReplicas(1))
+        .Then(Object(disk_key(2)).HasMemoryReplicas(0).HasLocalDiskReplicas(1))
+        .Then(Object(disk_key(3)).HasMemoryReplicas(0).HasLocalDiskReplicas(1))
+        .Then(Objects(0, kMemoryOnly).NamedBy(key).AreReadable());
+}
+
 }  // namespace mooncake::test

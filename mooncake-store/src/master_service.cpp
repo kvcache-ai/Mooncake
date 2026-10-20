@@ -11333,6 +11333,12 @@ MasterService::EvictionBackoff MasterService::BatchEvict(
         num_threads, std::chrono::system_clock::time_point::max());
     std::vector<std::vector<std::chrono::system_clock::time_point>>
         local_soft_pin(num_threads);
+    // Newest no-soft-pin candidate that already holds a LOCAL_DISK replica:
+    // once the in-flight room is gone these are the only objects the cycle can
+    // still free, and the refill below looks past the frontier for them only
+    // when one lies there.
+    std::vector<std::chrono::system_clock::time_point> local_newest_disk_backed(
+        num_threads, std::chrono::system_clock::time_point::min());
 
     std::vector<std::thread> threads;
     for (int t = 0; t < num_threads; t++) {
@@ -11378,6 +11384,12 @@ MasterService::EvictionBackoff MasterService::BatchEvict(
                                     {s, tenant_id, it->first, deadline});
                             } else {
                                 local_no_pin[t].push_back(deadline);
+                                if (offload_on_evict_ &&
+                                    deadline > local_newest_disk_backed[t] &&
+                                    has_local_disk_replica(
+                                        it->second.metadata)) {
+                                    local_newest_disk_backed[t] = deadline;
+                                }
                             }
                         } else if (allow_evict_soft_pinned_objects_) {
                             local_soft_pin[t].push_back(deadline);
@@ -11412,6 +11424,10 @@ MasterService::EvictionBackoff MasterService::BatchEvict(
             : 0;
     if (offload_on_evict_) {
         offload_room = std::max<long>(0, offload_cap - pending_offloads);
+    }
+    auto newest_disk_backed = std::chrono::system_clock::time_point::min();
+    for (const auto& v : local_newest_disk_backed) {
+        if (v > newest_disk_backed) newest_disk_backed = v;
     }
 
     std::vector<Candidate> candidates;
@@ -11468,7 +11484,8 @@ MasterService::EvictionBackoff MasterService::BatchEvict(
     // the census above, so the selected set matches what the census counted.
     auto collect_candidates = [&](bool use_cutoff,
                                   std::chrono::system_clock::time_point cutoff,
-                                  bool collect_older_or_equal) {
+                                  bool collect_older_or_equal,
+                                  bool disk_backed_only) {
         std::vector<std::vector<Candidate>> local_frontier(num_threads);
         std::vector<std::thread> collectors;
         collectors.reserve(num_threads);
@@ -11500,6 +11517,10 @@ MasterService::EvictionBackoff MasterService::BatchEvict(
                                                           ? deadline <= cutoff
                                                           : deadline > cutoff;
                                 if (!in_range) continue;
+                            }
+                            if (disk_backed_only &&
+                                !has_local_disk_replica(metadata)) {
+                                continue;
                             }
                             local_frontier[t].push_back(
                                 {s, tenant_id, key, deadline});
@@ -11544,7 +11565,8 @@ MasterService::EvictionBackoff MasterService::BatchEvict(
                              no_pin_timeouts.end());
             reserve_cutoff = no_pin_timeouts[reserve_count - 1];
             candidates = collect_candidates(/*use_cutoff=*/true, reserve_cutoff,
-                                            /*collect_older_or_equal=*/true);
+                                            /*collect_older_or_equal=*/true,
+                                            /*disk_backed_only=*/false);
 
             // Shortfall guard: if churn left the frontier holding fewer
             // objects than the target needs, fall back to the full candidate
@@ -11553,13 +11575,14 @@ MasterService::EvictionBackoff MasterService::BatchEvict(
             if (candidates.size() >= primary_count) {
                 compact_frontier_used = true;
             } else {
-                candidates =
-                    collect_candidates(/*use_cutoff=*/false, {},
-                                       /*collect_older_or_equal=*/true);
+                candidates = collect_candidates(/*use_cutoff=*/false, {},
+                                                /*collect_older_or_equal=*/true,
+                                                /*disk_backed_only=*/false);
             }
         } else {
             candidates = collect_candidates(/*use_cutoff=*/false, {},
-                                            /*collect_older_or_equal=*/true);
+                                            /*collect_older_or_equal=*/true,
+                                            /*disk_backed_only=*/false);
         }
     }
     // ===== Phase 2: Serial eviction via key lookup =====
@@ -11626,12 +11649,18 @@ MasterService::EvictionBackoff MasterService::BatchEvict(
         // reserve is exhausted before the target is met, refill from the
         // remainder of the current no-soft-pin population. This recovery
         // scan is paid only on churn and preserves the behavior of
-        // continuing past the cutoff until evict_num is reached.
+        // continuing past the cutoff until evict_num is reached. Once the
+        // in-flight room is gone, every candidate without a LOCAL_DISK replica
+        // is skipped for the rest of the cycle, so the refill then collects
+        // only objects the owners have already written, and runs only when
+        // the census saw one past the cutoff.
         if (!stop_eviction_scan && compact_frontier_used &&
-            !offload_room_exhausted && evicted_this_pass < evict_num) {
+            evicted_this_pass < evict_num &&
+            (!offload_room_exhausted || newest_disk_backed > reserve_cutoff)) {
             auto refill_candidates = collect_candidates(
                 /*use_cutoff=*/true, reserve_cutoff,
-                /*collect_older_or_equal=*/false);
+                /*collect_older_or_equal=*/false,
+                /*disk_backed_only=*/offload_room_exhausted);
             evict_candidate_batch(refill_candidates);
         }
     }
