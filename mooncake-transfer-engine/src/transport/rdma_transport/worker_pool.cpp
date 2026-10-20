@@ -744,8 +744,10 @@ void WorkerPool::performPostSend(int thread_id) {
             continue;
         }
         // Set endpoint pointer for each slice before submitting
+        auto auto_gid_token = endpoint->autoGidCompletionToken();
         for (auto &slice : entry.second) {
             slice->rdma.endpoint = endpoint.get();
+            slice->rdma.auto_gid_token = auto_gid_token;
         }
         endpoint->submitPostSend(entry.second, failed_slice_list);
         if (!endpoint->active()) context_.deleteEndpointByPtr(endpoint.get());
@@ -964,8 +966,12 @@ void WorkerPool::processCompletions(int thread_id,
                 }
                 retry_list = &local_failed_slice_list;
             } else {
-                if (hasAvailablePeerRailAlternative(slice,
-                                                    slice->peerNicPath())) {
+                bool auto_gid_recovery = false;
+                if (wc.status == IBV_WC_RETRY_EXC_ERR) {
+                    auto_gid_recovery = recordAutoGidDataPathFailure(slice);
+                }
+                if (!auto_gid_recovery && hasAvailablePeerRailAlternative(
+                                              slice, slice->peerNicPath())) {
                     markRailFailed(slice->peerNicPath(), true);
                     redispatch_counter_++;
                 }
@@ -979,6 +985,9 @@ void WorkerPool::processCompletions(int thread_id,
                 finalize_slice(slice, false);
             }
         } else {
+            if (slice->rdma.auto_gid_token.observe_success) {
+                recordAutoGidDataPathSuccess(slice);
+            }
             finalize_slice(slice, true);
         }
     }
@@ -997,6 +1006,27 @@ void WorkerPool::processCompletions(int thread_id,
     if (!failed_slice_list.empty()) {
         redispatch(failed_slice_list, thread_id, false, defer_local_redispatch);
     }
+}
+
+bool WorkerPool::recordAutoGidDataPathFailure(Transport::Slice *slice) {
+    const auto token = slice->rdma.auto_gid_token;
+    if (!token.valid || !context_.autoGidSelectionEnabled() ||
+        globalConfig().auto_gid_max_retries <= 0) {
+        return false;
+    }
+    auto action = context_.recordAutoGidCompletion(
+        slice->peerNicPath(), {token.endpoint_id, token.selection_epoch},
+        /*success=*/false);
+    return action != AutoGidDataPathAction::kExhausted &&
+           action != AutoGidDataPathAction::kUnavailable;
+}
+
+void WorkerPool::recordAutoGidDataPathSuccess(Transport::Slice *slice) {
+    const auto token = slice->rdma.auto_gid_token;
+    if (!token.valid) return;
+    context_.recordAutoGidCompletion(slice->peerNicPath(),
+                                     {token.endpoint_id, token.selection_epoch},
+                                     /*success=*/true);
 }
 
 void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
@@ -1351,9 +1381,10 @@ bool WorkerPool::handleContextEvent(ibv_event_type event_type,
                                         : "fatal event: ")
                   << event_type;
     } else if (event_type == IBV_EVENT_GID_CHANGE) {
-        auto gid_refresh_result = refreshPublishedLocalGid();
         if (event != nullptr) ibv_ack_async_event(event);
+        auto gid_refresh_result = refreshPublishedLocalGid();
 
+        // refreshCurrentGid already retires invalid per-peer GID bindings.
         if (gid_refresh_result != GidRefreshResult::UNCHANGED) {
             auto endpoint_lifecycle_locks =
                 context_.lockAllEndpointLifecycles();

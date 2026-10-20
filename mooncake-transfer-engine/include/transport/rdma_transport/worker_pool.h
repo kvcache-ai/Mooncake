@@ -101,6 +101,8 @@ class WorkerPool {
     void maybeActivateRecoveredContext();
     bool hasAvailablePeerRailAlternative(Transport::Slice *slice,
                                          const std::string &failed_peer_path);
+    bool recordAutoGidDataPathFailure(Transport::Slice *slice);
+    void recordAutoGidDataPathSuccess(Transport::Slice *slice);
 
     static bool isLocalWcFailure(const ibv_wc &wc);
 

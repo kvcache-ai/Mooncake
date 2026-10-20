@@ -2098,8 +2098,8 @@ TEST_F(RealClientTest, TestPutSessionStartRejectsReliableNofConfig) {
     EXPECT_EQ(rcs[0], kInvalidParams);
 }
 
-// Filtered start_keys must keep group_ids aligned (skip existing sessions).
-TEST_F(RealClientTest, TestPutSessionStartFiltersGroupIds) {
+// Skip existing sessions while keeping every per-key field aligned.
+TEST_F(RealClientTest, TestPutSessionStartFiltersSessionGroupAndHcaHints) {
     ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))
         << "Failed to start in-proc master";
     master_address_ = master_.master_address();
@@ -2119,17 +2119,24 @@ TEST_F(RealClientTest, TestPutSessionStartFiltersGroupIds) {
 
     ReplicateConfig first_config;
     first_config.group_ids = std::vector<std::string>{"group_a"};
+    first_config.session_ids = std::vector<std::string>{"session_a"};
+    first_config.per_key_preferred_hca_names =
+        std::vector<std::vector<std::string>>{{"mlx5_0"}};
     ASSERT_EQ(py_client_->batch_put_session_start({"group_key_a"}, {kSize},
                                                   first_config)[0],
               0);
 
     ReplicateConfig batch_config;
     batch_config.group_ids = std::vector<std::string>{"group_a", "group_b"};
+    batch_config.session_ids =
+        std::vector<std::string>{"session_a", "session_b"};
+    batch_config.per_key_preferred_hca_names =
+        std::vector<std::vector<std::string>>{{"mlx5_0"}, {"mlx5_1"}};
     auto rcs = py_client_->batch_put_session_start(
         {"group_key_a", "group_key_b"}, {kSize, kSize}, batch_config);
     ASSERT_EQ(rcs.size(), 2u);
     EXPECT_EQ(rcs[0], kInvalidParams) << "existing session should be skipped";
-    EXPECT_EQ(rcs[1], 0) << "filtered group_ids must match remaining keys";
+    EXPECT_EQ(rcs[1], 0) << "filtered metadata must match remaining keys";
 
     auto revoke_rcs =
         py_client_->batch_put_session_revoke({"group_key_a", "group_key_b"});

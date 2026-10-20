@@ -216,6 +216,8 @@ struct TransferHandshakeUtil {
         root["qp_num"] = qpNums;
         if (desc.ready_ack_supported || desc.ready_ack)
             root["ready_ack"] = desc.ready_ack;
+        if (!desc.auto_gid_reprobe_from.empty())
+            root["auto_gid_reprobe_from"] = desc.auto_gid_reprobe_from;
         if (desc.notify_qp_num != 0 || desc.ctrl_channel) {
             root["notify_qp_num"] = Json::UInt(desc.notify_qp_num);
             root["notify_rq_depth"] = Json::UInt(desc.notify_rq_depth);
@@ -264,6 +266,13 @@ struct TransferHandshakeUtil {
             desc.ready_ack = root["ready_ack"].asBool();
         } else {
             desc.ready_ack = false;
+        }
+        if (root.isMember("auto_gid_reprobe_from") &&
+            root["auto_gid_reprobe_from"].isString()) {
+            desc.auto_gid_reprobe_from =
+                root["auto_gid_reprobe_from"].asString();
+        } else {
+            desc.auto_gid_reprobe_from.clear();
         }
         desc.notify_qp_num = 0;
         desc.notify_rq_depth = 0;

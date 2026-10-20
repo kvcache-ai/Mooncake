@@ -341,10 +341,12 @@ This strategy currently applies to memory allocation with `replica_num == 1`. Ex
 
 **HCA-local NUMA placement**
 
-This Store feature is disabled by default. Enable it on the master, storage
+This Store feature is experimental and disabled by default. Enable it on the master, storage
 clients and RL workers before startup; unset, `0`, `false` or invalid values
 keep the existing allocation, memory layout and read-selection behavior.
 Transfer Engine's existing affinity setting alone does not enable this feature.
+Enabled-path small-object overhead has been observed; an end-to-end RL speedup
+has not been demonstrated.
 
 RDMA Store ranges bound to one NUMA node report receiver-local NUMA/HCA metadata to the
 master. Within a selected segment, allocation tries matching HCA-local ranges,
@@ -385,7 +387,8 @@ winner.
 
 Explicit hints override inference (`None` allows inference; an empty shared
 list or per-key entry means no preference). Per-key hints follow input key order and remain
-aligned with group IDs when a batch is filtered or retried:
+aligned with session and group IDs when a batch is filtered, retried or expanded
+into tensor-parallel shards:
 
 ```python
 from mooncake.store import ReplicateConfig

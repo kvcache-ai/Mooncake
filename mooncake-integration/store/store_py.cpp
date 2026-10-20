@@ -1171,68 +1171,39 @@ class MooncakeStorePyWrapper {
     ReplicateConfig MakeIndexedConfig(
         const ReplicateConfig &config,
         const std::vector<size_t> &original_indices) const {
-        ReplicateConfig indexed_config = config;
-        if (config.session_ids) {
-            indexed_config.session_ids->clear();
-            for (size_t index : original_indices) {
-                indexed_config.session_ids->push_back(
-                    config.session_ids->at(index));
-            }
-        }
-        if (!config.group_ids.has_value()) {
-            return indexed_config;
-        }
-
-        std::vector<std::string> group_ids;
-        group_ids.reserve(original_indices.size());
-        for (size_t index : original_indices) {
-            group_ids.push_back(config.group_ids->at(index));
-        }
-        indexed_config.group_ids = std::move(group_ids);
-        return indexed_config;
+        return config.ForKeySubset(original_indices);
     }
 
     ReplicateConfig MakeRepeatedIndexedConfig(
         const ReplicateConfig &config,
         const std::vector<size_t> &original_indices, int repeat_count) const {
-        ReplicateConfig indexed_config = config;
-        if (config.session_ids) {
-            indexed_config.session_ids->clear();
-            for (size_t index : original_indices) {
-                for (int i = 0; i < repeat_count; ++i) {
-                    indexed_config.session_ids->push_back(
-                        config.session_ids->at(index));
-                }
-            }
+        if (!config.group_ids && !config.session_ids &&
+            !config.per_key_preferred_hca_names) {
+            return config;
         }
-        if (!config.group_ids.has_value()) {
-            return indexed_config;
-        }
-
-        std::vector<std::string> group_ids;
-        group_ids.reserve(original_indices.size() *
-                          static_cast<size_t>(repeat_count));
+        std::vector<size_t> shard_indices;
+        shard_indices.reserve(original_indices.size() *
+                              static_cast<size_t>(repeat_count));
         for (size_t index : original_indices) {
             for (int i = 0; i < repeat_count; ++i) {
-                group_ids.push_back(config.group_ids->at(index));
+                shard_indices.push_back(index);
             }
         }
-        indexed_config.group_ids = std::move(group_ids);
-        return indexed_config;
+        return config.ForKeySubset(shard_indices);
     }
 
-    std::vector<int> ValidateGroupIdsForBatchConfig(
-        const ReplicateConfig &config, size_t key_count,
-        const char *operation_name) const {
+    std::vector<int> ValidateBatchKeyHints(const ReplicateConfig &config,
+                                           size_t key_count,
+                                           const char *operation_name) const {
         if (!config.ValidSessionIds(key_count)) {
             LOG(ERROR) << operation_name << ": invalid per-key session IDs";
             return std::vector<int>(key_count,
                                     to_py_ret(ErrorCode::INVALID_PARAMS));
         }
-        if (config.group_ids.has_value() &&
-            config.group_ids->size() != key_count) {
+        if (!config.HasValidKeyHints(key_count)) {
             LOG(ERROR) << operation_name
-                       << ": group_ids size must match keys size";
+                       << ": group_ids and per-key HCA hint counts must match "
+                          "keys size";
             return std::vector<int>(key_count,
                                     to_py_ret(ErrorCode::INVALID_PARAMS));
         }
@@ -1243,7 +1214,9 @@ class MooncakeStorePyWrapper {
         const std::string &key, pybind11::object tensor,
         const ReplicateConfig &config = ReplicateConfig{}, int tp_rank = 0,
         int tp_size = 1, int split_dim = 0) {
-        if (!config.ValidSessionIds(1))
+        // Single-tensor TP keeps per-shard group/HCA hints and one source
+        // session ID, which is expanded to all shards below.
+        if (!config.ValidSessionIds(1) || !config.HasValidKeyHints(tp_size))
             return to_py_ret(ErrorCode::INVALID_PARAMS);
         try {
             std::vector<std::string> tp_keys;
@@ -1292,6 +1265,8 @@ class MooncakeStorePyWrapper {
         const std::vector<std::string> &keys,
         const std::vector<PyTensorInfo> &infos,
         const ReplicateConfig &config = ReplicateConfig{}) {
+        auto config_error = ValidateBatchKeyHints(config, keys.size(), "put");
+        if (!config_error.empty()) return config_error;
         if (auto cuda_ipc_results =
                 try_dummy_cuda_ipc_batch_put_tensor_impl(keys, infos, config)) {
             return *cuda_ipc_results;
@@ -1318,6 +1293,9 @@ class MooncakeStorePyWrapper {
         const std::vector<std::string> &keys,
         const std::vector<PyTensorInfo> &infos,
         const ReplicateConfig &config = ReplicateConfig{}) {
+        auto config_error =
+            ValidateBatchKeyHints(config, keys.size(), "upsert");
+        if (!config_error.empty()) return config_error;
         if (auto cuda_ipc_results = try_dummy_cuda_ipc_batch_upsert_tensor_impl(
                 keys, infos, config)) {
             return *cuda_ipc_results;
@@ -1381,10 +1359,10 @@ class MooncakeStorePyWrapper {
         std::vector<size_t> processed_indices;
         std::vector<int> final_results(base_keys.size(),
                                        to_py_ret(ErrorCode::INVALID_PARAMS));
-        auto group_ids_error = ValidateGroupIdsForBatchConfig(
-            config, base_keys.size(), "batch_put_tensor_with_tp");
-        if (!group_ids_error.empty()) {
-            return group_ids_error;
+        auto config_error = ValidateBatchKeyHints(config, base_keys.size(),
+                                                  "batch_put_tensor_with_tp");
+        if (!config_error.empty()) {
+            return config_error;
         }
         try {
             for (size_t i = 0; i < base_keys.size(); ++i) {
