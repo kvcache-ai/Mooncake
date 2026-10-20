@@ -60,6 +60,8 @@ struct FileStorageEnvironment {
         "MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_INTERVAL_SECONDS"};
     ScopedEnvVar client_buffer_gc_ttl{
         "MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_TTL_MS"};
+    ScopedEnvVar client_buffer_alloc_wait{
+        "MOONCAKE_OFFLOAD_CLIENT_BUFFER_ALLOC_WAIT_MS"};
     ScopedEnvVar enable_disk_watermark_eviction{
         "MOONCAKE_OFFLOAD_ENABLE_DISK_WATERMARK_EVICTION"};
     ScopedEnvVar disk_eviction_high_watermark_ratio{
@@ -85,6 +87,7 @@ void ExpectDefaultFileStorageConfig(const FileStorageConfig& config) {
     EXPECT_EQ(config.heartbeat_interval_seconds, 10u);
     EXPECT_EQ(config.client_buffer_gc_interval_seconds, 1u);
     EXPECT_EQ(config.client_buffer_gc_ttl_ms, 5000u);
+    EXPECT_EQ(config.client_buffer_alloc_wait_ms, 5000u);
     EXPECT_FALSE(config.use_uring);
     EXPECT_FALSE(config.enable_dfs);
     EXPECT_TRUE(config.enable_disk_watermark_eviction);
@@ -129,6 +132,7 @@ TEST_F(FileStorageConfigTest, ReadsValidValues) {
     env.heartbeat_interval.Set("5");
     env.client_buffer_gc_interval.Set("7");
     env.client_buffer_gc_ttl.Set("9000");
+    env.client_buffer_alloc_wait.Set("1200");
     env.enable_disk_watermark_eviction.Set("0");
     env.disk_eviction_high_watermark_ratio.Set("0.75");
     env.disk_eviction_low_watermark_ratio.Set("0.50");
@@ -146,6 +150,7 @@ TEST_F(FileStorageConfigTest, ReadsValidValues) {
     EXPECT_EQ(config.heartbeat_interval_seconds, 5u);
     EXPECT_EQ(config.client_buffer_gc_interval_seconds, 7u);
     EXPECT_EQ(config.client_buffer_gc_ttl_ms, 9000u);
+    EXPECT_EQ(config.client_buffer_alloc_wait_ms, 1200u);
     EXPECT_FALSE(config.enable_disk_watermark_eviction);
     EXPECT_DOUBLE_EQ(config.disk_eviction_high_watermark_ratio, 0.75);
     EXPECT_DOUBLE_EQ(config.disk_eviction_low_watermark_ratio, 0.50);

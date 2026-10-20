@@ -1227,22 +1227,63 @@ FileStorage::AllocateBatch(const std::vector<std::string>& keys,
         }
 
         auto alloc_result = allocator.allocate(alloc_size);
-        if (!alloc_result && !gc_triggered &&
-            &allocator == client_buffer_allocator_.get()) {
-            gc_triggered = true;
-            {
-                MutexLocker locker(&client_buffer_mutex_);
-                auto gc_now = std::chrono::steady_clock::now();
-                for (auto it = client_buffer_allocated_batches_.begin();
-                     it != client_buffer_allocated_batches_.end();) {
-                    if (gc_now >= it->second->lease_timeout) {
-                        it = client_buffer_allocated_batches_.erase(it);
-                    } else {
-                        ++it;
+        if (!alloc_result && &allocator == client_buffer_allocator_.get()) {
+            if (!gc_triggered) {
+                gc_triggered = true;
+                size_t reaped = 0;
+                {
+                    MutexLocker locker(&client_buffer_mutex_);
+                    auto gc_now = std::chrono::steady_clock::now();
+                    for (auto it = client_buffer_allocated_batches_.begin();
+                         it != client_buffer_allocated_batches_.end();) {
+                        if (gc_now >= it->second->lease_timeout) {
+                            it = client_buffer_allocated_batches_.erase(it);
+                            ++reaped;
+                        } else {
+                            ++it;
+                        }
                     }
                 }
+                if (reaped > 0) {
+                    // Freed arena memory may satisfy other waiting readers.
+                    client_buffer_release_cv_.notify_all();
+                }
+                alloc_result = allocator.allocate(alloc_size);
             }
-            alloc_result = allocator.allocate(alloc_size);
+            // Still out of staging space: wait for in-flight read batches to
+            // release their arena slices instead of failing the read outright.
+            // Concurrent SSD restores legitimately share this arena, so a hard
+            // BUFFER_OVERFLOW here is a spurious failure, not an overload
+            // signal. The wait is bounded by client_buffer_alloc_wait_ms and
+            // wakes on batch release (or the lease GC reaping a dead holder).
+            if (!alloc_result && config_.client_buffer_alloc_wait_ms > 0) {
+                const auto deadline = std::chrono::steady_clock::now() +
+                                      std::chrono::milliseconds(
+                                          config_.client_buffer_alloc_wait_ms);
+                LOG(WARNING)
+                    << "Staging arena exhausted (" << config_.local_buffer_size
+                    << " bytes); waiting up to "
+                    << config_.client_buffer_alloc_wait_ms
+                    << "ms for in-flight read batches to release";
+                while (!alloc_result) {
+                    auto remaining =
+                        deadline - std::chrono::steady_clock::now();
+                    if (remaining <= std::chrono::milliseconds(0)) {
+                        break;
+                    }
+                    {
+                        std::unique_lock<std::mutex> lk(
+                            client_buffer_release_mu_);
+                        client_buffer_release_cv_.wait_for(lk, remaining);
+                    }
+                    alloc_result = allocator.allocate(alloc_size);
+                }
+                if (alloc_result) {
+                    LOG(INFO)
+                        << "Staging allocation succeeded after waiting for "
+                           "a batch release";
+                }
+            }
         }
         if (!alloc_result) {
             return tl::make_unexpected(ErrorCode::BUFFER_OVERFLOW);
@@ -1275,15 +1316,20 @@ void FileStorage::ClientBufferGCThreadFunc() {
             MutexLocker locker(&client_buffer_mutex_);
             if (!client_buffer_allocated_batches_.empty()) {
                 auto now = std::chrono::steady_clock::now();
+                size_t reaped = 0;
                 for (auto it = client_buffer_allocated_batches_.begin();
                      it != client_buffer_allocated_batches_.end();) {
                     if (now >= it->second->lease_timeout) {
                         VLOG(1) << "GC releasing batch_id: " << it->first
                                 << " (lease expired)";
                         it = client_buffer_allocated_batches_.erase(it);
+                        ++reaped;
                     } else {
                         ++it;
                     }
+                }
+                if (reaped > 0) {
+                    client_buffer_release_cv_.notify_all();
                 }
             }
         }
@@ -1302,12 +1348,20 @@ tl::expected<bool, ErrorCode> FileStorage::Exists(const std::string& key) {
 }
 
 bool FileStorage::ReleaseBuffer(uint64_t batch_id) {
-    MutexLocker locker(&client_buffer_mutex_);
-    auto it = client_buffer_allocated_batches_.find(batch_id);
-    if (it != client_buffer_allocated_batches_.end()) {
-        VLOG(1) << "Releasing buffer for batch_id: " << batch_id
-                << " (transfer completed)";
-        client_buffer_allocated_batches_.erase(it);
+    bool released = false;
+    {
+        MutexLocker locker(&client_buffer_mutex_);
+        auto it = client_buffer_allocated_batches_.find(batch_id);
+        if (it != client_buffer_allocated_batches_.end()) {
+            VLOG(1) << "Releasing buffer for batch_id: " << batch_id
+                    << " (transfer completed)";
+            client_buffer_allocated_batches_.erase(it);
+            released = true;
+        }
+    }
+    if (released) {
+        // Wake readers waiting on staging-arena space in AllocateBatch.
+        client_buffer_release_cv_.notify_all();
         return true;
     }
     VLOG(1) << "batch_id " << batch_id

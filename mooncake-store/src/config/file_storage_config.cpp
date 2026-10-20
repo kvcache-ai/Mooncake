@@ -103,6 +103,10 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
         Environ::ReadOr(Variables::MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_TTL_MS,
                         config.client_buffer_gc_ttl_ms);
 
+    config.client_buffer_alloc_wait_ms =
+        Environ::ReadOr(Variables::MOONCAKE_OFFLOAD_CLIENT_BUFFER_ALLOC_WAIT_MS,
+                        config.client_buffer_alloc_wait_ms);
+
     const auto enable_disk_watermark_eviction = Environ::ReadOr(
         Variables::MOONCAKE_OFFLOAD_ENABLE_DISK_WATERMARK_EVICTION,
         std::string{config.enable_disk_watermark_eviction ? "true" : "false"});

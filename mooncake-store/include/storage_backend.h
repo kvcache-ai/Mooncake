@@ -230,6 +230,15 @@ struct FileStorageConfig {
     uint32_t client_buffer_gc_interval_seconds = 1;
     uint64_t client_buffer_gc_ttl_ms = 5000;
 
+    // How long a staging-buffer allocation may wait for in-flight read batches
+    // to release arena memory before the read fails with BUFFER_OVERFLOW.
+    // Concurrent SSD restores legitimately share the arena
+    // (local_buffer_size), so a bounded wait converts a spurious hard failure
+    // into backpressure. The default pairs with client_buffer_gc_ttl_ms: a
+    // batch whose engine disappeared is reaped within that TTL, so waiting
+    // this long always observes the backstop.
+    uint32_t client_buffer_alloc_wait_ms = 5000;
+
     // Use io_uring for file I/O instead of POSIX pread/pwrite
     bool use_uring = false;
 
