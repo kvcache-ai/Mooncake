@@ -248,7 +248,9 @@ pinned host memory.
 Both direct RDMA and host-staged transfers involving XPU memory currently
 require an **XPU-platform initiator**, even when its local buffer is DRAM and
 only the remote buffer is XPU memory. Staging also requires the initiator's
-`XpuTransport` to be enabled. A CPU-platform initiator cannot currently route
+`XpuTransport` to be enabled; without it, XPU memory is not staged and is
+routed only over a transport that copies device memory itself, such as TCP.
+A CPU-platform initiator cannot currently route
 these requests; it does not transparently fall back to staging. A `cpu:0`
 buffer inside an XPU-platform process is not a CPU-platform peer.
 

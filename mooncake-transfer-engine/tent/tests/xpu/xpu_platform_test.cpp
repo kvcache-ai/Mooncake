@@ -25,8 +25,10 @@
 #include <unistd.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <string_view>
 #include <vector>
 
 #include "tent/common/config.h"
@@ -37,6 +39,19 @@
 namespace mooncake {
 namespace tent {
 namespace {
+
+// On hardware expected to support dma-buf export, set
+// MC_TENT_XPU_REQUIRE_DMABUF_RDMA=1 so missing support fails instead of
+// skipping.
+bool requireDmabufRdma() {
+    const char *value = std::getenv("MC_TENT_XPU_REQUIRE_DMABUF_RDMA");
+    return value && std::string_view(value) == "1";
+}
+#define SKIP_UNLESS_REQUIRED(message)               \
+    do {                                            \
+        if (requireDmabufRdma()) FAIL() << message; \
+        GTEST_SKIP() << message;                    \
+    } while (0)
 
 class XpuPlatformTest : public ::testing::Test {
    protected:
@@ -53,7 +68,7 @@ class XpuPlatformTest : public ::testing::Test {
             if (m.name.rfind("xpu:", 0) == 0) device_count_++;
         }
         if (device_count_ == 0) {
-            GTEST_SKIP() << "no SYCL device available; skipping XPU test";
+            SKIP_UNLESS_REQUIRED("no SYCL device available; skipping XPU test");
         }
     }
 
@@ -253,7 +268,7 @@ TEST_F(XpuPlatformTest, DeviceAllocationExportsAsDmabuf) {
     Status s = platform_->exportDmabuf(dev, kSize, base);
     if (s.IsInternalError()) {
         EXPECT_TRUE(platform_->free(dev, kSize).ok());
-        GTEST_SKIP() << "SYCL backend has no dma-buf export: " << s;
+        SKIP_UNLESS_REQUIRED("SYCL backend has no dma-buf export: " << s);
     }
     ASSERT_TRUE(s.ok()) << s;
     EXPECT_GE(base.fd, 0);
@@ -304,7 +319,7 @@ TEST_F(XpuPlatformTest, SeparateAllocationsExportDistinctDmabufs) {
     if (s.IsInternalError()) {
         EXPECT_TRUE(platform_->free(a, kSize).ok());
         EXPECT_TRUE(platform_->free(b, kSize).ok());
-        GTEST_SKIP() << "SYCL backend has no dma-buf export: " << s;
+        SKIP_UNLESS_REQUIRED("SYCL backend has no dma-buf export: " << s);
     }
     ASSERT_TRUE(s.ok()) << s;
     ASSERT_TRUE(platform_->exportDmabuf(b, kSize, eb).ok());

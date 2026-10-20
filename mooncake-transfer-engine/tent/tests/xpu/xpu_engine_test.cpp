@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <memory>
 #include <string_view>
 #include <thread>
@@ -159,7 +160,8 @@ class XpuEngineTest : public ::testing::TestWithParam<Params> {
         ASSERT_NE(*out, nullptr);
         opts.type = registration;
         ASSERT_TRUE(engine.registerLocalMemory({*out}, {kLength}, opts).ok());
-        EXPECT_TRUE(TransferEngineImplTestPeer::hasXpuTag(engine, *out));
+        EXPECT_EQ(TransferEngineImplTestPeer::hasXpuTag(engine, *out),
+                  &engine != a_.get() || local_xpu_);
     }
     TransferStatus wait(BatchID batch) {
         TransferStatus status{};
@@ -197,12 +199,16 @@ class XpuEngineTest : public ::testing::TestWithParam<Params> {
         const auto network = std::get<0>(GetParam()) ? HP_TCP : TCP;
         auto route = TransferEngineImplTestPeer::route(*a_, request);
         ASSERT_EQ(route.transport, network);
-        ASSERT_EQ(route.staging_params.size(), 3u);
-        // Only device sides are staged; the stage location must resolve.
-        EXPECT_EQ(route.staging_params[1].empty(),
-                  std::string_view(local_location) == "cpu:0");
-        EXPECT_EQ(route.staging_params[2].empty(),
-                  std::string_view(peer_location) == "cpu:0");
+        if (local_xpu_) {
+            ASSERT_EQ(route.staging_params.size(), 3u);
+            // Only device sides are staged; the stage location must resolve.
+            EXPECT_EQ(route.staging_params[1].empty(),
+                      std::string_view(local_location) == "cpu:0");
+            EXPECT_EQ(route.staging_params[2].empty(),
+                      std::string_view(peer_location) == "cpu:0");
+        } else {
+            EXPECT_TRUE(route.staging_params.empty());
+        }
         // Submit without a hint: the engine must reach staging on its own.
         auto batch = a_->allocateBatch(1);
         ASSERT_NE(batch, 0u);
@@ -216,6 +222,7 @@ class XpuEngineTest : public ::testing::TestWithParam<Params> {
     }
     std::unique_ptr<TransferEngineImpl> a_, b_;
     std::vector<std::pair<TransferEngineImpl*, BatchID>> batches_;
+    bool local_xpu_ = true;  // a_ has XpuTransport enabled
 };
 
 TEST_P(XpuEngineTest, DefaultRegistrationSelectsLocalXpuCopy) {
@@ -283,10 +290,41 @@ TEST_P(XpuEngineTest, UnstagedHostSourceMustCarryHostTransport) {
     EXPECT_EQ(route.transport, UNSPEC);
 }
 
+// Without a local XpuTransport the initiator cannot stage, so routing is left
+// to transport capabilities: TCP copies device memory itself.
+TEST_P(XpuEngineTest, DisabledXpuTransportRoutesByCapability) {
+    if (std::get<0>(GetParam()))
+        GTEST_SKIP() << "HP TCP alone cannot register device memory";
+    auto c = config();
+    c->set("transports/xpu/enable", false);
+    a_ = std::make_unique<TransferEngineImpl>(c);
+    ASSERT_TRUE(a_->available());
+    local_xpu_ = false;
+    ASSERT_NO_FATAL_FAILURE(transfer("xpu:0", "xpu:0", Request::WRITE));
+    ASSERT_NO_FATAL_FAILURE(transfer("xpu:0", "xpu:0", Request::READ));
+    ASSERT_NO_FATAL_FAILURE(transfer("cpu:0", "xpu:0", Request::WRITE));
+    ASSERT_NO_FATAL_FAILURE(transfer("cpu:0", "xpu:0", Request::READ));
+    ASSERT_NO_FATAL_FAILURE(transfer("xpu:0", "cpu:0", Request::WRITE));
+    ASSERT_NO_FATAL_FAILURE(transfer("xpu:0", "cpu:0", Request::READ));
+}
+
 INSTANTIATE_TEST_SUITE_P(NetworkAndDispatchModes, XpuEngineTest,
                          ::testing::Combine(::testing::Bool(),
                                             ::testing::Bool(),
                                             ::testing::Bool()));
+
+// On hardware expected to support dma-buf RDMA, set
+// MC_TENT_XPU_REQUIRE_DMABUF_RDMA=1 so missing support fails instead of
+// skipping.
+bool requireDmabufRdma() {
+    const char* value = std::getenv("MC_TENT_XPU_REQUIRE_DMABUF_RDMA");
+    return value && std::string_view(value) == "1";
+}
+#define SKIP_UNLESS_REQUIRED(message)               \
+    do {                                            \
+        if (requireDmabufRdma()) FAIL() << message; \
+        GTEST_SKIP() << message;                    \
+    } while (0)
 
 // GPUDirect-style path: with an RNIC whose verbs provide ibv_reg_dmabuf_mr,
 // XPU buffers are registered through dma-buf export, carry RDMA, and route
@@ -316,17 +354,17 @@ class XpuDirectRdmaTest : public ::testing::TestWithParam<bool> {
         opts.location = "xpu:0";
         void* probe = nullptr;
         if (!platform.allocate(&probe, 4096, opts).ok())
-            GTEST_SKIP() << "No SYCL device available";
+            SKIP_UNLESS_REQUIRED("No SYCL device available");
         DmabufExport exported;
         auto s = platform.exportDmabuf(probe, 4096, exported);
         ASSERT_TRUE(platform.free(probe, 4096).ok());
-        if (!s.ok()) GTEST_SKIP() << "No dma-buf export: " << s;
+        if (!s.ok()) SKIP_UNLESS_REQUIRED("No dma-buf export: " << s);
         a_ = std::make_unique<TransferEngineImpl>(config());
         b_ = std::make_unique<TransferEngineImpl>(config());
         ASSERT_TRUE(a_->available());
         ASSERT_TRUE(b_->available());
         if (!TransferEngineImplTestPeer::rdmaGpuDirect(*a_))
-            GTEST_SKIP() << "No RDMA device with ibv_reg_dmabuf_mr";
+            SKIP_UNLESS_REQUIRED("No RDMA device with ibv_reg_dmabuf_mr");
     }
     void TearDown() override {
         for (auto [engine, batch] : batches_)
@@ -407,8 +445,12 @@ TEST_P(XpuDirectRdmaTest, DeviceToDeviceReadAndWrite) {
 // Both engines use the XPU platform. cpu:0 selects host memory in that
 // process; this is not coverage of a CPU-platform initiator (unsupported).
 TEST_P(XpuDirectRdmaTest, OneDeviceSideReadAndWrite) {
+    // Host to device.
     ASSERT_NO_FATAL_FAILURE(transfer("cpu:0", "xpu:0", Request::WRITE));
     ASSERT_NO_FATAL_FAILURE(transfer("xpu:0", "cpu:0", Request::READ));
+    // Device to host.
+    ASSERT_NO_FATAL_FAILURE(transfer("xpu:0", "cpu:0", Request::WRITE));
+    ASSERT_NO_FATAL_FAILURE(transfer("cpu:0", "xpu:0", Request::READ));
 }
 
 // The dma-buf direct route exists on RDMA alone. A request hinted to another

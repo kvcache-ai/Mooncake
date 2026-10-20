@@ -1556,8 +1556,10 @@ SelectionResult TransferEngineImpl::planTransport(const Request& request,
     // Plan XPU/MLU staging before selecting a host-only network transport.
     // XPU can bypass staging only with registered dma-buf buffers and RDMA
     // device capability. Other transport hints or a policy rejecting direct
-    // RDMA require staging; MLU always requires it. Keep the original memory
-    // types for policy matching.
+    // RDMA require staging; MLU always requires it. XPU staging needs the
+    // local XpuTransport; without it, selection is left to transport
+    // capabilities (e.g. TCP copies device memory itself). Keep the original
+    // memory types for policy matching.
     std::vector<std::string> host_staging_params;
     std::vector<TransportType> staging_transports;
     if (desc->type == SegmentType::Memory &&
@@ -1574,7 +1576,7 @@ SelectionResult TransferEngineImpl::planTransport(const Request& request,
             (hint == UNSPEC || hint == RDMA) &&
             xpuDirectRdmaReady(request, entry, local_mtype, remote_mtype);
         if (xpu_direct) *xpu_direct = direct;
-        if ((xpu_side && !direct) || mlu_side) {
+        if ((xpu_side && !direct && transport_list_[XPU]) || mlu_side) {
             findStagingPolicy(request, host_staging_params);
             if (host_staging_params.empty()) return SelectionResult{};
             // A staged side is replaced by a freshly registered host stage
@@ -2102,8 +2104,9 @@ void TransferEngineImpl::findStagingPolicy(const Request& request,
     // copy to that peer. Each device side needs a resolvable host stage. Fail
     // closed when topology or the local copy transport is unavailable.
     // planTransport bypasses this policy for a verified XPU dma-buf RDMA
-    // route; otherwise every device side, including a mixed-vendor peer,
-    // must stage rather than exposing device memory to a host-only transport.
+    // route; otherwise, when XpuTransport is present, every device side,
+    // including a mixed-vendor peer, must stage rather than exposing device
+    // memory to a host-only transport.
     if (((transport_list_[XPU] &&
           (local_mtype == MTYPE_XPU || remote_mtype == MTYPE_XPU)) ||
          ((local_mtype == MTYPE_MLU || remote_mtype == MTYPE_MLU) &&
