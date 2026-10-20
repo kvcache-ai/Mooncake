@@ -2,7 +2,10 @@
 
 #include <csignal>
 
+#include <atomic>
+#include <memory>
 #include <string>
+#include <thread>
 #include <boost/functional/hash.hpp>
 #include <cstdint>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
@@ -454,5 +457,15 @@ class RpcWorkerPool;
 void RegisterRpcService(coro_rpc::coro_rpc_server& server,
                         mooncake::WrappedMasterService& wrapped_master_service,
                         RpcWorkerPool* worker_pool = nullptr);
+
+// Stops `server` and then destroys `worker_pool`, which waits for every
+// handler already handed to it, queued or running. `server_thread` runs
+// server.start() and sets `server_done` when start() returns; it is joined,
+// or detached if start() does not return (stop() raced with its start-up).
+// When this returns, no RPC handler can change the service any more.
+void StopRpcServerAndDrainHandlers(coro_rpc::coro_rpc_server& server,
+                                   std::thread& server_thread,
+                                   const std::atomic<bool>& server_done,
+                                   std::unique_ptr<RpcWorkerPool>& worker_pool);
 
 }  // namespace mooncake

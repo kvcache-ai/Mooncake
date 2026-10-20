@@ -9,17 +9,25 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <memory>
 #include <string>
 #include <thread>
 #include <vector>
 
+#include <async_simple/coro/SyncAwait.h>
+#include <ylt/coro_rpc/coro_rpc_client.hpp>
+#include <ylt/coro_rpc/coro_rpc_server.hpp>
+
+#include "common/network.h"
 #include "crc32c.h"
 #include "handoff/handoff_admission.h"
 #include "handoff/handoff_lifecycle.h"
 #include "handoff/handoff_runtime.h"
 #include "handoff/handoff_writer.h"
 #include "master_service.h"
+#include "rpc_service.h"
+#include "rpc_worker_pool.h"
 
 namespace mooncake::test {
 namespace {
@@ -1086,6 +1094,141 @@ TEST(HandoffEndToEndTest, ShutdownThenStartupRestoresTheIndex) {
         new_master.GetReplicaList("k-0-3", TenantId::Default()).has_value());
     // One shot: nothing left to restore.
     EXPECT_EQ(RunHandoffStartup(steps, Options(root.path())).result, "none");
+}
+
+// An RPC handler that runs on the worker pool, like every master RPC that
+// changes the index: it holds its worker thread until released, then removes
+// a key.
+class LateRemover {
+   public:
+    LateRemover(MasterService& service, std::string key)
+        : service_(service), key_(std::move(key)) {}
+
+    int Remove() {
+        running_.store(true);
+        release_.wait();
+        removed_.store(
+            service_.Remove(key_, TenantId::Default(), true).has_value());
+        return 0;
+    }
+
+    bool running() const { return running_.load(); }
+    bool removed() const { return removed_.load(); }
+    void Release() { release_promise_.set_value(); }
+
+   private:
+    MasterService& service_;
+    const std::string key_;
+    std::atomic<bool> running_{false};
+    std::atomic<bool> removed_{false};
+    std::promise<void> release_promise_;
+    std::shared_future<void> release_ = release_promise_.get_future().share();
+};
+
+// A handler that an io thread handed to the worker pool before the RPC
+// server stopped finishes within the stop step, before the quiesce, so it
+// cannot change the index while the snapshot is written. The handler here
+// is released one second after the stop step begins; a stop step that did
+// not wait for the pool would let the snapshot be written first.
+TEST(HandoffEndToEndTest, PooledHandlersFinishBeforeTheSnapshot) {
+    TempDir root;
+    MasterService master(MasterServiceConfig::builder()
+                             .set_memory_allocator(BufferAllocatorType::OFFSET)
+                             .set_eviction_ratio(0.0)
+                             .set_eviction_high_watermark_ratio(1.0)
+                             .build());
+    const Segment segment = MakeSegment(0);
+    const UUID client = generate_uuid();
+    ASSERT_TRUE(master.MountSegment(segment, client).has_value());
+    PutObject(master, client, segment, "kept");
+    PutObject(master, client, segment, "removed-by-a-late-handler");
+    ASSERT_EQ(master.HandoffObjectCount(), 2u);
+
+    LateRemover remover(master, "removed-by-a-late-handler");
+    const int port = getFreeTcpPort();
+    coro_rpc::coro_rpc_server server(/*thread_num=*/1, port, "127.0.0.1",
+                                     std::chrono::seconds(0),
+                                     /*tcp_no_delay=*/true);
+    auto worker_pool = std::make_unique<RpcWorkerPool>(1);
+    worker_pool->Register<&LateRemover::Remove>(server, remover);
+    std::atomic<bool> server_done{false};
+    std::thread server_thread([&] {
+        (void)server.start();
+        server_done.store(true);
+    });
+
+    // start() runs on its own thread, as in mooncake_master; retry the
+    // connect until it listens.
+    std::unique_ptr<coro_rpc::coro_rpc_client> rpc_client;
+    for (int i = 0; i < 100 && !rpc_client; ++i) {
+        auto attempt = std::make_unique<coro_rpc::coro_rpc_client>();
+        auto ec = async_simple::coro::syncAwait(
+            attempt->connect("127.0.0.1", std::to_string(port)));
+        if (!ec) {
+            rpc_client = std::move(attempt);
+        } else {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+    }
+    ASSERT_NE(rpc_client, nullptr);
+    std::thread caller([&] {
+        // The server stops before it can answer; only the removal matters.
+        (void)async_simple::coro::syncAwait(
+            rpc_client->call_for<&LateRemover::Remove>(
+                std::chrono::seconds(30)));
+    });
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!remover.running() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    ASSERT_TRUE(remover.running());
+
+    std::thread releaser;
+    ShutdownSteps steps;
+    steps.stop_serving = [&] {
+        releaser = std::thread([&] {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            remover.Release();
+        });
+        StopRpcServerAndDrainHandlers(server, server_thread, server_done,
+                                      worker_pool);
+    };
+    steps.quiesce = [&] { master.QuiesceBackgroundWork(); };
+    steps.read_memory = [] {
+        return tl::expected<MemorySnapshot, std::string>(
+            Memory(80 * kGiB, 1 * kGiB));
+    };
+    steps.object_count = [&] { return master.HandoffObjectCount(); };
+    steps.disk_free = [](const std::string& p) { return FreeDiskBytes(p); };
+    steps.write =
+        [&](const std::string& dir,
+            size_t workers) -> tl::expected<ShutdownWriteResult, std::string> {
+        HandoffWriteOptions options;
+        options.dir = dir;
+        options.workers = workers;
+        auto written = WriteHandoffSnapshot(master, options);
+        if (!written) return tl::make_unexpected(written.error());
+        return ShutdownWriteResult{
+            written->stats.objects, written->stats.total_bytes,
+            written->stats.local_disk_replicas,
+            written->stats.disk_only_objects, written->ToJson()};
+    };
+    ShutdownReport report =
+        RunHandoffShutdown(steps, {root.path(), true, 3, 4});
+    if (releaser.joinable()) {
+        releaser.join();
+    } else {
+        remover.Release();
+    }
+    caller.join();
+    worker_pool.reset();  // waits for the handler if it is still running
+
+    ASSERT_EQ(report.result, "ok") << report.detail;
+    ASSERT_TRUE(remover.removed());
+    // The snapshot holds the index as the handler left it.
+    EXPECT_EQ(master.HandoffObjectCount(), 1u);
+    EXPECT_EQ(report.objects, 1u);
 }
 // ---- Never serve next to a READY that could not be claimed or removed;
 // never serve without POISON as a non-owner.

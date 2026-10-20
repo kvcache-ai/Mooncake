@@ -1,5 +1,6 @@
 #include "rpc_service.h"
 
+#include <chrono>
 #include <cstddef>
 #include <functional>
 #include <string_view>
@@ -2205,6 +2206,33 @@ void RegisterRpcService(coro_rpc::coro_rpc_server& server,
         &WrappedMasterService::QueryWeightOperation,
         &WrappedMasterService::DeleteWeightRevision>(
         server, wrapped_master_service, worker_pool);
+}
+
+void StopRpcServerAndDrainHandlers(
+    coro_rpc::coro_rpc_server& server, std::thread& server_thread,
+    const std::atomic<bool>& server_done,
+    std::unique_ptr<RpcWorkerPool>& worker_pool) {
+    // stop() closes the acceptor and the connections and joins the io
+    // threads, so no new call reaches a handler. It does not wait for the
+    // handlers that an io thread already handed to the worker pool.
+    server.stop();
+    LOG(INFO) << "RPC server stopped";
+    // If stop() raced with the start-up of the accept loop, start() may never
+    // return although no io thread is left to run a handler. Do not wait for
+    // it forever.
+    for (int i = 0; i < 200 && !server_done.load(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    if (server_done.load()) {
+        server_thread.join();
+    } else {
+        LOG(WARNING) << "RPC server start() did not return after stop(); "
+                        "detaching it";
+        server_thread.detach();
+    }
+    // Waits for the handlers queued or running on the pool.
+    worker_pool.reset();
+    LOG(INFO) << "RPC handlers drained";
 }
 
 }  // namespace mooncake
