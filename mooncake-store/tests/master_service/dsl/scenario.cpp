@@ -1922,8 +1922,8 @@ MasterScenario& MasterScenario::Then(BatchProbeSpec batch_probe) {
         return *this;
     }
 
-    const auto result =
-        service_->BatchProbeKey(batch_probe.keys, TenantId(batch_probe.tenant));
+    const auto result = service_->BatchProbeKey({}, batch_probe.keys,
+                                                TenantId(batch_probe.tenant));
     if (result.size() != batch_probe.expected.size()) {
         Fail("BatchProbe returned " + std::to_string(result.size()) +
              " results; expected " +

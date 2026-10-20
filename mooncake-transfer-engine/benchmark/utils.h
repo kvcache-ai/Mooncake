@@ -42,6 +42,10 @@
 #include <hip/hip_runtime.h>
 #endif
 
+#ifdef USE_MLU
+#include <cnrt.h>
+#endif
+
 #define CHECK_FAIL(call)                                        \
     do {                                                        \
         auto status_ = call;                                    \
@@ -233,17 +237,47 @@ static inline bool isHipMemory(void* ptr) {
 }
 #endif
 
-static inline bool isGpuMemory(void* ptr) {
-#if defined(USE_CUDA) || defined(USE_SUNRISE)
-    if (isCudaMemory(ptr)) return true;
-#endif
-#ifdef USE_HIP
-    if (isHipMemory(ptr)) return true;
-#endif
-    return false;
+#ifdef USE_MLU
+static inline bool isMluMemory(void* ptr) {
+    cnrtPointerAttributes_t attr{};
+    return cnrtPointerGetAttributes(&attr, ptr) == cnrtSuccess &&
+           attr.type == cnrtMemTypeDevice;
 }
+#endif
+
+#ifdef USE_MLU
+static inline void copyMluData(void* host, void* device, size_t length,
+                               bool to_device) {
+    cnrtPointerAttributes_t attr{};
+    auto err = cnrtPointerGetAttributes(&attr, device);
+    LOG_ASSERT(err == cnrtSuccess)
+        << "cnrtPointerGetAttributes failed: " << cnrtGetErrorStr(err);
+    int previous_device = 0;
+    err = cnrtGetDevice(&previous_device);
+    LOG_ASSERT(err == cnrtSuccess)
+        << "cnrtGetDevice failed: " << cnrtGetErrorStr(err);
+    err = cnrtSetDevice(attr.device);
+    LOG_ASSERT(err == cnrtSuccess)
+        << "cnrtSetDevice failed: " << cnrtGetErrorStr(err);
+    err = cnrtMemcpy(to_device ? device : host, to_device ? host : device,
+                     length, cnrtMemcpyNoDirection);
+    auto restore = cnrtSetDevice(previous_device);
+    LOG_ASSERT(err == cnrtSuccess)
+        << "cnrtMemcpy failed: " << cnrtGetErrorStr(err);
+    LOG_ASSERT(restore == cnrtSuccess)
+        << "cnrtSetDevice failed: " << cnrtGetErrorStr(restore);
+}
+#endif
 
 static inline void fillData(void* addr, size_t length, uint8_t seed) {
+#ifdef USE_MLU
+    if (isMluMemory(addr)) {
+        std::vector<uint8_t> data(length);
+        fillData(data.data(), length, seed);
+        copyMluData(data.data(), addr, length, true);
+        return;
+    }
+#endif
 #if defined(USE_CUDA)
     if (isCudaMemory(addr)) {
         auto err = cudaMemset(addr, seed, length);
@@ -288,6 +322,17 @@ static inline uint8_t fillData(void* addr, size_t length) {
 
 static inline void verifyData(void* addr, size_t length, uint8_t seed) {
     std::vector<uint8_t> ref_data(length, seed);
+#ifdef USE_MLU
+    if (isMluMemory(addr)) {
+        fillData(ref_data.data(), length, seed);
+        std::vector<uint8_t> act_data(length);
+        copyMluData(act_data.data(), addr, length, false);
+        if (memcmp(act_data.data(), ref_data.data(), length)) {
+            LOG(FATAL) << "Inconsistent data detected";
+        }
+        return;
+    }
+#endif
 #if defined(USE_CUDA)
     if (isCudaMemory(addr)) {
         std::vector<uint8_t> act_data(length);

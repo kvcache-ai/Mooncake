@@ -99,6 +99,8 @@ struct HABackendSpec {
     HABackendType type = HABackendType::UNKNOWN;
     std::string connstring;
     ClusterNamespace cluster_namespace;
+    // Leadership lease TTL in seconds. Currently honored by the etcd backend.
+    int64_t leader_lease_ttl_sec = DEFAULT_MASTER_VIEW_LEASE_TTL_SEC;
 };
 
 struct MasterView {

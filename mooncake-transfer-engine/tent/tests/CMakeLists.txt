@@ -429,9 +429,13 @@ if(TARGET tent_xport_gds)
   target_link_libraries(tent_gds_transport_status_test PRIVATE gtest gtest_main
                                                                tent_link_group)
   target_link_options(
-    tent_gds_transport_status_test PRIVATE "-Wl,--wrap=cuFileDriverOpen"
-    "-Wl,--wrap=cuFileBatchIOGetStatus" "-Wl,--wrap=cuFileBatchIOCancel"
-    "-Wl,--wrap=cuFileBatchIOSubmit" "-Wl,--wrap=cuFileHandleRegister"
+    tent_gds_transport_status_test
+    PRIVATE
+    "-Wl,--wrap=cuFileDriverOpen"
+    "-Wl,--wrap=cuFileBatchIOGetStatus"
+    "-Wl,--wrap=cuFileBatchIOCancel"
+    "-Wl,--wrap=cuFileBatchIOSubmit"
+    "-Wl,--wrap=cuFileHandleRegister"
     "-Wl,--wrap=cuFileHandleDeregister")
   target_include_directories(tent_gds_transport_status_test
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
@@ -543,7 +547,8 @@ if(USE_UB)
   add_executable(
     tent_ub_teardown_test
     ub_teardown_test.cpp ../src/transport/ub/buffers.cpp
-    ../src/transport/ub/context.cpp ../src/transport/ub/jfc.cpp)
+    ../src/transport/ub/context.cpp ../src/transport/ub/endpoint.cpp
+    ../src/transport/ub/endpoint_store.cpp ../src/transport/ub/jfc.cpp)
   target_link_libraries(tent_ub_teardown_test PRIVATE tent_common gtest
                                                       gtest_main)
   target_include_directories(tent_ub_teardown_test
@@ -816,6 +821,17 @@ endif()
 target_include_directories(tent_segment_desc_retry_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_segment_desc_retry_test COMMAND tent_segment_desc_retry_test)
+
+if(USE_MEMFABRIC)
+  add_executable(tent_memfabric_transport_test memfabric_transport_test.cpp)
+  target_link_libraries(tent_memfabric_transport_test PRIVATE gtest gtest_main
+                                                              tent_link_group)
+  target_include_directories(
+    tent_memfabric_transport_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include
+                                          ${CMAKE_CURRENT_SOURCE_DIR}/mock_acl)
+  add_test(NAME tent_memfabric_transport_test
+           COMMAND tent_memfabric_transport_test)
+endif()
 set_tests_properties(tent_segment_desc_retry_test PROPERTIES TIMEOUT 60)
 
 # Fabric transport: attribute codec and slicing math, plus end-to-end cases on
@@ -849,5 +865,17 @@ if(TARGET tent_xport_fabric)
              COMMAND tent_fabric_transport_test
                      --gtest_filter=FabricTransportTest.${case})
     set_tests_properties(tent_fabric_transport_${case} PROPERTIES TIMEOUT 120)
+  endforeach()
+endif()
+
+if(USE_MLU)
+  foreach(suite platform transport engine process)
+    add_executable(tent_mlu_${suite}_test mlu/mlu_${suite}_test.cpp)
+    target_link_libraries(tent_mlu_${suite}_test PRIVATE gtest gtest_main
+                                                         tent_link_group)
+    target_include_directories(tent_mlu_${suite}_test
+                               PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+    add_test(NAME tent_mlu_${suite}_test COMMAND tent_mlu_${suite}_test)
+    set_tests_properties(tent_mlu_${suite}_test PROPERTIES TIMEOUT 300)
   endforeach()
 endif()
