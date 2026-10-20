@@ -68,7 +68,15 @@ uint64_t SaturatingAdd(uint64_t lhs, uint64_t rhs) {
 TenantQuotaPolicy::TenantQuotaPolicy(StoreControl& store, Options options)
     : store_(store),
       options_(options),
-      manager_([this] { return store_.AllocatableMemoryBytes(); }) {}
+      manager_([this] { return store_.AllocatableMemoryBytes(); }) {
+    // The master validates these ranges in its config; within them the
+    // eviction target stays below the watermark, so OnMaintenance never
+    // computes a negative byte count.
+    assert(options_.eviction_high_watermark_ratio >= 0.0 &&
+           options_.eviction_high_watermark_ratio <= 1.0);
+    assert(options_.eviction_ratio >= 0.0 && options_.eviction_ratio <= 1.0);
+    assert(options_.eviction_check_interval.count() >= 0);
+}
 
 void TenantQuotaPolicy::OpenPolicyStoreOrThrow(const std::string& type,
                                                const std::string& uri,

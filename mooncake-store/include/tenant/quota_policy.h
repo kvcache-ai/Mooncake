@@ -42,9 +42,11 @@ namespace mooncake {
 
 class TenantQuotaPolicy final : public NamespacePolicy {
    public:
+    // Internal settings the master passes after validating its config; both
+    // ratios are in [0, 1].
     struct Options {
         // A tenant whose charge exceeds this share of its quota is evicted
-        // down to (watermark - eviction_ratio); zero or less turns it off.
+        // down to (watermark - eviction_ratio); zero turns it off.
         double eviction_high_watermark_ratio = 0.0;
         double eviction_ratio = 0.0;
         // How often the watermark is checked, at most.
