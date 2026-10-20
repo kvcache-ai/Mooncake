@@ -2521,14 +2521,13 @@ void MasterService::ClearInvalidHandles() {
             std::shared_lock<std::shared_mutex> client_lock(client_mutex_);
             retaining_clients = GetRetainingClientIdsLocked();
         }
-        ClearStaleHandlesInShard(
-            i, [&retaining_clients](const Replica& replica) {
-                return (replica.has_invalid_mem_handle() ||
-                        replica.has_invalid_nof_handle() ||
-                        replica.has_stale_local_disk_client(
-                            retaining_clients)) &&
-                       replica.is_completed();
-            });
+        ClearStaleHandlesInShard(i, [&retaining_clients](
+                                        const Replica& replica) {
+            return (replica.has_invalid_mem_handle() ||
+                    replica.has_invalid_nof_handle() ||
+                    replica.has_stale_local_disk_client(retaining_clients)) &&
+                   replica.is_completed();
+        });
     }
 }
 
@@ -2565,8 +2564,7 @@ tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
 }
 
 tl::expected<void, ErrorCode> MasterService::ClearStaleHandlesInShard(
-    size_t shard_index,
-    const std::function<bool(const Replica&)>& is_stale) {
+    size_t shard_index, const std::function<bool(const Replica&)>& is_stale) {
     std::optional<ErrorCode> first_persist_error;
     // Pass 1: pick out the keys that need work under the shard's shared
     // lock. A sweep normally finds nothing in most shards, and such a
@@ -2596,8 +2594,8 @@ tl::expected<void, ErrorCode> MasterService::ClearStaleHandlesInShard(
     bool erased_in_shard = false;
     for (size_t begin = 0; begin < stale_keys.size();
          begin += kStaleHandleCleanupBatchSize) {
-        const size_t end = std::min(begin + kStaleHandleCleanupBatchSize,
-                                    stale_keys.size());
+        const size_t end =
+            std::min(begin + kStaleHandleCleanupBatchSize, stale_keys.size());
         MetadataShardAccessorRW shard(this, shard_index);
         for (size_t j = begin; j < end; j++) {
             auto tenant_it = shard->tenants.find(stale_keys[j].first);
@@ -2616,21 +2614,18 @@ tl::expected<void, ErrorCode> MasterService::ClearStaleHandlesInShard(
                     if (enable_oplog_) {
                         // The erase runs from the durable-finalize
                         // callback.
-                        auto persist_result =
-                            PersistStaleHandleCleanupForHA(
-                                "ClearStaleHandles", tenant_it->first,
-                                it->first, it->second.metadata,
-                                cleanup_plan);
+                        auto persist_result = PersistStaleHandleCleanupForHA(
+                            "ClearStaleHandles", tenant_it->first, it->first,
+                            it->second.metadata, cleanup_plan);
                         if (!persist_result && !first_persist_error) {
                             first_persist_error = persist_result.error();
                         }
                         continue;
                     }
                 }
-                if (CleanupStaleHandles(
-                        it->first, tenant_it->first,
-                        GetBoundTenantQuotaHandle(tenant_state), it->second,
-                        is_stale, &shard)) {
+                if (CleanupStaleHandles(it->first, tenant_it->first,
+                                        GetBoundTenantQuotaHandle(tenant_state),
+                                        it->second, is_stale, &shard)) {
                     EraseMetadata(tenant_state, it, tenant_it->first,
                                   QuotaEraseMode::kFull, &shard);
                     erased_in_shard = true;
@@ -2640,20 +2635,17 @@ tl::expected<void, ErrorCode> MasterService::ClearStaleHandlesInShard(
             } else if (!it->second.metadata.IsValid()) {
                 if (enable_ha_) {
                     if (enable_oplog_) {
-                        auto persist_result =
-                            AppendOpLogWithDurableFinalize(
-                                OpType::REMOVE, tenant_it->first.value(),
-                                it->first, {},
-                                [this,
-                                 object =
-                                     route::ObjectRef{
-                                         it->first, it->second.generation}](
-                                    const OpLogEntry& durable_entry) {
-                                    FinalizeMetadataEraseAfterDurable(
-                                        object,
-                                        TenantId(durable_entry.tenant_id),
-                                        QuotaEraseMode::kFull);
-                                });
+                        auto persist_result = AppendOpLogWithDurableFinalize(
+                            OpType::REMOVE, tenant_it->first.value(), it->first,
+                            {},
+                            [this,
+                             object = route::ObjectRef{it->first,
+                                                       it->second.generation}](
+                                const OpLogEntry& durable_entry) {
+                                FinalizeMetadataEraseAfterDurable(
+                                    object, TenantId(durable_entry.tenant_id),
+                                    QuotaEraseMode::kFull);
+                            });
                         if (!persist_result) {
                             LOG(WARNING)
                                 << "ClearStaleHandles(last replica)"
@@ -2661,8 +2653,7 @@ tl::expected<void, ErrorCode> MasterService::ClearStaleHandlesInShard(
                                 << it->first << ", err="
                                 << static_cast<int>(persist_result.error());
                             if (!first_persist_error) {
-                                first_persist_error =
-                                    persist_result.error();
+                                first_persist_error = persist_result.error();
                             }
                         }
                         continue;
@@ -8842,9 +8833,9 @@ auto MasterService::Ping(const UUID& client_id)
         std::shared_lock<std::shared_mutex> lock(client_status_mutex_);
         client_ok = client_status_view_.contains(client_id);
     }
-    const ClientStatus client_status =
-        observation_accepted && client_ok ? ClientStatus::OK
-                                          : ClientStatus::NEED_REMOUNT;
+    const ClientStatus client_status = observation_accepted && client_ok
+                                           ? ClientStatus::OK
+                                           : ClientStatus::NEED_REMOUNT;
     return PingResponse(view_version_, client_status);
 }
 

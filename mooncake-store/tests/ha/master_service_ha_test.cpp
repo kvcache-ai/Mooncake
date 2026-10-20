@@ -2004,6 +2004,240 @@ TEST_F(MasterServiceHATest, RemountRefreshesLeaseWhenAnotherReplicaIsReadable) {
               std::chrono::system_clock::now());
 }
 
+TEST_F(MasterServiceHATest, PingStaysResponsiveDuringRemountMetadataWalk) {
+    MasterService service(MasterServiceConfig::builder()
+                              .set_enable_ha(false)
+                              .set_default_kv_lease_ttl(10000)
+                              .build());
+    // Standby objects keep the segment accounted, so ReMountSegment runs the
+    // metadata restore walk that visits every metadata shard.
+    const std::string endpoint = "ping_walk_remount_segment";
+    const std::string key = "ping_walk_remount_key";
+    auto object = MakeStandbyObject(key, endpoint);
+    object.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    ASSERT_TRUE(service
+                    .RestoreFromStandbySnapshot(
+                        {object}, 7, {MakeStandbyMemorySegment(endpoint)})
+                    .has_value());
+
+    // The heartbeat client whose Ping calls must complete while the walk is
+    // in flight. Mount it before the remount: admission needs the same locks
+    // the remount is about to hold, and a disjoint base keeps its range away
+    // from the segment the remount restores.
+    const auto pinger =
+        PrepareSimpleSegment(service, "ping_walk_pinger_segment",
+                             kDefaultSegmentBase + kDefaultSegmentSize);
+    const UUID remount_client = generate_uuid();
+
+    // Park the walk on the first shard it visits, so the remount cannot leave
+    // the restore pass while the lock is held.
+    std::string park_key;
+    for (int i = 0; i < 1000000; ++i) {
+        const std::string candidate = "ping_walk_park_" + std::to_string(i);
+        if (MasterServiceTestPeer(service).getShardIndex(kDefaultTenant,
+                                                         candidate) == 0) {
+            park_key = candidate;
+            break;
+        }
+    }
+    ASSERT_FALSE(park_key.empty());
+    auto park_lock =
+        LockMetadataShardForTesting(service, kDefaultTenant, park_key);
+
+    auto remount = std::async(std::launch::async, [&] {
+        return service.ReMountSegment({MakeSegment(endpoint)}, remount_client);
+    });
+
+    // The remount is inside the restore pass once it has released
+    // client_mutex_ but still holds master_state exclusively -- the same
+    // observable PutStartHoldsSnapshotAfterClientReleaseForTesting detects.
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    bool walk_reached = false;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (PutStartHoldsSnapshotAfterClientReleaseForTesting(service)) {
+            walk_reached = true;
+            break;
+        }
+        std::this_thread::yield();
+    }
+
+    // Every heartbeat must complete with OK while the remount is parked in
+    // the walk. Before the fix the remount held client_mutex_ exclusively
+    // for the whole walk, so each Ping blocked until the walk finished --
+    // which is also why the loop only runs once the remount is known to be
+    // inside the walk: a Ping issued outside that state would hang instead
+    // of failing.
+    constexpr int kPings = 8;
+    std::vector<tl::expected<PingResponse, ErrorCode>> pings;
+    std::vector<std::chrono::steady_clock::duration> ping_durations;
+    if (walk_reached) {
+        pings.reserve(kPings);
+        ping_durations.reserve(kPings);
+        for (int i = 0; i < kPings; ++i) {
+            const auto start = std::chrono::steady_clock::now();
+            pings.push_back(service.Ping(pinger.client_id));
+            ping_durations.push_back(std::chrono::steady_clock::now() - start);
+        }
+    }
+    // The remount is still parked in the walk, so the pings above really
+    // overlapped it.
+    const bool still_in_walk =
+        walk_reached &&
+        PutStartHoldsSnapshotAfterClientReleaseForTesting(service);
+
+    park_lock.unlock();
+    const auto remount_result = remount.get();
+
+    ASSERT_TRUE(walk_reached)
+        << "remount never entered the metadata restore walk";
+    for (size_t i = 0; i < pings.size(); ++i) {
+        ASSERT_TRUE(pings[i].has_value());
+        EXPECT_EQ(pings[i]->client_status, ClientStatus::OK);
+        EXPECT_LT(std::chrono::duration_cast<std::chrono::milliseconds>(
+                      ping_durations[i])
+                      .count(),
+                  2000)
+            << "ping " << i << " blocked behind the remount walk";
+    }
+    EXPECT_TRUE(still_in_walk);
+    ASSERT_TRUE(remount_result.has_value()) << toString(remount_result.error());
+    EXPECT_EQ(service.Ping(remount_client)->client_status, ClientStatus::OK);
+}
+
+TEST_F(MasterServiceHATest,
+       ClearInvalidHandlesSeesOwnerThatBecameRetainingMidSweep) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+    const std::string endpoint = "sweep_mid_mount_segment";
+    const auto shard_of = [&](const std::string& key) {
+        return MasterServiceTestPeer(service).getShardIndex(kDefaultTenant,
+                                                            key);
+    };
+    // Three keys on shards in walk order: the sweep erases the progress
+    // marker first, parks on the middle shard, and only reaches the third
+    // shard after the park is released.
+    std::string progress_key;
+    std::string park_key;
+    std::string live_key;
+    for (int i = 0; i < 1000000; ++i) {
+        const std::string candidate =
+            "sweep_mid_mount_key_" + std::to_string(i);
+        const size_t shard = shard_of(candidate);
+        if (progress_key.empty() && shard <= 300) {
+            progress_key = candidate;
+        } else if (!progress_key.empty() && park_key.empty() && shard > 300 &&
+                   shard <= 700) {
+            park_key = candidate;
+        } else if (!park_key.empty() && live_key.empty() && shard > 700) {
+            live_key = candidate;
+            break;
+        }
+    }
+    ASSERT_FALSE(progress_key.empty());
+    ASSERT_FALSE(park_key.empty());
+    ASSERT_FALSE(live_key.empty());
+    ASSERT_LT(shard_of(progress_key), shard_of(park_key));
+    ASSERT_LT(shard_of(park_key), shard_of(live_key));
+
+    const auto make_local_disk_object = [&](const std::string& key,
+                                            const UUID& owner) {
+        StandbyObjectMetadata metadata;
+        metadata.client_id = generate_uuid();
+        metadata.size = 1024;
+        metadata.replicas.push_back(
+            MakeStandbyLocalDiskReplica(owner, endpoint));
+        return StandbyObjectEntry{"default", key, std::move(metadata)};
+    };
+
+    // Two objects whose owners have gone offline before the sweep starts.
+    const UUID offline_progress_owner = generate_uuid();
+    const UUID offline_park_owner = generate_uuid();
+    const UUID recovering_owner = generate_uuid();
+    ASSERT_TRUE(
+        service
+            .RestoreFromStandbySnapshot(
+                {make_local_disk_object(progress_key, offline_progress_owner),
+                 make_local_disk_object(park_key, offline_park_owner)},
+                7, {MakeStandbyMemorySegment(endpoint)})
+            .has_value());
+    for (const UUID& owner : {offline_progress_owner, offline_park_owner}) {
+        const auto record = ClientRecordForTesting(service, owner);
+        ASSERT_TRUE(record);
+        const auto now = ClientLivenessRecord::Clock::now();
+        EXPECT_EQ(record->Evaluate(now, std::chrono::seconds::zero(),
+                                   std::chrono::hours(1)),
+                  ClientLivenessTransition::BECAME_SUSPECTED);
+        EXPECT_EQ(record->Evaluate(now, std::chrono::seconds::zero(),
+                                   std::chrono::seconds::zero()),
+                  ClientLivenessTransition::BECAME_OFFLINE);
+    }
+
+    // Park the sweep on the middle shard: it cannot walk past it while the
+    // lock is held.
+    auto park_lock =
+        LockMetadataShardForTesting(service, kDefaultTenant, park_key);
+    auto sweep = std::async(std::launch::async,
+                            [&] { ClearInvalidHandlesForTesting(service); });
+
+    // The progress marker's erasure proves the sweep is past the first
+    // shard, so a point-in-time capture -- if the sweep took one -- is
+    // already done.
+    const auto marker_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    bool marker_erased = false;
+    while (std::chrono::steady_clock::now() < marker_deadline) {
+        if (ReplicaCountForTesting(service, kDefaultTenant, progress_key) ==
+            0) {
+            marker_erased = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    // While the sweep is parked between shards it must hold no global lock:
+    // the fixed sweep captures liveness per shard and takes only the current
+    // shard's mutex. The old sweep kept master_state_mutex_ shared for the
+    // whole table walk, which would deadlock the restore below (it needs
+    // master_state exclusively). Fail instead of hanging on that code.
+    bool parked_without_global_locks = false;
+    if (marker_erased) {
+        std::unique_lock<std::shared_mutex> probe(
+            MasterServiceTestPeer::MasterStateMutex(service), std::try_to_lock);
+        parked_without_global_locks = probe.owns_lock();
+    }
+    if (!parked_without_global_locks) {
+        park_lock.unlock();
+        sweep.get();
+        FAIL() << "sweep held master_state_mutex_ while parked between shards";
+        return;
+    }
+
+    // The owner registers while the sweep is parked between shards: the
+    // restore installs an ACTIVE liveness record for it and places its
+    // object on a shard the sweep has not reached yet.
+    const auto recovering_restore = service.RestoreFromStandbySnapshot(
+        {make_local_disk_object(live_key, recovering_owner)}, 7,
+        {MakeStandbyMemorySegment(endpoint)});
+
+    park_lock.unlock();
+    sweep.get();
+
+    ASSERT_TRUE(marker_erased) << "sweep never reached the progress marker";
+    ASSERT_TRUE(recovering_restore.has_value())
+        << toString(recovering_restore.error());
+    // The owner became retaining before the sweep reached its shard, so the
+    // liveness-complement re-capture keeps its replica. A point-in-time
+    // capture taken before the restore would have swept it.
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant, live_key), 1u);
+    // Owners that stayed offline are still swept, on both sides of the park.
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant, progress_key),
+              0u);
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant, park_key), 0u);
+}
+
 TEST_F(MasterServiceHATest,
        LocalFirstAllocationDoesNotReacquireClientLockUnderSnapshotBarrier) {
     MasterService service(
