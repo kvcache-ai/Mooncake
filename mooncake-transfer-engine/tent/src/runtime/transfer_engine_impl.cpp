@@ -3079,7 +3079,9 @@ Status TransferEngineImpl::maybeFireSubmitHooks(Batch* batch,
             for (size_t tid = hook.start_task_id; tid < hook.end_task_id;
                  ++tid) {
                 auto& t = batch->task_list[tid];
+#ifdef TENT_HOOK_OWNER_SCAN_COUNTER
                 hook_owner_scans_.fetch_add(1, std::memory_order_relaxed);
+#endif
                 // Merged requests are carried by one owning task; the derived
                 // ones keep their initial status forever, so checking them
                 // would make this hook never fire. getBatchStatus() skips them

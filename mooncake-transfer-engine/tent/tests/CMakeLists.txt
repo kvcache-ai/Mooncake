@@ -126,6 +126,8 @@ add_test(NAME rdma_cancel_test COMMAND rdma_cancel_test)
 # PR #4199 analogue: RDMA-only getBatchStatus skips the owner walk while the
 # worker-published finished_task_count says the batch is still in flight.
 add_executable(tent_batch_counter_wait_test batch_counter_wait_test.cpp)
+target_compile_definitions(tent_batch_counter_wait_test
+                           PRIVATE TENT_HOOK_OWNER_SCAN_COUNTER)
 target_link_libraries(tent_batch_counter_wait_test PRIVATE gtest gtest_main
                                                            tent_link_group)
 if(TARGET asio_shared)
