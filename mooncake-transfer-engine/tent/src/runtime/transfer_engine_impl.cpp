@@ -2290,6 +2290,7 @@ Status TransferEngineImpl::commitPreparedSubmit(
             } else {
                 task.post_time = std::chrono::steady_clock::now();
             }
+            merged_task_id_map[merged_task_id] = task;
             continue;
         }
 
