@@ -20,6 +20,7 @@ Mooncake Transfer Engine supports multiple communication protocols for data tran
 | **ascend** | Huawei Ascend NPU | Ascend NPU communication | ⚠️ Advanced |
 | **hylink** | Hygon DCU + DTK | Hygon DCU HSL fabric communication | ⚠️ Advanced |
 | **tpu** | Google TPU (PJRT) | TPU KV-cache transfer via host-DRAM staging | 🧪 Experimental (TENT) |
+| **xpu** | Intel GPU + oneAPI SYCL | Host staging and same-node XPU P2P/IPC; TCP/RDMA between nodes | ⚠️ Advanced (TENT) |
 | **mpcomm** | RDMA-capable NIC(s) | Multi-NIC memory pooling with NIC/QP load balancing | ⚠️ Advanced (TENT) |
 | **flagcx** | RDMA-capable NIC(s) | Unified P2P transfer through FlagOS FlagCX | ⚠️ Advanced |
 
@@ -482,6 +483,61 @@ planned as a follow-up.
 - DMA-mapped (pinned) staging buffers for true async device DMA are a planned
   performance follow-up.
 
+(intel-xpu-transport)=
+### Intel XPU Transport (xpu)
+
+**Description:** Intel GPU support in TENT through oneAPI SYCL. On the same
+node, the XPU transport copies VRAM directly between XPUs: over PCIe peer
+access within a process, and through Level Zero IPC handles between processes.
+With `rdma`, registered XPU memory is accessed directly through dma-buf when
+available. Otherwise, the XPU transport performs the local device-to-host and
+host-to-device copies, and an existing TCP/RDMA transport carries the staged
+data between peers. See the Intel XPU notes in the RDMA section above.
+
+**Status:** TENT only. `xpu` is a local transport (host staging and same-node
+XPU copies), not a network protocol to pass to Store setup. Select `tcp` or
+`rdma` for the network hop.
+
+**Use When:**
+- Moving Intel GPU device buffers through TENT
+- Copying between Intel GPUs on one node, including between processes such as
+  prefill and decode workers
+- Reading and writing PyTorch XPU tensors with the C++ Mooncake Store backend
+
+**Requirements:**
+- Built with `-DUSE_XPU=ON -DUSE_TENT=ON` using the Intel oneAPI compilers
+  (`icpx` for C++ is required; the build examples also use `icx` for C)
+- Compatible SYCL and Level Zero runtimes and access to the Intel GPU
+- `MC_USE_TENT=1` before constructing the Store client or compatibility API engine
+- A TCP or RDMA transport for transfers between nodes, or when same-node IPC
+  is unavailable
+
+**Configuration:**
+```bash
+export ONEAPI_DEVICE_SELECTOR=level_zero:gpu
+export MC_USE_TENT=1
+```
+
+**Design notes:**
+- Device memory uses `xpu:N` locations. Host/shared USM is treated as host memory.
+- PyTorch XPU device pointers are recognized through the platform default SYCL
+  context. Synchronize producing work before passing a buffer to Mooncake, and
+  keep registered allocations alive until transfers complete.
+- Same-node IPC is used only when the selector policy allows `xpu`; a policy
+  with a non-empty `transports` list must name `"xpu"` ahead of `"rdma"` (see
+  [Transport Selector](../design/tent/transport-selector.md)). Set
+  `transports/xpu/disable_ipc` to `true` to turn IPC off.
+
+**Limitations:**
+- No XPU support in the classic Transfer Engine
+- Transfers involving XPU memory require an XPU-platform initiator (see the
+  RDMA section above)
+- Same-node IPC needs ptrace permission over the exporting process (Yama
+  `ptrace_scope` 0 or 1, or `CAP_SYS_PTRACE`); otherwise transfers fall back
+  to the network transport
+
+**Build instructions:** See {ref}`build-with-intel-xpu`.
+
 ### MPComm Transport (mpcomm)
 
 **Description:** UCL-MPComm (Unified Communication Library - Memory Pool Communication) is an RDMA
@@ -619,6 +675,7 @@ export MOONCAKE_LOCAL_HOSTNAME="node1"
 | Multi-tier Storage | rdma + nvmeof | Combine protocols for different layers |
 | AMD GPU Clusters | rdma + hip | Use HIP for local GPU communication |
 | Cambricon MLU Clusters | rdma | Build with `-DUSE_MLU=ON`; MLU uses the normal RDMA protocol |
+| Intel XPU Clusters | tcp or rdma (TENT) | Build with `-DUSE_XPU=ON -DUSE_TENT=ON` and set `MC_USE_TENT=1`; RDMA uses dma-buf when available, otherwise host staging; same-node XPUs copy over P2P/IPC |
 | Ascend NPU Clusters | rdma + ascend | Use Ascend for NPU-specific operations |
 | Hygon DCU Clusters | rdma + hylink | Build with `-DUSE_HYLINK=ON`; use hylink for HSL fabric communication |
 | Multi-vendor or cross-vendor clusters | flagcx | Build with `-DUSE_FLAGCX=ON`; transfers use the FlagCX P2P Engine over RDMA-capable NICs |

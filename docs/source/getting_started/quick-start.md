@@ -169,6 +169,43 @@ pip install mooncake-transfer-engine-rocm
 ```
 :::
 
+:::{tab-item} Intel XPU
+**Prerequisites**
+
+- Python 3.10 or later; XPU-enabled PyTorch for tensor APIs.
+- An Intel GPU with a compatible driver and Level Zero runtime.
+- Intel oneAPI DPC++ compiler (`icpx`) and SYCL runtime. Source
+  `/opt/intel/oneapi/setvars.sh` before building and running Mooncake.
+
+**Installation**
+
+Build from source with XPU support enabled rather than using the default
+CUDA or non-CUDA wheel:
+
+```bash
+git clone https://github.com/kvcache-ai/Mooncake.git
+cd Mooncake
+sudo bash dependencies.sh
+source /opt/intel/oneapi/setvars.sh
+python -m pip install . \
+  -Ccmake.define.CMAKE_C_COMPILER=icx \
+  -Ccmake.define.CMAKE_CXX_COMPILER=icpx \
+  -Ccmake.define.USE_TENT=ON \
+  -Ccmake.define.USE_XPU=ON \
+  -Ccmake.define.USE_CUDA=OFF
+
+export ONEAPI_DEVICE_SELECTOR=level_zero:gpu
+export MC_USE_TENT=1
+```
+
+XPU requires TENT; the classic Transfer Engine has no XPU support. Use `tcp`
+or `rdma` for Store setup. With `rdma`, XPU memory uses dma-buf RDMA when
+available and is otherwise staged through host memory. XPUs on the same node,
+including in different processes, copy directly over P2P/IPC.
+See {ref}`build-with-intel-xpu` and
+{ref}`Intel XPU Transport <intel-xpu-transport>` for details and limitations.
+:::
+
 :::{tab-item} Moore Threads MUSA
 **Prerequisites**
 

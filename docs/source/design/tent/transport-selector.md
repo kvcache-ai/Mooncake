@@ -110,6 +110,7 @@ For `memory` segments, you can filter by source/destination memory type:
 | `"cpu"` | CPU/host memory |
 | `"hip"` | ROCm/HIP GPU memory |
 | `"npu"` | Ascend NPU memory |
+| `"xpu"` | Intel GPU device memory (host/shared USM matches `"cpu"`) |
 | `"*"` | Any memory type |
 
 For standard `tcp`, the local memory type always describes the initiating
