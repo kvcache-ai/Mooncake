@@ -1,3 +1,4 @@
+#include <fcntl.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -8,20 +9,29 @@
 #include <atomic>
 #include <chrono>
 #include <csignal>
+#include <filesystem>
+#include <fstream>
 #include <future>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
+#include <vector>
 
 #ifdef STORE_USE_ETCD
 #include "etcd_helper.h"
 #endif
 #include "common/network.h"
+#include "ha/kv/ha_kv_backend_factory.h"
 #include "ha/leadership/leader_coordinator_factory.h"
 #include "ha/leadership/high_availability_test_fixture.h"
 #include "ha/leadership/master_service_supervisor.h"
+#include "ha/oplog/oplog_batch_storage.h"
+#include "ha/oplog/oplog_types.h"
+#include "master_client.h"
 #include "master_service.h"
+#include "shutdown_request.h"
 #include "types.h"
 
 namespace mooncake {
@@ -35,6 +45,15 @@ DEFINE_bool(ha_supervisor_child, false,
 DEFINE_int32(ha_supervisor_rpc_port, 0, "Child supervisor RPC port");
 DEFINE_int32(ha_supervisor_admin_port, 0, "Child supervisor admin port");
 DEFINE_string(ha_supervisor_cluster_id, "", "Child supervisor cluster ID");
+DEFINE_bool(ha_supervisor_enable_oplog, false,
+            "Child supervisor enables the batch OpLog");
+DEFINE_string(ha_supervisor_shutdown_file, "",
+              "Child supervisor also treats this file's existence as a "
+              "shutdown request");
+DEFINE_int64(ha_supervisor_client_live_ttl_sec, DEFAULT_CLIENT_LIVE_TTL_SEC,
+             "Child client active TTL");
+DEFINE_int64(ha_supervisor_client_suspicion_ttl_sec,
+             DEFAULT_CLIENT_SUSPICION_TTL_SEC, "Child client suspicion TTL");
 
 void HighAvailabilityTest::SetUpTestSuite() {
     // Initialize glog
@@ -178,31 +197,71 @@ class FakeLeaderCoordinator : public ha::LeaderCoordinator {
 
 class SupervisorChildProcess {
    public:
-    SupervisorChildProcess(int rpc_port, int admin_port, std::string cluster_id)
+    SupervisorChildProcess(
+        int rpc_port, int admin_port, std::string cluster_id,
+        bool enable_oplog = false, std::string log_path = "",
+        std::string shutdown_file = "",
+        int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC,
+        int64_t client_suspicion_ttl_sec = DEFAULT_CLIENT_SUSPICION_TTL_SEC)
         : rpc_port_(rpc_port),
           admin_port_(admin_port),
-          cluster_id_(std::move(cluster_id)) {}
+          cluster_id_(std::move(cluster_id)),
+          enable_oplog_(enable_oplog),
+          log_path_(std::move(log_path)),
+          shutdown_file_(std::move(shutdown_file)),
+          client_live_ttl_sec_(client_live_ttl_sec),
+          client_suspicion_ttl_sec_(client_suspicion_ttl_sec) {}
 
     ~SupervisorChildProcess() { Stop(); }
 
     bool Start() {
-        pid_ = fork();
-        if (pid_ != 0) {
-            return pid_ > 0;
+        // The parent may run client threads, so build everything the child
+        // needs before fork(); between fork and exec the child only calls
+        // dup2, execv and _exit.
+        std::vector<std::string> args = {
+            "/proc/self/exe",
+            "--ha_supervisor_child=true",
+            "--etcd_endpoints=" + FLAGS_etcd_endpoints,
+            "--ha_supervisor_rpc_port=" + std::to_string(rpc_port_),
+            "--ha_supervisor_admin_port=" + std::to_string(admin_port_),
+            "--ha_supervisor_cluster_id=" + cluster_id_,
+            std::string("--ha_supervisor_enable_oplog=") +
+                (enable_oplog_ ? "true" : "false"),
+            "--ha_supervisor_client_live_ttl_sec=" +
+                std::to_string(client_live_ttl_sec_),
+            "--ha_supervisor_client_suspicion_ttl_sec=" +
+                std::to_string(client_suspicion_ttl_sec_),
+        };
+        if (!shutdown_file_.empty()) {
+            args.push_back("--ha_supervisor_shutdown_file=" + shutdown_file_);
+        }
+        std::vector<char*> argv;
+        for (auto& arg : args) {
+            argv.push_back(arg.data());
+        }
+        argv.push_back(nullptr);
+
+        int log_fd = -1;
+        if (!log_path_.empty()) {
+            log_fd = open(log_path_.c_str(),
+                          O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+            if (log_fd < 0) {
+                return false;
+            }
         }
 
-        const std::string endpoints_arg =
-            "--etcd_endpoints=" + FLAGS_etcd_endpoints;
-        const std::string rpc_port_arg =
-            "--ha_supervisor_rpc_port=" + std::to_string(rpc_port_);
-        const std::string admin_port_arg =
-            "--ha_supervisor_admin_port=" + std::to_string(admin_port_);
-        const std::string cluster_arg =
-            "--ha_supervisor_cluster_id=" + cluster_id_;
-        execl("/proc/self/exe", "/proc/self/exe", "--ha_supervisor_child=true",
-              endpoints_arg.c_str(), rpc_port_arg.c_str(),
-              admin_port_arg.c_str(), cluster_arg.c_str(), nullptr);
-        _exit(127);
+        pid_ = fork();
+        if (pid_ == 0) {
+            if (log_fd >= 0) {
+                dup2(log_fd, STDERR_FILENO);
+            }
+            execv("/proc/self/exe", argv.data());
+            _exit(127);
+        }
+        if (log_fd >= 0) {
+            close(log_fd);
+        }
+        return pid_ > 0;
     }
 
     bool IsRunning() {
@@ -213,8 +272,23 @@ class SupervisorChildProcess {
         if (waitpid(pid_, &status, WNOHANG) == 0) {
             return true;
         }
+        exit_status_ = status;
         pid_ = 0;
         return false;
+    }
+
+    bool Signal(int signo) { return pid_ > 0 && kill(pid_, signo) == 0; }
+
+    // Raw wait status, or nullopt if the child is still running at timeout.
+    std::optional<int> WaitForExit(std::chrono::milliseconds timeout) {
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (IsRunning()) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                return std::nullopt;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        return exit_status_;
     }
 
     void Stop() {
@@ -228,9 +302,15 @@ class SupervisorChildProcess {
 
    private:
     pid_t pid_{0};
+    std::optional<int> exit_status_;
     int rpc_port_;
     int admin_port_;
     std::string cluster_id_;
+    bool enable_oplog_;
+    std::string log_path_;
+    std::string shutdown_file_;
+    int64_t client_live_ttl_sec_;
+    int64_t client_suspicion_ttl_sec_;
 };
 
 struct HttpResponse {
@@ -277,8 +357,9 @@ int RunSupervisorChild() {
     config.nof_eviction_ratio = DEFAULT_NOF_EVICTION_RATIO;
     config.nof_eviction_high_watermark_ratio =
         DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO;
-    config.client_active_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC;
-    config.client_suspicion_ttl_sec = DEFAULT_CLIENT_SUSPICION_TTL_SEC;
+    config.client_active_ttl_sec = FLAGS_ha_supervisor_client_live_ttl_sec;
+    config.client_suspicion_ttl_sec =
+        FLAGS_ha_supervisor_client_suspicion_ttl_sec;
     config.nof_heartbeat_interval_sec = DEFAULT_NOF_HEARTBEAT_INTERVAL_SEC;
     config.nof_heartbeat_probe_timeout_ms =
         DEFAULT_NOF_HEARTBEAT_PROBE_TIMEOUT_MS;
@@ -294,10 +375,26 @@ int RunSupervisorChild() {
     config.ha_backend_connstring = FLAGS_etcd_endpoints;
     config.etcd_endpoints = FLAGS_etcd_endpoints;
     config.cluster_id = FLAGS_ha_supervisor_cluster_id;
-    config.enable_oplog = false;
+    config.enable_oplog = FLAGS_ha_supervisor_enable_oplog;
 
-    ha::MasterServiceSupervisor supervisor(config);
-    return supervisor.Start();
+    // Arm the shutdown bound and the handlers like main() does in HA mode.
+    if (!StartShutdownWatchdog(ha::kHaShutdownDeadline) ||
+        !InstallShutdownSignalHandlers()) {
+        return 1;
+    }
+    std::function<bool()> shutdown_requested = ShutdownRequested;
+    if (!FLAGS_ha_supervisor_shutdown_file.empty()) {
+        shutdown_requested = [path = FLAGS_ha_supervisor_shutdown_file] {
+            std::error_code ec;
+            return ShutdownRequested() || std::filesystem::exists(path, ec);
+        };
+    }
+    ha::MasterServiceSupervisor supervisor(config, shutdown_requested);
+    const int result = supervisor.Start();
+    if (ShutdownRequested() || ShutdownLatched()) {
+        ExitAfterShutdown(result);
+    }
+    return result;
 }
 
 TEST_F(HighAvailabilityTest, AcquiredViewFlowsIntoServingMasterService) {
@@ -465,6 +562,768 @@ TEST_F(HighAvailabilityTest, HaWithoutOplogRestoresEmptyContextAndServes) {
     ASSERT_TRUE(WaitForServing(child, ports[1], std::chrono::seconds(20)));
 
     EXPECT_EQ(HttpGet(ports[1], "/get_all_keys").status, 200);
+}
+
+namespace {
+
+using namespace std::chrono_literals;
+
+constexpr std::string_view kWarmingPrefix = "__mooncake_service_warming__:";
+
+#ifdef MOONCAKE_ENABLE_TEST_FAILPOINTS
+constexpr bool kFailPointsEnabled = true;
+#else
+constexpr bool kFailPointsEnabled = false;
+#endif
+
+// File-handshake fail points (see TestFailPoint::Wait): the test arms a point,
+// waits for the process under test to hit it, and releases it. Without
+// MOONCAKE_ENABLE_TEST_FAILPOINTS the points are no-ops and every method here
+// does nothing, so cases that need them skip first.
+class ScopedFailPointDir {
+   public:
+    ScopedFailPointDir() {
+        if (!kFailPointsEnabled) {
+            return;
+        }
+        std::string pattern =
+            ::testing::TempDir() + "mooncake-shutdown-fp-XXXXXX";
+        if (mkdtemp(pattern.data()) == nullptr) {
+            ADD_FAILURE() << "mkdtemp failed for " << pattern;
+            return;
+        }
+        dir_ = pattern;
+        setenv("MOONCAKE_TEST_FAILPOINT_DIR", dir_.c_str(), 1);
+        setenv("MOONCAKE_TEST_FAILPOINT_TIMEOUT_SEC", "20", 1);
+    }
+
+    ~ScopedFailPointDir() {
+        if (dir_.empty()) {
+            return;
+        }
+        unsetenv("MOONCAKE_TEST_FAILPOINT_DIR");
+        unsetenv("MOONCAKE_TEST_FAILPOINT_TIMEOUT_SEC");
+        std::error_code ec;
+        std::filesystem::remove_all(dir_, ec);
+    }
+
+    ScopedFailPointDir(const ScopedFailPointDir&) = delete;
+    ScopedFailPointDir& operator=(const ScopedFailPointDir&) = delete;
+
+    void Arm(const std::string& name) { Touch(name + ".arm"); }
+
+    bool WaitForHit(const std::string& name,
+                    std::chrono::milliseconds timeout) {
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (std::filesystem::exists(dir_ + "/" + name + ".hit")) {
+                return true;
+            }
+            std::this_thread::sleep_for(10ms);
+        }
+        return false;
+    }
+
+    void Release(const std::string& name) { Touch(name + ".release"); }
+
+   private:
+    void Touch(const std::string& file) {
+        if (!dir_.empty()) {
+            std::ofstream(dir_ + "/" + file).put('\n');
+        }
+    }
+
+    std::string dir_;
+};
+
+std::string TempPath(const std::string& name, const std::string& suffix) {
+    return ::testing::TempDir() + name + "-" + std::to_string(getpid()) +
+           suffix;
+}
+
+std::string MasterViewKey(const std::string& cluster_id) {
+    return "mooncake-store/" + cluster_id + "/master_view";
+}
+
+std::optional<std::string> ReadEtcdKey(const std::string& key,
+                                       EtcdRevisionId* revision = nullptr) {
+    std::string value;
+    EtcdRevisionId rev = 0;
+    const ErrorCode err = EtcdHelper::Get(key.c_str(), key.size(), value, rev);
+    if (err == ErrorCode::ETCD_KEY_NOT_EXIST) {
+        return std::nullopt;
+    }
+    if (err != ErrorCode::OK) {
+        ADD_FAILURE() << "etcd Get(" << key << ") failed: " << toString(err);
+        return std::nullopt;
+    }
+    if (revision != nullptr) {
+        *revision = rev;
+    }
+    return value;
+}
+
+bool WaitForEtcdKeyGone(const std::string& key,
+                        std::chrono::milliseconds timeout) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (!ReadEtcdKey(key).has_value()) {
+            return true;
+        }
+        std::this_thread::sleep_for(100ms);
+    }
+    return false;
+}
+
+bool WaitForHealthSubstring(SupervisorChildProcess& child, int admin_port,
+                            const std::string& needle,
+                            std::chrono::milliseconds timeout) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline && child.IsRunning()) {
+        const auto health = HttpGet(admin_port, "/health");
+        if (health.status == 200 &&
+            health.body.find(needle) != std::string::npos) {
+            return true;
+        }
+        std::this_thread::sleep_for(100ms);
+    }
+    return false;
+}
+
+std::string ReadTextFile(const std::string& path) {
+    std::ifstream input(path);
+    return std::string(std::istreambuf_iterator<char>(input),
+                       std::istreambuf_iterator<char>());
+}
+
+bool WaitForLogLine(const std::string& path, const std::string& needle,
+                    std::chrono::milliseconds timeout) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (ReadTextFile(path).find(needle) != std::string::npos) {
+            return true;
+        }
+        std::this_thread::sleep_for(20ms);
+    }
+    return false;
+}
+
+// True if the child logged "finishing from phase=<phase>" exactly, so that
+// "serve_start" does not match "serve_start_failure".
+bool LogHasPhase(const std::string& log, std::string_view phase) {
+    return log.find("finishing from phase=" + std::string(phase) + "\n") !=
+           std::string::npos;
+}
+
+bool LogContains(const std::string& log, std::string_view needle) {
+    return log.find(needle) != std::string::npos;
+}
+
+void ExpectExitedWith(const std::optional<int>& status, int code) {
+    ASSERT_TRUE(status.has_value()) << "child did not exit in time";
+    ASSERT_TRUE(WIFEXITED(*status))
+        << "child was terminated by signal "
+        << (WIFSIGNALED(*status) ? WTERMSIG(*status) : 0);
+    EXPECT_EQ(WEXITSTATUS(*status), code);
+}
+
+int64_t MillisSince(std::chrono::steady_clock::time_point start) {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now() - start)
+        .count();
+}
+
+std::optional<SegmentMountOp> FindDurableSegmentMount(
+    const std::string& cluster_id, const std::string& segment_name) {
+    auto backend =
+        CreateHaKvBackend(ha::HABackendSpec{.type = ha::HABackendType::ETCD,
+                                            .connstring = FLAGS_etcd_endpoints,
+                                            .cluster_namespace = cluster_id});
+    if (!backend) {
+        ADD_FAILURE() << "CreateHaKvBackend failed: "
+                      << toString(backend.error());
+        return std::nullopt;
+    }
+    OpLogBatchStorage storage(cluster_id, *backend.value());
+    DurablePrefix prefix;
+    if (const auto err = storage.ReadDurablePrefix(prefix);
+        err != ErrorCode::OK) {
+        ADD_FAILURE() << "ReadDurablePrefix failed: " << toString(err);
+        return std::nullopt;
+    }
+    for (uint64_t batch_id = 1; batch_id <= prefix.batch_id; ++batch_id) {
+        OpLogBatchRecord batch;
+        if (const auto err = storage.ReadBatch(batch_id, batch);
+            err != ErrorCode::OK) {
+            ADD_FAILURE() << "ReadBatch(" << batch_id
+                          << ") failed: " << toString(err);
+            return std::nullopt;
+        }
+        for (const auto& entry : batch.entries) {
+            if (entry.op_type != OpType::SEGMENT_MOUNT) {
+                continue;
+            }
+            SegmentMountOp op;
+            if (struct_pack::deserialize_to(op, entry.payload) !=
+                    struct_pack::errc::ok ||
+                op.segment_name != segment_name) {
+                continue;
+            }
+            return op;
+        }
+    }
+    return std::nullopt;
+}
+
+constexpr size_t kTestSegmentSize = 16 * 1024 * 1024;
+
+tl::expected<void, ErrorCode> MountTestSegment(MasterClient& client,
+                                               const std::string& name) {
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = name;
+    segment.base = 0x300000000;
+    segment.size = kTestSegmentSize;
+    segment.te_endpoint = "127.0.0.1:1";
+    return client.MountSegment(segment);
+}
+
+// Reads the lease ID that the child publishes in the warming value of
+// master_view, which is the decimal owner token.
+std::optional<int64_t> WaitForWarmingLeaseId(
+    SupervisorChildProcess& child, const std::string& key,
+    std::chrono::milliseconds timeout) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline && child.IsRunning()) {
+        const auto value = ReadEtcdKey(key);
+        if (value.has_value() && value->starts_with(kWarmingPrefix)) {
+            try {
+                return std::stoll(value->substr(kWarmingPrefix.size()));
+            } catch (const std::exception&) {
+                ADD_FAILURE() << "unparsable warming value: " << *value;
+                return std::nullopt;
+            }
+        }
+        std::this_thread::sleep_for(20ms);
+    }
+    return std::nullopt;
+}
+
+struct PortPair {
+    int rpc;
+    int admin;
+};
+
+std::vector<PortPair> FreePortPairs(size_t count) {
+    const auto ports = getFreeTcpPorts(static_cast<int>(count * 2));
+    std::vector<PortPair> pairs;
+    for (size_t i = 0; i + 1 < ports.size(); i += 2) {
+        pairs.push_back({ports[i], ports[i + 1]});
+    }
+    return pairs;
+}
+
+std::string ClusterIdFor(const std::string& name) {
+    return name + "-" + std::to_string(getpid());
+}
+
+}  // namespace
+
+TEST_F(HighAvailabilityTest, ServingLeaderSigtermDrainsAndKeepsLease) {
+    if (auto skip_reason = GetEtcdSkipReason(); skip_reason.has_value()) {
+        GTEST_SKIP() << *skip_reason;
+    }
+
+    const auto ports = FreePortPairs(1);
+    ASSERT_EQ(ports.size(), 1u);
+    const std::string cluster_id = ClusterIdFor("sigterm-serving");
+    const std::string log_path = TempPath("sigterm-serving", ".log");
+    SupervisorChildProcess child(ports[0].rpc, ports[0].admin, cluster_id,
+                                 /*enable_oplog=*/false, log_path);
+    ASSERT_TRUE(child.Start());
+    ASSERT_TRUE(WaitForServing(child, ports[0].admin, 20s));
+    const std::string key = MasterViewKey(cluster_id);
+    ASSERT_TRUE(ReadEtcdKey(key).has_value());
+
+    const auto sent = std::chrono::steady_clock::now();
+    ASSERT_TRUE(child.Signal(SIGTERM));
+    const auto status = child.WaitForExit(10s);
+    LOG(INFO) << "SIGTERM to exit: " << MillisSince(sent) << " ms";
+    ExpectExitedWith(status, 0);
+
+    EXPECT_TRUE(ReadEtcdKey(key).has_value())
+        << "no deliberate release: the key is left to TTL expiry";
+    const std::string log = ReadTextFile(log_path);
+    EXPECT_TRUE(LogContains(log, "reason=shutdown requested")) << log;
+    EXPECT_TRUE(LogHasPhase(log, "serving")) << log;
+    EXPECT_TRUE(LogContains(log, "no release attempted")) << log;
+    EXPECT_TRUE(WaitForEtcdKeyGone(key, 8s)) << "the lease must expire by TTL";
+}
+
+TEST_F(HighAvailabilityTest, StandbySigtermLeavesLeaderUntouched) {
+    if (auto skip_reason = GetEtcdSkipReason(); skip_reason.has_value()) {
+        GTEST_SKIP() << *skip_reason;
+    }
+
+    const auto ports = FreePortPairs(2);
+    ASSERT_EQ(ports.size(), 2u);
+    const std::string cluster_id = ClusterIdFor("sigterm-standby");
+    const std::string log_path_a = TempPath("sigterm-standby-a", ".log");
+    const std::string log_path_b = TempPath("sigterm-standby-b", ".log");
+    SupervisorChildProcess leader(ports[0].rpc, ports[0].admin, cluster_id,
+                                  /*enable_oplog=*/false, log_path_a);
+    ASSERT_TRUE(leader.Start());
+    ASSERT_TRUE(WaitForServing(leader, ports[0].admin, 20s));
+    SupervisorChildProcess standby(ports[1].rpc, ports[1].admin, cluster_id,
+                                   /*enable_oplog=*/false, log_path_b);
+    ASSERT_TRUE(standby.Start());
+    ASSERT_TRUE(WaitForHealthSubstring(
+        standby, ports[1].admin,
+        "\"leader_address\":\"127.0.0.1:" + std::to_string(ports[0].rpc) + "\"",
+        20s));
+
+    const std::string key = MasterViewKey(cluster_id);
+    EtcdRevisionId revision_before = 0;
+    const auto value_before = ReadEtcdKey(key, &revision_before);
+    ASSERT_TRUE(value_before.has_value());
+
+    const auto sent = std::chrono::steady_clock::now();
+    ASSERT_TRUE(standby.Signal(SIGTERM));
+    const auto status = standby.WaitForExit(10s);
+    LOG(INFO) << "standby SIGTERM to exit: " << MillisSince(sent) << " ms";
+    ExpectExitedWith(status, 0);
+
+    EtcdRevisionId revision_after = 0;
+    const auto value_after = ReadEtcdKey(key, &revision_after);
+    EXPECT_EQ(value_after, value_before);
+    EXPECT_EQ(revision_after, revision_before);
+    EXPECT_TRUE(WaitForServing(leader, ports[0].admin, 2s));
+    EXPECT_TRUE(LogContains(ReadTextFile(log_path_b), "no lease held"));
+}
+
+TEST_F(HighAvailabilityTest, WarmupSigtermKeepsLease) {
+    if (auto skip_reason = GetEtcdSkipReason(); skip_reason.has_value()) {
+        GTEST_SKIP() << *skip_reason;
+    }
+
+    const auto ports = FreePortPairs(1);
+    ASSERT_EQ(ports.size(), 1u);
+    const std::string cluster_id = ClusterIdFor("sigterm-warmup");
+    const std::string log_path = TempPath("sigterm-warmup", ".log");
+    SupervisorChildProcess child(ports[0].rpc, ports[0].admin, cluster_id,
+                                 /*enable_oplog=*/false, log_path);
+    ASSERT_TRUE(child.Start());
+    // The initial warmup lasts the lease TTL, so the signal lands inside it.
+    ASSERT_TRUE(WaitForLogLine(log_path, "Entering warmup phase...", 20s));
+
+    const auto sent = std::chrono::steady_clock::now();
+    ASSERT_TRUE(child.Signal(SIGTERM));
+    const auto status = child.WaitForExit(10s);
+    LOG(INFO) << "warmup SIGTERM to exit: " << MillisSince(sent) << " ms";
+    ExpectExitedWith(status, 0);
+
+    const auto value = ReadEtcdKey(MasterViewKey(cluster_id));
+    ASSERT_TRUE(value.has_value());
+    EXPECT_TRUE(value->starts_with(kWarmingPrefix)) << *value;
+    const std::string log = ReadTextFile(log_path);
+    EXPECT_TRUE(LogContains(log, "no release attempted")) << log;
+    EXPECT_TRUE(LogHasPhase(log, "warmup")) << log;
+    EXPECT_FALSE(LogContains(log, "Master runtime state -> recovering"))
+        << "the request must be seen in the initial warmup, not after restore";
+}
+
+TEST_F(HighAvailabilityTest, OplogLeaderCommitsQueuedRecordsBeforeExit) {
+    if (auto skip_reason = GetEtcdSkipReason(); skip_reason.has_value()) {
+        GTEST_SKIP() << *skip_reason;
+    }
+
+    ScopedFailPointDir failpoints;
+    const auto ports = FreePortPairs(2);
+    ASSERT_EQ(ports.size(), 2u);
+    const std::string cluster_id = ClusterIdFor("sigterm-oplog");
+    const std::string log_path = TempPath("sigterm-oplog", ".log");
+    const std::string segment_name =
+        "ha-shutdown-d-" + std::to_string(getpid());
+    constexpr int64_t kLiveTtlSec = 120;
+    constexpr int64_t kSuspicionTtlSec = 240;
+    {
+        SupervisorChildProcess child(ports[0].rpc, ports[0].admin, cluster_id,
+                                     /*enable_oplog=*/true, log_path, "",
+                                     kLiveTtlSec, kSuspicionTtlSec);
+        ASSERT_TRUE(child.Start());
+        ASSERT_TRUE(WaitForServing(child, ports[0].admin, 30s));
+        if (kFailPointsEnabled) {
+            failpoints.Arm("batch_before_txn");
+        }
+
+        MasterClient client(generate_uuid());
+        ASSERT_EQ(client.Connect("127.0.0.1:" + std::to_string(ports[0].rpc)),
+                  ErrorCode::OK);
+        auto mounted = MountTestSegment(client, segment_name);
+        ASSERT_TRUE(mounted.has_value()) << toString(mounted.error());
+
+        const auto sent = std::chrono::steady_clock::now();
+        if (kFailPointsEnabled) {
+            // Hold the writer before its etcd transaction so the entry is
+            // queued but not durable while the drain starts.
+            ASSERT_TRUE(failpoints.WaitForHit("batch_before_txn", 5s));
+            ASSERT_TRUE(child.Signal(SIGTERM));
+            ASSERT_TRUE(
+                WaitForLogLine(log_path, "reason=shutdown requested", 5s));
+            std::this_thread::sleep_for(1s);
+            EXPECT_TRUE(child.IsRunning())
+                << "the drain must wait for the writer";
+            EXPECT_FALSE(
+                LogContains(ReadTextFile(log_path), "Shutdown complete"));
+            failpoints.Release("batch_before_txn");
+        } else {
+            ASSERT_TRUE(child.Signal(SIGTERM));
+        }
+        const auto status = child.WaitForExit(10s);
+        LOG(INFO) << "OpLog SIGTERM to exit: " << MillisSince(sent) << " ms";
+        ExpectExitedWith(status, 0);
+    }
+
+    EXPECT_TRUE(ReadEtcdKey(MasterViewKey(cluster_id)).has_value());
+    const auto durable = FindDurableSegmentMount(cluster_id, segment_name);
+    ASSERT_TRUE(durable.has_value())
+        << "the mounted segment is missing from the durable OpLog";
+    EXPECT_EQ(durable->capacity, kTestSegmentSize);
+    EXPECT_EQ(durable->transport_endpoint, "127.0.0.1:1");
+
+    // A successor waits out the lease TTL and replays the log. A restored
+    // segment is a placeholder until its client remounts, so the admin
+    // segment list cannot show it; the restore log line counts it instead.
+    const std::string successor_log =
+        TempPath("sigterm-oplog-successor", ".log");
+    SupervisorChildProcess successor(ports[1].rpc, ports[1].admin, cluster_id,
+                                     /*enable_oplog=*/true, successor_log, "",
+                                     kLiveTtlSec, kSuspicionTtlSec);
+    ASSERT_TRUE(successor.Start());
+    ASSERT_TRUE(WaitForServing(successor, ports[1].admin, 40s));
+    const std::string successor_text = ReadTextFile(successor_log);
+    EXPECT_TRUE(LogContains(successor_text,
+                            "Restored from standby: 0 objects, "
+                            "1 segments"))
+        << successor_text;
+}
+
+// Revokes the leader's lease and signals it back to back, in either order.
+void RunSigtermRacingLeaseLoss(bool revoke_first) {
+    const auto ports = FreePortPairs(1);
+    ASSERT_EQ(ports.size(), 1u);
+    const std::string name =
+        revoke_first ? "sigterm-revoke-first" : "sigterm-signal-first";
+    const std::string cluster_id = ClusterIdFor(name);
+    const std::string log_path = TempPath(name, ".log");
+    SupervisorChildProcess child(ports[0].rpc, ports[0].admin, cluster_id,
+                                 /*enable_oplog=*/false, log_path);
+    ASSERT_TRUE(child.Start());
+    const std::string key = MasterViewKey(cluster_id);
+    const auto lease_id = WaitForWarmingLeaseId(child, key, 20s);
+    ASSERT_TRUE(lease_id.has_value());
+    ASSERT_TRUE(WaitForServing(child, ports[0].admin, 20s));
+
+    if (revoke_first) {
+        ASSERT_EQ(EtcdHelper::RevokeLease(*lease_id), ErrorCode::OK);
+        ASSERT_TRUE(child.Signal(SIGTERM));
+    } else {
+        ASSERT_TRUE(child.Signal(SIGTERM));
+        ASSERT_EQ(EtcdHelper::RevokeLease(*lease_id), ErrorCode::OK);
+    }
+    ExpectExitedWith(child.WaitForExit(10s), 0);
+
+    EXPECT_TRUE(LogContains(ReadTextFile(log_path), "Shutdown complete"));
+    EXPECT_FALSE(ReadEtcdKey(key).has_value()) << "the lease was revoked";
+}
+
+TEST_F(HighAvailabilityTest, SigtermRacingLeaseLossExitsZeroRevokeFirst) {
+    if (auto skip_reason = GetEtcdSkipReason(); skip_reason.has_value()) {
+        GTEST_SKIP() << *skip_reason;
+    }
+    RunSigtermRacingLeaseLoss(/*revoke_first=*/true);
+}
+
+TEST_F(HighAvailabilityTest, SigtermRacingLeaseLossExitsZeroSignalFirst) {
+    if (auto skip_reason = GetEtcdSkipReason(); skip_reason.has_value()) {
+        GTEST_SKIP() << *skip_reason;
+    }
+    RunSigtermRacingLeaseLoss(/*revoke_first=*/false);
+}
+
+TEST_F(HighAvailabilityTest, SigtermBeforeServeStartStopsWriter) {
+    if (auto skip_reason = GetEtcdSkipReason(); skip_reason.has_value()) {
+        GTEST_SKIP() << *skip_reason;
+    }
+    if (!kFailPointsEnabled) {
+        GTEST_SKIP() << "needs MOONCAKE_ENABLE_TEST_FAILPOINTS";
+    }
+
+    ScopedFailPointDir failpoints;
+    failpoints.Arm("supervisor_before_serve_start");
+    const auto ports = FreePortPairs(1);
+    ASSERT_EQ(ports.size(), 1u);
+    const std::string cluster_id = ClusterIdFor("sigterm-before-serve");
+    const std::string log_path = TempPath("sigterm-before-serve", ".log");
+    SupervisorChildProcess child(ports[0].rpc, ports[0].admin, cluster_id,
+                                 /*enable_oplog=*/true, log_path);
+    ASSERT_TRUE(child.Start());
+    ASSERT_TRUE(failpoints.WaitForHit("supervisor_before_serve_start", 30s));
+
+    const auto sent = std::chrono::steady_clock::now();
+    ASSERT_TRUE(child.Signal(SIGTERM));
+    ASSERT_TRUE(WaitForLogLine(log_path, "reason=shutdown requested", 5s));
+    EXPECT_TRUE(WaitForHealthSubstring(child, ports[0].admin,
+                                       "\"service_ready\":false", 5s));
+    failpoints.Release("supervisor_before_serve_start");
+    ExpectExitedWith(child.WaitForExit(10s), 0);
+    LOG(INFO) << "pre-listener SIGTERM to exit: " << MillisSince(sent) << " ms";
+
+    const std::string log = ReadTextFile(log_path);
+    EXPECT_TRUE(LogHasPhase(log, "serve_start")) << log;
+    const auto stopped = log.find(
+        "Shutdown stopped the term's workers, monitor and OpLog "
+        "writer");
+    ASSERT_NE(stopped, std::string::npos) << log;
+    EXPECT_LT(stopped, log.find("Shutdown complete")) << log;
+    const auto value = ReadEtcdKey(MasterViewKey(cluster_id));
+    ASSERT_TRUE(value.has_value());
+    EXPECT_TRUE(value->starts_with(kWarmingPrefix)) << *value;
+}
+
+TEST_F(HighAvailabilityTest, SigtermBeforeServeActivationNeverServes) {
+    if (auto skip_reason = GetEtcdSkipReason(); skip_reason.has_value()) {
+        GTEST_SKIP() << *skip_reason;
+    }
+    if (!kFailPointsEnabled) {
+        GTEST_SKIP() << "needs MOONCAKE_ENABLE_TEST_FAILPOINTS";
+    }
+
+    ScopedFailPointDir failpoints;
+    failpoints.Arm("supervisor_before_serve_activation");
+    const auto ports = FreePortPairs(1);
+    ASSERT_EQ(ports.size(), 1u);
+    const std::string cluster_id = ClusterIdFor("sigterm-before-activation");
+    const std::string log_path = TempPath("sigterm-before-activation", ".log");
+    SupervisorChildProcess child(ports[0].rpc, ports[0].admin, cluster_id,
+                                 /*enable_oplog=*/false, log_path);
+    ASSERT_TRUE(child.Start());
+    ASSERT_TRUE(
+        failpoints.WaitForHit("supervisor_before_serve_activation", 30s));
+
+    ASSERT_TRUE(child.Signal(SIGTERM));
+    ASSERT_TRUE(WaitForLogLine(log_path, "reason=shutdown requested", 5s));
+    failpoints.Release("supervisor_before_serve_activation");
+    ExpectExitedWith(child.WaitForExit(10s), 0);
+
+    const std::string log = ReadTextFile(log_path);
+    EXPECT_FALSE(LogContains(log, "Master runtime state -> serving")) << log;
+    EXPECT_TRUE(LogHasPhase(log, "serving")) << log;
+    const auto value = ReadEtcdKey(MasterViewKey(cluster_id));
+    ASSERT_TRUE(value.has_value());
+    EXPECT_EQ(*value, "127.0.0.1:" + std::to_string(ports[0].rpc))
+        << "published, then left to TTL";
+}
+
+TEST_F(HighAvailabilityTest, InjectedPredicateDrivesServingShutdown) {
+    if (auto skip_reason = GetEtcdSkipReason(); skip_reason.has_value()) {
+        GTEST_SKIP() << *skip_reason;
+    }
+
+    const auto ports = FreePortPairs(1);
+    ASSERT_EQ(ports.size(), 1u);
+    const std::string cluster_id = ClusterIdFor("injected-predicate");
+    const std::string log_path = TempPath("injected-predicate", ".log");
+    const std::string shutdown_file =
+        TempPath("injected-predicate", ".shutdown");
+    std::filesystem::remove(shutdown_file);
+    SupervisorChildProcess child(ports[0].rpc, ports[0].admin, cluster_id,
+                                 /*enable_oplog=*/false, log_path,
+                                 shutdown_file);
+    ASSERT_TRUE(child.Start());
+    ASSERT_TRUE(WaitForServing(child, ports[0].admin, 20s));
+
+    const auto sent = std::chrono::steady_clock::now();
+    std::ofstream(shutdown_file).put('\n');
+    const auto status = child.WaitForExit(10s);
+    LOG(INFO) << "injected request to exit: " << MillisSince(sent) << " ms";
+    std::filesystem::remove(shutdown_file);
+    ExpectExitedWith(status, 0);
+
+    const std::string log = ReadTextFile(log_path);
+    EXPECT_TRUE(LogContains(log, "reason=shutdown requested")) << log;
+    EXPECT_TRUE(LogHasPhase(log, "serving")) << log;
+    EXPECT_TRUE(ReadEtcdKey(MasterViewKey(cluster_id)).has_value());
+}
+
+TEST_F(HighAvailabilityTest, SecondSigtermDuringDrainExits143) {
+    if (auto skip_reason = GetEtcdSkipReason(); skip_reason.has_value()) {
+        GTEST_SKIP() << *skip_reason;
+    }
+    if (!kFailPointsEnabled) {
+        GTEST_SKIP() << "needs MOONCAKE_ENABLE_TEST_FAILPOINTS";
+    }
+
+    ScopedFailPointDir failpoints;
+    failpoints.Arm("supervisor_before_serve_start");
+    const auto ports = FreePortPairs(1);
+    ASSERT_EQ(ports.size(), 1u);
+    const std::string cluster_id = ClusterIdFor("second-sigterm");
+    const std::string log_path = TempPath("second-sigterm", ".log");
+    SupervisorChildProcess child(ports[0].rpc, ports[0].admin, cluster_id,
+                                 /*enable_oplog=*/true, log_path);
+    ASSERT_TRUE(child.Start());
+    ASSERT_TRUE(failpoints.WaitForHit("supervisor_before_serve_start", 30s));
+    ASSERT_TRUE(child.Signal(SIGTERM));
+    ASSERT_TRUE(WaitForLogLine(log_path, "reason=shutdown requested", 5s));
+
+    const auto sent = std::chrono::steady_clock::now();
+    ASSERT_TRUE(child.Signal(SIGTERM));
+    ExpectExitedWith(child.WaitForExit(2s), 143);
+    LOG(INFO) << "second SIGTERM to exit: " << MillisSince(sent) << " ms";
+    EXPECT_TRUE(ReadEtcdKey(MasterViewKey(cluster_id)).has_value());
+}
+
+TEST_F(HighAvailabilityTest, SigtermWaitsForAdmittedHandler) {
+    if (auto skip_reason = GetEtcdSkipReason(); skip_reason.has_value()) {
+        GTEST_SKIP() << *skip_reason;
+    }
+    if (!kFailPointsEnabled) {
+        GTEST_SKIP() << "needs MOONCAKE_ENABLE_TEST_FAILPOINTS";
+    }
+
+    ScopedFailPointDir failpoints;
+    const auto ports = FreePortPairs(1);
+    ASSERT_EQ(ports.size(), 1u);
+    const std::string cluster_id = ClusterIdFor("sigterm-admitted");
+    const std::string log_path = TempPath("sigterm-admitted", ".log");
+    const std::string segment_name =
+        "ha-shutdown-k-" + std::to_string(getpid());
+    SupervisorChildProcess child(ports[0].rpc, ports[0].admin, cluster_id,
+                                 /*enable_oplog=*/true, log_path);
+    ASSERT_TRUE(child.Start());
+    ASSERT_TRUE(WaitForServing(child, ports[0].admin, 30s));
+
+    failpoints.Arm("rpc_mount_segment_before_service");
+    MasterClient client(generate_uuid());
+    ASSERT_EQ(client.Connect("127.0.0.1:" + std::to_string(ports[0].rpc)),
+              ErrorCode::OK);
+    // The response may be lost when the server closes the socket, so the
+    // result is ignored.
+    std::jthread mount([&] { (void)MountTestSegment(client, segment_name); });
+    ASSERT_TRUE(failpoints.WaitForHit("rpc_mount_segment_before_service", 5s))
+        << "no handler was admitted";
+
+    ASSERT_TRUE(child.Signal(SIGTERM));
+    ASSERT_TRUE(WaitForLogLine(log_path, "reason=shutdown requested", 5s));
+    std::this_thread::sleep_for(1s);
+    EXPECT_TRUE(child.IsRunning()) << "the drain must wait for the handler";
+    EXPECT_FALSE(LogContains(ReadTextFile(log_path), "finishing from phase="));
+
+    const auto released = std::chrono::steady_clock::now();
+    failpoints.Release("rpc_mount_segment_before_service");
+    const auto status = child.WaitForExit(10s);
+    LOG(INFO) << "release to exit: " << MillisSince(released) << " ms";
+    mount.join();
+    ExpectExitedWith(status, 0);
+
+    EXPECT_TRUE(LogHasPhase(ReadTextFile(log_path), "serving"));
+    EXPECT_TRUE(FindDurableSegmentMount(cluster_id, segment_name).has_value())
+        << "the admitted handler's entry must be durable before exit";
+}
+
+TEST_F(HighAvailabilityTest, InjectedRequestBlockedInDrainEndsByWatchdog) {
+    if (auto skip_reason = GetEtcdSkipReason(); skip_reason.has_value()) {
+        GTEST_SKIP() << *skip_reason;
+    }
+    if (!kFailPointsEnabled) {
+        GTEST_SKIP() << "needs MOONCAKE_ENABLE_TEST_FAILPOINTS";
+    }
+
+    ScopedFailPointDir failpoints;
+    const auto ports = FreePortPairs(1);
+    ASSERT_EQ(ports.size(), 1u);
+    const std::string cluster_id = ClusterIdFor("blocked-drain");
+    const std::string log_path = TempPath("blocked-drain", ".log");
+    const std::string shutdown_file = TempPath("blocked-drain", ".shutdown");
+    std::filesystem::remove(shutdown_file);
+    SupervisorChildProcess child(ports[0].rpc, ports[0].admin, cluster_id,
+                                 /*enable_oplog=*/false, log_path,
+                                 shutdown_file);
+    ASSERT_TRUE(child.Start());
+    ASSERT_TRUE(WaitForServing(child, ports[0].admin, 20s));
+
+    failpoints.Arm("rpc_mount_segment_before_service");
+    MasterClient client(generate_uuid());
+    ASSERT_EQ(client.Connect("127.0.0.1:" + std::to_string(ports[0].rpc)),
+              ErrorCode::OK);
+    std::jthread mount([&] {
+        (void)MountTestSegment(client,
+                               "ha-shutdown-l-" + std::to_string(getpid()));
+    });
+    ASSERT_TRUE(failpoints.WaitForHit("rpc_mount_segment_before_service", 5s));
+
+    // No signal: only the latched request starts the watchdog deadline. The
+    // handler is never released, so the drain cannot finish by itself.
+    const auto requested = std::chrono::steady_clock::now();
+    std::ofstream(shutdown_file).put('\n');
+    const auto status = child.WaitForExit(25s);
+    const auto elapsed_ms = MillisSince(requested);
+    LOG(INFO) << "injected request to watchdog exit: " << elapsed_ms << " ms";
+    mount.join();
+    std::filesystem::remove(shutdown_file);
+    ExpectExitedWith(status, 1);
+    EXPECT_GE(elapsed_ms, 14000);
+    EXPECT_LE(elapsed_ms, 20000);
+
+    const std::string log = ReadTextFile(log_path);
+    EXPECT_TRUE(LogContains(log, "reason=shutdown requested")) << log;
+    EXPECT_FALSE(LogContains(log, "Shutdown complete")) << log;
+}
+
+TEST_F(HighAvailabilityTest, LateRequestAfterOrdinaryReleaseKeepsResult) {
+    if (auto skip_reason = GetEtcdSkipReason(); skip_reason.has_value()) {
+        GTEST_SKIP() << *skip_reason;
+    }
+    if (!kFailPointsEnabled) {
+        GTEST_SKIP() << "needs MOONCAKE_ENABLE_TEST_FAILPOINTS";
+    }
+
+    ScopedFailPointDir failpoints;
+    const auto ports = FreePortPairs(1);
+    ASSERT_EQ(ports.size(), 1u);
+    const std::string cluster_id = ClusterIdFor("late-request");
+    const std::string log_path = TempPath("late-request", ".log");
+    const std::string shutdown_file = TempPath("late-request", ".shutdown");
+    std::filesystem::remove(shutdown_file);
+    SupervisorChildProcess child(ports[0].rpc, ports[0].admin, cluster_id,
+                                 /*enable_oplog=*/false, log_path,
+                                 shutdown_file);
+    ASSERT_TRUE(child.Start());
+    const std::string key = MasterViewKey(cluster_id);
+    const auto lease_id = WaitForWarmingLeaseId(child, key, 20s);
+    ASSERT_TRUE(lease_id.has_value());
+    ASSERT_TRUE(WaitForServing(child, ports[0].admin, 20s));
+
+    // Losing the lease stops the listener, and the serving exit releases
+    // through the supervisor's ordinary path; hold it right after that release.
+    failpoints.Arm("supervisor_after_term_release");
+    ASSERT_EQ(EtcdHelper::RevokeLease(*lease_id), ErrorCode::OK);
+    ASSERT_TRUE(failpoints.WaitForHit("supervisor_after_term_release", 10s));
+    std::ofstream(shutdown_file).put('\n');
+    failpoints.Release("supervisor_after_term_release");
+    ExpectExitedWith(child.WaitForExit(10s), 0);
+    std::filesystem::remove(shutdown_file);
+
+    const std::string log = ReadTextFile(log_path);
+    EXPECT_TRUE(LogHasPhase(log, "serving")) << log;
+    EXPECT_TRUE(
+        LogContains(log, "Shutdown complete after leadership release, result="))
+        << log;
+    EXPECT_FALSE(LogContains(log, "no lease held")) << log;
+    EXPECT_FALSE(LogContains(log, "no release attempted")) << log;
+    EXPECT_FALSE(LogContains(log, "Release leadership: "))
+        << "the exit must come from the check right after the release";
 }
 
 TEST_F(HighAvailabilityTest, EtcdBasicOperations) {

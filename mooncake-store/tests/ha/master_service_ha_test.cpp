@@ -259,6 +259,11 @@ class GatedOrderedOpLogWriter : public OrderedOpLogWriter {
         cv_.notify_all();
     }
 
+    void HoldCallbacks() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        released_through_ = 0;
+    }
+
    private:
     std::mutex mutex_;
     std::condition_variable cv_;
@@ -740,17 +745,13 @@ class MasterServiceHATest : public ::testing::Test {
         auto& tenant_state =
             MasterServiceTestPeer(*service).GetOrCreateTenantState(
                 shard_access.get(), tenant);
-        tenant_state.promotion_tasks.emplace(
-            key, MasterServiceTestPeer::PromotionTask{
-                     .source_id = 0,
-                     .alloc_id = alloc_id,
-                     .object_size = object_size,
-                     .start_time = std::chrono::system_clock::now(),
-                     .holder_id = holder_id});
-    }
-
-    static bool SnapshotManagerCreatedForTesting(const MasterService& service) {
-        return MasterServiceTestPeer::SnapshotManager(service) != nullptr;
+        tenant_state.metadata.at(key).state.promotion_task =
+            MasterServiceTestPeer::PromotionTask{
+                .source_id = 0,
+                .alloc_id = alloc_id,
+                .object_size = object_size,
+                .start_time = std::chrono::system_clock::now(),
+                .holder_id = holder_id};
     }
 
     static bool NeedMemoryEvictionForTesting(const MasterService& service) {
@@ -925,7 +926,7 @@ class MasterServiceHATest : public ::testing::Test {
         }
         const auto metadata = tenant->second.metadata.find(key);
         return metadata != tenant->second.metadata.end() &&
-               metadata->second.HasReplica([](const Replica& replica) {
+               metadata->second.metadata.HasReplica([](const Replica& replica) {
                    return replica.is_memory_replica() && replica.is_completed();
                });
     }
@@ -980,7 +981,7 @@ class MasterServiceHATest : public ::testing::Test {
     static std::unique_lock<std::shared_mutex> LockSnapshotForTesting(
         MasterService& service) {
         return std::unique_lock<std::shared_mutex>(
-            MasterServiceTestPeer::SnapshotMutex(service));
+            MasterServiceTestPeer::MasterStateMutex(service));
     }
 
     static std::unique_lock<SharedMutex> LockMetadataShardForTesting(
@@ -1036,26 +1037,19 @@ class MasterServiceHATest : public ::testing::Test {
         return task.get().has_value() && reached_discovery && metadata_released;
     }
 
+    // PutStart is the only caller in these tests that holds the snapshot
+    // barrier shared, so a barrier that cannot be taken exclusively while the
+    // client lock is free means PutStart reached it and let the client lock
+    // go.
     static bool PutStartHoldsSnapshotAfterClientReleaseForTesting(
-        MasterService& service, const TenantId& tenant_id,
-        const std::string& key) {
-        const auto scoped_key = tenant_id.MakeScopedKey(key);
-        const size_t stripe_idx =
-            std::hash<std::string>{}(scoped_key) %
-            MasterServiceTestPeer::kObjectOperationLockStripes;
-        std::unique_lock<std::mutex> object_lock(
-            MasterServiceTestPeer::ObjectOperationLocks(service)[stripe_idx],
-            std::try_to_lock);
-        if (object_lock.owns_lock()) {
-            return false;
-        }
+        MasterService& service) {
         std::unique_lock<std::shared_mutex> client_lock(
             MasterServiceTestPeer::ClientMutex(service), std::try_to_lock);
         if (!client_lock.owns_lock()) {
             return false;
         }
         std::unique_lock<std::shared_mutex> snapshot_lock(
-            MasterServiceTestPeer::SnapshotMutex(service), std::try_to_lock);
+            MasterServiceTestPeer::MasterStateMutex(service), std::try_to_lock);
         return !snapshot_lock.owns_lock();
     }
 
@@ -1309,7 +1303,7 @@ TEST_F(MasterServiceHATest, RestoreFromStandbyPreservesReplicaIds) {
     EXPECT_GE(new_replicas.front().id, 43);
 }
 
-TEST_F(MasterServiceHATest, BatchPromotionDrainsMultipleChunksAndPreservesIds) {
+TEST_F(MasterServiceHATest, BatchPromotionCopiesMultipleChunksAndPreservesIds) {
     MasterService service(
         MasterServiceConfig::builder().set_enable_ha(false).build());
     const std::string endpoint = "batch_promotion_segment";
@@ -1337,8 +1331,11 @@ TEST_F(MasterServiceHATest, BatchPromotionDrainsMultipleChunksAndPreservesIds) {
     handoff.applied_cursor = {.batch_id = 7, .last_seq = 7};
     handoff.max_replica_id = 42;
 
-    ASSERT_TRUE(service.RestoreFromBatchOpLogPromotion(std::move(handoff), 1)
-                    .has_value());
+    ASSERT_TRUE(service.RestoreFromBatchOpLogPromotion(handoff, 1).has_value());
+    ASSERT_TRUE(handoff.metadata_store);
+    EXPECT_EQ(2u, handoff.metadata_store->GetKeyCount());
+    EXPECT_TRUE(handoff.metadata_store->Exists(first.tenant_id, first.key));
+    EXPECT_TRUE(handoff.metadata_store->Exists(second.tenant_id, second.key));
     auto first_descriptors =
         ReplicaDescriptorsForTesting(service, kDefaultTenant, first.key);
     auto second_descriptors = ReplicaDescriptorsForTesting(
@@ -1375,14 +1372,58 @@ TEST_F(MasterServiceHATest, BatchPromotionRejectsCrossChunkOverlap) {
     handoff.applied_cursor = {.batch_id = 7, .last_seq = 7};
     handoff.max_replica_id = 52;
 
-    auto result = service.RestoreFromBatchOpLogPromotion(std::move(handoff), 1);
+    auto result = service.RestoreFromBatchOpLogPromotion(handoff, 1);
 
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, result.error());
+    ASSERT_TRUE(handoff.metadata_store);
+    EXPECT_EQ(2u, handoff.metadata_store->GetKeyCount());
+    EXPECT_TRUE(handoff.metadata_store->Exists(first.tenant_id, first.key));
+    EXPECT_TRUE(handoff.metadata_store->Exists(second.tenant_id, second.key));
     EXPECT_EQ(
         HasMetadataEntryForTesting(service, kDefaultTenant, first.key) +
             HasMetadataEntryForTesting(service, kDefaultTenant, second.key),
         1);
+}
+
+TEST_F(MasterServiceHATest,
+       BatchPromotionRestoreLeavesHandoffIntactForPreserve) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+    const std::string endpoint = "batch_promotion_preserve_segment";
+    auto object = MakeStandbyObject("batch_promotion_preserve_key", endpoint);
+    object.metadata.replicas.front().id = 61;
+    object.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+
+    auto source = std::make_unique<StandbyMetadataStore>();
+    ASSERT_TRUE(
+        source->PutMetadata(object.tenant_id, object.key, object.metadata));
+    BatchOpLogPromotionHandoff handoff;
+    handoff.metadata_store = std::move(source);
+    handoff.segments = {MakeStandbyMemorySegment(endpoint)};
+    handoff.applied_cursor = {.batch_id = 11, .last_seq = 11};
+    handoff.max_replica_id = 61;
+
+    ASSERT_TRUE(service.RestoreFromBatchOpLogPromotion(handoff, 1).has_value());
+    ASSERT_TRUE(handoff.metadata_store);
+    EXPECT_EQ(1u, handoff.metadata_store->GetKeyCount());
+    EXPECT_TRUE(handoff.metadata_store->Exists(object.tenant_id, object.key));
+    auto replicas =
+        ReplicaDescriptorsForTesting(service, kDefaultTenant, object.key);
+    ASSERT_EQ(replicas.size(), 1);
+    EXPECT_EQ(replicas.front().id, 61);
+
+    HotStandbyConfig config;
+    config.enable_verification = false;
+    HotStandbyService standby(config);
+    ASSERT_EQ(ErrorCode::OK,
+              standby.PreservePromotionBaseline(
+                  std::move(handoff.metadata_store), handoff.applied_cursor,
+                  /*producer_view_version=*/7, handoff.segments));
+    EXPECT_EQ(11u, standby.GetSyncStatus().applied_seq_id);
+    EXPECT_EQ(1u, standby.GetMetadataCount());
 }
 
 TEST_F(MasterServiceHATest, RestoreRejectsInvalidReplicaIds) {
@@ -1512,6 +1553,88 @@ TEST_F(MasterServiceHATest, RestoreFromStandbyPreservesHardPinned) {
                         {object}, 7, {MakeStandbyMemorySegment(endpoint)})
                     .has_value());
     EXPECT_TRUE(IsHardPinnedForTesting(service, kDefaultTenant, key));
+}
+
+TEST_F(MasterServiceHATest, BatchPromotionDropsReplicasOnUnloadedSegments) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+
+    const std::string endpoint = "batch_drop_live_segment";
+    const std::string stale_endpoint = "batch_drop_unloaded_segment";
+    auto object = MakeStandbyObject("batch_drop_key", endpoint);
+    object.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    // A replica on a segment that was unloaded before the handoff must not
+    // fail the promotion; it is simply gone.
+    auto stale = MakeStandbyMemoryReplica(stale_endpoint);
+    stale.id = 2;
+    stale.get_memory_descriptor().buffer_descriptor.buffer_address_ =
+        kDefaultSegmentBase + 4096;
+    object.metadata.replicas.push_back(std::move(stale));
+    auto stale_tombstone = MakeStandbyMemoryReplica(stale_endpoint);
+    stale_tombstone.id = 3;
+    stale_tombstone.status = ReplicaStatus::REMOVED;
+    object.metadata.replicas.push_back(std::move(stale_tombstone));
+
+    auto source = std::make_unique<StandbyMetadataStore>();
+    ASSERT_TRUE(
+        source->PutMetadata(object.tenant_id, object.key, object.metadata));
+    BatchOpLogPromotionHandoff handoff;
+    handoff.metadata_store = std::move(source);
+    handoff.segments = {MakeStandbyMemorySegment(endpoint)};
+    handoff.applied_cursor = {.batch_id = 7, .last_seq = 7};
+    handoff.max_replica_id = 3;
+
+    ASSERT_TRUE(service.RestoreFromBatchOpLogPromotion(std::move(handoff), 1)
+                    .has_value());
+
+    auto replicas =
+        ReplicaDescriptorsForTesting(service, kDefaultTenant, "batch_drop_key");
+    ASSERT_EQ(replicas.size(), 1);
+    EXPECT_EQ(replicas.front().id, 1);
+    EXPECT_EQ(replicas.front()
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              endpoint);
+}
+
+TEST_F(MasterServiceHATest, BatchPromotionSkipsObjectWhenAllReplicasAreStale) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+
+    const std::string endpoint = "batch_skip_live_segment";
+    auto good = MakeStandbyObject("batch_skip_good", endpoint);
+    good.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    auto stale_only =
+        MakeStandbyObject("batch_skip_stale", "batch_skip_unloaded_segment");
+    stale_only.metadata.replicas.front().id = 2;
+    auto empty = MakeStandbyObject("batch_skip_empty", endpoint);
+    empty.metadata.replicas.clear();
+
+    auto source = std::make_unique<StandbyMetadataStore>();
+    ASSERT_TRUE(source->PutMetadata(good.tenant_id, good.key, good.metadata));
+    ASSERT_TRUE(source->PutMetadata(stale_only.tenant_id, stale_only.key,
+                                    stale_only.metadata));
+    ASSERT_TRUE(
+        source->PutMetadata(empty.tenant_id, empty.key, empty.metadata));
+    BatchOpLogPromotionHandoff handoff;
+    handoff.metadata_store = std::move(source);
+    handoff.segments = {MakeStandbyMemorySegment(endpoint)};
+    handoff.applied_cursor = {.batch_id = 7, .last_seq = 7};
+    handoff.max_replica_id = 2;
+
+    ASSERT_TRUE(service.RestoreFromBatchOpLogPromotion(std::move(handoff), 1)
+                    .has_value());
+
+    EXPECT_EQ(
+        ReplicaCountForTesting(service, kDefaultTenant, "batch_skip_good"), 1);
+    EXPECT_FALSE(HasMetadataEntryForTesting(service, kDefaultTenant,
+                                            "batch_skip_stale"));
+    EXPECT_TRUE(HasMetadataEntryForTesting(service, kDefaultTenant,
+                                           "batch_skip_empty"));
 }
 
 TEST_F(MasterServiceHATest, RestoreSkipsBadObjectAndKeepsExistingState) {
@@ -1904,8 +2027,7 @@ TEST_F(MasterServiceHATest,
         std::chrono::steady_clock::now() + std::chrono::seconds(5);
     bool reached_snapshot = false;
     while (std::chrono::steady_clock::now() < deadline) {
-        if (PutStartHoldsSnapshotAfterClientReleaseForTesting(
-                service, kDefaultTenant, key)) {
+        if (PutStartHoldsSnapshotAfterClientReleaseForTesting(service)) {
             reached_snapshot = true;
             break;
         }
@@ -2663,6 +2785,71 @@ TEST_F(MasterServiceHATest,
               0);
     EXPECT_TRUE(MasterServiceTestPeer::ClientLivenessRecords(service).contains(
         disk_owner));
+}
+
+TEST_F(MasterServiceHATest, RestoreDiscardRepairTimeoutThenRetrySucceeds) {
+    const std::string cluster_id = "test_restore_repair_timeout_retry";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_batch_max_entries(2)
+                              .set_restore_repair_durable_timeout_ms(50)
+                              .build();
+    MasterService service(service_config);
+    auto* writer = InstallGatedWriter(service, backend);
+    writer->HoldCallbacks();
+
+    const std::string endpoint = "standby_repair_timeout_segment";
+    auto survivor =
+        MakeStandbyObject("standby_repair_timeout_survivor", endpoint);
+    auto lost = MakeStandbyObject("standby_repair_timeout_lost", endpoint);
+    survivor.metadata.replicas.push_back(MakeStandbyMemoryReplica(endpoint));
+    survivor.metadata.replicas[1].id = 2;
+    survivor.metadata.replicas[0]
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    survivor.metadata.replicas[1]
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase + 8192;
+    lost.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+
+    const auto metric_before =
+        MasterMetricManager::instance().get_allocated_mem_size();
+
+    auto result = service.RestoreFromStandbySnapshot(
+        {survivor, lost}, 7, {MakeStandbyMemorySegment(endpoint)});
+
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(ErrorCode::INTERNAL_ERROR, result.error());
+    EXPECT_EQ(MasterMetricManager::instance().get_allocated_mem_size(),
+              metric_before);
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
+                                     "standby_repair_timeout_survivor"),
+              0);
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
+                                     "standby_repair_timeout_lost"),
+              0);
+    EXPECT_TRUE(MasterServiceTestPeer::ClientLivenessRecords(service).empty());
+
+    // The first repair may still become durable after the local restore
+    // has rolled back. Resume the writer, then retry the same snapshot.
+    writer->ResumeCallbacks();
+    auto retry = service.RestoreFromStandbySnapshot(
+        {survivor, lost}, 7, {MakeStandbyMemorySegment(endpoint)});
+    ASSERT_TRUE(retry.has_value());
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
+                                     "standby_repair_timeout_survivor"),
+              1);
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
+                                     "standby_repair_timeout_lost"),
+              0);
+    EXPECT_EQ(MasterMetricManager::instance().get_allocated_mem_size(),
+              metric_before + 1024);
 }
 
 TEST_F(MasterServiceHATest, RestoreDiscardRepairWithoutWriterFailsRestore) {
@@ -3977,21 +4164,6 @@ TEST_F(MasterServiceHATest, OplogRedisInvalidConnstringThrows) {
                       .build();
 
     EXPECT_THROW({ MasterService service(config); }, std::runtime_error);
-}
-
-TEST_F(MasterServiceHATest, BatchPrimaryDoesNotStartSnapshotWorker) {
-    auto config =
-        MasterServiceConfig::builder()
-            .set_enable_ha(true)
-            .set_enable_oplog(true)
-            .set_cluster_id("batch_snapshot_gate")
-            .set_enable_snapshot(true)
-            .set_snapshot_backup_dir(LegacyOpLogRootDir() + "/batch_snapshot")
-            .set_snapshot_object_store_type("local")
-            .build();
-
-    MasterService service(config);
-    EXPECT_FALSE(SnapshotManagerCreatedForTesting(service));
 }
 
 TEST_F(MasterServiceBatchRecordE2ETest,

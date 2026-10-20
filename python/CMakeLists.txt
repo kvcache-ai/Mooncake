@@ -4,11 +4,10 @@ find_package(
   REQUIRED)
 find_package(Threads REQUIRED)
 
-# This extension remains in its legacy source location until its subsystem is
-# migrated. CMake installs it directly into the backend-owned wheel tree.
-python3_add_library(
-  _fast_copy MODULE WITH_SOABI
-  "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/_fast_copy.c")
+# Compile the structured-object copy helper from the canonical Python package.
+# CMake installs the native artifact into the backend-owned wheel tree.
+python3_add_library(_fast_copy MODULE WITH_SOABI
+                    "${CMAKE_CURRENT_SOURCE_DIR}/mooncake/_fast_copy.c")
 target_link_libraries(_fast_copy PRIVATE Python3::NumPy Threads::Threads)
 target_compile_options(_fast_copy PRIVATE -O2)
 install(TARGETS _fast_copy LIBRARY DESTINATION mooncake COMPONENT python)
@@ -23,6 +22,20 @@ install(
   FILES_MATCHING
   PATTERN "*.py"
   PATTERN "__init__.py" EXCLUDE)
+if(WITH_EP)
+  install(
+    FILES
+      "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-pg/torch/src/pg_py.cpp"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-pg/torch/src/mooncake_backend.cpp"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-pg/torch/src/work_handles.cpp"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-pg/torch/include/mooncake_backend.h"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-pg/torch/include/work_handles.h"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-pg/torch/include/torch_utils.h"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-pg/include/pg_utils.h"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-pg/include/mooncake_pg.h"
+    DESTINATION mooncake/_pg_jit
+    COMPONENT python)
+endif()
 install(
   DIRECTORY
     "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-reshard/python/mooncake/reshard/"

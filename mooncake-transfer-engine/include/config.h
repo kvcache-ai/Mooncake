@@ -57,6 +57,10 @@ struct GlobalConfig {
     // one it honors the operator's value, clamped to the hardware.  The RDMA
     // transport passes max_wr to ibv_create_qp() and is unaffected.
     bool max_wr_from_env = false;
+    // 1 = signal every RDMA WR (historical). >1 enables unsignaled WRs with
+    // a signaled completion every N WRs plus the end of each ibv_post_send
+    // chain. Override via MC_RDMA_SIGNAL_INTERVAL.
+    int rdma_signal_interval = 1;
     size_t max_inline = 64;
     ibv_mtu mtu_length = IBV_MTU_4096;
     uint16_t handshake_port = 12001;
@@ -131,6 +135,13 @@ struct GlobalConfig {
     bool with_nvidia_peermem = true;
     // Register dma_buf MRs with mlx5 Data Direct. Set via MC_RDMA_DATA_DIRECT.
     bool rdma_data_direct = false;
+    // Pair Data Direct registrations and topology with the GPU's PCI root.
+    // Fail-closed: topology discovery is rejected when any NIC has no Data
+    // Direct function or any GPU has no paired NIC, instead of falling back
+    // to PCIe distance (which could select a NIC that cannot register the
+    // memory). Set via MC_RDMA_DATA_DIRECT_PAIRING; requires
+    // MC_RDMA_DATA_DIRECT.
+    bool rdma_data_direct_pairing = false;
     size_t eic_max_block_size = 64UL * 1024 * 1024;
     EndpointStoreType endpoint_store_type = EndpointStoreType::SIEVE;
     int ib_traffic_class = -1;

@@ -55,6 +55,9 @@ struct FdGuard {
 #ifdef HAVE_OSS_ADAPTER
 #include "storage/distributed/oss_adapter.h"
 #endif
+#ifdef HAVE_S3_ADAPTER
+#include "storage/distributed/s3_adapter.h"
+#endif
 #ifdef USE_3FS
 #include "storage/distributed/hf3fs_adapter.h"
 #endif
@@ -133,23 +136,7 @@ tl::expected<void, ErrorCode> StorageBackend::Init(uint64_t quota_bytes = 0) {
                    << e.what();
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
-    std::sort(existing_files.begin(), existing_files.end(),
-              [](const auto& a, const auto& b) {
-                  struct statx stx_a, stx_b;
-                  bool success_a = (statx(AT_FDCWD, a.path().c_str(), 0,
-                                          STATX_BTIME, &stx_a) == 0);
-                  bool success_b = (statx(AT_FDCWD, b.path().c_str(), 0,
-                                          STATX_BTIME, &stx_b) == 0);
-
-                  if (!success_a || !success_b) {
-                      return false;
-                  }
-
-                  if (stx_a.stx_btime.tv_sec == stx_b.stx_btime.tv_sec) {
-                      return stx_a.stx_btime.tv_nsec < stx_b.stx_btime.tv_nsec;
-                  }
-                  return stx_a.stx_btime.tv_sec < stx_b.stx_btime.tv_sec;
-              });
+    FileUtil::SortByCreationTime(existing_files);
     bool eviction_needed = false;
     {
         std::unique_lock<std::shared_mutex> space_lock(space_mutex_);
@@ -2184,7 +2171,24 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
 tl::expected<bool, ErrorCode> BucketStorageBackend::IsExist(
     const std::string& key) {
     SharedMutexLocker lock(&mutex_, shared_lock);
-    return object_bucket_map_.find(key) != object_bucket_map_.end();
+    auto it = object_bucket_map_.find(key);
+    if (it == object_bucket_map_.end()) {
+        return false;
+    }
+    // The index alone cannot see an externally wiped bucket file: writes
+    // commit file-then-index, so an index hit with no file behind it means
+    // the backing data is gone and the answer must be false, not "present".
+    auto path = GetBucketDataPath(it->second.bucket_id);
+    if (!path) {
+        return tl::make_unexpected(path.error());
+    }
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const bool on_disk = fs::exists(*path, ec);
+    if (ec) {
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    return on_disk;
 }
 
 tl::expected<bool, ErrorCode> BucketStorageBackend::IsEnableOffloading() {
@@ -2273,13 +2277,21 @@ BucketStorageBackend::GetStoreMetadata() {
 
 tl::expected<void, ErrorCode> BucketStorageBackend::AllocateOffloadingBuckets(
     const std::unordered_map<std::string, int64_t>& offloading_objects,
-    std::vector<std::vector<std::string>>& buckets_keys) {
-    return GroupOffloadingKeysByBucket(offloading_objects, buckets_keys);
+    std::vector<std::vector<std::string>>& buckets_keys,
+    std::vector<std::string>* deferred_keys) {
+    return GroupOffloadingKeysByBucket(offloading_objects, buckets_keys,
+                                       deferred_keys);
 }
 
 void BucketStorageBackend::ClearUngroupedOffloadingObjects() {
     MutexLocker locker(&offloading_mutex_);
     ungrouped_offloading_objects_.clear();
+}
+
+bool BucketStorageBackend::RemoveUngroupedOffloadingObject(
+    const std::string& key) {
+    MutexLocker locker(&offloading_mutex_);
+    return ungrouped_offloading_objects_.erase(key) > 0;
 }
 
 size_t BucketStorageBackend::UngroupedOffloadingObjectsSize() const {
@@ -2289,7 +2301,8 @@ size_t BucketStorageBackend::UngroupedOffloadingObjectsSize() const {
 
 tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
     const std::unordered_map<std::string, int64_t>& offloading_objects,
-    std::vector<std::vector<std::string>>& buckets_keys) {
+    std::vector<std::vector<std::string>>& buckets_keys,
+    std::vector<std::string>* deferred_keys) {
     MutexLocker offloading_locker(&offloading_mutex_);
     if (offloading_objects.empty()) {
         return {};
@@ -2327,9 +2340,25 @@ tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
         while (static_cast<int64_t>(bucket_keys.size()) <
                bucket_backend_config_.bucket_keys_limit) {
             if (it == offloading_objects.cend()) {
+                if (bucket_backend_config_.flush_partial_buckets) {
+                    // Keep these keys in the current cycle, while FileStorage
+                    // still has their tasks and source replicas are pinned.
+                    if (!bucket_keys.empty()) {
+                        buckets_keys.push_back(std::move(bucket_keys));
+                    }
+                    return {};
+                }
                 for (const auto& bucket_object : bucket_objects) {
                     ungrouped_offloading_objects.emplace(bucket_object.first,
                                                          bucket_object.second);
+                    // Report the deferral so the caller can keep these keys'
+                    // offload tasks alive until a later call re-emits them in
+                    // a bucket (upstream #3006: without this the tasks are
+                    // NACKed at deferral and the keys are silently dropped on
+                    // re-emission).
+                    if (deferred_keys != nullptr) {
+                        deferred_keys->push_back(bucket_object.first);
+                    }
                 }
                 VLOG(1) << "Add offloading objects to ungrouped pool. "
                         << "Total ungrouped count: "
@@ -5622,6 +5651,15 @@ CreateStorageBackend(const FileStorageConfig& config) {
                         distributed_config.fsdir);
 #else
                 LOG(ERROR) << "OSS adapter requires libcurl and OpenSSL";
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+#endif
+            } else if (distributed_config.fs_adapter_type == "s3") {
+#ifdef HAVE_S3_ADAPTER
+                object_storage_adapter =
+                    std::make_unique<S3ObjectStorageAdapter>(
+                        distributed_config.fsdir);
+#else
+                LOG(ERROR) << "S3 adapter requires libcurl and OpenSSL";
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
 #endif
             } else {

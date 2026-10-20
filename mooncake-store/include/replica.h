@@ -3,6 +3,10 @@
 #include <glog/logging.h>
 
 #include <boost/functional/hash.hpp>
+#include <boost/locale/utf.hpp>
+
+#include <algorithm>
+#include <ylt/struct_pack/compatible.hpp>
 
 #include <atomic>
 #include <cstdint>
@@ -125,13 +129,44 @@ struct ReplicateConfig {
     // always hash(tenant, key) and is decoupled from groups.
     std::optional<std::vector<std::string>> group_ids{};
 
-    ReplicateConfig ForSingleKey(size_t key_index) const {
-        ReplicateConfig key_config = *this;
-        if (group_ids.has_value()) {
-            key_config.group_ids =
-                std::vector<std::string>{group_ids->at(key_index)};
+    // Per-key write attribution, independent of key identity and eviction
+    // groups. Compatible field keeps pre-session RPC payloads readable in both
+    // directions.
+    struct_pack::compatible<std::vector<std::string>, 1> session_ids;
+
+    bool ValidSessionIds(size_t key_count) const {
+        return !session_ids ||
+               (session_ids->size() == key_count &&
+                std::all_of(session_ids->begin(), session_ids->end(),
+                            [](const auto& id) {
+                                if (id.size() > 256) return false;
+                                auto it = id.begin();
+                                while (it != id.end()) {
+                                    namespace utf = boost::locale::utf;
+                                    if (!utf::is_valid_codepoint(
+                                            utf::utf_traits<char>::decode(
+                                                it, id.end()))) {
+                                        return false;
+                                    }
+                                }
+                                return true;
+                            }));
+    }
+
+    std::string SessionId() const {
+        return session_ids && !session_ids->empty() ? session_ids->front() : "";
+    }
+
+    // Reuse a copy of the batch config; select IDs from the original batch.
+    void SetKeyIds(const ReplicateConfig& batch_config, size_t key_index) {
+        if (batch_config.group_ids.has_value()) {
+            group_ids =
+                std::vector<std::string>{batch_config.group_ids->at(key_index)};
         }
-        return key_config;
+        if (batch_config.session_ids) {
+            session_ids = std::vector<std::string>{
+                batch_config.session_ids->at(key_index)};
+        }
     }
 
     friend std::ostream& operator<<(std::ostream& os,
@@ -219,7 +254,10 @@ struct LocalDiskReplicaData {
     uint64_t object_size = 0;
     std::string transport_endpoint;
     // Process-local affiliation with the exact Client incarnation. This is
-    // rebuilt after restore and deliberately excluded from descriptors.
+    // rebuilt after restore and deliberately excluded from descriptors. Like
+    // the buffer bindings in AllocatedBuffer, it is set before the replica is
+    // published and not changed while readers can see it, so it needs no
+    // atomic access.
     std::shared_ptr<ClientLivenessRecord> client_liveness;
 };
 
@@ -346,39 +384,35 @@ class Replica {
 
     [[nodiscard]] Descriptor get_descriptor() const;
 
-    [[nodiscard]] bool getDescriptorIfAvailable(Descriptor& descriptor) const {
-        if (is_memory_replica()) {
-            const auto& data = std::get<MemoryReplicaData>(data_);
-            if (!data.buffer || !data.buffer->isAvailable()) {
-                return false;
-            }
-        } else if (is_nof_replica()) {
-            const auto& data = std::get<NoFReplicaData>(data_);
-            if (!data.buffer || !data.buffer->isAvailable()) {
-                return false;
-            }
-        } else if (is_local_disk_replica()) {
-            const auto& data = std::get<LocalDiskReplicaData>(data_);
-            const auto record = std::atomic_load_explicit(
-                &data.client_liveness, std::memory_order_acquire);
-            if (!record || !record->IsServing()) {
-                return false;
-            }
+    // The endpoint get_descriptor() would send a reader to, without building
+    // the descriptor; none for kinds whose descriptor names no endpoint.
+    [[nodiscard]] std::optional<std::string> transport_endpoint() const;
+
+    // True while the replica's storage can serve a read: a buffer still
+    // allocated on a live segment whose client is serving, or a local-disk
+    // owner that is still serving. Other kinds carry no such state.
+    [[nodiscard]] bool is_available() const {
+        if (const auto* data = std::get_if<MemoryReplicaData>(&data_)) {
+            return data->buffer && data->buffer->isAvailable();
         }
-        descriptor = get_descriptor();
-        if (is_memory_replica()) {
-            return std::get<MemoryReplicaData>(data_).buffer->isAvailable();
+        if (const auto* data = std::get_if<NoFReplicaData>(&data_)) {
+            return data->buffer && data->buffer->isAvailable();
         }
-        if (is_nof_replica()) {
-            return std::get<NoFReplicaData>(data_).buffer->isAvailable();
-        }
-        if (is_local_disk_replica()) {
-            const auto& data = std::get<LocalDiskReplicaData>(data_);
-            const auto record = std::atomic_load_explicit(
-                &data.client_liveness, std::memory_order_acquire);
-            return record && record->IsServing();
+        if (const auto* data = std::get_if<LocalDiskReplicaData>(&data_)) {
+            const ClientLivenessRecord* record = data->client_liveness.get();
+            return record != nullptr && record->IsServing();
         }
         return true;
+    }
+
+    [[nodiscard]] bool getDescriptorIfAvailable(Descriptor& descriptor) const {
+        if (!is_available()) {
+            return false;
+        }
+        descriptor = get_descriptor();
+        // Checked again: the storage can go away while the descriptor is
+        // built, and a reader must not be handed one that already has.
+        return is_available();
     }
 
     [[nodiscard]] ReplicaID id() const { return id_; }
@@ -529,10 +563,8 @@ class Replica {
                 data.buffer->bindClientLiveness(std::move(client_liveness));
             }
         } else if (is_local_disk_replica()) {
-            auto& record =
-                std::get<LocalDiskReplicaData>(data_).client_liveness;
-            std::atomic_store_explicit(&record, std::move(client_liveness),
-                                       std::memory_order_release);
+            std::get<LocalDiskReplicaData>(data_).client_liveness =
+                std::move(client_liveness);
         }
     }
 
@@ -544,8 +576,7 @@ class Replica {
         }
         if (is_local_disk_replica()) {
             const auto& data = std::get<LocalDiskReplicaData>(data_);
-            return std::atomic_load_explicit(&data.client_liveness,
-                                             std::memory_order_acquire);
+            return data.client_liveness;
         }
         return nullptr;
     }
@@ -559,9 +590,7 @@ class Replica {
         }
         if (is_local_disk_replica()) {
             const auto& data = std::get<LocalDiskReplicaData>(data_);
-            return std::atomic_load_explicit(&data.client_liveness,
-                                             std::memory_order_acquire) ==
-                   client_liveness;
+            return data.client_liveness == client_liveness;
         }
         return false;
     }
@@ -884,6 +913,21 @@ inline Replica::Descriptor Replica::get_descriptor() const {
     }
 
     return desc;
+}
+
+inline std::optional<std::string> Replica::transport_endpoint() const {
+    if (const auto* data = std::get_if<MemoryReplicaData>(&data_)) {
+        return data->buffer ? data->buffer->getTransportEndpoint()
+                            : std::string();
+    }
+    if (const auto* data = std::get_if<NoFReplicaData>(&data_)) {
+        return data->buffer ? data->buffer->getTransportEndpoint()
+                            : std::string();
+    }
+    if (const auto* data = std::get_if<LocalDiskReplicaData>(&data_)) {
+        return data->transport_endpoint;
+    }
+    return std::nullopt;
 }
 
 inline std::vector<std::optional<std::string>> Replica::get_segment_names()

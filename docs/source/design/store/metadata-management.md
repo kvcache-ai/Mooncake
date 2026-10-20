@@ -173,10 +173,9 @@ after a restart.
 The Master's hash tables are not written to disk directly. Fault tolerance is
 provided by:
 
-- **Snapshots**: each `ObjectMetadata` is serialized as a `MetadataPayload`
-  (struct_pack/msgpack: `client_id, size, replicas, group_id, data_type,
-  hard_pinned` — the key is *not* in the payload; it travels as the enclosing
-  map key) via `MasterSnapshotManager`/`MasterSnapshotRepository`.
+- **Batch OpLog snapshots**: standby-generated snapshots persist a durable
+  metadata baseline together with the OpLog cursor; the key and metadata are
+  restored as `StandbyObjectEntry` records before suffix replay.
 - **OpLog**: metadata mutations flow through the `OrderedOpLogWriter` to an
   HA KV backend (etcd or `HaKvBackend`), which the Standby replays into a
   `StandbyMetadataStore` (`tenant -> key -> StandbyObjectMetadata`). Snapshot
