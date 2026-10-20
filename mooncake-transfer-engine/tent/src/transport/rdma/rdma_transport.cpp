@@ -532,10 +532,7 @@ Status RdmaTransport::submitTransferTasks(
     int next_worker_idx = tl_caller_id;
     for (auto& request : request_list) {
         auto opcode = request.opcode;
-        auto type = static_cast<MemoryType>(request.source_memory_type);
-        if (type == MTYPE_UNKNOWN) {
-            type = Platform::getLoader().getMemoryType(request.source);
-        }
+        auto type = Platform::getLoader().getMemoryType(request.source);
         size_t max_slice_count = 64;
         if (type == MTYPE_CUDA || opcode == Request::WRITE)
             max_slice_count = 32;

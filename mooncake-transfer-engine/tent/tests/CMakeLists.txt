@@ -592,6 +592,8 @@ add_test(NAME tent_transport_hint_test COMMAND tent_transport_hint_test)
 # CP-3: homogeneous RDMA batches reuse SelectionResult per covering MR pair
 # instead of calling getTransportType once per descriptor.
 add_executable(tent_transport_route_cache_test transport_route_cache_test.cpp)
+target_compile_definitions(tent_transport_route_cache_test
+                           PRIVATE TENT_TRANSPORT_RESOLVE_COUNTER)
 target_link_libraries(tent_transport_route_cache_test PRIVATE gtest gtest_main
                                                               tent_link_group)
 if(TARGET asio_shared)
