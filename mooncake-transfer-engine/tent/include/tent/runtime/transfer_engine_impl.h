@@ -344,7 +344,8 @@ class TransferEngineImpl {
 
     Status transferSync(const std::vector<Request>& request_list);
 
-    uint64_t lockStageBuffer(const std::string& location);
+    uint64_t lockStageBuffer(const std::string& location,
+                             TransportType type = UNSPEC);
 
     Status unlockStageBuffer(uint64_t addr);
 
@@ -422,7 +423,7 @@ class TransferEngineImpl {
     std::vector<TransportType> getSupportedTransports(
         TransportType request_type);
 
-    void deregisterRemovedBuffer(BufferDesc& desc);
+    Status deregisterRemovedBuffer(BufferDesc& desc);
 
     Status resubmitTransferTask(Batch* batch, size_t task_id);
 

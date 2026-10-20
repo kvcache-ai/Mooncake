@@ -60,12 +60,18 @@ Status MluCopyQueue::synchronize() {
     std::lock_guard<std::mutex> lock(mutex);
     ContextGuard guard;
     CHECK_STATUS(guard.use(context));
-    return driverStatus(cnQueueSync(handle));
+    auto status = driverStatus(cnQueueSync(handle));
+    if (!status.ok()) error = status;
+    return status;
 }
 
 MluCopyQueue::~MluCopyQueue() {
     if (!handle) return;
-    logError(synchronize());
+    auto drained = synchronize();
+    if (!drained.ok()) {
+        logError(drained);
+        return;  // Destruction is not a device-side cancellation barrier.
+    }
     ContextGuard guard;
     auto status = guard.use(context);
     if (status.ok()) status = driverStatus(cnDestroyQueue(handle));
@@ -84,7 +90,13 @@ MluTask::~MluTask() {
     if (!completion) return;
     // Destroying a notifier does not wait for its copy. A caller may free a
     // sub-batch before polling completion, so drain before releasing resources.
-    if (status_word.load() == PENDING) logError(queue->synchronize());
+    if (status_word.load() == PENDING) {
+        auto drained = queue->synchronize();
+        if (!drained.ok()) {
+            logError(drained);
+            return;
+        }
+    }
     ContextGuard guard;
     auto status = guard.use(queue->context);
     if (status.ok()) status = driverStatus(cnDestroyNotifier(completion));
@@ -97,6 +109,7 @@ Status MluTransport::install(std::string & /*local_segment_name*/,
                              std::shared_ptr<ControlService> /*metadata*/,
                              std::shared_ptr<Topology> /*local_topology*/,
                              std::shared_ptr<Config> /*conf*/) {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (installed_) {
         return Status::InvalidArgument(
             "MLU transport has been installed" LOC_MARK);
@@ -113,8 +126,8 @@ Status MluTransport::install(std::string & /*local_segment_name*/,
 }
 
 Status MluTransport::uninstall() {
-    CHECK_STATUS(quiesce());
     std::lock_guard<std::mutex> lock(mutex_);
+    CHECK_STATUS(quiesceLocked());
     queues_.clear();
     platform_ = nullptr;
     installed_ = false;
@@ -123,15 +136,58 @@ Status MluTransport::uninstall() {
 
 Status MluTransport::quiesce() {
     std::lock_guard<std::mutex> lock(mutex_);
+    return quiesceLocked();
+}
+
+Status MluTransport::quiesceLocked() {
+    Status first_error;
     for (auto &[context, queues] : queues_) {
         for (auto &queue : queues) {
-            if (queue) CHECK_STATUS(queue->synchronize());
+            if (!queue) continue;
+            auto status = queue->synchronize();
+            if (!status.ok() && first_error.ok()) first_error = status;
         }
     }
+    return first_error;
+}
+
+Status MluTransport::drainTask(MluTask &task) {
+    if (task.status_word.load() != PENDING) return Status::OK();
+    ContextGuard guard;
+    CHECK_STATUS(guard.use(task.queue->context));
+    if (!task.drain_on_error) {
+        auto status = driverStatus(cnWaitNotifier(task.completion));
+        if (!status.ok()) task.drain_on_error = true;
+    }
+    if (task.drain_on_error) CHECK_STATUS(task.queue->synchronize());
+    task.transferred_bytes = task.drain_on_error ? 0 : task.request.length;
+    task.status_word = task.drain_on_error ? FAILED : COMPLETED;
     return Status::OK();
 }
 
+Status MluTransport::drainBuffer(uint64_t addr, size_t size) {
+    // mutex_ excludes submission through enqueue and notifier placement.
+    // A notifier waits only for this task's queue prefix, not later copies.
+    auto overlaps = [addr, size](uint64_t start, size_t length) {
+        return size && length &&
+               (start >= addr ? start - addr < size : addr - start < length);
+    };
+    Status first_error;
+    for (auto *batch : batches_) {
+        for (auto &task : batch->task_list) {
+            if (!overlaps(reinterpret_cast<uint64_t>(task.request.source),
+                          task.request.length) &&
+                !overlaps(task.request.target_offset, task.request.length))
+                continue;
+            auto status = drainTask(task);
+            if (!status.ok() && first_error.ok()) first_error = status;
+        }
+    }
+    return first_error;
+}
+
 Status MluTransport::allocateSubBatch(SubBatchRef &batch, size_t max_size) {
+    std::lock_guard<std::mutex> lock(mutex_);
     auto mlu_batch = Slab<MluSubBatch>::Get().allocate();
     if (!mlu_batch)
         return Status::InternalError(
@@ -139,21 +195,22 @@ Status MluTransport::allocateSubBatch(SubBatchRef &batch, size_t max_size) {
     batch = mlu_batch;
     mlu_batch->task_list.reserve(max_size);
     mlu_batch->max_size = max_size;
+    batches_.insert(mlu_batch);
     return Status::OK();
 }
 
 Status MluTransport::freeSubBatch(SubBatchRef &batch) {
+    std::lock_guard<std::mutex> lock(mutex_);
     auto mlu_batch = dynamic_cast<MluSubBatch *>(batch);
     if (!mlu_batch)
         return Status::InvalidArgument("Invalid MLU sub-batch" LOC_MARK);
+    Status first_error;
     for (auto &task : mlu_batch->task_list) {
-        if (task.status_word.load() == PENDING) {
-            CHECK_STATUS(task.queue->synchronize());
-            task.transferred_bytes =
-                task.drain_on_error ? 0 : task.request.length;
-            task.status_word = task.drain_on_error ? FAILED : COMPLETED;
-        }
+        auto status = drainTask(task);
+        if (!status.ok() && first_error.ok()) first_error = status;
     }
+    CHECK_STATUS(first_error);
+    batches_.erase(mlu_batch);
     Slab<MluSubBatch>::Get().deallocate(mlu_batch);
     batch = nullptr;
     return Status::OK();
@@ -174,12 +231,14 @@ Status MluTransport::submitTransferTasks(
         task.request = request;
         task.status_word = TransferStatusEnum::PENDING;
         task.transferred_bytes = 0;
-        startTransfer(&task, mlu_batch);
+        startTransfer(&task);
     }
+    mlu_batch->published_size.store(mlu_batch->task_list.size());
+    mlu_batch->notifyProgress();
     return Status::OK();
 }
 
-void MluTransport::startTransfer(MluTask *task, MluSubBatch *batch) {
+void MluTransport::startTransfer(MluTask *task) {
     ContextGuard caller_context;
     if (task->request.target_id != LOCAL_SEGMENT_ID ||
         (task->request.opcode != Request::READ &&
@@ -189,8 +248,20 @@ void MluTransport::startTransfer(MluTask *task, MluSubBatch *batch) {
                    << "; MLU only supports local staging copies";
         task->status_word = TransferStatusEnum::FAILED;
         task->transferred_bytes = 0;
-        batch->notifyProgress();
         return;
+    }
+
+    // A route may have been resolved before unregister removed its snapshot.
+    // Recheck it under the same lock that serializes enqueue and buffer drain.
+    if (metadata_) {
+        const auto local = metadata_->segmentManager().getLocal();
+        if (!local->findBuffer(reinterpret_cast<uint64_t>(task->request.source),
+                               task->request.length) ||
+            !local->findBuffer(task->request.target_offset,
+                               task->request.length)) {
+            task->status_word = FAILED;
+            return;
+        }
     }
 
     void *staging = reinterpret_cast<void *>(task->request.target_offset);
@@ -209,7 +280,6 @@ void MluTransport::startTransfer(MluTask *task, MluSubBatch *batch) {
                       "external device pointer.";
         task->status_word = TransferStatusEnum::FAILED;
         task->transferred_bytes = 0;
-        batch->notifyProgress();
         return;
     }
 
@@ -226,7 +296,6 @@ void MluTransport::startTransfer(MluTask *task, MluSubBatch *batch) {
         if (!task->drain_on_error)
             task->status_word = TransferStatusEnum::FAILED;
     }
-    batch->notifyProgress();
 }
 
 Status MluTransport::submitCopy(MluTask &task, bool to_device) {
@@ -301,28 +370,51 @@ Status MluTransport::submitCopy(MluTask &task, bool to_device) {
         cnCreateNotifier(&task.completion, CN_NOTIFIER_DISABLE_TIMING)));
     std::lock_guard<std::mutex> lock(task.queue->mutex);
     CHECK_STATUS(task.queue->error);
-    auto status = driverStatus(cnMemcpyAsync_V3(reinterpret_cast<CNaddr>(dst),
-                                                reinterpret_cast<CNaddr>(src),
-                                                length, task.queue->handle));
-    if (status.ok())
+    auto result_copy = cnMemcpyAsync_V3(reinterpret_cast<CNaddr>(dst),
+                                        reinterpret_cast<CNaddr>(src), length,
+                                        task.queue->handle);
+    auto status = driverStatus(result_copy);
+    if (status.ok()) {
         status =
             driverStatus(cnPlaceNotifier(task.completion, task.queue->handle));
-    if (!status.ok()) {
-        // A copy may already be queued when recording its notifier fails.
-        // Poll the queue before publishing failure and permitting buffer reuse.
-        task.drain_on_error = true;
+        // The copy was accepted even if its completion marker was rejected.
+        task.drain_on_error = !status.ok();
+        // Stop adding work behind a copy whose completion cannot be tracked.
+        if (!status.ok()) task.queue->error = status;
+    } else {
+        // Validation/invalid-handle errors reject this submission. A timeout
+        // or an unknown driver failure does not establish that no DMA ran.
+        switch (result_copy) {
+            case CN_ERROR_INVALID_VALUE:
+            case CN_ERROR_INVALID_ADDRESS:
+            case CN_MEMORY_ERROR_INVALID_ADDRESS:
+            case CN_CONTEXT_ERROR_INVALID:
+            case CN_QUEUE_ERROR_INVALID:
+            case CN_ERROR_NOT_INITIALIZED:
+            case CN_ERROR_DEINITIALIZED:
+                break;
+            default:
+                task.drain_on_error = true;
+                task.queue->error = status;
+        }
     }
     return status;
 }
 
 Status MluTransport::getTransferStatus(SubBatchRef batch, int task_id,
                                        TransferStatus &status) {
+    status = TransferStatus{PENDING, 0};
+    // Submission holds mutex_ until all task fields and notifiers are ready.
+    // Polling a submission in progress must neither block nor inspect them.
+    std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
+    if (!lock.owns_lock()) return Status::OK();
     auto mlu_batch = dynamic_cast<MluSubBatch *>(batch);
     if (!mlu_batch)
         return Status::InvalidArgument("Invalid MLU sub-batch" LOC_MARK);
-    if (task_id < 0 || task_id >= (int)mlu_batch->task_list.size()) {
+    if (task_id < 0 || task_id >= (int)mlu_batch->max_size) {
         return Status::InvalidArgument("Invalid task id" LOC_MARK);
     }
+    if (task_id >= (int)mlu_batch->published_size.load()) return Status::OK();
     auto &task = mlu_batch->task_list[task_id];
     if (task.status_word.load() == PENDING) {
         ContextGuard guard;
@@ -334,9 +426,9 @@ Status MluTransport::getTransferStatus(SubBatchRef batch, int task_id,
                 task.drain_on_error ? 0 : task.request.length;
             task.status_word = task.drain_on_error ? FAILED : COMPLETED;
         } else if (result != CN_ERROR_NOT_READY) {
-            LOG(WARNING) << driverStatus(result).ToString();
             task.drain_on_error = true;
-            if (task.queue->synchronize().ok()) task.status_word = FAILED;
+            CHECK_STATUS(task.queue->synchronize());
+            task.status_word = FAILED;
         }
     }
     status =
@@ -346,6 +438,7 @@ Status MluTransport::getTransferStatus(SubBatchRef batch, int task_id,
 
 Status MluTransport::allocateLocalMemory(void **addr, size_t size,
                                          MemoryOptions &options) {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (!installed_)
         return Status::InvalidArgument("MLU transport is not installed");
     if (!addr || !size) return Status::InvalidArgument("Empty allocation");
@@ -355,18 +448,41 @@ Status MluTransport::allocateLocalMemory(void **addr, size_t size,
     ContextGuard caller_context;
     *addr = nullptr;
     auto result = cnrtHostMalloc(addr, size);
-    return result == cnrtSuccess
-               ? Status::OK()
-               : Status::InternalError(cnrtGetErrorStr(result));
+    if (result != cnrtSuccess)
+        return Status::InternalError(cnrtGetErrorStr(result));
+    if (options.location != kWildcardLocation && options.location != "cpu") {
+        const auto locations = platform_->getLocation(*addr, size);
+        const bool local =
+            !locations.empty() &&
+            std::all_of(locations.begin(), locations.end(),
+                        [&](const auto &range) {
+                            return range.location == options.location;
+                        });
+        if (!local) {
+            // CNRT offers no host-NUMA allocation parameter. Preserve the
+            // requested locality through the normal allocator if its pinned
+            // allocation landed elsewhere; copies then use the pageable path.
+            auto freed = cnrtFreeHost(*addr);
+            if (freed != cnrtSuccess)
+                return Status::InternalError(cnrtGetErrorStr(freed));
+            *addr = nullptr;
+            return platform_->allocate(addr, size, options);
+        }
+    }
+    return Status::OK();
 }
 
 Status MluTransport::freeLocalMemory(void *addr, size_t size) {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (!installed_)
         return Status::InvalidArgument("MLU transport is not installed");
-    CHECK_STATUS(quiesce());
+    CHECK_STATUS(drainBuffer(reinterpret_cast<uint64_t>(addr), size));
     ContextGuard caller_context;
-    if (platform_->getMemoryType(addr) != MTYPE_CPU)
-        return platform_->free(addr, size);
+    cnrtPointerAttributes_t attributes{};
+    auto queried = cnrtPointerGetAttributes(&attributes, addr);
+    if (queried != cnrtSuccess)
+        return Status::InternalError(cnrtGetErrorStr(queried));
+    if (attributes.type != cnrtMemTypeHost) return platform_->free(addr, size);
     auto result = cnrtFreeHost(addr);
     return result == cnrtSuccess
                ? Status::OK()
@@ -388,10 +504,11 @@ Status MluTransport::addMemoryBuffer(BufferDesc &desc,
 }
 
 Status MluTransport::removeMemoryBuffer(BufferDesc &desc) {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (std::find(desc.transports.begin(), desc.transports.end(),
                   TransportType::MLU) == desc.transports.end())
         return Status::OK();
-    CHECK_STATUS(quiesce());
+    CHECK_STATUS(drainBuffer(desc.addr, desc.length));
     desc.transports.erase(
         std::remove(desc.transports.begin(), desc.transports.end(),
                     TransportType::MLU),

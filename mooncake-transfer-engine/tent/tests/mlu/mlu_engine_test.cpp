@@ -336,7 +336,7 @@ class MluEngineTest : public ::testing::TestWithParam<Params> {
         const auto network = std::get<0>(GetParam()) ? HP_TCP : TCP;
         auto route = TransferEngineImplTestPeer::route(*a_, request);
         ASSERT_EQ(route.transport, network);
-        ASSERT_EQ(route.staging_params.size(), 3u);
+        ASSERT_EQ(route.staging_params.size(), 5u);
         EXPECT_EQ(route.staging_params[1].empty(),
                   std::string_view(local_location) == "cpu:0");
         EXPECT_EQ(route.staging_params[2].empty(),
@@ -368,7 +368,7 @@ class MluEngineTest : public ::testing::TestWithParam<Params> {
                     engine->getLocalTopology()->findNearMem("mlu:0");
                 std::vector<uint64_t> pins;
                 for (int i = 0; i < 5; ++i) {
-                    auto pin = engine->lockStageBuffer(location);
+                    auto pin = engine->lockStageBuffer(location, MLU);
                     if (pin) pins.push_back(pin);
                 }
                 EXPECT_EQ(std::set<uint64_t>(pins.begin(), pins.end()).size(),
@@ -407,21 +407,47 @@ TEST_P(MluEngineTest, DefaultRegistrationSelectsLocalMluCopy) {
     EXPECT_TRUE(route.staging_params.empty());
 }
 
+TEST_P(MluEngineTest, StaleLocalRouteCannotSubmitAfterUnregister) {
+    void *device = nullptr, *host = nullptr;
+    ASSERT_NO_FATAL_FAILURE(allocate(*a_, "mlu:0", &device));
+    ASSERT_NO_FATAL_FAILURE(allocate(*a_, "cpu:0", &host));
+    Request request{};
+    request.opcode = Request::WRITE;
+    request.source = host;
+    request.target_id = LOCAL_SEGMENT_ID;
+    request.target_offset = reinterpret_cast<uint64_t>(device);
+    request.length = kLength;
+    ASSERT_EQ(TransferEngineImplTestPeer::route(*a_, request).transport, MLU);
+    ASSERT_TRUE(a_->unregisterLocalMemory(device).ok());
+    Transport::SubBatchRef batch = nullptr;
+    ASSERT_TRUE(local_copy_->allocateSubBatch(batch, 1).ok());
+    EXPECT_TRUE(local_copy_->submitTransferTasks(batch, {request}).ok());
+    TransferStatus status{};
+    EXPECT_TRUE(local_copy_->getTransferStatus(batch, 0, status).ok());
+    EXPECT_EQ(status.s, FAILED);
+    EXPECT_TRUE(local_copy_->freeSubBatch(batch).ok());
+}
+
 TEST_P(MluEngineTest, StagesDeviceToDeviceReadAndWrite) {
     ASSERT_NO_FATAL_FAILURE(transfer("mlu:0", "mlu:0", Request::WRITE, true));
     ASSERT_NO_FATAL_FAILURE(transfer("mlu:0", "mlu:0", Request::READ, true));
 }
 
-TEST_P(MluEngineTest, InternalStagingUsesPinnedHostMemory) {
+TEST_P(MluEngineTest, MluStagingHonorsRequestedNumaLocation) {
     const auto location = a_->getLocalTopology()->findNearMem("mlu:0");
-    const auto pin = a_->lockStageBuffer(location);
+    const auto pin = a_->lockStageBuffer(location, MLU);
     ASSERT_NE(pin, 0u);
     held_pins_.push_back({a_.get(), pin});
     cnrtPointerAttributes_t attributes{};
     ASSERT_EQ(
         cnrtPointerGetAttributes(&attributes, reinterpret_cast<void*>(pin)),
         cnrtSuccess);
-    EXPECT_EQ(attributes.type, cnrtMemTypeHost);
+    EXPECT_TRUE(attributes.type == cnrtMemTypeHost ||
+                attributes.type == cnrtMemTypeUnregistered);
+    const auto ranges = Platform::getLoader().getLocation(
+        reinterpret_cast<void*>(pin), 1UL << 20);
+    ASSERT_FALSE(ranges.empty());
+    for (const auto& range : ranges) EXPECT_EQ(range.location, location);
     ASSERT_TRUE(a_->unlockStageBuffer(pin).ok());
     held_pins_.pop_back();
     checkIdleResources();
@@ -545,7 +571,7 @@ TEST_P(MluEngineTest, PoolPressureRejectsThenCallerRetrySucceeds) {
             ASSERT_TRUE(
                 a_->openSegment(request.target_id, b_->getSegmentName()).ok());
             auto location = engine->getLocalTopology()->findNearMem("mlu:0");
-            auto pin = engine->lockStageBuffer(location);
+            auto pin = engine->lockStageBuffer(location, MLU);
             ASSERT_NE(pin, 0u);
             held_pins_.push_back({engine, pin});
             // Admission needs four slots before dispatching any payload.
@@ -595,27 +621,42 @@ TEST_P(MluEngineTest, CallerRetrySucceedsAfterPendingChunksDrain) {
             a_->openSegment(request.target_id, b_->getSegmentName()).ok());
         // Accept a pending network chunk before rejecting a later one.
         local_network_->network_passes_before_failure = 1;
-        local_network_->network_failures = 1;
+        // Keep rejecting the engine's automatic retry too, so this test
+        // observes terminal failure before a separate caller retry.
+        local_network_->network_failures = -1;
         local_network_->hold_network = true;
         local_network_->expire_network = false;
         int held_before = local_network_->held_submits;
+        int failures_before = local_network_->injected_failures;
         auto batch = a_->allocateBatch(1);
         ASSERT_NE(batch, 0u);
         batches_.push_back({a_.get(), batch});
         ASSERT_TRUE(a_->submitTransfer(batch, {request}).ok());
-        auto status = wait(batch);
-        ASSERT_EQ(status.s, FAILED);
-        EXPECT_EQ(status.transferred_bytes, 0u);
+        TransferStatus status{};
+        auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (local_network_->injected_failures.load() == failures_before &&
+               std::chrono::steady_clock::now() < deadline) {
+            ASSERT_TRUE(a_->progressBatch(batch, status).ok());
+            std::this_thread::yield();
+        }
+        ASSERT_GT(local_network_->injected_failures.load(), failures_before);
         ASSERT_GT(local_network_->held_submits.load(), held_before);
         EXPECT_GT(local_network_->live_batches.load(), 0);
-        ASSERT_TRUE(a_->freeBatch(batch).ok());
-        batches_.pop_back();
-        EXPECT_GT(local_network_->live_batches.load(), 0);
-        // Held operations dispatch no payload. Drain them before the caller
-        // resubmits, keeping both device allocations alive throughout.
+        ASSERT_TRUE(a_->progressBatch(batch, status).ok());
+        EXPECT_EQ(status.s, PENDING);
+        // A rejected sibling cannot authorize reuse while an accepted chunk
+        // still holds the caller's buffer. Confirm its timeout before failure
+        // is visible and the caller retries.
         local_network_->hold_network = false;
         local_network_->expire_network = true;
+        status = wait(batch);
+        ASSERT_EQ(status.s, FAILED);
+        EXPECT_EQ(status.transferred_bytes, 0u);
+        ASSERT_TRUE(a_->freeBatch(batch).ok());
+        batches_.pop_back();
         checkIdleResources();
+        local_network_->network_failures = 0;
         batch = a_->allocateBatch(1);
         ASSERT_NE(batch, 0u);
         batches_.push_back({a_.get(), batch});

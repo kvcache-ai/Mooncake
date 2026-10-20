@@ -893,9 +893,13 @@ if(USE_MLU)
   target_link_options(
     tent_mlu_transport_test
     PRIVATE
+    "-Wl,--wrap=cnrtHostMalloc"
+    "-Wl,--wrap=cnrtFreeHost"
+    "-Wl,--wrap=numa_move_pages"
     "-Wl,--wrap=cnPlaceNotifier"
     "-Wl,--wrap=cnMemcpyAsync_V3"
     "-Wl,--wrap=cnMemcpyHtoD"
     "-Wl,--wrap=cnQueueSync"
+    "-Wl,--wrap=cnQueryNotifier"
     "-Wl,--wrap=cnQueryQueue")
 endif()

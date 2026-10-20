@@ -317,7 +317,7 @@ TEST(MluProcessTest, TcpReadWriteWithIndependentDeviceAllocations) {
                 request.length = length;
                 auto route = TransferEngineImplTestPeer::route(engine, request);
                 ASSERT_EQ(route.transport, TCP);
-                ASSERT_EQ(route.staging_params.size(), 3u);
+                ASSERT_EQ(route.staging_params.size(), 5u);
                 BatchGuard owner(engine);
                 auto batch = owner.id;
                 ASSERT_NE(batch, 0u);

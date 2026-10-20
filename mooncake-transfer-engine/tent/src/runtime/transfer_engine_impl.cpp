@@ -796,10 +796,8 @@ Status TransferEngineImpl::allocateLocalMemory(void** addr, size_t size,
     options.internal = internal;
     if (location == kWildcardLocation ||
         LocationParser(location).type() == "cpu") {
-        if (internal && transport_list_[MLU])
-            options.type = MLU;  // SDK-pinned staging for asynchronous copies
-        else if (transport_list_[MNNVL] &&
-                 transport_list_[MNNVL]->capabilities().dram_to_dram)
+        if (transport_list_[MNNVL] &&
+            transport_list_[MNNVL]->capabilities().dram_to_dram)
             options.type = MNNVL;  // EGM: host memory NVLink peers can address
         else if (transport_list_[SHM])
             options.type = SHM;
@@ -1075,7 +1073,7 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
         },
         [&](BufferDesc& desc) {
             need_sync = true;
-            deregisterRemovedBuffer(desc);
+            return deregisterRemovedBuffer(desc);
         });
     // Synchronize local segment to metadata server so remote peers can see the
     // new buffers
@@ -1094,12 +1092,11 @@ Status TransferEngineImpl::unregisterLocalMemory(void* addr, size_t size) {
     auto status = local_segment_tracker_->remove(
         (uint64_t)addr, size, [&](BufferDesc& desc) -> Status {
             removed = true;
-            deregisterRemovedBuffer(desc);
-            return Status::OK();
+            return deregisterRemovedBuffer(desc);
         });
-    if (!status.ok()) return status;
-    if (!removed) return Status::OK();
-    return metadata_->segmentManager().synchronizeLocal();
+    if (!removed) return status;
+    auto synced = metadata_->segmentManager().synchronizeLocal();
+    return status.ok() ? synced : status;
 }
 
 Status TransferEngineImpl::unregisterLocalMemory(
@@ -1109,23 +1106,28 @@ Status TransferEngineImpl::unregisterLocalMemory(
             "Mismatched addresses and sizes in unregisterLocalMemory" LOC_MARK);
     }
     bool removed_any = false;
+    Status first_error;
     for (size_t i = 0; i < addr_list.size(); ++i) {
         bool removed = false;
         auto status = local_segment_tracker_->remove(
             (uint64_t)addr_list[i], size_list.empty() ? 0 : size_list[i],
             [&](BufferDesc& desc) -> Status {
                 removed = true;
-                deregisterRemovedBuffer(desc);
-                return Status::OK();
+                return deregisterRemovedBuffer(desc);
             });
-        if (!status.ok()) return status;
         if (removed) removed_any = true;
+        if (!status.ok()) {
+            first_error = status;
+            break;
+        }
     }
-    if (!removed_any) return Status::OK();
-    return metadata_->segmentManager().synchronizeLocal();
+    if (!removed_any) return first_error;
+    auto synced = metadata_->segmentManager().synchronizeLocal();
+    return first_error.ok() ? synced : first_error;
 }
 
-void TransferEngineImpl::deregisterRemovedBuffer(BufferDesc& desc) {
+Status TransferEngineImpl::deregisterRemovedBuffer(BufferDesc& desc) {
+    Status first_error;
     const BufferDesc original_desc = desc;
     const auto& registered_transports = original_desc.transports;
     for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
@@ -1136,16 +1138,25 @@ void TransferEngineImpl::deregisterRemovedBuffer(BufferDesc& desc) {
             std::find(registered_transports.begin(),
                       registered_transports.end(),
                       transport_type) != registered_transports.end();
-        BufferDesc transport_desc = original_desc;
+        BufferDesc transport_desc = desc;
         if (!advertised && !transport->tracksLocalBuffer(transport_desc))
             continue;
         auto status = transport->removeMemoryBuffer(transport_desc);
-        if (!status.ok()) LOG(WARNING) << status.ToString();
+        if (!status.ok()) {
+            if (first_error.ok()) first_error = status;
+            continue;
+        }
+        desc = std::move(transport_desc);
+        desc.transports.erase(
+            std::remove(desc.transports.begin(), desc.transports.end(),
+                        transport_type),
+            desc.transports.end());
+        if (advertised) {
+            TentMetrics::instance().recordRegisteredBufferBytes(
+                transport_type, -static_cast<int64_t>(original_desc.length));
+        }
     }
-    for (auto type : registered_transports) {
-        TentMetrics::instance().recordRegisteredBufferBytes(
-            type, -static_cast<int64_t>(original_desc.length));
-    }
+    return first_error;
 }
 
 BatchID TransferEngineImpl::allocateBatch(size_t batch_size) {
@@ -2138,6 +2149,10 @@ void TransferEngineImpl::findStagingPolicy(const Request& request,
         policy.push_back(server_addr);
         policy.push_back(local_stage);
         policy.push_back(remote_stage);
+        if (local_mtype == MTYPE_MLU || remote_mtype == MTYPE_MLU) {
+            policy.push_back(local_mtype == MTYPE_MLU ? "mlu" : "");
+            policy.push_back(remote_mtype == MTYPE_MLU ? "mlu" : "");
+        }
     }
 }
 
@@ -3722,9 +3737,10 @@ Status TransferEngineImpl::transferSync(
     return batch_guard.reset();
 }
 
-uint64_t TransferEngineImpl::lockStageBuffer(const std::string& location) {
+uint64_t TransferEngineImpl::lockStageBuffer(const std::string& location,
+                                             TransportType type) {
     uint64_t addr = 0;
-    auto status = staging_proxy_->pinStageBuffer(location, addr);
+    auto status = staging_proxy_->pinStageBuffer(location, addr, type);
     if (!status.ok()) LOG(ERROR) << status.ToString();
     return addr;
 }

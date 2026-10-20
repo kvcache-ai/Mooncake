@@ -63,7 +63,8 @@ class ProxyManager {
 
     Status getStatus(TaskInfo* task, TransferStatus& task_status);
 
-    Status pinStageBuffer(const std::string& location, uint64_t& addr);
+    Status pinStageBuffer(const std::string& location, uint64_t& addr,
+                          TransportType type = UNSPEC);
 
     Status unpinStageBuffer(uint64_t addr);
 
@@ -78,7 +79,8 @@ class ProxyManager {
 
     Status transferSync(StagingTask& task, StageBufferCache* cache);
 
-    Status allocateStageBuffers(const std::string& location);
+    Status allocateStageBuffers(const std::string& location,
+                                TransportType type);
 
     Status freeStageBuffers(const std::string& location);
 

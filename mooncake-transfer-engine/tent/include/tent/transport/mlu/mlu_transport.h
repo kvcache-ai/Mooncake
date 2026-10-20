@@ -21,6 +21,7 @@
 #include <mutex>
 #include <string>
 #include <vector>
+#include <unordered_set>
 #include <cn_api.h>
 
 #include "tent/platform/mlu.h"
@@ -34,7 +35,7 @@ struct MluCopyQueue {
     CNcontext context = nullptr;
     CNqueue handle = nullptr;
     std::mutex mutex;
-    Status error;
+    Status error;  // Guarded by mutex; do not submit to a failed queue.
     ~MluCopyQueue();
     Status synchronize();
 };
@@ -55,7 +56,8 @@ struct MluTask {
 struct MluSubBatch : public Transport::SubBatch {
     std::vector<MluTask> task_list;
     size_t max_size;
-    size_t size() const override { return task_list.size(); }
+    std::atomic<size_t> published_size{0};
+    size_t size() const override { return published_size.load(); }
 };
 
 // Executes copies with exactly one MLU endpoint, within the local
@@ -94,10 +96,14 @@ class MluTransport : public Transport {
 
    private:
     Status submitCopy(MluTask &task, bool to_device);
-    void startTransfer(MluTask *task, MluSubBatch *batch);
+    void startTransfer(MluTask *task);
+    Status quiesceLocked();
+    Status drainTask(MluTask &task);
+    Status drainBuffer(uint64_t addr, size_t size);
 
     std::mutex mutex_;
     std::map<CNcontext, std::array<std::shared_ptr<MluCopyQueue>, 2>> queues_;
+    std::unordered_set<MluSubBatch *> batches_;
     bool installed_ = false;
     MluPlatform *platform_ = nullptr;
 };

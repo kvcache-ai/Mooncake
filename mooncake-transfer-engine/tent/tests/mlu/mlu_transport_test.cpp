@@ -16,6 +16,8 @@
 
 #include <gtest/gtest.h>
 #include <cnrt.h>
+#include <numa.h>
+#include <sched.h>
 
 #include <cstdint>
 #include <chrono>
@@ -35,10 +37,48 @@
 
 namespace {
 std::atomic<bool> fail_notifier_record{false};
+std::atomic<CNresult> reject_copy{CN_SUCCESS};
 std::atomic<CNqueue> fail_queue{nullptr};
+std::atomic<bool> fail_query{false};
 std::atomic<bool> fail_sync{false};
+bool force_numa_mismatch = false;
+void *forced_pinned_allocation = nullptr;
+int forced_numa_node = -1;
+int forced_location_queries = 0;
+int forced_pinned_frees = 0;
 std::function<void()> before_copy, before_record, before_inline,
     after_idle_query;
+}
+
+extern "C" cnrtRet_t __real_cnrtHostMalloc(void **, size_t);
+extern "C" cnrtRet_t __wrap_cnrtHostMalloc(void **ptr, size_t size) {
+    auto result = __real_cnrtHostMalloc(ptr, size);
+    if (force_numa_mismatch && result == cnrtSuccess)
+        forced_pinned_allocation = *ptr;
+    return result;
+}
+extern "C" cnrtRet_t __real_cnrtFreeHost(void *);
+extern "C" cnrtRet_t __wrap_cnrtFreeHost(void *ptr) {
+    auto result = __real_cnrtFreeHost(ptr);
+    if (ptr == forced_pinned_allocation && result == cnrtSuccess) {
+        ++forced_pinned_frees;
+        forced_pinned_allocation = nullptr;
+    }
+    return result;
+}
+extern "C" int __real_numa_move_pages(int, unsigned long, void **, const int *,
+                                      int *, int);
+extern "C" int __wrap_numa_move_pages(int pid, unsigned long count,
+                                      void **pages, const int *nodes,
+                                      int *status, int flags) {
+    if (force_numa_mismatch && forced_pinned_allocation && count && !nodes &&
+        (reinterpret_cast<uintptr_t>(pages[0]) >> 12) ==
+            (reinterpret_cast<uintptr_t>(forced_pinned_allocation) >> 12)) {
+        std::fill(status, status + count, forced_numa_node);
+        ++forced_location_queries;
+        return 0;
+    }
+    return __real_numa_move_pages(pid, count, pages, nodes, status, flags);
 }
 
 extern "C" CNresult __real_cnPlaceNotifier(CNnotifier, CNqueue);
@@ -53,6 +93,8 @@ extern "C" CNresult __real_cnMemcpyAsync_V3(CNaddr, CNaddr, cn_uint64_t,
 extern "C" CNresult __wrap_cnMemcpyAsync_V3(CNaddr dst, CNaddr src,
                                             cn_uint64_t len, CNqueue queue) {
     if (before_copy) before_copy();
+    auto rejected = reject_copy.exchange(CN_SUCCESS);
+    if (rejected != CN_SUCCESS) return rejected;
     return __real_cnMemcpyAsync_V3(dst, src, len, queue);
 }
 extern "C" CNresult __real_cnMemcpyHtoD(CNaddr, const void *, cn_uint64_t);
@@ -64,7 +106,13 @@ extern "C" CNresult __wrap_cnMemcpyHtoD(CNaddr dst, const void *src,
 extern "C" CNresult __real_cnQueueSync(CNqueue);
 extern "C" CNresult __wrap_cnQueueSync(CNqueue queue) {
     if (fail_sync.exchange(false)) return CN_QUEUE_ERROR_INVALID;
+    if (queue == fail_queue.load()) return CN_QUEUE_ERROR_INVALID;
     return __real_cnQueueSync(queue);
+}
+extern "C" CNresult __real_cnQueryNotifier(CNnotifier);
+extern "C" CNresult __wrap_cnQueryNotifier(CNnotifier notifier) {
+    if (fail_query.load()) return CN_QUEUE_ERROR_INVALID;
+    return __real_cnQueryNotifier(notifier);
 }
 extern "C" CNresult __real_cnQueryQueue(CNqueue);
 extern "C" CNresult __wrap_cnQueryQueue(CNqueue queue) {
@@ -100,9 +148,14 @@ class MluTransportTest : public ::testing::Test {
     }
 
     void TearDown() override {
+        force_numa_mismatch = false;
+        forced_pinned_allocation = nullptr;
+        forced_location_queries = forced_pinned_frees = 0;
         before_copy = before_record = before_inline = after_idle_query = {};
+        fail_query = false;
         fail_sync = false;
         fail_queue = nullptr;
+        reject_copy = CN_SUCCESS;
         fail_notifier_record = false;
         transport_.uninstall();
     }
@@ -798,6 +851,9 @@ TEST_F(MluTransportTest, NotifierFailureRetainsPendingCopyUntilQueueDrains) {
     ASSERT_TRUE(transport_.getTransferStatus(batch, 0, status).ok());
     EXPECT_EQ(status.s, PENDING);
     EXPECT_EQ(status.transferred_bytes, 0u);
+    // A missing marker must not turn the fallback queue drain into an
+    // ever-growing wait behind unrelated later submissions.
+    EXPECT_EQ(run(request).s, FAILED);
     gate.release();
     status = wait(batch);
     EXPECT_EQ(status.s, FAILED);
@@ -827,12 +883,37 @@ TEST_F(MluTransportTest, DoesNotUnregisterCallerPinnedMemory) {
 
 TEST_F(MluTransportTest, AllocatesPinnedHostMemory) {
     MemoryOptions options;
-    options.location = "cpu:0";
+    options.location = kWildcardLocation;
     void *host = nullptr;
     ASSERT_TRUE(transport_.allocateLocalMemory(&host, kChunk, options).ok());
     cnrtPointerAttributes_t attributes{};
     ASSERT_EQ(cnrtPointerGetAttributes(&attributes, host), cnrtSuccess);
     EXPECT_EQ(attributes.type, cnrtMemTypeHost);
+    EXPECT_TRUE(transport_.freeLocalMemory(host, kChunk).ok());
+}
+
+TEST_F(MluTransportTest, PinnedNumaMismatchFallsBackAndReleasesAllocation) {
+    const int node = numa_node_of_cpu(sched_getcpu());
+    ASSERT_GE(node, 0);
+    MemoryOptions options;
+    options.location = "cpu:" + std::to_string(node);
+    // Keep the real SDK allocation, but report a different placement so the
+    // fallback is exercised regardless of where cnrtHostMalloc lands.
+    force_numa_mismatch = true;
+    forced_numa_node = node + 1;
+    void *host = nullptr;
+    auto status = transport_.allocateLocalMemory(&host, kChunk, options);
+    force_numa_mismatch = false;
+    ASSERT_TRUE(status.ok()) << status.ToString();
+    EXPECT_EQ(forced_location_queries, 1);
+    EXPECT_EQ(forced_pinned_frees, 1);
+    cnrtPointerAttributes_t attributes{};
+    EXPECT_EQ(cnrtPointerGetAttributes(&attributes, host), cnrtSuccess);
+    EXPECT_EQ(attributes.type, cnrtMemTypeUnregistered);
+    const auto ranges = loader_->getLocation(host, kChunk);
+    EXPECT_FALSE(ranges.empty());
+    for (const auto &range : ranges)
+        EXPECT_EQ(range.location, options.location);
     EXPECT_TRUE(transport_.freeLocalMemory(host, kChunk).ok());
 }
 
@@ -872,6 +953,240 @@ TEST_F(MluTransportTest, AsyncCopyPreservesFreshWorkerContext) {
     EXPECT_EQ(actual,
               std::vector<uint8_t>(host.bytes.begin(), host.bytes.end()));
     EXPECT_TRUE(loader_->free(dev, length).ok());
+}
+
+// Park the second task before enqueue, notifier publication, or an inline
+// copy. Polling a partially submitted batch must never inspect those fields.
+class MluPublicationTest : public MluTransportTest,
+                           public ::testing::WithParamInterface<int> {};
+TEST_P(MluPublicationTest, PollAndReleaseWaitForSubmissionPublication) {
+    const size_t length = GetParam() % 3 == 2 ? kChunk : kChunk + 1;
+    uint8_t *dev = nullptr;
+    ASSERT_NO_FATAL_FAILURE(allocDevice(&dev, 2 * length));
+    RegisteredHost host(transport_, 2 * length);
+    ASSERT_TRUE(host.status.ok());
+    std::fill(host.bytes.begin(), host.bytes.end(), 0x5A);
+    Transport::SubBatchRef batch = nullptr;
+    ASSERT_TRUE(transport_.allocateSubBatch(batch, 2).ok());
+    std::promise<void> entered, release;
+    auto released = release.get_future().share();
+    int calls = 0;
+    auto gate = [&] {
+        if (++calls != 2) return;
+        entered.set_value();
+        EXPECT_EQ(released.wait_for(std::chrono::seconds(5)),
+                  std::future_status::ready);
+    };
+    if (GetParam() % 3 == 0) before_copy = gate;
+    if (GetParam() % 3 == 1) before_record = gate;
+    if (GetParam() % 3 == 2) before_inline = gate;
+    auto submit = std::async(std::launch::async, [&] {
+        return transport_.submitTransferTasks(
+            batch, {makeRequest(Request::WRITE, host.bytes.data(),
+                                (uint64_t)dev, length),
+                    makeRequest(Request::WRITE, host.bytes.data() + length,
+                                (uint64_t)(dev + length), length)});
+    });
+    EXPECT_EQ(entered.get_future().wait_for(std::chrono::seconds(3)),
+              std::future_status::ready);
+    TransferStatus status{};
+    EXPECT_TRUE(transport_.getTransferStatus(batch, 1, status).ok());
+    EXPECT_EQ(status.s, PENDING);
+    std::promise<void> freeing;
+    auto cleanup = std::async(std::launch::async, [&] {
+        freeing.set_value();
+        return GetParam() < 3 ? transport_.freeSubBatch(batch)
+                              : transport_.removeMemoryBuffer(host.desc);
+    });
+    freeing.get_future().wait();
+    EXPECT_EQ(cleanup.wait_for(std::chrono::milliseconds(50)),
+              std::future_status::timeout);
+    release.set_value();
+    EXPECT_TRUE(submit.get().ok());
+    EXPECT_TRUE(cleanup.get().ok());
+    if (batch) {
+        EXPECT_TRUE(transport_.freeSubBatch(batch).ok());
+    }
+    before_copy = before_record = before_inline = {};
+    std::vector<uint8_t> actual(2 * length);
+    EXPECT_TRUE(loader_->copy(actual.data(), dev, actual.size()).ok());
+    EXPECT_EQ(actual, std::vector<uint8_t>(actual.size(), 0x5A));
+    EXPECT_TRUE(loader_->free(dev, actual.size()).ok());
+}
+INSTANTIATE_TEST_SUITE_P(EnqueueNotifierInline, MluPublicationTest,
+                         ::testing::Values(0, 1, 2, 3, 4, 5));
+
+TEST_F(MluTransportTest, RejectedCopyDoesNotWaitForUnrelatedQueueWork) {
+    uint8_t *dev = nullptr;
+    ASSERT_NO_FATAL_FAILURE(allocDevice(&dev, kBufSize));
+    RegisteredHost host(transport_, kBufSize);
+    ASSERT_TRUE(host.status.ok());
+    auto request = makeRequest(Request::WRITE, host.bytes.data(), (uint64_t)dev,
+                               kChunk + 1);
+    auto queue = queueFor(request);
+    ASSERT_NE(queue, nullptr);
+    QueueGate gate(queue);
+    Transport::SubBatchRef batch = nullptr;
+    ASSERT_TRUE(transport_.allocateSubBatch(batch, 1).ok());
+    reject_copy = CN_ERROR_INVALID_VALUE;
+    ASSERT_TRUE(transport_.submitTransferTasks(batch, {request}).ok());
+    TransferStatus status{};
+    EXPECT_TRUE(transport_.getTransferStatus(batch, 0, status).ok());
+    EXPECT_EQ(status.s, FAILED);
+    EXPECT_FALSE(
+        static_cast<MluSubBatch *>(batch)->task_list[0].drain_on_error);
+    gate.release();
+    EXPECT_TRUE(transport_.freeSubBatch(batch).ok());
+    EXPECT_TRUE(loader_->free(dev, kBufSize).ok());
+}
+
+TEST_F(MluTransportTest,
+       PersistentQueryFailureReportsErrorAndRetainsResources) {
+    uint8_t *dev = nullptr;
+    ASSERT_NO_FATAL_FAILURE(allocDevice(&dev, kBufSize));
+    RegisteredHost host(transport_, kBufSize);
+    ASSERT_TRUE(host.status.ok());
+    auto request = makeRequest(Request::WRITE, host.bytes.data(), (uint64_t)dev,
+                               kChunk + 1);
+    auto queue = queueFor(request);
+    ASSERT_NE(queue, nullptr);
+    QueueGate gate(queue);
+    Transport::SubBatchRef batch = nullptr;
+    ASSERT_TRUE(transport_.allocateSubBatch(batch, 1).ok());
+    ASSERT_TRUE(transport_.submitTransferTasks(batch, {request}).ok());
+    fail_queue = queue->handle;
+    fail_query = true;
+    for (int i = 0; i < 3; ++i) {
+        TransferStatus status{};
+        EXPECT_FALSE(transport_.getTransferStatus(batch, 0, status).ok());
+        EXPECT_EQ(status.s, PENDING);
+    }
+    EXPECT_FALSE(transport_.freeSubBatch(batch).ok());
+    EXPECT_NE(batch, nullptr);
+    EXPECT_FALSE(transport_.removeMemoryBuffer(host.desc).ok());
+    EXPECT_NE(std::find(host.desc.transports.begin(),
+                        host.desc.transports.end(), MLU),
+              host.desc.transports.end());
+    fail_query = false;
+    fail_queue = nullptr;
+    gate.release();
+    EXPECT_TRUE(transport_.freeSubBatch(batch).ok());
+    // A queue that failed synchronization is not reused for another copy.
+    EXPECT_EQ(run(request).s, FAILED);
+    EXPECT_TRUE(loader_->free(dev, kBufSize).ok());
+}
+
+TEST_F(MluTransportTest, UnregisterDoesNotDrainAnUnrelatedBuffer) {
+    uint8_t *dev = nullptr;
+    ASSERT_NO_FATAL_FAILURE(allocDevice(&dev, kBufSize));
+    RegisteredHost host(transport_, kBufSize), other(transport_, kBufSize);
+    ASSERT_TRUE(host.status.ok());
+    ASSERT_TRUE(other.status.ok());
+    auto request = makeRequest(Request::WRITE, host.bytes.data(), (uint64_t)dev,
+                               kChunk + 1);
+    auto queue = queueFor(request);
+    ASSERT_NE(queue, nullptr);
+    QueueGate gate(queue);
+    Transport::SubBatchRef batch = nullptr;
+    ASSERT_TRUE(transport_.allocateSubBatch(batch, 1).ok());
+    ASSERT_TRUE(transport_.submitTransferTasks(batch, {request}).ok());
+    auto removed = std::async(std::launch::async, [&] {
+        return transport_.removeMemoryBuffer(other.desc);
+    });
+    EXPECT_EQ(removed.wait_for(std::chrono::milliseconds(100)),
+              std::future_status::ready);
+    gate.release();
+    EXPECT_TRUE(removed.get().ok());
+    EXPECT_TRUE(transport_.freeSubBatch(batch).ok());
+    EXPECT_TRUE(loader_->free(dev, kBufSize).ok());
+}
+
+TEST_F(MluTransportTest,
+       QuiesceDrainsHealthyDirectionAfterOtherDirectionFails) {
+    uint8_t *dev = nullptr;
+    ASSERT_NO_FATAL_FAILURE(allocDevice(&dev, kBufSize));
+    RegisteredHost host(transport_, kBufSize);
+    ASSERT_TRUE(host.status.ok());
+    auto d2h = queueFor(makeRequest(Request::WRITE, dev,
+                                    (uint64_t)host.bytes.data(), kChunk + 1));
+    auto h2d_request = makeRequest(Request::WRITE, host.bytes.data(),
+                                   (uint64_t)dev, kChunk + 1);
+    auto h2d = queueFor(h2d_request);
+    ASSERT_NE(d2h, nullptr);
+    ASSERT_NE(h2d, nullptr);
+    QueueGate gate(h2d);
+    Transport::SubBatchRef batch = nullptr;
+    ASSERT_TRUE(transport_.allocateSubBatch(batch, 1).ok());
+    ASSERT_TRUE(transport_.submitTransferTasks(batch, {h2d_request}).ok());
+    fail_queue = d2h->handle;
+    auto drain =
+        std::async(std::launch::async, [&] { return transport_.quiesce(); });
+    EXPECT_EQ(drain.wait_for(std::chrono::milliseconds(50)),
+              std::future_status::timeout);
+    gate.release();
+    EXPECT_FALSE(drain.get().ok());
+    EXPECT_EQ(cnQueryQueue(h2d->handle), CN_SUCCESS);
+    fail_queue = nullptr;
+    EXPECT_TRUE(transport_.freeSubBatch(batch).ok());
+    EXPECT_TRUE(loader_->free(dev, kBufSize).ok());
+}
+
+TEST_F(MluTransportTest, AmbiguousSubmitFailureWaitsForQueueAndPoisonsIt) {
+    uint8_t *dev = nullptr;
+    ASSERT_NO_FATAL_FAILURE(allocDevice(&dev, kBufSize));
+    RegisteredHost host(transport_, kBufSize);
+    ASSERT_TRUE(host.status.ok());
+    auto request = makeRequest(Request::WRITE, host.bytes.data(), (uint64_t)dev,
+                               kChunk + 1);
+    auto queue = queueFor(request);
+    ASSERT_NE(queue, nullptr);
+    QueueGate gate(queue);
+    Transport::SubBatchRef batch = nullptr;
+    ASSERT_TRUE(transport_.allocateSubBatch(batch, 1).ok());
+    reject_copy = CN_INVOKE_ERROR_TIMEOUT;
+    ASSERT_TRUE(transport_.submitTransferTasks(batch, {request}).ok());
+    TransferStatus status{};
+    EXPECT_TRUE(transport_.getTransferStatus(batch, 0, status).ok());
+    EXPECT_EQ(status.s, PENDING);
+    EXPECT_TRUE(static_cast<MluSubBatch *>(batch)->task_list[0].drain_on_error);
+    gate.release();
+    EXPECT_EQ(wait(batch).s, FAILED);
+    EXPECT_TRUE(transport_.freeSubBatch(batch).ok());
+    EXPECT_EQ(run(request).s, FAILED);
+    request.length = kChunk;
+    EXPECT_EQ(run(request).s, FAILED);
+    EXPECT_TRUE(loader_->free(dev, kBufSize).ok());
+}
+
+TEST_F(MluTransportTest, UnregisterWaitsForOwnNotifierNotLaterQueueWork) {
+    uint8_t *dev = nullptr;
+    ASSERT_NO_FATAL_FAILURE(allocDevice(&dev, 2 * kBufSize));
+    RegisteredHost host(transport_, kBufSize), other(transport_, kBufSize);
+    ASSERT_TRUE(host.status.ok());
+    ASSERT_TRUE(other.status.ok());
+    Transport::SubBatchRef batch = nullptr;
+    ASSERT_TRUE(transport_.allocateSubBatch(batch, 2).ok());
+    auto first = makeRequest(Request::WRITE, host.bytes.data(), (uint64_t)dev,
+                             kChunk + 1);
+    ASSERT_TRUE(transport_.submitTransferTasks(batch, {first}).ok());
+    auto queue = static_cast<MluSubBatch *>(batch)->task_list[0].queue;
+    ASSERT_NE(queue, nullptr);
+    QueueGate gate(queue);
+    auto second = makeRequest(Request::WRITE, other.bytes.data(),
+                              (uint64_t)(dev + kBufSize), kChunk + 1);
+    ASSERT_TRUE(transport_.submitTransferTasks(batch, {second}).ok());
+    auto removed = std::async(std::launch::async, [&] {
+        return transport_.removeMemoryBuffer(host.desc);
+    });
+    EXPECT_EQ(removed.wait_for(std::chrono::milliseconds(200)),
+              std::future_status::ready);
+    TransferStatus status{};
+    EXPECT_TRUE(transport_.getTransferStatus(batch, 1, status).ok());
+    EXPECT_EQ(status.s, PENDING);
+    gate.release();
+    EXPECT_TRUE(removed.get().ok());
+    EXPECT_TRUE(transport_.freeSubBatch(batch).ok());
+    EXPECT_TRUE(loader_->free(dev, 2 * kBufSize).ok());
 }
 
 }  // namespace

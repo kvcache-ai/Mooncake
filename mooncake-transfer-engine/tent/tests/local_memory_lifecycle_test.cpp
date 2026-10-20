@@ -19,6 +19,8 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <algorithm>
+#include <utility>
 
 #include "tent/common/config.h"
 #include "tent/runtime/transfer_engine_impl.h"
@@ -49,6 +51,39 @@ class FailOnceFreeTransport : public Transport {
     const char* getName() const override { return "fail-once-free"; }
 
     int free_calls{0};
+};
+
+class FailOnceRemoveTransport : public Transport {
+   public:
+    explicit FailOnceRemoveTransport(TransportType type, bool fail = false)
+        : type(type), fail(fail) {}
+    Status addMemoryBuffer(BufferDesc& desc, const MemoryOptions&) override {
+        desc.transports.push_back(type);
+        return Status::OK();
+    }
+    Status removeMemoryBuffer(BufferDesc& desc) override {
+        ++remove_calls;
+        if (std::exchange(fail, false))
+            return Status::InternalError("injected drain failure");
+        desc.transports.erase(
+            std::remove(desc.transports.begin(), desc.transports.end(), type),
+            desc.transports.end());
+        return Status::OK();
+    }
+    Status allocateLocalMemory(void** addr, size_t size,
+                               MemoryOptions&) override {
+        ++allocate_calls;
+        *addr = std::malloc(size);
+        return Status::OK();
+    }
+    Status freeLocalMemory(void* addr, size_t) override {
+        std::free(addr);
+        return Status::OK();
+    }
+    const char* getName() const override { return "fail-once-remove"; }
+    TransportType type;
+    bool fail;
+    int remove_calls = 0, allocate_calls = 0;
 };
 
 std::shared_ptr<Config> makeConfig() {
@@ -220,6 +255,61 @@ TEST(LocalMemoryLifecycle, BasicShmAllocationsRegisterForReadAndWrite) {
     EXPECT_TRUE(target.unregisterLocalMemory(source).ok());
     EXPECT_TRUE(initiator.freeLocalMemory(destination).ok());
     EXPECT_TRUE(target.freeLocalMemory(source).ok());
+}
+
+TEST(LocalMemoryLifecycle, FailedUnregisterRetainsRegistrationForRetry) {
+    for (bool vector_api : {false, true}) {
+        TransferEngineImpl engine(makeConfig());
+        ASSERT_TRUE(engine.available());
+        auto rdma = std::make_shared<FailOnceRemoveTransport>(RDMA);
+        auto mlu = std::make_shared<FailOnceRemoveTransport>(MLU, true);
+        engine.swapTransportForTest(RDMA, rdma);
+        engine.swapTransportForTest(MLU, mlu);
+        std::vector<char> buffer(4096);
+        ASSERT_TRUE(
+            engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+        auto unregister = [&] {
+            return vector_api
+                       ? engine.unregisterLocalMemory(
+                             std::vector<void*>{buffer.data()}, {buffer.size()})
+                       : engine.unregisterLocalMemory(buffer.data(),
+                                                      buffer.size());
+        };
+        EXPECT_FALSE(unregister().ok());
+        SegmentInfo info;
+        ASSERT_TRUE(engine.getSegmentInfo(LOCAL_SEGMENT_ID, info).ok());
+        ASSERT_EQ(info.buffers.size(), 1u);
+        EXPECT_EQ(rdma->remove_calls, 1);
+        EXPECT_EQ(mlu->remove_calls, 1);
+        EXPECT_TRUE(unregister().ok());
+        EXPECT_EQ(rdma->remove_calls, 1)
+            << "Do not deregister a successful backend twice";
+        EXPECT_EQ(mlu->remove_calls, 2);
+        ASSERT_TRUE(engine.getSegmentInfo(LOCAL_SEGMENT_ID, info).ok());
+        EXPECT_TRUE(info.buffers.empty());
+    }
+}
+
+TEST(LocalMemoryLifecycle, InternalHostAllocationDoesNotImplicitlySelectMlu) {
+    TransferEngineImpl engine(makeConfig());
+    ASSERT_TRUE(engine.available());
+    auto tcp = std::make_shared<FailOnceRemoveTransport>(TCP);
+    auto mlu = std::make_shared<FailOnceRemoveTransport>(MLU);
+    engine.swapTransportForTest(TCP, tcp);
+    engine.swapTransportForTest(MLU, mlu);
+    void* address = nullptr;
+    ASSERT_TRUE(engine.allocateLocalMemory(&address, 4096, "cpu:0", true).ok());
+    EXPECT_EQ(tcp->allocate_calls, 1);
+    EXPECT_EQ(mlu->allocate_calls, 0);
+    EXPECT_TRUE(engine.freeLocalMemory(address).ok());
+    // An explicit MLU type selects the MLU allocation backend.
+    MemoryOptions options;
+    options.location = "cpu:0";
+    options.type = MLU;
+    options.internal = true;
+    ASSERT_TRUE(engine.allocateLocalMemory(&address, 4096, options).ok());
+    EXPECT_EQ(mlu->allocate_calls, 1);
+    EXPECT_TRUE(engine.freeLocalMemory(address).ok());
 }
 
 }  // namespace

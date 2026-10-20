@@ -353,13 +353,15 @@ Status ProxyManager::getStatus(TaskInfo* task, TransferStatus& task_status) {
 struct StageBufferCache {
     StageBufferCache(ProxyManager& mgr) : mgr(mgr) {}
 
-    uint64_t allocateLocal(const std::string& location, int idx = 0) {
-        auto key = location + "-" + std::to_string(idx);
+    uint64_t allocateLocal(const std::string& location, int idx = 0,
+                           TransportType type = UNSPEC) {
+        auto key = location + "-" + std::to_string(idx) + "-" +
+                   transportTypeName(type);
         if (local_stage_buffers.count(key)) {
             return local_stage_buffers[key];
         }
         uint64_t addr = 0;
-        auto status = mgr.pinStageBuffer(location, addr);
+        auto status = mgr.pinStageBuffer(location, addr, type);
         if (!status.ok()) {
             LOG(ERROR) << "Failed to pin local stage buffer: " << status
                        << ", location " << location;
@@ -370,14 +372,16 @@ struct StageBufferCache {
     }
 
     uint64_t allocateRemote(const std::string& server_addr,
-                            const std::string& location, int idx = 0) {
-        auto key = location + "-" + std::to_string(idx);
+                            const std::string& location, int idx = 0,
+                            TransportType type = UNSPEC) {
+        auto key = location + "-" + std::to_string(idx) + "-" +
+                   transportTypeName(type);
         if (remote_stage_buffers[server_addr].count(key)) {
             return remote_stage_buffers[server_addr][key];
         }
         uint64_t addr = 0;
         auto status =
-            ControlClient::pinStageBuffer(server_addr, location, addr);
+            ControlClient::pinStageBuffer(server_addr, location, addr, type);
         if (!status.ok()) {
             LOG(ERROR) << "Failed to pin remote stage buffer: " << status
                        << ", location " << location;
@@ -435,6 +439,32 @@ void ProxyManager::runner(size_t id) {
         auto status =
             transferEventLoop(task, &cache, buffers_safe_to_release,
                               undrained_batches, undrained_remote_operations);
+        // A failed sibling does not stop copies already using the caller's
+        // buffer. Keep the parent PENDING until those copies are terminal.
+        // Shutdown still uses the existing bounded deferred-teardown path.
+        uint64_t drain_polls = 0;
+        while (!buffers_safe_to_release &&
+               running_.load(std::memory_order_acquire)) {
+            for (auto it = undrained_batches.begin();
+                 it != undrained_batches.end();) {
+                TransferStatus child_status;
+                auto polled = impl_->progressBatch(*it, child_status);
+                if (polled.ok() && child_status.s != PENDING) {
+                    impl_->releaseBatch(reinterpret_cast<Batch*>(*it));
+                    it = undrained_batches.erase(it);
+                } else {
+                    if (!polled.ok()) {
+                        LOG_EVERY_N(WARNING, 100)
+                            << "Failed to drain staging copy: " << polled;
+                    }
+                    ++it;
+                }
+            }
+            internal::pollRemoteOperations(undrained_remote_operations);
+            buffers_safe_to_release = undrained_batches.empty() &&
+                                      undrained_remote_operations.empty();
+            if (!buffers_safe_to_release) waitBeforeNextPoll(drain_polls++);
+        }
         if (buffers_safe_to_release) {
             cache.reset();
         } else {
@@ -458,9 +488,11 @@ void ProxyManager::runner(size_t id) {
                 has_pending_cleanups_.store(true, std::memory_order_relaxed);
             }
         }
-        task.native->staging_status.store(status.ok() ? COMPLETED : FAILED,
-                                          std::memory_order_release);
-        impl_->notifyBatchMaybeReady(task.batch);
+        if (buffers_safe_to_release) {
+            task.native->staging_status.store(status.ok() ? COMPLETED : FAILED,
+                                              std::memory_order_release);
+            impl_->notifyBatchMaybeReady(task.batch);
+        }
     }
 }
 
@@ -474,14 +506,18 @@ Status ProxyManager::transferEventLoop(
     auto server_addr = task.params[0];
     bool local_staging = !task.params[1].empty();
     bool remote_staging = !task.params[2].empty();
+    const auto local_type =
+        task.params.size() > 3 && task.params[3] == "mlu" ? MLU : UNSPEC;
+    const auto remote_type =
+        task.params.size() > 4 && task.params[4] == "mlu" ? MLU : UNSPEC;
     const size_t kStageBuffers =
         std::min(chunk_count_, static_cast<size_t>(16));
     uint64_t local_stage_buffer[kStageBuffers],
         remote_stage_buffer[kStageBuffers];
     if (local_staging) {
         for (size_t i = 0; i < kStageBuffers; ++i) {
-            local_stage_buffer[i] =
-                cache->allocateLocal(task.params[1], static_cast<int>(i));
+            local_stage_buffer[i] = cache->allocateLocal(
+                task.params[1], static_cast<int>(i), local_type);
             if (local_stage_buffer[i] == 0)
                 return Status::InternalError(
                     "Failed to pin local stage buffer");
@@ -490,7 +526,7 @@ Status ProxyManager::transferEventLoop(
     if (remote_staging) {
         for (size_t i = 0; i < kStageBuffers; ++i) {
             remote_stage_buffer[i] = cache->allocateRemote(
-                server_addr, task.params[2], static_cast<int>(i));
+                server_addr, task.params[2], static_cast<int>(i), remote_type);
             if (remote_stage_buffer[i] == 0)
                 return Status::InternalError(
                     "Failed to pin remote stage buffer");
@@ -817,15 +853,20 @@ Status ProxyManager::transferSync(StagingTask& task, StageBufferCache* cache) {
     auto server_addr = task.params[0];
     bool local_staging = !task.params[1].empty();
     bool remote_staging = !task.params[2].empty();
+    const auto local_type =
+        task.params.size() > 3 && task.params[3] == "mlu" ? MLU : UNSPEC;
+    const auto remote_type =
+        task.params.size() > 4 && task.params[4] == "mlu" ? MLU : UNSPEC;
 
     if (local_staging) {
-        local_stage_buffer = cache->allocateLocal(task.params[1]);
+        local_stage_buffer =
+            cache->allocateLocal(task.params[1], 0, local_type);
         if (local_stage_buffer == 0)
             return Status::InternalError("Failed to pin local stage buffer");
     }
     if (remote_staging) {
         remote_stage_buffer =
-            cache->allocateRemote(server_addr, task.params[2]);
+            cache->allocateRemote(server_addr, task.params[2], 0, remote_type);
         if (remote_stage_buffer == 0)
             return Status::InternalError("Failed to pin remote stage buffer");
     }
@@ -873,25 +914,41 @@ Status ProxyManager::transferSync(StagingTask& task, StageBufferCache* cache) {
     return Status::OK();
 }
 
-Status ProxyManager::allocateStageBuffers(const std::string& location) {
+Status ProxyManager::allocateStageBuffers(const std::string& location,
+                                          TransportType type) {
     // Held across the slow allocate + register, which run once per location.
     // Racing instead would register the same hundreds of MB twice, then throw
     // one away.
     std::unique_lock<std::shared_mutex> guard(stage_buffers_mutex_);
-    if (stage_buffers_.count(location)) return Status::OK();
+    const auto key =
+        type == UNSPEC ? location : location + "/" + transportTypeName(type);
+    if (stage_buffers_.count(key)) return Status::OK();
     StageBuffers buf;
     auto total_size = chunk_size_ * chunk_count_;
-    CHECK_STATUS(
-        impl_->allocateLocalMemory(&buf.chunks, total_size, location, true));
+    if (type == MLU) {
+        MemoryOptions options;
+        options.location = location;
+        options.type = MLU;
+        options.internal = true;
+        CHECK_STATUS(
+            impl_->allocateLocalMemory(&buf.chunks, total_size, options));
+    } else {
+        CHECK_STATUS(impl_->allocateLocalMemory(&buf.chunks, total_size,
+                                                location, true));
+    }
     // Registration options determine visibility in getSegmentInfo().
     MemoryOptions options;
     options.internal = true;
-    CHECK_STATUS(
-        impl_->registerLocalMemory({buf.chunks}, {total_size}, options));
+    auto registered =
+        impl_->registerLocalMemory({buf.chunks}, {total_size}, options);
+    if (!registered.ok()) {
+        impl_->freeLocalMemory(buf.chunks);
+        return registered;
+    }
     buf.bitmap = new std::atomic_flag[chunk_count_];
     for (size_t i = 0; i < chunk_count_; ++i)
         buf.bitmap[i].clear(std::memory_order_relaxed);
-    stage_buffers_[location] = std::move(buf);
+    stage_buffers_[key] = std::move(buf);
     return Status::OK();
 }
 
@@ -907,16 +964,20 @@ Status ProxyManager::freeStageBuffers(const std::string& location) {
     return Status::OK();
 }
 
-Status ProxyManager::pinStageBuffer(const std::string& location,
-                                    uint64_t& addr) {
+Status ProxyManager::pinStageBuffer(const std::string& location, uint64_t& addr,
+                                    TransportType type) {
+    if (type != UNSPEC && type != MLU)
+        return Status::InvalidArgument("Unsupported stage allocator");
+    const auto key =
+        type == UNSPEC ? location : location + "/" + transportTypeName(type);
     {
         std::shared_lock<std::shared_mutex> guard(stage_buffers_mutex_);
-        auto it = stage_buffers_.find(location);
+        auto it = stage_buffers_.find(key);
         if (it == stage_buffers_.end()) {
             guard.unlock();
-            CHECK_STATUS(allocateStageBuffers(location));
+            CHECK_STATUS(allocateStageBuffers(location, type));
             guard.lock();
-            it = stage_buffers_.find(location);
+            it = stage_buffers_.find(key);
             if (it == stage_buffers_.end())
                 return Status::InternalError(
                     "Stage buffer disappeared" LOC_MARK);
@@ -935,7 +996,7 @@ Status ProxyManager::pinStageBuffer(const std::string& location,
     if (has_pending_cleanups_.load(std::memory_order_relaxed)) {
         flushPendingCleanups();
         std::shared_lock<std::shared_mutex> guard(stage_buffers_mutex_);
-        auto it = stage_buffers_.find(location);
+        auto it = stage_buffers_.find(key);
         if (it != stage_buffers_.end()) {
             auto& buf = it->second;
             for (size_t i = 0; i < chunk_count_; ++i) {

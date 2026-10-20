@@ -846,7 +846,7 @@ TEST(TransferEngineImpl, DirectSubmitRejectsBatchCapacityOverflow) {
         engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
 }
 
-TEST(ProxyManager, CleansUpDeferredStageBuffersWhenPendingBatchCompletes) {
+TEST(ProxyManager, ReusesStageBuffersAfterFailedTaskDrains) {
     class ControlledTransport : public FakeTransport {
        public:
         explicit ControlledTransport(TransportType type)
@@ -911,24 +911,25 @@ TEST(ProxyManager, CleansUpDeferredStageBuffersWhenPendingBatchCompletes) {
         TransferStatus status;
         const auto deadline =
             std::chrono::steady_clock::now() + std::chrono::seconds(2);
-        while (std::chrono::steady_clock::now() < deadline) {
-            ASSERT_TRUE(manager.getStatus(&task1, status).ok());
-            if (status.s != PENDING) break;
+        while (std::chrono::steady_clock::now() < deadline &&
+               fake_tcp->submit_count.load() < 2) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
         ASSERT_TRUE(manager.getStatus(&task1, status).ok());
-        EXPECT_EQ(status.s, FAILED);
+        EXPECT_GE(fake_tcp->submit_count.load(), 2);
+        EXPECT_EQ(status.s, PENDING);
 
-        // While task1's batch is still PENDING, its stage buffer remains
-        // deferred and pinned.
+        // While task1's batch is still PENDING, its stage buffer stays
+        // reserved.
         uint64_t addr = 0;
         EXPECT_TRUE(manager.pinStageBuffer(kWildcardLocation, addr)
                         .IsTooManyRequests());
 
         // Allow in-flight batches to complete.
         fake_tcp->stay_pending.store(false, std::memory_order_relaxed);
+        EXPECT_EQ(waitForStagingTerminal(manager, task1).s, FAILED);
 
-        // Submit task2 to trigger flushPendingCleanups() in worker thread.
+        // A subsequent task can reuse the drained staging pool.
         TaskInfo task2;
         task2.request = request;
         task2.request.length =
@@ -945,7 +946,7 @@ TEST(ProxyManager, CleansUpDeferredStageBuffersWhenPendingBatchCompletes) {
         }
         ASSERT_TRUE(manager.getStatus(&task2, status).ok());
 
-        // Now deferred stage buffers from task1 have been reclaimed!
+        // The completed drain makes task1's stage buffers available again.
         ASSERT_TRUE(manager.pinStageBuffer(kWildcardLocation, addr).ok());
         EXPECT_TRUE(manager.unpinStageBuffer(addr).ok());
     }
@@ -1021,23 +1022,24 @@ TEST(ProxyManager, RetainsBatchToPreventSlabReuseLeak) {
         TransferStatus status;
         const auto deadline =
             std::chrono::steady_clock::now() + std::chrono::seconds(2);
-        while (std::chrono::steady_clock::now() < deadline) {
-            ASSERT_TRUE(manager.getStatus(&task1, status).ok());
-            if (status.s != PENDING) break;
+        while (std::chrono::steady_clock::now() < deadline &&
+               fake_tcp->submit_count.load() < 2) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
         ASSERT_TRUE(manager.getStatus(&task1, status).ok());
-        EXPECT_EQ(status.s, FAILED);
+        EXPECT_GE(fake_tcp->submit_count.load(), 2);
+        EXPECT_EQ(status.s, PENDING);
 
         // Allow task1 in-flight batch to finish on transport
         fake_tcp->stay_pending.store(false, std::memory_order_relaxed);
+        EXPECT_EQ(waitForStagingTerminal(manager, task1).s, FAILED);
 
         // Attempting to allocate a new batch should not collide with retained
         // batch
         BatchID new_batch = engine.allocateBatch(1);
         ASSERT_NE(new_batch, (BatchID)0);
 
-        // Submit task2 to trigger flushPendingCleanups()
+        // Submit another task after the failed parent has drained.
         TaskInfo task2;
         task2.request = request;
         task2.request.length = 64;
@@ -1067,7 +1069,7 @@ TEST(ProxyManager, RetainsBatchToPreventSlabReuseLeak) {
         engine.unregisterLocalMemory(target.data(), target.size()).ok());
 }
 
-TEST(ProxyManager, DeferredCleanupPollErrorKeepsStageBuffersPinned) {
+TEST(ProxyManager, PollErrorKeepsInflightStageBuffersReserved) {
     auto cfg = makeMinimalP2PConfig();
     TransferEngineImpl engine(cfg);
     ASSERT_TRUE(engine.available());
@@ -1097,7 +1099,15 @@ TEST(ProxyManager, DeferredCleanupPollErrorKeepsStageBuffersPinned) {
         task.request = request;
         task.staging = true;
         ASSERT_TRUE(manager.submit(&task, 0, params).ok());
-        ASSERT_EQ(waitForStagingTerminal(manager, task).s, FAILED);
+        const auto submission_deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (fake_tcp->submit_attempts.load() < 2 &&
+               std::chrono::steady_clock::now() < submission_deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        EXPECT_GE(fake_tcp->submit_attempts.load(), 2);
+        TransferStatus pending{};
+        EXPECT_TRUE(manager.getStatus(&task, pending).ok());
+        EXPECT_EQ(pending.s, PENDING);
 
         fake_tcp->fail_polling.store(true, std::memory_order_release);
         uint64_t addr = 0;
@@ -1111,6 +1121,7 @@ TEST(ProxyManager, DeferredCleanupPollErrorKeepsStageBuffersPinned) {
 
         fake_tcp->fail_polling.store(false, std::memory_order_release);
         fake_tcp->stay_pending.store(false, std::memory_order_release);
+        EXPECT_EQ(waitForStagingTerminal(manager, task).s, FAILED);
         ASSERT_TRUE(manager.pinStageBuffer(kWildcardLocation, addr).ok());
         EXPECT_TRUE(manager.unpinStageBuffer(addr).ok());
     }
@@ -1329,7 +1340,15 @@ TEST(ProxyManager, DestructorWaitsForDeferredBatchBeforeFreeingStageMemory) {
     task.request = request;
     task.staging = true;
     ASSERT_TRUE(manager->submit(&task, 0, params).ok());
-    ASSERT_EQ(waitForStagingTerminal(*manager, task).s, FAILED);
+    const auto submission_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (fake_tcp->submit_attempts.load() < 2 &&
+           std::chrono::steady_clock::now() < submission_deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    EXPECT_GE(fake_tcp->submit_attempts.load(), 2);
+    TransferStatus pending{};
+    EXPECT_TRUE(manager->getStatus(&task, pending).ok());
+    EXPECT_EQ(pending.s, PENDING);
 
     std::atomic<bool> destroyed{false};
     std::thread destroyer([&] {
