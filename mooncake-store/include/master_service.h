@@ -2104,8 +2104,9 @@ class MasterService {
     // (config: offload_on_evict)
     bool offload_on_evict_{false};
     // Force-evict: after a failed allocation, allow evicting MEMORY replicas
-    // without disk offload when they cannot be queued (in-flight cap reached
-    // or the push refused) (config: offload_force_evict, only effective when
+    // without disk offload when they cannot be queued (the owner's in-flight
+    // room is full or the push refused); the tenant-quota pass drops them on
+    // quota pressure alone (config: offload_force_evict, only effective when
     // offload_on_evict_=true)
     bool offload_force_evict_{false};
 
