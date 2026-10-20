@@ -131,7 +131,7 @@ def memory_binding(
                     layers * width,
                     tokens * layers * width,
                 )
-            for l, layer in enumerate(part.layer_ids):
+            for local_layer, layer in enumerate(part.layer_ids):
                 for h in range(heads) if fmt is KVCacheStoreFormat.HPLD else (0,):
                     ranges.append(
                         KVCacheResolvedRange(
@@ -142,7 +142,7 @@ def memory_binding(
                             part.head_start + h,
                             1 if fmt is KVCacheStoreFormat.HPLD else heads,
                             region_id,
-                            l * layer_stride + h * head_stride,
+                            local_layer * layer_stride + h * head_stride,
                             token_stride,
                             head_stride,
                         )
