@@ -497,8 +497,8 @@ TEST_P(MluEngineTest, OlderPeerUsesLegacyStageAllocationRequest) {
 }
 
 TEST(MluStageRpcTest, DefaultAllocatorSendsLocationStringToLegacyServer) {
-    CoroRpcAgent server;
     std::atomic<bool> received_location{false};
+    CoroRpcAgent server;
     ASSERT_TRUE(
         server
             .registerFunction(
@@ -513,9 +513,15 @@ TEST(MluStageRpcTest, DefaultAllocatorSendsLocationStringToLegacyServer) {
     uint16_t port = 0;
     ASSERT_TRUE(server.start(port).ok());
     uint64_t addr = 0;
-    ASSERT_TRUE(ControlClient::pinStageBuffer(
-                    "127.0.0.1:" + std::to_string(port), "cpu:0", addr)
-                    .ok());
+    Status status;
+    // Each repetition starts a new server. Do not reuse a thread-local
+    // connection pool if the server gets a port used by an earlier iteration.
+    std::thread caller([&] {
+        status = ControlClient::pinStageBuffer(
+            "127.0.0.1:" + std::to_string(port), "cpu:0", addr);
+    });
+    caller.join();
+    ASSERT_TRUE(status.ok()) << status.ToString();
     EXPECT_TRUE(received_location.load());
     EXPECT_EQ(addr, 4096u);
 }
