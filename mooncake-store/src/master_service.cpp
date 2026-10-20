@@ -1519,7 +1519,8 @@ MasterService::GroupEvictionResult MasterService::EvictGroupOrObject(
         const auto live_member_keys = GetGroupMemberKeys(tenant_id, group_id);
         for (const auto& member_key : live_member_keys) {
             const size_t member_shard = getShardIndex(tenant_id, member_key);
-            MetadataAccessorRW member(this, ObjectIdentity{tenant_id, member_key});
+            MetadataAccessorRW member(this,
+                                      ObjectIdentity{tenant_id, member_key});
             const route::Generation generation =
                 member.IsPublished() ? member.GetRef().generation : 0;
             progress->members.push_back(
@@ -1608,7 +1609,8 @@ MasterService::GroupEvictionResult MasterService::EvictGroupOrObject(
             member_keys.push_back(key);
         }
         for (const auto& member_key : member_keys) {
-            MetadataAccessorRW member(this, ObjectIdentity{tenant_id, member_key});
+            MetadataAccessorRW member(this,
+                                      ObjectIdentity{tenant_id, member_key});
             if (!eligible(member)) {
                 continue;
             }
@@ -11282,8 +11284,7 @@ bool MasterService::ResumeEvictionContinuation() {
                 return result;
             }
             const auto& metadata = trigger.Get();
-            if (metadata.IsHardPinned() ||
-                !metadata.IsLeaseExpired(now) ||
+            if (metadata.IsHardPinned() || !metadata.IsLeaseExpired(now) ||
                 (cutoff &&
                  (!candidate_allows_soft_pin ||
                   IsSoftPinActive(metadata, now)) &&
@@ -11311,8 +11312,8 @@ bool MasterService::ResumeEvictionContinuation() {
 
             auto evict_one_member =
                 [&](MetadataAccessorRW& member) -> EvictMemberOutcome {
-                auto member_result =
-                    persist_one(candidate.tenant_id, member.GetKey(), member.Get());
+                auto member_result = persist_one(candidate.tenant_id,
+                                                 member.GetKey(), member.Get());
                 result.paused = member_result.paused;
                 if (member_result.paused ||
                     member_result.error != ErrorCode::OK) {
@@ -11344,20 +11345,16 @@ bool MasterService::ResumeEvictionContinuation() {
             return result;
         }
         auto& metadata = object.Get();
-        if (metadata.IsHardPinned() ||
-            !metadata.IsLeaseExpired(now) ||
+        if (metadata.IsHardPinned() || !metadata.IsLeaseExpired(now) ||
             (cutoff &&
-             (!candidate_allows_soft_pin ||
-              IsSoftPinActive(metadata, now)) &&
+             (!candidate_allows_soft_pin || IsSoftPinActive(metadata, now)) &&
              metadata.EvictionDeadline() > *cutoff) ||
-            (!candidate_allows_soft_pin &&
-             IsSoftPinActive(metadata, now)) ||
+            (!candidate_allows_soft_pin && IsSoftPinActive(metadata, now)) ||
             !metadata.HasReplica(is_evictable_memory_replica)) {
             result.stale = true;
             return result;
         }
-        result = persist_one(candidate.tenant_id, candidate.key,
-                             metadata);
+        result = persist_one(candidate.tenant_id, candidate.key, metadata);
         if (result.evicted_objects > 0) {
             result.evicted_shards.set(candidate.shard_idx);
         }
