@@ -10280,11 +10280,16 @@ void MasterService::EvictionThreadFunc() {
     auto last_discard_time = std::chrono::system_clock::now();
     auto next_dfs_eviction_time = std::chrono::steady_clock::now();
     auto next_tenant_eviction_time = std::chrono::steady_clock::now();
+    // Memory eviction is not checked before this time while a cycle backs off
+    // (see EvictionBackoff); the other work below keeps its
+    // kEvictionThreadSleepMs cadence.
+    auto next_mem_eviction_time = std::chrono::steady_clock::now();
     while (eviction_running_) {
         const auto now = std::chrono::system_clock::now();
         double used_ratio = segment_manager_.GetMemoryUsage().used_ratio();
-        if (used_ratio > eviction_high_watermark_ratio_ ||
-            (need_mem_eviction_ && eviction_ratio_ > 0.0)) {
+        if (std::chrono::steady_clock::now() >= next_mem_eviction_time &&
+            (used_ratio > eviction_high_watermark_ratio_ ||
+             (need_mem_eviction_ && eviction_ratio_ > 0.0))) {
             LOG(INFO) << "[EVICT-TRIGGER] memory_ratio=" << used_ratio
                       << " high_watermark=" << eviction_high_watermark_ratio_
                       << " need_mem_eviction=" << need_mem_eviction_
@@ -10309,8 +10314,9 @@ void MasterService::EvictionThreadFunc() {
                 // store). A failed allocation still wakes the next cycle,
                 // unless this cycle already answered one and could only
                 // re-arm it: that pressure stays armed through the wait.
-                std::this_thread::sleep_for(
-                    std::chrono::milliseconds(kEvictionDeferredBackoffMs));
+                next_mem_eviction_time =
+                    std::chrono::steady_clock::now() +
+                    std::chrono::milliseconds(kEvictionDeferredBackoffMs);
             }
         } else if (now - last_discard_time > put_start_release_timeout_sec_) {
             // Try discarding expired processing keys and ongoing replication
