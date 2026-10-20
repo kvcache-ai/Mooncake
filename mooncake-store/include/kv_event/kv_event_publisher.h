@@ -32,26 +32,36 @@ class KvEventPublisher {
     // Non-blocking enqueue into a bounded queue; drops oldest when full.
     // The string overloads keep the wire format independent of Store's
     // TenantId wrapper; the TenantId overloads preserve the existing API.
+    // `part_count` is how many parts the object's content is written in; an
+    // ordinary object has one.
     void PublishStored(const std::string& object_key, const std::string& medium,
                        const std::string& tenant_id = "",
                        const std::string& group_id = "",
-                       const std::string& session_id = "");
+                       const std::string& session_id = "",
+                       uint32_t part_count = 1);
     void PublishStored(const std::string& object_key, const std::string& medium,
                        const TenantId& tenant_id,
                        const std::string& group_id = "",
-                       const std::string& session_id = "") {
+                       const std::string& session_id = "",
+                       uint32_t part_count = 1) {
         PublishStored(object_key, medium, tenant_id.value(), group_id,
-                      session_id);
+                      session_id, part_count);
     }
     void PublishRemoved(const std::string& object_key,
                         const std::string& medium,
                         const std::string& tenant_id = "",
-                        const std::string& group_id = "");
+                        const std::string& group_id = "",
+                        const std::string& session_id = "",
+                        uint32_t part_count = 1);
     void PublishRemoved(const std::string& object_key,
                         const std::string& medium, const TenantId& tenant_id,
-                        const std::string& group_id = "") {
-        PublishRemoved(object_key, medium, tenant_id.value(), group_id);
+                        const std::string& group_id = "",
+                        const std::string& session_id = "",
+                        uint32_t part_count = 1) {
+        PublishRemoved(object_key, medium, tenant_id.value(), group_id,
+                       session_id, part_count);
     }
+
     void PublishCleared(const std::string& tenant_id = "");
 
     // The publisher keeps no per-object state: every delta below is computed
@@ -65,7 +75,8 @@ class KvEventPublisher {
                           const std::vector<std::string>& current_media,
                           const std::string& tenant_id = "",
                           const std::string& group_id = "",
-                          const std::string& session_id = "");
+                          const std::string& session_id = "",
+                          uint32_t part_count = 1);
 
     // Synchronize replica availability after an internal metadata mutation.
     // previous_media is the medium set captured before the mutation; media that
@@ -75,13 +86,15 @@ class KvEventPublisher {
                          const std::string& tenant_id = "",
                          const std::string& group_id = "",
                          const std::vector<std::string>& previous_media = {},
-                         const std::string& session_id = "");
+                         const std::string& session_id = "",
+                         uint32_t part_count = 1);
 
     // Publish removal of every medium the object had before deletion.
     void PublishObjectRemoved(
         const std::string& object_key, const std::string& tenant_id = "",
         const std::string& group_id = "",
-        const std::vector<std::string>& previous_media = {});
+        const std::vector<std::string>& previous_media = {},
+        uint32_t part_count = 1);
 
     struct Stats {
         uint64_t published_batches{0};
@@ -101,6 +114,9 @@ class KvEventPublisher {
         std::string tenant_id;
         std::string group_id;
         std::string session_id{};
+        // How many parts the object's content is written in; an ordinary object
+        // has one, and a subscriber asks for that many parts.
+        uint32_t part_count{1};
     };
 
     void EnqueueBatch(std::vector<PendingEvent> events);
@@ -139,24 +155,28 @@ class KvEventPublisher {
 
     void PublishStored(const std::string&, const std::string&,
                        const std::string& = "", const std::string& = "",
-                       const std::string& = "") {}
+                       const std::string& = "", uint32_t = 1) {}
     void PublishStored(const std::string&, const std::string&, const TenantId&,
-                       const std::string& = "", const std::string& = "") {}
+                       const std::string& = "", const std::string& = "",
+                       uint32_t = 1) {}
     void PublishRemoved(const std::string&, const std::string&,
-                        const std::string& = "", const std::string& = "") {}
+                        const std::string& = "", const std::string& = "",
+                        const std::string& = "", uint32_t = 1) {}
     void PublishRemoved(const std::string&, const std::string&, const TenantId&,
-                        const std::string& = "") {}
+                        const std::string& = "", const std::string& = "",
+                        uint32_t = 1) {}
     void PublishCleared(const std::string& = "") {}
     void PublishCommitted(const std::string&, const std::vector<std::string>&,
                           const std::string& = "", const std::string& = "",
-                          const std::string& = "") {}
+                          const std::string& = "", uint32_t = 1) {}
     void SyncObjectState(const std::string&, const std::vector<std::string>&,
                          const std::string& = "", const std::string& = "",
                          const std::vector<std::string>& = {},
-                         const std::string& = "") {}
+                         const std::string& = "", uint32_t = 1) {}
     void PublishObjectRemoved(const std::string&, const std::string& = "",
                               const std::string& = "",
-                              const std::vector<std::string>& = {}) {}
+                              const std::vector<std::string>& = {},
+                              uint32_t = 1) {}
 
     struct Stats {
         uint64_t published_batches{0};

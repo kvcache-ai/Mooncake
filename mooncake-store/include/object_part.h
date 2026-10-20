@@ -3,8 +3,7 @@
 // ObjectPart: one byte range of an object's content, written independently.
 // An object's content is an ordered sequence of parts; a part's position is its
 // index in the owner's container, and the part owns the replicas of that range.
-// Each part carries its own length and checksum. Every object has one part
-// today.
+// Each part carries its own length and checksum.
 
 #include <algorithm>
 #include <cstddef>
@@ -39,10 +38,48 @@ class ObjectPart {
         checksum_ = std::move(checksum);
     }
 
+    // True when the part holds replicas and all of them are still PROCESSING.
+    bool HasOnlyProcessingReplicas() const {
+        return !replicas_.empty() &&
+               std::ranges::all_of(replicas_, &Replica::is_processing);
+    }
+
+    // True when some replica of the part is still PROCESSING, which is what an
+    // open write attempt holds until it is completed or given up. A part can
+    // hold replicas of several types, and one type can be finished while
+    // another is still being written.
+    bool HasProcessingReplica() const {
+        return std::ranges::any_of(replicas_, &Replica::is_processing);
+    }
+
     // Elements may be modified; adding or removing goes through the calls
     // below.
     std::span<Replica> replicas() { return replicas_; }
     std::span<const Replica> replicas() const { return replicas_; }
+
+    // Whether one of the part's replicas can be read, by the caller's rule: the
+    // part does not own that rule, the service does.
+    template <typename IsReadable>
+    bool HasReadableReplica(IsReadable&& is_readable) const {
+        return std::ranges::any_of(replicas_,
+                                   std::forward<IsReadable>(is_readable));
+    }
+
+    // The descriptors of the replicas `try_descriptor` accepts, which fills a
+    // descriptor as it decides.
+    template <typename TryDescriptor>
+    std::vector<Replica::Descriptor> ReadableDescriptors(
+        TryDescriptor&& try_descriptor) const {
+        std::vector<Replica::Descriptor> descriptors;
+        descriptors.reserve(replicas_.size());
+        for (const auto& replica : replicas_) {
+            Replica::Descriptor descriptor;
+            if (try_descriptor(replica, descriptor)) {
+                descriptors.push_back(std::move(descriptor));
+            }
+        }
+        return descriptors;
+    }
 
     void AddReplicas(std::vector<Replica>&& replicas) {
         replicas_.insert(replicas_.end(), std::move_iterator(replicas.begin()),

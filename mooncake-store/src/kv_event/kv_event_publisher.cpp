@@ -44,8 +44,8 @@ size_t ComputeEventMapSize(bool is_stored, bool is_cleared, bool emit_legacy,
     }
     // Base envelope: event_id, timestamp, event_type, model_name, block_size,
     // additional_salt, lora_name, tenant_id, backend_id, medium, dp_rank,
-    // seq_hashes, group_id.
-    constexpr size_t kBaseFields = 13;
+    // seq_hashes, group_id, part_count.
+    constexpr size_t kBaseFields = 14;
     size_t map_size = kBaseFields;
     if (emit_legacy) {
         map_size += 2;  // type, block_hashes
@@ -175,7 +175,8 @@ void KvEventPublisher::PublishStored(const std::string& object_key,
                                      const std::string& medium,
                                      const std::string& tenant_id,
                                      const std::string& group_id,
-                                     const std::string& session_id) {
+                                     const std::string& session_id,
+                                     uint32_t part_count) {
     if (!config_.enabled) {
         return;
     }
@@ -187,14 +188,16 @@ void KvEventPublisher::PublishStored(const std::string& object_key,
     std::vector<PendingEvent> events;
     events.push_back(PendingEvent{EventKind::kStored, object_key, medium,
                                   NormalizeTenant(tenant_id), group_id,
-                                  session_id});
+                                  session_id, part_count});
     EnqueueBatch(std::move(events));
 }
 
 void KvEventPublisher::PublishRemoved(const std::string& object_key,
                                       const std::string& medium,
                                       const std::string& tenant_id,
-                                      const std::string& group_id) {
+                                      const std::string& group_id,
+                                      const std::string& session_id,
+                                      uint32_t part_count) {
     if (!config_.enabled) {
         return;
     }
@@ -205,7 +208,8 @@ void KvEventPublisher::PublishRemoved(const std::string& object_key,
     }
     std::vector<PendingEvent> events;
     events.push_back(PendingEvent{EventKind::kRemoved, object_key, medium,
-                                  NormalizeTenant(tenant_id), group_id});
+                                  NormalizeTenant(tenant_id), group_id,
+                                  session_id, part_count});
     EnqueueBatch(std::move(events));
 }
 
@@ -222,7 +226,8 @@ void KvEventPublisher::PublishCleared(const std::string& tenant_id) {
 void KvEventPublisher::PublishCommitted(
     const std::string& object_key,
     const std::vector<std::string>& current_media, const std::string& tenant_id,
-    const std::string& group_id, const std::string& session_id) {
+    const std::string& group_id, const std::string& session_id,
+    uint32_t part_count) {
     if (!config_.enabled) {
         return;
     }
@@ -234,15 +239,16 @@ void KvEventPublisher::PublishCommitted(
     // the previous contents.
     for (const auto& medium : SortedMedia(NormalizeMedia(current_media))) {
         events.push_back(PendingEvent{EventKind::kStored, object_key, medium,
-                                      normalized_tenant, group_id, session_id});
+                                      normalized_tenant, group_id, session_id,
+                                      part_count});
     }
     EnqueueBatch(std::move(events));
 }
 
 void KvEventPublisher::PublishObjectRemoved(
     const std::string& object_key, const std::string& tenant_id,
-    const std::string& group_id,
-    const std::vector<std::string>& previous_media) {
+    const std::string& group_id, const std::vector<std::string>& previous_media,
+    const std::string& session_id, uint32_t part_count) {
     if (!config_.enabled) {
         return;
     }
@@ -250,7 +256,8 @@ void KvEventPublisher::PublishObjectRemoved(
     std::vector<PendingEvent> events;
     for (const auto& medium : SortedMedia(NormalizeMedia(previous_media))) {
         events.push_back(PendingEvent{EventKind::kRemoved, object_key, medium,
-                                      normalized_tenant, group_id});
+                                      normalized_tenant, group_id, session_id,
+                                      part_count});
     }
     EnqueueBatch(std::move(events));
 }
@@ -259,7 +266,7 @@ void KvEventPublisher::SyncObjectState(
     const std::string& object_key,
     const std::vector<std::string>& current_media, const std::string& tenant_id,
     const std::string& group_id, const std::vector<std::string>& previous_media,
-    const std::string& session_id) {
+    const std::string& session_id, uint32_t part_count) {
     if (!config_.enabled) {
         return;
     }
@@ -271,14 +278,15 @@ void KvEventPublisher::SyncObjectState(
     for (const auto& medium : SortedMedia(previous_set)) {
         if (!new_set.contains(medium)) {
             events.push_back(PendingEvent{EventKind::kRemoved, object_key,
-                                          medium, normalized_tenant, group_id});
+                                          medium, normalized_tenant, group_id,
+                                          part_count});
         }
     }
     for (const auto& medium : SortedMedia(new_set)) {
         if (!previous_set.contains(medium)) {
             events.push_back(PendingEvent{EventKind::kStored, object_key,
                                           medium, normalized_tenant, group_id,
-                                          session_id});
+                                          session_id, part_count});
         }
     }
     EnqueueBatch(std::move(events));
@@ -434,6 +442,11 @@ void KvEventPublisher::PublishBatch(const std::vector<PendingEvent>& batch) {
 
         packer.pack("group_id");
         PackOptionalString(packer, item.pending.group_id);
+
+        // How many parts the object's content is written in, so a subscriber
+        // knows how many parts a readable object has.
+        packer.pack("part_count");
+        packer.pack(item.pending.part_count);
 
         if (config_.emit_object_key) {
             packer.pack("object_key");

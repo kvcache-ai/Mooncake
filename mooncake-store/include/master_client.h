@@ -208,6 +208,19 @@ class MasterClient {
     GetReplicaList(const std::string& object_key, const std::string& tenant_id);
 
     /**
+     * @brief Gets one part's replica list: which slice of an object written in
+     * several parts this caller means.
+     * @param object_key Key to query
+     * @param part_index Part to read, in [0, part_count)
+     * @return ErrorCode indicating success/failure
+     */
+    [[nodiscard]] tl::expected<GetReplicaListResponse, ErrorCode>
+    GetReplicaListForPart(const std::string& object_key, uint32_t part_index);
+    [[nodiscard]] tl::expected<GetReplicaListResponse, ErrorCode>
+    GetReplicaListForPart(const std::string& object_key, uint32_t part_index,
+                          const std::string& tenant_id);
+
+    /**
      * @brief Retrieves replica lists for object keys that match a regex
      * pattern.
      * @param str The regular expression string to match against object keys.
@@ -245,6 +258,18 @@ class MasterClient {
              const ReplicateConfig& config);
 
     /**
+     * @brief Starts a put operation for one part of an object
+     * @param key Object key
+     * @param value_length Length of this part's content
+     * @param request Which part this writer fills, out of how many, with the
+     * replication configuration to allocate it with
+     * @return ErrorCode indicating success/failure
+     */
+    [[nodiscard]] tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
+    PutStartForPart(const std::string& key, uint64_t value_length,
+                    const PartWriteRequest& request);
+
+    /**
      * @brief Starts a batch of put operations for N objects
      * @param keys Vector of object key
      * @param value_lengths Vector of total value lengths
@@ -268,6 +293,18 @@ class MasterClient {
         const ObjectMeta& object_meta, ReplicaType replica_type);
 
     /**
+     * @brief Ends the put operation of one part of an object
+     * @param request The part this request completes, the replicas that
+     * attempt allocated, and the checksum it wrote
+     * @param replica_type The replicas of the attempt to complete: finishing
+     * one type leaves the others in flight
+     * @return tl::expected<void, ErrorCode> indicating success/failure
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> PutEndForPart(
+        const PartEndRequest& request,
+        ReplicaType replica_type = ReplicaType::ALL);
+
+    /**
      * @brief Ends a put operation for a batch of objects
      * @param keys Vector of object keys
      * @return ErrorCode indicating success/failure
@@ -284,6 +321,20 @@ class MasterClient {
      */
     [[nodiscard]] tl::expected<void, ErrorCode> PutRevoke(
         const std::string& key, ReplicaType replica_type);
+
+    /**
+     * @brief Revokes one part's write attempt
+     * @param key Object key
+     * @param part_index Part whose write is abandoned
+     * @param replica_ids The replicas the attempt allocated. They have to cover
+     * every replica the part still holds, and an empty list is refused
+     * @param replica_type The replicas to give up; the others stay in flight
+     * @return tl::expected<void, ErrorCode> indicating success/failure
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> PutRevokeForPart(
+        const std::string& key, uint32_t part_index,
+        const std::vector<ReplicaID>& replica_ids,
+        ReplicaType replica_type = ReplicaType::ALL);
 
     /**
      * @brief Revokes a put operation for a batch of objects

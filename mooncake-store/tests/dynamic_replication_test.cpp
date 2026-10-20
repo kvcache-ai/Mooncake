@@ -179,7 +179,15 @@ class DynamicReplicationTest : public ::testing::Test {
             &service,
             MasterServiceTestPeer::ObjectIdentity{TenantId::Default(), key});
         ASSERT_TRUE(accessor.Exists());
-        accessor.Get().put_start_time += std::chrono::milliseconds(1);
+        // The version epoch is derived from the write's start time, so moving
+        // it forward is what a newer write looks like.
+        ObjectMetadata& metadata = accessor.Get();
+        const ObjectMetadata::PartWriteRecord* write =
+            metadata.GetPartWriteRecord(0);
+        ASSERT_NE(write, nullptr);
+        metadata.BeginPartWrite(
+            0, write->client_id,
+            write->put_start_time + std::chrono::milliseconds(1));
     }
 
     // True when the object still carries dynamic-replication state: its own
@@ -258,8 +266,11 @@ class DynamicReplicationTest : public ::testing::Test {
             return 0;
         }
         std::vector<ReplicaID> erased_replica_ids;
+        // Clearing the replicas an object holds on a segment takes the object
+        // as a whole, which is the erasure the batch clear and eviction paths
+        // run.
         return MasterServiceTestPeer(service)
-            .EraseReplicasWithCacheTotalAccounting(
+            .EraseAllReplicasWithCacheTotalAccounting(
                 accessor.Get(),
                 [&target_segment](const Replica& replica) {
                     if (!replica.is_memory_replica()) {
