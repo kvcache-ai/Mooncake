@@ -253,6 +253,15 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     elastic_target.register_local_memory()?;
     elastic_router.register_local_memory()?;
 
+    if matches!(
+        env::var("MC_STORE_RS_E2E_TENT_ABI_ONLY").as_deref(),
+        Ok("1")
+    ) {
+        verify_batch_put_get(&target_a, &reader, value_size)?;
+        println!("TENT ABI batch Put/Get E2E passed");
+        return Ok(());
+    }
+
     verify_single_put_get(&target_a, &reader, value_size)?;
     verify_multi_tenant_isolation(&target_a, &reader, value_size)?;
     verify_strict_tenant_quota(
