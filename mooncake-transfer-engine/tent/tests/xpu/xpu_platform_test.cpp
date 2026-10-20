@@ -271,13 +271,15 @@ TEST_F(XpuPlatformTest, DeviceAllocationExportsAsDmabuf) {
     EXPECT_NE(fcntl(base.fd, F_GETFD), -1);
     EXPECT_NE(fcntl(interior.fd, F_GETFD), -1);
 
-    // A range that runs past the allocation is refused rather than exported
-    // with an offset/length the dma-buf does not cover.
-    DmabufExport overrun;
+    // A range that runs past the allocation is a device-memory failure, not
+    // InvalidArgument (which would fall through to the host ibv_reg_mr path).
+    // Reusing an output must not retain a previously valid descriptor.
+    DmabufExport overrun = interior;
     s = platform_->exportDmabuf(static_cast<char *>(dev) + kInterior,
                                 kSize - kInterior + 1, overrun);
-    EXPECT_TRUE(s.IsInvalidArgument()) << s;
+    EXPECT_TRUE(s.IsInternalError()) << s;
     EXPECT_EQ(overrun.fd, -1);
+    EXPECT_EQ(overrun.offset, 0u);
 
     EXPECT_TRUE(platform_->free(dev, kSize).ok());
 }

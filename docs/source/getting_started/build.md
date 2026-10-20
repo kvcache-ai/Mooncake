@@ -245,13 +245,23 @@ when `transports/rdma/disable_gpu_direct_rdma` is set to `true` in the TENT
 configuration, transfers touching that buffer fall back to staging through
 pinned host memory.
 
-Memory allocated through the Transfer Engine is exportable. For device memory
-allocated elsewhere (for example PyTorch XPU tensors), note that the Intel
-compute runtime pools small USM allocations (below a few MB) into shared
-buffers whose dma-buf cannot be registered per allocation; such buffers are
-staged through host memory. Run with `NEOReadDebugKeys=1
-EnableDeviceUsmAllocationPool=0` to disable pooling if direct RDMA on small
-foreign allocations is required.
+Both direct RDMA and host-staged transfers involving XPU memory currently
+require an **XPU-platform initiator**, even when its local buffer is DRAM and
+only the remote buffer is XPU memory. Staging also requires the initiator's
+`XpuTransport` to be enabled. A CPU-platform initiator cannot currently route
+these requests; it does not transparently fall back to staging. A `cpu:0`
+buffer inside an XPU-platform process is not a CPU-platform peer.
+
+The Transfer Engine requests dedicated exportable Level Zero allocations;
+runtime allocation/export failures can still require staging. For device
+memory allocated elsewhere (for example PyTorch XPU tensors), the Intel
+compute runtime can pool small USM allocations into shared buffers whose
+dma-buf cannot be registered per allocation. Foreign or fallback USM is
+eligible for export only when the allocation and dma-buf sizes match exactly.
+Extra backing bytes cannot safely be distinguished from a shared pool, even
+when they match a rounded page size, so padded foreign allocations also stage.
+`NEOReadDebugKeys=1 EnableDeviceUsmAllocationPool=0` disables pooling, but does
+not bypass this conservative size check.
 ```
 
 ## Use Mooncake in Docker Containers

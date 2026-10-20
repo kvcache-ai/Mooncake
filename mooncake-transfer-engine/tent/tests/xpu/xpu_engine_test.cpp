@@ -404,6 +404,8 @@ TEST_P(XpuDirectRdmaTest, DeviceToDeviceReadAndWrite) {
     ASSERT_NO_FATAL_FAILURE(transfer("xpu:0", "xpu:0", Request::READ));
 }
 
+// Both engines use the XPU platform. cpu:0 selects host memory in that
+// process; this is not coverage of a CPU-platform initiator (unsupported).
 TEST_P(XpuDirectRdmaTest, OneDeviceSideReadAndWrite) {
     ASSERT_NO_FATAL_FAILURE(transfer("cpu:0", "xpu:0", Request::WRITE));
     ASSERT_NO_FATAL_FAILURE(transfer("xpu:0", "cpu:0", Request::READ));

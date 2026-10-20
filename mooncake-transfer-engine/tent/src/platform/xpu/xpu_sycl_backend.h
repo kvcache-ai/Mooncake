@@ -48,6 +48,8 @@
 #include <optional>
 #include <vector>
 
+#include "xpu_dmabuf_utils.h"
+
 namespace mooncake {
 namespace tent {
 
@@ -304,8 +306,8 @@ class XpuSyclBackend {
         kExportOk = 0,
         // Not device memory, not Level Zero, or the driver refused.
         kExportUnavailable = 1,
-        // The allocation lives in a runtime-managed pool whose dma-buf it
-        // shares with other allocations; its offset inside is unknowable.
+        // The allocation may share a runtime-managed pool's dma-buf; its
+        // offset inside that backing buffer cannot be established safely.
         kExportPooled = 2,
     };
 
@@ -324,13 +326,13 @@ class XpuSyclBackend {
     // sub-allocation. The pool offset is not exposed through any public API,
     // so such an allocation cannot be registered correctly -- registering it
     // at offset 0 would silently alias whatever sits at the pool's start.
-    // Pooling is detected by comparing the dma-buf's size with the
-    // allocation's: a dedicated dma-buf is the allocation rounded up to the
-    // runtime's page granularity (64 KB below 2 MB, 2 MB above), anything
-    // larger is a shared pool. Allocations made by allocDevice() request
-    // export up front and therefore never land in a pool; users who need
-    // direct RDMA on pooled foreign memory can disable pooling with
-    // NEOReadDebugKeys=1 EnableDeviceUsmAllocationPool=0.
+    // Foreign/fallback USM is exported only if its allocation size exactly
+    // matches the dma-buf size. A larger backing buffer could be a pool even
+    // when it equals the allocation rounded to the runtime's page size.
+    // Allocations tracked as ze_owned requested export up front, so their
+    // dedicated backing may safely include padding. Disabling pooling with
+    // NEOReadDebugKeys=1 EnableDeviceUsmAllocationPool=0 helps foreign memory,
+    // but padded foreign allocations still conservatively use host staging.
     //
     // Returns kExportOk and fills fd/offset (and the allocation's size, so
     // the caller can check that its range stays inside) on success. The fd is
@@ -341,11 +343,14 @@ class XpuSyclBackend {
                      uint64_t *alloc_size) {
         if (!fd || !offset || !alloc_size) return kExportUnavailable;
         std::optional<sycl::context> ctx;
+        bool explicitly_exported = false;
         {
             std::lock_guard<std::mutex> lock(mu_);
             int device_index = classifyLocked(addr);
             if (device_index < 0) return 1;
             ctx = queues_[device_index].get_context();
+            if (const Alloc *allocation = findLocked(addr))
+                explicitly_exported = allocation->ze_owned;
         }
         auto &ze = ZeLoader::instance();
         if (!ze.available()) return kExportUnavailable;
@@ -376,12 +381,13 @@ class XpuSyclBackend {
                 ZE_RESULT_SUCCESS ||
             props.type != ZE_MEMORY_TYPE_DEVICE || export_fd.fd < 0)
             return kExportUnavailable;
+        // Linux dma_buf_llseek uses SEEK_END only to report the size; unlike
+        // a regular file seek it does not update f_pos on this borrowed fd.
         const off_t dmabuf_size = lseek(export_fd.fd, 0, SEEK_END);
         if (dmabuf_size < 0) return kExportUnavailable;
-        const size_t granule =
-            size >= (size_t{2} << 20) ? (size_t{2} << 20) : (size_t{64} << 10);
-        const size_t rounded = (size + granule - 1) / granule * granule;
-        if (static_cast<size_t>(dmabuf_size) > rounded) return kExportPooled;
+        if (!xpu_detail::hasDedicatedDmabuf(size, dmabuf_size,
+                                            explicitly_exported))
+            return kExportPooled;
         *fd = export_fd.fd;
         *offset = reinterpret_cast<uintptr_t>(addr) -
                   reinterpret_cast<uintptr_t>(base);

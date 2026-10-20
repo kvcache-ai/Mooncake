@@ -85,6 +85,8 @@ export MOONCAKE_PROTOCOL="tcp"
 
 **Intel XPU Note:** Intel XPU support lives in TENT (`-DUSE_XPU=ON -DUSE_TENT=ON`, run with `MC_USE_TENT=1`). On registration, VRAM is exported through Level Zero as a dma-buf and registered with `ibv_reg_dmabuf_mr`, so RDMA reads and writes go to VRAM directly. The direct path is per buffer, not guaranteed: when the NIC or rdma-core lacks dma-buf support, when the export fails for an allocation (for example small foreign USM allocations pooled by the Intel compute runtime, see the build guide), or when `transports/rdma/disable_gpu_direct_rdma` is `true`, the engine transparently stages that VRAM through pinned host memory over the same RDMA or TCP transport. A request hinted to another transport (e.g. `tcp`), or one whose selector policy only admits a DRAM-only transport (e.g. `hp_tcp`), is staged as well.
 
+**XPU initiator requirement:** Both direct RDMA and host-staged transfers involving XPU memory currently require an XPU-platform initiator. Staging additionally requires its `XpuTransport` to be enabled. A CPU-platform initiator is not supported even when its local buffer is DRAM and only the remote buffer is XPU memory; it cannot transparently fall back to staging. A `cpu:0` buffer in an XPU-platform process does not exercise this CPU-platform case. Foreign/fallback USM whose dma-buf size exceeds its allocation size is conservatively staged, including ambiguous padding; see the [build guide](build.md).
+
 **Configuration:**
 ```python
 # Python API - With specific device

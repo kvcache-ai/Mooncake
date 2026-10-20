@@ -701,8 +701,8 @@ int RdmaContext::unregisterMemReg(MemReg id) {
                    << " to " << end << " in RDMA device " << device_name_;
         return -1;
     }
-    // dma-buf MRs pin no host pages: `addr` is a device VA (or the iova we
-    // supplied) with no VMA behind it, so there is no fork state to restore.
+    // dma-buf MRs pin no host pages: rdma-core stores the dma-buf offset in
+    // `addr`, not a host VMA, so there is no fork state to restore.
     if (is_dmabuf) return 0;
     // Restore mergeability after ibv_dereg_mr. ibv_reg_mr calls
     // madvise(MADV_DONTFORK) on the registered range when fork protection

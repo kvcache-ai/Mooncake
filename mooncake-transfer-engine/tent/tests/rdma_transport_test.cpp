@@ -32,6 +32,7 @@
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -55,6 +56,7 @@
 #include "tent/transport/rdma/rdma_transport.h"
 #include "tent/transport/rdma/slice.h"
 #include "tent/transport/rdma/workers.h"
+#include "../src/platform/xpu/xpu_dmabuf_utils.h"
 
 namespace mooncake {
 namespace tent {
@@ -1981,6 +1983,35 @@ TEST_F(RdmaContextEnableTest, OpenDeviceFallsBackToTheEncodedRate) {
 // Keep these stand-ins separate from the multi-NIC registration test helpers.
 namespace dmabuf_registration {
 
+TEST(XpuDmabufRangeTest, ChecksBoundsBeforeSubtracting) {
+    constexpr uint64_t size = 1 << 20;
+    constexpr uint64_t interior = 4096;
+    constexpr uint64_t max = std::numeric_limits<uint64_t>::max();
+    EXPECT_TRUE(xpu_detail::validateDmabufRange(0, size, size).ok());
+    EXPECT_TRUE(
+        xpu_detail::validateDmabufRange(interior, size - interior, size).ok());
+    EXPECT_TRUE(xpu_detail::validateDmabufRange(size, 0, size).ok());
+    EXPECT_TRUE(
+        xpu_detail::validateDmabufRange(interior, size - interior + 1, size)
+            .IsInternalError());
+    EXPECT_TRUE(
+        xpu_detail::validateDmabufRange(size + 1, 1, size).IsInternalError());
+    EXPECT_TRUE(
+        xpu_detail::validateDmabufRange(max, 1, size).IsInternalError());
+    EXPECT_TRUE(xpu_detail::validateDmabufRange(1, max, max).IsInternalError());
+}
+
+TEST(XpuDmabufBackingTest, RoundedForeignBackingIsNotProofOfNoPooling) {
+    constexpr uint64_t page = 64 << 10;
+    EXPECT_FALSE(xpu_detail::hasDedicatedDmabuf(page / 2, page, false));
+    EXPECT_FALSE(xpu_detail::hasDedicatedDmabuf(1 << 20, 2 << 20, false));
+    EXPECT_FALSE(xpu_detail::hasDedicatedDmabuf(2 << 20, 16 << 20, false));
+    EXPECT_TRUE(xpu_detail::hasDedicatedDmabuf(page, page, false));
+    EXPECT_TRUE(xpu_detail::hasDedicatedDmabuf(page / 2, page, true));
+    EXPECT_FALSE(xpu_detail::hasDedicatedDmabuf(page, page / 2, true));
+    EXPECT_FALSE(xpu_detail::hasDedicatedDmabuf(0, page, true));
+}
+
 // Memory-registration verbs stand-ins. registerMemReg() picks between
 // ibv_reg_mr and ibv_reg_dmabuf_mr from what the platform's dma-buf exporter
 // says about the address; the fake records which one it was handed and the
@@ -2021,8 +2052,8 @@ ibv_mr* fakeRegDmabufMr(ibv_pd*, uint64_t offset, size_t length, uint64_t iova,
         errno = EINVAL;
         return nullptr;
     }
-    // rdma-core reports the iova as the MR address for dma-buf MRs.
-    fake_mr.dmabuf_mr.addr = reinterpret_cast<void*>(iova);
+    // rdma-core stores the dma-buf offset, not a host VA or the supplied iova.
+    fake_mr.dmabuf_mr.addr = reinterpret_cast<void*>(offset);
     fake_mr.dmabuf_mr.length = length;
     return &fake_mr.dmabuf_mr;
 }
@@ -2087,13 +2118,21 @@ TEST_F(RdmaContextDmabufTest, ExportableMemoryUsesDmabufRegistration) {
     EXPECT_EQ(fake_mr.last_offset, 512u);
     EXPECT_EQ(fake_mr.last_length, 1024u);
     EXPECT_EQ(fake_mr.last_iova, reinterpret_cast<uint64_t>(addr));
+    EXPECT_EQ(static_cast<ibv_mr*>(mr)->addr, reinterpret_cast<void*>(512));
     EXPECT_EQ(fake_mr.last_fd, fd);
     EXPECT_EQ(fake_mr.last_access, IBV_ACCESS_LOCAL_WRITE);
     // The MR owns its dma-buf reference; the exporter's fd is left to the
     // runtime that handed it out (Level Zero caches it per allocation).
     EXPECT_TRUE(fdOpen(fd));
 
-    EXPECT_EQ(context_->unregisterMemReg(mr), 0);
+    // The unaligned offset is not a host VMA. Any accidental MADV_DOFORK on
+    // it would fail and log a warning, even though unregister returns success.
+    testing::internal::CaptureStderr();
+    const int unregister_result = context_->unregisterMemReg(mr);
+    const std::string unregister_log = testing::internal::GetCapturedStderr();
+    EXPECT_EQ(unregister_result, 0);
+    EXPECT_EQ(unregister_log.find("Failed to restore fork state"),
+              std::string::npos);
     EXPECT_EQ(fake_mr.dereg_calls, 1);
     close(fd);
 }
@@ -2144,6 +2183,24 @@ TEST_F(RdmaContextDmabufTest, ExportFailureIsARegistrationFailure) {
     auto mr = context_->registerMemReg(host_buffer_.data(), 4096,
                                        IBV_ACCESS_LOCAL_WRITE);
     EXPECT_EQ(mr, nullptr);
+    EXPECT_EQ(fake_mr.reg_dmabuf_calls, 0);
+    EXPECT_EQ(fake_mr.reg_mr_calls, 0);
+}
+
+TEST_F(RdmaContextDmabufTest,
+       OutOfBoundsDeviceRangeNeverUsesPlainRegistration) {
+    int exporter_calls = 0;
+    context_->setDmabufExporter([&](void*, size_t length, DmabufExport&) {
+        ++exporter_calls;
+        // Use the platform's validator for a device allocation of 4096 bytes
+        // with an interior start. The requested length must not be clipped.
+        EXPECT_EQ(length, 4096u);
+        return xpu_detail::validateDmabufRange(512, length, 4096);
+    });
+    auto mr = context_->registerMemReg(host_buffer_.data(), 4096,
+                                       IBV_ACCESS_LOCAL_WRITE);
+    EXPECT_EQ(mr, nullptr);
+    EXPECT_EQ(exporter_calls, 1);
     EXPECT_EQ(fake_mr.reg_dmabuf_calls, 0);
     EXPECT_EQ(fake_mr.reg_mr_calls, 0);
 }

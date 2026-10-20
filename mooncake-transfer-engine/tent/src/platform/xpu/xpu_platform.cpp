@@ -22,6 +22,7 @@
 #include <string>
 
 #include "tent/common/status.h"
+#include "xpu_dmabuf_utils.h"
 #include "xpu_sycl_backend.h"
 
 namespace mooncake {
@@ -162,13 +163,14 @@ Status XpuPlatform::exportDmabuf(void* addr, size_t length, DmabufExport& out) {
     const int rc = be.exportDmabuf(addr, &fd, &offset, &alloc_size);
     if (rc == XpuSyclBackend::kExportPooled) {
         LOG(WARNING) << "XpuPlatform: " << addr << " (" << length
-                     << " bytes) lives in a pooled USM allocation whose "
-                        "dma-buf is shared with other allocations; "
+                     << " bytes) has dma-buf backing that cannot be proven "
+                        "to cover only this allocation; "
                         "transfers will be staged through host. Set "
                         "NEOReadDebugKeys=1 EnableDeviceUsmAllocationPool=0 "
-                        "to disable pooling in the Intel compute runtime";
+                        "to disable pooling in the Intel compute runtime; "
+                        "foreign allocations with backing padding still stage";
         return Status::InternalError(
-            "pooled USM allocation cannot be exported as dma-buf" LOC_MARK);
+            "USM dma-buf backing is pooled or ambiguous" LOC_MARK);
     }
     if (rc != XpuSyclBackend::kExportOk) {
         LOG(WARNING) << "XpuPlatform: dma-buf export failed for " << addr
@@ -180,9 +182,7 @@ Status XpuPlatform::exportDmabuf(void* addr, size_t length, DmabufExport& out) {
     // The MR is registered as [offset, offset + length) of this dma-buf; a
     // range running past the allocation would describe memory it does not
     // cover.
-    if (length > alloc_size - offset)
-        return Status::InvalidArgument(
-            "range spans more than one XPU allocation" LOC_MARK);
+    CHECK_STATUS(xpu_detail::validateDmabufRange(offset, length, alloc_size));
     out.fd = fd;
     out.offset = offset;
     return Status::OK();
