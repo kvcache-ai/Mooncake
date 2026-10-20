@@ -10251,16 +10251,20 @@ void MasterService::EvictionThreadFunc() {
             double evict_ratio_lowerbound =
                 std::max(evict_ratio_target * 0.5,
                          used_ratio - eviction_high_watermark_ratio_);
-            const bool freed_now =
+            const EvictionBackoff backoff =
                 BatchEvict(evict_ratio_target, evict_ratio_lowerbound);
             LOG(INFO) << "[EVICT-DONE] BatchEvict execution completed.";
             last_discard_time = now;
-            if (!freed_now && !need_mem_eviction_) {
+            if (backoff == EvictionBackoff::kWaitForOwnersHoldingPressure ||
+                (backoff == EvictionBackoff::kWaitForOwners &&
+                 !need_mem_eviction_)) {
                 // Every evictee is waiting for its owner to write it to disk;
                 // nothing more can be freed until those offloads complete, so
                 // wait instead of re-scanning every kEvictionThreadSleepMs
                 // (each extra cycle would queue and pin the next ratio of the
-                // store). A failed allocation still wakes the next cycle.
+                // store). A failed allocation still wakes the next cycle,
+                // unless this cycle already answered one and could only
+                // re-arm it: that pressure stays armed through the wait.
                 std::this_thread::sleep_for(
                     std::chrono::milliseconds(kEvictionDeferredBackoffMs));
             }
@@ -10937,8 +10941,8 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
     return total;
 }
 
-bool MasterService::BatchEvict(double evict_ratio_target,
-                               double evict_ratio_lowerbound) {
+MasterService::EvictionBackoff MasterService::BatchEvict(
+    double evict_ratio_target, double evict_ratio_lowerbound) {
     // Consume the allocation-pressure signal before this pass. A new failure
     // during the pass remains visible to the next iteration.
     const bool allocation_pressure =
@@ -11449,7 +11453,7 @@ bool MasterService::BatchEvict(double evict_ratio_target,
     if (total_eviction_base == 0) {
         VLOG(1) << "[EVICT-DIAG] object_count=" << object_count
                 << " eviction_base=0 (no evictable memory objects)";
-        return true;
+        return EvictionBackoff::kNone;
     }
 
     const long ideal_evict_num =
@@ -11788,8 +11792,11 @@ bool MasterService::BatchEvict(double evict_ratio_target,
 
     const bool made_progress = evicted_count > 0 || released_discarded_cnt > 0;
     const bool success = made_progress || offload_deferred_count > 0;
-    if (allocation_pressure && !stop_eviction_scan && !success &&
-        total_eviction_base > 0) {
+    // A failed allocation this pass could not answer stays armed for the next
+    // cycle.
+    const bool pressure_held = allocation_pressure && !stop_eviction_scan &&
+                               !success && total_eviction_base > 0;
+    if (pressure_held) {
         need_mem_eviction_.store(true, std::memory_order_relaxed);
     }
 
@@ -11857,14 +11864,22 @@ bool MasterService::BatchEvict(double evict_ratio_target,
                      << " object(s); force-evicted without disk offload "
                         "(offload_force_evict=true).";
     }
-    // False (so the caller backs off) while the owners are the bottleneck: the
-    // in-flight room ran out this cycle, or nothing was freed and they still
-    // hold work (queued this cycle, or earlier cycles' objects in flight).
+    // The caller backs off while the owners are the bottleneck: the in-flight
+    // room ran out this cycle, or nothing was freed and they still hold work
+    // (queued this cycle, or earlier cycles' objects in flight).
     const bool waiting_on_offloads =
         offload_on_evict_ &&
         (offload_room_exhausted ||
          (!freed_now && (offload_deferred_count > 0 || pending_offloads > 0)));
-    return !waiting_on_offloads;
+    if (!waiting_on_offloads) {
+        return EvictionBackoff::kNone;
+    }
+    // A failed allocation found no room in flight and nothing it may drop:
+    // the re-armed pressure must not cancel the wait, or the thread would
+    // re-scan every kEvictionThreadSleepMs until the owners drain.
+    return pressure_held && offload_room_exhausted
+               ? EvictionBackoff::kWaitForOwnersHoldingPressure
+               : EvictionBackoff::kWaitForOwners;
 }
 
 void MasterService::NoFBatchEvict(double evict_ratio_target,

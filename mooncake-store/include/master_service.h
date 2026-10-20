@@ -1025,6 +1025,21 @@ class MasterService {
         const std::vector<std::string>& keys, const TenantId& tenant_id,
         bool grant_lease);
 
+    // Whether the eviction thread waits kEvictionDeferredBackoffMs after a
+    // BatchEvict cycle instead of checking again after kEvictionThreadSleepMs.
+    enum class EvictionBackoff {
+        kNone,
+        // The owners hold the work (offload_on_evict): the cycle found the
+        // in-flight room full, or freed nothing while offloads are in flight.
+        // An allocation that fails meanwhile cancels the wait.
+        kWaitForOwners,
+        // As above, but the cycle answered a failed allocation, found the
+        // in-flight room full and could drop nothing (offload_force_evict
+        // off), so it re-armed the pressure. Wait anyway: only the owners can
+        // make room, and the cycle after the wait acts on the pressure.
+        kWaitForOwnersHoldingPressure,
+    };
+
     // BatchEvict evicts objects in a near-LRU way, i.e., prioritizes to evict
     // object with smaller lease timeout. It has two passes. The first pass only
     // evicts objects without soft pin. The second pass prioritizes objects
@@ -1033,11 +1048,9 @@ class MasterService {
     // evict ratio target. If the actual evicted ratio is less than
     // evict_ratio_lowerbound, the second pass will be triggered and try to
     // fulfill evict ratio lowerbound.
-    // Returns false when the cycle freed no memory because every evictee was
-    // queued for disk offload (offload_on_evict): their memory is released
-    // when the owners report the writes done, so the eviction thread backs off
-    // instead of starting another cycle every kEvictionThreadSleepMs.
-    bool BatchEvict(double evict_ratio_target, double evict_ratio_lowerbound);
+    // Returns whether the eviction thread backs off before the next cycle.
+    EvictionBackoff BatchEvict(double evict_ratio_target,
+                               double evict_ratio_lowerbound);
     void NoFBatchEvict(double evict_ratio_target,
                        double evict_ratio_lowerbound);
     struct TenantQuotaEvictionResult {
@@ -1719,9 +1732,10 @@ class MasterService {
     std::atomic<bool> eviction_running_{false};
     static constexpr uint64_t kEvictionThreadSleepMs =
         10;  // 10 ms sleep between eviction checks
-    // Wait this long after a cycle that only queued objects for disk offload
-    // before checking the watermark again. The wait is not interrupted: a
-    // failed allocation during it is acted on when it ends.
+    // Wait this long after a cycle that is waiting for the owners to write
+    // queued objects to disk (see EvictionBackoff) before checking the
+    // watermark again. The wait is not interrupted: a failed allocation during
+    // it is acted on when it ends.
     static constexpr uint64_t kEvictionDeferredBackoffMs = 500;
     // The eviction thread wakes every 10 ms, but the tenant pass has to walk
     // every registered tenant and lock every quota shard, so it is throttled

@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 
+#include "master_metric_manager.h"
 #include "master_service/dsl/scenario.h"
 
 namespace mooncake::test {
@@ -872,6 +873,80 @@ TEST(MasterServiceOffloadScenarioTest,
                   .ExpectError(ErrorCode::NO_AVAILABLE_HANDLE))
         .When(WaitFor(std::chrono::milliseconds(300)))
         .Then(Objects(0, 2).NamedBy(key).DoNotExist())
+        .Then(Objects(2, kObjectCount).NamedBy(key).AreReadable());
+}
+
+// Without offload_force_evict, a failed allocation that finds the in-flight
+// room full cannot be answered until the owners write what is in flight. The
+// eviction thread keeps the pressure armed but backs off between cycles
+// instead of re-scanning every tick, and acts on the pressure once the owners
+// have written the objects.
+TEST(MasterServiceOffloadScenarioTest,
+     FullInFlightRoomBacksOffAndKeepsThePressure) {
+    constexpr uint64_t kLargeObject = 1024 * 1024;
+    constexpr size_t kObjectCount = 14;
+    constexpr size_t kCap = 2;
+    const auto key = [](size_t index) {
+        return "held_pressure_" + std::to_string(index);
+    };
+    const auto base = std::chrono::system_clock::now() - std::chrono::hours(1);
+    MasterServiceConfig config = OffloadOnEvictConfig();
+    config.default_kv_lease_ttl = 0;  // no leases in the way
+    // Only a failed allocation arms the eviction thread.
+    config.eviction_high_watermark_ratio = 1.0;
+    config.eviction_ratio = 0.10;
+    config.offloading_queue_limit = kCap;
+    config.offload_cap_ratio = 1.0;
+    MasterScenario scenario(
+        "a full in-flight room backs off and keeps the allocation pressure",
+        config);
+    scenario.Given(MemoryNode("node").Capacity(16 * 1024 * 1024))
+        .When(MountLocalDisk("node"))
+        .Given(Objects(0, 2)
+                   .NamedBy(key)
+                   .Size(kLargeObject)
+                   .By("node")
+                   .CompleteOn("node")
+                   .ExpiredFrom(base))
+        .Given(Objects(2, kObjectCount)
+                   .NamedBy(key)
+                   .Size(kLargeObject)
+                   .By("node")
+                   .CompleteOn("node")
+                   .ExpiredFrom(base + std::chrono::minutes(1)))
+        // Target 2 fills the in-flight room with the two oldest objects.
+        .When(EvictMemory(0.10))
+        .When(OffloadHeartbeat("node").ExpectTasks({key(0), key(1)},
+                                                   kLargeObject));
+
+    // Every BatchEvict cycle past the census moves this counter once.
+    auto& metrics = MasterMetricManager::instance();
+    const int64_t cycles_before = metrics.get_mem_eviction_attempts();
+    // A failed allocation arms the eviction thread. Its cycle finds no room
+    // and, without offload_force_evict, nothing it may drop.
+    scenario
+        .When(PutStart(key(kObjectCount), 3 * kLargeObject)
+                  .By("node")
+                  .ExpectError(ErrorCode::NO_AVAILABLE_HANDLE))
+        .When(WaitFor(std::chrono::milliseconds(1500)));
+    const int64_t cycles = metrics.get_mem_eviction_attempts() - cycles_before;
+    // One cycle answers the failure, then one per kEvictionDeferredBackoffMs
+    // (500 ms): four at most in 1.5 s. Re-scanning on every 10 ms tick would
+    // run well over a hundred.
+    EXPECT_GE(cycles, 1);
+    EXPECT_LE(cycles, 8);
+
+    // The owner writes the two objects. Only the pressure still armed can
+    // start another cycle (the watermark is 1.0); that cycle frees the memory
+    // replicas the disk now backs.
+    scenario.Then(Objects(0, kObjectCount).NamedBy(key).AreReadable())
+        .When(CompleteOffload({key(0), key(1)})
+                  .By("node")
+                  .OnNode("node")
+                  .OfSize(kLargeObject))
+        .When(WaitFor(std::chrono::milliseconds(1200)))
+        .Then(Object(key(0)).HasMemoryReplicas(0).HasLocalDiskReplicas(1))
+        .Then(Object(key(1)).HasMemoryReplicas(0).HasLocalDiskReplicas(1))
         .Then(Objects(2, kObjectCount).NamedBy(key).AreReadable());
 }
 
