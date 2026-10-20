@@ -20,7 +20,7 @@ ARG CMAKE_BUILD_TYPE=Release
 ARG PYPI_INDEX_URL=https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
 ENV PYTHON_VERSION=${PYTHON_VERSION} \
     PIP_INDEX_URL=${PYPI_INDEX_URL} \
-    PATH="/usr/local/go/bin:${PATH}"
+    PATH="/opt/mooncake-toolchain/bin:${PATH}"
 
 WORKDIR /workspace
 COPY . /workspace
@@ -29,9 +29,7 @@ COPY . /workspace
 RUN bash dependencies.sh -y
 
 # Configure & build Mooncake
-RUN mkdir -p build && \
-    cd build && \
-    cmake -G Ninja .. \
+RUN cmake -B build -G Ninja \
         -DBUILD_UNIT_TESTS=OFF \
         -DUSE_HTTP=ON \
         -DUSE_ETCD=ON \
@@ -40,7 +38,7 @@ RUN mkdir -p build && \
         -DSTORE_USE_ETCD=ON \
         -DPython3_EXECUTABLE=/usr/bin/python${PYTHON_VERSION} \
         -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE} && \
-    cmake --build . -j"$(nproc)"
+    cmake --build build
 
 # Build nvlink allocator to make wheel self-contained for MUSA paths
 RUN mkdir -p build/mooncake-transfer-engine/nvlink-allocator && \
