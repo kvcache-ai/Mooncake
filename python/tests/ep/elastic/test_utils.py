@@ -1,0 +1,254 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 DeepSeek
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+#
+# This file incorporates material from the DeepSeek project, licensed under the MIT License.
+# The modifications made by NVIDIA are licensed under the Apache License, Version 2.0.
+#
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import json
+import os
+import sys
+import tempfile
+from pathlib import Path
+from typing import Callable, Optional, Union
+
+import numpy as np
+import torch
+import torch.distributed as dist
+
+
+def calc_diff(x: torch.Tensor, y: torch.Tensor):
+    x, y = x.double() + 1, y.double() + 1
+    denominator = (x * x + y * y).sum()
+    sim = 2 * (x * y).sum() / denominator
+    return (1 - sim).item()
+
+
+def per_token_cast_back(x_fp8: torch.Tensor, x_scales: torch.Tensor):
+    if x_fp8.numel() == 0:
+        return x_fp8.to(torch.bfloat16)
+    if x_scales.dtype == torch.int:
+        x_scales = x_scales.view(dtype=torch.uint8).to(torch.int) << 23
+        x_scales = x_scales.view(dtype=torch.float)
+    x_fp32 = x_fp8.to(torch.float32).view(x_fp8.size(0), -1, 128)
+    x_scales = x_scales.view(x_fp8.size(0), -1, 1)
+    return (x_fp32 * x_scales).view(x_fp8.shape).to(torch.bfloat16)
+
+
+def bench(fn, num_warmups: int = 50, num_tests: int = 50, post_fn=None):
+    # Flush L2 cache with 256 MB data
+    torch.cuda.synchronize()
+    cache = torch.empty(int(256e6 // 4), dtype=torch.int, device="cuda")
+
+    # Warmup
+    for _ in range(num_warmups):
+        fn()
+
+    # Flush L2
+    cache.zero_()
+
+    # Testing
+    start_events = [torch.cuda.Event(enable_timing=True) for _ in range(num_tests)]
+    end_events = [torch.cuda.Event(enable_timing=True) for _ in range(num_tests)]
+    for i in range(num_tests):
+        # Record
+        start_events[i].record()
+        fn()
+        end_events[i].record()
+        if post_fn is not None:
+            post_fn()
+    torch.cuda.synchronize()
+
+    times = np.array(
+        [s.elapsed_time(e) / 1e3 for s, e in zip(start_events, end_events)]
+    )[1:]
+    return np.average(times), np.min(times), np.max(times)
+
+
+class empty_suppress:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        pass
+
+
+class suppress_stdout_stderr:
+    def __enter__(self):
+        self.outnull_file = open(os.devnull, "w")
+        self.errnull_file = open(os.devnull, "w")
+
+        self.old_stdout_fileno_undup = sys.stdout.fileno()
+        self.old_stderr_fileno_undup = sys.stderr.fileno()
+
+        self.old_stdout_fileno = os.dup(sys.stdout.fileno())
+        self.old_stderr_fileno = os.dup(sys.stderr.fileno())
+
+        self.old_stdout = sys.stdout
+        self.old_stderr = sys.stderr
+
+        os.dup2(self.outnull_file.fileno(), self.old_stdout_fileno_undup)
+        os.dup2(self.errnull_file.fileno(), self.old_stderr_fileno_undup)
+
+        sys.stdout = self.outnull_file
+        sys.stderr = self.errnull_file
+        return self
+
+    def __exit__(self, *_):
+        sys.stdout = self.old_stdout
+        sys.stderr = self.old_stderr
+
+        os.dup2(self.old_stdout_fileno, self.old_stdout_fileno_undup)
+        os.dup2(self.old_stderr_fileno, self.old_stderr_fileno_undup)
+
+        os.close(self.old_stdout_fileno)
+        os.close(self.old_stderr_fileno)
+
+        self.outnull_file.close()
+        self.errnull_file.close()
+
+
+def _has_cuda_profiler_events(key_averages) -> bool:
+    for event in key_averages:
+        if getattr(event, "is_legacy", False):
+            continue
+        for attr in (
+            "device_time_total",
+            "self_device_time_total",
+            "cuda_time_total",
+            "self_cuda_time_total",
+        ):
+            try:
+                if getattr(event, attr, 0) > 0:
+                    return True
+            except TypeError:
+                pass
+    return False
+
+
+def _run_cuda_profiler_sentinel():
+    sentinel = torch.empty((1024,), dtype=torch.float, device="cuda")
+    sentinel.fill_(1.0)
+
+
+def kineto_cuda_available(device_id: int) -> bool:
+    try:
+        torch.cuda.set_device(device_id)
+        with suppress_stdout_stderr():
+            with torch.profiler.profile(
+                activities=[torch.profiler.ProfilerActivity.CUDA]
+            ) as prof:
+                _run_cuda_profiler_sentinel()
+                torch.cuda.synchronize()
+
+        return _has_cuda_profiler_events(prof.key_averages())
+    except RuntimeError:
+        return False
+
+
+def bench_kineto(
+    fn,
+    kernel_names: Union[str, tuple],
+    num_tests: int = 30,
+    suppress_kineto_output: bool = False,
+    trace_path: Optional[str] = None,
+    barrier_comm_profiling: bool = False,
+    num_kernels_per_period: int = 1,
+    barrier_fn: Optional[Callable] = None,
+):
+    # Profile
+    suppress = suppress_stdout_stderr if suppress_kineto_output else empty_suppress
+    with suppress():
+        schedule = torch.profiler.schedule(wait=0, warmup=1, active=1, repeat=1)
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CUDA], schedule=schedule
+        ) as prof:
+            for i in range(2):
+                # NOTES: use a large kernel and a barrier to eliminate the unbalanced CPU launch overhead
+                if barrier_comm_profiling:
+                    lhs = torch.randn((8192, 8192), dtype=torch.float, device="cuda")
+                    rhs = torch.randn((8192, 8192), dtype=torch.float, device="cuda")
+                    lhs @ rhs
+                    if barrier_fn is not None:
+                        barrier_fn()
+                    else:
+                        dist.all_reduce(torch.ones(1, dtype=torch.float, device="cuda"))
+                for _ in range(num_tests):
+                    fn()
+                torch.cuda.synchronize()
+                prof.step()
+
+    # Parse the profiling table
+    assert isinstance(kernel_names, str) or isinstance(kernel_names, tuple)
+    is_tuple = isinstance(kernel_names, tuple)
+    prof_lines = (
+        prof.key_averages()
+        .table(sort_by="cuda_time_total", max_name_column_width=100)
+        .split("\n")
+    )
+    kernel_names = (kernel_names,) if isinstance(kernel_names, str) else kernel_names
+    assert all([isinstance(name, str) for name in kernel_names])
+    for name in kernel_names:
+        assert (
+            sum([name in line for line in prof_lines]) == 1
+        ), f"Errors of the kernel {name} in the profiling table"
+
+    # Save chrome traces
+    if trace_path is not None:
+        prof.export_chrome_trace(trace_path)
+
+    # Return average kernel durations
+    units = {"ms": 1e3, "us": 1e6}
+    kernel_durations = []
+    for name in kernel_names:
+        for line in prof_lines:
+            if name in line:
+                time_str = line.split()[-2]
+                for unit, scale in units.items():
+                    if unit in time_str:
+                        kernel_durations.append(
+                            float(time_str.replace(unit, "")) / scale
+                        )
+                        break
+                break
+
+    # Expand the kernels by periods
+    if num_kernels_per_period > 1:
+        with tempfile.NamedTemporaryFile(suffix=".json") as tmp:
+            prof.export_chrome_trace(tmp.name)
+            profile_data = json.loads(Path(tmp.name).read_text())
+
+        for i, kernel_name in enumerate(kernel_names):
+            events = [
+                event
+                for event in profile_data["traceEvents"]
+                if f"::{kernel_name}" in event["name"]
+            ]
+            events = sorted(events, key=lambda event: event["ts"])
+            durations = [event["dur"] / 1e6 for event in events]
+            assert len(durations) % num_kernels_per_period == 0
+            num_kernel_patterns = len(durations) // num_kernels_per_period
+            kernel_durations[i] = [
+                sum(durations[j::num_kernels_per_period]) / num_kernel_patterns
+                for j in range(num_kernels_per_period)
+            ]  # type: ignore[call-overload]
+
+    # Return execution durations
+    return kernel_durations if is_tuple else kernel_durations[0]
+
+
+def hash_tensor(t: torch.Tensor):
+    return t.view(torch.int).sum().item()

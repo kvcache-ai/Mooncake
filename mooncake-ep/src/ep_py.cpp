@@ -15,6 +15,7 @@ void bind_legacy_buffer_perf(py::module_& module);
 
 PYBIND11_MODULE(_ep, m) {
     m.def("get_ep_buffer_size_hint", &get_ep_buffer_size_hint);
+    m.def("get_ep_elastic_buffer_size_hint", &get_ep_elastic_buffer_size_hint);
 #if !defined(MOONCAKE_EP_USE_MACA)
     m.def("calculate_elastic_buffer_size",
           &MooncakeElasticBuffer::calculate_buffer_size);
@@ -54,7 +55,41 @@ PYBIND11_MODULE(_ep, m) {
         .def("get_ipc_handle", &MooncakeEpBuffer::get_ipc_handle)
         .def("sync_nvlink_ipc_handles",
              &MooncakeEpBuffer::sync_nvlink_ipc_handles)
-        .def("dispatch", &MooncakeEpBuffer::dispatch)
+        .def("_configure_elastic", &MooncakeEpBuffer::configure_elastic)
+        .def("_set_explicit_destroy", &MooncakeEpBuffer::set_explicit_destroy)
+        .def("_stage_peer",
+             [](MooncakeEpBuffer& buffer, int peer_rank, int64_t raddr,
+                int32_t rkey, int64_t subnet_prefix, int64_t interface_id,
+                const std::vector<int32_t>& qpns,
+                const std::vector<int32_t>& lids,
+                const std::vector<int32_t>& ipc_handle) {
+                 py::gil_scoped_release release;
+                 buffer.stage_peer(peer_rank, raddr, rkey, subnet_prefix,
+                                   interface_id, qpns, lids, ipc_handle);
+             })
+        .def("_disconnect_ranks", &MooncakeEpBuffer::disconnect_ranks)
+        .def("_update_mask_buffer", &MooncakeEpBuffer::update_mask_buffer)
+        .def("_query_mask_buffer", &MooncakeEpBuffer::query_mask_buffer)
+        .def("_clean_mask_buffer", &MooncakeEpBuffer::clean_mask_buffer)
+        .def("_barrier", &MooncakeEpBuffer::barrier)
+        .def("_get_active_rank_bound", &MooncakeEpBuffer::get_active_rank_bound)
+        .def("_get_comm_stream", &MooncakeEpBuffer::get_comm_stream)
+        .def("_get_local_buffer_descriptor",
+             &MooncakeEpBuffer::get_local_buffer_descriptor)
+        .def("_get_next_combine_buffer_descriptor",
+             &MooncakeEpBuffer::get_next_combine_buffer_descriptor)
+        .def("destroy", &MooncakeEpBuffer::destroy)
+        .def("dispatch", &MooncakeEpBuffer::dispatch, py::arg("x_ptr"),
+             py::arg("topk_idx_ptr"), py::arg("active_ranks_ptr"),
+             py::arg("num_tokens"), py::arg("hidden"), py::arg("num_topk"),
+             py::arg("num_max_dispatch_tokens_per_rank"),
+             py::arg("num_experts"), py::arg("timeout_us"), py::arg("use_fp8"),
+             py::arg("packed_recv_x_ptr"), py::arg("packed_recv_x_scales_ptr"),
+             py::arg("packed_recv_count_ptr"),
+             py::arg("packed_recv_src_info_ptr"),
+             py::arg("packed_recv_layout_range_ptr"), py::arg("async"),
+             py::arg("return_recv_hook"), py::arg("compute_stream_ptr"),
+             py::arg("cumulative_local_expert_recv_stats_ptr") = 0)
         .def("combine", &MooncakeEpBuffer::combine);
 
 #if !defined(MOONCAKE_EP_USE_MACA)
