@@ -285,7 +285,8 @@ DynamicReplicationController::FindReusableLease(
 
 std::optional<DynamicReplicationController::Plan>
 DynamicReplicationController::SelectPlan(
-    ScopedSegmentAccess& segment_access, const ObjectMetadata& metadata,
+    const std::vector<SegmentCandidate>& segments,
+    const ObjectMetadata& metadata,
     const std::function<bool(const Replica&)>& is_readable,
     const std::optional<std::string>& preferred_target_segment,
     std::string target_domain) const {
@@ -297,14 +298,9 @@ DynamicReplicationController::SelectPlan(
         source_liveness_by_segment;
     size_t memory_replicas = 0;
 
-    std::vector<std::pair<Segment, UUID>> segments;
-    if (segment_access.GetAllSegments(segments) != ErrorCode::OK) {
-        return std::nullopt;
-    }
     std::unordered_map<std::string, Segment> segments_by_name;
-    for (const auto& [segment, client_id] : segments) {
-        (void)client_id;
-        segments_by_name.emplace(segment.name, segment);
+    for (const auto& candidate : segments) {
+        segments_by_name.emplace(candidate.segment.name, candidate.segment);
     }
 
     metadata.VisitReplicas(
@@ -344,16 +340,14 @@ DynamicReplicationController::SelectPlan(
             return StableScore(object_key, lhs) < StableScore(object_key, rhs);
         });
 
-    auto is_valid_target = [&](const Segment& segment) {
-        if (existing_segments.contains(segment.name) ||
-            !segment_access.IsSegmentAllocatable(segment.name)) {
+    auto is_valid_target = [&](const SegmentCandidate& candidate) {
+        if (existing_segments.contains(candidate.segment.name) ||
+            !candidate.allocatable) {
             return false;
         }
-        size_t used = 0;
-        size_t capacity = 0;
-        if (segment_access.QuerySegments(segment.name, used, capacity) !=
-                ErrorCode::OK ||
-            capacity == 0 || used >= capacity ||
+        const size_t used = candidate.used;
+        const size_t capacity = candidate.capacity;
+        if (capacity == 0 || used >= capacity ||
             capacity - used < metadata.TotalLength()) {
             return false;
         }
@@ -363,12 +357,11 @@ DynamicReplicationController::SelectPlan(
         return util_after < kTargetHighWatermark;
     };
 
-    auto target_score = [&](const Segment& segment) {
-        size_t used = 0;
-        size_t capacity = 0;
-        if (segment_access.QuerySegments(segment.name, used, capacity) !=
-                ErrorCode::OK ||
-            capacity == 0) {
+    auto target_score = [&](const SegmentCandidate& candidate) {
+        const Segment& segment = candidate.segment;
+        const size_t used = candidate.used;
+        const size_t capacity = candidate.capacity;
+        if (capacity == 0) {
             return std::tuple<bool, double, uint64_t>(
                 false, std::numeric_limits<double>::max(),
                 std::numeric_limits<uint64_t>::max());
@@ -385,21 +378,20 @@ DynamicReplicationController::SelectPlan(
     std::optional<std::string> target_segment;
     if (preferred_target_segment.has_value()) {
         const auto preferred = std::find_if(
-            segments.begin(), segments.end(), [&](const auto& entry) {
-                return entry.first.name == *preferred_target_segment;
+            segments.begin(), segments.end(), [&](const auto& candidate) {
+                return candidate.segment.name == *preferred_target_segment;
             });
-        if (preferred != segments.end() && is_valid_target(preferred->first)) {
-            target_segment = preferred->first.name;
+        if (preferred != segments.end() && is_valid_target(*preferred)) {
+            target_segment = preferred->segment.name;
         }
     }
     if (!target_segment.has_value()) {
         std::optional<std::tuple<bool, double, uint64_t>> best_score;
-        for (const auto& [segment, client_id] : segments) {
-            (void)client_id;
-            if (!is_valid_target(segment)) {
+        for (const auto& candidate : segments) {
+            if (!is_valid_target(candidate)) {
                 continue;
             }
-            const auto score = target_score(segment);
+            const auto score = target_score(candidate);
             if (!best_score.has_value() ||
                 std::get<0>(score) > std::get<0>(*best_score) ||
                 (std::get<0>(score) == std::get<0>(*best_score) &&
@@ -408,7 +400,7 @@ DynamicReplicationController::SelectPlan(
                  std::get<1>(score) == std::get<1>(*best_score) &&
                  std::get<2>(score) < std::get<2>(*best_score))) {
                 best_score = score;
-                target_segment = segment.name;
+                target_segment = candidate.segment.name;
             }
         }
     }

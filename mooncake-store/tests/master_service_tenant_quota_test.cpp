@@ -390,11 +390,8 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
         next_segment_offset_ += size + 4096;
 
         auto segment_access =
-            MasterServiceTestPeer::SegmentManager(service).getSegmentAccess();
-        return segment_access.MountSegment(
-            segment, generate_uuid(),
-            std::make_shared<ClientLivenessRecord>(
-                ClientLivenessRecord::Clock::now()));
+            MasterServiceTestPeer::SegmentPool(service).AcquireWriteAccess();
+        return segment_access.MountSegment(segment, generate_uuid());
     }
 
     void RecomputeTenantEffectiveQuotasForTest(MasterService& service) {

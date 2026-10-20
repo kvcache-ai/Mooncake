@@ -3,14 +3,17 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <memory>
 #include <set>
 #include <shared_mutex>
 #include <string>
 #include <vector>
 
+#include "client_liveness.h"
 #include "local_ssd/manager.h"
 #include "placement/index.h"
+#include "random.h"
 #include "test_buffer_allocator.h"
 
 namespace mooncake::test {
@@ -27,7 +30,8 @@ class TestAllocationCandidate final : public AllocationCandidate {
           cxl_binding_(std::move(cxl_binding)) {}
 
     std::unique_ptr<AllocatedBuffer> Allocate(size_t size) const override {
-        auto buffer = allocator().allocate(size);
+        ++allocation_attempts_;
+        auto buffer = AllocateRegistered(size);
         if (buffer && is_cxl_) {
             buffer->change_to_cxl(cxl_binding_);
         }
@@ -39,9 +43,12 @@ class TestAllocationCandidate final : public AllocationCandidate {
                        : AllocationCandidateKind::NATIVE;
     }
 
+    size_t allocation_attempts() const { return allocation_attempts_; }
+
    private:
     bool is_cxl_;
     std::string cxl_binding_;
+    mutable size_t allocation_attempts_{0};
 };
 
 class PlacementState {
@@ -78,7 +85,7 @@ class PlacementState {
     RegionCatalog catalog;
     LocalSsdManager local_ssd;
     std::vector<std::shared_ptr<TestBufferAllocator>> allocators;
-    std::vector<std::unique_ptr<AllocationCandidate>> candidates;
+    std::vector<std::unique_ptr<TestAllocationCandidate>> candidates;
     std::shared_mutex mutex;
 
    private:
@@ -100,7 +107,233 @@ std::set<std::string> Endpoints(const std::vector<Replica>& replicas) {
     return result;
 }
 
+class ScopedRandomSeed final {
+   public:
+    explicit ScopedRandomSeed(RandomEngine::result_type seed)
+        : saved_engine_(threadLocalRandomEngine()) {
+        threadLocalRandomEngine().seed(seed);
+    }
+    ~ScopedRandomSeed() { threadLocalRandomEngine() = saved_engine_; }
+
+   private:
+    RandomEngine saved_engine_;
+};
+
+std::shared_ptr<ClientLivenessRecord> SuspectedClient() {
+    const auto initial = ClientLivenessRecord::TimePoint{};
+    auto record = std::make_shared<ClientLivenessRecord>(initial);
+    EXPECT_EQ(
+        record->Evaluate(initial + std::chrono::seconds(1),
+                         std::chrono::seconds(1), std::chrono::seconds(60)),
+        ClientLivenessTransition::BECAME_SUSPECTED);
+    return record;
+}
+
+template <typename Policy>
+class ReplicaAllocatorLivenessTest : public ::testing::Test {
+   protected:
+    auto Allocate(const ReplicaAllocationRequest& request,
+                  PlacementDiagnostics* diagnostics = nullptr) {
+        auto access = state.Access();
+        if constexpr (std::same_as<Policy, SsdFreeRatioFirstPlacementPolicy>) {
+            return ReplicaAllocator(SsdFreeRatioFirstPlacementPolicy{
+                                        LocalSSDMetricsView(state.local_ssd)})
+                .Allocate(access, request, diagnostics);
+        } else {
+            return ReplicaAllocator(Policy{}).Allocate(access, request,
+                                                       diagnostics);
+        }
+    }
+
+    PlacementState state;
+};
+
+using LivenessPolicies =
+    ::testing::Types<RandomPlacementPolicy, LocalFirstPlacementPolicy,
+                     FreeRatioFirstPlacementPolicy,
+                     SsdFreeRatioFirstPlacementPolicy>;
+TYPED_TEST_SUITE(ReplicaAllocatorLivenessTest, LivenessPolicies);
+
 }  // namespace
+
+TYPED_TEST(ReplicaAllocatorLivenessTest,
+           SuspectedEntriesDoNotConsumeFallbackRetries) {
+    // Both unfiltered sample starts for this seed miss the two healthy entries
+    // within the 100-entry retry budget.
+    ScopedRandomSeed seed(1);
+    auto suspected = SuspectedClient();
+    for (size_t i = 0; i < 256; ++i) {
+        auto name = "suspected-" + std::to_string(i);
+        this->state.Add(name, name);
+        this->state.candidates.back()->BindClientLiveness(suspected);
+    }
+    this->state.Add("full", "full", kCapacity);
+    this->state.Add("healthy", "healthy");
+
+    auto result = this->Allocate(Request());
+    ASSERT_TRUE(result.has_value());
+    ASSERT_EQ(result->size(), 1U);
+    EXPECT_EQ(ReplicaEndpoint(result->front()), "healthy");
+    for (size_t i = 0; i < 256; ++i) {
+        EXPECT_EQ(this->state.candidates[i]->allocation_attempts(), 0U);
+    }
+}
+
+TYPED_TEST(ReplicaAllocatorLivenessTest,
+           DiagnosticsCountServingEntriesAndTrackRecovery) {
+    ScopedRandomSeed seed(1);
+    auto suspected = SuspectedClient();
+    this->state.Add("healthy", "healthy");
+    this->state.Add("healthy", "duplicate");
+    this->state.Add("suspected", "suspected");
+    this->state.candidates.back()->BindClientLiveness(suspected);
+    this->state.Add("unavailable", "unavailable");
+    this->state.candidates.back()->SetStatus(SegmentStatus::DRAINING);
+    this->state.Add("cxl", "cxl", 0, true);
+
+    PlacementDiagnostics diagnostics;
+    {
+        auto result = this->Allocate(Request(2), &diagnostics);
+        ASSERT_TRUE(result.has_value());
+        EXPECT_EQ(result->size(), 1U);
+        // Neither duplicate regions nor non-serving/wrong-kind entries can
+        // justify eviction when strict replica count cannot be satisfied.
+        EXPECT_FALSE(diagnostics.has_sufficient_active_entry_count);
+    }
+    const auto recovery =
+        ClientLivenessRecord::TimePoint{} + std::chrono::seconds(2);
+    ASSERT_EQ(suspected->Observe(recovery),
+              ClientLivenessObservation::RECOVERED_ACTIVE);
+    {
+        auto result = this->Allocate(Request(2), &diagnostics);
+        ASSERT_TRUE(result.has_value());
+        EXPECT_EQ(result->size(), 2U);
+        EXPECT_TRUE(diagnostics.has_sufficient_active_entry_count);
+    }
+    ASSERT_EQ(
+        suspected->Evaluate(recovery + std::chrono::seconds(1),
+                            std::chrono::seconds(1), std::chrono::seconds(60)),
+        ClientLivenessTransition::BECAME_SUSPECTED);
+    this->state.allocators[0]->SetUsed(kCapacity);
+    this->state.allocators[1]->SetUsed(kCapacity);
+    auto result = this->Allocate(Request(2), &diagnostics);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+    EXPECT_FALSE(diagnostics.has_sufficient_active_entry_count);
+}
+
+TYPED_TEST(ReplicaAllocatorLivenessTest,
+           NoServingEntriesReportNoCapacityWithoutAllocationAttempts) {
+    auto suspected = SuspectedClient();
+    this->state.Add("suspected", "suspected");
+    this->state.candidates.back()->BindClientLiveness(suspected);
+    PlacementDiagnostics diagnostics;
+    diagnostics.has_sufficient_active_entry_count = true;
+    auto result = this->Allocate(Request(), &diagnostics);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+    EXPECT_FALSE(diagnostics.has_sufficient_active_entry_count);
+    EXPECT_EQ(this->state.candidates.front()->allocation_attempts(), 0U);
+}
+
+TEST(ReplicaAllocatorTest, RankedSamplingSkipsSuspectedEntries) {
+    for (bool use_ssd_metrics : {false, true}) {
+        SCOPED_TRACE(use_ssd_metrics);
+        ScopedRandomSeed seed(1);
+        PlacementState state;
+        auto suspected = SuspectedClient();
+        for (size_t i = 0; i < 256; ++i) {
+            auto name = "suspected-" + std::to_string(i);
+            state.Add(name, name);
+            state.candidates.back()->BindClientLiveness(suspected);
+        }
+        state.Add("second", "second", kCapacity / 2);
+        state.Add("best", "best");
+        const UUID second{1, 1};
+        const UUID best{2, 2};
+        state.Metadata("second", second);
+        state.Metadata("best", best);
+        for (const auto& owner : {second, best}) {
+            ASSERT_EQ(state.local_ssd.RegisterClient(owner, true),
+                      ErrorCode::OK);
+            ASSERT_TRUE(state.local_ssd.ReportCapacity(owner, 1000));
+        }
+        ASSERT_TRUE(state.local_ssd.AdjustUsedBytes(second, 500));
+        auto access = state.Access();
+        auto result =
+            use_ssd_metrics
+                ? ReplicaAllocator(SsdFreeRatioFirstPlacementPolicy{
+                                       LocalSSDMetricsView(state.local_ssd)})
+                      .Allocate(access, Request())
+                : ReplicaAllocator(FreeRatioFirstPlacementPolicy{})
+                      .Allocate(access, Request());
+        ASSERT_TRUE(result.has_value());
+        // Filtering only fallback retries would select "second" for this seed,
+        // rather than sampling and ranking the serving entries.
+        EXPECT_EQ(ReplicaEndpoint(result->front()), "best");
+    }
+}
+
+TEST(ReplicaAllocatorTest, SharedEntrySamplesOnlyServingCandidates) {
+    PlacementState state;
+    for (size_t i = 0; i < 4; ++i) {
+        state.Add("shared", "endpoint-" + std::to_string(i));
+    }
+    auto suspected = SuspectedClient();
+    const auto* entry =
+        state.index.Find("shared", AllocationCandidateKind::NATIVE);
+    // Make the unfiltered starting candidate non-serving, independently of
+    // pointer ordering in the entry's candidate set.
+    RandomEngine probe(3);
+    const auto* first = *entry->candidates.nth(randomIndex(4, probe));
+    for (auto& candidate : state.candidates) {
+        if (candidate.get() == first) {
+            candidate->BindClientLiveness(suspected);
+        }
+    }
+    ScopedRandomSeed seed(3);
+    auto access = state.Access();
+    auto result = ReplicaAllocator(RandomPlacementPolicy{})
+                      .AllocateFrom(access, 4096, "shared");
+    ASSERT_TRUE(result.has_value());
+    for (auto& candidate : state.candidates) {
+        if (!candidate->IsServing()) {
+            EXPECT_EQ(candidate->allocation_attempts(), 0U);
+        }
+    }
+}
+
+TEST(ReplicaAllocatorTest, PreferredOnlyCountsServingEntriesOfRequiredKind) {
+    for (auto kind :
+         {AllocationCandidateKind::NATIVE, AllocationCandidateKind::CXL}) {
+        SCOPED_TRACE(static_cast<int>(kind));
+        PlacementState state;
+        const bool is_cxl = kind == AllocationCandidateKind::CXL;
+        auto suspected = SuspectedClient();
+        state.Add("preferred", "preferred", 0, is_cxl);
+        state.candidates.back()->BindClientLiveness(suspected);
+        state.Add("healthy", "healthy", 0, is_cxl);
+        state.Add("other-kind", "other-kind", 0, !is_cxl);
+        auto access = state.Access();
+        ReplicaAllocator allocator(PreferredOnlyPlacementPolicy{kind});
+        PlacementDiagnostics diagnostics;
+        auto request = Request(2);
+        request.placement.preferred_segment_name = "preferred";
+        auto result = allocator.Allocate(access, request, &diagnostics);
+        ASSERT_FALSE(result.has_value());
+        EXPECT_EQ(result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+        EXPECT_FALSE(diagnostics.has_sufficient_active_entry_count);
+        EXPECT_EQ(state.candidates.front()->allocation_attempts(), 0U);
+
+        request.replicas.count = 1;
+        state.candidates[1]->SetStatus(SegmentStatus::DRAINING);
+        result = allocator.Allocate(access, request, &diagnostics);
+        ASSERT_FALSE(result.has_value());
+        EXPECT_EQ(result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+        EXPECT_FALSE(diagnostics.has_sufficient_active_entry_count);
+        EXPECT_EQ(state.candidates.front()->allocation_attempts(), 0U);
+    }
+}
 
 TEST(PlacementIndexTest,
      KeepsPointersStableAndRemovesCandidateSetsWithSwapPop) {

@@ -29,9 +29,7 @@ class SegmentAllocatorRegistration {
     void SetAllocatable(bool allocatable);
     void Invalidate();
     std::shared_ptr<BufferAllocatorBase> allocator_;
-    SegmentLifetime allocation_lifetime_;
-    SegmentLifetime buffer_lifetime_;
-    std::shared_ptr<ClientLivenessRecord> client_liveness_;
+    SegmentLifetime lifetime_;
     friend class AllocatorManager;
     friend class ScopedNoFSegmentAccess;
     friend class ScopedSegmentAccess;

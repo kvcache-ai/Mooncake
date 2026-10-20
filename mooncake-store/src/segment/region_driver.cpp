@@ -22,7 +22,7 @@ class NativeAllocationCandidate final : public AllocationCandidate {
         : AllocationCandidate(std::move(allocator)) {}
 
     std::unique_ptr<AllocatedBuffer> Allocate(size_t size) const override {
-        return allocator().allocate(size);
+        return AllocateRegistered(size);
     }
 
     AllocationCandidateKind Kind() const noexcept override {
@@ -38,7 +38,7 @@ class CxlAllocationCandidate final : public AllocationCandidate {
           cxl_binding_name_(std::move(binding_name)) {}
 
     std::unique_ptr<AllocatedBuffer> Allocate(size_t size) const override {
-        auto buffer = allocator().allocate(size);
+        auto buffer = AllocateRegistered(size);
         if (buffer) {
             buffer->change_to_cxl(cxl_binding_name_);
         }
@@ -86,6 +86,10 @@ class CxlRegionDriver final : public RegionDriver {
     explicit CxlRegionDriver(
         std::shared_ptr<BufferAllocatorBase> global_allocator);
     ~CxlRegionDriver() override;
+
+    std::shared_ptr<BufferAllocatorBase> GetSharedAllocator() const override {
+        return global_allocator_;
+    }
 
     tl::expected<PreparedRegionResource, ErrorCode> PrepareOpen(
         const RegionResourceSpec& spec,
@@ -196,7 +200,12 @@ bool RegionDriver::Reactivate(const UUID& id) {
     return true;
 }
 
-bool RegionDriver::Erase(const UUID& id) { return resources_.erase(id) != 0; }
+bool RegionDriver::Erase(const UUID& id) {
+    auto* resource = GetResource(id);
+    if (!resource) return false;
+    resource->candidate->Invalidate();
+    return resources_.erase(id) != 0;
+}
 
 PreparedRegionResource RegionDriver::Stage(
     const UUID& id, std::unique_ptr<RegionResource> resource,

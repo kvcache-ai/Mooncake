@@ -39,7 +39,6 @@
 #include "metadata/object_state.h"
 #include "object_metadata.h"
 #include "rpc_types.h"
-#include "segment.h"
 #include "tenant_id.h"
 #include "types.h"
 
@@ -57,6 +56,17 @@ class DynamicReplicationController {
         std::string target_segment;
         std::string target_domain;
         std::shared_ptr<ClientLivenessRecord> source_liveness;
+    };
+
+    // One mounted segment as placement sees it when a plan is selected.
+    struct SegmentCandidate {
+        Segment segment;
+        // Whether the segment accepts new allocations right now.
+        bool allocatable = false;
+        // Bytes in use and in total across the segment; capacity is 0 when
+        // the usage could not be read, which rules the segment out.
+        size_t used = 0;
+        size_t capacity = 0;
     };
 
     // Runs on the admission thread once per queued object.
@@ -114,7 +124,8 @@ class DynamicReplicationController {
     // Picks a source among the readable MEMORY replicas and a target segment
     // with room to spare, preferring another host.
     std::optional<Plan> SelectPlan(
-        ScopedSegmentAccess& segment_access, const ObjectMetadata& metadata,
+        const std::vector<SegmentCandidate>& segments,
+        const ObjectMetadata& metadata,
         const std::function<bool(const Replica&)>& is_readable,
         const std::optional<std::string>& preferred_target_segment,
         std::string target_domain) const;

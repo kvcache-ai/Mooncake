@@ -23,8 +23,7 @@ class SegmentPool final {
     class WriteAccess;
     class ReadAccess;
 
-    explicit SegmentPool(RegionDriverRegistry region_drivers)
-        : region_drivers_(std::move(region_drivers)) {}
+    explicit SegmentPool(RegionDriverRegistry region_drivers);
     ~SegmentPool();
 
     WriteAccess AcquireWriteAccess();
@@ -64,6 +63,8 @@ class SegmentPool final {
    private:
     ScopedPlacementReadAccess AcquirePlacementAccess() const;
     void ReleaseCapacityMetrics();
+    friend class Serializer<AllocatedBuffer>;
+
     RegionDriver* GetDriver(RegionKind kind);
     const RegionDriver* GetDriver(RegionKind kind) const;
     RegionResource* GetResource(const MountedRegion& mounted);
