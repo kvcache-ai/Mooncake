@@ -49,6 +49,7 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     segment.cpp
     tenant/quota.cpp
     tenant/quota_manager.cpp
+    tenant/quota_policy.cpp
     tenant_quota_ledger.cpp
     tenant/quota_policy_store.cpp
     weight_metadata_store.cpp
