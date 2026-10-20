@@ -24,7 +24,8 @@
 #include "tent/platform/rocm.h"
 #elif defined(USE_SUNRISE)
 #include "tent/platform/sunrise.h"
-#elif defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)
+#elif defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT) || \
+    defined(USE_MEMFABRIC)
 #include "tent/platform/ascend.h"
 #elif defined(USE_TPU)
 #include "tent/platform/tpu.h"
@@ -49,7 +50,8 @@ Platform& Platform::getLoader(std::shared_ptr<Config> conf) {
         g_instance = std::make_shared<RocmPlatform>(conf);
 #elif defined(USE_SUNRISE)
         g_instance = std::make_shared<SunrisePlatform>(conf);
-#elif defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)
+#elif defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT) || \
+    defined(USE_MEMFABRIC)
         g_instance = std::make_shared<AscendPlatform>(conf);
 #elif defined(USE_TPU)
         g_instance = std::make_shared<TpuPlatform>(conf);

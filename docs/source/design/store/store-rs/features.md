@@ -149,7 +149,7 @@ For simpler bring-up or debugging, the runtime can store and resolve routes dire
 
 The current implementation also exposes admin-driven explicit route migration tasks for key-level `copy` and `move`.
 
-See [Route Migration Guide](../deployment/store-rs/route-migration.md) for the current
+See [Route Migration Guide](../../../deployment/store-rs/route-migration.md) for the current
 operator workflow, task semantics, and request examples.
 
 What it provides:
@@ -507,7 +507,7 @@ Both paths are covered by repository validation scripts.
 
 The root validation entry point is `scripts/ci/run_store_rs_smoke.sh`. It
 covers the installed Python facade and the dummy and routed TCP/classic-TE
-read/write paths. See the [validation guide](../deployment/store-rs/testing.md)
+read/write paths. See the [validation guide](../../../deployment/store-rs/testing.md)
 for required build inputs and direct commands for additional scenarios.
 
 Manual path-specific validators stay available as:
