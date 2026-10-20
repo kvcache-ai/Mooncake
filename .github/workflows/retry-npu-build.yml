@@ -1,0 +1,27 @@
+name: Retry NPU Build on Runner Loss
+on:
+  workflow_run:
+    workflows: ["Build NPU Test Wheel"]
+    types: [completed]
+
+permissions:
+  actions: write
+
+jobs:
+  retry:
+    # Only auto-retry push-triggered failures (runner preemption / transient
+    # infra loss). workflow_dispatch retries that fail again do not loop.
+    if: >
+      github.event.workflow_run.conclusion == 'failure' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'feat/bypass-local-copy'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Re-dispatch NPU wheel build
+        run: |
+          curl -sS -X POST \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/build-npu-test.yml/dispatches" \
+            -d '{"ref":"feat/bypass-local-copy"}' \
+            -w "\nHTTP %{http_code}\n"
