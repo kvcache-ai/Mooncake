@@ -1,6 +1,8 @@
 #include "nvme_kv/object_layout.h"
 
+#include <algorithm>
 #include <cstring>
+#include <limits>
 
 namespace mooncake {
 namespace {
@@ -32,6 +34,21 @@ uint32_t ResolveNvmeKvObjectBlobSizeFromHeader(const char* buffer,
 
 }  // namespace
 
+tl::expected<uint32_t, ErrorCode> ComputeNvmeKvInlineSize(
+    uint64_t logical_key_size, uint64_t payload_size, uint32_t value_limit) {
+    if (logical_key_size > UINT32_MAX || payload_size > UINT32_MAX) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    const uint64_t bytes =
+        sizeof(NvmeKvObjectHeader) + sizeof(NvmeKvStoredIdentityMetadata) +
+        ComputeNvmeKvCanonicalIdentitySize(logical_key_size) + payload_size;
+    if (bytes > value_limit) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return static_cast<uint32_t>(bytes);
+}
+
 uint32_t ComputeNvmeKvPayloadChecksum(std::string_view payload) {
     return ComputeNvmeKvChecksum(std::span<const uint8_t>(
         reinterpret_cast<const uint8_t*>(payload.data()), payload.size()));
@@ -48,7 +65,7 @@ uint32_t ComputeNvmeKvStoredIdentityMetadataSize(
     const NvmeKvObjectIdentity& identity) {
     return static_cast<uint32_t>(
         sizeof(NvmeKvStoredIdentityMetadata) +
-        SerializeNvmeKvCanonicalIdentity(identity).size());
+        ComputeNvmeKvCanonicalIdentitySize(identity.logical_key.size()));
 }
 
 NvmeKvStoredIdentityMetadata BuildNvmeKvStoredIdentityMetadata(
