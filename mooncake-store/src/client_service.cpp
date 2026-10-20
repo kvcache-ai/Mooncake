@@ -5685,13 +5685,29 @@ void Client::ProcessSlicesAsync(const std::string& key,
         return;
     }
 
+    // The writeback copies out of the read destination with a host memcpy
+    // (LocalHotCacheHandler::SubmitPutTask), so a slice that landed in device
+    // memory (e.g. batch_get_into into CUDA buffers) would fault the reader.
+    // Device-resident results are not cached through this path.
+    auto runtime_accelerator =
+        device::GetAcceleratorRegistry().RuntimeAccelerators();
+    size_t device_dest_slices = 0;
     // Identify TE transfer slices (non-local) and submit async put tasks
     for (size_t i = 0; i < slices.size(); ++i) {
+        if (runtime_accelerator.FindDeviceForPointer(slices[i].ptr) !=
+            nullptr) {
+            ++device_dest_slices;
+            continue;
+        }
         if (!hot_cache_handler_->SubmitPutTask(key, slices[i])) {
             LOG(ERROR) << "Failed to submit hot cache put task for key=" << key
                        << " slice_idx=" << i;
             return;
         }
+    }
+    if (device_dest_slices > 0) {
+        LOG(INFO) << "Skipped hot-cache writeback for " << device_dest_slices
+                  << " device-resident slice(s), key=" << key;
     }
 }
 

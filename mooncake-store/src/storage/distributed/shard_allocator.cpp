@@ -261,13 +261,12 @@ tl::expected<DistributedFSDescriptor, ErrorCode> ShardAllocator::Allocate(
         size > std::numeric_limits<uint64_t>::max() - (alignment_ - 1)) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
+    // No leading slack is needed: each shard allocator starts at offset 0 and
+    // only receives alignment-multiple requests, whose size-class rounding
+    // stays a multiple of the power-of-two alignment. Every returned offset is
+    // therefore already aligned.
     const uint64_t aligned_size = AlignSize(size);
-    if (aligned_size >
-        std::numeric_limits<uint64_t>::max() - (alignment_ - 1)) {
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-    const uint64_t allocation_size = aligned_size + alignment_ - 1;
-    if (allocation_size > shard_capacity_) {
+    if (aligned_size > shard_capacity_) {
         return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
     }
 
@@ -283,11 +282,18 @@ tl::expected<DistributedFSDescriptor, ErrorCode> ShardAllocator::Allocate(
         std::unique_lock handle_lock(shard.handle_mutex);
         CleanupExpiredPendingFrees(shard, std::chrono::steady_clock::now());
         const uint64_t reserved_bytes =
-            shard.allocator->normalizedAllocationSize(allocation_size);
-        auto handle = shard.allocator->allocate(allocation_size);
+            shard.allocator->normalizedAllocationSize(aligned_size);
+        auto handle = shard.allocator->allocate(aligned_size);
         if (!handle) continue;
 
-        const uint64_t alloc_offset = AlignSize(handle->address());
+        const uint64_t alloc_offset = handle->address();
+        if ((alloc_offset & (alignment_ - 1)) != 0) {
+            // The reservation has no slack to round into; the handle releases
+            // the extent when it goes out of scope.
+            LOG(ERROR) << "DFS shard allocator returned unaligned offset "
+                       << alloc_offset << " for alignment " << alignment_;
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        }
         auto alloc_handle =
             std::make_shared<OffsetAllocationHandle>(std::move(*handle));
         shard.offset_to_handle[alloc_offset] = {key, std::move(alloc_handle),
