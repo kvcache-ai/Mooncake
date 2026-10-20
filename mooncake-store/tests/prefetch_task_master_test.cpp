@@ -92,21 +92,15 @@ class PrefetchTaskMasterTest : public ::testing::Test {
     }
 
     // Friend funnels (PrefetchTaskMasterTest is friended on MasterService).
-    // In-flight tasks live on the object's runtime state; read
-    // promotion_task through the public tenant metadata map.
+    // In-flight tasks live on the object's runtime state.
     static bool HasPromotionTaskForTesting(MasterService* service,
                                            const TenantId& tenant_id,
                                            const std::string& key) {
         MasterService::MetadataAccessorRO accessor(
             service, MasterService::ObjectIdentity{.tenant_id = tenant_id,
                                                    .user_key = key});
-        if (!accessor.Exists()) {
-            return false;
-        }
-        const auto* tenant_state = accessor.GetTenantState();
-        auto it = tenant_state->metadata.find(key);
-        return it != tenant_state->metadata.end() &&
-               it->second.state.promotion_task;
+        return accessor.Exists() &&
+               accessor.GetState().promotion_task.has_value();
     }
 
     static bool IsLeaseAliveForTesting(MasterService* service,
@@ -128,16 +122,11 @@ class PrefetchTaskMasterTest : public ::testing::Test {
         MasterService::MetadataAccessorRO accessor(
             service, MasterService::ObjectIdentity{.tenant_id = tenant_id,
                                                    .user_key = key});
-        const auto* tenant_state = accessor.GetTenantState();
-        if (tenant_state == nullptr) {
+        if (!accessor.Exists() ||
+            !accessor.GetState().promotion_candidate.has_value()) {
             return std::nullopt;
         }
-        auto it = tenant_state->metadata.find(key);
-        if (it == tenant_state->metadata.end() ||
-            !it->second.state.promotion_candidate) {
-            return std::nullopt;
-        }
-        return it->second.state.promotion_candidate->execution_failures;
+        return accessor.GetState().promotion_candidate->execution_failures;
     }
 
     // The in-flight task's execution-failure count if a task exists.
@@ -147,16 +136,11 @@ class PrefetchTaskMasterTest : public ::testing::Test {
         MasterService::MetadataAccessorRO accessor(
             service, MasterService::ObjectIdentity{.tenant_id = tenant_id,
                                                    .user_key = key});
-        if (!accessor.Exists()) {
+        if (!accessor.Exists() ||
+            !accessor.GetState().promotion_task.has_value()) {
             return std::nullopt;
         }
-        const auto* tenant_state = accessor.GetTenantState();
-        auto it = tenant_state->metadata.find(key);
-        if (it == tenant_state->metadata.end() ||
-            !it->second.state.promotion_task) {
-            return std::nullopt;
-        }
-        return it->second.state.promotion_task->execution_failures;
+        return accessor.GetState().promotion_task->execution_failures;
     }
 
     // Seed an on-hit candidate carrying a prior execution-failure history,

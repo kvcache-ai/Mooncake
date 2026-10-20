@@ -85,6 +85,8 @@ add_store_test(dfs_enablement_config_test dfs_enablement_config_test.cpp)
 add_store_test(master_service_weight_management_test
                master_service_weight_management_test.cpp)
 add_store_test(master_service_group_test master_service_group_test.cpp)
+add_store_test(master_service_object_ref_test
+               master_service_object_ref_test.cpp)
 add_ha_test(master_service_evict_scenario_test
             master_service_evict_scenario_test.cpp)
 target_link_libraries(master_service_evict_scenario_test
@@ -255,6 +257,8 @@ add_store_test(cxl_segment_config_test cxl_segment_config_test.cpp)
 add_store_test(client_numa_config_test client_numa_config_test.cpp)
 add_store_test(local_hot_cache_config_test local_hot_cache_config_test.cpp)
 add_store_test(client_local_hot_cache_test client_local_hot_cache_test.cpp)
+add_store_test(local_hot_cache_concurrency_test
+               local_hot_cache_concurrency_test.cpp)
 add_store_test(real_client_hugepage_register_test real_client_hugepage_register_test.cpp)
 add_store_test(real_client_regular_page_register_test real_client_regular_page_register_test.cpp)
 add_store_test(client_tcp_local_memcpy_test client_tcp_local_memcpy_test.cpp)
@@ -506,6 +510,13 @@ target_compile_definitions(oplog_test_failpoint_test
 target_link_libraries(oplog_test_failpoint_test PRIVATE glog::glog gtest
                                                         gtest_main pthread)
 add_test(NAME oplog_test_failpoint_test COMMAND oplog_test_failpoint_test)
+add_executable(shutdown_request_test shutdown_request_test.cpp
+                                     ../src/shutdown_request.cpp)
+target_include_directories(shutdown_request_test
+                           PRIVATE ${MOONCAKE_STORE_INCLUDE_ROOT})
+target_link_libraries(shutdown_request_test PRIVATE glog::glog gtest gtest_main
+                                                    pthread)
+add_test(NAME shutdown_request_test COMMAND shutdown_request_test)
 add_ha_test(master_service_ha_test ha/master_service_ha_test.cpp)
 
 foreach(

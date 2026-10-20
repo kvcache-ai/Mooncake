@@ -17,6 +17,7 @@
 
 #include <cassert>
 #include <exception>
+#include <optional>
 #include <set>
 #include <utility>
 
@@ -43,6 +44,11 @@ class CallbackInvocationGuard {
    private:
     Fn on_exit_;
 };
+
+// onNotify() answers a request it can never take with this prefix, which
+// ControlClient::notify() tells apart from a notification not taken yet.
+constexpr char kMalformedNotification[] = "malformed notification: ";
+constexpr char kNotifyCallbackFailed[] = "notify callback failed: ";
 
 }  // namespace
 
@@ -175,7 +181,13 @@ Status ControlClient::notify(const std::string& server_addr,
     json j = message;
     std::string request = j.dump();
     std::string response;
-    return tl_rpc_agent.call(server_addr, Notify, request, response);
+    CHECK_STATUS(tl_rpc_agent.call(server_addr, Notify, request, response));
+    // Not an RPC error: the peer answered. A malformed request fails the
+    // same way on every retry, while a missing callback may be set later.
+    if (response.empty()) return Status::OK();
+    if (response.rfind(kMalformedNotification, 0) == 0)
+        return Status::InvalidArgument(response);
+    return Status::InternalError(response);
 }
 
 Status ControlClient::probe(const std::string& server_addr) {
@@ -595,11 +607,15 @@ void ControlService::onRecvData(const std::string_view& request,
 
 void ControlService::onNotify(const std::string_view& request,
                               std::string& response) {
-    (void)response;
     OnNotify callback;
     {
         std::lock_guard<std::mutex> guard(notify_cb_mutex_);
-        if (!notify_callback_) return;
+        // An empty response is the sender's ack; before the callback is
+        // registered and after teardown clears it, nothing takes the message.
+        if (!notify_callback_) {
+            response = "notify callback not registered";
+            return;
+        }
         callback = notify_callback_;
         ++notify_callbacks_in_flight_;
     }
@@ -611,13 +627,26 @@ void ControlService::onNotify(const std::string_view& request,
         finishNotifyCallback();
     });
 
+    std::optional<Notification> message;
     try {
-        Notification message = json::parse(request).get<Notification>();
-        callback(message);
+        message = json::parse(request).get<Notification>();
+        int rc = callback(*message);
+        if (rc != 0) {
+            response = std::string(kNotifyCallbackFailed) + "returned " +
+                       std::to_string(rc);
+        }
+    } catch (const json::exception& e) {
+        LOG(ERROR) << "onNotify failed: " << e.what();
+        // Only a request that does not parse fails again on every retry.
+        response = std::string(message ? kNotifyCallbackFailed
+                                       : kMalformedNotification) +
+                   e.what();
     } catch (const std::exception& e) {
         LOG(ERROR) << "onNotify failed: " << e.what();
+        response = std::string(kNotifyCallbackFailed) + e.what();
     } catch (...) {
         LOG(ERROR) << "onNotify failed with unknown exception";
+        response = kNotifyCallbackFailed;
     }
 }
 
