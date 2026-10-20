@@ -14,6 +14,8 @@
 #include <utility>
 #include <vector>
 
+#include <glog/logging.h>
+
 #include "object_metadata.h"
 #include "metadata/object_route.h"
 
@@ -22,16 +24,24 @@ namespace test {
 
 // Publishes a minimal 128 B, replica-less envelope under the key `guard` holds,
 // which holds no object, and returns its generation. These suites exercise the
-// object model, not replica validity, so nothing here sets a real replica. The
-// write time is fixed rather than read from the clock so a suite that ages a
-// lease cannot pick up a moving value.
+// Publishes an empty 128 B part under the key `guard` holds, which holds no
+// object, and returns its generation. These suites exercise the object model,
+// not replica validity, so nothing here sets a real replica. The write time is
+// fixed rather than read from the clock so a suite that ages a lease cannot
+// pick up a moving value.
 inline route::Generation PublishEnvelope(const route::WriteGuard& guard,
                                          const std::string& group_id = {}) {
+    const auto generation = guard.Publish(
+        /*part_count=*/1, TenantId(), guard.key(), group_id,
+        ObjectDataType::UNKNOWN, /*hard_pinned=*/false, std::nullopt);
     const auto write_time =
         std::chrono::system_clock::time_point(std::chrono::seconds(1));
-    return guard.Publish(UUID{1, 2}, write_time, 128, std::vector<Replica>{},
-                         std::nullopt, false, ObjectDataType::UNKNOWN, group_id,
-                         TenantId(), guard.key());
+    auto begin_write = guard.metadata().BeginWrite(
+        /*index=*/0, /*length=*/128, std::vector<Replica>{}, UUID{1, 2},
+        /*session_id=*/"", write_time);
+    CHECK(begin_write.has_value())
+        << "an object published by this helper starts empty";
+    return generation;
 }
 
 // Publishes that envelope under `key` and returns its generation, or 0 when

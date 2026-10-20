@@ -69,7 +69,7 @@ MasterStoreBackend::SnapshotWeightGroup(
             .key = key,
             .size = metadata.TotalLength(),
             .data_type = metadata.data_type,
-            .readable = master_.HasReadableReplica(metadata),
+            .readable = metadata.IsReadable(),
         });
     }
     return members;

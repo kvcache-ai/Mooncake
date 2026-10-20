@@ -427,6 +427,15 @@ class Replica {
         return replica.is_completed();
     }
 
+    // Whether a reader may use this replica right now: the write on it
+    // finished and the buffer behind it is still reachable. A segment that
+    // went away, or one restored from a snapshot and not mounted again, makes
+    // its buffers unavailable, so this answers false without anything having
+    // to remember which segments those are.
+    [[nodiscard]] bool is_readable() const {
+        return is_completed() && is_available();
+    }
+
     [[nodiscard]] bool is_processing() const {
         return status_ == ReplicaStatus::PROCESSING;
     }
@@ -520,6 +529,23 @@ class Replica {
         if (is_nof_replica()) {
             const auto& nof_data = std::get<NoFReplicaData>(data_);
             return !nof_data.buffer->isAllocatorValid();
+        }
+        return false;
+    }
+
+    // Whether the allocator behind this replica is gone, which is what makes
+    // the replica unusable rather than merely unreadable right now. It is the
+    // half of isAllocatorValid() that a segment's availability does not touch:
+    // a segment that is unavailable for the moment keeps its allocator, and the
+    // object holding the replica is still a real object.
+    [[nodiscard]] bool has_dead_handle() const {
+        if (is_memory_replica()) {
+            const auto& mem_data = std::get<MemoryReplicaData>(data_);
+            return !mem_data.buffer->hasAllocator();
+        }
+        if (is_nof_replica()) {
+            const auto& nof_data = std::get<NoFReplicaData>(data_);
+            return !nof_data.buffer->hasAllocator();
         }
         return false;
     }

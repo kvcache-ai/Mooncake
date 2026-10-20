@@ -52,11 +52,39 @@ YLT_REFL(ReplicaActionLease, proposal_id, lease_id, action, tenant_id, key,
          expire_at_ms_epoch, task_id);
 
 /**
+ * @brief Bits a master reports in PingResponse::supported_features.
+ *
+ * Bit 0 is part support: the master accepts the part arguments on the write
+ * calls and answers a read with the object's part count. A client that wants to
+ * write or read by part must see it before it sends one, because a master that
+ * predates parts ignores the extra arguments instead of refusing them.
+ */
+inline constexpr uint64_t kPartSupportFeature = 1ULL << 0;
+
+/**
+ * @brief How many parts one object may have.
+ *
+ * An object's part count is fixed by its first write and sized once, so the
+ * value a request carries has to be bounded. A real payload is the product of
+ * the tensor-parallel and pipeline-parallel degrees and the tensors each rank
+ * writes (tp=8, pp=16, K and V is 256), and KV replicated under MLA or GQA is
+ * written as one part, so this leaves headroom over the layouts in use while
+ * keeping one object's slots to a bounded amount of memory.
+ */
+inline constexpr uint32_t kMaxPartsPerObject = 1024;
+
+/**
  * @brief Response structure for Ping operation
  */
 struct PingResponse {
     ViewVersionId view_version_id;
     ClientStatus client_status;
+    // What this master understands beyond the base protocol. Bit 0 means a
+    // call may name a part: it accepts the part arguments on the write calls
+    // and answers a read with the object's part count. A client that wants to
+    // write or read by part must see this bit before it sends one, because an
+    // older master silently ignores the extra arguments.
+    struct_pack::compatible<uint64_t, 1> supported_features;
 
     PingResponse() = default;
     PingResponse(ViewVersionId view_version, ClientStatus status)
@@ -69,7 +97,7 @@ struct PingResponse {
                   << ", client_status: " << response.client_status << " }";
     }
 };
-YLT_REFL(PingResponse, view_version_id, client_status);
+YLT_REFL(PingResponse, view_version_id, client_status, supported_features);
 
 /**
  * @brief Response structure for GetReplicaList operation
@@ -84,6 +112,11 @@ struct GetReplicaListResponse {
     // the exact scope the write path used. Empty when the master predates
     // this field.
     struct_pack::compatible<std::string, 1> resolved_tenant_id;
+    // How many parts the key holds. A reader that named a part needs this to
+    // know it holds a piece of a larger object; a reader that named none and
+    // gets more than one back must refuse the answer. Absent means the master
+    // predates parts, so the key has one.
+    struct_pack::compatible<uint32_t, 2> part_count;
 
     GetReplicaListResponse() : lease_ttl_ms(0) {}
     GetReplicaListResponse(
@@ -95,7 +128,7 @@ struct GetReplicaListResponse {
           object_checksum(object_checksum_param) {}
 };
 YLT_REFL(GetReplicaListResponse, replicas, lease_ttl_ms, object_checksum,
-         resolved_tenant_id);
+         resolved_tenant_id, part_count);
 
 struct CachedQueryResultResponse {
     bool success;

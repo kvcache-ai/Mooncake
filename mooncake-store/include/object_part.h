@@ -69,10 +69,6 @@ class ObjectPart {
         return popped_replicas;
     }
 
-    [[nodiscard]] std::vector<Replica> PopReplicas() {
-        return std::move(replicas_);
-    }
-
    private:
     const size_t length_;
     std::optional<uint64_t> checksum_;

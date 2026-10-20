@@ -101,6 +101,13 @@ class AllocatedBuffer {
         return !allocator_.expired() && segment_lifetime_.isAvailable();
     }
 
+    // Whether the allocator behind this buffer is still alive, without the
+    // segment availability the rest of isAllocatorValid() asks about. Reading
+    // the expiry of the weak pointer is a load; getAllocator() takes a
+    // reference count, and this is asked once per replica on the read and write
+    // paths, which an object of many parts walks in full.
+    [[nodiscard]] bool hasAllocator() const { return !allocator_.expired(); }
+
     [[nodiscard]] std::shared_ptr<BufferAllocatorBase> getAllocator() const {
         return allocator_.lock();
     }

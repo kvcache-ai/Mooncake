@@ -660,6 +660,39 @@ TEST(KvEventPublisherTest, EmptyMediumProducesNoEvent) {
     EXPECT_TRUE(ExpectNoMessage(subscriber.sub));
 }
 
+// A stored event says how many parts the object's content is split into, so a
+// reader of a parted object learns the part index space from the event instead
+// of from a read. An object of one part says one.
+TEST(KvEventPublisherTest, StoredEventCarriesPartCount) {
+    const std::string endpoint = MakeIpcEndpoint();
+    KvEventPublisher publisher(MakeEnabledConfig(endpoint));
+    ScopedSubscriber subscriber;
+    ASSERT_TRUE(subscriber.Connect(endpoint));
+
+    publisher.PublishCommitted("parted", {"cpu"}, "default", "", "", 8);
+    publisher.PublishStored("single", "cpu");
+
+    size_t seen = 0;
+    while (seen < 2) {
+        msgpack::object_handle payload;
+        ASSERT_TRUE(ReceivePayload(subscriber.sub, &payload));
+        for (uint32_t i = 0; i < EventCount(payload); ++i) {
+            const auto& event = EventAt(payload, i);
+            const auto* parts = FindMapValue(event, "part_count");
+            ASSERT_NE(parts, nullptr);
+            ASSERT_EQ(parts->type, msgpack::type::POSITIVE_INTEGER);
+            const auto key = MsgpackString(*FindMapValue(event, "object_key"));
+            if (key == "parted") {
+                EXPECT_EQ(parts->via.u64, 8u);
+            } else {
+                EXPECT_EQ(key, "single");
+                EXPECT_EQ(parts->via.u64, 1u);
+            }
+            ++seen;
+        }
+    }
+}
+
 #endif  // MOONCAKE_ENABLE_KV_EVENTS
 
 }  // namespace

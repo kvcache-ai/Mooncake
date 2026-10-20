@@ -674,9 +674,16 @@ size_t DynamicReplicationController::RecordReplicaRemoval(
 
 uint64_t DynamicReplicationController::VersionEpoch(
     const ObjectMetadata& metadata) {
+    // A proposal names the write it was admitted against, so a newer write
+    // makes it stale. Only an object of one part reaches this: dynamic
+    // replication skips an object of several parts.
+    const auto* attempt = metadata.GetAttempt(0);
+    if (attempt == nullptr) {
+        return 0;
+    }
     return static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(
-            metadata.put_start_time.time_since_epoch())
+            attempt->started.time_since_epoch())
             .count());
 }
 

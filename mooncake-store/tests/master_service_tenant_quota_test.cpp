@@ -1402,4 +1402,45 @@ TEST_F(MasterServiceTenantQuotaTest,
         << "a tenant under its own watermark must not pay for a noisy one";
 }
 
+// An object written part by part is charged for every replica of every part:
+// one part of 1 MiB and one of 2 MiB, each on two replicas, is 6 MiB. The whole
+// amount comes back when the object goes, so the parts do not leave anything
+// charged behind.
+TEST_F(MasterServiceTenantQuotaTest,
+       PartedObjectChargesEveryReplicaOfEveryPart) {
+    constexpr uint64_t kMiB = 1024 * 1024;
+    const TenantId tenant_id("tenant-a");
+    MasterService service(MakeConfig({{tenant_id, 32 * kMiB}}));
+    // Two replicas of every part need two segments to live on.
+    const UUID client_id = MountSegment(service, /*size=*/32 * kMiB);
+    (void)MountSegment(service, /*size=*/32 * kMiB, "quota_segment_two");
+
+    ReplicateConfig config;
+    config.replica_num = 2;
+
+    const std::string key = "parted_quota_key";
+    const std::vector<uint64_t> lengths{1 * kMiB, 2 * kMiB};
+    const auto part_count = static_cast<uint32_t>(lengths.size());
+    for (uint32_t part = 0; part < part_count; ++part) {
+        auto started = service.PutStart(
+            client_id, key, tenant_id, lengths[part], config, part, part_count);
+        ASSERT_TRUE(started.has_value()) << toString(started.error());
+        ASSERT_EQ(started->size(), 2u);
+        std::vector<ReplicaID> ids;
+        ids.reserve(started->size());
+        for (const auto& descriptor : *started) {
+            ids.push_back(descriptor.id);
+        }
+        ASSERT_TRUE(service
+                        .PutEnd(client_id, ObjectMeta{key, std::nullopt},
+                                tenant_id, ReplicaType::MEMORY, part, ids)
+                        .has_value());
+    }
+
+    EXPECT_EQ(Snapshot(service, tenant_id).charged_bytes, 6 * kMiB);
+
+    ASSERT_TRUE(service.Remove(key, tenant_id, /*force=*/true).has_value());
+    EXPECT_EQ(Snapshot(service, tenant_id).charged_bytes, 0u);
+}
+
 }  // namespace mooncake::test
