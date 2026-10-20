@@ -31,17 +31,13 @@ class FailingPosixFsAdapter : public PosixFsAdapter {
    public:
     int WriteCalls() const { return write_calls_.load(); }
     void FailWriteCall(int call) { fail_write_call_.store(call); }
+    void ClearWriteFailure() { fail_write_call_.store(-1); }
 
     tl::expected<size_t, ErrorCode> WriteAt(int fd, const iovec* iov,
                                             int iovcnt,
                                             int64_t offset) override {
         const int call = ++write_calls_;
         const int fail = fail_write_call_.load();
-        // Model a genuine, non-recoverable write failure: once the armed call
-        // is reached, keep failing. The backend retries POSIX write failures
-        // once after an fd reopen (SupportsFdReopen), so a single-call failure
-        // would be masked by the retry; a persistent failure correctly
-        // surfaces to the caller.
         if (fail > 0 && call >= fail) {
             return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
         }
@@ -623,6 +619,7 @@ TEST_F(DfsSyncClientTest, DfsOnlyBatchFailureOnlyRevokesFailedKey) {
     adapter_->FailWriteCall(adapter_->WriteCalls() + 2);
 
     auto results = writer_->BatchPut(keys, slices, DfsOnlyConfig());
+    adapter_->ClearWriteFailure();
     ASSERT_EQ(results.size(), keys.size());
     EXPECT_TRUE(results[0].has_value());
     ASSERT_FALSE(results[1].has_value());
