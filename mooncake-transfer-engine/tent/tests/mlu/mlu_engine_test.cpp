@@ -176,6 +176,21 @@ class TransferEngineImplTestPeer {
     static void disableMlu(tent::TransferEngineImpl& engine) {
         engine.swapTransportForTest(tent::MLU, nullptr);
     }
+    static void removeMluStageCapability(tent::TransferEngineImpl& engine) {
+        auto local = engine.metadata_->segmentManager().getLocal();
+        const auto* capability =
+            local->getMemory().getTransportAttrs(tent::MLU);
+        ASSERT_NE(capability, nullptr);
+        EXPECT_EQ(*capability, "pinned_stage_v1");
+        ASSERT_TRUE(engine.metadata_->segmentManager()
+                        .updateLocal([](tent::SegmentDesc& desc) {
+                            std::get<tent::MemorySegmentDesc>(desc.detail)
+                                .transport_attrs.erase(tent::MLU);
+                            return tent::Status::OK();
+                        })
+                        .ok());
+        ASSERT_TRUE(engine.metadata_->segmentManager().synchronizeLocal().ok());
+    }
     static std::shared_ptr<MluFaultTransport> wrap(
         tent::TransferEngineImpl& engine, tent::TransportType type) {
         auto wrapped =
@@ -458,6 +473,51 @@ TEST_P(MluEngineTest, StagesOneDeviceSideReadAndWrite) {
     ASSERT_NO_FATAL_FAILURE(transfer("cpu:0", "mlu:0", Request::READ, true));
     ASSERT_NO_FATAL_FAILURE(transfer("mlu:0", "cpu:0", Request::WRITE));
     ASSERT_NO_FATAL_FAILURE(transfer("mlu:0", "cpu:0", Request::READ));
+}
+
+TEST_P(MluEngineTest, OlderPeerUsesLegacyStageAllocationRequest) {
+    ASSERT_NO_FATAL_FAILURE(
+        TransferEngineImplTestPeer::removeMluStageCapability(*b_));
+    void *local = nullptr, *peer = nullptr;
+    ASSERT_NO_FATAL_FAILURE(allocate(*a_, "cpu:0", &local));
+    ASSERT_NO_FATAL_FAILURE(allocate(*b_, "mlu:0", &peer));
+    Request request{};
+    request.opcode = Request::WRITE;
+    request.source = local;
+    request.target_offset = reinterpret_cast<uint64_t>(peer);
+    request.length = kLength;
+    ASSERT_TRUE(a_->openSegment(request.target_id, b_->getSegmentName()).ok());
+    const auto route = TransferEngineImplTestPeer::route(*a_, request);
+    ASSERT_EQ(route.staging_params.size(), 5u);
+    EXPECT_TRUE(route.staging_params[4].empty());
+    for (auto op : {Request::WRITE, Request::READ}) {
+        ASSERT_NO_FATAL_FAILURE(transfer("cpu:0", "mlu:0", op));
+        ASSERT_NO_FATAL_FAILURE(transfer("mlu:0", "mlu:0", op));
+    }
+}
+
+TEST(MluStageRpcTest, DefaultAllocatorSendsLocationStringToLegacyServer) {
+    CoroRpcAgent server;
+    std::atomic<bool> received_location{false};
+    ASSERT_TRUE(
+        server
+            .registerFunction(
+                Pin,
+                [&](const std::string_view& request, std::string& response) {
+                    const auto location =
+                        nlohmann::json::parse(request).get<std::string>();
+                    received_location.store(location == "cpu:0");
+                    response = "4096";
+                })
+            .ok());
+    uint16_t port = 0;
+    ASSERT_TRUE(server.start(port).ok());
+    uint64_t addr = 0;
+    ASSERT_TRUE(ControlClient::pinStageBuffer(
+                    "127.0.0.1:" + std::to_string(port), "cpu:0", addr)
+                    .ok());
+    EXPECT_TRUE(received_location.load());
+    EXPECT_EQ(addr, 4096u);
 }
 
 TEST_P(MluEngineTest,

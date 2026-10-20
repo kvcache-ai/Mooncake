@@ -2151,7 +2151,12 @@ void TransferEngineImpl::findStagingPolicy(const Request& request,
         policy.push_back(remote_stage);
         if (local_mtype == MTYPE_MLU || remote_mtype == MTYPE_MLU) {
             policy.push_back(local_mtype == MTYPE_MLU ? "mlu" : "");
-            policy.push_back(remote_mtype == MTYPE_MLU ? "mlu" : "");
+            // Older peers accept only the location string in Pin requests.
+            const auto* peer_mlu = desc->getMemory().getTransportAttrs(MLU);
+            policy.push_back(remote_mtype == MTYPE_MLU && peer_mlu &&
+                                     *peer_mlu == "pinned_stage_v1"
+                                 ? "mlu"
+                                 : "");
         }
     }
 }

@@ -119,6 +119,14 @@ Status MluTransport::install(std::string & /*local_segment_name*/,
         return Status::InvalidArgument(
             "MLU transport requires the MluPlatform to be active" LOC_MARK);
     }
+    if (metadata) {
+        CHECK_STATUS(
+            metadata->segmentManager().updateLocal([](SegmentDesc &desc) {
+                std::get<MemorySegmentDesc>(desc.detail).transport_attrs[MLU] =
+                    "pinned_stage_v1";
+                return Status::OK();
+            }));
+    }
     metadata_ = std::move(metadata);
     installed_ = true;
     caps.gpu_to_dram = true;
@@ -129,6 +137,14 @@ Status MluTransport::install(std::string & /*local_segment_name*/,
 Status MluTransport::uninstall() {
     std::lock_guard<std::mutex> lock(mutex_);
     CHECK_STATUS(quiesceLocked());
+    if (metadata_) {
+        CHECK_STATUS(
+            metadata_->segmentManager().updateLocal([](SegmentDesc &desc) {
+                std::get<MemorySegmentDesc>(desc.detail)
+                    .transport_attrs.erase(MLU);
+                return Status::OK();
+            }));
+    }
     queues_.clear();
     metadata_.reset();
     platform_ = nullptr;
