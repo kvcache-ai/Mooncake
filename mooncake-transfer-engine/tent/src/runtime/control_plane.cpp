@@ -251,10 +251,9 @@ void ControlClient::delegateAsync(const std::string& server_addr,
 
 Status ControlClient::pinStageBuffer(const std::string& server_addr,
                                      const std::string& location,
-                                     uint64_t& addr, TransportType type) {
+                                     uint64_t& addr) {
     std::string request_raw, response_raw;
     json j = location;
-    if (type != UNSPEC) j = json{{"location", location}, {"transport", type}};
     request_raw = j.dump();
     CHECK_STATUS(
         tl_rpc_agent.call(server_addr, Pin, request_raw, response_raw));
@@ -666,15 +665,8 @@ void ControlService::onDelegate(const std::string_view& request,
 
 void ControlService::onPinStageBuffer(const std::string_view& request,
                                       std::string& response) {
-    auto params = json::parse(request);
-    // Older clients send only the location string.
-    auto location = params.is_string()
-                        ? params.get<std::string>()
-                        : params.at("location").get<std::string>();
-    auto type = params.is_string()
-                    ? UNSPEC
-                    : c_to_transport_hint(params.value("transport", 0));
-    uint64_t addr = impl_->lockStageBuffer(location, type);
+    std::string location = json::parse(request).get<std::string>();
+    uint64_t addr = impl_->lockStageBuffer(location);
     json j = addr;
     response = j.dump();
 }

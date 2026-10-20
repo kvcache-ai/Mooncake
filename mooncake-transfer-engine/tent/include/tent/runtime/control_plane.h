@@ -186,8 +186,7 @@ class ControlClient {
                               DelegateCallback callback);
 
     static Status pinStageBuffer(const std::string& server_addr,
-                                 const std::string& location, uint64_t& addr,
-                                 TransportType type = UNSPEC);
+                                 const std::string& location, uint64_t& addr);
 
     static Status unpinStageBuffer(const std::string& server_addr,
                                    uint64_t addr);

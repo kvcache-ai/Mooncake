@@ -2149,15 +2149,6 @@ void TransferEngineImpl::findStagingPolicy(const Request& request,
         policy.push_back(server_addr);
         policy.push_back(local_stage);
         policy.push_back(remote_stage);
-        if (local_mtype == MTYPE_MLU || remote_mtype == MTYPE_MLU) {
-            policy.push_back(local_mtype == MTYPE_MLU ? "mlu" : "");
-            // Older peers accept only the location string in Pin requests.
-            const auto* peer_mlu = desc->getMemory().getTransportAttrs(MLU);
-            policy.push_back(remote_mtype == MTYPE_MLU && peer_mlu &&
-                                     *peer_mlu == "pinned_stage_v1"
-                                 ? "mlu"
-                                 : "");
-        }
     }
 }
 
@@ -3742,10 +3733,9 @@ Status TransferEngineImpl::transferSync(
     return batch_guard.reset();
 }
 
-uint64_t TransferEngineImpl::lockStageBuffer(const std::string& location,
-                                             TransportType type) {
+uint64_t TransferEngineImpl::lockStageBuffer(const std::string& location) {
     uint64_t addr = 0;
-    auto status = staging_proxy_->pinStageBuffer(location, addr, type);
+    auto status = staging_proxy_->pinStageBuffer(location, addr);
     if (!status.ok()) LOG(ERROR) << status.ToString();
     return addr;
 }

@@ -137,11 +137,14 @@ class MluFaultTransport : public tent::Transport {
     }
     tent::Status allocateLocalMemory(void** ptr, size_t size,
                                      tent::MemoryOptions& options) override {
-        return delegate_->allocateLocalMemory(ptr, size, options);
+        CHECK_STATUS(delegate_->allocateLocalMemory(ptr, size, options));
+        ++memory_allocations;
+        return Status::OK();
     }
     tent::Status freeLocalMemory(void* ptr, size_t size) override {
         return delegate_->freeLocalMemory(ptr, size);
     }
+    std::atomic<int> memory_allocations{0};
     std::atomic<int> copy_failures{0}, network_failures{0};  // -1: persistent
     std::atomic<int> network_passes_before_failure{0};
     std::atomic<int> injected_failures{0}, live_batches{0};
@@ -175,21 +178,6 @@ class TransferEngineImplTestPeer {
     }
     static void disableMlu(tent::TransferEngineImpl& engine) {
         engine.swapTransportForTest(tent::MLU, nullptr);
-    }
-    static void removeMluStageCapability(tent::TransferEngineImpl& engine) {
-        auto local = engine.metadata_->segmentManager().getLocal();
-        const auto* capability =
-            local->getMemory().getTransportAttrs(tent::MLU);
-        ASSERT_NE(capability, nullptr);
-        EXPECT_EQ(*capability, "pinned_stage_v1");
-        ASSERT_TRUE(engine.metadata_->segmentManager()
-                        .updateLocal([](tent::SegmentDesc& desc) {
-                            std::get<tent::MemorySegmentDesc>(desc.detail)
-                                .transport_attrs.erase(tent::MLU);
-                            return tent::Status::OK();
-                        })
-                        .ok());
-        ASSERT_TRUE(engine.metadata_->segmentManager().synchronizeLocal().ok());
     }
     static std::shared_ptr<MluFaultTransport> wrap(
         tent::TransferEngineImpl& engine, tent::TransportType type) {
@@ -351,7 +339,7 @@ class MluEngineTest : public ::testing::TestWithParam<Params> {
         const auto network = std::get<0>(GetParam()) ? HP_TCP : TCP;
         auto route = TransferEngineImplTestPeer::route(*a_, request);
         ASSERT_EQ(route.transport, network);
-        ASSERT_EQ(route.staging_params.size(), 5u);
+        ASSERT_EQ(route.staging_params.size(), 3u);
         EXPECT_EQ(route.staging_params[1].empty(),
                   std::string_view(local_location) == "cpu:0");
         EXPECT_EQ(route.staging_params[2].empty(),
@@ -383,7 +371,7 @@ class MluEngineTest : public ::testing::TestWithParam<Params> {
                     engine->getLocalTopology()->findNearMem("mlu:0");
                 std::vector<uint64_t> pins;
                 for (int i = 0; i < 5; ++i) {
-                    auto pin = engine->lockStageBuffer(location, MLU);
+                    auto pin = engine->lockStageBuffer(location);
                     if (pin) pins.push_back(pin);
                 }
                 EXPECT_EQ(std::set<uint64_t>(pins.begin(), pins.end()).size(),
@@ -450,9 +438,11 @@ TEST_P(MluEngineTest, StagesDeviceToDeviceReadAndWrite) {
 
 TEST_P(MluEngineTest, MluStagingHonorsRequestedNumaLocation) {
     const auto location = a_->getLocalTopology()->findNearMem("mlu:0");
-    const auto pin = a_->lockStageBuffer(location, MLU);
+    const auto pin = a_->lockStageBuffer(location);
     ASSERT_NE(pin, 0u);
     held_pins_.push_back({a_.get(), pin});
+    EXPECT_EQ(local_copy_->memory_allocations.load(), 1);
+    EXPECT_EQ(local_network_->memory_allocations.load(), 0);
     cnrtPointerAttributes_t attributes{};
     ASSERT_EQ(
         cnrtPointerGetAttributes(&attributes, reinterpret_cast<void*>(pin)),
@@ -475,9 +465,7 @@ TEST_P(MluEngineTest, StagesOneDeviceSideReadAndWrite) {
     ASSERT_NO_FATAL_FAILURE(transfer("mlu:0", "cpu:0", Request::READ));
 }
 
-TEST_P(MluEngineTest, OlderPeerUsesLegacyStageAllocationRequest) {
-    ASSERT_NO_FATAL_FAILURE(
-        TransferEngineImplTestPeer::removeMluStageCapability(*b_));
+TEST_P(MluEngineTest, RemotePinSelectsPeerAllocatorAndSharesLocalPool) {
     void *local = nullptr, *peer = nullptr;
     ASSERT_NO_FATAL_FAILURE(allocate(*a_, "cpu:0", &local));
     ASSERT_NO_FATAL_FAILURE(allocate(*b_, "mlu:0", &peer));
@@ -488,15 +476,65 @@ TEST_P(MluEngineTest, OlderPeerUsesLegacyStageAllocationRequest) {
     request.length = kLength;
     ASSERT_TRUE(a_->openSegment(request.target_id, b_->getSegmentName()).ok());
     const auto route = TransferEngineImplTestPeer::route(*a_, request);
-    ASSERT_EQ(route.staging_params.size(), 5u);
-    EXPECT_TRUE(route.staging_params[4].empty());
-    for (auto op : {Request::WRITE, Request::READ}) {
-        ASSERT_NO_FATAL_FAILURE(transfer("cpu:0", "mlu:0", op));
-        ASSERT_NO_FATAL_FAILURE(transfer("mlu:0", "mlu:0", op));
-    }
+    ASSERT_EQ(route.staging_params.size(), 3u);
+    ASSERT_TRUE(route.staging_params[1].empty());
+    const auto& server = route.staging_params[0];
+    const auto& location = route.staging_params[2];
+    ASSERT_FALSE(location.empty());
+    const int peer_allocations = peer_copy_->memory_allocations;
+    const int network_allocations = peer_network_->memory_allocations;
+    uint64_t remote_pin = 0;
+    Status status;
+    std::thread caller([&] {
+        status = ControlClient::pinStageBuffer(server, location, remote_pin);
+    });
+    caller.join();
+    ASSERT_TRUE(status.ok()) << status.ToString();
+    ASSERT_NE(remote_pin, 0u);
+    held_pins_.push_back({b_.get(), remote_pin});
+    EXPECT_EQ(peer_copy_->memory_allocations.load(), peer_allocations + 1);
+    EXPECT_EQ(peer_network_->memory_allocations.load(), network_allocations);
+    EXPECT_EQ(local_copy_->memory_allocations.load(), 0);
+
+    const auto local_pin = b_->lockStageBuffer(location);
+    ASSERT_NE(local_pin, 0u);
+    held_pins_.push_back({b_.get(), local_pin});
+    EXPECT_NE(local_pin, remote_pin);
+    EXPECT_EQ(peer_copy_->memory_allocations.load(), peer_allocations + 1);
+    ASSERT_TRUE(b_->unlockStageBuffer(local_pin).ok());
+    held_pins_.pop_back();
+    std::thread release(
+        [&] { status = ControlClient::unpinStageBuffer(server, remote_pin); });
+    release.join();
+    ASSERT_TRUE(status.ok()) << status.ToString();
+    held_pins_.pop_back();
+    checkIdleResources();
 }
 
-TEST(MluStageRpcTest, DefaultAllocatorSendsLocationStringToLegacyServer) {
+TEST_P(MluEngineTest, OrdinaryCpuAllocationsKeepNetworkAllocator) {
+    for (bool internal : {false, true}) {
+        void* host = nullptr;
+        ASSERT_TRUE(
+            a_->allocateLocalMemory(&host, 4096, "cpu:0", internal).ok());
+        allocations_.push_back({a_.get(), host});
+        cnrtPointerAttributes_t attributes{};
+        ASSERT_EQ(cnrtPointerGetAttributes(&attributes, host), cnrtSuccess);
+        EXPECT_EQ(attributes.type, cnrtMemTypeUnregistered);
+    }
+    EXPECT_EQ(local_copy_->memory_allocations.load(), 0);
+    EXPECT_EQ(local_network_->memory_allocations.load(), 2);
+}
+
+TEST_P(MluEngineTest, StageAllocationWithoutMluUsesNetworkAllocator) {
+    TransferEngineImplTestPeer::disableMlu(*a_);
+    const auto pin = a_->lockStageBuffer("cpu:0");
+    ASSERT_NE(pin, 0u);
+    held_pins_.push_back({a_.get(), pin});
+    EXPECT_EQ(local_copy_->memory_allocations.load(), 0);
+    EXPECT_EQ(local_network_->memory_allocations.load(), 1);
+}
+
+TEST(MluStageRpcTest, SendsLocationStringToLegacyServer) {
     std::atomic<bool> received_location{false};
     CoroRpcAgent server;
     ASSERT_TRUE(
@@ -637,7 +675,7 @@ TEST_P(MluEngineTest, PoolPressureRejectsThenCallerRetrySucceeds) {
             ASSERT_TRUE(
                 a_->openSegment(request.target_id, b_->getSegmentName()).ok());
             auto location = engine->getLocalTopology()->findNearMem("mlu:0");
-            auto pin = engine->lockStageBuffer(location, MLU);
+            auto pin = engine->lockStageBuffer(location);
             ASSERT_NE(pin, 0u);
             held_pins_.push_back({engine, pin});
             // Admission needs four slots before dispatching any payload.

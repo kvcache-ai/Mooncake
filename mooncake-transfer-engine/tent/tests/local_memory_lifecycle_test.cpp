@@ -25,6 +25,7 @@
 #include "tent/common/config.h"
 #include "tent/runtime/transfer_engine_impl.h"
 #include "tent/runtime/transport.h"
+#include "tent/runtime/proxy_manager.h"
 
 namespace mooncake {
 namespace tent {
@@ -95,7 +96,7 @@ std::shared_ptr<Config> makeConfig() {
     config->set("log_level", "warning");
 
     for (const char* transport : {"tcp", "shm", "rdma", "io_uring", "nvlink",
-                                  "mnnvl", "gds", "ascend_direct"}) {
+                                  "mnnvl", "gds", "ascend_direct", "mlu"}) {
         config->set(std::string("transports/") + transport + "/enable", false);
     }
     return config;
@@ -310,6 +311,34 @@ TEST(LocalMemoryLifecycle, InternalHostAllocationDoesNotImplicitlySelectMlu) {
     ASSERT_TRUE(engine.allocateLocalMemory(&address, 4096, options).ok());
     EXPECT_EQ(mlu->allocate_calls, 1);
     EXPECT_TRUE(engine.freeLocalMemory(address).ok());
+}
+
+TEST(LocalMemoryLifecycle, StagePoolSelectsAllocatorFromLocalTransports) {
+    for (bool with_mlu : {false, true}) {
+        SCOPED_TRACE(with_mlu);
+        TransferEngineImpl engine(makeConfig());
+        ASSERT_TRUE(engine.available());
+        auto tcp = std::make_shared<FailOnceRemoveTransport>(TCP);
+        auto mlu = std::make_shared<FailOnceRemoveTransport>(MLU);
+        engine.swapTransportForTest(TCP, tcp);
+        if (with_mlu) engine.swapTransportForTest(MLU, mlu);
+        {
+            ProxyManager proxy(&engine, 4096, 2);
+            uint64_t first = 0, second = 0;
+            ASSERT_TRUE(proxy.pinStageBuffer("cpu:0", first).ok());
+            ASSERT_TRUE(proxy.pinStageBuffer("cpu:0", second).ok());
+            EXPECT_NE(first, second);
+            EXPECT_EQ(tcp->allocate_calls, with_mlu ? 0 : 1);
+            EXPECT_EQ(mlu->allocate_calls, with_mlu ? 1 : 0);
+            EXPECT_TRUE(proxy.unpinStageBuffer(first).ok());
+            EXPECT_TRUE(proxy.unpinStageBuffer(second).ok());
+        }
+        SegmentInfo info;
+        ASSERT_TRUE(engine.getSegmentInfo(LOCAL_SEGMENT_ID, info).ok());
+        EXPECT_TRUE(info.buffers.empty());
+        EXPECT_EQ(tcp->remove_calls, 1);
+        EXPECT_EQ(mlu->remove_calls, with_mlu ? 1 : 0);
+    }
 }
 
 }  // namespace
