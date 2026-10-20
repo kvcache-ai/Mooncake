@@ -266,6 +266,7 @@ struct SpdkControllerEnvironmentVariables {
     MC_DEFINE_ENV_VAR(uint64_t, MC_NVME_FABRICS_CONNECT_TIMEOUT_US);
     MC_DEFINE_ENV_VAR(bool, MC_NVME_HEADER_DIGEST);
     MC_DEFINE_ENV_VAR(bool, MC_NVME_DATA_DIGEST);
+    MC_DEFINE_ENV_VAR(uint32_t, MC_NVME_KEEP_ALIVE_TIMEOUT_MS);
 };
 
 struct NvmeKvConnectorEnvironmentVariables {

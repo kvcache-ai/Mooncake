@@ -13,6 +13,7 @@ The E2E test suite includes several executable programs designed to test differe
 - **chaos_rand_test**: Long-term randomized chaos testing with configurable parameters.
 - **store_client_e2e.py**: Python `MooncakeDistributedStore` client that continuously issues `put/get` operations.
 - **run_nof_heartbeat_tcp_e2e.sh**: Scripted NoF heartbeat end-to-end test using a TCP SPDK target.
+- **run_nof_controller_recovery_tcp_e2e.sh**: Verifies controller reset and I/O qpair reconnection across two workers after a TCP target restart.
 
 ## Parameters
 
@@ -122,6 +123,58 @@ PRE_FAULT_SUCCESS_TARGET=10 BUILD_DIR=/path/to/build ./run_nof_heartbeat_tcp_e2e
 - In default mode, the script verifies **service continuity** after NoF unmount by checking that post-fault I/O still succeeds.
 - In `CLIENT_GLOBAL_SEGMENT_SIZE=0` mode, the script verifies **NoF-only failure behavior** by checking that post-fault I/O starts failing after the NoF segment is removed.
 - Logs are written under `LOG_DIR` (default `/tmp/mooncake_nof_heartbeat_e2e`) and the final pass/fail summary is printed from `summary.log`.
+
+### run_nof_controller_recovery_tcp_e2e.sh
+
+Runs one Store NoF worker pool with two workers and two namespaces on the same
+controller. After verifying initial writes and reads, the runner pauses the
+target, waits until both workers have pending I/O, kills the target and checks
+that the requests fail within a timeout. It then recreates the target at the same
+endpoint. The original pool and segment handles must recover and successfully
+write/read a new pattern in both namespaces. Malloc bdev contents are not
+expected to survive the target restart.
+
+Build with `USE_NOF=ON` and `BUILD_UNIT_TESTS=ON`, using the normal SPDK build
+dependencies. Configure sufficient hugepages and access permissions for both the
+client and target before running:
+
+```bash
+cmake --build build --target nof_controller_recovery_e2e nof_worker_pool_config_test
+BUILD_DIR="$PWD/build" SPDK_DIR="$PWD/extern/spdk" \
+  ./mooncake-store/tests/e2e/run_nof_controller_recovery_tcp_e2e.sh
+```
+
+The script follows the other e2e runners' `BUILD_DIR`/`LOG_DIR` conventions. It
+requires Linux, Python 3, GNU `timeout`, and a built SPDK `nvmf_tgt` plus `rpc.py`.
+`LOG_DIR` must be empty; by default a new directory is created under `/tmp`.
+`TARGET_PORT`, `TARGET_CORE_MASK` and `TIMEOUT_SEC` can be overridden. Only the
+target and client started by this script are stopped on exit.
+
+The client uses the production SPDK initialization path. The target uses malloc
+bdevs backed by hugepages, with PCI disabled and hugepage backing files unlinked
+at initialization so they do not survive a forced stop. The script does not
+configure the host's hugepage pool or mount hugetlbfs. This is a manually invoked
+integration test, not an automatic CTest target.
+
+The target lifecycle is shared through `nof_target.sh`. Runners source this
+file and provide `SPDK_DIR`, `RPC_SOCKET`, `TARGET_NQN`, `TARGET_HOST` and
+`TARGET_PORT`; `TARGET_CORE_MASK`, `TARGET_MEM_MB` and `TIMEOUT_SEC` are optional.
+For example, a runner can configure two different namespaces as follows:
+
+```bash
+source "$SCRIPT_DIR/nof_target.sh"
+nof_target_start "$LOG_DIR/target-1.log"
+nof_target_add_malloc_ns 1 32 512   # NSID, capacity in MiB, block size in bytes
+nof_target_add_malloc_ns 2 32 4096
+nof_target_start_listener
+```
+
+Call `nof_target_add_malloc_ns` once per namespace. IDs are explicit so restarting
+the target can recreate the same layout. The helper retains `TARGET_PID` for
+fault injection; `nof_target_stop` kills and reaps that target and removes its
+RPC socket. Each runner owns its EXIT trap and calls this cleanup function,
+including when startup fails. The helper does not configure hugepages or manage
+client processes.
 
 ### store_client_e2e.py
 
