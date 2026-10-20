@@ -3632,10 +3632,12 @@ void TransferEngineImpl::noteBatchPollRequirement(Batch* batch,
 bool TransferEngineImpl::trySkipInFlightOwnerWalk(
     Batch* batch, TransferStatus& overall_status) {
     if (!batch->counter_eligible || batch->queue_token != 0) return false;
-    // Notify hooks fire on the completion walk. NIXL posts with
-    // submitTransferWithNotify; skipping in-flight polls is required for
-    // CP-1. Multi-submit hooks on the same batch wait until every owner
-    // finishes, same as TE #4199 bytes aggregation.
+    // Notify hooks fire on the completion walk, not here. Unfired hooks
+    // are not a skip veto: NIXL posts with submitTransferWithNotify, and
+    // skipping in-flight polls is required for that path. Timing matches
+    // classic TE #4199: notify waits until the RDMA publisher is fully
+    // done (batch-complete), not until a single submit interval finishes.
+    // Interval-early notify is out of scope for this path.
 
     Transport::SubBatchRef publisher = nullptr;
     for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
@@ -3765,8 +3767,9 @@ Status TransferEngineImpl::getBatchStatus(BatchID batch_id,
         overall_status.s = worst_failure;
     }
     // else: some tasks still PENDING → overall_status.s stays PENDING
-    // A hook belongs to its own submit interval. Other intervals can still
-    // be pending or failed without withholding this interval's notification.
+    // In-flight skip returns before this walk, so RDMA-only batches use
+    // TE #4199 batch-complete notify timing. Hooks fire here once the
+    // publisher is done (or has_failure / a non-publisher forces the walk).
     CHECK_STATUS(maybeFireSubmitHooks(batch));
     return Status::OK();
 }
