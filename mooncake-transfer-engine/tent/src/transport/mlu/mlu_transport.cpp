@@ -106,7 +106,7 @@ MluTask::~MluTask() {
 MluTransport::~MluTransport() { logError(uninstall()); }
 
 Status MluTransport::install(std::string & /*local_segment_name*/,
-                             std::shared_ptr<ControlService> /*metadata*/,
+                             std::shared_ptr<ControlService> metadata,
                              std::shared_ptr<Topology> /*local_topology*/,
                              std::shared_ptr<Config> /*conf*/) {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -119,6 +119,7 @@ Status MluTransport::install(std::string & /*local_segment_name*/,
         return Status::InvalidArgument(
             "MLU transport requires the MluPlatform to be active" LOC_MARK);
     }
+    metadata_ = std::move(metadata);
     installed_ = true;
     caps.gpu_to_dram = true;
     caps.dram_to_gpu = true;
@@ -129,6 +130,7 @@ Status MluTransport::uninstall() {
     std::lock_guard<std::mutex> lock(mutex_);
     CHECK_STATUS(quiesceLocked());
     queues_.clear();
+    metadata_.reset();
     platform_ = nullptr;
     installed_ = false;
     return Status::OK();

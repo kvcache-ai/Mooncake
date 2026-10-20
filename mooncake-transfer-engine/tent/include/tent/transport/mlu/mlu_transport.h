@@ -106,6 +106,7 @@ class MluTransport : public Transport {
     std::unordered_set<MluSubBatch *> batches_;
     bool installed_ = false;
     MluPlatform *platform_ = nullptr;
+    std::shared_ptr<ControlService> metadata_;
 };
 
 }  // namespace tent
