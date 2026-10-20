@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include "transport/transport.h"
 #include "transport/ascend_transport/ascend_direct_transport/utils.h"
 
@@ -26,6 +27,23 @@ namespace mooncake {
 
 namespace {
 constexpr size_t kMemcpyBatchLimit = 4096U;
+constexpr size_t kMaxLocalCopyStreams = 32U;
+constexpr size_t kDefaultLocalCopyStreams = 1U;
+
+size_t ResolveNumLocalCopyStreams() {
+    const char *env = std::getenv("MC_LOCAL_COPY_STREAMS");
+    if (env == nullptr || *env == '\0') {
+        return kDefaultLocalCopyStreams;
+    }
+    char *end = nullptr;
+    const long parsed = std::strtol(env, &end, 10);
+    if (end == env || *end != '\0' || parsed < 1) {
+        LOG(WARNING) << "Invalid MC_LOCAL_COPY_STREAMS value: '" << env
+                     << "', using default " << kDefaultLocalCopyStreams;
+        return kDefaultLocalCopyStreams;
+    }
+    return static_cast<size_t>(std::min<long>(parsed, kMaxLocalCopyStreams));
+}
 }  // namespace
 
 namespace {
@@ -33,15 +51,22 @@ constexpr uint32_t kStreamFlags = ACL_STREAM_FAST_LAUNCH | ACL_STREAM_FAST_SYNC;
 }  // namespace
 
 LocalCopyEngine::LocalCopyEngine()
-    : transfer_timeout_(10000), initialized_(false) {}
+    : transfer_timeout_(10000),
+      num_streams_(kDefaultLocalCopyStreams),
+      initialized_(false) {}
 
 LocalCopyEngine::~LocalCopyEngine() { Finalize(); }
 
 int LocalCopyEngine::Initialize(int32_t transfer_timeout) {
     transfer_timeout_ = transfer_timeout;
-    // Do not create a stream here: initEngines() may still be under a
+    num_streams_ = ResolveNumLocalCopyStreams();
+    if (num_streams_ > 1) {
+        LOG(INFO) << "LocalCopyEngine striping local copies across "
+                  << num_streams_ << " streams per device (MC_LOCAL_COPY_STREAMS)";
+    }
+    // Do not create streams here: initEngines() may still run under a
     // different device context than the worker threads that later call Copy.
-    // Streams are created lazily in GetOrCreateStreamForCurrentDevice().
+    // Streams are created lazily in GetOrCreateStreamsForCurrentDevice().
     initialized_ = true;
     return 0;
 }
@@ -62,30 +87,32 @@ void LocalCopyEngine::Finalize() {
 
     for (auto &kv : streams_) {
         auto &info = kv.second;
-        if (info.stream == nullptr) {
-            continue;
+        for (aclrtStream stream : info.streams) {
+            if (stream == nullptr) {
+                continue;
+            }
+            aclError ret = ACL_ERROR_NONE;
+            if (info.context != nullptr) {
+                ret = aclrtSetCurrentContext(info.context);
+            } else {
+                ret = aclrtSetDevice(kv.first);
+            }
+            if (ret != ACL_ERROR_NONE) {
+                LOG(ERROR)
+                    << "Failed to switch to device " << kv.first
+                    << " context before destroying LocalCopyEngine stream, ret:"
+                    << ret << ", errmsg:" << aclGetRecentErrMsg();
+            }
+            (void)aclrtDestroyStream(stream);
         }
-        aclError ret = ACL_ERROR_NONE;
-        if (info.context != nullptr) {
-            ret = aclrtSetCurrentContext(info.context);
-        } else {
-            ret = aclrtSetDevice(kv.first);
-        }
-        if (ret != ACL_ERROR_NONE) {
-            LOG(ERROR)
-                << "Failed to switch to device " << kv.first
-                << " context before destroying LocalCopyEngine stream, ret:"
-                << ret << ", errmsg:" << aclGetRecentErrMsg();
-        }
-        (void)aclrtDestroyStream(info.stream);
-        info.stream = nullptr;
+        info.streams.clear();
         info.context = nullptr;
     }
     streams_.clear();
     initialized_ = false;
 }
 
-aclrtStream LocalCopyEngine::GetOrCreateStreamForCurrentDevice() {
+const std::vector<aclrtStream> *LocalCopyEngine::GetOrCreateStreamsForCurrentDevice() {
     int32_t device_id = 0;
     auto ret = aclrtGetDevice(&device_id);
     if (ret != ACL_ERROR_NONE) {
@@ -96,31 +123,43 @@ aclrtStream LocalCopyEngine::GetOrCreateStreamForCurrentDevice() {
 
     std::lock_guard<std::mutex> lock(streams_mu_);
     auto it = streams_.find(device_id);
-    if (it != streams_.end() && it->second.stream != nullptr) {
-        return it->second.stream;
+    if (it != streams_.end() && !it->second.streams.empty() &&
+        it->second.streams[0] != nullptr) {
+        return &it->second.streams;
     }
 
-    aclrtStream stream = nullptr;
-    ret = aclrtCreateStreamWithConfig(&stream, 0, kStreamFlags);
-    if (ret != ACL_ERROR_NONE) {
-        LOG(ERROR) << "aclrtCreateStreamWithConfig failed for device "
-                   << device_id << ", ret:" << ret
-                   << ", errmsg:" << aclGetRecentErrMsg();
-        return nullptr;
+    std::vector<aclrtStream> created;
+    created.reserve(num_streams_);
+    for (size_t i = 0; i < num_streams_; ++i) {
+        aclrtStream stream = nullptr;
+        ret = aclrtCreateStreamWithConfig(&stream, 0, kStreamFlags);
+        if (ret != ACL_ERROR_NONE) {
+            LOG(ERROR) << "aclrtCreateStreamWithConfig failed for device "
+                       << device_id << " stream " << i << ", ret:" << ret
+                       << ", errmsg:" << aclGetRecentErrMsg();
+            for (aclrtStream s : created) {
+                (void)aclrtDestroyStream(s);
+            }
+            return nullptr;
+        }
+        created.push_back(stream);
     }
 
     aclrtContext ctx = nullptr;
     ret = aclrtGetCurrentContext(&ctx);
     if (ret != ACL_ERROR_NONE || ctx == nullptr) {
-        LOG(ERROR) << "aclrtGetCurrentContext failed after creating stream for "
+        LOG(ERROR) << "aclrtGetCurrentContext failed after creating streams for "
                       "device "
                    << device_id << ", ret:" << ret
                    << ", errmsg:" << aclGetRecentErrMsg();
         ctx = nullptr;
     }
-    streams_[device_id] = DeviceStream{stream, ctx};
-    VLOG(1) << "Created LocalCopyEngine stream for device " << device_id;
-    return stream;
+    DeviceStreams &entry = streams_[device_id];
+    entry.context = ctx;
+    entry.streams = std::move(created);
+    VLOG(1) << "Created " << entry.streams.size()
+            << " LocalCopyEngine stream(s) for device " << device_id;
+    return &entry.streams;
 }
 
 void LocalCopyEngine::Copy(TransferRequest::OpCode opcode,
@@ -311,18 +350,29 @@ void LocalCopyEngine::CopyWithSync(TransferRequest::OpCode opcode,
 void LocalCopyEngine::CopyWithAsync(TransferRequest::OpCode opcode,
                                     const std::vector<Slice *> &slice_list,
                                     aclrtMemcpyKind kind) {
-    aclrtStream stream = GetOrCreateStreamForCurrentDevice();
-    if (stream == nullptr) {
+    const std::vector<aclrtStream> *streams =
+        GetOrCreateStreamsForCurrentDevice();
+    if (streams == nullptr) {
         for (auto &slice : slice_list) {
             slice->markFailed();
         }
         return;
     }
+    const size_t num_streams = streams->size();
 
-    std::vector<Slice *> async_list;
+    // Per-slice stream index so completion can be tracked per stream.
+    // Note: slices are striped round-robin. Key-level striping is not possible
+    // at this layer: one TransferTask maps to one slice in the ascend direct
+    // transport, so no key identity reaches LocalCopyEngine. Splitting a key's
+    // pages across streams is harmless: each slice is an independent D2D copy
+    // with no ordering requirement.
+    std::vector<std::pair<Slice *, size_t>> async_list;
     async_list.reserve(slice_list.size());
 
-    for (auto &slice : slice_list) {
+    for (size_t i = 0; i < slice_list.size(); ++i) {
+        auto slice = slice_list[i];
+        const size_t stream_idx = i % num_streams;
+        aclrtStream stream = (*streams)[stream_idx];
         auto local_ptr = slice->source_addr;
         auto remote_ptr =
             reinterpret_cast<void *>(slice->ascend_direct.dest_addr);
@@ -330,11 +380,9 @@ void LocalCopyEngine::CopyWithAsync(TransferRequest::OpCode opcode,
 
         aclError ret;
         if (opcode == TransferRequest::WRITE) {
-            ret =
-                aclrtMemcpyAsync(remote_ptr, len, local_ptr, len, kind, stream);
+            ret = aclrtMemcpyAsync(remote_ptr, len, local_ptr, len, kind, stream);
         } else {
-            ret =
-                aclrtMemcpyAsync(local_ptr, len, remote_ptr, len, kind, stream);
+            ret = aclrtMemcpyAsync(local_ptr, len, remote_ptr, len, kind, stream);
         }
 
         if (ret != ACL_ERROR_NONE) {
@@ -342,26 +390,42 @@ void LocalCopyEngine::CopyWithAsync(TransferRequest::OpCode opcode,
             slice->markFailed();
             continue;
         }
-        async_list.emplace_back(slice);
+        async_list.emplace_back(slice, stream_idx);
     }
 
     if (async_list.empty()) {
         return;
     }
 
-    aclError ret = aclrtSynchronizeStreamWithTimeout(stream, transfer_timeout_);
-    if (ret == ACL_ERROR_NONE) {
-        VLOG(1) << "Copy with aclrtMemcpyAsync suc.";
-        for (auto &slice : async_list) {
-            slice->markSuccess();
+    // Sync each stream once, then resolve slices per stream result.
+    std::vector<aclError> sync_results(num_streams, ACL_ERROR_NONE);
+    std::vector<bool> stream_used(num_streams, false);
+    for (const auto &entry : async_list) {
+        stream_used[entry.second] = true;
+    }
+    for (size_t i = 0; i < num_streams; ++i) {
+        if (!stream_used[i]) {
+            continue;
         }
-    } else {
-        LOG(ERROR) << "Memory copy failed, ret:" << ret;
-        (void)aclrtStreamAbort(stream);
-        for (auto &slice : async_list) {
-            slice->markFailed();
+        sync_results[i] = aclrtSynchronizeStreamWithTimeout(
+            (*streams)[i], transfer_timeout_);
+        if (sync_results[i] != ACL_ERROR_NONE) {
+            LOG(ERROR) << "Memory copy failed on stream " << i
+                       << ", ret:" << sync_results[i];
+            (void)aclrtStreamAbort((*streams)[i]);
         }
     }
+    size_t success_count = 0;
+    for (const auto &entry : async_list) {
+        if (sync_results[entry.second] == ACL_ERROR_NONE) {
+            entry.first->markSuccess();
+            ++success_count;
+        } else {
+            entry.first->markFailed();
+        }
+    }
+    VLOG(1) << "Copy with aclrtMemcpyAsync done. success:" << success_count
+            << " total:" << async_list.size();
 }
 
 }  // namespace mooncake

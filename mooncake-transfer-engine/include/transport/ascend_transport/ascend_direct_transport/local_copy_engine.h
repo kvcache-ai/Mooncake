@@ -78,26 +78,32 @@ class LocalCopyEngine {
                                          aclrtPtrAttributes &src_attrs,
                                          aclrtPtrAttributes &dst_attrs);
 
-    // Return (or lazily create) a stream belonging to the current ACL device
-    // context. The stream must be created while that device's context is
-    // current so aclrtMemcpyAsync does not return 107003.
-    aclrtStream GetOrCreateStreamForCurrentDevice();
+    // Return (or lazily create) the stream set belonging to the current ACL
+    // device context. Streams must be created while that device's context is
+    // current so aclrtMemcpyAsync does not return 107003. The set holds
+    // MC_LOCAL_COPY_STREAMS streams (default 1) so local D2D copies can be
+    // striped across copy engines.
+    const std::vector<aclrtStream> *GetOrCreateStreamsForCurrentDevice();
 
    private:
-    // Stream plus the ACL context it was created under. Destroying a stream
-    // requires that same context to be current, otherwise aclrtDestroyStream
-    // can return 107003 (ACL_ERROR_RT_STREAM_CONTEXT).
-    struct DeviceStream {
-        aclrtStream stream = nullptr;
+    // Streams plus the ACL context they were created under. Destroying a
+    // stream requires that same context to be current, otherwise
+    // aclrtDestroyStream can return 107003 (ACL_ERROR_RT_STREAM_CONTEXT).
+    struct DeviceStreams {
+        std::vector<aclrtStream> streams;
         aclrtContext context = nullptr;
     };
 
-    // Per-device streams keyed by ACL device id. A single shared stream is
+    // Per-device stream sets keyed by ACL device id. A single shared stream is
     // unsafe across devices because Initialize() may run under device0
     // context while workers later copy under other device contexts.
-    std::unordered_map<int32_t, DeviceStream> streams_;
+    std::unordered_map<int32_t, DeviceStreams> streams_;
     mutable std::mutex streams_mu_;
     int32_t transfer_timeout_;
+    // Number of streams per device for local copy striping. Parsed once from
+    // MC_LOCAL_COPY_STREAMS at Initialize (clamped to [1, 32]). 1 keeps the
+    // historical single-stream behavior.
+    size_t num_streams_;
     bool initialized_;
 };
 
