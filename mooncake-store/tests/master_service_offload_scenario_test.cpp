@@ -1014,4 +1014,189 @@ TEST(MasterServiceOffloadScenarioTest,
         .Then(Objects(0, kMemoryOnly).NamedBy(key).AreReadable());
 }
 
+namespace {
+
+// Two owners, "a" and "b", each with its own memory segment and disk: no
+// leases, only the cycles a test runs, and a cap of two objects in flight per
+// owner.
+MasterServiceConfig PerOwnerOffloadConfig() {
+    MasterServiceConfig config = OffloadOnEvictConfig();
+    config.default_kv_lease_ttl = 0;
+    config.eviction_high_watermark_ratio = 1.0;
+    config.offloading_queue_limit = 4;  // the mailbox is not the bound
+    config.offload_cap_ratio = 0.5;     // cap = 2 objects in flight per owner
+    return config;
+}
+
+std::string OwnerKey(const std::string& owner, size_t index) {
+    return "owner_" + owner + "_" + std::to_string(index);
+}
+
+}  // namespace
+
+// The cap bounds what is in flight to each owner. An owner that takes its
+// share and never reports holds back only its own objects: the next cycle
+// skips them, queues the other owner's, and drops nothing.
+TEST(MasterServiceOffloadScenarioTest, StalledOwnerHoldsBackOnlyItsOwnObjects) {
+    const auto a_key = [](size_t index) { return OwnerKey("a", index); };
+    const auto b_key = [](size_t index) { return OwnerKey("b", index); };
+    const auto base = std::chrono::system_clock::now() - std::chrono::hours(1);
+    MasterScenario scenario("a stalled owner holds back only its own objects",
+                            PerOwnerOffloadConfig());
+    scenario.Given(MemoryNode("a").Capacity(64 * 1024 * 1024))
+        .Given(MemoryNode("b").Capacity(64 * 1024 * 1024))
+        .When(MountLocalDisk("a"))
+        .When(MountLocalDisk("b"))
+        .Given(Objects(0, 18)
+                   .NamedBy(a_key)
+                   .Size(1_KB)
+                   .By("a")
+                   .CompleteOn("a")
+                   .ExpiredFrom(base))
+        .Given(Objects(0, 2)
+                   .NamedBy(b_key)
+                   .Size(1_KB)
+                   .By("b")
+                   .CompleteOn("b")
+                   .ExpiredFrom(base + std::chrono::minutes(1)))
+        // Target 2 of 20: a's two oldest objects fill a's room.
+        .When(EvictMemory(0.10))
+        .When(OffloadHeartbeat("a").ExpectTasks({a_key(0), a_key(1)}, 1024))
+        .When(OffloadHeartbeat("b").ExpectNoTasks())
+        // a never reports. Target 2 of 18: a's objects are skipped and b's
+        // two are queued.
+        .When(EvictMemory(0.10))
+        .When(OffloadHeartbeat("a").ExpectNoTasks())
+        .When(OffloadHeartbeat("b").ExpectTasks({b_key(0), b_key(1)}, 1024))
+        .Then(Objects(0, 18).NamedBy(a_key).AreReadable())
+        .Then(Objects(0, 2).NamedBy(b_key).AreReadable());
+}
+
+// With the cap per owner, what is in flight can reach cap x owners: one cycle
+// queues two objects for each of the two owners.
+TEST(MasterServiceOffloadScenarioTest, InFlightOffloadsReachTheCapOnEachOwner) {
+    const auto a_key = [](size_t index) { return OwnerKey("a", index); };
+    const auto b_key = [](size_t index) { return OwnerKey("b", index); };
+    const auto base = std::chrono::system_clock::now() - std::chrono::hours(1);
+    MasterScenario scenario("in-flight offloads reach the cap on each owner",
+                            PerOwnerOffloadConfig());
+    scenario.Given(MemoryNode("a").Capacity(64 * 1024 * 1024))
+        .Given(MemoryNode("b").Capacity(64 * 1024 * 1024))
+        .When(MountLocalDisk("a"))
+        .When(MountLocalDisk("b"))
+        // The four oldest objects: two on each owner.
+        .Given(Objects(0, 2)
+                   .NamedBy(a_key)
+                   .Size(1_KB)
+                   .By("a")
+                   .CompleteOn("a")
+                   .ExpiredFrom(base))
+        .Given(Objects(0, 2)
+                   .NamedBy(b_key)
+                   .Size(1_KB)
+                   .By("b")
+                   .CompleteOn("b")
+                   .ExpiredFrom(base + std::chrono::microseconds(1)))
+        .Given(Objects(2, 10)
+                   .NamedBy(a_key)
+                   .Size(1_KB)
+                   .By("a")
+                   .CompleteOn("a")
+                   .ExpiredFrom(base + std::chrono::minutes(1)))
+        .Given(Objects(2, 10)
+                   .NamedBy(b_key)
+                   .Size(1_KB)
+                   .By("b")
+                   .CompleteOn("b")
+                   .ExpiredFrom(base + std::chrono::minutes(1)))
+        // Target 4 of 20: all four go in flight, two per owner.
+        .When(EvictMemory(0.18))
+        .When(OffloadHeartbeat("a").ExpectTasks({a_key(0), a_key(1)}, 1024))
+        .When(OffloadHeartbeat("b").ExpectTasks({b_key(0), b_key(1)}, 1024))
+        .Then(Objects(0, 10).NamedBy(a_key).AreReadable())
+        .Then(Objects(0, 10).NamedBy(b_key).AreReadable());
+}
+
+// A target high enough to bypass the compact frontier follows the same rule:
+// the full owner's objects are skipped, the other owner's are queued up to its
+// cap, an object already on disk gives back its memory, nothing is dropped.
+TEST(MasterServiceOffloadScenarioTest,
+     HighTargetSkipsOnlyTheFullOwnersObjects) {
+    const auto a_key = [](size_t index) { return OwnerKey("a", index); };
+    const auto b_key = [](size_t index) { return OwnerKey("b", index); };
+    const auto base = std::chrono::system_clock::now() - std::chrono::hours(1);
+    MasterScenario scenario("a high target skips only the full owner's objects",
+                            PerOwnerOffloadConfig());
+    scenario.Given(MemoryNode("a").Capacity(64 * 1024 * 1024))
+        .Given(MemoryNode("b").Capacity(64 * 1024 * 1024))
+        .When(MountLocalDisk("a"))
+        .When(MountLocalDisk("b"))
+        .Given(Objects(0, 8)
+                   .NamedBy(a_key)
+                   .Size(1_KB)
+                   .By("a")
+                   .CompleteOn("a")
+                   .ExpiredFrom(base))
+        .Given(Objects(0, 2)
+                   .NamedBy(b_key)
+                   .Size(1_KB)
+                   .By("b")
+                   .CompleteOn("b")
+                   .ExpiredFrom(base + std::chrono::minutes(1)))
+        // a has already written its newest object to disk.
+        .When(CompleteOffload({a_key(7)}).By("a").OnNode("a").OfSize(1024))
+        // Target 2 of 10: a's two oldest objects fill a's room.
+        .When(EvictMemory(0.15))
+        .When(OffloadHeartbeat("a").ExpectTasks({a_key(0), a_key(1)}, 1024))
+        // Target 4 of 8 (ratio 0.5, past the compact frontier): a's
+        // memory-only objects are skipped, its disk-backed one is freed, and
+        // b's two are queued.
+        .When(EvictMemory(0.5))
+        .When(OffloadHeartbeat("a").ExpectNoTasks())
+        .When(OffloadHeartbeat("b").ExpectTasks({b_key(0), b_key(1)}, 1024))
+        .Then(Object(a_key(7)).HasMemoryReplicas(0).HasLocalDiskReplicas(1))
+        .Then(Objects(0, 7).NamedBy(a_key).AreReadable())
+        .Then(Objects(0, 2).NamedBy(b_key).AreReadable());
+}
+
+// When the compact frontier holds only objects of an owner with no room, the
+// refill past it skips that owner's objects but still queues the newer
+// objects of an owner with room.
+TEST(MasterServiceOffloadScenarioTest,
+     FullOwnerFrontierStillQueuesOtherOwnersPastIt) {
+    constexpr size_t kOnA = 1198;
+    const auto a_key = [](size_t index) { return OwnerKey("a", index); };
+    const auto b_key = [](size_t index) { return OwnerKey("b", index); };
+    const auto base = std::chrono::system_clock::now() - std::chrono::hours(1);
+    MasterScenario scenario(
+        "a full owner's frontier still queues other owners past it",
+        PerOwnerOffloadConfig());
+    scenario.Given(MemoryNode("a").Capacity(64 * 1024 * 1024))
+        .Given(MemoryNode("b").Capacity(64 * 1024 * 1024))
+        .When(MountLocalDisk("a"))
+        .When(MountLocalDisk("b"))
+        .Given(Objects(0, kOnA)
+                   .NamedBy(a_key)
+                   .Size(1_KB)
+                   .By("a")
+                   .CompleteOn("a")
+                   .ExpiredFrom(base))
+        .Given(Objects(0, 2)
+                   .NamedBy(b_key)
+                   .Size(1_KB)
+                   .By("b")
+                   .CompleteOn("b")
+                   .ExpiredFrom(base + std::chrono::minutes(1)))
+        // Target 2 of 1200: a's two oldest objects fill a's room.
+        .When(EvictMemory(0.0015))
+        .When(OffloadHeartbeat("a").ExpectTasks({a_key(0), a_key(1)}, 1024))
+        // Target 6 of 1198: the frontier (the 1030 oldest) is all a's and
+        // skipped; the refill past it queues b's two.
+        .When(EvictMemory(0.005))
+        .When(OffloadHeartbeat("a").ExpectNoTasks())
+        .When(OffloadHeartbeat("b").ExpectTasks({b_key(0), b_key(1)}, 1024))
+        .Then(Objects(0, kOnA).NamedBy(a_key).AreReadable())
+        .Then(Objects(0, 2).NamedBy(b_key).AreReadable());
+}
+
 }  // namespace mooncake::test

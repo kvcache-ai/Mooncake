@@ -1029,14 +1029,15 @@ class MasterService {
     // BatchEvict cycle instead of checking again after kEvictionThreadSleepMs.
     enum class EvictionBackoff {
         kNone,
-        // The owners hold the work (offload_on_evict): the cycle found the
-        // in-flight room full, or freed nothing while offloads are in flight.
-        // An allocation that fails meanwhile cancels the wait.
+        // The owners hold the work (offload_on_evict): the cycle found an
+        // owner's in-flight room full, or freed nothing while offloads are in
+        // flight. An allocation that fails meanwhile cancels the wait.
         kWaitForOwners,
-        // As above, but the cycle answered a failed allocation, found the
-        // in-flight room full and could drop nothing (offload_force_evict
-        // off), so it re-armed the pressure. Wait anyway: only the owners can
-        // make room, and the cycle after the wait acts on the pressure.
+        // As above, but the cycle answered a failed allocation, found an
+        // owner's in-flight room full and could drop nothing
+        // (offload_force_evict off), so it re-armed the pressure. Wait anyway:
+        // only the owners can make room, and the cycle after the wait acts on
+        // the pressure.
         kWaitForOwnersHoldingPressure,
     };
 
@@ -1640,6 +1641,39 @@ class MasterService {
     tl::expected<void, ErrorCode> PushOffloadingQueue(
         const ObjectIdentity& object_id, Replica& replica,
         std::vector<UUID>* mirror_clients = nullptr);
+
+    // Offloads in flight per owner, the client whose segment holds the replica
+    // being written (keyed by its liveness record), and the cap on each owner
+    // (offload_on_evict). An eviction pass counts the objects' offload tasks
+    // into it and takes room as it queues more.
+    struct OffloadRoom {
+        long cap_per_owner{0};
+        std::unordered_map<const ClientLivenessRecord*, long> in_flight;
+
+        [[nodiscard]] bool HasRoom(const ClientLivenessRecord* owner) const {
+            const auto it = in_flight.find(owner);
+            return it == in_flight.end() || it->second < cap_per_owner;
+        }
+        void Take(const ClientLivenessRecord* owner) { ++in_flight[owner]; }
+    };
+
+    // The owner an in-flight offload task is writing for: the owner of its
+    // pinned source replica, or null when that replica is gone.
+    static const ClientLivenessRecord* OffloadTaskOwner(
+        const ObjectMetadata& metadata, const OffloadingTask& task);
+
+    enum class EvictionOffload {
+        kQueued,   // one memory replica pinned and queued for its owner's disk
+        kNoRoom,   // every evictable memory replica's owner is at the cap
+        kRefused,  // an owner with room refused the push
+    };
+
+    // Pins the first evictable memory replica whose owner has room, queues it
+    // for that owner's disk and records the object's offload task.
+    EvictionOffload QueueEvictionOffload(
+        const ObjectIdentity& object_id, ObjectMetadata& metadata,
+        route::ObjectState& state, OffloadRoom& room,
+        std::chrono::system_clock::time_point now);
 
     // Cancels the offload task on `object_id`, releasing the source refcnt
     // and dropping the task marker along with its mirrors. Returns false
