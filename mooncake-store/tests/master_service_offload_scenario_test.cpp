@@ -1199,4 +1199,46 @@ TEST(MasterServiceOffloadScenarioTest,
         .Then(Objects(0, 2).NamedBy(b_key).AreReadable());
 }
 
+// The eviction metrics count an object once, when its memory is freed:
+// queuing it for disk offload counts nothing, and the cycle that frees it
+// after the owner has written it counts it.
+TEST(MasterServiceOffloadScenarioTest,
+     EvictedKeyMetricsCountAnObjectWhenItsMemoryIsFreed) {
+    constexpr size_t kObjectCount = 20;
+    const auto key = [](size_t index) {
+        return "metric_count_" + std::to_string(index);
+    };
+    const auto base = std::chrono::system_clock::now() - std::chrono::hours(1);
+    MasterScenario scenario(
+        "the evicted-key metrics count an object when its memory is freed",
+        PerOwnerOffloadConfig());
+    scenario.Given(MemoryNode("a").Capacity(64 * 1024 * 1024))
+        .When(MountLocalDisk("a"))
+        .Given(Objects(0, kObjectCount)
+                   .NamedBy(key)
+                   .Size(1_KB)
+                   .By("a")
+                   .CompleteOn("a")
+                   .ExpiredFrom(base));
+
+    auto& metrics = MasterMetricManager::instance();
+    const int64_t mem_before = metrics.get_mem_evicted_key_count();
+    const int64_t all_before = metrics.get_evicted_key_count();
+    // Target 2 of 20: the two oldest objects are queued, nothing is freed.
+    scenario.When(EvictMemory(0.10))
+        .When(OffloadHeartbeat("a").ExpectTasks({key(0), key(1)}, 1024));
+    EXPECT_EQ(metrics.get_mem_evicted_key_count() - mem_before, 0);
+    EXPECT_EQ(metrics.get_evicted_key_count() - all_before, 0);
+
+    // The owner writes them; the next cycle frees their memory replicas.
+    scenario
+        .When(
+            CompleteOffload({key(0), key(1)}).By("a").OnNode("a").OfSize(1024))
+        .When(EvictMemory(0.10))
+        .Then(Object(key(0)).HasMemoryReplicas(0).HasLocalDiskReplicas(1))
+        .Then(Object(key(1)).HasMemoryReplicas(0).HasLocalDiskReplicas(1));
+    EXPECT_EQ(metrics.get_mem_evicted_key_count() - mem_before, 2);
+    EXPECT_EQ(metrics.get_evicted_key_count() - all_before, 2);
+}
+
 }  // namespace mooncake::test

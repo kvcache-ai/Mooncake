@@ -11048,6 +11048,10 @@ MasterService::EvictionBackoff MasterService::BatchEvict(
     long offload_deferred_count = 0;
     long offload_cap_forced_count = 0;    // #keys force-evicted due to cap
     long offload_push_failed_forced = 0;  // #keys force-evicted on push fail
+    // Objects whose memory this cycle freed. The cycle's target also counts
+    // the objects it queued for disk offload; the eviction metrics and the
+    // result log count an object once, when its memory is freed.
+    long freed_object_count = 0;
     const long offload_cap =
         offload_on_evict_
             ? static_cast<long>(offloading_queue_limit_ * offload_cap_ratio_)
@@ -11255,6 +11259,9 @@ MasterService::EvictionBackoff MasterService::BatchEvict(
                 EvictionResult result{
                     .freed_bytes = freed,
                     .evicted_objects = (freed > 0 || deferred) ? 1 : 0};
+                if (freed > 0 && !deferred) {
+                    ++freed_object_count;
+                }
                 if (!enable_oplog_ && freed > 0) {
                     PublishKvRemovedAfterEvict(key, 1, "cpu", metadata,
                                                tenant_id);
@@ -11292,6 +11299,9 @@ MasterService::EvictionBackoff MasterService::BatchEvict(
             EvictMemberOutcome outcome{
                 .freed_bytes = freed,
                 .evicted_objects = (freed > 0 || deferred) ? 1 : 0};
+            if (freed > 0 && !deferred) {
+                ++freed_object_count;
+            }
             if (freed > 0 && !enable_oplog_) {
                 PublishKvRemovedAfterEvict(member_key, 1, "cpu",
                                            member_metadata, tenant_id);
@@ -11924,16 +11934,16 @@ MasterService::EvictionBackoff MasterService::BatchEvict(
     }
 
     if (success) {
-        MasterMetricManager::instance().inc_eviction_success(evicted_count,
+        MasterMetricManager::instance().inc_eviction_success(freed_object_count,
                                                              total_freed_size);
         MasterMetricManager::instance().inc_mem_eviction_success(
-            evicted_count, total_freed_size);
+            freed_object_count, total_freed_size);
     } else {
         MasterMetricManager::instance().inc_eviction_fail();
         MasterMetricManager::instance().inc_mem_eviction_fail();
     }
     VLOG(1) << "action=evict_objects"
-            << ", evicted_count=" << evicted_count
+            << ", evicted_count=" << freed_object_count
             << ", offload_deferred=" << offload_deferred_count
             << ", offload_cap_forced=" << offload_cap_forced_count
             << ", offload_push_failed_forced=" << offload_push_failed_forced
@@ -11941,7 +11951,7 @@ MasterService::EvictionBackoff MasterService::BatchEvict(
             << ", eviction_base=" << total_eviction_base
             << ", actual_evict_ratio="
             << (total_eviction_base > 0
-                    ? (double)evicted_count / total_eviction_base
+                    ? (double)freed_object_count / total_eviction_base
                     : 0.0)
             << ", target_evict_ratio=" << evict_ratio_target;
     VLOG(1) << "[EVICT-DIAG] object_count=" << object_count
@@ -11955,11 +11965,12 @@ MasterService::EvictionBackoff MasterService::BatchEvict(
             << (long)std::ceil(object_count * evict_ratio_target)
             << " ideal_evict_num_correct="
             << (long)std::ceil(total_eviction_base * evict_ratio_target);
-    LOG(INFO) << "[EVICT-RESULT] evicted_count=" << evicted_count
+    LOG(INFO) << "[EVICT-RESULT] evicted_count=" << freed_object_count
+              << ", offload_deferred=" << offload_deferred_count
               << ", eviction_base=" << total_eviction_base
               << ", actual_evict_ratio="
               << (total_eviction_base > 0
-                      ? (double)evicted_count / total_eviction_base
+                      ? (double)freed_object_count / total_eviction_base
                       : 0.0)
               << ", target_evict_ratio=" << evict_ratio_target;
     const bool freed_now = total_freed_size > 0;
