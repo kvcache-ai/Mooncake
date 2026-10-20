@@ -30,6 +30,10 @@
 #include "tent/common/utils/os.h"
 #include "tent/runtime/slab.h"
 
+#if defined(USE_CUDA)
+#include "tent/platform/cuda_utils.h"
+#endif
+
 namespace mooncake {
 namespace tent {
 
@@ -43,16 +47,47 @@ const FabricProfile kProfiles[] = {
     // EFA: FI_VERSION(1,18) opts in to device RDMA read/write (#2041).
     {"efa", "efa", FI_VERSION(1, 18),
      FI_MR_LOCAL | FI_MR_VIRT_ADDR | FI_MR_ALLOCATED | FI_MR_PROV_KEY, "-rdm",
-     true, false},
+     true, false, true},
     // tcp;ofi_rxm: for tests on machines without fabric hardware. Its default
     // RMA completion fires once the data is queued on the socket.
-    {"tcp", "tcp;ofi_rxm", 0, kAppMrMode, "", false, true},
+    {"tcp", "tcp;ofi_rxm", 0, kAppMrMode, "", false, true, false},
 };
 
 std::string fiError(int rc) {
     return std::string(fi_strerror(rc < 0 ? -rc : rc)) + " (" +
            std::to_string(rc) + ")";
 }
+
+#if defined(USE_CUDA)
+// Makes a device's primary context current for the scope, then restores the
+// caller's context (#3177).
+class ScopedPrimaryContext {
+   public:
+    explicit ScopedPrimaryContext(int ordinal) {
+        CUcontext primary = nullptr;
+        if (!ensureCudaDriverInit() || cuCtxGetCurrent(&previous_) ||
+            cuDeviceGet(&device_, ordinal) ||
+            cuDevicePrimaryCtxRetain(&primary, device_))
+            return;
+        retained_ = true;
+        ok_ = cuCtxSetCurrent(primary) == CUDA_SUCCESS;
+    }
+    ~ScopedPrimaryContext() {
+        if (!retained_) return;
+        cuCtxSetCurrent(previous_);
+        cuDevicePrimaryCtxRelease(device_);
+    }
+    ScopedPrimaryContext(const ScopedPrimaryContext&) = delete;
+    ScopedPrimaryContext& operator=(const ScopedPrimaryContext&) = delete;
+    bool ok() const { return ok_; }
+
+   private:
+    CUcontext previous_ = nullptr;
+    CUdevice device_ = 0;
+    bool retained_ = false;
+    bool ok_ = false;
+};
+#endif
 
 int readPciNumaNode(const struct fi_info* info) {
     if (!info->nic || !info->nic->bus_attr ||
@@ -146,6 +181,14 @@ Status discoverFabricDomains(const FabricProfile& profile,
     hints->mode = FI_CONTEXT | FI_CONTEXT2;
     hints->ep_attr->type = FI_EP_RDM;
     hints->domain_attr->mr_mode = profile.mr_mode_hints;
+#if defined(USE_CUDA)
+    // Without FI_HMEM, the EFA SHM path copies into device memory with a
+    // host memcpy (ofiwg/libfabric#12328).
+    if (profile.hmem) {
+        hints->caps |= FI_HMEM;
+        hints->domain_attr->mr_mode |= FI_MR_HMEM;
+    }
+#endif
     hints->domain_attr->threading = FI_THREAD_SAFE;
     hints->fabric_attr->prov_name = strdup(profile.prov_name);
 
@@ -153,6 +196,15 @@ Status discoverFabricDomains(const FabricProfile& profile,
         profile.api_version ? profile.api_version : fi_version();
     struct fi_info* list = nullptr;
     int rc = fi_getinfo(version, nullptr, nullptr, 0, hints, &list);
+    if (rc && (hints->caps & FI_HMEM)) {
+        // No usable CUDA (driver missing, no GPU): keep host memory working.
+        LOG(WARNING) << "fi_getinfo(" << profile.prov_name
+                     << ") with FI_HMEM: " << fiError(rc)
+                     << "; retrying without device memory support";
+        hints->caps &= ~FI_HMEM;
+        hints->domain_attr->mr_mode &= ~FI_MR_HMEM;
+        rc = fi_getinfo(version, nullptr, nullptr, 0, hints, &list);
+    }
     fi_freeinfo(hints);
     if (rc) {
         return Status::DeviceNotFound("fi_getinfo(" +
@@ -236,6 +288,7 @@ Status FabricContext::open(const FabricProfile& profile,
     virt_addr_ = mr_mode & FI_MR_VIRT_ADDR;
     mr_bind_ep_ = mr_mode & FI_MR_ENDPOINT;
     prov_key_ = mr_mode & FI_MR_PROV_KEY;
+    hmem_ = info_->caps & FI_HMEM;
     max_msg_size_ = info_->ep_attr->max_msg_size;
     max_mr_size_ = 0;
     if (profile.delivery_complete) {
@@ -294,7 +347,7 @@ Status FabricContext::open(const FabricProfile& profile,
               << " numa=" << numa_node_ << " credits=" << credits_
               << " max_msg=" << max_msg_size_ << " mr_mode=0x" << std::hex
               << mr_mode << std::dec << (virt_addr_ ? " va" : " offset")
-              << (mr_bind_ep_ ? " mr-bind" : "");
+              << (mr_bind_ep_ ? " mr-bind" : "") << (hmem_ ? " hmem" : "");
     return Status::OK();
 }
 
@@ -348,7 +401,7 @@ void FabricContext::close() {
     peers_.clear();
 }
 
-Status FabricContext::registerMemory(void* addr, size_t length,
+Status FabricContext::registerMemory(void* addr, size_t length, int cuda_device,
                                      struct fid_mr*& mr, void*& desc,
                                      uint64_t& key) {
     const uint64_t access =
@@ -356,12 +409,44 @@ Status FabricContext::registerMemory(void* addr, size_t length,
     const uint64_t requested_key =
         prov_key_ ? 0 : next_key_.fetch_add(1, std::memory_order_relaxed);
     mr = nullptr;
-    int rc = fi_mr_reg(domain_, addr, length, access, 0, requested_key, 0, &mr,
+    int rc = 0;
+    if (cuda_device < 0) {
+        rc = fi_mr_reg(domain_, addr, length, access, 0, requested_key, 0, &mr,
                        nullptr);
+    } else {
+#if defined(USE_CUDA)
+        if (!hmem_) {
+            return Status::NotImplemented("Fabric domain " + name_ +
+                                          " has no FI_HMEM" LOC_MARK);
+        }
+        // fi_mr_reg() assumes host memory. The provider pins GPU memory in
+        // the calling thread's context, so bind the device's primary one.
+        ScopedPrimaryContext context(cuda_device);
+        if (!context.ok()) {
+            return Status::CudaError(
+                "Cannot bind CUDA primary context of device " +
+                std::to_string(cuda_device) + LOC_MARK);
+        }
+        struct iovec iov = {addr, length};
+        struct fi_mr_attr attr = {};
+        attr.mr_iov = &iov;
+        attr.iov_count = 1;
+        attr.access = access;
+        attr.requested_key = requested_key;
+        attr.iface = FI_HMEM_CUDA;
+        attr.device.cuda = cuda_device;
+        rc = fi_mr_regattr(domain_, &attr, 0, &mr);
+#else
+        return Status::NotImplemented(
+            "Fabric transport is built without CUDA" LOC_MARK);
+#endif
+    }
     if (rc) {
-        return Status::RdmaError("fi_mr_reg(" + std::to_string(length) +
-                                 " bytes) on " + name_ + ": " + fiError(rc) +
-                                 LOC_MARK);
+        return Status::RdmaError(
+            std::string(cuda_device < 0 ? "fi_mr_reg(" : "fi_mr_regattr(") +
+            std::to_string(length) + " bytes" +
+            (cuda_device < 0 ? "" : ", cuda:" + std::to_string(cuda_device)) +
+            ") on " + name_ + ": " + fiError(rc) + LOC_MARK);
     }
     if (mr_bind_ep_) {
         rc = fi_mr_bind(mr, &ep_->fid, 0);
