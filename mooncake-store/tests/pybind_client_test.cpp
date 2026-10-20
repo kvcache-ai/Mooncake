@@ -2572,7 +2572,7 @@ TEST_F(RealClientTest, EgmConfigCannotFallbackWithoutMnnvl) {
 
     auto result = py_client_->setup_internal(config);
     ASSERT_FALSE(result.has_value());
-    EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(result.error(), ErrorCode::INTERNAL_ERROR);
     EXPECT_EQ(py_client_->client_buffer_allocator_, nullptr);
     EXPECT_TRUE(py_client_->segment_ptrs_.empty());
     EXPECT_TRUE(py_client_->hugepage_segment_ptrs_.empty());

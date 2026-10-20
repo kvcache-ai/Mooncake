@@ -1177,7 +1177,7 @@ std::shared_ptr<NVMeoFInitiator> Client::GetNofInitiatorForTesting() const {
     return nof_initiator_;
 }
 
-std::optional<std::shared_ptr<Client>> Client::Create(
+tl::expected<std::shared_ptr<Client>, ErrorCode> Client::Create(
     const std::string& local_hostname, const std::string& metadata_connstring,
     const std::string& protocol, const std::optional<std::string>& device_names,
     const std::string& master_server_entry,
@@ -1203,7 +1203,7 @@ std::optional<std::shared_ptr<Client>> Client::Create(
 
     ErrorCode err = client->ConnectToMaster(master_server_entry);
     if (err != ErrorCode::OK) {
-        return std::nullopt;
+        return tl::unexpected(err);
     }
 
     // Initialize storage backend if storage_root_dir is valid
@@ -1234,11 +1234,11 @@ std::optional<std::shared_ptr<Client>> Client::Create(
                         << "Failed to initialize storage backend: " << prep_err
                         << ". Persistence was requested via fsdir but is "
                            "unavailable.";
-                    return std::nullopt;
+                    return tl::unexpected(prep_err);
                 }
             } else {
                 LOG(ERROR) << "Invalid fsdir format: " << dir_string;
-                return std::nullopt;
+                return tl::unexpected(ErrorCode::INVALID_PARAMS);
             }
         }
     } else {
@@ -1266,11 +1266,11 @@ std::optional<std::shared_ptr<Client>> Client::Create(
                         << "Failed to initialize storage backend: " << prep_err
                         << ". Persistence was requested via storage config "
                            "but is unavailable.";
-                    return std::nullopt;
+                    return tl::unexpected(prep_err);
                 }
             } else {
                 LOG(ERROR) << "Invalid fsdir format: " << config.fsdir;
-                return std::nullopt;
+                return tl::unexpected(ErrorCode::INVALID_PARAMS);
             }
         }
     }
@@ -1290,7 +1290,7 @@ std::optional<std::shared_ptr<Client>> Client::Create(
                                          protocol, device_names);
         if (err != ErrorCode::OK) {
             LOG(ERROR) << "Failed to initialize transfer engine";
-            return std::nullopt;
+            return tl::unexpected(err);
         }
     } else {
         client->transfer_engine_ = transfer_engine;
