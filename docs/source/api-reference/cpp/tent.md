@@ -289,7 +289,7 @@ struct TransferStatus {
 ```
 
 - `s`: Current status of the transfer.
-- `transferred_bytes`: Number of bytes successfully transferred (lower bound). In-flight `PENDING` polls that skip the owner walk leave this at 0; the completion walk fills the total.
+- `transferred_bytes`: Number of bytes successfully transferred (lower bound). In-flight `PENDING` polls that skip the owner walk leave this at 0; the completion walk fills the total. A later `submitTransfer` on a `COMPLETED` batch returns the batch to `PENDING` and this field to 0 until the next completion walk (same invalidate as classic TE [#4199](https://github.com/kvcache-ai/Mooncake/pull/4199)).
 
 ### Data Transfer
 
@@ -527,6 +527,7 @@ Submits transfers and sends a notification upon completion.
 
 - `notifi`: A `{name, msg}` payload delivered to the receiver when the transfer completes.
 - Typical use: Signal that transferred data is ready for consumption.
+- On the RDMA completion-counter fast path, the hook uses classic TE [#4199](https://github.com/kvcache-ai/Mooncake/pull/4199) batch-complete timing: it fires on the first `getTransferStatus` owner walk after the publisher is fully done. Interval-early notify while that publisher is still in flight is out of scope.
 
 #### TransferEngine::sendNotification
 

@@ -14,9 +14,11 @@
 //
 // TENT analogue of classic TE PR #4199: RDMA-only batches skip the owner
 // walk in getBatchStatus while the CQ/worker counter says the batch is
-// still in flight. Mixed RDMA+TCP, append of a non-publisher, rejected
-// submit (UNSPEC / submitTransferTasks failure), and failover onto TCP
-// keep the walk — those paths cannot use the CQ counter.
+// still in flight. Notify uses the same batch-complete timing: an earlier
+// interval's hook waits until the publisher is fully done. Mixed RDMA+TCP,
+// append of a non-publisher, rejected submit (UNSPEC / submitTransferTasks
+// failure), and failover onto TCP keep the walk — those paths cannot use
+// the CQ counter.
 
 #include <gtest/gtest.h>
 
@@ -365,6 +367,68 @@ TEST(BatchCounterWait, NotifyBatchSkipsInFlightAndFiresOnCompletion) {
     ASSERT_TRUE(engine.receiveNotification(received).ok());
     ASSERT_EQ(received.size(), 1u);
     EXPECT_EQ(received[0].msg, "batch-counter");
+
+    EXPECT_TRUE(engine.freeBatch(batch_id).ok());
+    EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), kBufLen).ok());
+}
+
+TEST(BatchCounterWait, NotifyWaitsForFullPublisherAfterAppend) {
+    // TE #4199: notify is batch-complete, not interval-complete. Submit A
+    // with notify, append B, finish only A — still PENDING, bytes 0, A's
+    // hook must not fire. Finish B — hook fires on the completion walk.
+    auto cfg = makeMinimalP2PConfig();
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake_rdma = std::make_shared<FakeTransport>(RDMA, true);
+    std::string seg = engine.getSegmentName();
+    ASSERT_TRUE(fake_rdma->install(seg, nullptr, nullptr).ok());
+    engine.swapTransportForTest(RDMA, fake_rdma);
+
+    constexpr size_t kBufLen = 4096;
+    std::vector<uint8_t> buf(kBufLen, 0x46);
+    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), kBufLen).ok());
+
+    Notification notifi;
+    notifi.name = "local";
+    notifi.msg = "interval-a";
+
+    BatchID batch_id = engine.allocateBatch(2);
+    auto req = makeLocalWrite(buf.data(), kBufLen);
+    ASSERT_TRUE(engine.submitTransfer(batch_id, {req}, notifi).ok());
+    ASSERT_TRUE(engine.submitTransfer(batch_id, {req}).ok());
+
+    TransferStatus status{};
+    ASSERT_TRUE(engine.getTransferStatus(batch_id, status).ok());
+    EXPECT_EQ(status.s, TransferStatusEnum::PENDING);
+    EXPECT_EQ(status.transferred_bytes, 0u);
+    EXPECT_EQ(fake_rdma->status_calls.load(), 0);
+
+    fake_rdma->completeOneSuccess(0);
+    status = {};
+    ASSERT_TRUE(engine.getTransferStatus(batch_id, status).ok());
+    EXPECT_EQ(status.s, TransferStatusEnum::PENDING);
+    EXPECT_EQ(status.transferred_bytes, 0u);
+    EXPECT_EQ(fake_rdma->status_calls.load(), 0);
+
+    // FakeTransport does not implement receiveNotification. An empty poll
+    // therefore reports "Notification not supported" unless sendNotification
+    // already queued a local payload. The pin is that A's hook has not
+    // delivered anything yet.
+    std::vector<Notification> received;
+    (void)engine.receiveNotification(received);
+    EXPECT_TRUE(received.empty());
+
+    fake_rdma->completeOneSuccess(1);
+    status = {};
+    ASSERT_TRUE(engine.getTransferStatus(batch_id, status).ok());
+    EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
+    EXPECT_EQ(fake_rdma->status_calls.load(), 2);
+
+    received.clear();
+    ASSERT_TRUE(engine.receiveNotification(received).ok());
+    ASSERT_EQ(received.size(), 1u);
+    EXPECT_EQ(received[0].msg, "interval-a");
 
     EXPECT_TRUE(engine.freeBatch(batch_id).ok());
     EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), kBufLen).ok());
