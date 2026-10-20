@@ -75,9 +75,10 @@ class MasterServiceTestPeer {
     // Enable epoch bookkeeping without starting a live KV event publisher.
     void SetKvTenantEpochTrackingForTesting(bool enabled);
 
-    // Called after each shard lock is released during RemoveAll. Tests can
-    // commit into an already-scanned shard to pin the interleaving.
-    void SetRemoveAllShardHookForTesting(std::function<void(size_t)> hook);
+    // Called once per tenant RemoveAll has finished removing. Tests can commit
+    // into a tenant the walk already passed to pin the interleaving.
+    void SetRemoveAllTenantHookForTesting(
+        std::function<void(const TenantId&)> hook);
 
     // Counts of published clears and clears suppressed by a concurrent commit.
     uint64_t GetKvClearedPublishedForTesting() const;

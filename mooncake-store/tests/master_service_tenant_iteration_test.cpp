@@ -1,5 +1,6 @@
 // The tenant iteration primitives: VisitTenants names the tenants that hold
-// objects, and a tenant cursor walks one tenant's objects.
+// objects, a tenant cursor walks one tenant's objects, and the removes are
+// built on both.
 
 #include "master_service_test_fixture.h"
 
@@ -157,6 +158,49 @@ TEST_F(TenantIterationTest, WriteCursorChangesStateInPlace) {
         object.state().is_processing = false;
     }
     EXPECT_EQ(service.RemoveAll(kTenantA, /*force=*/true), 8);
+}
+
+TEST_F(TenantIterationTest, RemoveByRegexStaysInItsTenant) {
+    MasterService service(MultiTenantConfig());
+    const auto context = PrepareSimpleSegment(service);
+    PutKeys(service, context.client_id, kTenantA, "match_", 4);
+    PutKeys(service, context.client_id, kTenantA, "keep_", 2);
+    PutKeys(service, context.client_id, kTenantB, "match_", 3);
+
+    auto removed = service.RemoveByRegex("^match_", kTenantA, /*force=*/true);
+    ASSERT_TRUE(removed.has_value());
+    EXPECT_EQ(removed.value(), 4);
+    EXPECT_EQ(KeysOf(service, kTenantA),
+              (std::set<std::string>{"keep_0", "keep_1"}));
+    EXPECT_EQ(KeysOf(service, kTenantB).size(), 3u);
+}
+
+TEST_F(TenantIterationTest, RemoveAllWalksEveryTenant) {
+    MasterService service(MultiTenantConfig());
+    const auto context = PrepareSimpleSegment(service);
+    PutKeys(service, context.client_id, kTenantA, "a", 5);
+    PutKeys(service, context.client_id, kTenantB, "b", 7);
+
+    EXPECT_EQ(service.RemoveAll(/*force=*/true), 12);
+    std::vector<TenantId> left;
+    MasterServiceTestPeer(service).VisitTenants(
+        [&](const TenantId& tenant_id) { left.push_back(tenant_id); });
+    EXPECT_TRUE(left.empty());
+}
+
+TEST_F(TenantIterationTest, RemoveAllLeavesLeasedObjectsUnlessForced) {
+    MasterService service(MultiTenantConfig());
+    const auto context = PrepareSimpleSegment(service);
+    PutKeys(service, context.client_id, kTenantA, "a", 4);
+    // A read grants every object a lease.
+    for (int i = 0; i < 4; ++i) {
+        ASSERT_TRUE(service.GetReplicaList("a" + std::to_string(i), kTenantA)
+                        .has_value());
+    }
+
+    EXPECT_EQ(service.RemoveAll(kTenantA), 0);
+    EXPECT_EQ(KeysOf(service, kTenantA).size(), 4u);
+    EXPECT_EQ(service.RemoveAll(kTenantA, /*force=*/true), 4);
 }
 
 }  // namespace mooncake::test

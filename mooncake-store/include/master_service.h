@@ -1469,6 +1469,34 @@ class MasterService {
         const std::string& why, const TenantId& tenant_id,
         const std::string& key, ObjectMetadata& metadata,
         const StaleHandleCleanupPlan& plan);
+    // Removes the object under HA with the oplog on: marks its completed
+    // replicas removed and queues a REMOVE whose durable callback drops them,
+    // and the object with them.
+    tl::expected<void, ErrorCode> MarkRemovedAndPersist(
+        const TenantId& tenant_id, const std::string& key,
+        ObjectMetadata& metadata);
+    // Returns why a remove may not take the object, or nothing if it may: its
+    // lease is still held (unless `force`), a replica is incomplete, or a
+    // replication task reads it.
+    static tl::expected<void, ErrorCode> CheckRemovable(
+        const ObjectMetadata& metadata, const route::ObjectState& state,
+        bool force, std::chrono::system_clock::time_point now);
+    struct RemoveResult {
+        long removed_count{0};
+        int64_t freed_bytes{0};
+        // Whether the walk reached any object, and whether it left any
+        // behind (not removable, or its removal could not be queued).
+        bool saw_object{false};
+        bool skipped_object{false};
+    };
+    // Removes each of the tenant's objects whose key `matches_key` accepts
+    // (every key, if unset) and that CheckRemovable lets go. `on_remove`, if
+    // set, sees each one just before it goes.
+    RemoveResult RemoveTenantObjects(
+        const TenantId& tenant_id, bool force,
+        std::chrono::system_clock::time_point now,
+        const std::function<bool(const std::string& key)>& matches_key,
+        const std::function<void(const ObjectMetadata&)>& on_remove);
     void RebuildGroupState();
     // Post-restore migration: re-route every object to its hash(tenant, key)
     // shard, fixing snapshots that placed grouped objects on hash(group_id)
@@ -1584,8 +1612,9 @@ class MasterService {
             tl::expected<std::vector<Replica::Descriptor>, ErrorCode>(
                 bool* dfs_allocation_failed)>& admit)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
-    // The accessor's first step: drops the held object's memory replicas whose
-    // segment is gone, and the object with them when none is left valid.
+    // The first step of an accessor that holds a key by name: drops the held
+    // object's memory replicas whose segment is gone, and the object with them
+    // when none is left valid.
     void CleanupInvalidMemoryReplicas(MetadataAccessorRW& accessor);
 
     /**
@@ -1766,6 +1795,10 @@ class MasterService {
 
         // Holds the key only while `ref` is still its current publication: a
         // key republished since `ref` was taken, or emptied, is not held.
+        // The held object is left as it is, without the invalid-replica
+        // cleanup: the caller comes back to act on what it judged, and the
+        // cleanup's KV sync would bump the tenant epoch a RemoveAll compares
+        // its `cleared` against.
         MetadataAccessorRW(MasterService* service, const TenantId& tenant_id,
                            const route::ObjectRef& ref)
             : service_(service),
@@ -1776,9 +1809,6 @@ class MasterService {
             Locate();
             if (IsPublished() && it_->second.generation != ref.generation) {
                 it_ = tenant_state_->metadata.end();
-            }
-            if (IsPublished()) {
-                service_->CleanupInvalidMemoryReplicas(*this);
             }
         }
 
@@ -2405,10 +2435,10 @@ class MasterService {
 
     std::unique_ptr<KvEventPublisher> kv_event_publisher_;
 
-    // RemoveAll releases each shard lock before moving to the next one, so a
-    // concurrent commit can land in an already-scanned shard. Publishing
-    // `cleared` from the scan's own bookkeeping would then order it after that
-    // commit's `stored` and tell subscribers to drop a live object. Every
+    // RemoveAll holds no lock across its walk, so a concurrent commit can land
+    // in a tenant or shard it already passed. Publishing `cleared` from the
+    // scan's own bookkeeping would then order it after that commit's `stored`
+    // and tell subscribers to drop a live object. Every
     // announcement of a newly available object bumps its tenant's epoch, and a
     // clear is published only if the epoch still matches the value read before
     // the scan began. A racing commit therefore suppresses the
@@ -2428,9 +2458,9 @@ class MasterService {
     bool kv_track_tenant_epochs_{false};
     std::atomic<uint64_t> kv_cleared_published_{0};
     std::atomic<uint64_t> kv_cleared_suppressed_by_epoch_{0};
-    // Fires after each shard's lock is released during a RemoveAll scan, which
-    // is the only point where a test can commit into an already-scanned shard.
-    std::function<void(size_t)> kv_remove_all_shard_hook_;
+    // Fires once per tenant whose objects a RemoveAll has finished removing,
+    // so a test can commit into a tenant the walk already passed.
+    std::function<void(const TenantId&)> kv_remove_all_tenant_hook_;
 
     static size_t KvTenantEpochSlot(const std::string& tenant) {
         return std::hash<std::string>{}(tenant) % kKvTenantEpochSlots;

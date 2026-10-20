@@ -1169,10 +1169,10 @@ TEST_F(MasterServiceTest, RemoveAllKeepsObjectWhenOpLogReservationFails) {
         << "the object survived, so the tenant was never emptied";
 }
 
-// RemoveAll holds one shard lock at a time, so a commit can land in a shard the
-// scan already passed. The scan's own bookkeeping cannot see it, and publishing
+// RemoveAll holds no lock across its walk, so a commit can land in a tenant the
+// walk already passed. The walk's own bookkeeping cannot see it, and publishing
 // `cleared` would order it after that commit's `stored` — telling subscribers
-// to drop an object that is live. Pause the scan right after the shard the new
+// to drop an object that is live. Pause the walk right after the tenant the new
 // key belongs to, commit there, and the clear must be withheld.
 TEST_F(MasterServiceTest, ConcurrentCommitDuringScanSuppressesClear) {
     MasterService service;
@@ -1190,13 +1190,12 @@ TEST_F(MasterServiceTest, ConcurrentCommitDuringScanSuppressesClear) {
                             TenantId::Default(), ReplicaType::ALL)
                     .has_value());
 
-    const size_t racer_shard = ShardIndexForKey(service, "racer_key");
     bool committed = false;
-    MasterServiceTestPeer(service).SetRemoveAllShardHookForTesting(
-        [&](size_t shard) {
-            // Commit exactly once, immediately after the scan releases the
-            // shard the new key hashes to, so the scan can never observe it.
-            if (shard != racer_shard || committed) {
+    MasterServiceTestPeer(service).SetRemoveAllTenantHookForTesting(
+        [&](const TenantId& tenant_id) {
+            // Commit exactly once, immediately after the walk finishes the
+            // tenant the new key belongs to, so the walk can never observe it.
+            if (!tenant_id.IsDefault() || committed) {
                 return;
             }
             committed = true;
@@ -1211,7 +1210,7 @@ TEST_F(MasterServiceTest, ConcurrentCommitDuringScanSuppressesClear) {
         });
 
     service.RemoveAll(true);
-    MasterServiceTestPeer(service).SetRemoveAllShardHookForTesting(nullptr);
+    MasterServiceTestPeer(service).SetRemoveAllTenantHookForTesting(nullptr);
 
     ASSERT_TRUE(committed) << "the hook never fired, so nothing was raced";
     auto exists = service.ExistKey("racer_key", TenantId::Default());
@@ -1270,11 +1269,10 @@ TEST_F(MasterServiceTest, TenantScopedRemoveAllSuppressesClearOnRace) {
                             TenantId::Default(), ReplicaType::ALL)
                     .has_value());
 
-    const size_t racer_shard = ShardIndexForKey(service, "scoped_racer");
     bool committed = false;
-    MasterServiceTestPeer(service).SetRemoveAllShardHookForTesting(
-        [&](size_t shard) {
-            if (shard != racer_shard || committed) {
+    MasterServiceTestPeer(service).SetRemoveAllTenantHookForTesting(
+        [&](const TenantId& tenant_id) {
+            if (!tenant_id.IsDefault() || committed) {
                 return;
             }
             committed = true;
@@ -1289,7 +1287,7 @@ TEST_F(MasterServiceTest, TenantScopedRemoveAllSuppressesClearOnRace) {
         });
 
     service.RemoveAll(TenantId::Default(), true);
-    MasterServiceTestPeer(service).SetRemoveAllShardHookForTesting(nullptr);
+    MasterServiceTestPeer(service).SetRemoveAllTenantHookForTesting(nullptr);
 
     ASSERT_TRUE(committed) << "the hook never fired, so nothing was raced";
     EXPECT_EQ(0u,
