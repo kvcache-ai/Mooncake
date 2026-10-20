@@ -107,7 +107,12 @@ Status ProxyManager::deconstruct() {
         return Status::OK();
     }
     for (size_t i = 0; i < kShards; ++i) {
-        shards_[i].cv.notify_all();
+        {
+            // Pair with the waiter's predicate check so shutdown cannot
+            // notify between that check and entering the condition wait.
+            std::lock_guard<std::mutex> lk(shards_[i].mu);
+            shards_[i].cv.notify_all();
+        }
         if (shards_[i].thread.joinable()) shards_[i].thread.join();
     }
 
