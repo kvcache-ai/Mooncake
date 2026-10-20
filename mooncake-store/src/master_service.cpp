@@ -10725,40 +10725,40 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
         return metadata.HasReplica(&Replica::fn_is_local_disk_replica);
     };
     auto evict_replicas =
-        [&, this](TenantQuotaHandle quota_account, ObjectMetadata& metadata,
-                  std::vector<std::vector<Replica>>& deferred_replicas) {
-            if (enable_oplog_) {
-                // PersistMemoryEvictionToOpLog marked them REMOVED; the
-                // durable finalize frees them and releases their quota.
-                return metadata.TotalLength() *
-                       metadata.CountReplicas([](const Replica& replica) {
-                           return replica.is_memory_replica() &&
-                                  replica.status() == ReplicaStatus::REMOVED;
-                       });
-            }
-            const uint64_t before_charge = CompletedMemoryQuotaCharge(metadata);
-            auto replicas = PopReplicasWithCacheTotalAccounting(
-                metadata, is_evictable_memory_replica);
-            std::vector<ReplicaID> erased_ids;
-            erased_ids.reserve(replicas.size());
-            for (const auto& replica : replicas) {
-                erased_ids.push_back(replica.id());
-            }
-            dynamic_replication_.RecordReplicaRemoval(metadata, erased_ids);
-            const uint64_t replica_count = replicas.size();
-            if (!replicas.empty()) {
-                deferred_replicas.emplace_back(std::move(replicas));
-            }
-            const uint64_t after_charge = CompletedMemoryQuotaCharge(metadata);
-            if (before_charge > after_charge) {
-                auto release_result = metadata.quota_ledger.ReleaseCommitted(
-                    quota_account, before_charge - after_charge);
-                LogTenantQuotaLedgerError(release_result, "release_committed",
-                                          metadata.tenant_id,
-                                          metadata.user_key);
-            }
-            return metadata.TotalLength() * replica_count;
-        };
+        [&, this](
+            TenantQuotaHandle quota_account, ObjectMetadata& metadata,
+            std::vector<std::vector<Replica>>& deferred_replicas) -> uint64_t {
+        if (enable_oplog_) {
+            // PersistMemoryEvictionToOpLog marked them REMOVED; the
+            // durable finalize frees them and releases their quota.
+            return metadata.TotalLength() *
+                   metadata.CountReplicas([](const Replica& replica) {
+                       return replica.is_memory_replica() &&
+                              replica.status() == ReplicaStatus::REMOVED;
+                   });
+        }
+        const uint64_t before_charge = CompletedMemoryQuotaCharge(metadata);
+        auto replicas = PopReplicasWithCacheTotalAccounting(
+            metadata, is_evictable_memory_replica);
+        std::vector<ReplicaID> erased_ids;
+        erased_ids.reserve(replicas.size());
+        for (const auto& replica : replicas) {
+            erased_ids.push_back(replica.id());
+        }
+        dynamic_replication_.RecordReplicaRemoval(metadata, erased_ids);
+        const uint64_t replica_count = replicas.size();
+        if (!replicas.empty()) {
+            deferred_replicas.emplace_back(std::move(replicas));
+        }
+        const uint64_t after_charge = CompletedMemoryQuotaCharge(metadata);
+        if (before_charge > after_charge) {
+            auto release_result = metadata.quota_ledger.ReleaseCommitted(
+                quota_account, before_charge - after_charge);
+            LogTenantQuotaLedgerError(release_result, "release_committed",
+                                      metadata.tenant_id, metadata.user_key);
+        }
+        return metadata.TotalLength() * replica_count;
+    };
     long offload_queued_this_call = 0;
     long offload_deferred_count = 0;
     long offload_cap_forced_count = 0;
