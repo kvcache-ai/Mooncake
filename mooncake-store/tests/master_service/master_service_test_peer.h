@@ -35,8 +35,6 @@ class MasterServiceTestPeer {
     static constexpr auto kMaxPromotionExecutionFailures =
         MasterService::kMaxPromotionExecutionFailures;
     static constexpr auto kNumShards = MasterService::kNumShards;
-    static constexpr auto kObjectOperationLockStripes =
-        MasterService::kObjectOperationLockStripes;
     static constexpr auto kPromotionCandidateMaxRetries =
         PromotionCandidateTracker::kMaxRetries;
 
@@ -199,13 +197,6 @@ class MasterServiceTestPeer {
     }
     static const auto& NofSegmentManager(const MasterService& service) {
         return service.nof_segment_manager_;
-    }
-
-    static auto& ObjectOperationLocks(MasterService& service) {
-        return service.object_operation_locks_;
-    }
-    static const auto& ObjectOperationLocks(const MasterService& service) {
-        return service.object_operation_locks_;
     }
 
     static auto& OrderedOplogWriter(MasterService& service) {
@@ -405,10 +396,16 @@ class MasterServiceTestPeer {
     }
 
     void FinalizeExpiredProcessingReplicasAfterDurable(
-        const OpLogEntry& durable_entry,
+        route::ObjectRef object, const OpLogEntry& durable_entry,
         const std::chrono::system_clock::time_point& ttl) {
-        service_.FinalizeExpiredProcessingReplicasAfterDurable(durable_entry,
-                                                               ttl);
+        service_.FinalizeExpiredProcessingReplicasAfterDurable(
+            std::move(object), durable_entry, ttl);
+    }
+
+    void FinalizeMetadataEraseAfterDurable(route::ObjectRef object,
+                                           const TenantId& tenant_id) {
+        service_.FinalizeMetadataEraseAfterDurable(std::move(object), tenant_id,
+                                                   QuotaEraseMode::kFull);
     }
 
     void FinalizeRemovedReplicasAfterDurable(
