@@ -7769,9 +7769,8 @@ tl::expected<void, ErrorCode> MasterService::MarkRemovedAndPersist(
     }
     std::vector<ReplicaID> removed_ids;
     metadata.VisitReplicas(&Replica::fn_is_completed,
-                           [&removed_ids](Replica& replica) {
+                           [&removed_ids](const Replica& replica) {
                                removed_ids.push_back(replica.id());
-                               replica.mark_removed();
                            });
     auto persist_result = AppendReservedOpLogWithDurableFinalize(
         std::move(reservation.value()), OpType::REMOVE, tenant_id.value(), key,
@@ -7784,6 +7783,11 @@ tl::expected<void, ErrorCode> MasterService::MarkRemovedAndPersist(
     if (!persist_result) {
         return tl::make_unexpected(persist_result.error());
     }
+    // Marked only once the REMOVE is queued, so a failed append leaves the
+    // object as it was. The durable finalizer takes this object's shard lock,
+    // which the caller holds, so it cannot run before the marks land.
+    metadata.VisitReplicas(&Replica::fn_is_completed,
+                           [](Replica& replica) { replica.mark_removed(); });
     return {};
 }
 
