@@ -34,6 +34,7 @@ struct MluCopyQueue {
     CNcontext context = nullptr;
     CNqueue handle = nullptr;
     std::mutex mutex;
+    Status error;
     ~MluCopyQueue();
     Status synchronize();
 };

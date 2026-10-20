@@ -64,10 +64,14 @@ device queues and reports completion after a notifier finishes. Internal staging
 buffers use `cnrtHostMalloc`, so the existing chunk scheduler can overlap device
 copies with TCP or HP TCP transfers. Host allocations requested explicitly through
 the MLU transport also use this allocator; their NUMA placement is determined by
-the SDK. Host-to-MLU copies of at most 64 KiB retain synchronous copies to avoid
-the queue overhead for small transfers. Ordinary pageable host buffers also use
-synchronous copies. Applications must keep both allocations alive until the
-transfer reaches a terminal state.
+the SDK. Host-to-MLU copies of at most 64 KiB run synchronously when their
+context's H2D queue is absent or idle. With earlier H2D work pending, pinned
+copies join the same queue; pageable copies wait for that queue to drain before
+copying synchronously. Submission is serialized through the idle check and
+inline copy, preserving H2D copy order within each context and transport.
+Dependencies across directions or contexts still require waiting for the
+preceding transfer to complete. Applications must keep both allocations alive
+and source contents unchanged until the transfer reaches a terminal state.
 
 Freeing a sub-batch, unregistering its buffers, or shutting down the transport
 drains outstanding copies before reclaiming resources. A notifier-record failure

@@ -161,6 +161,7 @@ Status MluTransport::freeSubBatch(SubBatchRef &batch) {
 
 Status MluTransport::submitTransferTasks(
     SubBatchRef batch, const std::vector<Request> &request_list) {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (!installed_)
         return Status::InvalidArgument("MLU transport is not installed");
     auto mlu_batch = dynamic_cast<MluSubBatch *>(batch);
@@ -234,27 +235,50 @@ Status MluTransport::submitCopy(MluTask &task, bool to_device) {
     if (task.request.opcode == Request::READ) std::swap(src, dst);
     const auto length = task.request.length;
     if (!length) return Status::OK();
-    // Small H2D copies finish sooner inline than through a device queue.
     constexpr size_t kInlineH2DLimit = 64 * 1024;
-    if (to_device && length <= kInlineH2DLimit)
-        return platform_->copy(dst, src, length);
+    const bool small_h2d = to_device && length <= kInlineH2DLimit;
+    // submitTransferTasks holds mutex_ through the copy, including before
+    // the first queue is created. Small-only workloads need no driver queue.
+    if (small_h2d && queues_.empty()) return platform_->copy(dst, src, length);
     void *host = to_device ? src : dst;
     void *device = to_device ? dst : src;
     cnrtPointerAttributes_t attributes{};
     auto result = cnrtPointerGetAttributes(&attributes, host);
     if (result != cnrtSuccess)
         return Status::InternalError(cnrtGetErrorStr(result));
-    // Host registration is unavailable on some Neuware/device combinations.
-    // Internal staging uses SDK-pinned allocations; pageable callers retain
-    // the synchronous copy path.
-    if (attributes.type != cnrtMemTypeHost)
-        return platform_->copy(dst, src, length);
+    const bool pinned = attributes.type == cnrtMemTypeHost;
+    if (!to_device && !pinned) return platform_->copy(dst, src, length);
 
     CNcontext context = nullptr;
     CHECK_STATUS(driverStatus(cnGetMemAttribute(
         &context, CN_MEM_ATTRIBUTE_CONTEXT, reinterpret_cast<CNaddr>(device))));
     ContextGuard guard;
     CHECK_STATUS(guard.use(context));
+    if (to_device && (small_h2d || !pinned)) {
+        auto it = queues_.find(context);
+        if (it == queues_.end() || !it->second[1])
+            return platform_->copy(dst, src, length);
+        auto &queue = it->second[1];
+        std::lock_guard<std::mutex> lock(queue->mutex);
+        CHECK_STATUS(queue->error);
+        auto ready = cnQueryQueue(queue->handle);
+        if (ready == CN_SUCCESS) return platform_->copy(dst, src, length);
+        if (ready != CN_ERROR_NOT_READY) {
+            queue->error = driverStatus(ready);
+            return queue->error;
+        }
+        // Busy pinned copies join the same H2D queue below. Pageable copies
+        // cannot use that path: drain this direction before copying inline.
+        // mutex_ prevents a later submission from passing either path.
+        if (!pinned) {
+            auto drained = driverStatus(cnQueueSync(queue->handle));
+            if (!drained.ok()) {
+                queue->error = drained;
+                return drained;
+            }
+            return platform_->copy(dst, src, length);
+        }
+    }
     CNaddr base = 0;
     cn_uint64_t size = 0;
     auto address = reinterpret_cast<CNaddr>(device);
@@ -264,7 +288,6 @@ Status MluTransport::submitCopy(MluTask &task, bool to_device) {
         return Status::InvalidArgument(
             "MLU memory range exceeds its allocation");
     {
-        std::lock_guard<std::mutex> lock(mutex_);
         auto &queue = queues_[context][to_device ? 1 : 0];
         if (!queue) {
             auto created = std::make_shared<MluCopyQueue>();
@@ -277,6 +300,7 @@ Status MluTransport::submitCopy(MluTask &task, bool to_device) {
     CHECK_STATUS(driverStatus(
         cnCreateNotifier(&task.completion, CN_NOTIFIER_DISABLE_TIMING)));
     std::lock_guard<std::mutex> lock(task.queue->mutex);
+    CHECK_STATUS(task.queue->error);
     auto status = driverStatus(cnMemcpyAsync_V3(reinterpret_cast<CNaddr>(dst),
                                                 reinterpret_cast<CNaddr>(src),
                                                 length, task.queue->handle));
