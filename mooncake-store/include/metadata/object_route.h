@@ -93,9 +93,11 @@ struct ObjectRef {
 struct SlotOwnerState {
     // Whether the owner's in-flight list holds the slot.
     bool in_flight_listed{false};
-    // Whether the owner's eviction index files the slot, and at what rank.
+    // Whether the owner's eviction index files the slot, at what rank, and
+    // under which of the index's own entries for a group, if any.
     bool eviction_filed{false};
     int64_t eviction_rank{0};
+    void* eviction_group{nullptr};
     // Two words for the owner's namespace policy.
     std::array<uint64_t, 2> policy_words{};
 };
