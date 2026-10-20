@@ -672,4 +672,5 @@ If a protocol fails to initialize:
 ../design/transfer-engine/transport/sunrise_link_transport
 ../design/transfer-engine/transport/flagcx_transport
 ../design/transfer-engine/transport/mpcomm_transport
+../design/transfer-engine/transport/memfabric_transport
 :::

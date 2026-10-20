@@ -47,6 +47,7 @@ add_store_test(replica_allocator_test replica_allocator_test.cpp)
 add_store_test(segment_pool_test segment_pool_test.cpp)
 add_store_test(runtime_accelerator_test runtime_accelerator_test.cpp)
 add_store_test(batch_read_fanout_test batch_read_fanout_test.cpp)
+add_store_test(real_client_direct_read_test real_client_direct_read_test.cpp)
 add_store_test(registered_pinned_memory_test registered_pinned_memory_test.cpp)
 add_store_test(egm_store_pool_test egm_store_pool_test.cpp)
 add_store_test(allocation_strategy_test allocation_strategy_test.cpp)
@@ -67,6 +68,7 @@ set_tests_properties(replica_selection_env_opt_in_test
 add_store_test(eviction_strategy_test eviction_strategy_test.cpp)
 add_store_test(deadline_scheduler_test deadline_scheduler_test.cpp)
 add_store_test(background_worker_test background_worker_test.cpp)
+add_store_test(session_tag_test session_tag_test.cpp)
 add_store_test(kv_event_publisher_test kv_event_publisher_test.cpp)
 if(ENABLE_KV_EVENTS)
   target_compile_definitions(kv_event_publisher_test
@@ -76,11 +78,15 @@ endif()
 add_subdirectory(master_service)
 
 add_store_test(master_service_test master_service_test.cpp)
+add_store_test(master_service_probe_policy_test
+               master_service_probe_policy_test.cpp)
 add_store_test(master_metadata_config_test master_metadata_config_test.cpp)
 add_store_test(dfs_enablement_config_test dfs_enablement_config_test.cpp)
 add_store_test(master_service_weight_management_test
                master_service_weight_management_test.cpp)
 add_store_test(master_service_group_test master_service_group_test.cpp)
+add_store_test(master_service_object_ref_test
+               master_service_object_ref_test.cpp)
 add_ha_test(master_service_evict_scenario_test
             master_service_evict_scenario_test.cpp)
 target_link_libraries(master_service_evict_scenario_test
@@ -161,11 +167,12 @@ set_tests_properties(master_service_hca_affinity_test
                      PROPERTIES ENVIRONMENT "MC_STORE_HCA_AFFINITY=1")
 add_store_test(batch_replica_clear_tenant_rpc_test
                batch_replica_clear_tenant_rpc_test.cpp)
+add_store_test(rpc_worker_pool_test rpc_worker_pool_test.cpp)
 add_test(
   NAME object_checksum_client_test
   COMMAND
     client_integration_test
-    "--gtest_filter=ObjectChecksumTest.*:ClientIntegrationTest.ObjectChecksumRejectsCorruptedObject:ClientIntegrationTest.BatchPutPreservesObjectChecksumPairing"
+    "--gtest_filter=ObjectChecksumTest.*:ClientIntegrationTest.ObjectChecksumRejectsCorruptedObject:ClientIntegrationTest.BatchPutPreservesObjectChecksumPairing:ClientIntegrationTest.TaggedBatchWritesSkipChecksumFailures"
 )
 set_tests_properties(object_checksum_client_test
                      PROPERTIES ENVIRONMENT "MOONCAKE_STORE_CHECKSUM=1")
@@ -224,11 +231,13 @@ add_store_test(tenant_quota_test tenant_quota_test.cpp)
 add_store_test(tenant_quota_manager_test tenant_quota_manager_test.cpp)
 add_store_test(tenant_quota_ledger_test tenant_quota_ledger_test.cpp)
 add_store_test(tenant_id_test tenant_id_test.cpp)
-add_store_test(object_entry_test object_entry_test.cpp)
-add_store_test(object_index_test object_index_test.cpp)
+add_store_test(object_part_test object_part_test.cpp)
+add_store_test(object_route_test object_route_test.cpp)
 add_store_test(heap_optional_test heap_optional_test.cpp)
 add_store_test(dynamic_replication_controller_test
                dynamic_replication_controller_test.cpp)
+add_store_test(promotion_candidate_tracker_test
+               promotion_candidate_tracker_test.cpp)
 add_store_test(dynamic_replication_lease_table_test
                dynamic_replication_lease_table_test.cpp)
 add_store_test(group_index_test group_index_test.cpp)
@@ -261,6 +270,8 @@ add_store_test(cxl_segment_config_test cxl_segment_config_test.cpp)
 add_store_test(client_numa_config_test client_numa_config_test.cpp)
 add_store_test(local_hot_cache_config_test local_hot_cache_config_test.cpp)
 add_store_test(client_local_hot_cache_test client_local_hot_cache_test.cpp)
+add_store_test(local_hot_cache_concurrency_test
+               local_hot_cache_concurrency_test.cpp)
 add_store_test(real_client_hugepage_register_test real_client_hugepage_register_test.cpp)
 add_store_test(real_client_regular_page_register_test real_client_regular_page_register_test.cpp)
 add_store_test(client_tcp_local_memcpy_test client_tcp_local_memcpy_test.cpp)
@@ -395,6 +406,13 @@ if(MOONCAKE_OSS_ADAPTER_ENABLED)
   add_store_test(oss_adapter_config_test oss_adapter_config_test.cpp)
   add_store_test(oss_adapter_test oss_adapter_test.cpp)
 endif()
+if(MOONCAKE_S3_ADAPTER_ENABLED)
+  add_store_test(s3_adapter_config_test s3_adapter_config_test.cpp)
+  add_store_test(s3_adapter_test s3_adapter_test.cpp)
+  add_store_test(s3_adapter_engine_test s3_adapter_engine_test.cpp)
+  add_store_test(s3_adapter_live_test s3_adapter_live_test.cpp)
+  add_store_test(object_storage_xml_test object_storage_xml_test.cpp)
+endif()
 add_store_test(http_metadata_server_test http_metadata_server_test.cpp)
 add_store_test(mmap_arena_test mmap_arena_test.cpp)
 add_store_test(mmap_arena_config_test mmap_arena_config_test.cpp)
@@ -501,6 +519,13 @@ target_compile_definitions(oplog_test_failpoint_test
 target_link_libraries(oplog_test_failpoint_test PRIVATE glog::glog gtest
                                                         gtest_main pthread)
 add_test(NAME oplog_test_failpoint_test COMMAND oplog_test_failpoint_test)
+add_executable(shutdown_request_test shutdown_request_test.cpp
+                                     ../src/shutdown_request.cpp)
+target_include_directories(shutdown_request_test
+                           PRIVATE ${MOONCAKE_STORE_INCLUDE_ROOT})
+target_link_libraries(shutdown_request_test PRIVATE glog::glog gtest gtest_main
+                                                    pthread)
+add_test(NAME shutdown_request_test COMMAND shutdown_request_test)
 add_ha_test(master_service_ha_test ha/master_service_ha_test.cpp)
 
 foreach(

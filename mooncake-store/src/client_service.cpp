@@ -2676,10 +2676,13 @@ void Client::healDanglingLocalDiskBatchStarts(
     if (retry_keys.empty()) {
         return;
     }
+    const auto retry_config =
+        config.group_ids || config.session_ids ||
+                config.per_key_preferred_hca_names
+            ? std::make_optional(config.ForKeySubset(retry_config_indices))
+            : std::nullopt;
     auto retry_responses = master_client_.BatchPutStart(
-        retry_keys, retry_slices,
-        StoreHcaAffinityEnabled() ? config.ForKeySubset(retry_config_indices)
-                                  : config);
+        retry_keys, retry_slices, retry_config ? *retry_config : config);
     if (retry_responses.size() != retry_keys.size()) {
         return;
     }
@@ -2744,11 +2747,16 @@ void Client::StartBatchPut(std::vector<PutOperation>& ops,
         return;
     }
 
-    const auto affinity_config =
-        StoreHcaAffinityEnabled() ? std::make_optional(AttachBatchHcaAffinity(
-                                        base_config, ops, active_indices))
-                                  : std::nullopt;
-    const auto& config = affinity_config ? *affinity_config : base_config;
+    std::optional<ReplicateConfig> active_config;
+    if (StoreHcaAffinityEnabled()) {
+        active_config =
+            AttachBatchHcaAffinity(base_config, ops, active_indices);
+    } else if (active_indices.size() != ops.size() &&
+               (base_config.group_ids || base_config.session_ids ||
+                base_config.per_key_preferred_hca_names)) {
+        active_config = base_config.ForKeySubset(active_indices);
+    }
+    const auto& config = active_config ? *active_config : base_config;
     auto start_responses =
         master_client_.BatchPutStart(keys, slice_lengths, config);
 
@@ -2848,11 +2856,16 @@ void Client::StartBatchUpsert(std::vector<PutOperation>& ops,
         return;
     }
 
-    const auto affinity_config =
-        StoreHcaAffinityEnabled() ? std::make_optional(AttachBatchHcaAffinity(
-                                        base_config, ops, active_indices))
-                                  : std::nullopt;
-    const auto& config = affinity_config ? *affinity_config : base_config;
+    std::optional<ReplicateConfig> active_config;
+    if (StoreHcaAffinityEnabled()) {
+        active_config =
+            AttachBatchHcaAffinity(base_config, ops, active_indices);
+    } else if (active_indices.size() != ops.size() &&
+               (base_config.group_ids || base_config.session_ids ||
+                base_config.per_key_preferred_hca_names)) {
+        active_config = base_config.ForKeySubset(active_indices);
+    }
+    const auto& config = active_config ? *active_config : base_config;
     auto start_responses =
         master_client_.BatchUpsertStart(keys, slice_lengths, config);
 
@@ -3735,7 +3748,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const ReplicateConfig& config, const WriteBufferStager& stager) {
-    if (StoreHcaAffinityEnabled() && !config.HasValidKeyHints(keys.size())) {
+    if (!config.ValidSessionIds(keys.size()) ||
+        !config.HasValidKeyHints(keys.size())) {
         return std::vector<tl::expected<void, ErrorCode>>(
             keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     }
@@ -3785,7 +3799,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const ReplicateConfig& config, const WriteBufferStager& stager) {
-    if (StoreHcaAffinityEnabled() && !config.HasValidKeyHints(keys.size())) {
+    if (!config.ValidSessionIds(keys.size()) ||
+        !config.HasValidKeyHints(keys.size())) {
         return std::vector<tl::expected<void, ErrorCode>>(
             keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     }
@@ -3828,6 +3843,10 @@ Client::StartBatchPutForSizes(const std::vector<std::string>& keys,
                               const ReplicateConfig& config) {
     std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
         results(keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    if (!config.ValidSessionIds(keys.size()) ||
+        !config.HasValidKeyHints(keys.size())) {
+        return results;
+    }
     if (keys.size() != object_sizes.size()) {
         LOG(ERROR) << "StartBatchPutForSizes size mismatch: keys="
                    << keys.size() << ", sizes=" << object_sizes.size();
@@ -4292,8 +4311,8 @@ std::vector<tl::expected<bool, ErrorCode>> Client::BatchIsExist(
 }
 
 std::vector<tl::expected<bool, ErrorCode>> Client::BatchProbeKey(
-    const std::vector<std::string>& keys) {
-    auto response = master_client_.BatchProbeKey(keys);
+    const std::vector<std::string>& keys, const GrantLeasePolicy& policy) {
+    auto response = master_client_.BatchProbeKey(keys, policy);
 
     // Check if we got the expected number of responses
     if (response.size() != keys.size()) {
@@ -5780,13 +5799,29 @@ void Client::ProcessSlicesAsync(const std::string& key,
         return;
     }
 
+    // The writeback copies out of the read destination with a host memcpy
+    // (LocalHotCacheHandler::SubmitPutTask), so a slice that landed in device
+    // memory (e.g. batch_get_into into CUDA buffers) would fault the reader.
+    // Device-resident results are not cached through this path.
+    auto runtime_accelerator =
+        device::GetAcceleratorRegistry().RuntimeAccelerators();
+    size_t device_dest_slices = 0;
     // Identify TE transfer slices (non-local) and submit async put tasks
     for (size_t i = 0; i < slices.size(); ++i) {
+        if (runtime_accelerator.FindDeviceForPointer(slices[i].ptr) !=
+            nullptr) {
+            ++device_dest_slices;
+            continue;
+        }
         if (!hot_cache_handler_->SubmitPutTask(key, slices[i])) {
             LOG(ERROR) << "Failed to submit hot cache put task for key=" << key
                        << " slice_idx=" << i;
             return;
         }
+    }
+    if (device_dest_slices > 0) {
+        LOG(INFO) << "Skipped hot-cache writeback for " << device_dest_slices
+                  << " device-resident slice(s), key=" << key;
     }
 }
 

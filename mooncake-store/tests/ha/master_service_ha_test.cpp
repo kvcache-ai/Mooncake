@@ -1037,19 +1037,12 @@ class MasterServiceHATest : public ::testing::Test {
         return task.get().has_value() && reached_discovery && metadata_released;
     }
 
+    // PutStart is the only caller in these tests that holds the snapshot
+    // barrier shared, so a barrier that cannot be taken exclusively while the
+    // client lock is free means PutStart reached it and let the client lock
+    // go.
     static bool PutStartHoldsSnapshotAfterClientReleaseForTesting(
-        MasterService& service, const TenantId& tenant_id,
-        const std::string& key) {
-        const auto scoped_key = tenant_id.MakeScopedKey(key);
-        const size_t stripe_idx =
-            std::hash<std::string>{}(scoped_key) %
-            MasterServiceTestPeer::kObjectOperationLockStripes;
-        std::unique_lock<std::mutex> object_lock(
-            MasterServiceTestPeer::ObjectOperationLocks(service)[stripe_idx],
-            std::try_to_lock);
-        if (object_lock.owns_lock()) {
-            return false;
-        }
+        MasterService& service) {
         std::unique_lock<std::shared_mutex> client_lock(
             MasterServiceTestPeer::ClientMutex(service), std::try_to_lock);
         if (!client_lock.owns_lock()) {
@@ -2034,8 +2027,7 @@ TEST_F(MasterServiceHATest,
         std::chrono::steady_clock::now() + std::chrono::seconds(5);
     bool reached_snapshot = false;
     while (std::chrono::steady_clock::now() < deadline) {
-        if (PutStartHoldsSnapshotAfterClientReleaseForTesting(
-                service, kDefaultTenant, key)) {
+        if (PutStartHoldsSnapshotAfterClientReleaseForTesting(service)) {
             reached_snapshot = true;
             break;
         }

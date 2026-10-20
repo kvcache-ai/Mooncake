@@ -21,9 +21,11 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <fcntl.h>
 #include <iomanip>
 #include <memory>
 #include <mutex>
+#include <unistd.h>
 
 #include "tent/runtime/slab.h"
 
@@ -31,21 +33,21 @@ namespace mooncake {
 namespace tent {
 class GdsFileContext {
    public:
-    explicit GdsFileContext(const std::string& path) : ready_(false) {
-        int fd = open(path.c_str(), O_RDWR | O_DIRECT);
-        if (fd < 0) {
+    explicit GdsFileContext(const std::string& path) {
+        fd_ = open(path.c_str(), O_RDWR | O_DIRECT);
+        if (fd_ < 0) {
             PLOG(ERROR) << "Failed to open file " << path;
             return;
         }
-        memset(&desc_, 0, sizeof(desc_));
         desc_.type = CU_FILE_HANDLE_TYPE_OPAQUE_FD;
-        desc_.handle.fd = fd;
+        desc_.handle.fd = fd_;
         auto result = cuFileHandleRegister(&handle_, &desc_);
         if (result.err != CU_FILE_SUCCESS) {
             LOG(ERROR) << "Failed to register GDS file handle: Code "
                        << result.err;
             return;
         }
+        handle_registered_ = true;
         ready_ = true;
     }
 
@@ -53,8 +55,8 @@ class GdsFileContext {
     GdsFileContext& operator=(const GdsFileContext&) = delete;
 
     ~GdsFileContext() {
-        if (handle_) cuFileHandleDeregister(handle_);
-        if (desc_.handle.fd) close(desc_.handle.fd);
+        if (handle_registered_) cuFileHandleDeregister(handle_);
+        if (fd_ >= 0) close(fd_);
     }
 
     CUfileHandle_t getHandle() const { return handle_; }
@@ -63,8 +65,10 @@ class GdsFileContext {
 
    private:
     CUfileHandle_t handle_ = NULL;
-    CUfileDescr_t desc_;
-    bool ready_;
+    CUfileDescr_t desc_{};
+    int fd_ = -1;
+    bool handle_registered_ = false;
+    bool ready_ = false;
 };
 
 TransferStatusEnum parseTransferStatus(CUfileStatus_t status) {
@@ -287,12 +291,21 @@ Status GdsTransport::uninstall() {
         }
 
         // Clean up all handles in the pool
-        std::lock_guard<std::mutex> lock(handle_pool_lock_);
-        for (auto* batch_handle : handle_pool_) {
-            cuFileBatchIODestroy(batch_handle->handle);
-            delete batch_handle;
+        {
+            std::lock_guard<std::mutex> lock(handle_pool_lock_);
+            for (auto* batch_handle : handle_pool_) {
+                cuFileBatchIODestroy(batch_handle->handle);
+                delete batch_handle;
+            }
+            handle_pool_.clear();
         }
-        handle_pool_.clear();
+
+        FileContextMap file_contexts;
+        {
+            RWSpinlock::WriteGuard guard(file_context_lock_);
+            file_contexts.swap(file_context_map_);
+        }
+        file_contexts.clear();
 
         metadata_.reset();
         installed_ = false;
@@ -418,20 +431,37 @@ std::string GdsTransport::getGdsFilePath(SegmentID target_id) {
     return ret;
 }
 
-GdsFileContext* GdsTransport::findFileContext(SegmentID target_id) {
-    thread_local FileContextMap tl_file_context_map;
-    if (tl_file_context_map.count(target_id))
-        return tl_file_context_map[target_id].get();
-
+std::shared_ptr<GdsFileContext> GdsTransport::getOrCreateFileContext(
+    SegmentID target_id, const std::string& path) {
     RWSpinlock::WriteGuard guard(file_context_lock_);
-    if (!file_context_map_.count(target_id)) {
-        std::string path = getGdsFilePath(target_id);
-        if (path.empty()) return nullptr;
-        file_context_map_[target_id] = std::make_shared<GdsFileContext>(path);
+    auto context_it = file_context_map_.find(target_id);
+    if (context_it != file_context_map_.end()) {
+        if (context_it->second->ready()) return context_it->second;
+        file_context_map_.erase(context_it);
+    }
+    if (path.empty()) return nullptr;
+
+    auto context = std::make_shared<GdsFileContext>(path);
+    if (!context->ready()) return nullptr;
+
+    file_context_map_.emplace(target_id, context);
+    return context;
+}
+
+std::shared_ptr<GdsFileContext> GdsTransport::findFileContext(
+    SegmentID target_id) {
+    {
+        RWSpinlock::ReadGuard guard(file_context_lock_);
+        auto context_it = file_context_map_.find(target_id);
+        if (context_it != file_context_map_.end() &&
+            context_it->second->ready()) {
+            return context_it->second;
+        }
     }
 
-    tl_file_context_map = file_context_map_;
-    return tl_file_context_map[target_id].get();
+    std::string path = getGdsFilePath(target_id);
+    if (path.empty()) return nullptr;
+    return getOrCreateFileContext(target_id, path);
 }
 
 Status GdsTransport::submitTransferTasks(
@@ -447,9 +477,10 @@ Status GdsTransport::submitTransferTasks(
     if (first_param_index + num_params > io_batch_depth_)
         return Status::TooManyRequests("Exceed batch capacity" LOC_MARK);
     for (auto& request : request_list) {
-        GdsFileContext* context = findFileContext(request.target_id);
+        auto context = findFileContext(request.target_id);
         if (!context || !context->ready())
             return Status::InvalidArgument("Invalid remote segment" LOC_MARK);
+        gds_batch->file_contexts.push_back(context);
         IOParamRange range;
         range.base = gds_batch->io_params.size();
         for (size_t offset = 0; offset < request.length;

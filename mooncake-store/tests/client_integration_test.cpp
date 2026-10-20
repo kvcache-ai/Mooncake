@@ -82,6 +82,24 @@ struct LegacyReplicateConfig {
     std::optional<std::vector<std::string>> group_ids;
 };
 
+// Main's session-aware RPC shape, without this PR's affinity extensions.
+struct SessionReplicateConfig {
+    size_t replica_num{1};
+    size_t nof_replica_num{0};
+    size_t dfs_replica_num{0};
+    SoftPinAction soft_pin_action{SoftPinAction::PRESERVE};
+    std::optional<uint64_t> soft_pin_ttl_ms;
+    bool with_hard_pin{false};
+    std::vector<std::string> preferred_segments;
+    std::string preferred_segment;
+    std::vector<std::string> preferred_nof_segments;
+    bool prefer_alloc_in_same_node{false};
+    ObjectDataType data_type{ObjectDataType::UNKNOWN};
+    std::string host_id;
+    std::optional<std::vector<std::string>> group_ids;
+    struct_pack::compatible<std::vector<std::string>, 1> session_ids;
+};
+
 TEST(HcaAffinityTest, RequestHintIsWireCompatibleAndSurvivesBatchSplitting) {
     LegacyReplicateConfig legacy;
     legacy.preferred_segments = {"receiver"};
@@ -102,6 +120,37 @@ TEST(HcaAffinityTest, RequestHintIsWireCompatibleAndSurvivesBatchSplitting) {
         struct_pack::serialize(*decoded));
     ASSERT_TRUE(old_reader);
     EXPECT_EQ(old_reader->preferred_segments, legacy.preferred_segments);
+}
+
+TEST(HcaAffinityTest, SessionAndAffinityExtensionsRemainWireCompatible) {
+    SessionReplicateConfig session_config;
+    session_config.group_ids = std::vector<std::string>{"g0", "g1"};
+    session_config.session_ids = std::vector<std::string>{"s0", "s1"};
+    EXPECT_EQ(struct_pack::get_type_code<ReplicateConfig>(),
+              struct_pack::get_type_code<SessionReplicateConfig>());
+    auto current = struct_pack::deserialize<ReplicateConfig>(
+        struct_pack::serialize(session_config));
+    ASSERT_TRUE(current);
+    EXPECT_EQ(current->session_ids, session_config.session_ids);
+    EXPECT_FALSE(current->preferred_hca_names);
+    EXPECT_FALSE(current->per_key_preferred_hca_names);
+
+    current->preferred_hca_names = std::vector<std::string>{"mlx5_0"};
+    current->per_key_preferred_hca_names =
+        std::vector<std::vector<std::string>>{{}, {"mlx5_1"}};
+    auto session_reader = struct_pack::deserialize<SessionReplicateConfig>(
+        struct_pack::serialize(*current));
+    ASSERT_TRUE(session_reader);
+    EXPECT_EQ(session_reader->session_ids, session_config.session_ids);
+    EXPECT_EQ(session_reader->group_ids, session_config.group_ids);
+    auto affinity_reader = struct_pack::deserialize<ReplicateConfig>(
+        struct_pack::serialize(*current));
+    ASSERT_TRUE(affinity_reader);
+    EXPECT_EQ(affinity_reader->session_ids, session_config.session_ids);
+    EXPECT_EQ(affinity_reader->preferred_hca_names,
+              current->preferred_hca_names);
+    EXPECT_EQ(affinity_reader->per_key_preferred_hca_names,
+              current->per_key_preferred_hca_names);
 }
 
 TEST(HcaAffinityTest, ReceiverTopologyDeterminesNuma) {
@@ -165,6 +214,7 @@ TEST(HcaAffinityTest, InfersOnlyHomogeneousRegisteredSources) {
 TEST(HcaAffinityTest, BatchHintsFollowKeysAndRetrySubsets) {
     ReplicateConfig config;
     config.group_ids = std::vector<std::string>{"g0", "g1", "g2"};
+    config.session_ids = std::vector<std::string>{"s0", "s1", "s2"};
     config.per_key_preferred_hca_names =
         std::vector<std::vector<std::string>>{{"mlx5_0"}, {"mlx5_1"}, {}};
     EXPECT_TRUE(config.HasValidKeyHints(3));
@@ -172,10 +222,26 @@ TEST(HcaAffinityTest, BatchHintsFollowKeysAndRetrySubsets) {
     auto subset = config.ForKeySubset({2, 0});
     ASSERT_TRUE(subset.HasValidKeyHints(2));
     EXPECT_EQ(*subset.group_ids, (std::vector<std::string>{"g2", "g0"}));
+    ASSERT_TRUE(subset.ValidSessionIds(2));
+    EXPECT_EQ(*subset.session_ids, (std::vector<std::string>{"s2", "s0"}));
+    EXPECT_EQ(subset.ForSingleKey(0).SessionId(), "s2");
     EXPECT_TRUE(subset.ForSingleKey(0).preferred_hca_names->empty());
     EXPECT_EQ(*subset.ForSingleKey(1).preferred_hca_names,
               (std::vector<std::string>{"mlx5_0"}));
     EXPECT_FALSE(subset.ForSingleKey(1).per_key_preferred_hca_names);
+    auto key_config = subset;
+    key_config.preferred_segment = "chosen-receiver";
+    for (size_t index : {1, 0, 1}) {
+        key_config.SetKeyIds(subset, index);
+        EXPECT_EQ(key_config.SessionId(), subset.session_ids->at(index));
+        EXPECT_EQ(*key_config.group_ids,
+                  (std::vector<std::string>{subset.group_ids->at(index)}));
+        EXPECT_EQ(*key_config.preferred_hca_names,
+                  subset.per_key_preferred_hca_names->at(index));
+        EXPECT_FALSE(key_config.per_key_preferred_hca_names);
+        EXPECT_EQ(key_config.preferred_segment, "chosen-receiver");
+    }
+    EXPECT_EQ(config.session_ids->size(), 3);
     auto restored = struct_pack::deserialize<ReplicateConfig>(
         struct_pack::serialize(config));
     ASSERT_TRUE(restored);
@@ -631,6 +697,64 @@ TEST_F(ClientIntegrationTest, BatchPutPreservesObjectChecksumPairing) {
                   ComputeCrcChecksum(values[i].data(), values[i].size()));
         client_buffer_allocator_->deallocate(buffers[i], values[i].size());
     }
+}
+
+TEST_F(ClientIntegrationTest, TaggedBatchWritesSkipChecksumFailures) {
+    if (!ClientObjectChecksumConfig::IsEnabledAtFirstUse()) {
+        GTEST_SKIP() << "MOONCAKE_STORE_CHECKSUM is not enabled";
+    }
+    void* buffer = client_buffer_allocator_->allocate(4);
+    ASSERT_NE(buffer, nullptr);
+    std::memcpy(buffer, "data", 4);
+    for (bool upsert : {false, true}) {
+        const std::vector<ObjectKey> keys = {
+            "invalid-slice", upsert ? "tagged-upsert" : "tagged-put"};
+        std::vector<std::vector<Slice>> slices{{Slice{nullptr, 1}},
+                                               {Slice{buffer, 4}}};
+        ReplicateConfig config;
+        config.session_ids = std::vector<std::string>{"invalid", "valid"};
+        config.group_ids =
+            std::vector<std::string>{"invalid-group", "valid-group"};
+        config.per_key_preferred_hca_names =
+            std::vector<std::vector<std::string>>{{"mlx5_0"}, {"mlx5_1"}};
+        auto results = upsert ? test_client_->BatchUpsert(keys, slices, config)
+                              : test_client_->BatchPut(keys, slices, config);
+        ASSERT_EQ(results.size(), 2);
+        ASSERT_FALSE(results[0]);
+        EXPECT_EQ(results[0].error(), ErrorCode::INVALID_PARAMS);
+        ASSERT_TRUE(results[1]) << toString(results[1].error());
+        auto query = test_client_->Query(keys[1]);
+        ASSERT_TRUE(query);
+        EXPECT_EQ(query->object_checksum, ComputeCrcChecksum("data", 4));
+
+        // A short tag vector must not become valid after filtering a key.
+        config.session_ids = std::vector<std::string>{"wrong"};
+        results = upsert ? test_client_->BatchUpsert(keys, slices, config)
+                         : test_client_->BatchPut(keys, slices, config);
+        for (const auto& result : results) {
+            ASSERT_FALSE(result);
+            EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+        }
+        config.session_ids = std::vector<std::string>{"invalid", "valid"};
+        config.group_ids = std::vector<std::string>{"wrong"};
+        results = upsert ? test_client_->BatchUpsert(keys, slices, config)
+                         : test_client_->BatchPut(keys, slices, config);
+        for (const auto& result : results) {
+            ASSERT_FALSE(result);
+            EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+        }
+        config.group_ids =
+            std::vector<std::string>{"invalid-group", "valid-group"};
+        config.per_key_preferred_hca_names =
+            std::vector<std::vector<std::string>>{{"wrong"}};
+        results = upsert ? test_client_->BatchUpsert(keys, slices, config)
+                         : test_client_->BatchPut(keys, slices, config);
+        for (const auto& result : results) {
+            ASSERT_FALSE(result);
+            EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+        }
+    }
+    client_buffer_allocator_->deallocate(buffer, 4);
 }
 
 // Test Remove operation

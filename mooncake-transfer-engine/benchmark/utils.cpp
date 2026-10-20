@@ -29,10 +29,9 @@ DEFINE_string(
     "Comma-separated segment types for mixed DRAM+VRAM runs, e.g. "
     "\"dram,vram\". When set, target registers buffers of each listed type "
     "in one segment, and initiator threads round-robin across them so a "
-    "single tebench process drives traffic over multiple memory types (and "
-    "thus multiple transports — SHM for DRAM, NVLink for VRAM) "
-    "concurrently. Empty falls back to --seg_type (single type, existing "
-    "behavior). Requires transports to be enabled via MC_TENT_CONF.");
+    "single tebench process drives traffic over multiple memory types "
+    "concurrently. Empty falls back to --seg_type. Select transports "
+    "with --xport_type or MC_TENT_CONF.");
 DEFINE_string(target_seg_name, "",
               "Target segment name for the initiator side. A comma-separated "
               "list enables multi-target initiator mode.");
@@ -97,8 +96,12 @@ DEFINE_int32(deadline_tight_threads, 0,
              "--workload_classes_json.");
 DEFINE_bool(deadline_bw_arbitration, false,
             "tent only: enable deadline-aware RDMA bandwidth arbitration.");
-DEFINE_int32(local_gpu_id, 0, "Local GPU ID to be used, -1 for all GPUs");
-DEFINE_int32(target_gpu_id, 0, "Target GPU ID to be used, -1 for all GPUs");
+DEFINE_int32(local_gpu_id, 0,
+             "Local device ordinal for VRAM, -1 for all visible devices. "
+             "Selects an MLU device with --backend=tent in USE_MLU builds.");
+DEFINE_int32(target_gpu_id, 0,
+             "Offset for round-robin assignment across target buffers; "
+             "-1 uses 0.");
 DEFINE_string(metadata_type, "p2p",
               "Type of metadata service: p2p|etcd|redis|http");
 DEFINE_string(metadata_url_list, "",

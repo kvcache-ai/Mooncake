@@ -131,7 +131,7 @@ jobs:
         python mooncake-wheel/tests/test_cuda_fabric_compat.py -v
       shell: bash
 
-    - name: Run all PG CPU tests with supported PyTorch
+    - name: Run all PG CPU tests with installed PyTorch
       if: matrix.ubuntu-version == 'ubuntu-22.04' && matrix.python-version == '3.12'
       env:
         MC_FORCE_TCP: "true"
@@ -139,7 +139,6 @@ jobs:
         TORCH_CUDA_ARCH_LIST: "8.0"
       run: |
         source test_env/bin/activate
-        python -m pip install torch==2.14.0
         export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}:/usr/local/lib
         python -m unittest discover -s mooncake-pg/tests -k CPU -v
       shell: bash
@@ -443,6 +442,9 @@ jobs:
         if [ "${{ github.event_name }}" == "pull_request" ]; then
           # For PRs: compare against the target branch
           BASE_REF="origin/${{ github.base_ref }}"
+        elif [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+          # Manual runs have no previous push SHA.
+          BASE_REF="origin/${{ github.event.repository.default_branch }}"
         else
           # For push events: use github.event.before to handle multi-commit pushes
           BEFORE_SHA="${{ github.event.before }}"
@@ -639,6 +641,15 @@ jobs:
             cmake_flags: '-DUSE_CUDA=OFF -DUSE_UB=ON -DCMAKE_BUILD_TYPE=Debug'
             need_cuda: false
             metrics_flags: ''
+          # Compile against stub ACL headers and embed host-only ACL stubs in
+          # transfer_engine for Rust checks; no CANN, NPU, or libmf_smem is required.
+          - name: memfabric-mock
+            cmake_flags: >-
+              -DUSE_CUDA=OFF -DUSE_MEMFABRIC=ON
+              -DWITH_STORE=OFF -DWITH_STORE_RUST=OFF
+              -DCMAKE_BUILD_TYPE=Debug
+            need_cuda: false
+            metrics_flags: ''
     name: tent-ci (${{ matrix.name }})
     env:
       CI: "true"
@@ -690,8 +701,12 @@ jobs:
           export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
         fi
         cd build-tent
-        cmake --build .
-        sudo cmake --install .
+        if [ "${{ matrix.name }}" = "memfabric-mock" ]; then
+          cmake --build . --target tent_memfabric_transport_test transfer_engine
+        else
+          cmake --build .
+          sudo cmake --install .
+        fi
       shell: bash
 
     # Check the Transfer Engine Rust crate against the freshly built C++
@@ -739,11 +754,17 @@ jobs:
       id: ctest
       if: '!matrix.need_cuda'
       run: |
+        ctest_args=()
+        if [ "${{ matrix.name }}" = "memfabric-mock" ]; then
+          # Only the MemFabric test executable is built in this test directory.
+          ctest_args=(-R '^tent_memfabric_transport_test$' --no-tests=error --timeout 120)
+        fi
         cd build-tent
         mkdir -p test-results
         ctest --test-dir mooncake-transfer-engine/tent/tests -j \
           --output-on-failure \
-          --output-junit "$GITHUB_WORKSPACE/build-tent/test-results/ctest.xml"
+          --output-junit "$GITHUB_WORKSPACE/build-tent/test-results/ctest.xml" \
+          "${ctest_args[@]}"
       shell: bash
 
     - name: Preserve TENT CTest diagnostics

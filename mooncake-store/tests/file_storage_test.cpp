@@ -540,7 +540,8 @@ class FileStorageTest : public ::testing::Test {
         EXPECT_TRUE(unmount.has_value());
         std::free(seg_ptr);
     }
-    void RunBatchPutHealWipeScenario(const std::string& data_path) {
+    void RunBatchPutHealWipeScenario(const std::string& data_path,
+                                     bool with_session_ids = false) {
         std::filesystem::path master_root =
             std::filesystem::path(data_path) / "heal_master_batch";
         std::filesystem::create_directories(master_root);
@@ -624,7 +625,7 @@ class FileStorageTest : public ::testing::Test {
         // One batch with both wiped keys and a fresh key.
         const std::string fresh_key = "heal_batch_fresh";
         const std::string updated(512, 'y');
-        std::vector<ObjectKey> keys = {wiped_keys[0], wiped_keys[1], fresh_key};
+        std::vector<ObjectKey> keys = {fresh_key, wiped_keys[0], wiped_keys[1]};
         std::vector<std::vector<Slice>> batched_slices;
         std::vector<void*> buffers;
         for (size_t i = 0; i < keys.size(); ++i) {
@@ -636,6 +637,10 @@ class FileStorageTest : public ::testing::Test {
         }
         ReplicateConfig cfg;
         cfg.replica_num = 1;
+        if (with_session_ids) {
+            cfg.session_ids =
+                std::vector<std::string>{"fresh", "wiped-a", "wiped-b"};
+        }
         auto results = client.value()->BatchPut(keys, batched_slices, cfg);
         ASSERT_EQ(results.size(), keys.size());
         for (size_t i = 0; i < results.size(); ++i) {
@@ -1365,6 +1370,11 @@ TEST_F(FileStorageTest,
     // backing file is gone. Two wiped keys and one fresh key go through one
     // batch; every key must really store.
     RunBatchPutHealWipeScenario(data_path);
+}
+
+TEST_F(FileStorageTest,
+       TaggedBatchPutAfterPhysicalWipeHealsDanglingLocalDiskReplica) {
+    RunBatchPutHealWipeScenario(data_path, true);
 }
 
 }  // namespace mooncake

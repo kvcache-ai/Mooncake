@@ -3,6 +3,10 @@
 #include <glog/logging.h>
 
 #include <boost/functional/hash.hpp>
+#include <boost/locale/utf.hpp>
+
+#include <algorithm>
+#include <ylt/struct_pack/compatible.hpp>
 
 #include <atomic>
 #include <cstdint>
@@ -124,11 +128,14 @@ struct ReplicateConfig {
     // eviction treats the group as a unit (all-or-none). Object routing is
     // always hash(tenant, key) and is decoupled from groups.
     std::optional<std::vector<std::string>> group_ids{};
+    // Per-key write attribution, independent of key identity and eviction
+    // groups. Preserve the session extension already used by main.
+    struct_pack::compatible<std::vector<std::string>, 1> session_ids;
     // Best-effort receiver affinity. A matching range is local to every
     // named HCA on that receiver; NUMA IDs are never compared across hosts.
-    struct_pack::compatible<std::vector<std::string>, 1> preferred_hca_names;
+    struct_pack::compatible<std::vector<std::string>, 2> preferred_hca_names;
     // Batch hints follow the key order; an empty entry means no preference.
-    struct_pack::compatible<std::vector<std::vector<std::string>>, 2>
+    struct_pack::compatible<std::vector<std::vector<std::string>>, 3>
         per_key_preferred_hca_names;
 
     bool HasValidKeyHints(size_t key_count) const {
@@ -144,6 +151,11 @@ struct ReplicateConfig {
             for (auto index : indices)
                 result.group_ids->push_back(group_ids->at(index));
         }
+        if (session_ids) {
+            result.session_ids = std::vector<std::string>{};
+            for (auto index : indices)
+                result.session_ids->push_back(session_ids->at(index));
+        }
         if (per_key_preferred_hca_names) {
             result.per_key_preferred_hca_names =
                 std::vector<std::vector<std::string>>{};
@@ -155,17 +167,50 @@ struct ReplicateConfig {
         return result;
     }
 
+    bool ValidSessionIds(size_t key_count) const {
+        return !session_ids ||
+               (session_ids->size() == key_count &&
+                std::all_of(session_ids->begin(), session_ids->end(),
+                            [](const auto& id) {
+                                if (id.size() > 256) return false;
+                                auto it = id.begin();
+                                while (it != id.end()) {
+                                    namespace utf = boost::locale::utf;
+                                    if (!utf::is_valid_codepoint(
+                                            utf::utf_traits<char>::decode(
+                                                it, id.end()))) {
+                                        return false;
+                                    }
+                                }
+                                return true;
+                            }));
+    }
+
+    std::string SessionId() const {
+        return session_ids && !session_ids->empty() ? session_ids->front() : "";
+    }
+
+    // Reuse a copy of the batch config; select metadata from the original
+    // batch.
+    void SetKeyIds(const ReplicateConfig& batch_config, size_t key_index) {
+        if (batch_config.group_ids.has_value()) {
+            group_ids =
+                std::vector<std::string>{batch_config.group_ids->at(key_index)};
+        }
+        if (batch_config.session_ids) {
+            session_ids = std::vector<std::string>{
+                batch_config.session_ids->at(key_index)};
+        }
+        if (batch_config.per_key_preferred_hca_names) {
+            preferred_hca_names =
+                batch_config.per_key_preferred_hca_names->at(key_index);
+            per_key_preferred_hca_names.reset();
+        }
+    }
+
     ReplicateConfig ForSingleKey(size_t key_index) const {
         ReplicateConfig key_config = *this;
-        if (group_ids.has_value()) {
-            key_config.group_ids =
-                std::vector<std::string>{group_ids->at(key_index)};
-        }
-        if (per_key_preferred_hca_names) {
-            key_config.preferred_hca_names =
-                per_key_preferred_hca_names->at(key_index);
-            key_config.per_key_preferred_hca_names.reset();
-        }
+        key_config.SetKeyIds(*this, key_index);
         return key_config;
     }
 

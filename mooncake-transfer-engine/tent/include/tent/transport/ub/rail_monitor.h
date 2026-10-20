@@ -113,10 +113,21 @@ class RailMonitor {
     void recordError(const UbPostPath& path, uint64_t now_ns = 0);
     void recordTimeout(const UbPostPath& path, uint64_t now_ns = 0);
     // Records at most one rebuild for each endpoint generation on a physical
-    // rail. Returns true when telemetry advanced, allowing EndpointStore to
-    // call this safely from converging/retried rebuild paths.
+    // rail. The first generation observed on a rail establishes the baseline
+    // and is not itself a rebuild, so a freshly bootstrapped endpoint does not
+    // look like a recovery. Returns true when telemetry advanced, allowing
+    // EndpointStore to call this safely from converging/retried rebuild paths.
     bool recordEndpointRebuild(const UbPostPath& path, uint64_t now_ns = 0);
 
+    // Non-inserting counterpart of stats(): an unknown rail is reported with
+    // defaults and is NOT added to the map. Path-selection probes use this so
+    // ranking every local x remote combination cannot grow the rail map or seed
+    // generations for rails that are never posted to. Like stats(), it still
+    // advances the time watermark and cooldown state of a rail that does exist.
+    [[nodiscard]] RailStats statsIfPresent(const UbPostPath& path,
+                                           uint64_t now_ns = 0);
+    // Creates the rail on demand, so the returned stats always reflect a real
+    // entry.
     [[nodiscard]] RailStats stats(const UbPostPath& path, uint64_t now_ns = 0);
     [[nodiscard]] std::vector<RailStats> allStats(uint64_t now_ns = 0);
 
@@ -139,6 +150,11 @@ class RailMonitor {
         // watermark from latest_endpoint_generation because path registration
         // may observe the replacement before rebuild telemetry is emitted.
         uint64_t recorded_rebuild_generation{0};
+        // False until the first ready generation seeds
+        // recorded_rebuild_generation. The initial build on a rail is not a
+        // rebuild, so it must not be counted even though the watermark starts
+        // at zero.
+        bool has_rebuild_baseline{false};
     };
 
     using RailMap = std::unordered_map<UbRailKey, RailState, UbRailKeyHash>;
@@ -146,6 +162,8 @@ class RailMonitor {
     static uint64_t normalizedNow(uint64_t now_ns);
     static uint64_t deadlineAfter(uint64_t now_ns, uint64_t duration_ns);
     static uint64_t observeTimeLocked(RailState& state, uint64_t event_ns);
+    // Refreshes time-dependent rail state and returns a consistent snapshot.
+    RailStats snapshotLocked(RailState& state, uint64_t now_ns);
     RailState& getOrCreateLocked(const UbPostPath& path);
     static void insertErrorLocked(RailState& state, uint64_t event_ns);
     void pruneErrorsLocked(RailState& state, uint64_t now_ns);

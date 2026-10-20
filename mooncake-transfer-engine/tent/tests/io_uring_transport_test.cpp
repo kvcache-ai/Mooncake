@@ -137,6 +137,86 @@ TransferStatus pollUntilSettled(IOUringTransport& transport,
     return ts;
 }
 
+class IOUringFileContextTest : public ::testing::TestWithParam<bool> {};
+
+TEST_P(IOUringFileContextTest, DoesNotReuseAnotherTransportsFile) {
+    ScopedTempFile first_file(kPageSize);
+    ScopedTempFile second_file(kPageSize);
+    ASSERT_GE(first_file.fd(), 0);
+    ASSERT_GE(second_file.fd(), 0);
+    std::vector<uint8_t> first_contents(kPageSize, 0x11);
+    std::vector<uint8_t> second_contents(kPageSize, 0x22);
+    ASSERT_EQ(pwrite(first_file.fd(), first_contents.data(), kPageSize, 0),
+              static_cast<ssize_t>(kPageSize));
+    ASSERT_EQ(pwrite(second_file.fd(), second_contents.data(), kPageSize, 0),
+              static_cast<ssize_t>(kPageSize));
+
+    auto first_metadata = std::make_shared<ControlService>("p2p", "", nullptr);
+    auto second_metadata = std::make_shared<ControlService>("p2p", "", nullptr);
+    SegmentID first_id = 0;
+    SegmentID second_id = 0;
+    ASSERT_TRUE(
+        first_metadata->segmentManager()
+            .openRemote(first_id, kLocalFileSegmentPrefix + first_file.path())
+            .ok());
+    ASSERT_TRUE(
+        second_metadata->segmentManager()
+            .openRemote(second_id, kLocalFileSegmentPrefix + second_file.path())
+            .ok());
+    ASSERT_EQ(first_id, second_id);
+
+    auto first = std::make_unique<IOUringTransport>();
+    auto installed = installTransport(*first, first_metadata);
+    if (!installed.ok()) GTEST_SKIP() << installed.message();
+    IOUringTransport second;
+    ASSERT_TRUE(installTransport(second, second_metadata).ok());
+
+    auto read_then_write = [&](IOUringTransport& transport, SegmentID id,
+                               uint8_t expected, uint8_t replacement) {
+        void* allocation = nullptr;
+        ASSERT_EQ(posix_memalign(&allocation, kPageSize, kPageSize), 0);
+        std::unique_ptr<void, decltype(&free)> memory(allocation, free);
+        auto* bytes = static_cast<uint8_t*>(allocation);
+        std::memset(bytes, 0, kPageSize);
+        Transport::SubBatchRef batch = nullptr;
+        ASSERT_TRUE(transport.allocateSubBatch(batch, 2).ok());
+        Request request{};
+        request.opcode = Request::READ;
+        request.source = bytes;
+        request.target_id = id;
+        request.length = kPageSize;
+        ASSERT_TRUE(transport.submitTransferTasks(batch, {request}).ok());
+        auto status = pollUntilSettled(transport, batch, 0);
+        EXPECT_EQ(status.s, COMPLETED);
+        EXPECT_EQ(status.transferred_bytes, kPageSize);
+        EXPECT_EQ(std::vector<uint8_t>(bytes, bytes + kPageSize),
+                  std::vector<uint8_t>(kPageSize, expected));
+        std::memset(bytes, replacement, kPageSize);
+        request.opcode = Request::WRITE;
+        ASSERT_TRUE(transport.submitTransferTasks(batch, {request}).ok());
+        status = pollUntilSettled(transport, batch, 1);
+        EXPECT_EQ(status.s, COMPLETED);
+        EXPECT_EQ(status.transferred_bytes, kPageSize);
+        ASSERT_TRUE(transport.freeSubBatch(batch).ok());
+    };
+
+    read_then_write(*first, first_id, 0x11, 0xA1);
+    if (GetParam()) first.reset();
+    read_then_write(second, second_id, 0x22, 0xB2);
+    ASSERT_EQ(pread(first_file.fd(), first_contents.data(), kPageSize, 0),
+              static_cast<ssize_t>(kPageSize));
+    ASSERT_EQ(pread(second_file.fd(), second_contents.data(), kPageSize, 0),
+              static_cast<ssize_t>(kPageSize));
+    EXPECT_EQ(first_contents, std::vector<uint8_t>(kPageSize, 0xA1));
+    EXPECT_EQ(second_contents, std::vector<uint8_t>(kPageSize, 0xB2));
+}
+
+INSTANTIATE_TEST_SUITE_P(OwnerLifetime, IOUringFileContextTest,
+                         ::testing::Bool(),
+                         [](const ::testing::TestParamInfo<bool>& info) {
+                             return info.param ? "RetiredOwner" : "LiveOwners";
+                         });
+
 // A positive short io_uring_submit() result must not fail the submission:
 // part of the batch is already dispatched, so an error return would make
 // the engine's submit-stage failover re-execute those requests.
