@@ -112,13 +112,8 @@ class PromotionOnHitTest : public ::testing::Test {
         MasterServiceTestPeer::MetadataAccessorRO accessor(
             service, MasterServiceTestPeer::ObjectIdentity{
                          .tenant_id = tenant_id, .user_key = key});
-        const auto* tenant_state = accessor.GetTenantState();
-        if (tenant_state == nullptr) {
-            return false;
-        }
-        auto it = tenant_state->metadata.find(key);
-        return it != tenant_state->metadata.end() &&
-               it->second.state.promotion_task;
+        return accessor.IsPublished() &&
+               accessor.GetState().promotion_task.has_value();
     }
 
     // std::nullopt when the key has no in-flight promotion task.
@@ -128,16 +123,10 @@ class PromotionOnHitTest : public ::testing::Test {
         MasterServiceTestPeer::MetadataAccessorRO accessor(
             service, MasterServiceTestPeer::ObjectIdentity{
                          .tenant_id = tenant_id, .user_key = key});
-        const auto* tenant_state = accessor.GetTenantState();
-        if (tenant_state == nullptr) {
+        if (!accessor.IsPublished() || !accessor.GetState().promotion_task) {
             return std::nullopt;
         }
-        auto it = tenant_state->metadata.find(key);
-        if (it == tenant_state->metadata.end() ||
-            !it->second.state.promotion_task) {
-            return std::nullopt;
-        }
-        return it->second.state.promotion_task->execution_failures;
+        return accessor.GetState().promotion_task->execution_failures;
     }
 
     static bool PromotionAdmissionBlockedByPrimaryWriteForTesting(
