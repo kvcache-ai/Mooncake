@@ -215,6 +215,16 @@ void LocalCopyEngine::Copy(TransferRequest::OpCode opcode,
         return;
     }
 
+    // For host-device transfers with multi-stream striping enabled, use the
+    // striped async path for device-side parallelism. aclrtMemcpyBatch is
+    // synchronous and stream-less, so it cannot be striped; the per-slice
+    // async copies trade higher host submission cost for N-way copy-engine
+    // parallelism.
+    if (num_streams_ > 1) {
+        CopyWithAsync(opcode, slice_list, kind);
+        return;
+    }
+
     // For host-device or device-host transfers, try batch copy first
     auto left_num = slice_list.size();
     size_t slice_index = 0;
