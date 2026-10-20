@@ -68,6 +68,9 @@ class RdmaHipKfdPinTest : public ::testing::Test {
    protected:
     void SetUp() override {
         ASSERT_EQ(hipSetDevice(0), hipSuccess);
+        if (kfdFreeVram() < kBufferSize + kSlack)
+            GTEST_SKIP() << "needs " << ((kBufferSize + kSlack) >> 20)
+                         << " MiB of free VRAM";
         engine_ = std::make_unique<TransferEngine>(true, testNics());
         ASSERT_EQ(engine_->init("P2PHANDSHAKE", "kfd_pin_test"), 0);
         ASSERT_EQ(hipMalloc(&buf_, kBufferSize), hipSuccess);
