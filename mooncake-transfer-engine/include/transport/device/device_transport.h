@@ -71,7 +71,8 @@ class P2pTransport {
     virtual void importPeerHandles(
         void* local_ptr, int rank, int num_ranks,
         const std::vector<std::vector<int32_t>>& remote_handles,
-        const std::vector<int>& active_ranks_mask) = 0;
+        const std::vector<int>& active_ranks_mask,
+        bool fixed_capacity_slots = false) = 0;
 
     // Device pointer to int32_t[num_ranks]: 1 if P2P is available to rank i.
     virtual int32_t* availableTablePtr() = 0;

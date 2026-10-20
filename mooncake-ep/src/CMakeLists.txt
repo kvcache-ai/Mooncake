@@ -154,6 +154,12 @@ if(USE_MACA)
 endif()
 
 target_include_directories(_ep PRIVATE ${Python3_INCLUDE_DIRS})
+# Keep GCC C++ exceptions on libgcc_s when glog also exposes libunwind.
+# Directly linking libunwind first can interpose its _Unwind_Resume and break
+# pybind11 exception translation in this extension.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+  target_link_libraries(_ep PRIVATE gcc_s)
+endif()
 if(USE_CUDA)
   target_link_libraries(_ep PRIVATE transfer_engine ibverbs mlx5 glog::glog
                                     gflags::gflags mooncake_ep_device

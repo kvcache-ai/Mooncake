@@ -67,8 +67,10 @@ PGResult<std::vector<DeviceTransferRoute>> P2pRoute::resolveRoutes(
     }
 
     PG_TRY(auto device_guard, GpuDeviceGuard::create(device_index_));
+    // PG ranks index the global fixed-capacity endpoint table; they are not
+    // CUDA ordinals within this process's visible-device list.
     transport_.importPeerHandles(local_region_, self_rank_, max_world_size_,
-                                 handles, active);
+                                 handles, active, true);
 
     std::vector<int32_t> available(max_world_size_, 0);
     std::vector<void*> region_bases(max_world_size_, nullptr);
