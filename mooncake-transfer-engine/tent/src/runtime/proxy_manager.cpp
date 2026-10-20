@@ -898,7 +898,11 @@ Status ProxyManager::allocateStageBuffers(const std::string& location) {
     auto total_size = chunk_size_ * chunk_count_;
     CHECK_STATUS(
         impl_->allocateLocalMemory(&buf.chunks, total_size, location, true));
-    CHECK_STATUS(impl_->registerLocalMemory(buf.chunks, total_size));
+    // Registration options determine visibility in getSegmentInfo().
+    MemoryOptions options;
+    options.internal = true;
+    CHECK_STATUS(
+        impl_->registerLocalMemory({buf.chunks}, {total_size}, options));
     buf.bitmap = new std::atomic_flag[chunk_count_];
     for (size_t i = 0; i < chunk_count_; ++i)
         buf.bitmap[i].clear(std::memory_order_relaxed);
