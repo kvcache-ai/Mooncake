@@ -80,12 +80,22 @@ struct tr_info {
 };
 
 struct ctrlr_info {
-    enum class State { Ready, Draining, Disconnecting, Reconnecting, Backoff };
+    enum class State {
+        Ready,
+        Draining,
+        Disconnecting,
+        Reconnecting,
+        Backoff,
+        // Probe-only: wait for the next heartbeat to initiate reconnection.
+        // Clients transition directly from Disconnecting to Reconnecting.
+        Disconnected
+    };
 
     struct spdk_nvme_ctrlr *ctrlr{nullptr};
 
-    // Fixed at creation, probe-only controllers leave recovery disabled.
-    bool recovery_enabled{false};
+    // Fixed at creation: true for client workers and ControllerLoop;
+    // false for the Master heartbeat thread.
+    bool client_managed{false};
     State state{State::Ready};
     // One entry per owner worker, shared by its namespaces on this controller.
     std::set<SpdkWrapper::WorkerId> owners;
@@ -398,7 +408,7 @@ int SpdkWrapper::ConnectController(const struct spdk_nvme_transport_id *trid,
 }
 
 nof_seg_handle *SpdkWrapper::OpenNofSegment(const std::string &tr_str,
-                                            bool recovery_enabled) {
+                                            bool client_managed) {
     // ConnectController -> spdk_nvme_probe() uses env-provided sockets and
     // memory, so the SPDK env must be up. Do not rely on an earlier
     // RegisterMemory() to have initialized it: callers now skip the
@@ -424,10 +434,10 @@ nof_seg_handle *SpdkWrapper::OpenNofSegment(const std::string &tr_str,
         if (it == connected_ctrlrs.end()) {
             auto new_info = std::make_unique<ctrlr_info>();
             info = new_info.get();
-            info->recovery_enabled = recovery_enabled;
+            info->client_managed = client_managed;
 
             ret = ConnectController(&tr.trid, info);
-            if (ret != 0) {
+            if (ret != 0 || info->ctrlr == nullptr) {
                 return nullptr;
             }
 
@@ -437,56 +447,56 @@ nof_seg_handle *SpdkWrapper::OpenNofSegment(const std::string &tr_str,
         }
     }
 
-    // SPDK may reuse a controller for the same transport ID. Never enable
-    // recovery around a legacy probe connection that has no worker owner.
-    if (info->recovery_enabled != recovery_enabled) {
+    // SPDK may reuse a controller for the same transport ID. Its ownership
+    // mode must remain fixed: client workers or the Master heartbeat thread.
+    if (info->client_managed != client_managed) {
         LOG(ERROR) << "Cannot mix probe and recoverable client ownership for "
                    << tr.ctrlr_key;
         return nullptr;
     }
 
     nof_seg_handle *seg_handle = nullptr;
-    struct spdk_nvme_qpair *qpair = nullptr;
-    struct spdk_nvme_ns *ns = nullptr;
     {
         auto &ns_seg = info->ns_seg;
         std::lock_guard<std::mutex> lock(info->ns_mutex);
         if (info->state != ctrlr_info::State::Ready) return nullptr;
 
         auto ns_it = ns_seg.find(tr.ns);
-        if (ns_it != ns_seg.end()) {
+        if (client_managed && ns_it != ns_seg.end()) {
             return ns_it->second.get();
         }
 
-        if (spdk_nvme_ctrlr_is_active_ns(info->ctrlr, tr.ns)) {
-            ns = spdk_nvme_ctrlr_get_ns(info->ctrlr, tr.ns);
-        } else {
+        if (!spdk_nvme_ctrlr_is_active_ns(info->ctrlr, tr.ns)) {
             LOG(ERROR) << "spdk_nvme_ctrlr_is_active_ns failed";
             return nullptr;
         }
+        auto *ns = spdk_nvme_ctrlr_get_ns(info->ctrlr, tr.ns);
 
-        auto new_seg = std::make_unique<nof_seg_handle>();
-        if (!recovery_enabled) {
-            qpair = spdk_nvme_ctrlr_alloc_io_qpair(info->ctrlr, nullptr, 0);
-            if (!qpair) {
-                LOG(ERROR) << "alloc spdk_nvme_qpair failed";
-                return nullptr;
-            }
+        if (ns_it == ns_seg.end()) {
+            ns_it =
+                ns_seg.emplace(tr.ns, std::make_unique<nof_seg_handle>()).first;
         }
-        new_seg->qpair = qpair;
-        new_seg->ns = ns;
-        new_seg->controller = info;
-        new_seg->block_size = spdk_nvme_ns_get_sector_size(ns);
-        seg_handle = new_seg.get();
-        ns_seg[tr.ns] = std::move(new_seg);
+        seg_handle = ns_it->second.get();
+        seg_handle->ns = ns;
+        seg_handle->controller = info;
+        seg_handle->block_size = spdk_nvme_ns_get_sector_size(ns);
     }
 
+    if (client_managed) return seg_handle;
+
+    // The heartbeat owner also advances recovery, so no worker barrier is
+    // needed for probe qpairs. Do not hold ns_mutex across qpair creation.
+    ret = SetupQpairIfNeeded(seg_handle);
+    if (ret != 0) {
+        if (ret == -ENXIO) MarkProbeControllerDraining(info);
+        return nullptr;
+    }
     return seg_handle;
 }
 
 uint32_t SpdkWrapper::GetBlockSize(const nof_seg_handle *seg_handle) {
     if (!seg_handle) return INVALID_BLOCK_SIZE;
-    if (!seg_handle->controller->recovery_enabled) {
+    if (!seg_handle->controller->client_managed) {
         return seg_handle->ns ? spdk_nvme_ns_get_sector_size(seg_handle->ns)
                               : INVALID_BLOCK_SIZE;
     }
@@ -546,10 +556,59 @@ SpdkWrapper::ProbeBuffer *SpdkWrapper::GetOrCreateProbeBuffer(
 bool SpdkWrapper::ProbeNofSegment(const std::string &tr_str,
                                   uint32_t timeout_ms,
                                   std::string *error_reason) {
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(timeout_ms);
     if (!InitializeEnv()) {
         if (error_reason) {
             *error_reason = "spdk_env_init_fail";
         }
+        return false;
+    }
+
+    tr_info tr;
+    if (ParseTransPortStr(tr_str, &tr) != 0) {
+        if (error_reason) *error_reason = "invalid_endpoint";
+        return false;
+    }
+    ctrlr_info *info = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(ctrlrs_mutex);
+        auto it = connected_ctrlrs.find(tr.ctrlr_key);
+        if (it != connected_ctrlrs.end()) info = it->second.get();
+    }
+    if (info && info->client_managed) {
+        if (error_reason) *error_reason = "controller_owner_mismatch";
+        return false;
+    }
+
+    // Attempt at most one reconnect for this heartbeat.
+    using State = ctrlr_info::State;
+    bool attempted = info && info->state == State::Reconnecting;
+    while (info && info->state != State::Ready) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            if (error_reason) *error_reason = "recovery_in_progress";
+            return false;
+        }
+        if (info->state == State::Disconnected && !attempted) {
+            {
+                std::lock_guard<std::mutex> lock(info->ns_mutex);
+                info->state = State::Reconnecting;
+            }
+            spdk_nvme_ctrlr_reconnect_async(info->ctrlr);
+            attempted = true;
+            LOG(INFO) << "nof_probe_recovery reconnect ctrlr=" << info;
+        }
+        PollProbeControllers();
+        if (attempted && info->state != State::Ready &&
+            info->state != State::Reconnecting) {
+            if (error_reason) *error_reason = "reconnect_failed";
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    if (std::chrono::steady_clock::now() >= deadline) {
+        if (error_reason) *error_reason = "prepare_timeout";
         return false;
     }
 
@@ -560,9 +619,18 @@ bool SpdkWrapper::ProbeNofSegment(const std::string &tr_str,
         }
         return false;
     }
+    info = seg_handle->controller;
+    if (std::chrono::steady_clock::now() >= deadline) {
+        // Attach or qpair setup exhausted the shared budget. Drain any pending
+        // qpair connection instead of leaving it unpolled after returning.
+        MarkProbeControllerDraining(info);
+        if (error_reason) *error_reason = "open_timeout";
+        return false;
+    }
 
     uint32_t block_size = GetBlockSize(seg_handle);
     if (block_size == INVALID_BLOCK_SIZE || block_size == 0) {
+        MarkProbeControllerDraining(info);
         if (error_reason) {
             *error_reason = "invalid_block_size";
         }
@@ -572,32 +640,57 @@ bool SpdkWrapper::ProbeNofSegment(const std::string &tr_str,
     ProbeBuffer *probe_buffer =
         GetOrCreateProbeBuffer(tr_str, block_size, error_reason);
     if (!probe_buffer || !probe_buffer->ptr) {
+        MarkProbeControllerDraining(info);
         return false;
     }
 
     ProbeRequestContext *probe_ctx = AcquireProbeRequestContext();
+    if (std::chrono::steady_clock::now() >= deadline) {
+        // Buffer/context preparation used the remaining budget. No read owns
+        // this context yet; a pending qpair connection still needs cleanup.
+        RecycleProbeRequestContext(probe_ctx);
+        MarkProbeControllerDraining(info);
+        if (error_reason) *error_reason = "prepare_timeout";
+        return false;
+    }
     int ret = SubmitRequest(seg_handle, probe_buffer->ptr, 0, 1, kSpdkNofOpRead,
                             ProbeReadComplete, probe_ctx);
     if (ret != 0) {
         RecycleProbeRequestContext(probe_ctx);
+        MarkProbeControllerDraining(info);
         if (error_reason) {
             *error_reason = "submit_fail";
         }
         return false;
     }
 
-    auto deadline = std::chrono::steady_clock::now() +
-                    std::chrono::milliseconds(timeout_ms);
+    bool connection_error = false;
     while (!probe_ctx->done.load(std::memory_order_acquire) &&
            std::chrono::steady_clock::now() < deadline) {
-        NvmePollProcessCompletion(seg_handle, 0);
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        // Process admin events and advance recovery while waiting for the read.
+        // Check controller state before polling I/O.
+        PollProbeControllers();
+
+        if (info->state != State::Ready ||
+            NvmePollProcessCompletion(seg_handle, 0) < 0 ||
+            spdk_nvme_qpair_get_failure_reason(seg_handle->qpair) !=
+                SPDK_NVME_QPAIR_FAILURE_NONE) {
+            connection_error = true;
+            break;
+        }
+        if (!probe_ctx->done.load(std::memory_order_acquire)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
     }
 
-    bool ok = probe_ctx->done.load(std::memory_order_acquire) &&
+    bool done = probe_ctx->done.load(std::memory_order_acquire);
+    bool timed_out = std::chrono::steady_clock::now() >= deadline;
+    bool ok = !connection_error && !timed_out && done &&
               probe_ctx->success.load(std::memory_order_acquire);
     if (!ok && error_reason) {
-        if (!probe_ctx->done.load(std::memory_order_acquire)) {
+        if (connection_error) {
+            *error_reason = "connection_error";
+        } else if (!done || timed_out) {
             *error_reason = "completion_timeout";
         } else {
             std::lock_guard<std::mutex> lock(probe_ctx->error_mutex);
@@ -607,7 +700,115 @@ bool SpdkWrapper::ProbeNofSegment(const std::string &tr_str,
         }
     }
 
+    // A timeout does not imply a broken connection. Drain unfinished reads
+    // before reusing their buffers; completion/abort callbacks recycle the
+    // request contexts.
+    if (connection_error || !done) MarkProbeControllerDraining(info);
+
     return ok;
+}
+
+void SpdkWrapper::MarkProbeControllerDraining(ctrlr_info *info) {
+    assert(!info->client_managed);
+    std::lock_guard<std::mutex> lock(info->ns_mutex);
+    if (info->state != ctrlr_info::State::Ready) return;
+    info->state = ctrlr_info::State::Draining;
+    LOG(WARNING) << "nof_probe_recovery begin ctrlr=" << info
+                 << " namespaces=" << info->ns_seg.size();
+}
+
+void SpdkWrapper::PollProbeControllers() {
+    using State = ctrlr_info::State;
+    std::vector<ctrlr_info *> controllers;
+    {
+        std::lock_guard<std::mutex> lock(ctrlrs_mutex);
+        for (auto &[_, info] : connected_ctrlrs) {
+            if (!info->client_managed) controllers.push_back(info.get());
+        }
+    }
+    for (auto *info : controllers) {
+        switch (info->state) {
+            case State::Ready: {
+                int rc = spdk_nvme_ctrlr_process_admin_completions(info->ctrlr);
+                if (rc >= 0) break;
+                MarkProbeControllerDraining(info);
+            }
+                [[fallthrough]];
+            case State::Draining: {
+                // Give every qpair a chance to finish teardown, even if an
+                // earlier one is still pending. Disconnect the controller
+                // only after all qpairs and their outstanding I/O are drained.
+                bool drained = true;
+                for (auto &[_, seg] : info->ns_seg) {
+                    if (!DrainQpair(seg.get())) drained = false;
+                }
+                if (!drained) break;
+                // Reset may invalidate SPDK namespace pointers. Keep the
+                // handles; OpenNofSegment refreshes namespaces on demand.
+                for (auto &[_, seg] : info->ns_seg) seg->ns = nullptr;
+                int rc = spdk_nvme_ctrlr_disconnect(info->ctrlr);
+                std::lock_guard<std::mutex> lock(info->ns_mutex);
+                info->state =
+                    rc == -ENXIO ? State::Disconnected : State::Disconnecting;
+                if (info->state == State::Disconnected) break;
+            }
+                [[fallthrough]];
+            case State::Disconnecting:
+                if (spdk_nvme_ctrlr_process_admin_completions(info->ctrlr) ==
+                    -ENXIO) {
+                    std::lock_guard<std::mutex> lock(info->ns_mutex);
+                    info->state = State::Disconnected;
+                    LOG(INFO)
+                        << "nof_probe_recovery disconnected ctrlr=" << info;
+                }
+                break;
+            case State::Disconnected:
+                // Cleanup is complete. Idle polling must not start retries;
+                // the next heartbeat probe decides whether to reconnect.
+                break;
+            case State::Reconnecting: {
+                int rc = spdk_nvme_ctrlr_reconnect_poll_async(info->ctrlr);
+                if (rc == -EAGAIN) break;
+                std::lock_guard<std::mutex> lock(info->ns_mutex);
+                if (rc != 0) {
+                    // Clean up the failed attempt on the next poll. A new
+                    // reconnect still requires another heartbeat probe.
+                    info->state = State::Draining;
+                    LOG(WARNING) << "nof_probe_recovery failed ctrlr=" << info
+                                 << " rc=" << rc;
+                } else {
+                    info->state = State::Ready;
+                    LOG(INFO) << "nof_probe_recovery ready ctrlr=" << info;
+                }
+                break;
+            }
+            case State::Backoff:
+                assert(false && "Backoff is only used by client recovery");
+                break;
+        }
+    }
+}
+
+void SpdkWrapper::ShutdownProbeConnections() {
+    std::vector<ctrlr_info *> controllers;
+    {
+        std::lock_guard<std::mutex> lock(ctrlrs_mutex);
+        for (auto &[_, info] : connected_ctrlrs) {
+            if (!info->client_managed) controllers.push_back(info.get());
+        }
+    }
+    // A reconnect holds SPDK's controller mutex across polling calls. Finish
+    // it on this owner even on shutdown; then drain without starting retries.
+    while (true) {
+        bool drained = true;
+        for (auto *info : controllers) {
+            MarkProbeControllerDraining(info);
+            if (info->state != ctrlr_info::State::Disconnected) drained = false;
+        }
+        if (drained) break;
+        PollProbeControllers();
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
 }
 
 void SpdkWrapper::RegisterRecoveryTaskPoster(RecoveryTaskPoster poster) {
@@ -630,7 +831,7 @@ bool SpdkWrapper::BindSegmentToWorker(nof_seg_handle *seg, WorkerId owner,
     auto *info = seg->controller;
 
     std::lock_guard<std::mutex> lock(info->ns_mutex);
-    if (!info->recovery_enabled || info->state != ctrlr_info::State::Ready ||
+    if (!info->client_managed || info->state != ctrlr_info::State::Ready ||
         !seg->ns || seg->owner.first)
         return false;
 
@@ -648,7 +849,7 @@ bool SpdkWrapper::BindSegmentToWorker(nof_seg_handle *seg, WorkerId owner,
 
 void SpdkWrapper::RequestRecovery(ctrlr_info *info) {
     std::lock_guard<std::mutex> lock(info->ns_mutex);
-    if (!info->recovery_enabled || info->state != ctrlr_info::State::Ready)
+    if (!info->client_managed || info->state != ctrlr_info::State::Ready)
         return;
 
     info->state = ctrlr_info::State::Draining;
@@ -694,7 +895,7 @@ void SpdkWrapper::UnregisterOwner(ctrlr_info *info, WorkerId owner) {
     controller_cv_.notify_one();
 }
 
-int SpdkWrapper::SetupClientQpairIfNeeded(nof_seg_handle *seg) {
+int SpdkWrapper::SetupQpairIfNeeded(nof_seg_handle *seg) {
     // Called only on its owner. The common case never takes a controller lock.
     if (seg->qpair) return 0;
 
@@ -705,9 +906,6 @@ int SpdkWrapper::SetupClientQpairIfNeeded(nof_seg_handle *seg) {
         if (!seg->ns) return -ENODEV;
     }
 
-    // This registered owner cannot acknowledge Cleanup while creating here.
-    // The cleanup barrier protects the controller without holding admission
-    // locked across a potentially slow transport connect.
     spdk_nvme_io_qpair_opts opts;
     spdk_nvme_ctrlr_get_default_io_qpair_opts(info->ctrlr, &opts, sizeof(opts));
     opts.async_mode = true;
@@ -726,7 +924,7 @@ int SpdkWrapper::SetupClientQpairIfNeeded(nof_seg_handle *seg) {
     return rc == 0 ? 0 : -ENXIO;
 }
 
-bool SpdkWrapper::DrainClientQpair(nof_seg_handle *seg) {
+bool SpdkWrapper::DrainQpair(nof_seg_handle *seg) {
     if (!seg->qpair) return true;
 
     if (!seg->disconnecting) {
@@ -771,7 +969,7 @@ void SpdkWrapper::ControllerLoop() {
         {
             std::lock_guard<std::mutex> lock(ctrlrs_mutex);
             for (auto &[_, info] : connected_ctrlrs) {
-                if (info->recovery_enabled) controllers.push_back(info.get());
+                if (info->client_managed) controllers.push_back(info.get());
             }
         }
 

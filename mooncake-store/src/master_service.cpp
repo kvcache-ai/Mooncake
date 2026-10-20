@@ -12411,9 +12411,11 @@ bool MasterService::TryUnmountNoFSegmentByHeartbeat(
     return true;
 }
 
+#ifdef USE_NOF
 void MasterService::NofHeartbeatThreadFunc() {
     size_t next_probe_index = 0;
     while (nof_heartbeat_running_) {
+        SpdkWrapper::GetInstance().PollProbeControllers();
         auto now = std::chrono::steady_clock::now();
         std::vector<MountedNoFSegmentSnapshot> mounted_segments;
         nof_segment_manager_.GetMountedSegmentsSnapshot(mounted_segments);
@@ -12561,7 +12563,9 @@ void MasterService::NofHeartbeatThreadFunc() {
             TryUnmountNoFSegmentByHeartbeat(*probe_target, error_reason);
         }
     }
+    SpdkWrapper::GetInstance().ShutdownProbeConnections();
 }
+#endif
 
 tl::expected<void, ErrorCode>
 MasterService::ValidateDynamicReplicaPendingForCopyStart(

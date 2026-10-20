@@ -525,7 +525,7 @@ struct SpdkNofWorkerPool::WorkerContext {
 
             bool drained = true;
             for (auto* seg : state.draining_segments)
-                drained &= wrapper.DrainClientQpair(seg);
+                drained &= wrapper.DrainQpair(seg);
             if (!drained) continue;
 
             for (auto& [_, qos] : seg_to_qos) {
@@ -629,7 +629,7 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
             if (nof_qos->controller_state->phase != Phase::Running ||
                 nof_qos->Empty())
                 continue;
-            int connect_rc = wrapper.SetupClientQpairIfNeeded(seg_handle);
+            int connect_rc = wrapper.SetupQpairIfNeeded(seg_handle);
             if (connect_rc != 0) {
                 if (connect_rc == -ENXIO)
                     wrapper.RequestRecovery(wrapper.GetController(seg_handle));
@@ -791,12 +791,12 @@ nof_seg_handle* SpdkNofWorkerPool::OpenNofSegment(const std::string& tr_str) {
                         // the local registration above so it finds this
                         // controller; otherwise the controller could retain an
                         // owner referencing a destroyed pool. Skip only
-                        // SpdkWrapper::SetupClientQpairIfNeeded() below.
+                        // SpdkWrapper::SetupQpairIfNeeded() below.
                         if (ctx.pool.shutdown_.load() ||
                             state.phase != WorkerContext::Phase::Running)
                             return;
 
-                        int rc = ctx.wrapper.SetupClientQpairIfNeeded(seg);
+                        int rc = ctx.wrapper.SetupQpairIfNeeded(seg);
                         if (rc == -ENXIO) ctx.wrapper.RequestRecovery(ctrlr);
                         if (rc != 0 && rc != -EAGAIN) {
                             LOG(WARNING)

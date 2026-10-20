@@ -46,10 +46,10 @@ class SpdkWrapper {
     int64_t NvmePollProcessCompletion(nof_seg_handle *seg,
                                       uint32_t complete_per_seg);
 
-    // When recovery_enabled is true, only prepare the segment metadata;
+    // When client_managed is true, only prepare the segment metadata;
     // the owner worker creates the qpair.
     nof_seg_handle *OpenNofSegment(const std::string &tr_str,
-                                   bool recovery_enabled = false);
+                                   bool client_managed = false);
 
     uint32_t GetBlockSize(const nof_seg_handle *seg_handle);
 
@@ -59,6 +59,9 @@ class SpdkWrapper {
 
     bool ProbeNofSegment(const std::string &tr_str, uint32_t timeout_ms,
                          std::string *error_reason = nullptr);
+
+    void PollProbeControllers();
+    void ShutdownProbeConnections();
 
     /** @brief Register external memory with SPDK for NoF zero-copy transfers.
      *
@@ -127,8 +130,8 @@ class SpdkWrapper {
     void OwnerDrained(ctrlr_info *ctrlr, WorkerId owner);
     void UnregisterOwner(ctrlr_info *ctrlr, WorkerId owner);
 
-    int SetupClientQpairIfNeeded(nof_seg_handle *seg);
-    bool DrainClientQpair(nof_seg_handle *seg);
+    int SetupQpairIfNeeded(nof_seg_handle *seg);
+    bool DrainQpair(nof_seg_handle *seg);
 
    private:
     struct ProbeBuffer {
@@ -171,6 +174,8 @@ class SpdkWrapper {
     void RecycleProbeRequestContext(ProbeRequestContext *ctx);
     void ReplenishProbeRequestContextPoolLocked(size_t count);
     static void ProbeReadComplete(void *ctx, const struct spdk_nvme_cpl *cpl);
+
+    void MarkProbeControllerDraining(ctrlr_info *info);
 
     void ControllerLoop();
 

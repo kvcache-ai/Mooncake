@@ -105,4 +105,10 @@ if(USE_NOF)
   target_link_libraries(
     nof_controller_recovery_e2e PRIVATE mooncake_store gflags::gflags
                                         glog::glog pthread)
+
+  # Run through run_nof_heartbeat_recovery_tcp_e2e.sh.
+  add_executable(nof_heartbeat_recovery_e2e nof_heartbeat_recovery_e2e.cpp)
+  target_link_libraries(
+    nof_heartbeat_recovery_e2e PRIVATE mooncake_store gflags::gflags
+                                       glog::glog pthread)
 endif()

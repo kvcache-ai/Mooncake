@@ -14,6 +14,7 @@ The E2E test suite includes several executable programs designed to test differe
 - **store_client_e2e.py**: Python `MooncakeDistributedStore` client that continuously issues `put/get` operations.
 - **run_nof_heartbeat_tcp_e2e.sh**: Scripted NoF heartbeat end-to-end test using a TCP SPDK target.
 - **run_nof_controller_recovery_tcp_e2e.sh**: Verifies controller reset and I/O qpair reconnection across two workers after a TCP target restart.
+- **run_nof_heartbeat_recovery_tcp_e2e.sh**: Verifies Master heartbeat recovery for two namespaces after a probe timeout and TCP target restart.
 
 ## Parameters
 
@@ -123,6 +124,22 @@ PRE_FAULT_SUCCESS_TARGET=10 BUILD_DIR=/path/to/build ./run_nof_heartbeat_tcp_e2e
 - In default mode, the script verifies **service continuity** after NoF unmount by checking that post-fault I/O still succeeds.
 - In `CLIENT_GLOBAL_SEGMENT_SIZE=0` mode, the script verifies **NoF-only failure behavior** by checking that post-fault I/O starts failing after the NoF segment is removed.
 - Logs are written under `LOG_DIR` (default `/tmp/mooncake_nof_heartbeat_e2e`) and the final pass/fail summary is printed from `summary.log`.
+
+### run_nof_heartbeat_recovery_tcp_e2e.sh
+
+Verifies recovery of two namespaces after a TCP target timeout/restart and
+removal during a persistent outage, using an independent Master process.
+
+Requires `USE_NOF=ON`, `BUILD_UNIT_TESTS=ON`, a built SPDK `nvmf_tgt`,
+and configured hugepages/access permissions. Run manually:
+
+```bash
+cmake --build build --target mooncake_master nof_heartbeat_recovery_e2e
+BUILD_DIR="$PWD/build" SPDK_DIR="$PWD/extern/spdk" \
+  ./mooncake-store/tests/e2e/run_nof_heartbeat_recovery_tcp_e2e.sh
+```
+
+Logs are saved in a fresh `/tmp/mooncake_heartbeat_recovery.*` directory.
 
 ### run_nof_controller_recovery_tcp_e2e.sh
 
