@@ -7764,87 +7764,115 @@ TEST_F(MasterServiceHATest, BatchEvictResumeRevalidatesCurrentPublication) {
     }
 }
 
-TEST_F(MasterServiceHATest, BatchEvictResumeRevalidatesConcurrentUpsert) {
-    const std::string cluster_id = "test_batch_evict_resume_upsert";
-    auto backend = std::make_shared<FakeBatchHaKvBackend>();
-    auto service_config = MasterServiceConfig::builder()
-                              .set_default_kv_lease_ttl(60'000)
-                              .set_enable_ha(true)
-                              .set_enable_oplog(true)
-                              .set_cluster_id(cluster_id)
-                              .set_oplog_batch_max_entries(1)
-                              .set_eviction_ratio(0.0)
-                              .build();
-    MasterService service(service_config);
-    auto* writer = InstallGatedWriter(service, backend);
-    auto mounted = PrepareSimpleSegment(service, "resume_upsert_segment");
-    OpLogBatchStorage storage(cluster_id, *backend);
-    OpLogBatchRecord batch;
-    ReadBatchEventually(storage, 1, batch);
+TEST_F(MasterServiceHATest, BatchEvictResumeRevalidatesInPlaceUpsert) {
+    for (bool complete_before_resume : {false, true}) {
+        SCOPED_TRACE(::testing::Message()
+                     << "complete_before_resume=" << complete_before_resume);
+        const std::string cluster_id = "test_batch_evict_resume_upsert";
+        auto backend = std::make_shared<FakeBatchHaKvBackend>();
+        auto service_config = MasterServiceConfig::builder()
+                                  .set_default_kv_lease_ttl(60'000)
+                                  .set_enable_ha(true)
+                                  .set_enable_oplog(true)
+                                  .set_cluster_id(cluster_id)
+                                  .set_oplog_batch_max_entries(1)
+                                  .set_eviction_ratio(0.0)
+                                  .build();
+        MasterService service(service_config);
+        MasterServiceTestPeer peer(service);
+        peer.StopEvictionWorkerForTesting();
+        auto* writer = InstallGatedWriter(service, backend);
+        auto mounted = PrepareSimpleSegment(service, "resume_upsert_segment");
+        OpLogBatchStorage storage(cluster_id, *backend);
+        OpLogBatchRecord batch;
+        ReadBatchEventually(storage, 1, batch);
+        ASSERT_TRUE(writer->RunCallbacksThrough(batch.last_seq));
 
-    const std::string key = "resume_upsert_key";
-    PutObjectOnSegment(service, mounted.client_id, key,
-                       "resume_upsert_segment");
-    ReadBatchEventually(storage, 2, batch);
-    SetLeaseDeadlineForTesting(
-        service, kDefaultTenant, key,
-        std::chrono::system_clock::now() - std::chrono::seconds(1));
+        const std::string key = "resume_upsert_key";
+        PutObjectOnSegment(service, mounted.client_id, key,
+                           "resume_upsert_segment");
+        ReadBatchEventually(storage, 2, batch);
+        ASSERT_TRUE(writer->RunCallbacksThrough(batch.last_seq));
+        const auto expired =
+            std::chrono::system_clock::now() - std::chrono::seconds(1);
+        SetLeaseDeadlineForTesting(service, kDefaultTenant, key, expired);
+        const auto old_generation =
+            peer.GetObjectGenerationForTesting(kDefaultTenant, key);
+        const auto evicted_before =
+            MasterMetricManager::instance().get_mem_evicted_key_count();
+        const auto bytes_before =
+            MasterMetricManager::instance().get_mem_evicted_size();
+        {
+            auto held_reservation = ReserveBatchSlotForTesting(service);
+            ASSERT_TRUE(held_reservation.has_value())
+                << toString(held_reservation.error());
+            peer.RunBatchEvictForTesting(/*evict_ratio_target=*/1.0,
+                                         /*evict_ratio_lowerbound=*/1.0);
+            ASSERT_TRUE(peer.HasEvictionContinuationForTesting());
 
-    MasterServiceTestPeer peer(service);
-    const auto old_generation =
-        peer.GetObjectGenerationForTesting(kDefaultTenant, key);
-    std::promise<void> finish_upsert_end;
-    auto finish_upsert_end_signal = finish_upsert_end.get_future().share();
-    std::promise<ErrorCode> upsert_started;
-    auto upsert_started_result = upsert_started.get_future();
-    std::future<ErrorCode> upsert_result;
-    {
-        auto held_reservation = ReserveBatchSlotForTesting(service);
-        ASSERT_TRUE(held_reservation.has_value())
-            << toString(held_reservation.error());
+            // A paused eviction must release the key's metadata lock so an
+            // in-place upsert can start even while the oplog slot is held.
+            auto started = std::async(std::launch::async, [&] {
+                ReplicateConfig config;
+                config.replica_num = 1;
+                auto result = service.UpsertStart(mounted.client_id, key,
+                                                  kDefaultTenant, 1024, config);
+                return result ? ErrorCode::OK : result.error();
+            });
+            EXPECT_EQ(std::future_status::ready,
+                      started.wait_for(std::chrono::seconds(2)));
+            ASSERT_EQ(ErrorCode::OK, started.get());
+        }
+        const auto census = peer.GetEvictionCensusRunsForTesting();
+        if (complete_before_resume) {
+            ASSERT_TRUE(service
+                            .UpsertEnd(mounted.client_id, key, kDefaultTenant,
+                                       ReplicaType::MEMORY)
+                            .has_value());
+            ReadBatchEventually(storage, 3, batch);
+            ASSERT_EQ(1u, batch.entries.size());
+            EXPECT_EQ(OpType::PUT_END, batch.entries.front().op_type);
+            ASSERT_TRUE(writer->RunCallbacksThrough(batch.last_seq));
+            // UpsertEnd grants a zero-duration lease, not the configured read
+            // TTL. Make expiry explicit rather than racing End against resume.
+            SetLeaseDeadlineForTesting(service, kDefaultTenant, key, expired);
+        }
+        ASSERT_EQ(old_generation,
+                  peer.GetObjectGenerationForTesting(kDefaultTenant, key));
+
         peer.RunBatchEvictForTesting(/*evict_ratio_target=*/1.0,
                                      /*evict_ratio_lowerbound=*/1.0);
-        ASSERT_TRUE(peer.HasEvictionContinuationForTesting());
-
-        upsert_result = std::async(std::launch::async, [&] {
-            ReplicateConfig config;
-            config.replica_num = 1;
-            auto started = service.UpsertStart(mounted.client_id, key,
-                                               kDefaultTenant, 1024, config);
-            if (!started) {
-                upsert_started.set_value(started.error());
-                return started.error();
-            }
-            upsert_started.set_value(ErrorCode::OK);
-            finish_upsert_end_signal.wait();
-            auto ended = service.UpsertEnd(mounted.client_id, key,
-                                           kDefaultTenant, ReplicaType::MEMORY);
-            return ended ? ErrorCode::OK : ended.error();
-        });
-        EXPECT_EQ(std::future_status::ready,
-                  upsert_started_result.wait_for(std::chrono::seconds(2)));
-        EXPECT_EQ(ErrorCode::OK, upsert_started_result.get());
+        EXPECT_FALSE(peer.HasEvictionContinuationForTesting());
+        EXPECT_EQ(census, peer.GetEvictionCensusRunsForTesting());
+        EXPECT_EQ(evicted_before + (complete_before_resume ? 1 : 0),
+                  MasterMetricManager::instance().get_mem_evicted_key_count());
+        EXPECT_EQ(bytes_before + (complete_before_resume ? 1024 : 0),
+                  MasterMetricManager::instance().get_mem_evicted_size());
+        if (complete_before_resume) {
+            ReadBatchEventually(storage, 4, batch);
+            ASSERT_EQ(1u, batch.entries.size());
+            EXPECT_EQ(OpType::REMOVE, batch.entries.front().op_type);
+            EXPECT_EQ(key, batch.entries.front().object_key);
+            ASSERT_TRUE(writer->RunCallbacksThrough(batch.last_seq));
+            EXPECT_EQ(0u, ReplicaCountForTesting(service, kDefaultTenant, key));
+        } else {
+            // PROCESSING replicas must survive resume under the same
+            // generation. Complete the write only after that check.
+            EXPECT_EQ(1u, ReplicaCountForTesting(service, kDefaultTenant, key));
+            ASSERT_TRUE(service
+                            .UpsertEnd(mounted.client_id, key, kDefaultTenant,
+                                       ReplicaType::MEMORY)
+                            .has_value());
+            ReadBatchEventually(storage, 3, batch);
+            ASSERT_EQ(1u, batch.entries.size());
+            EXPECT_EQ(OpType::PUT_END, batch.entries.front().op_type);
+            ASSERT_TRUE(writer->RunCallbacksThrough(batch.last_seq));
+            EXPECT_TRUE(
+                HasReadableReplicaForTesting(service, kDefaultTenant, key));
+        }
+        EXPECT_EQ(ErrorCode::ETCD_KEY_NOT_EXIST,
+                  storage.ReadBatch(complete_before_resume ? 5 : 4, batch));
     }
-
-    auto eviction = std::async(std::launch::async, [&] {
-        peer.RunBatchEvictForTesting(/*evict_ratio_target=*/1.0,
-                                     /*evict_ratio_lowerbound=*/1.0);
-    });
-    finish_upsert_end.set_value();
-    EXPECT_EQ(ErrorCode::OK, upsert_result.get());
-    eviction.get();
-
-    EXPECT_FALSE(peer.HasEvictionContinuationForTesting());
-    EXPECT_EQ(peer.GetObjectGenerationForTesting(kDefaultTenant, key),
-              old_generation);
-    EXPECT_EQ(1u, ReplicaCountForTesting(service, kDefaultTenant, key));
-    ReadBatchEventually(storage, 3, batch);
-    ASSERT_EQ(1u, batch.entries.size());
-    EXPECT_EQ(OpType::PUT_END, batch.entries.front().op_type);
-    OpLogBatchRecord unexpected_eviction_batch;
-    EXPECT_EQ(ErrorCode::ETCD_KEY_NOT_EXIST,
-              storage.ReadBatch(4, unexpected_eviction_batch));
-    (void)writer;
 }
 
 TEST_F(MasterServiceHATest, BatchEvictRestoreClearsContinuation) {
