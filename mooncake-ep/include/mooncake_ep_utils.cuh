@@ -48,7 +48,8 @@ struct VecInt<16> {
 };
 
 // ---- TMA / mbarrier helpers (CUDA only) ----
-#if !defined(MOONCAKE_EP_USE_MUSA) && !defined(MOONCAKE_EP_USE_MACA)
+#if !defined(MOONCAKE_EP_USE_MUSA) && !defined(MOONCAKE_EP_USE_MACA) && \
+    !defined(MOONCAKE_EP_USE_HYGON)
 
 __device__ __forceinline__ void fence_view_async_shared() {
     asm volatile("fence.proxy.async.shared::cta; \n" ::);
@@ -136,7 +137,7 @@ __device__ __forceinline__ void tma_store_wait() {
     asm volatile("cp.async.bulk.wait_group.read %0;" ::"n"(N) : "memory");
 }
 
-#endif  // !MOONCAKE_EP_USE_MUSA && !MOONCAKE_EP_USE_MACA
+#endif  // NVIDIA TMA/PTX path
 
 template <typename dtype_t>
 __host__ __device__ dtype_t cell_div(dtype_t a, dtype_t b) {
@@ -184,27 +185,33 @@ __device__ __forceinline__ dtype_t broadcast(dtype_t &ptr, int src_lane_idx) {
     int recv_int_values[sizeof(dtype_t) / sizeof(int)];
 #pragma unroll
     for (int i = 0; i < sizeof(dtype_t) / sizeof(int); ++i)
-        recv_int_values[i] =
-            __shfl_sync(0xffffffff, send_int_values[i], src_lane_idx);
+        recv_int_values[i] = ep_shfl(send_int_values[i], src_lane_idx);
     return *reinterpret_cast<dtype_t *>(recv_int_values);
 }
 
 __forceinline__ __device__ int warp_reduce_sum(int value) {
-    value += __shfl_xor_sync(0xffffffff, value, 16);
-    value += __shfl_xor_sync(0xffffffff, value, 8);
-    value += __shfl_xor_sync(0xffffffff, value, 4);
-    value += __shfl_xor_sync(0xffffffff, value, 2);
-    value += __shfl_xor_sync(0xffffffff, value, 1);
+    value += ep_shfl_xor(value, 16);
+    value += ep_shfl_xor(value, 8);
+    value += ep_shfl_xor(value, 4);
+    value += ep_shfl_xor(value, 2);
+    value += ep_shfl_xor(value, 1);
     return value;
 }
 
 __forceinline__ __device__ float half_warp_reduce_max(float value) {
+#if defined(MOONCAKE_EP_USE_HYGON)
+    value = max(value, ep_shfl_xor(value, 8));
+    value = max(value, ep_shfl_xor(value, 4));
+    value = max(value, ep_shfl_xor(value, 2));
+    value = max(value, ep_shfl_xor(value, 1));
+#else
     auto mask = __activemask();
-    // The mask be in `{0xffffffff, 0xffff}`
+    // The mask is in `{0xffffffff, 0xffff}`.
     value = max(value, __shfl_xor_sync(mask, value, 8));
     value = max(value, __shfl_xor_sync(mask, value, 4));
     value = max(value, __shfl_xor_sync(mask, value, 2));
     value = max(value, __shfl_xor_sync(mask, value, 1));
+#endif
     return value;
 }
 

@@ -66,13 +66,13 @@ __global__ void reduceKernel(scalar_t* dst, const scalar_t* src,
     size_t stride = blockDim.x * gridDim.x;
 
 #ifdef __MUSA__
-    // mt_bfloat16 lacks arithmetic and comparison operators; use float
-    // accumulator and fminf/fmaxf for that type only.  Other types
+    // mt_bfloat16 and __nv_bfloat16 lack comparison operators or native float
+    // precision; use float accumulator and fminf/fmaxf for that type. Other types
     // (float, double, int64_t, etc.) use their native accumulator to
     // preserve full precision.
     constexpr bool kIsBf16 = std::is_same_v<scalar_t, mt_bfloat16>;
 #else
-    constexpr bool kIsBf16 = false;
+    constexpr bool kIsBf16 = std::is_same_v<scalar_t, __nv_bfloat16>;
 #endif
     using acc_t = std::conditional_t<kIsBf16, float, scalar_t>;
 

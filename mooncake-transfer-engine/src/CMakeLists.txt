@@ -142,6 +142,31 @@ endif()
 if(USE_HYGON)
   target_include_directories(transfer_engine PRIVATE ${DTK_INCLUDE_DIR})
   target_link_libraries(transfer_engine PUBLIC cuda cudart rt)
+
+  # DTK device allocations need DMA-BUF registration when no GPU peer-memory
+  # kernel module is available. The IBGDA transport receives the allocation
+  # base and size directly, so it can export that allocation through HSA.
+  option(USE_HYGON_DMABUF "Enable Hygon DMA-BUF IBGDA MR registration" ON)
+  if(USE_HYGON_DMABUF)
+    find_package(hsa-runtime64 CONFIG)
+    if(hsa-runtime64_FOUND)
+      target_compile_definitions(device_transport PRIVATE USE_HYGON_DMABUF)
+      target_link_libraries(device_transport PRIVATE
+                            hsa-runtime64::hsa-runtime64)
+      target_compile_definitions(rdma_transport PRIVATE USE_HYGON_DMABUF)
+      target_include_directories(rdma_transport PRIVATE ${DTK_INCLUDE_DIR})
+      target_link_libraries(rdma_transport PUBLIC
+                            hsa-runtime64::hsa-runtime64)
+      target_link_libraries(transfer_engine PUBLIC
+                            hsa-runtime64::hsa-runtime64)
+      message(STATUS "Hygon DMA-BUF RDMA registration enabled")
+    else()
+      message(STATUS
+             "Hygon DMA-BUF RDMA registration disabled (hsa-runtime64 not found)")
+    endif()
+  else()
+    message(STATUS "Hygon IBGDA DMA-BUF registration disabled")
+  endif()
 endif()
 
 if(USE_COREX)
@@ -152,7 +177,9 @@ endif()
 if(USE_HIP)
   target_include_directories(transfer_engine PRIVATE ${HIP_INCLUDE_DIRS})
   target_link_libraries(transfer_engine PUBLIC hip::host rt)
+endif()
 
+if(USE_HIP)
   # Optional dmabuf MR registration path (requires hsa-runtime64 and a kernel
   # with CONFIG_PCI_P2PDMA + CONFIG_DMABUF_MOVE_NOTIFY).
   option(USE_HIP_DMABUF "Enable HIP dmabuf RDMA MR registration" ON)

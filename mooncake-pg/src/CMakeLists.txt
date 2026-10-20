@@ -15,7 +15,7 @@ if(USE_CUDA)
       "${_pg_device_source}"
       "${CMAKE_CURRENT_SOURCE_DIR}/device_comm/device_collective/algorithms/ring/ring_all_reduce.cu"
   )
-elseif(USE_MUSA OR USE_MACA)
+elseif(USE_MUSA OR USE_MACA OR USE_HYGON)
   set(_pg_device_object "${CMAKE_CURRENT_BINARY_DIR}/mooncake_worker_device.o")
   set(_pg_device_depfile "${CMAKE_CURRENT_BINARY_DIR}/mooncake_worker_device.d")
   set(_pg_device_flags
@@ -67,6 +67,14 @@ elseif(USE_MUSA OR USE_MACA)
     set(_pg_device_compiler_hint "${MACA_ROOT}/tools/cu-bridge/bin")
     set(_pg_platform_device_flags -Xcompiler=-fPIC -include cuda_bf16.h)
     list(APPEND _pg_device_flags "-I${MACA_ROOT}/tools/cu-bridge/include")
+  elseif(USE_HYGON)
+    set(_pg_platform_name HYGON)
+    get_filename_component(_pg_device_compiler_name
+                           "${DTK_NVCC_EXECUTABLE}" NAME)
+    get_filename_component(_pg_device_compiler_hint
+                           "${DTK_NVCC_EXECUTABLE}" DIRECTORY)
+    set(_pg_platform_device_flags -Xcompiler=-fPIC
+                                  -DDISABLE_SM90_FEATURES=1)
   endif()
 
   find_program(
@@ -94,7 +102,7 @@ elseif(USE_MUSA OR USE_MACA)
 else()
   message(
     FATAL_ERROR
-      "Mooncake PG currently requires one of USE_CUDA, USE_MUSA, or USE_MACA")
+      "Mooncake PG requires USE_CUDA, USE_MUSA, USE_MACA, or USE_HYGON")
 endif()
 
 # Keep the GPU fatbin out of the host core so auditwheel can safely repair the
@@ -126,6 +134,11 @@ elseif(USE_MACA)
   endif()
   set_target_properties(mooncake_pg_device PROPERTIES LINKER_LANGUAGE CXX)
   target_link_libraries(mooncake_pg_device PRIVATE ${MACA_RUNTIME_LIBS})
+elseif(USE_HYGON)
+  set_target_properties(mooncake_pg_device PROPERTIES LINKER_LANGUAGE CXX)
+  target_include_directories(mooncake_pg_device PRIVATE ${DTK_INCLUDE_DIR})
+  target_link_directories(mooncake_pg_device PRIVATE ${DTK_LIB_DIR})
+  target_link_libraries(mooncake_pg_device PRIVATE cuda cudart rt)
 endif()
 
 set_target_properties(
@@ -187,3 +200,11 @@ set_target_properties(
              BUILD_RPATH "$ORIGIN"
              BUILD_RPATH_USE_ORIGIN YES
              INSTALL_RPATH "$ORIGIN")
+
+if(USE_HYGON)
+  set_property(TARGET mooncake_pg_device APPEND PROPERTY INSTALL_RPATH "${DTK_LIB_DIR}")
+  set_property(TARGET mooncake_pg APPEND PROPERTY INSTALL_RPATH "${DTK_LIB_DIR}")
+endif()
+
+
+

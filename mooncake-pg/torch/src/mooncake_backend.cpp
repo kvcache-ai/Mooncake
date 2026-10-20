@@ -10,6 +10,7 @@
 #include <c10/cuda/CUDAStream.h>
 #include <c10/util/env.h>
 #include <torch/csrc/distributed/c10d/Backend.hpp>
+#include <torch/version.h>
 
 #include <exception>
 #include <functional>
@@ -66,8 +67,11 @@ mooncakePgDataType_t tensorType(const at::Tensor& tensor) {
             return mooncakePgFloat8e4m3fnuz;
         case at::kFloat8_e5m2fnuz:
             return mooncakePgFloat8e5m2fnuz;
+#if TORCH_VERSION_MAJOR > 2 || \
+    (TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR >= 7)
         case at::kFloat8_e8m0fnu:
             return mooncakePgFloat8e8m0fnu;
+#endif
         default:
             TORCH_CHECK(false, "Unsupported Mooncake PG datatype: ",
                         tensor.scalar_type());
@@ -158,6 +162,9 @@ std::function<void()> makeCopyBackToPeerTensors(
                             elements_per_peer)
                     .view(outputs[index].sizes()));
         }
+        if (!outputs.front().is_cpu()) {
+            currentCudaStream(outputs.front()).synchronize();
+        }
     };
 }
 
@@ -200,8 +207,9 @@ class MooncakeBackendShim final : public ::c10d::Backend {
         : Backend(owner->getRank(), maxGroupSize), owner_(owner) {}
 
     const std::string getBackendName() const override { return "mooncake"; }
-    bool supportsCoalescing() const override { return false; }
-
+    // This became a Backend virtual after PyTorch 2.5.  Without an explicit
+    // override specifier the same declaration works with both APIs.
+    bool supportsCoalescing() const { return false; }
     c10::intrusive_ptr<c10d::Work> send(std::vector<at::Tensor>& tensors,
                                         int dstRank, int tag) override {
         return owner_->send(tensors, dstRank, tag);
@@ -300,8 +308,13 @@ MooncakeBackend::MooncakeBackend(
     c10d::DistributedBackendOptions distBackendOpts,
     c10::intrusive_ptr<MooncakeBackendOptions> options,
     mooncakePgContext_t context, bool isCpu)
+#if TORCH_VERSION_MAJOR > 2 || \
+    (TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR >= 6)
     : ProcessGroup(distBackendOpts.store, distBackendOpts.group_rank,
                    distBackendOpts.group_size),
+#else
+    : ProcessGroup(distBackendOpts.group_rank, distBackendOpts.group_size),
+#endif
       options_(std::move(options)),
       isCpu_(isCpu),
       work_tracker_(std::make_shared<MooncakeWorkTracker>()) {
@@ -415,7 +428,9 @@ MooncakeBackend::MooncakeBackend(
     const auto device_type = isCpu_ ? c10::DeviceType::CPU : kGpuDeviceType;
     auto shim = c10::make_intrusive<MooncakeBackendShim>(this, max_group_size_);
     setBackend(device_type, BackendType::CUSTOM, shim);
-#ifndef MOONCAKE_EP_USE_MUSA
+#if !defined(MOONCAKE_EP_USE_MUSA) &&                       \
+    (TORCH_VERSION_MAJOR > 2 ||                             \
+     (TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR >= 6))
     setDefaultBackend(BackendType::CUSTOM);
 #endif
 }
@@ -437,6 +452,35 @@ int MooncakeBackend::getSize() const {
     int size = 0;
     checkResult(mooncakePgCommGetSize(comm_, &size), "mooncakePgCommGetSize");
     return size;
+}
+
+at::Tensor MooncakeBackend::getActiveRanksTensor() {
+    auto snapshot = at::empty(
+        {max_group_size_},
+        torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU));
+    checkResult(mooncakePgCommGetActiveRanks(
+                    comm_, snapshot.data_ptr<int32_t>(),
+                    static_cast<size_t>(max_group_size_)),
+                "mooncakePgCommGetActiveRanks");
+    auto* data = snapshot.data_ptr<int32_t>();
+    bool any_active = false;
+    for (int i = 0; i < max_group_size_; ++i) {
+        if (data[i] != 0) {
+            any_active = true;
+            break;
+        }
+    }
+    if (!any_active) {
+        // If the view has not yet populated active ranks, mark the group size as active
+        int active_size = getSize();
+        if (active_size <= 0) active_size = max_group_size_;
+        for (int i = 0; i < active_size && i < max_group_size_; ++i) {
+            data[i] = 1;
+        }
+    } else if (rank_ >= 0 && rank_ < max_group_size_ && data[rank_] == 0) {
+        data[rank_] = 1;
+    }
+    return snapshot;
 }
 
 template <auto CpuFn, auto GpuFn, typename... Args>
@@ -467,9 +511,12 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::launchCollective(
     if (postCompletion) postCompletion();
     auto event = std::make_shared<c10::Event>(kGpuDeviceType);
     event->record(stream);
-    cudaStreamCaptureStatus captureStatus = cudaStreamCaptureStatusNone;
+    cudaStreamCaptureStatus captureStatus{};
     cudaStreamIsCapturing(stream.stream(), &captureStatus);
-    const bool is_captured = captureStatus != cudaStreamCaptureStatusNone ||
+    // hipify translates the status type and query but leaves the CUDA enum
+    // spelling unchanged.  Both CUDA and HIP define the non-capturing state
+    // as zero, so comparing the underlying value is portable.
+    const bool is_captured = static_cast<int>(captureStatus) != 0 ||
                              at::cuda::currentStreamCaptureStatus() !=
                                  c10::cuda::CaptureStatus::None;
     if (is_captured) {

@@ -44,7 +44,8 @@ inline constexpr int kForegroundGet = 1;
 inline constexpr int kBackgroundPrefetch = 2;
 inline constexpr int kMigration = 3;
 }  // namespace transfer_intent_values
-#if (defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)) && \
+#if (defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA) || \
+     defined(USE_HYGON)) &&                                           \
     !defined(USE_CXI)
 namespace device {
 class P2pTransport;
@@ -293,7 +294,8 @@ class TransferEngine {
 
     Transport* getTransport(const std::string& proto);
 
-#if (defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)) && \
+#if (defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA) || \
+     defined(USE_HYGON)) &&                                           \
     !defined(USE_CXI)
     // Device transport accessors (P2P + IBGDA).  Lazily created on first
     // call and owned by the TransferEngine.  These allow EP (and future

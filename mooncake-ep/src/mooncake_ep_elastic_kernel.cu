@@ -409,7 +409,9 @@ void launch_cooperative(Kernel kernel, int device_id, int num_sms,
     kernel<<<num_sms, num_threads, smem_bytes, stream>>>(args...);
     CUDA_RUNTIME_CHECK(cudaGetLastError());
 #else
-    cudaLaunchConfig_t cfg = {{num_sms, 1, 1}, {num_threads, 1, 1},
+    cudaLaunchConfig_t cfg = {
+        {static_cast<unsigned int>(num_sms), 1, 1},
+        {static_cast<unsigned int>(num_threads), 1, 1},
                               static_cast<unsigned int>(smem_bytes), stream,
                               nullptr, 0};
     cudaLaunchAttribute attr[1];

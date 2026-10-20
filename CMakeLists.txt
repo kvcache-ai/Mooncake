@@ -198,6 +198,10 @@ if(WITH_EP)
     if(USE_CUDA)
       find_package(CUDAToolkit REQUIRED)
       message(STATUS "Detected CUDA version: ${CUDAToolkit_VERSION}")
+    elseif(USE_HYGON)
+      # DTK exposes CUDA-compatible headers and libraries but must be compiled
+      # with its own nvcc wrapper rather than CMake's NVIDIA CUDA frontend.
+      message(STATUS "Detected Hygon DTK CUDA compatibility toolkit: ${DTK_CUDA_ROOT}")
     endif()
 
     add_subdirectory(mooncake-ep)
@@ -244,15 +248,19 @@ if(WITH_EP)
               "${EP_PG_STAGING_DIR}/_pg_jit/mooncake_pg.h"
       COMMENT "Staging Mooncake PG Torch JIT sources")
 
-    if(USE_CUDA)
+    if(USE_CUDA OR USE_HYGON)
       add_custom_target(
         mooncake_ep_device_stage ALL
         COMMAND ${CMAKE_COMMAND} -E make_directory "${EP_PG_STAGING_DIR}"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 "$<TARGET_FILE:mooncake_ep_device>" "${EP_PG_STAGING_DIR}/"
-        COMMENT "Staging Mooncake EP CUDA device library"
+        COMMENT "Staging Mooncake EP device library"
         DEPENDS mooncake_ep_device
         VERBATIM)
+      # `_ep` is frequently built explicitly before a component-only install.
+      # Keep the staged device library in sync in that workflow; otherwise the
+      # install step can pair a newly linked `_ep` with a stale device DSO.
+      add_dependencies(_ep mooncake_ep_device_stage)
     endif()
 
     add_custom_target(
