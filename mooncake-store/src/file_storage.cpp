@@ -790,6 +790,10 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
                     client_->MountLocalDiskSegment(enable_offloading_);
                 if (remount_result) {
                     DropUnregisteredFiles("remount");
+                    // Tasks carried across a bucket deferral were taken under
+                    // the earlier registration; end them instead of writing
+                    // them after the wipe.
+                    NackCarriedOffloadTasks();
                     // Report configured SSD capacity so the Master can
                     // restore file_total_capacity_ (the denominator in
                     // "SSD Storage: X / Y").  This was lost on restart;
@@ -878,10 +882,79 @@ tl::expected<void, ErrorCode> FileStorage::ProcessDrainedOffloads(
                      << ", result="
                      << (result ? ErrorCode::OK : result.error());
     }
+    DropCarriedOffloadTasksOfAnotherEpoch(drained);
     if (drained.empty()) {
         return {};
     }
     return OffloadObjects(drained);
+}
+
+void FileStorage::DropCarriedOffloadTasksOfAnotherEpoch(
+    const std::vector<OffloadTaskItem>& drained) {
+    // A carried task keeps the item it was drained with, so its completion
+    // echoes the id of the master that issued it. Once the store drains
+    // items of another master (another epoch) while keeping its LOCAL_DISK
+    // registration, that master refuses such a completion by its id: the
+    // copy would only leave a file that no master registers and that makes
+    // a later offload of the key skip it as already on disk. Drop these
+    // tasks and their pooled keys; the master that issued them is gone, so
+    // there is nothing to NACK.
+    if (deferred_task_by_storage_key_.empty()) {
+        return;
+    }
+    std::optional<uint64_t> epoch;
+    for (const auto& item : drained) {
+        if (item.task_id.has_value()) {
+            epoch = item.task_id->epoch;
+            break;
+        }
+    }
+    if (!epoch.has_value()) {
+        return;
+    }
+    auto bucket_backend =
+        std::dynamic_pointer_cast<BucketStorageBackend>(storage_backend_);
+    size_t dropped = 0;
+    for (auto it = deferred_task_by_storage_key_.begin();
+         it != deferred_task_by_storage_key_.end();) {
+        const auto& task_id = it->second.task_id;
+        if (task_id.has_value() && task_id->epoch == *epoch) {
+            ++it;
+            continue;
+        }
+        if (bucket_backend) {
+            bucket_backend->RemoveUngroupedOffloadingObject(it->first);
+        }
+        it = deferred_task_by_storage_key_.erase(it);
+        ++dropped;
+    }
+    if (dropped > 0) {
+        LOG(INFO) << "action=drop_carried_offload_tasks, reason=another_master"
+                  << ", count=" << dropped;
+    }
+}
+
+void FileStorage::NackCarriedOffloadTasks() {
+    // The pool's keys are dropped with their tasks: without a task, a
+    // re-emitted key cannot be reported.
+    if (auto bucket_backend =
+            std::dynamic_pointer_cast<BucketStorageBackend>(storage_backend_)) {
+        bucket_backend->ClearUngroupedOffloadingObjects();
+    }
+    if (deferred_task_by_storage_key_.empty()) {
+        return;
+    }
+    std::vector<OffloadTaskItem> tasks;
+    tasks.reserve(deferred_task_by_storage_key_.size());
+    for (const auto& [_, task] : deferred_task_by_storage_key_) {
+        tasks.push_back(task);
+    }
+    deferred_task_by_storage_key_.clear();
+    std::vector<StorageObjectMetadata> nacks(
+        tasks.size(), StorageObjectMetadata{-1, 0, 0, -1, ""});
+    auto result = client_->NotifyOffloadSuccess(tasks, nacks);
+    LOG(INFO) << "action=nack_carried_offload_tasks, count=" << tasks.size()
+              << ", result=" << (result ? ErrorCode::OK : result.error());
 }
 
 void FileStorage::RemoveAll() {

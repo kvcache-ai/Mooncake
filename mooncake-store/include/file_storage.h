@@ -155,11 +155,21 @@ class FileStorage {
 
     /**
      * @brief Handles the offload items of one heartbeat drain: NACKs items
-     * without a task id without copying them and offloads the rest
+     * without a task id without copying them, drops carried tasks of another
+     * master (DropCarriedOffloadTasksOfAnotherEpoch) and offloads the rest
      * (OffloadObjects).
      */
     tl::expected<void, ErrorCode> ProcessDrainedOffloads(
         std::vector<OffloadTaskItem> drained);
+
+    // Drops the carried tasks (deferred_task_by_storage_key_) whose task id
+    // epoch is not that of `drained`, the items just drained from the current
+    // master, together with their keys in the bucket backend's pool.
+    void DropCarriedOffloadTasksOfAnotherEpoch(
+        const std::vector<OffloadTaskItem>& drained);
+
+    // NACKs every carried task and empties the bucket backend's pool.
+    void NackCarriedOffloadTasks();
 
     /**
      * @brief Classifies a BatchOffload error as affecting only the current
@@ -324,6 +334,9 @@ class FileStorage {
     // a bucket. Only touched from the offload worker path (single-threaded);
     // lost on restart together with the backend's in-memory ungrouped pool,
     // in which case the master's TTL reaper reclaims the orphaned tasks.
+    // NACKed when the LOCAL_DISK segment is mounted anew
+    // (NackCarriedOffloadTasks), and dropped once the store drains items of
+    // another master (DropCarriedOffloadTasksOfAnotherEpoch).
     std::unordered_map<std::string, OffloadTaskItem>
         deferred_task_by_storage_key_;
 
