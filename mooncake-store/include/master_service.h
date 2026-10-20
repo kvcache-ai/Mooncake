@@ -2054,8 +2054,9 @@ class MasterService {
     // Offload-on-evict: defer disk offload to eviction time
     // (config: offload_on_evict)
     bool offload_on_evict_{false};
-    // Force-evict: allow evicting MEMORY replicas without disk offload when cap
-    // exceeded (config: offload_force_evict, only effective when
+    // Force-evict: after a failed allocation, allow evicting MEMORY replicas
+    // without disk offload when they cannot be queued (in-flight cap reached
+    // or the push refused) (config: offload_force_evict, only effective when
     // offload_on_evict_=true)
     bool offload_force_evict_{false};
 

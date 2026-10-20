@@ -788,7 +788,7 @@ Flags for controlling data movement between DRAM and SSD.
 |------|---------|-------------|
 | `--enable_offload` | `false` | Enable offload from DRAM to SSD |
 | `--offload_on_evict` | `false` | Defer offload to eviction time rather than at `Put` |
-| `--offload_force_evict` | `false` | When the offload queue is full and an allocation has failed, evict objects without offload; otherwise a cycle stops at the cap and waits for the owners |
+| `--offload_force_evict` | `false` | When an object cannot be queued for offload (the queue is full or the owner refuses it) and an allocation has failed, evict it without offload; otherwise it stays in memory and the cycle waits for the owners |
 | `--offloading_queue_limit` | `50000` | Max number of objects allowed in the offloading queue per local disk segment. Increase to allow more objects to be offloaded to SSD before force-eviction kicks in |
 | `--offload_cap_ratio` | `0.5` | Per-cycle offload cap as a fraction of `offloading_queue_limit` (range `[0.0, 1.0]`). Controls how many objects can be queued for offload in a single eviction cycle before falling back to force-evict |
 | `--promotion_on_hit` | `false` | Promote SSD-resident keys to DRAM on read hit |
@@ -802,7 +802,7 @@ Start with `--enable_offload=true` for eager asynchronous SSD persistence after 
 
 For SSD offload, configure the disk path on each real client with `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH`; the master tracks these objects as `LOCAL_DISK` replicas. Do not use the legacy `--root_fs_dir` parameter with `--enable_offload=true`.
 
-When `--offload_on_evict=true` is active, the master keeps at most `offloading_queue_limit * offload_cap_ratio` objects in flight to the owners (default `50000 * 0.5 = 25000`; the cap must round to at least one object). A cycle evicts `eviction_ratio` of the evictable objects, oldest first, queues them for SSD up to the remaining room and stops there; the next cycle continues once the owners have written them. Objects are discarded without offload only when `--offload_force_evict=true` and an allocation has failed. If the master keeps logging `offload queue full`, raise `--offloading_queue_limit` or `--offload_cap_ratio` (for example `--offloading_queue_limit=500000 --offload_cap_ratio=0.8`, a cap of `400000`), or lower `--eviction_ratio`. The tenant-quota eviction pass keeps a per-call cap: past it, with `--offload_force_evict=true`, it evicts without offload regardless of allocation pressure; the objects it queues count toward the next cycle's in-flight room.
+When `--offload_on_evict=true` is active, the master keeps at most `offloading_queue_limit * offload_cap_ratio` objects in flight to the owners (default `50000 * 0.5 = 25000`; the cap must round to at least one object). A cycle evicts `eviction_ratio` of the evictable objects, oldest first, queues them for SSD up to the remaining room and stops there; the next cycle continues once the owners have written them. Objects are discarded without offload only when `--offload_force_evict=true` and an allocation has failed. If the master keeps logging `offload queue full`, raise `--offloading_queue_limit` or `--offload_cap_ratio` (for example `--offloading_queue_limit=500000 --offload_cap_ratio=0.8`, a cap of `400000`), or lower `--eviction_ratio`. The tenant-quota eviction pass keeps a per-call cap: past it, or when the owner refuses the offload, with `--offload_force_evict=true` it evicts without offload regardless of allocation pressure; the objects it queues count toward the next cycle's in-flight room.
 
 ### CXL Memory
 

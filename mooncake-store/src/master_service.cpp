@@ -329,8 +329,9 @@ MasterService::MasterService(const MasterServiceConfig& config)
                      "PutEnd";
         offload_force_evict_ = config.offload_force_evict;
         if (offload_force_evict_) {
-            LOG(INFO) << "Force-evict enabled: objects exceeding offload "
-                         "cap will be evicted without disk offload";
+            LOG(INFO) << "Force-evict enabled: after a failed allocation, "
+                         "objects that cannot be queued for disk offload "
+                         "will be evicted without it";
         }
     }
     // With offload_on_evict every evictee goes through the offload cap; a cap
@@ -11087,11 +11088,13 @@ bool MasterService::BatchEvict(double evict_ratio_target,
             return evict_replicas(quota_account, metadata, deferred_replicas);
         }
 
-        // PushOffloadingQueue failed. Default (data-preserving) behavior is to
-        // skip this cycle — the outer eviction loop will retry after the
-        // offload queue drains. Only force-evict when explicitly opted in, to
-        // prevent silent data loss when the queue is unavailable.
-        if (offload_force_evict_) {
+        // PushOffloadingQueue failed (the owner's queue is full or offloading
+        // is disabled). Default (data-preserving) behavior is to skip this
+        // cycle — the outer eviction loop will retry after the offload queue
+        // drains. Same rule as the in-flight cap above: drop without offload
+        // only with offload_force_evict and a failed allocation, so a
+        // watermark-triggered cycle never discards data.
+        if (offload_force_evict_ && allocation_pressure) {
             offload_push_failed_forced++;
             return evict_replicas(quota_account, metadata, deferred_replicas);
         }

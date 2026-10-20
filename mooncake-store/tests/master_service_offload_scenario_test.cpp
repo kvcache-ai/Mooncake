@@ -823,4 +823,56 @@ TEST(MasterServiceOffloadScenarioTest,
         .Then(Objects(4, kObjectCount).NamedBy(key).AreReadable());
 }
 
+// A refused offload (the owner's queue is full or offloading is disabled)
+// follows the same rule as the in-flight cap: with offload_force_evict, a cycle
+// with no failed allocation behind it, as the watermark starts one, drops
+// nothing; the cycle that answers a failed allocation drops its target, oldest
+// first.
+TEST(MasterServiceOffloadScenarioTest,
+     ForceEvictDropsRefusedOffloadsOnlyAfterAnAllocationFailed) {
+    constexpr uint64_t kLargeObject = 1024 * 1024;
+    constexpr size_t kObjectCount = 14;
+    const auto key = [](size_t index) {
+        return "refused_offload_" + std::to_string(index);
+    };
+    const auto base = std::chrono::system_clock::now() - std::chrono::hours(1);
+    MasterServiceConfig config = OffloadForceEvictConfig();
+    config.default_kv_lease_ttl = 0;  // no leases in the way
+    // Only a failed allocation arms the eviction thread.
+    config.eviction_high_watermark_ratio = 1.0;
+    config.eviction_ratio = 0.10;
+    MasterScenario scenario(
+        "offload_force_evict drops a refused offload only after an allocation "
+        "has failed",
+        config);
+    scenario
+        .Given(MemoryNode("node").Capacity(16 * 1024 * 1024))
+        // The owner refuses every offload task.
+        .When(MountLocalDisk("node").OffloadingDisabled())
+        .Given(Objects(0, 2)
+                   .NamedBy(key)
+                   .Size(kLargeObject)
+                   .By("node")
+                   .CompleteOn("node")
+                   .ExpiredFrom(base))
+        .Given(Objects(2, kObjectCount)
+                   .NamedBy(key)
+                   .Size(kLargeObject)
+                   .By("node")
+                   .CompleteOn("node")
+                   .ExpiredFrom(base + std::chrono::minutes(1)))
+        // A cycle with no failed allocation: every push is refused and
+        // nothing is dropped.
+        .When(EvictMemory(0.10))
+        .Then(Objects(0, kObjectCount).NamedBy(key).AreReadable())
+        // A failed allocation arms the eviction thread; its cycle drops its
+        // target of two without offload, oldest first.
+        .When(PutStart(key(kObjectCount), 3 * kLargeObject)
+                  .By("node")
+                  .ExpectError(ErrorCode::NO_AVAILABLE_HANDLE))
+        .When(WaitFor(std::chrono::milliseconds(300)))
+        .Then(Objects(0, 2).NamedBy(key).DoNotExist())
+        .Then(Objects(2, kObjectCount).NamedBy(key).AreReadable());
+}
+
 }  // namespace mooncake::test

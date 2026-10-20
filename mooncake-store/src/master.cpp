@@ -239,9 +239,10 @@ DEFINE_bool(enable_offload, false, "Enable offload availability");
 DEFINE_bool(offload_on_evict, false,
             "Defer LOCAL_DISK offload to eviction time instead of PutEnd");
 DEFINE_bool(offload_force_evict, false,
-            "When the offload queue is full and an allocation has failed, "
-            "evict objects without disk offload; otherwise an eviction cycle "
-            "stops at the cap and waits for the owners");
+            "When an object cannot be queued for disk offload (the offload "
+            "queue is full or the owner refuses it) and an allocation has "
+            "failed, evict it without disk offload; otherwise it stays in "
+            "memory and the eviction cycle waits for the owners");
 DEFINE_uint64(offloading_queue_limit, 50000,
               "Maximum number of objects allowed in the offloading queue per "
               "local disk segment. Increase to allow more objects to be "
