@@ -1731,7 +1731,6 @@ SelectionResult TransferEngineImpl::planTransport(const Request& request,
 
         auto candidates = TransportSelector::reorderWithHint(raw, hint);
         if (!candidates) {
-            result.local_memory_type = local_mtype;
             return result;  // UNSPEC: hint not authorized for this req
         }
         if (transport_index >= 0 &&
@@ -1739,7 +1738,6 @@ SelectionResult TransferEngineImpl::planTransport(const Request& request,
             result.transport = (*candidates)[transport_index];
             result.staging_params = std::move(host_staging_params);
         }
-        result.local_memory_type = local_mtype;
         return finish(std::move(result));
     }
 
@@ -1783,7 +1781,6 @@ SelectionResult TransferEngineImpl::planTransport(const Request& request,
 
     auto result = transport_selector_->select(ctx, transport_list_,
                                               transport_index, hint);
-    result.local_memory_type = local_mtype;
     if (result.transport != UNSPEC)
         result.staging_params = std::move(host_staging_params);
     return finish(std::move(result));
