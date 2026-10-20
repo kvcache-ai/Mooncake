@@ -14,11 +14,8 @@
 //
 // TENT analogue of classic TE PR #4199: RDMA-only batches skip the owner
 // walk in getBatchStatus while any submit interval is still unfinished.
-// Notify stays on TENT #4001 interval timing: a completed interval fires
-// even while a later interval is pending. Mixed RDMA+TCP, append of a
-// non-publisher, rejected submit (UNSPEC / submitTransferTasks failure),
-// and failover onto TCP keep the walk — those paths cannot use the CQ
-// counter.
+// Notify stays on TENT #4001 interval timing. The skip path evaluates hooks
+// from interval counters only — it must not scan TaskInfo.
 
 #include <gtest/gtest.h>
 
@@ -236,543 +233,357 @@ void installFake(TransferEngineImpl& engine,
     engine.swapTransportForTest(fake->type(), fake);
 }
 
-TEST(BatchCounterWait, InFlightSkipThenWalkOnCompletion) {
-    auto cfg = makeMinimalP2PConfig();
-    TransferEngineImpl engine(cfg);
-    ASSERT_TRUE(engine.available());
+class BatchCounterWaitTest : public ::testing::Test {
+   protected:
+    static constexpr size_t kBufLen = 4096;
 
-    auto fake_rdma = std::make_shared<FakeTransport>(RDMA, true);
-    std::string seg = engine.getSegmentName();
-    ASSERT_TRUE(fake_rdma->install(seg, nullptr, nullptr).ok());
-    engine.swapTransportForTest(RDMA, fake_rdma);
+    void TearDown() override {
+        if (engine_ && batch_id_) {
+            EXPECT_TRUE(engine_->freeBatch(batch_id_).ok());
+            batch_id_ = 0;
+        }
+        if (engine_ && registered_) {
+            EXPECT_TRUE(
+                engine_->unregisterLocalMemory(buf_.data(), kBufLen).ok());
+        }
+    }
 
-    constexpr size_t kBufLen = 4096;
-    std::vector<uint8_t> buf(kBufLen, 0x11);
-    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), kBufLen).ok());
+    void Start(bool failover = false) {
+        cfg_ = makeMinimalP2PConfig();
+        if (failover) {
+            cfg_->set("enable_auto_failover_on_poll", true);
+            cfg_->set("max_failover_attempts", 3);
+        }
+        engine_ = std::make_unique<TransferEngineImpl>(cfg_);
+        ASSERT_TRUE(engine_->available());
+        buf_.assign(kBufLen, 0x11);
+    }
 
-    BatchID batch_id = engine.allocateBatch(2);
-    ASSERT_NE(batch_id, (BatchID)0);
-    auto req = makeLocalWrite(buf.data(), kBufLen);
-    ASSERT_TRUE(engine.submitTransfer(batch_id, {req, req}).ok());
+    void RegisterMem() {
+        if (registered_) return;
+        ASSERT_TRUE(engine_->registerLocalMemory(buf_.data(), kBufLen).ok());
+        registered_ = true;
+    }
 
-    TransferStatus status{};
-    ASSERT_TRUE(engine.getTransferStatus(batch_id, status).ok());
-    EXPECT_EQ(status.s, TransferStatusEnum::PENDING);
-    EXPECT_EQ(status.transferred_bytes, 0u);
-    EXPECT_EQ(fake_rdma->status_calls.load(), 0);
+    std::shared_ptr<FakeTransport> AddRdma(bool publishes) {
+        auto fake = std::make_shared<FakeTransport>(RDMA, publishes);
+        installFake(*engine_, fake);
+        rdma_ = fake;
+        return fake;
+    }
 
-    fake_rdma->completeOneSuccess(0);
-    status = {};
-    ASSERT_TRUE(engine.getTransferStatus(batch_id, status).ok());
-    EXPECT_EQ(status.s, TransferStatusEnum::PENDING);
-    EXPECT_EQ(status.transferred_bytes, 0u);
-    EXPECT_EQ(fake_rdma->status_calls.load(), 0);
+    std::shared_ptr<FakeTransport> AddTcp() {
+        auto fake = std::make_shared<FakeTransport>(TCP, false);
+        installFake(*engine_, fake);
+        tcp_ = fake;
+        return fake;
+    }
 
-    fake_rdma->completeAllSuccess();
-    status = {};
-    ASSERT_TRUE(engine.getTransferStatus(batch_id, status).ok());
+    Request Req(TransportType hint = UNSPEC) {
+        return makeLocalWrite(buf_.data(), kBufLen, hint);
+    }
+
+    static Notification LocalNotify(const char* msg) {
+        Notification n;
+        n.name = "local";
+        n.msg = msg;
+        return n;
+    }
+
+    void Alloc(size_t n) {
+        RegisterMem();
+        batch_id_ = engine_->allocateBatch(n);
+        ASSERT_NE(batch_id_, (BatchID)0);
+    }
+
+    void Submit(std::vector<Request> reqs,
+                const Notification* notify = nullptr) {
+        if (notify) {
+            ASSERT_TRUE(engine_->submitTransfer(batch_id_, reqs, *notify).ok());
+        } else {
+            ASSERT_TRUE(engine_->submitTransfer(batch_id_, reqs).ok());
+        }
+    }
+
+    TransferStatus Poll() {
+        TransferStatus status{};
+        EXPECT_TRUE(engine_->getTransferStatus(batch_id_, status).ok());
+        return status;
+    }
+
+    void ExpectPendingSkip(int status_calls = 0) {
+        auto status = Poll();
+        EXPECT_EQ(status.s, TransferStatusEnum::PENDING);
+        EXPECT_EQ(status.transferred_bytes, 0u);
+        ASSERT_NE(rdma_, nullptr);
+        EXPECT_EQ(rdma_->status_calls.load(), status_calls);
+        EXPECT_EQ(engine_->hookOwnerScansForTest(), 0u);
+    }
+
+    std::vector<Notification> Recv() {
+        std::vector<Notification> received;
+        EXPECT_TRUE(engine_->receiveNotification(received).ok());
+        return received;
+    }
+
+    std::shared_ptr<Config> cfg_;
+    std::unique_ptr<TransferEngineImpl> engine_;
+    std::vector<uint8_t> buf_;
+    bool registered_{false};
+    BatchID batch_id_{0};
+    std::shared_ptr<FakeTransport> rdma_;
+    std::shared_ptr<FakeTransport> tcp_;
+};
+
+TEST_F(BatchCounterWaitTest, InFlightSkipThenWalkOnCompletion) {
+    Start();
+    AddRdma(true);
+    Alloc(2);
+    Submit({Req(), Req()});
+    ExpectPendingSkip();
+
+    rdma_->completeOneSuccess(0);
+    ExpectPendingSkip();
+
+    rdma_->completeAllSuccess();
+    auto status = Poll();
     EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
     EXPECT_EQ(status.transferred_bytes, 2 * kBufLen);
-    EXPECT_EQ(fake_rdma->status_calls.load(), 2);
-
-    EXPECT_TRUE(engine.freeBatch(batch_id).ok());
-    EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), kBufLen).ok());
+    EXPECT_EQ(rdma_->status_calls.load(), 2);
 }
 
-TEST(BatchCounterWait, NonPublisherKeepsOwnerWalk) {
-    auto cfg = makeMinimalP2PConfig();
-    TransferEngineImpl engine(cfg);
-    ASSERT_TRUE(engine.available());
+TEST_F(BatchCounterWaitTest, FailureDoesNotReportSuccess) {
+    Start();
+    AddRdma(true);
+    Alloc(2);
+    Submit({Req(), Req()});
+    rdma_->completeOneSuccess(0);
+    ExpectPendingSkip();
 
-    auto fake_rdma = std::make_shared<FakeTransport>(RDMA, false);
-    std::string seg = engine.getSegmentName();
-    ASSERT_TRUE(fake_rdma->install(seg, nullptr, nullptr).ok());
-    engine.swapTransportForTest(RDMA, fake_rdma);
-
-    constexpr size_t kBufLen = 4096;
-    std::vector<uint8_t> buf(kBufLen, 0x22);
-    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), kBufLen).ok());
-
-    BatchID batch_id = engine.allocateBatch(1);
-    ASSERT_NE(batch_id, (BatchID)0);
-    ASSERT_TRUE(
-        engine.submitTransfer(batch_id, {makeLocalWrite(buf.data(), kBufLen)})
-            .ok());
-
-    TransferStatus status{};
-    ASSERT_TRUE(engine.getTransferStatus(batch_id, status).ok());
-    EXPECT_EQ(status.s, TransferStatusEnum::PENDING);
-    EXPECT_GE(fake_rdma->status_calls.load(), 1);
-
-    fake_rdma->completeAllSuccess();
-    status = {};
-    ASSERT_TRUE(engine.getTransferStatus(batch_id, status).ok());
-    EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
-
-    EXPECT_TRUE(engine.freeBatch(batch_id).ok());
-    EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), kBufLen).ok());
-}
-
-TEST(BatchCounterWait, FailureDoesNotReportSuccess) {
-    auto cfg = makeMinimalP2PConfig();
-    TransferEngineImpl engine(cfg);
-    ASSERT_TRUE(engine.available());
-
-    auto fake_rdma = std::make_shared<FakeTransport>(RDMA, true);
-    std::string seg = engine.getSegmentName();
-    ASSERT_TRUE(fake_rdma->install(seg, nullptr, nullptr).ok());
-    engine.swapTransportForTest(RDMA, fake_rdma);
-
-    constexpr size_t kBufLen = 4096;
-    std::vector<uint8_t> buf(kBufLen, 0x33);
-    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), kBufLen).ok());
-
-    BatchID batch_id = engine.allocateBatch(2);
-    auto req = makeLocalWrite(buf.data(), kBufLen);
-    ASSERT_TRUE(engine.submitTransfer(batch_id, {req, req}).ok());
-
-    fake_rdma->completeOneSuccess(0);
-    TransferStatus status{};
-    ASSERT_TRUE(engine.getTransferStatus(batch_id, status).ok());
-    EXPECT_EQ(status.s, TransferStatusEnum::PENDING);
-    EXPECT_EQ(fake_rdma->status_calls.load(), 0);
-
-    fake_rdma->publishFailure(1);
-    status = {};
-    ASSERT_TRUE(engine.getTransferStatus(batch_id, status).ok());
+    rdma_->publishFailure(1);
+    auto status = Poll();
     EXPECT_EQ(status.s, TransferStatusEnum::FAILED);
-    EXPECT_GE(fake_rdma->status_calls.load(), 1);
-
-    EXPECT_TRUE(engine.freeBatch(batch_id).ok());
-    EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), kBufLen).ok());
+    EXPECT_GE(rdma_->status_calls.load(), 1);
 }
 
-TEST(BatchCounterWait, NotifyBatchSkipsInFlightAndFiresOnCompletion) {
-    auto cfg = makeMinimalP2PConfig();
-    TransferEngineImpl engine(cfg);
-    ASSERT_TRUE(engine.available());
+TEST_F(BatchCounterWaitTest, NotifySkipUsesCounterOnlyNoOwnerScan) {
+    Start();
+    AddRdma(true);
+    constexpr size_t kOwners = 32;
+    Alloc(kOwners);
+    std::vector<Request> reqs(kOwners, Req());
+    auto notify = LocalNotify("counter-only");
+    Submit(reqs, &notify);
+    ExpectPendingSkip();
 
-    auto fake_rdma = std::make_shared<FakeTransport>(RDMA, true);
-    std::string seg = engine.getSegmentName();
-    ASSERT_TRUE(fake_rdma->install(seg, nullptr, nullptr).ok());
-    engine.swapTransportForTest(RDMA, fake_rdma);
+    for (size_t i = 0; i + 1 < kOwners; ++i) rdma_->completeOneSuccess(i);
+    ExpectPendingSkip();
+    std::vector<Notification> silent;
+    (void)engine_->receiveNotification(silent);
+    EXPECT_TRUE(silent.empty());
 
-    constexpr size_t kBufLen = 4096;
-    std::vector<uint8_t> buf(kBufLen, 0x44);
-    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), kBufLen).ok());
-
-    Notification notifi;
-    notifi.name = "local";
-    notifi.msg = "batch-counter";
-
-    BatchID batch_id = engine.allocateBatch(1);
-    ASSERT_TRUE(engine
-                    .submitTransfer(
-                        batch_id, {makeLocalWrite(buf.data(), kBufLen)}, notifi)
-                    .ok());
-
-    TransferStatus status{};
-    ASSERT_TRUE(engine.getTransferStatus(batch_id, status).ok());
-    EXPECT_EQ(status.s, TransferStatusEnum::PENDING);
-    EXPECT_EQ(fake_rdma->status_calls.load(), 0);
-
-    fake_rdma->completeAllSuccess();
-    status = {};
-    ASSERT_TRUE(engine.getTransferStatus(batch_id, status).ok());
+    rdma_->completeOneSuccess(kOwners - 1);
+    auto status = Poll();
     EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
-    EXPECT_EQ(fake_rdma->status_calls.load(), 1);
-
-    std::vector<Notification> received;
-    ASSERT_TRUE(engine.receiveNotification(received).ok());
+    EXPECT_EQ(rdma_->status_calls.load(), static_cast<int>(kOwners));
+    // Completion walk still fires from the interval counter, so TaskInfo is
+    // not scanned even when allow_owner_scan is true.
+    EXPECT_EQ(engine_->hookOwnerScansForTest(), 0u);
+    auto received = Recv();
     ASSERT_EQ(received.size(), 1u);
-    EXPECT_EQ(received[0].msg, "batch-counter");
-
-    EXPECT_TRUE(engine.freeBatch(batch_id).ok());
-    EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), kBufLen).ok());
+    EXPECT_EQ(received[0].msg, "counter-only");
 }
 
-TEST(BatchCounterWait, NotifyFiresForCompletedIntervalWhileAppendPending) {
-    // TENT #4001: notify is interval-complete. Submit A with notify, append
-    // B, finish only A — still PENDING, bytes 0, no owner walk, but A's hook
-    // must fire. Finish B — batch becomes COMPLETED.
-    auto cfg = makeMinimalP2PConfig();
-    TransferEngineImpl engine(cfg);
-    ASSERT_TRUE(engine.available());
+TEST_F(BatchCounterWaitTest,
+       NotifyFiresForCompletedIntervalWhileAppendPending) {
+    Start();
+    AddRdma(true);
+    Alloc(2);
+    auto notify = LocalNotify("interval-a");
+    Submit({Req()}, &notify);
+    Submit({Req()});
+    ExpectPendingSkip();
 
-    auto fake_rdma = std::make_shared<FakeTransport>(RDMA, true);
-    std::string seg = engine.getSegmentName();
-    ASSERT_TRUE(fake_rdma->install(seg, nullptr, nullptr).ok());
-    engine.swapTransportForTest(RDMA, fake_rdma);
-
-    constexpr size_t kBufLen = 4096;
-    std::vector<uint8_t> buf(kBufLen, 0x46);
-    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), kBufLen).ok());
-
-    Notification notifi;
-    notifi.name = "local";
-    notifi.msg = "interval-a";
-
-    BatchID batch_id = engine.allocateBatch(2);
-    auto req = makeLocalWrite(buf.data(), kBufLen);
-    ASSERT_TRUE(engine.submitTransfer(batch_id, {req}, notifi).ok());
-    ASSERT_TRUE(engine.submitTransfer(batch_id, {req}).ok());
-
-    TransferStatus status{};
-    ASSERT_TRUE(engine.getTransferStatus(batch_id, status).ok());
-    EXPECT_EQ(status.s, TransferStatusEnum::PENDING);
-    EXPECT_EQ(status.transferred_bytes, 0u);
-    EXPECT_EQ(fake_rdma->status_calls.load(), 0);
-
-    fake_rdma->completeOneSuccess(0);
-    status = {};
-    ASSERT_TRUE(engine.getTransferStatus(batch_id, status).ok());
-    EXPECT_EQ(status.s, TransferStatusEnum::PENDING);
-    EXPECT_EQ(status.transferred_bytes, 0u);
-    EXPECT_EQ(fake_rdma->status_calls.load(), 0);
-
-    std::vector<Notification> received;
-    ASSERT_TRUE(engine.receiveNotification(received).ok());
+    rdma_->completeOneSuccess(0);
+    ExpectPendingSkip();
+    auto received = Recv();
     ASSERT_EQ(received.size(), 1u);
     EXPECT_EQ(received[0].msg, "interval-a");
 
-    fake_rdma->completeOneSuccess(1);
-    status = {};
-    ASSERT_TRUE(engine.getTransferStatus(batch_id, status).ok());
+    rdma_->completeOneSuccess(1);
+    auto status = Poll();
     EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
-    EXPECT_EQ(fake_rdma->status_calls.load(), 2);
-
+    EXPECT_EQ(rdma_->status_calls.load(), 2);
     received.clear();
-    (void)engine.receiveNotification(received);
+    (void)engine_->receiveNotification(received);
     EXPECT_TRUE(received.empty());
-
-    EXPECT_TRUE(engine.freeBatch(batch_id).ok());
-    EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), kBufLen).ok());
 }
 
-TEST(BatchCounterWait, NotifySecondIntervalStaysSilentUntilComplete) {
-    auto cfg = makeMinimalP2PConfig();
-    TransferEngineImpl engine(cfg);
-    ASSERT_TRUE(engine.available());
+TEST_F(BatchCounterWaitTest, NotifySecondIntervalStaysSilentUntilComplete) {
+    Start();
+    AddRdma(true);
+    Alloc(2);
+    auto first = LocalNotify("first");
+    auto second = LocalNotify("second");
+    Submit({Req()}, &first);
+    Submit({Req()}, &second);
 
-    auto fake_rdma = std::make_shared<FakeTransport>(RDMA, true);
-    std::string seg = engine.getSegmentName();
-    ASSERT_TRUE(fake_rdma->install(seg, nullptr, nullptr).ok());
-    engine.swapTransportForTest(RDMA, fake_rdma);
-
-    constexpr size_t kBufLen = 4096;
-    std::vector<uint8_t> buf(kBufLen, 0x47);
-    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), kBufLen).ok());
-
-    Notification first;
-    first.name = "local";
-    first.msg = "first";
-    Notification second;
-    second.name = "local";
-    second.msg = "second";
-
-    BatchID batch_id = engine.allocateBatch(2);
-    auto req = makeLocalWrite(buf.data(), kBufLen);
-    ASSERT_TRUE(engine.submitTransfer(batch_id, {req}, first).ok());
-    ASSERT_TRUE(engine.submitTransfer(batch_id, {req}, second).ok());
-
-    fake_rdma->completeOneSuccess(0);
-    TransferStatus status{};
-    ASSERT_TRUE(engine.getTransferStatus(batch_id, status).ok());
-    EXPECT_EQ(status.s, TransferStatusEnum::PENDING);
-    EXPECT_EQ(fake_rdma->status_calls.load(), 0);
-
-    std::vector<Notification> received;
-    ASSERT_TRUE(engine.receiveNotification(received).ok());
+    rdma_->completeOneSuccess(0);
+    ExpectPendingSkip();
+    auto received = Recv();
     ASSERT_EQ(received.size(), 1u);
     EXPECT_EQ(received[0].msg, "first");
 
-    fake_rdma->completeOneSuccess(1);
-    status = {};
-    ASSERT_TRUE(engine.getTransferStatus(batch_id, status).ok());
+    rdma_->completeOneSuccess(1);
+    auto status = Poll();
     EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
-
     received.clear();
-    ASSERT_TRUE(engine.receiveNotification(received).ok());
+    received = Recv();
     ASSERT_EQ(received.size(), 1u);
     EXPECT_EQ(received[0].msg, "second");
-
-    EXPECT_TRUE(engine.freeBatch(batch_id).ok());
-    EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), kBufLen).ok());
 }
 
-TEST(BatchCounterWait, AppendAfterCompletionUsesCounterAgain) {
-    auto cfg = makeMinimalP2PConfig();
-    TransferEngineImpl engine(cfg);
-    ASSERT_TRUE(engine.available());
+TEST_F(BatchCounterWaitTest, AppendAfterCompletionUsesCounterAgain) {
+    Start();
+    AddRdma(true);
+    Alloc(2);
+    Submit({Req()});
+    rdma_->completeAllSuccess();
+    EXPECT_EQ(Poll().s, TransferStatusEnum::COMPLETED);
+    const int calls_after_first = rdma_->status_calls.load();
 
-    auto fake_rdma = std::make_shared<FakeTransport>(RDMA, true);
-    std::string seg = engine.getSegmentName();
-    ASSERT_TRUE(fake_rdma->install(seg, nullptr, nullptr).ok());
-    engine.swapTransportForTest(RDMA, fake_rdma);
-
-    constexpr size_t kBufLen = 4096;
-    std::vector<uint8_t> buf(kBufLen, 0x55);
-    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), kBufLen).ok());
-
-    BatchID batch_id = engine.allocateBatch(2);
-    auto req = makeLocalWrite(buf.data(), kBufLen);
-    ASSERT_TRUE(engine.submitTransfer(batch_id, {req}).ok());
-    fake_rdma->completeAllSuccess();
-    TransferStatus status{};
-    ASSERT_TRUE(engine.getTransferStatus(batch_id, status).ok());
-    EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
-    const int calls_after_first = fake_rdma->status_calls.load();
-
-    ASSERT_TRUE(engine.submitTransfer(batch_id, {req}).ok());
-    status = {};
-    ASSERT_TRUE(engine.getTransferStatus(batch_id, status).ok());
+    Submit({Req()});
+    auto status = Poll();
     EXPECT_EQ(status.s, TransferStatusEnum::PENDING);
     EXPECT_EQ(status.transferred_bytes, 0u);
-    EXPECT_EQ(fake_rdma->status_calls.load(), calls_after_first);
+    EXPECT_EQ(rdma_->status_calls.load(), calls_after_first);
 
-    fake_rdma->completeAllSuccess();
-    status = {};
-    ASSERT_TRUE(engine.getTransferStatus(batch_id, status).ok());
-    EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
-
-    EXPECT_TRUE(engine.freeBatch(batch_id).ok());
-    EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), kBufLen).ok());
+    rdma_->completeAllSuccess();
+    EXPECT_EQ(Poll().s, TransferStatusEnum::COMPLETED);
 }
 
-// TCP (and any other non-publisher) progress is driven by getTransferStatus.
-// A mixed batch must keep walking even when the RDMA sub-batch publishes.
-TEST(BatchCounterWait, MixedRdmaAndTcpKeepsOwnerWalk) {
-    auto cfg = makeMinimalP2PConfig();
-    TransferEngineImpl engine(cfg);
-    ASSERT_TRUE(engine.available());
+TEST_F(BatchCounterWaitTest, FailoverFromPublisherToTcpKeepsOwnerWalk) {
+    Start(/*failover=*/true);
+    AddRdma(true);
+    AddTcp();
+    Alloc(1);
+    Submit({Req(RDMA)});
+    EXPECT_EQ(rdma_->submit_calls.load(), 1);
+    EXPECT_EQ(tcp_->submit_calls.load(), 0);
+    ExpectPendingSkip();
 
-    auto fake_rdma = std::make_shared<FakeTransport>(RDMA, true);
-    auto fake_tcp = std::make_shared<FakeTransport>(TCP, false);
-    installFake(engine, fake_rdma);
-    installFake(engine, fake_tcp);
-
-    constexpr size_t kBufLen = 4096;
-    std::vector<uint8_t> buf(kBufLen, 0x61);
-    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), kBufLen).ok());
-
-    BatchID batch_id = engine.allocateBatch(2);
-    ASSERT_TRUE(engine
-                    .submitTransfer(batch_id,
-                                    {makeLocalWrite(buf.data(), kBufLen, RDMA),
-                                     makeLocalWrite(buf.data(), kBufLen, TCP)})
-                    .ok());
-    EXPECT_EQ(fake_rdma->submit_calls.load(), 1);
-    EXPECT_EQ(fake_tcp->submit_calls.load(), 1);
-
-    TransferStatus status{};
-    ASSERT_TRUE(engine.getTransferStatus(batch_id, status).ok());
+    rdma_->publishFailure(0);
+    auto status = Poll();
     EXPECT_EQ(status.s, TransferStatusEnum::PENDING);
-    EXPECT_EQ(status.transferred_bytes, 0u);
-    EXPECT_GE(fake_rdma->status_calls.load(), 1);
-    EXPECT_GE(fake_tcp->status_calls.load(), 1);
+    EXPECT_GE(rdma_->status_calls.load(), 1);
+    EXPECT_GE(tcp_->submit_calls.load(), 1);
 
-    fake_rdma->completeAllSuccess();
-    status = {};
-    ASSERT_TRUE(engine.getTransferStatus(batch_id, status).ok());
+    status = Poll();
     EXPECT_EQ(status.s, TransferStatusEnum::PENDING);
-    EXPECT_EQ(status.transferred_bytes, kBufLen);
+    EXPECT_GE(tcp_->status_calls.load(), 1);
 
-    fake_tcp->completeAllSuccess();
-    status = {};
-    ASSERT_TRUE(engine.getTransferStatus(batch_id, status).ok());
-    EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
-    EXPECT_EQ(status.transferred_bytes, 2 * kBufLen);
-
-    EXPECT_TRUE(engine.freeBatch(batch_id).ok());
-    EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), kBufLen).ok());
-}
-
-// First submit is publisher-only and eligible. Appending TCP must drop the
-// shortcut so later in-flight polls walk both owners.
-TEST(BatchCounterWait, AppendNonPublisherDisablesShortcut) {
-    auto cfg = makeMinimalP2PConfig();
-    TransferEngineImpl engine(cfg);
-    ASSERT_TRUE(engine.available());
-
-    auto fake_rdma = std::make_shared<FakeTransport>(RDMA, true);
-    auto fake_tcp = std::make_shared<FakeTransport>(TCP, false);
-    installFake(engine, fake_rdma);
-    installFake(engine, fake_tcp);
-
-    constexpr size_t kBufLen = 4096;
-    std::vector<uint8_t> buf(kBufLen, 0x62);
-    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), kBufLen).ok());
-
-    BatchID batch_id = engine.allocateBatch(2);
-    ASSERT_TRUE(engine
-                    .submitTransfer(batch_id,
-                                    {makeLocalWrite(buf.data(), kBufLen, RDMA)})
-                    .ok());
-
-    TransferStatus status{};
-    ASSERT_TRUE(engine.getTransferStatus(batch_id, status).ok());
-    EXPECT_EQ(status.s, TransferStatusEnum::PENDING);
-    EXPECT_EQ(status.transferred_bytes, 0u);
-    EXPECT_EQ(fake_rdma->status_calls.load(), 0);
-    EXPECT_EQ(fake_tcp->submit_calls.load(), 0);
-
-    ASSERT_TRUE(engine
-                    .submitTransfer(batch_id,
-                                    {makeLocalWrite(buf.data(), kBufLen, TCP)})
-                    .ok());
-    EXPECT_EQ(fake_tcp->submit_calls.load(), 1);
-
-    status = {};
-    ASSERT_TRUE(engine.getTransferStatus(batch_id, status).ok());
-    EXPECT_EQ(status.s, TransferStatusEnum::PENDING);
-    EXPECT_GE(fake_rdma->status_calls.load(), 1);
-    EXPECT_GE(fake_tcp->status_calls.load(), 1);
-
-    fake_rdma->completeAllSuccess();
-    fake_tcp->completeAllSuccess();
-    status = {};
-    ASSERT_TRUE(engine.getTransferStatus(batch_id, status).ok());
-    EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
-
-    EXPECT_TRUE(engine.freeBatch(batch_id).ok());
-    EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), kBufLen).ok());
-}
-
-// Failed submitTransferTasks does not append owners, so the CQ counter still
-// looks in-flight. Eligibility must drop or getBatchStatus would skip forever.
-TEST(BatchCounterWait, FailedSubmitDisablesShortcut) {
-    auto cfg = makeMinimalP2PConfig();
-    TransferEngineImpl engine(cfg);
-    ASSERT_TRUE(engine.available());
-
-    auto fake_rdma = std::make_shared<FakeTransport>(RDMA, true);
-    installFake(engine, fake_rdma);
-
-    constexpr size_t kBufLen = 4096;
-    std::vector<uint8_t> buf(kBufLen, 0x63);
-    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), kBufLen).ok());
-
-    BatchID batch_id = engine.allocateBatch(2);
-    auto req = makeLocalWrite(buf.data(), kBufLen, RDMA);
-    ASSERT_TRUE(engine.submitTransfer(batch_id, {req}).ok());
-
-    TransferStatus status{};
-    ASSERT_TRUE(engine.getTransferStatus(batch_id, status).ok());
-    EXPECT_EQ(status.s, TransferStatusEnum::PENDING);
-    EXPECT_EQ(fake_rdma->status_calls.load(), 0);
-
-    fake_rdma->fail_next_submit = true;
-    ASSERT_TRUE(engine.submitTransfer(batch_id, {req}).ok());
-
-    status = {};
-    ASSERT_TRUE(engine.getTransferStatus(batch_id, status).ok());
-    EXPECT_EQ(status.s, TransferStatusEnum::PENDING);
-    EXPECT_GE(fake_rdma->status_calls.load(), 1);
-
-    fake_rdma->completeAllSuccess();
-    status = {};
-    ASSERT_TRUE(engine.getTransferStatus(batch_id, status).ok());
-    EXPECT_EQ(status.s, TransferStatusEnum::FAILED);
-
-    EXPECT_TRUE(engine.freeBatch(batch_id).ok());
-    EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), kBufLen).ok());
-}
-
-// UNSPEC owners have no SubBatch, so the mixed-publisher check cannot see
-// them. Only counter_eligible=false prevents an in-flight skip.
-TEST(BatchCounterWait, UnspecSubmitDisablesShortcut) {
-    auto cfg = makeMinimalP2PConfig();
-    TransferEngineImpl engine(cfg);
-    ASSERT_TRUE(engine.available());
-
-    auto fake_rdma = std::make_shared<FakeTransport>(RDMA, true);
-    installFake(engine, fake_rdma);
-
-    constexpr size_t kBufLen = 4096;
-    std::vector<uint8_t> buf(kBufLen, 0x64);
-    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), kBufLen).ok());
-
-    BatchID batch_id = engine.allocateBatch(2);
-    ASSERT_TRUE(engine
-                    .submitTransfer(batch_id,
-                                    {makeLocalWrite(buf.data(), kBufLen, RDMA)})
-                    .ok());
-
-    TransferStatus status{};
-    ASSERT_TRUE(engine.getTransferStatus(batch_id, status).ok());
-    EXPECT_EQ(status.s, TransferStatusEnum::PENDING);
-    EXPECT_EQ(fake_rdma->status_calls.load(), 0);
-
-    Request missing = makeLocalWrite(buf.data(), kBufLen, RDMA);
-    missing.target_offset = 0x100000000ULL;
-    ASSERT_TRUE(engine.submitTransfer(batch_id, {missing}).ok());
-
-    status = {};
-    ASSERT_TRUE(engine.getTransferStatus(batch_id, status).ok());
-    EXPECT_EQ(status.s, TransferStatusEnum::PENDING);
-    EXPECT_GE(fake_rdma->status_calls.load(), 1);
-
-    fake_rdma->completeAllSuccess();
-    status = {};
-    ASSERT_TRUE(engine.getTransferStatus(batch_id, status).ok());
-    EXPECT_EQ(status.s, TransferStatusEnum::FAILED);
-
-    EXPECT_TRUE(engine.freeBatch(batch_id).ok());
-    EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), kBufLen).ok());
-}
-
-// Poll-time failover onto TCP must keep walking: TCP does not publish, and
-// the surviving RDMA sub-batch's CQ counter is no longer the live transport.
-TEST(BatchCounterWait, FailoverFromPublisherToTcpKeepsOwnerWalk) {
-    auto cfg = makeMinimalP2PConfig();
-    cfg->set("enable_auto_failover_on_poll", true);
-    cfg->set("max_failover_attempts", 3);
-    TransferEngineImpl engine(cfg);
-    ASSERT_TRUE(engine.available());
-
-    auto fake_rdma = std::make_shared<FakeTransport>(RDMA, true);
-    auto fake_tcp = std::make_shared<FakeTransport>(TCP, false);
-    installFake(engine, fake_rdma);
-    installFake(engine, fake_tcp);
-
-    constexpr size_t kBufLen = 4096;
-    std::vector<uint8_t> buf(kBufLen, 0x65);
-    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), kBufLen).ok());
-
-    BatchID batch_id = engine.allocateBatch(1);
-    ASSERT_TRUE(engine
-                    .submitTransfer(batch_id,
-                                    {makeLocalWrite(buf.data(), kBufLen, RDMA)})
-                    .ok());
-    EXPECT_EQ(fake_rdma->submit_calls.load(), 1);
-    EXPECT_EQ(fake_tcp->submit_calls.load(), 0);
-
-    TransferStatus status{};
-    ASSERT_TRUE(engine.getTransferStatus(batch_id, status).ok());
-    EXPECT_EQ(status.s, TransferStatusEnum::PENDING);
-    EXPECT_EQ(fake_rdma->status_calls.load(), 0);
-
-    fake_rdma->publishFailure(0);
-    status = {};
-    ASSERT_TRUE(engine.getTransferStatus(batch_id, status).ok());
-    EXPECT_EQ(status.s, TransferStatusEnum::PENDING);
-    EXPECT_GE(fake_rdma->status_calls.load(), 1);
-    EXPECT_GE(fake_tcp->submit_calls.load(), 1);
-
-    status = {};
-    ASSERT_TRUE(engine.getTransferStatus(batch_id, status).ok());
-    EXPECT_EQ(status.s, TransferStatusEnum::PENDING);
-    EXPECT_GE(fake_tcp->status_calls.load(), 1);
-
-    fake_tcp->completeAllSuccess();
-    status = {};
-    ASSERT_TRUE(engine.getTransferStatus(batch_id, status).ok());
+    tcp_->completeAllSuccess();
+    status = Poll();
     EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
     EXPECT_EQ(status.transferred_bytes, kBufLen);
-
-    EXPECT_TRUE(engine.freeBatch(batch_id).ok());
-    EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), kBufLen).ok());
 }
+
+enum class EligibilityDrop {
+    NonPublisher,
+    MixedRdmaTcp,
+    AppendTcp,
+    FailedSubmit,
+    UnspecSubmit,
+};
+
+class BatchCounterWaitEligibility
+    : public BatchCounterWaitTest,
+      public ::testing::WithParamInterface<EligibilityDrop> {};
+
+TEST_P(BatchCounterWaitEligibility, KeepsOwnerWalk) {
+    Start();
+    const bool publishes = GetParam() != EligibilityDrop::NonPublisher;
+    AddRdma(publishes);
+    if (GetParam() == EligibilityDrop::MixedRdmaTcp ||
+        GetParam() == EligibilityDrop::AppendTcp) {
+        AddTcp();
+    }
+    Alloc(2);
+
+    switch (GetParam()) {
+        case EligibilityDrop::NonPublisher:
+            Submit({Req()});
+            break;
+        case EligibilityDrop::MixedRdmaTcp:
+            Submit({Req(RDMA), Req(TCP)});
+            EXPECT_EQ(rdma_->submit_calls.load(), 1);
+            EXPECT_EQ(tcp_->submit_calls.load(), 1);
+            break;
+        case EligibilityDrop::AppendTcp:
+            Submit({Req(RDMA)});
+            ExpectPendingSkip();
+            Submit({Req(TCP)});
+            EXPECT_EQ(tcp_->submit_calls.load(), 1);
+            break;
+        case EligibilityDrop::FailedSubmit:
+            Submit({Req(RDMA)});
+            ExpectPendingSkip();
+            rdma_->fail_next_submit = true;
+            Submit({Req(RDMA)});
+            break;
+        case EligibilityDrop::UnspecSubmit:
+            Submit({Req(RDMA)});
+            ExpectPendingSkip();
+            {
+                Request missing = Req(RDMA);
+                missing.target_offset = 0x100000000ULL;
+                Submit({missing});
+            }
+            break;
+    }
+
+    auto status = Poll();
+    EXPECT_EQ(status.s, TransferStatusEnum::PENDING);
+    EXPECT_GE(rdma_->status_calls.load(), 1);
+    if (tcp_) {
+        EXPECT_GE(tcp_->status_calls.load(), 1);
+    }
+
+    rdma_->completeAllSuccess();
+    if (tcp_) tcp_->completeAllSuccess();
+    status = Poll();
+    if (GetParam() == EligibilityDrop::FailedSubmit ||
+        GetParam() == EligibilityDrop::UnspecSubmit) {
+        EXPECT_EQ(status.s, TransferStatusEnum::FAILED);
+    } else {
+        EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
+    }
+}
+
+std::string EligibilityName(
+    const ::testing::TestParamInfo<EligibilityDrop>& info) {
+    switch (info.param) {
+        case EligibilityDrop::NonPublisher:
+            return "NonPublisher";
+        case EligibilityDrop::MixedRdmaTcp:
+            return "MixedRdmaTcp";
+        case EligibilityDrop::AppendTcp:
+            return "AppendTcp";
+        case EligibilityDrop::FailedSubmit:
+            return "FailedSubmit";
+        case EligibilityDrop::UnspecSubmit:
+            return "UnspecSubmit";
+    }
+    return "Unknown";
+}
+
+INSTANTIATE_TEST_SUITE_P(Cases, BatchCounterWaitEligibility,
+                         ::testing::Values(EligibilityDrop::NonPublisher,
+                                           EligibilityDrop::MixedRdmaTcp,
+                                           EligibilityDrop::AppendTcp,
+                                           EligibilityDrop::FailedSubmit,
+                                           EligibilityDrop::UnspecSubmit),
+                         EligibilityName);
 
 }  // namespace
 }  // namespace tent

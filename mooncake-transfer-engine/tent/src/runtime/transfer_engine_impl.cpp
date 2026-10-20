@@ -3066,17 +3066,20 @@ Status TransferEngineImpl::submitStagingTransfer(
                           QueueOwnerKind::StagingInternal);
 }
 
-Status TransferEngineImpl::maybeFireSubmitHooks(Batch* batch, bool check) {
+Status TransferEngineImpl::maybeFireSubmitHooks(Batch* batch,
+                                                bool allow_owner_scan) {
     for (auto& interval : batch->submit_intervals) {
         auto& hook = *interval;
         if (hook.fired || !hook.has_notify) continue;
-        bool all_completed = true;
-        if (hook.expected_owners > 0 && intervalOwnersComplete(hook)) {
+        // Counter-only on the RDMA skip path. Do not initialize this to true:
+        // an unfinished interval with allow_owner_scan=false would fire early.
+        bool all_completed = intervalOwnersComplete(hook);
+        if (!all_completed && allow_owner_scan) {
             all_completed = true;
-        } else if (check) {
             for (size_t tid = hook.start_task_id; tid < hook.end_task_id;
                  ++tid) {
                 auto& t = batch->task_list[tid];
+                hook_owner_scans_.fetch_add(1, std::memory_order_relaxed);
                 // Merged requests are carried by one owning task; the derived
                 // ones keep their initial status forever, so checking them
                 // would make this hook never fire. getBatchStatus() skips them
@@ -3694,7 +3697,7 @@ bool TransferEngineImpl::trySkipInFlightOwnerWalk(
     if (!batch->counter_eligible || batch->queue_token != 0) return false;
     // Batch status stays PENDING while any submit interval is unfinished
     // (TE #4199). Unfired hooks are not a skip veto: ready intervals fire
-    // from their own counters (TENT #4001) without walking owners.
+    // from their own counters (TENT #4001) without scanning TaskInfo.
 
     Transport::SubBatchRef publisher = nullptr;
     for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
@@ -3731,7 +3734,7 @@ Status TransferEngineImpl::getBatchStatus(BatchID batch_id,
     overall_status.s = PENDING;
     overall_status.transferred_bytes = 0;
     if (trySkipInFlightOwnerWalk(batch, overall_status)) {
-        CHECK_STATUS(maybeFireSubmitHooks(batch));
+        CHECK_STATUS(maybeFireSubmitHooks(batch, /*allow_owner_scan=*/false));
         return Status::OK();
     }
     size_t success_tasks = 0;

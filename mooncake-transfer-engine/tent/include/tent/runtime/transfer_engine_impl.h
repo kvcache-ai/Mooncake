@@ -392,6 +392,12 @@ class TransferEngineImpl {
         return deferred_stage_teardown_.batches.size();
     }
 
+    // Test-only: TaskInfo owners read by maybeFireSubmitHooks' walk fallback.
+    // The RDMA counter skip must keep this at 0.
+    uint64_t hookOwnerScansForTest() const {
+        return hook_owner_scans_.load(std::memory_order_relaxed);
+    }
+
     // Wake the optional event-driven progress worker for `batch_id`. No-op if
     // enable_progress_worker is false. Transport completion paths use this as
     // an idempotent "maybe ready" signal.
@@ -572,7 +578,9 @@ class TransferEngineImpl {
     bool xpuIpcReady(const Request& req, const SegmentDesc* desc,
                      const BufferDesc* remote_entry);
 
-    Status maybeFireSubmitHooks(Batch* batch, bool check = true);
+    // allow_owner_scan: walk path / TCP / mixed / failure may read TaskInfo.
+    // The RDMA counter skip must pass false (counter-only).
+    Status maybeFireSubmitHooks(Batch* batch, bool allow_owner_scan = true);
 
     void recordTaskCompletionMetrics(TaskInfo& task,
                                      TransferStatusEnum prev_status,
@@ -642,6 +650,7 @@ class TransferEngineImpl {
     // in-process rather than through a transport; see sendNotification().
     std::mutex local_notifi_mutex_;
     std::vector<Notification> local_notifi_list_;
+    std::atomic<uint64_t> hook_owner_scans_{0};
 
     std::string hostname_;
     uint16_t port_;

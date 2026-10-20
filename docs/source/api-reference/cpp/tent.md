@@ -527,7 +527,7 @@ Submits transfers and sends a notification upon completion.
 
 - `notifi`: A `{name, msg}` payload delivered to the receiver when the transfer completes.
 - Typical use: Signal that transferred data is ready for consumption.
-- Notification is per submit interval ([#4001](https://github.com/kvcache-ai/Mooncake/pull/4001)): a completed interval notifies even if later submits on the same batch are still `PENDING` or `FAILED`. The RDMA completion-counter fast path ([#4199](https://github.com/kvcache-ai/Mooncake/pull/4199)) skips the owner walk for batch status only; it still fires a ready interval from that interval's completion counter.
+- Notification is per submit interval ([#4001](https://github.com/kvcache-ai/Mooncake/pull/4001)): a completed interval notifies even if later submits on the same batch are still `PENDING` or `FAILED`. The RDMA completion-counter fast path ([#4199](https://github.com/kvcache-ai/Mooncake/pull/4199)) skips the owner walk for batch status only. A ready interval fires from that interval's completion counter; the skip path does not scan the interval's owners.
 
 #### TransferEngine::sendNotification
 
