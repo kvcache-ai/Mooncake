@@ -574,10 +574,6 @@ class TransferEngineImpl {
 
     Status maybeFireSubmitHooks(Batch* batch, bool check = true);
 
-    void addSubmitHook(Batch* batch, size_t start_task_id,
-                       const std::vector<Request>& request_list,
-                       const Notification& notifi);
-
     void recordTaskCompletionMetrics(TaskInfo& task,
                                      TransferStatusEnum prev_status,
                                      TransferStatusEnum new_status);

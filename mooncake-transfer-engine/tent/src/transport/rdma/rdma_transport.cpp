@@ -555,7 +555,9 @@ Status RdmaTransport::submitTransferTasks(
         task->resolved_slices.store(0, std::memory_order_relaxed);
         task->first_error = PENDING;
         task->cancel_requested.store(false, std::memory_order_relaxed);
-        task->finished_counter = &rdma_batch->finished_task_count;
+        task->finished_counter = rdma_batch->publish_finished_counter
+                                     ? rdma_batch->publish_finished_counter
+                                     : &rdma_batch->finished_task_count;
         task->has_failure_flag = &rdma_batch->has_failure;
         task->ref();  // Batch holds a reference to the task
 
