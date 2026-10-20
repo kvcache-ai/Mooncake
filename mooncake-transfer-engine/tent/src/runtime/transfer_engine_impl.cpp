@@ -1555,7 +1555,9 @@ Status TransferEngineImpl::validateTransportHint(const Request& req,
 
 SelectionResult TransferEngineImpl::getTransportType(const Request& request,
                                                      int transport_index) {
+#ifdef TENT_TRANSPORT_RESOLVE_COUNTER
     transport_resolve_calls_.fetch_add(1, std::memory_order_relaxed);
+#endif
     bool device_direct = false;
     auto result =
         planTransport(request, transport_index, true, true, &device_direct);
@@ -1863,9 +1865,8 @@ uint64_t requestSourceAddr(const Request& request) {
     return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(request.source));
 }
 
-// prepareSubmit reuses SelectionResult when two owners share the inputs
-// getTransportType actually reads: peer, covering local/remote MR, hint,
-// intent, priority, length, and optional policy name (CP-3).
+// key(a) == key(b) => getTransportType(a) == getTransportType(b).
+// policy_name keeps optional presence: nullopt (default matching) is not "".
 struct RouteCacheKey {
     SegmentID target_id{0};
     TransportType hint{UNSPEC};
@@ -1874,7 +1875,7 @@ struct RouteCacheKey {
     size_t length{0};
     BufferKey source{};
     BufferKey target{};
-    std::string policy_name;
+    std::optional<std::string> policy_name;
 
     bool operator==(const RouteCacheKey&) const = default;
 };
@@ -1891,7 +1892,8 @@ struct RouteCacheKeyHash {
         mix(std::hash<uint64_t>{}(k.source.length));
         mix(std::hash<uint64_t>{}(k.target.addr));
         mix(std::hash<uint64_t>{}(k.target.length));
-        mix(std::hash<std::string>{}(k.policy_name));
+        mix(k.policy_name.has_value() ? 1u : 0u);
+        if (k.policy_name) mix(std::hash<std::string>{}(*k.policy_name));
         return h;
     }
 };
@@ -1912,7 +1914,7 @@ RouteCacheKey makeRouteCacheKey(const Request& req, const BufferKey& source,
     key.length = req.length;
     key.source = source;
     key.target = target;
-    key.policy_name = req.policy_name.value_or("");
+    key.policy_name = req.policy_name;
     return key;
 }
 
@@ -2394,6 +2396,9 @@ Status TransferEngineImpl::prepareSubmit(
     }
     const bool have_boundaries = merge_boundaries.size() == request_list.size();
 
+    // One prepareSubmit only. Each lookup uses the snapshot findBuffer /
+    // resolve sees then; a mid-submit metadata refresh is not part of the
+    // key. Pinning one snapshot per target is follow-up.
     std::unordered_map<RouteCacheKey, SelectionResult, RouteCacheKeyHash>
         route_cache;
     RouteCacheKey last_key{};
@@ -2437,7 +2442,7 @@ Status TransferEngineImpl::prepareSubmit(
             last_key.intent == owner.request.intent_type &&
             last_key.priority == owner.request.priority &&
             last_key.length == len &&
-            last_key.policy_name == owner.request.policy_name.value_or("") &&
+            last_key.policy_name == owner.request.policy_name &&
             bufferCovers(last_key.source, src, len) &&
             bufferCovers(last_key.target, dst, len)) {
             owner.route = last_route;
@@ -2467,8 +2472,6 @@ Status TransferEngineImpl::prepareSubmit(
                 last_valid = false;
             }
         }
-        owner.request.source_memory_type =
-            static_cast<int>(owner.route.local_memory_type);
         if (require_post_submit_cancellation) {
             const auto type = owner.route.transport;
             if (type == UNSPEC || type < 0 ||

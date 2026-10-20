@@ -177,9 +177,6 @@ struct Request {
     // and docs/source/design/tent/deadline-scheduling.md.
     uint64_t deadline_ns = 0;
     IntentType intent_type = IntentType::INTENT_UNSPEC;
-    // Filled by prepareSubmit. Values match MemoryType; 0 = unknown and the
-    // transport probes. Callers should leave the default.
-    int source_memory_type = 0;
 };
 
 enum TransferStatusEnum {
