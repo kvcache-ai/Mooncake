@@ -8,6 +8,9 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <ostream>
+#include <functional>
+#include <span>
+#include "drain_recovery.h"
 #include "types.h"
 #include "mutex.h"
 #include "master_config.h"
@@ -75,7 +78,8 @@ struct Task {
 
     std::string message;
     UUID assigned_client;
-    uint32_t max_retry_attempts;
+    uint32_t max_retry_attempts{0};
+    std::optional<DrainUnitRecord> drain;
 
     bool is_finished() const { return is_finished_status(status); }
 
@@ -90,6 +94,9 @@ struct Task {
         last_updated_at = std::chrono::system_clock::now();
     }
 };
+
+DurableTaskRecord ToDurableTask(const Task& task, bool removed = false);
+Task FromDurableTask(const DurableTaskRecord& record);
 
 struct ReplicaCopyPayload {
     std::string tenant_id = "default";
@@ -171,9 +178,10 @@ class ScopedTaskWriteAccess {
     template <TaskType Type>
     tl::expected<UUID, ErrorCode> submit_task_typed(
         const UUID& client_id,
-        const typename TaskPayloadTraits<Type>::type& payload) {
+        const typename TaskPayloadTraits<Type>::type& payload,
+        std::optional<DrainUnitRecord> drain = std::nullopt) {
         std::string json = serialize_payload(payload);
-        return submit_task(client_id, Type, json);
+        return submit_task(client_id, Type, json, std::move(drain));
     }
 
     std::vector<Task> pop_tasks(const UUID& client_id, size_t batch_size);
@@ -193,9 +201,9 @@ class ScopedTaskWriteAccess {
     void prune_expired_tasks();
 
    private:
-    tl::expected<UUID, ErrorCode> submit_task(const UUID& client_id,
-                                              TaskType type,
-                                              const std::string& payload);
+    tl::expected<UUID, ErrorCode> submit_task(
+        const UUID& client_id, TaskType type, const std::string& payload,
+        std::optional<DrainUnitRecord> drain);
 
     ClientTaskManager* manager_;
     SharedMutexLocker lock_;
@@ -206,13 +214,18 @@ class ClientTaskManager {
     friend class ScopedTaskReadAccess;
     friend class ScopedTaskWriteAccess;
 
-    explicit ClientTaskManager(const TaskManagerConfig& config)
+    using Persistence =
+        std::function<ErrorCode(std::span<const DurableTaskRecord>)>;
+
+    explicit ClientTaskManager(const TaskManagerConfig& config,
+                               Persistence persistence = {})
         : max_total_finished_tasks_(config.max_total_finished_tasks),
           max_total_pending_tasks_(config.max_total_pending_tasks),
           max_total_processing_tasks_(config.max_total_processing_tasks),
           pending_task_timeout_sec_(config.pending_task_timeout_sec),
           processing_task_timeout_sec_(config.processing_task_timeout_sec),
-          max_retry_attempts_(config.max_retry_attempts) {}
+          max_retry_attempts_(config.max_retry_attempts),
+          persistence_(std::move(persistence)) {}
 
     ~ClientTaskManager() = default;
 
@@ -235,6 +248,12 @@ class ClientTaskManager {
     uint64_t pending_task_timeout_sec_;
     uint64_t processing_task_timeout_sec_;
     uint32_t max_retry_attempts_;
+    Persistence persistence_;
+    ErrorCode Persist(const Task& task, bool removed = false) const {
+        if (!persistence_) return ErrorCode::OK;
+        const auto record = ToDurableTask(task, removed);
+        return persistence_({&record, 1});
+    }
 
     size_t total_pending_tasks_ GUARDED_BY(mutex_) = 0;
     size_t total_processing_tasks_ GUARDED_BY(mutex_) = 0;

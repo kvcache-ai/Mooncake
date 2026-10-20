@@ -128,7 +128,10 @@ bool ValidateIdentity(const SnapshotMetadata& metadata, std::string* reason) {
     const bool with_weights =
         metadata.schema_version == kBatchOpLogWeightSnapshotSchemaVersion &&
         metadata.snapshot_format == kBatchOpLogWeightSnapshotFormat;
-    if (!legacy && !with_weights) {
+    const bool with_recovery =
+        metadata.schema_version == kBatchOpLogRecoverySnapshotSchemaVersion &&
+        metadata.snapshot_format == kBatchOpLogRecoverySnapshotFormat;
+    if (!legacy && !with_weights && !with_recovery) {
         SetReason(reason, "unsupported snapshot version and format");
         return false;
     }
@@ -323,6 +326,13 @@ std::string EncodeBatchOpLogSnapshotManifest(
         chunks.append(EncodeChunkDescriptor(descriptor));
     }
     root["object_chunks"] = std::move(chunks);
+    if (manifest.schema_version == kBatchOpLogRecoverySnapshotSchemaVersion) {
+        Json::Value recovery(Json::arrayValue);
+        for (const auto& chunk : manifest.recovery_chunks) {
+            recovery.append(EncodeChunkDescriptor(chunk));
+        }
+        root["recovery_chunks"] = std::move(recovery);
+    }
     return WriteJson(root);
 }
 
@@ -342,7 +352,9 @@ DecodeBatchOpLogSnapshotManifest(std::string_view value) {
     if (!DecodeObjectDescriptor(root["segments"], decoded.segments, &reason)) {
         return tl::make_unexpected(std::move(reason));
     }
-    if (decoded.schema_version == kBatchOpLogWeightSnapshotSchemaVersion) {
+    if (decoded.schema_version == kBatchOpLogWeightSnapshotSchemaVersion ||
+        (decoded.schema_version == kBatchOpLogRecoverySnapshotSchemaVersion &&
+         root.isMember("weight_metadata"))) {
         BatchOpLogSnapshotObjectDescriptor weights;
         if (!root.isMember("weight_metadata") ||
             !DecodeObjectDescriptor(root["weight_metadata"], weights,
@@ -368,7 +380,34 @@ DecodeBatchOpLogSnapshotManifest(std::string_view value) {
         }
         decoded.object_chunks.push_back(std::move(descriptor));
     }
+    if (decoded.schema_version == kBatchOpLogRecoverySnapshotSchemaVersion) {
+        if (!root.isMember("recovery_chunks") ||
+            !root["recovery_chunks"].isArray()) {
+            return tl::make_unexpected(
+                std::string("recovery_chunks must be an array"));
+        }
+        const auto& recovery = root["recovery_chunks"];
+        for (Json::ArrayIndex i = 0; i < recovery.size(); ++i) {
+            BatchOpLogSnapshotChunkDescriptor chunk;
+            if (!DecodeChunkDescriptor(recovery[i], i, chunk, &reason)) {
+                return tl::make_unexpected(
+                    std::string("Invalid recovery chunk: ") + reason);
+            }
+            decoded.recovery_chunks.push_back(std::move(chunk));
+        }
+    } else if (root.isMember("recovery_chunks")) {
+        return tl::make_unexpected(
+            std::string("Recovery chunks require snapshot v3"));
+    }
     return decoded;
+}
+
+std::string BuildBatchOpLogSnapshotRecoveryChunkKey(
+    const std::string& root, std::string_view snapshot_id, uint64_t index) {
+    const auto prefix = BuildArtifactPrefix(root, snapshot_id);
+    return prefix.empty()
+               ? std::string()
+               : prefix + "recovery/" + std::to_string(index) + ".bin";
 }
 
 std::string BuildBatchOpLogSnapshotId(uint64_t last_included_batch_id,

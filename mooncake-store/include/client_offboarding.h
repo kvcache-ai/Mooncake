@@ -32,6 +32,7 @@ struct PreparedSegmentOffboarding {
     std::string segment_name;
     std::string transport_endpoint;
     size_t metrics_dec_capacity{0};
+    bool recovered{false};
 };
 
 // Process-local residual work for one terminal Client incarnation. The job is

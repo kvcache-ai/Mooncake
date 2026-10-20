@@ -31,6 +31,8 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     client_offboarding.cpp
     dynamic_replication_controller.cpp
     master_service.cpp
+    master_service_drain_recovery.cpp
+    drain_recovery.cpp
     promotion_candidate_tracker.cpp
     master_store_backend.cpp
     weight_store_manager.cpp

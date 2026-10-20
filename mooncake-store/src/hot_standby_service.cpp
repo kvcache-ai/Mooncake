@@ -172,7 +172,9 @@ ErrorCode HotStandbyService::PrepareBootstrapBaselineLocked(
     uint64_t& baseline_seq_id) {
     const uint64_t local_last_seq_id = GetLocalLastAppliedSequenceIdLocked();
     const bool has_local_metadata =
-        metadata_store_ && metadata_store_->GetKeyCount() > 0;
+        metadata_store_ &&
+        (metadata_store_->GetKeyCount() > 0 ||
+         !metadata_store_->DrainRecovery().records().empty());
     const bool has_recoverable_local_state =
         has_local_metadata && local_last_seq_id > 0;
 
@@ -185,29 +187,29 @@ ErrorCode HotStandbyService::PrepareBootstrapBaselineLocked(
 
     oplog_applier_ =
         std::make_unique<OpLogApplier>(metadata_store_.get(), cluster_id_);
-    if (batch_oplog_snapshot_provider_ && config_.enable_snapshot_bootstrap) {
-        if (preserve_promotion_baseline_ && metadata_store_ &&
-            batch_snapshot_baseline_) {
-            const uint64_t preserved_seq = batch_snapshot_baseline_->last_seq;
-            oplog_applier_->Recover(preserved_seq);
-            if (!preserved_segments_.empty()) {
-                oplog_applier_->LoadSegmentRegistry(preserved_segments_);
-            }
-            preserved_segments_.clear();
-            preserve_promotion_baseline_ = false;
-            applied_seq_id_.store(preserved_seq, std::memory_order_release);
-            primary_seq_id_.store(preserved_seq, std::memory_order_release);
-            baseline_seq_id = preserved_seq;
-            {
-                std::lock_guard<std::mutex> cursor_lock(
-                    batch_snapshot_cursor_mutex_);
-                last_applied_batch_snapshot_prefix_ = *batch_snapshot_baseline_;
-            }
-            LOG(INFO) << "Standby restart resumes preserved promotion cursor, "
-                      << "applied_seq=" << preserved_seq
-                      << ", batch_id=" << batch_snapshot_baseline_->batch_id;
-            return ErrorCode::OK;
+    if (preserve_promotion_baseline_ && metadata_store_ &&
+        batch_snapshot_baseline_) {
+        const uint64_t preserved_seq = batch_snapshot_baseline_->last_seq;
+        oplog_applier_->Recover(preserved_seq);
+        if (!preserved_segments_.empty()) {
+            oplog_applier_->LoadSegmentRegistry(preserved_segments_);
         }
+        preserved_segments_.clear();
+        preserve_promotion_baseline_ = false;
+        applied_seq_id_.store(preserved_seq, std::memory_order_release);
+        primary_seq_id_.store(preserved_seq, std::memory_order_release);
+        baseline_seq_id = preserved_seq;
+        {
+            std::lock_guard<std::mutex> cursor_lock(
+                batch_snapshot_cursor_mutex_);
+            last_applied_batch_snapshot_prefix_ = *batch_snapshot_baseline_;
+        }
+        LOG(INFO) << "Standby restart resumes preserved promotion cursor, "
+                  << "applied_seq=" << preserved_seq
+                  << ", batch_id=" << batch_snapshot_baseline_->batch_id;
+        return ErrorCode::OK;
+    }
+    if (batch_oplog_snapshot_provider_ && config_.enable_snapshot_bootstrap) {
         preserve_promotion_baseline_ = false;
         return LoadBatchOpLogSnapshotBaselineLocked(baseline_seq_id);
     }
@@ -805,8 +807,7 @@ bool HotStandbyService::IsBatchOpLogSnapshotMode() const {
 tl::expected<BatchOpLogPromotionHandoff, ErrorCode>
 HotStandbyService::PromoteAndDetachBatchOpLogStore() {
     std::unique_lock<std::mutex> lock(mutex_);
-    if (!batch_oplog_snapshot_provider_ || !config_.enable_oplog_following ||
-        !batch_standby_reader_) {
+    if (!config_.enable_oplog_following || !batch_standby_reader_) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
     if (!IsReadyForPromotion()) {
@@ -972,6 +973,24 @@ bool HotStandbyService::CopyNextBatchOpLogSnapshotChunk(
     return metadata_store_->CopyNextSnapshotChunk(count, capture.cursor_, out);
 }
 
+bool HotStandbyService::CopyNextBatchOpLogRecoveryChunk(
+    size_t count, BatchOpLogSnapshotCapture& capture,
+    std::vector<DrainRecoveryRecord>& out) {
+    auto state = snapshot_capture_state_;
+    std::lock_guard lock(state->mutex);
+    out.clear();
+    if (count == 0 || capture.lease_state_ != state || !state->active ||
+        capture.generation_ != state->generation || !metadata_store_)
+        return false;
+    while (out.size() < count && !capture.recovery_done()) {
+        out.push_back(capture.recovery_cursor_->second);
+        ++capture.recovery_cursor_;
+        capture.recovery_done_ =
+            capture.recovery_cursor_ == capture.recovery_end_;
+    }
+    return true;
+}
+
 void HotStandbyService::EndBatchOpLogSnapshotCapture(
     BatchOpLogSnapshotCapture& capture) {
     if (capture.lease_state_ == snapshot_capture_state_) {
@@ -1017,6 +1036,10 @@ void HotStandbyService::HandleSnapshotCaptureRequest(
             metadata_store_->BeginSnapshotTraversal(), state->generation,
             state);
         capture.weight_metadata = metadata_store_->SnapshotWeightMetadata();
+        const auto& recovery = metadata_store_->DrainRecovery().records();
+        capture.recovery_cursor_ = recovery.begin();
+        capture.recovery_end_ = recovery.end();
+        capture.recovery_done_ = recovery.empty();
         ready_snapshot_capture_ = std::move(capture);
         state->active = true;
     }

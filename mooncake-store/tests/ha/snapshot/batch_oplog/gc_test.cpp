@@ -134,13 +134,13 @@ TEST(BatchOpLogSnapshotGcTest, PointerMismatchSkipsDeletion) {
     EXPECT_TRUE(object_store.deleted.empty());
 }
 
-TEST(BatchOpLogSnapshotGcTest, MissingWeightArtifactSkipsDeletion) {
+TEST(BatchOpLogSnapshotGcTest, MissingWeightOrRecoveryArtifactSkipsDeletion) {
     FakeBackend backend;
     RecordingObjectStore object_store;
     auto lease = SnapshotMaintenanceLease::MakeForTesting("c", "1");
     auto descriptor = MakeDescriptor("snapshots", 2);
-    descriptor.schema_version = ha::kBatchOpLogWeightSnapshotSchemaVersion;
-    descriptor.snapshot_format = ha::kBatchOpLogWeightSnapshotFormat;
+    descriptor.schema_version = ha::kBatchOpLogRecoverySnapshotSchemaVersion;
+    descriptor.snapshot_format = ha::kBatchOpLogRecoverySnapshotFormat;
     ha::BatchOpLogSnapshotManifest manifest;
     manifest.schema_version = descriptor.schema_version;
     manifest.snapshot_format = descriptor.snapshot_format;
@@ -155,6 +155,11 @@ TEST(BatchOpLogSnapshotGcTest, MissingWeightArtifactSkipsDeletion) {
         ha::BuildBatchOpLogSnapshotWeightMetadataKey("snapshots",
                                                      descriptor.snapshot_id),
         1, Crc32cValue("w", 1)};
+    manifest.recovery_chunks.push_back(
+        {0,
+         ha::BuildBatchOpLogSnapshotRecoveryChunkKey("snapshots",
+                                                     descriptor.snapshot_id, 0),
+         1, 1, Crc32cValue("r", 1)});
     const auto manifest_json = ha::EncodeBatchOpLogSnapshotManifest(manifest);
     descriptor.manifest_size = manifest_json.size();
     descriptor.manifest_crc32c =
@@ -165,14 +170,19 @@ TEST(BatchOpLogSnapshotGcTest, MissingWeightArtifactSkipsDeletion) {
                                                      manifest_json.end()};
     object_store.objects[manifest.segments.key] = {'s'};
     object_store.objects[manifest.weight_metadata->key] = {'w'};
+    object_store.objects[manifest.recovery_chunks.front().key] = {'r'};
     const auto stale_prefix =
         ha::BuildBatchOpLogSnapshotArtifactPrefix("snapshots", "1-1");
     object_store.objects[stale_prefix + "marker"] = {1};
-    object_store.objects.erase(manifest.weight_metadata->key);
     BatchOpLogSnapshotGc gc(backend, object_store, "c", "snapshots");
-    EXPECT_NE(ErrorCode::OK, gc.Run(*lease, pointer, std::nullopt));
-    EXPECT_TRUE(object_store.deleted.empty());
-    object_store.objects[manifest.weight_metadata->key] = {'w'};
+    for (const auto& key : {manifest.weight_metadata->key,
+                            manifest.recovery_chunks.front().key}) {
+        const auto bytes = object_store.objects.at(key);
+        object_store.objects.erase(key);
+        EXPECT_NE(ErrorCode::OK, gc.Run(*lease, pointer, std::nullopt));
+        EXPECT_TRUE(object_store.deleted.empty());
+        object_store.objects[key] = bytes;
+    }
     EXPECT_EQ(ErrorCode::OK, gc.Run(*lease, pointer, std::nullopt));
     ASSERT_EQ(1u, object_store.deleted.size());
     EXPECT_EQ(stale_prefix, object_store.deleted.front());

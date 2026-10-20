@@ -109,6 +109,16 @@ ErrorCode BatchOpLogSnapshotGc::Run(
                               chunk.crc32c))
                 return ErrorCode::INTERNAL_ERROR;
         }
+        for (size_t i = 0; i < manifest->recovery_chunks.size(); ++i) {
+            const auto& chunk = manifest->recovery_chunks[i];
+            if (chunk.chunk_index != i ||
+                chunk.key != ha::BuildBatchOpLogSnapshotRecoveryChunkKey(
+                                 root_, descriptor->snapshot_id, i) ||
+                !VerifyObject(store_, chunk.key, chunk.stored_size,
+                              chunk.crc32c)) {
+                return ErrorCode::INTERNAL_ERROR;
+            }
+        }
         if (manifest->weight_metadata) {
             const auto& weights = *manifest->weight_metadata;
             if (weights.key != ha::BuildBatchOpLogSnapshotWeightMetadataKey(

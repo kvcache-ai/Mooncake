@@ -174,6 +174,56 @@ TEST(BatchOpLogPromotionTest, EmptyStoreWithoutDurablePrefixUsesZeroCursor) {
     EXPECT_FALSE(standby->ExportMetadataSnapshot(retained));
 }
 
+TEST(BatchOpLogPromotionTest, DetachesRecoveryStoreWithoutSnapshotProvider) {
+    auto backend = std::make_shared<MemoryBackend>();
+    DrainJobRecord job{.id = {1, 2}, .sources = {"source"}, .concurrency = 1};
+    OpLogEntry update;
+    update.sequence_id = 1;
+    update.op_type = OpType::DRAIN_JOB_UPDATE;
+    update.object_key = "drain";
+    update.payload = EncodeRecoveryValue(DrainJobUpdate{job, std::nullopt, {}});
+    update.checksum = ComputeOpLogChecksum(update.payload);
+    OpLogEntry put;
+    put.sequence_id = 2;
+    put.op_type = OpType::PUT_END;
+    put.object_key = "object";
+    OpLogBatchRecord batch;
+    batch.batch_id = 1;
+    batch.first_seq = 1;
+    batch.last_seq = 2;
+    batch.entries = {update, put};
+    ASSERT_EQ(ErrorCode::OK,
+              backend->Put(BuildBatchRecordKey("promotion-test", 1),
+                           EncodeOpLogBatchRecord(batch)));
+    ASSERT_EQ(ErrorCode::OK,
+              backend->Put(BuildDurablePrefixKey("promotion-test"),
+                           EncodeDurablePrefix({1, 2})));
+    ASSERT_EQ(ErrorCode::OK,
+              backend->Put(BuildProducerViewKey("promotion-test"), "7"));
+    HotStandbyConfig config;
+    config.enable_snapshot_bootstrap = false;
+    config.enable_oplog_following = true;
+    config.enable_verification = false;
+    config.oplog_poll_interval_ms = 1;
+    HotStandbyService standby(config);
+    standby.SetCatchUpBatchKvBackendForTesting(backend);
+    ASSERT_EQ(ErrorCode::OK, standby.Start("", "", "promotion-test"));
+    EXPECT_FALSE(standby.IsBatchOpLogSnapshotMode());
+
+    auto handoff = standby.PromoteAndDetachBatchOpLogStore();
+
+    ASSERT_TRUE(handoff) << toString(handoff.error());
+    ASSERT_TRUE(handoff->metadata_store);
+    const DurablePrefix expected_cursor{.batch_id = 1, .last_seq = 2};
+    EXPECT_EQ(expected_cursor, handoff->applied_cursor);
+    EXPECT_EQ(7, handoff->producer_view_version);
+    EXPECT_TRUE(handoff->metadata_store->Exists("object"));
+    const auto& records = handoff->metadata_store->DrainRecovery().records();
+    ASSERT_EQ(1u, records.size());
+    EXPECT_EQ(EncodeRecoveryValue(job), records.begin()->second.payload);
+    EXPECT_EQ(StandbyState::STOPPED, standby.GetState());
+}
+
 TEST(BatchOpLogPromotionTest, SnapshotOnlyProviderFallsBackToLegacyExport) {
     auto backend = std::make_shared<MemoryBackend>();
     LocalFileSnapshotObjectStore object_store(

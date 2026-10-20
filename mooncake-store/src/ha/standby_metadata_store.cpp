@@ -80,6 +80,7 @@ size_t StandbyMetadataStore::GetKeyCount() const {
 void StandbyMetadataStore::Clear() {
     std::lock_guard<std::mutex> lock(mutex_);
     store_.clear();
+    DrainRecovery().Clear();
     weight_metadata_.clear();
     weight_metadata_tombstones_.clear();
     weight_leases_.clear();
@@ -265,6 +266,15 @@ bool StandbyMetadataStore::ValidateReplicaIds(ReplicaID& max_replica_id) const {
                 max_replica_id = std::max(max_replica_id, replica.id);
             }
         }
+    }
+    for (const auto& [key, value] : DrainRecovery().records()) {
+        if (value.kind != RecoveryRecordKind::RetiredReplica) continue;
+        RetiredReplicaRecord retired;
+        if (!DecodeRecoveryValue(value.payload, retired) ||
+            retired.replica.id == 0 ||
+            retired.replica.id == std::numeric_limits<ReplicaID>::max())
+            return false;
+        max_replica_id = std::max(max_replica_id, retired.replica.id);
     }
     return true;
 }

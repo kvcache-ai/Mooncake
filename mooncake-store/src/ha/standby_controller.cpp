@@ -310,7 +310,7 @@ class CapabilityDrivenStandbyController final : public StandbyController {
             return tl::unexpected(promote_error);
         }
 
-        if (standby_service_->IsBatchOpLogSnapshotMode()) {
+        if (capabilities_.has_oplog_following) {
             auto handoff = standby_service_->PromoteAndDetachBatchOpLogStore();
             if (!handoff) {
                 standby_service_->MarkAppliedCursorForRestart();

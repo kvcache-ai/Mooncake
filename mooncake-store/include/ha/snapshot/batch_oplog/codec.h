@@ -18,6 +18,18 @@ struct BatchOpLogSnapshotObjectChunk {
     YLT_REFL(BatchOpLogSnapshotObjectChunk, chunk_index, objects);
 };
 
+struct BatchOpLogRecoveryChunk {
+    uint64_t chunk_index{0};
+    std::vector<DrainRecoveryRecord> records;
+    YLT_REFL(BatchOpLogRecoveryChunk, chunk_index, records);
+};
+
+std::vector<uint8_t> EncodeBatchOpLogRecoveryChunk(
+    uint64_t index, std::vector<DrainRecoveryRecord> records);
+tl::expected<BatchOpLogRecoveryChunk, std::string>
+DecodeBatchOpLogRecoveryChunk(const std::vector<uint8_t>& encoded,
+                              uint64_t index, uint64_t count);
+
 std::vector<uint8_t> EncodeBatchOpLogSnapshotSegments(
     const std::vector<StandbySegmentInfo>& segments);
 tl::expected<std::vector<StandbySegmentInfo>, std::string>

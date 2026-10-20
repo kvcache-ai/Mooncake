@@ -22,6 +22,9 @@ class BatchOpLogSnapshotCapture {
           segments(std::move(other.segments)),
           weight_metadata(std::move(other.weight_metadata)),
           cursor_(std::move(other.cursor_)),
+          recovery_cursor_(other.recovery_cursor_),
+          recovery_end_(other.recovery_end_),
+          recovery_done_(other.recovery_done_),
           generation_(std::exchange(other.generation_, 0)),
           lease_state_(std::move(other.lease_state_)) {}
     BatchOpLogSnapshotCapture& operator=(
@@ -34,6 +37,9 @@ class BatchOpLogSnapshotCapture {
             segments = std::move(other.segments);
             weight_metadata = std::move(other.weight_metadata);
             cursor_ = std::move(other.cursor_);
+            recovery_cursor_ = other.recovery_cursor_;
+            recovery_end_ = other.recovery_end_;
+            recovery_done_ = other.recovery_done_;
             generation_ = std::exchange(other.generation_, 0);
             lease_state_ = std::move(other.lease_state_);
         }
@@ -45,6 +51,7 @@ class BatchOpLogSnapshotCapture {
     ~BatchOpLogSnapshotCapture() { Release(); }
 
     bool done() const { return !lease_state_ || cursor_.done(); }
+    bool recovery_done() const { return !lease_state_ || recovery_done_; }
 
     uint64_t last_included_seq;
     uint64_t last_included_batch_id;
@@ -91,6 +98,8 @@ class BatchOpLogSnapshotCapture {
     }
 
     StandbyMetadataStore::SnapshotCursor cursor_;
+    DrainRecoveryRecords::const_iterator recovery_cursor_, recovery_end_;
+    bool recovery_done_{true};
     uint64_t generation_;
     std::shared_ptr<LeaseState> lease_state_;
 };

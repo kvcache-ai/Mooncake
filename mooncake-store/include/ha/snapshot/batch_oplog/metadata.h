@@ -18,6 +18,9 @@ inline constexpr char kBatchOpLogSnapshotFormat[] =
 inline constexpr uint32_t kBatchOpLogWeightSnapshotSchemaVersion = 2;
 inline constexpr char kBatchOpLogWeightSnapshotFormat[] =
     "standby-oplog-materialized/v2";
+inline constexpr uint32_t kBatchOpLogRecoverySnapshotSchemaVersion = 3;
+inline constexpr char kBatchOpLogRecoverySnapshotFormat[] =
+    "standby-oplog-materialized/v3";
 
 struct BatchOpLogSnapshotDescriptor {
     uint32_t schema_version{kBatchOpLogSnapshotSchemaVersion};
@@ -56,6 +59,7 @@ struct BatchOpLogSnapshotManifest {
     BatchOpLogSnapshotObjectDescriptor segments;
     std::vector<BatchOpLogSnapshotChunkDescriptor> object_chunks;
     std::optional<BatchOpLogSnapshotObjectDescriptor> weight_metadata;
+    std::vector<BatchOpLogSnapshotChunkDescriptor> recovery_chunks;
 };
 
 std::string EncodeBatchOpLogSnapshotDescriptor(
@@ -71,6 +75,9 @@ DecodeBatchOpLogSnapshotManifest(std::string_view value);
 std::string BuildBatchOpLogSnapshotId(uint64_t last_included_batch_id,
                                       int64_t maintenance_lease_id);
 std::string BuildBatchOpLogSnapshotRoot(const std::string& cluster_id);
+std::string BuildBatchOpLogSnapshotRecoveryChunkKey(
+    const std::string& snapshot_root, std::string_view snapshot_id,
+    uint64_t chunk_index);
 
 std::string BuildBatchOpLogSnapshotMaintenanceKey(
     const std::string& cluster_id);
