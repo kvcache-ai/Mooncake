@@ -360,6 +360,16 @@ class TransferEngineImpl {
         }
     }
 
+#ifdef TENT_TRANSPORT_RESOLVE_COUNTER
+    // Unit-test build only: how many times getTransportType ran.
+    uint64_t transportResolveCallsForTest() const {
+        return transport_resolve_calls_.load(std::memory_order_relaxed);
+    }
+    void resetTransportResolveCallsForTest() {
+        transport_resolve_calls_.store(0, std::memory_order_relaxed);
+    }
+#endif
+
     Status publishRuntimeConfigForTest(
         std::shared_ptr<const RuntimeConfigSnapshot> snapshot) {
         if (!snapshot) {
@@ -613,6 +623,9 @@ class TransferEngineImpl {
 
     std::unique_ptr<ProxyManager> staging_proxy_;
     bool merge_requests_;
+#ifdef TENT_TRANSPORT_RESOLVE_COUNTER
+    std::atomic<uint64_t> transport_resolve_calls_{0};
+#endif
     std::shared_ptr<const RuntimeConfigSnapshot> runtime_config_snapshot_;
     bool notify_rpc_fallback_{true};
     bool enable_progress_worker_{false};
