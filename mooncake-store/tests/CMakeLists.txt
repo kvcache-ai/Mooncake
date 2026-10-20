@@ -389,6 +389,8 @@ set_tests_properties(dummy_client_object_checksum_test
                      PROPERTIES ENVIRONMENT "MOONCAKE_STORE_CHECKSUM=1")
 add_store_test(uds_transport_test uds_transport_test.cpp)
 add_store_test(health_check_test health_check_test.cpp)
+add_store_test(real_client_uninitialized_test
+               real_client_uninitialized_test.cpp)
 if(MOONCAKE_OSS_ADAPTER_ENABLED)
   add_store_test(oss_adapter_config_test oss_adapter_config_test.cpp)
   add_store_test(oss_adapter_test oss_adapter_test.cpp)
