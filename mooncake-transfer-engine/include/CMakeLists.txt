@@ -12,6 +12,13 @@ install(FILES ub_allocator.h DESTINATION include)
 install(FILES common/base/status.h DESTINATION include/common/base)
 install(FILES transport/transport.h DESTINATION include/transport)
 
+if(MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL)
+  install(
+    FILES
+      ${CMAKE_CURRENT_SOURCE_DIR}/../src/common/adaptive_congestion_control/adaptive_congestion_control.h
+    DESTINATION include)
+endif()
+
 # Device API headers (header-only, consumed by EP kernel)
 install(FILES transport/device/device_transport.h
         DESTINATION include/transport/device)

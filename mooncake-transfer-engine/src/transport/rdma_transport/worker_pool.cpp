@@ -23,12 +23,16 @@
 #include <exception>
 #include <functional>
 #include <future>
+#include <limits>
 #include <queue>
 #include <thread>
 
 #include "config.h"
 #include "memory_location.h"
 #include "transport/rdma_transport/rdma_batch_cache.h"
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+#include "rdma_error_classifier.h"
+#endif
 #include "transport/rdma_transport/rdma_context.h"
 #include "transport/rdma_transport/rdma_endpoint.h"
 #include "transport/rdma_transport/rdma_transport.h"
@@ -38,6 +42,236 @@
 // #define CONFIG_CACHE_ENDPOINT
 
 namespace mooncake {
+
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+struct ClassicRdmaCongestionControl::RouteState {
+    RouteState(adaptive_congestion_control::Config config, std::string path,
+               const ClassicRdmaCongestionControl *owner)
+        : owner(owner), peer_nic_path(std::move(path)), domain(config) {}
+
+    const ClassicRdmaCongestionControl *const owner;
+    const std::string peer_nic_path;
+    adaptive_congestion_control::DomainState domain;
+    std::atomic<RdmaEndPoint *> endpoint{nullptr};
+    std::atomic<uint64_t> endpoint_generation{1};
+    std::mutex endpoint_mutex;
+    std::atomic<uint64_t> completed_bytes{0};
+};
+
+ClassicRdmaCongestionControl::ClassicRdmaCongestionControl(
+    adaptive_congestion_control::Config config)
+    : config_(config),
+      mode_(config.mode),
+      device_(mode_ == adaptive_congestion_control::Mode::kOff
+                  ? nullptr
+                  : std::make_unique<adaptive_congestion_control::DomainState>(
+                        config)) {}
+
+ClassicRdmaCongestionControl::~ClassicRdmaCongestionControl() = default;
+
+ClassicRdmaCongestionControl::RouteState *ClassicRdmaCongestionControl::route(
+    const std::string &peer_nic_path) {
+    std::lock_guard<std::mutex> lock(routes_mutex_);
+    auto &entry = routes_[peer_nic_path];
+    if (!entry) {
+        entry = std::make_unique<RouteState>(config_, peer_nic_path, this);
+    }
+    return entry.get();
+}
+
+void ClassicRdmaCongestionControl::prepare(Transport::Slice *slice,
+                                           const std::string &peer_nic_path) {
+    if (!enabled()) return;
+    auto *current_route =
+        static_cast<RouteState *>(slice->rdma_congestion_control_route);
+    if (current_route != nullptr && current_route->owner == this &&
+        current_route->peer_nic_path == peer_nic_path) {
+        return;
+    }
+    RouteState *next_route = route(peer_nic_path);
+    if (current_route != next_route) releaseUnposted(slice);
+    slice->rdma_congestion_control_route = next_route;
+}
+
+void ClassicRdmaCongestionControl::prepare(SliceList &slices,
+                                           const std::string &peer_nic_path) {
+    if (!enabled() || slices.empty()) return;
+    auto *next_route = static_cast<RouteState *>(
+        slices.front()->rdma_congestion_control_route);
+    if (next_route == nullptr || next_route->owner != this ||
+        next_route->peer_nic_path != peer_nic_path) {
+        next_route = route(peer_nic_path);
+    }
+    for (auto *slice : slices) {
+        auto *current_route =
+            static_cast<RouteState *>(slice->rdma_congestion_control_route);
+        if (current_route != next_route) releaseUnposted(slice);
+        slice->rdma_congestion_control_route = next_route;
+    }
+}
+
+void ClassicRdmaCongestionControl::bindEndpoint(Transport::Slice *slice,
+                                                RdmaEndPoint *endpoint) {
+    auto *state =
+        static_cast<RouteState *>(slice->rdma_congestion_control_route);
+    if (state == nullptr) return;
+    if (state->endpoint.load(std::memory_order_acquire) == endpoint) return;
+    std::lock_guard<std::mutex> lock(state->endpoint_mutex);
+    if (state->endpoint.load(std::memory_order_relaxed) == endpoint) return;
+    uint64_t next =
+        state->endpoint_generation.load(std::memory_order_relaxed) + 1;
+    if (next == 0) next = 1;
+    state->endpoint_generation.store(next, std::memory_order_release);
+    state->endpoint.store(endpoint, std::memory_order_release);
+}
+
+void ClassicRdmaCongestionControl::retireEndpoint(
+    const std::string &peer_nic_path, RdmaEndPoint *endpoint) {
+    if (!enabled()) return;
+    RouteState *state = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(routes_mutex_);
+        auto it = routes_.find(peer_nic_path);
+        if (it == routes_.end()) return;
+        state = it->second.get();
+    }
+    std::lock_guard<std::mutex> lock(state->endpoint_mutex);
+    if (state->endpoint.load(std::memory_order_relaxed) != endpoint) return;
+    uint64_t next =
+        state->endpoint_generation.load(std::memory_order_relaxed) + 1;
+    if (next == 0) next = 1;
+    state->endpoint_generation.store(next, std::memory_order_release);
+    state->endpoint.store(nullptr, std::memory_order_release);
+}
+
+size_t ClassicRdmaCongestionControl::gate(SliceList &queued) {
+    if (!enabled()) return queued.size();
+    size_t admitted_count = 0;
+    size_t cursor = 0;
+    while (cursor < queued.size()) {
+        auto *slice = queued[cursor];
+        auto *state =
+            static_cast<RouteState *>(slice->rdma_congestion_control_route);
+        if (state == nullptr) {
+            std::swap(queued[admitted_count++], queued[cursor++]);
+            continue;
+        }
+        adaptive_congestion_control::PathHandle path{
+            device_.get(), &state->domain,
+            adaptive_congestion_control::generation(*device_),
+            adaptive_congestion_control::generation(state->domain)};
+        const auto decision = adaptive_congestion_control::tryAcquire(
+            path, slice->length, slice->rdma_congestion_control_permit);
+        if (decision == adaptive_congestion_control::Decision::kAllow) {
+            slice->rdma_congestion_control_endpoint =
+                state->endpoint.load(std::memory_order_acquire);
+            slice->rdma_congestion_control_endpoint_generation =
+                state->endpoint_generation.load(std::memory_order_acquire);
+            std::swap(queued[admitted_count++], queued[cursor++]);
+        } else {
+            ++cursor;
+        }
+    }
+    return admitted_count;
+}
+
+void ClassicRdmaCongestionControl::complete(Transport::Slice *slice,
+                                            ibv_wc_status status,
+                                            uint32_t vendor_error) {
+    auto *state =
+        static_cast<RouteState *>(slice->rdma_congestion_control_route);
+    if (!slice->rdma_congestion_control_permit.active()) return;
+    const bool current_endpoint =
+        state != nullptr &&
+        slice->rdma_congestion_control_endpoint ==
+            state->endpoint.load(std::memory_order_acquire) &&
+        slice->rdma_congestion_control_endpoint_generation ==
+            state->endpoint_generation.load(std::memory_order_acquire);
+    const auto result =
+        current_endpoint
+            ? adaptive_congestion_control::classifyCompletion(status,
+                                                              vendor_error)
+            : adaptive_congestion_control::Classification{
+                  adaptive_congestion_control::OutcomeClass::kDerivedFlush,
+                  adaptive_congestion_control::FailureScope::kOperation, false,
+                  vendor_error};
+    const bool current_generation =
+        adaptive_congestion_control::isCurrentGeneration(
+            slice->rdma_congestion_control_permit);
+    const bool completed = adaptive_congestion_control::complete(
+        slice->rdma_congestion_control_permit, result.outcome, result.scope);
+    if (completed && current_endpoint && current_generation &&
+        status == IBV_WC_SUCCESS) {
+        completed_bytes_.fetch_add(slice->length, std::memory_order_relaxed);
+        if (state) {
+            state->completed_bytes.fetch_add(slice->length,
+                                             std::memory_order_relaxed);
+        }
+    }
+}
+
+void ClassicRdmaCongestionControl::releaseUnposted(Transport::Slice *slice) {
+    if (!slice->rdma_congestion_control_permit.active()) return;
+    adaptive_congestion_control::complete(
+        slice->rdma_congestion_control_permit,
+        adaptive_congestion_control::OutcomeClass::kDerivedFlush,
+        adaptive_congestion_control::FailureScope::kOperation);
+}
+
+void ClassicRdmaCongestionControl::tick(uint64_t now_ns) {
+    if (!enabled()) return;
+    const uint64_t elapsed = last_tick_ns_ == 0 ? 0 : now_ns - last_tick_ns_;
+    last_tick_ns_ = now_ns;
+
+    if (elapsed != 0) {
+        const auto device_snapshot =
+            adaptive_congestion_control::snapshot(*device_);
+        adaptive_congestion_control::Signals signals;
+        signals.backlog_bytes = device_snapshot.inflight_bytes;
+        const auto completed =
+            completed_bytes_.exchange(0, std::memory_order_relaxed);
+        const __uint128_t scaled =
+            static_cast<__uint128_t>(completed) * 1'000'000'000ULL;
+        signals.delivery_rate_bytes_per_sec =
+            static_cast<uint64_t>(std::min<__uint128_t>(
+                scaled / elapsed, std::numeric_limits<uint64_t>::max()));
+        adaptive_congestion_control::recordSignals(
+            *device_, device_snapshot.generation, signals);
+    }
+    adaptive_congestion_control::controlTick(*device_, now_ns);
+
+    std::lock_guard<std::mutex> lock(routes_mutex_);
+    for (auto &entry : routes_) {
+        auto &state = *entry.second;
+        if (elapsed != 0) {
+            const auto route_snapshot =
+                adaptive_congestion_control::snapshot(state.domain);
+            adaptive_congestion_control::Signals signals;
+            signals.backlog_bytes = route_snapshot.inflight_bytes;
+            const auto completed =
+                state.completed_bytes.exchange(0, std::memory_order_relaxed);
+            const __uint128_t scaled =
+                static_cast<__uint128_t>(completed) * 1'000'000'000ULL;
+            signals.delivery_rate_bytes_per_sec =
+                static_cast<uint64_t>(std::min<__uint128_t>(
+                    scaled / elapsed, std::numeric_limits<uint64_t>::max()));
+            adaptive_congestion_control::recordSignals(
+                state.domain, route_snapshot.generation, signals);
+        }
+        adaptive_congestion_control::controlTick(state.domain, now_ns);
+    }
+}
+
+void ClassicRdmaCongestionControl::resetDevice() {
+    if (!enabled()) return;
+    const uint32_t generation =
+        adaptive_congestion_control::generation(*device_) + 1;
+    adaptive_congestion_control::resetGeneration(*device_, generation);
+}
+
+#endif
+
+
 
 static std::string resolveBufferLocation(
     const TransferMetadata::BufferDesc &buffer, uint64_t offset) {
