@@ -3,6 +3,11 @@ on:
   push:
     branches: [feat/bypass-local-copy]
   workflow_dispatch:
+    inputs:
+      python_version:
+        description: 'Python version for the wheel (e.g. 3.11)'
+        required: false
+        default: '3.12'
 
 jobs:
   build:
@@ -12,20 +17,20 @@ jobs:
           - arch: aarch64
             runner: ubuntu-22.04-arm
             cann_arch: aarch64
-            python-version: '3.12'
 
     runs-on: ${{ matrix.runner }}
     env:
       NPU_BUILD: "1"
+      PY_VER: ${{ inputs.python_version || '3.12' }}
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup Python 3.12
+      - name: Setup Python ${{ env.PY_VER }}
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: ${{ env.PY_VER }}
 
       - name: Install CANN Toolkit
         shell: bash
@@ -46,7 +51,7 @@ jobs:
         run: |
           set -eo pipefail
           source /usr/local/Ascend/cann/set_env.sh
-          sudo $(command -v python3.12) -m pip install setuptools
+          sudo "$(command -v python3)" -m pip install setuptools
           cd /tmp
           git clone https://gitcode.com/cann/hixl.git
           cd hixl
@@ -75,7 +80,7 @@ jobs:
             -DSTORE_USE_ETCD=ON \
             -DBUILD_UNIT_TESTS=OFF \
             -DCMAKE_BUILD_TYPE=Release \
-            -DPython3_EXECUTABLE="$(command -v python3.12)" \
+            -DPython3_EXECUTABLE="$(command -v python3)" \
             -DCMAKE_INSTALL_RPATH_USE_LINK_PATH=OFF \
             -DCMAKE_BUILD_WITH_INSTALL_RPATH=OFF \
             -DCMAKE_SKIP_INSTALL_RPATH=ON
@@ -95,10 +100,10 @@ jobs:
           set -eo pipefail
           source /usr/local/Ascend/cann/set_env.sh
           export LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:/usr/local/lib"
-          NPU_BUILD=1 PYTHON_VERSION=3.12 OUTPUT_DIR=dist-npu ./scripts/build_wheel.sh
+          NPU_BUILD=1 PYTHON_VERSION=${{ env.PY_VER }} OUTPUT_DIR=dist-npu ./scripts/build_wheel.sh
 
       - name: Upload Python wheel artifact
         uses: actions/upload-artifact@v4
         with:
-          name: mooncake-wheel-npu-test
+          name: mooncake-wheel-npu-test-py${{ env.PY_VER }}
           path: mooncake-wheel/dist-npu/*.whl
