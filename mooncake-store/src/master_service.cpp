@@ -2754,8 +2754,15 @@ bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
                         return replica.get_local_disk_client_id() ==
                                job.client_id;
                     }
+                    // This client's own memory replicas, and any replica whose
+                    // allocator the unmount above released: a segment can hold
+                    // replicas another client wrote through preferred_segments,
+                    // and this sweep is the last one before the allocator goes,
+                    // so a dead handle left here waits for an unrelated unmount
+                    // to clear it.
                     return replica.is_memory_replica() &&
-                           replica.isAffiliatedWith(job.liveness);
+                           (replica.isAffiliatedWith(job.liveness) ||
+                            replica.has_dead_handle());
                 });
             if (!cleanup_result) {
                 LOG(ERROR) << "client_id=" << job.client_id
