@@ -139,6 +139,12 @@ struct MasterConfig {
     std::string memory_allocator;
     std::string allocation_strategy;
 
+    // TE metadata backend the master advertises to clients via
+    // GetStorageConfig (issue #4536): "P2PHANDSHAKE" or a shared-backend
+    // URL (e.g. http://.../metadata). Empty means unset: clients keep their
+    // own configuration and no class check is enforced.
+    std::string te_metadata_server;
+
     // HTTP metadata server configuration
     bool enable_http_metadata_server;
     uint32_t http_metadata_server_port;
@@ -279,6 +285,9 @@ class MasterServiceSupervisorConfig {
     uint64_t put_start_release_timeout_sec = DEFAULT_PUT_START_RELEASE_TIMEOUT;
     bool enable_disk_eviction = true;
     uint64_t quota_bytes = 0;
+    // TE metadata backend advertised to clients (issue #4536). See
+    // MasterConfig::te_metadata_server.
+    std::string te_metadata_server;
     bool enable_multi_tenants = false;
     std::string tenant_quota_connector_type = "file";
     std::string tenant_quota_connector_uri;
@@ -445,6 +454,7 @@ class MasterServiceSupervisorConfig {
         put_start_release_timeout_sec = config.put_start_release_timeout_sec;
         enable_disk_eviction = config.enable_disk_eviction;
         quota_bytes = config.quota_bytes;
+        te_metadata_server = config.te_metadata_server;
         enable_multi_tenants = config.enable_multi_tenants;
         tenant_quota_connector_type = config.tenant_quota_connector_type;
         tenant_quota_connector_uri = config.tenant_quota_connector_uri;
@@ -601,6 +611,7 @@ class WrappedMasterServiceConfig {
     bool enable_multi_tenants = false;
     std::string tenant_quota_connector_type = "file";
     std::string tenant_quota_connector_uri;
+    std::string te_metadata_server;
 
     uint64_t snapshot_interval_seconds = DEFAULT_SNAPSHOT_INTERVAL_SEC;
     std::string snapshot_object_store_type;
@@ -690,6 +701,7 @@ class WrappedMasterServiceConfig {
         global_file_segment_size = config.global_file_segment_size;
         enable_disk_eviction = config.enable_disk_eviction;
         quota_bytes = config.quota_bytes;
+        te_metadata_server = config.te_metadata_server;
         enable_multi_tenants = config.enable_multi_tenants;
         tenant_quota_connector_type = config.tenant_quota_connector_type;
         tenant_quota_connector_uri = config.tenant_quota_connector_uri;
@@ -817,6 +829,7 @@ class WrappedMasterServiceConfig {
         allocation_strategy_type = config.allocation_strategy_type;
         enable_disk_eviction = config.enable_disk_eviction;
         quota_bytes = config.quota_bytes;
+        te_metadata_server = config.te_metadata_server;
         enable_multi_tenants = config.enable_multi_tenants;
         tenant_quota_connector_type = config.tenant_quota_connector_type;
         tenant_quota_connector_uri = config.tenant_quota_connector_uri;
@@ -887,6 +900,7 @@ class MasterServiceConfigBuilder {
         AllocationStrategyType::RANDOM;
     bool enable_disk_eviction_ = true;
     uint64_t quota_bytes_ = 0;
+    std::string te_metadata_server_;
     bool enable_multi_tenants_ = false;
     std::string tenant_quota_connector_type_ = "file";
     std::string tenant_quota_connector_uri_;
@@ -1020,6 +1034,12 @@ class MasterServiceConfigBuilder {
 
     MasterServiceConfigBuilder& set_enable_oplog(bool enable) {
         enable_oplog_ = enable;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_te_metadata_server(
+        std::string te_metadata_server) {
+        te_metadata_server_ = std::move(te_metadata_server);
         return *this;
     }
 
@@ -1262,6 +1282,7 @@ class MasterServiceConfig {
     bool enable_multi_tenants = false;
     std::string tenant_quota_connector_type = "file";
     std::string tenant_quota_connector_uri;
+    std::string te_metadata_server;
 
     uint64_t snapshot_interval_seconds = DEFAULT_SNAPSHOT_INTERVAL_SEC;
     std::string snapshot_object_store_type;
@@ -1348,6 +1369,7 @@ class MasterServiceConfig {
         allocation_strategy_type = config.allocation_strategy_type;
         enable_disk_eviction = config.enable_disk_eviction;
         quota_bytes = config.quota_bytes;
+        te_metadata_server = config.te_metadata_server;
         enable_multi_tenants = config.enable_multi_tenants;
         tenant_quota_connector_type = config.tenant_quota_connector_type;
         tenant_quota_connector_uri = config.tenant_quota_connector_uri;
@@ -1426,6 +1448,7 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.put_start_release_timeout_sec = put_start_release_timeout_sec_;
     config.enable_disk_eviction = enable_disk_eviction_;
     config.quota_bytes = quota_bytes_;
+    config.te_metadata_server = te_metadata_server_;
     config.enable_multi_tenants = enable_multi_tenants_;
     config.tenant_quota_connector_type = tenant_quota_connector_type_;
     config.tenant_quota_connector_uri = tenant_quota_connector_uri_;

@@ -2,6 +2,8 @@
 
 #include <optional>
 
+#include "ylt/struct_pack.hpp"
+
 #include "types.h"
 #include "replica.h"
 #include "task_manager.h"
@@ -118,6 +120,10 @@ struct GetStorageConfigResponse {
     std::string fsdir;
     bool enable_disk_eviction;
     uint64_t quota_bytes;
+    // TE metadata backend the master advertises to clients (issue #4536):
+    // "P2PHANDSHAKE" or a shared-backend URL. Empty means unset: clients
+    // keep their own configuration and no class check is enforced.
+    struct_pack::compatible<std::string, 1> te_metadata_server;
 
     GetStorageConfigResponse() : enable_disk_eviction(true), quota_bytes(0) {}
     GetStorageConfigResponse(const std::string& fsdir_param,
@@ -126,7 +132,8 @@ struct GetStorageConfigResponse {
           enable_disk_eviction(enable_eviction),
           quota_bytes(quota) {}
 };
-YLT_REFL(GetStorageConfigResponse, fsdir, enable_disk_eviction, quota_bytes);
+YLT_REFL(GetStorageConfigResponse, fsdir, enable_disk_eviction, quota_bytes,
+         te_metadata_server);
 
 struct NoFSegmentOwnerInfo {
     UUID segment_id;
