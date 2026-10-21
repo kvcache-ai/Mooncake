@@ -65,10 +65,17 @@ inline constexpr uint64_t kPartSupportFeature = 1ULL << 0;
  * @brief How many parts one object may have.
  *
  * A part count is fixed by an object's first write, so the value a request
- * carries has to be bounded. Real layouts are the product of the
- * tensor-parallel and pipeline-parallel degrees (tp=8, pp=16, K and V is 256),
- * and KV replicated under MLA or GQA is written as one part, so this leaves
- * headroom while keeping an object's slots to a bounded amount of memory.
+ * carries is bounded: a caller that reaches the service directly must not be
+ * able to declare a shape no deployment would use, and code that walks a part
+ * count may rely on the bound. Nothing is allocated from it: an object holds
+ * slots for the parts that were written, so declaring more parts costs nothing
+ * until they arrive.
+ *
+ * The bound follows the cost of the object it describes. An object of N parts
+ * holds N slots and N replica sets, which is what N ordinary objects hold, and
+ * every read of it walks those parts; the master already serves N keys, so this
+ * leaves room for layouts far beyond the tensor-parallel and pipeline-parallel
+ * degrees of a single deployment.
  *
  * The layout behind a count belongs to the key: the parallel degrees, and which
  * (stage, rank) a part index stands for, are the writer's convention. The
@@ -76,7 +83,7 @@ inline constexpr uint64_t kPartSupportFeature = 1ULL << 0;
  * that the writers agreed, and the part checksum says which shard a reader
  * holds.
  */
-inline constexpr uint32_t kMaxPartsPerObject = 1024;
+inline constexpr uint32_t kMaxPartsPerObject = 4096;
 
 /**
  * @brief Response structure for Ping operation

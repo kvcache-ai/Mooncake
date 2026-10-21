@@ -3387,8 +3387,7 @@ struct MasterService::LegacyRestoreContext {
     std::vector<std::tuple<size_t, TenantId, std::string>>& installed_keys;
     std::unordered_map<UUID, std::shared_ptr<ClientLivenessRecord>,
                        boost::hash<UUID>>& new_known_owner_records;
-    // Segments the owner has not mounted again yet; a replica restored onto one
-    // of them is bound to its lifetime, which is what keeps it unreadable.
+    // Segments the owner has not mounted again yet.
     const std::unordered_map<std::string, SegmentLifetime>& awaiting_lifetimes;
 
     struct AcceptedEntry {
@@ -4121,9 +4120,6 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
                             restored_allocators.at(buffer.transport_endpoint_);
                         auto restored_buffer =
                             std::make_unique<AllocatedBuffer>(alloc, buffer);
-                        // A segment the owner has not mounted again on this
-                        // primary keeps its buffers unavailable, which is what
-                        // makes the replica unreadable until it does.
                         BindAwaitingLifetime(restored_awaiting_lifetimes,
                                              buffer.transport_endpoint_,
                                              *restored_buffer);
@@ -4858,13 +4854,9 @@ tl::expected<MasterService::PartReadOutcome, ErrorCode> MasterService::ReadPart(
                      << ", error=part_index_out_of_range";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    // The object is readable only once every part holds a replica a reader can
-    // use, so a reader of one part waits for the whole object. A block missing
-    // one rank's shard cannot be decoded, so "this block is usable" is the only
-    // answer a rank can act on; answering per part would move the same failure
-    // into the framework after the other shards were already gathered. A batch
-    // of items naming parts of one key asks this answer once and hands it in:
-    // the parts do not change under the shard lock the batch holds.
+    // Readability is the object's, so a reader of one part waits for the whole
+    // object. A batch of items naming parts of one key asks this once and hands
+    // the answer in: nothing changes under the shard lock the batch holds.
     const bool readable =
         object_readable.has_value() ? *object_readable : metadata.IsReadable();
     if (!readable) {
