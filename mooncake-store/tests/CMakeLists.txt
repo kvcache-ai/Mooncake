@@ -88,6 +88,8 @@ add_store_test(master_service_group_test master_service_group_test.cpp)
 add_store_test(master_service_part_test master_service_part_test.cpp)
 add_store_test(master_service_object_ref_test
                master_service_object_ref_test.cpp)
+add_store_test(master_service_tenant_iteration_test
+               master_service_tenant_iteration_test.cpp)
 add_ha_test(master_service_evict_scenario_test
             master_service_evict_scenario_test.cpp)
 target_link_libraries(master_service_evict_scenario_test
@@ -229,8 +231,9 @@ add_store_test(promotion_candidate_tracker_test
 add_store_test(dynamic_replication_lease_table_test
                dynamic_replication_lease_table_test.cpp)
 add_store_test(group_index_test group_index_test.cpp)
-add_store_test(metadata_tenant_test metadata_tenant_test.cpp)
-add_store_test(metadata_tenant_registry_test metadata_tenant_registry_test.cpp)
+add_store_test(metadata_namespace_test metadata_namespace_test.cpp)
+add_store_test(metadata_namespace_table_test metadata_namespace_table_test.cpp)
+add_store_test(eviction_index_test eviction_index_test.cpp)
 add_store_test(segment_test segment_test.cpp)
 add_executable(local_ssd_test local_ssd/local_ssd_test.cpp)
 target_include_directories(local_ssd_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

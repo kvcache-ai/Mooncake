@@ -22,22 +22,30 @@
 namespace mooncake {
 namespace test {
 
-// Publishes a minimal 128 B, replica-less envelope under the key `guard` holds,
-// which holds no object, and returns its generation. These suites exercise the
+// One disk replica in `status`: a suite that asks whether an object has work in
+// flight needs a replica its write has not completed, and a disk replica needs
+// no segment to exist.
+inline Replica DiskReplica(ReplicaStatus status, const std::string& path,
+                           size_t length = 128) {
+    return Replica(path, length, status);
+}
+
 // Publishes an empty 128 B part under the key `guard` holds, which holds no
 // object, and returns its generation. These suites exercise the object model,
-// not replica validity, so nothing here sets a real replica. The write time is
+// not replica validity, so the replica-less default sets no real replica; a
+// suite that wants work in flight hands it a PROCESSING one. The write time is
 // fixed rather than read from the clock so a suite that ages a lease cannot
 // pick up a moving value.
 inline route::Generation PublishEnvelope(const route::WriteGuard& guard,
-                                         const std::string& group_id = {}) {
+                                         const std::string& group_id = {},
+                                         std::vector<Replica> replicas = {}) {
     const auto generation = guard.Publish(
         /*part_count=*/1, TenantId(), guard.key(), group_id,
         ObjectDataType::UNKNOWN, /*hard_pinned=*/false, std::nullopt);
     const auto write_time =
         std::chrono::system_clock::time_point(std::chrono::seconds(1));
     auto begin_write = guard.metadata().BeginWrite(
-        /*index=*/0, /*length=*/128, std::vector<Replica>{}, UUID{1, 2},
+        /*index=*/0, /*length=*/128, std::move(replicas), UUID{1, 2},
         /*session_id=*/"", write_time);
     CHECK(begin_write.has_value())
         << "an object published by this helper starts empty";
@@ -48,12 +56,26 @@ inline route::Generation PublishEnvelope(const route::WriteGuard& guard,
 // the key already holds an object (the route never hands out generation 0).
 inline route::Generation PublishObject(route::ObjectRoute& route,
                                        const std::string& key,
-                                       const std::string& group_id = {}) {
+                                       const std::string& group_id = {},
+                                       std::vector<Replica> replicas = {}) {
     auto guard = route.WriteKey(key);
     if (guard.has_object()) {
         return 0;
     }
-    return PublishEnvelope(guard, group_id);
+    return PublishEnvelope(guard, group_id, std::move(replicas));
+}
+
+// Completes every replica the write of `guard`'s object handed out, so the
+// object no longer has a write in flight.
+inline void FinishWriteInFlight(const route::WriteGuard& guard) {
+    std::vector<ReplicaID> ids;
+    const ObjectPart* part = guard.metadata().GetPart(0);
+    CHECK(part != nullptr) << "the write in flight is on part 0";
+    for (const auto& replica : part->replicas()) {
+        ids.push_back(replica.id());
+    }
+    auto ended = guard.metadata().EndWrite(0, ids);
+    CHECK(ended.has_value()) << "the write in flight closes";
 }
 
 // Reaches beneath the route's public surface: for the route's own suite,

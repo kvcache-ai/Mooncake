@@ -96,9 +96,9 @@ void MasterServiceTestPeer::SetKvTenantEpochTrackingForTesting(bool enabled) {
     service_.kv_track_tenant_epochs_ = enabled;
 }
 
-void MasterServiceTestPeer::SetRemoveAllShardHookForTesting(
-    std::function<void(size_t)> hook) {
-    service_.kv_remove_all_shard_hook_ = std::move(hook);
+void MasterServiceTestPeer::SetRemoveAllTenantHookForTesting(
+    std::function<void(const TenantId&)> hook) {
+    service_.kv_remove_all_tenant_hook_ = std::move(hook);
 }
 
 uint64_t MasterServiceTestPeer::GetKvClearedPublishedForTesting() const {

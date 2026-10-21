@@ -33,6 +33,11 @@
 //
 // Lifetime: guards and cursors point into the route, so its owner keeps it
 // alive for as long as any of them exists; a route destroyed under one aborts.
+//
+// Owner state: every slot also carries a few words and two list hooks for the
+// route's owner (see SlotOwnerState), which the route stores and never reads.
+// The owner keeps them in step with each write through the RouteObserver, so
+// they describe the key as of the last write guard released on it.
 
 #include <array>
 #include <atomic>
@@ -51,6 +56,7 @@
 #include <utility>
 #include <vector>
 
+#include <boost/intrusive/list.hpp>
 #include <glog/logging.h>
 
 #include "common/transparent_string_hash.h"
@@ -78,6 +84,20 @@ using Generation = uint64_t;
 struct ObjectRef {
     std::string key;
     Generation generation{0};
+};
+
+// What the route's owner keeps on every slot, guarded by the slot lock. The
+// route stores it and never reads it; it survives the objects published in the
+// slot, so the owner returns it to its initial value once the key holds none,
+// before the slot can be dropped.
+struct SlotOwnerState {
+    // Whether the owner's in-flight list holds the slot.
+    bool in_flight_listed{false};
+    // Whether the owner's eviction index files the slot, and at what rank.
+    bool eviction_filed{false};
+    int64_t eviction_rank{0};
+    // Two words for the owner's namespace policy.
+    std::array<uint64_t, 2> policy_words{};
 };
 
 // A slot's lock as a guard or cursor holds it in `kMode`.
@@ -113,6 +133,13 @@ class KeySlot {
     // Set in state_ while the slot holds an object.
     static constexpr uint32_t kOccupied = uint32_t{1} << 31;
 
+    // Links the slot into one of its owner's lists. Neither the hook nor the
+    // list synchronizes: whatever guards a list guards every hook in it. A
+    // safe-link hook asserts it is unlinked when destroyed, and a list unlinks
+    // whatever it still holds when it is cleared or destroyed.
+    using ListHook = boost::intrusive::list_member_hook<
+        boost::intrusive::link_mode<boost::intrusive::safe_link>>;
+
     // One publication. The metadata is built in place, since it can be
     // neither copied nor moved.
     struct Record {
@@ -134,6 +161,21 @@ class KeySlot {
     std::atomic<uint32_t> state_{0};
     mutable std::shared_mutex mutex_;
     std::optional<Record> record_;
+    SlotOwnerState owner_;
+    // Hooks into the owner's in-flight list and its eviction index.
+    ListHook in_flight_hook_;
+    ListHook eviction_hook_;
+
+   public:
+    // The owner's lists of slots. Each names its hook here, where the hook is
+    // accessible, so the slot needs no friend for them. The owner links a slot
+    // only while it holds an object, so a slot is never dropped linked.
+    using InFlightList = boost::intrusive::list<
+        KeySlot, boost::intrusive::member_hook<KeySlot, ListHook,
+                                               &KeySlot::in_flight_hook_>>;
+    using EvictionList = boost::intrusive::list<
+        KeySlot, boost::intrusive::member_hook<KeySlot, ListHook,
+                                               &KeySlot::eviction_hook_>>;
 };
 
 // Each slot is built in its map node and stays there while the map grows, so a
@@ -264,6 +306,13 @@ class Guard {
     Metadata& metadata() const { return record().metadata; }
     State& state() const { return record().state; }
 
+    // Whether the held object carries work: a task a release left behind, or a
+    // primary write whose parts are not all complete. The object model keeps
+    // the two in different places, so the question is answered here, once.
+    bool HasWorkInFlight() const {
+        return state().HasWorkInFlight() || metadata().HasWriteInFlight();
+    }
+
     // Publishes an object under this key, which must hold none: builds its
     // metadata in place from `metadata_args`, ObjectMetadata's constructor
     // arguments, and wires its group membership and the group's shared lease;
@@ -286,6 +335,15 @@ class Guard {
     // object aborts in every build.
     void TearDown() const
         requires kWrite;
+
+    // The owner's per-slot state and the slot its lists link, for the
+    // route's owner only.
+    SlotOwnerState& owner_state() const
+        requires kWrite
+    {
+        return slot_->owner_;
+    }
+    KeySlot& slot() const { return *slot_; }
 
    private:
     friend class ObjectRoute;
@@ -385,7 +443,8 @@ class ObjectRoute {
     // a time rather than reading one point in time: an object published or
     // torn down meanwhile may or may not be seen. A write cursor may change an
     // object's metadata and state but not publish or tear down, and it does
-    // not run the observer, so it must not start or finish in-flight work.
+    // not run the observer, so it must not start or finish in-flight work,
+    // and the owner hears of nothing else it changes either.
     //
     // The cursor holds a stripe lock across the loop body, so the body must
     // not reach this route or another one (debug builds assert it), nor block
@@ -527,6 +586,12 @@ class ObjectRoute::Cursor {
         ObjectRef ref() const { return {key(), generation()}; }
         Metadata& metadata() const { return slot_.record_->metadata; }
         State& state() const { return slot_.record_->state; }
+        // The owner's per-slot state, for the route's owner only.
+        SlotOwnerState& owner_state() const
+            requires kWrite
+        {
+            return slot_.owner_;
+        }
 
        private:
         friend class Cursor;
@@ -627,15 +692,21 @@ class ObjectRoute::Cursor {
     // the cursor then advances or the loop is left early.
     void AssertInFlightUnchanged() const {
         assert((!kWrite || current_ == nullptr ||
-                current_->record_->state.HasWorkInFlight() ==
-                    visited_in_flight_) &&
+                CarriesWork(*current_) == visited_in_flight_) &&
                "a write cursor's loop body changed in-flight work");
     }
 
     void Stand(KeySlot& slot, Lock lock) {
         slot_lock_ = std::move(lock);
         current_ = &slot;
-        visited_in_flight_ = slot.record_->state.HasWorkInFlight();
+        visited_in_flight_ = CarriesWork(slot);
+    }
+
+    // What the namespace asks of a released guard, asked of the slot a cursor
+    // stands on: a task or a primary write that has not finished.
+    static bool CarriesWork(const KeySlot& slot) {
+        return slot.record_->state.HasWorkInFlight() ||
+               slot.record_->metadata.HasWriteInFlight();
     }
 
     void UnlockSlot() {

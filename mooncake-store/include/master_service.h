@@ -20,6 +20,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -1530,6 +1531,34 @@ class MasterService {
         const std::string& why, const TenantId& tenant_id,
         const std::string& key, ObjectMetadata& metadata,
         const StaleHandleCleanupPlan& plan);
+    // Removes the object under HA with the oplog on: marks its completed
+    // replicas removed and queues a REMOVE whose durable callback drops them,
+    // and the object with them.
+    tl::expected<void, ErrorCode> MarkRemovedAndPersist(
+        const TenantId& tenant_id, const std::string& key,
+        ObjectMetadata& metadata);
+    // Returns why a remove may not take the object, or nothing if it may: its
+    // lease is still held (unless `force`), a replica is incomplete, or a
+    // replication task reads it.
+    static tl::expected<void, ErrorCode> CheckRemovable(
+        const ObjectMetadata& metadata, const route::ObjectState& state,
+        bool force, std::chrono::system_clock::time_point now);
+    struct RemoveResult {
+        long removed_count{0};
+        int64_t freed_bytes{0};
+        // Whether the walk reached any object, and whether it left any
+        // behind (not removable, or its removal could not be queued).
+        bool saw_object{false};
+        bool skipped_object{false};
+    };
+    // Removes each of the tenant's objects whose key `matches_key` accepts
+    // (every key, if unset) and that CheckRemovable lets go. `on_remove`, if
+    // set, sees each one just before it goes.
+    RemoveResult RemoveTenantObjects(
+        const TenantId& tenant_id, bool force,
+        std::chrono::system_clock::time_point now,
+        const std::function<bool(const std::string& key)>& matches_key,
+        const std::function<void(const ObjectMetadata&)>& on_remove);
     void RebuildGroupState();
     // Post-restore migration: re-route every object to its hash(tenant, key)
     // shard, fixing snapshots that placed grouped objects on hash(group_id)
@@ -1909,6 +1938,10 @@ class MasterService {
 
         // Holds the key only while `ref` is still its current publication: a
         // key republished since `ref` was taken, or emptied, is not held.
+        // The held object is left as it is, without the invalid-replica
+        // cleanup: the caller comes back to act on what it judged, and the
+        // cleanup's KV sync would bump the tenant epoch a RemoveAll compares
+        // its `cleared` against.
         MetadataAccessorRW(MasterService* service, const TenantId& tenant_id,
                            const route::ObjectRef& ref)
             : service_(service),
@@ -2137,6 +2170,138 @@ class MasterService {
 
     friend class MetadataAccessorRW;
     friend class MetadataAccessorRO;
+
+    template <LockMode kMode>
+    class TenantCursor;
+
+    // A cursor over one tenant's objects, each visited under its shard's read
+    // or write lock:
+    //
+    //     for (auto object : ReadCursor(tenant)) { ... object.metadata() ... }
+    //
+    // Each object is visited at most once, and the cursor moves one shard at a
+    // time rather than reading one point in time: an object published or torn
+    // down meanwhile may or may not be seen. A write cursor may change an
+    // object's metadata and state but not publish or tear down.
+    //
+    // The cursor holds a shard lock across the loop body, so the body must
+    // not reach any key through an accessor or another cursor, nor block on a
+    // lock whose holder may be waiting on a shard. One that acts after the
+    // cursor keeps `ref()` and comes back through MetadataAccessorRW(service,
+    // tenant_id, ref).
+    [[nodiscard]] TenantCursor<LockMode::kRead> ReadCursor(
+        const TenantId& tenant_id) const;
+    [[nodiscard]] TenantCursor<LockMode::kWrite> WriteCursor(
+        const TenantId& tenant_id);
+
+    // Calls `visit` with each tenant that holds an object when the walk
+    // starts, holding no lock, so `visit` may reach any key. A tenant that
+    // gains its first object meanwhile may or may not be visited.
+    void VisitTenants(const std::function<void(const TenantId&)>& visit) const;
+
+    // The single-pass cursor behind ReadCursor() and WriteCursor(). It owns
+    // the lock of the shard it stands in, so it neither copies nor moves, and
+    // leaving the loop early releases it.
+    template <LockMode kMode>
+    class TenantCursor {
+        static constexpr bool kWrite = kMode == LockMode::kWrite;
+        template <typename T>
+        using Access = std::conditional_t<kWrite, T, const T>;
+        using RecordIterator = std::conditional_t<kWrite, ObjectMap::iterator,
+                                                  ObjectMap::const_iterator>;
+
+       public:
+        // The object a position stands on, valid until the cursor advances.
+        class Object {
+           public:
+            using Metadata = Access<ObjectMetadata>;
+            using State = Access<route::ObjectState>;
+
+            const std::string& key() const { return it_->first; }
+            route::Generation generation() const {
+                return it_->second.generation;
+            }
+            route::ObjectRef ref() const { return {key(), generation()}; }
+            Metadata& metadata() const { return it_->second.metadata; }
+            State& state() const { return it_->second.state; }
+
+           private:
+            friend class TenantCursor;
+            explicit Object(RecordIterator it) : it_(it) {}
+            RecordIterator it_;
+        };
+
+        struct Sentinel {};
+
+        class Iterator {
+           public:
+            Object operator*() const { return Object(cursor_->it_); }
+            Iterator& operator++() {
+                cursor_->Advance();
+                return *this;
+            }
+            bool operator!=(Sentinel) const {
+                return cursor_->lock_.has_value();
+            }
+
+           private:
+            friend class TenantCursor;
+            explicit Iterator(TenantCursor* cursor) : cursor_(cursor) {}
+            TenantCursor* cursor_;
+        };
+
+        TenantCursor(const TenantCursor&) = delete;
+        TenantCursor& operator=(const TenantCursor&) = delete;
+
+        Iterator begin() { return Iterator(this); }
+        Sentinel end() const { return {}; }
+
+       private:
+        friend class MasterService;
+
+        TenantCursor(Access<MasterService>& service, TenantId tenant_id)
+            : service_(service), tenant_id_(std::move(tenant_id)) {
+            Settle();
+        }
+
+        void Advance() {
+            ++it_;
+            Settle();
+        }
+
+        // Stays on the current object if the shard has one left, or else
+        // moves to the next shard that holds an object of the tenant, or to
+        // the end, where it holds no lock.
+        void Settle() NO_THREAD_SAFETY_ANALYSIS {
+            while (it_ == end_) {
+                // Value-initialized iterators compare equal, unlike ones into
+                // a map whose lock is gone.
+                it_ = end_ = RecordIterator{};
+                lock_.reset();
+                if (next_shard_ == kNumShards) {
+                    return;
+                }
+                auto& shard = service_.metadata_shards_[next_shard_++];
+                if constexpr (kWrite) {
+                    lock_.emplace(&shard.mutex);
+                } else {
+                    lock_.emplace(&shard.mutex, shared_lock);
+                }
+                auto tenant_it = shard.tenants.find(tenant_id_);
+                if (tenant_it != shard.tenants.end()) {
+                    it_ = tenant_it->second.metadata.begin();
+                    end_ = tenant_it->second.metadata.end();
+                }
+            }
+        }
+
+        Access<MasterService>& service_;
+        const TenantId tenant_id_;
+        size_t next_shard_{0};
+        std::optional<SharedMutexLocker> lock_;
+        RecordIterator it_{};
+        RecordIterator end_{};
+    };
 
     ViewVersionId view_version_;
 
@@ -2412,10 +2577,10 @@ class MasterService {
 
     std::unique_ptr<KvEventPublisher> kv_event_publisher_;
 
-    // RemoveAll releases each shard lock before moving to the next one, so a
-    // concurrent commit can land in an already-scanned shard. Publishing
-    // `cleared` from the scan's own bookkeeping would then order it after that
-    // commit's `stored` and tell subscribers to drop a live object. Every
+    // RemoveAll holds no lock across its walk, so a concurrent commit can land
+    // in a tenant or shard it already passed. Publishing `cleared` from the
+    // scan's own bookkeeping would then order it after that commit's `stored`
+    // and tell subscribers to drop a live object. Every
     // announcement of a newly available object bumps its tenant's epoch, and a
     // clear is published only if the epoch still matches the value read before
     // the scan began. A racing commit therefore suppresses the
@@ -2435,9 +2600,9 @@ class MasterService {
     bool kv_track_tenant_epochs_{false};
     std::atomic<uint64_t> kv_cleared_published_{0};
     std::atomic<uint64_t> kv_cleared_suppressed_by_epoch_{0};
-    // Fires after each shard's lock is released during a RemoveAll scan, which
-    // is the only point where a test can commit into an already-scanned shard.
-    std::function<void(size_t)> kv_remove_all_shard_hook_;
+    // Fires once per tenant whose objects a RemoveAll has finished removing,
+    // so a test can commit into a tenant the walk already passed.
+    std::function<void(const TenantId&)> kv_remove_all_tenant_hook_;
 
     static size_t KvTenantEpochSlot(const std::string& tenant) {
         return std::hash<std::string>{}(tenant) % kKvTenantEpochSlots;
