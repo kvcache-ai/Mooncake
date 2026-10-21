@@ -1163,14 +1163,12 @@ class MasterService {
 
         struct Entry {
             TimePoint deadline;
-            size_t shard_idx;
             std::string scoped_key;
         };
 
-        void Upsert(std::string scoped_key, size_t shard_idx,
-                    const TimePoint& deadline);
+        void Upsert(std::string scoped_key, const TimePoint& deadline);
         void Remove(const std::string& scoped_key);
-        void RemoveIfMatches(const std::string& scoped_key, size_t shard_idx,
+        void RemoveIfMatches(const std::string& scoped_key,
                              const TimePoint& deadline);
         std::vector<Entry> PopExpired(const TimePoint& now);
         void Clear();
@@ -1178,7 +1176,6 @@ class MasterService {
        private:
         struct Registration {
             TimePoint deadline;
-            size_t shard_idx;
         };
 
         struct EarlierDeadline {
@@ -1503,7 +1500,6 @@ class MasterService {
     // shards. No-op for correctly-routed snapshots.
     void ReRouteRestoredObjectsByKey();
     static void ApplySoftPinMetricDelta(int metric_delta);
-    size_t GetMetadataShardIndex(const ObjectMetadata& metadata) const;
     void ApplySoftPinEvaluation(
         const ObjectMetadata& metadata,
         const ObjectMetadata::SoftPinEvaluation& result) const;
@@ -1770,14 +1766,23 @@ class MasterService {
     // accessor's scope may reach another key through another accessor.
     class MetadataAccessorRW {
        public:
-        // Holds the key only while it holds an object.
-        MetadataAccessorRW(MasterService* service, ObjectIdentity object_id)
+        struct AsIs {};
+        // Holds the key only while it holds an object, and leaves that object
+        // as it is, without the invalid-replica cleanup: for a pass that acts
+        // on what the object's own state says, such as an expiry sweep.
+        MetadataAccessorRW(MasterService* service, ObjectIdentity object_id,
+                           AsIs)
             : service_(service),
               object_id_(std::move(object_id)),
               shard_guard_(service_,
                            service_->getShardIndex(object_id_.tenant_id,
                                                    object_id_.user_key)) {
             Locate();
+        }
+
+        // Holds the key only while it holds an object.
+        MetadataAccessorRW(MasterService* service, ObjectIdentity object_id)
+            : MetadataAccessorRW(service, std::move(object_id), AsIs{}) {
             // Invalid memory replicas go first, which may tear the object down.
             if (IsPublished()) {
                 service_->CleanupInvalidMemoryReplicas(*this);
@@ -1801,12 +1806,8 @@ class MasterService {
         // its `cleared` against.
         MetadataAccessorRW(MasterService* service, const TenantId& tenant_id,
                            const route::ObjectRef& ref)
-            : service_(service),
-              object_id_{tenant_id, ref.key},
-              shard_guard_(service_,
-                           service_->getShardIndex(object_id_.tenant_id,
-                                                   object_id_.user_key)) {
-            Locate();
+            : MetadataAccessorRW(service, ObjectIdentity{tenant_id, ref.key},
+                                 AsIs{}) {
             if (IsPublished() && it_->second.generation != ref.generation) {
                 it_ = tenant_state_->metadata.end();
             }

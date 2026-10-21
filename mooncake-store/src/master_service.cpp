@@ -2302,26 +2302,23 @@ void MasterService::SoftPinDeadlineIndex::MaybeCompactLocked() {
 
     decltype(heap_) rebuilt;
     for (const auto& [scoped_key, registration] : registrations_) {
-        rebuilt.push(
-            Entry{registration.deadline, registration.shard_idx, scoped_key});
+        rebuilt.push(Entry{registration.deadline, scoped_key});
     }
     heap_.swap(rebuilt);
 }
 
 void MasterService::SoftPinDeadlineIndex::Upsert(std::string scoped_key,
-                                                 size_t shard_idx,
                                                  const TimePoint& deadline) {
     std::lock_guard lock(mutex_);
     const auto it = registrations_.find(scoped_key);
-    if (it != registrations_.end() && it->second.deadline == deadline &&
-        it->second.shard_idx == shard_idx) {
+    if (it != registrations_.end() && it->second.deadline == deadline) {
         return;
     }
 
-    auto [registration_it, inserted] = registrations_.insert_or_assign(
-        scoped_key, Registration{deadline, shard_idx});
+    auto [registration_it, inserted] =
+        registrations_.insert_or_assign(scoped_key, Registration{deadline});
     (void)inserted;
-    heap_.push(Entry{deadline, shard_idx, registration_it->first});
+    heap_.push(Entry{deadline, registration_it->first});
     MaybeCompactLocked();
 }
 
@@ -2334,12 +2331,10 @@ void MasterService::SoftPinDeadlineIndex::Remove(
 }
 
 void MasterService::SoftPinDeadlineIndex::RemoveIfMatches(
-    const std::string& scoped_key, size_t shard_idx,
-    const TimePoint& deadline) {
+    const std::string& scoped_key, const TimePoint& deadline) {
     std::lock_guard lock(mutex_);
     const auto it = registrations_.find(scoped_key);
-    if (it != registrations_.end() && it->second.deadline == deadline &&
-        it->second.shard_idx == shard_idx) {
+    if (it != registrations_.end() && it->second.deadline == deadline) {
         registrations_.erase(it);
         MaybeCompactLocked();
     }
@@ -2355,8 +2350,7 @@ MasterService::SoftPinDeadlineIndex::PopExpired(const TimePoint& now) {
 
         const auto it = registrations_.find(entry.scoped_key);
         if (it == registrations_.end() ||
-            it->second.deadline != entry.deadline ||
-            it->second.shard_idx != entry.shard_idx) {
+            it->second.deadline != entry.deadline) {
             continue;
         }
         registrations_.erase(it);
@@ -2413,13 +2407,6 @@ void MasterService::ApplySoftPinMetricDelta(int metric_delta) {
     }
 }
 
-size_t MasterService::GetMetadataShardIndex(
-    const ObjectMetadata& metadata) const {
-    // Object routing is decoupled from groups: always route by the object's
-    // own (tenant, key) hash. group_id is an annotation only.
-    return getShardIndex(metadata.tenant_id, metadata.user_key);
-}
-
 void MasterService::ApplySoftPinEvaluation(
     const ObjectMetadata& metadata,
     const ObjectMetadata::SoftPinEvaluation& result) const {
@@ -2428,13 +2415,11 @@ void MasterService::ApplySoftPinEvaluation(
         return;
     }
 
-    const size_t shard_idx = GetMetadataShardIndex(metadata);
     const auto scoped_key = metadata.tenant_id.MakeScopedKey(metadata.user_key);
     if (result.deadline_to_index) {
-        soft_pin_deadline_index_.Upsert(scoped_key, shard_idx,
-                                        *result.deadline_to_index);
+        soft_pin_deadline_index_.Upsert(scoped_key, *result.deadline_to_index);
     } else if (result.removed_deadline) {
-        soft_pin_deadline_index_.RemoveIfMatches(scoped_key, shard_idx,
+        soft_pin_deadline_index_.RemoveIfMatches(scoped_key,
                                                  *result.removed_deadline);
     }
     ApplySoftPinMetricDelta(result.metric_delta);
@@ -2451,39 +2436,20 @@ bool MasterService::IsSoftPinActive(
 void MasterService::CleanupExpiredSoftPins(
     const std::chrono::system_clock::time_point& now) {
     auto expired_entries = soft_pin_deadline_index_.PopExpired(now);
-    std::sort(expired_entries.begin(), expired_entries.end(),
-              [](const auto& lhs, const auto& rhs) {
-                  return lhs.shard_idx < rhs.shard_idx;
-              });
 
+    // Each deadline is resolved on its own, under the key the scoped key
+    // names: the key may have been republished since, and only the deadline
+    // the index still holds may expire a soft pin.
     int expired_count = 0;
-    for (size_t begin = 0; begin < expired_entries.size();) {
-        const size_t shard_idx = expired_entries[begin].shard_idx;
-        size_t end = begin + 1;
-        while (end < expired_entries.size() &&
-               expired_entries[end].shard_idx == shard_idx) {
-            ++end;
+    for (const auto& entry : expired_entries) {
+        auto [tenant_id, key] = TenantId::ParseScopedKey(entry.scoped_key);
+        MetadataAccessorRO accessor(
+            this, ObjectIdentity{std::move(tenant_id), std::move(key)});
+        if (accessor.IsPublished() &&
+            accessor.Get().ExpireSoftPinIfDeadlineMatches(entry.deadline,
+                                                          now)) {
+            ++expired_count;
         }
-
-        MetadataShardAccessorRO shard(this, shard_idx);
-        for (size_t i = begin; i < end; ++i) {
-            const auto& entry = expired_entries[i];
-            const auto [tenant_id, key] =
-                TenantId::ParseScopedKey(entry.scoped_key);
-            const auto tenant_it = shard->tenants.find(tenant_id);
-            if (tenant_it == shard->tenants.end()) {
-                continue;
-            }
-            const auto metadata_it = tenant_it->second.metadata.find(key);
-            if (metadata_it == tenant_it->second.metadata.end()) {
-                continue;
-            }
-            if (metadata_it->second.metadata.ExpireSoftPinIfDeadlineMatches(
-                    entry.deadline, now)) {
-                ++expired_count;
-            }
-        }
-        begin = end;
     }
     if (expired_count > 0) {
         MasterMetricManager::instance().dec_soft_pin_key_count(expired_count);
@@ -5417,7 +5383,6 @@ auto MasterService::InsertMetadata(
                                 std::move(eligible_replica_ids));
     if (deadline_to_index) {
         soft_pin_deadline_index_.Upsert(tenant_id.MakeScopedKey(key),
-                                        GetMetadataShardIndex(metadata),
                                         *deadline_to_index);
     }
     // Wire grouped objects to the group's shared lease; ungrouped objects keep
@@ -8222,11 +8187,6 @@ bool MasterService::RunBucketDfsEvictionInternal(bool force_one) {
         }
 
         const auto& candidates = pending.Candidates();
-        std::map<size_t, std::vector<size_t>> indexes_by_shard;
-        for (size_t i = 0; i < candidates.size(); ++i) {
-            indexes_by_shard[getShardIndex(tenant_id, candidates[i].key)]
-                .push_back(i);
-        }
 
         auto matches_candidate =
             [](const Replica& replica,
@@ -8242,57 +8202,47 @@ bool MasterService::RunBucketDfsEvictionInternal(bool force_one) {
                        descriptor.file_path == candidate.descriptor.file_path;
             };
 
+        // The bucket goes as a whole: every member is validated before the
+        // allocator commits the bucket, and one member that may not be evicted
+        // aborts the attempt. A prepared eviction keeps the bucket's extents
+        // out of allocation until it is committed or aborted, so no member
+        // gains a replica in it meanwhile, and each member is validated under
+        // its own key rather than all of them under one lock. A member read
+        // after it was validated still loses its replica once the bucket is
+        // committed, but its reader holds a lease: the file is kept until the
+        // last lease seen on a member that drops a replica has run out.
         bool all_accepted = true;
         ImmutableBucketAllocator::EvictedBucket evicted_bucket;
         bool logical_committed = false;
+        std::chrono::system_clock::time_point keep_until{};
         {
             std::shared_lock<std::shared_mutex> snapshot_lock(
                 master_state_mutex_);
-            std::vector<std::unique_ptr<SharedMutexLocker>> shard_locks;
-            shard_locks.reserve(indexes_by_shard.size());
-            // std::map iteration is ascending, giving every bucket eviction
-            // the same cross-shard lock order.
-            for (const auto& [shard_idx, indexes] : indexes_by_shard) {
-                (void)indexes;
-                shard_locks.emplace_back(std::make_unique<SharedMutexLocker>(
-                    &metadata_shards_[shard_idx].mutex));
-            }
-
             auto now = std::chrono::system_clock::now();
-            for (const auto& [shard_idx, indexes] : indexes_by_shard) {
-                if (!all_accepted) break;
-                for (const size_t index : indexes) {
-                    const auto& candidate = candidates[index];
-                    auto tenant_it =
-                        metadata_shards_[shard_idx].tenants.find(tenant_id);
-                    if (tenant_it ==
-                        metadata_shards_[shard_idx].tenants.end()) {
-                        continue;
-                    }
-                    auto& tenant_state = tenant_it->second;
-                    auto metadata_it =
-                        tenant_state.metadata.find(candidate.key);
-                    if (metadata_it == tenant_state.metadata.end()) continue;
-                    auto& metadata = metadata_it->second.metadata;
-                    if (!metadata.HasReplica([&](const Replica& replica) {
-                            return matches_candidate(replica, candidate);
-                        })) {
-                        continue;
-                    }
+            for (const auto& candidate : candidates) {
+                MetadataAccessorRO accessor(
+                    this, ObjectIdentity{tenant_id, candidate.key});
+                if (!accessor.IsPublished()) continue;
+                const auto& metadata = accessor.Get();
+                // A key without the candidate replica has already released
+                // the extent from the master's side.
+                if (!metadata.HasReplica([&](const Replica& replica) {
+                        return matches_candidate(replica, candidate);
+                    })) {
+                    continue;
+                }
 
-                    const bool processing =
-                        metadata.HasReplica([&](const Replica& replica) {
-                            return matches_candidate(replica, candidate) &&
-                                   replica.is_processing();
-                        });
-                    if (processing || metadata_it->second.state.is_processing ||
-                        metadata.IsHardPinned() ||
-                        !metadata.IsLeaseExpired(now) ||
-                        (IsSoftPinActive(metadata, now) &&
-                         !allow_evict_soft_pinned_objects_)) {
-                        all_accepted = false;
-                        break;
-                    }
+                const bool processing =
+                    metadata.HasReplica([&](const Replica& replica) {
+                        return matches_candidate(replica, candidate) &&
+                               replica.is_processing();
+                    });
+                if (processing || accessor.InProcessing() ||
+                    metadata.IsHardPinned() || !metadata.IsLeaseExpired(now) ||
+                    (IsSoftPinActive(metadata, now) &&
+                     !allow_evict_soft_pinned_objects_)) {
+                    all_accepted = false;
+                    break;
                 }
             }
 
@@ -8308,54 +8258,47 @@ bool MasterService::RunBucketDfsEvictionInternal(bool force_one) {
                                << logical.error();
                 }
             }
+
+            // The bucket is committed, so the members that still carry one of
+            // its replicas drop it now. Each key is resolved again: a member
+            // may have been republished since it was validated, and the
+            // replica is matched by its descriptor, not by the publication.
             if (logical_committed) {
-                for (const auto& [shard_idx, indexes] : indexes_by_shard) {
-                    for (const size_t index : indexes) {
-                        const auto& candidate = candidates[index];
-                        auto tenant_it =
-                            metadata_shards_[shard_idx].tenants.find(tenant_id);
-                        if (tenant_it ==
-                            metadata_shards_[shard_idx].tenants.end()) {
-                            continue;
+                for (const auto& candidate : candidates) {
+                    MetadataAccessorRW accessor(
+                        this, ObjectIdentity{tenant_id, candidate.key},
+                        MetadataAccessorRW::AsIs{});
+                    if (!accessor.IsPublished()) continue;
+                    auto& metadata = accessor.Get();
+                    const auto lease_deadline = metadata.EvictionDeadline();
+                    const size_t erased =
+                        metadata.EraseReplicas([&](const Replica& replica) {
+                            return matches_candidate(replica, candidate);
+                        });
+                    if (erased > 0) {
+                        keep_until = std::max(keep_until, lease_deadline);
+                        PublishKvRemovedAfterEvict(candidate.key, erased,
+                                                   "disk", metadata, tenant_id);
+                        if (!metadata.IsValid()) {
+                            accessor.Erase();
                         }
-                        auto& tenant_state = tenant_it->second;
-                        auto metadata_it =
-                            tenant_state.metadata.find(candidate.key);
-                        if (metadata_it == tenant_state.metadata.end()) {
-                            continue;
-                        }
-                        auto& metadata = metadata_it->second.metadata;
-                        const size_t erased =
-                            metadata.EraseReplicas([&](const Replica& replica) {
-                                return matches_candidate(replica, candidate);
-                            });
-                        if (erased > 0) {
-                            PublishKvRemovedAfterEvict(candidate.key, erased,
-                                                       "disk", metadata,
-                                                       tenant_id);
-                            if (!metadata.IsValid()) {
-                                EraseMetadata(tenant_state, metadata_it,
-                                              tenant_id, QuotaEraseMode::kFull);
-                            }
-                        }
-                    }
-                    auto tenant_it =
-                        metadata_shards_[shard_idx].tenants.find(tenant_id);
-                    if (tenant_it !=
-                            metadata_shards_[shard_idx].tenants.end() &&
-                        tenant_it->second.Empty()) {
-                        metadata_shards_[shard_idx].tenants.erase(tenant_it);
                     }
                 }
             }
         }
 
-        if (!all_accepted) {
+        if (!logical_committed) {
             bucket_allocator_->AbortEviction(std::move(pending));
             continue;
         }
-        if (!logical_committed) {
-            bucket_allocator_->AbortEviction(std::move(pending));
+        // The bucket's space comes back only once the file is deleted, so a
+        // forced eviction goes on to another bucket.
+        if (keep_until > std::chrono::system_clock::now()) {
+            VLOG(1) << "DFS bucket eviction deferred until a member's lease "
+                       "runs out, bucket_id="
+                    << evicted_bucket.bucket_id();
+            bucket_allocator_->DeferDeletion(std::move(evicted_bucket),
+                                             keep_until);
             continue;
         }
 
@@ -8398,11 +8341,11 @@ void MasterService::RunShardDfsEviction() {
         std::vector<bool> considered(candidates.size(), false);
         bool saw_repeated_candidate = false;
 
-        // Group prepared candidates by metadata shard, then validate and
-        // remove each group while holding only that shard. Prepared allocator
-        // extents remain unavailable until ResolvePreparedEviction(), so
-        // different metadata shards do not need one cross-shard transaction.
-        std::array<std::vector<size_t>, kNumShards> indexes_by_shard;
+        // Prepared allocator extents stay unavailable until
+        // ResolvePreparedEviction(), so each candidate is validated and removed
+        // under its own key rather than in one transaction across keys.
+        std::vector<size_t> candidate_indexes;
+        candidate_indexes.reserve(candidates.size());
         for (size_t i = 0; i < candidates.size(); ++i) {
             const auto& candidate = candidates[i];
             if (!attempted
@@ -8413,8 +8356,7 @@ void MasterService::RunShardDfsEviction() {
                 continue;
             }
             considered[i] = true;
-            indexes_by_shard[getShardIndex(tenant_id, candidate.key)].push_back(
-                i);
+            candidate_indexes.push_back(i);
         }
 
         auto matches_candidate = [](const Replica& replica,
@@ -8426,32 +8368,24 @@ void MasterService::RunShardDfsEviction() {
         };
 
         auto now = std::chrono::system_clock::now();
-        for (size_t shard_idx = 0; shard_idx < kNumShards; ++shard_idx) {
-            if (indexes_by_shard[shard_idx].empty()) continue;
-
+        {
             std::shared_lock<std::shared_mutex> snapshot_lock(
                 master_state_mutex_);
-            SharedMutexLocker shard_lock(&metadata_shards_[shard_idx].mutex);
 
-            // Validate and remove candidates under the same shard lock. Once a
-            // candidate has been seen in this cycle, it is excluded above;
+            // Validate and remove each candidate under the same key lock. Once
+            // a candidate has been seen in this cycle, it is excluded above;
             // encountering it again means the LRU scan has wrapped.
-            for (const size_t i : indexes_by_shard[shard_idx]) {
+            for (const size_t i : candidate_indexes) {
                 const auto& candidate = candidates[i];
-                auto tenant_it =
-                    metadata_shards_[shard_idx].tenants.find(tenant_id);
-                if (tenant_it == metadata_shards_[shard_idx].tenants.end()) {
-                    accepted[i] = true;
-                    continue;
-                }
-                auto& tenant_state = tenant_it->second;
-                auto metadata_it = tenant_state.metadata.find(candidate.key);
-                if (metadata_it == tenant_state.metadata.end()) {
+                MetadataAccessorRW accessor(
+                    this, ObjectIdentity{tenant_id, candidate.key},
+                    MetadataAccessorRW::AsIs{});
+                if (!accessor.IsPublished()) {
                     accepted[i] = true;
                     continue;
                 }
 
-                auto& metadata = metadata_it->second.metadata;
+                auto& metadata = accessor.Get();
                 const bool has_candidate =
                     metadata.HasReplica([&](const Replica& replica) {
                         return matches_candidate(replica, candidate);
@@ -8466,12 +8400,11 @@ void MasterService::RunShardDfsEviction() {
                         return matches_candidate(replica, candidate) &&
                                replica.is_processing();
                     });
-                accepted[i] = !candidate_is_processing &&
-                              !metadata_it->second.state.is_processing &&
-                              !metadata.IsHardPinned() &&
-                              metadata.IsLeaseExpired(now) &&
-                              (!IsSoftPinActive(metadata, now) ||
-                               allow_evict_soft_pinned_objects_);
+                accepted[i] =
+                    !candidate_is_processing && !accessor.InProcessing() &&
+                    !metadata.IsHardPinned() && metadata.IsLeaseExpired(now) &&
+                    (!IsSoftPinActive(metadata, now) ||
+                     allow_evict_soft_pinned_objects_);
                 if (!accepted[i]) continue;
 
                 // A missing descriptor was accepted above and is already
@@ -8487,17 +8420,9 @@ void MasterService::RunShardDfsEviction() {
                     PublishKvRemovedAfterEvict(candidate.key, erased, "disk",
                                                metadata, tenant_id);
                     if (!metadata.IsValid()) {
-                        EraseMetadata(tenant_state, metadata_it, tenant_id,
-                                      QuotaEraseMode::kFull);
+                        accessor.Erase();
                     }
                 }
-            }
-
-            auto tenant_it =
-                metadata_shards_[shard_idx].tenants.find(tenant_id);
-            if (tenant_it != metadata_shards_[shard_idx].tenants.end() &&
-                tenant_it->second.Empty()) {
-                metadata_shards_[shard_idx].tenants.erase(tenant_it);
             }
         }
 
