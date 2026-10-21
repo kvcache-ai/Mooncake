@@ -52,36 +52,20 @@ YLT_REFL(ReplicaActionLease, proposal_id, lease_id, action, tenant_id, key,
          expire_at_ms_epoch, task_id);
 
 /**
- * @brief Bits a master reports in PingResponse::supported_features.
- *
- * Bit 0 is part support: the master accepts the part arguments on the write
- * calls and answers a read with the object's part count. A client that wants to
- * write or read by part must see it before it sends one, because a master that
- * predates parts ignores the extra arguments instead of refusing them.
+ * @brief Bits a master reports in PingResponse::supported_features. Bit 0 means
+ * it speaks parts; the field says what a client does with that.
  */
 inline constexpr uint64_t kPartSupportFeature = 1ULL << 0;
 
 /**
  * @brief How many parts one object may have.
  *
- * A part count is fixed by an object's first write, so the value a request
- * carries is bounded: a caller that reaches the service directly must not be
- * able to declare a shape no deployment would use, and code that walks a part
- * count may rely on the bound. Nothing is allocated from it: an object holds
- * slots for the parts that were written, so declaring more parts costs nothing
- * until they arrive.
- *
- * The bound follows the cost of the object it describes. An object of N parts
- * holds N slots and N replica sets, which is what N ordinary objects hold, and
- * every read of it walks those parts; the master already serves N keys, so this
- * leaves room for layouts far beyond the tensor-parallel and pipeline-parallel
- * degrees of a single deployment.
- *
- * The layout behind a count belongs to the key: the parallel degrees, and which
- * (stage, rank) a part index stands for, are the writer's convention. The
- * master never sees it, so 8x4 and 16x2 are one shape to it; the count checks
- * that the writers agreed, and the part checksum says which shard a reader
- * holds.
+ * The first write fixes the count, so a request is bounded here. Nothing is
+ * allocated from it, because slots follow the parts that were written. A count
+ * records that the writers agreed on a shape, not which one: the parallel
+ * degrees and the (stage, rank) an index stands for are the key's own
+ * convention, so 8x4 and 16x2 are one shape to the master, and the part
+ * checksum is what says which shard a reader holds.
  */
 inline constexpr uint32_t kMaxPartsPerObject = 4096;
 
@@ -91,10 +75,9 @@ inline constexpr uint32_t kMaxPartsPerObject = 4096;
 struct PingResponse {
     ViewVersionId view_version_id;
     ClientStatus client_status;
-    // What this master understands beyond the base protocol. Bit 0 means it
-    // accepts the part arguments on the write calls and reports the part count
-    // on a read. A part-aware client checks this bit first: an older master
-    // ignores the extra arguments silently.
+    // What this master understands beyond the base protocol; see
+    // kPartSupportFeature for the bits. A part-aware client checks it before
+    // sending part arguments, which an older master ignores silently.
     struct_pack::compatible<uint64_t, 1> supported_features;
 
     PingResponse() = default;
@@ -123,10 +106,9 @@ struct GetReplicaListResponse {
     // the exact scope the write path used. Empty when the master predates
     // this field.
     struct_pack::compatible<std::string, 1> resolved_tenant_id;
-    // How many parts the key holds. A reader that named a part uses it to place
-    // what it got in a larger object; a reader that named none and sees more
-    // than one must refuse the answer. Absent means the master predates parts,
-    // so the key has one.
+    // How many parts the key holds: a reader that named a part places what it
+    // got with it, and one that named none refuses an answer above one. Absent
+    // means the master predates parts.
     struct_pack::compatible<uint32_t, 2> part_count;
 
     GetReplicaListResponse() : lease_ttl_ms(0) {}
