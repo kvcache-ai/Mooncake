@@ -266,7 +266,7 @@ tl::expected<std::vector<Slice>, ErrorCode> StageWriteSlices(
 
 using BatchWriteMethod = std::vector<tl::expected<void, ErrorCode>> (Client::*)(
     const std::vector<ObjectKey> &, std::vector<std::vector<Slice>> &,
-    const ReplicateConfig &, const Client::WriteBufferStager &);
+    const ReplicateConfig &, const Client::WriteBufferStager &, bool);
 
 std::vector<tl::expected<void, ErrorCode>> BatchWriteFromMultiBuffers(
     const std::shared_ptr<Client> &client, const std::vector<std::string> &keys,
@@ -295,7 +295,8 @@ std::vector<tl::expected<void, ErrorCode>> BatchWriteFromMultiBuffers(
             return StageWriteSlices(allocator, slices, staging_handles);
         };
     }
-    return ((*client).*write)(keys, batched_slices.value(), config, stager);
+    return ((*client).*write)(keys, batched_slices.value(), config, stager,
+                              /*group_by_target=*/true);
 }
 
 #ifdef USE_ASCEND_DIRECT
@@ -6129,8 +6130,8 @@ std::vector<tl::expected<int64_t, ErrorCode>>
 RealClient::batch_get_into_multi_buffers_dummy_helper(
     const std::vector<std::string> &keys,
     const std::vector<std::vector<uint64_t>> &dummy_all_buffers,
-    const std::vector<std::vector<size_t>> &all_sizes,
-    bool prefer_alloc_in_same_node, int32_t device_id, const UUID &client_id) {
+    const std::vector<std::vector<size_t>> &all_sizes, bool group_by_target,
+    int32_t device_id, const UUID &client_id) {
 #ifdef USE_ASCEND_DIRECT
     if (!ContextManager::getInstance().setCurrentContextByPhysicalId(
             device_id)) {
@@ -6157,8 +6158,7 @@ RealClient::batch_get_into_multi_buffers_dummy_helper(
     }
 
     return batch_get_into_multi_buffers_internal(
-        keys, real_buffers_result.value(), all_sizes,
-        prefer_alloc_in_same_node);
+        keys, real_buffers_result.value(), all_sizes, group_by_target);
 }
 
 tl::expected<int64_t, ErrorCode> RealClient::get_into_range_shm_helper(
@@ -7921,13 +7921,12 @@ RealClient::batch_put_from_multi_buffers_internal(
 std::vector<int> RealClient::batch_get_into_multi_buffers(
     const std::vector<std::string> &keys,
     const std::vector<std::vector<void *>> &all_buffers,
-    const std::vector<std::vector<size_t>> &all_sizes,
-    bool prefer_alloc_in_same_node) {
+    const std::vector<std::vector<size_t>> &all_sizes, bool group_by_target) {
     auto internal_results =
         execute_timed_operation<std::vector<tl::expected<int64_t, ErrorCode>>>(
             [&]() {
                 return batch_get_into_multi_buffers_internal(
-                    keys, all_buffers, all_sizes, prefer_alloc_in_same_node);
+                    keys, all_buffers, all_sizes, group_by_target);
             },
             [](const auto &) { return true; },
             [&](uint64_t latency_us, const auto &ret) {
@@ -7954,8 +7953,7 @@ std::vector<tl::expected<int64_t, ErrorCode>>
 RealClient::batch_get_into_multi_buffers_internal(
     const std::vector<std::string> &keys,
     const std::vector<std::vector<void *>> &all_buffers,
-    const std::vector<std::vector<size_t>> &all_sizes,
-    bool prefer_alloc_in_same_node) {
+    const std::vector<std::vector<size_t>> &all_sizes, bool group_by_target) {
     // Validate preconditions
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
@@ -8136,7 +8134,7 @@ RealClient::batch_get_into_multi_buffers_internal(
 
         auto batch_get_results =
             client_->BatchGet(batch_keys, batch_query_results, batch_slices,
-                              prefer_alloc_in_same_node);
+                              group_by_target);
 
         for (size_t j = 0; j < batch_get_results.size(); ++j) {
             const auto &op = valid_operations[dedup.primaries[j]];
@@ -8333,7 +8331,7 @@ RealClient::batch_get_into_multi_buffers_internal(
             if (!disk_batch_keys.empty()) {
                 auto disk_results = client_->BatchGet(
                     disk_batch_keys, disk_batch_qrs, disk_batch_slices,
-                    prefer_alloc_in_same_node);
+                    group_by_target);
 
                 for (size_t di = 0; di < disk_key_order.size(); ++di) {
                     const auto &key = disk_key_order[di];

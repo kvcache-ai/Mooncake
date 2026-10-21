@@ -53,6 +53,8 @@ static thread_local aclrtContext g_context =
 static aclError g_memcpy_result = ACL_ERROR_NONE;
 static aclError g_memcpy_async_result = ACL_ERROR_NONE;
 static aclError g_memcpy_batch_result = ACL_ERROR_NONE;
+static int g_memcpy_batch_call_count = 0;
+static size_t g_memcpy_batch_max_count = 0;
 static int g_get_device_call_count = 0;
 static int g_set_device_call_count = 0;
 static std::set<int> g_set_device_ids;
@@ -86,6 +88,8 @@ void reset() {
     g_memcpy_result = ACL_ERROR_NONE;
     g_memcpy_async_result = ACL_ERROR_NONE;
     g_memcpy_batch_result = ACL_ERROR_NONE;
+    g_memcpy_batch_call_count = 0;
+    g_memcpy_batch_max_count = 0;
     g_get_device_call_count = 0;
     g_set_device_call_count = 0;
     g_set_device_ids.clear();
@@ -130,6 +134,16 @@ void set_memcpy_batch_result(aclError result) {
 void set_memcpy_async_result(aclError result) {
     std::lock_guard<std::mutex> lock(g_acl_mutex);
     g_memcpy_async_result = result;
+}
+
+int memcpy_batch_call_count() {
+    std::lock_guard<std::mutex> lock(g_acl_mutex);
+    return g_memcpy_batch_call_count;
+}
+
+size_t memcpy_batch_max_count() {
+    std::lock_guard<std::mutex> lock(g_acl_mutex);
+    return g_memcpy_batch_max_count;
 }
 
 int get_get_device_call_count() {
@@ -257,6 +271,8 @@ aclError aclrtMemcpyBatch(void** dstList, size_t* dstSizes, void** srcList,
     (void)attrCount;
 
     std::lock_guard<std::mutex> lock(g_acl_mutex);
+    ++g_memcpy_batch_call_count;
+    g_memcpy_batch_max_count = std::max(g_memcpy_batch_max_count, count);
 
     if (g_memcpy_batch_result == ACL_ERROR_RT_FEATURE_NOT_SUPPORT) {
         return ACL_ERROR_RT_FEATURE_NOT_SUPPORT;
@@ -1707,6 +1723,79 @@ TEST_F(AscendDirectTransportTest,
 
     mock_acl::set_memcpy_batch_result(ACL_ERROR_NONE);
     transport->freeBatchID(batch_id);
+}
+
+class AscendDirectParallelLocalCopyTest : public AscendDirectTransportTest {
+   protected:
+    static constexpr size_t kSliceCount = 500;
+    static constexpr size_t kSliceSize = 8;
+    static constexpr size_t kCopyBytes = kSliceCount * kSliceSize;
+
+    // Copies kSliceCount host slices to device memory in one batch, which is
+    // the shape a store batch put produces for a single target.
+    TransferWaitResult runHostToDeviceSlices(AscendDirectTransport* transport) {
+        mock_acl::set_pointer_location(test_buffer_src_,
+                                       ACL_MEM_LOCATION_TYPE_HOST, 0);
+        mock_acl::set_pointer_location(test_buffer_dst_,
+                                       ACL_MEM_LOCATION_TYPE_DEVICE, 0);
+        initTestData(kCopyBytes);
+
+        auto batch_id = transport->allocateBatchID(kSliceCount);
+        EXPECT_NE(batch_id, 0);
+        std::vector<Transport::TransferRequest> requests;
+        for (size_t i = 0; i < kSliceCount; ++i) {
+            Transport::TransferRequest req;
+            req.opcode = Transport::TransferRequest::WRITE;
+            req.source = test_buffer_src_ + i * kSliceSize;
+            req.target_id = 0;
+            req.target_offset =
+                reinterpret_cast<uint64_t>(test_buffer_dst_ + i * kSliceSize);
+            req.length = kSliceSize;
+            requests.push_back(req);
+        }
+        EXPECT_TRUE(transport->submitTransfer(batch_id, requests).ok());
+        auto result = waitForTransfer(transport, batch_id, kSliceCount);
+        transport->freeBatchID(batch_id);
+        return result;
+    }
+};
+
+TEST_F(AscendDirectParallelLocalCopyTest, SplitsIntoBoundedBatchCalls) {
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+    ASSERT_EQ(transport->registerLocalMemory(test_buffer_src_, kRegisterMemSize,
+                                             "cpu:0", true, true),
+              0);
+    ASSERT_EQ(transport->registerLocalMemory(test_buffer_dst_, kRegisterMemSize,
+                                             "cpu:0", true, true),
+              0);
+
+    auto result = runHostToDeviceSlices(transport.get());
+    ASSERT_TRUE(result.finished);
+    EXPECT_FALSE(result.failed);
+    EXPECT_TRUE(verifyTestData(kCopyBytes));
+    EXPECT_EQ(mock_acl::memcpy_batch_call_count(), 5)
+        << "500 slices should be split into ceil(500 / 122) calls";
+    EXPECT_EQ(mock_acl::memcpy_batch_max_count(), 122u);
+}
+
+TEST_F(AscendDirectParallelLocalCopyTest, FeatureNotSupportFallsBackPerChunk) {
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+    ASSERT_EQ(transport->registerLocalMemory(test_buffer_src_, kRegisterMemSize,
+                                             "cpu:0", true, true),
+              0);
+    ASSERT_EQ(transport->registerLocalMemory(test_buffer_dst_, kRegisterMemSize,
+                                             "cpu:0", true, true),
+              0);
+    mock_acl::set_memcpy_batch_result(ACL_ERROR_RT_FEATURE_NOT_SUPPORT);
+
+    auto result = runHostToDeviceSlices(transport.get());
+    ASSERT_TRUE(result.finished);
+    EXPECT_FALSE(result.failed) << "Every chunk should fall back to async copy";
+    EXPECT_TRUE(verifyTestData(kCopyBytes));
+
+    mock_acl::set_memcpy_batch_result(ACL_ERROR_NONE);
 }
 
 // -----------------------------------------------------------------------------

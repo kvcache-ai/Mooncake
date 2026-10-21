@@ -16,6 +16,7 @@
 #ifndef LOCAL_COPY_ENGINE_H
 #define LOCAL_COPY_ENGINE_H
 
+#include <functional>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -33,6 +34,9 @@ using Slice = Transport::Slice;
 // patterns including sync, async, and batch copy operations.
 class LocalCopyEngine {
    public:
+    // Runs a task on another thread of the pool that calls Copy().
+    using TaskRunner = std::function<void(std::function<void()>)>;
+
     LocalCopyEngine();
 
     ~LocalCopyEngine();
@@ -45,6 +49,12 @@ class LocalCopyEngine {
 
     // Finalize and cleanup resources
     void Finalize();
+
+    // Lets a large host-device copy split its aclrtMemcpyBatch calls across
+    // `runner`, using at most `max_parallelism` threads including the caller.
+    // Pass an empty runner to keep every copy on the calling thread. Must not
+    // be called while a Copy() is in flight.
+    void SetTaskRunner(TaskRunner runner, size_t max_parallelism);
 
     // Perform local memory copy for a list of slices.
     // This is the main entry point that determines the optimal copy method
@@ -72,33 +82,61 @@ class LocalCopyEngine {
                            aclrtMemcpyKind kind, size_t batch_num,
                            size_t slice_index) const;
 
+    // Copies slices [slice_index, slice_index + batch_num) with one
+    // aclrtMemcpyBatch call, falling back to async copy for just these slices
+    // when batch copy is not supported.
+    void CopyBatchChunk(TransferRequest::OpCode opcode,
+                        const std::vector<Slice *> &slice_list,
+                        aclrtMemcpyKind kind, size_t slice_index,
+                        size_t batch_num);
+
+    // Splits the slices into fixed-size aclrtMemcpyBatch calls and runs them
+    // on the calling thread and on task_runner_ in parallel.
+    void CopyWithParallelBatch(TransferRequest::OpCode opcode,
+                               const std::vector<Slice *> &slice_list,
+                               aclrtMemcpyKind kind);
+
     // Determine the appropriate memcpy kind based on source and dest memory
     // types
     static aclrtMemcpyKind GetMemcpyKind(TransferRequest::OpCode opcode,
                                          aclrtPtrAttributes &src_attrs,
                                          aclrtPtrAttributes &dst_attrs);
 
-    // Return (or lazily create) a stream belonging to the current ACL device
-    // context. The stream must be created while that device's context is
-    // current so aclrtMemcpyAsync does not return 107003.
-    aclrtStream GetOrCreateStreamForCurrentDevice();
+    // Return (or lazily create) the stream set belonging to the current ACL
+    // device context. Streams must be created while that device's context is
+    // current so aclrtMemcpyAsync does not return 107003. The set holds
+    // MC_LOCAL_COPY_STREAMS streams (default 1) so local D2D copies can be
+    // striped across copy engines.
+    const std::vector<aclrtStream> *GetOrCreateStreamsForCurrentDevice();
 
    private:
-    // Stream plus the ACL context it was created under. Destroying a stream
-    // requires that same context to be current, otherwise aclrtDestroyStream
-    // can return 107003 (ACL_ERROR_RT_STREAM_CONTEXT).
-    struct DeviceStream {
-        aclrtStream stream = nullptr;
+    // Streams plus the ACL context they were created under. Destroying a
+    // stream requires that same context to be current, otherwise
+    // aclrtDestroyStream can return 107003 (ACL_ERROR_RT_STREAM_CONTEXT).
+    struct DeviceStreams {
+        std::vector<aclrtStream> streams;
         aclrtContext context = nullptr;
     };
 
-    // Per-device streams keyed by ACL device id. A single shared stream is
+    // Per-device stream sets keyed by ACL device id. A single shared stream is
     // unsafe across devices because Initialize() may run under device0
     // context while workers later copy under other device contexts.
-    std::unordered_map<int32_t, DeviceStream> streams_;
+    std::unordered_map<int32_t, DeviceStreams> streams_;
     mutable std::mutex streams_mu_;
     int32_t transfer_timeout_;
+    // Number of streams per device for local copy striping. Parsed once from
+    // MC_LOCAL_COPY_STREAMS at Initialize (clamped to [1, 32]). 1 keeps the
+    // historical single-stream behavior.
+    size_t num_streams_;
     bool initialized_;
+    // Parallel-chunked aclrtMemcpyBatch support (from upstream PR #4799).
+    // Enabled via MC_LOCAL_COPY_PARALLEL_BATCH=1; requires a task runner
+    // supplied by the slice dispatcher's thread pool. Independent of
+    // MC_LOCAL_COPY_STREAMS: when both are set the striped-streams path
+    // takes precedence.
+    TaskRunner task_runner_;
+    size_t max_parallelism_ = 1;
+    bool parallel_batch_enabled_ = false;
 };
 
 }  // namespace mooncake

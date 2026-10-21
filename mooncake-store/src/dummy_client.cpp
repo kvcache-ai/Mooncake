@@ -1964,8 +1964,7 @@ std::vector<int> DummyClient::batch_upsert_from_multi_buffers(
 std::vector<int> DummyClient::batch_get_into_multi_buffers(
     const std::vector<std::string>& keys,
     const std::vector<std::vector<void*>>& all_buffer_ptrs,
-    const std::vector<std::vector<size_t>>& all_sizes,
-    bool prefer_alloc_in_same_node) {
+    const std::vector<std::vector<size_t>>& all_sizes, bool group_by_target) {
     if (keys.size() != all_buffer_ptrs.size() ||
         keys.size() != all_sizes.size()) {
         return std::vector<int>(keys.size(), toInt(ErrorCode::INVALID_PARAMS));
@@ -1979,8 +1978,8 @@ std::vector<int> DummyClient::batch_get_into_multi_buffers(
     auto internal_results =
         invoke_batch_rpc<&RealClient::batch_get_into_multi_buffers_dummy_helper,
                          int64_t>(keys.size(), keys, prepared->dummy_buffers,
-                                  all_sizes, prefer_alloc_in_same_node,
-                                  device_id_, client_id_);
+                                  all_sizes, group_by_target, device_id_,
+                                  client_id_);
     std::vector<int> results;
     results.reserve(internal_results.size());
     for (const auto& result : internal_results) {

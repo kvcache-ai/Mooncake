@@ -111,7 +111,10 @@ class AscendThreadPool {
      * threads.
      * @param num_threads The number of worker threads to create.
      */
-    explicit AscendThreadPool(size_t num_threads);
+    // thread_name_prefix plus the worker index must fit in 15 characters,
+    // the pthread name limit.
+    explicit AscendThreadPool(size_t num_threads,
+                              std::string thread_name_prefix = "ascend-wk-");
 
     /**
      * @brief Destructor that stops the thread pool and waits for all threads.
@@ -131,6 +134,11 @@ class AscendThreadPool {
      * @return true if the pool is running, false otherwise.
      */
     bool isRunning() const;
+
+    /**
+     * @brief Returns the number of worker threads.
+     */
+    size_t size() const { return workers_.size(); }
 
     /**
      * @brief Enqueues a task to be executed by the thread pool.

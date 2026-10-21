@@ -646,6 +646,13 @@ std::string TransferExecutorBase::resolveTargetAdxlEngineName(
     return EngineNameForDestAddr(segment_desc->buffers, endpoints, dest_addr);
 }
 
+void TransferExecutorBase::setLocalCopyTaskRunner(
+    std::function<void(std::function<void()>)> runner, size_t max_parallelism) {
+    if (local_copy_engine_) {
+        local_copy_engine_->SetTaskRunner(std::move(runner), max_parallelism);
+    }
+}
+
 void TransferExecutorBase::processSliceList(
     const std::vector<Transport::Slice*>& slice_list) {
     if (slice_list.empty()) {
@@ -724,7 +731,16 @@ void TransferExecutorBase::processHomogeneousSliceList(
 
         auto need_local_copy = !params_.use_fabric_mem &&
                                (target_adxl_engine_name == local_engine_name);
-        if (need_local_copy && local_copy_engine_) {
+        // MC_ASCEND_FORCE_HIXL_LOCAL=1 bypasses LocalCopyEngine so transfers
+        // targeting the local engine are submitted through the ADXL/HIXL path
+        // (engine self-loopback). Intended for benchmarking and diagnostics on
+        // setups where the memcpy path is not desired (e.g. hugepage-backed
+        // segments that aclrtMemcpyBatch cannot DMA-pin, ret 507899).
+        static const bool kForceHixlLocal =
+            (std::getenv("MC_ASCEND_FORCE_HIXL_LOCAL") != nullptr) &&
+            (*std::getenv("MC_ASCEND_FORCE_HIXL_LOCAL") != '\0') &&
+            (*std::getenv("MC_ASCEND_FORCE_HIXL_LOCAL") != '0');
+        if (!kForceHixlLocal && need_local_copy && local_copy_engine_) {
             auto start = std::chrono::steady_clock::now();
             local_copy_engine_->Copy(slice_list[0]->opcode, slice_list);
             VLOG(1) << "Local copy time: "

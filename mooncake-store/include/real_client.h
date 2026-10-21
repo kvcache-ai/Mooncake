@@ -180,6 +180,8 @@ class RealClient : public PyClient {
      * @param all_buffers Vector of vectors of pointers to the pre-allocated
      * buffers
      * @param all_sizes Vector of vectors of sizes of the buffers
+     * @param group_by_target Read exact-size memory replicas on one segment
+     * in one transfer. A size mismatch stays on the per-key path.
      * @return Vector of integers, where each element is the number of bytes
      * read on success, or a negative value on error
      * @note The buffer addresses must resolve to Store-managed registered
@@ -190,7 +192,7 @@ class RealClient : public PyClient {
         const std::vector<std::string> &keys,
         const std::vector<std::vector<void *>> &all_buffers,
         const std::vector<std::vector<size_t>> &all_sizes,
-        bool prefer_same_node);
+        bool group_by_target);
 
     /**
      * @brief Put object data directly from a pre-allocated buffer
@@ -554,8 +556,7 @@ class RealClient : public PyClient {
         const std::vector<std::string> &keys,
         const std::vector<std::vector<uint64_t>> &dummy_all_buffers,
         const std::vector<std::vector<size_t>> &all_sizes,
-        bool prefer_alloc_in_same_node, int32_t device_id,
-        const UUID &client_id);
+        bool group_by_target, int32_t device_id, const UUID &client_id);
 
     tl::expected<int64_t, ErrorCode> get_into_range_shm_helper(
         const std::string &key, uint64_t buffer, size_t dst_offset,
@@ -713,7 +714,7 @@ class RealClient : public PyClient {
         const std::vector<std::string> &keys,
         const std::vector<std::vector<void *>> &all_buffers,
         const std::vector<std::vector<size_t>> &all_sizes,
-        bool prefer_same_node);
+        bool group_by_target);
 
     tl::expected<void, ErrorCode> put_from_internal(
         const std::string &key, void *buffer, size_t size,

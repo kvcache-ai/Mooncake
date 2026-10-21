@@ -171,10 +171,18 @@ bool IsRoceModeEnabled() {
 }
 
 // AscendThreadPool implementation
-AscendThreadPool::AscendThreadPool(size_t num_threads) : running_(true) {
+AscendThreadPool::AscendThreadPool(size_t num_threads,
+                                   std::string thread_name_prefix)
+    : running_(true) {
+    if (thread_name_prefix.empty()) {
+        thread_name_prefix = "ascend-wk-";
+    }
     for (size_t i = 0; i < num_threads; ++i) {
-        workers_.emplace_back([this, i] {
-            auto thread_name = "ascend-wk-" + std::to_string(i);
+        workers_.emplace_back([this, i, thread_name_prefix] {
+            auto thread_name = thread_name_prefix + std::to_string(i);
+            if (thread_name.size() > 15) {
+                thread_name.resize(15);
+            }
             pthread_setname_np(pthread_self(), thread_name.c_str());
             while (true) {
                 std::function<void()> task;
