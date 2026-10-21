@@ -6,6 +6,7 @@
 #include <thread>
 
 #include "client_metric.h"
+#include "pinned_buffer_pool.h"
 
 namespace mooncake::test {
 
@@ -37,6 +38,10 @@ TEST_F(SsdMetricsTest, SerializeTest) {
     metrics.ssd_write_latency_summary.observe(1000);
     metrics.ssd_total_latency_summary.observe(200);
     metrics.ssd_total_latency_summary.observe(1000);
+    metrics.ObserveWriteStaging(150);
+    metrics.RecordReadErrors("STORAGE_FILE_READ_FAIL", 2);
+    metrics.RecordWriteErrors("STORAGE_FILE_WRITE_FAIL", 3);
+    metrics.RecordPinnedPoolFallback(4);
 
     std::string serialized;
     metrics.serialize(serialized);
@@ -61,6 +66,16 @@ TEST_F(SsdMetricsTest, SerializeTest) {
     EXPECT_TRUE(serialized.find("mooncake_ssd_total_latency_us") !=
                 std::string::npos);
     EXPECT_TRUE(serialized.find("mooncake_ssd_read_latency_summary_us") !=
+                std::string::npos);
+    EXPECT_TRUE(serialized.find("mooncake_ssd_write_staging_latency_us") !=
+                std::string::npos);
+    EXPECT_TRUE(serialized.find("mooncake_ssd_read_errors_total{error="
+                                "\"STORAGE_FILE_READ_FAIL\"} 2") !=
+                std::string::npos);
+    EXPECT_TRUE(serialized.find("mooncake_ssd_write_errors_total{error="
+                                "\"STORAGE_FILE_WRITE_FAIL\"} 3") !=
+                std::string::npos);
+    EXPECT_TRUE(serialized.find("mooncake_ssd_pinned_pool_fallback_total 4") !=
                 std::string::npos);
 
     std::cout << "Serialized SSD Metrics:\n" << serialized << std::endl;
@@ -250,6 +265,49 @@ TEST_F(SsdMetricsTest, LatencyBucketBoundaryTest) {
 
     std::cout << "Bucket boundary test serialization:\n"
               << serialized << std::endl;
+}
+
+TEST_F(SsdMetricsTest, ErrorMetricsAndFallbackSummaryTest) {
+    SsdMetric metrics;
+
+    metrics.RecordReadErrors("STORAGE_FILE_READ_FAIL", 2);
+    metrics.RecordWriteErrors("STORAGE_FILE_WRITE_FAIL", 3);
+    metrics.RecordPinnedPoolFallback(5);
+
+    std::string summary = metrics.summary_metrics();
+    EXPECT_TRUE(summary.find("SSD Pinned Fallback: 5") != std::string::npos);
+    EXPECT_TRUE(summary.find("SSD Read Errors: STORAGE_FILE_READ_FAIL=2") !=
+                std::string::npos);
+    EXPECT_TRUE(summary.find("SSD Write Errors: STORAGE_FILE_WRITE_FAIL=3") !=
+                std::string::npos);
+}
+
+TEST_F(SsdMetricsTest, PinnedBufferPoolFallbackCallback) {
+    PinnedBufferPool pool;
+    size_t callback_count = 0;
+    size_t requested_size = 0;
+    pool.SetFallbackCallback([&callback_count, &requested_size](size_t sz) {
+        callback_count++;
+        requested_size = sz;
+    });
+
+    auto buf = pool.Acquire(4096);
+    EXPECT_NE(buf.data, nullptr);
+    EXPECT_GE(buf.capacity, 4096);
+
+    // In test environment without GPU accelerators, Acquire falls back to
+    // pageable memory
+    EXPECT_EQ(pool.GetFallbackCount(), 1);
+    EXPECT_EQ(callback_count, 1);
+    EXPECT_EQ(requested_size, 4096);
+
+    // Returning buffer to pool and acquiring again should reuse and not trigger
+    // fallback
+    pool.Release(std::move(buf));
+    auto buf2 = pool.Acquire(2048);
+    EXPECT_NE(buf2.data, nullptr);
+    EXPECT_EQ(pool.GetFallbackCount(), 1);
+    EXPECT_EQ(callback_count, 1);
 }
 
 }  // namespace mooncake::test
