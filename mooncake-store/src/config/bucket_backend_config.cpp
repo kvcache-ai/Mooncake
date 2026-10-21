@@ -29,6 +29,10 @@ BucketBackendConfig BucketBackendConfig::FromEnvironment() {
         Environ::ReadOr(Variables::MOONCAKE_OFFLOAD_FLUSH_PARTIAL_BUCKETS,
                         config.flush_partial_buckets);
 
+    config.aligned_direct_write =
+        Environ::ReadOr(Variables::MOONCAKE_OFFLOAD_BUCKET_ALIGNED_DIRECT_WRITE,
+                        config.aligned_direct_write);
+
     config.bucket_keys_limit =
         Environ::ReadOr(Variables::MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT,
                         config.bucket_keys_limit);
