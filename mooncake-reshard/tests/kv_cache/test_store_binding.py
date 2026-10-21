@@ -9,9 +9,10 @@ from mooncake.reshard.kv_cache import (
     KVCacheStoreFormat,
     KVCacheStoreRuntimeBinding,
     KVCacheTransferLimits,
+    validate_resolved_runtime_binding,
 )
 from mooncake.reshard.kv_cache._store.binding import validate_store_binding
-from test_kv_cache_reshard import _placement
+from test_kv_cache_reshard import _placement, _snapshot
 
 
 @pytest.fixture
@@ -27,15 +28,40 @@ def bound_page():
     return placement, binding, buffers
 
 
-def validate(placement, binding):
+def validate(placement, binding, limits=KVCacheTransferLimits()):
     validate_store_binding(
         placement,
         binding,
         "read",
         0,
         placement.descriptor.page_size,
-        KVCacheTransferLimits(),
+        limits,
     )
+
+
+def as_resolved(placement, binding):
+    snapshot = _snapshot(
+        resource_id=placement.resource_id,
+        token_count=placement.descriptor.page_size,
+    )
+    values = {field.name: getattr(binding, field.name) for field in fields(binding)}
+    return snapshot, KVCacheResolvedRuntimeBinding(
+        **values, snapshot_id=snapshot.snapshot_id, snapshot_digest=snapshot.digest
+    )
+
+
+@pytest.fixture(params=("store", "r2r"))
+def validator(request):
+    if request.param == "store":
+        return validate
+
+    def validate_r2r(placement, binding, limits=KVCacheTransferLimits()):
+        snapshot, resolved = as_resolved(placement, binding)
+        validate_resolved_runtime_binding(
+            placement, snapshot, resolved, operation_id="read", limits=limits
+        )
+
+    return validate_r2r
 
 
 def test_store_and_r2r_bindings_keep_separate_identity_contracts(bound_page):
@@ -46,11 +72,19 @@ def test_store_and_r2r_bindings_keep_separate_identity_contracts(bound_page):
     values = {field.name: getattr(binding, field.name) for field in fields(binding)}
     with pytest.raises(ValueError):
         KVCacheResolvedRuntimeBinding(**values, snapshot_id=None, snapshot_digest=None)
-    r2r = KVCacheResolvedRuntimeBinding(
-        **values, snapshot_id="snapshot", snapshot_digest="a" * 64
-    )
+    snapshot, r2r = as_resolved(placement, binding)
+    validate_resolved_runtime_binding(placement, snapshot, r2r, operation_id="read")
     with pytest.raises(TypeError, match="KVCacheStoreRuntimeBinding"):
         validate(placement, r2r)
+    with pytest.raises(TypeError, match="KVCacheResolvedRuntimeBinding"):
+        validate_resolved_runtime_binding(
+            placement, snapshot, binding, operation_id="read"
+        )
+    for field, value in (("snapshot_id", "other"), ("snapshot_digest", "a" * 64)):
+        with pytest.raises(ValueError, match=f"{field} differs"):
+            validate_resolved_runtime_binding(
+                placement, snapshot, replace(r2r, **{field: value}), operation_id="read"
+            )
 
 
 @pytest.mark.parametrize(
@@ -102,7 +136,23 @@ def test_store_and_r2r_bindings_keep_separate_identity_contracts(bound_page):
         ),
     ],
 )
-def test_store_binding_rejects_invalid_memory_before_io(bound_page, mutation, error):
+def test_bindings_reject_invalid_memory_before_io(
+    bound_page, validator, mutation, error
+):
     placement, binding, _ = bound_page
     with pytest.raises(ValueError, match=error):
-        validate(placement, mutation(binding))
+        validator(placement, mutation(binding))
+
+
+@pytest.mark.parametrize(
+    "limits,error",
+    [
+        (KVCacheTransferLimits(max_ranges=1), "range count limit"),
+        (KVCacheTransferLimits(max_operations=1), "physical expansion limit"),
+        (KVCacheTransferLimits(max_validation_work=1), "validation work limit"),
+    ],
+)
+def test_bindings_enforce_geometry_limits(bound_page, validator, limits, error):
+    placement, binding, _ = bound_page
+    with pytest.raises(ValueError, match=error):
+        validator(placement, binding, limits)

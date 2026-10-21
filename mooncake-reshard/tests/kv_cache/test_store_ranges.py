@@ -32,7 +32,7 @@ def test_lowered_ranges_restore_tp1pp3_to_tp2pp2(source_format, target_format):
         )
         for shard in layout.shards
     ]
-    plan = plan_kv_cache_store_load(layout, target, runtime_format=target_format)
+    plan = plan_kv_cache_store_load(layout, target)
     limits = KVCacheTransferLimits(max_batch_operations=3, max_batch_bytes=137)
     for part in target.parts:
         binding, buffers, expected = memory_binding(

@@ -30,9 +30,7 @@ def test_upload_and_load_cover_selected_dp_and_all_target_heads(source_tp, targe
         source.part(writer).rank.dp == 1 and source.part(writer).replica_ordinal == 0
         for writer in upload.part_writers
     )
-    load = plan_kv_cache_store_load(
-        upload.layout, target, runtime_format=KVCacheStoreFormat.PLHD, target_dp_rank=1
-    )
+    load = plan_kv_cache_store_load(upload.layout, target, target_dp_rank=1)
     # Check the logical plan here; execution tests check actual copied bytes.
     for part in target.parts:
         actual = [
@@ -60,7 +58,7 @@ def test_upload_and_load_cover_selected_dp_and_all_target_heads(source_tp, targe
 def test_tp1pp3_to_tp2pp2_read_splits_layers_and_heads(fmt):
     layout = _layout(1, (tuple(range(4)), tuple(range(4, 8)), tuple(range(8, 12))), fmt)
     target = _placement("reader", (tuple(range(6)), tuple(range(6, 12))), 2)
-    plan = plan_kv_cache_store_load(layout, target, runtime_format=fmt)
+    plan = plan_kv_cache_store_load(layout, target)
     local = [r.fragment for r in plan.ranges if r.participant_id == "reader-p0-t0"]
     assert {f.global_layer_id for f in local} == set(range(6))
     assert all((f.head_start, f.head_count) == (0, 2) for f in local)
@@ -172,7 +170,6 @@ def test_planning_limits(limit):
         plan_kv_cache_store_load(
             _layout(),
             _placement("s", ((0, 1), (2, 3)), 2),
-            runtime_format=FORMATS[0],
             limits=limit,
         )
 
@@ -183,35 +180,23 @@ def test_load_replica_expansion_obeys_byte_budget():
     limits = KVCacheStorePlanningLimits(max_bytes=sum(layout.part_sizes))
     plan_kv_cache_store_upload(runtime, object_format=FORMATS[0], limits=limits)
     with pytest.raises(ValueError, match="byte limit"):
-        plan_kv_cache_store_load(
-            layout, runtime, runtime_format=FORMATS[0], limits=limits
-        )
+        plan_kv_cache_store_load(layout, runtime, limits=limits)
 
 
 def test_plan_identity_and_unsupported_conversions():
     layout = _layout()
     runtime = _placement("s", ((0, 1), (2, 3)), 2)
-    load = plan_kv_cache_store_load(layout, runtime, runtime_format=FORMATS[0])
-    assert (
-        load.digest
-        == plan_kv_cache_store_load(layout, runtime, runtime_format=FORMATS[0]).digest
-    )
+    load = plan_kv_cache_store_load(layout, runtime)
+    assert load.digest == plan_kv_cache_store_load(layout, runtime).digest
     with pytest.raises(TypeError):
         plan_kv_cache_store_upload(runtime, layout, object_format=FORMATS[0])
-    assert (
-        plan_kv_cache_store_load(layout, runtime, runtime_format=FORMATS[1]).ranges
-        == load.ranges
-    )
     with pytest.raises(ValueError, match="descriptors differ"):
         plan_kv_cache_store_load(
             layout,
             _placement("s", ((0, 1), (2, 3)), 2, page_size=32),
-            runtime_format=FORMATS[0],
         )
     with pytest.raises(ValueError, match="DP rank"):
-        plan_kv_cache_store_load(
-            layout, runtime, runtime_format=FORMATS[0], target_dp_rank=2
-        )
+        plan_kv_cache_store_load(layout, runtime, target_dp_rank=2)
 
 
 @pytest.mark.parametrize("fmt", FORMATS)
@@ -235,6 +220,5 @@ def test_intersection_expansion_obeys_range_limit():
         plan_kv_cache_store_load(
             layout,
             target,
-            runtime_format=FORMATS[0],
             limits=KVCacheStorePlanningLimits(max_fragments=6),
         )

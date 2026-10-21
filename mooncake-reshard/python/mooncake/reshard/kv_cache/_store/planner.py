@@ -147,16 +147,11 @@ class KVCacheStoreLoadPlan:
         layout: KVCacheStoreLayout,
         target_placement: KVCachePlacementManifest,
         *,
-        runtime_format: KVCacheStoreFormat,
         target_dp_rank: int | None = None,
         limits: KVCacheStorePlanningLimits = DEFAULT_STORE_PLANNING_LIMITS,
     ) -> None:
         if not isinstance(layout, KVCacheStoreLayout):
             raise ValueError("layout must be a KVCacheStoreLayout")  # noqa: TRY004
-        if not isinstance(runtime_format, KVCacheStoreFormat):
-            raise ValueError(  # noqa: TRY004
-                "runtime_format must be a KVCacheStoreFormat"
-            )
         # Source fragments retain their stored strides. Destination strides
         # come from the validated runtime binding during range lowering.
         selected, parts = _selected_parts(
@@ -266,7 +261,6 @@ def plan_kv_cache_store_load(
     layout: KVCacheStoreLayout,
     target_placement: KVCachePlacementManifest,
     *,
-    runtime_format: KVCacheStoreFormat,
     target_dp_rank: int | None = None,
     limits: KVCacheStorePlanningLimits = DEFAULT_STORE_PLANNING_LIMITS,
 ) -> KVCacheStoreLoadPlan:
@@ -274,7 +268,6 @@ def plan_kv_cache_store_load(
     return KVCacheStoreLoadPlan(
         layout,
         target_placement,
-        runtime_format=runtime_format,
         target_dp_rank=target_dp_rank,
         limits=limits,
     )
