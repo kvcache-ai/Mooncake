@@ -1506,11 +1506,6 @@ class MasterService {
         std::chrono::system_clock::time_point now,
         const std::function<bool(const std::string& key)>& matches_key,
         const std::function<void(const ObjectMetadata&)>& on_remove);
-    void RebuildGroupState();
-    // Post-restore migration: re-route every object to its hash(tenant, key)
-    // shard, fixing snapshots that placed grouped objects on hash(group_id)
-    // shards. No-op for correctly-routed snapshots.
-    void ReRouteRestoredObjectsByKey();
     static void ApplySoftPinMetricDelta(int metric_delta);
     size_t GetMetadataShardIndex(const ObjectMetadata& metadata) const;
     void ApplySoftPinEvaluation(
