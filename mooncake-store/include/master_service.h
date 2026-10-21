@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bitset>
 #include <boost/functional/hash.hpp>
 #include <chrono>
 #include <condition_variable>
@@ -1069,19 +1070,18 @@ class MasterService {
     void ClearInvalidHandles(
         const std::unordered_set<UUID, boost::hash<UUID>>& retaining_clients);
     // Clear completed LOCAL_DISK replicas owned by exactly this client, in
-    // all shards. Owner-targeted on purpose: a liveness-complement sweep
+    // every tenant. Owner-targeted on purpose: a liveness-complement sweep
     // classifies by absence from a point-in-time set, so an owner that
     // mounts and registers between taking that set and the sweep reaching
-    // its shard would be swept as stale. A predicate on the owner id cannot
+    // its object would be swept as stale. A predicate on the owner id cannot
     // misclassify a concurrent mount, whatever the interleaving.
     void ClearLocalDiskHandlesOwnedBy(const UUID& owner);
-    // Shard walk shared by the two sweeps above; removes completed replicas
+    // Walk shared by the two sweeps above; removes completed replicas
     // matching is_stale, erasing a key when no valid replica remains. Each
-    // shard is first scanned under its shared lock to pick the keys that
-    // match, and only those are cleaned, in bounded batches under the write
-    // lock: a mass client expiry marks handles stale table-wide, and walking
-    // a whole shard while holding it exclusively blocked every RPC for that
-    // shard until the sweep moved on.
+    // tenant is first read to pick the objects that match, and only those are
+    // cleaned, each under its own write lock: a mass client expiry marks
+    // handles stale table-wide, and walking a whole shard while holding it
+    // exclusively blocked every RPC for that shard until the sweep moved on.
     tl::expected<void, ErrorCode> ClearStaleHandles(
         const std::function<bool(const Replica&)>& is_stale);
     bool ProcessClientOffboardingJob(ClientOffboardingJob& job);
@@ -2060,6 +2060,12 @@ class MasterService {
     // starts, holding no lock, so `visit` may reach any key. A tenant that
     // gains its first object meanwhile may or may not be visited.
     void VisitTenants(const std::function<void(const TenantId&)>& visit) const;
+
+    // Rehashes the tenant's object map in each of `shards` that has grown
+    // sparse, since erase() never returns bucket memory. Interim: it goes
+    // with the shards.
+    void ShrinkSparseTenantMaps(const TenantId& tenant_id,
+                                const std::bitset<kNumShards>& shards);
 
     // The work client reads leave for when they hold no lock on any key:
     // queueing a promotion for each read served only from LOCAL_DISK, and
