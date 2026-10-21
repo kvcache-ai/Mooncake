@@ -188,10 +188,12 @@ class LeaseEvictionIndex final : public EvictionIndex {
                 return last + 1;
             }
             for (const route::KeySlot& slot : it->second.keys) {
-                out.push_back({{slot.key()}, it->first});
+                out.push_back(Entry{{slot.key()}, it->first, {}});
             }
             for (const Group& group : it->second.groups) {
-                group.AppendKeys(out.emplace_back(Entry{{}, it->first}).keys);
+                Entry& entry =
+                    out.emplace_back(Entry{{}, it->first, group.id()});
+                group.AppendKeys(entry.keys);
             }
             return it->first + 1;
         }
@@ -235,7 +237,11 @@ class LeaseEvictionIndex final : public EvictionIndex {
 
         bool StillAt(const route::WriteGuard& guard,
                      const Entry& entry) const override {
-            return guard.has_object() && RankOf(guard.metadata()) <= entry.rank;
+            // A key published again in another group, or in or out of one,
+            // belongs to another entry, whatever its rank.
+            return guard.has_object() &&
+                   guard.metadata().group_id == entry.group_id &&
+                   RankOf(guard.metadata()) <= entry.rank;
         }
 
         size_t Total() const override { return total_; }

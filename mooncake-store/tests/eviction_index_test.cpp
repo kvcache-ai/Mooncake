@@ -254,6 +254,35 @@ TEST_F(LeaseEvictionIndexTest, AKeyPublishedAgainMovesToItsNewGroup) {
               (std::vector<std::set<std::string>>{{"g1", "h1"}, {"g2"}}));
 }
 
+// A key published in another group, or into a group, after the walk copied
+// its entry no longer stands there, even at the same rank.
+TEST_F(LeaseEvictionIndexTest, AKeyMovedToAnotherGroupIsNoLongerAtItsEntry) {
+    PublishInGroup("g1", "g", t0_);
+    PublishInGroup("g2", "g", t0_);
+    Publish("k", t0_);
+    auto cursor = ns_.eviction_index().Scan(t0_ + seconds(1));
+    std::vector<EvictionIndex::Entry> entries;
+    while (auto entry = cursor->Next()) {
+        entries.push_back(std::move(*entry));
+    }
+    ASSERT_EQ(entries.size(), 2u);
+
+    for (const std::string key : {"g2", "k"}) {
+        auto guard = ns_.objects.Write(key);
+        ASSERT_TRUE(guard.has_value());
+        guard->TearDown();
+        PublishIn(*guard, key, "h");
+        SetDeadline(guard->metadata(), t0_);
+    }
+    for (const auto& entry : entries) {
+        for (const std::string& key : entry.keys) {
+            auto guard = ns_.objects.Write(key);
+            ASSERT_TRUE(guard.has_value());
+            EXPECT_EQ(cursor->StillAt(*guard, entry), key == "g1") << key;
+        }
+    }
+}
+
 // An index that counts what the namespace tells it.
 class CountingIndex final : public EvictionIndex {
    public:
