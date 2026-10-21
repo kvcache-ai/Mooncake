@@ -338,7 +338,8 @@ def _validate_split_axis_participation(
     }
     actual = {_parallel_split_rank(tensor, fragment.rank) for fragment in fragments}
     complete_axis_ranges = all(
-        {dict(split_rank)[kind] for split_rank in expected}
+        (kind == "dp" and bool(fixed_coordinates))
+        or {dict(split_rank)[kind] for split_rank in expected}
         == set(range(getattr(topology, f"{kind}_size")))
         for kind in split_axis_kinds
     )

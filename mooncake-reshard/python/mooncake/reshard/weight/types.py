@@ -18,7 +18,7 @@ RuntimeBindingFragment = _RuntimeBindingFragment
 
 _MAX_U64 = (1 << 64) - 1
 ParallelAxisKind = Literal["dp", "pp", "ep", "tp"]
-SplitAxisKind = Literal["ep", "tp"]
+SplitAxisKind = Literal["dp", "ep", "tp"]
 _PARALLEL_AXIS_ORDER: dict[ParallelAxisKind, int] = {
     "dp": 0,
     "pp": 1,
@@ -56,7 +56,7 @@ class SplitAxis:
 
     def __post_init__(self) -> None:
         _validate_parallel_axis_kind(self.kind)
-        if self.kind not in {"ep", "tp"}:
+        if self.kind not in {"dp", "ep", "tp"}:
             raise ValueError(f"{self.kind} cannot use split semantics")
         _require_integer(self.dim, "split axis dim", minimum=0)
         if self.kind == "ep" and self.dim != 0:

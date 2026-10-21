@@ -80,6 +80,21 @@ turn a compact N-D plan into an unbounded number of operations.
 The logical planner is copy-only. It does not infer model semantics from tensor
 names or transform dtype, quantization, packing, swizzle, or checkpoint format.
 
+### FSDP shards versus DP replicas
+
+Use `SplitAxis(kind="dp", dim=...)` when data-parallel ranks jointly hold
+different boxes of one tensor, as with FSDP. `ReplicatedAxis(kind="dp")`
+continues to mean complete DP replicas; `OwnershipAxis(kind="dp")` means one
+owner. These semantics are explicit, not inferred from framework names.
+
+For DP-split sources, the planner requires the complete shard cover and reads
+all intersecting shards instead of selecting a single DP replica. Target TP
+degree and split dimension may differ from the source. Nonuniform edge shards
+are supported. PP/EP owner groups may use noncontiguous global DP ranks, but
+each group's declared participants and tensor geometry must still be complete.
+Missing shards, gaps and overlapping coverage remain errors. No gather,
+framework import, allocation or data transfer is performed by this planner.
+
 ## Runtime Binding
 
 `bind_logical_transfer_plan` attaches selected typed
