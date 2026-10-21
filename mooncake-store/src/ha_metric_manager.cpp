@@ -106,6 +106,10 @@ HAMetricManager::HAMetricManager()
       oplog_applied_entries_total_(
           "ha_oplog_applied_entries_total",
           "Total number of OpLog entries successfully applied"),
+      oplog_dropped_put_end_total_(
+          "ha_oplog_dropped_put_end_total",
+          "Total number of PUT_END records the OpLog writer rejected; PutEnd "
+          "still returned success and the standby never received them"),
       oplog_batch_commits_total_(
           "ha_oplog_batch_commits_total",
           "Total number of Group Commit batches flushed to etcd"),
@@ -235,6 +239,14 @@ void HAMetricManager::inc_oplog_applied_entries(int64_t val) {
 
 int64_t HAMetricManager::get_oplog_applied_entries_total() {
     return static_cast<int64_t>(oplog_applied_entries_total_.value());
+}
+
+void HAMetricManager::inc_oplog_dropped_put_end(int64_t val) {
+    oplog_dropped_put_end_total_.inc(val);
+}
+
+int64_t HAMetricManager::get_oplog_dropped_put_end_total() {
+    return static_cast<int64_t>(oplog_dropped_put_end_total_.value());
 }
 
 void HAMetricManager::inc_oplog_batch_commits(int64_t val) {
@@ -387,6 +399,7 @@ std::string HAMetricManager::serialize_metrics() {
     serialize_metric(oplog_checksum_failures_total_);
     serialize_metric(oplog_watch_disconnections_total_);
     serialize_metric(oplog_applied_entries_total_);
+    serialize_metric(oplog_dropped_put_end_total_);
     serialize_metric(oplog_batch_commits_total_);
     serialize_metric(oplog_sync_batch_commits_total_);
 #ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS

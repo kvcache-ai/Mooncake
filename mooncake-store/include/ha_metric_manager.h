@@ -200,6 +200,15 @@ class HAMetricManager {
     int64_t get_oplog_applied_entries_total();
 
     /**
+     * @brief Increment counter for PUT_END records the OpLog writer rejected.
+     *
+     * The append is not retried and PutEnd still returns success, so the
+     * standby never receives the object. This is the only trace of that loss.
+     */
+    void inc_oplog_dropped_put_end(int64_t val = 1);
+    int64_t get_oplog_dropped_put_end_total();
+
+    /**
      * @brief Increase the total number of OpLog batch commits (Group Commit)
      */
     void inc_oplog_batch_commits(int64_t count = 1);
@@ -293,6 +302,7 @@ class HAMetricManager {
     ylt::metric::counter_t oplog_checksum_failures_total_;
     ylt::metric::counter_t oplog_watch_disconnections_total_;
     ylt::metric::counter_t oplog_applied_entries_total_;
+    ylt::metric::counter_t oplog_dropped_put_end_total_;
     ylt::metric::counter_t oplog_batch_commits_total_;
     ylt::metric::counter_t oplog_sync_batch_commits_total_;
 
