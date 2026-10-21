@@ -5107,10 +5107,7 @@ auto MasterService::GetReplicaListForAdmin(const std::string& key,
         return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
     }
 
-    const ObjectPart* part = metadata.GetPart(0);
-    return GetReplicaListResponse(
-        std::move(replica_list), default_kv_lease_ttl_,
-        part != nullptr ? part->checksum() : std::nullopt);
+    return MakeWholeObjectResponse(metadata, std::move(replica_list));
 }
 
 std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
@@ -5385,10 +5382,8 @@ MasterService::BatchGetReplicaListForAdmin(const std::vector<std::string>& keys,
                     continue;
                 }
 
-                const ObjectPart* part = metadata.GetPart(0);
-                results[original_idx] = GetReplicaListResponse(
-                    std::move(replica_list), default_kv_lease_ttl_,
-                    part != nullptr ? part->checksum() : std::nullopt);
+                results[original_idx] =
+                    MakeWholeObjectResponse(metadata, std::move(replica_list));
             }
         }
     }
