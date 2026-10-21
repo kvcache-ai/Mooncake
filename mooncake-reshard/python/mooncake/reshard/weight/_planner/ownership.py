@@ -4,7 +4,7 @@ from typing import Sequence
 
 from ...contracts import TensorId
 from ...geometry import boxes_exactly_cover
-from ..manifest import OwnershipAxis, PlacementFragment, SplitAxis, TensorDescriptor
+from ..manifest import OwnershipAxis, PlacementFragment, TensorDescriptor
 from .contracts import (
     RuntimeTensorOwner,
 )
@@ -43,55 +43,6 @@ def has_dp_ownership(tensor: TensorDescriptor) -> bool:
         isinstance(axis, OwnershipAxis) and axis.kind == "dp"
         for axis in tensor.parallel_axes
     )
-
-
-def has_dp_split(tensor: TensorDescriptor) -> bool:
-    """Return whether DP ranks jointly partition the logical tensor."""
-
-    return any(
-        isinstance(axis, SplitAxis) and axis.kind == "dp"
-        for axis in tensor.parallel_axes
-    )
-
-
-def dp_split_source_group(
-    tensor: TensorDescriptor, fragment: PlacementFragment
-) -> RuntimeTensorOwner:
-    """Identify one owner/replica group whose DP shards form a full copy."""
-    return tuple(
-        (axis.kind, getattr(fragment.rank, axis.kind))
-        for axis in tensor.parallel_axes
-        if not isinstance(axis, SplitAxis)
-    )
-
-
-def complete_dp_split_source_groups(
-    source_tensors: dict[TensorId, TensorDescriptor],
-    source_fragments: Sequence[PlacementFragment],
-) -> dict[TensorId, RuntimeTensorOwner]:
-    """Select one complete owner/replica group, never mix distinct shard covers."""
-
-    fragments_by_tensor: dict[TensorId, list[PlacementFragment]] = {}
-    for fragment in source_fragments:
-        fragments_by_tensor.setdefault(fragment.tensor_id, []).append(fragment)
-    selected: dict[TensorId, RuntimeTensorOwner] = {}
-    for tensor in source_tensors.values():
-        if not has_dp_split(tensor):
-            continue
-        groups: dict[RuntimeTensorOwner, list[PlacementFragment]] = {}
-        for fragment in fragments_by_tensor.get(tensor.tensor_id, ()):
-            groups.setdefault(dp_split_source_group(tensor, fragment), []).append(
-                fragment
-            )
-        if not groups or any(
-            not _fragments_fully_cover_tensor(tensor, fragments)
-            for fragments in groups.values()
-        ):
-            raise ValueError(
-                "DP-split source tensor is not fully covered: " f"{tensor.tensor_id}"
-            )
-        selected[tensor.tensor_id] = min(groups)
-    return selected
 
 
 def complete_dp_owned_source_owners(
@@ -206,9 +157,7 @@ def complete_parallel_source_replicas(
             fragment.tensor_id, []
         ).append(fragment)
     replica_tensors = tuple(
-        tensor
-        for tensor in source_tensors.values()
-        if not has_dp_ownership(tensor) and not has_dp_split(tensor)
+        tensor for tensor in source_tensors.values() if not has_dp_ownership(tensor)
     )
     if not replica_tensors:
         return {}
@@ -264,9 +213,6 @@ def _validate_local_target_inventory(
 __all__ = [
     "complete_dp_owned_source_owners",
     "complete_parallel_source_replicas",
-    "has_dp_split",
     "has_dp_ownership",
     "parallel_tensor_owner",
-    "dp_split_source_group",
-    "complete_dp_split_source_groups",
 ]

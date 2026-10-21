@@ -135,6 +135,7 @@ def test_individually_allocated_expert_rejects_ep_split_semantics() -> None:
         (lambda: SplitAxis(kind="tp", dim=-1), "at least"),
         (lambda: SplitAxis(kind="tp", dim=True), "integer"),
         (lambda: SplitAxis(kind="pp", dim=0), "split semantics"),
+        (lambda: SplitAxis(kind="dp", dim=0), "split semantics"),
         (lambda: SplitAxis(kind="ep", dim=1), "leading"),
         (lambda: ReplicatedAxis(kind="unknown"), "kind"),
         (lambda: OwnershipAxis(kind="unknown"), "kind"),

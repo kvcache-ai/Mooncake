@@ -492,6 +492,6 @@ def _parallel_axis_kind(value: object) -> ParallelAxisKind:
 
 def _split_axis_kind(value: object) -> SplitAxisKind:
     kind = _parallel_axis_kind(value)
-    if kind not in {"dp", "ep", "tp"}:
+    if kind not in {"ep", "tp"}:
         raise ValueError(f"{kind} cannot use split semantics")
     return cast(SplitAxisKind, kind)

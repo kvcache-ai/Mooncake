@@ -29,11 +29,8 @@ from .ownership import (
     _validate_target_coverage,
     complete_dp_owned_source_owners,
     complete_parallel_source_replicas,
-    has_dp_split,
     has_dp_ownership,
     parallel_tensor_owner,
-    complete_dp_split_source_groups,
-    dp_split_source_group,
 )
 from .validation import (
     _validate_tensor_compatibility,
@@ -193,11 +190,6 @@ def _plan_transfer(
         if parallel_sources
         else {}
     )
-    source_dp_split_groups = (
-        complete_dp_split_source_groups(source_tensors, placement_source_fragments)
-        if parallel_sources
-        else {}
-    )
     source_dp_ranks = sorted(source_replicas)
     source_dp_by_target_dp = (
         {
@@ -243,15 +235,7 @@ def _plan_transfer(
         )
         for group in candidate_groups:
             if parallel_sources:
-                if has_dp_split(source_tensor):
-                    eligible = [
-                        fragment
-                        for fragment in group
-                        if isinstance(fragment, PlacementFragment)
-                        and dp_split_source_group(source_tensor, fragment)
-                        == source_dp_split_groups[target.tensor_id]
-                    ]
-                elif has_dp_ownership(source_tensor):
+                if has_dp_ownership(source_tensor):
                     source_owner = source_dp_owners[target.tensor_id]
                     eligible = [
                         fragment

@@ -80,20 +80,27 @@ turn a compact N-D plan into an unbounded number of operations.
 The logical planner is copy-only. It does not infer model semantics from tensor
 names or transform dtype, quantization, packing, swizzle, or checkpoint format.
 
-### FSDP shards versus DP replicas
+### Stored-source geometry
 
-Use `SplitAxis(kind="dp", dim=...)` when data-parallel ranks jointly hold
-different boxes of one tensor, as with FSDP. `ReplicatedAxis(kind="dp")`
-continues to mean complete DP replicas; `OwnershipAxis(kind="dp")` means one
-owner. These semantics are explicit, not inferred from framework names.
+For an already published source, use `StoredWeightManifest` and
+`plan_stored_transfer_to_target_placement(source_manifest, target_placement)`.
+Each `StoredFragmentSnapshot` identifies a logical box by `global_offset` and
+`local_shape`, and its bytes by `object_key`, `object_offset`, and `nbytes`.
+There is no source rank, training mesh, or framework runtime object in this
+fragment contract. Source fragment count, boundaries, and dimensions can differ
+from the target placement.
 
-For DP-split sources, the planner requires the complete shard cover and reads
-all intersecting shards instead of selecting a single DP replica. Target TP
-degree and split dimension may differ from the source. Nonuniform edge shards
-are supported. PP/EP owner groups may use noncontiguous global DP ranks, but
-each group's declared participants and tensor geometry must still be complete.
-Missing shards, gaps and overlapping coverage remain errors. No gather,
-framework import, allocation or data transfer is performed by this planner.
+The framework adapter determines the logical boxes and which consistent source
+copy to publish. It must decompose any nonrectangular local allocation into
+valid boxes. Mooncake validates the declared snapshot and geometry, computes
+source/target intersections, and lowers them to byte ranges; it does not infer
+training sharding or select a training replica from runtime state.
+
+The stored-source planner tests reconstruct exact bytes for nonuniform 4-to-8
+and 8-to-4 layouts, both tensor dimensions, shuffled fragments, and padded
+object offsets. These are CPU planning regressions, not transport or throughput
+measurements. This path does not replace sparse coordinate planning or change
+its wire format.
 
 ## Runtime Binding
 
