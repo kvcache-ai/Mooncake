@@ -3,9 +3,21 @@ if(NOT USE_CUDA OR NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
   return()
 endif()
 
-# Exercise the real platform and plugin methods without transfer transports.
+# Model the non-CUDA unknown-host contract without requiring HIP hardware.
+if(TARGET tent_transport_hint_test AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+  set(cuda_pointer_platform_loader
+      "_ZN8mooncake4tent8Platform9getLoaderESt10shared_ptrINS0_6ConfigEE")
+  target_compile_definitions(
+    tent_transport_hint_test
+    PRIVATE TENT_TEST_PLATFORM_LOADER="${cuda_pointer_platform_loader}")
+  target_link_options(tent_transport_hint_test PRIVATE
+                      "-Wl,--wrap=${cuda_pointer_platform_loader}")
+endif()
+
+# Include platform base definitions directly: platform_cuda also references
+# them, so separate static archives can fail to link in optimized builds.
 add_library(
-  cuda_pointer_test_runtime STATIC
+  cuda_pointer_test_runtime OBJECT
   ${CMAKE_CURRENT_LIST_DIR}/../src/runtime/platform.cpp
   ${CMAKE_CURRENT_LIST_DIR}/../src/runtime/topology.cpp
   ${CMAKE_CURRENT_LIST_DIR}/../src/runtime/memory_prober.cpp)

@@ -39,6 +39,42 @@
 #include "tent/runtime/transfer_engine_impl.h"
 #include "tent/runtime/transport.h"
 
+#ifdef TENT_TEST_PLATFORM_LOADER
+#include "tent/platform/cpu.h"
+
+namespace mooncake {
+namespace tent {
+namespace {
+std::atomic<bool> use_unknown_host_platform{false};
+
+class UnknownHostPlatform : public CpuPlatform {
+   public:
+    explicit UnknownHostPlatform(std::shared_ptr<Config> conf)
+        : CpuPlatform(std::move(conf)) {}
+    MemoryType getMemoryType(void*) override { return MTYPE_UNKNOWN; }
+    const std::vector<RangeLocation> getLocation(void* addr, size_t size,
+                                                 bool) override {
+        return {{(uint64_t)addr, size, kWildcardLocation}};
+    }
+};
+}  // namespace
+
+Platform& realPlatformLoader(std::shared_ptr<Config>) asm(
+    "__real_" TENT_TEST_PLATFORM_LOADER);
+Platform& wrappedPlatformLoader(std::shared_ptr<Config>) asm(
+    "__wrap_" TENT_TEST_PLATFORM_LOADER);
+
+Platform& wrappedPlatformLoader(std::shared_ptr<Config> conf) {
+    if (use_unknown_host_platform) {
+        static UnknownHostPlatform platform(conf);
+        return platform;
+    }
+    return realPlatformLoader(std::move(conf));
+}
+}  // namespace tent
+}  // namespace mooncake
+#endif
+
 namespace mooncake {
 namespace tent {
 namespace {
@@ -194,6 +230,31 @@ Request makeLocalWriteRequest(uint8_t* buf, size_t len) {
     r.length = len;
     return r;
 }
+
+#ifdef TENT_TEST_PLATFORM_LOADER
+TEST(TransportRegistration, NonCudaUnknownHostMemoryKeepsLocationFallback) {
+    use_unknown_host_platform = true;
+    struct ResetPlatform {
+        ~ResetPlatform() { use_unknown_host_platform = false; }
+    } reset;
+    TransferEngineImpl engine(makeMinimalP2PConfig());
+    ASSERT_TRUE(engine.available());
+    std::shared_ptr<FakeTransport> rdma, tcp;
+    installFakeRdmaAndTcp(engine, rdma, tcp);
+    std::vector<char> host(4096);
+    auto& platform = Platform::getLoader();
+    ASSERT_EQ(MTYPE_UNKNOWN, platform.getMemoryType(host.data()));
+    const auto locations = platform.getLocation(host.data(), host.size());
+    ASSERT_EQ(1, locations.size());
+    EXPECT_EQ(kWildcardLocation, locations[0].location);
+    ASSERT_TRUE(engine.registerLocalMemory(host.data(), host.size()).ok());
+    EXPECT_EQ(1, rdma->warmup_calls);
+    EXPECT_EQ(1, tcp->warmup_calls);
+    EXPECT_EQ(1, rdma->registration_calls);
+    EXPECT_EQ(1, tcp->registration_calls);
+    EXPECT_TRUE(engine.unregisterLocalMemory(host.data(), host.size()).ok());
+}
+#endif
 
 #ifdef USE_CUDA
 TEST(TransportRegistration, ManagedMemoryNeverReachesWarmupOrRegistration) {
