@@ -10,6 +10,8 @@ import asyncio
 from collections.abc import Callable, Sequence
 from typing import Any, ClassVar, overload
 
+from typing_extensions import Buffer
+
 SUPPORT_CUDA: bool
 SUPPORT_EFA: bool
 SUPPORT_HIP: bool
@@ -137,6 +139,28 @@ class TransferEngine:
         transport_hint: str = "",
         nic_hint: str = "",
     ) -> int: ...
+    def submit_scatter_write(
+        self,
+        endpoint: str,
+        local_base_addresses: Sequence[int],
+        local_capacities: Sequence[int],
+        remote_base_addresses: Sequence[int],
+        remote_capacities: Sequence[int],
+        local_offsets: Sequence[Sequence[int]],
+        remote_offsets: Sequence[Sequence[int]],
+        lengths: Sequence[Sequence[int]],
+    ) -> ScatterTransferTicket: ...
+    def submit_scatter_read(
+        self,
+        endpoint: str,
+        local_base_addresses: Sequence[int],
+        local_capacities: Sequence[int],
+        remote_base_addresses: Sequence[int],
+        remote_capacities: Sequence[int],
+        local_offsets: Sequence[Sequence[int]],
+        remote_offsets: Sequence[Sequence[int]],
+        lengths: Sequence[Sequence[int]],
+    ) -> ScatterTransferTicket: ...
     def scatter_transfer_sync_write_with_ticket(
         self,
         endpoint: str,
@@ -174,6 +198,64 @@ class TransferEngine:
         buffers: Sequence[int],
         peer_buffer_addresses: Sequence[int],
         lengths: Sequence[int],
+        transport_hint: str = "",
+        nic_hint: str = "",
+    ) -> int: ...
+    # The *_arrays and *_pages methods take contiguous 8-byte integer arrays
+    # (e.g. numpy uint64/int64); `fields` is a C-contiguous [F, 5] array.
+    def batch_transfer_sync_write_arrays(
+        self,
+        target_hostname: str,
+        buffers: Buffer,
+        peer_buffer_addresses: Buffer,
+        lengths: Buffer,
+        transport_hint: str = "",
+        nic_hint: str = "",
+    ) -> int: ...
+    def batch_transfer_sync_read_arrays(
+        self,
+        target_hostname: str,
+        buffers: Buffer,
+        peer_buffer_addresses: Buffer,
+        lengths: Buffer,
+        transport_hint: str = "",
+        nic_hint: str = "",
+    ) -> int: ...
+    def batch_transfer_async_write_arrays(
+        self,
+        target_hostname: str,
+        buffers: Buffer,
+        peer_buffer_addresses: Buffer,
+        lengths: Buffer,
+        transport_hint: str = "",
+        nic_hint: str = "",
+    ) -> int: ...
+    def batch_transfer_async_read_arrays(
+        self,
+        target_hostname: str,
+        buffers: Buffer,
+        peer_buffer_addresses: Buffer,
+        lengths: Buffer,
+        transport_hint: str = "",
+        nic_hint: str = "",
+    ) -> int: ...
+    def batch_transfer_sync_write_pages(
+        self,
+        target_hostname: str,
+        src_pages: Buffer,
+        dst_pages: Buffer,
+        fields: Buffer,
+        max_batch_size: int = 0,
+        transport_hint: str = "",
+        nic_hint: str = "",
+    ) -> int: ...
+    def batch_transfer_sync_read_pages(
+        self,
+        target_hostname: str,
+        src_pages: Buffer,
+        dst_pages: Buffer,
+        fields: Buffer,
+        max_batch_size: int = 0,
         transport_hint: str = "",
         nic_hint: str = "",
     ) -> int: ...

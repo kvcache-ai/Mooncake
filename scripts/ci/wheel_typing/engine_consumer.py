@@ -7,6 +7,8 @@ The ``type: ignore[...]`` lines are negative checks: ``--strict`` enables
 
 from __future__ import annotations
 
+from array import array
+
 from typing_extensions import assert_type
 
 from mooncake.engine import (
@@ -64,6 +66,15 @@ def exercise_transfer_engine(engine: TransferEngine) -> None:
     assert_type(ticket, ScatterTransferTicket)
     assert_type(ticket.drain(1000), ScatterTransferCompletionStatus)
     assert_type(ticket.drained, bool)
+
+    addresses = array("Q", [buffer])
+    assert_type(
+        engine.batch_transfer_sync_write_arrays(
+            "peer:1", addresses, array("Q", [0]), array("Q", [4096])
+        ),
+        int,
+    )
+    engine.batch_transfer_sync_read_arrays("peer:1", [buffer], [0], [4096])  # type: ignore[arg-type]
 
     assert_type(engine.write_bytes_to_buffer(buffer, b"payload", 7), int)
     assert_type(engine.read_bytes_from_buffer(buffer, 7), bytes)
