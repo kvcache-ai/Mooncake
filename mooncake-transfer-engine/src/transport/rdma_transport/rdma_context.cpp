@@ -743,6 +743,8 @@ int RdmaContext::exportDmabuf(void *addr, size_t length, DmabufExport &out) {
         // allocation base, plus any offset hsa returned for the export.
         out.offset = (uintptr_t)addr - (uintptr_t)allocBase + hsa_dmabuf_offset;
         out.alloc_base = allocBase;
+        out.alloc_size = allocSize;
+        out.device = hipAttr.device;
     }
 #else
     out.method = DmabufExport::Method::kHostReg;

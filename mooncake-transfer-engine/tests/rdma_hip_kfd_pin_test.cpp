@@ -14,8 +14,9 @@
 
 // Registering HIP device memory for RDMA must not shrink the KFD free VRAM
 // that hipMemGetInfo reports and new device allocations draw from. amdgpu
-// charges a NIC's dma-buf pin of KFD memory a second time, so a prefill node
-// whose KV cache exceeded its remaining headroom could no longer load a kernel
+// before 6.19.14 charges a NIC's dma-buf pin of KFD memory a second time, so
+// without the KFD pin anchor (MC_HIP_KFD_PIN_FIX) a prefill node whose KV
+// cache exceeded its remaining headroom could no longer load a kernel
 // after registering it (HSA OUT_OF_RESOURCES, surfaced as HIP error 209).
 //
 // Needs an AMD GPU, an RDMA NIC and the amdgpu peer-memory client. Pick NICs

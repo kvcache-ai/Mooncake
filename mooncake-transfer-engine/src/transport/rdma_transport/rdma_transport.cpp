@@ -37,6 +37,7 @@
 #include "buffer_range_index.h"
 #include "common.h"
 #include "config.h"
+#include "hip_device_guard.h"
 #include "memory_location.h"
 #include "topology.h"
 #include "transport/batch_registration.h"
@@ -169,6 +170,69 @@ bool has_ibv_reg_mr_iova2(void) {
     return sym != NULL;
 }
 
+static void deregKfdPinAnchor(ibv_mr *mr) {
+    int ret = ibv_dereg_mr(mr);
+    if (ret)
+        LOG(WARNING) << "Failed to release KFD pin anchor: " << strerror(ret);
+}
+
+#ifdef USE_HIP_DMABUF
+// Whether HIP allocations get a KFD pin anchor. Process-wide: it depends on
+// the amdgpu driver and on whether any NIC takes a peer-memory MR.
+enum KfdPinAnchorState { kKfdPinUnprobed, kKfdPinAnchor, kKfdPinNoAnchor };
+
+static std::atomic<KfdPinAnchorState> &kfdPinAnchorState() {
+    static std::atomic<KfdPinAnchorState> state{
+        globalConfig().hip_kfd_pin_fix == HipKfdPinFix::OFF ? kKfdPinNoAnchor
+        : globalConfig().hip_kfd_pin_fix == HipKfdPinFix::FORCE
+            ? kKfdPinAnchor
+            : kKfdPinUnprobed};
+    return state;
+}
+
+// A smaller allocation moves KFD free VRAM too little to tell a double charge
+// from concurrent allocations, so the probe waits for a larger one.
+static constexpr size_t kKfdPinProbeMinBytes = 64ull << 20;
+
+// Pins the allocation through a dma-buf MR over the buffer's first page. KFD
+// free VRAM dropping by the allocation size means the driver charges dma-buf
+// pins twice; not moving means it does not. Anything else means other
+// allocations interfered, and a later registration probes again.
+static KfdPinAnchorState probeKfdPin(ibv_pd *pd, void *addr, size_t length,
+                                     const DmabufExport &exp) {
+    HipDeviceGuard device(exp.device);
+    size_t before = 0, after = 0, total = 0;
+    if (!device.set_ok() || hipMemGetInfo(&before, &total) != hipSuccess)
+        return kKfdPinUnprobed;
+    ibv_mr *mr = ibv_reg_dmabuf_mr(
+        pd, exp.offset, std::min<size_t>(length, getpagesize()),
+        reinterpret_cast<uintptr_t>(addr), exp.fd, IBV_ACCESS_LOCAL_WRITE);
+    if (!mr) return kKfdPinUnprobed;
+    const bool measured = hipMemGetInfo(&after, &total) == hipSuccess;
+    if (int ret = ibv_dereg_mr(mr))
+        LOG(WARNING) << "Failed to deregister KFD pin probe MR: "
+                     << strerror(ret);
+    if (!measured) return kKfdPinUnprobed;
+
+    const int64_t drop = (int64_t)before - (int64_t)after;
+    const int64_t size = (int64_t)exp.alloc_size;
+    KfdPinAnchorState result = kKfdPinUnprobed;
+    if (std::llabs(drop) < size / 4)
+        result = kKfdPinNoAnchor;
+    else if (std::llabs(drop - size) < size / 4)
+        result = kKfdPinAnchor;
+    LOG(INFO) << "KFD pin probe: a dma-buf MR of a " << (size >> 20)
+              << " MiB allocation lowered KFD free VRAM by " << drop / (1 << 20)
+              << " MiB; "
+              << (result == kKfdPinAnchor ? "holding one peer-memory pin per "
+                                            "registered allocation"
+                  : result == kKfdPinNoAnchor
+                      ? "the driver counts it once, no anchor needed"
+                      : "inconclusive, probing again at the next registration");
+    return result;
+}
+#endif
+
 RdmaTransport::RdmaTransport() {
     MCIbRelaxedOrderingMode = getIbRelaxedOrderingMode();
     if (MCIbRelaxedOrderingMode == 0) {
@@ -200,8 +264,9 @@ RdmaTransport::~RdmaTransport() {
 #endif
     metadata_->removeSegmentDesc(local_server_name_);
     batch_desc_set_.clear();
-    for (auto &[_, anchor] : kfd_pin_anchors_) ibv_dereg_mr(anchor.mr);
+    for (auto &[_, anchor] : kfd_pin_anchors_) deregKfdPinAnchor(anchor.mr);
     kfd_pin_anchors_.clear();
+    kfd_pin_anchor_of_buffer_.clear();
     context_list_.clear();
 }
 
@@ -382,9 +447,7 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
         ~KfdPinAnchorGuard() {
             if (held) transport->releaseKfdPinAnchor(addr);
         }
-    } kfd_pin_anchor{this, addr,
-                     dmabuf_exp.alloc_base &&
-                         acquireKfdPinAnchor(addr, dmabuf_exp.alloc_base)};
+    } kfd_pin_anchor{this, addr, acquireKfdPinAnchor(addr, length, dmabuf_exp)};
 
     // Mooncake#2017: ibv_reg_mr silently truncates a registration to the device
     // max_mr_size, but the metadata would still advertise the full BufferDesc
@@ -728,6 +791,7 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
             if (use_parallel_unreg == -1)
                 use_parallel_unreg = context_list_.size() > 1;
         }
+        int mr_err = 0;
         if (use_parallel_unreg) {
             std::vector<std::thread> threads;
             threads.reserve(context_list_.size());
@@ -743,7 +807,7 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
             }
             for (auto &t : threads) t.join();
             for (int rc : ret_codes)
-                if (rc && !first_err) first_err = rc;
+                if (rc && !mr_err) mr_err = rc;
         } else {
             for (uint64_t ca : chunk_addrs)
                 for (auto &context : context_list_) {
@@ -752,10 +816,12 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
                     if (ret) {
                         LOG(ERROR) << "Failed to unregister chunk MR at "
                                    << reinterpret_cast<void *>(ca);
-                        if (!first_err) first_err = ret;
+                        if (!mr_err) mr_err = ret;
                     }
                 }
         }
+        if (!mr_err) releaseKfdPinAnchor(addr);
+        if (!first_err) first_err = mr_err;
 
         // Single metadata publish covering all removed chunks.
         if (update_metadata) {
@@ -766,7 +832,6 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
             std::lock_guard<std::mutex> lock(chunk_map_mutex_);
             chunk_map_.erase((uint64_t)addr);
         }
-        if (!first_err) releaseKfdPinAnchor(addr);
         return first_err;
     }
 
@@ -857,9 +922,25 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
     return 0;
 }
 
-bool RdmaTransport::acquireKfdPinAnchor(void *addr, void *alloc_base) {
+bool RdmaTransport::acquireKfdPinAnchor(void *addr, size_t length,
+                                        const DmabufExport &exp) {
+#ifdef USE_HIP_DMABUF
+    auto &state = kfdPinAnchorState();
+    if (!exp.alloc_base || state.load() == kKfdPinNoAnchor) return false;
+    if (state.load() == kKfdPinUnprobed) {
+        ibv_pd *pd = nullptr;
+        for (auto &context : context_list_)
+            if ((pd = context->pd())) break;
+        if (!pd || exp.alloc_size < kKfdPinProbeMinBytes) return false;
+        static std::mutex probe_mutex;
+        std::lock_guard<std::mutex> lock(probe_mutex);
+        if (state.load() == kKfdPinUnprobed)
+            state.store(probeKfdPin(pd, addr, length, exp));
+        if (state.load() != kKfdPinAnchor) return false;
+    }
+
     std::lock_guard<std::mutex> lock(kfd_pin_anchor_mutex_);
-    auto base = reinterpret_cast<uintptr_t>(alloc_base);
+    auto base = reinterpret_cast<uintptr_t>(exp.alloc_base);
     if (!kfd_pin_anchor_of_buffer_
              .emplace(reinterpret_cast<uintptr_t>(addr), base)
              .second)
@@ -869,15 +950,17 @@ bool RdmaTransport::acquireKfdPinAnchor(void *addr, void *alloc_base) {
         // The peer-memory client pins the whole allocation for any range.
         for (auto &context : context_list_) {
             if (!context->pd()) continue;
-            anchor.mr = ibv_reg_mr(context->pd(), alloc_base, getpagesize(),
+            anchor.mr = ibv_reg_mr(context->pd(), exp.alloc_base, getpagesize(),
                                    IBV_ACCESS_LOCAL_WRITE);
             if (anchor.mr) break;
         }
         if (!anchor.mr) {
-            LOG_FIRST_N(WARNING, 1)
-                << "amdgpu peer-memory pin unavailable (" << strerror(errno)
-                << "); KFD will count registered GPU memory twice in its "
-                   "free VRAM";
+            const int err = errno;
+            if (state.exchange(kKfdPinNoAnchor) == kKfdPinAnchor)
+                LOG(WARNING)
+                    << "amdgpu peer-memory pin unavailable (" << strerror(err)
+                    << "); KFD will count registered GPU memory "
+                       "twice in its free VRAM";
             kfd_pin_anchors_.erase(base);
             kfd_pin_anchor_of_buffer_.erase(reinterpret_cast<uintptr_t>(addr));
             return false;
@@ -885,6 +968,9 @@ bool RdmaTransport::acquireKfdPinAnchor(void *addr, void *alloc_base) {
     }
     ++anchor.refs;
     return true;
+#else
+    return false;
+#endif
 }
 
 void RdmaTransport::releaseKfdPinAnchor(void *addr) {
@@ -895,9 +981,7 @@ void RdmaTransport::releaseKfdPinAnchor(void *addr) {
     auto anchor = kfd_pin_anchors_.find(owner->second);
     kfd_pin_anchor_of_buffer_.erase(owner);
     if (--anchor->second.refs) return;
-    int ret = ibv_dereg_mr(anchor->second.mr);
-    if (ret)
-        LOG(WARNING) << "Failed to release KFD pin anchor: " << strerror(ret);
+    deregKfdPinAnchor(anchor->second.mr);
     kfd_pin_anchors_.erase(anchor);
 }
 
