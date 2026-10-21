@@ -902,7 +902,7 @@ struct EtcdHostPort {
 // The first plain-http host:port of --etcd_endpoints. The relay and the lease
 // probe below speak neither TLS nor any other endpoint syntax.
 std::optional<EtcdHostPort> FirstEtcdHostPort() {
-    // etcd_wrapper.go splits on ',' and ';', trims spaces and skips empty
+    // etcd_wrapper.go splits on ',' and ';', trims whitespace and skips empty
     // entries.
     std::string endpoints = FLAGS_etcd_endpoints;
     std::replace(endpoints.begin(), endpoints.end(), ';', ',');
@@ -914,11 +914,13 @@ std::optional<EtcdHostPort> FirstEtcdHostPort() {
         }
         std::string entry = endpoints.substr(start, end - start);
         start = end + 1;
-        const auto first = entry.find_first_not_of(' ');
+        constexpr const char* kWhitespace = " \t\n\v\f\r";
+        const auto first = entry.find_first_not_of(kWhitespace);
         if (first == std::string::npos) {
             continue;
         }
-        endpoint = entry.substr(first, entry.find_last_not_of(' ') - first + 1);
+        endpoint = entry.substr(
+            first, entry.find_last_not_of(kWhitespace) - first + 1);
         break;
     }
     if (endpoint.starts_with("http://")) {

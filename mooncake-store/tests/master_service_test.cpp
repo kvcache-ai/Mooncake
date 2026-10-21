@@ -3854,10 +3854,11 @@ TEST_F(MasterServiceTest, StopHttpMetadataCleanupWaitsForInFlightDelete) {
     // 3. Queue one more segment, then stop while #3 is in flight.
     peer.CleanupHttpMetadataForTesting("segment_d");
     EXPECT_EQ(1u, peer.HttpMetadataCleanupQueueSizeForTesting());
-    // The packaged task sets the future inside the thread runtime. That
-    // removes the user-code window between Stop returning and the signal; a
-    // scheduler pause inside the runtime call is the only residual window.
-    // The 150 ms hold stays well under the HTTP client's request timeout.
+    // The packaged task sets the future inside the thread runtime, which
+    // removes the user-code window after Stop returns. A scheduler pause of
+    // more than 150 ms after the queue clear is the only residual window;
+    // the queue gate above is bounded at 5 s, and a stall past the HTTP
+    // client's request timeout can make a correct run finish early.
     std::packaged_task<void()> stop_task(
         [&] { service.StopHttpMetadataCleanup(); });
     auto stop_done = stop_task.get_future();
