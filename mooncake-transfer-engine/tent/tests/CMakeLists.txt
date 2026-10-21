@@ -899,6 +899,7 @@ if(USE_MLU)
     "-Wl,--wrap=cnPlaceNotifier"
     "-Wl,--wrap=cnMemcpyAsync_V3"
     "-Wl,--wrap=cnMemcpyHtoD"
+    "-Wl,--wrap=cnMemcpyDtoH"
     "-Wl,--wrap=cnQueueSync"
     "-Wl,--wrap=cnQueryNotifier"
     "-Wl,--wrap=cnQueryQueue")

@@ -103,6 +103,12 @@ extern "C" CNresult __wrap_cnMemcpyHtoD(CNaddr dst, const void *src,
     if (before_inline) before_inline();
     return __real_cnMemcpyHtoD(dst, src, len);
 }
+extern "C" CNresult __real_cnMemcpyDtoH(void *, CNaddr, cn_uint64_t);
+extern "C" CNresult __wrap_cnMemcpyDtoH(void *dst, CNaddr src,
+                                        cn_uint64_t len) {
+    if (before_inline) before_inline();
+    return __real_cnMemcpyDtoH(dst, src, len);
+}
 extern "C" CNresult __real_cnQueueSync(CNqueue);
 extern "C" CNresult __wrap_cnQueueSync(CNqueue queue) {
     if (fail_sync.exchange(false)) return CN_QUEUE_ERROR_INVALID;
@@ -413,6 +419,147 @@ TEST_P(MluAsyncCopyTest, RemainsPendingUntilDeviceCopyCompletes) {
     EXPECT_TRUE(loader_->free(dev, kBufSize).ok());
 }
 
+TEST_P(MluAsyncCopyTest, FailedQueueRecoversAfterDrain) {
+    uint8_t *dev = nullptr;
+    ASSERT_NO_FATAL_FAILURE(allocDevice(&dev, kBufSize));
+    RegisteredHost host(transport_, kBufSize);
+    ASSERT_TRUE(host.status.ok());
+    auto [op, device_source] = GetParam();
+    const bool to_device = device_source == (op == Request::READ);
+    auto request = makeRequest(
+        op, device_source ? dev : host.bytes.data(),
+        (uint64_t)(device_source ? host.bytes.data() : dev), kBufSize);
+    for (bool notifier_failure : {false, true}) {
+        // Exercise polling, batch release, and an explicit queue drain that
+        // leaves the failed task unpolled while new work is submitted.
+        for (int drain = 0; drain < 3; ++drain) {
+            SCOPED_TRACE(::testing::Message()
+                         << notifier_failure << ":" << drain);
+            std::vector<uint8_t> expected(kBufSize, 0x27);
+            std::fill(host.bytes.begin(), host.bytes.end(), 0x27);
+            ASSERT_TRUE(loader_->copy(dev, expected.data(), kBufSize).ok());
+            auto queue = queueFor(request);
+            ASSERT_NE(queue, nullptr);
+            QueueGate gate(queue);
+            Transport::SubBatchRef failed = nullptr;
+            ASSERT_TRUE(transport_.allocateSubBatch(failed, 1).ok());
+            if (notifier_failure)
+                fail_notifier_record = true;
+            else
+                reject_copy = CN_INVOKE_ERROR_TIMEOUT;
+            EXPECT_TRUE(transport_.submitTransferTasks(failed, {request}).ok());
+            TransferStatus status{};
+            EXPECT_TRUE(transport_.getTransferStatus(failed, 0, status).ok());
+            EXPECT_EQ(status.s, PENDING);
+            EXPECT_EQ(run(request).s, FAILED);
+            gate.release();
+            if (drain == 0) {
+                EXPECT_EQ(wait(failed).s, FAILED);
+            } else if (drain == 1) {
+                EXPECT_TRUE(transport_.freeSubBatch(failed).ok());
+            } else {
+                EXPECT_TRUE(transport_.quiesce().ok());
+            }
+
+            std::fill(expected.begin(), expected.end(), 0x6B);
+            if (to_device)
+                std::fill(host.bytes.begin(), host.bytes.end(), 0x6B);
+            else
+                EXPECT_TRUE(loader_->copy(dev, expected.data(), kBufSize).ok());
+            auto recovered = queueFor(request);
+            ASSERT_NE(recovered, nullptr);
+            EXPECT_NE(recovered, queue);
+            if (to_device) {
+                std::vector<uint8_t> actual(kBufSize);
+                EXPECT_TRUE(loader_->copy(actual.data(), dev, kBufSize).ok());
+                EXPECT_EQ(actual, expected);
+            } else {
+                EXPECT_TRUE(std::equal(host.bytes.begin(), host.bytes.end(),
+                                       expected.begin()));
+            }
+            QueueGate later_gate(recovered);
+            Transport::SubBatchRef later = nullptr;
+            EXPECT_TRUE(transport_.allocateSubBatch(later, 1).ok());
+            EXPECT_TRUE(transport_.submitTransferTasks(later, {request}).ok());
+            if (failed) {
+                // New work must not extend the old failed task's drain.
+                EXPECT_TRUE(
+                    transport_.getTransferStatus(failed, 0, status).ok());
+                EXPECT_EQ(status.s, FAILED);
+                EXPECT_EQ(status.transferred_bytes, 0u);
+                EXPECT_TRUE(transport_.freeSubBatch(failed).ok());
+            }
+            later_gate.release();
+            EXPECT_EQ(wait(later).s, COMPLETED);
+            EXPECT_TRUE(transport_.freeSubBatch(later).ok());
+        }
+    }
+    EXPECT_TRUE(loader_->free(dev, kBufSize).ok());
+}
+
+TEST_P(MluAsyncCopyTest, PageableCopiesWaitForEarlierQueuedCopy) {
+    uint8_t *dev = nullptr;
+    ASSERT_NO_FATAL_FAILURE(allocDevice(&dev, kBufSize));
+    RegisteredHost host(transport_, kBufSize);
+    ASSERT_TRUE(host.status.ok());
+    auto [op, device_source] = GetParam();
+    const bool to_device = device_source == (op == Request::READ);
+    auto request = [&](void *host_ptr, void *device_ptr, size_t length) {
+        return makeRequest(op, device_source ? device_ptr : host_ptr,
+                           (uint64_t)(device_source ? host_ptr : device_ptr),
+                           length);
+    };
+    std::vector<uint8_t> seed(kBufSize, 0x27);
+    ASSERT_TRUE(loader_->copy(dev, seed.data(), kBufSize).ok());
+    std::fill(host.bytes.begin(), host.bytes.end(), 0x27);
+    auto large = request(host.bytes.data(), dev, kBufSize);
+    auto queue = queueFor(large);
+    ASSERT_NE(queue, nullptr);
+    for (size_t length : {kChunk, kChunk + 1}) {
+        SCOPED_TRACE(length);
+        std::vector<uint8_t> pageable(length, 0x6B);
+        cnrtPointerAttributes_t attributes{};
+        ASSERT_EQ(cnrtPointerGetAttributes(&attributes, pageable.data()),
+                  cnrtSuccess);
+        ASSERT_EQ(attributes.type, cnrtMemTypeUnregistered);
+        Transport::SubBatchRef first = nullptr, second = nullptr;
+        ASSERT_TRUE(transport_.allocateSubBatch(first, 1).ok());
+        ASSERT_TRUE(transport_.allocateSubBatch(second, 1).ok());
+        QueueGate gate(queue);
+        EXPECT_TRUE(transport_.submitTransferTasks(first, {large}).ok());
+        std::promise<void> started;
+        std::atomic<int> inline_calls{0};
+        before_inline = [&] { ++inline_calls; };
+        auto submit = std::async(std::launch::async, [&] {
+            started.set_value();
+            return transport_.submitTransferTasks(
+                second, {request(pageable.data(), dev + 17, length)});
+        });
+        started.get_future().wait();
+        EXPECT_EQ(submit.wait_for(std::chrono::milliseconds(50)),
+                  std::future_status::timeout);
+        EXPECT_EQ(inline_calls.load(), 0);
+        gate.release();
+        EXPECT_TRUE(submit.get().ok());
+        before_inline = {};
+        EXPECT_EQ(inline_calls.load(), 1);
+        EXPECT_EQ(wait(second).s, COMPLETED);
+        EXPECT_TRUE(transport_.freeSubBatch(first).ok());
+        EXPECT_TRUE(transport_.freeSubBatch(second).ok());
+        if (to_device) {
+            auto expected = seed;
+            std::fill(expected.begin() + 17, expected.begin() + 17 + length,
+                      0x6B);
+            std::vector<uint8_t> actual(kBufSize);
+            EXPECT_TRUE(loader_->copy(actual.data(), dev, kBufSize).ok());
+            EXPECT_EQ(actual, expected);
+        } else {
+            EXPECT_EQ(pageable, std::vector<uint8_t>(length, 0x27));
+        }
+    }
+    EXPECT_TRUE(loader_->free(dev, kBufSize).ok());
+}
+
 INSTANTIATE_TEST_SUITE_P(ReadWrite, MluAsyncCopyTest,
                          ::testing::Combine(::testing::Values(Request::READ,
                                                               Request::WRITE),
@@ -522,63 +669,6 @@ TEST_P(MluSmallH2DTest, OrdersOverlappingLargeSmallLargeCopies) {
         std::fill(expected.begin() + kChunk / 2,
                   expected.begin() + kChunk / 2 + kChunk + 1, 0xC4);
         std::vector<uint8_t> actual(kBufSize);
-        EXPECT_TRUE(loader_->copy(actual.data(), dev, kBufSize).ok());
-        EXPECT_EQ(actual, expected);
-    }
-    EXPECT_TRUE(loader_->free(dev, kBufSize).ok());
-}
-
-TEST_P(MluSmallH2DTest, PageableH2DWaitsForEarlierQueuedCopy) {
-    uint8_t *dev = nullptr;
-    ASSERT_NO_FATAL_FAILURE(allocDevice(&dev, kBufSize));
-    RegisteredHost host(transport_, kBufSize);
-    ASSERT_TRUE(host.status.ok());
-    std::fill(host.bytes.begin(), host.bytes.end(), 0x27);
-    auto large =
-        makeRequest(Request::WRITE, host.bytes.data(), (uint64_t)dev, kBufSize);
-    auto queue = queueFor(large);
-    ASSERT_NE(queue, nullptr);
-    for (size_t length : {kChunk, kChunk + 1}) {
-        SCOPED_TRACE(length);
-        std::vector<uint8_t> pageable(length, 0x6B);
-        cnrtPointerAttributes_t attributes{};
-        ASSERT_EQ(cnrtPointerGetAttributes(&attributes, pageable.data()),
-                  cnrtSuccess);
-        ASSERT_EQ(attributes.type, cnrtMemTypeUnregistered);
-        Transport::SubBatchRef first = nullptr, second = nullptr;
-        ASSERT_TRUE(transport_.allocateSubBatch(first, 1).ok());
-        ASSERT_TRUE(transport_.allocateSubBatch(second, 1).ok());
-        QueueGate gate(queue);
-        EXPECT_TRUE(transport_.submitTransferTasks(first, {large}).ok());
-        std::promise<void> started;
-        std::atomic<int> inline_calls{0};
-        before_inline = [&] { ++inline_calls; };
-        auto submit = std::async(std::launch::async, [&] {
-            started.set_value();
-            return transport_.submitTransferTasks(
-                second,
-                {makeRequest(
-                    GetParam(),
-                    GetParam() == Request::READ ? dev + 17 : pageable.data(),
-                    (uint64_t)(GetParam() == Request::READ ? pageable.data()
-                                                           : dev + 17),
-                    length)});
-        });
-        started.get_future().wait();
-        EXPECT_EQ(submit.wait_for(std::chrono::milliseconds(50)),
-                  std::future_status::timeout);
-        EXPECT_EQ(inline_calls.load(), 0);
-        gate.release();
-        EXPECT_TRUE(submit.get().ok());
-        before_inline = {};
-        EXPECT_EQ(inline_calls.load(), 1);
-        auto &task = static_cast<MluSubBatch *>(second)->task_list[0];
-        EXPECT_EQ(task.status_word.load(), COMPLETED);
-        EXPECT_EQ(task.completion, nullptr);
-        EXPECT_TRUE(transport_.freeSubBatch(first).ok());
-        EXPECT_TRUE(transport_.freeSubBatch(second).ok());
-        std::vector<uint8_t> actual(kBufSize), expected(kBufSize, 0x27);
-        std::fill(expected.begin() + 17, expected.begin() + 17 + length, 0x6B);
         EXPECT_TRUE(loader_->copy(actual.data(), dev, kBufSize).ok());
         EXPECT_EQ(actual, expected);
     }
@@ -704,13 +794,16 @@ TEST_F(MluTransportTest, H2DQueueQueryFailureDoesNotPermitInlineCopy) {
     fail_queue = queue->handle;
     EXPECT_EQ(run(small).s, FAILED);
     fail_queue = nullptr;
-    // A successful later query must not bypass the recorded queue error.
-    EXPECT_EQ(run(small).s, FAILED);
     EXPECT_EQ(inline_calls.load(), 0);
     before_inline = {};
     std::vector<uint8_t> actual(kBufSize);
     EXPECT_TRUE(loader_->copy(actual.data(), dev, kBufSize).ok());
     EXPECT_EQ(actual, std::vector<uint8_t>(kBufSize, 0x27));
+    // Once the driver confirms the failed queue is idle, inline copies resume.
+    EXPECT_EQ(run(small).s, COMPLETED);
+    EXPECT_TRUE(loader_->copy(actual.data(), dev, kBufSize).ok());
+    EXPECT_TRUE(std::all_of(actual.begin(), actual.begin() + kChunk,
+                            [](uint8_t value) { return value == 0x6B; }));
     EXPECT_TRUE(loader_->free(dev, kBufSize).ok());
 }
 
@@ -1071,8 +1164,8 @@ TEST_F(MluTransportTest,
     fail_queue = nullptr;
     gate.release();
     EXPECT_TRUE(transport_.freeSubBatch(batch).ok());
-    // A queue that failed synchronization is not reused for another copy.
-    EXPECT_EQ(run(request).s, FAILED);
+    // The failed queue has drained; subsequent copies can use a fresh queue.
+    EXPECT_EQ(run(request).s, COMPLETED);
     EXPECT_TRUE(loader_->free(dev, kBufSize).ok());
 }
 
@@ -1131,7 +1224,7 @@ TEST_F(MluTransportTest,
     EXPECT_TRUE(loader_->free(dev, kBufSize).ok());
 }
 
-TEST_F(MluTransportTest, AmbiguousSubmitFailureWaitsForQueueAndPoisonsIt) {
+TEST_F(MluTransportTest, AmbiguousSubmitFailureRecoversOnlyAfterQueueDrains) {
     uint8_t *dev = nullptr;
     ASSERT_NO_FATAL_FAILURE(allocDevice(&dev, kBufSize));
     RegisteredHost host(transport_, kBufSize);
@@ -1152,9 +1245,9 @@ TEST_F(MluTransportTest, AmbiguousSubmitFailureWaitsForQueueAndPoisonsIt) {
     gate.release();
     EXPECT_EQ(wait(batch).s, FAILED);
     EXPECT_TRUE(transport_.freeSubBatch(batch).ok());
-    EXPECT_EQ(run(request).s, FAILED);
+    EXPECT_EQ(run(request).s, COMPLETED);
     request.length = kChunk;
-    EXPECT_EQ(run(request).s, FAILED);
+    EXPECT_EQ(run(request).s, COMPLETED);
     EXPECT_TRUE(loader_->free(dev, kBufSize).ok());
 }
 

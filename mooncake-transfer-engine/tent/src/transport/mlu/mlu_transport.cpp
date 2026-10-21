@@ -318,20 +318,30 @@ Status MluTransport::submitCopy(MluTask &task, bool to_device) {
     if (result != cnrtSuccess)
         return Status::InternalError(cnrtGetErrorStr(result));
     const bool pinned = attributes.type == cnrtMemTypeHost;
-    if (!to_device && !pinned) return platform_->copy(dst, src, length);
+    if (!pinned && queues_.empty()) return platform_->copy(dst, src, length);
 
     CNcontext context = nullptr;
     CHECK_STATUS(driverStatus(cnGetMemAttribute(
         &context, CN_MEM_ATTRIBUTE_CONTEXT, reinterpret_cast<CNaddr>(device))));
     ContextGuard guard;
     CHECK_STATUS(guard.use(context));
-    if (to_device && (small_h2d || !pinned)) {
-        auto it = queues_.find(context);
-        if (it == queues_.end() || !it->second[1])
-            return platform_->copy(dst, src, length);
-        auto &queue = it->second[1];
+    auto &queue = queues_[context][to_device ? 1 : 0];
+    if (queue) {
+        auto previous = queue;
+        std::lock_guard<std::mutex> lock(previous->mutex);
+        if (!previous->error.ok()) {
+            auto ready = cnQueryQueue(previous->handle);
+            if (ready != CN_SUCCESS)
+                return ready == CN_ERROR_NOT_READY ? previous->error
+                                                   : driverStatus(ready);
+            // Retire the drained queue instead of appending new work to it.
+            // Failed tasks may still need to poll it or release their buffers.
+            queue.reset();
+        }
+    }
+    if (small_h2d || !pinned) {
+        if (!queue) return platform_->copy(dst, src, length);
         std::lock_guard<std::mutex> lock(queue->mutex);
-        CHECK_STATUS(queue->error);
         auto ready = cnQueryQueue(queue->handle);
         if (ready == CN_SUCCESS) return platform_->copy(dst, src, length);
         if (ready != CN_ERROR_NOT_READY) {
@@ -359,7 +369,6 @@ Status MluTransport::submitCopy(MluTask &task, bool to_device) {
         return Status::InvalidArgument(
             "MLU memory range exceeds its allocation");
     {
-        auto &queue = queues_[context][to_device ? 1 : 0];
         if (!queue) {
             auto created = std::make_shared<MluCopyQueue>();
             created->context = context;
