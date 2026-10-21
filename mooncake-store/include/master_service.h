@@ -687,6 +687,12 @@ class MasterService {
      */
     long RemoveAll(const TenantId& tenant_id, bool force = false);
 
+    // Update existing objects without transferring data. Results follow input
+    // order; batches are not atomic. A zero TTL clears the soft pin.
+    auto BatchUpdateSoftPin(const std::vector<std::string>& keys,
+                            const TenantId& tenant_id, uint64_t ttl_ms)
+        -> std::vector<tl::expected<void, ErrorCode>>;
+
     /**
      * @brief Batch remove objects and their replicas
      * @param keys The list of keys to remove.
