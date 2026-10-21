@@ -34,6 +34,7 @@ namespace {
 constexpr size_t kDefaultThreadPoolSize = 8U;
 constexpr size_t kBufferModeThreadPoolSize = 1U;
 constexpr size_t kMaxThreadPoolSize = 16U;
+constexpr size_t kMemcpyThreadPoolSize = 8U;
 }  // namespace
 
 size_t DefaultSliceDispatcher::resolveThreadPoolSize() const {
@@ -60,15 +61,15 @@ DefaultSliceDispatcher::DefaultSliceDispatcher(
     const std::vector<aclrtContext> &local_engine_contexts)
     : transfer_executor_(transfer_executor),
       thread_pool_(std::make_unique<AscendThreadPool>(resolveThreadPoolSize())),
+      memcpy_thread_pool_(std::make_unique<AscendThreadPool>(
+          kMemcpyThreadPoolSize, "mc-cpy-")),
       local_engine_contexts_(local_engine_contexts) {
-    if (thread_pool_->size() > 1) {
-        auto *pool = thread_pool_.get();
-        transfer_executor_->setLocalCopyTaskRunner(
-            [pool](std::function<void()> task) {
-                pool->enqueue(std::move(task));
-            },
-            thread_pool_->size());
-    }
+    auto *pool = memcpy_thread_pool_.get();
+    transfer_executor_->setLocalCopyTaskRunner(
+        [pool](std::function<void()> task) { pool->enqueue(std::move(task)); },
+        memcpy_thread_pool_->size());
+    LOG(INFO) << "Local memcpy batch thread pool size: "
+              << memcpy_thread_pool_->size();
 }
 
 void DefaultSliceDispatcher::enqueue(
@@ -110,9 +111,16 @@ void DefaultSliceDispatcher::enqueue(
 }
 
 void DefaultSliceDispatcher::stop() {
+    // Dispatcher workers may be inside a copy that waits for memcpy helpers.
+    // Join them before stopping the memcpy pool.
     if (thread_pool_) {
         thread_pool_->stop();
+    }
+    if (transfer_executor_) {
         transfer_executor_->setLocalCopyTaskRunner(nullptr, 1);
+    }
+    if (memcpy_thread_pool_) {
+        memcpy_thread_pool_->stop();
     }
 }
 

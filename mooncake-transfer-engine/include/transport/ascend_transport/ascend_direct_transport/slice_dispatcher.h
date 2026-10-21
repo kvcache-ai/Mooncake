@@ -48,6 +48,7 @@ class ISliceDispatcher {
  * Default dispatcher: groups by target_id, enqueues to shared thread pool.
  * Sets ACL context before invoking executor. Thread pool size is parsed from
  * ASCEND_THREAD_POOL_SIZE; when use_buffer_pool (single-thread only), uses 1.
+ * aclrtMemcpyBatch helpers use a separate pool of 8 threads.
  */
 class DefaultSliceDispatcher : public ISliceDispatcher {
    public:
@@ -62,6 +63,7 @@ class DefaultSliceDispatcher : public ISliceDispatcher {
 
     TransferExecutorBase *transfer_executor_;
     std::unique_ptr<AscendThreadPool> thread_pool_;
+    std::unique_ptr<AscendThreadPool> memcpy_thread_pool_;
     std::vector<aclrtContext> local_engine_contexts_;
 };
 
