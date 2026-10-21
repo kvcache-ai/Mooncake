@@ -4900,21 +4900,11 @@ tl::expected<MasterService::PartReadOutcome, ErrorCode> MasterService::ReadPart(
 }
 
 GetReplicaListResponse MasterService::MakeReadResponse(
-    PartReadOutcome&& outcome) const {
-    GetReplicaListResponse response(std::move(outcome.replicas),
-                                    default_kv_lease_ttl_, outcome.checksum);
-    response.part_count = outcome.part_count;
-    return response;
-}
-
-GetReplicaListResponse MasterService::MakeWholeObjectResponse(
-    const ObjectMetadata& metadata,
-    std::vector<Replica::Descriptor>&& replicas) const {
-    const ObjectPart* part = metadata.GetPart(0);
-    GetReplicaListResponse response(
-        std::move(replicas), default_kv_lease_ttl_,
-        part != nullptr ? part->checksum() : std::nullopt);
-    response.part_count = static_cast<uint32_t>(metadata.PartCount());
+    std::vector<Replica::Descriptor>&& replicas,
+    std::optional<uint64_t> checksum, uint32_t part_count) const {
+    GetReplicaListResponse response(std::move(replicas), default_kv_lease_ttl_,
+                                    checksum);
+    response.part_count = part_count;
     return response;
 }
 
@@ -5065,7 +5055,8 @@ auto MasterService::GetReplicaList(const std::string& key,
                 dynamic_replication_.WantsAnotherMemoryReplica(memory_replicas);
         }
 
-        resp = MakeReadResponse(std::move(*read));
+        resp = MakeReadResponse(std::move(read->replicas), read->checksum,
+                                read->part_count);
     }
     // RO accessor released. Safe to take a fresh RW accessor now.
     if (promotion_eligible) {
@@ -5106,7 +5097,10 @@ auto MasterService::GetReplicaListForAdmin(const std::string& key,
         return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
     }
 
-    return MakeWholeObjectResponse(metadata, std::move(replica_list));
+    const ObjectPart* part = metadata.GetPart(0);
+    return MakeReadResponse(std::move(replica_list),
+                            part != nullptr ? part->checksum() : std::nullopt,
+                            static_cast<uint32_t>(metadata.PartCount()));
 }
 
 std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
@@ -5288,7 +5282,9 @@ MasterService::BatchGetReplicaList(
                     }
                 }
 
-                results[original_idx] = MakeReadResponse(std::move(*read));
+                results[original_idx] =
+                    MakeReadResponse(std::move(read->replicas), read->checksum,
+                                     read->part_count);
             }
         }
 
@@ -5378,8 +5374,11 @@ MasterService::BatchGetReplicaListForAdmin(const std::vector<std::string>& keys,
                     continue;
                 }
 
-                results[original_idx] =
-                    MakeWholeObjectResponse(metadata, std::move(replica_list));
+                const ObjectPart* part = metadata.GetPart(0);
+                results[original_idx] = MakeReadResponse(
+                    std::move(replica_list),
+                    part != nullptr ? part->checksum() : std::nullopt,
+                    static_cast<uint32_t>(metadata.PartCount()));
             }
         }
     }
