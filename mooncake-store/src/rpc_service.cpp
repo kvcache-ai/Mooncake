@@ -140,13 +140,13 @@ tl::expected<std::vector<uint32_t>, ErrorCode> ResolvePartIndices(
 
 // The part each item of a batch read names, for the reads that leave the range
 // check to the object they land on. A caller that names none names no part at
-// all, which is the read of a whole object.
+// all, which is the read of a whole object and is passed on as an empty list.
 tl::expected<std::vector<std::optional<uint32_t>>, ErrorCode>
 ResolveOptionalPartIndices(
     const struct_pack::compatible<std::vector<uint32_t>>& part_indices,
     size_t item_count) {
     if (!part_indices.has_value()) {
-        return std::vector<std::optional<uint32_t>>(item_count, std::nullopt);
+        return std::vector<std::optional<uint32_t>>{};
     }
     if (part_indices->size() != item_count) {
         LOG(ERROR) << "part_indices=" << part_indices->size()

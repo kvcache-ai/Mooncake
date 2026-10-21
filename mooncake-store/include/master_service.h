@@ -1464,7 +1464,14 @@ class MasterService {
     // ledger to say so, so a caller with nothing to decide may ignore it.
     tl::expected<void, ErrorCode> SettlePrimaryWriteQuotaIfReady(
         TenantQuotaHandle quota_account, ObjectMetadata& metadata);
-    uint64_t CompletedMemoryQuotaCharge(const ObjectMetadata& metadata) const;
+    // What the object is charged for: every part charges its own length per
+    // completed memory replica it carries. `counts_as_completed` adds replicas
+    // a caller is about to drop, which still held their buffers when the charge
+    // was taken.
+    uint64_t CompletedMemoryQuotaCharge(
+        const ObjectMetadata& metadata,
+        const std::function<bool(const Replica&)>& counts_as_completed = {})
+        const;
     uint64_t RequestedMemoryQuotaCharge(uint64_t value_length,
                                         const ReplicateConfig& config) const;
     TenantState& GetOrCreateTenantState(MetadataShard& shard,
@@ -1627,24 +1634,42 @@ class MasterService {
     // One object's End, with the key held. The batch calls reach it for every
     // item that names the key they hold, so the parts of one object cost one
     // visit to its shard however many of them a batch carries.
-    // One object's End, with the key held. `was_readable` is the object's state
-    // before this End when the caller already knows it, and
-    // `resolve_completion` tells this End to read the state after it: a batch
-    // of Ends for one key reads that state once before its items and once after
-    // the last of them, instead of twice per item.
-    auto PutEndLocked(MetadataAccessorRW& accessor, const UUID& client_id,
-                      const ObjectMeta& object_meta, ReplicaType replica_type,
-                      uint32_t part_index,
-                      std::optional<std::vector<ReplicaID>> replica_ids,
-                      std::optional<bool> was_readable = std::nullopt,
-                      bool resolve_completion = true)
+    // One part of one object's End, with the key held: the replicas of that
+    // part become complete and the part's write closes. What the object answers
+    // as a whole is left to FinishEndLocked.
+    auto PutEndPartLocked(MetadataAccessorRW& accessor, const UUID& client_id,
+                          const ObjectMeta& object_meta,
+                          ReplicaType replica_type, uint32_t part_index,
+                          std::optional<std::vector<ReplicaID>> replica_ids)
         -> tl::expected<void, ErrorCode>;
 
-    // One object's Revoke, with the key held.
-    auto PutRevokeLocked(MetadataAccessorRW& accessor, const UUID& client_id,
-                         const std::string& key, ReplicaType replica_type,
-                         uint32_t part_index,
-                         std::optional<std::vector<ReplicaID>> replica_ids)
+    // The object-level work an End leaves behind, run once for the object
+    // instead of once per part: the quota settlement, the cache totals, the
+    // offload queue, the readability transition that publishes the stored event
+    // and grants the lease, and the durable record. `readable_before` and the
+    // medium snapshot are the answers to the same questions taken before the
+    // first End of the group changed anything.
+    auto FinishEndLocked(MetadataAccessorRW& accessor, ReplicaType replica_type,
+                         bool readable_before,
+                         const std::vector<std::string>& previous_kv_media)
+        -> tl::expected<void, ErrorCode>;
+
+    // One part of one object's Revoke, with the key held: the replicas that
+    // part's write handed out go. The answer says whether the object-level step
+    // is still owed, which the durable path settles in its finalize callback.
+    auto PutRevokePartLocked(MetadataAccessorRW& accessor,
+                             const UUID& client_id, const std::string& key,
+                             ReplicaType replica_type, uint32_t part_index,
+                             std::optional<std::vector<ReplicaID>> replica_ids)
+        -> tl::expected<bool, ErrorCode>;
+
+    // The object-level work a Revoke leaves behind, run once for the object:
+    // the object goes when the revoked replicas were the last usable ones, and
+    // the medium change and the tenant settlement follow what is left.
+    // `charge_before` is the group's committed bytes before it revoked.
+    auto FinishRevokeLocked(MetadataAccessorRW& accessor,
+                            const std::vector<std::string>& previous_kv_media,
+                            uint64_t charge_before)
         -> tl::expected<void, ErrorCode>;
 
     // Hand part `part_index` the content produced by one write: take the
@@ -2560,6 +2585,13 @@ class MasterService {
         const ObjectMetadata& metadata, std::optional<uint32_t> part_index,
         std::optional<bool> object_readable = std::nullopt) const;
     GetReplicaListResponse MakeReadResponse(PartReadOutcome&& outcome) const;
+    // The answer a surface that shows an object whole gives: every readable
+    // replica of it, the checksum of its content, and the part count a read of
+    // the same object reports. Such a surface refuses an object of several
+    // parts before it gets here, so the part it reads is the object's only one.
+    GetReplicaListResponse MakeWholeObjectResponse(
+        const ObjectMetadata& metadata,
+        std::vector<Replica::Descriptor>&& replicas) const;
     bool IsEvictableMemoryReplica(const Replica& replica) const;
 
     // Whether this surface meets an object it has no form for. The surfaces
