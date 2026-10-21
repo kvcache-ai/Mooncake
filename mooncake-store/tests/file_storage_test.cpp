@@ -532,6 +532,15 @@ class FileStorageTest : public ::testing::Test {
         return fileStorage.draining_.load();
     }
 
+    static void InjectDiskError(FileStorage& fileStorage, int err,
+                                const char* op) {
+        fileStorage.OnDiskError(err, op);
+    }
+
+    static bool IsDiskFenced(FileStorage& fileStorage) {
+        return fileStorage.disk_fenced_.load();
+    }
+
     static tl::expected<void, ErrorCode> InitStorageBackend(
         FileStorage& fileStorage) {
         return fileStorage.storage_backend_->Init();
@@ -2107,9 +2116,9 @@ TEST_F(FileStorageTest, DiskFenceQueuedCheckReleasesTheCheckingSlot) {
     EXPECT_FALSE(FailDuringFilesystemCheck(file_storage, "preadv", "pwritev",
                                            {0, 0}, synced));
     EXPECT_EQ(synced, (std::vector<bool>{false, true}));
-    file_storage.OnDiskError(EIO, "read");
+    InjectDiskError(file_storage, EIO, "read");
     EXPECT_EQ(synced, (std::vector<bool>{false, true, false}));
-    EXPECT_FALSE(file_storage.disk_fenced_.load());
+    EXPECT_FALSE(IsDiskFenced(file_storage));
 }
 
 // A drain whose unmount RPC fails keeps its latch: the heartbeat must
