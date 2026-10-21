@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include <gtest/gtest.h>
+#include <atomic>
 
 #include <cstdlib>
 #include <cstring>
@@ -27,7 +28,35 @@
 #include "tent/runtime/transport.h"
 #include "tent/runtime/proxy_manager.h"
 
+#if defined(__linux__)
+namespace {
+std::atomic<bool> fail_next_segment_sync{false};
+}
+extern "C" mooncake::tent::Status
+__real__ZN8mooncake4tent14SegmentManager16synchronizeLocalEv(
+    mooncake::tent::SegmentManager* manager);
+extern "C" mooncake::tent::Status
+__wrap__ZN8mooncake4tent14SegmentManager16synchronizeLocalEv(
+    mooncake::tent::SegmentManager* manager) {
+    if (fail_next_segment_sync.exchange(false))
+        return mooncake::tent::Status::MetadataError(
+            "injected registry write failure");
+    return __real__ZN8mooncake4tent14SegmentManager16synchronizeLocalEv(
+        manager);
+}
+
+#endif
+
 namespace mooncake {
+class TransferEngineImplTestPeer {
+   public:
+    static std::vector<tent::BufferDesc> localBuffers(
+        tent::TransferEngineImpl& engine) {
+        const auto local = engine.metadata_->segmentManager().getLocal();
+        return std::get<tent::MemorySegmentDesc>(local->detail).buffers;
+    }
+};
+
 namespace tent {
 namespace {
 
@@ -78,13 +107,14 @@ class FailOnceRemoveTransport : public Transport {
         return Status::OK();
     }
     Status freeLocalMemory(void* addr, size_t) override {
+        ++free_calls;
         std::free(addr);
         return Status::OK();
     }
     const char* getName() const override { return "fail-once-remove"; }
     TransportType type;
     bool fail;
-    int remove_calls = 0, allocate_calls = 0;
+    int remove_calls = 0, allocate_calls = 0, free_calls = 0;
 };
 
 std::shared_ptr<Config> makeConfig() {
@@ -312,6 +342,75 @@ TEST(LocalMemoryLifecycle, InternalHostAllocationDoesNotImplicitlySelectMlu) {
     EXPECT_EQ(mlu->allocate_calls, 1);
     EXPECT_TRUE(engine.freeLocalMemory(address).ok());
 }
+
+#if defined(__linux__)
+TEST(LocalMemoryLifecycle,
+     StageMetadataFailureDoesNotLeaveFreedRegisteredBuffer) {
+    for (bool with_mlu : {false, true}) {
+        SCOPED_TRACE(with_mlu);
+        TransferEngineImpl engine(makeConfig());
+        ASSERT_TRUE(engine.available());
+        auto tcp = std::make_shared<FailOnceRemoveTransport>(TCP);
+        auto mlu = std::make_shared<FailOnceRemoveTransport>(MLU);
+        engine.swapTransportForTest(TCP, tcp);
+        if (with_mlu) engine.swapTransportForTest(MLU, mlu);
+        ProxyManager proxy(&engine, 4096, 2);
+        fail_next_segment_sync = true;
+        uint64_t address = 0;
+        const auto status = proxy.pinStageBuffer("cpu:0", address);
+        EXPECT_TRUE(status.IsMetadataError()) << status;
+        EXPECT_FALSE(fail_next_segment_sync.load());
+        EXPECT_EQ((with_mlu ? mlu : tcp)->free_calls, 1);
+        SegmentInfo info;
+        ASSERT_TRUE(engine.getSegmentInfo(LOCAL_SEGMENT_ID, info).ok());
+        EXPECT_TRUE(info.buffers.empty());
+        // Internal staging registrations are hidden from getSegmentInfo().
+        const auto buffers = TransferEngineImplTestPeer::localBuffers(engine);
+        EXPECT_TRUE(buffers.empty())
+            << "Registration survives after its stage allocation was freed";
+        // Clean up the stale test registration without touching freed memory.
+        for (const auto& buffer : buffers)
+            EXPECT_TRUE(
+                engine
+                    .unregisterLocalMemory(reinterpret_cast<void*>(buffer.addr),
+                                           buffer.length)
+                    .ok());
+    }
+}
+
+TEST(LocalMemoryLifecycle, StageMetadataFailureRetainsMemoryIfRollbackFails) {
+    TransferEngineImpl engine(makeConfig());
+    ASSERT_TRUE(engine.available());
+    auto tcp = std::make_shared<FailOnceRemoveTransport>(TCP, true);
+    auto mlu = std::make_shared<FailOnceRemoveTransport>(MLU);
+    engine.swapTransportForTest(TCP, tcp);
+    engine.swapTransportForTest(MLU, mlu);
+    ProxyManager proxy(&engine, 4096, 2);
+    fail_next_segment_sync = true;
+    uint64_t address = 0;
+    EXPECT_TRUE(proxy.pinStageBuffer("cpu:0", address).IsMetadataError());
+    EXPECT_EQ(mlu->free_calls, 0);
+    EXPECT_EQ(tcp->remove_calls, 1);
+    EXPECT_EQ(mlu->remove_calls, 1);
+    SegmentInfo info;
+    ASSERT_TRUE(engine.getSegmentInfo(LOCAL_SEGMENT_ID, info).ok());
+    EXPECT_TRUE(info.buffers.empty());
+    const auto buffers = TransferEngineImplTestPeer::localBuffers(engine);
+    ASSERT_EQ(buffers.size(), 1u);
+    EXPECT_TRUE(buffers.front().internal);
+    void* retained = reinterpret_cast<void*>(buffers.front().addr);
+    // A failed rollback remains owned by the engine and can be retried safely.
+    EXPECT_TRUE(engine.unregisterLocalMemory(retained).ok());
+    EXPECT_EQ(tcp->remove_calls, 2);
+    EXPECT_EQ(mlu->remove_calls, 1);
+    EXPECT_TRUE(engine.freeLocalMemory(retained).ok());
+    EXPECT_EQ(mlu->free_calls, 1);
+    EXPECT_TRUE(engine.getSegmentInfo(LOCAL_SEGMENT_ID, info).ok());
+    EXPECT_TRUE(info.buffers.empty());
+    EXPECT_TRUE(TransferEngineImplTestPeer::localBuffers(engine).empty());
+}
+
+#endif
 
 TEST(LocalMemoryLifecycle, StagePoolSelectsAllocatorFromLocalTransports) {
     for (bool with_mlu : {false, true}) {

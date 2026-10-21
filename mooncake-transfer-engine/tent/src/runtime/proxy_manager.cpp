@@ -932,6 +932,15 @@ Status ProxyManager::allocateStageBuffers(const std::string& location) {
     auto registered =
         impl_->registerLocalMemory({buf.chunks}, {total_size}, options);
     if (!registered.ok()) {
+        // Registration may have succeeded locally before metadata publication
+        // failed. Keep the allocation alive if its registrations cannot drain.
+        auto removed = impl_->unregisterLocalMemory(buf.chunks, total_size);
+        if (!removed.ok()) {
+            LOG(WARNING) << "Retaining failed staging allocation " << buf.chunks
+                         << " because registration rollback failed: "
+                         << removed;
+            return registered;
+        }
         impl_->freeLocalMemory(buf.chunks);
         return registered;
     }
