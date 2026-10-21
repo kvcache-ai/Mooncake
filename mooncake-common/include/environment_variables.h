@@ -235,6 +235,11 @@ struct TransferSubmitterEnvironmentVariables {
     MC_DEFINE_ENV_VAR(std::string, MC_STORE_MEMCPY);
 };
 
+struct TransferTimeoutEnvironmentVariables {
+    // Preserve the raw value in invalid-value warnings.
+    MC_DEFINE_ENV_VAR(std::string, MC_STORE_TRANSFER_TIMEOUT_S);
+};
+
 struct FilereadWorkerPoolEnvironmentVariables {
     // Preserve the raw value in invalid-value warnings.
     MC_DEFINE_ENV_VAR(std::string, MC_FILEREAD_WORKERS);

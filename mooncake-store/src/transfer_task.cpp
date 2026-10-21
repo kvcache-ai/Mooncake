@@ -922,8 +922,11 @@ void TransferEngineOperationState::wait_for_completion() {
         return;
     }
 
-    // 60 seconds
-    constexpr int64_t timeout_milliseconds = 60 * 1000;
+    // Defaults to 60 seconds; override with MC_STORE_TRANSFER_TIMEOUT_S.
+    static const int64_t timeout_milliseconds =
+        static_cast<int64_t>(
+            TransferTimeoutConfig::FromEnvironment().timeout_seconds) *
+        1000;
 
 #ifdef USE_EVENT_DRIVEN_COMPLETION
     // TENT batches do not use the classic transport BatchDesc layout.

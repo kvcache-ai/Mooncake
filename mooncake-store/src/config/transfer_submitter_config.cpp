@@ -7,6 +7,7 @@
 
 #include "bool_parser.h"
 #include "environ.h"
+#include "environment_value_parser.h"
 #include "environment_variables.h"
 
 namespace mooncake {
@@ -29,6 +30,24 @@ TransferSubmitterConfig TransferSubmitterConfig::FromEnvironment() {
         LOG(WARNING) << "Invalid value for MC_STORE_MEMCPY: " << *value
                      << ", defaulting to enabled";
         config.memcpy_enabled_override = true;
+    }
+    return config;
+}
+
+TransferTimeoutConfig TransferTimeoutConfig::FromEnvironment() {
+    TransferTimeoutConfig config;
+    const auto raw = Environ::Read(
+        TransferTimeoutEnvironmentVariables::MC_STORE_TRANSFER_TIMEOUT_S);
+    if (!raw || raw->empty()) {
+        return config;
+    }
+
+    const auto value = TryParseEnvironmentValue<int>(*raw);
+    if (value && *value > 0) {
+        config.timeout_seconds = *value;
+    } else {
+        LOG(WARNING) << "Invalid value for MC_STORE_TRANSFER_TIMEOUT_S: "
+                     << *raw << ", using default " << config.timeout_seconds;
     }
     return config;
 }
