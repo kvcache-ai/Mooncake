@@ -1,7 +1,8 @@
 #pragma once
 
 #include "client_service.h"
-#include "centralized_master_client.h"
+#include "ha_helper.h"
+#include "master_client.h"
 #include "storage_backend.h"
 #include "file_storage.h"
 #include "transfer_task.h"
@@ -130,6 +131,16 @@ class CentralizedClientService
     std::vector<tl::expected<bool, ErrorCode>> BatchIsExist(
         const std::vector<std::string>& keys) override;
 
+    tl::expected<
+        std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>,
+        ErrorCode>
+    BatchQueryIp(const std::vector<UUID>& client_ids) override;
+
+    tl::expected<
+        std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
+        ErrorCode>
+    QueryByRegex(const std::string& regex) override;
+
     DeploymentMode deployment_mode() const override {
         return DeploymentMode::CENTRALIZATION;
     }
@@ -233,8 +244,8 @@ class CentralizedClientService
         const std::vector<std::string>& keys,
         const std::vector<StorageObjectMetadata>& metadatas);
 
-    tl::expected<RegisterClientResponse, ErrorCode> InnerRegisterClient()
-        override REQUIRES(registration_mutex_);
+    tl::expected<ViewVersionId, ErrorCode> InnerRegisterClient() override
+        REQUIRES(registration_mutex_);
 
     tl::expected<BatchGetOffloadObjectResponse, ErrorCode>
     BatchGetOffloadObjectFromStorage(const std::vector<std::string>& keys,
@@ -290,14 +301,22 @@ class CentralizedClientService
     tl::expected<void, ErrorCode> MarkTaskToComplete(
         const TaskCompleteRequest& task_complete) override;
 
-   protected:
-    HeartbeatRequest build_heartbeat_request() override;
+    tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>
+    CalcCacheStats() override;
 
-    MasterClient& GetMasterClient() override { return master_client_; }
+   protected:
+    void StartPing(const std::string& master_server_entry);
+    void PingThreadMain(bool is_ha_mode, std::string current_master_address);
 
     ClientMetric* GetMetrics() override { return metrics_.get(); }
 
    private:
+    bool IsHAMode(const std::string& master_server_entry) const;
+    ErrorCode ResolveMasterAddress(std::string& master_address);
+    ErrorCode ConnectToMaster(const std::string& master_server_entry);
+    bool ReconnectToMaster(bool is_ha_mode,
+                           std::string& current_master_address);
+
     void InitTransferSubmitter();
 
     std::vector<tl::expected<void, ErrorCode>> BatchGetWhenPreferSameNode(
@@ -387,7 +406,8 @@ class CentralizedClientService
     std::vector<std::unique_ptr<void, HugepageSegmentDeleter>>
         hugepage_segment_ptrs_;
 
-    CentralizedMasterClient master_client_;
+    MasterClient master_client_;
+    MasterViewHelper master_view_helper_;
     std::unique_ptr<TransferSubmitter> transfer_submitter_;
 
     // Mutex to protect mounted_segments_

@@ -161,7 +161,7 @@ class Replay {
                            " tier=" + std::to_string(RankOf(tier_id)));
             return {};
         };
-        callbacks.segment_sync = [](const Segment&,
+        callbacks.segment_sync = [](const P2PSegment&,
                                     bool) -> tl::expected<void, ErrorCode> {
             return {};
         };

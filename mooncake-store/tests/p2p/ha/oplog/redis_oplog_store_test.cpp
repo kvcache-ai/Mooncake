@@ -45,9 +45,9 @@ TEST(RedisOpLogStoreStandaloneTest, EndpointRequiresExplicitPort) {
     }
 }
 
-TEST(RedisOpLogStoreStandaloneTest, OnlyAddReplicaIsBestEffort) {
-    EXPECT_TRUE(IsBestEffortP2POpLog(OpType_ADD_REPLICA));
-    EXPECT_FALSE(IsBestEffortP2POpLog(OpType_REMOVE_REPLICA));
+TEST(RedisOpLogStoreStandaloneTest, OnlyPublishRouteIsBestEffort) {
+    EXPECT_TRUE(IsBestEffortP2POpLog(OpType_PUBLISH_ROUTE));
+    EXPECT_FALSE(IsBestEffortP2POpLog(OpType_WITHDRAW_ROUTE));
     EXPECT_FALSE(IsBestEffortP2POpLog(OpType_MOUNT_SEGMENT));
     EXPECT_FALSE(IsBestEffortP2POpLog(OpType_UNMOUNT_SEGMENT));
     EXPECT_FALSE(IsBestEffortP2POpLog(OpType_REGISTER_CLIENT));
@@ -513,6 +513,51 @@ TEST_F(RedisOpLogStoreTest, MasterRegistryHeartbeatUpdatesAndUnregisters) {
     EXPECT_TRUE(masters.empty());
 }
 
+TEST_F(RedisOpLogStoreTest, ClearingProvidersWaitsForInflightCallback) {
+    auto registry = std::make_unique<RedisMasterRegistry>(
+        cluster_id_, redis_endpoint_, redis_username_, redis_password_, 0);
+    RedisMasterRegistryHeartbeat heartbeat(
+        std::move(registry),
+        RedisMasterRegistryEntry{"provider-instance", "127.0.0.1:51051",
+                                 "127.0.0.1:53051", "starting", false},
+        std::chrono::seconds(10));
+    ASSERT_EQ(heartbeat.Start(), ErrorCode::OK);
+
+    std::atomic<bool> provider_entered{false};
+    std::atomic<bool> release_provider{false};
+    std::atomic<bool> providers_cleared{false};
+    heartbeat.SetStandbyProviders(
+        [&] {
+            provider_entered.store(true, std::memory_order_release);
+            while (!release_provider.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            return uint64_t{42};
+        },
+        [] { return true; });
+    heartbeat.UpdateRole("standby", false);
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!provider_entered.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    ASSERT_TRUE(provider_entered.load(std::memory_order_acquire));
+
+    std::thread clear_thread([&] {
+        heartbeat.ClearStandbyProviders();
+        providers_cleared.store(true, std::memory_order_release);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    EXPECT_FALSE(providers_cleared.load(std::memory_order_acquire));
+
+    release_provider.store(true, std::memory_order_release);
+    clear_thread.join();
+    EXPECT_TRUE(providers_cleared.load(std::memory_order_acquire));
+    heartbeat.Stop();
+}
+
 TEST_F(RedisOpLogStoreTest, SnapshotSequenceRoundTrip) {
     auto writer = CreateWriter();
     ASSERT_EQ(ErrorCode::OK, writer->RecordSnapshotSequenceId("snap-a", 42));
@@ -543,14 +588,14 @@ TEST_F(RedisOpLogStoreTest, RejectsInvalidDatabaseIndex) {
 }
 
 TEST_F(RedisOpLogStoreTest, MasterServiceUsesRedisEndpointForRedisOpLog) {
-    MasterServiceConfig config;
-    config.enable_oplog = true;
-    config.oplog_store_type = "redis";
+    P2PMasterConfig config;
+    config.oplog.enabled = true;
+    config.oplog.store_type = "redis";
     config.cluster_id = cluster_id_;
-    config.redis_endpoint = redis_endpoint_;
-    config.redis_username = redis_username_;
-    config.redis_password = redis_password_;
-    config.oplog_data_dir = "127.0.0.1:notaport";
+    config.redis.endpoint = redis_endpoint_;
+    config.redis.username = redis_username_;
+    config.redis.password = redis_password_;
+    config.oplog.data_dir = "127.0.0.1:notaport";
 
     EXPECT_NO_THROW({ P2PMasterService service(config); });
 }

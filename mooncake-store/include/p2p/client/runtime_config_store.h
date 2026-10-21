@@ -7,9 +7,9 @@
 #include <string>
 #include <variant>
 
-#include "p2p/master/p2p_rpc_types.h"
+#include "p2p/common/p2p_rpc_types.h"
+#include "p2p/common/p2p_types.h"
 #include "replica.h"
-#include "rpc_types.h"
 #include "types.h"
 
 namespace mooncake {

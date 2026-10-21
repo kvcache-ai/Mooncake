@@ -16,30 +16,32 @@
 
 namespace mooncake {
 
-static const uint64_t kMetricReportIntervalSeconds = 10;
+extern const uint64_t kMetricReportIntervalSeconds;
 
 class WrappedMasterService {
    public:
     WrappedMasterService(const WrappedMasterServiceConfig& config);
 
-    virtual ~WrappedMasterService();
+    ~WrappedMasterService();
 
-    void init();
+    void init_http_server();
 
-    uint16_t GetHttpPort() const { return http_server_.port(); }
-
-    tl::expected<bool, ErrorCode> ExistKey(std::string_view key);
+    tl::expected<bool, ErrorCode> ExistKey(const std::string& key);
 
     tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>
     CalcCacheStats();
 
     std::vector<tl::expected<bool, ErrorCode>> BatchExistKey(
-        const std::vector<std::string_view>& keys);
+        const std::vector<std::string>& keys);
 
     tl::expected<
         std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>,
         ErrorCode>
     BatchQueryIp(const std::vector<UUID>& client_ids);
+
+    tl::expected<std::vector<std::string>, ErrorCode> BatchReplicaClear(
+        const std::vector<std::string>& object_keys, const UUID& client_id,
+        const std::string& segment_name);
 
     tl::expected<
         std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
@@ -47,71 +49,112 @@ class WrappedMasterService {
     GetReplicaListByRegex(const std::string& str);
 
     tl::expected<GetReplicaListResponse, ErrorCode> GetReplicaList(
-        std::string_view key, const GetReplicaListRequestConfig& config =
-                                  GetReplicaListRequestConfig());
+        const std::string& key);
 
     std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
-    BatchGetReplicaList(const std::vector<std::string_view>& keys,
-                        const GetReplicaListRequestConfig& config =
-                            GetReplicaListRequestConfig());
+    BatchGetReplicaList(const std::vector<std::string>& keys);
 
-    tl::expected<void, ErrorCode> Remove(std::string_view key,
+    tl::expected<std::vector<Replica::Descriptor>, ErrorCode> PutStart(
+        const UUID& client_id, const std::string& key,
+        const uint64_t slice_length, const ReplicateConfig& config);
+
+    tl::expected<void, ErrorCode> PutEnd(const UUID& client_id,
+                                         const std::string& key,
+                                         ReplicaType replica_type);
+
+    tl::expected<void, ErrorCode> PutRevoke(const UUID& client_id,
+                                            const std::string& key,
+                                            ReplicaType replica_type);
+
+    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+    BatchPutStart(const UUID& client_id, const std::vector<std::string>& keys,
+                  const std::vector<uint64_t>& slice_lengths,
+                  const ReplicateConfig& config);
+
+    std::vector<tl::expected<void, ErrorCode>> BatchPutEnd(
+        const UUID& client_id, const std::vector<std::string>& keys);
+
+    std::vector<tl::expected<void, ErrorCode>> BatchPutRevoke(
+        const UUID& client_id, const std::vector<std::string>& keys);
+
+    tl::expected<void, ErrorCode> Remove(const std::string& key,
                                          bool force = false);
 
-    tl::expected<long, ErrorCode> RemoveByRegex(std::string_view str,
+    tl::expected<long, ErrorCode> RemoveByRegex(const std::string& str,
                                                 bool force = false);
 
     long RemoveAll(bool force = false);
 
-    tl::expected<void, ErrorCode> UnmountSegment(const UUID& segment_id,
-                                                 const UUID& client_id);
-
     tl::expected<void, ErrorCode> MountSegment(const Segment& segment,
                                                const UUID& client_id);
 
-    tl::expected<HeartbeatResponse, ErrorCode> Heartbeat(
-        const HeartbeatRequest& req);
+    tl::expected<void, ErrorCode> ReMountSegment(
+        const std::vector<Segment>& segments, const UUID& client_id);
 
-    tl::expected<QueryClientStatusResponse, ErrorCode> QueryClientStatus(
-        const QueryClientStatusRequest& req);
+    tl::expected<void, ErrorCode> UnmountSegment(const UUID& segment_id,
+                                                 const UUID& client_id);
 
-    tl::expected<RegisterClientResponse, ErrorCode> RegisterClient(
-        const RegisterClientRequest& req);
+    tl::expected<std::string, ErrorCode> GetFsdir();
 
-    tl::expected<UnregisterClientResponse, ErrorCode> UnregisterClient(
-        const UnregisterClientRequest& req);
+    tl::expected<GetStorageConfigResponse, ErrorCode> GetStorageConfig();
+
+    tl::expected<PingResponse, ErrorCode> Ping(const UUID& client_id);
 
     tl::expected<std::string, ErrorCode> ServiceReady();
 
-    // Reports the master's heartbeat routing (dedicated port vs legacy main
-    // server) so clients can detect a heartbeat-port mismatch at Connect time.
-    tl::expected<HeartbeatServiceReadyResponse, ErrorCode>
-    HeartbeatServiceReady();
+    tl::expected<void, ErrorCode> MountLocalDiskSegment(const UUID& client_id,
+                                                        bool enable_offloading);
 
-   protected:
-    void init_http_server();
-    virtual MasterService& GetMasterService() = 0;
+    tl::expected<std::unordered_map<std::string, int64_t>, ErrorCode>
+    OffloadObjectHeartbeat(const UUID& client_id, bool enable_offloading);
 
-    virtual void init_http_handlers() = 0;
+    tl::expected<void, ErrorCode> NotifyOffloadSuccess(
+        const UUID& client_id, const std::vector<std::string>& keys,
+        const std::vector<StorageObjectMetadata>& metadatas);
+    tl::expected<UUID, ErrorCode> CreateCopyTask(
+        const std::string& key, const std::vector<std::string>& targets);
 
-   protected:
+    tl::expected<UUID, ErrorCode> CreateMoveTask(const std::string& key,
+                                                 const std::string& source,
+                                                 const std::string& target);
+
+    tl::expected<QueryTaskResponse, ErrorCode> QueryTask(const UUID& task_id);
+
+    tl::expected<std::vector<TaskAssignment>, ErrorCode> FetchTasks(
+        const UUID& client_id, size_t batch_size);
+
+    tl::expected<void, ErrorCode> MarkTaskToComplete(
+        const UUID& client_id, const TaskCompleteRequest& request);
+
+    tl::expected<CopyStartResponse, ErrorCode> CopyStart(
+        const UUID& client_id, const std::string& key,
+        const std::string& src_segment,
+        const std::vector<std::string>& tgt_segments);
+
+    tl::expected<void, ErrorCode> CopyEnd(const UUID& client_id,
+                                          const std::string& key);
+
+    tl::expected<void, ErrorCode> CopyRevoke(const UUID& client_id,
+                                             const std::string& key);
+
+    tl::expected<MoveStartResponse, ErrorCode> MoveStart(
+        const UUID& client_id, const std::string& key,
+        const std::string& src_segment, const std::string& tgt_segment);
+
+    tl::expected<void, ErrorCode> MoveEnd(const UUID& client_id,
+                                          const std::string& key);
+
+    tl::expected<void, ErrorCode> MoveRevoke(const UUID& client_id,
+                                             const std::string& key);
+
+   private:
+    MasterService master_service_;
     std::thread metric_report_thread_;
     coro_http::coro_http_server http_server_;
     std::atomic<bool> metric_report_running_;
-    // Dedicated heartbeat RPC server port configured on this master
-    // (0 = legacy: Heartbeat served on the main server).
-    uint32_t heartbeat_rpc_port_ = 0;
 };
 
 void RegisterRpcService(coro_rpc::coro_rpc_server& server,
-                        mooncake::WrappedMasterService& wrapped_master_service,
-                        bool include_heartbeat = true);
-
-// Registers only the Heartbeat handler on a dedicated heartbeat server. Used
-// by the priority-scheduling path to serve heartbeats on a separate
-// coro_rpc_server so heavy RPCs cannot head-of-line-block them.
-void RegisterHeartbeatRpcService(
-    coro_rpc::coro_rpc_server& server,
-    mooncake::WrappedMasterService& wrapped_master_service);
+                        mooncake::WrappedMasterService& wrapped_master_service);
 
 }  // namespace mooncake

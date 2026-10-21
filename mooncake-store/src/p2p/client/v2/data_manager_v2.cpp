@@ -1830,7 +1830,7 @@ void DataManagerV2::Destroy() {
         // alive through the shared pool state until that reader is done.
         auto detached = tiler->DrainAll();
         if (metadata_callbacks_.segment_sync) {
-            Segment segment;
+            P2PSegment segment;
             const TierView view = tiler->GetView();
             segment.id = view.id;
             segment.name = view.GetName();

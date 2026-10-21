@@ -16,85 +16,9 @@
 #include "types.h"
 #include "p2p/client/p2p_client_service.h"
 #include "centralized_client_service.h"
-#ifdef STORE_USE_REDIS
-#include "p2p/ha/redis_master_view_helper.h"
-#endif
 #include <ylt/coro_http/coro_http_client.hpp>
 
 namespace mooncake {
-
-namespace {
-
-constexpr const char* kEtcdPrefix = "etcd://";
-constexpr const char* kRedisPrefix = "redis://";
-
-bool StartsWith(const std::string& value, const char* prefix) {
-    return value.find(prefix) == 0;
-}
-
-tl::expected<std::unique_ptr<MasterViewHelper>, ErrorCode>
-CreateClientMasterViewHelper(const std::string& master_server_entry,
-                             const ClientMasterDiscoveryConfig& config) {
-    if (StartsWith(master_server_entry, kEtcdPrefix)) {
-        auto helper = std::make_unique<MasterViewHelper>();
-        std::string etcd_entry =
-            master_server_entry.substr(strlen(kEtcdPrefix));
-        auto err = helper->ConnectToEtcd(etcd_entry);
-        if (err != ErrorCode::OK) {
-            LOG(ERROR) << "Failed to connect to etcd";
-            return tl::make_unexpected(err);
-        }
-        return helper;
-    }
-
-    if (StartsWith(master_server_entry, kRedisPrefix)) {
-        if (config.redis_db_index < 0) {
-            LOG(ERROR) << "Invalid Redis DB index: " << config.redis_db_index;
-            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-        }
-        if (config.redis_master_view_ttl_sec <= 0) {
-            LOG(ERROR) << "Invalid Redis master view TTL seconds: "
-                       << config.redis_master_view_ttl_sec;
-            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-        }
-        if (config.redis_heartbeat_interval_sec <= 0) {
-            LOG(ERROR) << "Invalid Redis heartbeat interval seconds: "
-                       << config.redis_heartbeat_interval_sec;
-            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-        }
-        if (config.redis_heartbeat_interval_sec >=
-            config.redis_master_view_ttl_sec) {
-            LOG(ERROR) << "Redis heartbeat interval must be smaller than "
-                          "master view TTL"
-                       << ", heartbeat_interval_sec="
-                       << config.redis_heartbeat_interval_sec
-                       << ", ttl_sec=" << config.redis_master_view_ttl_sec;
-            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-        }
-#ifdef STORE_USE_REDIS
-        std::string redis_entry =
-            master_server_entry.substr(strlen(kRedisPrefix));
-        auto helper = std::make_unique<RedisMasterViewHelper>(
-            config.redis_cluster_id, redis_entry, config.redis_password,
-            config.redis_db_index, config.redis_master_view_ttl_sec,
-            config.redis_heartbeat_interval_sec, config.redis_username);
-        auto err = helper->Connect();
-        if (err != ErrorCode::OK) {
-            LOG(ERROR) << "Failed to connect to Redis at: " << redis_entry;
-            return tl::make_unexpected(err);
-        }
-        return helper;
-#else
-        LOG(ERROR) << "Redis election backend requested but STORE_USE_REDIS "
-                      "is not enabled at compile time";
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-#endif
-    }
-
-    return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-}
-
-}  // namespace
 
 void ClientService::initTeEndpoint() {
     // For P2PHANDSHAKE the TE picks a random port and updates
@@ -214,90 +138,7 @@ void ClientService::InnerStopHeartbeat() {
 
 void ClientService::Destroy() {}
 
-bool ClientService::IsHAMode(const std::string& master_server_entry) const {
-    return StartsWith(master_server_entry, kEtcdPrefix) ||
-           StartsWith(master_server_entry, kRedisPrefix);
-}
-
-void ClientService::SetMasterDiscoveryConfig(
-    const RealClientConfigBase& config) {
-    master_view_helper_.reset();
-    master_view_helper_entry_.clear();
-    master_discovery_config_.redis_cluster_id = config.redis_cluster_id.empty()
-                                                    ? DEFAULT_CLUSTER_ID
-                                                    : config.redis_cluster_id;
-    master_discovery_config_.redis_username = config.redis_username;
-    master_discovery_config_.redis_password = config.redis_password;
-    master_discovery_config_.redis_db_index = config.redis_db_index;
-    master_discovery_config_.redis_master_view_ttl_sec =
-        config.redis_master_view_ttl_sec;
-    master_discovery_config_.redis_heartbeat_interval_sec =
-        config.redis_heartbeat_interval_sec;
-}
-
-ErrorCode ClientService::ResolveMasterAddress(
-    const std::string& master_server_entry, std::string& master_address) {
-    if (!master_view_helper_ ||
-        master_view_helper_entry_ != master_server_entry) {
-        auto helper = CreateClientMasterViewHelper(master_server_entry,
-                                                   master_discovery_config_);
-        if (!helper) {
-            LOG(ERROR) << "Failed to create master view helper for "
-                       << master_server_entry << ": "
-                       << toString(helper.error());
-            return helper.error();
-        }
-        master_view_helper_ = std::move(helper.value());
-        master_view_helper_entry_ = master_server_entry;
-    }
-
-    ViewVersionId version = 0;
-    auto err = master_view_helper_->GetMasterView(master_address, version);
-    if (err != ErrorCode::OK) {
-        LOG(ERROR) << "Failed to resolve master address from "
-                   << master_server_entry << ": " << toString(err);
-        master_view_helper_.reset();
-        master_view_helper_entry_.clear();
-    }
-    return err;
-}
-
-void ClientService::StartHeartbeat(const std::string& master_server_entry) {
-    if (heartbeat_running_) {
-        LOG(WARNING) << "Heartbeat thread already running, skip starting";
-        return;
-    }
-
-    bool is_ha_mode = IsHAMode(master_server_entry);
-    std::string current_master_address;
-
-    if (is_ha_mode) {
-        // For HA mode, try to resolve the actual master address.
-        // If unavailable, start heartbeat thread anyway - it will
-        // retry and recover when the election backend/master becomes
-        // available.
-        auto err =
-            ResolveMasterAddress(master_server_entry, current_master_address);
-        if (err != ErrorCode::OK) {
-            LOG(WARNING) << "Failed to get master address from HA backend, "
-                         << "starting heartbeat thread in degraded mode "
-                         << "(will retry): " << err;
-            // Don't return - Let heartbeat thread handle reconnection
-        }
-    } else {
-        current_master_address = master_server_entry;
-    }
-
-    heartbeat_running_ = true;
-    heartbeat_thread_ = std::thread([this, is_ha_mode, current_master_address,
-                                     master_server_entry]() mutable {
-        this->HeartbeatThreadMain(is_ha_mode, std::move(current_master_address),
-                                  master_server_entry);
-    });
-}
-
-tl::expected<RegisterClientResponse, ErrorCode>
-ClientService::RegisterClient() {
+tl::expected<ViewVersionId, ErrorCode> ClientService::RegisterClient() {
     MutexLocker lk(&registration_mutex_);
     InflightTracker::Guard guard = AcquireInflightGuard();
     if (!guard.is_valid()) {
@@ -305,32 +146,6 @@ ClientService::RegisterClient() {
         return tl::make_unexpected(ErrorCode::SHUTTING_DOWN);
     }
     return InnerRegisterClient();
-}
-
-ErrorCode ClientService::ConnectToMaster(
-    const std::string& master_server_entry) {
-    if (IsHAMode(master_server_entry)) {
-        std::string master_address;
-        auto err = ResolveMasterAddress(master_server_entry, master_address);
-        if (err != ErrorCode::OK) {
-            LOG(ERROR) << "Failed to resolve master address";
-            return err;
-        }
-
-        err = GetMasterClient().Connect(master_address);
-        if (err != ErrorCode::OK) {
-            LOG(ERROR) << "Failed to connect to master";
-            return err;
-        }
-
-        return ErrorCode::OK;
-    } else {
-        auto err = GetMasterClient().Connect(master_server_entry);
-        if (err != ErrorCode::OK) {
-            return err;
-        }
-        return ErrorCode::OK;
-    }
 }
 
 static std::optional<bool> get_auto_discover() {
@@ -639,29 +454,6 @@ ErrorCode ClientService::InnerInitTransferEngine(
     return ErrorCode::OK;
 }
 
-tl::expected<
-    std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>,
-    ErrorCode>
-ClientService::BatchQueryIp(const std::vector<UUID>& client_ids) {
-    auto guard = AcquireInflightGuard();
-    if (!guard.is_valid()) {
-        LOG(ERROR) << "client is shutting down";
-        return tl::unexpected(ErrorCode::SHUTTING_DOWN);
-    }
-    return GetMasterClient().BatchQueryIp(client_ids);
-}
-
-tl::expected<std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
-             ErrorCode>
-ClientService::QueryByRegex(const std::string& str) {
-    auto guard = AcquireInflightGuard();
-    if (!guard.is_valid()) {
-        LOG(ERROR) << "client is shutting down";
-        return tl::unexpected(ErrorCode::SHUTTING_DOWN);
-    }
-    return GetMasterClient().GetReplicaListByRegex(str);
-}
-
 tl::expected<void, ErrorCode> ClientService::RegisterLocalMemory(
     void* addr, size_t length, const std::string& location,
     bool remote_accessible, bool update_metadata) {
@@ -693,70 +485,6 @@ tl::expected<void, ErrorCode> ClientService::unregisterLocalMemory(
     return {};
 }
 
-void ClientService::HeartbeatThreadMain(
-    bool is_ha_mode, std::string current_master_address,
-    const std::string& master_server_entry) {
-    // How many failed heartbeats before getting latest master view from HA
-    // backend
-    const int max_heartbeat_fail_count = 10;
-    // How long to wait for next heartbeat after success
-    const int success_heartbeat_interval_ms = 1000;
-    // How long to wait for next heartbeat after failure
-    const int fail_heartbeat_interval_ms = 1000;
-    // Increment after a heartbeat failure, reset after a heartbeat success
-    int heartbeat_fail_count = 0;
-
-    auto register_client = [this]() { HeartbeatTryRegister(); };
-    // Use another thread to register client to avoid blocking the heartbeat
-    // thread
-    std::future<void> register_client_future;
-
-    while (heartbeat_running_) {
-        // Join the register client thread if it is ready
-        if (register_client_future.valid() &&
-            register_client_future.wait_for(std::chrono::seconds(0)) ==
-                std::future_status::ready) {
-            register_client_future = std::future<void>();
-        }
-
-        // Send heartbeat to master
-        HeartbeatRequest req = build_heartbeat_request();
-        auto heartbeat_result = GetMasterClient().Heartbeat(req);
-        if (heartbeat_result) {  // Heartbeat success
-            heartbeat_fail_count = 0;
-            HandleHeartbeatResponse(heartbeat_result.value(),
-                                    current_master_address, register_client,
-                                    register_client_future);
-            WaitForNextHeartbeat(success_heartbeat_interval_ms);
-        } else {  // Heartbeat failed
-            heartbeat_fail_count++;
-            if (heartbeat_fail_count < max_heartbeat_fail_count) {
-                // just retry
-                LOG(ERROR) << "Failed to send heartbeat to master";
-            } else {
-                if (!connection_interrupted_) {
-                    OnHAEvent(HAEvent::MASTER_UNREACHABLE);
-                    connection_interrupted_ = true;
-                }
-                // Attempt reconnect
-                if (ReconnectToMaster(is_ha_mode, current_master_address)) {
-                    heartbeat_fail_count = 0;
-                    // Do NOT sleep here, immediately loop back to send
-                    // heartbeat so the client can discover UNDEFINED status and
-                    // re-register as fast as possible.
-                    continue;
-                }
-            }
-            WaitForNextHeartbeat(fail_heartbeat_interval_ms);
-        }
-    }  // end while
-
-    // Wait for any pending register client thread to finish
-    if (register_client_future.valid()) {
-        register_client_future.wait();
-    }
-}
-
 void ClientService::WaitForNextHeartbeat(int interval_ms) {
     std::unique_lock<std::mutex> lock{heartbeat_mtx_};
     heartbeat_cv_.wait_for(lock, std::chrono::milliseconds(interval_ms),
@@ -784,7 +512,7 @@ void ClientService::HeartbeatTryRegister() NO_THREAD_SAFETY_ANALYSIS {
                   << client_id_;
         return;
     }
-    tl::expected<RegisterClientResponse, ErrorCode> res;
+    tl::expected<ViewVersionId, ErrorCode> res;
     try {
         res = InnerRegisterClient();
     } catch (const std::exception& e) {
@@ -801,92 +529,6 @@ void ClientService::HeartbeatTryRegister() NO_THREAD_SAFETY_ANALYSIS {
     if (!res) {
         LOG(ERROR) << "Failed to register client, client_id=" << client_id_
                    << ", error=" << res.error();
-    }
-}
-
-void ClientService::HandleHeartbeatResponse(
-    const HeartbeatResponse& response,
-    const std::string& current_master_address,
-    const std::function<void()>& register_client,
-    std::future<void>& register_client_future) {
-    if (response.view_version != view_version_.load()) {
-        LOG(WARNING) << "Master view_version changed"
-                     << ", client status in master: " << (int)response.status
-                     << ", master address: " << current_master_address
-                     << ", Master version: " << response.view_version
-                     << ", Client version: " << view_version_.load();
-    }
-    for (auto& task_result : response.task_results) {
-        HandleHeartbeatTaskResult(task_result);
-    }
-    if (response.status == ClientStatus::HEALTH) {
-        // Heartbeat recovered after a connection interruption: master still
-        // knows this client. Fire MASTER_RECONNECTED once to trigger re-sync.
-        if (connection_interrupted_) {
-            OnHAEvent(HAEvent::MASTER_RECONNECTED);
-            connection_interrupted_ = false;
-        }
-    } else if (response.status == ClientStatus::UNDEFINED &&
-               !register_client_future.valid()) {
-        // Ensure at most one register client thread is running
-        register_client_future =
-            std::async(std::launch::async, register_client);
-    }
-}
-
-void ClientService::HandleHeartbeatTaskResult(
-    const HeartbeatTaskResult& task_result) {
-    if (task_result.error != ErrorCode::OK) {
-        LOG(ERROR) << "Failed to process task"
-                   << ", task_type=" << (int)task_result.type
-                   << ", error=" << toString(task_result.error);
-    }
-
-    if (std::holds_alternative<SyncSegmentMetaResult>(task_result.detail)) {
-        auto& sync_res = std::get<SyncSegmentMetaResult>(task_result.detail);
-        for (auto& sub : sync_res.sub_results) {
-            if (sub.error != ErrorCode::OK) {
-                LOG(WARNING) << "Failed to sync segment usage"
-                             << ", segment_id=" << sub.segment_id
-                             << ", error=" << toString(sub.error);
-            }
-        }
-    }
-}
-
-bool ClientService::ReconnectToMaster(bool is_ha_mode,
-                                      std::string& current_master_address) {
-    if (is_ha_mode) {
-        LOG(ERROR) << "Heartbeat failure threshold exceeded;"
-                   << " fetching latest master view and reconnecting";
-        std::string master_address;
-        auto err = ResolveMasterAddress(master_server_entry_, master_address);
-        if (err != ErrorCode::OK) {
-            LOG(ERROR) << "Failed to get new master view: " << toString(err);
-            return false;
-        }
-
-        err = GetMasterClient().Connect(master_address);
-        if (err != ErrorCode::OK) {
-            LOG(ERROR) << "Failed to connect to master " << master_address
-                       << ": " << toString(err);
-            return false;
-        }
-
-        current_master_address = master_address;
-        LOG(INFO) << "Reconnected to master " << master_address;
-        return true;
-    } else {
-        LOG(ERROR) << "Heartbeat failure threshold exceeded (non-HA);"
-                   << " reconnecting to " << current_master_address;
-        auto err = GetMasterClient().Connect(current_master_address);
-        if (err != ErrorCode::OK) {
-            LOG(ERROR) << "Reconnect failed to " << current_master_address
-                       << ": " << toString(err);
-            return false;
-        }
-        LOG(INFO) << "Reconnected to master " << current_master_address;
-        return true;
     }
 }
 

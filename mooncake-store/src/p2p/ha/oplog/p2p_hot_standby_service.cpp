@@ -342,7 +342,7 @@ ErrorCode P2PHotStandbyService::Promote(bool force) {
     }
 
     auto gaps = force_apply_failure
-                    ? OpLogApplier::GapResolveResult{}
+                    ? P2POpLogApplier::GapResolveResult{}
                     : oplog_applier_->TryResolveGapsOnceForPromotion();
     if (gaps.attempted > 0) {
         LOG(INFO) << "P2PHotStandbyService: promotion gap resolve"

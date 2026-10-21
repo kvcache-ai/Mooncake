@@ -2,7 +2,7 @@
 
 This page summarizes useful flags, environment variables, and HTTP endpoints to help advanced users tune Mooncake Master and observe metrics.
 
-## Master Startup Flags (with defaults)
+## Centralized Master Startup Flags (with defaults)
 
 - RPC Related
   - `--rpc_port` (int, default 50051): RPC listen port.
@@ -29,23 +29,13 @@ This page summarizes useful flags, environment variables, and HTTP endpoints to 
 
 - High Availability (optional)
   - `--enable_ha` (bool, default `false`): Enable HA.
-  - `--election_backend` (str, default `etcd`): Election backend, either `etcd` or `redis`.
   - `--etcd_endpoints` (str, default empty unless HA config): etcd endpoints, semicolon separated.
-  - `--redis_endpoint` (str, default empty): Redis endpoint for Redis-based HA, such as `10.0.0.10:6379`.
-  - `--redis_username` (str, default empty): Redis ACL username for Redis-based HA.
-  - `--redis_password` (str, default empty): Redis AUTH password for Redis-based HA.
-  - `--redis_db_index` (int, default `0`): Redis DB index for Redis-based HA.
-  - `--redis_master_view_ttl_sec` (int, default `4`): TTL for the Redis master view key.
-  - `--redis_heartbeat_interval_sec` (int, default `1`): Redis leader renewal interval. It must be smaller than `--redis_master_view_ttl_sec`.
   - `--client_ttl` (int64, default `10` s): Client alive TTL after last ping (HA mode).
   - `--cluster_id` (str, default `mooncake_cluster`): Cluster ID for persistence and HA metadata isolation.
-  - `--enable_oplog` (bool, default `false`): Enable master metadata OpLog recording.
-  - `--oplog_store_type` (str, default `localfs`): OpLog backend, for example `localfs` or `redis`.
-  - `--oplog_data_dir` (str, default `/tmp/mooncake_oplog`): OpLog data path for `localfs`; Redis endpoint for `redis`.
-  - `--standby_snapshot_service_port` (uint32, default `0`): Port for serving P2P Standby metadata snapshots. `0` disables the snapshot service.
-  - `--standby_snapshot_service_endpoint` (str, default empty): Optional advertised snapshot endpoint. If empty, it is derived from the master endpoint and snapshot service port.
-  - `--standby_snapshot_sources` (str, default empty): Optional comma-separated snapshot source override. If empty, sources are discovered from Redis master registry.
-  - `--standby_snapshot_chunk_size` (uint32, default `256`): Maximum metadata records per snapshot RPC chunk.
+
+## P2P Master Startup Flags
+
+`mooncake_master_p2p` shares the RPC and metrics flags above and adds P2P-specific heartbeat, client lifecycle, route, election, OpLog, and standby settings. It does not accept centralized lease, eviction, offload, allocator, CXL, task-manager, or embedded metadata-server flags. See `mooncake-store/conf/p2p_master.yaml` for the complete P2P configuration surface.
 
 ### P2P HA OpLog Coverage
 
@@ -67,21 +57,21 @@ mooncake_master \
   --enable_metric_reporting=true
 ```
 
-## Redis-based Master HA
+## P2P Redis-based Master HA
 
-Redis-based HA uses Redis as the coordination backend for master election. It is independent from the Transfer Engine metadata backend: the Store master election backend can use Redis even if the Transfer Engine metadata service uses etcd, Redis, or HTTP.
+Redis-based master election belongs to the P2P master executable. It is independent from the Transfer Engine metadata backend.
 
 Build with Redis HA support before deployment:
 
 ```bash
 cmake -S . -B build -DSTORE_USE_REDIS=ON
-cmake --build build --target mooncake_master
+cmake --build build --target mooncake_master_p2p
 ```
 
 Start multiple master processes with the same Redis endpoint and cluster ID. Each master must advertise an RPC address that clients can reach; do not use `0.0.0.0` as the advertised address in a multi-node deployment.
 
 ```bash
-mooncake_master \
+mooncake_master_p2p \
   --enable_ha=true \
   --election_backend=redis \
   --redis_endpoint=10.0.0.10:6379 \
@@ -121,11 +111,10 @@ Operational notes:
 - Clients using `redis://` resolve the current leader from Redis and reconnect after heartbeat failures. Existing requests may fail during the failover window and should be retried by the caller.
 - Redis HA metadata is isolated by `--cluster_id`, so different Mooncake Store clusters can share one Redis instance when they use different cluster IDs.
 
-For P2P master HA, run the masters in P2P deployment mode and enable Redis-backed OpLog storage. The election Redis endpoint and the OpLog Redis endpoint may be the same Redis instance, but every master in the cluster must use the same values. Redis-backed OpLog uses the same `--redis_username` and `--redis_password` authentication settings.
+For standby promotion, enable Redis-backed OpLog storage. The election Redis endpoint and the OpLog Redis endpoint may be the same Redis instance, but every master in the cluster must use the same values. Redis-backed OpLog uses the same `--redis_username` and `--redis_password` authentication settings.
 
 ```bash
-mooncake_master \
-  --deployment_mode=P2P \
+mooncake_master_p2p \
   --enable_ha=true \
   --election_backend=redis \
   --redis_endpoint=10.0.0.10:6379 \
@@ -174,11 +163,14 @@ mooncake_client \
 
 **Tips:**
 
-In addition to command-line flags, the Master also supports configuration via JSON and YAML files. For example:
+The two master executables use architecture-specific configuration files:
 
 ```bash
 mooncake_master \
-  --config_path=mooncake-store/conf/master.yaml 
+  --config_path=mooncake-store/conf/master.yaml
+
+mooncake_master_p2p \
+  --config_path=mooncake-store/conf/p2p_master.yaml
 ```
 
 ## Metrics Endpoints

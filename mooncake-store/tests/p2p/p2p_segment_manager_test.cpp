@@ -1,468 +1,217 @@
 #include <gtest/gtest.h>
-#include <glog/logging.h>
 
 #include <atomic>
 #include <thread>
 #include <vector>
 
-#define private public
-#define protected public
 #include "p2p/master/p2p_segment_manager.h"
-#undef private
-#undef protected
 #include "p2p/master/p2p_master_metric_manager.h"
 
 namespace mooncake {
+namespace {
 
-class P2PSegmentManagerTest : public ::testing::Test {
-   protected:
-    void SetUp() override {
-        google::InitGoogleLogging("P2PSegmentManagerTest");
-        FLAGS_logtostderr = 1;
-    }
-
-    void TearDown() override { google::ShutdownGoogleLogging(); }
-
-    Segment MakeSegment(UUID id, const std::string& name = "seg1",
-                        size_t size = 1024 * 1024, int priority = 1) {
-        Segment seg;
-        seg.id = id;
-        seg.name = name;
-        seg.size = size;
-        seg.extra = P2PSegmentExtraData{
-            .priority = priority,
-            .tags = {},
-            .memory_type = MemoryType::DRAM,
-            .usage = 0,
-        };
-        return seg;
-    }
-};
-
-// ============================================================
-// Mount / Unmount
-// ============================================================
-
-TEST_F(P2PSegmentManagerTest, MountSegmentSuccess) {
-    P2PSegmentManager mgr;
-    auto seg = MakeSegment(generate_uuid());
-    auto res = mgr.MountSegment(seg);
-    EXPECT_TRUE(res.has_value());
+P2PSegment Segment(UUID id = {1, 1}, std::string name = "segment",
+                   size_t size = 4096, size_t usage = 0,
+                   MemoryType memory_type = MemoryType::DRAM) {
+    return P2PSegment{.id = id,
+                      .name = std::move(name),
+                      .size = size,
+                      .priority = 1,
+                      .tags = {},
+                      .memory_type = memory_type,
+                      .usage = usage};
 }
 
-TEST_F(P2PSegmentManagerTest, MountDuplicateSegment) {
-    P2PSegmentManager mgr;
-    auto seg = MakeSegment(generate_uuid());
-    ASSERT_TRUE(mgr.MountSegment(seg).has_value());
+TEST(P2PSegmentManagerTest, StoresSegmentsByValue) {
+    P2PSegmentManager manager;
+    auto input = Segment();
+    ASSERT_TRUE(manager.MountSegment(input).has_value());
 
-    auto res = mgr.MountSegment(seg);
-    EXPECT_FALSE(res.has_value());
-    EXPECT_EQ(res.error(), ErrorCode::SEGMENT_ALREADY_EXISTS);
+    input.name = "changed-by-caller";
+    auto snapshot = manager.QuerySegment({1, 1});
+    ASSERT_TRUE(snapshot.has_value());
+    EXPECT_EQ(snapshot->name, "segment");
+
+    snapshot->usage = 999;
+    auto second_snapshot = manager.QuerySegment({1, 1});
+    ASSERT_TRUE(second_snapshot.has_value());
+    EXPECT_EQ(second_snapshot->usage, 0);
 }
 
-TEST_F(P2PSegmentManagerTest, UnmountSegmentSuccess) {
-    P2PSegmentManager mgr;
-    auto seg1 = MakeSegment(generate_uuid());
-    auto seg2 = MakeSegment(generate_uuid());
+TEST(P2PSegmentManagerTest, RejectsDuplicateAndMissingSegments) {
+    P2PSegmentManager manager;
+    ASSERT_TRUE(manager.MountSegment(Segment()).has_value());
+    auto duplicate = manager.MountSegment(Segment());
+    ASSERT_FALSE(duplicate.has_value());
+    EXPECT_EQ(duplicate.error(), ErrorCode::SEGMENT_ALREADY_EXISTS);
 
-    ASSERT_TRUE(mgr.MountSegment(seg1).has_value());
-    ASSERT_TRUE(mgr.MountSegment(seg2).has_value());
+    auto missing = manager.QuerySegment({9, 9});
+    ASSERT_FALSE(missing.has_value());
+    EXPECT_EQ(missing.error(), ErrorCode::SEGMENT_NOT_FOUND);
 
-    // Verify consistency between ForEachSegment and GetSegments
-    EXPECT_EQ(mgr.mounted_segments_.size(), 2);
-
-    ASSERT_TRUE(mgr.UnmountSegment(seg1.id).has_value());
-    EXPECT_EQ(mgr.mounted_segments_.size(), 1);
-
-    ASSERT_TRUE(mgr.UnmountSegment(seg2.id).has_value());
-    EXPECT_EQ(mgr.mounted_segments_.size(), 0);
+    const auto& read_only_manager = manager;
+    EXPECT_TRUE(read_only_manager.CheckSegmentExists({1, 1}).has_value());
+    auto absent = read_only_manager.CheckSegmentExists({9, 9});
+    ASSERT_FALSE(absent.has_value());
+    EXPECT_EQ(absent.error(), ErrorCode::SEGMENT_NOT_FOUND);
+    ASSERT_TRUE(manager.UnmountSegment({1, 1}).has_value());
+    auto removed = read_only_manager.CheckSegmentExists({1, 1});
+    ASSERT_FALSE(removed.has_value());
+    EXPECT_EQ(removed.error(), ErrorCode::SEGMENT_NOT_FOUND);
 }
 
-TEST_F(P2PSegmentManagerTest, UnmountNonexistentSegment) {
-    P2PSegmentManager mgr;
-    UUID id = {999, 999};
-    auto res = mgr.UnmountSegment(id);
-    EXPECT_FALSE(res.has_value());
-    EXPECT_EQ(res.error(), ErrorCode::SEGMENT_NOT_FOUND);
+TEST(P2PSegmentManagerTest, MaintainsCapacityAndUsageAggregate) {
+    P2PSegmentManager manager;
+    ASSERT_TRUE(
+        manager.MountSegment(Segment({1, 1}, "a", 4096, 100)).has_value());
+    ASSERT_TRUE(
+        manager.MountSegment(Segment({2, 2}, "b", 8192, 200)).has_value());
+    EXPECT_EQ(manager.GetCapacityUsage(),
+              std::make_pair(size_t{12288}, size_t{300}));
+
+    auto old_usage = manager.UpdateSegmentUsage({1, 1}, 500);
+    ASSERT_TRUE(old_usage.has_value());
+    EXPECT_EQ(*old_usage, 100);
+    EXPECT_EQ(manager.GetCapacityUsage(),
+              std::make_pair(size_t{12288}, size_t{700}));
+
+    auto removed = manager.UnmountSegment({2, 2});
+    ASSERT_TRUE(removed.has_value());
+    EXPECT_EQ(manager.GetCapacityUsage(),
+              std::make_pair(size_t{4096}, size_t{500}));
 }
 
-TEST_F(P2PSegmentManagerTest, UnmountDuplicate) {
-    P2PSegmentManager mgr;
-    auto seg = MakeSegment(generate_uuid());
-    ASSERT_TRUE(mgr.MountSegment(seg).has_value());
-    ASSERT_TRUE(mgr.UnmountSegment(seg.id).has_value());
-
-    auto res = mgr.UnmountSegment(seg.id);
-    EXPECT_FALSE(res.has_value());
-    EXPECT_EQ(res.error(), ErrorCode::SEGMENT_NOT_FOUND);
+TEST(P2PSegmentManagerTest, RejectsUsageBeyondCapacity) {
+    P2PSegmentManager manager;
+    ASSERT_TRUE(manager.MountSegment(Segment()).has_value());
+    auto result = manager.UpdateSegmentUsage({1, 1}, 4097);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(manager.GetCapacityUsage(),
+              std::make_pair(size_t{4096}, size_t{0}));
 }
 
-// ============================================================
-// GetSegments / QuerySegment
-// ============================================================
+TEST(P2PSegmentManagerTest, ReturnsSegmentSnapshots) {
+    P2PSegmentManager manager;
+    ASSERT_TRUE(manager.MountSegment(Segment({1, 1}, "a")).has_value());
+    ASSERT_TRUE(manager.MountSegment(Segment({2, 2}, "b")).has_value());
 
-TEST_F(P2PSegmentManagerTest, GetSegmentsAfterMount) {
-    P2PSegmentManager mgr;
-    auto seg1 = MakeSegment({1, 1}, "seg1", 1000);
-    auto seg2 = MakeSegment({2, 2}, "seg2", 2000);
-    ASSERT_TRUE(mgr.MountSegment(seg1).has_value());
-    ASSERT_TRUE(mgr.MountSegment(seg2).has_value());
+    auto segments = manager.GetSegments();
+    ASSERT_TRUE(segments.has_value());
+    ASSERT_EQ(segments->size(), 2);
+    segments->clear();
+    auto stored_segments = manager.GetSegments();
+    ASSERT_TRUE(stored_segments.has_value());
+    EXPECT_EQ(stored_segments->size(), 2);
 
-    auto res = mgr.GetSegments();
-    ASSERT_TRUE(res.has_value());
-    EXPECT_EQ(res.value().size(), 2);
+    auto by_name = manager.QuerySegments("b");
+    ASSERT_TRUE(by_name.has_value());
+    EXPECT_EQ(*by_name, std::make_pair(size_t{0}, size_t{4096}));
 }
 
-TEST_F(P2PSegmentManagerTest, QuerySegmentsCheck) {
-    P2PSegmentManager mgr;
-    auto seg = MakeSegment({1, 1}, "detailed_seg", 10000);
-    ASSERT_TRUE(mgr.MountSegment(seg).has_value());
-    ASSERT_TRUE(mgr.UpdateSegmentUsage({1, 1}, 4500).has_value());
-
-    auto res = mgr.QuerySegments("detailed_seg");
-    ASSERT_TRUE(res.has_value());
-    auto [used, capacity] = res.value();
-    EXPECT_EQ(used, 4500);
-    EXPECT_EQ(capacity, 10000);
-}
-
-TEST_F(P2PSegmentManagerTest, QueryNonexistentSegment) {
-    P2PSegmentManager mgr;
-    auto res = mgr.QuerySegments("nonexistent");
-    EXPECT_FALSE(res.has_value());
-    EXPECT_EQ(res.error(), ErrorCode::SEGMENT_NOT_FOUND);
-}
-
-TEST_F(P2PSegmentManagerTest, QuerySegmentByIDSuccess) {
-    P2PSegmentManager mgr;
-    auto seg = MakeSegment({123, 456}, "id_seg", 8192);
-    ASSERT_TRUE(mgr.MountSegment(seg).has_value());
-
-    auto res = mgr.QuerySegment({123, 456});
-    ASSERT_TRUE(res.has_value());
-    EXPECT_EQ((*res)->id, seg.id);
-    EXPECT_EQ((*res)->name, "id_seg");
-}
-
-TEST_F(P2PSegmentManagerTest, QuerySegmentByIDNotFound) {
-    P2PSegmentManager mgr;
-    auto res = mgr.QuerySegment({999, 999});
-    EXPECT_FALSE(res.has_value());
-    EXPECT_EQ(res.error(), ErrorCode::SEGMENT_NOT_FOUND);
-}
-
-// ============================================================
-// UpdateSegmentUsage / GetSegmentUsage
-// ============================================================
-
-TEST_F(P2PSegmentManagerTest, UpdateSegmentUsage) {
-    P2PSegmentManager mgr;
-    auto seg = MakeSegment({1, 1}, "seg1", 10000);
-    ASSERT_TRUE(mgr.MountSegment(seg).has_value());
-
-    auto res = mgr.UpdateSegmentUsage({1, 1}, 4000);
-    ASSERT_TRUE(res.has_value());
-    // Returns old usage
-    EXPECT_EQ(res.value(), 0);
-
-    // Verify new usage
-    EXPECT_EQ(mgr.GetSegmentUsage({1, 1}), 4000);
-}
-
-TEST_F(P2PSegmentManagerTest, UpdateSegmentUsageMultipleTimes) {
-    P2PSegmentManager mgr;
-    auto seg = MakeSegment({1, 1}, "seg1", 10000);
-    ASSERT_TRUE(mgr.MountSegment(seg).has_value());
-
-    auto res = mgr.UpdateSegmentUsage({1, 1}, 1000);
-    ASSERT_TRUE(res.has_value());
-    EXPECT_EQ(res.value(), 0);  // old usage
-    EXPECT_EQ(mgr.GetSegmentUsage({1, 1}), 1000);
-
-    res = mgr.UpdateSegmentUsage({1, 1}, 3000);
-    ASSERT_TRUE(res.has_value());
-    EXPECT_EQ(res.value(), 1000);  // old usage
-    EXPECT_EQ(mgr.GetSegmentUsage({1, 1}), 3000);
-}
-
-TEST_F(P2PSegmentManagerTest, UsageZeroAndMax) {
-    P2PSegmentManager mgr;
-    auto seg = MakeSegment({1, 1}, "seg1", SIZE_MAX);
-    ASSERT_TRUE(mgr.MountSegment(seg).has_value());
-
-    mgr.UpdateSegmentUsage({1, 1}, 0);
-    EXPECT_EQ(mgr.GetSegmentUsage({1, 1}), 0);
-
-    mgr.UpdateSegmentUsage({1, 1}, SIZE_MAX);
-    EXPECT_EQ(mgr.GetSegmentUsage({1, 1}), SIZE_MAX);
-}
-
-TEST_F(P2PSegmentManagerTest, UpdateSegmentUsageNotFound) {
-    P2PSegmentManager mgr;
-    auto res = mgr.UpdateSegmentUsage(generate_uuid(), 100);
-    EXPECT_FALSE(res.has_value());
-    EXPECT_EQ(res.error(), ErrorCode::SEGMENT_NOT_FOUND);
-}
-
-TEST_F(P2PSegmentManagerTest, UpdateSegmentUsageExceedCapacity) {
-    P2PSegmentManager mgr;
-    auto seg = MakeSegment({0, 0}, "seg1", 1000);
-    ASSERT_TRUE(mgr.MountSegment(seg).has_value());
-
-    auto res = mgr.UpdateSegmentUsage(seg.id, 1001);
-    EXPECT_FALSE(res.has_value());
-    EXPECT_EQ(res.error(), ErrorCode::INVALID_PARAMS);
-}
-
-TEST_F(P2PSegmentManagerTest, GetSegmentUsageNotFound) {
-    P2PSegmentManager mgr;
-    // Should return 0 and log warning
-    EXPECT_EQ(mgr.GetSegmentUsage(generate_uuid()), 0);
-}
-
-// ============================================================
-// ForEachSegment
-// ============================================================
-
-TEST_F(P2PSegmentManagerTest, ForEachSegmentVisitsAll) {
-    P2PSegmentManager mgr;
-    for (int i = 0; i < 5; i++) {
-        auto seg = MakeSegment({static_cast<uint64_t>(i), 0},
-                               "seg_" + std::to_string(i), 1024);
-        ASSERT_TRUE(mgr.MountSegment(seg).has_value());
-    }
-
-    int count = 0;
-    mgr.ForEachSegment([&count](const Segment& seg) -> bool {
-        count++;
-        return false;  // continue
-    });
-    EXPECT_EQ(count, 5);
-}
-
-TEST_F(P2PSegmentManagerTest, ForEachSegmentEmpty) {
-    P2PSegmentManager mgr;
-
-    int count = 0;
-    mgr.ForEachSegment([&count](const Segment& seg) -> bool {
-        count++;
-        return false;
-    });
-    EXPECT_EQ(count, 0);
-}
-
-TEST_F(P2PSegmentManagerTest, ForEachSegmentEarlyStop) {
-    P2PSegmentManager mgr;
-    for (int i = 0; i < 10; i++) {
-        auto seg = MakeSegment({static_cast<uint64_t>(i), 0},
-                               "seg_" + std::to_string(i), 1024);
-        ASSERT_TRUE(mgr.MountSegment(seg).has_value());
-    }
-
-    int count = 0;
-    mgr.ForEachSegment([&count](const Segment& seg) -> bool {
-        count++;
-        return count >= 3;  // stop after 3
-    });
-    EXPECT_EQ(count, 3);
-}
-
-// ============================================================
-// Callbacks
-// ============================================================
-
-TEST_F(P2PSegmentManagerTest, SegmentChangeCallbacksTriggered) {
-    P2PSegmentManager mgr;
-
-    int add_count = 0;
-    int remove_count = 0;
-    mgr.SetSegmentChangeCallbacks(
-        [&add_count](const Segment& seg) { add_count++; },
-        [&remove_count](const Segment& seg) { remove_count++; });
-
-    auto seg = MakeSegment({0, 0});
-    ASSERT_TRUE(mgr.MountSegment(seg).has_value());
-    EXPECT_EQ(add_count, 1);
-    EXPECT_EQ(remove_count, 0);
-
-    ASSERT_TRUE(mgr.UnmountSegment(seg.id).has_value());
-    EXPECT_EQ(add_count, 1);
-    EXPECT_EQ(remove_count, 1);
-}
-
-TEST_F(P2PSegmentManagerTest, SegmentRemovalCallback) {
-    P2PSegmentManager mgr;
-    auto seg = MakeSegment({1, 1});
-    ASSERT_TRUE(mgr.MountSegment(seg).has_value());
-
-    bool callback_triggered = false;
-    mgr.SetSegmentRemovalCallback([&callback_triggered, &seg](const UUID& id) {
-        if (id == seg.id) {
-            callback_triggered = true;
-        }
-    });
-
-    ASSERT_TRUE(mgr.UnmountSegment(seg.id).has_value());
-    EXPECT_TRUE(callback_triggered);
-}
-
-// ============================================================
-// Concurrency Tests
-// ============================================================
-
-TEST_F(P2PSegmentManagerTest, ConcurrentMountAndUnmount) {
-    P2PSegmentManager mgr;
-    constexpr int kNumThreads = 16;
-    std::vector<std::thread> threads;
-    std::atomic<int> mount_success_count{0};
-
-    for (int i = 0; i < kNumThreads; i++) {
-        threads.emplace_back([&mgr, &mount_success_count, i]() {
-            auto seg = Segment();
-            seg.id = {static_cast<uint64_t>(i + 100), 0};
-            seg.name = "concurrent_seg_" + std::to_string(i);
-            seg.size = 1024 * 1024;
-            seg.extra = P2PSegmentExtraData{
-                .priority = 1,
-                .tags = {},
-                .memory_type = MemoryType::DRAM,
-                .usage = 0,
-            };
-
-            auto mount_result = mgr.MountSegment(seg);
-            ASSERT_TRUE(mount_result.has_value());
-            mount_success_count.fetch_add(1);
-
-            auto unmount_result = mgr.UnmountSegment(seg.id);
-            ASSERT_TRUE(unmount_result.has_value());
-        });
-    }
-
-    for (auto& t : threads) {
-        t.join();
-    }
-
-    EXPECT_EQ(mount_success_count, kNumThreads);
-
-    // All segments should be unmounted
-    auto res = mgr.GetSegments();
-    ASSERT_TRUE(res.has_value());
-    EXPECT_EQ(res.value().size(), 0);
-}
-
-TEST_F(P2PSegmentManagerTest, UpdateSegmentUsageLifeCycleRace) {
-    P2PSegmentManager mgr;
-    auto id = generate_uuid();
-    auto seg = MakeSegment(id, "race_seg", 10000);
-
-    std::atomic<bool> stop{false};
-    // Thread A: Constantly Mount and Unmount this segment
-    std::thread mounter([&]() {
-        while (!stop) {
-            mgr.MountSegment(seg);
-            std::this_thread::yield();
-            mgr.UnmountSegment(id);
-            std::this_thread::yield();
-        }
-    });
-
-    // Thread B: Concurrent UpdateSegmentUsage attempts
-    constexpr int kNumUpdaters = 4;
-    std::vector<std::thread> updaters;
-    for (int i = 0; i < kNumUpdaters; ++i) {
-        updaters.emplace_back([&]() {
-            while (!stop) {
-                auto res = mgr.UpdateSegmentUsage(id, 500);
-                if (!res.has_value()) {
-                    // If failed, it must be because segment not found during
-                    // unmount window
-                    ASSERT_EQ(res.error(), ErrorCode::SEGMENT_NOT_FOUND);
+TEST(P2PSegmentManagerTest, ConcurrentUsageAndUnmountRemainConsistent) {
+    P2PSegmentManager manager;
+    ASSERT_TRUE(manager.MountSegment(Segment()).has_value());
+    std::atomic<bool> start{false};
+    std::vector<std::thread> workers;
+    for (size_t worker = 0; worker < 8; ++worker) {
+        workers.emplace_back([&, worker]() {
+            while (!start.load(std::memory_order_acquire)) {
+            }
+            for (size_t i = 0; i < 1000; ++i) {
+                auto result = manager.UpdateSegmentUsage(
+                    {1, 1}, (worker * 1000 + i) % 4097);
+                if (!result.has_value()) {
+                    EXPECT_EQ(result.error(), ErrorCode::SEGMENT_NOT_FOUND);
+                    return;
                 }
-                std::this_thread::yield();
             }
         });
     }
-
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    stop = true;
-    mounter.join();
-    for (auto& t : updaters) t.join();
+    start.store(true, std::memory_order_release);
+    auto removed = manager.UnmountSegment({1, 1});
+    for (auto& worker : workers) {
+        worker.join();
+    }
+    ASSERT_TRUE(removed.has_value());
+    EXPECT_EQ(manager.GetCapacityUsage(), std::make_pair(size_t{0}, size_t{0}));
 }
 
-TEST_F(P2PSegmentManagerTest, MountCapacityClassifiedByMemoryType) {
-    P2PMasterMetricManager::instance().reset_all_metrics();
-    auto& metrics = P2PMasterMetricManager::instance();
+class P2PSegmentMetricsTest : public ::testing::TestWithParam<MemoryType> {
+   protected:
+    void SetUp() override { Metrics().reset_all_metrics(); }
 
-    P2PSegmentManager mgr;
+    void TearDown() override {
+        auto segments = manager_.GetSegments();
+        ASSERT_TRUE(segments.has_value());
+        for (const auto& segment : *segments) {
+            EXPECT_TRUE(manager_.UnmountSegment(segment.id).has_value());
+        }
+        Metrics().reset_all_metrics();
+    }
 
-    // DRAM -> mem capacity family.
-    auto dram = MakeSegment({1, 1}, "dram_seg", 1000);
-    ASSERT_TRUE(mgr.MountSegment(dram).has_value());
-    EXPECT_EQ(metrics.get_total_mem_capacity(), 1000);
-    EXPECT_EQ(metrics.get_total_file_capacity(), 0);
+    static P2PMasterMetricManager& Metrics() {
+        return P2PMasterMetricManager::instance();
+    }
 
-    // NVME -> file capacity family.
-    Segment nvme = MakeSegment({2, 2}, "nvme_seg", 2000);
-    nvme.extra = P2PSegmentExtraData{
-        .priority = 0, .tags = {}, .memory_type = MemoryType::NVME, .usage = 0};
-    ASSERT_TRUE(mgr.MountSegment(nvme).has_value());
-    EXPECT_EQ(metrics.get_total_mem_capacity(), 1000);
-    EXPECT_EQ(metrics.get_total_file_capacity(), 2000);
+    void ExpectGauges(int64_t capacity, int64_t usage) {
+        const bool dram = GetParam() == MemoryType::DRAM;
+        EXPECT_EQ(Metrics().get_total_mem_capacity(), dram ? capacity : 0);
+        EXPECT_EQ(Metrics().get_allocated_mem_size(), dram ? usage : 0);
+        EXPECT_EQ(Metrics().get_total_file_capacity(), dram ? 0 : capacity);
+        EXPECT_EQ(Metrics().get_allocated_file_size(), dram ? 0 : usage);
+        if (dram) {
+            EXPECT_EQ(Metrics().get_segment_total_mem_capacity("metrics"),
+                      capacity);
+            EXPECT_EQ(Metrics().get_segment_allocated_mem_size("metrics"),
+                      usage);
+        }
+    }
 
-    // Unmount drops the capacity symmetrically.
-    ASSERT_TRUE(mgr.UnmountSegment(nvme.id).has_value());
-    EXPECT_EQ(metrics.get_total_mem_capacity(), 1000);
-    EXPECT_EQ(metrics.get_total_file_capacity(), 0);
+    P2PSegmentManager manager_;
+};
+
+TEST_P(P2PSegmentMetricsTest, MountUsageAndUnmountMaintainGauges) {
+    const auto segment = Segment({1, 1}, "metrics", 4096, 100, GetParam());
+    ASSERT_TRUE(manager_.MountSegment(segment).has_value());
+    ExpectGauges(4096, 100);
+    auto duplicate = manager_.MountSegment(segment);
+    ASSERT_FALSE(duplicate.has_value());
+    EXPECT_EQ(duplicate.error(), ErrorCode::SEGMENT_ALREADY_EXISTS);
+    ExpectGauges(4096, 100);
+    size_t previous = 100;
+    for (size_t usage : {size_t{500}, size_t{20}, size_t{0}, size_t{4096}}) {
+        auto old = manager_.UpdateSegmentUsage(segment.id, usage);
+        ASSERT_TRUE(old.has_value());
+        EXPECT_EQ(*old, previous);
+        previous = usage;
+        ExpectGauges(4096, usage);
+    }
+    auto invalid = manager_.UpdateSegmentUsage(segment.id, 4097);
+    ASSERT_FALSE(invalid.has_value());
+    EXPECT_EQ(invalid.error(), ErrorCode::INVALID_PARAMS);
+    ExpectGauges(4096, 4096);
+    ASSERT_TRUE(manager_.UnmountSegment(segment.id).has_value());
+    ExpectGauges(0, 0);
+    auto missing = manager_.UnmountSegment(segment.id);
+    ASSERT_FALSE(missing.has_value());
+    EXPECT_EQ(missing.error(), ErrorCode::SEGMENT_NOT_FOUND);
+    auto late_usage = manager_.UpdateSegmentUsage(segment.id, 20);
+    ASSERT_FALSE(late_usage.has_value());
+    EXPECT_EQ(late_usage.error(), ErrorCode::SEGMENT_NOT_FOUND);
+    ExpectGauges(0, 0);
 }
 
-TEST_F(P2PSegmentManagerTest, UpdateSegmentUsageMaintainsGauges) {
-    P2PMasterMetricManager::instance().reset_all_metrics();
-    auto& metrics = P2PMasterMetricManager::instance();
-
-    P2PSegmentManager mgr;
-
-    // DRAM usage deltas go to the mem gauge family (total + per-segment).
-    auto dram = MakeSegment({1, 1}, "dram_seg", 1000);
-    ASSERT_TRUE(mgr.MountSegment(dram).has_value());
-    ASSERT_TRUE(mgr.UpdateSegmentUsage({1, 1}, 400).has_value());
-    EXPECT_EQ(metrics.get_allocated_mem_size(), 400);
-    EXPECT_EQ(metrics.get_segment_allocated_mem_size("dram_seg"), 400);
-
-    // Negative delta (usage fell back) is applied via dec().
-    ASSERT_TRUE(mgr.UpdateSegmentUsage({1, 1}, 100).has_value());
-    EXPECT_EQ(metrics.get_allocated_mem_size(), 100);
-
-    // NVME usage deltas go to the file gauge family only.
-    Segment nvme = MakeSegment({2, 2}, "nvme_seg", 2000);
-    nvme.extra = P2PSegmentExtraData{
-        .priority = 0, .tags = {}, .memory_type = MemoryType::NVME, .usage = 0};
-    ASSERT_TRUE(mgr.MountSegment(nvme).has_value());
-    ASSERT_TRUE(mgr.UpdateSegmentUsage({2, 2}, 700).has_value());
-    EXPECT_EQ(metrics.get_allocated_file_size(), 700);
-    EXPECT_EQ(metrics.get_allocated_mem_size(), 100);
-
-    // Unmount subtracts the last reported usage.
-    ASSERT_TRUE(mgr.UnmountSegment({2, 2}).has_value());
-    EXPECT_EQ(metrics.get_allocated_file_size(), 0);
-    ASSERT_TRUE(mgr.UnmountSegment({1, 1}).has_value());
-    EXPECT_EQ(metrics.get_allocated_mem_size(), 0);
+TEST_P(P2PSegmentMetricsTest, UnmountBeforeUsageReportKeepsUsageZero) {
+    const auto segment = Segment({1, 1}, "metrics", 4096, 0, GetParam());
+    ASSERT_TRUE(manager_.MountSegment(segment).has_value());
+    ExpectGauges(4096, 0);
+    ASSERT_TRUE(manager_.UnmountSegment(segment.id).has_value());
+    ExpectGauges(0, 0);
 }
 
-TEST_F(P2PSegmentManagerTest, UnmountBeforeUsageSyncKeepsZeroUsage) {
-    P2PMasterMetricManager::instance().reset_all_metrics();
-    auto& metrics = P2PMasterMetricManager::instance();
+INSTANTIATE_TEST_SUITE_P(StorageTypes, P2PSegmentMetricsTest,
+                         ::testing::Values(MemoryType::DRAM, MemoryType::NVME));
 
-    P2PSegmentManager mgr;
-    auto seg = MakeSegment({1, 1}, "seg1", 1000);
-    ASSERT_TRUE(mgr.MountSegment(seg).has_value());
-    EXPECT_EQ(metrics.get_total_mem_capacity(), 1000);
-
-    // No usage sync yet: stored usage is still 0, so unmount only drops
-    // capacity and the usage gauge stays 0.
-    EXPECT_EQ(metrics.get_allocated_mem_size(), 0);
-    ASSERT_TRUE(mgr.UnmountSegment(seg.id).has_value());
-    EXPECT_EQ(metrics.get_total_mem_capacity(), 0);
-    EXPECT_EQ(metrics.get_allocated_mem_size(), 0);
-}
-
+}  // namespace
 }  // namespace mooncake

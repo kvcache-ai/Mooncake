@@ -35,6 +35,8 @@ class P2PClientHttpEndpointsTest : public ::testing::Test {
    protected:
     static std::shared_ptr<P2PClientService> CreateP2PClient(
         const std::string& host_name, uint32_t rpc_port, uint16_t http_port) {
+        // TODO(C2): Bind the client listener atomically and publish its actual
+        // port after runtime ownership is split; remove the port-probe race.
         auto config = ClientConfigBuilder::build_p2p_real_client(
             host_name, "P2PHANDSHAKE", "tcp", std::nullopt, master_address_,
             R"({"tiers": [{"type": "DRAM", "capacity": 67108864, "priority": 100}]})",
@@ -51,8 +53,11 @@ class P2PClientHttpEndpointsTest : public ::testing::Test {
             config.enable_http_server, config.labels);
 
         auto err = client->Init(config);
-        EXPECT_EQ(err, ErrorCode::OK)
-            << "Init failed: " << static_cast<int>(err);
+        if (err != ErrorCode::OK) {
+            LOG(ERROR) << "P2P fixture initialization failed: " << err;
+            ADD_FAILURE() << "Init failed: " << static_cast<int>(err);
+            return nullptr;
+        }
         return client;
     }
 
@@ -102,11 +107,12 @@ class P2PClientHttpEndpointsTest : public ::testing::Test {
         return {resp.status, std::string(resp.resp_body)};
     }
 
-    static coro_http::resp_data HttpPost(const std::string& url,
-                                         std::string body = "") {
+    static HttpResponse HttpPost(const std::string& url,
+                                 std::string body = "") {
         coro_http::coro_http_client client;
-        return client.post(url, std::move(body),
-                           coro_http::req_content_type::octet_stream);
+        auto resp = client.post(url, std::move(body),
+                                coro_http::req_content_type::octet_stream);
+        return {resp.status, std::string(resp.resp_body)};
     }
 
     static std::vector<std::string> SplitLines(std::string_view body) {

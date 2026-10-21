@@ -58,7 +58,7 @@ void HARecoveryManager::EnterLocalOnly() {
 }
 
 tl::expected<void, ErrorCode> HARecoveryManager::SetSyncCompleted() {
-    auto result = master_client_.SetSyncCompleted(client_id_);
+    auto result = master_client_.CompleteRouteSync(client_id_);
     if (!result) {
         LOG(ERROR) << "SetSyncCompleted RPC failed: " << result.error();
     }
@@ -169,6 +169,12 @@ void HARecoveryManager::RecoveryPipelineMain(AbortToken need_abort) {
         return;
     }
 
+    // TODO(P2P heartbeat/HA redesign): A live client can retain its IDs and
+    // data after the master expires its metadata. Re-registration restores
+    // client and segment metadata, but RegisterOnly leaves the deleted routes
+    // missing. Use OpLog/snapshots for bulk recovery after master failure and
+    // heartbeat reconciliation for client liveness/rejoin, with consistent
+    // cleanup and re-registration semantics across both mechanisms.
     if (recovery_mode_ == RecoveryMode::RegisterOnly) {
         LOG(INFO) << "Recovery mode RegisterOnly: skipping full metadata sync";
         FinishRecovery(need_abort);

@@ -2,7 +2,7 @@
  * @file async_metadata_notifier_test.cpp
  * @brief Unit tests for AsyncMetadataNotifier.
  *
- * Uses an in-process P2P master so that BatchSyncReplica RPCs are real but
+ * Uses an in-process P2P master so that BatchSyncRoutes RPCs are real but
  * require no network setup.
  */
 #include <glog/logging.h>
@@ -50,12 +50,11 @@ class AsyncMetadataNotifierTest : public ::testing::Test {
         segment_ = MakeSegment();
 
         // Register client + segment with master
-        RegisterClientRequest reg;
+        P2PRegisterClientRequest reg;
         reg.client_id = client_id_;
         reg.ip_address = "127.0.0.1";
         reg.rpc_port = 50099;
         reg.segments.push_back(segment_);
-        reg.deployment_mode = DeploymentMode::P2P;
         auto& svc = master_.GetWrapped().GetMasterService();
         auto res = svc.RegisterClient(reg);
         ASSERT_TRUE(res.has_value())
@@ -69,32 +68,29 @@ class AsyncMetadataNotifierTest : public ::testing::Test {
 
     void TearDown() override { master_client_.reset(); }
 
-    static Segment MakeSegment(size_t size = 16 * 1024 * 1024) {
-        Segment seg;
+    static P2PSegment MakeSegment(size_t size = 16 * 1024 * 1024) {
+        P2PSegment seg;
         seg.id = generate_uuid();
         seg.name = "test_segment";
         seg.size = size;
-        seg.extra = P2PSegmentExtraData{
-            .priority = 0,
-            .tags = {},
-            .memory_type = MemoryType::DRAM,
-        };
+        seg.priority = 0;
+        seg.memory_type = MemoryType::DRAM;
         return seg;
     }
 
     // Helper: query replicas for a key via the master service directly
     size_t CountReplicas(const std::string& key) {
         auto& svc = master_.GetWrapped().GetMasterService();
-        auto res = svc.GetReplicaList(key);
+        auto res = svc.GetReadRoute(key);
         if (!res.has_value()) return 0;
-        return res->replicas.size();
+        return res->size();
     }
 
     static testing::InProcP2PMaster master_;
     static std::string master_addr_;
 
     UUID client_id_{};
-    Segment segment_;
+    P2PSegment segment_;
     std::unique_ptr<P2PMasterClient> master_client_;
 };
 

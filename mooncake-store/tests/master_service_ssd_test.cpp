@@ -1,4 +1,4 @@
-#include "centralized_master_service.h"
+#include "master_service.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -8,13 +8,12 @@
 #include <vector>
 
 #include "types.h"
-#include "rpc_types.h"
 
 namespace mooncake::test {
 
-std::unique_ptr<CentralizedMasterService> CreateMasterServiceWithSSDFeat(
+std::unique_ptr<MasterService> CreateMasterServiceWithSSDFeat(
     const std::string& root_fs_dir) {
-    return std::make_unique<CentralizedMasterService>(
+    return std::make_unique<MasterService>(
         MasterServiceConfig::builder().set_root_fs_dir(root_fs_dir).build());
 }
 
@@ -26,14 +25,6 @@ class MasterServiceSSDTest : public ::testing::Test {
     }
 
     void TearDown() override { google::ShutdownGoogleLogging(); }
-
-    void RegisterClient(CentralizedMasterService& service,
-                        const UUID& client_id) const {
-        RegisterClientRequest reg_req;
-        reg_req.client_id = client_id;
-        auto reg_result = service.RegisterClient(reg_req);
-        EXPECT_TRUE(reg_result.has_value());
-    }
 };
 
 TEST_F(MasterServiceSSDTest, PutEndBothReplica) {
@@ -45,11 +36,10 @@ TEST_F(MasterServiceSSDTest, PutEndBothReplica) {
     Segment segment;
     segment.id = generate_uuid();
     segment.name = segment_name;
-    segment.GetCentralizedExtra().base = buffer;
+    segment.base = buffer;
     segment.size = size;
-    segment.GetCentralizedExtra().te_endpoint = segment.name;
+    segment.te_endpoint = segment.name;
     UUID client_id = generate_uuid();
-    RegisterClient(*service_, client_id);
 
     auto mount_result = service_->MountSegment(segment, client_id);
     ASSERT_TRUE(mount_result.has_value());
@@ -101,11 +91,10 @@ TEST_F(MasterServiceSSDTest, PutRevokeDiskReplica) {
     Segment segment;
     segment.id = generate_uuid();
     segment.name = segment_name;
-    segment.GetCentralizedExtra().base = buffer;
+    segment.base = buffer;
     segment.size = size;
-    segment.GetCentralizedExtra().te_endpoint = segment.name;
+    segment.te_endpoint = segment.name;
     UUID client_id = generate_uuid();
-    RegisterClient(*service_, client_id);
 
     auto mount_result = service_->MountSegment(segment, client_id);
     ASSERT_TRUE(mount_result.has_value());
@@ -143,11 +132,10 @@ TEST_F(MasterServiceSSDTest, PutRevokeMemoryReplica) {
     Segment segment;
     segment.id = generate_uuid();
     segment.name = segment_name;
-    segment.GetCentralizedExtra().base = buffer;
+    segment.base = buffer;
     segment.size = size;
-    segment.GetCentralizedExtra().te_endpoint = segment.name;
+    segment.te_endpoint = segment.name;
     UUID client_id = generate_uuid();
-    RegisterClient(*service_, client_id);
 
     auto mount_result = service_->MountSegment(segment, client_id);
     ASSERT_TRUE(mount_result.has_value());
@@ -183,11 +171,10 @@ TEST_F(MasterServiceSSDTest, PutRevokeBothReplica) {
     Segment segment;
     segment.id = generate_uuid();
     segment.name = segment_name;
-    segment.GetCentralizedExtra().base = buffer;
+    segment.base = buffer;
     segment.size = size;
-    segment.GetCentralizedExtra().te_endpoint = segment.name;
+    segment.te_endpoint = segment.name;
     UUID client_id = generate_uuid();
-    RegisterClient(*service_, client_id);
 
     auto mount_result = service_->MountSegment(segment, client_id);
     ASSERT_TRUE(mount_result.has_value());
@@ -222,11 +209,10 @@ TEST_F(MasterServiceSSDTest, RemoveKey) {
     Segment segment;
     segment.id = generate_uuid();
     segment.name = segment_name;
-    segment.GetCentralizedExtra().base = buffer;
+    segment.base = buffer;
     segment.size = size;
-    segment.GetCentralizedExtra().te_endpoint = segment.name;
+    segment.te_endpoint = segment.name;
     UUID client_id = generate_uuid();
-    RegisterClient(*service_, client_id);
 
     auto mount_result = service_->MountSegment(segment, client_id);
     ASSERT_TRUE(mount_result.has_value());
@@ -263,11 +249,10 @@ TEST_F(MasterServiceSSDTest, EvictObject) {
     Segment segment;
     segment.id = generate_uuid();
     segment.name = segment_name;
-    segment.GetCentralizedExtra().base = buffer;
+    segment.base = buffer;
     segment.size = size;
-    segment.GetCentralizedExtra().te_endpoint = segment.name;
+    segment.te_endpoint = segment.name;
     UUID client_id = generate_uuid();
-    RegisterClient(*service_, client_id);
     auto mount_result = service_->MountSegment(segment, client_id);
     ASSERT_TRUE(mount_result.has_value());
 
@@ -313,15 +298,14 @@ TEST_F(MasterServiceSSDTest, EvictObject) {
 
 TEST_F(MasterServiceSSDTest, PutStartExpires) {
     // Reset storage space metrics.
-    CentralizedMasterMetricManager::instance().reset_allocated_mem_size();
-    CentralizedMasterMetricManager::instance().reset_total_mem_capacity();
+    MasterMetricManager::instance().reset_allocated_mem_size();
+    MasterMetricManager::instance().reset_total_mem_capacity();
 
     MasterServiceConfig master_config;
     master_config.root_fs_dir = "/mnt/ssd";
     master_config.put_start_discard_timeout_sec = 3;
     master_config.put_start_release_timeout_sec = 5;
-    std::unique_ptr<CentralizedMasterService> service_(
-        new CentralizedMasterService(master_config));
+    std::unique_ptr<MasterService> service_(new MasterService(master_config));
 
     constexpr size_t kReplicaCnt = 2;  // 1 memory replica + 1 disk replica
     constexpr size_t kBaseAddr = 0x300000000;
@@ -332,11 +316,10 @@ TEST_F(MasterServiceSSDTest, PutStartExpires) {
     Segment segment;
     segment.id = generate_uuid();
     segment.name = segment_name;
-    segment.GetCentralizedExtra().base = kBaseAddr;
+    segment.base = kBaseAddr;
     segment.size = kSegmentSize;
-    segment.GetCentralizedExtra().te_endpoint = segment.name;
+    segment.te_endpoint = segment.name;
     auto client_id = generate_uuid();
-    RegisterClient(*service_, client_id);
     auto mount_result = service_->MountSegment(segment, client_id);
     ASSERT_TRUE(mount_result.has_value());
 
@@ -368,9 +351,7 @@ TEST_F(MasterServiceSSDTest, PutStartExpires) {
         for (size_t i = 0; i <= master_config.put_start_discard_timeout_sec;
              i++) {
             // Keep mounted segments alive.
-            HeartbeatRequest hb_req;
-            hb_req.client_id = client_id;
-            auto result = service_->Heartbeat(hb_req);
+            auto result = service_->Ping(client_id);
             EXPECT_TRUE(result.has_value());
             // Protect the key from eviction.
             auto get_result = service_->GetReplicaList(key);
@@ -389,9 +370,7 @@ TEST_F(MasterServiceSSDTest, PutStartExpires) {
         for (size_t i = 0; i <= master_config.put_start_release_timeout_sec;
              i++) {
             // Keep mounted segments alive.
-            HeartbeatRequest hb_req;
-            hb_req.client_id = client_id;
-            auto result = service_->Heartbeat(hb_req);
+            auto result = service_->Ping(client_id);
             EXPECT_TRUE(result.has_value());
             // Protect the key from eviction.
             auto get_result = service_->GetReplicaList(key);
@@ -415,9 +394,7 @@ TEST_F(MasterServiceSSDTest, PutStartExpires) {
 
         // Wait for the key to expire.
         for (size_t i = 0; i <= DEFAULT_DEFAULT_KV_LEASE_TTL / 1000; i++) {
-            HeartbeatRequest hb_req;
-            hb_req.client_id = client_id;
-            auto result = service_->Heartbeat(hb_req);
+            auto result = service_->Ping(client_id);
             EXPECT_TRUE(result.has_value());
             std::this_thread::sleep_for(std::chrono::seconds(1));
         }

@@ -15,14 +15,14 @@
 #include "mutex.h"
 
 #include "client_metric.h"
-#include "ha_helper.h"
 #include "p2p/client/inflight_tracker.h"
 #include "transfer_engine.h"
 #include "types.h"
-#include "p2p/master/p2p_rpc_types.h"
+#include "p2p/common/p2p_rpc_types.h"
+#include "p2p/common/p2p_types.h"
 #include "rpc_types.h"
 #include "replica.h"
-#include "master_client.h"
+#include "master_metric_manager.h"
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include <ylt/coro_http/coro_http_server.hpp>
 #include "client_config_builder.h"
@@ -32,15 +32,6 @@
 namespace mooncake {
 
 using WriteConfig = std::variant<ReplicateConfig, WriteRouteRequestConfig>;
-
-struct ClientMasterDiscoveryConfig {
-    std::string redis_cluster_id = DEFAULT_CLUSTER_ID;
-    std::string redis_username;
-    std::string redis_password;
-    int redis_db_index = 0;
-    int redis_master_view_ttl_sec = 4;
-    int redis_heartbeat_interval_sec = 1;
-};
 
 /**
  * @brief Result of a query operation containing replica information
@@ -110,7 +101,7 @@ class ClientService {
     virtual tl::expected<
         std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>,
         ErrorCode>
-    BatchQueryIp(const std::vector<UUID>& client_ids);
+    BatchQueryIp(const std::vector<UUID>& client_ids) = 0;
 
     /**
      * @brief Queries replica lists for object keys that match a regex pattern.
@@ -121,7 +112,7 @@ class ClientService {
     virtual tl::expected<
         std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
         ErrorCode>
-    QueryByRegex(const std::string& str);
+    QueryByRegex(const std::string& str) = 0;
 
     /**
      * @brief Gets object metadata without transferring data
@@ -372,15 +363,8 @@ class ClientService {
         return metrics->summary_metrics();
     }
 
-    tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>
-    CalcCacheStats() {
-        auto guard = AcquireInflightGuard();
-        if (!guard.is_valid()) {
-            LOG(ERROR) << "client is shutting down";
-            return tl::unexpected(ErrorCode::SHUTTING_DOWN);
-        }
-        return GetMasterClient().CalcCacheStats();
-    }
+    virtual tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>
+    CalcCacheStats() = 0;
 
     // For Prometheus-style metrics
     tl::expected<std::string, ErrorCode> SerializeMetrics() {
@@ -482,23 +466,10 @@ class ClientService {
                   const std::map<std::string, std::string>& labels = {});
 
     /**
-     * @brief Get the RPC Client for Master service calls
-     * @return Reference to MasterClient
-     */
-    virtual MasterClient& GetMasterClient() = 0;
-
-    /**
      * @brief Get the metrics object for this client.
      * @return Pointer to ClientMetric, or nullptr if metrics are disabled.
      */
     virtual ClientMetric* GetMetrics() = 0;
-
-    /**
-     * @brief Connects to the master server.
-     * @param master_server_entry Entry point of the master server.
-     * @return ErrorCode indicating success or failure.
-     */
-    ErrorCode ConnectToMaster(const std::string& master_server_entry);
 
     /**
      * @brief Initializes the Transfer Engine.
@@ -517,52 +488,11 @@ class ClientService {
     ErrorCode InnerInitTransferEngine(
         bool auto_discover, const std::string& protocol,
         const std::optional<std::string>& device_names);
-    // Heartbeat-related function
-
-    /**
-     * @brief Starts the heartbeat thread.
-     * @param master_server_entry Entry point of the master server.
-     */
-    void StartHeartbeat(const std::string& master_server_entry);
-
-    void HeartbeatThreadMain(bool is_ha_mode,
-                             std::string current_master_address,
-                             const std::string& master_server_entry);
-
-    /**
-     * @brief Handles a successful heartbeat response.
-     * Triggers async RegisterClient if master reports UNDEFINED status.
-     * Fires MASTER_RECONNECTED if connection_interrupted_ was set.
-     */
-    void HandleHeartbeatResponse(const HeartbeatResponse& response,
-                                 const std::string& current_master_address,
-                                 const std::function<void()>& register_client,
-                                 std::future<void>& register_client_future);
-
-    /**
-     * @brief Handles the result of a task received in a heartbeat response.
-     * @param task_result The result of the task.
-     */
-    void HandleHeartbeatTaskResult(const HeartbeatTaskResult& task_result);
-
-    /**
-     * @brief Attempts to reconnect to master after heartbeat failures.
-     * For HA mode, fetches the latest master address from etcd.
-     * For non-HA mode, reconnects to the current_master_address.
-     * @param is_ha_mode Whether HA mode is enabled.
-     * @param current_master_address Current master address, may be updated
-     * after successful reconnection in HA mode.
-     * @return true if reconnect succeeded, false otherwise.
-     */
-    bool ReconnectToMaster(bool is_ha_mode,
-                           std::string& current_master_address);
-
     /**
      * @brief Waits for the next heartbeat interval using condition variable.
      * @param interval_ms Milliseconds to wait.
      */
     void WaitForNextHeartbeat(int interval_ms);
-    virtual HeartbeatRequest build_heartbeat_request() = 0;
 
     void HeartbeatTryRegister();
 
@@ -602,11 +532,11 @@ class ClientService {
     /**
      * @brief Register (or re-register) this client with the master
      */
-    tl::expected<RegisterClientResponse, ErrorCode> RegisterClient()
+    tl::expected<ViewVersionId, ErrorCode> RegisterClient()
         EXCLUDES(registration_mutex_);
 
-    virtual tl::expected<RegisterClientResponse, ErrorCode>
-    InnerRegisterClient() REQUIRES(registration_mutex_) = 0;
+    virtual tl::expected<ViewVersionId, ErrorCode> InnerRegisterClient()
+        REQUIRES(registration_mutex_) = 0;
 
     /**
      * @brief Hook invoked when a local (client-initiated) request enters
@@ -614,17 +544,6 @@ class ClientService {
      * override to update an in-flight gauge. Base default is a no-op.
      */
     virtual void RecordLocalInflight(bool entering) { (void)entering; }
-
-    /**
-     * @brief Single hook for all HA-related events from the heartbeat loop.
-     * Subclasses override to handle state transitions.
-     */
-    virtual void OnHAEvent(HAEvent event) { (void)event; }
-
-    bool IsHAMode(const std::string& master_server_entry) const;
-    ErrorCode ResolveMasterAddress(const std::string& master_server_entry,
-                                   std::string& master_address);
-    void SetMasterDiscoveryConfig(const RealClientConfigBase& config);
 
    protected:
     /**
@@ -668,10 +587,6 @@ class ClientService {
     const std::string& get_te_endpoint() const { return te_endpoint_; }
 
     const std::string metadata_connstring_;
-    // For high availability. Created lazily in ResolveMasterAddress().
-    std::unique_ptr<MasterViewHelper> master_view_helper_;
-    std::string master_view_helper_entry_;
-    ClientMasterDiscoveryConfig master_discovery_config_;
     std::thread heartbeat_thread_;
     std::atomic<bool> heartbeat_running_{false};
     std::condition_variable heartbeat_cv_;
@@ -679,17 +594,9 @@ class ClientService {
     /// View version from master. Updated by async registration thread,
     /// read by heartbeat thread.
     std::atomic<ViewVersionId> view_version_{0};
-    /// True after MASTER_UNREACHABLE fires; cleared when MASTER_RECONNECTED
-    /// fires. Only accessed from the heartbeat thread — no locking required.
-    bool connection_interrupted_ = false;
-
     /// Master server entry saved at Init() (e.g. "etcd://..." or a direct
     /// address), so a re-registration can restart the heartbeat.
     std::string master_server_entry_;
-    /// Set inside RegisterClient(); cleared by UnregisterClient().
-    /// Read by Stop() to decide whether to unregister before shutting down.
-    std::atomic<bool> registered_{false};
-
     // Serializes register / unregister / stop-heartbeat.
     // Lock order: registration_mutex_ before draining local_inflight_tracker_
     // (and registration_mutex_ -> heartbeat_mtx_). Stop() holds

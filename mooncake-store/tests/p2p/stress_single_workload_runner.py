@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-This script integrates single-run performance comparison and multi-dimensional matrix sweeping.
+This script integrates P2P single-run performance testing and multi-dimensional matrix sweeping.
 
 !!! IMPORTANT: DEPENDENCIES REQUIRED !!!
 This script is a WRAPPER that orchestrates the following C++ binaries:
-1. mooncake_master (The master node service)
-2. stress_workload_test (The benchmark client)
+1. mooncake_master_p2p (The P2P master node service)
+2. stress_workload_test_p2p (The P2P benchmark client)
 
 The locations of these two binaries MUST be correctly provided via the MASTER_BIN and TEST_BIN
 variables before running this script. Moreover, bad rounds (non-100% PUT/GET success) are excluded from averages and
@@ -13,21 +13,20 @@ surfaced in the CSV as bad_round_count.
 
 Usage:
 ------
-# Single comparison run (Centralization vs P2P) with batch=4:
-  python3 stress_single_workload_runner.py --mode both --threads 8 --value_size 1048576 --batch 4
+# Single P2P run with batch=4:
+  python3 stress_single_workload_runner.py --threads 8 --value_size 1048576 --batch 4
 
 # P2P only, sweep async worker counts (memcpy mode):
-  python3 stress_single_workload_runner.py --mode P2P --threads 8 --value_size 1048576 \
+  python3 stress_single_workload_runner.py --threads 8 --value_size 1048576 \
       --p2p_local_transfer_mode memcpy --local_memcpy_async_worker_num 32
 
 # Matrix sweep: all combinations of threads/value_size/batch/transfer-mode, save to CSV:
-  python3 stress_single_workload_runner.py --mode both --matrix --rounds 10 --ops 200 --rpc_threads 32 --ram_buffer_size_gb 70 \
+  python3 stress_single_workload_runner.py --matrix --rounds 10 --ops 200 --rpc_threads 32 --ram_buffer_size_gb 70 \
       --threads 16 --batch 1,4,16,32 --value_size 1048576,4194304,8388608 \
       --p2p_local_transfer_mode te,memcpy --local_memcpy_async_worker_num 32 \
       --output results.csv
 Arguments:
 ----------
---mode:              [Centralization, P2P, both] (default: both)
 --rounds:            Number of rounds per configuration to average (default: 5)
 --ops:               Number of operations per thread, supports lists like "100,200" (default: 100)
 --threads:           Number of worker threads, supports lists like "4,8,16"
@@ -38,8 +37,6 @@ Arguments:
 --output:            Path to save results (.csv or .json)
 --matrix:            Enable matrix sweep mode (Cartesian product over all list-valued arguments)
 
-P2P-Specific (ignored in Centralization mode):
-----------------------------------------------
 --p2p_local_transfer_mode:      Local transfer mode: te|memcpy, supports lists like "te,memcpy" (default: te)
 --local_memcpy_async_worker_num:  Async memcpy worker threads, supports lists like "4,16,32" (default: 32, memcpy mode only)
 """
@@ -58,13 +55,16 @@ import urllib.request
 import urllib.error
 
 # --- Configuration ---
-# PROJECT_ROOT points to the repository root directory (two levels up from mooncake-store/tests/)
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-MASTER_BIN = os.path.join(PROJECT_ROOT, "build/mooncake-store/src/mooncake_master")
-TEST_BIN = os.path.join(PROJECT_ROOT, "build/mooncake-store/tests/stress_workload_test")
+# PROJECT_ROOT points to the repository root directory.
+PROJECT_ROOT = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+)
+MASTER_BIN = os.path.join(PROJECT_ROOT, "build/mooncake-store/src/mooncake_master_p2p")
+TEST_BIN = os.path.join(
+    PROJECT_ROOT, "build/mooncake-store/tests/p2p/stress_workload_test_p2p"
+)
 RPC_PORT = 50051
 METRICS_PORT = 9003
-HTTP_METADATA_PORT = 8080  # master's HttpMetadataServer /health endpoint
 
 # --- Utils ---
 def run_command(cmd):
@@ -79,11 +79,11 @@ def run_command(cmd):
 
 def kill_existing_processes():
     """Clean up any existing master or test processes."""
-    subprocess.run("killall -9 mooncake_master stress_workload_test 2>/dev/null", shell=True)
+    subprocess.run("killall -9 mooncake_master_p2p stress_workload_test_p2p 2>/dev/null", shell=True)
     time.sleep(1)
 
 def wait_master_ready(http_port, timeout_s=30):
-    """Poll master's HttpMetadataServer /health endpoint until it responds
+    """Poll P2P master's metrics /health endpoint until it responds
     with HTTP 200 + body "OK", indicating the master process has completed
     startup and is accepting requests. Replaces a brittle time.sleep(2)."""
     url = f"http://127.0.0.1:{http_port}/health"
@@ -160,25 +160,20 @@ def parse_metrics(output):
         is_bad = True
     return metrics, is_bad
 
-def run_benchmark_config(mode, rounds, threads, value_size, ops, rpc_threads, ram_buffer_size_gb,
+def run_benchmark_config(rounds, threads, value_size, ops, rpc_threads, ram_buffer_size_gb,
                          batch=1, p2p_local_transfer_mode="te",
                          local_memcpy_async_worker_num=32,
-                         route_cache_max_memory_mb=300, route_cache_ttl_ms=60000,
-                         http_metadata_port=HTTP_METADATA_PORT):
-    """Run a specific configuration for a single mode."""
+                         route_cache_max_memory_mb=300, route_cache_ttl_ms=60000):
+    """Run a specific P2P configuration."""
     kill_existing_processes()
 
-    # Enable master's HttpMetadataServer so we can poll /health deterministically
-    # instead of sleeping a fixed 2s and hoping startup is fast enough.
     master_cmd = (
         f"{MASTER_BIN} --rpc_port={RPC_PORT} --metrics_port={METRICS_PORT} "
-        f"--deployment_mode={mode} --rpc_thread_num={rpc_threads} "
-        f"--enable_http_metadata_server=true "
-        f"--http_metadata_server_port={http_metadata_port}"
+        f"--rpc_thread_num={rpc_threads}"
     )
     master_proc = subprocess.Popen(master_cmd.split(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
-        wait_master_ready(http_metadata_port)
+        wait_master_ready(METRICS_PORT)
     except RuntimeError as e:
         master_proc.terminate()
         print(f"    [!] Master startup failed: {e}")
@@ -187,25 +182,24 @@ def run_benchmark_config(mode, rounds, threads, value_size, ops, rpc_threads, ra
     good_rounds = []
     bad_rounds = []
     for r in range(1, rounds + 1):
-        test_cmd = (f"{TEST_BIN} --client_type={mode} --num_threads={threads} --value_size={value_size} "
+        test_cmd = (f"{TEST_BIN} --num_threads={threads} --value_size={value_size} "
                     f"--test_operation_nums={ops} --ram_buffer_size_gb={ram_buffer_size_gb} --batch_size={batch}")
 
-        if mode == "P2P":
+        test_cmd += (
+            f" --p2p_local_transfer_mode={p2p_local_transfer_mode}"
+            f" --route_cache_max_memory_mb={route_cache_max_memory_mb}"
+            f" --route_cache_ttl_ms={route_cache_ttl_ms}"
+        )
+        if p2p_local_transfer_mode == "memcpy":
             test_cmd += (
-                f" --p2p_local_transfer_mode={p2p_local_transfer_mode}"
-                f" --route_cache_max_memory_mb={route_cache_max_memory_mb}"
-                f" --route_cache_ttl_ms={route_cache_ttl_ms}"
+                f" --local_memcpy_async_worker_num={local_memcpy_async_worker_num}"
             )
-            if p2p_local_transfer_mode == "memcpy":
-                test_cmd += (
-                    f" --local_memcpy_async_worker_num={local_memcpy_async_worker_num}"
-                )
 
         output = run_command(test_cmd)
         metrics, is_bad = parse_metrics(output)
         if is_bad:
             bad_rounds.append(metrics)
-            print(f"    [!] Mode {mode} Round {r}/{rounds} BAD "
+            print(f"    [!] Mode P2P Round {r}/{rounds} BAD "
                   f"(put_success={metrics['put_success_rate']:.1f}% "
                   f"get_success={metrics['get_success_rate']:.1f}%) — excluded from average.")
         else:
@@ -240,9 +234,8 @@ def parse_list_arg(arg, type_fn=int):
     return [type_fn(x.strip()) for x in str(arg).split(",")]
 
 def main():
-    parser = argparse.ArgumentParser(description="Mooncake Binary Stress Workload Runner")
+    parser = argparse.ArgumentParser(description="Mooncake P2P Stress Workload Runner")
     # Basic Config
-    parser.add_argument("--mode", type=str, default="both", choices=["Centralization", "P2P", "both"], help="Test mode")
     parser.add_argument("--rounds", type=int, default=5, help="Rounds per configuration")
     parser.add_argument("--ops", type=str, default="100", help="Batch operations per thread (list: 100,500,1000)")
     
@@ -265,8 +258,6 @@ def main():
     # Flags
     parser.add_argument("--matrix", action="store_true", help="Enable matrix sweep mode")
     parser.add_argument("--output", type=str, help="Output file path (ends in .csv or .json)")
-    parser.add_argument("--http_metadata_port", type=int, default=HTTP_METADATA_PORT,
-                        help="Port for master's HttpMetadataServer (used for readiness probe)")
     
     args = parser.parse_args()
     
@@ -276,9 +267,8 @@ def main():
     rpc_threads_list = parse_list_arg(args.rpc_threads)
     ops_list = parse_list_arg(args.ops)
     ram_list = parse_list_arg(args.ram_buffer_size_gb)
-    modes = ["Centralization", "P2P"] if args.mode == "both" else [args.mode]
     
-    # Global sweep dims (apply to all modes)
+    # Common P2P sweep dimensions.
     base_sweep_dims = {
         "value_size": value_list,
         "rpc_threads": rpc_threads_list,
@@ -317,11 +307,7 @@ def main():
     base_keys = list(base_sweep_dims.keys())
     base_combinations = list(itertools.product(*base_sweep_dims.values()))
 
-    total_runs = 0
-    if "Centralization" in modes:
-        total_runs += len(base_combinations)
-    if "P2P" in modes:
-        total_runs += len(base_combinations) * len(p2p_combinations)
+    total_runs = len(base_combinations) * len(p2p_combinations)
 
     current = 0
     print(f"Starting {('matrix' if args.matrix else 'comparison')} benchmark...")
@@ -331,52 +317,29 @@ def main():
         base_cfg = dict(zip(base_keys, base_combo))
         v_size, r_th, th, ops, r_buf_gb, batch = [base_cfg[k] for k in base_keys]
         
-        config_results = {}
-        
-        # 1. Run Centralization
-        if "Centralization" in modes:
+        for p2p_cfg in p2p_combinations:
             current += 1
-            print(f"\n[{current}/{total_runs}] Testing: mode=Centralization")
+            transfer_mode = p2p_cfg["p2p_local_transfer_mode"]
+            wk = p2p_cfg["local_memcpy_async_worker_num"]
+            rc_mem = p2p_cfg["route_cache_max_memory_mb"]
+            rc_ttl = p2p_cfg["route_cache_ttl_ms"]
+
+            print(f"\n[{current}/{total_runs}] Testing: mode=P2P")
             print(f"    threads={th}, batch={batch}, val={v_size/1024/1024:.1f}MB, rpc_threads={r_th}, ops={ops}, ram={r_buf_gb}GB")
-            avg = run_benchmark_config("Centralization", args.rounds, th, v_size, ops, r_th, r_buf_gb, batch=batch,
-                                       http_metadata_port=args.http_metadata_port)
+            extra = f"p2p_local_transfer_mode={transfer_mode}, route_cache={rc_mem}MB/{rc_ttl}ms"
+            if transfer_mode == "memcpy":
+                extra += f", local_memcpy_async_worker_num={wk}"
+            print(f"    {extra}")
+
+            avg = run_benchmark_config(args.rounds, th, v_size, ops, r_th, r_buf_gb,
+                                       batch=batch, p2p_local_transfer_mode=transfer_mode,
+                                       local_memcpy_async_worker_num=wk,
+                                       route_cache_max_memory_mb=rc_mem,
+                                       route_cache_ttl_ms=rc_ttl)
             if avg:
-                entry = {"mode": "Centralization", **base_cfg, **avg}
+                entry = {"mode": "P2P", **base_cfg, **p2p_cfg, **avg}
                 results.append(entry)
-                config_results["Centralization"] = avg
-                print_single_result("Centralization", avg)
-
-        # 2. Run P2P with all extra dims
-        if "P2P" in modes:
-            for p2p_cfg in p2p_combinations:
-                current += 1
-                transfer_mode = p2p_cfg["p2p_local_transfer_mode"]
-                wk = p2p_cfg["local_memcpy_async_worker_num"]
-                rc_mem = p2p_cfg["route_cache_max_memory_mb"]
-                rc_ttl = p2p_cfg["route_cache_ttl_ms"]
-
-                print(f"\n[{current}/{total_runs}] Testing: mode=P2P")
-                print(f"    threads={th}, batch={batch}, val={v_size/1024/1024:.1f}MB, rpc_threads={r_th}, ops={ops}, ram={r_buf_gb}GB")
-                extra = f"p2p_local_transfer_mode={transfer_mode}, route_cache={rc_mem}MB/{rc_ttl}ms"
-                if transfer_mode == "memcpy":
-                    extra += f", local_memcpy_async_worker_num={wk}"
-                print(f"    {extra}")
-
-                avg = run_benchmark_config("P2P", args.rounds, th, v_size, ops, r_th, r_buf_gb,
-                                           batch=batch, p2p_local_transfer_mode=transfer_mode,
-                                           local_memcpy_async_worker_num=wk,
-                                           route_cache_max_memory_mb=rc_mem,
-                                           route_cache_ttl_ms=rc_ttl,
-                                           http_metadata_port=args.http_metadata_port)
-                if avg:
-                    entry = {"mode": "P2P", **base_cfg, **p2p_cfg, **avg}
-                    results.append(entry)
-                    config_results["P2P"] = avg  # only last p2p result is kept for print_comparison_table
-                    print_single_result("P2P", avg)
-
-        # If comparison mode (single combo), we just show the comparison of Centralization vs LAST P2P run
-        if not args.matrix and "Centralization" in config_results and "P2P" in config_results:
-            print_comparison_table(th, v_size, r_th, ops, r_buf_gb, config_results, args.rounds)
+                print_single_result("P2P", avg)
 
     # If matrix mode or we have many results, show final summary
     if args.matrix:
@@ -394,39 +357,6 @@ def print_single_result(mode, avg):
           f"PUT P50/P99: {avg['put_p50']:.1f}/{avg['put_p99']:.1f} us  "
           f"GET P50/P99: {avg['get_p50']:.1f}/{avg['get_p99']:.1f} us  "
           f"(good={good}, bad={bad})")
-
-def print_comparison_table(threads, value_size, rpc_threads, ops, ram_buffer_size_gb, results, rounds):
-    print("\n" + "="*80)
-    print(f"Comparison Summary (Averages over {rounds} rounds)")
-    print(f"Config: threads={threads}, value_size={value_size}, rpc_threads={rpc_threads}, ops={ops}, ram_buffer={ram_buffer_size_gb}GB")
-    print("-" * 80)
-    print(f"{'Metric':<30} | {'Centralization':<20} | {'P2P':<20}")
-    print("-" * 80)
-
-    metrics_to_show = [
-        ("PUT Success Rate (%)", "put_success_rate", "{:.2f}"),
-        ("GET Success Rate (%)", "get_success_rate", "{:.2f}"),
-        ("PUT Ops/sec", "put_ops_sec", "{:.2f}"),
-        ("GET Ops/sec", "get_ops_sec", "{:.2f}"),
-        ("PUT Throughput (MB/s)", "put_throughput", "{:.2f}"),
-        ("GET Throughput (MB/s)", "get_throughput", "{:.2f}"),
-        ("PUT P50 (us)", "put_p50", "{:.1f}"),
-        ("PUT P70 (us)", "put_p70", "{:.1f}"),
-        ("PUT P99 (us)", "put_p99", "{:.1f}"),
-        ("GET P50 (us)", "get_p50", "{:.1f}"),
-        ("GET P70 (us)", "get_p70", "{:.1f}"),
-        ("GET P99 (us)", "get_p99", "{:.1f}"),
-        ("PUT Batch P50 (us)", "put_batch_p50", "{:.1f}"),
-        ("PUT Batch P99 (us)", "put_batch_p99", "{:.1f}"),
-        ("GET Batch P50 (us)", "get_batch_p50", "{:.1f}"),
-        ("GET Batch P99 (us)", "get_batch_p99", "{:.1f}"),
-    ]
-    
-    for label, key, fmt in metrics_to_show:
-        c_val = fmt.format(results["Centralization"].get(key, 0)) if "Centralization" in results else "N/A"
-        p_val = fmt.format(results["P2P"].get(key, 0)) if "P2P" in results else "N/A"
-        print(f"{label:<30} | {c_val:<20} | {p_val:<20}")
-    print("=" * 80 + "\n")
 
 def print_matrix_summary(results):
     print("\n" + "="*210)

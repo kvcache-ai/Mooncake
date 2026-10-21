@@ -10,8 +10,6 @@ namespace mooncake {
 
 // The configuration for the master server
 struct MasterConfig {
-    static constexpr int kDefaultRedisPort = 6379;
-
     bool enable_metric_reporting;
     uint32_t metrics_port;
     uint32_t rpc_port;
@@ -20,32 +18,14 @@ struct MasterConfig {
     int32_t rpc_conn_timeout_seconds;
     bool rpc_enable_tcp_no_delay;
 
-    // Dedicated heartbeat RPC server. When heartbeat_rpc_port > 0, Heartbeat is
-    // served by a separate coro_rpc_server with its own thread pool so that
-    // heavy metadata RPCs cannot head-of-line-block heartbeats. 0 = disabled,
-    // heartbeat is served on the main RPC server as a legacy fallback.
-    uint32_t heartbeat_rpc_port = 0;
-    uint32_t heartbeat_rpc_thread_num = 1;
-
     uint64_t default_kv_lease_ttl;
     uint64_t default_kv_soft_pin_ttl;
     bool allow_evict_soft_pinned_objects;
     double eviction_ratio;
     double eviction_high_watermark_ratio;
     int64_t client_live_ttl_sec;
-    int64_t client_crashed_ttl_sec = -1;
 
     bool enable_ha;
-    bool enable_oplog = false;
-    std::string oplog_store_type = "localfs";
-    std::string oplog_data_dir = "/tmp/mooncake_oplog";
-    uint64_t oplog_async_queue_max_entries = 100000;
-    std::string oplog_async_queue_overflow_mode = "reject";
-    uint64_t oplog_best_effort_max_retries = 3;
-    uint32_t standby_snapshot_service_port = 0;
-    std::string standby_snapshot_service_endpoint;
-    std::string standby_snapshot_sources;
-    uint32_t standby_snapshot_chunk_size = 256;
     bool enable_offload;
     std::string etcd_endpoints;
 
@@ -75,34 +55,6 @@ struct MasterConfig {
     std::string cxl_path;
     size_t cxl_size;
     bool enable_cxl = false;
-    uint64_t max_client_per_key;
-
-    std::string deployment_mode;
-
-    // Redis election backend configuration (used when election_backend ==
-    // "redis")
-    std::string election_backend = "etcd";  // "etcd" (default) or "redis"
-    std::string redis_endpoint;         // Redis endpoint, e.g. "10.0.0.1:6379"
-    std::string redis_username;         // Redis ACL username
-    std::string redis_password;         // Redis AUTH password (empty = no auth)
-    int redis_db_index = 0;             // Redis DB index
-    int redis_master_view_ttl_sec = 4;  // Leader key TTL in seconds
-    int redis_heartbeat_interval_sec = 1;  // KeepLeader renewal interval
-
-    void ApplyRedisEndpointDefaults() {
-        if (redis_endpoint.empty()) {
-            return;
-        }
-        if (redis_endpoint.front() == '[') {
-            if (redis_endpoint.back() == ']') {
-                redis_endpoint += ":" + std::to_string(kDefaultRedisPort);
-            }
-            return;
-        }
-        if (redis_endpoint.find(':') == std::string::npos) {
-            redis_endpoint += ":" + std::to_string(kDefaultRedisPort);
-        }
-    }
 };
 
 class MasterServiceSupervisorConfig {
@@ -118,7 +70,6 @@ class MasterServiceSupervisorConfig {
     RequiredParam<double> eviction_high_watermark_ratio{
         "eviction_high_watermark_ratio"};
     RequiredParam<int64_t> client_live_ttl_sec{"client_live_ttl_sec"};
-    RequiredParam<int64_t> client_crashed_ttl_sec{"client_crashed_ttl_sec"};
     RequiredParam<bool> enable_offload{"enable_offload"};
     RequiredParam<int> rpc_port{"rpc_port"};
     RequiredParam<size_t> rpc_thread_num{"rpc_thread_num"};
@@ -128,9 +79,6 @@ class MasterServiceSupervisorConfig {
     std::chrono::steady_clock::duration rpc_conn_timeout = std::chrono::seconds(
         0);  // Client connection timeout. 0 = no timeout (infinite)
     bool rpc_enable_tcp_no_delay = true;
-    // Dedicated heartbeat RPC server (0 = disabled, serve on main server).
-    uint32_t heartbeat_rpc_port = 0;
-    uint32_t heartbeat_rpc_thread_num = 1;
     std::string etcd_endpoints = "0.0.0.0:2379";
     std::string local_hostname = "0.0.0.0:50051";
     std::string cluster_id = DEFAULT_CLUSTER_ID;
@@ -141,16 +89,6 @@ class MasterServiceSupervisorConfig {
     uint64_t put_start_release_timeout_sec = DEFAULT_PUT_START_RELEASE_TIMEOUT;
     bool enable_disk_eviction = true;
     uint64_t quota_bytes = 0;
-    bool enable_oplog = false;
-    std::string oplog_store_type = "localfs";
-    std::string oplog_data_dir = "/tmp/mooncake_oplog";
-    uint64_t oplog_async_queue_max_entries = 100000;
-    std::string oplog_async_queue_overflow_mode = "reject";
-    uint64_t oplog_best_effort_max_retries = 3;
-    uint32_t standby_snapshot_service_port = 0;
-    std::string standby_snapshot_service_endpoint;
-    std::string standby_snapshot_sources;
-    uint32_t standby_snapshot_chunk_size = 256;
     uint32_t max_total_finished_tasks = DEFAULT_MAX_TOTAL_FINISHED_TASKS;
     uint32_t max_total_pending_tasks = DEFAULT_MAX_TOTAL_PENDING_TASKS;
     uint32_t max_total_processing_tasks = DEFAULT_MAX_TOTAL_PROCESSING_TASKS;
@@ -158,22 +96,10 @@ class MasterServiceSupervisorConfig {
         DEFAULT_PENDING_TASK_TIMEOUT_SEC;  // 0 = no timeout(infinite)
     uint64_t processing_task_timeout_sec =
         DEFAULT_PROCESSING_TASK_TIMEOUT_SEC;  // 0 = no timeout(infinite)
-    uint64_t max_client_per_key = 1;
-    DeploymentMode deployment_mode = DeploymentMode::CENTRALIZATION;
 
     std::string cxl_path = DEFAULT_CXL_PATH;
     size_t cxl_size = DEFAULT_CXL_SIZE;
     bool enable_cxl = false;
-
-    // Redis election backend configuration
-    ElectionBackend election_backend = ElectionBackend::ETCD;
-    std::string redis_endpoint;            // Redis endpoint for election
-    std::string redis_username;            // Redis ACL username
-    std::string redis_password;            // Redis AUTH password
-    int redis_db_index = 0;                // Redis DB index
-    int redis_master_view_ttl_sec = 4;     // Leader key TTL in seconds
-    int redis_heartbeat_interval_sec = 1;  // KeepLeader renewal interval
-
     MasterServiceSupervisorConfig() = default;
 
     // From MasterConfig
@@ -188,7 +114,6 @@ class MasterServiceSupervisorConfig {
         eviction_ratio = config.eviction_ratio;
         eviction_high_watermark_ratio = config.eviction_high_watermark_ratio;
         client_live_ttl_sec = config.client_live_ttl_sec;
-        client_crashed_ttl_sec = config.client_crashed_ttl_sec;
         enable_offload = config.enable_offload;
         rpc_port = static_cast<int>(config.rpc_port);
         rpc_thread_num = static_cast<size_t>(config.rpc_thread_num);
@@ -198,8 +123,6 @@ class MasterServiceSupervisorConfig {
         rpc_conn_timeout =
             std::chrono::seconds(config.rpc_conn_timeout_seconds);
         rpc_enable_tcp_no_delay = config.rpc_enable_tcp_no_delay;
-        heartbeat_rpc_port = config.heartbeat_rpc_port;
-        heartbeat_rpc_thread_num = config.heartbeat_rpc_thread_num;
         etcd_endpoints = config.etcd_endpoints;
         local_hostname = rpc_address + ":" + std::to_string(rpc_port);
         cluster_id = config.cluster_id;
@@ -217,52 +140,16 @@ class MasterServiceSupervisorConfig {
         put_start_release_timeout_sec = config.put_start_release_timeout_sec;
         enable_disk_eviction = config.enable_disk_eviction;
         quota_bytes = config.quota_bytes;
-        enable_oplog = config.enable_oplog;
-        oplog_store_type = config.oplog_store_type;
-        oplog_data_dir = config.oplog_data_dir;
-        oplog_async_queue_max_entries = config.oplog_async_queue_max_entries;
-        oplog_async_queue_overflow_mode =
-            config.oplog_async_queue_overflow_mode;
-        oplog_best_effort_max_retries = config.oplog_best_effort_max_retries;
-        standby_snapshot_service_port = config.standby_snapshot_service_port;
-        standby_snapshot_service_endpoint =
-            config.standby_snapshot_service_endpoint;
-        standby_snapshot_sources = config.standby_snapshot_sources;
-        standby_snapshot_chunk_size = config.standby_snapshot_chunk_size;
 
         max_total_finished_tasks = config.max_total_finished_tasks;
         max_total_pending_tasks = config.max_total_pending_tasks;
         max_total_processing_tasks = config.max_total_processing_tasks;
         pending_task_timeout_sec = config.pending_task_timeout_sec;
         processing_task_timeout_sec = config.processing_task_timeout_sec;
-        max_client_per_key = config.max_client_per_key;
-        if (config.deployment_mode == "Centralization") {
-            deployment_mode = DeploymentMode::CENTRALIZATION;
-        } else {
-            deployment_mode = DeploymentMode::P2P;
-        }
 
         cxl_path = config.cxl_path;
         cxl_size = config.cxl_size;
         enable_cxl = config.enable_cxl;
-
-        // Election backend configuration
-        if (config.election_backend == "redis") {
-            election_backend = ElectionBackend::REDIS;
-        } else if (config.election_backend == "etcd") {
-            election_backend = ElectionBackend::ETCD;
-        } else {
-            throw std::runtime_error(
-                "Unknown election_backend: " + config.election_backend +
-                ". Must be 'etcd' or 'redis'");
-        }
-        redis_endpoint = config.redis_endpoint;
-        redis_username = config.redis_username;
-        redis_password = config.redis_password;
-        redis_db_index = config.redis_db_index;
-        redis_master_view_ttl_sec = config.redis_master_view_ttl_sec;
-        redis_heartbeat_interval_sec = config.redis_heartbeat_interval_sec;
-
         validate();
     }
 
@@ -297,37 +184,11 @@ class MasterServiceSupervisorConfig {
         if (!client_live_ttl_sec.IsSet()) {
             throw std::runtime_error("client_live_ttl_sec is not set");
         }
-        if (!client_crashed_ttl_sec.IsSet()) {
-            throw std::runtime_error("client_crashed_ttl_sec is not set");
-        }
         if (!rpc_port.IsSet()) {
             throw std::runtime_error("rpc_port is not set");
         }
         if (!rpc_thread_num.IsSet()) {
             throw std::runtime_error("rpc_thread_num is not set");
-        }
-        // Validate Redis election backend configuration
-        if (election_backend == ElectionBackend::REDIS &&
-            redis_endpoint.empty()) {
-            throw std::runtime_error(
-                "redis_endpoint is required when election_backend is redis");
-        }
-        if (election_backend == ElectionBackend::REDIS) {
-            if (redis_master_view_ttl_sec <= 0) {
-                throw std::runtime_error(
-                    "redis_master_view_ttl_sec must be greater than 0");
-            }
-            if (redis_heartbeat_interval_sec <= 0) {
-                throw std::runtime_error(
-                    "redis_heartbeat_interval_sec must be greater than 0");
-            }
-            if (redis_heartbeat_interval_sec >= redis_master_view_ttl_sec) {
-                throw std::runtime_error(
-                    "redis_heartbeat_interval_sec (" +
-                    std::to_string(redis_heartbeat_interval_sec) +
-                    ") must be less than redis_master_view_ttl_sec (" +
-                    std::to_string(redis_master_view_ttl_sec) + ")");
-            }
         }
     }
 };
@@ -343,27 +204,12 @@ class WrappedMasterServiceConfig {
         DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS;
     bool enable_metric_reporting = true;
     uint16_t http_port = 9003;
-    // Dedicated heartbeat RPC server port (0 = legacy: Heartbeat served on the
-    // main server). Exposed to clients via HeartbeatServiceReady so they can
-    // detect a client/master heartbeat-routing mismatch at Connect time.
-    uint32_t heartbeat_rpc_port = 0;
     double eviction_ratio = DEFAULT_EVICTION_RATIO;
     double eviction_high_watermark_ratio =
         DEFAULT_EVICTION_HIGH_WATERMARK_RATIO;
     ViewVersionId view_version = 0;
     int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC;
-    int64_t client_crashed_ttl_sec = DEFAULT_CLIENT_CRASHED_TTL_SEC;
     bool enable_ha = false;
-    bool enable_oplog = false;
-    std::string oplog_store_type = "localfs";
-    std::string oplog_data_dir = "/tmp/mooncake_oplog";
-    uint64_t oplog_async_queue_max_entries = 100000;
-    std::string oplog_async_queue_overflow_mode = "reject";
-    uint64_t oplog_best_effort_max_retries = 3;
-    std::string redis_endpoint;
-    std::string redis_username;
-    std::string redis_password;
-    int redis_db_index = 0;
     bool enable_offload = false;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
@@ -373,7 +219,6 @@ class WrappedMasterServiceConfig {
     uint64_t put_start_release_timeout_sec = DEFAULT_PUT_START_RELEASE_TIMEOUT;
     bool enable_disk_eviction = true;
     uint64_t quota_bytes = 0;
-    uint64_t max_client_per_key = 1;
 
     uint32_t max_total_finished_tasks = DEFAULT_MAX_TOTAL_FINISHED_TASKS;
     uint32_t max_total_pending_tasks = DEFAULT_MAX_TOTAL_PENDING_TASKS;
@@ -400,31 +245,17 @@ class WrappedMasterServiceConfig {
             config.allow_evict_soft_pinned_objects;
         enable_metric_reporting = config.enable_metric_reporting;
         http_port = static_cast<uint16_t>(config.metrics_port);
-        heartbeat_rpc_port = config.heartbeat_rpc_port;
         eviction_ratio = config.eviction_ratio;
         eviction_high_watermark_ratio = config.eviction_high_watermark_ratio;
         view_version = view_version_param;
         client_live_ttl_sec = config.client_live_ttl_sec;
-        client_crashed_ttl_sec = config.client_crashed_ttl_sec;
         enable_ha = config.enable_ha;
-        enable_oplog = config.enable_oplog;
-        oplog_store_type = config.oplog_store_type;
-        oplog_data_dir = config.oplog_data_dir;
-        oplog_async_queue_max_entries = config.oplog_async_queue_max_entries;
-        oplog_async_queue_overflow_mode =
-            config.oplog_async_queue_overflow_mode;
-        oplog_best_effort_max_retries = config.oplog_best_effort_max_retries;
-        redis_endpoint = config.redis_endpoint;
-        redis_username = config.redis_username;
-        redis_password = config.redis_password;
-        redis_db_index = config.redis_db_index;
         enable_offload = config.enable_offload;
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
         global_file_segment_size = config.global_file_segment_size;
         enable_disk_eviction = config.enable_disk_eviction;
         quota_bytes = config.quota_bytes;
-        max_client_per_key = config.max_client_per_key;
 
         // Convert string memory_allocator to BufferAllocatorType enum
         if (config.memory_allocator == "cachelib") {
@@ -459,24 +290,12 @@ class WrappedMasterServiceConfig {
             config.allow_evict_soft_pinned_objects;
         enable_metric_reporting = config.enable_metric_reporting;
         http_port = static_cast<uint16_t>(config.metrics_port);
-        heartbeat_rpc_port = config.heartbeat_rpc_port;
         eviction_ratio = config.eviction_ratio;
         eviction_high_watermark_ratio = config.eviction_high_watermark_ratio;
         view_version = view_version_param;
         client_live_ttl_sec = config.client_live_ttl_sec;
         enable_ha =
             true;  // This is used in HA mode, so enable_ha should be true
-        enable_oplog = config.enable_oplog;
-        oplog_store_type = config.oplog_store_type;
-        oplog_data_dir = config.oplog_data_dir;
-        oplog_async_queue_max_entries = config.oplog_async_queue_max_entries;
-        oplog_async_queue_overflow_mode =
-            config.oplog_async_queue_overflow_mode;
-        oplog_best_effort_max_retries = config.oplog_best_effort_max_retries;
-        redis_endpoint = config.redis_endpoint;
-        redis_username = config.redis_username;
-        redis_password = config.redis_password;
-        redis_db_index = config.redis_db_index;
         enable_offload = config.enable_offload;
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
@@ -484,7 +303,6 @@ class WrappedMasterServiceConfig {
         memory_allocator = config.memory_allocator;
         enable_disk_eviction = config.enable_disk_eviction;
         quota_bytes = config.quota_bytes;
-        max_client_per_key = config.max_client_per_key;
         put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
         put_start_release_timeout_sec = config.put_start_release_timeout_sec;
         max_total_finished_tasks = config.max_total_finished_tasks;
@@ -514,17 +332,7 @@ class MasterServiceConfigBuilder {
         DEFAULT_EVICTION_HIGH_WATERMARK_RATIO;
     ViewVersionId view_version_ = 0;
     int64_t client_live_ttl_sec_ = DEFAULT_CLIENT_LIVE_TTL_SEC;
-    // We use a separate flag to track if crashed ttl is explicitly set
-    bool client_crashed_ttl_sec_set_ = false;
-    int64_t client_crashed_ttl_sec_ = DEFAULT_CLIENT_CRASHED_TTL_SEC;
-
     bool enable_ha_ = false;
-    bool enable_oplog_ = false;
-    std::string oplog_store_type_ = "localfs";
-    std::string oplog_data_dir_ = "/tmp/mooncake_oplog";
-    uint64_t oplog_async_queue_max_entries_ = 100000;
-    std::string oplog_async_queue_overflow_mode_ = "reject";
-    uint64_t oplog_best_effort_max_retries_ = 3;
     bool enable_offload_ = false;
     std::string cluster_id_ = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir_ = DEFAULT_ROOT_FS_DIR;
@@ -532,7 +340,6 @@ class MasterServiceConfigBuilder {
     BufferAllocatorType memory_allocator_ = BufferAllocatorType::OFFSET;
     bool enable_disk_eviction_ = true;
     uint64_t quota_bytes_ = 0;
-    uint64_t max_client_per_key_ = 1;
     uint64_t put_start_discard_timeout_sec_ = DEFAULT_PUT_START_DISCARD_TIMEOUT;
     uint64_t put_start_release_timeout_sec_ = DEFAULT_PUT_START_RELEASE_TIMEOUT;
     uint32_t max_total_finished_tasks_ = DEFAULT_MAX_TOTAL_FINISHED_TASKS;
@@ -585,47 +392,8 @@ class MasterServiceConfigBuilder {
         return *this;
     }
 
-    MasterServiceConfigBuilder& set_client_crashed_ttl_sec(int64_t ttl) {
-        client_crashed_ttl_sec_ = ttl;
-        client_crashed_ttl_sec_set_ = true;
-        return *this;
-    }
-
     MasterServiceConfigBuilder& set_enable_ha(bool enable) {
         enable_ha_ = enable;
-        return *this;
-    }
-
-    MasterServiceConfigBuilder& set_enable_oplog(bool enable) {
-        enable_oplog_ = enable;
-        return *this;
-    }
-
-    MasterServiceConfigBuilder& set_oplog_store_type(const std::string& type) {
-        oplog_store_type_ = type;
-        return *this;
-    }
-
-    MasterServiceConfigBuilder& set_oplog_data_dir(const std::string& dir) {
-        oplog_data_dir_ = dir;
-        return *this;
-    }
-
-    MasterServiceConfigBuilder& set_oplog_async_queue_max_entries(
-        uint64_t max_entries) {
-        oplog_async_queue_max_entries_ = max_entries;
-        return *this;
-    }
-
-    MasterServiceConfigBuilder& set_oplog_async_queue_overflow_mode(
-        const std::string& mode) {
-        oplog_async_queue_overflow_mode_ = mode;
-        return *this;
-    }
-
-    MasterServiceConfigBuilder& set_oplog_best_effort_max_retries(
-        uint64_t max_retries) {
-        oplog_best_effort_max_retries_ = max_retries;
         return *this;
     }
 
@@ -653,11 +421,6 @@ class MasterServiceConfigBuilder {
     MasterServiceConfigBuilder& set_memory_allocator(
         BufferAllocatorType allocator) {
         memory_allocator_ = allocator;
-        return *this;
-    }
-
-    MasterServiceConfigBuilder& set_max_client_per_key(uint64_t limit) {
-        max_client_per_key_ = limit;
         return *this;
     }
 
@@ -739,18 +502,7 @@ class MasterServiceConfig {
         DEFAULT_EVICTION_HIGH_WATERMARK_RATIO;
     ViewVersionId view_version = 0;
     int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC;
-    int64_t client_crashed_ttl_sec = DEFAULT_CLIENT_CRASHED_TTL_SEC;
     bool enable_ha = false;
-    bool enable_oplog = false;
-    std::string oplog_store_type = "localfs";
-    std::string oplog_data_dir = "/tmp/mooncake_oplog";
-    uint64_t oplog_async_queue_max_entries = 100000;
-    std::string oplog_async_queue_overflow_mode = "reject";
-    uint64_t oplog_best_effort_max_retries = 3;
-    std::string redis_endpoint;
-    std::string redis_username;
-    std::string redis_password;
-    int redis_db_index = 0;
     bool enable_offload = false;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
@@ -768,7 +520,6 @@ class MasterServiceConfig {
         .pending_task_timeout_sec = DEFAULT_PENDING_TASK_TIMEOUT_SEC,
         .processing_task_timeout_sec = DEFAULT_PROCESSING_TASK_TIMEOUT_SEC,
     };
-    uint64_t max_client_per_key = 1;
 
     std::string cxl_path = DEFAULT_CXL_PATH;
     size_t cxl_size = DEFAULT_CXL_SIZE;
@@ -787,19 +538,7 @@ class MasterServiceConfig {
         eviction_high_watermark_ratio = config.eviction_high_watermark_ratio;
         view_version = config.view_version;
         client_live_ttl_sec = config.client_live_ttl_sec;
-        client_crashed_ttl_sec = config.client_crashed_ttl_sec;
         enable_ha = config.enable_ha;
-        enable_oplog = config.enable_oplog;
-        oplog_store_type = config.oplog_store_type;
-        oplog_data_dir = config.oplog_data_dir;
-        oplog_async_queue_max_entries = config.oplog_async_queue_max_entries;
-        oplog_async_queue_overflow_mode =
-            config.oplog_async_queue_overflow_mode;
-        oplog_best_effort_max_retries = config.oplog_best_effort_max_retries;
-        redis_endpoint = config.redis_endpoint;
-        redis_username = config.redis_username;
-        redis_password = config.redis_password;
-        redis_db_index = config.redis_db_index;
         enable_offload = config.enable_offload;
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
@@ -808,7 +547,6 @@ class MasterServiceConfig {
             config.enable_cxl ? cxl_allocator_type : config.memory_allocator;
         enable_disk_eviction = config.enable_disk_eviction;
         quota_bytes = config.quota_bytes;
-        max_client_per_key = config.max_client_per_key;
         put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
         put_start_release_timeout_sec = config.put_start_release_timeout_sec;
         task_manager_config.max_total_finished_tasks =
@@ -840,14 +578,7 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.eviction_high_watermark_ratio = eviction_high_watermark_ratio_;
     config.view_version = view_version_;
     config.client_live_ttl_sec = client_live_ttl_sec_;
-    config.client_crashed_ttl_sec = client_crashed_ttl_sec_;
     config.enable_ha = enable_ha_;
-    config.enable_oplog = enable_oplog_;
-    config.oplog_store_type = oplog_store_type_;
-    config.oplog_data_dir = oplog_data_dir_;
-    config.oplog_async_queue_max_entries = oplog_async_queue_max_entries_;
-    config.oplog_async_queue_overflow_mode = oplog_async_queue_overflow_mode_;
-    config.oplog_best_effort_max_retries = oplog_best_effort_max_retries_;
     config.enable_offload = enable_offload_;
     config.cluster_id = cluster_id_;
     config.root_fs_dir = root_fs_dir_;
@@ -870,20 +601,6 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.cxl_path = cxl_path_;
     config.cxl_size = cxl_size_;
     config.enable_cxl = enable_cxl_;
-    config.max_client_per_key = max_client_per_key_;
-
-    // Logic for client_crashed_ttl_sec
-    if (client_crashed_ttl_sec_set_) {
-        // User explicitly set it, so we must validate it is >= live ttl
-        if (config.client_crashed_ttl_sec < config.client_live_ttl_sec) {
-            throw std::invalid_argument(
-                "client_crashed_ttl_sec must be >= client_live_ttl_sec");
-        }
-    } else {
-        // User did not set it, defaults to 3 * live ttl
-        config.client_crashed_ttl_sec = config.client_live_ttl_sec * 3;
-    }
-
     return config;
 }
 
@@ -901,12 +618,6 @@ struct InProcMasterConfig {
     std::optional<bool> enable_cxl;
     std::optional<std::string> cxl_path;
     std::optional<size_t> cxl_size;
-    std::optional<int64_t> client_live_ttl_sec;
-    std::optional<int64_t> client_crashed_ttl_sec;
-    // Dedicated heartbeat RPC server port (>0 enables; nullopt => free port
-    // only honored when explicitly requested via Start).
-    std::optional<int> heartbeat_rpc_port;
-    std::optional<uint32_t> heartbeat_rpc_thread_num;
 };
 
 // Builder class for InProcMasterConfig
@@ -919,10 +630,6 @@ class InProcMasterConfigBuilder {
     std::optional<bool> enable_cxl_ = std::nullopt;
     std::optional<std::string> cxl_path_ = std::nullopt;
     std::optional<size_t> cxl_size_ = std::nullopt;
-    std::optional<int64_t> client_live_ttl_sec_ = std::nullopt;
-    std::optional<int64_t> client_crashed_ttl_sec_ = std::nullopt;
-    std::optional<int> heartbeat_rpc_port_ = std::nullopt;
-    std::optional<uint32_t> heartbeat_rpc_thread_num_ = std::nullopt;
 
    public:
     InProcMasterConfigBuilder() = default;
@@ -962,26 +669,6 @@ class InProcMasterConfigBuilder {
         return *this;
     }
 
-    InProcMasterConfigBuilder& set_client_live_ttl_sec(int64_t ttl) {
-        client_live_ttl_sec_ = ttl;
-        return *this;
-    }
-
-    InProcMasterConfigBuilder& set_client_crashed_ttl_sec(int64_t ttl) {
-        client_crashed_ttl_sec_ = ttl;
-        return *this;
-    }
-
-    InProcMasterConfigBuilder& set_heartbeat_rpc_port(int port) {
-        heartbeat_rpc_port_ = port;
-        return *this;
-    }
-
-    InProcMasterConfigBuilder& set_heartbeat_rpc_thread_num(uint32_t num) {
-        heartbeat_rpc_thread_num_ = num;
-        return *this;
-    }
-
     InProcMasterConfig build() const;
 };
 
@@ -995,10 +682,6 @@ inline InProcMasterConfig InProcMasterConfigBuilder::build() const {
     config.enable_cxl = enable_cxl_;
     config.cxl_path = cxl_path_;
     config.cxl_size = cxl_size_;
-    config.client_live_ttl_sec = client_live_ttl_sec_;
-    config.client_crashed_ttl_sec = client_crashed_ttl_sec_;
-    config.heartbeat_rpc_port = heartbeat_rpc_port_;
-    config.heartbeat_rpc_thread_num = heartbeat_rpc_thread_num_;
     return config;
 }
 

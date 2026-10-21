@@ -22,6 +22,8 @@ class RuntimeConfigTest : public ::testing::Test {
    protected:
     static std::shared_ptr<P2PClientService> CreateP2PClient(
         const std::string& host_name, uint32_t rpc_port, uint16_t http_port) {
+        // TODO(C2): Bind the client listener atomically and publish its actual
+        // port after runtime ownership is split; remove the port-probe race.
         auto config = ClientConfigBuilder::build_p2p_real_client(
             host_name, "P2PHANDSHAKE", "tcp", std::nullopt, master_address_,
             R"({"tiers": [{"type": "DRAM", "capacity": 67108864, "priority": 100}]})",
@@ -33,7 +35,11 @@ class RuntimeConfigTest : public ::testing::Test {
             config.enable_http_server, config.labels);
 
         auto err = client->Init(config);
-        EXPECT_EQ(err, ErrorCode::OK);
+        if (err != ErrorCode::OK) {
+            LOG(ERROR) << "P2P fixture initialization failed: " << err;
+            ADD_FAILURE() << "Init failed: " << static_cast<int>(err);
+            return nullptr;
+        }
         return client;
     }
 
@@ -52,6 +58,9 @@ class RuntimeConfigTest : public ::testing::Test {
         http_base_url_ =
             "http://127.0.0.1:" + std::to_string(client_->GetHttpPort());
 
+        // TODO(C2/C4): Separate shared-facade configuration checks by concrete
+        // client architecture; preserve A00 centralized behavior and
+        // assertions.
         centralized_store_ = std::make_unique<RuntimeConfigStore>(
             DeploymentMode::CENTRALIZATION);
     }

@@ -12,8 +12,7 @@
 
 #include <xxhash.h>
 
-#include "p2p/ha/metadata_store.h"
-#include "p2p/ha/oplog/oplog_applier.h"
+#include "p2p/ha/oplog/p2p_oplog_applier.h"
 #include "p2p/ha/oplog/oplog_change_notifier.h"
 #include "p2p/ha/oplog/oplog_manager.h"
 #include "p2p/ha/oplog/oplog_serializer.h"
@@ -22,23 +21,6 @@
 #include "types.h"
 
 namespace mooncake::test {
-
-// Minimal MetadataStore implementation for OpLogApplier
-class MinimalMockMetadataStore : public MetadataStore {
-   public:
-    bool PutMetadata(const std::string&,
-                     const StandbyObjectMetadata&) override {
-        return true;
-    }
-    bool Put(const std::string&, const std::string&) override { return true; }
-    std::optional<StandbyObjectMetadata> GetMetadata(
-        const std::string&) const override {
-        return std::nullopt;
-    }
-    bool Remove(const std::string&) override { return true; }
-    bool Exists(const std::string&) const override { return false; }
-    size_t GetKeyCount() const override { return 0; }
-};
 
 // In-memory MockOpLogChangeNotifier for tests
 class MockOpLogChangeNotifier : public OpLogChangeNotifier {
@@ -92,6 +74,23 @@ OpLogEntry MakeEntry(uint64_t seq, OpType type, const std::string& key,
     return e;
 }
 
+std::string MakePublishPayload(const std::string& key) {
+    PublishRoutePayload payload;
+    payload.object_key = key;
+    payload.client_id = {1, 2};
+    payload.segment_id = {3, 4};
+    payload.size = 1024;
+    return SerializeP2PPayload(payload);
+}
+
+std::string MakeWithdrawPayload(const std::string& key) {
+    WithdrawRoutePayload payload;
+    payload.object_key = key;
+    payload.client_id = {1, 2};
+    payload.segment_id = {3, 4};
+    return SerializeP2PPayload(payload);
+}
+
 class SparseReadOpLogStore : public MockOpLogStore {
    public:
     ErrorCode ReadOpLogSinceWithProgress(uint64_t start_sequence_id,
@@ -101,8 +100,10 @@ class SparseReadOpLogStore : public MockOpLogStore {
         entries.clear();
         progress.last_scanned_sequence_id = start_sequence_id;
         if (start_sequence_id == 0) {
-            entries.push_back(MakeEntry(1, OpType::REMOVE, "key1", ""));
-            entries.push_back(MakeEntry(3, OpType::REMOVE, "key3", ""));
+            entries.push_back(MakeEntry(1, OpType_WITHDRAW_ROUTE, "key1",
+                                        MakeWithdrawPayload("key1")));
+            entries.push_back(MakeEntry(3, OpType_WITHDRAW_ROUTE, "key3",
+                                        MakeWithdrawPayload("key3")));
             progress.last_scanned_sequence_id = 4;
         }
         return ErrorCode::OK;
@@ -114,9 +115,9 @@ class OpLogReplicatorTest : public ::testing::Test {
     void SetUp() override {
         google::InitGoogleLogging("OpLogReplicatorTest");
         FLAGS_logtostderr = 1;
-        metadata_store_ = std::make_unique<MinimalMockMetadataStore>();
+        metadata_store_ = std::make_unique<P2PStandbyMetadataStore>();
         applier_ =
-            std::make_unique<OpLogApplier>(metadata_store_.get(), "test");
+            std::make_unique<P2POpLogApplier>(metadata_store_.get(), "test");
         notifier_ = std::make_unique<MockOpLogChangeNotifier>();
         replicator_ =
             std::make_unique<OpLogReplicator>(notifier_.get(), applier_.get());
@@ -131,8 +132,8 @@ class OpLogReplicatorTest : public ::testing::Test {
 
     MockOpLogChangeNotifier& Notifier() { return *notifier_; }
 
-    std::unique_ptr<MinimalMockMetadataStore> metadata_store_;
-    std::unique_ptr<OpLogApplier> applier_;
+    std::unique_ptr<P2PStandbyMetadataStore> metadata_store_;
+    std::unique_ptr<P2POpLogApplier> applier_;
     std::unique_ptr<MockOpLogChangeNotifier> notifier_;
     std::unique_ptr<OpLogReplicator> replicator_;
 };
@@ -156,22 +157,29 @@ TEST_F(OpLogReplicatorTest, TestStartFromSequenceId) {
 TEST_F(OpLogReplicatorTest, InjectEntry_Applied) {
     replicator_->StartFromSequenceId(0);
 
-    OpLogEntry entry = MakeEntry(1, OpType::PUT_END, "key1", "payload1");
+    OpLogEntry entry =
+        MakeEntry(1, OpType_PUBLISH_ROUTE, "key1", MakePublishPayload("key1"));
     Notifier().InjectEntry(entry);
 
     EXPECT_EQ(1u, replicator_->GetLastProcessedSequenceId());
     EXPECT_EQ(2u, applier_->GetExpectedSequenceId());
+    EXPECT_TRUE(metadata_store_->RouteExists("key1"));
 }
 
 TEST_F(OpLogReplicatorTest, InjectMultipleEntries_SequenceTracking) {
     replicator_->StartFromSequenceId(0);
 
-    Notifier().InjectEntry(MakeEntry(1, OpType::PUT_END, "k1", "p1"));
-    Notifier().InjectEntry(MakeEntry(2, OpType::PUT_END, "k2", "p2"));
-    Notifier().InjectEntry(MakeEntry(3, OpType::REMOVE, "k3", ""));
+    Notifier().InjectEntry(
+        MakeEntry(1, OpType_PUBLISH_ROUTE, "k1", MakePublishPayload("k1")));
+    Notifier().InjectEntry(
+        MakeEntry(2, OpType_PUBLISH_ROUTE, "k2", MakePublishPayload("k2")));
+    Notifier().InjectEntry(
+        MakeEntry(3, OpType_WITHDRAW_ROUTE, "k3", MakeWithdrawPayload("k3")));
 
     EXPECT_EQ(3u, replicator_->GetLastProcessedSequenceId());
     EXPECT_EQ(4u, applier_->GetExpectedSequenceId());
+    EXPECT_TRUE(metadata_store_->RouteExists("k1"));
+    EXPECT_TRUE(metadata_store_->RouteExists("k2"));
 }
 
 TEST_F(OpLogReplicatorTest, InjectError_NotifiesCallback) {
@@ -209,7 +217,8 @@ TEST_F(OpLogReplicatorTest, FatalApplyFailureMarksReplicatorUnhealthy) {
 TEST_F(OpLogReplicatorTest, MaintenanceProcessesFinalGap) {
     replicator_->StartFromSequenceId(0);
 
-    Notifier().InjectEntry(MakeEntry(2, OpType::REMOVE, "key2", ""));
+    Notifier().InjectEntry(MakeEntry(2, OpType_WITHDRAW_ROUTE, "key2",
+                                     MakeWithdrawPayload("key2")));
     EXPECT_EQ(0u, replicator_->GetLastProcessedSequenceId());
     EXPECT_EQ(1u, applier_->GetExpectedSequenceId());
 
@@ -224,7 +233,8 @@ TEST_F(OpLogReplicatorTest, MaintenanceProcessesFinalGap) {
 TEST_F(OpLogReplicatorTest, ConfirmedGapIsProcessedImmediately) {
     replicator_->StartFromSequenceId(0);
 
-    Notifier().InjectEntry(MakeEntry(2, OpType::REMOVE, "key2", ""));
+    Notifier().InjectEntry(MakeEntry(2, OpType_WITHDRAW_ROUTE, "key2",
+                                     MakeWithdrawPayload("key2")));
     Notifier().RunMaintenance({1});
 
     EXPECT_EQ(2u, replicator_->GetLastProcessedSequenceId());

@@ -5,6 +5,7 @@
 #include <unordered_map>
 
 #include "client_config_builder.h"
+#include "client_service.h"
 
 namespace mooncake {
 namespace {
@@ -18,6 +19,14 @@ const char* kTieredConfigJson = R"({
     }
   ]
 })";
+
+// Architecture-separation contract, separate from the A00 reconnect suite.
+TEST(ClientConfigBuilderTest, CentralizedClientRejectsRedisMasterDiscovery) {
+    auto config = ClientConfigBuilder::build_centralized_real_client(
+        "127.0.0.1:18000", "P2PHANDSHAKE", "tcp", std::nullopt,
+        "redis://127.0.0.1:6379");
+    EXPECT_FALSE(ClientService::Create(config).has_value());
+}
 
 TEST(ClientConfigBuilderTest, BuildP2PClientConfigUsesDefaults) {
     auto config = ClientConfigBuilder::build_p2p_real_client(

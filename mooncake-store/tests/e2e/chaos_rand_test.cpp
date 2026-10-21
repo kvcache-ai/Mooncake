@@ -8,6 +8,7 @@
 
 #include "client_wrapper.h"
 #include "e2e_utils.h"
+#include "ha_helper.h"
 #include "process_handler.h"
 #include "types.h"
 #include "utils.h"

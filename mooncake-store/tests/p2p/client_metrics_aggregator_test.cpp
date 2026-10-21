@@ -10,10 +10,11 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "p2p/client/heartbeat_type.h"
-#include "p2p/client/p2p_client_metric.h"
+#include "p2p/util/metric_util.h"
 #include "p2p/master/p2p_master_metric_manager.h"
 
 namespace mooncake {
@@ -39,6 +40,32 @@ void ExpectMetricValue(const std::string& text, const std::string& name,
     auto value = ParseMetricValue(text, name);
     ASSERT_TRUE(value.has_value()) << "metric not found: " << name;
     EXPECT_EQ(*value, expected);
+}
+
+size_t NumRetentionBuckets() {
+    return p2p::metric_util::LifetimeBuckets().size() + 1;
+}
+
+std::vector<int64_t> ZeroRetentionBuckets() {
+    return std::vector<int64_t>(NumRetentionBuckets(), 0);
+}
+
+std::vector<int64_t> RetentionBucketWith(size_t index, int64_t count) {
+    std::vector<int64_t> buckets(NumRetentionBuckets(), 0);
+    buckets[index] = count;
+    return buckets;
+}
+
+ClientMetricSnapshot MakeRetentionSnapshot(
+    int64_t live_count, int64_t removed_total,
+    std::vector<int64_t> live_age_buckets,
+    std::vector<int64_t> removed_buckets) {
+    ClientMetricSnapshot snap;
+    snap.key_retention.live_count = live_count;
+    snap.key_retention.removed_total = removed_total;
+    snap.key_retention.live_age_buckets = std::move(live_age_buckets);
+    snap.key_retention.removed_buckets = std::move(removed_buckets);
+    return snap;
 }
 
 }  // namespace
@@ -270,7 +297,9 @@ TEST_F(ClientMetricsAggregatorTest, ConcurrentUpdateSerializeAndRemove) {
                 UUID client_id{static_cast<uint64_t>(t + 1),
                                static_cast<uint64_t>(c + 1)};
                 for (int i = 1; i <= kIterations; ++i) {
-                    ClientMetricSnapshot snap;
+                    auto snap = MakeRetentionSnapshot(
+                        i, i * 2, RetentionBucketWith(0, i),
+                        RetentionBucketWith(1, i * 2));
                     snap.total_request.get_requests = i;
                     snap.total_request.get_bytes = i * 10;
                     snap.remote_request.data.get_requests = i;
@@ -293,7 +322,9 @@ TEST_F(ClientMetricsAggregatorTest, ConcurrentUpdateSerializeAndRemove) {
     UUID churn_client{9999, 9999};
     std::thread remover([&]() {
         for (int i = 1; i <= kIterations; ++i) {
-            ClientMetricSnapshot snap;
+            auto snap =
+                MakeRetentionSnapshot(i, i * 3, RetentionBucketWith(2, i),
+                                      RetentionBucketWith(3, i * 3));
             snap.total_request.get_requests = i;
             Update(churn_client, snap);
             Remove(churn_client);
@@ -316,6 +347,16 @@ TEST_F(ClientMetricsAggregatorTest, ConcurrentUpdateSerializeAndRemove) {
                       expected_requests * 10);
     ExpectMetricValue(text, "master_cluster_remote_get_requests",
                       expected_requests);
+    ExpectMetricValue(text, "master_cluster_key_retention_live_count",
+                      expected_requests);
+    ExpectMetricValue(text, "master_cluster_key_retention_removed_count",
+                      expected_requests * 2);
+    ExpectMetricValue(text,
+                      "master_cluster_key_retention_live_age_seconds_count",
+                      expected_requests);
+    ExpectMetricValue(text,
+                      "master_cluster_key_retention_removed_age_seconds_count",
+                      expected_requests * 2);
 
     // Removing every remaining client zeroes the gauges again.
     for (int t = 0; t < kNumWriters; ++t) {
@@ -328,37 +369,13 @@ TEST_F(ClientMetricsAggregatorTest, ConcurrentUpdateSerializeAndRemove) {
     ExpectMetricValue(empty, "master_cluster_total_get_requests", 0);
     ExpectMetricValue(empty, "master_cluster_total_get_bytes", 0);
     ExpectMetricValue(empty, "master_cluster_remote_get_requests", 0);
+    ExpectMetricValue(empty, "master_cluster_key_retention_live_count", 0);
+    ExpectMetricValue(empty, "master_cluster_key_retention_removed_count", 0);
+    EXPECT_EQ(empty.find("master_cluster_key_retention_live_age_seconds"),
+              std::string::npos);
+    EXPECT_EQ(empty.find("master_cluster_key_retention_removed_age_seconds"),
+              std::string::npos);
 }
-
-namespace {
-
-size_t NumRetentionBuckets() {
-    return KeyRetentionMetric::LifetimeBuckets().size() + 1;
-}
-
-std::vector<int64_t> ZeroRetentionBuckets() {
-    return std::vector<int64_t>(NumRetentionBuckets(), 0);
-}
-
-std::vector<int64_t> RetentionBucketWith(size_t index, int64_t count) {
-    std::vector<int64_t> buckets(NumRetentionBuckets(), 0);
-    buckets[index] = count;
-    return buckets;
-}
-
-ClientMetricSnapshot MakeRetentionSnapshot(
-    int64_t live_count, int64_t removed_total,
-    std::vector<int64_t> live_age_buckets,
-    std::vector<int64_t> removed_buckets) {
-    ClientMetricSnapshot snap;
-    snap.key_retention.live_count = live_count;
-    snap.key_retention.removed_total = removed_total;
-    snap.key_retention.live_age_buckets = std::move(live_age_buckets);
-    snap.key_retention.removed_buckets = std::move(removed_buckets);
-    return snap;
-}
-
-}  // namespace
 
 TEST_F(ClientMetricsAggregatorTest, RetentionCountsSumAcrossClients) {
     Update({1, 1}, MakeRetentionSnapshot(3, 2, ZeroRetentionBuckets(),
@@ -481,6 +498,68 @@ TEST_F(ClientMetricsAggregatorTest, RetentionBucketSizeMismatchIsIgnored) {
               std::string::npos);
     EXPECT_EQ(text.find("master_cluster_key_retention_all_lifetime_seconds"),
               std::string::npos);
+}
+
+TEST_F(ClientMetricsAggregatorTest,
+       RetentionReplacementHandlesMissingAndMalformedBuckets) {
+    const UUID steady_client{1, 1};
+    const UUID changing_client{2, 2};
+    Update(steady_client, MakeRetentionSnapshot(5, 7, RetentionBucketWith(0, 5),
+                                                RetentionBucketWith(1, 7)));
+
+    auto expect_retention = [&](int64_t live_count, int64_t removed_count,
+                                int64_t live_samples, int64_t removed_samples,
+                                int64_t live_le_one, int64_t removed_le_two) {
+        const auto text = Serialize();
+        const std::string prefix = "master_cluster_key_retention_";
+        ExpectMetricValue(text, prefix + "live_count", live_count);
+        ExpectMetricValue(text, prefix + "removed_count", removed_count);
+        ExpectMetricValue(text, prefix + "live_age_seconds_count",
+                          live_samples);
+        ExpectMetricValue(text, prefix + "removed_age_seconds_count",
+                          removed_samples);
+        ExpectMetricValue(text, prefix + "all_lifetime_seconds_count",
+                          live_samples + removed_samples);
+        ExpectMetricValue(text, prefix + "live_age_seconds_bucket{le=\"1\"}",
+                          live_le_one);
+        ExpectMetricValue(text, prefix + "removed_age_seconds_bucket{le=\"2\"}",
+                          removed_le_two);
+    };
+
+    Update(changing_client,
+           MakeRetentionSnapshot(2, 3, RetentionBucketWith(0, 2),
+                                 RetentionBucketWith(1, 3)));
+    expect_retention(7, 10, 7, 10, 7, 10);
+
+    // Missing distributions replace prior buckets while counts still change.
+    Update(changing_client, MakeRetentionSnapshot(4, 6, {}, {}));
+    expect_retention(9, 13, 5, 7, 5, 7);
+    Update(changing_client, MakeRetentionSnapshot(1, 2, {1}, {1, 2}));
+    expect_retention(6, 9, 5, 7, 5, 7);
+
+    // Each distribution is validated independently.
+    Update(changing_client,
+           MakeRetentionSnapshot(3, 4, RetentionBucketWith(2, 3), {99}));
+    expect_retention(8, 11, 8, 7, 5, 7);
+    Update(changing_client,
+           MakeRetentionSnapshot(8, 9, {99}, RetentionBucketWith(3, 9)));
+    expect_retention(13, 16, 5, 16, 5, 7);
+
+    const auto restored = MakeRetentionSnapshot(1, 2, RetentionBucketWith(0, 1),
+                                                RetentionBucketWith(1, 2));
+    Update(changing_client, restored);
+    expect_retention(6, 9, 6, 9, 6, 9);
+    Update(changing_client, restored);
+    expect_retention(6, 9, 6, 9, 6, 9);
+
+    // Removing a malformed replacement must not subtract its invalid buckets.
+    Update(changing_client, MakeRetentionSnapshot(1, 2, {99}, {99}));
+    Remove(changing_client);
+    expect_retention(5, 7, 5, 7, 5, 7);
+    Remove(changing_client);
+    expect_retention(5, 7, 5, 7, 5, 7);
+    Update(changing_client, restored);
+    expect_retention(6, 9, 6, 9, 6, 9);
 }
 
 TEST_F(ClientMetricsAggregatorTest, RetentionSerializeAndSummary) {

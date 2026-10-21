@@ -1,64 +1,8 @@
 #include "ha_helper.h"
 #include "etcd_helper.h"
-#include "centralized_rpc_service.h"
-#include "p2p/ha/oplog/p2p_hot_standby_service.h"
-#include "p2p/master/p2p_rpc_service.h"
 #include "rpc_service.h"
-#include "utils.h"
-#ifdef STORE_USE_REDIS
-#include "p2p/ha/redis_master_view_helper.h"
-#endif
-
-#include <limits>
-#include <optional>
-#include <iomanip>
-#include <random>
-#include <sstream>
 
 namespace mooncake {
-
-namespace {
-
-#ifdef STORE_USE_REDIS
-std::string GenerateMasterInstanceId() {
-    std::random_device random;
-    std::mt19937_64 generator(random());
-    std::ostringstream stream;
-    stream << std::hex << std::setfill('0') << std::setw(16) << generator()
-           << std::setw(16) << generator();
-    return stream.str();
-}
-
-std::string BuildSnapshotEndpoint(const std::string& master_endpoint,
-                                  uint32_t snapshot_port,
-                                  const std::string& override_endpoint) {
-    if (!override_endpoint.empty()) {
-        return override_endpoint;
-    }
-    if (snapshot_port == 0 || master_endpoint.empty()) {
-        return "";
-    }
-    std::string host;
-    if (master_endpoint.front() == '[') {
-        const auto closing_bracket = master_endpoint.find(']');
-        if (closing_bracket == std::string::npos) {
-            return "";
-        }
-        host = master_endpoint.substr(0, closing_bracket + 1);
-    } else {
-        const auto separator = master_endpoint.rfind(':');
-        host = separator == std::string::npos
-                   ? master_endpoint
-                   : master_endpoint.substr(0, separator);
-    }
-    if (host.empty() || host == "0.0.0.0" || host == "[::]") {
-        return "";
-    }
-    return host + ":" + std::to_string(snapshot_port);
-}
-#endif
-
-}  // namespace
 
 MasterViewHelper::MasterViewHelper() {
     std::string cluster_id;
@@ -75,8 +19,6 @@ MasterViewHelper::MasterViewHelper() {
     master_view_key_ = "mooncake-store/" + cluster_id + "master_view";
     LOG(INFO) << "Master view key: " << master_view_key_;
 }
-
-MasterViewHelper::~MasterViewHelper() = default;
 
 ErrorCode MasterViewHelper::ConnectToEtcd(const std::string& etcd_endpoints) {
     return EtcdHelper::ConnectToEtcdStoreClient(etcd_endpoints);
@@ -148,18 +90,6 @@ void MasterViewHelper::KeepLeader(EtcdLeaseId lease_id) {
     EtcdHelper::KeepAlive(lease_id);
 }
 
-void MasterViewHelper::CancelKeepAlive(EtcdLeaseId lease_id) {
-    auto ret = EtcdHelper::CancelKeepAlive(lease_id);
-    if (ret != ErrorCode::OK) {
-        LOG(ERROR) << "Failed to cancel etcd keep-alive, lease_id=" << lease_id
-                   << ", error=" << ret;
-    }
-}
-
-int MasterViewHelper::GetLeaderLeaseTTLSeconds() const {
-    return static_cast<int>(ETCD_MASTER_VIEW_LEASE_TTL);
-}
-
 ErrorCode MasterViewHelper::GetMasterView(std::string& master_address,
                                           ViewVersionId& version) {
     auto err_code =
@@ -194,256 +124,63 @@ int MasterServiceSupervisor::Start() {
             server.init_ibv();
         }
 
-        LOG(INFO) << "Init leader election helper (backend="
-                  << (config_.election_backend == ElectionBackend::REDIS
-                          ? "redis"
-                          : "etcd")
-                  << ")...";
-
-        auto mv_helper = CreateMasterViewHelper(config_);
-        if (!mv_helper) {
-            LOG(ERROR) << "Failed to create leader election helper, backend="
-                       << (config_.election_backend == ElectionBackend::REDIS
-                               ? "redis"
-                               : "etcd");
+        LOG(INFO) << "Init leader election helper...";
+        MasterViewHelper mv_helper;
+        if (mv_helper.ConnectToEtcd(config_.etcd_endpoints) != ErrorCode::OK) {
+            LOG(ERROR) << "Failed to connect to etcd endpoints: "
+                       << config_.etcd_endpoints;
             return -1;
         }
-
-#ifdef STORE_USE_REDIS
-        std::unique_ptr<RedisMasterRegistryHeartbeat> master_registry_heartbeat;
-        std::string master_instance_id;
-        if (config_.deployment_mode == DeploymentMode::P2P &&
-            config_.enable_oplog &&
-            config_.election_backend == ElectionBackend::REDIS) {
-            master_instance_id = GenerateMasterInstanceId();
-            RedisMasterRegistryEntry entry;
-            entry.instance_id = master_instance_id;
-            entry.master_endpoint = config_.local_hostname;
-            entry.snapshot_endpoint = BuildSnapshotEndpoint(
-                config_.local_hostname, config_.standby_snapshot_service_port,
-                config_.standby_snapshot_service_endpoint);
-            entry.role = "starting";
-            entry.snapshot_ready = false;
-            master_registry_heartbeat =
-                std::make_unique<RedisMasterRegistryHeartbeat>(
-                    std::make_unique<RedisMasterRegistry>(
-                        config_.cluster_id, config_.redis_endpoint,
-                        config_.redis_username, config_.redis_password,
-                        config_.redis_db_index),
-                    std::move(entry));
-            if (master_registry_heartbeat->Start() != ErrorCode::OK) {
-                LOG(WARNING) << "Initial Redis Master registration failed; "
-                                "heartbeat will retry"
-                             << ", instance_id=" << master_instance_id;
-            }
-        }
-#endif
-
-        std::unique_ptr<P2PHotStandbyService> p2p_standby;
-        if (config_.deployment_mode == DeploymentMode::P2P &&
-            config_.enable_oplog) {
-            if (config_.standby_snapshot_service_port >
-                    std::numeric_limits<uint16_t>::max() ||
-                config_.standby_snapshot_chunk_size == 0 ||
-                config_.standby_snapshot_chunk_size >
-                    kMaxStandbySnapshotChunkSize) {
-                LOG(ERROR) << "Invalid standby snapshot configuration"
-                           << ", port=" << config_.standby_snapshot_service_port
-                           << ", chunk_size="
-                           << config_.standby_snapshot_chunk_size;
-                return -1;
-            }
-            P2PHotStandbyConfig standby_config;
-            standby_config.cluster_id = config_.cluster_id;
-            standby_config.oplog_store_type =
-                ParseOpLogStoreType(config_.oplog_store_type);
-            standby_config.oplog_store_root_dir = config_.oplog_data_dir;
-            standby_config.redis_endpoint = config_.redis_endpoint;
-            standby_config.redis_username = config_.redis_username;
-            standby_config.redis_password = config_.redis_password;
-            standby_config.redis_db_index = config_.redis_db_index;
-            standby_config.snapshot_service_port =
-                static_cast<uint16_t>(config_.standby_snapshot_service_port);
-#ifdef STORE_USE_REDIS
-            standby_config.master_instance_id = master_instance_id;
-#endif
-            standby_config.snapshot_chunk_size =
-                config_.standby_snapshot_chunk_size;
-            if (!config_.standby_snapshot_sources.empty()) {
-                standby_config.snapshot_source_endpoints = splitString(
-                    config_.standby_snapshot_sources, ',', /*trim=*/true);
-            }
-
-            p2p_standby =
-                std::make_unique<P2PHotStandbyService>(standby_config);
-            auto standby_start = p2p_standby->Start();
-            if (standby_start != ErrorCode::OK) {
-                LOG(ERROR) << "Failed to start P2P hot standby service"
-                           << ", error=" << toString(standby_start);
-                return -1;
-            }
-#ifdef STORE_USE_REDIS
-            if (master_registry_heartbeat) {
-                master_registry_heartbeat->SetAppliedSequenceProvider(
-                    [standby = p2p_standby.get()] {
-                        return standby->GetLatestAppliedSequenceId();
-                    });
-                master_registry_heartbeat->SetSnapshotReadyProvider(
-                    [standby = p2p_standby.get()] {
-                        return standby->IsReadyForSnapshot();
-                    });
-                master_registry_heartbeat->UpdateRole(
-                    "standby", p2p_standby->IsReadyForSnapshot());
-            }
-#endif
-        }
-
         LOG(INFO) << "Trying to elect self as leader...";
         EtcdLeaseId lease_id = 0;
         // view_version will be updated by ElectLeader and then used in
         // WrappedMasterService
         ViewVersionId view_version = 0;
-        mv_helper->ElectLeader(config_.local_hostname, view_version, lease_id);
+        mv_helper.ElectLeader(config_.local_hostname, view_version, lease_id);
 
         // Start a thread to keep the leader alive
         auto keep_leader_thread =
-            std::thread([&server, mv_helper = mv_helper.get(), lease_id]() {
-                mv_helper->KeepLeader(lease_id);
+            std::thread([&server, &mv_helper, lease_id]() {
+                mv_helper.KeepLeader(lease_id);
                 LOG(INFO) << "Trying to stop server...";
                 server.stop();
             });
 
         // To prevent potential split-brain, wait long enough for the old leader
         // to retire.
-        std::this_thread::sleep_for(
-            std::chrono::seconds(mv_helper->GetLeaderLeaseTTLSeconds()));
-
-        std::optional<P2PStandbyMetadataStore::ExportedMetadata>
-            p2p_promoted_metadata;
-        uint64_t p2p_promoted_sequence_id = 0;
-        if (p2p_standby) {
-#ifdef STORE_USE_REDIS
-            if (master_registry_heartbeat) {
-                master_registry_heartbeat->UpdateRole("promoting", false);
-            }
-#endif
-            auto promote_err = p2p_standby->Promote();
-            if (promote_err != ErrorCode::OK) {
-                LOG(ERROR) << "Failed to promote P2P hot standby service"
-                           << ", error=" << toString(promote_err);
-                mv_helper->CancelKeepAlive(lease_id);
-                keep_leader_thread.join();
-                return -1;
-            }
-            p2p_promoted_sequence_id =
-                p2p_standby->GetLatestAppliedSequenceId();
-            p2p_promoted_metadata = p2p_standby->ExportMetadata();
-#ifdef STORE_USE_REDIS
-            if (master_registry_heartbeat) {
-                master_registry_heartbeat->SetAppliedSequenceProvider({});
-                master_registry_heartbeat->SetSnapshotReadyProvider({});
-            }
-#endif
-            p2p_standby.reset();
-        }
+        const int waiting_time = ETCD_MASTER_VIEW_LEASE_TTL;
+        std::this_thread::sleep_for(std::chrono::seconds(waiting_time));
 
         LOG(INFO) << "Starting master service...";
-        // When a dedicated heartbeat port is configured, Heartbeat is served on
-        // a separate coro_rpc_server so heavy metadata RPCs cannot
-        // head-of-line-block heartbeats. The heartbeat server runs plain TCP
-        // (no init_ibv) to avoid contending for IB resources with the main
-        // server. The main server serves Heartbeat only as a legacy fallback
-        // when no dedicated heartbeat port is configured (heartbeat_rpc_port
-        // == 0).
-        const bool dedicated_heartbeat = config_.heartbeat_rpc_port > 0;
-        const bool main_includes_heartbeat = !dedicated_heartbeat;
-        std::unique_ptr<WrappedMasterService> wrapped_master_service;
-        if (config_.deployment_mode == DeploymentMode::CENTRALIZATION) {
-            wrapped_master_service =
-                std::make_unique<WrappedCentralizedMasterService>(
-                    WrappedMasterServiceConfig(config_, view_version));
-            wrapped_master_service->init();
-            RegisterCentralizedRpcService(
-                server,
-                static_cast<WrappedCentralizedMasterService&>(
-                    *wrapped_master_service),
-                /*include_heartbeat=*/main_includes_heartbeat);
-        } else {
-            auto p2p_wrapped_service =
-                std::make_unique<WrappedP2PMasterService>(
-                    WrappedMasterServiceConfig(config_, view_version));
-            p2p_wrapped_service->init();
-            if (p2p_promoted_metadata.has_value()) {
-                auto& p2p_master_service = static_cast<P2PMasterService&>(
-                    p2p_wrapped_service->GetMasterService());
-                auto restore_err =
-                    p2p_master_service.RestoreFromStandbyMetadata(
-                        p2p_promoted_metadata.value(),
-                        p2p_promoted_sequence_id);
-                if (restore_err != ErrorCode::OK) {
-                    LOG(ERROR) << "Failed to restore P2P promoted metadata"
-                               << ", error=" << toString(restore_err);
-                    mv_helper->CancelKeepAlive(lease_id);
-                    keep_leader_thread.join();
-                    return -1;
-                }
-            }
-            RegisterP2PRpcService(
-                server, *p2p_wrapped_service,
-                /*include_heartbeat=*/main_includes_heartbeat);
-            wrapped_master_service = std::move(p2p_wrapped_service);
-        }
-#ifdef STORE_USE_REDIS
-        if (master_registry_heartbeat) {
-            master_registry_heartbeat->UpdateRole("primary", false);
-        }
-#endif
+        mooncake::WrappedMasterService wrapped_master_service(
+            mooncake::WrappedMasterServiceConfig(config_, view_version));
+        mooncake::RegisterRpcService(server, wrapped_master_service);
         // Metric reporting is now handled by WrappedMasterService.
-
-        // Start the dedicated heartbeat server alongside the main server. It
-        // shares the wrapped_master_service, so it must be stopped before that
-        // service object is destroyed (below, after the main server stops).
-        std::optional<coro_rpc::coro_rpc_server> heartbeat_server;
-        if (dedicated_heartbeat) {
-            heartbeat_server.emplace(
-                std::max<size_t>(1, config_.heartbeat_rpc_thread_num),
-                config_.heartbeat_rpc_port, config_.rpc_address,
-                config_.rpc_conn_timeout, config_.rpc_enable_tcp_no_delay);
-            RegisterHeartbeatRpcService(*heartbeat_server,
-                                        *wrapped_master_service);
-            LOG(INFO) << "Starting dedicated heartbeat RPC server on port "
-                      << config_.heartbeat_rpc_port;
-            auto heartbeat_ec = heartbeat_server->async_start();
-            if (heartbeat_ec.hasResult()) {
-                LOG(ERROR) << "Failed to start heartbeat RPC server: "
-                           << heartbeat_ec.result().value();
-                mv_helper->CancelKeepAlive(lease_id);
-                keep_leader_thread.join();
-                return -1;
-            }
-        }
 
         async_simple::Future<coro_rpc::err_code> ec =
             server.async_start();  // won't block here
         if (ec.hasResult()) {
             LOG(ERROR) << "Failed to start master service: "
                        << ec.result().value();
-            heartbeat_server.reset();
-            mv_helper->CancelKeepAlive(lease_id);
+            auto etcd_err = EtcdHelper::CancelKeepAlive(lease_id);
+            if (etcd_err != ErrorCode::OK) {
+                LOG(ERROR) << "Failed to cancel keep leader alive: "
+                           << etcd_err;
+            }
+            // Even if CancelKeepAlive fails, the keep alive context are closed.
+            // We can safely join the keep leader thread.
             keep_leader_thread.join();
             return -1;
         }
         // Block until the server is stopped
         auto server_err = std::move(ec).get();
         LOG(ERROR) << "Master service stopped: " << server_err;
-        // Stop the heartbeat server before wrapped_master_service (declared
-        // above) is destroyed at the end of this loop iteration.
-        heartbeat_server.reset();
 
         // If the server is closed due to internal errors, we need to manually
         // stop keep leader alive.
-        mv_helper->CancelKeepAlive(lease_id);
-        LOG(INFO) << "Cancel keep leader alive requested";
+        auto etcd_err = EtcdHelper::CancelKeepAlive(lease_id);
+        // The error here is predicatable, no need to log it as ERROR.
+        LOG(INFO) << "Cancel keep leader alive: " << etcd_err;
         keep_leader_thread.join();
     }
     return 0;
@@ -453,38 +190,6 @@ MasterServiceSupervisor::~MasterServiceSupervisor() {
     if (server_thread_.joinable()) {
         server_thread_.join();
     }
-}
-
-std::unique_ptr<MasterViewHelper> CreateMasterViewHelper(
-    const MasterServiceSupervisorConfig& config) {
-    if (config.election_backend == ElectionBackend::REDIS) {
-#ifdef STORE_USE_REDIS
-        auto helper = std::make_unique<RedisMasterViewHelper>(
-            config.cluster_id, config.redis_endpoint, config.redis_password,
-            config.redis_db_index, config.redis_master_view_ttl_sec,
-            config.redis_heartbeat_interval_sec, config.redis_username);
-        auto rc = helper->Connect();
-        if (rc != ErrorCode::OK) {
-            LOG(ERROR) << "Failed to connect to Redis at: "
-                       << config.redis_endpoint;
-            return nullptr;
-        }
-        return helper;
-#else
-        LOG(ERROR) << "Redis election backend requested but STORE_USE_REDIS "
-                      "is not enabled at compile time";
-        return nullptr;
-#endif
-    }
-
-    // Default: etcd backend
-    auto helper = std::make_unique<MasterViewHelper>();
-    if (helper->ConnectToEtcd(config.etcd_endpoints) != ErrorCode::OK) {
-        LOG(ERROR) << "Failed to connect to etcd endpoints: "
-                   << config.etcd_endpoints;
-        return nullptr;
-    }
-    return helper;
 }
 
 }  // namespace mooncake

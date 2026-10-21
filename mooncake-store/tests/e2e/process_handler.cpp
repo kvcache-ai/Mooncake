@@ -122,14 +122,13 @@ bool MasterProcessHandler::start() {
         // Execute the master
         std::string rpc_address_arg = "--rpc-address=" + config_.rpc_address;
         std::string rpc_port_arg = "--rpc-port=" + std::to_string(port_);
-        std::vector<std::string> args = {
-            master_path_,
-            "--enable-ha=true",
-            rpc_address_arg,
-            rpc_port_arg,
-            "--deployment-mode=" + config_.deployment_mode,
-            "--max-client-per-key=" +
-                std::to_string(config_.max_client_per_key)};
+        std::vector<std::string> args = {master_path_, "--enable-ha=true",
+                                         rpc_address_arg, rpc_port_arg};
+
+        if (config_.max_client_per_key.has_value()) {
+            args.emplace_back("--max-client-per-key=" +
+                              std::to_string(*config_.max_client_per_key));
+        }
 
         if (config_.enable_oplog) {
             args.emplace_back("--enable-oplog=true");
@@ -146,6 +145,10 @@ bool MasterProcessHandler::start() {
                                   config_.rpc_address + ":" +
                                   std::to_string(snapshot_port));
             }
+        }
+
+        if (!config_.cluster_id.empty()) {
+            args.emplace_back("--cluster-id=" + config_.cluster_id);
         }
 
         if (config_.election_backend == "redis") {
@@ -165,9 +168,6 @@ bool MasterProcessHandler::start() {
             if (!config_.redis_password.empty()) {
                 args.emplace_back("--redis-password=" + config_.redis_password);
             }
-            if (!config_.cluster_id.empty()) {
-                args.emplace_back("--cluster-id=" + config_.cluster_id);
-            }
         } else {
             args.emplace_back("--etcd-endpoints=" + config_.etcd_endpoints);
         }
@@ -175,7 +175,6 @@ bool MasterProcessHandler::start() {
         LOG(INFO) << "[m" << index_ << "] Exec master " << rpc_address_arg
                   << " " << rpc_port_arg
                   << " backend=" << config_.election_backend
-                  << " deployment=" << config_.deployment_mode
                   << " enable_oplog=" << config_.enable_oplog;
         std::vector<char*> argv;
         argv.reserve(args.size() + 1);

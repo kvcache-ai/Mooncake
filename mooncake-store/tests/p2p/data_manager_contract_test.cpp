@@ -241,7 +241,7 @@ std::unique_ptr<ManagerEnv> MakeManager(DataManagerVersion version,
         recorder->removes.push_back({std::string(key), tier_id});
         return {};
     };
-    callbacks.segment_sync = [](const Segment&,
+    callbacks.segment_sync = [](const P2PSegment&,
                                 bool) -> tl::expected<void, ErrorCode> {
         return {};
     };

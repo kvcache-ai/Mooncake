@@ -24,6 +24,7 @@
 #include "client_buffer.hpp"
 #include "client_config_builder.h"
 #include "p2p/client/task_handle.h"
+#include "p2p/common/p2p_types.h"
 #include "types.h"
 
 namespace mooncake {
@@ -137,7 +138,7 @@ using RemoveReplicaCallback = std::function<tl::expected<void, ErrorCode>(
  * The callback should register/unregister the segment with Master.
  */
 using SegmentSyncCallback = std::function<tl::expected<void, ErrorCode>(
-    const Segment& segment, bool mount)>;
+    const P2PSegment& segment, bool mount)>;
 
 /**
  * @brief Callback used to remove a stale replica route from Master when a read

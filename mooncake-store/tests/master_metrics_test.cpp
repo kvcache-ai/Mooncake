@@ -4,12 +4,10 @@
 #include <thread>
 #include <vector>
 
-#include "centralized_rpc_service.h"
+#include "rpc_service.h"
 #include "types.h"
 #include "master_config.h"
-#include "centralized_master_metric_manager.h"
 #include "master_metric_manager.h"
-#include "p2p/master/p2p_master_metric_manager.h"
 
 namespace mooncake::test {
 
@@ -18,7 +16,6 @@ class MasterMetricsTest : public ::testing::Test {
     void SetUp() override {
         google::InitGoogleLogging("MasterMetricsTest");
         FLAGS_logtostderr = true;
-        CentralizedMasterMetricManager::instance().reset_all_metrics();
     }
 
     std::vector<Replica::Descriptor> replica_list;
@@ -27,7 +24,7 @@ class MasterMetricsTest : public ::testing::Test {
 };
 
 TEST_F(MasterMetricsTest, InitialStatusTest) {
-    auto& metrics = CentralizedMasterMetricManager::instance();
+    auto& metrics = MasterMetricManager::instance();
 
     // Mem Storage Metrics
     ASSERT_EQ(metrics.get_allocated_mem_size(), 0);
@@ -115,55 +112,14 @@ TEST_F(MasterMetricsTest, InitialStatusTest) {
     ASSERT_EQ(metrics.get_put_start_discarded_staging_size(), 0);
 }
 
-TEST_F(MasterMetricsTest, RegisterUnregisterRpcMetrics) {
-    auto& metrics = CentralizedMasterMetricManager::instance();
-    WrappedMasterServiceConfig service_config;
-    service_config.default_kv_lease_ttl = 100;
-    service_config.enable_metric_reporting = true;
-    WrappedCentralizedMasterService service_(service_config);
-    service_.init();
-
-    UUID client_id = generate_uuid();
-
-    // RegisterClient success -> requests=1, failures=0.
-    RegisterClientRequest reg;
-    reg.client_id = client_id;
-    ASSERT_TRUE(service_.RegisterClient(reg).has_value());
-    EXPECT_EQ(metrics.get_register_client_requests(), 1);
-    EXPECT_EQ(metrics.get_register_client_failures(), 0);
-
-    // RegisterClient duplicate -> requests=2, failures=1.
-    ASSERT_FALSE(service_.RegisterClient(reg).has_value());
-    EXPECT_EQ(metrics.get_register_client_requests(), 2);
-    EXPECT_EQ(metrics.get_register_client_failures(), 1);
-
-    // UnregisterClient success -> requests=1, failures=0.
-    UnregisterClientRequest unreg;
-    unreg.client_id = client_id;
-    unreg.deployment_mode = DeploymentMode::CENTRALIZATION;
-    ASSERT_TRUE(service_.UnregisterClient(unreg).has_value());
-    EXPECT_EQ(metrics.get_unregister_client_requests(), 1);
-    EXPECT_EQ(metrics.get_unregister_client_failures(), 0);
-
-    // UnregisterClient with the wrong deployment mode -> requests=2,
-    // failures=1.
-    UnregisterClientRequest bad;
-    bad.client_id = client_id;
-    bad.deployment_mode = DeploymentMode::P2P;
-    ASSERT_FALSE(service_.UnregisterClient(bad).has_value());
-    EXPECT_EQ(metrics.get_unregister_client_requests(), 2);
-    EXPECT_EQ(metrics.get_unregister_client_failures(), 1);
-}
-
 TEST_F(MasterMetricsTest, BasicRequestTest) {
     const uint64_t default_kv_lease_ttl = 100;
-    auto& metrics = CentralizedMasterMetricManager::instance();
+    auto& metrics = MasterMetricManager::instance();
     // Use a wrapped master service to test the metrics manager
     WrappedMasterServiceConfig service_config;
     service_config.default_kv_lease_ttl = default_kv_lease_ttl;
     service_config.enable_metric_reporting = true;
-    WrappedCentralizedMasterService service_(service_config);
-    service_.init();
+    WrappedMasterService service_(service_config);
 
     constexpr size_t kBufferAddress = 0x300000000;
     constexpr size_t kSegmentSize = 1024 * 1024 * 16;
@@ -172,7 +128,7 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     Segment segment;
     segment.id = segment_id;
     segment.name = segment_name;
-    segment.GetCentralizedExtra().base = kBufferAddress;
+    segment.base = kBufferAddress;
     segment.size = kSegmentSize;
     UUID client_id = generate_uuid();
 
@@ -182,12 +138,6 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     config.replica_num = 1;
 
     // Test MountSegment request
-    {
-        RegisterClientRequest req;
-        req.client_id = client_id;
-        auto reg_result = service_.RegisterClient(req);
-        ASSERT_TRUE(reg_result.has_value());
-    }
     auto mount_result = service_.MountSegment(segment, client_id);
     ASSERT_TRUE(mount_result.has_value());
     ASSERT_EQ(metrics.get_allocated_mem_size(), 0);
@@ -300,13 +250,12 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
 
 TEST_F(MasterMetricsTest, CalcCacheStatsTest) {
     const uint64_t default_kv_lease_ttl = 100;
-    auto& metrics = CentralizedMasterMetricManager::instance();
+    auto& metrics = MasterMetricManager::instance();
     // Use a wrapped master service to test the metrics manager
     WrappedMasterServiceConfig service_config;
     service_config.default_kv_lease_ttl = default_kv_lease_ttl;
     service_config.enable_metric_reporting = true;
-    WrappedCentralizedMasterService service_(service_config);
-    service_.init();
+    WrappedMasterService service_(service_config);
 
     constexpr size_t kBufferAddress = 0x300000000;
     constexpr size_t kSegmentSize = 1024 * 1024 * 16;
@@ -315,7 +264,7 @@ TEST_F(MasterMetricsTest, CalcCacheStatsTest) {
     Segment segment;
     segment.id = segment_id;
     segment.name = segment_name;
-    segment.GetCentralizedExtra().base = kBufferAddress;
+    segment.base = kBufferAddress;
     segment.size = kSegmentSize;
     UUID client_id = generate_uuid();
 
@@ -325,23 +274,17 @@ TEST_F(MasterMetricsTest, CalcCacheStatsTest) {
     config.replica_num = 1;
 
     auto stats_dict = metrics.calculate_cache_stats();
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::MEMORY_HITS], 0);
+    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::MEMORY_HITS], 1);
     ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::SSD_HITS], 0);
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::MEMORY_TOTAL], 0);
+    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::MEMORY_TOTAL], 2);
     ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::SSD_TOTAL], 0);
     ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::MEMORY_HIT_RATE],
-              0.0);
+              0.5);
     ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::SSD_HIT_RATE], 0);
     ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::OVERALL_HIT_RATE],
-              0.0);
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::VALID_GET_RATE], 0);
+              0.5);
+    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::VALID_GET_RATE], 1);
 
-    {
-        RegisterClientRequest req;
-        req.client_id = client_id;
-        auto reg_result = service_.RegisterClient(req);
-        ASSERT_TRUE(reg_result.has_value());
-    }
     auto mount_result = service_.MountSegment(segment, client_id);
     ASSERT_TRUE(mount_result.has_value());
     auto put_start_result1 =
@@ -351,19 +294,19 @@ TEST_F(MasterMetricsTest, CalcCacheStatsTest) {
     ASSERT_TRUE(put_end_result1.has_value());
     stats_dict = metrics.calculate_cache_stats();
 
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::MEMORY_TOTAL], 1);
+    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::MEMORY_TOTAL], 3);
 
     auto get_replica_result = service_.GetReplicaList(key);
     stats_dict = metrics.calculate_cache_stats();
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::MEMORY_HITS], 1);
+    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::MEMORY_HITS], 2);
     ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::SSD_HITS], 0);
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::MEMORY_TOTAL], 1);
+    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::MEMORY_TOTAL], 3);
     ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::SSD_TOTAL], 0);
     ASSERT_NEAR(stats_dict[MasterMetricManager::CacheHitStat::MEMORY_HIT_RATE],
-                1.0, 0.01);
+                0.67, 0.01);
     ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::SSD_HIT_RATE], 0);
     ASSERT_NEAR(stats_dict[MasterMetricManager::CacheHitStat::OVERALL_HIT_RATE],
-                1.0, 0.01);
+                0.67, 0.01);
     ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::VALID_GET_RATE], 1);
 
     std::this_thread::sleep_for(
@@ -374,11 +317,10 @@ TEST_F(MasterMetricsTest, CalcCacheStatsTest) {
 
 TEST_F(MasterMetricsTest, BatchRequestTest) {
     const uint64_t default_kv_lease_ttl = 100;
-    auto& metrics = CentralizedMasterMetricManager::instance();
+    auto& metrics = MasterMetricManager::instance();
     WrappedMasterServiceConfig service_config;
     service_config.default_kv_lease_ttl = default_kv_lease_ttl;
-    WrappedCentralizedMasterService service_(service_config);
-    service_.init();
+    WrappedMasterService service_(service_config);
 
     constexpr size_t kBufferAddress = 0x300000000;
     constexpr size_t kSegmentSize = 1024 * 1024 * 64;
@@ -387,28 +329,21 @@ TEST_F(MasterMetricsTest, BatchRequestTest) {
     Segment segment;
     segment.id = segment_id;
     segment.name = segment_name;
-    segment.GetCentralizedExtra().base = kBufferAddress;
+    segment.base = kBufferAddress;
     segment.size = kSegmentSize;
     UUID client_id = generate_uuid();
 
     std::vector<std::string> keys = {"test_key1", "test_key2", "test_key3"};
-    std::vector<std::string_view> key_views(keys.begin(), keys.end());
     std::vector<uint64_t> value_lengths = {1024, 2048, 512};
     ReplicateConfig config;
     config.replica_num = 1;
 
     // Mount segment
-    {
-        RegisterClientRequest req;
-        req.client_id = client_id;
-        auto reg_result = service_.RegisterClient(req);
-        ASSERT_TRUE(reg_result.has_value());
-    }
     auto mount_result = service_.MountSegment(segment, client_id);
     ASSERT_TRUE(mount_result.has_value());
 
     // Test BatchExistKey request (should all return false initially)
-    auto batch_exist_result = service_.BatchExistKey(key_views);
+    auto batch_exist_result = service_.BatchExistKey(keys);
     ASSERT_EQ(batch_exist_result.size(), 3);
     ASSERT_EQ(metrics.get_batch_exist_key_requests(), 1);
     ASSERT_EQ(metrics.get_batch_exist_key_partial_successes(), 0);
@@ -427,7 +362,7 @@ TEST_F(MasterMetricsTest, BatchRequestTest) {
     ASSERT_EQ(metrics.get_batch_put_start_failed_items(), 0);
 
     // Test BatchGetReplicaList request (should all fail)
-    auto batch_get_replica_result = service_.BatchGetReplicaList(key_views);
+    auto batch_get_replica_result = service_.BatchGetReplicaList(keys);
     ASSERT_EQ(batch_get_replica_result.size(), 3);
     ASSERT_EQ(metrics.get_batch_get_replica_list_requests(), 1);
     ASSERT_EQ(metrics.get_batch_get_replica_list_partial_successes(), 0);
@@ -445,7 +380,7 @@ TEST_F(MasterMetricsTest, BatchRequestTest) {
     ASSERT_EQ(metrics.get_batch_put_end_failed_items(), 0);
 
     // Test BatchExistKey again (should all return true now)
-    auto batch_exist_result2 = service_.BatchExistKey(key_views);
+    auto batch_exist_result2 = service_.BatchExistKey(keys);
     ASSERT_EQ(batch_exist_result2.size(), 3);
     ASSERT_EQ(metrics.get_batch_exist_key_requests(), 2);
     ASSERT_EQ(metrics.get_batch_exist_key_partial_successes(), 0);
@@ -454,7 +389,7 @@ TEST_F(MasterMetricsTest, BatchRequestTest) {
     ASSERT_EQ(metrics.get_batch_exist_key_failed_items(), 0);
 
     // Test BatchGetReplicaList again (should all succeed now)
-    auto batch_get_replica_result2 = service_.BatchGetReplicaList(key_views);
+    auto batch_get_replica_result2 = service_.BatchGetReplicaList(keys);
     ASSERT_EQ(batch_get_replica_result2.size(), 3);
     ASSERT_EQ(metrics.get_batch_get_replica_list_requests(), 2);
     ASSERT_EQ(metrics.get_batch_get_replica_list_partial_successes(), 0);
@@ -473,9 +408,8 @@ TEST_F(MasterMetricsTest, BatchRequestTest) {
 
     // Test partial success
     keys.push_back("test_key4");
-    key_views = std::vector<std::string_view>(keys.begin(), keys.end());
     value_lengths.push_back(512);
-    auto batch_get_replica_result3 = service_.BatchGetReplicaList(key_views);
+    auto batch_get_replica_result3 = service_.BatchGetReplicaList(keys);
     ASSERT_EQ(batch_get_replica_result3.size(), 4);
     ASSERT_EQ(metrics.get_batch_get_replica_list_requests(), 3);
     ASSERT_EQ(metrics.get_batch_get_replica_list_partial_successes(), 1);

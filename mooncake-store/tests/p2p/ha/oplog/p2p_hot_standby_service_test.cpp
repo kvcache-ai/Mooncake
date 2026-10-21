@@ -10,7 +10,6 @@
 #include <filesystem>
 #include <string>
 #include <thread>
-#include <variant>
 
 #include <xxhash.h>
 
@@ -18,7 +17,7 @@
 #include "mock_oplog_store.h"
 #include "p2p/master/p2p_master_service.h"
 #include "p2p/master/p2p_rpc_service.h"
-#include "p2p/master/p2p_rpc_types.h"
+#include "p2p/common/p2p_rpc_types.h"
 
 namespace mooncake::test {
 namespace {
@@ -116,31 +115,19 @@ class P2PHotStandbyServiceTest : public ::testing::Test {
 
     void TearDown() override { std::filesystem::remove_all(test_dir_); }
 
-    MasterServiceConfig MakeMasterConfig() const {
-        return MasterServiceConfig::builder()
-            .set_enable_ha(true)
-            .set_enable_oplog(true)
-            .set_cluster_id(kClusterId)
-            .set_oplog_store_type("localfs")
-            .set_oplog_data_dir(test_dir_.string())
-            .set_max_client_per_key(0)
-            .build();
+    P2PMasterConfig MakeMasterConfig() const {
+        P2PMasterConfig config;
+        config.oplog.enabled = true;
+        config.cluster_id = kClusterId;
+        config.oplog.store_type = "localfs";
+        config.oplog.data_dir = test_dir_.string();
+        config.routes.max_clients_per_key = 0;
+        return config;
     }
 
-    WrappedMasterServiceConfig MakeWrappedMasterConfig() const {
-        auto master_config = MakeMasterConfig();
-        WrappedMasterServiceConfig config;
-        config.default_kv_lease_ttl = master_config.default_kv_lease_ttl;
-        config.default_kv_soft_pin_ttl = master_config.default_kv_soft_pin_ttl;
-        config.allow_evict_soft_pinned_objects =
-            master_config.allow_evict_soft_pinned_objects;
-        config.enable_metric_reporting = false;
-        config.enable_ha = master_config.enable_ha;
-        config.enable_oplog = master_config.enable_oplog;
-        config.oplog_store_type = master_config.oplog_store_type;
-        config.oplog_data_dir = master_config.oplog_data_dir;
-        config.cluster_id = master_config.cluster_id;
-        config.max_client_per_key = master_config.max_client_per_key;
+    P2PMasterConfig MakeWrappedMasterConfig() const {
+        auto config = MakeMasterConfig();
+        config.metrics.enable_reporting = false;
         return config;
     }
 
@@ -153,17 +140,14 @@ class P2PHotStandbyServiceTest : public ::testing::Test {
         return config;
     }
 
-    Segment MakeSegment(const UUID& segment_id) const {
-        Segment segment;
+    P2PSegment MakeSegment(const UUID& segment_id) const {
+        P2PSegment segment;
         segment.id = segment_id;
         segment.name = "segment-" + std::to_string(segment_id.first) + "-" +
                        std::to_string(segment_id.second);
         segment.size = 1024 * 1024;
-        segment.extra = P2PSegmentExtraData{
-            .priority = 1,
-            .tags = {},
-            .memory_type = MemoryType::DRAM,
-        };
+        segment.priority = 1;
+        segment.memory_type = MemoryType::DRAM;
         return segment;
     }
 
@@ -185,36 +169,35 @@ class P2PHotStandbyServiceTest : public ::testing::Test {
     }
 
     void RegisterClient(P2PMasterService& service, const UUID& client_id,
-                        const Segment& segment) const {
-        RegisterClientRequest req;
+                        const P2PSegment& segment) const {
+        P2PRegisterClientRequest req;
         req.client_id = client_id;
         req.ip_address = "127.0.0.1";
         req.rpc_port = 50051;
         req.segments = {segment};
-        req.deployment_mode = DeploymentMode::P2P;
         auto result = service.RegisterClient(req);
         ASSERT_TRUE(result.has_value()) << toString(result.error());
     }
 
-    void AddReplica(P2PMasterService& service, const std::string& key,
-                    const UUID& client_id, const UUID& segment_id,
-                    size_t size = 4096) const {
-        AddReplicaRequest req;
+    void PublishRoute(P2PMasterService& service, const std::string& key,
+                      const UUID& client_id, const UUID& segment_id,
+                      size_t size = 4096) const {
+        P2PPublishRouteRequest req;
         req.key = key;
         req.client_id = client_id;
         req.segment_id = segment_id;
-        req.size = size;
-        auto result = service.AddReplica(req);
+        req.object_size = size;
+        auto result = service.PublishRoute(req);
         ASSERT_TRUE(result.has_value()) << toString(result.error());
     }
 
-    void RemoveReplica(P2PMasterService& service, const std::string& key,
+    void WithdrawRoute(P2PMasterService& service, const std::string& key,
                        const UUID& client_id, const UUID& segment_id) const {
-        RemoveReplicaRequest req;
+        P2PWithdrawRouteRequest req;
         req.key = key;
         req.client_id = client_id;
         req.segment_id = segment_id;
-        auto result = service.RemoveReplica(req);
+        auto result = service.WithdrawRoute(req);
         ASSERT_TRUE(result.has_value()) << toString(result.error());
     }
 
@@ -228,7 +211,7 @@ TEST_F(P2PHotStandbyServiceTest, ReplicatesMasterWrittenP2POplog) {
     const UUID segment_id{2, 2};
 
     RegisterClient(master, client_id, MakeSegment(segment_id));
-    AddReplica(master, "key-a", client_id, segment_id, 1234);
+    PublishRoute(master, "key-a", client_id, segment_id, 1234);
 
     P2PHotStandbyService standby(MakeStandbyConfig());
     ASSERT_EQ(standby.Start(), ErrorCode::OK);
@@ -244,18 +227,12 @@ TEST_F(P2PHotStandbyServiceTest, ReplicatesMasterWrittenP2POplog) {
     ASSERT_EQ(client_it->second.segments.size(), 1);
     EXPECT_EQ(client_it->second.segments[0].id, segment_id);
 
-    auto object_it = exported.objects.find("key-a");
-    ASSERT_NE(object_it, exported.objects.end());
-    EXPECT_EQ(object_it->second.size, 1234);
-    ASSERT_EQ(object_it->second.replicas.size(), 1);
-    ASSERT_TRUE(std::holds_alternative<P2PProxyDescriptor>(
-        object_it->second.replicas[0].descriptor_variant));
-    const auto& desc = std::get<P2PProxyDescriptor>(
-        object_it->second.replicas[0].descriptor_variant);
-    EXPECT_EQ(desc.client_id, client_id);
-    EXPECT_EQ(desc.segment_id, segment_id);
-    EXPECT_EQ(desc.ip_address, "127.0.0.1");
-    EXPECT_EQ(desc.rpc_port, 50051);
+    auto object_it = exported.routes.find("key-a");
+    ASSERT_NE(object_it, exported.routes.end());
+    EXPECT_EQ(object_it->second.object_size, 1234);
+    ASSERT_EQ(object_it->second.locations.size(), 1);
+    EXPECT_EQ(object_it->second.locations[0].client_id, client_id);
+    EXPECT_EQ(object_it->second.locations[0].segment_id, segment_id);
 }
 
 TEST_F(P2PHotStandbyServiceTest, BootstrapsFromStandbySnapshotSource) {
@@ -263,7 +240,7 @@ TEST_F(P2PHotStandbyServiceTest, BootstrapsFromStandbySnapshotSource) {
     const UUID client_id{11, 11};
     const UUID segment_id{12, 12};
     RegisterClient(master, client_id, MakeSegment(segment_id));
-    AddReplica(master, "snapshot-key", client_id, segment_id, 8192);
+    PublishRoute(master, "snapshot-key", client_id, segment_id, 8192);
 
     auto source_config = MakeStandbyConfig();
     source_config.snapshot_service_port =
@@ -283,10 +260,10 @@ TEST_F(P2PHotStandbyServiceTest, BootstrapsFromStandbySnapshotSource) {
 
     auto exported = target.ExportMetadata();
     ASSERT_NE(exported.clients.find(client_id), exported.clients.end());
-    auto object = exported.objects.find("snapshot-key");
-    ASSERT_NE(object, exported.objects.end());
-    EXPECT_EQ(object->second.size, 8192);
-    ASSERT_EQ(object->second.replicas.size(), 1);
+    auto object = exported.routes.find("snapshot-key");
+    ASSERT_NE(object, exported.routes.end());
+    EXPECT_EQ(object->second.object_size, 8192);
+    ASSERT_EQ(object->second.locations.size(), 1);
 
     target.Stop();
     source.Stop();
@@ -298,7 +275,7 @@ TEST_F(P2PHotStandbyServiceTest,
     const UUID client_id{21, 21};
     const UUID segment_id{22, 22};
     RegisterClient(master, client_id, MakeSegment(segment_id));
-    AddReplica(master, "before-snapshot", client_id, segment_id, 4096);
+    PublishRoute(master, "before-snapshot", client_id, segment_id, 4096);
 
     P2PHotStandbyService source(MakeStandbyConfig());
     ASSERT_EQ(source.Start(), ErrorCode::OK);
@@ -310,7 +287,7 @@ TEST_F(P2PHotStandbyServiceTest,
     ASSERT_EQ(fromInt(begin.error_code), ErrorCode::OK);
     EXPECT_EQ(begin.baseline_sequence_id, 2);
 
-    AddReplica(master, "after-snapshot", client_id, segment_id, 8192);
+    PublishRoute(master, "after-snapshot", client_id, segment_id, 8192);
     ASSERT_TRUE(
         source.WaitForAppliedSequence(3, std::chrono::milliseconds(2000)));
 
@@ -376,7 +353,7 @@ TEST_F(P2PHotStandbyServiceTest, TrimSignalSwitchesToSnapshotResync) {
     const UUID client_id{31, 31};
     const UUID segment_id{32, 32};
     RegisterClient(master, client_id, MakeSegment(segment_id));
-    AddReplica(master, "trim-resync-key", client_id, segment_id, 4096);
+    PublishRoute(master, "trim-resync-key", client_id, segment_id, 4096);
 
     auto source_config = MakeStandbyConfig();
     source_config.snapshot_service_port =
@@ -426,7 +403,7 @@ TEST_F(P2PHotStandbyServiceTest, TrimSignalSwitchesToSnapshotResync) {
     }
     EXPECT_EQ(target.GetState(), StandbyState::WATCHING);
     auto exported = target.ExportMetadata();
-    EXPECT_NE(exported.objects.find("trim-resync-key"), exported.objects.end());
+    EXPECT_NE(exported.routes.find("trim-resync-key"), exported.routes.end());
 }
 
 TEST_F(P2PHotStandbyServiceTest, ReconnectsFromLastAppliedSequence) {
@@ -615,7 +592,7 @@ TEST_F(P2PHotStandbyServiceTest, UnmountSegmentCascadeIsReplayed) {
     const UUID segment_id{4, 4};
 
     RegisterClient(master, client_id, MakeSegment(segment_id));
-    AddReplica(master, "key-cascade", client_id, segment_id);
+    PublishRoute(master, "key-cascade", client_id, segment_id);
     auto unmount = master.UnmountSegment(segment_id, client_id);
     ASSERT_TRUE(unmount.has_value()) << toString(unmount.error());
 
@@ -626,7 +603,7 @@ TEST_F(P2PHotStandbyServiceTest, UnmountSegmentCascadeIsReplayed) {
     standby.Stop();
 
     auto exported = standby.ExportMetadata();
-    EXPECT_EQ(exported.objects.find("key-cascade"), exported.objects.end());
+    EXPECT_EQ(exported.routes.find("key-cascade"), exported.routes.end());
     auto client_it = exported.clients.find(client_id);
     ASSERT_NE(client_it, exported.clients.end());
     EXPECT_TRUE(client_it->second.segments.empty());
@@ -644,16 +621,16 @@ TEST_F(P2PHotStandbyServiceTest, PromoteFinalCatchUpExportsLateEntry) {
     ASSERT_TRUE(
         standby.WaitForAppliedSequence(1, std::chrono::milliseconds(2000)));
 
-    AddReplica(master, "key-late", client_id, segment_id, 8192);
+    PublishRoute(master, "key-late", client_id, segment_id, 8192);
     ASSERT_TRUE(WaitForPersistedEntry(2, std::chrono::milliseconds(2000)));
     ASSERT_EQ(standby.Promote(), ErrorCode::OK);
     EXPECT_EQ(standby.GetState(), StandbyState::PROMOTED);
     EXPECT_GE(standby.GetLatestAppliedSequenceId(), 2);
 
     auto exported = standby.ExportMetadata();
-    auto object_it = exported.objects.find("key-late");
-    ASSERT_NE(object_it, exported.objects.end());
-    EXPECT_EQ(object_it->second.size, 8192);
+    auto object_it = exported.routes.find("key-late");
+    ASSERT_NE(object_it, exported.routes.end());
+    EXPECT_EQ(object_it->second.object_size, 8192);
 }
 
 TEST_F(P2PHotStandbyServiceTest, PromotionFailsOnFinalCatchUpApplyFailure) {
@@ -721,7 +698,7 @@ TEST_F(P2PHotStandbyServiceTest, RestoreExportedMetadataIntoP2PMasterService) {
     const auto segment = MakeSegment(segment_id);
 
     RegisterClient(master, client_id, segment);
-    AddReplica(master, "key-restore", client_id, segment_id, 2048);
+    PublishRoute(master, "key-restore", client_id, segment_id, 2048);
 
     P2PHotStandbyService standby(MakeStandbyConfig());
     ASSERT_EQ(standby.Start(), ErrorCode::OK);
@@ -746,40 +723,38 @@ TEST_F(P2PHotStandbyServiceTest, RestoreExportedMetadataIntoP2PMasterService) {
     ASSERT_EQ(segments_result.value().size(), 1);
     EXPECT_EQ(segments_result.value()[0], segment.name);
 
-    auto replica_result = restored_master.GetReplicaList("key-restore");
+    auto replica_result = restored_master.GetReadRoute("key-restore");
     ASSERT_TRUE(replica_result.has_value()) << toString(replica_result.error());
-    ASSERT_EQ(replica_result.value().replicas.size(), 1);
-    const auto& replica = replica_result.value().replicas[0];
-    ASSERT_TRUE(replica.is_p2p_proxy_replica());
-    const auto& p2p_desc = replica.get_p2p_proxy_descriptor();
-    EXPECT_EQ(p2p_desc.client_id, client_id);
-    EXPECT_EQ(p2p_desc.segment_id, segment_id);
-    EXPECT_EQ(p2p_desc.ip_address, "127.0.0.1");
-    EXPECT_EQ(p2p_desc.rpc_port, 50051);
-    EXPECT_EQ(p2p_desc.object_size, 2048);
+    ASSERT_EQ(replica_result.value().size(), 1);
+    const auto& route = replica_result.value()[0];
+    EXPECT_EQ(route.client_id, client_id);
+    EXPECT_EQ(route.segment_id, segment_id);
+    EXPECT_EQ(route.ip_address, "127.0.0.1");
+    EXPECT_EQ(route.rpc_port, 50051);
+    EXPECT_EQ(route.object_size, 2048);
 
-    WriteRouteRequest route_req;
+    P2PGetWriteRouteRequest route_req;
     route_req.client_id = {99, 99};
     route_req.key = "new-key-after-restore";
-    route_req.size = 1024;
+    route_req.object_size = 1024;
     auto route_result = restored_master.GetWriteRoute(route_req);
     ASSERT_TRUE(route_result.has_value()) << toString(route_result.error());
-    ASSERT_FALSE(route_result.value().candidates.empty());
-    EXPECT_EQ(route_result.value().candidates[0].client_id, client_id);
+    ASSERT_FALSE(route_result.value().empty());
+    EXPECT_EQ(route_result.value()[0].client_id, client_id);
 
-    AddReplica(restored_master, "key-after-restore", client_id, segment_id,
-               1024);
+    PublishRoute(restored_master, "key-after-restore", client_id, segment_id,
+                 1024);
     ASSERT_NE(restored_master.GetOpLogManager(), nullptr);
     EXPECT_EQ(restored_master.GetOpLogManager()->GetLastSequenceId(),
               promoted_sequence_id + 1);
 
     auto added_replica_result =
-        restored_master.GetReplicaList("key-after-restore");
+        restored_master.GetReadRoute("key-after-restore");
     ASSERT_TRUE(added_replica_result.has_value())
         << toString(added_replica_result.error());
-    ASSERT_EQ(added_replica_result.value().replicas.size(), 1);
+    ASSERT_EQ(added_replica_result.value().size(), 1);
 
-    RemoveReplica(restored_master, "key-after-restore", client_id, segment_id);
+    WithdrawRoute(restored_master, "key-after-restore", client_id, segment_id);
     EXPECT_EQ(restored_master.GetOpLogManager()->GetLastSequenceId(),
               promoted_sequence_id + 2);
 }
@@ -791,7 +766,7 @@ TEST_F(P2PHotStandbyServiceTest, RestorePromotedMetadataIntoWrappedRuntime) {
     const auto segment = MakeSegment(segment_id);
 
     RegisterClient(primary_master, client_id, segment);
-    AddReplica(primary_master, "runtime-key", client_id, segment_id, 4096);
+    PublishRoute(primary_master, "runtime-key", client_id, segment_id, 4096);
 
     P2PHotStandbyService standby(MakeStandbyConfig());
     ASSERT_EQ(standby.Start(), ErrorCode::OK);
@@ -800,32 +775,33 @@ TEST_F(P2PHotStandbyServiceTest, RestorePromotedMetadataIntoWrappedRuntime) {
     ASSERT_EQ(standby.Promote(), ErrorCode::OK);
     const uint64_t promoted_sequence_id = standby.GetLatestAppliedSequenceId();
 
-    WrappedP2PMasterService promoted_runtime(MakeWrappedMasterConfig());
+    P2PMasterRpcService promoted_runtime(MakeWrappedMasterConfig());
     auto& promoted_master =
         static_cast<P2PMasterService&>(promoted_runtime.GetMasterService());
     ASSERT_EQ(promoted_master.RestoreFromStandbyMetadata(
                   standby.ExportMetadata(), promoted_sequence_id),
               ErrorCode::OK);
 
-    auto replica_result = promoted_runtime.GetReplicaList("runtime-key");
+    auto replica_result = promoted_runtime.GetReadRoute(
+        P2PGetReadRouteRequest{.key = "runtime-key"});
     ASSERT_TRUE(replica_result.has_value()) << toString(replica_result.error());
-    ASSERT_EQ(replica_result.value().replicas.size(), 1);
+    ASSERT_EQ(replica_result.value().size(), 1);
 
-    WriteRouteRequest route_req;
+    P2PGetWriteRouteRequest route_req;
     route_req.client_id = {99, 99};
     route_req.key = "runtime-key-after-promotion";
-    route_req.size = 1024;
+    route_req.object_size = 1024;
     auto route_result = promoted_runtime.GetWriteRoute(route_req);
     ASSERT_TRUE(route_result.has_value()) << toString(route_result.error());
-    ASSERT_FALSE(route_result.value().candidates.empty());
-    EXPECT_EQ(route_result.value().candidates[0].client_id, client_id);
+    ASSERT_FALSE(route_result.value().empty());
+    EXPECT_EQ(route_result.value()[0].client_id, client_id);
 
-    AddReplicaRequest add_req;
+    P2PPublishRouteRequest add_req;
     add_req.key = "runtime-key-after-promotion";
     add_req.client_id = client_id;
     add_req.segment_id = segment_id;
-    add_req.size = 1024;
-    ASSERT_TRUE(promoted_runtime.AddReplica(add_req).has_value());
+    add_req.object_size = 1024;
+    ASSERT_TRUE(promoted_runtime.PublishRoute(add_req).has_value());
 
     ASSERT_NE(promoted_master.GetOpLogManager(), nullptr);
     EXPECT_EQ(promoted_master.GetOpLogManager()->GetLastSequenceId(),
@@ -839,8 +815,8 @@ TEST_F(P2PHotStandbyServiceTest, PromotedRuntimeContinuesP2PMasterFlow) {
     const auto original_segment = MakeSegment(original_segment_id);
 
     RegisterClient(primary_master, original_client_id, original_segment);
-    AddReplica(primary_master, "flow-key-before-promotion", original_client_id,
-               original_segment_id, 4096);
+    PublishRoute(primary_master, "flow-key-before-promotion",
+                 original_client_id, original_segment_id, 4096);
 
     P2PHotStandbyService standby(MakeStandbyConfig());
     ASSERT_EQ(standby.Start(), ErrorCode::OK);
@@ -849,52 +825,52 @@ TEST_F(P2PHotStandbyServiceTest, PromotedRuntimeContinuesP2PMasterFlow) {
     ASSERT_EQ(standby.Promote(), ErrorCode::OK);
     const uint64_t promoted_sequence_id = standby.GetLatestAppliedSequenceId();
 
-    WrappedP2PMasterService promoted_runtime(MakeWrappedMasterConfig());
+    P2PMasterRpcService promoted_runtime(MakeWrappedMasterConfig());
     auto& promoted_master =
         static_cast<P2PMasterService&>(promoted_runtime.GetMasterService());
     ASSERT_EQ(promoted_master.RestoreFromStandbyMetadata(
                   standby.ExportMetadata(), promoted_sequence_id),
               ErrorCode::OK);
 
-    auto restored_replica =
-        promoted_runtime.GetReplicaList("flow-key-before-promotion");
+    auto restored_replica = promoted_runtime.GetReadRoute(
+        P2PGetReadRouteRequest{.key = "flow-key-before-promotion"});
     ASSERT_TRUE(restored_replica.has_value())
         << toString(restored_replica.error());
-    ASSERT_EQ(restored_replica.value().replicas.size(), 1);
+    ASSERT_EQ(restored_replica.value().size(), 1);
 
     const UUID rejoined_client_id{29, 29};
     const UUID rejoined_segment_id{30, 30};
     const auto rejoined_segment = MakeSegment(rejoined_segment_id);
     RegisterClient(promoted_master, rejoined_client_id, rejoined_segment);
 
-    WriteRouteRequest route_req;
+    P2PGetWriteRouteRequest route_req;
     route_req.client_id = {31, 31};
     route_req.key = "flow-key-after-promotion";
-    route_req.size = 1024;
+    route_req.object_size = 1024;
     auto route_result = promoted_runtime.GetWriteRoute(route_req);
     ASSERT_TRUE(route_result.has_value()) << toString(route_result.error());
-    ASSERT_FALSE(route_result.value().candidates.empty());
+    ASSERT_FALSE(route_result.value().empty());
 
-    AddReplicaRequest add_req;
+    P2PPublishRouteRequest add_req;
     add_req.key = route_req.key;
     add_req.client_id = rejoined_client_id;
     add_req.segment_id = rejoined_segment_id;
-    add_req.size = route_req.size;
-    ASSERT_TRUE(promoted_runtime.AddReplica(add_req).has_value());
+    add_req.object_size = route_req.object_size;
+    ASSERT_TRUE(promoted_runtime.PublishRoute(add_req).has_value());
 
-    auto added_replica = promoted_runtime.GetReplicaList(route_req.key);
+    auto added_replica = promoted_runtime.GetReadRoute(
+        P2PGetReadRouteRequest{.key = route_req.key});
     ASSERT_TRUE(added_replica.has_value()) << toString(added_replica.error());
-    ASSERT_EQ(added_replica.value().replicas.size(), 1);
-    const auto& p2p_desc =
-        added_replica.value().replicas[0].get_p2p_proxy_descriptor();
+    ASSERT_EQ(added_replica.value().size(), 1);
+    const auto& p2p_desc = added_replica.value()[0];
     EXPECT_EQ(p2p_desc.client_id, rejoined_client_id);
     EXPECT_EQ(p2p_desc.segment_id, rejoined_segment_id);
 
-    RemoveReplicaRequest remove_req;
+    P2PWithdrawRouteRequest remove_req;
     remove_req.key = route_req.key;
     remove_req.client_id = rejoined_client_id;
     remove_req.segment_id = rejoined_segment_id;
-    ASSERT_TRUE(promoted_runtime.RemoveReplica(remove_req).has_value());
+    ASSERT_TRUE(promoted_runtime.WithdrawRoute(remove_req).has_value());
 
     ASSERT_NE(promoted_master.GetOpLogManager(), nullptr);
     EXPECT_EQ(promoted_master.GetOpLogManager()->GetLastSequenceId(),

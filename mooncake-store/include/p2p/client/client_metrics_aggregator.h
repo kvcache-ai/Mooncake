@@ -15,6 +15,9 @@ namespace mooncake {
 
 // Aggregates per-client cumulative metric snapshots into cluster-wide
 // master_cluster_* gauges
+// TODO: Extend ClientMetricSnapshot and this aggregator with per-medium hit
+// dimensions when clients can attribute hits to a concrete storage tier. The
+// master must not infer DRAM/NVMe hits from replica metadata.
 class ClientMetricsAggregator {
    public:
     ClientMetricsAggregator();
@@ -47,9 +50,11 @@ class ClientMetricsAggregator {
                               const DataMetricSnapshot& new_v,
                               CounterGroup& group);
 
-    // Recomputes retention aggregates from client_snapshots_.
-    // Callers must hold mutex_.
-    void RefreshRetentionAggregates();
+    // Updates retention aggregates using this client's stored baseline.
+    // Callers must hold mutex_ and replace or erase the stored snapshot
+    // afterwards.
+    void UpdateRetention(const UUID& client_id,
+                         const KeyRetentionSnapshot& current);
 
     mutable std::mutex mutex_;
     // Per-client baseline for signed deltas; subtracted on client removal.
@@ -62,7 +67,7 @@ class ClientMetricsAggregator {
     ylt::metric::gauge_t remote_write_retries_;
 
     // Cluster-wide key retention. The bucket arrays hold the merged
-    // distributions (non-cumulative) over KeyRetentionMetric::LifetimeBuckets()
+    // distributions (non-cumulative) over p2p::metric_util::LifetimeBuckets()
     // and are rendered as histograms at serialize time.
     ylt::metric::gauge_t key_live_count_;
     ylt::metric::gauge_t key_removed_count_;

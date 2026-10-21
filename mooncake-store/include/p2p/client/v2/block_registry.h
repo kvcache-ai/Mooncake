@@ -18,6 +18,7 @@
 //     registration id and the raw pointer identity still match, which is what
 //     makes concurrent delete-then-recreate safe.
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
