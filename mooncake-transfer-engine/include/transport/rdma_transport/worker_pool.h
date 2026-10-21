@@ -239,6 +239,9 @@ class WorkerPool {
     std::atomic<int> context_failure_count_{0};
     uint64_t breaker_reactivate_after_ns_{0};
     static constexpr int kLocalCompletionFailureThreshold = 32;
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+    ClassicRdmaCongestionControl adaptive_congestion_control_;
+#endif
 };
 }  // namespace mooncake
 
