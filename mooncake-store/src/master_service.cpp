@@ -895,12 +895,15 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
             rollback_new_segments();
             // Once client_mutex_ has been released for the metadata restore
             // pass, re-acquire it for the provisional-record discard only
-            // after releasing master_state_mutex_: acquiring client_mutex_
-            // exclusive while holding master_state_mutex_ exclusive would
-            // invert the documented lock order and can deadlock against a
-            // concurrent mount or remount admission.
+            // after releasing master_state_mutex_ AND the liveness retaining
+            // guard: acquiring client_mutex_ exclusive while holding either
+            // would invert the documented lock order (client_mutex_ before
+            // master_state_mutex_, and mount admission takes client_mutex_
+            // before the record's transition mutex via ObserveAndRun) and can
+            // deadlock against a concurrent mount or remount admission.
             if (client_lock_released) {
                 snapshot_lock.unlock();
+                remount_guard.reset();
                 client_lock.lock();
             }
             discard_provisional_record();
@@ -1126,12 +1129,14 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
         }
 
         // Change the client status to OK. The metadata restore pass is done,
-        // so master_state_mutex_ is released first: acquiring client_mutex_
-        // exclusive while still holding master_state_mutex_ exclusive would
-        // invert the documented lock order (client_mutex_ before
-        // master_state_mutex_) and can deadlock against a concurrent mount
-        // or remount admission.
+        // so master_state_mutex_ and the liveness retaining guard are released
+        // first: acquiring client_mutex_ exclusive while still holding either
+        // would invert the documented lock order (client_mutex_ before
+        // master_state_mutex_; mount admission takes client_mutex_ before the
+        // record's transition mutex via ObserveAndRun) and can deadlock
+        // against a concurrent mount or remount admission.
         snapshot_lock.unlock();
+        remount_guard.reset();
         client_lock.lock();
         ok_client_.insert(client_id);
         {
