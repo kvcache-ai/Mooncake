@@ -1970,20 +1970,25 @@ class MasterService {
     friend class MetadataAccessor;
     class MetadataAccessorRO {
        public:
+        // Reads the object without copying its identity, which a batch read
+        // would otherwise pay for once per key.
         MetadataAccessorRO(const MasterService* service,
-                           ObjectIdentity object_id)
+                           const TenantId& tenant_id,
+                           const std::string& user_key)
             : service_(service),
-              object_id_(std::move(object_id)),
-              shard_idx_(service_->getShardIndex(object_id_.tenant_id,
-                                                 object_id_.user_key)),
+              shard_idx_(service_->getShardIndex(tenant_id, user_key)),
               shard_guard_(service_, shard_idx_),
-              tenant_it_(shard_guard_->tenants.find(object_id_.tenant_id)),
+              tenant_it_(shard_guard_->tenants.find(tenant_id)),
               tenant_state_(tenant_it_ == shard_guard_->tenants.end()
                                 ? nullptr
                                 : &tenant_it_->second),
               it_(tenant_state_ == nullptr
                       ? ObjectMetadataConstIterator{}
-                      : tenant_state_->metadata.find(object_id_.user_key)) {}
+                      : tenant_state_->metadata.find(user_key)) {}
+        MetadataAccessorRO(const MasterService* service,
+                           const ObjectIdentity& object_id)
+            : MetadataAccessorRO(service, object_id.tenant_id,
+                                 object_id.user_key) {}
 
         // Check if metadata exists
         bool Exists() const NO_THREAD_SAFETY_ANALYSIS {
@@ -2017,7 +2022,6 @@ class MasterService {
         using ObjectMetadataConstIterator = ObjectMap::const_iterator;
 
         const MasterService* service_;
-        const ObjectIdentity object_id_;
         const size_t shard_idx_;
         MetadataShardAccessorRO shard_guard_;
         std::unordered_map<TenantId, TenantState, TenantIdHash>::const_iterator
@@ -2056,6 +2060,42 @@ class MasterService {
     // starts, holding no lock, so `visit` may reach any key. A tenant that
     // gains its first object meanwhile may or may not be visited.
     void VisitTenants(const std::function<void(const TenantId&)>& visit) const;
+
+    // The work client reads leave for when they hold no lock on any key:
+    // queueing a promotion for each read served only from LOCAL_DISK, and
+    // counting each object's access towards another memory replica once.
+    class ReadFollowUps {
+       public:
+        void Promote(const TenantId& tenant_id, const std::string& key) {
+            promotions_.push_back({tenant_id, key});
+        }
+        void RecordAccess(const TenantId& tenant_id, const std::string& key) {
+            if (accessed_.insert(tenant_id.MakeScopedKey(key)).second) {
+                accesses_.push_back({tenant_id, key});
+            }
+        }
+        // The caller holds master_state_mutex_ (shared) and no key.
+        void Run(MasterService& service) const;
+
+       private:
+        std::vector<ObjectIdentity> promotions_;
+        std::vector<ObjectIdentity> accesses_;
+        std::unordered_set<std::string> accessed_;
+    };
+
+    // What ExistKey answers for an object: whether it has a replica to read,
+    // granting it a read lease if it does and `grant_lease` is set.
+    bool ReadExistence(const ObjectMetadata& metadata, bool grant_lease) const;
+    // A client read of an object: its readable replicas, after the read's
+    // effects on it (the read lease, the DFS LRU, hit metrics). What is left
+    // for when no key is held goes to `follow_ups`.
+    auto ReadReplicaList(const TenantId& tenant_id, const std::string& key,
+                         const ObjectMetadata& metadata,
+                         ReadFollowUps& follow_ups)
+        -> tl::expected<GetReplicaListResponse, ErrorCode>;
+    // An admin read of an object, which leaves it as it is.
+    auto ReadReplicaListForAdmin(const ObjectMetadata& metadata) const
+        -> tl::expected<GetReplicaListResponse, ErrorCode>;
 
     // The single-pass cursor behind ReadCursor() and WriteCursor(). It owns
     // the lock of the shard it stands in, so it neither copies nor moves, and
