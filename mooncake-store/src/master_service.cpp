@@ -4924,10 +4924,11 @@ tl::expected<MasterService::PartReadOutcome, ErrorCode> MasterService::ReadPart(
     // A read that names no part asks for a whole object. An object of several
     // parts has no whole to hand out: its parts are read one at a time, and a
     // reader that cannot say which part it wants is too old to be given any.
-    if (!part_index.has_value() && metadata.PartCount() > 1) {
-        LOG(WARNING) << "key=" << key << ", part_count=" << metadata.PartCount()
-                     << ", error=read_names_no_part";
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    if (!part_index.has_value()) {
+        if (const auto refusal =
+                RefusesPartedObject("read_without_part", key, metadata)) {
+            return tl::make_unexpected(*refusal);
+        }
     }
     const uint32_t resolved = part_index.value_or(0);
     if (resolved >= metadata.PartCount()) {
@@ -4995,15 +4996,16 @@ bool MasterService::IsEvictableMemoryReplica(const Replica& replica) const {
            replica.get_refcnt() == 0;
 }
 
-bool MasterService::RefusesPartedReplicas(
+std::optional<ErrorCode> MasterService::RefusesPartedObject(
     const char* action, const std::string& key,
     const ObjectMetadata& metadata) const {
     if (metadata.PartCount() <= 1) {
-        return false;
+        return std::nullopt;
     }
-    LOG(ERROR) << "key=" << key << ", part_count=" << metadata.PartCount()
-               << ", error=" << action << "_has_no_per_part_form";
-    return true;
+    LOG(WARNING) << "key=" << key << ", part_count=" << metadata.PartCount()
+                 << ", action=" << action
+                 << ", error=parted_object_has_no_single_replica_set";
+    return ErrorCode::INVALID_PARAMS;
 }
 
 auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern,
@@ -5034,12 +5036,9 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern,
             const auto& metadata = record.metadata;
             if (std::regex_search(key, pattern)) {
                 // A regex answers with whole objects, and an object of several
-                // parts has no whole to hand out.
-                if (metadata.PartCount() > 1) {
-                    LOG(WARNING)
-                        << "key=" << key << " matched by regex, but has "
-                        << metadata.PartCount()
-                        << " parts, which this query cannot show.";
+                // parts has no whole to hand out, so the key stays out of the
+                // answer rather than failing the whole query.
+                if (RefusesPartedObject("regex_list", key, metadata)) {
                     continue;
                 }
                 auto replica_list = GetReadableReplicaDescriptors(metadata);
@@ -5169,10 +5168,8 @@ auto MasterService::GetReplicaListForAdmin(const std::string& key,
 
     // The admin view shows an object as a whole, and the admin surfaces do not
     // speak parts, so an object of several parts has nothing to show here.
-    if (metadata.PartCount() > 1) {
-        LOG(WARNING) << "key=" << key << ", part_count=" << metadata.PartCount()
-                     << ", error=admin_read_of_a_parted_object";
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    if (const auto refusal = RefusesPartedObject("admin_read", key, metadata)) {
+        return tl::make_unexpected(*refusal);
     }
 
     auto replica_list = GetReadableReplicaDescriptors(metadata);
@@ -5425,9 +5422,9 @@ MasterService::BatchGetReplicaListForAdmin(const std::vector<std::string>& keys,
 
                 const auto& metadata = metadata_it->second.metadata;
                 // The admin view shows an object as a whole.
-                if (metadata.PartCount() > 1) {
-                    results[original_idx] =
-                        tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+                if (const auto refusal = RefusesPartedObject("admin_batch_read",
+                                                             key, metadata)) {
+                    results[original_idx] = tl::make_unexpected(*refusal);
                     continue;
                 }
                 auto replica_list = GetReadableReplicaDescriptors(metadata);
@@ -6603,8 +6600,9 @@ auto MasterService::AddReplicaForRetainedClient(const UUID& client_id,
         }
     }
     auto& metadata = accessor.Get();
-    if (RefusesPartedReplicas("add_replica", key, metadata)) {
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    if (const auto refusal =
+            RefusesPartedObject("add_replica", key, metadata)) {
+        return tl::make_unexpected(*refusal);
     }
     const auto previous_kv_media = KvMediaSnapshot(metadata);
     if (replica.type() != ReplicaType::LOCAL_DISK) {
@@ -7100,11 +7098,9 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 // several parts has one length per part, and every part is
                 // written on its own, so there is no single write for an
                 // upsert to open.
-                if (metadata.PartCount() > 1) {
-                    LOG(ERROR) << "key=" << key
-                               << ", part_count=" << metadata.PartCount()
-                               << ", error=upsert_has_no_part_form";
-                    return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+                if (const auto refusal =
+                        RefusesPartedObject("upsert", key, metadata)) {
+                    return tl::make_unexpected(*refusal);
                 }
 
                 // Reject if the caller tries to change group membership.
@@ -7793,8 +7789,8 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
     }
 
     auto& metadata = accessor.Get();
-    if (RefusesPartedReplicas("copy", key, metadata)) {
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    if (const auto refusal = RefusesPartedObject("copy", key, metadata)) {
+        return tl::make_unexpected(*refusal);
     }
     const TenantQuotaHandle quota_account = accessor.QuotaAccount();
     auto& state = accessor.GetState();
@@ -8257,8 +8253,8 @@ tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
     }
 
     auto& metadata = accessor.Get();
-    if (RefusesPartedReplicas("move", key, metadata)) {
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    if (const auto refusal = RefusesPartedObject("move", key, metadata)) {
+        return tl::make_unexpected(*refusal);
     }
     const TenantQuotaHandle quota_account = accessor.QuotaAccount();
     auto source = metadata.GetReplicaBySegmentName(src_segment);
@@ -9977,7 +9973,7 @@ auto MasterService::NotifyOffloadSuccess(
                 // Nothing queues a part object for offload, so this can only be
                 // a registration that arrived for one: drop the task and refuse
                 // it rather than give one part a disk replica of its own.
-                if (RefusesPartedReplicas("offload", task.key, obj_metadata)) {
+                if (RefusesPartedObject("offload", task.key, obj_metadata)) {
                     auto& offloading_task = accessor.GetState().offloading_task;
                     if (offloading_task) {
                         auto source = obj_metadata.GetReplicaByID(
@@ -10483,9 +10479,9 @@ MasterService::SubmitReplicaActionProposalLocked(
     auto& metadata = accessor.Get();
     // Dynamic replication adds one replica of the object; an object of several
     // parts has one replica set per part and no single set to copy.
-    if (RefusesPartedReplicas("dynamic_replication", object_id.user_key,
-                              metadata)) {
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    if (const auto refusal = RefusesPartedObject(
+            "dynamic_replication", object_id.user_key, metadata)) {
+        return tl::make_unexpected(*refusal);
     }
     const uint64_t version_epoch =
         DynamicReplicationController::VersionEpoch(metadata);
@@ -10767,8 +10763,8 @@ auto MasterService::PromotionAllocStart(
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
     auto& metadata = accessor.Get();
-    if (RefusesPartedReplicas("promotion", key, metadata)) {
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    if (const auto refusal = RefusesPartedObject("promotion", key, metadata)) {
+        return tl::make_unexpected(*refusal);
     }
 
     if (accessor.InProcessing()) {

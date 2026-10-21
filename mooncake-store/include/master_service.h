@@ -2576,14 +2576,19 @@ class MasterService {
     GetReplicaListResponse MakeReadResponse(PartReadOutcome&& outcome) const;
     bool IsEvictableMemoryReplica(const Replica& replica) const;
 
-    // Whether `metadata` describes an object of several parts, which the
-    // replica-set transitions have no form for: copy, move, offload, promotion
-    // and the local-disk registration hand an object one replica set for all of
-    // it, and the accessor that adds replicas acts on part 0 alone. `action`
-    // names the caller in the log. True means the caller must refuse with
-    // INVALID_PARAMS.
-    bool RefusesPartedReplicas(const char* action, const std::string& key,
-                               const ObjectMetadata& metadata) const;
+    // Whether this surface meets an object it has no form for. The surfaces
+    // that address one replica set of an object name a key and no part: copy,
+    // move, offload, promotion, dynamic replication, the add-replica
+    // registration, the admin views, upsert, and a read that names no part. An
+    // object of several parts has one replica set per part, and one length per
+    // part. The answer is the error the surface returns, so every refusal
+    // carries one error code and one log line, with `action` naming the
+    // surface. A surface that drops the key instead of failing (the regex
+    // listing, the promotion candidate scan, BatchReplicaClear) asks the same
+    // question and keeps its own answer.
+    [[nodiscard]] std::optional<ErrorCode> RefusesPartedObject(
+        const char* action, const std::string& key,
+        const ObjectMetadata& metadata) const;
 
     /**
      * Segment lifecycle persist helper. Tries to durably persist the
