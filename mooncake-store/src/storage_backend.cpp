@@ -7,6 +7,7 @@
 #include <sys/stat.h>
 #include <sys/uio.h>
 #include <errno.h>
+#include <climits>
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
@@ -1705,7 +1706,16 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
 
     // Phase 1: eviction — remove oldest buckets from metadata maps to make
     // room. Must notify master BEFORE deleting files (Phase 2).
-    const int64_t required_size = bucket->data_size + bucket->meta_size;
+    // An aligned direct bucket file also holds its padding, which the
+    // logical data_size leaves out.
+    int64_t file_bytes = bucket->data_size;
+    if (bucket_backend_config_.aligned_direct_write) {
+        file_bytes = 0;
+        for (const auto& iov : iovs) {
+            file_bytes += static_cast<int64_t>(iov.iov_len);
+        }
+    }
+    const int64_t required_size = file_bytes + bucket->meta_size;
     auto prepare_result = PrepareEviction(required_size, bucket->keys);
     if (!prepare_result) {
         return tl::make_unexpected(prepare_result.error());
@@ -2117,21 +2127,20 @@ tl::expected<void, ErrorCode> BucketStorageBackend::GetBucketKeys(
 }
 
 namespace {
-// Shared selector for bucket direct-write implementations. The aligned layout
-// will be added separately; do not silently treat it as packed or buffered.
+// Shared selector for bucket direct-write implementations: returns whether
+// the packed layout is selected. Unknown values fail instead of silently
+// falling back to buffered writes.
 tl::expected<bool, ErrorCode> ReadPackedBucketDirectWrite() {
     const auto setting = Environ::ReadOr(
         BucketBackendEnvironmentVariables::MOONCAKE_OFFLOAD_BUCKET_DIRECT_WRITE,
         std::string{"0"});
     if (setting == "0" || setting == "false") return false;
     if (setting == "packed" || setting == "true" || setting == "1") return true;
-    if (setting == "aligned") {
-        LOG(ERROR) << "MOONCAKE_OFFLOAD_BUCKET_DIRECT_WRITE=aligned is not yet "
-                      "supported by this build";
-    } else {
-        LOG(ERROR) << "Invalid MOONCAKE_OFFLOAD_BUCKET_DIRECT_WRITE='"
-                   << setting << "'; expected 0/false or packed/true/1";
-    }
+    // BucketBackendConfig::FromEnvironment() turns aligned into
+    // aligned_direct_write.
+    if (setting == "aligned") return false;
+    LOG(ERROR) << "Invalid MOONCAKE_OFFLOAD_BUCKET_DIRECT_WRITE='" << setting
+               << "'; expected 0/false, packed/true/1 or aligned";
     return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
 }
 }  // namespace
@@ -2146,6 +2155,12 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
 
         const auto direct_write = ReadPackedBucketDirectWrite();
         if (!direct_write) return tl::make_unexpected(direct_write.error());
+        if (direct_write.value() &&
+            bucket_backend_config_.aligned_direct_write) {
+            LOG(ERROR) << "aligned_direct_write is set, but "
+                          "MOONCAKE_OFFLOAD_BUCKET_DIRECT_WRITE selects packed";
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
         if (direct_write.value()) {
 #ifdef USE_URING
             if (!file_storage_config_.use_uring) {
@@ -2817,6 +2832,10 @@ BucketStorageBackend::BuildBucket(
     int64_t bucket_id,
     const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
     std::vector<iovec>& iovs, std::vector<StorageObjectMetadata>& metadatas) {
+    if (bucket_backend_config_.aligned_direct_write) {
+        return BuildAlignedDirectBucket(bucket_id, batch_object, iovs,
+                                        metadatas);
+    }
     auto bucket = std::make_shared<BucketMetadata>();
     int64_t storage_offset = 0;
     for (const auto& object : batch_object) {
@@ -2844,6 +2863,158 @@ BucketStorageBackend::BuildBucket(
     return bucket;
 }
 
+namespace {
+
+// A value's slices can go to O_DIRECT as they are when each one starts on an
+// alignment boundary and each one but the last is a multiple of alignment.
+bool SlicesAreDirectAligned(const std::vector<Slice>& slices,
+                            size_t alignment) {
+    for (size_t i = 0; i < slices.size(); ++i) {
+        if (reinterpret_cast<uintptr_t>(slices[i].ptr) % alignment != 0) {
+            return false;
+        }
+        if (i + 1 < slices.size() && slices[i].size % alignment != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Aligned direct writes need the file's direct I/O alignment to be at most
+// alignment. A reported alignment of 0 means the file does not support
+// direct I/O (ext4 still accepts F_SETFL O_DIRECT there and falls back to
+// buffered writes). Builds or kernels that do not report the alignment are
+// left to fcntl(F_SETFL, O_DIRECT) to accept or refuse.
+bool DirectIOAlignmentFits(int fd, size_t alignment) {
+#ifdef STATX_DIOALIGN
+    struct statx stx{};
+    if (statx(fd, "", AT_EMPTY_PATH, STATX_DIOALIGN, &stx) == 0 &&
+        (stx.stx_mask & STATX_DIOALIGN) != 0) {
+        return stx.stx_dio_offset_align != 0 &&
+               stx.stx_dio_offset_align <= alignment &&
+               stx.stx_dio_mem_align <= alignment;
+    }
+#endif
+    return true;
+}
+
+// The bytes an aligned direct bucket copies, reused by the next bucket built
+// on the same thread. It grows to the largest such bucket and is freed when
+// the thread exits.
+struct AlignedCopyBuffer {
+    struct Free {
+        void operator()(char* p) const { std::free(p); }
+    };
+    std::unique_ptr<char, Free> data;
+    size_t capacity = 0;
+};
+
+}  // namespace
+
+// Each object takes whole 4 KiB blocks: zeros and then the key, so that the
+// value starts on a block boundary, then the value padded with zeros to a
+// block boundary. The metadata offset is the key's, as in the packed layout,
+// so readers find the value at offset + key_size either way. Aligned value
+// slices go into iovs as they are. The per-thread copy buffer holds the key
+// blocks, the last partial block of each value, and the values whose slices
+// are not aligned.
+tl::expected<std::shared_ptr<BucketMetadata>, ErrorCode>
+BucketStorageBackend::BuildAlignedDirectBucket(
+    int64_t bucket_id,
+    const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
+    std::vector<iovec>& iovs, std::vector<StorageObjectMetadata>& metadatas) {
+    constexpr size_t kBlock = kDirectIOAlignment;
+    size_t scratch_size = 0;
+    for (const auto& [key, slices] : batch_object) {
+        if (slices.empty()) {
+            LOG(ERROR) << "Failed to create bucket, object is empty";
+            return tl::make_unexpected(ErrorCode::INVALID_KEY);
+        }
+        size_t value_size = 0;
+        for (const auto& slice : slices) value_size += slice.size;
+        scratch_size += align_up(key.size(), kBlock);
+        if (!SlicesAreDirectAligned(slices, kBlock)) {
+            scratch_size += align_up(value_size, kBlock);
+        } else if (value_size % kBlock != 0) {
+            scratch_size += kBlock;
+        }
+    }
+    thread_local AlignedCopyBuffer copy_buffer;
+    if (scratch_size > copy_buffer.capacity) {
+        void* buf = nullptr;
+        int ret = posix_memalign(&buf, kBlock, scratch_size);
+        if (ret != 0) {
+            LOG(ERROR) << "Failed to allocate " << scratch_size
+                       << " bytes for an aligned direct bucket: "
+                       << strerror(ret);
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+        copy_buffer.data.reset(static_cast<char*>(buf));
+        copy_buffer.capacity = scratch_size;
+    }
+    last_aligned_copy_bytes_.store(scratch_size, std::memory_order_relaxed);
+
+    char* next = copy_buffer.data.get();
+    auto bucket = std::make_shared<BucketMetadata>();
+    int64_t storage_offset = 0;
+    for (const auto& [key, slices] : batch_object) {
+        const size_t key_block = align_up(key.size(), kBlock);
+        if (key_block > 0) {
+            memset(next, 0, key_block - key.size());
+            memcpy(next + key_block - key.size(), key.data(), key.size());
+            iovs.emplace_back(iovec{next, key_block});
+            next += key_block;
+        }
+
+        size_t value_size = 0;
+        for (const auto& slice : slices) value_size += slice.size;
+        const size_t value_block = align_up(value_size, kBlock);
+        if (SlicesAreDirectAligned(slices, kBlock)) {
+            for (size_t i = 0; i + 1 < slices.size(); ++i) {
+                if (slices[i].size > 0) {
+                    iovs.emplace_back(iovec{slices[i].ptr, slices[i].size});
+                }
+            }
+            const Slice& last = slices.back();
+            const size_t whole = last.size & ~(kBlock - 1);
+            if (whole > 0) {
+                iovs.emplace_back(iovec{last.ptr, whole});
+            }
+            if (whole < last.size) {
+                const size_t tail = last.size - whole;
+                memcpy(next, static_cast<const char*>(last.ptr) + whole, tail);
+                memset(next + tail, 0, kBlock - tail);
+                iovs.emplace_back(iovec{next, kBlock});
+                next += kBlock;
+            }
+        } else if (value_block > 0) {
+            size_t copied = 0;
+            for (const auto& slice : slices) {
+                if (slice.size > 0) {
+                    memcpy(next + copied, slice.ptr, slice.size);
+                    copied += slice.size;
+                }
+            }
+            memset(next + copied, 0, value_block - copied);
+            iovs.emplace_back(iovec{next, value_block});
+            next += value_block;
+        }
+
+        const int64_t key_size = static_cast<int64_t>(key.size());
+        const int64_t key_offset =
+            storage_offset + static_cast<int64_t>(key_block) - key_size;
+        const int64_t object_total_size = static_cast<int64_t>(value_size);
+        bucket->data_size += object_total_size + key_size;
+        bucket->metadatas.emplace_back(
+            BucketObjectMetadata{key_offset, key_size, object_total_size});
+        metadatas.emplace_back(StorageObjectMetadata{
+            bucket_id, key_offset, key_size, object_total_size, ""});
+        bucket->keys.push_back(key);
+        storage_offset += static_cast<int64_t>(key_block + value_block);
+    }
+    return bucket;
+}
+
 tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
     int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket_metadata,
     std::vector<iovec>& iovs, int disk_index) {
@@ -2854,7 +3025,9 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
     auto bucket_data_path = bucket_data_path_res.value();
-    auto open_file_result = OpenFile(bucket_data_path, FileMode::Write);
+    const bool direct_write = bucket_backend_config_.aligned_direct_write;
+    auto open_file_result =
+        OpenFile(bucket_data_path, FileMode::Write, direct_write);
     if (!open_file_result) {
         LOG(ERROR) << "Failed to open file for bucket writing: "
                    << bucket_data_path;
@@ -2862,10 +3035,29 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
     }
     auto file = std::move(open_file_result.value());
 
+    // The UringFile branch below packs data_size bytes; it must not see the
+    // padded iovecs of an aligned direct bucket.
+    if (direct_write) {
+        // One pwritev takes at most IOV_MAX iovecs.
+        off_t offset = 0;
+        for (size_t i = 0; i < iovs.size(); i += IOV_MAX) {
+            const int count =
+                static_cast<int>(std::min<size_t>(IOV_MAX, iovs.size() - i));
+            auto write_result =
+                file->vector_write(iovs.data() + i, count, offset);
+            if (!write_result) {
+                const int write_errno = errno;
+                LOG(ERROR) << "vector_write failed for: " << bucket_id
+                           << ", error: " << write_result.error() << " ("
+                           << strerror(write_errno) << ")";
+                return tl::make_unexpected(write_result.error());
+            }
+            offset += static_cast<off_t>(write_result.value());
+        }
+    }
 #ifdef USE_URING
     // Try to use write_aligned for O_DIRECT I/O if file is UringFile
-    UringFile* uring_file = dynamic_cast<UringFile*>(file.get());
-    if (uring_file != nullptr) {
+    else if (UringFile* uring_file = dynamic_cast<UringFile*>(file.get())) {
         size_t total_size = static_cast<size_t>(bucket_metadata->data_size);
         size_t aligned_size = align_up(total_size, kDirectIOAlignment);
 
@@ -2962,9 +3154,9 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
                        << ", got: " << write_result.value();
             return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
         }
-    } else
+    }
 #endif
-    {
+    else {
         // Fallback to vector_write for non-UringFile
         auto write_result = file->vector_write(iovs.data(), iovs.size(), 0);
         if (!write_result) {
@@ -4021,7 +4213,8 @@ BucketStorageBackend::GetBucketMetadataPath(int64_t bucket_id,
 }
 
 tl::expected<std::unique_ptr<StorageFile>, ErrorCode>
-BucketStorageBackend::OpenFile(const std::string& path, FileMode mode) const {
+BucketStorageBackend::OpenFile(const std::string& path, FileMode mode,
+                               bool direct_write) const {
     int flags = O_CLOEXEC;
     int access_mode = 0;
     switch (mode) {
@@ -4041,17 +4234,20 @@ BucketStorageBackend::OpenFile(const std::string& path, FileMode mode) const {
     }
 
 #ifdef USE_URING
-    // Data buckets can use the existing aligned io_uring write path.
-    // Keep protobuf metadata buffered: padding .meta changes its encoding.
-    // Opt in explicitly so deployments can roll back by configuration.
-    bool direct_write = false;
+    // Reads use O_DIRECT when io_uring is on. Packed direct buckets open
+    // their data files with O_DIRECT for the aligned io_uring write path.
+    // The data files of aligned direct buckets are switched to O_DIRECT
+    // below. Keep protobuf metadata buffered: padding .meta changes its
+    // encoding. Opt in explicitly so deployments can roll back by
+    // configuration.
+    bool packed_write = false;
     if (mode == FileMode::Write && path.ends_with(BUCKET_DATA_FILE_SUFFIX)) {
         const auto packed = ReadPackedBucketDirectWrite();
         if (!packed) return tl::make_unexpected(packed.error());
-        direct_write = packed.value();
+        packed_write = packed.value();
     }
     const bool use_direct = file_storage_config_.use_uring &&
-                            (mode == FileMode::Read || direct_write);
+                            (mode == FileMode::Read || packed_write);
     if (use_direct) {
         flags |= O_DIRECT;
     }
@@ -4062,6 +4258,29 @@ BucketStorageBackend::OpenFile(const std::string& path, FileMode mode) const {
         LOG(ERROR) << "Failed to open file: " << path << ", errno=" << errno
                    << " (" << strerror(errno) << ")";
         return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+    }
+    if (mode == FileMode::Write && direct_write) {
+        // The writes are 4 KiB aligned, so they also work through the page
+        // cache where O_DIRECT is refused or needs a larger alignment.
+        int direct_error = 0;
+        if (test_direct_io_unavailable_.load(std::memory_order_relaxed) ||
+            !DirectIOAlignmentFits(fd, kDirectIOAlignment)) {
+            direct_error = EINVAL;
+        } else {
+            const int file_flags = fcntl(fd, F_GETFL);
+            if (file_flags < 0 ||
+                fcntl(fd, F_SETFL, file_flags | O_DIRECT) != 0) {
+                direct_error = errno;
+            }
+        }
+        if (direct_error != 0) {
+            LOG_FIRST_N(WARNING, 1)
+                << "O_DIRECT is not available for " << path << " ("
+                << strerror(direct_error)
+                << "), aligned direct bucket writes go through the page cache";
+        } else {
+            LOG_FIRST_N(INFO, 1) << "Aligned direct bucket writes use O_DIRECT";
+        }
     }
 #ifdef USE_URING
     if (use_direct) {
