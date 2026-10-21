@@ -93,6 +93,17 @@ underlying allocation. A Transfer Engine executor must acquire allocation
 guards and revalidate bindings atomically with the submission that consumes
 the plan.
 
+### Shared allocation validation
+
+Runtime binding checks every fragment's logical geometry and physical view
+range. Many disjoint model-weight views may share one backing allocation;
+identical `(storage_address, storage_nbytes)` pairs are collapsed only for the
+backing-allocation overlap sweep. Distinct overlapping allocations still fail,
+including a partial overlap hidden behind repeated aliases of another arena.
+The sweep sorts unique allocations once instead of repeatedly comparing every
+pair of views in the same arena. View-overlap and declared-alias checks are
+unchanged; no persistent validation cache or new lifetime owner is introduced.
+
 ## Transfer Engine Execution
 
 `mooncake.reshard.transfer_engine` executes resource-neutral physical batches
