@@ -26,7 +26,7 @@ Query results report four cumulative tiers:
 
 | Tier | Meaning | Event source |
 |---|---|---|
-| `device` | Engine accelerator memory (GPU or NPU) on the matching DP rank | vLLM `gpu`; SGLang `gpu` or no medium |
+| `device` | Engine accelerator memory (GPU or NPU) on the matching DP rank | vLLM `gpu`; SGLang `gpu` |
 | `cpu_local` | Engine-local host memory | SGLang `cpu` / `cpu_pinned` |
 | `cpu_share` | Shared host memory pool, such as Mooncake Store | Mooncake `cpu` / `cpu_pinned` |
 | `disk` | Disk-backed KV storage, engine-local or shared | SGLang `disk`; Mooncake `disk` |

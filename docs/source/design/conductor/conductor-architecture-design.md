@@ -74,13 +74,12 @@ A prefix entry records owners per storage tier:
 
 | Tier | Owner | Fed by |
 |---|---|---|
-| `device` | engine `(source, instance_id, dp_rank)` | vLLM `gpu` medium; SGLang `gpu` or absent medium |
+| `device` | engine `(source, instance_id, dp_rank)` | vLLM `gpu` medium; SGLang `gpu`  medium |
 | `cpu_local` | engine | SGLang `cpu` / `cpu_pinned` medium |
 | `cpu_share` | shared store object | Mooncake `cpu` / `cpu_pinned` medium |
-| `disk` | engine or shared store object | SGLang `disk`; Mooncake `disk` |
+| `disk` | engine or shared store object | Mooncake `disk` |
 
-vLLM events with any medium other than `gpu` are ignored, as are Mooncake events
-with a medium other than `cpu`, `cpu_pinned`, or `disk`.
+Mooncake events with a medium other than `cpu`, `cpu_pinned`, or `disk` are ignored.
 
 ## Hash profiles
 
@@ -198,12 +197,9 @@ used. Invalid entries are logged and skipped.
 
 | Key | Default | Description |
 |---|---|---|
-| `http_server_port` | `13333` without a config file | HTTP port. Set it explicitly: when a config file is loaded and the key is absent, the port is 0 and the server binds an ephemeral port. |
+| `http_server_port` | `13333` without a config file | HTTP port. Set it explicitly. |
 | `rpc_server_port` | `13334` | RPC port. `0` disables the RPC server. |
 | `kvevent_instance` | none | Static services keyed by name. |
-
-A missing config file is not an error: Conductor starts with no services on the
-default ports. A file that is not valid JSON exits the process.
 
 ## Environment variables
 
