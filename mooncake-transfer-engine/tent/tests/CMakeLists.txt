@@ -934,3 +934,13 @@ if(USE_MLU)
     set_tests_properties(tent_mlu_${suite}_test PROPERTIES TIMEOUT 300)
   endforeach()
 endif()
+
+# A TENT built with TENT_XPORT_TCP/RDMA=plugin creates neither transport itself,
+# so every test here runs with the build's plugin directory.
+if(TENT_XPORT_TCP STREQUAL "plugin" OR TENT_XPORT_RDMA STREQUAL "plugin")
+  get_directory_property(tent_tests TESTS)
+  set_property(
+    TEST ${tent_tests}
+    APPEND
+    PROPERTY ENVIRONMENT "MC_TENT_PLUGIN_DIR=${CMAKE_BINARY_DIR}/tent_plugins")
+endif()

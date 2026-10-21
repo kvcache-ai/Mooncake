@@ -650,6 +650,12 @@ jobs:
               -DCMAKE_BUILD_TYPE=Debug
             need_cuda: false
             metrics_flags: ''
+          # TCP and RDMA built as plugins and loaded from the build's plugin
+          # directory.
+          - name: xport-plugin
+            cmake_flags: '-DUSE_CUDA=OFF -DTENT_XPORT_TCP=plugin -DTENT_XPORT_RDMA=plugin'
+            need_cuda: false
+            metrics_flags: ''
     name: tent-ci (${{ matrix.name }})
     env:
       CI: "true"

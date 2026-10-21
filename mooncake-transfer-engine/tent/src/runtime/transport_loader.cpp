@@ -79,8 +79,10 @@ namespace mooncake {
 namespace tent {
 
 Status TransferEngineImpl::loadTransports() {
+#if !defined(TENT_XPORT_TCP_PLUGIN_ONLY)
     if (conf_->get("transports/tcp/enable", true))
         transport_list_[TCP] = std::make_shared<TcpTransport>();
+#endif
 
     if (hp_tcp_transport_config_.enabled)
         transport_list_[HP_TCP] = std::make_shared<HighPerformanceTcpTransport>(
@@ -91,7 +93,7 @@ Status TransferEngineImpl::loadTransports() {
     if (conf_->get("transports/shm/enable", false))
         transport_list_[SHM] = std::make_shared<ShmTransport>();
 
-#ifdef USE_RDMA
+#if defined(USE_RDMA) && !defined(TENT_XPORT_RDMA_PLUGIN_ONLY)
     if (conf_->get("transports/rdma/enable", true) &&
         topology_->getNicCount(Topology::NIC_RDMA)) {
         transport_list_[RDMA] = std::make_shared<RdmaTransport>();

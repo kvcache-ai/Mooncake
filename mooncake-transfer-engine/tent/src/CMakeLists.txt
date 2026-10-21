@@ -168,6 +168,34 @@ if(USE_SUNRISE)
   target_link_libraries(tent_interface INTERFACE tangrt_shared ptml_shared dl)
 endif()
 
+# TCP and RDMA are built inside TENT (static, the default) or only as the
+# plugins libtent_xport_tcp.so and libtent_xport_rdma.so (plugin), which TENT
+# then loads from plugins/dir or MC_TENT_PLUGIN_DIR.
+set(TENT_XPORT_TCP
+    static
+    CACHE STRING "TCP transport: static or plugin")
+set(TENT_XPORT_RDMA
+    static
+    CACHE STRING "RDMA transport: static or plugin")
+foreach(xport TCP RDMA)
+  if(NOT TENT_XPORT_${xport} MATCHES "^(static|plugin)$")
+    message(FATAL_ERROR "TENT_XPORT_${xport} must be static or plugin, not "
+                        "'${TENT_XPORT_${xport}}'")
+  endif()
+endforeach()
+if(TENT_XPORT_RDMA STREQUAL "plugin" AND NOT (IBVERBS_LIB AND IBVERBS_INCLUDE))
+  message(FATAL_ERROR "TENT_XPORT_RDMA=plugin needs libibverbs, not found")
+endif()
+if(TENT_XPORT_RDMA STREQUAL "plugin" AND WITH_STORE_RS)
+  message(FATAL_ERROR "mooncake-store-rs uses TENT's IbvLoader, which "
+                      "TENT_XPORT_RDMA=plugin leaves out of libtent_shared.so")
+endif()
+if(WITH_STORE_C_SHARED AND (TENT_XPORT_TCP STREQUAL "plugin"
+                            OR TENT_XPORT_RDMA STREQUAL "plugin"))
+  message(WARNING "libmooncake_store.so (WITH_STORE_C_SHARED) hides TENT's "
+                  "symbols, so its engines cannot load the TCP/RDMA plugins")
+endif()
+
 add_subdirectory(common)
 add_subdirectory(rpc)
 add_subdirectory(metastore)
@@ -242,6 +270,20 @@ if(TARGET mooncake_common)
                         INTERFACE "$<TARGET_FILE:mooncake_common>")
 endif()
 target_link_libraries(tent_link_group INTERFACE "-Wl,--end-group")
+# A plugin-only transport is not created by transport_loader.cpp, so nothing
+# links its static library into TENT. Executables that link TENT statically
+# export TENT's symbols for the plugins.
+foreach(xport TCP RDMA)
+  if(TENT_XPORT_${xport} STREQUAL "plugin")
+    target_compile_definitions(tent_runtime
+                               PRIVATE TENT_XPORT_${xport}_PLUGIN_ONLY)
+  endif()
+endforeach()
+if(TENT_XPORT_TCP STREQUAL "plugin" OR TENT_XPORT_RDMA STREQUAL "plugin")
+  target_link_options(
+    tent_link_group INTERFACE
+    $<$<STREQUAL:$<TARGET_PROPERTY:TYPE>,EXECUTABLE>:-rdynamic>)
+endif()
 install(
   TARGETS tent_shared
   ARCHIVE DESTINATION lib

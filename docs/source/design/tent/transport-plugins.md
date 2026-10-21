@@ -95,3 +95,22 @@ whose `install()` fails is skipped with the usual warning.
   object to `RTLD_GLOBAL` before loading plugins; the object must export
   TENT's symbols. The promotion lasts for the rest of the process, so a module
   loaded later with its own copy of TENT may bind to the promoted one.
+
+## Building TCP and RDMA as plugins
+
+The CMake options `TENT_XPORT_TCP` and `TENT_XPORT_RDMA` choose how these two
+transports are built:
+
+- `static` (the default): inside TENT, as before.
+- `plugin`: only as `libtent_xport_tcp.so` or `libtent_xport_rdma.so`, in
+  `tent_plugins` of the build tree and installed to `lib/tent_plugins`. TENT
+  itself then has no such transport, so an engine gets it only from the plugin
+  directory. The plugin is created under the same conditions as the built-in
+  transport: `transports/<name>/enable`, and for RDMA an RDMA NIC in the
+  engine's topology. It carries the build ID of its build tree; a TENT from
+  another build stops with a fatal error when it loads the plugin. Executables
+  that CMake links with TENT statically get `-rdynamic` in this mode; others,
+  such as the Rust bindings' binaries, must export TENT's symbols themselves.
+  Plugin mode is exercised by TENT's own tests and `tent_python_guards_test`;
+  the Store and integration tests assume TCP/RDMA inside TENT and are not run
+  in plugin mode.
