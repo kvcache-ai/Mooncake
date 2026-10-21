@@ -669,18 +669,25 @@ class FileStorageTest : public ::testing::Test {
         EXPECT_TRUE(client->unregisterLocalMemory(allocator.getBase()));
     }
 
-    // A second disk failure arrives while the first one's filesystem check
-    // is running (simulated by re-entering from inside the check).
-    static void FailDuringFilesystemCheck(FileStorage& fileStorage, int& checks,
-                                          bool& synced, bool& fenced) {
-        fileStorage.test_filesystem_check_ = [&fileStorage, &checks,
-                                              &synced](bool sync) {
-            synced = sync;
-            if (++checks == 1) fileStorage.OnDiskError(EIO, "preadv");
-            return EIO;
-        };
-        fileStorage.OnDiskError(EIO, "pwritev");
-        fenced = fileStorage.disk_fenced_.load();
+    // An EIO from second_op arrives while the check for an EIO from first_op
+    // is running (simulated by re-entering from inside the check). Check i
+    // answers check_errnos[i], or 0 past the end; synced records whether
+    // each check ran syncfs. Returns whether the disk tier is fenced.
+    static bool FailDuringFilesystemCheck(FileStorage& fileStorage,
+                                          const char* first_op,
+                                          const char* second_op,
+                                          std::vector<int> check_errnos,
+                                          std::vector<bool>& synced) {
+        fileStorage.test_filesystem_check_ =
+            [&fileStorage, second_op, check_errnos, &synced](bool sync) {
+                synced.push_back(sync);
+                if (synced.size() == 1) fileStorage.OnDiskError(EIO, second_op);
+                return synced.size() <= check_errnos.size()
+                           ? check_errnos[synced.size() - 1]
+                           : 0;
+            };
+        fileStorage.OnDiskError(EIO, first_op);
+        return fileStorage.disk_fenced_.load();
     }
 
     void AssertHeartbeatEvictsAllKeys(
@@ -2041,19 +2048,44 @@ TEST_F(FileStorageTest, DiskFenceEnodevFencesWithoutFilesystemCheck) {
 }
 
 // Concurrent failures do not run parallel filesystem checks: one that finds
-// a check running skips its own, and the running check still fences. A
-// write failure's check runs syncfs first.
-TEST_F(FileStorageTest, DiskFenceSkipsCheckWhileOneIsRunning) {
+// a check running is queued behind it. Once the running check fences, the
+// queued failure needs no check. A write failure's check runs syncfs first.
+TEST_F(FileStorageTest, DiskFenceRunsOneCheckAtATime) {
     auto config = FileStorageConfig::FromEnvironment();
     config.storage_filepath = data_path;
     FileStorage file_storage(config, nullptr, "localhost:9003");
-    int checks = 0;
-    bool synced = false;
-    bool fenced = false;
-    FailDuringFilesystemCheck(file_storage, checks, synced, fenced);
-    EXPECT_EQ(checks, 1);
-    EXPECT_TRUE(synced);
-    EXPECT_TRUE(fenced);
+    std::vector<bool> synced;
+    EXPECT_TRUE(FailDuringFilesystemCheck(file_storage, "pwritev", "preadv",
+                                          {EIO}, synced));
+    EXPECT_EQ(synced, std::vector<bool>{true});
+}
+
+// A write failure that arrives during a read failure's fstat-only check is
+// checked after it, with syncfs: XFS is usually still up until syncfs forces
+// the log write, so only the write's check can find the dead device.
+TEST_F(FileStorageTest, DiskFenceChecksWriteFailureQueuedBehindReadCheck) {
+    auto config = FileStorageConfig::FromEnvironment();
+    config.storage_filepath = data_path;
+    FileStorage file_storage(config, nullptr, "localhost:9003");
+    std::vector<bool> synced;
+    EXPECT_TRUE(FailDuringFilesystemCheck(file_storage, "preadv", "pwritev",
+                                          {0, EIO}, synced));
+    EXPECT_EQ(synced, (std::vector<bool>{false, true}));
+}
+
+// When the queued check passes too, the checking slot is released: a later
+// failure runs its own check.
+TEST_F(FileStorageTest, DiskFenceQueuedCheckReleasesTheCheckingSlot) {
+    auto config = FileStorageConfig::FromEnvironment();
+    config.storage_filepath = data_path;
+    FileStorage file_storage(config, nullptr, "localhost:9003");
+    std::vector<bool> synced;
+    EXPECT_FALSE(FailDuringFilesystemCheck(file_storage, "preadv", "pwritev",
+                                           {0, 0}, synced));
+    EXPECT_EQ(synced, (std::vector<bool>{false, true}));
+    file_storage.OnDiskError(EIO, "read");
+    EXPECT_EQ(synced, (std::vector<bool>{false, true, false}));
+    EXPECT_FALSE(file_storage.disk_fenced_.load());
 }
 
 // A drain whose unmount RPC fails keeps its latch: the heartbeat must

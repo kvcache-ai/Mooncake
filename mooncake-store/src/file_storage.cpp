@@ -27,6 +27,14 @@ namespace mooncake {
 
 namespace {
 
+// syncfs for every failure except a data or metadata read: reads leave the
+// log nothing to write (measured: they alone never shut XFS down), and one
+// bad file would otherwise flush the whole filesystem on every failed read.
+bool CheckNeedsSyncfs(const char* op) {
+    const std::string_view op_name(op);
+    return op_name != "preadv" && op_name != "read";
+}
+
 std::vector<OffloadTaskItem> BuildOffloadTasksFromStorageKeys(
     const std::vector<std::string>& storage_keys,
     const std::vector<StorageObjectMetadata>& metadatas) {
@@ -1048,32 +1056,60 @@ int FileStorage::CheckFilesystem(bool sync_first) const {
     return rc == 0 ? 0 : errno;
 }
 
+std::optional<FileStorage::DiskFailure> FileStorage::RunFilesystemChecks(
+    DiskFailure failure, int& check_err) {
+    {
+        MutexLocker locker(&filesystem_check_mutex_);
+        if (filesystem_check_running_) {
+            // The running check may have looked before this failure, so the
+            // failure gets a check of its own after it. Queued failures share
+            // that check, which runs syncfs if any of them needs it.
+            if (!queued_disk_failure_ || CheckNeedsSyncfs(failure.op)) {
+                queued_disk_failure_ = failure;
+            }
+            return std::nullopt;
+        }
+        filesystem_check_running_ = true;
+    }
+    while (true) {
+        const bool sync_first = CheckNeedsSyncfs(failure.op);
+        check_err = CheckFilesystem(sync_first);
+        const bool filesystem_down =
+            ClassifyDiskErrno(check_err) != DiskErrorAction::kIgnore;
+        if (!filesystem_down) {
+            LOG(WARNING) << "action=disk_error_not_fenced, op=" << failure.op
+                         << ", errno=" << failure.err << " ("
+                         << strerror(failure.err) << "), check="
+                         << (sync_first ? "syncfs+fstat" : "fstat");
+        }
+        MutexLocker locker(&filesystem_check_mutex_);
+        if (filesystem_down || !queued_disk_failure_ || disk_fenced_.load()) {
+            // Released under the same lock that queues, so no failure is
+            // queued after the last look.
+            filesystem_check_running_ = false;
+            queued_disk_failure_.reset();
+            if (filesystem_down) return failure;
+            return std::nullopt;
+        }
+        failure = *queued_disk_failure_;
+        queued_disk_failure_.reset();
+    }
+}
+
 void FileStorage::OnDiskError(int err, const char* op) {
     const DiskErrorAction action = ClassifyDiskErrno(err);
     if (disk_fenced_.load() || action == DiskErrorAction::kIgnore) return;
+    DiskFailure failure{err, op};
     int check_err = 0;
     if (action == DiskErrorAction::kCheckFilesystem) {
-        // One check at a time; a concurrent failure defers to the running one.
-        if (filesystem_check_running_.exchange(true)) return;
-        // syncfs for every failure except a data or metadata read: reads
-        // leave the log nothing to write (measured: they alone never shut XFS
-        // down), and one bad file would otherwise flush the whole filesystem
-        // on every failed read.
-        const std::string_view op_name(op);
-        const bool sync_first = op_name != "preadv" && op_name != "read";
-        check_err = CheckFilesystem(sync_first);
-        filesystem_check_running_.store(false);
-        if (ClassifyDiskErrno(check_err) == DiskErrorAction::kIgnore) {
-            LOG(WARNING) << "action=disk_error_not_fenced, op=" << op
-                         << ", errno=" << err << " (" << strerror(err)
-                         << "), check="
-                         << (sync_first ? "syncfs+fstat" : "fstat");
-            return;
-        }
+        auto fencing = RunFilesystemChecks(failure, check_err);
+        if (!fencing) return;
+        failure = *fencing;
     }
     if (disk_fenced_.exchange(true)) return;
-    LOG(ERROR) << "action=disk_fence, op=" << op << ", errno=" << err << " ("
-               << strerror(err) << "), fs_check_errno=" << check_err
+    LOG(ERROR) << "action=disk_fence, op=" << failure.op
+               << ", errno=" << failure.err << " (" << strerror(failure.err)
+               << "), fs_check_errno=" << check_err
                << ", path=" << config_.storage_filepath;
     if (ssd_metric_) ssd_metric_->ssd_disk_fenced.update(1);
     WakeHeartbeat();

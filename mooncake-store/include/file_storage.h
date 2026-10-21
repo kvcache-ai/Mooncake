@@ -237,6 +237,15 @@ class FileStorage {
     // Backend disk-error observer. Runs inline on the failing I/O thread, so
     // it makes no RPC and takes no lock that I/O or the heartbeat holds.
     void OnDiskError(int err, const char* op);
+    struct DiskFailure {
+        int err;
+        const char* op;  // string literal naming the failed syscall
+    };
+    // Checks the filesystem for this failure, then for the failures other
+    // threads queued while a check ran. Returns the failure whose check found
+    // the filesystem down, with that check's errno in check_err.
+    std::optional<DiskFailure> RunFilesystemChecks(DiskFailure failure,
+                                                   int& check_err);
     // errno, 0 if the filesystem is up; sync_first runs syncfs before fstat.
     int CheckFilesystem(bool sync_first) const;
     // Heartbeat: latch the drain and hand pending offload work back.
@@ -346,7 +355,12 @@ class FileStorage {
     // store restart. Reads and offload stop as soon as it is set.
     std::atomic<bool> disk_fenced_{false};
     int disk_dir_fd_{-1};  // offload dir, held open for CheckFilesystem
-    std::atomic<bool> filesystem_check_running_{false};
+    // One filesystem check runs at a time; a failure that arrives during it
+    // is queued for the running thread to check next.
+    Mutex filesystem_check_mutex_;
+    bool GUARDED_BY(filesystem_check_mutex_) filesystem_check_running_{false};
+    std::optional<DiskFailure> GUARDED_BY(filesystem_check_mutex_)
+        queued_disk_failure_;
     // Test-only replacement for CheckFilesystem; returns errno.
     std::function<int(bool sync_first)> test_filesystem_check_;
     std::mutex heartbeat_wake_mutex_;
