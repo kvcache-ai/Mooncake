@@ -2138,6 +2138,112 @@ TEST_F(StorageBackendTest,
 // BucketStorageBackend: Duplicate Key Detection Tests (Phase 0 - D0)
 //-----------------------------------------------------------------------------
 
+TEST_F(StorageBackendTest,
+       BucketStorageBackend_PartialFlushDisabledRetainsTail) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    bucket_config.bucket_keys_limit = 4;
+    bucket_config.bucket_size_limit = 64;
+    EXPECT_FALSE(bucket_config.flush_partial_buckets);
+    BucketStorageBackend backend(config, bucket_config);
+    ASSERT_TRUE(backend.Init());
+    std::vector<std::vector<std::string>> buckets;
+    ASSERT_TRUE(
+        backend.AllocateOffloadingBuckets({{"A1", 16}, {"A2", 16}}, buckets));
+    EXPECT_TRUE(buckets.empty());
+    EXPECT_EQ(backend.UngroupedOffloadingObjectsSize(), 2);
+    ASSERT_TRUE(
+        backend.AllocateOffloadingBuckets({{"B1", 16}, {"B2", 16}}, buckets));
+    ASSERT_EQ(buckets.size(), 1);
+    std::sort(buckets[0].begin(), buckets[0].end());
+    EXPECT_EQ(buckets[0], (std::vector<std::string>{"A1", "A2", "B1", "B2"}));
+    EXPECT_EQ(backend.UngroupedOffloadingObjectsSize(), 0);
+}
+
+TEST_F(StorageBackendTest,
+       BucketStorageBackend_PartialFlushKeepsCyclesSeparate) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    bucket_config.bucket_keys_limit = 4;
+    bucket_config.bucket_size_limit = 64;
+    bucket_config.flush_partial_buckets = true;
+    BucketStorageBackend backend(config, bucket_config);
+    ASSERT_TRUE(backend.Init());
+    for (const auto* prefix : {"A", "B"}) {
+        const std::string first = std::string(prefix) + "1";
+        const std::string second = std::string(prefix) + "2";
+        std::vector<std::vector<std::string>> buckets;
+        ASSERT_TRUE(backend.AllocateOffloadingBuckets(
+            {{first, 16}, {second, 16}}, buckets));
+        ASSERT_EQ(buckets.size(), 1);
+        std::sort(buckets[0].begin(), buckets[0].end());
+        EXPECT_EQ(buckets[0], (std::vector<std::string>{first, second}));
+        EXPECT_EQ(backend.UngroupedOffloadingObjectsSize(), 0);
+    }
+}
+
+TEST_F(StorageBackendTest, BucketStorageBackend_PartialFlushSkipsEmptyBuckets) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    bucket_config.bucket_keys_limit = 4;
+    bucket_config.bucket_size_limit = 64;
+    bucket_config.flush_partial_buckets = true;
+    BucketStorageBackend backend(config, bucket_config);
+    ASSERT_TRUE(backend.Init());
+    std::string value = "value";
+    std::unordered_map<std::string, std::vector<Slice>> batch;
+    batch.emplace("existing", std::vector<Slice>{{value.data(), value.size()}});
+    ASSERT_TRUE(backend.BatchOffload(
+        batch,
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; }));
+    using Objects = std::unordered_map<std::string, int64_t>;
+    for (const auto& objects :
+         {Objects{}, Objects{{"existing", 5}}, Objects{{"oversized", 65}},
+          Objects{{"existing", 5}, {"oversized", 65}}}) {
+        std::vector<std::vector<std::string>> buckets;
+        ASSERT_TRUE(backend.AllocateOffloadingBuckets(objects, buckets));
+        EXPECT_TRUE(buckets.empty());
+        EXPECT_EQ(backend.UngroupedOffloadingObjectsSize(), 0);
+    }
+}
+
+TEST_F(StorageBackendTest, BucketStorageBackend_PartialFlushRespectsLimits) {
+    for (const auto& limits : {std::pair<int64_t, int64_t>{2, 64},
+                               std::pair<int64_t, int64_t>{8, 24}}) {
+        FileStorageConfig config;
+        config.storage_filepath = data_path;
+        BucketBackendConfig bucket_config;
+        bucket_config.bucket_keys_limit = limits.first;
+        bucket_config.bucket_size_limit = limits.second;
+        bucket_config.flush_partial_buckets = true;
+        BucketStorageBackend backend(config, bucket_config);
+        ASSERT_TRUE(backend.Init());
+        const std::unordered_map<std::string, int64_t> objects{
+            {"A", 8}, {"B", 8}, {"C", 8}, {"D", 8}, {"E", 8}};
+        std::vector<std::vector<std::string>> buckets;
+        ASSERT_TRUE(backend.AllocateOffloadingBuckets(objects, buckets));
+        EXPECT_EQ(buckets.size(), limits.first == 2 ? 3 : 2);
+        std::vector<std::string> all_keys;
+        for (const auto& bucket : buckets) {
+            EXPECT_FALSE(bucket.empty());
+            EXPECT_LE(bucket.size(),
+                      static_cast<size_t>(bucket_config.bucket_keys_limit));
+            int64_t bytes = 0;
+            for (const auto& key : bucket) bytes += objects.at(key);
+            EXPECT_LE(bytes, bucket_config.bucket_size_limit);
+            all_keys.insert(all_keys.end(), bucket.begin(), bucket.end());
+        }
+        std::sort(all_keys.begin(), all_keys.end());
+        EXPECT_EQ(all_keys,
+                  (std::vector<std::string>{"A", "B", "C", "D", "E"}));
+        EXPECT_EQ(backend.UngroupedOffloadingObjectsSize(), 0);
+    }
+}
+
 TEST_F(StorageBackendTest, BucketStorageBackend_DuplicateKeyIdempotentSkip) {
     FileStorageConfig config;
     config.storage_filepath = data_path;

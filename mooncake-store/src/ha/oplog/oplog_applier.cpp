@@ -432,7 +432,6 @@ void OpLogApplier::ApplySegmentMount(const OpLogEntry& entry) {
     info.is_memory_segment = op.is_memory_segment;
     info.file_path = op.file_path;
     segment_registry_.OnSegmentMount(info);
-    HAMetricManager::instance().inc_oplog_applied_entries();
 }
 
 void OpLogApplier::ApplySegmentUnmount(const OpLogEntry& entry) {
@@ -444,7 +443,6 @@ void OpLogApplier::ApplySegmentUnmount(const OpLogEntry& entry) {
         return;
     }
     segment_registry_.OnSegmentUnmount(op.transport_endpoint);
-    HAMetricManager::instance().inc_oplog_applied_entries();
 }
 
 void OpLogApplier::ApplySegmentUpdate(const OpLogEntry& entry) {
@@ -462,7 +460,6 @@ void OpLogApplier::ApplySegmentUpdate(const OpLogEntry& entry) {
     info.is_memory_segment = op.is_memory_segment;
     info.file_path = op.file_path;
     segment_registry_.OnSegmentUpdate(info);
-    HAMetricManager::instance().inc_oplog_applied_entries();
 }
 
 }  // namespace mooncake

@@ -386,6 +386,8 @@ impl TentEngine {
                 target_id: request.target_id,
                 target_offset: request.target_offset,
                 length: request.length,
+                priority: ffi::PRIORITY_HIGH,
+                transport_hint: ffi::TRANSPORT_UNSPEC,
             })
             .collect::<Vec<_>>();
         let rc = unsafe {
