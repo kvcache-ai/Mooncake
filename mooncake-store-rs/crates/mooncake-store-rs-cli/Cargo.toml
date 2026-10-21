@@ -1,0 +1,35 @@
+[package]
+name = "mooncake-store-rs-cli"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+
+[lib]
+name = "mooncake_store_rs_cli"
+
+[[bin]]
+name = "mooncake-store-rs-client"
+path = "src/bin/mooncake-store-rs-client.rs"
+
+[[bin]]
+name = "mooncake-store-rs-bench"
+path = "src/bin/mooncake-store-rs-bench/main.rs"
+
+[dependencies]
+clap.workspace = true
+ctrlc.workspace = true
+mooncake-store-rs-metadata = { path = "../mooncake-store-rs-metadata" }
+mooncake-store-client = { path = "../mooncake-store-client" }
+mooncake-store-core = { path = "../mooncake-store-core" }
+mooncake-store-rs-runtime = { path = "../mooncake-store-rs-runtime" }
+serde_json.workspace = true
+shadow-rs.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+url = "2"
+
+[build-dependencies]
+shadow-rs.workspace = true
+
+[lints]
+workspace = true

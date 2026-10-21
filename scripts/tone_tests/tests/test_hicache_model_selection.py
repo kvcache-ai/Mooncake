@@ -41,7 +41,8 @@ def load_test_module():
     )
 
     module_path = (
-        Path(__file__).resolve().parents[1]
+        Path(__file__).resolve().parents[2]
+        / "e2e"
         / "python"
         / "test_hicache_storage_mooncake_backend.py"
     )

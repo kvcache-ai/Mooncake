@@ -115,12 +115,31 @@ bool RailMonitor::recordEndpointRebuild(const UbPostPath& path,
     auto& state = getOrCreateLocked(path);
     now_ns = observeTimeLocked(state, now_ns);
     refreshCooldownLocked(state, now_ns);
+    if (!state.has_rebuild_baseline) {
+        // The first generation to become ready is the rail's initial build.
+        // Seed the watermark without counting it so endpoint_rebuilds only
+        // advances on a real generation increase.
+        state.has_rebuild_baseline = true;
+        state.recorded_rebuild_generation = path.endpoint_generation;
+        return false;
+    }
     if (path.endpoint_generation <= state.recorded_rebuild_generation) {
         return false;
     }
     state.recorded_rebuild_generation = path.endpoint_generation;
     ++state.stats.endpoint_rebuilds;
     return true;
+}
+
+RailStats RailMonitor::statsIfPresent(const UbPostPath& path, uint64_t now_ns) {
+    RailStats result;
+    result.key = UbRailKey::fromPath(path);
+    if (!path.valid()) return result;
+    now_ns = normalizedNow(now_ns);
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = rails_.find(result.key);
+    if (it == rails_.end()) return result;
+    return snapshotLocked(it->second, now_ns);
 }
 
 RailStats RailMonitor::stats(const UbPostPath& path, uint64_t now_ns) {
@@ -130,9 +149,12 @@ RailStats RailMonitor::stats(const UbPostPath& path, uint64_t now_ns) {
     now_ns = normalizedNow(now_ns);
     std::lock_guard<std::mutex> lock(mutex_);
     auto& state = getOrCreateLocked(path);
+    return snapshotLocked(state, now_ns);
+}
+
+RailStats RailMonitor::snapshotLocked(RailState& state, uint64_t now_ns) {
     now_ns = observeTimeLocked(state, now_ns);
     refreshCooldownLocked(state, now_ns);
-    pruneErrorsLocked(state, now_ns);
     state.stats.errors_in_window = static_cast<uint32_t>(std::min<size_t>(
         state.recent_errors.size(), std::numeric_limits<uint32_t>::max()));
     return state.stats;
@@ -144,12 +166,7 @@ std::vector<RailStats> RailMonitor::allStats(uint64_t now_ns) {
     std::vector<RailStats> result;
     result.reserve(rails_.size());
     for (auto& [key, state] : rails_) {
-        const uint64_t observed_ns = observeTimeLocked(state, now_ns);
-        refreshCooldownLocked(state, observed_ns);
-        pruneErrorsLocked(state, observed_ns);
-        state.stats.errors_in_window = static_cast<uint32_t>(std::min<size_t>(
-            state.recent_errors.size(), std::numeric_limits<uint32_t>::max()));
-        result.push_back(state.stats);
+        result.push_back(snapshotLocked(state, now_ns));
     }
     return result;
 }

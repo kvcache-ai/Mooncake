@@ -140,7 +140,7 @@ class MasterServiceTest : public ::testing::Test {
         if (metadata_it == tenant_it->second.metadata.end()) {
             return std::nullopt;
         }
-        return metadata_it->second.GetCommittedSoftPinTimeout();
+        return metadata_it->second.metadata.GetCommittedSoftPinTimeout();
     }
 
     void CleanupExpiredSoftPinsAt(
@@ -152,6 +152,12 @@ class MasterServiceTest : public ::testing::Test {
     size_t MetadataShardIndex(MasterService& service, const std::string& key,
                               const TenantId& tenant_id = TenantId::Default()) {
         return MasterServiceTestPeer(service).getShardIndex(tenant_id, key);
+    }
+
+    std::unique_ptr<SharedMutexLocker> LockMetadataShardForTest(
+        MasterService& service, size_t shard_idx) {
+        return std::make_unique<SharedMutexLocker>(
+            &MasterServiceTestPeer::MetadataShards(service)[shard_idx].mutex);
     }
 
     size_t MetadataBucketCount(
@@ -176,7 +182,8 @@ class MasterServiceTest : public ::testing::Test {
             normalized_tenant, key);
         MasterServiceTestPeer::MetadataShardAccessorRW shard(&service,
                                                              shard_idx);
-        auto& metadata = shard->tenants.at(normalized_tenant).metadata.at(key);
+        auto& metadata =
+            shard->tenants.at(normalized_tenant).metadata.at(key).metadata;
         {
             SpinLocker locker(&metadata.lock);
             metadata.soft_pin_timeout = deadline;
@@ -239,14 +246,6 @@ class MasterServiceTest : public ::testing::Test {
             return std::nullopt;
         }
         return MasterServiceTestPeer::KvMediaForRemoval(accessor.Get());
-    }
-
-    // Lets a test line up a key with a shard the RemoveAll scan has already
-    // passed, which is the only way to reproduce the commit/clear ordering race
-    // deterministically.
-    size_t ShardIndexForKey(MasterService& service, const std::string& key,
-                            const TenantId& tenant_id = TenantId::Default()) {
-        return MasterServiceTestPeer(service).getShardIndex(tenant_id, key);
     }
 
     void UpsertSoftPinDeadlineIndexForTest(

@@ -25,8 +25,19 @@ void* ascend_allocate_memory_best_effort(size_t target_size,
 
 void ascend_free_memory(const std::string& protocol, void* ptr);
 
+// Handle a peer process on this machine can import to map the same physical
+// pages (ASCEND_USE_SHMEM). True only when `addr` is the base of a shared
+// memfd allocation; false for private mappings, aclrtMallocHost buffers, VMM
+// allocations, and for any address that is not an allocation base.
+bool ascend_get_shared_host_handle(void* addr, std::string* handle);
+
 // Check if [addr, addr+length) overlaps with any store memory range.
 bool ascend_is_store_memory(void* addr, size_t length);
+
+// Check whether addr starts inside a direct ACL VMM allocation (allocated via
+// ascend_allocate_vmm_memory_direct). Returns false for adxl::MallocMem
+// allocations and non-VMM host buffers.
+bool ascend_is_direct_vmm_memory(void* addr, size_t length);
 
 // Direct ACL VMM allocation, always bypasses adxl MallocMem.
 // For use by shm_helper when ascend_agent_mode && ascend_use_fabric_mem.

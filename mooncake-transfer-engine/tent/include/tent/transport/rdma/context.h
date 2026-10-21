@@ -44,7 +44,7 @@ class EndpointStore;
 class RdmaTransport;
 
 struct RdmaAddressSnapshot {
-    uint16_t lid = 0;
+    uint32_t lid = 0;
     std::string gid;
     int gid_index = -1;
 };
@@ -117,7 +117,7 @@ class RdmaContext {
     // two address generations while the monitor thread refreshes the port.
     RdmaAddressSnapshot address() const;
 
-    uint16_t lid() const { return address().lid; }
+    uint32_t lid() const { return address().lid; }
 
     std::string gid() const { return address().gid; }
 
@@ -221,7 +221,7 @@ class RdmaContext {
     // address_refresh_mutex_ serializes hardware reprobes and publication.
     mutable std::mutex address_mutex_;
     std::mutex address_refresh_mutex_;
-    uint16_t lid_ = 0;
+    uint32_t lid_ = 0;
     // Set by openDevice() and refreshed by refreshPortAttributes() on the
     // monitor thread. Today every runtime reader is that same thread;
     // atomic so a reader added elsewhere stays well-defined.

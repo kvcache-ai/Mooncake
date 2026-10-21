@@ -93,22 +93,26 @@ bool AllocatedBuffer::copyTransferProtocolFrom(const AllocatedBuffer& source) {
     return true;
 }
 
-// Implementation of get_descriptor
-AllocatedBuffer::Descriptor AllocatedBuffer::get_descriptor() const {
+std::string AllocatedBuffer::getTransportEndpoint() const {
     auto alloc = allocator_.lock();
     std::string endpoint;
     if (alloc) {
         endpoint = alloc->getTransportEndpoint();
     } else {
-        LOG(ERROR) << "allocator=expired_or_null in get_descriptor";
+        LOG(ERROR) << "allocator=expired_or_null in getTransportEndpoint";
     }
 
     if (this->protocol == "cxl") {
         endpoint = this->segment_name_;
     }
+    return endpoint;
+}
 
+// Implementation of get_descriptor
+AllocatedBuffer::Descriptor AllocatedBuffer::get_descriptor() const {
     return {static_cast<uint64_t>(size()),
-            reinterpret_cast<uintptr_t>(buffer_ptr_), this->protocol, endpoint};
+            reinterpret_cast<uintptr_t>(buffer_ptr_), this->protocol,
+            getTransportEndpoint()};
 }
 
 void AllocatedBuffer::change_to_cxl(std::string client_segment_name) {
@@ -233,7 +237,7 @@ std::unique_ptr<AllocatedBuffer> CachelibBufferAllocator::allocate(
     void* buffer = nullptr;
     try {
         // Allocate memory using CacheLib.
-        size_t padding_size = std::max(size, kMinSliceSize);
+        size_t padding_size = std::max<size_t>(size, kMinSliceSize);
         buffer = memory_allocator_->allocate(pool_id_, padding_size);
         if (!buffer) {
             VLOG(1) << "allocation_failed size=" << size
@@ -722,7 +726,7 @@ void* SimpleAllocator::allocate(size_t size) {
     }
 
     try {
-        size_t padding_size = std::max(size, kMinSliceSize);
+        size_t padding_size = std::max<size_t>(size, kMinSliceSize);
         void* ptr = memory_allocator_->allocate(pool_id_, padding_size);
         if (!ptr) {
             // This allocator is used in client side. Though the failure will

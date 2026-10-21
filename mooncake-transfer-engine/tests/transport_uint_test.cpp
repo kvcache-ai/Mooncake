@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
@@ -35,8 +36,11 @@
 #include <thread>
 #include <utility>
 
+#include "common.h"
+#include "config.h"
 #include "multi_transport.h"
 #include "transfer_engine.h"
+#include "transfer_engine_c.h"
 #include "transfer_engine_impl.h"
 #include "transport/transport.h"
 #ifdef USE_TENT
@@ -106,6 +110,10 @@ class TransferEngineImplTestPeer {
         return engine.autoDiscoverTransport();
     }
 
+    static bool autoDiscoverUsesEfa(const TransferEngineImpl& engine) {
+        return engine.autoDiscoverUsesEfa();
+    }
+
     static void setUseBarex(TransferEngineImpl& engine, bool use_barex) {
         engine.use_barex_ = use_barex;
     }
@@ -121,6 +129,12 @@ class TransferEngineImplTestPeer {
         return engine.multi_transports_->freeBatchID(batch_id, before_delete);
     }
 
+    static Status freeBatchWithCallback(
+        MultiTransport& transport, BatchID batch_id,
+        const std::function<void()>& before_delete) {
+        return transport.freeBatchID(batch_id, before_delete);
+    }
+
 #ifdef USE_TENT
     static const tent::Config* tentConfig(const TransferEngine& engine) {
         if (!engine.impl_tent_ || !engine.impl_tent_->impl_) return nullptr;
@@ -133,6 +147,59 @@ class TransferEngineImplTestPeer {
         return engine.buildTentConfig(metadata, segment);
     }
 #endif
+
+    static void prepareBusyBatch(MultiTransport& transport,
+                                 Transport::BatchID batch_id,
+                                 Transport* task_transport) {
+        auto& batch = Transport::toBatchDesc(batch_id);
+        auto& task = batch.task_list.emplace_back();
+        task.batch_id = batch_id;
+        task.slice_count = 1;
+        task.transport_ = task_transport;
+    }
+
+    static Transport::Slice* prepareAgedSliceBatch(MultiTransport& transport,
+                                                   Transport::BatchID batch_id,
+                                                   int64_t slice_age_ns) {
+        auto& batch = Transport::toBatchDesc(batch_id);
+        auto& task = batch.task_list.emplace_back();
+        task.batch_id = batch_id;
+        task.slice_count = 1;
+
+        auto* slice = new Transport::Slice();
+        slice->source_addr = nullptr;
+        slice->length = 1;
+        slice->status = Transport::Slice::PENDING;
+        slice->task = &task;
+        slice->ts = getCurrentTimeInNano() - slice_age_ns;
+        task.slice_list.push_back(slice);
+        return slice;
+    }
+
+    static void prepareFinishedBatchWithActiveCallback(
+        MultiTransport& transport, Transport::BatchID batch_id) {
+        auto& batch = Transport::toBatchDesc(batch_id);
+        auto& task = batch.task_list.emplace_back();
+        task.batch_id = batch_id;
+        task.slice_count = 1;
+        task.success_slice_count = 1;
+        task.is_finished = true;
+        // Model a completion callback that already published the terminal
+        // slice count but is still unwinding while holding its pin.
+        batch.active_completion_callbacks.store(1, std::memory_order_release);
+    }
+
+    static void finishActiveCompletionCallback(MultiTransport& transport,
+                                               Transport::BatchID batch_id) {
+        auto& batch = Transport::toBatchDesc(batch_id);
+        batch.active_completion_callbacks.store(0, std::memory_order_release);
+    }
+
+    static bool isCleanupDeferred(MultiTransport& transport,
+                                  Transport::BatchID batch_id) {
+        std::lock_guard<std::mutex> guard(transport.deferred_cleanup_mutex_);
+        return transport.deferred_cleanup_batches_.count(batch_id) != 0;
+    }
 };
 
 #ifdef USE_TENT
@@ -234,6 +301,30 @@ TEST(TransferEngineAutoDiscoverTest, SelectsEfaForEfaProtocol) {
     EXPECT_EQ(TransferEngineImplTestPeer::autoDiscoverTransport(engine), "efa");
 }
 
+// EFA discovery must keep EFA NICs and install EFA in every USE_EFA build;
+// any other selection keeps excluding them.
+TEST(TransferEngineAutoDiscoverTest, EfaProtocolKeepsEfaNics) {
+    TransferEngineImpl engine(false);
+    engine.setAutoDiscover({.enabled = true, .protocol = "efa"});
+#ifdef USE_EFA
+    EXPECT_TRUE(TransferEngineImplTestPeer::autoDiscoverUsesEfa(engine));
+#else
+    EXPECT_FALSE(TransferEngineImplTestPeer::autoDiscoverUsesEfa(engine));
+#endif
+
+    TransferEngineImplTestPeer::setUseBarex(engine, true);
+    EXPECT_FALSE(TransferEngineImplTestPeer::autoDiscoverUsesEfa(engine));
+}
+
+TEST(TransferEngineAutoDiscoverTest, OtherProtocolsExcludeEfaNics) {
+    for (const char* protocol : {"", "rdma", "tcp"}) {
+        TransferEngineImpl engine(false);
+        engine.setAutoDiscover({.enabled = true, .protocol = protocol});
+        EXPECT_FALSE(TransferEngineImplTestPeer::autoDiscoverUsesEfa(engine))
+            << "protocol=" << protocol;
+    }
+}
+
 TEST(TransferEngineAutoDiscoverTest, BarexOverrideTakesPrecedence) {
     TransferEngineImpl engine(false);
     engine.setAutoDiscover({.enabled = true, .protocol = "efa"});
@@ -254,6 +345,78 @@ TEST(TransferEngineAutoDiscoverTest, BoolSetterPreservesDefaultSelection) {
     EXPECT_EQ(TransferEngineImplTestPeer::autoDiscoverTransport(engine),
               "rdma");
 }
+
+TEST(TransferEngineAscendTransportTest, AscendHintsSelectAscendTransport) {
+#if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)
+    EXPECT_TRUE(shouldInstallAscendTransport(""));
+    EXPECT_TRUE(shouldInstallAscendTransport("ascend"));
+    EXPECT_TRUE(shouldInstallAscendTransport("ascend_direct"));
+#else
+    EXPECT_FALSE(shouldInstallAscendTransport(""));
+    EXPECT_FALSE(shouldInstallAscendTransport("ascend"));
+#endif
+}
+
+TEST(TransferEngineAscendTransportTest, HostHintsKeepHostTransportPath) {
+#if defined(USE_ASCEND) && !defined(USE_ASCEND_DIRECT)
+    // HCCL builds always install Ascend, whatever the hint names.
+    EXPECT_TRUE(shouldInstallAscendTransport("rdma"));
+    EXPECT_TRUE(shouldInstallAscendTransport("tcp"));
+#else
+    EXPECT_FALSE(shouldInstallAscendTransport("rdma"));
+    EXPECT_FALSE(shouldInstallAscendTransport("tcp"));
+#endif
+}
+
+TEST(TransferEngineAscendTransportTest, ProtocolHintMergeKeepsStoredProtocol) {
+    TransferEngineImpl engine(false);
+    engine.setAutoDiscover({.enabled = true, .protocol = "rdma"});
+
+    // Store configures the protocol before init(); an omitted one must not
+    // wipe it, while an explicit one wins.
+    engine.applyProtocolHint("");
+    auto config = TransferEngineImplTestPeer::autoDiscoverConfig(engine);
+    EXPECT_TRUE(config.enabled);
+    EXPECT_EQ(config.protocol, "rdma");
+
+    engine.applyProtocolHint("ascend");
+    config = TransferEngineImplTestPeer::autoDiscoverConfig(engine);
+    EXPECT_TRUE(config.enabled);
+    EXPECT_EQ(config.protocol, "ascend");
+
+#if !defined(USE_EFA)
+    // "efa" is dropped instead of being handed to auto-discovery, which could
+    // only fail on a build without the EFA transport.
+    engine.applyProtocolHint("efa");
+    EXPECT_EQ(TransferEngineImplTestPeer::autoDiscoverConfig(engine).protocol,
+              "ascend");
+#endif
+}
+
+TEST(TransferEngineAscendTransportTest, InitProtocolHintReachesEngine) {
+    TransferEngine engine(/*auto_discover=*/false);
+
+    // The hint is recorded before init() picks a transport, so the assertion
+    // holds whatever init() returns on this host.
+    (void)engine.init(P2PHANDSHAKE, "127.0.0.1:18465", "", 0, "rdma");
+    auto& impl = TransferEngineImplTestPeer::implementation(engine);
+    const auto config = TransferEngineImplTestPeer::autoDiscoverConfig(impl);
+    EXPECT_FALSE(config.enabled);
+    EXPECT_EQ(config.protocol, "rdma");
+}
+
+#if defined(USE_ASCEND_DIRECT)
+TEST(TransferEngineAscendTransportTest, RdmaHintNeverInstallsAscendDirect) {
+    TransferEngine engine(/*auto_discover=*/false);
+
+    // End to end over the public API: with discovery off, the hint alone
+    // decides and no host transport is installed here; that is the caller's
+    // job, the way Store does it. An "rdma" hint never selects Ascend Direct,
+    // which the pre-fix code did and which fails the install without an NPU.
+    EXPECT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:18463", "", 0, "rdma"), 0);
+    EXPECT_EQ(engine.getTransport("ascend"), nullptr);
+}
+#endif
 
 #ifdef USE_TENT
 // RDMA is left enabled and TCP disabled so a regression that drops forceTcp()
@@ -288,6 +451,63 @@ TEST(TransferEngineTentCompatibilityTest, CheckSegmentStatusRejectsDeadPeer) {
     EXPECT_FALSE(engine.CheckSegmentStatus(1ull << 40).ok());
 }
 
+TEST(TransferEngineTentCompatibilityTest, NotifyByNamePreservesOpenSegment) {
+    ScopedEnvVar use_tent("MC_USE_TENT", "1");
+    ScopedEnvVar force_tcp("MC_FORCE_TCP", nullptr);
+    ScopedEnvVar hostname("MOONCAKE_LOCAL_HOSTNAME", "127.0.0.1");
+    ScopedEnvVar conf("MC_TENT_CONF", kTentConfPrefersRdma);
+    std::array<char, 4096> source{};
+    std::array<char, 4096> destination{};
+    source.fill('n');
+    TransferEngine target(true);
+    TransferEngine initiator(true);
+    ASSERT_EQ(target.init(P2PHANDSHAKE, "", "", 0, "tcp"), 0);
+    ASSERT_EQ(initiator.init(P2PHANDSHAKE, "", "", 0, "tcp"), 0);
+    ASSERT_EQ(
+        target.registerLocalMemory(destination.data(), destination.size()), 0);
+    ASSERT_EQ(initiator.registerLocalMemory(source.data(), source.size()), 0);
+    const std::string target_name =
+        "127.0.0.1:" + std::to_string(target.getRpcPort());
+    const auto peer = initiator.openSegment(target_name);
+    ASSERT_NE(peer, static_cast<Transport::SegmentHandle>(-1));
+
+    ASSERT_EQ(initiator.sendNotifyByName(target_name, {"test", "ready"}), 0);
+    std::vector<TransferMetadata::NotifyDesc> notifications;
+    ASSERT_EQ(target.getNotifies(notifications), 0);
+    ASSERT_EQ(notifications.size(), 1u);
+    EXPECT_EQ(notifications.front().notify_msg, "ready");
+    EXPECT_TRUE(initiator.CheckSegmentStatus(peer).ok());
+    EXPECT_EQ(initiator.openSegment(target_name), peer);
+
+    const auto batch = initiator.allocateBatchID(1);
+    TransferRequest request;
+    request.opcode = TransferRequest::WRITE;
+    request.source = source.data();
+    request.target_id = peer;
+    request.target_offset = reinterpret_cast<uint64_t>(destination.data());
+    request.length = source.size();
+    auto submitted = initiator.submitTransfer(batch, {request});
+    EXPECT_TRUE(submitted.ok()) << submitted.ToString();
+    if (submitted.ok()) {
+        TransferStatus status;
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        do {
+            ASSERT_TRUE(initiator.getTransferStatus(batch, 0, status).ok());
+            if (status.s != TransferStatusEnum::WAITING &&
+                status.s != TransferStatusEnum::PENDING)
+                break;
+            std::this_thread::yield();
+        } while (std::chrono::steady_clock::now() < deadline);
+        EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
+        EXPECT_EQ(source, destination);
+    }
+    EXPECT_TRUE(initiator.freeBatchID(batch).ok());
+    EXPECT_EQ(initiator.closeSegment(peer), 0);
+    EXPECT_EQ(initiator.unregisterLocalMemory(source.data()), 0);
+    EXPECT_EQ(target.unregisterLocalMemory(destination.data()), 0);
+}
+
 TEST(TransferEngineTentCompatibilityTest, TcpProtocolForcesTcpTransport) {
     ScopedEnvVar use_tent("MC_USE_TENT", "1");
     ScopedEnvVar force_tcp("MC_FORCE_TCP", nullptr);
@@ -305,6 +525,47 @@ TEST(TransferEngineTentCompatibilityTest, TcpProtocolForcesTcpTransport) {
 
     std::array<char, 4096> buffer{};
     ASSERT_EQ(engine.registerLocalMemory(buffer.data(), buffer.size()), 0);
+    EXPECT_EQ(engine.unregisterLocalMemory(buffer.data()), 0);
+}
+
+TEST(TransferEngineTentCompatibilityTest,
+     PublicScatterRejectsNonCancellableTcpRoute) {
+    ScopedEnvVar use_tent("MC_USE_TENT", "1");
+    ScopedEnvVar force_tcp("MC_FORCE_TCP", nullptr);
+    ScopedEnvVar hostname("MOONCAKE_LOCAL_HOSTNAME", "127.0.0.1");
+    ScopedEnvVar conf("MC_TENT_CONF", kTentConfPrefersRdma);
+
+    constexpr const char* kSegmentName = "compat-scatter-tcp";
+    TransferEngine engine(true);
+    ASSERT_TRUE(engine.isUsingTent());
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, kSegmentName, "", 0, "tcp"), 0);
+
+    std::array<char, 1> buffer{};
+    ASSERT_EQ(engine.registerLocalMemory(buffer.data(), buffer.size()), 0);
+    std::array<size_t, 1> offsets{0};
+    std::array<size_t, 1> lengths{1};
+    std::optional<Status::Code> callback_code;
+    TransferEngine::ScatterTransferRange range{
+        .opcode = TransferRequest::WRITE,
+        .remote_segment = kSegmentName,
+        .remote_base_offset = reinterpret_cast<uint64_t>(buffer.data()),
+        .remote_size = buffer.size(),
+        .local_buffer = buffer.data(),
+        .local_capacity = buffer.size(),
+        .local_offsets = offsets,
+        .remote_offsets = offsets,
+        .lengths = lengths,
+        .on_fragment_complete =
+            [&](size_t, const Status& status) {
+                callback_code = status.code();
+            },
+    };
+
+    auto operation = engine.submitScatter({range});
+    const auto status = operation.wait();
+    EXPECT_TRUE(status.IsNotImplemented());
+    ASSERT_TRUE(callback_code.has_value());
+    EXPECT_EQ(*callback_code, Status::Code::kNotImplemented);
     EXPECT_EQ(engine.unregisterLocalMemory(buffer.data()), 0);
 }
 
@@ -503,25 +764,236 @@ class TerminalFailureTransport : public BatchResultTransport {
         const std::vector<TransferTask*>& tasks) override {
         tasks_ = tasks;
         for (auto* task : tasks_) {
-            task->is_finished = initially_finished_;
+            task->slice_count = 1;
+            __atomic_store_n(&task->is_finished, initially_finished_,
+                             __ATOMIC_RELEASE);
         }
         return Status::OK();
     }
 
     Status getTransferStatus(BatchID, size_t, TransferStatus& status) override {
-        status.s = TransferStatusEnum::FAILED;
+        const bool all_finished =
+            std::all_of(tasks_.begin(), tasks_.end(), [](const auto* task) {
+                return __atomic_load_n(&task->is_finished, __ATOMIC_ACQUIRE);
+            });
+        status.s = all_finished ? TransferStatusEnum::FAILED
+                                : TransferStatusEnum::TIMEOUT;
         return Status::OK();
     }
 
     void finishTasks() {
         for (auto* task : tasks_) {
-            task->is_finished = true;
+            __atomic_store_n(&task->is_finished, true, __ATOMIC_RELEASE);
         }
     }
 
    private:
     bool initially_finished_;
     std::vector<TransferTask*> tasks_;
+};
+
+enum class ScatterPollFailure { kStatusError, kTimeout };
+
+class ScatterDrainProbeTransport : public BatchResultTransport {
+   public:
+    explicit ScatterDrainProbeTransport(ScatterPollFailure failure)
+        : failure_(failure) {}
+
+    Status submitTransferTask(
+        const std::vector<TransferTask*>& tasks) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        tasks_ = tasks;
+        for (auto* task : tasks_) {
+            task->slice_count = task->request_count;
+            auto* slice = new Slice{};
+            slice->task = task;
+            slice->length = task->request[0].length;
+            slice->status = Slice::POSTED;
+            slice->source_addr = this;
+            slice->cleanup_callback = [](Slice* released) {
+                auto* transport = static_cast<ScatterDrainProbeTransport*>(
+                    released->source_addr);
+                transport->released_before_physical_completion_.store(
+                    !transport->physical_completion_.load());
+                transport->batch_released_.store(true);
+            };
+            task->slice_list.push_back(slice);
+        }
+        return Status::OK();
+    }
+
+    Status getTransferStatus(BatchID, size_t, TransferStatus& status) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        first_poll_seen_ = true;
+        cv_.notify_all();
+        if (allow_terminal_status_) {
+            status.s = TransferStatusEnum::FAILED;
+            return Status::OK();
+        }
+        if (failure_ == ScatterPollFailure::kStatusError)
+            return Status::Context("synthetic scatter status failure");
+        status.s = TransferStatusEnum::TIMEOUT;
+        return Status::OK();
+    }
+
+    bool waitForFirstPoll() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return cv_.wait_for(lock, std::chrono::seconds(1),
+                            [this] { return first_poll_seen_; });
+    }
+
+    void finishPhysicalTransfer(bool success = false) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        physical_completion_.store(true);
+        for (auto* task : tasks_) {
+            if (success) {
+                __atomic_store_n(&task->success_slice_count, task->slice_count,
+                                 __ATOMIC_RELEASE);
+                for (auto* slice : task->slice_list)
+                    slice->status = Slice::SUCCESS;
+            } else {
+                __atomic_store_n(&task->failed_slice_count, task->slice_count,
+                                 __ATOMIC_RELEASE);
+                for (auto* slice : task->slice_list)
+                    slice->status = Slice::FAILED;
+            }
+            __atomic_store_n(&task->is_finished, true, __ATOMIC_RELEASE);
+        }
+    }
+
+    void allowTerminalStatus() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        allow_terminal_status_ = true;
+    }
+
+    bool batchReleased() const { return batch_released_.load(); }
+
+    bool releasedBeforePhysicalCompletion() const {
+        return released_before_physical_completion_.load();
+    }
+
+   private:
+    ScatterPollFailure failure_;
+    mutable std::mutex mutex_;
+    std::condition_variable cv_;
+    std::vector<TransferTask*> tasks_;
+    std::atomic<bool> physical_completion_{false};
+    std::atomic<bool> batch_released_{false};
+    std::atomic<bool> released_before_physical_completion_{false};
+    bool first_poll_seen_ = false;
+    bool allow_terminal_status_ = false;
+};
+
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+class DeferredEventPublicationTransport : public BatchResultTransport {
+   public:
+    Status submitTransferTask(
+        const std::vector<TransferTask*>& tasks) override {
+        tasks_ = tasks;
+        for (auto* task : tasks_) {
+            task->slice_count = 1;
+            task->success_slice_count = 1;
+            auto* slice = new Slice{};
+            slice->task = task;
+            slice->length = task->request[0].length;
+            slice->status = Slice::SUCCESS;
+            task->slice_list.push_back(slice);
+        }
+        return Status::OK();
+    }
+
+    Status getTransferStatus(BatchID, size_t, TransferStatus&) override {
+        return Status::Context("synthetic event publication delay");
+    }
+
+    void publishCompletion() {
+        for (auto* task : tasks_)
+            __atomic_store_n(&task->is_finished, true, __ATOMIC_RELEASE);
+    }
+
+   private:
+    std::vector<TransferTask*> tasks_;
+};
+#endif
+
+class PrePublishFailureTransport : public BatchResultTransport {
+   public:
+    Status submitTransferTask(
+        const std::vector<TransferTask*>& tasks) override {
+        tasks_ = tasks;
+        return Status::InvalidArgument("synthetic pre-publish failure");
+    }
+
+    Status getTransferStatus(BatchID, size_t, TransferStatus& status) override {
+        if (!allow_cleanup_) {
+            return Status::Context("synthetic unpublished status failure");
+        }
+        for (auto* task : tasks_) task->is_finished = true;
+        status.s = TransferStatusEnum::FAILED;
+        return Status::OK();
+    }
+
+    void allowCleanup() { allow_cleanup_ = true; }
+
+   private:
+    std::vector<TransferTask*> tasks_;
+    bool allow_cleanup_ = false;
+};
+
+class GroupedDrainResultTransport : public BatchResultTransport {
+   public:
+    Status submitTransferTask(
+        const std::vector<TransferTask*>& tasks) override {
+        for (auto* task : tasks) {
+            for (size_t i = 0; i < task->request_count; ++i) {
+                auto* slice = new Slice{};
+                slice->task = task;
+                slice->length = task->request[i].length;
+                task->slice_list.push_back(slice);
+                __atomic_add_fetch(&task->slice_count, 1, __ATOMIC_ACQ_REL);
+                if (i == 0) {
+                    slice->markSuccess();
+                } else {
+                    slice->markFailed();
+                }
+            }
+        }
+        return Status::OK();
+    }
+
+    Status getTransferStatus(BatchID, size_t, TransferStatus&) override {
+        return Status::Context("synthetic grouped status failure");
+    }
+
+    bool supportsGroupedScatter() const override { return true; }
+};
+
+class ScopedSliceTimeout {
+   public:
+    explicit ScopedSliceTimeout(int64_t timeout_sec)
+        : old_timeout_(globalConfig().slice_timeout) {
+        globalConfig().slice_timeout = timeout_sec;
+    }
+
+    ~ScopedSliceTimeout() { globalConfig().slice_timeout = old_timeout_; }
+
+   private:
+    int64_t old_timeout_;
+};
+
+class TimeoutThenFailureTransport : public BatchResultTransport {
+   public:
+    Status getTransferStatus(BatchID, size_t, TransferStatus& status) override {
+        status.s = status_.load(std::memory_order_acquire);
+        return Status::OK();
+    }
+
+    void fail() {
+        status_.store(TransferStatusEnum::FAILED, std::memory_order_release);
+    }
+
+   private:
+    std::atomic<TransferStatusEnum> status_{TransferStatusEnum::TIMEOUT};
 };
 
 class TransportTest : public ::testing::Test {
@@ -657,6 +1129,100 @@ TEST_F(TransportTest, parseHostNameWithPortTest) {
     res = parseHostNameWithPort(local_server_name);
     ASSERT_EQ(res.first, "1.2.3.4");
     ASSERT_EQ(res.second, 12001);
+}
+
+TEST_F(TransportTest, RealSliceTimeoutDefersBatchCleanup) {
+    ScopedSliceTimeout timeout(/*timeout_sec=*/1);
+    std::string server_name = "unit-test-server:1234";
+    MultiTransport multi_transport(nullptr, server_name);
+    auto batch_id = multi_transport.allocateBatchID(1);
+    auto* slice = TransferEngineImplTestPeer::prepareAgedSliceBatch(
+        multi_transport, batch_id, /*slice_age_ns=*/2'000'000'000LL);
+
+    Transport::TransferStatus status;
+    ASSERT_EQ(multi_transport.getTransferStatus(batch_id, 0, status),
+              Status::OK());
+    EXPECT_EQ(status.s, Transport::TransferStatusEnum::TIMEOUT);
+
+    Status free_status = multi_transport.freeBatchID(batch_id);
+    EXPECT_TRUE(free_status.IsBatchCleanupDeferred());
+    EXPECT_EQ(free_status.ToString(),
+              "BatchCleanupDeferred: BatchID is invalid because cleanup has "
+              "been deferred");
+    EXPECT_EQ(free_status.message(),
+              "BatchID is invalid because cleanup has been deferred");
+    EXPECT_TRUE(TransferEngineImplTestPeer::isCleanupDeferred(multi_transport,
+                                                              batch_id));
+
+    slice->markFailed();
+    constexpr auto kCleanupDeadline = std::chrono::seconds(2);
+    const auto deadline = std::chrono::steady_clock::now() + kCleanupDeadline;
+    while (TransferEngineImplTestPeer::isCleanupDeferred(multi_transport,
+                                                         batch_id) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_FALSE(TransferEngineImplTestPeer::isCleanupDeferred(multi_transport,
+                                                               batch_id));
+}
+
+TEST_F(TransportTest, TimedOutBatchIsReclaimedAfterCallbacksFinish) {
+    std::string server_name = "unit-test-server:1234";
+    TimeoutThenFailureTransport task_transport;
+    MultiTransport multi_transport(nullptr, server_name);
+    auto batch_id = multi_transport.allocateBatchID(1);
+    TransferEngineImplTestPeer::prepareBusyBatch(multi_transport, batch_id,
+                                                 &task_transport);
+
+    std::atomic<bool> callback_called{false};
+    Status free_status = TransferEngineImplTestPeer::freeBatchWithCallback(
+        multi_transport, batch_id,
+        [&] { callback_called.store(true, std::memory_order_release); });
+    EXPECT_TRUE(free_status.IsBatchCleanupDeferred());
+    EXPECT_EQ(free_status.message(),
+              "BatchID is invalid because cleanup has been deferred");
+    EXPECT_TRUE(TransferEngineImplTestPeer::isCleanupDeferred(multi_transport,
+                                                              batch_id));
+    EXPECT_FALSE(callback_called.load(std::memory_order_acquire));
+
+    task_transport.fail();
+    constexpr auto kCleanupDeadline = std::chrono::seconds(2);
+    const auto deadline = std::chrono::steady_clock::now() + kCleanupDeadline;
+    while (TransferEngineImplTestPeer::isCleanupDeferred(multi_transport,
+                                                         batch_id) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_FALSE(TransferEngineImplTestPeer::isCleanupDeferred(multi_transport,
+                                                               batch_id));
+    EXPECT_TRUE(callback_called.load(std::memory_order_acquire));
+}
+
+TEST_F(TransportTest, FinishedBatchWaitsForCompletionCallbackQuiescence) {
+    std::string server_name = "unit-test-server:1234";
+    MultiTransport multi_transport(nullptr, server_name);
+    auto batch_id = multi_transport.allocateBatchID(1);
+    TransferEngineImplTestPeer::prepareFinishedBatchWithActiveCallback(
+        multi_transport, batch_id);
+
+    Status free_status = multi_transport.freeBatchID(batch_id);
+    EXPECT_TRUE(free_status.IsBatchCleanupDeferred());
+    EXPECT_EQ(free_status.message(),
+              "BatchID is invalid because cleanup has been deferred");
+    EXPECT_TRUE(TransferEngineImplTestPeer::isCleanupDeferred(multi_transport,
+                                                              batch_id));
+
+    TransferEngineImplTestPeer::finishActiveCompletionCallback(multi_transport,
+                                                               batch_id);
+    constexpr auto kCleanupDeadline = std::chrono::seconds(2);
+    const auto deadline = std::chrono::steady_clock::now() + kCleanupDeadline;
+    while (TransferEngineImplTestPeer::isCleanupDeferred(multi_transport,
+                                                         batch_id) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_FALSE(TransferEngineImplTestPeer::isCleanupDeferred(multi_transport,
+                                                               batch_id));
 }
 
 TEST_F(TransportTest, TransferTaskDestructorRunsSliceCleanup) {
@@ -1049,11 +1615,16 @@ TEST_F(TransportTest, BusyBatchKeepsPendingNotify) {
             .submitTransferWithNotify(batch_id, {request}, {"name", "payload"})
             .ok());
 
-    EXPECT_TRUE(engine.freeBatchID(batch_id).IsBatchBusy());
+    EXPECT_TRUE(engine.freeBatchID(batch_id).IsBatchCleanupDeferred());
     EXPECT_EQ(TransferEngineImplTestPeer::pendingNotifyCount(engine), 1);
 
     transport->finishTasks();
-    ASSERT_TRUE(engine.freeBatchID(batch_id).ok());
+    constexpr auto kCleanupDeadline = std::chrono::seconds(2);
+    const auto deadline = std::chrono::steady_clock::now() + kCleanupDeadline;
+    while (TransferEngineImplTestPeer::pendingNotifyCount(engine) != 0 &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
     EXPECT_EQ(TransferEngineImplTestPeer::pendingNotifyCount(engine), 0);
 }
 
@@ -1165,7 +1736,10 @@ TEST_F(TransportTest, TcpScatterCombinesRequestsIntoOneTask) {
         }
         ASSERT_EQ(remaining, 0u)
             << "TCP scatter did not reach physical completion";
-        EXPECT_TRUE(engine.freeBatchID(submission.batch_id).ok());
+        // The last io callback may still hold its BatchDesc pin here;
+        // a deferred cleanup is a legal terminal outcome.
+        Status free_status = engine.freeBatchID(submission.batch_id);
+        EXPECT_TRUE(free_status.ok() || free_status.IsBatchCleanupDeferred());
         EXPECT_TRUE(submitted.ok());
         EXPECT_TRUE(successful);
         EXPECT_EQ(memcmp(source, destination, kBytes), 0);
@@ -1304,6 +1878,309 @@ TEST_F(TransportTest, RepeatedBatchQueryPreservesAggregatedBytes) {
     EXPECT_EQ(status.transferred_bytes, total_bytes);
 }
 
+TEST_F(TransportTest, ScatterPrePublishFailureDoesNotWaitForPhysicalSlices) {
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:12345"), 0);
+    auto transport = std::make_shared<PrePublishFailureTransport>();
+    auto& impl = TransferEngineImplTestPeer::implementation(engine);
+    TransferEngineImplTestPeer::replaceTransports(
+        impl, {{"pre-publish-failure", transport}});
+
+    constexpr SegmentID kSegmentId = 14;
+    auto descriptor = std::make_shared<TransferMetadata::SegmentDesc>();
+    descriptor->name = "pre-publish-remote";
+    descriptor->protocol = "pre-publish-failure";
+    impl.getMetadata()->addLocalSegment(kSegmentId, "pre-publish-remote",
+                                        std::move(descriptor));
+
+    std::array<char, 1> buffer{};
+    std::array<size_t, 1> offsets{0};
+    std::array<size_t, 1> lengths{1};
+    size_t callback_count = 0;
+    TransferEngine::ScatterTransferRange range{
+        .opcode = TransferRequest::READ,
+        .remote_segment = "pre-publish-remote",
+        .remote_base_offset = 0,
+        .remote_size = buffer.size(),
+        .local_buffer = buffer.data(),
+        .local_capacity = buffer.size(),
+        .local_offsets = offsets,
+        .remote_offsets = offsets,
+        .lengths = lengths,
+        .on_fragment_complete =
+            [&](size_t, const Status& status) {
+                EXPECT_FALSE(status.ok());
+                ++callback_count;
+            },
+    };
+
+    auto operation = engine.submitScatter({range});
+    auto status = operation.waitFor(std::chrono::milliseconds(20));
+    EXPECT_FALSE(status.IsClock());
+    EXPECT_EQ(callback_count, 1u);
+
+    transport->allowCleanup();
+    EXPECT_FALSE(operation.wait().ok());
+}
+
+TEST_F(TransportTest, GroupedScatterDrainPreservesFragmentResults) {
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:12345"), 0);
+    auto transport = std::make_shared<GroupedDrainResultTransport>();
+    auto& impl = TransferEngineImplTestPeer::implementation(engine);
+    TransferEngineImplTestPeer::replaceTransports(
+        impl, {{"grouped-drain-results", transport}});
+
+    constexpr SegmentID kSegmentId = 15;
+    auto descriptor = std::make_shared<TransferMetadata::SegmentDesc>();
+    descriptor->name = "grouped-drain-remote";
+    descriptor->protocol = "grouped-drain-results";
+    impl.getMetadata()->addLocalSegment(kSegmentId, "grouped-drain-remote",
+                                        std::move(descriptor));
+
+    std::array<char, 2> buffer{};
+    std::array<size_t, 2> offsets{0, 1};
+    std::array<size_t, 2> lengths{1, 1};
+    std::vector<bool> fragment_ok;
+    TransferEngine::ScatterTransferRange range{
+        .opcode = TransferRequest::READ,
+        .remote_segment = "grouped-drain-remote",
+        .remote_base_offset = 0,
+        .remote_size = buffer.size(),
+        .local_buffer = buffer.data(),
+        .local_capacity = buffer.size(),
+        .local_offsets = offsets,
+        .remote_offsets = offsets,
+        .lengths = lengths,
+        .on_fragment_complete =
+            [&](size_t, const Status& status) {
+                fragment_ok.push_back(status.ok());
+            },
+    };
+
+    auto operation = engine.submitScatter({range});
+    EXPECT_FALSE(operation.wait().ok());
+    EXPECT_EQ(fragment_ok, (std::vector<bool>{true, false}));
+}
+
+void expectLegacyScatterDrainAfterPollFailure(ScatterPollFailure failure,
+                                              bool physical_success = false) {
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:12345"), 0);
+    auto transport = std::make_shared<ScatterDrainProbeTransport>(failure);
+    auto& impl = TransferEngineImplTestPeer::implementation(engine);
+    TransferEngineImplTestPeer::replaceTransports(
+        impl, {{"scatter-drain-probe", transport}});
+
+    constexpr SegmentID kSegmentId = 13;
+    auto descriptor = std::make_shared<TransferMetadata::SegmentDesc>();
+    descriptor->name = "scatter-drain-remote";
+    descriptor->protocol = "scatter-drain-probe";
+    impl.getMetadata()->addLocalSegment(kSegmentId, "scatter-drain-remote",
+                                        std::move(descriptor));
+
+    std::array<char, 1> buffer{};
+    std::array<size_t, 1> offsets{0};
+    std::array<size_t, 1> lengths{1};
+    std::atomic<size_t> callback_count{0};
+    std::atomic<bool> callback_ok{true};
+    std::atomic<bool> callback_before_batch_release{false};
+    TransferEngine::ScatterTransferRange range{
+        .opcode = TransferRequest::READ,
+        .remote_segment = "scatter-drain-remote",
+        .remote_base_offset = 0,
+        .remote_size = buffer.size(),
+        .local_buffer = buffer.data(),
+        .local_capacity = buffer.size(),
+        .local_offsets = offsets,
+        .remote_offsets = offsets,
+        .lengths = lengths,
+        .on_fragment_complete =
+            [&](size_t, const Status& status) {
+                callback_ok.store(status.ok());
+                callback_before_batch_release.store(
+                    !transport->batchReleased());
+                callback_count.fetch_add(1);
+            },
+    };
+
+    auto operation = engine.submitScatter({range});
+    auto destruction = std::async(
+        std::launch::async, [operation = std::move(operation)]() mutable {
+            auto local_operation = std::move(operation);
+        });
+
+    const bool polled = transport->waitForFirstPoll();
+    EXPECT_TRUE(polled);
+    EXPECT_EQ(destruction.wait_for(std::chrono::milliseconds(20)),
+              std::future_status::timeout);
+    EXPECT_FALSE(transport->batchReleased());
+    EXPECT_EQ(callback_count.load(), 0u);
+
+    transport->finishPhysicalTransfer(physical_success);
+    const auto drained = destruction.wait_for(std::chrono::milliseconds(500));
+    EXPECT_EQ(drained, std::future_status::ready);
+    if (drained != std::future_status::ready) {
+        transport->allowTerminalStatus();
+        ASSERT_EQ(destruction.wait_for(std::chrono::seconds(1)),
+                  std::future_status::ready);
+    }
+    destruction.get();
+
+    EXPECT_TRUE(transport->batchReleased());
+    EXPECT_FALSE(transport->releasedBeforePhysicalCompletion());
+    EXPECT_EQ(callback_count.load(), 1u);
+    EXPECT_EQ(callback_ok.load(), physical_success);
+    EXPECT_TRUE(callback_before_batch_release.load());
+}
+
+TEST_F(TransportTest, LegacyScatterDrainsAfterStatusQueryFailure) {
+    expectLegacyScatterDrainAfterPollFailure(ScatterPollFailure::kStatusError);
+}
+
+TEST_F(TransportTest, LegacyScatterDrainsAfterTimeout) {
+    expectLegacyScatterDrainAfterPollFailure(ScatterPollFailure::kTimeout);
+}
+
+TEST_F(TransportTest, LegacyScatterDrainPreservesSingleRequestSuccess) {
+    expectLegacyScatterDrainAfterPollFailure(ScatterPollFailure::kStatusError,
+                                             true);
+}
+
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+TEST_F(TransportTest, LegacyScatterDrainWaitsForEventPublication) {
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:12345"), 0);
+    auto transport = std::make_shared<DeferredEventPublicationTransport>();
+    auto& impl = TransferEngineImplTestPeer::implementation(engine);
+    TransferEngineImplTestPeer::replaceTransports(
+        impl, {{"deferred-event-publication", transport}});
+
+    constexpr SegmentID kSegmentId = 16;
+    auto descriptor = std::make_shared<TransferMetadata::SegmentDesc>();
+    descriptor->name = "deferred-event-publication-remote";
+    descriptor->protocol = "deferred-event-publication";
+    impl.getMetadata()->addLocalSegment(
+        kSegmentId, "deferred-event-publication-remote", std::move(descriptor));
+
+    std::array<char, 1> buffer{};
+    std::array<size_t, 1> offsets{0};
+    std::array<size_t, 1> lengths{1};
+    TransferEngine::ScatterTransferRange range{
+        .opcode = TransferRequest::READ,
+        .remote_segment = "deferred-event-publication-remote",
+        .remote_base_offset = 0,
+        .remote_size = buffer.size(),
+        .local_buffer = buffer.data(),
+        .local_capacity = buffer.size(),
+        .local_offsets = offsets,
+        .remote_offsets = offsets,
+        .lengths = lengths,
+        .on_fragment_complete = {},
+    };
+
+    auto operation = engine.submitScatter({range});
+    EXPECT_TRUE(operation.waitFor(std::chrono::milliseconds(20)).IsClock());
+    transport->publishCompletion();
+    EXPECT_FALSE(operation.wait().ok());
+}
+#endif
+TEST_F(TransportTest, CqMarkSuccessPublishesBatchFinishedTaskCount) {
+    Transport::BatchDesc batch{};
+    batch.id = reinterpret_cast<Transport::BatchID>(&batch);
+    batch.batch_size = 2;
+
+    Transport::TransferTask first;
+    Transport::TransferTask second;
+    first.batch_id = batch.id;
+    second.batch_id = batch.id;
+    first.slice_count = 1;
+    second.slice_count = 1;
+
+    Transport::Slice first_slice{};
+    first_slice.task = &first;
+    first_slice.length = 4;
+    first_slice.markSuccess();
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+    EXPECT_TRUE(first.is_finished);
+#else
+    EXPECT_FALSE(first.is_finished);
+#endif
+    EXPECT_FALSE(batch.is_finished.load());
+    EXPECT_EQ(batch.finished_task_count.load(), 1u);
+
+    Transport::Slice second_slice{};
+    second_slice.task = &second;
+    second_slice.length = 4;
+    second_slice.markSuccess();
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+    EXPECT_TRUE(second.is_finished);
+    EXPECT_TRUE(batch.is_finished.load());
+#else
+    EXPECT_FALSE(second.is_finished);
+    // Foreground aggregation publishes the status/byte cache when polling.
+    EXPECT_FALSE(batch.is_finished.load());
+#endif
+    EXPECT_EQ(batch.finished_task_count.load(), 2u);
+    // Completion callbacks drop their BatchDesc pins when they unwind.
+    EXPECT_EQ(batch.active_completion_callbacks.load(), 0u);
+}
+
+TEST_F(TransportTest, SealPublishesWhenAllSlicesCompletedFirst) {
+    Transport::BatchDesc batch{};
+    batch.id = reinterpret_cast<Transport::BatchID>(&batch);
+    batch.batch_size = 1;
+    Transport::TransferTask task;
+    task.batch_id = batch.id;
+    task.slice_count = 1;
+    Transport::Slice::unsealTaskSubmission(&task);
+
+    Transport::Slice slice{};
+    slice.task = &task;
+    slice.length = 4;
+    slice.markSuccess();
+    EXPECT_FALSE(task.completion_published);
+    EXPECT_EQ(batch.finished_task_count.load(), 0u);
+
+    Transport::Slice::sealTaskSubmission(&task);
+    EXPECT_TRUE(task.completion_published);
+    EXPECT_EQ(batch.finished_task_count.load(), 1u);
+    EXPECT_EQ(batch.active_completion_callbacks.load(), 0u);
+}
+
+TEST_F(TransportTest, MarkFailedWithoutBatchIdDoesNotTouchBatchDesc) {
+    Transport::TransferTask task;
+    Transport::Slice slice{};
+    slice.task = &task;
+    slice.markFailed();
+    EXPECT_EQ(task.failed_slice_count, 1u);
+    EXPECT_FALSE(task.completion_published);
+}
+
+TEST_F(TransportTest, LastSliceAndSealConcurrentlyStillPublish) {
+    for (int iter = 0; iter < 2000; ++iter) {
+        Transport::BatchDesc batch{};
+        batch.id = reinterpret_cast<Transport::BatchID>(&batch);
+        batch.batch_size = 1;
+        Transport::TransferTask task;
+        task.batch_id = batch.id;
+        task.slice_count = 1;
+        Transport::Slice::unsealTaskSubmission(&task);
+
+        Transport::Slice slice{};
+        slice.task = &task;
+        slice.length = 4;
+
+        std::thread cq([&] { slice.markSuccess(); });
+        std::thread sealer(
+            [&] { Transport::Slice::sealTaskSubmission(&task); });
+        cq.join();
+        sealer.join();
+        EXPECT_TRUE(task.completion_published) << "iter=" << iter;
+        EXPECT_EQ(batch.finished_task_count.load(), 1u) << "iter=" << iter;
+    }
+}
+
 #ifdef USE_EVENT_DRIVEN_COMPLETION
 TEST_F(TransportTest, GroupedTaskCompletionWaitsForSubmissionSeal) {
     Transport::BatchDesc batch{};
@@ -1312,7 +2189,7 @@ TEST_F(TransportTest, GroupedTaskCompletionWaitsForSubmissionSeal) {
     Transport::TransferTask task;
     task.batch_id = batch.id;
     task.request_count = 2;
-    task.submission_sealed = false;
+    Transport::Slice::unsealTaskSubmission(&task);
 
     auto complete_slice = [&] {
         __atomic_add_fetch(&task.slice_count, 1, __ATOMIC_ACQ_REL);
@@ -1333,6 +2210,90 @@ TEST_F(TransportTest, GroupedTaskCompletionWaitsForSubmissionSeal) {
 
     Transport::Slice::sealTaskSubmission(&task);
     EXPECT_EQ(batch.finished_task_count.load(), 1);
+}
+#endif
+
+#ifdef USE_TENT
+TEST(TransferEngineTentCompatibilityTest,
+     InstallTransportReturnsCompatibilityHandle) {
+    ScopedEnvVar use_tent("MC_USE_TENT", "1");
+    ScopedEnvVar force_tcp("MC_FORCE_TCP", "1");
+    ScopedEnvVar hostname("MOONCAKE_LOCAL_HOSTNAME", "127.0.0.1");
+
+    TransferEngine engine;
+    ASSERT_TRUE(engine.isUsingTent());
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "tent-install-transport"), 0);
+
+    Transport* transport = nullptr;
+    for (const auto* protocol : {"tcp", "efa", "cxi", "ascend"}) {
+        auto* current = engine.installTransport(protocol, nullptr);
+        ASSERT_NE(current, nullptr) << protocol;
+        if (transport)
+            EXPECT_EQ(current, transport) << protocol;
+        else
+            transport = current;
+    }
+
+    EXPECT_EQ(transport->allocateBatchID(1), INVALID_BATCH_ID);
+    EXPECT_EQ(transport->freeBatchID(INVALID_BATCH_ID).code(),
+              Status::Code::kNotImplemented);
+    EXPECT_EQ(transport->submitTransfer(0, {}).code(),
+              Status::Code::kNotImplemented);
+    TransferStatus status{};
+    EXPECT_EQ(transport->getTransferStatus(0, 0, status).code(),
+              Status::Code::kNotImplemented);
+    EXPECT_EQ(engine.uninstallTransport("tcp"), 0);
+}
+
+TEST(TransferEngineTentCompatibilityTest,
+     CApiInstallTransportReturnsCompatibilityHandle) {
+    ScopedEnvVar use_tent("MC_USE_TENT", "1");
+    ScopedEnvVar force_tcp("MC_FORCE_TCP", "1");
+    ScopedEnvVar hostname("MOONCAKE_LOCAL_HOSTNAME", "127.0.0.1");
+
+    transfer_engine_t engine = createTransferEngine(
+        P2PHANDSHAKE, "tent-c-api-install-transport", "", 0, false);
+    ASSERT_NE(engine, nullptr);
+
+    transport_t transport = nullptr;
+    for (const auto* protocol : {"tcp", "efa", "cxi", "ascend"}) {
+        auto current = installTransport(engine, protocol, nullptr);
+        ASSERT_NE(current, nullptr) << protocol;
+        if (transport)
+            EXPECT_EQ(current, transport) << protocol;
+        else
+            transport = current;
+    }
+    EXPECT_EQ(uninstallTransport(engine, "tcp"), 0);
+    destroyTransferEngine(engine);
+}
+
+TEST(TransferEngineTentCompatibilityTest,
+     ConcurrentInstallTransportReturnsOneCompatibilityHandle) {
+    ScopedEnvVar use_tent("MC_USE_TENT", "1");
+    ScopedEnvVar force_tcp("MC_FORCE_TCP", "1");
+    ScopedEnvVar hostname("MOONCAKE_LOCAL_HOSTNAME", "127.0.0.1");
+
+    TransferEngine engine;
+    ASSERT_TRUE(engine.isUsingTent());
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "tent-concurrent-install"), 0);
+
+    constexpr size_t kThreadCount = 16;
+    std::array<Transport*, kThreadCount> transports{};
+    std::vector<std::thread> threads;
+    threads.reserve(kThreadCount);
+    for (size_t i = 0; i < kThreadCount; ++i) {
+        threads.emplace_back([&engine, &transports, i] {
+            transports[i] = engine.installTransport("tcp", nullptr);
+        });
+    }
+    for (auto& thread : threads) thread.join();
+
+    ASSERT_NE(transports[0], nullptr);
+    for (const auto* transport : transports) {
+        ASSERT_NE(transport, nullptr);
+        EXPECT_EQ(transport, transports[0]);
+    }
 }
 #endif
 

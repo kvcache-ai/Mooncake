@@ -5,9 +5,22 @@
 #include <thread>
 
 #include "common/byte_size.h"
+#include "config/store_cluster_identity_config.h"
 #include "version.h"
 
 namespace mooncake {
+
+const std::map<std::string, std::string> merge_labels(
+    const std::map<std::string, std::string>& labels) {
+    static const std::string cluster_id =
+        StoreClusterIdentityConfig::FromEnvironment().cluster_id.value_or("");
+    std::map<std::string, std::string> merged_labels;
+    if (!cluster_id.empty()) {
+        merged_labels["cluster_id"] = cluster_id;
+    }
+    merged_labels.insert(labels.begin(), labels.end());
+    return merged_labels;
+}
 
 namespace {
 
@@ -31,6 +44,9 @@ ClientMetric::ClientMetric(uint64_t interval_seconds,
       transfer_operation_metric(labels),
       ssd_metric(labels),
       dfs_metric(labels),
+#ifdef USE_NOF
+      nof_metric(labels),
+#endif
       allocator_metric(labels),
       build_info("mooncake_build_info",
                  "Build version of the running client; the value is always 1 "
@@ -84,6 +100,9 @@ void ClientMetric::serialize(std::string& str) {
     transfer_operation_metric.serialize(str);
     ssd_metric.serialize(str);
     dfs_metric.serialize(str);
+#ifdef USE_NOF
+    nof_metric.serialize(str);
+#endif
     allocator_metric.Refresh();
     allocator_metric.serialize(str);
     build_info.serialize(str);
@@ -109,6 +128,10 @@ std::string ClientMetric::summary_metrics() {
     ss << "\n";
     ss << dfs_metric.summary_metrics();
     ss << "\n";
+#ifdef USE_NOF
+    ss << nof_metric.summary_metrics();
+    ss << "\n";
+#endif
     allocator_metric.Refresh();
     ss << allocator_metric.summary_metrics();
     return ss.str();

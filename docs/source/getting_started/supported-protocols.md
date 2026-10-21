@@ -18,6 +18,7 @@ Mooncake Transfer Engine supports multiple communication protocols for data tran
 | **cxl** | CXL-capable hardware | Memory pooling and sharing | ⚠️ Advanced |
 | **shm** | None (POSIX shm, same host) | Same-host DRAM copies without NIC loopback | ⚠️ Advanced |
 | **ascend** | Huawei Ascend NPU | Ascend NPU communication | ⚠️ Advanced |
+| **hylink** | Hygon DCU + DTK | Hygon DCU HSL fabric communication | ⚠️ Advanced |
 | **tpu** | Google TPU (PJRT) | TPU KV-cache transfer via host-DRAM staging | 🧪 Experimental (TENT) |
 | **mpcomm** | RDMA-capable NIC(s) | Multi-NIC memory pooling with NIC/QP load balancing | ⚠️ Advanced (TENT) |
 | **flagcx** | RDMA-capable NIC(s) | Unified P2P transfer through FlagOS FlagCX | ⚠️ Advanced |
@@ -70,6 +71,7 @@ export MOONCAKE_PROTOCOL="tcp"
 - NVIDIA GPUDirect RDMA
 - Non-NVIDAI GPUDirect RDMA (e.g., Intel E810 RDMA NIC)
 - Cambricon MLU memory via Neuware (`-DUSE_MLU=ON`)
+- Biren GPU memory via SUPA (`-DUSE_SUPA=ON`)
 
 **Use When:**
 - High-performance networking is required
@@ -200,13 +202,55 @@ The following protocols are available at the C++ Transfer Engine level for speci
 - NVIDIA MNNVL hardware
 - Compiled with `USE_MNNVL=ON`
 
+Mooncake Store providers can use this transport for a default-off,
+EGM-backed DRAM tier. Configure the Python `setup(config)` overload with
+`enable_egm_store_pool=true`, `protocol="nvlink"`,
+`global_segment_size>0`, and `local_buffer_size=0`. `egm_numa_nodes` accepts
+`auto` (the default, using each visible GPU's CUDA
+`CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID`) or a comma-separated node list. Consumers
+do not enable the pool; they use the ordinary `nvlink` protocol to access the
+provider's mounted segments. Use `MC_MS_AUTO_DISC=0` for the manual selection
+shown below, for both Providers and Consumers. `MC_FORCE_MNNVL` is not needed
+in this mode. EGM requires a non-TENT Transfer Engine with the `nvlink`
+transport installed.
+
+The requested EGM capacity is rounded down to a multiple of the common
+alignment: the maximum of the Store slab alignment and the selected nodes'
+CUDA allocation granularities. It is distributed across nodes, then split
+into balanced, aligned chunks no larger than `max_mr_size`. This planning
+applies only to EGM pools.
+
 **Configuration:**
 ```bash
-# Set MC_FORCE_MNNVL=true to use MNNVL even when RDMA NICs are present
-export MC_FORCE_MNNVL=true
+# Provider and Consumer: install the requested nvlink transport explicitly.
+export MC_MS_AUTO_DISC=0
 ```
 
-**Note:** When `protocol="rdma"` is set and RDMA NICs exist, you must explicitly set `MC_FORCE_MNNVL=true` to use MNNVL instead of RDMA. If no RDMA HCA is detected, MNNVL will be used automatically.
+```python
+consumer.setup({
+    "local_hostname": "10.192.8.58:12400",
+    "metadata_server": "http://10.192.8.81:8079/metadata",
+    "master_server_addr": "10.192.8.81:50051",
+    "protocol": "nvlink",
+    "global_segment_size": "0",
+    "local_buffer_size": "0",
+    "rdma_devices": "",
+    "enable_egm_store_pool": "false",
+})
+```
+
+**Note:** Manual `protocol="nvlink"` selection is supported for both Providers
+and Consumers. If you use `MC_MS_AUTO_DISC=1` instead, set `MC_FORCE_MNNVL=1`
+on hosts with RDMA HCAs so discovery selects MNNVL. EGM setup checks the
+actual engine and fails before allocation unless it is non-TENT and has
+`nvlink` installed.
+
+Drain all application and offload calls before closing a Store. Close is
+terminal, even on error. EGM cleanup is attempted, and resources whose cleanup
+cannot be confirmed are retained until process exit rather than retried by a
+later close. See
+`close()` in the [Python Store API](../api-reference/python/mooncake-store.md)
+for cleanup and failure handling.
 
 **Host memory over NVLink (TENT, EGM):** on Grace-Blackwell systems the GPUs of
 an NVLink domain can also address each other's host DRAM (Extended GPU Memory).
@@ -367,6 +411,38 @@ export MC_INTRANODE_NVLINK=true
 **Documentation:**
 - [Heterogeneous Ascend](../design/transfer-engine/transport/heterogeneous_ascend.md)
 - [Ascend Transport](../design/transfer-engine/transport/ascend_transport.md)
+
+### Hylink Transport (hylink)
+
+**Description:** Transfer Engine transport for Hygon DCU memory over HSL
+(Hygon Scale-up Link). HSL connects DCUs directly, including across machines,
+and does not use an IB/RoCE NIC. Peers exchange a DTK VMM fabric handle
+(`hipMemAllocationHandleType` `0x8`, 512 bytes). The same handle works on one
+machine and across machines. An imported fabric address can be granted access
+only once, and only to one device, so each local GPU imports and maps the
+handle, then grants access on its own device. The TENT transport uses the same
+HSL fabric path by default, and remains selectable across machines. Set
+`MC_HYLINK_USE_VMM=0` on both sides of a TENT run to use HIP IPC in
+environments that do not support VMM. IPC cannot cross machines.
+
+**Status:** Select it with `transfer_engine_bench --protocol=hylink`.
+TENT selects it with `transports.hylink.enable=true` or
+`transfer_engine_bench --backend=tent --protocol=hylink`. It is off unless
+that switch is set, so a DTK build keeps using RDMA/TCP by default.
+
+**Use When:**
+- DCU copies on one machine or across machines should use HSL instead of a
+  NIC path. The exporter must register VMM memory (`hipMemCreate`)
+- TENT only: set `MC_HYLINK_USE_VMM=0` in environments that do not support
+  VMM. That path uses same-machine `hipMalloc` buffers and a HIP IPC
+  handle, and cannot cross machines
+
+**Requirements:**
+- Built with `-DUSE_HYLINK=ON` (implies `USE_HIP`)
+- TENT builds also pass `-DUSE_TENT=ON`
+- Hygon DTK runtime
+- Both sides must support DTK VMM fabric
+- TENT IPC does not require VMM and stays on one machine
 
 ### TPU Transport (tpu) — Experimental
 
@@ -539,6 +615,7 @@ export MOONCAKE_LOCAL_HOSTNAME="node1"
 | AMD GPU Clusters | rdma + hip | Use HIP for local GPU communication |
 | Cambricon MLU Clusters | rdma | Build with `-DUSE_MLU=ON`; MLU uses the normal RDMA protocol |
 | Ascend NPU Clusters | rdma + ascend | Use Ascend for NPU-specific operations |
+| Hygon DCU Clusters | rdma + hylink | Build with `-DUSE_HYLINK=ON`; use hylink for HSL fabric communication |
 | Multi-vendor or cross-vendor clusters | flagcx | Build with `-DUSE_FLAGCX=ON`; transfers use the FlagCX P2P Engine over RDMA-capable NICs |
 
 ## Troubleshooting
@@ -595,4 +672,5 @@ If a protocol fails to initialize:
 ../design/transfer-engine/transport/sunrise_link_transport
 ../design/transfer-engine/transport/flagcx_transport
 ../design/transfer-engine/transport/mpcomm_transport
+../design/transfer-engine/transport/memfabric_transport
 :::

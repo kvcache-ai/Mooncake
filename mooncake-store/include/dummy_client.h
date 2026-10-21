@@ -183,6 +183,11 @@ class DummyClient : public PyClient {
 
     std::vector<int> batchIsExist(const std::vector<std::string> &keys);
 
+    int probeKey(const std::string &key);
+
+    std::vector<int> batchProbeKey(const std::vector<std::string> &keys,
+                                   const GrantLeasePolicy &policy = {});
+
     int64_t getSize(const std::string &key);
 
     std::map<std::string, std::vector<Replica::Descriptor>>
