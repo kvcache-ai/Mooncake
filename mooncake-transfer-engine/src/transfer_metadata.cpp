@@ -707,6 +707,11 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
             bufferJSON["addr"] = static_cast<Json::UInt64>(buffer.addr);
             bufferJSON["length"] = static_cast<Json::UInt64>(buffer.length);
             bufferJSON["device_id"] = buffer.device_id;
+            // Host memfd handle (ASCEND_USE_SHMEM). Emitted only when the
+            // buffer is shareable, so a peer built without this field keeps
+            // parsing the descriptor unchanged.
+            if (!buffer.shm_name.empty())
+                bufferJSON["shm_name"] = buffer.shm_name;
             buffersJSON.append(bufferJSON);
         }
         segmentJSON["buffers"] = buffersJSON;
@@ -1269,6 +1274,10 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
                 LOG(WARNING) << "Corrupted segment descriptor, name "
                              << segment_name << " protocol " << desc->protocol;
                 return nullptr;
+            }
+            if (bufferJSON.isMember("shm_name") &&
+                bufferJSON["shm_name"].isString()) {
+                buffer.shm_name = bufferJSON["shm_name"].asString();
             }
             desc->buffers.push_back(buffer);
         }
