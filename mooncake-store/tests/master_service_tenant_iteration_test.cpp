@@ -203,4 +203,33 @@ TEST_F(TenantIterationTest, RemoveAllLeavesLeasedObjectsUnlessForced) {
     EXPECT_EQ(service.RemoveAll(kTenantA, /*force=*/true), 4);
 }
 
+TEST_F(TenantIterationTest, InFlightKeysNameOnlyKeysWithWorkInFlight) {
+    MasterService service(MultiTenantConfig());
+    const auto context = PrepareSimpleSegment(service);
+    PutKeys(service, context.client_id, kTenantA, "done_", 3);
+    for (const auto& [tenant_id, key] :
+         {std::pair{kTenantA, "pending_a"}, std::pair{kTenantB, "pending_b"}}) {
+        ASSERT_TRUE(service
+                        .PutStart(context.client_id, key, tenant_id, 1024,
+                                  OneMemoryReplica())
+                        .has_value());
+    }
+
+    MasterServiceTestPeer peer(service);
+    EXPECT_EQ(peer.InFlightKeys(kTenantA),
+              std::vector<std::string>{"pending_a"});
+    EXPECT_EQ(peer.InFlightKeys(kTenantB),
+              std::vector<std::string>{"pending_b"});
+    EXPECT_TRUE(peer.InFlightKeys(kTenantC).empty());
+
+    // The expiry sweep of one tenant leaves the others' writes alone.
+    peer.DiscardExpiredProcessingReplicas(
+        kTenantA, std::chrono::system_clock::time_point::max());
+    EXPECT_TRUE(peer.InFlightKeys(kTenantA).empty());
+    EXPECT_EQ(KeysOf(service, kTenantA),
+              (std::set<std::string>{"done_0", "done_1", "done_2"}));
+    EXPECT_EQ(peer.InFlightKeys(kTenantB),
+              std::vector<std::string>{"pending_b"});
+}
+
 }  // namespace mooncake::test

@@ -1984,6 +1984,17 @@ void MasterService::VisitTenants(
     }
 }
 
+auto MasterService::InFlightKeys(const TenantId& tenant_id) const
+    -> std::vector<std::string> {
+    std::vector<std::string> keys;
+    for (auto object : ReadCursor(tenant_id)) {
+        if (object.state().HasWorkInFlight()) {
+            keys.push_back(object.key());
+        }
+    }
+    return keys;
+}
+
 void MasterService::CleanupInvalidMemoryReplicas(MetadataAccessorRW& accessor) {
     // Only memory replicas are checked here, to avoid a lock order violation
     // (client_mutex_ must be acquired before a metadata shard). local_disk
@@ -9034,36 +9045,26 @@ tl::expected<void, ErrorCode> MasterService::PushPromotionQueue(
 // --- Promotion retry candidate helpers ---
 
 void MasterService::EraseCandidate(const ObjectIdentity& object_id) {
-    MetadataShardAccessorRW shard(
-        this, getShardIndex(object_id.tenant_id, object_id.user_key));
-    auto tenant_it = shard->tenants.find(object_id.tenant_id);
-    if (tenant_it == shard->tenants.end()) return;
-    auto& tenant_state = tenant_it->second;
-    auto it = tenant_state.metadata.find(object_id.user_key);
-    if (it == tenant_state.metadata.end()) {
+    MetadataAccessorRW accessor(this, object_id, MetadataAccessorRW::AsIs{});
+    if (!accessor.IsPublished()) {
         promotion_candidates_.ForgetLocked(object_id.tenant_id,
                                            object_id.user_key);
         return;
     }
     promotion_candidates_.EraseLocked(object_id.tenant_id, object_id.user_key,
-                                      it->second.state);
+                                      accessor.GetState());
 }
 
 void MasterService::BackoffCandidate(const ObjectIdentity& object_id,
                                      PromotionQueueResult result) {
-    MetadataShardAccessorRW shard(
-        this, getShardIndex(object_id.tenant_id, object_id.user_key));
-    auto tenant_it = shard->tenants.find(object_id.tenant_id);
-    if (tenant_it == shard->tenants.end()) return;
-    auto& tenant_state = tenant_it->second;
-    auto it = tenant_state.metadata.find(object_id.user_key);
-    if (it == tenant_state.metadata.end()) {
+    MetadataAccessorRW accessor(this, object_id, MetadataAccessorRW::AsIs{});
+    if (!accessor.IsPublished()) {
         promotion_candidates_.ForgetLocked(object_id.tenant_id,
                                            object_id.user_key);
         return;
     }
     promotion_candidates_.BackoffLocked(object_id.tenant_id, object_id.user_key,
-                                        it->second.state, result);
+                                        accessor.GetState(), result);
 }
 
 void MasterService::ClearCandidatesForReload() {
@@ -9097,26 +9098,21 @@ size_t MasterService::RunPromotionCandidateRetry() {
              promotion_candidates_.Due(now, kPromotionRetryBatchSize)) {
             ObjectIdentity object_id{.tenant_id = std::move(tenant_id),
                                      .user_key = std::move(key)};
-            MetadataShardAccessorRW shard(
-                this, getShardIndex(object_id.tenant_id, object_id.user_key));
-            auto tenant_it = shard->tenants.find(object_id.tenant_id);
-            auto it = tenant_it == shard->tenants.end()
-                          ? ObjectMap::iterator{}
-                          : tenant_it->second.metadata.find(object_id.user_key);
-            if (tenant_it == shard->tenants.end() ||
-                it == tenant_it->second.metadata.end()) {
+            MetadataAccessorRW accessor(this, object_id,
+                                        MetadataAccessorRW::AsIs{});
+            if (!accessor.IsPublished()) {
                 promotion_candidates_.ForgetLocked(object_id.tenant_id,
                                                    object_id.user_key);
                 continue;
             }
-            auto& metadata = it->second.metadata;
-            auto& state = it->second.state;
+            auto& metadata = accessor.Get();
+            auto& state = accessor.GetState();
             if (!promotion_candidates_.DueLocked(
                     object_id.tenant_id, object_id.user_key, state, now)) {
                 continue;
             }
 
-            // Quick pre-filter under shard lock to avoid adding
+            // Quick pre-filter under the key's lock to avoid adding
             // candidates that are obviously ineligible.
             if (!metadata.IsValid() || state.is_processing ||
                 state.promotion_task ||
@@ -9177,22 +9173,17 @@ void MasterService::CleanupExpiredDynamicReplicationState() {
     }
     const int64_t now_ms = DynamicReplicationController::NowMs();
     // Only the keys a pending task was issued for are looked at, not every
-    // object. Each is resolved again under its shard lock: since it was
-    // indexed, its task may have started or been dropped, or its object may be
-    // gone.
+    // object. Each is resolved again under its own lock: since it was indexed,
+    // its task may have started or been dropped, or its object may be gone.
     for (const auto& [tenant_id, key] : dynamic_replication_.PendingKeys()) {
-        MetadataShardAccessorRW shard(this, getShardIndex(tenant_id, key));
-        auto tenant_it = shard->tenants.find(tenant_id);
-        auto object_it = tenant_it == shard->tenants.end()
-                             ? ObjectMap::iterator{}
-                             : tenant_it->second.metadata.find(key);
-        if (tenant_it == shard->tenants.end() ||
-            object_it == tenant_it->second.metadata.end() ||
-            !object_it->second.state.dynamic_replication_pending) {
+        MetadataAccessorRW accessor(this, ObjectIdentity{tenant_id, key},
+                                    MetadataAccessorRW::AsIs{});
+        if (!accessor.IsPublished() ||
+            !accessor.GetState().dynamic_replication_pending) {
             dynamic_replication_.UnindexPendingLocked(tenant_id, key);
             continue;
         }
-        auto& state = object_it->second.state;
+        auto& state = accessor.GetState();
         if (!dynamic_replication_.PendingExpiredLocked(state, now_ms)) {
             continue;
         }
@@ -9967,10 +9958,9 @@ void MasterService::EvictionThreadFunc() {
             {
                 std::shared_lock<std::shared_mutex> shared_lock(
                     master_state_mutex_);
-                for (size_t i = 0; i < kNumShards; i++) {
-                    MetadataShardAccessorRW shard(this, i);
-                    DiscardExpiredProcessingReplicas(shard, now);
-                }
+                VisitTenants([&](const TenantId& tenant_id) {
+                    DiscardExpiredProcessingReplicas(tenant_id, now);
+                });
                 ReleaseExpiredDiscardedReplicas(now);
             }
             last_discard_time = now;
@@ -10028,311 +10018,247 @@ void MasterService::EvictionThreadFunc() {
 }
 
 void MasterService::DiscardExpiredProcessingReplicas(
-    MetadataShardAccessorRW& shard,
+    const TenantId& tenant_id,
     const std::chrono::system_clock::time_point& now) {
     std::list<DiscardedReplicas> discarded_replicas;
 
-    for (auto tenant_it = shard->tenants.begin();
-         tenant_it != shard->tenants.end();) {
-        auto& tenant_state = tenant_it->second;
-        auto& objects = tenant_state.metadata;
+    // Every task of the tenant lives on its own object, and the tenant lists
+    // the keys whose object carries one, so each pass below walks that list
+    // and holds one key at a time. Each key is resolved again as it is held:
+    // its work may have finished, or its object been torn down or replaced,
+    // since the list was taken, and a pass acts on the object it holds now.
+    const auto keys = InFlightKeys(tenant_id);
 
-        // Find the objects with work in flight once, so that each pass below
-        // walks only those. A pass that erases an object sets its entry to
-        // end(), and the passes after it skip the entry.
-        std::vector<ObjectMap::iterator> in_flight;
-        for (auto it = objects.begin(); it != objects.end(); ++it) {
-            if (it->second.state.HasWorkInFlight()) {
-                in_flight.push_back(it);
-            }
+    for (const auto& key : keys) {
+        MetadataAccessorRW accessor(this, ObjectIdentity{tenant_id, key},
+                                    MetadataAccessorRW::AsIs{});
+        if (!accessor.InProcessing()) {
+            continue;
         }
 
-        for (auto& it : in_flight) {
-            if (it == objects.end() || !it->second.state.is_processing) {
-                continue;
-            }
-
-            auto& metadata = it->second.metadata;
-            if (!metadata.IsValid() ||
-                metadata.AllReplicas(&Replica::fn_is_completed)) {
-                metadata.ClearPendingSoftPinIfNoViableReplica();
-                metadata.ClearSessionTagIfNoViableReplica();
-                if (!metadata.IsValid()) {
-                    EraseMetadata(tenant_state, it, tenant_it->first,
-                                  QuotaEraseMode::kFull, &shard);
-                    it = objects.end();
-                } else {
-                    auto settle_result = SettlePrimaryWriteQuotaIfReady(
-                        GetBoundTenantQuotaHandle(tenant_state), metadata);
-                    if (settle_result) {
-                        it->second.state.is_processing = false;
-                    }
-                }
-                continue;
-            }
-
-            const auto ttl =
-                metadata.put_start_time + put_start_release_timeout_sec_;
-            if (ttl < now) {
-                const route::ObjectRef object{it->first, it->second.generation};
-                const bool had_complete_replica =
-                    metadata.HasReplica(&Replica::fn_is_completed);
-                // Predict post-discard descriptors WITHOUT mutating: drop
-                // PROCESSING replicas; keep COMPLETE replicas.
-                auto post_descriptors = BuildRemainingReplicaDescriptors(
-                    metadata, &Replica::fn_is_processing);
-                const bool would_invalidate = post_descriptors.empty();
-
-                if (had_complete_replica && enable_oplog_ &&
-                    ordered_oplog_writer_) {
-                    tl::expected<OpLogEntry, ErrorCode> persist_result;
-                    if (would_invalidate) {
-                        persist_result = AppendOpLogWithDurableFinalize(
-                            OpType::REMOVE, tenant_it->first.value(), it->first,
-                            {},
-                            enable_oplog_
-                                ? [this, object, ttl](
-                                      const OpLogEntry& durable_entry) {
-                                      FinalizeExpiredProcessingReplicasAfterDurable(
-                                          object, durable_entry, ttl);
-                                  }
-                                : DurableFinalizeCallback{});
-                    } else {
-                        persist_result = AppendOpLogWithDurableFinalize(
-                            OpType::PUT_END, tenant_it->first.value(), it->first,
-                            SerializeMetadataForOpLogFromReplicaDescriptors(
-                                metadata, post_descriptors),
-                            enable_oplog_
-                                ? [this, object, ttl](
-                                      const OpLogEntry& durable_entry) {
-                                      FinalizeExpiredProcessingReplicasAfterDurable(
-                                          object, durable_entry, ttl);
-                                  }
-                                : DurableFinalizeCallback{});
-                    }
-                    if (!persist_result) {
-                        LOG(WARNING) << "DiscardExpiredProcessingReplicas: "
-                                        "OpLog persist failed for key="
-                                     << it->first << ", err="
-                                     << static_cast<int>(persist_result.error())
-                                     << ", deferring discard";
-                        continue;
-                    }
-                    if (enable_oplog_) {
-                        continue;
-                    }
-                }
-
-                // Persist OK (or HA disabled / never published) — apply.
-                auto replicas =
-                    metadata.PopReplicas(&Replica::fn_is_processing);
-                metadata.ClearPendingSoftPinIfNoViableReplica();
-                metadata.ClearSessionTagIfNoViableReplica();
-                if (!replicas.empty()) {
-                    FreeDfsReplicas(it->first, replicas);
-                    discarded_replicas.emplace_back(std::move(replicas), ttl);
-                }
-                if (!metadata.IsValid()) {
-                    EraseMetadata(tenant_state, it, tenant_it->first,
-                                  QuotaEraseMode::kFull, &shard);
-                    it = objects.end();
-                } else {
-                    auto settle_result = SettlePrimaryWriteQuotaIfReady(
-                        GetBoundTenantQuotaHandle(tenant_state), metadata);
-                    if (settle_result) {
-                        it->second.state.is_processing = false;
-                    }
+        auto& metadata = accessor.Get();
+        if (!metadata.IsValid() ||
+            metadata.AllReplicas(&Replica::fn_is_completed)) {
+            metadata.ClearPendingSoftPinIfNoViableReplica();
+            metadata.ClearSessionTagIfNoViableReplica();
+            if (!metadata.IsValid()) {
+                accessor.Erase();
+            } else {
+                auto settle_result = SettlePrimaryWriteQuotaIfReady(
+                    accessor.QuotaAccount(), metadata);
+                if (settle_result) {
+                    accessor.EraseFromProcessing();
                 }
             }
+            continue;
         }
 
-        for (auto& metadata_it : in_flight) {
-            if (metadata_it == objects.end()) {
-                continue;
-            }
-            auto& task = metadata_it->second.state.replication_task;
-            if (!task) {
-                continue;
-            }
-
-            const auto ttl = task->start_time + put_start_release_timeout_sec_;
-            if (ttl > now || task->durable_cleanup_pending) {
-                continue;
-            }
-
-            auto& metadata = metadata_it->second.metadata;
-
+        const auto ttl =
+            metadata.put_start_time + put_start_release_timeout_sec_;
+        if (ttl < now) {
+            const route::ObjectRef object = accessor.GetRef();
             const bool had_complete_replica =
                 metadata.HasReplica(&Replica::fn_is_completed);
-            auto& replica_ids = task->replica_ids;
-
-            const auto target_pred = [&replica_ids](const Replica& r) {
-                return std::find(replica_ids.begin(), replica_ids.end(),
-                                 r.id()) != replica_ids.end();
-            };
-            // Predict post-discard descriptor list WITHOUT mutating: drop
-            // task target replicas; keep the rest of the COMPLETE replicas.
-            auto post_descriptors =
-                BuildRemainingReplicaDescriptors(metadata, target_pred);
+            // Predict post-discard descriptors WITHOUT mutating: drop
+            // PROCESSING replicas; keep COMPLETE replicas.
+            auto post_descriptors = BuildRemainingReplicaDescriptors(
+                metadata, &Replica::fn_is_processing);
             const bool would_invalidate = post_descriptors.empty();
 
             if (had_complete_replica && enable_oplog_ &&
                 ordered_oplog_writer_) {
-                task->durable_cleanup_pending = true;
-                tl::expected<OpLogEntry, ErrorCode> persist_result;
-                auto source_id = task->source_id;
-                auto target_ids = replica_ids;
-                auto dynamic_lease_id = task->dynamic_replication_lease_id;
-                auto dynamic_version_epoch =
-                    task->dynamic_replication_version_epoch;
-                if (would_invalidate) {
-                    persist_result = AppendOpLogWithDurableFinalize(
-                        OpType::REMOVE, tenant_it->first.value(),
-                        metadata_it->first, {},
-                        enable_oplog_
-                            ? [this, source_id,
-                               target_ids = std::move(target_ids),
-                               dynamic_lease_id, dynamic_version_epoch,
-                               ttl](const OpLogEntry& durable_entry) {
-                                  FinalizeExpiredReplicationTaskAfterDurable(
-                                      durable_entry, source_id, target_ids,
-                                      dynamic_lease_id, dynamic_version_epoch,
-                                      ttl);
-                              }
-                            : DurableFinalizeCallback{});
-                } else {
-                    persist_result = AppendOpLogWithDurableFinalize(
-                        OpType::PUT_END, tenant_it->first.value(),
-                        metadata_it->first,
-                        SerializeMetadataForOpLogFromReplicaDescriptors(
-                            metadata, post_descriptors),
-                        enable_oplog_
-                            ? [this, source_id,
-                               target_ids = std::move(target_ids),
-                               dynamic_lease_id, dynamic_version_epoch,
-                               ttl](const OpLogEntry& durable_entry) {
-                                  FinalizeExpiredReplicationTaskAfterDurable(
-                                      durable_entry, source_id, target_ids,
-                                      dynamic_lease_id, dynamic_version_epoch,
-                                      ttl);
-                              }
-                            : DurableFinalizeCallback{});
-                }
+                // The discard is applied once it is durable.
+                auto persist_result = AppendOpLogWithDurableFinalize(
+                    would_invalidate ? OpType::REMOVE : OpType::PUT_END,
+                    tenant_id.value(), key,
+                    would_invalidate
+                        ? std::string{}
+                        : SerializeMetadataForOpLogFromReplicaDescriptors(
+                              metadata, post_descriptors),
+                    [this, object, ttl](const OpLogEntry& durable_entry) {
+                        FinalizeExpiredProcessingReplicasAfterDurable(
+                            object, durable_entry, ttl);
+                    });
                 if (!persist_result) {
                     LOG(WARNING)
-                        << "DiscardExpiredProcessingReplicas: OpLog persist "
-                           "failed for replication task key="
-                        << metadata_it->first
+                        << "DiscardExpiredProcessingReplicas: "
+                           "OpLog persist failed for key="
+                        << key
                         << ", err=" << static_cast<int>(persist_result.error())
                         << ", deferring discard";
-                    task->durable_cleanup_pending = false;
-                    continue;
                 }
-                if (enable_oplog_) {
-                    continue;
-                }
+                continue;
             }
 
-            auto source = metadata.GetReplicaByID(task->source_id);
-            if (source != nullptr) {
-                source->dec_refcnt();
-            }
-
-            auto replicas =
-                PopReplicasWithCacheTotalAccounting(metadata, target_pred);
-            std::vector<ReplicaID> erased_replica_ids;
-            erased_replica_ids.reserve(replicas.size());
-            for (const auto& replica : replicas) {
-                erased_replica_ids.push_back(replica.id());
-            }
-            const bool dynamic_task =
-                task->dynamic_replication_lease_id != UUID{} ||
-                task->dynamic_replication_version_epoch != 0;
-            dynamic_replication_.RecordReplicaRemoval(metadata,
-                                                      erased_replica_ids);
+            // HA disabled or never published — apply.
+            auto replicas = metadata.PopReplicas(&Replica::fn_is_processing);
+            metadata.ClearPendingSoftPinIfNoViableReplica();
+            metadata.ClearSessionTagIfNoViableReplica();
             if (!replicas.empty()) {
-                FreeDfsReplicas(metadata_it->first, replicas);
+                FreeDfsReplicas(key, replicas);
                 discarded_replicas.emplace_back(std::move(replicas), ttl);
             }
-            if (dynamic_task) {
-                dynamic_replication_.ClearPendingLocked(
-                    tenant_it->first, metadata_it->first,
-                    metadata_it->second.state);
-            }
             if (!metadata.IsValid()) {
-                EraseMetadata(tenant_state, metadata_it, tenant_it->first,
-                              QuotaEraseMode::kFull, &shard);
-                metadata_it = objects.end();
+                accessor.Erase();
             } else {
-                ReleaseTenantQuota(GetBoundTenantQuotaHandle(tenant_state),
-                                   task->pending_quota_charge_bytes);
-                task.reset();
+                auto settle_result = SettlePrimaryWriteQuotaIfReady(
+                    accessor.QuotaAccount(), metadata);
+                if (settle_result) {
+                    accessor.EraseFromProcessing();
+                }
             }
         }
+    }
 
-        for (const auto& it : in_flight) {
-            if (it == objects.end()) {
-                continue;
-            }
-            const auto& key = it->first;
-            auto& record = it->second;
-            auto& task = record.state.offloading_task;
-            if (!task) {
-                continue;
-            }
-            const auto ttl = task->start_time + put_start_release_timeout_sec_;
-            if (ttl > now) {
-                continue;
-            }
-            auto source = record.metadata.GetReplicaByID(task->source_id);
-            if (source != nullptr) {
-                source->dec_refcnt();
-            }
-            LOG(WARNING) << "Offloading task expired for key: " << key
-                         << " tenant=" << tenant_it->first;
-            task.reset();
+    for (const auto& key : keys) {
+        MetadataAccessorRW accessor(this, ObjectIdentity{tenant_id, key},
+                                    MetadataAccessorRW::AsIs{});
+        if (!accessor.HasReplicationTask()) {
+            continue;
+        }
+        auto& task = accessor.GetState().replication_task;
+
+        const auto ttl = task->start_time + put_start_release_timeout_sec_;
+        if (ttl > now || task->durable_cleanup_pending) {
+            continue;
         }
 
-        for (const auto& it : in_flight) {
-            if (it == objects.end()) {
-                continue;
+        auto& metadata = accessor.Get();
+
+        const bool had_complete_replica =
+            metadata.HasReplica(&Replica::fn_is_completed);
+        auto& replica_ids = task->replica_ids;
+
+        const auto target_pred = [&replica_ids](const Replica& r) {
+            return std::find(replica_ids.begin(), replica_ids.end(), r.id()) !=
+                   replica_ids.end();
+        };
+        // Predict post-discard descriptor list WITHOUT mutating: drop
+        // task target replicas; keep the rest of the COMPLETE replicas.
+        auto post_descriptors =
+            BuildRemainingReplicaDescriptors(metadata, target_pred);
+        const bool would_invalidate = post_descriptors.empty();
+
+        if (had_complete_replica && enable_oplog_ && ordered_oplog_writer_) {
+            // The discard is applied once it is durable.
+            task->durable_cleanup_pending = true;
+            auto persist_result = AppendOpLogWithDurableFinalize(
+                would_invalidate ? OpType::REMOVE : OpType::PUT_END,
+                tenant_id.value(), key,
+                would_invalidate
+                    ? std::string{}
+                    : SerializeMetadataForOpLogFromReplicaDescriptors(
+                          metadata, post_descriptors),
+                [this, source_id = task->source_id, target_ids = replica_ids,
+                 dynamic_lease_id = task->dynamic_replication_lease_id,
+                 dynamic_version_epoch =
+                     task->dynamic_replication_version_epoch,
+                 ttl](const OpLogEntry& durable_entry) {
+                    FinalizeExpiredReplicationTaskAfterDurable(
+                        durable_entry, source_id, target_ids, dynamic_lease_id,
+                        dynamic_version_epoch, ttl);
+                });
+            if (!persist_result) {
+                LOG(WARNING)
+                    << "DiscardExpiredProcessingReplicas: OpLog persist "
+                       "failed for replication task key="
+                    << key
+                    << ", err=" << static_cast<int>(persist_result.error())
+                    << ", deferring discard";
+                task->durable_cleanup_pending = false;
             }
-            const auto& key = it->first;
-            auto& record = it->second;
-            auto& task = record.state.promotion_task;
-            if (!task) {
-                continue;
-            }
-            const auto ttl = task->start_time + put_start_release_timeout_sec_;
-            if (ttl > now) {
-                continue;
-            }
-            auto source = record.metadata.GetReplicaByID(task->source_id);
-            if (source != nullptr) {
-                source->dec_refcnt();
-            }
-            if (task->alloc_id != 0) {
-                const ReplicaID alloc_id = task->alloc_id;
-                EraseReplicasWithCacheTotalAccounting(
-                    record.metadata, [alloc_id](const Replica& replica) {
-                        return replica.id() == alloc_id;
-                    });
-            }
-            ReleaseTenantQuota(
-                GetBoundTenantQuotaHandle(tenant_state),
-                std::exchange(task->pending_quota_charge_bytes, 0));
-            LOG(WARNING) << "Promotion task expired for key: " << key;
-            task.reset();
-            promotion_in_flight_.fetch_sub(1, std::memory_order_relaxed);
-            MasterMetricManager::instance().dec_promotion_in_flight();
-            MasterMetricManager::instance().inc_promotion_expired();
+            continue;
         }
 
-        if (tenant_state.Empty()) {
-            tenant_it = shard->tenants.erase(tenant_it);
+        auto source = metadata.GetReplicaByID(task->source_id);
+        if (source != nullptr) {
+            source->dec_refcnt();
+        }
+
+        auto replicas =
+            PopReplicasWithCacheTotalAccounting(metadata, target_pred);
+        std::vector<ReplicaID> erased_replica_ids;
+        erased_replica_ids.reserve(replicas.size());
+        for (const auto& replica : replicas) {
+            erased_replica_ids.push_back(replica.id());
+        }
+        const bool dynamic_task =
+            task->dynamic_replication_lease_id != UUID{} ||
+            task->dynamic_replication_version_epoch != 0;
+        dynamic_replication_.RecordReplicaRemoval(metadata, erased_replica_ids);
+        if (!replicas.empty()) {
+            FreeDfsReplicas(key, replicas);
+            discarded_replicas.emplace_back(std::move(replicas), ttl);
+        }
+        if (dynamic_task) {
+            dynamic_replication_.ClearPendingLocked(tenant_id, key,
+                                                    accessor.GetState());
+        }
+        if (!metadata.IsValid()) {
+            accessor.Erase();
         } else {
-            ++tenant_it;
+            ReleaseTenantQuota(accessor.QuotaAccount(),
+                               task->pending_quota_charge_bytes);
+            task.reset();
         }
+    }
+
+    for (const auto& key : keys) {
+        MetadataAccessorRW accessor(this, ObjectIdentity{tenant_id, key},
+                                    MetadataAccessorRW::AsIs{});
+        if (!accessor.IsPublished()) {
+            continue;
+        }
+        auto& task = accessor.GetState().offloading_task;
+        if (!task) {
+            continue;
+        }
+        const auto ttl = task->start_time + put_start_release_timeout_sec_;
+        if (ttl > now) {
+            continue;
+        }
+        auto source = accessor.Get().GetReplicaByID(task->source_id);
+        if (source != nullptr) {
+            source->dec_refcnt();
+        }
+        LOG(WARNING) << "Offloading task expired for key: " << key
+                     << " tenant=" << tenant_id;
+        task.reset();
+    }
+
+    for (const auto& key : keys) {
+        MetadataAccessorRW accessor(this, ObjectIdentity{tenant_id, key},
+                                    MetadataAccessorRW::AsIs{});
+        if (!accessor.IsPublished()) {
+            continue;
+        }
+        auto& metadata = accessor.Get();
+        auto& task = accessor.GetState().promotion_task;
+        if (!task) {
+            continue;
+        }
+        const auto ttl = task->start_time + put_start_release_timeout_sec_;
+        if (ttl > now) {
+            continue;
+        }
+        auto source = metadata.GetReplicaByID(task->source_id);
+        if (source != nullptr) {
+            source->dec_refcnt();
+        }
+        if (task->alloc_id != 0) {
+            const ReplicaID alloc_id = task->alloc_id;
+            EraseReplicasWithCacheTotalAccounting(
+                metadata, [alloc_id](const Replica& replica) {
+                    return replica.id() == alloc_id;
+                });
+        }
+        ReleaseTenantQuota(accessor.QuotaAccount(),
+                           std::exchange(task->pending_quota_charge_bytes, 0));
+        LOG(WARNING) << "Promotion task expired for key: " << key;
+        task.reset();
+        promotion_in_flight_.fetch_sub(1, std::memory_order_relaxed);
+        MasterMetricManager::instance().dec_promotion_in_flight();
+        MasterMetricManager::instance().inc_promotion_expired();
     }
 
     if (!discarded_replicas.empty()) {
@@ -10966,6 +10892,12 @@ void MasterService::BatchEvict(double evict_ratio_target,
     size_t start_idx = randomIndex(kNumShards);
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
 
+    // Writes that expired before they finished go first, so the census below
+    // counts what is left.
+    VisitTenants([&](const TenantId& tenant_id) {
+        DiscardExpiredProcessingReplicas(tenant_id, now);
+    });
+
     // ===== Phase 1: Parallel candidate census =====
     // N threads each scan a batch of shards. For selective ratios only the
     // lease timestamps are collected here; full tenant/key identities are
@@ -11003,7 +10935,6 @@ void MasterService::BatchEvict(double evict_ratio_target,
             size_t s_end = std::min(s_start + shards_per_thread, kNumShards);
             for (size_t s = s_start; s < s_end; s++) {
                 MetadataShardAccessorRW shard(this, s);
-                DiscardExpiredProcessingReplicas(shard, now);
 
                 size_t shard_metadata_count = 0;
                 size_t shard_evictable_count = 0;
@@ -11510,11 +11441,14 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
                replica.get_refcnt() == 0;
     };
 
+    VisitTenants([&](const TenantId& tenant_id) {
+        DiscardExpiredProcessingReplicas(tenant_id, now);
+    });
+
     size_t start_idx = randomIndex(metadata_shards_.size());
     for (size_t i = 0; i < metadata_shards_.size(); i++) {
         MetadataShardAccessorRW shard(
             this, (start_idx + i) % metadata_shards_.size());
-        DiscardExpiredProcessingReplicas(shard, now);
         for (const auto& [tenant_id, tenant_state] : shard->tenants) {
             object_count += tenant_state.metadata.size();
         }

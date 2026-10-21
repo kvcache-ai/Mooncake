@@ -1613,11 +1613,9 @@ class MasterService {
     // when none is left valid.
     void CleanupInvalidMemoryReplicas(MetadataAccessorRW& accessor);
 
-    /**
-     * @brief Helper to discard expired processing keys.
-     */
+    // Discards the tenant's expired processing replicas and expired tasks.
     void DiscardExpiredProcessingReplicas(
-        MetadataShardAccessorRW& shard,
+        const TenantId& tenant_id,
         const std::chrono::system_clock::time_point& now);
     void FreeDfsReplicas(const std::string& key,
                          std::span<const Replica> replicas);
@@ -2052,6 +2050,14 @@ class MasterService {
         const TenantId& tenant_id) const;
     [[nodiscard]] TenantCursor<LockMode::kWrite> WriteCursor(
         const TenantId& tenant_id);
+
+    // The tenant's keys whose object carries work in flight (see
+    // route::ObjectState::HasWorkInFlight), as a snapshot to resolve again: the
+    // work can finish, or the object be torn down or replaced, once the walk
+    // has moved on. Until the store moves to per-tenant routes this walks
+    // every object of the tenant.
+    [[nodiscard]] std::vector<std::string> InFlightKeys(
+        const TenantId& tenant_id) const;
 
     // Calls `visit` with each tenant that holds an object when the walk
     // starts, holding no lock, so `visit` may reach any key. A tenant that

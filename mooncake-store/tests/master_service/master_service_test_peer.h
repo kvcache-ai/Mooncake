@@ -71,6 +71,9 @@ class MasterServiceTestPeer {
     void VisitTenants(const std::function<void(const TenantId&)>& visit) const {
         service_.VisitTenants(visit);
     }
+    std::vector<std::string> InFlightKeys(const TenantId& tenant_id) const {
+        return service_.InFlightKeys(tenant_id);
+    }
 
     // Enable epoch bookkeeping without starting a live KV event publisher.
     void SetKvTenantEpochTrackingForTesting(bool enabled);
@@ -376,9 +379,9 @@ class MasterServiceTestPeer {
     }
 
     void DiscardExpiredProcessingReplicas(
-        MetadataShardAccessorRW& shard,
+        const TenantId& tenant_id,
         const std::chrono::system_clock::time_point& now) {
-        service_.DiscardExpiredProcessingReplicas(shard, now);
+        service_.DiscardExpiredProcessingReplicas(tenant_id, now);
     }
 
     uint32_t DynamicReplicationAdmissionMinHits() const {
