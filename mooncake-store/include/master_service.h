@@ -1001,6 +1001,15 @@ class MasterService {
     tl::expected<size_t, ErrorCode> InstallLegacyStandbyObjects(
         LegacyRestoreContext& ctx);
 
+    // A standby object whose replicas are built and that waits to be
+    // published under its own tenant and key.
+    struct PreparedObject;
+    // Publishes each of `objects` and records the publication in `installed`.
+    // Publishes nothing if a key already holds an object when it starts.
+    tl::expected<void, ErrorCode> PublishRestoredObjects(
+        std::vector<PreparedObject>& objects,
+        std::vector<std::pair<TenantId, route::ObjectRef>>& installed);
+
     // A restored local-disk replica reads only while its owner has a liveness
     // record; share the existing one or stage a fresh record for install.
     std::shared_ptr<ClientLivenessRecord> RecordRestoreKnownOwner(

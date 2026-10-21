@@ -1223,15 +1223,8 @@ tl::expected<TenantId, ErrorCode> MasterService::ResolveTenantIdForWriteLocked(
 }
 
 bool MasterService::TenantHasObjects(const TenantId& tenant_id) const {
-    for (size_t i = 0; i < kNumShards; ++i) {
-        MetadataShardAccessorRO shard(this, i);
-        auto tenant_it = shard->tenants.find(tenant_id);
-        if (tenant_it != shard->tenants.end() &&
-            !tenant_it->second.metadata.empty()) {
-            return true;
-        }
-    }
-    return false;
+    auto cursor = ReadCursor(tenant_id);
+    return cursor.begin() != cursor.end();
 }
 
 uint64_t MasterService::CompletedMemoryQuotaCharge(
@@ -1342,43 +1335,40 @@ void MasterService::RebuildTenantQuotaUsageFromMetadata() {
         return;
     }
 
+    // Every usage is computed before any ledger changes, so a tenant past the
+    // accounting range aborts the rebuild with nothing half-applied.
     TenantQuotaUsageMap usage;
-    for (size_t i = 0; i < kNumShards; ++i) {
-        MetadataShardAccessorRO shard(this, i);
-        for (const auto& [tenant_id, tenant_state] : shard->tenants) {
-            for (const auto& [_, record] : tenant_state.metadata) {
-                const auto& metadata = record.metadata;
-                auto& charged_bytes = usage[tenant_id];
-                const uint64_t charge = CompletedMemoryQuotaCharge(metadata);
-                if (charge > TenantQuotaAccount::kMaxChargedBytes ||
-                    charged_bytes >
-                        TenantQuotaAccount::kMaxChargedBytes - charge) {
-                    throw std::overflow_error(
-                        "rebuilt tenant quota exceeds 2^63 - 1 bytes");
-                }
-                charged_bytes += charge;
+    VisitTenants([&](const TenantId& tenant_id) {
+        uint64_t charged_bytes = 0;
+        for (auto object : ReadCursor(tenant_id)) {
+            const uint64_t charge =
+                CompletedMemoryQuotaCharge(object.metadata());
+            if (charge > TenantQuotaAccount::kMaxChargedBytes ||
+                charged_bytes > TenantQuotaAccount::kMaxChargedBytes - charge) {
+                throw std::overflow_error(
+                    "rebuilt tenant quota exceeds 2^63 - 1 bytes");
             }
+            charged_bytes += charge;
         }
-    }
+        usage.emplace(tenant_id, charged_bytes);
+    });
 
-    for (size_t i = 0; i < kNumShards; ++i) {
-        MetadataShardAccessorRW shard(this, i);
-        for (auto& [tenant_id, tenant_state] : shard->tenants) {
-            tenant_state.quota_account =
-                &tenant_quota_manager_.AccountFor(tenant_id);
-            for (auto& [key, record] : tenant_state.metadata) {
-                auto& metadata = record.metadata;
-                auto rebuild_result = metadata.quota_ledger.Rebuild(
-                    tenant_state.quota_account,
-                    CompletedMemoryQuotaCharge(metadata));
-                if (!rebuild_result) {
-                    throw std::runtime_error(
-                        "failed to rebuild object tenant quota ledger for " +
-                        tenant_id.value() + "/" + key);
-                }
+    // Then every object's ledger is reset to what its replicas charge; the
+    // accounts themselves are rebuilt by the quota manager below.
+    VisitTenants([&](const TenantId& tenant_id) {
+        const TenantQuotaHandle account =
+            &tenant_quota_manager_.AccountFor(tenant_id);
+        for (auto object : WriteCursor(tenant_id)) {
+            ObjectMetadata& metadata = object.metadata();
+            auto rebuild_result = metadata.quota_ledger.Rebuild(
+                account, CompletedMemoryQuotaCharge(metadata));
+            if (!rebuild_result) {
+                throw std::runtime_error(
+                    "failed to rebuild object tenant quota ledger for " +
+                    tenant_id.value() + "/" + object.key());
             }
         }
-    }
+    });
 
     tenant_quota_manager_.RebuildUsageOrThrow(usage);
 }
@@ -3206,7 +3196,7 @@ std::pair<TenantId, std::string> ResolveStandbyObject(
 
 }  // namespace
 
-struct PreparedObject {
+struct MasterService::PreparedObject {
     const StandbyObjectEntry* entry;
     TenantId tenant_id;
     std::string user_key;
@@ -3233,7 +3223,7 @@ struct MasterService::LegacyRestoreContext {
     size_t& already_existing_count;
     std::vector<std::pair<TenantId, std::string>>& repair_remove_keys;
     std::vector<std::pair<TenantId, std::string>>& repair_canonical_keys;
-    std::vector<std::tuple<size_t, TenantId, std::string>>& installed_keys;
+    std::vector<std::pair<TenantId, route::ObjectRef>>& installed;
     std::unordered_map<UUID, std::shared_ptr<ClientLivenessRecord>,
                        boost::hash<UUID>>& new_known_owner_records;
 
@@ -3241,7 +3231,6 @@ struct MasterService::LegacyRestoreContext {
         const StandbyObjectEntry* entry;
         TenantId tenant_id;
         std::string user_key;
-        size_t shard_idx;
     };
     std::vector<AcceptedEntry> accepted;
     std::unordered_set<std::string> object_ids;
@@ -3251,7 +3240,7 @@ struct MasterService::LegacyRestoreContext {
         std::vector<std::tuple<uintptr_t, uint64_t, size_t, size_t>>>
         pending_ranges;
     std::unordered_map<size_t, std::unordered_set<size_t>> discarded_replicas;
-    std::unordered_map<size_t, std::vector<PreparedObject>> objects_by_shard;
+    std::vector<PreparedObject> prepared;
 };
 
 void MasterService::NoteLegacyStandbyRejection(LegacyRestoreContext& ctx,
@@ -3291,16 +3280,10 @@ tl::expected<void, ErrorCode> MasterService::ValidateLegacyStandbyEntries(
             NoteLegacyStandbyRejection(ctx, entry, "duplicate_object");
             continue;
         }
-        const size_t existing_shard_idx = getShardIndex(tenant_id, user_key);
-        {
-            MetadataShardAccessorRO existing_shard(this, existing_shard_idx);
-            auto existing_tenant = existing_shard->tenants.find(tenant_id);
-            if (existing_tenant != existing_shard->tenants.end() &&
-                existing_tenant->second.metadata.contains(user_key)) {
-                NoteLegacyStandbyRejection(ctx, entry, "object_already_exists");
-                ++ctx.already_existing_count;
-                continue;
-            }
+        if (MetadataAccessorRO(this, {tenant_id, user_key}).IsPublished()) {
+            NoteLegacyStandbyRejection(ctx, entry, "object_already_exists");
+            ++ctx.already_existing_count;
+            continue;
         }
         bool valid = true;
         // (segment, address, size, descriptor index) for this object's
@@ -3342,12 +3325,9 @@ tl::expected<void, ErrorCode> MasterService::ValidateLegacyStandbyEntries(
         if (!valid) {
             continue;
         }
-        // Routing is decoupled from groups: metadata always lands on the
-        // (tenant, key) shard, group membership lives in group_domain_.
-        const auto shard_idx = getShardIndex(tenant_id, user_key);
         const size_t owner = ctx.accepted.size();
         ctx.accepted.push_back(
-            {&entry, std::move(tenant_id), std::move(user_key), shard_idx});
+            {&entry, std::move(tenant_id), std::move(user_key)});
         for (const auto& [segment, addr, size, desc_idx] : object_ranges) {
             ctx.pending_ranges[segment].emplace_back(addr, size, owner,
                                                      desc_idx);
@@ -3537,7 +3517,7 @@ tl::expected<void, ErrorCode> MasterService::ConstructLegacyStandbyReplicas(
         for (const auto& [segment_name, bytes] : object_bytes) {
             ctx.accounted_bytes[segment_name] += bytes;
         }
-        ctx.objects_by_shard[accepted_entry.shard_idx].push_back(
+        ctx.prepared.push_back(
             {accepted_entry.entry, std::move(accepted_entry.tenant_id),
              std::move(accepted_entry.user_key), std::move(replicas)});
     }
@@ -3547,10 +3527,7 @@ tl::expected<void, ErrorCode> MasterService::ConstructLegacyStandbyReplicas(
 
 tl::expected<size_t, ErrorCode> MasterService::InstallLegacyStandbyObjects(
     LegacyRestoreContext& ctx) {
-    size_t restored_count = 0;
-    for (const auto& [shard_idx, shard_objects] : ctx.objects_by_shard) {
-        restored_count += shard_objects.size();
-    }
+    const size_t restored_count = ctx.prepared.size();
     // A snapshot whose objects all fail to land is a failed restore, not
     // an empty cluster: reporting success here would let the supervisor
     // serve on zero state. Duplicates of already-served objects are the
@@ -3564,46 +3541,51 @@ tl::expected<size_t, ErrorCode> MasterService::InstallLegacyStandbyObjects(
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    for (const auto& [shard_idx, shard_objects] : ctx.objects_by_shard) {
-        MetadataShardAccessorRW shard(this, shard_idx);
-        for (const auto& object : shard_objects) {
-            auto tenant = shard->tenants.find(object.tenant_id);
-            if (tenant != shard->tenants.end() &&
-                tenant->second.metadata.contains(object.user_key)) {
-                return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
-            }
+    if (auto published = PublishRestoredObjects(ctx.prepared, ctx.installed);
+        !published) {
+        return tl::make_unexpected(published.error());
+    }
+    return restored_count;
+}
+
+tl::expected<void, ErrorCode> MasterService::PublishRestoredObjects(
+    std::vector<PreparedObject>& objects,
+    std::vector<std::pair<TenantId, route::ObjectRef>>& installed) {
+    for (const auto& object : objects) {
+        if (MetadataAccessorRO(this, {object.tenant_id, object.user_key})
+                .IsPublished()) {
+            return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
         }
     }
 
     const auto now = std::chrono::system_clock::now();
-    for (auto& [shard_idx, shard_objects] : ctx.objects_by_shard) {
-        MetadataShardAccessorRW shard(this, shard_idx);
-        for (auto& object : shard_objects) {
-            const auto& standby_meta = object.entry->metadata;
-            auto& tenant_state =
-                GetOrCreateTenantState(shard.get(), object.tenant_id);
-            auto [it, inserted] = tenant_state.metadata.emplace(
-                std::piecewise_construct,
-                std::forward_as_tuple(object.user_key),
-                std::forward_as_tuple(
-                    shard.NextGeneration(), standby_meta.client_id, now,
-                    standby_meta.size, std::move(object.replicas), std::nullopt,
-                    standby_meta.hard_pinned.value_or(false),
-                    standby_meta.data_type, standby_meta.group_id,
-                    object.tenant_id, object.user_key));
-            (void)inserted;
-            it->second.metadata.session_id =
-                standby_meta.session_id.value_or("");
-            if (!standby_meta.group_id.empty()) {
-                it->second.metadata.lease_ = RegisterGroupMember(
-                    object.tenant_id, object.user_key, standby_meta.group_id);
-            }
-            it->second.state.is_processing = false;
-            ctx.installed_keys.emplace_back(shard_idx, object.tenant_id,
-                                            object.user_key);
+    for (auto& object : objects) {
+        const auto& standby_meta = object.entry->metadata;
+        MetadataAccessorRW accessor(this, {object.tenant_id, object.user_key},
+                                    MetadataAccessorRW::CreateKey{});
+        if (accessor.IsPublished()) {
+            // The pass above found none, and a restore runs with every
+            // writer held off, so this is a key the objects name twice.
+            return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
         }
+        const route::Generation generation = accessor.Publish(
+            standby_meta.client_id, now, standby_meta.size,
+            std::move(object.replicas), std::nullopt,
+            standby_meta.hard_pinned.value_or(false), standby_meta.data_type,
+            standby_meta.group_id, object.tenant_id, object.user_key);
+        auto& metadata = accessor.Get();
+        metadata.session_id = standby_meta.session_id.value_or("");
+        if (!standby_meta.group_id.empty()) {
+            metadata.lease_ = RegisterGroupMember(
+                object.tenant_id, object.user_key, standby_meta.group_id);
+        }
+        // Counted like a LOCAL_DISK replica added, since erasing the object
+        // uncounts it.
+        accessor.OnDiskReplicaAdded(metadata);
+        installed.emplace_back(object.tenant_id,
+                               route::ObjectRef{object.user_key, generation});
     }
-    return restored_count;
+    return {};
 }
 
 tl::expected<void, ErrorCode> MasterService::SetSegmentStatus(
@@ -3823,15 +3805,14 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
     // the survivors.
     std::vector<std::pair<TenantId, std::string>> repair_remove_keys;
     std::vector<std::pair<TenantId, std::string>> repair_canonical_keys;
-    // (shard_idx, tenant, key) of everything this call installed, so a
-    // failed restore can roll its own state back before reporting the error.
-    std::vector<std::tuple<size_t, TenantId, std::string>> installed_keys;
+    // The publications this call installed, so a failed restore can roll its
+    // own state back before reporting the error.
+    std::vector<std::pair<TenantId, route::ObjectRef>> installed;
 
     const auto restore_chunk =
         [&](const std::vector<StandbyObjectEntry>& objects)
         -> tl::expected<void, ErrorCode> {
-        std::unordered_map<size_t, std::vector<PreparedObject>>
-            objects_by_shard;
+        std::vector<PreparedObject> prepared;
         std::unordered_set<std::string> chunk_object_ids;
         size_t chunk_skipped_objects = 0;
         for (const auto& entry : objects) {
@@ -3848,19 +3829,11 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
                     << tenant_id.value() << ", key=" << user_key;
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             }
-            const size_t shard_idx = getShardIndex(tenant_id, user_key);
-            {
-                MetadataShardAccessorRO existing_shard(this, shard_idx);
-                auto existing_tenant = existing_shard->tenants.find(tenant_id);
-                if (existing_tenant != existing_shard->tenants.end() &&
-                    existing_tenant->second.metadata.contains(user_key)) {
-                    LOG(ERROR)
-                        << "RestoreFromStandbySnapshot: object already exists, "
-                        << "tenant=" << tenant_id.value()
-                        << ", key=" << user_key;
-                    return tl::make_unexpected(
-                        ErrorCode::OBJECT_ALREADY_EXISTS);
-                }
+            if (MetadataAccessorRO(this, {tenant_id, user_key}).IsPublished()) {
+                LOG(ERROR)
+                    << "RestoreFromStandbySnapshot: object already exists, "
+                    << "tenant=" << tenant_id.value() << ", key=" << user_key;
+                return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
             }
             const auto& standby_meta = entry.metadata;
             std::vector<Replica> replicas;
@@ -4013,21 +3986,8 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
                 ++chunk_skipped_objects;
                 continue;
             }
-            objects_by_shard[shard_idx].push_back({&entry, std::move(tenant_id),
-                                                   std::move(user_key),
-                                                   std::move(replicas)});
-        }
-
-        for (const auto& [shard_idx, shard_objects] : objects_by_shard) {
-            MetadataShardAccessorRW shard(this, shard_idx);
-            for (const auto& object : shard_objects) {
-                auto tenant = shard->tenants.find(object.tenant_id);
-                if (tenant != shard->tenants.end() &&
-                    tenant->second.metadata.contains(object.user_key)) {
-                    return tl::make_unexpected(
-                        ErrorCode::OBJECT_ALREADY_EXISTS);
-                }
-            }
+            prepared.push_back({&entry, std::move(tenant_id),
+                                std::move(user_key), std::move(replicas)});
         }
 
         if (!bounded_restore) {
@@ -4046,34 +4006,9 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
             }
         }
 
-        const auto now = std::chrono::system_clock::now();
-        for (auto& [shard_idx, shard_objects] : objects_by_shard) {
-            MetadataShardAccessorRW shard(this, shard_idx);
-            for (auto& object : shard_objects) {
-                const auto& standby_meta = object.entry->metadata;
-                auto& tenant_state =
-                    GetOrCreateTenantState(shard.get(), object.tenant_id);
-                auto [it, inserted] = tenant_state.metadata.emplace(
-                    std::piecewise_construct,
-                    std::forward_as_tuple(object.user_key),
-                    std::forward_as_tuple(
-                        shard.NextGeneration(), standby_meta.client_id, now,
-                        standby_meta.size, std::move(object.replicas),
-                        std::nullopt, standby_meta.hard_pinned.value_or(false),
-                        standby_meta.data_type, standby_meta.group_id,
-                        object.tenant_id, object.user_key));
-                (void)inserted;
-                it->second.metadata.session_id =
-                    standby_meta.session_id.value_or("");
-                if (!standby_meta.group_id.empty()) {
-                    it->second.metadata.lease_ =
-                        RegisterGroupMember(object.tenant_id, object.user_key,
-                                            standby_meta.group_id);
-                }
-                it->second.state.is_processing = false;
-                installed_keys.emplace_back(shard_idx, object.tenant_id,
-                                            object.user_key);
-            }
+        if (auto published = PublishRestoredObjects(prepared, installed);
+            !published) {
+            return tl::make_unexpected(published.error());
         }
         restored_object_count += objects.size() - chunk_skipped_objects;
         skipped_stale_object_count += chunk_skipped_objects;
@@ -4086,7 +4021,7 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
             restored_allocators, restored_accounted_memory_bytes,
             rejected_count,      already_existing_count,
             repair_remove_keys,  repair_canonical_keys,
-            installed_keys,      new_known_owner_records};
+            installed,           new_known_owner_records};
         if (auto r = ValidateLegacyStandbyEntries(legacy_ctx); !r) {
             return tl::make_unexpected(r.error());
         }
@@ -4131,19 +4066,10 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
     // The exported memory gauges are only swapped in once the restore can no
     // longer fail, so rollback never has to undo a published metric delta.
     const auto rollback_restored_state = [&]() {
-        for (const auto& [shard_idx, tenant, key] : installed_keys) {
-            MetadataShardAccessorRW shard(this, shard_idx);
-            auto tenant_it = shard->tenants.find(tenant);
-            if (tenant_it == shard->tenants.end()) {
-                continue;
-            }
-            auto meta_it = tenant_it->second.metadata.find(key);
-            if (meta_it == tenant_it->second.metadata.end()) {
-                continue;
-            }
-            EraseMetadata(tenant_it->second, meta_it, tenant);
-            if (tenant_it->second.Empty()) {
-                shard->tenants.erase(tenant_it);
+        for (const auto& [tenant, ref] : installed) {
+            MetadataAccessorRW accessor(this, tenant, ref);
+            if (accessor.IsPublished()) {
+                accessor.Erase();
             }
         }
         standby_accounted_memory_bytes_ = prev_standby_accounted_memory_bytes;
@@ -4229,22 +4155,18 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
             repair_entries.push_back(std::move(entry));
         }
         for (const auto& [tenant, key] : repair_canonical_keys) {
-            const size_t shard_idx = getShardIndex(tenant, key);
-            MetadataShardAccessorRO shard(this, shard_idx);
-            auto tenant_it = shard->tenants.find(tenant);
+            MetadataAccessorRO accessor(this, {tenant, key});
             OpLogEntry entry;
             entry.tenant_id = tenant.value();
             entry.object_key = key;
-            if (tenant_it == shard->tenants.end() ||
-                !tenant_it->second.metadata.contains(key)) {
+            if (!accessor.IsPublished()) {
                 // Survived the conflict but failed construction (e.g.
                 // capacity): nothing installed, so the canonical state is
                 // absence. Repudiate the key outright.
                 entry.op_type = OpType::REMOVE;
             } else {
                 entry.op_type = OpType::PUT_END;
-                entry.payload = SerializeMetadataForOpLog(
-                    tenant_it->second.metadata.at(key).metadata);
+                entry.payload = SerializeMetadataForOpLog(accessor.Get());
             }
             repair_entries.push_back(std::move(entry));
         }
