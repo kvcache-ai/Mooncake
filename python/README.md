@@ -23,14 +23,17 @@ ranges = (StructuredMemberRange("values", 1024, 256, 0, alignment=4),)
 result = transfer.materialize_ranges_into(spec, ranges, {"values": destination})
 ```
 
-The range API only **borrows already-registered memory**. It does not register,
-unregister, release a lease, create a pool or copy through a Python staging
-buffer. Keep the lease, registration and exporting allocation alive, and do
+The member-payload path only **borrows already-registered destination memory**.
+For that destination it does not register, unregister, release a lease, create
+a pool or copy member bytes through a Python staging buffer. Manifest and
+metadata reads retain their existing path, including small temporary buffers,
+registration and metadata copies where needed. Keep the lease, registration
+and exporting allocation alive, and do
 not modify/release the destination until the synchronous call completes. A
 non-registered destination is rejected; existing whole-object APIs retain
 their automatic registration and fallback behavior.
 
-Validation precedes payload submission: selected members, nonempty ranges,
+Range validation precedes member-payload submission: selected members, nonempty ranges,
 natural element alignment, source/destination bounds, address-space overflow,
 and actual destination-address overlap across members. Encoded/serialized
 members and simultaneous member-slice plus byte-range requests are rejected.
