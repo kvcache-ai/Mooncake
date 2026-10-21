@@ -33,6 +33,7 @@
 #include <functional>
 #include <future>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 #include <utility>
@@ -286,6 +287,141 @@ std::shared_ptr<Config> makeMinimalP2PConfig() {
     cfg->set("max_failover_attempts", 3);
     return cfg;
 }
+
+// Pause at transport boundaries without adding a production test hook.
+class PublicationProbeTransport : public FakeTransport {
+   public:
+    PublicationProbeTransport() : FakeTransport(TCP) {}
+    std::function<void()> before_allocate;
+    std::function<void()> after_submit;
+
+    Status allocateSubBatch(SubBatchRef& batch, size_t max_size) override {
+        if (before_allocate) before_allocate();
+        return FakeTransport::allocateSubBatch(batch, max_size);
+    }
+    Status submitTransferTasks(SubBatchRef batch,
+                               const std::vector<Request>& requests) override {
+        CHECK_STATUS(FakeTransport::submitTransferTasks(batch, requests));
+        batch->notifyProgress();
+        if (after_submit) after_submit();
+        return Status::OK();
+    }
+};
+
+class SubmitPublication : public ::testing::TestWithParam<bool> {};
+
+TEST_P(SubmitPublication, PollCannotFailAnUnpublishedTask) {
+    auto cfg = makeMinimalP2PConfig();
+    cfg->set("enable_progress_worker", true);
+    cfg->set("enable_runtime_queue", GetParam());
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+    auto tcp = std::make_shared<PublicationProbeTransport>();
+    engine.swapTransportForTest(TCP, tcp);
+    std::vector<uint8_t> bytes(4096, 0x7A);
+    ASSERT_TRUE(engine.registerLocalMemory(bytes.data(), bytes.size()).ok());
+    auto batch = engine.allocateBatch(2);
+    Request first{};
+    first.opcode = Request::WRITE;
+    first.source = bytes.data();
+    first.target_id = LOCAL_SEGMENT_ID;
+    first.target_offset = reinterpret_cast<uint64_t>(bytes.data() + 1024);
+    first.length = 64;
+    first.transport_hint = TCP;
+    auto second = first;
+    second.source = bytes.data() + 128;
+    second.target_offset += 128;
+
+    std::promise<void> entered, release;
+    auto entered_future = entered.get_future();
+    auto released = release.get_future().share();
+    tcp->before_allocate = [&] {
+        entered.set_value();
+        EXPECT_EQ(released.wait_for(std::chrono::seconds(2)),
+                  std::future_status::ready);
+    };
+    auto submit = std::async(std::launch::async, [&] {
+        return engine.submitTransfer(batch, {first, second});
+    });
+    EXPECT_EQ(entered_future.wait_for(std::chrono::seconds(1)),
+              std::future_status::ready);
+    std::promise<void> polling;
+    auto polling_future = polling.get_future();
+    auto poll = std::async(std::launch::async, [&] {
+        polling.set_value();
+        TransferStatus status{PENDING, 0};
+        auto result = engine.getTransferStatus(batch, 1, status);
+        return std::make_pair(result, status);
+    });
+    polling_future.wait();
+    // Direct mode used to expose the second task with its default UNSPEC
+    // route while allocation for the first task was still in progress.
+    const bool returned_early = poll.wait_for(std::chrono::milliseconds(100)) ==
+                                std::future_status::ready;
+    std::optional<std::pair<Status, TransferStatus>> early;
+    if (returned_early) early = poll.get();
+    release.set_value();
+    EXPECT_TRUE(submit.get().ok());
+    if (early) {
+        EXPECT_TRUE(early->first.ok());
+        EXPECT_EQ(early->second.s, PENDING)
+            << "an unpublished task must not acquire a terminal status";
+    } else {
+        auto result = poll.get();
+        EXPECT_TRUE(result.first.ok());
+        EXPECT_EQ(result.second.s, COMPLETED);
+    }
+    EXPECT_TRUE(engine.waitTransferCompletion(batch).ok());
+    EXPECT_TRUE(engine.unregisterLocalMemory(bytes.data()).ok());
+}
+
+TEST_P(SubmitPublication, CompletionWakeCannotPrecedeSubmitHook) {
+    auto cfg = makeMinimalP2PConfig();
+    cfg->set("enable_progress_worker", true);
+    cfg->set("enable_runtime_queue", GetParam());
+    // Exercise the event-only contract: no periodic runtime queue fallback.
+    cfg->set("runtime_queue/progress_fallback_interval_us", 0UL);
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+    auto tcp = std::make_shared<PublicationProbeTransport>();
+    engine.swapTransportForTest(TCP, tcp);
+    std::vector<uint8_t> bytes(4096, 0x42);
+    ASSERT_TRUE(engine.registerLocalMemory(bytes.data(), bytes.size()).ok());
+    auto batch = engine.allocateBatch(1);
+    Request request{};
+    request.opcode = Request::WRITE;
+    request.source = bytes.data();
+    request.target_id = LOCAL_SEGMENT_ID;
+    request.target_offset = reinterpret_cast<uint64_t>(bytes.data());
+    request.length = bytes.size();
+    request.transport_hint = TCP;
+    Notification notification;
+    notification.msg = "published-hook";
+
+    tcp->after_submit = [&] {
+        // The transport has completed and emitted its only wake, but the
+        // engine has not installed this submit's notification hook yet.
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    };
+    ASSERT_TRUE(engine.submitTransfer(batch, {request}, notification).ok());
+    std::vector<Notification> received;
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+    while (received.empty() && std::chrono::steady_clock::now() < deadline) {
+        (void)engine.receiveNotification(received);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_EQ(received.size(), 1u);
+    if (!received.empty()) {
+        EXPECT_EQ(received.front().msg, notification.msg);
+    }
+    // Only poll manually after checking background notification delivery.
+    EXPECT_TRUE(engine.waitTransferCompletion(batch).ok());
+    EXPECT_TRUE(engine.unregisterLocalMemory(bytes.data()).ok());
+}
+
+INSTANTIATE_TEST_SUITE_P(DirectAndRuntimeQueue, SubmitPublication,
+                         ::testing::Bool());
 
 // ---------------------------------------------------------------------------
 // 1. Default config: worker is not constructed, notifyBatchMaybeReady is a

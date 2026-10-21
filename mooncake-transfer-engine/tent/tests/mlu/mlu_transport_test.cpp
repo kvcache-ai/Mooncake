@@ -52,7 +52,7 @@ int forced_location_queries = 0;
 int forced_pinned_frees = 0;
 std::function<void()> before_copy, before_record, before_inline,
     after_idle_query;
-}
+}  // namespace
 
 extern "C" cnrtRet_t __real_cnrtHostMalloc(void **, size_t);
 extern "C" cnrtRet_t __wrap_cnrtHostMalloc(void **ptr, size_t size) {
@@ -316,24 +316,15 @@ class QueueGate {
     bool released_ = false;
 };
 
-// Keep TCP's sub-batch unpublished long enough for the progress worker to
-// poll the still-pending MLU task and encounter the missing TCP transport.
+// Delay TCP publication while an earlier MLU task remains pending. A poller
+// must not inspect the batch until this submit has published all of its state.
 class DelayedTcpAllocation : public FaultProxyTransport {
    public:
     explicit DelayedTcpAllocation(std::shared_ptr<Transport> tcp)
         : FaultProxyTransport(std::move(tcp), {}) {}
 
     Status allocateSubBatch(SubBatchRef &batch, size_t max_size) override {
-        const auto before = pending_queries.load();
-        const auto deadline =
-            std::chrono::steady_clock::now() + std::chrono::seconds(2);
-        while (pending_queries.load() == before &&
-               std::chrono::steady_clock::now() < deadline)
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        EXPECT_GT(pending_queries.load(), before);
-        // Allow that worker pass to finish before TCP publishes its sub-batch
-        // and emits its own (event-only) wake.
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
         return FaultProxyTransport::allocateSubBatch(batch, max_size);
     }
 

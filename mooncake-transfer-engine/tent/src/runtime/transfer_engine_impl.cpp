@@ -2850,27 +2850,37 @@ Status TransferEngineImpl::submitTransfer(
     Batch* batch = nullptr;
     CHECK_STATUS(retainBatch(batch_id, batch));
     BatchRef batch_ref(*this, batch);
-    const size_t start_task_id = batch_ref.get()->task_list.size();
-    PreparedSubmit prepared;
-    CHECK_STATUS(prepareSubmit(batch_ref.get(), request_list, prepared,
-                               require_post_submit_cancellation));
+    {
+        // Publish the task list, sub-batch IDs and submit hook together with
+        // respect to polling, cancellation and other submits on this batch.
+        // Queue mode uses the global progress lock; direct mode uses its shard.
+        std::lock_guard<std::recursive_mutex> lk(progressLockFor(batch_id));
+        const size_t start_task_id = batch_ref.get()->task_list.size();
+        PreparedSubmit prepared;
+        CHECK_STATUS(prepareSubmit(batch_ref.get(), request_list, prepared,
+                                   require_post_submit_cancellation));
 
-    if (shouldQueueSubmit(prepared, owner_kind)) {
-        CHECK_STATUS(
-            enqueuePreparedSubmit(batch_ref.get(), prepared, owner_kind));
-        auto dispatch_status = refillDispatchWindow();
-        if (!dispatch_status.ok()) {
-            LOG(WARNING) << "runtime queue dispatch failed after admission: "
-                         << dispatch_status.ToString();
+        if (shouldQueueSubmit(prepared, owner_kind)) {
+            CHECK_STATUS(
+                enqueuePreparedSubmit(batch_ref.get(), prepared, owner_kind));
+            auto dispatch_status = refillDispatchWindow();
+            if (!dispatch_status.ok()) {
+                LOG(WARNING)
+                    << "runtime queue dispatch failed after admission: "
+                    << dispatch_status.ToString();
+            }
+            notifyRuntimeQueueReady();
+        } else {
+            CHECK_STATUS(commitPreparedSubmit(batch_ref.get(), prepared));
         }
-        notifyRuntimeQueueReady();
-    } else {
-        CHECK_STATUS(commitPreparedSubmit(batch_ref.get(), prepared));
-    }
 
-    if (notifi) {
-        addSubmitHook(batch_ref.get(), start_task_id, request_list, *notifi);
+        if (notifi) {
+            addSubmitHook(batch_ref.get(), start_task_id, request_list,
+                          *notifi);
+        }
     }
+    // releaseBatch may sweep deferred frees under progress_mutex_. Drop the
+    // shard first so this path preserves the global -> shard lock order.
     return batch_ref.release();
 }
 

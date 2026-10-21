@@ -649,8 +649,8 @@ class TransferEngineImpl {
     DeferredStageTeardown deferred_stage_teardown_;
     std::unique_ptr<ProgressWorker> progress_worker_;
 
-    // Per-batch hot paths (poll / free / retain) lock only the shard for
-    // that BatchID instead of progress_mutex_, so N threads polling N
+    // Per-batch hot paths (submit / poll / free / retain) lock only the shard
+    // for that BatchID instead of progress_mutex_, so N threads polling N
     // independent batches do not serialize.
     //
     // Exception: enable_runtime_queue=true keeps those paths on
