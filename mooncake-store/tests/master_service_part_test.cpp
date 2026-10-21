@@ -367,20 +367,12 @@ TEST_F(MasterServicePartTest, BatchEndCarriesEveryPartOfOneKey) {
     EXPECT_TRUE(IsReadable(key));
 }
 
-// An object of several parts refuses the operations that have no per-part form.
-TEST_F(MasterServicePartTest, UpsertRefusesAMultiPartObject) {
-    const std::string key = "upsert_parts_key";
-    ASSERT_TRUE(WriteWholePart(key, 0, 2));
-    auto refused = service_.UpsertStart(client_, key, TenantId::Default(), 1024,
-                                        OneMemoryReplica());
-    ASSERT_FALSE(refused.has_value());
-    EXPECT_EQ(ErrorCode::INVALID_PARAMS, refused.error());
-}
-
-// Copy, move, offload and promotion hand an object one replica set for all of
-// it. An object written as several parts is refused, rather than given a
-// replica on one part alone.
-TEST_F(MasterServicePartTest, RefusesReplicaSetTransitionsOnAPartedObject) {
+// The surfaces that have no per-part form refuse the object rather than act on
+// one part alone: copy and move hand it one replica set for all of it, and an
+// upsert has one length to write. Offload, promotion, dynamic replication and
+// the add-replica registration ask the same question through the same refusal;
+// these three are the ones a fixture drives without a background task.
+TEST_F(MasterServicePartTest, RefusesSurfacesThatHaveNoPerPartForm) {
     const std::string key = "parted_transition_key";
     ASSERT_TRUE(WriteWholePart(key, 0, 2));
     ASSERT_TRUE(WriteWholePart(key, 1, 2));
@@ -397,6 +389,11 @@ TEST_F(MasterServicePartTest, RefusesReplicaSetTransitionsOnAPartedObject) {
                                     "test_segment", target);
     ASSERT_FALSE(moved.has_value());
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, moved.error());
+
+    auto upserted = service_.UpsertStart(client_, key, TenantId::Default(),
+                                         1024, OneMemoryReplica());
+    ASSERT_FALSE(upserted.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, upserted.error());
 }
 
 // Removal acts on the whole object, and one whose parts are not all written is
