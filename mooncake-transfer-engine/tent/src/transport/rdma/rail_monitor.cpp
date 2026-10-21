@@ -299,7 +299,6 @@ void RailMonitor::abandonRecoveryProbe(uint64_t token) {
                            });
     if (it == rail_states_.end()) return;
     auto& st = it->second;
-    if (st.active_probe_token != token) return;
 
     st.active_probe_token = 0;
     if (st.last_probe_generation == metadata_generation_ &&

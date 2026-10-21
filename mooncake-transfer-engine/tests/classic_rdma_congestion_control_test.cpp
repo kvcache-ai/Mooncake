@@ -522,12 +522,15 @@ TEST(ClassicRdmaCongestionControlTest, LocalHandoffRebindsRouteOwner) {
         slice.length = 64;
         failed_adapter.prepare(&slice, path);
         std::vector<Transport::Slice *> queued{&slice};
+        ASSERT_EQ(failed_adapter.gate(queued), 1u);
+        ASSERT_TRUE(slice.rdma_congestion_control_permit.active());
         // Local failover retains the remote NIC path on the same slice.
         if (batch) {
             healthy_adapter.prepare(queued, path);
         } else {
             healthy_adapter.prepare(&slice, path);
         }
+        EXPECT_FALSE(slice.rdma_congestion_control_permit.active());
         EXPECT_EQ(healthy_adapter.gate(queued), 1u);
         healthy_adapter.releaseUnposted(&slice);
     }

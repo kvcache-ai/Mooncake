@@ -58,6 +58,25 @@ constexpr uint8_t kRedisDefaultDbIndex = 0;
 constexpr size_t kMaxReclaimAttempts = 4096;
 constexpr int kMaxHpTcpMetadataRefreshRetries = 1;
 
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+void initializeTaskCongestionObservation(
+    TaskInfo& owner, std::vector<TaskInfo>& tasks,
+    const std::vector<size_t>& public_task_ids) {
+    if (!owner.congestion_observation) {
+        owner.congestion_observation = std::make_shared<
+            adaptive_congestion_control::TaskCongestionObservation>(0, 0);
+    }
+    if (!owner.congestion_current_type) {
+        owner.congestion_current_type =
+            std::make_shared<std::atomic<TransportType>>(RDMA);
+    }
+    for (const auto task_id : public_task_ids) {
+        tasks[task_id].congestion_observation = owner.congestion_observation;
+        tasks[task_id].congestion_current_type = owner.congestion_current_type;
+    }
+}
+#endif
+
 TransportType currentTaskCongestionType(const TaskInfo& task) {
 #ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
     if (task.congestion_current_type) {
@@ -2309,26 +2328,9 @@ Status TransferEngineImpl::commitPreparedSubmit(
 #ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
             if (type == RDMA && transport->taskCongestionEnabled()) {
                 for (const auto physical_task_id : group) {
-                    auto& owner_task = batch->task_list[physical_task_id];
-                    if (!owner_task.congestion_observation) {
-                        owner_task.congestion_observation =
-                            std::make_shared<adaptive_congestion_control::
-                                                 TaskCongestionObservation>(0,
-                                                                            0);
-                    }
-                    if (!owner_task.congestion_current_type) {
-                        owner_task.congestion_current_type =
-                            std::make_shared<std::atomic<TransportType>>(RDMA);
-                    }
-                    for (const auto public_task_id :
-                         public_tasks_by_physical_owner.at(physical_task_id)) {
-                        batch->task_list[public_task_id]
-                            .congestion_observation =
-                            owner_task.congestion_observation;
-                        batch->task_list[public_task_id]
-                            .congestion_current_type =
-                            owner_task.congestion_current_type;
-                    }
+                    initializeTaskCongestionObservation(
+                        batch->task_list[physical_task_id], batch->task_list,
+                        public_tasks_by_physical_owner.at(physical_task_id));
                 }
             }
 #endif
@@ -2654,20 +2656,8 @@ Status TransferEngineImpl::dispatchQueuedOwner(QueueOwnerId owner_id) {
     task.sub_task_id = sub_batch->size();
 #ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
     if (task.type == RDMA && transport->taskCongestionEnabled()) {
-        if (!task.congestion_observation) {
-            task.congestion_observation = std::make_shared<
-                adaptive_congestion_control::TaskCongestionObservation>(0, 0);
-        }
-        if (!task.congestion_current_type) {
-            task.congestion_current_type =
-                std::make_shared<std::atomic<TransportType>>(RDMA);
-        }
-        for (const auto public_task_id : queued.public_task_ids) {
-            batch->task_list[public_task_id].congestion_observation =
-                task.congestion_observation;
-            batch->task_list[public_task_id].congestion_current_type =
-                task.congestion_current_type;
-        }
+        initializeTaskCongestionObservation(task, batch->task_list,
+                                            queued.public_task_ids);
     }
 #endif
     startTransportAttempt(task, task.type, std::chrono::steady_clock::now());
@@ -3525,17 +3515,9 @@ Status TransferEngineImpl::getTaskCongestionDetail(
     const auto& task = batch->task_list[task_id];
     detail = {};
     const TransportType current_type = currentTaskCongestionType(task);
-    detail.attempt_kind =
-        current_type == RDMA     ? TaskCongestionAttemptKind::kRdma
-        : current_type == UNSPEC ? TaskCongestionAttemptKind::kUnknown
-                                 : TaskCongestionAttemptKind::kOther;
 #ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
     if (task.congestion_observation) {
         detail = task.congestion_observation->detail();
-        detail.attempt_kind =
-            current_type == RDMA     ? TaskCongestionAttemptKind::kRdma
-            : current_type == UNSPEC ? TaskCongestionAttemptKind::kUnknown
-                                     : TaskCongestionAttemptKind::kOther;
         if (current_type == RDMA && task.status == COMPLETED) {
             detail.state = TaskCongestionState::kNormal;
             detail.resolved = true;
@@ -3546,6 +3528,10 @@ Status TransferEngineImpl::getTaskCongestionDetail(
         }
     }
 #endif
+    detail.attempt_kind =
+        current_type == RDMA     ? TaskCongestionAttemptKind::kRdma
+        : current_type == UNSPEC ? TaskCongestionAttemptKind::kUnknown
+                                 : TaskCongestionAttemptKind::kOther;
     return Status::OK();
 }
 

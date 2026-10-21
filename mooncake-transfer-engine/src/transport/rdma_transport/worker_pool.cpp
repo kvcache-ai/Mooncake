@@ -115,17 +115,14 @@ adaptive_congestion_control::TaskCongestionEvidence congestionEvidence(
 
 void recordCongestion(
     Transport::Slice *slice, adaptive_congestion_control::Snapshot snapshot,
-    const std::string &path, TaskCongestionReason reason, bool unavailable,
+    const std::string &path, TaskCongestionReason reason,
     std::optional<TaskCongestionFailureScope> scope = std::nullopt) {
     auto slice_id = congestionSliceId(slice);
     if (!slice_id) return;
     auto observation = congestionObservation(slice->task);
     auto evidence = congestionEvidence(path, snapshot, reason);
     evidence.failure_scope = scope;
-    const bool recorded = unavailable
-                              ? observation->avoid(*slice_id, 1, evidence)
-                              : observation->defer(*slice_id, 1, evidence);
-    if (recorded)
+    if (observation->defer(*slice_id, 1, evidence))
         slice->rdma_congestion_control_observed_blocked.store(
             true, std::memory_order_release);
 }
@@ -163,13 +160,7 @@ void ClassicRdmaCongestionControl::prepare(Transport::Slice *slice,
         return;
     }
     RouteState *next_route = route(peer_nic_path);
-    if (current_route != next_route &&
-        slice->rdma_congestion_control_permit.active()) {
-        adaptive_congestion_control::complete(
-            slice->rdma_congestion_control_permit,
-            adaptive_congestion_control::OutcomeClass::kDerivedFlush,
-            adaptive_congestion_control::FailureScope::kOperation);
-    }
+    if (current_route != next_route) releaseUnposted(slice);
     slice->rdma_congestion_control_route = next_route;
 }
 
@@ -185,13 +176,7 @@ void ClassicRdmaCongestionControl::prepare(SliceList &slices,
     for (auto *slice : slices) {
         auto *current_route =
             static_cast<RouteState *>(slice->rdma_congestion_control_route);
-        if (current_route != next_route &&
-            slice->rdma_congestion_control_permit.active()) {
-            adaptive_congestion_control::complete(
-                slice->rdma_congestion_control_permit,
-                adaptive_congestion_control::OutcomeClass::kDerivedFlush,
-                adaptive_congestion_control::FailureScope::kOperation);
-        }
+        if (current_route != next_route) releaseUnposted(slice);
         slice->rdma_congestion_control_route = next_route;
     }
 }
@@ -261,7 +246,7 @@ size_t ClassicRdmaCongestionControl::gate(SliceList &queued) {
             if (evidence.reason ==
                 adaptive_congestion_control::AdmissionReason::kWindow)
                 recordCongestion(slice, evidence.snapshot, state->peer_nic_path,
-                                 TaskCongestionReason::kByteWindow, false,
+                                 TaskCongestionReason::kByteWindow,
                                  evidence.domain ==
                                          adaptive_congestion_control::
                                              AdmissionDomain::kDevice
@@ -357,7 +342,7 @@ void ClassicRdmaCongestionControl::complete(Transport::Slice *slice,
                      adaptive_congestion_control::OutcomeClass::kRouteTimeout)
                 reason = TaskCongestionReason::kRouteTimeout;
             recordCongestion(
-                slice, route_after, state->peer_nic_path, reason, false,
+                slice, route_after, state->peer_nic_path, reason,
                 static_cast<TaskCongestionFailureScope>(result.scope));
         }
     }
@@ -1211,12 +1196,7 @@ void WorkerPool::performPostSend(int thread_id) {
 #endif
             for (auto *slice : entry.second)
                 slice->rdma.endpoint = endpoint.get();
-#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
-            endpoint->submitPostSendLimited(entry.second, failed_slice_list,
-                                            entry.second.size());
-#else
-        endpoint->submitPostSend(entry.second, failed_slice_list);
-#endif
+            endpoint->submitPostSend(entry.second, failed_slice_list);
 #ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
         }
 #endif
