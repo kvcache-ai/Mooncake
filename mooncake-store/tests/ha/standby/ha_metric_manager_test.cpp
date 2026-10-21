@@ -179,6 +179,14 @@ TEST_F(HAMetricManagerTest, TestIncWatchDisconnectionsAndAppliedEntries) {
     EXPECT_EQ(before_applied + 10, M().get_oplog_applied_entries_total());
 }
 
+TEST_F(HAMetricManagerTest, TestIncOpLogDroppedPutEnd) {
+    auto before = M().get_oplog_dropped_put_end_total();
+    M().inc_oplog_dropped_put_end();
+    EXPECT_EQ(before + 1, M().get_oplog_dropped_put_end_total());
+    M().inc_oplog_dropped_put_end(4);
+    EXPECT_EQ(before + 5, M().get_oplog_dropped_put_end_total());
+}
+
 TEST_F(HAMetricManagerTest, TestRecordOpLogEtcdWriteLatency) {
     const std::string count_name = "ha_oplog_etcd_write_latency_us_count";
     const std::string sum_name = "ha_oplog_etcd_write_latency_us_sum";
@@ -287,6 +295,8 @@ TEST_F(HAMetricManagerTest, TestSerializeMetrics) {
     // Basic fields should appear in the Prometheus text output
     EXPECT_NE(std::string::npos, text.find("ha_oplog_applied_sequence_id"));
     EXPECT_NE(std::string::npos, text.find("ha_oplog_standby_lag"));
+    // Kept alive: PutEnd drops OpLog records with no other trace (#4546).
+    EXPECT_NE(std::string::npos, text.find("ha_oplog_dropped_put_end_total"));
 }
 
 // Metrics whose setters had no production caller were removed rather than
@@ -301,7 +311,6 @@ TEST_F(HAMetricManagerTest, RetiredMetricsAreNotSerialized) {
              "ha_oplog_gap_resolve_success_total",
              "ha_oplog_etcd_write_failures_total",
              "ha_oplog_etcd_write_retries_total",
-             "ha_oplog_dropped_put_end_total",
          }) {
         EXPECT_EQ(std::string::npos, text.find(name)) << name;
     }
