@@ -29,6 +29,10 @@
 #include <string>
 #include <vector>
 
+#ifdef USE_CUDA
+#include <cuda_runtime.h>
+#endif
+
 #include "tent/common/config.h"
 #include "tent/common/types.h"
 #include "tent/runtime/segment.h"
@@ -59,6 +63,8 @@ class FakeTransport : public Transport {
     }
 
     std::atomic<int> submit_calls{0};
+    int warmup_calls = 0;
+    int registration_calls = 0;
     std::vector<uint64_t> submitted_device_masks;
     std::vector<std::string> submitted_qp_pools;
     std::vector<size_t> submitted_request_counts;
@@ -108,6 +114,7 @@ class FakeTransport : public Transport {
     }
 
     Status addMemoryBuffer(BufferDesc& desc, const MemoryOptions&) override {
+        ++registration_calls;
         desc.transports.push_back(self_type_);
         return Status::OK();
     }
@@ -131,7 +138,10 @@ class FakeTransport : public Transport {
         std::free(addr);
         return Status::OK();
     }
-    bool warmupMemory(void*, size_t) override { return false; }
+    bool warmupMemory(void*, size_t) override {
+        ++warmup_calls;
+        return false;
+    }
     const char* getName() const override {
         return self_type_ == RDMA ? "<fake-rdma>" : "<fake-tcp>";
     }
@@ -184,6 +194,42 @@ Request makeLocalWriteRequest(uint8_t* buf, size_t len) {
     r.length = len;
     return r;
 }
+
+#ifdef USE_CUDA
+TEST(TransportRegistration, ManagedMemoryNeverReachesWarmupOrRegistration) {
+    int count = 0;
+    if (cudaGetDeviceCount(&count) != cudaSuccess || count == 0) GTEST_SKIP();
+    TransferEngineImpl engine(makeMinimalP2PConfig());
+    ASSERT_TRUE(engine.available());
+    std::shared_ptr<FakeTransport> rdma, tcp;
+    installFakeRdmaAndTcp(engine, rdma, tcp);
+    void* ptr = nullptr;
+    ASSERT_EQ(cudaSuccess, cudaMallocManaged(&ptr, 4096));
+    std::shared_ptr<void> allocation(ptr, [](void* p) { cudaFree(p); });
+    for (const char* location : {"*", "cpu:0", "cuda:0"}) {
+        MemoryOptions options;
+        options.location = location;
+        EXPECT_FALSE(engine.registerLocalMemory({ptr}, {4096}, options).ok());
+    }
+    EXPECT_EQ(0, rdma->warmup_calls);
+    EXPECT_EQ(0, tcp->warmup_calls);
+    EXPECT_EQ(0, rdma->registration_calls);
+    EXPECT_EQ(0, tcp->registration_calls);
+    std::vector<char> host(4096);
+    ASSERT_TRUE(engine.registerLocalMemory(host.data(), host.size()).ok());
+    EXPECT_EQ(1, rdma->registration_calls);
+    EXPECT_EQ(1, tcp->registration_calls);
+    EXPECT_TRUE(engine.unregisterLocalMemory(host.data(), host.size()).ok());
+    void* device = nullptr;
+    ASSERT_EQ(cudaSuccess, cudaMalloc(&device, 4096));
+    std::shared_ptr<void> device_allocation(device,
+                                            [](void* p) { cudaFree(p); });
+    ASSERT_TRUE(engine.registerLocalMemory(device, 4096).ok());
+    EXPECT_EQ(2, rdma->registration_calls);
+    EXPECT_EQ(2, tcp->registration_calls);
+    EXPECT_TRUE(engine.unregisterLocalMemory(device, 4096).ok());
+}
+#endif
 
 // ---------------------------------------------------------------------------
 // 1. hint=RDMA / hint=TCP routing
