@@ -241,6 +241,7 @@ add_store_test(local_ssd_codec_test ha/snapshot/local_ssd_codec_test.cpp)
 add_store_test(store_resource_snapshot_codec_test
                ha/snapshot/store_resource_snapshot_codec_test.cpp)
 add_store_test(offset_allocator_test offset_allocator_test.cpp)
+add_store_test(crc32c_test crc32c_test.cpp)
 add_store_test(byte_size_test byte_size_test.cpp)
 add_store_test(network_test network_test.cpp)
 add_store_test(hugepage_config_test hugepage_config_test.cpp)
