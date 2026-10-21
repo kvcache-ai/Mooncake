@@ -138,11 +138,6 @@ struct ObjectMetadata {
     const bool hard_pinned{false};  // immutable, set at creation
     bool memory_cache_total_accounted{false};
     bool disk_cache_total_accounted{false};
-    // The sweep generation this object's dead handles were last dropped at.
-    // A write compares it with the master's current generation to know whether
-    // walking every replica for a released allocator can find anything: it
-    // cannot, until a sweep after that allocator was released has run.
-    uint64_t handle_generation{0};
     TenantQuotaLedger quota_ledger;
 
     struct DynamicReplicaRecord {

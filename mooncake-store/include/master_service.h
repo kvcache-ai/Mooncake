@@ -1700,9 +1700,6 @@ class MasterService {
             tl::expected<std::vector<Replica::Descriptor>, ErrorCode>(
                 bool* dfs_allocation_failed)>& admit)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
-    // The accessor's first step: drops the held object's memory replicas whose
-    // segment is gone, and the object with them when none is left valid.
-    void CleanupInvalidMemoryReplicas(MetadataAccessorRW& accessor);
 
     /**
      * @brief Helper to discard expired processing keys.
@@ -1817,10 +1814,6 @@ class MasterService {
         false};  // Set to trigger memory eviction when allocation fails
     std::atomic<bool> need_nof_eviction_{
         false};  // Set to trigger NoF eviction when allocation fails
-    // Bumped after every sweep that drops replicas with released allocators.
-    // An object records the generation it was last swept at, so a write can
-    // tell that walking its replicas cannot find a dead handle.
-    std::atomic<uint64_t> allocator_generation_{0};
     const double eviction_ratio_;                 // in range [0.0, 1.0]
     const double eviction_high_watermark_ratio_;  // in range [0.0, 1.0]
     // Per-tenant watermark as a fraction of each tenant's OWN effective quota.
@@ -1869,10 +1862,6 @@ class MasterService {
                            service_->getShardIndex(object_id_.tenant_id,
                                                    object_id_.user_key)) {
             Locate();
-            // Invalid memory replicas go first, which may tear the object down.
-            if (IsPublished()) {
-                service_->CleanupInvalidMemoryReplicas(*this);
-            }
         }
 
         struct CreateKey {};
@@ -1896,9 +1885,6 @@ class MasterService {
             Locate();
             if (IsPublished() && it_->second.generation != ref.generation) {
                 it_ = tenant_state_->metadata.end();
-            }
-            if (IsPublished()) {
-                service_->CleanupInvalidMemoryReplicas(*this);
             }
         }
 

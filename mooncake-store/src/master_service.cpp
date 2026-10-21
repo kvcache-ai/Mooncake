@@ -2055,80 +2055,6 @@ tl::expected<void, ErrorCode> MasterService::PersistStaleHandleCleanupForHA(
     return {};
 }
 
-void MasterService::CleanupInvalidMemoryReplicas(MetadataAccessorRW& accessor) {
-    // Only memory replicas are checked here, to avoid a lock order violation
-    // (client_mutex_ must be acquired before a metadata shard). local_disk
-    // replicas are cleaned up by ClearInvalidHandles() in ClientMonitorFunc.
-    if (enable_ha_ && enable_oplog_) {
-        return;
-    }
-    const TenantId& tenant_id = accessor.GetTenantId();
-    ObjectMetadata& metadata = accessor.Get();
-    // A replica loses its allocator when a segment goes away, and the sweep
-    // that follows that removal has already dropped every such replica from
-    // this table. An object already swept at the current generation therefore
-    // has none, which is what lets the walk below be skipped on an object of
-    // many parts instead of running once per part write.
-    const uint64_t generation =
-        allocator_generation_.load(std::memory_order_relaxed);
-    if (metadata.handle_generation == generation) {
-        return;
-    }
-    metadata.handle_generation = generation;
-    // This runs on every read-write access of an object, and everything below
-    // walks all of its replicas: the snapshot, the erasing scan and two quota
-    // sums, once per part. An object whose handles are all alive, which is what
-    // every access of a healthy object sees, is answered by one scan that stops
-    // at the first replica whose allocator is gone.
-    if (!metadata.HasReplica(&Replica::has_dead_handle)) {
-        // With no dead handle left, the only object that still has to go is one
-        // that holds no replica at all: it has no content and nothing to read.
-        if (!metadata.HasAnyReplicaWithValidHandle()) {
-            accessor.Erase();
-        }
-        return;
-    }
-    // Gate the snapshot on the publisher being live: this runs on every
-    // read-write metadata access, and the VisitReplicas walk plus vector
-    // allocation is pure overhead when KV events are off (the default).
-    const auto previous_kv_media = KvMediaSnapshot(metadata);
-    // Erase invalid memory replicas (those with unmounted segments). No
-    // client_mutex_ needed since we only check memory replicas.
-    const uint64_t before_charge =
-        enable_multi_tenants_ ? CompletedMemoryQuotaCharge(metadata) : 0;
-    std::vector<ReplicaID> removed_replica_ids;
-    EraseReplicasWithCacheTotalAccounting(
-        metadata,
-        [](const Replica& replica) {
-            // A replica whose allocator is gone answers false here; one whose
-            // segment is merely unavailable keeps its allocator, and dropping
-            // it would take the object with it.
-            return replica.has_dead_handle();
-        },
-        &removed_replica_ids);
-    CancelPromotionTaskForRemovedReplicas(accessor.QuotaAccount(), metadata,
-                                          accessor.GetState(),
-                                          removed_replica_ids);
-    const uint64_t after_charge =
-        enable_multi_tenants_ ? CompletedMemoryQuotaCharge(metadata) : 0;
-    if (enable_multi_tenants_ && before_charge > after_charge) {
-        auto release_result = metadata.quota_ledger.ReleaseCommitted(
-            accessor.QuotaAccount(), before_charge - after_charge);
-        if (!release_result) {
-            LOG(ERROR) << "tenant quota committed release mismatch tenant="
-                       << tenant_id.value() << ", key=" << accessor.GetKey()
-                       << ", bytes=" << before_charge - after_charge;
-        }
-    }
-    SyncKvObjectState(accessor.GetKey(), metadata, tenant_id,
-                      previous_kv_media);
-    // If no valid replicas remain, delete the whole object, and with it every
-    // task in flight for it.
-    if (!metadata.HasAnyReplicaWithValidHandle()) {
-        accessor.Erase();
-    }
-}
-
 MasterService::ObjectMap::iterator MasterService::EraseMetadata(
     TenantState& tenant_state, ObjectMap::iterator it,
     const TenantId& tenant_id) {
@@ -2616,10 +2542,6 @@ void MasterService::ClearInvalidHandles(
                 replica.has_stale_local_disk_client(retaining_clients)) &&
                replica.is_completed();
     });
-    // Every replica whose allocator was released has just been swept from the
-    // table, so an object it belonged to no longer holds a dead handle until
-    // the next sweep: the generation is what lets a write skip the walk.
-    allocator_generation_.fetch_add(1, std::memory_order_relaxed);
 }
 
 void MasterService::ClearLocalDiskHandlesOwnedBy(const UUID& owner) {
@@ -4938,9 +4860,12 @@ tl::expected<MasterService::PartReadOutcome, ErrorCode> MasterService::ReadPart(
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     // The object is readable only once every part holds a replica a reader can
-    // use, so a reader of one part waits for the whole object. A batch of items
-    // naming parts of one key asks this answer once and hands it in: the parts
-    // do not change under the shard lock the batch holds.
+    // use, so a reader of one part waits for the whole object. A block missing
+    // one rank's shard cannot be decoded, so "this block is usable" is the only
+    // answer a rank can act on; answering per part would move the same failure
+    // into the framework after the other shards were already gathered. A batch
+    // of items naming parts of one key asks this answer once and hands it in:
+    // the parts do not change under the shard lock the batch holds.
     const bool readable =
         object_readable.has_value() ? *object_readable : metadata.IsReadable();
     if (!readable) {
@@ -5974,6 +5899,9 @@ auto MasterService::PutStartLocked(
     -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
     if (accessor.IsPublished()) {
         auto& metadata = accessor.Get();
+        // The count is the only thing about the shape the master can check: the
+        // layout that produced it, and which (stage, rank) a part index stands
+        // for, belong to the key's own convention and are never sent here.
         if (metadata.PartCount() != part_count) {
             LOG(ERROR) << "key=" << key << ", part_index=" << part_index
                        << ", part_count=" << part_count
