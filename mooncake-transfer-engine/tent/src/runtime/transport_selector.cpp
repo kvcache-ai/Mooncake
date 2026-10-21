@@ -301,7 +301,7 @@ void TransportSelector::loadPolicies() {
 }
 
 TransportSelector::TransportSelector(std::shared_ptr<Config> config)
-    : config_(config) {
+    : config_(config), force_tcp_(config_->get("transports/force_tcp", false)) {
     loadPolicies();
 }
 
@@ -378,6 +378,12 @@ bool TransportSelector::matchesMemoryPattern(const std::string& pattern,
             return isAmdGpuLocationType(pattern);
         case MTYPE_TPU:
             type_str = "tpu";
+            break;
+        case MTYPE_MLU:
+            type_str = "mlu";
+            break;
+        case MTYPE_XPU:
+            type_str = "xpu";
             break;
         default:
             type_str = "unknown";
@@ -468,23 +474,28 @@ bool TransportSelector::isTransportAvailable(
         return false;
     }
 
-    // Special constraints
+    // XPU/MLU need process-local addresses, not merely machine locality.
+    if ((type == XPU || type == MLU) && !context.local_segment) return false;
     if ((type == NVLINK || type == SHM || type == TPU) &&
         !context.same_machine) {
-        // NVLINK/SHM only work on same machine; TPU is a local-stage-only
-        // executor (HBM<->host), so it must never be picked for a remote hop.
         return false;
     }
 
     const auto& caps = transport->capabilities();
+    if (context.host_staging) {
+        return (type == RDMA || type == FABRIC || type == TCP ||
+                type == HP_TCP) &&
+               caps.dram_to_dram;
+    }
 
-    // Helper to check if memory type is a device (GPU/NPU/TPU). TPU is included
-    // so its device<->host staging hop routes to TpuTransport (gpu_to_dram /
-    // dram_to_gpu); it never satisfies gpu_to_gpu, so cross-node TPU traffic is
-    // always staged through host DRAM.
-    auto is_gpu = [](MemoryType t) {
-        return t == MTYPE_CUDA || t == MTYPE_ROCM || t == MTYPE_TPU;
-    };
+    // Helper to check if memory type is a device (GPU/NPU/TPU/XPU). Delegates
+    // to the single isGpuMemoryType() in platform.h so this routing predicate
+    // and the staging capability checks share one device-type list and cannot
+    // disagree. TPU and Intel XPU are included so their device<->host staging
+    // hop routes to the matching staging transport (gpu_to_dram / dram_to_gpu);
+    // they never satisfy gpu_to_gpu, so cross-node device traffic is always
+    // staged through host DRAM.
+    auto is_gpu = [](MemoryType t) { return isGpuMemoryType(t); };
 
     // For file segments, check file-specific capabilities (original logic)
     if (context.segment_type == SegmentType::File) {
@@ -556,10 +567,12 @@ SelectionResult TransportSelector::select(
     // the policy's explicit transports list, or the buffer's registered
     // transports as a fallback.
     static const std::vector<TransportType> kEmpty;
-    const auto& raw = !matching_policy->transports.empty()
-                          ? matching_policy->transports
-                      : context.buffer_transports ? *context.buffer_transports
-                                                  : kEmpty;
+    static const std::vector<TransportType> kTcpOnly{TCP};
+    const auto& raw =
+        force_tcp_ && context.segment_type == SegmentType::Memory ? kTcpOnly
+        : !matching_policy->transports.empty() ? matching_policy->transports
+        : context.buffer_transports            ? *context.buffer_transports
+                                               : kEmpty;
 
     if (transport_index < 0) return result;
     const int original_index = transport_index;

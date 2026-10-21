@@ -50,7 +50,7 @@ struct SessionHeader {
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
-    defined(USE_COREX)
+    defined(USE_COREX) || defined(USE_SUPA)
 // Returns the CUDA device ordinal if addr is device memory, or -1 otherwise.
 // Callers must call cudaSetDevice before any cudaMemcpy to avoid implicit
 // GPU 0 context creation.
@@ -158,7 +158,7 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
     uint64_t status_frame_;
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
-    defined(USE_COREX)
+    defined(USE_COREX) || defined(USE_SUPA)
     int cuda_device_ = -1;
     TcpStagingBuffer staging_buffer_;
 #endif
@@ -218,7 +218,7 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
                 }
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
-    defined(USE_COREX)
+    defined(USE_COREX) || defined(USE_SUPA)
                 cuda_device_ = getCudaDeviceId(local_buffer_);
 #endif
                 if (opcode == (uint8_t)TransferRequest::WRITE) {
@@ -249,7 +249,7 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
-    defined(USE_COREX)
+    defined(USE_COREX) || defined(USE_SUPA)
         if (cuda_device_ >= 0) {
             dram_buffer = staging_buffer_.ensure(buffer_size);
             cudaSetDevice(cuda_device_);
@@ -312,7 +312,7 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
-    defined(USE_COREX)
+    defined(USE_COREX) || defined(USE_SUPA)
         if (cuda_device_ >= 0) {
             dram_buffer = staging_buffer_.ensure(buffer_size);
         }
@@ -339,7 +339,7 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
-    defined(USE_COREX)
+    defined(USE_COREX) || defined(USE_SUPA)
                 if (cuda_device_ >= 0) {
                     cudaSetDevice(cuda_device_);
 #ifdef USE_MACA
@@ -385,7 +385,7 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
     uint64_t status_frame_;
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
-    defined(USE_COREX)
+    defined(USE_COREX) || defined(USE_SUPA)
     int cuda_device_ = -1;
     TcpStagingBuffer staging_buffer_;
 #endif
@@ -445,7 +445,7 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
         local_buffer_ = (char*)buffer;
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
-    defined(USE_COREX)
+    defined(USE_COREX) || defined(USE_SUPA)
         cuda_device_ = getCudaDeviceId(local_buffer_);
 #endif
         header_.addr = htole64(dest_addr);
@@ -763,7 +763,7 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
-    defined(USE_COREX)
+    defined(USE_COREX) || defined(USE_SUPA)
         if (cuda_device_ >= 0) {
             dram_buffer = staging_buffer_.ensure(buffer_size);
         }
@@ -800,7 +800,7 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
-    defined(USE_COREX)
+    defined(USE_COREX) || defined(USE_SUPA)
                 if (cuda_device_ >= 0) {
                     cudaSetDevice(cuda_device_);
 #ifdef USE_MACA
@@ -864,7 +864,7 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
-    defined(USE_COREX)
+    defined(USE_COREX) || defined(USE_SUPA)
         if (cuda_device_ >= 0) {
             dram_buffer = staging_buffer_.ensure(buffer_size);
             cudaSetDevice(cuda_device_);
@@ -921,8 +921,11 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
 };
 
 struct TcpContext {
-    TcpContext(short port, ValidateAddrFn validate_addr)
-        : acceptor(io_context), validate_addr_(std::move(validate_addr)) {
+    TcpContext(TcpIoPool& pool, short port, ValidateAddrFn validate_addr)
+        : pool_(pool),
+          io_context(pool.context(0)),
+          acceptor(io_context),
+          validate_addr_(std::move(validate_addr)) {
         std::error_code ec;
         asio::ip::tcp::endpoint endpoint(asio::ip::tcp::v6(), port);
 
@@ -950,21 +953,30 @@ struct TcpContext {
     }
 
     void doAccept() {
-        acceptor.async_accept([this](asio::error_code ec, tcpsocket socket) {
-            if (!ec) {
-                asio::error_code nodelay_ec;
-                socket.set_option(asio::ip::tcp::no_delay(true), nodelay_ec);
-                auto socket_ptr =
-                    std::make_shared<tcpsocket>(std::move(socket));
-                auto session =
-                    std::make_shared<ServerSession>(socket_ptr, validate_addr_);
-                session->start();
-            }
-            doAccept();
-        });
+        // Round-robin each accepted connection onto a shard so ServerSession
+        // I/O spreads across io threads. The accept handler runs on shard 0
+        // (the acceptor's context); the accepted socket lives on the target
+        // shard, so start its session there.
+        acceptor.async_accept(
+            pool_.context(pool_.nextShardIndex()),
+            [this](asio::error_code ec, tcpsocket socket) {
+                if (!ec) {
+                    asio::error_code nodelay_ec;
+                    socket.set_option(asio::ip::tcp::no_delay(true),
+                                      nodelay_ec);
+                    auto socket_ptr =
+                        std::make_shared<tcpsocket>(std::move(socket));
+                    auto session = std::make_shared<ServerSession>(
+                        socket_ptr, validate_addr_);
+                    asio::post(socket_ptr->get_executor(),
+                               [session] { session->start(); });
+                }
+                doAccept();
+            });
     }
 
-    asio::io_context io_context;
+    TcpIoPool& pool_;
+    asio::io_context& io_context;
     asio::ip::tcp::acceptor acceptor;
     ValidateAddrFn validate_addr_;
 };

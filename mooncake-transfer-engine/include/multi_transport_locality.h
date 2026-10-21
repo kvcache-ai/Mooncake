@@ -65,14 +65,19 @@ inline bool hostEquals(const std::string& a, const std::string& b) {
     return true;
 }
 
-// GPU IPC transports (HIP and MUSA) only work between processes on the same
-// physical host. A cross-host target must fall back to RDMA/TCP. Two engines
-// co-located on one host share the host portion of their segment name (they
-// differ only in port).
-inline bool isGpuIpcReachableTarget(const std::string& target_segment_name,
-                                    const std::string& local_server_name) {
+// Same-host IPC transports (HIP/MUSA GPU IPC and POSIX SHM) only work between
+// processes on the same physical host. A cross-host target must fall back to
+// RDMA/TCP. Two engines co-located on one host share the host portion of their
+// segment name (they differ only in port).
+inline bool isLocalIpcReachableTarget(const std::string& target_segment_name,
+                                      const std::string& local_server_name) {
     return hostEquals(segmentHost(target_segment_name),
                       segmentHost(local_server_name));
+}
+
+inline bool isGpuIpcReachableTarget(const std::string& target_segment_name,
+                                    const std::string& local_server_name) {
+    return isLocalIpcReachableTarget(target_segment_name, local_server_name);
 }
 
 // Compatibility name retained for existing callers/tests.

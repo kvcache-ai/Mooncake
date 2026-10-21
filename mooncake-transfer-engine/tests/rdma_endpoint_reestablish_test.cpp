@@ -839,11 +839,11 @@ class RdmaEndPointTestPeer {
         endpoint.qp_list_.clear();
     }
 
-    static int doSetupConnection(RdmaEndPoint &endpoint, int qp_index,
-                                 const ibv_gid &peer_gid, uint16_t peer_lid,
+    static int doSetupConnection(RdmaEndPoint& endpoint, int qp_index,
+                                 const ibv_gid& peer_gid, uint32_t peer_lid,
                                  uint32_t peer_qp_num, int local_gid_index,
-                                 std::string *reply_msg,
-                                 int &out_stage, int &out_sys_errno) {
+                                 std::string* reply_msg, int& out_stage,
+                                 int& out_sys_errno) {
         RdmaEndPoint::SetupConnectionFailureInfo failure_info = {};
         int rc = endpoint.doSetupConnection(qp_index, peer_gid, peer_lid,
                                             peer_qp_num, local_gid_index,
@@ -856,14 +856,32 @@ class RdmaEndPointTestPeer {
     static int getResetStageValue() {
         return static_cast<int>(RdmaEndPoint::SetupConnectionFailureStage::kReset);
     }
+
+    static int getInitStageValue() {
+        return static_cast<int>(
+            RdmaEndPoint::SetupConnectionFailureStage::kInit);
+    }
 };
 }
 
 extern std::atomic<int> g_inject_modify_qp_error;
+extern std::atomic<int> g_inject_query_qp_state;
+extern std::atomic<int> g_inject_query_qp_error;
+extern std::atomic<int> g_modify_qp_reset_calls;
 
 namespace {
 
-TEST(RDMAEndpointSetupErrorTest, VerifyVerbsErrorCorrectlyCaptured) {
+struct SetupResult {
+    int rc = 0;
+    int stage = 0;
+    int sys_errno = 0;
+    std::string reply_msg;
+};
+
+// Runs doSetupConnection on a fake QP. ibv_query_qp and ibv_modify_qp are
+// wrapped, so the fake pointer is never dereferenced. Every ibv_modify_qp
+// fails with EINVAL, so the returned stage is the first one attempted.
+SetupResult setupWithFakeQp(int query_state, int query_error) {
     auto* transport = new RdmaTransport();
     // Ignore memory leak of transport during destruction since it's a test
     MC_LSAN_IGNORE_OBJECT(transport);
@@ -874,26 +892,58 @@ TEST(RDMAEndpointSetupErrorTest, VerifyVerbsErrorCorrectlyCaptured) {
     ibv_qp* dummy_qp = reinterpret_cast<ibv_qp*>(0xdeadbeef);
     mooncake::RdmaEndPointTestPeer::addDummyQp(*endpoint, dummy_qp);
 
-    // Inject EINVAL error for ibv_modify_qp
+    g_inject_query_qp_state.store(query_state);
+    g_inject_query_qp_error.store(query_error);
+    g_modify_qp_reset_calls.store(0);
     g_inject_modify_qp_error.store(EINVAL);
 
     ibv_gid dummy_gid = {};
-    std::string reply_msg;
-    int stage = 0;
-    int sys_errno = 0;
-    int rc = mooncake::RdmaEndPointTestPeer::doSetupConnection(
-        *endpoint, 0, dummy_gid, 0, 0, 0, &reply_msg, stage, sys_errno);
+    SetupResult result;
+    result.rc = mooncake::RdmaEndPointTestPeer::doSetupConnection(
+        *endpoint, 0, dummy_gid, 0, 0, 0, &result.reply_msg, result.stage,
+        result.sys_errno);
 
     // Clear injection immediately
     g_inject_modify_qp_error.store(0);
+    g_inject_query_qp_error.store(0);
+    g_inject_query_qp_state.store(-1);
 
     // Clear dummy qp so destructor doesn't try to destroy 0xdeadbeef and crash
     mooncake::RdmaEndPointTestPeer::clearDummyQp(*endpoint);
+    return result;
+}
 
-    EXPECT_EQ(rc, ERR_ENDPOINT);
-    EXPECT_EQ(stage, mooncake::RdmaEndPointTestPeer::getResetStageValue());
-    EXPECT_EQ(sys_errno, EINVAL);
-    EXPECT_TRUE(reply_msg.find("EINVAL") != std::string::npos || reply_msg.find("Invalid argument") != std::string::npos || reply_msg.find("22") != std::string::npos);
+TEST(RDMAEndpointSetupErrorTest, VerifyVerbsErrorCorrectlyCaptured) {
+    // A QP that has been used is reset before INIT.
+    SetupResult r = setupWithFakeQp(IBV_QPS_RTS, 0);
+
+    EXPECT_EQ(r.rc, ERR_ENDPOINT);
+    EXPECT_EQ(r.stage, mooncake::RdmaEndPointTestPeer::getResetStageValue());
+    EXPECT_EQ(r.sys_errno, EINVAL);
+    EXPECT_EQ(g_modify_qp_reset_calls.load(), 1);
+    EXPECT_TRUE(r.reply_msg.find("EINVAL") != std::string::npos ||
+                r.reply_msg.find("Invalid argument") != std::string::npos ||
+                r.reply_msg.find("22") != std::string::npos);
+}
+
+TEST(RDMAEndpointSetupErrorTest, SkipsResetWhenQpAlreadyInReset) {
+    // A fresh QP is already in RESET; the RESET request is skipped and the
+    // first modify is INIT.
+    SetupResult r = setupWithFakeQp(IBV_QPS_RESET, 0);
+
+    EXPECT_EQ(r.rc, ERR_ENDPOINT);
+    EXPECT_EQ(r.stage, mooncake::RdmaEndPointTestPeer::getInitStageValue());
+    EXPECT_EQ(r.sys_errno, EINVAL);
+    EXPECT_EQ(g_modify_qp_reset_calls.load(), 0);
+}
+
+TEST(RDMAEndpointSetupErrorTest, ResetsWhenQueryQpFails) {
+    // If the state cannot be read, fall back to the unconditional RESET.
+    SetupResult r = setupWithFakeQp(IBV_QPS_RESET, EIO);
+
+    EXPECT_EQ(r.rc, ERR_ENDPOINT);
+    EXPECT_EQ(r.stage, mooncake::RdmaEndPointTestPeer::getResetStageValue());
+    EXPECT_EQ(g_modify_qp_reset_calls.load(), 1);
 }
 
 }  // namespace
@@ -923,13 +973,39 @@ extern "C" int __wrap_ibv_query_gid(ibv_context* context, uint8_t port_num,
     return __real_ibv_query_gid(context, port_num, wrapped_gid_index, gid);
 }
 
+extern "C" int __real_ibv_query_qp(ibv_qp* qp, ibv_qp_attr* attr, int attr_mask,
+                                   ibv_qp_init_attr* init_attr);
+
+// -1 passes through to the real ibv_query_qp.
+std::atomic<int> g_inject_query_qp_state{-1};
+std::atomic<int> g_inject_query_qp_error{0};
+
+extern "C" int __wrap_ibv_query_qp(ibv_qp* qp, ibv_qp_attr* attr, int attr_mask,
+                                   ibv_qp_init_attr* init_attr) {
+    int error_to_inject = g_inject_query_qp_error.load();
+    if (error_to_inject != 0) {
+        return error_to_inject;
+    }
+    int state_to_inject = g_inject_query_qp_state.load();
+    if (state_to_inject >= 0) {
+        attr->qp_state = static_cast<ibv_qp_state>(state_to_inject);
+        return 0;
+    }
+    return __real_ibv_query_qp(qp, attr, attr_mask, init_attr);
+}
+
 extern "C" int __real_ibv_modify_qp(ibv_qp* qp, ibv_qp_attr* attr,
                                     int attr_mask);
 
 std::atomic<int> g_inject_modify_qp_error{0};
+std::atomic<int> g_modify_qp_reset_calls{0};
 
 extern "C" int __wrap_ibv_modify_qp(ibv_qp* qp, ibv_qp_attr* attr,
                                     int attr_mask) {
+    if (attr != nullptr && (attr_mask & IBV_QP_STATE) &&
+        attr->qp_state == IBV_QPS_RESET) {
+        g_modify_qp_reset_calls.fetch_add(1);
+    }
     int error_to_inject = g_inject_modify_qp_error.load();
     if (error_to_inject != 0) {
         return error_to_inject;

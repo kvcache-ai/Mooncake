@@ -14,7 +14,10 @@
 
 #include "tent_backend.h"
 #include "utils.h"
+#include "split_output.h"
 #include "char_util.h"
+
+#include <atomic>
 #include "tent/common/types.h"
 #include "tent/runtime/platform.h"
 #include "tent/runtime/topology.h"
@@ -31,18 +34,36 @@
 namespace mooncake {
 namespace tent {
 
-volatile bool g_tent_running = true;
-volatile bool g_tent_triggered_sig = false;
+std::atomic<bool> g_tent_running{true};
+std::atomic<bool> g_tent_triggered_sig{false};
 
 void signalHandlerV1(int signum) {
-    if (g_tent_triggered_sig) {
+    if (g_tent_triggered_sig.load()) {
         LOG(ERROR) << "Received signal " << signum
                    << " again, forcefully terminating...";
         std::exit(EXIT_FAILURE);
     }
     LOG(INFO) << "Received signal " << signum << ", stopping target server...";
-    g_tent_running = false;
-    g_tent_triggered_sig = true;
+    g_tent_running.store(false);
+    g_tent_triggered_sig.store(true);
+}
+
+// Parse a comma-separated list (e.g. "dram,vram") into a vector of lowercased
+// seg_type names. Empty input returns an empty vector.
+static std::vector<std::string> parseSegTypeMix(const std::string& mix) {
+    std::vector<std::string> result;
+    if (mix.empty()) return result;
+    std::stringstream ss(mix);
+    std::string token;
+    while (std::getline(ss, token, ',')) {
+        size_t b = token.find_first_not_of(" \t");
+        size_t e = token.find_last_not_of(" \t");
+        if (b == std::string::npos) continue;
+        std::string name = token.substr(b, e - b + 1);
+        for (auto& c : name) c = to_lower(c);
+        result.push_back(name);
+    }
+    return result;
 }
 
 std::shared_ptr<Config> loadConfig() {
@@ -60,24 +81,39 @@ std::shared_ptr<Config> loadConfig() {
         std::unordered_map<std::string, std::string> transport_map = {
             {"rdma", "rdma"},
             {"tcp", "tcp"},
+            {"hp_tcp", "hp_tcp"},
             {"shm", "shm"},
             {"iouring", "io_uring"},  // Note: iouring -> io_uring
             {"gds", "gds"},
             {"mnnvl", "mnnvl"},
             {"nvlink", "nvlink"},
+            {"ub", "ub"},
             {"sunrise_link", "sunrise_link"},
-            {"mpcomm", "mpcomm"}};
+            {"mpcomm", "mpcomm"},
+            {"fabric", "fabric"}};
 
-        // Disable all transports by default
+        // Disable the selectable benchmark transports.
         for (const auto& entry : transport_map) {
             config->set("transports/" + entry.second + "/enable", false);
         }
 
-        // Enable only the specified transport
+        // Enable the selected benchmark transport.
         auto it = transport_map.find(XferBenchConfig::xport_type);
         if (it != transport_map.end()) {
             config->set("transports/" + it->second + "/enable", true);
         }
+
+#ifdef USE_MLU
+        auto seg_types = parseSegTypeMix(XferBenchConfig::seg_type_mix);
+        if (seg_types.empty()) {
+            seg_types = parseSegTypeMix(XferBenchConfig::seg_type);
+        }
+        if (std::find(seg_types.begin(), seg_types.end(), "vram") !=
+            seg_types.end()) {
+            // Network transfers of MLU memory also need local host copies.
+            config->set("transports/mlu/enable", true);
+        }
+#endif
     }
 
     return config;
@@ -91,8 +127,11 @@ static TransportType getTransportType(const std::string& xport_type) {
     if (xport_type == "nvlink") return NVLINK;
     if (xport_type == "tcp") return TCP;
     if (xport_type == "iouring") return IOURING;
+    if (xport_type == "ub") return UB;
     if (xport_type == "sunrise_link") return SUNRISE_LINK;
     if (xport_type == "mpcomm") return MPCOMM;
+    if (xport_type == "hp_tcp") return HP_TCP;
+    if (xport_type == "fabric") return FABRIC;
     return UNSPEC;
 }
 
@@ -154,30 +193,30 @@ static int resolveSegTypeParams(const std::string& seg_type,
                 << "local_gpu_id " << start_idx << " out of range [0, "
                 << gpu_count << ")";
         }
+#elif defined(USE_MLU)
+    } else if (seg_type == "VRAM" || seg_type == "vram") {
+        device_prefix = "mlu";
+        unsigned int device_count = 0;
+        auto err = cnrtGetDeviceCount(&device_count);
+        LOG_ASSERT(err == cnrtSuccess)
+            << "cnrtGetDeviceCount failed: " << cnrtGetErrorStr(err);
+        LOG_ASSERT(device_count > 0) << "No MLU devices are visible";
+        start_idx = 0;
+        num_buffers = device_count;
+        if (XferBenchConfig::local_gpu_id != -1) {
+            start_idx = XferBenchConfig::local_gpu_id;
+            num_buffers = 1;
+            LOG_ASSERT(start_idx >= 0 &&
+                       static_cast<unsigned int>(start_idx) < device_count)
+                << "local_gpu_id " << start_idx << " out of range [0, "
+                << device_count << ")";
+        }
 #endif
     } else {
         LOG(ERROR) << "Unknown seg_type: " << seg_type;
         return -1;
     }
     return 0;
-}
-
-// Parse a comma-separated list (e.g. "dram,vram") into a vector of lowercased
-// seg_type names. Empty input returns an empty vector.
-static std::vector<std::string> parseSegTypeMix(const std::string& mix) {
-    std::vector<std::string> result;
-    if (mix.empty()) return result;
-    std::stringstream ss(mix);
-    std::string token;
-    while (std::getline(ss, token, ',')) {
-        size_t b = token.find_first_not_of(" \t");
-        size_t e = token.find_last_not_of(" \t");
-        if (b == std::string::npos) continue;
-        std::string name = token.substr(b, e - b + 1);
-        for (auto& c : name) c = to_lower(c);
-        result.push_back(name);
-    }
-    return result;
 }
 
 int TENTBenchRunner::allocateBuffers() {
@@ -214,8 +253,7 @@ int TENTBenchRunner::allocateBuffers() {
             MemoryOptions options;
             options.location = location;
             if (!xport_type.empty()) {
-                // Explicit single transport: honor it for both allocate and
-                // register (existing behavior).
+                // Use the allocator requested by --xport_type.
                 options.type = getTransportType(xport_type);
             } else if (!seg_type_mix_.empty()) {
                 // Multi-transport mode (--seg_type_mix set, transports
@@ -225,7 +263,9 @@ int TENTBenchRunner::allocateBuffers() {
                 // handle). registerLocalMemory below then resets options.type
                 // to UNSPEC so the buffer registers to ALL enabled transports,
                 // not just this one.
-                options.type = (seg_type == "vram") ? NVLINK : SHM;
+                options.type = (seg_type == "vram")
+                                   ? (device_prefix == "mlu" ? UNSPEC : NVLINK)
+                                   : SHM;
             }
             // else: single-seg_type fallback (--seg_type without
             // --seg_type_mix, no --xport_type). Leave options.type as UNSPEC
@@ -249,19 +289,14 @@ int TENTBenchRunner::allocateBuffers() {
                                                        "registerLocalMemory"));
             }
 #endif
-            // Reset options.type to UNSPEC so registerLocalMemory registers
-            // the buffer to ALL enabled transports (via
-            // getSupportedTransports(UNSPEC)), not just the one that
-            // allocated it. This is what makes multi-transport work: the
-            // buffer ends up registered to both SHM (which has shm_path set
-            // by the allocate call above) and TCP/NVLink (which don't need
-            // it), so requests targeting this buffer resolve regardless of
-            // which transport the engine picks. Only applies in multi-transport
-            // mode (--seg_type_mix set, no --xport_type); single-seg_type
-            // fallback keeps options.type as set above (UNSPEC or explicit).
+            // Mixed-mode buffers must be registered with all enabled
+            // transports.
             if (xport_type.empty() && !seg_type_mix_.empty()) {
                 options.type = UNSPEC;
             }
+            // A network-selected MLU allocation also needs its local-copy
+            // transport registered for host staging.
+            if (device_prefix == "mlu") options.type = UNSPEC;
             CHECK_FAIL(
                 engine_->registerLocalMemory(buf, total_buffer_size, options));
             auto t2 = getCurrentTimeInNano();
@@ -296,13 +331,14 @@ TENTBenchRunner::TENTBenchRunner() {
     engine_ = std::make_unique<TransferEngine>(loadConfig());
     transport_hint_ = parseTransportType(XferBenchConfig::tent_transport_hint);
     intent_type_ = getIntentType(XferBenchConfig::tent_intent_type);
-    allocateBuffers();
+    LOG_ASSERT(allocateBuffers() == 0)
+        << "Failed to allocate benchmark buffers";
 }
 
 TENTBenchRunner::~TENTBenchRunner() { freeBuffers(); }
 
 int TENTBenchRunner::runTarget() {
-    while (g_tent_running) sleep(1);
+    while (g_tent_running.load()) sleep(1);
     return 0;
 }
 
@@ -350,7 +386,7 @@ int TENTBenchRunner::startInitiator(int num_threads) {
     LOG(INFO) << "Opened " << target_handles_.size() << " target segments";
     threads_.resize(num_threads);
     current_task_.resize(threads_.size());
-    g_tent_running = true;
+    g_tent_running.store(true);
     for (size_t i = 0; i < threads_.size(); ++i)
         threads_[i] = std::thread(&TENTBenchRunner::runner, this, i);
     return 0;
@@ -359,7 +395,7 @@ int TENTBenchRunner::startInitiator(int num_threads) {
 int TENTBenchRunner::stopInitiator() {
     {
         std::unique_lock<std::mutex> lk(mtx_);
-        g_tent_running = false;
+        g_tent_running.store(false);
         cv_task_.notify_all();
         cv_done_.notify_all();
     }
@@ -399,6 +435,17 @@ static inline int getGpuDeviceNumaID(int gpu_id) {
              prop.pciDomainID, prop.pciBusID, prop.pciDeviceID);
     return getNumaNodeFromPciDevice(pci_bus_id);
 }
+#elif defined(USE_MLU)
+static inline int getGpuDeviceNumaID(int gpu_id) {
+    char pci_bus_id[32] = {};
+    auto err = cnrtDeviceGetPCIBusId(pci_bus_id, sizeof(pci_bus_id), gpu_id);
+    if (err != cnrtSuccess) {
+        LOG(WARNING) << "cnrtDeviceGetPCIBusId: " << cnrtGetErrorStr(err);
+        return -1;
+    }
+    for (char* ch = pci_bus_id; (*ch = to_lower(*ch)); ch++);
+    return getNumaNodeFromPciDevice(pci_bus_id);
+}
 #else
 static inline int getGpuDeviceNumaID(int gpu_id) { return 0; }
 #endif
@@ -418,14 +465,14 @@ void TENTBenchRunner::pinThread(int thread_id) {
         return;
     }
 #endif
-    uint64_t addr =
-        (uint64_t)pinned_buffer_list_[thread_id % pinned_buffer_list_.size()];
+    uint64_t addr = getLocalBufferBase(thread_id, 0, 0);
     auto result = Platform::getLoader().getLocation((void*)addr, 1);
+    if (result.empty()) return;
     LocationParser location(result[0].location);
     if (location.type() == "cpu") {
         auto socket_id = location.index();
         bindToSocket(socket_id);
-    } else if (location.type() == "cuda" ||
+    } else if (location.type() == "cuda" || location.type() == "mlu" ||
                isAmdGpuLocationType(location.type())) {
         auto device_id = location.index();
         auto socket_id = getGpuDeviceNumaID(device_id);
@@ -434,14 +481,14 @@ void TENTBenchRunner::pinThread(int thread_id) {
 }
 
 int TENTBenchRunner::runner(int thread_id) {
-    while (g_tent_running) {
+    while (g_tent_running.load()) {
         std::function<int(int)> task;
         {
             std::unique_lock<std::mutex> lk(mtx_);
             cv_task_.wait(lk, [&] {
-                return !g_tent_running || current_task_[thread_id];
+                return !g_tent_running.load() || current_task_[thread_id];
             });
-            if (!g_tent_running) break;
+            if (!g_tent_running.load()) break;
             std::swap(task, current_task_[thread_id]);
         }
         if (task) task(thread_id);
@@ -460,15 +507,37 @@ int TENTBenchRunner::runInitiatorTasks(
         current_task_[id] = func;
     pending_ = (int)threads_.size();
     cv_task_.notify_all();
-    cv_done_.wait(lk, [&] { return !g_tent_running || pending_ == 0; });
-    return g_tent_running ? 0 : -1;
+    cv_done_.wait(lk, [&] { return !g_tent_running.load() || pending_ == 0; });
+    return g_tent_running.load() ? 0 : -1;
+}
+
+void TENTBenchRunner::noteTransferFailed() {
+    std::lock_guard<std::mutex> lk(mtx_);
+    g_tent_running.store(false);
+    cv_task_.notify_all();
+    cv_done_.notify_all();
 }
 
 double TENTBenchRunner::runSingleTransfer(
     uint64_t local_addr, uint64_t target_id, uint64_t target_addr,
     uint64_t block_size, uint64_t batch_size, OpCode opcode,
     uint64_t deadline_ns, IntentType intent_type) {
+    if (!g_tent_running.load()) return -1.0;
+
+    auto abortTransfer = [&](const char* why) {
+        LOG(ERROR) << why;
+        noteTransferFailed();
+        return -1.0;
+    };
+
     auto batch_id = engine_->allocateBatch(batch_size);
+    if (!batch_id) return abortTransfer("Failed to allocate transfer batch");
+
+    auto finish = [&](double duration) {
+        (void)engine_->freeBatch(batch_id);
+        return duration;
+    };
+
     std::vector<Request> requests;
     for (uint64_t i = 0; i < batch_size; ++i) {
         Request entry;
@@ -484,27 +553,83 @@ double TENTBenchRunner::runSingleTransfer(
                                 : intent_type;
         requests.emplace_back(entry);
     }
-    XferBenchTimer timer;
-    if (XferBenchConfig::notifi) {
-        // Use target_addr as msg for verification by peer
-        Notification notifi{"benchmark", std::to_string(target_addr)};
-        CHECK_FAIL(engine_->submitTransfer(batch_id, requests, notifi));
-    } else {
-        CHECK_FAIL(engine_->submitTransfer(batch_id, requests));
+    if (!splitOutputEnabled()) {
+        XferBenchTimer timer;
+        Status submitted;
+        if (XferBenchConfig::notifi) {
+            Notification notifi{"benchmark", std::to_string(target_addr)};
+            submitted = engine_->submitTransfer(batch_id, requests, notifi);
+        } else {
+            submitted = engine_->submitTransfer(batch_id, requests);
+        }
+        if (!submitted.ok()) {
+            LOG(ERROR) << "Failed to submit transfer: " << submitted.ToString();
+            noteTransferFailed();
+            return finish(-1.0);
+        }
+        while (g_tent_running.load()) {
+            TransferStatus overall_status;
+            auto polled = engine_->getTransferStatus(batch_id, overall_status);
+            if (!polled.ok()) {
+                LOG(ERROR) << "Failed to poll transfer: " << polled.ToString();
+                noteTransferFailed();
+                return finish(-1.0);
+            }
+            if (overall_status.s == TransferStatusEnum::COMPLETED) {
+                return finish(timer.lap_us());
+            }
+            if (overall_status.s == TransferStatusEnum::FAILED ||
+                overall_status.s == TransferStatusEnum::TIMEOUT ||
+                overall_status.s == TransferStatusEnum::CANCELED ||
+                overall_status.s == TransferStatusEnum::INVALID) {
+                LOG(ERROR) << "Failed transfer detected";
+                noteTransferFailed();
+                return finish(-1.0);
+            }
+        }
+        return finish(-1.0);
     }
-    while (true) {
+
+    XferBenchTimer submit_timer;
+    Status submitted;
+    if (XferBenchConfig::notifi) {
+        Notification notifi{"benchmark", std::to_string(target_addr)};
+        submitted = engine_->submitTransfer(batch_id, requests, notifi);
+    } else {
+        submitted = engine_->submitTransfer(batch_id, requests);
+    }
+    if (!submitted.ok()) {
+        LOG(ERROR) << "Failed to submit transfer: " << submitted.ToString();
+        noteTransferFailed();
+        return finish(-1.0);
+    }
+    const uint64_t submit_us = submit_timer.lap_us();
+    XferBenchTimer wait_timer;
+    uint64_t polls = 0;
+    while (g_tent_running.load()) {
         TransferStatus overall_status;
-        CHECK_FAIL(engine_->getTransferStatus(batch_id, overall_status));
+        auto polled = engine_->getTransferStatus(batch_id, overall_status);
+        polls++;
+        if (!polled.ok()) {
+            LOG(ERROR) << "Failed to poll transfer: " << polled.ToString();
+            noteTransferFailed();
+            return finish(-1.0);
+        }
         if (overall_status.s == TransferStatusEnum::COMPLETED) {
-            break;
-        } else if (overall_status.s == TransferStatusEnum::FAILED) {
+            const uint64_t wait_us = wait_timer.lap_us();
+            logSplitXfer({batch_size, submit_us, wait_us, polls});
+            return finish(static_cast<double>(submit_us + wait_us));
+        }
+        if (overall_status.s == TransferStatusEnum::FAILED ||
+            overall_status.s == TransferStatusEnum::TIMEOUT ||
+            overall_status.s == TransferStatusEnum::CANCELED ||
+            overall_status.s == TransferStatusEnum::INVALID) {
             LOG(ERROR) << "Failed transfer detected";
-            exit(EXIT_FAILURE);
+            noteTransferFailed();
+            return finish(-1.0);
         }
     }
-    auto duration = timer.lap_us();
-    CHECK_FAIL(engine_->freeBatch(batch_id));
-    return duration;
+    return finish(-1.0);
 }
 
 }  // namespace tent

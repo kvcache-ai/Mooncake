@@ -41,7 +41,32 @@ from .planner import (
     resolve_executor_plan,
     resolve_executor_plans,
 )
-from .storage_manifest import StoredFragmentSnapshot, WeightManifest
+from .storage_manifest import StoredFragmentSnapshot, StoredWeightManifest
+from ._store import UploadOperation, WeightUploadPlan, plan_weight_upload
+from .store import (
+    StoreRegistrationLease,
+    UploadReceipt,
+    WeightLoadPlan,
+    WeightSnapshotAdapter,
+    WeightSnapshotDescriptor,
+    WeightStoreWriter,
+    WeightStore,
+    WeightStoreError,
+)
+from .te import (
+    DirectReadReceipt,
+    DirectTransferReceipt,
+    MemoryRegistrationLease,
+    MooncakeTransferEngineReader,
+    MooncakeTransferEngineSink,
+    TransferCompletionFailedError,
+    TransferCompletionInterrupted,
+    TransferCompletionUnknownError,
+    TransferEngineError,
+    TransferRegistrationCleanupPendingError,
+    WeightAllocationGuardProvider,
+    WeightAllocationGuardProviders,
+)
 
 __all__ = [
     "ParallelRank",
@@ -61,7 +86,18 @@ __all__ = [
     "weight_placement_from_json",
     "weight_placement_to_json",
     "StoredFragmentSnapshot",
-    "WeightManifest",
+    "StoredWeightManifest",
+    "UploadOperation",
+    "UploadReceipt",
+    "StoreRegistrationLease",
+    "WeightLoadPlan",
+    "WeightSnapshotAdapter",
+    "WeightSnapshotDescriptor",
+    "WeightStoreWriter",
+    "WeightStore",
+    "WeightStoreError",
+    "WeightUploadPlan",
+    "plan_weight_upload",
     "BoundWeightFragment",
     "ExecutableTransferOperation",
     "ExecutorTransferPlan",
@@ -84,4 +120,16 @@ __all__ = [
     "plan_stored_transfer_to_target_placement",
     "resolve_executor_plan",
     "resolve_executor_plans",
+    "DirectReadReceipt",
+    "DirectTransferReceipt",
+    "MemoryRegistrationLease",
+    "MooncakeTransferEngineReader",
+    "MooncakeTransferEngineSink",
+    "TransferCompletionFailedError",
+    "TransferCompletionInterrupted",
+    "TransferCompletionUnknownError",
+    "TransferEngineError",
+    "TransferRegistrationCleanupPendingError",
+    "WeightAllocationGuardProvider",
+    "WeightAllocationGuardProviders",
 ]

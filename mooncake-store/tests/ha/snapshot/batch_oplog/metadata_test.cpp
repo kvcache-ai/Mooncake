@@ -127,6 +127,34 @@ TEST(BatchOpLogSnapshotTypesTest, ManifestRoundTripsChunksAndAllowsEmptySet) {
     EXPECT_TRUE(decoded_empty->object_chunks.empty());
 }
 
+TEST(BatchOpLogSnapshotTypesTest, WeightSnapshotRequiresVersionedArtifact) {
+    auto manifest = MakeManifest();
+    manifest.schema_version = kBatchOpLogWeightSnapshotSchemaVersion;
+    manifest.snapshot_format = kBatchOpLogWeightSnapshotFormat;
+    ExpectManifestRejected(EncodeBatchOpLogSnapshotManifest(manifest));
+    manifest.weight_metadata = BatchOpLogSnapshotObjectDescriptor{
+        .key = "snapshots/batch-oplog/9-12345/weight_metadata.bin",
+        .stored_size = 42,
+        .crc32c = 7,
+    };
+    auto encoded = EncodeBatchOpLogSnapshotManifest(manifest);
+    auto decoded = DecodeBatchOpLogSnapshotManifest(encoded);
+    ASSERT_TRUE(decoded) << decoded.error();
+    ASSERT_TRUE(decoded->weight_metadata);
+    EXPECT_EQ(42u, decoded->weight_metadata->stored_size);
+    auto json = ParseJson(encoded);
+    json["weight_metadata"]["stored_size"] = 0;
+    ExpectManifestRejected(WriteJson(json));
+    manifest.schema_version = kBatchOpLogSnapshotSchemaVersion;
+    manifest.snapshot_format = kBatchOpLogSnapshotFormat;
+    ExpectManifestRejected(EncodeBatchOpLogSnapshotManifest(manifest));
+    manifest.weight_metadata.reset();
+    auto legacy = DecodeBatchOpLogSnapshotManifest(
+        EncodeBatchOpLogSnapshotManifest(manifest));
+    ASSERT_TRUE(legacy);
+    EXPECT_FALSE(legacy->weight_metadata);
+}
+
 TEST(BatchOpLogSnapshotTypesTest, JsonRoundTripPreservesEscapedKeys) {
     auto descriptor = MakeDescriptor();
     descriptor.manifest_key = R"(snapshots/"quoted"/manifest\key.json)";
@@ -232,6 +260,9 @@ TEST(BatchOpLogSnapshotTypesTest, RejectsInvalidManifestJson) {
 }
 
 TEST(BatchOpLogSnapshotTypesTest, BuildsControlAndArtifactKeys) {
+    EXPECT_EQ(BuildBatchOpLogSnapshotRoot("cluster-a/"),
+              "mooncake_master_snapshot/cluster-a");
+    EXPECT_TRUE(BuildBatchOpLogSnapshotRoot("../cluster").empty());
     EXPECT_EQ(BuildBatchOpLogSnapshotMaintenanceKey("cluster-a/"),
               "/oplog/cluster-a/snapshot/maintenance");
     EXPECT_EQ(BuildBatchOpLogSnapshotLatestKey("cluster-a"),

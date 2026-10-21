@@ -914,5 +914,161 @@ TEST_F(MtuEnvTest, InvalidIsIgnored) {
     EXPECT_EQ(config.mtu_length, IBV_MTU_4096);
 }
 
+// MC_CONTEXT_PAUSE_TTL_MS bounds how long the context-level circuit breaker
+// holds a tripped local RNIC context inactive before half-open reactivation.
+// The valid range is 1-600000ms. Zero, garbage, negative and out-of-range
+// values must preserve the configured value because zero would re-introduce
+// the permanent-latch behavior this knob exists to fix.
+class ContextPauseTtlEnvTest : public ::testing::Test {
+   protected:
+    void TearDown() override { ::unsetenv("MC_CONTEXT_PAUSE_TTL_MS"); }
+};
+
+TEST_F(ContextPauseTtlEnvTest, DefaultIsFiveThousandWhenUnset) {
+    ::unsetenv("MC_CONTEXT_PAUSE_TTL_MS");
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.context_pause_ttl_ms, 5000);
+}
+
+TEST_F(ContextPauseTtlEnvTest, ValidOverrideIsApplied) {
+    ASSERT_EQ(::setenv("MC_CONTEXT_PAUSE_TTL_MS", "10000", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.context_pause_ttl_ms, 10000);
+}
+
+TEST_F(ContextPauseTtlEnvTest, ZeroIsIgnored) {
+    ASSERT_EQ(::setenv("MC_CONTEXT_PAUSE_TTL_MS", "0", 1), 0);
+    GlobalConfig config;
+    config.context_pause_ttl_ms = 99;  // sentinel preserved when rejected
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.context_pause_ttl_ms, 99);
+}
+
+TEST_F(ContextPauseTtlEnvTest, MaxBoundaryIsApplied) {
+    ASSERT_EQ(::setenv("MC_CONTEXT_PAUSE_TTL_MS", "600000", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.context_pause_ttl_ms, 600000);
+}
+
+TEST_F(ContextPauseTtlEnvTest, OutOfRangeIsIgnored) {
+    ASSERT_EQ(::setenv("MC_CONTEXT_PAUSE_TTL_MS", "600001", 1), 0);
+    GlobalConfig config;
+    config.context_pause_ttl_ms = 7;  // sentinel preserved when rejected
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.context_pause_ttl_ms, 7);
+}
+
+TEST_F(ContextPauseTtlEnvTest, NegativeIsIgnored) {
+    ASSERT_EQ(::setenv("MC_CONTEXT_PAUSE_TTL_MS", "-1", 1), 0);
+    GlobalConfig config;
+    config.context_pause_ttl_ms = 11;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.context_pause_ttl_ms, 11);
+}
+
+TEST_F(ContextPauseTtlEnvTest, NonNumericKeepsDefault) {
+    ASSERT_EQ(::setenv("MC_CONTEXT_PAUSE_TTL_MS", "abc", 1), 0);
+    GlobalConfig config;
+    config.context_pause_ttl_ms = 13;  // a typo must NOT re-enable the latch
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.context_pause_ttl_ms, 13);
+}
+
+TEST_F(ContextPauseTtlEnvTest, NumericSuffixKeepsDefault) {
+    ASSERT_EQ(::setenv("MC_CONTEXT_PAUSE_TTL_MS", "5000s", 1), 0);
+    GlobalConfig config;
+    config.context_pause_ttl_ms = 15;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.context_pause_ttl_ms, 15);
+}
+
+TEST_F(ContextPauseTtlEnvTest, EmptyStringKeepsDefault) {
+    ASSERT_EQ(::setenv("MC_CONTEXT_PAUSE_TTL_MS", "", 1), 0);
+    GlobalConfig config;
+    config.context_pause_ttl_ms = 17;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.context_pause_ttl_ms, 17);
+}
+
+// MC_RDMA_WORKER_IDLE_SPIN_US sets how long an RDMA transfer worker keeps
+// busy-polling after its device instance goes idle before it parks. The
+// default keeps the historical 100 ms; 0 parks immediately; the range is
+// capped at 10 s. A typo / out-of-range value must preserve the default.
+class RdmaWorkerIdleSpinEnvTest : public ::testing::Test {
+   protected:
+    void TearDown() override { ::unsetenv("MC_RDMA_WORKER_IDLE_SPIN_US"); }
+};
+
+TEST_F(RdmaWorkerIdleSpinEnvTest, DefaultIs100msWhenUnset) {
+    ::unsetenv("MC_RDMA_WORKER_IDLE_SPIN_US");
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.rdma_worker_idle_spin_us, 100000u);
+}
+
+TEST_F(RdmaWorkerIdleSpinEnvTest, ValidOverrideIsApplied) {
+    ASSERT_EQ(::setenv("MC_RDMA_WORKER_IDLE_SPIN_US", "1000", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.rdma_worker_idle_spin_us, 1000u);
+}
+
+TEST_F(RdmaWorkerIdleSpinEnvTest, ZeroIsAccepted) {
+    ASSERT_EQ(::setenv("MC_RDMA_WORKER_IDLE_SPIN_US", "0", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.rdma_worker_idle_spin_us, 0u);
+}
+
+TEST_F(RdmaWorkerIdleSpinEnvTest, MaxBoundaryIsApplied) {
+    ASSERT_EQ(::setenv("MC_RDMA_WORKER_IDLE_SPIN_US", "10000000", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.rdma_worker_idle_spin_us, 10000000u);
+}
+
+TEST_F(RdmaWorkerIdleSpinEnvTest, OutOfRangeKeepsDefault) {
+    ASSERT_EQ(::setenv("MC_RDMA_WORKER_IDLE_SPIN_US", "10000001", 1), 0);
+    GlobalConfig config;
+    config.rdma_worker_idle_spin_us = 11;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.rdma_worker_idle_spin_us, 11u);
+}
+
+TEST_F(RdmaWorkerIdleSpinEnvTest, NegativeKeepsDefault) {
+    ASSERT_EQ(::setenv("MC_RDMA_WORKER_IDLE_SPIN_US", "-1", 1), 0);
+    GlobalConfig config;
+    config.rdma_worker_idle_spin_us = 13;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.rdma_worker_idle_spin_us, 13u);
+}
+
+TEST_F(RdmaWorkerIdleSpinEnvTest, NonNumericKeepsDefault) {
+    ASSERT_EQ(::setenv("MC_RDMA_WORKER_IDLE_SPIN_US", "abc", 1), 0);
+    GlobalConfig config;
+    config.rdma_worker_idle_spin_us = 15;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.rdma_worker_idle_spin_us, 15u);
+}
+
+TEST_F(RdmaWorkerIdleSpinEnvTest, NumericSuffixKeepsDefault) {
+    ASSERT_EQ(::setenv("MC_RDMA_WORKER_IDLE_SPIN_US", "1000us", 1), 0);
+    GlobalConfig config;
+    config.rdma_worker_idle_spin_us = 17;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.rdma_worker_idle_spin_us, 17u);
+}
+
+TEST_F(RdmaWorkerIdleSpinEnvTest, EmptyStringKeepsDefault) {
+    ASSERT_EQ(::setenv("MC_RDMA_WORKER_IDLE_SPIN_US", "", 1), 0);
+    GlobalConfig config;
+    config.rdma_worker_idle_spin_us = 19;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.rdma_worker_idle_spin_us, 19u);
+}
+
 }  // namespace
 }  // namespace mooncake

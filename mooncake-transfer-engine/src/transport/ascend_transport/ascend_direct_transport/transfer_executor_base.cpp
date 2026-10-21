@@ -47,6 +47,12 @@ void markSlicesFailed(const std::vector<Transport::Slice*>& slice_list) {
 std::string EngineNameForDestAddr(
     const std::vector<TransferMetadata::BufferDesc>& buffers,
     const std::vector<std::string>& endpoints, uint64_t dest_addr) {
+    // A single-engine TE (embedded/standalone) publishes one endpoint at
+    // index 0, while buffer device_id is the logical NPU id and is often
+    // >= 1. That id is not an engine index.
+    if (endpoints.size() == 1) {
+        return endpoints.front();
+    }
     for (const auto& buf : buffers) {
         if (dest_addr < buf.addr || dest_addr - buf.addr >= buf.length) {
             continue;
@@ -119,6 +125,46 @@ void TransferExecutorBase::ParseExecutorEnvIntoInitParams(InitParams& params) {
         if (transfer_timeout.has_value()) {
             params.transfer_timeout = transfer_timeout.value();
             LOG(INFO) << "Set transfer timeout to:" << params.transfer_timeout;
+        }
+    }
+    // A transfer that hits the timeout above is retried, so the inner budget
+    // can be spent kTransferRetryTimes times. The Python wrapper returns once
+    // its own MC_TRANSFER_TIMEOUT elapses, so if that deadline does not cover
+    // every attempt it can return while a later attempt is still writing the
+    // target buffer and the caller cannot tell that it has to keep that buffer.
+    {
+        constexpr int64_t kMillisPerSecond = 1000;
+        constexpr int64_t kTransferTimeoutFloorSeconds = 5;
+        constexpr int64_t kDefaultTransferTimeoutSeconds = 30;
+        int64_t outer_timeout_sec = kDefaultTransferTimeoutSeconds;
+        if (char* outer_timeout_str = std::getenv("MC_TRANSFER_TIMEOUT")) {
+            // Mirrors how the Python wrapper reads this variable (parse then
+            // clamp to the floor), so the value compared here is the deadline
+            // that wrapper actually uses.
+            const int parsed = std::atoi(outer_timeout_str);
+            outer_timeout_sec = parsed > kTransferTimeoutFloorSeconds
+                                    ? parsed
+                                    : kTransferTimeoutFloorSeconds;
+        }
+        // int64 so a large ASCEND_TRANSFER_TIMEOUT cannot overflow the
+        // multiplication and wrap the bound negative.
+        const int64_t required_outer_timeout_sec =
+            (static_cast<int64_t>(kTransferRetryTimes) *
+                 params.transfer_timeout +
+             kMillisPerSecond - 1) /
+            kMillisPerSecond;
+        if (outer_timeout_sec <= required_outer_timeout_sec) {
+            LOG_FIRST_N(WARNING, 1)
+                << "MC_TRANSFER_TIMEOUT (" << outer_timeout_sec
+                << "s) does not cover the Ascend transfer budget: a transfer "
+                   "that hits ASCEND_TRANSFER_TIMEOUT ("
+                << params.transfer_timeout << "ms) is retried up to "
+                << kTransferRetryTimes
+                << " times, so the outer deadline must be greater than "
+                << required_outer_timeout_sec
+                << "s, or a batch transfer can return while the Ascend "
+                   "transport is still writing the target buffer. Raise "
+                   "MC_TRANSFER_TIMEOUT or lower ASCEND_TRANSFER_TIMEOUT.";
         }
     }
     char* use_short_connection_str = std::getenv("ASCEND_USE_SHORT_CONNECTION");
@@ -265,7 +311,10 @@ int TransferExecutorBase::initEngines() {
     const auto& endpoints = local_segment_desc->rank_info.endpoints;
     for (size_t idx = 0; idx < endpoints.size(); ++idx) {
         if (idx >= local_engine_contexts_.size()) {
-            LOG(ERROR) << "Endpoint count exceeds local_engine_contexts size";
+            LOG(ERROR) << "Endpoint count exceeds local_engine_contexts size, "
+                       << "idx: " << idx << ", endpoints: " << endpoints.size()
+                       << ", local_engine_contexts: "
+                       << local_engine_contexts_.size();
             return -1;
         }
         CHECK_ACL(aclrtSetCurrentContext(local_engine_contexts_[idx]));
@@ -468,7 +517,8 @@ void TransferExecutorBase::rollbackRegisteredMem(
 
 int TransferExecutorBase::registerMem(void* addr, size_t length,
                                       adxl::MemType mem_type,
-                                      bool use_buffer_pool) {
+                                      bool use_buffer_pool,
+                                      bool remote_accessible) {
     if (mem_type == adxl::MEM_HOST && use_buffer_pool) {
         LOG(INFO) << "Ignore register host mem:" << addr
                   << " when buffer pool is enabled.";
@@ -498,6 +548,9 @@ int TransferExecutorBase::registerMem(void* addr, size_t length,
     adxl::MemDesc mem_desc{};
     mem_desc.addr = reinterpret_cast<uintptr_t>(addr);
     mem_desc.len = length;
+    // HIXL MemDesc.local_only is the inverse of TransferEngine
+    // remote_accessible.
+    mem_desc.local_only = !remote_accessible;
 
     std::vector<EngineMemHandle> registered_mem_handles;
     registered_mem_handles.reserve(engine_indices.size());
@@ -520,7 +573,9 @@ int TransferExecutorBase::registerMem(void* addr, size_t length,
         auto adxl_ret = adxl_engines_[engine_idx]->RegisterMem(
             mem_desc, mem_type, mem_handle);
         if (adxl_ret != adxl::SUCCESS) {
-            LOG(ERROR) << "Register mem ret: " << adxl_ret
+            LOG(ERROR) << "Register mem ret: " << adxl_ret << ", addr: " << addr
+                       << ", length: " << length
+                       << ", engine index: " << engine_idx
                        << ", errmsg: " << aclGetRecentErrMsg();
             rollbackRegisteredMem(registered_mem_handles);
             return -1;
@@ -529,6 +584,7 @@ int TransferExecutorBase::registerMem(void* addr, size_t length,
         LOG(INFO) << "TransferExecutor register mem addr:" << addr
                   << ", length:" << length << ", mem type:"
                   << (mem_type == adxl::MEM_HOST ? "host" : "device")
+                  << ", local_only:" << mem_desc.local_only
                   << ", engine index:" << engine_idx;
     }
     std::lock_guard<std::mutex> lock(mem_handle_mutex_);

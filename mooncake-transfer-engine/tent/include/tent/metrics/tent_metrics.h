@@ -124,6 +124,31 @@ class TentMetrics {
     // are parked until shutdown and the last reclaim error is in the log.
     void recordBatchQuarantined();
 
+    // Why a task failed. "submit" failures were observed synchronously at
+    // submission (the transport rejected the request); "poll" failures were
+    // observed by polling after the request had been accepted; timeout and
+    // canceled come from the terminal status itself.
+    enum class TaskFailureReason { Submit, Poll, Timeout, Canceled };
+
+    // Record a task-level failure with its reason. Additive to the legacy
+    // read/write_failures_total counters (which stay label-compatible); also
+    // the only failure metric that records TIMEOUT/CANCELED outcomes.
+    void recordTaskFailure(TransportType tp, TaskFailureReason reason);
+
+    // In-flight transport attempts (gauge): incremented when an attempt is
+    // submitted, decremented when it finishes. Reflects how much work is
+    // sitting in the engine right now — a persistently high or stuck value
+    // is the signature of a stalled pipeline. Gauge updates are paired
+    // add/sub operations, so they execute whenever initialized and ignore
+    // setEnabled(): skipping one half of a pair across an enable/disable
+    // transition would permanently corrupt the gauge.
+    void recordInflightAttemptStarted(TransportType tp);
+    void recordInflightAttemptFinished(TransportType tp);
+
+    // Registered buffer bytes per transport (gauge), maintained on
+    // register/unregisterLocalMemory. Same pairing rule as above.
+    void recordRegisteredBufferBytes(TransportType tp, int64_t delta);
+
     enum class Stage {
         QueueWait,
         Dispatch,
@@ -199,6 +224,8 @@ class TentMetrics {
                                                                    "to"};
     static inline const std::array<std::string, 2> kAttemptLabels{"transport",
                                                                   "operation"};
+    static inline const std::array<std::string, 2> kTaskFailureLabels{
+        "transport", "reason"};
 
     // Hot-path metrics record through pre-resolved label cells (see
     // cached_metric.h). Label domain sizes: TransportType has
@@ -207,6 +234,7 @@ class TentMetrics {
     static constexpr size_t kTransportDomain =
         static_cast<size_t>(kNumTransportTypes);
     static constexpr size_t kAttemptDomain = kTransportDomain * 2;
+    static constexpr size_t kTaskFailureDomain = kTransportDomain * 4;
 
     // Stable slot indices into the cached-cell label domain.
     static size_t transportSlot(TransportType tp) {
@@ -214,6 +242,9 @@ class TentMetrics {
     }
     static size_t attemptSlot(TransportType tp, Request::OpCode op) {
         return static_cast<size_t>(tp) * 2 + (op == Request::READ ? 0u : 1u);
+    }
+    static size_t taskFailureSlot(TransportType tp, TaskFailureReason reason) {
+        return static_cast<size_t>(tp) * 4 + static_cast<size_t>(reason);
     }
 
     // Per-transport counters (label: transport). Values are int64_t.
@@ -248,6 +279,13 @@ class TentMetrics {
         "tent_transport_attempt_failures_total",
         "Physical transport attempts that terminated with FAILED",
         kAttemptLabels, kAttemptDomain};
+    // Task-level failures with a reason label, so Grafana can alert on the
+    // failure signature (submit vs poll vs timeout vs canceled) without log
+    // scraping. Additive to the legacy read/write_failures_total counters.
+    metrics::CachedDynamicCounter<2> task_failures_total_{
+        "tent_task_failures_total",
+        "Task-level failures by terminal transport and failure reason",
+        kTaskFailureLabels, kTaskFailureDomain};
     metrics::CachedDynamicCounter<1> deadline_infeasible_total_{
         "tent_deadline_infeasible_total",
         "Transfers whose deadline was already in the past at submit",
@@ -258,6 +296,18 @@ class TentMetrics {
         "tent_quarantined_batches_total",
         "Batches abandoned by lazyFreeBatch after repeated failed reclaim "
         "attempts; reclaimed only at engine teardown"};
+
+    // Gauges, backed by cached cells and updated with add/sub. Serialized as
+    // Prometheus gauges (current value per label), NOT via the counters_
+    // vector.
+    metrics::CachedDynamicCounter<1> inflight_attempts_{
+        "tent_inflight_attempts",
+        "In-flight transport attempts (submitted, not yet finished)",
+        kTransportLabel, kTransportDomain};
+    metrics::CachedDynamicCounter<1> registered_buffer_bytes_{
+        "tent_registered_buffer_bytes", "Registered local buffer bytes",
+        kTransportLabel, kTransportDomain};
+    std::vector<metrics::CachedDynamicCounter<1>*> gauges_;
 
     // Latency histograms use microseconds (us) as unit
     // Default buckets: 100us, 500us, 1ms, 5ms, 10ms, 50ms, 100ms, 500ms, 1s
@@ -320,6 +370,11 @@ class TentMetrics {
     // transport_attempt_latency_ histogram is serialized separately (see
     // getPrometheusMetrics / getJsonMetrics) via the same templated helpers.
     std::vector<metrics::CachedDynamicHistogram<1>*> histograms_;
+
+    // Serialize a gauge backed by a cached-cell counter: emits the current
+    // value per label with # TYPE ... gauge.
+    void serializeGaugePrometheus(metrics::CachedDynamicCounter<1>& gauge,
+                                  std::string& out) const;
 
     // Helper to register all metrics to the vectors
     void registerMetrics();

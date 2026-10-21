@@ -32,9 +32,9 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
-#include <limits>
-#include <numeric>
 #include <vector>
+
+#include "tent/runtime/deadline_mlu.h"
 
 namespace mooncake {
 namespace tent {
@@ -46,37 +46,73 @@ struct ArbFlow {
     size_t length;         // bytes to transfer
 };
 
-// Predicted Missed-Latency-per-Unit: predicted transfer time / remaining
-// deadline window. Higher == more urgent (closer to / past its deadline).
-// A flow with no deadline (deadline_ns == 0) is least urgent (MLU 0). A flow
-// already past its deadline, or that cannot fit its window at the given
-// bandwidth, gets a very high MLU so it sorts first. bw_bps <= 0 disables
-// prediction (returns 0 for everyone == no reordering).
-inline double PredictedMlu(const ArbFlow& f, uint64_t now_ns, double bw_bps) {
-    if (f.deadline_ns == 0 || bw_bps <= 0.0) return 0.0;
-    if (f.deadline_ns <= now_ns) return std::numeric_limits<double>::max();
-    const double window_s = (f.deadline_ns - now_ns) / 1e9;
-    const double predicted_time_s = static_cast<double>(f.length) / bw_bps;
-    return predicted_time_s / window_s;
+// Predicted MLU for one contending flow; see DeadlineMlu for the semantics.
+// `bytes_ahead` is what the NIC has to move before this flow: the bytes
+// already posted to it, plus those of the flows OrderByUrgency has placed
+// ahead of this one. Higher == more urgent (closer to / past its deadline).
+// bw_bps <= 0 disables prediction (returns 0 for everyone == no reordering).
+inline double PredictedMlu(const ArbFlow& f, uint64_t now_ns, double bw_bps,
+                           size_t bytes_ahead = 0) {
+    return DeadlineMlu(bytes_ahead, f.length, f.deadline_ns, now_ns, bw_bps);
 }
 
 // Return the indices of `flows` ordered most-urgent-first (highest predicted
-// MLU first). Ties and the no-deadline case keep original (FIFO) order — a
-// stable sort — so a symmetric set degrades to today's behavior. This does not
-// drop or admit anything; it only reorders selection among already-eligible,
-// same-tier flows.
+// MLU first). Ties keep the original relative order, so with no deadlines
+// anywhere the input order is preserved exactly. This never drops or admits
+// anything; it only reorders selection among already-eligible, same-tier
+// flows.
+//
+// The order is built one slot at a time: the flow that takes a slot is then
+// part of what the remaining flows wait behind, so its bytes join
+// `bytes_ahead` before the next slot is scored. `bytes_ahead` on entry is
+// what the NIC owes that is *not* in `flows`. Scoring every flow once
+// against the same value would instead treat all of them as simultaneous.
+//
+// Cost is O(n * kGreedySlots). Callers post a prefix of this order (the QP
+// budget decides how long), so only the head is worth resolving exactly;
+// past kGreedySlots the remainder is ranked in one pass against the bytes
+// accumulated so far.
+inline constexpr size_t kGreedySlots = 64;
+
 inline std::vector<size_t> OrderByUrgency(const std::vector<ArbFlow>& flows,
-                                          uint64_t now_ns, double bw_bps) {
-    std::vector<size_t> idx(flows.size());
-    std::iota(idx.begin(), idx.end(), size_t{0});
-    std::vector<double> mlu(flows.size());
-    for (size_t i = 0; i < flows.size(); ++i) {
-        mlu[i] = PredictedMlu(flows[i], now_ns, bw_bps);
+                                          uint64_t now_ns, double bw_bps,
+                                          size_t bytes_ahead = 0) {
+    const size_t n = flows.size();
+    std::vector<size_t> order;
+    order.reserve(n);
+    std::vector<bool> taken(n, false);
+
+    const size_t greedy = std::min(n, kGreedySlots);
+    for (size_t slot = 0; slot < greedy; ++slot) {
+        size_t best = n;
+        double best_mlu = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            if (taken[i]) continue;
+            const double mlu =
+                PredictedMlu(flows[i], now_ns, bw_bps, bytes_ahead);
+            // Strictly greater keeps the lowest index on ties (FIFO).
+            if (best == n || mlu > best_mlu) {
+                best = i;
+                best_mlu = mlu;
+            }
+        }
+        taken[best] = true;
+        order.push_back(best);
+        bytes_ahead += flows[best].length;
     }
-    std::stable_sort(idx.begin(), idx.end(), [&](size_t a, size_t b) {
-        return mlu[a] > mlu[b];  // higher MLU first; stable keeps FIFO on ties
-    });
-    return idx;
+    if (order.size() == n) return order;
+
+    std::vector<size_t> rest;
+    rest.reserve(n - order.size());
+    for (size_t i = 0; i < n; ++i)
+        if (!taken[i]) rest.push_back(i);
+    std::vector<double> mlu(n, 0.0);
+    for (size_t i : rest)
+        mlu[i] = PredictedMlu(flows[i], now_ns, bw_bps, bytes_ahead);
+    std::stable_sort(rest.begin(), rest.end(),
+                     [&](size_t a, size_t b) { return mlu[a] > mlu[b]; });
+    order.insert(order.end(), rest.begin(), rest.end());
+    return order;
 }
 
 }  // namespace tent

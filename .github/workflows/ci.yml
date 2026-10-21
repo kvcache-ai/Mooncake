@@ -9,28 +9,34 @@ on:
     branches:
       - "main"
       - "release/**"
-    types: [opened, synchronize, reopened, labeled]
+    # `labeled` is intentionally omitted. Auto-labeler already applies
+    # `run-ci`, so any new label (including `run-e2e-ci`) would retrigger
+    # this whole workflow and cancel the in-progress run. Same-SHA
+    # retrigger via the `run-ci` label lives in ci-on-label.yml.
+    types: [opened, synchronize, reopened]
   workflow_dispatch: {}
 
 permissions:
   contents: read
 
+# A branch push lets the running build finish: a full run outlasts the gap
+# between merges, so cancelling on every push left main with no completed
+# result. Newer pushes still replace the one pending run.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.event.pull_request.number || github.sha }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'push' }}
+
+env:
+  # Only push/schedule builds write: PR-scoped entries are invisible to
+  # other PRs and would evict the main entries every PR reads.
+  SCCACHE_GHA_RW_MODE: ${{ (github.event_name == 'push' || github.event_name == 'schedule') && 'READ_WRITE' || 'READ_ONLY' }}
 
 jobs:
   # Build the artifact tested below through the exact release wheel path. The
   # Ubuntu jobs remain consumer tests, not an alternate wheel build environment.
   build-wheel:
     needs: [spell-check, clang-format, check-paths]
-    if: &run-ci-for-source-changes >-
-      (needs.check-paths.outputs.should-run-downstream == 'true' ||
-       github.event_name == 'workflow_dispatch') &&
-      (github.event_name == 'push' ||
-       github.event_name == 'workflow_dispatch' ||
-       github.event.action == 'opened' ||
-       contains(github.event.pull_request.labels.*.name, 'run-ci'))
+    if: &run-ci-for-source-changes needs.check-paths.outputs.src == 'true'
     uses: ./.github/workflows/_build-wheel.yaml
     with:
       python-versions: '["3.10", "3.12"]'
@@ -38,17 +44,16 @@ jobs:
       version-override: 0.0.0.dev0
 
   test-wheel-ubuntu:
-    needs: [spell-check, clang-format, build-wheel]
-    if: >-
-      needs.build-wheel.result == 'success' &&
-      (github.event_name == 'push' ||
-       github.event_name == 'workflow_dispatch' ||
-       github.event.action == 'opened' ||
-       contains(github.event.pull_request.labels.*.name, 'run-ci'))
+    needs: [build-wheel]
     strategy:
       matrix:
-        ubuntu-version: [ubuntu-22.04, ubuntu-24.04]
-        python-version: ['3.10', '3.12']
+        include:
+          - ubuntu-version: ubuntu-22.04
+            python-version: '3.12'
+            artifact: mooncake-wheel-ci-py312
+          - ubuntu-version: ubuntu-24.04
+            python-version: '3.10'
+            artifact: mooncake-wheel-ci-py310
     runs-on: ${{ matrix.ubuntu-version }}
     steps:
     - uses: actions/checkout@v4
@@ -60,16 +65,10 @@ jobs:
       with:
         python-version: ${{ matrix.python-version }}
 
-    - name: Generate Python version tag
-      id: generate_tag_test
-      run: |
-        echo "python_version_tag=$(echo ${{ matrix.python-version }} | tr -d '.')" >> $GITHUB_OUTPUT
-      shell: bash
-
     - name: Download wheel artifact
       uses: actions/download-artifact@v4
       with:
-        name: mooncake-wheel-ci-py${{ steps.generate_tag_test.outputs.python_version_tag }}
+        name: ${{ matrix.artifact }}
         path: mooncake-wheel/dist
 
     - name: Verify wheel file exists
@@ -96,122 +95,187 @@ jobs:
         bash scripts/test_installation.sh
       shell: bash
 
-    - name: Run tests with ssd
+    - name: Run in-process master e2e tests (no mooncake_master)
       run: |
-        # Reserve port 50052 (mooncake_client RPC port) so the kernel never
-        # auto-allocates it as ephemeral source port for other outbound
-        # connections in the test suite. Without this, a random Python test
-        # connection can pick src_port=50052, leave a TIME_WAIT on
-        # <eth0_ip>:50052 for 60s, and block mooncake_client's bind to
-        # 0.0.0.0:50052 even with SO_REUSEADDR (Linux only relaxes
-        # TIME_WAIT+bind conflict for same-IP or loopback).
-        sudo sysctl -w net.ipv4.ip_local_reserved_ports=50052
         source test_env/bin/activate
-        MC_STORE_MEMCPY=false TEST_SSD_OFFLOAD_IN_EVICT=true ./scripts/run_tests.sh
-        rm -rf /tmp/mooncake_test_ssd
+        bash scripts/run_standalone_store_e2e.sh
         deactivate
       shell: bash
 
-    - name: Start Mooncake Master
-      run: |
-        source test_env/bin/activate
-        mkdir -p /tmp/mooncake_storage
-        mooncake_master \
-          --default_kv_lease_ttl=500 \
-          --eviction_high_watermark_ratio=0.95 \
-          --cluster_id=ci_test_cluster \
-          --port 50051 \
-          --enable_http_metadata_server=true &
-        sleep 3
-      shell: bash
-
-    - name: Run Python Tensor API Performance Test (CI check)
+    - name: Run tensor snapshot regressions
       env:
-        MOONCAKE_MASTER: "127.0.0.1:50051"
-        MOONCAKE_TE_META_DATA_SERVER: "http://127.0.0.1:8080/metadata"
-        MOONCAKE_PROTOCOL: "tcp"
+        MASTER_SERVER: "127.0.0.1:50061"
+        MC_METADATA_SERVER: "P2PHANDSHAKE"
         LOCAL_HOSTNAME: "127.0.0.1"
+        DEFAULT_KV_LEASE_TTL: "500"
       run: |
         source test_env/bin/activate
-        python scripts/test_tensor_api.py -n 1
+        export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}:/usr/local/lib
+        mooncake_master --port 50061 --default_kv_lease_ttl=500 \
+          >"$RUNNER_TEMP/tensor-snapshot-master.log" 2>&1 &
+        master_pid=$!
+        trap 'kill "$master_pid" 2>/dev/null || true; wait "$master_pid" 2>/dev/null || true' EXIT
+        python - <<'PY'
+        import socket
+        import time
+        for attempt in range(100):
+            try:
+                with socket.create_connection(("127.0.0.1", 50061), timeout=0.2):
+                    break
+            except OSError:
+                time.sleep(0.1)
+        else:
+            raise RuntimeError("Tensor snapshot test master did not start")
+        PY
+        python mooncake-wheel/tests/test_tensor_read_snapshot.py -v
+        python mooncake-wheel/tests/test_cuda_fabric_compat.py -v
       shell: bash
 
-    - name: Run Python Async API Test (CI check)
-      env:
-        MOONCAKE_MASTER: "127.0.0.1:50051"
-        MOONCAKE_TE_META_DATA_SERVER: "http://127.0.0.1:8080/metadata"
-        MOONCAKE_PROTOCOL: "tcp"
-        LOCAL_HOSTNAME: "127.0.0.1"
-      run: |
-        source test_env/bin/activate
-        python scripts/test_async_store.py
-      shell: bash
-
-    - name: Test Mooncake Copy/Move API
-      env:
-        MOONCAKE_MASTER: "127.0.0.1:50051"
-        MOONCAKE_TE_META_DATA_SERVER: "http://127.0.0.1:8080/metadata"
-        MOONCAKE_PROTOCOL: "tcp"
-        LOCAL_HOSTNAME: "127.0.0.1"
-      run: |
-        source test_env/bin/activate
-        python scripts/test_copy_move_api.py
-      shell: bash
-
-    - name: Run Python Drain HTTP E2E Test (CI check)
-      env:
-        MOONCAKE_MASTER: "127.0.0.1:50051"
-        MOONCAKE_TE_META_DATA_SERVER: "http://127.0.0.1:8080/metadata"
-        MOONCAKE_PROTOCOL: "tcp"
-        LOCAL_HOSTNAME: "127.0.0.1"
-      run: |
-        source test_env/bin/activate
-        export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
-        python scripts/test_drain_http_api.py --timeout-sec 90
-      shell: bash
-
-    - name: Run RPC Communicator Bandwidth Test
-      run: |
-        source test_env/bin/activate
-        python mooncake-transfer-engine/tests/rpc_communicator_test.py server --url 127.0.0.1:9004 --data-size 1 &
-        SERVER_PID=$!
-        sleep 5
-        timeout 10 python mooncake-transfer-engine/tests/rpc_communicator_test.py client --url 127.0.0.1:9004 --threads 2 --data-size 1 || true
-        kill $SERVER_PID 2>/dev/null || true
-        wait $SERVER_PID 2>/dev/null || true
-
-    - name: Test Mooncake PyTorch Backend (CPU Only)
+    - name: Run all PG CPU tests with installed PyTorch
+      if: matrix.ubuntu-version == 'ubuntu-22.04' && matrix.python-version == '3.12'
       env:
         MC_FORCE_TCP: "true"
+        # The runner has CUDA headers/nvcc but no usable GPU for arch detection.
+        TORCH_CUDA_ARCH_LIST: "8.0"
       run: |
         source test_env/bin/activate
-        python mooncake-pg/tests/test_pg_collectives.py
+        export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}:/usr/local/lib
+        python -m unittest discover -s mooncake-pg/tests -k CPU -v
       shell: bash
 
-    - name: Test PyTorch >= 2.13 Single-Buffer Collectives (CPU Only)
+    - name: Run Store API and RPC smoke tests
+      if: matrix.ubuntu-version == 'ubuntu-22.04' && matrix.python-version == '3.12'
       env:
-        MC_FORCE_TCP: "true"
+        MOONCAKE_MASTER: "127.0.0.1:50051"
+        MOONCAKE_TE_META_DATA_SERVER: "http://127.0.0.1:8080/metadata"
+        MOONCAKE_PROTOCOL: "tcp"
+        LOCAL_HOSTNAME: "127.0.0.1"
       run: |
         source test_env/bin/activate
-        python mooncake-pg/tests/test_pg_collectives.py \
-          TestMooncakePGCollectivesCPU.test_all_gather_into_tensor \
-          TestMooncakePGCollectivesCPU.test_reduce_scatter_sum
+        export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}:/usr/local/lib
+        python -m pip install safetensors
+
+        reserved_ports=$(sysctl -n net.ipv4.ip_local_reserved_ports)
+        sudo sysctl -w \
+          "net.ipv4.ip_local_reserved_ports=${reserved_ports:+$reserved_ports,}50052"
+
+        ./scripts/ci/run_store_api_smoke.sh
+        ./scripts/ci/run_rpc_smoke.sh
       shell: bash
 
-    - name: Test Safetensor Functions
+    - name: Run SSD offload and promotion end-to-end tests
+      if: matrix.ubuntu-version == 'ubuntu-22.04' && matrix.python-version == '3.12'
       run: |
         source test_env/bin/activate
-        pip install safetensors
-        python -m unittest mooncake-wheel.tests.test_safetensor_functions
+        ./scripts/ci/run_ssd_offload_smoke.sh
       shell: bash
 
-  build-flags:
-    needs: [spell-check, clang-format, check-paths]
+  unit-tests:
+    name: CTest unit tests (Python 3.12)
+    needs: [check-paths]
     if: *run-ci-for-source-changes
     runs-on: ubuntu-22.04
-    strategy:
-      matrix:
-        python-version: ['3.10', '3.12']
+    env:
+      CI: "true"
+      SCCACHE_GHA_ENABLED: "true"
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+
+    - name: Set up Python 3.12
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Install and start etcd
+      uses: ./.github/actions/setup-etcd
+
+    - name: Free up disk space
+      uses: ./.github/actions/free-disk-space
+
+    - name: Install CUDA Toolkit
+      uses: Jimver/cuda-toolkit@v0.2.24
+      with:
+        cuda: '12.8.1'
+        linux-local-args: '["--toolkit"]'
+        method: 'network'
+        sub-packages: '["nvcc"]'
+
+    - name: Install build utilities and dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y ninja-build
+        sudo bash -x dependencies.sh -y
+        echo "/usr/local/go/bin" >> "$GITHUB_PATH"
+      shell: bash
+
+    - name: Set up compiler cache
+      uses: ./.github/actions/setup-sccache
+
+    - name: Configure project with unit tests
+      run: |
+        cmake -S . -B build -G Ninja \
+          -DUSE_HTTP=ON \
+          -DUSE_CXL=ON \
+          -DUSE_UB=ON \
+          -DUSE_ETCD=ON \
+          -DUSE_CUDA=ON \
+          -DUSE_MNNVL=ON \
+          -DWITH_P2P_STORE=ON \
+          -DWITH_CONDUCTOR=ON \
+          -DSTORE_USE_ETCD=ON \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DBUILD_UNIT_TESTS=ON \
+          -DENABLE_SCCACHE=ON
+      shell: bash
+
+    - name: Configure CUDA driver runtime
+      uses: ./.github/actions/setup-cuda-runtime
+
+    - name: Build project and unit tests
+      run: |
+        cmake --build build --parallel 128
+        sudo -E cmake --install build
+      shell: bash
+
+    - name: Run Mooncake Store Rust unit tests
+      env:
+        MOONCAKE_BUILD_DIR: ${{ github.workspace }}/build
+        MOONCAKE_STORE_LIB_DIR: ${{ github.workspace }}/build/mooncake-store/src
+        MOONCAKE_STORE_INCLUDE_DIR: ${{ github.workspace }}/mooncake-store/include
+      run: |
+        export LD_LIBRARY_PATH="$GITHUB_WORKSPACE/build/mooncake-asio:$GITHUB_WORKSPACE/build/mooncake-store/src:$GITHUB_WORKSPACE/build/mooncake-store/src/cachelib_memory_allocator:$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src:$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src/common/base:$GITHUB_WORKSPACE/build/mooncake-common/etcd:/usr/local/lib:${LD_LIBRARY_PATH:-}"
+        cargo test --manifest-path mooncake-store/rust/Cargo.toml --lib
+      shell: bash
+
+    - name: Start Metadata Server
+      uses: ./.github/actions/setup-metadata-server
+
+    - name: Run all CTest unit tests
+      id: ctest
+      uses: ./.github/actions/run-ctest
+      with:
+        junit-report: build/test-results/ctest.xml
+        label-exclude: '^nvlink_gpu$'
+
+    - name: Preserve CTest diagnostics
+      if: ${{ always() && steps.ctest.outcome == 'failure' }}
+      uses: ./.github/actions/ctest-diagnostics
+      with:
+        summary-title: PR CTest failure
+        artifact-name: ctest-diagnostics-pr
+        junit-report: build/test-results/ctest.xml
+        failed-tests-log: build/Testing/Temporary/LastTestsFailed.log
+        last-test-log: build/Testing/Temporary/LastTest.log
+
+  build-flags:
+    needs: [check-paths]
+    if: *run-ci-for-source-changes
+    runs-on: ubuntu-22.04
     env:
       CI: "true"
       SCCACHE_GHA_ENABLED: "true"
@@ -223,10 +287,10 @@ jobs:
       with:
         persist-credentials: false
 
-    - name: Set up Python ${{ matrix.python-version }}
+    - name: Set up Python 3.12
       uses: actions/setup-python@v5
       with:
-        python-version: ${{ matrix.python-version }}
+        python-version: '3.12'
 
     - name: Free up disk space
       uses: ./.github/actions/free-disk-space
@@ -240,15 +304,8 @@ jobs:
         sub-packages: '["nvcc", "nvrtc-dev"]'
         non-cuda-sub-packages: '["libcusparse-dev", "libcublas-dev", "libcusolver-dev"]'
 
-    - name: Run sccache-cache
-      uses: mozilla-actions/sccache-action@v0.0.9
-
-    - name: Configure sccache
-      uses: actions/github-script@v7
-      with:
-        script: |
-          core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
-          core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+    - name: Set up compiler cache
+      uses: ./.github/actions/setup-sccache
 
     - name: Install dependencies
       run: |
@@ -291,11 +348,6 @@ jobs:
 
   spell-check:
     name: Spell Check with Typos
-    if: &run-ci >-
-      (github.event_name == 'push' ||
-       github.event_name == 'workflow_dispatch' ||
-       github.event.action == 'opened' ||
-       contains(github.event.pull_request.labels.*.name, 'run-ci'))
     runs-on: ubuntu-22.04
     steps:
     - name: Checkout Actions Repository
@@ -307,7 +359,6 @@ jobs:
 
   reshard-type-check:
     name: Check reshard manifest types
-    if: *run-ci
     runs-on: ubuntu-22.04
     steps:
     - uses: actions/checkout@v4
@@ -325,9 +376,8 @@ jobs:
         bash scripts/check_reshard_types.sh
       shell: bash
 
-  release-gate-tests:
-    name: Test TestPyPI release gate
-    if: *run-ci
+  ci-script-tests:
+    name: Test CI scripts
     runs-on: ubuntu-22.04
     steps:
     - uses: actions/checkout@v4
@@ -342,13 +392,29 @@ jobs:
     - name: Run focused release gate tests
       run: |
         python -m pip install --disable-pip-version-check \
-          packaging pytest==8.3.5
+          packaging pytest==8.3.5 pyyaml
         python -m pytest -q mooncake-wheel/tests/test_testpypi_wheel_gate.py
+      shell: bash
+
+    - name: Test CI service and smoke scripts
+      run: python -m unittest discover -s scripts/ci/tests -v
+
+  tone-script-tests:
+    name: Test external CI lifecycle helpers
+    runs-on: ubuntu-22.04
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+
+    - name: Run focused shell regression tests
+      run: |
+        bash scripts/tone_tests/tests/test_common_cleanup.sh
+        python3 -m unittest discover -s scripts/tone_tests/tests -p 'test_*.py'
       shell: bash
 
   clang-format:
     name: Check code format
-    if: *run-ci
     runs-on: ubuntu-22.04
     steps:
     - name: Checkout Actions Repository
@@ -376,6 +442,9 @@ jobs:
         if [ "${{ github.event_name }}" == "pull_request" ]; then
           # For PRs: compare against the target branch
           BASE_REF="origin/${{ github.base_ref }}"
+        elif [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+          # Manual runs have no previous push SHA.
+          BASE_REF="origin/${{ github.event.repository.default_branch }}"
         else
           # For push events: use github.event.before to handle multi-commit pushes
           BEFORE_SHA="${{ github.event.before }}"
@@ -391,61 +460,87 @@ jobs:
         ./scripts/code_format.sh --check --changed-lines --base "${BASE_REF}"
       shell: bash
 
-
-  docs-check:
-    name: Check Sphinx docs build
-    if: *run-ci
+  python-lint:
+    name: Check Python with Ruff
     runs-on: ubuntu-22.04
     steps:
     - uses: actions/checkout@v4
       with:
-        fetch-depth: 2
+        fetch-depth: 0
         persist-credentials: false
 
-    - uses: dorny/paths-filter@v3
-      id: filter
+    - name: Set up Python 3.12
+      uses: actions/setup-python@v5
       with:
-        filters: |
-          docs:
-            - 'docs/**'
-            - 'docs/requirements-docs.txt'
+        python-version: '3.12'
+
+    - name: Install Ruff
+      run: python -m pip install --disable-pip-version-check ruff==0.6.9
+
+    - name: Check changed Python files
+      run: |
+        if [ "${{ github.event_name }}" = "pull_request" ]; then
+          base_ref="origin/${{ github.base_ref }}"
+        elif [ "${{ github.event.before }}" = \
+               "0000000000000000000000000000000000000000" ]; then
+          base_ref="origin/${{ github.event.repository.default_branch }}"
+        elif [ -n "${{ github.event.before }}" ]; then
+          base_ref="${{ github.event.before }}"
+        else
+          base_ref="HEAD^"
+        fi
+
+        mapfile -d '' python_files < <(
+          git diff --name-only --diff-filter=ACMR -z "$base_ref"...HEAD -- \
+            '*.py' \
+            ':(exclude)extern/**' \
+            ':(exclude)FAST25-release/**'
+        )
+        if [ "${#python_files[@]}" -eq 0 ]; then
+          echo "No changed Python files to check."
+          exit 0
+        fi
+
+        ruff check "${python_files[@]}"
+        python scripts/ci/check_changed_python_format.py \
+          "$base_ref" "${python_files[@]}"
+      shell: bash
+
+
+  docs-check:
+    name: Check Sphinx docs build
+    needs: check-paths
+    if: needs.check-paths.outputs.docs == 'true'
+    runs-on: ubuntu-22.04
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
 
     - name: Set up Python
-      if: steps.filter.outputs.docs == 'true'
       uses: actions/setup-python@v5
       with:
         python-version: '3.12'
 
     - name: Install documentation dependencies
-      if: steps.filter.outputs.docs == 'true'
       run: |
         python -m pip install --upgrade pip
         pip install -r docs/requirements-docs.txt
 
     - name: Build docs with strict mode
-      if: steps.filter.outputs.docs == 'true'
-      run: |
-        cd docs
-        make html SPHINXOPTS=-W
-      shell: bash
-
+      working-directory: docs
+      run: make html SPHINXOPTS=-W
 
   check-paths:
-    if: *run-ci
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
     outputs:
-      should-run-downstream: ${{ steps.dispatch-override.outputs.src || steps.filter.outputs.src }}
-      should-run-tent: ${{ steps.dispatch-override.outputs.tent || steps.filter.outputs.tent }}
-      should-run-reshard: ${{ steps.dispatch-override.outputs.reshard || steps.filter.outputs.reshard }}
+      src: ${{ github.event_name == 'workflow_dispatch' && 'true' || steps.filter.outputs.src }}
+      tent: ${{ github.event_name == 'workflow_dispatch' && 'true' || steps.filter.outputs.tent }}
+      docs: ${{ github.event_name == 'workflow_dispatch' && 'true' || steps.filter.outputs.docs }}
     steps:
-      # workflow_dispatch has no PR/push diff context — skip paths-filter and default to true
-      - name: Default to true for workflow_dispatch
-        id: dispatch-override
-        if: github.event_name == 'workflow_dispatch'
-        run: |
-          echo "src=true" >> $GITHUB_OUTPUT
-          echo "tent=true" >> $GITHUB_OUTPUT
-          echo "reshard=true" >> $GITHUB_OUTPUT
       - uses: actions/checkout@v4
         if: github.event_name != 'workflow_dispatch'
         with:
@@ -455,10 +550,14 @@ jobs:
         if: github.event_name != 'workflow_dispatch'
         id: filter
         with:
+          # PRs use their base branch; pushes compare against the previous push
+          # on this ref, including release branches.
+          base: ${{ github.event_name == 'push' && github.ref || '' }}
           filters: |
             src:
               - 'mooncake-*/**'
               - 'extern/**'
+              - 'cmake/**'
               - 'CMakeLists.txt'
               - 'dependencies.sh'
               - 'scripts/**'
@@ -466,53 +565,20 @@ jobs:
               - '.github/workflows/**'
             tent:
               - 'mooncake-transfer-engine/**'
+              - 'mooncake-store/src/transfer_task.cpp'
+              - 'mooncake-store/tests/transfer_task_test.cpp'
+              - 'mooncake-store/tests/CMakeLists.txt'
               - 'mooncake-common/**'
+              - 'extern/**'
+              - 'cmake/**'
               - 'CMakeLists.txt'
               - 'dependencies.sh'
+              - 'scripts/ci/run_transfer_engine_rust_smoke.sh'
+              - '.github/actions/**'
               - '.github/workflows/ci.yml'
-            reshard:
-              - 'mooncake-reshard/**'
-              - 'mooncake-wheel/pyproject.toml'
-              - 'requirements.txt'
-              - 'scripts/check_reshard_types.sh'
+            docs:
+              - 'docs/**'
               - '.github/workflows/ci.yml'
-
-  reshard-test:
-    name: Test Reshard (Python ${{ matrix.python-version }})
-    needs: [check-paths]
-    if: >-
-      (needs.check-paths.outputs.should-run-reshard == 'true' ||
-       github.event_name == 'workflow_dispatch') &&
-      (github.event_name == 'push' ||
-       github.event_name == 'workflow_dispatch' ||
-       github.event.action == 'opened' ||
-       contains(github.event.pull_request.labels.*.name, 'run-ci'))
-    runs-on: ubuntu-22.04
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ['3.10', '3.12']
-    steps:
-    - uses: actions/checkout@v4
-      with:
-        persist-credentials: false
-
-    - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v5
-      with:
-        python-version: ${{ matrix.python-version }}
-
-    - name: Install Reshard test dependencies
-      run: |
-        python -m pip install --disable-pip-version-check --upgrade pip
-        python -m pip install --disable-pip-version-check \
-          -r requirements.txt pytest==8.3.5
-
-    - name: Test Reshard
-      run: |
-        PYTHONPATH=mooncake-reshard/python \
-          python -m pytest -q mooncake-reshard/tests
-      shell: bash
 
   build-wheel-cu13:
     needs: [spell-check, clang-format, check-paths]
@@ -520,8 +586,21 @@ jobs:
     uses: ./.github/workflows/_build-wheel.yaml
     with:
       variant: cuda13
-      python-versions: '["3.10", "3.12"]'
+      python-versions: '["3.12"]'
       artifact-prefix: mooncake-wheel-cu130
+      version-override: 0.0.0.dev0
+
+  # arm64 default wheels use a different transport set (USE_MNNVL) than
+  # x86_64 (USE_INTRA_NVLINK), so build one here instead of only at release.
+  build-wheel-cu13-arm64:
+    needs: [spell-check, clang-format, check-paths]
+    if: *run-ci-for-source-changes
+    uses: ./.github/workflows/_build-wheel.yaml
+    with:
+      variant: cuda13
+      architecture: arm64
+      python-versions: '["3.12"]'
+      artifact-prefix: mooncake-wheel-cu130-arm64
       version-override: 0.0.0.dev0
 
   build-wheel-efa:
@@ -532,31 +611,13 @@ jobs:
 
   build-wheel-rocm:
     needs: [spell-check, clang-format, check-paths]
-    if: >-
-      (needs.check-paths.outputs.should-run-downstream == 'true' ||
-       github.event_name == 'workflow_dispatch') &&
-      (github.event_name == 'push' ||
-       github.event_name == 'workflow_dispatch' ||
-       github.event.action == 'opened' ||
-       contains(github.event.pull_request.labels.*.name, 'run-ci'))
+    if: needs.check-paths.outputs.src == 'true'
     uses: ./.github/workflows/ci_rocm.yml
-    secrets: inherit
-
-  integration-test:
-    needs: [build-wheel-cu13, check-paths]
-    if: needs.check-paths.outputs.should-run-downstream == 'true'
-    uses: ./.github/workflows/integration-test.yml
     secrets: inherit
 
   tent-ci:
     needs: [spell-check, clang-format, check-paths]
-    if: >-
-      (needs.check-paths.outputs.should-run-tent == 'true' ||
-       github.event_name == 'workflow_dispatch') &&
-      (github.event_name == 'push' ||
-       github.event_name == 'workflow_dispatch' ||
-       github.event.action == 'opened' ||
-       contains(github.event.pull_request.labels.*.name, 'run-ci'))
+    if: needs.check-paths.outputs.tent == 'true'
     runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
@@ -567,7 +628,7 @@ jobs:
             need_cuda: true
             metrics_flags: ''
           - name: cuda-off
-            cmake_flags: '-DUSE_CUDA=OFF'
+            cmake_flags: '-DUSE_CUDA=OFF -DUSE_EVENT_DRIVEN_COMPLETION=ON'
             need_cuda: false
             metrics_flags: ''
           - name: cuda-off-metrics-on
@@ -578,6 +639,15 @@ jobs:
           # Debug build also catches ODR/link errors hidden by optimization.
           - name: ub-mock
             cmake_flags: '-DUSE_CUDA=OFF -DUSE_UB=ON -DCMAKE_BUILD_TYPE=Debug'
+            need_cuda: false
+            metrics_flags: ''
+          # Compile against stub ACL headers and embed host-only ACL stubs in
+          # transfer_engine for Rust checks; no CANN, NPU, or libmf_smem is required.
+          - name: memfabric-mock
+            cmake_flags: >-
+              -DUSE_CUDA=OFF -DUSE_MEMFABRIC=ON
+              -DWITH_STORE=OFF -DWITH_STORE_RUST=OFF
+              -DCMAKE_BUILD_TYPE=Debug
             need_cuda: false
             metrics_flags: ''
     name: tent-ci (${{ matrix.name }})
@@ -603,15 +673,8 @@ jobs:
         method: 'network'
         sub-packages: '["nvcc", "nvrtc-dev"]'
 
-    - name: Run sccache-cache
-      uses: mozilla-actions/sccache-action@v0.0.9
-
-    - name: Configure sccache
-      uses: actions/github-script@v7
-      with:
-        script: |
-          core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
-          core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+    - name: Set up compiler cache
+      uses: ./.github/actions/setup-sccache
 
     - name: Install dependencies
       run: |
@@ -638,8 +701,12 @@ jobs:
           export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
         fi
         cd build-tent
-        cmake --build .
-        sudo cmake --install .
+        if [ "${{ matrix.name }}" = "memfabric-mock" ]; then
+          cmake --build . --target tent_memfabric_transport_test transfer_engine
+        else
+          cmake --build .
+          sudo cmake --install .
+        fi
       shell: bash
 
     # Check the Transfer Engine Rust crate against the freshly built C++
@@ -664,6 +731,20 @@ jobs:
         cargo clean
       shell: bash
 
+    - name: Test Store completion and engine reuse with TENT
+      if: matrix.name == 'cuda-off'
+      run: |
+        ctest --test-dir build-tent --output-on-failure --no-tests=error \
+          -R '^(transfer_task_tent_completion_test|standalone_client_tent_test)$'
+      shell: bash
+
+    - name: Test TENT notification handle ownership
+      if: matrix.name == 'cuda-off'
+      run: |
+        ctest --test-dir build-tent --output-on-failure --no-tests=error \
+          -R '^tent_compat_notify_test$'
+      shell: bash
+
     # Only run tests on the cuda-off leg. GitHub runners have no real GPU;
     # with USE_CUDA=ON tent's cuda_probe hits the CUDA stub library at
     # runtime and drives some dispatch paths past the fake objects the
@@ -673,11 +754,17 @@ jobs:
       id: ctest
       if: '!matrix.need_cuda'
       run: |
+        ctest_args=()
+        if [ "${{ matrix.name }}" = "memfabric-mock" ]; then
+          # Only the MemFabric test executable is built in this test directory.
+          ctest_args=(-R '^tent_memfabric_transport_test$' --no-tests=error --timeout 120)
+        fi
         cd build-tent
         mkdir -p test-results
         ctest --test-dir mooncake-transfer-engine/tent/tests -j \
           --output-on-failure \
-          --output-junit "$GITHUB_WORKSPACE/build-tent/test-results/ctest.xml"
+          --output-junit "$GITHUB_WORKSPACE/build-tent/test-results/ctest.xml" \
+          "${ctest_args[@]}"
       shell: bash
 
     - name: Preserve TENT CTest diagnostics
@@ -714,35 +801,72 @@ jobs:
 
   ci-gate:
     name: CI Gate
-    if: always()
+    # A cancelled branch push run reports no result rather than a failed gate.
+    # Everywhere else the gate must fail: a skipped gate would satisfy the
+    # required check for a PR head whose run was cancelled.
+    if: ${{ (github.event_name != 'push' && always()) || !cancelled() }}
     needs:
+      - check-paths
       - spell-check
       - clang-format
+      - python-lint
       - docs-check
       - reshard-type-check
-      - release-gate-tests
-      - reshard-test
+      - ci-script-tests
+      - tone-script-tests
       - build-wheel
+      - unit-tests
       - build-flags
       - test-wheel-ubuntu
       - build-wheel-cu13
+      - build-wheel-cu13-arm64
       - build-wheel-efa
       - build-wheel-rocm
       - tent-ci
-      - integration-test
     runs-on: ubuntu-latest
     steps:
-      - name: Check required job results
-        run: |
-          failing=$(echo "$NEEDS_JSON" | jq -r '
-            to_entries[] |
-            select(.value.result != "success" and .value.result != "skipped") |
-            "\(.key): \(.value.result)"')
-          if [ -n "$failing" ]; then
-            echo "::error::The following jobs failed or were cancelled:"
-            echo "$failing"
-            exit 1
-          fi
-          echo "All checks passed or were acceptably skipped."
+      # Each path-gated group must succeed when selected and be skipped otherwise.
+      # A failed selector must never turn skipped builds into a successful gate.
+      - name: Check unconditional jobs
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
+          PASSED: >-
+            ${{ needs.check-paths.result == 'success' &&
+                needs.spell-check.result == 'success' &&
+                needs.clang-format.result == 'success' &&
+                needs.python-lint.result == 'success' &&
+                needs.reshard-type-check.result == 'success' &&
+                needs.ci-script-tests.result == 'success' &&
+                needs.tone-script-tests.result == 'success' }}
+        run: |
+          echo "$NEEDS_JSON"
+          test "$PASSED" = true
+
+      - name: Check source jobs
+        env:
+          EXPECTED: ${{ needs.check-paths.outputs.src == 'true' && 'success' || 'skipped' }}
+          RESULTS: >-
+            ${{ needs.build-wheel.result }}
+            ${{ needs.unit-tests.result }}
+            ${{ needs.build-flags.result }}
+            ${{ needs.test-wheel-ubuntu.result }}
+            ${{ needs.build-wheel-cu13.result }}
+            ${{ needs.build-wheel-cu13-arm64.result }}
+            ${{ needs.build-wheel-efa.result }}
+            ${{ needs.build-wheel-rocm.result }}
+        run: |
+          for result in $RESULTS; do
+            test "$result" = "$EXPECTED" || exit 1
+          done
+
+      - name: Check TENT jobs
+        env:
+          EXPECTED: ${{ needs.check-paths.outputs.tent == 'true' && 'success' || 'skipped' }}
+          RESULT: ${{ needs.tent-ci.result }}
+        run: test "$RESULT" = "$EXPECTED"
+
+      - name: Check documentation job
+        env:
+          EXPECTED: ${{ needs.check-paths.outputs.docs == 'true' && 'success' || 'skipped' }}
+          RESULT: ${{ needs.docs-check.result }}
+        run: test "$RESULT" = "$EXPECTED"

@@ -5,8 +5,9 @@
 #include <memory>
 #include <mutex>
 #include <string>
-#include <utility>
 #include <vector>
+
+#include "config/registered_pinned_memory_config.h"
 
 namespace mooncake {
 
@@ -62,7 +63,7 @@ class RegisteredPinnedMemoryManager {
 #if defined(MOONCAKE_STORE_TEST)
    public:
 #endif
-    RegisteredPinnedMemoryManager(std::pair<bool, uint64_t> config,
+    RegisteredPinnedMemoryManager(RegisteredPinnedMemoryConfig config,
                                   PinOps pin_ops);
 #if defined(MOONCAKE_STORE_TEST)
    private:
@@ -71,7 +72,6 @@ class RegisteredPinnedMemoryManager {
     bool release(RegisteredPinnedRegion* region);
     void remove_inactive_region_locked(void* addr, size_t size);
 
-    const bool enabled_;
     const uint64_t limit_bytes_;
     const PinOps pin_ops_;
 

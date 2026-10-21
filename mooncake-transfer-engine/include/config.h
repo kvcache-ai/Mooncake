@@ -57,6 +57,10 @@ struct GlobalConfig {
     // one it honors the operator's value, clamped to the hardware.  The RDMA
     // transport passes max_wr to ibv_create_qp() and is unaffected.
     bool max_wr_from_env = false;
+    // 1 = signal every RDMA WR (historical). >1 enables unsignaled WRs with
+    // a signaled completion every N WRs plus the end of each ibv_post_send
+    // chain. Override via MC_RDMA_SIGNAL_INTERVAL.
+    int rdma_signal_interval = 1;
     size_t max_inline = 64;
     ibv_mtu mtu_length = IBV_MTU_4096;
     uint16_t handshake_port = 12001;
@@ -74,6 +78,12 @@ struct GlobalConfig {
     // Cooldown before retrying a failed RDMA peer rail. Override via
     // MC_RDMA_RAIL_PAUSE_SECONDS.
     uint64_t rdma_rail_pause_seconds = 30;
+    // How long an RDMA transfer worker keeps busy-polling after its device
+    // instance becomes idle before it parks, in microseconds. A polling worker
+    // occupies a whole CPU core; a parked one pays a thread wake-up when the
+    // next transfer arrives. 0 parks as soon as the instance is idle. Override
+    // via MC_RDMA_WORKER_IDLE_SPIN_US.
+    uint64_t rdma_worker_idle_spin_us = 100000;
     bool metacache = true;
     // Periodically refresh Transfer Engine metadata-derived local caches. 0
     // disables the background poller and preserves the manual
@@ -91,6 +101,12 @@ struct GlobalConfig {
     // not-yet-posted slices fail/redispatch instead of hanging. 0 disables.
     // Override via MC_CONN_PAUSE_TTL_MS.
     int conn_pause_ttl_ms = 0;
+    // Context-level circuit-breaker pause. Repeated local WC failures
+    // deactivate the local RNIC context for this many milliseconds. The
+    // monitor then reactivates it with a reset failure count. Must be positive
+    // so a breaker trip cannot recreate the legacy permanent latch. Override
+    // via MC_CONTEXT_PAUSE_TTL_MS.
+    int context_pause_ttl_ms = 5000;
     uint16_t rpc_min_port = 15000;
     uint16_t rpc_max_port = 17000;
     bool use_ipv6 = false;
@@ -111,6 +127,21 @@ struct GlobalConfig {
     // NICs the topology reports as closest to that GPU. Set via
     // MC_EFA_NIC_SELECTION=all|local; see efa_transport.cpp for the trade-off.
     EfaNicSelection efa_nic_selection = EfaNicSelection::ALL;
+    // Cap on EFA CQ poller threads. Set via MC_EFA_CQ_THREADS; 0 disables the
+    // cap.
+    int efa_cq_threads = 1;
+    // Register GPU memory with ibv_reg_mr() through the nvidia-peermem kernel
+    // module instead of exporting a dma_buf. Set via WITH_NVIDIA_PEERMEM.
+    bool with_nvidia_peermem = true;
+    // Register dma_buf MRs with mlx5 Data Direct. Set via MC_RDMA_DATA_DIRECT.
+    bool rdma_data_direct = false;
+    // Pair Data Direct registrations and topology with the GPU's PCI root.
+    // Fail-closed: topology discovery is rejected when any NIC has no Data
+    // Direct function or any GPU has no paired NIC, instead of falling back
+    // to PCIe distance (which could select a NIC that cannot register the
+    // memory). Set via MC_RDMA_DATA_DIRECT_PAIRING; requires
+    // MC_RDMA_DATA_DIRECT.
+    bool rdma_data_direct_pairing = false;
     size_t eic_max_block_size = 64UL * 1024 * 1024;
     EndpointStoreType endpoint_store_type = EndpointStoreType::SIEVE;
     int ib_traffic_class = -1;
@@ -131,7 +162,7 @@ struct GlobalConfig {
     // Install RdmaTwoSidedTransport (CtrlChannel notify) instead of classic
     // one-sided RdmaTransport. MC_USE_RDMA_TWOSIDED.
     bool use_rdma_twosided = false;
-    // RDMA CtrlChannel notify path. MC_RDMA_NOTIFY_ENABLED.
+    // RDMA notifications for rdma and rdma_twosided. MC_RDMA_NOTIFY_ENABLED.
     bool rdma_notify_enabled = true;
     // Ctrl recv/send slot count and slot size. MC_RDMA_NOTIFY_RECV_COUNT /
     // MC_RDMA_NOTIFY_BUFFER_SIZE.
@@ -140,7 +171,7 @@ struct GlobalConfig {
     // Local pending SEND cap; actual cap is min(this, peer notify_rq_depth).
     // MC_RDMA_NOTIFY_MAX_PENDING_SENDS.
     size_t rdma_notify_max_pending_sends = 64;
-    // Fall back to OOB RPC notify when CtrlChannel is unavailable.
+    // Allow OOB RPC fallback when the RDMA notification path is unavailable.
     // MC_RDMA_NOTIFY_OOB_FALLBACK.
     bool rdma_notify_oob_fallback = true;
     // Upper bound for waiting on an in-flight CtrlChannel connect to the same
