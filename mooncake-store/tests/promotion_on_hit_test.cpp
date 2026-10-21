@@ -3,6 +3,7 @@
 // layer.
 
 #include "master_service.h"
+#include "master_service/master_service_test_peer.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -20,7 +21,7 @@
 
 #include <unistd.h>
 
-#include "tenant_quota_policy_store.h"
+#include "tenant/quota_policy_store.h"
 #include "types.h"
 
 namespace mooncake::test {
@@ -47,99 +48,105 @@ class PromotionOnHitTest : public ::testing::Test {
         google::ShutdownGoogleLogging();
     }
 
-    // Friend access to MasterService::promotion_admission_threshold_, which
-    // is otherwise private. PromotionOnHitTest is friended; TEST_F-generated
-    // subclasses are not, hence this static funnel.
+    // Inspect admission state through the shared test peer.
     static uint32_t GetPromotionAdmissionThresholdForTesting(
         MasterService* service) {
-        return service->promotion_admission_threshold_;
+        return MasterServiceTestPeer::PromotionAdmissionThreshold(*service);
     }
 
     static size_t CountPromotionCandidatesForTesting(MasterService* service,
                                                      const TenantId& tenant) {
-        return service->CountCandidatesForTesting(tenant);
+        return MasterServiceTestPeer(*service).CountCandidatesForTesting(
+            tenant);
     }
 
     static constexpr uint32_t MaxPromotionCandidateRetriesForTesting() {
-        return MasterService::kPromotionCandidateMaxRetries;
+        return MasterServiceTestPeer::kPromotionCandidateMaxRetries;
     }
 
     static constexpr uint32_t MaxPromotionExecutionFailuresForTesting() {
-        return MasterService::kMaxPromotionExecutionFailures;
+        return MasterServiceTestPeer::kMaxPromotionExecutionFailures;
     }
 
     static void ResetCandidateBackoffsForTesting(MasterService* service) {
-        service->ResetCandidateBackoffsForTesting();
+        MasterServiceTestPeer(*service).ResetCandidateBackoffsForTesting();
     }
 
     static size_t RunPromotionCandidateRetryForTesting(MasterService* service) {
-        return service->RunPromotionCandidateRetryForTesting();
-    }
-
-    static size_t RunPromotionCandidateRetryForTesting(MasterService* service,
-                                                       size_t shards_to_scan) {
-        return service->RunPromotionCandidateRetry(shards_to_scan);
+        return MasterServiceTestPeer(*service)
+            .RunPromotionCandidateRetryForTesting();
     }
 
     static void ClearCandidatesForReloadForTesting(MasterService* service) {
-        service->ClearCandidatesForReload();
+        MasterServiceTestPeer(*service).ClearCandidatesForReload();
     }
 
     static uint64_t GetPromotionCandidateCountForTesting(
         MasterService* service) {
-        return service->promotion_candidate_count_.load(
+        return MasterServiceTestPeer::PromotionCandidateCount(*service).load(
             std::memory_order_relaxed);
     }
 
     static uint64_t GetPromotionInFlightForTesting(MasterService* service) {
-        return service->promotion_in_flight_.load(std::memory_order_relaxed);
+        return MasterServiceTestPeer::PromotionInFlight(*service).load(
+            std::memory_order_relaxed);
+    }
+
+    static void MarkClientOfflineForTesting(MasterService* service,
+                                            const UUID& client_id) {
+        auto record =
+            MasterServiceTestPeer(*service).FindClientRecord(client_id);
+        ASSERT_TRUE(record);
+        const auto now = ClientLivenessRecord::Clock::now();
+        ASSERT_EQ(record->Evaluate(now, std::chrono::seconds::zero(),
+                                   std::chrono::seconds::zero()),
+                  ClientLivenessTransition::BECAME_SUSPECTED);
+        ASSERT_EQ(record->Evaluate(now, std::chrono::seconds::zero(),
+                                   std::chrono::seconds::zero()),
+                  ClientLivenessTransition::BECAME_OFFLINE);
     }
 
     static bool HasPromotionTaskForTesting(MasterService* service,
                                            const TenantId& tenant_id,
                                            const std::string& key) {
-        MasterService::MetadataAccessorRO accessor(
-            service, MasterService::ObjectIdentity{.tenant_id = tenant_id,
-                                                   .user_key = key});
-        const auto* tenant_state = accessor.GetTenantState();
-        return tenant_state != nullptr &&
-               tenant_state->promotion_tasks.contains(key);
+        MasterServiceTestPeer::MetadataAccessorRO accessor(
+            service, MasterServiceTestPeer::ObjectIdentity{
+                         .tenant_id = tenant_id, .user_key = key});
+        return accessor.IsPublished() &&
+               accessor.GetState().promotion_task.has_value();
     }
 
     // std::nullopt when the key has no in-flight promotion task.
     static std::optional<uint32_t> GetPromotionTaskExecutionFailuresForTesting(
         MasterService* service, const TenantId& tenant_id,
         const std::string& key) {
-        MasterService::MetadataAccessorRO accessor(
-            service, MasterService::ObjectIdentity{.tenant_id = tenant_id,
-                                                   .user_key = key});
-        const auto* tenant_state = accessor.GetTenantState();
-        if (tenant_state == nullptr) {
+        MasterServiceTestPeer::MetadataAccessorRO accessor(
+            service, MasterServiceTestPeer::ObjectIdentity{
+                         .tenant_id = tenant_id, .user_key = key});
+        if (!accessor.IsPublished() || !accessor.GetState().promotion_task) {
             return std::nullopt;
         }
-        auto it = tenant_state->promotion_tasks.find(key);
-        if (it == tenant_state->promotion_tasks.end()) {
-            return std::nullopt;
-        }
-        return it->second.execution_failures;
+        return accessor.GetState().promotion_task->execution_failures;
     }
 
     static bool PromotionAdmissionBlockedByPrimaryWriteForTesting(
         MasterService* service, const TenantId& tenant_id,
         const std::string& key) {
         const auto result =
-            service->TryPushPromotionQueue(MasterService::ObjectIdentity{
-                .tenant_id = tenant_id, .user_key = key});
-        return result == MasterService::PromotionQueueResult::kAlreadyInFlight;
+            MasterServiceTestPeer(*service).TryPushPromotionQueue(
+                MasterServiceTestPeer::ObjectIdentity{.tenant_id = tenant_id,
+                                                      .user_key = key});
+        return result ==
+               MasterServiceTestPeer::PromotionQueueResult::kAlreadyInFlight;
     }
 
     static void MarkReplicaCompleteForTesting(MasterService* service,
                                               const TenantId& tenant_id,
                                               const std::string& key,
                                               ReplicaID replica_id) {
-        MasterService::MetadataAccessorRW accessor(
-            service, MasterService::ObjectIdentity{.tenant_id = tenant_id,
-                                                   .user_key = key});
+        MasterServiceTestPeer::MetadataAccessorRW accessor(
+            service, MasterServiceTestPeer::ObjectIdentity{
+                         .tenant_id = tenant_id, .user_key = key});
         ASSERT_TRUE(accessor.Exists());
         auto* replica = accessor.Get().GetReplicaByID(replica_id);
         ASSERT_NE(replica, nullptr);
@@ -150,7 +157,9 @@ class PromotionOnHitTest : public ::testing::Test {
         MasterService* service, const UUID& segment_id, size_t size) {
         std::shared_ptr<BufferAllocatorBase> allocator;
         {
-            auto segment_access = service->segment_manager_.getSegmentAccess();
+            auto segment_access =
+                MasterServiceTestPeer::SegmentManager(*service)
+                    .getSegmentAccess();
             allocator = segment_access.GetAllocator(segment_id);
         }
         if (!allocator) {
@@ -482,8 +491,8 @@ TEST_F(PromotionOnHitTest,
     service->RemoveAll();
 }
 
-// PromotionObjectHeartbeat returns an empty task list when called against a
-// client that has no LocalDiskSegment registered.
+// An unknown Client is rejected by the liveness work gate before the
+// LocalDisk mailbox is consulted.
 TEST_F(PromotionOnHitTest, HeartbeatReturnsErrorForUnknownClient) {
     MasterServiceConfig config;
     config.enable_offload = true;
@@ -493,10 +502,10 @@ TEST_F(PromotionOnHitTest, HeartbeatReturnsErrorForUnknownClient) {
     UUID unknown_client = generate_uuid();
     auto pending = service->PromotionObjectHeartbeat(unknown_client);
     ASSERT_FALSE(pending.has_value());
-    EXPECT_EQ(pending.error(), ErrorCode::SEGMENT_NOT_FOUND);
+    EXPECT_EQ(pending.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
 }
 
-// PromotionAllocStart on a non-existent key returns OBJECT_NOT_FOUND.
+// An unknown Client is rejected before object metadata is consulted.
 TEST_F(PromotionOnHitTest, AllocStartUnknownKey) {
     MasterServiceConfig config;
     config.enable_offload = true;
@@ -506,7 +515,7 @@ TEST_F(PromotionOnHitTest, AllocStartUnknownKey) {
     auto resp = service->PromotionAllocStart(generate_uuid(), "nonexistent",
                                              TenantId::Default(), 1024, {});
     ASSERT_FALSE(resp.has_value());
-    EXPECT_EQ(resp.error(), ErrorCode::OBJECT_NOT_FOUND);
+    EXPECT_EQ(resp.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
 }
 
 TEST_F(PromotionOnHitTest, InvalidPrimaryEndCannotCompletePromotionReplica) {
@@ -682,7 +691,7 @@ TEST_F(PromotionOnHitTest, StalePromotionReplicaCleanupErasesTask) {
     service->RemoveAll();
 }
 
-// NotifyPromotionSuccess on a non-existent key returns OBJECT_NOT_FOUND.
+// An unknown Client is rejected before promotion metadata is consulted.
 TEST_F(PromotionOnHitTest, NotifyUnknownKey) {
     MasterServiceConfig config;
     config.enable_offload = true;
@@ -693,7 +702,7 @@ TEST_F(PromotionOnHitTest, NotifyUnknownKey) {
     auto resp = service->NotifyPromotionSuccess(client_id, "nonexistent",
                                                 TenantId::Default());
     ASSERT_FALSE(resp.has_value());
-    EXPECT_EQ(resp.error(), ErrorCode::OBJECT_NOT_FOUND);
+    EXPECT_EQ(resp.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
 }
 
 // Concurrent readers racing into TryPushPromotionQueue must dedupe to a
@@ -1118,7 +1127,7 @@ TEST_F(PromotionOnHitTest, HeartbeatBoundedBatchPreservesLeftovers) {
     EXPECT_TRUE(tick4->empty())
         << "after draining all queued keys, heartbeat must return empty";
 
-    // Sanity: master-side promotion_tasks records are intact for all keys
+    // Sanity: master-side promotion tasks are intact for all keys
     // (they're cleared by NotifyPromotionSuccess, not by Heartbeat), so the
     // source refcnts remain pinned until processed.
     for (const auto& k : keys) {
@@ -1130,8 +1139,8 @@ TEST_F(PromotionOnHitTest, HeartbeatBoundedBatchPreservesLeftovers) {
 }
 
 // The promotion task reaper must pop the staged PROCESSING MEMORY
-// replica added by PromotionAllocStart. The staged replica is not in
-// shard->processing_keys, so DiscardExpiredProcessingReplicas's main
+// replica added by PromotionAllocStart. Promotion never marks the object
+// processing, so DiscardExpiredProcessingReplicas's main
 // sweep can't see it, and the reaper for promotion tasks is the only
 // place that knows the replica exists. Without this path the orphan
 // holds its allocator buffer indefinitely (until the object is removed
@@ -1190,8 +1199,8 @@ TEST_F(PromotionOnHitTest, ReaperPopsStagedMemoryReplicaOnExpiry) {
         << "(allocator-tracked PROCESSING MEMORY replica)";
 
     // Wait past the staleness window; the eviction thread reaps the
-    // task and (with the fix) pops the staged replica via
-    // EraseReplicaByID, which releases the buffer back to the allocator.
+    // task and (with the fix) pops the staged replica by its allocation
+    // id, which releases the buffer back to the allocator.
     // Poll instead of a fixed sleep — the eviction thread cadence and
     // the test runner's scheduling jitter (especially under suite load)
     // both vary, so a hard 2s sleep is flaky here.
@@ -1294,8 +1303,8 @@ TEST_F(PromotionOnHitTest, QueueLimitRejectsCrossShard) {
 // the queue-wait phase. Without the reset, a task that waited in the
 // holder's promotion_objects queue for most of the original TTL could
 // enter active transfer with little budget left; if the SSD read + RDMA
-// write of a large object then ran past expiry, the reaper would
-// EraseReplicaByID on the staged MEMORY replica mid-flight and the
+// write of a large object then ran past expiry, the reaper would erase
+// the staged MEMORY replica by its allocation id mid-flight and the
 // allocator could hand the freed buffer to a concurrent Put while the
 // client's RDMA write is still landing into it (use-after-free in the
 // allocator + silent data corruption for the concurrent Put).
@@ -1322,7 +1331,7 @@ TEST_F(PromotionOnHitTest, QueueLimitRejectsCrossShard) {
 // the reset is wired up correctly.
 //
 // QuerySegments(seg).first (used bytes) is the observable: AllocStart
-// bumps it, the reaper's EraseReplicaByID returns it to baseline. We
+// bumps it, the reaper's erase by allocation id returns it to baseline. We
 // can't use GetReplicaList because the master filters out PROCESSING
 // replicas from the response.
 TEST_F(PromotionOnHitTest, AllocStartResetsTaskDeadline) {
@@ -1371,8 +1380,9 @@ TEST_F(PromotionOnHitTest, AllocStartResetsTaskDeadline) {
 
     // T=Wq+Wa : total elapsed since admission is 3.0s > TTL=2s. If the
     // reset is missing, the reaper sees the original start_time = 0
-    // and expires the task here, calling EraseReplicaByID which would
-    // free the staged buffer mid-RDMA-write in production. With the
+    // and expires the task here, erasing the staged replica by its
+    // allocation id, which would free the buffer mid-RDMA-write in
+    // production. With the
     // reset, start_time was bumped at AllocStart so age-since-reset is
     // only 1.5s < TTL=2s and the task stays alive. This is the
     // assertion that proves the reset is in place.
@@ -1397,7 +1407,7 @@ TEST_F(PromotionOnHitTest, AllocStartResetsTaskDeadline) {
     EXPECT_EQ(seg_after_reap->first, used_baseline)
         << "after the active-transfer phase's own TTL expires "
         << "(4.5s > 2s since AllocStart), the reaper must fire and "
-        << "free the staged buffer via EraseReplicaByID";
+        << "erase the staged replica by its allocation id";
 
     service->RemoveAll();
 }
@@ -1553,8 +1563,8 @@ TEST_F(PromotionOnHitTest, UpsertStartRejectsActivePromotionTask) {
 // (e.g. client stall past put_start_release_timeout_sec_). Without the
 // check, AllocStart would allocate + AddReplicas a PROCESSING MEMORY
 // replica with nothing tracking it: the generic PROCESSING reaper only
-// iterates shard->processing_keys (never populated by promotion) and
-// the promotion-task reaper has nothing left to iterate, so the buffer
+// reclaims objects marked processing (which promotion never sets) and
+// the promotion-task reaper has nothing left to reclaim, so the buffer
 // leaks until the object is removed or evicted.
 TEST_F(PromotionOnHitTest, AllocStartRejectsReapedTask) {
     MasterServiceConfig config;
@@ -1584,7 +1594,7 @@ TEST_F(PromotionOnHitTest, AllocStartRejectsReapedTask) {
 
     // Wait past the TTL so the reaper sweeps the task. AllocStart has
     // not yet been called, so alloc_id is 0; the reaper's
-    // EraseReplicaByID branch is a no-op and only the task entry is
+    // erase-by-allocation branch is a no-op and only the task entry is
     // removed. We can't easily poll for reap externally (the only
     // user-facing observable would be re-admitting through the gate,
     // which would create a fresh task and defeat the test), so use a
@@ -1642,10 +1652,11 @@ TEST_F(PromotionOnHitTest, NotifyRejectsNonHolder) {
                                               TenantId::Default(), 1024, {});
     ASSERT_TRUE(alloc.has_value());
 
-    // An unrelated client tries to Notify. Must be rejected as
-    // INVALID_PARAMS so the staged replica stays PROCESSING.
+    // A live but unrelated client reaches the holder check and is rejected,
+    // so the staged replica stays PROCESSING.
     UUID intruder_id = generate_uuid();
     ASSERT_NE(intruder_id, holder.client_id);
+    ASSERT_TRUE(service->MountLocalDiskSegment(intruder_id, true).has_value());
     auto bad_notify = service->NotifyPromotionSuccess(intruder_id, "k_cold",
                                                       TenantId::Default());
     ASSERT_FALSE(bad_notify.has_value())
@@ -1759,7 +1770,7 @@ TEST_F(PromotionOnHitTest, NotifyFailureReleasesStateImmediately) {
 
     // The staged buffer must be freed back to the DRAM allocator. If
     // this fires, NotifyPromotionFailure did not pop the staged replica
-    // via EraseReplicaByID — same orphan-replica shape that originally
+    // by its allocation id — same orphan-replica shape that originally
     // motivated the reaper fix.
     auto seg_after_release = service->QuerySegments(seg.segment_name);
     ASSERT_TRUE(seg_after_release.has_value());
@@ -1990,6 +2001,7 @@ TEST_F(PromotionOnHitTest, NotifyFailureRejectsNonHolder) {
     // Intruder calls Failure with the wrong client_id.
     UUID intruder_id = generate_uuid();
     ASSERT_NE(intruder_id, holder.client_id);
+    ASSERT_TRUE(service->MountLocalDiskSegment(intruder_id, true).has_value());
     auto bad_failure = service->NotifyPromotionFailure(intruder_id, "k_cold",
                                                        TenantId::Default());
     ASSERT_FALSE(bad_failure.has_value())
@@ -2040,6 +2052,7 @@ TEST_F(PromotionOnHitTest, AllocStartRejectsNonHolder) {
 
     UUID intruder_id = generate_uuid();
     ASSERT_NE(intruder_id, holder.client_id);
+    ASSERT_TRUE(service->MountLocalDiskSegment(intruder_id, true).has_value());
     auto bad_alloc = service->PromotionAllocStart(
         intruder_id, "k_cold", TenantId::Default(), 1024, {});
     ASSERT_FALSE(bad_alloc.has_value())
@@ -2126,7 +2139,7 @@ TEST_F(PromotionOnHitTest, AllocStartRejectsSizeMismatch) {
 }
 
 // When a holder client expires, ClientMonitorFunc must clean up its
-// dangling promotion_tasks entries and decrement the global in-flight
+// dangling promotion tasks and decrement the global in-flight
 // counter. Without this cleanup, the entries stay pinned until reaper
 // TTL — and on a rolling restart of many holders the cluster-wide cap
 // promotion_queue_limit_ saturates and blocks all new admissions for
@@ -2148,7 +2161,8 @@ TEST_F(PromotionOnHitTest, ClientExpiryClearsPromotionTask) {
     // ClearInvalidHandles, not from the promotion-task reaper.
     config.put_start_release_timeout_sec = 300;
     // Short client TTL so expiration is fast.
-    config.client_live_ttl_sec = 1;
+    config.client_active_ttl_sec = 1;
+    config.client_suspicion_ttl_sec = 1;
     auto service = std::make_unique<MasterService>(config);
 
     constexpr size_t seg_size = 1024 * 1024 * 16;
@@ -2170,22 +2184,8 @@ TEST_F(PromotionOnHitTest, ClientExpiryClearsPromotionTask) {
     // different-shard admission must be rejected right now.
     auto second_holder = PrepareSegment(
         *service, "seg_b", kDefaultSegmentBase + seg_size, seg_size);
-    // Promote second_holder into ok_client_ via ReMountSegment so its
-    // LOCAL_DISK replicas survive any ClearInvalidHandles run triggered
-    // by the first holder's expiry. MountSegment alone does not register
-    // the client as alive (only ReMountSegment does), and
-    // CleanupStaleHandles uses ok_client_ to decide which LOCAL_DISK
-    // replicas to erase — without this, second_holder's k_other replica
-    // would be wiped alongside the first holder's k_cold replica when
-    // ClearInvalidHandles runs.
-    {
-        Segment seg_b =
-            MakeSegment("seg_b", kDefaultSegmentBase + seg_size, seg_size);
-        seg_b.id = second_holder.segment_id;
-        std::vector<Segment> segs{seg_b};
-        auto remount = service->ReMountSegment(segs, second_holder.client_id);
-        ASSERT_TRUE(remount.has_value()) << "ReMount failed";
-    }
+    // MountSegment and MountLocalDiskSegment establish Active liveness; no
+    // ReMountSegment is needed for stale cleanup to retain this holder.
     ASSERT_TRUE(InjectLocalDiskReplica(*service, second_holder.client_id,
                                        "k_other", 1024,
                                        second_holder.segment_name));
@@ -2218,7 +2218,7 @@ TEST_F(PromotionOnHitTest, ClientExpiryClearsPromotionTask) {
     }
 
     // ClearInvalidHandles should have erased the holder's LOCAL_DISK
-    // source replica AND (with the fix) the promotion_tasks entry,
+    // source replica AND (with the fix) the promotion task,
     // decrementing the global in-flight counter. Re-admit a promotion
     // on the second holder; with queue_limit=1 this can only succeed if
     // the slot was freed.
@@ -2232,7 +2232,7 @@ TEST_F(PromotionOnHitTest, ClientExpiryClearsPromotionTask) {
     ASSERT_TRUE(pending_post.has_value());
     EXPECT_EQ(CountPromotionTask(*pending_post, "k_other"), 1u)
         << "After the holder expired, ClearInvalidHandles must have "
-        << "erased its promotion_tasks entry and decremented "
+        << "erased its promotion task and decremented "
         << "promotion_in_flight_. Otherwise the global cap remains "
         << "saturated by the dead holder's task for "
         << "put_start_release_timeout_sec_ seconds, and this admission "
@@ -2315,7 +2315,7 @@ TEST_F(PromotionOnHitTest, RemoveErasesPromotionTask) {
     }
 
     // Remove k_first with force=true. With the fix, this also wipes
-    // k_first's promotion_tasks entry and decrements
+    // k_first's promotion task and decrements
     // promotion_in_flight_ back to 0.
     auto rm = service->Remove("k_first", TenantId::Default(), /*force=*/true);
     ASSERT_TRUE(rm.has_value())
@@ -2332,7 +2332,7 @@ TEST_F(PromotionOnHitTest, RemoveErasesPromotionTask) {
     ASSERT_TRUE(pending_post.has_value());
     EXPECT_EQ(CountPromotionTask(*pending_post, "k_second"), 1u)
         << "k_second must be admittable after Remove of k_first — Remove "
-        << "must erase the in-flight promotion_tasks entry and decrement "
+        << "must erase the in-flight promotion task and decrement "
         << "promotion_in_flight_, otherwise queue_limit=1 stays saturated.";
 
     service->RemoveAll();
@@ -2383,8 +2383,8 @@ TEST_F(PromotionOnHitTest, RemoveByRegexErasesPromotionTask) {
     ASSERT_TRUE(pending_post.has_value());
     EXPECT_EQ(CountPromotionTask(*pending_post, "other_k2"), 1u)
         << "other_k2 must be admittable after RemoveByRegex of regex_k1 "
-        << "— RemoveByRegex must erase the in-flight promotion_tasks "
-        << "entry. Otherwise queue_limit=1 stays saturated.";
+        << "— RemoveByRegex must erase the in-flight promotion task. "
+        << "Otherwise queue_limit=1 stays saturated.";
 
     service->RemoveAll();
 }
@@ -2446,9 +2446,7 @@ TEST_F(PromotionOnHitTest, RemoveAllErasesPromotionTask) {
 }
 
 // BatchRemove normal-completion path on a key with an in-flight
-// PromotionTask must drop the task entry. ReMountSegment registers the
-// holder in ok_client_ so CleanupStaleHandles returns false and
-// BatchRemove takes the non-stale branch.
+// PromotionTask must drop the task entry while its holder remains Active.
 TEST_F(PromotionOnHitTest, BatchRemoveErasesPromotionTask) {
     MasterServiceConfig config;
     config.enable_offload = true;
@@ -2462,13 +2460,6 @@ TEST_F(PromotionOnHitTest, BatchRemoveErasesPromotionTask) {
     constexpr size_t seg_size = 1024 * 1024 * 16;
     auto holder =
         PrepareSegment(*service, "seg_a", kDefaultSegmentBase, seg_size);
-    {
-        Segment seg_a = MakeSegment("seg_a", kDefaultSegmentBase, seg_size);
-        seg_a.id = holder.segment_id;
-        std::vector<Segment> segs{seg_a};
-        auto remount = service->ReMountSegment(segs, holder.client_id);
-        ASSERT_TRUE(remount.has_value()) << "ReMount failed";
-    }
     ASSERT_TRUE(InjectLocalDiskReplica(*service, holder.client_id, "k_first",
                                        1024, holder.segment_name));
     ASSERT_TRUE(InjectLocalDiskReplica(*service, holder.client_id, "k_second",
@@ -2510,11 +2501,8 @@ TEST_F(PromotionOnHitTest, BatchRemoveErasesPromotionTask) {
     service->RemoveAll(/*force=*/true);
 }
 
-// BatchRemove stale-handle path on a key with an in-flight
-// PromotionTask must drop the task entry. The holder is mounted via
-// PrepareSegment only (no ReMount), so its client is absent from
-// ok_client_; BatchRemove's CleanupStaleHandles then erases the
-// LOCAL_DISK replica and the stale-handle branch fires.
+// BatchRemove stale-handle path on a key with an in-flight PromotionTask must
+// drop the task entry after its holder becomes Offline.
 TEST_F(PromotionOnHitTest, BatchRemoveStaleHandleErasesPromotionTask) {
     MasterServiceConfig config;
     config.enable_offload = true;
@@ -2544,6 +2532,8 @@ TEST_F(PromotionOnHitTest, BatchRemoveStaleHandleErasesPromotionTask) {
         EXPECT_EQ(CountPromotionTask(*pending, "k_first"), 1u);
     }
 
+    MarkClientOfflineForTesting(service.get(), holder.client_id);
+
     auto results =
         service->BatchRemove({"k_first"}, TenantId::Default(), /*force=*/true);
     ASSERT_EQ(results.size(), 1u);
@@ -2557,14 +2547,6 @@ TEST_F(PromotionOnHitTest, BatchRemoveStaleHandleErasesPromotionTask) {
 
     auto second_holder = PrepareSegment(
         *service, "seg_b", kDefaultSegmentBase + seg_size, seg_size);
-    {
-        Segment seg_b =
-            MakeSegment("seg_b", kDefaultSegmentBase + seg_size, seg_size);
-        seg_b.id = second_holder.segment_id;
-        std::vector<Segment> segs{seg_b};
-        auto remount = service->ReMountSegment(segs, second_holder.client_id);
-        ASSERT_TRUE(remount.has_value()) << "ReMount failed";
-    }
     ASSERT_TRUE(InjectLocalDiskReplica(*service, second_holder.client_id,
                                        "k_second", 1024,
                                        second_holder.segment_name));
@@ -3038,7 +3020,10 @@ TEST_F(PromotionOnHitTest, RetryCandidate_CapRejectedThenQueuedOnRetry) {
     service->RemoveAll();
 }
 
-TEST_F(PromotionOnHitTest, RetryCandidate_NoCandidatesOrNoShardBudgetNoops) {
+// The retry driver queues nothing without candidates, and nothing for a
+// candidate whose admission stays rejected: it is backed off, not dropped.
+TEST_F(PromotionOnHitTest,
+       RetryCandidate_NoCandidatesOrTransientRejectionQueuesNothing) {
     MasterServiceConfig config;
     config.enable_offload = true;
     config.promotion_on_hit = true;
@@ -3063,9 +3048,7 @@ TEST_F(PromotionOnHitTest, RetryCandidate_NoCandidatesOrNoShardBudgetNoops) {
         CountPromotionCandidatesForTesting(service.get(), TenantId::Default()),
         1u);
 
-    EXPECT_EQ(RunPromotionCandidateRetryForTesting(service.get(),
-                                                   /*shards_to_scan=*/0),
-              0u);
+    EXPECT_EQ(RunPromotionCandidateRetryForTesting(service.get()), 0u);
     EXPECT_EQ(
         CountPromotionCandidatesForTesting(service.get(), TenantId::Default()),
         1u);

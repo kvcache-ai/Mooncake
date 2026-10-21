@@ -19,8 +19,12 @@
 #include <cassert>
 #include <set>
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <exception>
+#include <memory>
+#include <mutex>
+#include <unordered_map>
 
 #include "common.h"
 #include "config.h"
@@ -28,6 +32,36 @@
 #include "transfer_metadata_plugin.h"
 
 namespace mooncake {
+// Process-lifetime intern pool for RDMA NIC paths. Entries are never erased
+// so Slice can hold a non-owning pointer without tracking SegmentDesc.
+// Keys include the NIC-path server name (host:port, often an ephemeral RPC
+// port), so cardinality is historical peer endpoints × NICs, not hosts × NICs.
+// Function-local *new storage: lazy, thread-safe init, and no destructor
+// that would UAF slices during static teardown.
+static std::mutex &NicPathInternMu() {
+    static std::mutex &mu = *new std::mutex();
+    return mu;
+}
+
+static std::unordered_map<std::string, std::unique_ptr<std::string>> &
+NicPathInternPool() {
+    static auto &pool =
+        *new std::unordered_map<std::string, std::unique_ptr<std::string>>();
+    return pool;
+}
+
+static const std::string &InternNicPath(const std::string &path) {
+    auto &pool = NicPathInternPool();
+    std::lock_guard<std::mutex> lock(NicPathInternMu());
+    auto it = pool.find(path);
+    if (it != pool.end()) return *it->second;
+    auto owned = std::make_unique<std::string>(path);
+    const std::string *ptr = owned.get();
+    pool.emplace(path, std::move(owned));
+    LOG_EVERY_N(INFO, 128) << "NIC path intern pool size=" << pool.size();
+    return *ptr;
+}
+
 static uint64_t currentWallTimeInMicroseconds() {
     const int64_t now_ns = getCurrentTimeInNano();
     if (now_ns <= 0) return 1;
@@ -143,6 +177,14 @@ static inline std::string extractProtocolFromConnString(
     return "etcd";
 }
 
+// A cached REMOTE segment whose backend fetch keeps failing this many
+// consecutive sync cycles is treated as gone (peer unmounted / master expiry
+// cleanup removed its key) and invalidated from the local cache. The plugin
+// get() collapses "not found" and "transient error" into a single false, so a
+// single blip must not trigger a purge -- only a streak that persists across
+// cycles does.
+static constexpr int kStaleSegmentFailureThreshold = 2;
+
 struct TransferNotifyUtil {
     static Json::Value encode(const TransferMetadata::NotifyDesc &desc) {
         Json::Value root;
@@ -174,6 +216,8 @@ struct TransferHandshakeUtil {
         root["qp_num"] = qpNums;
         if (desc.ready_ack_supported || desc.ready_ack)
             root["ready_ack"] = desc.ready_ack;
+        if (!desc.auto_gid_reprobe_from.empty())
+            root["auto_gid_reprobe_from"] = desc.auto_gid_reprobe_from;
         if (desc.notify_qp_num != 0 || desc.ctrl_channel) {
             root["notify_qp_num"] = Json::UInt(desc.notify_qp_num);
             root["notify_rq_depth"] = Json::UInt(desc.notify_rq_depth);
@@ -222,6 +266,13 @@ struct TransferHandshakeUtil {
             desc.ready_ack = root["ready_ack"].asBool();
         } else {
             desc.ready_ack = false;
+        }
+        if (root.isMember("auto_gid_reprobe_from") &&
+            root["auto_gid_reprobe_from"].isString()) {
+            desc.auto_gid_reprobe_from =
+                root["auto_gid_reprobe_from"].asString();
+        } else {
+            desc.auto_gid_reprobe_from.clear();
         }
         desc.notify_qp_num = 0;
         desc.notify_rq_depth = 0;
@@ -295,6 +346,20 @@ TransferMetadata::TransferMetadata(const std::string &conn_string) {
             << "Unable to create metadata storage plugin with conn string "
             << conn_string;
     }
+    startMetadataRefreshPollingIfNeeded();
+}
+
+TransferMetadata::TransferMetadata(
+    std::shared_ptr<MetadataStoragePlugin> storage_plugin) {
+    // Test-only seam (see header). Mirrors the conn-string ctor's key-prefix
+    // setup so getFullMetadataKey() yields "mooncake/ram/<name>" keys, but
+    // skips the plugin factory (no etcd/redis/http needed) and the P2P
+    // handshake daemon. The background refresh poller stays disabled when the
+    // caller configures a zero refresh interval.
+    next_segment_id_.store(1);
+    common_key_prefix_ = "mooncake/";
+    rpc_meta_prefix_ = common_key_prefix_ + "rpc_meta/";
+    storage_plugin_ = std::move(storage_plugin);
     startMetadataRefreshPollingIfNeeded();
 }
 
@@ -380,6 +445,17 @@ int TransferMetadata::receivePeerNotify(const Json::Value &peer_json,
     RWSpinlock::WriteGuard guard(notify_lock_);
     TransferMetadata::NotifyDesc peer_notify, local_reply;
     TransferNotifyUtil::decode(peer_json, peer_notify);
+    const size_t max_entries = getHandshakeMaxNotifyEntries();
+    if (notifys.size() >= max_entries) {
+        // The daemon accepts notify frames from any peer, so an unbounded
+        // vector lets a flood grow RSS without limit (#4445). Evict the
+        // oldest undrained entry: a flood degrades pending notifications
+        // instead of the process.
+        notifys.erase(notifys.begin());
+        LOG_EVERY_N(WARNING, 1000)
+            << "pending notify queue is full (" << max_entries
+            << " entries); evicting the oldest entry";
+    }
     notifys.push_back(peer_notify);
     // reply
     local_reply.name = "";
@@ -459,10 +535,17 @@ static int encodeMultiProtocolSegmentDesc(
             Json::Value lkeyJSON(Json::arrayValue);
             for (auto &entry : buffer.lkey) lkeyJSON.append(entry);
             bufferJSON["lkey"] = lkeyJSON;
+            if (!buffer.shm_name.empty())
+                bufferJSON["shm_name"] = buffer.shm_name;
         } else if (buffer.protocol == "tcp") {
             bufferJSON["addr"] = static_cast<Json::UInt64>(buffer.addr);
-        } else if (buffer.protocol == "hip" || buffer.protocol == "maca" ||
-                   buffer.protocol == "musa") {
+            if (!buffer.shm_name.empty())
+                bufferJSON["shm_name"] = buffer.shm_name;
+        } else if (buffer.protocol == "shm") {
+            bufferJSON["addr"] = static_cast<Json::UInt64>(buffer.addr);
+            bufferJSON["shm_name"] = buffer.shm_name;
+        } else if (buffer.protocol == "hip" || buffer.protocol == "hylink" ||
+                   buffer.protocol == "maca" || buffer.protocol == "musa") {
             bufferJSON["addr"] = static_cast<Json::UInt64>(buffer.addr);
             bufferJSON["shm_name"] = buffer.shm_name;
         }
@@ -494,7 +577,8 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
         is_multi_protocol = true;
         for (const auto &proto : protocols) {
             if (proto != "cxl" && proto != "tcp" && proto != "rdma" &&
-                proto != "hip" && proto != "maca" && proto != "musa") {
+                proto != "hip" && proto != "hylink" && proto != "maca" &&
+                proto != "musa" && proto != "shm") {
                 is_multi_protocol = false;
                 break;
             }
@@ -502,8 +586,8 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
         if (!is_multi_protocol) {
             LOG(ERROR) << "Unsupported multi-protocol combination: "
                        << desc.protocol
-                       << ". Only cxl, tcp, rdma, hip, maca and musa may be "
-                          "combined.";
+                       << ". Only cxl, tcp, rdma, hip, hylink, maca, musa "
+                          "and shm may be combined.";
             return ERR_INVALID_ARGUMENT;
         }
     }
@@ -553,6 +637,8 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
             Json::Value lkeyJSON(Json::arrayValue);
             for (auto &entry : buffer.lkey) lkeyJSON.append(entry);
             bufferJSON["lkey"] = lkeyJSON;
+            if (!buffer.shm_name.empty())
+                bufferJSON["shm_name"] = buffer.shm_name;
             buffersJSON.append(bufferJSON);
         }
         segmentJSON["buffers"] = buffersJSON;
@@ -588,6 +674,8 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
             bufferJSON["name"] = buffer.name;
             bufferJSON["addr"] = static_cast<Json::UInt64>(buffer.addr);
             bufferJSON["length"] = static_cast<Json::UInt64>(buffer.length);
+            if (!buffer.shm_name.empty())
+                bufferJSON["shm_name"] = buffer.shm_name;
             buffersJSON.append(bufferJSON);
         }
         segmentJSON["buffers"] = buffersJSON;
@@ -649,10 +737,12 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
     } else if (segmentJSON["protocol"] == "nvlink" ||
                segmentJSON["protocol"] == "nvlink_intra" ||
                segmentJSON["protocol"] == "hip" ||
+               segmentJSON["protocol"] == "hylink" ||
                segmentJSON["protocol"] == "maca" ||
                segmentJSON["protocol"] == "musa" ||
                segmentJSON["protocol"] == "ubshmem" ||
-               segmentJSON["protocol"] == "sunrise_link") {
+               segmentJSON["protocol"] == "sunrise_link" ||
+               segmentJSON["protocol"] == "shm") {
         Json::Value buffersJSON(Json::arrayValue);
         for (const auto &buffer : desc.buffers) {
             Json::Value bufferJSON;
@@ -850,6 +940,10 @@ decodeMultiProtocolSegmentDesc(Json::Value &segmentJSON,
                     << buffer.lkey.size() << ", " << desc->devices.size();
                 return nullptr;
             }
+            if (bufferJSON.isMember("shm_name") &&
+                bufferJSON["shm_name"].isString()) {
+                buffer.shm_name = bufferJSON["shm_name"].asString();
+            }
             desc->buffers.push_back(buffer);
         } else if (buffer_protocol == "tcp") {
             TransferMetadata::BufferDesc buffer;
@@ -863,9 +957,31 @@ decodeMultiProtocolSegmentDesc(Json::Value &segmentJSON,
                     << " buffer_protocol " << buffer_protocol;
                 return nullptr;
             }
+            if (bufferJSON.isMember("shm_name") &&
+                bufferJSON["shm_name"].isString()) {
+                buffer.shm_name = bufferJSON["shm_name"].asString();
+            }
             desc->buffers.push_back(buffer);
-        } else if (buffer_protocol == "hip" || buffer_protocol == "maca" ||
-                   buffer_protocol == "musa") {
+        } else if (buffer_protocol == "shm") {
+            TransferMetadata::BufferDesc buffer;
+            buffer.name = bufferJSON["name"].asString();
+            buffer.addr = bufferJSON["addr"].asUInt64();
+            buffer.length = bufferJSON["length"].asUInt64();
+            buffer.protocol = buffer_protocol;
+            if (bufferJSON.isMember("shm_name") &&
+                bufferJSON["shm_name"].isString()) {
+                buffer.shm_name = bufferJSON["shm_name"].asString();
+            }
+            if (buffer.name.empty() || !buffer.addr || !buffer.length ||
+                buffer.shm_name.empty()) {
+                LOG(WARNING)
+                    << "Corrupted segment descriptor, name " << segment_name
+                    << " buffer_protocol " << buffer_protocol;
+                return nullptr;
+            }
+            desc->buffers.push_back(buffer);
+        } else if (buffer_protocol == "hip" || buffer_protocol == "hylink" ||
+                   buffer_protocol == "maca" || buffer_protocol == "musa") {
             TransferMetadata::BufferDesc buffer;
             buffer.name = bufferJSON["name"].asString();
             buffer.addr = bufferJSON["addr"].asUInt64();
@@ -902,7 +1018,8 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
             for (const auto &protocolStr : segmentJSON["protocol"]) {
                 std::string proto = protocolStr.asString();
                 if (proto != "cxl" && proto != "tcp" && proto != "rdma" &&
-                    proto != "hip" && proto != "maca" && proto != "musa") {
+                    proto != "hip" && proto != "hylink" && proto != "maca" &&
+                    proto != "musa" && proto != "shm") {
                     is_multi_protocol = false;
                     break;
                 }
@@ -911,8 +1028,8 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
                 LOG(ERROR)
                     << "Unsupported multi-protocol combination in segment: "
                     << segment_name
-                    << ". Only cxl, tcp, rdma, hip, maca and musa may be "
-                       "combined.";
+                    << ". Only cxl, tcp, rdma, hip, hylink, maca, musa and "
+                       "shm may be combined.";
                 return nullptr;
             }
         }
@@ -920,7 +1037,12 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
 
     // If multi-protocol scenario, use multi-protocol decoding
     if (is_multi_protocol) {
-        return decodeMultiProtocolSegmentDesc(segmentJSON, segment_name);
+        auto desc = decodeMultiProtocolSegmentDesc(segmentJSON, segment_name);
+        if (desc) {
+            desc->rebuildBufferRangeIndex();
+            desc->rebuildInternedNicPaths();
+        }
+        return desc;
     }
 #endif
 
@@ -998,6 +1120,10 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
                     << desc->devices.size();
                 return nullptr;
             }
+            if (bufferJSON.isMember("shm_name") &&
+                bufferJSON["shm_name"].isString()) {
+                buffer.shm_name = bufferJSON["shm_name"].asString();
+            }
             desc->buffers.push_back(buffer);
         }
 
@@ -1054,6 +1180,10 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
                              << segment_name << " protocol " << desc->protocol;
                 return nullptr;
             }
+            if (bufferJSON.isMember("shm_name") &&
+                bufferJSON["shm_name"].isString()) {
+                buffer.shm_name = bufferJSON["shm_name"].asString();
+            }
             desc->buffers.push_back(buffer);
         }
         desc->rdma_server_name = segmentJSON["rdma_server_name"].asString();
@@ -1075,9 +1205,10 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
             desc->buffers.push_back(buffer);
         }
     } else if (desc->protocol == "nvlink" || desc->protocol == "nvlink_intra" ||
-               desc->protocol == "hip" || desc->protocol == "maca" ||
-               desc->protocol == "musa" || desc->protocol == "ubshmem" ||
-               desc->protocol == "sunrise_link") {
+               desc->protocol == "hip" || desc->protocol == "hylink" ||
+               desc->protocol == "maca" || desc->protocol == "musa" ||
+               desc->protocol == "ubshmem" ||
+               desc->protocol == "sunrise_link" || desc->protocol == "shm") {
         for (const auto &bufferJSON : segmentJSON["buffers"]) {
             BufferDesc buffer;
             buffer.name = bufferJSON["name"].asString();
@@ -1181,6 +1312,8 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
                    << " protocol " << desc->protocol;
         return nullptr;
     }
+    desc->rebuildBufferRangeIndex();
+    desc->rebuildInternedNicPaths();
     return desc;
 }
 
@@ -1204,13 +1337,14 @@ int TransferMetadata::receivePeerMetadata(const Json::Value &peer_json,
 }
 
 std::shared_ptr<TransferMetadata::SegmentDesc> TransferMetadata::getSegmentDesc(
-    const std::string &segment_name) {
-    return getSegmentDescInternal(segment_name, false);
+    const std::string &segment_name, GetResult *status) {
+    return getSegmentDescInternal(segment_name, false, status);
 }
 
 std::shared_ptr<TransferMetadata::SegmentDesc>
 TransferMetadata::getSegmentDescInternal(const std::string &segment_name,
-                                         bool force_rpc_update) {
+                                         bool force_rpc_update,
+                                         GetResult *status) {
     Json::Value peer_json;
 
     if (p2p_handshake_mode_) {
@@ -1222,22 +1356,27 @@ TransferMetadata::getSegmentDescInternal(const std::string &segment_name,
             auto it = segment_id_to_desc_map_.find(LOCAL_SEGMENT_ID);
             if (it == segment_id_to_desc_map_.end() || !it->second) {
                 LOG(ERROR) << "Local segment descriptor not found";
+                if (status) *status = GetResult::kUnavailable;
                 return nullptr;
             }
             desc = it->second;
         }
         int ret = encodeSegmentDesc(*desc.get(), local_json);
         if (ret) {
+            if (status) *status = GetResult::kUnavailable;
             return nullptr;
         }
         ret = handshake_plugin_->exchangeMetadata(ip, port, local_json,
                                                   peer_json);
         if (ret) {
+            if (status) *status = GetResult::kUnavailable;
             return nullptr;
         }
     } else {
-        if (!storage_plugin_->get(getFullMetadataKey(segment_name),
-                                  peer_json)) {
+        GetResult result = storage_plugin_->getWithStatus(
+            getFullMetadataKey(segment_name), peer_json);
+        if (result != GetResult::kFound) {
+            if (status) *status = result;
             LOG(WARNING) << "Failed to retrieve segment descriptor, name "
                          << segment_name;
             return nullptr;
@@ -1245,6 +1384,11 @@ TransferMetadata::getSegmentDescInternal(const std::string &segment_name,
     }
 
     auto result = decodeSegmentDesc(peer_json, segment_name);
+    if (!result) {
+        if (status) *status = GetResult::kUnavailable;
+        return nullptr;
+    }
+    if (status) *status = GetResult::kFound;
 
     // Compatibility for descriptors published before tcp_data_host was part
     // of SegmentDesc. Freeze the legacy RPC location into this descriptor
@@ -1285,10 +1429,43 @@ TransferMetadata::getSegmentDescInternal(const std::string &segment_name,
     return result;
 }
 
+void TransferMetadata::SegmentDesc::rebuildInternedNicPaths() {
+    interned_nic_paths.clear();
+    interned_nic_paths.reserve(devices.size());
+    const auto &server = nicPathServerName();
+    for (const auto &device : devices) {
+        interned_nic_paths.push_back(
+            &InternNicPath(MakeNicPath(server, device.name)));
+    }
+}
+
+const std::string &TransferMetadata::SegmentDesc::internedNicPath(
+    size_t device_id) const {
+    if (device_id >= devices.size()) {
+        LOG_EVERY_N(ERROR, 1000)
+            << "internedNicPath: device_id " << device_id
+            << " out of range (devices=" << devices.size()
+            << ", interned=" << interned_nic_paths.size() << ")";
+        static const std::string kEmpty;
+        return kEmpty;
+    }
+    if (interned_nic_paths.size() == devices.size() &&
+        interned_nic_paths[device_id] != nullptr) {
+        return *interned_nic_paths[device_id];
+    }
+    LOG_FIRST_N(WARNING, 8)
+        << "internedNicPath: intern snapshot missing for "
+        << nicPathServerName() << " (devices=" << devices.size()
+        << ", interned=" << interned_nic_paths.size()
+        << "), falling back to the global pool";
+    return InternNicPath(
+        MakeNicPath(nicPathServerName(), devices[device_id].name));
+}
+
 bool TransferMetadata::SegmentDesc::operator==(const SegmentDesc &other) const {
-    // timestamp and metadata_version are intentionally excluded: metadata
-    // encoding/publication may refresh them even when the operational
-    // descriptor is unchanged.
+    // timestamp, metadata_version, buffer_range_index, and interned_nic_paths
+    // are excluded: publication may refresh timestamps, and the last two are
+    // derived from `buffers` / `devices`.
     return name == other.name && protocol == other.protocol &&
            devices == other.devices && topology == other.topology &&
            buffers == other.buffers && nvmeof_buffers == other.nvmeof_buffers &&
@@ -1320,17 +1497,35 @@ int TransferMetadata::syncSegmentCache(const std::string &segment_name) {
     size_t unchanged_count = 0;
     size_t skipped_count = 0;
     std::vector<std::string> updated_names;
+    size_t invalidated_count = 0;
+    size_t unavailable_count = 0;
 
     // Fetch updates without holding lock (may involve network I/O)
     std::vector<std::pair<std::string, std::shared_ptr<SegmentDesc>>> updates;
+    // Cached REMOTE segment names whose backend lookup returned kNotFound
+    // (authoritative key absence -- the master removed the key on peer
+    // unmount/expiry). Resolved into per-segment failure streaks under the
+    // write lock below, so no shared state (segment_failure_counts_) is
+    // touched during network I/O. Transient failures (kUnavailable) do NOT
+    // enter this list -- they must not advance the streak.
+    std::vector<std::string> failed_names;
     for (const auto &name : names_to_sync) {
-        auto segment_desc = getSegmentDescInternal(name, true);
+        GetResult status = GetResult::kUnavailable;
+        auto segment_desc = getSegmentDescInternal(name, true, &status);
         if (segment_desc) {
             updates.emplace_back(name, segment_desc);
             ++fetched_count;
-        } else {
+        } else if (status == GetResult::kNotFound) {
             ++failed_count;
+            failed_names.push_back(name);
             LOG(WARNING) << "segment " << name << " is now invalid";
+        } else {
+            // Transient backend failure (kUnavailable): the key may still
+            // exist; do NOT advance the invalidation streak. The cached
+            // entry survives and is retried next sync cycle.
+            ++unavailable_count;
+            LOG(WARNING) << "segment " << name
+                         << " backend unavailable (transient)";
         }
     }
 
@@ -1338,6 +1533,10 @@ int TransferMetadata::syncSegmentCache(const std::string &segment_name) {
         // Apply updates with write lock
         RWSpinlock::WriteGuard guard(segment_lock_);
         for (const auto &[name, desc] : updates) {
+            // A successful fetch ends any prior failure streak for this
+            // segment; the entry stays cached. Done under the write lock
+            // because segment_failure_counts_ is guarded by segment_lock_.
+            segment_failure_counts_[name] = 0;
             auto it = segment_name_to_id_map_.find(name);
             if (it == segment_name_to_id_map_.end()) {
                 ++skipped_count;
@@ -1374,7 +1573,25 @@ int TransferMetadata::syncSegmentCache(const std::string &segment_name) {
             updated_names.push_back(name);
             ++updated_count;
             LOG(WARNING) << "Segment cache descriptor changed, name=" << name
-                         << ", segment_id=" << segment_id;
+                         << ", segment_id=" << segment_id << ", old_version="
+                         << (old_desc ? old_desc->metadata_version : 0)
+                         << ", new_version=" << desc->metadata_version
+                         << ", buffers=" << desc->buffers.size();
+            // The old/new descriptor bodies are sizable (one line per
+            // registered buffer); under churn every sync cycle would print
+            // them per changed segment. Throttle process-wide like
+            // dumpMetadataContent(); trace mode always prints. The WARNING
+            // header above stays per-change so no event is lost.
+            static std::atomic<uint64_t> last_desc_dump_ns{0};
+            const uint64_t now_ns = getCurrentTimeInNano();
+            uint64_t prev = last_desc_dump_ns.load(std::memory_order_relaxed);
+            constexpr uint64_t kDescDumpThrottleNs = 500000000;  // 0.5 sec
+            const bool may_dump =
+                globalConfig().trace ||
+                (now_ns - prev > kDescDumpThrottleNs &&
+                 last_desc_dump_ns.compare_exchange_strong(
+                     prev, now_ns, std::memory_order_relaxed));
+            if (!may_dump) continue;
             if (old_desc) {
                 LOG(INFO) << "Old segment descriptor:";
                 old_desc->dump();
@@ -1383,6 +1600,40 @@ int TransferMetadata::syncSegmentCache(const std::string &segment_name) {
             }
             LOG(INFO) << "New segment descriptor:";
             desc->dump();
+        }
+
+        // Invalidate stale REMOTE segments. Only authoritative key-absence
+        // results (kNotFound -- the master removed the key on peer
+        // unmount/expiry) enter failed_names and advance the streak.
+        // Transient backend failures (kUnavailable) are excluded above, so
+        // a metadata-service outage cannot purge the cache and strand
+        // in-flight transfers whose callers still hold a shared_ptr copy
+        // of the descriptor. A consecutive-failure streak that persists
+        // across sync cycles is the signal that the segment is genuinely
+        // gone; only then do we drop the cached entry, mirroring the erase
+        // pattern in removeSegmentDesc() (segment_id_to_desc_map_ + name map).
+        for (const auto &name : failed_names) {
+            ++segment_failure_counts_[name];
+        }
+        for (auto fit = segment_failure_counts_.begin();
+             fit != segment_failure_counts_.end();) {
+            if (fit->second < kStaleSegmentFailureThreshold) {
+                ++fit;
+                continue;
+            }
+            const auto &name = fit->first;
+            auto name_it = segment_name_to_id_map_.find(name);
+            // Only invalidate cached remote entries; LOCAL_SEGMENT_ID is
+            // skipped by the collect phase and must never be purged here.
+            if (name_it != segment_name_to_id_map_.end() &&
+                name_it->second != LOCAL_SEGMENT_ID) {
+                segment_id_to_desc_map_.erase(name_it->second);
+                segment_name_to_id_map_.erase(name_it);
+                ++invalidated_count;
+                LOG(WARNING)
+                    << "Invalidated stale segment cache entry, name=" << name;
+            }
+            fit = segment_failure_counts_.erase(fit);
         }
     }
 
@@ -1405,7 +1656,10 @@ int TransferMetadata::syncSegmentCache(const std::string &segment_name) {
               << ", scanned=" << names_to_sync.size()
               << ", fetched=" << fetched_count << ", updated=" << updated_count
               << ", unchanged=" << unchanged_count
-              << ", failed=" << failed_count << ", skipped=" << skipped_count
+              << ", failed=" << failed_count
+              << ", unavailable=" << unavailable_count
+              << ", skipped=" << skipped_count
+              << ", invalidated=" << invalidated_count
               << ", sync_duration_ms=" << sync_duration_ms;
     return 0;
 }
@@ -1557,6 +1811,7 @@ int TransferMetadata::updateLocalSegmentDesc(uint64_t segment_id) {
 int TransferMetadata::addLocalSegment(SegmentID segment_id,
                                       const std::string &segment_name,
                                       std::shared_ptr<SegmentDesc> &&desc) {
+    if (desc) desc->rebuildInternedNicPaths();
     RWSpinlock::WriteGuard guard(segment_lock_);
     segment_id_to_desc_map_[segment_id] = desc;
     segment_name_to_id_map_[segment_name] = segment_id;
@@ -1577,11 +1832,11 @@ int TransferMetadata::addLocalMemoryBuffer(const BufferDesc &buffer_desc,
                                            bool update_metadata) {
     {
         RWSpinlock::WriteGuard guard(segment_lock_);
-        auto new_segment_desc = std::make_shared<SegmentDesc>();
         auto &segment_desc = segment_id_to_desc_map_[LOCAL_SEGMENT_ID];
-        *new_segment_desc = *segment_desc;
+        auto new_segment_desc = std::make_shared<SegmentDesc>(*segment_desc);
+        new_segment_desc->buffers.push_back(buffer_desc);
+        new_segment_desc->rebuildBufferRangeIndex();
         segment_desc = new_segment_desc;
-        segment_desc->buffers.push_back(buffer_desc);
     }
     if (update_metadata) return updateLocalSegmentDesc();
     return 0;
@@ -1592,20 +1847,20 @@ int TransferMetadata::removeLocalMemoryBuffer(void *addr,
     bool addr_exist = false;
     {
         RWSpinlock::WriteGuard guard(segment_lock_);
-        auto new_segment_desc = std::make_shared<SegmentDesc>();
         auto &segment_desc = segment_id_to_desc_map_[LOCAL_SEGMENT_ID];
-        *new_segment_desc = *segment_desc;
-        segment_desc = new_segment_desc;
-        for (auto iter = segment_desc->buffers.begin();
-             iter != segment_desc->buffers.end(); ++iter) {
+        auto new_segment_desc = std::make_shared<SegmentDesc>(*segment_desc);
+        for (auto iter = new_segment_desc->buffers.begin();
+             iter != new_segment_desc->buffers.end(); ++iter) {
             if (iter->addr == (uint64_t)addr
 #ifdef USE_CXL
-                ||
-                (iter->offset + segment_desc->cxl_base_addr) == (uint64_t)addr
+                || (iter->offset + new_segment_desc->cxl_base_addr) ==
+                       (uint64_t)addr
 #endif
             ) {
-                segment_desc->buffers.erase(iter);
+                new_segment_desc->buffers.erase(iter);
                 addr_exist = true;
+                new_segment_desc->rebuildBufferRangeIndex();
+                segment_desc = new_segment_desc;
                 break;
             }
         }

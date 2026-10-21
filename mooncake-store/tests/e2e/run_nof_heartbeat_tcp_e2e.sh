@@ -4,6 +4,9 @@ set -euo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd -- "$SCRIPT_DIR/../../.." && pwd)
 BUILD_DIR=${BUILD_DIR:-"$REPO_ROOT/build"}
+# The build-tree pybind module only carries an $ORIGIN RUNPATH, which does not
+# cover libasio.so in mooncake-common.
+export LD_LIBRARY_PATH="$BUILD_DIR/mooncake-common${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 LOG_DIR=${LOG_DIR:-/tmp/mooncake_nof_heartbeat_e2e}
 MASTER_RPC=${MASTER_RPC:-127.0.0.1:50051}
 MASTER_HOST=${MASTER_RPC%:*}
@@ -87,7 +90,7 @@ python3 "$REPO_ROOT/extern/spdk/scripts/rpc.py" nvmf_create_subsystem "$TARGET_N
 python3 "$REPO_ROOT/extern/spdk/scripts/rpc.py" nvmf_subsystem_add_ns "$TARGET_NQN" Malloc0 >/dev/null || true
 python3 "$REPO_ROOT/extern/spdk/scripts/rpc.py" nvmf_subsystem_add_listener "$TARGET_NQN" -t tcp -a "$TARGET_HOST" -s "$TARGET_PORT" >/dev/null || true
 
-python3 "$REPO_ROOT/mooncake-wheel/mooncake/http_metadata_server.py" --host "$METADATA_HOST" --port "$METADATA_PORT" >"$LOG_DIR/metadata.log" 2>&1 &
+python3 "$REPO_ROOT/python/mooncake/http_metadata_server.py" --host "$METADATA_HOST" --port "$METADATA_PORT" >"$LOG_DIR/metadata.log" 2>&1 &
 META_PID=$!
 sleep 2
 
@@ -102,9 +105,9 @@ sleep 2
 MASTER_PID=$!
 sleep 3
 
-PYTHONPATH="$BUILD_DIR/mooncake-integration" MC_NOF_TRTYPE=TCP python3 - <<PY >"$LOG_DIR/register.log" 2>&1
-import store
-ret = store.MooncakeDistributedNoFRegister().real_register(
+MOONCAKE_STORE_BACKEND=cpp MC_NOF_TRTYPE=TCP "${MOONCAKE_PYTHON_BIN:?MOONCAKE_PYTHON_BIN must point to the installed root-wheel virtualenv}" - <<PY >"$LOG_DIR/register.log" 2>&1
+from mooncake.store import MooncakeDistributedNoFRegister
+ret = MooncakeDistributedNoFRegister().real_register(
     "$TARGET_NQN",
     1,
     "$TARGET_HOST",

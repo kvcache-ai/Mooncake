@@ -10,6 +10,7 @@
 
 #include "replica.h"
 #include "types.h"
+#include "weight_metadata_store.h"
 
 namespace mooncake {
 
@@ -35,13 +36,15 @@ struct StandbyObjectMetadata {
     // state; promoted objects resume as ordinary cache.
     std::string group_id;  // Tenant group identifier
     ObjectDataType data_type{
-        ObjectDataType::UNKNOWN};  // Data type classification
+        ObjectDataType::UNKNOWN};                  // Data type classification
     struct_pack::compatible<bool, 1> hard_pinned;  // Eviction protection
+
+    struct_pack::compatible<std::string, 2> session_id;
 
     StandbyObjectMetadata() = default;
 
     YLT_REFL(StandbyObjectMetadata, client_id, size, replicas, group_id,
-             data_type, hard_pinned);
+             data_type, hard_pinned, session_id);
 
     // Check if this metadata has valid replicas
     bool HasReplicas() const { return !replicas.empty(); }
@@ -85,8 +88,10 @@ struct StandbySnapshot {
     uint64_t oplog_sequence_id{0};
     std::vector<StandbySegmentInfo> segments;
     std::vector<StandbyObjectEntry> objects;
+    struct_pack::compatible<WeightMetadataSnapshot, 1> weight_metadata;
 
-    YLT_REFL(StandbySnapshot, oplog_sequence_id, segments, objects);
+    YLT_REFL(StandbySnapshot, oplog_sequence_id, segments, objects,
+             weight_metadata);
 };
 
 /**
@@ -103,8 +108,10 @@ struct MetadataPayload {
     struct_pack::compatible<ObjectDataType, 1> data_type;  // Data type
     struct_pack::compatible<bool, 1> hard_pinned;          // Hard pin state
 
+    struct_pack::compatible<std::string, 2> session_id;
+
     YLT_REFL(MetadataPayload, client_id, size, replicas, group_id, data_type,
-             hard_pinned);
+             hard_pinned, session_id);
 
     // Convert to StandbyObjectMetadata
     StandbyObjectMetadata ToStandbyMetadata() const {
@@ -113,6 +120,7 @@ struct MetadataPayload {
         meta.size = size;
         meta.replicas = replicas;
         meta.group_id = group_id.value_or("");
+        meta.session_id = session_id.value_or("");
         meta.data_type = data_type.value_or(ObjectDataType::UNKNOWN);
         meta.hard_pinned = hard_pinned.value_or(false);
         return meta;
@@ -191,6 +199,23 @@ class MetadataStore {
 
     // GetKeyCount semantics unchanged - returns total across ALL tenants
     virtual size_t GetKeyCount() const = 0;
+
+    virtual bool PutWeightMetadata(const WeightRevisionMetadata& metadata) = 0;
+    virtual std::optional<WeightRevisionMetadata> GetWeightMetadata(
+        const WeightRevisionIdentity& identity) const = 0;
+    virtual std::optional<uint64_t> GetWeightMetadataTombstoneGeneration(
+        const WeightRevisionIdentity& identity) const = 0;
+    virtual bool RemoveWeightMetadata(const WeightRevisionIdentity& identity,
+                                      uint64_t metadata_generation) = 0;
+
+    virtual bool PutWeightLease(const WeightRevisionLease& lease) = 0;
+    virtual std::optional<WeightRevisionLease> GetWeightLease(
+        uint64_t lease_id) const = 0;
+    virtual std::optional<WeightRevisionLease> GetWeightLeaseTombstone(
+        uint64_t lease_id) const = 0;
+    virtual bool RemoveWeightLease(uint64_t lease_id,
+                                   const WeightRevisionIdentity& identity,
+                                   uint64_t fenced_metadata_generation) = 0;
 };
 
 }  // namespace mooncake

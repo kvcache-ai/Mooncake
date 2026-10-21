@@ -1,7 +1,7 @@
 #include "common/client_buffer_allocation.h"
 
-#include "bool_parser.h"
-#include "environ.h"
+#include "config/hugepage_config.h"
+#include "config/mmap_arena_config.h"
 #include "mmap_arena.h"
 
 #include <algorithm>
@@ -34,64 +34,17 @@ static std::atomic<uint64_t> g_arena_oom_fallback_count{0};
 static std::atomic<uint64_t> g_arena_noop_free_count{0};
 
 static void initializeGlobalArena() {
-    const std::string env_pool_size =
-        Environ::GetString("MC_MMAP_ARENA_POOL_SIZE", "");
-    // Allow env var to override the gflag (useful when loaded as .so from
-    // Python). An explicit pool-size env var is also treated as an opt-in,
-    // because pybind11 users cannot easily pass gflags.
-    const std::string env_disable =
-        Environ::GetString("MC_DISABLE_MMAP_ARENA", "");
-    const std::optional<bool> disable_override = TryParseBool(env_disable);
-    if (!env_disable.empty() && !disable_override.has_value()) {
-        LOG(WARNING) << "Ignoring invalid MC_DISABLE_MMAP_ARENA='"
-                     << env_disable
-                     << "'; accepted values: 1/0, true/false, yes/no, on/off";
-    }
-    const bool arena_requested =
-        FLAGS_use_mmap_arena_allocator || !env_pool_size.empty();
-    const bool arena_disabled = disable_override.value_or(false);
-    if (!arena_requested || arena_disabled) {
-        LOG(INFO) << "=== ARENA ALLOCATOR DISABLED ===";
-        if (arena_disabled) {
-            LOG(INFO) << "MC_DISABLE_MMAP_ARENA=" << env_disable
-                      << " forces direct mmap()";
-        } else {
-            LOG(INFO) << "Arena is opt-in; set --use_mmap_arena_allocator or "
-                         "MC_MMAP_ARENA_POOL_SIZE to enable it";
-        }
+    const MmapArenaConfig config = MmapArenaConfig::FromEnvironment(
+        FLAGS_use_mmap_arena_allocator, FLAGS_mmap_arena_pool_size);
+    if (!config.enabled) {
         return;
     }
 
     g_mmap_arena = std::make_unique<MmapArena>();
-    // Keep arena init consistent with the direct-mmap path:
-    //   MC_STORE_USE_HUGEPAGE=1  -> strict: hard fail if hugepage mmap fails
-    //   unset                    -> permissive: try hugepages, retry on
-    //                               regular pages if HugeTLB is unavailable
-    // This preserves both pre-existing contracts and avoids surprising
-    // operators with a silent hugepage downgrade.
-    const bool hugepages_explicitly_requested =
-        get_hugepage_size_from_env() > 0;
-
-    // Allow env var override since gflags cannot be set from Python (pybind11).
-    // Supports human-readable sizes via string_to_byte_size(): "20gb", "16GB",
-    // etc.
-    uint64_t arena_pool_size = FLAGS_mmap_arena_pool_size;
-    if (!env_pool_size.empty()) {
-        const uint64_t parsed = string_to_byte_size(env_pool_size);
-        if (parsed > 0) {
-            arena_pool_size = parsed;
-            LOG(INFO) << "MC_MMAP_ARENA_POOL_SIZE override: " << env_pool_size
-                      << " (" << byte_size_to_string(arena_pool_size) << ")";
-        } else {
-            LOG(WARNING) << "Invalid MC_MMAP_ARENA_POOL_SIZE='" << env_pool_size
-                         << "', using default "
-                         << byte_size_to_string(FLAGS_mmap_arena_pool_size);
-        }
-    }
 
     bool success =
-        g_mmap_arena->initialize(arena_pool_size, MmapArena::kMinAlignment,
-                                 !hugepages_explicitly_requested);
+        g_mmap_arena->initialize(config.pool_size, MmapArena::kMinAlignment,
+                                 !config.hugepages_explicitly_requested);
 
     if (success) {
         auto stats = g_mmap_arena->getStats();
@@ -102,7 +55,7 @@ static void initializeGlobalArena() {
     } else {
         LOG(ERROR) << "=== ARENA INITIALIZATION FAILED ===";
         LOG(ERROR) << "Falling back to traditional mmap()";
-        if (hugepages_explicitly_requested) {
+        if (config.hugepages_explicitly_requested) {
             LOG(ERROR) << "MC_STORE_USE_HUGEPAGE is set, so the fallback path "
                           "will also require hugepages";
         }
@@ -278,7 +231,7 @@ void *allocate_buffer_mmap_memory(size_t total_size, size_t alignment,
 
     // Traditional mmap allocation (fallback or arena disabled).
     const bool defer_direct_population =
-        defer_hugetlb_population && get_hugepage_size_from_env() > 0;
+        defer_hugetlb_population && HugepageConfig::FromEnvironment().enabled;
     unsigned int flags = MAP_PRIVATE | MAP_ANONYMOUS;
     if (!defer_direct_population) {
         flags |= MAP_POPULATE;
@@ -409,6 +362,74 @@ void *allocate_buffer_numa_segments(size_t total_size,
             }
             return s;
         }() << "]";
+    return ptr;
+}
+
+void *allocate_buffer_thp_interleaved(size_t total_size) {
+    constexpr size_t kThpSize = SZ_2MB;
+    if (total_size == 0 || total_size % kThpSize != 0) {
+        LOG(ERROR) << "Invalid THP segment size " << total_size
+                   << ", must be a non-zero multiple of " << kThpSize;
+        return nullptr;
+    }
+
+    // Over-reserve by one huge page and trim, so the returned range is
+    // 2MB-aligned and every PMD in it can be backed by a THP. The trimmed
+    // mapping is exactly [ptr, ptr + total_size), which is what
+    // free_buffer_mmap_memory() unmaps.
+    const size_t reserve_size = total_size + kThpSize;
+    void *raw = mmap(nullptr, reserve_size, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (raw == MAP_FAILED) {
+        LOG(ERROR) << "mmap failed, size=" << reserve_size
+                   << ", errno=" << errno << " (" << strerror(errno) << ")";
+        return nullptr;
+    }
+    const uintptr_t raw_addr = reinterpret_cast<uintptr_t>(raw);
+    const uintptr_t addr = align_up(raw_addr, kThpSize);
+    if (addr > raw_addr) {
+        munmap(raw, addr - raw_addr);
+    }
+    const uintptr_t tail = addr + total_size;
+    if (raw_addr + reserve_size > tail) {
+        munmap(reinterpret_cast<void *>(tail), raw_addr + reserve_size - tail);
+    }
+    void *ptr = reinterpret_cast<void *>(addr);
+
+    // Request THP explicitly instead of relying on the system default or on
+    // GLIBC_TUNABLES=glibc.malloc.hugetlb=1. With THP enabled=madvise a 4KB
+    // backed segment needs 512x more NIC page-table entries, and EFA reg_mr
+    // runs out of them (ENOMEM) once several ranks register large segments.
+    if (madvise(ptr, total_size, MADV_HUGEPAGE) != 0) {
+        LOG(WARNING) << "madvise(MADV_HUGEPAGE) failed, errno=" << errno << " ("
+                     << strerror(errno) << "); segment may be 4KB backed";
+    }
+
+    // Interleave across all allowed NUMA nodes. Under the default local
+    // policy one node fills first, and from then on every THP fault runs
+    // direct compaction on the full node (__GFP_THISNODE) before falling back
+    // to the other node. With several ranks registering hundreds of GB each,
+    // that turns registration from tens of seconds into tens of minutes.
+    // Interleaving also spreads the segment evenly across the NICs' nodes.
+    // An explicit task policy (e.g. numactl --membind) is left untouched.
+    int task_policy = MPOL_DEFAULT;
+    if (get_mempolicy(&task_policy, nullptr, 0, nullptr, 0) != 0) {
+        task_policy = MPOL_DEFAULT;
+    }
+    if (task_policy == MPOL_DEFAULT && numa_available() >= 0) {
+        struct bitmask *nodes = numa_get_mems_allowed();
+        if (nodes && numa_bitmask_weight(nodes) > 1) {
+            if (mbind(ptr, total_size, MPOL_INTERLEAVE, nodes->maskp,
+                      nodes->size + 1, 0) != 0) {
+                LOG(WARNING) << "mbind(MPOL_INTERLEAVE) failed, errno=" << errno
+                             << " (" << strerror(errno) << ")";
+            }
+        }
+        if (nodes) numa_bitmask_free(nodes);
+    }
+
+    LOG(INFO) << "Allocated THP-interleaved buffer: " << total_size
+              << " bytes at " << ptr;
     return ptr;
 }
 

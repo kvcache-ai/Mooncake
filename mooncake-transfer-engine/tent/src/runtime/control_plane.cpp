@@ -17,6 +17,7 @@
 
 #include <cassert>
 #include <exception>
+#include <optional>
 #include <set>
 #include <utility>
 
@@ -44,6 +45,11 @@ class CallbackInvocationGuard {
     Fn on_exit_;
 };
 
+// onNotify() answers a request it can never take with this prefix, which
+// ControlClient::notify() tells apart from a notification not taken yet.
+constexpr char kMalformedNotification[] = "malformed notification: ";
+constexpr char kNotifyCallbackFailed[] = "notify callback failed: ";
+
 }  // namespace
 
 thread_local const ControlService* ControlService::active_bootstrap_service_ =
@@ -55,7 +61,15 @@ thread_local CoroRpcAgent tl_rpc_agent;
 Status ControlClient::getSegmentDesc(const std::string& server_addr,
                                      std::string& response) {
     std::string request;
-    return tl_rpc_agent.call(server_addr, GetSegmentDesc, request, response);
+    auto status =
+        tl_rpc_agent.call(server_addr, GetSegmentDesc, request, response);
+    if (status.IsRpcServiceError()) {
+        // A failed stale connection is discarded by the RPC agent. Retry this
+        // read-only operation once; other control RPCs may have side effects.
+        return tl_rpc_agent.call(server_addr, GetSegmentDesc, request,
+                                 response);
+    }
+    return status;
 }
 
 Status ControlClient::decodeBootstrapResponse(const std::string& response_raw,
@@ -108,6 +122,9 @@ Status ControlClient::bootstrapUb(const std::string& server_addr,
 Status ControlClient::sendData(const std::string& server_addr,
                                uint64_t peer_mem_addr, void* local_mem_addr,
                                size_t length) {
+    // Check before addition/allocation or reading the caller's source buffer.
+    if (length > kTcpMaxWriteBytes)
+        return Status::InvalidArgument("TCP WRITE exceeds RPC payload limit");
     std::string response;
     XferDataDesc desc{htole64(peer_mem_addr), htole64(length)};
     std::string request;
@@ -136,6 +153,8 @@ Status ControlClient::sendData(const std::string& server_addr,
 Status ControlClient::recvData(const std::string& server_addr,
                                uint64_t peer_mem_addr, void* local_mem_addr,
                                size_t length) {
+    if (length > kTcpMaxReadBytes)
+        return Status::InvalidArgument("TCP READ exceeds RPC payload limit");
     std::string request, response;
     XferDataDesc desc{htole64(peer_mem_addr), htole64(length)};
     request.resize(sizeof(XferDataDesc));
@@ -162,7 +181,13 @@ Status ControlClient::notify(const std::string& server_addr,
     json j = message;
     std::string request = j.dump();
     std::string response;
-    return tl_rpc_agent.call(server_addr, Notify, request, response);
+    CHECK_STATUS(tl_rpc_agent.call(server_addr, Notify, request, response));
+    // Not an RPC error: the peer answered. A malformed request fails the
+    // same way on every retry, while a missing callback may be set later.
+    if (response.empty()) return Status::OK();
+    if (response.rfind(kMalformedNotification, 0) == 0)
+        return Status::InvalidArgument(response);
+    return Status::InternalError(response);
 }
 
 Status ControlClient::probe(const std::string& server_addr) {
@@ -506,12 +531,17 @@ void ControlService::onSendData(const std::string_view& request,
     auto length = le64toh(desc->length);
 
     // Validate request size to prevent buffer over-read
-    if (request.size() < sizeof(XferDataDesc) + length) {
+    if (length > kTcpMaxWriteBytes ||
+        length > request.size() - sizeof(XferDataDesc)) {
         response = "SendData failed: invalid request size";
         return;
     }
 
-    if (local_desc->findBuffer(peer_mem_addr, length)) {
+    if (auto* buffer = local_desc->findBuffer(peer_mem_addr, length)) {
+        if (buffer->permission != kGlobalReadWrite) {
+            response = "SendData failed: remote write permission denied";
+            return;
+        }
         auto status =
             Platform::getLoader().copy((void*)peer_mem_addr, &desc[1], length);
         if (!status.ok()) {
@@ -546,13 +576,17 @@ void ControlService::onRecvData(const std::string_view& request,
     };
 
     // Validate length to prevent DoS via excessive memory allocation
-    constexpr size_t kMaxTransferSize = 1ULL << 30;  // 1GB max per RPC
-    if (length > kMaxTransferSize) {
+    if (length > kTcpMaxReadBytes) {
         fail("RecvData failed: length exceeds maximum allowed");
         return;
     }
 
-    if (local_desc->findBuffer(peer_mem_addr, length)) {
+    if (auto* buffer = local_desc->findBuffer(peer_mem_addr, length)) {
+        if (buffer->permission != kGlobalReadOnly &&
+            buffer->permission != kGlobalReadWrite) {
+            fail("RecvData failed: remote read permission denied");
+            return;
+        }
         auto& loader = Platform::getLoader();
         if (loader.getMemoryType((void*)peer_mem_addr) == MTYPE_CPU) {
             // assign() skips the resize() zero-fill pass.
@@ -573,11 +607,15 @@ void ControlService::onRecvData(const std::string_view& request,
 
 void ControlService::onNotify(const std::string_view& request,
                               std::string& response) {
-    (void)response;
     OnNotify callback;
     {
         std::lock_guard<std::mutex> guard(notify_cb_mutex_);
-        if (!notify_callback_) return;
+        // An empty response is the sender's ack; before the callback is
+        // registered and after teardown clears it, nothing takes the message.
+        if (!notify_callback_) {
+            response = "notify callback not registered";
+            return;
+        }
         callback = notify_callback_;
         ++notify_callbacks_in_flight_;
     }
@@ -589,13 +627,26 @@ void ControlService::onNotify(const std::string_view& request,
         finishNotifyCallback();
     });
 
+    std::optional<Notification> message;
     try {
-        Notification message = json::parse(request).get<Notification>();
-        callback(message);
+        message = json::parse(request).get<Notification>();
+        int rc = callback(*message);
+        if (rc != 0) {
+            response = std::string(kNotifyCallbackFailed) + "returned " +
+                       std::to_string(rc);
+        }
+    } catch (const json::exception& e) {
+        LOG(ERROR) << "onNotify failed: " << e.what();
+        // Only a request that does not parse fails again on every retry.
+        response = std::string(message ? kNotifyCallbackFailed
+                                       : kMalformedNotification) +
+                   e.what();
     } catch (const std::exception& e) {
         LOG(ERROR) << "onNotify failed: " << e.what();
+        response = std::string(kNotifyCallbackFailed) + e.what();
     } catch (...) {
         LOG(ERROR) << "onNotify failed with unknown exception";
+        response = kNotifyCallbackFailed;
     }
 }
 
@@ -652,8 +703,11 @@ void ControlClient::subscribeSegmentUpdateAsync(
         server_addr, SubscribeSegmentUpdate, request,
         [](const Status& status, const std::string&) {
             if (!status.ok()) {
-                LOG(ERROR) << "SubscribeSegmentUpdate RPC failed with: "
-                           << status.ToString();
+                VLOG(1) << "SubscribeSegmentUpdate RPC failed with: "
+                        << status.ToString();
+                LOG_EVERY_N(ERROR, 100)
+                    << "SubscribeSegmentUpdate RPC failed with: "
+                    << status.ToString();
             }
         });
 }
@@ -663,12 +717,10 @@ void ControlClient::notifySegmentUpdatedAsync(
     const onNotifySegmentUpdateFailure& on_failure) {
     json j = segment_name;
     std::string request = j.dump();
-    tl_rpc_agent.callAsync(
+    tl_rpc_agent.callAsyncRetryOnce(
         server_addr, NotifySegmentUpdated, request,
         [on_failure](const Status& status, const std::string&) {
-            if (!status.ok()) {
-                on_failure();
-            }
+            if (!status.ok()) on_failure();
         });
 }
 

@@ -56,6 +56,7 @@ class WorkerPool {
     void enqueuePreparedSlices(const SliceList &slice_list,
                                uint64_t submitted_slice_count);
     void enqueueSliceToOwner(Transport::Slice *slice);
+    void enqueueSlicesToOwner(int owner_thread, const SliceList &slices);
     int postingThreadForPeer(const std::string &peer_nic_path) const;
     int cqIndexForPostingThread(int thread_id) const;
 
@@ -100,6 +101,8 @@ class WorkerPool {
     void maybeActivateRecoveredContext();
     bool hasAvailablePeerRailAlternative(Transport::Slice *slice,
                                          const std::string &failed_peer_path);
+    bool recordAutoGidDataPathFailure(Transport::Slice *slice);
+    void recordAutoGidDataPathSuccess(Transport::Slice *slice);
 
     static bool isLocalWcFailure(const ibv_wc &wc);
 
@@ -156,6 +159,10 @@ class WorkerPool {
     // Rail state management: peer_nic_path -> RailState
     std::unordered_map<std::string, RailState> rail_states_;
     std::mutex rail_state_lock_;
+    // Number of rails with pause_until_ns in the future. The submit hot path
+    // skips rail_state_lock_ while this is zero. Expired pauses are cleared on
+    // the next locked isRailAvailable() for any path, not only the expired one.
+    std::atomic<int> paused_rail_count_{0};
 
     // Rail monitor configuration
     const static int kRailErrorThreshold = 5;  // Errors before pause

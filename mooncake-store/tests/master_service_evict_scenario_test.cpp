@@ -20,7 +20,7 @@
 #include "ha/kv/ha_kv_backend.h"
 #include "ha/oplog/oplog_batch_storage.h"
 #include "ha/oplog/oplog_batch_types.h"
-#include "tenant_quota_policy_store.h"
+#include "tenant/quota_policy_store.h"
 #include "types.h"
 
 namespace mooncake::test {
@@ -28,6 +28,10 @@ namespace {
 
 class EvictFakeBatchHaKvBackend : public HaKvBackend {
    public:
+    ErrorCode DeleteRange(std::string_view, std::string_view) override {
+        return ErrorCode::INVALID_PARAMS;
+    }
+
     ErrorCode Get(std::string_view key, std::string& value) override {
         std::lock_guard lock(kvs_mutex_);
         auto it = kvs_.find(std::string(key));
@@ -368,6 +372,31 @@ TEST_F(MasterServiceEvictScenarioTest, ActiveGroupMemberBlocksWholeGroup) {
         .Then(Object(Key(kGroupSize)).DoesNotExist());
 }
 
+TEST_F(MasterServiceEvictScenarioTest,
+       ProbedObjectsStayEvictableWhileLeasedObjectsSurvive) {
+    auto config = EvictConfig();
+    config.default_kv_lease_ttl = 60 * 60 * 1000;
+    MasterScenario scenario("batch probe grants no lease", config);
+    scenario.Given(MemoryNode("memory"))
+        .Given(Objects({"leased_a", "leased_b", "probed_a", "probed_b"})
+                   .Size(kObjectSize)
+                   .CompleteOn("memory")
+                   .ExpiredFrom(ExpiredBase()))
+        // BatchExistence grants every hit a fresh lease. BatchProbe reports
+        // the same hits and leaves their expired leases untouched.
+        .Then(BatchExistence({"leased_a", "leased_b"}).Returns({true, true}))
+        .Then(BatchProbe({"probed_a", "missing", "probed_b", "probed_a"})
+                  .Returns({true, false, true, true}))
+        .When(EvictMemory(1.0))
+        .Then(Objects({"leased_a", "leased_b"}).AreReadable())
+        .Then(Objects({"probed_a", "probed_b"}).DoNotExist())
+        // Once those leases expire, the same pass reclaims the leased objects.
+        .When(ExpireAt("leased_a", ExpiredBase()))
+        .When(ExpireAt("leased_b", ExpiredBase()))
+        .When(EvictMemory(1.0))
+        .Then(Objects({"leased_a", "leased_b"}).DoNotExist());
+}
+
 TEST_F(MasterServiceEvictScenarioTest, EvictsExactOldestObjectsAtHighRatio) {
     constexpr size_t kObjectCount = 200;
     constexpr size_t kExpectedEvicted = 160;
@@ -574,10 +603,12 @@ TEST_F(MasterServiceEvictScenarioTest,
                   .ExpectError(ErrorCode::TENANT_QUOTA_EXCEEDED));
 }
 
+// Admission does not evict. A tenant at its ceiling is rejected outright and
+// the background watermark pass is what makes room -- within that tenant only.
 TEST_F(MasterServiceEvictScenarioTest,
-       TenantAdmissionEvictsOnlyThatTenantsExpiredObject) {
+       TenantOverQuotaRejectsAdmissionAndBackgroundPassReclaims) {
     MasterScenario scenario(
-        "tenant admission evicts within tenant",
+        "over-quota admission rejects; the tenant pass makes room",
         TenantConfig({{"tenant-a", kObjectSize}, {"tenant-b", kObjectSize}}));
     scenario.Given(MemoryNode("memory"))
         .Given(Objects({"tenant-a-old"})
@@ -590,12 +621,25 @@ TEST_F(MasterServiceEvictScenarioTest,
                    .ForTenant("tenant-b")
                    .WithHardPin()
                    .CompleteOn("memory"))
+        // The write path no longer evicts inline, so the expired object
+        // survives the rejected admission.
+        .When(PutStart("tenant-a-new", kObjectSize)
+                  .ForTenant("tenant-a")
+                  .ExpectError(ErrorCode::TENANT_QUOTA_EXCEEDED))
+        .Then(Object("tenant-a-old").ForTenant("tenant-a").IsReadable())
+        // The pass reclaims tenant-a's own expired object. tenant-b is over
+        // its watermark too, but its object is hard-pinned, so the pass frees
+        // nothing for it and never reaches across tenants to compensate.
+        .When(EvictTenants())
+        .Then(Object("tenant-a-old").ForTenant("tenant-a").DoesNotExist())
+        .Then(Object("tenant-b-object").ForTenant("tenant-b").IsReadable())
+        // With headroom built ahead of it, the retry is admitted.
         .When(PutStart("tenant-a-new", kObjectSize)
                   .ForTenant("tenant-a")
                   .ExpectReplicas(1))
-        .Then(Object("tenant-a-old").ForTenant("tenant-a").DoesNotExist())
-        .Then(Object("tenant-b-object").ForTenant("tenant-b").IsReadable())
         .When(PutEnd("tenant-a-new").ForTenant("tenant-a"))
+        // tenant-b has nothing evictable, so it keeps rejecting -- now
+        // without a shard scan per attempt.
         .When(PutStart("tenant-b-overflow", 1)
                   .ForTenant("tenant-b")
                   .ExpectError(ErrorCode::TENANT_QUOTA_EXCEEDED));

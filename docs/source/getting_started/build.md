@@ -75,6 +75,69 @@ sudo make install
 `-DUSE_NOF=ON` builds the NoF registration APIs and deployment tools. Use
 `-DUSE_NOF=OFF` or omit the option when the NVMe-oF SSD pool is not needed.
 
+(build-with-store-rs)=
+### Build with Store-RS
+
+Store-RS is an optional Rust-native Mooncake Store. The default CMake build
+leaves it disabled, and the Python Store facade uses the C++ backend. Enable
+it when building a root wheel that should include the Rust backend and its standalone commands.
+
+The build needs a root checkout with submodules, CMake, a C++ toolchain, Rust
+(`cargo` on `PATH`), and Python 3.10 or newer. A multi-client runtime also
+needs Redis or etcd.
+
+```bash
+export MOONCAKE_ROOT_DIR="$PWD"
+export MOONCAKE_STORE_RS_DIR="$MOONCAKE_ROOT_DIR/mooncake-store-rs"
+export MOONCAKE_BUILD_DIR="$MOONCAKE_ROOT_DIR/build/store-rs"
+export MOONCAKE_PYTHON_BIN="$(command -v python3)"
+
+cmake -S "$MOONCAKE_ROOT_DIR" -B "$MOONCAKE_BUILD_DIR" \
+  -DPython3_EXECUTABLE="$MOONCAKE_PYTHON_BIN" \
+  -DWITH_STORE=ON \
+  -DWITH_STORE_RUST=OFF \
+  -DWITH_STORE_RS=ON \
+  -DWITH_TE=ON \
+  -DUSE_TENT=ON \
+  -DBUILD_SHARED_LIBS=ON \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build "$MOONCAKE_BUILD_DIR" --target build_store_rs --parallel
+```
+
+This out-of-tree build provides the native artifacts and standalone binaries. For a Python wheel only, skip the separate CMake build command; the wheel builder configures and builds its own CMake tree.
+
+The root wheel owns the mooncake Python package. Build and install one wheel,
+then select its Store backend before importing mooncake.store:
+
+| Setting | Backend |
+|---------|---------|
+| Unset or cpp | C++ Store |
+| rs | Store-RS, included by WITH_STORE_RS=ON |
+
+The facade reads MOONCAKE_STORE_BACKEND when mooncake.store is first imported.
+Use exactly cpp or rs. The setting does not change the standalone command
+names.
+
+```bash
+MOONCAKE_STORE_BACKEND=rs .venv-store-rs/bin/python -c \
+  "from mooncake.store import MooncakeDistributedStore; print(MooncakeDistributedStore)"
+
+.venv-store-rs/bin/mooncake-store-rs-client --help
+.venv-store-rs/bin/mooncake-store-rs-admin --help
+.venv-store-rs/bin/mooncake-store-rs-bench --help
+```
+
+For workspace unit tests and installed-package smoke coverage, run
+`scripts/ci/run_store_rs_smoke.sh` after installing the CMake `python`
+component. The [Store-RS validation guide](../deployment/store-rs/testing.md#local-validation)
+lists the required CMake paths and the direct commands for heavier scenarios.
+
+Configuration, validation, and API details are in the
+[Store-RS deployment guides](../deployment/store-rs/index.md), the
+[Rust API](../api-reference/rust/store-rs.md), the
+[Python API](../api-reference/python/store-rs.md), and the
+[Admin HTTP API](../api-reference/http/store-rs-admin.md).
+
 ### RISC-V Build
 
 Mooncake supports native 64-bit RISC-V Linux builds with `USE_RISCV` enabled.
@@ -126,7 +189,9 @@ environment setup must be prepared separately.
 | Huawei Ascend UBSHMEM | `-DUSE_UBSHMEM=ON` | Install Ascend CANN Toolkit. Requires CANN >= 9.0.0, driver >= 26.0.0, Lingqu >= 1.5. | Source the CANN `set_env.sh` before configuring CMake. |
 | AMD HIP / ROCm | `-DUSE_HIP=ON` | Install ROCm/HIP SDK. | Ensure HIP compiler, headers, and runtime libraries are visible to CMake. |
 | Hygon DCU | `-DUSE_HYGON=ON` | Install DTK SDK. | Set `DTK_HOME`, or pass `-DDTK_ROOT=/path/to/dtk`. Use `-DDTK_INCLUDE_DIR` and `-DDTK_LIB_DIR` for custom layouts. |
+| ScaleFabric SHCA | `-DUSE_SHCA=ON` | Install `shca-tools`. | Supports Transfer Engine/TENT RDMA paths only; Mooncake-EP IBGDA is not supported. `MC_RPC_PROTOCOL=rdma` is not supported on SHCA builds; Store/RPC should use TCP. |
 | Iluvatar CoreX | `-DUSE_COREX=ON` | Install CoreX SDK. | Set `COREX_HOME`, or pass `-DCOREX_ROOT=/path/to/corex`. Use `-DCOREX_INCLUDE_DIR` and `-DCOREX_LIB_DIR` for custom layouts. |
+| Biren GPU | `-DUSE_SUPA=ON` | Install Biren SUPA SDK. | Set `BIREN_HOME` to the SDK root containing `supa/include` and `supa/lib`, or pass `-DBIREN_HOME=/path/to/biren-sdk`. Uses a CUDA-compatible runtime. |
 
 ```{admonition} NCCL host RMA constraints
 :class: important
@@ -160,6 +225,13 @@ starting Mooncake to use DMA-BUF. Set `WITH_NVIDIA_PEERMEM=1` to use the legacy
 `ibv_reg_mr` path, which requires `nvidia-peermem`. See Section 3.7 of
 https://docs.nvidia.com/cuda/gpudirect-rdma/ for `nvidia-peermem` installation
 instructions.
+
+When `WITH_NVIDIA_PEERMEM` is **unset**, Mooncake uses the legacy `ibv_reg_mr`
+path. On hosts without `nvidia-peermem` (for example the NVIDIA open kernel
+modules with the inbox RDMA stack and no MLNX_OFED), GPU memory registration
+then fails with `Failed to register memory 0x...: Bad address [14]`; set
+`WITH_NVIDIA_PEERMEM=0` there. DMA-BUF needs the NVIDIA open kernel modules and
+Linux 5.12 or later.
 ```
 
 ## Use Mooncake in Docker Containers
@@ -237,14 +309,16 @@ The following options can be passed to `cmake ..`.
 | `-DUSE_HIP=ON/OFF` | `OFF` | Enable AMD GPU support via HIP/ROCm. |
 | `-DUSE_HYGON=ON/OFF` | `OFF` | Enable Hygon DCU support via DTK SDK. Uses a CUDA-compatible runtime. |
 | `-DUSE_COREX=ON/OFF` | `OFF` | Enable Iluvatar CoreX GPU support. Uses a CUDA-compatible runtime. |
+| `-DUSE_SUPA=ON/OFF` | `OFF` | Enable Biren GPU support via the SUPA SDK. Uses a CUDA-compatible runtime. Set `BIREN_HOME` to the SDK root. |
 | `-DUSE_MLU=ON/OFF` | `OFF` | Enable Cambricon MLU memory support via Neuware, including memory detection, topology discovery, and RDMA registration. |
 | `-DUSE_RISCV=ON/OFF` | `OFF` | Enable RISC-V build compatibility settings, including disabling full IPO/LTO for Python extensions. |
+| `-DUSE_SHCA=ON/OFF` | `OFF` | Enable ScaleFabric SHCA InfiniBand support for Transfer Engine/TENT RDMA paths only. Mooncake-EP IBGDA is not supported. `MC_RPC_PROTOCOL=rdma` is not supported on SHCA builds; Store/RPC should use TCP. |
 | `-DUSE_ASCEND_DIRECT=ON/OFF` | `OFF` | Enable Ascend Direct transport and HCCS support via the ADXL engine. Recommended for Ascend builds. |
 | `-DUSE_UBSHMEM=ON/OFF` | `OFF` | Enable Huawei Ascend NPU shared memory transport via CANN VMM APIs. |
 | `-DUSE_INTRA_NVLINK=ON/OFF` | `OFF` | Enable intranode NVLink transport. |
 | `-DUSE_VRAM_SEGMENT=ON/OFF` | `OFF` | Enable create VRAM Segment instead of (default) DRAM Segment. |
 | `-DUSE_CXL=ON/OFF` | `OFF` | Enable CXL support. |
-| `-DUSE_MPCOMM=ON/OFF` | `OFF` | Enable the MPComm transport in TENT (multi-NIC memory pooling over RDMA). Requires `-DUSE_TENT=ON` and `-DMPCOMM_ROOT=<prefix>`. See [MPComm Transport](../design/transfer-engine/mpcomm_transport.md). |
+| `-DUSE_MPCOMM=ON/OFF` | `OFF` | Enable the MPComm transport in TENT (multi-NIC memory pooling over RDMA). Requires `-DUSE_TENT=ON` and `-DMPCOMM_ROOT=<prefix>`. See [MPComm Transport](../design/transfer-engine/transport/mpcomm_transport.md). |
 
 ### Vendor SDK Path Overrides
 
@@ -260,6 +334,7 @@ The following options can be passed to `cmake ..`.
 | `-DCOREX_ROOT=/path/to/corex` | `-DUSE_COREX=ON` | Override the CoreX SDK root. `COREX_HOME` is also honored; default is `/usr/local/corex`. |
 | `-DCOREX_INCLUDE_DIR=/path/to/include` | `-DUSE_COREX=ON` | Override the CoreX include directory. |
 | `-DCOREX_LIB_DIR=/path/to/lib` | `-DUSE_COREX=ON` | Override the CoreX library directory. |
+| `-DBIREN_HOME=/path/to/biren-sdk` | `-DUSE_SUPA=ON` | Override the Biren SUPA SDK root. `BIREN_HOME` is also honored; default is `/usr/local/birensupa/all/latest`. The root must contain `supa/include` and `supa/lib`. |
 | `-DNEUWARE_ROOT=/path/to/neuware` | `-DUSE_MLU=ON` | Override the Neuware SDK root. `NEUWARE_HOME` is also honored; default is `/usr/local/neuware`. |
 | `-DMLU_INCLUDE_DIR=/path/to/include` | `-DUSE_MLU=ON` | Override the Neuware include directory. |
 | `-DMLU_LIB_DIR=/path/to/lib64` | `-DUSE_MLU=ON` | Override the Neuware library directory. |
@@ -269,7 +344,7 @@ The following options can be passed to `cmake ..`.
 
 | Option | Default | Description |
 | --- | --- | --- |
-| `-DUSE_EFA=ON/OFF` | `OFF` | Enable AWS Elastic Fabric Adapter transport via libfabric. See [EFA Transport](../design/transfer-engine/efa_transport.md). |
+| `-DUSE_EFA=ON/OFF` | `OFF` | Enable AWS Elastic Fabric Adapter transport via libfabric. See [EFA Transport](../design/transfer-engine/transport/efa_transport.md). |
 | `-DUSE_NOF=ON/OFF` | `OFF` | Build Mooncake Store with NVMe-oF SSD pool support. Use `sudo bash dependencies.sh --with-spdk` before enabling it. |
 | `-DUSE_REDIS=ON/OFF` | `OFF` | Enable Redis-based metadata service for Transfer Engine. Requires hiredis. |
 | `-DUSE_HTTP=ON/OFF` | `ON` | Enable HTTP-based metadata service. |
@@ -289,7 +364,8 @@ The following options can be passed to `cmake ..`.
 | `-DWITH_P2P_STORE=ON/OFF` | `OFF` | Enable Golang support and build the P2P Store component. Requires Go 1.23+. |
 | `-DWITH_RUST_EXAMPLE=ON/OFF` | `OFF` | Build the Transfer Engine Rust library (`transfer_engine_rust`), tests, and sample benchmark. |
 | `-DWITH_STORE_RUST=ON/OFF` | `ON` | Build Mooncake Store Rust bindings and CMake Rust targets. |
-| `-DWITH_EP=ON/OFF` | `OFF` | Build the EP and PG Python extensions for CUDA. Requires CUDA toolkit and PyTorch. Use `-DEP_TORCH_VERSIONS="2.13.0"` to build for specific PyTorch versions, or leave empty to use the currently installed torch. The CUDA version is detected automatically. |
+| `-DWITH_STORE_RS=ON/OFF` | `OFF` | Build the Rust-native Mooncake Store (Store-RS), its Python extension, and the standalone commands. Requires `-DWITH_TE=ON`, `-DUSE_TENT=ON`, and `cargo`. See {ref}`Build with Store-RS <build-with-store-rs>`. |
+| `-DWITH_EP=ON/OFF` | `OFF` | Build Mooncake EP and the native Mooncake PG core/device libraries. The Torch-facing PG adapter is compiled by the installed package at first `import mooncake.pg`. |
 
 ### Build Behavior Options
 

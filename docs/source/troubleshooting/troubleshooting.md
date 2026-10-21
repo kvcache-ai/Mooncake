@@ -8,6 +8,19 @@ This document lists common errors that may occur when using Mooncake Store and p
 > - [ ] Incorrect RDMA device name and connection status is not active.
 > - [ ] etcd is not started normally and it is not bind with `0.0.0.0`.
 
+## TENT Configuration Load Failures
+
+`MC_TENT_CONF` accepts inline JSON or a configuration file path. Malformed JSON,
+an unreadable file, or a missing path prevents TENT from starting, including
+when vLLM's `MooncakeConnector` enables TENT through `MC_USE_TENT`.
+The log reports `Failed to construct Transfer Engine instance` with the
+configuration loading error. Check the JSON syntax and ensure the file exists
+and is readable in the worker's environment before retrying startup.
+
+The native `TransferEngine(config_path)` constructor also rejects missing or
+malformed files: `available()` stays false and no RPC server is started. Valid
+environment defaults do not rescue a failed explicit file load.
+
 ## Corrupted Data or Garbled Output
 
 Use object-level checksum diagnostics when a full-object Mooncake Store read returns corrupted data or the application produces garbled output that may originate from stored data. Deploy checksum-capable Mooncake Store client, primary master, and standby master binaries from the same version, then set `MOONCAKE_STORE_CHECKSUM=1` before starting every writer and reader client process:
@@ -25,6 +38,16 @@ An enabled reader skips verification when the object's metadata has no checksum,
 Checksum diagnostics add a full data scan to writes and reads, perform device-to-host staging for GPU buffers, and disable the local hot cache. Disable the switch after diagnosis. See the [Mooncake Store Deployment and Tuning Guide](../deployment/mooncake-store-deployment-guide.md) for deployment and snapshot compatibility details.
 
 ## Metadata and Out-of-Band Communication
+
+### TENT Configuration Parse Diagnostics
+
+JSON parse errors report a parser code and byte position without echoing the
+configuration's input tokens. Check the original `MC_TENT_CONF` value or file
+privately at that position. Errors from probing an inline configuration as a
+filename report the filesystem error without printing the configuration.
+Numeric parsing failures also omit the input literal. Review other log fields
+and attachments for sensitive data before sharing them.
+
 1. At startup, a `TransferMetadata` object is constructed according to the incoming `metadata_server` parameter. During program execution, this object is used to communicate with the etcd server to maintain internal data required for connection.
 2. At startup, the current node is registered with the cluster according to the incoming `connectable_name` parameter and `rpc_port` parameter, and the TCP port specified by the `rpc_port` parameter is listened. Before other nodes send the first read/write request to the current node, they will use the above information, resolve DNS, and initiate a connection through socket's `connect()` method.
 
@@ -130,6 +153,21 @@ Errors in this part usually indicate that the error occurred within the `mooncak
    - Set the environment variable `MC_ENABLE_DEST_DEVICE_AFFINITY=1` before starting the application
    - If the leak persists under sustained peer failures (many `endpoint evicted` log lines accompanying the QP growth), update to a version that includes the fix for [issue #1845](https://github.com/kvcache-ai/Mooncake/issues/1845). Prior to that fix, the endpoint store's `waiting_list_` only drained when new endpoints were inserted, so evictions under failure load accumulated QPs until the driver limit was hit. The fix adds a periodic reclaim tick to `monitorWorker`.
 
+8. If you encounter `Failed to register memory 0x...: Bad address [14]` when registering **GPU** memory (for example a vLLM or SGLang KV cache), usually followed by `Memory region not registered by any active device(s)` and `AddressNotRegistered` on every transfer, Mooncake is registering GPU memory with the legacy `ibv_reg_mr` path, which needs the `nvidia-peermem` kernel module. This is the default while `WITH_NVIDIA_PEERMEM` is unset.
+
+   **Diagnostic Commands:**
+   ```bash
+   # Is nvidia-peermem loaded? (no output: it is not)
+   lsmod | grep nvidia_peermem
+
+   # Open kernel modules? DMA-BUF needs them (and Linux >= 5.12)
+   cat /proc/driver/nvidia/version    # "Open Kernel Module" in the first line
+   ```
+
+   **Solutions:**
+   - Set `WITH_NVIDIA_PEERMEM=0` before starting Mooncake to register GPU memory through DMA-BUF (`cuMemGetHandleForAddressRange` + `ibv_reg_dmabuf_mr`), which does not need `nvidia-peermem`. This also works on MIG GPU instances.
+   - Or install and load `nvidia-peermem` (it requires MLNX_OFED or DOCA-OFED) and keep the legacy path.
+
 ## RDMA Transfer Period
 ### Recommended Troubleshooting Directions
 
@@ -154,10 +192,11 @@ In addition, if the error `Failed to get description of XXX` is displayed, it in
    ```
 
    **Solutions:**
-   - Enable the TCP connection pool so that long-lived sockets are reused across transfers instead of being opened per transfer:
+   - Keep the TCP connection pool enabled so that long-lived sockets are reused across transfers instead of being opened per transfer. The pool is on by default in current builds; if it was explicitly disabled, re-enable it by removing the opt-out:
      ```bash
-     export MC_TCP_ENABLE_CONNECTION_POOL=1
+     unset MC_TCP_ENABLE_CONNECTION_POOL   # or stop setting it to 0
      ```
+     On older builds where the pool is still opt-in, enable it with `export MC_TCP_ENABLE_CONNECTION_POOL=1`.
    - Widen the ephemeral port range if the workload genuinely needs many distinct connections:
      ```bash
      sysctl -w net.ipv4.ip_local_port_range="1024 65535"
@@ -167,20 +206,19 @@ In addition, if the error `Failed to get description of XXX` is displayed, it in
      sysctl -w net.ipv4.tcp_tw_reuse=1
      ```
 
-2. The TCP connection pool (`MC_TCP_ENABLE_CONNECTION_POOL=1`) has two known limitations in the current implementation. The pool is functional for most workloads, but operators running long-lived services should be aware of them:
+2. The TCP connection pool is enabled by default (`MC_TCP_ENABLE_CONNECTION_POOL=0` opts out). The current lane-based implementation has none of the failure modes the old dynamic pool had here before; its actual operational caveats are:
 
-   * **Idle-expired connections are not always reclaimed.** `cleanupIdleConnections()` only inspects the tail of each endpoint's deque. When a newer `in_use` entry has been pushed behind an older idle-expired entry, the loop terminates at the tail and the idle entry is never removed. The pool's reported state diverges from reality: it still lists the connection as idle while the socket has been sitting past `kConnectionIdleTimeout`, may have been half-closed by the peer, and will fail on the next `getConnection()` that tries to reuse it. In long-running services this also leaks sockets and file descriptors until the process is restarted.
+   * **Lane sockets are kept open for the life of the process.** There is no idle reaping, so a long-lived initiator holds up to `MC_TCP_LANES_PER_PEER` (default 4) sockets per peer. That is bounded per peer, but the total grows with the number of distinct peers the process talks to.
 
      **Diagnostic Commands:**
      ```bash
-     # Watch for unbounded growth of open sockets from the process
+     # Watch open socket count from the process
      ls /proc/$PID/fd | wc -l
      ss -tan | awk '$1=="ESTAB"' | wc -l
      ```
 
-     **Workaround:** restart the process periodically if fd usage climbs without bound.
-
-   * **`asio::socket::close()` runs under `pool_mutex_`.** `close()` cancels outstanding async operations and posts completion handlers to the io_context. Handlers such as `returnConnection()` also acquire `pool_mutex_`, so the current code is one scheduling step away from a circular wait. No deadlock has been observed in practice, but if the transfer engine hangs with all worker threads stuck waiting on `pool_mutex_`, this is the first place to look.
+   * **Reused sockets are not probed before a transfer.** A connection that a middlebox silently dropped while idle surfaces as a stall on the next transfer (TCP retransmission timeout) rather than a fast reconnect. Same-datacenter peers are unaffected in practice; if your initiators reach peers across a NAT or firewall with aggressive idle expiry, keep the pool opted out or shorten the idle gap below the middlebox timeout.
+   * A connection whose protocol stream went dirty is closed instead of reused, and a failed lane is retried on a cooldown, so a restarted peer costs at most the transfer that was in flight.
 
 ## Memory Allocator
 
@@ -227,7 +265,7 @@ lsmod | grep -E 'ib_core|mlx4_core|mlx5_core|nvidia_peer_mem'
 If no RDMA devices appear: (1) Confirm physical NIC presence via lspci
 (2) Install vendor-specific drivers (e.g., Mellanox MLNX_OFED)
 
-2. check GDR driver is ready, and peer_memory module (part of MLNX_OFED) should be installed
+2. check GDR driver is ready. With the legacy `ibv_reg_mr` path (the default while `WITH_NVIDIA_PEERMEM` is unset), the peer_memory module (part of MLNX_OFED) should be installed. Without it, set `WITH_NVIDIA_PEERMEM=0` to use the DMA-BUF path instead, which needs the NVIDIA open kernel modules and Linux 5.12 or later (see item 8 under RDMA Resource Initialization)
 ```
 # Check peer_memory module (from MLNX_OFED)
 lsmod | grep peer_mem

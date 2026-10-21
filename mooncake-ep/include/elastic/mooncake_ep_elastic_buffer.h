@@ -75,6 +75,12 @@ class MooncakeElasticBuffer {
     void destroy();
     bool using_nccl() const { return nccl_state_ != nullptr; }
 
+    // Replace the NCCL communicator-owned resources while preserving this
+    // buffer's fixed logical rank and configuration. Every rank must join the
+    // matching NCCL setup sequence at a quiescent EP boundary with the same
+    // fresh unique ID; replacement ranks enter it through construction.
+    void reconfigure_nccl(const std::vector<int32_t>& nccl_unique_id);
+
     static int64_t calculate_buffer_size(int num_ranks,
                                          int64_t num_max_tokens_per_rank,
                                          int64_t hidden, int64_t num_topk,

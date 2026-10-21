@@ -12,13 +12,13 @@
 #include <thread>
 #include <vector>
 
+#include "ha/ha_types.h"
 #include "ha/oplog/oplog_applier.h"
 #include "ha/oplog/oplog_batch_types.h"
 #include "ha/oplog/oplog_types.h"
 #include "ha/snapshot/batch_oplog/batch_oplog_snapshot_provider.h"
 #include "ha/snapshot/batch_oplog/capture.h"
 #include "ha/snapshot/batch_oplog/promotion.h"
-#include "ha/snapshot/snapshot_provider.h"
 #include "ha/standby_metadata_store.h"
 #include "standby_state_machine.h"
 #include "types.h"
@@ -47,9 +47,7 @@ struct HotStandbyConfig {
     // snapshot baseline before switching to steady-state replication.
     bool enable_snapshot_bootstrap{false};
 
-    // OpLog following phase (optional): when disabled, Start() stops after the
-    // snapshot bootstrap phase and keeps the standby in a snapshot-only steady
-    // state.
+    // When disabled, the standby starts empty without metadata replication.
     bool enable_oplog_following{true};
 
     int oplog_poll_interval_ms{1000};
@@ -66,6 +64,7 @@ struct StandbySyncStatus {
     std::chrono::milliseconds lag_time{0};
     bool is_syncing{false};
     bool is_connected{false};
+    bool is_recovering{false};
     StandbyState state{StandbyState::STOPPED};
     std::chrono::milliseconds time_in_state{0};
     ErrorCode last_error{ErrorCode::OK};
@@ -131,6 +130,17 @@ class HotStandbyService {
      */
     ErrorCode Promote();
 
+    // Remember the applied durable prefix across Stop()/Start(). Used when
+    // promotion fails before the metadata store is detached.
+    void MarkAppliedCursorForRestart();
+
+    // Reinstall a detached promotion handoff. The following Start() resumes
+    // from this cursor instead of reloading an older snapshot.
+    ErrorCode PreservePromotionBaseline(
+        std::unique_ptr<StandbyMetadataStore> metadata_store,
+        DurablePrefix applied_cursor, ViewVersionId producer_view_version,
+        std::vector<StandbySegmentInfo> segments);
+
     /**
      * @brief Promote this standby to Primary and export a snapshot atomically.
      *
@@ -194,9 +204,6 @@ class HotStandbyService {
         SnapshotLifecycleCallback callback);
     void SetBatchOpLogSnapshotStopCallback(SnapshotLifecycleCallback callback);
 
-    // Inject a snapshot provider (from external snapshot implementation).
-    void SetSnapshotProvider(std::unique_ptr<SnapshotProvider> provider);
-
     // Inject the new batch-OpLog bootstrap path. It owns no running state;
     // Start() gives it temporary stores and installs them only on success.
     void SetBatchOpLogSnapshotProvider(
@@ -207,11 +214,16 @@ class HotStandbyService {
     void SetSyncStatusCallback(SyncStatusCallback callback);
 
     /**
-     * @brief Test seam: when set, promotion final catch-up first tries
-     *        batch-record durable prefix/batches from this backend.
+     * @brief Test seam: inject a HaKvBackend used for Start()/replication and
+     *        promotion catch-up. When set, Start() skips live etcd connection
+     *        (and works even when STORE_USE_ETCD is OFF).
      */
     void SetCatchUpBatchKvBackendForTesting(
         std::shared_ptr<HaKvBackend> backend);
+
+    // Selects the durable OpLog backend opened by Start(). Defaults to etcd so
+    // existing callers keep the previous connection path.
+    void SetOpLogBackendType(ha::HABackendType type);
 
     /**
      * @brief Get current state from state machine
@@ -226,14 +238,21 @@ class HotStandbyService {
     }
 
    private:
+    enum class PromotionCatchUpPolicy {
+        kLegacyTotalDeadline,
+        kBoundedNoProgress,
+    };
+
     ErrorCode PrepareBootstrapBaselineLocked(uint64_t& baseline_seq_id);
     ErrorCode LoadSnapshotBaselineLocked(uint64_t& baseline_seq_id);
     ErrorCode LoadBatchOpLogSnapshotBaselineLocked(uint64_t& baseline_seq_id);
     ErrorCode StartOplogFollowingLocked(uint64_t baseline_seq_id);
     void ActivateSnapshotOnlyStandbyLocked(uint64_t baseline_seq_id);
     uint64_t GetLocalLastAppliedSequenceIdLocked() const;
-    ErrorCode FinalCatchUpForPromotionLocked(uint64_t current_applied_seq_id);
-    ErrorCode FinalCatchUpBatchRecordsLocked(HaKvBackend& backend);
+    ErrorCode FinalCatchUpForPromotionLocked(uint64_t current_applied_seq_id,
+                                             PromotionCatchUpPolicy policy);
+    ErrorCode FinalCatchUpBatchRecordsLocked(HaKvBackend& backend,
+                                             PromotionCatchUpPolicy policy);
     void StopReplicationLoop();
     void HandleSnapshotCaptureRequest(
         const OpLogBatchStandbyPollResult& result);
@@ -241,7 +260,8 @@ class HotStandbyService {
     void NotifySnapshotPromotion();
     void NotifySnapshotStop();
 
-    ErrorCode PreparePromotionLocked(uint64_t current_applied_seq_id);
+    ErrorCode PreparePromotionLocked(uint64_t current_applied_seq_id,
+                                     PromotionCatchUpPolicy policy);
     ErrorCode CompletePromotionLocked();
 
     void NotifySyncStatus();
@@ -250,6 +270,7 @@ class HotStandbyService {
      * @brief Main replication loop (runs in background thread)
      */
     void ReplicationLoop();
+    ErrorCode RebootstrapBatchOpLog(uint64_t floor);
 
     /**
      * @brief Verification loop (runs in background thread)
@@ -259,9 +280,7 @@ class HotStandbyService {
     HotStandbyConfig config_;
 
     std::unique_ptr<StandbyMetadataStore> metadata_store_;
-    std::unique_ptr<SnapshotProvider> snapshot_provider_{
-        std::make_unique<NoopSnapshotProvider>()};
-    std::unique_ptr<BatchOpLogSnapshotProvider> batch_oplog_snapshot_provider_;
+    std::shared_ptr<BatchOpLogSnapshotProvider> batch_oplog_snapshot_provider_;
 
     // OpLog replication components
     std::unique_ptr<OpLogApplier> oplog_applier_;
@@ -269,17 +288,21 @@ class HotStandbyService {
     std::unique_ptr<OpLogBatchStandbyReader> batch_standby_reader_;
     std::optional<DurablePrefix> batch_snapshot_baseline_;
     ViewVersionId batch_snapshot_producer_view_version_{0};
+    std::vector<StandbySegmentInfo> preserved_segments_;
+    bool preserve_promotion_baseline_{false};
 
     std::shared_ptr<HaKvBackend> catch_up_batch_kv_backend_for_testing_;
 
     // Configuration for OpLog sync
     std::string oplog_endpoints_;
     std::string cluster_id_;
+    ha::HABackendType oplog_backend_type_{ha::HABackendType::ETCD};
 
     // Replication state
     std::atomic<uint64_t> applied_seq_id_{0};
     std::atomic<uint64_t> primary_seq_id_{0};
     std::atomic<ErrorCode> last_error_{ErrorCode::OK};
+    std::atomic<bool> recovering_{false};
 
     // State machine for managing service lifecycle
     StandbyStateMachine state_machine_;

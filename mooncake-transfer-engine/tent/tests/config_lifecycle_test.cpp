@@ -13,8 +13,10 @@
 // limitations under the License.
 
 #include <gtest/gtest.h>
+#include <glog/logging.h>
 
 #include <cstdlib>
+#include <mutex>
 #include <set>
 #include <string>
 
@@ -48,6 +50,58 @@ class EnvVarGuard {
     std::string old_value_;
     bool had_value_{false};
 };
+
+class ConfigLogSink : public google::LogSink {
+   public:
+    ConfigLogSink() { google::AddLogSink(this); }
+    ~ConfigLogSink() override { google::RemoveLogSink(this); }
+
+    void send(google::LogSeverity, const char*, const char*, int,
+              const std::tm*, const char* message, size_t length) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        messages_.append(message, length);
+    }
+
+    std::string messages() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return messages_;
+    }
+
+   private:
+    std::mutex mutex_;
+    std::string messages_;
+};
+
+TEST(ConfigLifecycleTest, ParseErrorDoesNotEchoPrivateInput) {
+    Config config;
+    config.set("merge_requests", false);
+    const auto status = config.load(R"({"token":"diagnostic-secret-42)");
+    ASSERT_TRUE(status.IsInvalidArgument());
+    const auto message = status.ToString();
+    EXPECT_EQ(message.find("diagnostic-secret-42"), std::string::npos);
+    EXPECT_NE(message.find("parse error 101"), std::string::npos);
+    EXPECT_NE(message.find("byte"), std::string::npos);
+    EXPECT_FALSE(config.get("merge_requests", true));
+}
+
+TEST(ConfigLifecycleTest, NumericParseFailureDoesNotEchoTheLiteral) {
+    Config config;
+    const auto status = config.load(R"({"private_value": 1e10000})");
+    ASSERT_TRUE(status.IsInvalidArgument());
+    EXPECT_EQ(status.ToString().find("1e10000"), std::string::npos);
+    EXPECT_NE(status.ToString().find("parse error 406"), std::string::npos);
+}
+
+TEST(ConfigLifecycleTest, LongInlineConfigIsNotPrintedByFileProbeFailure) {
+    const auto token = "diagnostic-secret-42" + std::string(512, 'x');
+    const auto input = json{{"token", token}}.dump();
+    EnvVarGuard conf_guard("MC_TENT_CONF", input.c_str());
+    ConfigLogSink sink;
+    Config config;
+    ASSERT_TRUE(ConfigHelper().loadFromEnv(config).ok());
+    EXPECT_EQ(config.get("token", ""), token);
+    EXPECT_EQ(sink.messages().find("diagnostic-secret-42"), std::string::npos);
+}
 
 TEST(ConfigLifecycleTest, RuntimeAllowlistPathsAreUnique) {
     std::set<std::string_view> paths;
@@ -284,6 +338,26 @@ TEST(ConfigLifecycleTest, AcceptsEmptyKnownObjects) {
 
     auto bundle = buildTentConfigBundle(config);
     EXPECT_TRUE(bundle.diagnostics.empty());
+}
+
+TEST(ConfigLifecycleTest, MnnvlEgmDefaultsOffAndFollowsEnv) {
+    {
+        Config config;
+        ASSERT_TRUE(ConfigHelper().loadFromEnv(config).ok());
+        EXPECT_FALSE(config.get("transports/mnnvl/egm", false));
+    }
+    {
+        EnvVarGuard egm_guard("MC_MNNVL_EGM", "1");
+        Config config;
+        ASSERT_TRUE(ConfigHelper().loadFromEnv(config).ok());
+        EXPECT_TRUE(config.get("transports/mnnvl/egm", false));
+    }
+    {
+        EnvVarGuard egm_guard("MC_MNNVL_EGM", "0");
+        Config config;
+        ASSERT_TRUE(ConfigHelper().loadFromEnv(config).ok());
+        EXPECT_FALSE(config.get("transports/mnnvl/egm", true));
+    }
 }
 
 TEST(ConfigLifecycleTest, PreservesLegacyEnvironmentPrecedence) {

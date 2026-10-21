@@ -73,6 +73,8 @@ std::string_view Status::CodeToString(Status::Code code) {
             return "MetadataError";
         case Code::kRpcServiceError:
             return "RpcServiceError";
+        case Code::kRpcConnectionError:
+            return "RpcConnectionError";
         case Code::kMalformedJson:
             return "MalformedJson";
         case Code::kInternalError:

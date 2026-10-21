@@ -1,13 +1,18 @@
+find_package(OpenSSL REQUIRED COMPONENTS Crypto)
+
 add_subdirectory(cachelib_memory_allocator)
 add_subdirectory(local_ssd)
 
 set(MOONCAKE_STORE_SHARED_SOURCES
+    allocator_metric.cpp
     types.cpp
     common/network.cpp
     thread_pool.cpp
     etcd_helper.cpp
     uds_transport.cpp
     config/distributed_storage_config.cpp
+    config/rpc_protocol_config.cpp
+    config/store_cluster_identity_config.cpp
     storage/distributed/distributed_storage_backend.cpp
     storage/distributed/posix_fs_adapter.cpp
     common/file_util.cpp)
@@ -15,47 +20,70 @@ set(MOONCAKE_STORE_SHARED_SOURCES
 set(MOONCAKE_STORE_MASTER_SOURCES
     allocation_strategy.cpp
     allocator.cpp
+    config/dfs_enablement_config.cpp
+    config/ha_cluster_namespace_config.cpp
+    config/master_metadata_config.cpp
     config/local_file_snapshot_config.cpp
+    config/metrics_bootstrap_config_loader.cpp
+    config/redis_connection_config.cpp
+    config/s3_client_config.cpp
+    segment_allocator_registration.cpp
+    client_offboarding.cpp
+    dynamic_replication_controller.cpp
     master_service.cpp
-    master_snapshot_manager.cpp
-    master_snapshot_repository.cpp
+    promotion_candidate_tracker.cpp
+    master_store_backend.cpp
+    weight_store_manager.cpp
     master_metric_manager.cpp
     segment/region_driver.cpp
     placement/index.cpp
     placement/replica_allocator.cpp
+    segment/catalog.cpp
+    segment/pool.cpp
+    segment/pool_mount.cpp
+    segment/snapshot.cpp
+    ha/snapshot/allocator_snapshot_codec.cpp
+    ha/snapshot/store_resource_snapshot_codec.cpp
+    segment/pool_write_access.cpp
+    segment/pool_read_access.cpp
     segment.cpp
-    tenant_quota.cpp
+    tenant/quota.cpp
+    tenant/quota_manager.cpp
     tenant_quota_ledger.cpp
-    tenant_quota_policy_store.cpp
+    tenant/quota_policy_store.cpp
+    weight_metadata_store.cpp
     rpc_service.cpp
     master_admin_service.cpp
     offset_allocator.cpp
     http_metadata_server.cpp
+    embedded_master.cpp
     serialize/serializer.cpp
-    storage/distributed/dfs_global_allocator.cpp
+    storage/distributed/shard_allocator.cpp
+    storage/distributed/immutable_bucket_allocator.cpp
     ha/leadership/leader_coordinator_factory.cpp
     ha/leadership/backends/etcd/etcd_leader_coordinator.cpp
     ha/common/redis/redis_connection.cpp
     ha/leadership/backends/redis/redis_leader_coordinator.cpp
     ha/leadership/master_service_supervisor.cpp
+    shutdown_request.cpp
     ha/kv/etcd_ha_kv_backend.cpp
+    ha/kv/redis_ha_kv_backend.cpp
+    ha/kv/ha_kv_backend_factory.cpp
     ha/standby_controller.cpp
     ha/standby_metadata_store.cpp
-    ha/snapshot/catalog_backed_snapshot_provider.cpp
     ha/snapshot/batch_oplog/codec.cpp
     ha/snapshot/batch_oplog/metadata.cpp
     ha/snapshot/batch_oplog/batch_oplog_snapshot_provider.cpp
     ha/snapshot/batch_oplog/writer.cpp
     ha/snapshot/batch_oplog/batch_oplog_snapshot_publisher.cpp
     ha/snapshot/batch_oplog/batch_oplog_snapshot_coordinator.cpp
+    ha/snapshot/batch_oplog/batch_oplog_snapshot_gc.cpp
+    ha/snapshot/batch_oplog/batch_oplog_pruning_coordinator.cpp
     ha/snapshot/snapshot_maintenance_lease.cpp
-    ha/snapshot/master_snapshot_codec.cpp
     ha/snapshot/local_ssd_codec.cpp
     ha/snapshot/object/snapshot_object_store.cpp
     ha/snapshot/object/backends/local/local_file_snapshot_object_store.cpp
     ha/snapshot/object/backends/s3/s3_snapshot_object_store.cpp
-    ha/snapshot/catalog/backends/embedded/embedded_snapshot_catalog_store.cpp
-    ha/snapshot/catalog/backends/redis/redis_snapshot_catalog_store.cpp
     task_manager.cpp
     ha/oplog/oplog_types.cpp
     ha/oplog/oplog_batch_codec.cpp
@@ -73,20 +101,29 @@ set(MOONCAKE_STORE_MASTER_SOURCES
 set(MOONCAKE_STORE_CLIENT_SOURCES
     common/client_buffer_allocation.cpp
     mmap_arena.cpp
+    config/hugepage_config.cpp
+    config/mmap_arena_config.cpp
     common/mmap_buffer.cpp
     client_service.cpp
     client_metric.cpp
     master_client.cpp
     storage_backend.cpp
-    nvme_kv_backend.cpp
-    nvme_kv_connector.cpp
-    nvme_kv_executor_io_uring.cpp
-    nvme_kv_executor_ioctl.cpp
-    nvme_kv_executor_util.cpp
-    nvme_kv_key_codec.cpp
-    nvme_kv_key_conflict_policy.cpp
-    nvme_kv_object_layout.cpp
+    nvme_kv/backend.cpp
+    nvme_kv/connector.cpp
+    nvme_kv/config/connector_config.cpp
+    nvme_kv/config/executor_config.cpp
+    nvme_kv/config/io_concurrency_config.cpp
+    nvme_kv/config/u32_parser.cpp
+    nvme_kv/executor_io_uring.cpp
+    nvme_kv/executor_ioctl.cpp
+    nvme_kv/executor_util.cpp
+    nvme_kv/key_codec.cpp
+    nvme_kv/key_conflict_policy.cpp
+    nvme_kv/object_layout.cpp
     transfer_task.cpp
+    config/nof_debug_config.cpp
+    config/fileread_worker_pool_config.cpp
+    config/nof_worker_pool_config.cpp
     posix_file.cpp
     client_buffer.cpp
     aligned_client_buffer.cpp
@@ -95,16 +132,26 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     registered_pinned_memory.cpp
     dummy_client.cpp
     shm_helper.cpp
+    config/shm_spdk_registration_config.cpp
     file_storage.cpp
+    config/client_host_identity_config.cpp
     config/client_metric_config.cpp
+    config/client_object_checksum_config.cpp
     config/file_storage_config.cpp
+    config/bucket_backend_config.cpp
     config/file_per_key_config.cpp
     config/client_auto_port_config.cpp
+    config/client_auto_discovery_config.cpp
+    config/cxl_segment_config.cpp
+    config/client_numa_config.cpp
     config/local_hot_cache_config.cpp
+    config/nof_register_config.cpp
     config/offset_allocator_backend_config.cpp
     config/replica_selection_config.cpp
     config/rpc_timeout_config.cpp
+    config/spdk_controller_config.cpp
     config/transfer_submitter_config.cpp
+    config/egm_store_pool_config.cpp
     device/accelerator_device.cpp
     device/accelerator_registry.cpp
     device/runtime_accelerator.cpp
@@ -113,6 +160,7 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     device/hip_accelerator_device.cpp
     device/ascend_accelerator_device.cpp
     device/sunrise_accelerator_device.cpp
+    device/xpu_accelerator_device.cpp
     local_hot_cache.cpp
     store_c.cpp
     memory_alloc.cpp
@@ -120,7 +168,7 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     engram/engram_store.cpp)
 
 if(BUILD_UNIT_TESTS)
-  list(APPEND MOONCAKE_STORE_CLIENT_SOURCES nvme_kv_executor_stub.cpp)
+  list(APPEND MOONCAKE_STORE_CLIENT_SOURCES nvme_kv/executor_stub.cpp)
 endif()
 set(EXTRA_LIBS "")
 set(SPDK_STATIC_LIBS "")
@@ -161,6 +209,49 @@ int main(int argc, char**) {
       message(FATAL_ERROR "16-byte atomic operations are not supported")
     endif()
   endif()
+endif()
+
+# Alibaba Cloud OSS adapter (REST API with OSS V4 signing).
+find_package(CURL QUIET)
+find_package(OpenSSL QUIET)
+if(CURL_FOUND AND OpenSSL_FOUND)
+  message(STATUS "Alibaba Cloud OSS adapter: Enabled")
+  set(MOONCAKE_OSS_ADAPTER_ENABLED
+      TRUE
+      CACHE INTERNAL "Whether the Alibaba Cloud OSS adapter is built")
+  list(APPEND MOONCAKE_STORE_CLIENT_SOURCES config/oss_adapter_config.cpp
+       storage/distributed/oss_adapter.cpp)
+  list(APPEND EXTRA_LIBS CURL::libcurl OpenSSL::Crypto)
+  add_definitions(-DHAVE_OSS_ADAPTER)
+else()
+  message(
+    STATUS "Alibaba Cloud OSS adapter: Disabled (requires CURL and OpenSSL)")
+  set(MOONCAKE_OSS_ADAPTER_ENABLED
+      FALSE
+      CACHE INTERNAL "Whether the Alibaba Cloud OSS adapter is built")
+endif()
+
+# S3-compatible adapter (REST API with AWS Signature V4). Independent of the OSS
+# adapter; it needs the same CURL and OpenSSL packages found above.
+if(CURL_FOUND AND OpenSSL_FOUND)
+  message(STATUS "S3-compatible adapter: Enabled")
+  set(MOONCAKE_S3_ADAPTER_ENABLED
+      TRUE
+      CACHE INTERNAL "Whether the S3-compatible adapter is built")
+  list(
+    APPEND
+    MOONCAKE_STORE_CLIENT_SOURCES
+    storage/distributed/rest_object_storage_adapter.cpp
+    storage/distributed/object_storage_xml.cpp
+    config/s3_adapter_config.cpp
+    storage/distributed/s3_adapter.cpp)
+  list(APPEND EXTRA_LIBS CURL::libcurl OpenSSL::Crypto)
+  add_definitions(-DHAVE_S3_ADAPTER)
+else()
+  message(STATUS "S3-compatible adapter: Disabled (requires CURL and OpenSSL)")
+  set(MOONCAKE_S3_ADAPTER_ENABLED
+      FALSE
+      CACHE INTERNAL "Whether the S3-compatible adapter is built")
 endif()
 
 # Find AWS SDK
@@ -259,6 +350,10 @@ if(USE_NOF)
   add_subdirectory(spdk)
   list(APPEND MOONCAKE_STORE_CLIENT_SOURCES ${SPDK_WRAPPER_SOURCES})
 
+  # The master's NoF heartbeat probe also goes through SpdkWrapper.
+  list(APPEND MOONCAKE_STORE_MASTER_SOURCES ${SPDK_WRAPPER_SOURCES}
+       config/spdk_controller_config.cpp)
+
   set(SPDK_INCLUDE_DIR
       "/usr/local/include"
       CACHE PATH "SPDK include directory")
@@ -271,6 +366,16 @@ if(USE_NOF)
   set(DPDK_LIB_DIR
       "/usr/local/lib"
       CACHE PATH "DPDK static library directory")
+
+  set(SPDK_ISA_L_LIB_DIR
+      "${CMAKE_SOURCE_DIR}/extern/spdk/isa-l/.libs"
+      CACHE PATH "isa-l static library directory")
+  if(NOT EXISTS "${SPDK_ISA_L_LIB_DIR}/libisal.a")
+    message(
+      FATAL_ERROR
+        "isa-l not found at ${SPDK_ISA_L_LIB_DIR}/libisal.a. Run "
+        "`sudo bash dependencies.sh --with-spdk`, or set -DSPDK_ISA_L_LIB_DIR.")
+  endif()
 
   set(SPDK_STATIC_LIBS
       -Wl,--whole-archive
@@ -324,6 +429,7 @@ if(USE_NOF)
       crypto
       aio
       z
+      -L${SPDK_ISA_L_LIB_DIR}
       isal
       elf
       ibverbs
@@ -338,13 +444,27 @@ set(MOONCAKE_STORE_INCLUDE_DIRS
     ${MOONCAKE_STORE_INCLUDE_ROOT} ${CMAKE_CURRENT_BINARY_DIR}/../include
     ${ETCD_WRAPPER_INCLUDE})
 
-set(MASTER_EXTRA_INCS)
-set(MASTER_EXTRA_LIBS)
+# jemalloc replaces the process allocator, so it is linked into the executables
+# rather than into libmooncake_store, which is also consumed by the Python
+# extension and must not force an allocator on its host process.
+#
+# The results are copied into ALLOCATOR_* rather than used through the
+# JEMALLOC_* names directly: pkg_check_modules writes those into the CMake
+# cache, so a build directory reconfigured back to STORE_USE_JEMALLOC=OFF would
+# keep linking the allocator while the compile definition is gone, leaving the
+# binary running on jemalloc but reporting mooncake_jemalloc_enabled 0. These
+# four are plain variables, so clearing them here takes effect every configure.
+set(ALLOCATOR_DEFS)
+set(ALLOCATOR_INCS)
+set(ALLOCATOR_LIB_DIRS)
+set(ALLOCATOR_LIBS)
 if(STORE_USE_JEMALLOC)
   find_package(PkgConfig REQUIRED)
   pkg_check_modules(JEMALLOC REQUIRED jemalloc)
-  list(APPEND MASTER_EXTRA_INCS ${JEMALLOC_INCLUDE_DIRS})
-  list(APPEND MASTER_EXTRA_LIBS ${JEMALLOC_STATIC_LIBRARIES})
+  set(ALLOCATOR_DEFS STORE_USE_JEMALLOC)
+  set(ALLOCATOR_INCS ${JEMALLOC_INCLUDE_DIRS})
+  set(ALLOCATOR_LIB_DIRS ${JEMALLOC_LIBRARY_DIRS})
+  set(ALLOCATOR_LIBS ${JEMALLOC_STATIC_LIBRARIES})
 endif()
 
 include(CheckPIESupported)
@@ -371,11 +491,10 @@ target_include_directories(mooncake_store_shared_objects
 target_link_libraries(
   mooncake_store_shared_objects
   PRIVATE cachelib_memory_allocator
-          transfer_metadata_plugin
           glog::glog
           gflags::gflags
           mooncake_common
-          numa
+          $<$<PLATFORM_ID:Linux>:numa>
           asio_shared
           yalantinglibs::yalantinglibs)
 if(STORE_USE_ETCD)
@@ -397,7 +516,6 @@ target_link_libraries(
   mooncake_store_master_objects
   PRIVATE mooncake_store_shared_objects
           mooncake_local_ssd
-          transfer_metadata_plugin
           cachelib_memory_allocator
           glog::glog
           gflags::gflags
@@ -406,6 +524,7 @@ target_link_libraries(
           mooncake_common
           Mooncake::zstd
           Mooncake::xxhash
+          OpenSSL::Crypto
           asio_shared
           yalantinglibs::yalantinglibs)
 if(KV_EVENTS_ZMQ_FOUND)
@@ -432,8 +551,9 @@ add_library(mooncake_store_client_objects OBJECT
             ${MOONCAKE_STORE_CLIENT_SOURCES})
 set_target_properties(mooncake_store_client_objects
                       PROPERTIES POSITION_INDEPENDENT_CODE ON)
-target_include_directories(mooncake_store_client_objects
-                           PRIVATE ${MOONCAKE_STORE_INCLUDE_DIRS})
+target_include_directories(
+  mooncake_store_client_objects PRIVATE ${MOONCAKE_STORE_INCLUDE_DIRS}
+                                        ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(
   mooncake_store_client_objects
   PRIVATE mooncake_store_shared_objects
@@ -445,7 +565,7 @@ target_link_libraries(
           yaml-cpp
           Mooncake::xxhash
           mooncake_common
-          numa
+          $<$<PLATFORM_ID:Linux>:numa>
           asio_shared
           yalantinglibs::yalantinglibs)
 if(BUILD_UNIT_TESTS)
@@ -476,12 +596,21 @@ if(USE_CUDA)
 elseif(USE_HIP)
   message(STATUS "mooncake_store: HIP enabled, enabling D2H staging")
   target_compile_definitions(mooncake_store_client_objects PRIVATE USE_HIP)
+elseif(USE_XPU)
+  # USE_XPU is a global compile definition (common.cmake) and -fsycl propagates
+  # from TENT's platform_xpu through transfer_engine, so the SYCL-based
+  # accelerator device needs no extra include dirs or link libraries here.
+  message(STATUS "mooncake_store: XPU enabled, enabling D2H staging")
 endif()
 if(USE_ASCEND
    OR USE_ASCEND_DIRECT
    OR USE_UBSHMEM)
   target_include_directories(mooncake_store_client_objects
                              PRIVATE $ENV{ASCEND_PATH}/include)
+endif()
+if(USE_TENT)
+  target_compile_definitions(mooncake_store_client_objects PRIVATE USE_TENT)
+  target_link_libraries(mooncake_store_client_objects PRIVATE tent)
 endif()
 
 # Reduced Store library linked by mooncake_master.
@@ -490,9 +619,14 @@ add_library(
                                $<TARGET_OBJECTS:mooncake_store_master_objects>)
 target_include_directories(mooncake_store_master
                            PUBLIC ${MOONCAKE_STORE_INCLUDE_DIRS})
+if(USE_NOF)
+  target_include_directories(mooncake_store_master_objects
+                             PRIVATE ${SPDK_INCLUDE_DIR} ${DPDK_INCLUDE_DIR})
+endif()
 target_link_libraries(
   mooncake_store_master
-  PRIVATE mooncake_local_ssd
+  PRIVATE ${SPDK_STATIC_LIBS}
+          mooncake_local_ssd
           cachelib_memory_allocator
           ${ETCD_WRAPPER_LIB}
           glog::glog
@@ -501,12 +635,12 @@ target_link_libraries(
           Mooncake::zstd
           asio_shared
           yalantinglibs::yalantinglibs
-          transfer_metadata_plugin
           gflags::gflags
           JsonCpp::JsonCpp
           yaml-cpp
           Mooncake::xxhash
-          numa)
+          OpenSSL::Crypto
+          $<$<PLATFORM_ID:Linux>:numa>)
 if(KV_EVENTS_ZMQ_FOUND)
   target_link_libraries(mooncake_store_master PRIVATE Mooncake::libzmq)
 endif()
@@ -537,7 +671,8 @@ target_link_libraries(
          asio_shared
          transfer_engine
          yalantinglibs::yalantinglibs
-  PRIVATE gflags::gflags JsonCpp::JsonCpp yaml-cpp Mooncake::xxhash numa)
+  PRIVATE gflags::gflags JsonCpp::JsonCpp yaml-cpp Mooncake::xxhash
+          OpenSSL::Crypto $<$<PLATFORM_ID:Linux>:numa>)
 if(KV_EVENTS_ZMQ_FOUND)
   target_link_libraries(mooncake_store PRIVATE Mooncake::libzmq)
 endif()
@@ -563,27 +698,31 @@ if(USE_SUNRISE)
     mooncake_store PRIVATE ${MC_TANGRT_ROOT}/lib/libtangrt_shared.so
                            ${MC_TANGRT_ROOT}/lib/libptml_shared.so dl)
 endif()
+
 if(BUILD_SHARED_LIBS)
+  set_target_properties(mooncake_store PROPERTIES INSTALL_RPATH "$ORIGIN")
   install(TARGETS mooncake_store DESTINATION lib)
 endif()
 
 # Store Master executable.
 add_executable(mooncake_master master.cpp)
 set_target_properties(mooncake_master PROPERTIES POSITION_INDEPENDENT_CODE ON)
-target_include_directories(mooncake_master PRIVATE ${MASTER_EXTRA_INCS})
+target_include_directories(mooncake_master PRIVATE ${ALLOCATOR_INCS})
+target_compile_definitions(mooncake_master PRIVATE ${ALLOCATOR_DEFS})
+target_link_directories(mooncake_master PRIVATE ${ALLOCATOR_LIB_DIRS})
 target_link_libraries(
   mooncake_master
   PRIVATE mooncake_store_master
           cachelib_memory_allocator
           pthread
-          ibverbs
+          $<$<BOOL:${YLT_ENABLE_IBV}>:ibverbs>
           mooncake_common
           glog::glog
           gflags::gflags
           JsonCpp::JsonCpp
           yalantinglibs::yalantinglibs
           ${ETCD_WRAPPER_LIB}
-          ${MASTER_EXTRA_LIBS}
+          ${ALLOCATOR_LIBS}
           asio_shared)
 if(USE_SUNRISE)
   target_link_directories(mooncake_master PRIVATE ${MC_TANGRT_ROOT}/lib)
@@ -601,9 +740,13 @@ install(TARGETS mooncake_master DESTINATION bin)
 # Store Client executable.
 add_executable(mooncake_client real_client_main.cpp)
 set_target_properties(mooncake_client PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(mooncake_client PRIVATE ${ALLOCATOR_INCS})
+target_compile_definitions(mooncake_client PRIVATE ${ALLOCATOR_DEFS})
+target_link_directories(mooncake_client PRIVATE ${ALLOCATOR_LIB_DIRS})
 target_link_libraries(
-  mooncake_client PRIVATE mooncake_store transfer_engine asio_shared
-                          gflags::gflags yalantinglibs::yalantinglibs)
+  mooncake_client
+  PRIVATE mooncake_store transfer_engine asio_shared gflags::gflags
+          yalantinglibs::yalantinglibs ${ALLOCATOR_LIBS})
 if(USE_CUDA)
   target_compile_definitions(mooncake_client PRIVATE USE_CUDA)
   target_include_directories(mooncake_client

@@ -20,6 +20,19 @@ For Transfer Engine metadata, use the `P2PHANDSHAKE` connection string for
 decentralized peer discovery, enable the master's embedded HTTP metadata
 server, or provide an external metadata service.
 
+## Backend Selection
+
+The Python facade in mooncake.store uses the C++ Store when
+MOONCAKE_STORE_BACKEND is unset or set to cpp. A root wheel built with Store-RS
+enabled also supports rs. The setting is read when mooncake.store is first
+imported and accepts cpp or rs.
+
+This page describes the shared facade and the default C++ backend. See the
+[Store-RS Python API](store-rs.md) for backend-specific runtime behavior, API
+coverage, and compatibility notes. The
+{ref}`Build with Store-RS <build-with-store-rs>` section shows how to
+build the root wheel with Store-RS enabled.
+
 ## Quick Start
 
 ### Start Master (with HTTP enabled)
@@ -276,6 +289,33 @@ Zero-copy operations require registered memory buffers. For repeated reads and w
 
 #### register_buffer()
 Register a memory buffer for direct RDMA access.
+
+For a contiguous PyTorch CPU tensor, including one created with
+`pin_memory=True`, pass its address and **byte size**:
+
+```python
+import torch
+
+# Assumes store.setup(...) or store.setup_dummy(...) has already succeeded.
+tensor = torch.empty(1024, dtype=torch.float32, pin_memory=True)
+tensor.fill_(1)
+ptr = tensor.data_ptr()
+size = tensor.numel() * tensor.element_size()
+assert store.register_buffer(ptr, size) == 0
+try:
+    assert store.put_from("pinned_tensor", ptr, size) == 0
+    tensor.zero_()
+    assert store.get_into("pinned_tensor", ptr, size) == size
+    assert torch.all(tensor == 1)
+finally:
+    assert store.unregister_buffer(ptr) == 0
+```
+
+Keep the tensor alive and its storage unchanged until all operations finish and
+the buffer is unregistered. `put_from` stores raw bytes; it does not serialize
+the tensor's shape or dtype. With `setup_dummy()`, external CPU buffers use
+shared-memory staging and read copy-back across the RealClient process boundary.
+Pinned allocation alone does not make this path zero-copy.
 
 #### unregister_buffer()
 Unregister a previously registered buffer.
@@ -627,9 +667,10 @@ config.nof_replica_num = 1
 **Default:** `0`
 **Status:** **Work in progress; development and evaluation only.**
 **Description:** Requests an additional replica in the configured shared
-distributed filesystem. The supported values are currently `0` and `1`. When
-set to `1`, `replica_num` must be at least `1`, so DFS-only placement is not
-supported. DFS replicas currently support only the `default` tenant.
+distributed filesystem. The supported values are currently `0` and `1`.
+DFS-only placement (`replica_num = 0` with `dfs_replica_num = 1`) is supported;
+the DFS replica is then the object's only copy, so DFS eviction or removal
+deletes the object. DFS replicas currently support only the `default` tenant.
 
 ```python
 config = ReplicateConfig()
@@ -704,6 +745,40 @@ config = ReplicateConfig()
 config.prefer_alloc_in_same_node = True
 ```
 
+#### session_ids
+**Type:** `Optional[List[str]]`
+**Default:** `None`
+
+Optional per-key write attribution. Supply one entry for each input key (one
+entry for a single-key write). Each ID must be valid UTF-8 and at most 256 bytes.
+An empty string means no new attribution. The field does not change object identity,
+replication, group membership, leases, or eviction policy.
+
+```python
+config = ReplicateConfig()
+config.session_ids = ["session-a", "session-a", "session-b"]
+store.batch_put_from(keys, buffer_ptrs, buffer_sizes, config)
+```
+
+The tag becomes committed when the first replica of the write becomes readable.
+A skipped duplicate Put leaves the original tag unchanged. Upsert with a
+non-empty ID replaces attribution at commit; an omitted or empty ID preserves
+the previous tag, including when storage is reallocated. Failed/preempted
+writes do not commit their pending tags. Committed tags survive metadata
+OpLog/snapshot recovery and standby promotion; old metadata defaults to no tag.
+
+With KV events enabled, each `stored` / `BlockStored` map carries a single
+`session_id` string, or MessagePack `nil` when untagged. Replica availability
+changes reuse the committed object tag. `removed` and `cleared` keep their
+existing schemas: they retract availability, not a particular session's
+association. This matches SGLang's single-session stored-event attribution;
+it does not enumerate every session that has reused a shared object.
+
+Old RPC readers can ignore the compatible extension, but do not persist or
+publish session tags. Upgrade the Store client and Master to enable attribution.
+A storage node's disk scan alone cannot reconstruct metadata tags after all
+Master metadata is lost; preserve the metadata recovery artifacts as well.
+
 #### group_ids
 **Type:** `List[str] | None`
 **Default:** `None`
@@ -733,6 +808,56 @@ store.put("key-a", b"value-a", config)
 
 ---
 
+(choosing-a-parallel-tensor-io-api)=
+## Choosing a Parallel Tensor IO API
+
+Use the API that matches the object being stored. The single-axis TP methods
+and the manifest-backed weight snapshot API have different storage contracts.
+
+| Requirement | Public API | Contract |
+| --- | --- | --- |
+| Store and retrieve a complete tensor | `put_tensor()` / `get_tensor()` | One ordinary Store tensor object. |
+| Split a full tensor and read a TP shard | `put_tensor_with_tp()` / `get_tensor_with_tp()` | Legacy single-axis TP tensor objects; batch and registered-buffer variants are also available. |
+| Save weights and restore into a different TP/DP/EP/PP placement | `begin_weight_snapshot()` and `WeightStore.load_manifest()` / `plan_load()` / `load()` | Immutable manifest-managed fragments, with framework-supplied placement and runtime bindings. |
+| Use `put/get_tensor_with_cp`, `*_with_dp`, `*_with_ep`, or `*_with_pp` | No such public convenience methods | DP/EP/PP weight placement is expressed through the manifest API; CP is not a supported axis. |
+| Supply an arbitrary parallel strategy through `*_with_config` | No such public tensor API | `ReplicateConfig` controls Store replication and placement policy, not tensor parallel topology. |
+
+For example, with an already initialized `MooncakeDistributedStore`, the
+legacy TP write accepts the **full** tensor and writes all shards. `tp_rank`
+on this write does not select a single shard to persist:
+
+```python
+import torch
+
+tensor = torch.linspace(0, 23, 24, dtype=torch.float32).reshape(4, 6)
+assert store.put_tensor_with_tp("tp-example", tensor, tp_size=2, split_dim=1) == 0
+shard = store.get_tensor_with_tp("tp-example", tp_rank=1, tp_size=2, split_dim=1)
+assert torch.equal(shard, tensor[:, 3:])
+```
+
+### Parallel configuration boundaries
+
+The model-weight API uses typed `ParallelTopology`, `WeightPlacementManifest`,
+and `WeightRuntimeBindingManifest` values supplied by the framework adapter.
+It does not provide a factory that generates a separate put/get method family
+for each axis, or accept an arbitrary strategy dictionary.
+
+- TP and EP can describe logical splits. EP splits the leading logical expert
+  dimension; TP names an explicit logical dimension.
+- DP describes replicas or ownership. PP describes framework-provided tensor
+  or layer ownership. Neither implies a tensor split dimension.
+- CP (context parallelism) is absent from the current topology and axis types.
+  A sequence-dimension slice through the TP API does not establish CP topology
+  support or CP-aware KV-cache resharding.
+- Combining supported axes still requires complete logical coverage and
+  compatible source/target tensor descriptors. The planner is copy-only; it
+  does not convert dtype, quantization, packing, or model semantics.
+
+See the [manifest contracts](../../design/mooncake-reshard/reshard-manifest.md),
+[weight reshard planner](../../design/mooncake-reshard/model-weight-reshard-planner.md), and
+[Store upload planning](../../design/mooncake-reshard/model-weight-store-upload-planning.md)
+for the configuration and execution boundaries.
+
 ## Model Weight Snapshot API
 
 Heterogeneous model-weight snapshots use the manifest-backed Reshard API.
@@ -760,7 +885,8 @@ placement and runtime binding manifests.
 
 ### Breaking Change and Migration
 
-This release removes the public `*_with_parallelism` API family and the
+PR [#3772](https://github.com/kvcache-ai/Mooncake/pull/3772) removed the public
+`*_with_parallelism` API family and the
 associated `ParallelAxis`, `TensorParallelism`, and `ReadTarget` helper types.
 Applications that create heterogeneous model-weight snapshots migrate their
 write path to `begin_weight_snapshot()`, `write_tensor()`, and `commit()`.
@@ -1003,6 +1129,63 @@ store.setup("localhost", "http://localhost:8080/metadata", 512*1024*1024, 128*10
 ```
 
 </details>
+
+The class also accepts a configuration dictionary. For the EGM Provider and
+Consumer examples below, select NVLink explicitly before calling `setup()`:
+
+```bash
+export MC_MS_AUTO_DISC=0
+# MC_FORCE_MNNVL is not needed with manual protocol selection.
+```
+
+```python
+# EGM Provider
+store.setup({
+    "local_hostname": "10.192.8.81:12345",
+    "metadata_server": "http://10.192.8.81:8079/metadata",
+    "master_server_addr": "10.192.8.81:50051",
+    "protocol": "nvlink",
+    "global_segment_size": str(64 * 1024**3),
+    "local_buffer_size": "0",
+    "enable_egm_store_pool": "true",
+    "egm_numa_nodes": "auto",  # or, for example, "0,1"
+})
+```
+
+`enable_egm_store_pool` defaults to `false`; `egm_numa_nodes` defaults to
+`auto`. These controls apply only to this dictionary overload. The EGM pool
+requires a `USE_MNNVL=ON` build, a non-TENT Transfer Engine, and the exact
+`nvlink`/nonzero-global/zero-local combination shown above. With `auto`, nodes
+come from the visible GPUs' CUDA `CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID` values.
+
+EGM capacity is rounded down to a multiple of the common alignment: the
+maximum of the Store slab alignment and the selected nodes' CUDA allocation
+granularities. It is then divided across nodes and split into balanced,
+aligned chunks no larger than `max_mr_size`. This capacity planning applies
+only to the EGM pool.
+
+An ordinary Consumer does not enable the EGM pool; it uses `protocol="nvlink"`
+to access the Provider's mounted segments:
+
+```python
+# Consumer accessing the Provider's EGM pool
+consumer.setup({
+    "local_hostname": "10.192.8.58:12400",
+    "metadata_server": "http://10.192.8.81:8079/metadata",
+    "master_server_addr": "10.192.8.81:50051",
+    "protocol": "nvlink",
+    "global_segment_size": "0",
+    "local_buffer_size": "0",
+    "rdma_devices": "",
+    "enable_egm_store_pool": "false",
+})
+```
+
+Manual NVLink selection is supported for both Providers and Consumers.
+If you instead set `MC_MS_AUTO_DISC=1`, EGM setup verifies that the selected
+non-TENT engine actually has the `nvlink` transport installed and fails before
+allocating EGM memory otherwise. Set `MC_FORCE_MNNVL=1` when using discovery on
+hosts with RDMA HCAs to select MNNVL instead of RDMA.
 
 ---
 #### setup_dummy()
@@ -1431,6 +1614,122 @@ for key, exists in zip(keys, results):
     status = "exists" if exists == 1 else "not found" if exists == 0 else "error"
     print(f"{key}: {status}")
 ```
+
+---
+
+#### probe_key()
+Point-in-time existence check that grants no read lease.
+
+Unlike `is_exist()`, a successful probe does not extend the object's lease,
+so probed objects remain eligible for eviction. A `1` result only means the
+object existed at the time of the call; it may be evicted before a
+subsequent `get`, and callers must treat a following miss as normal. This is
+suited for speculative scans (e.g., probing candidate keys to estimate
+prefix reuse) where the caller reads back only a subset of the probed keys.
+
+```python
+def probe_key(self, key: str) -> int
+```
+
+**Parameters:**
+- `key` (str): Object identifier to check
+
+**Returns:**
+- `int`:
+  - `1`: Object existed at the time of the call
+  - `0`: Object didn't exist
+  - `-1`: Error occurred
+
+**Example:**
+```python
+exists = store.probe_key("my_key")
+if exists == 1:
+    print("Object existed at probe time (no lease granted)")
+elif exists == 0:
+    print("Object not found")
+else:
+    print("Error checking existence")
+```
+
+---
+
+#### batch_probe_key()
+Probe multiple objects, optionally selecting and leasing the last complete
+candidate. The default `"none"` policy remains a lease-free existence check.
+
+```python
+def batch_probe_key(
+    self, keys: List[str], policy: str = "none", candidate_size: int = 1
+) -> List[int]
+```
+
+**Parameters:**
+- `keys` (List[str]): List of object identifiers to check
+- `policy` (str): `"none"` or `"LastHitOnly"`.
+- `candidate_size` (int): Number of consecutive keys forming each candidate.
+  Ignored for `"none"`. For a nonempty `"LastHitOnly"` request, it must be
+  positive and divide the number of keys exactly. Empty input returns `[]`.
+
+**Returns:**
+- Both policies return per-key existence results in the same length and order
+  as `keys`: 1=readable when checked, 0=missing or unreadable. Negative values
+  indicate errors, not cache misses.
+- With `"LastHitOnly"`, the last group of `candidate_size` all-1 results is
+  the selected, leased candidate. Earlier complete groups and incomplete
+  groups retain their existence results. If no group is all-1, no complete
+  candidate was selected.
+
+Candidates are ordered by the caller. A candidate is complete when every key
+has a readable replica. Earlier candidates may be missing or incomplete.
+The caller must include all required components,
+cache groups, and rank shards; Store does not infer prefix or model semantics.
+Duplicate key positions are allowed and must not alter the grouping.
+
+The Master first probes without leases, then rechecks and leases complete
+candidates in reverse order using the existing per-shard lookup. Recheck
+results replace that candidate's initial results; a candidate that loses a
+member cannot remain all-1. A failed candidate may retain partial leases
+while selection falls back to an earlier candidate. This is not an atomic
+snapshot of all keys, and unselected existence results are not lease guarantees.
+
+Selected objects receive the Master's default read-lease TTL, protecting them
+from normal eviction while the leases remain valid; soft-pin deadlines are
+unchanged. The policy does not protect against lease expiry, forced removal,
+or replica loss. Existing shared group leases (or a physical key repeated
+outside the selected candidate) may also protect unselected positions. No
+persistent group registration is added. Invalid candidate sizes return
+per-key parameter errors; unknown policy strings raise `ValueError` in Python.
+
+**Example:**
+```python
+keys = ["key1", "key2", "key3"]
+results = store.batch_probe_key(keys)
+candidates = [key for key, exists in zip(keys, results) if exists == 1]
+print("Probed candidates (unprotected from eviction):", candidates)
+```
+
+For checkpoint selection, first use `batch_is_exist()` to protect the required
+KV data and determine its usable boundary. Pass only valid checkpoint
+candidates within that boundary, in increasing resume-position order:
+
+```python
+keys = ["checkpoint128.rank0", "checkpoint128.rank1",
+        "checkpoint256.rank0", "checkpoint256.rank1"]
+results = store.batch_probe_key(keys, policy="LastHitOnly", candidate_size=2)
+if any(result < 0 for result in results):
+    raise RuntimeError("Checkpoint lookup failed")
+selected = next((i for i in reversed(range(len(keys) // 2))
+                 if all(result == 1 for result in results[i * 2:(i + 1) * 2])), None)
+# Both complete: [1, 1, 1, 1] selects 1.
+# Last incomplete: [1, 1, 1, 0] selects 0.
+# Load only the selected checkpoint, with the KV prefix it needs.
+```
+
+**Upgrade note:** the policy changes the `BatchProbeKey` Master RPC and the
+DummyClient-to-RealClient batch-probe RPC signatures. Upgrade the Master,
+client daemon, and clients together; mixed-version batch-probe calls are not
+supported. Default Python arguments preserve the old call syntax, not wire
+compatibility. `is_exist()`, `batch_is_exist()`, and `probe_key()` are unchanged.
 
 ---
 
@@ -1954,18 +2253,37 @@ store.close()
 ---
 
 #### close()
-Clean up all resources and terminate connections.
+Terminate the store and clean up its resources. Before calling `close()`, wait
+for setup and all application and offload calls to finish; do not issue new
+calls concurrently. Close stops local services. For an EGM Provider, close
+also stops `FileStorage` workers before unmounting EGM segments and
+releasing their backing memory.
+
+Close is terminal: both real-client and dummy-client handles are cleared from
+the Python object even when cleanup fails. Further `close()` calls are
+idempotent, not cleanup retries. Repeated `setup()` calls are not a recovery
+mechanism.
+
+If EGM setup fails, Mooncake attempts cleanup even for failed or uncertain
+mounts. When unmount cannot be confirmed, it logs the error and retains the
+affected EGM allocation until process exit. CUDA cleanup failures likewise
+retain any remaining resources. Recreating the store does not reclaim retained
+resources; restart the process to reclaim them.
+A failed mount may leave a remote segment record: close does not guarantee
+synchronous remote cleanup, and there is no background cleanup reaper.
 
 ```python
 def close(self) -> int
 ```
 
 **Returns:**
-- `int`: Status code (0 = success, non-zero = error code)
+- `int`: Status code (0 = success, non-zero = terminal cleanup failure).
 
 **Example:**
 ```python
-store.close()
+if store.close() != 0:
+    # Inspect the cleanup logs; retained EGM memory requires process restart.
+    raise RuntimeError("Store cleanup failed")
 ```
 
 ---
@@ -2817,9 +3135,26 @@ Typical flow:
 - Get: `batch_get_session_start` → `batch_get_into_multi_buffer_ranges` (per layer) → `batch_get_session_end`
 - Put: `batch_put_session_start` → `batch_put_from_multi_buffer_ranges` (per layer) → `batch_put_session_end` / `batch_put_session_revoke`
 
-Get sessions cache a filtered `QueryResult` (single complete memory replica + lease).
-Range calls only check the cached lease locally (zero Master RPCs). Put sessions
-reserve object space via Master `BatchPutStart` and finalize with `BatchPutEnd`.
+Get sessions cache a filtered `QueryResult` (one complete supported replica,
+plus lease). Range calls only check the cached lease locally (zero Master RPCs),
+and each request re-checks it once its transfer completes: if the cached lease
+lapsed while the read was in flight, the call returns `LEASE_EXPIRED`, the
+result is discarded, and the session is dropped. LOCAL_DISK reads additionally
+report `OBJECT_HAS_LEASE` when the restored offload buffer outlives its GC TTL.
+The MEMORY path remains zero-copy via `BatchTransferReadRanges`. DFS replicas
+are read into request-scoped host staging and then scattered to host or device
+destinations; for device destinations, staging first uses the fixed-capacity
+pinned restore arena configured by `MC_STORE_PINNED_RESTORE_ARENA_SIZE_BYTES`
+and falls back to the regular client buffer allocator if it is unavailable or
+exhausted. LOCAL_DISK replicas are restored on the owner via the offload RPC
+and then scatter object-byte ranges into already `register_buffer`'d
+destinations (the reader does not need a setup local buffer). DISK replicas
+`BatchGet` into a temporary host buffer and scatter by `src_offset`. If a key
+has no complete MEMORY, DFS, LOCAL_DISK, or DISK replica — for example because
+it has only NOF replicas — `batch_get_session_start` returns
+`INVALID_REPLICA` for that key and does not open a session. Put sessions
+reserve object space via Master `BatchPutStart` and finalize with
+`BatchPutEnd`.
 
 Put sessions write MEMORY replicas only. `nof_replica_num > 0` is accepted only for
 flexible dual-replica configs (`replica_num == 1` and `nof_replica_num == 1`), where
@@ -2828,8 +3163,9 @@ Reliable multi-replica NoF configs are rejected at session start. `end` / `revok
 seal the session (no further range writes) and wait for in-flight range transfers
 before talking to Master.
 
-⚠️ **Store-managed Buffer Required**: All buffers must resolve to Store-managed
-registered memory before ranged zero-copy operations.
+⚠️ **Store-managed Buffer Required**: All destination buffers must resolve to
+Store-managed registered memory. DFS session reads use temporary staging; the
+staging allocation is released after the synchronous read and scatter finish.
 
 #### batch_get_session_start()
 

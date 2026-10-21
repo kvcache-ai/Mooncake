@@ -115,7 +115,11 @@ jobs:
                   if [ -n "$ARTIFACT_NAME" ]; then
                     artifact_id=$(jq -r --arg name "$ARTIFACT_NAME" '.artifacts[] | select(.name == $name) | .id' artifact.json | head -n 1)
                   else
-                    artifact_id=$(jq -r '.artifacts[] | select(.name | contains("py312") ) | select(.name | contains("mooncake") ) | select(.name | contains("cu130") ) | .id' artifact.json | head -n 1)
+                    # Exclude arm64: "mooncake-wheel-cu130-arm64-py312" also
+                    # matches all three substrings below, and head -n 1 would
+                    # silently pick whichever artifact uploaded first — an
+                    # aarch64 wheel then fails pip on the x86_64 T-One hosts.
+                    artifact_id=$(jq -r '.artifacts[] | select(.name | contains("py312") ) | select(.name | contains("mooncake") ) | select(.name | contains("cu130") ) | select(.name | contains("arm64") | not) | .id' artifact.json | head -n 1)
                   fi
                   if [ -z "$artifact_id" ]; then
                     echo "Available artifacts in workflow run $run_id:"

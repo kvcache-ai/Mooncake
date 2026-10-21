@@ -72,6 +72,35 @@ int64_t elastic_atomic_scratch_num_bytes() {
 }
 
 #ifdef USE_NCCL_DEVICE
+class ScopedCudaDevice {
+   public:
+    explicit ScopedCudaDevice(int device) {
+        CUDA_CHECK(cudaGetDevice(&previous_device_));
+        if (previous_device_ != device) {
+            CUDA_CHECK(cudaSetDevice(device));
+            restore_ = true;
+        }
+    }
+
+    ScopedCudaDevice(const ScopedCudaDevice&) = delete;
+    ScopedCudaDevice& operator=(const ScopedCudaDevice&) = delete;
+
+    ~ScopedCudaDevice() {
+        if (!restore_) return;
+        const auto status = cudaSetDevice(previous_device_);
+        if (status != cudaSuccess) {
+            LOG(ERROR)
+                << "failed to restore CUDA device after NCCL ElasticBuffer "
+                   "reconfiguration: "
+                << cudaGetErrorString(status);
+        }
+    }
+
+   private:
+    int previous_device_ = -1;
+    bool restore_ = false;
+};
+
 class NcclCommStream {
    public:
     NcclCommStream() {
@@ -133,15 +162,17 @@ struct NcclElasticState {
     void* allocation = nullptr;
     size_t allocation_bytes = 0;
     int device_id = -1;
+    int gin_context_count = 0;
     int clock_rate_khz = 0;
     NcclCommStream comm_stream;
 
     NcclElasticState(int rank, int num_ranks, size_t bytes,
-                     int gin_context_count, bool use_rail_gin,
+                     int requested_gin_context_count, bool use_rail_gin,
                      int gin_traffic_class,
                      const std::vector<int32_t>& nccl_unique_id)
         : transport(device::createNcclDeviceTransport()),
-          allocation_bytes(bytes) {
+          allocation_bytes(bytes),
+          gin_context_count(requested_gin_context_count) {
         if (!transport) {
             throw std::runtime_error(
                 "failed to create the NCCL device transport");
@@ -158,7 +189,8 @@ struct NcclElasticState {
         config.gin_connection_type = use_rail_gin
                                          ? device::NcclGinConnectionType::kRail
                                          : device::NcclGinConnectionType::kFull;
-        config.gin_context_count = config.enable_gin ? gin_context_count : 0;
+        config.gin_context_count =
+            config.enable_gin ? requested_gin_context_count : 0;
         config.gin_exclusive_contexts = config.enable_gin;
         config.gin_queue_depth = config.enable_gin ? 1024 : 0;
         config.gin_signal_count = config.enable_gin ? num_ranks + 4 : 0;
@@ -216,6 +248,32 @@ struct NcclElasticState {
         }
         return status;
     }
+
+    int abort() noexcept {
+        if (!transport) return 0;
+
+        int status = 0;
+        int previous_device = -1;
+        if (cudaGetDevice(&previous_device) != cudaSuccess ||
+            cudaSetDevice(device_id) != cudaSuccess) {
+            status = -1;
+        }
+        if (cudaStreamSynchronize(comm_stream.stream()) != cudaSuccess) {
+            status = -1;
+        }
+        if (transport->abort() != 0) status = -1;
+        if (comm_stream.reset() != cudaSuccess) status = -1;
+
+        allocation = nullptr;
+        registration = {};
+        device_context = {};
+        transport.reset();
+        if (previous_device >= 0 && previous_device != device_id &&
+            cudaSetDevice(previous_device) != cudaSuccess) {
+            status = -1;
+        }
+        return status;
+    }
 #endif
 
     ~NcclElasticState() {
@@ -224,6 +282,70 @@ struct NcclElasticState {
 #endif
     }
 };
+
+#ifdef USE_NCCL_DEVICE
+namespace {
+ElasticTopology make_nccl_topology(NcclElasticState& state, int rank,
+                                   int num_ranks, bool allow_hybrid_mode) {
+    const auto& properties = state.properties;
+    const auto& lsa = state.lsa_topology;
+    const bool local_lsa_topology_valid =
+        properties.rank == rank && properties.num_ranks == num_ranks &&
+        lsa.rank >= 0 && lsa.size > 0 && lsa.first_rank >= 0 &&
+        lsa.first_rank + lsa.rank == rank &&
+        lsa.first_rank + lsa.size <= num_ranks && num_ranks % lsa.size == 0 &&
+        lsa.first_rank == (rank / lsa.size) * lsa.size;
+    if (!state.transport->allRanksSucceeded(local_lsa_topology_valid)) {
+        throw std::runtime_error(
+            "NCCL LSA membership on one or more ranks is not a "
+            "contiguous, equal-sized EP local team; reorder "
+            "process-group ranks by node/device");
+    }
+
+    ElasticTopology topology;
+    topology.rank_idx = rank;
+    topology.num_ranks = num_ranks;
+    topology.num_rdma_ranks = num_ranks / lsa.size;
+    topology.num_nvlink_ranks = lsa.size;
+    const bool local_mode_supported =
+        topology.num_rdma_ranks <= 1 || allow_hybrid_mode;
+    if (!state.transport->allRanksSucceeded(local_mode_supported)) {
+        throw std::runtime_error(
+            "multi-node NCCL ElasticBuffer requires "
+            "allow_hybrid_mode=true; full-world GIN kernels are not part "
+            "of the initial backend");
+    }
+    const bool local_topology_supported =
+        topology.num_rdma_ranks == 1
+            ? (lsa.size == 2 || lsa.size == 8)
+            : ((topology.num_rdma_ranks == 2 &&
+                (lsa.size == 4 || lsa.size == 8)) ||
+               (topology.num_rdma_ranks == 4 && lsa.size == 4));
+    if (!state.transport->allRanksSucceeded(local_topology_supported)) {
+        throw std::runtime_error(
+            "NCCL ElasticBuffer currently supports one LSA team of 2 or 8 "
+            "GPUs, two LSA teams of 4 or 8 GPUs, or four LSA teams of 4 "
+            "GPUs");
+    }
+    if (allow_hybrid_mode && topology.num_rdma_ranks > 1) {
+        topology.num_scaleout_ranks = topology.num_rdma_ranks;
+        topology.num_scaleup_ranks = topology.num_nvlink_ranks;
+        topology.scaleout_rank_idx = lsa.first_rank / lsa.size;
+        topology.scaleup_rank_idx = lsa.rank;
+        topology.hybrid_enabled = true;
+        topology.scaleup_lsa = true;
+    } else {
+        topology.num_scaleout_ranks = 1;
+        topology.num_scaleup_ranks = num_ranks;
+        topology.scaleout_rank_idx = 0;
+        topology.scaleup_rank_idx = rank;
+        topology.hybrid_enabled = false;
+        topology.scaleup_lsa = topology.num_rdma_ranks == 1;
+    }
+    return topology;
+}
+}  // namespace
+#endif
 
 ElasticLaunchContext MooncakeElasticBuffer::make_launch_context(
     int64_t timeout_cycles) const {
@@ -373,63 +495,8 @@ MooncakeElasticBuffer::MooncakeElasticBuffer(
         nccl_state_ = std::make_unique<NcclElasticState>(
             rank, num_ranks, static_cast<size_t>(num_buffer_bytes),
             context_count, allow_hybrid_mode, sl_idx, nccl_unique_id);
-        const auto& properties = nccl_state_->properties;
-        const auto& lsa = nccl_state_->lsa_topology;
-        const bool local_lsa_topology_valid =
-            properties.rank == rank && properties.num_ranks == num_ranks &&
-            lsa.rank >= 0 && lsa.size > 0 && lsa.first_rank >= 0 &&
-            lsa.first_rank + lsa.rank == rank &&
-            lsa.first_rank + lsa.size <= num_ranks &&
-            num_ranks % lsa.size == 0 &&
-            lsa.first_rank == (rank / lsa.size) * lsa.size;
-        if (!nccl_state_->transport->allRanksSucceeded(
-                local_lsa_topology_valid)) {
-            throw std::runtime_error(
-                "NCCL LSA membership on one or more ranks is not a "
-                "contiguous, equal-sized EP local team; reorder "
-                "process-group ranks by node/device");
-        }
-
-        topology_.rank_idx = rank;
-        topology_.num_ranks = num_ranks;
-        topology_.num_rdma_ranks = num_ranks / lsa.size;
-        topology_.num_nvlink_ranks = lsa.size;
-        const bool local_mode_supported =
-            topology_.num_rdma_ranks <= 1 || allow_hybrid_mode;
-        if (!nccl_state_->transport->allRanksSucceeded(local_mode_supported)) {
-            throw std::runtime_error(
-                "multi-node NCCL ElasticBuffer requires "
-                "allow_hybrid_mode=true; full-world GIN kernels are not part "
-                "of the initial backend");
-        }
-        const bool local_topology_supported =
-            topology_.num_rdma_ranks == 1
-                ? (lsa.size == 2 || lsa.size == 8)
-                : ((topology_.num_rdma_ranks == 2 &&
-                    (lsa.size == 4 || lsa.size == 8)) ||
-                   (topology_.num_rdma_ranks == 4 && lsa.size == 4));
-        if (!nccl_state_->transport->allRanksSucceeded(
-                local_topology_supported)) {
-            throw std::runtime_error(
-                "NCCL ElasticBuffer currently supports one LSA team of 2 or 8 "
-                "GPUs, two LSA teams of 4 or 8 GPUs, or four LSA teams of 4 "
-                "GPUs");
-        }
-        if (allow_hybrid_mode && topology_.num_rdma_ranks > 1) {
-            topology_.num_scaleout_ranks = topology_.num_rdma_ranks;
-            topology_.num_scaleup_ranks = topology_.num_nvlink_ranks;
-            topology_.scaleout_rank_idx = lsa.first_rank / lsa.size;
-            topology_.scaleup_rank_idx = lsa.rank;
-            topology_.hybrid_enabled = true;
-            topology_.scaleup_lsa = true;
-        } else {
-            topology_.num_scaleout_ranks = 1;
-            topology_.num_scaleup_ranks = num_ranks;
-            topology_.scaleout_rank_idx = 0;
-            topology_.scaleup_rank_idx = rank;
-            topology_.hybrid_enabled = false;
-            topology_.scaleup_lsa = topology_.num_rdma_ranks == 1;
-        }
+        topology_ = make_nccl_topology(*nccl_state_, rank, num_ranks,
+                                       allow_hybrid_mode);
 #else
         (void)nccl_unique_id;
         throw std::runtime_error(
@@ -533,6 +600,65 @@ void MooncakeElasticBuffer::destroy() {
         mapped_host_workspace_ = nullptr;
     }
     if (cleanup_error) std::rethrow_exception(cleanup_error);
+}
+
+void MooncakeElasticBuffer::reconfigure_nccl(
+    const std::vector<int32_t>& nccl_unique_id) {
+    if (destroyed_ || !nccl_state_) {
+        throw std::runtime_error(
+            "NCCL ElasticBuffer reconfiguration requires a live NCCL buffer");
+    }
+#ifdef USE_NCCL_DEVICE
+    const ScopedCudaDevice device_guard(device_id_);
+    // update_ep_member() is a quiescent-boundary operation. Synchronizing the
+    // communication stream makes the lifetime boundary explicit even for
+    // direct native callers that do not use the Python wrapper.
+    CUDA_CHECK(cudaStreamSynchronize(nccl_state_->comm_stream.stream()));
+
+    const int rank = topology_.rank_idx;
+    const int num_ranks = topology_.num_ranks;
+    const int context_count = nccl_state_->gin_context_count;
+
+    // Build the complete replacement before publishing it. This intentionally
+    // uses a second allocation: GIN VA-signal storage cannot be cleared with
+    // ordinary CUDA stores while its old NCCL window remains registered.
+    auto candidate = std::make_unique<NcclElasticState>(
+        rank, num_ranks, nccl_state_->allocation_bytes, context_count,
+        config_.allow_hybrid_mode, config_.sl_idx, nccl_unique_id);
+    const auto candidate_topology = make_nccl_topology(
+        *candidate, rank, num_ranks, config_.allow_hybrid_mode);
+
+    // Initial construction performs this same status collective after
+    // creating its host workspace. Reconfiguration participates as well so a
+    // replacement rank constructing a new buffer and surviving ranks updating
+    // an old one execute an identical NCCL setup sequence.
+    const bool local_workspace_valid =
+        host_workspace_ != nullptr && mapped_host_workspace_ != nullptr;
+    if (!candidate->transport->allRanksSucceeded(local_workspace_valid)) {
+        throw std::runtime_error(
+            "NCCL ElasticBuffer host workspace is unavailable on one or more "
+            "recovered ranks");
+    }
+
+    auto previous = std::move(nccl_state_);
+    nccl_state_ = std::move(candidate);
+    topology_ = candidate_topology;
+    std::memset(host_workspace_, 0, host_workspace_bytes_);
+    deterministic_rank_count_buffer_.reset();
+    deterministic_rank_count_buffer_bytes_ = 0;
+
+    // A replacement process never owned the previous communicator, so normal
+    // collective destruction cannot be required here. Retire it locally after
+    // the new generation is already usable.
+    if (previous->abort() != 0) {
+        LOG(WARNING) << "failed to completely release an obsolete NCCL "
+                        "ElasticBuffer generation";
+    }
+#else
+    (void)nccl_unique_id;
+    throw std::runtime_error(
+        "Mooncake EP was built without NCCL Device API support");
+#endif
 }
 
 MooncakeEpBuffer& MooncakeElasticBuffer::native_buffer() {

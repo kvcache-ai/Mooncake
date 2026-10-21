@@ -1,8 +1,5 @@
 #include "common/network.h"
-#include "environ.h"
 
-#include "common.h"
-#include "ascii_string.h"
 #include "random.h"
 
 #include <cerrno>
@@ -75,6 +72,23 @@ tl::expected<std::string, int> httpGet(const std::string &url) {
         return std::string(res.resp_body);
     }
     return tl::unexpected(res.status);
+}
+
+tl::expected<void, std::string> httpDelete(const std::string &url,
+                                           std::chrono::milliseconds timeout) {
+    coro_http::coro_http_client client;
+    client.set_conn_timeout(timeout);
+    client.set_req_timeout(timeout);
+    auto res = async_simple::coro::syncAwait(
+        client.async_delete(url, "", coro_http::req_content_type::none));
+    if (res.net_err) {
+        return tl::unexpected("network error: " + res.net_err.message());
+    }
+    if (res.status != 200) {
+        return tl::unexpected("http=" + std::to_string(res.status) +
+                              " body: " + std::string(res.resp_body));
+    }
+    return {};
 }
 
 tl::expected<std::string, std::string> GetInterfaceIPv4Address(
@@ -185,32 +199,6 @@ std::vector<int> getFreeTcpPorts(int count) {
         ::close(sock);
     }
     return ports;
-}
-
-static bool IsUsableMooncakeHostId(std::string_view host_id) {
-    return !host_id.empty() &&
-           !AsciiCaseInsensitiveEquals(host_id, "localhost") &&
-           host_id != "127.0.0.1" && host_id != "0.0.0.0" && host_id != "::1" &&
-           host_id != "[::1]" && host_id != "::" && host_id != "[::]";
-}
-
-static std::string NormalizeMooncakeHostId(std::string_view value) {
-    const std::string hostname(TrimAsciiWhitespace(value));
-    const std::string host_id = (hostname == "::1" || hostname == "::")
-                                    ? hostname
-                                    : std::string(TrimAsciiWhitespace(
-                                          getHostNameWithoutPort(hostname)));
-    return IsUsableMooncakeHostId(host_id) ? host_id : "";
-}
-
-std::string ResolveMooncakeHostId(const std::string &local_hostname) {
-    const std::string configured_host_id(
-        TrimAsciiWhitespace(Environ::GetString("MOONCAKE_HOST_ID", "")));
-    if (!configured_host_id.empty()) {
-        return NormalizeMooncakeHostId(configured_host_id);
-    }
-
-    return NormalizeMooncakeHostId(local_hostname);
 }
 
 }  // namespace mooncake

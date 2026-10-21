@@ -34,6 +34,7 @@
 #include <glog/logging.h>
 
 #include "rdma_test_peers.h"
+#include "transport/rdma_transport/endpoint_store.h"
 #include "transport/rdma_transport/rdma_context.h"
 #include "transport/rdma_transport/rdma_transport.h"
 #include "transport/rdma_transport/worker_pool.h"
@@ -113,6 +114,15 @@ class WorkerPoolTestPeer {
     static int errorThreshold() { return WorkerPool::kRailErrorThreshold; }
 
     static uint64_t errorWindowNs() { return WorkerPool::kRailErrorWindowNs; }
+
+    static int pausedRailCount(WorkerPool &pool) {
+        return pool.paused_rail_count_.load(std::memory_order_acquire);
+    }
+
+    static void expirePause(WorkerPool &pool, const std::string &path) {
+        std::lock_guard<std::mutex> lock(pool.rail_state_lock_);
+        pool.rail_states_[path].pause_until_ns = 1;
+    }
 
     static void setContextActive(WorkerPool &pool, bool active) {
         pool.context_.set_active(active);
@@ -222,6 +232,58 @@ class WorkerPoolRailStateTest : public ::testing::Test {
 
 TEST_F(WorkerPoolRailStateTest, UnknownRailIsAvailable) {
     EXPECT_TRUE(railAvailable(kPeerA));
+    EXPECT_EQ(WorkerPoolTestPeer::pausedRailCount(*worker_pool_), 0);
+}
+
+TEST_F(WorkerPoolRailStateTest, FailuresBelowThresholdDoNotPauseCount) {
+    for (int i = 0; i < WorkerPoolTestPeer::errorThreshold() - 1; ++i)
+        failRail(kPeerA);
+    EXPECT_EQ(WorkerPoolTestPeer::pausedRailCount(*worker_pool_), 0);
+    EXPECT_TRUE(railAvailable(kPeerA));
+}
+
+TEST_F(WorkerPoolRailStateTest, PauseIncrementsCountOnce) {
+    for (int i = 0; i < WorkerPoolTestPeer::errorThreshold(); ++i)
+        failRail(kPeerA);
+    EXPECT_EQ(WorkerPoolTestPeer::pausedRailCount(*worker_pool_), 1);
+    EXPECT_FALSE(railAvailable(kPeerA));
+
+    failRail(kPeerA, /*immediate_pause=*/true);
+    EXPECT_EQ(WorkerPoolTestPeer::pausedRailCount(*worker_pool_), 1);
+}
+
+TEST_F(WorkerPoolRailStateTest, IndependentPausesIncrementCount) {
+    failRail(kPeerA, /*immediate_pause=*/true);
+    failRail(kPeerB, /*immediate_pause=*/true);
+    EXPECT_EQ(WorkerPoolTestPeer::pausedRailCount(*worker_pool_), 2);
+    EXPECT_FALSE(railAvailable(kPeerA));
+    EXPECT_FALSE(railAvailable(kPeerB));
+}
+
+TEST_F(WorkerPoolRailStateTest, ExpiredPauseDecrementsCount) {
+    failRail(kPeerA, /*immediate_pause=*/true);
+    ASSERT_EQ(WorkerPoolTestPeer::pausedRailCount(*worker_pool_), 1);
+    WorkerPoolTestPeer::expirePause(*worker_pool_, kPeerA);
+    EXPECT_TRUE(railAvailable(kPeerA));
+    EXPECT_EQ(WorkerPoolTestPeer::pausedRailCount(*worker_pool_), 0);
+    EXPECT_TRUE(railAvailable(kPeerB));
+}
+
+TEST_F(WorkerPoolRailStateTest, ExpiredPauseClearsCountOnOtherRailCheck) {
+    failRail(kPeerA, /*immediate_pause=*/true);
+    failRail(kPeerB, /*immediate_pause=*/true);
+    ASSERT_EQ(WorkerPoolTestPeer::pausedRailCount(*worker_pool_), 2);
+    WorkerPoolTestPeer::expirePause(*worker_pool_, kPeerA);
+    EXPECT_FALSE(railAvailable(kPeerB));
+    EXPECT_EQ(WorkerPoolTestPeer::pausedRailCount(*worker_pool_), 1);
+    EXPECT_TRUE(railAvailable(kPeerA));
+    EXPECT_EQ(WorkerPoolTestPeer::pausedRailCount(*worker_pool_), 1);
+
+    WorkerPoolTestPeer::expirePause(*worker_pool_, kPeerB);
+    constexpr const char *kPeerC = "10.0.0.1@mlx5_bond_2";
+    EXPECT_TRUE(railAvailable(kPeerC));
+    EXPECT_EQ(WorkerPoolTestPeer::pausedRailCount(*worker_pool_), 0);
+    EXPECT_TRUE(railAvailable(kPeerB));
 }
 
 // A single local fault must stay free: the endpoint is rebuilt and the slice
@@ -460,6 +522,32 @@ TEST_F(WorkerPoolRailStateTest, GidProbeOwnsRecoveryThroughoutIoAndRetry) {
     EXPECT_TRUE(WorkerPoolTestPeer::contextActive(*worker_pool_));
     EXPECT_EQ(WorkerPoolTestPeer::recoveryActivateAfter(*worker_pool_), 0u);
     EXPECT_EQ(WorkerPoolTestPeer::contextFailureCount(*worker_pool_), 0);
+}
+
+TEST_F(WorkerPoolRailStateTest, UnchangedDefaultDoesNotDisconnectAllPeers) {
+    class RecordingStore : public FIFOEndpointStore {
+       public:
+        RecordingStore() : FIFOEndpointStore(8) {}
+        int disconnectQPs() override {
+            ++disconnects;
+            return 0;
+        }
+        int disconnects = 0;
+    };
+    auto store = std::make_shared<RecordingStore>();
+    RdmaContextTestPeer::bindEndpointStore(*context_, store);
+    RdmaContextTestPeer::seedAutoGidState(*context_, nullptr, 1, 0, {}, 0);
+    gid_probe = [] { return GidRefreshResult::UNCHANGED; };
+    WorkerPoolTestPeer::contextEvent(*worker_pool_, IBV_EVENT_GID_CHANGE);
+    EXPECT_EQ(store->disconnects, 0);
+    WorkerPoolTestPeer::setContextActive(*worker_pool_, false);
+    WorkerPoolTestPeer::setRecoveryActivateAfter(*worker_pool_, 1);
+    WorkerPoolTestPeer::recoverContext(*worker_pool_);
+    EXPECT_EQ(store->disconnects, 0);
+    // A real default-GID change still rebuilds every endpoint.
+    gid_probe = [] { return GidRefreshResult::CHANGED; };
+    WorkerPoolTestPeer::contextEvent(*worker_pool_, IBV_EVENT_GID_CHANGE);
+    EXPECT_EQ(store->disconnects, 1);
 }
 
 TEST_F(WorkerPoolRailStateTest, FatalEventCancelsPendingGidProbe) {

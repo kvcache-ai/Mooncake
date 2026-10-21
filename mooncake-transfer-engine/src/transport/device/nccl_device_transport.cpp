@@ -118,7 +118,7 @@ bool decodeUniqueId(const std::vector<int32_t>& encoded, ncclUniqueId* id) {
 
 class NcclDeviceTransportImpl final : public NcclTransport {
    public:
-    ~NcclDeviceTransportImpl() override { shutdown(); }
+    ~NcclDeviceTransportImpl() override { abort(); }
 
     std::vector<int32_t> createUniqueId() override {
         ncclUniqueId id{};
@@ -257,15 +257,15 @@ class NcclDeviceTransportImpl final : public NcclTransport {
         const bool local_dev_comm_valid =
             reportNcclError(ncclDevCommCreate(comm_, &requirements, &dev_comm_),
                             "ncclDevCommCreate") == 0;
+        // Record rank-local ownership before group agreement so the abort path
+        // destroys a successful local create even if another rank failed.
+        dev_comm_created_ = local_dev_comm_valid;
         if (!collectiveAllSucceeded(local_dev_comm_valid)) {
             LOG(ERROR) << "[Device NCCL] device communicator creation failed "
                           "on one or more ranks";
             abortPartialInitialization();
             return -1;
         }
-        // Ownership begins only after every rank agrees that the grouped create
-        // completed. A mismatched partial create is discarded by comm abort.
-        dev_comm_created_ = true;
 
         const bool local_gin_resources_valid =
             !config.enable_gin ||
@@ -587,6 +587,75 @@ class NcclDeviceTransportImpl final : public NcclTransport {
         return status;
     }
 
+    int abort() override {
+        int status = 0;
+
+        // Window and device-communicator resources are local to this rank, but
+        // still require the host communicator handle. Release them before
+        // aborting that handle. Errors are best effort here: an obsolete
+        // generation must never keep recovery waiting on failed peers.
+        if (comm_) {
+            for (const auto& entry : registrations_) {
+                if (reportNcclError(
+                        ncclCommWindowDeregister(comm_, entry.second.window),
+                        "ncclCommWindowDeregister(abort)") != 0) {
+                    status = -1;
+                }
+            }
+        }
+        registrations_.clear();
+
+        if (dev_comm_created_) {
+            if (reportNcclError(ncclDevCommDestroy(comm_, &dev_comm_),
+                                "ncclDevCommDestroy(abort)") != 0) {
+                status = -1;
+            }
+            dev_comm_created_ = false;
+            dev_comm_ = {};
+        }
+        if (comm_) {
+            if (reportNcclError(ncclCommAbort(comm_), "ncclCommAbort") != 0) {
+                status = -1;
+            }
+            comm_ = nullptr;
+        }
+
+        for (void* ptr : allocations_) {
+            if (reportNcclError(ncclMemFree(ptr), "ncclMemFree(abort)") != 0) {
+                status = -1;
+            }
+        }
+        allocations_.clear();
+
+        if (collective_status_) {
+            if (reportCudaError(cudaFree(collective_status_),
+                                "cudaFree(collective status, abort)") != 0) {
+                status = -1;
+            }
+            collective_status_ = nullptr;
+        }
+        if (control_stream_) {
+            if (reportCudaError(cudaStreamDestroy(control_stream_),
+                                "cudaStreamDestroy(control, abort)") != 0) {
+                status = -1;
+            }
+            control_stream_ = nullptr;
+        }
+        if (device_comm_) {
+            if (reportCudaError(cudaFree(device_comm_),
+                                "cudaFree(device communicator, abort)") != 0) {
+                status = -1;
+            }
+            device_comm_ = nullptr;
+        }
+
+        initialized_ = false;
+        next_registration_id_ = 1;
+        properties_ = {};
+        lsa_topology_ = {};
+        return status;
+    }
+
    private:
     struct WindowRecord {
         ncclWindow_t window;
@@ -615,29 +684,7 @@ class NcclDeviceTransportImpl final : public NcclTransport {
         return value != 0;
     }
 
-    void abortPartialInitialization() {
-        if (collective_status_) {
-            cudaFree(collective_status_);
-            collective_status_ = nullptr;
-        }
-        if (control_stream_) {
-            cudaStreamDestroy(control_stream_);
-            control_stream_ = nullptr;
-        }
-        if (device_comm_) {
-            cudaFree(device_comm_);
-            device_comm_ = nullptr;
-        }
-        if (dev_comm_created_) {
-            ncclDevCommDestroy(comm_, &dev_comm_);
-            dev_comm_created_ = false;
-            dev_comm_ = {};
-        }
-        if (comm_) {
-            ncclCommAbort(comm_);
-            comm_ = nullptr;
-        }
-    }
+    void abortPartialInitialization() { (void)abort(); }
 
     ncclComm_t comm_ = nullptr;
     ncclDevComm_t dev_comm_{};

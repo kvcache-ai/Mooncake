@@ -28,8 +28,10 @@
 #endif
 
 #include "transfer_metadata_plugin.h"
+#include "common.h"
 #include "transport/transport.h"
 #include "transport/rdma_twosided/rdma_twosided_transport.h"
+#include "transport/shm_transport/shm_transport.h"
 #ifdef USE_BAREX
 #include "transport/barex_transport/barex_transport.h"
 #endif
@@ -41,6 +43,34 @@ bool overlapWithRegion(uintptr_t addr, uint64_t length, void* region_addr,
                        uint64_t region_length) {
     return overlap(reinterpret_cast<void*>(addr), length, region_addr,
                    region_length);
+}
+
+Transport* tryInstallShmTransport(MultiTransport* multi_transports,
+                                  std::shared_ptr<Topology> topology) {
+    if (!multi_transports) return nullptr;
+    if (Transport* existing = multi_transports->getTransport("shm")) {
+        return existing;
+    }
+    return multi_transports->installTransport("shm", topology);
+}
+
+int maybeInstallShmTransport(MultiTransport* multi_transports,
+                             std::shared_ptr<Topology> topology) {
+#ifdef ENABLE_MULTI_PROTOCOL
+    if (!multi_transports || !envFlagEnabled("MC_FORCE_SHM")) return 0;
+    Transport* shm = tryInstallShmTransport(multi_transports, topology);
+    if (!shm) {
+        LOG(WARNING) << "MC_FORCE_SHM is set but failed to install SHM "
+                        "transport; continuing without it";
+        return 0;
+    }
+    LOG(INFO) << "SHM transport installed for same-host DRAM copies";
+    return 0;
+#else
+    (void)multi_transports;
+    (void)topology;
+    return 0;
+#endif
 }
 }  // namespace
 
@@ -98,7 +128,7 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
     }
 #endif
 
-#ifdef USE_ASCEND
+#if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)
     // The only difference in initializing the Ascend Transport is that the
     // `local_server_name` must include the physical NPU card ID. The format
     // changes from `ip:port` to `ip:port:npu_x`, e.g., `"0.0.0.0:12345:npu_2"`.
@@ -224,14 +254,42 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
 #endif
     }
 
-#if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)
-    Transport* ascend_transport =
-        multi_transports_->installTransport("ascend", local_topology_);
-    if (!ascend_transport) {
-        LOG(ERROR) << "Failed to install Ascend transport";
-        return -1;
+    // MC_FORCE_SHM:
+    // - Without ENABLE_MULTI_PROTOCOL: SHM-only (skip RDMA/TCP), like
+    //   MC_FORCE_TCP.
+    // - With ENABLE_MULTI_PROTOCOL: fall through so auto-discover still
+    //   installs RDMA/TCP, then maybeInstallShmTransport appends SHM.
+#ifndef ENABLE_MULTI_PROTOCOL
+    if (envFlagEnabled("MC_FORCE_SHM")) {
+        Transport* shm_transport =
+            tryInstallShmTransport(multi_transports_.get(), local_topology_);
+        if (!shm_transport) {
+            LOG(ERROR)
+                << "MC_FORCE_SHM is set but failed to install SHM transport";
+            return -1;
+        }
+        LOG(INFO) << "MC_FORCE_SHM is set, using SHM transport only";
+        return 0;
     }
-#else
+#endif
+
+#if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)
+    if (shouldInstallAscendTransport(auto_discover_config_.protocol)) {
+        Transport* ascend_transport =
+            multi_transports_->installTransport("ascend", local_topology_);
+        if (!ascend_transport) {
+            LOG(ERROR) << "Failed to install Ascend transport";
+            return -1;
+        }
+        maybeInstallShmTransport(multi_transports_.get(), local_topology_);
+        return 0;
+    }
+    // The hint asked for a host transport. Discovery installs it below when
+    // enabled; with discovery off the caller installs it explicitly, the way
+    // Store and the Python binding do.
+    LOG(INFO) << "protocol=" << auto_discover_config_.protocol
+              << ", skipping Ascend Direct for the host transports";
+#endif
 
 #ifdef USE_UBSHMEM
     Transport* ubshmem_transport =
@@ -257,6 +315,9 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
 
     if (auto_discover_config_.enabled) {
         LOG(INFO) << "Auto-discovering topology...";
+        // RDMA discovery drops EFA NICs (they expose SRD only, not the RC QPs
+        // the RDMA transport needs), but EFA discovery must keep them.
+        const bool use_efa = autoDiscoverUsesEfa();
         if (getenv("MC_CUSTOM_TOPO_JSON")) {
             auto path = getenv("MC_CUSTOM_TOPO_JSON");
             LOG(INFO) << "Using custom topology from: " << path;
@@ -266,13 +327,31 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
             } else {
                 LOG(WARNING) << "Failed to load custom topology from " << path
                              << ", falling back to auto-detect.";
-                local_topology_->discover(filter_);
+                local_topology_->discover(filter_, /*exclude_efa=*/!use_efa);
             }
         } else {
-            local_topology_->discover(filter_);
+            local_topology_->discover(filter_, /*exclude_efa=*/!use_efa);
         }
         LOG(INFO) << "Topology discovery complete. Found "
                   << local_topology_->getHcaList().size() << " HCAs.";
+
+#ifdef USE_EFA
+        // Install EFA before the per-build transport selection below. The
+        // NVLink/MNNVL branch never installs EFA, so builds that combine
+        // USE_EFA with it (the default CUDA wheels) would otherwise fall back
+        // to TCP, or to RDMA on the host's non-EFA NICs.
+        if (use_efa) {
+            Transport* efa_transport =
+                multi_transports_->installTransport("efa", local_topology_);
+            if (!efa_transport) {
+                LOG(ERROR) << "Failed to install EFA transport";
+                return -1;
+            }
+            LOG(INFO) << "installTransport, type=efa";
+            maybeInstallShmTransport(multi_transports_.get(), local_topology_);
+            return 0;
+        }
+#endif
 
 #ifdef USE_UB
         Transport* ub_transport =
@@ -368,7 +447,10 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
             }
             LOG(INFO) << "Using Intra-Node NVLink transport "
                          "(MC_INTRANODE_NVLINK set)";
-        } else if (kGpuP2PCompiled && (force_gpu_p2p || no_hca)) {
+        } else if (kGpuP2PCompiled &&
+                   (force_gpu_p2p || (no_hca && !force_hca))) {
+            // MC_FORCE_HCA suppresses automatic no-HCA fallback, but keeps
+            // explicitly requested GPU P2P transport precedence unchanged.
             Transport* t =
                 multi_transports_->installTransport(gpu_p2p_protocol, nullptr);
             if (!t) {
@@ -455,8 +537,8 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
         }
 #endif
     }
-#endif
 
+    maybeInstallShmTransport(multi_transports_.get(), local_topology_);
     return 0;
 }
 
@@ -511,6 +593,38 @@ Transport* TransferEngineImpl::installTransport(const std::string& proto,
 
 int TransferEngineImpl::uninstallTransport(const std::string& proto) {
     return 0;
+}
+
+void* TransferEngineImpl::allocateSharedMemory(size_t length) {
+    return allocateSharedMemory(length, SharedMemoryOptions{});
+}
+
+void* TransferEngineImpl::allocateSharedMemory(size_t length,
+                                               const SharedMemoryOptions& opt) {
+    auto* shm =
+        dynamic_cast<ShmTransport*>(multi_transports_->getTransport("shm"));
+    if (!shm) {
+        LOG(ERROR) << "allocateSharedMemory requires ShmTransport "
+                      "(set MC_FORCE_SHM=1 or installTransport(\"shm\"))";
+        return nullptr;
+    }
+    return shm->allocateSharedMemory(length, opt);
+}
+
+int TransferEngineImpl::freeSharedMemory(void* addr) {
+    if (!addr) return ERR_INVALID_ARGUMENT;
+    auto* shm =
+        dynamic_cast<ShmTransport*>(multi_transports_->getTransport("shm"));
+    if (!shm) return ERR_INVALID_ARGUMENT;
+    std::string shm_name;
+    if (!shm->getShmName(addr, &shm_name)) return ERR_INVALID_ARGUMENT;
+    int uret = unregisterLocalMemory(addr, true);
+    if (uret && uret != ERR_ADDRESS_NOT_REGISTERED) {
+        LOG(WARNING) << "unregisterLocalMemory failed before freeSharedMemory, "
+                        "ret="
+                     << uret;
+    }
+    return shm->freeSharedMemory(addr);
 }
 
 #if (defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)) && \
@@ -582,6 +696,15 @@ int TransferEngineImpl::sendNotifyByName(
             }
             VLOG(1) << "sendNotifyByName: RDMA notify unavailable for "
                     << remote_agent << ", falling back to OOB";
+        } else if (auto* rdma = dynamic_cast<RdmaTransport*>(transport)) {
+            int ret = rdma->sendNativeNotify(remote_agent, notify_msg);
+            if (ret == 0) return 0;
+            // Only unsupported peers/oversized payloads may use OOB. A QP
+            // failure must remain visible, and accepted SENDs are never
+            // replayed.
+            if (ret != ERR_NOT_IMPLEMENTED ||
+                !globalConfig().rdma_notify_oob_fallback)
+                return ret;
         }
     }
     Transport::NotifyDesc peer_desc;
