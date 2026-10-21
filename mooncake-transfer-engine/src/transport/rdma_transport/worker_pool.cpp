@@ -31,6 +31,7 @@
 #include "memory_location.h"
 #include "transport/rdma_transport/rdma_batch_cache.h"
 #ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+#include "adaptive_congestion_control_config.h"
 #include "rdma_error_classifier.h"
 #endif
 #include "transport/rdma_transport/rdma_context.h"
@@ -269,9 +270,19 @@ void ClassicRdmaCongestionControl::resetDevice() {
     adaptive_congestion_control::resetGeneration(*device_, generation);
 }
 
+static adaptive_congestion_control::Config
+loadClassicCongestionControlConfig() {
+    auto result = adaptive_congestion_control::loadConfigFromEnvironment();
+    if (result.valid) return result.config;
+
+    static std::once_flag warning_once;
+    std::call_once(warning_once, [&] {
+        LOG(ERROR) << "Invalid adaptive congestion-control setting: "
+                   << result.error << "; classic RDMA enforcement disabled";
+    });
+    return adaptive_congestion_control::Config{};
+}
 #endif
-
-
 
 static std::string resolveBufferLocation(
     const TransferMetadata::BufferDesc &buffer, uint64_t offset) {
@@ -468,7 +479,12 @@ WorkerPool::WorkerPool(RdmaContext &context, int numa_socket_id)
       worker_slice_queue_(worker_count_),
       worker_slice_queue_lock_(worker_count_),
       submitted_slice_count_(0),
-      processed_slice_count_(0) {
+      processed_slice_count_(0)
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+      ,
+      adaptive_congestion_control_(loadClassicCongestionControlConfig())
+#endif
+{
     collective_slice_queue_.resize(worker_count_);
     for (int i = 0; i < worker_count_; ++i)
         worker_thread_.emplace_back(
@@ -950,6 +966,10 @@ void WorkerPool::performPostSend(int thread_id) {
                     refreshPublishedLocalTopology();
                     redispatch_counter_++;
                 }
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+                adaptive_congestion_control_.retireEndpoint(entry.first,
+                                                            endpoint.get());
+#endif
                 context_.deleteEndpointByPtr(endpoint.get());
                 for (auto &slice : entry.second) {
                     if (!has_peer_alternative && local_context_inactive &&
@@ -970,6 +990,10 @@ void WorkerPool::performPostSend(int thread_id) {
                            << ", deleting endpoint";
                 markRailFailed(entry.first, true);
                 redispatch_counter_++;
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+                adaptive_congestion_control_.retireEndpoint(entry.first,
+                                                            endpoint.get());
+#endif
                 context_.deleteEndpointByPtr(endpoint.get());
                 for (auto &slice : entry.second)
                     failed_slice_list.push_back(slice);
@@ -977,14 +1001,53 @@ void WorkerPool::performPostSend(int thread_id) {
             }
             continue;
         }
-        // Set endpoint pointer for each slice before submitting
-        auto auto_gid_token = endpoint->autoGidCompletionToken();
-        for (auto &slice : entry.second) {
-            slice->rdma.endpoint = endpoint.get();
-            slice->rdma.auto_gid_token = auto_gid_token;
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+        if (adaptive_congestion_control_.enabled()) {
+            adaptive_congestion_control_.prepare(entry.second, entry.first);
+            adaptive_congestion_control_.bindEndpoint(entry.second.front(),
+                                                      endpoint.get());
+            const size_t admitted_count =
+                adaptive_congestion_control_.gate(entry.second);
+            if (admitted_count != 0) {
+                auto auto_gid_token = endpoint->autoGidCompletionToken();
+                for (size_t i = 0; i < admitted_count; ++i) {
+                    entry.second[i]->rdma.endpoint = endpoint.get();
+                    entry.second[i]->rdma.auto_gid_token = auto_gid_token;
+                }
+                const size_t failed_before = failed_slice_list.size();
+                const size_t queued_before = entry.second.size();
+                endpoint->submitPostSendLimited(entry.second, failed_slice_list,
+                                                admitted_count);
+                const size_t consumed = queued_before - entry.second.size();
+                for (size_t i = failed_before; i < failed_slice_list.size();
+                     ++i) {
+                    adaptive_congestion_control_.releaseUnposted(
+                        failed_slice_list[i]);
+                }
+                for (size_t i = 0; i < admitted_count - consumed; ++i)
+                    adaptive_congestion_control_.releaseUnposted(
+                        entry.second[i]);
+            }
+        } else {
+#endif
+            auto auto_gid_token = endpoint->autoGidCompletionToken();
+            for (auto *slice : entry.second) {
+                slice->rdma.endpoint = endpoint.get();
+                slice->rdma.auto_gid_token = auto_gid_token;
+            }
+            endpoint->submitPostSend(entry.second, failed_slice_list);
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
         }
-        endpoint->submitPostSend(entry.second, failed_slice_list);
-        if (!endpoint->active()) context_.deleteEndpointByPtr(endpoint.get());
+#endif
+        if (!endpoint->active()) {
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+            if (adaptive_congestion_control_.enabled()) {
+                adaptive_congestion_control_.retireEndpoint(entry.first,
+                                                            endpoint.get());
+            }
+#endif
+            context_.deleteEndpointByPtr(endpoint.get());
+        }
 #endif
     }
 
@@ -1122,6 +1185,11 @@ void WorkerPool::processCompletions(int thread_id,
     for (const auto &wc : wc_list) {
         Transport::Slice *slice = (Transport::Slice *)wc.wr_id;
         assert(slice);
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+        if (adaptive_congestion_control_.enabled())
+            adaptive_congestion_control_.complete(slice, wc.status,
+                                                  wc.vendor_err);
+#endif
         if (wc.status != IBV_WC_SUCCESS) {
             // Flush errors are generated when QPs transition to ERR state
             // during normal endpoint destruction (beginDestroy). They are not
@@ -1195,6 +1263,10 @@ void WorkerPool::processCompletions(int thread_id,
                 } else if (slice->rdma.endpoint &&
                            !local_failed_endpoints.count(
                                slice->rdma.endpoint)) {
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+                    adaptive_congestion_control_.retireEndpoint(
+                        slice->peerNicPath(), slice->rdma.endpoint);
+#endif
                     context_.deleteEndpointByPtr(slice->rdma.endpoint);
                     local_failed_endpoints.insert(slice->rdma.endpoint);
                 }
@@ -1210,6 +1282,10 @@ void WorkerPool::processCompletions(int thread_id,
                     redispatch_counter_++;
                 }
                 if (slice->rdma.endpoint) {
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+                    adaptive_congestion_control_.retireEndpoint(
+                        slice->peerNicPath(), slice->rdma.endpoint);
+#endif
                     context_.deleteEndpointByPtr(slice->rdma.endpoint);
                 }
             }
@@ -1557,6 +1633,10 @@ int WorkerPool::doProcessContextEvents() {
             if (endpoint) {
                 auto endpoint_lifecycle_lock =
                     context_.lockEndpointLifecycle(endpoint->peerNicPath());
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+                adaptive_congestion_control_.retireEndpoint(
+                    endpoint->peerNicPath(), endpoint.get());
+#endif
                 context_.deleteEndpointByPtr(endpoint.get());
             } else {
                 LOG(WARNING) << "QP fatal event endpoint is no longer tracked";
@@ -1688,6 +1768,9 @@ void WorkerPool::maybeActivateRecoveredContext() {
     }
 
     resetContextBreaker(true);
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+    adaptive_congestion_control_.resetDevice();
+#endif
     recovery_activate_after_ns_.store(0, std::memory_order_relaxed);
     refreshPublishedLocalTopology();
     LOG(INFO) << "Worker: Context " << context_.deviceName()
@@ -1777,6 +1860,9 @@ void WorkerPool::monitorWorker() {
     while (workers_running_) {
         const uint64_t current_ts =
             static_cast<uint64_t>(getCurrentTimeInNano());
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+        adaptive_congestion_control_.tick(current_ts);
+#endif
         maybeActivateRecoveredContext();
         // Check short breaker TTLs on every loop, like GID recovery.
         maybeReactivateContext();
@@ -2008,6 +2094,9 @@ void WorkerPool::handleLocalFailure(const std::string &peer_nic_path,
 
     // Endpoint may also be poisoned; retire it for safety.
     if (endpoint) {
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+        adaptive_congestion_control_.retireEndpoint(peer_nic_path, endpoint);
+#endif
         context_.deleteEndpointByPtr(endpoint);
     }
 
