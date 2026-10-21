@@ -191,6 +191,7 @@ if [ "$OS" = "ubuntu" ] || [ "$OS" = "debian" ]; then
                      libzstd-dev \
                      libasio-dev \
                      libxxhash-dev \
+                     libcli11-dev \
                      pkg-config \
                      patchelf \
                      libc6-dev \
@@ -253,6 +254,8 @@ elif [ "$OS" = "centos" ] || [ "$OS" = "rhel" ] || [ "$OS" = "rocky" ] || [ "$OS
 
     yum install -y $SYSTEM_PACKAGES
     check_success "Failed to install system packages"
+    # The TENT CLI needs CLI11 headers; some releases do not package them.
+    yum install -y cli11-devel || echo -e "${YELLOW}cli11-devel is not available; install CLI11 headers manually to build the TENT CLI.${NC}"
 
 elif [ "$OS" = "kylin" ]; then
     SYSTEM_PACKAGES="@development \
@@ -307,6 +310,9 @@ elif [ "$OS" = "kylin" ]; then
         --setopt=kylin-epkl.gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-kylin \
         --enablerepo=kylin-epkl install -y $SYSTEM_PACKAGES
     check_success "Failed to install system packages"
+    dnf --repofrompath="kylin-epkl,$KYLIN_EPKL_URL" \
+        --setopt=kylin-epkl.gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-kylin \
+        --enablerepo=kylin-epkl install -y cli11-devel || echo -e "${YELLOW}cli11-devel is not available; install CLI11 headers manually to build the TENT CLI.${NC}"
 else
     print_error "Unsupported OS: $OS"
 fi
