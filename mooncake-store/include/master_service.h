@@ -2598,16 +2598,11 @@ class MasterService {
         std::vector<Replica::Descriptor>&& replicas) const;
     bool IsEvictableMemoryReplica(const Replica& replica) const;
 
-    // Whether this surface meets an object it has no form for. The surfaces
-    // that address one replica set of an object name a key and no part: copy,
-    // move, offload, promotion, dynamic replication, the add-replica
-    // registration, the admin views, upsert, and a read that names no part. An
-    // object of several parts has one replica set per part, and one length per
-    // part. The answer is the error the surface returns, so every refusal
-    // carries one error code and one log line, with `action` naming the
-    // surface. A surface that drops the key instead of failing (the regex
-    // listing, the promotion candidate scan, BatchReplicaClear) asks the same
-    // question and keeps its own answer.
+    // The error a surface that addresses one replica set of a whole object
+    // answers when it meets an object of several parts, or nullopt for an
+    // ordinary object. One decision, so the code and the log line are chosen
+    // once and `action` names the surface. A surface that drops the key rather
+    // than failing asks the same question and keeps its own answer.
     [[nodiscard]] std::optional<ErrorCode> RefusesPartedObject(
         const char* action, const std::string& key,
         const ObjectMetadata& metadata) const;

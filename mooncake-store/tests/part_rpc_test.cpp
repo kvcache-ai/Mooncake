@@ -106,9 +106,9 @@ class PartRpcTest : public ::testing::Test {
     UUID client_id_{};
 };
 
-// The part count sizes the object the master builds, so the value is bounded:
-// a count past the bound is refused at the RPC boundary and leaves nothing
-// behind, and the bound itself is a count a client may ask for.
+// The first write fixes the object's shape for its life, so the count is
+// bounded: past the bound the master refuses and leaves nothing behind, and the
+// bound itself is a count a client may ask for.
 TEST_F(PartRpcTest, RefusesAPartCountPastTheBound) {
     coro_rpc::coro_rpc_client client;
     auto connected = async_simple::coro::syncAwait(
@@ -358,13 +358,8 @@ TEST_F(PartRpcTest, BatchWriteCarriesEveryPartOfOneKey) {
         kBatchParts);
 }
 
-// A tensor-parallel, pipeline-parallel deployment keeps the KV cache of one
-// block in one object: every rank computed its own shard, so every rank writes
-// one part from its own segment, and a rank that needs another rank's shard
-// asks for that part.
-
-// A checksum that names the rank and a tag the test chose for the write, so a
-// read answers which shard came back.
+// A checksum built from who wrote the part and a tag the test picks, so a read
+// answers which shard came back.
 uint64_t ShardChecksum(uint32_t rank, uint32_t tag) {
     return static_cast<uint64_t>(rank) * 1000 + tag;
 }
@@ -393,13 +388,13 @@ MountedRank MountRank(WrappedMasterService& service, const std::string& name,
     return rank;
 }
 
-// The failure text of one rank's write of one part; empty when it landed.
+// The failure text of a write of one part; empty when it landed.
 struct ShardWrite {
     std::string failure;
 };
 
-// A rank writes its shard into its own segment, which is what a client does
-// with the buffer it allocated, so the write names that segment.
+// A write names the segment its replica should land in, the way a client names
+// the buffer it allocated.
 ShardWrite WriteShard(coro_rpc::coro_rpc_client& client, const UUID& client_id,
                       const std::string& key, uint32_t part_index,
                       uint32_t part_count, uint64_t part_bytes,

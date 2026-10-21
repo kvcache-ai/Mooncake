@@ -179,13 +179,11 @@ TEST_F(MasterServicePartTest, RefusesASecondWriteOfAPartThatHoldsContent) {
     auto refused = PutStartPart(key, 0, 2);
     ASSERT_FALSE(refused.has_value());
     EXPECT_EQ(ErrorCode::OBJECT_ALREADY_EXISTS, refused.error());
-    // The other part is still free.
     ASSERT_TRUE(WriteWholePart(key, 1, 2));
     EXPECT_TRUE(IsReadable(key));
 }
 
-// One write of a part is in flight until it completes; a second writer of the
-// same part is refused while the first one may still be streaming.
+// A second writer is refused while the first may still be streaming.
 TEST_F(MasterServicePartTest, RefusesASecondWriterOfTheSamePart) {
     const std::string key = "contended_key";
     ASSERT_TRUE(PutStartPart(key, 0, 1).has_value());
@@ -479,7 +477,6 @@ TEST_F(MasterServicePartTest, PartReadAnswersWithThatPartOnly) {
         EXPECT_EQ(response->lease_ttl_ms, solo_response->lease_ttl_ms);
     }
 
-    // A part the object does not have is refused.
     auto out_of_range =
         service_.GetReplicaList(key, TenantId::Default(), kReadParts);
     ASSERT_FALSE(out_of_range.has_value());
@@ -604,7 +601,6 @@ TEST_F(MasterServicePartTest, ReclaimsThePartsWhoseWriteWentSilent) {
         service_, TenantId::Default(), key,
         between + std::chrono::seconds(DEFAULT_PUT_START_RELEASE_TIMEOUT));
 
-    // The silent part gave its replicas up.
     auto reclaimed = service_.GetReplicaList(key, TenantId::Default(), 1);
     ASSERT_FALSE(reclaimed.has_value());
     EXPECT_EQ(ErrorCode::REPLICA_IS_NOT_READY, reclaimed.error());
