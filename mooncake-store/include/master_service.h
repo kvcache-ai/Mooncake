@@ -2753,14 +2753,13 @@ class MasterService {
     tl::expected<PartReadOutcome, ErrorCode> ReadPart(
         const ObjectMetadata& metadata, std::optional<uint32_t> part_index,
         std::optional<bool> object_readable = std::nullopt) const;
-    GetReplicaListResponse MakeReadResponse(PartReadOutcome&& outcome) const;
-    // The answer a surface that shows an object whole gives: every readable
-    // replica of it, the checksum of its content, and the part count a read of
-    // the same object reports. Such a surface refuses an object of several
-    // parts before it gets here, so the part it reads is the object's only one.
-    GetReplicaListResponse MakeWholeObjectResponse(
-        const ObjectMetadata& metadata,
-        std::vector<Replica::Descriptor>&& replicas) const;
+    // The answer to a read, from the replicas it hands out, the checksum of
+    // that content, and the part count the object declares. A surface that
+    // shows an object whole passes the object's only part and its declared
+    // count.
+    GetReplicaListResponse MakeReadResponse(
+        std::vector<Replica::Descriptor>&& replicas,
+        std::optional<uint64_t> checksum, uint32_t part_count) const;
     bool IsEvictableMemoryReplica(const Replica& replica) const;
 
     // The error a surface that addresses one replica set of a whole object
