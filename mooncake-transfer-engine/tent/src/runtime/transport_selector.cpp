@@ -379,6 +379,9 @@ bool TransportSelector::matchesMemoryPattern(const std::string& pattern,
         case MTYPE_TPU:
             type_str = "tpu";
             break;
+        case MTYPE_MLU:
+            type_str = "mlu";
+            break;
         case MTYPE_XPU:
             type_str = "xpu";
             break;
@@ -471,18 +474,17 @@ bool TransportSelector::isTransportAvailable(
         return false;
     }
 
-    // Special constraints
-    if (type == XPU && !context.local_segment) return false;
+    // XPU/MLU need process-local addresses, not merely machine locality.
+    if ((type == XPU || type == MLU) && !context.local_segment) return false;
     if ((type == NVLINK || type == SHM || type == TPU) &&
         !context.same_machine) {
-        // These transports require machine locality. XPU additionally needs
-        // process-local addresses, checked separately above.
         return false;
     }
 
     const auto& caps = transport->capabilities();
     if (context.host_staging) {
-        return (type == RDMA || type == TCP || type == HP_TCP) &&
+        return (type == RDMA || type == FABRIC || type == TCP ||
+                type == HP_TCP) &&
                caps.dram_to_dram;
     }
 

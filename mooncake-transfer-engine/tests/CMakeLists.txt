@@ -21,6 +21,12 @@ if(USE_TENT)
   # Match the compatibility shim public class definition and enable the
   # MC_USE_TENT regression cases in transport_uint_test.cpp.
   target_compile_definitions(transport_uint_test PRIVATE USE_TENT)
+  add_test(
+    NAME tent_compat_notify_test
+    COMMAND
+      transport_uint_test
+      --gtest_filter=TransferEngineTentCompatibilityTest.NotifyByNamePreservesOpenSegment
+  )
 endif()
 add_test(NAME transport_uint_test COMMAND transport_uint_test)
 
@@ -59,6 +65,11 @@ add_executable(rdma_endpoint_state_test
 target_link_libraries(rdma_endpoint_state_test PUBLIC transfer_engine gtest
                                                       gtest_main)
 add_test(NAME rdma_endpoint_state_test COMMAND rdma_endpoint_state_test)
+
+add_executable(rdma_posted_fifo_test ${WORKSPACE}/rdma_posted_fifo_test.cpp)
+target_link_libraries(rdma_posted_fifo_test PUBLIC transfer_engine gtest
+                                                   gtest_main)
+add_test(NAME rdma_posted_fifo_test COMMAND rdma_posted_fifo_test)
 
 # Hardware-free regression tests for peer-rail pausing and the local-WC context
 # breaker. Both are plain per-worker-pool state, so this runs on every CI runner
@@ -138,7 +149,8 @@ target_link_libraries(rdma_endpoint_reestablish_test PUBLIC transfer_engine
 if(UNIX AND NOT APPLE)
   target_link_options(
     rdma_endpoint_reestablish_test PRIVATE "-Wl,--wrap=ibv_modify_qp"
-    "-Wl,--wrap=ibv_query_gid" "-Wl,--wrap=_ibv_query_gid_ex")
+    "-Wl,--wrap=ibv_query_qp" "-Wl,--wrap=ibv_query_gid"
+    "-Wl,--wrap=_ibv_query_gid_ex")
 endif()
 add_test(NAME rdma_endpoint_reestablish_test
          COMMAND rdma_endpoint_reestablish_test)
@@ -298,6 +310,30 @@ if(USE_EFA)
   target_link_libraries(efa_transport_test PUBLIC transfer_engine gtest
                                                   gtest_main)
   add_test(NAME efa_transport_test COMMAND efa_transport_test)
+
+  add_executable(efa_select_device_test ${WORKSPACE}/efa_select_device_test.cpp)
+  target_link_libraries(efa_select_device_test PUBLIC transfer_engine gtest
+                                                      gtest_main)
+  add_test(NAME efa_select_device_test COMMAND efa_select_device_test)
+
+  # Compiles the real EfaEndPoint source against the test-only
+  # RPC/address-vector fakes in efa_endpoint_handshake_fakes/ (shadowed
+  # efa_context.h via -iquote), so the endpoint locking and generation logic
+  # runs without an EFA device. Bounded: a locking regression must fail, not
+  # hang the test runner.
+  add_executable(
+    efa_endpoint_handshake_test
+    ${WORKSPACE}/efa_endpoint_handshake_test.cpp
+    ${CMAKE_SOURCE_DIR}/mooncake-transfer-engine/src/transport/efa_transport/efa_endpoint.cpp
+  )
+  target_compile_options(
+    efa_endpoint_handshake_test
+    PRIVATE -iquote${WORKSPACE}/efa_endpoint_handshake_fakes)
+  target_link_libraries(
+    efa_endpoint_handshake_test PUBLIC glog::glog gflags::gflags gtest
+                                       gtest_main pthread)
+  add_test(NAME efa_endpoint_handshake_test COMMAND efa_endpoint_handshake_test)
+  set_tests_properties(efa_endpoint_handshake_test PROPERTIES TIMEOUT 120)
 
   add_executable(efa_c_api_test ${WORKSPACE}/efa_c_api_test.cpp)
   target_link_libraries(efa_c_api_test PUBLIC transfer_engine gtest gtest_main)
@@ -569,3 +605,8 @@ if(USE_NCCL_DEVICE AND NOT USE_CXI)
     endif()
   endif()
 endif()
+
+add_executable(batch_counter_wait_test ${WORKSPACE}/batch_counter_wait_test.cpp)
+target_link_libraries(batch_counter_wait_test PUBLIC transfer_engine gtest
+                                                     gtest_main)
+add_test(NAME batch_counter_wait_test COMMAND batch_counter_wait_test)

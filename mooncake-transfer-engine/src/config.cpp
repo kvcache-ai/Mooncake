@@ -14,6 +14,9 @@
 
 #include "config.h"
 
+#include "bool_parser.h"
+#include "integer_parser.h"
+
 #include "glog_compat.h"
 
 #include <charconv>
@@ -216,6 +219,16 @@ void loadGlobalConfig(GlobalConfig& config) {
         } else {
             LOG(WARNING) << "Ignore value from environment variable MC_MAX_WR";
         }
+    }
+
+    const char* signal_interval_env = std::getenv("MC_RDMA_SIGNAL_INTERVAL");
+    if (signal_interval_env) {
+        int val = atoi(signal_interval_env);
+        if (val > 0 && val <= UINT16_MAX)
+            config.rdma_signal_interval = val;
+        else
+            LOG(WARNING) << "Ignore value from environment variable "
+                            "MC_RDMA_SIGNAL_INTERVAL";
     }
 
     const char* max_inline_env = std::getenv("MC_MAX_INLINE");
@@ -682,6 +695,37 @@ void loadGlobalConfig(GlobalConfig& config) {
         }
     }
 
+    if (const char* value = std::getenv("MC_EFA_CQ_THREADS")) {
+        const auto parsed = TryParseInteger<int>(
+            value, {.trim_ascii_whitespace = true, .allow_leading_plus = true});
+        if (parsed.has_value()) {
+            config.efa_cq_threads = *parsed;
+        } else {
+            LOG(WARNING) << "Invalid MC_EFA_CQ_THREADS environment value: "
+                         << value << ", keeping default "
+                         << config.efa_cq_threads;
+        }
+    }
+
+    for (const auto& [env_name, field] :
+         {std::pair{"WITH_NVIDIA_PEERMEM", &config.with_nvidia_peermem},
+          std::pair{"MC_RDMA_DATA_DIRECT", &config.rdma_data_direct},
+          std::pair{"MC_RDMA_DATA_DIRECT_PAIRING",
+                    &config.rdma_data_direct_pairing}}) {
+        const char* value = std::getenv(env_name);
+        if (value == nullptr) {
+            continue;
+        }
+        const auto parsed = TryParseBool(value);
+        if (parsed.has_value()) {
+            *field = *parsed;
+        } else {
+            LOG(WARNING) << "Invalid " << env_name
+                         << " environment value: " << value
+                         << ", keeping default " << *field;
+        }
+    }
+
     const char* endpoint_store_type_env = std::getenv("MC_ENDPOINT_STORE_TYPE");
     if (endpoint_store_type_env) {
         if (strcmp(endpoint_store_type_env, "FIFO") == 0) {
@@ -843,6 +887,7 @@ void dumpGlobalConfig() {
     LOG(INFO) << "num_qp_per_ep = " << config.num_qp_per_ep;
     LOG(INFO) << "max_sge = " << config.max_sge;
     LOG(INFO) << "max_wr = " << config.max_wr;
+    LOG(INFO) << "rdma_signal_interval = " << config.rdma_signal_interval;
     LOG(INFO) << "max_inline = " << config.max_inline;
     LOG(INFO) << "mtu_length = " << mtuLengthToString(config.mtu_length);
     LOG(INFO) << "parallel_reg_mr = " << config.parallel_reg_mr;

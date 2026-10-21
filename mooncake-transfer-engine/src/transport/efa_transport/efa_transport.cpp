@@ -32,7 +32,6 @@
 
 #include "common.h"
 #include "config.h"
-#include "environ.h"
 #include "memory_location.h"
 #include "topology.h"
 #include "transport/batch_registration.h"
@@ -66,7 +65,7 @@ void EfaTransport::startWorkerThreads() {
     worker_running_ = true;
     // MC_EFA_CQ_THREADS caps CQ poller count (default 1). Set 0 to disable cap.
     size_t num_threads = context_list_.size();
-    int cq_cap = Environ::Get().GetEfaCqThreads();
+    const int cq_cap = globalConfig().efa_cq_threads;
     if (cq_cap > 0 && static_cast<size_t>(cq_cap) < num_threads) {
         num_threads = static_cast<size_t>(cq_cap);
     }
@@ -133,6 +132,12 @@ int EfaTransport::install(std::string& local_server_name,
     metadata_ = meta;
     local_server_name_ = local_server_name;
     local_topology_ = topo;
+
+    std::string fabric_error;
+    if (!loadLibfabric(&fabric_error)) {
+        LOG(ERROR) << "EfaTransport: " << fabric_error;
+        return ERR_CONTEXT;
+    }
 
     auto ret = initializeEfaResources();
     if (ret) {
@@ -1286,8 +1291,12 @@ int EfaTransport::selectDevice(SegmentDesc* desc, uint64_t offset,
         // Try multiple attempts to find a device with valid MR registration.
         // With per-NIC partition, not all devices have all buffers registered,
         // so rkey[device_id] may be 0 for unassigned NICs.
+        // Topology::selectDevice() draws a random preferred HCA for try 0 and
+        // returns entry (try - 1) of preferred + available for try > 0, so
+        // num_devices + 1 attempts are needed for the deterministic part of the
+        // walk to visit every entry, whatever retry_count it starts from.
         int num_devices = static_cast<int>(desc->devices.size());
-        for (int attempt = 0; attempt < num_devices; ++attempt) {
+        for (int attempt = 0; attempt <= num_devices; ++attempt) {
             int try_count = retry_count + attempt;
             device_id =
                 hint.empty()
@@ -1305,6 +1314,28 @@ int EfaTransport::selectDevice(SegmentDesc* desc, uint64_t offset,
             if (device_id >= 0 &&
                 static_cast<size_t>(device_id) < buffer.rkey.size() &&
                 buffer.rkey[device_id] != 0) {
+                return 0;
+            }
+        }
+
+        // The walk can still miss a keyed NIC: a hint that resolves to an HCA
+        // pins every attempt to that HCA, and a topology that lists fewer HCAs
+        // than the buffer has keys (or none for this location) never reaches
+        // the rest. Under the disjoint per-NIC partition a chunk is registered
+        // on a single NIC, so a miss fails a transfer that a registered NIC
+        // could serve. Fall back to any NIC that holds a key for this buffer.
+        const size_t num_keys = buffer.rkey.size();
+        for (size_t i = 0; i < num_keys; ++i) {
+            const size_t candidate =
+                (static_cast<size_t>(retry_count) + i) % num_keys;
+            if (buffer.rkey[candidate] != 0) {
+                device_id = static_cast<int>(candidate);
+                LOG_EVERY_N(WARNING, 1000)
+                    << "selectDevice: topology walk found no keyed NIC for "
+                       "buffer "
+                    << buffer.name << " (hint '" << hint << "', retry_count "
+                    << retry_count << "), falling back to device_id "
+                    << device_id;
                 return 0;
             }
         }

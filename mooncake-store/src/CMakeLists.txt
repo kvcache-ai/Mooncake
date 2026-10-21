@@ -29,11 +29,11 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     config/s3_client_config.cpp
     segment_allocator_registration.cpp
     client_offboarding.cpp
+    dynamic_replication_controller.cpp
     master_service.cpp
+    promotion_candidate_tracker.cpp
     master_store_backend.cpp
     weight_store_manager.cpp
-    master_snapshot_manager.cpp
-    master_snapshot_repository.cpp
     master_metric_manager.cpp
     segment/region_driver.cpp
     placement/index.cpp
@@ -47,9 +47,10 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     segment/pool_write_access.cpp
     segment/pool_read_access.cpp
     segment.cpp
-    tenant_quota.cpp
+    tenant/quota.cpp
+    tenant/quota_manager.cpp
     tenant_quota_ledger.cpp
-    tenant_quota_policy_store.cpp
+    tenant/quota_policy_store.cpp
     weight_metadata_store.cpp
     rpc_service.cpp
     master_admin_service.cpp
@@ -64,10 +65,12 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     ha/common/redis/redis_connection.cpp
     ha/leadership/backends/redis/redis_leader_coordinator.cpp
     ha/leadership/master_service_supervisor.cpp
+    shutdown_request.cpp
     ha/kv/etcd_ha_kv_backend.cpp
+    ha/kv/redis_ha_kv_backend.cpp
+    ha/kv/ha_kv_backend_factory.cpp
     ha/standby_controller.cpp
     ha/standby_metadata_store.cpp
-    ha/snapshot/catalog_backed_snapshot_provider.cpp
     ha/snapshot/batch_oplog/codec.cpp
     ha/snapshot/batch_oplog/metadata.cpp
     ha/snapshot/batch_oplog/batch_oplog_snapshot_provider.cpp
@@ -77,13 +80,10 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     ha/snapshot/batch_oplog/batch_oplog_snapshot_gc.cpp
     ha/snapshot/batch_oplog/batch_oplog_pruning_coordinator.cpp
     ha/snapshot/snapshot_maintenance_lease.cpp
-    ha/snapshot/master_snapshot_codec.cpp
     ha/snapshot/local_ssd_codec.cpp
     ha/snapshot/object/snapshot_object_store.cpp
     ha/snapshot/object/backends/local/local_file_snapshot_object_store.cpp
     ha/snapshot/object/backends/s3/s3_snapshot_object_store.cpp
-    ha/snapshot/catalog/backends/embedded/embedded_snapshot_catalog_store.cpp
-    ha/snapshot/catalog/backends/redis/redis_snapshot_catalog_store.cpp
     task_manager.cpp
     ha/oplog/oplog_types.cpp
     ha/oplog/oplog_batch_codec.cpp
@@ -151,6 +151,7 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     config/rpc_timeout_config.cpp
     config/spdk_controller_config.cpp
     config/transfer_submitter_config.cpp
+    config/egm_store_pool_config.cpp
     device/accelerator_device.cpp
     device/accelerator_registry.cpp
     device/runtime_accelerator.cpp
@@ -159,6 +160,7 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     device/hip_accelerator_device.cpp
     device/ascend_accelerator_device.cpp
     device/sunrise_accelerator_device.cpp
+    device/xpu_accelerator_device.cpp
     local_hot_cache.cpp
     store_c.cpp
     memory_alloc.cpp
@@ -227,6 +229,29 @@ else()
   set(MOONCAKE_OSS_ADAPTER_ENABLED
       FALSE
       CACHE INTERNAL "Whether the Alibaba Cloud OSS adapter is built")
+endif()
+
+# S3-compatible adapter (REST API with AWS Signature V4). Independent of the OSS
+# adapter; it needs the same CURL and OpenSSL packages found above.
+if(CURL_FOUND AND OpenSSL_FOUND)
+  message(STATUS "S3-compatible adapter: Enabled")
+  set(MOONCAKE_S3_ADAPTER_ENABLED
+      TRUE
+      CACHE INTERNAL "Whether the S3-compatible adapter is built")
+  list(
+    APPEND
+    MOONCAKE_STORE_CLIENT_SOURCES
+    storage/distributed/rest_object_storage_adapter.cpp
+    storage/distributed/object_storage_xml.cpp
+    config/s3_adapter_config.cpp
+    storage/distributed/s3_adapter.cpp)
+  list(APPEND EXTRA_LIBS CURL::libcurl OpenSSL::Crypto)
+  add_definitions(-DHAVE_S3_ADAPTER)
+else()
+  message(STATUS "S3-compatible adapter: Disabled (requires CURL and OpenSSL)")
+  set(MOONCAKE_S3_ADAPTER_ENABLED
+      FALSE
+      CACHE INTERNAL "Whether the S3-compatible adapter is built")
 endif()
 
 # Find AWS SDK
@@ -571,6 +596,11 @@ if(USE_CUDA)
 elseif(USE_HIP)
   message(STATUS "mooncake_store: HIP enabled, enabling D2H staging")
   target_compile_definitions(mooncake_store_client_objects PRIVATE USE_HIP)
+elseif(USE_XPU)
+  # USE_XPU is a global compile definition (common.cmake) and -fsycl propagates
+  # from TENT's platform_xpu through transfer_engine, so the SYCL-based
+  # accelerator device needs no extra include dirs or link libraries here.
+  message(STATUS "mooncake_store: XPU enabled, enabling D2H staging")
 endif()
 if(USE_ASCEND
    OR USE_ASCEND_DIRECT
@@ -670,6 +700,7 @@ if(USE_SUNRISE)
 endif()
 
 if(BUILD_SHARED_LIBS)
+  set_target_properties(mooncake_store PROPERTIES INSTALL_RPATH "$ORIGIN")
   install(TARGETS mooncake_store DESTINATION lib)
 endif()
 

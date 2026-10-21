@@ -73,30 +73,35 @@ class TransferEnginePy {
 
     int transferSyncWrite(const char *target_hostname, uintptr_t buffer,
                           uintptr_t peer_buffer_address, size_t length,
-                          const std::string &transport_hint = "");
+                          const std::string &transport_hint = "",
+                          const std::string &nic_hint = "");
 
     batch_id_t transferSubmitWrite(const char *target_hostname,
                                    uintptr_t buffer,
                                    uintptr_t peer_buffer_address, size_t length,
-                                   const std::string &transport_hint = "");
+                                   const std::string &transport_hint = "",
+                                   const std::string &nic_hint = "");
 
     int transferCheckStatus(batch_id_t batch_id);
 
     int transferSyncRead(const char *target_hostname, uintptr_t buffer,
                          uintptr_t peer_buffer_address, size_t length,
-                         const std::string &transport_hint = "");
+                         const std::string &transport_hint = "",
+                         const std::string &nic_hint = "");
 
     int batchTransferSyncWrite(const char *target_hostname,
                                std::vector<uintptr_t> buffers,
                                std::vector<uintptr_t> peer_buffer_addresses,
                                std::vector<size_t> lengths,
-                               const std::string &transport_hint = "");
+                               const std::string &transport_hint = "",
+                               const std::string &nic_hint = "");
 
     int batchTransferSyncRead(const char *target_hostname,
                               std::vector<uintptr_t> buffers,
                               std::vector<uintptr_t> peer_buffer_addresses,
                               std::vector<size_t> lengths,
-                              const std::string &transport_hint = "");
+                              const std::string &transport_hint = "",
+                              const std::string &nic_hint = "");
 
     std::shared_ptr<ScatterTransferTicket> scatterTransferSyncWriteWithTicket(
         const std::string &endpoint,
@@ -122,18 +127,81 @@ class TransferEnginePy {
         const char *target_hostname, const std::vector<uintptr_t> &buffers,
         const std::vector<uintptr_t> &peer_buffer_addresses,
         const std::vector<size_t> &lengths,
-        const std::string &transport_hint = "");
+        const std::string &transport_hint = "",
+        const std::string &nic_hint = "");
 
     batch_id_t batchTransferAsyncRead(
         const char *target_hostname, const std::vector<uintptr_t> &buffers,
         const std::vector<uintptr_t> &peer_buffer_addresses,
         const std::vector<size_t> &lengths,
-        const std::string &transport_hint = "");
+        const std::string &transport_hint = "",
+        const std::string &nic_hint = "");
+
+    // Buffer-protocol variants of the batch APIs. Each argument is a
+    // contiguous 1-D array of 8-byte integers (a NumPy uint64/int64 array,
+    // an array.array('Q'), ...). Large batches skip building three Python
+    // lists of ints and converting them one element at a time.
+    int batchTransferSyncWriteArrays(
+        const char *target_hostname, const pybind11::buffer &buffers,
+        const pybind11::buffer &peer_buffer_addresses,
+        const pybind11::buffer &lengths, const std::string &transport_hint = "",
+        const std::string &nic_hint = "");
+
+    int batchTransferSyncReadArrays(
+        const char *target_hostname, const pybind11::buffer &buffers,
+        const pybind11::buffer &peer_buffer_addresses,
+        const pybind11::buffer &lengths, const std::string &transport_hint = "",
+        const std::string &nic_hint = "");
+
+    batch_id_t batchTransferAsyncWriteArrays(
+        const char *target_hostname, const pybind11::buffer &buffers,
+        const pybind11::buffer &peer_buffer_addresses,
+        const pybind11::buffer &lengths, const std::string &transport_hint = "",
+        const std::string &nic_hint = "");
+
+    batch_id_t batchTransferAsyncReadArrays(
+        const char *target_hostname, const pybind11::buffer &buffers,
+        const pybind11::buffer &peer_buffer_addresses,
+        const pybind11::buffer &lengths, const std::string &transport_hint = "",
+        const std::string &nic_hint = "");
+
+    // Page-gathered batch transfer: `fields` is a C-contiguous [F, 5] array
+    // of 8-byte integers, one row (src_base, src_stride, dst_base,
+    // dst_stride, length) per field; `src_pages` / `dst_pages` are 1-D
+    // arrays of P page ids. Descriptor (f, i) copies `length` bytes from
+    // src_base + src_pages[i] * src_stride to dst_base + dst_pages[i] *
+    // dst_stride. The F x P descriptors are expanded here, field-major, and
+    // submitted in batches of at most `max_batch_size` (0: one batch).
+    // Returns 0, or the first batch's nonzero status.
+    int batchTransferSyncWritePages(const char *target_hostname,
+                                    const pybind11::buffer &src_pages,
+                                    const pybind11::buffer &dst_pages,
+                                    const pybind11::buffer &fields,
+                                    size_t max_batch_size = 0,
+                                    const std::string &transport_hint = "",
+                                    const std::string &nic_hint = "");
+
+    int batchTransferSyncReadPages(const char *target_hostname,
+                                   const pybind11::buffer &src_pages,
+                                   const pybind11::buffer &dst_pages,
+                                   const pybind11::buffer &fields,
+                                   size_t max_batch_size = 0,
+                                   const std::string &transport_hint = "",
+                                   const std::string &nic_hint = "");
+
+    int batchTransferSyncPages(const char *target_hostname,
+                               const pybind11::buffer &src_pages,
+                               const pybind11::buffer &dst_pages,
+                               const pybind11::buffer &fields,
+                               size_t max_batch_size, TransferOpcode opcode,
+                               const std::string &transport_hint,
+                               const std::string &nic_hint);
 
     int transferSync(const char *target_hostname, uintptr_t buffer,
                      uintptr_t peer_buffer_address, size_t length,
                      TransferOpcode opcode, TransferNotify *notify = nullptr,
-                     const std::string &transport_hint = "");
+                     const std::string &transport_hint = "",
+                     const std::string &nic_hint = "");
 
     // Known issue: in a few inference engines and benchmarks, accuracy
     // may be affected when using the batchTransferSync API. We currently
@@ -143,13 +211,15 @@ class TransferEnginePy {
                           std::vector<uintptr_t> peer_buffer_addresses,
                           std::vector<size_t> lengths, TransferOpcode opcode,
                           TransferNotify *notify = nullptr,
-                          const std::string &transport_hint = "");
+                          const std::string &transport_hint = "",
+                          const std::string &nic_hint = "");
 
     batch_id_t batchTransferAsync(
         const char *target_hostname, const std::vector<uintptr_t> &buffers,
         const std::vector<uintptr_t> &peer_buffer_addresses,
         const std::vector<size_t> &lengths, TransferOpcode opcode,
-        const std::string &transport_hint = "");
+        const std::string &transport_hint = "",
+        const std::string &nic_hint = "");
 
     int getBatchTransferStatus(const std::vector<batch_id_t> &batch_ids);
 
@@ -158,29 +228,34 @@ class TransferEnginePy {
         const char *target_hostname, const std::vector<uintptr_t> &buffers,
         const std::vector<uintptr_t> &peer_buffer_addresses,
         const std::vector<size_t> &lengths, TransferOpcode opcode,
-        uintptr_t stream_ptr = 0, const std::string &transport_hint = "");
+        uintptr_t stream_ptr = 0, const std::string &transport_hint = "",
+        const std::string &nic_hint = "");
 
     void transferWriteOnCuda(const char *target_hostname, uintptr_t buffer,
                              uintptr_t peer_buffer_address, size_t length,
                              uintptr_t stream_ptr = 0,
-                             const std::string &transport_hint = "");
+                             const std::string &transport_hint = "",
+                             const std::string &nic_hint = "");
 
     void transferReadOnCuda(const char *target_hostname, uintptr_t buffer,
                             uintptr_t peer_buffer_address, size_t length,
                             uintptr_t stream_ptr = 0,
-                            const std::string &transport_hint = "");
+                            const std::string &transport_hint = "",
+                            const std::string &nic_hint = "");
 
     void batchTransferWriteOnCuda(
         const char *target_hostname, const std::vector<uintptr_t> &buffers,
         const std::vector<uintptr_t> &peer_buffer_addresses,
         const std::vector<size_t> &lengths, uintptr_t stream_ptr = 0,
-        const std::string &transport_hint = "");
+        const std::string &transport_hint = "",
+        const std::string &nic_hint = "");
 
     void batchTransferReadOnCuda(
         const char *target_hostname, const std::vector<uintptr_t> &buffers,
         const std::vector<uintptr_t> &peer_buffer_addresses,
         const std::vector<size_t> &lengths, uintptr_t stream_ptr = 0,
-        const std::string &transport_hint = "");
+        const std::string &transport_hint = "",
+        const std::string &nic_hint = "");
 #endif
 
     uintptr_t getFirstBufferAddress(const std::string &segment_name);
@@ -205,7 +280,8 @@ class TransferEnginePy {
 
     // FOR EXPERIMENT ONLY
     int registerMemory(uintptr_t buffer_addr, size_t capacity,
-                       const std::string &location = kWildcardLocation);
+                       const std::string &location = kWildcardLocation,
+                       bool remote_accessible = true);
 
     // must be called before TransferEnginePy::~TransferEnginePy()
     int unregisterMemory(uintptr_t buffer_addr);
@@ -236,6 +312,8 @@ class TransferEnginePy {
         const std::vector<std::vector<size_t>> &local_offsets,
         const std::vector<std::vector<size_t>> &remote_offsets,
         const std::vector<std::vector<size_t>> &lengths, TransferOpcode opcode);
+
+    int resolveNicHint(const std::string &name) const;
 
     char *allocateRawBuffer(size_t capacity);
 

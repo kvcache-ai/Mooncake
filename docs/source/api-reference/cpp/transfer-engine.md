@@ -72,12 +72,19 @@ The `TransferRequest` structure is defined as follows:
 struct TransferRequest
 {
     enum OpCode { READ, WRITE };
+    enum Priority { PRIO_HIGH = 0, PRIO_MEDIUM = 1, PRIO_LOW = 2 };
+    static constexpr uint64_t kNoTaskGroup = 0;
+
     OpCode opcode;
     void *source;
     SegmentID target_id; // The ID of the target segment, which may correspond to local or remote DRAM/VRAM/NVMeof, with the specific routing logic hidden
     uint64_t target_offset;
     size_t length;
     int advise_retry_cnt = 0;
+    int transport_hint = 0;
+    uint64_t task_group_id = kNoTaskGroup;
+    int priority = PRIO_MEDIUM;
+    int nic_hint = -1;
 };
 ```
 
@@ -87,6 +94,7 @@ struct TransferRequest
   - RAM space type, covering DRAM/VRAM. As mentioned earlier, there is only one segment under the same process (or `TransferEngine` instance), which contains various types of Buffers (DRAM/VRAM). In this case, the segment name passed to the `openSegment` interface is equivalent to the server hostname. `target_offset` is the virtual address of the target server.
   - NVMeOF space type, where each file corresponds to a segment. In this case, the segment name passed to the `openSegment` interface is equivalent to the unique identifier of the file. `target_offset` is the offset of the target file.
 - `length` represents the amount of data transferred. TransferEngine may further split this into multiple read/write requests internally.
+- `nic_hint` optionally prefers a local RNIC by its index in `getLocalTopology()->getHcaList()` in the classic RDMA transport. The default `-1`, an out-of-range index, or an unavailable device falls back to normal topology-based selection. The hint affects initial submission only and is not a hard pin for an in-flight slice.
 
 #### TransferEngine::allocateBatchID
 
@@ -146,6 +154,13 @@ Status getBatchTransferStatus(BatchID batch_id, TransferStatus& status);
 ```
 
 Obtains the aggregated status of the batch and the total transferred bytes.
+
+While the batch is still `WAITING`, RDMA-only batches that use the
+completion-counter fast path report `status.transferred_bytes = 0`. That
+is still a valid lower bound; the accurate total is filled in when the
+batch reaches `COMPLETED`. TCP, NVLink, mixed batches, failures, and
+`MC_SLICE_TIMEOUT > 0` keep walking every task and still accumulate bytes
+while in flight.
 
 - `batch_id`: The `BatchID` it belongs to;
 - `status`: Output Transfer status;

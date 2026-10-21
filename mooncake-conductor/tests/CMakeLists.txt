@@ -18,10 +18,12 @@ add_executable(
   msgpack_reader_test.cpp
   msg_decoder_test.cpp
   zmq_client_test.cpp
+  zmq_transport_test.cpp
   event_manager_test.cpp
   conductor_service_test.cpp
   wire_types_test.cpp
-  client_server_e2e_test.cpp)
+  client_server_e2e_test.cpp
+  conductor_c_test.cpp)
 
 target_link_libraries(conductor_test PRIVATE conductor_cpp_core
                                              ${CONDUCTOR_GTEST_LIBS})
