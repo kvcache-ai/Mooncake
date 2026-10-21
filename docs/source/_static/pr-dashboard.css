@@ -133,11 +133,19 @@ html[data-theme="dark"] .pr-dashboard {
     font-size: 0.8rem;
 }
 
+.prd-card-sample {
+    margin-top: 0.5rem;
+}
+
 .prd-card-states {
     display: flex;
     flex-wrap: wrap;
     gap: 0.3rem;
     margin: 0.6rem 0 0.4rem;
+}
+
+.prd-card-sample + .prd-card-states {
+    margin-top: 0.2rem;
 }
 
 .prd-repo-sglang { --prd-accent: var(--prd-sglang); }

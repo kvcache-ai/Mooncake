@@ -452,6 +452,9 @@
             ),
             el("div", { class: "prd-card-total", text: data ? data.total.toLocaleString() : "–" }),
             el("div", { class: "prd-card-caption", text: "matching pull requests" }),
+            items.length < (data ? data.total : 0)
+              ? el("div", { class: "prd-card-caption prd-card-sample", text: `Latest ${items.length} by state:` })
+              : null,
             el(
               "div",
               { class: "prd-card-states" },
