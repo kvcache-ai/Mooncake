@@ -1958,6 +1958,32 @@ tl::expected<void, ErrorCode> MasterService::PersistStaleHandleCleanupForHA(
     return {};
 }
 
+auto MasterService::ReadCursor(const TenantId& tenant_id) const
+    -> TenantCursor<LockMode::kRead> {
+    return TenantCursor<LockMode::kRead>(*this, tenant_id);
+}
+
+auto MasterService::WriteCursor(const TenantId& tenant_id)
+    -> TenantCursor<LockMode::kWrite> {
+    return TenantCursor<LockMode::kWrite>(*this, tenant_id);
+}
+
+void MasterService::VisitTenants(
+    const std::function<void(const TenantId&)>& visit) const {
+    std::unordered_set<TenantId, TenantIdHash> tenants;
+    for (size_t i = 0; i < kNumShards; ++i) {
+        MetadataShardAccessorRO shard(this, i);
+        for (const auto& [tenant_id, tenant_state] : shard->tenants) {
+            if (!tenant_state.Empty()) {
+                tenants.insert(tenant_id);
+            }
+        }
+    }
+    for (const TenantId& tenant_id : tenants) {
+        visit(tenant_id);
+    }
+}
+
 void MasterService::CleanupInvalidMemoryReplicas(MetadataAccessorRW& accessor) {
     // Only memory replicas are checked here, to avoid a lock order violation
     // (client_mutex_ must be acquired before a metadata shard). local_disk
@@ -4218,6 +4244,9 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
                 continue;
             }
             EraseMetadata(tenant_it->second, meta_it, tenant);
+            if (tenant_it->second.Empty()) {
+                shard->tenants.erase(tenant_it);
+            }
         }
         standby_accounted_memory_bytes_ = prev_standby_accounted_memory_bytes;
         standby_memory_segments_ = prev_standby_memory_segments;
@@ -7694,6 +7723,18 @@ tl::expected<void, ErrorCode> MasterService::MoveRevoke(
     return {};
 }
 
+// How a single-key remove reports a refusal: a held lease is routine, while
+// the other refusals mean a write or a copy is still on the object.
+static void LogRemoveRefused(const std::string& key, ErrorCode error) {
+    if (error == ErrorCode::OBJECT_HAS_LEASE) {
+        VLOG(1) << "key=" << key << ", error=object_has_lease";
+    } else if (error == ErrorCode::REPLICA_IS_NOT_READY) {
+        LOG(ERROR) << "key=" << key << ", error=replica_not_ready";
+    } else {
+        LOG(ERROR) << "key=" << key << ", error=object_has_replication_task";
+    }
+}
+
 auto MasterService::Remove(const std::string& key, const TenantId& tenant_id,
                            bool force) -> tl::expected<void, ErrorCode> {
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
@@ -7705,12 +7746,57 @@ auto MasterService::Remove(const std::string& key, const TenantId& tenant_id,
     }
 
     auto& metadata = accessor.Get();
-
-    if (!force && !metadata.IsLeaseExpired()) {
-        VLOG(1) << "key=" << key << ", error=object_has_lease";
-        return tl::make_unexpected(ErrorCode::OBJECT_HAS_LEASE);
+    auto removable = CheckRemovable(metadata, accessor.GetState(), force,
+                                    std::chrono::system_clock::now());
+    if (!removable) {
+        LogRemoveRefused(key, removable.error());
+        return removable;
     }
 
+    if (enable_ha_ && enable_oplog_) {
+        return MarkRemovedAndPersist(object_id.tenant_id, key, metadata);
+    }
+    accessor.Erase();
+    return {};
+}
+
+tl::expected<void, ErrorCode> MasterService::MarkRemovedAndPersist(
+    const TenantId& tenant_id, const std::string& key,
+    ObjectMetadata& metadata) {
+    auto reservation = ReserveBatchOpLogSlot();
+    if (!reservation) {
+        return tl::make_unexpected(reservation.error());
+    }
+    std::vector<ReplicaID> removed_ids;
+    metadata.VisitReplicas(&Replica::fn_is_completed,
+                           [&removed_ids](const Replica& replica) {
+                               removed_ids.push_back(replica.id());
+                           });
+    auto persist_result = AppendReservedOpLogWithDurableFinalize(
+        std::move(reservation.value()), OpType::REMOVE, tenant_id.value(), key,
+        {},
+        [this, removed_ids =
+                   std::move(removed_ids)](const OpLogEntry& durable_entry) {
+            FinalizeRemovedReplicasAfterDurable(durable_entry, removed_ids,
+                                                QuotaEraseMode::kFull);
+        });
+    if (!persist_result) {
+        return tl::make_unexpected(persist_result.error());
+    }
+    // Marked only once the REMOVE is queued, so a failed append leaves the
+    // object as it was. The durable finalizer takes this object's shard lock,
+    // which the caller holds, so it cannot run before the marks land.
+    metadata.VisitReplicas(&Replica::fn_is_completed,
+                           [](Replica& replica) { replica.mark_removed(); });
+    return {};
+}
+
+tl::expected<void, ErrorCode> MasterService::CheckRemovable(
+    const ObjectMetadata& metadata, const route::ObjectState& state, bool force,
+    std::chrono::system_clock::time_point now) {
+    if (!force && !metadata.IsLeaseExpired(now)) {
+        return tl::make_unexpected(ErrorCode::OBJECT_HAS_LEASE);
+    }
     /**
      * The reason the force operation here does not bypass the replica
      * check is that put operations (which could also be copy or move)
@@ -7718,50 +7804,79 @@ auto MasterService::Remove(const std::string& key, const TenantId& tenant_id,
      * extremely dangerous to perform a direct removal at this point.
      */
     if (!metadata.AllReplicas(&Replica::fn_is_completed)) {
-        LOG(ERROR) << "key=" << key << ", error=replica_not_ready";
         return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
     }
-
-    if (accessor.HasReplicationTask()) {
-        LOG(ERROR) << "key=" << key << ", error=object_has_replication_task";
+    if (state.replication_task) {
         return tl::make_unexpected(ErrorCode::OBJECT_HAS_REPLICATION_TASK);
     }
+    return {};
+}
 
-    if (enable_ha_) {
-        if (enable_oplog_) {
-            auto reservation = ReserveBatchOpLogSlot();
-            if (!reservation) {
-                return tl::make_unexpected(reservation.error());
-            }
-            std::vector<ReplicaID> removed_ids;
-            metadata.VisitReplicas(&Replica::fn_is_completed,
-                                   [&removed_ids](Replica& replica) {
-                                       removed_ids.push_back(replica.id());
-                                       replica.mark_removed();
-                                   });
-            auto persist_result = AppendReservedOpLogWithDurableFinalize(
-                std::move(reservation.value()), OpType::REMOVE,
-                object_id.tenant_id.value(), key, {},
-                [this, removed_ids = std::move(removed_ids)](
-                    const OpLogEntry& durable_entry) {
-                    FinalizeRemovedReplicasAfterDurable(
-                        durable_entry, removed_ids, QuotaEraseMode::kFull);
-                });
-            if (!persist_result) {
-                return tl::make_unexpected(persist_result.error());
-            }
-            return {};
+MasterService::RemoveResult MasterService::RemoveTenantObjects(
+    const TenantId& tenant_id, bool force,
+    std::chrono::system_clock::time_point now,
+    const std::function<bool(const std::string& key)>& matches_key,
+    const std::function<void(const ObjectMetadata&)>& on_remove) {
+    RemoveResult result;
+    const auto removable = [&](const std::string& key,
+                               const ObjectMetadata& metadata,
+                               const route::ObjectState& state) {
+        auto checked = CheckRemovable(metadata, state, force, now);
+        if (!checked) {
+            VLOG(1) << "key=" << key << ", action=remove_skipped"
+                    << ", error=" << toString(checked.error());
+        }
+        return checked.has_value();
+    };
+    // The walk only names the objects that look removable: each is judged
+    // again under its own lock below, and one torn down or published again
+    // meanwhile is left alone.
+    std::vector<route::ObjectRef> candidates;
+    for (auto object : ReadCursor(tenant_id)) {
+        if (matches_key && !matches_key(object.key())) {
+            continue;
+        }
+        result.saw_object = true;
+        if (removable(object.key(), object.metadata(), object.state())) {
+            candidates.push_back(object.ref());
+        } else {
+            result.skipped_object = true;
         }
     }
-    accessor.Erase();
-    return {};
+    for (const auto& candidate : candidates) {
+        MetadataAccessorRW accessor(this, tenant_id, candidate);
+        if (!accessor.IsPublished()) {
+            continue;
+        }
+        auto& metadata = accessor.Get();
+        if (!removable(candidate.key, metadata, accessor.GetState())) {
+            result.skipped_object = true;
+            continue;
+        }
+        if (on_remove) {
+            on_remove(metadata);
+        }
+        const int64_t freed =
+            metadata.TotalLength() *
+            metadata.CountReplicas(&Replica::fn_is_memory_replica);
+        if (enable_ha_ && enable_oplog_) {
+            if (!MarkRemovedAndPersist(tenant_id, candidate.key, metadata)) {
+                result.skipped_object = true;
+                continue;
+            }
+        } else {
+            accessor.Erase();
+        }
+        result.freed_bytes += freed;
+        result.removed_count++;
+    }
+    return result;
 }
 
 auto MasterService::RemoveByRegex(const std::string& regex_pattern,
                                   const TenantId& tenant_id, bool force)
     -> tl::expected<long, ErrorCode> {
     assert(tenant_id.IsValid());
-    long removed_count = 0;
     std::regex pattern;
 
     try {
@@ -7773,98 +7888,17 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern,
     }
 
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
-    const TenantId& normalized_tenant = ResolveRequestTenantId(tenant_id);
-    for (size_t i = 0; i < kNumShards; ++i) {
-        MetadataShardAccessorRW shard(this, i);
-        auto tenant_it = shard->tenants.find(normalized_tenant);
-        if (tenant_it == shard->tenants.end()) {
-            continue;
-        }
-        auto& tenant_state = tenant_it->second;
-
-        for (auto it = tenant_state.metadata.begin();
-             it != tenant_state.metadata.end();) {
-            if (std::regex_search(it->first, pattern)) {
-                if (!force && !it->second.metadata.IsLeaseExpired()) {
-                    VLOG(1) << "key=" << it->first
-                            << " matched by regex, but has lease. Skipping "
-                            << "removal.";
-                    ++it;
-                    continue;
-                }
-                /**
-                 * The reason the force operation here does not bypass the
-                 * replica check is that put operations (which could also be
-                 * copy or move) and remove operations might be happening
-                 * concurrently, making it extremely dangerous to perform a
-                 * direct removal at this point.
-                 */
-                if (!it->second.metadata.AllReplicas(
-                        &Replica::fn_is_completed)) {
-                    LOG(WARNING) << "key=" << it->first
-                                 << " matched by regex, but not all replicas "
-                                    "are complete. Skipping removal.";
-                    ++it;
-                    continue;
-                }
-                if (it->second.state.replication_task) {
-                    LOG(WARNING) << "key=" << it->first
-                                 << ", matched by regex, but has replication "
-                                    "task. Skipping removal.";
-                    ++it;
-                    continue;
-                }
-
-                VLOG(1) << "key=" << it->first
-                        << " matched by regex. Removing.";
-                if (enable_ha_) {
-                    if (enable_oplog_) {
-                        auto reservation = ReserveBatchOpLogSlot();
-                        if (!reservation) {
-                            ++it;
-                            continue;
-                        }
-                        std::vector<ReplicaID> removed_ids;
-                        it->second.metadata.VisitReplicas(
-                            &Replica::fn_is_completed,
-                            [&removed_ids](Replica& replica) {
-                                removed_ids.push_back(replica.id());
-                                replica.mark_removed();
-                            });
-                        auto persist_result =
-                            AppendReservedOpLogWithDurableFinalize(
-                                std::move(reservation.value()), OpType::REMOVE,
-                                normalized_tenant.value(), it->first, {},
-                                [this, removed_ids = std::move(removed_ids)](
-                                    const OpLogEntry& durable_entry) {
-                                    FinalizeRemovedReplicasAfterDurable(
-                                        durable_entry, removed_ids,
-                                        QuotaEraseMode::kFull);
-                                });
-                        if (!persist_result) {
-                            ++it;
-                            continue;
-                        }
-                        ++it;
-                        removed_count++;
-                        continue;
-                    }
-                }
-                it = EraseMetadata(tenant_state, it, normalized_tenant,
-                                   QuotaEraseMode::kFull, &shard);
-                removed_count++;
-            } else {
-                ++it;
-            }
-        }
-        if (tenant_state.Empty()) {
-            shard->tenants.erase(tenant_it);
-        }
-    }
+    const RemoveResult result = RemoveTenantObjects(
+        ResolveRequestTenantId(tenant_id), force,
+        std::chrono::system_clock::now(),
+        [&pattern](const std::string& key) {
+            return std::regex_search(key, pattern);
+        },
+        nullptr);
 
     VLOG(1) << "action=remove_by_regex, pattern=" << regex_pattern
-            << ", removed_count=" << removed_count;
-    return removed_count;
+            << ", removed_count=" << result.removed_count;
+    return result.removed_count;
 }
 
 long MasterService::RemoveAll(bool force) {
@@ -7873,11 +7907,11 @@ long MasterService::RemoveAll(bool force) {
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     auto now = std::chrono::system_clock::now();
     // Tracking which tenants ended up empty costs a hash insert per visited
-    // object, so it is skipped entirely when nobody is listening for `cleared`.
+    // tenant, so it is skipped entirely when nobody is listening for `cleared`.
     const bool track_cleared_tenants =
         KvEventsEnabled() || kv_track_tenant_epochs_;
     // Baselines must be read before the scan starts, not at first sight of each
-    // tenant: a commit can land in a shard the scan already passed while the
+    // tenant: a commit can land in a tenant the walk already passed while that
     // tenant is still unseen, and a per-tenant read would then fold that commit
     // into its own baseline and wrongly conclude nothing raced.
     const auto epoch_baseline = SnapshotKvTenantEpochs(track_cleared_tenants);
@@ -7890,110 +7924,27 @@ long MasterService::RemoveAll(bool force) {
     local_ssd_manager_.RequestRemoveAll();
 
     // Delete metadata — runs concurrently with client SSD cleanup.
-    for (size_t i = 0; i < kNumShards; i++) {
-        // Scoped in a lambda so the shard lock is released before the hook
-        // runs; a hook that commits into shard i would otherwise deadlock.
-        auto scan_shard = [&] {
-            MetadataShardAccessorRW shard(this, i);
-            for (auto tenant_it = shard->tenants.begin();
-                 tenant_it != shard->tenants.end();) {
-                auto& tenant_state = tenant_it->second;
-                auto it = tenant_state.metadata.begin();
-                while (it != tenant_state.metadata.end()) {
-                    // Record the tenant only once the loop actually reaches an
-                    // object. A tenant row can outlive its objects, and
-                    // recording it unconditionally made every empty-but-present
-                    // tenant look like a fresh wipe and emit a spurious
-                    // `cleared`.
-                    if (track_cleared_tenants) {
-                        tenants_seen.insert(tenant_it->first.value());
-                    }
-                    if ((force || it->second.metadata.IsLeaseExpired(now)) &&
-                        it->second.metadata.AllReplicas(
-                            &Replica::fn_is_completed) &&
-                        !it->second.state.replication_task) {
-                        auto mem_rep_count = it->second.metadata.CountReplicas(
-                            &Replica::fn_is_memory_replica);
-
-                        if (enable_ha_) {
-                            if (enable_oplog_) {
-                                auto reservation = ReserveBatchOpLogSlot();
-                                if (!reservation) {
-                                    // Skipped, so the tenant is not empty.
-                                    if (track_cleared_tenants) {
-                                        tenants_with_remaining_objects.insert(
-                                            tenant_it->first.value());
-                                    }
-                                    ++it;
-                                    continue;
-                                }
-                                std::vector<ReplicaID> removed_ids;
-                                it->second.metadata.VisitReplicas(
-                                    &Replica::fn_is_completed,
-                                    [&removed_ids](Replica& replica) {
-                                        removed_ids.push_back(replica.id());
-                                        replica.mark_removed();
-                                    });
-                                auto persist_result =
-                                    AppendReservedOpLogWithDurableFinalize(
-                                        std::move(reservation.value()),
-                                        OpType::REMOVE,
-                                        tenant_it->first.value(), it->first, {},
-                                        [this,
-                                         removed_ids = std::move(removed_ids)](
-                                            const OpLogEntry& durable_entry) {
-                                            FinalizeRemovedReplicasAfterDurable(
-                                                durable_entry, removed_ids,
-                                                QuotaEraseMode::kFull);
-                                        });
-                                if (!persist_result) {
-                                    if (track_cleared_tenants) {
-                                        tenants_with_remaining_objects.insert(
-                                            tenant_it->first.value());
-                                    }
-                                    ++it;
-                                    continue;
-                                }
-                                total_freed_size +=
-                                    it->second.metadata.TotalLength() *
-                                    mem_rep_count;
-                                ++it;
-                                removed_count++;
-                                continue;
-                            }
-                        }
-
-                        total_freed_size +=
-                            it->second.metadata.TotalLength() * mem_rep_count;
-                        ErasePromotionTaskIfPresent(
-                            GetBoundTenantQuotaHandle(tenant_state),
-                            it->second.state);
-                        it = EraseMetadata(tenant_state, it, tenant_it->first,
-                                           QuotaEraseMode::kFull, &shard);
-                        removed_count++;
-                    } else {
-                        // Only a skipped object means the tenant is not empty.
-                        // Under HA+oplog the erase is deferred to the durable
-                        // callback, so a non-empty metadata map does not.
-                        if (track_cleared_tenants) {
-                            tenants_with_remaining_objects.insert(
-                                tenant_it->first.value());
-                        }
-                        ++it;
-                    }
-                }
-                if (tenant_state.Empty()) {
-                    tenant_it = shard->tenants.erase(tenant_it);
-                } else {
-                    ++tenant_it;
-                }
+    VisitTenants([&](const TenantId& tenant_id) {
+        const RemoveResult result =
+            RemoveTenantObjects(tenant_id, force, now, nullptr, nullptr);
+        removed_count += result.removed_count;
+        total_freed_size += result.freed_bytes;
+        // Record the tenant only once the walk actually reached an object. A
+        // tenant row can outlive its objects, and recording it unconditionally
+        // made every empty-but-present tenant look like a fresh wipe and emit
+        // a spurious `cleared`. Under HA+oplog the erase is deferred to the
+        // durable callback, so only a skipped object means the tenant is not
+        // empty.
+        if (track_cleared_tenants && result.saw_object) {
+            tenants_seen.insert(tenant_id.value());
+            if (result.skipped_object) {
+                tenants_with_remaining_objects.insert(tenant_id.value());
             }
-        };
-        scan_shard();
-        if (kv_remove_all_shard_hook_) {
-            kv_remove_all_shard_hook_(i);
         }
-    }
+        if (kv_remove_all_tenant_hook_) {
+            kv_remove_all_tenant_hook_(tenant_id);
+        }
+    });
 
     // tenants_seen holds only tenants that actually held an object, so this
     // difference is "held objects and lost all of them" — a real wipe. Both
@@ -8015,18 +7966,9 @@ long MasterService::RemoveAll(bool force) {
 }
 
 long MasterService::RemoveAll(const TenantId& tenant_id, bool force) {
-    long removed_count = 0;
-    int64_t total_freed_size = 0;
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     auto now = std::chrono::system_clock::now();
     const TenantId& normalized_tenant = ResolveRequestTenantId(tenant_id);
-    // A `cleared` event means "this tenant is now empty". Deciding that from
-    // tenant_state.metadata being empty is wrong in both directions: a tenant
-    // that never existed looks empty, and under HA+oplog the erase is deferred
-    // to the durable callback so a full wipe still looks non-empty. Count what
-    // the loop actually did instead.
-    bool saw_any_object = false;
-    bool skipped_any_object = false;
     // This overload knows its tenant up front, so the epoch can be read before
     // the scan starts rather than at first sight of an object.
     const uint64_t entry_epoch = ReadKvTenantEpoch(normalized_tenant.value());
@@ -8036,110 +7978,40 @@ long MasterService::RemoveAll(const TenantId& tenant_id, bool force) {
     // tenants' SSD data.
     std::unordered_set<UUID, boost::hash<UUID>> clients_with_disk_replicas;
 
-    for (size_t i = 0; i < kNumShards; i++) {
-        // Scoped in a lambda so the shard lock is released before the hook
-        // runs; a hook that commits into shard i would otherwise deadlock.
-        auto scan_shard = [&] {
-            MetadataShardAccessorRW shard(this, i);
-            auto tenant_it = shard->tenants.find(normalized_tenant);
-            if (tenant_it == shard->tenants.end()) {
-                return;
-            }
-            auto& tenant_state = tenant_it->second;
-            auto it = tenant_state.metadata.begin();
-            while (it != tenant_state.metadata.end()) {
-                saw_any_object = true;
-                if ((force || it->second.metadata.IsLeaseExpired(now)) &&
-                    it->second.metadata.AllReplicas(
-                        &Replica::fn_is_completed) &&
-                    !it->second.state.replication_task) {
-                    it->second.metadata.VisitReplicas(
-                        &Replica::fn_is_local_disk_replica,
-                        [&clients_with_disk_replicas](const Replica& replica) {
-                            auto cid = replica.get_local_disk_client_id();
-                            if (cid) {
-                                clients_with_disk_replicas.insert(*cid);
-                            }
-                        });
-                    auto mem_rep_count = it->second.metadata.CountReplicas(
-                        &Replica::fn_is_memory_replica);
-                    if (enable_ha_) {
-                        if (enable_oplog_) {
-                            auto reservation = ReserveBatchOpLogSlot();
-                            if (!reservation) {
-                                // Skipped, so this is not a wipe.
-                                skipped_any_object = true;
-                                ++it;
-                                continue;
-                            }
-                            std::vector<ReplicaID> removed_ids;
-                            it->second.metadata.VisitReplicas(
-                                &Replica::fn_is_completed,
-                                [&removed_ids](Replica& replica) {
-                                    removed_ids.push_back(replica.id());
-                                    replica.mark_removed();
-                                });
-                            auto persist_result =
-                                AppendReservedOpLogWithDurableFinalize(
-                                    std::move(reservation.value()),
-                                    OpType::REMOVE, normalized_tenant.value(),
-                                    it->first, {},
-                                    [this,
-                                     removed_ids = std::move(removed_ids)](
-                                        const OpLogEntry& durable_entry) {
-                                        FinalizeRemovedReplicasAfterDurable(
-                                            durable_entry, removed_ids,
-                                            QuotaEraseMode::kFull);
-                                    });
-                            if (!persist_result) {
-                                skipped_any_object = true;
-                                ++it;
-                                continue;
-                            }
-                            total_freed_size +=
-                                it->second.metadata.TotalLength() *
-                                mem_rep_count;
-                            ++it;
-                            removed_count++;
-                            continue;
-                        }
+    // A `cleared` event means "this tenant is now empty". Deciding that from
+    // the tenant's remaining objects is wrong in both directions: a tenant
+    // that never existed looks empty, and under HA+oplog the erase is deferred
+    // to the durable callback so a full wipe still looks non-empty. Count what
+    // the walk actually did instead.
+    const RemoveResult result = RemoveTenantObjects(
+        normalized_tenant, force, now, nullptr,
+        [&clients_with_disk_replicas](const ObjectMetadata& metadata) {
+            metadata.VisitReplicas(
+                &Replica::fn_is_local_disk_replica,
+                [&clients_with_disk_replicas](const Replica& replica) {
+                    auto cid = replica.get_local_disk_client_id();
+                    if (cid) {
+                        clients_with_disk_replicas.insert(*cid);
                     }
-                    total_freed_size +=
-                        it->second.metadata.TotalLength() * mem_rep_count;
-                    ErasePromotionTaskIfPresent(
-                        GetBoundTenantQuotaHandle(tenant_state),
-                        it->second.state);
-                    it = EraseMetadata(tenant_state, it, normalized_tenant,
-                                       QuotaEraseMode::kFull, &shard);
-                    removed_count++;
-                } else {
-                    skipped_any_object = true;
-                    ++it;
-                }
-            }
-            if (tenant_state.Empty()) {
-                shard->tenants.erase(tenant_it);
-            }
-        };
-        scan_shard();
-        if (kv_remove_all_shard_hook_) {
-            kv_remove_all_shard_hook_(i);
-        }
+                });
+        });
+    if (kv_remove_all_tenant_hook_) {
+        kv_remove_all_tenant_hook_(normalized_tenant);
     }
 
     local_ssd_manager_.RequestRemoveAll(std::vector<UUID>(
         clients_with_disk_replicas.begin(), clients_with_disk_replicas.end()));
 
-    if (saw_any_object && !skipped_any_object) {
+    if (result.saw_object && !result.skipped_object) {
         PublishKvClearedIfEpochUnchanged(normalized_tenant, entry_epoch);
     }
 
     VLOG(1) << "action=remove_all_objects"
             << ", tenant_id=" << normalized_tenant.value()
-            << ", removed_count=" << removed_count
-            << ", total_freed_size=" << total_freed_size
+            << ", removed_count=" << result.removed_count
+            << ", total_freed_size=" << result.freed_bytes
             << ", signaled_clients=" << clients_with_disk_replicas.size();
-    return removed_count;
+    return result.removed_count;
 }
 
 auto MasterService::BatchRemove(const std::vector<std::string>& keys,
@@ -8148,151 +8020,75 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
     std::vector<tl::expected<void, ErrorCode>> results(keys.size());
     const TenantId& normalized_tenant = ResolveRequestTenantId(tenant_id);
 
-    // Group keys by shard to reduce lock contention
-    std::unordered_map<size_t,
-                       std::vector<std::pair<size_t, const std::string*>>>
-        keys_by_shard;
-    keys_by_shard.reserve(
-        std::min(keys.size(), static_cast<size_t>(kNumShards)));
-
-    for (size_t i = 0; i < keys.size(); ++i) {
-        size_t shard_idx = getShardIndex(normalized_tenant, keys[i]);
-        keys_by_shard[shard_idx].emplace_back(i, &keys[i]);
-    }
-
     std::shared_lock<std::shared_mutex> client_lock(client_mutex_);
     std::shared_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
     auto retaining_clients = GetRetainingClientIdsLocked();
     client_lock.unlock();
 
-    // Process each shard once, acquiring lock per shard
-    for (auto& [shard_idx, key_group] : keys_by_shard) {
-        MetadataShardAccessorRW shard(this, shard_idx);
-        auto now = std::chrono::system_clock::now();
-
-        for (const auto& [original_idx, key_ptr] : key_group) {
-            const std::string& key = *key_ptr;
-            auto tenant_it = shard->tenants.find(normalized_tenant);
-            if (tenant_it == shard->tenants.end()) {
-                VLOG(1) << "key=" << key << ", error=object_not_found";
-                results[original_idx] =
-                    tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
-                continue;
-            }
-            auto& tenant_state = tenant_it->second;
-            auto it = tenant_state.metadata.find(key);
-
-            if (it == tenant_state.metadata.end()) {
-                VLOG(1) << "key=" << key << ", error=object_not_found";
-                results[original_idx] =
-                    tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
-                continue;
-            }
-
-            // Clean up stale replica handles (consistent with single Remove).
-            auto cleanup_plan = BuildStaleHandleCleanupPlan(it->second.metadata,
-                                                            retaining_clients);
-            if (!cleanup_plan.removed_ids.empty()) {
-                auto persist_result = PersistStaleHandleCleanupForHA(
-                    "BatchRemove(stale cleanup)", normalized_tenant, key,
-                    it->second.metadata, cleanup_plan);
-                if (!persist_result) {
-                    results[original_idx] =
-                        tl::make_unexpected(persist_result.error());
-                    continue;
-                }
-                if (enable_oplog_) {
-                    results[original_idx] = tl::make_unexpected(
-                        cleanup_plan.would_invalidate
-                            ? ErrorCode::OBJECT_NOT_FOUND
-                            : ErrorCode::OBJECT_ALREADY_EXISTS);
-                    continue;
-                } else if (CleanupStaleHandles(
-                               key, normalized_tenant,
-                               GetBoundTenantQuotaHandle(tenant_state),
-                               it->second, retaining_clients, &shard)) {
-                    EraseMetadata(tenant_state, it, normalized_tenant,
-                                  QuotaEraseMode::kFull, &shard);
-                    if (tenant_state.Empty()) {
-                        shard->tenants.erase(tenant_it);
-                    }
-                    results[original_idx] =
-                        tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
-                    continue;
-                }
-            }
-            if (!it->second.metadata.IsValid()) {
-                results[original_idx] =
-                    tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
-                continue;
-            }
-
-            auto& metadata = it->second.metadata;
-
-            if (!force && !metadata.IsLeaseExpired(now)) {
-                VLOG(1) << "key=" << key << ", error=object_has_lease";
-                results[original_idx] =
-                    tl::make_unexpected(ErrorCode::OBJECT_HAS_LEASE);
-                continue;
-            }
-
-            if (!metadata.AllReplicas(&Replica::fn_is_completed)) {
-                LOG(ERROR) << "key=" << key << ", error=replica_not_ready";
-                results[original_idx] =
-                    tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
-                continue;
-            }
-
-            if (it->second.state.replication_task) {
-                LOG(ERROR) << "key=" << key
-                           << ", error=object_has_replication_task";
-                results[original_idx] =
-                    tl::make_unexpected(ErrorCode::OBJECT_HAS_REPLICATION_TASK);
-                continue;
-            }
-
-            // Remove object metadata
-            if (enable_ha_) {
-                if (enable_oplog_) {
-                    auto reservation = ReserveBatchOpLogSlot();
-                    if (!reservation) {
-                        results[original_idx] =
-                            tl::make_unexpected(reservation.error());
-                        continue;
-                    }
-                    std::vector<ReplicaID> removed_ids;
-                    metadata.VisitReplicas(
-                        &Replica::fn_is_completed,
-                        [&removed_ids](Replica& replica) {
-                            removed_ids.push_back(replica.id());
-                            replica.mark_removed();
-                        });
-                    auto persist_result =
-                        AppendReservedOpLogWithDurableFinalize(
-                            std::move(reservation.value()), OpType::REMOVE,
-                            normalized_tenant.value(), key, {},
-                            [this, removed_ids = std::move(removed_ids)](
-                                const OpLogEntry& durable_entry) {
-                                FinalizeRemovedReplicasAfterDurable(
-                                    durable_entry, removed_ids,
-                                    QuotaEraseMode::kFull);
-                            });
-                    if (!persist_result) {
-                        results[original_idx] =
-                            tl::make_unexpected(persist_result.error());
-                        continue;
-                    }
-                    results[original_idx] = {};
-                    continue;
-                }
-            }
-            EraseMetadata(tenant_state, it, normalized_tenant,
-                          QuotaEraseMode::kFull, &shard);
-            if (tenant_state.Empty()) {
-                shard->tenants.erase(tenant_it);
-            }
-            results[original_idx] = {};  // Success
+    const auto now = std::chrono::system_clock::now();
+    for (size_t original_idx = 0; original_idx < keys.size(); ++original_idx) {
+        const std::string& key = keys[original_idx];
+        // Every check and the erase run under the key's lock, so a
+        // concurrent write on this key cannot slip between them.
+        MetadataAccessorRW accessor(this,
+                                    MakeObjectIdentity(key, normalized_tenant));
+        if (!accessor.IsPublished()) {
+            VLOG(1) << "key=" << key << ", error=object_not_found";
+            results[original_idx] =
+                tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+            continue;
         }
+
+        // Clean up stale replica handles (consistent with single Remove).
+        auto cleanup_plan =
+            BuildStaleHandleCleanupPlan(accessor.Get(), retaining_clients);
+        if (!cleanup_plan.removed_ids.empty()) {
+            auto persist_result = PersistStaleHandleCleanupForHA(
+                "BatchRemove(stale cleanup)", normalized_tenant, key,
+                accessor.Get(), cleanup_plan);
+            if (!persist_result) {
+                results[original_idx] =
+                    tl::make_unexpected(persist_result.error());
+                continue;
+            }
+            if (enable_oplog_) {
+                results[original_idx] =
+                    tl::make_unexpected(cleanup_plan.would_invalidate
+                                            ? ErrorCode::OBJECT_NOT_FOUND
+                                            : ErrorCode::OBJECT_ALREADY_EXISTS);
+                continue;
+            } else if (CleanupStaleHandles(
+                           key, normalized_tenant, accessor.QuotaAccount(),
+                           accessor.it_->second, retaining_clients,
+                           &accessor.shard_guard_)) {
+                accessor.Erase();
+                results[original_idx] =
+                    tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+                continue;
+            }
+        }
+        if (!accessor.Exists()) {
+            results[original_idx] =
+                tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+            continue;
+        }
+
+        auto& metadata = accessor.Get();
+        auto removable =
+            CheckRemovable(metadata, accessor.GetState(), force, now);
+        if (!removable) {
+            LogRemoveRefused(key, removable.error());
+            results[original_idx] = removable;
+            continue;
+        }
+
+        if (enable_ha_ && enable_oplog_) {
+            results[original_idx] =
+                MarkRemovedAndPersist(normalized_tenant, key, metadata);
+            continue;
+        }
+        accessor.Erase();
+        results[original_idx] = {};  // Success
     }
 
     return results;
