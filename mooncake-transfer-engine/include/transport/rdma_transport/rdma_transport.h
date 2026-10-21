@@ -35,6 +35,7 @@
 
 namespace mooncake {
 
+struct DmabufExport;
 class RdmaContext;
 class RdmaEndPoint;
 class TransferMetadata;
@@ -94,11 +95,14 @@ class RdmaTransport : public Transport {
     int unregisterLocalMemoryInternal(void *addr, bool update_metadata,
                                       bool force_sequential);
 
-    // amdgpu charges a NIC's dma-buf pin of KFD-allocated VRAM against the KFD
-    // free pool a second time; only pins taken through its peer-memory client
-    // are offset. Holding one such pin per allocation keeps hipMemGetInfo and
-    // later device allocations exact while the data MRs stay on dma-buf.
-    bool acquireKfdPinAnchor(void *addr, void *alloc_base);
+    // amdgpu before 6.19.14 charges a NIC's dma-buf pin of KFD-allocated VRAM
+    // against the KFD free pool a second time; only pins taken through its
+    // peer-memory client are offset. Holding one such pin per allocation keeps
+    // hipMemGetInfo and later device allocations exact while the data MRs stay
+    // on dma-buf. MC_HIP_KFD_PIN_FIX and a probe at the first registration
+    // decide whether the driver needs it.
+    bool acquireKfdPinAnchor(void *addr, size_t length,
+                             const DmabufExport &exp);
     void releaseKfdPinAnchor(void *addr);
 
    public:

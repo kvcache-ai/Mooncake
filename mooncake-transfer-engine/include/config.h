@@ -39,6 +39,12 @@ enum class EfaNicSelection {
     LOCAL = 1,  // device memory only on that GPU's topology-local NICs
 };
 
+enum class HipKfdPinFix {
+    OFF = 0,    // never hold a KFD pin anchor
+    PROBE = 1,  // hold anchors if a probe shows the driver needs them
+    FORCE = 2,  // hold anchors without probing
+};
+
 struct GlobalConfig {
     size_t num_cq_per_ctx = 1;
     size_t num_comp_channels_per_ctx = 1;
@@ -142,6 +148,10 @@ struct GlobalConfig {
     // memory). Set via MC_RDMA_DATA_DIRECT_PAIRING; requires
     // MC_RDMA_DATA_DIRECT.
     bool rdma_data_direct_pairing = false;
+    // Hold one peer-memory pin per HIP allocation registered through dma-buf
+    // so that amdgpu before 6.19.14 does not charge it to KFD free VRAM twice.
+    // Set via MC_HIP_KFD_PIN_FIX=0|1|force.
+    HipKfdPinFix hip_kfd_pin_fix = HipKfdPinFix::PROBE;
     size_t eic_max_block_size = 64UL * 1024 * 1024;
     EndpointStoreType endpoint_store_type = EndpointStoreType::SIEVE;
     int ib_traffic_class = -1;
