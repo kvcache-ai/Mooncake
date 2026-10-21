@@ -7,6 +7,25 @@ target_include_directories(
             $<INSTALL_INTERFACE:include>)
 target_compile_features(tent_interface INTERFACE cxx_std_20)
 
+# tent/build_id.h: the source revision and compiler of this build, which
+# transport plugins are checked against (include/tent/transport_plugin.h).
+find_package(Git QUIET)
+if(GIT_FOUND)
+  execute_process(
+    COMMAND ${GIT_EXECUTABLE} rev-parse HEAD
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    OUTPUT_VARIABLE TENT_SOURCE_REVISION
+    OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+endif()
+if(NOT TENT_SOURCE_REVISION)
+  set(TENT_SOURCE_REVISION "unknown")
+endif()
+configure_file(../include/tent/build_id.h.in
+               ${CMAKE_CURRENT_BINARY_DIR}/generated/tent/build_id.h @ONLY)
+target_include_directories(
+  tent_interface
+  INTERFACE $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/generated>)
+
 if(TARGET asio_shared)
   target_link_libraries(tent_interface INTERFACE asio_shared)
 endif()

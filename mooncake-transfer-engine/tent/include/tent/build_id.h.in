@@ -1,0 +1,9 @@
+#ifndef TENT_BUILD_ID_H
+#define TENT_BUILD_ID_H
+
+// The source revision and the compiler of this TENT build, recorded when CMake
+// configures it (src/CMakeLists.txt). See TENT_BUILD_ID in transport_plugin.h.
+#define TENT_BUILD_SOURCE \
+    "@TENT_SOURCE_REVISION@ @CMAKE_CXX_COMPILER_ID@-@CMAKE_CXX_COMPILER_VERSION@"
+
+#endif  // TENT_BUILD_ID_H
