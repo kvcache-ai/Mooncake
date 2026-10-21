@@ -257,6 +257,7 @@ add_store_test(client_object_checksum_config_test
 add_store_test(cxl_segment_config_test cxl_segment_config_test.cpp)
 add_store_test(client_numa_config_test client_numa_config_test.cpp)
 add_store_test(local_hot_cache_config_test local_hot_cache_config_test.cpp)
+add_store_test(local_hot_cache_handler_test local_hot_cache_handler_test.cpp)
 add_store_test(client_local_hot_cache_test client_local_hot_cache_test.cpp)
 add_store_test(local_hot_cache_concurrency_test
                local_hot_cache_concurrency_test.cpp)
