@@ -733,5 +733,98 @@ TEST_F(PartRpcTest, ARankWhoseSegmentWentAwayRewritesItsShard) {
     }
 }
 
+// The master learns a part count and nothing about the layout behind it: which
+// (stage, rank) a part index stands for is the key's own convention, and 8x4
+// and 16x2 have the same product. Two objects split under those two layouts
+// therefore have one shape as far as the master can tell, and neither write is
+// refused. Which shard a reader holds is answered by the part checksum, which
+// is why the write carries one.
+TEST_F(PartRpcTest, TwoLayoutsWithTheSamePartCountFillTheSameShape) {
+    constexpr uint32_t kParts = 32;
+    const std::string tenant(TenantId::kDefaultValue);
+
+    coro_rpc::coro_rpc_client client;
+    ASSERT_FALSE(async_simple::coro::syncAwait(
+        client.connect("127.0.0.1", std::to_string(port_))))
+        << "connect failed";
+
+    // Each rank writes the index its own mapping gives it, and the checksum it
+    // records names the (rank, stage) pair that index stands for there.
+    const auto write_block = [&](const std::string& key, uint32_t tp,
+                                 uint32_t pp) {
+        for (uint32_t stage = 0; stage < pp; ++stage) {
+            for (uint32_t rank = 0; rank < tp; ++rank) {
+                const ShardWrite write = WriteShard(
+                    client, client_id_, key, stage * tp + rank, kParts,
+                    uint64_t{1024}, ShardChecksum(rank, stage));
+                ASSERT_TRUE(write.failure.empty())
+                    << key << " part " << stage * tp + rank << ": "
+                    << write.failure;
+            }
+        }
+    };
+    const auto read_part = [&](const std::string& key, uint32_t part) {
+        return async_simple::coro::syncAwait(
+            client.call<&WrappedMasterService::GetReplicaList>(
+                key, tenant, struct_pack::compatible<uint32_t>{part}));
+    };
+
+    write_block("kv_block_tp8_pp4", /*tp=*/8, /*pp=*/4);
+    write_block("kv_block_tp16_pp2", /*tp=*/16, /*pp=*/2);
+
+    // Part 17 is stage 2 rank 1 under 8x4 and stage 1 rank 1 under 16x2: the
+    // same index, a different shard, and only the checksum tells them apart.
+    auto tp8 = read_part("kv_block_tp8_pp4", 17);
+    ASSERT_TRUE(tp8.has_value()) << "8x4: call failed";
+    ASSERT_TRUE(tp8->has_value()) << "8x4: " << toString(tp8->error());
+    EXPECT_EQ(*(*tp8)->object_checksum, ShardChecksum(/*rank=*/1, /*tag=*/2));
+
+    auto tp16 = read_part("kv_block_tp16_pp2", 17);
+    ASSERT_TRUE(tp16.has_value()) << "16x2: call failed";
+    ASSERT_TRUE(tp16->has_value()) << "16x2: " << toString(tp16->error());
+    EXPECT_EQ(*(*tp16)->object_checksum, ShardChecksum(/*rank=*/1, /*tag=*/1));
+}
+
+// A part's replica need not sit in the segment of the client that wrote it: the
+// write names the segment it wants, the master records the replica there, and a
+// reader addresses the replica's own endpoint. Keeping a rank's shard next to
+// that rank is a locality choice the client makes, not a constraint the master
+// enforces.
+TEST_F(PartRpcTest, APartReplicaLandsInTheSegmentTheWriteNames) {
+    constexpr uint32_t kParts = 2;
+    const std::string key = "kv_block_borrowed_segment";
+    const std::string tenant(TenantId::kDefaultValue);
+
+    const MountedRank spare =
+        MountRank(*service_, "kv_rank_spare", 0x500000000ULL, 16 * 1024 * 1024);
+    ASSERT_TRUE(spare.failure.empty()) << spare.failure;
+
+    coro_rpc::coro_rpc_client client;
+    ASSERT_FALSE(async_simple::coro::syncAwait(
+        client.connect("127.0.0.1", std::to_string(port_))))
+        << "connect failed";
+
+    // This client writes both parts, and asks for the spare rank's segment for
+    // the first of them.
+    const ShardWrite borrowed =
+        WriteShard(client, client_id_, key, /*part_index=*/0, kParts,
+                   uint64_t{1024}, ShardChecksum(0, 6), spare.segment.name);
+    ASSERT_TRUE(borrowed.failure.empty()) << borrowed.failure;
+    const ShardWrite own =
+        WriteShard(client, client_id_, key, /*part_index=*/1, kParts,
+                   uint64_t{1024}, ShardChecksum(1, 6));
+    ASSERT_TRUE(own.failure.empty()) << own.failure;
+
+    auto read = async_simple::coro::syncAwait(
+        client.call<&WrappedMasterService::GetReplicaList>(
+            key, tenant, struct_pack::compatible<uint32_t>{0}));
+    ASSERT_TRUE(read.has_value()) << "call failed";
+    ASSERT_TRUE(read->has_value()) << toString(read->error());
+    EXPECT_EQ(
+        std::get<MemoryDescriptor>((*read)->replicas[0].descriptor_variant)
+            .buffer_descriptor.transport_endpoint_,
+        spare.segment.name);
+}
+
 }  // namespace
 }  // namespace mooncake

@@ -70,6 +70,14 @@ inline constexpr uint64_t kPartSupportFeature = 1ULL << 0;
  * writes (tp=8, pp=16, K and V is 256), and KV replicated under MLA or GQA is
  * written as one part, so this leaves headroom over the layouts in use while
  * keeping one object's slots to a bounded amount of memory.
+ *
+ * The layout behind a count lives in the key's own namespace: which parallel
+ * degrees a deployment runs, and which (stage, rank) a part index stands for,
+ * are the writer's convention and hold for the whole life of the object. The
+ * master never sees a layout, so two layouts with the same product are one
+ * shape to it. A part count is a check that the writers agreed on that shape,
+ * not an identity for it; the part checksum is what tells a reader which shard
+ * it holds.
  */
 inline constexpr uint32_t kMaxPartsPerObject = 1024;
 
