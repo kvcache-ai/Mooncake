@@ -5,16 +5,14 @@
 // Moved out of MasterService so the service and the per-object metadata
 // module share one definition. The envelope owns the object identity, the
 // authoritative read lease, the soft-pin state and the tenant quota ledger.
-// The object's content lives in its slots: one slot per part, fixed in number
-// when the object is created, each holding that part's ObjectPart and the
-// record of the write that produced it.
+// The content of the object lives in its slots: one slot per part, its number
+// fixed at creation, each holding that part's ObjectPart and the record of the
+// write that produced it.
 //
-// It has no ownership lock of its own: whoever owns the envelope decides how
-// the envelope as a whole is guarded. The read path holds the owning metadata
-// shard's shared lock and every write path its exclusive lock, so a part's
-// content and its write record need no lock of their own. The `lock` member
-// below is internal and narrower — it protects only `lease_` and
-// `soft_pin_timeout`.
+// The envelope has no ownership lock of its own: the holder guards it. Reads
+// hold the metadata shard's shared lock and writes its exclusive lock, so part
+// content and write records need none. The `lock` member below is narrower: it
+// protects `lease_` and `soft_pin_timeout` only.
 
 #include <algorithm>
 #include <chrono>
@@ -49,18 +47,17 @@ struct ResolvedSoftPinRequest {
 };
 
 // The write that produced one part's content: who started it, when, and which
-// replicas it handed out. It outlives the write, because a later PutEnd or
-// PutRevoke is matched against the attempt current for its part and the
-// object-level timeouts are measured from the newest one.
+// replicas it handed out. It outlives the write: a later End or Revoke is
+// matched against it, and the timeouts are measured from the newest one.
 struct WriteAttempt {
     UUID writer;
     std::chrono::system_clock::time_point started;
     std::vector<ReplicaID> replica_ids;
 };
 
-// One part of the object. `part` is that part's content, absent until the part
-// is first written and again once every replica of it is gone; `attempt` is
-// the most recent write of that part, which the next write replaces.
+// One part of the object: `part` is its content, absent until the part is first
+// written and again once its last replica is gone; `attempt` is its newest
+// write.
 struct PartSlot {
     std::optional<ObjectPart> part;
     std::optional<WriteAttempt> attempt;
@@ -90,9 +87,9 @@ struct ObjectMetadata {
 
     ObjectMetadata() = delete;
 
-    // The envelope of an object of `part_count` parts. Every part starts empty:
-    // content arrives through BeginWrite, which is also what opens the write a
-    // later End or Revoke is scoped to.
+    // An object of `part_count` parts, every part empty. Content arrives
+    // through BeginWrite, which also opens the write a later End or Revoke is
+    // scoped to.
     ObjectMetadata(
         size_t part_count, TenantId tenant_id_, std::string user_key_,
         std::string group_id_, ObjectDataType data_type_, bool hard_pinned_,
@@ -210,11 +207,9 @@ struct ObjectMetadata {
         return &*slot->attempt;
     }
 
-    // Every part holds content and every part has a replica a reader can use.
-    // Asked for each time it is needed: a part loses its answer the moment the
-    // last usable replica of it goes away, whether through eviction, a segment
-    // going offline or a handle going stale. A part that holds no content is
-    // counted out in one step.
+    // Every part holds content and has a replica a reader can use. Computed on
+    // each call: a part loses its answer as soon as its last usable replica is
+    // gone, so nothing here can go stale.
     bool IsReadable() const {
         if (present_parts_ != part_count_) {
             return false;
@@ -229,20 +224,16 @@ struct ObjectMetadata {
         return true;
     }
 
-    // Whether any part still holds a replica whose allocator and segment are
-    // both usable. This is the answer to "should this object stay", which used
-    // to be called IsValid.
+    // Whether any part still holds a replica whose allocator is alive: the
+    // answer to "should this object stay". A segment that is merely unavailable
+    // still counts, because the object exists and is unreadable only until the
+    // segment returns.
     bool HasAnyReplicaWithValidHandle() const {
-        return HasReplica([](const Replica& replica) {
-            // A segment that is unavailable right now still counts: the object
-            // exists, its replica just cannot be read until the segment comes
-            // back.
-            return !replica.has_dead_handle();
-        });
+        return HasReplica(
+            [](const Replica& replica) { return !replica.has_dead_handle(); });
     }
 
-    // Whether any part still carries an unfinished write: a replica that
-    // part's attempt handed out is still PROCESSING.
+    // Whether a replica some part's write handed out is still PROCESSING.
     bool HasWriteInFlight() const {
         for (const auto& [index, slot] : slots_) {
             (void)index;
@@ -263,11 +254,9 @@ struct ObjectMetadata {
         return false;
     }
 
-    // The newest write of any part: the moment the object last had a writer
-    // working on it, which is what the object-level incompleteness timeout is
-    // measured from. Empty only for an object no write has opened a part of;
-    // an object that arrived from a snapshot counts from the restore, which
-    // opens its parts.
+    // The newest write of any part, which the object-level incompleteness
+    // timeout is measured from. A restored object counts from its restore,
+    // which opens its parts.
     std::optional<std::chrono::system_clock::time_point> GetLastPutStartTime()
         const {
         std::optional<std::chrono::system_clock::time_point> newest;
@@ -297,10 +286,9 @@ struct ObjectMetadata {
     // --- Changing the slots. Caller holds the owning shard's exclusive
     // lock. ---
 
-    // Give part `index` its content and open the write that produced it. The
-    // replicas arrive as the allocator handed them out; setting their status
-    // is the caller's job. `session_id` is the session this write belongs to,
-    // empty when the caller named none.
+    // Give part `index` its content and open the write that produced it.
+    // Replica status is the caller's to set; `session_id` is empty when the
+    // caller named none.
     tl::expected<void, ErrorCode> BeginWrite(
         size_t index, size_t length, std::vector<Replica>&& replicas,
         const UUID& writer, const std::string& session_id,
@@ -312,12 +300,10 @@ struct ObjectMetadata {
         if (slot.part.has_value()) {
             return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
         }
-        // The parts of one object are pieces of one write, so they name one
-        // session. It is recorded with the object on the first write that names
-        // one, and a later part that names another is a caller mixing two
-        // writes in one object. An object of one part is rewritten whole, so
-        // the newest write names the session, which is what the object-level
-        // record (the stored event, the snapshot) reads.
+        // One object's parts are pieces of one write, so they name one session:
+        // the first write that names one records it, and a later part naming a
+        // different one is a caller mixing two writes. A one-part object is
+        // rewritten whole, so its newest write names the session.
         if (!session_id.empty()) {
             if (session_id_.empty() || part_count_ == 1) {
                 session_id_ = session_id;
@@ -343,11 +329,10 @@ struct ObjectMetadata {
     // The session the object's parts belong to, empty when no write named one.
     const std::string& WriteSessionId() const { return session_id_; }
 
-    // Complete the replicas of part `index` that this part's write handed out
-    // and that the caller names. What comes back are the replicas that changed
-    // state, so the caller can act on exactly those. A repeated End of replicas
-    // that are already COMPLETE succeeds and changes nothing; an End that names
-    // nothing of this part's write is refused.
+    // Complete the replicas of part `index` that its write handed out and the
+    // caller names, and return the ones that changed state. A repeated End of
+    // replicas that are already COMPLETE succeeds and changes nothing; an End
+    // that names nothing of this part's write is refused.
     tl::expected<std::vector<ReplicaID>, ErrorCode> EndWrite(
         size_t index, const std::vector<ReplicaID>& ended_ids) {
         PartSlot* found = FindSlot(index);
@@ -394,11 +379,9 @@ struct ObjectMetadata {
         return found->part.value();
     }
 
-    // Take replicas out of part `index`. What comes back is out of the object:
-    // the caller owns those replicas and decides how to isolate or release
-    // them. A part that loses its last replica loses its content with it; the
-    // attempt stays in the slot, because it records the write that produced it,
-    // and every walk skips a slot whose content is gone.
+    // Take replicas out of part `index`; the caller owns what comes back. A
+    // part that loses its last replica loses its content, while its attempt
+    // stays because it records the write that produced the part.
     std::vector<Replica> PopPartReplicas(
         size_t index, const std::function<bool(const Replica&)>& pred_fn) {
         PartSlot* found = FindSlot(index);
@@ -438,17 +421,14 @@ struct ObjectMetadata {
         return PopReplicas([](const Replica&) { return true; });
     }
 
-    // --- Accessors over the object's replicas, across every part ---
+    // --- Accessors that run on a whole object, across every part ---
     //
-    // A transition that runs on an object as a whole — eviction, expiry, quota,
-    // replica cleanup, the read of a whole object — walks every part. The write
-    // and read paths that name a part use GetPart and MutablePart instead; the
-    // one that adds replicas acts on part 0 and says so.
+    // Eviction, expiry, quota, replica cleanup and the read of a whole object
+    // walk every part; the paths that name a part use GetPart and MutablePart.
 
     // Offload, copy, move and the local-disk registration have no per-part
     // form, so adding replicas to an object of several parts would silently act
-    // on part 0 alone. A fatal log rather than an assert keeps the guard in a
-    // release build.
+    // on part 0. A fatal log keeps the guard in a release build.
     void AddReplicas(std::vector<Replica>&& replicas) {
         if (part_count_ != 1) {
             LOG(FATAL) << "ObjectMetadata::" << __func__
@@ -505,11 +485,9 @@ struct ObjectMetadata {
         return num_visited;
     }
 
-    // Every part that holds content, with the index it sits at. A slot whose
-    // content is gone keeps the record of the write that produced it, so a
-    // caller that wants the parts themselves walks them through this instead of
-    // asking for each index in turn: an object sized for 1024 parts may hold
-    // one, and every such question would then be 1024 lookups.
+    // Every part that holds content, with its index. A caller that wants the
+    // parts walks this rather than asking for each index in turn: an object
+    // sized for 1024 parts may hold one.
     template <typename Fn>
     void ForEachPart(Fn&& fn) const {
         for (const auto& [index, slot] : slots_) {
@@ -519,17 +497,15 @@ struct ObjectMetadata {
         }
     }
 
-    // Every replica of every part, for a caller that wants all of them rather
-    // than the ones a predicate selects: an object of several parts has no
-    // single range of replicas to hand out.
+    // Every replica of every part: an object of several parts has no single
+    // range of replicas to hand out.
     size_t VisitReplicas(
         const std::function<void(const Replica&)>& visit_fn) const {
         return VisitReplicas([](const Replica&) { return true; }, visit_fn);
     }
 
-    // Any part, any replica. The predicates the callers pass in ask domain
-    // questions (any COMPLETE replica, every replica complete, how many on a
-    // medium), and an object of several parts answers them over all its parts.
+    // Whether any replica of any part matches, for predicates that ask a
+    // question any single replica can answer on its own.
     bool HasReplica(const std::function<bool(const Replica&)>& pred_fn) const {
         for (const auto& [index, slot] : slots_) {
             (void)index;
@@ -541,10 +517,9 @@ struct ObjectMetadata {
         return false;
     }
 
-    // Every part, and every replica of every part. A part that holds no content
-    // is counted out first, so an object still being written is not a set of
-    // finished replicas, and the removal and drain paths that ask this must not
-    // treat one as such.
+    // Whether every replica of every part matches. A part holding no content
+    // answers false, so an object still being written never looks finished to
+    // the removal and drain paths.
     bool AllReplicas(const std::function<bool(const Replica&)>& pred_fn) const {
         if (present_parts_ != part_count_) {
             return false;
@@ -793,30 +768,25 @@ struct ObjectMetadata {
     bool IsGrouped() const { return !group_id.empty(); }
 
    private:
-    // One entry per part that holds content, keyed by its index. A part that
-    // holds none has no entry, so an object sized for a layout far larger than
-    // what has arrived so far costs only the parts it holds. The attempt of a
-    // part whose content is gone stays, which is why the entry stays with it.
+    // One entry per part that holds content, keyed by its index, so an object
+    // sized for 1024 parts costs only what has arrived. The entry outlives the
+    // content, because the attempt in it records the write.
     std::unordered_map<uint32_t, PartSlot> slots_;
     const size_t part_count_;
-    // Part 0's slot, for the object of one part. Every object written before
-    // parts existed is one, and its writes and reads reach part 0 several times
-    // each, so they follow this pointer instead of hashing the index. Null
-    // until the part is first written; the slot lives in the map above and its
-    // address does not move while the object does.
+    // Part 0's slot, cached because the writes and reads of a one-part object,
+    // which is every object that predates parts, reach it several times. Null
+    // until the part is first written; the slot lives in the map above, whose
+    // nodes do not move.
     PartSlot* part_zero_slot_{nullptr};
-    // How many parts hold content. A slot outlives the content it held, because
-    // the attempt in it records the write that produced that content, so the
-    // count is what answers "does every part hold content" without walking.
+    // How many parts hold content. Slots outlive their content, so counting
+    // slots would answer a different question.
     size_t present_parts_{0};
     // The session the object's parts belong to, recorded by the first write
-    // that named one. One object is one write session, so it belongs to the
-    // object rather than to a part, and every later write of it is checked
-    // against this one value.
+    // that named one and checked against by every later write.
     std::string session_id_;
 
     // That part's slot, or null when the part has never been written. Part 0 of
-    // an object of one part is answered without hashing.
+    // a one-part object is answered without hashing.
     PartSlot* FindSlot(size_t index) {
         if (index == 0 && part_zero_slot_ != nullptr) {
             return part_zero_slot_;

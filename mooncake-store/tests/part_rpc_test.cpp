@@ -393,8 +393,7 @@ MountedRank MountRank(WrappedMasterService& service, const std::string& name,
     return rank;
 }
 
-// What one rank did with one part: the text of whichever call failed, empty
-// when the part landed.
+// The failure text of one rank's write of one part; empty when it landed.
 struct ShardWrite {
     std::string failure;
 };
@@ -733,12 +732,9 @@ TEST_F(PartRpcTest, ARankWhoseSegmentWentAwayRewritesItsShard) {
     }
 }
 
-// The master learns a part count and nothing about the layout behind it: which
-// (stage, rank) a part index stands for is the key's own convention, and 8x4
-// and 16x2 have the same product. Two objects split under those two layouts
-// therefore have one shape as far as the master can tell, and neither write is
-// refused. Which shard a reader holds is answered by the part checksum, which
-// is why the write carries one.
+// The master sees a part count and no layout, so 8x4 and 16x2 are one shape to
+// it: an object split either way is accepted, and the part checksum is what
+// says which shard a reader holds.
 TEST_F(PartRpcTest, TwoLayoutsWithTheSamePartCountFillTheSameShape) {
     constexpr uint32_t kParts = 32;
     const std::string tenant(TenantId::kDefaultValue);
@@ -785,11 +781,9 @@ TEST_F(PartRpcTest, TwoLayoutsWithTheSamePartCountFillTheSameShape) {
     EXPECT_EQ(*(*tp16)->object_checksum, ShardChecksum(/*rank=*/1, /*tag=*/1));
 }
 
-// A part's replica need not sit in the segment of the client that wrote it: the
-// write names the segment it wants, the master records the replica there, and a
-// reader addresses the replica's own endpoint. Keeping a rank's shard next to
-// that rank is a locality choice the client makes, not a constraint the master
-// enforces.
+// A part's replica need not sit in a segment its writer mounted: the write
+// names the segment it wants, and a reader addresses that replica's own
+// endpoint. Keeping a rank's shard next to the rank is the client's choice.
 TEST_F(PartRpcTest, APartReplicaLandsInTheSegmentTheWriteNames) {
     constexpr uint32_t kParts = 2;
     const std::string key = "kv_block_borrowed_segment";

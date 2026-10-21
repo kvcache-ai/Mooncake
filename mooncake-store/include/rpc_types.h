@@ -64,20 +64,17 @@ inline constexpr uint64_t kPartSupportFeature = 1ULL << 0;
 /**
  * @brief How many parts one object may have.
  *
- * An object's part count is fixed by its first write and sized once, so the
- * value a request carries has to be bounded. A real payload is the product of
- * the tensor-parallel and pipeline-parallel degrees and the tensors each rank
- * writes (tp=8, pp=16, K and V is 256), and KV replicated under MLA or GQA is
- * written as one part, so this leaves headroom over the layouts in use while
- * keeping one object's slots to a bounded amount of memory.
+ * A part count is fixed by an object's first write, so the value a request
+ * carries has to be bounded. Real layouts are the product of the
+ * tensor-parallel and pipeline-parallel degrees (tp=8, pp=16, K and V is 256),
+ * and KV replicated under MLA or GQA is written as one part, so this leaves
+ * headroom while keeping an object's slots to a bounded amount of memory.
  *
- * The layout behind a count lives in the key's own namespace: which parallel
- * degrees a deployment runs, and which (stage, rank) a part index stands for,
- * are the writer's convention and hold for the whole life of the object. The
- * master never sees a layout, so two layouts with the same product are one
- * shape to it. A part count is a check that the writers agreed on that shape,
- * not an identity for it; the part checksum is what tells a reader which shard
- * it holds.
+ * The layout behind a count belongs to the key: the parallel degrees, and which
+ * (stage, rank) a part index stands for, are the writer's convention. The
+ * master never sees it, so 8x4 and 16x2 are one shape to it; the count checks
+ * that the writers agreed, and the part checksum says which shard a reader
+ * holds.
  */
 inline constexpr uint32_t kMaxPartsPerObject = 1024;
 
@@ -87,11 +84,10 @@ inline constexpr uint32_t kMaxPartsPerObject = 1024;
 struct PingResponse {
     ViewVersionId view_version_id;
     ClientStatus client_status;
-    // What this master understands beyond the base protocol. Bit 0 means a
-    // call may name a part: it accepts the part arguments on the write calls
-    // and answers a read with the object's part count. A client that wants to
-    // write or read by part must see this bit before it sends one, because an
-    // older master silently ignores the extra arguments.
+    // What this master understands beyond the base protocol. Bit 0 means it
+    // accepts the part arguments on the write calls and reports the part count
+    // on a read. A part-aware client checks this bit first: an older master
+    // ignores the extra arguments silently.
     struct_pack::compatible<uint64_t, 1> supported_features;
 
     PingResponse() = default;
@@ -120,10 +116,10 @@ struct GetReplicaListResponse {
     // the exact scope the write path used. Empty when the master predates
     // this field.
     struct_pack::compatible<std::string, 1> resolved_tenant_id;
-    // How many parts the key holds. A reader that named a part needs this to
-    // know it holds a piece of a larger object; a reader that named none and
-    // gets more than one back must refuse the answer. Absent means the master
-    // predates parts, so the key has one.
+    // How many parts the key holds. A reader that named a part uses it to place
+    // what it got in a larger object; a reader that named none and sees more
+    // than one must refuse the answer. Absent means the master predates parts,
+    // so the key has one.
     struct_pack::compatible<uint32_t, 2> part_count;
 
     GetReplicaListResponse() : lease_ttl_ms(0) {}
