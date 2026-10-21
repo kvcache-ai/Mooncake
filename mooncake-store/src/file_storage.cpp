@@ -1129,6 +1129,27 @@ void FileStorage::ApplyDiskFence() {
     auto result = client_->OffloadObjectHeartbeat(false, discarded);
     LOG(INFO) << "action=release_offload_queue, result="
               << (result ? ErrorCode::OK : result.error());
+
+    // Tasks carried across a bucket deferral already left that queue, and
+    // the unmount does not release them either. NACK them, the same way the
+    // key-count limit does when it stops offloading.
+    if (deferred_task_by_storage_key_.empty()) return;
+    std::vector<OffloadTaskItem> carried;
+    carried.reserve(deferred_task_by_storage_key_.size());
+    for (const auto& [_, task] : deferred_task_by_storage_key_) {
+        carried.push_back(task);
+    }
+    deferred_task_by_storage_key_.clear();
+    if (auto bucket_backend =
+            std::dynamic_pointer_cast<BucketStorageBackend>(storage_backend_)) {
+        bucket_backend->ClearUngroupedOffloadingObjects();
+    }
+    std::vector<StorageObjectMetadata> failed_metadatas(
+        carried.size(), StorageObjectMetadata{-1, 0, 0, -1, ""});
+    auto nack = client_->NotifyOffloadSuccess(carried, failed_metadatas);
+    LOG(INFO) << "action=release_deferred_offload_tasks, count="
+              << carried.size()
+              << ", result=" << (nack ? ErrorCode::OK : nack.error());
 }
 
 void FileStorage::UnmountLocalDiskIfPending() {

@@ -545,6 +545,7 @@ class FileStorageTest : public ::testing::Test {
         bool gauge_exported = false;    // before any disk error
         bool segment_mounted = true;    // after two heartbeats
         bool offload_released = false;  // queued offload task, after them
+        bool carried_released = false;  // task carried across a deferral
         int64_t fenced_gauge = -1;
         bool fenced_offload_reached_backend = false;
     };
@@ -562,7 +563,8 @@ class FileStorageTest : public ::testing::Test {
     // disk reads fail with read_errno while the filesystem check answers
     // check_errno (kRealFilesystemCheck: the real check on the live test
     // directory). One put leaves an offload task queued at the master for
-    // this store. Runs two reads, then two heartbeats, and records what
+    // this store; the task of another is held by the store, carried across a
+    // bucket deferral. Runs two reads, then two heartbeats, and records what
     // happened.
     void RunDiskErrorScenario(const std::string& name, int read_errno,
                               int check_errno, DiskFenceOutcome& out) {
@@ -594,13 +596,25 @@ class FileStorageTest : public ::testing::Test {
         // registered, Upsert is refused until the master releases the task
         // (while the task is still queued, Upsert would cancel it itself).
         const std::string offload_key = "offload_key";
+        const std::string carried_key = "carried_key";
         const std::string value(64, 'v');
         void* buffer = allocator.allocate(value.size());
+        void* carried_buffer = allocator.allocate(value.size());
         ASSERT_NE(buffer, nullptr);
+        ASSERT_NE(carried_buffer, nullptr);
         std::memcpy(buffer, value.data(), value.size());
+        std::memcpy(carried_buffer, value.data(), value.size());
         std::vector<Slice> slices{{buffer, value.size()}};
+        std::vector<Slice> carried_slices{{carried_buffer, value.size()}};
         ReplicateConfig replicate;
         replicate.replica_num = 1;
+        // This key's task is drained first and then carried across a bucket
+        // deferral below, so it is no longer queued when the fence comes.
+        ASSERT_TRUE(client->Put(carried_key, carried_slices, replicate));
+        std::vector<OffloadTaskItem> carried_tasks;
+        ASSERT_TRUE(
+            client->OffloadObjectHeartbeat(true, carried_tasks).has_value());
+        ASSERT_EQ(carried_tasks.size(), 1u);
         ASSERT_TRUE(client->Put(offload_key, slices, replicate));
 
         FileStorageConfig config = FileStorageConfig::FromEnvironment();
@@ -634,6 +648,10 @@ class FileStorageTest : public ::testing::Test {
             MutexLocker locker(&file_storage.offloading_mutex_);
             file_storage.enable_offloading_ = true;
         }
+        for (const auto& task : carried_tasks) {
+            file_storage.deferred_task_by_storage_key_.emplace(
+                TenantId(task.tenant_id).MakeScopedKey(task.key), task);
+        }
 
         for (int i = 0; i < 2; ++i) {
             std::string read_buffer(64, '\0');
@@ -652,6 +670,8 @@ class FileStorageTest : public ::testing::Test {
             client->OffloadObjectHeartbeat(true, items).has_value();
         out.offload_released =
             client->Upsert(offload_key, slices, replicate).has_value();
+        out.carried_released =
+            client->Upsert(carried_key, carried_slices, replicate).has_value();
         out.fenced_gauge = metric.ssd_disk_fenced.value();
         if (out.fenced) {
             // Offload work already in hand must not reach a fenced disk. The
@@ -665,6 +685,7 @@ class FileStorageTest : public ::testing::Test {
             out.fenced_offload_reached_backend = backend->offloads > 0;
         }
         allocator.deallocate(buffer, value.size());
+        allocator.deallocate(carried_buffer, value.size());
         EXPECT_TRUE(client->UnmountSegment(segment.get(), kSegmentSize));
         EXPECT_TRUE(client->unregisterLocalMemory(allocator.getBase()));
     }
@@ -1998,8 +2019,9 @@ TEST_F(FileStorageTest, ClassifyDiskErrno) {
 
 // EIO on a filesystem that is shut down: the first failure fences the disk
 // tier. Reads stop reaching the disk at once, offload stops, the heartbeat
-// hands the queued offload task back to the master (releasing the memory
-// replica it pinned), unmounts the segment and never re-mounts it.
+// hands the queued and the carried offload tasks back to the master
+// (releasing the memory replicas they pinned), unmounts the segment and never
+// re-mounts it.
 TEST_F(FileStorageTest, DiskFenceEioOnDeadFilesystemFencesDiskTier) {
     DiskFenceOutcome out;
     RunDiskErrorScenario("fence_eio_dead", EIO, EIO, out);
@@ -2009,6 +2031,7 @@ TEST_F(FileStorageTest, DiskFenceEioOnDeadFilesystemFencesDiskTier) {
     EXPECT_EQ(out.backend_loads, 1);
     EXPECT_FALSE(out.segment_mounted);
     EXPECT_TRUE(out.offload_released);
+    EXPECT_TRUE(out.carried_released);
     EXPECT_EQ(out.fenced_gauge, 1);
     EXPECT_FALSE(out.fenced_offload_reached_backend);
 }
@@ -2045,6 +2068,7 @@ TEST_F(FileStorageTest, DiskFenceEnodevFencesWithoutFilesystemCheck) {
     EXPECT_EQ(out.backend_loads, 1);
     EXPECT_FALSE(out.segment_mounted);
     EXPECT_TRUE(out.offload_released);
+    EXPECT_TRUE(out.carried_released);
 }
 
 // Concurrent failures do not run parallel filesystem checks: one that finds
