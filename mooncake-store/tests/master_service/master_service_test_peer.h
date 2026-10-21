@@ -65,6 +65,10 @@ class MasterServiceTestPeer {
     auto ReadCursor(const TenantId& tenant_id) const {
         return service_.ReadCursor(tenant_id);
     }
+    using CursorSlice = MasterService::CursorSlice;
+    auto ReadCursor(const TenantId& tenant_id, CursorSlice slice) const {
+        return service_.ReadCursor(tenant_id, slice);
+    }
     auto WriteCursor(const TenantId& tenant_id) {
         return service_.WriteCursor(tenant_id);
     }

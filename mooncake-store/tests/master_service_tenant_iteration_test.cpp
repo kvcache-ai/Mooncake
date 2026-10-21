@@ -11,6 +11,7 @@
 #include <map>
 #include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "tenant/quota_policy_store.h"
@@ -117,6 +118,27 @@ TEST_F(TenantIterationTest, ReadCursorVisitsEachObjectOfItsTenantOnce) {
         EXPECT_EQ(object.ref().key, object.key());
         EXPECT_EQ(object.ref().generation, object.generation());
         EXPECT_EQ(object.metadata().user_key, object.key());
+    }
+}
+
+TEST_F(TenantIterationTest, CursorSlicesTogetherVisitEachObjectOnce) {
+    MasterService service(MultiTenantConfig());
+    const auto context = PrepareSimpleSegment(service);
+    PutKeys(service, context.client_id, kTenantA, "a", 200);
+    PutKeys(service, context.client_id, kTenantB, "b", 5);
+
+    MasterServiceTestPeer peer(service);
+    for (const size_t count : {1, 3, 16}) {
+        std::set<std::string> keys;
+        for (size_t index = 0; index < count; ++index) {
+            for (auto object : peer.ReadCursor(
+                     kTenantA,
+                     MasterServiceTestPeer::CursorSlice{index, count})) {
+                EXPECT_TRUE(keys.insert(object.key()).second)
+                    << "visited twice: " << object.key();
+            }
+        }
+        EXPECT_EQ(keys, KeysOf(service, kTenantA)) << "count=" << count;
     }
 }
 
@@ -230,6 +252,21 @@ TEST_F(TenantIterationTest, InFlightKeysNameOnlyKeysWithWorkInFlight) {
               (std::set<std::string>{"done_0", "done_1", "done_2"}));
     EXPECT_EQ(peer.InFlightKeys(kTenantB),
               std::vector<std::string>{"pending_b"});
+}
+
+TEST_F(TenantIterationTest, MemoryEvictionCensusCoversEveryTenant) {
+    auto config = MultiTenantConfig();
+    config.default_kv_lease_ttl = 1;
+    MasterService service(config);
+    const auto context = PrepareSimpleSegment(service);
+    PutKeys(service, context.client_id, kTenantA, "a", 4);
+    PutKeys(service, context.client_id, kTenantB, "b", 6);
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+    MasterServiceTestPeer(service).RunBatchEvictForTesting(1.0, 1.0);
+
+    EXPECT_TRUE(KeysOf(service, kTenantA).empty());
+    EXPECT_TRUE(KeysOf(service, kTenantB).empty());
 }
 
 }  // namespace mooncake::test

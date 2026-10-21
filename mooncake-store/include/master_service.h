@@ -1096,6 +1096,14 @@ class MasterService {
         std::string user_key;
     };
 
+    // One of `count` disjoint slices of a tenant's objects: the read cursors
+    // of slices 0 to count - 1 together visit what one ReadCursor() would, so
+    // that many threads can walk one tenant at once.
+    struct CursorSlice {
+        size_t index;
+        size_t count;
+    };
+
     static constexpr size_t kNumShards = 1024;  // Number of metadata shards
 
     // One publication of an object: its metadata and the tasks in flight for
@@ -1613,10 +1621,12 @@ class MasterService {
     // when none is left valid.
     void CleanupInvalidMemoryReplicas(MetadataAccessorRW& accessor);
 
-    // Discards the tenant's expired processing replicas and expired tasks.
+    // Discards the tenant's expired processing replicas and expired tasks;
+    // with `slice`, only those of that slice of its objects.
     void DiscardExpiredProcessingReplicas(
         const TenantId& tenant_id,
-        const std::chrono::system_clock::time_point& now);
+        const std::chrono::system_clock::time_point& now,
+        CursorSlice slice = {0, 1});
     void FreeDfsReplicas(const std::string& key,
                          std::span<const Replica> replicas);
     void RunDfsEviction();
@@ -2051,13 +2061,17 @@ class MasterService {
     [[nodiscard]] TenantCursor<LockMode::kWrite> WriteCursor(
         const TenantId& tenant_id);
 
+    // Walks only `slice` of the tenant's objects; see CursorSlice.
+    [[nodiscard]] TenantCursor<LockMode::kRead> ReadCursor(
+        const TenantId& tenant_id, CursorSlice slice) const;
+
     // The tenant's keys whose object carries work in flight (see
     // route::ObjectState::HasWorkInFlight), as a snapshot to resolve again: the
     // work can finish, or the object be torn down or replaced, once the walk
-    // has moved on. Until the store moves to per-tenant routes this walks
-    // every object of the tenant.
+    // has moved on; with `slice`, only those of that slice. Until the store
+    // moves to per-tenant routes this walks every object of the slice.
     [[nodiscard]] std::vector<std::string> InFlightKeys(
-        const TenantId& tenant_id) const;
+        const TenantId& tenant_id, CursorSlice slice = {0, 1}) const;
 
     // Calls `visit` with each tenant that holds an object when the walk
     // starts, holding no lock, so `visit` may reach any key. A tenant that
@@ -2124,8 +2138,12 @@ class MasterService {
        private:
         friend class MasterService;
 
-        TenantCursor(Access<MasterService>& service, TenantId tenant_id)
-            : service_(service), tenant_id_(std::move(tenant_id)) {
+        TenantCursor(Access<MasterService>& service, TenantId tenant_id,
+                     CursorSlice slice = {0, 1})
+            : service_(service),
+              tenant_id_(std::move(tenant_id)),
+              next_shard_(kNumShards * slice.index / slice.count),
+              end_shard_(kNumShards * (slice.index + 1) / slice.count) {
             Settle();
         }
 
@@ -2143,7 +2161,7 @@ class MasterService {
                 // a map whose lock is gone.
                 it_ = end_ = RecordIterator{};
                 lock_.reset();
-                if (next_shard_ == kNumShards) {
+                if (next_shard_ == end_shard_) {
                     return;
                 }
                 auto& shard = service_.metadata_shards_[next_shard_++];
@@ -2162,7 +2180,8 @@ class MasterService {
 
         Access<MasterService>& service_;
         const TenantId tenant_id_;
-        size_t next_shard_{0};
+        size_t next_shard_;
+        const size_t end_shard_;
         std::optional<SharedMutexLocker> lock_;
         RecordIterator it_{};
         RecordIterator end_{};
