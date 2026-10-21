@@ -757,6 +757,10 @@ int RunSupervisorLoop(const HABackendSpec& spec,
                 StopLeadershipMonitor(monitor);
                 wrapped_master_service->StopBatchOpLogWriter();
                 DeactivateServingState(admin_server, label_reconciler);
+                // Local cleanup requests finish or time out before the lease
+                // release; a server that accepted a request whose reply was
+                // lost may still apply it afterwards.
+                wrapped_master_service->StopHttpMetadataCleanup();
                 LOG(INFO) << "Shutdown stopped the term's workers, monitor "
                              "and OpLog writer";
             };
@@ -1019,6 +1023,7 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         StopLeadershipMonitor(leadership_monitor_handle);
         wrapped_master_service->StopBatchOpLogWriter();
         DeactivateServingState(admin_server, label_reconciler);
+        wrapped_master_service->StopHttpMetadataCleanup();
         auto err = release_term("serving");
         LOG(INFO) << "Release leadership: " << toString(err);
         auto current_view = leader_coordinator.ReadCurrentView();

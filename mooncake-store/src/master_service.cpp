@@ -13386,6 +13386,19 @@ void MasterService::setHttpMetadataRemoteUrl(
     LOG(INFO) << "HTTP metadata cleanup worker thread started";
 }
 
+void MasterService::StopHttpMetadataCleanup() {
+    if (!http_metadata_cleanup_thread_.joinable()) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lk(http_metadata_cleanup_mutex_);
+        http_metadata_cleanup_running_ = false;
+        http_metadata_cleanup_queue_.clear();
+    }
+    http_metadata_cleanup_cv_.notify_all();
+    http_metadata_cleanup_thread_.join();
+}
+
 void MasterService::cleanupHttpMetadata(const std::string& segment_name) {
     // Co-located: remove in-process, safe to run inline (no network I/O).
     if (http_metadata_server_) {
@@ -13406,6 +13419,11 @@ void MasterService::cleanupHttpMetadata(const std::string& segment_name) {
     if (!http_metadata_remote_url_.empty()) {
         {
             std::lock_guard<std::mutex> lk(http_metadata_cleanup_mutex_);
+            // A stopped worker never drains the queue, and a late DELETE
+            // could land after the lease is released.
+            if (!http_metadata_cleanup_running_) {
+                return;
+            }
             http_metadata_cleanup_queue_.push_back(segment_name);
         }
         http_metadata_cleanup_cv_.notify_one();
@@ -13447,6 +13465,10 @@ void MasterService::HttpMetadataCleanupThreadFunc() {
         }
 
         for (const auto& segment_name : batch) {
+            // Stopping skips the rest of the batch.
+            if (!http_metadata_cleanup_running_) {
+                break;
+            }
             const std::string ram_key =
                 http_metadata_prefix_ + "ram/" + segment_name;
             const std::string rpc_key =
@@ -13455,7 +13477,10 @@ void MasterService::HttpMetadataCleanupThreadFunc() {
             // Each key attempted independently so one failure does not
             // prevent cleanup of the other.
             const bool ram_removed = removeRemoteHttpMetadataKey(ram_key);
-            const bool rpc_removed = removeRemoteHttpMetadataKey(rpc_key);
+            // Stopping also skips the second key, so at most one DELETE is
+            // in flight when the stop request arrives.
+            const bool rpc_removed = http_metadata_cleanup_running_ &&
+                                     removeRemoteHttpMetadataKey(rpc_key);
             LOG(INFO) << "Cleaned up remote HTTP metadata for segment: "
                       << segment_name << ", ram_key_removed=" << ram_removed
                       << ", rpc_key_removed=" << rpc_removed;

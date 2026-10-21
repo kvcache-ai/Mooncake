@@ -436,7 +436,7 @@ On the first signal the master:
 2. Waits for the RPC handlers that were already admitted.
 3. Stops the leadership monitor.
 4. Stops the batch OpLog writer after it commits the entries already queued. A writer that is already retrying leaves its batch, as it does on lease loss.
-5. Stops the admin HTTP server and standby replication.
+5. Stops the admin HTTP server and standby replication, and stops the remote metadata cleanup worker (its in-flight request finishes or times out) before the lease is released.
 6. Releases the leadership lease once.
 7. Exits.
 
@@ -451,6 +451,8 @@ The whole shutdown, including the release, is bounded to 15 seconds from the fir
 | 1 | The 15 second bound expired. |
 | 130, 143 | A second SIGINT or SIGTERM arrived during the shutdown. |
 | 255 | A request was seen only after a fatal backend error made the supervisor return. |
+
+The confirmed-release semantics and the exit statuses 0 and 2 above describe the etcd backend; the Kubernetes backend reports only that the cancel request was accepted.
 
 With `T` the lease TTL and `W` the successor's warmup (`W = T`), a planned stop changes how long the old key lives:
 

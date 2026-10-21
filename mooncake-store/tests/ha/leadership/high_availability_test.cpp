@@ -902,8 +902,25 @@ struct EtcdHostPort {
 // The first plain-http host:port of --etcd_endpoints. The relay and the lease
 // probe below speak neither TLS nor any other endpoint syntax.
 std::optional<EtcdHostPort> FirstEtcdHostPort() {
-    std::string endpoint =
-        FLAGS_etcd_endpoints.substr(0, FLAGS_etcd_endpoints.find(','));
+    // etcd_wrapper.go splits on ',' and ';', trims spaces and skips empty
+    // entries.
+    std::string endpoints = FLAGS_etcd_endpoints;
+    std::replace(endpoints.begin(), endpoints.end(), ';', ',');
+    std::string endpoint;
+    for (size_t start = 0; start <= endpoints.size();) {
+        size_t end = endpoints.find(',', start);
+        if (end == std::string::npos) {
+            end = endpoints.size();
+        }
+        std::string entry = endpoints.substr(start, end - start);
+        start = end + 1;
+        const auto first = entry.find_first_not_of(' ');
+        if (first == std::string::npos) {
+            continue;
+        }
+        endpoint = entry.substr(first, entry.find_last_not_of(' ') - first + 1);
+        break;
+    }
     if (endpoint.starts_with("http://")) {
         endpoint.erase(0, 7);
     }
@@ -923,6 +940,30 @@ std::optional<EtcdHostPort> FirstEtcdHostPort() {
         return std::nullopt;
     }
     return EtcdHostPort{endpoint.substr(0, colon), port};
+}
+
+// Needs no etcd: production accepts ';' as well as ',' between endpoints, trims
+// spaces and skips empty entries.
+TEST(EtcdEndpointParsingTest, FirstEndpointAcceptsSemicolonSeparator) {
+    const std::string saved = FLAGS_etcd_endpoints;
+    const auto first_of = [](const std::string& endpoints) {
+        FLAGS_etcd_endpoints = endpoints;
+        return FirstEtcdHostPort();
+    };
+    const auto semicolon = first_of("127.0.0.1:2379;127.0.0.1:2380");
+    const auto comma = first_of("127.0.0.1:2379,127.0.0.1:2380");
+    const auto leading_separator = first_of(";127.0.0.1:2379");
+    const auto spaced = first_of(" 127.0.0.1:2379 ; 127.0.0.1:2380");
+    FLAGS_etcd_endpoints = saved;
+
+    ASSERT_TRUE(semicolon.has_value());
+    EXPECT_EQ("127.0.0.1:2379", semicolon->ToString());
+    ASSERT_TRUE(comma.has_value());
+    EXPECT_EQ("127.0.0.1:2379", comma->ToString());
+    ASSERT_TRUE(leading_separator.has_value());
+    EXPECT_EQ("127.0.0.1:2379", leading_separator->ToString());
+    ASSERT_TRUE(spaced.has_value());
+    EXPECT_EQ("127.0.0.1:2379", spaced->ToString());
 }
 
 // Test-only byte relay between the child and etcd. Cut() drops every

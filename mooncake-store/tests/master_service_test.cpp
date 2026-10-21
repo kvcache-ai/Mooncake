@@ -14,17 +14,26 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <future>
 #include <map>
 #include <memory>
 #include <limits>
 #include <optional>
+#include <set>
 #include <string>
 #include <thread>
 #include <utility>
 #include <vector>
 #include <unordered_set>
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <sys/socket.h>
 #include <unistd.h>
+
+#include <condition_variable>
+#include <mutex>
 
 #include "tenant/quota_policy_store.h"
 #include "types.h"
@@ -3662,6 +3671,247 @@ TEST_F(MasterServiceTest,
     EXPECT_TRUE(job.prepared_segments.empty());
     EXPECT_TRUE(job.pending_prepare_segments.empty());
     EXPECT_FALSE(FindClientLivenessForTest(service, client_id));
+}
+
+// Localhost-only HTTP server that records DELETE request lines. A test picks
+// which requests (by 1-based arrival number) the server holds before it
+// answers, and releases them one by one, so the cleanup worker can be stopped
+// while a chosen DELETE is in flight.
+class RecordingDeleteServer {
+   public:
+    RecordingDeleteServer() {
+        listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
+        EXPECT_GE(listen_fd_, 0) << "socket() failed";
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = 0;
+        EXPECT_EQ(0, ::bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr),
+                            sizeof(addr)))
+            << "bind() failed";
+        EXPECT_EQ(0, ::listen(listen_fd_, 16)) << "listen() failed";
+        socklen_t len = sizeof(addr);
+        ::getsockname(listen_fd_, reinterpret_cast<sockaddr*>(&addr), &len);
+        port_ = ntohs(addr.sin_port);
+        thread_ = std::thread([this] { Serve(); });
+    }
+
+    ~RecordingDeleteServer() {
+        {
+            std::lock_guard<std::mutex> lk(mutex_);
+            stopping_ = true;
+        }
+        cv_.notify_all();
+        thread_.join();
+        ::close(listen_fd_);
+    }
+
+    std::string Url() const {
+        return "http://127.0.0.1:" + std::to_string(port_) + "/metadata";
+    }
+
+    // Hold the answer to the request_number-th DELETE until it is released.
+    // Call before that request can arrive.
+    void HoldRequest(size_t request_number) {
+        std::lock_guard<std::mutex> lk(mutex_);
+        held_.insert(request_number);
+    }
+
+    void ReleaseRequest(size_t request_number) {
+        {
+            std::lock_guard<std::mutex> lk(mutex_);
+            released_.insert(request_number);
+        }
+        cv_.notify_all();
+    }
+
+    size_t DeleteCount() {
+        std::lock_guard<std::mutex> lk(mutex_);
+        return requests_.size();
+    }
+
+    // Blocks until at least count DELETEs have arrived.
+    bool WaitForDeleteCount(size_t count, std::chrono::milliseconds timeout) {
+        std::unique_lock<std::mutex> lk(mutex_);
+        return cv_.wait_for(lk, timeout,
+                            [&] { return requests_.size() >= count; });
+    }
+
+    std::vector<std::string> Requests() {
+        std::lock_guard<std::mutex> lk(mutex_);
+        return requests_;
+    }
+
+   private:
+    void Serve() {
+        while (!stopping_) {
+            pollfd pfd{listen_fd_, POLLIN, 0};
+            if (::poll(&pfd, 1, 20) <= 0) {
+                continue;
+            }
+            const int fd = ::accept(listen_fd_, nullptr, nullptr);
+            if (fd < 0) {
+                continue;
+            }
+            Handle(fd);
+            ::close(fd);
+        }
+    }
+
+    void Handle(int fd) {
+        std::string request;
+        char buf[1024];
+        while (request.find("\r\n\r\n") == std::string::npos) {
+            pollfd pfd{fd, POLLIN, 0};
+            if (::poll(&pfd, 1, 2000) <= 0) {
+                return;
+            }
+            const ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
+            if (n <= 0) {
+                return;
+            }
+            request.append(buf, static_cast<size_t>(n));
+        }
+        {
+            std::unique_lock<std::mutex> lk(mutex_);
+            requests_.push_back(request.substr(0, request.find("\r\n")));
+            const size_t request_number = requests_.size();
+            cv_.notify_all();
+            if (held_.count(request_number) != 0) {
+                cv_.wait(lk, [&] {
+                    return stopping_ || released_.count(request_number) != 0;
+                });
+            }
+        }
+        static constexpr char kOk[] =
+            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n"
+            "Connection: close\r\n\r\n";
+        (void)::send(fd, kOk, sizeof(kOk) - 1, MSG_NOSIGNAL);
+    }
+
+    int listen_fd_ = -1;
+    uint16_t port_ = 0;
+    std::atomic<bool> stopping_{false};
+    std::thread thread_;
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    std::vector<std::string> requests_;
+    std::set<size_t> held_;
+    std::set<size_t> released_;
+};
+
+// Drives one deterministic sequence against a held request:
+//  1. The server holds DELETE #1 (segment_a, ram key). segment_b and
+//     segment_c queue behind it as one batch.
+//  2. Releasing #1 lets the worker send segment_a's rpc key (#2), then take
+//     [segment_b, segment_c].
+//  3. The server holds DELETE #3 (segment_b, ram key); segment_d is queued and
+//     stop starts on another thread.
+//  4. While #3 is held, stop has not returned (it joins the worker) and the
+//     queue is empty.
+//  5. Releasing #3 ends the worker without segment_b's rpc key and without
+//     segment_c; stop returns.
+//  6. A cleanup request after stop is dropped.
+TEST_F(MasterServiceTest, StopHttpMetadataCleanupWaitsForInFlightDelete) {
+    RecordingDeleteServer server;
+    server.HoldRequest(1);
+    server.HoldRequest(3);
+
+    MasterService service;
+    service.setHttpMetadataRemoteUrl(server.Url());
+    MasterServiceTestPeer peer(service);
+
+    std::thread stop_thread;
+    // Never leave a held request or the stop thread behind on an early
+    // assertion failure.
+    auto cleanup = [&] {
+        server.ReleaseRequest(1);
+        server.ReleaseRequest(3);
+        if (stop_thread.joinable()) {
+            stop_thread.join();
+        }
+    };
+
+    // 1. The worker takes [segment_a] and blocks inside DELETE #1.
+    peer.CleanupHttpMetadataForTesting("segment_a");
+    if (!server.WaitForDeleteCount(1, std::chrono::seconds(5))) {
+        cleanup();
+        FAIL() << "the cleanup worker never sent its first DELETE";
+    }
+    peer.CleanupHttpMetadataForTesting("segment_b");
+    peer.CleanupHttpMetadataForTesting("segment_c");
+    EXPECT_EQ(2u, peer.HttpMetadataCleanupQueueSizeForTesting());
+
+    // 2. Release #1: the worker sends segment_a's rpc key, then takes the
+    // [segment_b, segment_c] batch and blocks inside DELETE #3.
+    server.ReleaseRequest(1);
+    if (!server.WaitForDeleteCount(3, std::chrono::seconds(5))) {
+        cleanup();
+        FAIL() << "the worker did not reach DELETE #3";
+    }
+    EXPECT_EQ(0u, peer.HttpMetadataCleanupQueueSizeForTesting());
+
+    // 3. Queue one more segment, then stop while #3 is in flight.
+    peer.CleanupHttpMetadataForTesting("segment_d");
+    EXPECT_EQ(1u, peer.HttpMetadataCleanupQueueSizeForTesting());
+    // The packaged task sets the future inside the thread runtime. That
+    // removes the user-code window between Stop returning and the signal; a
+    // scheduler pause inside the runtime call is the only residual window.
+    // The 150 ms hold stays well under the HTTP client's request timeout.
+    std::packaged_task<void()> stop_task(
+        [&] { service.StopHttpMetadataCleanup(); });
+    auto stop_done = stop_task.get_future();
+    stop_thread = std::thread(std::move(stop_task));
+
+    // 4. Stop drops the queue at once but keeps joining the held worker.
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (peer.HttpMetadataCleanupQueueSizeForTesting() != 0 &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    EXPECT_EQ(0u, peer.HttpMetadataCleanupQueueSizeForTesting())
+        << "stop did not drop the queued segment";
+    EXPECT_EQ(std::future_status::timeout,
+              stop_done.wait_for(std::chrono::milliseconds(150)))
+        << "StopHttpMetadataCleanup returned while a DELETE was in flight";
+
+    // 5. Release #3: the worker skips segment_b's rpc key and the rest of the
+    // batch, and stop returns.
+    server.ReleaseRequest(3);
+    stop_thread.join();
+    EXPECT_EQ(std::future_status::ready,
+              stop_done.wait_for(std::chrono::milliseconds(0)));
+    EXPECT_EQ(3u, server.DeleteCount())
+        << "the second key or the rest of the batch was sent after stop";
+    const auto requests = server.Requests();
+    ASSERT_EQ(3u, requests.size());
+    for (const auto& request : requests) {
+        EXPECT_NE(std::string::npos, request.find("DELETE "));
+    }
+    EXPECT_NE(std::string::npos, requests[0].find("ram"));
+    EXPECT_NE(std::string::npos, requests[0].find("segment_a"));
+    EXPECT_NE(std::string::npos, requests[1].find("rpc_meta"));
+    EXPECT_NE(std::string::npos, requests[1].find("segment_a"));
+    EXPECT_NE(std::string::npos, requests[2].find("ram"));
+    EXPECT_NE(std::string::npos, requests[2].find("segment_b"));
+
+    // 6. A late client-monitor callback must not grow the queue or send.
+    peer.CleanupHttpMetadataForTesting("segment_e");
+    EXPECT_EQ(0u, peer.HttpMetadataCleanupQueueSizeForTesting())
+        << "a cleanup request was queued after stop";
+    EXPECT_FALSE(server.WaitForDeleteCount(4, std::chrono::milliseconds(300)))
+        << "a DELETE arrived after StopHttpMetadataCleanup returned";
+}
+
+TEST_F(MasterServiceTest, StopHttpMetadataCleanupIsNoOpWhenNeverStarted) {
+    MasterService service;
+    service.StopHttpMetadataCleanup();
+    service.StopHttpMetadataCleanup();
+
+    // Cleanup stays disabled: neither a co-located server nor a remote URL.
+    MasterServiceTestPeer(service).CleanupHttpMetadataForTesting("segment_a");
+    service.StopHttpMetadataCleanup();
 }
 
 }  // namespace mooncake::test
