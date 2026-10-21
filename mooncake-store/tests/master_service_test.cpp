@@ -3730,7 +3730,7 @@ class RecordingDeleteServer {
         return requests_.size();
     }
 
-    // Blocks until at least count DELETEs have arrived.
+    // Blocks until at least count DELETE requests have arrived.
     bool WaitForDeleteCount(size_t count, std::chrono::milliseconds timeout) {
         std::unique_lock<std::mutex> lk(mutex_);
         return cv_.wait_for(lk, timeout,
