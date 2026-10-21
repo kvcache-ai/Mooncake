@@ -87,8 +87,13 @@ class TcpStagingBuffer {
 // at the end preserves the copy's completion contract for the caller.
 static cudaError_t copyTcpCudaMemory(void* dst, const void* src, size_t size) {
     cudaStream_t stream;
+#ifdef USE_MLU
+    // CNRT queues have no CUDA stream-flags API in the MLU shim.
+    cudaError_t status = cudaStreamCreate(&stream);
+#else
     cudaError_t status =
         cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
+#endif
     if (status != cudaSuccess) return status;
 
     status = cudaMemcpyAsync(dst, src, size, cudaMemcpyDefault, stream);
