@@ -14,7 +14,7 @@
 #include <unistd.h>
 
 #include "mutex.h"
-#include "tenant_quota_policy_store.h"
+#include "tenant/quota_policy_store.h"
 #include "types.h"
 
 namespace mooncake::test {
@@ -207,6 +207,12 @@ BatchExistenceSpec BatchExistence(std::initializer_list<std::string> keys) {
     BatchExistenceSpec existence;
     existence.keys.assign(keys.begin(), keys.end());
     return existence;
+}
+
+BatchProbeSpec BatchProbe(std::initializer_list<std::string> keys) {
+    BatchProbeSpec probe;
+    probe.keys.assign(keys.begin(), keys.end());
+    return probe;
 }
 
 BatchReplicaListsSpec BatchReplicaLists(
@@ -1085,9 +1091,10 @@ MasterScenario& MasterScenario::When(ExpireAtAction action) {
         if (metadata_it == tenant_it->second.metadata.end()) {
             return false;
         }
-        SpinLocker locker(&metadata_it->second.lock);
-        metadata_it->second.lease_->SetDeadline(action.lease_timeout);
-        metadata_it->second.soft_pin_timeout = action.soft_pin_timeout;
+        auto& metadata = metadata_it->second.metadata;
+        SpinLocker locker(&metadata.lock);
+        metadata.lease_->SetDeadline(action.lease_timeout);
+        metadata.soft_pin_timeout = action.soft_pin_timeout;
         return true;
     };
 
@@ -1905,6 +1912,31 @@ MasterScenario& MasterScenario::Then(BatchExistenceSpec batch_existence) {
         } else if (*result[index] != batch_existence.expected[index]) {
             Fail("BatchExistence returned an unexpected result for key " +
                  batch_existence.keys[index]);
+        }
+    }
+    return *this;
+}
+
+MasterScenario& MasterScenario::Then(BatchProbeSpec batch_probe) {
+    if (!EnsureService()) {
+        return *this;
+    }
+
+    const auto result = service_->BatchProbeKey({}, batch_probe.keys,
+                                                TenantId(batch_probe.tenant));
+    if (result.size() != batch_probe.expected.size()) {
+        Fail("BatchProbe returned " + std::to_string(result.size()) +
+             " results; expected " +
+             std::to_string(batch_probe.expected.size()));
+        return *this;
+    }
+    for (size_t index = 0; index < result.size(); ++index) {
+        if (!result[index]) {
+            Fail("BatchProbe failed for key " + batch_probe.keys[index] + ": " +
+                 toString(result[index].error()));
+        } else if (*result[index] != batch_probe.expected[index]) {
+            Fail("BatchProbe returned an unexpected result for key " +
+                 batch_probe.keys[index]);
         }
     }
     return *this;

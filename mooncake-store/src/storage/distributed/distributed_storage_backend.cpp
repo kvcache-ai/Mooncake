@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <filesystem>
 #include <limits>
+#include <map>
 #include <optional>
 #include <string_view>
 
@@ -91,31 +92,15 @@ bool IsBucketDescriptorRangeValid(const DistributedFSDescriptor& desc,
            desc.aligned_size <= kMaxOffset - desc.offset;
 }
 
+// Completes a positional transfer of `total` bytes at `offset` whose first
+// `transferred` bytes are already done, retrying short transfers.
 tl::expected<void, ErrorCode> TransferAll(FileSystemAdapter& adapter, int fd,
                                           std::vector<iovec> iovs,
                                           int64_t offset, uint64_t total,
-                                          bool write) {
+                                          uint64_t transferred, bool write) {
     size_t index = 0;
-    uint64_t transferred = 0;
-    while (transferred < total) {
-        while (index < iovs.size() && iovs[index].iov_len == 0) ++index;
-        if (index == iovs.size() ||
-            iovs.size() - index >
-                static_cast<size_t>(std::numeric_limits<int>::max())) {
-            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-        }
-        const auto count = static_cast<int>(iovs.size() - index);
-        auto result =
-            write ? adapter.WriteAt(fd, iovs.data() + index, count, offset)
-                  : adapter.ReadAt(fd, iovs.data() + index, count, offset);
-        if (!result) return tl::make_unexpected(result.error());
-        if (*result == 0 || *result > total - transferred) {
-            return tl::make_unexpected(write ? ErrorCode::FILE_WRITE_FAIL
-                                             : ErrorCode::FILE_READ_FAIL);
-        }
-        size_t consumed = *result;
-        transferred += *result;
-        offset += static_cast<int64_t>(*result);
+    size_t consumed = transferred;
+    while (true) {
         while (consumed > 0 && index < iovs.size()) {
             if (consumed >= iovs[index].iov_len) {
                 consumed -= iovs[index].iov_len;
@@ -127,8 +112,27 @@ tl::expected<void, ErrorCode> TransferAll(FileSystemAdapter& adapter, int fd,
                 consumed = 0;
             }
         }
+        if (transferred >= total) return {};
+
+        while (index < iovs.size() && iovs[index].iov_len == 0) ++index;
+        if (index == iovs.size() ||
+            iovs.size() - index >
+                static_cast<size_t>(std::numeric_limits<int>::max())) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        const auto count = static_cast<int>(iovs.size() - index);
+        const auto position = offset + static_cast<int64_t>(transferred);
+        auto result =
+            write ? adapter.WriteAt(fd, iovs.data() + index, count, position)
+                  : adapter.ReadAt(fd, iovs.data() + index, count, position);
+        if (!result) return tl::make_unexpected(result.error());
+        if (*result == 0 || *result > total - transferred) {
+            return tl::make_unexpected(write ? ErrorCode::FILE_WRITE_FAIL
+                                             : ErrorCode::FILE_READ_FAIL);
+        }
+        consumed = *result;
+        transferred += *result;
     }
-    return {};
 }
 
 }  // namespace
@@ -212,6 +216,24 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::Init() {
 tl::expected<DistributedStorageBackend::ShardFile*, ErrorCode>
 DistributedStorageBackend::GetOrOpenShard(
     const DistributedFSDescriptor& descriptor) {
+    if (descriptor.shard_idx < 0) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    ShardFile* shard = nullptr;
+    {
+        std::lock_guard cache_lock(shard_files_mutex_);
+        auto existing = shard_files_.find(descriptor.shard_idx);
+        if (existing != shard_files_.end()) shard = existing->second.get();
+    }
+    if (shard) {
+        std::lock_guard shard_lock(shard->mutex);
+        // Only the exact path validated when this fd was opened can bypass
+        // normalization. Aliases and changed descriptors take the full
+        // validation path below. Cache entries live until backend teardown.
+        if (shard->fd >= 0 && shard->path == descriptor.file_path) return shard;
+    }
+
     const auto path =
         std::filesystem::path(descriptor.file_path).lexically_normal();
     auto root = std::filesystem::path(root_dir_).lexically_normal();
@@ -219,13 +241,11 @@ DistributedStorageBackend::GetOrOpenShard(
     auto parent = path.parent_path();
     if (parent.empty()) parent = ".";
     const auto index = ParseShardFileName(path.filename().string());
-    if (descriptor.shard_idx < 0 || !index || *index != descriptor.shard_idx ||
-        parent != root) {
+    if (!index || *index != descriptor.shard_idx || parent != root) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    ShardFile* shard;
-    {
+    if (!shard) {
         std::lock_guard cache_lock(shard_files_mutex_);
         auto existing = shard_files_.find(descriptor.shard_idx);
         if (existing == shard_files_.end()) {
@@ -238,7 +258,8 @@ DistributedStorageBackend::GetOrOpenShard(
     }
 
     // File validation and opening may block. Serialize them only with this
-    // shard's initialization and I/O, leaving other cached shards available.
+    // shard's initialization and non-batched I/O, leaving other cached shards
+    // available.
     std::lock_guard shard_lock(shard->mutex);
     auto file_path = path.string();
     if (shard->fd >= 0) {
@@ -248,6 +269,18 @@ DistributedStorageBackend::GetOrOpenShard(
         return shard;
     }
 
+    auto fd = ValidateAndOpenShardFile(file_path);
+    if (!fd) return tl::make_unexpected(fd.error());
+    // Failed attempts keep fd == -1 so a later request can retry
+    // initialization.
+    shard->path = std::move(file_path);
+    shard->fd = *fd;
+    return shard;
+}
+
+tl::expected<int, ErrorCode>
+DistributedStorageBackend::ValidateAndOpenShardFile(
+    const std::string& file_path) {
     // The master prepares new shards before publishing their descriptors.
     // OpenFile may create a file, so reject missing/unprepared shards first.
     auto file_size = fs_adapter_->GetFileSize(file_path);
@@ -255,6 +288,9 @@ DistributedStorageBackend::GetOrOpenShard(
     if (*file_size != distributed_config_.shard_capacity) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
+    auto root = std::filesystem::path(root_dir_).lexically_normal();
+    if (root.filename().empty()) root = root.parent_path();
+    const auto path = std::filesystem::path(file_path);
     std::error_code ec;
     const auto canonical_root = std::filesystem::canonical(root, ec);
     if (ec) return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
@@ -264,13 +300,25 @@ DistributedStorageBackend::GetOrOpenShard(
         canonical_path.filename() != path.filename()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    auto fd = fs_adapter_->OpenFile(file_path);
+    return fs_adapter_->OpenFile(file_path);
+}
+
+tl::expected<void, ErrorCode> DistributedStorageBackend::ReopenShardLocked(
+    ShardFile& shard) {
+    if (shard.path.empty()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    // Drop the stale descriptor first. The caller holds shard.mutex, which
+    // serializes all I/O on this shard, so no other thread can be reading or
+    // writing through the old fd while we close it.
+    if (shard.fd >= 0) {
+        (void)fs_adapter_->CloseFile(shard.fd);
+        shard.fd = -1;
+    }
+    auto fd = ValidateAndOpenShardFile(shard.path);
     if (!fd) return tl::make_unexpected(fd.error());
-    // Failed attempts keep fd == -1 so a later request can retry
-    // initialization.
-    shard->path = std::move(file_path);
-    shard->fd = *fd;
-    return shard;
+    shard.fd = *fd;
+    return {};
 }
 
 bool DistributedStorageBackend::UsesBucketAllocator() const {
@@ -395,11 +443,197 @@ tl::expected<int64_t, ErrorCode> DistributedStorageBackend::BatchOffload(
     return static_cast<int64_t>(success_keys.size());
 }
 
+struct DistributedStorageBackend::DfsIoOp {
+    size_t index;  // Position in the caller's request batch.
+    const std::string& key;
+    const DistributedFSDescriptor& descriptor;
+    std::vector<iovec> iovs;
+    uint64_t size;
+};
+
+tl::expected<void, ErrorCode> DistributedStorageBackend::ExecuteSingleIo(
+    DfsIoOp& op, bool write) {
+    if (UsesBucketAllocator()) {
+        auto fd = OpenBucket(op.descriptor);
+        if (!fd) return tl::make_unexpected(fd.error());
+        auto result = TransferAll(*fs_adapter_, *fd, std::move(op.iovs),
+                                  static_cast<int64_t>(op.descriptor.offset),
+                                  op.size, 0, write);
+        auto close_result = fs_adapter_->CloseFile(*fd);
+        if (!result) return result;
+        return close_result;
+    }
+
+    auto shard = GetOrOpenShard(op.descriptor);
+    if (!shard) {
+        LOG(ERROR) << "Failed to open DFS shard for key " << op.key << ": "
+                   << shard.error();
+        return tl::make_unexpected(shard.error());
+    }
+    std::lock_guard lock((*shard)->mutex);
+    const auto count = static_cast<int>(op.iovs.size());
+    const auto offset = static_cast<int64_t>(op.descriptor.offset);
+    auto result =
+        write
+            ? fs_adapter_->WriteAt((*shard)->fd, op.iovs.data(), count, offset)
+            : fs_adapter_->ReadAt((*shard)->fd, op.iovs.data(), count, offset);
+    const char* op_name = write ? "write" : "read";
+    if (!result && fs_adapter_->SupportsFdReopen()) {
+        // A cached descriptor can go stale (fd invalidated, shard file
+        // rotated). Reopen once under the shard lock and retry before
+        // surfacing the failure. A short transfer below is treated as genuine
+        // corruption and not retried. The lock already serializes shard I/O, so
+        // the reopen adds no cost to the success path. Only adapters whose I/O
+        // faults are fd-recoverable (POSIX) opt in via SupportsFdReopen.
+        LOG(WARNING) << "DFS " << op_name << " failed for key " << op.key
+                     << ", error=" << result.error() << ", reopening shard "
+                     << op.descriptor.shard_idx;
+        auto reopen = ReopenShardLocked(**shard);
+        if (reopen) {
+            result = write ? fs_adapter_->WriteAt((*shard)->fd, op.iovs.data(),
+                                                  count, offset)
+                           : fs_adapter_->ReadAt((*shard)->fd, op.iovs.data(),
+                                                 count, offset);
+        } else {
+            LOG(ERROR) << "DFS shard " << op.descriptor.shard_idx
+                       << " reopen failed for key " << op.key
+                       << ", error=" << reopen.error();
+        }
+    }
+    if (!result) {
+        LOG(WARNING) << "DFS " << op_name << " failed for key " << op.key
+                     << ", error=" << result.error();
+        return tl::make_unexpected(result.error());
+    }
+    if (*result != op.size) {
+        LOG(WARNING) << "DFS short " << op_name << " for key " << op.key
+                     << ", expected=" << op.size << ", actual=" << *result;
+        return tl::make_unexpected(write ? ErrorCode::FILE_WRITE_FAIL
+                                         : ErrorCode::FILE_READ_FAIL);
+    }
+    return {};
+}
+
+void DistributedStorageBackend::ExecuteShardBatchIo(
+    std::vector<DfsIoOp>& ops,
+    std::vector<tl::expected<void, ErrorCode>>& results, bool write) {
+    std::vector<FdIoRequest> io_requests;
+    std::vector<DfsIoOp*> io_ops;
+    io_requests.reserve(ops.size());
+    io_ops.reserve(ops.size());
+    for (auto& op : ops) {
+        auto shard = GetOrOpenShard(op.descriptor);
+        if (!shard) {
+            LOG(ERROR) << "Failed to open DFS shard for key " << op.key << ": "
+                       << shard.error();
+            results[op.index] = tl::make_unexpected(shard.error());
+            continue;
+        }
+        io_requests.push_back({(*shard)->fd, op.iovs.data(),
+                               static_cast<int>(op.iovs.size()),
+                               static_cast<int64_t>(op.descriptor.offset)});
+        io_ops.push_back(&op);
+    }
+    // Shard I/O fails short transfers.
+    SubmitBatchIo(io_requests, io_ops, results, write, false);
+}
+
+void DistributedStorageBackend::ExecuteBucketBatchIo(
+    std::vector<DfsIoOp>& ops,
+    std::vector<tl::expected<void, ErrorCode>>& results, bool write) {
+    // Group ops by the full descriptor identity OpenBucket validates, so each
+    // bucket is opened once per batch.
+    std::map<std::pair<std::string, int>, std::vector<DfsIoOp*>> buckets;
+    for (auto& op : ops) {
+        buckets[{op.descriptor.file_path, op.descriptor.shard_idx}].push_back(
+            &op);
+    }
+
+    auto next = buckets.begin();
+    while (next != buckets.end()) {
+        std::vector<std::pair<int, const std::vector<DfsIoOp*>*>> opened;
+        std::vector<FdIoRequest> io_requests;
+        std::vector<DfsIoOp*> io_ops;
+        for (; next != buckets.end() && opened.size() < kMaxOpenBucketsPerBatch;
+             ++next) {
+            const auto& bucket_ops = next->second;
+            auto fd = OpenBucket(bucket_ops.front()->descriptor);
+            if (!fd) {
+                LOG(ERROR) << "Failed to open DFS bucket " << next->first.first
+                           << ": " << fd.error();
+                for (auto* op : bucket_ops) {
+                    results[op->index] = tl::make_unexpected(fd.error());
+                }
+                continue;
+            }
+            opened.emplace_back(*fd, &bucket_ops);
+            for (auto* op : bucket_ops) {
+                io_requests.push_back(
+                    {*fd, op->iovs.data(), static_cast<int>(op->iovs.size()),
+                     static_cast<int64_t>(op->descriptor.offset)});
+                io_ops.push_back(op);
+            }
+        }
+
+        // Bucket I/O completes short transfers.
+        SubmitBatchIo(io_requests, io_ops, results, write, true);
+
+        // A failed close fails the bucket's otherwise successful requests.
+        for (const auto& [fd, bucket_ops] : opened) {
+            auto close_result = fs_adapter_->CloseFile(fd);
+            if (close_result) continue;
+            for (auto* op : *bucket_ops) {
+                auto& result = results[op->index];
+                if (result) result = tl::make_unexpected(close_result.error());
+            }
+        }
+    }
+}
+
+void DistributedStorageBackend::SubmitBatchIo(
+    const std::vector<FdIoRequest>& io_requests,
+    const std::vector<DfsIoOp*>& io_ops,
+    std::vector<tl::expected<void, ErrorCode>>& results, bool write,
+    bool complete_short_io) {
+    if (io_requests.empty()) return;
+    const char* op_name = write ? "write" : "read";
+    auto io_results = write ? fs_adapter_->BatchWriteAt(io_requests)
+                            : fs_adapter_->BatchReadAt(io_requests);
+    if (io_results.size() != io_requests.size()) {
+        LOG(ERROR) << "Filesystem adapter returned an invalid batch " << op_name
+                   << " result count";
+        for (auto* op : io_ops) {
+            results[op->index] = tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+        return;
+    }
+    for (size_t i = 0; i < io_results.size(); ++i) {
+        auto& op = *io_ops[i];
+        const auto& result = io_results[i];
+        if (!result) {
+            LOG(WARNING) << "DFS " << op_name << " failed for key " << op.key
+                         << ", error=" << result.error();
+            results[op.index] = tl::make_unexpected(result.error());
+        } else if (*result == op.size) {
+            continue;
+        } else if (complete_short_io && *result != 0 && *result < op.size) {
+            auto rest =
+                TransferAll(*fs_adapter_, io_requests[i].fd, std::move(op.iovs),
+                            io_requests[i].offset, op.size, *result, write);
+            if (!rest) results[op.index] = tl::make_unexpected(rest.error());
+        } else {
+            LOG(WARNING) << "DFS short " << op_name << " for key " << op.key
+                         << ", expected=" << op.size << ", actual=" << *result;
+            results[op.index] = tl::make_unexpected(
+                write ? ErrorCode::FILE_WRITE_FAIL : ErrorCode::FILE_READ_FAIL);
+        }
+    }
+}
+
 std::vector<tl::expected<void, ErrorCode>>
 DistributedStorageBackend::BatchWrite(
     const std::vector<DfsWriteRequest>& requests) {
-    std::vector<tl::expected<void, ErrorCode>> results;
-    results.reserve(requests.size());
+    std::vector<tl::expected<void, ErrorCode>> results(requests.size());
 
     if (UsesObjectStorage()) {
         results.assign(requests.size(),
@@ -413,9 +647,19 @@ DistributedStorageBackend::BatchWrite(
         return results;
     }
 
-    for (const auto& request : requests) {
+    // Storage layout: bucket I/O uses temporary fds and completes short writes;
+    // shard I/O reuses cached fds and fails short writes.
+    const bool bucket_mode = UsesBucketAllocator();
+    // Execution mode: adapters that opt in (currently 3FS) collect validated
+    // writes for submission after the loop. Other adapters (including POSIX)
+    // execute each write in the loop, preserving per-request bucket handles
+    // and shard I/O locking.
+    const bool batch_io = fs_adapter_->SupportsBatchIo();
+    std::vector<DfsIoOp> ops;
+    if (batch_io) ops.reserve(requests.size());
+    for (size_t i = 0; i < requests.size(); ++i) {
+        const auto& request = requests[i];
         const auto& desc = request.descriptor;
-        const bool bucket_mode = UsesBucketAllocator();
         const bool range_valid =
             bucket_mode
                 ? IsBucketDescriptorRangeValid(desc, distributed_config_)
@@ -428,15 +672,13 @@ DistributedStorageBackend::BatchWrite(
                        << ", capacity="
                        << (bucket_mode ? distributed_config_.bucket_capacity
                                        : distributed_config_.shard_capacity);
-            results.emplace_back(
-                tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+            results[i] = tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             continue;
         }
 
         if (request.slices.size() >
             static_cast<size_t>(std::numeric_limits<int>::max())) {
-            results.emplace_back(
-                tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+            results[i] = tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             continue;
         }
         std::vector<iovec> iovs;
@@ -457,66 +699,29 @@ DistributedStorageBackend::BatchWrite(
             LOG(WARNING) << "Invalid DFS write request for key " << request.key
                          << ", expected=" << desc.object_size
                          << ", actual=" << total_size;
-            results.emplace_back(
-                tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+            results[i] = tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             continue;
         }
+        DfsIoOp op{i, request.key, desc, std::move(iovs), total_size};
+        if (batch_io) {
+            ops.push_back(std::move(op));
+        } else {
+            results[i] = ExecuteSingleIo(op, true);
+        }
+    }
 
-        if (bucket_mode) {
-            auto fd = OpenBucket(desc);
-            if (!fd) {
-                results.emplace_back(tl::make_unexpected(fd.error()));
-                continue;
-            }
-            auto write_result = TransferAll(*fs_adapter_, *fd, std::move(iovs),
-                                            static_cast<int64_t>(desc.offset),
-                                            total_size, true);
-            auto close_result = fs_adapter_->CloseFile(*fd);
-            if (!write_result) {
-                results.emplace_back(tl::make_unexpected(write_result.error()));
-            } else if (!close_result) {
-                results.emplace_back(tl::make_unexpected(close_result.error()));
-            } else {
-                results.emplace_back();
-            }
-            continue;
-        }
-
-        auto shard_result = GetOrOpenShard(desc);
-        if (!shard_result) {
-            LOG(ERROR) << "Failed to open DFS shard for key " << request.key
-                       << ": " << shard_result.error();
-            results.emplace_back(tl::make_unexpected(shard_result.error()));
-            continue;
-        }
-        auto& shard = **shard_result;
-        std::lock_guard lock(shard.mutex);
-        auto write_result =
-            fs_adapter_->WriteAt(shard.fd, iovs.data(), iovs.size(),
-                                 static_cast<int64_t>(desc.offset));
-        if (!write_result) {
-            LOG(WARNING) << "DFS write failed for key " << request.key
-                         << ", error=" << write_result.error();
-            results.emplace_back(tl::make_unexpected(write_result.error()));
-            continue;
-        }
-        if (*write_result != total_size) {
-            LOG(WARNING) << "DFS short write for key " << request.key
-                         << ", expected=" << total_size
-                         << ", actual=" << *write_result;
-            results.emplace_back(
-                tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL));
-            continue;
-        }
-        results.emplace_back();
+    if (!batch_io) return results;
+    if (bucket_mode) {
+        ExecuteBucketBatchIo(ops, results, true);
+    } else {
+        ExecuteShardBatchIo(ops, results, true);
     }
     return results;
 }
 
 std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
     const std::vector<DfsReadRequest>& requests) {
-    std::vector<tl::expected<void, ErrorCode>> results;
-    results.reserve(requests.size());
+    std::vector<tl::expected<void, ErrorCode>> results(requests.size());
 
     if (UsesObjectStorage()) {
         results.assign(requests.size(),
@@ -530,9 +735,19 @@ std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
         return results;
     }
 
-    for (const auto& request : requests) {
+    // Storage layout: bucket I/O uses temporary fds and completes short reads;
+    // shard I/O reuses cached fds and fails short reads.
+    const bool bucket_mode = UsesBucketAllocator();
+    // Execution mode: adapters that opt in (currently 3FS) collect validated
+    // reads for submission after the loop. Other adapters (including POSIX)
+    // execute each read in the loop, preserving per-request bucket handles
+    // and shard I/O locking.
+    const bool batch_io = fs_adapter_->SupportsBatchIo();
+    std::vector<DfsIoOp> ops;
+    if (batch_io) ops.reserve(requests.size());
+    for (size_t i = 0; i < requests.size(); ++i) {
+        const auto& request = requests[i];
         const auto& desc = request.descriptor;
-        const bool bucket_mode = UsesBucketAllocator();
         const bool range_valid =
             bucket_mode
                 ? IsBucketDescriptorRangeValid(desc, distributed_config_)
@@ -545,8 +760,7 @@ std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
                        << ", capacity="
                        << (bucket_mode ? distributed_config_.bucket_capacity
                                        : distributed_config_.shard_capacity);
-            results.emplace_back(
-                tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+            results[i] = tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             continue;
         }
         if (desc.object_size > std::numeric_limits<size_t>::max() ||
@@ -555,8 +769,7 @@ std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
             LOG(ERROR) << "DFS read request exceeds platform limits for key "
                        << request.key << ", object_size=" << desc.object_size
                        << ", slice_count=" << request.slices.size();
-            results.emplace_back(
-                tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+            results[i] = tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             continue;
         }
 
@@ -579,58 +792,22 @@ std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
         if (invalid || remaining != 0) {
             LOG(WARNING) << "Invalid DFS read request for key " << request.key
                          << ", expected capacity at least=" << desc.object_size;
-            results.emplace_back(
-                tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+            results[i] = tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             continue;
         }
+        DfsIoOp op{i, request.key, desc, std::move(iovs), desc.object_size};
+        if (batch_io) {
+            ops.push_back(std::move(op));
+        } else {
+            results[i] = ExecuteSingleIo(op, false);
+        }
+    }
 
-        if (bucket_mode) {
-            auto fd = OpenBucket(desc);
-            if (!fd) {
-                results.emplace_back(tl::make_unexpected(fd.error()));
-                continue;
-            }
-            auto read_result = TransferAll(*fs_adapter_, *fd, std::move(iovs),
-                                           static_cast<int64_t>(desc.offset),
-                                           desc.object_size, false);
-            auto close_result = fs_adapter_->CloseFile(*fd);
-            if (!read_result) {
-                results.emplace_back(tl::make_unexpected(read_result.error()));
-            } else if (!close_result) {
-                results.emplace_back(tl::make_unexpected(close_result.error()));
-            } else {
-                results.emplace_back();
-            }
-            continue;
-        }
-
-        auto shard_result = GetOrOpenShard(desc);
-        if (!shard_result) {
-            LOG(ERROR) << "Failed to open DFS shard for key " << request.key
-                       << ": " << shard_result.error();
-            results.emplace_back(tl::make_unexpected(shard_result.error()));
-            continue;
-        }
-        auto& shard = **shard_result;
-        std::lock_guard lock(shard.mutex);
-        auto read_result = fs_adapter_->ReadAt(
-            shard.fd, iovs.data(), static_cast<int>(iovs.size()),
-            static_cast<int64_t>(desc.offset));
-        if (!read_result) {
-            LOG(WARNING) << "DFS read failed for key " << request.key
-                         << ", error=" << read_result.error();
-            results.emplace_back(tl::make_unexpected(read_result.error()));
-            continue;
-        }
-        if (*read_result != desc.object_size) {
-            LOG(WARNING) << "DFS short read for key " << request.key
-                         << ", expected=" << desc.object_size
-                         << ", actual=" << *read_result;
-            results.emplace_back(
-                tl::make_unexpected(ErrorCode::FILE_READ_FAIL));
-            continue;
-        }
-        results.emplace_back();
+    if (!batch_io) return results;
+    if (bucket_mode) {
+        ExecuteBucketBatchIo(ops, results, false);
+    } else {
+        ExecuteShardBatchIo(ops, results, false);
     }
     return results;
 }

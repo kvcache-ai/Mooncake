@@ -12,6 +12,11 @@ namespace fs = std::filesystem;
 
 class FileUtil {
    public:
+    // Snapshot birth times before sorting, oldest known first. Failed metadata
+    // queries and filesystems without birth times sort last, by path. Entries
+    // are retained so callers can separately check whether they are readable.
+    static void SortByCreationTime(std::vector<fs::directory_entry>& files);
+
     static std::string ResolvePathFromKey(const std::string& key,
                                           const std::string& root_dir,
                                           const std::string& fsdir);

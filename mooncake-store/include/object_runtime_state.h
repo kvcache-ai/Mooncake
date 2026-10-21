@@ -99,8 +99,8 @@ struct PromotionCandidate {
 // and reset at PromotionAllocStart so each phase (queue-wait and
 // active-transfer) gets its own full put_start_release_timeout_sec_
 // window. Without the reset a backlogged task could enter active
-// transfer with little TTL left, and the reaper could free the
-// staged replica via EraseReplicaByID mid-RDMA-write.
+// transfer with little TTL left, and the reaper could erase the
+// staged replica by its allocation id mid-RDMA-write.
 //
 // holder_id is the client owning the source LOCAL_DISK segment and
 // the only one authorized to commit (NotifyPromotionSuccess) or

@@ -25,6 +25,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -86,6 +87,7 @@ class FakeTransport : public Transport {
     std::atomic<int> submit_calls{0};
     std::atomic<int> status_calls{0};
     std::atomic<int> add_mem_calls{0};
+    std::atomic<int> remove_mem_calls{0};
 
     Status install(std::string& /*local_segment_name*/,
                    std::shared_ptr<ControlService> /*metadata*/,
@@ -157,7 +159,11 @@ class FakeTransport : public Transport {
         return Status::OK();
     }
 
-    Status removeMemoryBuffer(BufferDesc& /*desc*/) override {
+    Status removeMemoryBuffer(BufferDesc& desc) override {
+        ++remove_mem_calls;
+        desc.transports.erase(std::remove(desc.transports.begin(),
+                                          desc.transports.end(), self_type_),
+                              desc.transports.end());
         return Status::OK();
     }
 
@@ -324,6 +330,31 @@ TEST(ProgressWorker, DisabledByDefaultLeavesBehaviorUnchanged) {
 
     EXPECT_TRUE(engine.freeBatch(batch_id).ok());
     EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), kBufLen).ok());
+}
+
+TEST(ProgressWorker, MemoryUnregisterSurvivesBackendMetadataMutation) {
+    auto cfg = makeMinimalP2PConfig();
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake_rdma = std::make_shared<FakeTransport>(RDMA);
+    auto fake_tcp = std::make_shared<FakeTransport>(TCP);
+    std::string segment = engine.getSegmentName();
+    ASSERT_TRUE(fake_rdma->install(segment, nullptr, nullptr).ok());
+    ASSERT_TRUE(fake_tcp->install(segment, nullptr, nullptr).ok());
+    engine.swapTransportForTest(RDMA, fake_rdma);
+    engine.swapTransportForTest(TCP, fake_tcp);
+
+    constexpr size_t kBufferLength = 4096;
+    std::vector<uint8_t> buffer(kBufferLength);
+    ASSERT_TRUE(engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+    ASSERT_EQ(fake_rdma->add_mem_calls.load(), 1);
+    ASSERT_EQ(fake_tcp->add_mem_calls.load(), 1);
+
+    ASSERT_TRUE(
+        engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
+    EXPECT_EQ(fake_rdma->remove_mem_calls.load(), 1);
+    EXPECT_EQ(fake_tcp->remove_mem_calls.load(), 1);
 }
 
 // ---------------------------------------------------------------------------

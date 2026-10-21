@@ -58,8 +58,21 @@ class RdmaTransportTestPeer {
 
 class RdmaContextTestPeer {
    public:
+    static void bindProtectionDomain(RdmaContext &context, ibv_pd *pd) {
+        context.pd_ = pd;
+    }
+
     static bool hasEndpointStore(const RdmaContext &context) {
         return context.endpoint_store_ != nullptr;
+    }
+
+    static void bindEndpointStore(RdmaContext &context,
+                                  std::shared_ptr<EndpointStore> store) {
+        context.endpoint_store_ = std::move(store);
+    }
+
+    static void enablePeerGidRecovery(RdmaContext &context) {
+        context.peer_auto_gid_states_.configure(2, true);
     }
 
     static void seedAutoGidState(RdmaContext &context, ibv_context *verbs_ctx,

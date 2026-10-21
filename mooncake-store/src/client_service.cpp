@@ -946,8 +946,8 @@ ErrorCode Client::InitTransferEngine(
                 LOG(ERROR) << "Failed to install TCP transport";
                 return ErrorCode::INTERNAL_ERROR;
             }
-        } else if (protocol == "ascend" || protocol == "ubshmem" ||
-                   protocol == "sunrise_link") {
+        } else if (protocol == "nvlink" || protocol == "ascend" ||
+                   protocol == "ubshmem" || protocol == "sunrise_link") {
             if (device_names.has_value()) {
                 LOG(WARNING) << protocol
                              << " protocol does not use device names, ignoring";
@@ -1060,7 +1060,8 @@ void Client::InitTransferSubmitter() {
             GetCurrentNumaSocketId());
     transfer_submitter_ = std::make_unique<TransferSubmitter>(
         *transfer_engine_, storage_backend_, local_hostname_,
-        metrics_ ? &metrics_->transfer_metric : nullptr, numa_socket_id);
+        metrics_ ? &metrics_->transfer_metric : nullptr, numa_socket_id,
+        metrics_ ? &metrics_->nof_metric : nullptr);
 #else
     transfer_submitter_ = std::make_unique<TransferSubmitter>(
         *transfer_engine_, storage_backend_, local_hostname_,
@@ -1074,8 +1075,14 @@ std::optional<std::shared_ptr<Client>> Client::Create(
     const std::string& master_server_entry,
     const std::shared_ptr<TransferEngine>& transfer_engine,
     std::map<std::string, std::string> labels, const std::string& tenant_id) {
+    // Reused engines retain their metadata mode. In particular, P2PHANDSHAKE
+    // must publish the engine's actual endpoint rather than the Store hostname.
+    const auto& resolved_metadata =
+        transfer_engine && metadata_connstring.empty()
+            ? transfer_engine->getMetadataConnectionString()
+            : metadata_connstring;
     auto client = std::shared_ptr<Client>(new Client(
-        local_hostname, metadata_connstring, protocol, labels, tenant_id));
+        local_hostname, resolved_metadata, protocol, labels, tenant_id));
 
     ErrorCode err = client->ConnectToMaster(master_server_entry);
     if (err != ErrorCode::OK) {
@@ -1267,7 +1274,7 @@ tl::expected<QueryResult, ErrorCode> Client::Query(
     return tl::expected<QueryResult, ErrorCode>(
         tl::in_place, std::move(result.value().replicas),
         start_time + std::chrono::milliseconds(result.value().lease_ttl_ms),
-        result.value().object_checksum);
+        result.value().object_checksum, result.value().resolved_tenant_id);
 }
 
 std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
@@ -1301,7 +1308,8 @@ std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
                 tl::in_place, std::move(response[i].value().replicas),
                 start_time +
                     std::chrono::milliseconds(response[i].value().lease_ttl_ms),
-                response[i].value().object_checksum);
+                response[i].value().object_checksum,
+                response[i].value().resolved_tenant_id);
         } else {
             results.emplace_back(tl::unexpected(response[i].error()));
         }
@@ -2006,7 +2014,7 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     auto start_result = master_client_.PutStart(key, slice_lengths, client_cfg);
     if (!start_result &&
         start_result.error() == ErrorCode::OBJECT_ALREADY_EXISTS &&
-        healDanglingLocalDiskReplica(key)) {
+        healDanglingLocalDiskReplica(key) == DiskReplicaHealResult::kEvicted) {
         start_result = master_client_.PutStart(key, slice_lengths, client_cfg);
     }
     if (!start_result) {
@@ -2157,12 +2165,13 @@ bool HasOnlyClientLocalDiskReplicas(
 
 }  // namespace
 
-bool Client::healDanglingLocalDiskReplica(const ObjectKey& key) {
+Client::DiskReplicaHealResult Client::healDanglingLocalDiskReplica(
+    const ObjectKey& key) {
     auto replicas = master_client_.GetReplicaList(key);
     if (!replicas ||
         !HasOnlyClientLocalDiskReplicas(replicas->replicas, client_id_) ||
         !local_disk_probe_fn_) {
-        return false;
+        return DiskReplicaHealResult::kNotDangling;
     }
     // RemoveAll wipes client SSD files while master keeps the metadata
     // (issue #3709), leaving a completed entry whose backing file is gone.
@@ -2172,19 +2181,22 @@ bool Client::healDanglingLocalDiskReplica(const ObjectKey& key) {
     // unknown (transport/config trouble) keeps the old idempotent path, so a
     // healthy replica can never be evicted by mistake.
     const std::optional<bool> file_gone = local_disk_probe_fn_(key);
+    if (file_gone == false) {
+        return DiskReplicaHealResult::kPresent;
+    }
     if (file_gone != true) {
-        return false;
+        return DiskReplicaHealResult::kUnknown;
     }
     auto evicted =
         master_client_.EvictDiskReplica(key, ReplicaType::LOCAL_DISK);
     if (!evicted) {
         LOG(WARNING) << "Failed to evict dangling LOCAL_DISK replica for key="
                      << key << ": " << toString(evicted.error());
-        return false;
+        return DiskReplicaHealResult::kUnknown;
     }
     LOG(WARNING) << "Evicted dangling LOCAL_DISK replica for key=" << key
                  << " (backing file already gone)";
-    return true;
+    return DiskReplicaHealResult::kEvicted;
 }
 
 tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
@@ -2337,50 +2349,6 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
     }
 
     return {};
-}
-
-std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
-    const std::vector<ObjectKey>& keys,
-    std::vector<std::vector<Slice>>& batched_slices,
-    const ReplicateConfig& config) {
-    return BatchUpsert(keys, batched_slices, config, {});
-}
-
-std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
-    const std::vector<ObjectKey>& keys,
-    std::vector<std::vector<Slice>>& batched_slices,
-    const ReplicateConfig& config, const WriteBufferStager& stager) {
-    ReplicateConfig client_cfg = AttachHostId(config);
-    if (protocol_ == "cxl") {
-        client_cfg.preferred_segment = local_hostname_;
-    }
-    std::vector<PutOperation> ops = CreatePutOperations(keys, batched_slices);
-    ComputeBatchObjectChecksums(ops);
-    if (client_cfg.prefer_alloc_in_same_node) {
-        if (auto err = ValidatePreferSameNodeWriteConfig(client_cfg)) {
-            return std::vector<tl::expected<void, ErrorCode>>(
-                keys.size(), tl::unexpected(*err));
-        }
-        StartBatchUpsert(ops, client_cfg);
-        StageWriteBuffersForRemoteReplicas(ops, stager);
-        return BatchWriteWhenPreferSameNode(ops, true);
-    }
-
-    StartBatchUpsert(ops, client_cfg);
-    StageWriteBuffersForRemoteReplicas(ops, stager);
-    auto t0 = std::chrono::steady_clock::now();
-    SubmitTransfers(ops);
-    WaitForTransfers(ops);
-    SubmitDfsWrites(ops);
-    auto us = std::chrono::duration_cast<std::chrono::microseconds>(
-                  std::chrono::steady_clock::now() - t0)
-                  .count();
-    if (metrics_) {
-        metrics_->transfer_metric.batch_put_latency_us.observe(us);
-    }
-
-    FinalizeBatchUpsert(ops);
-    return CollectResults(ops);
 }
 
 // TODO: `client.cpp` is too long, consider split it into multiple files
@@ -2575,6 +2543,8 @@ void Client::healDanglingLocalDiskBatchStarts(
     std::vector<std::string> retry_keys;
     std::vector<std::vector<uint64_t>> retry_slices;
     std::vector<size_t> retry_positions;
+    ReplicateConfig retry_config = config;
+    if (retry_config.session_ids) retry_config.session_ids->clear();
     for (size_t j = 0; j < evict_keys.size(); ++j) {
         if (!evicted[j]) {
             LOG(WARNING) << "Failed to evict dangling LOCAL_DISK replica for "
@@ -2588,12 +2558,16 @@ void Client::healDanglingLocalDiskBatchStarts(
         retry_keys.emplace_back(keys[already_exists[evict_positions[j]]]);
         retry_slices.emplace_back(
             slice_lengths[already_exists[evict_positions[j]]]);
+        if (config.session_ids) {
+            retry_config.session_ids->push_back(
+                config.session_ids->at(already_exists[evict_positions[j]]));
+        }
     }
     if (retry_keys.empty()) {
         return;
     }
     auto retry_responses =
-        master_client_.BatchPutStart(retry_keys, retry_slices, config);
+        master_client_.BatchPutStart(retry_keys, retry_slices, retry_config);
     if (retry_responses.size() != retry_keys.size()) {
         return;
     }
@@ -2626,6 +2600,8 @@ void Client::StartBatchPut(std::vector<PutOperation>& ops,
     std::vector<std::string> keys;
     std::vector<std::vector<uint64_t>> slice_lengths;
     std::vector<size_t> active_indices;
+    ReplicateConfig active_config = config;
+    if (active_config.session_ids) active_config.session_ids->clear();
 
     keys.reserve(ops.size());
     slice_lengths.reserve(ops.size());
@@ -2645,6 +2621,9 @@ void Client::StartBatchPut(std::vector<PutOperation>& ops,
         }
         active_indices.emplace_back(i);
         keys.emplace_back(op.key);
+        if (config.session_ids) {
+            active_config.session_ids->push_back(config.session_ids->at(i));
+        }
 
         std::vector<uint64_t> slice_sizes;
         slice_sizes.reserve(op.slices.size());
@@ -2659,7 +2638,7 @@ void Client::StartBatchPut(std::vector<PutOperation>& ops,
     }
 
     auto start_responses =
-        master_client_.BatchPutStart(keys, slice_lengths, config);
+        master_client_.BatchPutStart(keys, slice_lengths, active_config);
 
     // Ensure response size matches request size
     if (start_responses.size() != active_indices.size()) {
@@ -2709,7 +2688,7 @@ void Client::StartBatchPut(std::vector<PutOperation>& ops,
     }
 
     healDanglingLocalDiskBatchStarts(ops, active_indices, already_exists, keys,
-                                     slice_lengths, config);
+                                     slice_lengths, active_config);
     for (size_t i : already_exists) {
         auto& op = ops[active_indices[i]];
         if (!op.IsResolved() && op.replicas.empty()) {
@@ -2725,6 +2704,8 @@ void Client::StartBatchUpsert(std::vector<PutOperation>& ops,
     std::vector<std::string> keys;
     std::vector<std::vector<uint64_t>> slice_lengths;
     std::vector<size_t> active_indices;
+    ReplicateConfig active_config = config;
+    if (active_config.session_ids) active_config.session_ids->clear();
 
     keys.reserve(ops.size());
     slice_lengths.reserve(ops.size());
@@ -2744,6 +2725,9 @@ void Client::StartBatchUpsert(std::vector<PutOperation>& ops,
         }
         active_indices.emplace_back(i);
         keys.emplace_back(op.key);
+        if (config.session_ids) {
+            active_config.session_ids->push_back(config.session_ids->at(i));
+        }
 
         std::vector<uint64_t> slice_sizes;
         slice_sizes.reserve(op.slices.size());
@@ -2758,7 +2742,7 @@ void Client::StartBatchUpsert(std::vector<PutOperation>& ops,
     }
 
     auto start_responses =
-        master_client_.BatchUpsertStart(keys, slice_lengths, config);
+        master_client_.BatchUpsertStart(keys, slice_lengths, active_config);
 
     // Ensure response size matches request size
     if (start_responses.size() != active_indices.size()) {
@@ -3639,6 +3623,10 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const ReplicateConfig& config, const WriteBufferStager& stager) {
+    if (!config.ValidSessionIds(keys.size())) {
+        return std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
     ReplicateConfig client_cfg = AttachHostId(config);
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
@@ -3672,12 +3660,65 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     return CollectResults(ops);
 }
 
+// Defined after PutOperation: std::vector<PutOperation> must be instantiated
+// on a complete type (clang-based compilers diagnose this; GCC defers it).
+std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
+    const std::vector<ObjectKey>& keys,
+    std::vector<std::vector<Slice>>& batched_slices,
+    const ReplicateConfig& config) {
+    return BatchUpsert(keys, batched_slices, config, {});
+}
+
+std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
+    const std::vector<ObjectKey>& keys,
+    std::vector<std::vector<Slice>>& batched_slices,
+    const ReplicateConfig& config, const WriteBufferStager& stager) {
+    if (!config.ValidSessionIds(keys.size())) {
+        return std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
+    ReplicateConfig client_cfg = AttachHostId(config);
+    if (protocol_ == "cxl") {
+        client_cfg.preferred_segment = local_hostname_;
+    }
+    std::vector<PutOperation> ops = CreatePutOperations(keys, batched_slices);
+    ComputeBatchObjectChecksums(ops);
+    if (client_cfg.prefer_alloc_in_same_node) {
+        if (auto err = ValidatePreferSameNodeWriteConfig(client_cfg)) {
+            return std::vector<tl::expected<void, ErrorCode>>(
+                keys.size(), tl::unexpected(*err));
+        }
+        StartBatchUpsert(ops, client_cfg);
+        StageWriteBuffersForRemoteReplicas(ops, stager);
+        return BatchWriteWhenPreferSameNode(ops, true);
+    }
+
+    StartBatchUpsert(ops, client_cfg);
+    StageWriteBuffersForRemoteReplicas(ops, stager);
+    auto t0 = std::chrono::steady_clock::now();
+    SubmitTransfers(ops);
+    WaitForTransfers(ops);
+    SubmitDfsWrites(ops);
+    auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+                  std::chrono::steady_clock::now() - t0)
+                  .count();
+    if (metrics_) {
+        metrics_->transfer_metric.batch_put_latency_us.observe(us);
+    }
+
+    FinalizeBatchUpsert(ops);
+    return CollectResults(ops);
+}
+
 std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
 Client::StartBatchPutForSizes(const std::vector<std::string>& keys,
                               const std::vector<uint64_t>& object_sizes,
                               const ReplicateConfig& config) {
     std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
         results(keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    if (!config.ValidSessionIds(keys.size())) {
+        return results;
+    }
     if (keys.size() != object_sizes.size()) {
         LOG(ERROR) << "StartBatchPutForSizes size mismatch: keys="
                    << keys.size() << ", sizes=" << object_sizes.size();
@@ -3805,6 +3846,13 @@ tl::expected<void, ErrorCode> Client::EvictDiskReplica(
     const std::string& key, const std::string& tenant_id,
     ReplicaType replica_type) {
     return master_client_.EvictDiskReplica(key, tenant_id, replica_type);
+}
+
+tl::expected<bool, ErrorCode> Client::EvictDiskReplicaIfCurrent(
+    const std::string& key, const std::string& tenant_id,
+    ReplicaType replica_type, ReplicaID expected_replica_id) {
+    return master_client_.EvictDiskReplicaIfCurrent(
+        key, tenant_id, replica_type, expected_replica_id);
 }
 
 std::vector<tl::expected<void, ErrorCode>> Client::BatchEvictDiskReplica(
@@ -4130,8 +4178,8 @@ std::vector<tl::expected<bool, ErrorCode>> Client::BatchIsExist(
 }
 
 std::vector<tl::expected<bool, ErrorCode>> Client::BatchProbeKey(
-    const std::vector<std::string>& keys) {
-    auto response = master_client_.BatchProbeKey(keys);
+    const std::vector<std::string>& keys, const GrantLeasePolicy& policy) {
+    auto response = master_client_.BatchProbeKey(keys, policy);
 
     // Check if we got the expected number of responses
     if (response.size() != keys.size()) {
@@ -5601,13 +5649,29 @@ void Client::ProcessSlicesAsync(const std::string& key,
         return;
     }
 
+    // The writeback copies out of the read destination with a host memcpy
+    // (LocalHotCacheHandler::SubmitPutTask), so a slice that landed in device
+    // memory (e.g. batch_get_into into CUDA buffers) would fault the reader.
+    // Device-resident results are not cached through this path.
+    auto runtime_accelerator =
+        device::GetAcceleratorRegistry().RuntimeAccelerators();
+    size_t device_dest_slices = 0;
     // Identify TE transfer slices (non-local) and submit async put tasks
     for (size_t i = 0; i < slices.size(); ++i) {
+        if (runtime_accelerator.FindDeviceForPointer(slices[i].ptr) !=
+            nullptr) {
+            ++device_dest_slices;
+            continue;
+        }
         if (!hot_cache_handler_->SubmitPutTask(key, slices[i])) {
             LOG(ERROR) << "Failed to submit hot cache put task for key=" << key
                        << " slice_idx=" << i;
             return;
         }
+    }
+    if (device_dest_slices > 0) {
+        LOG(INFO) << "Skipped hot-cache writeback for " << device_dest_slices
+                  << " device-resident slice(s), key=" << key;
     }
 }
 

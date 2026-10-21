@@ -96,6 +96,41 @@ else()
   message(STATUS "RDMA: Disabled")
 endif()
 
+# libfabric (EFA, and tcp;ofi_rxm for tests). USE_EFA/USE_CXI already
+# resolve libfabric in mooncake-common/common.cmake.
+if(USE_FABRIC
+   OR USE_EFA
+   OR USE_CXI)
+  if(NOT LIBFABRIC_INCLUDE_DIR OR NOT LIBFABRIC_LIBRARY)
+    find_path(
+      LIBFABRIC_INCLUDE_DIR rdma/fabric.h
+      HINTS /opt/amazon/efa/include
+      PATH_SUFFIXES include)
+    find_library(
+      LIBFABRIC_LIBRARY fabric
+      HINTS /opt/amazon/efa/lib
+      PATH_SUFFIXES lib lib64)
+  endif()
+  if(NOT LIBFABRIC_INCLUDE_DIR OR NOT LIBFABRIC_LIBRARY)
+    message(
+      FATAL_ERROR
+        "TENT fabric transport needs libfabric. Set LIBFABRIC_INCLUDE_DIR and LIBFABRIC_LIBRARY."
+    )
+  endif()
+  set(TENT_WITH_FABRIC
+      ON
+      CACHE INTERNAL "")
+  message(STATUS "Fabric (libfabric): Enabled, ${LIBFABRIC_LIBRARY}")
+  target_compile_definitions(tent_interface INTERFACE USE_FABRIC)
+  target_include_directories(tent_interface INTERFACE ${LIBFABRIC_INCLUDE_DIR})
+  target_link_libraries(tent_interface INTERFACE ${LIBFABRIC_LIBRARY})
+else()
+  set(TENT_WITH_FABRIC
+      OFF
+      CACHE INTERNAL "")
+  message(STATUS "Fabric (libfabric): Disabled")
+endif()
+
 # io_uring
 if(TARGET Mooncake::liburing)
   message(STATUS "Uring: Enabled")
@@ -153,6 +188,7 @@ foreach(
   platform_sunrise
   platform_tpu
   platform_xpu
+  platform_mlu
   tent_xport_gds
   tent_xport_uring
   tent_xport_bufio
@@ -168,8 +204,11 @@ foreach(
   tent_xport_sunrise_link
   tent_xport_tpu
   tent_xport_xpu
+  tent_xport_mlu
   tent_xport_mpcomm
   tent_xport_hylink
+  tent_xport_fabric
+  tent_xport_memfabric
   tent_metrics)
   if(TARGET ${tgt})
     target_link_libraries(tent_link_group INTERFACE ${tgt})

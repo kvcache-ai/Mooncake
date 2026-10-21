@@ -19,12 +19,15 @@
 #include <glog/logging.h>
 #include <sys/mman.h>
 #include <sys/time.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <cassert>
 #include <cerrno>
 #include <cstddef>
+#include <climits>
 #include <cstdlib>
+#include <cstring>
 #include <future>
 #include <limits>
 #include <sstream>
@@ -55,6 +58,18 @@ namespace tent {
 namespace {
 
 constexpr uint64_t kDefaultRdmaQuiesceTimeoutNs = 10000000000ull;
+
+// EFA devices are listed by ibverbs but have no RC QPs; they are served by
+// the fabric transport instead.
+bool isEfaDevice(const std::string& name) {
+    const std::string link = "/sys/class/infiniband/" + name + "/device/driver";
+    char target[PATH_MAX];
+    ssize_t len = readlink(link.c_str(), target, sizeof(target) - 1);
+    if (len <= 0) return false;
+    target[len] = '\0';
+    const char* base = strrchr(target, '/');
+    return strcmp(base ? base + 1 : target, "efa") == 0;
+}
 
 uint16_t getRdmaBindDefaultPort(const Config& config) {
     constexpr const char* kKey = "rpc_server_port";
@@ -282,7 +297,10 @@ size_t RdmaTransport::initializeContexts() {
     size_t context_count = 0;
     for (size_t i = 0; i < local_topology_->getNicCount(); ++i) {
         auto entry = local_topology_->getNicEntry(i);
-        if (entry->type == Topology::NIC_RDMA) {
+        if (entry->type == Topology::NIC_RDMA && isEfaDevice(entry->name)) {
+            LOG(INFO) << "Skip EFA device " << entry->name
+                      << " (not RC capable; use the fabric transport)";
+        } else if (entry->type == Topology::NIC_RDMA) {
             auto context = std::make_shared<RdmaContext>(*this);
             if (context->construct(entry->name, params_) == 0) {
                 context_name_lookup_[entry->name] = i;
@@ -539,22 +557,12 @@ Status RdmaTransport::submitTransferTasks(
         std::vector<int> slice_dev_ids;
         // Only if a single request is enough, we perform aggregated allocation
         if (num_slices >= max_slice_count / 2) {
-            std::string source_location = kWildcardLocation;
-            auto source_locations =
-                Platform::getLoader().getLocation(request.source, 1, true);
-            if (!source_locations.empty()) {
-                source_location = source_locations[0].location;
-            }
-            auto device_selector = workers_->getDeviceSelector();
-            if (device_selector) {
-                auto status = device_selector->allocate(
-                    request.length, static_cast<uint32_t>(num_slices),
-                    block_size, source_location, slice_dev_ids,
-                    request.priority, batch->device_mask);
-                if (!status.ok() || slice_dev_ids.empty()) {
-                    LOG(WARNING) << "Device quota allocation failed: "
-                                 << status.message();
-                }
+            auto status = workers_->allocateDevices(
+                request, static_cast<uint32_t>(num_slices), block_size,
+                task->device_mask, slice_dev_ids);
+            if (!status.ok()) {
+                LOG(WARNING)
+                    << "Device quota allocation failed: " << status.message();
             }
         }
 

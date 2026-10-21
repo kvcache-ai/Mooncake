@@ -9,6 +9,10 @@ on:
         description: 'Skip publishing to TestPyPI'
         type: boolean
         default: false
+      run_rocm_integration:
+        description: 'Run MI350X hardware tests (requires the configured self-hosted runner)'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -24,7 +28,9 @@ concurrency:
 #    each wheel is stamped with the correct dev version for TestPyPI.
 # 3. Specialized platform and packaging checks run nightly instead of on every PR.
 # 4. publish-testpypi uploads standard and ROCm nightly artifacts to TestPyPI.
-# 5. nightly-gate aggregates ALL build + test results; notify-failure files an issue.
+# 5. MI350X hardware tests require NIGHTLY_ROCM_INTEGRATION=true or a manual opt-in.
+#    ROCm wheel builds and their smoke tests always run.
+# 6. nightly-gate aggregates required results; notify-failure files an issue.
 # ──────────────────────────────────────────────────────────────────────────────
 
 env:
@@ -37,8 +43,23 @@ jobs:
     runs-on: ubuntu-22.04
     outputs:
       nightly_version: ${{ steps.version.outputs.nightly_version }}
+      run_rocm_integration: ${{ steps.hardware.outputs.run_rocm_integration }}
     steps:
       - uses: actions/checkout@v4
+      - name: Select hardware tests
+        id: hardware
+        env:
+          RUN_ROCM_INTEGRATION: ${{ vars.NIGHTLY_ROCM_INTEGRATION == 'true' || (github.event_name == 'workflow_dispatch' && inputs.run_rocm_integration) }}
+        run: |
+          echo "run_rocm_integration=$RUN_ROCM_INTEGRATION" >> "$GITHUB_OUTPUT"
+          if [ "$RUN_ROCM_INTEGRATION" = "true" ]; then
+            echo "ROCm MI350X hardware integration: enabled and required." >> "$GITHUB_STEP_SUMMARY"
+          else
+            message="ROCm MI350X hardware integration was not requested and will not run. Set the repository variable NIGHTLY_ROCM_INTEGRATION=true after provisioning its runner, or select run_rocm_integration for a manual run. ROCm wheel builds and smoke tests remain required."
+            echo "::warning::$message"
+            echo "$message" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       - name: Compute nightly version
         id: version
         run: |
@@ -100,7 +121,8 @@ jobs:
       version_override: ${{ needs.version-stamp.outputs.nightly_version }}
 
   rocm-integration-test:
-    needs: build-wheel-rocm
+    needs: [version-stamp, build-wheel-rocm]
+    if: ${{ needs.version-stamp.outputs.run_rocm_integration == 'true' }}
     uses: ./.github/workflows/integration-test-rocm.yml
     with:
       checkout_ref: ${{ github.sha }}
@@ -142,6 +164,7 @@ jobs:
   build-docker:
     name: Build Docker Image
     runs-on: ubuntu-22.04
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
         with:
@@ -152,12 +175,24 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+        with:
+          # Avoid building the CUDA builder and runtime stages concurrently.
+          buildkitd-config-inline: |
+            [worker.oci]
+              max-parallelism = 1
 
       - name: Build Docker image
         run: |
-          docker build -f docker/mooncake.Dockerfile \
+          free -h
+          df -h
+          vmstat -w 30 &
+          monitor_pid=$!
+          trap 'kill "$monitor_pid" 2>/dev/null || true; free -h; df -h' EXIT
+          # This job validates the build; avoid a second image copy in Docker's store.
+          docker buildx build --output=type=cacheonly --progress=plain -f docker/mooncake.Dockerfile \
             --build-arg PYTHON_VERSION=3.10 \
-            --build-arg EP_TORCH_VERSIONS="2.14.0" \
+            --build-arg TORCH_VERSION=2.14.1 \
+            --build-arg BUILD_JOBS=2 \
             --build-arg CLEAN_BUILD_ARTIFACTS=1 \
             -t mooncake:from-source .
 
@@ -176,6 +211,15 @@ jobs:
       - name: Log nightly version
         run: |
           echo "Publishing nightly version: ${{ needs.version-stamp.outputs.nightly_version }}"
+
+      - name: Require TestPyPI credentials
+        env:
+          TESTPYPI_API_TOKEN: ${{ secrets.TESTPYPI_API_TOKEN }}
+        run: |
+          if [ -z "$TESTPYPI_API_TOKEN" ]; then
+            echo "::error::Set TESTPYPI_API_TOKEN in the nightly environment before publishing."
+            exit 1
+          fi
 
       - name: Download standard nightly wheel artifacts
         uses: actions/download-artifact@v4
@@ -213,8 +257,10 @@ jobs:
         env:
           TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ secrets.TESTPYPI_API_TOKEN }}
+          TWINE_NON_INTERACTIVE: "1"
         run: |
-          twine upload --repository testpypi --skip-existing dist-publish/*.whl
+          # Warehouse reports storage and file-size limits in the response body.
+          twine upload --repository testpypi --skip-existing --verbose --disable-progress-bar dist-publish/*.whl
 
   nightly-test:
     needs: version-stamp
@@ -551,15 +597,24 @@ jobs:
           echo "=== Nightly Gate Summary ==="
           echo "$NEEDS_JSON" | jq -r '
             to_entries[] | "\(.key): \(.value.result)"'
+          echo "$NEEDS_JSON" | jq -r '
+            to_entries[] | "- \(.key): \(.value.result)"' >> "$GITHUB_STEP_SUMMARY"
+          if [ "$ALLOW_ROCM_SKIP" = "true" ]; then
+            echo "ROCm MI350X hardware integration was not requested; its coverage is absent from this run." >> "$GITHUB_STEP_SUMMARY"
+          fi
 
           failing=$(echo "$NEEDS_JSON" | jq -r \
-            --arg allow_publish_skip "$ALLOW_PUBLISH_SKIP" '
+            --arg allow_publish_skip "$ALLOW_PUBLISH_SKIP" \
+            --arg allow_rocm_skip "$ALLOW_ROCM_SKIP" '
               to_entries[] |
               select(
                 .value.result != "success" and
                 (.key != "publish-testpypi" or
                  .value.result != "skipped" or
-                 $allow_publish_skip != "true")
+                 $allow_publish_skip != "true") and
+                (.key != "rocm-integration-test" or
+                 .value.result != "skipped" or
+                 $allow_rocm_skip != "true")
               ) |
               "\(.key): \(.value.result)"')
           if [ -n "$failing" ]; then
@@ -567,10 +622,11 @@ jobs:
             echo "$failing"
             exit 1
           fi
-          echo "All nightly jobs passed!"
+          echo "All required nightly jobs passed!"
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
           ALLOW_PUBLISH_SKIP: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.skip_publish == 'true' }}
+          ALLOW_ROCM_SKIP: ${{ needs.version-stamp.outputs.run_rocm_integration == 'false' }}
 
   notify-failure:
     if: ${{ always() && needs.nightly-gate.result == 'failure' }}

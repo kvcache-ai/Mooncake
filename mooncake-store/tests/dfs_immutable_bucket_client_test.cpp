@@ -1,10 +1,12 @@
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <memory>
 #include <optional>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -38,6 +40,9 @@ class FailingBucketPosixAdapter : public PosixFsAdapter {
 
 class DfsImmutableBucketClientTest : public ::testing::Test {
    protected:
+    virtual int MaxBucketCount() const { return 2; }
+    virtual uint64_t DefaultKvLeaseTtl() const { return 0; }
+
     void SetUp() override {
         root_ = (std::filesystem::temp_directory_path() /
                  ("dfs_bucket_client_" + std::to_string(::getpid()) + "_" +
@@ -49,15 +54,18 @@ class DfsImmutableBucketClientTest : public ::testing::Test {
         SetEnv("MOONCAKE_DFS_ROOT_DIR", root_);
         SetEnv("MOONCAKE_DFS_ALLOCATOR", "bucket");
         SetEnv("MOONCAKE_DFS_BUCKET_CAPACITY", "4096");
-        SetEnv("MOONCAKE_DFS_MAX_BUCKET_COUNT", "2");
+        SetEnv("MOONCAKE_DFS_MAX_BUCKET_COUNT",
+               std::to_string(MaxBucketCount()));
         SetEnv("MOONCAKE_DFS_ALIGNMENT", "4096");
         SetEnv("MOONCAKE_DFS_EVICTION_ENABLED", "1");
         SetEnv("MOONCAKE_DFS_EVICTION_HIGH_WATERMARK", "0.1");
         SetEnv("MOONCAKE_DFS_EVICTION_LOW_WATERMARK", "0.0");
         SetEnv("MOONCAKE_DFS_SINGLE_TENANT", "true");
 
-        ASSERT_TRUE(master_.Start(
-            InProcMasterConfigBuilder().set_default_kv_lease_ttl(0).build()));
+        ASSERT_TRUE(
+            master_.Start(InProcMasterConfigBuilder()
+                              .set_default_kv_lease_ttl(DefaultKvLeaseTtl())
+                              .build()));
         writer_ = CreateClient("127.0.0.1:18201");
         provider_ = CreateClient("127.0.0.1:18202");
         ASSERT_NE(writer_, nullptr);
@@ -76,7 +84,7 @@ class DfsImmutableBucketClientTest : public ::testing::Test {
         distributed_config.allocator_type = "bucket";
         distributed_config.alignment = 4096;
         distributed_config.bucket_capacity = 4096;
-        distributed_config.max_bucket_count = 2;
+        distributed_config.max_bucket_count = MaxBucketCount();
         auto adapter = std::make_unique<FailingBucketPosixAdapter>();
         adapter_ = adapter.get();
         backend_ = std::make_shared<DistributedStorageBackend>(
@@ -139,6 +147,12 @@ class DfsImmutableBucketClientTest : public ::testing::Test {
     size_t segment_size_ = 0;
     std::string root_;
     std::vector<std::pair<std::string, std::optional<std::string>>> saved_env_;
+};
+
+class DfsImmutableBucketLruClientTest : public DfsImmutableBucketClientTest {
+   protected:
+    int MaxBucketCount() const override { return 3; }
+    uint64_t DefaultKvLeaseTtl() const override { return 50; }
 };
 
 TEST_F(DfsImmutableBucketClientTest, PutReturnsAfterWriteAndFailureRevokes) {
@@ -226,6 +240,101 @@ TEST_F(DfsImmutableBucketClientTest, ExhaustionEvictsWholeBucketAndRetries) {
     auto third_query = writer_->Query("third");
     ASSERT_TRUE(third_query);
     EXPECT_EQ(third_query->replicas.size(), 2u);
+}
+
+TEST_F(DfsImmutableBucketClientTest, DfsOnlyObjectsLiveAndDieWithTheirBucket) {
+    ReplicateConfig dfs_only;
+    dfs_only.replica_num = 0;
+    dfs_only.dfs_replica_num = 1;
+    auto expect_value = [this](const std::string& key,
+                               const std::string& expected) {
+        auto query = writer_->Query(key);
+        ASSERT_TRUE(query) << key;
+        ASSERT_EQ(query->replicas.size(), 1u) << key;
+        ASSERT_TRUE(query->replicas[0].is_dfs_replica()) << key;
+        // The fixture's zero lease TTL makes Client::Get report LEASE_EXPIRED,
+        // so read the descriptor through the backend like the other tests.
+        std::string output(expected.size(), '\0');
+        auto reads =
+            backend_->BatchRead({{key,
+                                  query->replicas[0].get_dfs_descriptor(),
+                                  {{output.data(), output.size()}}}});
+        ASSERT_TRUE(reads[0]) << key;
+        EXPECT_EQ(output, expected) << key;
+    };
+
+    std::string first(4096, '1');
+    std::string second(4096, '2');
+    std::string third(4096, '3');
+    auto first_slices = Slices(first);
+    auto second_slices = Slices(second);
+    auto third_slices = Slices(third);
+    ASSERT_TRUE(writer_->Put("first", first_slices, dfs_only));
+    ASSERT_TRUE(writer_->Put("second", second_slices, dfs_only));
+    // Both buckets are full: the third write forces a whole-bucket eviction.
+    // With no memory replica, the evicted object disappears entirely.
+    ASSERT_TRUE(writer_->Put("third", third_slices, dfs_only));
+    auto first_query = writer_->Query("first");
+    ASSERT_FALSE(first_query);
+    EXPECT_EQ(first_query.error(), ErrorCode::OBJECT_NOT_FOUND);
+    expect_value("third", third);
+
+    adapter_->FailNextWrite();
+    std::string failed(4096, 'F');
+    auto failed_slices = Slices(failed);
+    auto failed_put = writer_->Put("failed", failed_slices, dfs_only);
+    ASSERT_FALSE(failed_put);
+    EXPECT_EQ(failed_put.error(), ErrorCode::FILE_WRITE_FAIL);
+    auto missing = writer_->Query("failed");
+    ASSERT_FALSE(missing);
+    EXPECT_EQ(missing.error(), ErrorCode::OBJECT_NOT_FOUND);
+
+    // Same-size upsert reallocates into a new bucket.
+    std::string replacement(4096, 'R');
+    auto replacement_slices = Slices(replacement);
+    ASSERT_TRUE(writer_->Upsert("third", replacement_slices, dfs_only));
+    expect_value("third", replacement);
+}
+
+TEST_F(DfsImmutableBucketLruClientTest, BatchQueryRefreshesDfsBucketLru) {
+    std::string first(4096, '1');
+    std::string second(4096, '2');
+    std::string third(4096, '3');
+    std::string fourth(4096, '4');
+    auto first_slices = Slices(first);
+    auto second_slices = Slices(second);
+    auto third_slices = Slices(third);
+    auto fourth_slices = Slices(fourth);
+    ASSERT_TRUE(writer_->Put("first", first_slices, DfsConfig()));
+    ASSERT_TRUE(writer_->Put("second", second_slices, DfsConfig()));
+    ASSERT_TRUE(writer_->Put("third", third_slices, DfsConfig()));
+
+    auto batch_queries = writer_->BatchQuery({"first"});
+    ASSERT_EQ(batch_queries.size(), 1u);
+    ASSERT_TRUE(batch_queries[0]);
+    // Let the read lease expire so the next allocation can exercise LRU order.
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(DefaultKvLeaseTtl() + 100));
+
+    ASSERT_TRUE(writer_->Put("fourth", fourth_slices, DfsConfig()));
+
+    auto first_query = writer_->Query("first");
+    ASSERT_TRUE(first_query);
+    auto first_dfs =
+        std::find_if(first_query->replicas.begin(), first_query->replicas.end(),
+                     [](const Replica::Descriptor& descriptor) {
+                         return descriptor.is_dfs_replica();
+                     });
+    ASSERT_NE(first_dfs, first_query->replicas.end());
+
+    auto second_query = writer_->Query("second");
+    ASSERT_TRUE(second_query);
+    auto second_dfs = std::find_if(second_query->replicas.begin(),
+                                   second_query->replicas.end(),
+                                   [](const Replica::Descriptor& descriptor) {
+                                       return descriptor.is_dfs_replica();
+                                   });
+    EXPECT_EQ(second_dfs, second_query->replicas.end());
 }
 
 }  // namespace
