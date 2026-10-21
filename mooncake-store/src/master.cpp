@@ -35,6 +35,8 @@
 #include "master_config.h"
 #include "version.h"
 
+#include "etcd_helper.h"
+
 using namespace coro_rpc;
 using namespace async_simple;
 using namespace async_simple::coro;
@@ -346,6 +348,16 @@ DEFINE_string(ha_backend_connstring, "",
 DEFINE_string(
     etcd_endpoints, "",
     "Endpoints of ETCD server, separated by semicolon, required in HA mode");
+DEFINE_string(etcd_ca_file, "",
+              "Path to CA certificate file for etcd TLS connections");
+DEFINE_string(etcd_cert_file, "",
+              "Path to client certificate file for etcd TLS connections");
+DEFINE_string(etcd_key_file, "",
+              "Path to client key file for etcd TLS connections");
+DEFINE_bool(etcd_tls_enabled, false,
+            "Enable TLS authentication for etcd connections. "
+            "When true, --etcd_ca_file, --etcd_cert_file, and "
+            "--etcd_key_file must all be provided");
 DEFINE_int64(client_ttl, mooncake::DEFAULT_CLIENT_LIVE_TTL_SEC,
              "Deprecated alias for --client_active_ttl_sec");
 DEFINE_int64(client_active_ttl_sec, mooncake::DEFAULT_CLIENT_LIVE_TTL_SEC,
@@ -678,6 +690,14 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
                             FLAGS_ha_leader_lease_ttl_sec);
     default_config.GetString("etcd_endpoints", &master_config.etcd_endpoints,
                              FLAGS_etcd_endpoints);
+    default_config.GetBool("etcd_tls_enabled", &master_config.etcd_tls_enabled,
+                           FLAGS_etcd_tls_enabled);
+    default_config.GetString("etcd_ca_file", &master_config.etcd_ca_file,
+                             FLAGS_etcd_ca_file);
+    default_config.GetString("etcd_cert_file", &master_config.etcd_cert_file,
+                             FLAGS_etcd_cert_file);
+    default_config.GetString("etcd_key_file", &master_config.etcd_key_file,
+                             FLAGS_etcd_key_file);
     default_config.GetString("cluster_id", &master_config.cluster_id,
                              FLAGS_cluster_id);
     default_config.GetBool("enable_oplog", &master_config.enable_oplog,
@@ -1122,6 +1142,26 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.etcd_endpoints = FLAGS_etcd_endpoints;
     }
+    if ((google::GetCommandLineFlagInfo("etcd_tls_enabled", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.etcd_tls_enabled = FLAGS_etcd_tls_enabled;
+    }
+    if ((google::GetCommandLineFlagInfo("etcd_ca_file", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.etcd_ca_file = FLAGS_etcd_ca_file;
+    }
+    if ((google::GetCommandLineFlagInfo("etcd_cert_file", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.etcd_cert_file = FLAGS_etcd_cert_file;
+    }
+    if ((google::GetCommandLineFlagInfo("etcd_key_file", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.etcd_key_file = FLAGS_etcd_key_file;
+    }
     if ((google::GetCommandLineFlagInfo("nof_heartbeat_interval_sec", &info) &&
          !info.is_default) ||
         !conf_set) {
@@ -1477,6 +1517,11 @@ int main(int argc, char* argv[]) {
         const char* env = std::getenv("POD_NAMESPACE");
         if (env) master_config.pod_namespace = env;
     }
+
+    // Configure TLS for etcd connections before any HA setup
+    mooncake::EtcdHelper::SetTLSConfig(
+        master_config.etcd_tls_enabled, master_config.etcd_ca_file,
+        master_config.etcd_cert_file, master_config.etcd_key_file);
 
     const std::string ha_backend_connstring =
         ResolveHABackendConnstring(master_config);

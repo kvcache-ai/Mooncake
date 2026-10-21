@@ -747,6 +747,11 @@ target_link_libraries(
   mooncake_client
   PRIVATE mooncake_store transfer_engine asio_shared gflags::gflags
           yalantinglibs::yalantinglibs ${ALLOCATOR_LIBS})
+
+if(STORE_USE_ETCD)
+  add_dependencies(mooncake_client build_etcd_wrapper)
+endif()
+
 if(USE_CUDA)
   target_compile_definitions(mooncake_client PRIVATE USE_CUDA)
   target_include_directories(mooncake_client

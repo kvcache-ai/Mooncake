@@ -33,8 +33,12 @@ import "C"
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
+	"log"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -103,6 +107,9 @@ var (
 	globalClient   *clientv3.Client
 	globalMutex    sync.Mutex
 	globalRefCount int
+	// global TLS config for globalClient (set via SetGlobalTLSConfig)
+	globalTLSCfg     *tls.Config
+	globalTLSCfgInit sync.Once
 	// etcd client for store
 	storeClient *clientv3.Client
 	storeMutex  sync.Mutex
@@ -163,6 +170,45 @@ func parseEtcdEndpoints(endpoints *C.char) []string {
 	return validEndpoints
 }
 
+//export SetGlobalTLSConfig
+func SetGlobalTLSConfig(enabled C.int, caFile *C.char, certFile *C.char, keyFile *C.char) {
+	// When TLS is explicitly disabled, clear any existing config
+	if enabled == 0 {
+		globalMutex.Lock()
+		defer globalMutex.Unlock()
+		globalTLSCfg = nil
+		return
+	}
+
+	var ca, cert, key string
+	if caFile != nil {
+		ca = C.GoString(caFile)
+	}
+	if certFile != nil {
+		cert = C.GoString(certFile)
+	}
+	if keyFile != nil {
+		key = C.GoString(keyFile)
+	}
+
+	// When TLS is enabled, all three cert files must be provided
+	if ca == "" || cert == "" || key == "" {
+		log.Printf("ERROR: etcd TLS enabled but missing certificate files (ca=%q, cert=%q, key=%q)",
+			ca, cert, key)
+		return
+	}
+
+	cfg, err := buildTLSConfigFromFiles(ca, cert, key)
+	if err != nil {
+		log.Printf("ERROR: failed to build etcd TLS config from files (ca=%s, cert=%s, key=%s): %v",
+			ca, cert, key, err)
+		return
+	}
+	globalMutex.Lock()
+	defer globalMutex.Unlock()
+	globalTLSCfg = cfg
+}
+
 //export NewEtcdClient
 func NewEtcdClient(endpoints *C.char, errMsg **C.char) int {
 	globalMutex.Lock()
@@ -190,11 +236,79 @@ func NewEtcdClient(endpoints *C.char, errMsg **C.char) int {
 		return -1
 	}
 
+	cfg := clientv3.Config{
+		Endpoints:          validEndpoints,
+		DialTimeout:        5 * time.Second,
+		MaxCallSendMsgSize: MaxMsgSize,
+		MaxCallRecvMsgSize: MaxMsgSize,
+	}
+	if globalTLSCfg != nil {
+		cfg.TLS = globalTLSCfg
+	}
+
+	cli, err := clientv3.New(cfg)
+
+	if err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+
+	globalClient = cli
+	globalRefCount++
+	return 0
+}
+
+//export NewEtcdClientWithTLS
+func NewEtcdClientWithTLS(endpoints *C.char, caFile *C.char, certFile *C.char, keyFile *C.char, errMsg **C.char) int {
+	globalMutex.Lock()
+	defer globalMutex.Unlock()
+	if globalClient != nil {
+		globalRefCount++
+		return 0
+	}
+
+	if endpoints == nil {
+		*errMsg = C.CString("no valid endpoints provided")
+		return -1
+	}
+	MaxMsgSize := 32 * 1024 * 1024
+	endpointStr := C.GoString(endpoints)
+	endpointStr = strings.ReplaceAll(endpointStr, ",", ";")
+	parts := strings.Split(endpointStr, ";")
+	var validEndpoints []string
+	for _, ep := range parts {
+		ep = strings.TrimSpace(ep)
+		if ep != "" {
+			validEndpoints = append(validEndpoints, ep)
+		}
+	}
+	if len(validEndpoints) == 0 {
+		*errMsg = C.CString("no valid endpoints provided")
+		return -1
+	}
+
+	var ca, cert, key string
+	if caFile != nil {
+		ca = C.GoString(caFile)
+	}
+	if certFile != nil {
+		cert = C.GoString(certFile)
+	}
+	if keyFile != nil {
+		key = C.GoString(keyFile)
+	}
+	tlsCfg, tlsErr := buildTLSConfigFromFiles(ca, cert, key)
+	if tlsErr != nil {
+		*errMsg = C.CString("failed to build TLS config: " + tlsErr.Error())
+		return -1
+	}
+
 	cli, err := clientv3.New(clientv3.Config{
 		Endpoints:          validEndpoints,
 		DialTimeout:        5 * time.Second,
 		MaxCallSendMsgSize: MaxMsgSize,
 		MaxCallRecvMsgSize: MaxMsgSize,
+		TLS:                tlsCfg,
 	})
 
 	if err != nil {
@@ -284,6 +398,44 @@ func getStoreClient() *clientv3.Client {
 	return storeClient
 }
 
+// buildTLSConfigFromFiles loads CA cert, client cert, and client key from
+// the given file paths and returns a *tls.Config suitable for clientv3.Config.TLS.
+// Any parameter may be empty; if all are empty, nil is returned (no TLS).
+func buildTLSConfigFromFiles(caFile, certFile, keyFile string) (*tls.Config, error) {
+	if caFile == "" && certFile == "" && keyFile == "" {
+		return nil, nil
+	}
+
+	var tlsConfig tls.Config
+
+	// Load client certificate if provided
+	if certFile != "" || keyFile != "" {
+		if certFile == "" || keyFile == "" {
+			return nil, errors.New("both client certificate and key file must be provided for mTLS")
+		}
+		cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+		if err != nil {
+			return nil, err
+		}
+		tlsConfig.Certificates = []tls.Certificate{cert}
+	}
+
+	// Load CA certificate if provided
+	if caFile != "" {
+		caData, err := os.ReadFile(caFile)
+		if err != nil {
+			return nil, err
+		}
+		caPool := x509.NewCertPool()
+		if !caPool.AppendCertsFromPEM(caData) {
+			return nil, errors.New("failed to parse CA certificate: no valid PEM data found")
+		}
+		tlsConfig.RootCAs = caPool
+	}
+
+	return &tlsConfig, nil
+}
+
 //export NewStoreEtcdClient
 func NewStoreEtcdClient(endpoints *C.char, errMsg **C.char) int {
 	storeMutex.Lock()
@@ -310,6 +462,50 @@ func NewStoreEtcdClient(endpoints *C.char, errMsg **C.char) int {
 	return 0
 }
 
+//export NewStoreEtcdClientWithTLS
+func NewStoreEtcdClientWithTLS(endpoints *C.char, caFile *C.char, certFile *C.char, keyFile *C.char, errMsg **C.char) int {
+	storeMutex.Lock()
+	defer storeMutex.Unlock()
+	if storeClient != nil {
+		*errMsg = C.CString("etcd client can be initialized only once")
+		return -2
+	}
+
+	validEndpoints := parseEtcdEndpoints(endpoints)
+	if len(validEndpoints) == 0 {
+		*errMsg = C.CString("no valid endpoints provided")
+		return -1
+	}
+
+	cfg := newStoreClientConfig(validEndpoints)
+
+	var ca, cert, key string
+	if caFile != nil {
+		ca = C.GoString(caFile)
+	}
+	if certFile != nil {
+		cert = C.GoString(certFile)
+	}
+	if keyFile != nil {
+		key = C.GoString(keyFile)
+	}
+	tlsCfg, err := buildTLSConfigFromFiles(ca, cert, key)
+	if err != nil {
+		*errMsg = C.CString("failed to build TLS config: " + err.Error())
+		return -1
+	}
+	cfg.TLS = tlsCfg
+
+	cli, err := clientv3.New(cfg)
+	if err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+
+	storeClient = cli
+	return 0
+}
+
 //export EtcdStoreResetClientWrapper
 func EtcdStoreResetClientWrapper(endpoints *C.char, errMsg **C.char) int {
 	validEndpoints := parseEtcdEndpoints(endpoints)
@@ -319,6 +515,55 @@ func EtcdStoreResetClientWrapper(endpoints *C.char, errMsg **C.char) int {
 	}
 
 	cli, err := clientv3.New(newStoreClientConfig(validEndpoints))
+	if err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+
+	closeAllStoreMaintenanceSessions()
+	cancelAllStoreWatches()
+	cancelAllStorePrefixWatches()
+
+	storeMutex.Lock()
+	oldClient := storeClient
+	storeClient = cli
+	storeMutex.Unlock()
+
+	if oldClient != nil {
+		oldClient.Close()
+	}
+
+	return 0
+}
+
+//export EtcdStoreResetClientWrapperWithTLS
+func EtcdStoreResetClientWrapperWithTLS(endpoints *C.char, caFile *C.char, certFile *C.char, keyFile *C.char, errMsg **C.char) int {
+	validEndpoints := parseEtcdEndpoints(endpoints)
+	if len(validEndpoints) == 0 {
+		*errMsg = C.CString("no valid endpoints provided")
+		return -1
+	}
+
+	cfg := newStoreClientConfig(validEndpoints)
+
+	var ca, cert, key string
+	if caFile != nil {
+		ca = C.GoString(caFile)
+	}
+	if certFile != nil {
+		cert = C.GoString(certFile)
+	}
+	if keyFile != nil {
+		key = C.GoString(keyFile)
+	}
+	tlsCfg, err := buildTLSConfigFromFiles(ca, cert, key)
+	if err != nil {
+		*errMsg = C.CString("failed to build TLS config: " + err.Error())
+		return -1
+	}
+	cfg.TLS = tlsCfg
+
+	cli, err := clientv3.New(cfg)
 	if err != nil {
 		*errMsg = C.CString(err.Error())
 		return -1
@@ -375,6 +620,68 @@ func NewSnapshotEtcdClient(endpoints *C.char, errMsg **C.char) int {
 		MaxCallRecvMsgSize: snapshotMaxMsgSize,
 	})
 
+	if err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+
+	snapshotClient = cli
+	return 0
+}
+
+//export NewSnapshotEtcdClientWithTLS
+func NewSnapshotEtcdClientWithTLS(endpoints *C.char, caFile *C.char, certFile *C.char, keyFile *C.char, errMsg **C.char) int {
+	snapshotMutex.Lock()
+	defer snapshotMutex.Unlock()
+	if snapshotClient != nil {
+		*errMsg = C.CString("etcd snapshot client can be initialized only once")
+		return -2
+	}
+
+	if endpoints == nil {
+		*errMsg = C.CString("no valid endpoints provided")
+		return -1
+	}
+	endpointStr := C.GoString(endpoints)
+	endpointStr = strings.ReplaceAll(endpointStr, ",", ";")
+	endpointList := strings.Split(endpointStr, ";")
+
+	var validEndpoints []string
+	for _, ep := range endpointList {
+		ep = strings.TrimSpace(ep)
+		if ep != "" {
+			validEndpoints = append(validEndpoints, ep)
+		}
+	}
+
+	if len(validEndpoints) == 0 {
+		*errMsg = C.CString("no valid endpoints provided")
+		return -1
+	}
+
+	var ca, cert, key string
+	if caFile != nil {
+		ca = C.GoString(caFile)
+	}
+	if certFile != nil {
+		cert = C.GoString(certFile)
+	}
+	if keyFile != nil {
+		key = C.GoString(keyFile)
+	}
+	tlsCfg, tlsErr := buildTLSConfigFromFiles(ca, cert, key)
+	if tlsErr != nil {
+		*errMsg = C.CString("failed to build TLS config: " + tlsErr.Error())
+		return -1
+	}
+
+	cli, err := clientv3.New(clientv3.Config{
+		Endpoints:          validEndpoints,
+		DialTimeout:        10 * time.Second,
+		MaxCallSendMsgSize: snapshotMaxMsgSize,
+		MaxCallRecvMsgSize: snapshotMaxMsgSize,
+		TLS:                tlsCfg,
+	})
 	if err != nil {
 		*errMsg = C.CString(err.Error())
 		return -1
