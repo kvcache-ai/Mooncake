@@ -2009,27 +2009,38 @@ TEST_F(MasterServiceHATest, PingStaysResponsiveDuringRemountMetadataWalk) {
                               .set_enable_ha(false)
                               .set_default_kv_lease_ttl(10000)
                               .build());
-    // Standby objects keep the segment accounted, so ReMountSegment runs the
-    // metadata restore walk that visits every metadata shard.
-    const std::string endpoint = "ping_walk_remount_segment";
+    // Standby objects keep their segments accounted, so ReMountSegment runs
+    // the metadata restore walk that visits every metadata shard. Two standby
+    // segments: the walk segment whose remount is parked below, and the
+    // pinger segment whose remount completes up front. Ping only answers OK
+    // for admitted clients, and admission happens on remount -- mounting a
+    // segment alone leaves the client in NEED_REMOUNT by design.
+    const std::string walk_endpoint = "ping_walk_remount_segment";
+    const std::string pinger_endpoint = "ping_walk_pinger_segment";
     const std::string key = "ping_walk_remount_key";
-    auto object = MakeStandbyObject(key, endpoint);
+    auto object = MakeStandbyObject(key, walk_endpoint);
     object.metadata.replicas.front()
         .get_memory_descriptor()
         .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
     ASSERT_TRUE(service
                     .RestoreFromStandbySnapshot(
-                        {object}, 7, {MakeStandbyMemorySegment(endpoint)})
+                        {object}, 7,
+                        {MakeStandbyMemorySegment(walk_endpoint),
+                         MakeStandbyMemorySegment(pinger_endpoint)})
                     .has_value());
 
-    // The heartbeat client whose Ping calls must complete while the walk is
-    // in flight. Mount it before the remount: admission needs the same locks
-    // the remount is about to hold, and a disjoint base keeps its range away
-    // from the segment the remount restores.
-    const auto pinger =
-        PrepareSimpleSegment(service, "ping_walk_pinger_segment",
-                             kDefaultSegmentBase + kDefaultSegmentSize);
+    // Admit the pinger before the parked remount starts. Its segment sits at
+    // a disjoint base, so its own restore walk finds no replica to rebuild
+    // and completes without touching the walk segment's range.
+    const UUID pinger_client = generate_uuid();
     const UUID remount_client = generate_uuid();
+    ASSERT_TRUE(service
+                    .ReMountSegment(
+                        {MakeSegment(pinger_endpoint, kDefaultSegmentBase +
+                                                          kDefaultSegmentSize)},
+                        pinger_client)
+                    .has_value());
+    ASSERT_EQ(service.Ping(pinger_client)->client_status, ClientStatus::OK);
 
     // Park the walk on the first shard it visits, so the remount cannot leave
     // the restore pass while the lock is held.
@@ -2047,7 +2058,8 @@ TEST_F(MasterServiceHATest, PingStaysResponsiveDuringRemountMetadataWalk) {
         LockMetadataShardForTesting(service, kDefaultTenant, park_key);
 
     auto remount = std::async(std::launch::async, [&] {
-        return service.ReMountSegment({MakeSegment(endpoint)}, remount_client);
+        return service.ReMountSegment({MakeSegment(walk_endpoint)},
+                                      remount_client);
     });
 
     // The remount is inside the restore pass once it has released
@@ -2078,7 +2090,7 @@ TEST_F(MasterServiceHATest, PingStaysResponsiveDuringRemountMetadataWalk) {
         ping_durations.reserve(kPings);
         for (int i = 0; i < kPings; ++i) {
             const auto start = std::chrono::steady_clock::now();
-            pings.push_back(service.Ping(pinger.client_id));
+            pings.push_back(service.Ping(pinger_client));
             ping_durations.push_back(std::chrono::steady_clock::now() - start);
         }
     }
@@ -2481,22 +2493,20 @@ TEST_F(MasterServiceHATest, NoFBatchEvictWaitsForSnapshotBarrier) {
     eviction.get();
 }
 
-TEST_F(MasterServiceHATest, InvalidHandleCleanupWaitsForSnapshotBarrier) {
+TEST_F(MasterServiceHATest, InvalidHandleCleanupDoesNotWaitForSnapshotBarrier) {
     MasterService service(
         MasterServiceConfig::builder().set_enable_ha(false).build());
+    // The sweep takes only per-shard locks plus a short client_mutex_ shared
+    // capture per shard, so it must complete while the global snapshot
+    // barrier is held exclusively. The old sweep kept master_state_mutex_
+    // shared across the whole table walk, which is what the barrier-pinned
+    // predecessor of this test asserted.
     auto snapshot_lock = LockSnapshotForTesting(service);
-    std::promise<void> started;
-    auto started_future = started.get_future();
-    auto cleanup = std::async(std::launch::async, [&] {
-        started.set_value();
-        ClearInvalidHandlesForTesting(service);
-    });
-    started_future.wait();
-    EXPECT_EQ(cleanup.wait_for(std::chrono::milliseconds(100)),
-              std::future_status::timeout);
-    snapshot_lock.unlock();
+    auto cleanup = std::async(std::launch::async,
+                              [&] { ClearInvalidHandlesForTesting(service); });
     ASSERT_EQ(cleanup.wait_for(std::chrono::seconds(5)),
               std::future_status::ready);
+    snapshot_lock.unlock();
     cleanup.get();
 }
 
