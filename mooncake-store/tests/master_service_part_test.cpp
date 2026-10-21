@@ -367,6 +367,36 @@ TEST_F(MasterServicePartTest, BatchEndCarriesEveryPartOfOneKey) {
     EXPECT_TRUE(IsReadable(key));
 }
 
+// A batch names one part per item, so every per-item list it indexes is as long
+// as the batch: a shorter one is answered for every item instead of read past
+// its end.
+TEST_F(MasterServicePartTest, RefusesAPerItemListShorterThanTheBatch) {
+    const std::string key = "batched_short_list_key";
+    const std::vector<std::string> keys(3, key);
+    const std::vector<uint32_t> part_indices{0, 1, 2};
+    const ReplicateConfig config = OneMemoryReplica();
+
+    const auto short_lengths = service_.BatchPutStart(
+        client_, keys, std::vector<uint64_t>{1024, 1024}, part_indices,
+        /*part_count=*/3, config, TenantId::Default());
+    ASSERT_EQ(short_lengths.size(), keys.size());
+    for (const auto& item : short_lengths) {
+        ASSERT_FALSE(item.has_value());
+        EXPECT_EQ(ErrorCode::INVALID_PARAMS, item.error());
+    }
+
+    const auto short_parts = service_.BatchPutStart(
+        client_, keys, std::vector<uint64_t>(keys.size(), 1024),
+        std::vector<uint32_t>{0, 1}, /*part_count=*/3, config,
+        TenantId::Default());
+    ASSERT_EQ(short_parts.size(), keys.size());
+    for (const auto& item : short_parts) {
+        ASSERT_FALSE(item.has_value());
+        EXPECT_EQ(ErrorCode::INVALID_PARAMS, item.error());
+    }
+    EXPECT_FALSE(IsReadable(key));
+}
+
 // The surfaces that have no per-part form refuse the object rather than act on
 // one part alone: copy and move hand it one replica set for all of it, and an
 // upsert has one length to write. Offload, promotion, dynamic replication and

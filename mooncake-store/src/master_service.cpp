@@ -99,6 +99,15 @@ uint64_t SaturatingFromWide(unsigned __int128 value) {
     return static_cast<uint64_t>(value);
 }
 
+// How long a per-item list of a batch call is, for a list the call may leave
+// out: a batch that names no part or no replica ids has no length to answer
+// for.
+template <typename List>
+std::optional<size_t> OptionalLength(const std::optional<List>& list) {
+    return list.has_value() ? std::optional<size_t>(list->size())
+                            : std::nullopt;
+}
+
 // Decides whether PutStart may proceed with the replicas that were
 // actually allocated. Three deliberately different policies apply:
 //
@@ -6055,6 +6064,21 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
     return result;
 }
 
+bool MasterService::BatchListsDifferInLength(
+    const char* call, size_t count,
+    std::initializer_list<std::pair<const char*, std::optional<size_t>>> lists)
+    const {
+    for (const auto& [name, length] : lists) {
+        if (!length.has_value() || *length == count) {
+            continue;
+        }
+        LOG(ERROR) << call << ": item count=" << count << ", " << name << "="
+                   << *length << ", error=item_count_mismatch";
+        return true;
+    }
+    return false;
+}
+
 std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
 MasterService::BatchPutStart(const UUID& client_id,
                              const std::vector<std::string>& keys,
@@ -6063,6 +6087,15 @@ MasterService::BatchPutStart(const UUID& client_id,
                              uint32_t part_count, const ReplicateConfig& config,
                              const TenantId& tenant_id) {
     const size_t count = keys.size();
+    // Every item of this call indexes both lists, so a short one would read
+    // past its end rather than answer with an error.
+    if (BatchListsDifferInLength("BatchPutStart", count,
+                                 {{"slice_lengths", slice_lengths.size()},
+                                  {"part_indices", part_indices.size()}})) {
+        return std::vector<
+            tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>(
+            count, tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+    }
     std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
         results(count);
     UpdateClientHostId(client_id, config.host_id);
@@ -6909,16 +6942,12 @@ std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutEnd(
     std::optional<std::vector<std::vector<ReplicaID>>> replica_ids) {
     assert(tenant_id.IsValid());
     const size_t count = object_metas.size();
-    if ((part_indices.has_value() && part_indices->size() != count) ||
-        (replica_ids.has_value() && replica_ids->size() != count)) {
-        LOG(ERROR) << "BatchPutEnd: item count=" << count << ", part_indices="
-                   << (part_indices.has_value() ? part_indices->size() : 0)
-                   << ", replica_ids="
-                   << (replica_ids.has_value() ? replica_ids->size() : 0)
-                   << ", error=item_count_mismatch";
-        std::vector<tl::expected<void, ErrorCode>> results;
-        results.assign(count, tl::make_unexpected(ErrorCode::INVALID_PARAMS));
-        return results;
+    if (BatchListsDifferInLength(
+            "BatchPutEnd", count,
+            {{"part_indices", OptionalLength(part_indices)},
+             {"replica_ids", OptionalLength(replica_ids)}})) {
+        return std::vector<tl::expected<void, ErrorCode>>(
+            count, tl::make_unexpected(ErrorCode::INVALID_PARAMS));
     }
 
     // Items are grouped by the key they name, so a batch carrying many parts of
@@ -6996,17 +7025,12 @@ std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutRevoke(
     std::optional<std::vector<std::vector<ReplicaID>>> replica_ids) {
     assert(tenant_id.IsValid());
     const size_t count = keys.size();
-    if ((part_indices.has_value() && part_indices->size() != count) ||
-        (replica_ids.has_value() && replica_ids->size() != count)) {
-        LOG(ERROR) << "BatchPutRevoke: item count=" << count
-                   << ", part_indices="
-                   << (part_indices.has_value() ? part_indices->size() : 0)
-                   << ", replica_ids="
-                   << (replica_ids.has_value() ? replica_ids->size() : 0)
-                   << ", error=item_count_mismatch";
-        std::vector<tl::expected<void, ErrorCode>> results;
-        results.assign(count, tl::make_unexpected(ErrorCode::INVALID_PARAMS));
-        return results;
+    if (BatchListsDifferInLength(
+            "BatchPutRevoke", count,
+            {{"part_indices", OptionalLength(part_indices)},
+             {"replica_ids", OptionalLength(replica_ids)}})) {
+        return std::vector<tl::expected<void, ErrorCode>>(
+            count, tl::make_unexpected(ErrorCode::INVALID_PARAMS));
     }
 
     // Items are grouped by the key they name, so a batch carrying many parts of

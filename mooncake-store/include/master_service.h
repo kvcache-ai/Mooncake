@@ -1672,6 +1672,15 @@ class MasterService {
                             uint64_t charge_before)
         -> tl::expected<void, ErrorCode>;
 
+    // A batch indexes every per-item list by the item, so a list of another
+    // length is refused outright rather than read as a default for the items it
+    // does not cover, and a list the call does not carry has no length to
+    // answer for. `call` names the caller in the log.
+    bool BatchListsDifferInLength(
+        const char* call, size_t count,
+        std::initializer_list<std::pair<const char*, std::optional<size_t>>>
+            lists) const;
+
     // Hand part `part_index` the content produced by one write: take the
     // replicas the caller allocated, charge the quota that write holds against
     // the object's ledger and record the soft-pin action it asked for. The
