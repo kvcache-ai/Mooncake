@@ -196,9 +196,8 @@ struct ObjectMetadata {
         return &*slot->part;
     }
 
-    // That part's most recent write, null only when the part has never been
-    // written. A pointer rather than a copy: the caller reads it under the same
-    // lock, and its replica ids belong to the object.
+    // That part's most recent write, null when the part has never been written.
+    // A pointer rather than a copy: the caller holds the lock this reads under.
     const WriteAttempt* GetAttempt(size_t index) const {
         const PartSlot* slot = FindSlot(index);
         if (slot == nullptr || !slot->attempt.has_value()) {
@@ -207,9 +206,8 @@ struct ObjectMetadata {
         return &*slot->attempt;
     }
 
-    // Every part holds content and has a replica a reader can use. Computed on
-    // each call: a part loses its answer as soon as its last usable replica is
-    // gone, so nothing here can go stale.
+    // Every part holds content and a replica a reader can use. Computed per
+    // call, so a part that lost its last usable replica answers false at once.
     bool IsReadable() const {
         if (present_parts_ != part_count_) {
             return false;
@@ -225,9 +223,8 @@ struct ObjectMetadata {
     }
 
     // Whether any part still holds a replica whose allocator is alive: the
-    // answer to "should this object stay". A segment that is merely unavailable
-    // still counts, because the object exists and is unreadable only until the
-    // segment returns.
+    // answer to "should this object stay". A merely unavailable segment counts,
+    // because has_dead_handle() asks about the allocator and not the segment.
     bool HasAnyReplicaWithValidHandle() const {
         return HasReplica(
             [](const Replica& replica) { return !replica.has_dead_handle(); });

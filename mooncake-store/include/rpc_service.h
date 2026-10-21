@@ -99,11 +99,9 @@ class WrappedMasterService {
     tl::expected<GetReplicaListResponse, ErrorCode> GetReplicaListForAdmin(
         const std::string& key, const std::string& tenant_id = "default");
 
-    // The part arguments trail the call. A caller that leaves them out names
-    // the first part of an object of one part, which is what every client that
-    // predates parts means by the call it makes. The count is the shape the
-    // writers agreed on, and it is all the master checks: which (stage, rank) a
-    // part index stands for is the key's own convention.
+    // The part arguments trail the call. Leaving them out names the first part
+    // of an object of one part, which is what a client that predates parts
+    // means; see kMaxPartsPerObject for what the count does and does not say.
     tl::expected<std::vector<Replica::Descriptor>, ErrorCode> PutStart(
         const UUID& client_id, const std::string& key,
         const uint64_t slice_length, const ReplicateConfig& config,
@@ -126,9 +124,7 @@ class WrappedMasterService {
         struct_pack::compatible<std::vector<uint64_t>> replica_ids = {});
 
     // A batch names the part of each item, one entry per key, because one batch
-    // may mix parts of one object. A caller that writes the same part of many
-    // objects fills the vector with that index; a field saying "one part for
-    // the whole batch" would be a second way to say the same thing.
+    // may mix parts of one object.
     std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
     BatchPutStart(
         const UUID& client_id, const std::vector<std::string>& keys,
