@@ -34,12 +34,16 @@
 
 #include "tent/common/config.h"
 #include "tent/runtime/platform.h"
+#include "tent/runtime/transfer_engine_impl.h"
+#include "tent/transport/fault_proxy/fault_proxy_transport.h"
 
 namespace {
 std::atomic<bool> fail_notifier_record{false};
 std::atomic<CNresult> reject_copy{CN_SUCCESS};
 std::atomic<CNqueue> fail_queue{nullptr};
 std::atomic<bool> fail_query{false};
+std::atomic<int> pending_queries{0};
+std::atomic<CNqueue> last_recorded_queue{nullptr};
 std::atomic<bool> fail_sync{false};
 bool force_numa_mismatch = false;
 void *forced_pinned_allocation = nullptr;
@@ -83,6 +87,7 @@ extern "C" int __wrap_numa_move_pages(int pid, unsigned long count,
 
 extern "C" CNresult __real_cnPlaceNotifier(CNnotifier, CNqueue);
 extern "C" CNresult __wrap_cnPlaceNotifier(CNnotifier notifier, CNqueue queue) {
+    last_recorded_queue = queue;
     if (before_record) before_record();
     if (fail_notifier_record.exchange(false)) return CN_ERROR_INVALID_VALUE;
     return __real_cnPlaceNotifier(notifier, queue);
@@ -118,7 +123,9 @@ extern "C" CNresult __wrap_cnQueueSync(CNqueue queue) {
 extern "C" CNresult __real_cnQueryNotifier(CNnotifier);
 extern "C" CNresult __wrap_cnQueryNotifier(CNnotifier notifier) {
     if (fail_query.load()) return CN_QUEUE_ERROR_INVALID;
-    return __real_cnQueryNotifier(notifier);
+    auto result = __real_cnQueryNotifier(notifier);
+    if (result == CN_ERROR_NOT_READY) ++pending_queries;
+    return result;
 }
 extern "C" CNresult __real_cnQueryQueue(CNqueue);
 extern "C" CNresult __wrap_cnQueryQueue(CNqueue queue) {
@@ -129,6 +136,13 @@ extern "C" CNresult __wrap_cnQueryQueue(CNqueue queue) {
 }
 
 namespace mooncake {
+class TransferEngineImplTestPeer {
+   public:
+    static std::shared_ptr<tent::Transport> tcp(
+        tent::TransferEngineImpl &engine) {
+        return engine.transport_list_[tent::TCP];
+    }
+};
 namespace tent {
 namespace {
 
@@ -258,9 +272,28 @@ class QueueGate {
         : queue_(std::move(queue)) {
         EXPECT_EQ(cnInvokeHostFunc(queue_->handle, block, this), CN_SUCCESS);
     }
+    QueueGate(CNqueue handle, CNcontext context)
+        : handle_(handle), context_(context) {
+        CNcontext previous = nullptr;
+        EXPECT_EQ(cnCtxGetCurrent(&previous), CN_SUCCESS);
+        EXPECT_EQ(cnCtxSetCurrent(context_), CN_SUCCESS);
+        EXPECT_EQ(cnInvokeHostFunc(handle_, block, this), CN_SUCCESS);
+        EXPECT_EQ(cnCtxSetCurrent(previous), CN_SUCCESS);
+    }
     ~QueueGate() {
         release();
-        EXPECT_TRUE(queue_->synchronize().ok());
+        synchronize();
+    }
+    void synchronize() {
+        if (queue_) {
+            EXPECT_TRUE(queue_->synchronize().ok());
+        } else {
+            CNcontext previous = nullptr;
+            EXPECT_EQ(cnCtxGetCurrent(&previous), CN_SUCCESS);
+            EXPECT_EQ(cnCtxSetCurrent(context_), CN_SUCCESS);
+            EXPECT_EQ(cnQueueSync(handle_), CN_SUCCESS);
+            EXPECT_EQ(cnCtxSetCurrent(previous), CN_SUCCESS);
+        }
     }
     void release() {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -276,10 +309,166 @@ class QueueGate {
                           [&] { return self.released_; });
     }
     std::shared_ptr<MluCopyQueue> queue_;
+    CNqueue handle_ = nullptr;
+    CNcontext context_ = nullptr;
     std::mutex mutex_;
     std::condition_variable cv_;
     bool released_ = false;
 };
+
+// Keep TCP's sub-batch unpublished long enough for the progress worker to
+// poll the still-pending MLU task and encounter the missing TCP transport.
+class DelayedTcpAllocation : public FaultProxyTransport {
+   public:
+    explicit DelayedTcpAllocation(std::shared_ptr<Transport> tcp)
+        : FaultProxyTransport(std::move(tcp), {}) {}
+
+    Status allocateSubBatch(SubBatchRef &batch, size_t max_size) override {
+        const auto before = pending_queries.load();
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (pending_queries.load() == before &&
+               std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        EXPECT_GT(pending_queries.load(), before);
+        // Allow that worker pass to finish before TCP publishes its sub-batch
+        // and emits its own (event-only) wake.
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        return FaultProxyTransport::allocateSubBatch(batch, max_size);
+    }
+
+    Status getTransferStatus(SubBatchRef batch, int task_id,
+                             TransferStatus &status) override {
+        auto result =
+            FaultProxyTransport::getTransferStatus(batch, task_id, status);
+        if (result.ok() && status.s == COMPLETED) completed = true;
+        return result;
+    }
+
+    std::atomic<bool> completed{false};
+};
+
+class MluNotificationTest : public MluTransportTest {
+   protected:
+    void checkNotification(bool runtime_queue, bool to_device, bool append_tcp);
+};
+
+void MluNotificationTest::checkNotification(bool runtime_queue, bool to_device,
+                                            bool append_tcp) {
+    auto conf = std::make_shared<Config>();
+    conf->set("metadata_type", "p2p");
+    conf->set("rpc_server_hostname", "127.0.0.1");
+    conf->set("rpc_server_port", "0");
+    conf->set("log_level", "warning");
+    conf->set("transports/rdma/enable", false);
+    conf->set("transports/shm/enable", false);
+    conf->set("transports/io_uring/enable", false);
+    conf->set("transports/mpcomm/enable", false);
+    conf->set("transports/mlu/enable", true);
+    conf->set("enable_progress_worker", true);
+    conf->set("enable_runtime_queue", runtime_queue);
+    conf->set("runtime_queue/progress_fallback_interval_us", 10000UL);
+    conf->set("transports/tcp/enable", true);
+    conf->set("transports/hp_tcp/enable", false);
+    TransferEngineImpl engine(conf);
+    ASSERT_TRUE(engine.available());
+    std::shared_ptr<DelayedTcpAllocation> tcp;
+    if (append_tcp) {
+        auto real_tcp = ::mooncake::TransferEngineImplTestPeer::tcp(engine);
+        ASSERT_NE(real_tcp, nullptr);
+        tcp = std::make_shared<DelayedTcpAllocation>(std::move(real_tcp));
+        engine.swapTransportForTest(TCP, tcp);
+    }
+    uint8_t *dev = nullptr;
+    ASSERT_NO_FATAL_FAILURE(allocDevice(&dev, kBufSize));
+    RegisteredHost host(transport_, kBufSize);
+    ASSERT_TRUE(host.status.ok());
+    ASSERT_TRUE(engine.registerLocalMemory(dev, kBufSize).ok());
+    ASSERT_TRUE(engine.registerLocalMemory(host.bytes.data(), kBufSize).ok());
+    std::fill(host.bytes.begin(), host.bytes.end(), 0x6B);
+    ASSERT_TRUE(loader_->copy(dev, host.bytes.data(), kBufSize).ok());
+    const auto request =
+        makeRequest(Request::WRITE, to_device ? host.bytes.data() : dev,
+                    (uint64_t)(to_device ? dev : host.bytes.data()), kBufSize);
+    auto warm = engine.allocateBatch(1);
+    ASSERT_TRUE(engine.submitTransfer(warm, {request}).ok());
+    ASSERT_TRUE(engine.waitTransferCompletion(warm).ok());
+    auto queue = last_recorded_queue.load();
+    ASSERT_NE(queue, nullptr);
+    CNcontext context = nullptr;
+    ASSERT_EQ(cnGetMemAttribute(&context, CN_MEM_ATTRIBUTE_CONTEXT,
+                                reinterpret_cast<CNaddr>(dev)),
+              CN_SUCCESS);
+    QueueGate gate(queue, context);
+    auto batch = engine.allocateBatch(append_tcp ? 2 : 1);
+    Notification notification;
+    notification.name = engine.getSegmentName();
+    notification.msg = "mlu-background-completion";
+    const auto queries_before = pending_queries.load();
+    ASSERT_TRUE(engine.submitTransfer(batch, {request}, notification).ok());
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (pending_queries.load() == queries_before &&
+           std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    EXPECT_GT(pending_queries.load(), queries_before)
+        << "worker must first observe the held copy as pending";
+    if (append_tcp) {
+        auto tcp_request =
+            makeRequest(Request::WRITE, host.bytes.data(),
+                        (uint64_t)(host.bytes.data() + kChunk), kChunk);
+        tcp_request.transport_hint = TCP;
+        ASSERT_TRUE(engine.submitTransfer(batch, {tcp_request}).ok());
+        // Consume TCP's completion wake while MLU is still pending. Delivery
+        // after releasing the DMA gate must come from retained polling.
+        deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (!tcp->completed.load() &&
+               std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        EXPECT_TRUE(tcp->completed.load());
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    gate.release();
+    gate.synchronize();
+    std::vector<Notification> received;
+    deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(300);
+    do {
+        (void)engine.receiveNotification(received);
+        if (!received.empty()) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    } while (std::chrono::steady_clock::now() < deadline);
+    EXPECT_EQ(received.size(), 1u);
+    if (!received.empty()) {
+        EXPECT_EQ(received.front().msg, notification.msg);
+    }
+    // Manual progress is only a cleanup path after the assertion above.
+    EXPECT_TRUE(engine.waitTransferCompletion(batch).ok());
+    EXPECT_TRUE(engine.unregisterLocalMemory(host.bytes.data(), kBufSize).ok());
+    EXPECT_TRUE(engine.unregisterLocalMemory(dev, kBufSize).ok());
+    EXPECT_TRUE(loader_->free(dev, kBufSize).ok());
+}
+
+class MluProgressTest
+    : public MluNotificationTest,
+      public ::testing::WithParamInterface<std::tuple<bool, bool>> {};
+
+TEST_P(MluProgressTest, CompletionNotificationWithoutCallerPolling) {
+    const auto [runtime_queue, to_device] = GetParam();
+    checkNotification(runtime_queue, to_device, false);
+}
+
+class MluMixedProgressTest : public MluNotificationTest,
+                             public ::testing::WithParamInterface<bool> {};
+
+TEST_P(MluMixedProgressTest, AppendTcpPreservesMluPolling) {
+    checkNotification(false, GetParam(), true);
+}
+
+INSTANTIATE_TEST_SUITE_P(HostAndDevice, MluMixedProgressTest,
+                         ::testing::Bool());
+INSTANTIATE_TEST_SUITE_P(DirectAndRuntimeQueue, MluProgressTest,
+                         ::testing::Combine(::testing::Bool(),
+                                            ::testing::Bool()));
 
 TEST_F(MluTransportTest, LocalStageCopiesFromInteriorDeviceOffset) {
     uint8_t *dev = nullptr;
@@ -416,6 +605,55 @@ TEST_P(MluAsyncCopyTest, RemainsPendingUntilDeviceCopyCompletes) {
         actual.assign(host.bytes.begin(), host.bytes.end());
     std::fill(zeros.begin() + 17, zeros.begin() + 17 + request.length, 0xAB);
     EXPECT_EQ(actual, zeros);
+    EXPECT_TRUE(loader_->free(dev, kBufSize).ok());
+}
+
+TEST_P(MluAsyncCopyTest, QueryErrorPollReturnsBeforeQueueDrains) {
+    uint8_t *dev = nullptr;
+    ASSERT_NO_FATAL_FAILURE(allocDevice(&dev, kBufSize));
+    RegisteredHost host(transport_, kBufSize);
+    ASSERT_TRUE(host.status.ok());
+    auto [op, device_source] = GetParam();
+    auto request = makeRequest(
+        op, device_source ? dev : host.bytes.data(),
+        (uint64_t)(device_source ? host.bytes.data() : dev), kBufSize);
+    auto queue = queueFor(request);
+    ASSERT_NE(queue, nullptr);
+    QueueGate gate(queue);
+    Transport::SubBatchRef batch = nullptr;
+    ASSERT_TRUE(transport_.allocateSubBatch(batch, 1).ok());
+    ASSERT_TRUE(transport_.submitTransferTasks(batch, {request}).ok());
+    fail_query = true;
+    TransferStatus status{};
+    auto poll = std::async(std::launch::async, [&] {
+        return transport_.getTransferStatus(batch, 0, status);
+    });
+    const auto ready = poll.wait_for(std::chrono::milliseconds(150));
+    EXPECT_EQ(ready, std::future_status::ready);
+    if (ready == std::future_status::ready) {
+        EXPECT_FALSE(poll.get().ok());
+        EXPECT_EQ(status.s, PENDING);
+        // Further polls query the queue without waiting for its held work.
+        for (int i = 0; i < 3; ++i) {
+            EXPECT_TRUE(transport_.getTransferStatus(batch, 0, status).ok());
+            EXPECT_EQ(status.s, PENDING);
+            EXPECT_EQ(status.transferred_bytes, 0u);
+        }
+        // No later submission may extend the failed task's drain.
+        Transport::SubBatchRef rejected = nullptr;
+        EXPECT_TRUE(transport_.allocateSubBatch(rejected, 1).ok());
+        EXPECT_TRUE(transport_.submitTransferTasks(rejected, {request}).ok());
+        EXPECT_TRUE(transport_.getTransferStatus(rejected, 0, status).ok());
+        EXPECT_EQ(status.s, FAILED);
+        EXPECT_TRUE(transport_.freeSubBatch(rejected).ok());
+    }
+    // Also release on the buggy implementation, so a failed test cannot hang.
+    gate.release();
+    if (poll.valid()) (void)poll.get();
+    fail_query = false;
+    EXPECT_EQ(wait(batch).s, FAILED);
+    EXPECT_TRUE(transport_.freeSubBatch(batch).ok());
+    EXPECT_EQ(run(request).s, COMPLETED);
     EXPECT_TRUE(loader_->free(dev, kBufSize).ok());
 }
 

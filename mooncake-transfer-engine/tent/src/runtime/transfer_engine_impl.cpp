@@ -545,9 +545,7 @@ Status TransferEngineImpl::construct() {
 
     if (enable_progress_worker_) {
         progress_worker_ = std::make_unique<ProgressWorker>(
-            this, runtime_queue_config_.enabled
-                      ? runtime_queue_config_.progress_fallback_interval
-                      : std::chrono::microseconds(0));
+            this, runtime_queue_config_.progress_fallback_interval);
         progress_worker_->start();
     }
 
@@ -2284,9 +2282,10 @@ void TransferEngineImpl::attachProgressNotifier(
     Batch* batch, Transport::SubBatchRef sub_batch) {
     if (!batch || !sub_batch) return;
     sub_batch->progress_batch_id = (BatchID)batch;
-    sub_batch->notify_progress = [this](BatchID batch_id) {
-        notifyBatchMaybeReady(batch_id);
-    };
+    sub_batch->notify_progress =
+        [this, poll = sub_batch->needsProgressPolling()](BatchID batch_id) {
+            notifyBatchMaybeReady(batch_id, poll);
+        };
 }
 
 Status TransferEngineImpl::commitPreparedSubmit(
@@ -3636,8 +3635,10 @@ Status TransferEngineImpl::getNicLoadStats(
     return Status::OK();
 }
 
-void TransferEngineImpl::notifyBatchMaybeReady(BatchID batch_id) {
-    if (progress_worker_) progress_worker_->notifyBatchMaybeReady(batch_id);
+void TransferEngineImpl::notifyBatchMaybeReady(BatchID batch_id,
+                                               bool poll_until_terminal) {
+    if (progress_worker_)
+        progress_worker_->notifyBatchMaybeReady(batch_id, poll_until_terminal);
 }
 
 void TransferEngineImpl::notifyRuntimeQueueReady() {

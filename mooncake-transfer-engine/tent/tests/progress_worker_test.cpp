@@ -430,69 +430,67 @@ TEST(ProgressWorker, ProgressesWithoutPollAutoFailover) {
 // until completion; the next step requires another notify.
 // ---------------------------------------------------------------------------
 
-TEST(ProgressWorker, SingleNotifyAdvancesOneStep) {
-    auto cfg = makeMinimalP2PConfig();
-    cfg->set("enable_auto_failover_on_poll", false);
-    cfg->set("enable_progress_worker", true);
-    TransferEngineImpl engine(cfg);
-    ASSERT_TRUE(engine.available());
+TEST(ProgressWorker, SingleNotifyOnlyRepollsOptedInBatches) {
+    for (bool poll_until_terminal : {false, true}) {
+        SCOPED_TRACE(poll_until_terminal);
+        auto cfg = makeMinimalP2PConfig();
+        cfg->set("enable_auto_failover_on_poll", false);
+        cfg->set("enable_progress_worker", true);
+        cfg->set("runtime_queue/progress_fallback_interval_us", 10000UL);
+        TransferEngineImpl engine(cfg);
+        ASSERT_TRUE(engine.available());
 
-    auto fake_rdma = std::make_shared<FakeTransport>(
-        RDMA, FakeTransport::StatusFactory{},
-        [](const Request& req, int poll_count) {
-            if (poll_count < 3) {
-                return TransferStatus{TransferStatusEnum::PENDING, 0};
-            }
-            return TransferStatus{TransferStatusEnum::COMPLETED, req.length};
-        });
-    auto fake_tcp = std::make_shared<FakeTransport>(TCP);
+        auto fake_rdma = std::make_shared<FakeTransport>(
+            RDMA, FakeTransport::StatusFactory{},
+            [](const Request& req, int poll_count) {
+                if (poll_count < 3) {
+                    return TransferStatus{TransferStatusEnum::PENDING, 0};
+                }
+                return TransferStatus{TransferStatusEnum::COMPLETED,
+                                      req.length};
+            });
+        auto fake_tcp = std::make_shared<FakeTransport>(TCP);
 
-    std::string seg = engine.getSegmentName();
-    ASSERT_TRUE(fake_rdma->install(seg, nullptr, nullptr).ok());
-    ASSERT_TRUE(fake_tcp->install(seg, nullptr, nullptr).ok());
-    engine.swapTransportForTest(RDMA, fake_rdma);
-    engine.swapTransportForTest(TCP, fake_tcp);
+        std::string seg = engine.getSegmentName();
+        ASSERT_TRUE(fake_rdma->install(seg, nullptr, nullptr).ok());
+        ASSERT_TRUE(fake_tcp->install(seg, nullptr, nullptr).ok());
+        engine.swapTransportForTest(RDMA, fake_rdma);
+        engine.swapTransportForTest(TCP, fake_tcp);
 
-    constexpr size_t kBufLen = 4096;
-    std::vector<uint8_t> buf(kBufLen, 0xC2);
-    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), kBufLen).ok());
+        constexpr size_t kBufLen = 4096;
+        std::vector<uint8_t> buf(kBufLen, 0xC2);
+        ASSERT_TRUE(engine.registerLocalMemory(buf.data(), kBufLen).ok());
 
-    BatchID batch_id = engine.allocateBatch(1);
-    ASSERT_NE(batch_id, (BatchID)0);
+        BatchID batch_id = engine.allocateBatch(1);
+        ASSERT_NE(batch_id, (BatchID)0);
 
-    Request req;
-    req.opcode = Request::WRITE;
-    req.source = buf.data();
-    req.target_id = LOCAL_SEGMENT_ID;
-    req.target_offset = reinterpret_cast<uint64_t>(buf.data());
-    req.length = kBufLen;
-    ASSERT_TRUE(engine.submitTransfer(batch_id, {req}).ok());
+        Request req;
+        req.opcode = Request::WRITE;
+        req.source = buf.data();
+        req.target_id = LOCAL_SEGMENT_ID;
+        req.target_offset = reinterpret_cast<uint64_t>(buf.data());
+        req.length = kBufLen;
+        ASSERT_TRUE(engine.submitTransfer(batch_id, {req}).ok());
 
-    // Initial state: nothing polled yet.
-    EXPECT_EQ(fake_rdma->status_calls.load(), 0);
+        // Initial state: nothing polled yet.
+        EXPECT_EQ(fake_rdma->status_calls.load(), 0);
 
-    // Drive exactly one progress step via the worker. We can't observe the
-    // step instantly, but we can wait until status_calls increments by 1
-    // and then assert it does NOT keep climbing to 3 on its own.
-    engine.notifyBatchMaybeReady(batch_id);
-    const auto step_deadline =
-        std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
-    while (std::chrono::steady_clock::now() < step_deadline &&
-           fake_rdma->status_calls.load() == 0) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        // Event-driven transports still advance once per wake. Only an opted-in
+        // batch keeps polling, and polling must stop when it becomes terminal.
+        engine.notifyBatchMaybeReady(batch_id, poll_until_terminal);
+        const int expected_polls = poll_until_terminal ? 3 : 1;
+        const auto step_deadline =
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+        while (std::chrono::steady_clock::now() < step_deadline &&
+               fake_rdma->status_calls.load() < expected_polls)
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        EXPECT_EQ(fake_rdma->status_calls.load(), expected_polls);
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        EXPECT_EQ(fake_rdma->status_calls.load(), expected_polls);
+
+        EXPECT_TRUE(engine.freeBatch(batch_id).ok());
+        EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), kBufLen).ok());
     }
-    ASSERT_EQ(fake_rdma->status_calls.load(), 1)
-        << "worker should issue exactly one poll for a single notify";
-
-    // Give the worker a generous window to misbehave. status_calls must
-    // stay at 1 because we did not notify again and the engine did not
-    // reach a terminal state.
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    EXPECT_EQ(fake_rdma->status_calls.load(), 1)
-        << "worker must not loop internally until completion";
-
-    EXPECT_TRUE(engine.freeBatch(batch_id).ok());
-    EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), kBufLen).ok());
 }
 
 // ---------------------------------------------------------------------------
@@ -526,7 +524,7 @@ TEST(ProgressWorker, FreeBatchRacesWithWorker) {
     std::thread spammer([&] {
         while (!stop.load(std::memory_order_acquire)) {
             BatchID bid = latest.load(std::memory_order_acquire);
-            engine.notifyBatchMaybeReady(bid);
+            engine.notifyBatchMaybeReady(bid, true);
             std::this_thread::sleep_for(std::chrono::microseconds(50));
         }
     });
@@ -545,7 +543,7 @@ TEST(ProgressWorker, FreeBatchRacesWithWorker) {
         ASSERT_TRUE(engine.submitTransfer(batch_id, {req}).ok());
 
         latest.store(batch_id, std::memory_order_release);
-        engine.notifyBatchMaybeReady(batch_id);
+        engine.notifyBatchMaybeReady(batch_id, i % 2 == 0);
 
         // Free immediately; the worker may pick the notification up after
         // free. The progress_mutex_ + alive_batches_ guard must keep this

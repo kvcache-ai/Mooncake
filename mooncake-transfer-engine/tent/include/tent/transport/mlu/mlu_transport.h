@@ -58,6 +58,7 @@ struct MluSubBatch : public Transport::SubBatch {
     size_t max_size;
     std::atomic<size_t> published_size{0};
     size_t size() const override { return published_size.load(); }
+    bool needsProgressPolling() const override { return true; }
 };
 
 // Executes copies with exactly one MLU endpoint, within the local

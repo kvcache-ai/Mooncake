@@ -438,8 +438,11 @@ Status MluTransport::getTransferStatus(SubBatchRef batch, int task_id,
             task.status_word = task.drain_on_error ? FAILED : COMPLETED;
         } else if (result != CN_ERROR_NOT_READY) {
             task.drain_on_error = true;
-            CHECK_STATUS(task.queue->synchronize());
-            task.status_word = FAILED;
+            // A failed query is not a completion barrier. Stop appending to
+            // this queue and let later nonblocking polls establish its drain.
+            std::lock_guard<std::mutex> queue_lock(task.queue->mutex);
+            task.queue->error = driverStatus(result);
+            return task.queue->error;
         }
     }
     status =

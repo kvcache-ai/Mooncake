@@ -395,7 +395,8 @@ class TransferEngineImpl {
     // Wake the optional event-driven progress worker for `batch_id`. No-op if
     // enable_progress_worker is false. Transport completion paths use this as
     // an idempotent "maybe ready" signal.
-    void notifyBatchMaybeReady(BatchID batch_id);
+    void notifyBatchMaybeReady(BatchID batch_id,
+                               bool poll_until_terminal = false);
 
    private:
     friend class ProgressWorker;
