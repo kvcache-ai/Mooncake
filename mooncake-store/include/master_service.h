@@ -1631,46 +1631,41 @@ class MasterService {
         std::chrono::system_clock::time_point now, bool& dfs_allocation_failed)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
 
-    // One object's End, with the key held. The batch calls reach it for every
-    // item that names the key they hold, so the parts of one object cost one
-    // visit to its shard however many of them a batch carries.
-    // One part of one object's End, with the key held: the replicas of that
-    // part become complete and the part's write closes. What the object answers
-    // as a whole is left to FinishEndLocked.
+    // One part's End, with the key held: that part's replicas become complete
+    // and its write closes.
     auto PutEndPartLocked(MetadataAccessorRW& accessor, const UUID& client_id,
                           const ObjectMeta& object_meta,
                           ReplicaType replica_type, uint32_t part_index,
                           std::optional<std::vector<ReplicaID>> replica_ids)
         -> tl::expected<void, ErrorCode>;
 
-    // The object-level work an End leaves behind, run once for the object
-    // instead of once per part: the quota settlement, the cache totals, the
-    // offload queue, the readability transition that publishes the stored event
-    // and grants the lease, and the durable record. `readable_before` and the
-    // medium snapshot are the answers to the same questions taken before the
-    // first End of the group changed anything.
-    auto FinishEndLocked(MetadataAccessorRW& accessor, ReplicaType replica_type,
-                         bool readable_before,
-                         const std::vector<std::string>& previous_kv_media)
+    // What the object as a whole owes the Ends just run, asked once per object
+    // rather than once per part: the tenant settlement, the cache totals, the
+    // offload queue, the readability transition that leases and announces the
+    // object, and the durable record. `readable_before` and the medium snapshot
+    // are what the object said before those Ends changed it.
+    auto PutEndObjectLocked(MetadataAccessorRW& accessor,
+                            ReplicaType replica_type, bool readable_before,
+                            const std::vector<std::string>& previous_kv_media)
         -> tl::expected<void, ErrorCode>;
 
-    // One part of one object's Revoke, with the key held: the replicas that
-    // part's write handed out go. The answer says whether the object-level step
-    // is still owed, which the durable path settles in its finalize callback.
+    // One part's Revoke, with the key held: the replicas that part's write
+    // handed out go. The answer says whether the object-level step is still
+    // owed, which the durable path settles in its finalize callback.
     auto PutRevokePartLocked(MetadataAccessorRW& accessor,
                              const UUID& client_id, const std::string& key,
                              ReplicaType replica_type, uint32_t part_index,
                              std::optional<std::vector<ReplicaID>> replica_ids)
         -> tl::expected<bool, ErrorCode>;
 
-    // The object-level work a Revoke leaves behind, run once for the object:
-    // the object goes when the revoked replicas were the last usable ones, and
-    // the medium change and the tenant settlement follow what is left.
-    // `charge_before` is the group's committed bytes before it revoked.
-    auto FinishRevokeLocked(MetadataAccessorRW& accessor,
-                            const std::vector<std::string>& previous_kv_media,
-                            uint64_t charge_before)
-        -> tl::expected<void, ErrorCode>;
+    // What the object as a whole owes the Revokes just run: it goes when they
+    // were its last usable replicas, and the medium change and the tenant
+    // settlement follow what is left. `charge_before` is its committed bytes
+    // before them.
+    auto PutRevokeObjectLocked(
+        MetadataAccessorRW& accessor,
+        const std::vector<std::string>& previous_kv_media,
+        uint64_t charge_before) -> tl::expected<void, ErrorCode>;
 
     // A batch indexes every per-item list by the item, so a list of another
     // length is refused outright rather than read as a default for the items it
