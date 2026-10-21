@@ -105,6 +105,14 @@ For `memory` segments, you can filter by source/destination memory type:
 | `"npu"` | Ascend NPU memory |
 | `"*"` | Any memory type |
 
+For standard `tcp`, the local memory type always describes the initiating
+process's buffer, for both READ and WRITE. A CPU-only build can transfer between
+its host buffer and a peer's registered GPU buffer when the peer exports that
+buffer over TCP. The peer's device-enabled RPC handler performs the GPU copy
+through host staging; the initiator does not need a local GPU runtime. Local GPU
+buffers still require a device-enabled build. This applies to standard `tcp`;
+`hp_tcp` currently supports host memory only.
+
 ### Size Filters
 
 Restrict policies to specific transfer sizes:
@@ -190,6 +198,25 @@ If no `policy` is configured, TENT falls back to original behavior:
 |--------------|-------------------------|
 | File | GDS → IOURING → RDMA |
 | Memory | Uses `buffer_transports` order from buffer registration |
+
+### UB as a selectable transport
+
+UB (`TransportType::UB`) takes part in the same policy machinery as every other
+transport: it can be listed in a policy's `transports` array, pinned with
+`transport_hint`, or reached through `transport_index`. Two places name it
+explicitly instead:
+
+* **Local memory allocation.** When the requested transport is `UNSPEC`,
+  allocation walks `MNNVL → RDMA → UB → FABRIC → TCP → HP_TCP` (with `SHM` taking the
+  host-memory slot ahead of RDMA for CPU and wildcard locations), so an
+  installed UB transport is preferred over the generic TCP paths.
+* **TPU staging.** The TPU staging policy needs a host-DRAM network transport
+  for the host↔host hop and gates on `RDMA`, `UB`, `FABRIC`, `TCP` or `HP_TCP`.
+
+Once UB is the selected transport, the rail for each slice is chosen inside
+`UbTransport` rather than by this selector; see {ref}`TENT Failover
+<tent-failover>` for UB rail health, path ranking and endpoint rebuild
+behaviour.
 
 ## Complete Example
 

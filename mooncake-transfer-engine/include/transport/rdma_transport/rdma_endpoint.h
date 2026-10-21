@@ -17,11 +17,15 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <deque>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <queue>
+#include <vector>
 
 #include "rdma_context.h"
+#include "rdma_posted_fifo.h"
 
 namespace mooncake {
 
@@ -78,6 +82,7 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
    public:
     void setPeerNicPath(const std::string &peer_nic_path);
     std::string peerNicPath() const;
+    Transport::Slice::RdmaCompletionToken autoGidCompletionToken() const;
 
     int setupConnectionsByActive();
 
@@ -170,6 +175,8 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     int resetConnection(const std::string &reason);
     int sendReadyAck(const std::string &peer_server_name,
                      const HandShakeDesc &local_desc);
+    void rememberConnectedAutoGid(const PeerAutoGidSelection &local_selection,
+                                  const HandShakeDesc &peer_desc);
 
    public:
     const std::string toString() const;
@@ -180,6 +187,14 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     // Failed tasks (which must be submitted) are inserted in failed_slice_list
     int submitPostSend(std::vector<Transport::Slice *> &slice_list,
                        std::vector<Transport::Slice *> &failed_slice_list);
+
+    // Map a CQE onto the posting-order FIFO for that QP. Retires every WR
+    // up to `completed` inclusive (RC order). The tail stays queued because
+    // failed/flushed WRs still generate CQEs. Decrements wr_depth by the
+    // number of retired slices. Returns 0 if `completed` is not in the FIFO
+    // (already collected, or interval==1 which does not use the FIFO).
+    size_t collectPostedCompletions(Transport::Slice *completed,
+                                    std::vector<Transport::Slice *> &out);
 
     // Get the number of QPs in this endpoint
     size_t getQPNumber() const;
@@ -209,6 +224,7 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
 
     int doSetupConnection(const std::string &peer_gid, uint32_t peer_lid,
                           std::vector<uint32_t> peer_qp_num_list,
+                          int local_gid_index,
                           Status connected_status = CONNECTED,
                           std::string *reply_msg = nullptr,
                           SetupConnectionFailureInfo *failure_info = nullptr,
@@ -240,6 +256,7 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     static constexpr int kFinishDestroyMaxRetries = 3;
 
     RdmaContext &context_;
+    const uint64_t endpoint_id_;
     std::atomic<Status> status_;
 
     mutable RWSpinlock lock_;
@@ -269,6 +286,7 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
 
     std::string peer_nic_path_;
     std::vector<uint32_t> peer_qp_num_list_;
+    std::optional<PeerAutoGidSelection> connected_auto_gid_;
     bool has_connected_;
     std::atomic<uint64_t> ready_wait_start_ts_;
 
@@ -276,6 +294,10 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     int max_wr_depth_;
     size_t max_sge_per_wr_;
     size_t max_inline_bytes_;
+
+    // One posting-order FIFO per QP so a signaled CQE can retire the
+    // unsignaled WRs that preceded it.
+    std::vector<std::deque<Transport::Slice *>> posted_fifo_;
 
     std::atomic<bool> active_;
     ibv_cq *cq_;

@@ -34,6 +34,7 @@
 #include <glog/logging.h>
 
 #include "rdma_test_peers.h"
+#include "transport/rdma_transport/endpoint_store.h"
 #include "transport/rdma_transport/rdma_context.h"
 #include "transport/rdma_transport/rdma_transport.h"
 #include "transport/rdma_transport/worker_pool.h"
@@ -521,6 +522,32 @@ TEST_F(WorkerPoolRailStateTest, GidProbeOwnsRecoveryThroughoutIoAndRetry) {
     EXPECT_TRUE(WorkerPoolTestPeer::contextActive(*worker_pool_));
     EXPECT_EQ(WorkerPoolTestPeer::recoveryActivateAfter(*worker_pool_), 0u);
     EXPECT_EQ(WorkerPoolTestPeer::contextFailureCount(*worker_pool_), 0);
+}
+
+TEST_F(WorkerPoolRailStateTest, UnchangedDefaultDoesNotDisconnectAllPeers) {
+    class RecordingStore : public FIFOEndpointStore {
+       public:
+        RecordingStore() : FIFOEndpointStore(8) {}
+        int disconnectQPs() override {
+            ++disconnects;
+            return 0;
+        }
+        int disconnects = 0;
+    };
+    auto store = std::make_shared<RecordingStore>();
+    RdmaContextTestPeer::bindEndpointStore(*context_, store);
+    RdmaContextTestPeer::seedAutoGidState(*context_, nullptr, 1, 0, {}, 0);
+    gid_probe = [] { return GidRefreshResult::UNCHANGED; };
+    WorkerPoolTestPeer::contextEvent(*worker_pool_, IBV_EVENT_GID_CHANGE);
+    EXPECT_EQ(store->disconnects, 0);
+    WorkerPoolTestPeer::setContextActive(*worker_pool_, false);
+    WorkerPoolTestPeer::setRecoveryActivateAfter(*worker_pool_, 1);
+    WorkerPoolTestPeer::recoverContext(*worker_pool_);
+    EXPECT_EQ(store->disconnects, 0);
+    // A real default-GID change still rebuilds every endpoint.
+    gid_probe = [] { return GidRefreshResult::CHANGED; };
+    WorkerPoolTestPeer::contextEvent(*worker_pool_, IBV_EVENT_GID_CHANGE);
+    EXPECT_EQ(store->disconnects, 1);
 }
 
 TEST_F(WorkerPoolRailStateTest, FatalEventCancelsPendingGidProbe) {
