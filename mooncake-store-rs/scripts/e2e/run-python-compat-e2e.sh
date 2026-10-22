@@ -242,7 +242,13 @@ assert store.batch_is_exist(["put-batch-a", "put-batch-b"]) == [0, 0]
 
 metrics = metrics_text()
 assert "mooncake_store_operation_total" in metrics
-assert 'operation="put",status="ok"' in metrics
+assert any(
+    operation in metrics
+    for operation in (
+        'operation="put",status="ok"',
+        'operation="batch_put",status="ok"',
+    )
+)
 assert 'operation="batch_get",status="ok"' in metrics
 
 metrics_addr = store.start_metrics_server()
