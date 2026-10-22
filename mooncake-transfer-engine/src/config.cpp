@@ -63,6 +63,20 @@ bool parseBoolConfigEnv(const char* value, const char* env_name, bool& output) {
     return false;
 }
 
+void parseNicSelectionEnv(const char* env_name, NicSelection& output) {
+    const char* value = std::getenv(env_name);
+    if (!value) return;
+    if (strcasecmp(value, "all") == 0) {
+        output = NicSelection::ALL;
+    } else if (strcasecmp(value, "local") == 0) {
+        output = NicSelection::LOCAL;
+    } else {
+        LOG(WARNING) << "Invalid " << env_name
+                     << " environment value: " << value
+                     << ", expected all|local, keeping default";
+    }
+}
+
 void parseNicPeerAffinity(
     const char* env,
     std::unordered_map<std::string, std::vector<std::string>>& affinity) {
@@ -682,18 +696,8 @@ void loadGlobalConfig(GlobalConfig& config) {
         }
     }
 
-    const char* efa_nic_selection = std::getenv("MC_EFA_NIC_SELECTION");
-    if (efa_nic_selection) {
-        if (strcasecmp(efa_nic_selection, "all") == 0) {
-            config.efa_nic_selection = EfaNicSelection::ALL;
-        } else if (strcasecmp(efa_nic_selection, "local") == 0) {
-            config.efa_nic_selection = EfaNicSelection::LOCAL;
-        } else {
-            LOG(WARNING) << "Invalid MC_EFA_NIC_SELECTION environment value: "
-                         << efa_nic_selection
-                         << ", expected all|local, keeping default";
-        }
-    }
+    parseNicSelectionEnv("MC_EFA_NIC_SELECTION", config.efa_nic_selection);
+    parseNicSelectionEnv("MC_RDMA_NIC_SELECTION", config.rdma_nic_selection);
 
     if (const char* value = std::getenv("MC_EFA_CQ_THREADS")) {
         const auto parsed = TryParseInteger<int>(
@@ -892,8 +896,11 @@ void dumpGlobalConfig() {
     LOG(INFO) << "mtu_length = " << mtuLengthToString(config.mtu_length);
     LOG(INFO) << "parallel_reg_mr = " << config.parallel_reg_mr;
     LOG(INFO) << "efa_nic_selection = "
-              << (config.efa_nic_selection == EfaNicSelection::LOCAL ? "local"
-                                                                     : "all");
+              << (config.efa_nic_selection == NicSelection::LOCAL ? "local"
+                                                                  : "all");
+    LOG(INFO) << "rdma_nic_selection = "
+              << (config.rdma_nic_selection == NicSelection::LOCAL ? "local"
+                                                                   : "all");
     LOG(INFO) << "ib_traffic_class = " << config.ib_traffic_class;
     LOG(INFO) << "ib_service_level = " << config.ib_service_level;
     LOG(INFO) << "te_metadata_refresh_interval_seconds = "

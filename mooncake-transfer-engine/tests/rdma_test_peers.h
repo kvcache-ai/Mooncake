@@ -21,7 +21,9 @@
 
 #include <memory>
 #include <string>
+#include <vector>
 
+#include "topology.h"
 #include "transfer_metadata.h"
 #include "transport/rdma_transport/rdma_context.h"
 #include "transport/rdma_transport/rdma_transport.h"
@@ -53,6 +55,16 @@ class RdmaTransportTestPeer {
     // the resulting context_list_ layout without a full install().
     static int initializeResources(RdmaTransport &transport) {
         return transport.initializeRdmaResources();
+    }
+
+    // Builds the MC_RDMA_NIC_SELECTION=local map as initializeRdmaResources()
+    // does, for contexts added with addContext().
+    static void initializeLocalNicMap(RdmaTransport &transport) {
+        std::vector<std::string> context_names;
+        for (const auto &context : transport.context_list_)
+            context_names.push_back(context->deviceName());
+        transport.local_nic_map_ = buildPreferredNicIndexMap(
+            transport.local_topology_->getMatrix(), context_names);
     }
 };
 

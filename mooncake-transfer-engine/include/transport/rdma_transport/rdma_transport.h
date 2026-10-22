@@ -162,6 +162,10 @@ class RdmaTransport : public Transport {
     std::atomic<bool> notify_running_{false};
     std::thread notify_worker_;
     std::shared_ptr<Topology> local_topology_;
+    // Location -> preferred context indices under MC_RDMA_NIC_SELECTION=local;
+    // empty otherwise. Const after initializeRdmaResources(), so registration
+    // reads it without a lock.
+    std::unordered_map<std::string, std::vector<size_t>> local_nic_map_;
     // When MC_RDMA_BIND_ADDRESS is set in a dual-NIC environment,
     // rdma_server_name_ holds the RDMA-reachable address (e.g.
     // "192.168.0.y:port") for NIC path construction, while

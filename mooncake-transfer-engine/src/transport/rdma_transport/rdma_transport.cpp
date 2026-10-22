@@ -36,6 +36,7 @@
 #include "buffer_range_index.h"
 #include "common.h"
 #include "config.h"
+#include "cuda_alike.h"
 #include "memory_location.h"
 #include "topology.h"
 #include "transport/batch_registration.h"
@@ -351,6 +352,36 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
 
     std::string resolved_name = name;
 
+    // MC_RDMA_NIC_SELECTION=local: register device memory only on the HCAs
+    // the topology prefers for its GPU; the other HCAs publish zero keys,
+    // which device selection skips. An explicit location is trusted because
+    // peers select HCAs by that name. Host memory keeps every HCA: a "cpu:N"
+    // preferred set is a NUMA node's NICs, not a rail group. local_nics is
+    // indexed by context; empty means the buffer is registered on every HCA.
+    std::vector<bool> local_nics;
+    if (!local_nic_map_.empty()) {
+        std::string location = name;
+        if (name == kWildcardLocation) {
+            const auto entries = getMemoryLocation(addr, length, true);
+            if (!entries.empty()) location = entries[0].location;
+        }
+        auto it = location.rfind(GPU_PREFIX, 0) == 0
+                      ? local_nic_map_.find(location)
+                      : local_nic_map_.end();
+        if (it != local_nic_map_.end()) {
+            local_nics.assign(context_list_.size(), false);
+            for (size_t i : it->second) local_nics[i] = true;
+            if (globalConfig().trace) {
+                LOG(INFO) << "RDMA local NIC selection: " << addr << " ("
+                          << location << ") on " << it->second.size() << "/"
+                          << context_list_.size() << " HCAs";
+            }
+        }
+    }
+    auto uses_hca = [&](size_t i) {
+        return local_nics.empty() || local_nics[i];
+    };
+
     // Export a single dma_buf fd for the whole buffer and import it into every
     // NIC's PD during each chunk's registration below (one dma_buf object
     // shared across NICs keeps a single BAR1 window for the buffer instead of
@@ -505,10 +536,12 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
     // Pre-touch faults host pages in before the real registration. It gains
     // nothing for device memory registered through DMA-BUF, where each
     // pre-touch thread only adds a DMA-BUF import (and a BAR1 mapping) of its
-    // block, so skip it there.
+    // block, so skip it there. A narrowed buffer is device memory, and its
+    // pre-touch MR on context 0 may be on an excluded HCA.
     const bool do_pre_touch =
         dmabuf_exp.method != DmabufExport::Method::kDmabufReg &&
-        context_list_.size() > 0 && std::thread::hardware_concurrency() >= 4 &&
+        context_list_.size() > 0 && local_nics.empty() &&
+        std::thread::hardware_concurrency() >= 4 &&
         length >= (size_t)4 * 1024 * 1024 * 1024;
 
     for (size_t ci = 0; ci < chunks.size(); ++ci) {
@@ -554,6 +587,7 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
             const int ar = access_rights;  // Local copy for lambda capture
 
             for (size_t i = 0; i < context_list_.size(); ++i) {
+                if (!uses_hca(i)) continue;
                 reg_threads.emplace_back([this, &ret_codes, chunk_dmabuf_exp, i,
                                           chunk_addr, chunk_len, ar]() {
                     ret_codes[i] = context_list_[i]->registerMemoryRegion(
@@ -577,6 +611,7 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
             }
         } else {
             for (size_t i = 0; i < context_list_.size(); ++i) {
+                if (!uses_hca(i)) continue;
                 int ret = context_list_[i]->registerMemoryRegion(
                     chunk_addr, chunk_len, access_rights, chunk_dmabuf_exp);
                 if (ret) {
@@ -616,10 +651,26 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
 
         // Collect per-context keys for THIS chunk (address-range lookup).
         BufferDesc buffer_desc;
-        for (auto &context : context_list_) {
-            buffer_desc.lkey.push_back(context->lkey(chunk_addr));
+        for (size_t i = 0; i < context_list_.size(); ++i) {
+            auto &context = context_list_[i];
+            buffer_desc.lkey.push_back(uses_hca(i) ? context->lkey(chunk_addr)
+                                                   : 0);
             if (remote_accessible)
-                buffer_desc.rkey.push_back(context->rkey(chunk_addr));
+                buffer_desc.rkey.push_back(
+                    uses_hca(i) ? context->rkey(chunk_addr) : 0);
+        }
+        // Placeholder contexts and NICs not Data Direct-paired with the GPU
+        // register without an MR, so a narrowed set can end up with no key.
+        if (!local_nics.empty() &&
+            std::all_of(buffer_desc.lkey.begin(), buffer_desc.lkey.end(),
+                        [](BufferDesc::mr_key_t key) { return key == 0; })) {
+            LOG(ERROR) << "No preferred HCA of " << resolved_name
+                       << " registered memory region " << chunk_addr
+                       << "; disable topology-local registration or fix the "
+                          "topology";
+            unregisterChunkMRs(chunk_addr);
+            rollbackChunks(ci);
+            return ERR_CONTEXT;
         }
         buffer_desc.name = resolved_name;
         buffer_desc.addr = (uint64_t)chunk_addr;
@@ -1462,6 +1513,29 @@ int RdmaTransport::initializeRdmaResources() {
     if (local_topology_->empty()) {
         LOG(ERROR) << "RdmaTransport: No available RNIC";
         return ERR_DEVICE_NOT_FOUND;
+    }
+
+    if (globalConfig().rdma_nic_selection == NicSelection::LOCAL) {
+        std::vector<std::string> context_names;
+        context_names.reserve(context_list_.size());
+        for (auto &context : context_list_)
+            context_names.push_back(context->deviceName());
+        local_nic_map_ = buildPreferredNicIndexMap(local_topology_->getMatrix(),
+                                                   context_names);
+        for (auto &entry : local_nic_map_) {
+            std::string nic_list;
+            for (size_t i = 0; i < entry.second.size(); ++i) {
+                if (i > 0) nic_list += ",";
+                nic_list += context_names[entry.second[i]];
+            }
+            LOG(INFO) << "RdmaTransport: local NICs for " << entry.first
+                      << ": [" << nic_list << "]";
+        }
+        if (local_nic_map_.empty()) {
+            LOG(WARNING) << "RdmaTransport: MC_RDMA_NIC_SELECTION=local but "
+                            "the topology reports no per-location preferred "
+                            "NICs; every buffer will use all NICs as before";
+        }
     }
     return 0;
 }
