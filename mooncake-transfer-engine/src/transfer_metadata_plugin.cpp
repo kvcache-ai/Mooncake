@@ -712,8 +712,8 @@ struct SocketHandShakePlugin : public HandShakePlugin {
         listener_running_ = true;
         listener_ = std::thread([this]() {
             while (listener_running_) {
-                sockaddr_in addr;
-                socklen_t addr_len = sizeof(sockaddr_in);
+                sockaddr_storage addr{};
+                socklen_t addr_len = sizeof(addr);
                 int conn_fd = accept(listen_fd_, (sockaddr *)&addr, &addr_len);
                 if (conn_fd < 0) {
                     if (errno != EWOULDBLOCK && errno != EINTR)
@@ -721,7 +721,7 @@ struct SocketHandShakePlugin : public HandShakePlugin {
                     continue;
                 }
 
-                if (addr.sin_family != AF_INET && addr.sin_family != AF_INET6) {
+                if (addr.ss_family != AF_INET && addr.ss_family != AF_INET6) {
                     LOG(ERROR) << "SocketHandShakePlugin: unsupported socket "
                                   "type, should be AF_INET or AF_INET6";
                     close(conn_fd);
