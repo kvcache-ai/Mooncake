@@ -1664,6 +1664,24 @@ bool isSelectableRdmaBuffer(
     return true;
 }
 
+// A device has valid keys for a buffer if it is in range and every key array
+// the buffer publishes holds a nonzero key for it. A buffer may have no MR on
+// some HCAs (e.g. Data Direct pairing leaves zero keys on non-paired NICs). A
+// local-only MR has no rkey array.
+bool hasValidKeys(const RdmaTransport::SegmentDesc *desc,
+                  const TransferMetadata::BufferDesc &buffer, int device_id) {
+    if (device_id < 0 ||
+        (!desc->devices.empty() &&
+         static_cast<size_t>(device_id) >= desc->devices.size()))
+        return false;
+    for (const auto *keys : {&buffer.lkey, &buffer.rkey}) {
+        if (!keys->empty() && (static_cast<size_t>(device_id) >= keys->size() ||
+                               (*keys)[device_id] == 0))
+            return false;
+    }
+    return !buffer.lkey.empty() || !buffer.rkey.empty();
+}
+
 int pickTopologyDevice(RdmaTransport::SegmentDesc *desc,
                        const TransferMetadata::BufferDesc &buffer,
                        uint64_t offset, std::string_view hint,
@@ -1687,12 +1705,13 @@ int pickTopologyDevice(RdmaTransport::SegmentDesc *desc,
     // A named hint is an explicit override: try the buffer location first,
     // then the global HCA set. Do not call the hint-taking selectDevice()
     // overload here because it applies normal selection immediately on a
-    // location miss, making the wildcard attempt unreachable.
+    // location miss, making the wildcard attempt unreachable. A hinted HCA
+    // without valid keys for the buffer is treated like an unknown hint name.
     if (!hint.empty()) {
         int device_id = desc->topology.getDeviceIndex(location, hint);
-        if (device_id >= 0) return device_id;
+        if (hasValidKeys(desc, buffer, device_id)) return device_id;
         device_id = desc->topology.getDeviceIndex(kWildcardLocation, hint);
-        if (device_id >= 0) return device_id;
+        if (hasValidKeys(desc, buffer, device_id)) return device_id;
     }
 
     int device_id = desc->topology.selectDevice(location, retry_count);
@@ -1725,8 +1744,7 @@ int selectDeviceImpl(RdmaTransport::SegmentDesc *desc, uint64_t offset,
             const size_t nkeys =
                 by_local_hca ? buffer.lkey.size() : buffer.rkey.size();
             if (static_cast<size_t>(hint_device_id) < nkeys &&
-                (desc->devices.empty() ||
-                 static_cast<size_t>(hint_device_id) < desc->devices.size())) {
+                hasValidKeys(desc, buffer, hint_device_id)) {
                 selected = hint_device_id;
             }
         }
@@ -1734,7 +1752,19 @@ int selectDeviceImpl(RdmaTransport::SegmentDesc *desc, uint64_t offset,
             selected = pickTopologyDevice(desc, buffer, offset, hint, local_hca,
                                           retry_count, by_local_hca);
         }
-        if (selected < 0) return false;
+        // Skip topology candidates without valid MR keys within this selection
+        // call. Additional attempts only advance the topology walk; they do not
+        // update the slice's retry counter. Preserve the existing location and
+        // peer-affinity policy. This bound assumes no duplicate HCAs within a
+        // location entry.
+        const int max_attempts =
+            static_cast<int>(desc->topology.getHcaList().size());
+        for (int i = 1;
+             i <= max_attempts && !hasValidKeys(desc, buffer, selected); ++i) {
+            selected = pickTopologyDevice(desc, buffer, offset, hint, local_hca,
+                                          retry_count + i, by_local_hca);
+        }
+        if (!hasValidKeys(desc, buffer, selected)) return false;
         buffer_id = candidate;
         device_id = selected;
         return true;
