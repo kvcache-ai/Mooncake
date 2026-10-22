@@ -259,7 +259,8 @@ class ScopedNoFSegmentAccess {
      * @brief Prepare to unmount a segment by deleting its allocator
      */
     ErrorCode PrepareUnmountSegment(const UUID& segment_id,
-                                    size_t& metrics_dec_capacity);
+                                    size_t& metrics_dec_capacity,
+                                    std::string* te_endpoint = nullptr);
 
     /**
      * @brief Deleting the segment to complete the unmounting operation
@@ -512,6 +513,9 @@ class NoFSegmentManager {
         std::shared_lock<std::shared_mutex> lock(segment_mutex_);
         return mounted_segments_.size();
     }
+
+    // True if any mounted/unmounting NoF segment still owns this te_endpoint.
+    bool HasEndpoint(const std::string& endpoint) const;
 
     void GetMountedSegmentsSnapshot(
         std::vector<MountedNoFSegmentSnapshot>& segments) const;

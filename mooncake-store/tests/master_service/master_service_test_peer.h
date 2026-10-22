@@ -86,6 +86,7 @@ class MasterServiceTestPeer {
     uint64_t GetKvClearedSuppressedForTesting() const;
 
     void SetNoFProbeFnForTesting(MasterService::NoFProbeFn fn);
+    void SetNoFProbeReleaseFnForTesting(MasterService::NoFProbeReleaseFn fn);
 
     size_t GetMountedNoFSegmentCountForTesting();
 
