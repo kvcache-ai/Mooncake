@@ -48,6 +48,17 @@ struct OffloadingTask {
     // offload is pushed once per completed MEMORY replica and those
     // replicas may live on different clients.
     std::vector<UUID> mirror_clients;
+    // The mirrors pushed for the source replica: only they copy from the
+    // buffer that source_id pins.
+    std::vector<UUID> source_clients;
+    // Mirrors that drained this task from their queue while it was the
+    // key's current task. A completion only describes this object's bytes
+    // if it comes from one of them: the store copies after the drain.
+    std::vector<UUID> takers;
+    // Identity of this task (MasterService::NextL4TaskId). Every mirror's
+    // item carries it, and a report counts for this task only if it echoes
+    // it: a report of an earlier task of the key carries another id.
+    L4TaskId task_id;
 };
 
 // Tracks an in-flight LOCAL_DISK -> MEMORY copy. The source
@@ -122,6 +133,12 @@ struct PromotionTask {
     // copies candidate -> task verbatim, failure re-record writes
     // task+1 -> candidate.
     uint32_t execution_failures{0};
+    // Identity of this task (MasterService::NextL4TaskId), carried by the
+    // holder's PromotionTaskItem. AllocStart, Success and Failure act on this
+    // task only if they echo it: a late call for an earlier promotion of the
+    // key carries another id and must not stage, commit or free a buffer of
+    // this one.
+    L4TaskId task_id;
 };
 
 }  // namespace mooncake

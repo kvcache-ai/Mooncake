@@ -263,12 +263,16 @@ TEST(MasterServiceOffloadScenarioTest, RemoveReleasesLocalDiskUsage) {
         .When(ReportSsdCapacity("disk-1", 1000))
         .When(MountLocalDisk("disk-2"))
         .When(ReportSsdCapacity("disk-2", 1000))
-        .When(PutStart("ssd_remove_released", 800).By("disk-1"))
+        .When(PutStart("ssd_remove_released", 800)
+                  .By("disk-1")
+                  .OnNodes({"disk-1"}))
         .When(PutEnd("ssd_remove_released").By("disk-1"))
         .When(CompleteOffload({"ssd_remove_released"})
                   .By("disk-1")
                   .OnNode("disk-1"))
-        .When(PutStart("ssd_remove_baseline", 100).By("disk-2"))
+        .When(PutStart("ssd_remove_baseline", 100)
+                  .By("disk-2")
+                  .OnNodes({"disk-2"}))
         .When(PutEnd("ssd_remove_baseline").By("disk-2"))
         .When(CompleteOffload({"ssd_remove_baseline"})
                   .By("disk-2")
@@ -289,12 +293,16 @@ TEST(MasterServiceOffloadScenarioTest, ReplicaClearReleasesLocalDiskUsage) {
         .When(ReportSsdCapacity("disk-1", 1000))
         .When(MountLocalDisk("disk-2"))
         .When(ReportSsdCapacity("disk-2", 1000))
-        .When(PutStart("ssd_clear_released", 800).By("disk-1"))
+        .When(PutStart("ssd_clear_released", 800)
+                  .By("disk-1")
+                  .OnNodes({"disk-1"}))
         .When(PutEnd("ssd_clear_released").By("disk-1"))
         .When(CompleteOffload({"ssd_clear_released"})
                   .By("disk-1")
                   .OnNode("disk-1"))
-        .When(PutStart("ssd_clear_baseline", 100).By("disk-2"))
+        .When(PutStart("ssd_clear_baseline", 100)
+                  .By("disk-2")
+                  .OnNodes({"disk-2"}))
         .When(PutEnd("ssd_clear_baseline").By("disk-2"))
         .When(CompleteOffload({"ssd_clear_baseline"})
                   .By("disk-2")
@@ -317,12 +325,14 @@ TEST(MasterServiceOffloadScenarioTest, AllocationPrefersTheFresherSsd) {
         .When(ReportSsdCapacity("disk-1", 1000))
         .When(MountLocalDisk("disk-2"))
         .When(ReportSsdCapacity("disk-2", 1000))
-        .When(PutStart("ssd_fresher_heavy", 800).By("disk-1"))
+        .When(
+            PutStart("ssd_fresher_heavy", 800).By("disk-1").OnNodes({"disk-1"}))
         .When(PutEnd("ssd_fresher_heavy").By("disk-1"))
         .When(CompleteOffload({"ssd_fresher_heavy"})
                   .By("disk-1")
                   .OnNode("disk-1"))
-        .When(PutStart("ssd_fresher_light", 100).By("disk-2"))
+        .When(
+            PutStart("ssd_fresher_light", 100).By("disk-2").OnNodes({"disk-2"}))
         .When(PutEnd("ssd_fresher_light").By("disk-2"))
         .When(CompleteOffload({"ssd_fresher_light"})
                   .By("disk-2")
@@ -342,12 +352,16 @@ TEST(MasterServiceOffloadScenarioTest, EvictDiskReplicaReleasesLocalDiskUsage) {
         .When(ReportSsdCapacity("disk-1", 1000))
         .When(MountLocalDisk("disk-2"))
         .When(ReportSsdCapacity("disk-2", 1000))
-        .When(PutStart("ssd_evict_dec_heavy", 800).By("disk-1"))
+        .When(PutStart("ssd_evict_dec_heavy", 800)
+                  .By("disk-1")
+                  .OnNodes({"disk-1"}))
         .When(PutEnd("ssd_evict_dec_heavy").By("disk-1"))
         .When(CompleteOffload({"ssd_evict_dec_heavy"})
                   .By("disk-1")
                   .OnNode("disk-1"))
-        .When(PutStart("ssd_evict_dec_light", 100).By("disk-2"))
+        .When(PutStart("ssd_evict_dec_light", 100)
+                  .By("disk-2")
+                  .OnNodes({"disk-2"}))
         .When(PutEnd("ssd_evict_dec_light").By("disk-2"))
         .When(CompleteOffload({"ssd_evict_dec_light"})
                   .By("disk-2")
@@ -416,12 +430,16 @@ TEST(MasterServiceOffloadScenarioTest, UnmountLocalDiskDropsOnlyItsReplicas) {
         .When(ReportSsdCapacity("leaving", 1000))
         .When(MountLocalDisk("staying"))
         .When(ReportSsdCapacity("staying", 1000))
-        .When(PutStart("ssd_unmount_leaving_key", 1_KB).By("leaving"))
+        .When(PutStart("ssd_unmount_leaving_key", 1_KB)
+                  .By("leaving")
+                  .OnNodes({"leaving"}))
         .When(PutEnd("ssd_unmount_leaving_key").By("leaving"))
         .When(CompleteOffload({"ssd_unmount_leaving_key"})
                   .By("leaving")
                   .OnNode("leaving"))
-        .When(PutStart("ssd_unmount_staying_key", 1_KB).By("staying"))
+        .When(PutStart("ssd_unmount_staying_key", 1_KB)
+                  .By("staying")
+                  .OnNodes({"staying"}))
         .When(PutEnd("ssd_unmount_staying_key").By("staying"))
         .When(CompleteOffload({"ssd_unmount_staying_key"})
                   .By("staying")
@@ -435,31 +453,37 @@ TEST(MasterServiceOffloadScenarioTest, UnmountLocalDiskDropsOnlyItsReplicas) {
                   .HasLocalDiskReplicas(1));
 }
 
-TEST(MasterServiceOffloadScenarioTest, UnmountLocalDiskKeepsReAdoptionWorking) {
-    // A key whose only replica is the disk is what a store's own files look
-    // like to the master after it re-registers them. Deregistration erases it
-    // the same as client expiry would, and a store that comes back re-adopts
-    // its files, so deregistering costs a restart nothing.
-    MasterScenario("a disk-only key is erased and can be re-adopted",
+TEST(MasterServiceOffloadScenarioTest, UnmountLocalDiskErasesDiskOnlyKeys) {
+    // A disk-only key is erased by deregistration the same as by client
+    // expiry. A store that comes back cannot re-adopt the file: a report
+    // without an offload task the store took (its rescan) never registers a
+    // disk replica, since the file may predate the key's current value.
+    MasterScenario("a disk-only key is erased and not re-adopted",
                    SsdAwareOffloadConfig())
         .Given(MemoryNode("node"))
         .When(MountLocalDisk("node"))
         .When(ReportSsdCapacity("node", 1000))
+        .When(PutStart("ssd_unmount_disk_only_key", 1_KB).By("node"))
+        .When(PutEnd("ssd_unmount_disk_only_key").By("node"))
         .When(CompleteOffload({"ssd_unmount_disk_only_key"})
                   .By("node")
-                  .OnNode("node")
-                  .OfSize(1024))
-        .Then(Object("ssd_unmount_disk_only_key").IsReadable())
+                  .OnNode("node"))
+        .When(ClearReplicas({"ssd_unmount_disk_only_key"})
+                  .By("node")
+                  .FromNode("node")
+                  .ExpectCleared({"ssd_unmount_disk_only_key"}))
+        .Then(Object("ssd_unmount_disk_only_key")
+                  .HasReplicas(1)
+                  .HasLocalDiskReplicas(1))
         .When(UnmountLocalDisk("node"))
         .Then(Object("ssd_unmount_disk_only_key").DoesNotExist())
         .When(MountLocalDisk("node"))
         .When(CompleteOffload({"ssd_unmount_disk_only_key"})
                   .By("node")
                   .OnNode("node")
-                  .OfSize(1024))
-        .Then(Object("ssd_unmount_disk_only_key")
-                  .HasReplicas(1)
-                  .HasLocalDiskReplicas(1));
+                  .OfSize(1024)
+                  .AsReRegistration())
+        .Then(Object("ssd_unmount_disk_only_key").DoesNotExist());
 }
 
 TEST(MasterServiceOffloadScenarioTest, CompleteOffloadAfterUnmountIsRefused) {

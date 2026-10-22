@@ -237,7 +237,16 @@ class WrappedMasterService {
     tl::expected<void, ErrorCode> ReportSsdCapacity(
         const UUID& client_id, int64_t ssd_total_capacity_bytes);
 
+    // Offload NACKs (data_size < 0). Completions sent under this name are
+    // dropped: see NotifyOffloadTaskSuccess.
     tl::expected<void, ErrorCode> NotifyOffloadSuccess(
+        const UUID& client_id, const std::vector<OffloadTaskItem>& tasks,
+        const std::vector<StorageObjectMetadata>& metadatas);
+
+    // Offload reports (completions and NACKs) of a store that echoes task
+    // ids. The only RPC through which a completion is registered, so a
+    // master that predates task ids cannot receive one.
+    tl::expected<void, ErrorCode> NotifyOffloadTaskSuccess(
         const UUID& client_id, const std::vector<OffloadTaskItem>& tasks,
         const std::vector<StorageObjectMetadata>& metadatas);
 
@@ -257,6 +266,19 @@ class WrappedMasterService {
     tl::expected<void, ErrorCode> NotifyPromotionFailure(
         const UUID& client_id, const std::string& key,
         const std::string& tenant_id);
+
+    // Promotion RPCs that name their task by the drained item's task id (see
+    // MasterService::PromotionTaskAllocStart). The tenant is the item's.
+    tl::expected<PromotionAllocStartResponse, ErrorCode>
+    PromotionTaskAllocStart(const UUID& client_id,
+                            const PromotionTaskItem& item,
+                            const std::vector<std::string>& preferred_segments);
+
+    tl::expected<void, ErrorCode> NotifyPromotionTaskSuccess(
+        const UUID& client_id, const PromotionTaskItem& item);
+
+    tl::expected<void, ErrorCode> NotifyPromotionTaskFailure(
+        const UUID& client_id, const PromotionTaskItem& item);
 
     // Admin-only, grow-only DFS capacity management. Existing placements remain
     // valid.
@@ -374,6 +396,10 @@ class WrappedMasterService {
     KvEventPublisher::Stats GetKvEventStats() const;
 
    private:
+    // The tenant checks of both offload report RPCs.
+    tl::expected<void, ErrorCode> ValidateOffloadReportTenants(
+        const std::vector<OffloadTaskItem>& tasks) const;
+
     MasterService master_service_;
 };
 
