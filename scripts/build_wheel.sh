@@ -173,9 +173,30 @@ if [ "$CI" = "true" ] || [ "$FREE_BUILD_DIR" = "1" ]; then
     fi
 fi
 
+# Release builds still compile with -g (ENABLE_DEBUG_SYMBOLS defaults to ON),
+# and DWARF made up most of each wheel, pushing the CUDA wheels past the
+# 100 MiB per-file upload limit of PyPI/TestPyPI. Strip it here, before
+# auditwheel: patchelf has to run after strip, never before. --strip-debug
+# keeps .symtab, so stack traces still resolve function names. The CUDA device
+# libraries injected after repair are not touched.
+WHEEL_PACKAGE_DIR="$(pwd)/mooncake-wheel/mooncake"
+if [ "${KEEP_DEBUG_SYMBOLS:-0}" != "1" ]; then
+    echo "Stripping debug info from staged ELF files (set KEEP_DEBUG_SYMBOLS=1 to keep it)..."
+    while IFS= read -r -d '' staged_file; do
+        if [ "$(od -An -tx1 -N4 "$staged_file" | tr -d ' \n')" = "7f454c46" ]; then
+            strip --strip-debug "$staged_file"
+        fi
+    done < <(find "$WHEEL_PACKAGE_DIR" -type f -print0)
+fi
+
 # Make the post-repair device library discoverable while auditwheel resolves
 # the host extension.  It is explicitly excluded below and injected later.
-export LD_LIBRARY_PATH="${CUDA_EP_STAGING_DIR}:${LD_LIBRARY_PATH}"
+# The staged package directory comes next so that libraries auditwheel grafts
+# into .libs (libetcd_wrapper.so, libasio.so, ...) are the stripped copies
+# rather than the installed ones. auditwheel checks the build-tree RUNPATH
+# before LD_LIBRARY_PATH, so this applies once the build directory has been
+# removed above (CI or FREE_BUILD_DIR=1).
+export LD_LIBRARY_PATH="${CUDA_EP_STAGING_DIR}:${WHEEL_PACKAGE_DIR}:${LD_LIBRARY_PATH}"
 
 if [ "$NPU_BUILD" = "1" ]; then
     echo "Stripping shared libraries to reduce wheel size..."
