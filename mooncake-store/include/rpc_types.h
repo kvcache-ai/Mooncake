@@ -52,11 +52,33 @@ YLT_REFL(ReplicaActionLease, proposal_id, lease_id, action, tenant_id, key,
          expire_at_ms_epoch, task_id);
 
 /**
+ * @brief Bits a master reports in PingResponse::supported_features. Bit 0 means
+ * it speaks parts; the field says what a client does with that.
+ */
+inline constexpr uint64_t kPartSupportFeature = 1ULL << 0;
+
+/**
+ * @brief How many parts one object may have.
+ *
+ * The first write fixes the count, so a request is bounded here. Nothing is
+ * allocated from it, because slots follow the parts that were written. A count
+ * records that the writers agreed on a shape, not which one: the parallel
+ * degrees and the (stage, rank) an index stands for are the key's own
+ * convention, so 8x4 and 16x2 are one shape to the master, and the part
+ * checksum is what says which shard a reader holds.
+ */
+inline constexpr uint32_t kMaxPartsPerObject = 4096;
+
+/**
  * @brief Response structure for Ping operation
  */
 struct PingResponse {
     ViewVersionId view_version_id;
     ClientStatus client_status;
+    // What this master understands beyond the base protocol; see
+    // kPartSupportFeature for the bits. A part-aware client checks it before
+    // sending part arguments, which an older master ignores silently.
+    struct_pack::compatible<uint64_t, 1> supported_features;
 
     PingResponse() = default;
     PingResponse(ViewVersionId view_version, ClientStatus status)
@@ -69,7 +91,7 @@ struct PingResponse {
                   << ", client_status: " << response.client_status << " }";
     }
 };
-YLT_REFL(PingResponse, view_version_id, client_status);
+YLT_REFL(PingResponse, view_version_id, client_status, supported_features);
 
 /**
  * @brief Response structure for GetReplicaList operation
@@ -84,6 +106,10 @@ struct GetReplicaListResponse {
     // the exact scope the write path used. Empty when the master predates
     // this field.
     struct_pack::compatible<std::string, 1> resolved_tenant_id;
+    // How many parts the key holds: a reader that named a part places what it
+    // got with it, and one that named none refuses an answer above one. Absent
+    // means the master predates parts.
+    struct_pack::compatible<uint32_t, 2> part_count;
 
     GetReplicaListResponse() : lease_ttl_ms(0) {}
     GetReplicaListResponse(
@@ -95,7 +121,7 @@ struct GetReplicaListResponse {
           object_checksum(object_checksum_param) {}
 };
 YLT_REFL(GetReplicaListResponse, replicas, lease_ttl_ms, object_checksum,
-         resolved_tenant_id);
+         resolved_tenant_id, part_count);
 
 struct CachedQueryResultResponse {
     bool success;

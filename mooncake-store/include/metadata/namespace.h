@@ -145,8 +145,7 @@ class Namespace final : private route::RouteObserver {
     // only when that changed.
     void SyncInFlight(const route::WriteGuard& guard) {
         route::SlotOwnerState& owner = guard.owner_state();
-        const bool listed =
-            guard.has_object() && guard.state().HasWorkInFlight();
+        const bool listed = guard.has_object() && guard.HasWorkInFlight();
         if (listed == owner.in_flight_listed) {
             return;
         }

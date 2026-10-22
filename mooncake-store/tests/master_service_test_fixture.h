@@ -211,14 +211,18 @@ class MasterServiceTest : public ::testing::Test {
             return std::nullopt;
         }
 
-        for (const auto& replica : accessor.Get().GetAllReplicas()) {
+        std::optional<uint32_t> refcnt;
+        accessor.Get().VisitReplicas([&](const Replica& replica) {
+            if (refcnt.has_value()) {
+                return;
+            }
             for (const auto& name : replica.get_segment_names()) {
                 if (name.has_value() && *name == segment_name) {
-                    return replica.get_refcnt();
+                    refcnt = replica.get_refcnt();
                 }
             }
-        }
-        return std::nullopt;
+        });
+        return refcnt;
     }
 
     // Inspect normalized media through the peer's locked metadata accessors.

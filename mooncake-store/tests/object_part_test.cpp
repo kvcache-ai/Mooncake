@@ -53,10 +53,14 @@ std::vector<Replica> MakeDiskReplicas(
 
 std::unique_ptr<ObjectMetadata> MakeEnvelope(size_t length,
                                              std::vector<Replica>&& replicas) {
-    return std::make_unique<ObjectMetadata>(
-        UUID{1, 2}, kWriteTime, length, std::move(replicas), std::nullopt,
-        false, ObjectDataType::UNKNOWN, std::string(kGroupId), TenantId(),
-        "part-test-key");
+    auto metadata = std::make_unique<ObjectMetadata>(
+        /*part_count=*/1, TenantId(), "part-test-key", std::string(kGroupId),
+        ObjectDataType::UNKNOWN, /*hard_pinned=*/false, std::nullopt);
+    auto begin_write = metadata->BeginWrite(/*index=*/0, length,
+                                            std::move(replicas), UUID{1, 2},
+                                            /*session_id=*/"", kWriteTime);
+    EXPECT_TRUE(begin_write.has_value());
+    return metadata;
 }
 
 }  // namespace
@@ -140,7 +144,7 @@ TEST(ObjectPartTest, PopsOnlyTheMatchingReplicas) {
     EXPECT_EQ(erased.size(), 1u);
     EXPECT_EQ(part.replicas().size(), 1u);
 
-    auto remaining = part.PopReplicas();
+    auto remaining = part.PopReplicas([](const Replica&) { return true; });
     EXPECT_EQ(remaining.size(), 1u);
     EXPECT_TRUE(part.replicas().empty());
 }
@@ -152,14 +156,15 @@ TEST(EnvelopePartTest, TheEnvelopeReadsAndWritesItsSinglePart) {
 
     // The read accessor and the write accessor name the same part, and the
     // envelope's own operations answer with what that part holds.
-    const ObjectPart& part = metadata->GetPart(0);
+    const ObjectPart& part = *metadata->GetPart(0);
     EXPECT_EQ(&metadata->MutablePart(0), &part);
     EXPECT_EQ(part.length(), kObjectLength);
     EXPECT_EQ(*part.checksum(), kChecksum);
     EXPECT_EQ(metadata->TotalLength(), part.length());
     EXPECT_EQ(metadata->CountReplicas(), part.replicas().size());
-    EXPECT_EQ(metadata->GetAllReplicas().data(), part.replicas().data());
-    EXPECT_EQ(metadata->GetAllReplicas().size(), part.replicas().size());
+    size_t walked = 0;
+    metadata->VisitReplicas([&](const Replica&) { ++walked; });
+    EXPECT_EQ(walked, part.replicas().size());
     EXPECT_TRUE(metadata->HasReplica(&Replica::fn_is_completed));
 }
 
@@ -193,14 +198,14 @@ TEST(EnvelopePartTest, VisitsAndErasesThroughTheEnvelope) {
 TEST(EnvelopePartTest, ValidityFollowsThePartsLengthAndReplicas) {
     auto with_replica = MakeEnvelope(
         kObjectLength, MakeDiskReplicas({ReplicaStatus::COMPLETE}));
-    EXPECT_TRUE(with_replica->IsValid());
+    EXPECT_TRUE(with_replica->HasAnyReplicaWithValidHandle());
 
     auto without_replica = MakeEnvelope(kObjectLength, {});
-    EXPECT_FALSE(without_replica->IsValid());
+    EXPECT_FALSE(without_replica->HasAnyReplicaWithValidHandle());
 
     auto without_content =
         MakeEnvelope(0, MakeDiskReplicas({ReplicaStatus::COMPLETE}));
-    EXPECT_FALSE(without_content->IsValid());
+    EXPECT_TRUE(without_content->HasAnyReplicaWithValidHandle());
 }
 
 // The OpLog payload carries the envelope's own fields and no checksum, so this

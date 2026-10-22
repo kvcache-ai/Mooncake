@@ -19,6 +19,11 @@ namespace mooncake {
 
 // Forward declaration
 class HttpMetadataServer;
+
+namespace test {
+class MasterServiceTestPeer;
+}  // namespace test
+
 class WrappedMasterService {
    public:
     void SetBatchOpLogTerminalCallback(
@@ -73,12 +78,17 @@ class WrappedMasterService {
     GetReplicaListByRegex(const std::string& str,
                           const std::string& tenant_id = "default");
 
+    // The part a read names trails the call. A caller that names none asks for
+    // a whole object, which an object of several parts cannot give.
     tl::expected<GetReplicaListResponse, ErrorCode> GetReplicaList(
-        const std::string& key, const std::string& tenant_id = "default");
+        const std::string& key, const std::string& tenant_id = "default",
+        struct_pack::compatible<uint32_t> part_index = {});
 
     std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
-    BatchGetReplicaList(const std::vector<std::string>& keys,
-                        const std::string& tenant_id = "default");
+    BatchGetReplicaList(
+        const std::vector<std::string>& keys,
+        const std::string& tenant_id = "default",
+        struct_pack::compatible<std::vector<uint32_t>> part_indices = {});
 
     // Read-only admin variants: no lease grants, no promotion, no metric
     // updates.
@@ -89,36 +99,55 @@ class WrappedMasterService {
     tl::expected<GetReplicaListResponse, ErrorCode> GetReplicaListForAdmin(
         const std::string& key, const std::string& tenant_id = "default");
 
+    // The part arguments trail the call. Leaving them out names the first part
+    // of an object of one part, which is what a client that predates parts
+    // means; see kMaxPartsPerObject for what the count does and does not say.
     tl::expected<std::vector<Replica::Descriptor>, ErrorCode> PutStart(
         const UUID& client_id, const std::string& key,
         const uint64_t slice_length, const ReplicateConfig& config,
-        const std::string& tenant_id = "default");
+        const std::string& tenant_id = "default",
+        struct_pack::compatible<uint32_t> part_index = {},
+        struct_pack::compatible<uint32_t> part_count = {});
 
     tl::expected<void, ErrorCode> PutEnd(
         const UUID& client_id, const ObjectMeta& object_meta,
         ReplicaType replica_type = ReplicaType::ALL,
-        const std::string& tenant_id = "default");
+        const std::string& tenant_id = "default",
+        struct_pack::compatible<uint32_t> part_index = {},
+        struct_pack::compatible<std::vector<uint64_t>> replica_ids = {});
 
     tl::expected<void, ErrorCode> PutRevoke(
         const UUID& client_id, const std::string& key,
         ReplicaType replica_type = ReplicaType::ALL,
-        const std::string& tenant_id = "default");
+        const std::string& tenant_id = "default",
+        struct_pack::compatible<uint32_t> part_index = {},
+        struct_pack::compatible<std::vector<uint64_t>> replica_ids = {});
 
+    // A batch names the part of each item, one entry per key, because one batch
+    // may mix parts of one object.
     std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
-    BatchPutStart(const UUID& client_id, const std::vector<std::string>& keys,
-                  const std::vector<uint64_t>& slice_lengths,
-                  const ReplicateConfig& config,
-                  const std::string& tenant_id = "default");
+    BatchPutStart(
+        const UUID& client_id, const std::vector<std::string>& keys,
+        const std::vector<uint64_t>& slice_lengths,
+        const ReplicateConfig& config, const std::string& tenant_id = "default",
+        struct_pack::compatible<std::vector<uint32_t>> part_indices = {},
+        struct_pack::compatible<uint32_t> part_count = {});
 
     std::vector<tl::expected<void, ErrorCode>> BatchPutEnd(
         const UUID& client_id, const std::vector<ObjectMeta>& object_metas,
         ReplicaType replica_type = ReplicaType::ALL,
-        const std::string& tenant_id = "default");
+        const std::string& tenant_id = "default",
+        struct_pack::compatible<std::vector<uint32_t>> part_indices = {},
+        struct_pack::compatible<std::vector<std::vector<uint64_t>>>
+            replica_ids = {});
 
     std::vector<tl::expected<void, ErrorCode>> BatchPutRevoke(
         const UUID& client_id, const std::vector<std::string>& keys,
         ReplicaType replica_type = ReplicaType::ALL,
-        const std::string& tenant_id = "default");
+        const std::string& tenant_id = "default",
+        struct_pack::compatible<std::vector<uint32_t>> part_indices = {},
+        struct_pack::compatible<std::vector<std::vector<uint64_t>>>
+            replica_ids = {});
 
     tl::expected<std::vector<Replica::Descriptor>, ErrorCode> UpsertStart(
         const UUID& client_id, const std::string& key,
@@ -374,6 +403,8 @@ class WrappedMasterService {
     KvEventPublisher::Stats GetKvEventStats() const;
 
    private:
+    friend class test::MasterServiceTestPeer;
+
     MasterService master_service_;
 };
 

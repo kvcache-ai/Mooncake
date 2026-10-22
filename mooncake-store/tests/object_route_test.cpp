@@ -45,6 +45,23 @@ bool TearDownKey(ObjectRoute& route, std::string_view key) {
     return true;
 }
 
+// Puts work in flight on the object and takes it off again. Anything a write
+// of the key would have to wait for serves; a replication task is the cheapest
+// one to put on an object that carries none.
+void SetWorkInFlight(route::ObjectState& state, bool in_flight) {
+    if (!in_flight) {
+        state.replication_task.reset();
+        return;
+    }
+    state.replication_task = ReplicationTask{
+        /*client_id=*/UUID{},
+        /*start_time=*/std::chrono::system_clock::now(),
+        /*type=*/ReplicationTask::Type::COPY,
+        /*source_id=*/0,
+        /*replica_ids=*/{},
+    };
+}
+
 std::vector<std::string> Sorted(std::vector<std::string> keys) {
     std::sort(keys.begin(), keys.end());
     return keys;
@@ -590,8 +607,8 @@ TEST(ObjectRouteTest, WriteCursorChangesMetadataAndState) {
     for (const char* key : {"k1", "k2"}) {
         auto guard = route.Read(key);
         ASSERT_TRUE(guard.has_value());
-        ASSERT_TRUE(guard->metadata().GetPart(0).checksum().has_value());
-        EXPECT_EQ(*guard->metadata().GetPart(0).checksum(), 42u);
+        ASSERT_TRUE(guard->metadata().GetPart(0)->checksum().has_value());
+        EXPECT_EQ(*guard->metadata().GetPart(0)->checksum(), 42u);
         ASSERT_TRUE(guard->state().offloading_task.has_value());
         EXPECT_EQ(guard->state().offloading_task->mirror_clients.size(), 1u);
     }
@@ -737,15 +754,12 @@ TEST(ObjectRouteDeathTest, PublishOverAnObjectAborts) {
 
 TEST(ObjectRouteDeathTest, PublishOfAnotherKeysMetadataAborts) {
     ObjectRoute route;
-    const auto write_time =
-        std::chrono::system_clock::time_point(std::chrono::seconds(1));
     EXPECT_DEATH(
         {
             auto guard = route.WriteKey("k1");
-            (void)guard.Publish(UUID{1, 2}, write_time, 128,
-                                std::vector<Replica>{}, std::nullopt, false,
-                                ObjectDataType::UNKNOWN, std::string(),
-                                TenantId(), std::string("k2"));
+            (void)guard.Publish(/*part_count=*/1, TenantId(), std::string("k2"),
+                                std::string(""), ObjectDataType::UNKNOWN,
+                                /*hard_pinned=*/false, std::nullopt);
         },
         "of an object keyed k2");
 }
@@ -799,14 +813,14 @@ TEST(ObjectRouteDeathTest, WriteCursorChangingInFlightWorkAsserts) {
     EXPECT_DEATH(
         {
             for (auto object : route.WriteCursor()) {
-                object.state().is_processing = true;
+                SetWorkInFlight(object.state(), true);
             }
         },
         "changed in-flight work");
     EXPECT_DEATH(
         {
             for (auto object : route.WriteCursor()) {
-                object.state().is_processing = true;
+                SetWorkInFlight(object.state(), true);
                 break;
             }
         },
@@ -826,8 +840,9 @@ class RecordingObserver final : public route::RouteObserver {
     };
 
     void OnWriteRelease(const route::WriteGuard& guard) override {
-        releases.push_back({guard.key(), guard.has_object(),
-                            guard.has_object() && guard.state().is_processing});
+        releases.push_back(
+            {guard.key(), guard.has_object(),
+             guard.has_object() && guard.state().HasWorkInFlight()});
     }
 
     std::vector<Release> releases;
@@ -850,7 +865,7 @@ TEST(ObjectRouteTest, ObserverSeesEveryWriteGuardAsItIsReleased) {
     {
         auto guard = route.WriteKey("k1");
         (void)test::PublishEnvelope(guard);
-        guard.state().is_processing = true;
+        SetWorkInFlight(guard.state(), true);
         EXPECT_EQ(observer.releases.size(), 1u);
     }
     ASSERT_EQ(observer.releases.size(), 2u);
@@ -860,7 +875,7 @@ TEST(ObjectRouteTest, ObserverSeesEveryWriteGuardAsItIsReleased) {
     {
         auto guard = route.Write("k1");
         ASSERT_TRUE(guard.has_value());
-        guard->state().is_processing = false;
+        SetWorkInFlight(guard->state(), false);
     }
     ASSERT_EQ(observer.releases.size(), 3u);
     EXPECT_TRUE(observer.releases[2].has_object);
@@ -1003,8 +1018,8 @@ TEST(ObjectRouteTest, ChurnKeepsTheRouteAndTheGroupConsistent) {
                     if (!is_member(key)) {
                         violation();
                     }
-                    guard->state().is_processing =
-                        !guard->state().is_processing;
+                    SetWorkInFlight(guard->state(),
+                                    !guard->state().HasWorkInFlight());
                 }
             }
         });

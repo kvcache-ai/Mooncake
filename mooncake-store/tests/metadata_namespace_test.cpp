@@ -26,12 +26,41 @@ std::vector<std::string> SortedInFlightKeys(const Namespace& ns) {
     return keys;
 }
 
-// Starts or finishes a primary write on the object under `key`, under a write
-// guard of its own.
-void SetProcessing(Namespace& ns, const std::string& key, bool processing) {
+// Starts or finishes work on the object a write guard holds. The object model
+// keeps "a primary write is unfinished" in the parts, so the work a suite puts
+// on an object and takes off again is a task; the cases below cover a write in
+// flight where that is what they are about.
+void SetWork(const route::WriteGuard& guard, bool work) {
+    if (work) {
+        guard.state().offloading_task =
+            OffloadingTask{1, std::chrono::system_clock::now(), {}};
+    } else {
+        guard.state().offloading_task.reset();
+    }
+}
+
+// The same, under a write guard of its own.
+void SetWork(Namespace& ns, const std::string& key, bool work) {
     auto guard = ns.objects.Write(key);
     ASSERT_TRUE(guard.has_value());
-    guard->state().is_processing = processing;
+    SetWork(*guard, work);
+}
+
+// Completes the write the object under `key` has in flight, under a write guard
+// of its own.
+void FinishWrite(Namespace& ns, const std::string& key) {
+    auto guard = ns.objects.Write(key);
+    ASSERT_TRUE(guard.has_value());
+    test::FinishWriteInFlight(*guard);
+}
+
+// A replica the write has not completed, which is what puts a primary write in
+// flight.
+std::vector<Replica> ProcessingReplica(const std::string& key) {
+    std::vector<Replica> replicas;
+    replicas.push_back(
+        test::DiskReplica(ReplicaStatus::PROCESSING, "file://" + key));
+    return replicas;
 }
 
 TEST(NamespaceTest, InFlightListsOnlyObjectsWithWork) {
@@ -43,7 +72,7 @@ TEST(NamespaceTest, InFlightListsOnlyObjectsWithWork) {
     {
         auto guard = ns.objects.Write("busy");
         ASSERT_TRUE(guard.has_value());
-        guard->state().is_processing = true;
+        SetWork(*guard, true);
         // Listed as the guard is released, not before.
         EXPECT_TRUE(ns.InFlightKeys().empty());
     }
@@ -55,27 +84,45 @@ TEST(NamespaceTest, InFlightListsOnlyObjectsWithWork) {
         ASSERT_TRUE(guard.has_value());
     }
     // Starting work again on a listed object lists it once.
-    SetProcessing(ns, "busy", true);
+    SetWork(ns, "busy", true);
     EXPECT_EQ(SortedInFlightKeys(ns), (std::vector<std::string>{"busy"}));
 
-    SetProcessing(ns, "busy", false);
+    SetWork(ns, "busy", false);
+    EXPECT_TRUE(ns.InFlightKeys().empty());
+}
+
+// A primary write that has not finished is work in flight too, and the key
+// leaves the list when its last replica completes.
+TEST(NamespaceTest, AWriteInFlightListsTheKeyUntilItCompletes) {
+    Namespace ns;
+    ASSERT_NE(
+        test::PublishObject(ns.objects, "k1", {}, ProcessingReplica("k1")), 0u);
+    EXPECT_EQ(SortedInFlightKeys(ns), (std::vector<std::string>{"k1"}));
+
+    // A guard on the object without changing it leaves the listing alone.
+    {
+        auto guard = ns.objects.Write("k1");
+        ASSERT_TRUE(guard.has_value());
+    }
+    EXPECT_EQ(SortedInFlightKeys(ns), (std::vector<std::string>{"k1"}));
+
+    FinishWrite(ns, "k1");
     EXPECT_TRUE(ns.InFlightKeys().empty());
 }
 
 TEST(NamespaceTest, AKeyStaysListedWhileAnyWorkRemains) {
     Namespace ns;
-    ASSERT_NE(test::PublishObject(ns.objects, "k1"), 0u);
+    ASSERT_NE(
+        test::PublishObject(ns.objects, "k1", {}, ProcessingReplica("k1")), 0u);
 
     {
         auto guard = ns.objects.Write("k1");
         ASSERT_TRUE(guard.has_value());
-        guard->state().is_processing = true;
-        guard->state().offloading_task =
-            OffloadingTask{1, std::chrono::system_clock::now(), {}};
+        SetWork(*guard, true);
     }
 
     // The write finished but the offload has not, so the key stays listed.
-    SetProcessing(ns, "k1", false);
+    FinishWrite(ns, "k1");
     EXPECT_EQ(SortedInFlightKeys(ns), (std::vector<std::string>{"k1"}));
 
     {
@@ -92,8 +139,7 @@ TEST(NamespaceTest, PublishingWithWorkListsTheKeyOnRelease) {
         // The write that creates the object starts with work in flight.
         auto guard = ns.objects.WriteKey("k1");
         ASSERT_FALSE(guard.has_object());
-        (void)test::PublishEnvelope(guard);
-        guard.state().is_processing = true;
+        (void)test::PublishEnvelope(guard, {}, ProcessingReplica("k1"));
         EXPECT_TRUE(ns.InFlightKeys().empty());
     }
     EXPECT_EQ(SortedInFlightKeys(ns), (std::vector<std::string>{"k1"}));
@@ -103,7 +149,7 @@ TEST(NamespaceTest, PublishingWithWorkListsTheKeyOnRelease) {
     EXPECT_EQ(test::PublishObject(ns.objects, "k1"), 0u);
     EXPECT_EQ(SortedInFlightKeys(ns), (std::vector<std::string>{"k1"}));
 
-    SetProcessing(ns, "k1", false);
+    FinishWrite(ns, "k1");
     EXPECT_TRUE(ns.InFlightKeys().empty());
 }
 
@@ -120,8 +166,8 @@ TEST(NamespaceTest, TearDownTakesAKeyOffTheInFlightList) {
     Namespace ns;
     ASSERT_NE(test::PublishObject(ns.objects, "k1"), 0u);
     ASSERT_NE(test::PublishObject(ns.objects, "k2"), 0u);
-    SetProcessing(ns, "k1", true);
-    SetProcessing(ns, "k2", true);
+    SetWork(ns, "k1", true);
+    SetWork(ns, "k2", true);
     ASSERT_EQ(SortedInFlightKeys(ns), (std::vector<std::string>{"k1", "k2"}));
 
     // The object still carried its write, yet the key leaves the list with
@@ -133,14 +179,14 @@ TEST(NamespaceTest, TearDownTakesAKeyOffTheInFlightList) {
     }
     EXPECT_EQ(SortedInFlightKeys(ns), (std::vector<std::string>{"k2"}));
 
-    SetProcessing(ns, "k2", false);
+    SetWork(ns, "k2", false);
     EXPECT_TRUE(ns.InFlightKeys().empty());
 }
 
 TEST(NamespaceTest, AReplacementIsListedByItsOwnWork) {
     Namespace ns;
     ASSERT_NE(test::PublishObject(ns.objects, "k1"), 0u);
-    SetProcessing(ns, "k1", true);
+    SetWork(ns, "k1", true);
 
     // A replacement under one guard starts with empty state, so the key is
     // unlisted unless the new publication carries work of its own.
@@ -156,12 +202,11 @@ TEST(NamespaceTest, AReplacementIsListedByItsOwnWork) {
         auto guard = ns.objects.Write("k1");
         ASSERT_TRUE(guard.has_value());
         guard->TearDown();
-        (void)test::PublishEnvelope(*guard);
-        guard->state().is_processing = true;
+        (void)test::PublishEnvelope(*guard, {}, ProcessingReplica("k1"));
     }
     EXPECT_EQ(SortedInFlightKeys(ns), (std::vector<std::string>{"k1"}));
 
-    SetProcessing(ns, "k1", false);
+    FinishWrite(ns, "k1");
 }
 
 TEST(NamespaceTest, DestroyingANamespaceWithListedKeysIsClean) {
@@ -170,8 +215,8 @@ TEST(NamespaceTest, DestroyingANamespaceWithListedKeysIsClean) {
     Namespace ns;
     ASSERT_NE(test::PublishObject(ns.objects, "k1"), 0u);
     ASSERT_NE(test::PublishObject(ns.objects, "k2", "g1"), 0u);
-    SetProcessing(ns, "k1", true);
-    SetProcessing(ns, "k2", true);
+    SetWork(ns, "k1", true);
+    SetWork(ns, "k2", true);
     ASSERT_EQ(ns.InFlightKeys().size(), 2u);
 }
 
@@ -211,8 +256,8 @@ TEST(NamespaceTest, ConcurrentWritersKeepTheInFlightListExact) {
             for (int round = 0; round < kRounds; ++round) {
                 const bool last = round == kRounds - 1;
                 for (int k = 0; k < kKeysPerThread; ++k) {
-                    SetProcessing(ns, key_of(t, k),
-                                  last ? k % 2 == 0 : round % 2 == 0);
+                    SetWork(ns, key_of(t, k),
+                            last ? k % 2 == 0 : round % 2 == 0);
                 }
             }
         });

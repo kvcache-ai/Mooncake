@@ -306,6 +306,13 @@ class Guard {
     Metadata& metadata() const { return record().metadata; }
     State& state() const { return record().state; }
 
+    // Whether the held object carries work: a task a release left behind, or a
+    // primary write whose parts are not all complete. The object model keeps
+    // the two in different places, so the question is answered here, once.
+    bool HasWorkInFlight() const {
+        return state().HasWorkInFlight() || metadata().HasWriteInFlight();
+    }
+
     // Publishes an object under this key, which must hold none: builds its
     // metadata in place from `metadata_args`, ObjectMetadata's constructor
     // arguments, and wires its group membership and the group's shared lease;
@@ -685,15 +692,21 @@ class ObjectRoute::Cursor {
     // the cursor then advances or the loop is left early.
     void AssertInFlightUnchanged() const {
         assert((!kWrite || current_ == nullptr ||
-                current_->record_->state.HasWorkInFlight() ==
-                    visited_in_flight_) &&
+                CarriesWork(*current_) == visited_in_flight_) &&
                "a write cursor's loop body changed in-flight work");
     }
 
     void Stand(KeySlot& slot, Lock lock) {
         slot_lock_ = std::move(lock);
         current_ = &slot;
-        visited_in_flight_ = slot.record_->state.HasWorkInFlight();
+        visited_in_flight_ = CarriesWork(slot);
+    }
+
+    // What the namespace asks of a released guard, asked of the slot a cursor
+    // stands on: a task or a primary write that has not finished.
+    static bool CarriesWork(const KeySlot& slot) {
+        return slot.record_->state.HasWorkInFlight() ||
+               slot.record_->metadata.HasWriteInFlight();
     }
 
     void UnlockSlot() {

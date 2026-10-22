@@ -45,9 +45,6 @@ struct StandbyObjectMetadata {
 
     YLT_REFL(StandbyObjectMetadata, client_id, size, replicas, group_id,
              data_type, hard_pinned, session_id);
-
-    // Check if this metadata has valid replicas
-    bool HasReplicas() const { return !replicas.empty(); }
 };
 
 /**

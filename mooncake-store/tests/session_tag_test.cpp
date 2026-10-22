@@ -55,7 +55,10 @@ std::string SessionTag(MasterService& service, const std::string& key) {
         &service, MasterServiceTestPeer(service).MakeObjectIdentityForRequest(
                       key, TenantId::Default()));
     EXPECT_TRUE(access.Exists());
-    return access.Exists() ? access.Get().session_id : "<missing>";
+    if (!access.Exists()) {
+        return "<missing>";
+    }
+    return access.Get().WriteSessionId();
 }
 
 ReplicateConfig Tagged(std::string id) {
@@ -180,14 +183,15 @@ TEST_F(MasterServiceTest, SessionTagSurvivesAddingDiskReplica) {
     EXPECT_EQ(SessionTag(service, "key"), "writer");
 }
 
-TEST_F(MasterServiceTest, SessionTagCommitsAndSurvivesUpsertReplacement) {
+TEST_F(MasterServiceTest, SessionTagFollowsTheNewestWrite) {
     MasterService service(
         MasterServiceConfig::builder().set_default_kv_lease_ttl(0).build());
     PrepareSimpleSegment(service);
     const auto client = generate_uuid();
     auto a = Tagged("a");
     ASSERT_TRUE(service.PutStart(client, "key", TenantId::Default(), 1024, a));
-    EXPECT_EQ(SessionTag(service, "key"), "");
+    // The write record carries the session from the moment the write opens.
+    EXPECT_EQ(SessionTag(service, "key"), "a");
     ASSERT_TRUE(service.PutEnd(client, "key", TenantId::Default(),
                                ReplicaType::MEMORY));
     EXPECT_EQ(SessionTag(service, "key"), "a");
@@ -195,7 +199,8 @@ TEST_F(MasterServiceTest, SessionTagCommitsAndSurvivesUpsertReplacement) {
                                   Tagged("b")));
     EXPECT_EQ(SessionTag(service, "key"), "a");
 
-    // Same-size, absent tag; then size-changing, explicit tag.
+    // A rewrite that names no session keeps the one the object carries, and
+    // one that names a session records it.
     ASSERT_TRUE(
         service.UpsertStart(client, "key", TenantId::Default(), 1024, {}));
     ASSERT_TRUE(service.UpsertEnd(client, "key", TenantId::Default(),
@@ -203,10 +208,10 @@ TEST_F(MasterServiceTest, SessionTagCommitsAndSurvivesUpsertReplacement) {
     EXPECT_EQ(SessionTag(service, "key"), "a");
     ASSERT_TRUE(service.UpsertStart(client, "key", TenantId::Default(), 2048,
                                     Tagged("b")));
-    EXPECT_EQ(SessionTag(service, "key"), "a");
+    EXPECT_EQ(SessionTag(service, "key"), "b");
     EXPECT_FALSE(service.UpsertEnd(generate_uuid(), "key", TenantId::Default(),
                                    ReplicaType::MEMORY));
-    EXPECT_EQ(SessionTag(service, "key"), "a");
+    EXPECT_EQ(SessionTag(service, "key"), "b");
     ASSERT_TRUE(service.UpsertEnd(client, "key", TenantId::Default(),
                                   ReplicaType::MEMORY));
     EXPECT_EQ(SessionTag(service, "key"), "b");
@@ -216,15 +221,16 @@ TEST_F(MasterServiceTest, SessionTagCommitsAndSurvivesUpsertReplacement) {
     ASSERT_TRUE(service.UpsertEnd(client, "key", TenantId::Default(),
                                   ReplicaType::MEMORY));
     EXPECT_EQ(SessionTag(service, "key"), "b");
-    // Preempt an unfinished tagged write; its pending tag must not survive.
+    // Preempt an unfinished tagged write: the record holds the session of that
+    // write, and the replacement that names none carries it on.
     ASSERT_TRUE(service.UpsertStart(client, "key", TenantId::Default(), 4096,
                                     Tagged("failed")));
-    EXPECT_EQ(SessionTag(service, "key"), "b");
+    EXPECT_EQ(SessionTag(service, "key"), "failed");
     ASSERT_TRUE(
         service.UpsertStart(client, "key", TenantId::Default(), 4096, {}));
     ASSERT_TRUE(service.UpsertEnd(client, "key", TenantId::Default(),
                                   ReplicaType::MEMORY));
-    EXPECT_EQ(SessionTag(service, "key"), "b");
+    EXPECT_EQ(SessionTag(service, "key"), "failed");
     ASSERT_TRUE(service.Remove("key", TenantId::Default(), true));
     PutCompletedObject(service, client, "key", {});
     EXPECT_EQ(SessionTag(service, "key"), "");
@@ -273,8 +279,12 @@ TEST_F(MasterServiceTest, SessionTagOpLogAndStandbyRestore) {
     PrepareSimpleSegment(service);
     const auto client = generate_uuid();
     PutCompletedObject(service, client, "key", Tagged("committed"));
-    ASSERT_TRUE(service.UpsertStart(client, "key", TenantId::Default(), 1024,
-                                    Tagged("pending")));
+    // The rewrite names no session, so it is attributed to the one that
+    // produced the content it replaces.
+    ASSERT_TRUE(
+        service.UpsertStart(client, "key", TenantId::Default(), 1024, {}));
+    ASSERT_TRUE(service.UpsertEnd(client, "key", TenantId::Default(),
+                                  ReplicaType::MEMORY));
     std::string payload;
     {
         MasterServiceTestPeer::MetadataAccessorRO access(

@@ -850,9 +850,9 @@ class MasterServiceHATest : public ::testing::Test {
             return {};
         }
         std::vector<Replica::Descriptor> descriptors;
-        for (const auto& replica : accessor.Get().GetAllReplicas()) {
+        accessor.Get().VisitReplicas([&descriptors](const Replica& replica) {
             descriptors.push_back(replica.get_descriptor());
-        }
+        });
         return descriptors;
     }
 
@@ -876,12 +876,14 @@ class MasterServiceHATest : public ::testing::Test {
         if (!accessor.Exists()) {
             return true;
         }
-        for (const auto& replica : accessor.Get().GetAllReplicas()) {
-            if (replica.has_invalid_mem_handle()) {
-                return true;
-            }
-        }
-        return false;
+        bool has_invalid_handle = false;
+        accessor.Get().VisitReplicas(
+            [&has_invalid_handle](const Replica& replica) {
+                if (replica.has_invalid_mem_handle()) {
+                    has_invalid_handle = true;
+                }
+            });
+        return has_invalid_handle;
     }
 
     static bool HasReadableReplicaForTesting(MasterService& service,
@@ -890,9 +892,8 @@ class MasterServiceHATest : public ::testing::Test {
         MasterServiceTestPeer::MetadataAccessorRO accessor(
             &service, MasterServiceTestPeer::ObjectIdentity{tenant_id, key});
         return accessor.Exists() &&
-               accessor.Get().HasReplica([&service](const Replica& replica) {
-                   return MasterServiceTestPeer(service).IsReplicaReadable(
-                       replica);
+               accessor.Get().HasReplica([](const Replica& replica) {
+                   return replica.is_readable();
                });
     }
 

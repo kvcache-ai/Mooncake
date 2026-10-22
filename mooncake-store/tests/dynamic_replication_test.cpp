@@ -179,7 +179,21 @@ class DynamicReplicationTest : public ::testing::Test {
             &service,
             MasterServiceTestPeer::ObjectIdentity{TenantId::Default(), key});
         ASSERT_TRUE(accessor.Exists());
-        accessor.Get().put_start_time += std::chrono::milliseconds(1);
+        // The epoch is measured from the newest write of any part, so writing
+        // the part again is what makes a proposal admitted before it stale.
+        // Nothing about the replicas changes: they keep their status, and the
+        // write record simply moves forward.
+        auto& metadata = accessor.Get();
+        const ObjectPart* part = metadata.GetPart(0);
+        ASSERT_NE(part, nullptr);
+        const size_t length = part->length();
+        auto replicas = metadata.PopReplicas();
+        ASSERT_FALSE(replicas.empty());
+        auto begin_write = metadata.BeginWrite(
+            /*index=*/0, length, std::move(replicas), UUID{1, 2},
+            /*session_id=*/"",
+            std::chrono::system_clock::now() + std::chrono::milliseconds(1));
+        ASSERT_TRUE(begin_write.has_value());
     }
 
     // True when the object still carries dynamic-replication state: its own

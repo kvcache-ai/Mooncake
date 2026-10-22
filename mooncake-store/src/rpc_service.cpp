@@ -76,6 +76,136 @@ auto WithWriteTenant(std::string_view raw, bool enable_multi_tenants, Fn&& fn) {
     return std::invoke(std::forward<Fn>(fn), tenant_id.value());
 }
 
+// Which part of a key a call acts on. An argument the caller left out means the
+// first part of an object of one part, which is what a client that predates
+// parts means by the call it makes.
+struct PartPosition {
+    uint32_t index{0};
+    uint32_t count{1};
+};
+
+tl::expected<PartPosition, ErrorCode> ResolvePartPosition(
+    const struct_pack::compatible<uint32_t>& part_index,
+    const struct_pack::compatible<uint32_t>& part_count) {
+    PartPosition position;
+    if (part_count.has_value()) {
+        if (*part_count == 0) {
+            LOG(ERROR) << "part_count=0, error=part_count_must_be_positive";
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        if (*part_count > kMaxPartsPerObject) {
+            LOG(ERROR) << "part_count=" << *part_count
+                       << ", max_parts=" << kMaxPartsPerObject
+                       << ", error=part_count_too_large";
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        position.count = *part_count;
+    }
+    position.index = part_index.value_or(0);
+    if (position.index >= position.count) {
+        LOG(ERROR) << "part_index=" << position.index
+                   << ", part_count=" << position.count
+                   << ", error=part_index_out_of_range";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return position;
+}
+
+// The part every item of a batch names. A caller that names none means the
+// first part of an object of one part for each of them.
+tl::expected<std::vector<uint32_t>, ErrorCode> ResolvePartIndices(
+    const struct_pack::compatible<std::vector<uint32_t>>& part_indices,
+    uint32_t part_count, size_t item_count) {
+    std::vector<uint32_t> indices;
+    if (!part_indices.has_value()) {
+        indices.assign(item_count, 0);
+        return indices;
+    }
+    if (part_indices->size() != item_count) {
+        LOG(ERROR) << "part_indices=" << part_indices->size()
+                   << ", items=" << item_count
+                   << ", error=part_indices_item_count_mismatch";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    for (const auto index : *part_indices) {
+        if (index >= part_count) {
+            LOG(ERROR) << "part_index=" << index
+                       << ", part_count=" << part_count
+                       << ", error=part_index_out_of_range";
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+    }
+    return *part_indices;
+}
+
+// The part each item of a batch read names, for the reads that leave the range
+// check to the object they land on. A caller that names none names no part at
+// all, which is the read of a whole object and is passed on as an empty list.
+tl::expected<std::vector<std::optional<uint32_t>>, ErrorCode>
+ResolveOptionalPartIndices(
+    const struct_pack::compatible<std::vector<uint32_t>>& part_indices,
+    size_t item_count) {
+    if (!part_indices.has_value()) {
+        return std::vector<std::optional<uint32_t>>{};
+    }
+    if (part_indices->size() != item_count) {
+        LOG(ERROR) << "part_indices=" << part_indices->size()
+                   << ", items=" << item_count
+                   << ", error=part_indices_item_count_mismatch";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    std::vector<std::optional<uint32_t>> resolved;
+    resolved.reserve(part_indices->size());
+    for (const auto index : *part_indices) {
+        resolved.push_back(index);
+    }
+    return resolved;
+}
+
+// The replicas an End or a Revoke names. A caller that names none acts on every
+// replica the part's write handed out, which is what a client that predates
+// parts means; an empty list names nothing at all and is refused.
+tl::expected<std::optional<std::vector<ReplicaID>>, ErrorCode>
+ResolvePartReplicaIds(
+    const struct_pack::compatible<std::vector<uint64_t>>& replica_ids) {
+    if (!replica_ids.has_value()) {
+        return std::optional<std::vector<ReplicaID>>{};
+    }
+    if (replica_ids->empty()) {
+        LOG(ERROR) << "error=empty_replica_ids";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return std::optional<std::vector<ReplicaID>>{
+        std::vector<ReplicaID>(replica_ids->begin(), replica_ids->end())};
+}
+
+tl::expected<std::optional<std::vector<std::vector<ReplicaID>>>, ErrorCode>
+ResolvePartReplicaIdBatches(
+    const struct_pack::compatible<std::vector<std::vector<uint64_t>>>&
+        replica_ids,
+    size_t item_count) {
+    if (!replica_ids.has_value()) {
+        return std::optional<std::vector<std::vector<ReplicaID>>>{};
+    }
+    if (replica_ids->size() != item_count) {
+        LOG(ERROR) << "replica_ids=" << replica_ids->size()
+                   << ", items=" << item_count
+                   << ", error=replica_ids_item_count_mismatch";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    std::vector<std::vector<ReplicaID>> resolved;
+    resolved.reserve(replica_ids->size());
+    for (const auto& ids : *replica_ids) {
+        if (ids.empty()) {
+            LOG(ERROR) << "error=empty_replica_ids";
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        resolved.emplace_back(ids.begin(), ids.end());
+    }
+    return std::optional<std::vector<std::vector<ReplicaID>>>{
+        std::move(resolved)};
+}
+
 }  // namespace
 
 WrappedMasterService::WrappedMasterService(
@@ -309,8 +439,9 @@ WrappedMasterService::GetReplicaListByRegex(const std::string& str,
 }
 
 tl::expected<GetReplicaListResponse, ErrorCode>
-WrappedMasterService::GetReplicaList(const std::string& key,
-                                     const std::string& tenant_id) {
+WrappedMasterService::GetReplicaList(
+    const std::string& key, const std::string& tenant_id,
+    struct_pack::compatible<uint32_t> part_index) {
     return execute_rpc(
         "GetReplicaList",
         [&] {
@@ -319,8 +450,12 @@ WrappedMasterService::GetReplicaList(const std::string& key,
                     ? std::string_view(tenant_id)
                     : TenantId::kDefaultValue,
                 [&](const TenantId& resolved_tenant_id) {
-                    auto result =
-                        master_service_.GetReplicaList(key, resolved_tenant_id);
+                    std::optional<uint32_t> named_part;
+                    if (part_index.has_value()) {
+                        named_part = *part_index;
+                    }
+                    auto result = master_service_.GetReplicaList(
+                        key, resolved_tenant_id, named_part);
                     // Tell the reader which scope the
                     // object actually lives in, so its
                     // disk-replica verify requests can
@@ -331,7 +466,10 @@ WrappedMasterService::GetReplicaList(const std::string& key,
                     return result;
                 });
         },
-        [&](auto& timer) { timer.LogRequest("key=", key); },
+        [&](auto& timer) {
+            timer.LogRequest("key=", key, ", part_index=",
+                             part_index.has_value() ? part_index.value() : 0u);
+        },
         [] { MasterMetricManager::instance().inc_get_replica_list_requests(); },
         [] {
             MasterMetricManager::instance().inc_get_replica_list_failures();
@@ -339,8 +477,9 @@ WrappedMasterService::GetReplicaList(const std::string& key,
 }
 
 std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
-WrappedMasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
-                                          const std::string& tenant_id) {
+WrappedMasterService::BatchGetReplicaList(
+    const std::vector<std::string>& keys, const std::string& tenant_id,
+    struct_pack::compatible<std::vector<uint32_t>> part_indices) {
     ScopedVLogTimer timer(1, "BatchGetReplicaList");
     const size_t total_keys = keys.size();
     timer.LogRequest("keys_count=", total_keys);
@@ -350,12 +489,24 @@ WrappedMasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
     std::vector<tl::expected<GetReplicaListResponse, ErrorCode>> results;
     results.reserve(keys.size());
 
+    auto resolved_part_indices =
+        ResolveOptionalPartIndices(part_indices, keys.size());
+    if (!resolved_part_indices) {
+        results.assign(keys.size(),
+                       tl::make_unexpected(resolved_part_indices.error()));
+        MasterMetricManager::instance().inc_batch_get_replica_list_failures(
+            keys.size());
+        timer.LogResponse("total=", results.size(), ", success=0",
+                          ", failures=", keys.size());
+        return results;
+    }
+
     results = WithRequestTenantBatch(
         master_service_.IsTenantQuotaEnabled() ? std::string_view(tenant_id)
                                                : TenantId::kDefaultValue,
         keys.size(), [&](const TenantId& resolved_tenant_id) {
-            auto batch =
-                master_service_.BatchGetReplicaList(keys, resolved_tenant_id);
+            auto batch = master_service_.BatchGetReplicaList(
+                keys, resolved_tenant_id, *resolved_part_indices);
             for (auto& result : batch) {
                 if (result) {
                     result->resolved_tenant_id = resolved_tenant_id.value();
@@ -428,21 +579,28 @@ tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
 WrappedMasterService::PutStart(const UUID& client_id, const std::string& key,
                                const uint64_t slice_length,
                                const ReplicateConfig& config,
-                               const std::string& tenant_id) {
+                               const std::string& tenant_id,
+                               struct_pack::compatible<uint32_t> part_index,
+                               struct_pack::compatible<uint32_t> part_count) {
     auto result = execute_rpc(
         "PutStart",
-        [&] {
-            return WithWriteTenant(tenant_id,
-                                   master_service_.IsTenantQuotaEnabled(),
-                                   [&](const TenantId& resolved_tenant_id) {
-                                       return master_service_.PutStart(
-                                           client_id, key, resolved_tenant_id,
-                                           slice_length, config);
-                                   });
+        [&]() -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
+            auto position = ResolvePartPosition(part_index, part_count);
+            if (!position) {
+                return tl::make_unexpected(position.error());
+            }
+            return WithWriteTenant(
+                tenant_id, master_service_.IsTenantQuotaEnabled(),
+                [&](const TenantId& resolved_tenant_id) {
+                    return master_service_.PutStart(
+                        client_id, key, resolved_tenant_id, slice_length,
+                        config, position->index, position->count);
+                });
         },
         [&](auto& timer) {
             timer.LogRequest("client_id=", client_id, ", key=", key,
-                             ", slice_length=", slice_length);
+                             ", slice_length=", slice_length,
+                             ", part_index=", part_index.value_or(0));
         },
         [&] { MasterMetricManager::instance().inc_put_start_requests(); },
         [] { MasterMetricManager::instance().inc_put_start_failures(); });
@@ -454,22 +612,33 @@ WrappedMasterService::PutStart(const UUID& client_id, const std::string& key,
 
 tl::expected<void, ErrorCode> WrappedMasterService::PutEnd(
     const UUID& client_id, const ObjectMeta& object_meta,
-    ReplicaType replica_type, const std::string& tenant_id) {
+    ReplicaType replica_type, const std::string& tenant_id,
+    struct_pack::compatible<uint32_t> part_index,
+    struct_pack::compatible<std::vector<uint64_t>> replica_ids) {
     return execute_rpc(
         "PutEnd",
-        [&] {
+        [&]() -> tl::expected<void, ErrorCode> {
+            // The End names a part but not how many the object has: that is
+            // the service's answer to give, from the object it holds.
+            auto end_ids = ResolvePartReplicaIds(replica_ids);
+            if (!end_ids) {
+                return tl::make_unexpected(end_ids.error());
+            }
             return WithRequestTenant(master_service_.IsTenantQuotaEnabled()
                                          ? std::string_view(tenant_id)
                                          : TenantId::kDefaultValue,
                                      [&](const TenantId& resolved_tenant_id) {
                                          return master_service_.PutEnd(
                                              client_id, object_meta,
-                                             resolved_tenant_id, replica_type);
+                                             resolved_tenant_id, replica_type,
+                                             part_index.value_or(0),
+                                             std::move(*end_ids));
                                      });
         },
         [&](auto& timer) {
             timer.LogRequest("client_id=", client_id, ", key=", object_meta.key,
-                             ", replica_type=", replica_type);
+                             ", replica_type=", replica_type,
+                             ", part_index=", part_index.value_or(0));
         },
         [] { MasterMetricManager::instance().inc_put_end_requests(); },
         [] { MasterMetricManager::instance().inc_put_end_failures(); });
@@ -477,33 +646,43 @@ tl::expected<void, ErrorCode> WrappedMasterService::PutEnd(
 
 tl::expected<void, ErrorCode> WrappedMasterService::PutRevoke(
     const UUID& client_id, const std::string& key, ReplicaType replica_type,
-    const std::string& tenant_id) {
+    const std::string& tenant_id, struct_pack::compatible<uint32_t> part_index,
+    struct_pack::compatible<std::vector<uint64_t>> replica_ids) {
     return execute_rpc(
         "PutRevoke",
-        [&] {
-            return WithRequestTenant(master_service_.IsTenantQuotaEnabled()
-                                         ? std::string_view(tenant_id)
-                                         : TenantId::kDefaultValue,
-                                     [&](const TenantId& resolved_tenant_id) {
-                                         return master_service_.PutRevoke(
-                                             client_id, key, resolved_tenant_id,
-                                             replica_type);
-                                     });
+        [&]() -> tl::expected<void, ErrorCode> {
+            // The Revoke names a part but not how many the object has: that is
+            // the service's answer to give, from the object it holds.
+            auto revoke_ids = ResolvePartReplicaIds(replica_ids);
+            if (!revoke_ids) {
+                return tl::make_unexpected(revoke_ids.error());
+            }
+            return WithRequestTenant(
+                master_service_.IsTenantQuotaEnabled()
+                    ? std::string_view(tenant_id)
+                    : TenantId::kDefaultValue,
+                [&](const TenantId& resolved_tenant_id) {
+                    return master_service_.PutRevoke(
+                        client_id, key, resolved_tenant_id, replica_type,
+                        part_index.value_or(0), std::move(*revoke_ids));
+                });
         },
         [&](auto& timer) {
             timer.LogRequest("client_id=", client_id, ", key=", key,
-                             ", replica_type=", replica_type);
+                             ", replica_type=", replica_type,
+                             ", part_index=", part_index.value_or(0));
         },
         [] { MasterMetricManager::instance().inc_put_revoke_requests(); },
         [] { MasterMetricManager::instance().inc_put_revoke_failures(); });
 }
 
 std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
-WrappedMasterService::BatchPutStart(const UUID& client_id,
-                                    const std::vector<std::string>& keys,
-                                    const std::vector<uint64_t>& slice_lengths,
-                                    const ReplicateConfig& config,
-                                    const std::string& tenant_id) {
+WrappedMasterService::BatchPutStart(
+    const UUID& client_id, const std::vector<std::string>& keys,
+    const std::vector<uint64_t>& slice_lengths, const ReplicateConfig& config,
+    const std::string& tenant_id,
+    struct_pack::compatible<std::vector<uint32_t>> part_indices,
+    struct_pack::compatible<uint32_t> part_count) {
     ScopedVLogTimer timer(1, "BatchPutStart");
     const size_t total_keys = keys.size();
     timer.LogRequest("client_id=", client_id, ", keys_count=", total_keys);
@@ -514,6 +693,12 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
     results.reserve(keys.size());
     auto resolved_tenant_id = ResolveTenantIdForWrite(
         tenant_id, master_service_.IsTenantQuotaEnabled());
+    auto position = ResolvePartPosition({}, part_count);
+    auto resolved_part_indices =
+        position
+            ? ResolvePartIndices(part_indices, position->count, keys.size())
+            : tl::expected<std::vector<uint32_t>, ErrorCode>(
+                  tl::make_unexpected(position.error()));
 
     if (keys.size() != slice_lengths.size()) {
         LOG(ERROR) << "BatchPutStart: keys.size()=" << keys.size()
@@ -533,13 +718,20 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
     } else if (!resolved_tenant_id) {
         results.assign(keys.size(),
                        tl::make_unexpected(resolved_tenant_id.error()));
+    } else if (!resolved_part_indices) {
+        results.assign(keys.size(),
+                       tl::make_unexpected(resolved_part_indices.error()));
     } else if (config.prefer_alloc_in_same_node) {
+        // Every key is placed on the node the previous one landed on, so the
+        // keys are written one after another: the next allocation needs the
+        // previous answer.
         ReplicateConfig new_config = config;
         for (size_t i = 0; i < keys.size(); ++i) {
             new_config.SetKeyIds(config, i);
             auto result = master_service_.PutStart(
                 client_id, keys[i], resolved_tenant_id.value(),
-                slice_lengths[i], new_config);
+                slice_lengths[i], new_config, resolved_part_indices->at(i),
+                position->count);
             results.emplace_back(result);
             if ((i == 0) && result.has_value()) {
                 std::string preferred_segment;
@@ -558,13 +750,9 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
             }
         }
     } else {
-        ReplicateConfig key_config = config;
-        for (size_t i = 0; i < keys.size(); ++i) {
-            key_config.SetKeyIds(config, i);
-            results.emplace_back(master_service_.PutStart(
-                client_id, keys[i], resolved_tenant_id.value(),
-                slice_lengths[i], key_config));
-        }
+        results = master_service_.BatchPutStart(
+            client_id, keys, slice_lengths, *resolved_part_indices,
+            position->count, config, resolved_tenant_id.value());
     }
 
     size_t failure_count = 0;
@@ -609,19 +797,37 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
 
 std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutEnd(
     const UUID& client_id, const std::vector<ObjectMeta>& object_metas,
-    ReplicaType replica_type, const std::string& tenant_id) {
+    ReplicaType replica_type, const std::string& tenant_id,
+    struct_pack::compatible<std::vector<uint32_t>> part_indices,
+    struct_pack::compatible<std::vector<std::vector<uint64_t>>> replica_ids) {
     ScopedVLogTimer timer(1, "BatchPutEnd");
     const size_t total_keys = object_metas.size();
     timer.LogRequest("client_id=", client_id, ", keys_count=", total_keys);
     MasterMetricManager::instance().inc_batch_put_end_requests(total_keys);
 
-    auto results = WithRequestTenantBatch(
-        master_service_.IsTenantQuotaEnabled() ? std::string_view(tenant_id)
-                                               : TenantId::kDefaultValue,
-        object_metas.size(), [&](const TenantId& resolved_tenant_id) {
-            return master_service_.BatchPutEnd(
-                client_id, object_metas, resolved_tenant_id, replica_type);
-        });
+    auto resolved_part_indices =
+        ResolvePartIndices(part_indices, UINT32_MAX, object_metas.size());
+    auto resolved_replica_ids =
+        ResolvePartReplicaIdBatches(replica_ids, object_metas.size());
+
+    std::vector<tl::expected<void, ErrorCode>> results;
+    if (!resolved_part_indices) {
+        results.assign(object_metas.size(),
+                       tl::make_unexpected(resolved_part_indices.error()));
+    } else if (!resolved_replica_ids) {
+        results.assign(object_metas.size(),
+                       tl::make_unexpected(resolved_replica_ids.error()));
+    } else {
+        results = WithRequestTenantBatch(
+            master_service_.IsTenantQuotaEnabled() ? std::string_view(tenant_id)
+                                                   : TenantId::kDefaultValue,
+            object_metas.size(), [&](const TenantId& resolved_tenant_id) {
+                return master_service_.BatchPutEnd(
+                    client_id, object_metas, resolved_tenant_id, replica_type,
+                    std::move(*resolved_part_indices),
+                    std::move(*resolved_replica_ids));
+            });
+    }
 
     size_t failure_count = 0;
     for (size_t i = 0; i < results.size(); ++i) {
@@ -649,24 +855,37 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutEnd(
 
 std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutRevoke(
     const UUID& client_id, const std::vector<std::string>& keys,
-    ReplicaType replica_type, const std::string& tenant_id) {
+    ReplicaType replica_type, const std::string& tenant_id,
+    struct_pack::compatible<std::vector<uint32_t>> part_indices,
+    struct_pack::compatible<std::vector<std::vector<uint64_t>>> replica_ids) {
     ScopedVLogTimer timer(1, "BatchPutRevoke");
     const size_t total_keys = keys.size();
     timer.LogRequest("client_id=", client_id, ", keys_count=", total_keys);
     MasterMetricManager::instance().inc_batch_put_revoke_requests(total_keys);
 
-    auto results = WithRequestTenantBatch(
-        master_service_.IsTenantQuotaEnabled() ? std::string_view(tenant_id)
-                                               : TenantId::kDefaultValue,
-        keys.size(), [&](const TenantId& resolved_tenant_id) {
-            std::vector<tl::expected<void, ErrorCode>> batch_results;
-            batch_results.reserve(keys.size());
-            for (const auto& key : keys) {
-                batch_results.emplace_back(master_service_.PutRevoke(
-                    client_id, key, resolved_tenant_id, replica_type));
-            }
-            return batch_results;
-        });
+    auto resolved_part_indices =
+        ResolvePartIndices(part_indices, UINT32_MAX, keys.size());
+    auto resolved_replica_ids =
+        ResolvePartReplicaIdBatches(replica_ids, keys.size());
+
+    std::vector<tl::expected<void, ErrorCode>> results;
+    if (!resolved_part_indices) {
+        results.assign(keys.size(),
+                       tl::make_unexpected(resolved_part_indices.error()));
+    } else if (!resolved_replica_ids) {
+        results.assign(keys.size(),
+                       tl::make_unexpected(resolved_replica_ids.error()));
+    } else {
+        results = WithRequestTenantBatch(
+            master_service_.IsTenantQuotaEnabled() ? std::string_view(tenant_id)
+                                                   : TenantId::kDefaultValue,
+            keys.size(), [&](const TenantId& resolved_tenant_id) {
+                return master_service_.BatchPutRevoke(
+                    client_id, keys, resolved_tenant_id, replica_type,
+                    std::move(*resolved_part_indices),
+                    std::move(*resolved_replica_ids));
+            });
+    }
 
     size_t failure_count = 0;
     for (size_t i = 0; i < results.size(); ++i) {

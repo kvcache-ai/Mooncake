@@ -145,17 +145,20 @@ TEST_F(TenantIterationTest, WriteCursorChangesStateInPlace) {
     const auto context = PrepareSimpleSegment(service);
     PutKeys(service, context.client_id, kTenantA, "a", 8);
 
+    // A task is what a write cursor can put on an object and take off again:
+    // whether a primary write is unfinished is a question the parts answer.
     for (auto object : MasterServiceTestPeer(service).WriteCursor(kTenantA)) {
-        object.state().is_processing = true;
+        object.state().offloading_task =
+            OffloadingTask{1, std::chrono::system_clock::now(), {}};
     }
-    int processing = 0;
+    int with_task = 0;
     for (auto object : MasterServiceTestPeer(service).ReadCursor(kTenantA)) {
-        processing += object.state().is_processing ? 1 : 0;
+        with_task += object.state().offloading_task ? 1 : 0;
     }
-    EXPECT_EQ(processing, 8);
+    EXPECT_EQ(with_task, 8);
 
     for (auto object : MasterServiceTestPeer(service).WriteCursor(kTenantA)) {
-        object.state().is_processing = false;
+        object.state().offloading_task.reset();
     }
     EXPECT_EQ(service.RemoveAll(kTenantA, /*force=*/true), 8);
 }
