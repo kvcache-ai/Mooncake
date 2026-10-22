@@ -529,6 +529,16 @@ struct SsdMetric {
           ssd_total_latency_summary("mooncake_ssd_total_latency_summary_us",
                                     "SSD total latency quantiles (us)",
                                     {0.5, 0.9, 0.99}, labels),
+          ssd_evict_latency_us("mooncake_ssd_evict_latency_us",
+                               "SSD disk-watermark eviction latency per cycle "
+                               "(us), by phase: evict (the whole cycle), "
+                               "notify (BatchEvictDiskReplica RPC to the "
+                               "master), local (candidate selection and disk "
+                               "unlink)",
+                               kSsdLatencyBucket, labels, evict_op_names),
+          ssd_evict_keys_total(
+              "mooncake_ssd_evict_keys_total",
+              "Number of keys removed by SSD disk-watermark eviction", labels),
           start_time_(std::chrono::steady_clock::now()) {}
 
     ylt::metric::counter_t ssd_read_bytes;
@@ -543,6 +553,11 @@ struct SsdMetric {
     ylt::metric::summary_t ssd_read_latency_summary;
     ylt::metric::summary_t ssd_write_latency_summary;
     ylt::metric::summary_t ssd_total_latency_summary;
+    // Disk-watermark eviction, reported per phase so a slow cycle can be
+    // attributed to the master RPC or to local disk work.
+    std::array<std::string, 1> evict_op_names = {"op_name"};
+    ylt::metric::hybrid_histogram_1t ssd_evict_latency_us;
+    ylt::metric::counter_t ssd_evict_keys_total;
     std::chrono::steady_clock::time_point start_time_;
 
     void serialize(std::string& str) {
@@ -558,6 +573,25 @@ struct SsdMetric {
         ssd_read_latency_summary.serialize(str);
         ssd_write_latency_summary.serialize(str);
         ssd_total_latency_summary.serialize(str);
+        ssd_evict_latency_us.serialize(str);
+        ssd_evict_keys_total.serialize(str);
+    }
+
+    // Records one disk-watermark eviction cycle: its total duration, the part
+    // of it spent notifying the master, and how many keys it removed. The
+    // remainder (total - notify) is the local candidate selection and unlink,
+    // which the backend performs while this cycle holds the disk lock.
+    void ObserveEvictCycle(int64_t total_us, int64_t notify_us,
+                           int64_t keys_removed) {
+        const std::array<std::string, 1> evict_label = {"evict"};
+        const std::array<std::string, 1> notify_label = {"notify"};
+        const std::array<std::string, 1> local_label = {"local"};
+        const int64_t local_us =
+            total_us > notify_us ? total_us - notify_us : 0;
+        ssd_evict_latency_us.observe(evict_label, total_us);
+        ssd_evict_latency_us.observe(notify_label, notify_us);
+        ssd_evict_latency_us.observe(local_label, local_us);
+        ssd_evict_keys_total.inc(keys_removed);
     }
 
     std::string summary_metrics() {
