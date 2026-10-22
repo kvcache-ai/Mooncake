@@ -849,6 +849,7 @@ class MasterServiceConfigBuilder {
     uint64_t max_kv_soft_pin_ttl_ = DEFAULT_MAX_KV_SOFT_PIN_TTL_MS;
     bool allow_evict_soft_pinned_objects_ =
         DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS;
+    size_t stale_handle_sweep_workers_ = 1;
     double eviction_ratio_ = DEFAULT_EVICTION_RATIO;
     double eviction_high_watermark_ratio_ =
         DEFAULT_EVICTION_HIGH_WATERMARK_RATIO;
@@ -926,6 +927,12 @@ class MasterServiceConfigBuilder {
     MasterServiceConfigBuilder& set_allow_evict_soft_pinned_objects(
         bool allow) {
         allow_evict_soft_pinned_objects_ = allow;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_stale_handle_sweep_workers(
+        size_t workers) {
+        stale_handle_sweep_workers_ = workers;
         return *this;
     }
 
@@ -1192,6 +1199,9 @@ class MasterServiceConfig {
     uint64_t default_kv_lease_ttl = DEFAULT_DEFAULT_KV_LEASE_TTL;
     uint64_t default_kv_soft_pin_ttl = DEFAULT_KV_SOFT_PIN_TTL_MS;
     uint64_t max_kv_soft_pin_ttl = DEFAULT_MAX_KV_SOFT_PIN_TTL_MS;
+    // Workers sweeping stale handles in parallel (see ClearStaleHandles).
+    // 1 reproduces the historical serial walk over all metadata shards.
+    size_t stale_handle_sweep_workers = 1;
     bool allow_evict_soft_pinned_objects =
         DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS;
     double eviction_ratio = DEFAULT_EVICTION_RATIO;
@@ -1391,6 +1401,7 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.default_kv_soft_pin_ttl = default_kv_soft_pin_ttl_;
     config.max_kv_soft_pin_ttl = max_kv_soft_pin_ttl_;
     config.allow_evict_soft_pinned_objects = allow_evict_soft_pinned_objects_;
+    config.stale_handle_sweep_workers = stale_handle_sweep_workers_;
     config.eviction_ratio = eviction_ratio_;
     config.eviction_high_watermark_ratio = eviction_high_watermark_ratio_;
     config.tenant_eviction_high_watermark_ratio =

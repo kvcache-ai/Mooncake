@@ -18,6 +18,7 @@
 #include <shared_mutex>
 #include <sstream>
 #include <stdexcept>
+#include <atomic>
 #include <thread>
 #include <tuple>
 #include <regex>
@@ -67,6 +68,11 @@ namespace {
 // each shard exclusively for as long as it took to walk that whole shard,
 // so every RPC that touched those keys stalled behind the sweep.
 constexpr size_t kStaleHandleCleanupBatchSize = 64;
+
+// Upper bound on the workers sweeping stale handles in parallel. Shards are
+// independent, but each worker still walks metadata on a master thread, so
+// the fan-out stays bounded.
+constexpr size_t kStaleHandleSweepMaxWorkers = 16;
 
 // Per-cycle offload cap as a fraction of `offloading_queue_limit_`. Used only
 // when offload-on-evict mode is active. Defers memory eviction for at most
@@ -165,6 +171,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
           }),
       replica_cleanup_worker_([this] { ClearInvalidHandles(); }),
       enable_async_segment_cleanup_(!config.enable_ha && !config.enable_cxl),
+      stale_handle_sweep_workers_(config.stale_handle_sweep_workers),
       default_kv_lease_ttl_(config.default_kv_lease_ttl),
       default_kv_soft_pin_ttl_(config.default_kv_soft_pin_ttl),
       max_kv_soft_pin_ttl_(config.max_kv_soft_pin_ttl),
@@ -2518,7 +2525,11 @@ void MasterService::ClearLocalDiskHandlesOwnedBy(const UUID& owner) {
 tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
     const std::function<bool(const Replica&)>& is_stale) {
     std::optional<ErrorCode> first_persist_error;
-    for (size_t i = 0; i < kNumShards; i++) {
+    // One shard of the sweep. Shards are independent -- each is scanned and
+    // cleaned under its own locks -- so the caller may run this serially or
+    // spread it over workers sharing an atomic shard cursor.
+    auto sweep_shard = [this, &is_stale](size_t i,
+                                         std::optional<ErrorCode>* out_error) {
         // Pass 1: pick out the keys that need work under the shard's shared
         // lock. A sweep normally finds nothing in most shards, and such a
         // shard never takes the exclusive lock at all.
@@ -2572,8 +2583,8 @@ tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
                                     "ClearStaleHandles", tenant_it->first,
                                     it->first, it->second.metadata,
                                     cleanup_plan);
-                            if (!persist_result && !first_persist_error) {
-                                first_persist_error = persist_result.error();
+                            if (!persist_result && !*out_error) {
+                                *out_error = persist_result.error();
                             }
                             continue;
                         }
@@ -2611,9 +2622,8 @@ tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
                                     << ": REMOVE persist failed for key="
                                     << it->first << ", err="
                                     << static_cast<int>(persist_result.error());
-                                if (!first_persist_error) {
-                                    first_persist_error =
-                                        persist_result.error();
+                                if (!*out_error) {
+                                    *out_error = persist_result.error();
                                 }
                             }
                             continue;
@@ -2647,6 +2657,65 @@ tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
             MetadataShardAccessorRW shard(this, i);
             for (auto& tenant : shard->tenants) {
                 ShrinkBucketsIfSparse(tenant.second.metadata);
+            }
+        }
+    };
+
+    const size_t workers =
+        std::min<size_t>(std::max<size_t>(stale_handle_sweep_workers_, 1),
+                         kStaleHandleSweepMaxWorkers);
+    if (workers == 1) {
+        for (size_t i = 0; i < kNumShards; i++) {
+            sweep_shard(i, &first_persist_error);
+        }
+    } else {
+        // Shards are independent, so hand them out through an atomic cursor:
+        // the wall-clock cost of a sweep over a large keyspace is then split
+        // across `workers` instead of paid by one thread walking all of them.
+        std::atomic<size_t> cursor{0};
+        std::vector<std::optional<ErrorCode>> worker_errors(workers);
+        std::vector<std::thread> threads;
+        threads.reserve(workers);
+        try {
+            for (size_t w = 0; w < workers; w++) {
+                threads.emplace_back([this, &cursor, &sweep_shard,
+                                      &worker_errors, w] {
+                    std::optional<ErrorCode> local_error;
+                    size_t shard_index = 0;
+                    while ((shard_index = cursor.fetch_add(
+                                1, std::memory_order_relaxed)) < kNumShards) {
+                        sweep_shard(shard_index, &local_error);
+                    }
+                    worker_errors[w] = local_error;
+                });
+            }
+        } catch (const std::exception& e) {
+            // Losing the master to an uncaught spawn failure would be far
+            // worse than a slow sweep: whatever started keeps consuming the
+            // cursor, and this thread finishes the rest below.
+            LOG(WARNING) << "ClearStaleHandles: started " << threads.size()
+                         << "/" << workers << " sweep workers (" << e.what()
+                         << "), finishing the remainder on this thread";
+        }
+        for (auto& thread : threads) {
+            if (thread.joinable()) {
+                thread.join();
+            }
+        }
+        // Pick up whatever the workers did not reach -- all of it if none
+        // started. Re-visiting a shard is harmless: Pass 2 re-classifies
+        // every key under that shard's write lock.
+        while (true) {
+            const size_t shard_index =
+                cursor.fetch_add(1, std::memory_order_relaxed);
+            if (shard_index >= kNumShards) {
+                break;
+            }
+            sweep_shard(shard_index, &first_persist_error);
+        }
+        for (const auto& error : worker_errors) {
+            if (error && !first_persist_error) {
+                first_persist_error = error;
             }
         }
     }

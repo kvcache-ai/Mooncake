@@ -1084,6 +1084,7 @@ class MasterService {
     // shard until the sweep moved on.
     tl::expected<void, ErrorCode> ClearStaleHandles(
         const std::function<bool(const Replica&)>& is_stale);
+
     bool ProcessClientOffboardingJob(ClientOffboardingJob& job);
     // We need to clean up finished tasks periodically to avoid memory leak
     // And also we can add some task ttl mechanism in the future
@@ -1670,6 +1671,10 @@ class MasterService {
         graceful_unmount_scheduler_;
     BackgroundWorker replica_cleanup_worker_;
     const bool enable_async_segment_cleanup_;
+    // Workers sweeping ClearStaleHandles shards in parallel. 1 reproduces the
+    // historical serial walk; >1 only changes how shards are handed out, not
+    // what happens inside a shard.
+    const size_t stale_handle_sweep_workers_;
 
     /**
      * @brief Mirror of PushOffloadingQueue for promotion-on-hit. Inserts an
