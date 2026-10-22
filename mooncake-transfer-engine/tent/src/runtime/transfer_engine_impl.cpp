@@ -43,6 +43,8 @@
 #include "tent/metrics/tent_metrics.h"
 #include "tent/metrics/config_loader.h"
 #include "tent/transport/hp_tcp/hp_tcp_protocol.h"
+#include "tent/common/transport_slots.h"
+#include "transport_plugin_registry.h"
 
 namespace mooncake {
 namespace tent {
@@ -446,6 +448,10 @@ Status TransferEngineImpl::construct() {
 
     CHECK_STATUS(setupLocalSegment());
 
+    // Plugin names must resolve before the selector parses policies.
+    CHECK_STATUS(
+        TransportPluginRegistry::Get().ensureLoaded(*conf_, topology_.get()));
+
     // Initialize transport selector
     transport_selector_ = std::make_unique<TransportSelector>(conf_);
     transport_selector_->setTopology(topology_);
@@ -501,6 +507,28 @@ Status TransferEngineImpl::construct() {
                 transport = nullptr;
                 continue;
             }
+            transport_string += transport->getName();
+            transport_string += " ";
+        }
+    }
+
+    std::string plugin_summary;
+    if (Status status = TransportPluginRegistry::Get().verifyInstalled(
+            *conf_, transport_list_, &plugin_summary);
+        !status.ok()) {
+        const Status cleanup = deconstruct();
+        if (!cleanup.ok()) {
+            LOG(ERROR) << "Failed to unwind TENT after a transport plugin "
+                          "failure: "
+                       << cleanup.ToString();
+        }
+        return status;
+    }
+    if (!plugin_summary.empty()) {
+        // verifyInstalled() may have dropped a plugin transport.
+        transport_string.clear();
+        for (const auto& transport : transport_list_) {
+            if (!transport) continue;
             transport_string += transport->getName();
             transport_string += " ";
         }
@@ -581,6 +609,8 @@ Status TransferEngineImpl::construct() {
         LOG(INFO) << " - Metadata Type:      " << metadata_type;
         LOG(INFO) << " - Metadata Servers:   " << metadata_servers;
         LOG(INFO) << " - Loaded Transports:  " << transport_string;
+        if (!plugin_summary.empty())
+            LOG(INFO) << " - Transport plugins:  " << plugin_summary;
         LOG(INFO) << "================================================";
     } else {
         LOG(INFO) << "Transfer Engine " << local_segment_name_
@@ -940,6 +970,11 @@ std::vector<TransportType> TransferEngineImpl::getSupportedTransports(
     if (transport_list_[TPU]) result.push_back(TPU);
     if (transport_list_[HYLINK]) result.push_back(HYLINK);
     if (transport_list_[MEMFABRIC]) result.push_back(MEMFABRIC);
+    // Plugin transports come after every built-in one.
+    for (int type = kFirstPluginSlot; type < kNumTransportTypes; ++type) {
+        if (transport_list_[type])
+            result.push_back(static_cast<TransportType>(type));
+    }
     return result;
 }
 
@@ -1603,6 +1638,16 @@ SelectionResult TransferEngineImpl::planTransport(const Request& request,
                     staging_transports.push_back(type);
                 }
             }
+            for (int slot = kFirstPluginSlot; slot < kNumTransportTypes;
+                 ++slot) {
+                auto type = static_cast<TransportType>(slot);
+                if (pluginSlotHasFlag(type,
+                                      TENT_XPORT_FLAG_HOST_STAGING_CAPABLE) &&
+                    transport_list_[type] && carries(local_entry, type) &&
+                    carries(remote_entry, type)) {
+                    staging_transports.push_back(type);
+                }
+            }
         }
     }
     const bool host_staging = !host_staging_params.empty();
@@ -1640,6 +1685,10 @@ SelectionResult TransferEngineImpl::planTransport(const Request& request,
                         continue;
                     if ((type == NVLINK || type == SHM || type == TPU) &&
                         !same_machine)
+                        continue;
+                    if (!pluginSlotAllowsRoute(
+                            type, request.target_id == LOCAL_SEGMENT_ID,
+                            same_machine))
                         continue;
                     if (checkAvailability(
                             transport_list_[type],

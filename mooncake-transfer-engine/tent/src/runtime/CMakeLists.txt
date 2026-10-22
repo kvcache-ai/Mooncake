@@ -16,7 +16,9 @@ if (TARGET metastore_etcd)
   target_link_libraries(tent_runtime PUBLIC metastore_etcd)
 endif()
 
-target_link_libraries(tent_runtime PUBLIC tent_common tent_rpc tent_platform_all tent_transport_all tent_metrics)
+target_link_libraries(
+  tent_runtime PUBLIC tent_common tent_rpc tent_platform_all tent_transport_all
+                      tent_metrics ${CMAKE_DL_LIBS})
 # The runtime references the Transfer Engine client I/O pool accessor
 # (mooncake::CreateRpcClientIoContextPool / mooncake::Environ) from the common
 # library. Declaring the dependency here keeps the shared library link ordered

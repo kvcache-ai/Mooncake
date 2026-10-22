@@ -20,6 +20,7 @@
 #include "tent/common/status.h"
 #include "tent/common/utils/os.h"
 #include "tent/runtime/control_plane.h"
+#include "transport_wire_codec.h"
 
 namespace mooncake {
 namespace tent {
@@ -46,6 +47,7 @@ Status CentralSegmentRegistry::getSegmentDesc(SegmentDescRef &desc,
     if (!status.ok()) return status;
     desc = std::make_shared<SegmentDesc>();
     *desc = json::parse(jstr).get<SegmentDesc>();
+    decodeSegmentDescFromWire(*desc);
     return Status::OK();
 }
 
@@ -53,7 +55,7 @@ Status CentralSegmentRegistry::putSegmentDesc(SegmentDescRef &desc) {
     if (!plugin_)
         return Status::MetadataError(
             "Central metadata store not started" LOC_MARK);
-    json j = *desc;
+    json j = segmentDescToWireJson(*desc);
     return plugin_->set(getFullMetadataKey(desc->name), j.dump());
 }
 
@@ -77,6 +79,7 @@ Status PeerSegmentRegistry::getSegmentDesc(SegmentDescRef &desc,
     }
     desc = std::make_shared<SegmentDesc>();
     *desc = json::parse(response).get<SegmentDesc>();
+    decodeSegmentDescFromWire(*desc);
     return Status::OK();
 }
 
