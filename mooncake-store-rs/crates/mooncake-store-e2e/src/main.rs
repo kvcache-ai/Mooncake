@@ -287,6 +287,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         &reader,
         value_size,
     )?;
+    target_c.register_local_memory()?;
     verify_rdma_bandwidth_isolation(
         metadata.clone(),
         planner.clone(),
