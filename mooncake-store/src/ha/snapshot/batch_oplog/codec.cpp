@@ -73,4 +73,22 @@ DecodeBatchOpLogSnapshotObjectChunk(const std::vector<uint8_t>& encoded,
     return decoded;
 }
 
+std::vector<uint8_t> EncodeBatchOpLogRecoveryChunk(
+    uint64_t index, std::vector<DrainRecoveryRecord> records) {
+    return Encode(BatchOpLogRecoveryChunk{index, std::move(records)});
+}
+
+tl::expected<BatchOpLogRecoveryChunk, std::string>
+DecodeBatchOpLogRecoveryChunk(const std::vector<uint8_t>& encoded,
+                              uint64_t index, uint64_t count) {
+    auto decoded =
+        Decode<BatchOpLogRecoveryChunk>(encoded, "snapshot recovery chunk");
+    if (!decoded) return decoded;
+    if (decoded->chunk_index != index || decoded->records.size() != count) {
+        return tl::make_unexpected(
+            std::string("Snapshot recovery chunk index/count mismatch"));
+    }
+    return decoded;
+}
+
 }  // namespace mooncake

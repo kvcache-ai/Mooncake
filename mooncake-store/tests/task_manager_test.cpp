@@ -605,4 +605,94 @@ INSTANTIATE_TEST_SUITE_P(
                                          TaskStatus::FAILED),
                        ::testing::Bool()));
 
+TEST_F(ClientTaskManagerTest,
+       DurableClaimsAndCompletionPublishOnlyAfterCommit) {
+    bool reject = false;
+    std::vector<DurableTaskRecord> committed;
+    size_t calls = 0;
+    ClientTaskManager manager(
+        {0, 3, 2, 0, 0, 3}, [&](std::span<const DurableTaskRecord> records) {
+            ++calls;
+            if (reject) return ErrorCode::ETCD_OPERATION_ERROR;
+            committed.assign(records.begin(), records.end());
+            return ErrorCode::OK;
+        });
+    const auto client = generate_uuid();
+    const ReplicaMovePayload payload{"default", "key", "source", "target"};
+    std::vector<UUID> ids;
+    for (int i = 0; i < 3; ++i) {
+        auto id =
+            manager.get_write_access()
+                .submit_task_typed<TaskType::REPLICA_MOVE>(client, payload);
+        ASSERT_TRUE(id);
+        ids.push_back(*id);
+    }
+    reject = true;
+    EXPECT_TRUE(manager.get_write_access().pop_tasks(client, 2).empty());
+    for (auto id : ids) {
+        EXPECT_EQ(manager.get_read_access().find_task_by_id(id)->status,
+                  TaskStatus::PENDING);
+    }
+    reject = false;
+    calls = 0;
+    auto claimed = manager.get_write_access().pop_tasks(client, 3);
+    ASSERT_EQ(claimed.size(), 2);
+    EXPECT_EQ(calls, 1);
+    ASSERT_EQ(committed.size(), 2);
+    EXPECT_EQ(claimed[0].id, ids[0]);
+    EXPECT_EQ(claimed[1].id, ids[1]);
+    EXPECT_TRUE(manager.get_write_access().pop_tasks(client, 1).empty());
+    reject = true;
+    EXPECT_EQ(manager.get_write_access().complete_task(
+                  client, ids[0], TaskStatus::SUCCESS, "done"),
+              ErrorCode::ETCD_OPERATION_ERROR);
+    EXPECT_EQ(manager.get_read_access().find_task_by_id(ids[0])->status,
+              TaskStatus::PROCESSING);
+    reject = false;
+    ASSERT_EQ(manager.get_write_access().complete_task(
+                  client, ids[0], TaskStatus::SUCCESS, "done"),
+              ErrorCode::OK);
+    reject = true;
+    manager.get_write_access().prune_finished_tasks();
+    EXPECT_TRUE(manager.get_read_access().find_task_by_id(ids[0]));
+    reject = false;
+    manager.get_write_access().prune_finished_tasks();
+    ASSERT_EQ(committed.size(), 1);
+    EXPECT_TRUE(committed.front().removed);
+    EXPECT_FALSE(manager.get_read_access().find_task_by_id(ids[0]));
+    auto tail = manager.get_write_access().pop_tasks(client, 1);
+    ASSERT_EQ(tail.size(), 1);
+    EXPECT_EQ(tail.front().id, ids[2]);
+}
+
+TEST_F(ClientTaskManagerTest,
+       DurableTaskBindingRoundTripsAndRejectsDifferentWork) {
+    const auto client = generate_uuid();
+    ClientTaskManager manager({10, 10, 10, 0, 0, 7});
+    DrainUnitRecord unit{
+        generate_uuid(), {},    DrainUnitKey("tenant", "key", "source"),
+        "tenant",        "key", "source",
+        "target",        4096};
+    auto id =
+        manager.get_write_access().submit_task_typed<TaskType::REPLICA_MOVE>(
+            client, {"tenant", "key", "source", "target"}, unit);
+    ASSERT_TRUE(id);
+    auto task = manager.get_read_access().find_task_by_id(*id);
+    ASSERT_TRUE(task);
+    auto record = ToDurableTask(*task);
+    ASSERT_TRUE(ValidateDurableTask(record));
+    DurableTaskRecord decoded;
+    ASSERT_TRUE(DecodeRecoveryValue(EncodeRecoveryValue(record), decoded));
+    auto restored = FromDurableTask(decoded);
+    ASSERT_TRUE(restored.drain);
+    EXPECT_EQ(restored.id, *id);
+    EXPECT_EQ(restored.drain->task_id, *id);
+    EXPECT_EQ(restored.max_retry_attempts, 7);
+    EXPECT_EQ(restored.drain->unit_key, unit.unit_key);
+    decoded.drain->target = "another-target";
+    EXPECT_FALSE(ValidateDurableTask(decoded));
+    decoded.payload = "invalid json";
+    EXPECT_FALSE(ValidateDurableTask(decoded));
+}
+
 }  // namespace mooncake

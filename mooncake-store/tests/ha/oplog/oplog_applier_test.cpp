@@ -11,6 +11,7 @@
 #include <xxhash.h>
 
 #include "metadata_store.h"
+#include "ha/oplog/oplog_batch_codec.h"
 #include "mock_metadata_store.h"
 #include "ha/oplog/oplog_types.h"
 #include "ha/standby_metadata_store.h"
@@ -113,6 +114,25 @@ class OpLogApplierTest : public ::testing::Test {
     std::unique_ptr<OpLogApplier> applier_;
     std::string cluster_id_;
 };
+
+TEST_F(OpLogApplierTest, NativeBatchPrunesExpiredRetiredMoveSources) {
+    StandbyMetadataStore metadata;
+    OpLogApplier applier(&metadata, cluster_id_);
+    Replica::Descriptor source{1, MemoryDescriptor{{64, 4096, "tcp", "source"}},
+                               ReplicaStatus::COMPLETE};
+    ASSERT_TRUE(metadata.DrainRecovery().Retire({source, 1}));
+    ASSERT_EQ(1u, metadata.DrainRecovery().records().size());
+    OpLogEntry entry = MakeEntry(1, OpType::REMOVE, "unrelated", "");
+    OpLogBatchRecord batch;
+    batch.batch_id = batch.first_seq = batch.last_seq = 1;
+    batch.entries = {entry};
+    OpLogBatchRecord decoded;
+    ASSERT_TRUE(
+        DecodeOpLogBatchRecord(EncodeOpLogBatchRecord(batch), &decoded));
+    ASSERT_EQ(0, decoded.entries.front().timestamp_ms);
+    ASSERT_TRUE(applier.ApplyOpLogEntry(decoded.entries.front()));
+    EXPECT_TRUE(metadata.DrainRecovery().records().empty());
+}
 
 TEST_F(OpLogApplierTest, AppliesWeightMetadataAndRejectsStaleGeneration) {
     auto generation_one = MakeWeightMetadata(1);

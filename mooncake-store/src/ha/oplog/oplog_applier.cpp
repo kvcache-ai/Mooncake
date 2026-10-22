@@ -1,5 +1,7 @@
 #include "ha/oplog/oplog_applier.h"
 
+#include <algorithm>
+#include <chrono>
 #include <glog/logging.h>
 
 #include "ha_metric_manager.h"
@@ -85,7 +87,7 @@ bool OpLogApplier::ApplyOpLogEntry(const OpLogEntry& entry) {
     bool applied = true;
     switch (entry.op_type) {
         case OpType::PUT_END:
-            ApplyPutEnd(entry);
+            applied = ApplyPutEnd(entry);
             break;
         case OpType::PUT_REVOKE:
             ApplyPutRevoke(entry);
@@ -114,6 +116,42 @@ bool OpLogApplier::ApplyOpLogEntry(const OpLogEntry& entry) {
         case OpType::WEIGHT_LEASE_DELETE:
             applied = ApplyWeightLeaseDelete(entry);
             break;
+        case OpType::DRAIN_JOB_UPDATE: {
+            DrainJobUpdate update;
+            applied = DecodeRecoveryValue(entry.payload, update) &&
+                      metadata_store_->DrainRecovery().Apply(update);
+            break;
+        }
+        case OpType::TASK_UPDATE: {
+            DurableTaskRecord task;
+            applied = DecodeRecoveryValue(entry.payload, task) &&
+                      metadata_store_->DrainRecovery().Apply(task);
+            break;
+        }
+        case OpType::REPLICATION_START: {
+            ReplicationStartRecord start;
+            MetadataPayload payload;
+            applied = DecodeRecoveryValue(entry.payload, start) &&
+                      start.runtime.tenant == entry.tenant_id &&
+                      start.runtime.key == entry.object_key &&
+                      DecodeRecoveryValue(start.metadata_payload, payload);
+            if (!applied) break;
+            applied = ValidateReplicationRecovery(
+                start.runtime, payload.replicas, payload.size);
+            if (!applied) break;
+            DrainRecoveryState prepared;
+            applied = prepared.Apply(start.runtime) &&
+                      prepared.Apply(DrainJobUpdate{std::nullopt, std::nullopt,
+                                                    start.segments});
+            if (!applied) break;
+            auto metadata = payload.ToStandbyMetadata();
+            applied = metadata_store_->PutMetadata(
+                          entry.tenant_id, entry.object_key, metadata) &&
+                      metadata_store_->DrainRecovery().Apply(start.runtime) &&
+                      metadata_store_->DrainRecovery().Apply(DrainJobUpdate{
+                          std::nullopt, std::nullopt, start.segments});
+            break;
+        }
         default:
             LOG(ERROR) << "OpLogApplier: unsupported op_type="
                        << static_cast<int>(entry.op_type)
@@ -124,6 +162,11 @@ bool OpLogApplier::ApplyOpLogEntry(const OpLogEntry& entry) {
     if (!applied) {
         return false;
     }
+
+    metadata_store_->DrainRecovery().PruneRetired(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count());
 
     // Update expected sequence ID
     expected_sequence_id_.store(entry.sequence_id + 1);
@@ -157,7 +200,7 @@ void OpLogApplier::Recover(uint64_t last_applied_sequence_id) {
               << expected_sequence_id_.load();
 }
 
-void OpLogApplier::ApplyPutEnd(const OpLogEntry& entry) {
+bool OpLogApplier::ApplyPutEnd(const OpLogEntry& entry) {
     // Payload contains serialized metadata (replicas, size, etc.) in JSON
     // format. Deserialize the payload immediately and store structured
     // metadata. This allows Standby to serve requests immediately after
@@ -175,7 +218,7 @@ void OpLogApplier::ApplyPutEnd(const OpLogEntry& entry) {
                        << entry.object_key
                        << ", sequence_id=" << entry.sequence_id;
         }
-        return;
+        return true;
     }
 
     // Deserialize payload using struct_pack (msgpack binary format)
@@ -190,7 +233,43 @@ void OpLogApplier::ApplyPutEnd(const OpLogEntry& entry) {
         StandbyObjectMetadata empty_metadata;
         metadata_store_->PutMetadata(entry.tenant_id, entry.object_key,
                                      empty_metadata);
-        return;
+        return true;
+    }
+
+    if (payload.replication_finished.value_or(false)) {
+        metadata_store_->DrainRecovery().EraseReplication(entry.tenant_id,
+                                                          entry.object_key);
+    } else {
+        const auto& records = metadata_store_->DrainRecovery().records();
+        const auto runtime_key = DrainRecoveryKey(
+            RecoveryRecordKind::Replication,
+            TenantId(entry.tenant_id).MakeScopedKey(entry.object_key));
+        if (auto it = records.find(runtime_key); it != records.end()) {
+            ReplicationRecoveryRecord runtime;
+            if (!DecodeRecoveryValue(it->second.payload, runtime)) return false;
+            for (const auto& target : payload.processing_replicas.value_or(
+                     std::vector<Replica::Descriptor>{})) {
+                if (target.status != ReplicaStatus::PROCESSING) return false;
+                if (std::find(runtime.targets.begin(), runtime.targets.end(),
+                              target.id) != runtime.targets.end() &&
+                    std::none_of(payload.replicas.begin(),
+                                 payload.replicas.end(),
+                                 [&](const auto& existing) {
+                                     return existing.id == target.id;
+                                 })) {
+                    payload.replicas.push_back(target);
+                }
+            }
+        }
+    }
+
+    for (const auto& retired : payload.retired_replicas.value_or(
+             std::vector<RetiredReplicaRecord>{})) {
+        if (!metadata_store_->DrainRecovery().Retire(retired)) {
+            LOG(ERROR) << "Invalid retired MOVE source, key="
+                       << entry.object_key;
+            return false;
+        }
     }
 
     // Convert to StandbyObjectMetadata and store
@@ -206,9 +285,12 @@ void OpLogApplier::ApplyPutEnd(const OpLogEntry& entry) {
                 << ", replicas=" << metadata.replicas.size()
                 << ", size=" << metadata.size;
     }
+    return true;
 }
 
 void OpLogApplier::ApplyPutRevoke(const OpLogEntry& entry) {
+    metadata_store_->DrainRecovery().EraseReplication(entry.tenant_id,
+                                                      entry.object_key);
     // PUT_REVOKE means the object should be removed from metadata store
     // (but the key itself may still exist if there are other replicas).
     // Current implementation removes the entire key; if we later support
@@ -225,6 +307,8 @@ void OpLogApplier::ApplyPutRevoke(const OpLogEntry& entry) {
 }
 
 void OpLogApplier::ApplyRemove(const OpLogEntry& entry) {
+    metadata_store_->DrainRecovery().EraseReplication(entry.tenant_id,
+                                                      entry.object_key);
     if (!metadata_store_->Remove(entry.tenant_id, entry.object_key)) {
         LOG(WARNING) << "OpLogApplier: failed to Remove key="
                      << entry.object_key
@@ -441,6 +525,10 @@ void OpLogApplier::ApplySegmentUnmount(const OpLogEntry& entry) {
         LOG(ERROR) << "Failed to deserialize SEGMENT_UNMOUNT payload for key "
                    << entry.object_key;
         return;
+    }
+    if (auto segment = segment_registry_.GetSegment(op.transport_endpoint)) {
+        metadata_store_->DrainRecovery().EraseSegment(
+            segment->segment_name, segment->transport_endpoint);
     }
     segment_registry_.OnSegmentUnmount(op.transport_endpoint);
 }

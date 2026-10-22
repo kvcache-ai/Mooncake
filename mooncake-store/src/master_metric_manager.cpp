@@ -485,6 +485,9 @@ MasterMetricManager::MasterMetricManager()
       // MoveRevoke Counters
       copy_start_requests_("master_copy_start_requests_total",
                            "Total number of CopyStart requests received"),
+      orphaned_draining_restore_(
+          "master_orphaned_draining_restore_total",
+          "Orphaned draining segments found during restore"),
       copy_start_failures_("master_copy_start_failures_total",
                            "Total number of failed CopyStart requests"),
       copy_end_requests_("master_copy_end_requests_total",
@@ -640,6 +643,7 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     // Update CopyStart, CopyEnd, CopyRevoke, MoveStart, MoveEnd, MoveRevoke
     // counters
     copy_start_requests_.inc(0);
+    orphaned_draining_restore_.inc(0);
     copy_start_failures_.inc(0);
     copy_end_requests_.inc(0);
     copy_end_failures_.inc(0);
@@ -1861,6 +1865,10 @@ int64_t MasterMetricManager::get_promotion_candidate_dropped_limit() {
 void MasterMetricManager::inc_copy_start_requests(int64_t val) {
     copy_start_requests_.inc(val);
 }
+
+void MasterMetricManager::inc_orphaned_draining_restore() {
+    orphaned_draining_restore_.inc();
+}
 void MasterMetricManager::inc_copy_start_failures(int64_t val) {
     copy_start_failures_.inc(val);
 }
@@ -2106,6 +2114,7 @@ std::string MasterMetricManager::serialize_metrics() {
     // Serialize CopyStart, CopyEnd, CopyRevoke, MoveStart, MoveEnd, MoveRevoke
     // Counters
     serialize_metric(copy_start_requests_);
+    serialize_metric(orphaned_draining_restore_);
     serialize_metric(copy_start_failures_);
     serialize_metric(copy_end_requests_);
     serialize_metric(copy_end_failures_);

@@ -1436,13 +1436,16 @@ class MasterService {
     void FinalizeRemovedReplicasAfterDurable(
         const OpLogEntry& durable_entry,
         const std::vector<ReplicaID>& replica_ids, QuotaEraseMode quota_mode,
-        const std::vector<std::string>& previous_media_hint = {});
+        const std::vector<std::string>& previous_media_hint = {},
+        std::optional<std::chrono::system_clock::time_point> retire_at =
+            std::nullopt);
     // The durable finalizers of a decision taken under a key's lock that was
     // let go of before the OpLog entry became durable. Those that name the
     // object by `ObjectRef` act only on that same publication, so a same-key
     // recreate that landed meanwhile is left alone.
     void FinalizeMetadataEraseAfterDurable(route::ObjectRef object,
                                            const TenantId& tenant_id,
+
                                            QuotaEraseMode quota_mode);
     void FinalizeExpiredProcessingReplicasAfterDurable(
         route::ObjectRef object, const OpLogEntry& durable_entry,
@@ -2338,6 +2341,8 @@ class MasterService {
     const std::chrono::seconds put_start_discard_timeout_sec_;
     const std::chrono::seconds put_start_release_timeout_sec_;
     class DiscardedReplicas {
+        friend class MasterService;
+
        public:
         DiscardedReplicas() = delete;
 
@@ -2408,7 +2413,47 @@ class MasterService {
         std::unordered_set<std::string> terminal_failed_unit_keys;
     };
 
-    static constexpr uint32_t kMaxDrainUnitRetries = 3;
+    static DrainJobRecord DescribeDrainJob(const DrainJob& job);
+    static void PublishDrainJob(DrainJob& job, const DrainJobRecord& record);
+    std::vector<DrainSegmentRecord> DescribeDrainSegments(
+        ScopedSegmentAccess& access, const std::vector<std::string>& names,
+        std::optional<SegmentStatus> status);
+    ErrorCode SetDrainSegmentStatus(ScopedSegmentAccess& access,
+                                    const std::string& name,
+                                    SegmentStatus status);
+    ErrorCode GetDrainSegmentStatus(ScopedSegmentAccess& access,
+                                    const std::string& name,
+                                    SegmentStatus& status) const;
+    ErrorCode PersistRecoveryEntry(OpType type, const std::string& payload,
+                                   const std::string& key,
+                                   const std::string& tenant = "default");
+    ErrorCode AwaitRecoveryDurability(uint64_t sequence);
+    ErrorCode PersistRecoveryTasks(std::span<const DurableTaskRecord> tasks);
+    ErrorCode PersistDrainJobUpdate(const DrainJobUpdate& update);
+    ErrorCode PersistReplicationStart(
+        MetadataAccessorRW& accessor,
+        std::optional<OrderedOpLogWriter::Reservation>& reservation);
+    ErrorCode PersistReplicationRevoke(MetadataAccessorRW& accessor);
+    tl::expected<UUID, ErrorCode> CreateMoveTaskImpl(
+        const std::string& key, const TenantId& tenant_id,
+        const std::string& source, const std::string& target,
+        std::optional<DrainUnitRecord> drain);
+    tl::expected<void, ErrorCode> RestoreDrainRecovery(
+        const DrainRecoveryState& state, int64_t restore_epoch_ms);
+    tl::expected<void, ErrorCode> RestoreReplicationRecovery(
+        const StandbyMetadataStore& metadata_store);
+    struct RestoredDrainSegment : DrainSegmentRecord {
+        explicit RestoredDrainSegment(DrainSegmentRecord record)
+            : DrainSegmentRecord(std::move(record)) {}
+        SegmentLifetime lifetime;
+        std::shared_ptr<std::mutex> unmount_mutex{
+            std::make_shared<std::mutex>()};
+    };
+    // Accessed under the segment-manager access lock, like mounted segments.
+    std::unordered_map<std::string, RestoredDrainSegment>
+        restored_drain_segments_;
+    void ForgetRestoredSegments(
+        const std::vector<DrainSegmentRecord>& segments);
 
     tl::expected<void, ErrorCode> ValidateDrainRequest(
         const CreateDrainJobRequest& request);
@@ -2416,15 +2461,13 @@ class MasterService {
         ScopedSegmentAccess& segment_access,
         const CreateDrainJobRequest& request);
     void ProcessDrainJobs();
+    void WarnOrphanedDrainingSegments();
     void RefreshDrainJobTasks(DrainJob& job);
     void ScheduleDrainJobTasks(DrainJob& job);
     bool MaybeCompleteDrainJob(DrainJob& job);
     std::optional<std::string> SelectDrainTargetForKey(
         const ObjectMetadata& metadata, const std::string& source_segment,
         const std::vector<std::string>& requested_targets);
-    std::string MakeDrainUnitKey(const TenantId& tenant_id,
-                                 const std::string& key,
-                                 const std::string& source_segment) const;
 
     std::thread job_dispatch_thread_;
     std::atomic<bool> job_dispatch_running_{false};
@@ -2551,7 +2594,9 @@ class MasterService {
         const ObjectMetadata& metadata) const;
     std::string SerializeMetadataForOpLogFromReplicaDescriptors(
         const ObjectMetadata& metadata,
-        const std::vector<Replica::Descriptor>& replicas) const;
+        const std::vector<Replica::Descriptor>& replicas,
+        const std::vector<RetiredReplicaRecord>& retired = {},
+        bool replication_finished = false) const;
     ErrorCode InitializeBatchOpLogWriter(std::shared_ptr<HaKvBackend> backend,
                                          bool require_fenced_writer);
     tl::expected<uint64_t, ErrorCode> AppendOpLogVisibleBeforeDurable(
@@ -2583,7 +2628,8 @@ class MasterService {
     std::vector<StandbySegmentInfo> standby_memory_segments_;
     std::unordered_map<std::string, uint64_t> standby_accounted_memory_bytes_;
 
-    ErrorCode ValidateStandbyRemountSegment(const Segment& segment) const;
+    ErrorCode ValidateStandbyRemountSegment(const Segment& segment,
+                                            const UUID& client_id) const;
 
     // True while the replica sits on an endpoint in
     // invalid_replica_endpoints_. The read path asks only this, never the set.

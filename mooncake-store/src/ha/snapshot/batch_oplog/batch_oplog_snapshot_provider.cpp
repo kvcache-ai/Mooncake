@@ -323,6 +323,28 @@ AttemptResult RestorePointer(
         }
     }
 
+    for (size_t i = 0; i < manifest.recovery_chunks.size(); ++i) {
+        if (cancelled && cancelled())
+            return Invalid(ErrorCode::ETCD_CTX_CANCELLED);
+        const auto& chunk = manifest.recovery_chunks[i];
+        if (chunk.chunk_index != i ||
+            chunk.key != ha::BuildBatchOpLogSnapshotRecoveryChunkKey(
+                             snapshot_root, descriptor.snapshot_id, i))
+            return Invalid();
+        std::vector<uint8_t> bytes;
+        auto read = ReadVerifiedObject(object_store, chunk.key,
+                                       chunk.stored_size, chunk.crc32c, bytes);
+        if (read.disposition != AttemptDisposition::kSuccess) return read;
+        auto decoded =
+            DecodeBatchOpLogRecoveryChunk(bytes, i, chunk.object_count);
+        if (!decoded) return Invalid(ErrorCode::DESERIALIZE_FAIL);
+        for (const auto& record : decoded->records) {
+            if (!metadata.DrainRecovery().Restore(record)) {
+                return Invalid(ErrorCode::DESERIALIZE_FAIL);
+            }
+        }
+    }
+
     auto suffix =
         ReplaySuffix(cluster_id, backend, *applier, &baseline, cancelled);
     if (suffix.disposition != AttemptDisposition::kSuccess) {
@@ -336,8 +358,11 @@ AttemptResult RestorePointer(
     uint64_t chunk_bytes = 0;
     for (const auto& chunk : manifest.object_chunks)
         chunk_bytes += chunk.stored_size;
+    for (const auto& chunk : manifest.recovery_chunks)
+        chunk_bytes += chunk.stored_size;
     HAMetricManager::instance().update_snapshot_runtime([&](auto& metrics) {
-        metrics.chunk_count = manifest.object_chunks.size();
+        metrics.chunk_count =
+            manifest.object_chunks.size() + manifest.recovery_chunks.size();
         metrics.chunk_bytes = chunk_bytes;
         metrics.snapshot_bytes =
             metrics.chunk_bytes + manifest.segments.stored_size +

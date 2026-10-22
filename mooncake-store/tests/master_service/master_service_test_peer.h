@@ -282,6 +282,15 @@ class MasterServiceTestPeer {
         return service.task_manager_;
     }
 
+    void StopJobDispatchForTesting() {
+        service_.job_dispatch_running_ = false;
+        if (service_.job_dispatch_thread_.joinable()) {
+            service_.job_dispatch_thread_.join();
+        }
+    }
+
+    void ProcessDrainJobsForTesting() { service_.ProcessDrainJobs(); }
+
     static auto& TenantQuotaPolicyMutex(MasterService& service) {
         return service.tenant_quota_manager_.policy_mutex_;
     }

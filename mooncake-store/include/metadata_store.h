@@ -1,5 +1,7 @@
 #pragma once
 
+#include "drain_recovery.h"
+
 #include <cstddef>
 #include <optional>
 #include <shared_mutex>
@@ -110,8 +112,18 @@ struct MetadataPayload {
 
     struct_pack::compatible<std::string, 2> session_id;
 
+    struct_pack::compatible<std::vector<RetiredReplicaRecord>, 3>
+        retired_replicas;
+
+    // Ordinary metadata updates can project only COMPLETE replicas. Preserve
+    // their live COPY/MOVE targets separately until an explicit settlement.
+    struct_pack::compatible<std::vector<Replica::Descriptor>, 4>
+        processing_replicas;
+    struct_pack::compatible<bool, 4> replication_finished;
+
     YLT_REFL(MetadataPayload, client_id, size, replicas, group_id, data_type,
-             hard_pinned, session_id);
+             hard_pinned, session_id, retired_replicas, processing_replicas,
+             replication_finished);
 
     // Convert to StandbyObjectMetadata
     StandbyObjectMetadata ToStandbyMetadata() const {
@@ -163,6 +175,10 @@ class StandbySegmentRegistry {
 class MetadataStore {
    public:
     virtual ~MetadataStore() = default;
+
+    // Written by the ordered applier; snapshot capture pauses that writer.
+    DrainRecoveryState& DrainRecovery() { return drain_recovery_; }
+    const DrainRecoveryState& DrainRecovery() const { return drain_recovery_; }
 
     // NEW: tenant-aware methods (primary API)
     virtual bool PutMetadata(const std::string& tenant_id,
@@ -216,6 +232,9 @@ class MetadataStore {
     virtual bool RemoveWeightLease(uint64_t lease_id,
                                    const WeightRevisionIdentity& identity,
                                    uint64_t fenced_metadata_generation) = 0;
+
+   private:
+    DrainRecoveryState drain_recovery_;
 };
 
 }  // namespace mooncake

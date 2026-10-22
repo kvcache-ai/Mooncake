@@ -23,6 +23,9 @@
 #include "ha/snapshot/batch_oplog/metadata.h"
 #include "ha/snapshot/object/snapshot_object_store.h"
 #include "hot_standby_service.h"
+#include "rpc_types.h"
+#include "segment/status.h"
+#include "task_manager.h"
 
 namespace mooncake::test {
 
@@ -161,6 +164,9 @@ class FakeObjectStore final : public SnapshotObjectStore {
     }
 
     std::string GetConnectionInfo() const override { return "fake"; }
+    bool IsNotFoundError(const std::string& error) const override {
+        return error == "not found";
+    }
 
     void PutExisting(const std::string& key) { objects_[key] = {1}; }
     bool Contains(const std::string& key) const {
@@ -225,7 +231,8 @@ class BatchOpLogSnapshotWriterTest : public ::testing::Test {
 
     std::optional<BatchOpLogSnapshotCapture> StartCapture(
         size_t object_count,
-        const WeightMetadataSnapshot* weight_metadata = nullptr) {
+        const WeightMetadataSnapshot* weight_metadata = nullptr,
+        std::vector<OpLogEntry> recovery_entries = {}) {
         backend_ = std::make_shared<FakeHaKvBackend>();
         auto batch = MakeObjectBatch(object_count);
         const auto append = [&](OpType type, const std::string& key,
@@ -261,6 +268,11 @@ class BatchOpLogSnapshotWriterTest : public ::testing::Test {
                 append(OpType::WEIGHT_LEASE_UPSERT,
                        "weight-lease:" + std::to_string(lease.lease_id), lease);
             }
+        }
+        for (auto& entry : recovery_entries) {
+            entry.sequence_id = ++batch.last_seq;
+            entry.checksum = ComputeOpLogChecksum(entry.payload);
+            batch.entries.push_back(std::move(entry));
         }
         if (!batch.entries.empty()) {
             EXPECT_EQ(ErrorCode::OK,
@@ -485,6 +497,207 @@ TEST_F(BatchOpLogSnapshotWriterTest,
     ASSERT_TRUE(object_store.UploadBuffer(weight_key, weight_bytes));
     EXPECT_FALSE(provider.RestoreBaseline(restored, registry));
     EXPECT_TRUE(restored.SnapshotWeightMetadata().metadata.empty());
+}
+
+TEST_F(BatchOpLogSnapshotWriterTest,
+       RestoresRecoveryChunksAndSuffixAfterCompaction) {
+    DrainJobRecord job{.id = {1, 1},
+                       .status = static_cast<int32_t>(JobStatus::RUNNING),
+                       .sources = {"source"},
+                       .targets = {"target"},
+                       .concurrency = 2,
+                       .created_ms = 100,
+                       .updated_ms = 101,
+                       .message = "Drain job running",
+                       .failed = 2};
+    DrainUnitRecord unit{.job_id = job.id,
+                         .task_id = {2, 2},
+                         .unit_key = DrainUnitKey("tenant", "moving", "source"),
+                         .tenant = "tenant",
+                         .key = "moving",
+                         .source = "source",
+                         .target = "target",
+                         .bytes = 64,
+                         .retries = 2};
+    DurableTaskRecord task{
+        .id = unit.task_id,
+        .client_id = {3, 3},
+        .type = static_cast<int32_t>(TaskType::REPLICA_MOVE),
+        .status = static_cast<int32_t>(TaskStatus::PROCESSING),
+        .payload = R"({"tenant_id":"tenant","key":"moving",)"
+                   R"("source":"source","target":"target"})",
+        .created_ms = 101,
+        .updated_ms = 102,
+        .max_retries = 3,
+        .drain = unit};
+    DrainSegmentRecord segment{
+        .id = {4, 4},
+        .client_id = task.client_id,
+        .name = "source",
+        .endpoint = "host:1234",
+        .base = 4096,
+        .size = 4096,
+        .status = static_cast<int32_t>(SegmentStatus::DRAINING)};
+    Replica::Descriptor source{10,
+                               MemoryDescriptor{{64, 4096, "tcp", "host:1234"}},
+                               ReplicaStatus::COMPLETE};
+    Replica::Descriptor target{11,
+                               MemoryDescriptor{{64, 8192, "tcp", "host:5678"}},
+                               ReplicaStatus::PROCESSING};
+    ReplicationRecoveryRecord runtime{.tenant = "tenant",
+                                      .key = "moving",
+                                      .client_id = task.client_id,
+                                      .type = 1,
+                                      .started_ms = 102,
+                                      .source_id = source.id,
+                                      .targets = {target.id},
+                                      .pending_bytes = 64};
+    MetadataPayload moving;
+    moving.client_id = task.client_id;
+    moving.size = 64;
+    moving.replicas = {source, target};
+    auto retired_source = source;
+    retired_source.id = 20;
+    retired_source.get_memory_descriptor().buffer_descriptor.buffer_address_ +=
+        64;
+    RetiredReplicaRecord retired{
+        retired_source, std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::system_clock::now().time_since_epoch())
+                                .count() +
+                            60000};
+    MetadataPayload completed;
+    completed.size = 64;
+    completed.retired_replicas = std::vector<RetiredReplicaRecord>{retired};
+    std::vector<OpLogEntry> entries;
+    const auto append = [&](OpType type, const std::string& key,
+                            const auto& payload) {
+        OpLogEntry entry;
+        entry.op_type = type;
+        entry.tenant_id = "tenant";
+        entry.object_key = key;
+        entry.payload = EncodeRecoveryValue(payload);
+        entries.push_back(std::move(entry));
+    };
+    append(OpType::DRAIN_JOB_UPDATE, "drain",
+           DrainJobUpdate{job, std::nullopt, {segment}});
+    append(OpType::TASK_UPDATE, "task", task);
+    append(OpType::REPLICATION_START, "moving",
+           ReplicationStartRecord{runtime, EncodeRecoveryValue(moving), {}});
+    append(OpType::PUT_END, "completed", completed);
+    auto capture = StartCapture(0, nullptr, std::move(entries));
+    ASSERT_TRUE(capture);
+    ASSERT_EQ(4u, capture->last_included_seq);
+    FakeObjectStore object_store;
+    BatchOpLogSnapshotWriter writer(object_store);
+    const auto latest =
+        writer.Write(*standby_, *capture, "snapshots", "1-42", 2, 1234);
+    ASSERT_TRUE(latest) << latest.error();
+    auto descriptor = ha::DecodeBatchOpLogSnapshotDescriptor(*latest);
+    ASSERT_TRUE(descriptor);
+    EXPECT_EQ(ha::kBatchOpLogRecoverySnapshotSchemaVersion,
+              descriptor->schema_version);
+    EXPECT_EQ(ha::kBatchOpLogRecoverySnapshotFormat,
+              descriptor->snapshot_format);
+    std::string manifest_json;
+    ASSERT_TRUE(
+        object_store.DownloadString(descriptor->manifest_key, manifest_json));
+    auto manifest = ha::DecodeBatchOpLogSnapshotManifest(manifest_json);
+    ASSERT_TRUE(manifest);
+    ASSERT_EQ(3u, manifest->recovery_chunks.size());
+    for (const auto& chunk : manifest->recovery_chunks) {
+        EXPECT_EQ(2u, chunk.object_count);
+    }
+    auto fallback_capture = standby_->BeginBatchOpLogSnapshotCapture();
+    ASSERT_TRUE(fallback_capture);
+    const auto fallback = writer.Write(*standby_, *fallback_capture,
+                                       "snapshots", "1-41", 2, 1233);
+    ASSERT_TRUE(fallback) << fallback.error();
+    standby_->Stop();
+
+    FakeHaKvBackend compacted_backend;
+    ASSERT_EQ(ErrorCode::OK,
+              compacted_backend.Put(
+                  ha::BuildBatchOpLogSnapshotLatestKey(kClusterId), *latest));
+    ASSERT_EQ(
+        ErrorCode::OK,
+        compacted_backend.Put(
+            ha::BuildBatchOpLogSnapshotFallbackKey(kClusterId), *fallback));
+    ASSERT_EQ(
+        ErrorCode::OK,
+        compacted_backend.Put(
+            ha::BuildBatchOpLogSnapshotCompactionFloorKey(kClusterId), "1"));
+    ASSERT_EQ(ErrorCode::OK,
+              compacted_backend.Put(BuildDurablePrefixKey(kClusterId),
+                                    EncodeDurablePrefix({1, 4})));
+    BatchOpLogSnapshotProvider provider(kClusterId, compacted_backend,
+                                        object_store, "snapshots");
+    StandbyMetadataStore restored;
+    StandbySegmentRegistry registry;
+    const auto expected = std::vector<DrainRecoveryRecord>{
+        MakeRecoveryRecord(RecoveryRecordKind::Job, UuidToString(job.id), job),
+        MakeRecoveryRecord(RecoveryRecordKind::Unit,
+                           UuidToString(job.id) + ":" + unit.unit_key, unit),
+        MakeRecoveryRecord(RecoveryRecordKind::Task, UuidToString(task.id),
+                           task),
+        MakeRecoveryRecord(RecoveryRecordKind::Segment, segment.name, segment),
+        MakeRecoveryRecord(RecoveryRecordKind::Replication,
+                           TenantId("tenant").MakeScopedKey("moving"), runtime),
+        MakeRecoveryRecord(RecoveryRecordKind::RetiredReplica, "20", retired)};
+    const auto expect_recovery = [&] {
+        const auto& records = restored.DrainRecovery().records();
+        ASSERT_EQ(expected.size(), records.size());
+        for (const auto& record : expected) {
+            ASSERT_TRUE(records.contains(record.key)) << record.key;
+            EXPECT_EQ(record.payload, records.at(record.key).payload)
+                << record.key;
+        }
+    };
+    auto result = provider.RestoreBaseline(restored, registry);
+    ASSERT_TRUE(result) << toString(result.error());
+    expect_recovery();
+    EXPECT_EQ(20u, result->max_replica_id);
+    auto object = restored.GetMetadata("tenant", "moving");
+    ASSERT_TRUE(object);
+    ASSERT_EQ(2u, object->replicas.size());
+    EXPECT_EQ(ReplicaStatus::PROCESSING, object->replicas[1].status);
+
+    // A later chunk fails after earlier recovery records were installed.
+    const auto& damaged = manifest->recovery_chunks.back();
+    std::vector<uint8_t> bytes;
+    ASSERT_TRUE(object_store.DownloadBuffer(damaged.key, bytes));
+    auto corrupt = bytes;
+    corrupt.back() ^= 1;
+    ASSERT_TRUE(object_store.UploadBuffer(damaged.key, corrupt));
+    ASSERT_TRUE(provider.RestoreBaseline(restored, registry));
+    expect_recovery();
+    ASSERT_TRUE(object_store.DeleteObjectsWithPrefix(damaged.key));
+    ASSERT_TRUE(provider.RestoreBaseline(restored, registry));
+    expect_recovery();
+    ASSERT_TRUE(object_store.UploadBuffer(damaged.key, bytes));
+
+    task.removed = true;
+    OpLogEntry removal;
+    removal.sequence_id = 5;
+    removal.op_type = OpType::TASK_UPDATE;
+    removal.payload = EncodeRecoveryValue(task);
+    removal.checksum = ComputeOpLogChecksum(removal.payload);
+    OpLogBatchRecord suffix;
+    suffix.batch_id = 2;
+    suffix.first_seq = suffix.last_seq = 5;
+    suffix.entries = {removal};
+    ASSERT_EQ(ErrorCode::OK,
+              compacted_backend.Put(BuildBatchRecordKey(kClusterId, 2),
+                                    EncodeOpLogBatchRecord(suffix)));
+    ASSERT_EQ(ErrorCode::OK,
+              compacted_backend.Put(BuildDurablePrefixKey(kClusterId),
+                                    EncodeDurablePrefix({2, 5})));
+    result = provider.RestoreBaseline(restored, registry);
+    ASSERT_TRUE(result) << toString(result.error());
+    EXPECT_EQ(2u, result->last_applied_batch_id);
+    EXPECT_EQ(5u, result->last_applied_seq);
+    EXPECT_EQ(expected.size() - 1, restored.DrainRecovery().records().size());
+    EXPECT_FALSE(restored.DrainRecovery().records().contains(
+        DrainRecoveryKey(RecoveryRecordKind::Task, UuidToString(task.id))));
 }
 
 TEST_F(BatchOpLogSnapshotWriterTest,

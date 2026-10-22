@@ -125,6 +125,7 @@ TEST(BatchOpLogSnapshotTypesTest, ManifestRoundTripsChunksAndAllowsEmptySet) {
         EncodeBatchOpLogSnapshotManifest(empty));
     ASSERT_TRUE(decoded_empty.has_value()) << decoded_empty.error();
     EXPECT_TRUE(decoded_empty->object_chunks.empty());
+    EXPECT_TRUE(decoded_empty->recovery_chunks.empty());
 }
 
 TEST(BatchOpLogSnapshotTypesTest, WeightSnapshotRequiresVersionedArtifact) {
@@ -153,6 +154,52 @@ TEST(BatchOpLogSnapshotTypesTest, WeightSnapshotRequiresVersionedArtifact) {
         EncodeBatchOpLogSnapshotManifest(manifest));
     ASSERT_TRUE(legacy);
     EXPECT_FALSE(legacy->weight_metadata);
+}
+
+TEST(BatchOpLogSnapshotTypesTest, RecoverySnapshotRequiresVersionedChunks) {
+    auto manifest = MakeManifest();
+    manifest.schema_version = kBatchOpLogRecoverySnapshotSchemaVersion;
+    manifest.snapshot_format = kBatchOpLogRecoverySnapshotFormat;
+    manifest.recovery_chunks = {{0,
+                                 BuildBatchOpLogSnapshotRecoveryChunkKey(
+                                     "snapshots", manifest.snapshot_id, 0),
+                                 2, 42, 7}};
+    const auto encoded = EncodeBatchOpLogSnapshotManifest(manifest);
+    auto decoded = DecodeBatchOpLogSnapshotManifest(encoded);
+    ASSERT_TRUE(decoded) << decoded.error();
+    ASSERT_EQ(1u, decoded->recovery_chunks.size());
+    EXPECT_EQ(2u, decoded->recovery_chunks.front().object_count);
+    EXPECT_FALSE(decoded->weight_metadata);
+    auto json = ParseJson(encoded);
+    json.removeMember("recovery_chunks");
+    ExpectManifestRejected(WriteJson(json));
+    json = ParseJson(encoded);
+    json["recovery_chunks"][0]["chunk_index"] = Json::UInt64(1);
+    ExpectManifestRejected(WriteJson(json));
+    json = ParseJson(encoded);
+    json["recovery_chunks"][0]["object_count"] = Json::UInt64(0);
+    ExpectManifestRejected(WriteJson(json));
+    for (const auto version : {kBatchOpLogSnapshotSchemaVersion,
+                               kBatchOpLogWeightSnapshotSchemaVersion}) {
+        json = ParseJson(encoded);
+        json["schema_version"] = version;
+        json["snapshot_format"] = version == kBatchOpLogSnapshotSchemaVersion
+                                      ? kBatchOpLogSnapshotFormat
+                                      : kBatchOpLogWeightSnapshotFormat;
+        if (version == kBatchOpLogWeightSnapshotSchemaVersion) {
+            json["weight_metadata"] = json["segments"];
+        }
+        ExpectManifestRejected(WriteJson(json));
+        json.removeMember("recovery_chunks");
+        auto legacy = DecodeBatchOpLogSnapshotManifest(WriteJson(json));
+        ASSERT_TRUE(legacy) << legacy.error();
+        EXPECT_TRUE(legacy->recovery_chunks.empty());
+    }
+    auto descriptor = MakeDescriptor();
+    descriptor.schema_version = kBatchOpLogRecoverySnapshotSchemaVersion;
+    descriptor.snapshot_format = kBatchOpLogRecoverySnapshotFormat;
+    EXPECT_TRUE(DecodeBatchOpLogSnapshotDescriptor(
+        EncodeBatchOpLogSnapshotDescriptor(descriptor)));
 }
 
 TEST(BatchOpLogSnapshotTypesTest, JsonRoundTripPreservesEscapedKeys) {

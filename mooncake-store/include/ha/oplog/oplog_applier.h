@@ -70,7 +70,7 @@ class OpLogApplier {
      * @brief Apply PUT_END operation
      * @param entry OpLog entry
      */
-    void ApplyPutEnd(const OpLogEntry& entry);
+    bool ApplyPutEnd(const OpLogEntry& entry);
 
     /**
      * @brief Apply PUT_REVOKE operation

@@ -390,6 +390,7 @@ class MasterMetricManager {
 
     // CopyStart, CopyEnd, CopyRevoke, MoveStart, MoveEnd, MoveRevoke Metrics
     void inc_copy_start_requests(int64_t val = 1);
+    void inc_orphaned_draining_restore();
     void inc_copy_start_failures(int64_t val = 1);
     void inc_copy_end_requests(int64_t val = 1);
     void inc_copy_end_failures(int64_t val = 1);
@@ -785,6 +786,7 @@ class MasterMetricManager {
 
     // CopyStart, CopyEnd, CopyRevoke, MoveStart, MoveEnd, MoveRevoke Metrics
     ylt::metric::counter_t copy_start_requests_;
+    ylt::metric::counter_t orphaned_draining_restore_;
     ylt::metric::counter_t copy_start_failures_;
     ylt::metric::counter_t copy_end_requests_;
     ylt::metric::counter_t copy_end_failures_;

@@ -8,6 +8,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <future>
@@ -15,6 +16,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -32,6 +34,8 @@
 #include "ha/oplog/oplog_batch_types.h"
 #include "ha/oplog/oplog_applier.h"
 #include "ha/oplog/ordered_oplog_writer.h"
+#include "ha/standby_metadata_store.h"
+#include "master_metric_manager.h"
 #include "types.h"
 
 namespace mooncake::test {
@@ -43,6 +47,7 @@ class FakeBatchHaKvBackend : public HaKvBackend {
     }
 
     ErrorCode Get(std::string_view key, std::string& value) override {
+        std::lock_guard<std::mutex> lock(kvs_mutex_);
         auto it = kvs_.find(std::string(key));
         if (it == kvs_.end()) {
             return ErrorCode::ETCD_KEY_NOT_EXIST;
@@ -52,12 +57,14 @@ class FakeBatchHaKvBackend : public HaKvBackend {
     }
 
     ErrorCode Put(std::string_view key, std::string_view value) override {
+        std::lock_guard<std::mutex> lock(kvs_mutex_);
         kvs_[std::string(key)] = std::string(value);
         return ErrorCode::OK;
     }
 
     ErrorCode Range(std::string_view begin_key, std::string_view end_key,
                     size_t limit, std::vector<KvPair>& kvs) override {
+        std::lock_guard<std::mutex> lock(kvs_mutex_);
         kvs.clear();
         for (auto it = kvs_.lower_bound(std::string(begin_key));
              it != kvs_.end() && it->first < end_key; ++it) {
@@ -72,6 +79,7 @@ class FakeBatchHaKvBackend : public HaKvBackend {
     bool SupportsTxn() const override { return true; }
 
     ErrorCode Txn(const KvTxn& txn) override {
+        std::lock_guard<std::mutex> lock(kvs_mutex_);
         for (const auto& compare : txn.compares) {
             auto it = kvs_.find(compare.key);
             if (compare.kind == KvCompareKind::kKeyNotExists) {
@@ -90,6 +98,7 @@ class FakeBatchHaKvBackend : public HaKvBackend {
     }
 
    private:
+    std::mutex kvs_mutex_;
     std::map<std::string, std::string> kvs_;
 };
 
@@ -536,6 +545,69 @@ class MasterServiceHATest : public ::testing::Test {
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
         }
         ASSERT_EQ(ErrorCode::OK, read_err);
+    }
+
+    static MasterServiceConfig DrainRecoveryConfig(const std::string& cluster) {
+        return MasterServiceConfig::builder()
+            .set_enable_ha(true)
+            .set_enable_oplog(true)
+            .set_cluster_id(cluster)
+            .set_default_kv_lease_ttl(0)
+            .set_put_start_release_timeout_sec(3600)
+            .set_pending_task_timeout_sec(0)
+            .set_processing_task_timeout_sec(0)
+            .set_max_retry_attempts(5)
+            .build();
+    }
+
+    static void StopDrainWorkers(MasterService& service) {
+        MasterServiceTestPeer(service).StopJobDispatchForTesting();
+        MasterServiceTestPeer::EvictionRunning(service) = false;
+        auto& eviction = MasterServiceTestPeer::EvictionThread(service);
+        if (eviction.joinable()) eviction.join();
+    }
+
+    static ::testing::AssertionResult ReplayAndPromoteDrain(
+        MasterService& primary, MasterService& promoted,
+        const std::shared_ptr<FakeBatchHaKvBackend>& backend,
+        const std::string& cluster) {
+        primary.StopBatchOpLogWriter();
+        StandbyMetadataStore metadata;
+        OpLogApplier applier(&metadata, cluster);
+        OpLogBatchStandbyReader reader(cluster, *backend, applier);
+        const auto replay = reader.PollOnce();
+        if (replay.error != ErrorCode::OK ||
+            !reader.GetLastAppliedDurablePrefix()) {
+            return ::testing::AssertionFailure()
+                   << "batch replay: " << toString(replay.error);
+        }
+        ReplicaID max_replica_id = 0;
+        if (!metadata.ValidateReplicaIds(max_replica_id)) {
+            return ::testing::AssertionFailure() << "invalid replica IDs";
+        }
+        const auto restored = promoted.RestoreFromBatchOpLogPromotion(
+            metadata, *reader.GetLastAppliedDurablePrefix(),
+            applier.GetSegmentRegistry().GetAllSegments(), max_replica_id, 1);
+        if (!restored) {
+            return ::testing::AssertionFailure()
+                   << "promotion: " << toString(restored.error());
+        }
+        const auto error =
+            MasterServiceTestPeer(promoted).SetBatchOpLogBackendForTesting(
+                backend);
+        return error == ErrorCode::OK
+                   ? ::testing::AssertionSuccess()
+                   : ::testing::AssertionFailure() << toString(error);
+    }
+
+    static tl::expected<void, ErrorCode> CompleteDrainTask(
+        MasterService& service, const UUID& client, const UUID& task,
+        TaskStatus status) {
+        TaskCompleteRequest request;
+        request.id = task;
+        request.status = status;
+        request.message = status == TaskStatus::SUCCESS ? "copied" : "failed";
+        return service.MarkTaskToComplete(client, request);
     }
 
     static GatedOrderedOpLogWriter* InstallGatedWriter(
@@ -5416,6 +5488,9 @@ TEST_F(MasterServiceHATest, CopyEndVisibleBeforeBatchRecordDurable) {
                                {"batch_copy_visible_dst"})
                     .has_value());
 
+    ReadBatchEventually(storage, 4, batch);
+    ASSERT_EQ(OpType::REPLICATION_START, batch.entries.front().op_type);
+
     backend->BlockTxn();
     auto copy_future = std::async(std::launch::async, [&] {
         return service.CopyEnd(source.client_id, key, kDefaultTenant);
@@ -5431,15 +5506,15 @@ TEST_F(MasterServiceHATest, CopyEndVisibleBeforeBatchRecordDurable) {
 
     DurablePrefix prefix;
     ASSERT_EQ(ErrorCode::OK, storage.ReadDurablePrefix(prefix));
-    EXPECT_EQ(3u, prefix.batch_id);
-    EXPECT_EQ(3u, prefix.last_seq);
+    EXPECT_EQ(4u, prefix.batch_id);
+    EXPECT_EQ(4u, prefix.last_seq);
 
     auto replicas = service.GetReplicaList(key, kDefaultTenant);
     ASSERT_TRUE(replicas.has_value());
     EXPECT_EQ(2u, replicas->replicas.size());
 
     backend->AllowTxn();
-    ReadBatchEventually(storage, 4, batch);
+    ReadBatchEventually(storage, 5, batch);
     ASSERT_EQ(1u, batch.entries.size());
     EXPECT_EQ(OpType::PUT_END, batch.entries[0].op_type);
     EXPECT_EQ(key, batch.entries[0].object_key);
@@ -5483,6 +5558,9 @@ TEST_F(MasterServiceHATest,
                                "batch_move_visible_dst")
                     .has_value());
 
+    ReadBatchEventually(storage, 4, batch);
+    ASSERT_EQ(OpType::REPLICATION_START, batch.entries.front().op_type);
+
     backend->BlockTxn();
     auto move_future = std::async(std::launch::async, [&] {
         return service.MoveEnd(source.client_id, key, kDefaultTenant);
@@ -5498,8 +5576,8 @@ TEST_F(MasterServiceHATest,
 
     DurablePrefix prefix;
     ASSERT_EQ(ErrorCode::OK, storage.ReadDurablePrefix(prefix));
-    EXPECT_EQ(3u, prefix.batch_id);
-    EXPECT_EQ(3u, prefix.last_seq);
+    EXPECT_EQ(4u, prefix.batch_id);
+    EXPECT_EQ(4u, prefix.last_seq);
 
     auto replicas = service.GetReplicaList(key, kDefaultTenant);
     ASSERT_TRUE(replicas.has_value());
@@ -5514,7 +5592,7 @@ TEST_F(MasterServiceHATest,
     EXPECT_FALSE(before_finalize.has_value());
 
     backend->AllowTxn();
-    ReadBatchEventually(storage, 4, batch);
+    ReadBatchEventually(storage, 5, batch);
     ASSERT_EQ(1u, batch.entries.size());
     EXPECT_EQ(OpType::PUT_END, batch.entries[0].op_type);
     EXPECT_EQ(key, batch.entries[0].object_key);
@@ -5599,7 +5677,7 @@ TEST_F(MasterServiceHATest,
     ASSERT_TRUE(upsert.has_value()) << toString(upsert.error());
 
     backend->AllowTxn();
-    ReadBatchEventually(storage, 4, batch);
+    ReadBatchEventually(storage, 5, batch);
     uint64_t charged_bytes = 2 * object_size;
     for (int i = 0; i < 50 && charged_bytes == 2 * object_size; ++i) {
         charged_bytes =
@@ -6257,6 +6335,7 @@ TEST_F(MasterServiceHATest, BatchReplicaClearSegmentWritesBatchRecordOpLog) {
     ASSERT_TRUE(copy_start.has_value());
     auto copy_end = service.CopyEnd(mounted.client_id, key, kDefaultTenant);
     ASSERT_TRUE(copy_end.has_value());
+    ReadBatchEventually(storage, 5, batch);
 
     std::this_thread::sleep_for(std::chrono::milliseconds(60));
     auto res =
@@ -6264,14 +6343,20 @@ TEST_F(MasterServiceHATest, BatchReplicaClearSegmentWritesBatchRecordOpLog) {
     ASSERT_TRUE(res.has_value());
     ASSERT_EQ(1u, res->size());
     EXPECT_EQ(key, (*res)[0]);
-    ReadBatchEventually(storage, 4, batch);
+    ReadBatchEventually(storage, 6, batch);
 
     ASSERT_EQ(1u, batch.entries.size());
     EXPECT_EQ(OpType::PUT_END, batch.entries[0].op_type);
     EXPECT_EQ(kDefaultTenant.value(), batch.entries[0].tenant_id);
     EXPECT_EQ(key, batch.entries[0].object_key);
-    EXPECT_EQ(4u, batch.entries[0].sequence_id);
+    EXPECT_EQ(6u, batch.entries[0].sequence_id);
     EXPECT_FALSE(batch.entries[0].payload.empty());
+    MetadataPayload cleared;
+    ASSERT_TRUE(DecodeRecoveryValue(batch.entries[0].payload, cleared));
+    ASSERT_EQ(1u, cleared.replicas.size());
+    EXPECT_EQ("batch_clear_seg2", cleared.replicas.front()
+                                      .get_memory_descriptor()
+                                      .buffer_descriptor.transport_endpoint_);
 }
 
 TEST_F(MasterServiceHATest, BatchReplicaClearAllReleasesAfterDurable) {
@@ -6378,7 +6463,7 @@ TEST_F(MasterServiceHATest, BatchReplicaClearSegmentReleasesAfterDurable) {
     ASSERT_TRUE(copy_start.has_value());
     ASSERT_TRUE(
         service.CopyEnd(mounted.client_id, key, kDefaultTenant).has_value());
-    ReadBatchEventually(storage, 4, batch);
+    ReadBatchEventually(storage, 5, batch);
     ASSERT_TRUE(writer->PauseCallbacksAfter(batch.last_seq));
 
     std::this_thread::sleep_for(std::chrono::milliseconds(60));
@@ -6397,7 +6482,7 @@ TEST_F(MasterServiceHATest, BatchReplicaClearSegmentReleasesAfterDurable) {
     EXPECT_FALSE(before_finalize.has_value());
 
     backend->AllowTxn();
-    ReadBatchEventually(storage, 5, batch);
+    ReadBatchEventually(storage, 6, batch);
     EXPECT_EQ(2048, TenantUsedBytes(service));
     ASSERT_TRUE(writer->RunCallbacksThrough(batch.last_seq));
     EXPECT_EQ(1024, TenantUsedBytes(service));
@@ -6956,14 +7041,17 @@ TEST_F(MasterServiceHATest,
     MasterServiceTestPeer(service).RunBatchEvictForTesting(
         /*evict_ratio_target=*/1.0,
         /*evict_ratio_lowerbound=*/1.0);
-    ReadBatchEventually(storage, 4, batch);
+    ReadBatchEventually(storage, 5, batch);
 
     ASSERT_EQ(1u, batch.entries.size());
     EXPECT_EQ(OpType::PUT_END, batch.entries[0].op_type);
     EXPECT_EQ(kDefaultTenant.value(), batch.entries[0].tenant_id);
     EXPECT_EQ(key, batch.entries[0].object_key);
-    EXPECT_EQ(4u, batch.entries[0].sequence_id);
+    EXPECT_EQ(5u, batch.entries[0].sequence_id);
     EXPECT_FALSE(batch.entries[0].payload.empty());
+    MetadataPayload settled;
+    ASSERT_TRUE(DecodeRecoveryValue(batch.entries[0].payload, settled));
+    EXPECT_TRUE(settled.replication_finished.value_or(false));
 }
 
 TEST_F(MasterServiceHATest, WeightLeaseShorterTtlRenewalReplaysThroughReader) {
@@ -7153,6 +7241,647 @@ TEST_F(MasterServiceHATest, WeightLeaseRenewalRechecksExpiryAfterGroupWait) {
     EXPECT_TRUE(blocker.has_value());
     ASSERT_FALSE(renewed.has_value());
     EXPECT_EQ(WeightManagementError::LEASE_EXPIRED, renewed.error());
+}
+
+TEST_F(MasterServiceHATest, DrainJobSurvivesBatchReplayAndPromotion) {
+    const std::string cluster = "drain_recovery";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    MasterService primary(MasterServiceConfig::builder()
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id(cluster)
+                              .build());
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(primary).SetBatchOpLogBackendForTesting(backend));
+    PrepareSimpleSegment(primary, "drain-source");
+    auto created = primary.CreateDrainJob({{"drain-source"}, {}, 1});
+    ASSERT_TRUE(created.has_value());
+    primary.StopBatchOpLogWriter();
+
+    StandbyMetadataStore metadata;
+    OpLogApplier applier(&metadata, cluster);
+    OpLogBatchStandbyReader reader(cluster, *backend, applier);
+    auto replay = reader.PollOnce();
+    ASSERT_EQ(ErrorCode::OK, replay.error);
+    ASSERT_TRUE(reader.GetLastAppliedDurablePrefix());
+    MasterService promoted;
+    ASSERT_TRUE(promoted.RestoreFromBatchOpLogPromotion(
+        metadata, *reader.GetLastAppliedDurablePrefix(),
+        applier.GetSegmentRegistry().GetAllSegments(), 0, 1));
+    auto restored = promoted.QueryDrainJob(*created);
+    ASSERT_TRUE(restored.has_value());
+    EXPECT_EQ(*created, restored->id);
+    EXPECT_EQ(std::vector<std::string>{"drain-source"}, restored->segments);
+}
+
+TEST_F(MasterServiceHATest,
+       DrainRecoveryResumesPendingAndProcessingTasksWithoutDoubleCounting) {
+    const std::string cluster = "drain_recovery_progress";
+    const auto config = DrainRecoveryConfig(cluster);
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    MasterService primary(config);
+    StopDrainWorkers(primary);
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(primary).SetBatchOpLogBackendForTesting(backend));
+    const auto source = MakeSegment("drain-source");
+    const auto target =
+        MakeSegment("drain-target", kDefaultSegmentBase + kDefaultSegmentSize);
+    const auto source_client = generate_uuid();
+    const auto target_client = generate_uuid();
+    ASSERT_TRUE(primary.MountSegment(source, source_client));
+    ASSERT_TRUE(primary.MountSegment(target, target_client));
+    PutObjectOnSegment(primary, source_client, "first", source.name, 1024);
+    PutObjectOnSegment(primary, source_client, "second", source.name, 2048);
+    const auto job = primary.CreateDrainJob({{source.name}, {target.name}, 2});
+    ASSERT_TRUE(job);
+    MasterServiceTestPeer(primary).ProcessDrainJobsForTesting();
+    std::vector<Task> original_tasks;
+    {
+        const auto tasks =
+            MasterServiceTestPeer::TaskManager(primary).get_read_access();
+        for (const auto& [id, task] : tasks) original_tasks.push_back(task);
+    }
+    ASSERT_EQ(2u, original_tasks.size());
+    const auto fetched = primary.FetchTasks(source_client, 1);
+    ASSERT_TRUE(fetched);
+    ASSERT_EQ(1u, fetched->size());
+    const auto processing_id = fetched->front().id;
+    ReplicaMovePayload processing_payload;
+    struct_json::from_json(processing_payload, fetched->front().payload);
+    ASSERT_TRUE(primary.MoveStart(source_client, processing_payload.key,
+                                  kDefaultTenant, source.name, target.name));
+
+    MasterService promoted(config);
+    StopDrainWorkers(promoted);
+    ASSERT_TRUE(ReplayAndPromoteDrain(primary, promoted, backend, cluster));
+    auto progress = promoted.QueryDrainJob(*job);
+    ASSERT_TRUE(progress);
+    EXPECT_EQ(2u, progress->active_units);
+    EXPECT_EQ(0u, progress->succeeded_units);
+    EXPECT_EQ(0u, progress->migrated_bytes);
+    for (const auto& original : original_tasks) {
+        const auto task = promoted.QueryTask(original.id);
+        ASSERT_TRUE(task);
+        EXPECT_EQ(original.id, task->id);
+        EXPECT_EQ(source_client, task->assigned_client);
+        EXPECT_EQ(original.id == processing_id ? TaskStatus::PROCESSING
+                                               : TaskStatus::PENDING,
+                  task->status);
+        const auto restored = MasterServiceTestPeer::TaskManager(promoted)
+                                  .get_read_access()
+                                  .find_task_by_id(original.id);
+        ASSERT_TRUE(restored);
+        EXPECT_EQ(original.payload, restored->payload);
+        EXPECT_EQ(original.max_retry_attempts, restored->max_retry_attempts);
+    }
+    ASSERT_TRUE(promoted.MountSegment(source, source_client));
+    ASSERT_TRUE(promoted.MountSegment(target, target_client));
+    ASSERT_EQ(SegmentStatus::DRAINING,
+              promoted.QuerySegmentStatus(source.name).value());
+    const auto canceled = promoted.CancelDrainJob(*job);
+    ASSERT_FALSE(canceled);
+    EXPECT_EQ(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS, canceled.error());
+    // The in-flight MOVE must finish with the same task and replica IDs.
+    ASSERT_TRUE(promoted.MoveEnd(source_client, processing_payload.key,
+                                 kDefaultTenant));
+    ASSERT_TRUE(CompleteDrainTask(promoted, source_client, processing_id,
+                                  TaskStatus::SUCCESS));
+    MasterServiceTestPeer(promoted).ProcessDrainJobsForTesting();
+    const auto pending = promoted.FetchTasks(source_client, 8);
+    ASSERT_TRUE(pending);
+    ASSERT_EQ(1u, pending->size());
+    EXPECT_NE(processing_id, pending->front().id);
+    ReplicaMovePayload pending_payload;
+    struct_json::from_json(pending_payload, pending->front().payload);
+    ASSERT_TRUE(promoted.MoveStart(source_client, pending_payload.key,
+                                   kDefaultTenant, source.name, target.name));
+    ASSERT_TRUE(
+        promoted.MoveEnd(source_client, pending_payload.key, kDefaultTenant));
+    ASSERT_TRUE(CompleteDrainTask(promoted, source_client, pending->front().id,
+                                  TaskStatus::SUCCESS));
+    MasterServiceTestPeer(promoted).ProcessDrainJobsForTesting();
+    progress = promoted.QueryDrainJob(*job);
+    ASSERT_TRUE(progress);
+    EXPECT_EQ(JobStatus::SUCCEEDED, progress->status);
+    EXPECT_EQ(2u, progress->succeeded_units);
+    EXPECT_EQ(3072u, progress->migrated_bytes);
+    EXPECT_EQ(0u, progress->active_units);
+
+    MasterService promoted_again(config);
+    StopDrainWorkers(promoted_again);
+    ASSERT_TRUE(
+        ReplayAndPromoteDrain(promoted, promoted_again, backend, cluster));
+    ASSERT_TRUE(promoted_again.MountSegment(source, source_client));
+    ASSERT_TRUE(promoted_again.MountSegment(target, target_client));
+    MasterServiceTestPeer(promoted_again).ProcessDrainJobsForTesting();
+    const auto final = promoted_again.QueryDrainJob(*job);
+    ASSERT_TRUE(final);
+    EXPECT_EQ(JobStatus::SUCCEEDED, final->status);
+    EXPECT_EQ(2u, final->succeeded_units);
+    EXPECT_EQ(3072u, final->migrated_bytes);
+    EXPECT_EQ(0u, final->failed_units);
+    EXPECT_EQ(0u, final->active_units);
+    EXPECT_EQ(SegmentStatus::DRAINED,
+              promoted_again.QuerySegmentStatus(source.name).value());
+    for (const auto& key : {"first", "second"}) {
+        const auto replicas =
+            promoted_again.GetReplicaList(key, kDefaultTenant);
+        ASSERT_TRUE(replicas);
+        ASSERT_EQ(1u, replicas->replicas.size());
+        EXPECT_EQ(target.te_endpoint,
+                  replicas->replicas.front()
+                      .get_memory_descriptor()
+                      .buffer_descriptor.transport_endpoint_);
+    }
+    for (const auto& original : original_tasks) {
+        const auto task = promoted_again.QueryTask(original.id);
+        ASSERT_TRUE(task);
+        EXPECT_EQ(TaskStatus::SUCCESS, task->status);
+        EXPECT_EQ("copied", task->message);
+    }
+    ASSERT_TRUE(promoted_again.FetchTasks(source_client, 8)->empty());
+}
+
+TEST_F(MasterServiceHATest, DrainRecoveryRetainsRetryBudgetAndCanceledJobs) {
+    const std::string cluster = "drain_recovery_retries";
+    const auto config = DrainRecoveryConfig(cluster);
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    MasterService primary(config);
+    StopDrainWorkers(primary);
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(primary).SetBatchOpLogBackendForTesting(backend));
+    const auto source = MakeSegment("retry-source");
+    const auto target =
+        MakeSegment("retry-target", kDefaultSegmentBase + kDefaultSegmentSize);
+    const auto owner = generate_uuid();
+    ASSERT_TRUE(primary.MountSegment(source, owner));
+    ASSERT_TRUE(primary.MountSegment(target, owner));
+    PutObjectOnSegment(primary, owner, "retry-key", source.name);
+    const auto job = primary.CreateDrainJob({{source.name}, {target.name}, 1});
+    ASSERT_TRUE(job);
+    MasterServiceTestPeer(primary).ProcessDrainJobsForTesting();
+    auto tasks = primary.FetchTasks(owner, 1);
+    ASSERT_TRUE(tasks);
+    ASSERT_EQ(1u, tasks->size());
+    const auto first_id = tasks->front().id;
+    ASSERT_TRUE(
+        CompleteDrainTask(primary, owner, first_id, TaskStatus::FAILED));
+    MasterServiceTestPeer(primary).ProcessDrainJobsForTesting();
+    tasks = primary.FetchTasks(owner, 1);
+    ASSERT_TRUE(tasks);
+    ASSERT_EQ(1u, tasks->size());
+    auto active_id = tasks->front().id;
+    EXPECT_NE(first_id, active_id);
+
+    MasterService promoted(config);
+    StopDrainWorkers(promoted);
+    ASSERT_TRUE(ReplayAndPromoteDrain(primary, promoted, backend, cluster));
+    ASSERT_TRUE(promoted.MountSegment(source, owner));
+    ASSERT_TRUE(promoted.MountSegment(target, owner));
+    auto progress = promoted.QueryDrainJob(*job);
+    ASSERT_TRUE(progress);
+    EXPECT_EQ(1u, progress->failed_units);
+    EXPECT_EQ(1u, progress->active_units);
+    ASSERT_TRUE(promoted.QueryTask(active_id));
+    EXPECT_EQ(TaskStatus::PROCESSING, promoted.QueryTask(active_id)->status);
+    for (int attempt = 2; attempt <= 3; ++attempt) {
+        ASSERT_TRUE(
+            CompleteDrainTask(promoted, owner, active_id, TaskStatus::FAILED));
+        MasterServiceTestPeer(promoted).ProcessDrainJobsForTesting();
+        progress = promoted.QueryDrainJob(*job);
+        ASSERT_TRUE(progress);
+        EXPECT_EQ(static_cast<uint64_t>(attempt), progress->failed_units);
+        tasks = promoted.FetchTasks(owner, 1);
+        ASSERT_TRUE(tasks);
+        if (attempt == 2) {
+            ASSERT_EQ(1u, tasks->size());
+            EXPECT_NE(active_id, tasks->front().id);
+            active_id = tasks->front().id;
+        } else {
+            EXPECT_TRUE(tasks->empty());
+            EXPECT_EQ(JobStatus::FAILED, progress->status);
+            EXPECT_EQ(0u, progress->active_units);
+        }
+    }
+    EXPECT_EQ(SegmentStatus::OK,
+              promoted.QuerySegmentStatus(source.name).value());
+    const auto canceled =
+        promoted.CreateDrainJob({{source.name}, {target.name}, 1});
+    ASSERT_TRUE(canceled);
+    ASSERT_TRUE(promoted.CancelDrainJob(*canceled));
+
+    MasterService promoted_again(config);
+    StopDrainWorkers(promoted_again);
+    ASSERT_TRUE(
+        ReplayAndPromoteDrain(promoted, promoted_again, backend, cluster));
+    ASSERT_TRUE(promoted_again.MountSegment(source, owner));
+    ASSERT_TRUE(promoted_again.MountSegment(target, owner));
+    MasterServiceTestPeer(promoted_again).ProcessDrainJobsForTesting();
+    const auto failed_job = promoted_again.QueryDrainJob(*job);
+    const auto canceled_job = promoted_again.QueryDrainJob(*canceled);
+    ASSERT_TRUE(failed_job);
+    ASSERT_TRUE(canceled_job);
+    EXPECT_EQ(JobStatus::FAILED, failed_job->status);
+    EXPECT_EQ(3u, failed_job->failed_units);
+    EXPECT_EQ(JobStatus::CANCELED, canceled_job->status);
+    EXPECT_EQ(0u, canceled_job->active_units);
+    EXPECT_EQ(SegmentStatus::OK,
+              promoted_again.QuerySegmentStatus(source.name).value());
+    EXPECT_TRUE(promoted_again.FetchTasks(owner, 8)->empty());
+}
+
+TEST_F(MasterServiceHATest,
+       DrainRecoveryTreatsPrunedActiveTaskAsTerminalFailure) {
+    const std::string cluster = "drain_recovery_missing_task";
+    auto config = DrainRecoveryConfig(cluster);
+    config.task_manager_config.max_total_finished_tasks = 0;
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    MasterService primary(config);
+    StopDrainWorkers(primary);
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(primary).SetBatchOpLogBackendForTesting(backend));
+    const auto source = MakeSegment("pruned-source");
+    const auto target =
+        MakeSegment("pruned-target", kDefaultSegmentBase + kDefaultSegmentSize);
+    const auto owner = generate_uuid();
+    ASSERT_TRUE(primary.MountSegment(source, owner));
+    ASSERT_TRUE(primary.MountSegment(target, owner));
+    PutObjectOnSegment(primary, owner, "pruned-key", source.name);
+    const auto job = primary.CreateDrainJob({{source.name}, {target.name}, 1});
+    ASSERT_TRUE(job);
+    MasterServiceTestPeer(primary).ProcessDrainJobsForTesting();
+    const auto tasks = primary.FetchTasks(owner, 1);
+    ASSERT_TRUE(tasks);
+    ASSERT_EQ(1u, tasks->size());
+    ASSERT_TRUE(CompleteDrainTask(primary, owner, tasks->front().id,
+                                  TaskStatus::FAILED));
+    MasterServiceTestPeer::TaskManager(primary)
+        .get_write_access()
+        .prune_finished_tasks();
+    ASSERT_FALSE(primary.QueryTask(tasks->front().id));
+
+    MasterService promoted(config);
+    StopDrainWorkers(promoted);
+    ASSERT_TRUE(ReplayAndPromoteDrain(primary, promoted, backend, cluster));
+    ASSERT_TRUE(promoted.MountSegment(source, owner));
+    ASSERT_TRUE(promoted.MountSegment(target, owner));
+    MasterServiceTestPeer(promoted).ProcessDrainJobsForTesting();
+    MasterServiceTestPeer(promoted).ProcessDrainJobsForTesting();
+    const auto failed = promoted.QueryDrainJob(*job);
+    ASSERT_TRUE(failed);
+    EXPECT_EQ(JobStatus::FAILED, failed->status);
+    EXPECT_EQ(1u, failed->failed_units);
+    EXPECT_EQ(0u, failed->active_units);
+    EXPECT_TRUE(promoted.FetchTasks(owner, 8)->empty());
+    EXPECT_EQ(SegmentStatus::OK,
+              promoted.QuerySegmentStatus(source.name).value());
+}
+
+TEST_F(MasterServiceHATest,
+       DrainRecoveryReportsOrphanAndRequiresExactRemountWithEmptyName) {
+    const std::string cluster = "drain_recovery_orphan";
+    const auto config = DrainRecoveryConfig(cluster);
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    MasterService primary(config);
+    StopDrainWorkers(primary);
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(primary).SetBatchOpLogBackendForTesting(backend));
+    auto source = MakeSegment("");
+    source.te_endpoint = "empty-name-source-endpoint";
+    const auto owner = generate_uuid();
+    ASSERT_TRUE(primary.MountSegment(source, owner));
+    ASSERT_TRUE(primary.SetSegmentStatus(source.name, SegmentStatus::DRAINING));
+    const auto orphan_count = [] {
+        std::istringstream metrics(
+            MasterMetricManager::instance().serialize_metrics());
+        for (std::string line; std::getline(metrics, line);) {
+            std::istringstream sample(line);
+            std::string name;
+            uint64_t value = 0;
+            if (sample >> name >> value &&
+                name == "master_orphaned_draining_restore_total")
+                return value;
+        }
+        return uint64_t{0};
+    };
+    const auto before = orphan_count();
+    MasterService promoted(config);
+    StopDrainWorkers(promoted);
+    ASSERT_TRUE(ReplayAndPromoteDrain(primary, promoted, backend, cluster));
+    EXPECT_EQ(before + 1, orphan_count());
+    const auto status = promoted.QuerySegmentStatus(source.name);
+    ASSERT_TRUE(status);
+    EXPECT_EQ(SegmentStatus::DRAINING, *status);
+    auto wrong_owner = promoted.MountSegment(source, generate_uuid());
+    ASSERT_FALSE(wrong_owner);
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, wrong_owner.error());
+    auto wrong_geometry = source;
+    wrong_geometry.base += 4096;
+    const auto remapped = promoted.MountSegment(wrong_geometry, owner);
+    ASSERT_FALSE(remapped);
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, remapped.error());
+    ASSERT_TRUE(promoted.MountSegment(source, owner));
+    EXPECT_EQ(SegmentStatus::DRAINING,
+              promoted.QuerySegmentStatus(source.name).value());
+    ReplicateConfig placement;
+    placement.replica_num = 1;
+    EXPECT_FALSE(
+        promoted.PutStart(owner, "blocked", kDefaultTenant, 1024, placement));
+    ASSERT_TRUE(promoted.SetSegmentStatus(source.name, SegmentStatus::OK));
+    ASSERT_TRUE(
+        promoted.PutStart(owner, "resumed", kDefaultTenant, 1024, placement));
+    ASSERT_TRUE(
+        promoted.PutEnd(owner, "resumed", kDefaultTenant, ReplicaType::MEMORY));
+}
+
+TEST_F(MasterServiceHATest,
+       DrainRecoveryRestoresCopyMoveQuotaAndSourcePinsUntilCompletionOrRevoke) {
+    const std::string cluster = "drain_recovery_replication";
+    auto config = DrainRecoveryConfig(cluster);
+    config.enable_multi_tenants = true;
+    config.tenant_quota_connector_type = "file";
+    config.tenant_quota_connector_uri = WriteTenantPolicyFile(
+        {{kDefaultTenant.value(), kStrictTenantQuotaBytes}});
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    MasterService primary(config);
+    StopDrainWorkers(primary);
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(primary).SetBatchOpLogBackendForTesting(backend));
+    const auto source = MakeSegment("runtime-source");
+    const auto target = MakeSegment("runtime-target",
+                                    kDefaultSegmentBase + kDefaultSegmentSize);
+    const auto owner = generate_uuid();
+    ASSERT_TRUE(primary.MountSegment(source, owner));
+    ASSERT_TRUE(primary.MountSegment(target, owner));
+    for (const auto& key : {"copy-end", "copy-revoke", "move-revoke"}) {
+        PutObjectOnSegment(primary, owner, key, source.name);
+    }
+    ASSERT_TRUE(primary.CopyStart(owner, "copy-end", kDefaultTenant,
+                                  source.name, {target.name}));
+    ASSERT_TRUE(primary.CopyStart(owner, "copy-revoke", kDefaultTenant,
+                                  source.name, {target.name}));
+    ASSERT_TRUE(primary.MoveStart(owner, "move-revoke", kDefaultTenant,
+                                  source.name, target.name));
+    // An ordinary metadata update must not settle the in-flight operation.
+    for (const auto& key : {"copy-end", "copy-revoke", "move-revoke"}) {
+        Replica disk(owner, 1024, "runtime-local-disk",
+                     ReplicaStatus::COMPLETE);
+        ASSERT_TRUE(primary.AddReplica(owner, key, kDefaultTenant, disk));
+    }
+    ASSERT_TRUE(primary.GetTenantQuotaSnapshot(kDefaultTenant));
+    EXPECT_EQ(6144u,
+              primary.GetTenantQuotaSnapshot(kDefaultTenant)->charged_bytes);
+    MasterService promoted(config);
+    StopDrainWorkers(promoted);
+    ASSERT_TRUE(ReplayAndPromoteDrain(primary, promoted, backend, cluster));
+    ASSERT_TRUE(promoted.MountSegment(source, owner));
+    ASSERT_TRUE(promoted.MountSegment(target, owner));
+    ASSERT_TRUE(promoted.GetTenantQuotaSnapshot(kDefaultTenant));
+    EXPECT_EQ(6144u,
+              promoted.GetTenantQuotaSnapshot(kDefaultTenant)->charged_bytes);
+    const auto check_source_pin = [&](const std::string& key,
+                                      uint32_t expected) {
+        MasterServiceTestPeer::MetadataAccessorRO access(&promoted,
+                                                         {kDefaultTenant, key});
+        ASSERT_TRUE(access.Exists());
+        uint32_t pins = 0;
+        for (const auto& replica : access.Get().GetAllReplicas()) {
+            pins += replica.get_refcnt();
+        }
+        EXPECT_EQ(expected, pins) << key;
+    };
+    for (const auto& key : {"copy-end", "copy-revoke", "move-revoke"}) {
+        check_source_pin(key, 1);
+    }
+    const auto intruder = generate_uuid();
+    const auto illegal =
+        promoted.CopyRevoke(intruder, "copy-revoke", kDefaultTenant);
+    ASSERT_FALSE(illegal);
+    EXPECT_EQ(6144u,
+              promoted.GetTenantQuotaSnapshot(kDefaultTenant)->charged_bytes);
+    ASSERT_TRUE(promoted.CopyEnd(owner, "copy-end", kDefaultTenant));
+    ASSERT_TRUE(promoted.CopyRevoke(owner, "copy-revoke", kDefaultTenant));
+    ASSERT_TRUE(promoted.MoveRevoke(owner, "move-revoke", kDefaultTenant));
+    EXPECT_EQ(4096u,
+              promoted.GetTenantQuotaSnapshot(kDefaultTenant)->charged_bytes);
+    for (const auto& key : {"copy-end", "copy-revoke", "move-revoke"}) {
+        check_source_pin(key, 0);
+        const auto replicas = promoted.GetReplicaList(key, kDefaultTenant);
+        ASSERT_TRUE(replicas);
+        EXPECT_EQ(std::string(key) == "copy-end" ? 3u : 2u,
+                  replicas->replicas.size());
+    }
+    const auto already_revoked =
+        promoted.MoveRevoke(owner, "move-revoke", kDefaultTenant);
+    ASSERT_FALSE(already_revoked);
+    EXPECT_EQ(ErrorCode::OBJECT_NO_REPLICATION_TASK, already_revoked.error());
+    check_source_pin("move-revoke", 0);
+    EXPECT_EQ(4096u,
+              promoted.GetTenantQuotaSnapshot(kDefaultTenant)->charged_bytes);
+    MasterService promoted_again(config);
+    StopDrainWorkers(promoted_again);
+    ASSERT_TRUE(
+        ReplayAndPromoteDrain(promoted, promoted_again, backend, cluster));
+    ASSERT_TRUE(promoted_again.MountSegment(source, owner));
+    ASSERT_TRUE(promoted_again.MountSegment(target, owner));
+    EXPECT_EQ(
+        4096u,
+        promoted_again.GetTenantQuotaSnapshot(kDefaultTenant)->charged_bytes);
+    for (const auto& key : {"copy-end", "copy-revoke", "move-revoke"}) {
+        MasterServiceTestPeer::MetadataAccessorRO access(&promoted_again,
+                                                         {kDefaultTenant, key});
+        ASSERT_TRUE(access.Exists());
+        EXPECT_FALSE(access.GetState().replication_task);
+        for (const auto& replica : access.Get().GetAllReplicas()) {
+            EXPECT_EQ(0u, replica.get_refcnt());
+        }
+    }
+}
+
+TEST_F(MasterServiceHATest,
+       DrainRecoveryReservesMovedSourceDuringReleaseGrace) {
+    const std::string cluster = "drain_recovery_source_grace";
+    auto config = DrainRecoveryConfig(cluster);
+    config.default_kv_lease_ttl = 30000;
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    // Real, page-aligned process buffers exercise the persisted byte addresses.
+    std::vector<char> source_memory(kDefaultSegmentSize + 4096);
+    std::vector<char> target_memory(kDefaultSegmentSize + 4096);
+    const auto aligned_base = [](const auto& memory) {
+        return (reinterpret_cast<uintptr_t>(memory.data()) + 4095) &
+               ~uintptr_t{4095};
+    };
+    const auto source =
+        MakeSegment("grace-source", aligned_base(source_memory));
+    const auto target =
+        MakeSegment("grace-target", aligned_base(target_memory));
+    const auto owner = generate_uuid();
+    MasterService primary(config);
+    StopDrainWorkers(primary);
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(primary).SetBatchOpLogBackendForTesting(backend));
+    ASSERT_TRUE(primary.MountSegment(source, owner));
+    ASSERT_TRUE(primary.MountSegment(target, owner));
+    PutObjectOnSegment(primary, owner, "grace-key", source.name,
+                       kDefaultSegmentSize);
+    // Keep a real pre-move reader lease across promotion.
+    ASSERT_TRUE(primary.GetReplicaList("grace-key", kDefaultTenant));
+    const auto move = primary.MoveStart(owner, "grace-key", kDefaultTenant,
+                                        source.name, target.name);
+    ASSERT_TRUE(move);
+    ASSERT_TRUE(move->target);
+    const auto old_address =
+        move->source.get_memory_descriptor().buffer_descriptor.buffer_address_;
+    const auto target_address =
+        move->target->get_memory_descriptor().buffer_descriptor.buffer_address_;
+    std::memset(reinterpret_cast<void*>(old_address), 0x5a,
+                kDefaultSegmentSize);
+    std::memcpy(reinterpret_cast<void*>(target_address),
+                reinterpret_cast<void*>(old_address), kDefaultSegmentSize);
+    ASSERT_TRUE(primary.MoveEnd(owner, "grace-key", kDefaultTenant));
+
+    MasterService promoted(config);
+    StopDrainWorkers(promoted);
+    ASSERT_TRUE(ReplayAndPromoteDrain(primary, promoted, backend, cluster));
+    ASSERT_TRUE(promoted.MountSegment(source, owner));
+    ASSERT_TRUE(promoted.MountSegment(target, owner));
+    ReplicateConfig placement;
+    placement.replica_num = 1;
+    placement.preferred_segments = {source.name};
+    // Both segments are full: the target is live and the source is retained
+    // for existing readers, so neither range may satisfy another full-size put.
+    const auto replacement = promoted.PutStart(
+        owner, "too-early", kDefaultTenant, kDefaultSegmentSize, placement);
+    EXPECT_FALSE(replacement);
+    EXPECT_EQ(0, std::memcmp(reinterpret_cast<void*>(old_address),
+                             reinterpret_cast<void*>(target_address),
+                             kDefaultSegmentSize));
+    const auto replicas = promoted.GetReplicaList("grace-key", kDefaultTenant);
+    ASSERT_TRUE(replicas);
+    ASSERT_EQ(1u, replicas->replicas.size());
+    EXPECT_EQ(target_address, replicas->replicas.front()
+                                  .get_memory_descriptor()
+                                  .buffer_descriptor.buffer_address_);
+}
+
+TEST_F(MasterServiceHATest, DrainRecoveryReleasesUnremountedSegmentNamespaces) {
+    for (bool offboard : {false, true}) {
+        const std::string cluster =
+            offboard ? "recovered_offboarding" : "recovered_unmount";
+        const auto config = DrainRecoveryConfig(cluster);
+        auto backend = std::make_shared<FakeBatchHaKvBackend>();
+        MasterService primary(config);
+        StopDrainWorkers(primary);
+        ASSERT_EQ(ErrorCode::OK,
+                  MasterServiceTestPeer(primary).SetBatchOpLogBackendForTesting(
+                      backend));
+        auto segment = MakeSegment("unremounted-source");
+        const auto owner = generate_uuid();
+        ASSERT_TRUE(primary.MountSegment(segment, owner));
+        PutObjectOnSegment(primary, owner, "unremounted-key", segment.name);
+        ASSERT_TRUE(
+            primary.SetSegmentStatus(segment.name, SegmentStatus::DRAINING));
+        MasterService promoted(config);
+        StopDrainWorkers(promoted);
+        ASSERT_TRUE(ReplayAndPromoteDrain(primary, promoted, backend, cluster));
+        if (offboard) {
+            const auto liveness = ClientRecordForTesting(promoted, owner);
+            ASSERT_TRUE(liveness);
+            const auto now = ClientLivenessRecord::Clock::now();
+            ASSERT_EQ(ClientLivenessTransition::BECAME_SUSPECTED,
+                      liveness->Evaluate(now, std::chrono::seconds::zero(),
+                                         std::chrono::seconds::zero()));
+            MasterMetricManager::instance().client_liveness_became_suspected();
+            ASSERT_EQ(ClientLivenessTransition::BECAME_OFFLINE,
+                      liveness->Evaluate(now, std::chrono::seconds::zero(),
+                                         std::chrono::seconds::zero()));
+            MasterMetricManager::instance().client_liveness_became_offline();
+            ClientOffboardingJob job;
+            job.client_id = owner;
+            job.liveness = liveness;
+            ASSERT_TRUE(ProcessClientOffboardingForTesting(promoted, job));
+            EXPECT_FALSE(ClientRecordForTesting(promoted, owner));
+        } else {
+            auto illegal = promoted.UnmountSegment(segment.id, generate_uuid());
+            ASSERT_FALSE(illegal);
+            EXPECT_EQ(ErrorCode::ILLEGAL_CLIENT, illegal.error());
+            ASSERT_TRUE(promoted.UnmountSegment(segment.id, owner));
+        }
+        EXPECT_FALSE(promoted.QuerySegmentStatusById(segment.id));
+        EXPECT_FALSE(
+            promoted.GetReplicaListForAdmin("unremounted-key", kDefaultTenant));
+        segment.id = generate_uuid();
+        segment.te_endpoint = "replacement-endpoint";
+        ASSERT_TRUE(promoted.MountSegment(segment, generate_uuid()));
+        EXPECT_EQ(SegmentStatus::OK,
+                  promoted.QuerySegmentStatus(segment.name).value());
+    }
+}
+
+TEST_F(MasterServiceHATest,
+       DrainRecoveryRejectsInconsistentAssociationsWithoutPublishingState) {
+    const std::string cluster = "drain_recovery_invalid_associations";
+    const auto config = DrainRecoveryConfig(cluster);
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    MasterService primary(config);
+    StopDrainWorkers(primary);
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(primary).SetBatchOpLogBackendForTesting(backend));
+    const auto source = PrepareSimpleSegment(primary, "invalid-source");
+    PrepareSimpleSegment(primary, "invalid-target",
+                         kDefaultSegmentBase + kDefaultSegmentSize);
+    PutObjectOnSegment(primary, source.client_id, "invalid-key",
+                       "invalid-source");
+    const auto job =
+        primary.CreateDrainJob({{"invalid-source"}, {"invalid-target"}, 1});
+    ASSERT_TRUE(job);
+    MasterServiceTestPeer(primary).ProcessDrainJobsForTesting();
+    const auto tasks = primary.FetchTasks(source.client_id, 1);
+    ASSERT_TRUE(tasks);
+    ASSERT_EQ(1u, tasks->size());
+    primary.StopBatchOpLogWriter();
+
+    for (const bool invalid_source : {true, false}) {
+        SCOPED_TRACE(invalid_source ? "unit source outside job"
+                                    : "counter mismatch");
+        StandbyMetadataStore metadata;
+        OpLogApplier applier(&metadata, cluster);
+        OpLogBatchStandbyReader reader(cluster, *backend, applier);
+        ASSERT_EQ(ErrorCode::OK, reader.PollOnce().error);
+        ASSERT_TRUE(reader.GetLastAppliedDurablePrefix());
+        const auto& record = metadata.DrainRecovery().records().at(
+            DrainRecoveryKey(RecoveryRecordKind::Job, UuidToString(*job)));
+        DrainJobRecord inconsistent;
+        ASSERT_TRUE(DecodeRecoveryValue(record.payload, inconsistent));
+        if (invalid_source)
+            inconsistent.sources = {"unrelated-source"};
+        else
+            inconsistent.succeeded = 1;
+        // Each row is valid on its own; restore must validate their relation.
+        ASSERT_TRUE(ValidateDrainJob(inconsistent));
+        ASSERT_TRUE(metadata.DrainRecovery().Apply(
+            DrainJobUpdate{inconsistent, std::nullopt, {}}));
+        ReplicaID max_replica_id = 0;
+        ASSERT_TRUE(metadata.ValidateReplicaIds(max_replica_id));
+        MasterService promoted(config);
+        StopDrainWorkers(promoted);
+        const auto restored = promoted.RestoreFromBatchOpLogPromotion(
+            metadata, *reader.GetLastAppliedDurablePrefix(),
+            applier.GetSegmentRegistry().GetAllSegments(), max_replica_id, 1);
+        EXPECT_FALSE(restored);
+        EXPECT_FALSE(promoted.QueryDrainJob(*job));
+        EXPECT_FALSE(promoted.QueryTask(tasks->front().id));
+        EXPECT_FALSE(
+            promoted.GetReplicaListForAdmin("invalid-key", kDefaultTenant));
+    }
 }
 
 }  // namespace mooncake::test

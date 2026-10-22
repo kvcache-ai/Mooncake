@@ -74,6 +74,15 @@ bool ValidateSnapshot(SnapshotObjectStore& store, const std::string& root,
                              weights.crc32c))
             return false;
     }
+    for (size_t i = 0; i < manifest->recovery_chunks.size(); ++i) {
+        if (cancelled()) return false;
+        const auto& chunk = manifest->recovery_chunks[i];
+        if (chunk.chunk_index != i ||
+            chunk.key != ha::BuildBatchOpLogSnapshotRecoveryChunkKey(
+                             root, descriptor.snapshot_id, i) ||
+            !InspectArtifact(store, chunk.key, chunk.stored_size, chunk.crc32c))
+            return false;
+    }
     return true;
 }
 

@@ -100,6 +100,22 @@ TEST(BatchOpLogSnapshotCodecTest, OldObjectChunkDefaultsHardPinnedToFalse) {
     EXPECT_FALSE(decoded->objects[0].metadata.session_id.has_value());
 }
 
+TEST(BatchOpLogSnapshotCodecTest, RecoveryChunkChecksEnvelopeAndTruncation) {
+    DrainJobRecord job{.id = {1, 2}, .sources = {"source"}, .concurrency = 1};
+    const auto record =
+        MakeRecoveryRecord(RecoveryRecordKind::Job, UuidToString(job.id), job);
+    auto encoded = EncodeBatchOpLogRecoveryChunk(7, {record});
+    auto decoded = DecodeBatchOpLogRecoveryChunk(encoded, 7, 1);
+    ASSERT_TRUE(decoded) << decoded.error();
+    ASSERT_EQ(1u, decoded->records.size());
+    EXPECT_EQ(record.key, decoded->records[0].key);
+    EXPECT_EQ(record.payload, decoded->records[0].payload);
+    EXPECT_FALSE(DecodeBatchOpLogRecoveryChunk(encoded, 8, 1));
+    EXPECT_FALSE(DecodeBatchOpLogRecoveryChunk(encoded, 7, 2));
+    encoded.pop_back();
+    EXPECT_FALSE(DecodeBatchOpLogRecoveryChunk(encoded, 7, 1));
+}
+
 TEST(BatchOpLogSnapshotCodecTest, RejectsTruncatedArtifacts) {
     auto segments = EncodeBatchOpLogSnapshotSegments({});
     auto objects = EncodeBatchOpLogSnapshotObjectChunk(

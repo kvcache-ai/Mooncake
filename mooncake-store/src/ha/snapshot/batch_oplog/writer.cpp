@@ -109,6 +109,10 @@ tl::expected<std::string, std::string> BatchOpLogSnapshotWriter::Write(
         manifest.schema_version = ha::kBatchOpLogWeightSnapshotSchemaVersion;
         manifest.snapshot_format = ha::kBatchOpLogWeightSnapshotFormat;
     }
+    if (!capture.recovery_done()) {
+        manifest.schema_version = ha::kBatchOpLogRecoverySnapshotSchemaVersion;
+        manifest.snapshot_format = ha::kBatchOpLogRecoverySnapshotFormat;
+    }
     manifest.snapshot_id = snapshot_id;
     manifest.last_included_seq = capture.last_included_seq;
     manifest.last_included_batch_id = capture.last_included_batch_id;
@@ -179,6 +183,28 @@ tl::expected<std::string, std::string> BatchOpLogSnapshotWriter::Write(
         manifest.object_chunks.push_back(std::move(descriptor));
         ++chunk_index;
     }
+    chunk_index = 0;
+    while (!capture.recovery_done()) {
+        std::vector<DrainRecoveryRecord> records;
+        if (!standby.CopyNextBatchOpLogRecoveryChunk(chunk_object_count,
+                                                     capture, records) ||
+            records.empty()) {
+            return fail("Recovery snapshot capture was cancelled or empty");
+        }
+        const auto count = records.size();
+        auto encoded =
+            EncodeBatchOpLogRecoveryChunk(chunk_index, std::move(records));
+        const auto key = ha::BuildBatchOpLogSnapshotRecoveryChunkKey(
+            snapshot_root, snapshot_id, chunk_index);
+        ha::BatchOpLogSnapshotChunkDescriptor chunk{
+            chunk_index, key, count, encoded.size(),
+            Crc32cValue(encoded.data(), encoded.size())};
+        upload = object_store_.UploadBuffer(key, encoded);
+        if (!upload)
+            return fail("Failed to upload recovery chunk: " + upload.error());
+        manifest.recovery_chunks.push_back(std::move(chunk));
+        ++chunk_index;
+    }
     end_capture();
 
     auto verify =
@@ -201,6 +227,12 @@ tl::expected<std::string, std::string> BatchOpLogSnapshotWriter::Write(
         if (!verify) {
             return fail(std::move(verify.error()));
         }
+    }
+
+    for (const auto& chunk : manifest.recovery_chunks) {
+        verify = VerifyObject(object_store_, chunk.key, chunk.stored_size,
+                              chunk.crc32c);
+        if (!verify) return fail(std::move(verify.error()));
     }
 
     const std::string manifest_key =
@@ -248,8 +280,11 @@ tl::expected<std::string, std::string> BatchOpLogSnapshotWriter::Write(
     uint64_t chunk_bytes = 0;
     for (const auto& chunk : manifest.object_chunks)
         chunk_bytes += chunk.stored_size;
+    for (const auto& chunk : manifest.recovery_chunks)
+        chunk_bytes += chunk.stored_size;
     HAMetricManager::instance().update_snapshot_runtime([&](auto& metrics) {
-        metrics.chunk_count = manifest.object_chunks.size();
+        metrics.chunk_count =
+            manifest.object_chunks.size() + manifest.recovery_chunks.size();
         metrics.chunk_bytes = chunk_bytes;
         metrics.snapshot_bytes =
             metrics.chunk_bytes + manifest.segments.stored_size +

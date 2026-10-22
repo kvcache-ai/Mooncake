@@ -170,7 +170,8 @@ class RecordingObjectStore final : public SnapshotObjectStore {
 };
 
 std::string AddSnapshot(RecordingObjectStore& store, uint64_t batch,
-                        int64_t lease_id = 101, bool with_weights = false) {
+                        int64_t lease_id = 101, bool with_weights = false,
+                        bool with_recovery = false) {
     ha::BatchOpLogSnapshotManifest manifest;
     manifest.snapshot_id = ha::BuildBatchOpLogSnapshotId(batch, lease_id);
     manifest.last_included_batch_id = batch;
@@ -194,6 +195,16 @@ std::string AddSnapshot(RecordingObjectStore& store, uint64_t batch,
                                                          manifest.snapshot_id),
             1, Crc32cValue("w", 1)};
         store.objects[manifest.weight_metadata->key] = {'w'};
+    }
+    if (with_recovery) {
+        manifest.schema_version = ha::kBatchOpLogRecoverySnapshotSchemaVersion;
+        manifest.snapshot_format = ha::kBatchOpLogRecoverySnapshotFormat;
+        manifest.recovery_chunks.push_back(
+            {0,
+             ha::BuildBatchOpLogSnapshotRecoveryChunkKey(
+                 root, manifest.snapshot_id, 0),
+             1, 1, Crc32cValue("r", 1)});
+        store.objects[manifest.recovery_chunks.front().key] = {'r'};
     }
     const auto bytes = ha::EncodeBatchOpLogSnapshotManifest(manifest);
     ha::BatchOpLogSnapshotDescriptor descriptor;
@@ -253,6 +264,28 @@ TEST_F(PruningTest, MissingWeightArtifactDoesNotAdvanceFloorOrDeleteLog) {
             ha::BuildBatchOpLogSnapshotWeightMetadataKey("snapshots", id);
         const auto bytes = store.objects.at(key);
         store.objects.erase(key);
+        EXPECT_NE(ErrorCode::OK, Run());
+        EXPECT_FALSE(backend.values.contains(floor_key));
+        EXPECT_EQ(0u, backend.delete_count);
+        store.objects[key] = bytes;
+    }
+    EXPECT_EQ(ErrorCode::OK, Run());
+    EXPECT_EQ("10", backend.values.at(floor_key));
+    EXPECT_EQ(1u, backend.delete_count);
+}
+
+TEST_F(PruningTest, InvalidRecoveryChunkDoesNotAdvanceFloorOrDeleteLog) {
+    latest = AddSnapshot(store, 20, 101, true, true);
+    fallback = AddSnapshot(store, 10, 101, true, true);
+    backend.Put(latest_key, latest);
+    backend.Put(fallback_key, fallback);
+    for (const auto& id : {"20-101", "10-101"}) {
+        const auto key =
+            ha::BuildBatchOpLogSnapshotRecoveryChunkKey("snapshots", id, 0);
+        const auto bytes = store.objects.at(key);
+        store.objects.erase(key);
+        EXPECT_NE(ErrorCode::OK, Run());
+        store.objects[key] = {'x'};
         EXPECT_NE(ErrorCode::OK, Run());
         EXPECT_FALSE(backend.values.contains(floor_key));
         EXPECT_EQ(0u, backend.delete_count);

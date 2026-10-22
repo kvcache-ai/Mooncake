@@ -5,6 +5,40 @@
 
 namespace mooncake {
 
+DurableTaskRecord ToDurableTask(const Task& task, bool removed) {
+    const auto milliseconds = [](auto time) {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+                   time.time_since_epoch())
+            .count();
+    };
+    return {task.id,
+            task.assigned_client,
+            static_cast<int32_t>(task.type),
+            static_cast<int32_t>(task.status),
+            task.payload,
+            task.message,
+            milliseconds(task.created_at),
+            milliseconds(task.last_updated_at),
+            task.max_retry_attempts,
+            task.drain,
+            removed};
+}
+
+Task FromDurableTask(const DurableTaskRecord& record) {
+    return {.id = record.id,
+            .type = static_cast<TaskType>(record.type),
+            .status = static_cast<TaskStatus>(record.status),
+            .payload = record.payload,
+            .created_at = std::chrono::system_clock::time_point(
+                std::chrono::milliseconds(record.created_ms)),
+            .last_updated_at = std::chrono::system_clock::time_point(
+                std::chrono::milliseconds(record.updated_ms)),
+            .message = record.message,
+            .assigned_client = record.client_id,
+            .max_retry_attempts = record.max_retries,
+            .drain = record.drain};
+}
+
 std::optional<Task> ScopedTaskReadAccess::find_task_by_id(
     const UUID& task_id) const {
     auto it = manager_->all_tasks_.find(task_id);
@@ -27,7 +61,8 @@ size_t ScopedTaskReadAccess::size() const {
 }
 
 tl::expected<UUID, ErrorCode> ScopedTaskWriteAccess::submit_task(
-    const UUID& client_id, TaskType type, const std::string& payload) {
+    const UUID& client_id, TaskType type, const std::string& payload,
+    std::optional<DrainUnitRecord> drain) {
     if (manager_->total_pending_tasks_ >= manager_->max_total_pending_tasks_) {
         LOG(ERROR) << "Cannot submit new task: pending task limit reached ("
                    << manager_->total_pending_tasks_ << "/"
@@ -47,7 +82,12 @@ tl::expected<UUID, ErrorCode> ScopedTaskWriteAccess::submit_task(
                  .last_updated_at = now,
                  .message = "",
                  .assigned_client = client_id,
-                 .max_retry_attempts = manager_->max_retry_attempts_};
+                 .max_retry_attempts = manager_->max_retry_attempts_,
+                 .drain = std::move(drain)};
+    if (task.drain) task.drain->task_id = task.id;
+    if (const auto error = manager_->Persist(task); error != ErrorCode::OK) {
+        return tl::make_unexpected(error);
+    }
     manager_->total_pending_tasks_++;
     manager_->all_tasks_[task.id] = task;
     manager_->pending_tasks_[client_id].push(task.id);
@@ -58,54 +98,50 @@ tl::expected<UUID, ErrorCode> ScopedTaskWriteAccess::submit_task(
 std::vector<Task> ScopedTaskWriteAccess::pop_tasks(const UUID& client_id,
                                                    size_t batch_size) {
     std::vector<Task> result;
-
-    auto pit = manager_->pending_tasks_.find(client_id);
-    if (pit == manager_->pending_tasks_.end()) {
-        return result;
-    }
-
-    auto& queue = pit->second;
-    auto& processing_set = manager_->processing_tasks_[client_id];
-
+    auto pending = manager_->pending_tasks_.find(client_id);
+    if (pending == manager_->pending_tasks_.end()) return result;
+    auto& queue = pending->second;
+    const size_t available = manager_->max_total_processing_tasks_ >
+                                     manager_->total_processing_tasks_
+                                 ? manager_->max_total_processing_tasks_ -
+                                       manager_->total_processing_tasks_
+                                 : 0;
+    batch_size = std::min(batch_size, available);
     while (!queue.empty() && result.size() < batch_size) {
-        if (manager_->total_processing_tasks_ >=
-            manager_->max_total_processing_tasks_) {
-            break;
-        }
-
-        const UUID task_id = queue.front();
+        const auto id = queue.front();
         queue.pop();
-
-        auto it = manager_->all_tasks_.find(task_id);
-        if (it == manager_->all_tasks_.end()) {
-            // Terminal tasks can be pruned before their queued IDs are
-            // consumed.
-            VLOG(1) << "Skipping stale pending queue entry for task "
-                    << task_id;
+        auto task = manager_->all_tasks_.find(id);
+        if (task == manager_->all_tasks_.end() ||
+            task->second.status != TaskStatus::PENDING)
             continue;
-        }
-
-        Task& task = it->second;
-        if (task.status != TaskStatus::PENDING) {
-            continue;
-        }
-        if (manager_->total_pending_tasks_ > 0) {
-            manager_->total_pending_tasks_--;
-        }
-        task.mark_processing();
-
-        const auto [_, inserted] = processing_set.insert(task_id);
-        if (!inserted) {
-            LOG(WARNING) << "Task " << task_id
-                         << " is already in processing set for client "
-                         << client_id;
-        } else {
-            manager_->total_processing_tasks_++;
-        }
-
-        result.push_back(task);
+        auto next = task->second;
+        next.mark_processing();
+        result.push_back(std::move(next));
     }
-
+    if (result.empty()) return result;
+    if (manager_->persistence_) {
+        std::vector<DurableTaskRecord> records;
+        records.reserve(result.size());
+        for (const auto& task : result) records.push_back(ToDurableTask(task));
+        if (manager_->persistence_(records) != ErrorCode::OK) {
+            // Restore the selected prefix before the untouched queue tail.
+            std::queue<UUID> retry;
+            for (const auto& task : result) retry.push(task.id);
+            while (!queue.empty()) {
+                retry.push(queue.front());
+                queue.pop();
+            }
+            queue.swap(retry);
+            return {};
+        }
+    }
+    auto& processing = manager_->processing_tasks_[client_id];
+    for (const auto& task : result) {
+        manager_->all_tasks_.at(task.id) = task;
+        --manager_->total_pending_tasks_;
+        ++manager_->total_processing_tasks_;
+        processing.insert(task.id);
+    }
     return result;
 }
 
@@ -139,11 +175,16 @@ ErrorCode ScopedTaskWriteAccess::complete_task(const UUID& client_id,
         return ErrorCode::OK;
     }
 
+    Task next = task;
+    next.mark_complete(status, message);
+    if (auto error = manager_->Persist(next); error != ErrorCode::OK)
+        return error;
+
     if (task.status == TaskStatus::PENDING &&
         manager_->total_pending_tasks_ > 0) {
         manager_->total_pending_tasks_--;
     }
-    task.mark_complete(status, message);
+    task = std::move(next);
 
     auto ps_it = manager_->processing_tasks_.find(client_id);
     if (ps_it != manager_->processing_tasks_.end()) {
@@ -163,6 +204,10 @@ void ScopedTaskWriteAccess::prune_finished_tasks() {
     while (manager_->finished_task_history_.size() >
            manager_->max_total_finished_tasks_) {
         UUID oldest_task_id = manager_->finished_task_history_.front();
+        auto task = manager_->all_tasks_.find(oldest_task_id);
+        if (task != manager_->all_tasks_.end() &&
+            manager_->Persist(task->second, true) != ErrorCode::OK)
+            break;
         manager_->finished_task_history_.pop_front();
         manager_->all_tasks_.erase(oldest_task_id);
     }
@@ -197,7 +242,13 @@ void ScopedTaskWriteAccess::prune_expired_tasks() {
                 }
 
                 if (now - task.created_at > pending_timeout_duration) {
-                    task.mark_complete(TaskStatus::FAILED, "pending timeout");
+                    Task next = task;
+                    next.mark_complete(TaskStatus::FAILED, "pending timeout");
+                    if (manager_->Persist(next) != ErrorCode::OK) {
+                        keep_queue.push(task_id);
+                        continue;
+                    }
+                    task = std::move(next);
                     if (manager_->total_pending_tasks_ > 0) {
                         manager_->total_pending_tasks_--;
                     }
@@ -242,8 +293,11 @@ void ScopedTaskWriteAccess::prune_expired_tasks() {
                 }
 
                 if (now - task.last_updated_at > processing_timeout) {
-                    task.mark_complete(TaskStatus::FAILED,
+                    Task next = task;
+                    next.mark_complete(TaskStatus::FAILED,
                                        "processing timeout");
+                    if (manager_->Persist(next) != ErrorCode::OK) continue;
+                    task = std::move(next);
                     to_remove.push_back(task_id);
                     if (manager_->total_processing_tasks_ > 0) {
                         manager_->total_processing_tasks_--;
@@ -297,7 +351,11 @@ ErrorCode ScopedTaskWriteAccess::fail_task_if_pending(
         return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
     }
 
-    task.mark_complete(TaskStatus::FAILED, message);
+    Task next = task;
+    next.mark_complete(TaskStatus::FAILED, message);
+    if (auto error = manager_->Persist(next); error != ErrorCode::OK)
+        return error;
+    task = std::move(next);
     if (manager_->total_pending_tasks_ > 0) {
         manager_->total_pending_tasks_--;
     }

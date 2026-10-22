@@ -153,6 +153,9 @@ class HotStandbyService {
     ErrorCode PromoteAndExportSnapshot(StandbySnapshot& out);
 
     bool IsBatchOpLogSnapshotMode() const;
+    bool CopyNextBatchOpLogRecoveryChunk(size_t count,
+                                         BatchOpLogSnapshotCapture& capture,
+                                         std::vector<DrainRecoveryRecord>& out);
     tl::expected<BatchOpLogPromotionHandoff, ErrorCode>
     PromoteAndDetachBatchOpLogStore();
 
