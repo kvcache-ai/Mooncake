@@ -260,6 +260,8 @@ Status ConfigHelper::loadFromEnv(Config& config) {
     // defaults to several threads so concurrent bulk transfers are not
     // serialized on one io_context.
     setConfig(config, "MC_TENT_RPC_THREADS", "rpc_server_threads");
+    // Directory (or ':'-separated directories) of transport plugins.
+    setConfig(config, "MC_TENT_PLUGIN_DIR", "plugins/dir");
     return status;
 }
 

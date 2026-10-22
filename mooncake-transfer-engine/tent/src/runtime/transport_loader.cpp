@@ -13,11 +13,14 @@
 // limitations under the License.
 
 #include "tent/runtime/transfer_engine_impl.h"
+#include "transport_plugin_registry.h"
 #include "tent/transport/shm/shm_transport.h"
+#ifndef TENT_XPORT_TCP_PLUGIN_ONLY
 #include "tent/transport/tcp/tcp_transport.h"
+#endif
 #include "tent/transport/hp_tcp/hp_tcp_transport.h"
 
-#ifdef USE_RDMA
+#if defined(USE_RDMA) && !defined(TENT_XPORT_RDMA_PLUGIN_ONLY)
 #include "tent/transport/rdma/rdma_transport.h"
 #endif
 
@@ -78,8 +81,10 @@ namespace mooncake {
 namespace tent {
 
 Status TransferEngineImpl::loadTransports() {
+#ifndef TENT_XPORT_TCP_PLUGIN_ONLY
     if (conf_->get("transports/tcp/enable", true))
         transport_list_[TCP] = std::make_shared<TcpTransport>();
+#endif
 
     if (hp_tcp_transport_config_.enabled)
         transport_list_[HP_TCP] = std::make_shared<HighPerformanceTcpTransport>(
@@ -90,7 +95,7 @@ Status TransferEngineImpl::loadTransports() {
     if (conf_->get("transports/shm/enable", false))
         transport_list_[SHM] = std::make_shared<ShmTransport>();
 
-#ifdef USE_RDMA
+#if defined(USE_RDMA) && !defined(TENT_XPORT_RDMA_PLUGIN_ONLY)
     if (conf_->get("transports/rdma/enable", true) &&
         topology_->getNicCount(Topology::NIC_RDMA)) {
         transport_list_[RDMA] = std::make_shared<RdmaTransport>();
@@ -174,6 +179,32 @@ Status TransferEngineImpl::loadTransports() {
         transport_list_[MEMFABRIC] = std::make_shared<MemFabricTransport>();
 #endif
 
+    CHECK_STATUS(
+        instantiateTransportPlugins(*conf_, topology_, transport_list_));
+
+#if defined(TENT_XPORT_TCP_PLUGIN_ONLY) || defined(TENT_XPORT_RDMA_PLUGIN_ONLY)
+    // A transport built only as a plugin that no plugin provided.
+    auto warnNotLoaded = [&](const char* name, const char* file) {
+        if (conf_->get("plugins/dir", std::string()).empty())
+            LOG(WARNING) << name << " is built as a plugin (TENT_XPORT_" << name
+                         << "=plugin) and was not loaded: set plugins/dir or "
+                            "MC_TENT_PLUGIN_DIR to the directory that holds "
+                         << file;
+        else
+            LOG(WARNING) << name << " is built as a plugin (TENT_XPORT_" << name
+                         << "=plugin) and plugins/dir did not provide it for "
+                            "this engine; see the [TransportPlugin] lines";
+    };
+#endif
+#ifdef TENT_XPORT_TCP_PLUGIN_ONLY
+    if (!transport_list_[TCP] && conf_->get("transports/tcp/enable", true))
+        warnNotLoaded("TCP", "libtent_xport_tcp.so");
+#endif
+#if defined(USE_RDMA) && defined(TENT_XPORT_RDMA_PLUGIN_ONLY)
+    if (!transport_list_[RDMA] && conf_->get("transports/rdma/enable", true) &&
+        topology_->getNicCount(Topology::NIC_RDMA))
+        warnNotLoaded("RDMA", "libtent_xport_rdma.so");
+#endif
     return Status::OK();
 }
 

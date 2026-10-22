@@ -1,11 +1,9 @@
-install(FILES
-    transfer_engine_c.h
-    transfer_engine.h
-    DESTINATION include/tent
-)
-
-install(FILES
-    common/status.h
-    common/types.h
-    DESTINATION include/tent/common
-)
+# TENT's public headers, for applications and for transport plugins built out of
+# tree; with plugins/sdk they form the component tent_plugin_sdk.
+install(
+  DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/
+  DESTINATION include/tent
+  COMPONENT tent_plugin_sdk
+  FILES_MATCHING
+  PATTERN "*.h"
+  PATTERN "*.hpp")

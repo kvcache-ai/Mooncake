@@ -1,0 +1,74 @@
+# tentPlugin: build TENT transport plugins out of tree.
+#
+#   find_package(tentPlugin REQUIRED)
+#   add_library(my_plugin MODULE ...)
+#   target_link_libraries(my_plugin PRIVATE tent::plugin)
+#   set_target_properties(my_plugin PROPERTIES PREFIX "lib"
+#                         OUTPUT_NAME tent_xport_<name>)
+#
+# tent::plugin carries TENT's headers and the compile definitions of the build
+# this package was installed from: a plugin has to see the same types as the
+# core that loads it. Use the same compiler, standard library and C++ standard
+# as that build; the core checks the ABI version and a fingerprint of the ABI
+# types' sizes and the toolchain. tent::plugin links nothing; the loading
+# process provides TENT.
+
+@PACKAGE_INIT@
+
+if(NOT EXISTS "${PACKAGE_PREFIX_DIR}/include/ylt/coro_rpc/coro_rpc_client.hpp")
+  set(tentPlugin_FOUND FALSE)
+  string(
+    CONCAT tentPlugin_NOT_FOUND_MESSAGE
+           "TENT's headers need yalantinglibs (commit @YLT_COMMIT@) in "
+           "${PACKAGE_PREFIX_DIR}/include: install it from the TENT build "
+           "with: cmake --install <build>/_deps/yalantinglibs-build --prefix "
+           "${PACKAGE_PREFIX_DIR}")
+  return()
+endif()
+
+# The sources of the loopback sample plugin.
+set(tentPlugin_EXAMPLE_DIR "${PACKAGE_PREFIX_DIR}/share/tent/examples/loopback")
+
+if(NOT TARGET tent::plugin)
+  # Include directories of the libraries TENT's headers use, outside the TENT
+  # source and build trees, as found where TENT was built. Those missing here
+  # are left out and listed (a header the plugin needs from them then fails to
+  # compile).
+  set(_tent_plugin_includes
+      [==[$<REMOVE_DUPLICATES:$<FILTER:$<TARGET_PROPERTY:tent_runtime,INTERFACE_INCLUDE_DIRECTORIES>,EXCLUDE,@TENT_PLUGIN_TREES@>>]==]
+  )
+  set(_tent_plugin_definitions
+      [==[$<FILTER:$<REMOVE_DUPLICATES:@TENT_PLUGIN_DEFINITIONS@;$<TARGET_PROPERTY:tent_runtime,INTERFACE_COMPILE_DEFINITIONS>>,EXCLUDE,^$>]==]
+  )
+  set(_tent_plugin_options
+      [==[$<FILTER:$<REMOVE_DUPLICATES:@TENT_PLUGIN_OPTIONS@;$<TARGET_PROPERTY:tent_runtime,INTERFACE_COMPILE_OPTIONS>>,EXCLUDE,^$>]==]
+  )
+  set(_tent_plugin_found_includes)
+  set(_tent_plugin_missing_includes)
+  foreach(_tent_plugin_dir IN LISTS _tent_plugin_includes)
+    if(EXISTS "${_tent_plugin_dir}")
+      list(APPEND _tent_plugin_found_includes "${_tent_plugin_dir}")
+    else()
+      list(APPEND _tent_plugin_missing_includes "${_tent_plugin_dir}")
+    endif()
+  endforeach()
+  if(_tent_plugin_missing_includes AND NOT tentPlugin_FIND_QUIETLY)
+    message(STATUS "tent::plugin: include directories of the TENT build that "
+                   "do not exist here: ${_tent_plugin_missing_includes}")
+  endif()
+  add_library(tent::plugin INTERFACE IMPORTED)
+  set_target_properties(
+    tent::plugin
+    PROPERTIES INTERFACE_COMPILE_FEATURES cxx_std_20
+               INTERFACE_INCLUDE_DIRECTORIES
+               "${PACKAGE_PREFIX_DIR}/include;${_tent_plugin_found_includes}"
+               INTERFACE_COMPILE_DEFINITIONS "${_tent_plugin_definitions}"
+               INTERFACE_COMPILE_OPTIONS "${_tent_plugin_options}")
+  unset(_tent_plugin_includes)
+  unset(_tent_plugin_found_includes)
+  unset(_tent_plugin_missing_includes)
+  unset(_tent_plugin_dir)
+  unset(_tent_plugin_definitions)
+  unset(_tent_plugin_options)
+endif()
+check_required_components(tentPlugin)

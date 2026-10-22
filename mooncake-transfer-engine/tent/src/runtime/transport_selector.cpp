@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "tent/runtime/transport_selector.h"
+#include "tent/common/transport_slots.h"
 #include "tent/runtime/transport.h"
 #include "tent/runtime/platform.h"
 #include "tent/runtime/topology.h"
@@ -133,6 +134,8 @@ void TransportSelector::loadPolicies() {
     }
 
     LOG(INFO) << "Loading transport selection policies from config";
+    const bool plugins_configured =
+        !config_->get("plugins/dir", std::string()).empty();
 
     for (const auto& policy_json : policies_array) {
         if (!policy_json.is_object()) continue;
@@ -234,12 +237,23 @@ void TransportSelector::loadPolicies() {
                 if (!transport_str.is_string()) continue;
                 const auto name = transport_str.get<std::string>();
                 TransportType type = parseTransportType(name);
+                // Plugin names only mean something to an engine that loads
+                // plugins, whatever another engine of the process loaded.
+                if (type >= kFirstPluginSlot && !plugins_configured)
+                    type = UNSPEC;
                 if (type == UNSPEC && name != "unspec") {
                     LOG(WARNING) << "Unknown transport type: " << name;
                 }
                 if (type != UNSPEC) {
                     policy.transports.push_back(type);
                 }
+            }
+            if (plugins_configured && policy.transports.empty() &&
+                !policy_json["transports"].empty()) {
+                LOG(ERROR) << "Policy " << policy.name
+                           << " names no loaded transport, so it does not "
+                              "restrict transports; list the plugins it "
+                              "needs in plugins/required to fail instead";
             }
         }
 
@@ -480,11 +494,16 @@ bool TransportSelector::isTransportAvailable(
         !context.same_machine) {
         return false;
     }
+    if (!pluginSlotAllowsRoute(type, context.local_segment,
+                               context.same_machine))
+        return false;
 
     const auto& caps = transport->capabilities();
     if (context.host_staging) {
         return (type == RDMA || type == FABRIC || type == TCP ||
-                type == HP_TCP) &&
+                type == HP_TCP ||
+                pluginSlotHasFlag(type,
+                                  TENT_XPORT_FLAG_HOST_STAGING_CAPABLE)) &&
                caps.dram_to_dram;
     }
 

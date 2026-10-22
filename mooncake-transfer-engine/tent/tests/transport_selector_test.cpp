@@ -296,7 +296,8 @@ TEST(TransportTypeTest, WireValuesRemainStableWithXpuAppended) {
     EXPECT_EQ(static_cast<int>(FABRIC), 16);
     EXPECT_EQ(static_cast<int>(MLU), 17);
     EXPECT_EQ(static_cast<int>(MEMFABRIC), 18);
-    EXPECT_EQ(static_cast<int>(kNumTransportTypes), 19);
+    EXPECT_EQ(static_cast<int>(kNumBuiltinTransportTypes), 19);
+    EXPECT_EQ(static_cast<int>(kNumTransportTypes), 19 + kNumPluginSlots);
 }
 
 // MPComm is appended after UB, so it takes wire value 12. The same integer is

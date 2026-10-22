@@ -233,6 +233,7 @@ add_test(NAME transfer_engine_config_override_test
 add_executable(tent_tcp_transport_test tcp_transport_test.cpp)
 target_link_libraries(tent_tcp_transport_test PRIVATE gtest gtest_main
                                                       tent_link_group)
+target_link_libraries(tent_tcp_transport_test PRIVATE tent_xport_tcp)
 target_include_directories(tent_tcp_transport_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_tcp_transport_test COMMAND tent_tcp_transport_test)
@@ -240,6 +241,7 @@ add_test(NAME tent_tcp_transport_test COMMAND tent_tcp_transport_test)
 add_executable(tent_tcp_regression_test tcp_regression_test.cpp)
 target_link_libraries(tent_tcp_regression_test PRIVATE gtest gtest_main
                                                        tent_link_group)
+target_link_libraries(tent_tcp_regression_test PRIVATE tent_xport_tcp)
 if(TARGET asio_shared)
   target_link_libraries(tent_tcp_regression_test PRIVATE asio_shared)
 endif()
@@ -375,6 +377,7 @@ endif()
 add_executable(tent_endpoint_lifecycle_test endpoint_lifecycle_test.cpp)
 target_link_libraries(tent_endpoint_lifecycle_test PRIVATE gtest gtest_main
                                                            tent_link_group)
+target_link_libraries(tent_endpoint_lifecycle_test PRIVATE tent_xport_rdma)
 target_include_directories(tent_endpoint_lifecycle_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_endpoint_lifecycle_test COMMAND tent_endpoint_lifecycle_test)
@@ -389,6 +392,7 @@ add_test(NAME tent_bootstrap_response_test COMMAND tent_bootstrap_response_test)
 add_executable(tent_endpoint_store_test endpoint_store_test.cpp)
 target_link_libraries(tent_endpoint_store_test PRIVATE gtest gtest_main
                                                        tent_link_group)
+target_link_libraries(tent_endpoint_store_test PRIVATE tent_xport_rdma)
 target_include_directories(tent_endpoint_store_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_endpoint_store_test COMMAND tent_endpoint_store_test)
@@ -396,6 +400,7 @@ add_test(NAME tent_endpoint_store_test COMMAND tent_endpoint_store_test)
 add_executable(tent_device_selector_test device_selector_test.cpp)
 target_link_libraries(tent_device_selector_test PRIVATE gtest gtest_main
                                                         tent_link_group)
+target_link_libraries(tent_device_selector_test PRIVATE tent_xport_rdma)
 target_include_directories(tent_device_selector_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_device_selector_test COMMAND tent_device_selector_test)
@@ -403,6 +408,7 @@ add_test(NAME tent_device_selector_test COMMAND tent_device_selector_test)
 add_executable(tent_rdma_transport_test rdma_transport_test.cpp)
 target_link_libraries(tent_rdma_transport_test PRIVATE gtest gtest_main
                                                        tent_link_group ibverbs)
+target_link_libraries(tent_rdma_transport_test PRIVATE tent_xport_rdma)
 target_include_directories(tent_rdma_transport_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_rdma_transport_test COMMAND tent_rdma_transport_test)
@@ -417,6 +423,8 @@ if(UNIX AND NOT APPLE)
                  rdma_async_event_drain_test.cpp)
   target_link_libraries(tent_rdma_async_event_drain_test
                         PRIVATE gtest gtest_main tent_link_group ibverbs)
+  target_link_libraries(tent_rdma_async_event_drain_test
+                        PRIVATE tent_xport_rdma)
   target_include_directories(tent_rdma_async_event_drain_test
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
   target_link_options(
@@ -502,6 +510,7 @@ add_test(NAME tent_fault_proxy_test COMMAND tent_fault_proxy_test)
 add_executable(tent_rail_monitor_test rail_monitor_test.cpp)
 target_link_libraries(tent_rail_monitor_test PRIVATE gtest gtest_main
                                                      tent_link_group)
+target_link_libraries(tent_rail_monitor_test PRIVATE tent_xport_rdma)
 target_include_directories(tent_rail_monitor_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_rail_monitor_test COMMAND tent_rail_monitor_test)
@@ -511,6 +520,7 @@ add_test(NAME tent_rail_monitor_test COMMAND tent_rail_monitor_test)
 add_executable(tent_quota_accounting_test quota_accounting_test.cpp)
 target_link_libraries(tent_quota_accounting_test PRIVATE gtest gtest_main
                                                          tent_link_group)
+target_link_libraries(tent_quota_accounting_test PRIVATE tent_xport_rdma)
 target_include_directories(tent_quota_accounting_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_quota_accounting_test COMMAND tent_quota_accounting_test)
@@ -531,6 +541,250 @@ target_include_directories(tent_transport_selector_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_transport_selector_test COMMAND tent_transport_selector_test)
 
+# Transport plugins (include/tent/transport_plugin.h). Executables that load
+# plugins export their TENT symbols (ENABLE_EXPORTS), as any plugin host that
+# links TENT statically must.
+add_executable(tent_transport_slots_test transport_slots_test.cpp)
+target_link_libraries(tent_transport_slots_test PRIVATE gtest gtest_main
+                                                        tent_common)
+target_include_directories(tent_transport_slots_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_transport_slots_test COMMAND tent_transport_slots_test)
+
+add_executable(tent_transport_wire_codec_test transport_wire_codec_test.cpp)
+target_link_libraries(tent_transport_wire_codec_test PRIVATE gtest gtest_main
+                                                             tent_link_group)
+target_include_directories(
+  tent_transport_wire_codec_test
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include
+          ${CMAKE_CURRENT_SOURCE_DIR}/../src/runtime)
+add_test(NAME tent_transport_wire_codec_test
+         COMMAND tent_transport_wire_codec_test)
+
+add_test(
+  NAME tent_transport_abi_manifest_test
+  COMMAND
+    ${CMAKE_COMMAND} -DTENT_INCLUDE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/../include
+    -DMANIFEST=${CMAKE_CURRENT_SOURCE_DIR}/transport_abi_manifest.txt -P
+    ${CMAKE_CURRENT_SOURCE_DIR}/check_transport_abi_manifest.cmake)
+
+if(TARGET tent_xport_loopback)
+  set(TENT_TEST_BAD_PLUGIN_DIR ${CMAKE_BINARY_DIR}/tent_plugins_bad)
+  set(TENT_TEST_DUP_PLUGIN_DIR ${CMAKE_BINARY_DIR}/tent_plugins_dup)
+  set(TENT_TEST_PROBE_PLUGIN_DIR ${CMAKE_BINARY_DIR}/tent_plugins_probe)
+  # The tests count the plugins they load, so they take loopback from a
+  # directory of its own: TENT_TRANSPORT_PLUGIN_DIR also holds the TCP and RDMA
+  # plugins when TENT_XPORT_TCP/RDMA builds them.
+  set(TENT_TEST_LOOPBACK_PLUGIN_DIR ${CMAKE_BINARY_DIR}/tent_plugins_loopback)
+  set(TENT_TEST_LOOPBACK_PLUGIN
+      ${TENT_TEST_LOOPBACK_PLUGIN_DIR}/libtent_xport_loopback.so)
+  add_custom_command(
+    OUTPUT ${TENT_TEST_LOOPBACK_PLUGIN}
+    COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:tent_xport_loopback>
+            ${TENT_TEST_LOOPBACK_PLUGIN}
+    DEPENDS tent_xport_loopback)
+  add_custom_target(tent_test_loopback_plugin
+                    DEPENDS ${TENT_TEST_LOOPBACK_PLUGIN})
+
+  # tent_test_plugin(<target> <dir> <file name> <sources>...)
+  function(tent_test_plugin target dir name)
+    add_library(${target} MODULE ${ARGN})
+    target_link_libraries(${target} PRIVATE tent_plugin)
+    set_target_properties(
+      ${target}
+      PROPERTIES PREFIX "lib"
+                 OUTPUT_NAME ${name}
+                 LIBRARY_OUTPUT_DIRECTORY ${dir})
+  endfunction()
+
+  # Broken plugins, <file name>:<BAD_PLUGIN_ variant>; the expected loader
+  # outcome of each is asserted in transport_plugin_registry_test.cpp.
+  set(TENT_TEST_BAD_PLUGINS
+      abi_version:ABI_VERSION
+      newer_struct:NEWER_STRUCT
+      fingerprint:FINGERPRINT
+      missing_entry:MISSING_ENTRY
+      null_create:NULL_CREATE
+      probe_fails:PROBE_FAILS
+      caps_overclaim:CAPS_OVERCLAIM
+      install_fails:INSTALL_FAILS
+      wrongname:WRONG_NAME
+      tcp:CONFLICT_TCP
+      shm:BUILTIN_NAME
+      create_throws:CREATE_THROWS
+      probe_throws:PROBE_THROWS
+      builtin_range:BUILTIN_OUT_OF_RANGE
+      notify_overclaim:NOTIFY_OVERCLAIM
+      cancel_overclaim:CANCEL_OVERCLAIM)
+  set(TENT_TEST_PLUGIN_TARGETS tent_test_loopback_plugin)
+  foreach(entry IN LISTS TENT_TEST_BAD_PLUGINS)
+    string(REPLACE ":" ";" parts ${entry})
+    list(GET parts 0 file)
+    list(GET parts 1 variant)
+    tent_test_plugin(tent_test_bad_plugin_${file} ${TENT_TEST_BAD_PLUGIN_DIR}
+                     tent_xport_${file} plugins/bad_plugins.cpp)
+    target_compile_definitions(tent_test_bad_plugin_${file}
+                               PRIVATE BAD_PLUGIN_${variant})
+    list(APPEND TENT_TEST_PLUGIN_TARGETS tent_test_bad_plugin_${file})
+  endforeach()
+  target_compile_definitions(tent_test_bad_plugin_fingerprint
+                             PRIVATE TENT_TRANSPORT_ABI_FINGERPRINT_OVERRIDE=1)
+  # Not named libtent_xport_*.so: must be ignored.
+  tent_test_plugin(tent_test_not_a_plugin ${TENT_TEST_BAD_PLUGIN_DIR}
+                   notaplugin plugins/bad_plugins.cpp)
+  target_compile_definitions(tent_test_not_a_plugin
+                             PRIVATE BAD_PLUGIN_NOT_A_PLUGIN)
+  # A second loopback in another directory.
+  tent_test_plugin(
+    tent_test_dup_loopback ${TENT_TEST_DUP_PLUGIN_DIR} tent_xport_loopback
+    ../plugins/transport/loopback/loopback_transport.cpp
+    ../plugins/transport/loopback/plugin_entry.cpp)
+  tent_test_plugin(tent_test_addr_probe ${TENT_TEST_PROBE_PLUGIN_DIR}
+                   tent_xport_addr_probe plugins/addr_probe.cpp)
+  list(APPEND TENT_TEST_PLUGIN_TARGETS tent_test_not_a_plugin
+       tent_test_dup_loopback tent_test_addr_probe)
+
+  set(TENT_TEST_PLUGIN_DIR_DEFINITIONS
+      TENT_TEST_PLUGIN_DIR="${TENT_TEST_LOOPBACK_PLUGIN_DIR}"
+      TENT_TEST_BAD_PLUGIN_DIR="${TENT_TEST_BAD_PLUGIN_DIR}"
+      TENT_TEST_DUP_PLUGIN_DIR="${TENT_TEST_DUP_PLUGIN_DIR}"
+      TENT_TEST_PROBE_PLUGIN_DIR="${TENT_TEST_PROBE_PLUGIN_DIR}"
+      TENT_TEST_TCP_PLUGIN_ONLY=$<STREQUAL:${TENT_XPORT_TCP},plugin>
+      TENT_TEST_XPORT_TCP="${TENT_XPORT_TCP}"
+      TENT_TEST_XPORT_RDMA="${TENT_XPORT_RDMA}"
+      TENT_TEST_BUILTIN_PLUGIN_DIR="${TENT_TRANSPORT_PLUGIN_DIR}")
+
+  # The loopback transport claiming the built-in hylink slot, which this core
+  # leaves empty.
+  if(NOT USE_HYLINK)
+    set(TENT_TEST_CLAIM_PLUGIN_DIR ${CMAKE_BINARY_DIR}/tent_plugins_claim)
+    tent_test_plugin(
+      tent_test_claim_hylink ${TENT_TEST_CLAIM_PLUGIN_DIR} tent_xport_hylink
+      plugins/claim_hylink_entry.cpp
+      ../plugins/transport/loopback/loopback_transport.cpp)
+    list(APPEND TENT_TEST_PLUGIN_TARGETS tent_test_claim_hylink)
+    list(APPEND TENT_TEST_PLUGIN_DIR_DEFINITIONS
+         TENT_TEST_CLAIM_PLUGIN_DIR="${TENT_TEST_CLAIM_PLUGIN_DIR}")
+  endif()
+  add_custom_target(tent_test_plugins DEPENDS ${TENT_TEST_PLUGIN_TARGETS})
+
+  # tent_plugin_test(<target> <source> <exports> [definitions...])
+  function(tent_plugin_test target source exports)
+    add_executable(${target} ${source})
+    target_link_libraries(${target} PRIVATE gtest gtest_main tent_link_group)
+    target_include_directories(
+      ${target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include
+                        ${CMAKE_CURRENT_SOURCE_DIR}/../src/runtime)
+    target_compile_definitions(
+      ${target} PRIVATE ${TENT_TEST_PLUGIN_DIR_DEFINITIONS} ${ARGN})
+    set_target_properties(${target} PROPERTIES ENABLE_EXPORTS ${exports})
+    add_dependencies(${target} tent_test_plugins)
+    add_test(NAME ${target} COMMAND ${target})
+  endfunction()
+
+  tent_plugin_test(tent_transport_plugin_registry_test
+                   transport_plugin_registry_test.cpp ON)
+  tent_plugin_test(tent_transport_plugin_engine_test
+                   transport_plugin_engine_test.cpp ON)
+  tent_plugin_test(tent_transport_plugin_noop_test
+                   transport_plugin_noop_test.cpp ON)
+  tent_plugin_test(tent_transport_plugin_adversarial_test
+                   transport_plugin_adversarial_test.cpp ON)
+  tent_plugin_test(tent_transport_plugin_host_test
+                   transport_plugin_host_test.cpp ON TENT_TEST_HOST_EXPORTS=1)
+  tent_plugin_test(tent_transport_plugin_nohost_test
+                   transport_plugin_host_test.cpp OFF TENT_TEST_HOST_EXPORTS=0)
+
+  # A host that uses TENT only through libtent_shared.so.
+  add_executable(tent_plugin_host_shared_app plugin_host_shared_app.cpp)
+  target_link_libraries(tent_plugin_host_shared_app PRIVATE tent_shared)
+  add_dependencies(tent_plugin_host_shared_app tent_test_plugins)
+  add_test(NAME tent_plugin_host_shared_app
+           COMMAND tent_plugin_host_shared_app ${TENT_TEST_LOOPBACK_PLUGIN_DIR}
+                   ${TENT_TEST_PROBE_PLUGIN_DIR})
+  # The same with the plugin directory named relative to libtent_shared.so,
+  # through runtime/, which only the library's build directory has (not the
+  # executable's directory); once with the library found through its RUNPATH
+  # entry and once through a relative path. The second needs the library in its
+  # build directory.
+  get_target_property(tent_shared_output tent_shared LIBRARY_OUTPUT_DIRECTORY)
+  if(NOT tent_shared_output)
+    get_target_property(tent_shared_dir tent_shared BINARY_DIR)
+    file(RELATIVE_PATH tent_loopback_from_core ${tent_shared_dir}/runtime
+         ${TENT_TEST_LOOPBACK_PLUGIN_DIR})
+    foreach(test origin origin_relative_core)
+      add_test(
+        NAME tent_plugin_host_shared_app_${test}
+        COMMAND
+          tent_plugin_host_shared_app ${TENT_TEST_LOOPBACK_PLUGIN_DIR}
+          ${TENT_TEST_PROBE_PLUGIN_DIR}
+          "$ORIGIN/runtime/${tent_loopback_from_core}")
+    endforeach()
+    set_tests_properties(
+      tent_plugin_host_shared_app_origin_relative_core
+      PROPERTIES WORKING_DIRECTORY ${tent_shared_dir} ENVIRONMENT
+                 "LD_LIBRARY_PATH=.")
+  endif()
+
+  # The plugin SDK: the example, copied out of the source tree, builds the
+  # loopback sample from the SDK of this build (installed into the build tree)
+  # and is loaded by the host above.
+  set(tent_sdk_example ${CMAKE_CURRENT_SOURCE_DIR}/../examples/tent-plugin-sdk)
+  if(yalantinglibs_BINARY_DIR)
+    add_test(
+      NAME tent_plugin_sdk_example_build
+      COMMAND
+        ${CMAKE_COMMAND} -DBUILD_DIR=${CMAKE_BINARY_DIR}
+        -DYLT_BUILD_DIR=${yalantinglibs_BINARY_DIR}
+        -DEXAMPLE=${tent_sdk_example} -DWORK=${CMAKE_CURRENT_BINARY_DIR}/sdk
+        "-DGENERATOR=${CMAKE_GENERATOR}" -DMAKE_PROGRAM=${CMAKE_MAKE_PROGRAM}
+        -DCXX=${CMAKE_CXX_COMPILER}
+        -DHOST=$<TARGET_FILE:tent_plugin_host_shared_app>
+        -DPROBE_DIR=${TENT_TEST_PROBE_PLUGIN_DIR} -P
+        ${CMAKE_CURRENT_SOURCE_DIR}/../plugins/sdk/check_sdk_example.cmake)
+    set_tests_properties(tent_plugin_sdk_example_build PROPERTIES TIMEOUT 600)
+  endif()
+
+  # A second TENT core in the same process: a module that links TENT statically
+  # and binds to its own copy (-Bsymbolic). It must refuse plugins, whichever
+  # core loads plugins first.
+  add_library(tent_test_second_core MODULE plugins/second_core.cpp)
+  target_link_libraries(tent_test_second_core PRIVATE tent_link_group)
+  target_include_directories(
+    tent_test_second_core PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include
+                                  ${CMAKE_CURRENT_SOURCE_DIR}/../src/runtime)
+  target_link_options(tent_test_second_core PRIVATE -Wl,-Bsymbolic)
+  add_executable(tent_plugin_two_cores_app plugin_two_cores_app.cpp)
+  target_link_libraries(tent_plugin_two_cores_app PRIVATE tent_shared
+                                                          ${CMAKE_DL_LIBS})
+  add_dependencies(tent_plugin_two_cores_app tent_test_plugins
+                   tent_test_second_core)
+  foreach(order shared_first second_first)
+    add_test(NAME tent_plugin_two_cores_${order}
+             COMMAND tent_plugin_two_cores_app ${TENT_TEST_LOOPBACK_PLUGIN_DIR}
+                     $<TARGET_FILE:tent_test_second_core> ${order})
+  endforeach()
+
+  # Two cores that are both loaded RTLD_LOCAL (like two Python extensions): the
+  # first to load plugins is promoted and wins, the other is refused.
+  add_library(tent_test_second_core_b MODULE plugins/second_core.cpp)
+  target_link_libraries(tent_test_second_core_b PRIVATE tent_link_group)
+  target_include_directories(
+    tent_test_second_core_b PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include
+                                    ${CMAKE_CURRENT_SOURCE_DIR}/../src/runtime)
+  target_link_options(tent_test_second_core_b PRIVATE -Wl,-Bsymbolic)
+  add_executable(tent_plugin_local_cores_app plugin_local_cores_app.cpp)
+  target_link_libraries(tent_plugin_local_cores_app PRIVATE ${CMAKE_DL_LIBS})
+  add_dependencies(tent_plugin_local_cores_app tent_test_plugins
+                   tent_test_second_core tent_test_second_core_b)
+  add_test(
+    NAME tent_plugin_local_cores
+    COMMAND
+      tent_plugin_local_cores_app ${TENT_TEST_LOOPBACK_PLUGIN_DIR}
+      $<TARGET_FILE:tent_test_second_core>
+      $<TARGET_FILE:tent_test_second_core_b>)
+endif()
+
 add_executable(tent_topology_priority_matrix_test
                topology_priority_matrix_test.cpp)
 target_link_libraries(tent_topology_priority_matrix_test
@@ -543,6 +797,7 @@ add_test(NAME tent_topology_priority_matrix_test
 add_executable(tent_strict_local_numa_test strict_local_numa_test.cpp)
 target_link_libraries(tent_strict_local_numa_test PRIVATE gtest gtest_main
                                                           tent_link_group)
+target_link_libraries(tent_strict_local_numa_test PRIVATE tent_xport_rdma)
 target_include_directories(tent_strict_local_numa_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_strict_local_numa_test COMMAND tent_strict_local_numa_test)
@@ -700,6 +955,24 @@ target_include_directories(tent_local_memory_lifecycle_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_local_memory_lifecycle_test
          COMMAND tent_local_memory_lifecycle_test)
+
+# A core built with TENT_XPORT_TCP=plugin has no TCP of its own. The tests below
+# need TCP inside their engines, so they load it from TENT_TRANSPORT_PLUGIN_DIR.
+# The TCP round trip skips when its server cannot start, which in such a core
+# usually means the plugin did not load: fail instead.
+if(TENT_XPORT_TCP STREQUAL "plugin")
+  set(tent_tcp_datapath_tests
+      tent_tcp_datapath_roundtrip_test_single_threaded
+      tent_tcp_datapath_roundtrip_test_multi_threaded_rpc)
+  set_property(
+    TEST local_notification_test tent_local_memory_lifecycle_test
+         transfer_engine_config_override_test ${tent_tcp_datapath_tests}
+    APPEND
+    PROPERTY ENVIRONMENT "MC_TENT_PLUGIN_DIR=${TENT_TRANSPORT_PLUGIN_DIR}")
+  set_property(
+    TEST ${tent_tcp_datapath_tests} PROPERTY FAIL_REGULAR_EXPRESSION
+                                             "TCP server initialization failed")
+endif()
 
 # Causal chain stage decomposition: validates that dispatch_time and post_time
 # timestamps are populated on both queue and direct-commit paths.

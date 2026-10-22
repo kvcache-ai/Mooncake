@@ -55,6 +55,7 @@ set(TENT_FEATURE_SUNRISE ${USE_SUNRISE})
 set(TENT_FEATURE_TPU ${USE_TPU})
 
 add_subdirectory(src)
+add_subdirectory(include/tent)
 add_subdirectory(plugins)
 add_subdirectory(cli)
 if(BUILD_UNIT_TESTS)

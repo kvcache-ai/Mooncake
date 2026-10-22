@@ -40,7 +40,7 @@ foreach(
   tent_xport_hylink
   tent_xport_fabric
   tent_xport_memfabric)
-  if(TARGET ${tgt})
+  if(TARGET ${tgt} AND NOT tgt IN_LIST TENT_XPORT_PLUGIN_ONLY_TARGETS)
     target_link_libraries(tent_transport_all INTERFACE ${tgt})
   endif()
 endforeach()

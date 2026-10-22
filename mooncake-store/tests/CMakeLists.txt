@@ -278,6 +278,16 @@ if(USE_TENT)
   set_tests_properties(standalone_client_tent_test
                        PROPERTIES ENVIRONMENT "MC_USE_TENT=1;MC_FORCE_TCP=1")
 endif()
+# In a TENT_XPORT_TCP=plugin build the core has no TCP; the four TENT tests
+# above get it from the plugin directory. This block must follow their
+# set_tests_properties() calls, which replace ENVIRONMENT.
+if(USE_TENT AND TENT_XPORT_TCP STREQUAL "plugin")
+  set_property(
+    TEST transfer_task_tent_completion_test transfer_scatter_tent_test
+         transfer_submitter_scatter_tent_test standalone_client_tent_test
+    APPEND
+    PROPERTY ENVIRONMENT "MC_TENT_PLUGIN_DIR=${TENT_TRANSPORT_PLUGIN_DIR}")
+endif()
 if(USE_CUDA)
   target_compile_definitions(pybind_client_test PRIVATE MOONCAKE_TEST_CUDA_H2D)
   target_link_libraries(pybind_client_test PRIVATE CUDA::cudart)
