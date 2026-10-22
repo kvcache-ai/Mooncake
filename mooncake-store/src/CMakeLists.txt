@@ -30,6 +30,9 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     segment_allocator_registration.cpp
     client_offboarding.cpp
     dynamic_replication_controller.cpp
+    eviction/evictor.cpp
+    eviction/offloading_reclaimer.cpp
+    eviction/report_observers.cpp
     master_service.cpp
     promotion_candidate_tracker.cpp
     master_store_backend.cpp
