@@ -1248,12 +1248,12 @@ def context_rows(root, logs):
 def collect_context(root, logs):
     """Keep literal ID evidence; explicit pairs never merge different request IDs."""
     limit = 128
-    priority, errors = {}, {}
+    priority, errors = set(), {}
     for parsed, ref, ids in context_rows(root, logs):
         if ref["error"]:
             for identity in sorted(ids):
                 if len(priority) < limit:
-                    priority.setdefault(identity, None)
+                    priority.add(identity)
             site = (ref["file"], parsed.file, parsed.line)
             if len(errors) < 12:
                 errors.setdefault(site, ref)
@@ -1268,7 +1268,7 @@ def collect_context(root, logs):
             ):
                 for identity in sorted(ids):
                     if len(priority) < limit:
-                        priority.setdefault(identity, None)
+                        priority.add(identity)
     groups = {identity: {} for identity in priority}
     links, omitted = {}, 0
     for parsed, ref, ids in context_rows(root, logs):
@@ -1290,7 +1290,7 @@ def collect_context(root, logs):
             and len(requests) == len(transfers) == 1
         ):
             pair = (requests[0], transfers[0])
-            if ids & set(priority) and len(links) < 16:
+            if ids & priority and len(links) < 16:
                 links.setdefault(pair, ref)
     ordered = sorted(groups, key=lambda identity: (identity not in priority, identity))
     return {
