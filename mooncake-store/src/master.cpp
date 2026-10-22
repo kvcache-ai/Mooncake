@@ -45,7 +45,8 @@ static_assert(mooncake::DEFAULT_DEFAULT_KV_LEASE_TTL == 10000,
 static_assert(mooncake::DEFAULT_KV_SOFT_PIN_TTL_MS == 30 * 60 * 1000,
               "Update kDefaultKvSoftPinTtlFlagValue when "
               "DEFAULT_KV_SOFT_PIN_TTL_MS changes");
-static_assert(mooncake::DEFAULT_MAX_KV_SOFT_PIN_TTL_MS == 7 * 24 * 60 * 60 * 1000,
+static_assert(mooncake::DEFAULT_MAX_KV_SOFT_PIN_TTL_MS ==
+                  7 * 24 * 60 * 60 * 1000,
               "Update kDefaultMaxKvSoftPinTtlFlagValue when "
               "DEFAULT_MAX_KV_SOFT_PIN_TTL_MS changes");
 

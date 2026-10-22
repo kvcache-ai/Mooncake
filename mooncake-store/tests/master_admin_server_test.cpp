@@ -1047,8 +1047,8 @@ TEST_F(MasterAdminServerWithServiceTest, StandaloneSoftPinHttp) {
 
 TEST_F(MasterAdminServerWithServiceTest,
        SoftPinRejectsTrailingContentWithoutChangingState) {
-    const auto pin = std::string("{\"keys\":[\"") + kDefaultKey +
-                     "\"],\"ttl_ms\":60000}";
+    const auto pin =
+        std::string("{\"keys\":[\"") + kDefaultKey + "\"],\"ttl_ms\":60000}";
     const auto unpin = std::string("{\"keys\":[\"") + kDefaultKey + "\"]}";
     ASSERT_EQ(HttpPostJson("/api/v1/soft_unpin", unpin).http_status, 200);
     const auto baseline =
@@ -1066,8 +1066,9 @@ TEST_F(MasterAdminServerWithServiceTest,
     ASSERT_EQ(MasterMetricManager::instance().get_soft_pin_key_count(),
               baseline + 1);
     for (const auto& suffix : suffixes) {
-        EXPECT_EQ(HttpPostJson("/api/v1/soft_unpin", unpin + suffix).http_status,
-                  400);
+        EXPECT_EQ(
+            HttpPostJson("/api/v1/soft_unpin", unpin + suffix).http_status,
+            400);
         EXPECT_EQ(MasterMetricManager::instance().get_soft_pin_key_count(),
                   baseline + 1);
     }
