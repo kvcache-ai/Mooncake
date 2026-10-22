@@ -377,6 +377,22 @@ MasterMetricManager::MasterMetricManager()
                              "Total number of keys evicted in nof"),
       nof_evicted_size_("master_evicted_size_bytes_nof",
                         "Total bytes of evicted objects in nof"),
+      // Eviction timing. Buckets run to two minutes: a cycle over a large
+      // keyspace is dominated by its scan and can take tens of seconds.
+      evict_cycle_duration_ms_(
+          "master_evict_cycle_duration_ms",
+          "Duration of a memory BatchEvict cycle in milliseconds",
+          {1, 5, 10, 25, 50, 100, 250, 500, 1000, 5000, 30000, 120000}),
+      evict_scan_duration_ms_(
+          "master_evict_scan_duration_ms",
+          "Duration of the Phase-1 parallel candidate scan of a memory "
+          "BatchEvict cycle in milliseconds",
+          {1, 5, 10, 25, 50, 100, 250, 500, 1000, 5000, 30000, 120000}),
+      evict_reclaim_duration_ms_(
+          "master_evict_reclaim_duration_ms",
+          "Duration of the Phase-2 serial eviction of a memory BatchEvict "
+          "cycle in milliseconds",
+          {1, 5, 10, 25, 50, 100, 250, 500, 1000, 5000, 30000, 120000}),
 
       // Initialize Discarded Replicas Counters
       put_start_discard_cnt_("master_put_start_discard_cnt",
@@ -714,6 +730,9 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     value_size_distribution_.observe(0);
     client_offboarding_duration_ms_.observe(0);
     nof_heartbeat_probe_latency_ms_.observe(0);
+    evict_cycle_duration_ms_.observe(0);
+    evict_scan_duration_ms_.observe(0);
+    evict_reclaim_duration_ms_.observe(0);
 
     // Note: dynamic_gauge_1t (mem_allocated_size_per_segment_ and
     // mem_total_capacity_per_segment_) are not initialized here because they
@@ -1743,6 +1762,19 @@ void MasterMetricManager::inc_nof_eviction_fail() {
     nof_eviction_attempts_.inc();
 }
 
+void MasterMetricManager::observe_evict_cycle_duration_ms(int64_t duration_ms) {
+    evict_cycle_duration_ms_.observe(duration_ms);
+}
+
+void MasterMetricManager::observe_evict_scan_duration_ms(int64_t duration_ms) {
+    evict_scan_duration_ms_.observe(duration_ms);
+}
+
+void MasterMetricManager::observe_evict_reclaim_duration_ms(
+    int64_t duration_ms) {
+    evict_reclaim_duration_ms_.observe(duration_ms);
+}
+
 int64_t MasterMetricManager::get_eviction_success() {
     return eviction_success_.value();
 }
@@ -2054,6 +2086,9 @@ std::string MasterMetricManager::serialize_metrics() {
     // Serialize Histogram
     serialize_metric(value_size_distribution_);
     serialize_metric(client_offboarding_duration_ms_);
+    serialize_metric(evict_cycle_duration_ms_);
+    serialize_metric(evict_scan_duration_ms_);
+    serialize_metric(evict_reclaim_duration_ms_);
 
     serialize_metric(client_liveness_suspected_transitions_);
     serialize_metric(client_liveness_recoveries_);

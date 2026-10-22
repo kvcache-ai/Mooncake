@@ -306,6 +306,16 @@ class MasterMetricManager {
     void inc_nof_eviction_success(int64_t key_count, int64_t size);
     void inc_nof_eviction_fail();  // not a single object is evicted
 
+    // Eviction timing (memory BatchEvict). The cycle is the whole pass; scan
+    // is its Phase-1 parallel candidate census, which grows with the keyspace,
+    // and reclaim is its Phase-2 serial eviction, which grows with how many
+    // objects are freed and how expensive each one is (oplog, offload queue).
+    // The part of the cycle the two do not cover is the frontier
+    // materialization between them plus the shard shrink afterwards.
+    void observe_evict_cycle_duration_ms(int64_t duration_ms);
+    void observe_evict_scan_duration_ms(int64_t duration_ms);
+    void observe_evict_reclaim_duration_ms(int64_t duration_ms);
+
     // Eviction Metrics Getters
     // total eviction metrics
     int64_t get_eviction_success();
@@ -746,6 +756,10 @@ class MasterMetricManager {
     ylt::metric::counter_t nof_eviction_attempts_;
     ylt::metric::counter_t nof_evicted_key_count_;
     ylt::metric::counter_t nof_evicted_size_;
+    // eviction timing
+    ylt::metric::histogram_t evict_cycle_duration_ms_;
+    ylt::metric::histogram_t evict_scan_duration_ms_;
+    ylt::metric::histogram_t evict_reclaim_duration_ms_;
 
     // PutStart Discard Metrics
     ylt::metric::counter_t put_start_discard_cnt_;
