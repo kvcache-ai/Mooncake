@@ -14,6 +14,8 @@
 
 #include "memory_location.h"
 
+#include <fcntl.h>
+#include <sys/ioctl.h>
 #include <unistd.h>
 
 #include <cctype>
@@ -24,7 +26,52 @@
 
 namespace mooncake {
 
+namespace {
+
+// struct procmap_query and PROCMAP_QUERY (Linux 6.11) from <linux/fs.h>,
+// spelled out so the build does not depend on the installed kernel headers.
+struct ProcmapQuery {
+    uint64_t size;
+    uint64_t query_flags;
+    uint64_t query_addr;
+    uint64_t vma_start;
+    uint64_t vma_end;
+    uint64_t vma_flags;
+    uint64_t vma_page_size;
+    uint64_t vma_offset;
+    uint64_t inode;
+    uint32_t dev_major;
+    uint32_t dev_minor;
+    uint32_t vma_name_size;
+    uint32_t build_id_size;
+    uint64_t vma_name_addr;
+    uint64_t build_id_addr;
+};
+static_assert(sizeof(ProcmapQuery) == 104, "must match struct procmap_query");
+constexpr unsigned long kProcmapQuery = _IOWR('f', 17, ProcmapQuery);
+
+// Ask the kernel for the page size of the VMA containing addr. Returns 0 if
+// PROCMAP_QUERY is not supported or addr is not mapped.
+size_t queryVmaPageSize(void *addr) {
+    int fd = open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 0;
+    ProcmapQuery query = {};
+    query.size = sizeof(query);
+    query.query_addr = reinterpret_cast<uintptr_t>(addr);
+    int rc = ioctl(fd, kProcmapQuery, &query);
+    close(fd);
+    return rc == 0 ? query.vma_page_size : 0;
+}
+
+}  // namespace
+
 size_t detectBufferPageSize(void *addr) {
+    // Reading smaps walks the page tables of every mapping up to and
+    // including addr's, which takes hundreds of milliseconds once several GB
+    // are resident. PROCMAP_QUERY looks up the one VMA instead.
+    const size_t queried = queryVmaPageSize(addr);
+    if (queried > 0) return queried;
+
     const size_t fallback = static_cast<size_t>(sysconf(_SC_PAGESIZE));
     std::ifstream smaps("/proc/self/smaps");
     if (!smaps.is_open()) return fallback;
