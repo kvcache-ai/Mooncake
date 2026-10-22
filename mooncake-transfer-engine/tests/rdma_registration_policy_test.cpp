@@ -87,6 +87,7 @@ class RdmaRegistrationPolicyTest : public ::testing::TestWithParam<bool> {
         fail_call = 0;
         old_limit_ = globalConfig().max_mr_size;
         old_parallel_ = globalConfig().parallel_reg_mr;
+        old_selection_ = globalConfig().rdma_nic_selection;
         globalConfig().max_mr_size = kPageSize;
         globalConfig().parallel_reg_mr = 0;
         for (int i = 0; i < 2; ++i) {
@@ -107,11 +108,12 @@ class RdmaRegistrationPolicyTest : public ::testing::TestWithParam<bool> {
         for (void *addr : buffers_) munmap(addr, 2 * kPageSize);
         globalConfig().max_mr_size = old_limit_;
         globalConfig().parallel_reg_mr = old_parallel_;
+        globalConfig().rdma_nic_selection = old_selection_;
     }
 
     // Builds a transport with one context per HCA of `topology`, in HCA index
     // order as initializeRdmaResources() does, which builds the local NIC map
-    // only under MC_RDMA_NIC_SELECTION=local.
+    // only when `selection` is LOCAL.
     void install(NicSelection selection,
                  const std::string &topology = kTopology) {
         topology_ = std::make_shared<Topology>();
@@ -127,9 +129,9 @@ class RdmaRegistrationPolicyTest : public ::testing::TestWithParam<bool> {
                                              std::move(desc)),
                   0);
         if (GetParam())
-            transport_ = std::make_unique<RdmaTwoSidedTransport>();
+            transport_ = std::make_unique<RdmaTwoSidedTransport>(selection);
         else
-            transport_ = std::make_unique<RdmaTransport>();
+            transport_ = std::make_unique<RdmaTransport>(selection);
         RdmaTransportTestPeer::bindMetadata(*transport_, metadata_,
                                             "registration-policy-test");
         RdmaTransportTestPeer::bindTopology(*transport_, topology_);
@@ -139,8 +141,7 @@ class RdmaRegistrationPolicyTest : public ::testing::TestWithParam<bool> {
             RdmaContextTestPeer::bindProtectionDomain(*context, &domains[i++]);
             RdmaTransportTestPeer::addContext(*transport_, context);
         }
-        if (selection == NicSelection::LOCAL)
-            RdmaTransportTestPeer::initializeLocalNicMap(*transport_);
+        RdmaTransportTestPeer::initializeLocalNicMap(*transport_);
     }
 
     int reg(size_t buffer, const std::string &location,
@@ -184,6 +185,7 @@ class RdmaRegistrationPolicyTest : public ::testing::TestWithParam<bool> {
     std::shared_ptr<Topology> topology_;
     uint64_t old_limit_ = 0;
     int old_parallel_ = 0;
+    NicSelection old_selection_ = NicSelection::ALL;
 };
 
 TEST_P(RdmaRegistrationPolicyTest, AllRegistersGpuBufferOnEveryHca) {
@@ -199,6 +201,16 @@ TEST_P(RdmaRegistrationPolicyTest, LocalRegistersGpuBufferOnPreferredHcas) {
     EXPECT_EQ(calls, 1);
     EXPECT_EQ(desc()->buffers[0].name, "cuda:0");
     expectKeyedOn({"nic0"});
+}
+
+// The selection passed at construction wins over MC_RDMA_NIC_SELECTION, so
+// engines in one process can differ. The LOCAL tests cover the other direction.
+TEST_P(RdmaRegistrationPolicyTest, ExplicitAllOverridesGlobalLocal) {
+    globalConfig().rdma_nic_selection = NicSelection::LOCAL;
+    install(NicSelection::ALL);
+    ASSERT_EQ(reg(0, "cuda:0"), 0);
+    EXPECT_EQ(calls, 3);
+    expectKeyedOn({"nic0", "nic1", "nic2"});
 }
 
 TEST_P(RdmaRegistrationPolicyTest, LocalKeepsWildcardHostBufferOnEveryHca) {

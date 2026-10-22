@@ -41,6 +41,7 @@ class RdmaTwoSidedTransport : public RdmaTransport {
     using HandShakeDesc = TransferMetadata::HandShakeDesc;
 
     RdmaTwoSidedTransport();
+    explicit RdmaTwoSidedTransport(NicSelection nic_selection);
     ~RdmaTwoSidedTransport() override;
 
     int install(std::string &local_server_name,

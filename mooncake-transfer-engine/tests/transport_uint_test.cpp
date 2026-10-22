@@ -106,6 +106,16 @@ class TransferEngineImplTestPeer {
         return engine.auto_discover_config_;
     }
 
+    static std::optional<bool> topologyLocalRegistration(
+        const TransferEngineImpl& engine) {
+        return engine.topology_local_registration_;
+    }
+
+    static std::optional<bool> installedTopologyLocalRegistration(
+        const TransferEngineImpl& engine) {
+        return engine.multi_transports_->topology_local_registration_;
+    }
+
     static std::string autoDiscoverTransport(const TransferEngineImpl& engine) {
         return engine.autoDiscoverTransport();
     }
@@ -246,6 +256,17 @@ TEST(TransferEngineTentCompatibilityTest,
               (std::vector<std::string>{"mlx5_1"}));
 }
 
+// TENT has no classic implementation; the override must only warn.
+TEST(TransferEngineTentCompatibilityTest, TopologyLocalRegistrationIsIgnored) {
+    ScopedEnvVar use_tent("MC_USE_TENT", "1");
+    TransferEngine engine(/*auto_discover=*/true);
+    engine.setTopologyLocalRegistration(true);
+
+    EXPECT_NE(TransferEngineImplTestPeer::buildTentConfig(engine, P2PHANDSHAKE,
+                                                          "local-segment"),
+              nullptr);
+}
+
 TEST(TransferEngineTentCompatibilityTest,
      DeviceFilterSurvivesMoveConstructionAndAssignment) {
     ScopedEnvVar use_tent("MC_USE_TENT", "1");
@@ -344,6 +365,22 @@ TEST(TransferEngineAutoDiscoverTest, BoolSetterPreservesDefaultSelection) {
     EXPECT_TRUE(config.protocol.empty());
     EXPECT_EQ(TransferEngineImplTestPeer::autoDiscoverTransport(engine),
               "rdma");
+}
+
+// The value set before init() reaches MultiTransport, which constructs the
+// transports; later calls cannot change what is already installed.
+TEST(TransferEngineTopologyLocalRegistrationTest, IsFixedAtInit) {
+    TransferEngineImpl engine(false);
+    engine.setTopologyLocalRegistration(false);
+    engine.setTopologyLocalRegistration(true);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:12345"), 0);
+    EXPECT_EQ(
+        TransferEngineImplTestPeer::installedTopologyLocalRegistration(engine),
+        std::optional<bool>(true));
+
+    engine.setTopologyLocalRegistration(false);
+    EXPECT_EQ(TransferEngineImplTestPeer::topologyLocalRegistration(engine),
+              std::optional<bool>(true));
 }
 
 TEST(TransferEngineAscendTransportTest, AscendHintsSelectAscendTransport) {

@@ -29,6 +29,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "config.h"
 #include "topology.h"
 #include "transfer_metadata.h"
 #include "transport/transport.h"
@@ -55,6 +56,7 @@ class RdmaTransport : public Transport {
 
    public:
     RdmaTransport();
+    explicit RdmaTransport(NicSelection nic_selection);
 
     ~RdmaTransport();
 
@@ -158,11 +160,12 @@ class RdmaTransport : public Transport {
     }
 
    private:
+    const NicSelection nic_selection_;
     std::vector<std::shared_ptr<RdmaContext>> context_list_;
     std::atomic<bool> notify_running_{false};
     std::thread notify_worker_;
     std::shared_ptr<Topology> local_topology_;
-    // Location -> preferred context indices under MC_RDMA_NIC_SELECTION=local;
+    // Location -> preferred context indices when nic_selection_ is LOCAL;
     // empty otherwise. Const after initializeRdmaResources(), so registration
     // reads it without a lock.
     std::unordered_map<std::string, std::vector<size_t>> local_nic_map_;

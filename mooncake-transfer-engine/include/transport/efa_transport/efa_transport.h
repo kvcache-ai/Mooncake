@@ -28,6 +28,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "config.h"
 #include "topology.h"
 #include "transfer_metadata.h"
 #include "transport/transport.h"
@@ -49,6 +50,7 @@ class EfaTransport : public Transport {
 
    public:
     EfaTransport();
+    explicit EfaTransport(NicSelection nic_selection);
 
     ~EfaTransport();
 
@@ -166,13 +168,14 @@ class EfaTransport : public Transport {
     void workerThreadFunc(int thread_id);
 
    private:
+    const NicSelection nic_selection_;
     std::vector<std::shared_ptr<EfaContext>> context_list_;
     std::shared_ptr<Topology> local_topology_;
 
     // Memory location -> context_list_ indices of the topology-local NICs,
-    // built once in initializeEfaResources(). Only read when
-    // MC_EFA_NIC_SELECTION=local; empty otherwise. Const after install(), so no
-    // lock is needed on the registration path.
+    // built once in initializeEfaResources(). Only read when nic_selection_ is
+    // LOCAL; empty otherwise. Const after install(), so no lock is needed on
+    // the registration path.
     std::unordered_map<std::string, std::vector<size_t>> local_nic_map_;
 
     // Track chunked MR registrations for per-NIC partitioned buffers.

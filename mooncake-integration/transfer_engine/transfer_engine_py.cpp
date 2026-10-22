@@ -369,20 +369,20 @@ std::string buildConnString(const std::string& metadata_type,
     return conn_string;
 }
 
-int TransferEnginePy::initialize(const char* local_hostname,
-                                 const char* metadata_server,
-                                 const char* protocol,
-                                 const char* device_name) {
+int TransferEnginePy::initialize(
+    const char* local_hostname, const char* metadata_server,
+    const char* protocol, const char* device_name,
+    std::optional<bool> topology_local_registration) {
     auto conn_string = parseConnectionString(metadata_server);
     return initializeExt(local_hostname, conn_string.second.c_str(), protocol,
-                         device_name, conn_string.first.c_str());
+                         device_name, conn_string.first.c_str(),
+                         topology_local_registration);
 }
 
-int TransferEnginePy::initializeExt(const char* local_hostname,
-                                    const char* metadata_server,
-                                    const char* protocol,
-                                    const char* device_name,
-                                    const char* metadata_type) {
+int TransferEnginePy::initializeExt(
+    const char* local_hostname, const char* metadata_server,
+    const char* protocol, const char* device_name, const char* metadata_type,
+    std::optional<bool> topology_local_registration) {
     if (protocol != nullptr && strcmp(protocol, "xgmi") == 0) {
         LOG(ERROR) << "Protocol 'xgmi' is not exposed in the Python API. "
                    << "Use 'hip' instead.";
@@ -424,6 +424,9 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
 #else
     engine_ = std::make_unique<TransferEngine>(!use_flagcx, device_filter);
 #endif
+
+    if (topology_local_registration)
+        engine_->setTopologyLocalRegistration(*topology_local_registration);
 
     if (getenv("MC_LEGACY_RPC_PORT_BINDING")) {
         auto hostname_port = parseHostNameWithPort(local_hostname);
@@ -1844,8 +1847,15 @@ PYBIND11_MODULE(engine, m) {
     auto adaptor_cls =
         py::class_<TransferEnginePy>(m, "TransferEngine")
             .def(py::init<>())
-            .def("initialize", &TransferEnginePy::initialize)
-            .def("initialize_ext", &TransferEnginePy::initializeExt)
+            .def("initialize", &TransferEnginePy::initialize,
+                 py::arg("local_hostname"), py::arg("metadata_server"),
+                 py::arg("protocol"), py::arg("device_name"),
+                 py::arg("topology_local_registration") = py::none())
+            .def("initialize_ext", &TransferEnginePy::initializeExt,
+                 py::arg("local_hostname"), py::arg("metadata_server"),
+                 py::arg("protocol"), py::arg("device_name"),
+                 py::arg("metadata_type"),
+                 py::arg("topology_local_registration") = py::none())
             .def("get_rpc_port", &TransferEnginePy::getRpcPort)
             .def("allocate_managed_buffer",
                  &TransferEnginePy::allocateManagedBuffer)

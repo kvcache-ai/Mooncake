@@ -169,7 +169,11 @@ bool has_ibv_reg_mr_iova2(void) {
     return sym != NULL;
 }
 
-RdmaTransport::RdmaTransport() {
+RdmaTransport::RdmaTransport()
+    : RdmaTransport(globalConfig().rdma_nic_selection) {}
+
+RdmaTransport::RdmaTransport(NicSelection nic_selection)
+    : nic_selection_(nic_selection) {
     MCIbRelaxedOrderingMode = getIbRelaxedOrderingMode();
     if (MCIbRelaxedOrderingMode == 0) {
         LOG(INFO) << "[RDMA] Relaxed ordering disabled via "
@@ -1515,7 +1519,7 @@ int RdmaTransport::initializeRdmaResources() {
         return ERR_DEVICE_NOT_FOUND;
     }
 
-    if (globalConfig().rdma_nic_selection == NicSelection::LOCAL) {
+    if (nic_selection_ == NicSelection::LOCAL) {
         std::vector<std::string> context_names;
         context_names.reserve(context_list_.size());
         for (auto &context : context_list_)
@@ -1532,7 +1536,7 @@ int RdmaTransport::initializeRdmaResources() {
                       << ": [" << nic_list << "]";
         }
         if (local_nic_map_.empty()) {
-            LOG(WARNING) << "RdmaTransport: MC_RDMA_NIC_SELECTION=local but "
+            LOG(WARNING) << "RdmaTransport: local NIC selection is enabled but "
                             "the topology reports no per-location preferred "
                             "NICs; every buffer will use all NICs as before";
         }

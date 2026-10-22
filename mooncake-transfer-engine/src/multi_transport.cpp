@@ -90,8 +90,11 @@
 
 namespace mooncake {
 MultiTransport::MultiTransport(std::shared_ptr<TransferMetadata> metadata,
-                               std::string& local_server_name)
-    : metadata_(metadata), local_server_name_(local_server_name) {}
+                               std::string& local_server_name,
+                               std::optional<bool> topology_local_registration)
+    : metadata_(metadata),
+      local_server_name_(local_server_name),
+      topology_local_registration_(topology_local_registration) {}
 
 MultiTransport::~MultiTransport() {
     {
@@ -575,6 +578,11 @@ Transport* MultiTransport::installTransport(const std::string& proto,
     }
 #endif
     Transport* transport = nullptr;
+    auto nic_selection = [&](NicSelection env_selection) {
+        if (!topology_local_registration_) return env_selection;
+        return *topology_local_registration_ ? NicSelection::LOCAL
+                                             : NicSelection::ALL;
+    };
     if (std::string(proto) == "rdma" || std::string(proto) == "rdma_twosided") {
         if ((proto == "rdma" && transport_map_.count("rdma_twosided")) ||
             (proto == "rdma_twosided" && transport_map_.count("rdma"))) {
@@ -582,10 +590,11 @@ Transport* MultiTransport::installTransport(const std::string& proto,
                           "transports in the same Transfer Engine instance";
             return nullptr;
         }
+        const auto selection = nic_selection(globalConfig().rdma_nic_selection);
         if (std::string(proto) == "rdma") {
-            transport = new RdmaTransport();
+            transport = new RdmaTransport(selection);
         } else {
-            transport = new RdmaTwoSidedTransport();
+            transport = new RdmaTwoSidedTransport(selection);
         }
     }
 #ifdef USE_UB
@@ -680,7 +689,8 @@ Transport* MultiTransport::installTransport(const std::string& proto,
 #endif
 #ifdef USE_EFA
     else if (std::string(proto) == "efa") {
-        transport = new EfaTransport();
+        transport =
+            new EfaTransport(nic_selection(globalConfig().efa_nic_selection));
     }
 #endif
 #ifdef USE_CXI
@@ -737,6 +747,12 @@ Transport* MultiTransport::installTransport(const std::string& proto,
     if (transport->install(local_server_name_, metadata_, topo)) {
         delete transport;
         return nullptr;
+    }
+
+    if (topology_local_registration_ && proto != "rdma" &&
+        proto != "rdma_twosided" && proto != "efa") {
+        LOG(WARNING) << "Topology-local registration is not supported by "
+                     << proto << " transport; ignoring the override";
     }
 
     transport_map_[proto] = std::shared_ptr<Transport>(transport);

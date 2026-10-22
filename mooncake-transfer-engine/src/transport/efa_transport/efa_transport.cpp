@@ -50,7 +50,10 @@ static size_t getMaxPteEntries() { return kDefaultMaxPteEntries; }
 
 static constexpr size_t kThpPageSize = 2ULL * 1024 * 1024;
 
-EfaTransport::EfaTransport() {
+EfaTransport::EfaTransport() : EfaTransport(globalConfig().efa_nic_selection) {}
+
+EfaTransport::EfaTransport(NicSelection nic_selection)
+    : nic_selection_(nic_selection) {
     LOG(INFO) << "[EFA] AWS Elastic Fabric Adapter transport initialized";
 }
 
@@ -1261,7 +1264,7 @@ int EfaTransport::initializeEfaResources() {
         return ERR_DEVICE_NOT_FOUND;
     }
 
-    if (globalConfig().efa_nic_selection == NicSelection::LOCAL) {
+    if (nic_selection_ == NicSelection::LOCAL) {
         std::vector<std::string> context_names;
         context_names.reserve(context_list_.size());
         for (auto& context : context_list_)
@@ -1278,9 +1281,9 @@ int EfaTransport::initializeEfaResources() {
                       << nic_list << "]";
         }
         if (local_nic_map_.empty()) {
-            LOG(WARNING) << "EfaTransport: MC_EFA_NIC_SELECTION=local but the "
-                            "topology reports no per-location preferred NICs; "
-                            "every buffer will use all NICs as before";
+            LOG(WARNING) << "EfaTransport: local NIC selection is enabled but "
+                            "the topology reports no per-location preferred "
+                            "NICs; every buffer will use all NICs as before";
         }
     }
 

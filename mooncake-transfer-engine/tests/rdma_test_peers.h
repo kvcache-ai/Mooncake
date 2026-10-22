@@ -57,9 +57,10 @@ class RdmaTransportTestPeer {
         return transport.initializeRdmaResources();
     }
 
-    // Builds the MC_RDMA_NIC_SELECTION=local map as initializeRdmaResources()
-    // does, for contexts added with addContext().
+    // Builds the local NIC map as initializeRdmaResources() does, for contexts
+    // added with addContext().
     static void initializeLocalNicMap(RdmaTransport &transport) {
+        if (transport.nic_selection_ != NicSelection::LOCAL) return;
         std::vector<std::string> context_names;
         for (const auto &context : transport.context_list_)
             context_names.push_back(context->deviceName());

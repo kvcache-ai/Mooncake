@@ -352,6 +352,10 @@ void TransferEngine::setAutoDiscover(const AutoDiscoverConfig& config) {
     impl_->setAutoDiscover(config);
 }
 
+void TransferEngine::setTopologyLocalRegistration(bool enabled) {
+    impl_->setTopologyLocalRegistration(enabled);
+}
+
 void* TransferEngine::getBaseAddr() { return impl_->getBaseAddr(); }
 
 void TransferEngine::setWhitelistFilters(std::vector<std::string>&& filters) {
@@ -1149,6 +1153,14 @@ void TransferEngine::setAutoDiscover(bool auto_discover) {
 
 void TransferEngine::setAutoDiscover(const AutoDiscoverConfig& config) {
     if (!use_tent_) impl_->setAutoDiscover(config);
+}
+
+void TransferEngine::setTopologyLocalRegistration(bool enabled) {
+    if (!use_tent_) {
+        impl_->setTopologyLocalRegistration(enabled);
+    } else {
+        LOG(WARNING) << "Topology-local registration is not supported in TENT";
+    }
 }
 
 void TransferEngine::setWhitelistFilters(std::vector<std::string>&& filters) {
