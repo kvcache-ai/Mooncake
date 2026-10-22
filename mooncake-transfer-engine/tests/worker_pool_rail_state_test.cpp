@@ -89,6 +89,12 @@ namespace mooncake {
 
 class WorkerPoolTestPeer {
    public:
+    static bool hasAvailableAlternative(WorkerPool &pool,
+                                        Transport::Slice *slice,
+                                        const std::string &failed_path) {
+        return pool.hasAvailablePeerRailAlternative(slice, failed_path);
+    }
+
     static void markRailFailed(WorkerPool &pool, const std::string &path,
                                bool immediate_pause) {
         pool.markRailFailed(path, immediate_pause);
@@ -242,6 +248,44 @@ class WorkerPoolRailStateTest : public ::testing::Test {
     std::unique_ptr<RdmaContext> context_;
     std::unique_ptr<WorkerPool> worker_pool_;
 };
+
+TEST_F(WorkerPoolRailStateTest, ZeroKeyIsNotAnAlternativePeerRail) {
+    auto desc = std::make_shared<TransferMetadata::SegmentDesc>();
+    desc->name = "sparse-peer";
+    desc->protocol = "rdma";
+    ASSERT_EQ(desc->topology.parse(R"({"cpu:0":[["nic0"],[]],)"
+                                   R"("cpu:1":[["nic1"],[]]})"),
+              0);
+    for (const auto &name : desc->topology.getHcaList())
+        desc->devices.push_back({name, 0, "", ""});
+    TransferMetadata::BufferDesc buffer;
+    buffer.name = "cpu:0";
+    buffer.addr = 0x1000;
+    buffer.length = 4096;
+    const int first = desc->topology.getDeviceIndex("*", "nic0");
+    const int second = desc->topology.getDeviceIndex("*", "nic1");
+    buffer.rkey.assign(2, 0);
+    buffer.rkey[first] = 11;
+    buffer.lkey = buffer.rkey;
+    desc->buffers.push_back(buffer);
+    // Share ownership with the stored descriptor so the key updates below are
+    // visible through the metadata.
+    ASSERT_EQ(metadata_->addLocalSegment(
+                  77, "sparse-peer",
+                  std::shared_ptr<TransferMetadata::SegmentDesc>(desc)),
+              0);
+    Transport::Slice slice{};
+    slice.target_id = 77;
+    slice.rdma.dest_addr = 0x1000;
+    slice.length = 16;
+    const std::string path = desc->internedNicPath(first);
+    EXPECT_FALSE(WorkerPoolTestPeer::hasAvailableAlternative(*worker_pool_,
+                                                             &slice, path));
+    desc->buffers[0].lkey[second] = 22;
+    desc->buffers[0].rkey[second] = 22;
+    EXPECT_TRUE(WorkerPoolTestPeer::hasAvailableAlternative(*worker_pool_,
+                                                            &slice, path));
+}
 
 TEST_F(WorkerPoolRailStateTest, UnknownRailIsAvailable) {
     EXPECT_TRUE(railAvailable(kPeerA));

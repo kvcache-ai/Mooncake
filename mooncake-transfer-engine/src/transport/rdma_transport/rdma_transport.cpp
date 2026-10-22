@@ -1543,6 +1543,22 @@ int selectDeviceImpl(RdmaTransport::SegmentDesc *desc, uint64_t offset,
             !bufferCoversRange(buffer.addr, buffer.length, offset, length)) {
             return false;
         }
+        // A buffer may have no MR on some HCAs (e.g. Data Direct pairing
+        // leaves zero keys on non-paired NICs), so a device is usable only if
+        // every key array it has holds a nonzero key for it. A local-only MR
+        // has no rkey array.
+        auto has_key = [&](int id) {
+            if (id < 0 || (!desc->devices.empty() &&
+                           static_cast<size_t>(id) >= desc->devices.size()))
+                return false;
+            for (const auto *keys : {&buffer.lkey, &buffer.rkey}) {
+                if (!keys->empty() &&
+                    (static_cast<size_t>(id) >= keys->size() ||
+                     (*keys)[id] == 0))
+                    return false;
+            }
+            return !buffer.lkey.empty() || !buffer.rkey.empty();
+        };
         int selected = -1;
         // Consecutive hits in the same offset-independent MR (typical GPU
         // "cuda:N" buffers) keep the previous topology pick. retry_count > 0
@@ -1552,8 +1568,7 @@ int selectDeviceImpl(RdmaTransport::SegmentDesc *desc, uint64_t offset,
             const size_t nkeys =
                 by_local_hca ? buffer.lkey.size() : buffer.rkey.size();
             if (static_cast<size_t>(hint_device_id) < nkeys &&
-                (desc->devices.empty() ||
-                 static_cast<size_t>(hint_device_id) < desc->devices.size())) {
+                has_key(hint_device_id)) {
                 selected = hint_device_id;
             }
         }
@@ -1561,7 +1576,29 @@ int selectDeviceImpl(RdmaTransport::SegmentDesc *desc, uint64_t offset,
             selected = pickTopologyDevice(desc, buffer, offset, hint, local_hca,
                                           retry_count, by_local_hca);
         }
-        if (selected < 0) return false;
+        // A hinted HCA without an MR is treated like an unknown hint name:
+        // fall back to normal topology selection.
+        if (!has_key(selected) && !hint.empty()) {
+            selected = pickTopologyDevice(desc, buffer, offset, {}, local_hca,
+                                          retry_count, by_local_hca);
+        }
+        if (!has_key(selected)) {
+            // Walk the location's preferred and available HCAs once, starting
+            // where this retry would have picked, so the walk stays bounded.
+            // A peer-affinity mapping limits the walk to its candidates, since
+            // other peer HCAs may be unreachable from local_hca.
+            const size_t count = desc->topology.getHcaList().size();
+            const size_t start =
+                static_cast<size_t>(std::max(0, retry_count - 1));
+            selected = -1;
+            for (size_t i = 0; i < count && selected < 0; ++i) {
+                const int attempt = static_cast<int>(1 + (start + i) % count);
+                const int id = pickTopologyDevice(
+                    desc, buffer, offset, {}, local_hca, attempt, by_local_hca);
+                if (has_key(id)) selected = id;
+            }
+            if (selected < 0) return false;
+        }
         buffer_id = candidate;
         device_id = selected;
         return true;

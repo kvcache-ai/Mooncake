@@ -202,7 +202,8 @@ static int selectPeerDevice(RdmaTransport::SegmentDesc *peer_segment_desc,
         static_cast<size_t>(buffer_id) >= peer_segment_desc->buffers.size() ||
         device_id < 0 ||
         static_cast<size_t>(device_id) >=
-            peer_segment_desc->buffers[buffer_id].rkey.size()) {
+            peer_segment_desc->buffers[buffer_id].rkey.size() ||
+        peer_segment_desc->buffers[buffer_id].rkey[device_id] == 0) {
         LOG(ERROR) << "[RDMA] No rkey for MR access: seg="
                    << (peer_segment_desc ? peer_segment_desc->name : "null")
                    << " addr=" << (void *)offset << " len=" << length;
@@ -400,11 +401,11 @@ int WorkerPool::submitPostSend(
         // If selected rail is paused, try alternative devices
         if (!isRailAvailable(*peer_nic_path)) {
             bool found = false;
+            const auto &rkey = peer_segment_desc->buffers[buffer_id].rkey;
             for (size_t alt_dev_id = 0;
                  alt_dev_id < peer_segment_desc->devices.size(); ++alt_dev_id) {
                 if (alt_dev_id == (size_t)device_id ||
-                    alt_dev_id >=
-                        peer_segment_desc->buffers[buffer_id].rkey.size()) {
+                    alt_dev_id >= rkey.size() || rkey[alt_dev_id] == 0) {
                     continue;
                 }
                 const auto &alt_path =
@@ -1095,12 +1096,12 @@ void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
                     static_cast<size_t>(device_id));
             if (!isRailAvailable(*peer_nic_path)) {
                 bool found = false;
+                const auto &rkey = peer_segment_desc->buffers[buffer_id].rkey;
                 for (size_t alt_dev_id = 0;
                      alt_dev_id < peer_segment_desc->devices.size();
                      ++alt_dev_id) {
                     if (alt_dev_id == (size_t)device_id ||
-                        alt_dev_id >=
-                            peer_segment_desc->buffers[buffer_id].rkey.size()) {
+                        alt_dev_id >= rkey.size() || rkey[alt_dev_id] == 0) {
                         continue;
                     }
                     const auto &alt_path =
@@ -1210,14 +1211,13 @@ bool WorkerPool::tryHandoffToAnotherLocalWorker(Transport::Slice *slice) {
         if (buffer_id < 0) {
             continue;
         }
-        if (device_id >=
-            static_cast<int>(
-                local_segment_desc->buffers[buffer_id].lkey.size())) {
+        const auto &lkey = local_segment_desc->buffers[buffer_id].lkey;
+        if (device_id >= static_cast<int>(lkey.size()) ||
+            lkey[device_id] == 0) {
             continue;
         }
 
-        slice->rdma.source_lkey =
-            local_segment_desc->buffers[buffer_id].lkey[device_id];
+        slice->rdma.source_lkey = lkey[device_id];
         slice->rdma.endpoint = nullptr;
         slice->ts = 0;
 
@@ -1519,9 +1519,10 @@ bool WorkerPool::hasAvailablePeerRailAlternative(
     }
     if (buffer_id < 0) return false;
 
+    const auto &rkey = peer_segment_desc->buffers[buffer_id].rkey;
     for (size_t dev_id = 0; dev_id < peer_segment_desc->devices.size();
          ++dev_id) {
-        if (dev_id >= peer_segment_desc->buffers[buffer_id].rkey.size()) {
+        if (dev_id >= rkey.size() || rkey[dev_id] == 0) {
             continue;
         }
         const auto &peer_path = peer_segment_desc->internedNicPath(dev_id);
