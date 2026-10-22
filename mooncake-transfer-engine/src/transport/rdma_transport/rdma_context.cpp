@@ -57,6 +57,13 @@
 #include "transport/rdma_transport/worker_pool.h"
 #include "transport/transport.h"
 
+#ifdef MOONCAKE_ENABLE_PXN
+#include "transport/rdma_transport/pxn/pxn_topology_manager.h"
+#include "topology.h"
+#include "transport/rdma_transport/pxn/pxn_context_resource.h"
+#include "transport/rdma_transport/pxn/pxn_runtime_manager.h"
+#endif
+
 namespace mooncake {
 static int isNullGid(union ibv_gid *gid) {
     for (int i = 0; i < 16; ++i) {
@@ -345,6 +352,23 @@ int RdmaContext::construct(size_t num_cq_list, size_t num_comp_channels,
             return ERR_CONTEXT;
         }
     }
+#ifdef MOONCAKE_ENABLE_PXN
+    if (engine_.local_topology_) {
+        if (auto *pxn_mgr = engine_.PxnRuntimeMgr()) {
+            auto &mcConfig = globalConfig();
+            pxn::PxnTopologyManager *pxn_topo_mgr = pxn_mgr->PxnTopoMgrRef();
+            // alloc rdma pxn context resource
+            pxn::PxnAllocContextResource(pd_, device_name_,
+                                     transfer_worker_count_,
+                                     pxn_topo_mgr,
+                                     &pxn_resource_,
+                                     mcConfig.pxn_slot_size,
+                                     mcConfig.pxn_slot_count_per_worker,
+                                     pxn_mgr->PxnIbRelaxedOrderingEnabled());
+        }
+    }
+#endif
+
     worker_pool_ = std::make_shared<WorkerPool>(*this, socketId());
 
 #ifdef USE_MLX5DV
@@ -420,6 +444,11 @@ int RdmaContext::socketId() {
 
 int RdmaContext::deconstruct() {
     worker_pool_.reset();
+
+#ifdef MOONCAKE_ENABLE_PXN
+    // Release rdma PXN context resource
+    pxn::PxnFreeContextResource(&pxn_resource_);
+#endif
 
     // Graceful teardown order: QPs -> MRs.
     if (endpoint_store_) {

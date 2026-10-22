@@ -38,6 +38,11 @@ namespace mooncake {
 
 class RdmaEndPoint;
 class TransferMetadata;
+#ifdef MOONCAKE_ENABLE_PXN
+namespace pxn {
+class PxnRuntimeManager;
+}
+#endif
 /// By default, these functions return 0 (or non-null pointer) on success and
 /// return -1 (or null pointer) on failure. The errno is set accordingly on
 /// failure.
@@ -45,6 +50,9 @@ class Transport {
     friend class TransferEngine;
     friend class TransferEngineImpl;
     friend class MultiTransport;
+#ifdef MOONCAKE_ENABLE_PXN
+    friend class pxn::PxnRuntimeManager;
+#endif
 
    public:
     using SegmentID = uint64_t;
@@ -269,6 +277,19 @@ class Transport {
             } flagcx;
         };
 
+#ifdef MOONCAKE_ENABLE_PXN
+        struct {
+            // true:CopyWorker shell slice,false:conventional slice
+            bool is_copy_worker = false;
+            // src_gpu source memory + same rail local nic
+            uint32_t pxn_fallback_source_lkey = 0;
+            // mount PxnCopyWorker
+            void *pxn_copy_worker = nullptr;
+            // src_gpu source memory
+            void *pxn_fallback_source_addr = nullptr;
+        } pxn_info;
+#endif
+
        public:
         // Packed handshake word: bit 63 = sealed, bits 0..62 = completed
         // slices. One location so last-slice CQ and seal share a modification
@@ -289,6 +310,12 @@ class Transport {
             TransferTask *t = task.load(std::memory_order_acquire);
             __atomic_fetch_add(&t->transferred_bytes, length, __ATOMIC_RELAXED);
             __atomic_fetch_add(&t->success_slice_count, 1, __ATOMIC_ACQ_REL);
+#ifdef MOONCAKE_ENABLE_PXN
+            // Call transport-specific PXN completion handler
+            if (task && task->transport_) {
+                task->transport_->pxnSliceCompletion(this);
+            }
+#endif
             // Second CQ RMW: handshake word. success_slice_count stays for
             // getTransferStatus; packing both into one word is a follow-up.
             const uint64_t state =
@@ -301,6 +328,12 @@ class Transport {
             status = Slice::FAILED;
             TransferTask *t = task.load(std::memory_order_acquire);
             __atomic_fetch_add(&t->failed_slice_count, 1, __ATOMIC_ACQ_REL);
+#ifdef MOONCAKE_ENABLE_PXN
+            // Call transport-specific PXN completion handler
+            if (task && task->transport_) {
+                task->transport_->pxnSliceCompletion(this);
+            }
+#endif
             const uint64_t state =
                 __atomic_add_fetch(&t->completion_state, 1, __ATOMIC_ACQ_REL);
             finishIfComplete(t, state, true);
@@ -434,6 +467,18 @@ class Transport {
                 slice->from_cache = true;
             }
 
+#ifdef MOONCAKE_ENABLE_PXN
+            // Reset PXN fields so a reused slice from the TLS cache does not
+            // carry stale is_copy_worker / pxn_copy_worker pointers from its
+            // previous life. Bypass (non-PXN) callers in rdma_transport.cpp
+            // never touch pxn_info, so without this reset, worker_pool.cpp
+            // would misroute the slice as a copy worker shell.
+            slice->pxn_info.is_copy_worker = false;
+            slice->pxn_info.pxn_copy_worker = nullptr;
+            slice->pxn_info.pxn_fallback_source_addr = nullptr;
+            slice->pxn_info.pxn_fallback_source_lkey = 0;
+#endif
+
             return slice;
         }
 
@@ -497,9 +542,24 @@ class Transport {
         size_t request_count = 1;
         // record the slice list for freeing objects
         std::vector<Slice *> slice_list;
+
+#ifdef MOONCAKE_ENABLE_PXN
+        std::vector<void *> pxn_copy_worker_list;
+#endif
+
         ~TransferTask() {
             for (auto &slice : slice_list)
                 Transport::getSliceCache().deallocate(slice);
+#ifdef MOONCAKE_ENABLE_PXN
+            // Delegate CW reclaim to the transport that owns the packing
+            // logic. Non-PXN transports keep the empty default
+            // Transport::pxnFreeTaskCws() and never populate
+            // pxn_copy_worker_list, so this stays free of any hard
+            // dependency on pxn/ symbols from transport.h.
+            if (transport_) {
+                transport_->pxnFreeTaskCws(pxn_copy_worker_list);
+            }
+#endif
         }
     };
 
@@ -539,6 +599,21 @@ class Transport {
 
    public:
     virtual ~Transport() {}
+
+#ifdef MOONCAKE_ENABLE_PXN
+    // PXN slice completion handler
+    // Called by Slice::markSuccess/markFailed when a slice completes
+    // Default implementation does nothing; RdmaTransport overrides this
+    virtual void pxnSliceCompletion(Slice *slice) {}
+
+    // PXN task-owned copy-worker reclaim hook.
+    // Called from ~TransferTask so the transport that actually populated
+    // pxn_copy_worker_list (currently RdmaTransport) can decrement each
+    // CW's task_refcount and return it to the TLS pool when it drops to 0.
+    // Non-PXN transports never push into pxn_copy_worker_list, so the
+    // default empty implementation is safe.
+    virtual void pxnFreeTaskCws(std::vector<void *> &cws) {}
+#endif
 
     /// @brief Create a batch with specified maximum outstanding transfers.
     virtual BatchID allocateBatchID(size_t batch_size);
