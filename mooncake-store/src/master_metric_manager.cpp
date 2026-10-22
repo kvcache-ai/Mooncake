@@ -377,6 +377,26 @@ MasterMetricManager::MasterMetricManager()
                              "Total number of keys evicted in nof"),
       nof_evicted_size_("master_evicted_size_bytes_nof",
                         "Total bytes of evicted objects in nof"),
+      eviction_census_runs_("master_eviction_census_runs_total",
+                            "Total memory eviction census runs"),
+      eviction_continuation_created_(
+          "master_eviction_continuation_created_total",
+          "Total memory eviction continuation episodes created"),
+      eviction_continuation_resumes_(
+          "master_eviction_continuation_resumes_total",
+          "Total memory eviction continuation resumes"),
+      eviction_backpressure_pauses_(
+          "master_eviction_backpressure_pauses_total",
+          "Total memory eviction pauses caused by OpLog backpressure"),
+      eviction_continuation_drops_(
+          "master_eviction_continuation_drops_total",
+          "Total memory eviction continuations dropped"),
+      eviction_continuation_dropped_(
+          "master_eviction_continuation_dropped_total",
+          "Memory eviction continuations dropped by reason", {"reason"}),
+      eviction_continuation_stale_skips_(
+          "master_eviction_continuation_stale_skips_total",
+          "Total stale or ineligible continuation candidates skipped"),
 
       // Initialize Discarded Replicas Counters
       put_start_discard_cnt_("master_put_start_discard_cnt",
@@ -705,6 +725,12 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     eviction_attempts_.inc(0);
     evicted_key_count_.inc(0);
     evicted_size_.inc(0);
+    eviction_census_runs_.inc(0);
+    eviction_continuation_created_.inc(0);
+    eviction_continuation_resumes_.inc(0);
+    eviction_backpressure_pauses_.inc(0);
+    eviction_continuation_drops_.inc(0);
+    eviction_continuation_stale_skips_.inc(0);
 
     // Update PutStart Discard Metrics
     put_start_discard_cnt_.inc(0);
@@ -1791,6 +1817,60 @@ int64_t MasterMetricManager::get_nof_evicted_size() {
     return nof_evicted_size_.value();
 }
 
+void MasterMetricManager::inc_eviction_census_runs(int64_t val) {
+    eviction_census_runs_.inc(val);
+}
+
+void MasterMetricManager::inc_eviction_continuation_created(int64_t val) {
+    eviction_continuation_created_.inc(val);
+}
+
+void MasterMetricManager::inc_eviction_continuation_resumes(int64_t val) {
+    eviction_continuation_resumes_.inc(val);
+}
+
+void MasterMetricManager::inc_eviction_backpressure_pauses(int64_t val) {
+    eviction_backpressure_pauses_.inc(val);
+}
+
+void MasterMetricManager::inc_eviction_continuation_drops(int64_t val) {
+    eviction_continuation_drops_.inc(val);
+}
+
+void MasterMetricManager::inc_eviction_continuation_dropped(
+    const std::string& reason, int64_t val) {
+    eviction_continuation_drops_.inc(val);
+    eviction_continuation_dropped_.inc({reason}, val);
+}
+
+void MasterMetricManager::inc_eviction_continuation_stale_skips(int64_t val) {
+    eviction_continuation_stale_skips_.inc(val);
+}
+
+int64_t MasterMetricManager::get_eviction_census_runs() {
+    return eviction_census_runs_.value();
+}
+
+int64_t MasterMetricManager::get_eviction_continuation_created() {
+    return eviction_continuation_created_.value();
+}
+
+int64_t MasterMetricManager::get_eviction_continuation_resumes() {
+    return eviction_continuation_resumes_.value();
+}
+
+int64_t MasterMetricManager::get_eviction_backpressure_pauses() {
+    return eviction_backpressure_pauses_.value();
+}
+
+int64_t MasterMetricManager::get_eviction_continuation_drops() {
+    return eviction_continuation_drops_.value();
+}
+
+int64_t MasterMetricManager::get_eviction_continuation_stale_skips() {
+    return eviction_continuation_stale_skips_.value();
+}
+
 // PutStart Discard Metrics Getters
 int64_t MasterMetricManager::get_put_start_discard_cnt() {
     return put_start_discard_cnt_.value();
@@ -2194,6 +2274,13 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(nof_eviction_attempts_);
     serialize_metric(nof_evicted_key_count_);
     serialize_metric(nof_evicted_size_);
+    serialize_metric(eviction_census_runs_);
+    serialize_metric(eviction_continuation_created_);
+    serialize_metric(eviction_continuation_resumes_);
+    serialize_metric(eviction_backpressure_pauses_);
+    serialize_metric(eviction_continuation_drops_);
+    serialize_metric(eviction_continuation_dropped_);
+    serialize_metric(eviction_continuation_stale_skips_);
 
     // Serialize PutStart Discard Metrics
     serialize_metric(put_start_discard_cnt_);

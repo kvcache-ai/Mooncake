@@ -75,6 +75,12 @@ class HealthCheckTest : public ::testing::Test {
         if (!master_.Start(InProcMasterConfigBuilder().build())) return -1;
         master_address_ = master_.master_address();
 
+        // Pick the client HTTP port after the master's listeners have bound.
+        // Otherwise a master listener can claim the probed, unreserved port
+        // before setup_real starts the client's HTTP server.
+        FLAGS_http_port = getFreeTcpPort();
+        if (FLAGS_http_port <= 0) return -1;
+
         const std::string rdma_devices =
             (FLAGS_protocol == "rdma") ? FLAGS_device_name : "";
         return py_client_->setup_real("localhost:" + std::to_string(port),
@@ -144,9 +150,8 @@ TEST_F(HealthCheckTest, ReturnsTwoWhenMasterDown) {
 
 // Test 5: HTTP /health returns 200 when healthy
 TEST_F(HealthCheckTest, HttpReturns200WhenHealthy) {
-    int http_port = getFreeTcpPort();
-    FLAGS_http_port = http_port;
     ASSERT_EQ(StartMasterAndSetupClient(18910), 0) << "setup_real failed";
+    const int http_port = FLAGS_http_port;
 
     std::this_thread::sleep_for(std::chrono::seconds(2));
 
@@ -161,9 +166,8 @@ TEST_F(HealthCheckTest, HttpReturns200WhenHealthy) {
 
 // Test 6: HTTP /health returns 503 when master unreachable
 TEST_F(HealthCheckTest, HttpReturns503WhenMasterDown) {
-    int http_port = getFreeTcpPort();
-    FLAGS_http_port = http_port;
     ASSERT_EQ(StartMasterAndSetupClient(18911), 0);
+    const int http_port = FLAGS_http_port;
 
     std::this_thread::sleep_for(std::chrono::seconds(2));
     EXPECT_EQ(py_client_->health_check(), HC_HEALTHY);
@@ -183,9 +187,8 @@ TEST_F(HealthCheckTest, HttpReturns503WhenMasterDown) {
 // Test 7: HTTP /metrics and /metrics/summary return 200 and reflect
 // transfer stats after put/get operations
 TEST_F(HealthCheckTest, MetricsEndpointsReturnCorrectData) {
-    int http_port = getFreeTcpPort();
-    FLAGS_http_port = http_port;
     ASSERT_EQ(StartMasterAndSetupClient(18920), 0) << "setup_real failed";
+    const int http_port = FLAGS_http_port;
 
     std::this_thread::sleep_for(std::chrono::seconds(2));
 
@@ -245,9 +248,8 @@ TEST_F(HealthCheckTest, MetricsEndpointsReturnCorrectData) {
 
 // Test 8: HTTP /version returns 200 with version information
 TEST_F(HealthCheckTest, VersionEndpointReturnsVersion) {
-    int http_port = getFreeTcpPort();
-    FLAGS_http_port = http_port;
     ASSERT_EQ(StartMasterAndSetupClient(18930), 0) << "setup_real failed";
+    const int http_port = FLAGS_http_port;
 
     std::this_thread::sleep_for(std::chrono::seconds(2));
 

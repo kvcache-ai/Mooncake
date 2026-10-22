@@ -444,6 +444,16 @@ bool OrderedOpLogWriter::IsAccepting() const {
     return impl_->accepting;
 }
 
+OrderedOpLogWriter::AdmissionState OrderedOpLogWriter::GetAdmissionState()
+    const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->terminal_state) return AdmissionState::kTerminal;
+    if (impl_->stop_requested) return AdmissionState::kStopped;
+    if (impl_->accepting) return AdmissionState::kAccepting;
+    return IsRetryableWriteError(impl_->last_error) ? AdmissionState::kRetrying
+                                                    : AdmissionState::kInvalid;
+}
+
 ErrorCode OrderedOpLogWriter::LastError() const {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     return impl_->last_error;

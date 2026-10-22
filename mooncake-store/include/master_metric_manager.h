@@ -323,6 +323,22 @@ class MasterMetricManager {
     int64_t get_nof_evicted_key_count();
     int64_t get_nof_evicted_size();
 
+    // HA-004 eviction continuation diagnostics.
+    void inc_eviction_census_runs(int64_t val = 1);
+    void inc_eviction_continuation_created(int64_t val = 1);
+    void inc_eviction_continuation_resumes(int64_t val = 1);
+    void inc_eviction_backpressure_pauses(int64_t val = 1);
+    void inc_eviction_continuation_drops(int64_t val = 1);
+    void inc_eviction_continuation_dropped(const std::string& reason,
+                                           int64_t val = 1);
+    void inc_eviction_continuation_stale_skips(int64_t val = 1);
+    int64_t get_eviction_census_runs();
+    int64_t get_eviction_continuation_created();
+    int64_t get_eviction_continuation_resumes();
+    int64_t get_eviction_backpressure_pauses();
+    int64_t get_eviction_continuation_drops();
+    int64_t get_eviction_continuation_stale_skips();
+
     // PutStart Discard Metrics
     void inc_put_start_discard_cnt(int64_t count, int64_t size);
     void inc_put_start_release_cnt(int64_t count, int64_t size);
@@ -746,6 +762,14 @@ class MasterMetricManager {
     ylt::metric::counter_t nof_eviction_attempts_;
     ylt::metric::counter_t nof_evicted_key_count_;
     ylt::metric::counter_t nof_evicted_size_;
+
+    ylt::metric::counter_t eviction_census_runs_;
+    ylt::metric::counter_t eviction_continuation_created_;
+    ylt::metric::counter_t eviction_continuation_resumes_;
+    ylt::metric::counter_t eviction_backpressure_pauses_;
+    ylt::metric::counter_t eviction_continuation_drops_;
+    ylt::metric::dynamic_counter_1t eviction_continuation_dropped_;
+    ylt::metric::counter_t eviction_continuation_stale_skips_;
 
     // PutStart Discard Metrics
     ylt::metric::counter_t put_start_discard_cnt_;
