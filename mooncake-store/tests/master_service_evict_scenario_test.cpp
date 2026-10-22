@@ -852,5 +852,30 @@ TEST_F(MasterServiceEvictScenarioTest,
         .Then(Object("grouped_leased_b").IsReadable());
 }
 
+TEST_F(MasterServiceEvictScenarioTest,
+       OpLogEvictionQueuesOffloadInsteadOfDropping) {
+    // With enable_oplog the eviction path used to skip the offload decision
+    // outright, so offload_on_evict silently deleted objects the config says
+    // should spill to LOCAL_DISK (#4830). The offload pin must land before the
+    // record is written, so the key survives as an offload task.
+    const std::string cluster_id = "evict_scenario_offload_on_evict";
+    auto backend = std::make_shared<EvictFakeBatchHaKvBackend>();
+    auto config = HaConfig(cluster_id);
+    config.enable_offload = true;
+    config.offload_on_evict = true;
+    MasterScenario scenario("oplog eviction spills to disk instead of dropping",
+                            config, backend);
+    scenario.Given(MemoryNode("memory"))
+        .When(MountLocalDisk("memory"))
+        .Given(Objects({"spilled"})
+                   .Size(kObjectSize)
+                   .By("memory")
+                   .CompleteOn("memory")
+                   .ExpiresAt(ExpiredBase()))
+        .When(EvictMemory(1.0))
+        .When(OffloadHeartbeat("memory").ExpectTasks({"spilled"}, kObjectSize))
+        .Then(Object("spilled").IsReadable());
+}
+
 }  // namespace
 }  // namespace mooncake::test
