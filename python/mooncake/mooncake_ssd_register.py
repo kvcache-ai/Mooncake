@@ -8,7 +8,7 @@ import re
 import shlex
 from typing import List, Dict, Any
 
-from mooncake._administration import require_paramiko
+from mooncake._administration import SSHConnectionPool
 
 from mooncake.store import MooncakeDistributedNoFRegister
 
@@ -91,49 +91,46 @@ class MooncakeNoFRegister:
         return result
 
     def _execute_ssh_command(self, ip: str, command: str, path: str) -> str:
+        """Execute command on remote server via SSH.
+
+        The SSH handshake is performed ONCE per (ip, creds) pair and reused
+        across every path probe and every bdev/nvmf call in the same target
+        discovery. See SSHConnectionPool for details.
         """
-        Execute command on remote server via SSH
-        """
-        paramiko = require_paramiko()
-        ssh = paramiko.SSHClient()
-        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        try:
-            ssh.connect(
-                ip,
+        pool = SSHConnectionPool.instance()
+        possible_paths = [
+            path,  # Direct path provided by user
+            f"{path}/spdk",  # Common case: spdk is a subdirectory
+        ]
+
+        for test_path in possible_paths:
+            full_command = f"cd {shlex.quote(test_path)} && test -f scripts/rpc.py"
+            exit_status, out, err = pool.exec_command(
+                ip, full_command,
                 port=int(self.cli_config.get("port", 22)),
                 username=self.cli_config.get("username", "root"),
                 password=self.cli_config.get("password"),
-                key_filename=self.cli_config.get("key_file"),
-                timeout=10,
+                key_file=self.cli_config.get("key_file"),
+                command_timeout=5,
             )
+            if exit_status == 0:
+                full_command = f"cd {shlex.quote(test_path)} && {command}"
+                exit_status, out, err = pool.exec_command(
+                    ip, full_command,
+                    port=int(self.cli_config.get("port", 22)),
+                    username=self.cli_config.get("username", "root"),
+                    password=self.cli_config.get("password"),
+                    key_file=self.cli_config.get("key_file"),
+                    command_timeout=30,
+                )
+                if exit_status != 0:
+                    logging.error(f"SSH command error on {ip}: {err}")
+                    raise RuntimeError(f"SSH command failed: {err or out}")
+                return out
 
-            # Try multiple possible paths to find the RPC script
-            possible_paths = [
-                path,  # Direct path provided by user
-                f"{path}/spdk",  # Common case: spdk is a subdirectory
-            ]
-
-            for test_path in possible_paths:
-                full_command = f"cd {shlex.quote(test_path)} && test -f scripts/rpc.py"
-                stdin, stdout, stderr = ssh.exec_command(full_command, timeout=5)
-                if stdout.channel.recv_exit_status() == 0:
-                    # Found the script, execute the actual command
-                    full_command = f"cd {shlex.quote(test_path)} && {command}"
-                    stdin, stdout, stderr = ssh.exec_command(full_command, timeout=30)
-                    exit_status = stdout.channel.recv_exit_status()
-                    output = stdout.read().decode("utf-8")
-                    error = stderr.read().decode("utf-8")
-                    if exit_status != 0:
-                        logging.error(f"SSH command error on {ip}: {error}")
-                        raise RuntimeError(f"SSH command failed: {error or output}")
-                    return output
-
-            # If we get here, none of the paths worked
-            raise RuntimeError(
-                f"Could not find scripts/rpc.py in any of the possible paths: {possible_paths}"
-            )
-        finally:
-            ssh.close()
+        raise RuntimeError(
+            f"Could not find scripts/rpc.py in any of the possible paths: {possible_paths}"
+        )
 
     def _get_remote_ssd_info(self, master_server_address: str) -> List[Dict[str, Any]]:
         """
