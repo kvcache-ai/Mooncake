@@ -86,6 +86,12 @@ bool IsRoceModeEnabled();
 // Parse ASCEND_GLOBAL_RESOURCE_CONFIG JSON for roce protocol_desc only.
 bool HasRoceProtocolDescInGlobalResourceConfig(const char *config_str);
 
+// True when protocol_desc is "roce:host", or an array containing that entry,
+// on this object or on its "store" subtree. "roce:device" does not match.
+// The store subtree is included because host memory is allocated after TE
+// init, when ascend_store_te_init has already been cleared.
+bool HasRoceHostProtocolDescInGlobalResourceConfig(const char *config_str);
+
 // Resolve the effective ASCEND_GLOBAL_RESOURCE_CONFIG for the current TE role.
 // Schema: the top-level object is the default config (passed verbatim to adxl
 // for normal/P2P TEs); an optional "store" sub-object overrides it for a

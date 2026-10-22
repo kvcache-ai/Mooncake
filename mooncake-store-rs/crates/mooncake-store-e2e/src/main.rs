@@ -253,15 +253,18 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     elastic_target.register_local_memory()?;
     elastic_router.register_local_memory()?;
 
+    if matches!(
+        env::var("MC_STORE_RS_E2E_TENT_ABI_ONLY").as_deref(),
+        Ok("1")
+    ) {
+        verify_batch_put_get(&target_a, &reader, value_size)?;
+        println!("TENT ABI batch Put/Get E2E passed");
+        return Ok(());
+    }
+
     verify_single_put_get(&target_a, &reader, value_size)?;
     verify_multi_tenant_isolation(&target_a, &reader, value_size)?;
-    verify_strict_tenant_quota(
-        metadata.clone(),
-        redis_port,
-        &reader,
-        value_size,
-        rdma_mode.enabled,
-    )?;
+    verify_strict_tenant_quota(metadata.clone(), redis_port, value_size, rdma_mode.enabled)?;
     verify_batch_put_get(&target_a, &reader, value_size)?;
     verify_batch_put_from_get_into(&target_a, &reader, value_size)?;
     verify_multi_buffer_batch_ops(&target_a, &reader, value_size)?;
@@ -288,7 +291,6 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         metadata.clone(),
         planner.clone(),
         redis_port,
-        &reader,
         value_size,
         &rdma_mode,
     )?;
@@ -497,22 +499,31 @@ fn verify_multi_tenant_isolation(
     value_size: usize,
 ) -> Result<()> {
     let tenant_a = payload("tenant-a-value", value_size);
-    let tenant_b = payload("tenant-b-value", value_size);
     writer.put_in_tenant("tenant-a", "shared-key", &tenant_a)?;
-    writer.put_in_tenant("tenant-b", "shared-key", &tenant_b)?;
+    let round_trip = reader.get_in_tenant("tenant-a", "shared-key")?;
+    ensure_payload("tenant-a isolation", &tenant_a, &round_trip)?;
 
-    let keys = [
-        ObjectRef::new("shared-key").tenant("tenant-a"),
-        ObjectRef::new("shared-key").tenant("tenant-b"),
-    ];
-    let results = reader.batch_get(&keys)?;
-    ensure_payload("tenant-a isolation", &tenant_a, &results[0])?;
-    ensure_payload("tenant-b isolation", &tenant_b, &results[1])?;
+    if !matches!(
+        writer.put_in_tenant("tenant-b", "shared-key", b"tenant-b-value"),
+        Err(StoreError::InvalidState(_))
+    ) {
+        return Err(StoreError::InvalidState(
+            "tenant-bound writer accepted a cross-tenant write".to_string(),
+        ));
+    }
+    if !matches!(
+        reader.get_in_tenant("tenant-b", "shared-key"),
+        Err(StoreError::InvalidState(_))
+    ) {
+        return Err(StoreError::InvalidState(
+            "tenant-bound reader accepted a cross-tenant read".to_string(),
+        ));
+    }
     Ok(())
 }
 
 fn put_tenant_quota_policy(
-    metadata: &RedisMetadataBackend,
+    metadata: &dyn MetadataBackend,
     tenant: &str,
     max_bytes: u64,
     max_objects: usize,
@@ -539,7 +550,6 @@ fn put_tenant_quota_policy(
 fn verify_strict_tenant_quota(
     metadata: Arc<RedisMetadataBackend>,
     redis_port: u16,
-    reader: &StoreClient,
     value_size: usize,
     rdma_enabled: bool,
 ) -> Result<()> {
@@ -547,6 +557,13 @@ fn verify_strict_tenant_quota(
     let key_ok = "quota-ok";
     let key_over = "quota-over";
     let key_reuse = "quota-reuse";
+    let quota_metadata = metadata.for_tenant(tenant).ok_or_else(|| {
+        StoreError::InvalidState(format!(
+            "metadata backend does not support tenant keyspace for {tenant}"
+        ))
+    })?;
+    // Policy APIs derive the tenant control-plane keyspace from the scope.
+    // Keep this tenant view for quota state and accounting inspection below.
     put_tenant_quota_policy(metadata.as_ref(), tenant, value_size as u64, 1)?;
 
     let bundle = build_tent_bundle(redis_port, "quota-e2e-segment", rdma_enabled)?;
@@ -571,11 +588,11 @@ fn verify_strict_tenant_quota(
 
     let first = payload("strict-quota-ok", value_size);
     writer.put(key_ok, &first)?;
-    let round_trip = reader.get_in_tenant(tenant, key_ok)?;
+    let round_trip = writer.get(key_ok)?;
     ensure_payload("strict quota first put", &first, &round_trip)?;
 
     let scope = TenantPolicyScope::new(tenant, None::<String>, None::<String>);
-    let quota_after_put = metadata
+    let quota_after_put = quota_metadata
         .get_tenant_quota_state(&scope)?
         .ok_or_else(|| StoreError::NotFound(format!("quota state missing for {tenant}")))?;
     if quota_after_put.used_bytes != value_size as u64
@@ -593,7 +610,7 @@ fn verify_strict_tenant_quota(
         )));
     }
 
-    let accounting_after_put = metadata
+    let accounting_after_put = quota_metadata
         .get_tenant_object_accounting(&ObjectKey::new(format!("{tenant}::{key_ok}")))?
         .ok_or_else(|| {
             StoreError::NotFound(format!("quota accounting missing for {tenant}::{key_ok}"))
@@ -609,7 +626,7 @@ fn verify_strict_tenant_quota(
         )));
     }
 
-    let reservations_after_put = metadata.list_tenant_quota_reservations(&scope)?;
+    let reservations_after_put = quota_metadata.list_tenant_quota_reservations(&scope)?;
     let first_reservation = reservations_after_put
         .iter()
         .find(|reservation| reservation.key == ObjectKey::new(format!("{tenant}::{key_ok}")))
@@ -645,16 +662,18 @@ fn verify_strict_tenant_quota(
         )));
     }
 
-    let quota_after_reject = metadata.get_tenant_quota_state(&scope)?.ok_or_else(|| {
-        StoreError::NotFound(format!("quota state missing for {tenant} after reject"))
-    })?;
+    let quota_after_reject = quota_metadata
+        .get_tenant_quota_state(&scope)?
+        .ok_or_else(|| {
+            StoreError::NotFound(format!("quota state missing for {tenant} after reject"))
+        })?;
     if quota_after_reject != quota_after_put {
         return Err(StoreError::InvalidState(format!(
             "strict quota reject changed quota state: before={:?} after={:?}",
             quota_after_put, quota_after_reject
         )));
     }
-    let reservations_after_reject = metadata.list_tenant_quota_reservations(&scope)?;
+    let reservations_after_reject = quota_metadata.list_tenant_quota_reservations(&scope)?;
     if reservations_after_reject.len() != reservations_after_put.len() {
         return Err(StoreError::InvalidState(format!(
             "strict quota reject changed reservation count: before={} after={}",
@@ -665,13 +684,13 @@ fn verify_strict_tenant_quota(
 
     let second = payload("strict-quota-evicted", value_size);
     writer.put(key_over, &second)?;
-    let round_trip_after_evict = reader.get_in_tenant(tenant, key_over)?;
+    let round_trip_after_evict = writer.get(key_over)?;
     ensure_payload(
         "strict quota eviction admitted replacement",
         &second,
         &round_trip_after_evict,
     )?;
-    if metadata
+    if quota_metadata
         .get_tenant_object_accounting(&ObjectKey::new(format!("{tenant}::{key_ok}")))?
         .is_some()
     {
@@ -679,9 +698,11 @@ fn verify_strict_tenant_quota(
             "strict quota original accounting still exists after tenant-local eviction".to_string(),
         ));
     }
-    let quota_after_evict = metadata.get_tenant_quota_state(&scope)?.ok_or_else(|| {
-        StoreError::NotFound(format!("quota state missing for {tenant} after eviction"))
-    })?;
+    let quota_after_evict = quota_metadata
+        .get_tenant_quota_state(&scope)?
+        .ok_or_else(|| {
+            StoreError::NotFound(format!("quota state missing for {tenant} after eviction"))
+        })?;
     if quota_after_evict.used_bytes != value_size as u64
         || quota_after_evict.used_objects != 1
         || quota_after_evict.pending_reserved_bytes != 0
@@ -698,9 +719,11 @@ fn verify_strict_tenant_quota(
     }
 
     writer.remove(key_over, true)?;
-    let quota_after_delete = metadata.get_tenant_quota_state(&scope)?.ok_or_else(|| {
-        StoreError::NotFound(format!("quota state missing for {tenant} after delete"))
-    })?;
+    let quota_after_delete = quota_metadata
+        .get_tenant_quota_state(&scope)?
+        .ok_or_else(|| {
+            StoreError::NotFound(format!("quota state missing for {tenant} after delete"))
+        })?;
     if quota_after_delete.used_bytes != 0
         || quota_after_delete.used_objects != 0
         || quota_after_delete.pending_reserved_bytes != 0
@@ -714,7 +737,7 @@ fn verify_strict_tenant_quota(
             quota_after_delete.pending_reserved_objects,
         )));
     }
-    if metadata
+    if quota_metadata
         .get_tenant_object_accounting(&ObjectKey::new(format!("{tenant}::{key_over}")))?
         .is_some()
     {
@@ -722,7 +745,7 @@ fn verify_strict_tenant_quota(
             "strict quota accounting still exists after authoritative delete".to_string(),
         ));
     }
-    let reservations_after_delete = metadata.list_tenant_quota_reservations(&scope)?;
+    let reservations_after_delete = quota_metadata.list_tenant_quota_reservations(&scope)?;
     let delete_reservation = reservations_after_delete
         .iter()
         .find(|reservation| {
@@ -744,7 +767,7 @@ fn verify_strict_tenant_quota(
 
     let third = payload("strict-quota-reuse", value_size);
     writer.put(key_reuse, &third)?;
-    let reused = reader.get_in_tenant(tenant, key_reuse)?;
+    let reused = writer.get(key_reuse)?;
     ensure_payload("strict quota delete refund reuse", &third, &reused)?;
     Ok(())
 }
@@ -1461,7 +1484,6 @@ fn verify_rdma_bandwidth_isolation(
     metadata: Arc<RedisMetadataBackend>,
     planner: PlacementPlanner,
     redis_port: u16,
-    reader: &StoreClient,
     value_size: usize,
     rdma_mode: &RdmaMode,
 ) -> Result<()> {
@@ -1611,13 +1633,13 @@ fn verify_rdma_bandwidth_isolation(
             ensure_payload(
                 "rdma high tenant readback",
                 &payload(&high_key, value_size),
-                &reader.get_in_tenant("tenant-high", &high_key)?,
+                &high.get(&high_key)?,
             )?;
             let low_key = format!("{low_prefix}-{index}");
             ensure_payload(
                 "rdma low tenant readback",
                 &payload(&low_key, value_size),
-                &reader.get_in_tenant("tenant-low", &low_key)?,
+                &low.get(&low_key)?,
             )?;
         }
 

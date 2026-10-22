@@ -68,6 +68,7 @@ set_tests_properties(replica_selection_env_opt_in_test
 add_store_test(eviction_strategy_test eviction_strategy_test.cpp)
 add_store_test(deadline_scheduler_test deadline_scheduler_test.cpp)
 add_store_test(background_worker_test background_worker_test.cpp)
+add_store_test(session_tag_test session_tag_test.cpp)
 add_store_test(kv_event_publisher_test kv_event_publisher_test.cpp)
 if(ENABLE_KV_EVENTS)
   target_compile_definitions(kv_event_publisher_test
@@ -84,6 +85,12 @@ add_store_test(dfs_enablement_config_test dfs_enablement_config_test.cpp)
 add_store_test(master_service_weight_management_test
                master_service_weight_management_test.cpp)
 add_store_test(master_service_group_test master_service_group_test.cpp)
+add_store_test(master_service_object_ref_test
+               master_service_object_ref_test.cpp)
+add_store_test(master_service_tenant_iteration_test
+               master_service_tenant_iteration_test.cpp)
+add_store_test(master_service_batch_read_test
+               master_service_batch_read_test.cpp)
 add_ha_test(master_service_evict_scenario_test
             master_service_evict_scenario_test.cpp)
 target_link_libraries(master_service_evict_scenario_test
@@ -156,7 +163,7 @@ add_test(
   NAME object_checksum_client_test
   COMMAND
     client_integration_test
-    "--gtest_filter=ObjectChecksumTest.*:ClientIntegrationTest.ObjectChecksumRejectsCorruptedObject:ClientIntegrationTest.BatchPutPreservesObjectChecksumPairing"
+    "--gtest_filter=ObjectChecksumTest.*:ClientIntegrationTest.ObjectChecksumRejectsCorruptedObject:ClientIntegrationTest.BatchPutPreservesObjectChecksumPairing:ClientIntegrationTest.TaggedBatchWritesSkipChecksumFailures"
 )
 set_tests_properties(object_checksum_client_test
                      PROPERTIES ENVIRONMENT "MOONCAKE_STORE_CHECKSUM=1")
@@ -213,6 +220,7 @@ if(USE_TENT)
 endif()
 add_store_test(tenant_quota_test tenant_quota_test.cpp)
 add_store_test(tenant_quota_manager_test tenant_quota_manager_test.cpp)
+add_store_test(tenant_quota_policy_test tenant_quota_policy_test.cpp)
 add_store_test(tenant_quota_ledger_test tenant_quota_ledger_test.cpp)
 add_store_test(tenant_id_test tenant_id_test.cpp)
 add_store_test(object_part_test object_part_test.cpp)
@@ -225,8 +233,10 @@ add_store_test(promotion_candidate_tracker_test
 add_store_test(dynamic_replication_lease_table_test
                dynamic_replication_lease_table_test.cpp)
 add_store_test(group_index_test group_index_test.cpp)
-add_store_test(metadata_tenant_test metadata_tenant_test.cpp)
-add_store_test(metadata_tenant_registry_test metadata_tenant_registry_test.cpp)
+add_store_test(metadata_namespace_test metadata_namespace_test.cpp)
+add_store_test(metadata_namespace_table_test metadata_namespace_table_test.cpp)
+add_store_test(eviction_index_test eviction_index_test.cpp)
+add_store_test(evictor_test evictor_test.cpp)
 add_store_test(segment_test segment_test.cpp)
 add_executable(local_ssd_test local_ssd/local_ssd_test.cpp)
 target_include_directories(local_ssd_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
@@ -254,6 +264,8 @@ add_store_test(cxl_segment_config_test cxl_segment_config_test.cpp)
 add_store_test(client_numa_config_test client_numa_config_test.cpp)
 add_store_test(local_hot_cache_config_test local_hot_cache_config_test.cpp)
 add_store_test(client_local_hot_cache_test client_local_hot_cache_test.cpp)
+add_store_test(local_hot_cache_concurrency_test
+               local_hot_cache_concurrency_test.cpp)
 add_store_test(real_client_hugepage_register_test real_client_hugepage_register_test.cpp)
 add_store_test(real_client_regular_page_register_test real_client_regular_page_register_test.cpp)
 add_store_test(client_tcp_local_memcpy_test client_tcp_local_memcpy_test.cpp)
@@ -501,6 +513,13 @@ target_compile_definitions(oplog_test_failpoint_test
 target_link_libraries(oplog_test_failpoint_test PRIVATE glog::glog gtest
                                                         gtest_main pthread)
 add_test(NAME oplog_test_failpoint_test COMMAND oplog_test_failpoint_test)
+add_executable(shutdown_request_test shutdown_request_test.cpp
+                                     ../src/shutdown_request.cpp)
+target_include_directories(shutdown_request_test
+                           PRIVATE ${MOONCAKE_STORE_INCLUDE_ROOT})
+target_link_libraries(shutdown_request_test PRIVATE glog::glog gtest gtest_main
+                                                    pthread)
+add_test(NAME shutdown_request_test COMMAND shutdown_request_test)
 add_ha_test(master_service_ha_test ha/master_service_ha_test.cpp)
 
 foreach(
