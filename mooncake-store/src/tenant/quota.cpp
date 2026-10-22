@@ -156,6 +156,25 @@ TenantQuotaChargeResult TenantQuotaAccount::TryCharge(uint64_t bytes) {
     }
 }
 
+void TenantQuotaAccount::ChargeUnchecked(uint64_t bytes) {
+    if (bytes == 0) {
+        return;
+    }
+    uint64_t expected = charged_state_.load(std::memory_order_acquire);
+    for (;;) {
+        const uint64_t charged_bytes = expected & kChargedBytesMask;
+        const uint64_t next = bytes > kMaxChargedBytes - charged_bytes
+                                  ? kMaxChargedBytes
+                                  : charged_bytes + bytes;
+        const uint64_t desired = (expected & kAdmissionClosed) | next;
+        if (charged_state_.compare_exchange_weak(expected, desired,
+                                                 std::memory_order_acq_rel,
+                                                 std::memory_order_acquire)) {
+            return;
+        }
+    }
+}
+
 TenantQuotaResult TenantQuotaAccount::Release(uint64_t bytes) {
     if (bytes == 0) {
         return {};

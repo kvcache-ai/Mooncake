@@ -99,7 +99,8 @@ void RunDfsEvictionCase(
     MasterScenario scenario("DFS eviction case " + case_name);
     scenario.Given(MemoryNode("memory"));
     for (size_t index = 0; index < 4; ++index) {
-        scenario.When(PutStart(DfsEvictionKey(index), 100).DfsReplicas(1));
+        // Four 8 KiB objects fill the 32 KiB shard past the high watermark.
+        scenario.When(PutStart(DfsEvictionKey(index), 8 * 1024).DfsReplicas(1));
         scenario.When(PutEnd(DfsEvictionKey(index)).OfType(ReplicaType::ALL));
     }
     for (const size_t index : leased_indexes) {

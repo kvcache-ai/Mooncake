@@ -106,6 +106,42 @@ struct ObjectMetadata {
     const TenantId tenant_id;
     const std::string user_key;
 
+    // Committed attribution only; protected by the owning metadata shard lock.
+    std::string session_id;
+    struct PendingSessionTag {
+        std::string session_id;
+        std::unordered_set<ReplicaID> eligible_replica_ids;
+    };
+    std::optional<PendingSessionTag> pending_session_tag;
+
+    void BeginSessionTag(std::string id,
+                         const std::unordered_set<ReplicaID>& replicas) {
+        pending_session_tag.reset();
+        if (!id.empty()) {
+            pending_session_tag = PendingSessionTag{std::move(id), replicas};
+        }
+    }
+
+    void CommitSessionTag(ReplicaID replica_id) {
+        if (pending_session_tag &&
+            pending_session_tag->eligible_replica_ids.contains(replica_id)) {
+            session_id = std::move(pending_session_tag->session_id);
+            pending_session_tag.reset();
+        }
+    }
+
+    void ClearSessionTagIfNoViableReplica() {
+        if (pending_session_tag && !HasReplica([this](const Replica& replica) {
+                return pending_session_tag->eligible_replica_ids.contains(
+                           replica.id()) &&
+                       replica.is_processing() &&
+                       !replica.has_invalid_mem_handle() &&
+                       !replica.has_invalid_nof_handle();
+            })) {
+            pending_session_tag.reset();
+        }
+    }
+
     mutable SpinLock lock;
     // Authoritative lease: ungrouped objects own one; grouped objects share
     // the group's. Never null after construction.

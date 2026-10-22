@@ -21,6 +21,16 @@ use std::sync::Arc;
 pub trait MetadataBackend: Send + Sync {
     fn route_namespace(&self) -> String;
 
+    /// Returns the tenant whose control-plane keyspace this backend is bound to.
+    ///
+    /// An unbound backend returns `None` and may be used by administrative
+    /// callers to select a tenant with [`Self::for_tenant`]. Operations whose
+    /// explicit tenant selects the control-plane keyspace must reject a tenant
+    /// different from this binding.
+    fn bound_tenant(&self) -> Option<&str> {
+        None
+    }
+
     fn for_tenant(&self, _tenant: &str) -> Option<Arc<dyn MetadataBackend>> {
         None
     }
@@ -350,6 +360,13 @@ pub trait MetadataBackend: Send + Sync {
             .iter()
             .map(|scope| self.get_tenant_policy(scope))
             .collect()
+    }
+
+    /// Lists tenants known to the metadata backend using a maintained index.
+    fn list_tenants(&self) -> Result<Vec<String>> {
+        Err(crate::error::StoreError::Unsupported(
+            "metadata backend does not support list_tenants".to_string(),
+        ))
     }
 
     fn list_tenant_policies(&self, tenant: Option<&str>) -> Result<Vec<TenantPolicy>>;
