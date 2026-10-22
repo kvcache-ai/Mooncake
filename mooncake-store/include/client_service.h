@@ -14,7 +14,6 @@
 #include <ylt/util/tl/expected.hpp>
 #include "mutex.h"
 
-#include "client_metric.h"
 #include "p2p/client/inflight_tracker.h"
 #include "transfer_engine.h"
 #include "types.h"
@@ -355,27 +354,13 @@ class ClientService {
         const TaskCompleteRequest& task_complete);
 
     // For human-readable metrics
-    tl::expected<std::string, ErrorCode> GetSummaryMetrics() {
-        ClientMetric* metrics = GetMetrics();
-        if (metrics == nullptr) {
-            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-        }
-        return metrics->summary_metrics();
-    }
+    virtual tl::expected<std::string, ErrorCode> GetSummaryMetrics() = 0;
 
     virtual tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>
     CalcCacheStats() = 0;
 
     // For Prometheus-style metrics
-    tl::expected<std::string, ErrorCode> SerializeMetrics() {
-        ClientMetric* metrics = GetMetrics();
-        if (metrics == nullptr) {
-            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-        }
-        std::string str;
-        metrics->serialize(str);
-        return str;
-    }
+    virtual tl::expected<std::string, ErrorCode> SerializeMetrics() = 0;
 
     /**
      * @brief Gets the HTTP server port.
@@ -464,12 +449,6 @@ class ClientService {
     ClientService(const std::string& metadata_connstring,
                   uint16_t http_port = 9003, bool enable_http_server = true,
                   const std::map<std::string, std::string>& labels = {});
-
-    /**
-     * @brief Get the metrics object for this client.
-     * @return Pointer to ClientMetric, or nullptr if metrics are disabled.
-     */
-    virtual ClientMetric* GetMetrics() = 0;
 
     /**
      * @brief Initializes the Transfer Engine.

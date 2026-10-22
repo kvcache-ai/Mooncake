@@ -8,6 +8,7 @@
 #include <functional>
 #include <iomanip>
 #include <limits>
+#include <map>
 #include <linux/memfd.h>
 #include <linux/mman.h>
 #include <optional>
@@ -27,6 +28,14 @@
 #include "types.h"
 
 namespace mooncake {
+
+// Merge process-start cluster labels with caller-provided metric labels.
+// A configured cluster_id takes precedence over a caller-provided value.
+// TODO(post-Client / before external interface; see p2p-split-plan-v2.md):
+// Audit P2P consumers of this header and utils.cpp at the include, object and
+// link-target levels. Preserve label behavior if a narrower helper is needed.
+std::map<std::string, std::string> merge_labels(
+    const std::map<std::string, std::string>& labels);
 
 // Convert ErrorCode to integer for Python bindings
 template <class T>

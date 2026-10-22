@@ -1,6 +1,7 @@
 #pragma once
 
 #include "client_service.h"
+#include "client_metric.h"
 #include "ha_helper.h"
 #include "master_client.h"
 #include "storage_backend.h"
@@ -304,11 +305,13 @@ class CentralizedClientService
     tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>
     CalcCacheStats() override;
 
+    tl::expected<std::string, ErrorCode> GetSummaryMetrics() override;
+
+    tl::expected<std::string, ErrorCode> SerializeMetrics() override;
+
    protected:
     void StartPing(const std::string& master_server_entry);
     void PingThreadMain(bool is_ha_mode, std::string current_master_address);
-
-    ClientMetric* GetMetrics() override { return metrics_.get(); }
 
    private:
     bool IsHAMode(const std::string& master_server_entry) const;
