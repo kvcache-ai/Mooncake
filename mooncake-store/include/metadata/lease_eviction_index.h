@@ -19,7 +19,8 @@
 // The filed members of a group are filed as one entry of the index's own,
 // which the group's last filed member takes with it. Members share one lease,
 // which only ever grows, so the deadline the latest member write saw is the
-// group's, and the group is filed at it.
+// group's, and the group is filed at it. That lease is also how the index tells
+// groups apart: a group recreated under the same id has a new one.
 
 #include <atomic>
 #include <chrono>
@@ -31,15 +32,16 @@
 #include <mutex>
 #include <optional>
 #include <string>
-#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include <boost/intrusive/list.hpp>
 
+#include "lease.h"
 #include "metadata/eviction_index.h"
 #include "metadata/object_route.h"
+#include "mutex.h"
 #include "object_metadata.h"
 
 namespace mooncake {
@@ -66,14 +68,13 @@ class LeaseEvictionIndex final : public EvictionIndex {
         route::SlotOwnerState& owner = guard.owner_state();
         const bool file = guard.has_object() && Qualifies(guard.metadata());
         const Rank rank = file ? RankOf(guard.metadata()) : 0;
-        const std::string_view group_id =
-            file ? std::string_view(guard.metadata().group_id)
-                 : std::string_view();
+        const Lease* const lease =
+            file ? GroupLeaseOf(guard.metadata()) : nullptr;
         // Read without the index lock: the group outlives this member, which
-        // the held key lock keeps in it, and its id never changes.
+        // the held key lock keeps in it, and its lease never changes.
         Group* const filed_in = GroupOf(owner);
         const bool same_group =
-            filed_in != nullptr ? filed_in->id() == group_id : group_id.empty();
+            (filed_in != nullptr ? filed_in->lease() : nullptr) == lease;
         if (file == owner.eviction_filed &&
             (!file || (rank == owner.eviction_rank && same_group))) {
             return;
@@ -86,7 +87,7 @@ class LeaseEvictionIndex final : public EvictionIndex {
                 Unfile(guard.slot(), owner);
             }
             if (file) {
-                File(guard.slot(), group_id, rank, owner);
+                File(guard.slot(), guard.metadata(), lease, rank, owner);
             }
         }
         owner.eviction_filed = file;
@@ -105,11 +106,13 @@ class LeaseEvictionIndex final : public EvictionIndex {
     // The filed members of one group, filed in `buckets` at the rank the
     // latest member write saw from construction to destruction. Members are
     // linked through the hook a key filed on its own is linked into its
-    // bucket by. A group recreated under the same id is another incarnation.
+    // bucket by. The group holds the lease its members share, so that lease's
+    // address names it alone while it lives.
     class Group {
        public:
-        Group(std::string id, uint64_t incarnation, Rank rank, Buckets& buckets)
-            : id_(std::move(id)),
+        Group(std::shared_ptr<const Lease> lease, uint64_t incarnation,
+              Rank rank, Buckets& buckets)
+            : lease_(std::move(lease)),
               incarnation_(incarnation),
               rank_(rank),
               buckets_(buckets) {
@@ -120,7 +123,7 @@ class LeaseEvictionIndex final : public EvictionIndex {
         Group(const Group&) = delete;
         Group& operator=(const Group&) = delete;
 
-        [[nodiscard]] const std::string& id() const { return id_; }
+        [[nodiscard]] const Lease* lease() const { return lease_.get(); }
         [[nodiscard]] uint64_t incarnation() const { return incarnation_; }
 
         void MoveTo(Rank rank) {
@@ -150,7 +153,7 @@ class LeaseEvictionIndex final : public EvictionIndex {
         using Hook = boost::intrusive::list_member_hook<
             boost::intrusive::link_mode<boost::intrusive::safe_link>>;
 
-        const std::string id_;
+        const std::shared_ptr<const Lease> lease_;
         const uint64_t incarnation_;
         Rank rank_;
         Buckets& buckets_;
@@ -292,21 +295,37 @@ class LeaseEvictionIndex final : public EvictionIndex {
         return static_cast<Group*>(owner.eviction_group);
     }
 
-    // Files `slot`, which `owner` describes, at `rank`, on its own or as a
-    // member of `group_id`.
-    void File(route::KeySlot& slot, std::string_view group_id, Rank rank,
-              route::SlotOwnerState& owner) {
+    // The lease the members of `metadata`'s group share; null for an object
+    // on its own.
+    static const Lease* GroupLeaseOf(const ObjectMetadata& metadata) {
+        if (!metadata.IsGrouped()) {
+            return nullptr;
+        }
+        SpinLocker locker(&metadata.lock);
+        return metadata.lease_.get();
+    }
+
+    // Files `slot`, which holds `metadata` and which `owner` describes, at
+    // `rank`, on its own or, with `lease`, as a member of that lease's group.
+    void File(route::KeySlot& slot, const ObjectMetadata& metadata,
+              const Lease* lease, Rank rank, route::SlotOwnerState& owner) {
         ++size_;
-        if (group_id.empty()) {
+        if (lease == nullptr) {
             buckets_.Add(rank, slot);
             return;
         }
-        auto it = groups_.find(group_id);
+        auto it = groups_.find(lease);
         if (it == groups_.end()) {
-            auto group = std::make_unique<Group>(
-                std::string(group_id), ++groups_created_, rank, buckets_);
-            const std::string_view id = group->id();
-            it = groups_.emplace(id, std::move(group)).first;
+            std::shared_ptr<const Lease> held;
+            {
+                SpinLocker locker(&metadata.lock);
+                held = metadata.lease_;
+            }
+            it = groups_
+                     .emplace(lease, std::make_unique<Group>(std::move(held),
+                                                             ++groups_created_,
+                                                             rank, buckets_))
+                     .first;
         } else {
             it->second->MoveTo(rank);
         }
@@ -322,15 +341,15 @@ class LeaseEvictionIndex final : public EvictionIndex {
         if (group == nullptr) {
             buckets_.Remove(owner.eviction_rank, slot);
         } else if (group->Leave(slot)) {
-            groups_.erase(groups_.find(group->id()));
+            groups_.erase(groups_.find(group->lease()));
         }
     }
 
     mutable std::mutex mutex_;
     Buckets buckets_;
-    // Each keyed by its own id. Declared after the buckets, so every group
-    // leaves its bucket before the buckets go.
-    std::unordered_map<std::string_view, std::unique_ptr<Group>> groups_;
+    // Each keyed by the lease it holds. Declared after the buckets, so every
+    // group leaves its bucket before the buckets go.
+    std::unordered_map<const Lease*, std::unique_ptr<Group>> groups_;
     // Numbers each group's incarnation, from 1.
     uint64_t groups_created_ = 0;
     // Keys filed, on their own or in a group.

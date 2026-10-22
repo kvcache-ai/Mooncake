@@ -306,6 +306,50 @@ TEST_F(LeaseEvictionIndexTest, AKeyInARecreatedGroupIsNoLongerAtItsEntry) {
     EXPECT_FALSE(cursor->StillAt(*guard, *entry));
 }
 
+// A group's last member torn down and published again under the same id
+// within one write lock starts a new group with a new lease, which an entry
+// copied before does not stand for.
+TEST_F(LeaseEvictionIndexTest, AGroupRecreatedInPlaceIsANewIncarnation) {
+    PublishInGroup("g1", "g", t0_);
+    auto cursor = ns_.eviction_index().Scan(t0_ + seconds(1));
+    std::optional<EvictionIndex::Entry> entry = cursor->Next();
+    ASSERT_TRUE(entry.has_value());
+    {
+        auto guard = ns_.objects.Write("g1");
+        ASSERT_TRUE(guard.has_value());
+        guard->TearDown();
+        PublishIn(*guard, "g1", "g");
+        SetDeadline(guard->metadata(), t0_);
+    }
+
+    auto guard = ns_.objects.Write("g1");
+    ASSERT_TRUE(guard.has_value());
+    EXPECT_FALSE(cursor->StillAt(*guard, *entry));
+}
+
+// A member replaced in place while others keep the group stays in it.
+TEST_F(LeaseEvictionIndexTest, AMemberReplacedInPlaceStaysInItsGroup) {
+    PublishInGroup("g1", "g", t0_);
+    PublishInGroup("g2", "g", t0_);
+    auto cursor = ns_.eviction_index().Scan(t0_ + seconds(1));
+    std::optional<EvictionIndex::Entry> entry = cursor->Next();
+    ASSERT_TRUE(entry.has_value());
+    {
+        auto guard = ns_.objects.Write("g1");
+        ASSERT_TRUE(guard.has_value());
+        guard->TearDown();
+        PublishIn(*guard, "g1", "g");
+    }
+
+    {
+        auto guard = ns_.objects.Write("g1");
+        ASSERT_TRUE(guard.has_value());
+        EXPECT_TRUE(cursor->StillAt(*guard, *entry));
+    }
+    EXPECT_EQ(DueEntries(t0_ + seconds(1)),
+              (std::vector<std::set<std::string>>{{"g1", "g2"}}));
+}
+
 // An index that counts what the namespace tells it.
 class CountingIndex final : public EvictionIndex {
    public:
