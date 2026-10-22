@@ -315,6 +315,41 @@ TEST_F(P2PClientHttpEndpointsTest, HttpGetAllKeysInvalidLimit) {
 }
 
 // ============================================================================
+// /metrics + /metrics/summary
+// ============================================================================
+
+TEST_F(P2PClientHttpEndpointsTest, MetricsUseConcreteClientOutput) {
+    ClientService& facade = *client_;
+    ASSERT_TRUE(facade.SerializeMetrics().has_value());
+    ASSERT_TRUE(facade.GetSummaryMetrics().has_value());
+
+    const auto metrics = HttpGet(Url("/metrics"));
+    ASSERT_EQ(metrics.status, 200);
+    EXPECT_NE(metrics.resp_body.find("mooncake_p2p_total_get_requests_total"),
+              std::string::npos);
+    EXPECT_NE(metrics.resp_body.find("mooncake_transfer_read_bytes"),
+              std::string::npos);
+
+    const auto summary = HttpGet(Url("/metrics/summary"));
+    ASSERT_EQ(summary.status, 200);
+    EXPECT_NE(summary.resp_body.find("P2P Total (per-request)"),
+              std::string::npos);
+    EXPECT_EQ(summary.resp_body.find("Transfer Metrics Summary"),
+              std::string::npos);
+}
+
+TEST_F(P2PClientHttpEndpointsTest, DisabledMetricsPreserveFacadeErrors) {
+    P2PClientService disabled_client("P2PHANDSHAKE", 0, false, {}, false);
+    ClientService& facade = disabled_client;
+    const auto metrics = facade.SerializeMetrics();
+    ASSERT_FALSE(metrics.has_value());
+    EXPECT_EQ(metrics.error(), ErrorCode::INVALID_PARAMS);
+    const auto summary = facade.GetSummaryMetrics();
+    ASSERT_FALSE(summary.has_value());
+    EXPECT_EQ(summary.error(), ErrorCode::INVALID_PARAMS);
+}
+
+// ============================================================================
 // /unregister + /register
 // ============================================================================
 

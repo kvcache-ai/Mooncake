@@ -3,18 +3,47 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <map>
 #include <memory>
+#include <ostream>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
 #include <ylt/metric/gauge.hpp>
 
-#include "client_metric.h"
 #include "p2p/client/heartbeat_type.h"
+#include "hybrid_metric.h"
 #include "types.h"
 
 namespace mooncake {
+
+struct P2PTransferMetric {
+    P2PTransferMetric(std::map<std::string, std::string> labels = {});
+
+    ylt::metric::counter_t total_read_bytes;
+    ylt::metric::counter_t total_write_bytes;
+    ylt::metric::histogram_t batch_put_latency_us;
+    ylt::metric::histogram_t batch_get_latency_us;
+    ylt::metric::histogram_t get_latency_us;
+    ylt::metric::histogram_t put_latency_us;
+
+    void serialize(std::string& str);
+};
+
+struct P2PMasterClientMetric {
+    std::array<std::string, 1> rpc_names = {"rpc_name"};
+
+    P2PMasterClientMetric(std::map<std::string, std::string> labels = {});
+
+    ylt::metric::hybrid_counter_1t rpc_count;
+    ylt::metric::hybrid_histogram_1t rpc_latency;
+
+    void serialize(std::string& str);
+
+    std::string summary_metrics();
+};
 
 class CacheTier;  // Defined in tiered_cache/tiers/cache_tier.h
 
@@ -252,8 +281,11 @@ struct KeyRetentionMetric {
     std::vector<std::atomic<int64_t>> cohorts_;
 };
 
-struct P2PClientMetric : public ClientMetric {
+struct P2PClientMetric {
    public:
+    P2PTransferMetric transfer_metric;
+    P2PMasterClientMetric master_client_metric;
+
     // total_request is recorded at request (Batch) granularity:
     // BatchPut/BatchGet counts as one request, and every key in the batch
     // shares same latency sample (the time cost depend on the slowest key).
@@ -271,18 +303,28 @@ struct P2PClientMetric : public ClientMetric {
 
    public:
     static std::unique_ptr<P2PClientMetric> Create(
-        const std::map<std::string, std::string>& labels = {}) {
-        return CreatePtr<P2PClientMetric>(labels);
-    }
+        const std::map<std::string, std::string>& labels = {});
 
     explicit P2PClientMetric(
         uint64_t interval_seconds = 0,
         const std::map<std::string, std::string>& labels = {});
+    ~P2PClientMetric();
+
+    uint64_t GetReportingInterval() const { return metrics_interval_seconds_; }
+    void StartMetricReporting(uint64_t interval_seconds);
 
     ClientMetricSnapshot BuildSyncSnapshot();
 
-    void serialize(std::string& str) override;
-    std::string summary_metrics() override;
+    void serialize(std::string& str);
+    std::string summary_metrics();
+
+   private:
+    std::jthread metrics_reporting_thread_;
+    std::atomic<bool> should_stop_metrics_thread_{false};
+    uint64_t metrics_interval_seconds_{0};
+
+    void StartMetricsReportingThread();
+    void StopMetricsReportingThread();
 };
 
 }  // namespace mooncake

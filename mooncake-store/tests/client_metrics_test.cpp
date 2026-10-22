@@ -1,17 +1,12 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
-#include <array>
 #include <cstdlib>
-#include <map>
-#include <memory>
+#include <optional>
 #include <string>
-#include <thread>
-#include <vector>
-
-#include <ylt/struct_pack.hpp>
 
 #include "client_metric.h"
+#include "utils.h"
 
 namespace mooncake::test {
 
@@ -90,12 +85,10 @@ TEST_F(ClientMetricsTest, MasterClientMetricsSummaryTest) {
 
     summary = metrics.summary_metrics();
 
-    // TODO(C1): Restore A00 successful-call count summaries and these original
-    // seven centralized cases when the shared P2P metric implementation splits.
     // Check that RPC calls are recorded
-    EXPECT_TRUE(summary.find("GetReplicaList: total=2") != std::string::npos);
-    EXPECT_TRUE(summary.find("MountSegment: total=1") != std::string::npos);
-    EXPECT_TRUE(summary.find("UnmountSegment: total=1") != std::string::npos);
+    EXPECT_TRUE(summary.find("GetReplicaList: count=2") != std::string::npos);
+    EXPECT_TRUE(summary.find("MountSegment: count=1") != std::string::npos);
+    EXPECT_TRUE(summary.find("UnmountSegment: count=1") != std::string::npos);
 
     // Check percentiles are present for RPCs with data
     EXPECT_TRUE(summary.find("p95<") != std::string::npos);
@@ -126,8 +119,7 @@ TEST_F(ClientMetricsTest, ClientMetricsSummaryTest) {
     EXPECT_TRUE(summary.find("RPC Metrics Summary") != std::string::npos);
     EXPECT_TRUE(summary.find("Total Read: 5.00 MB") != std::string::npos);
     EXPECT_TRUE(summary.find("Total Write: 10.00 MB") != std::string::npos);
-    // TODO(C1): Restore A00 "ExistKey: count=1" with centralized metrics.
-    EXPECT_TRUE(summary.find("ExistKey: total=1") != std::string::npos);
+    EXPECT_TRUE(summary.find("ExistKey: count=1") != std::string::npos);
 
     std::cout << "Full Client Metrics Summary:\n" << summary << std::endl;
 }
@@ -277,43 +269,105 @@ TEST_F(ClientMetricsTest, SerializeWithoutDynamicLabels) {
     }
 }
 
-// TODO(C1): Restore a00f757 ClientMetric::Create environment/interval behavior
-// with the centralized implementation split; this is not an A00 baseline case.
-TEST_F(ClientMetricsTest, ClientMetricCreateReturnsInstance) {
-    auto metrics = ClientMetric::Create({});
-    EXPECT_NE(metrics, nullptr);
-    // Created without a reporting thread; interval is set at Init.
-    EXPECT_EQ(metrics->GetReportingInterval(), 0u);
+TEST_F(ClientMetricsTest, SingleSamplePreservesA00Summary) {
+    TransferMetric transfer;
+    transfer.get_latency_us.observe(5000);
+    EXPECT_NE(
+        transfer.summary_metrics().find("Get: count=1, p95<125μs, max<5000μs"),
+        std::string::npos);
+
+    MasterClientMetric rpc;
+    const std::array<std::string, 1> label = {"GetReplicaList"};
+    rpc.rpc_count.inc(label, 3);
+    EXPECT_EQ(rpc.summary_metrics(),
+              "=== RPC Metrics Summary ===\nNo RPC calls recorded\n");
+    rpc.rpc_latency.observe(label, 5000);
+    EXPECT_EQ(rpc.summary_metrics(),
+              "=== RPC Metrics Summary ===\n"
+              "GetReplicaList: count=1, p95<125μs, max<5000μs\n");
+
+    // The centralized baseline reports only its fixed RPC name list.
+    rpc.rpc_count.inc({"P2POnlyRpc"});
+    rpc.rpc_latency.observe({"P2POnlyRpc"}, 5000);
+    EXPECT_EQ(rpc.summary_metrics().find("P2POnlyRpc"), std::string::npos);
 }
 
-// TODO(C1): Keep the single-sample improvement on the P2P path only after
-// metrics are split. Restore centralized A00 behavior without fixing its p95
-// limitation; this shared-implementation check is not an A00 baseline case.
-TEST_F(ClientMetricsTest, FormatLatencySummarySingleSampleTest) {
-    // A single sample in a high bucket must not be reported as p95 of the
-    // first bucket (p95_target rounds to at least 1).
-    ylt::metric::histogram_t hist("test_single_sample_hist", "test",
-                                  kLatencyBucket,
-                                  std::map<std::string, std::string>{});
-    hist.observe(5000);
+TEST_F(ClientMetricsTest, ClusterLabelsPreserveA00Precedence) {
+    const std::map<std::string, std::string> labels = {
+        {"cluster_id", "caller-cluster"}, {"instance", "test-instance"}};
+    const auto merged = merge_labels(labels);
+    const char* cluster = std::getenv("MC_STORE_CLUSTER_ID");
+    EXPECT_EQ(merged.at("cluster_id"),
+              cluster && *cluster ? cluster : "caller-cluster");
+    EXPECT_EQ(merged.at("instance"), "test-instance");
+    EXPECT_EQ(labels.at("cluster_id"), "caller-cluster");
+}
 
-    std::string summary = format_latency_summary(hist);
-    EXPECT_TRUE(summary.find("count=1") != std::string::npos);
-    EXPECT_TRUE(summary.find("p95<5000μs") != std::string::npos);
-    EXPECT_TRUE(summary.find("max<5000μs") != std::string::npos);
-    EXPECT_TRUE(summary.find("p95<125μs") == std::string::npos);
+class ClientMetricFactoryTest : public ClientMetricsTest {
+   protected:
+    void SetUp() override {
+        ClientMetricsTest::SetUp();
+        for (size_t i = 0; i < env_names_.size(); ++i) {
+            if (const char* value = std::getenv(env_names_[i])) {
+                saved_env_[i] = value;
+            }
+            ASSERT_EQ(unsetenv(env_names_[i]), 0);
+        }
+    }
 
-    // Same boundary through the labeled RPC histogram path.
-    MasterClientMetric master_metrics;
-    std::array<std::string, 1> label = {"GetReplicaList"};
-    master_metrics.rpc_count.inc(label);
-    master_metrics.rpc_latency.observe(label, 5000);
+    void TearDown() override {
+        for (size_t i = 0; i < env_names_.size(); ++i) {
+            const int result =
+                saved_env_[i] ? setenv(env_names_[i], saved_env_[i]->c_str(), 1)
+                              : unsetenv(env_names_[i]);
+            EXPECT_EQ(result, 0);
+        }
+        ClientMetricsTest::TearDown();
+    }
 
-    std::string rpc_summary = master_metrics.summary_metrics();
-    EXPECT_TRUE(
-        rpc_summary.find("GetReplicaList: total=1, success=1, p95<5000μs") !=
-        std::string::npos);
-    EXPECT_TRUE(rpc_summary.find("p95<125μs") == std::string::npos);
+   private:
+    const std::array<const char*, 2> env_names_ = {
+        "MC_STORE_CLIENT_METRIC", "MC_STORE_CLIENT_METRIC_INTERVAL"};
+    std::array<std::optional<std::string>, 2> saved_env_;
+};
+
+TEST_F(ClientMetricFactoryTest, DefaultsToCollectionWithoutReporting) {
+    auto metrics = ClientMetric::Create({{"instance", "centralized"}});
+    ASSERT_NE(metrics, nullptr);
+    EXPECT_EQ(metrics->GetReportingInterval(), 0u);
+    std::string serialized;
+    metrics->serialize(serialized);
+    EXPECT_NE(serialized.find("instance=\"centralized\""), std::string::npos);
+    EXPECT_EQ(serialized.find("cluster_id="), std::string::npos);
+}
+
+TEST_F(ClientMetricFactoryTest, UsesA00EnableValues) {
+    for (const char* value : {"1", "TRUE", "Yes", "ON", "enable"}) {
+        SCOPED_TRACE(value);
+        ASSERT_EQ(setenv("MC_STORE_CLIENT_METRIC", value, 1), 0);
+        EXPECT_NE(ClientMetric::Create(), nullptr);
+    }
+    for (const char* value : {"0", "false", "off", "", "invalid"}) {
+        SCOPED_TRACE(value);
+        ASSERT_EQ(setenv("MC_STORE_CLIENT_METRIC", value, 1), 0);
+        EXPECT_EQ(ClientMetric::Create(), nullptr);
+    }
+}
+
+TEST_F(ClientMetricFactoryTest, UsesEnvironmentReportingInterval) {
+    ASSERT_EQ(setenv("MC_STORE_CLIENT_METRIC_INTERVAL", "7", 1), 0);
+    auto metrics = ClientMetric::Create();
+    ASSERT_NE(metrics, nullptr);
+    EXPECT_EQ(metrics->GetReportingInterval(), 7u);
+    metrics.reset();
+
+    for (const char* value : {"0", "invalid", "18446744073709551616"}) {
+        SCOPED_TRACE(value);
+        ASSERT_EQ(setenv("MC_STORE_CLIENT_METRIC_INTERVAL", value, 1), 0);
+        metrics = ClientMetric::Create();
+        ASSERT_NE(metrics, nullptr);
+        EXPECT_EQ(metrics->GetReportingInterval(), 0u);
+    }
 }
 
 }  // namespace mooncake::test

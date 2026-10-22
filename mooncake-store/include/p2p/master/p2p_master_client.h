@@ -20,8 +20,8 @@
 #include <ylt/coro_io/client_pool.hpp>
 #include <ylt/coro_rpc/coro_rpc_client.hpp>
 
-#include "client_metric.h"
 #include "mutex.h"
+#include "p2p/client/p2p_client_metric.h"
 #include "p2p/common/p2p_rpc_types.h"
 #include "types.h"
 
@@ -38,7 +38,7 @@ inline const std::string kDefaultP2PMasterAddress = "localhost:50051";
 class P2PMasterClient final {
    public:
     P2PMasterClient(const UUID& client_id,
-                    MasterClientMetric* metrics = nullptr)
+                    P2PMasterClientMetric* metrics = nullptr)
         : client_id_(client_id), metrics_(metrics) {
         coro_io::client_pool<coro_rpc::coro_rpc_client>::pool_config
             pool_conf{};
@@ -281,7 +281,7 @@ class P2PMasterClient final {
     uint16_t heartbeat_rpc_port_ = 0;
 
     const UUID client_id_;
-    MasterClientMetric* metrics_;
+    P2PMasterClientMetric* metrics_;
     std::shared_ptr<coro_io::client_pools<coro_rpc::coro_rpc_client>>
         client_pools_;
 

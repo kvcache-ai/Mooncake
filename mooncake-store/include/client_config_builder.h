@@ -123,11 +123,17 @@ struct RealClientConfigBase {
     // Loaded from file path, inline JSON string, or env MC_RUNTIME_CONFIG
     Json::Value runtime_config_json;
 
+    // TODO(C4 / external interface; see p2p-split-plan-v2.md): Define metric
+    // input and environment precedence in the architecture-specific builders.
+    // Shared effective fields must have identical semantics; split fields that
+    // cannot meet that contract out of RealClientConfigBase.
     // Whether to collect client metrics at all.
+    // Centralized clients also honor MC_STORE_CLIENT_METRIC.
     bool enable_metric_collection = true;
 
-    // Periodic client-metric reporting interval, in seconds.
+    // P2P client-metric reporting interval, in seconds.
     // When it is 0, metric reporting is disabled.
+    // Centralized reporting uses MC_STORE_CLIENT_METRIC_INTERVAL.
     uint64_t metric_report_interval_seconds = 60;
 
     // Redis election backend configuration.

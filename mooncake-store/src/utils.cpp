@@ -23,6 +23,23 @@
 
 namespace mooncake {
 
+namespace {
+const std::string kMetricClusterID = [] {
+    const char* value = std::getenv("MC_STORE_CLUSTER_ID");
+    return value ? std::string(value) : std::string();
+}();
+}  // namespace
+
+std::map<std::string, std::string> merge_labels(
+    const std::map<std::string, std::string>& labels) {
+    std::map<std::string, std::string> merged_labels;
+    if (!kMetricClusterID.empty()) {
+        merged_labels["cluster_id"] = kMetricClusterID;
+    }
+    merged_labels.insert(labels.begin(), labels.end());
+    return merged_labels;
+}
+
 bool isPortAvailable(int port) {
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0) return false;

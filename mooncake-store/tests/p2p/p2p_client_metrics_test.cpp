@@ -11,7 +11,6 @@
 
 #include <ylt/struct_pack.hpp>
 
-#include "client_metric.h"
 #include "p2p/client/p2p_client_metric.h"
 #include "p2p/util/metric_util.h"
 #include "p2p/client/tiered_cache/tiers/cache_tier.h"
@@ -162,42 +161,84 @@ TEST_F(P2PClientMetricsTest, P2PClientMetricWithLabelsTest) {
                 std::string::npos);
 }
 
-// TODO(C1): Replace shared-base coverage with the standalone P2P metric
-// contract after implementation inheritance is removed; preserve outputs.
-// Test P2PClientMetric inheritance from ClientMetric
-TEST_F(P2PClientMetricsTest, P2PClientMetricInheritanceTest) {
+TEST_F(P2PClientMetricsTest, P2PMasterRpcSummaryPreservesAttemptCounts) {
+    P2PMasterClientMetric metrics;
+    EXPECT_EQ(metrics.summary_metrics(),
+              "=== RPC Metrics Summary ===\nNo RPC calls recorded\n");
+
+    const std::array<std::string, 1> label = {"GetReadRoute"};
+    metrics.rpc_count.inc(label, 3);
+    EXPECT_EQ(metrics.summary_metrics(),
+              "=== RPC Metrics Summary ===\n"
+              "GetReadRoute: total=3, success=0\n");
+
+    metrics.rpc_latency.observe(label, 5000);
+    EXPECT_EQ(metrics.summary_metrics(),
+              "=== RPC Metrics Summary ===\n"
+              "GetReadRoute: total=3, success=1, p95<5000μs, max<5000μs\n");
+}
+
+TEST_F(P2PClientMetricsTest, P2PLatencySummaryPreservesSingleSample) {
+    ylt::metric::histogram_t hist("test_p2p_single_sample_hist", "test",
+                                  p2p::metric_util::LatencyBuckets(),
+                                  std::map<std::string, std::string>{});
+    EXPECT_EQ(p2p::metric_util::FormatLatencySummary(hist), "No data");
+    hist.observe(5000);
+    EXPECT_EQ(p2p::metric_util::FormatLatencySummary(hist),
+              "count=1, p95<5000μs, max<5000μs");
+}
+
+TEST_F(P2PClientMetricsTest, P2PReportingCanRestartAndStop) {
+    auto metrics = P2PClientMetric::Create({});
+    ASSERT_NE(metrics, nullptr);
+    EXPECT_EQ(metrics->GetReportingInterval(), 0u);
+    metrics->StartMetricReporting(1);
+    EXPECT_EQ(metrics->GetReportingInterval(), 1u);
+    metrics->StartMetricReporting(2);
+    EXPECT_EQ(metrics->GetReportingInterval(), 2u);
+    metrics->StartMetricReporting(0);
+    EXPECT_EQ(metrics->GetReportingInterval(), 0u);
+
+    // Destruction must join the reporter before destroying its metric members.
+    P2PClientMetric reporting_metrics(1);
+    EXPECT_EQ(reporting_metrics.GetReportingInterval(), 1u);
+}
+
+// Test the standalone metric preserves all previously exported series.
+TEST_F(P2PClientMetricsTest, P2PClientMetricStandaloneContractTest) {
     auto p2p_metrics = P2PClientMetric::Create({});
     ASSERT_NE(p2p_metrics, nullptr);
 
-    // Add data to both base class metrics and P2P-specific metrics
+    // Add data to retained transfer metrics and P2P request metrics
     p2p_metrics->transfer_metric.total_read_bytes.inc(1024 * 1024);  // 1 MB
     p2p_metrics->transfer_metric.total_write_bytes.inc(2 * 1024 *
                                                        1024);  // 2 MB
     p2p_metrics->total_request.get_requests.inc(100);
     p2p_metrics->total_request.put_requests.inc(50);
 
-    // Test serialize includes both base and P2P metrics
+    // Test serialize includes both retained transfer and P2P request metrics
     std::string serialized;
     p2p_metrics->serialize(serialized);
     EXPECT_TRUE(serialized.find("mooncake_transfer_read_bytes") !=
-                std::string::npos);  // Base class metric
+                std::string::npos);  // Retained transfer metric
     EXPECT_TRUE(serialized.find("mooncake_transfer_write_bytes") !=
-                std::string::npos);  // Base class metric
+                std::string::npos);  // Retained transfer metric
     EXPECT_TRUE(serialized.find("mooncake_p2p_total_get_requests_total") !=
                 std::string::npos);  // P2P-specific metric
     EXPECT_TRUE(serialized.find("mooncake_p2p_total_put_requests_total") !=
                 std::string::npos);  // P2P-specific metric
 
-    // Test summary_metrics includes both base and P2P metrics.
+    // Test summary_metrics includes RPC and P2P request metrics.
     // Note: transfer metrics are not recorded in P2P mode, so the P2P
     // summary intentionally skips the transfer section.
     std::string summary = p2p_metrics->summary_metrics();
     EXPECT_TRUE(summary.find("RPC Metrics Summary") !=
-                std::string::npos);  // Base class summary
+                std::string::npos);  // RPC summary
     EXPECT_TRUE(summary.find("P2P Total (per-request)") !=
                 std::string::npos);  // P2P-specific summary
     EXPECT_TRUE(summary.find("Get: 100 requests") != std::string::npos);
     EXPECT_TRUE(summary.find("Put: 50 requests") != std::string::npos);
+    EXPECT_EQ(summary.find("Transfer Metrics Summary"), std::string::npos);
 }
 
 // Test P2PClientMetric peer_request_metrics (per-RPC peer metrics)

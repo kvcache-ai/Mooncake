@@ -1,4 +1,5 @@
 #include "p2p/client/p2p_client_service.h"
+#include "p2p/util/metric_util.h"
 
 #include <glog/logging.h>
 
@@ -101,6 +102,24 @@ P2PClientService::P2PClientService(
                      metrics_ ? &metrics_->master_client_metric : nullptr) {
     runtime_config_store_ =
         std::make_unique<RuntimeConfigStore>(DeploymentMode::P2P);
+}
+
+tl::expected<std::string, ErrorCode> P2PClientService::GetSummaryMetrics() {
+    if (!metrics_) {
+        LOG(ERROR) << "Cannot get P2P client metrics summary: metrics disabled";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return metrics_->summary_metrics();
+}
+
+tl::expected<std::string, ErrorCode> P2PClientService::SerializeMetrics() {
+    if (!metrics_) {
+        LOG(ERROR) << "Cannot serialize P2P client metrics: metrics disabled";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    std::string str;
+    metrics_->serialize(str);
+    return str;
 }
 
 bool P2PClientService::IsHAMode(const std::string& master_server_entry) const {
@@ -2194,7 +2213,7 @@ async_simple::coro::Lazy<ErrorCode> P2PClientService::RunForwardReadOnRoute(
         UnPinKeyRequest cleanup;
         cleanup.key = req->key;
         cleanup.read_operation_id = read_operation_id;
-        Stopwatch rollback_sw;
+        p2p::metric_util::Stopwatch rollback_sw;
         bool cleanup_ok = false;
         ErrorCode cleanup_error = ErrorCode::OK;
         for (int attempt = 0; attempt < kRevokeRetryMaxCnt; ++attempt) {
@@ -2894,7 +2913,7 @@ P2PClientService::RemoteForwardWriteOp::RunForwardRemotePut(
             WriteRevokeRequest revoke_req;
             revoke_req.key = write_req->key;
             revoke_req.write_operation_id = pre.value().write_operation_id;
-            Stopwatch rollback_sw;
+            p2p::metric_util::Stopwatch rollback_sw;
             tl::expected<void, ErrorCode> revoke_res;
             for (int attempt = 0; attempt < kRevokeRetryMaxCnt; ++attempt) {
                 if (metrics) {

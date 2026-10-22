@@ -219,7 +219,11 @@ class P2PClientService final : public ClientService {
     tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>
     CalcCacheStats() override;
 
-    ClientMetric* GetMetrics() override { return metrics_.get(); }
+    P2PClientMetric* GetMetrics() { return metrics_.get(); }
+
+    tl::expected<std::string, ErrorCode> GetSummaryMetrics() override;
+
+    tl::expected<std::string, ErrorCode> SerializeMetrics() override;
 
     std::string GetHealthStatus() const override;
 
