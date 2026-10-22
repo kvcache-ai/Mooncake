@@ -149,6 +149,13 @@ struct MasterConfig {
     // (2) separately-deployed metadata server via async HTTP DELETE.
     bool enable_metadata_cleanup_on_timeout;
 
+    // True when this master process runs the co-located HTTP metadata
+    // server (enable_http_metadata_server=true). Propagated to
+    // MasterService so MountSegment can warn when a client in P2PHANDSHAKE
+    // mode (te_endpoint != name) mounts into a cluster whose readers rely
+    // on the HTTP metadata server (issue #4536).
+    bool serve_http_metadata = false;
+
     // Pod identity for K8s label-based routing
     std::string pod_name;
     std::string pod_namespace;
@@ -588,6 +595,12 @@ class WrappedMasterServiceConfig {
     uint64_t snapshot_chunk_object_count = 1000000;
     int oplog_poll_interval_ms = 1000;
     uint32_t oplog_batch_max_entries = 1024;
+    // True when the master process serves the co-located HTTP metadata
+    // server; propagated from MasterConfig.enable_http_metadata_server so
+    // MasterService can detect mixed metadata-mode clusters at
+    // MountSegment time (issue #4536). Embedded/in-process masters leave
+    // this false (their P2PHANDSHAKE default is self-consistent).
+    bool serve_http_metadata = false;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
@@ -685,6 +698,7 @@ class WrappedMasterServiceConfig {
         snapshot_chunk_object_count = config.snapshot_chunk_object_count;
         oplog_poll_interval_ms = config.oplog_poll_interval_ms;
         oplog_batch_max_entries = config.oplog_batch_max_entries;
+        serve_http_metadata = config.enable_http_metadata_server;
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
         global_file_segment_size = config.global_file_segment_size;
@@ -877,6 +891,7 @@ class MasterServiceConfigBuilder {
     uint64_t snapshot_chunk_object_count_ = 1000000;
     int oplog_poll_interval_ms_ = 1000;
     uint32_t oplog_batch_max_entries_ = 1024;
+    bool serve_http_metadata_ = false;
     uint64_t restore_repair_durable_timeout_ms_ =
         DEFAULT_RESTORE_REPAIR_DURABLE_TIMEOUT_MS;
     std::string cluster_id_ = DEFAULT_CLUSTER_ID;
@@ -1047,6 +1062,14 @@ class MasterServiceConfigBuilder {
 
     MasterServiceConfigBuilder& set_oplog_batch_max_entries(uint32_t entries) {
         oplog_batch_max_entries_ = entries;
+        return *this;
+    }
+
+    // Tests simulate an HTTP-metadata-served master (MasterConfig.
+    // enable_http_metadata_server=true) to exercise the mixed
+    // metadata-mode warning at MountSegment (issue #4536).
+    MasterServiceConfigBuilder& set_serve_http_metadata(bool serve) {
+        serve_http_metadata_ = serve;
         return *this;
     }
 
@@ -1247,6 +1270,12 @@ class MasterServiceConfig {
     uint64_t snapshot_chunk_object_count = 1000000;
     int oplog_poll_interval_ms = 1000;
     uint32_t oplog_batch_max_entries = 1024;
+    // True when the master process serves the co-located HTTP metadata
+    // server. MasterService uses this at MountSegment time to warn when a
+    // P2PHANDSHAKE-mode client (te_endpoint != name) mounts into a cluster
+    // whose readers resolve segments through the HTTP metadata server
+    // (issue #4536).
+    bool serve_http_metadata = false;
     uint64_t restore_repair_durable_timeout_ms =
         DEFAULT_RESTORE_REPAIR_DURABLE_TIMEOUT_MS;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
@@ -1340,6 +1369,7 @@ class MasterServiceConfig {
         snapshot_chunk_object_count = config.snapshot_chunk_object_count;
         oplog_poll_interval_ms = config.oplog_poll_interval_ms;
         oplog_batch_max_entries = config.oplog_batch_max_entries;
+        serve_http_metadata = config.serve_http_metadata;
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
         global_file_segment_size = config.global_file_segment_size;
@@ -1415,6 +1445,7 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.snapshot_chunk_object_count = snapshot_chunk_object_count_;
     config.oplog_poll_interval_ms = oplog_poll_interval_ms_;
     config.oplog_batch_max_entries = oplog_batch_max_entries_;
+    config.serve_http_metadata = serve_http_metadata_;
     config.restore_repair_durable_timeout_ms =
         restore_repair_durable_timeout_ms_;
     config.cluster_id = cluster_id_;
