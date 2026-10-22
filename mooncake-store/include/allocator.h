@@ -122,6 +122,13 @@ class AllocatedBuffer {
         segment_lifetime_ = std::move(lifetime);
     }
 
+    // The same record without a reference-count update, for comparing owners
+    // on hot paths; valid while the buffer is.
+    [[nodiscard]] const ClientLivenessRecord* clientLivenessRecord()
+        const noexcept {
+        return client_liveness_.get();
+    }
+
     [[nodiscard]] std::shared_ptr<ClientLivenessRecord> getClientLiveness()
         const {
         return client_liveness_;

@@ -581,6 +581,17 @@ class Replica {
         return nullptr;
     }
 
+    // The liveness record of the client whose segment holds this memory
+    // replica, identifying its owner without copying the shared pointer; null
+    // for other kinds or an unbound buffer.
+    [[nodiscard]] const ClientLivenessRecord* memory_owner() const {
+        if (const auto* data = std::get_if<MemoryReplicaData>(&data_)) {
+            return data->buffer ? data->buffer->clientLivenessRecord()
+                                : nullptr;
+        }
+        return nullptr;
+    }
+
     [[nodiscard]] bool isAffiliatedWith(
         const std::shared_ptr<ClientLivenessRecord>& client_liveness) const {
         if (is_memory_replica()) {

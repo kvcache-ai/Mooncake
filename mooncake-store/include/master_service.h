@@ -1026,6 +1026,22 @@ class MasterService {
         const std::vector<std::string>& keys, const TenantId& tenant_id,
         bool grant_lease);
 
+    // Whether the eviction thread waits kEvictionDeferredBackoffMs after a
+    // BatchEvict cycle instead of checking again after kEvictionThreadSleepMs.
+    enum class EvictionBackoff {
+        kNone,
+        // The owners hold the work (offload_on_evict): the cycle found an
+        // owner's in-flight room full, or freed nothing while offloads are in
+        // flight or while owners refused the pushes (nothing evictable
+        // included). An allocation that fails meanwhile cancels the wait.
+        kWaitForOwners,
+        // As above, but the cycle answered a failed allocation, found an
+        // owner's in-flight room full or the pushes refused, and could drop
+        // nothing, so it re-armed the pressure. Wait anyway: only the owners
+        // can make room, and the cycle after the wait acts on the pressure.
+        kWaitForOwnersHoldingPressure,
+    };
+
     // BatchEvict evicts objects in a near-LRU way, i.e., prioritizes to evict
     // object with smaller lease timeout. It has two passes. The first pass only
     // evicts objects without soft pin. The second pass prioritizes objects
@@ -1034,7 +1050,9 @@ class MasterService {
     // evict ratio target. If the actual evicted ratio is less than
     // evict_ratio_lowerbound, the second pass will be triggered and try to
     // fulfill evict ratio lowerbound.
-    void BatchEvict(double evict_ratio_target, double evict_ratio_lowerbound);
+    // Returns whether the eviction thread backs off before the next cycle.
+    EvictionBackoff BatchEvict(double evict_ratio_target,
+                               double evict_ratio_lowerbound);
     void NoFBatchEvict(double evict_ratio_target,
                        double evict_ratio_lowerbound);
     struct TenantQuotaEvictionResult {
@@ -1654,6 +1672,39 @@ class MasterService {
         const ObjectIdentity& object_id, Replica& replica,
         std::vector<UUID>* mirror_clients = nullptr);
 
+    // Offloads in flight per owner, the client whose segment holds the replica
+    // being written (keyed by its liveness record), and the cap on each owner
+    // (offload_on_evict). An eviction pass counts the objects' offload tasks
+    // into it and takes room as it queues more.
+    struct OffloadRoom {
+        long cap_per_owner{0};
+        std::unordered_map<const ClientLivenessRecord*, long> in_flight;
+
+        [[nodiscard]] bool HasRoom(const ClientLivenessRecord* owner) const {
+            const auto it = in_flight.find(owner);
+            return it == in_flight.end() || it->second < cap_per_owner;
+        }
+        void Take(const ClientLivenessRecord* owner) { ++in_flight[owner]; }
+    };
+
+    // The owner an in-flight offload task is writing for: the owner of its
+    // pinned source replica, or null when that replica is gone.
+    static const ClientLivenessRecord* OffloadTaskOwner(
+        const ObjectMetadata& metadata, const OffloadingTask& task);
+
+    enum class EvictionOffload {
+        kQueued,   // one memory replica pinned and queued for its owner's disk
+        kNoRoom,   // every evictable memory replica's owner is at the cap
+        kRefused,  // an owner with room refused the push
+    };
+
+    // Pins the first evictable memory replica whose owner has room, queues it
+    // for that owner's disk and records the object's offload task.
+    EvictionOffload QueueEvictionOffload(
+        const ObjectIdentity& object_id, ObjectMetadata& metadata,
+        route::ObjectState& state, OffloadRoom& room,
+        std::chrono::system_clock::time_point now);
+
     // Cancels the offload task on `object_id`, releasing the source refcnt
     // and dropping the task marker along with its mirrors. Returns false
     // without touching the task if any mirror has already been drained by a
@@ -1745,6 +1796,12 @@ class MasterService {
     std::atomic<bool> eviction_running_{false};
     static constexpr uint64_t kEvictionThreadSleepMs =
         10;  // 10 ms sleep between eviction checks
+    // Wait this long after a cycle that is waiting for the owners to write
+    // queued objects to disk (see EvictionBackoff) before checking the
+    // watermark again. Only memory eviction waits; the eviction thread's other
+    // work keeps its cadence. A failed allocation during the wait is acted on
+    // when it ends.
+    static constexpr uint64_t kEvictionDeferredBackoffMs = 500;
     // The eviction thread wakes every 10 ms, but the tenant pass has to walk
     // every registered tenant and lock every quota shard, so it is throttled
     // rather than run on each tick. Quota pressure builds over seconds, not
@@ -2209,8 +2266,10 @@ class MasterService {
     // Offload-on-evict: defer disk offload to eviction time
     // (config: offload_on_evict)
     bool offload_on_evict_{false};
-    // Force-evict: allow evicting MEMORY replicas without disk offload when cap
-    // exceeded (config: offload_force_evict, only effective when
+    // Force-evict: after a failed allocation, allow evicting MEMORY replicas
+    // without disk offload when they cannot be queued (the owner's in-flight
+    // room is full or the push refused); the tenant-quota pass drops them on
+    // quota pressure alone (config: offload_force_evict, only effective when
     // offload_on_evict_=true)
     bool offload_force_evict_{false};
 
