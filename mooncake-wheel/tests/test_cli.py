@@ -55,9 +55,10 @@ def test_entry_point_installed():
 def test_run_master_and_client():
     """Test running the master service through the entry point."""
     try:
-        # Run mooncake_master with a non-default port to avoid conflicts
+        # Reuse the metadata server on 8080; isolate this Master's RPC and metrics.
         process = subprocess.Popen(
-            ["mooncake_master", "--port=61351", "--max_threads=2", "--enable_http_metadata_server=true"],
+            ["mooncake_master", "--port=61351", "--max_threads=2",
+             "--metrics_port=19003"],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE
         )
