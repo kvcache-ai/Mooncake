@@ -393,6 +393,25 @@ TEST_F(XpuPlatformTest, DeviceToDeviceCopyAcrossDevices) {
     deviceToDeviceRoundTrip(*platform_, "xpu:1");
 }
 
+// A copy running past the end of the allocation is rejected, including one so
+// long that the interior address plus the length wraps around.
+TEST_F(XpuPlatformTest, CopyRejectsRangePastAllocationEnd) {
+    const size_t kSize = 4096;
+    const size_t kOffset = 1024;
+    MemoryOptions opts;
+    opts.location = "xpu:0";
+    void *dev = nullptr;
+    ASSERT_TRUE(platform_->allocate(&dev, kSize, opts).ok());
+    auto *interior = static_cast<uint8_t *>(dev) + kOffset;
+    std::vector<uint8_t> host(kSize);
+    for (size_t len : {kSize - kOffset + 1, SIZE_MAX - kOffset, SIZE_MAX}) {
+        EXPECT_FALSE(platform_->copy(interior, host.data(), len).ok()) << len;
+        EXPECT_FALSE(platform_->copy(host.data(), interior, len).ok()) << len;
+        EXPECT_FALSE(platform_->copy(interior, dev, len).ok()) << len;
+    }
+    EXPECT_TRUE(platform_->free(dev, kSize).ok());
+}
+
 // Cross-process sharing primitives, exercised within one process: exportIpc
 // describes the allocation (Level Zero IPC handle, base, size), importIpc
 // maps that handle as device memory the given local device can address, and

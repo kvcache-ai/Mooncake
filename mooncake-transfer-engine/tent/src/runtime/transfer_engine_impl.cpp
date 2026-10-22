@@ -750,6 +750,11 @@ Status TransferEngineImpl::openSegment(SegmentID& handle,
 
 Status TransferEngineImpl::closeSegment(SegmentID handle) {
     if (handle == LOCAL_SEGMENT_ID) return Status::OK();
+#ifdef USE_XPU
+    // Unmap the peer XPU buffers imported for this segment (IPC).
+    if (auto* xpu = dynamic_cast<XpuTransport*>(transport_list_[XPU].get()))
+        xpu->closeRemoteSegment(handle);
+#endif
     return metadata_->segmentManager().closeRemote(handle);
 }
 
@@ -1558,12 +1563,13 @@ SelectionResult TransferEngineImpl::planTransport(const Request& request,
 
     // Plan XPU/MLU staging before selecting a host-only network transport.
     // XPU can bypass staging through verified dma-buf RDMA or a same-host
-    // peer's IPC mapping. XPU IPC precedes RDMA in the candidate order, with
-    // RDMA available for failover. Other transport hints or a policy rejecting
-    // direct access require staging; MLU always requires it. XPU staging needs
-    // the local XpuTransport; without it, selection is left to transport
-    // capabilities (e.g. TCP copies device memory itself). Keep the original
-    // memory types for policy matching.
+    // peer's IPC mapping. XPU IPC precedes RDMA in the default candidate
+    // order, with RDMA available for failover; a policy with an explicit
+    // transports list uses IPC only if it names "xpu". Other transport hints
+    // or a policy rejecting direct access require staging; MLU always requires
+    // it. XPU staging needs the local XpuTransport; without it, selection is
+    // left to transport capabilities (e.g. TCP copies device memory itself).
+    // Keep the original memory types for policy matching.
     std::vector<std::string> host_staging_params;
     std::vector<TransportType> staging_transports;
     bool xpu_ipc = false;

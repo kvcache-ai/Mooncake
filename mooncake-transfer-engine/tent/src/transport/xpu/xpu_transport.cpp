@@ -21,6 +21,7 @@
 #include <cerrno>
 #include <cstring>
 #include <sstream>
+#include <string_view>
 
 #include "tent/common/status.h"
 #include "tent/runtime/platform.h"
@@ -102,6 +103,15 @@ bool parseIpcAttr(const std::string &text, IpcAttr &attr) {
     return attr.pid > 0 && attr.size > 0;
 }
 
+// True when [addr, addr + length) lies within [base, base + size). Like
+// xpu_detail::validateDmabufRange, the offset is checked before subtracting
+// so no sum can wrap.
+bool rangeWithin(uint64_t addr, uint64_t length, uint64_t base, uint64_t size) {
+    if (addr < base) return false;
+    const uint64_t offset = addr - base;
+    return offset <= size && length <= size - offset;
+}
+
 }  // namespace
 
 XpuTransport::XpuTransport()
@@ -149,28 +159,13 @@ Status XpuTransport::install(std::string &local_segment_name,
 
 Status XpuTransport::uninstall() {
     if (installed_) {
+        std::unordered_map<SegmentID, SegmentImports> imports;
         {
             std::lock_guard<std::mutex> lock(imports_lock_);
-            for (auto &segment : imports_) {
-                for (auto &entry : segment.second) {
-                    auto status = platform_->closeImport(entry.ptr);
-                    if (!status.ok())
-                        LOG(WARNING) << "XpuTransport: closing imported "
-                                        "buffer failed: "
-                                     << status.ToString();
-                }
-            }
-            for (void *ptr : retired_imports_) {
-                auto status = platform_->closeImport(ptr);
-                if (!status.ok())
-                    LOG(WARNING) << "XpuTransport: closing retired imported "
-                                    "buffer failed: "
-                                 << status.ToString();
-            }
-            imports_.clear();
-            retired_imports_.clear();
+            imports.swap(imports_);
             failed_imports_.clear();
         }
+        imports.clear();  // closes the mappings outside imports_lock_
         metadata_.reset();
         platform_ = nullptr;
         installed_ = false;
@@ -208,15 +203,24 @@ Status XpuTransport::submitTransferTasks(
     // Resolve every target before any copy starts, so a request whose peer
     // buffer is not mapped fails synchronously with no half-appended tasks
     // left behind; the engine then fails the task over to another transport.
+    // The mappings are held until the copies below are done (they are
+    // synchronous, so the batch has completed when this returns): a mapping
+    // dropped meanwhile is closed by its last holder.
     std::vector<uint64_t> targets;
+    std::vector<std::shared_ptr<void>> mappings;
     targets.reserve(request_list.size());
     for (auto &request : request_list) {
         uint64_t target = request.target_offset;
-        if (request.target_id != LOCAL_SEGMENT_ID &&
-            !relocate(request.target_id, target, request.length)) {
-            return Status::InvalidArgument(
-                "XPU transport: target buffer of remote segment is not mapped "
-                "into this process" LOC_MARK);
+        if (request.target_id != LOCAL_SEGMENT_ID) {
+            auto mapping =
+                relocate(request.target_id, copyDevice(request.source), target,
+                         request.length);
+            if (!mapping) {
+                return Status::InvalidArgument(
+                    "XPU transport: target buffer of remote segment is not "
+                    "mapped into this process" LOC_MARK);
+            }
+            mappings.push_back(std::move(mapping));
         }
         targets.push_back(target);
     }
@@ -376,22 +380,50 @@ bool XpuTransport::prepareRemoteBuffer(SegmentID target_id,
     // Open on the device that will drive the copy: the one holding the local
     // source, or device 0 for a host source. The local device reaches the
     // peer's VRAM over PCIe P2P (or Xe Link) through this mapping.
-    int device_index = platform_->deviceIndex(local_source);
-    if (device_index < 0) device_index = 0;
+    const int device_index = copyDevice(local_source);
     const std::string failure_key =
         attr_text + '@' + std::to_string(device_index);
 
+    // Declared before the lock so that mappings dropped below are closed
+    // after it is released.
+    std::vector<ImportEntry> dropped;
     std::lock_guard<std::mutex> lock(imports_lock_);
-    auto &entries = imports_[target_id];
-    for (auto &imported : entries) {
-        if (imported.attr == attr_text) return true;
+    auto &imports = imports_[target_id];
+    auto &entries = imports.entries;
+    const bool cached =
+        std::any_of(entries.begin(), entries.end(), [&](const auto &e) {
+            return e.attr == attr_text && e.device == device_index;
+        });
+    // Drop the mappings of buffers the peer no longer publishes (removed, or
+    // freed and registered again under a new attribute) so the exporter can
+    // reclaim their memory. Checked for each new descriptor snapshot, and
+    // before importing a new attribute, rather than on every request.
+    if (!cached || imports.snapshot != &segment) {
+        imports.snapshot = &segment;
+        std::unordered_set<std::string_view> published;
+        if (segment.type == SegmentType::Memory) {
+            for (auto &buffer : segment.getMemory().buffers) {
+                auto attr_it = buffer.transport_attrs.find(TransportType::XPU);
+                if (attr_it != buffer.transport_attrs.end())
+                    published.insert(attr_it->second);
+            }
+        }
+        for (auto e = entries.begin(); e != entries.end();) {
+            if (published.count(e->attr)) {
+                ++e;
+                continue;
+            }
+            dropped.push_back(std::move(*e));
+            e = entries.erase(e);
+        }
     }
+    if (cached) return true;
     if (failed_imports_.count(failure_key)) return false;
 
     IpcAttr attr;
     if (!parseIpcAttr(attr_text, attr) ||
-        attr.pid_namespace != pid_namespace_ || attr.base > entry.addr ||
-        entry.addr + entry.length > attr.base + attr.size) {
+        attr.pid_namespace != pid_namespace_ ||
+        !rangeWithin(entry.addr, entry.length, attr.base, attr.size)) {
         LOG_EVERY_N(WARNING, 1000)
             << "XpuTransport: peer buffer " << (void *)entry.addr
             << " in segment " << segment.name
@@ -400,17 +432,6 @@ bool XpuTransport::prepareRemoteBuffer(SegmentID target_id,
         failed_imports_.insert(failure_key);
         return false;
     }
-    // The peer may have freed and re-registered the same range: withdraw the
-    // mapping of the previous allocation from lookup before importing the new
-    // one. It is not closed here -- a transfer that relocated into it before
-    // this refresh may still be copying -- but at uninstall().
-    for (size_t i = 0; i < entries.size(); ++i) {
-        if (entries[i].base != attr.base) continue;
-        retired_imports_.push_back(entries[i].ptr);
-        entries.erase(entries.begin() + i);
-        break;
-    }
-
     void *ptr = nullptr;
     errno = 0;
     auto status = platform_->importIpc(attr.handle, attr.pid, attr.size,
@@ -433,22 +454,46 @@ bool XpuTransport::prepareRemoteBuffer(SegmentID target_id,
     LOG(INFO) << "XpuTransport: mapped peer buffer " << (void *)attr.base
               << " (" << attr.size << " bytes) of segment " << segment.name
               << " at " << ptr << " on xpu:" << device_index;
-    entries.push_back(ImportEntry{attr_text, attr.base, attr.size, ptr});
+    XpuPlatform *platform = platform_;
+    std::shared_ptr<void> mapping(ptr, [platform](void *mapped) {
+        auto status = platform->closeImport(mapped);
+        if (!status.ok())
+            LOG(WARNING) << "XpuTransport: closing imported buffer failed: "
+                         << status.ToString();
+    });
+    entries.push_back(ImportEntry{attr_text, attr.base, attr.size, device_index,
+                                  std::move(mapping)});
     return true;
 }
 
-bool XpuTransport::relocate(SegmentID target_id, uint64_t &addr,
-                            uint64_t length) {
+void XpuTransport::closeRemoteSegment(SegmentID target_id) {
+    SegmentImports dropped;  // closed after imports_lock_ is released
     std::lock_guard<std::mutex> lock(imports_lock_);
     auto it = imports_.find(target_id);
-    if (it == imports_.end()) return false;
-    for (auto &entry : it->second) {
-        if (entry.base <= addr && addr + length <= entry.base + entry.size) {
-            addr = addr - entry.base + reinterpret_cast<uint64_t>(entry.ptr);
-            return true;
-        }
+    if (it == imports_.end()) return;
+    dropped = std::move(it->second);
+    imports_.erase(it);
+}
+
+int XpuTransport::copyDevice(void *local_source) {
+    const int device_index = platform_->deviceIndex(local_source);
+    return device_index < 0 ? 0 : device_index;
+}
+
+std::shared_ptr<void> XpuTransport::relocate(SegmentID target_id, int device,
+                                             uint64_t &addr, uint64_t length) {
+    std::lock_guard<std::mutex> lock(imports_lock_);
+    auto it = imports_.find(target_id);
+    if (it == imports_.end()) return nullptr;
+    for (auto &entry : it->second.entries) {
+        if (entry.device != device ||
+            !rangeWithin(addr, length, entry.base, entry.size))
+            continue;
+        addr =
+            addr - entry.base + reinterpret_cast<uint64_t>(entry.mapping.get());
+        return entry.mapping;
     }
-    return false;
+    return nullptr;
 }
 
 }  // namespace tent

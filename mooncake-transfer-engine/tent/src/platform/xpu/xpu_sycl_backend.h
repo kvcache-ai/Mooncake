@@ -741,11 +741,11 @@ class XpuSyclBackend {
     std::optional<Range> findLocked(const void *addr) const {
         const uintptr_t a = reinterpret_cast<uintptr_t>(addr);
         for (const auto &al : allocs_) {
-            if (a >= al.base && a < al.base + al.size)
+            if (a >= al.base && a - al.base < al.size)
                 return Range{al.base, al.size, al.device};
         }
         for (const auto &im : imports_) {
-            if (a >= im.base && a < im.base + im.size)
+            if (a >= im.base && a - im.base < im.size)
                 return Range{im.base, im.size, im.device};
         }
         return std::nullopt;
@@ -781,7 +781,9 @@ class XpuSyclBackend {
     int resolveLocked(const void *dev, size_t len) const {
         if (auto a = findLocked(dev)) {
             const uintptr_t start = reinterpret_cast<uintptr_t>(dev);
-            if (start + len > a->base + a->size) return -1;
+            if (!xpu_detail::validateDmabufRange(start - a->base, len, a->size)
+                     .ok())
+                return -1;
             return a->device;
         }
         return classifyLocked(dev);

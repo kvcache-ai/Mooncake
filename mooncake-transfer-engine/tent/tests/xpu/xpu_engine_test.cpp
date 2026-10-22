@@ -31,6 +31,7 @@
 #include "tent/common/config.h"
 #include "tent/platform/xpu.h"
 #include "tent/runtime/transfer_engine_impl.h"
+#include "tent/transport/xpu/xpu_transport.h"
 
 namespace mooncake {
 // Report one completed device copy as failed, so ProxyManager has to retry
@@ -98,6 +99,19 @@ class TransferEngineImplTestPeer {
     static bool rdmaGpuDirect(tent::TransferEngineImpl& engine) {
         auto& rdma = engine.transport_list_[tent::RDMA];
         return rdma && rdma->capabilities().gpu_to_gpu;
+    }
+    // Local devices of the XPU IPC mappings `engine` holds for segment `id`.
+    static std::vector<int> xpuImports(tent::TransferEngineImpl& engine,
+                                       tent::SegmentID id) {
+        std::vector<int> devices;
+        auto* xpu = dynamic_cast<tent::XpuTransport*>(
+            engine.transport_list_[tent::XPU].get());
+        if (!xpu) return devices;
+        std::lock_guard<std::mutex> lock(xpu->imports_lock_);
+        auto it = xpu->imports_.find(id);
+        if (it == xpu->imports_.end()) return devices;
+        for (auto& entry : it->second.entries) devices.push_back(entry.device);
+        return devices;
     }
     static std::shared_ptr<FailOnceXpuTransport> failNextCopy(
         tent::TransferEngineImpl& engine) {
@@ -463,12 +477,18 @@ class XpuIpcEngineTest
         return status;
     }
     // local (on a_) <-> peer (on b_); the route must be the unstaged XPU
-    // copy and the payload must land in the peer's real allocation.
+    // copy and the payload must land in the peer's real allocation. A non-null
+    // `*peer_io` is reused as the peer buffer; otherwise a new one is
+    // allocated and stored there.
     void transfer(const char* local_location, const char* peer_location,
-                  Request::OpCode opcode, TransportType hint = UNSPEC) {
-        void *local = nullptr, *peer = nullptr;
+                  Request::OpCode opcode, TransportType hint = UNSPEC,
+                  void** peer_io = nullptr) {
+        void *local = nullptr, *peer = peer_io ? *peer_io : nullptr;
         ASSERT_NO_FATAL_FAILURE(allocate(*a_, local_location, &local));
-        ASSERT_NO_FATAL_FAILURE(allocate(*b_, peer_location, &peer));
+        if (!peer) {
+            ASSERT_NO_FATAL_FAILURE(allocate(*b_, peer_location, &peer));
+            if (peer_io) *peer_io = peer;
+        }
         std::vector<uint8_t> seed(kLength), zero(kLength, 0), readback(kLength);
         for (size_t i = 0; i < seed.size(); ++i) seed[i] = (i * 3) % 251;
         auto& platform = Platform::getLoader();
@@ -516,6 +536,57 @@ TEST_P(XpuIpcEngineTest, HostToPeerDeviceReadAndWrite) {
 // reachable over IPC (contrast XpuEngineTest.RejectsXpuHintForPeerSegment).
 TEST_P(XpuIpcEngineTest, XpuHintForPeerSegmentIsHonoured) {
     ASSERT_NO_FATAL_FAILURE(transfer("xpu:0", "xpu:0", Request::WRITE, XPU));
+}
+
+// The peer buffer is mapped on the device that drives the copy, so a second
+// local device opens its own mapping instead of reusing device 0's.
+TEST_P(XpuIpcEngineTest, ImportsArePerLocalDevice) {
+    {
+        MemoryOptions opts;
+        opts.location = "xpu:1";
+        void* probe = nullptr;
+        auto& platform = Platform::getLoader();
+        if (!platform.allocate(&probe, 4096, opts).ok())
+            GTEST_SKIP() << "needs two XPU devices";
+        ASSERT_TRUE(platform.free(probe, 4096).ok());
+    }
+    void* peer = nullptr;
+    ASSERT_NO_FATAL_FAILURE(
+        transfer("xpu:0", "xpu:0", Request::WRITE, UNSPEC, &peer));
+    ASSERT_NO_FATAL_FAILURE(
+        transfer("xpu:1", "xpu:0", Request::WRITE, UNSPEC, &peer));
+    SegmentID id = 0;
+    ASSERT_TRUE(a_->openSegment(id, b_->getSegmentName()).ok());
+    auto devices = TransferEngineImplTestPeer::xpuImports(*a_, id);
+    std::sort(devices.begin(), devices.end());
+    EXPECT_EQ(devices, (std::vector<int>{0, 1}));
+}
+
+// Closing the segment unmaps its peer buffers; reopening maps them again.
+TEST_P(XpuIpcEngineTest, ClosingSegmentReleasesImports) {
+    void* peer = nullptr;
+    ASSERT_NO_FATAL_FAILURE(
+        transfer("xpu:0", "xpu:0", Request::WRITE, UNSPEC, &peer));
+    SegmentID id = 0;
+    ASSERT_TRUE(a_->openSegment(id, b_->getSegmentName()).ok());
+    EXPECT_EQ(TransferEngineImplTestPeer::xpuImports(*a_, id).size(), 1u);
+    ASSERT_TRUE(a_->closeSegment(id).ok());
+    EXPECT_TRUE(TransferEngineImplTestPeer::xpuImports(*a_, id).empty());
+    ASSERT_NO_FATAL_FAILURE(
+        transfer("xpu:0", "xpu:0", Request::READ, UNSPEC, &peer));
+}
+
+// A buffer the peer no longer publishes is unmapped once the initiator sees
+// the new descriptor, so the exporter can reclaim its memory.
+TEST_P(XpuIpcEngineTest, UnpublishedPeerBufferIsReleased) {
+    void* first = nullptr;
+    ASSERT_NO_FATAL_FAILURE(
+        transfer("xpu:0", "xpu:0", Request::WRITE, UNSPEC, &first));
+    ASSERT_TRUE(b_->unregisterLocalMemory(first).ok());
+    ASSERT_NO_FATAL_FAILURE(transfer("xpu:0", "xpu:0", Request::WRITE));
+    SegmentID id = 0;
+    ASSERT_TRUE(a_->openSegment(id, b_->getSegmentName()).ok());
+    EXPECT_EQ(TransferEngineImplTestPeer::xpuImports(*a_, id).size(), 1u);
 }
 
 // Interior offsets: the request covers a slice of both registrations, so the
