@@ -1707,8 +1707,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     }
     int client_http_port = client_http_port_opt.value();
 
-    auto egm_config = ParseEgmStorePoolConfig(
-        config, protocol, global_segment_size, local_buffer_size);
+    auto egm_config =
+        ParseEgmStorePoolConfig(config, protocol, global_segment_size);
     if (!egm_config) return tl::unexpected(egm_config.error());
     try {
         auto result = setup_internal(
