@@ -3,6 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=${MOONCAKE_STORE_RS_DIR:-}
+MOONCAKE_ROOT=${MOONCAKE_ROOT_DIR:-}
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/../lib/common.sh"
 MODE="${1:-all}"
@@ -44,7 +45,8 @@ Environment:
   MC_STORE_RS_KEEP_TEMP                  Keep temp dir on failure when set to 1
   MOONCAKE_PYTHON_BIN                    Interpreter from a virtualenv with
                                          the root wheel installed
-  MOONCAKE_STORE_RS_DIR              Absolute Store-RS source directory
+  MOONCAKE_ROOT_DIR                      Absolute Mooncake source directory
+  MOONCAKE_STORE_RS_DIR                  Absolute Store-RS source directory
 EOF
 }
 
@@ -62,6 +64,11 @@ fi
 REPO_ROOT=${MOONCAKE_STORE_RS_DIR:?MOONCAKE_STORE_RS_DIR must be set to an explicit Store-RS source directory}
 [[ "${REPO_ROOT}" == /* && -d "${REPO_ROOT}" ]] || {
   echo "MOONCAKE_STORE_RS_DIR must be an absolute existing directory: ${REPO_ROOT}" >&2
+  exit 1
+}
+MOONCAKE_ROOT=${MOONCAKE_ROOT_DIR:?MOONCAKE_ROOT_DIR must be set to an explicit Mooncake source directory}
+[[ "${MOONCAKE_ROOT}" == /* && -f "${MOONCAKE_ROOT}/python/tests/store/rs/clients/real_client_rw.py" ]] || {
+  echo "MOONCAKE_ROOT_DIR must contain the Store-RS Python test clients: ${MOONCAKE_ROOT}" >&2
   exit 1
 }
 
@@ -203,7 +210,7 @@ run_real_client() {
   local -a args=(
     "${PYTHON_BIN}"
     -u
-    "${REPO_ROOT}/python/tests/store/rs/clients/real_client_rw.py"
+    "${MOONCAKE_ROOT}/python/tests/store/rs/clients/real_client_rw.py"
     --local_host "${local_host}"
     --metadata_url "${REDIS_URL}"
     --storage-bytes "${storage_bytes}"
@@ -243,7 +250,7 @@ start_storage_client() {
 
   MC_STORE_RS_EXPIRES_AT_MS="${expires_at_ms}" \
     PYTHONUNBUFFERED=1 \
-    "${PYTHON_BIN}" -u "${REPO_ROOT}/python/tests/store/rs/clients/real_client_rw.py" \
+    "${PYTHON_BIN}" -u "${MOONCAKE_ROOT}/python/tests/store/rs/clients/real_client_rw.py" \
       --local_host "${local_host}" \
       --metadata_url "${REDIS_URL}" \
       --storage-bytes "${STORAGE_BYTES}" \

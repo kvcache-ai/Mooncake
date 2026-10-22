@@ -8,6 +8,22 @@ PYTHON_PREFIX=${MOONCAKE_PYTHON_PREFIX:?MOONCAKE_PYTHON_PREFIX must name the CMa
 CLASSIC_SHIM=${MOONCAKE_CLASSIC_SHIM_LIB_PATH:?MOONCAKE_CLASSIC_SHIM_LIB_PATH must name the CMake-built classic TE shim}
 TENT_SHIM=${MOONCAKE_TENT_SHIM_LIB_PATH:?MOONCAKE_TENT_SHIM_LIB_PATH must name the CMake-built TENT shim}
 BUILD_PYTHON_BIN=${MOONCAKE_PYTHON_BIN:-python3}
+TRANSPORT_BACKEND_LIST=${MC_STORE_RS_TRANSPORT_BACKENDS:-${MC_STORE_RS_TRANSPORT_BACKEND:-classic-te}}
+read -r -a TRANSPORT_BACKENDS <<< "${TRANSPORT_BACKEND_LIST}"
+
+[[ "${#TRANSPORT_BACKENDS[@]}" -gt 0 ]] || {
+  echo "at least one Store-RS transport backend is required" >&2
+  exit 1
+}
+for transport_backend in "${TRANSPORT_BACKENDS[@]}"; do
+  case "${transport_backend}" in
+    classic-te | tent) ;;
+    *)
+      echo "unsupported Store-RS transport backend: ${transport_backend}" >&2
+      exit 1
+      ;;
+  esac
+done
 
 for path in "${ROOT_DIR}" "${STORE_RS_DIR}" "${BUILD_DIR}" "${PYTHON_PREFIX}"; do
   [[ "${path}" == /* && -d "${path}" ]] || {
@@ -131,25 +147,27 @@ for command in \
   "${command}" --help >/dev/null
 done
 
-REDIS_PORT=$("${PYTHON_BIN}" -I - <<'PY'
+for transport_backend in "${TRANSPORT_BACKENDS[@]}"; do
+  REDIS_PORT=$("${PYTHON_BIN}" -I - <<'PY'
 import socket
 
 with socket.socket() as sock:
     sock.bind(("127.0.0.1", 0))
     print(sock.getsockname()[1])
 PY
-)
+  )
 
-echo "==> Store-RS installed-package dummy and TCP/classic-TE read/write smoke"
-env \
-  MOONCAKE_ROOT_DIR="${ROOT_DIR}" \
-  MOONCAKE_STORE_RS_DIR="${STORE_RS_DIR}" \
-  MOONCAKE_PYTHON_BIN="${PYTHON_BIN}" \
-  MC_STORE_RS_CLIENT_RW_BIN="${INSTALLED_PACKAGE_DIR}/mooncake-store-rs-client" \
-  MC_STORE_RS_REDIS_PORT="${REDIS_PORT}" \
-  MC_STORE_RS_TRANSPORT_METADATA_URL="redis://127.0.0.1:${REDIS_PORT}/0" \
-  MC_STORE_RS_TRANSPORT_BACKEND=classic-te \
-  MC_STORE_RS_TEST_PROTOCOL=tcp \
-  MC_STORE_RS_ROUTE_CONTROL=embedded-wrh \
-  MC_STORE_RS_ROUTE_TOPK=2 \
-  bash "${STORE_RS_DIR}/scripts/tests/client/test-client-rw-cli.sh" all
+  echo "==> Store-RS installed-package dummy and TCP/${transport_backend} read/write smoke"
+  env \
+    MOONCAKE_ROOT_DIR="${ROOT_DIR}" \
+    MOONCAKE_STORE_RS_DIR="${STORE_RS_DIR}" \
+    MOONCAKE_PYTHON_BIN="${PYTHON_BIN}" \
+    MC_STORE_RS_CLIENT_RW_BIN="${INSTALLED_PACKAGE_DIR}/mooncake-store-rs-client" \
+    MC_STORE_RS_REDIS_PORT="${REDIS_PORT}" \
+    MC_STORE_RS_TRANSPORT_METADATA_URL="redis://127.0.0.1:${REDIS_PORT}/0" \
+    MC_STORE_RS_TRANSPORT_BACKEND="${transport_backend}" \
+    MC_STORE_RS_TEST_PROTOCOL=tcp \
+    MC_STORE_RS_ROUTE_CONTROL=embedded-wrh \
+    MC_STORE_RS_ROUTE_TOPK=2 \
+    bash "${STORE_RS_DIR}/scripts/tests/client/test-client-rw-cli.sh" all
+done
