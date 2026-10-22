@@ -1525,6 +1525,21 @@ Status TransferEngineImpl::validateTransportHint(const Request& req,
 
 SelectionResult TransferEngineImpl::getTransportType(const Request& request,
                                                      int transport_index) {
+    bool xpu_direct = false;
+    auto result = planTransport(request, transport_index, true, &xpu_direct);
+    // The direct plan left the XPU buffers unstaged, but the selector policy
+    // admitted no transport able to address device memory (e.g. a policy that
+    // permits only host transports). Fall back to the staged plan, where the
+    // host stage buffers can be carried by any host-DRAM transport.
+    if (result.transport == UNSPEC && xpu_direct)
+        result = planTransport(request, transport_index, false, nullptr);
+    return result;
+}
+
+SelectionResult TransferEngineImpl::planTransport(const Request& request,
+                                                  int transport_index,
+                                                  bool allow_xpu_direct,
+                                                  bool* xpu_direct) {
     // Owning reference: keeps the snapshot alive while we read through it.
     SegmentDescRef desc;
     if (request.target_id == LOCAL_SEGMENT_ID) {
@@ -1539,7 +1554,12 @@ SelectionResult TransferEngineImpl::getTransportType(const Request& request,
     const TransportType hint = request.transport_hint;
 
     // Plan XPU/MLU staging before selecting a host-only network transport.
-    // Keep the original memory types for policy matching.
+    // XPU can bypass staging only with registered dma-buf buffers and RDMA
+    // device capability. Other transport hints or a policy rejecting direct
+    // RDMA require staging; MLU always requires it. XPU staging needs the
+    // local XpuTransport; without it, selection is left to transport
+    // capabilities (e.g. TCP copies device memory itself). Keep the original
+    // memory types for policy matching.
     std::vector<std::string> host_staging_params;
     std::vector<TransportType> staging_transports;
     if (desc->type == SegmentType::Memory &&
@@ -1547,9 +1567,16 @@ SelectionResult TransferEngineImpl::getTransportType(const Request& request,
         auto* entry = desc->findBuffer(request.target_offset, request.length);
         if (!entry) return SelectionResult{};
         auto remote_mtype = getTypeEnum(LocationParser(entry->location).type());
-        if ((transport_list_[XPU] &&
-             (local_mtype == MTYPE_XPU || remote_mtype == MTYPE_XPU)) ||
-            local_mtype == MTYPE_MLU || remote_mtype == MTYPE_MLU) {
+        const bool xpu_side =
+            local_mtype == MTYPE_XPU || remote_mtype == MTYPE_XPU;
+        const bool mlu_side =
+            local_mtype == MTYPE_MLU || remote_mtype == MTYPE_MLU;
+        const bool direct =
+            xpu_side && !mlu_side && allow_xpu_direct &&
+            (hint == UNSPEC || hint == RDMA) &&
+            xpuDirectRdmaReady(request, entry, local_mtype, remote_mtype);
+        if (xpu_direct) *xpu_direct = direct;
+        if ((xpu_side && !direct && transport_list_[XPU]) || mlu_side) {
             findStagingPolicy(request, host_staging_params);
             if (host_staging_params.empty()) return SelectionResult{};
             // A staged side is replaced by a freshly registered host stage
@@ -1939,6 +1966,37 @@ std::vector<RequestBoundaryInfo> resolveRequestBoundaries(
     return boundaries;
 }
 
+bool TransferEngineImpl::xpuDirectRdmaReady(const Request& request,
+                                            const BufferDesc* remote_entry,
+                                            MemoryType local_mtype,
+                                            MemoryType remote_mtype) {
+    if (!remote_entry || !transport_list_[RDMA]) return false;
+    const auto& caps = transport_list_[RDMA]->capabilities();
+    const bool local_gpu = isGpuType(local_mtype);
+    const bool remote_gpu = isGpuType(remote_mtype);
+    bool cap_ok;
+    if (local_gpu && remote_gpu)
+        cap_ok = caps.gpu_to_gpu;
+    else if (local_gpu)
+        cap_ok = caps.gpu_to_dram;
+    else if (remote_gpu)
+        cap_ok = caps.dram_to_gpu;
+    else
+        cap_ok = caps.dram_to_dram;
+    if (!cap_ok) return false;
+
+    auto carries_rdma = [](const BufferDesc* buffer) {
+        return buffer &&
+               std::find(buffer->transports.begin(), buffer->transports.end(),
+                         RDMA) != buffer->transports.end();
+    };
+    if (!carries_rdma(remote_entry)) return false;
+    auto local_desc = metadata_->segmentManager().getLocal();
+    if (!local_desc) return false;
+    return carries_rdma(
+        local_desc->findBuffer((uint64_t)request.source, request.length));
+}
+
 void TransferEngineImpl::findStagingPolicy(const Request& request,
                                            std::vector<std::string>& policy) {
     if (request.target_id == LOCAL_SEGMENT_ID) return;
@@ -2045,6 +2103,10 @@ void TransferEngineImpl::findStagingPolicy(const Request& request,
     // needs its copy transport; a host-only caller can delegate a peer's MLU
     // copy to that peer. Each device side needs a resolvable host stage. Fail
     // closed when topology or the local copy transport is unavailable.
+    // planTransport bypasses this policy for a verified XPU dma-buf RDMA
+    // route; otherwise, when XpuTransport is present, every device side,
+    // including a mixed-vendor peer, must stage rather than exposing device
+    // memory to a host-only transport.
     if (((transport_list_[XPU] &&
           (local_mtype == MTYPE_XPU || remote_mtype == MTYPE_XPU)) ||
          ((local_mtype == MTYPE_MLU || remote_mtype == MTYPE_MLU) &&

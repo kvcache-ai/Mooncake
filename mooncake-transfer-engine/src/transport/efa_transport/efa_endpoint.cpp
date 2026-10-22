@@ -36,41 +36,57 @@ void EfaEndPoint::setPeerNicPath(const std::string& peer_nic_path) {
                   << peer_nic_path_ << " -> " << peer_nic_path;
         disconnectUnlocked();
     }
+    ++generation_;
     peer_nic_path_ = peer_nic_path;
 }
 
 int EfaEndPoint::setupConnectionsByActive() {
-    RWSpinlock::WriteGuard guard(lock_);
-    if (status_.load(std::memory_order_relaxed) == CONNECTED) return 0;
+    std::lock_guard<std::mutex> setup_guard(active_setup_mutex_);
+    TransferMetadata::HandShakeDesc local_desc, peer_desc;
+    uint64_t generation;
+    {
+        RWSpinlock::WriteGuard guard(lock_);
+        if (status_.load(std::memory_order_relaxed) == CONNECTED) return 0;
 
-    // Loopback: handshake against ourselves.  Use the binary overload
-    // so we avoid hex-encoding the local address just to have
-    // insertPeerAddr decode it right back.
-    if (context_.nicPath() == peer_nic_path_) {
-        const auto& bytes = context_.localEpAddrBytes();
-        int ret = context_.insertPeerAddrBytes(bytes.data(), bytes.size(),
-                                               peer_fi_addr_);
-        if (ret != 0) return ret;
-        status_.store(CONNECTED, std::memory_order_release);
-        LOG(INFO) << "EFA loopback connection established: " << toString();
-        return 0;
+        if (context_.nicPath() == peer_nic_path_) {
+            // Loopback: handshake against ourselves.  Use the binary overload
+            // so we avoid hex-encoding the local address just to have
+            // insertPeerAddr decode it right back.
+            const auto& bytes = context_.localEpAddrBytes();
+            int ret = context_.insertPeerAddrBytes(bytes.data(), bytes.size(),
+                                                   peer_fi_addr_);
+            if (ret != 0) return ret;
+            status_.store(CONNECTED, std::memory_order_release);
+            LOG(INFO) << "EFA loopback connection established: " << toString();
+            return 0;
+        }
+        generation = generation_;
+        // Exchange addresses via the transfer-metadata handshake RPC.
+        local_desc.local_nic_path = context_.nicPath();
+        local_desc.peer_nic_path = peer_nic_path_;
+        local_desc.efa_addr = context_.localEpAddr();
     }
 
-    // Exchange addresses via the transfer-metadata handshake RPC.
-    TransferMetadata::HandShakeDesc local_desc, peer_desc;
-    local_desc.local_nic_path = context_.nicPath();
-    local_desc.peer_nic_path = peer_nic_path_;
-    local_desc.efa_addr = context_.localEpAddr();
-
-    auto peer_server_name = getServerNameFromNicPath(peer_nic_path_);
-    auto peer_nic_name = getNicNameFromNicPath(peer_nic_path_);
+    auto peer_server_name = getServerNameFromNicPath(local_desc.peer_nic_path);
+    auto peer_nic_name = getNicNameFromNicPath(local_desc.peer_nic_path);
     if (peer_server_name.empty() || peer_nic_name.empty()) {
-        LOG(ERROR) << "Parse peer EFA nic path failed: " << peer_nic_path_;
+        LOG(ERROR) << "Parse peer EFA nic path failed: "
+                   << local_desc.peer_nic_path;
         return ERR_INVALID_ARGUMENT;
     }
 
+    // A reciprocal RPC needs our passive handler, which takes lock_.
     int rc = context_.engine().sendHandshake(peer_server_name, local_desc,
                                              peer_desc);
+
+    RWSpinlock::WriteGuard guard(lock_);
+    // A passive handshake may have connected the endpoint while the RPC was
+    // in flight; reuse that connection and discard this reply.
+    if (status_.load(std::memory_order_relaxed) == CONNECTED) return 0;
+    if (generation != generation_) {
+        LOG(WARNING) << "Discarding stale EFA handshake reply: " << toString();
+        return ERR_ENDPOINT;
+    }
     if (rc) return rc;
 
     if (peer_desc.efa_addr.empty()) {
@@ -157,6 +173,7 @@ void EfaEndPoint::disconnect() {
 }
 
 void EfaEndPoint::disconnectUnlocked() {
+    ++generation_;
     if (peer_fi_addr_ != FI_ADDR_UNSPEC) {
         context_.removePeerAddr(peer_fi_addr_);
         peer_fi_addr_ = FI_ADDR_UNSPEC;
@@ -167,6 +184,7 @@ void EfaEndPoint::disconnectUnlocked() {
 
 void EfaEndPoint::markDetachedForTeardown() {
     RWSpinlock::WriteGuard guard(lock_);
+    ++generation_;
     peer_fi_addr_ = FI_ADDR_UNSPEC;
     cached_peer_addr_.clear();
     status_.store(UNCONNECTED, std::memory_order_release);

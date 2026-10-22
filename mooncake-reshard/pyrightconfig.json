@@ -17,6 +17,7 @@
     "python/mooncake/reshard/kv_cache/snapshot.py",
     "python/mooncake/reshard/kv_cache/snapshot_serde.py",
     "python/mooncake/reshard/kv_cache/types.py",
+    "python/mooncake/reshard/kv_cache/identity.py",
     "python/mooncake/reshard/kv_cache/topology.py",
     "python/mooncake/reshard/kv_cache/part.py",
     "python/mooncake/reshard/kv_cache/placement.py",
@@ -25,11 +26,14 @@
     "python/mooncake/reshard/kv_cache/serde.py",
     "python/mooncake/reshard/kv_cache/planner.py",
     "python/mooncake/reshard/kv_cache/plan_serde.py",
+    "python/mooncake/reshard/kv_cache/_store",
     "python/mooncake/reshard/weight/_planner",
     "python/mooncake/reshard/weight/_te",
     "python/mooncake/reshard/transfer_engine"
   ],
-  "extraPaths": ["python"],
+  "extraPaths": [
+    "python"
+  ],
   "pythonVersion": "3.10",
   "typeCheckingMode": "strict",
   "reportPrivateUsage": "none",
