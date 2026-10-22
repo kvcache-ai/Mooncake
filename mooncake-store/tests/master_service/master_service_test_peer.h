@@ -481,12 +481,6 @@ class MasterServiceTestPeer {
         return service_.PushOffloadingQueue(object_id, replica, mirror_clients);
     }
 
-    void ReRouteRestoredObjectsByKey() {
-        service_.ReRouteRestoredObjectsByKey();
-    }
-
-    void RebuildGroupState() { service_.RebuildGroupState(); }
-
     void RebuildTenantQuotaUsageFromMetadata() {
         service_.RebuildTenantQuotaUsageFromMetadata();
     }
