@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <memory>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
@@ -281,6 +282,28 @@ TEST_F(LeaseEvictionIndexTest, AKeyMovedToAnotherGroupIsNoLongerAtItsEntry) {
             EXPECT_EQ(cursor->StillAt(*guard, entry), key == "g1") << key;
         }
     }
+}
+
+// A group whose members were all torn down after the walk copied its entry
+// is gone; a key published again under the same id joins a new incarnation,
+// which the old entry does not stand for.
+TEST_F(LeaseEvictionIndexTest, AKeyInARecreatedGroupIsNoLongerAtItsEntry) {
+    PublishInGroup("g1", "g", t0_);
+    PublishInGroup("g2", "g", t0_);
+    auto cursor = ns_.eviction_index().Scan(t0_ + seconds(1));
+    std::optional<EvictionIndex::Entry> entry = cursor->Next();
+    ASSERT_TRUE(entry.has_value());
+
+    for (const std::string key : {"g1", "g2"}) {
+        auto guard = ns_.objects.Write(key);
+        ASSERT_TRUE(guard.has_value());
+        guard->TearDown();
+    }
+    PublishInGroup("g1", "g", t0_);
+
+    auto guard = ns_.objects.Write("g1");
+    ASSERT_TRUE(guard.has_value());
+    EXPECT_FALSE(cursor->StillAt(*guard, *entry));
 }
 
 // An index that counts what the namespace tells it.

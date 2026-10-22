@@ -105,11 +105,14 @@ class LeaseEvictionIndex final : public EvictionIndex {
     // The filed members of one group, filed in `buckets` at the rank the
     // latest member write saw from construction to destruction. Members are
     // linked through the hook a key filed on its own is linked into its
-    // bucket by.
+    // bucket by. A group recreated under the same id is another incarnation.
     class Group {
        public:
-        Group(std::string id, Rank rank, Buckets& buckets)
-            : id_(std::move(id)), rank_(rank), buckets_(buckets) {
+        Group(std::string id, uint64_t incarnation, Rank rank, Buckets& buckets)
+            : id_(std::move(id)),
+              incarnation_(incarnation),
+              rank_(rank),
+              buckets_(buckets) {
             buckets_.Add(rank_, *this);
         }
         // The members still linked are unlinked with the list.
@@ -118,6 +121,7 @@ class LeaseEvictionIndex final : public EvictionIndex {
         Group& operator=(const Group&) = delete;
 
         [[nodiscard]] const std::string& id() const { return id_; }
+        [[nodiscard]] uint64_t incarnation() const { return incarnation_; }
 
         void MoveTo(Rank rank) {
             if (rank == rank_) {
@@ -147,6 +151,7 @@ class LeaseEvictionIndex final : public EvictionIndex {
             boost::intrusive::link_mode<boost::intrusive::safe_link>>;
 
         const std::string id_;
+        const uint64_t incarnation_;
         Rank rank_;
         Buckets& buckets_;
         SlotList members_;
@@ -188,11 +193,11 @@ class LeaseEvictionIndex final : public EvictionIndex {
                 return last + 1;
             }
             for (const route::KeySlot& slot : it->second.keys) {
-                out.push_back(Entry{{slot.key()}, it->first, {}});
+                out.push_back(Entry{{slot.key()}, it->first, 0});
             }
             for (const Group& group : it->second.groups) {
                 Entry& entry =
-                    out.emplace_back(Entry{{}, it->first, group.id()});
+                    out.emplace_back(Entry{{}, it->first, group.incarnation()});
                 group.AppendKeys(entry.keys);
             }
             return it->first + 1;
@@ -237,10 +242,14 @@ class LeaseEvictionIndex final : public EvictionIndex {
 
         bool StillAt(const route::WriteGuard& guard,
                      const Entry& entry) const override {
-            // A key published again in another group, or in or out of one,
-            // belongs to another entry, whatever its rank.
-            return guard.has_object() &&
-                   guard.metadata().group_id == entry.group_id &&
+            // A key filed in another group since, a group recreated under the
+            // same id included, or into or out of one, belongs to another
+            // entry, whatever its rank. The group outlives the key filed in
+            // it, which the held key lock keeps there.
+            const Group* group = GroupOf(guard.owner_state());
+            const uint64_t incarnation =
+                group != nullptr ? group->incarnation() : 0;
+            return guard.has_object() && incarnation == entry.group &&
                    RankOf(guard.metadata()) <= entry.rank;
         }
 
@@ -294,8 +303,8 @@ class LeaseEvictionIndex final : public EvictionIndex {
         }
         auto it = groups_.find(group_id);
         if (it == groups_.end()) {
-            auto group =
-                std::make_unique<Group>(std::string(group_id), rank, buckets_);
+            auto group = std::make_unique<Group>(
+                std::string(group_id), ++groups_created_, rank, buckets_);
             const std::string_view id = group->id();
             it = groups_.emplace(id, std::move(group)).first;
         } else {
@@ -322,6 +331,8 @@ class LeaseEvictionIndex final : public EvictionIndex {
     // Each keyed by its own id. Declared after the buckets, so every group
     // leaves its bucket before the buckets go.
     std::unordered_map<std::string_view, std::unique_ptr<Group>> groups_;
+    // Numbers each group's incarnation, from 1.
+    uint64_t groups_created_ = 0;
     // Keys filed, on their own or in a group.
     std::atomic<size_t> size_{0};
 };

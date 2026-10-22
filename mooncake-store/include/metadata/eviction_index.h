@@ -44,8 +44,9 @@ class EvictionIndex {
     struct Entry {
         std::vector<std::string> keys;
         Rank rank;
-        // The group the keys were filed in; empty for a key on its own.
-        std::string group_id;
+        // Which incarnation of a group the keys were filed in, as the index
+        // numbers them; 0 for a key on its own.
+        uint64_t group = 0;
     };
 
     // One walk over the filed entries, lowest rank first. What it hands out
@@ -57,8 +58,9 @@ class EvictionIndex {
         virtual std::optional<Entry> Next() = 0;
         // Whether the key `guard` holds, one of `entry`'s, which this cursor
         // handed out, still stands where the entry filed it: at its rank, in
-        // its group. Asked under the key's write lock, so a key that moved on
-        // is refiled where it belongs as that lock is let go.
+        // the same incarnation of its group. Asked under the key's write lock,
+        // so a key that moved on is refiled where it belongs as that lock is
+        // let go.
         [[nodiscard]] virtual bool StillAt(const route::WriteGuard& guard,
                                            const Entry& entry) const = 0;
         // How many keys were filed when the walk began.

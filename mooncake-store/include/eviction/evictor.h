@@ -48,7 +48,8 @@ namespace eviction {
 // How much a run frees, counted in objects that released memory, as shares
 // of the objects each namespace's index filed when the run began. The caller
 // sets it from the memory pressure it sees; the policy only says which objects
-// may go.
+// may go. A ratio above 1 asks for every eligible object; one that is negative
+// or not a number is logged and taken as 0.
 struct ObjectGoal {
     // Each namespace frees the objects the policy takes outright up to this
     // share of what it filed, rounded up.

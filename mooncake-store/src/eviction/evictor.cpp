@@ -2,6 +2,7 @@
 
 #include <glog/logging.h>
 
+#include <algorithm>
 #include <cmath>
 #include <memory>
 #include <optional>
@@ -10,6 +11,19 @@
 
 namespace mooncake {
 namespace eviction {
+namespace {
+
+// A ratio above 1 asks for every eligible object; one that is negative or not
+// a number asks for none.
+double Sanitized(const char* name, double ratio) {
+    if (std::isnan(ratio) || ratio < 0) {
+        LOG(ERROR) << name << "=" << ratio << ", error=invalid_params";
+        return 0;
+    }
+    return std::min(ratio, 1.0);
+}
+
+}  // namespace
 
 // Either goal, as a run holds each namespace to it.
 struct Evictor::Aim {
@@ -186,7 +200,8 @@ Evictor::Evictor(metadata::NamespaceTable& namespaces,
       observers_(std::move(observers)) {}
 
 Report Evictor::Run(const Scope& scope, const ObjectGoal& goal) {
-    Aim aim{.target_ratio = goal.target_ratio, .min_ratio = goal.min_ratio};
+    Aim aim{.target_ratio = Sanitized("evict_ratio_target", goal.target_ratio),
+            .min_ratio = Sanitized("evict_ratio_lowerbound", goal.min_ratio)};
     if (aim.min_ratio > aim.target_ratio) {
         LOG(ERROR) << "evict_ratio_target=" << aim.target_ratio
                    << ", evict_ratio_lowerbound=" << aim.min_ratio

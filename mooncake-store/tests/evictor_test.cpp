@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <set>
 #include <string>
@@ -279,6 +280,24 @@ TEST_F(EvictorTest, ARunCutShortLeavesTheRestToTheNextRun) {
     EXPECT_FALSE(evictor.Run(Scope::All(), goal).stopped);
     ASSERT_EQ(reclaimer_.applied.size(), 2u);
     EXPECT_NE(reclaimer_.applied.front()[0], first);
+}
+
+// A ratio above 1 asks for every eligible object; one that is negative or not
+// a number asks for none.
+TEST_F(EvictorTest, ARatioOutsideZeroToOneIsClamped) {
+    Publish("a", "k1", seconds(10));
+    Publish("a", "k2", seconds(8));
+
+    for (const double ratio :
+         {std::numeric_limits<double>::quiet_NaN(), -0.5}) {
+        const auto report =
+            Run(ObjectGoal{.target_ratio = ratio, .min_ratio = ratio});
+        EXPECT_EQ(report.evicted_objects, 0u) << ratio;
+    }
+    EXPECT_TRUE(reclaimer_.applied.empty());
+
+    const auto report = Run(ObjectGoal{.target_ratio = 1.5, .min_ratio = 1.5});
+    EXPECT_EQ(report.evicted_objects, 2u);
 }
 
 TEST_F(EvictorTest, StopsOnceTheTargetShareIsMet) {
