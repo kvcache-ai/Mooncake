@@ -49,10 +49,9 @@ Status XpuTransport::install(std::string &local_segment_name,
     local_topology_ = local_topology;
     conf_ = conf;
     installed_ = true;
-    // XPU VRAM is not NIC-addressable in the MVP: only the device<->host
-    // staging hop is supported here. gpu_to_gpu stays false so the engine
-    // always stages cross-node traffic through host DRAM (direct VRAM RDMA and
-    // PCIe P2P land in later PRs, as NVLinkTransport already exposes them).
+    // Only the local device<->host staging hop is executed here. Direct
+    // cross-node VRAM access is RdmaTransport's job (dma-buf registration);
+    // gpu_to_gpu stays false because PCIe P2P between XPUs is not implemented.
     caps.gpu_to_dram = true;
     caps.dram_to_gpu = true;
     return Status::OK();

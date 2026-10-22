@@ -7490,6 +7490,9 @@ std::vector<int> RealClient::batch_put_session_start(
         return std::vector<int>(
             keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
     }
+    if (!config.ValidSessionIds(keys.size())) {
+        return std::vector<int>(keys.size(), toInt(ErrorCode::INVALID_PARAMS));
+    }
     if (config.group_ids.has_value() &&
         config.group_ids->size() != keys.size()) {
         LOG(ERROR) << "batch_put_session_start: group_ids.size()="
@@ -7539,6 +7542,15 @@ std::vector<int> RealClient::batch_put_session_start(
             filtered_group_ids.push_back(start_config.group_ids->at(idx));
         }
         start_config.group_ids = std::move(filtered_group_ids);
+    }
+
+    if (start_config.session_ids) {
+        std::vector<std::string> ids;
+        ids.reserve(start_indices.size());
+        for (size_t idx : start_indices) {
+            ids.push_back(start_config.session_ids->at(idx));
+        }
+        start_config.session_ids = std::move(ids);
     }
 
     auto start_responses =

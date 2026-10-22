@@ -24,6 +24,9 @@
 #include <numeric>
 
 #include <pybind11/stl.h>
+
+#include <algorithm>
+#include <cstring>
 #include "shared_segment_py.h"
 #include "transport/rpc_communicator/rpc_interface.h"
 
@@ -129,6 +132,11 @@ class ScatterTransferTicket {
 
 namespace {
 
+struct ScatterTransferSubmission {
+    std::shared_ptr<ScatterTransferTicket> ticket;
+    uint64_t total_length;
+};
+
 uint64_t nanosToCeilingMillis(uint64_t timeout_ns) {
     constexpr uint64_t kNanosPerMillis = 1000 * 1000;
     if (timeout_ns >
@@ -136,6 +144,83 @@ uint64_t nanosToCeilingMillis(uint64_t timeout_ns) {
         return std::numeric_limits<uint64_t>::max() / kNanosPerMillis;
     }
     return (timeout_ns + kNanosPerMillis - 1) / kNanosPerMillis;
+}
+
+ScatterTransferSubmission submitScatterWithTicket(
+    const std::shared_ptr<TransferEngine>& engine, const std::string& endpoint,
+    const std::vector<uintptr_t>& local_base_addresses,
+    const std::vector<size_t>& local_capacities,
+    const std::vector<uint64_t>& remote_base_addresses,
+    const std::vector<size_t>& remote_capacities,
+    const std::vector<std::vector<size_t>>& local_offsets,
+    const std::vector<std::vector<size_t>>& remote_offsets,
+    const std::vector<std::vector<size_t>>& lengths,
+    TransferEnginePy::TransferOpcode opcode) {
+    const size_t range_count = local_base_addresses.size();
+    if (local_capacities.size() != range_count ||
+        remote_base_addresses.size() != range_count ||
+        remote_capacities.size() != range_count ||
+        local_offsets.size() != range_count ||
+        remote_offsets.size() != range_count || lengths.size() != range_count) {
+        LOG(ERROR) << "Scatter transfer range arrays have different sizes";
+        return {ScatterTransferTicket::terminal(
+                    ScatterTransferCompletionStatus::FAILED_DRAINED),
+                0};
+    }
+
+    std::vector<TransferEngine::ScatterTransferRange> ranges;
+    ranges.reserve(range_count);
+    uint64_t total_length = 0;
+    for (size_t i = 0; i < range_count; ++i) {
+        constexpr auto kMaxLocalAddress = std::numeric_limits<uintptr_t>::max();
+        if (local_capacities[i] > kMaxLocalAddress ||
+            local_base_addresses[i] >
+                kMaxLocalAddress -
+                    static_cast<uintptr_t>(local_capacities[i])) {
+            LOG(ERROR) << "Scatter transfer local allocation range overflows "
+                          "the address space at range "
+                       << i;
+            return {ScatterTransferTicket::terminal(
+                        ScatterTransferCompletionStatus::FAILED_DRAINED),
+                    0};
+        }
+        const size_t fragment_count = local_offsets[i].size();
+        if (remote_offsets[i].size() != fragment_count ||
+            lengths[i].size() != fragment_count) {
+            LOG(ERROR) << "Scatter transfer fragment arrays have different "
+                          "sizes at range "
+                       << i;
+            return {ScatterTransferTicket::terminal(
+                        ScatterTransferCompletionStatus::FAILED_DRAINED),
+                    0};
+        }
+
+        TransferEngine::ScatterTransferRange range;
+        range.opcode = opcode == TransferEnginePy::TransferOpcode::WRITE
+                           ? TransferRequest::WRITE
+                           : TransferRequest::READ;
+        range.remote_segment = endpoint;
+        range.remote_base_offset = remote_base_addresses[i];
+        range.remote_size = remote_capacities[i];
+        range.local_buffer = reinterpret_cast<void*>(local_base_addresses[i]);
+        range.local_capacity = local_capacities[i];
+        range.local_offsets = local_offsets[i];
+        range.remote_offsets = remote_offsets[i];
+        range.lengths = lengths[i];
+        ranges.push_back(std::move(range));
+
+        for (size_t length : lengths[i]) {
+            if (length > std::numeric_limits<uint64_t>::max() - total_length) {
+                total_length = std::numeric_limits<uint64_t>::max();
+                break;
+            }
+            total_length += length;
+        }
+    }
+
+    auto operation = std::make_shared<TransferEngine::ScatterTransferOperation>(
+        engine->submitScatter(ranges));
+    return {std::make_shared<ScatterTransferTicket>(operation), total_length};
 }
 
 }  // namespace
@@ -608,74 +693,17 @@ TransferEnginePy::scatterTransferSyncWithTicket(
     const std::vector<std::vector<size_t>>& remote_offsets,
     const std::vector<std::vector<size_t>>& lengths, TransferOpcode opcode) {
     pybind11::gil_scoped_release release;
-    const size_t range_count = local_base_addresses.size();
-    if (local_capacities.size() != range_count ||
-        remote_base_addresses.size() != range_count ||
-        remote_capacities.size() != range_count ||
-        local_offsets.size() != range_count ||
-        remote_offsets.size() != range_count || lengths.size() != range_count) {
-        LOG(ERROR) << "Scatter transfer range arrays have different sizes";
-        return ScatterTransferTicket::terminal(
-            ScatterTransferCompletionStatus::FAILED_DRAINED);
-    }
-
-    std::vector<TransferEngine::ScatterTransferRange> ranges;
-    ranges.reserve(range_count);
-    uint64_t total_length = 0;
-    for (size_t i = 0; i < range_count; ++i) {
-        constexpr auto kMaxLocalAddress = std::numeric_limits<uintptr_t>::max();
-        if (local_capacities[i] > kMaxLocalAddress ||
-            local_base_addresses[i] >
-                kMaxLocalAddress -
-                    static_cast<uintptr_t>(local_capacities[i])) {
-            LOG(ERROR) << "Scatter transfer local allocation range overflows "
-                          "the address space at range "
-                       << i;
-            return ScatterTransferTicket::terminal(
-                ScatterTransferCompletionStatus::FAILED_DRAINED);
-        }
-        const size_t fragment_count = local_offsets[i].size();
-        if (remote_offsets[i].size() != fragment_count ||
-            lengths[i].size() != fragment_count) {
-            LOG(ERROR) << "Scatter transfer fragment arrays have different "
-                          "sizes at range "
-                       << i;
-            return ScatterTransferTicket::terminal(
-                ScatterTransferCompletionStatus::FAILED_DRAINED);
-        }
-
-        TransferEngine::ScatterTransferRange range;
-        range.opcode = opcode == TransferOpcode::WRITE ? TransferRequest::WRITE
-                                                       : TransferRequest::READ;
-        range.remote_segment = endpoint;
-        range.remote_base_offset = remote_base_addresses[i];
-        range.remote_size = remote_capacities[i];
-        range.local_buffer = reinterpret_cast<void*>(local_base_addresses[i]);
-        range.local_capacity = local_capacities[i];
-        range.local_offsets = local_offsets[i];
-        range.remote_offsets = remote_offsets[i];
-        range.lengths = lengths[i];
-        ranges.push_back(std::move(range));
-
-        for (size_t length : lengths[i]) {
-            if (length > std::numeric_limits<uint64_t>::max() - total_length) {
-                total_length = std::numeric_limits<uint64_t>::max();
-                break;
-            }
-            total_length += length;
-        }
-    }
-
-    auto operation = std::make_shared<TransferEngine::ScatterTransferOperation>(
-        engine_->submitScatter(ranges));
-    auto ticket = std::make_shared<ScatterTransferTicket>(operation);
+    auto submission = submitScatterWithTicket(
+        engine_, endpoint, local_base_addresses, local_capacities,
+        remote_base_addresses, remote_capacities, local_offsets, remote_offsets,
+        lengths, opcode);
     const uint64_t timeout_ns =
-        total_length >
+        submission.total_length >
                 std::numeric_limits<uint64_t>::max() - transfer_timeout_nsec_
             ? std::numeric_limits<uint64_t>::max()
-            : transfer_timeout_nsec_ + total_length;
-    ticket->drain(nanosToCeilingMillis(timeout_ns));
-    return ticket;
+            : transfer_timeout_nsec_ + submission.total_length;
+    submission.ticket->drain(nanosToCeilingMillis(timeout_ns));
+    return submission.ticket;
 }
 
 batch_id_t TransferEnginePy::batchTransferAsyncWrite(
@@ -696,6 +724,239 @@ batch_id_t TransferEnginePy::batchTransferAsyncRead(
     return batchTransferAsync(target_hostname, buffers, peer_buffer_addresses,
                               lengths, TransferOpcode::READ, transport_hint,
                               nic_hint);
+}
+
+namespace {
+
+// Copy a contiguous 1-D array of 8-byte integers out of a buffer-protocol
+// object. Raises TypeError/ValueError like pybind11's own casters would.
+template <typename T>
+std::vector<T> vectorFromIntegerBuffer(const pybind11::buffer& source,
+                                       const char* name) {
+    pybind11::buffer_info info = source.request();
+    if (info.ndim != 1) {
+        throw pybind11::type_error(std::string(name) +
+                                   " must be a one-dimensional array");
+    }
+    if (info.itemsize != sizeof(T) ||
+        info.format.find_first_of("QLqlNn") == std::string::npos ||
+        info.format.size() > 2) {
+        throw pybind11::type_error(std::string(name) +
+                                   " must hold 8-byte integers (uint64/int64)");
+    }
+    const auto count = static_cast<size_t>(info.shape[0]);
+    if (count && info.strides[0] != static_cast<pybind11::ssize_t>(sizeof(T))) {
+        throw pybind11::type_error(std::string(name) + " must be contiguous");
+    }
+    const bool is_signed =
+        info.format.find_first_of("qln") != std::string::npos;
+    std::vector<T> values(count);
+    if (count) {
+        std::memcpy(values.data(), info.ptr, count * sizeof(T));
+        if (is_signed) {
+            const auto* signed_values = static_cast<const int64_t*>(info.ptr);
+            for (size_t i = 0; i < count; ++i) {
+                if (signed_values[i] < 0) {
+                    throw pybind11::value_error(
+                        std::string(name) +
+                        " must not contain negative values");
+                }
+            }
+        }
+    }
+    return values;
+}
+
+struct BatchArrays {
+    std::vector<uintptr_t> buffers;
+    std::vector<uintptr_t> peer_buffer_addresses;
+    std::vector<size_t> lengths;
+};
+
+BatchArrays batchArraysFromBuffers(
+    const pybind11::buffer& buffers,
+    const pybind11::buffer& peer_buffer_addresses,
+    const pybind11::buffer& lengths) {
+    BatchArrays arrays{
+        vectorFromIntegerBuffer<uintptr_t>(buffers, "buffers"),
+        vectorFromIntegerBuffer<uintptr_t>(peer_buffer_addresses,
+                                           "peer_buffer_addresses"),
+        vectorFromIntegerBuffer<size_t>(lengths, "lengths"),
+    };
+    if (arrays.buffers.size() != arrays.peer_buffer_addresses.size() ||
+        arrays.buffers.size() != arrays.lengths.size()) {
+        throw pybind11::value_error(
+            "buffers, peer_buffer_addresses and lengths must have the same "
+            "length");
+    }
+    return arrays;
+}
+
+// Read a C-contiguous [rows, columns] array of 8-byte integers.
+std::vector<int64_t> matrixFromIntegerBuffer(const pybind11::buffer& source,
+                                             size_t columns, const char* name) {
+    pybind11::buffer_info info = source.request();
+    if (info.ndim != 2 || static_cast<size_t>(info.shape[1]) != columns) {
+        throw pybind11::type_error(std::string(name) + " must be a [rows, " +
+                                   std::to_string(columns) + "] array");
+    }
+    if (info.itemsize != sizeof(int64_t) ||
+        info.format.find_first_of("QLqlNn") == std::string::npos ||
+        info.format.size() > 2) {
+        throw pybind11::type_error(std::string(name) +
+                                   " must hold 8-byte integers (uint64/int64)");
+    }
+    const auto rows = static_cast<size_t>(info.shape[0]);
+    if (rows &&
+        (info.strides[1] != static_cast<pybind11::ssize_t>(sizeof(int64_t)) ||
+         info.strides[0] !=
+             static_cast<pybind11::ssize_t>(sizeof(int64_t) * columns))) {
+        throw pybind11::type_error(std::string(name) + " must be C-contiguous");
+    }
+    std::vector<int64_t> values(rows * columns);
+    if (!values.empty()) {
+        std::memcpy(values.data(), info.ptr, values.size() * sizeof(int64_t));
+    }
+    return values;
+}
+
+// Expand (fields x pages) into flat descriptor columns, field-major.
+BatchArrays batchArraysFromPages(const pybind11::buffer& src_pages,
+                                 const pybind11::buffer& dst_pages,
+                                 const pybind11::buffer& fields) {
+    const std::vector<int64_t> src =
+        vectorFromIntegerBuffer<int64_t>(src_pages, "src_pages");
+    const std::vector<int64_t> dst =
+        vectorFromIntegerBuffer<int64_t>(dst_pages, "dst_pages");
+    if (src.size() != dst.size()) {
+        throw pybind11::value_error(
+            "src_pages and dst_pages must have the same length");
+    }
+    constexpr size_t kColumns = 5;
+    const std::vector<int64_t> table =
+        matrixFromIntegerBuffer(fields, kColumns, "fields");
+    const size_t num_fields = table.size() / kColumns;
+    const size_t num_pages = src.size();
+    BatchArrays arrays;
+    arrays.buffers.reserve(num_fields * num_pages);
+    arrays.peer_buffer_addresses.reserve(num_fields * num_pages);
+    arrays.lengths.reserve(num_fields * num_pages);
+    for (size_t f = 0; f < num_fields; ++f) {
+        const int64_t src_base = table[f * kColumns + 0];
+        const int64_t src_stride = table[f * kColumns + 1];
+        const int64_t dst_base = table[f * kColumns + 2];
+        const int64_t dst_stride = table[f * kColumns + 3];
+        const int64_t length = table[f * kColumns + 4];
+        if (length <= 0 || src_stride < 0 || dst_stride < 0) {
+            throw pybind11::value_error(
+                "fields rows need a positive length and non-negative strides");
+        }
+        for (size_t i = 0; i < num_pages; ++i) {
+            arrays.buffers.push_back(
+                static_cast<uintptr_t>(src_base + src[i] * src_stride));
+            arrays.peer_buffer_addresses.push_back(
+                static_cast<uintptr_t>(dst_base + dst[i] * dst_stride));
+            arrays.lengths.push_back(static_cast<size_t>(length));
+        }
+    }
+    return arrays;
+}
+
+}  // namespace
+
+int TransferEnginePy::batchTransferSyncWritePages(
+    const char* target_hostname, const pybind11::buffer& src_pages,
+    const pybind11::buffer& dst_pages, const pybind11::buffer& fields,
+    size_t max_batch_size, const std::string& transport_hint,
+    const std::string& nic_hint) {
+    return batchTransferSyncPages(target_hostname, src_pages, dst_pages, fields,
+                                  max_batch_size, TransferOpcode::WRITE,
+                                  transport_hint, nic_hint);
+}
+
+int TransferEnginePy::batchTransferSyncReadPages(
+    const char* target_hostname, const pybind11::buffer& src_pages,
+    const pybind11::buffer& dst_pages, const pybind11::buffer& fields,
+    size_t max_batch_size, const std::string& transport_hint,
+    const std::string& nic_hint) {
+    return batchTransferSyncPages(target_hostname, src_pages, dst_pages, fields,
+                                  max_batch_size, TransferOpcode::READ,
+                                  transport_hint, nic_hint);
+}
+
+int TransferEnginePy::batchTransferSyncPages(
+    const char* target_hostname, const pybind11::buffer& src_pages,
+    const pybind11::buffer& dst_pages, const pybind11::buffer& fields,
+    size_t max_batch_size, TransferOpcode opcode,
+    const std::string& transport_hint, const std::string& nic_hint) {
+    BatchArrays arrays = batchArraysFromPages(src_pages, dst_pages, fields);
+    const size_t total = arrays.buffers.size();
+    if (total == 0) return 0;
+    const size_t step = max_batch_size == 0 ? total : max_batch_size;
+    for (size_t start = 0; start < total; start += step) {
+        const size_t stop = std::min(total, start + step);
+        int ret = batchTransferSync(
+            target_hostname,
+            std::vector<uintptr_t>(arrays.buffers.begin() + start,
+                                   arrays.buffers.begin() + stop),
+            std::vector<uintptr_t>(arrays.peer_buffer_addresses.begin() + start,
+                                   arrays.peer_buffer_addresses.begin() + stop),
+            std::vector<size_t>(arrays.lengths.begin() + start,
+                                arrays.lengths.begin() + stop),
+            opcode, nullptr, transport_hint, nic_hint);
+        if (ret != 0) return ret;
+    }
+    return 0;
+}
+
+int TransferEnginePy::batchTransferSyncWriteArrays(
+    const char* target_hostname, const pybind11::buffer& buffers,
+    const pybind11::buffer& peer_buffer_addresses,
+    const pybind11::buffer& lengths, const std::string& transport_hint,
+    const std::string& nic_hint) {
+    BatchArrays arrays =
+        batchArraysFromBuffers(buffers, peer_buffer_addresses, lengths);
+    return batchTransferSync(target_hostname, std::move(arrays.buffers),
+                             std::move(arrays.peer_buffer_addresses),
+                             std::move(arrays.lengths), TransferOpcode::WRITE,
+                             nullptr, transport_hint, nic_hint);
+}
+
+int TransferEnginePy::batchTransferSyncReadArrays(
+    const char* target_hostname, const pybind11::buffer& buffers,
+    const pybind11::buffer& peer_buffer_addresses,
+    const pybind11::buffer& lengths, const std::string& transport_hint,
+    const std::string& nic_hint) {
+    BatchArrays arrays =
+        batchArraysFromBuffers(buffers, peer_buffer_addresses, lengths);
+    return batchTransferSync(target_hostname, std::move(arrays.buffers),
+                             std::move(arrays.peer_buffer_addresses),
+                             std::move(arrays.lengths), TransferOpcode::READ,
+                             nullptr, transport_hint, nic_hint);
+}
+
+batch_id_t TransferEnginePy::batchTransferAsyncWriteArrays(
+    const char* target_hostname, const pybind11::buffer& buffers,
+    const pybind11::buffer& peer_buffer_addresses,
+    const pybind11::buffer& lengths, const std::string& transport_hint,
+    const std::string& nic_hint) {
+    BatchArrays arrays =
+        batchArraysFromBuffers(buffers, peer_buffer_addresses, lengths);
+    return batchTransferAsync(target_hostname, arrays.buffers,
+                              arrays.peer_buffer_addresses, arrays.lengths,
+                              TransferOpcode::WRITE, transport_hint, nic_hint);
+}
+
+batch_id_t TransferEnginePy::batchTransferAsyncReadArrays(
+    const char* target_hostname, const pybind11::buffer& buffers,
+    const pybind11::buffer& peer_buffer_addresses,
+    const pybind11::buffer& lengths, const std::string& transport_hint,
+    const std::string& nic_hint) {
+    BatchArrays arrays =
+        batchArraysFromBuffers(buffers, peer_buffer_addresses, lengths);
+    return batchTransferAsync(target_hostname, arrays.buffers,
+                              arrays.peer_buffer_addresses, arrays.lengths,
+                              TransferOpcode::READ, transport_hint, nic_hint);
 }
 
 int TransferEnginePy::transferSync(const char* target_hostname,
@@ -1561,6 +1822,25 @@ PYBIND11_MODULE(engine, m) {
         .def_readwrite("name", &TransferEnginePy::TransferNotify::name)
         .def_readwrite("msg", &TransferEnginePy::TransferNotify::msg);
 
+    auto submit_scatter = [](TransferEnginePy::TransferOpcode opcode) {
+        return [opcode](TransferEnginePy& adaptor, const std::string& endpoint,
+                        const std::vector<uintptr_t>& local_base_addresses,
+                        const std::vector<size_t>& local_capacities,
+                        const std::vector<uint64_t>& remote_base_addresses,
+                        const std::vector<size_t>& remote_capacities,
+                        const std::vector<std::vector<size_t>>& local_offsets,
+                        const std::vector<std::vector<size_t>>& remote_offsets,
+                        const std::vector<std::vector<size_t>>& lengths) {
+            py::gil_scoped_release release;
+            return submitScatterWithTicket(
+                       adaptor.getEngine(), endpoint, local_base_addresses,
+                       local_capacities, remote_base_addresses,
+                       remote_capacities, local_offsets, remote_offsets,
+                       lengths, opcode)
+                .ticket;
+        };
+    };
+
     auto adaptor_cls =
         py::class_<TransferEnginePy>(m, "TransferEngine")
             .def(py::init<>())
@@ -1588,6 +1868,20 @@ PYBIND11_MODULE(engine, m) {
                  py::arg("target_hostname"), py::arg("buffers"),
                  py::arg("peer_buffer_addresses"), py::arg("lengths"),
                  py::arg("transport_hint") = "", py::arg("nic_hint") = "")
+            .def("submit_scatter_write",
+                 submit_scatter(TransferEnginePy::TransferOpcode::WRITE),
+                 py::arg("endpoint"), py::arg("local_base_addresses"),
+                 py::arg("local_capacities"), py::arg("remote_base_addresses"),
+                 py::arg("remote_capacities"), py::arg("local_offsets"),
+                 py::arg("remote_offsets"), py::arg("lengths"),
+                 py::keep_alive<0, 1>())
+            .def("submit_scatter_read",
+                 submit_scatter(TransferEnginePy::TransferOpcode::READ),
+                 py::arg("endpoint"), py::arg("local_base_addresses"),
+                 py::arg("local_capacities"), py::arg("remote_base_addresses"),
+                 py::arg("remote_capacities"), py::arg("local_offsets"),
+                 py::arg("remote_offsets"), py::arg("lengths"),
+                 py::keep_alive<0, 1>())
             .def("scatter_transfer_sync_write_with_ticket",
                  &TransferEnginePy::scatterTransferSyncWriteWithTicket,
                  py::arg("endpoint"), py::arg("local_base_addresses"),
@@ -1612,6 +1906,38 @@ PYBIND11_MODULE(engine, m) {
                  py::arg("target_hostname"), py::arg("buffers"),
                  py::arg("peer_buffer_addresses"), py::arg("lengths"),
                  py::arg("transport_hint") = "", py::arg("nic_hint") = "")
+            .def("batch_transfer_sync_write_arrays",
+                 &TransferEnginePy::batchTransferSyncWriteArrays,
+                 py::arg("target_hostname"), py::arg("buffers"),
+                 py::arg("peer_buffer_addresses"), py::arg("lengths"),
+                 py::arg("transport_hint") = "", py::arg("nic_hint") = "")
+            .def("batch_transfer_sync_read_arrays",
+                 &TransferEnginePy::batchTransferSyncReadArrays,
+                 py::arg("target_hostname"), py::arg("buffers"),
+                 py::arg("peer_buffer_addresses"), py::arg("lengths"),
+                 py::arg("transport_hint") = "", py::arg("nic_hint") = "")
+            .def("batch_transfer_async_write_arrays",
+                 &TransferEnginePy::batchTransferAsyncWriteArrays,
+                 py::arg("target_hostname"), py::arg("buffers"),
+                 py::arg("peer_buffer_addresses"), py::arg("lengths"),
+                 py::arg("transport_hint") = "", py::arg("nic_hint") = "")
+            .def("batch_transfer_async_read_arrays",
+                 &TransferEnginePy::batchTransferAsyncReadArrays,
+                 py::arg("target_hostname"), py::arg("buffers"),
+                 py::arg("peer_buffer_addresses"), py::arg("lengths"),
+                 py::arg("transport_hint") = "", py::arg("nic_hint") = "")
+            .def("batch_transfer_sync_write_pages",
+                 &TransferEnginePy::batchTransferSyncWritePages,
+                 py::arg("target_hostname"), py::arg("src_pages"),
+                 py::arg("dst_pages"), py::arg("fields"),
+                 py::arg("max_batch_size") = 0, py::arg("transport_hint") = "",
+                 py::arg("nic_hint") = "")
+            .def("batch_transfer_sync_read_pages",
+                 &TransferEnginePy::batchTransferSyncReadPages,
+                 py::arg("target_hostname"), py::arg("src_pages"),
+                 py::arg("dst_pages"), py::arg("fields"),
+                 py::arg("max_batch_size") = 0, py::arg("transport_hint") = "",
+                 py::arg("nic_hint") = "")
             .def("transfer_sync", &TransferEnginePy::transferSync,
                  py::arg("target_hostname"), py::arg("buffer"),
                  py::arg("peer_buffer_address"), py::arg("length"),

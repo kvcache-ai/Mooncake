@@ -24,6 +24,8 @@ option(WITH_P2P_STORE "build p2p store library and sample code" OFF)
 option(WITH_RUST_EXAMPLE
        "build the Rust interface and sample code for the transfer engine" OFF)
 option(WITH_STORE_RUST "build the Rust bindings for the Mooncake Store" ON)
+option(WITH_CONDUCTOR_RUST
+       "build the Rust bindings for the Mooncake Conductor client" OFF)
 option(
   WITH_STORE_RS
   "build the Rust-native Mooncake Store implementation (mooncake-store-rs)"
@@ -114,6 +116,9 @@ endif()
 if(WITH_STORE OR (WITH_TE AND USE_TENT))
   mooncake_provide_liburing()
 endif()
+if(WITH_TE AND USE_TENT)
+  mooncake_provide_cli11()
+endif()
 if((WITH_TE AND USE_REDIS) OR (WITH_STORE AND STORE_USE_REDIS))
   mooncake_provide_hiredis(REQUIRED)
 elseif(WITH_TE AND USE_TENT)
@@ -156,6 +161,14 @@ if(WITH_STORE_RUST)
   endif()
   message(STATUS "Mooncake Store Rust bindings will be built")
   add_subdirectory(mooncake-store/rust)
+endif()
+
+if(WITH_CONDUCTOR_RUST)
+  if(NOT WITH_CONDUCTOR)
+    message(FATAL_ERROR "WITH_CONDUCTOR_RUST=ON requires WITH_CONDUCTOR=ON")
+  endif()
+  message(STATUS "Mooncake Conductor Rust bindings will be built")
+  add_subdirectory(mooncake-conductor/rust)
 endif()
 
 if (WITH_STORE_RS)

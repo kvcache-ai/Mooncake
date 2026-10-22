@@ -10,6 +10,7 @@
 
 #include "master_metric_manager.h"
 #include "master_service.h"
+#include "ha/oplog/oplog_test_failpoint.h"
 #include "rpc_worker_pool.h"
 #include "rpc_helper.h"
 #include "types.h"
@@ -519,6 +520,9 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
                    << " != slice_lengths.size()=" << slice_lengths.size();
         results.assign(keys.size(),
                        tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+    } else if (!config.ValidSessionIds(keys.size())) {
+        results.assign(keys.size(),
+                       tl::make_unexpected(ErrorCode::INVALID_PARAMS));
     } else if (config.group_ids.has_value() &&
                config.group_ids->size() != keys.size()) {
         LOG(ERROR) << "BatchPutStart: group_ids.size()="
@@ -532,10 +536,10 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
     } else if (config.prefer_alloc_in_same_node) {
         ReplicateConfig new_config = config;
         for (size_t i = 0; i < keys.size(); ++i) {
-            auto key_config = new_config.ForSingleKey(i);
+            new_config.SetKeyIds(config, i);
             auto result = master_service_.PutStart(
                 client_id, keys[i], resolved_tenant_id.value(),
-                slice_lengths[i], key_config);
+                slice_lengths[i], new_config);
             results.emplace_back(result);
             if ((i == 0) && result.has_value()) {
                 std::string preferred_segment;
@@ -554,8 +558,9 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
             }
         }
     } else {
+        ReplicateConfig key_config = config;
         for (size_t i = 0; i < keys.size(); ++i) {
-            auto key_config = config.ForSingleKey(i);
+            key_config.SetKeyIds(config, i);
             results.emplace_back(master_service_.PutStart(
                 client_id, keys[i], resolved_tenant_id.value(),
                 slice_lengths[i], key_config));
@@ -772,6 +777,9 @@ WrappedMasterService::BatchUpsertStart(
     if (keys.size() != slice_lengths.size()) {
         LOG(ERROR) << "BatchUpsertStart: keys.size()=" << keys.size()
                    << " != slice_lengths.size()=" << slice_lengths.size();
+        results.assign(keys.size(),
+                       tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+    } else if (!config.ValidSessionIds(keys.size())) {
         results.assign(keys.size(),
                        tl::make_unexpected(ErrorCode::INVALID_PARAMS));
     } else if (config.group_ids.has_value() &&
@@ -993,6 +1001,7 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchRemove(
 
 tl::expected<void, ErrorCode> WrappedMasterService::MountSegment(
     const Segment& segment, const UUID& client_id) {
+    TestFailPoint::Wait("rpc_mount_segment_before_service");
     return execute_rpc(
         "MountSegment",
         [&] { return master_service_.MountSegment(segment, client_id); },
