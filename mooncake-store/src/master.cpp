@@ -10,6 +10,7 @@
 #include <optional>
 #include <string>
 #include <thread>  // For std::thread
+#include <utility>
 #include <json/json.h>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include <ylt/easylog/record.hpp>
@@ -1701,6 +1702,24 @@ int main(int argc, char* argv[]) {
         }
         return result;
     } else {
+        // Standalone masters skip the HA lease path, but still need a bounded
+        // SIGTERM exit: destroying metadata_shards_ on the way out of main()
+        // can take tens of seconds at tens of millions of objects (#4856), and
+        // the index is not reused across a restart. Match the HA branch: stop
+        // serving work, then ExitAfterShutdown so the kernel reclaims the
+        // index without walking it in user space.
+        if (!mooncake::StartShutdownWatchdog(
+                mooncake::ha::kHaShutdownDeadline)) {
+            LOG(ERROR) << "Failed to start the shutdown watchdog, "
+                          "refusing to start";
+            return 1;
+        }
+        if (!mooncake::InstallShutdownSignalHandlers()) {
+            PLOG(ERROR) << "Failed to install SIGINT/SIGTERM handlers, "
+                           "refusing to start";
+            return 1;
+        }
+
         // version is not used in non-HA mode, just pass a dummy value
         mooncake::ViewVersionId version = 0;
         coro_rpc::coro_rpc_server server(
@@ -1732,19 +1751,12 @@ int main(int argc, char* argv[]) {
         admin_server.SetServiceDelegate(wrapped_master_service);
         admin_server.SetServiceAvailable(true);
 
-        // Declared after the service so that it drains before the service
-        // is destroyed.
-        mooncake::RpcWorkerPool worker_pool(
-            master_config.handler_worker_thread_num);
+        // optional so a signalled exit can join the pool before _exit without
+        // destroying WrappedMasterService / the object index.
+        std::optional<mooncake::RpcWorkerPool> worker_pool(
+            std::in_place, master_config.handler_worker_thread_num);
         mooncake::RegisterRpcService(server, *wrapped_master_service,
-                                     &worker_pool);
-
-        static std::atomic<bool> shutdown_requested{false};
-        auto signal_handler = [](int /* signum */) {
-            shutdown_requested.store(true);
-        };
-        std::signal(SIGINT, signal_handler);
-        std::signal(SIGTERM, signal_handler);
+                                     &*worker_pool);
 
         int server_result = 0;
         std::atomic<bool> server_done{false};
@@ -1753,16 +1765,27 @@ int main(int argc, char* argv[]) {
             server_done.store(true);
         });
 
-        while (!shutdown_requested.load() && !server_done.load()) {
+        while (!mooncake::ShutdownRequested() && !server_done.load()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
 
         server.stop();
         server_thread.join();
 
-        if (shutdown_requested.load()) {
-            LOG(INFO) << "Shutdown signal received, exiting gracefully";
-            return 0;
+        if (mooncake::ShutdownRequested() || mooncake::ShutdownLatched()) {
+            LOG(INFO) << "Shutdown signal received, exiting without destroying "
+                         "the object index";
+            // Stop everything that has an effect outside the process, then
+            // leave WrappedMasterService (and metadata_shards_) alive for the
+            // kernel to reclaim. Standalone has no etcd lease to revoke.
+            admin_server.SetServiceAvailable(false);
+            admin_server.SetServiceDelegate(nullptr);
+            admin_server.Stop();
+            worker_pool.reset();
+            if (http_metadata_server) {
+                http_metadata_server->stop();
+            }
+            mooncake::ExitAfterShutdown(0);
         }
         return server_result;
     }
