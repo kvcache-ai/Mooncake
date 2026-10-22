@@ -38,3 +38,14 @@ add_executable(ib_link_speed_test ib_link_speed_test.cpp)
 target_link_libraries(ib_link_speed_test PUBLIC mooncake_common gtest
                                                 gtest_main pthread)
 add_test(NAME ib_link_speed_test COMMAND ib_link_speed_test)
+
+add_executable(metrics_test metrics_test.cpp)
+target_link_libraries(metrics_test PUBLIC mooncake_metrics gtest gtest_main
+                                          pthread)
+add_test(NAME metrics_test COMMAND metrics_test)
+
+add_executable(metrics_noop_test metrics_test.cpp)
+target_compile_definitions(metrics_noop_test PRIVATE MOONCAKE_METRICS_NOOP)
+target_link_libraries(metrics_noop_test PUBLIC mooncake_metrics gtest
+                                               gtest_main pthread)
+add_test(NAME metrics_noop_test COMMAND metrics_noop_test)
