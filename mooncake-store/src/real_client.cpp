@@ -482,6 +482,25 @@ inline tl::expected<void, ErrorCode> scatter_host_to_maybe_device(
     return {};
 }
 
+// DFS adapters fill read slices with host I/O (preadv/memcpy), so a host
+// destination can be read into directly. Device destinations still need a
+// host staging buffer. Destination contents are unspecified on failure, as
+// for MEMORY replicas that are read directly into user buffers.
+inline bool can_read_dfs_into_buffers(const Replica::Descriptor &replica,
+                                      std::span<void *const> buffers) {
+    if (!replica.is_dfs_replica()) return false;
+    const auto runtime_accelerator =
+        device::GetAcceleratorRegistry().RuntimeAccelerators();
+    return std::none_of(buffers.begin(), buffers.end(), [&](const void *dst) {
+        return runtime_accelerator.FindDeviceForPointer(dst) != nullptr;
+    });
+}
+
+inline bool can_read_dfs_into_buffer(const Replica::Descriptor &replica,
+                                     void *dst) {
+    return can_read_dfs_into_buffers(replica, {&dst, 1});
+}
+
 // Gather memory that may be GPU or host into a host destination.
 inline tl::expected<void, ErrorCode> gather_maybe_device_to_host(
     void *dst, const void *src, size_t size, const std::string &context) {
@@ -4854,6 +4873,21 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
             return static_cast<int64_t>(total_size);
         }
 
+        if (void *dst = static_cast<char *>(buffer) + dst_offset;
+            can_read_dfs_into_buffer(replica, dst)) {
+            std::vector<mooncake::Slice> dst_slices;
+            allocateSlices(dst_slices, replica, dst);
+            auto filtered_qr =
+                FilterQueryResult(query_result, replica, verify_checksum);
+            auto get_result = client_->Get(key, filtered_qr, dst_slices);
+            if (!get_result) {
+                LOG(ERROR) << "DFS Get failed for key: " << key
+                           << " with error: " << toString(get_result.error());
+                return tl::unexpected(get_result.error());
+            }
+            return static_cast<int64_t>(total_size);
+        }
+
         if (replica.is_disk_replica() || replica.is_dfs_replica()) {
             // File-backed full read: use a contiguous temp buffer, then
             // scatter to the requested destination.
@@ -6693,9 +6727,11 @@ RealClient::batch_get_into_internal(
             results[i] = static_cast<int64_t>(total_size);
             continue;
         }
-        if (replica.is_disk_replica() || replica.is_dfs_replica()) {
-            // File-backed replicas cannot safely read directly into arbitrary
-            // user buffers. Use a contiguous temp buffer, then scatter.
+        if ((replica.is_disk_replica() || replica.is_dfs_replica()) &&
+            !can_read_dfs_into_buffer(replica, buffers[i])) {
+            // File-backed replicas cannot safely read directly into device
+            // or legacy DISK destinations. Use a contiguous temp buffer, then
+            // scatter. Host-destined DFS reads take the direct path below.
             disk_operations.emplace_back(
                 DiskKeyInfo{.key = key,
                             .original_index = i,
@@ -6706,7 +6742,8 @@ RealClient::batch_get_into_internal(
             results[i] = static_cast<int64_t>(total_size);
             continue;
         }
-        // MEMORY / NOF: RDMA directly to user buffer.
+        // MEMORY / NOF: RDMA directly to user buffer. Host-destined DFS:
+        // the DFS backend reads directly into the user buffer.
         std::vector<Slice> key_slices;
         allocateSlices(key_slices, replica, buffers[i]);
         valid_operations.push_back(
@@ -8294,15 +8331,19 @@ RealClient::batch_get_into_multi_buffers_internal(
         const auto &buffers = all_buffers[i];
         std::vector<Slice> key_slices;
         key_slices.reserve(buffers.size());
-        if (replica.is_memory_replica() || replica.is_nof_replica()) {
-            // MEMORY / NOF: RDMA directly to the user buffers.
+        if (replica.is_memory_replica() || replica.is_nof_replica() ||
+            can_read_dfs_into_buffers(replica, buffers)) {
+            // MEMORY / NOF: RDMA directly to the user buffers. Host-destined
+            // DFS: the DFS backend reads object bytes into the buffers in
+            // order.
             for (size_t j = 0; j < buffers.size(); ++j) {
                 key_slices.emplace_back(Slice{buffers[j], sizes[j]});
             }
         } else if (replica.is_local_disk_replica() ||
                    replica.is_disk_replica() || replica.is_dfs_replica()) {
             // LOCAL_DISK: GPU buffers passed directly as scatter-gather slices
-            // (zero-copy). DISK/DFS use a contiguous temp buffer at read time.
+            // (zero-copy). DISK and device/mixed-destined DFS use a contiguous
+            // temp buffer at read time.
             if (valid_local_disk_ops.count(key)) {
                 // Duplicate key: the first occurrence stays the transfer
                 // primary; its verified bytes fan out to this duplicate's
