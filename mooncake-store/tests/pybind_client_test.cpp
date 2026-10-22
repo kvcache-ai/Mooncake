@@ -3444,10 +3444,10 @@ TEST_F(RealClientTest, SunriseLinkHostPutGetRemove) {
 // Regression for the read-side half of the dangling-replica problem: a
 // COMPLETE LOCAL_DISK replica whose backing file physically disappeared used
 // to make every read return empty bytes forever while the master kept
-// advertising the key. The batch get path must now heal it like the Put path
-// does: prove the file gone, evict the replica, and stop advertising the key
-// instead of returning a silent empty value.
-TEST_F(RealClientTest, BatchGetBufferHealsDanglingLocalDiskReplica) {
+// advertising the key. Batch reads must heal it like the Put path does: prove
+// the file gone, evict the replica, and stop advertising the key instead of
+// returning a silent empty value.
+TEST_F(RealClientTest, BatchGetApisHealDanglingLocalDiskReplica) {
     ScopedEnvVar local_memcpy("MC_STORE_MEMCPY", "1");
     ScopedEnvVar heartbeat("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "1");
     ScopedEnvVar storage_backend("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
@@ -3524,12 +3524,210 @@ TEST_F(RealClientTest, BatchGetBufferHealsDanglingLocalDiskReplica) {
         ASSERT_FALSE(ec) << ec.message();
     }
 
-    auto after = py_client_->batch_get_buffer({key});
-    ASSERT_EQ(after.size(), 1u);
-    EXPECT_EQ(after[0], nullptr);
+    std::vector<char> destination(kSize);
+    auto into = py_client_->batch_get_into({key}, {destination.data()},
+                                           {destination.size()});
+    ASSERT_EQ(into.size(), 1u);
+    EXPECT_LT(into[0], 0);
     // The dead replica must be evicted: the master stops advertising the key
     // instead of letting every later read come back empty.
     EXPECT_TRUE(py_client_->get_replica_desc(key).empty());
+}
+
+TEST_F(RealClientTest, BatchGetIntoRejectsChangedRetrySizeForDuplicates) {
+    ScopedEnvVar local_memcpy("MC_STORE_MEMCPY", "1");
+    ScopedEnvVar heartbeat("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "1");
+    ScopedEnvVar storage_backend("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+                                 "bucket_storage_backend");
+    ScopedEnvVar bucket_keys("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "1");
+    char path[] = "/tmp/mooncake_ssd_retry_size_XXXXXX";
+    ASSERT_NE(mkdtemp(path), nullptr);
+    ssd_path_ = path;
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
+                                  .set_enable_offload(true)
+                                  .set_default_kv_lease_ttl(10)
+                                  .build()));
+    master_address_ = master_.master_address();
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17816", "P2PHANDSHAKE",
+                               16 * 1024 * 1024, 16 * 1024 * 1024, "tcp", "",
+                               master_address_, nullptr, "", true, ssd_path_),
+        0);
+
+    constexpr size_t original_size = 4096;
+    for (const size_t replacement_size :
+         {original_size / 2, original_size, original_size * 2}) {
+        SCOPED_TRACE(replacement_size);
+        const auto key = "retry-size-" + std::to_string(replacement_size);
+        ASSERT_EQ(py_client_->put(key, std::vector<char>(original_size, 'a')),
+                  0);
+        std::optional<Replica::Descriptor> disk_replica;
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (!disk_replica && std::chrono::steady_clock::now() < deadline) {
+            for (const auto& replica : py_client_->get_replica_desc(key)) {
+                if (replica.is_local_disk_replica()) {
+                    disk_replica = replica;
+                    break;
+                }
+            }
+            if (!disk_replica) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            }
+        }
+        ASSERT_TRUE(disk_replica.has_value());
+        const QueryResult stale_query(
+            {*disk_replica},
+            std::chrono::steady_clock::now() + std::chrono::minutes(1));
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        ASSERT_EQ(py_client_->remove(key), 0);
+        const std::vector<char> replacement(replacement_size, 'b');
+        ASSERT_EQ(py_client_->put(key, replacement), 0);
+
+        std::vector<char> primary(original_size * 2, 'p');
+        std::vector<char> duplicate(original_size * 2, 'd');
+        size_t disk_reads = 0;
+        auto reader = [&disk_reads](const std::string&,
+                                    RealClient::LocalDiskOffloadObjects&)
+            -> tl::expected<void, ErrorCode> {
+            ++disk_reads;
+            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+        };
+        const auto results = py_client_->batch_get_into_internal(
+            {key, key}, {primary.data(), duplicate.data()},
+            {primary.size(), duplicate.size()}, {stale_query, stale_query},
+            reader);
+        ASSERT_EQ(results.size(), 2);
+        EXPECT_EQ(disk_reads, 1);
+        EXPECT_TRUE(std::equal(replacement.begin(), replacement.end(),
+                               primary.begin()));
+        if (replacement_size == original_size) {
+            ASSERT_TRUE(results[0].has_value());
+            ASSERT_TRUE(results[1].has_value());
+            EXPECT_EQ(*results[0], original_size);
+            EXPECT_EQ(*results[1], original_size);
+            EXPECT_TRUE(std::equal(replacement.begin(), replacement.end(),
+                                   duplicate.begin()));
+        } else {
+            EXPECT_FALSE(results[0].has_value());
+            EXPECT_FALSE(results[1].has_value());
+            if (!results[0]) {
+                EXPECT_EQ(results[0].error(), ErrorCode::FILE_READ_FAIL);
+            }
+            if (!results[1]) {
+                EXPECT_EQ(results[1].error(), ErrorCode::FILE_READ_FAIL);
+            }
+            EXPECT_EQ(duplicate, std::vector<char>(duplicate.size(), 'd'));
+        }
+    }
+}
+
+TEST_F(RealClientTest, BatchGetIntoFallsBackToDiskAfterLocalDiskHeal) {
+    ScopedEnvVar local_memcpy("MC_STORE_MEMCPY", "1");
+    ScopedEnvVar heartbeat("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "1");
+    ScopedEnvVar storage_backend("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+                                 "bucket_storage_backend");
+    ScopedEnvVar bucket_keys("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "1");
+
+    char path[] = "/tmp/mooncake_ssd_disk_fallback_XXXXXX";
+    const char* created = mkdtemp(path);
+    ASSERT_NE(created, nullptr);
+    ssd_path_ = created;
+
+    char disk_path[] = "/tmp/mooncake_disk_fallback_XXXXXX";
+    const char* disk_created = mkdtemp(disk_path);
+    ASSERT_NE(disk_created, nullptr);
+
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
+                                  .set_enable_offload(true)
+                                  .set_root_fs_dir(disk_created)
+                                  .set_default_kv_lease_ttl(10)
+                                  .build()));
+    master_address_ = master_.master_address();
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17815", "P2PHANDSHAKE",
+                               16 * 1024 * 1024, 16 * 1024 * 1024, "tcp", "",
+                               master_address_, nullptr, "", true, ssd_path_),
+        0);
+
+    constexpr size_t kSize = 64 * 1024;
+    std::vector<char> source(kSize);
+    for (size_t i = 0; i < source.size(); ++i) {
+        source[i] = static_cast<char>((i * 17 + 11) & 0xFF);
+    }
+    const std::string key = "local_disk_to_disk_fallback";
+    ReplicateConfig config;
+    config.replica_num = 1;
+    ASSERT_EQ(py_client_->put(key, source, config), 0);
+
+    const auto ready_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    bool local_disk_ready = false;
+    while (std::chrono::steady_clock::now() < ready_deadline &&
+           !local_disk_ready) {
+        local_disk_ready = false;
+        for (const auto& replica : py_client_->get_replica_desc(key)) {
+            local_disk_ready |= replica.is_local_disk_replica();
+        }
+        if (!local_disk_ready) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    }
+    ASSERT_TRUE(local_disk_ready);
+    bool disk_ready = false;
+    for (const auto& replica : py_client_->get_replica_desc(key)) {
+        disk_ready |= replica.is_disk_replica();
+    }
+    ASSERT_TRUE(disk_ready);
+
+    const auto clear_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    bool memory_cleared = false;
+    while (std::chrono::steady_clock::now() < clear_deadline) {
+        if (py_client_->batch_replica_clear({key}, "localhost:17815").size() ==
+            1) {
+            memory_cleared = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    ASSERT_TRUE(memory_cleared);
+
+    std::vector<char> before_destination(kSize, '\0');
+    auto before = py_client_->batch_get_into({key}, {before_destination.data()},
+                                             {before_destination.size()});
+    ASSERT_EQ(before.size(), 1u);
+    ASSERT_EQ(before[0], static_cast<int64_t>(kSize));
+    ASSERT_EQ(before_destination, source);
+
+    std::vector<std::filesystem::path> offload_files;
+    for (const auto& entry : std::filesystem::directory_iterator(ssd_path_)) {
+        offload_files.push_back(entry.path());
+    }
+    ASSERT_FALSE(offload_files.empty());
+    std::error_code ec;
+    for (const auto& file : offload_files) {
+        std::filesystem::remove_all(file, ec);
+        ASSERT_FALSE(ec) << ec.message();
+    }
+
+    std::vector<char> destination(kSize, '\0');
+    auto result = py_client_->batch_get_into({key}, {destination.data()},
+                                             {destination.size()});
+    ASSERT_EQ(result.size(), 1u);
+    EXPECT_EQ(result[0], static_cast<int64_t>(kSize));
+    EXPECT_EQ(destination, source);
+
+    bool local_disk_survives = false;
+    bool disk_survives = false;
+    for (const auto& replica : py_client_->get_replica_desc(key)) {
+        local_disk_survives |= replica.is_local_disk_replica();
+        disk_survives |= replica.is_disk_replica();
+    }
+    EXPECT_FALSE(local_disk_survives);
+    EXPECT_TRUE(disk_survives);
+
+    std::filesystem::remove_all(disk_created, ec);
 }
 
 // fcczzz's race on #3889: a reader fails on replica R1, and before its verify
