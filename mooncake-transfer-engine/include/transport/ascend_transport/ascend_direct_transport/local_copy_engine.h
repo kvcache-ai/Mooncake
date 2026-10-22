@@ -16,6 +16,7 @@
 #ifndef LOCAL_COPY_ENGINE_H
 #define LOCAL_COPY_ENGINE_H
 
+#include <functional>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -33,6 +34,9 @@ using Slice = Transport::Slice;
 // patterns including sync, async, and batch copy operations.
 class LocalCopyEngine {
    public:
+    // Runs a task on another thread of the pool that calls Copy().
+    using TaskRunner = std::function<void(std::function<void()>)>;
+
     LocalCopyEngine();
 
     ~LocalCopyEngine();
@@ -46,6 +50,12 @@ class LocalCopyEngine {
     // Finalize and cleanup resources
     void Finalize();
 
+    // Lets a large host-device copy split its aclrtMemcpyBatch calls across
+    // `runner`, using at most `max_parallelism` threads including the caller.
+    // Pass an empty runner to keep every copy on the calling thread. Must not
+    // be called while a Copy() is in flight.
+    void SetTaskRunner(TaskRunner runner, size_t max_parallelism);
+
     // Perform local memory copy for a list of slices.
     // This is the main entry point that determines the optimal copy method
     // based on memory types and transfer size.
@@ -57,62 +67,77 @@ class LocalCopyEngine {
     //   needed for a segment owned by another process on this machine, whose
     //   virtual addresses mean nothing here.
     void Copy(TransferRequest::OpCode opcode,
-              const std::vector<Slice *> &slice_list,
-              const std::vector<void *> &dest_addrs = {});
+              const std::vector<Slice*>& slice_list,
+              const std::vector<void*>& dest_addrs = {});
 
    private:
     // Destination for slice_list[index], honouring the rebased addresses when
     // the caller supplied them.
-    static void *DestAddr(const std::vector<Slice *> &slice_list,
-                          const std::vector<void *> &dest_addrs, size_t index);
+    static void* DestAddr(const std::vector<Slice*>& slice_list,
+                          const std::vector<void*>& dest_addrs, size_t index);
 
     // Perform synchronous memory copy for each slice individually
     void CopyWithSync(TransferRequest::OpCode opcode,
-                      const std::vector<Slice *> &slice_list,
-                      const std::vector<void *> &dest_addrs,
+                      const std::vector<Slice*>& slice_list,
+                      const std::vector<void*>& dest_addrs,
                       aclrtMemcpyKind kind);
 
-    // Perform asynchronous memory copy with stream synchronization
-    void CopyWithAsync(TransferRequest::OpCode opcode,
-                       const std::vector<Slice *> &slice_list,
-                       const std::vector<void *> &dest_addrs,
-                       aclrtMemcpyKind kind);
+    // Create 6 streams for this device, then submit aclrtMemcpyAsync through
+    // the memcpy pool and synchronize each stream. use_pool is false when the
+    // caller is already a memcpy worker.
+    std::vector<aclrtStream> EnsureAsyncCopyStreams(int32_t device_id,
+                                                    aclrtContext context);
+    void CopyWithMultiStreamAsync(TransferRequest::OpCode opcode,
+                                  const std::vector<Slice*>& slice_list,
+                                  const std::vector<void*>& dest_addrs,
+                                  aclrtMemcpyKind kind, bool use_pool = true);
 
     // Perform batched memory copy using aclrtMemcpyBatch
     // Returns ACL_ERROR_RT_FEATURE_NOT_SUPPORT if batch copy is not supported
     aclError CopyWithBatch(TransferRequest::OpCode opcode,
-                           const std::vector<Slice *> &slice_list,
-                           const std::vector<void *> &dest_addrs,
+                           const std::vector<Slice*>& slice_list,
+                           const std::vector<void*>& dest_addrs,
                            aclrtMemcpyKind kind, size_t batch_num,
                            size_t slice_index) const;
+
+    // Copies slices [slice_index, slice_index + batch_num) with one
+    // aclrtMemcpyBatch call, falling back to async copy for just these slices
+    // when batch copy is not supported. dest_addrs follows Copy().
+    void CopyBatchChunk(TransferRequest::OpCode opcode,
+                        const std::vector<Slice*>& slice_list,
+                        const std::vector<void*>& dest_addrs,
+                        aclrtMemcpyKind kind, size_t slice_index,
+                        size_t batch_num);
+
+    // Splits the slices into fixed-size aclrtMemcpyBatch calls and runs them
+    // on task_runner_. The caller waits. It copies only when the pool cannot
+    // enter the caller's ACL context.
+    void CopyWithParallelBatch(TransferRequest::OpCode opcode,
+                               const std::vector<Slice*>& slice_list,
+                               const std::vector<void*>& dest_addrs,
+                               aclrtMemcpyKind kind);
 
     // Determine the appropriate memcpy kind based on source and dest memory
     // types
     static aclrtMemcpyKind GetMemcpyKind(TransferRequest::OpCode opcode,
-                                         aclrtPtrAttributes &src_attrs,
-                                         aclrtPtrAttributes &dst_attrs);
-
-    // Return (or lazily create) a stream belonging to the current ACL device
-    // context. The stream must be created while that device's context is
-    // current so aclrtMemcpyAsync does not return 107003.
-    aclrtStream GetOrCreateStreamForCurrentDevice();
+                                         aclrtPtrAttributes& src_attrs,
+                                         aclrtPtrAttributes& dst_attrs);
 
    private:
-    // Stream plus the ACL context it was created under. Destroying a stream
-    // requires that same context to be current, otherwise aclrtDestroyStream
-    // can return 107003 (ACL_ERROR_RT_STREAM_CONTEXT).
-    struct DeviceStream {
-        aclrtStream stream = nullptr;
+    // Six streams per device for the default async copy path.
+    struct AsyncStreamGroup {
         aclrtContext context = nullptr;
+        std::vector<aclrtStream> streams;
     };
-
-    // Per-device streams keyed by ACL device id. A single shared stream is
-    // unsafe across devices because Initialize() may run under device0
-    // context while workers later copy under other device contexts.
-    std::unordered_map<int32_t, DeviceStream> streams_;
+    std::unordered_map<int32_t, AsyncStreamGroup> async_stream_groups_;
+    // Serializes multi-stream copies so they do not share the 6 streams.
+    std::mutex async_copy_mu_;
     mutable std::mutex streams_mu_;
     int32_t transfer_timeout_;
     bool initialized_;
+    bool use_memcpy_batch_ = false;
+    TaskRunner task_runner_;
+    size_t max_parallelism_ = 1;
 };
 
 }  // namespace mooncake

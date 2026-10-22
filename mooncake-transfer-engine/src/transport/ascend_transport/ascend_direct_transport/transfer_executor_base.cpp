@@ -271,12 +271,9 @@ int TransferExecutorBase::initEngines() {
         LOG(INFO) << "Set LocalCommRes to:" << local_comm_res;
     } else if (params_.client_server_mode) {
         options["adxl.LocalCommRes"] = R"({"version":"1.3"})";
-        LOG(INFO) << "Client-Server mode enabled, set LocalCommRes to "
-                     "{\"version\":\"1.3\"}";
     }
 
     options[kAutoConnect] = params_.auto_connect ? kEnabled : kDisabled;
-    LOG(INFO) << "Set AutoConnect to: " << (params_.auto_connect ? "1" : "0");
 
     options["adxl.BufferPool"] = "0:0";
     char* buffer_pool = std::getenv("ASCEND_BUFFER_POOL");
@@ -471,8 +468,7 @@ void TransferExecutorBase::disconnectAllForEngine(size_t engine_idx) {
                        << connected_segment
                        << ", errmsg: " << aclGetRecentErrMsg();
         } else {
-            LOG(INFO) << "Success to disconnect AdxlEngine:"
-                      << connected_segment;
+            VLOG(1) << "Success to disconnect AdxlEngine:" << connected_segment;
         }
     }
     connected_segments_.erase(it);
@@ -676,6 +672,13 @@ bool TransferExecutorBase::resolveLocalCopyDestinations(
         dest_addrs.push_back(local_addr);
     }
     return true;
+}
+
+void TransferExecutorBase::setLocalCopyTaskRunner(
+    std::function<void(std::function<void()>)> runner, size_t max_parallelism) {
+    if (local_copy_engine_) {
+        local_copy_engine_->SetTaskRunner(std::move(runner), max_parallelism);
+    }
 }
 
 void TransferExecutorBase::processSliceList(

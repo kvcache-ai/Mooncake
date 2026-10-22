@@ -31,16 +31,49 @@
 
 namespace mooncake {
 namespace {
-constexpr size_t kDefaultThreadPoolSize = 8U;
+constexpr size_t kDefaultThreadPoolSize = 16U;
 constexpr size_t kBufferModeThreadPoolSize = 1U;
-constexpr size_t kMaxThreadPoolSize = 16U;
+constexpr size_t kMaxThreadPoolSize = 32U;
+constexpr size_t kMemcpyThreadPoolSize = 6U;
+
+void StartMemcpyThreadPool(TransferExecutorBase* executor,
+                           std::unique_ptr<AscendThreadPool>& pool,
+                           const std::vector<int>& affinity_cpus) {
+    pool = std::make_unique<AscendThreadPool>(kMemcpyThreadPoolSize, "mc-cpy-",
+                                              affinity_cpus);
+    auto* raw = pool.get();
+    executor->setLocalCopyTaskRunner(
+        [raw](std::function<void()> task) { raw->enqueue(std::move(task)); },
+        raw->size());
+}
+
+void PublishBoundAllocPool(AscendThreadPool* pool) {
+    if (pool == nullptr) {
+        return;
+    }
+    SetBoundAffinityRunner(pool, [pool](std::function<void()> task) {
+        if (!pool->tryEnqueue(std::move(task))) {
+            task();
+        }
+    });
+}
+
+void StopMemcpyThreadPool(TransferExecutorBase* executor,
+                          std::unique_ptr<AscendThreadPool>& pool) {
+    if (executor != nullptr) {
+        executor->setLocalCopyTaskRunner(nullptr, 1);
+    }
+    if (pool) {
+        pool->stop();
+    }
+}
 }  // namespace
 
 size_t DefaultSliceDispatcher::resolveThreadPoolSize() const {
     if (transfer_executor_->getUseBufferPool()) {
         return kBufferModeThreadPoolSize;
     }
-    char *ascend_thread_pool_size_str = std::getenv("ASCEND_THREAD_POOL_SIZE");
+    char* ascend_thread_pool_size_str = std::getenv("ASCEND_THREAD_POOL_SIZE");
     if (ascend_thread_pool_size_str) {
         auto opt = parseFromString<int32_t>(ascend_thread_pool_size_str);
         if (opt.has_value()) {
@@ -56,25 +89,35 @@ size_t DefaultSliceDispatcher::resolveThreadPoolSize() const {
 }
 
 DefaultSliceDispatcher::DefaultSliceDispatcher(
-    TransferExecutorBase *transfer_executor,
-    const std::vector<aclrtContext> &local_engine_contexts)
+    TransferExecutorBase* transfer_executor,
+    const std::vector<aclrtContext>& local_engine_contexts,
+    const std::vector<int32_t>& logic_device_ids)
     : transfer_executor_(transfer_executor),
-      thread_pool_(std::make_unique<AscendThreadPool>(resolveThreadPoolSize())),
-      local_engine_contexts_(local_engine_contexts) {}
+      local_engine_contexts_(local_engine_contexts) {
+    const AscendAffinityPlan affinity =
+        BuildAscendAffinityPlan(logic_device_ids);
+    thread_pool_ = std::make_unique<AscendThreadPool>(
+        resolveThreadPoolSize(), "ascend-wk-", affinity.shared_cpus);
+    StartMemcpyThreadPool(transfer_executor_, memcpy_thread_pool_,
+                          affinity.shared_cpus);
+    if (!affinity.shared_cpus.empty()) {
+        PublishBoundAllocPool(thread_pool_.get());
+    }
+}
 
 void DefaultSliceDispatcher::enqueue(
-    std::vector<Transport::Slice *> slice_list) {
+    std::vector<Transport::Slice*> slice_list) {
     std::map<
         std::pair<Transport::SegmentID, Transport::TransferRequest::OpCode>,
-        std::vector<Transport::Slice *>>
+        std::vector<Transport::Slice*>>
         seg_to_slices;
     for (auto slice : slice_list) {
         seg_to_slices[{slice->target_id, slice->opcode}].push_back(slice);
     }
-    auto *executor = transfer_executor_;
+    auto* executor = transfer_executor_;
     auto contexts = local_engine_contexts_;
-    auto *pool = thread_pool_.get();
-    for (auto &[key, slices] : seg_to_slices) {
+    auto* pool = thread_pool_.get();
+    for (auto& [key, slices] : seg_to_slices) {
         pool->enqueue([executor, contexts, moved_slices = std::move(slices)] {
             size_t engine_idx = 0;
             if (!moved_slices.empty() &&
@@ -89,7 +132,7 @@ void DefaultSliceDispatcher::enqueue(
                                   "aclrtSetCurrentContext failed, "
                                << "engine_idx: " << engine_idx
                                << ", errmsg: " << aclGetRecentErrMsg();
-                    for (auto *s : moved_slices) {
+                    for (auto* s : moved_slices) {
                         s->markFailed();
                     }
                     return;
@@ -101,20 +144,33 @@ void DefaultSliceDispatcher::enqueue(
 }
 
 void DefaultSliceDispatcher::stop() {
+    // Dispatcher workers may be inside a copy that waits for memcpy helpers.
+    // Join them before stopping the memcpy pool.
     if (thread_pool_) {
+        ClearBoundAffinityRunner(thread_pool_.get());
         thread_pool_->stop();
     }
+    StopMemcpyThreadPool(transfer_executor_, memcpy_thread_pool_);
 }
 
 RoceDummyRealSliceDispatcher::RoceDummyRealSliceDispatcher(
-    TransferExecutorBase *transfer_executor,
-    const std::vector<aclrtContext> &local_engine_contexts)
+    TransferExecutorBase* transfer_executor,
+    const std::vector<aclrtContext>& local_engine_contexts,
+    const std::vector<int32_t>& logic_device_ids)
     : num_engines_(transfer_executor->getNumEngines()),
       local_engine_contexts_(local_engine_contexts),
       transfer_executor_(transfer_executor),
       engine_queues_(num_engines_),
       queue_mutexes_(num_engines_),
       queue_cvs_(num_engines_) {
+    const AscendAffinityPlan affinity =
+        BuildAscendAffinityPlan(logic_device_ids);
+    engine_affinity_cpus_ = affinity.per_device_cpus;
+    StartMemcpyThreadPool(transfer_executor_, memcpy_thread_pool_,
+                          affinity.shared_cpus);
+    if (!affinity.shared_cpus.empty()) {
+        PublishBoundAllocPool(memcpy_thread_pool_.get());
+    }
     engine_threads_.reserve(num_engines_);
     for (size_t i = 0; i < num_engines_; ++i) {
         engine_threads_.emplace_back(
@@ -129,10 +185,10 @@ RoceDummyRealSliceDispatcher::~RoceDummyRealSliceDispatcher() {
 }
 
 void RoceDummyRealSliceDispatcher::enqueue(
-    std::vector<Transport::Slice *> slice_list) {
+    std::vector<Transport::Slice*> slice_list) {
     std::map<std::tuple<size_t, Transport::SegmentID,
                         Transport::TransferRequest::OpCode>,
-             std::vector<Transport::Slice *>>
+             std::vector<Transport::Slice*>>
         grouped;
     for (auto slice : slice_list) {
         int32_t dev_id = slice->ascend_direct.engine_id;
@@ -150,7 +206,7 @@ void RoceDummyRealSliceDispatcher::enqueue(
         }
         grouped[{engine_idx, slice->target_id, slice->opcode}].push_back(slice);
     }
-    for (auto &[key, slices] : grouped) {
+    for (auto& [key, slices] : grouped) {
         size_t engine_idx = std::get<0>(key);
         SliceTask task{std::move(slices)};
         {
@@ -169,11 +225,16 @@ void RoceDummyRealSliceDispatcher::stop() {
     for (size_t i = 0; i < num_engines_; ++i) {
         queue_cvs_[i].notify_all();
     }
-    for (auto &t : engine_threads_) {
+    for (auto& t : engine_threads_) {
         if (t.joinable()) {
             t.join();
         }
     }
+    // Engine workers may be inside a copy that waits for memcpy helpers.
+    if (memcpy_thread_pool_) {
+        ClearBoundAffinityRunner(memcpy_thread_pool_.get());
+    }
+    StopMemcpyThreadPool(transfer_executor_, memcpy_thread_pool_);
     LOG(INFO) << "RoceDummyRealSliceDispatcher: stopped";
 }
 
@@ -187,6 +248,9 @@ void RoceDummyRealSliceDispatcher::engineWorker(size_t engine_idx) {
         LOG(ERROR) << "engineWorker: aclrtSetCurrentContext failed for engine "
                    << engine_idx << ", errmsg: " << aclGetRecentErrMsg();
         return;
+    }
+    if (engine_idx < engine_affinity_cpus_.size()) {
+        (void)TryBindCurrentThread(engine_affinity_cpus_[engine_idx]);
     }
     while (running_) {
         SliceTask task;
