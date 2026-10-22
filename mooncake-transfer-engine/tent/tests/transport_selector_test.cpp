@@ -733,6 +733,55 @@ TEST(TransportSelectorTest, XpuIpcMappedPeerIsRoutable) {
         << "xpu_ipc must not make XPU routable across machines";
 }
 
+// XPU IPC alongside host staging: XPU copies the original buffers, while the
+// network transports behind it are judged on host stage buffers. With no
+// staging route, XPU is the only transport that may see the device memory,
+// even if a policy names others.
+TEST(TransportSelectorTest, XpuIpcKeepsNetworkFallbackStaged) {
+    auto conf = std::make_shared<Config>();
+    TransportSelector selector(conf);
+
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
+    transports[XPU] = std::make_shared<FakeTransport>(XPU);
+    transports[TCP] = std::make_shared<FakeTransport>(TCP);
+    auto* xpu = static_cast<FakeTransport*>(transports[XPU].get());
+    xpu->setGpuToDram(true);
+    xpu->setDramToGpu(true);
+    xpu->setGpuToGpu(true);
+    auto* tcp = static_cast<FakeTransport*>(transports[TCP].get());
+    tcp->setDramToDram(true);
+    tcp->setGpuToGpu(true);
+
+    std::vector<TransportType> buffer_transports = {XPU, TCP};
+    SelectionContext ctx;
+    ctx.segment_type = SegmentType::Memory;
+    ctx.same_machine = true;
+    ctx.local_segment = false;
+    ctx.xpu_ipc = true;
+    ctx.host_staging = true;
+    ctx.local_memory_type = MTYPE_XPU;
+    ctx.remote_memory_type = MTYPE_XPU;
+    ctx.buffer_transports = &buffer_transports;
+
+    EXPECT_EQ(selector.select(ctx, transports, 0).transport, XPU)
+        << "the IPC route is not subject to host staging";
+    EXPECT_EQ(selector.select(ctx, transports, 1).transport, TCP)
+        << "the staged network transport stays available for failover";
+
+    // A host-staged network leg needs dram_to_dram, not gpu_to_gpu.
+    tcp->setDramToDram(false);
+    EXPECT_EQ(selector.select(ctx, transports, 1).transport, UNSPEC);
+    tcp->setDramToDram(true);
+
+    // Without a staging route only XPU qualifies, even though TCP claims
+    // gpu_to_gpu for the original memory.
+    ctx.host_staging = false;
+    ctx.xpu_ipc_only = true;
+    EXPECT_EQ(selector.select(ctx, transports, 0).transport, XPU);
+    EXPECT_EQ(selector.select(ctx, transports, 1).transport, UNSPEC);
+}
+
 // Regression: a SelectionPolicy memory pattern of "xpu" must match XPU VRAM
 // (MTYPE_XPU). matchesMemoryPattern maps MTYPE_XPU -> "xpu"; without that arm
 // XPU fell through to "unknown" and no xpu-scoped policy could ever match.

@@ -15,13 +15,16 @@
 #include "tent/transport/xpu/xpu_transport.h"
 
 #include <glog/logging.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <cerrno>
+#include <charconv>
 #include <cstring>
 #include <sstream>
 #include <string_view>
+#include <unordered_set>
 
 #include "tent/common/status.h"
 #include "tent/runtime/platform.h"
@@ -43,32 +46,58 @@ std::string pidNamespace() {
 }
 
 // Exporter attribute:
-// "<pid>-<base>-<size>-<handle hex>-<pid namespace>-<generation>".
+// "<pid>-<base>-<size>-<handle hex>-<pid namespace>-<owner hex>-<generation>".
 // The handle is the allocation's Level Zero IPC handle as produced in the
-// exporter; it names a descriptor of that process, hence the pid. The
-// generation counts registrations in the exporter: a freed and reallocated
-// buffer can reuse the same address, size and descriptor number, and only
-// this field then tells the importer that its mapping is stale.
+// exporter; it names a descriptor of that process, hence the pid. The owner
+// is the hardware UUID of the device holding the allocation. The generation
+// orders registrations on this host (see XpuTransport::ipc_generation_): a
+// freed and reallocated buffer can reuse the same address, size and
+// descriptor number, and only this field then tells the importer that its
+// mapping is stale. It is the last field so attrGeneration can read it
+// cheaply.
 struct IpcAttr {
     pid_t pid = 0;
     uint64_t base = 0;
     uint64_t size = 0;
     XpuPlatform::IpcHandle handle{};
     std::string pid_namespace;
+    XpuPlatform::DeviceUuid owner{};
     uint64_t generation = 0;
 };
 
-std::string formatIpcAttr(const IpcAttr &attr) {
+std::string toHex(const uint8_t *data, size_t size) {
     static const char kHex[] = "0123456789abcdef";
     std::string hex;
-    hex.reserve(attr.handle.size() * 2);
-    for (uint8_t byte : attr.handle) {
-        hex.push_back(kHex[byte >> 4]);
-        hex.push_back(kHex[byte & 0xf]);
+    hex.reserve(size * 2);
+    for (size_t i = 0; i < size; ++i) {
+        hex.push_back(kHex[data[i] >> 4]);
+        hex.push_back(kHex[data[i] & 0xf]);
     }
+    return hex;
+}
+
+bool fromHex(const std::string &hex, uint8_t *data, size_t size) {
+    if (hex.size() != size * 2) return false;
+    auto nibble = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    for (size_t i = 0; i < size; ++i) {
+        const int hi = nibble(hex[2 * i]), lo = nibble(hex[2 * i + 1]);
+        if (hi < 0 || lo < 0) return false;
+        data[i] = static_cast<uint8_t>((hi << 4) | lo);
+    }
+    return true;
+}
+
+std::string formatIpcAttr(const IpcAttr &attr) {
     std::ostringstream ss;
-    ss << attr.pid << '-' << attr.base << '-' << attr.size << '-' << hex << '-'
-       << attr.pid_namespace << '-' << attr.generation;
+    ss << attr.pid << '-' << attr.base << '-' << attr.size << '-'
+       << toHex(attr.handle.data(), attr.handle.size()) << '-'
+       << attr.pid_namespace << '-'
+       << toHex(attr.owner.data(), attr.owner.size()) << '-' << attr.generation;
     return ss.str();
 }
 
@@ -77,30 +106,63 @@ bool parseIpcAttr(const std::string &text, IpcAttr &attr) {
     std::stringstream ss(text);
     std::string token;
     while (std::getline(ss, token, '-')) parts.push_back(token);
-    if (parts.size() != 6) return false;
+    if (parts.size() != 7) return false;
     try {
         attr.pid = static_cast<pid_t>(std::stol(parts[0]));
         attr.base = std::stoull(parts[1]);
         attr.size = std::stoull(parts[2]);
-        attr.generation = std::stoull(parts[5]);
+        attr.generation = std::stoull(parts[6]);
     } catch (const std::exception &) {
         return false;
     }
-    const std::string &hex = parts[3];
-    if (hex.size() != attr.handle.size() * 2) return false;
-    auto nibble = [](char c) -> int {
-        if (c >= '0' && c <= '9') return c - '0';
-        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-        return -1;
-    };
-    for (size_t i = 0; i < attr.handle.size(); ++i) {
-        const int hi = nibble(hex[2 * i]), lo = nibble(hex[2 * i + 1]);
-        if (hi < 0 || lo < 0) return false;
-        attr.handle[i] = static_cast<uint8_t>((hi << 4) | lo);
-    }
+    if (!fromHex(parts[3], attr.handle.data(), attr.handle.size()) ||
+        !fromHex(parts[5], attr.owner.data(), attr.owner.size()))
+        return false;
     attr.pid_namespace = parts[4];
     return attr.pid > 0 && attr.size > 0;
+}
+
+// Generation of an exporter attribute (its last field), or 0 if malformed.
+uint64_t attrGeneration(std::string_view text) {
+    const size_t dash = text.rfind('-');
+    if (dash == std::string_view::npos) return 0;
+    uint64_t generation = 0;
+    auto [end, ec] = std::from_chars(text.data() + dash + 1,
+                                     text.data() + text.size(), generation);
+    if (ec != std::errc() || end != text.data() + text.size()) return 0;
+    return generation;
+}
+
+// Failures worth retrying on a later request rather than caching.
+bool isTransient(int err) {
+    return err == EMFILE || err == ENFILE || err == ENOMEM || err == EAGAIN ||
+           err == EINTR;
+}
+
+// True the first time the calling thread asks about descriptor snapshot
+// `segment` of segment `target_id` in transport `owner`. Descriptors are
+// cached per thread (SegmentManager), so each thread reconciles the imports
+// once per snapshot it sees rather than on every request. Pointers are only
+// compared, never dereferenced; a reused address merely skips one check.
+bool firstLookAt(const void *owner, SegmentID target_id,
+                 const SegmentDesc &segment) {
+    thread_local const void *tl_owner = nullptr;
+    thread_local std::unordered_map<SegmentID, const SegmentDesc *> tl_seen;
+    if (tl_owner != owner) {
+        tl_owner = owner;
+        tl_seen.clear();
+    }
+    auto &seen = tl_seen[target_id];
+    if (seen == &segment) return false;
+    seen = &segment;
+    return true;
+}
+
+uint64_t bootTimeNs() {
+    timespec ts{};
+    if (clock_gettime(CLOCK_BOOTTIME, &ts) != 0) return 0;
+    return static_cast<uint64_t>(ts.tv_sec) * 1000000000ull +
+           static_cast<uint64_t>(ts.tv_nsec);
 }
 
 // True when [addr, addr + length) lies within [base, base + size). Like
@@ -144,6 +206,7 @@ Status XpuTransport::install(std::string &local_segment_name,
         if (local) machine_id_ = local->machine_id;
     }
     pid_namespace_ = pidNamespace();
+    ipc_generation_ = bootTimeNs();
     installed_ = true;
     // Executes same-host copies only: the device<->host staging hop, the
     // intra-node device<->device copy (same XPU, or PCIe P2P between two XPUs
@@ -163,7 +226,6 @@ Status XpuTransport::uninstall() {
         {
             std::lock_guard<std::mutex> lock(imports_lock_);
             imports.swap(imports_);
-            failed_imports_.clear();
         }
         imports.clear();  // closes the mappings outside imports_lock_
         metadata_.reset();
@@ -212,9 +274,9 @@ Status XpuTransport::submitTransferTasks(
     for (auto &request : request_list) {
         uint64_t target = request.target_offset;
         if (request.target_id != LOCAL_SEGMENT_ID) {
-            auto mapping =
-                relocate(request.target_id, copyDevice(request.source), target,
-                         request.length);
+            auto mapping = relocate(request.target_id,
+                                    platform_->deviceIndex(request.source),
+                                    target, request.length);
             if (!mapping) {
                 return Status::InvalidArgument(
                     "XPU transport: target buffer of remote segment is not "
@@ -343,6 +405,7 @@ Status XpuTransport::addMemoryBuffer(BufferDesc &desc,
             attr.base = exported.base;
             attr.size = exported.size;
             attr.pid_namespace = pid_namespace_;
+            attr.owner = exported.owner;
             attr.generation = ++ipc_generation_;
             desc.transport_attrs[TransportType::XPU] = formatIpcAttr(attr);
         } else {
@@ -366,23 +429,76 @@ Status XpuTransport::removeMemoryBuffer(BufferDesc &desc) {
     return Status::OK();
 }
 
-bool XpuTransport::prepareRemoteBuffer(SegmentID target_id,
-                                       const SegmentDesc &segment,
-                                       const BufferDesc &entry,
-                                       void *local_source) {
+bool XpuTransport::sharesHost(SegmentID target_id, const SegmentDesc &segment,
+                              const BufferDesc &entry) const {
     if (!installed_ || !ipc_enabled_ || target_id == LOCAL_SEGMENT_ID)
         return false;
     auto it = entry.transport_attrs.find(TransportType::XPU);
     if (it == entry.transport_attrs.end() || it->second.empty()) return false;
     // machine_id embeds the boot id, so equal values mean this very host.
-    if (machine_id_.empty() || segment.machine_id != machine_id_) return false;
-    const std::string &attr_text = it->second;
-    // Open on the device that will drive the copy: the one holding the local
-    // source, or device 0 for a host source. The local device reaches the
-    // peer's VRAM over PCIe P2P (or Xe Link) through this mapping.
-    const int device_index = copyDevice(local_source);
+    return !machine_id_.empty() && segment.machine_id == machine_id_;
+}
+
+bool XpuTransport::mayMapRemoteBuffer(SegmentID target_id,
+                                      const SegmentDesc &segment,
+                                      const BufferDesc &entry,
+                                      void *local_source) {
+    if (!sharesHost(target_id, segment, entry)) return false;
     const std::string failure_key =
-        attr_text + '@' + std::to_string(device_index);
+        entry.transport_attrs.at(TransportType::XPU) + '@' +
+        std::to_string(platform_->deviceIndex(local_source));
+    std::lock_guard<std::mutex> lock(imports_lock_);
+    auto it = imports_.find(target_id);
+    return it == imports_.end() || !it->second.failed.count(failure_key);
+}
+
+void XpuTransport::reconcileLocked(SegmentImports &imports,
+                                   const SegmentDesc &segment,
+                                   std::vector<ImportEntry> &dropped) {
+    std::unordered_set<std::string_view> published;
+    uint64_t newest = 0;
+    if (segment.type == SegmentType::Memory) {
+        for (auto &buffer : segment.getMemory().buffers) {
+            auto it = buffer.transport_attrs.find(TransportType::XPU);
+            if (it == buffer.transport_attrs.end()) continue;
+            published.insert(it->second);
+            newest = std::max(newest, attrGeneration(it->second));
+        }
+    }
+    // An attribute missing from `segment` is gone only if `segment` was
+    // published after it, i.e. carries a newer registration.
+    auto retired = [&](const std::string &attr, uint64_t generation) {
+        return generation <= newest && !published.count(attr);
+    };
+    auto &entries = imports.entries;
+    for (auto e = entries.begin(); e != entries.end();) {
+        if (!retired(e->attr, e->generation)) {
+            ++e;
+            continue;
+        }
+        dropped.push_back(std::move(*e));
+        e = entries.erase(e);
+    }
+    for (auto f = imports.failed.begin(); f != imports.failed.end();) {
+        const std::string attr = f->first.substr(0, f->first.rfind('@'));
+        if (retired(attr, f->second))
+            f = imports.failed.erase(f);
+        else
+            ++f;
+    }
+}
+
+bool XpuTransport::prepareRemoteBuffer(SegmentID target_id,
+                                       const SegmentDesc &segment,
+                                       const BufferDesc &entry,
+                                       void *local_source) {
+    if (!sharesHost(target_id, segment, entry)) return false;
+    const std::string &attr_text = entry.transport_attrs.at(TransportType::XPU);
+    // The device that drives the copy: the one holding the local source, or
+    // (-1) none for a host source, which the peer buffer's own device copies.
+    const int source_device = platform_->deviceIndex(local_source);
+    const std::string failure_key =
+        attr_text + '@' + std::to_string(source_device);
 
     // Declared before the lock so that mappings dropped below are closed
     // after it is released.
@@ -392,33 +508,21 @@ bool XpuTransport::prepareRemoteBuffer(SegmentID target_id,
     auto &entries = imports.entries;
     const bool cached =
         std::any_of(entries.begin(), entries.end(), [&](const auto &e) {
-            return e.attr == attr_text && e.device == device_index;
+            return e.attr == attr_text && e.serves(source_device);
         });
     // Drop the mappings of buffers the peer no longer publishes (removed, or
     // freed and registered again under a new attribute) so the exporter can
-    // reclaim their memory. Checked for each new descriptor snapshot, and
-    // before importing a new attribute, rather than on every request.
-    if (!cached || imports.snapshot != &segment) {
-        imports.snapshot = &segment;
-        std::unordered_set<std::string_view> published;
-        if (segment.type == SegmentType::Memory) {
-            for (auto &buffer : segment.getMemory().buffers) {
-                auto attr_it = buffer.transport_attrs.find(TransportType::XPU);
-                if (attr_it != buffer.transport_attrs.end())
-                    published.insert(attr_it->second);
-            }
-        }
-        for (auto e = entries.begin(); e != entries.end();) {
-            if (published.count(e->attr)) {
-                ++e;
-                continue;
-            }
-            dropped.push_back(std::move(*e));
-            e = entries.erase(e);
-        }
-    }
+    // reclaim their memory. Checked once per thread and descriptor snapshot,
+    // and before importing a new attribute, rather than on every request.
+    const bool first_look = firstLookAt(this, target_id, segment);
+    if (!cached || first_look) reconcileLocked(imports, segment, dropped);
     if (cached) return true;
-    if (failed_imports_.count(failure_key)) return false;
+    if (imports.failed.count(failure_key)) return false;
+    auto fail = [&](bool transient) {
+        if (!transient)
+            imports.failed.emplace(failure_key, attrGeneration(attr_text));
+        return false;
+    };
 
     IpcAttr attr;
     if (!parseIpcAttr(attr_text, attr) ||
@@ -429,8 +533,22 @@ bool XpuTransport::prepareRemoteBuffer(SegmentID target_id,
             << " in segment " << segment.name
             << " carries an XPU IPC attribute this process cannot use ("
             << attr_text << "); using another route";
-        failed_imports_.insert(failure_key);
-        return false;
+        return fail(false);
+    }
+    // Map on the source's device, which reaches the peer's VRAM over PCIe
+    // P2P (or Xe Link) through the mapping, so it needs peer access to the
+    // device holding it. A host source is copied by that device itself.
+    const int owner = platform_->deviceByUuid(attr.owner);
+    const int device_index = source_device >= 0 ? source_device : owner;
+    if (owner < 0 || !platform_->canAccessPeer(device_index, owner)) {
+        LOG_EVERY_N(INFO, 1000)
+            << "XpuTransport: peer buffer " << (void *)entry.addr
+            << " in segment " << segment.name << " is on "
+            << (owner < 0 ? std::string("a device not visible here")
+                          : "xpu:" + std::to_string(owner))
+            << ", which xpu:" << device_index
+            << " has no peer access to; using another route";
+        return fail(false);
     }
     void *ptr = nullptr;
     errno = 0;
@@ -447,13 +565,13 @@ bool XpuTransport::prepareRemoteBuffer(SegmentID target_id,
                       "to it: same user with kernel.yama.ptrace_scope <= 1, "
                       "or CAP_SYS_PTRACE)"
                     : "")
+            << (err ? std::string(" [") + std::strerror(err) + "]" : "")
             << "; using another route";
-        failed_imports_.insert(failure_key);
-        return false;
+        return fail(isTransient(err));
     }
     LOG(INFO) << "XpuTransport: mapped peer buffer " << (void *)attr.base
-              << " (" << attr.size << " bytes) of segment " << segment.name
-              << " at " << ptr << " on xpu:" << device_index;
+              << " (" << attr.size << " bytes, xpu:" << owner << ") of segment "
+              << segment.name << " at " << ptr << " on xpu:" << device_index;
     XpuPlatform *platform = platform_;
     std::shared_ptr<void> mapping(ptr, [platform](void *mapped) {
         auto status = platform->closeImport(mapped);
@@ -461,7 +579,8 @@ bool XpuTransport::prepareRemoteBuffer(SegmentID target_id,
             LOG(WARNING) << "XpuTransport: closing imported buffer failed: "
                          << status.ToString();
     });
-    entries.push_back(ImportEntry{attr_text, attr.base, attr.size, device_index,
+    entries.push_back(ImportEntry{attr_text, attr.base, attr.size,
+                                  attr.generation, owner, device_index,
                                   std::move(mapping)});
     return true;
 }
@@ -475,18 +594,14 @@ void XpuTransport::closeRemoteSegment(SegmentID target_id) {
     imports_.erase(it);
 }
 
-int XpuTransport::copyDevice(void *local_source) {
-    const int device_index = platform_->deviceIndex(local_source);
-    return device_index < 0 ? 0 : device_index;
-}
-
-std::shared_ptr<void> XpuTransport::relocate(SegmentID target_id, int device,
-                                             uint64_t &addr, uint64_t length) {
+std::shared_ptr<void> XpuTransport::relocate(SegmentID target_id,
+                                             int source_device, uint64_t &addr,
+                                             uint64_t length) {
     std::lock_guard<std::mutex> lock(imports_lock_);
     auto it = imports_.find(target_id);
     if (it == imports_.end()) return nullptr;
     for (auto &entry : it->second.entries) {
-        if (entry.device != device ||
+        if (!entry.serves(source_device) ||
             !rangeWithin(addr, length, entry.base, entry.size))
             continue;
         addr =

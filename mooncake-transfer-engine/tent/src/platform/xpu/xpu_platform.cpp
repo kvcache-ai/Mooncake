@@ -199,11 +199,13 @@ Status XpuPlatform::exportIpc(void* addr, size_t length, IpcExport& out) {
         return Status::InvalidArgument("not an XPU device allocation" LOC_MARK);
     uint64_t base = 0, size = 0;
     static_assert(sizeof(IpcHandle) == sizeof(XpuSyclBackend::IpcHandleBytes));
-    if (be.exportIpc(addr, &base, &size, &out.handle) != 0)
+    static_assert(sizeof(DeviceUuid) == sizeof(XpuSyclBackend::DeviceUuid));
+    if (be.exportIpc(addr, &base, &size, &out.handle, &out.owner) != 0)
         return Status::InternalError(
             "Level Zero IPC handle export failed" LOC_MARK);
     const uint64_t start = reinterpret_cast<uint64_t>(addr);
-    if (start < base || start - base + length > size)
+    if (start < base ||
+        !xpu_detail::validateDmabufRange(start - base, length, size).ok())
         return Status::InvalidArgument(
             "range spans more than one XPU allocation" LOC_MARK);
     out.base = base;
@@ -228,6 +230,14 @@ Status XpuPlatform::closeImport(void* ptr) {
 }
 
 int XpuPlatform::deviceIndex(void* addr) { return backend().deviceIndex(addr); }
+
+int XpuPlatform::deviceByUuid(const DeviceUuid& uuid) {
+    return backend().deviceByUuid(uuid);
+}
+
+bool XpuPlatform::canAccessPeer(int from, int to) {
+    return backend().canAccessPeer(from, to);
+}
 
 }  // namespace tent
 }  // namespace mooncake

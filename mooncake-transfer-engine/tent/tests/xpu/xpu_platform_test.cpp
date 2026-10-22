@@ -438,12 +438,28 @@ void ipcRoundTrip(XpuPlatform &platform, int import_device) {
     EXPECT_NE(exported.handle, empty);
     EXPECT_EQ(exported.base, reinterpret_cast<uint64_t>(dev));
     EXPECT_EQ(exported.size, kSize);
-    // A range running past the allocation is refused.
+    EXPECT_EQ(platform.deviceByUuid(exported.owner), 0);
+    // A range running past the allocation is refused, including lengths
+    // whose end would wrap around the address space.
     XpuPlatform::IpcExport overflow;
     EXPECT_TRUE(
         platform.exportIpc(dev, kSize + 1, overflow).IsInvalidArgument());
+    for (size_t len : {SIZE_MAX - kOffset + 2, SIZE_MAX}) {
+        EXPECT_TRUE(
+            platform
+                .exportIpc(static_cast<char *>(dev) + kOffset, len, overflow)
+                .IsInvalidArgument())
+            << len;
+    }
 
+    // A mapping smaller than the claimed size is refused.
     void *mapped = nullptr;
+    EXPECT_FALSE(platform
+                     .importIpc(exported.handle, getpid(), exported.size * 4,
+                                import_device, &mapped)
+                     .ok());
+    EXPECT_EQ(mapped, nullptr);
+
     s = platform.importIpc(exported.handle, getpid(), exported.size,
                            import_device, &mapped);
     if (!s.ok()) {

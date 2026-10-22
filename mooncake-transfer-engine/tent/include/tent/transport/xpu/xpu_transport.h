@@ -20,7 +20,6 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 #include "tent/platform/xpu.h"
@@ -80,12 +79,15 @@ struct XpuSubBatch : public Transport::SubBatch {
 //    XPU buffer publishes its Level Zero IPC handle in the segment descriptor
 //    (transport_attrs[XPU], see addMemoryBuffer), and the peer maps it into
 //    its own device address space with zeMemOpenIpcHandle before copying
-//    (prepareRemoteBuffer). The planner offers XPU for a remote segment only
-//    when that mapping succeeded (same machine, attribute present, import
-//    ok); anything else keeps the RDMA dma-buf route or host staging. Once
-//    the peer stops publishing the buffer or the segment is closed, the
-//    mapping is closed after the last copy through it, so the exporter can
-//    reclaim the memory.
+//    (prepareRemoteBuffer). The mapping is opened on a local device that can
+//    reach the device holding the buffer (that device itself, or one with
+//    peer access to it). The planner offers XPU for a remote segment
+//    whenever such a mapping may exist (mayMapRemoteBuffer) and imports only
+//    once XPU is actually selected; if the import fails, the request is
+//    planned again without it and keeps the RDMA dma-buf route or host
+//    staging. Once the peer stops publishing the buffer or the segment is
+//    closed, the mapping is closed after the last copy through it, so the
+//    exporter can reclaim the memory.
 // Cross-node VRAM traffic bypasses this transport entirely when RdmaTransport
 // registered both ends through dma-buf (GPUDirect-style, see
 // xpuDirectRdmaReady); staging remains the fallback for hosts or buffers
@@ -136,15 +138,26 @@ class XpuTransport : public Transport {
 
     const char *getName() const override { return "xpu"; }
 
+    // Cheap pre-check, with no import: true when `entry`, a buffer of
+    // remote segment `segment`, publishes an XPU IPC attribute this
+    // transport could try to map for a copy from/to `local_source` (IPC
+    // enabled, same machine, and no earlier import of it failed for good).
+    bool mayMapRemoteBuffer(SegmentID target_id, const SegmentDesc &segment,
+                            const BufferDesc &entry, void *local_source);
+
     // True when `entry`, a buffer of remote segment `segment` that covers the
     // request target, is (now) mapped into this process so a request against
-    // it can be executed as a local copy. Imports on first use, opening the
-    // mapping on the local device holding `local_source` (device 0 for a
-    // host source), and caches both successes and failures per attribute
-    // value and local device, so the planner may call this on every request.
-    // Mappings of buffers `segment` no longer publishes are dropped here.
-    // Returns false when the segment is on another machine, the buffer
-    // carries no XPU IPC attribute, IPC is disabled, or the import failed.
+    // it can be executed as a local copy. Imports on first use and caches
+    // the mapping per attribute value and local device. The mapping is
+    // opened on the local device holding `local_source`, which must be the
+    // device holding the peer buffer or have peer access to it, or, for a
+    // host source, on the device holding the peer buffer. Permanent failures
+    // are cached per segment too, so the planner may call this on every
+    // request; transient ones (out of descriptors or memory) are retried.
+    // Mappings and failures for buffers `segment` no longer publishes are
+    // dropped here once `segment` is known to be at least as new as them.
+    // Returns false whenever mayMapRemoteBuffer would, when the buffer's
+    // device is not reachable from the local one, or when the import failed.
     bool prepareRemoteBuffer(SegmentID target_id, const SegmentDesc &segment,
                              const BufferDesc &entry, void *local_source);
 
@@ -156,32 +169,50 @@ class XpuTransport : public Transport {
 
     void startTransfer(XpuTask *task, XpuSubBatch *batch);
 
-    // Local device that drives a copy from/to `local_source`: the one holding
-    // it, or device 0 for host memory.
-    int copyDevice(void *local_source);
+    // The checks of mayMapRemoteBuffer that need no lock.
+    bool sharesHost(SegmentID target_id, const SegmentDesc &segment,
+                    const BufferDesc &entry) const;
 
-    // Translate a peer address into the mapping imported on local device
-    // `device` (cache only). Returns that mapping, which stays open while the
-    // caller holds it, or null when there is none.
-    std::shared_ptr<void> relocate(SegmentID target_id, int device,
+    // Translate a peer address into the mapping that serves a copy from/to
+    // local device `source_device` (-1: host memory). Cache only. Returns
+    // that mapping, which stays open while the caller holds it, or null when
+    // there is none.
+    std::shared_ptr<void> relocate(SegmentID target_id, int source_device,
                                    uint64_t &addr, uint64_t length);
 
     struct ImportEntry {
         std::string attr;  // exporter attribute the mapping was made from
         uint64_t base;     // peer address of the allocation
         uint64_t size;
-        int device;  // local device the mapping was opened on
+        uint64_t generation;  // from `attr`, see addMemoryBuffer
+        int owner;            // local device holding the peer's bytes
+        int device;           // local device the mapping was opened on
         // Local mapping. Closed (XpuPlatform::closeImport) once the entry is
         // dropped and no submitTransferTasks() copying through it holds it.
         std::shared_ptr<void> mapping;
+
+        // Usable by a copy from/to local device `source_device` (-1: host
+        // memory, which the owner's queue copies).
+        bool serves(int source_device) const {
+            return device == (source_device >= 0 ? source_device : owner);
+        }
     };
 
     struct SegmentImports {
-        // Descriptor snapshot the entries were last checked against; only
-        // compared, never dereferenced.
-        const SegmentDesc *snapshot = nullptr;
         std::vector<ImportEntry> entries;
+        // "<attribute>@<local source device>" of imports that failed for a
+        // non-transient reason, with the attribute's generation; a failure
+        // for one device must not disable the route for another.
+        std::unordered_map<std::string, uint64_t> failed;
     };
+
+    // Drop the entries and failures of attributes `segment` no longer
+    // publishes, but only those no newer than the newest attribute it does
+    // publish: descriptors are cached per thread, so an older snapshot must
+    // not retire a mapping made from a newer one.
+    static void reconcileLocked(SegmentImports &imports,
+                                const SegmentDesc &segment,
+                                std::vector<ImportEntry> &dropped);
 
    private:
     bool installed_;
@@ -196,14 +227,13 @@ class XpuTransport : public Transport {
 
     // Distinguishes successive registrations of the same allocation in the
     // published attribute, so a peer never mistakes a re-registered buffer
-    // for the one it already mapped.
+    // for the one it already mapped. Seeded from CLOCK_BOOTTIME at install,
+    // so generations also order across processes on this host (a restarted
+    // peer's buffers are newer than its predecessor's).
     std::atomic<uint64_t> ipc_generation_{0};
 
     std::mutex imports_lock_;
     std::unordered_map<SegmentID, SegmentImports> imports_;
-    // "<attribute>@<local device>" of imports that failed; a failure on one
-    // device must not disable the route for another.
-    std::unordered_set<std::string> failed_imports_;
 };
 
 }  // namespace tent

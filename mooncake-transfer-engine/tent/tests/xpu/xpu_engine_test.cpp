@@ -85,6 +85,31 @@ class TransferEngineImplTestPeer {
                                        const tent::Request& request) {
         return engine.resolveTransport(request, 0);
     }
+    // The route failover attempt `index` would take.
+    static tent::SelectionResult routeAt(tent::TransferEngineImpl& engine,
+                                         const tent::Request& request,
+                                         int index) {
+        return engine.resolveTransport(request, index);
+    }
+    // A private copy of the engine's cached descriptor of segment `id`.
+    static std::shared_ptr<tent::SegmentDesc> snapshot(
+        tent::TransferEngineImpl& engine, tent::SegmentID id) {
+        tent::SegmentDescRef desc;
+        if (!engine.metadata_->segmentManager().getRemoteCached(desc, id).ok())
+            return nullptr;
+        return std::make_shared<tent::SegmentDesc>(*desc);
+    }
+    // XpuTransport::prepareRemoteBuffer for the buffer at `peer` as
+    // `desc` describes segment `id`.
+    static bool prepareAgainst(tent::TransferEngineImpl& engine,
+                               tent::SegmentID id, tent::SegmentDesc& desc,
+                               void* peer, void* source) {
+        auto* xpu = dynamic_cast<tent::XpuTransport*>(
+            engine.transport_list_[tent::XPU].get());
+        auto* entry = desc.findBuffer(reinterpret_cast<uint64_t>(peer), 1);
+        return xpu && entry &&
+               xpu->prepareRemoteBuffer(id, desc, *entry, source);
+    }
     static bool hasXpuTag(tent::TransferEngineImpl& engine, void* address) {
         return hasTag(engine, address, tent::XPU);
     }
@@ -539,13 +564,14 @@ TEST_P(XpuIpcEngineTest, XpuHintForPeerSegmentIsHonoured) {
 }
 
 // The peer buffer is mapped on the device that drives the copy, so a second
-// local device opens its own mapping instead of reusing device 0's.
+// local device opens its own mapping instead of reusing device 0's. Without
+// peer access between the two devices that copy is staged instead.
 TEST_P(XpuIpcEngineTest, ImportsArePerLocalDevice) {
+    auto& platform = Platform::getLoader();
     {
         MemoryOptions opts;
         opts.location = "xpu:1";
         void* probe = nullptr;
-        auto& platform = Platform::getLoader();
         if (!platform.allocate(&probe, 4096, opts).ok())
             GTEST_SKIP() << "needs two XPU devices";
         ASSERT_TRUE(platform.free(probe, 4096).ok());
@@ -553,13 +579,121 @@ TEST_P(XpuIpcEngineTest, ImportsArePerLocalDevice) {
     void* peer = nullptr;
     ASSERT_NO_FATAL_FAILURE(
         transfer("xpu:0", "xpu:0", Request::WRITE, UNSPEC, &peer));
-    ASSERT_NO_FATAL_FAILURE(
-        transfer("xpu:1", "xpu:0", Request::WRITE, UNSPEC, &peer));
     SegmentID id = 0;
     ASSERT_TRUE(a_->openSegment(id, b_->getSegmentName()).ok());
-    auto devices = TransferEngineImplTestPeer::xpuImports(*a_, id);
-    std::sort(devices.begin(), devices.end());
-    EXPECT_EQ(devices, (std::vector<int>{0, 1}));
+    auto* xpu = dynamic_cast<XpuPlatform*>(&platform);
+    ASSERT_NE(xpu, nullptr);
+    if (xpu->canAccessPeer(1, 0)) {
+        ASSERT_NO_FATAL_FAILURE(
+            transfer("xpu:1", "xpu:0", Request::WRITE, UNSPEC, &peer));
+        auto devices = TransferEngineImplTestPeer::xpuImports(*a_, id);
+        std::sort(devices.begin(), devices.end());
+        EXPECT_EQ(devices, (std::vector<int>{0, 1}));
+        return;
+    }
+    void* local = nullptr;
+    ASSERT_NO_FATAL_FAILURE(allocate(*a_, "xpu:1", &local));
+    Request request{};
+    request.opcode = Request::WRITE;
+    request.source = local;
+    request.target_id = id;
+    request.target_offset = reinterpret_cast<uint64_t>(peer);
+    request.length = kLength;
+    auto route = TransferEngineImplTestPeer::route(*a_, request);
+    EXPECT_EQ(route.transport, TCP);
+    ASSERT_EQ(route.staging_params.size(), 3u);
+    EXPECT_FALSE(route.staging_params[1].empty());
+    EXPECT_FALSE(route.staging_params[2].empty());
+    EXPECT_EQ(TransferEngineImplTestPeer::xpuImports(*a_, id),
+              (std::vector<int>{0}));
+}
+
+// Failover behind the IPC route still stages the device memory for the
+// network transport.
+TEST_P(XpuIpcEngineTest, FailoverRouteIsStaged) {
+    void *local = nullptr, *peer = nullptr;
+    ASSERT_NO_FATAL_FAILURE(allocate(*a_, "xpu:0", &local));
+    ASSERT_NO_FATAL_FAILURE(allocate(*b_, "xpu:0", &peer));
+    Request request{};
+    request.opcode = Request::WRITE;
+    request.source = local;
+    request.target_offset = reinterpret_cast<uint64_t>(peer);
+    request.length = kLength;
+    ASSERT_TRUE(a_->openSegment(request.target_id, b_->getSegmentName()).ok());
+    auto route = TransferEngineImplTestPeer::routeAt(*a_, request, 0);
+    ASSERT_EQ(route.transport, XPU);
+    EXPECT_TRUE(route.staging_params.empty());
+    route = TransferEngineImplTestPeer::routeAt(*a_, request, 1);
+    EXPECT_EQ(route.transport, TCP);
+    ASSERT_EQ(route.staging_params.size(), 3u);
+    EXPECT_FALSE(route.staging_params[1].empty());
+    EXPECT_FALSE(route.staging_params[2].empty());
+}
+
+// A selector policy that does not list "xpu" keeps a same-host peer's
+// device memory on the staged network route and never maps it.
+TEST_P(XpuIpcEngineTest, PolicyWithoutXpuStaysStaged) {
+    if (std::get<0>(GetParam()))
+        GTEST_SKIP() << "Policies apply to selector mode only";
+    auto c = config();
+    c->set("policy", json::parse(R"([{"name":"tcp_only",
+        "segment_type":"memory","transports":["tcp"]}])"));
+    a_ = std::make_unique<TransferEngineImpl>(c);
+    ASSERT_TRUE(a_->available());
+    void *local = nullptr, *peer = nullptr;
+    ASSERT_NO_FATAL_FAILURE(allocate(*a_, "xpu:0", &local));
+    ASSERT_NO_FATAL_FAILURE(allocate(*b_, "xpu:0", &peer));
+    Request request{};
+    request.opcode = Request::WRITE;
+    request.source = local;
+    request.target_offset = reinterpret_cast<uint64_t>(peer);
+    request.length = kLength;
+    ASSERT_TRUE(a_->openSegment(request.target_id, b_->getSegmentName()).ok());
+    auto route = TransferEngineImplTestPeer::route(*a_, request);
+    EXPECT_EQ(route.transport, TCP);
+    ASSERT_EQ(route.staging_params.size(), 3u);
+    EXPECT_FALSE(route.staging_params[1].empty());
+    EXPECT_FALSE(route.staging_params[2].empty());
+    EXPECT_TRUE(
+        TransferEngineImplTestPeer::xpuImports(*a_, request.target_id).empty());
+}
+
+// Descriptor snapshots reach threads in any order. One taken before a buffer
+// was registered must not unmap it; one that has seen a newer buffer but no
+// longer lists an older one retires the older mapping.
+TEST_P(XpuIpcEngineTest, StaleSnapshotKeepsNewerImports) {
+    void *older = nullptr, *newer = nullptr;
+    ASSERT_NO_FATAL_FAILURE(
+        transfer("xpu:0", "xpu:0", Request::WRITE, UNSPEC, &older));
+    ASSERT_NO_FATAL_FAILURE(
+        transfer("xpu:0", "xpu:0", Request::WRITE, UNSPEC, &newer));
+    SegmentID id = 0;
+    ASSERT_TRUE(a_->openSegment(id, b_->getSegmentName()).ok());
+    ASSERT_EQ(TransferEngineImplTestPeer::xpuImports(*a_, id).size(), 2u);
+    auto current = TransferEngineImplTestPeer::snapshot(*a_, id);
+    ASSERT_NE(current, nullptr);
+    auto without = [&](void* buffer) {
+        auto desc = std::make_shared<SegmentDesc>(*current);
+        auto& buffers = std::get<MemorySegmentDesc>(desc->detail).buffers;
+        buffers.erase(
+            std::remove_if(buffers.begin(), buffers.end(),
+                           [&](const BufferDesc& b) {
+                               return b.addr ==
+                                      reinterpret_cast<uint64_t>(buffer);
+                           }),
+            buffers.end());
+        return desc;
+    };
+    void* local = nullptr;
+    ASSERT_NO_FATAL_FAILURE(allocate(*a_, "xpu:0", &local));
+    auto stale = without(newer);
+    EXPECT_TRUE(TransferEngineImplTestPeer::prepareAgainst(*a_, id, *stale,
+                                                           older, local));
+    EXPECT_EQ(TransferEngineImplTestPeer::xpuImports(*a_, id).size(), 2u);
+    auto pruned = without(older);
+    EXPECT_TRUE(TransferEngineImplTestPeer::prepareAgainst(*a_, id, *pruned,
+                                                           newer, local));
+    EXPECT_EQ(TransferEngineImplTestPeer::xpuImports(*a_, id).size(), 1u);
 }
 
 // Closing the segment unmaps its peer buffers; reopening maps them again.

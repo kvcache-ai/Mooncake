@@ -97,16 +97,19 @@ class XpuPlatform : public CpuPlatform {
     // [addr, addr+length): its Level Zero IPC handle (zeMemGetIpcHandle; an
     // opaque blob that names the allocation's dma-buf by a descriptor of this
     // process, so it is only meaningful together with this process's pid),
-    // its base address in this process and its size. Fails for host memory
+    // its base address in this process, its size and the hardware UUID of
+    // the device holding it. Fails for host memory
     // and for ranges that span more than one allocation; reported without
     // logging so a registration that also failed dma-buf export does not warn
     // twice.
     static constexpr size_t kIpcHandleSize = 64;  // ZE_MAX_IPC_HANDLE_SIZE
     using IpcHandle = std::array<uint8_t, kIpcHandleSize>;
+    using DeviceUuid = std::array<uint8_t, 16>;
     struct IpcExport {
         IpcHandle handle{};
         uint64_t base = 0;
         uint64_t size = 0;
+        DeviceUuid owner{};
     };
     Status exportIpc(void *addr, size_t length, IpcExport &out);
 
@@ -125,6 +128,16 @@ class XpuPlatform : public CpuPlatform {
     // Local ordinal N of the "xpu:N" device owning `addr`, or -1 for host
     // memory.
     int deviceIndex(void *addr);
+
+    // Local ordinal of the device with hardware UUID `uuid` (as reported by
+    // exportIpc in any process on this host), or -1 when it is not visible
+    // here.
+    int deviceByUuid(const DeviceUuid &uuid);
+
+    // True when local device `from` can directly access memory on local
+    // device `to` (always true for from == to); an IPC mapping of memory on
+    // `to` is usable from `from` only then.
+    bool canAccessPeer(int from, int to);
 
     const std::string type() const override { return "xpu"; }
 };
