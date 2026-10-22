@@ -35,8 +35,10 @@ class MooncakeNoFRegister:
                         "master_server_address is required when using spdk_target_info"
                     )
                 self.config_list = self._get_remote_ssd_info(master_server_address)
+            elif self.cli_config.get("nqn"):
+                self.config_list = [self._get_namespace_config()]
             else:
-                raise ValueError("spdk_target_info is required")
+                raise ValueError("spdk_target_info or nqn is required")
 
             # Apply CLI overrides to every config (if key exists)
             for config in self.config_list:
@@ -248,15 +250,24 @@ class MooncakeNoFRegister:
 
                 # Create register instance and register SSD
                 self.register = MooncakeDistributedNoFRegister()
-                ret = self.register.real_register(
-                    cfg["nqn"],
-                    cfg["nsid"],
-                    cfg["traddr"],
-                    cfg["trsvcid"],
-                    cfg["base"],
-                    cfg["size"],
-                    cfg["master_server_address"],
-                )
+                if not self.spdk_targets:
+                    ret = self.register.query_and_register(
+                        cfg["nqn"],
+                        cfg["nsid"],
+                        cfg["traddr"],
+                        cfg["trsvcid"],
+                        cfg["master_server_address"],
+                    )
+                else:
+                    ret = self.register.real_register(
+                        cfg["nqn"],
+                        cfg["nsid"],
+                        cfg["traddr"],
+                        cfg["trsvcid"],
+                        cfg["base"],
+                        cfg["size"],
+                        cfg["master_server_address"],
+                    )
 
                 if ret != 0:
                     raise RuntimeError(f"Registration failed with code {ret}")
@@ -291,6 +302,18 @@ class MooncakeNoFRegister:
         # Return success if all SSDs were either registered or already existed
         return failed_count == 0
 
+    def _get_namespace_config(self) -> Dict[str, Any]:
+        for key in ("traddr", "master_server_address"):
+            if not self.cli_config.get(key):
+                raise ValueError(f"{key} is required when using nqn")
+        return {
+            "nqn": self.cli_config["nqn"],
+            "nsid": self.cli_config.get("nsid", 1),
+            "traddr": self.cli_config["traddr"],
+            "trsvcid": self.cli_config.get("trsvcid", 4420),
+            "master_server_address": self.cli_config["master_server_address"],
+        }
+
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description="Mooncake SSD Register with REST API")
@@ -300,12 +323,18 @@ def parse_arguments():
         help="Master server address (e.g., 192.168.65.81:50051)",
         required=True,
     )
-    parser.add_argument(
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument(
         "--spdk_target_info",
         action="append",
         help='SPDK target information (e.g., "ip:192.168.65.56 path:/home")',
-        required=True,
     )
+    source.add_argument("--nqn", help="NQN of an existing NVMe-oF subsystem")
+    parser.add_argument("--traddr", help="NVMe-oF target address (required with --nqn)")
+    parser.add_argument(
+        "--trsvcid", type=int, help="NVMe-oF target port (default: 4420)"
+    )
+    parser.add_argument("--nsid", type=int, help="Namespace ID (default: 1)")
     parser.add_argument(
         "--username",
         type=str,
@@ -347,6 +376,10 @@ def main():
         cli_config["password"] = args.password
     if args.key_file:
         cli_config["key_file"] = args.key_file
+    for key in ("nqn", "traddr", "trsvcid", "nsid"):
+        value = getattr(args, key)
+        if value is not None:
+            cli_config[key] = value
 
     register = MooncakeNoFRegister(cli_config, args.spdk_target_info)
     success = register.start_ssd_service()
