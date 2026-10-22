@@ -250,6 +250,9 @@ class FileStorage {
     int CheckFilesystem(bool sync_first) const;
     // Heartbeat: latch the drain and hand pending offload work back.
     void ApplyDiskFence();
+    // Heartbeat thread: NACK the tasks carried for the backend's ungrouped
+    // pool and drop the pool (see deferred_task_by_storage_key_).
+    void NackCarriedOffloadTasks();
     // Heartbeat, while draining_: unmount until the master acknowledges it
     // (the master treats an already-unmounted segment as success).
     void UnmountLocalDiskIfPending();
@@ -328,11 +331,9 @@ class FileStorage {
     // Tasks for keys the bucket backend deferred to its ungrouped pool, keyed
     // by tenant-scoped storage key. Consumed (merged into task_by_storage_key)
     // on the next OffloadObjects call, when the backend re-emits those keys in
-    // a bucket. Only touched from the offload worker path (single-threaded),
-    // which also runs ApplyDiskFence; that NACKs them, since a fenced store
-    // never writes their bucket. Lost on restart together with the backend's
-    // in-memory ungrouped pool, in which case the master's TTL reaper
-    // reclaims the orphaned tasks.
+    // a bucket. Only touched from the offload worker path (single-threaded);
+    // lost on restart together with the backend's in-memory ungrouped pool,
+    // in which case the master's TTL reaper reclaims the orphaned tasks.
     std::unordered_map<std::string, OffloadTaskItem>
         deferred_task_by_storage_key_;
 

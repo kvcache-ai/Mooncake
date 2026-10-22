@@ -509,7 +509,10 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
 
     for (const auto& keys : buckets_keys) {
         if (disk_fenced_.load()) {
-            // Not yet in all_bucket_keys, so the sweep below NACKs the rest.
+            // Not yet in all_bucket_keys, so the sweep below NACKs the rest,
+            // except carried keys (this cycle's deferrals and the pool's
+            // carryover in the first bucket): those stay carried, and
+            // ApplyDiskFence NACKs every carried task on the next tick.
             abort_error = ErrorCode::FILE_WRITE_FAIL;
             break;
         }
@@ -1120,6 +1123,7 @@ void FileStorage::ApplyDiskFence() {
     MutexLocker locker(&offloading_mutex_);
     enable_offloading_ = false;
     draining_.store(true);
+    NackCarriedOffloadTasks();
     if (local_disk_unmounted_) return;  // a drain already deregistered
     // Unmounting drops the master's queue of offload tasks for this store but
     // not the source-replica references those tasks hold, which would pin the
@@ -1129,27 +1133,29 @@ void FileStorage::ApplyDiskFence() {
     auto result = client_->OffloadObjectHeartbeat(false, discarded);
     LOG(INFO) << "action=release_offload_queue, result="
               << (result ? ErrorCode::OK : result.error());
+}
 
-    // Tasks carried across a bucket deferral already left that queue, and
-    // the unmount does not release them either. NACK them, the same way the
-    // key-count limit does when it stops offloading.
-    if (deferred_task_by_storage_key_.empty()) return;
-    std::vector<OffloadTaskItem> carried;
-    carried.reserve(deferred_task_by_storage_key_.size());
-    for (const auto& [_, task] : deferred_task_by_storage_key_) {
-        carried.push_back(task);
-    }
-    deferred_task_by_storage_key_.clear();
+void FileStorage::NackCarriedOffloadTasks() {
+    // No OffloadObjects call follows a fence, so nothing would re-emit the
+    // pool's keys; their carried tasks would pin the source replicas until
+    // the master's TTL reaper. A NACK is handled whether or not the segment
+    // is still mounted.
     if (auto bucket_backend =
             std::dynamic_pointer_cast<BucketStorageBackend>(storage_backend_)) {
         bucket_backend->ClearUngroupedOffloadingObjects();
     }
-    std::vector<StorageObjectMetadata> failed_metadatas(
-        carried.size(), StorageObjectMetadata{-1, 0, 0, -1, ""});
-    auto nack = client_->NotifyOffloadSuccess(carried, failed_metadatas);
-    LOG(INFO) << "action=release_deferred_offload_tasks, count="
-              << carried.size()
-              << ", result=" << (nack ? ErrorCode::OK : nack.error());
+    if (deferred_task_by_storage_key_.empty()) return;
+    std::vector<OffloadTaskItem> tasks;
+    tasks.reserve(deferred_task_by_storage_key_.size());
+    for (const auto& [_, task] : deferred_task_by_storage_key_) {
+        tasks.push_back(task);
+    }
+    deferred_task_by_storage_key_.clear();
+    std::vector<StorageObjectMetadata> nacks(
+        tasks.size(), StorageObjectMetadata{-1, 0, 0, -1, ""});
+    auto result = client_->NotifyOffloadSuccess(tasks, nacks);
+    LOG(INFO) << "action=nack_carried_offload_tasks, count=" << tasks.size()
+              << ", result=" << (result ? ErrorCode::OK : result.error());
 }
 
 void FileStorage::UnmountLocalDiskIfPending() {
