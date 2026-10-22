@@ -220,6 +220,20 @@ jobs:
         env:
           VERSION: ${{ env.VERSION }}
 
+      - name: Check wheel size
+        # Warehouse's default per-file limit; larger uploads are rejected by
+        # PyPI and TestPyPI.
+        run: |
+          limit=$((100 * 1024 * 1024))
+          for wheel in mooncake-wheel/dist-py${{ steps.pytag.outputs.tag }}/*.whl; do
+            size=$(stat -c %s "$wheel")
+            echo "$(basename "$wheel"): $((size / 1024 / 1024)) MiB"
+            if [ "$size" -gt "$limit" ]; then
+              echo "::error file=$wheel::Wheel is $size bytes, above the 100 MiB per-file upload limit"
+              exit 1
+            fi
+          done
+
       - name: Smoke test repaired wheel
         shell: bash
         run: |
