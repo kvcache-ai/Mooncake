@@ -86,7 +86,7 @@ class PausedReadMaster {
     using Service = WrappedMasterService;
     using ReadRequest = const std::vector<std::string>&;
     using ReadResponse =
-        std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>;
+        std::vector<tl::expected<GetReplicaListResponse, ErrorCode> >;
 #endif
 
     explicit PausedReadMaster(Service& service)
@@ -330,8 +330,8 @@ void CheckUnmapWaitsForContext(Config config, const WriteConfig& write_config) {
     const auto id = generate_uuid();
     const int fd = dup(file.fd());
     ASSERT_GE(fd, 0);
-    ASSERT_TRUE(RealClientTestHelper::MapShm(
-        *owner.client, fd, 0x100000, SharedFile::kSize, false, id));
+    ASSERT_TRUE(RealClientTestHelper::MapShm(*owner.client, fd, 0x100000,
+                                             SharedFile::kSize, false, id));
     const std::string value = "read while SHM is being unmapped";
     ASSERT_EQ(owner.client->put("unmap_key", value, write_config), 0);
     auto context = RealClientTestHelper::FindShmContext(*owner.client, id);
@@ -476,8 +476,8 @@ TEST_F(RealClientDeploymentTest, DummyRequestsDoNotWaitForLifecycleWriter) {
     const auto id = generate_uuid();
     const int fd = dup(file.fd());
     ASSERT_GE(fd, 0);
-    ASSERT_TRUE(RealClientTestHelper::MapShm(
-        *owner.client, fd, 0x100000, SharedFile::kSize, false, id));
+    ASSERT_TRUE(RealClientTestHelper::MapShm(*owner.client, fd, 0x100000,
+                                             SharedFile::kSize, false, id));
     auto context = RealClientTestHelper::FindShmContext(*owner.client, id);
     ASSERT_NE(context, nullptr);
     const int rejected_fd = dup(file.fd());
@@ -485,10 +485,10 @@ TEST_F(RealClientDeploymentTest, DummyRequestsDoNotWaitForLifecycleWriter) {
 
     std::unique_lock writer(
         RealClientTestHelper::LifecycleMutex(*owner.client));
-    auto ping_while_locked = std::async(std::launch::async, [&] {
-        return owner.client->ping(id);
-    });
-    const auto ping_status = ping_while_locked.wait_for(std::chrono::seconds(5));
+    auto ping_while_locked =
+        std::async(std::launch::async, [&] { return owner.client->ping(id); });
+    const auto ping_status =
+        ping_while_locked.wait_for(std::chrono::seconds(5));
     EXPECT_EQ(ping_status, std::future_status::ready);
     if (ping_status != std::future_status::ready) writer.unlock();
     EXPECT_TRUE(ping_while_locked.get());
@@ -510,8 +510,7 @@ TEST_F(RealClientDeploymentTest, DummyRequestsDoNotWaitForLifecycleWriter) {
         if (reads.size() == 1) {
             EXPECT_FALSE(reads.front());
             if (!reads.front()) {
-                EXPECT_EQ(reads.front().error(),
-                          ErrorCode::SHUTTING_DOWN);
+                EXPECT_EQ(reads.front().error(), ErrorCode::SHUTTING_DOWN);
             }
         }
         auto unmap = owner.client->unmap_shm_internal(id);
@@ -546,8 +545,8 @@ namespace {
 void CheckIpcStop(ClientConfig config, bool connect_peer,
                   bool partial_request) {
     const auto id = generate_uuid();
-    config.ipc_socket_path = "ipc_stop_" + std::to_string(getpid()) + "_" +
-                             std::to_string(id.first);
+    config.ipc_socket_path =
+        "ipc_stop_" + std::to_string(getpid()) + "_" + std::to_string(id.first);
     ClientOwner owner;
     ASSERT_EQ(owner.client->setup(config), 0);
     Socket peer(connect_peer ? ConnectIpc(config.ipc_socket_path) : -1);
@@ -557,9 +556,8 @@ void CheckIpcStop(ClientConfig config, bool connect_peer,
         const char prefix = 'x';
         ASSERT_EQ(send(peer.fd, &prefix, sizeof(prefix), MSG_NOSIGNAL), 1);
     }
-    auto closed = std::async(std::launch::async, [&] {
-        return owner.client->tearDownAll();
-    });
+    auto closed = std::async(std::launch::async,
+                             [&] { return owner.client->tearDownAll(); });
     // IPC receive alone may take five seconds; allow time for native/monitor
     // shutdown and thread scheduling as well.
     const auto status = closed.wait_for(std::chrono::seconds(15));
@@ -577,7 +575,9 @@ void CheckIpcStop(ClientConfig config, bool connect_peer,
 class PausedDummyRead {
    public:
     PausedDummyRead(RealClient& client, UUID id, bool after_native)
-        : client_(client), id_(id), after_native_(after_native),
+        : client_(client),
+          id_(id),
+          after_native_(after_native),
           released_(release.get_future()) {}
 
     int64_t Read() {
@@ -617,16 +617,17 @@ void CheckDummyRpcDrain(ClientConfig config, const WriteConfig& write_config,
     const auto id = generate_uuid();
     const int fd = dup(file.fd());
     ASSERT_GE(fd, 0);
-    ASSERT_TRUE(RealClientTestHelper::MapShm(
-        *owner.client, fd, 0x100000, SharedFile::kSize, false, id));
+    ASSERT_TRUE(RealClientTestHelper::MapShm(*owner.client, fd, 0x100000,
+                                             SharedFile::kSize, false, id));
     const int local_fd = dup(local_buffer.fd());
     ASSERT_GE(local_fd, 0);
-    ASSERT_TRUE(RealClientTestHelper::MapShm(
-        *owner.client, local_fd, 0x200000, SharedFile::kSize, true, id));
+    ASSERT_TRUE(RealClientTestHelper::MapShm(*owner.client, local_fd, 0x200000,
+                                             SharedFile::kSize, true, id));
     const std::string value = "drain the complete Dummy handler";
     ASSERT_EQ(owner.client->put("drain_key", value, write_config), 0);
     auto context = RealClientTestHelper::FindShmContext(*owner.client, id);
-    // Retain the native object: close must call Stop(), not rely on destruction.
+    // Retain the native object: close must call Stop(), not rely on
+    // destruction.
     ASSERT_NE(context, nullptr);
     auto native = RealClientTestHelper::NativeClient(*owner.client);
     std::weak_ptr<ClientServiceImpl> native_lifetime = native;
@@ -644,7 +645,8 @@ void CheckDummyRpcDrain(ClientConfig config, const WriteConfig& write_config,
         auto connected = async_simple::coro::syncAwait(
             peer.connect("127.0.0.1", std::to_string(server.port())));
         EXPECT_FALSE(connected);
-        return async_simple::coro::syncAwait(peer.call<&PausedDummyRead::Read>());
+        return async_simple::coro::syncAwait(
+            peer.call<&PausedDummyRead::Read>());
     });
     const auto entered = reached.wait_for(std::chrono::seconds(5));
     if (entered != std::future_status::ready) {
@@ -653,9 +655,8 @@ void CheckDummyRpcDrain(ClientConfig config, const WriteConfig& write_config,
         response.get();
         FAIL() << "Dummy handler did not reach its pause point";
     }
-    auto closed = std::async(std::launch::async, [&] {
-        return owner.client->tearDownAll();
-    });
+    auto closed = std::async(std::launch::async,
+                             [&] { return owner.client->tearDownAll(); });
     EXPECT_EQ(closed.wait_for(std::chrono::milliseconds(100)),
               std::future_status::timeout);
     // Acceptor shutdown happens after native Stop has completed.
@@ -693,8 +694,8 @@ void CheckDummyRpcDrain(ClientConfig config, const WriteConfig& write_config,
         if (!result) EXPECT_EQ(result.error(), ErrorCode::SHUTTING_DOWN);
     };
     const std::span<const char> payload(value.data(), value.size());
-    expect_shutdown(owner.client->put_dummy_helper(
-        "late_put", payload, write_config, id));
+    expect_shutdown(
+        owner.client->put_dummy_helper("late_put", payload, write_config, id));
     expect_shutdown(owner.client->put_batch_dummy_helper(
         {"late_batch_put"}, {payload}, write_config, id));
     expect_shutdown(owner.client->put_parts_dummy_helper(
@@ -732,7 +733,8 @@ void CheckDummyRpcDrain(ClientConfig config, const WriteConfig& write_config,
     EXPECT_EQ(closed.get(), 0);
     if (after_native) {
         EXPECT_EQ(finished.get(), static_cast<int64_t>(value.size()));
-        EXPECT_EQ(std::string(static_cast<char*>(file.data), value.size()), value);
+        EXPECT_EQ(std::string(static_cast<char*>(file.data), value.size()),
+                  value);
     } else {
         EXPECT_EQ(finished.get(), toInt(ErrorCode::SHUTTING_DOWN));
         EXPECT_EQ(std::string(static_cast<char*>(file.data), SharedFile::kSize),
@@ -1003,9 +1005,8 @@ TEST_F(RealClientDeploymentTest, CloseWaitsForRegisteredShmPublication) {
         FAIL() << "IPC registration did not become visible in TE metadata";
     }
     EXPECT_TRUE(RealClientTestHelper::ShmContexts(*owner.client).empty());
-    auto closed = std::async(std::launch::async, [&] {
-        return owner.client->tearDownAll();
-    });
+    auto closed = std::async(std::launch::async,
+                             [&] { return owner.client->tearDownAll(); });
     EXPECT_EQ(closed.wait_for(std::chrono::milliseconds(100)),
               std::future_status::timeout);
     const auto stop_deadline =
@@ -1036,17 +1037,16 @@ TEST_F(RealClientDeploymentTest, RpcWaitReturnsAfterShmCleanup) {
     const auto id = generate_uuid();
     const int fd = dup(file.fd());
     ASSERT_GE(fd, 0);
-    ASSERT_TRUE(RealClientTestHelper::MapShm(
-        *owner.client, fd, 0x100000, SharedFile::kSize, false, id));
+    ASSERT_TRUE(RealClientTestHelper::MapShm(*owner.client, fd, 0x100000,
+                                             SharedFile::kSize, false, id));
     auto context = RealClientTestHelper::FindShmContext(*owner.client, id);
     ASSERT_NE(context, nullptr);
     std::unique_lock<SharedMutex> held(context->mutex_);
     auto serving = std::async(std::launch::async, [&] {
         return owner.client->wait_dummy_rpc_server();
     });
-    auto closed = std::async(std::launch::async, [&] {
-        return owner.client->tearDownAll();
-    });
+    auto closed = std::async(std::launch::async,
+                             [&] { return owner.client->tearDownAll(); });
     const auto close_deadline =
         std::chrono::steady_clock::now() + std::chrono::seconds(5);
     // The listener is already stopped when close detaches this context.

@@ -34,8 +34,8 @@ class ClientBufferAllocator
         bool use_hugepage = false);
 
     // Create for caller-owned memory; report allocation failures as errors.
-    static tl::expected<std::shared_ptr<ClientBufferAllocator>, ErrorCode> create(
-        void* addr, size_t size, const std::string& protocol = "");
+    static tl::expected<std::shared_ptr<ClientBufferAllocator>, ErrorCode>
+    create(void* addr, size_t size, const std::string& protocol = "");
 
     ~ClientBufferAllocator();
 

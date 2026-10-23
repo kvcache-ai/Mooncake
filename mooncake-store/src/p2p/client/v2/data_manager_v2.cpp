@@ -1671,8 +1671,8 @@ DataManagerV2::WriteRemoteDataAsync(
     // TODO(V2-REVERSE-WRITE-LIFETIME): Move the pending-write transaction into
     // this coroutine before submitting TE and retain its MutableBlock across
     // the await. Lease expiry can currently free the target behind this raw
-    // address. Reattach only after TE drains and the token/deadline still match;
-    // this also requires fixing V2-TE-DRAIN in TransferCoordinator.
+    // address. Reattach only after TE drains and the token/deadline still
+    // match; this also requires fixing V2-TE-DRAIN in TransferCoordinator.
     auto reserved = PreWrite(key, total, target_id);
     if (!reserved) {
         co_return tl::make_unexpected(reserved.error());

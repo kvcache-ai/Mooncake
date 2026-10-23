@@ -1589,8 +1589,9 @@ struct RealRdmaResources {
         auto topology = engine->getLocalTopology();
         ASSERT_EQ(topology->discover(), 0);
         if (topology->getHcaList().empty()) {
-            LOG(WARNING) << "Skipping real RDMA test: no accessible RDMA device "
-                            "with an active port";
+            LOG(WARNING)
+                << "Skipping real RDMA test: no accessible RDMA device "
+                   "with an active port";
             GTEST_SKIP() << "No accessible RDMA device with an active port";
         }
 
@@ -1611,7 +1612,8 @@ struct RealRdmaResources {
         if (registered) {
             const int result = engine->unregisterLocalMemory(buffer);
             if (result != 0) {
-                LOG(ERROR) << "Failed to unregister RDMA test buffer: " << result;
+                LOG(ERROR) << "Failed to unregister RDMA test buffer: "
+                           << result;
             }
             EXPECT_EQ(result, 0);
         }

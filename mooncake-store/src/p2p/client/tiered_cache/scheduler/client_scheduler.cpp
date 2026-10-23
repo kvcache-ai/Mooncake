@@ -90,8 +90,7 @@ LegacyClientScheduler::LegacyClientScheduler(TieredBackend* backend,
 
         // Simple Policy Configuration
         SimplePolicy::Config simple_config;
-        simple_config.promotion_threshold =
-            5.0;
+        simple_config.promotion_threshold = 5.0;
         if (config.isMember("scheduler")) {
             const auto& sched_conf = config["scheduler"];
             if (sched_conf.isMember("promotion_threshold"))

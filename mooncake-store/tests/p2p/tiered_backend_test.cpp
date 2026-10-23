@@ -1382,8 +1382,8 @@ TEST_F(TieredBackendTest, MultiTierInteraction) {
 
     // Create a storage replica of hot_key.
     DataSource demote_source;
-    demote_source.buffer = std::make_unique<TempDRAMBuffer>(
-        std::move(buf1), data_size);
+    demote_source.buffer =
+        std::make_unique<TempDRAMBuffer>(std::move(buf1), data_size);
     // Create new buffer
     auto buf_copy = CreateTestBuffer(data_size);
     demote_source.buffer =

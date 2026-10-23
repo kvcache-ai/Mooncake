@@ -36,7 +36,6 @@ struct TieredLocation {
     struct DataSource data;
 };
 
-
 /**
  * @struct AllocationEntry
  * @brief The internal state of an allocation.
@@ -63,7 +62,6 @@ struct AllocationEntry {
  */
 using AllocationHandle = std::shared_ptr<AllocationEntry>;
 
-
 /**
  * @brief Result of TieredBackend::conditionalExecute.
  */
@@ -77,7 +75,6 @@ template <>
 struct ConditionalExecuteResult<void> {
     bool key_exists = false;
 };
-
 
 /**
  * @class TieredBackend

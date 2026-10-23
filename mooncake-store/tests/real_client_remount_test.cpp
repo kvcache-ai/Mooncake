@@ -102,8 +102,8 @@ TEST(RealClientRemountTest, PingNotBlockedByConcurrentReader) {
     std::atomic<bool> locked{false};
     std::atomic<bool> release{false};
     std::thread reader([&] {
-        SharedMutexLocker lock(
-            &RealClientTestHelper::ShmMutex(rc), shared_lock);
+        SharedMutexLocker lock(&RealClientTestHelper::ShmMutex(rc),
+                               shared_lock);
         locked.store(true);
         while (!release.load()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(5));

@@ -602,9 +602,9 @@ ErrorCode P2PClientService::InitStorage(const P2PClientConfig& config) {
         dm_metrics.key_retention = metrics_->key_retention;
     }
 
-    auto data_manager = CreateDataManager(
-        dm_config, resources_.GetTransferEngine(), std::move(callbacks),
-        dm_metrics);
+    auto data_manager =
+        CreateDataManager(dm_config, resources_.GetTransferEngine(),
+                          std::move(callbacks), dm_metrics);
     if (!data_manager) {
         LOG(ERROR) << "Failed to create DataManager: "
                    << toString(data_manager.error());

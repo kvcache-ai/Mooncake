@@ -272,7 +272,7 @@ class P2PPeerProcessStack {
             return false;
         }
         if (!WaitForRoutableClient(client_->GetMasterClient(),
-                                  client_->GetClientID())) {
+                                   client_->GetClientID())) {
             LOG(ERROR) << "Peer process did not become routable";
             return false;
         }

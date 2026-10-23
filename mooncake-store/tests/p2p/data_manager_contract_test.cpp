@@ -1388,9 +1388,11 @@ TEST_P(DataManagerContractTest, LeaseDrainKeepsCompletionOperationsAvailable) {
     EXPECT_EQ(drained.wait_for(std::chrono::milliseconds(50)),
               std::future_status::timeout);
 
-    EXPECT_TRUE(dm().WriteCommit(write_key, pre->write_operation_id).has_value());
+    EXPECT_TRUE(
+        dm().WriteCommit(write_key, pre->write_operation_id).has_value());
     // Also release the lease if a broken drain closed commit admission.
-    EXPECT_TRUE(dm().WriteRevoke(write_key, pre->write_operation_id).has_value());
+    EXPECT_TRUE(
+        dm().WriteRevoke(write_key, pre->write_operation_id).has_value());
     EXPECT_EQ(drained.wait_for(std::chrono::milliseconds(50)),
               std::future_status::timeout);
     EXPECT_TRUE(dm().UnPinKey(read_key, pin->read_operation_id).has_value());

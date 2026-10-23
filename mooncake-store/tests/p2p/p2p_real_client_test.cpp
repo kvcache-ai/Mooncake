@@ -223,9 +223,8 @@ TEST_F(P2PRealClientTest, InvalidShmRegistrationClosesFdAndLeavesNoContext) {
     ASSERT_GE(passed_fd, 0);
     {
         ScopedMaxMrSize limit(1);
-        auto result =
-            RealClientTestHelper::MapShm(*client, passed_fd, 0x100000, 4096,
-                                         false, {1, 2});
+        auto result = RealClientTestHelper::MapShm(*client, passed_fd, 0x100000,
+                                                   4096, false, {1, 2});
         EXPECT_FALSE(result);
     }
     struct stat after{};

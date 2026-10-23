@@ -21,12 +21,13 @@ std::shared_ptr<ClientBufferAllocator> ClientBufferAllocator::create(
 
 tl::expected<std::shared_ptr<ClientBufferAllocator>, ErrorCode>
 ClientBufferAllocator::create(void* addr, size_t size,
-                             const std::string& protocol) {
+                              const std::string& protocol) {
     try {
         return std::shared_ptr<ClientBufferAllocator>(
             new ClientBufferAllocator(addr, size, protocol));
     } catch (const std::exception& e) {
-        LOG(ERROR) << "Failed to create external buffer allocator: " << e.what();
+        LOG(ERROR) << "Failed to create external buffer allocator: "
+                   << e.what();
         return tl::unexpected(ErrorCode::INTERNAL_ERROR);
     }
 }

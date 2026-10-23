@@ -5,7 +5,7 @@
 namespace mooncake {
 
 void RealClient::register_dummy_rpc_handlers() {
-    auto &server = *dummy_rpc_server_;
+    auto& server = *dummy_rpc_server_;
     server.register_handler<&RealClient::put_dummy_helper>(this);
     server.register_handler<&RealClient::put_batch_dummy_helper>(this);
     server.register_handler<&RealClient::put_parts_dummy_helper>(this);
@@ -19,22 +19,18 @@ void RealClient::register_dummy_rpc_handlers() {
     server.register_handler<&RealClient::getSize_internal>(this);
     server.register_handler<&RealClient::get_replica_desc>(this);
     server.register_handler<&RealClient::batch_get_replica_desc>(this);
-    server.register_handler<&RealClient::get_buffer_info_dummy_helper>(
-        this);
-    server.register_handler<&RealClient::batch_put_from_dummy_helper>(
-        this);
-    server.register_handler<&RealClient::batch_get_into_dummy_helper>(
-        this);
+    server.register_handler<&RealClient::get_buffer_info_dummy_helper>(this);
+    server.register_handler<&RealClient::batch_put_from_dummy_helper>(this);
+    server.register_handler<&RealClient::batch_get_into_dummy_helper>(this);
     server.register_handler<&RealClient::map_shm_internal>(this);
     server.register_handler<&RealClient::unmap_shm_internal>(this);
-    server.register_handler<&RealClient::unregister_shm_buffer_internal>(
-        this);
+    server.register_handler<&RealClient::unregister_shm_buffer_internal>(this);
     server.register_handler<&RealClient::service_ready_internal>(this);
     server.register_handler<&RealClient::ping>(this);
 }
 
 tl::expected<std::shared_ptr<ClientServiceImpl>, ErrorCode>
-RealClient::CreateService(const ClientConfig &config) {
+RealClient::CreateService(const ClientConfig& config) {
     auto client = P2PClientService::Create(config);
     if (!client) {
         LOG(ERROR) << "Failed to create native client";
@@ -44,7 +40,7 @@ RealClient::CreateService(const ClientConfig &config) {
 }
 
 tl::expected<void, ErrorCode> RealClient::initAll_internal(
-    const std::string & /*protocol*/, const std::string & /*device_name*/,
+    const std::string& /*protocol*/, const std::string& /*device_name*/,
     size_t /*mount_segment_size*/) {
     LOG(ERROR) << "initAll is not supported by the P2P build; use setup";
     return tl::unexpected(ErrorCode::NOT_IMPLEMENTED);

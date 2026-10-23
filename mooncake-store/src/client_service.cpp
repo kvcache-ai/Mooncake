@@ -1920,8 +1920,10 @@ ErrorCode Client::InitStorage(uint64_t global_segment_size,
                               uint64_t local_buffer_size, bool enable_offload,
                               uint16_t client_rpc_port) {
     if (!resources_.GetTransferEngine() &&
-        (global_segment_size != 0 || local_buffer_size != 0 || enable_offload)) {
-        LOG(ERROR) << "Storage memory and file offload require a transfer engine";
+        (global_segment_size != 0 || local_buffer_size != 0 ||
+         enable_offload)) {
+        LOG(ERROR)
+            << "Storage memory and file offload require a transfer engine";
         return ErrorCode::INVALID_PARAMS;
     }
     const bool should_use_hugepage =
