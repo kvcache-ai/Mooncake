@@ -307,6 +307,14 @@ enum class ErrorCode : int32_t {
     // Buffer allocation errors (Range: -20 to -99)
     BUFFER_OVERFLOW = -10,  ///< Insufficient buffer space.
 
+    // Memory registration errors
+    NOF_REGISTRATION_STUCK =
+        -11,  ///< NoF DMA registration failed after partially changing backend
+              ///< state; cleanup could not be confirmed. The range stays
+              ///< quarantined (never munmap without a successful unregister).
+    NOT_REGISTERED = -12,  ///< The address is not registered with the transfer
+                           ///< engine.
+
     // Segment selection errors (Range: -100 to -199)
     SHARD_INDEX_OUT_OF_RANGE = -100,  ///< Shard index is out of bounds.
     SEGMENT_NOT_FOUND = -101,         ///< No available segments found.
