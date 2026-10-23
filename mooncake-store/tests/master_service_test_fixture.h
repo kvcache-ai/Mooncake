@@ -368,21 +368,6 @@ class MasterServiceTest : public ::testing::Test {
         return key;
     }
 
-    std::string FindGroupIdOnDifferentShard(const std::string& key) const {
-        static constexpr size_t kMetadataShardCountForTest = 1024;
-        const size_t key_shard =
-            std::hash<std::string>{}(key) % kMetadataShardCountForTest;
-        for (int i = 0; i < 10000; ++i) {
-            std::string group_id = key + "_group_" + std::to_string(i);
-            if (std::hash<std::string>{}(group_id) %
-                    kMetadataShardCountForTest !=
-                key_shard) {
-                return group_id;
-            }
-        }
-        return key + "_fallback_group";
-    }
-
     void PutCompletedObject(MasterService& service, const UUID& client_id,
                             const std::string& key,
                             const ReplicateConfig& config,

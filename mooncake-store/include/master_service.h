@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <bitset>
 #include <boost/functional/hash.hpp>
 #include <chrono>
 #include <condition_variable>
@@ -808,7 +807,7 @@ class MasterService {
 
     /**
      * @brief Commit a staged MEMORY replica to COMPLETE; decrement source
-     * refcnt; erase per-shard and per-client task entries. Mirror of
+     * refcnt; erase the key's and the client's task entries. Mirror of
      * NotifyOffloadSuccess.
      */
     auto NotifyPromotionSuccess(const UUID& client_id, const std::string& key,
@@ -1069,10 +1068,8 @@ class MasterService {
     // Walk shared by the two sweeps above; removes completed replicas
     // matching is_stale, erasing a key when no valid replica remains. Each
     // tenant is first read to pick the objects that match, and only those are
-    // cleaned, each under its own write lock: a mass client expiry marks
-    // handles stale table-wide, and walking a whole shard of the old store
-    // while holding it exclusively blocked every RPC for that shard until the
-    // sweep moved on.
+    // cleaned, each under its own write lock, since a mass client expiry marks
+    // handles stale table-wide.
     tl::expected<void, ErrorCode> ClearStaleHandles(
         const std::function<bool(const Replica&)>& is_stale);
     bool ProcessClientOffboardingJob(ClientOffboardingJob& job);
@@ -1165,7 +1162,6 @@ class MasterService {
     tl::expected<TenantId, ErrorCode> ResolveTenantIdForWrite(
         const TenantId& tenant_id) const;
     bool IsTenantRegistered(const TenantId& tenant_id) const;
-    bool TenantHasObjects(const TenantId& tenant_id) const;
 
     // Reads the member keys registered for `group_id` in the tenant's route;
     // empty if the tenant or the group is unregistered.
@@ -1199,15 +1195,13 @@ class MasterService {
         const std::vector<std::string>& previous_media_hint = {});
     void FinalizeRemovedReplicasAfterDurable(
         const OpLogEntry& durable_entry,
-        const std::vector<ReplicaID>& replica_ids, EraseMode erase_mode,
-        const std::vector<std::string>& previous_media_hint = {});
+        const std::vector<ReplicaID>& replica_ids);
     // The durable finalizers of a decision taken under a key's lock that was
     // let go of before the OpLog entry became durable. Those that name the
     // object by `ObjectRef` act only on that same publication, so a same-key
     // recreate that landed meanwhile is left alone.
     void FinalizeMetadataEraseAfterDurable(route::ObjectRef object,
-                                           const TenantId& tenant_id,
-                                           EraseMode erase_mode);
+                                           const TenantId& tenant_id);
     void FinalizeExpiredProcessingReplicasAfterDurable(
         route::ObjectRef object, const OpLogEntry& durable_entry,
         const std::chrono::system_clock::time_point& ttl);
@@ -1591,7 +1585,9 @@ class MasterService {
 
         // The namespace policy's say on the held key taking `bytes` more
         // memory, asked before it is allocated; zero bytes asks only whether
-        // the namespace admits writes. Only while a key is held.
+        // the namespace admits writes. Only while a key is held. A caller that
+        // fails after growing needs no rollback: releasing the key settles the
+        // account to what the object holds then, which gives the growth back.
         [[nodiscard]] tl::expected<void, ErrorCode> Grow(uint64_t bytes) const {
             return ns_->Grow(*guard_, bytes);
         }
@@ -1646,10 +1642,6 @@ class MasterService {
         }
 
        private:
-        // The rollback of a publication that could not be set up reaches the
-        // guard.
-        friend class MasterService;
-
         MasterService* service_;
         ObjectIdentity object_id_;
         // Null when the namespace does not exist; a namespace stays put once
@@ -1658,7 +1650,6 @@ class MasterService {
         std::optional<route::WriteGuard> guard_;
     };
 
-    friend class MetadataAccessor;
     class MetadataAccessorRO {
        public:
         // Reads the object without copying its identity, which a batch read
@@ -1813,10 +1804,6 @@ class MasterService {
     // Offload-on-evict: defer disk offload to eviction time
     // (config: offload_on_evict)
     bool offload_on_evict_{false};
-    // Force-evict: allow evicting MEMORY replicas without disk offload when cap
-    // exceeded (config: offload_force_evict, only effective when
-    // offload_on_evict_=true)
-    bool offload_force_evict_{false};
 
     // Promotion-on-hit: opt-in flag enabling LOCAL_DISK -> MEMORY promotion
     // when a Get observes a key with only LOCAL_DISK replicas.
@@ -1998,7 +1985,6 @@ class MasterService {
     std::list<DiscardedReplicas> discarded_replicas_
         GUARDED_BY(discarded_replicas_mutex_);
     size_t offloading_queue_limit_ = 50000;
-    double offload_cap_ratio_ = 0.5;
 
     // Task manager
     ClientTaskManager task_manager_;

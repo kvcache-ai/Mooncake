@@ -9,7 +9,7 @@
 // then comes back to the objects the policy deferred while the namespace is
 // short of its share of the minimum. What one namespace cannot give up is not
 // made up by another, so each namespace's outcome is told by its own objects
-// alone. With one namespace this is BatchEvict's order today.
+// alone.
 //
 // The evictor runs the loop and keeps its invariants; what varies is
 // injected:

@@ -235,7 +235,7 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
     void ReloadTenantQuotaPolicyFromStore(MasterService& service) {
         MasterServiceTestPeer(service)
             .LoadTenantQuotaPoliciesFromStoreOrThrow();
-        MasterServiceTestPeer(service).RebuildTenantQuotaUsageFromMetadata();
+        service.tenant_quota_policy()->OnRestored();
     }
 
     void ReplaceTenantQuotaPolicyStore(
@@ -320,7 +320,7 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
         entry.tenant_id = tenant_id.value();
         entry.object_key = key;
         MasterServiceTestPeer(service).FinalizeRemovedReplicasAfterDurable(
-            entry, removed_ids, MasterServiceTestPeer::EraseMode::kFull);
+            entry, removed_ids);
     }
 
     void AddCompletedDiskReplica(MasterService& service, const UUID& client_id,
@@ -379,10 +379,6 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
             segment, generate_uuid(),
             std::make_shared<ClientLivenessRecord>(
                 ClientLivenessRecord::Clock::now()));
-    }
-
-    void RecomputeTenantEffectiveQuotasForTest(MasterService& service) {
-        MasterServiceTestPeer(service).RecomputeTenantEffectiveQuotas();
     }
 
     bool WaitForTenantQuotaPolicyMutexContention(MasterService& service) {
@@ -1131,7 +1127,7 @@ TEST_F(MasterServiceTenantQuotaTest,
     EXPECT_EQ(delete_future.wait_for(std::chrono::milliseconds(200)),
               std::future_status::timeout)
         << "tenant deletion passed the metadata scan while zero-charge "
-           "PutStart still held the target metadata shard";
+           "PutStart still held the target key";
 
     blocking_strategy_ptr->AllowAllocation();
     put_thread.join();
@@ -1172,7 +1168,7 @@ TEST_F(MasterServiceTenantQuotaTest,
     auto recompute_started_future = recompute_started.get_future();
     auto recompute = std::async(std::launch::async, [&] {
         recompute_started.set_value();
-        RecomputeTenantEffectiveQuotasForTest(service);
+        service.tenant_quota_policy()->OnCapacityChanged();
     });
     recompute_started_future.wait();
 

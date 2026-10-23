@@ -1069,8 +1069,7 @@ class MasterServiceHATest : public ::testing::Test {
         MasterService& service, const OpLogEntry& durable_entry,
         const std::vector<ReplicaID>& replica_ids) {
         MasterServiceTestPeer(service).FinalizeRemovedReplicasAfterDurable(
-            durable_entry, replica_ids,
-            MasterServiceTestPeer::EraseMode::kFull);
+            durable_entry, replica_ids);
     }
 
     static void SetLocalDiskUsedBytesForTesting(MasterService& service,

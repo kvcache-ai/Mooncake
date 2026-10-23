@@ -9,8 +9,8 @@
 // keeps what it is charged in its quota ledger. This class decides how large
 // every account is.
 //
-// Lock order: the policy lock, then (outside it) the master's snapshot lock and
-// a metadata shard lock, then the recompute lock, then the table's shard locks.
+// Lock order: the policy lock, then (outside it) the master's state lock and a
+// key lock, then the recompute lock, then the table's shard locks.
 // The capacity callback runs under the recompute lock and must take nothing
 // above it.
 

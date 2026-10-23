@@ -642,8 +642,7 @@ TEST_F(MasterServiceEvictScenarioTest,
                   .ForTenant("tenant-a")
                   .ExpectReplicas(1))
         .When(PutEnd("tenant-a-new").ForTenant("tenant-a"))
-        // tenant-b has nothing evictable, so it keeps rejecting -- now
-        // without a shard scan per attempt.
+        // tenant-b has nothing evictable, so it keeps rejecting.
         .When(PutStart("tenant-b-overflow", 1)
                   .ForTenant("tenant-b")
                   .ExpectError(ErrorCode::TENANT_QUOTA_EXCEEDED));
@@ -821,7 +820,7 @@ TEST_F(MasterServiceEvictScenarioTest, PressureEvictionExpandsToWholeGroup) {
         .Given(Objects({"grouped_evict_a", "grouped_evict_b"})
                    .Size(kGroupObject)
                    .CompleteOn("memory")
-                   .InGroup(GroupOnDifferentShard("grouped_evict_a"))
+                   .InGroup("grouped_evict_a_group")
                    .ExpiredFrom(ExpiredBase()))
         .When(PutStart("grouped_evict_trigger", kGroupObject)
                   .Eventually(std::chrono::seconds(10)))
@@ -842,7 +841,7 @@ TEST_F(MasterServiceEvictScenarioTest,
         .Given(Objects({"grouped_leased_a", "grouped_leased_b"})
                    .Size(kGroupObject)
                    .CompleteOn("memory")
-                   .InGroup(GroupOnDifferentShard("grouped_leased_a"))
+                   .InGroup("grouped_leased_a_group")
                    .ExpiredFrom(ExpiredBase()))
         // Reading one member grants it a fresh lease, which shields the whole
         // group from the eviction armed by the failing writes below.

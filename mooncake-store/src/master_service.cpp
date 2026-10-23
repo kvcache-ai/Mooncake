@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <array>
 #include <algorithm>
-#include <bitset>
 #include <cassert>
 #include <cctype>
 #include <cmath>
@@ -62,13 +61,6 @@
 namespace mooncake {
 
 namespace {
-
-// Per-cycle offload cap as a fraction of `offloading_queue_limit_`. Used only
-// when offload-on-evict mode is active. Defers memory eviction for at most
-// this fraction of the queue limit per BatchEvict cycle; beyond that, eviction
-// falls back according to `offload_force_evict_`.
-// NOTE: Both offloading_queue_limit_ and offload_cap_ratio_ are now
-// configurable via --offloading_queue_limit and --offload_cap_ratio flags.
 
 uint64_t SaturatingAdd(uint64_t lhs, uint64_t rhs) {
     if (lhs > std::numeric_limits<uint64_t>::max() - rhs) {
@@ -253,7 +245,7 @@ struct MasterService::MemoryEviction {
             auto reservation = service_.ReserveBatchOpLogSlot();
             if (!reservation) {
                 LOG(WARNING)
-                    << "BatchEvict: OpLog reservation failed for key=" << key
+                    << "Eviction: OpLog reservation failed for key=" << key
                     << ", err=" << static_cast<int>(reservation.error())
                     << ", stopping eviction scan";
                 return tl::make_unexpected(reservation.error());
@@ -272,8 +264,8 @@ struct MasterService::MemoryEviction {
                     : service_.SerializeMetadataForOpLogFromReplicaDescriptors(
                           metadata, remaining),
                 [this, removed_ids](const OpLogEntry& durable_entry) {
-                    service_.FinalizeRemovedReplicasAfterDurable(
-                        durable_entry, removed_ids, EraseMode::kFull);
+                    service_.FinalizeRemovedReplicasAfterDurable(durable_entry,
+                                                                 removed_ids);
                 });
             if (!persisted) {
                 for (const auto& id : removed_ids) {
@@ -282,10 +274,9 @@ struct MasterService::MemoryEviction {
                         replica->cancel_remove();
                     }
                 }
-                LOG(WARNING)
-                    << "BatchEvict: OpLog persist failed for key=" << key
-                    << ", err=" << static_cast<int>(persisted.error())
-                    << ", stopping eviction scan";
+                LOG(WARNING) << "Eviction: OpLog persist failed for key=" << key
+                             << ", err=" << static_cast<int>(persisted.error())
+                             << ", stopping eviction scan";
                 return tl::make_unexpected(persisted.error());
             }
             eviction::Effect effect;
@@ -452,7 +443,6 @@ MasterService::MasterService(const MasterServiceConfig& config)
       put_start_discard_timeout_sec_(config.put_start_discard_timeout_sec),
       put_start_release_timeout_sec_(config.put_start_release_timeout_sec),
       offloading_queue_limit_(config.offloading_queue_limit),
-      offload_cap_ratio_(config.offload_cap_ratio),
       task_manager_(config.task_manager_config),
       batch_oplog_writer_factory_(
           [](OrderedOpLogWriterConfig writer_config,
@@ -513,9 +503,9 @@ MasterService::MasterService(const MasterServiceConfig& config)
     // Validate offload tuning knobs here (not only via gflags validator),
     // because values loaded from a configuration file bypass the gflags
     // validator chain.
-    if (offload_cap_ratio_ < 0.0 || offload_cap_ratio_ > 1.0) {
+    if (config.offload_cap_ratio < 0.0 || config.offload_cap_ratio > 1.0) {
         LOG(ERROR) << "offload_cap_ratio must be between 0.0 and 1.0, "
-                   << "current value: " << offload_cap_ratio_;
+                   << "current value: " << config.offload_cap_ratio;
         throw std::invalid_argument("Invalid offload_cap_ratio");
     }
     if (offloading_queue_limit_ == 0) {
@@ -564,23 +554,23 @@ MasterService::MasterService(const MasterServiceConfig& config)
         LOG(INFO) << "Offload-on-evict mode enabled: DRAM offload to "
                      "LOCAL_DISK will occur at eviction time instead of "
                      "PutEnd";
-        offload_force_evict_ = config.offload_force_evict;
-        if (offload_force_evict_) {
+        if (config.offload_force_evict) {
             LOG(INFO) << "Force-evict enabled: objects exceeding offload "
                          "cap will be evicted without disk offload";
         }
     }
+    // With offload-on-evict and offload_force_evict, a round that has queued
+    // offload_cap_ratio of the offloading queue limit lets the rest of the
+    // memory it takes go without an offload.
     memory_eviction_ = std::make_unique<MemoryEviction>(
         *this,
         MemoryEviction::Settings{
             .through_oplog = enable_oplog_,
             .allow_evict_soft_pinned = allow_evict_soft_pinned_objects_,
             .offload_on_evict = offload_on_evict_,
-            .offload = {.cap = offload_on_evict_
-                                   ? static_cast<long>(offloading_queue_limit_ *
-                                                       offload_cap_ratio_)
-                                   : 0,
-                        .force_evict = offload_force_evict_}});
+            .offload = {.cap = static_cast<long>(offloading_queue_limit_ *
+                                                 config.offload_cap_ratio),
+                        .force_evict = config.offload_force_evict}});
 
     // Promotion-on-hit: when Get observes a LOCAL_DISK-only key, queue an
     // async copy back to MEMORY. Only meaningful when offload is enabled
@@ -1431,11 +1421,6 @@ tl::expected<TenantId, ErrorCode> MasterService::ResolveTenantIdForWrite(
     return tenant_id;
 }
 
-bool MasterService::TenantHasObjects(const TenantId& tenant_id) const {
-    const metadata::Namespace* ns = namespaces_.Lookup(tenant_id);
-    return ns != nullptr && ns->objects.ObjectCount() != 0;
-}
-
 uint64_t MasterService::AllocatableMemoryBytes() {
     uint64_t capacity = 0;
     ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
@@ -1632,8 +1617,8 @@ size_t MasterService::EraseReplicasWithCacheTotalAccounting(
 }
 
 void MasterService::FinalizeRemovedReplicasAfterDurable(
-    const OpLogEntry& durable_entry, const std::vector<ReplicaID>& replica_ids,
-    EraseMode erase_mode, const std::vector<std::string>& previous_media_hint) {
+    const OpLogEntry& durable_entry,
+    const std::vector<ReplicaID>& replica_ids) {
     if (replica_ids.empty()) {
         return;
     }
@@ -1652,10 +1637,8 @@ void MasterService::FinalizeRemovedReplicasAfterDurable(
     auto& metadata = accessor.Get();
     // The replicas being finalized are already marked REMOVED, so the normal
     // completed-replica view no longer contains their media. Preserve the
-    // pre-removal view (and any caller-provided snapshot) for the event delta.
-    auto previous_media = KvRemovalSnapshot(metadata);
-    previous_media.insert(previous_media.end(), previous_media_hint.begin(),
-                          previous_media_hint.end());
+    // pre-removal view for the event delta.
+    const auto previous_media = KvRemovalSnapshot(metadata);
     auto erased_replicas = PopReplicasWithCacheTotalAccounting(
         metadata, [&ids](const Replica& replica) {
             return replica.status() == ReplicaStatus::REMOVED &&
@@ -1675,7 +1658,7 @@ void MasterService::FinalizeRemovedReplicasAfterDurable(
     CancelPromotionTaskForRemovedReplicas(metadata, accessor.GetState(),
                                           erased_replica_ids);
     if (!metadata.IsValid()) {
-        accessor.Erase(erase_mode, previous_media);
+        accessor.Erase(previous_media);
     } else {
         SyncKvObjectState(durable_entry.object_key, metadata, tenant_id,
                           previous_media);
@@ -1685,9 +1668,8 @@ void MasterService::FinalizeRemovedReplicasAfterDurable(
     }
 }
 
-void MasterService::FinalizeMetadataEraseAfterDurable(route::ObjectRef object,
-                                                      const TenantId& tenant_id,
-                                                      EraseMode erase_mode) {
+void MasterService::FinalizeMetadataEraseAfterDurable(
+    route::ObjectRef object, const TenantId& tenant_id) {
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     // Act on the pinned publication only: a same-key recreate that landed
     // while the erase was in flight must not be erased, and an object already
@@ -1697,7 +1679,7 @@ void MasterService::FinalizeMetadataEraseAfterDurable(route::ObjectRef object,
     if (!accessor.IsPublished()) {
         return;
     }
-    accessor.Erase(erase_mode);
+    accessor.Erase();
 }
 
 void MasterService::FinalizeExpiredProcessingReplicasAfterDurable(
@@ -1869,8 +1851,7 @@ tl::expected<void, ErrorCode> MasterService::PersistStaleHandleCleanupForHA(
         payload,
         [this,
          removed_ids = plan.removed_ids](const OpLogEntry& durable_entry) {
-            FinalizeRemovedReplicasAfterDurable(durable_entry, removed_ids,
-                                                EraseMode::kFull);
+            FinalizeRemovedReplicasAfterDurable(durable_entry, removed_ids);
         });
     if (!result) {
         metadata.VisitReplicas(
@@ -2303,8 +2284,7 @@ tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
                         OpType::REMOVE, tenant_id.value(), object.key, {},
                         [this, object](const OpLogEntry& durable_entry) {
                             FinalizeMetadataEraseAfterDurable(
-                                object, TenantId(durable_entry.tenant_id),
-                                EraseMode::kFull);
+                                object, TenantId(durable_entry.tenant_id));
                         });
                     if (!persist_result) {
                         LOG(WARNING)
@@ -4115,8 +4095,7 @@ auto MasterService::BatchReplicaClear(
                             [this, removed_ids = std::move(removed_ids)](
                                 const OpLogEntry& durable_entry) {
                                 FinalizeRemovedReplicasAfterDurable(
-                                    durable_entry, removed_ids,
-                                    EraseMode::kFull);
+                                    durable_entry, removed_ids);
                             });
                     if (!persist_result) {
                         continue;
@@ -4189,8 +4168,7 @@ auto MasterService::BatchReplicaClear(
                             [this, removed_ids = std::move(removed_ids)](
                                 const OpLogEntry& durable_entry) {
                                 FinalizeRemovedReplicasAfterDurable(
-                                    durable_entry, removed_ids,
-                                    EraseMode::kFull);
+                                    durable_entry, removed_ids);
                             });
                     } else {
                         persist_result = AppendReservedOpLogWithDurableFinalize(
@@ -4201,8 +4179,7 @@ auto MasterService::BatchReplicaClear(
                             [this, removed_ids = std::move(removed_ids)](
                                 const OpLogEntry& durable_entry) {
                                 FinalizeRemovedReplicasAfterDurable(
-                                    durable_entry, removed_ids,
-                                    EraseMode::kFull);
+                                    durable_entry, removed_ids);
                             });
                     }
                     if (!persist_result) {
@@ -4784,8 +4761,6 @@ auto MasterService::AllocateAndInsertMetadata(
     assert(!accessor.IsPublished());
     const std::string& key = accessor.GetKey();
 
-    // Asked before anything is allocated; if the insert below fails, the key
-    // is released holding no object and the policy gives the growth back.
     auto grown =
         accessor.Grow(SaturatingMultiply(value_length, config.replica_num));
     if (!grown) {
@@ -5015,12 +4990,7 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
 
     // Tenant over-quota remains a background-eviction concern. Bucket-count
     // exhaustion is different: see AdmitWithDfsRecovery.
-    auto result = AdmitWithDfsRecovery(config, admit);
-    if (!result && result.error() == ErrorCode::TENANT_QUOTA_EXCEEDED) {
-        MasterMetricManager::instance().inc_tenant_quota_reject(
-            object_id.tenant_id.value(), "quota_exceeded");
-    }
-    return result;
+    return AdmitWithDfsRecovery(config, admit);
 }
 
 auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
@@ -5395,8 +5365,8 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
                 tenant_id.value(), key, {},
                 [this, removed_ids = std::move(removed_ids)](
                     const OpLogEntry& durable_entry) {
-                    FinalizeRemovedReplicasAfterDurable(
-                        durable_entry, removed_ids, EraseMode::kFull);
+                    FinalizeRemovedReplicasAfterDurable(durable_entry,
+                                                        removed_ids);
                 });
         } else {
             persist_result = AppendReservedOpLogWithDurableFinalize(
@@ -5406,8 +5376,8 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
                                                                 remaining),
                 [this, removed_ids = std::move(removed_ids)](
                     const OpLogEntry& durable_entry) {
-                    FinalizeRemovedReplicasAfterDurable(
-                        durable_entry, removed_ids, EraseMode::kFull);
+                    FinalizeRemovedReplicasAfterDurable(durable_entry,
+                                                        removed_ids);
                 });
         }
         if (!persist_result) {
@@ -5770,9 +5740,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 // A leased memory snapshot still references the old replica
                 // descriptors. Allocate the replacement before removing the
                 // old metadata so an allocation failure leaves the old object
-                // readable instead of turning it into OBJECT_NOT_FOUND. If it
-                // fails, the key is released with the old object only, and the
-                // policy gives the growth back.
+                // readable instead of turning it into OBJECT_NOT_FOUND.
                 std::optional<std::vector<Replica>> replacement_replicas;
                 if (has_read_lease) {
                     auto grown = accessor.Grow(SaturatingMultiply(
@@ -5840,19 +5808,10 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
         }
     };
 
-    // Over-quota is rejected outright. Making room is the background pass's
-    // job (the namespace policy's maintenance pass), not the write path's: the
-    // same contract the pool has when enable_multi_tenants is false -- this
-    // write fails, the evictor builds headroom, the next one succeeds. Evicting
-    // inline instead put a scan of up to kNumShards shard write locks on
-    // admission, which every concurrent writer at the ceiling repeated for the
-    // same freed extent.
-    auto result = AdmitWithDfsRecovery(config, admit);
-    if (!result && result.error() == ErrorCode::TENANT_QUOTA_EXCEEDED) {
-        MasterMetricManager::instance().inc_tenant_quota_reject(
-            object_id.tenant_id.value(), "quota_exceeded");
-    }
-    return result;
+    // Over-quota is rejected outright. Making room is the namespace policy's
+    // maintenance pass, not the write path's: this write fails, the evictor
+    // builds headroom, the next one succeeds.
+    return AdmitWithDfsRecovery(config, admit);
 }
 
 auto MasterService::UpsertEnd(const UUID& client_id,
@@ -5998,8 +5957,8 @@ auto MasterService::EvictDiskReplicaImpl(const UUID& client_id,
                     metadata.tenant_id.value(), key, {},
                     [this, removed_ids = std::move(removed_ids)](
                         const OpLogEntry& durable_entry) {
-                        FinalizeRemovedReplicasAfterDurable(
-                            durable_entry, removed_ids, EraseMode::kFull);
+                        FinalizeRemovedReplicasAfterDurable(durable_entry,
+                                                            removed_ids);
                     });
             } else {
                 persist_result = AppendReservedOpLogWithDurableFinalize(
@@ -6009,8 +5968,8 @@ auto MasterService::EvictDiskReplicaImpl(const UUID& client_id,
                                                                     remaining),
                     [this, removed_ids = std::move(removed_ids)](
                         const OpLogEntry& durable_entry) {
-                        FinalizeRemovedReplicasAfterDurable(
-                            durable_entry, removed_ids, EraseMode::kFull);
+                        FinalizeRemovedReplicasAfterDurable(durable_entry,
+                                                            removed_ids);
                     });
             }
             if (!persist_result) {
@@ -6188,8 +6147,6 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
 
-    // Every failure below releases the key without the new replicas, and the
-    // policy gives the growth back.
     if (auto grown = accessor.Grow(
             SaturatingMultiply(static_cast<uint64_t>(metadata.TotalLength()),
                                static_cast<uint64_t>(new_replica_count)));
@@ -6582,8 +6539,6 @@ tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
     // be nested under the source executor's guard. The key's lock keeps
     // terminal cleanup ordered after this already-admitted MoveStart.
     serving_guard.reset();
-    // Every failure below releases the key without the new replica, and the
-    // policy gives the growth back.
     const bool needs_target =
         metadata.GetReplicaBySegmentName(tgt_segment) == nullptr;
     if (auto grown = accessor.Grow(
@@ -6765,8 +6720,8 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(
                 SerializeMetadataForOpLogFromReplicaDescriptors(metadata, post),
                 [this, removed_ids = std::vector<ReplicaID>{source_id}](
                     const OpLogEntry& durable_entry) {
-                    FinalizeRemovedReplicasAfterDurable(
-                        durable_entry, removed_ids, EraseMode::kFull);
+                    FinalizeRemovedReplicasAfterDurable(durable_entry,
+                                                        removed_ids);
                 });
         } else {
             persist_result = AppendOpLogWithDurableFinalize(
@@ -6926,8 +6881,7 @@ tl::expected<void, ErrorCode> MasterService::MarkRemovedAndPersist(
         {},
         [this, removed_ids =
                    std::move(removed_ids)](const OpLogEntry& durable_entry) {
-            FinalizeRemovedReplicasAfterDurable(durable_entry, removed_ids,
-                                                EraseMode::kFull);
+            FinalizeRemovedReplicasAfterDurable(durable_entry, removed_ids);
         });
     if (!persist_result) {
         return tl::make_unexpected(persist_result.error());
@@ -8711,8 +8665,6 @@ auto MasterService::PromotionAllocStart(
         return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
     }
 
-    // Every failure below releases the key without the new replica, and the
-    // policy gives the growth back.
     if (auto grown = accessor.Grow(size); !grown) {
         return tl::make_unexpected(grown.error());
     }
@@ -9363,8 +9315,10 @@ void MasterService::BatchEvict(double evict_ratio_target,
                              .min_ratio = evict_ratio_lowerbound});
     // erase() never returns bucket memory, so a route that once held far
     // more keys than it does now would keep its high-water buckets forever.
+    // Every namespace, including one the round left empty: VisitNamespaces
+    // would skip it, and it has the most buckets to give back.
     if (report.evicted_objects > 0) {
-        VisitNamespaces(
+        namespaces_.Visit(
             [](const TenantId& /*tenant_id*/, metadata::Namespace& ns) {
                 ns.objects.ShrinkSparseStripes();
             });
@@ -9465,8 +9419,8 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
                     tenant_id.value(), key, {},
                     [this, removed_ids = std::move(removed_ids)](
                         const OpLogEntry& durable_entry) {
-                        FinalizeRemovedReplicasAfterDurable(
-                            durable_entry, removed_ids, EraseMode::kFull);
+                        FinalizeRemovedReplicasAfterDurable(durable_entry,
+                                                            removed_ids);
                     });
             } else {
                 persist_result = AppendReservedOpLogWithDurableFinalize(
@@ -9476,8 +9430,8 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
                                                                     remaining),
                     [this, removed_ids = std::move(removed_ids)](
                         const OpLogEntry& durable_entry) {
-                        FinalizeRemovedReplicasAfterDurable(
-                            durable_entry, removed_ids, EraseMode::kFull);
+                        FinalizeRemovedReplicasAfterDurable(durable_entry,
+                                                            removed_ids);
                     });
             }
             if (!persist_result) {
