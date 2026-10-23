@@ -395,7 +395,8 @@ class TransferEngineImpl {
     // Wake the optional event-driven progress worker for `batch_id`. No-op if
     // enable_progress_worker is false. Transport completion paths use this as
     // an idempotent "maybe ready" signal.
-    void notifyBatchMaybeReady(BatchID batch_id);
+    void notifyBatchMaybeReady(BatchID batch_id,
+                               bool poll_until_terminal = false);
 
    private:
     friend class ProgressWorker;
@@ -422,7 +423,7 @@ class TransferEngineImpl {
     std::vector<TransportType> getSupportedTransports(
         TransportType request_type);
 
-    void deregisterRemovedBuffer(BufferDesc& desc);
+    Status deregisterRemovedBuffer(BufferDesc& desc);
 
     Status resubmitTransferTask(Batch* batch, size_t task_id);
 
@@ -648,8 +649,8 @@ class TransferEngineImpl {
     DeferredStageTeardown deferred_stage_teardown_;
     std::unique_ptr<ProgressWorker> progress_worker_;
 
-    // Per-batch hot paths (poll / free / retain) lock only the shard for
-    // that BatchID instead of progress_mutex_, so N threads polling N
+    // Per-batch hot paths (submit / poll / free / retain) lock only the shard
+    // for that BatchID instead of progress_mutex_, so N threads polling N
     // independent batches do not serialize.
     //
     // Exception: enable_runtime_queue=true keeps those paths on

@@ -700,6 +700,11 @@ target_include_directories(tent_local_memory_lifecycle_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_local_memory_lifecycle_test
          COMMAND tent_local_memory_lifecycle_test)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  target_link_options(
+    tent_local_memory_lifecycle_test PRIVATE
+    "-Wl,--wrap=_ZN8mooncake4tent14SegmentManager16synchronizeLocalEv")
+endif()
 
 # Causal chain stage decomposition: validates that dispatch_time and post_time
 # timestamps are populated on both queue and direct-commit paths.
@@ -890,4 +895,17 @@ if(USE_MLU)
     add_test(NAME tent_mlu_${suite}_test COMMAND tent_mlu_${suite}_test)
     set_tests_properties(tent_mlu_${suite}_test PROPERTIES TIMEOUT 300)
   endforeach()
+  target_link_options(
+    tent_mlu_transport_test
+    PRIVATE
+    "-Wl,--wrap=cnrtHostMalloc"
+    "-Wl,--wrap=cnrtFreeHost"
+    "-Wl,--wrap=numa_move_pages"
+    "-Wl,--wrap=cnPlaceNotifier"
+    "-Wl,--wrap=cnMemcpyAsync_V3"
+    "-Wl,--wrap=cnMemcpyHtoD"
+    "-Wl,--wrap=cnMemcpyDtoH"
+    "-Wl,--wrap=cnQueueSync"
+    "-Wl,--wrap=cnQueryNotifier"
+    "-Wl,--wrap=cnQueryQueue")
 endif()
