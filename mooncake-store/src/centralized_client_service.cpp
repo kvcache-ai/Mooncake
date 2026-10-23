@@ -24,6 +24,18 @@
 
 namespace mooncake {
 
+void CentralizedClientService::SegmentDeleter::operator()(void* ptr) const {
+    if (ptr) free(ptr);
+}
+void CentralizedClientService::AscendSegmentDeleter::operator()(
+    void* ptr) const {
+    if (ptr) free_memory("ascend", ptr);
+}
+void CentralizedClientService::HugepageSegmentDeleter::operator()(
+    void* ptr) const {
+    if (ptr && size > 0) free_buffer_mmap_memory(ptr, size);
+}
+
 namespace {
 constexpr const char* kEtcdPrefix = "etcd://";
 constexpr const char* kRedisPrefix = "redis://";

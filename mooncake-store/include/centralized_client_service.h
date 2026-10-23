@@ -388,20 +388,14 @@ class CentralizedClientService
 
     // Global segment memory management
     struct SegmentDeleter {
-        void operator()(void* ptr) {
-            if (ptr) free(ptr);
-        }
+        void operator()(void* ptr) const;
     };
     struct AscendSegmentDeleter {
-        void operator()(void* ptr) {
-            if (ptr) free_memory("ascend", ptr);
-        }
+        void operator()(void* ptr) const;
     };
     struct HugepageSegmentDeleter {
         size_t size = 0;
-        void operator()(void* ptr) const {
-            if (ptr && size > 0) free_buffer_mmap_memory(ptr, size);
-        }
+        void operator()(void* ptr) const;
     };
     std::vector<std::unique_ptr<void, SegmentDeleter>> segment_ptrs_;
     std::vector<std::unique_ptr<void, AscendSegmentDeleter>>
