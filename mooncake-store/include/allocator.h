@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <string>
@@ -448,6 +449,18 @@ std::optional<RestoredOffsetBufferAllocator> ImportOffsetBufferAllocator(
     std::string transport_endpoint,
     const std::vector<LiveAllocation>& allocations,
     ReplicaType replica_type = ReplicaType::MEMORY);
+
+// Imports live allocations into an existing, empty OffsetBufferAllocator and
+// hands each imported buffer to `sink` together with its index in
+// `allocations`, in address order, as soon as it is allocated. Buffers handed
+// out before a failure stay with the caller; the caller must discard the
+// allocator (and those buffers) when this returns false.
+using ImportedBufferSink =
+    std::function<void(size_t index, std::unique_ptr<AllocatedBuffer> buffer)>;
+bool ImportOffsetBufferAllocations(
+    const std::shared_ptr<OffsetBufferAllocator>& allocator,
+    const std::vector<LiveAllocation>& allocations,
+    const ImportedBufferSink& sink);
 
 tl::expected<std::shared_ptr<BufferAllocatorBase>, ErrorCode>
 CreateBufferAllocator(BufferAllocatorType allocator_type,

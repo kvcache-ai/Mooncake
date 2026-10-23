@@ -730,6 +730,17 @@ class MasterServiceHATest : public ::testing::Test {
             prefix);
     }
 
+    // The task id of every seeded promotion task; SeededPromotionItem
+    // carries it, as the holder's drained item would.
+    static constexpr L4TaskId kSeededPromotionTaskId{1, 1};
+    static PromotionTaskItem SeededPromotionItem(const TenantId& tenant,
+                                                 const std::string& key) {
+        return PromotionTaskItem{.tenant_id = tenant.value(),
+                                 .key = key,
+                                 .size = 0,
+                                 .task_id = kSeededPromotionTaskId};
+    }
+
     // Use the test peer to seed an in-flight PromotionTask for a
     // given (tenant, key) so NotifyPromotionSuccess can proceed without
     // going through the on-hit admission gate (which is currently
@@ -751,7 +762,8 @@ class MasterServiceHATest : public ::testing::Test {
                 .alloc_id = alloc_id,
                 .object_size = object_size,
                 .start_time = std::chrono::system_clock::now(),
-                .holder_id = holder_id};
+                .holder_id = holder_id,
+                .task_id = kSeededPromotionTaskId};
     }
 
     static bool NeedMemoryEvictionForTesting(const MasterService& service) {
@@ -1390,10 +1402,171 @@ TEST_F(MasterServiceHATest, BatchPromotionRejectsCrossChunkOverlap) {
     EXPECT_EQ(2u, handoff.metadata_store->GetKeyCount());
     EXPECT_TRUE(handoff.metadata_store->Exists(first.tenant_id, first.key));
     EXPECT_TRUE(handoff.metadata_store->Exists(second.tenant_id, second.key));
-    EXPECT_EQ(
-        HasMetadataEntryForTesting(service, kDefaultTenant, first.key) +
-            HasMetadataEntryForTesting(service, kDefaultTenant, second.key),
-        1);
+    // A failed restore installs nothing, whichever chunk failed.
+    EXPECT_FALSE(
+        HasMetadataEntryForTesting(service, kDefaultTenant, first.key));
+    EXPECT_FALSE(
+        HasMetadataEntryForTesting(service, kDefaultTenant, second.key));
+}
+
+namespace {
+
+// `count` objects of 1 KiB, alternating between `endpoints`, packed from
+// kBase on each endpoint, with replica ids 1..count.
+std::unique_ptr<StandbyMetadataStore> MakeParallelRestoreSource(
+    size_t count, const std::vector<std::string>& endpoints, uint64_t base) {
+    auto source = std::make_unique<StandbyMetadataStore>();
+    std::vector<uint64_t> next(endpoints.size(), base);
+    for (size_t i = 0; i < count; ++i) {
+        const size_t e = i % endpoints.size();
+        StandbyObjectMetadata metadata;
+        metadata.client_id = generate_uuid();
+        metadata.size = 1024;
+        Replica::Descriptor replica;
+        replica.id = i + 1;
+        replica.status = ReplicaStatus::COMPLETE;
+        MemoryDescriptor memory;
+        memory.buffer_descriptor.transport_endpoint_ = endpoints[e];
+        memory.buffer_descriptor.buffer_address_ = next[e];
+        memory.buffer_descriptor.size_ = 1024;
+        replica.descriptor_variant = std::move(memory);
+        metadata.replicas.push_back(std::move(replica));
+        next[e] += 1024;
+        EXPECT_TRUE(source->PutMetadata(
+            "default", "parallel_" + std::to_string(i), metadata));
+    }
+    return source;
+}
+
+}  // namespace
+
+TEST_F(MasterServiceHATest, BatchPromotionRestoresInParallel) {
+    constexpr size_t kObjects = 5000;
+    const std::vector<std::string> endpoints = {"parallel_segment_a",
+                                                "parallel_segment_b"};
+    for (const size_t workers : {size_t{1}, size_t{4}}) {
+        MasterService service(
+            MasterServiceConfig::builder().set_enable_ha(false).build());
+        auto source =
+            MakeParallelRestoreSource(kObjects, endpoints, kDefaultSegmentBase);
+        ASSERT_TRUE(service
+                        .RestoreFromBatchOpLogPromotion(
+                            *source, {.batch_id = 3, .last_seq = 3},
+                            {MakeStandbyMemorySegment(endpoints[0]),
+                             MakeStandbyMemorySegment(endpoints[1])},
+                            kObjects, /*chunk_object_count=*/64, workers)
+                        .has_value())
+            << "workers=" << workers;
+        EXPECT_EQ(kObjects, service.GetKeyCount()) << "workers=" << workers;
+        for (const size_t i : {size_t{0}, size_t{1}, kObjects - 1}) {
+            auto replicas = ReplicaDescriptorsForTesting(
+                service, kDefaultTenant, "parallel_" + std::to_string(i));
+            ASSERT_EQ(replicas.size(), 1);
+            EXPECT_EQ(replicas.front().id, i + 1);
+            const auto& buffer =
+                replicas.front().get_memory_descriptor().buffer_descriptor;
+            EXPECT_EQ(buffer.transport_endpoint_, endpoints[i % 2]);
+            EXPECT_EQ(buffer.buffer_address_,
+                      kDefaultSegmentBase + (i / 2) * 1024);
+        }
+    }
+}
+
+TEST_F(MasterServiceHATest, BatchPromotionFailureInParallelInstallsNothing) {
+    constexpr size_t kObjects = 2000;
+    const std::string endpoint = "parallel_failure_segment";
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+    auto source =
+        MakeParallelRestoreSource(kObjects, {endpoint}, kDefaultSegmentBase);
+    // One object whose descriptor does not match its size.
+    auto bad = MakeStandbyObject("parallel_failure_bad", endpoint);
+    bad.metadata.replicas.front().id = kObjects + 1;
+    bad.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.size_ = 512;
+    ASSERT_TRUE(source->PutMetadata(bad.tenant_id, bad.key, bad.metadata));
+
+    auto result = service.RestoreFromBatchOpLogPromotion(
+        *source, {.batch_id = 3, .last_seq = 3},
+        {MakeStandbyMemorySegment(endpoint)}, kObjects + 1,
+        /*chunk_object_count=*/32, /*restore_workers=*/4);
+
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, result.error());
+    EXPECT_EQ(0u, service.GetKeyCount());
+}
+
+TEST_F(MasterServiceHATest, BatchPromotionRejectsRangesBeyondCapacity) {
+    // Ranges from different chunks that only together exceed the segment.
+    constexpr size_t kObjects = 64;
+    const std::string endpoint = "parallel_capacity_segment";
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+    auto source =
+        MakeParallelRestoreSource(kObjects, {endpoint}, kDefaultSegmentBase);
+
+    auto result = service.RestoreFromBatchOpLogPromotion(
+        *source, {.batch_id = 3, .last_seq = 3},
+        {MakeStandbyMemorySegment(endpoint, (kObjects - 1) * 1024)}, kObjects,
+        /*chunk_object_count=*/8, /*restore_workers=*/4);
+
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, result.error());
+    EXPECT_EQ(0u, service.GetKeyCount());
+}
+
+TEST_F(MasterServiceHATest, BatchPromotionCountsRestoredDiskObjects) {
+    // An object restored with a completed LOCAL_DISK replica counts as a disk
+    // object, as one whose replica came through AddReplica does, and a failed
+    // restore takes the count back out with the objects.
+    constexpr size_t kObjects = 200;
+    constexpr size_t kDiskObjects = 10;
+    const std::string endpoint = "parallel_disk_segment";
+    const UUID disk_owner = generate_uuid();
+    for (const bool fail : {false, true}) {
+        MasterService service(
+            MasterServiceConfig::builder().set_enable_ha(false).build());
+        auto source = MakeParallelRestoreSource(kObjects, {endpoint},
+                                                kDefaultSegmentBase);
+        for (size_t i = 0; i < kDiskObjects; ++i) {
+            StandbyObjectMetadata metadata;
+            metadata.client_id = generate_uuid();
+            metadata.size = 1024;
+            metadata.replicas.push_back(
+                MakeStandbyLocalDiskReplica(disk_owner, "parallel_disk_owner"));
+            metadata.replicas.front().id = kObjects + 1 + i;
+            ASSERT_TRUE(source->PutMetadata(
+                "default", "parallel_disk_" + std::to_string(i), metadata));
+        }
+        ReplicaID max_replica_id = kObjects + kDiskObjects;
+        if (fail) {
+            // One object whose descriptor does not match its size.
+            auto bad = MakeStandbyObject("parallel_disk_bad", endpoint);
+            bad.metadata.replicas.front().id = ++max_replica_id;
+            bad.metadata.replicas.front()
+                .get_memory_descriptor()
+                .buffer_descriptor.size_ = 512;
+            ASSERT_TRUE(
+                source->PutMetadata(bad.tenant_id, bad.key, bad.metadata));
+        }
+
+        auto result = service.RestoreFromBatchOpLogPromotion(
+            *source, {.batch_id = 3, .last_seq = 3},
+            {MakeStandbyMemorySegment(endpoint)}, max_replica_id,
+            /*chunk_object_count=*/16, /*restore_workers=*/4);
+
+        if (fail) {
+            ASSERT_FALSE(result.has_value());
+            EXPECT_EQ(0u, service.GetKeyCount());
+            EXPECT_EQ(DiskObjectCountForTesting(service), 0);
+        } else {
+            ASSERT_TRUE(result.has_value());
+            EXPECT_EQ(kObjects + kDiskObjects, service.GetKeyCount());
+            EXPECT_EQ(DiskObjectCountForTesting(service),
+                      static_cast<long>(kDiskObjects));
+        }
+    }
 }
 
 TEST_F(MasterServiceHATest,
@@ -3412,6 +3585,44 @@ TEST_F(MasterServiceHATest, RemountRejectsStandbySegmentEndpointMismatch) {
     ASSERT_TRUE(service.ReMountSegment({correct}, generate_uuid()).has_value());
 }
 
+TEST_F(MasterServiceHATest, RemountRejectsStandbySegmentOfAnotherMount) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+    const std::string endpoint = "standby_identity_mount";
+    const UUID owner = generate_uuid();
+    const Segment original = MakeSegment(endpoint);
+    StandbySegmentInfo standby = MakeStandbyMemorySegment(endpoint);
+    standby.segment_id = original.id;
+    standby.base = original.base;
+    standby.owner_client_id = owner;
+    auto object = MakeStandbyObject("standby_identity_object", endpoint);
+    object.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    ASSERT_TRUE(
+        service.RestoreFromStandbySnapshot({object}, 7, {standby}).has_value());
+
+    // A store that restarted mounts the same name, endpoint and range under
+    // a new segment id.
+    const Segment restarted = MakeSegment(endpoint);
+    auto failed = service.ReMountSegment({restarted}, generate_uuid());
+    ASSERT_FALSE(failed.has_value());
+    EXPECT_EQ(failed.error(), ErrorCode::INVALID_PARAMS);
+
+    Segment moved = original;
+    moved.base = kDefaultSegmentBase + kDefaultSegmentSize;
+    failed = service.ReMountSegment({moved}, owner);
+    ASSERT_FALSE(failed.has_value());
+    EXPECT_EQ(failed.error(), ErrorCode::INVALID_PARAMS);
+
+    failed = service.ReMountSegment({original}, generate_uuid());
+    ASSERT_FALSE(failed.has_value());
+    EXPECT_EQ(failed.error(), ErrorCode::INVALID_PARAMS);
+
+    ASSERT_TRUE(service.ReMountSegment({original}, owner).has_value());
+    EXPECT_EQ(SegmentAllocatedSizeForTesting(service, endpoint), 1024);
+}
+
 TEST_F(MasterServiceHATest, RemountRejectsCxlForStandbyMemorySegment) {
     MasterService service(
         MasterServiceConfig::builder().set_enable_ha(false).build());
@@ -5051,13 +5262,13 @@ TEST_F(MasterServiceBatchRecordE2ETest,
                        "batch_e2e_partial_evict_seg");
     ReadBatchEventually(storage, 2, batch);
 
-    OffloadTaskItem task{
-        .tenant_id = kDefaultTenant.value(), .key = key, .size = 1024};
-    StorageObjectMetadata metadata;
-    metadata.data_size = 1024;
-    metadata.transport_endpoint = "batch_e2e_partial_evict_disk";
+    // A disk replica registered through AddReplica (NotifyOffloadSuccess
+    // only registers the completion of an offload task the client took).
+    Replica disk_replica(mounted.client_id, 1024,
+                         "batch_e2e_partial_evict_disk",
+                         ReplicaStatus::COMPLETE);
     ASSERT_TRUE(
-        service.NotifyOffloadSuccess(mounted.client_id, {task}, {metadata})
+        service.AddReplica(mounted.client_id, key, kDefaultTenant, disk_replica)
             .has_value());
     ReadBatchEventually(storage, 3, batch);
 
@@ -5183,14 +5394,14 @@ TEST_F(MasterServiceBatchRecordE2ETest,
                        "batch_e2e_offload_promotion_seg");
     ReadBatchEventually(storage, 2, batch);
 
-    OffloadTaskItem task{
-        .tenant_id = kDefaultTenant.value(), .key = offload_key, .size = 1024};
-    StorageObjectMetadata metadata;
-    metadata.data_size = 1024;
-    metadata.transport_endpoint = "batch_e2e_offload_endpoint";
-    ASSERT_TRUE(
-        service.NotifyOffloadSuccess(mounted.client_id, {task}, {metadata})
-            .has_value());
+    // A disk replica registered through AddReplica (NotifyOffloadSuccess
+    // only registers the completion of an offload task the client took).
+    Replica disk_replica(mounted.client_id, 1024, "batch_e2e_offload_endpoint",
+                         ReplicaStatus::COMPLETE);
+    ASSERT_TRUE(service
+                    .AddReplica(mounted.client_id, offload_key, kDefaultTenant,
+                                disk_replica)
+                    .has_value());
     ReadBatchEventually(storage, 3, batch);
 
     auto offload_replicas = service.GetReplicaList(offload_key, kDefaultTenant);
@@ -5214,8 +5425,10 @@ TEST_F(MasterServiceBatchRecordE2ETest,
                                 mounted.client_id, put_start->front().id, 1024);
 
     ASSERT_TRUE(service
-                    .NotifyPromotionSuccess(mounted.client_id, promotion_key,
-                                            kDefaultTenant)
+                    .NotifyPromotionTaskSuccess(
+                        mounted.client_id,
+                        SeededPromotionItem(kDefaultTenant, promotion_key),
+                        kDefaultTenant)
                     .has_value());
     ReadBatchEventually(storage, 4, batch);
 
@@ -5631,8 +5844,7 @@ TEST_F(MasterServiceHATest,
               object_size);
 }
 
-TEST_F(MasterServiceHATest,
-       NotifyOffloadSuccessFallbackWritesBatchRecordOpLog) {
+TEST_F(MasterServiceHATest, AddDiskReplicaWritesBatchRecordOpLog) {
     const std::string cluster_id = "test_batch_record_offload_cluster";
     auto backend = std::make_shared<FakeBatchHaKvBackend>();
     auto service_config = MasterServiceConfig::builder()
@@ -5672,13 +5884,12 @@ TEST_F(MasterServiceHATest,
     }
     ASSERT_EQ(ErrorCode::OK, read_err);
 
-    OffloadTaskItem task{
-        .tenant_id = kDefaultTenant.value(), .key = key, .size = 1024};
-    StorageObjectMetadata metadata;
-    metadata.data_size = 1024;
-    metadata.transport_endpoint = "local_disk_endpoint";
+    // A disk replica registered through AddReplica (NotifyOffloadSuccess
+    // only registers the completion of an offload task the client took).
+    Replica disk_replica(mounted.client_id, 1024, "local_disk_endpoint",
+                         ReplicaStatus::COMPLETE);
     ASSERT_TRUE(
-        service.NotifyOffloadSuccess(mounted.client_id, {task}, {metadata})
+        service.AddReplica(mounted.client_id, key, kDefaultTenant, disk_replica)
             .has_value());
     auto replicas = service.GetReplicaList(key, kDefaultTenant);
     ASSERT_TRUE(replicas.has_value());
@@ -5704,8 +5915,7 @@ TEST_F(MasterServiceHATest,
     EXPECT_FALSE(batch.entries[0].payload.empty());
 }
 
-TEST_F(MasterServiceHATest,
-       NotifyOffloadSuccessFallbackVisibleBeforeBatchRecordDurable) {
+TEST_F(MasterServiceHATest, AddDiskReplicaVisibleBeforeBatchRecordDurable) {
     const std::string cluster_id = "test_batch_record_offload_visible";
     auto backend = std::make_shared<BlockingBatchHaKvBackend>();
     auto service_config = MasterServiceConfig::builder()
@@ -5730,15 +5940,14 @@ TEST_F(MasterServiceHATest,
                        "batch_offload_visible_seg");
     ReadBatchEventually(storage, 2, batch);
 
-    OffloadTaskItem task{
-        .tenant_id = kDefaultTenant.value(), .key = key, .size = 1024};
-    StorageObjectMetadata metadata;
-    metadata.data_size = 1024;
-    metadata.transport_endpoint = "local_disk_visible_endpoint";
+    // A disk replica registered through AddReplica (NotifyOffloadSuccess
+    // only registers the completion of an offload task the client took).
+    Replica disk_replica(mounted.client_id, 1024, "local_disk_visible_endpoint",
+                         ReplicaStatus::COMPLETE);
 
     backend->BlockTxn();
-    auto offload =
-        service.NotifyOffloadSuccess(mounted.client_id, {task}, {metadata});
+    auto offload = service.AddReplica(mounted.client_id, key, kDefaultTenant,
+                                      disk_replica);
     EXPECT_TRUE(offload.has_value());
 
     auto replicas = service.GetReplicaList(key, kDefaultTenant);
@@ -5806,6 +6015,22 @@ TEST_F(MasterServiceHATest, SegmentLifecycleWritesBatchRecordOpLogs) {
     EXPECT_EQ(2u, remount_batch.entries[0].sequence_id);
     EXPECT_FALSE(remount_batch.entries[0].payload.empty());
 
+    // Both mount records carry the mount's identity.
+    for (const auto& [entry, segment, owner] :
+         {std::tuple{&mount_batch.entries[0], &mounted, client_id},
+          std::tuple{&remount_batch.entries[0], &remounted,
+                     remount_client_id}}) {
+        SegmentMountOp op;
+        ASSERT_EQ(struct_pack::errc::ok,
+                  struct_pack::deserialize_to(op, entry->payload));
+        ASSERT_TRUE(op.segment_id.has_value());
+        EXPECT_EQ(*op.segment_id, segment->id);
+        ASSERT_TRUE(op.base.has_value());
+        EXPECT_EQ(*op.base, segment->base);
+        ASSERT_TRUE(op.owner_client_id.has_value());
+        EXPECT_EQ(*op.owner_client_id, owner);
+    }
+
     ASSERT_EQ(1u, unmount_batch.entries.size());
     EXPECT_EQ(OpType::SEGMENT_UNMOUNT, unmount_batch.entries[0].op_type);
     EXPECT_EQ(3u, unmount_batch.entries[0].sequence_id);
@@ -5851,8 +6076,9 @@ TEST_F(MasterServiceHATest, NotifyPromotionSuccessWritesBatchRecordOpLog) {
     SeedPromotionTaskForTesting(&service, kDefaultTenant, key,
                                 mounted.client_id, put_start->front().id, 1024);
 
-    auto res =
-        service.NotifyPromotionSuccess(mounted.client_id, key, kDefaultTenant);
+    auto res = service.NotifyPromotionTaskSuccess(
+        mounted.client_id, SeededPromotionItem(kDefaultTenant, key),
+        kDefaultTenant);
     ASSERT_TRUE(res.has_value());
 
     for (int i = 0; i < 50; ++i) {
@@ -5905,8 +6131,9 @@ TEST_F(MasterServiceHATest,
                                 mounted.client_id, put_start->front().id, 1024);
 
     backend->BlockTxn();
-    auto promotion =
-        service.NotifyPromotionSuccess(mounted.client_id, key, kDefaultTenant);
+    auto promotion = service.NotifyPromotionTaskSuccess(
+        mounted.client_id, SeededPromotionItem(kDefaultTenant, key),
+        kDefaultTenant);
     EXPECT_TRUE(promotion.has_value());
 
     auto replicas = service.GetReplicaList(key, kDefaultTenant);

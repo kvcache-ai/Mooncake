@@ -35,6 +35,12 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     eviction/report_observers.cpp
     master_service.cpp
     promotion_candidate_tracker.cpp
+    master_service_handoff.cpp
+    handoff/handoff_format.cpp
+    handoff/handoff_writer.cpp
+    handoff/handoff_lifecycle.cpp
+    handoff/handoff_admission.cpp
+    handoff/handoff_runtime.cpp
     master_store_backend.cpp
     weight_store_manager.cpp
     master_metric_manager.cpp

@@ -188,7 +188,13 @@ ErrorCode ScopedSegmentAccess::MountSegment(
     // CXL, instead of letting protocol-specific branches bypass it.
     auto existing = segment_manager_->mounted_segments_.find(segment.id);
     if (existing != segment_manager_->mounted_segments_.end()) {
-        if (existing->second.status != SegmentStatus::OK) {
+        // A segment restored by a shutdown handoff as DRAINING / DRAINED
+        // must accept its owner's remount, which is what confirms it.
+        const bool restored_drain =
+            existing->second.handoff_pending &&
+            (existing->second.status == SegmentStatus::DRAINING ||
+             existing->second.status == SegmentStatus::DRAINED);
+        if (existing->second.status != SegmentStatus::OK && !restored_drain) {
             return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
         }
         const auto owner = segment_manager_->client_segments_.find(client_id);
@@ -341,6 +347,91 @@ ErrorCode ScopedSegmentAccess::ReMountSegment(
     }
 
     return ErrorCode::OK;
+}
+
+ErrorCode ScopedSegmentAccess::MountRestoredSegment(
+    const Segment& segment, const UUID& client_id,
+    std::shared_ptr<ClientLivenessRecord> client_liveness,
+    std::shared_ptr<BufferAllocatorBase> allocator, SegmentStatus status) {
+    if (!allocator || segment.protocol == "cxl" || segment.base == 0 ||
+        segment.size == 0 || allocator->base() != segment.base ||
+        allocator->capacity() != segment.size) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    if (status != SegmentStatus::OK && status != SegmentStatus::DRAINING &&
+        status != SegmentStatus::DRAINED) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    if (segment_manager_->mounted_segments_.contains(segment.id)) {
+        return ErrorCode::SEGMENT_ALREADY_EXISTS;
+    }
+    const auto indexed_name =
+        segment_manager_->segment_id_by_name_.find(segment.name);
+    if (indexed_name != segment_manager_->segment_id_by_name_.end()) {
+        const auto indexed_segment =
+            segment_manager_->mounted_segments_.find(indexed_name->second);
+        if (indexed_segment == segment_manager_->mounted_segments_.end() ||
+            indexed_segment->second.status == SegmentStatus::UNMOUNTING) {
+            return ErrorCode::INVALID_PARAMS;
+        }
+    }
+    allocator->AttachUsageTracker(segment_manager_->usage_tracker_);
+    auto registration = segment_manager_->allocator_manager_.addAllocator(
+        segment.name, allocator, std::move(client_liveness));
+    registration->SetAllocatable(false);
+    segment_manager_->client_segments_[client_id].push_back(segment.id);
+    MountedSegment mounted{segment, status, std::move(allocator), registration};
+    mounted.handoff_pending = true;
+    segment_manager_->mounted_segments_[segment.id] = std::move(mounted);
+    segment_manager_->client_by_name_[segment.name] = client_id;
+    segment_manager_->segment_id_by_name_[segment.name] = segment.id;
+    if (status == SegmentStatus::OK) {
+        AddHostSegment(segment_manager_->segments_by_host_, segment);
+    } else {
+        // As SetSegmentStatusByName does for a segment that leaves OK.
+        segment_manager_->allocator_manager_.removeAllocator(segment.name,
+                                                             registration);
+    }
+    MasterMetricManager::instance().inc_total_mem_capacity(segment.name,
+                                                           segment.size);
+    return ErrorCode::OK;
+}
+
+bool ScopedSegmentAccess::IsRestoredSegmentPending(
+    const UUID& segment_id) const {
+    const auto mounted = segment_manager_->mounted_segments_.find(segment_id);
+    return mounted != segment_manager_->mounted_segments_.end() &&
+           mounted->second.handoff_pending;
+}
+
+ErrorCode ScopedSegmentAccess::ConfirmRestoredSegment(const UUID& segment_id) {
+    auto mounted = segment_manager_->mounted_segments_.find(segment_id);
+    if (mounted == segment_manager_->mounted_segments_.end() ||
+        !mounted->second.allocator_registration) {
+        return ErrorCode::SEGMENT_NOT_FOUND;
+    }
+    if (!mounted->second.handoff_pending) {
+        return ErrorCode::OK;
+    }
+    mounted->second.handoff_pending = false;
+    if (mounted->second.status == SegmentStatus::OK) {
+        mounted->second.allocator_registration->SetAllocatable(true);
+    }
+    return ErrorCode::OK;
+}
+
+std::function<void(AllocatedBuffer&)> ScopedSegmentAccess::MakeBufferBinder(
+    const UUID& segment_id) const {
+    auto mounted = segment_manager_->mounted_segments_.find(segment_id);
+    if (mounted == segment_manager_->mounted_segments_.end() ||
+        !mounted->second.allocator_registration) {
+        return {};
+    }
+    std::shared_ptr<const SegmentAllocatorRegistration> registration =
+        mounted->second.allocator_registration;
+    return [registration](AllocatedBuffer& buffer) {
+        registration->BindBuffer(buffer);
+    };
 }
 
 ErrorCode ScopedSegmentAccess::ValidateRemountSegment(
@@ -1241,6 +1332,12 @@ ErrorCode ScopedSegmentAccess::SetSegmentStatusByName(
     }
     if (mounted_segment.status == status) {
         return ErrorCode::OK;
+    }
+    if (mounted_segment.handoff_pending) {
+        // A restored segment whose owner has not confirmed it yet: its
+        // ranges may belong to a store that restarted, so nothing may make
+        // it allocatable (or start draining it) before the confirmation.
+        return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
     }
 
     auto& allocator_manager = segment_manager_->allocator_manager_;

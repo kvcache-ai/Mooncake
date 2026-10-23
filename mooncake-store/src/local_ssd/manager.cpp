@@ -16,13 +16,20 @@ ErrorCode LocalSsdTaskMailbox::EnqueueOffload(OffloadTaskItem task,
     if (!enable_offloading_) {
         return ErrorCode::UNABLE_OFFLOADING;
     }
+    auto index = TenantId(task.tenant_id).MakeScopedKey(task.key);
+    auto it = pending_offloads_.find(index);
+    if (it != pending_offloads_.end()) {
+        // An item still queued for the key belongs to an earlier task of it
+        // (the master queues a key's next task only after the previous one
+        // ended), so no store can report it any more. The new task's item
+        // takes its place; the queue does not grow.
+        it->second = std::move(task);
+        return ErrorCode::OK;
+    }
     if (pending_offloads_.size() >= limit) {
         return ErrorCode::KEYS_ULTRA_LIMIT;
     }
-    auto index = TenantId(task.tenant_id).MakeScopedKey(task.key);
-    if (!pending_offloads_.emplace(std::move(index), std::move(task)).second) {
-        return ErrorCode::OBJECT_ALREADY_EXISTS;
-    }
+    pending_offloads_.emplace(std::move(index), std::move(task));
     return ErrorCode::OK;
 }
 
@@ -49,14 +56,12 @@ ErrorCode LocalSsdTaskMailbox::EnqueuePromotion(PromotionTaskItem task) {
     MutexLocker lock(&mutex_);
     auto index = TenantId(task.tenant_id).MakeScopedKey(task.key);
     const uint64_t seq = ++promotion_seq_;
-    auto [it, inserted] = pending_promotions_.emplace(
-        std::move(index), PromotionEntry{std::move(task), seq});
-    if (!inserted) {
-        // Already queued: keep the dedup contract but refresh recency, so a
-        // repeated admission moves ahead of stale entries.
-        it->second.seq = seq;
-        return ErrorCode::OBJECT_ALREADY_EXISTS;
-    }
+    // An item still queued for the key belongs to an earlier task of it (the
+    // master admits a key's next promotion only after the previous one
+    // ended), so the holder could not act on it any more. The new task's item
+    // takes its place, with fresh recency.
+    pending_promotions_.insert_or_assign(std::move(index),
+                                         PromotionEntry{std::move(task), seq});
     return ErrorCode::OK;
 }
 
@@ -351,6 +356,47 @@ tl::expected<bool, ErrorCode> LocalSsdManager::ConsumeRemoveAll(
         return tl::unexpected(ErrorCode::SEGMENT_NOT_FOUND);
     }
     return client->record->mailbox.ConsumeRemoveAll();
+}
+
+std::vector<LocalSsdHandoffClient> LocalSsdManager::ExportHandoffClients()
+    const {
+    auto clients = SnapshotClients();
+    std::vector<LocalSsdHandoffClient> out;
+    out.reserve(clients.size());
+    for (const auto& client_access : clients) {
+        const auto& record = client_access.record;
+        LocalSsdHandoffClient client;
+        client.client_id = client_access.client_id;
+        {
+            MutexLocker stats_lock(&record->stats_mutex);
+            client.total_capacity_bytes = record->total_capacity_bytes;
+        }
+        {
+            MutexLocker mailbox_lock(&record->mailbox.mutex_);
+            client.enable_offloading = record->mailbox.enable_offloading_;
+            client.pending_remove_all = record->mailbox.pending_remove_all_;
+        }
+        out.push_back(client);
+    }
+    return out;
+}
+
+ErrorCode LocalSsdManager::RestoreHandoffClient(
+    const LocalSsdHandoffClient& client, int64_t used_bytes) {
+    auto record = std::make_shared<ClientRecord>(client.enable_offloading);
+    {
+        MutexLocker stats_lock(&record->stats_mutex);
+        record->total_capacity_bytes = client.total_capacity_bytes;
+    }
+    record->used_bytes.store(used_bytes, std::memory_order_relaxed);
+    if (client.pending_remove_all) {
+        record->mailbox.RequestRemoveAll();
+    }
+    std::unique_lock lock(mutex_);
+    if (!clients_.emplace(client.client_id, std::move(record)).second) {
+        return ErrorCode::SEGMENT_ALREADY_EXISTS;
+    }
+    return ErrorCode::OK;
 }
 
 LocalSsdPersistedState LocalSsdManager::ExportPersistedState() const {
