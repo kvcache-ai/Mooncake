@@ -158,6 +158,7 @@ Status MultiTransport::tryFreeBatchID(
     BatchID batch_id, const std::function<void()>& before_delete) {
     auto& batch_desc = *((BatchDesc*)(batch_id));
     const size_t task_count = batch_desc.task_list.size();
+    bool busy = false;
     for (size_t task_id = 0; task_id < task_count; task_id++) {
         auto& task = batch_desc.task_list[task_id];
         if (task.is_finished) {
@@ -167,7 +168,6 @@ Status MultiTransport::tryFreeBatchID(
             task.is_finished = true;
             continue;
         }
-
         TransferStatus status;
         Status query_status = getTransferStatus(batch_id, task_id, status);
         if (!query_status.ok()) {
@@ -179,9 +179,15 @@ Status MultiTransport::tryFreeBatchID(
         // counter reaches zero below.
         if (status.s != Transport::TransferStatusEnum::COMPLETED &&
             status.s != Transport::TransferStatusEnum::FAILED) {
-            return Status::BatchBusy(
-                "BatchID cannot be freed until all tasks are done");
+            busy = true;
+            // With metrics, keep going so finished tasks behind a busy one
+            // are still recorded.
+            if (!metricsEnabled()) break;
         }
+    }
+    if (busy) {
+        return Status::BatchBusy(
+            "BatchID cannot be freed until all tasks are done");
     }
     // A terminal status only means the task published completion; the
     // completion callback may still be unwinding while holding a pin on
@@ -297,6 +303,10 @@ void MultiTransport::recordTaskEnd(Transport::TransferTask& task,
     }
 }
 
+bool MultiTransport::metricsEnabled() {
+    return TransferEngineMetrics::isEnabled();
+}
+
 #else
 
 void MultiTransport::recordTaskStart(Transport::TransferTask&,
@@ -304,6 +314,8 @@ void MultiTransport::recordTaskStart(Transport::TransferTask&,
 
 void MultiTransport::recordTaskEnd(Transport::TransferTask&,
                                    const TransferStatus&) {}
+
+bool MultiTransport::metricsEnabled() { return false; }
 
 #endif  // WITH_METRICS
 
@@ -597,7 +609,18 @@ Status MultiTransport::getBatchTransferStatus(BatchID batch_id,
     // set is_finished. The WAITING fast path does not write is_finished.
 
     size_t success_count = 0;
+    bool any_failed = false;
     for (size_t task_id = 0; task_id < task_count; task_id++) {
+        // Once a failure is seen, the walk continues only to record metrics
+        // for tasks that finished later. Tasks already recorded have nothing
+        // left to report, so skip the transport query for them.
+#ifdef WITH_METRICS
+        if (any_failed &&
+            __atomic_load_n(
+                &batch_desc.task_list[task_id].export_metrics_recorded,
+                __ATOMIC_ACQUIRE))
+            continue;
+#endif
         TransferStatus task_status;
         auto ret = getTransferStatus(batch_id, task_id, task_status);
 
@@ -611,9 +634,14 @@ Status MultiTransport::getBatchTransferStatus(BatchID batch_id,
             success_count++;
         } else if (task_status.s == Transport::TransferStatusEnum::FAILED ||
                    task_status.s == Transport::TransferStatusEnum::TIMEOUT) {
-            status.s = Transport::TransferStatusEnum::FAILED;
-            return Status::OK();
+            any_failed = true;
+            // With metrics, keep going so every finished task is recorded.
+            if (!metricsEnabled()) break;
         }
+    }
+    if (any_failed) {
+        status.s = Transport::TransferStatusEnum::FAILED;
+        return Status::OK();
     }
 
     status.s = (success_count == task_count)
@@ -624,8 +652,6 @@ Status MultiTransport::getBatchTransferStatus(BatchID batch_id,
                                                  std::memory_order_relaxed);
         batch_desc.status_cached.store(true, std::memory_order_release);
         batch_desc.is_finished.store(true, std::memory_order_release);
-    } else if (status.s == Transport::TransferStatusEnum::FAILED) {
-        batch_desc.has_failure.store(true, std::memory_order_release);
     }
     return Status::OK();
 }
