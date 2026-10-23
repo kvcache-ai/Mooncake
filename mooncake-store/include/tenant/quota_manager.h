@@ -71,8 +71,9 @@ class TenantQuotaManager {
 
     tl::expected<TenantQuotaSnapshot, ErrorCode> UpsertPolicy(
         const TenantId& tenant_id, uint64_t requested_quota_bytes);
-    // TENANT_NOT_EMPTY while the tenant still charges anything or, by
-    // `tenant_has_objects`, still holds an object.
+    // TENANT_NOT_EMPTY while the tenant still charges anything, has a write
+    // in flight (TenantQuotaAccount::BeginWrite) or, by `tenant_has_objects`,
+    // still holds an object.
     tl::expected<std::optional<TenantQuotaSnapshot>, ErrorCode> DeletePolicy(
         const TenantId& tenant_id,
         const std::function<bool(const TenantId&)>& tenant_has_objects);
